@@ -15,6 +15,13 @@ cmp build/stage2.c build/stage3.c
 python3 tools/run_tests.py --orinc build/orin2
 ```
 
+The self-hosted compiler also embeds the std prelude (`std/`, spec 19 R1; docs/architecture.md
+"Preludes"). `tools/bootstrap.sh` first checks that `compiler/loader/embedded_std.or` is up to date
+(`tools/embed_prelude.py --check`). Stage 0 builds stage 1 with the C implementations of the library
+built-ins (it never sees `std/`); stage 2 and 3 are compiled *with* the prelude (library calls inside the
+compiler become Orin code), and `stage2.c == stage3.c` additionally shows that the C-builtin and the
+prelude implementations agree on the compiler's own workload.
+
 All stages share the CLI `<compiler> compile <entry.or> -o <out.c>` and the C runtime.
 Generated C must not contain timestamps, absolute paths or hash-order-dependent output.
 Stage equality is a consistency check, not a correctness proof (spec 09).

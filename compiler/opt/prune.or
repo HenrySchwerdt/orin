@@ -1,0 +1,98 @@
+// Dead-function elimination for prelude code (spec 19 R1). The implicit preludes
+// (compiler/loader/prelude.or) add every function of their units to the program; those whose names
+// start with `$` are dropped here unless they are reachable from `main` or from a function of the
+// program itself. User functions are never dropped (so the verifier and the C output keep covering
+// all of them). Remaining functions keep their relative order; calls and `main` are renumbered.
+//
+// The only MIR construct that names a function is `ICall`. A new instruction that refers to a
+// function (e.g. closure creation) MUST be added to `callees` and `renumber` below.
+
+import { MProgram, MFunction, MBlock, Instr } from "../mir";
+
+function isPrelude(f: MFunction): bool {
+  return f.name.startsWith("$");
+}
+
+// Functions called by `f` (with repeats).
+function callees(f: MFunction): usize[] {
+  let out: usize[] = [];
+  for (const b of f.blocks) {
+    for (const ins of b.instrs) {
+      match (ins) {
+        ICall(_, g, _) => { out.push(g); },
+        _ => {}
+      }
+    }
+  }
+  return out;
+}
+
+function renumber(f: MFunction, idx: usize[]): MFunction {
+  let blocks: MBlock[] = [];
+  for (const b of f.blocks) {
+    let instrs: Instr[] = [];
+    for (const ins of b.instrs) {
+      match (ins) {
+        ICall(d, g, a) => { instrs.push(ICall(d, idx[g], a)); },
+        _ => { instrs.push(ins); }
+      }
+    }
+    blocks.push(MBlock { instrs: instrs, term: b.term });
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    locals: f.locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
+
+export function pruneProgram(p: MProgram): MProgram {
+  let live: bool[] = [];
+  let work: usize[] = [];
+  let anyDead = false;
+  let i: usize = 0;
+  while (i < p.functions.length) {
+    const keep = !isPrelude(p.functions[i]) || i == p.main;
+    live.push(keep);
+    if (keep) {
+      work.push(i);
+    }
+    i += 1;
+  }
+  while (work.length > 0) {
+    const k = work.pop().unwrap();
+    for (const g of callees(p.functions[k])) {
+      if (!live[g]) {
+        live[g] = true;
+        work.push(g);
+      }
+    }
+  }
+  let idx: usize[] = [];
+  let n: usize = 0;
+  i = 0;
+  while (i < live.length) {
+    idx.push(n);
+    if (live[i]) {
+      n += 1;
+    } else {
+      anyDead = true;
+    }
+    i += 1;
+  }
+  if (!anyDead) {
+    return p;
+  }
+  let fns: MFunction[] = [];
+  i = 0;
+  while (i < p.functions.length) {
+    if (live[i]) {
+      fns.push(renumber(p.functions[i], idx));
+    }
+    i += 1;
+  }
+  return MProgram { functions: fns, strings: p.strings, main: idx[p.main] };
+}
