@@ -77,7 +77,7 @@ a.increment();      // a.value == 1, b.value == 0 — no spooky action at a dist
 **3. The compiler manages memory (OIM — "Orin Inferred Memory").** Under the hood, values are
 reference-counted and copied lazily (copy-on-write). The compiler infers ownership, moves values
 at their last use and updates in place when nothing else can observe it — so value semantics
-stay cheap. Planned next: unboxing, region allocation and more verified optimisations.
+stay cheap. Planned next: unboxing, escape analysis with stack allocation, and more verified optimisations.
 
 **4. Safety you can check, with explicit limits.** Orin builds multiple layers of evidence rather
 than claiming complete memory-safety proof for every compiler and runtime path:
@@ -85,7 +85,11 @@ than claiming complete memory-safety proof for every compiler and runtime path:
   (MIR) — ownership-rule violations in MIR are rejected before code generation; this does not detect every possible compiler bug;
 - a **Lean 4 formal model** proves that the reference-counting machine never touches freed
   memory, that copy-on-write never changes what aliases observe, and that code accepted by the
-  ownership checker is safe (for the core of the IR so far);
+  ownership checker is safe — **in the formal model** and for the core of the IR so far. The real
+  verifier is cross-checked against that model by differential and mutation testing, not proved
+  equal to it. Shape/type confusion (reading a field a value does not have) is outside the proof;
+  this gap was hit once by a real compiler bug, and runtime field bounds checks are now the backstop
+  ([finding F-shape](docs/assurance.md));
 - the runtime has an Orin standard-library layer and an L0 platform boundary; further runtime
   implementation and verification work remains ([runtime plan](spec/19-self-hosted-runtime.md),
   [assurance ledger](docs/assurance.md)).
@@ -123,7 +127,7 @@ structured, stable diagnostics — optimised for the total effort needed to reac
 | Area | Status |
 |---|---|
 | Self-hosted compiler, checked-in C bootstrap seed, C and LLVM IR backends | ✅ Implemented |
-| Language: classes, generics, interfaces, closures, maps, fixed-width integers, packages | ✅ Implemented |
+| Language: classes, generics, interfaces, closures, maps, floats, fixed-width integers, template literals, packages | ✅ Implemented (language frozen for 1.0, ADR-0016) |
 | Copy-on-write value semantics, MIR ownership verification, resource-safe `File` handles | ✅ Implemented; safety evidence has documented limits |
 | Formatter, diagnostics, language server, MCP, VS Code support, `orin test` | ✅ Implemented |
 | Contract clauses + SMT verification | ✅ Supported subset; not universal proof |
@@ -143,7 +147,7 @@ capabilities.
 
 ## Try it
 
-Download a package from [Releases](../../releases) (Linux x86-64, macOS arm64). You need a C
+Download a package from [Releases](../../releases) (Linux x86-64, macOS arm64; use **v0.1.0-alpha.2** or later for the features listed here, or build from source). You need a C
 compiler (`cc`, gcc or clang) on your PATH for the default backend. An LLVM IR backend
 is also implemented; see the [build and backend documentation](docs/architecture.md).
 
@@ -189,11 +193,12 @@ Use the structural graph and semantic diff in the current alpha:
 
 ```bash
 bin/orin graph examples/shapes.or -o shapes.graph.json
-bin/orin diff --base examples/counter.or --head examples/shapes.or --format=html -o osig-diff.html
+bin/orin diff --base examples/osig/base --head examples/osig/head --format=html -o osig-diff.html
 ```
 
-The diff above demonstrates the commands on different examples; in normal PR workflows,
-compare **base and head versions of the same package**. OSIG currently reports symbols,
+The two versions in `examples/osig` (in a source checkout: `tests/osig/accept`) contain a rename, a signature change and a new call path
+from an entry point; the report shows all three (the rename only as a heuristic candidate). In a
+PR workflow, compare the base and head versions of your package. OSIG currently reports symbols,
 calls, imports, type relationships and contracts — **not** automatic HTTP/Kafka workflows
 or field-level data lineage. See [docs/osig.md](docs/osig.md).
 
