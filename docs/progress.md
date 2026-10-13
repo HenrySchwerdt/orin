@@ -2,39 +2,36 @@
 
 _Updated: 2026-10-13_
 
-## Current stage: self-hosting alpha
-- Self-hosted compiler (`compiler/`, Orin-B) bootstraps: Stage 0 → orin1 → orin2 → stage3,
-  `stage2.c == stage3.c`; in CI (`tools/bootstrap.sh`).
-- Default pipeline: parse → load → check → **HIR → MIR → ownership verifier → C**. The verifier
-  gates every compile (ICE exit 70 on failure); the legacy HIR → C path remains for
-  differential testing (`--legacy-codegen`, `tools/diff_backends.py`).
-- Test status (all in CI, also under ASan/UBSan): 138 default conformance tests (Stage 0 and
-  orin2), 60 `tests/next` tests (orin2), 753+ parser differential files, 875 formatter checks,
-  67 verifier unit cases, JSON/analysis/LSP unit tests, VS Code grammar tests, Lean proofs.
+## Current stage: self-hosting alpha, first public pre-release
+- Release **v0.1.0-alpha.1** (Linux x86-64, macOS arm64):
+  https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.1
+- Self-hosted compiler (`compiler/`, Orin-B source) bootstraps reproducibly (`stage2.c == stage3.c`);
+  a compiler built through the LLVM backend reproduces the same `stage3.c`.
+- Pipeline: parse → load (modules, preludes) → check → HIR → MIR → optimise (owned params, moves)
+  → independent ownership verifier (gates every compile) → C or LLVM IR.
+- CI: Linux + macOS; ~295 conformance programs (also ASan/UBSan and LLVM), parser/backend/
+  optimiser/prelude differential tests, formatter, LSP, MCP, verifier, Lean proofs, packaging.
 
-## Capability matrix (self-hosted compiler)
+## Capability matrix
 | Area | Status |
 |---|---|
-| Orin-B core (functions, records, unions, match, Option/Result/`?`, arrays, strings, modules) | done |
-| Generics (functions, records, unions, aliases; monomorphised, ADR-0007) | done |
-| Classes (ADR-0009) | in progress |
-| MIR + independent ownership verifier (docs/mir.md) | done; verifier gates compile |
-| Owned params / last-use moves / RC cancellation (ADR-0010) | in progress |
-| Formal model (Lean): RC machine safety + COW lemma | done (partial, docs/formal.md) |
-| Formal link verifier ⇒ machine safety | in progress |
-| `orin fmt`, `check --format=json` | done |
-| LSP core (pure), JSON lib, analysis facade, VS Code extension + grammar | done |
-| Live `orin lsp` (stdin), semantic index (definition/hover/references/rename) | in progress |
-| Benchmarks + runtime stats (docs/benchmarks.md) | done; Orin 1.1–2.7× C |
-| Closures, floats, maps, interfaces, annotations, MCP, LLVM backend | not started |
+| Core language, modules, Option/Result/`?`, match | done |
+| Generics (ADR-0007), classes (ADR-0009), closures + array API (ADR-0011) | done |
+| MIR + verifier + ownership optimisation (ADR-0010) | done |
+| Backends: C (default), LLVM IR (ADR-0006) | done |
+| Runtime R1: string/number std in Orin (spec 19) | done |
+| Lean: RC machine safety, COW, checker soundness for the MIR core | done (partial) |
+| Tooling: fmt, check --format=json, lsp, mcp, VS Code | done |
+| Releases (dispatch workflow, packages, seed C) | done |
+| Seed bootstrap (ADR-0014) | in progress |
+| Floats + Map<K,V> | in progress |
+| Runtime R2: platform layer with contracts | in progress |
+| Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | in progress |
+| Interfaces, annotations (spec 05), concurrency, packages, incremental analysis | not started |
+| Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
 
 ## Next milestones
-1. Classes + owned-param optimisation merged; benchmarks re-measured.
-2. Live LSP with navigation; then MCP (`orin mcp`) on the same analysis API.
-3. Closures/lambdas + std array API (`map`/`filter`/…), floats, `Map<K,V>`.
-4. Seed C file so the compiler source may use features beyond Orin-B (ADR pending).
-5. LLVM IR backend from MIR (ADR-0006).
-6. Self-hosted runtime (spec 19, ADR-0013): R1 std logic in Orin (done: split/trim/indexOf/includes/
-   startsWith/endsWith/parseInt/toString/join, see spec 19 §4 inventory) → R2 platform layer (C, closed
-   list, contracts) → R3 core dialect + object model in Orin → R4 L0 verification + L1 refinement
-   proofs against the Lean model.
+1. Seed bootstrap merged → compiler source may use generics/closures/classes.
+2. v0.1.0-alpha.2 with closures, floats, maps.
+3. Runtime R3 (core dialect, object model in Orin) and refinement proofs.
+4. Contract verification beyond pure functions; interfaces; concurrency design (spec 12 #5).
