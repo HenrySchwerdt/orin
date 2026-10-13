@@ -6,45 +6,187 @@ import { Ident } from "../syntax";
 import { Type, Local, HStmt, HExpr } from "../hir";
 import { FuncInfo, Env } from "./env";
 
+// What a visible name is bound to: the local's id and the scope level it was declared at.
+type Bind = { id: usize; level: usize; };
+// What a declaration shadowed (`prev`), so that closing its scope can restore it.
+type Shadowed = { name: string; prev: Option<Bind>; };
+
+// The open scopes' start positions never decrease and lie inside the log.
+function marksOrdered(marks: usize[], logLen: usize): bool {
+  let prev: usize = 0;
+  for (const m of marks) {
+    if (m < prev || m > logLen) {
+      return false;
+    }
+    prev = m;
+  }
+  return true;
+}
+
+// The visible local names of one function body: a stack of lexical scopes over a hash table, so a
+// lookup is O(1) however deep the nesting. `vis` maps a visible name to its binding; `log` remembers
+// what every declaration shadowed, so closing a scope restores the outer binding; `marks` holds the
+// log length at the opening of each open scope (the first one, the parameters' scope, starts at 0).
+@Invariant(marksOrdered(this.marks, this.log.length))
+@Invariant(this.vis.size <= this.log.length)
+export class Scope {
+  private vis: Map<string, Bind> = new Map<string, Bind>();
+  private log: Shadowed[] = [];
+  private marks: usize[] = [0];
+
+  // Number of open scopes.
+  depth(): usize {
+    return this.marks.length;
+  }
+
+  @Ensures(this.depth() == old(this.depth()) + 1)
+  open(): void {
+    this.marks.push(this.log.length);
+  }
+
+  // Closes the innermost scope and forgets its names; with no scope open it forgets every name.
+  @Ensures(old(this.depth()) > 0 ? this.depth() + 1 == old(this.depth()) : this.depth() == 0)
+  close(): void {
+    const k = this.marks.pop().unwrapOr(0);
+    while (this.log.length > k) {
+      const u = this.log.pop().unwrap();
+      match (u.prev) {
+        Some(b) => {
+          this.vis.set(u.name, b);
+        },
+        None => {
+          this.vis.delete(u.name);
+        },
+      }
+    }
+  }
+
+  // Binds `name` in the innermost scope; a binding of the same name (in this or an outer scope) is
+  // shadowed until this scope closes.
+  @Ensures(this.depth() == old(this.depth()))
+  @Ensures(this.lookup(name).isSome() && this.lookup(name).unwrap() == id)
+  @Ensures(this.inInnermost(name))
+  bind(name: string, id: usize): void {
+    this.log.push(Shadowed { name: name, prev: this.vis.get(name) });
+    this.vis.set(name, Bind { id: id, level: this.marks.length });
+  }
+
+  lookup(name: string): Option<usize> {
+    const b = this.vis.get(name);
+    return b.isSome() ? Some(b.unwrap().id) : None;
+  }
+
+  // True if `name` is declared in the innermost scope.
+  @Ensures(result ==> this.lookup(name).isSome())
+  inInnermost(name: string): bool {
+    const b = this.vis.get(name);
+    return b.isSome() && b.unwrap().level == this.marks.length;
+  }
+}
+
+// All distinct (no value occurs twice).
+function distinctStrings(xs: string[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (xs[i] == xs[j]) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function distinctUsizes(xs: usize[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (xs[i] == xs[j]) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The variables an arrow function captured from its enclosing functions (ADR-0011): per capture its name,
+// its type and the id of the fresh local that holds it, in the order of first use (that is the field
+// order of the closure's environment record). The three arrays are parallel, and a variable is captured
+// once: a second use finds the first capture. The arrays are read by the closure lowering; only `add`
+// may grow them.
+@Invariant(this.names.length == this.tys.length && this.names.length == this.ids.length)
+@Invariant(distinctStrings(this.names) && distinctUsizes(this.ids))
+export class Captures {
+  names: string[] = [];
+  tys: Type[] = [];
+  ids: usize[] = [];
+
+  size(): usize {
+    return this.names.length;
+  }
+
+  @Ensures(result.isSome()
+      ==> result.unwrap() < this.names.length && this.names[result.unwrap()] == name)
+  indexOf(name: string): Option<usize> {
+    return this.names.indexOf(name);
+  }
+
+  @Ensures(result == this.ids.includes(id))
+  hasId(id: usize): bool {
+    return this.ids.includes(id);
+  }
+
+  @Requires(this.indexOf(name).isNone() && !this.hasId(id))
+  @Ensures(this.size() == old(this.size()) + 1)
+  @Ensures(this.indexOf(name).isSome() && this.indexOf(name).unwrap() == this.size() - 1)
+  add(name: string, ty: Type, id: usize): void {
+    this.names.push(name);
+    this.tys.push(ty);
+    this.ids.push(id);
+  }
+}
+
 export type FnCtx = {
   unit: usize;
   ret: Type;
   locals: Local[];
-  names: string[];     // flat scope stack: visible local names ...
-  ids: usize[];        // ... and their local ids
-  marks: usize[];      // start index (into names/ids) of each open scope
-  loops: bool[];       // one flag per enclosing loop: has a `break` targeting it been seen?
-  env: Env;            // current environment: grows as generic instances are created
-  tpNames: string[];   // type parameters of the function being checked ...
-  tpTys: Type[];       // ... and their bindings (opaque types in an abstract check)
-  abs: bool;           // abstract check of a generic body: no function instances are created
-  depth: usize;        // instantiation depth of the function being checked
+  scope: Scope; // the visible local names
+  loops: bool[]; // one flag per enclosing loop: has a `break` targeting it been seen?
+  env: Env; // current environment: grows as generic instances are created
+  tpNames: string[]; // type parameters of the function being checked ...
+  tpTys: Type[]; // ... and their bindings (opaque types in an abstract check)
+  abs: bool; // abstract check of a generic body: no function instances are created
+  depth: usize; // instantiation depth of the function being checked
   // Classes (ADR-0009): FuncInfo.mode / cls of the function being checked ...
   fmode: int;
   fcls: usize;
-  lret: Type;          // the lowered return type (FuncInfo.ret); `ret` is the source-level one
+  lret: Type; // the lowered return type (FuncInfo.ret); `ret` is the source-level one
   // ... statements hoisted out of the expression being checked (mutating method calls), flushed by
   // the enclosing block before the statement that contains the expression ...
   pre: HStmt[];
-  tmps: usize;         // counter for hoisting temporaries
+  tmps: usize; // counter for hoisting temporaries
   // ... and the mutation probe: while true, bodies are only analysed for `this` mutation (no HIR is kept).
   probe: bool;
-  mutThis: bool;       // a `this` place was mutated (set by the probe)
+  mutThis: bool; // a `this` place was mutated (set by the probe)
   // Closures (ADR-0011). While an arrow function body is checked, `outer` is the context of the
   // enclosing function at the point of creation (a snapshot; never modified). A name that is not
   // a local of this function but is visible in `outer` becomes a *capture*: a fresh immutable local
   // (`capIds`) initialised from the environment record, recorded in capNames / capTys.
   outer: Option<FnCtx>;
-  capNames: string[];
-  capTys: Type[];
-  capIds: usize[];
-  qname: string;       // name of the function being checked (prefix of its lifted closures)
-  ncl: usize;          // closures created so far in this function
-  retInfer: bool;      // arrow block body without a known result type: `ret` is inferred from `return`s
+  caps: Captures;
+  qname: string; // name of the function being checked (prefix of its lifted closures)
+  ncl: usize; // closures created so far in this function
+  retInfer: bool; // arrow block body without a known result type: `ret` is inferred from `return`s
   retSeen: Option<Type>;
-  clsAcc: int;         // class whose private members are visible here (-1: none); closures inherit it
-  selfName: string;    // name of the `let` whose initialiser is being checked ("" if none)
-  pendLet: string;     // set by `let` while checking its initialiser, consumed by an arrow
+  clsAcc: int; // class whose private members are visible here (-1: none); closures inherit it
+  selfName: string; // name of the `let` whose initialiser is being checked ("" if none)
+  pendLet: string; // set by `let` while checking its initialiser, consumed by an arrow
   // Contract clauses (ADR-0012): 0 ordinary code, 1 contract expression (`@Requires`, `@Invariant`,
   // `@Decreases`), 2 `@Ensures` expression (`result`, `old(..)`), 3 inside `old(..)`; and the checked
   // expressions of the loop clauses seen so far (for the purity pass).
@@ -57,113 +199,102 @@ export type VarOut = { fx: FnCtx; id: Option<usize>; };
 export type LocalOut = { fx: FnCtx; id: usize; };
 export type LoopOut = { fx: FnCtx; broke: bool; };
 
-export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
-  let names: string[] = [];
-  let ids: usize[] = [];
-  let i: usize = 0;
-  for (const l of f.paramLocals) {
-    names.push(l.name);
-    ids.push(i);
-    i += 1;
-  }
-  const marks: usize[] = [0];
-  const loops: bool[] = [];
-  const pre: HStmt[] = [];
-  const noCapN: string[] = [];
-  const noCapT: Type[] = [];
-  const noCapI: usize[] = [];
-  const noOuter: Option<FnCtx> = None;
-  const noSeen: Option<Type> = None;
+// A context with the defaults every function starts with; the two constructors below set the rest.
+function blankCtx(
+  unit: usize,
+  qname: string,
+  env: Env,
+  locals: Local[],
+  scope: Scope,
+  ret: Type,
+): FnCtx {
   return FnCtx {
-    unit: f.unit,
-    ret: f.mode == 0 ? f.ret : f.srcRet,
-    locals: f.paramLocals,
-    names: names,
-    ids: ids,
-    marks: marks,
-    loops: loops,
+    unit: unit,
+    ret: ret,
+    locals: locals,
+    scope: scope,
+    loops: [],
     env: env,
-    tpNames: f.tpNames,
-    tpTys: f.tpTys,
-    abs: abs,
-    depth: f.depth,
-    fmode: f.mode,
-    fcls: f.cls,
-    lret: f.ret,
-    pre: pre,
+    tpNames: [],
+    tpTys: [],
+    abs: false,
+    depth: 0,
+    fmode: 0,
+    fcls: 0,
+    lret: ret,
+    pre: [],
     tmps: 0,
     probe: false,
     mutThis: false,
-    outer: noOuter,
-    capNames: noCapN,
-    capTys: noCapT,
-    capIds: noCapI,
-    qname: f.qname,
+    outer: None,
+    caps: new Captures(),
+    qname: qname,
     ncl: 0,
     retInfer: false,
-    retSeen: noSeen,
-    clsAcc: (f.mode >= 1 && f.mode <= 5) ? f.cls.toInt() : -1,
+    retSeen: None,
+    clsAcc: -1,
     selfName: "",
     pendLet: "",
     cmode: 0,
-    cexprs: []
+    cexprs: [],
   };
+}
+
+@Ensures(result.locals.length == f.paramLocals.length && result.scope.depth() == 1)
+@Ensures(result.loops.length == 0 && result.caps.size() == 0 && result.outer.isNone())
+@Ensures(paramsVisible(result, f))
+export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
+  let scope = new Scope();
+  let i: usize = 0;
+  for (const l of f.paramLocals) {
+    scope.bind(l.name, i);
+    i += 1;
+  }
+  let fx = blankCtx(f.unit, f.qname, env, f.paramLocals, scope, f.mode == 0 ? f.ret : f.srcRet);
+  fx.tpNames = f.tpNames;
+  fx.tpTys = f.tpTys;
+  fx.abs = abs;
+  fx.depth = f.depth;
+  fx.fmode = f.mode;
+  fx.fcls = f.cls;
+  fx.lret = f.ret;
+  fx.clsAcc = f.mode >= 1 && f.mode <= 5 ? f.cls.toInt() : -1;
+  return fx;
 }
 
 // The context for checking the body of an arrow function created in `o`: parameters (after the
 // environment local 0) are given by name and type. `ret` is TyVoid when it has to be inferred.
-export function newClosureCtx(o: FnCtx, qname: string, names: string[], tys: Type[], ret: Type, infer: bool): FnCtx {
+@Requires(names.length == tys.length)
+@Ensures(result.locals.length == names.length + 1
+    && result.scope.depth() == 1
+    && result.outer.isSome())
+export function newClosureCtx(
+  o: FnCtx,
+  qname: string,
+  names: string[],
+  tys: Type[],
+  ret: Type,
+  infer: bool,
+): FnCtx {
   let locals: Local[] = [Local { name: "env$", ty: TyVoid, mutable: false }];
-  let ns: string[] = [];
-  let ids: usize[] = [];
+  let scope = new Scope();
   let i: usize = 0;
   while (i < names.length) {
     locals.push(Local { name: names[i], ty: tys[i], mutable: false });
-    ns.push(names[i]);
-    ids.push(i + 1);
+    scope.bind(names[i], i + 1);
     i += 1;
   }
-  const marks: usize[] = [0];
-  const loops: bool[] = [];
-  const pre: HStmt[] = [];
-  const noCapN: string[] = [];
-  const noCapT: Type[] = [];
-  const noCapI: usize[] = [];
-  const noSeen: Option<Type> = None;
-  return FnCtx {
-    unit: o.unit,
-    ret: ret,
-    locals: locals,
-    names: ns,
-    ids: ids,
-    marks: marks,
-    loops: loops,
-    env: o.env,
-    tpNames: o.tpNames,
-    tpTys: o.tpTys,
-    abs: o.abs,
-    depth: o.depth,
-    fmode: 0,
-    fcls: 0,
-    lret: ret,
-    pre: pre,
-    tmps: 0,
-    probe: o.probe,
-    mutThis: false,
-    outer: Some(o),
-    capNames: noCapN,
-    capTys: noCapT,
-    capIds: noCapI,
-    qname: qname,
-    ncl: 0,
-    retInfer: infer,
-    retSeen: noSeen,
-    clsAcc: o.clsAcc,
-    selfName: o.pendLet,
-    pendLet: "",
-    cmode: 0,
-    cexprs: []
-  };
+  let fx = blankCtx(o.unit, qname, o.env, locals, scope, ret);
+  fx.tpNames = o.tpNames;
+  fx.tpTys = o.tpTys;
+  fx.abs = o.abs;
+  fx.depth = o.depth;
+  fx.probe = o.probe;
+  fx.outer = Some(o);
+  fx.retInfer = infer;
+  fx.clsAcc = o.clsAcc;
+  fx.selfName = o.pendLet;
+  return fx;
 }
 
 // Type of `name` as seen from `fx`: a local, a capture, or (through the chain of enclosing
@@ -173,16 +304,13 @@ export function varType(fx: FnCtx, name: string): Option<Type> {
   if (l.isSome()) {
     return Some(fx.locals[l.unwrap()].ty);
   }
-  let i: usize = 0;
-  while (i < fx.capNames.length) {
-    if (fx.capNames[i] == name) {
-      return Some(fx.capTys[i]);
-    }
-    i += 1;
+  const c = fx.caps.indexOf(name);
+  if (c.isSome()) {
+    return Some(fx.caps.tys[c.unwrap()]);
   }
   return match (fx.outer) {
     Some(o) => varType(o, name),
-    None => None
+    None => None,
   };
 }
 
@@ -192,17 +320,15 @@ export function isVisibleVar(fx: FnCtx, name: string): bool {
 
 // Resolves a variable use: a local of this function, else (inside an arrow function) a capture
 // of a variable of an enclosing function, which is registered on first use.
+@Ensures(varOutOk(fx, result))
 export function lookupVar(fx: FnCtx, name: string): VarOut {
   const l = lookupLocal(fx, name);
   if (l.isSome()) {
     return VarOut { fx: fx, id: l };
   }
-  let i: usize = 0;
-  while (i < fx.capNames.length) {
-    if (fx.capNames[i] == name) {
-      return VarOut { fx: fx, id: Some(fx.capIds[i]) };
-    }
-    i += 1;
+  const c = fx.caps.indexOf(name);
+  if (c.isSome()) {
+    return VarOut { fx: fx, id: Some(fx.caps.ids[c.unwrap()]) };
   }
   match (fx.outer) {
     Some(o) => {
@@ -212,56 +338,44 @@ export function lookupVar(fx: FnCtx, name: string): VarOut {
           let f = fx;
           const id = f.locals.length;
           f.locals.push(Local { name: name, ty: ty, mutable: false });
-          f.capNames.push(name);
-          f.capTys.push(ty);
-          f.capIds.push(id);
+          f.caps.add(name, ty, id);
           return VarOut { fx: f, id: Some(id) };
         },
-        None => {}
+        None => {},
       }
     },
-    None => {}
+    None => {},
   }
   return VarOut { fx: fx, id: None };
 }
 
+@Ensures(result ==> id < fx.locals.length)
 export function isCapturedLocal(fx: FnCtx, id: usize): bool {
-  for (const c of fx.capIds) {
-    if (c == id) {
-      return true;
-    }
-  }
-  return false;
+  return fx.caps.hasId(id);
 }
 
+@Ensures(result.scope.depth() == fx.scope.depth() + 1 && result.locals.length == fx.locals.length)
 export function pushScope(fx: FnCtx): FnCtx {
   let f = fx;
-  f.marks.push(f.names.length);
+  f.scope.open();
   return f;
 }
 
+@Requires(fx.scope.depth() > 0)
+@Ensures(result.scope.depth() + 1 == fx.scope.depth() && result.locals.length == fx.locals.length)
 export function popScope(fx: FnCtx): FnCtx {
   let f = fx;
-  const m = f.marks.pop();
-  const k = m.unwrapOr(0);
-  while (f.names.length > k) {
-    f.names.pop();
-    f.ids.pop();
-  }
+  f.scope.close();
   return f;
 }
 
+@Ensures(result.isSome() ==> result.unwrap() < fx.locals.length)
 export function lookupLocal(fx: FnCtx, name: string): Option<usize> {
-  let i = fx.names.length;
-  while (i > 0) {
-    i -= 1;
-    if (fx.names[i] == name) {
-      return Some(fx.ids[i]);
-    }
-  }
-  return None;
+  return fx.scope.lookup(name);
 }
 
+@Ensures(result.id == fx.locals.length && result.fx.locals.length == fx.locals.length + 1)
+@Ensures(result.fx.locals[result.id].name == name && result.fx.locals[result.id].mutable == mutable)
 export function newLocal(fx: FnCtx, name: string, ty: Type, mutable: bool): LocalOut {
   let f = fx;
   const id = f.locals.length;
@@ -270,34 +384,31 @@ export function newLocal(fx: FnCtx, name: string, ty: Type, mutable: bool): Loca
 }
 
 // True if `name` is already declared in the innermost scope.
+@Ensures(result ==> fx.scope.lookup(name).isSome())
 export function declaredInScope(fx: FnCtx, name: string): bool {
-  const start = fx.marks.length > 0 ? fx.marks[fx.marks.length - 1] : 0;
-  let i = fx.names.length;
-  while (i > start) {
-    i -= 1;
-    if (fx.names[i] == name) {
-      return true;
-    }
-  }
-  return false;
+  return fx.scope.inInnermost(name);
 }
 
+@Requires(id < fx.locals.length)
+@Ensures(declareOk(fx, name, id, result))
 export function declare(fx: FnCtx, name: Ident, id: usize): Result<FnCtx, Diagnostic> {
   if (declaredInScope(fx, name.name)) {
-    return Err(diag("E0304", name.span, "`" + name.name + "` is already declared in this block"));
+    return Err(diag("E0304", name.span, `\`${name.name}\` is already declared in this block`));
   }
   let f = fx;
-  f.names.push(name.name);
-  f.ids.push(id);
+  f.scope.bind(name.name, id);
   return Ok(f);
 }
 
+@Ensures(result.loops.length == fx.loops.length + 1)
 export function pushLoop(fx: FnCtx): FnCtx {
   let f = fx;
   f.loops.push(false);
   return f;
 }
 
+@Requires(fx.loops.length > 0)
+@Ensures(result.fx.loops.length + 1 == fx.loops.length)
 export function popLoop(fx: FnCtx): LoopOut {
   let f = fx;
   const b = f.loops.pop();
@@ -305,10 +416,42 @@ export function popLoop(fx: FnCtx): LoopOut {
 }
 
 // Records a `break` for the innermost loop; the caller has checked that a loop exists.
+@Requires(fx.loops.length > 0)
+@Ensures(result.loops.length == fx.loops.length && result.loops[result.loops.length - 1])
 export function markBreak(fx: FnCtx): FnCtx {
   let f = fx;
   if (f.loops.length > 0) {
     f.loops[f.loops.length - 1] = true;
   }
   return f;
+}
+
+// Every parameter of `f` is a visible name of `fx`.
+function paramsVisible(fx: FnCtx, f: FuncInfo): bool {
+  for (const l of f.paramLocals) {
+    if (fx.scope.lookup(l.name).isNone()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A variable lookup is sound: a found id is a local of the returned context, which has the locals of
+// the one it started from (a capture only appends one).
+function varOutOk(fx: FnCtx, r: VarOut): bool {
+  return r.fx.locals.length >= fx.locals.length
+      && r.fx.caps.size() >= fx.caps.size()
+      && (r.id.isNone() || r.id.unwrap() < r.fx.locals.length);
+}
+
+// A declaration leaves the context as it was, plus the name; a refusal is the duplicate error and happens
+// only when the name is already in the innermost scope.
+function declareOk(fx: FnCtx, name: Ident, id: usize, r: Result<FnCtx, Diagnostic>): bool {
+  return match (r) {
+    Ok(f) => f.scope.lookup(name.name).isSome()
+        && f.scope.lookup(name.name).unwrap() == id
+        && f.scope.depth() == fx.scope.depth()
+        && f.locals.length == fx.locals.length,
+    Err(d) => d.code == "E0304" && fx.scope.inInnermost(name.name),
+  };
 }

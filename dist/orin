@@ -5,9 +5,23 @@
 #                                         a directory containing orin.toml is a package (its entry is built)
 #   orin run <file.or|dir> [args...]      build to a temp dir and run
 #   orin test [--filter S] [--format=json] <file.or|dir>   run the @Test functions (needs a C compiler)
+#   orin --version                    print the package version
+#   orin doctor                       check the install (version, layout, C compiler, PATH); exit 1 on a problem
 #   orin <anything else>              forwarded to the compiler (check, compile, fmt, lsp, ...)
 set -e
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+# Follow symlinks (install.sh links bin/orin into other directories)
+# so that HERE is the real package root.
+resolve() { # resolve <path>: print the path with symlinks on the last component followed
+  _p=$1
+  while [ -h "$_p" ]; do
+    _d=$(dirname -- "$_p"); _l=$(readlink "$_p")
+    case $_l in /*) _p=$_l ;; *) _p=$_d/$_l ;; esac
+  done
+  printf '%s\n' "$_p"
+}
+SELF=$(resolve "$0")
+HERE=$(CDPATH= cd -- "$(dirname -- "$SELF")/.." && pwd -P)
 BIN="$HERE/libexec/orin"
 RT="$HERE/lib/orin/runtime"
 PF="$HERE/lib/orin/platform"
@@ -20,7 +34,101 @@ native() { # native <src> <exe>
   rm -rf "$tmp"
 }
 
+cc_hint() { # print how to install a C compiler on this system
+  case $(uname -s 2>/dev/null) in
+    Darwin) echo "         fix: xcode-select --install   (installs clang and the command line tools)" ;;
+    *)
+      _id=$( (. /etc/os-release 2>/dev/null && echo "${ID:-} ${ID_LIKE:-}") || true)
+      case " $_id " in
+        *" debian "*|*" ubuntu "*) echo "         fix: sudo apt-get update && sudo apt-get install -y build-essential" ;;
+        *" fedora "*|*" rhel "*|*" centos "*) echo "         fix: sudo dnf install -y gcc make" ;;
+        *" arch "*) echo "         fix: sudo pacman -S --needed base-devel" ;;
+        *" alpine "*) echo "         fix: sudo apk add build-base" ;;
+        *" suse "*|*" opensuse "*) echo "         fix: sudo zypper install gcc make" ;;
+        *) echo "         fix: install gcc or clang with your package manager, or point CC at one (CC=clang orin run ...)" ;;
+      esac ;;
+  esac
+}
+
+doctor() {
+  bad=0; warn=0
+  ok() { printf '  [ ok ] %s\n' "$1"; }
+  wn() { printf '  [warn] %s\n' "$1"; warn=$((warn + 1)); }
+  fl() { printf '  [FAIL] %s\n' "$1"; bad=$((bad + 1)); }
+  echo "orin doctor"
+
+  # version
+  if [ -s "$HERE/VERSION" ]; then ok "version: $(cat "$HERE/VERSION")"
+  else fl "version: $HERE/VERSION is missing or empty"; echo "         fix: reinstall Orin (see docs/install.md)"; fi
+
+  # install layout
+  missing=
+  [ -x "$BIN" ] || missing="$missing libexec/orin"
+  [ -f "$RT/orin_runtime.c" ] || missing="$missing lib/orin/runtime/orin_runtime.c"
+  [ -f "$PF/orin_platform.c" ] || missing="$missing lib/orin/platform/orin_platform.c"
+  if [ -n "$missing" ]; then
+    fl "install layout: missing$missing under $HERE"
+    echo "         fix: the package is incomplete; reinstall it (curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh)"
+  else ok "install layout: $HERE"; fi
+
+  # C compiler
+  set -- $CC
+  ccbin=${1:-cc}
+  if ! command -v "$ccbin" >/dev/null 2>&1; then
+    fl "C compiler: '$ccbin' not found on PATH (needed by orin build/run/test)"
+    cc_hint
+  else
+    ccv=$($CC --version 2>/dev/null | head -n 1 || true)
+    t=$(mktemp -d)
+    printf 'int main(void) { return 0; }\n' > "$t/t.c"
+    if $CC "$t/t.c" -lm -o "$t/t" >/dev/null 2>&1 && "$t/t"; then
+      ok "C compiler: $ccbin (${ccv:-version unknown})"
+    else
+      fl "C compiler: '$ccbin' exists but cannot compile and link a trivial program (with -lm)"
+      echo "         fix: check that the compiler is complete (build-essential / Xcode command line tools) or set CC to a working one"
+      cc_hint
+    fi
+    rm -rf "$t"
+  fi
+
+  # end to end: compile and run a tiny program
+  if [ "$bad" -eq 0 ]; then
+    t=$(mktemp -d)
+    printf 'function main(): void {\n  console.log("orin-doctor-ok");\n}\n' > "$t/d.or"
+    if out=$(native "$t/d.or" "$t/d" 2>&1) && [ "$("$t/d")" = "orin-doctor-ok" ]; then
+      ok "end to end: compiled and ran a test program"
+    else
+      fl "end to end: compiling and running a test program failed"
+      printf '%s\n' "$out" | head -n 8 | sed 's/^/         /'
+      echo "         fix: on Alpine/musl the release binary needs gcompat or a source build (docs/install.md)"
+    fi
+    rm -rf "$t"
+  fi
+
+  # PATH
+  selfdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  found=$(command -v orin 2>/dev/null || true)
+  if [ -z "$found" ]; then
+    wn "PATH: 'orin' is not on your PATH"
+    echo "         fix: add this to your shell profile (~/.profile, ~/.bashrc or ~/.zshrc):"
+    echo "                export PATH=\"$selfdir:\$PATH\""
+  else
+    foundhere=$(CDPATH= cd -- "$(dirname -- "$(resolve "$found")")/.." 2>/dev/null && pwd -P || true)
+    if [ "$foundhere" = "$HERE" ]; then ok "PATH: $found"
+    else
+      wn "PATH: 'orin' on your PATH ($found) is a different install than this one ($HERE)"
+      echo "         fix: put $selfdir before the other directory in PATH, or remove the other install"
+    fi
+  fi
+
+  if [ "$bad" -gt 0 ]; then echo "$bad problem(s) found."; return 1; fi
+  if [ "$warn" -gt 0 ]; then echo "OK with $warn warning(s)."; else echo "All good."; fi
+}
+
 case "${1:-}" in
+  doctor)
+    doctor || exit 1
+    ;;
   build)
     [ $# -ge 2 ] || { echo "usage: orin build <file.or|package-dir> [-o <exe>]" >&2; exit 2; }
     src=$2; out=$(basename "$src" .or)

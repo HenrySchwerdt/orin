@@ -77,6 +77,19 @@ contract that the next layer's proof assumes.
 Every std module: contract and class standard, contract-quality warnings clean, `@Test` coverage, a
 mutation kill-rate gate, OSIG effect summary in its docs.
 
+**Best known algorithm, fully specified** (project owner, 2026-10-13, binding). Provability and
+optimal algorithms do not conflict: B-trees, balanced trees, Swiss tables and DFA decoders all
+have published correctness proofs. A std module uses the best known algorithm for its job and
+states that algorithm's full invariants. If the contract tooling cannot express an invariant, the
+author must either find a formulation that works (for example arena storage with index ids and
+iterative helpers) or report the tooling gap so it gets fixed (ADR-0031 A, constraints ADR). A
+weaker algorithm is never acceptable for that reason. A simpler version may stay in the tests as
+an executable specification, with a differential or property test against the fast one.
+
+A known language gap: there are no equality, ordering or hash constraints on type parameters
+(`T extends Eq/Ord/Hash`). This forces key-specialised sets and maps. ADR-0034 adds those
+constraints before the std I/O freeze.
+
 ### 4. JSX
 
 JSX is **additive syntax** after the language freeze, so it needs its own ADR (ADR-0016 rule).

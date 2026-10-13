@@ -34,6 +34,7 @@ _Updated: 2026-10-13_
 | Fixed-width integers (`i8`..`u64`, `isize`, `usize`; 128-bit deferred, E0431) and template-literal interpolation (ADR-0022) | done |
 | Built-in annotations `@Test` (`orin test`, `std:test`), `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) | done |
 | Resources (`File`, ADR-0025): checker + verifier rules, scope API, streaming `std:fs` (unstable until capabilities) | done |
+| Compiler rewrite with the full language (ADR-0015, docs/rewrite.md): `diag` + `loader` (step 1), checker foundation `check/{env,fnctx,types}` (step 2a: Map-based symbol tables / instance indexes, `Scope` class) | in progress (rest of `check`, lower / opt / verify, backends, tooling: not started) |
 | Capabilities (ADR-0020/0021) | not started |
 | Concurrency (ADR-0017), incremental analysis | not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
@@ -45,5 +46,5 @@ See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-softwa
 ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 1. Interfaces + contract clauses phase 1 merged; OSIG/`orin graph`/`orin diff` started in parallel.
 2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), ~~resources~~ (done, ADR-0025), ~~generic classes~~ (done, ADR-0026: all language-freeze prerequisites are in; the language freeze and the compiler rewrite of ADR-0015 can start); capabilities (ADR-0021) → std I/O freeze.
-3. Compiler rewrite with the full language and MIR source spans (ADR-0015).
+3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1 and 2a done; next 2b/2c (`body.or`), then the other checker files, lower / opt / verify, backends, tooling.
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.

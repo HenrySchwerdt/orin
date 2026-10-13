@@ -13,6 +13,14 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 1. Language 1.0 core and freeze (done).
 2. Compiler rewrite under the contract and class standard, then diagnostics and CLI polish (2a).
    The refusal protocol (ADR-0029) is part of 2a.
+   **Stronger invariants (ADR-0031):** directly after rewrite 2a. This step covers:
+   - violation reports with values and blame;
+   - enforced record invariants and pure functions in contracts;
+   - static per-method proofs of class invariants;
+   - business-logic patterns: quantifiers, `sum`, conservation laws, executable specs, state
+     machines, `std:decimal` and `@Property`.
+
+   The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
    - `std:net`, `std:http`
@@ -24,6 +32,20 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      `MODEL_ONLY`;
    - all L0 functions contract-verified;
    - R3 object model in Orin, then R4 refinement proofs against the Lean machine.
+
+   **End-to-end assurance (ADR-0032)** extends this step:
+   - a Lean semantics of the source language with type soundness;
+   - per-compile translation validation of lowering, optimisation and emission, built with the
+     lowering rewrite and R3;
+   - SMT proof certificates checked by the Lean kernel, and a proof that VC generation is sound;
+   - `@Decreases` (termination) and a "no runtime errors" mode;
+   - for people:
+     - a traceable normative language reference;
+     - a per-program assurance report;
+     - decision tables as a specification form, checked for completeness and overlap;
+     - a TCB size budget enforced in CI;
+   - closing the chain to the binary: a CompCert-compatible C path, diverse double compiling
+     against the archived Stage 0, and signed `.orcert` attestations.
 5. **Concurrency** (ADR-0017), placed after R3/R4 and before the performance push:
    - *after R3*, because task heaps and the L0 thread primitives belong to the Orin core runtime.
      Built before R3, threads would be built twice, once in C and again in Orin;
@@ -35,6 +57,15 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 6. **Performance push:**
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
+   - **contract-driven optimisation** (ADR-0031 §E). Only `VERIFIED` facts remove checks or change
+     representations, for example:
+     - bounds and overflow checks;
+     - narrower integer storage;
+     - inline storage for size-bounded arrays;
+     - tag-free `Option` fields;
+     - exact-size allocation.
+
+     Check hoisting from runtime-checked `@Requires` comes earlier.
    - every optimisation is translation-validated or proved; the goal is at least on par with Go,
      measured.
 7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
@@ -86,6 +117,13 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   `@Invariant`s, stateful logic is a class (class invariants are runtime-checked, record invariants
   are not), every non-trivial function states real `@Requires`/`@Ensures`. Step 1 (loader/diag) is
   brought up to this standard in step 1b. Details: `docs/rewrite.md`.
+- **Contract gate for the compiler (planned, not implemented):** CI fails when the compiler's own
+  contracts are weak or regress: strict contract coverage on (`[contracts] strict = true`, ADR-0028;
+  today `compiler/` has 0 non-strict and 2 strict findings, both in `compiler/loader`), a minimum mutation kill rate
+  (`tools/contract_mutation.py --min-kill-rate`) per module, and no regression of `VERIFIED`
+  contracts (`orin verify --contracts` results may not turn `UNKNOWN`/`REFUTED`). **Capability gate
+  (planned):** only `loader/sources` and the output module may have `PERFORMS_IO` edges (ADR-0021 effect
+  analysis, checked by `orin diff` / `orin effects`).
 
 ### 2a. Diagnostics and CLI polish (directly after the rewrite)
 Goal (project owner, 2026-10-13): hints and CLI tooling that are a pleasure to use, built on
@@ -100,6 +138,11 @@ the rewritten, contract-checked front end.
   terminal-width-aware output (off for non-TTY, `NO_COLOR`); `--format=json` for every command;
   short timing summary; `orin new` (package scaffold), `orin fix`, `orin explain`; watch mode
   for `check`/`test`; clear exit codes (documented).
+- **Contract-quality warnings (landed in part, ADR-0028):** syntactic warnings W0450-W0452 in every
+  `check`/`compile`/LSP run, solver-based W0460-W0462 in `orin verify --contracts`, opt-in strict
+  coverage W0470/W0471 (`--strict-contracts`, `[contracts] strict`), and the mutation tool
+  `tools/contract_mutation.py`. Missing: `orin explain` pages and golden `fix` edits for them, strict
+  mode for loop invariants, and warnings from the MCP `check` tool.
 - Measured: a TS-developer task corpus (common mistakes from `docs/ts-developers.md`) where each
   mistake must produce a diagnostic with a correct, applicable suggestion.
 - **Refusal protocol for agents (ADR-0029, accepted):** every error and verification result says
@@ -196,6 +239,17 @@ What each phase delivers:
 - **Phase 8:**
   - HTTP, Postgres adapter, JSX
   - the payment/orders reference service
+
+## Distribution and developer tools
+
+| Item | Status |
+|---|---|
+| Release matrix: linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64; per-target bootstrap, smoke test, `.sha256`, combined `SHA256SUMS`; dry-run dispatch | done (`.github/workflows/release.yml`) |
+| `install.sh` (checksum-verified, `~/.orin`, uninstall), tested in CI against the packages (`tools/test_install.sh`) | done ([install.md](install.md)) |
+| `orin doctor` and `orin --version` in the wrapper | done (no compiler change) |
+| Homebrew tap | planned (dropped from the first distribution round) |
+| Native Windows (clang, PowerShell wrapper, zip, Scoop, winget, `install.ps1`) | planned, starts after capabilities Stage A ([windows.md](windows.md)) |
+| Notarised/signed macOS and Windows binaries; `.deb`/`.rpm`; musl (static Linux) builds | not planned yet |
 
 ## Next concrete steps
 1. (done) Interfaces and contract clauses merged.

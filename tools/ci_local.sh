@@ -7,6 +7,7 @@ step() { name=$1; shift; printf '%-34s ' "$name"; out=$("$@" 2>&1) || { echo FAI
 step "bootstrap (seed root)"   ./tools/bootstrap.sh
 step "all suites (sanitize)"   python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --sanitize
 step "package smoke"           ./tools/package.sh 0.0.0-ci linux-x86_64
+step "install.sh + doctor"      tools/test_install.sh build/dist/orin-0.0.0-ci-linux-x86_64.tar.gz
 step "all suites (llvm)"       python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --backend llvm
 step "diff llvm"               python3 tools/diff_backends.py --mode llvm
 step "diff builtins"           python3 tools/diff_backends.py --mode builtins
@@ -24,6 +25,7 @@ step "annotation erasure"      python3 tools/test_annotation_erasure.py --orinc 
 step "annotations, orin test"  python3 tools/test_annotations.py --orinc build/bootstrap/orin2
 step "provable std (tests+mutants)" tools/test_std.sh --mutate
 step "contract verification"   python3 tools/test_verify_contracts.py --require-z3 --orinc build/bootstrap/orin2
+step "contract strength smoke" python3 tools/contract_mutation.py examples/contract_mutation.or --orinc build/bootstrap/orin2 --max-mutants 6 --min-kill-rate 0.3
 step "platform layer"         sh -c 'tools/check_platform_boundary.sh && tools/verify_platform.sh'
 step "runtime unit tests"      sh -c 'cc -g -fsanitize=address,undefined -I runtime runtime/tests/runtime_test.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/runtime_test && build/runtime_test'
 step "mutation corpus"         python3 tools/mutate_mir.py
