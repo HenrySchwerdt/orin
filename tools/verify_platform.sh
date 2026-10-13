@@ -32,8 +32,8 @@ if ! command -v cbmc >/dev/null 2>&1; then
   exit 0
 fi
 echo "[platform] CBMC: $(cbmc --version)"
-# unwind bound: 6-element arrays, 6-digit (nondet) / 20-digit (concrete) formatting loops
-for h in harness_mem_find:24 harness_fmt_u64:8 harness_fmt_i64:8 harness_fmt_extremes:24 harness_mem:16 harness_alloc:16; do
+# unwind bound: 6-element arrays, 6-digit (nondet) / 20-digit (concrete) formatting loops, 7-character paths
+for h in harness_mem_find:24 harness_fmt_u64:8 harness_fmt_i64:8 harness_fmt_extremes:24 harness_mem:16 harness_alloc:16 harness_policy_parse:14 harness_path_normalize:20 harness_path_within:12; do
   fn=${h%%:*}; un=${h##*:}
   printf '%s ... ' "$fn"
   if cbmc platform/tests/cbmc_harness.c platform/orin_platform.c --function "$fn" \

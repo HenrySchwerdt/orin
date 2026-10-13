@@ -2,10 +2,12 @@
 #include "orin_platform.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 _Static_assert(ORIN_PLATFORM_EINVAL == EINVAL, "EINVAL value");
 _Static_assert(ORIN_PLATFORM_ENOMEM == ENOMEM, "ENOMEM value");
@@ -82,6 +84,130 @@ int64_t orin_platform_now_millis(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+/* ---------------------------------------------------------------- host policy and path scopes */
+
+/* One policy element: exact family names, plain loops (no libc) so that CBMC covers the whole function. */
+static unsigned policy_word(const char *w, size_t n) {
+    static const char *const names[] = {"fs", "process", "stdio", "clock", "net", "all"};
+    static const unsigned bits[] = {ORIN_PLATFORM_FAM_FS, ORIN_PLATFORM_FAM_PROCESS, ORIN_PLATFORM_FAM_STDIO,
+                                    ORIN_PLATFORM_FAM_CLOCK, ORIN_PLATFORM_FAM_NET, 31u};
+    for (size_t k = 0; k < 6; k++) {
+        size_t i = 0;
+        while (i < n && names[k][i] && w[i] == names[k][i]) i++;
+        if (i == n && names[k][i] == 0) return bits[k];
+    }
+    return 0;
+}
+
+int orin_platform_policy_parse(const char *spec, size_t n, unsigned *mask) {
+    *mask = 0;
+    if (n == 0) return 0;
+    unsigned m = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i == n || spec[i] == ',') {
+            unsigned b = policy_word(spec + start, i - start);
+            if (b == 0) return ORIN_PLATFORM_EINVAL;
+            m |= b;
+            start = i + 1;
+        }
+    }
+    *mask = m;
+    return 0;
+}
+
+int orin_platform_policy_load(unsigned *mask) {
+    const char *v = getenv("ORIN_DENY");
+    if (!v) {
+        *mask = 0;
+        return 0;
+    }
+    return orin_platform_policy_parse(v, strlen(v), mask);
+}
+
+int64_t orin_platform_path_normalize(const char *path, size_t plen, char *out, size_t cap) {
+    if (plen == 0 || path[0] != '/' || cap < plen + 1) return -1;
+    for (size_t i = 0; i < plen; i++)
+        if (path[i] == 0) return -1;
+    size_t len = 1; /* out[0..len-1] is the result so far; always starts with '/' */
+    out[0] = '/';
+    size_t i = 0;
+    while (i < plen) {
+        while (i < plen && path[i] == '/') i++;
+        size_t s = i;
+        while (i < plen && path[i] != '/') i++;
+        size_t n = i - s;
+        if (n == 0 || (n == 1 && path[s] == '.')) continue;
+        if (n == 2 && path[s] == '.' && path[s + 1] == '.') {
+            while (len > 1 && out[len - 1] != '/') len--; /* drop the last component ... */
+            if (len > 1) len--;                           /* ... and the '/' before it */
+            continue;
+        }
+        if (len > 1) out[len++] = '/';
+        for (size_t k = 0; k < n; k++) out[len++] = path[s + k];
+    }
+    out[len] = 0;
+    return (int64_t)len;
+}
+
+int orin_platform_path_within(const char *scope, size_t slen, const char *path, size_t plen) {
+    if (slen == 1) return 1; /* "/" contains every absolute path */
+    if (plen < slen) return 0;
+    for (size_t i = 0; i < slen; i++)
+        if (scope[i] != path[i]) return 0;
+    return plen == slen || path[slen] == '/';
+}
+
+int64_t orin_platform_path_absolute(const char *path, size_t plen, char *out, size_t cap) {
+    if (plen == 0) return -1;
+    if (path[0] == '/') return orin_platform_path_normalize(path, plen, out, cap);
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd)) return -1;
+    size_t cl = strlen(cwd);
+    char *tmp = (char *)orin_platform_alloc(cl + 1 + plen);
+    if (!tmp) return -1;
+    orin_platform_mem_copy(tmp, cwd, cl);
+    tmp[cl] = '/';
+    orin_platform_mem_copy(tmp + cl + 1, path, plen);
+    int64_t r = orin_platform_path_normalize(tmp, cl + 1 + plen, out, cap);
+    orin_platform_free(tmp);
+    return r;
+}
+
+int64_t orin_platform_path_real(const char *abs, size_t alen, char *out, size_t cap) {
+    if (alen == 0 || alen >= PATH_MAX) return -1;
+    char pre[PATH_MAX], res[PATH_MAX];
+    orin_platform_mem_copy(pre, abs, alen);
+    pre[alen] = 0;
+    size_t plen = alen; /* pre[0..plen-1] is the prefix still to be resolved; abs[plen..] the rest */
+    for (;;) {
+        if (realpath(pre, res)) break;
+        int e = errno;
+        struct stat st;
+        if (lstat(pre, &st) == 0) return -1; /* exists but cannot be resolved: a dangling link or a loop */
+        if (e != ENOENT && e != ENOTDIR) return -1;
+        while (plen > 1 && pre[plen - 1] != '/') plen--; /* drop the last component */
+        if (plen > 1) plen--;
+        pre[plen] = 0;
+    }
+    /* the rest of abs starts at abs[plen], which is a '/' (or the end) -- except when only the root is left,
+       where plen == 1 and the rest is abs[1..] without a leading '/' */
+    size_t rl = strlen(res), from = plen, rest;
+    if (plen == 1) {
+        if (rl != 1) return -1; /* realpath("/") is "/" */
+        from = 1;
+        rest = alen - 1;
+    } else {
+        rest = alen - plen;
+        if (rl == 1) rl = 0; /* the prefix resolved to "/": the rest brings its own '/' */
+    }
+    if (rl + rest + 1 > cap) return -1;
+    orin_platform_mem_copy(out, res, rl);
+    orin_platform_mem_copy(out + rl, abs + from, rest);
+    out[rl + rest] = 0;
+    return (int64_t)(rl + rest);
 }
 
 /* ---------------------------------------------------------------- floating point text */

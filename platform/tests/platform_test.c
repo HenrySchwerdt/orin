@@ -341,6 +341,97 @@ static void test_stdin(void) {
     CHECK(orin_platform_stdin_getc() == 255 && orin_platform_stdin_getc() == -1);
 }
 
+static int norm(const char *in, char *out, size_t cap) { return (int)orin_platform_path_normalize(in, strlen(in), out, cap); }
+
+static void test_policy_and_scopes(void) {
+    unsigned m = 99;
+    CHECK(orin_platform_policy_parse("", 0, &m) == 0 && m == 0);
+    CHECK(orin_platform_policy_parse("fs", 2, &m) == 0 && m == ORIN_PLATFORM_FAM_FS);
+    CHECK(orin_platform_policy_parse("fs,process", 10, &m) == 0 && m == (ORIN_PLATFORM_FAM_FS | ORIN_PLATFORM_FAM_PROCESS));
+    CHECK(orin_platform_policy_parse("stdio,clock,net", 15, &m) == 0 &&
+          m == (ORIN_PLATFORM_FAM_STDIO | ORIN_PLATFORM_FAM_CLOCK | ORIN_PLATFORM_FAM_NET));
+    CHECK(orin_platform_policy_parse("all", 3, &m) == 0 && m == 31u);
+    CHECK(orin_platform_policy_parse("fs,fs", 5, &m) == 0 && m == ORIN_PLATFORM_FAM_FS);
+    /* a typo must never silently allow: the whole policy is rejected */
+    CHECK(orin_platform_policy_parse("fss", 3, &m) == ORIN_PLATFORM_EINVAL && m == 0);
+    CHECK(orin_platform_policy_parse("fs,", 3, &m) == ORIN_PLATFORM_EINVAL && m == 0);
+    CHECK(orin_platform_policy_parse(",fs", 3, &m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_policy_parse("fs, process", 11, &m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_policy_parse("FS", 2, &m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_policy_parse("f\0s", 3, &m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_policy_parse("fs", 1, &m) == ORIN_PLATFORM_EINVAL); /* length counts, not the NUL */
+    unsetenv("ORIN_DENY");
+    CHECK(orin_platform_policy_load(&m) == 0 && m == 0);
+    setenv("ORIN_DENY", "process,net", 1);
+    CHECK(orin_platform_policy_load(&m) == 0 && m == (ORIN_PLATFORM_FAM_PROCESS | ORIN_PLATFORM_FAM_NET));
+    setenv("ORIN_DENY", "bogus", 1);
+    CHECK(orin_platform_policy_load(&m) == ORIN_PLATFORM_EINVAL && m == 0);
+    unsetenv("ORIN_DENY");
+
+    char o[64];
+    CHECK(norm("/", o, sizeof o) == 1 && strcmp(o, "/") == 0);
+    CHECK(norm("//a///b/", o, sizeof o) == 4 && strcmp(o, "/a/b") == 0);
+    CHECK(norm("/a/./b/.", o, sizeof o) == 4 && strcmp(o, "/a/b") == 0);
+    CHECK(norm("/a/b/../c", o, sizeof o) == 4 && strcmp(o, "/a/c") == 0);
+    CHECK(norm("/a/../../..", o, sizeof o) == 1 && strcmp(o, "/") == 0); /* ".." at the root is dropped */
+    CHECK(norm("/..a/b..", o, sizeof o) == 8 && strcmp(o, "/..a/b..") == 0); /* names that merely contain dots */
+    CHECK(norm("/a/b/..", o, sizeof o) == 2 && strcmp(o, "/a") == 0);
+    CHECK(norm("a/b", o, sizeof o) == -1 && norm("", o, sizeof o) == -1);
+    CHECK(norm("/abc", o, 3) == -1 && norm("/abc", o, 5) == 4); /* capacity is plen + 1 */
+    CHECK(orin_platform_path_normalize("/a\0b", 4, o, sizeof o) == -1);
+
+    CHECK(orin_platform_path_within("/", 1, "/etc/passwd", 11) == 1);
+    CHECK(orin_platform_path_within("/a/b", 4, "/a/b", 4) == 1);
+    CHECK(orin_platform_path_within("/a/b", 4, "/a/b/c", 6) == 1);
+    CHECK(orin_platform_path_within("/a/b", 4, "/a/bc", 5) == 0); /* component boundary */
+    CHECK(orin_platform_path_within("/a/b", 4, "/a", 2) == 0);
+    CHECK(orin_platform_path_within("/a/b", 4, "/x/a/b", 6) == 0);
+
+    /* absolute: relative paths resolve against the working directory */
+    char cwd[PATH_MAX], a[PATH_MAX + 64];
+    CHECK(getcwd(cwd, sizeof cwd) != NULL);
+    CHECK(orin_platform_path_absolute("x/../y", 6, a, sizeof a) > 0);
+    char want[PATH_MAX + 64];
+    snprintf(want, sizeof want, "%s/y", strcmp(cwd, "/") == 0 ? "" : cwd);
+    CHECK(strcmp(a, want) == 0);
+    CHECK(orin_platform_path_absolute("/p/./q", 6, a, sizeof a) == 4 && strcmp(a, "/p/q") == 0);
+    CHECK(orin_platform_path_absolute("", 0, a, sizeof a) == -1);
+    CHECK(orin_platform_path_absolute("y", 1, a, 2) == -1); /* buffer too small */
+
+    /* real: symbolic links in the existing prefix are resolved, the non-existing rest is kept */
+    char root[PATH_MAX], r[PATH_MAX + 64], q[PATH_MAX + 64];
+    CHECK(realpath(tmpdir, root) != NULL); /* the temp dir itself may be below a link (macOS /tmp) */
+    mkdir(P("rd"), 0700);
+    mkdir(P("rd/in"), 0700);
+    mkdir(P("outside"), 0700);
+    FILE *f = fopen(P("outside/secret.txt"), "wb");
+    fputs("s", f);
+    fclose(f);
+    CHECK(symlink(P("outside"), P("rd/in/escape")) == 0);          /* link to a directory outside */
+    CHECK(symlink(P("outside/secret.txt"), P("rd/in/flink")) == 0); /* link to a file outside */
+    CHECK(symlink(P("outside/nothing_here"), P("rd/in/dangling")) == 0);
+    CHECK(symlink("in", P("rd/loop1")) == 0);
+    snprintf(q, sizeof q, "%s/rd/in/new/deeper.txt", root);
+    CHECK(orin_platform_path_real(q, strlen(q), r, sizeof r) > 0 && strcmp(r, q) == 0); /* nothing to resolve */
+    snprintf(q, sizeof q, "%s/rd/in/escape/secret.txt", root);
+    snprintf(want, sizeof want, "%s/outside/secret.txt", root);
+    CHECK(orin_platform_path_real(q, strlen(q), r, sizeof r) > 0 && strcmp(r, want) == 0);
+    snprintf(q, sizeof q, "%s/rd/in/escape/not_yet.txt", root);
+    snprintf(want, sizeof want, "%s/outside/not_yet.txt", root);
+    CHECK(orin_platform_path_real(q, strlen(q), r, sizeof r) > 0 && strcmp(r, want) == 0); /* new file below a link */
+    snprintf(q, sizeof q, "%s/rd/in/flink", root);
+    snprintf(want, sizeof want, "%s/outside/secret.txt", root);
+    CHECK(orin_platform_path_real(q, strlen(q), r, sizeof r) > 0 && strcmp(r, want) == 0);
+    snprintf(q, sizeof q, "%s/rd/in/dangling", root); /* creating through a dangling link would escape */
+    CHECK(orin_platform_path_real(q, strlen(q), r, sizeof r) == -1);
+    snprintf(q, sizeof q, "%s/rd/loop1/new.txt", root); /* a link inside the tree stays inside */
+    snprintf(want, sizeof want, "%s/rd/in/new.txt", root);
+    CHECK(orin_platform_path_real(q, strlen(q), r, sizeof r) > 0 && strcmp(r, want) == 0);
+    CHECK(orin_platform_path_real("/", 1, r, sizeof r) == 1 && strcmp(r, "/") == 0);
+    CHECK(orin_platform_path_real("/orin_no_such_dir_xyz/a", 23, r, sizeof r) == 23 && strcmp(r, "/orin_no_such_dir_xyz/a") == 0);
+    CHECK(orin_platform_path_real(root, strlen(root), r, 3) == -1); /* buffer too small */
+}
+
 int main(void) {
     snprintf(tmpdir, sizeof tmpdir, "/tmp/orin_platform_test_%d", (int)getpid());
     mkdir(tmpdir, 0700);
@@ -351,6 +442,7 @@ int main(void) {
     test_streams();
     test_process_and_output();
     test_stdin();
+    test_policy_and_scopes();
     char cmd[300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);
     if (system(cmd)) {}
