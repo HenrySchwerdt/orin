@@ -1,11 +1,12 @@
-# MIR and the OIM ownership verifier (v1.2)
+# MIR and the OIM ownership verifier (v1.3)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
 checker of its ownership discipline. It is deliberately small and does not trust the lowering.
 
 Changelog: v1.1 Unique-demotion across calls; v1.2 (ADR-0010) per-parameter modes
-(`MFunction.paramOwned`) and consuming call operands, produced by the optimiser `compiler/opt`.
+(`MFunction.paramOwned`) and consuming call operands, produced by the optimiser `compiler/opt`;
+v1.3 (ADR-0011) closures: `IClosure` and `ICallIndirect`.
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -59,6 +60,17 @@ hole slot when reading that slot.
   to holes(x); invalidates `Borrowed(x)` locals.
 - `IPutField(x, i, s)` / `IArrayPut(x, i, s)`: x Unique, i ∈ holes(x), s Owned/Unique → s Dead,
   i removed from holes.
+- `IClosure(d, f, caps)` (v1.3): the captured values are consumed exactly like the slots of
+  `IStructNew` (Owned/Unique local → Dead, `OStr` allowed, Borrowed/Param is an **error**; scalars are
+  read); d Unique. `f` must be a function whose first parameter is a reference (the environment record
+  holding the captures, in order) and whose parameters are **all borrowed** (wf error otherwise; the
+  optimiser never makes the parameters of an `IClosure` target owned). Runtime layout: a closure is a
+  struct `{ code pointer (scalar slot 0), environment (reference slot 1) }`.
+- `ICallIndirect(d, c, args)` (v1.3): the callee `c` (a reference local holding a closure) and all `args`
+  are **borrowed** for the call (read, any live state); the callee is invoked as `f(env, args..)`; the
+  result d is Owned (references) or initialised (scalars). As for `ICall`, a `Unique` operand is demoted
+  to `Owned` when the call has a reference result. MIR has no signature for indirect calls, so only
+  operand classes are checked (callee must be a reference local); the checker guarantees the types.
 - `IMakeUnique(x)`: x Owned/Unique → Unique; invalidates `Borrowed(x)` locals (the object may be
   replaced).
 - `IArrayPush(x, v)` / `IArrayPop(d, x)`: x Owned/Unique (→ Owned: the runtime may reallocate);

@@ -15,7 +15,7 @@
 //   EXP     := export | local
 //   RET     := TYPE | -                       (- = no annotation)
 //   TBODY   := (dalias TYPE) | (drecord (field NAME TYPE)*) | (dunion (variant NAME TYPE*)*)
-//   TYPE    := NAME | (app NAME TYPE+) | (array TYPE)       e.g. Result<int, string[]> =
+//   TYPE    := NAME | (app NAME TYPE+) | (array TYPE) | (fn (p NAME TYPE)* TYPE)   e.g. Result<int, string[]> =
 //                                                           (app Result int (array string))
 //   BLOCK   := (block STMTLINE*)   each statement on its own line, indented 2 spaces deeper
 //              than the line holding the enclosing construct; ")" ends the last line.
@@ -32,6 +32,7 @@
 //            | (cond@S EXPR EXPR EXPR) | (arr@S EXPR*)
 //            | (record@S NAME SPREAD (field NAME EXPR)*)   SPREAD := - | EXPR
 //            | (new@S NAME [TYPE*] EXPR*) | (this@S)
+//            | (arrow@S (p NAME TYPE_OR_DASH)* RET EXPR_OR_BLOCK)       (beyond Orin-B, ADR-0011)
 //            | (match@S EXPR ARMLINE*)  each arm on its own line, indented 2 deeper:
 //                  (arm PAT EXPR_OR_BLOCK)
 //   PAT     := _ | (pident NAME) | (pvariant NAME PAT*) | (pint N) | (pstr "escaped") | (pbool B)
@@ -50,7 +51,8 @@ import {
   Ident, Module, Item, ImportDecl, FunctionDecl, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl,
   TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp, BinaryOp,
-  ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember, CtorParam, Param
+  ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember, CtorParam, Param,
+  FnTyParam, ArrowParam, ArrowBody
 } from "../syntax";
 import { Span } from "../diag";
 
@@ -248,8 +250,17 @@ function dumpConst(c: ConstDecl): string {
 function dumpType(t: TypeExpr): string {
   return match (t.kind) {
     TNamed(id, args) => dumpNamed(id, args),
-    TArray(el) => "(array " + dumpType(el) + ")"
+    TArray(el) => "(array " + dumpType(el) + ")",
+    TFn(ps, ret) => dumpFnType(ps, ret)
   };
+}
+
+function dumpFnType(ps: FnTyParam[], ret: TypeExpr): string {
+  let parts: string[] = [];
+  for (const p of ps) {
+    parts.push("(p " + p.name.name + " " + dumpType(p.ty) + ")");
+  }
+  return "(fn" + joinTail(parts) + " " + dumpType(ret) + ")";
 }
 
 function dumpNamed(id: Ident, args: TypeExpr[]): string {
@@ -406,8 +417,21 @@ function dumpExpr(e: Expr, ind: string): string {
     ERecordT(id, targs, spread, fields) => dumpRecord(sp, id, spread, fields, ind) + " ; " + typesStr(targs),
     EMatch(scrut, arms) => dumpMatch(sp, scrut, arms, ind),
     ENew(id, targs, args) => "(new" + sp + " " + id.name + " " + typesStr(targs) + exprsTail(args, ind) + ")",
-    EThis => "(this" + sp + ")"
+    EThis => "(this" + sp + ")",
+    EArrow(ps, ret, body) => dumpArrow(sp, ps, ret, body, ind)
   };
+}
+
+function dumpArrow(sp: string, ps: ArrowParam[], ret: Option<TypeExpr>, body: ArrowBody, ind: string): string {
+  let parts: string[] = [];
+  for (const p of ps) {
+    parts.push("(p " + p.name.name + " " + optType(p.ty) + ")");
+  }
+  const b = match (body) {
+    AExpr(e) => dumpExpr(e, ind),
+    ABlock(blk) => dumpBlock(blk, ind)
+  };
+  return "(arrow" + sp + joinTail(parts) + " " + optType(ret) + " " + b + ")";
 }
 
 function dumpRecord(sp: string, id: Ident, spread: Option<Expr>, fields: FieldInit[], ind: string): string {

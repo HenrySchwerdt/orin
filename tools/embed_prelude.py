@@ -21,6 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # (source dir, unit prefix, generated file, exported function)
 PRELUDES = [
     ("std", "$std", "compiler/loader/embedded_std.or", "embeddedStdFiles"),
+    ("array", "$array", "compiler/loader/embedded_array.or", "embeddedArrayFiles"),
 ]
 
 

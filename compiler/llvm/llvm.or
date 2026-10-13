@@ -614,6 +614,57 @@ function structNewI(fx: Fx, p: string, d: usize, tag: usize, slots: Operand[]): 
   return s + st(fx, d, n);
 }
 
+// Closure (docs/mir.md v1.3): struct { code pointer (scalar slot 0), environment (reference slot 1) }; the
+// environment is a struct of the captured values (the nullary singleton when nothing is captured).
+function closureI(fx: Fx, p: string, d: usize, f: usize, caps: Operand[]): string {
+  let s = loadsOf(fx, p, caps);
+  let env = p + "e";
+  if (caps.length > 0) {
+    s += "  " + env + " = call ptr @orin_struct_new(i32 0, i32 " + u(caps.length) + ", i64 " + u(maskOf(fx, caps)) + ")\n";
+    let k: usize = 0;
+    while (k < caps.length) {
+      s += slotGep(p + "g" + u(k), env, k);
+      s += "  store " + targ(fx, p, k, caps[k]) + ", ptr " + p + "g" + u(k) + "\n";
+      k += 1;
+    }
+  } else {
+    s += "  " + env + " = call ptr @orin_nullary(i32 0)\n";
+  }
+  const n = p + "n";
+  s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+  s += slotGep(p + "c0", n, 0) + "  store ptr @" + fx.names[f] + ", ptr " + p + "c0\n";
+  s += slotGep(p + "c1", n, 1) + "  store ptr " + env + ", ptr " + p + "c1\n";
+  return s + st(fx, d, n);
+}
+
+// Call through a closure: load code pointer and environment, call with the environment first.
+function callIndirectI(fx: Fx, p: string, d: Option<usize>, f: Operand, args: Operand[]): string {
+  let s = ld(fx, p, 0, f);
+  let all: string[] = [];
+  let k: usize = 0;
+  while (k < args.length) {
+    s += ld(fx, p, k + 1, args[k]);
+    all.push(targ(fx, p, k + 1, args[k]));
+    k += 1;
+  }
+  const cv = ov(p, 0, f);
+  s += slotGep(p + "c0", cv, 0) + "  " + p + "fp = load ptr, ptr " + p + "c0\n";
+  s += slotGep(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+  const rt = match (d) {
+    Some(x) => lty(fx.f.locals[x].ty),
+    None => "void"
+  };
+  let argl = "ptr " + p + "ev";
+  if (all.length > 0) {
+    argl += ", " + all.join(", ");
+  }
+  const call = "call " + rt + " " + p + "fp(" + argl + ")\n";
+  return s + match (d) {
+    Some(x) => "  " + p + "r = " + call + st(fx, x, p + "r"),
+    None => "  " + call
+  };
+}
+
 function arrayNewI(fx: Fx, p: string, d: usize, isRef: bool, es: Operand[]): string {
   let s = loadsOf(fx, p, es);
   const n = p + "n";
@@ -676,7 +727,9 @@ function instrI(fx: Fx, p: string, i: Instr): string {
       + "  " + p + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n"
       + "  call void @orinl_array_push(ptr " + p + "u, i64 " + slotVal(fx, p, 1, v) + ")\n" + st(fx, x, p + "u"),
     IArrayPop(d, x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n"
-      + st(fx, x, p + "u") + "  " + p + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + st(fx, d, p + "r")
+      + st(fx, x, p + "u") + "  " + p + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + st(fx, d, p + "r"),
+    IClosure(d, f, caps) => closureI(fx, p, d, f, caps),
+    ICallIndirect(d, f, args) => callIndirectI(fx, p, d, f, args)
   };
 }
 

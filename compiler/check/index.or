@@ -20,7 +20,7 @@
 import { Span, SourceMap } from "../diag";
 import {
   Ident, Item, FunctionDecl, TypeDecl, ConstDecl, TypeExpr, Param, Block, Stmt, Expr, FieldInit, MatchArm,
-  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam
+  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, ArrowBody
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
@@ -101,7 +101,20 @@ function renderTE(t: TypeExpr): string {
       }
       return id.name + "<" + parts.join(", ") + ">";
     },
-    TArray(e) => renderTE(e) + "[]"
+    TArray(e) => {
+      const inner = renderTE(e);
+      return match (e.kind) {
+        TFn(_, _) => "(" + inner + ")[]",
+        _ => inner + "[]"
+      };
+    },
+    TFn(ps, ret) => {
+      let parts: string[] = [];
+      for (const p of ps) {
+        parts.push(p.name.name + ": " + renderTE(p.ty));
+      }
+      return "(" + parts.join(", ") + ") => " + renderTE(ret);
+    }
   };
 }
 
@@ -158,7 +171,14 @@ function renderTy(p: Program, t: Type): string {
     TyOption(e) => "Option<" + renderTy(p, e) + ">",
     TyResult(a, b) => "Result<" + renderTy(p, a) + ", " + renderTy(p, b) + ">",
     TyRecord(r) => r < p.records.length ? shortName(p.records[r].name) : "?",
-    TyUnion(u) => u < p.unions.length ? shortName(p.unions[u].name) : "?"
+    TyUnion(u) => u < p.unions.length ? shortName(p.unions[u].name) : "?",
+    TyFn(ps, r) => {
+      let parts: string[] = [];
+      for (const t of ps) {
+        parts.push(renderTy(p, t));
+      }
+      return "(" + parts.join(", ") + ") => " + renderTy(p, r);
+    }
   };
 }
 
@@ -639,7 +659,13 @@ function typeRefs(w: W, c: Ctx, te: TypeExpr): W {
         x = typeRefs(x, c, a);
       }
     },
-    TArray(e) => { x = typeRefs(x, c, e); }
+    TArray(e) => { x = typeRefs(x, c, e); },
+    TFn(ps, ret) => {
+      for (const p of ps) {
+        x = typeRefs(x, c, p.ty);
+      }
+      x = typeRefs(x, c, ret);
+    }
   }
   return x;
 }
@@ -769,6 +795,32 @@ function walkExpr(w: W, c: Ctx, e: Expr): W {
       for (const a of arms) {
         x = walkArm(x, c, a);
       }
+    },
+    EArrow(ps, rte, body) => {
+      // The arrow's parameters and locals belong to a lifted HIR function, not to the enclosing one:
+      // walk it with its own (empty) HIR local table so the enclosing function's cursor is untouched.
+      const sHl = x.hl;
+      const sTy = x.hlTy;
+      const sK = x.hk;
+      const noNames: string[] = [];
+      const noTys: Type[] = [];
+      x.hl = noNames;
+      x.hlTy = noTys;
+      x.hk = 0;
+      x = pushScope(x);
+      for (const p of ps) {
+        x = optTypeRefs(x, c, p.ty);
+        x = declare(x, c, p.name, p.span, SkParam, "(parameter)", p.ty);
+      }
+      x = optTypeRefs(x, c, rte);
+      match (body) {
+        AExpr(b) => { x = walkExpr(x, c, b); },
+        ABlock(b) => { x = walkBlock(x, c, b); }
+      }
+      x = popScope(x);
+      x.hl = sHl;
+      x.hlTy = sTy;
+      x.hk = sK;
     },
     _ => {}
   }
@@ -1186,7 +1238,7 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
           if (rid < p.records.length && rid < c.recDef.length && fi < p.records[rid].fields.length) {
             const name = p.records[rid].fields[fi].name;
             const sp = e.span;
-            if (sp.end >= name.length && sp.end - name.length >= sp.start) {
+            if (sp.file < c.sm.files.length && sp.end >= name.length && sp.end - name.length >= sp.start) {
               const start = sp.end - name.length;
               const text = c.sm.files[sp.file].text;
               if (sp.end <= text.length && text.substring(start, sp.end) == name) {
@@ -1236,6 +1288,11 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
           None => {}
         }
       }
+    },
+    XClosure(_, caps) => { x = hExprs(x, c, caps, ty); },
+    XCallIndirect(f, args) => {
+      x = hExpr(x, c, f, ty);
+      x = hExprs(x, c, args, ty);
     },
     _ => {}
   }
@@ -1521,7 +1578,8 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
   match (hir) {
     Some(h) => {
       while (hn < h.functions.length) {
-        w = hBlock(w, c, h.functions[hn].body, false);
+        // Lifted closure bodies (arrow functions, ADR-0011) also contribute expression types.
+        w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
         hn += 1;
       }
     },
