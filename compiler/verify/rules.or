@@ -177,7 +177,7 @@ function needOwned(cx: Cx, l: usize, what: string): Cx {
     return readWhole(cx, l);
   }
   if (k == KParam) {
-    return err(cx, what + " of parameter " + nm(cx, l) + " (parameters are borrowed for the whole call)");
+    return err(cx, what + " of parameter " + nm(cx, l) + " (borrowed parameters are borrowed for the whole call)");
   }
   if (k == KBorrowed) {
     return err(cx, what + " of borrowed " + nm(cx, l));
@@ -300,13 +300,57 @@ function readAll(cx: Cx, os: Operand[]): Cx {
 // ICall / IBuiltin: arguments are borrowed for the call; the result is Owned. A reference
 // result may alias an argument, so a Unique argument is demoted (docs/mir.md notes).
 function call(cx: Cx, dst: Option<usize>, args: Operand[]): Cx {
+  return callOwned(cx, dst, args, []);
+}
+
+// v1.2: `owned[i]` (when i < owned.length) marks an operand in an owned-parameter position: it is
+// consumed (Owned/Unique/Imm -> Dead, OStr allowed; Borrowed/Param is an error). Borrowed
+// positions may not alias a consumed operand (the callee could release it while reading the
+// alias). Unique-demotion applies to borrowed positions only.
+function callOwned(cx: Cx, dst: Option<usize>, args: Operand[], owned: bool[]): Cx {
   let c = readAll(cx, args);
+  let i: usize = 0;
+  while (i < args.length) {
+    if (i < owned.length && owned[i]) {
+      match (args[i]) {
+        OLocal(x) => {
+          let j: usize = 0;
+          while (j < args.length) {
+            if (j != i && !(j < owned.length && owned[j])) {
+              match (args[j]) {
+                OLocal(y) => {
+                  if (y == x || (kindOf(c, y) == KBorrowed && c.st.ls[y].src == x)) {
+                    c = err(c, "borrowed argument " + nm(c, y) + " aliases consumed argument " + nm(c, x));
+                  }
+                },
+                _ => {}
+              }
+            }
+            j += 1;
+          }
+        },
+        _ => {}
+      }
+    }
+    i += 1;
+  }
+  i = 0;
+  while (i < args.length) {
+    if (i < owned.length && owned[i]) {
+      c = consume(c, args[i]);
+    }
+    i += 1;
+  }
   return match (dst) {
     None => c,
     Some(d) => {
       if (isRefLocal(c, d)) {
-        for (const a of args) {
-          c = demoteOp(c, a);
+        i = 0;
+        while (i < args.length) {
+          if (!(i < owned.length && owned[i])) {
+            c = demoteOp(c, args[i]);
+          }
+          i += 1;
         }
       }
       return defResult(c, d);
@@ -403,8 +447,8 @@ export function step(cx: Cx, ins: Instr): Cx {
     IBinary(d, _, a, b) => {
       return def(readOp(readOp(cx, a), b), d, KInit, 0);
     },
-    ICall(dst, _, args) => {
-      return call(cx, dst, args);
+    ICall(dst, fi, args) => {
+      return callOwned(cx, dst, args, cx.prog.functions[fi].paramOwned);
     },
     IBuiltin(dst, _, args) => {
       return call(cx, dst, args);
