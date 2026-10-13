@@ -1,20 +1,30 @@
 name: release
 
+# Tag push (v*): build all four targets and publish a GitHub pre-release.
+# Manual run: same build; with dry_run (the default) nothing is published, the packages stay as
+# workflow artifacts. Untick dry_run to publish release v<version> from the selected ref.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release without the leading v (e.g. 0.1.0-alpha.1)"
+        description: "Version without the leading v (e.g. 0.1.0-alpha.3). For a dry run any valid version works."
         required: true
+        default: "0.0.0-dryrun"
+      dry_run:
+        description: "Dry run: build, package, test and render everything, but do not publish a release"
+        type: boolean
+        default: true
 
 env:
   # Tag name for both triggers: the pushed tag, or "v" + the requested version.
   TAG: ${{ github.event_name == 'push' && github.ref_name || format('v{0}', inputs.version) }}
+  # "true" for a manual dry run; a tag push always publishes.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   package:
@@ -24,36 +34,85 @@ jobs:
         include:
           - os: ubuntu-latest
             plat: linux-x86_64
+          - os: ubuntu-24.04-arm
+            plat: linux-aarch64
           - os: macos-14
             plat: macos-arm64
+          # Intel macOS. macos-13 (the first Intel image used here) was retired by GitHub in Dec 2025;
+          # macos-15-intel is its successor and itself has an announced end of life (Aug 2027).
+          - os: macos-15-intel
+            plat: macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check the version
+        run: |
+          printf '%s' "${TAG#v}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$' || { echo "bad version '$TAG' (want v<major>.<minor>.<patch>[-suffix])" >&2; exit 1; }
       - name: Bootstrap (seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance)
         run: ./tools/bootstrap.sh
       - name: Full conformance suite with the self-hosted compiler
         run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all
-      - name: Package
+      - name: Package (includes the hello and @Test smoke test, writes the .sha256)
         run: ./tools/package.sh "${TAG#v}" "${{ matrix.plat }}"
+      - name: Install the package with install.sh and run orin doctor
+        run: ./tools/test_install.sh "build/dist/orin-${TAG#v}-${{ matrix.plat }}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: orin-${{ matrix.plat }}
-          path: build/dist/*.tar.gz
+          path: |
+            build/dist/*.tar.gz
+            build/dist/*.tar.gz.sha256
+          if-no-files-found: error
 
-  publish:
+  # Combines the four packages: SHA256SUMS, an install.sh run against the real combined checksums.
+  # Publishes the GitHub pre-release unless this is a dry run.
+  release:
     needs: package
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          pattern: orin-*
           path: dist
           merge-multiple: true
+      - name: Combine checksums (SHA256SUMS) and verify
+        run: |
+          ver="${TAG#v}"
+          cd dist
+          for p in linux-x86_64 linux-aarch64 macos-arm64 macos-x86_64; do
+            test -f "orin-$ver-$p.tar.gz" || { echo "missing package for $p" >&2; exit 1; }
+            test -f "orin-$ver-$p.tar.gz.sha256" || { echo "missing checksum for $p" >&2; exit 1; }
+          done
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+      - name: install.sh against the combined release files (local file:// release)
+        run: |
+          ver="${TAG#v}"
+          mkdir -p "rel/$TAG"
+          cp dist/*.tar.gz dist/SHA256SUMS "rel/$TAG/"
+          export ORIN_HOME="$RUNNER_TEMP/orin-home" ORIN_BIN_DIR="$RUNNER_TEMP/orin-bin"
+          ORIN_BASE_URL="file://$PWD/rel" ORIN_VERSION="$ver" sh install.sh
+          test "$("$ORIN_BIN_DIR/orin" --version)" = "$ver"
+          "$ORIN_BIN_DIR/orin" doctor
+          sh install.sh --uninstall
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
       - name: Create GitHub pre-release
+        if: env.DRY_RUN != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
-          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 dist/SHA256SUMS \
             --target "$GITHUB_SHA" --prerelease --title "Orin $TAG (experimental)" \
             --notes-file CHANGELOG.md
+      - name: Dry run summary
+        if: env.DRY_RUN == 'true'
+        run: |
+          echo "Dry run, nothing published. Packages and SHA256SUMS are in the workflow artifacts." | tee -a "$GITHUB_STEP_SUMMARY"
