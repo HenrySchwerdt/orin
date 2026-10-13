@@ -37,7 +37,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - LLVM tuning and a parallel compiler;
    - every optimisation is translation-validated or proved; the goal is at least on par with Go,
      measured.
-7. Flagship: TypeScript tooling in Orin (3a).
+7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
 
 ### 1. Language 1.0 core (ADR-0016), then a two-stage freeze
 - **done:**
@@ -102,7 +102,7 @@ the rewritten, contract-checked front end.
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
 primitives.
 
-### 3a. Flagship: TypeScript tooling in Orin (after concurrency)
+### 3a. Flagship: TypeScript tooling in Orin (deferred until a GitHub organisation exists)
 Goal (project owner, 2026-10-13): show that Orin is the natural language for TypeScript tooling —
 TS-familiar syntax for the community, native speed **at least on par with Go**, measured, not claimed.
 1. **Benchmark target first:** Orin formatter/parser on a large TS-like corpus vs a Go parser
