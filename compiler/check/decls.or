@@ -1,0 +1,280 @@
+// Phase 2: resolution of declarations (aliases, record fields, variant payloads, constants,
+// function signatures) and the `main` check. Port of `resolve_decls`, `resolve_const`,
+// `check_main` and `resolve_type` from bootstrap/src/checker/mod.rs.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Ident, TypeExpr, EInt, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
+import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
+import {
+  Env, RecordSrc, UnionSrc, FuncInfo, ConstInfo, ConstLit, LitInt, LitStr, LitBool, typeEq, isVoid, showType
+} from "./env";
+import { CYCLE_MSG, TyOut, aliasType, resolveType, plainScope } from "./types";
+
+// Resolves a type annotation that cannot involve generics' state (top-level const types).
+function resolveTypeTop(env: Env, unit: usize, te: TypeExpr, voidOk: bool): Result<Type, Diagnostic> {
+  const r = resolveType(env, plainScope(unit), te, voidOk)?;
+  return Ok(r.ty);
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+type LitInfo = { lit: ConstLit; ty: Type; neg: bool; };
+
+function constLit(e: Expr): Option<LitInfo> {
+  return match (e.kind) {
+    EInt(n) => Some(LitInfo { lit: LitInt(n), ty: TyInt, neg: false }),
+    EStr(s) => Some(LitInfo { lit: LitStr(s), ty: TyString, neg: false }),
+    EBool(b) => Some(LitInfo { lit: LitBool(b), ty: TyBool, neg: false }),
+    EUnary(op, inner) => match (op) {
+      UNeg => match (inner.kind) {
+        EInt(n) => Some(LitInfo { lit: LitInt(-n), ty: TyInt, neg: true }),
+        _ => None
+      },
+      _ => None
+    },
+    _ => None
+  };
+}
+
+function resolveConst(env: Env, c: ConstInfo): Result<ConstInfo, Diagnostic> {
+  const vspan = c.decl.value.span;
+  const li = match (constLit(c.decl.value)) {
+    Some(x) => x,
+    None => {
+      return Err(diag("E0408", vspan, "top-level const initializer must be a literal"));
+    }
+  };
+  let ty = li.ty;
+  match (c.decl.ty) {
+    Some(te) => {
+      ty = resolveTypeTop(env, c.unit, te, false)?;
+    },
+    None => {}
+  }
+  let ok = typeEq(li.ty, ty);
+  if (isIntLike(li.ty) && isUsizeTy(ty)) {
+    if (li.neg) {
+      return Err(diag("E0400", vspan, "negative integer literal cannot have type `usize`"));
+    }
+    ok = true;
+  }
+  if (!ok) {
+    return Err(diag("E0400", vspan, "expected `" + showType(env, ty) + "`, found `" + showType(env, li.ty) + "`"));
+  }
+  return Ok(ConstInfo { unit: c.unit, decl: c.decl, ty: ty, lit: li.lit });
+}
+
+function isIntLike(t: Type): bool {
+  return match (t) { TyInt => true, _ => false };
+}
+
+function isUsizeTy(t: Type): bool {
+  return match (t) { TyUsize => true, _ => false };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 driver
+// ---------------------------------------------------------------------------
+
+export type Resolved = { env: Env; diags: Diagnostic[]; };
+
+function hasCycleDiag(ds: Diagnostic[]): bool {
+  for (const d of ds) {
+    if (d.message == CYCLE_MSG) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function resolveFunc(env: Env, f: FuncInfo, diags: Diagnostic[]): FuncResolved {
+  let ds = diags;
+  let cur = env;
+  let params: Type[] = [];
+  let locals: Local[] = [];
+  const sc = plainScope(f.unit);
+  for (const p of f.decl.params) {
+    let dup = false;
+    for (const l of locals) {
+      if (l.name == p.name.name) {
+        dup = true;
+      }
+    }
+    if (dup) {
+      ds.push(diag("E0304", p.name.span, "duplicate parameter `" + p.name.name + "`"));
+    }
+    match (resolveType(cur, sc, p.ty, false)) {
+      Ok(r) => {
+        cur = r.env;
+        locals.push(Local { name: p.name.name, ty: r.ty, mutable: false });
+        params.push(r.ty);
+      },
+      Err(d) => { ds.push(d); }
+    }
+  }
+  let ret: Type = TyVoid;
+  match (f.decl.ret) {
+    Some(te) => {
+      match (resolveType(cur, sc, te, true)) {
+        Ok(r) => {
+          cur = r.env;
+          ret = r.ty;
+        },
+        Err(d) => { ds.push(d); }
+      }
+    },
+    None => {}
+  }
+  const nf = FuncInfo {
+    unit: f.unit,
+    qname: f.qname,
+    decl: f.decl,
+    params: params,
+    paramLocals: locals,
+    ret: ret,
+    tpNames: f.tpNames,
+    tpTys: f.tpTys,
+    depth: f.depth
+  };
+  return FuncResolved { env: cur, func: nf, diags: ds };
+}
+
+type FuncResolved = { env: Env; func: FuncInfo; diags: Diagnostic[]; };
+
+export function findMain(env: Env): Option<usize> {
+  let i: usize = 0;
+  for (const f of env.funcs) {
+    if (f.unit == env.entry && f.decl.name.name == "main") {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+export function resolveDecls(env0: Env, recordSrc: RecordSrc[], unionSrc: UnionSrc[]): Resolved {
+  let diags: Diagnostic[] = [];
+  // `cur` threads the environment: resolving a generic type application may append instances.
+  let cur = env0;
+  // Aliases first (also detects cycles among unused aliases).
+  let ai: usize = 0;
+  while (ai < env0.aliases.length) {
+    const none: int[] = [];
+    match (aliasType(cur, ai, none)) {
+      Ok(r) => { cur = r.env; },
+      Err(d) => {
+        if (!(d.message == CYCLE_MSG && hasCycleDiag(diags))) {
+          diags.push(d);
+        }
+      }
+    }
+    ai += 1;
+  }
+  // Record fields.
+  const nrec = env0.records.length;
+  let ri: usize = 0;
+  while (ri < nrec) {
+    const src = recordSrc[ri];
+    const sc = plainScope(src.unit);
+    let out: FieldDef[] = [];
+    for (const f of src.fields) {
+      let dup = false;
+      for (const o of out) {
+        if (o.name == f.name.name) {
+          dup = true;
+        }
+      }
+      if (dup) {
+        diags.push(diag("E0304", f.name.span, "duplicate field `" + f.name.name + "`"));
+      } else {
+        match (resolveType(cur, sc, f.ty, false)) {
+          Ok(r) => {
+            cur = r.env;
+            out.push(FieldDef { name: f.name.name, ty: r.ty });
+          },
+          Err(d) => { diags.push(d); }
+        }
+      }
+    }
+    cur.records[ri] = RecordDef { name: env0.records[ri].name, fields: out };
+    ri += 1;
+  }
+  // Union payloads.
+  const nuni = env0.unions.length;
+  let ui: usize = 0;
+  while (ui < nuni) {
+    const src = unionSrc[ui];
+    const sc = plainScope(src.unit);
+    let vdefs: VariantDef[] = [];
+    for (const v of src.variants) {
+      let payload: Type[] = [];
+      for (const te of v.payload) {
+        match (resolveType(cur, sc, te, false)) {
+          Ok(r) => {
+            cur = r.env;
+            payload.push(r.ty);
+          },
+          Err(d) => { diags.push(d); }
+        }
+      }
+      vdefs.push(VariantDef { name: v.name.name, payload: payload });
+    }
+    cur.unions[ui] = UnionDef { name: env0.unions[ui].name, variants: vdefs };
+    ui += 1;
+  }
+  // Consts.
+  let consts: ConstInfo[] = [];
+  for (const c of env0.consts) {
+    match (resolveConst(cur, c)) {
+      Ok(r) => { consts.push(r); },
+      Err(d) => {
+        diags.push(d);
+        consts.push(c);
+      }
+    }
+  }
+  // Function signatures (ordinary functions; generic ones are resolved per instance).
+  let funcs: FuncInfo[] = [];
+  for (const f of env0.funcs) {
+    const r = resolveFunc(cur, f, diags);
+    diags = r.diags;
+    cur = r.env;
+    funcs.push(r.func);
+  }
+  const env2 = Env {
+    units: env0.units,
+    aliases: env0.aliases,
+    records: cur.records,
+    unions: cur.unions,
+    funcs: funcs,
+    consts: consts,
+    entry: env0.entry,
+    gtypes: env0.gtypes,
+    gfuncs: env0.gfuncs,
+    insts: cur.insts
+  };
+  // `main` check.
+  const entryUnit = env2.units[env2.entry];
+  match (findMain(env2)) {
+    None => {
+      diags.push(diag(
+        "E0412",
+        Span { file: entryUnit.file, start: 0, end: 0 },
+        "entry file must define `function main(): void`"
+      ));
+    },
+    Some(i) => {
+      const f = env2.funcs[i];
+      if (f.decl.params.length > 0 || !isVoid(f.ret)) {
+        diags.push(diag(
+          "E0412",
+          f.decl.name.span,
+          "`main` must be declared as `function main(): void` with no parameters"
+        ));
+      }
+    }
+  }
+  return Resolved { env: env2, diags: diags };
+}

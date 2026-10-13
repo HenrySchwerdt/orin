@@ -1,0 +1,133 @@
+// orin — the self-hosted Orin compiler driver (Stage 1+).
+//   orin check [--format=json] <entry.or>
+//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify]
+//       default pipeline: HIR -> MIR -> ownership verifier -> C
+//   orin fmt [--check] [--stdout] <file.or>...
+//   orin mir <entry.or>      print the MIR
+//   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
+
+import { args, exit } from "std:process";
+import { writeFile } from "std:fs";
+import { SourceMap, Diagnostic, render } from "./diag";
+import { loadAll } from "./loader";
+import { check } from "./check";
+import { generate } from "./codegen";
+import { lower } from "./lower";
+import { emitC } from "./cemit";
+import { MProgram, printProgram } from "./mir";
+import { verify } from "./verify";
+import { runFmt, printDiagnosticsJson } from "./tools";
+
+function usage(): void {
+  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin mir <entry.or>\n  orin verify <entry.or>");
+  exit(2);
+}
+
+function report(sm: SourceMap, diags: Diagnostic[], json: bool): void {
+  if (json) {
+    printDiagnosticsJson(sm, diags);
+    exit(1);
+    return;
+  }
+  for (const d of diags) {
+    console.error(render(sm, d));
+  }
+  exit(1);
+}
+
+// Runs the verifier; prints errors (and warnings when `verbose`). Returns the error count.
+function runVerify(prog: MProgram, verbose: bool): usize {
+  const rep = verify(prog);
+  for (const d of rep.errors) {
+    console.error("verify error: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+  }
+  if (verbose) {
+    for (const d of rep.warnings) {
+      console.log("warning: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+    }
+    console.log("verify: " + rep.errors.length.toString() + " errors, " + rep.warnings.length.toString() + " warnings");
+  }
+  return rep.errors.length;
+}
+
+function main(): void {
+  const all = args();
+  if (all.length >= 1 && all[0] == "fmt") {
+    const code = runFmt(all.slice(1, all.length));
+    if (code != 0) {
+      exit(code);
+    }
+    return;
+  }
+  let json = false;
+  let legacy = false;
+  let noVerify = false;
+  let argv: string[] = [];
+  for (const a of all) {
+    if (a == "--format=json") {
+      json = true;
+    } else if (a == "--legacy-codegen") {
+      legacy = true;
+    } else if (a == "--no-verify") {
+      noVerify = true;
+    } else {
+      argv.push(a);
+    }
+  }
+  if (argv.length < 2) {
+    usage();
+    return;
+  }
+  const cmd = argv[0];
+  const entry = argv[1];
+  const isCompile = cmd == "compile";
+  if (!isCompile && cmd != "check" && cmd != "mir" && cmd != "verify") {
+    usage();
+    return;
+  }
+  if (isCompile && (argv.length < 4 || argv[2] != "-o")) {
+    usage();
+    return;
+  }
+  const loaded = loadAll(entry);
+  if (loaded.diags.length > 0) {
+    report(loaded.sm, loaded.diags, json);
+    return;
+  }
+  const program = loaded.program.unwrap();
+  const checked = check(program, loaded.sm);
+  if (checked.isErr()) {
+    report(loaded.sm, checked.unwrapErr(), json);
+    return;
+  }
+  if (cmd == "check") {
+    return;
+  }
+  if (cmd == "mir") {
+    console.log(printProgram(lower(checked.unwrap())));
+    return;
+  }
+  if (cmd == "verify") {
+    if (runVerify(lower(checked.unwrap()), true) > 0) {
+      exit(1);
+    }
+    return;
+  }
+  let c = "";
+  if (legacy) {
+    c = generate(checked.unwrap());
+  } else {
+    const mir = lower(checked.unwrap());
+    if (!noVerify && runVerify(mir, false) > 0) {
+      console.error("error: internal compiler error: MIR ownership verification failed");
+      exit(70);
+      return;
+    }
+    c = emitC(mir);
+  }
+  const written = writeFile(argv[3], c);
+  if (written.isErr()) {
+    console.error("error: cannot write " + argv[3] + ": " + written.unwrapErr());
+    exit(1);
+  }
+}

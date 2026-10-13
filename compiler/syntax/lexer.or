@@ -1,0 +1,293 @@
+// Lexer for Orin-B source text (docs/bootstrap-subset.md §1).
+// Produces a flat token array that always ends with one KEof token.
+// Errors are E0100 (lexical). Written in Orin-B: positions are `usize` byte offsets.
+
+import { Span, Diagnostic, span, diag } from "../diag";
+
+// Token classes. Punctuation and keywords share one class each; the exact
+// spelling is in `Token.text` (e.g. KPunct with text "=>", KKeyword with text "let").
+// Reserved words (`var`, `class`, ...) are KKeyword too; the parser rejects them.
+export type TokKind = KIdent | KKeyword | KInt | KStr | KPunct | KEof;
+
+// `text`: source spelling; for KStr the unescaped bytes. `value`: integer value for KInt, else 0.
+export type Token = { kind: TokKind; text: string; span: Span; value: int; };
+
+type LexRes = { tok: Token; end: usize; };
+
+const INT_MAX: int = 9223372036854775807;
+
+function mkTok(kind: TokKind, text: string, file: usize, start: usize, end: usize, value: int): Token {
+  return Token { kind: kind, text: text, span: span(file, start, end), value: value };
+}
+
+function isAlpha(c: int): bool {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+// Value of a hex digit character, or -1.
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+function isKeyword(s: string): bool {
+  return s == "const" || s == "let" || s == "function" || s == "return" || s == "if"
+    || s == "else" || s == "while" || s == "for" || s == "of" || s == "break"
+    || s == "continue" || s == "type" || s == "import" || s == "export" || s == "from"
+    || s == "match" || s == "true" || s == "false";
+}
+
+// Reserved words: lexed as keywords so they can never be identifiers.
+function isReserved(s: string): bool {
+  return s == "var" || s == "class" || s == "interface" || s == "enum" || s == "new"
+    || s == "this" || s == "null" || s == "undefined" || s == "async" || s == "await";
+}
+
+// Skip whitespace and comments starting at `start`; returns the next significant offset.
+function skipTrivia(file: usize, src: string, start: usize): Result<usize, Diagnostic> {
+  const n = src.length;
+  let i = start;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      i += 1;
+    } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
+      i += 2;
+      while (i < n && src.charCodeAt(i) != 10) {
+        i += 1;
+      }
+    } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 42) {
+      const cstart = i;
+      i += 2;
+      let closed = false;
+      while (i < n && !closed) {
+        if (src.charCodeAt(i) == 42 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
+          closed = true;
+          i += 2;
+        } else {
+          i += 1;
+        }
+      }
+      if (!closed) {
+        return Err(diag("E0100", span(file, cstart, cstart + 2), "unterminated block comment"));
+      }
+    } else {
+      return Ok(i);
+    }
+  }
+  return Ok(i);
+}
+
+function lexIdent(file: usize, src: string, start: usize): LexRes {
+  const n = src.length;
+  let i = start + 1;
+  while (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
+    i += 1;
+  }
+  const text = src.substring(start, i);
+  let kind: TokKind = KIdent;
+  if (isKeyword(text) || isReserved(text)) {
+    kind = KKeyword;
+  }
+  return LexRes { tok: mkTok(kind, text, file, start, i, 0), end: i };
+}
+
+// Value of the digits src[a..b) in `base`, or -1 if it exceeds i64 max (no overflow trap).
+function digitsValue(src: string, a: usize, b: usize, base: int): int {
+  let v: int = 0;
+  let i = a;
+  while (i < b) {
+    const d = hexVal(src.charCodeAt(i));
+    if (v > (INT_MAX - d) / base) {
+      return -1;
+    }
+    v = v * base + d;
+    i += 1;
+  }
+  return v;
+}
+
+function lexNumber(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
+  const n = src.length;
+  let base: int = 10;
+  let i = start;
+  if (src.charCodeAt(start) == 48 && start + 1 < n && (src.charCodeAt(start + 1) == 120 || src.charCodeAt(start + 1) == 88)) {
+    base = 16;
+    i = start + 2;
+  }
+  const dstart = i;
+  if (base == 16) {
+    while (i < n && hexVal(src.charCodeAt(i)) >= 0) {
+      i += 1;
+    }
+  } else {
+    while (i < n && isDigit(src.charCodeAt(i))) {
+      i += 1;
+    }
+  }
+  if (i == dstart) {
+    return Err(diag("E0100", span(file, start, i), "hexadecimal literal has no digits"));
+  }
+  if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
+    return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+  }
+  const v = digitsValue(src, dstart, i, base);
+  if (v < 0) {
+    return Err(diag("E0100", span(file, start, i), "integer literal does not fit in i64"));
+  }
+  if (i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
+    return Err(diag("E0100", span(file, start, i + 1), "float literals are not supported in Orin-B"));
+  }
+  return Ok(LexRes { tok: mkTok(KInt, src.substring(start, i), file, start, i, v), end: i });
+}
+
+// Character code for a simple escape letter (`n t r 0 \ " '`), or -1.
+function simpleEscape(e: int): int {
+  if (e == 110) {
+    return 10;
+  }
+  if (e == 116) {
+    return 9;
+  }
+  if (e == 114) {
+    return 13;
+  }
+  if (e == 48) {
+    return 0;
+  }
+  if (e == 92 || e == 34 || e == 39) {
+    return e;
+  }
+  return -1;
+}
+
+// String literal starting at the opening quote. The token text is the unescaped content.
+function lexString(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
+  const n = src.length;
+  let parts: string[] = [];
+  let i = start + 1;
+  let run = i;
+  while (true) {
+    if (i >= n) {
+      return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
+    }
+    const c = src.charCodeAt(i);
+    if (c == 34) {
+      parts.push(src.substring(run, i));
+      i += 1;
+      break;
+    }
+    if (c == 10) {
+      return Err(diag("E0100", span(file, start, i), "unterminated string literal"));
+    }
+    if (c == 92) {
+      parts.push(src.substring(run, i));
+      if (i + 1 >= n) {
+        return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
+      }
+      const e = src.charCodeAt(i + 1);
+      let code = simpleEscape(e);
+      let adv: usize = 2;
+      if (e == 120) {
+        if (i + 3 >= n) {
+          return Err(diag("E0100", span(file, i, n), "invalid \\x escape"));
+        }
+        const h1 = hexVal(src.charCodeAt(i + 2));
+        const h2 = hexVal(src.charCodeAt(i + 3));
+        if (h1 < 0 || h2 < 0) {
+          return Err(diag("E0100", span(file, i, i + 4), "invalid \\x escape"));
+        }
+        code = h1 * 16 + h2;
+        adv = 4;
+      }
+      if (code < 0) {
+        return Err(diag("E0100", span(file, i, i + 2), "unknown escape sequence"));
+      }
+      parts.push(String.fromCharCode(code));
+      i += adv;
+      run = i;
+    } else {
+      i += 1;
+    }
+  }
+  return Ok(LexRes { tok: mkTok(KStr, parts.join(""), file, start, i, 0), end: i });
+}
+
+function lexPunct(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
+  const n = src.length;
+  const c = src.charCodeAt(start);
+  let c2: int = 0;
+  if (start + 1 < n) {
+    c2 = src.charCodeAt(start + 1);
+  }
+  const ch = src.charAt(start);
+  let len: usize = 0;
+  if (c == 46 && c2 == 46) {
+    if (start + 2 < n && src.charCodeAt(start + 2) == 46) {
+      len = 3;
+    } else {
+      return Err(diag("E0100", span(file, start, start + 2), "unexpected `..`; did you mean `...`?"));
+    }
+  } else if (c2 == 61 && "=!+-*/%<>".includes(ch)) {
+    len = 2;
+  } else if ((c == 61 && c2 == 62) || (c == 38 && c2 == 38) || (c == 124 && c2 == 124)) {
+    len = 2;
+  } else if ("(){}[],;:.?=+-*/%<>!|".includes(ch)) {
+    len = 1;
+  } else {
+    if (c >= 128) {
+      return Err(diag("E0100", span(file, start, start + 1), "unexpected non-ASCII character"));
+    }
+    return Err(diag("E0100", span(file, start, start + 1), "unexpected character `" + ch + "`"));
+  }
+  const text = src.substring(start, start + len);
+  return Ok(LexRes { tok: mkTok(KPunct, text, file, start, start + len, 0), end: start + len });
+}
+
+export function lex(file: usize, src: string): Result<Token[], Diagnostic> {
+  let toks: Token[] = [];
+  const n = src.length;
+  let i: usize = 0;
+  while (true) {
+    i = skipTrivia(file, src, i)?;
+    if (i >= n) {
+      break;
+    }
+    const c = src.charCodeAt(i);
+    if (isAlpha(c)) {
+      const r = lexIdent(file, src, i);
+      toks.push(r.tok);
+      i = r.end;
+      continue;
+    }
+    if (isDigit(c)) {
+      const r = lexNumber(file, src, i)?;
+      toks.push(r.tok);
+      i = r.end;
+      continue;
+    }
+    if (c == 34) {
+      const r = lexString(file, src, i)?;
+      toks.push(r.tok);
+      i = r.end;
+      continue;
+    }
+    const r = lexPunct(file, src, i)?;
+    toks.push(r.tok);
+    i = r.end;
+  }
+  toks.push(mkTok(KEof, "", file, n, n, 0));
+  return Ok(toks);
+}

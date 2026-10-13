@@ -1,0 +1,386 @@
+// Canonical AST dump, used for differential parser testing (Stage 1 vs Stage 0).
+//
+// FORMAT (deterministic, s-expression-like; one top-level item per line)
+//
+//   module  := item ("\n" item)*              (no trailing text; the printer adds "\n")
+//   item    := (import STR NAME*) | (reexport STR NAME*)
+//            | (fn EXP NAME (tparams NAME*) (params (param NAME TYPE)*) RET BLOCK)
+//            | (type EXP NAME (tparams NAME*) TBODY)
+//            | (const EXP NAME TYPE_OR_DASH EXPR)
+//   EXP     := export | local
+//   RET     := TYPE | -                       (- = no annotation)
+//   TBODY   := (dalias TYPE) | (drecord (field NAME TYPE)*) | (dunion (variant NAME TYPE*)*)
+//   TYPE    := NAME | (app NAME TYPE+) | (array TYPE)       e.g. Result<int, string[]> =
+//                                                           (app Result int (array string))
+//   BLOCK   := (block STMTLINE*)   each statement on its own line, indented 2 spaces deeper
+//              than the line holding the enclosing construct; ")" ends the last line.
+//   STMT    := (let@S MUT NAME TYPE_OR_DASH EXPR)          MUT := let | const
+//            | (assign@S OP EXPR EXPR)                     OP := = += -= *= /= %=
+//            | (expr@S EXPR) | (return@S) | (return@S EXPR)
+//            | (if@S EXPR BLOCK ELSE)                      ELSE := - | STMT (sblock or if)
+//            | (while@S EXPR BLOCK) | (for@S NAME EXPR BLOCK)
+//            | (break@S) | (continue@S) | (sblock@S BLOCK)
+//   EXPR    := (int@S N) | (str@S "escaped") | (bool@S true|false) | (ident@S NAME)
+//            | (unary@S OP EXPR)                           OP := ! -
+//            | (binary@S OP EXPR EXPR)                     OP := + - * / % == != < <= > >= && ||
+//            | (call@S EXPR EXPR*) | (member@S EXPR NAME) | (index@S EXPR EXPR) | (try@S EXPR)
+//            | (cond@S EXPR EXPR EXPR) | (arr@S EXPR*)
+//            | (record@S NAME SPREAD (field NAME EXPR)*)   SPREAD := - | EXPR
+//            | (match@S EXPR ARMLINE*)  each arm on its own line, indented 2 deeper:
+//                  (arm PAT EXPR_OR_BLOCK)
+//   PAT     := _ | (pident NAME) | (pvariant NAME PAT*) | (pint N) | (pstr "escaped") | (pbool B)
+//   S       := "@" start "-" end              byte offsets, half-open [start, end)
+//
+// Notes:
+//  * Only statements and expressions carry spans. A parenthesised expression has no node
+//    of its own: it dumps as the inner expression, with its span widened to include the
+//    parentheses (this is what Stage 0 does; `((x))` takes the outermost pair).
+//  * A negative literal is (unary@S - (int@S N)); the parser does not fold it.
+//    Negative patterns are (pint -N).
+//  * Strings are escaped: \\ \" \n \t \r, any other byte < 0x20 or >= 0x7f as \xHH (lowercase).
+//  * Statement spans include the terminating `;`; block/if/while/for spans end at `}`.
+
+import {
+  Ident, Module, Item, ImportDecl, FunctionDecl, TypeDecl, TypeDeclBody, FieldDecl,
+  VariantDecl, ConstDecl,
+  TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp, BinaryOp,
+  ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind
+} from "../syntax";
+import { Span } from "../diag";
+
+export function dumpModule(m: Module): string {
+  let lines: string[] = [];
+  for (const it of m.items) {
+    lines.push(dumpItem(it));
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+function hex2(c: int): string {
+  const d = "0123456789abcdef";
+  return d.charAt((c / 16).toUsize()) + d.charAt((c % 16).toUsize());
+}
+
+function quote(s: string): string {
+  let parts: string[] = ["\""];
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 34) {
+      parts.push("\\\"");
+    } else if (c == 92) {
+      parts.push("\\\\");
+    } else if (c == 10) {
+      parts.push("\\n");
+    } else if (c == 9) {
+      parts.push("\\t");
+    } else if (c == 13) {
+      parts.push("\\r");
+    } else if (c < 32 || c > 126) {
+      parts.push("\\x" + hex2(c));
+    } else {
+      parts.push(s.charAt(i));
+    }
+    i += 1;
+  }
+  parts.push("\"");
+  return parts.join("");
+}
+
+function spanStr(sp: Span): string {
+  return "@" + sp.start.toString() + "-" + sp.end.toString();
+}
+
+function expWord(b: bool): string {
+  if (b) {
+    return "export";
+  }
+  return "local";
+}
+
+// " a b c" (empty string for no names)
+function namesTail(ids: Ident[]): string {
+  let s = "";
+  for (const id of ids) {
+    s += " " + id.name;
+  }
+  return s;
+}
+
+// " x y z" (empty string for none)
+function joinTail(xs: string[]): string {
+  if (xs.length == 0) {
+    return "";
+  }
+  return " " + xs.join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// Items and types
+// ---------------------------------------------------------------------------
+
+function dumpItem(it: Item): string {
+  return match (it) {
+    IImport(d) => "(import " + quote(d.path) + namesTail(d.names) + ")",
+    IReExport(d) => "(reexport " + quote(d.path) + namesTail(d.names) + ")",
+    IFunction(f) => dumpFn(f),
+    IType(t) => dumpTypeDecl(t),
+    IConst(c) => dumpConst(c)
+  };
+}
+
+function dumpFn(f: FunctionDecl): string {
+  let ps: string[] = [];
+  for (const p of f.params) {
+    ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
+  }
+  return "(fn " + expWord(f.exported) + " " + f.name.name + " (tparams" + namesTail(f.typeParams) + ") (params"
+    + joinTail(ps) + ") " + optType(f.ret) + " " + dumpBlock(f.body, "") + ")";
+}
+
+function dumpTypeDecl(t: TypeDecl): string {
+  return "(type " + expWord(t.exported) + " " + t.name.name + " (tparams" + namesTail(t.typeParams) + ") "
+    + dumpTypeBody(t.body) + ")";
+}
+
+function dumpTypeBody(b: TypeDeclBody): string {
+  return match (b) {
+    DAlias(t) => "(dalias " + dumpType(t) + ")",
+    DRecord(fields) => dumpFields(fields),
+    DUnion(variants) => dumpVariants(variants)
+  };
+}
+
+function dumpFields(fields: FieldDecl[]): string {
+  let parts: string[] = [];
+  for (const f of fields) {
+    parts.push("(field " + f.name.name + " " + dumpType(f.ty) + ")");
+  }
+  return "(drecord" + joinTail(parts) + ")";
+}
+
+function dumpVariants(variants: VariantDecl[]): string {
+  let parts: string[] = [];
+  for (const v of variants) {
+    let tys: string[] = [];
+    for (const t of v.payload) {
+      tys.push(dumpType(t));
+    }
+    parts.push("(variant " + v.name.name + joinTail(tys) + ")");
+  }
+  return "(dunion" + joinTail(parts) + ")";
+}
+
+function dumpConst(c: ConstDecl): string {
+  return "(const " + expWord(c.exported) + " " + c.name.name + " " + optType(c.ty) + " " + dumpExpr(c.value, "") + ")";
+}
+
+function dumpType(t: TypeExpr): string {
+  return match (t.kind) {
+    TNamed(id, args) => dumpNamed(id, args),
+    TArray(el) => "(array " + dumpType(el) + ")"
+  };
+}
+
+function dumpNamed(id: Ident, args: TypeExpr[]): string {
+  if (args.length == 0) {
+    return id.name;
+  }
+  let parts: string[] = [];
+  for (const a of args) {
+    parts.push(dumpType(a));
+  }
+  return "(app " + id.name + " " + parts.join(" ") + ")";
+}
+
+function typesStr(ts: TypeExpr[]): string {
+  let parts: string[] = [];
+  for (const t of ts) {
+    parts.push(dumpType(t));
+  }
+  return "[" + parts.join(" ") + "]";
+}
+
+function optType(o: Option<TypeExpr>): string {
+  return match (o) {
+    Some(t) => dumpType(t),
+    None => "-"
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Statements. `ind` is the indentation of the line the construct starts on.
+// ---------------------------------------------------------------------------
+
+function dumpBlock(b: Block, ind: string): string {
+  const ind2 = ind + "  ";
+  let parts: string[] = ["(block"];
+  for (const s of b.stmts) {
+    parts.push("\n" + ind2 + dumpStmt(s, ind2));
+  }
+  return parts.join("") + ")";
+}
+
+function assignStr(op: AssignOp): string {
+  return match (op) {
+    OpAssign => "=",
+    OpAddAssign => "+=",
+    OpSubAssign => "-=",
+    OpMulAssign => "*=",
+    OpDivAssign => "/=",
+    OpRemAssign => "%="
+  };
+}
+
+function mutWord(mutable: bool): string {
+  if (mutable) {
+    return "let";
+  }
+  return "const";
+}
+
+function dumpElse(els: Option<Stmt>, ind: string): string {
+  return match (els) {
+    Some(s) => dumpStmt(s, ind),
+    None => "-"
+  };
+}
+
+function dumpReturn(sp: string, v: Option<Expr>, ind: string): string {
+  return match (v) {
+    Some(e) => "(return" + sp + " " + dumpExpr(e, ind) + ")",
+    None => "(return" + sp + ")"
+  };
+}
+
+function dumpStmt(s: Stmt, ind: string): string {
+  const sp = spanStr(s.span);
+  return match (s.kind) {
+    SLet(mutable, name, ty, init) => "(let" + sp + " " + mutWord(mutable) + " " + name.name + " " + optType(ty)
+      + " " + dumpExpr(init, ind) + ")",
+    SAssign(target, op, value) => "(assign" + sp + " " + assignStr(op) + " " + dumpExpr(target, ind) + " "
+      + dumpExpr(value, ind) + ")",
+    SExpr(e) => "(expr" + sp + " " + dumpExpr(e, ind) + ")",
+    SReturn(v) => dumpReturn(sp, v, ind),
+    SIf(c, th, els) => "(if" + sp + " " + dumpExpr(c, ind) + " " + dumpBlock(th, ind) + " " + dumpElse(els, ind) + ")",
+    SWhile(c, body) => "(while" + sp + " " + dumpExpr(c, ind) + " " + dumpBlock(body, ind) + ")",
+    SForOf(name, it, body) => "(for" + sp + " " + name.name + " " + dumpExpr(it, ind) + " " + dumpBlock(body, ind) + ")",
+    SBreak => "(break" + sp + ")",
+    SContinue => "(continue" + sp + ")",
+    SBlock(b) => "(sblock" + sp + " " + dumpBlock(b, ind) + ")"
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------------
+
+function unaryStr(op: UnaryOp): string {
+  return match (op) {
+    UNot => "!",
+    UNeg => "-"
+  };
+}
+
+function binaryStr(op: BinaryOp): string {
+  return match (op) {
+    BAdd => "+",
+    BSub => "-",
+    BMul => "*",
+    BDiv => "/",
+    BRem => "%",
+    BEq => "==",
+    BNe => "!=",
+    BLt => "<",
+    BLe => "<=",
+    BGt => ">",
+    BGe => ">=",
+    BAnd => "&&",
+    BOr => "||"
+  };
+}
+
+// " e1 e2" (empty string for none)
+function exprsTail(xs: Expr[], ind: string): string {
+  let parts: string[] = [];
+  for (const x of xs) {
+    parts.push(dumpExpr(x, ind));
+  }
+  return joinTail(parts);
+}
+
+function optExpr(o: Option<Expr>, ind: string): string {
+  return match (o) {
+    Some(e) => dumpExpr(e, ind),
+    None => "-"
+  };
+}
+
+function dumpExpr(e: Expr, ind: string): string {
+  const sp = spanStr(e.span);
+  return match (e.kind) {
+    EInt(v) => "(int" + sp + " " + v.toString() + ")",
+    EStr(s) => "(str" + sp + " " + quote(s) + ")",
+    EBool(b) => "(bool" + sp + " " + b.toString() + ")",
+    EIdent(id) => "(ident" + sp + " " + id.name + ")",
+    EUnary(op, x) => "(unary" + sp + " " + unaryStr(op) + " " + dumpExpr(x, ind) + ")",
+    EBinary(op, l, r) => "(binary" + sp + " " + binaryStr(op) + " " + dumpExpr(l, ind) + " " + dumpExpr(r, ind) + ")",
+    ECall(f, args) => "(call" + sp + " " + dumpExpr(f, ind) + exprsTail(args, ind) + ")",
+    EMember(x, id) => "(member" + sp + " " + dumpExpr(x, ind) + " " + id.name + ")",
+    EIndex(x, i) => "(index" + sp + " " + dumpExpr(x, ind) + " " + dumpExpr(i, ind) + ")",
+    ETry(x) => "(try" + sp + " " + dumpExpr(x, ind) + ")",
+    ECond(c, a, b) => "(cond" + sp + " " + dumpExpr(c, ind) + " " + dumpExpr(a, ind) + " " + dumpExpr(b, ind) + ")",
+    EArray(xs) => "(arr" + sp + exprsTail(xs, ind) + ")",
+    ERecord(id, spread, fields) => dumpRecord(sp, id, spread, fields, ind),
+    ETyApp(id, targs) => "(tyapp" + sp + " " + id.name + " " + typesStr(targs) + ")",
+    ERecordT(id, targs, spread, fields) => dumpRecord(sp, id, spread, fields, ind) + " ; " + typesStr(targs),
+    EMatch(scrut, arms) => dumpMatch(sp, scrut, arms, ind)
+  };
+}
+
+function dumpRecord(sp: string, id: Ident, spread: Option<Expr>, fields: FieldInit[], ind: string): string {
+  let parts: string[] = [];
+  for (const f of fields) {
+    parts.push("(field " + f.name.name + " " + dumpExpr(f.value, ind) + ")");
+  }
+  return "(record" + sp + " " + id.name + " " + optExpr(spread, ind) + joinTail(parts) + ")";
+}
+
+function dumpMatch(sp: string, scrut: Expr, arms: MatchArm[], ind: string): string {
+  const ind2 = ind + "  ";
+  let parts: string[] = ["(match" + sp + " " + dumpExpr(scrut, ind)];
+  for (const a of arms) {
+    parts.push("\n" + ind2 + "(arm " + dumpPat(a.pattern) + " " + dumpArmBody(a.body, ind2) + ")");
+  }
+  return parts.join("") + ")";
+}
+
+function dumpArmBody(b: ArmBody, ind: string): string {
+  return match (b) {
+    BExpr(e) => dumpExpr(e, ind),
+    BBlock(blk) => dumpBlock(blk, ind)
+  };
+}
+
+function dumpPat(p: Pattern): string {
+  return match (p.kind) {
+    PWildcard => "_",
+    PIdent(id) => "(pident " + id.name + ")",
+    PVariant(id, subs) => dumpVariantPat(id, subs),
+    PInt(v) => "(pint " + v.toString() + ")",
+    PStr(s) => "(pstr " + quote(s) + ")",
+    PBool(b) => "(pbool " + b.toString() + ")"
+  };
+}
+
+function dumpVariantPat(id: Ident, subs: Pattern[]): string {
+  let parts: string[] = [];
+  for (const s of subs) {
+    parts.push(dumpPat(s));
+  }
+  return "(pvariant " + id.name + joinTail(parts) + ")";
+}

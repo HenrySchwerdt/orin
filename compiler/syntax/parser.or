@@ -1,0 +1,1046 @@
+// Recursive-descent parser: source text -> ast.Module (docs/bootstrap-subset.md §2, §4, §5).
+// Errors: E0200 (syntax, first error only), E0201 (`var`). Lexical errors (E0100) come from lex.
+//
+// Style (docs/bootstrap.md, "Writing efficient Orin-B"): every parse function takes the
+// immutable token array plus a position and returns a small `{ node, pos }` record, where
+// `pos` is the index of the first token after the parsed construct.
+
+import { Span, Diagnostic, spanTo, diag } from "../diag";
+import {
+  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
+  VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
+  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind
+} from "./ast";
+import { Token, TokKind, lex } from "./lexer";
+
+type IdentRes = { id: Ident; pos: usize; };
+type IdentsRes = { ids: Ident[]; pos: usize; };
+type TypeRes = { ty: TypeExpr; pos: usize; };
+type BodyRes = { body: TypeDeclBody; pos: usize; };
+type VariantRes = { variant: VariantDecl; pos: usize; };
+type ImportRes = { decl: ImportDecl; pos: usize; };
+type ItemRes = { item: Item; pos: usize; };
+type BlockRes = { block: Block; pos: usize; };
+type StmtRes = { stmt: Stmt; pos: usize; };
+type ExprRes = { expr: Expr; pos: usize; };
+type ExprsRes = { exprs: Expr[]; pos: usize; };
+type TypeArgsRes = { tys: TypeExpr[]; pos: usize; };
+type PatRes = { pat: Pattern; pos: usize; };
+
+// ---------------------------------------------------------------------------
+// Token helpers
+// ---------------------------------------------------------------------------
+
+// Token at `pos`; positions past the end read as the final KEof token.
+function tokAt(toks: Token[], pos: usize): Token {
+  if (pos < toks.length) {
+    return toks[pos];
+  }
+  return toks[toks.length - 1];
+}
+
+function isP(toks: Token[], pos: usize, s: string): bool {
+  const t = tokAt(toks, pos);
+  return match (t.kind) {
+    KPunct => t.text == s,
+    _ => false
+  };
+}
+
+function isKw(toks: Token[], pos: usize, s: string): bool {
+  const t = tokAt(toks, pos);
+  return match (t.kind) {
+    KKeyword => t.text == s,
+    _ => false
+  };
+}
+
+function isEof(toks: Token[], pos: usize): bool {
+  return match (tokAt(toks, pos).kind) {
+    KEof => true,
+    _ => false
+  };
+}
+
+function isKindInt(t: Token): bool {
+  return match (t.kind) {
+    KInt => true,
+    _ => false
+  };
+}
+
+function describe(t: Token): string {
+  return match (t.kind) {
+    KEof => "end of file",
+    KStr => "string literal",
+    _ => "`" + t.text + "`"
+  };
+}
+
+// Syntax error at token `t`; a stray `var` keyword always reports E0201.
+function errAt(t: Token, msg: string): Diagnostic {
+  const isVar = match (t.kind) {
+    KKeyword => t.text == "var",
+    _ => false
+  };
+  if (isVar) {
+    return diag("E0201", t.span, "`var` is not allowed; use `const` or `let`");
+  }
+  return diag("E0200", t.span, msg);
+}
+
+function errExpected(toks: Token[], pos: usize, what: string): Diagnostic {
+  const t = tokAt(toks, pos);
+  return errAt(t, "expected " + what + ", found " + describe(t));
+}
+
+function expectP(toks: Token[], pos: usize, s: string): Result<usize, Diagnostic> {
+  if (isP(toks, pos, s)) {
+    return Ok(pos + 1);
+  }
+  return Err(errExpected(toks, pos, "`" + s + "`"));
+}
+
+function expectKw(toks: Token[], pos: usize, s: string): Result<usize, Diagnostic> {
+  if (isKw(toks, pos, s)) {
+    return Ok(pos + 1);
+  }
+  return Err(errExpected(toks, pos, "`" + s + "`"));
+}
+
+// Span of the last consumed token (pos must be >= 1).
+function lastSpan(toks: Token[], pos: usize): Span {
+  return toks[pos - 1].span;
+}
+
+function parseIdent(toks: Token[], pos: usize): Result<IdentRes, Diagnostic> {
+  const t = tokAt(toks, pos);
+  const ok = match (t.kind) {
+    KIdent => true,
+    _ => false
+  };
+  if (ok) {
+    return Ok(IdentRes { id: Ident { name: t.text, span: t.span }, pos: pos + 1 });
+  }
+  return Err(errExpected(toks, pos, "identifier"));
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+// `Name`, `Name<A, B>`, followed by any number of `[]`.
+function parseType(toks: Token[], pos: usize): Result<TypeRes, Diagnostic> {
+  const nm = parseIdent(toks, pos)?;
+  let p = nm.pos;
+  let args: TypeExpr[] = [];
+  if (isP(toks, p, "<")) {
+    p += 1;
+    while (true) {
+      const a = parseType(toks, p)?;
+      args.push(a.ty);
+      p = a.pos;
+      if (isP(toks, p, ",")) {
+        p += 1;
+      } else {
+        break;
+      }
+    }
+    p = expectP(toks, p, ">")?;
+  }
+  let ty = TypeExpr { kind: TNamed(nm.id, args), span: spanTo(nm.id.span, lastSpan(toks, p)) };
+  while (isP(toks, p, "[") && isP(toks, p + 1, "]")) {
+    p += 2;
+    ty = TypeExpr { kind: TArray(ty), span: spanTo(ty.span, lastSpan(toks, p)) };
+  }
+  return Ok(TypeRes { ty: ty, pos: p });
+}
+
+// Optional `<T, U>` list of generic parameter names.
+function parseTypeParams(toks: Token[], pos: usize): Result<IdentsRes, Diagnostic> {
+  let ids: Ident[] = [];
+  if (!isP(toks, pos, "<")) {
+    return Ok(IdentsRes { ids: ids, pos: pos });
+  }
+  let p = pos + 1;
+  while (true) {
+    const id = parseIdent(toks, p)?;
+    ids.push(id.id);
+    p = id.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else {
+      break;
+    }
+  }
+  p = expectP(toks, p, ">")?;
+  return Ok(IdentsRes { ids: ids, pos: p });
+}
+
+// ---------------------------------------------------------------------------
+// Items
+// ---------------------------------------------------------------------------
+
+// `{ a, b, }` list of names (trailing comma allowed).
+function parseNameList(toks: Token[], pos: usize): Result<IdentsRes, Diagnostic> {
+  let p = expectP(toks, pos, "{")?;
+  let ids: Ident[] = [];
+  while (!isP(toks, p, "}")) {
+    const id = parseIdent(toks, p)?;
+    ids.push(id.id);
+    p = id.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, "}")) {
+      return Err(errExpected(toks, p, "`,` or `}`"));
+    }
+  }
+  return Ok(IdentsRes { ids: ids, pos: p + 1 });
+}
+
+// `import { .. } from "path";` or `export { .. } from "path";` (pos at the first keyword).
+function parseImportDecl(toks: Token[], pos: usize): Result<ImportRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  const names = parseNameList(toks, pos + 1)?;
+  let p = expectKw(toks, names.pos, "from")?;
+  const pt = tokAt(toks, p);
+  const isStr = match (pt.kind) {
+    KStr => true,
+    _ => false
+  };
+  if (!isStr) {
+    return Err(errExpected(toks, p, "module path string"));
+  }
+  p = expectP(toks, p + 1, ";")?;
+  const decl = ImportDecl { names: names.ids, path: pt.text, pathSpan: pt.span, span: spanTo(start, lastSpan(toks, p)) };
+  return Ok(ImportRes { decl: decl, pos: p });
+}
+
+function parseItem(toks: Token[], pos: usize): Result<ItemRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  if (isKw(toks, pos, "import")) {
+    const r = parseImportDecl(toks, pos)?;
+    return Ok(ItemRes { item: IImport(r.decl), pos: r.pos });
+  }
+  let p = pos;
+  let exported = false;
+  if (isKw(toks, p, "export")) {
+    exported = true;
+    p += 1;
+    if (isP(toks, p, "{")) {
+      const r = parseImportDecl(toks, pos)?;
+      return Ok(ItemRes { item: IReExport(r.decl), pos: r.pos });
+    }
+  }
+  if (isKw(toks, p, "function")) {
+    return parseFunction(toks, p, exported, start);
+  }
+  if (isKw(toks, p, "type")) {
+    return parseTypeDecl(toks, p, exported, start);
+  }
+  if (isKw(toks, p, "const")) {
+    return parseConstDecl(toks, p, exported, start);
+  }
+  return Err(errExpected(toks, p, "declaration"));
+}
+
+// pos at `function`; `start` is the span of the item's first token.
+function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+  const name = parseIdent(toks, pos + 1)?;
+  const tps = parseTypeParams(toks, name.pos)?;
+  let p = expectP(toks, tps.pos, "(")?;
+  let params: Param[] = [];
+  while (!isP(toks, p, ")")) {
+    const pn = parseIdent(toks, p)?;
+    const colon = expectP(toks, pn.pos, ":")?;
+    const pt = parseType(toks, colon)?;
+    params.push(Param { name: pn.id, ty: pt.ty, span: spanTo(pn.id.span, pt.ty.span) });
+    p = pt.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, ")")) {
+      return Err(errExpected(toks, p, "`,` or `)`"));
+    }
+  }
+  p += 1;
+  let ret: Option<TypeExpr> = None;
+  if (isP(toks, p, ":")) {
+    const rt = parseType(toks, p + 1)?;
+    ret = Some(rt.ty);
+    p = rt.pos;
+  }
+  const body = parseBlock(toks, p)?;
+  const decl = FunctionDecl {
+    exported: exported,
+    name: name.id,
+    typeParams: tps.ids,
+    params: params,
+    ret: ret,
+    body: body.block,
+    span: spanTo(start, body.block.span)
+  };
+  return Ok(ItemRes { item: IFunction(decl), pos: body.pos });
+}
+
+// pos at `type`.
+function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+  const name = parseIdent(toks, pos + 1)?;
+  const tps = parseTypeParams(toks, name.pos)?;
+  const eq = expectP(toks, tps.pos, "=")?;
+  const body = parseTypeBody(toks, eq)?;
+  const p = expectP(toks, body.pos, ";")?;
+  const decl = TypeDecl {
+    exported: exported,
+    name: name.id,
+    typeParams: tps.ids,
+    body: body.body,
+    span: spanTo(start, lastSpan(toks, p))
+  };
+  return Ok(ItemRes { item: IType(decl), pos: p });
+}
+
+// Right side of `type N = ...`: `{..}` record; `Name(..)` or any `|` -> union; else alias.
+// Mirrors Stage 0: the first member is parsed as a type; a following `|` makes it a union,
+// in which case it must be a bare `Name`. A leading `|` is not accepted.
+function parseTypeBody(toks: Token[], pos: usize): Result<BodyRes, Diagnostic> {
+  if (isP(toks, pos, "{")) {
+    return parseRecordBody(toks, pos);
+  }
+  let p = pos;
+  let variants: VariantDecl[] = [];
+  const first = tokAt(toks, p);
+  const isName = match (first.kind) {
+    KIdent => true,
+    _ => false
+  };
+  if (isName && isP(toks, p + 1, "(")) {
+    const v = parseVariant(toks, p)?;
+    variants.push(v.variant);
+    p = v.pos;
+  } else {
+    const t = parseType(toks, p)?;
+    if (!isP(toks, t.pos, "|")) {
+      return Ok(BodyRes { body: DAlias(t.ty), pos: t.pos });
+    }
+    const bare = match (t.ty.kind) {
+      TNamed(id, args) => args.length == 0,
+      TArray(_) => false
+    };
+    if (!bare) {
+      return Err(diag("E0200", t.ty.span, "union members must be `Name` or `Name(T, ...)`"));
+    }
+    const nm = match (t.ty.kind) {
+      TNamed(id, args) => id,
+      TArray(_) => Ident { name: "", span: t.ty.span }
+    };
+    variants.push(VariantDecl { name: nm, payload: [], span: t.ty.span });
+    p = t.pos;
+  }
+  while (isP(toks, p, "|")) {
+    const v = parseVariant(toks, p + 1)?;
+    variants.push(v.variant);
+    p = v.pos;
+  }
+  return Ok(BodyRes { body: DUnion(variants), pos: p });
+}
+
+// `{ a: T; b: U; }`
+function parseRecordBody(toks: Token[], pos: usize): Result<BodyRes, Diagnostic> {
+  let p = pos + 1;
+  let fields: FieldDecl[] = [];
+  while (!isP(toks, p, "}")) {
+    const fname = parseIdent(toks, p)?;
+    const colon = expectP(toks, fname.pos, ":")?;
+    const ft = parseType(toks, colon)?;
+    p = expectP(toks, ft.pos, ";")?;
+    fields.push(FieldDecl { name: fname.id, ty: ft.ty, span: spanTo(fname.id.span, lastSpan(toks, p)) });
+  }
+  return Ok(BodyRes { body: DRecord(fields), pos: p + 1 });
+}
+
+// `Name` or `Name(T1, T2)`
+function parseVariant(toks: Token[], pos: usize): Result<VariantRes, Diagnostic> {
+  const name = parseIdent(toks, pos)?;
+  let p = name.pos;
+  let payload: TypeExpr[] = [];
+  if (isP(toks, p, "(")) {
+    p += 1;
+    while (true) {
+      const t = parseType(toks, p)?;
+      payload.push(t.ty);
+      p = t.pos;
+      if (isP(toks, p, ",")) {
+        p += 1;
+        if (isP(toks, p, ")")) {
+          break;
+        }
+      } else {
+        break;
+      }
+    }
+    p = expectP(toks, p, ")")?;
+  }
+  const v = VariantDecl { name: name.id, payload: payload, span: spanTo(name.id.span, lastSpan(toks, p)) };
+  return Ok(VariantRes { variant: v, pos: p });
+}
+
+// pos at `const`: `const NAME: T = expr;`
+function parseConstDecl(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+  const name = parseIdent(toks, pos + 1)?;
+  let p = name.pos;
+  let ty: Option<TypeExpr> = None;
+  if (isP(toks, p, ":")) {
+    const t = parseType(toks, p + 1)?;
+    ty = Some(t.ty);
+    p = t.pos;
+  }
+  p = expectP(toks, p, "=")?;
+  const value = parseExpr(toks, p)?;
+  p = expectP(toks, value.pos, ";")?;
+  const decl = ConstDecl {
+    exported: exported,
+    name: name.id,
+    ty: ty,
+    value: value.expr,
+    span: spanTo(start, lastSpan(toks, p))
+  };
+  return Ok(ItemRes { item: IConst(decl), pos: p });
+}
+
+// ---------------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------------
+
+function mkStmt(kind: StmtKind, start: Span, toks: Token[], p: usize): Stmt {
+  return Stmt { kind: kind, span: spanTo(start, lastSpan(toks, p)) };
+}
+
+// `{ stmt* }`
+function parseBlock(toks: Token[], pos: usize): Result<BlockRes, Diagnostic> {
+  const open = tokAt(toks, pos).span;
+  let p = expectP(toks, pos, "{")?;
+  let stmts: Stmt[] = [];
+  while (!isP(toks, p, "}")) {
+    if (isEof(toks, p)) {
+      return Err(errExpected(toks, p, "`}`"));
+    }
+    const s = parseStmt(toks, p)?;
+    stmts.push(s.stmt);
+    p = s.pos;
+  }
+  const blk = Block { stmts: stmts, span: spanTo(open, tokAt(toks, p).span) };
+  return Ok(BlockRes { block: blk, pos: p + 1 });
+}
+
+function blockStmt(b: BlockRes): StmtRes {
+  return StmtRes { stmt: Stmt { kind: SBlock(b.block), span: b.block.span }, pos: b.pos };
+}
+
+function parseStmt(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const t = tokAt(toks, pos);
+  const start = t.span;
+  const isKwTok = match (t.kind) {
+    KKeyword => true,
+    _ => false
+  };
+  if (isKwTok) {
+    if (t.text == "const" || t.text == "let") {
+      return parseLet(toks, pos);
+    }
+    if (t.text == "if") {
+      return parseIf(toks, pos);
+    }
+    if (t.text == "while") {
+      return parseWhile(toks, pos);
+    }
+    if (t.text == "for") {
+      return parseFor(toks, pos);
+    }
+    if (t.text == "return") {
+      return parseReturn(toks, pos);
+    }
+    if (t.text == "break" || t.text == "continue") {
+      const p = expectP(toks, pos + 1, ";")?;
+      let k: StmtKind = SBreak;
+      if (t.text == "continue") {
+        k = SContinue;
+      }
+      return Ok(StmtRes { stmt: mkStmt(k, start, toks, p), pos: p });
+    }
+  }
+  if (isP(toks, pos, "{")) {
+    const b = parseBlock(toks, pos)?;
+    return Ok(blockStmt(b));
+  }
+  return parseExprStmt(toks, pos);
+}
+
+// `const x[: T] = e;` / `let x[: T] = e;` (initializer required)
+function parseLet(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  const mutable = isKw(toks, pos, "let");
+  const name = parseIdent(toks, pos + 1)?;
+  let p = name.pos;
+  let ty: Option<TypeExpr> = None;
+  if (isP(toks, p, ":")) {
+    const t = parseType(toks, p + 1)?;
+    ty = Some(t.ty);
+    p = t.pos;
+  }
+  p = expectP(toks, p, "=")?;
+  const init = parseExpr(toks, p)?;
+  p = expectP(toks, init.pos, ";")?;
+  return Ok(StmtRes { stmt: mkStmt(SLet(mutable, name.id, ty, init.expr), start, toks, p), pos: p });
+}
+
+// `( expr )`
+function parseParenExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const open = expectP(toks, pos, "(")?;
+  const e = parseExpr(toks, open)?;
+  const close = expectP(toks, e.pos, ")")?;
+  return Ok(ExprRes { expr: e.expr, pos: close });
+}
+
+function parseIf(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  const cond = parseParenExpr(toks, pos + 1)?;
+  const thenB = parseBlock(toks, cond.pos)?;
+  let p = thenB.pos;
+  let els: Option<Stmt> = None;
+  if (isKw(toks, p, "else")) {
+    if (isKw(toks, p + 1, "if")) {
+      const e = parseIf(toks, p + 1)?;
+      els = Some(e.stmt);
+      p = e.pos;
+    } else {
+      const b = parseBlock(toks, p + 1)?;
+      els = Some(blockStmt(b).stmt);
+      p = b.pos;
+    }
+  }
+  return Ok(StmtRes { stmt: mkStmt(SIf(cond.expr, thenB.block, els), start, toks, p), pos: p });
+}
+
+function parseWhile(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  const cond = parseParenExpr(toks, pos + 1)?;
+  const body = parseBlock(toks, cond.pos)?;
+  return Ok(StmtRes { stmt: mkStmt(SWhile(cond.expr, body.block), start, toks, body.pos), pos: body.pos });
+}
+
+// `for (const x of expr) { .. }`
+function parseFor(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  let p = expectP(toks, pos + 1, "(")?;
+  p = expectKw(toks, p, "const")?;
+  const name = parseIdent(toks, p)?;
+  p = expectKw(toks, name.pos, "of")?;
+  const iter = parseExpr(toks, p)?;
+  p = expectP(toks, iter.pos, ")")?;
+  const body = parseBlock(toks, p)?;
+  return Ok(StmtRes { stmt: mkStmt(SForOf(name.id, iter.expr, body.block), start, toks, body.pos), pos: body.pos });
+}
+
+function parseReturn(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  let p = pos + 1;
+  let val: Option<Expr> = None;
+  if (!isP(toks, p, ";")) {
+    const e = parseExpr(toks, p)?;
+    val = Some(e.expr);
+    p = e.pos;
+  }
+  p = expectP(toks, p, ";")?;
+  return Ok(StmtRes { stmt: mkStmt(SReturn(val), start, toks, p), pos: p });
+}
+
+function isAssignTok(toks: Token[], pos: usize): bool {
+  const t = tokAt(toks, pos);
+  return match (t.kind) {
+    KPunct => t.text == "=" || t.text == "+=" || t.text == "-=" || t.text == "*=" || t.text == "/=" || t.text == "%=",
+    _ => false
+  };
+}
+
+function assignOpOf(s: string): AssignOp {
+  if (s == "=") {
+    return OpAssign;
+  }
+  if (s == "+=") {
+    return OpAddAssign;
+  }
+  if (s == "-=") {
+    return OpSubAssign;
+  }
+  if (s == "*=") {
+    return OpMulAssign;
+  }
+  if (s == "/=") {
+    return OpDivAssign;
+  }
+  return OpRemAssign;
+}
+
+function isMatchExpr(e: Expr): bool {
+  return match (e.kind) {
+    EMatch(_, _) => true,
+    _ => false
+  };
+}
+
+// Expression statement or assignment. A statement-level `match` needs no `;`.
+function parseExprStmt(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  const e = parseExpr(toks, pos)?;
+  let p = e.pos;
+  if (isAssignTok(toks, p)) {
+    const op = assignOpOf(tokAt(toks, p).text);
+    const rhs = parseExpr(toks, p + 1)?;
+    p = expectP(toks, rhs.pos, ";")?;
+    return Ok(StmtRes { stmt: mkStmt(SAssign(e.expr, op, rhs.expr), start, toks, p), pos: p });
+  }
+  if (isMatchExpr(e.expr) && !isP(toks, p, ";")) {
+    return Ok(StmtRes { stmt: mkStmt(SExpr(e.expr), start, toks, p), pos: p });
+  }
+  p = expectP(toks, p, ";")?;
+  return Ok(StmtRes { stmt: mkStmt(SExpr(e.expr), start, toks, p), pos: p });
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------------
+
+function mkExpr(kind: ExprKind, sp: Span): Expr {
+  return Expr { kind: kind, span: sp };
+}
+
+function parseExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  return parseCond(toks, pos);
+}
+
+// `c ? a : b` (right-associative, lowest precedence). A `?` that reaches here was not
+// taken as postfix propagation (ADR-0003).
+function parseCond(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const c = parseBin(toks, pos, 0)?;
+  if (isP(toks, c.pos, "?")) {
+    const a = parseCond(toks, c.pos + 1)?;
+    const colon = expectP(toks, a.pos, ":")?;
+    const b = parseCond(toks, colon)?;
+    const sp = spanTo(c.expr.span, b.expr.span);
+    return Ok(ExprRes { expr: mkExpr(ECond(c.expr, a.expr, b.expr), sp), pos: b.pos });
+  }
+  return Ok(c);
+}
+
+// Precedence level of a binary operator token, or -1.
+// 0 `||`, 1 `&&`, 2 `== !=`, 3 `< <= > >=`, 4 `+ -`, 5 `* / %`.
+function binLevel(t: Token): int {
+  return match (t.kind) {
+    KPunct => levelOfText(t.text),
+    _ => -1
+  };
+}
+
+function levelOfText(s: string): int {
+  if (s == "||") {
+    return 0;
+  }
+  if (s == "&&") {
+    return 1;
+  }
+  if (s == "==" || s == "!=") {
+    return 2;
+  }
+  if (s == "<" || s == "<=" || s == ">" || s == ">=") {
+    return 3;
+  }
+  if (s == "+" || s == "-") {
+    return 4;
+  }
+  if (s == "*" || s == "/" || s == "%") {
+    return 5;
+  }
+  return -1;
+}
+
+function binOpOf(s: string): BinaryOp {
+  if (s == "||") {
+    return BOr;
+  }
+  if (s == "&&") {
+    return BAnd;
+  }
+  if (s == "==") {
+    return BEq;
+  }
+  if (s == "!=") {
+    return BNe;
+  }
+  if (s == "<") {
+    return BLt;
+  }
+  if (s == "<=") {
+    return BLe;
+  }
+  if (s == ">") {
+    return BGt;
+  }
+  if (s == ">=") {
+    return BGe;
+  }
+  if (s == "+") {
+    return BAdd;
+  }
+  if (s == "-") {
+    return BSub;
+  }
+  if (s == "*") {
+    return BMul;
+  }
+  if (s == "/") {
+    return BDiv;
+  }
+  return BRem;
+}
+
+// Left-associative binary operators at `level` and tighter.
+function parseBin(toks: Token[], pos: usize, level: int): Result<ExprRes, Diagnostic> {
+  if (level > 5) {
+    return parseUnary(toks, pos);
+  }
+  const first = parseBin(toks, pos, level + 1)?;
+  let lhs = first.expr;
+  let p = first.pos;
+  while (binLevel(tokAt(toks, p)) == level) {
+    const op = binOpOf(tokAt(toks, p).text);
+    const r = parseBin(toks, p + 1, level + 1)?;
+    lhs = mkExpr(EBinary(op, lhs, r.expr), spanTo(lhs.span, r.expr.span));
+    p = r.pos;
+  }
+  return Ok(ExprRes { expr: lhs, pos: p });
+}
+
+function parseUnary(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const t = tokAt(toks, pos);
+  if (isP(toks, pos, "!") || isP(toks, pos, "-")) {
+    const operand = parseUnary(toks, pos + 1)?;
+    let op: UnaryOp = UNot;
+    if (t.text == "-") {
+      op = UNeg;
+    }
+    return Ok(ExprRes { expr: mkExpr(EUnary(op, operand.expr), spanTo(t.span, operand.expr.span)), pos: operand.pos });
+  }
+  return parsePostfix(toks, pos);
+}
+
+// True if the token at `pos` cannot start an expression, so a preceding `?` is
+// propagation: one of `) ] } , ; . ? :` or end of file (ADR-0003).
+function isPropagateFollow(toks: Token[], pos: usize): bool {
+  const t = tokAt(toks, pos);
+  return match (t.kind) {
+    KEof => true,
+    KPunct => t.text == ")" || t.text == "]" || t.text == "}" || t.text == "," || t.text == ";"
+      || t.text == "." || t.text == "?" || t.text == ":",
+    _ => false
+  };
+}
+
+// `open` ... `close` comma-separated expressions; pos at the opening token.
+function parseExprList(toks: Token[], pos: usize, close: string): Result<ExprsRes, Diagnostic> {
+  let p = pos + 1;
+  let xs: Expr[] = [];
+  while (!isP(toks, p, close)) {
+    const a = parseExpr(toks, p)?;
+    xs.push(a.expr);
+    p = a.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, close)) {
+      return Err(errExpected(toks, p, "`,` or `" + close + "`"));
+    }
+  }
+  return Ok(ExprsRes { exprs: xs, pos: p + 1 });
+}
+
+// primary followed by calls, member accesses, indexing and `?`.
+function parsePostfix(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const prim = parsePrimary(toks, pos)?;
+  let e = prim.expr;
+  let p = prim.pos;
+  while (true) {
+    if (isP(toks, p, "(")) {
+      const args = parseExprList(toks, p, ")")?;
+      e = mkExpr(ECall(e, args.exprs), spanTo(e.span, lastSpan(toks, args.pos)));
+      p = args.pos;
+    } else if (isP(toks, p, ".")) {
+      const m = parseIdent(toks, p + 1)?;
+      e = mkExpr(EMember(e, m.id), spanTo(e.span, m.id.span));
+      p = m.pos;
+    } else if (isP(toks, p, "[")) {
+      const ix = parseExpr(toks, p + 1)?;
+      const q = expectP(toks, ix.pos, "]")?;
+      e = mkExpr(EIndex(e, ix.expr), spanTo(e.span, lastSpan(toks, q)));
+      p = q;
+    } else if (isP(toks, p, "?") && isPropagateFollow(toks, p + 1)) {
+      e = mkExpr(ETry(e), spanTo(e.span, tokAt(toks, p).span));
+      p += 1;
+    } else {
+      break;
+    }
+  }
+  return Ok(ExprRes { expr: e, pos: p });
+}
+
+function parsePrimary(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const t = tokAt(toks, pos);
+  match (t.kind) {
+    KInt => {
+      return Ok(ExprRes { expr: mkExpr(EInt(t.value), t.span), pos: pos + 1 });
+    },
+    KStr => {
+      return Ok(ExprRes { expr: mkExpr(EStr(t.text), t.span), pos: pos + 1 });
+    },
+    KIdent => {
+      return parseIdentExpr(toks, pos);
+    },
+    KPunct => {
+      return parsePunctExpr(toks, pos);
+    },
+    KKeyword => {
+      return parseKeywordExpr(toks, pos);
+    },
+    KEof => {
+      return Err(errExpected(toks, pos, "expression"));
+    }
+  }
+}
+
+// `( e )` or `[a, b]`. Parentheses produce no node: the result is the inner expression with
+// its span widened to include the parentheses (as Stage 0 does).
+function parsePunctExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  if (isP(toks, pos, "(")) {
+    const inner = parseParenExpr(toks, pos)?;
+    const wide = spanTo(tokAt(toks, pos).span, lastSpan(toks, inner.pos));
+    return Ok(ExprRes { expr: mkExpr(inner.expr.kind, wide), pos: inner.pos });
+  }
+  if (isP(toks, pos, "[")) {
+    const xs = parseExprList(toks, pos, "]")?;
+    const sp = spanTo(tokAt(toks, pos).span, lastSpan(toks, xs.pos));
+    return Ok(ExprRes { expr: mkExpr(EArray(xs.exprs), sp), pos: xs.pos });
+  }
+  return Err(errExpected(toks, pos, "expression"));
+}
+
+function parseKeywordExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const t = tokAt(toks, pos);
+  if (t.text == "true" || t.text == "false") {
+    return Ok(ExprRes { expr: mkExpr(EBool(t.text == "true"), t.span), pos: pos + 1 });
+  }
+  if (t.text == "match") {
+    return parseMatch(toks, pos);
+  }
+  return Err(errExpected(toks, pos, "expression"));
+}
+
+// `<T, U>` list of type arguments at `pos`, or None if the tokens there are not a well-formed
+// list (the caller then treats `<` as a comparison). Never reports errors.
+function tryTypeArgs(toks: Token[], pos: usize): Option<TypeArgsRes> {
+  if (!isP(toks, pos, "<")) {
+    return None;
+  }
+  let p = pos + 1;
+  let tys: TypeExpr[] = [];
+  while (true) {
+    const r = parseType(toks, p);
+    if (r.isErr()) {
+      return None;
+    }
+    const a = r.unwrap();
+    tys.push(a.ty);
+    p = a.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else {
+      break;
+    }
+  }
+  if (!isP(toks, p, ">")) {
+    return None;
+  }
+  return Some(TypeArgsRes { tys: tys, pos: p + 1 });
+}
+
+// Identifier, record literal when directly followed by `{`, or (beyond Orin-B) a generic
+// form `name<types>(` / `Name<types> {` -- decided by backtracking (ADR-0007).
+function parseIdentExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const nm = parseIdent(toks, pos)?;
+  if (isP(toks, nm.pos, "{")) {
+    return parseRecordLit(toks, nm, []);
+  }
+  if (isP(toks, nm.pos, "<")) {
+    const ta = tryTypeArgs(toks, nm.pos);
+    if (ta.isSome()) {
+      const targs = ta.unwrap();
+      if (isP(toks, targs.pos, "(")) {
+        const sp = spanTo(nm.id.span, lastSpan(toks, targs.pos));
+        return Ok(ExprRes { expr: mkExpr(ETyApp(nm.id, targs.tys), sp), pos: targs.pos });
+      }
+      if (isP(toks, targs.pos, "{")) {
+        return parseRecordLit(toks, IdentRes { id: nm.id, pos: targs.pos }, targs.tys);
+      }
+    }
+  }
+  return Ok(ExprRes { expr: mkExpr(EIdent(nm.id), nm.id.span), pos: nm.pos });
+}
+
+// `Name { ...spread, a: e, b: e }`; `nm.pos` is at the `{`.
+function parseRecordLit(toks: Token[], nm: IdentRes, targs: TypeExpr[]): Result<ExprRes, Diagnostic> {
+  let p = nm.pos + 1;
+  let spread: Option<Expr> = None;
+  if (isP(toks, p, "...")) {
+    const s = parseExpr(toks, p + 1)?;
+    spread = Some(s.expr);
+    p = s.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, "}")) {
+      return Err(errExpected(toks, p, "`,` or `}`"));
+    }
+  }
+  let fields: FieldInit[] = [];
+  while (!isP(toks, p, "}")) {
+    const fname = parseIdent(toks, p)?;
+    const colon = expectP(toks, fname.pos, ":")?;
+    const v = parseExpr(toks, colon)?;
+    fields.push(FieldInit { name: fname.id, value: v.expr, span: spanTo(fname.id.span, v.expr.span) });
+    p = v.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, "}")) {
+      return Err(errExpected(toks, p, "`,` or `}`"));
+    }
+  }
+  p += 1;
+  const sp = spanTo(nm.id.span, lastSpan(toks, p));
+  if (targs.length > 0) {
+    return Ok(ExprRes { expr: mkExpr(ERecordT(nm.id, targs, spread, fields), sp), pos: p });
+  }
+  return Ok(ExprRes { expr: mkExpr(ERecord(nm.id, spread, fields), sp), pos: p });
+}
+
+// `match (e) { pattern => body, ... }`
+function parseMatch(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  const scrut = parseParenExpr(toks, pos + 1)?;
+  let p = expectP(toks, scrut.pos, "{")?;
+  let arms: MatchArm[] = [];
+  while (!isP(toks, p, "}")) {
+    const pat = parsePattern(toks, p)?;
+    const arrow = expectP(toks, pat.pos, "=>")?;
+    if (isP(toks, arrow, "{")) {
+      // Block arm: the comma after it is optional.
+      const b = parseBlock(toks, arrow)?;
+      arms.push(MatchArm { pattern: pat.pat, body: BBlock(b.block), span: spanTo(pat.pat.span, b.block.span) });
+      p = b.pos;
+      if (isP(toks, p, ",")) {
+        p += 1;
+      }
+    } else {
+      const e = parseExpr(toks, arrow)?;
+      arms.push(MatchArm { pattern: pat.pat, body: BExpr(e.expr), span: spanTo(pat.pat.span, e.expr.span) });
+      p = e.pos;
+      if (isP(toks, p, ",")) {
+        p += 1;
+      } else if (!isP(toks, p, "}")) {
+        return Err(errExpected(toks, p, "`,` or `}`"));
+      }
+    }
+  }
+  p += 1;
+  return Ok(ExprRes { expr: mkExpr(EMatch(scrut.expr, arms), spanTo(start, lastSpan(toks, p))), pos: p });
+}
+
+// ---------------------------------------------------------------------------
+// Patterns
+// ---------------------------------------------------------------------------
+
+function mkPat(kind: PatternKind, sp: Span, pos: usize): Result<PatRes, Diagnostic> {
+  return Ok(PatRes { pat: Pattern { kind: kind, span: sp }, pos: pos });
+}
+
+function parsePattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
+  const t = tokAt(toks, pos);
+  match (t.kind) {
+    KIdent => {
+      return parseIdentPattern(toks, pos);
+    },
+    KInt => {
+      return mkPat(PInt(t.value), t.span, pos + 1);
+    },
+    KStr => {
+      return mkPat(PStr(t.text), t.span, pos + 1);
+    },
+    KKeyword => {
+      if (t.text == "true" || t.text == "false") {
+        return mkPat(PBool(t.text == "true"), t.span, pos + 1);
+      }
+      return Err(errExpected(toks, pos, "pattern"));
+    },
+    KPunct => {
+      // Negative integer literal pattern.
+      const nt = tokAt(toks, pos + 1);
+      if (isP(toks, pos, "-")) {
+        if (isKindInt(nt)) {
+          return mkPat(PInt(0 - nt.value), spanTo(t.span, nt.span), pos + 2);
+        }
+        return Err(errExpected(toks, pos + 1, "integer after `-` in pattern"));
+      }
+      return Err(errExpected(toks, pos, "pattern"));
+    },
+    KEof => {
+      return Err(errExpected(toks, pos, "pattern"));
+    }
+  }
+}
+
+// `_`, `Name`, or `Name(p, ..)`. Nested patterns are accepted here (as in Stage 0); Orin-B's
+// restriction to bindings and `_` is enforced later, by the checker.
+function parseIdentPattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
+  const nm = parseIdent(toks, pos)?;
+  if (nm.id.name == "_") {
+    return mkPat(PWildcard, nm.id.span, nm.pos);
+  }
+  if (!isP(toks, nm.pos, "(")) {
+    return mkPat(PIdent(nm.id), nm.id.span, nm.pos);
+  }
+  let p = nm.pos + 1;
+  let subs: Pattern[] = [];
+  while (!isP(toks, p, ")")) {
+    const sub = parsePattern(toks, p)?;
+    subs.push(sub.pat);
+    p = sub.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, ")")) {
+      return Err(errExpected(toks, p, "`,` or `)`"));
+    }
+  }
+  p += 1;
+  return mkPat(PVariant(nm.id, subs), spanTo(nm.id.span, lastSpan(toks, p)), p);
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+export function parse(file: usize, src: string): Result<Module, Diagnostic> {
+  const toks = lex(file, src)?;
+  let items: Item[] = [];
+  let p: usize = 0;
+  while (!isEof(toks, p)) {
+    const r = parseItem(toks, p)?;
+    items.push(r.item);
+    p = r.pos;
+  }
+  return Ok(Module { file: file, items: items });
+}

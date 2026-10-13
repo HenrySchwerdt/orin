@@ -1,0 +1,838 @@
+// Canonical pretty-printer: AST -> source text (spec 18 §3, spec 01 canonical style).
+//
+// Layout rules: 2-space indent, `;`-terminated statements, line width 100. A call argument list,
+// array literal, record literal, parameter list, record type or union type that does not fit on
+// the line is broken one element per line with a trailing comma; a binary chain breaks before
+// its operators (4-space continuation), `c ? a : b` breaks before `?` and `:`. Everything else
+// is single-line. `match` is always multi-line. Parentheses are re-derived from precedence (the
+// AST has none). Comments are re-inserted by position (layout.or).
+//
+// Expression printing: `ex(c, e, ind, col, tail, lim)` returns the text of `e` where `ind` is the
+// indent of the current line, `col` the column where the text starts and `tail` the number of
+// characters that follow it on its last line. With `lim == HUGE` it renders the single-line form;
+// a result containing a newline then means "cannot be single-line".
+
+import { Span } from "../diag";
+import {
+  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
+  VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
+  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind
+} from "../syntax";
+import { Ctx, seq, bracketed, gapsHave, hasCommentIn, findChar } from "./layout";
+import { pad, quote, endCol } from "./text";
+
+const WIDTH: usize = 100;
+const HUGE: usize = 1000000;
+
+type Chain = { operands: Expr[]; ops: string[]; };
+
+// ---------------------------------------------------------------------------
+// Types, patterns, small tokens
+// ---------------------------------------------------------------------------
+
+function joinTypes(ts: TypeExpr[]): string {
+  let parts: string[] = [];
+  for (const t of ts) {
+    parts.push(typeText(t));
+  }
+  return parts.join(", ");
+}
+
+function typeText(t: TypeExpr): string {
+  match (t.kind) {
+    TNamed(id, args) => {
+      if (args.length == 0) {
+        return id.name;
+      }
+      return id.name + "<" + joinTypes(args) + ">";
+    },
+    TArray(el) => {
+      return typeText(el) + "[]";
+    }
+  }
+}
+
+function typeParamsText(ids: Ident[]): string {
+  if (ids.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  for (const id of ids) {
+    parts.push(id.name);
+  }
+  return "<" + parts.join(", ") + ">";
+}
+
+function binLevel(op: BinaryOp): int {
+  match (op) {
+    BOr => { return 0; },
+    BAnd => { return 1; },
+    BEq => { return 2; },
+    BNe => { return 2; },
+    BLt => { return 3; },
+    BLe => { return 3; },
+    BGt => { return 3; },
+    BGe => { return 3; },
+    BAdd => { return 4; },
+    BSub => { return 4; },
+    BMul => { return 5; },
+    BDiv => { return 5; },
+    BRem => { return 5; }
+  }
+}
+
+function binText(op: BinaryOp): string {
+  match (op) {
+    BOr => { return "||"; },
+    BAnd => { return "&&"; },
+    BEq => { return "=="; },
+    BNe => { return "!="; },
+    BLt => { return "<"; },
+    BLe => { return "<="; },
+    BGt => { return ">"; },
+    BGe => { return ">="; },
+    BAdd => { return "+"; },
+    BSub => { return "-"; },
+    BMul => { return "*"; },
+    BDiv => { return "/"; },
+    BRem => { return "%"; }
+  }
+}
+
+function assignText(op: AssignOp): string {
+  match (op) {
+    OpAssign => { return "="; },
+    OpAddAssign => { return "+="; },
+    OpSubAssign => { return "-="; },
+    OpMulAssign => { return "*="; },
+    OpDivAssign => { return "/="; },
+    OpRemAssign => { return "%="; }
+  }
+}
+
+function isSpaceCh(ch: int): bool {
+  return ch == 32 || ch == 9 || ch == 10 || ch == 13;
+}
+
+function isHexCh(ch: int): bool {
+  return (ch >= 48 && ch <= 57) || (ch >= 97 && ch <= 102) || (ch >= 65 && ch <= 70);
+}
+
+// Source spelling of an integer literal (keeps hex notation); `[a, b)` covers the literal and
+// possibly surrounding parentheses / whitespace.
+function litText(c: Ctx, a0: usize, b0: usize, v: int): string {
+  let a = a0;
+  let b = b0;
+  while (a < b && (c.src.charCodeAt(a) == 40 || isSpaceCh(c.src.charCodeAt(a)))) {
+    a += 1;
+  }
+  while (b > a && (c.src.charCodeAt(b - 1) == 41 || isSpaceCh(c.src.charCodeAt(b - 1)))) {
+    b -= 1;
+  }
+  const t = c.src.substring(a, b);
+  if (t.length > 2 && t.charCodeAt(0) == 48 && (t.charCodeAt(1) == 120 || t.charCodeAt(1) == 88)) {
+    let ok = true;
+    let i: usize = 2;
+    while (i < t.length) {
+      if (!isHexCh(t.charCodeAt(i))) {
+        ok = false;
+      }
+      i += 1;
+    }
+    if (ok) {
+      return t;
+    }
+  }
+  return v.toString();
+}
+
+function patText(c: Ctx, p: Pattern): string {
+  match (p.kind) {
+    PWildcard => { return "_"; },
+    PIdent(id) => { return id.name; },
+    PVariant(id, subs) => {
+      let parts: string[] = [];
+      for (const s of subs) {
+        parts.push(patText(c, s));
+      }
+      return id.name + "(" + parts.join(", ") + ")";
+    },
+    PInt(v) => {
+      if (v < 0) {
+        return "-" + litText(c, p.span.start + 1, p.span.end, 0 - v);
+      }
+      return litText(c, p.span.start, p.span.end, v);
+    },
+    PStr(s) => { return quote(s); },
+    PBool(b) => { return b ? "true" : "false"; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------------
+
+// Binding strength: 0 `?:`, 1..6 binary levels, 7 unary, 8 postfix, 9 primary.
+function prec(e: Expr): int {
+  match (e.kind) {
+    ECond(_, _, _) => { return 0; },
+    EBinary(op, _, _) => { return binLevel(op) + 1; },
+    EUnary(_, _) => { return 7; },
+    ECall(_, _) => { return 8; },
+    EMember(_, _) => { return 8; },
+    EIndex(_, _) => { return 8; },
+    ETry(_) => { return 8; },
+    _ => { return 9; }
+  }
+}
+
+// `e` as an operand needing binding strength >= `need` (else parenthesised). `noTry`: the operand is
+// followed by something that would make a trailing `?` parse as a conditional, so wrap it.
+function sub(c: Ctx, e: Expr, need: int, ind: usize, col: usize, tail: usize, noTry: bool, lim: usize): string {
+  if (prec(e) < need) {
+    return "(" + ex(c, e, ind, col + 1, tail + 1, lim) + ")";
+  }
+  const s = ex(c, e, ind, col, tail, lim);
+  if (noTry && s.endsWith("?")) {
+    return "(" + ex(c, e, ind, col + 1, tail + 1, lim) + ")";
+  }
+  return s;
+}
+
+function ex(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  if (lim < HUGE) {
+    const f = ex(c, e, 0, 0, 0, HUGE);
+    if (!f.includes("\n") && col + f.length + tail <= lim) {
+      return f;
+    }
+  }
+  return exBreak(c, e, ind, col, tail, lim);
+}
+
+function exBreak(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  match (e.kind) {
+    EInt(v) => {
+      return litText(c, e.span.start, e.span.end, v);
+    },
+    EStr(s) => {
+      return quote(s);
+    },
+    EBool(b) => {
+      return b ? "true" : "false";
+    },
+    EIdent(id) => {
+      return id.name;
+    },
+    EUnary(op, x) => {
+      const o = match (op) {
+        UNot => "!",
+        UNeg => "-"
+      };
+      const xs = sub(c, x, 7, ind, col + 1, tail, false, lim);
+      if (o == "-" && xs.startsWith("-")) {
+        return "-(" + ex(c, x, ind, col + 2, tail + 1, lim) + ")";
+      }
+      return o + xs;
+    },
+    EBinary(_, _, _) => {
+      return binaryText(c, e, ind, col, tail, lim);
+    },
+    ECall(callee, args) => {
+      if (lim < HUGE) {
+        const sg = segsOf(e);
+        if (sg.calls >= 2) {
+          return chainText(c, sg, ind, col, tail, lim);
+        }
+      }
+      return callText(c, e, callee, args, ind, col, tail, lim);
+    },
+    EMember(o, id) => {
+      return sub(c, o, 8, ind, col, tail + 1 + id.name.length, false, lim) + "." + id.name;
+    },
+    EIndex(o, ix) => {
+      const os = sub(c, o, 8, ind, col, 1, true, lim);
+      return os + "[" + ex(c, ix, ind, endCol(os, col) + 1, tail + 1, lim) + "]";
+    },
+    ETry(x) => {
+      return sub(c, x, 8, ind, col, tail + 1, false, lim) + "?";
+    },
+    ECond(cd, a, b) => {
+      return condText(c, cd, a, b, ind, col, tail, lim);
+    },
+    EArray(xs) => {
+      return arrayText(c, e, xs, ind, lim);
+    },
+    ERecord(nm, spread, fields) => {
+      const noArgs: TypeExpr[] = [];
+      return recordText(c, e, nm, noArgs, spread, fields, ind, lim);
+    },
+    ERecordT(nm, tys, spread, fields) => {
+      return recordText(c, e, nm, tys, spread, fields, ind, lim);
+    },
+    ETyApp(id, tys) => {
+      return id.name + "<" + joinTypes(tys) + ">";
+    },
+    EMatch(scrut, arms) => {
+      return matchText(c, e, scrut, arms, ind, col, lim);
+    }
+  }
+}
+
+function collect(e: Expr, lvl: int): Chain {
+  match (e.kind) {
+    EBinary(op, l, r) => {
+      if (binLevel(op) == lvl) {
+        const left = collect(l, lvl);
+        let operands = left.operands;
+        let ops = left.ops;
+        operands.push(r);
+        ops.push(binText(op));
+        return Chain { operands: operands, ops: ops };
+      }
+    },
+    _ => {}
+  }
+  const ops: string[] = [];
+  return Chain { operands: [e], ops: ops };
+}
+
+function binaryText(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  let lvl: int = 0;
+  match (e.kind) {
+    EBinary(op, _, _) => {
+      lvl = binLevel(op);
+    },
+    _ => {}
+  }
+  const ch = collect(e, lvl);
+  const n = ch.operands.length;
+  if (lim >= HUGE) {
+    let parts: string[] = [];
+    let i: usize = 0;
+    while (i < n) {
+      if (i > 0) {
+        parts.push(" " + ch.ops[i - 1] + " ");
+      }
+      const need = i == 0 ? lvl + 1 : lvl + 2;
+      parts.push(sub(c, ch.operands[i], need, 0, 0, 0, i + 1 < n, HUGE));
+      i += 1;
+    }
+    return parts.join("");
+  }
+  // Additive chains (string concatenation) are filled; other chains break before every operator.
+  const fill = lvl == 4;
+  let lines: string[] = [];
+  let cur = "";
+  let curCol = col;
+  let i: usize = 0;
+  while (i < n) {
+    const last = i + 1 == n;
+    const t = last ? tail : 0;
+    if (i == 0) {
+      cur = sub(c, ch.operands[0], lvl + 1, ind, col, t, true, lim);
+      curCol = endCol(cur, col);
+    } else {
+      const op = ch.ops[i - 1];
+      const flatOp = sub(c, ch.operands[i], lvl + 2, 0, 0, 0, !last, HUGE);
+      const piece = op + " " + flatOp;
+      if (fill && !flatOp.includes("\n") && !cur.includes("\n") && curCol + 1 + piece.length + t <= lim) {
+        cur = cur + " " + piece;
+        curCol = curCol + 1 + piece.length;
+      } else {
+        lines.push(cur);
+        const oc = ind + 4 + op.length + 1;
+        cur = pad(ind + 4) + op + " " + sub(c, ch.operands[i], lvl + 2, ind + 4, oc, t, !last, lim);
+        curCol = endCol(cur, 0);
+      }
+    }
+    i += 1;
+  }
+  lines.push(cur);
+  return lines.join("\n");
+}
+
+function condText(c: Ctx, cd: Expr, a: Expr, b: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  if (lim >= HUGE) {
+    return sub(c, cd, 1, 0, 0, 0, false, HUGE) + " ? " + ex(c, a, 0, 0, 0, HUGE) + " : " + ex(c, b, 0, 0, 0, HUGE);
+  }
+  const p = pad(ind + 4);
+  return sub(c, cd, 1, ind, col, 0, false, lim) + "\n" + p + "? " + ex(c, a, ind + 4, ind + 6, 0, lim) + "\n" + p
+    + ": " + ex(c, b, ind + 4, ind + 6, tail, lim);
+}
+
+function callText(c: Ctx, e: Expr, callee: Expr, args: Expr[], ind: usize, col: usize, tail: usize, lim: usize): string {
+  const cs = sub(c, callee, 8, ind, col, 1, true, lim);
+  return callArgs(c, e, cs, callee.span.end, args, ind, col, tail, lim);
+}
+
+// `cs(args)` where `cs` is the already rendered callee starting at column `col`; `calleeEnd` is the
+// source position after the callee, `e` the call expression (for its closing parenthesis).
+function callArgs(c: Ctx, e: Expr, cs: string, calleeEnd: usize, args: Expr[], ind: usize, col: usize, tail: usize, lim: usize): string {
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  for (const a of args) {
+    starts.push(a.span.start);
+    ends.push(a.span.end);
+  }
+  const open = findChar(c, calleeEnd, 40) + 1;
+  const close = e.span.end - 1;
+  const forced = gapsHave(c, starts, ends, open, close);
+  if (args.length == 0 && !forced) {
+    return cs + "()";
+  }
+  if (lim >= HUGE) {
+    if (forced) {
+      return "\n";
+    }
+    let parts: string[] = [];
+    for (const a of args) {
+      parts.push(ex(c, a, 0, 0, 0, HUGE));
+    }
+    return cs + "(" + parts.join(", ") + ")";
+  }
+  const f = callArgs(c, e, cs, calleeEnd, args, ind, col, tail, HUGE);
+  if (!f.includes("\n") && col + f.length + tail <= lim) {
+    return f;
+  }
+  if (args.length == 1 && !forced) {
+    const hug = match (args[0].kind) {
+      ERecord(_, _, _) => true,
+      EArray(_) => true,
+      _ => false
+    };
+    if (hug) {
+      return cs + "(" + ex(c, args[0], ind, endCol(cs, col) + 1, tail + 1, lim) + ")";
+    }
+  }
+  let texts: string[] = [];
+  for (const a of args) {
+    texts.push(ex(c, a, ind + 2, ind + 2, 1, lim));
+  }
+  return bracketed(c, cs + "(", ")", open, close, starts, ends, texts, ind, ",");
+}
+
+type Segs = { root: Expr; nodes: Expr[]; calls: usize; };
+
+// A method-call chain `root.a(..).b(..)`: `nodes` are the call nodes, outermost first.
+function segsOf(e: Expr): Segs {
+  let nodes: Expr[] = [];
+  let cur = e;
+  let go = true;
+  while (go) {
+    let next = cur;
+    let step = false;
+    match (cur.kind) {
+      ECall(callee, _) => {
+        match (callee.kind) {
+          EMember(o, _) => {
+            nodes.push(cur);
+            next = o;
+            step = true;
+          },
+          _ => {}
+        }
+      },
+      _ => {}
+    }
+    if (step) {
+      cur = next;
+    } else {
+      go = false;
+    }
+  }
+  return Segs { root: cur, nodes: nodes, calls: nodes.length };
+}
+
+// Too-long method chain: the receiver, then one `.call(..)` per line (4-space continuation).
+function chainText(c: Ctx, sg: Segs, ind: usize, col: usize, tail: usize, lim: usize): string {
+  let out = sub(c, sg.root, 8, ind, col, 0, true, lim);
+  let k = sg.nodes.length;
+  while (k > 0) {
+    k -= 1;
+    const nd = sg.nodes[k];
+    match (nd.kind) {
+      ECall(callee, args) => {
+        match (callee.kind) {
+          EMember(_, id) => {
+            const t = k == 0 ? tail : 0;
+            out += "\n" + pad(ind + 4) + callArgs(c, nd, "." + id.name, id.span.end, args, ind + 4, ind + 4, t, lim);
+          },
+          _ => {}
+        }
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+function arrayText(c: Ctx, e: Expr, xs: Expr[], ind: usize, lim: usize): string {
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  for (const x of xs) {
+    starts.push(x.span.start);
+    ends.push(x.span.end);
+  }
+  const open = findChar(c, e.span.start, 91) + 1;
+  const close = e.span.end - 1;
+  const forced = gapsHave(c, starts, ends, open, close);
+  if (xs.length == 0 && !forced) {
+    return "[]";
+  }
+  if (lim >= HUGE) {
+    if (forced) {
+      return "\n";
+    }
+    let parts: string[] = [];
+    for (const x of xs) {
+      parts.push(ex(c, x, 0, 0, 0, HUGE));
+    }
+    return "[" + parts.join(", ") + "]";
+  }
+  let texts: string[] = [];
+  for (const x of xs) {
+    texts.push(ex(c, x, ind + 2, ind + 2, 1, lim));
+  }
+  return bracketed(c, "[", "]", open, close, starts, ends, texts, ind, ",");
+}
+
+function recordText(c: Ctx, e: Expr, nm: Ident, tyArgs: TypeExpr[], spread: Option<Expr>, fields: FieldInit[], ind: usize, lim: usize): string {
+  const head = tyArgs.length == 0 ? nm.name : nm.name + "<" + joinTypes(tyArgs) + ">";
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  if (spread.isSome()) {
+    starts.push(spread.unwrap().span.start);
+    ends.push(spread.unwrap().span.end);
+  }
+  for (const f of fields) {
+    starts.push(f.span.start);
+    ends.push(f.span.end);
+  }
+  const open = findChar(c, nm.span.end, 123) + 1;
+  const close = e.span.end - 1;
+  const forced = gapsHave(c, starts, ends, open, close);
+  if (starts.length == 0 && !forced) {
+    return head + " {}";
+  }
+  if (lim >= HUGE) {
+    if (forced) {
+      return "\n";
+    }
+    let parts: string[] = [];
+    if (spread.isSome()) {
+      parts.push("..." + ex(c, spread.unwrap(), 0, 0, 0, HUGE));
+    }
+    for (const f of fields) {
+      parts.push(f.name.name + ": " + ex(c, f.value, 0, 0, 0, HUGE));
+    }
+    return head + " { " + parts.join(", ") + " }";
+  }
+  let texts: string[] = [];
+  if (spread.isSome()) {
+    texts.push("..." + ex(c, spread.unwrap(), ind + 2, ind + 5, 1, lim));
+  }
+  for (const f of fields) {
+    texts.push(f.name.name + ": " + ex(c, f.value, ind + 2, ind + 2 + f.name.name.length + 2, 1, lim));
+  }
+  return bracketed(c, head + " {", "}", open, close, starts, ends, texts, ind, ",");
+}
+
+function matchText(c: Ctx, e: Expr, scrut: Expr, arms: MatchArm[], ind: usize, col: usize, lim: usize): string {
+  if (lim >= HUGE) {
+    return "\n";
+  }
+  const head = "match (" + ex(c, scrut, ind, col + 7, 3, lim) + ") {";
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const a of arms) {
+    starts.push(a.span.start);
+    ends.push(a.span.end);
+    const pt = patText(c, a.pattern);
+    match (a.body) {
+      BExpr(x) => {
+        texts.push(pt + " => " + ex(c, x, ind + 2, ind + 2 + pt.length + 4, 1, lim));
+      },
+      BBlock(b) => {
+        texts.push(pt + " => " + block(c, b, ind + 2));
+      }
+    }
+  }
+  const open = findChar(c, scrut.span.end, 123) + 1;
+  return bracketed(c, head, "}", open, e.span.end - 1, starts, ends, texts, ind, ",");
+}
+
+// ---------------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------------
+
+function isMatchExpr(e: Expr): bool {
+  return match (e.kind) {
+    EMatch(_, _) => true,
+    _ => false
+  };
+}
+
+function isMatchStmt(s: Stmt): bool {
+  return match (s.kind) {
+    SExpr(x) => isMatchExpr(x),
+    _ => false
+  };
+}
+
+// `{ stmts }` at indent `ind` (the opening brace is on the current line).
+function block(c: Ctx, b: Block, ind: usize): string {
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const s of b.stmts) {
+    starts.push(s.span.start);
+    ends.push(s.span.end);
+    texts.push(stmtText(c, s, ind + 2));
+  }
+  // A statement-level `match` has no `;`; keep one when the next statement could continue it.
+  let i: usize = 0;
+  while (i + 1 < texts.length) {
+    if (isMatchStmt(b.stmts[i])) {
+      const ch = texts[i + 1].charCodeAt(0);
+      if (ch == 40 || ch == 91 || ch == 45) {
+        texts[i] = texts[i] + ";";
+      }
+    }
+    i += 1;
+  }
+  return bracketed(c, "{", "}", b.span.start + 1, b.span.end - 1, starts, ends, texts, ind, "");
+}
+
+function stmtText(c: Ctx, s: Stmt, ind: usize): string {
+  match (s.kind) {
+    SLet(mutable, name, ty, init) => {
+      let head = (mutable ? "let " : "const ") + name.name;
+      if (ty.isSome()) {
+        head += ": " + typeText(ty.unwrap());
+      }
+      head += " = ";
+      return head + ex(c, init, ind, ind + head.length, 1, WIDTH) + ";";
+    },
+    SAssign(target, op, value) => {
+      const head = ex(c, target, ind, ind, 4, WIDTH) + " " + assignText(op) + " ";
+      return head + ex(c, value, ind, endCol(head, ind), 1, WIDTH) + ";";
+    },
+    SExpr(x) => {
+      if (isMatchExpr(x)) {
+        return ex(c, x, ind, ind, 0, WIDTH);
+      }
+      return ex(c, x, ind, ind, 1, WIDTH) + ";";
+    },
+    SReturn(v) => {
+      if (v.isSome()) {
+        return "return " + ex(c, v.unwrap(), ind, ind + 7, 1, WIDTH) + ";";
+      }
+      return "return;";
+    },
+    SIf(cond, thenB, els) => {
+      let out = "if (" + ex(c, cond, ind, ind + 4, 3, WIDTH) + ") " + block(c, thenB, ind);
+      if (els.isSome()) {
+        out += " else " + stmtText(c, els.unwrap(), ind);
+      }
+      return out;
+    },
+    SWhile(cond, body) => {
+      return "while (" + ex(c, cond, ind, ind + 7, 3, WIDTH) + ") " + block(c, body, ind);
+    },
+    SForOf(name, iter, body) => {
+      const head = "for (const " + name.name + " of ";
+      return head + ex(c, iter, ind, ind + head.length, 3, WIDTH) + ") " + block(c, body, ind);
+    },
+    SBreak => {
+      return "break;";
+    },
+    SContinue => {
+      return "continue;";
+    },
+    SBlock(b) => {
+      return block(c, b, ind);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Items
+// ---------------------------------------------------------------------------
+
+function importText(c: Ctx, kw: string, d: ImportDecl): string {
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let names: string[] = [];
+  for (const id of d.names) {
+    starts.push(id.span.start);
+    ends.push(id.span.end);
+    names.push(id.name);
+  }
+  const open = findChar(c, d.span.start, 123) + 1;
+  const close = d.pathSpan.start;
+  const forced = gapsHave(c, starts, ends, open, close);
+  const rest = " from " + quote(d.path) + ";";
+  if (names.length == 0 && !forced) {
+    return kw + " {}" + rest;
+  }
+  const flat = kw + " { " + names.join(", ") + " }" + rest;
+  if (!forced && flat.length <= WIDTH) {
+    return flat;
+  }
+  if (forced) {
+    return bracketed(c, kw + " {", "}", open, close, starts, ends, names, 0, ",") + rest;
+  }
+  let lines: string[] = [];
+  let cur = "  ";
+  for (const nm of names) {
+    const piece = nm + ",";
+    if (cur.length == 2) {
+      cur = cur + piece;
+    } else if (cur.length + 1 + piece.length > WIDTH) {
+      lines.push(cur);
+      cur = "  " + piece;
+    } else {
+      cur = cur + " " + piece;
+    }
+  }
+  lines.push(cur);
+  return kw + " {\n" + lines.join("\n") + "\n}" + rest;
+}
+
+function functionText(c: Ctx, f: FunctionDecl): string {
+  const head = (f.exported ? "export " : "") + "function " + f.name.name + typeParamsText(f.typeParams);
+  let ret = "";
+  if (f.ret.isSome()) {
+    ret = ": " + typeText(f.ret.unwrap());
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  let lo2 = f.name.span.end;
+  for (const tp of f.typeParams) {
+    if (tp.span.end > lo2) {
+      lo2 = tp.span.end;
+    }
+  }
+  for (const p of f.params) {
+    starts.push(p.span.start);
+    ends.push(p.span.end);
+    texts.push(p.name.name + ": " + typeText(p.ty));
+  }
+  const open = findChar(c, lo2, 40) + 1;
+  const close = f.body.span.start;
+  const forced = gapsHave(c, starts, ends, open, close);
+  const flat = head + "(" + texts.join(", ") + ")" + ret + " ";
+  if (!forced && flat.length + 1 <= WIDTH) {
+    return flat + block(c, f.body, 0);
+  }
+  return bracketed(c, head + "(", ")", open, close, starts, ends, texts, 0, ",") + ret + " " + block(c, f.body, 0);
+}
+
+function variantText(v: VariantDecl): string {
+  if (v.payload.length == 0) {
+    return v.name.name;
+  }
+  return v.name.name + "(" + joinTypes(v.payload) + ")";
+}
+
+function typeDeclText(c: Ctx, t: TypeDecl): string {
+  const head = (t.exported ? "export " : "") + "type " + t.name.name + typeParamsText(t.typeParams) + " =";
+  const hi = t.span.end - 1;
+  match (t.body) {
+    DAlias(ty) => {
+      return head + " " + typeText(ty) + ";";
+    },
+    DRecord(fields) => {
+      let starts: usize[] = [];
+      let ends: usize[] = [];
+      let texts: string[] = [];
+      let lo2 = t.name.span.end;
+      for (const tp of t.typeParams) {
+        if (tp.span.end > lo2) {
+          lo2 = tp.span.end;
+        }
+      }
+      for (const f of fields) {
+        starts.push(f.span.start);
+        ends.push(f.span.end);
+        texts.push(f.name.name + ": " + typeText(f.ty));
+      }
+      const open = findChar(c, lo2, 123) + 1;
+      const forced = gapsHave(c, starts, ends, open, hi);
+      if (fields.length == 0 && !forced) {
+        return head + " {};";
+      }
+      const flat = head + " { " + texts.join("; ") + "; };";
+      if (!forced && flat.length <= WIDTH) {
+        return flat;
+      }
+      return head + " " + bracketed(c, "{", "}", open, hi, starts, ends, texts, 0, ";") + ";";
+    },
+    DUnion(variants) => {
+      let starts: usize[] = [];
+      let ends: usize[] = [];
+      let texts: string[] = [];
+      for (const v of variants) {
+        starts.push(v.span.start);
+        ends.push(v.span.end);
+        texts.push((texts.length == 0 ? "" : "| ") + variantText(v));
+      }
+      const forced = gapsHave(c, starts, ends, t.name.span.end, hi);
+      const flat = head + " " + texts.join(" ") + ";";
+      if (!forced && flat.length <= WIDTH) {
+        return flat;
+      }
+      texts[texts.length - 1] = texts[texts.length - 1] + ";";
+      return head + "\n" + seq(c, starts, ends, texts, t.name.span.end, hi, 2, "");
+    }
+  }
+}
+
+function constText(c: Ctx, k: ConstDecl): string {
+  let head = (k.exported ? "export " : "") + "const " + k.name.name;
+  if (k.ty.isSome()) {
+    head += ": " + typeText(k.ty.unwrap());
+  }
+  head += " = ";
+  return head + ex(c, k.value, 0, head.length, 1, WIDTH) + ";";
+}
+
+function itemSpan(it: Item): Span {
+  match (it) {
+    IImport(d) => { return d.span; },
+    IReExport(d) => { return d.span; },
+    IFunction(f) => { return f.span; },
+    IType(t) => { return t.span; },
+    IConst(k) => { return k.span; }
+  }
+}
+
+function itemText(c: Ctx, it: Item): string {
+  match (it) {
+    IImport(d) => { return importText(c, "import", d); },
+    IReExport(d) => { return importText(c, "export", d); },
+    IFunction(f) => { return functionText(c, f); },
+    IType(t) => { return typeDeclText(c, t); },
+    IConst(k) => { return constText(c, k); }
+  }
+}
+
+// Whole module, with a trailing newline (empty output for an empty file). Markers still present.
+export function printModule(c: Ctx, m: Module): string {
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const it of m.items) {
+    const sp = itemSpan(it);
+    starts.push(sp.start);
+    ends.push(sp.end);
+    texts.push(itemText(c, it));
+  }
+  const out = seq(c, starts, ends, texts, 0, c.src.length, 0, "");
+  if (out == "") {
+    return "";
+  }
+  return out + "\n";
+}

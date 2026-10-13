@@ -1,0 +1,77 @@
+// Signatures of built-in functions and methods (docs/bootstrap-subset.md §6).
+// Port of `builtin_sig` and `method_sig` from bootstrap/src/checker/mod.rs.
+
+import { Type, Builtin } from "../hir";
+import { typeEq } from "./env";
+
+export type Sig = { params: Type[]; ret: Type; };
+export type MSig = { op: Builtin; params: Type[]; ret: Type; };
+
+function sig(params: Type[], ret: Type): Sig {
+  return Sig { params: params, ret: ret };
+}
+
+export function builtinSig(b: Builtin): Sig {
+  const none: Type[] = [];
+  return match (b) {
+    BParseInt => sig([TyString], TyOption(TyInt)),
+    BFsReadFile => sig([TyString], TyResult(TyString, TyString)),
+    BFsWriteFile => sig([TyString, TyString], TyResult(TyVoid, TyString)),
+    BFsExists => sig([TyString], TyBool),
+    BProcessArgs => sig(none, TyArray(TyString)),
+    BProcessExit => sig([TyInt], TyVoid),
+    BConsoleLog => sig([TyString], TyVoid),
+    BConsoleError => sig([TyString], TyVoid),
+    BStringFromCharCode => sig([TyInt], TyString),
+    _ => sig(none, TyVoid)
+  };
+}
+
+function ms(op: Builtin, params: Type[], ret: Type): Option<MSig> {
+  return Some(MSig { op: op, params: params, ret: ret });
+}
+
+function stringMethod(name: string): Option<MSig> {
+  const none: Type[] = [];
+  if (name == "charCodeAt") { return ms(BStrCharCodeAt, [TyUsize], TyInt); }
+  if (name == "charAt") { return ms(BStrCharAt, [TyUsize], TyString); }
+  if (name == "substring") { return ms(BStrSubstring, [TyUsize, TyUsize], TyString); }
+  if (name == "indexOf") { return ms(BStrIndexOf, [TyString], TyOption(TyUsize)); }
+  if (name == "includes") { return ms(BStrIncludes, [TyString], TyBool); }
+  if (name == "startsWith") { return ms(BStrStartsWith, [TyString], TyBool); }
+  if (name == "endsWith") { return ms(BStrEndsWith, [TyString], TyBool); }
+  if (name == "split") { return ms(BStrSplit, [TyString], TyArray(TyString)); }
+  if (name == "trim") { return ms(BStrTrim, none, TyString); }
+  return None;
+}
+
+function arrayMethod(t: Type, name: string): Option<MSig> {
+  const none: Type[] = [];
+  if (name == "get") { return ms(BArrGet, [TyUsize], TyOption(t)); }
+  if (name == "slice") { return ms(BArrSlice, [TyUsize, TyUsize], TyArray(t)); }
+  if (name == "concat") { return ms(BArrConcat, [TyArray(t)], TyArray(t)); }
+  if (name == "join" && typeEq(t, TyString)) { return ms(BArrJoin, [TyString], TyString); }
+  return None;
+}
+
+export function methodSig(recv: Type, name: string): Option<MSig> {
+  const none: Type[] = [];
+  return match (recv) {
+    TyString => stringMethod(name),
+    TyArray(t) => arrayMethod(t, name),
+    TyInt => name == "toString" ? ms(BIntToString, none, TyString)
+      : (name == "toUsize" ? ms(BIntToUsize, none, TyUsize) : None),
+    TyUsize => name == "toString" ? ms(BUsizeToString, none, TyString)
+      : (name == "toInt" ? ms(BUsizeToInt, none, TyInt) : None),
+    TyBool => name == "toString" ? ms(BBoolToString, none, TyString) : None,
+    TyOption(t) => name == "isSome" ? ms(BOptIsSome, none, TyBool)
+      : (name == "isNone" ? ms(BOptIsNone, none, TyBool)
+      : (name == "unwrap" ? ms(BOptUnwrap, none, t)
+      : (name == "unwrapOr" ? ms(BOptUnwrapOr, [t], t) : None))),
+    TyResult(t, e) => name == "isOk" ? ms(BResIsOk, none, TyBool)
+      : (name == "isErr" ? ms(BResIsErr, none, TyBool)
+      : (name == "unwrap" ? ms(BResUnwrap, none, t)
+      : (name == "unwrapErr" ? ms(BResUnwrapErr, none, e) : None))),
+    _ => None
+  };
+}

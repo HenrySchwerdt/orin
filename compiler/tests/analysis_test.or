@@ -1,0 +1,273 @@
+// Assertions for compiler/analysis (workspace overlay, diagnostics, symbols, completions,
+// positions, SemanticIndex queries on a hand-built index). Prints `ok` or one line per failure.
+// Build: build/bootstrap/orin2 compile compiler/tests/analysis_test.or -o x.c && cc -O1 -w -I runtime x.c runtime/orin_runtime.c
+
+import {
+  newWorkspace, openFile, changeFile, closeFile, fileText, openPaths, analyze, diagsForPath, documentSymbols,
+  keywordCompletions, declCompletions, offsetToPos, posToOffset, definitionAt, hoverAt, referencesTo,
+  renameEdits, symbolSpanAt, Workspace, DocSymbol, CompletionItem, PathDiag, DkFunction, DkRecord,
+  DkUnion, DkVariant, DkConst, DkField, DkImported, DkAlias
+} from "../analysis";
+import { SemanticIndex, SymbolDef, SymbolRef, TypeAt, SkFunction, SkParam } from "../hir";
+import { Span, span } from "../diag";
+import { exit } from "std:process";
+
+function eq(fails: string[], what: string, got: string, want: string): string[] {
+  let f = fails;
+  if (got != want) {
+    f.push(what + ": got `" + got + "`, want `" + want + "`");
+  }
+  return f;
+}
+
+function eqi(fails: string[], what: string, got: usize, want: usize): string[] {
+  return eq(fails, what, got.toString(), want.toString());
+}
+
+function names(items: CompletionItem[]): string {
+  let parts: string[] = [];
+  for (const i of items) {
+    parts.push(i.label);
+  }
+  return parts.join(",");
+}
+
+function symNames(ss: DocSymbol[]): string {
+  let parts: string[] = [];
+  for (const s of ss) {
+    parts.push(s.name);
+  }
+  return parts.join(",");
+}
+
+function diagLine(d: PathDiag): string {
+  return d.path + " " + d.code + " " + d.start.toString() + "-" + d.end.toString();
+}
+
+// Span of the nth-agnostic first occurrence of `needle` in `text` (file 0).
+function sp(text: string, needle: string): Span {
+  const i = text.indexOf(needle).unwrap();
+  return span(0, i, i + needle.length);
+}
+
+// Span of the occurrence of `needle` that starts at or after `begin`.
+function spAfter(text: string, begin: usize, needle: string): Span {
+  const rest = text.substring(begin, text.length);
+  const i = begin + rest.indexOf(needle).unwrap();
+  return span(0, i, i + needle.length);
+}
+
+function testWorkspace(f: string[]): string[] {
+  let fails = f;
+  let ws = newWorkspace();
+  fails = eqi(fails, "rev0", ws.revision.toUsize(), 0);
+  ws = openFile(ws, "/w/./a.or", "one");
+  ws = openFile(ws, "/w/b.or", "two");
+  fails = eq(fails, "text a", fileText(ws, "/w/a.or").unwrapOr("?"), "one");
+  ws = changeFile(ws, "/w/x/../a.or", "uno");
+  fails = eq(fails, "changed a", fileText(ws, "/w/a.or").unwrapOr("?"), "uno");
+  fails = eq(fails, "paths", openPaths(ws).join(";"), "/w/a.or;/w/b.or");
+  ws = closeFile(ws, "/w/a.or");
+  fails = eq(fails, "closed", fileText(ws, "/w/a.or").isNone().toString(), "true");
+  fails = eqi(fails, "rev4", ws.revision.toUsize(), 4);
+  return fails;
+}
+
+function testPositions(f: string[]): string[] {
+  let fails = f;
+  const t = "ab\ncd\xc3\xa9f\n\xf0\x9f\x98\x80x";
+  const p0 = offsetToPos(t, 4);
+  fails = eq(fails, "pos 4", p0.line.toString() + ":" + p0.character.toString(), "1:1");
+  // after the e-acute (2 bytes, 1 unit): byte 7 -> col 3
+  const p1 = offsetToPos(t, 7);
+  fails = eq(fails, "pos 7", p1.line.toString() + ":" + p1.character.toString(), "1:3");
+  // after the emoji (4 bytes, 2 units): line 2, col 2
+  const p2 = offsetToPos(t, 13);
+  fails = eq(fails, "pos emoji", p2.line.toString() + ":" + p2.character.toString(), "2:2");
+  fails = eqi(fails, "off 1:3", posToOffset(t, 1, 3), 7);
+  fails = eqi(fails, "off 2:2", posToOffset(t, 2, 2), 13);
+  fails = eqi(fails, "off clamp", posToOffset(t, 0, 99), 2);
+  fails = eqi(fails, "off eof", posToOffset(t, 9, 0), t.length);
+  fails = eqi(fails, "off 0:0", posToOffset(t, 0, 0), 0);
+  return fails;
+}
+
+function testAnalyze(f: string[]): string[] {
+  let fails = f;
+  // Valid file without main: no diagnostics (synthetic main).
+  let ws = openFile(newWorkspace(), "/v/ok.or", "export function f(x: int): int { return x + 1; }");
+  let a = analyze(ws, "/v/ok.or");
+  fails = eqi(fails, "ok diags", a.diags.length, 0);
+  fails = eqi(fails, "ok rev", a.revision.toUsize(), 1);
+  // Type error, position preserved.
+  ws = changeFile(ws, "/v/ok.or", "function f(): int { return true; }");
+  a = analyze(ws, "/v/ok.or");
+  fails = eqi(fails, "terr n", a.diags.length, 1);
+  if (a.diags.length == 1) {
+    fails = eq(fails, "terr", diagLine(a.diags[0]), "/v/ok.or E0400 27-31");
+  }
+  // Syntax error.
+  ws = changeFile(ws, "/v/ok.or", "function f( {");
+  a = analyze(ws, "/v/ok.or");
+  fails = eqi(fails, "syn n", a.diags.length, 1);
+  if (a.diags.length == 1) {
+    fails = eq(fails, "syn code", a.diags[0].code, "E0200");
+  }
+  // Existing main is respected (E0412 for a wrong signature is reported).
+  ws = changeFile(ws, "/v/ok.or", "function main(x: int): void { }");
+  a = analyze(ws, "/v/ok.or");
+  fails = eqi(fails, "main sig n", a.diags.length, 1);
+  // Cross-module: the error is in the imported file.
+  ws = newWorkspace();
+  ws = openFile(ws, "/v/main.or", "import { f } from \"./lib\";\nfunction main(): void { console.log(f(1).toString()); }");
+  ws = openFile(ws, "/v/lib.or", "export function f(x: int): int { return \"s\"; }");
+  a = analyze(ws, "/v/main.or");
+  fails = eqi(fails, "x n", a.diags.length, 1);
+  if (a.diags.length == 1) {
+    fails = eq(fails, "x diag", diagLine(a.diags[0]), "/v/lib.or E0400 40-43");
+  }
+  fails = eqi(fails, "x main empty", diagsForPath(a, "/v/main.or").length, 0);
+  fails = eqi(fails, "x lib", diagsForPath(a, "/v/./lib.or").length, 1);
+  // Fix the imported file: clean.
+  ws = changeFile(ws, "/v/lib.or", "export function f(x: int): int { return x; }");
+  a = analyze(ws, "/v/main.or");
+  fails = eqi(fails, "fixed", a.diags.length, 0);
+  // Imported name that is not exported -> E0300 in the importer.
+  ws = changeFile(ws, "/v/lib.or", "function f(x: int): int { return x; }");
+  a = analyze(ws, "/v/main.or");
+  fails = eqi(fails, "unexported n", a.diags.length, 1);
+  if (a.diags.length == 1) {
+    fails = eq(fails, "unexported", a.diags[0].code + " " + a.diags[0].path, "E0300 /v/main.or");
+  }
+  // Missing module.
+  ws = changeFile(ws, "/v/main.or", "import { g } from \"./nothere\";\nfunction main(): void { }");
+  a = analyze(ws, "/v/main.or");
+  fails = eqi(fails, "missing n", a.diags.length, 1);
+  if (a.diags.length == 1) {
+    fails = eq(fails, "missing", a.diags[0].code, "E0301");
+  }
+  return fails;
+}
+
+function testSymbols(f: string[]): string[] {
+  let fails = f;
+  const src = "import { g } from \"./lib\";\nexport type P = { x: int; y: int; };\ntype S = A(int) | B;\ntype N = string;\nconst K: int = 3;\nfunction h(a: int, b: string): bool { return true; }\n";
+  const ws = openFile(newWorkspace(), "/s/a.or", src);
+  const ss = documentSymbols(ws, "/s/a.or");
+  fails = eq(fails, "top names", symNames(ss), "P,S,N,K,h");
+  if (ss.length == 5) {
+    fails = eq(fails, "P children", symNames(ss[0].children), "x,y");
+    fails = eq(fails, "S children", symNames(ss[1].children), "A,B");
+    fails = eq(fails, "h detail", ss[4].detail, "function h(a: int, b: string): bool");
+    fails = eq(fails, "K detail", ss[3].detail, "const K: int");
+    fails = eq(fails, "A detail", ss[1].children[0].detail, "A(int): S");
+    fails = eqi(fails, "P nameSpan", ss[0].nameSpan.start, src.indexOf("P =").unwrap());
+    fails = eq(fails, "P exported", ss[0].exported.toString(), "true");
+    fails = eq(fails, "kinds", match (ss[0].kind) { DkRecord => "rec", _ => "?" } + match (ss[1].kind) { DkUnion => "uni", _ => "?" }
+      + match (ss[2].kind) { DkAlias => "ali", _ => "?" } + match (ss[3].kind) { DkConst => "con", _ => "?" }
+      + match (ss[4].kind) { DkFunction => "fun", _ => "?" }, "recunialiconfun");
+  }
+  const bad = openFile(newWorkspace(), "/s/bad.or", "function (");
+  fails = eqi(fails, "bad syms", documentSymbols(bad, "/s/bad.or").length, 0);
+  fails = eqi(fails, "kw count", keywordCompletions().length, 18);
+
+  // Completions: own decls (+ union variants) and imported names (+ imported variants).
+  let ws2 = openFile(newWorkspace(), "/s/lib.or", "export type Shape = Circle(int) | Dot;\nexport function area(s: Shape): int { return 0; }\nfunction hidden(): void { }\n");
+  ws2 = openFile(ws2, "/s/main.or", "import { Shape, area, hidden, nothing } from \"./lib\";\ntype T = { q: int; };\nfunction main(): void { }\n");
+  const cs = declCompletions(ws2, "/s/main.or");
+  fails = eq(fails, "completions", names(cs), "T,main,Shape,Circle,Dot,area,hidden,nothing");
+  if (cs.length == 8) {
+    fails = eq(fails, "area detail", cs[5].detail, "function area(s: Shape): int");
+    fails = eq(fails, "hidden imported", match (cs[6].kind) { DkImported => "imp", _ => "?" }, "imp");
+    fails = eq(fails, "variant kind", match (cs[3].kind) { DkVariant => "var", _ => "?" }, "var");
+  }
+  return fails;
+}
+
+function testIndex(f: string[]): string[] {
+  let fails = f;
+  const text = "function add(a: int): int { return a; }\nfunction main(): void { add(1); }\n";
+  const addDecl = sp(text, "add");
+  const aDecl = sp(text, "a:");
+  const aName = span(0, aDecl.start, aDecl.start + 1);
+  const mainDecl = sp(text, "main");
+  const aUse = spAfter(text, aName.end, "a;");
+  const aUse1 = span(0, aUse.start, aUse.start + 1);
+  const callAt = spAfter(text, mainDecl.end, "add");
+  const callExpr = spAfter(text, mainDecl.end, "add(1)");
+  const defs = [
+    SymbolDef { id: 0, name: "add", kind: SkFunction, nameSpan: addDecl, declSpan: span(0, 0, 39), unit: 0, container: None, exported: false, detail: "function add(a: int): int" },
+    SymbolDef { id: 1, name: "a", kind: SkParam, nameSpan: aName, declSpan: aName, unit: 0, container: Some(0), exported: false, detail: "a: int" },
+    SymbolDef { id: 2, name: "main", kind: SkFunction, nameSpan: mainDecl, declSpan: span(0, 40, 70), unit: 0, container: None, exported: false, detail: "function main(): void" }
+  ];
+  const refs = [
+    SymbolRef { span: aUse1, def: 1 },
+    SymbolRef { span: callAt, def: 0 }
+  ];
+  const types = [
+    TypeAt { span: callExpr, ty: "int" },
+    TypeAt { span: aUse1, ty: "int" }
+  ];
+  const idx = SemanticIndex { defs: defs, refs: refs, types: types };
+
+  // definitionAt: on the call -> decl; on the decl itself -> decl; at a keyword -> none.
+  const d1 = definitionAt(idx, 0, callAt.start + 1);
+  fails = eq(fails, "def call", d1.isSome().toString(), "true");
+  if (d1.isSome()) {
+    fails = eqi(fails, "def call start", d1.unwrap().start, addDecl.start);
+  }
+  fails = eq(fails, "def on decl", definitionAt(idx, 0, addDecl.start).isSome().toString(), "true");
+  fails = eq(fails, "def end-of-ident", definitionAt(idx, 0, callAt.end).isSome().toString(), "true");
+  fails = eq(fails, "def none", definitionAt(idx, 0, 2).isNone().toString(), "true");
+  fails = eq(fails, "def other file", definitionAt(idx, 1, callAt.start).isNone().toString(), "true");
+  const d2 = definitionAt(idx, 0, aUse1.start);
+  fails = eqi(fails, "def param", d2.unwrap().start, aName.start);
+
+  // hover: symbol detail, else the narrowest type.
+  fails = eq(fails, "hover sym", hoverAt(idx, 0, callAt.start).unwrap().text, "function add(a: int): int");
+  fails = eq(fails, "hover type", hoverAt(idx, 0, callExpr.end - 1).unwrap().text, "int");
+  fails = eq(fails, "hover none", hoverAt(idx, 0, 1).isNone().toString(), "true");
+
+  // references.
+  fails = eqi(fails, "refs incl", referencesTo(idx, 0, callAt.start, true).length, 2);
+  fails = eqi(fails, "refs excl", referencesTo(idx, 0, addDecl.start, false).length, 1);
+  fails = eqi(fails, "refs param", referencesTo(idx, 0, aUse1.start, true).length, 2);
+  fails = eqi(fails, "refs none", referencesTo(idx, 0, 1, true).length, 0);
+  fails = eq(fails, "symbolSpan", symbolSpanAt(idx, 0, callAt.start).unwrap().start.toString(), callAt.start.toString());
+
+  // rename.
+  const r1 = renameEdits(idx, 0, callAt.start, "plus");
+  fails = eq(fails, "rename ok", r1.isOk().toString(), "true");
+  if (r1.isOk()) {
+    const es = r1.unwrap();
+    fails = eqi(fails, "rename n", es.length, 2);
+    fails = eq(fails, "rename text", es[0].newText, "plus");
+    fails = eqi(fails, "rename decl first", es[0].span.start, addDecl.start);
+  }
+  fails = eq(fails, "rename collide", renameEdits(idx, 0, callAt.start, "main").unwrapErr(), "`main` is already defined in this scope");
+  fails = eq(fails, "rename reserved", renameEdits(idx, 0, callAt.start, "let").unwrapErr(), "`let` is a reserved word");
+  fails = eq(fails, "rename invalid", renameEdits(idx, 0, callAt.start, "1x").unwrapErr(), "`1x` is not a valid identifier");
+  fails = eq(fails, "rename empty", renameEdits(idx, 0, callAt.start, "").unwrapErr(), "name is empty");
+  fails = eq(fails, "rename same", renameEdits(idx, 0, callAt.start, "add").isErr().toString(), "true");
+  fails = eq(fails, "rename nosym", renameEdits(idx, 0, 1, "zzz").isErr().toString(), "true");
+  // A parameter may take a name that exists in another scope.
+  fails = eq(fails, "rename param", renameEdits(idx, 0, aUse1.start, "add").isOk().toString(), "true");
+  return fails;
+}
+
+function main(): void {
+  let f: string[] = [];
+  f = testWorkspace(f);
+  f = testPositions(f);
+  f = testAnalyze(f);
+  f = testSymbols(f);
+  f = testIndex(f);
+  if (f.length == 0) {
+    console.log("ok");
+  } else {
+    for (const m of f) {
+      console.log("FAIL " + m);
+    }
+    exit(1);
+  }
+}

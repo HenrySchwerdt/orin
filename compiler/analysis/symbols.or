@@ -1,0 +1,327 @@
+// AST-level queries that need no checker support: document symbols and completion candidates.
+//
+// Phase 1 limitation: a file with a syntax error has NO symbols (the parser is not error
+// tolerant); callers may answer from a cached earlier result.
+
+import { Item, FunctionDecl, TypeDecl, ConstDecl, ImportDecl, TypeExpr, Param, FieldDecl, VariantDecl, Ident, parse } from "../syntax";
+import { Span } from "../diag";
+import { readFile, exists } from "std:fs";
+import { dirname, joinPath, normalizePath } from "../loader";
+import { Workspace, fileText } from "./workspace";
+
+export type DeclKind =
+  DkFunction | DkRecord | DkUnion | DkAlias | DkConst | DkField | DkVariant
+  | DkKeyword | DkBuiltinType | DkImported;
+
+// A declaration with its spans. `span` covers the whole declaration, `nameSpan` its name; both
+// are in file 0 of the parse (byte offsets are what matters).
+export type DocSymbol = {
+  name: string;
+  kind: DeclKind;
+  detail: string;
+  exported: bool;
+  span: Span;
+  nameSpan: Span;
+  children: DocSymbol[];     // record fields / union variants
+};
+
+export type CompletionItem = { label: string; kind: DeclKind; detail: string; };
+
+// ---- rendering ----------------------------------------------------------------------------
+
+export function renderType(t: TypeExpr): string {
+  return match (t.kind) {
+    TNamed(id, args) => {
+      if (args.length == 0) {
+        return id.name;
+      }
+      let parts: string[] = [];
+      for (const a of args) {
+        parts.push(renderType(a));
+      }
+      return id.name + "<" + parts.join(", ") + ">";
+    },
+    TArray(e) => renderType(e) + "[]"
+  };
+}
+
+function renderParams(ps: Param[]): string {
+  let parts: string[] = [];
+  for (const p of ps) {
+    parts.push(p.name.name + ": " + renderType(p.ty));
+  }
+  return parts.join(", ");
+}
+
+function funcSymbol(f: FunctionDecl): DocSymbol {
+  let detail = "function " + f.name.name + "(" + renderParams(f.params) + ")";
+  match (f.ret) {
+    Some(t) => { detail += ": " + renderType(t); },
+    None => {}
+  }
+  const none: DocSymbol[] = [];
+  return DocSymbol {
+    name: f.name.name, kind: DkFunction, detail: detail, exported: f.exported,
+    span: f.span, nameSpan: f.name.span, children: none
+  };
+}
+
+function fieldSymbol(fd: FieldDecl): DocSymbol {
+  const none: DocSymbol[] = [];
+  return DocSymbol {
+    name: fd.name.name, kind: DkField, detail: renderType(fd.ty), exported: false,
+    span: fd.span, nameSpan: fd.name.span, children: none
+  };
+}
+
+function variantSymbol(v: VariantDecl, owner: string, exported: bool): DocSymbol {
+  let detail = owner;
+  if (v.payload.length > 0) {
+    let parts: string[] = [];
+    for (const t of v.payload) {
+      parts.push(renderType(t));
+    }
+    detail = v.name.name + "(" + parts.join(", ") + "): " + owner;
+  }
+  const none: DocSymbol[] = [];
+  return DocSymbol {
+    name: v.name.name, kind: DkVariant, detail: detail, exported: exported,
+    span: v.span, nameSpan: v.name.span, children: none
+  };
+}
+
+function typeSymbol(t: TypeDecl): DocSymbol {
+  let kind: DeclKind = DkAlias;
+  let detail = "";
+  let children: DocSymbol[] = [];
+  match (t.body) {
+    DAlias(te) => { detail = "type " + t.name.name + " = " + renderType(te); },
+    DRecord(fs) => {
+      kind = DkRecord;
+      detail = "type " + t.name.name + " (record)";
+      for (const fd of fs) {
+        children.push(fieldSymbol(fd));
+      }
+    },
+    DUnion(vs) => {
+      kind = DkUnion;
+      detail = "type " + t.name.name + " (union)";
+      for (const v of vs) {
+        children.push(variantSymbol(v, t.name.name, t.exported));
+      }
+    }
+  }
+  return DocSymbol {
+    name: t.name.name, kind: kind, detail: detail, exported: t.exported,
+    span: t.span, nameSpan: t.name.span, children: children
+  };
+}
+
+function constSymbol(c: ConstDecl): DocSymbol {
+  let detail = "const " + c.name.name;
+  match (c.ty) {
+    Some(t) => { detail += ": " + renderType(t); },
+    None => {}
+  }
+  const none: DocSymbol[] = [];
+  return DocSymbol {
+    name: c.name.name, kind: DkConst, detail: detail, exported: c.exported,
+    span: c.span, nameSpan: c.name.span, children: none
+  };
+}
+
+// ---- document symbols ---------------------------------------------------------------------
+
+function symbolsOfText(text: string): Result<DocSymbol[], string> {
+  const pr = parse(0, text);
+  if (pr.isErr()) {
+    return Err(pr.unwrapErr().message);
+  }
+  let out: DocSymbol[] = [];
+  for (const it of pr.unwrap().items) {
+    match (it) {
+      IFunction(f) => { out.push(funcSymbol(f)); },
+      IType(t) => { out.push(typeSymbol(t)); },
+      IConst(c) => { out.push(constSymbol(c)); },
+      _ => {}
+    }
+  }
+  return Ok(out);
+}
+
+function symbolsOrEmpty(text: string): DocSymbol[] {
+  const r = symbolsOfText(text);
+  if (r.isErr()) {
+    return [];
+  }
+  return r.unwrap();
+}
+
+// Buffer text from the workspace overlay, else the file on disk.
+export function readText(ws: Workspace, path: string): Option<string> {
+  const t = fileText(ws, path);
+  if (t.isSome()) {
+    return t;
+  }
+  const p = normalizePath(path);
+  if (!exists(p)) {
+    return None;
+  }
+  const r = readFile(p);
+  if (r.isErr()) {
+    return None;
+  }
+  return Some(r.unwrap());
+}
+
+// Top-level declarations of `path` in source order (functions, types with field/variant
+// children, consts). Imports and re-exports are not symbols. Empty on read or syntax errors.
+export function documentSymbols(ws: Workspace, path: string): DocSymbol[] {
+  const t = readText(ws, path);
+  if (t.isNone()) {
+    return [];
+  }
+  const r = symbolsOfText(t.unwrap());
+  if (r.isErr()) {
+    return [];
+  }
+  return r.unwrap();
+}
+
+// ---- completion ---------------------------------------------------------------------------
+
+export function keywordCompletions(): CompletionItem[] {
+  const words = [
+    "const", "let", "function", "return", "if", "else", "while", "for", "of", "break",
+    "continue", "type", "import", "export", "from", "match", "true", "false"
+  ];
+  let out: CompletionItem[] = [];
+  for (const w of words) {
+    out.push(CompletionItem { label: w, kind: DkKeyword, detail: "keyword" });
+  }
+  return out;
+}
+
+// Built-in types and global objects of Orin-B (docs/bootstrap-subset.md §3, §6).
+export function builtinCompletions(): CompletionItem[] {
+  let out: CompletionItem[] = [];
+  const types = ["int", "usize", "bool", "string", "void", "Option", "Result"];
+  for (const t of types) {
+    out.push(CompletionItem { label: t, kind: DkBuiltinType, detail: "built-in type" });
+  }
+  out.push(CompletionItem { label: "console", kind: DkBuiltinType, detail: "console.log / console.error" });
+  out.push(CompletionItem { label: "String", kind: DkBuiltinType, detail: "String.fromCharCode" });
+  out.push(CompletionItem { label: "parseInt", kind: DkFunction, detail: "function parseInt(s: string): Option<int>" });
+  out.push(CompletionItem { label: "Some", kind: DkVariant, detail: "Some(v): Option<T>" });
+  out.push(CompletionItem { label: "None", kind: DkVariant, detail: "None: Option<T>" });
+  out.push(CompletionItem { label: "Ok", kind: DkVariant, detail: "Ok(v): Result<T, E>" });
+  out.push(CompletionItem { label: "Err", kind: DkVariant, detail: "Err(e): Result<T, E>" });
+  return out;
+}
+
+// Resolve import path `p` (as written in `import ... from "p"`) from file `fromPath` to a normalized
+// file path that exists in the workspace overlay or on disk. None for std modules/missing files.
+export function resolveModulePath(ws: Workspace, fromPath: string, p: string): Option<string> {
+  if (p.startsWith("std:")) {
+    return None;
+  }
+  const dir = dirname(normalizePath(fromPath));
+  const c1 = joinPath(dir, p + ".or");
+  if (fileText(ws, c1).isSome() || exists(c1)) {
+    return Some(c1);
+  }
+  const c2 = joinPath(dir, p + "/module.or");
+  if (fileText(ws, c2).isSome() || exists(c2)) {
+    return Some(c2);
+  }
+  return None;
+}
+
+function hasLabel(items: CompletionItem[], label: string): bool {
+  for (const it of items) {
+    if (it.label == label) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isUnion(k: DeclKind): bool {
+  return match (k) {
+    DkUnion => true,
+    _ => false
+  };
+}
+
+function asItem(s: DocSymbol): CompletionItem {
+  return CompletionItem { label: s.name, kind: s.kind, detail: s.detail };
+}
+
+// Names usable at top level of `path`: its own declarations (and union variants, which are
+// module-level constructors) plus the names of its `import { ... }` lists. Imported names
+// are described from the exporting file when it can be resolved and parsed (an imported union
+// brings its variants too, ADR-0004); otherwise they are offered as `DkImported`.
+export function declCompletions(ws: Workspace, path: string): CompletionItem[] {
+  let out: CompletionItem[] = [];
+  const t = readText(ws, path);
+  if (t.isNone()) {
+    return out;
+  }
+  const pr = parse(0, t.unwrap());
+  if (pr.isErr()) {
+    return out;
+  }
+  const own = symbolsOrEmpty(t.unwrap());
+  for (const s of own) {
+    out.push(asItem(s));
+    if (isUnion(s.kind)) {
+      for (const v of s.children) {
+        out.push(asItem(v));
+      }
+    }
+  }
+  for (const it of pr.unwrap().items) {
+    match (it) {
+      IImport(imp) => {
+        out = addImported(ws, path, imp, out);
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+function addImported(ws: Workspace, path: string, imp: ImportDecl, items: CompletionItem[]): CompletionItem[] {
+  let out = items;
+  let target: DocSymbol[] = [];
+  const mp = resolveModulePath(ws, path, imp.path);
+  if (mp.isSome()) {
+    const tt = readText(ws, mp.unwrap());
+    if (tt.isSome()) {
+      target = symbolsOrEmpty(tt.unwrap());
+    }
+  }
+  for (const n of imp.names) {
+    if (hasLabel(out, n.name)) {
+      continue;
+    }
+    let found = false;
+    for (const s of target) {
+      if (s.name == n.name && s.exported) {
+        found = true;
+        out.push(asItem(s));
+        if (isUnion(s.kind)) {
+          for (const v of s.children) {
+            if (!hasLabel(out, v.name)) {
+              out.push(asItem(v));
+            }
+          }
+        }
+      }
+    }
+    if (!found) {
+      out.push(CompletionItem { label: n.name, kind: DkImported, detail: "imported from \"" + imp.path + "\"" });
+    }
+  }
+  return out;
+}

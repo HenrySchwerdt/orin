@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Stage 0 compiler
+        working-directory: bootstrap
+        run: cargo build --release
+      - name: Unit tests (Stage 0)
+        working-directory: bootstrap
+        run: cargo test
+      - name: Conformance tests
+        run: python3 tools/run_tests.py --orinc bootstrap/target/release/orinb
+      - name: Conformance tests (ASan + UBSan)
+        run: python3 tools/run_tests.py --orinc bootstrap/target/release/orinb --sanitize
+      - name: Parser differential test (Stage 0 vs Stage 1)
+        run: python3 tools/diff_parsers.py
+      - name: Self-hosting bootstrap (stage1 -> stage2 -> stage3, compare, conformance)
+        run: ./tools/bootstrap.sh
+      - name: Conformance tests with self-hosted compiler (ASan + UBSan)
+        run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --sanitize
+      - name: MIR backend vs legacy backend
+        run: python3 tools/diff_backends.py
+      - name: Formatter (goldens, idempotence, AST + comment preservation, JSON diagnostics)
+        run: python3 tools/test_fmt.py
+      - name: Tooling unit tests (JSON, analysis, LSP)
+        run: |
+          for t in json_test analysis_test lsp_test; do
+            build/bootstrap/orin2 compile compiler/tests/$t.or -o build/$t.c
+            cc -O1 -w -I runtime build/$t.c runtime/orin_runtime.c -o build/$t
+            ./build/$t
+          done
+
+  vscode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Grammar tests
+        working-directory: editors/vscode
+        run: npm ci && npm test
+
+  formal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lean (elan)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+      - name: Check formal model (no sorry, standard axioms only)
+        working-directory: formal
+        run: ./check.sh

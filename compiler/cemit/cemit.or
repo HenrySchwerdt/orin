@@ -1,0 +1,450 @@
+// MIR -> GNU C (against runtime/orin_runtime.h and runtime/orin_runtime_mir.h).
+// A direct translation: one C local per MIR local (`l<i>`), blocks as labels (`B<i>:`) and gotos.
+// The output is deterministic for a given MIR.
+
+import { BinOp, UnOp, Builtin } from "../hir";
+import {
+  MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram
+} from "../mir";
+
+type Fx = { prog: MProgram; f: MFunction; names: string[]; };
+
+function u(n: usize): string {
+  return n.toString();
+}
+
+// ---------------------------------------------------------------- types and literals
+
+function isRefT(t: MType): bool {
+  return match (t) {
+    MRef => true,
+    _ => false
+  };
+}
+
+function isUsizeT(t: MType): bool {
+  return match (t) {
+    MUsize => true,
+    _ => false
+  };
+}
+
+function cty(t: MType): string {
+  return match (t) {
+    MInt => "int64_t",
+    MBool => "int64_t",
+    MUsize => "uint64_t",
+    MVoid => "void",
+    MRef => "OrinObj *"
+  };
+}
+
+function fromSlot(t: MType, code: string): string {
+  if (isRefT(t)) {
+    return "ORIN_REF(" + code + ")";
+  }
+  return "((" + cty(t) + ")(" + code + "))";
+}
+
+function toSlot(t: MType, code: string): string {
+  if (isRefT(t)) {
+    return "ORIN_SLOT(" + code + ")";
+  }
+  return "((uint64_t)(" + code + "))";
+}
+
+function sanitize(name: string): string {
+  let out = "";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < name.length) {
+    const c = name.charCodeAt(i);
+    const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    if (!ok) {
+      out += name.substring(start, i);
+      out += "_";
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += name.substring(start, name.length);
+  return out;
+}
+
+function commentSafe(name: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < name.length) {
+    if (name.charCodeAt(i) == 42 && i + 1 < name.length && name.charCodeAt(i + 1) == 47) {
+      out += "* /";
+      i += 2;
+    } else {
+      out += name.charAt(i);
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function cString(s: string): string {
+  let out = "\"";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    let esc = "";
+    if (c == 34) {
+      esc = "\\\"";
+    } else if (c == 92) {
+      esc = "\\\\";
+    } else if (c == 63) {
+      esc = "\\?";
+    } else if (c < 32 || c > 126) {
+      esc = "\\" + (c / 64).toString() + ((c / 8) % 8).toString() + (c % 8).toString();
+    }
+    if (esc.length > 0) {
+      out += s.substring(start, i);
+      out += esc;
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += s.substring(start, s.length);
+  out += "\"";
+  return out;
+}
+
+// ---------------------------------------------------------------- operands
+
+function lname(i: usize): string {
+  return "l" + u(i);
+}
+
+function opTy(fx: Fx, o: Operand): MType {
+  return match (o) {
+    OLocal(l) => fx.f.locals[l].ty,
+    OInt(_) => MInt,
+    OUsize(_) => MUsize,
+    OBool(_) => MBool,
+    OStr(_) => MRef
+  };
+}
+
+function intCode(v: int): string {
+  if (v == -9223372036854775807 - 1) {
+    return "INT64_MIN";
+  }
+  return "((int64_t)" + v.toString() + "LL)";
+}
+
+function opC(o: Operand): string {
+  return match (o) {
+    OLocal(l) => lname(l),
+    OInt(v) => intCode(v),
+    OUsize(v) => "((uint64_t)" + v.toString() + "ULL)",
+    OBool(b) => b ? "1" : "0",
+    OStr(i) => "orin_s" + u(i)
+  };
+}
+
+function slotOf(fx: Fx, o: Operand): string {
+  return toSlot(opTy(fx, o), opC(o));
+}
+
+function maskOf(fx: Fx, os: Operand[]): usize {
+  let m: usize = 0;
+  let p: usize = 1;
+  let i: usize = 0;
+  while (i < os.length) {
+    if (isRefT(opTy(fx, os[i]))) {
+      m += p;
+    }
+    if (i < 63) {
+      p *= 2;
+    }
+    i += 1;
+  }
+  return m;
+}
+
+// ---------------------------------------------------------------- operators and builtins
+
+function arith(op: BinOp, usz: bool, a: string, b: string): string {
+  const suffix = usz ? "u" : "i";
+  const name = match (op) {
+    OpAdd => "add",
+    OpSub => "sub",
+    OpMul => "mul",
+    OpDiv => "div",
+    OpRem => "rem",
+    _ => "?"
+  };
+  return "orin_" + name + "_" + suffix + "(" + a + ", " + b + ")";
+}
+
+function binaryC(op: BinOp, ref: bool, usz: bool, a: string, b: string): string {
+  return match (op) {
+    OpAdd => arith(op, usz, a, b),
+    OpSub => arith(op, usz, a, b),
+    OpMul => arith(op, usz, a, b),
+    OpDiv => arith(op, usz, a, b),
+    OpRem => arith(op, usz, a, b),
+    OpEq => ref ? "orin_str_eq(" + a + ", " + b + ")" : "(" + a + " == " + b + ")",
+    OpNe => ref ? "(!orin_str_eq(" + a + ", " + b + "))" : "(" + a + " != " + b + ")",
+    OpLt => "(" + a + " < " + b + ")",
+    OpLe => "(" + a + " <= " + b + ")",
+    OpGt => "(" + a + " > " + b + ")",
+    OpGe => "(" + a + " >= " + b + ")",
+    OpAnd => "(" + a + " && " + b + ")",
+    OpOr => "(" + a + " || " + b + ")"
+  };
+}
+
+function c1(f: string, a: string[]): string {
+  return f + "(" + a[0] + ")";
+}
+
+function c2(f: string, a: string[]): string {
+  return f + "(" + a[0] + ", " + a[1] + ")";
+}
+
+function c3(f: string, a: string[]): string {
+  return f + "(" + a[0] + ", " + a[1] + ", " + a[2] + ")";
+}
+
+// C expression for a builtin whose result is a fresh Owned ref or a scalar. `rt` is the type of
+// the destination (MVoid when there is none).
+function builtinC(op: Builtin, a: string[], rt: MType): string {
+  return match (op) {
+    BConsoleLog => c1("orin_console_log", a),
+    BConsoleError => c1("orin_console_error", a),
+    BStringFromCharCode => c1("orin_string_from_char_code", a),
+    BParseInt => c1("orin_parse_int", a),
+    BFsReadFile => c1("orin_fs_read_file", a),
+    BFsWriteFile => c2("orin_fs_write_file", a),
+    BFsExists => c1("orin_fs_exists", a),
+    BProcessArgs => "orin_process_args()",
+    BProcessExit => c1("orin_process_exit", a),
+    BStrLength => c1("orin_str_len", a),
+    BStrCharCodeAt => c2("orin_str_char_code_at", a),
+    BStrCharAt => c2("orin_str_char_at", a),
+    BStrSubstring => c3("orin_str_substring", a),
+    BStrIndexOf => c2("orin_str_index_of", a),
+    BStrIncludes => c2("orin_str_includes", a),
+    BStrStartsWith => c2("orin_str_starts_with", a),
+    BStrEndsWith => c2("orin_str_ends_with", a),
+    BStrSplit => c2("orin_str_split", a),
+    BStrTrim => c1("orin_str_trim", a),
+    BArrLength => c1("orin_array_len", a),
+    BArrGet => c2("orin_array_get", a),
+    BArrSlice => c3("orin_array_slice", a),
+    BArrConcat => c2("orin_array_concat", a),
+    BArrJoin => c2("orin_array_join", a),
+    BIntToString => c1("orin_int_to_string", a),
+    BIntToUsize => c1("orin_int_to_usize", a),
+    BUsizeToString => c1("orin_usize_to_string", a),
+    BUsizeToInt => c1("orin_usize_to_int", a),
+    BBoolToString => c1("orin_bool_to_string", a),
+    BOptIsSome => "(orin_tag(" + a[0] + ") == 0)",
+    BOptIsNone => "(orin_tag(" + a[0] + ") == 1)",
+    BResIsOk => "(orin_tag(" + a[0] + ") == 0)",
+    BResIsErr => "(orin_tag(" + a[0] + ") == 1)",
+    BOptUnwrap => dupIf(rt, fromSlot(rt, c1("orin_opt_unwrap", a))),
+    BOptUnwrapOr => dupIf(rt, "(orin_tag(" + a[0] + ") == 0 ? " + fromSlot(rt, "orin_struct_get(" + a[0] + ", 0)") + " : " + a[1] + ")"),
+    BResUnwrap => dupIf(rt, fromSlot(rt, c1("orin_res_unwrap", a))),
+    BResUnwrapErr => dupIf(rt, fromSlot(rt, c1("orin_res_unwrap_err", a)))
+  };
+}
+
+// Builtins that return a borrowed slot are retained: the MIR result is Owned.
+function dupIf(rt: MType, code: string): string {
+  if (isRefT(rt)) {
+    return "orin_dup(" + code + ")";
+  }
+  return code;
+}
+
+// ---------------------------------------------------------------- instructions
+
+function argsC(os: Operand[]): string[] {
+  let out: string[] = [];
+  for (const o of os) {
+    out.push(opC(o));
+  }
+  return out;
+}
+
+function instrC(fx: Fx, i: Instr): string {
+  return match (i) {
+    ICopy(d, o) => lname(d) + " = " + opC(o) + ";",
+    IMove(d, s) => lname(d) + " = " + lname(s) + ";",
+    IBorrow(d, s) => lname(d) + " = " + lname(s) + ";",
+    IDup(d, o) => lname(d) + " = orin_dup(" + opC(o) + ");",
+    IRelease(x) => "orin_release(" + lname(x) + ");",
+    IUnary(d, op, o) => lname(d) + " = " + unaryC(op, isUsizeT(fx.f.locals[d].ty), opC(o)) + ";",
+    IBinary(d, op, a, b) => lname(d) + " = " + binaryC(op, isRefT(opTy(fx, a)), isUsizeT(opTy(fx, a)), opC(a), opC(b)) + ";",
+    ICall(d, f, args) => callC(fx, d, f, args),
+    IBuiltin(d, b, args) => builtinInstr(fx, d, b, args),
+    IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
+    IStructNew(d, tag, slots) => structNewC(fx, d, tag, slots),
+    INullary(d, t) => lname(d) + " = orin_nullary(" + u(t) + ");",
+    ITag(d, o) => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
+    IGetField(d, o, k) => lname(d) + " = " + fromSlot(fx.f.locals[d].ty, "orin_struct_get(" + opC(o) + ", " + u(k) + ")") + ";",
+    ISetField(x, k, v) => "orin_mir_struct_replace(" + lname(x) + ", " + u(k) + ", " + slotOf(fx, v) + ");",
+    ITakeField(d, x, k) => lname(d) + " = ORIN_REF(orin_mir_struct_take(" + lname(x) + ", " + u(k) + "));",
+    IPutField(x, k, s) => "orin_struct_set(" + lname(x) + ", " + u(k) + ", ORIN_SLOT(" + lname(s) + "));",
+    IMakeUnique(x) => lname(x) + " = orin_make_unique(" + lname(x) + ");",
+    IArrayNew(d, r, es) => arrayNewC(fx, d, r, es),
+    IArrayGet(d, a, k) => lname(d) + " = " + fromSlot(fx.f.locals[d].ty, "orin_array_at(" + opC(a) + ", " + opC(k) + ")") + ";",
+    IArraySet(x, k, v) => "orin_mir_array_replace(" + lname(x) + ", " + opC(k) + ", " + slotOf(fx, v) + ");",
+    IArrayTake(d, x, k) => lname(d) + " = ORIN_REF(orin_mir_array_take(" + lname(x) + ", " + opC(k) + "));",
+    IArrayPut(x, k, s) => "orin_mir_array_put(" + lname(x) + ", " + opC(k) + ", ORIN_SLOT(" + lname(s) + "));",
+    IArrayPush(x, v) => lname(x) + " = orin_mir_array_push(" + lname(x) + ", " + slotOf(fx, v) + ");",
+    IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); " + lname(d) + " = orin_array_pop(" + lname(x) + ");"
+  };
+}
+
+function unaryC(op: UnOp, usz: bool, a: string): string {
+  return match (op) {
+    UnNot => "(!" + a + ")",
+    UnNeg => usz ? "orin_neg_u(" + a + ")" : "orin_neg_i(" + a + ")"
+  };
+}
+
+function callC(fx: Fx, d: Option<usize>, f: usize, args: Operand[]): string {
+  const call = fx.names[f] + "(" + argsC(args).join(", ") + ")";
+  return match (d) {
+    Some(x) => lname(x) + " = " + call + ";",
+    None => call + ";"
+  };
+}
+
+function builtinInstr(fx: Fx, d: Option<usize>, b: Builtin, args: Operand[]): string {
+  return match (d) {
+    Some(x) => lname(x) + " = " + builtinC(b, argsC(args), fx.f.locals[x].ty) + ";",
+    None => builtinC(b, argsC(args), MVoid) + ";"
+  };
+}
+
+function structNewC(fx: Fx, d: usize, tag: usize, slots: Operand[]): string {
+  const n = lname(d);
+  let s = n + " = orin_struct_new(" + u(tag) + ", " + u(slots.length) + ", " + u(maskOf(fx, slots)) + "ULL);";
+  let k: usize = 0;
+  for (const o of slots) {
+    s += " orin_struct_set(" + n + ", " + u(k) + ", " + slotOf(fx, o) + ");";
+    k += 1;
+  }
+  return s;
+}
+
+function arrayNewC(fx: Fx, d: usize, isRef: bool, es: Operand[]): string {
+  const n = lname(d);
+  let s = n + " = orin_array_new(" + u(es.length) + ", " + (isRef ? "1" : "0") + ");";
+  for (const o of es) {
+    s += " orin_array_push(" + n + ", " + slotOf(fx, o) + ");";
+  }
+  return s;
+}
+
+function termC(fx: Fx, t: Terminator): string {
+  return match (t) {
+    TGoto(b) => "goto B" + u(b) + ";",
+    TBranch(c, a, b) => "if (" + opC(c) + ") goto B" + u(a) + "; else goto B" + u(b) + ";",
+    TSwitch(o, cases, d) => switchC(o, cases, d),
+    TReturn(o) => match (o) {
+      Some(x) => "return " + opC(x) + ";",
+      None => "return;"
+    },
+    TTrap(m) => "orin_trap(" + cString(m) + ");"
+  };
+}
+
+function switchC(o: Operand, cases: SwitchCase[], d: usize): string {
+  let s = "switch (" + opC(o) + ") {";
+  for (const k of cases) {
+    s += " case " + k.value.toString() + ": goto B" + u(k.target) + ";";
+  }
+  s += " default: goto B" + u(d) + "; }";
+  return s;
+}
+
+// ---------------------------------------------------------------- functions
+
+function signature(name: string, f: MFunction): string {
+  let s = cty(f.ret) + " " + name + "(";
+  if (f.paramCount == 0) {
+    s += "void";
+  }
+  let i: usize = 0;
+  while (i < f.paramCount) {
+    if (i > 0) {
+      s += ", ";
+    }
+    s += cty(f.locals[i].ty) + " " + lname(i);
+    i += 1;
+  }
+  s += ")";
+  return s;
+}
+
+function genFunction(fx: Fx, sig: string): string {
+  const f = fx.f;
+  let out: string[] = [];
+  out.push(sig + " {\n");
+  let i = f.paramCount;
+  while (i < f.locals.length) {
+    const l = f.locals[i];
+    const init = isRefT(l.ty) ? "NULL" : "0";
+    out.push("  " + cty(l.ty) + " " + lname(i) + " = " + init + "; /* " + commentSafe(l.name) + " */\n");
+    i += 1;
+  }
+  let b: usize = 0;
+  for (const blk of f.blocks) {
+    out.push("B" + u(b) + ":;\n");
+    for (const ins of blk.instrs) {
+      out.push("  " + instrC(fx, ins) + "\n");
+    }
+    out.push("  " + termC(fx, blk.term) + "\n");
+    b += 1;
+  }
+  out.push("}\n");
+  return out.join("");
+}
+
+export function emitC(prog: MProgram): string {
+  let names: string[] = [];
+  let i: usize = 0;
+  for (const f of prog.functions) {
+    names.push("orin_fn_" + u(i) + "_" + sanitize(f.name));
+    i += 1;
+  }
+  let sigs: string[] = [];
+  i = 0;
+  while (i < prog.functions.length) {
+    sigs.push(signature(names[i], prog.functions[i]));
+    i += 1;
+  }
+  let out: string[] = [];
+  out.push("/* Generated by orinc (Orin Stage 1, MIR backend). Do not edit. */\n#include \"orin_runtime.h\"\n#include \"orin_runtime_mir.h\"\n\n");
+  i = 0;
+  while (i < prog.strings.length) {
+    const s = prog.strings[i];
+    out.push("ORIN_STRING_LIT(orin_s" + u(i) + ", " + s.length.toString() + ", " + cString(s) + ");\n");
+    i += 1;
+  }
+  out.push("\n");
+  for (const sg of sigs) {
+    out.push(sg + ";\n");
+  }
+  out.push("\n");
+  i = 0;
+  while (i < prog.functions.length) {
+    const fx = Fx { prog: prog, f: prog.functions[i], names: names };
+    out.push(genFunction(fx, sigs[i]));
+    out.push("\n");
+    i += 1;
+  }
+  out.push("int main(int argc, char **argv) {\n  orin_init(argc, argv);\n  " + names[prog.main]
+    + "();\n  orin_flush();\n  return 0;\n}\n");
+  return out.join("");
+}

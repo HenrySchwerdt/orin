@@ -1,0 +1,310 @@
+// JSON parser (RFC 8259 subset, see json.or for the number rule).
+//
+// Errors are `Err("<message> at offset N")`. Nesting deeper than MAX_DEPTH is rejected.
+// `\uXXXX` escapes are decoded to UTF-8 bytes; a surrogate pair becomes one 4-byte sequence,
+// a lone surrogate becomes U+FFFD. Raw control characters inside strings are rejected.
+
+import { Json, JField } from "./json";
+
+const MAX_DEPTH: int = 200;
+
+type PRes = { v: Json; pos: usize; };
+type SRes = { text: string; pos: usize; };
+type NRes = { n: int; pos: usize; };
+
+function fail(msg: string, at: usize): string {
+  return msg + " at offset " + at.toString();
+}
+
+function isWs(c: int): bool {
+  return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+function skipWs(s: string, start: usize): usize {
+  let i = start;
+  while (i < s.length && isWs(s.charCodeAt(i))) {
+    i += 1;
+  }
+  return i;
+}
+
+function hexVal(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+// Four hex digits at `at`, or -1.
+function hex4(s: string, at: usize): int {
+  if (at + 4 > s.length) {
+    return -1;
+  }
+  let v = 0;
+  let k: usize = 0;
+  while (k < 4) {
+    const h = hexVal(s.charCodeAt(at + k));
+    if (h < 0) {
+      return -1;
+    }
+    v = v * 16 + h;
+    k += 1;
+  }
+  return v;
+}
+
+function utf8(cp: int): string {
+  if (cp < 128) {
+    return String.fromCharCode(cp);
+  }
+  if (cp < 2048) {
+    return String.fromCharCode(192 + cp / 64) + String.fromCharCode(128 + cp % 64);
+  }
+  if (cp < 65536) {
+    return String.fromCharCode(224 + cp / 4096) + String.fromCharCode(128 + (cp / 64) % 64)
+      + String.fromCharCode(128 + cp % 64);
+  }
+  return String.fromCharCode(240 + cp / 262144) + String.fromCharCode(128 + (cp / 4096) % 64)
+    + String.fromCharCode(128 + (cp / 64) % 64) + String.fromCharCode(128 + cp % 64);
+}
+
+// `s[start]` is the opening quote.
+function parseString(s: string, start: usize): Result<SRes, string> {
+  let parts: string[] = [];
+  let i = start + 1;
+  let runStart = i;
+  while (true) {
+    if (i >= s.length) {
+      return Err(fail("unterminated string", start));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 34) {
+      if (i > runStart) {
+        parts.push(s.substring(runStart, i));
+      }
+      return Ok(SRes { text: parts.join(""), pos: i + 1 });
+    }
+    if (c < 32) {
+      return Err(fail("control character in string", i));
+    }
+    if (c != 92) {
+      i += 1;
+      continue;
+    }
+    if (i > runStart) {
+      parts.push(s.substring(runStart, i));
+    }
+    if (i + 1 >= s.length) {
+      return Err(fail("unterminated escape", i));
+    }
+    const e = s.charCodeAt(i + 1);
+    i += 2;
+    if (e == 34) {
+      parts.push("\"");
+    } else if (e == 92) {
+      parts.push("\\");
+    } else if (e == 47) {
+      parts.push("/");
+    } else if (e == 98) {
+      parts.push(String.fromCharCode(8));
+    } else if (e == 102) {
+      parts.push(String.fromCharCode(12));
+    } else if (e == 110) {
+      parts.push("\n");
+    } else if (e == 114) {
+      parts.push("\r");
+    } else if (e == 116) {
+      parts.push("\t");
+    } else if (e == 117) {
+      const u = hex4(s, i);
+      if (u < 0) {
+        return Err(fail("invalid \\u escape", i - 2));
+      }
+      i += 4;
+      let cp = u;
+      if (u >= 55296 && u <= 56319) {
+        // High surrogate: needs a following \uDC00..\uDFFF.
+        let lo = -1;
+        if (i + 1 < s.length && s.charCodeAt(i) == 92 && s.charCodeAt(i + 1) == 117) {
+          lo = hex4(s, i + 2);
+        }
+        if (lo >= 56320 && lo <= 57343) {
+          cp = 65536 + (u - 55296) * 1024 + (lo - 56320);
+          i += 6;
+        } else {
+          cp = 65533;
+        }
+      } else if (u >= 56320 && u <= 57343) {
+        cp = 65533;
+      }
+      parts.push(utf8(cp));
+    } else {
+      return Err(fail("invalid escape", i - 2));
+    }
+    runStart = i;
+  }
+  return Err("unreachable");
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+function parseNumber(s: string, start: usize): Result<NRes, string> {
+  let i = start;
+  let neg = false;
+  if (s.charCodeAt(i) == 45) {
+    neg = true;
+    i += 1;
+  }
+  const ds = i;
+  while (i < s.length && isDigit(s.charCodeAt(i))) {
+    i += 1;
+  }
+  if (i == ds) {
+    return Err(fail("invalid number", start));
+  }
+  if (i - ds > 18) {
+    return Err(fail("integer too large", start));
+  }
+  let v = 0;
+  let k = ds;
+  while (k < i) {
+    v = v * 10 + (s.charCodeAt(k) - 48);
+    k += 1;
+  }
+  if (i < s.length && s.charCodeAt(i) == 46) {
+    // Fraction: validated, then truncated toward zero.
+    i += 1;
+    const fs = i;
+    while (i < s.length && isDigit(s.charCodeAt(i))) {
+      i += 1;
+    }
+    if (i == fs) {
+      return Err(fail("invalid number", start));
+    }
+  }
+  if (i < s.length && (s.charCodeAt(i) == 101 || s.charCodeAt(i) == 69)) {
+    return Err(fail("exponent notation is not supported", i));
+  }
+  if (neg) {
+    v = 0 - v;
+  }
+  return Ok(NRes { n: v, pos: i });
+}
+
+function expectLit(s: string, at: usize, lit: string): bool {
+  if (at + lit.length > s.length) {
+    return false;
+  }
+  return s.substring(at, at + lit.length) == lit;
+}
+
+function parseValue(s: string, start: usize, depth: int): Result<PRes, string> {
+  const i = skipWs(s, start);
+  if (i >= s.length) {
+    return Err(fail("unexpected end of input", i));
+  }
+  if (depth > MAX_DEPTH) {
+    return Err(fail("nesting too deep", i));
+  }
+  const c = s.charCodeAt(i);
+  if (c == 34) {
+    const r = parseString(s, i)?;
+    return Ok(PRes { v: JStr(r.text), pos: r.pos });
+  }
+  if (c == 123) {
+    return parseObject(s, i, depth);
+  }
+  if (c == 91) {
+    return parseArray(s, i, depth);
+  }
+  if (c == 45 || isDigit(c)) {
+    const r = parseNumber(s, i)?;
+    return Ok(PRes { v: JNum(r.n), pos: r.pos });
+  }
+  if (expectLit(s, i, "true")) {
+    return Ok(PRes { v: JBool(true), pos: i + 4 });
+  }
+  if (expectLit(s, i, "false")) {
+    return Ok(PRes { v: JBool(false), pos: i + 5 });
+  }
+  if (expectLit(s, i, "null")) {
+    return Ok(PRes { v: JNull, pos: i + 4 });
+  }
+  return Err(fail("unexpected character", i));
+}
+
+function parseArray(s: string, start: usize, depth: int): Result<PRes, string> {
+  let items: Json[] = [];
+  let i = skipWs(s, start + 1);
+  if (i < s.length && s.charCodeAt(i) == 93) {
+    return Ok(PRes { v: JArr(items), pos: i + 1 });
+  }
+  while (true) {
+    const r = parseValue(s, i, depth + 1)?;
+    items.push(r.v);
+    i = skipWs(s, r.pos);
+    if (i >= s.length) {
+      return Err(fail("unterminated array", start));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 93) {
+      return Ok(PRes { v: JArr(items), pos: i + 1 });
+    }
+    if (c != 44) {
+      return Err(fail("expected `,` or `]`", i));
+    }
+    i += 1;
+  }
+  return Err("unreachable");
+}
+
+function parseObject(s: string, start: usize, depth: int): Result<PRes, string> {
+  let fields: JField[] = [];
+  let i = skipWs(s, start + 1);
+  if (i < s.length && s.charCodeAt(i) == 125) {
+    return Ok(PRes { v: JObj(fields), pos: i + 1 });
+  }
+  while (true) {
+    i = skipWs(s, i);
+    if (i >= s.length || s.charCodeAt(i) != 34) {
+      return Err(fail("expected string key", i));
+    }
+    const k = parseString(s, i)?;
+    i = skipWs(s, k.pos);
+    if (i >= s.length || s.charCodeAt(i) != 58) {
+      return Err(fail("expected `:`", i));
+    }
+    const r = parseValue(s, i + 1, depth + 1)?;
+    fields.push(JField { key: k.text, value: r.v });
+    i = skipWs(s, r.pos);
+    if (i >= s.length) {
+      return Err(fail("unterminated object", start));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 125) {
+      return Ok(PRes { v: JObj(fields), pos: i + 1 });
+    }
+    if (c != 44) {
+      return Err(fail("expected `,` or `}`", i));
+    }
+    i += 1;
+  }
+  return Err("unreachable");
+}
+
+export function parseJson(s: string): Result<Json, string> {
+  const r = parseValue(s, 0, 0)?;
+  const end = skipWs(s, r.pos);
+  if (end < s.length) {
+    return Err(fail("trailing characters", end));
+  }
+  return Ok(r.v);
+}
