@@ -1,0 +1,421 @@
+// Tests for std:utf8, including hand-written vectors in the style of Markus Kuhn's "UTF-8 decoder capability
+// and stress test" (valid boundary values, then every class of malformed input). Run with `orin test` (contracts
+// checked) and with `--no-contracts`; see tools/test_std.sh.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool } from "std:test";
+import { Bytes, bytesFromHex, bytesFromInts, bytesFromString, emptyBytes } from "std:bytes";
+import { Utf8String, Utf8Error, Utf8ErrorKind, CodePointCursor, isScalarValue, utf8Len, encodeCodePoint, isValidUtf8,
+  checkUtf8, validate, validateString, encode, fromCodePoints, utf8ErrorMessage } from "std:utf8";
+
+function hex(h: string): Bytes {
+  return bytesFromHex(h).unwrap();
+}
+
+function kindName(k: Utf8ErrorKind): string {
+  return match (k) {
+    InvalidLead => "InvalidLead",
+    TruncatedSequence => "Truncated",
+    InvalidContinuation => "InvalidContinuation",
+    Overlong => "Overlong",
+    Surrogate => "Surrogate",
+    TooLarge => "TooLarge"
+  };
+}
+
+function expectValid(h: string, name: string): void {
+  const r = validate(hex(h));
+  assertEqBool(r.isOk(), true, name);
+  assertEqString(encode(r.unwrap()).toHex(), h, name + " re-encodes to the same bytes");
+}
+
+function expectBad(h: string, position: usize, length: usize, kind: string, name: string): void {
+  const r = validate(hex(h));
+  assertEqBool(r.isErr(), true, name + " rejected");
+  const e: Utf8Error = r.unwrapErr();
+  assertEqUsize(e.position, position, name + " position");
+  assertEqUsize(e.length, length, name + " length");
+  assertEqString(kindName(e.kind), kind, name + " kind");
+}
+
+// ---------------------------------------------------------------- Kuhn 1: some correct UTF-8 text
+
+@Test
+function kuhn1Greek(): void {
+  // "kosme" in Greek: CE BA E1 BD B9 CF 83 CE BC CE B5
+  expectValid("cebae1bdb9cf83cebcceb5", "kosme");
+  const s = validate(hex("cebae1bdb9cf83cebcceb5")).unwrap();
+  assertEqUsize(s.codePointCount(), 5, "5 code points");
+  assertEqUsize(s.byteLength(), 11, "11 bytes");
+}
+
+// ---------------------------------------------------------------- Kuhn 2: boundary conditions (valid)
+
+@Test
+function kuhn2FirstPossibleSequences(): void {
+  expectValid("00", "U+0000");
+  expectValid("c280", "U+0080");
+  expectValid("e0a080", "U+0800");
+  expectValid("f0908080", "U+10000");
+}
+
+@Test
+function kuhn2LastPossibleSequences(): void {
+  expectValid("7f", "U+007F");
+  expectValid("dfbf", "U+07FF");
+  expectValid("efbfbf", "U+FFFF");
+  expectValid("f48fbfbf", "U+10FFFF");
+}
+
+@Test
+function kuhn2OtherBoundaries(): void {
+  expectValid("ed9fbf", "U+D7FF");
+  expectValid("ee8080", "U+E000");
+  expectValid("efbfbd", "U+FFFD");
+  expectValid("efbfbe", "U+FFFE is a noncharacter but a scalar value");
+  expectValid("efb790", "U+FDD0 noncharacter");
+  expectValid("f09fbfbf", "U+1FFFF");
+  expectValid("", "empty input");
+}
+
+// ---------------------------------------------------------------- Kuhn 3: malformed, unexpected continuation
+
+@Test
+function kuhn3UnexpectedContinuation(): void {
+  expectBad("80", 0, 1, "InvalidLead", "first continuation byte 0x80");
+  expectBad("bf", 0, 1, "InvalidLead", "last continuation byte 0xbf");
+  expectBad("8081", 0, 1, "InvalidLead", "2 continuation bytes");
+  expectBad("80bf80", 0, 1, "InvalidLead", "3 continuation bytes");
+  expectBad("4180", 1, 1, "InvalidLead", "continuation after ASCII");
+  expectBad("c280bf", 2, 1, "InvalidLead", "extra continuation after a good sequence");
+}
+
+@Test
+function kuhn3AllContinuationBytesAreRejected(): void {
+  let b: int = 128;
+  while (b <= 191) {
+    assertEqBool(validate(bytesFromInts([b])).isErr(), true, "lone continuation byte " + b.toString());
+    b += 1;
+  }
+}
+
+// ---------------------------------------------------------------- Kuhn 3.2-3.5: lone start characters
+
+@Test
+function kuhn3LoneStartCharacters(): void {
+  // Every 2-, 3-, 4-byte lead followed by a space (0x20) is a missing continuation. C0/C1 are overlong leads,
+  // F5..F7 are leads of sequences above U+10FFFF, F8..FF never occur.
+  let b: int = 194;
+  while (b <= 244) {
+    const r = validate(bytesFromInts([b, 32]));
+    assertEqBool(r.isErr(), true, "lead " + b.toString() + " + space");
+    assertEqUsize(r.unwrapErr().position, 0, "position of lead " + b.toString());
+    assertEqString(kindName(r.unwrapErr().kind), "InvalidContinuation", "kind of lead " + b.toString());
+    b += 1;
+  }
+  expectBad("c020", 0, 1, "Overlong", "C0 is never valid");
+  expectBad("c120", 0, 1, "Overlong", "C1 is never valid");
+  expectBad("f520", 0, 1, "TooLarge", "F5");
+  expectBad("f720", 0, 1, "TooLarge", "F7");
+  expectBad("f820", 0, 1, "InvalidLead", "F8 (5-byte lead)");
+  expectBad("fc20", 0, 1, "InvalidLead", "FC (6-byte lead)");
+  expectBad("fd20", 0, 1, "InvalidLead", "FD");
+}
+
+// ---------------------------------------------------------------- Kuhn 3.3: last continuation missing
+
+@Test
+function kuhn3TruncatedAtEnd(): void {
+  expectBad("c0", 0, 1, "Overlong", "C0 alone");
+  expectBad("df", 0, 1, "Truncated", "2-byte lead at end");
+  expectBad("e0", 0, 1, "Truncated", "3-byte lead at end");
+  expectBad("e1", 0, 1, "Truncated", "E1 alone");
+  expectBad("e180", 0, 2, "Truncated", "E1 80");
+  expectBad("efbf", 0, 2, "Truncated", "EF BF");
+  expectBad("f1", 0, 1, "Truncated", "4-byte lead at end");
+  expectBad("f180", 0, 2, "Truncated", "F1 80");
+  expectBad("f18080", 0, 3, "Truncated", "F1 80 80");
+  expectBad("f4", 0, 1, "Truncated", "F4 alone");
+  expectBad("f48f", 0, 2, "Truncated", "F4 8F");
+  expectBad("f48fbf", 0, 3, "Truncated", "F4 8F BF");
+  expectBad("41e180", 1, 2, "Truncated", "valid prefix then truncated");
+}
+
+@Test
+function kuhn3ConcatenatedTruncations(): void {
+  // Each lead is cut off by the next lead byte, so it is a missing continuation, not a truncation.
+  expectBad("dfefbfc2", 0, 1, "InvalidContinuation", "DF then EF");
+  expectBad("e180e180", 0, 2, "InvalidContinuation", "E1 80 then E1");
+  expectBad("f18080f18080", 0, 3, "InvalidContinuation", "F1 80 80 then F1");
+  expectBad("41e18041", 1, 2, "InvalidContinuation", "E1 80 41");
+  expectBad("f1804141", 0, 2, "InvalidContinuation", "F1 80 41");
+  expectBad("f18080ff", 0, 3, "InvalidContinuation", "F1 80 80 FF");
+}
+
+// ---------------------------------------------------------------- Kuhn 3.5: impossible bytes
+
+@Test
+function kuhn3ImpossibleBytes(): void {
+  expectBad("fe", 0, 1, "InvalidLead", "FE");
+  expectBad("ff", 0, 1, "InvalidLead", "FF");
+  expectBad("fefeffff", 0, 1, "InvalidLead", "FE FE FF FF");
+  expectBad("6162ff", 2, 1, "InvalidLead", "FF after valid text");
+}
+
+// ---------------------------------------------------------------- Kuhn 4: overlong sequences
+
+@Test
+function kuhn4OverlongSlash(): void {
+  expectBad("c0af", 0, 1, "Overlong", "2-byte '/'");
+  expectBad("e080af", 0, 1, "Overlong", "3-byte '/'");
+  expectBad("f08080af", 0, 1, "Overlong", "4-byte '/'");
+  expectBad("f880808080af", 0, 1, "InvalidLead", "5-byte '/'");
+  expectBad("fc8080808080af", 0, 1, "InvalidLead", "6-byte '/'");
+}
+
+@Test
+function kuhn4MaximumOverlong(): void {
+  expectBad("c1bf", 0, 1, "Overlong", "U+007F as 2 bytes");
+  expectBad("e09fbf", 0, 1, "Overlong", "U+07FF as 3 bytes");
+  expectBad("f08fbfbf", 0, 1, "Overlong", "U+FFFF as 4 bytes");
+}
+
+@Test
+function kuhn4OverlongNul(): void {
+  expectBad("c080", 0, 1, "Overlong", "NUL as 2 bytes");
+  expectBad("e08080", 0, 1, "Overlong", "NUL as 3 bytes");
+  expectBad("f0808080", 0, 1, "Overlong", "NUL as 4 bytes");
+  expectBad("e08000", 0, 1, "Overlong", "E0 80 then ASCII");
+}
+
+@Test
+function kuhn4SmallestEncodingsAreAccepted(): void {
+  expectValid("c2a0", "U+00A0 smallest 2-byte after C1");
+  expectValid("e0a0bf", "E0 A0 BF");
+  expectValid("f0908080", "F0 90 80 80");
+  expectBad("e09f80", 0, 1, "Overlong", "E0 9F 80 is the largest overlong 3-byte");
+  expectBad("f08f8080", 0, 1, "Overlong", "F0 8F 80 80 is the largest-start overlong 4-byte");
+}
+
+// ---------------------------------------------------------------- Kuhn 5: illegal code positions
+
+@Test
+function kuhn5Surrogates(): void {
+  expectBad("eda080", 0, 1, "Surrogate", "U+D800");
+  expectBad("edadbf", 0, 1, "Surrogate", "U+DB7F");
+  expectBad("edae80", 0, 1, "Surrogate", "U+DB80");
+  expectBad("edafbf", 0, 1, "Surrogate", "U+DBFF");
+  expectBad("edb080", 0, 1, "Surrogate", "U+DC00");
+  expectBad("edbe80", 0, 1, "Surrogate", "U+DF80");
+  expectBad("edbfbf", 0, 1, "Surrogate", "U+DFFF");
+  expectBad("eda080edb080", 0, 1, "Surrogate", "CESU-8 pair U+D800 U+DC00");
+  expectBad("41edbfbf", 1, 1, "Surrogate", "surrogate after text");
+}
+
+@Test
+function kuhn5AboveTheLastCodePoint(): void {
+  expectBad("f4908080", 0, 1, "TooLarge", "U+110000");
+  expectBad("f4bfbfbf", 0, 1, "TooLarge", "F4 BF BF BF");
+  expectBad("f7bfbfbf", 0, 1, "TooLarge", "F7 BF BF BF");
+  expectBad("f5808080", 0, 1, "TooLarge", "F5 80 80 80");
+}
+
+// ---------------------------------------------------------------- positions
+
+@Test
+function errorPositionIsTheLongestValidPrefix(): void {
+  const s = "ok \xc3\xa9\xe2\x82\xac" + "!\xf0\x9f\x98\x80?\xc0\xaf"; // ok, e-acute, euro, "!", U+1F600, "?", then overlong
+  const r = checkUtf8(s);
+  assertEqBool(r.isErr(), true, "bad tail");
+  const e = r.unwrapErr();
+  assertEqUsize(e.position, 14, "valid prefix is 14 bytes");
+  assertEqBool(isValidUtf8(s.substring(0, e.position)), true, "prefix is valid");
+  assertEqString(utf8ErrorMessage(e), "invalid UTF-8 at byte 14: overlong encoding", "message");
+  assertEqBool(checkUtf8("plain").isOk(), true, "ASCII");
+}
+
+@Test
+function errorMessagesNameTheKind(): void {
+  assertEqString(utf8ErrorMessage(validate(hex("80")).unwrapErr()), "invalid UTF-8 at byte 0: invalid leading byte", "lead");
+  assertEqString(utf8ErrorMessage(validate(hex("e180")).unwrapErr()), "invalid UTF-8 at byte 0: truncated sequence", "truncated");
+  assertEqString(utf8ErrorMessage(validate(hex("e141")).unwrapErr()), "invalid UTF-8 at byte 0: invalid continuation byte", "continuation");
+  assertEqString(utf8ErrorMessage(validate(hex("eda080")).unwrapErr()), "invalid UTF-8 at byte 0: encoded surrogate", "surrogate");
+  assertEqString(utf8ErrorMessage(validate(hex("f4908080")).unwrapErr()), "invalid UTF-8 at byte 0: code point above U+10FFFF", "too large");
+}
+
+// ---------------------------------------------------------------- scalar values and encoding
+
+@Test
+function scalarValues(): void {
+  assertEqBool(isScalarValue(0), true, "0");
+  assertEqBool(isScalarValue(55295), true, "D7FF");
+  assertEqBool(isScalarValue(55296), false, "D800");
+  assertEqBool(isScalarValue(57343), false, "DFFF");
+  assertEqBool(isScalarValue(57344), true, "E000");
+  assertEqBool(isScalarValue(1114111), true, "10FFFF");
+  assertEqBool(isScalarValue(1114112), false, "110000");
+  assertEqBool(isScalarValue(-1), false, "negative");
+}
+
+@Test
+function utf8LenByRange(): void {
+  assertEq(utf8Len(0), 1, "0");
+  assertEq(utf8Len(127), 1, "7F");
+  assertEq(utf8Len(128), 2, "80");
+  assertEq(utf8Len(2047), 2, "7FF");
+  assertEq(utf8Len(2048), 3, "800");
+  assertEq(utf8Len(65535), 3, "FFFF");
+  assertEq(utf8Len(65536), 4, "10000");
+  assertEq(utf8Len(1114111), 4, "10FFFF");
+}
+
+@Test
+function encodeCodePointVectors(): void {
+  assertEqString(bytesOf(encodeCodePoint(0)), "00", "U+0000");
+  assertEqString(bytesOf(encodeCodePoint(127)), "7f", "U+007F");
+  assertEqString(bytesOf(encodeCodePoint(128)), "c280", "U+0080");
+  assertEqString(bytesOf(encodeCodePoint(233)), "c3a9", "e-acute");
+  assertEqString(bytesOf(encodeCodePoint(2047)), "dfbf", "U+07FF");
+  assertEqString(bytesOf(encodeCodePoint(2048)), "e0a080", "U+0800");
+  assertEqString(bytesOf(encodeCodePoint(8364)), "e282ac", "euro");
+  assertEqString(bytesOf(encodeCodePoint(55295)), "ed9fbf", "U+D7FF");
+  assertEqString(bytesOf(encodeCodePoint(57344)), "ee8080", "U+E000");
+  assertEqString(bytesOf(encodeCodePoint(65535)), "efbfbf", "U+FFFF");
+  assertEqString(bytesOf(encodeCodePoint(65536)), "f0908080", "U+10000");
+  assertEqString(bytesOf(encodeCodePoint(128512)), "f09f9880", "U+1F600");
+  assertEqString(bytesOf(encodeCodePoint(1114111)), "f48fbfbf", "U+10FFFF");
+  assertEqBool(encodeCodePoint(55296).isNone(), true, "surrogate");
+  assertEqBool(encodeCodePoint(57343).isNone(), true, "low surrogate");
+  assertEqBool(encodeCodePoint(1114112).isNone(), true, "too large");
+  assertEqBool(encodeCodePoint(-1).isNone(), true, "negative");
+}
+
+function bytesOf(o: Option<string>): string {
+  return o.isSome() ? bytesHex(o.unwrap()) : "none";
+}
+
+function bytesHex(s: string): string {
+  return bytesFromString(s).toHex();
+}
+
+@Test
+function everyScalarValueRoundTrips(): void {
+  // every code point up to U+0898, then a stride of 997 through the rest of the range
+  let cp: int = 0;
+  while (cp <= 1114111) {
+    if (isScalarValue(cp)) {
+      const e = encodeCodePoint(cp).unwrap();
+      assertEqUsize(e.length, utf8Len(cp).toUsize(), "length " + cp.toString());
+      const s = validateString(e).unwrap();
+      assertEqUsize(s.codePointCount(), 1, "one code point " + cp.toString());
+      assertEq(s.codePointAt(0).unwrap(), cp, "round trip " + cp.toString());
+    } else {
+      assertEqBool(encodeCodePoint(cp).isNone(), true, "no encoding " + cp.toString());
+    }
+    cp += cp < 2200 ? 1 : 997;
+  }
+}
+
+// ---------------------------------------------------------------- Utf8String
+
+@Test
+function utf8StringBasics(): void {
+  const s = validateString("h\xc3\xa9llo \xe2\x82\xac \xf0\x9f\x98\x80").unwrap();
+  assertEqUsize(s.byteLength(), 15, "bytes");
+  assertEqUsize(s.codePointCount(), 9, "code points");
+  assertEqBool(s.isEmpty(), false, "not empty");
+  assertEqBool(validateString("").unwrap().isEmpty(), true, "empty");
+  assertEqUsize(validateString("").unwrap().codePointCount(), 0, "empty count");
+  assertEqString(s.asString(), "h\xc3\xa9llo \xe2\x82\xac \xf0\x9f\x98\x80", "asString");
+  assertEqUsize(s.toBytes().length(), 15, "toBytes");
+  assertEqBool(validate(s.toBytes()).unwrap().asString() == s.asString(), true, "bytes round trip");
+}
+
+@Test
+function utf8StringRejectsInvalidInput(): void {
+  assertEqBool(validateString("a\xffb").isErr(), true, "0xff");
+  assertEqUsize(validateString("a\xffb").unwrapErr().position, 1, "position");
+  assertEqBool(validate(hex("c0af")).isErr(), true, "bytes overlong");
+  assertEqBool(validate(emptyBytes()).isOk(), true, "empty bytes");
+  assertEqBool(isValidUtf8("\xed\xa0\x80"), false, "surrogate");
+  assertEqBool(isValidUtf8("abc"), true, "ascii");
+}
+
+@Test
+function codePointsInOrder(): void {
+  const s = validateString("a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80").unwrap();
+  const cps = s.codePoints();
+  assertEqUsize(cps.length, 4, "count");
+  assertEq(cps[0], 97, "a");
+  assertEq(cps[1], 233, "e-acute");
+  assertEq(cps[2], 8364, "euro");
+  assertEq(cps[3], 128512, "emoji");
+  assertEqUsize(validateString("").unwrap().codePoints().length, 0, "empty");
+}
+
+@Test
+function fromCodePointsRoundTrip(): void {
+  const s = fromCodePoints([97, 233, 8364, 128512, 0]).unwrap();
+  assertEqUsize(s.codePointCount(), 5, "count");
+  assertEqUsize(s.byteLength(), 11, "bytes");
+  assertEq(s.codePoints()[4], 0, "NUL is a code point");
+  assertEqBool(fromCodePoints([97, 55296]).isNone(), true, "surrogate rejected");
+  assertEqBool(fromCodePoints([1114112]).isNone(), true, "too large rejected");
+  assertEqBool(fromCodePoints([-5]).isNone(), true, "negative rejected");
+  assertEqBool(fromCodePoints([]).unwrap().isEmpty(), true, "empty");
+}
+
+@Test
+function boundariesAndSlices(): void {
+  const s = validateString("a\xc3\xa9\xe2\x82\xac").unwrap(); // a (1) e-acute (2) euro (3): 6 bytes
+  assertEqBool(s.isCharBoundary(0), true, "0");
+  assertEqBool(s.isCharBoundary(1), true, "1");
+  assertEqBool(s.isCharBoundary(2), false, "inside e-acute");
+  assertEqBool(s.isCharBoundary(3), true, "3");
+  assertEqBool(s.isCharBoundary(4), false, "inside euro");
+  assertEqBool(s.isCharBoundary(5), false, "inside euro 2");
+  assertEqBool(s.isCharBoundary(6), true, "end");
+  assertEqBool(s.isCharBoundary(7), false, "past end");
+  assertEqBool(s.codePointAt(2).isNone(), true, "codePointAt inside");
+  assertEqBool(s.codePointAt(6).isNone(), true, "codePointAt at end");
+  assertEq(s.codePointAt(3).unwrap(), 8364, "codePointAt euro");
+  const t = s.trySlice(1, 3).unwrap();
+  assertEqString(t.asString(), "\xc3\xa9", "slice e-acute");
+  assertEqBool(s.trySlice(1, 2).isNone(), true, "cuts a character");
+  assertEqBool(s.trySlice(2, 3).isNone(), true, "starts inside a character");
+  assertEqBool(s.trySlice(3, 1).isNone(), true, "reversed");
+  assertEqBool(s.trySlice(0, 7).isNone(), true, "past end");
+  assertEqBool(s.trySlice(6, 6).unwrap().isEmpty(), true, "empty at end");
+  assertEqUsize(s.trySlice(0, 6).unwrap().byteLength(), 6, "whole");
+}
+
+@Test
+function concatKeepsValidity(): void {
+  const a = validateString("\xe2").isErr();
+  assertEqBool(a, true, "a half character is not a Utf8String");
+  const x = validateString("\xc3\xa9").unwrap();
+  const y = validateString("\xe2\x82\xac!").unwrap();
+  const z = x.concat(y);
+  assertEqUsize(z.byteLength(), 6, "length");
+  assertEqUsize(z.codePointCount(), 3, "count");
+  assertEqString(z.asString(), "\xc3\xa9\xe2\x82\xac!", "text");
+  assertEqUsize(x.concat(validateString("").unwrap()).byteLength(), 2, "empty right");
+}
+
+// ---------------------------------------------------------------- cursor
+
+@Test
+function cursorWalksCodePoints(): void {
+  const s = validateString("a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80").unwrap();
+  let c = new CodePointCursor(s);
+  assertEqBool(c.hasNext(), true, "has next");
+  assertEq(c.next().unwrap(), 97, "a");
+  assertEqUsize(c.position(), 1, "after a");
+  assertEq(c.next().unwrap(), 233, "e-acute");
+  assertEqUsize(c.position(), 3, "after e-acute");
+  assertEq(c.next().unwrap(), 8364, "euro");
+  assertEq(c.next().unwrap(), 128512, "emoji");
+  assertEqBool(c.hasNext(), false, "at end");
+  assertEqBool(c.next().isNone(), true, "next at end");
+  assertEqUsize(c.position(), 10, "position at end");
+  let e = new CodePointCursor(validateString("").unwrap());
+  assertEqBool(e.next().isNone(), true, "empty string");
+}
