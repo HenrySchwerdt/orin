@@ -1,0 +1,84 @@
+// MIR — explicit-ownership control-flow IR. Shared contract (v1), owned by the lead architect.
+// Pipeline: HIR --lower--> MIR --verify--> MIR --emit--> C (later also LLVM IR, ADR-0006).
+// Semantics, ownership rules and verifier obligations: docs/mir.md (normative for this file).
+//
+// Every heap value is a reference (`MRef`) to an RC'd object (docs/architecture.md). Ownership is
+// explicit: a local holding a reference is, at each program point, Owned (counts one reference),
+// Borrowed (an alias valid while its source is unchanged) or Dead. The verifier
+// (compiler/verify) checks these states by dataflow; codegen trusts a verified MIR.
+
+import { Builtin, UnOp, BinOp } from "../hir";
+
+export type MType = MInt | MUsize | MBool | MRef | MVoid;
+
+// A local slot. Parameters are the first `paramCount` locals; they are Borrowed for the whole
+// function and must never be released, moved or mutated.
+export type MLocal = { name: string; ty: MType; };
+
+export type Operand =
+  OLocal(usize)
+  | OInt(int)          // int constant (type MInt)
+  | OUsize(int)        // usize constant (non-negative)
+  | OBool(bool)
+  | OStr(usize);       // immortal string literal: index into MProgram.strings; behaves as Owned
+                       // when consumed and as Borrowed when read (never needs release)
+
+export type Instr =
+  // --- moves, copies, reference counting ---
+  ICopy(usize, Operand)                 // dst = scalar operand (or OStr constant)
+  | IMove(usize, usize)                 // dst = src; ownership transfers; src becomes Dead
+  | IBorrow(usize, usize)               // dst = borrowed alias of src (no RC change)
+  | IDup(usize, Operand)                // dst = retain(src): dst Owned (+1)
+  | IRelease(usize)                     // release Owned local; it becomes Dead
+  // --- scalars (checked; overflow/div-by-zero trap) ---
+  | IUnary(usize, UnOp, Operand)
+  | IBinary(usize, BinOp, Operand, Operand)   // int/usize/bool ops; Eq/Ne on strings allowed
+  // --- calls: arguments are borrowed for the call's duration; result is Owned ---
+  | ICall(Option<usize>, usize, Operand[])          // dst, function index, args
+  | IBuiltin(Option<usize>, Builtin, Operand[])     // non-mutating builtins (hir.Builtin)
+  | IStrAppend(usize, Operand)          // x = x + y in place when x unique; x must be Owned
+  // --- structs (records, variants, Option, Result) ---
+  | IStructNew(usize, usize, Operand[]) // dst, tag, slots: ref slot operands are CONSUMED
+                                        // (Owned locals become Dead; OStr allowed)
+  | INullary(usize, usize)              // dst = immortal payload-less variant with tag
+  | ITag(usize, Operand)                // dst (MInt) = tag of a struct
+  | IGetField(usize, Operand, usize)    // dst = obj.slot[i]; ref result is Borrowed from obj
+  | ISetField(usize, usize, Operand)    // obj.slot[i] = v; obj must be Unique; v consumed;
+                                        // old slot value released
+  | ITakeField(usize, usize, usize)     // dst = take obj.slot[i] (Owned); obj must be Unique;
+                                        // slot becomes a hole until IPutField
+  | IPutField(usize, usize, usize)      // obj.slot[i] = src (fills a hole); src consumed
+  | IMakeUnique(usize)                  // x Owned -> Owned+Unique (copies if shared)
+  // --- arrays ---
+  | IArrayNew(usize, bool, Operand[])   // dst, elemIsRef, elements (ref elements consumed)
+  | IArrayGet(usize, Operand, Operand)  // dst = arr[i] (trap if OOB); ref result Borrowed
+  | IArraySet(usize, Operand, Operand)  // arr[i] = v; arr Unique; v consumed; old released
+  | IArrayTake(usize, usize, Operand)   // dst = take arr[i] (Owned); arr Unique; hole
+  | IArrayPut(usize, Operand, usize)    // arr[i] = src (fills hole); src consumed
+  | IArrayPush(usize, Operand)          // arr Owned (COW inside runtime); v consumed
+  | IArrayPop(usize, usize);            // dst (Owned Option) = pop arr; arr Owned
+
+export type SwitchCase = { value: int; target: usize; };
+
+export type Terminator =
+  TGoto(usize)
+  | TBranch(Operand, usize, usize)              // bool cond, then-block, else-block
+  | TSwitch(Operand, SwitchCase[], usize)       // int scrutinee (e.g. a tag), cases, default
+  | TReturn(Option<Operand>)                    // ref result must be Owned (consumed) or OStr
+  | TTrap(string);                              // defined trap: "trap: <msg>", exit 101
+
+export type MBlock = { instrs: Instr[]; term: Terminator; };
+
+export type MFunction = {
+  name: string;            // qualified, unique, deterministic (same as HIR)
+  paramCount: usize;
+  locals: MLocal[];
+  ret: MType;
+  blocks: MBlock[];        // blocks[0] is the entry
+};
+
+export type MProgram = {
+  functions: MFunction[];  // same indices as HIR functions
+  strings: string[];       // deduplicated string literals, in first-use order
+  main: usize;
+};
