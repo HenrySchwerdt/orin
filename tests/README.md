@@ -54,7 +54,7 @@ mismatch), exit status, or compiler/C stderr head. Exit status is non-zero if an
 ## Headers for `tests/next`
 
 Beyond `// exit: N`, the leading `//` comment lines of a test may contain `// flags: --check-contracts`
-(extra compiler flags, ADR-0012) and `// stderr: text` (the run's stderr must contain `text`).
+(extra compiler flags, ADR-0012), `// stderr: text` (the run's stderr must contain `text`) and `// warns: W0450 W0452` (the warning codes of the compile, as a multiset, must be exactly these; `// warns: none` for no warning; ADR-0028).
 `tests/contracts/` holds inputs for `tools/test_verify_contracts.py` (`orin verify --contracts`,
 needs z3): expected results are given as `// expect: <function> <kind> <STATUS>` lines.
 
