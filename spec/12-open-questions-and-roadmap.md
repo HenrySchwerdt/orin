@@ -22,6 +22,7 @@
 - Closures: capture by value, immutable captures — ADR-0011.
 - Concurrency: isolated tasks, send = move-or-copy, structured `scope`, no shared mutable memory — ADR-0017.
 - Language 1.0 core scope and freeze — ADR-0016.
+- Verifiable-software vision adopted; proof status vocabulary; OSIG = grown semantic engine; capabilities before the freeze — ADR-0020 (plan: `docs/roadmap.md`, TCB: `docs/tcb.md`).
 
 ## Priority OPEN decisions
 

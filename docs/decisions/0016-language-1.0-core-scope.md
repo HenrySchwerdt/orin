@@ -16,6 +16,7 @@ Status: accepted (2026-10-13). After the core is complete the language surface i
 | **Graph<T>/GraphId<T>** | std library type (Orin) with generational, graph-tagged IDs; stale/foreign IDs → `Err` (spec 06 cycle rule). |
 | **Packages** (spec 04) | `orin.toml` manifest: package name, module architecture rules (`allowed_dependencies`), entry point; `orin build`/`check` from a package root. No registry/versions in 1.0 core (post-1.0). |
 | **std** | `std:fs`, `std:process`, `std:io`, `std:math`, `std:path`, `std:time`, `std:json` (`parse` into a `Json` union + typed helpers; codegen-based `parse<T>` needs annotations → post-1.0), `std:map`. HTTP is post-1.0. |
+| **Capabilities** (ADR-0020 D4) | language part only: unforgeable capability handles granted at the program root, boundary declarations in `orin.toml`, enforcement in the L0 platform layer; std I/O APIs take handles. Designed in ADR-0021 (pending) — **the freeze waits for it**. Effect inference/policy checking come after the freeze. |
 | **Concurrency** | **designed now** (ADR-0017), implemented after the core freeze but before 1.0 final. |
 
 ## Explicitly post-1.0

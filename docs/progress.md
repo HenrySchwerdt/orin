@@ -23,16 +23,22 @@ _Updated: 2026-10-13_
 | Lean: RC machine safety, COW, checker soundness for the MIR core | done (partial) |
 | Tooling: fmt, check --format=json, lsp, mcp, VS Code | done |
 | Releases (dispatch workflow, packages, seed C) | done |
-| Seed bootstrap (ADR-0014) | in progress |
+| Seed bootstrap (ADR-0014) | done |
 | Floats (`float`, `f32`), `std:math`, `Map<K,V>` (ADR-0018) | done |
 | Runtime R2: platform layer with contracts | done (CBMC-bounded + tests) |
 | Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | in progress |
-| Interfaces, annotations (spec 05), concurrency, packages, incremental analysis | not started |
+| Packages: `orin.toml`, architecture rules, API snapshots | done |
+| std:path/json/time/graph | done |
+| Interfaces (ADR-0019) | integrating |
+| Integers, interpolation, annotations (spec 05), resources, capabilities (ADR-0020/0021) | not started |
+| Concurrency (ADR-0017), incremental analysis | not started |
+| OSIG / `orin graph` / `orin diff`, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
 
 ## Next milestones
-1. Seed bootstrap merged → compiler source may use generics/closures/classes; then the
-   compiler modernisation with contract dogfooding (ADR-0015), module by module.
-2. v0.1.0-alpha.2 with closures, floats, maps.
-3. Runtime R3 (core dialect, object model in Orin) and refinement proofs.
-4. Contract verification beyond pure functions; interfaces; concurrency design (spec 12 #5).
+See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-software tracks of
+ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
+1. Interfaces + contract clauses phase 1 merged; OSIG/`orin graph`/`orin diff` started in parallel.
+2. Fixed-width integers, interpolation, `@Test`, resources, capability handles (ADR-0021) → freeze.
+3. Compiler rewrite with the full language and MIR source spans (ADR-0015).
+4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.
