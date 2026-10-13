@@ -1,0 +1,724 @@
+// Tests for std:collections. Besides hand-written cases each structure is compared with a naive reference model
+// on deterministic pseudo-random operation sequences, so a wrong result and a broken invariant both show up.
+// Run with `orin test` (contracts checked) and with `--no-contracts`; see tools/test_std.sh.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool } from "std:test";
+import { IntSet, StringSet, Deque, SortedMap, SortedStringMap, SortedEntry, SortedStringEntry, PriorityQueue, PQEntry,
+  allTrue, isStrictlyIncreasing, isStrictlyIncreasingStrings, compareStrings, ringConsistent } from "std:collections";
+
+// Linear congruential generator; all products stay below 2^63.
+function nextRand(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+function joinInts(xs: int[]): string {
+  let parts: string[] = [];
+  for (const x of xs) {
+    parts.push(x.toString());
+  }
+  return parts.join(",");
+}
+
+function sortedCopy(xs: int[]): int[] {
+  let out = xs;
+  let i: usize = 1;
+  while (i < out.length) {
+    let j = i;
+    while (j > 0 && out[j - 1] > out[j]) {
+      const t = out[j];
+      out[j] = out[j - 1];
+      out[j - 1] = t;
+      j -= 1;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function indexOfInt(xs: int[], x: int): int {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i] == x) {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// ---------------------------------------------------------------- helpers
+
+@Test
+function helperPredicates(): void {
+  assertEqBool(allTrue([]), true, "allTrue empty");
+  assertEqBool(allTrue([true, true]), true, "allTrue");
+  assertEqBool(allTrue([true, false]), false, "allTrue false");
+  assertEqBool(isStrictlyIncreasing([]), true, "empty");
+  assertEqBool(isStrictlyIncreasing([5]), true, "single");
+  assertEqBool(isStrictlyIncreasing([1, 2, 9]), true, "increasing");
+  assertEqBool(isStrictlyIncreasing([1, 1]), false, "duplicate");
+  assertEqBool(isStrictlyIncreasing([2, 1]), false, "decreasing");
+  assertEqBool(isStrictlyIncreasingStrings(["a", "ab", "b"]), true, "strings");
+  assertEqBool(isStrictlyIncreasingStrings(["a", "a"]), false, "string duplicate");
+  assertEqBool(isStrictlyIncreasingStrings(["b", "a"]), false, "string decreasing");
+}
+
+@Test
+function compareStringsOrder(): void {
+  assertEq(compareStrings("", ""), 0, "empty");
+  assertEq(compareStrings("", "a"), -1, "empty first");
+  assertEq(compareStrings("a", ""), 1, "empty second");
+  assertEq(compareStrings("a", "a"), 0, "equal");
+  assertEq(compareStrings("a", "b"), -1, "a < b");
+  assertEq(compareStrings("ab", "a"), 1, "prefix is smaller");
+  assertEq(compareStrings("B", "a"), -1, "uppercase before lowercase");
+  assertEq(compareStrings("a\xff", "a\x7f"), 1, "bytes compare unsigned");
+  assertEq(compareStrings("abc", "abd"), -1, "last byte");
+}
+
+@Test
+function ringConsistentChecksTheRing(): void {
+  const none: Option<int> = None;
+  const empty: Option<int>[] = [];
+  assertEqBool(ringConsistent(empty, 0, 0), true, "no slots");
+  assertEqBool(ringConsistent(empty, 0, 1), false, "no slots but length");
+  assertEqBool(ringConsistent([Some(1), none, none], 0, 1), true, "one at head");
+  assertEqBool(ringConsistent([none, none, Some(1)], 2, 1), true, "one at the end");
+  assertEqBool(ringConsistent([Some(2), none, Some(1)], 2, 2), true, "wrapped");
+  assertEqBool(ringConsistent([Some(1), none, none], 1, 1), false, "head on an empty slot");
+  assertEqBool(ringConsistent([Some(1), Some(2), none], 0, 1), false, "extra occupied slot");
+  assertEqBool(ringConsistent([Some(1), none, none], 3, 1), false, "head out of range");
+  assertEqBool(ringConsistent([Some(1)], 0, 2), false, "length above capacity");
+}
+
+// ---------------------------------------------------------------- IntSet
+
+@Test
+function intSetBasics(): void {
+  let s = new IntSet();
+  assertEqBool(s.isEmpty(), true, "empty");
+  assertEqBool(s.add(5), true, "new");
+  assertEqBool(s.add(5), false, "duplicate");
+  assertEqBool(s.add(-3), true, "negative");
+  assertEqUsize(s.size(), 2, "size");
+  assertEqBool(s.has(5) && s.has(-3) && !s.has(4), true, "membership");
+  assertEqBool(s.remove(4), false, "remove absent");
+  assertEqBool(s.remove(5), true, "remove");
+  assertEqBool(s.has(5), false, "gone");
+  assertEqUsize(s.size(), 1, "size after remove");
+  assertEqBool(s.add(5), true, "re-add");
+  assertEqString(joinInts(s.toArray()), "-3,5", "insertion order after delete and re-add");
+  s.clear();
+  assertEqUsize(s.size(), 0, "clear");
+  assertEqBool(s.has(-3), false, "cleared");
+}
+
+@Test
+function intSetOperations(): void {
+  let a = new IntSet();
+  let b = new IntSet();
+  a.add(1);
+  a.add(2);
+  a.add(3);
+  b.add(3);
+  b.add(4);
+  const u = a.union(b);
+  assertEqUsize(u.size(), 4, "union size");
+  assertEqBool(u.has(1) && u.has(4), true, "union members");
+  const i = a.intersection(b);
+  assertEqUsize(i.size(), 1, "intersection size");
+  assertEqBool(i.has(3), true, "intersection member");
+  const d = a.difference(b);
+  assertEqUsize(d.size(), 2, "difference size");
+  assertEqBool(d.has(1) && d.has(2) && !d.has(3), true, "difference members");
+  assertEqBool(i.isSubsetOf(a) && i.isSubsetOf(b), true, "subset");
+  assertEqBool(a.isSubsetOf(b), false, "not subset");
+  assertEqBool(a.isSubsetOf(a), true, "self subset");
+  const e = new IntSet();
+  assertEqBool(e.isSubsetOf(a), true, "empty is subset");
+  assertEqBool(a.union(e).size() == 3 && e.union(a).size() == 3, true, "union with empty");
+  assertEqBool(a.intersection(e).isEmpty(), true, "intersection with empty");
+  assertEqUsize(a.difference(e).size(), 3, "difference with empty");
+  assertEqUsize(a.difference(a).size(), 0, "difference with self");
+}
+
+@Test
+function intSetIsAValue(): void {
+  let a = new IntSet();
+  a.add(1);
+  let b = a;
+  b.add(2);
+  assertEqUsize(a.size(), 1, "original unchanged");
+  assertEqUsize(b.size(), 2, "copy changed");
+}
+
+@Test
+function intSetAgainstModel(): void {
+  let s = new IntSet();
+  let model: int[] = [];
+  let seed: int = 7;
+  let step: int = 0;
+  while (step < 400) {
+    seed = nextRand(seed);
+    const x = (seed / 16) % 40;
+    seed = nextRand(seed);
+    const op = (seed / 16) % 3;
+    const at = indexOfInt(model, x);
+    if (op < 2) {
+      assertEqBool(s.add(x), at < 0, "add result");
+      if (at < 0) {
+        model.push(x);
+      }
+    } else {
+      assertEqBool(s.remove(x), at >= 0, "remove result");
+      if (at >= 0) {
+        let rest: int[] = [];
+        for (const m of model) {
+          if (m != x) {
+            rest.push(m);
+          }
+        }
+        model = rest;
+      }
+    }
+    assertEqUsize(s.size(), model.length, "size");
+    step += 1;
+  }
+  assertEqString(joinInts(sortedCopy(s.toArray())), joinInts(sortedCopy(model)), "same members");
+}
+
+// ---------------------------------------------------------------- StringSet
+
+@Test
+function stringSetBasics(): void {
+  let s = new StringSet();
+  assertEqBool(s.add("a"), true, "new");
+  assertEqBool(s.add("a"), false, "duplicate");
+  assertEqBool(s.add(""), true, "empty string is a member");
+  assertEqBool(s.has("") && s.has("a") && !s.has("b"), true, "membership");
+  assertEqUsize(s.size(), 2, "size");
+  assertEqBool(s.remove("zz"), false, "absent");
+  assertEqBool(s.remove("a"), true, "remove");
+  assertEqUsize(s.size(), 1, "size after remove");
+  assertEqString(s.toArray().join("|"), "", "only the empty string left");
+  s.clear();
+  assertEqBool(s.isEmpty(), true, "cleared");
+}
+
+@Test
+function stringSetOperations(): void {
+  let a = new StringSet();
+  let b = new StringSet();
+  a.add("x");
+  a.add("y");
+  b.add("y");
+  b.add("z");
+  assertEqUsize(a.union(b).size(), 3, "union");
+  assertEqString(a.intersection(b).toArray().join(","), "y", "intersection");
+  assertEqString(a.difference(b).toArray().join(","), "x", "difference");
+  assertEqBool(a.intersection(b).isSubsetOf(a), true, "subset");
+  assertEqBool(a.isSubsetOf(b), false, "not subset");
+  assertEqBool(new StringSet().isSubsetOf(a), true, "empty subset");
+}
+
+// ---------------------------------------------------------------- Deque
+
+@Test
+function dequeBothEnds(): void {
+  let d = new Deque<int>();
+  assertEqBool(d.isEmpty(), true, "empty");
+  assertEqUsize(d.capacity(), 0, "no storage before the first push");
+  assertEqBool(d.popFront().isNone(), true, "popFront on empty");
+  assertEqBool(d.popBack().isNone(), true, "popBack on empty");
+  assertEqBool(d.front().isNone() && d.back().isNone() && d.get(0).isNone(), true, "peek on empty");
+  d.pushBack(2);
+  d.pushBack(3);
+  d.pushFront(1);
+  d.pushFront(0);
+  assertEqString(joinInts(d.toArray()), "0,1,2,3", "order");
+  assertEq(d.front().unwrap(), 0, "front");
+  assertEq(d.back().unwrap(), 3, "back");
+  assertEq(d.get(2).unwrap(), 2, "get 2");
+  assertEqBool(d.get(4).isNone(), true, "get past end");
+  assertEq(d.popFront().unwrap(), 0, "popFront");
+  assertEq(d.popBack().unwrap(), 3, "popBack");
+  assertEqString(joinInts(d.toArray()), "1,2", "after pops");
+  assertEqUsize(d.size(), 2, "size");
+}
+
+@Test
+function dequeWrapsAndGrows(): void {
+  let d = new Deque<int>();
+  // fill the 4-slot ring, then rotate so that the head is in the middle, then grow with a wrapped ring
+  d.pushBack(1);
+  d.pushBack(2);
+  d.pushBack(3);
+  d.pushBack(4);
+  assertEqUsize(d.capacity(), 4, "capacity 4");
+  assertEq(d.popFront().unwrap(), 1, "pop 1");
+  assertEq(d.popFront().unwrap(), 2, "pop 2");
+  d.pushBack(5);
+  d.pushBack(6);
+  assertEqUsize(d.capacity(), 4, "still 4, ring wrapped");
+  assertEqString(joinInts(d.toArray()), "3,4,5,6", "wrapped order");
+  d.pushBack(7);
+  assertEqUsize(d.capacity(), 8, "grown to 8");
+  assertEqString(joinInts(d.toArray()), "3,4,5,6,7", "order kept by growth");
+  d.pushFront(2);
+  d.pushFront(1);
+  d.pushFront(0);
+  assertEqUsize(d.capacity(), 8, "8 elements fit");
+  d.pushFront(-1);
+  assertEqUsize(d.capacity(), 16, "grown to 16 from a front-heavy ring");
+  assertEqString(joinInts(d.toArray()), "-1,0,1,2,3,4,5,6,7", "order after second growth");
+  assertEq(d.get(0).unwrap(), -1, "get front");
+  assertEq(d.get(8).unwrap(), 7, "get back");
+}
+
+@Test
+function dequeAsStackAndQueue(): void {
+  let q = new Deque<string>();
+  q.pushBack("a");
+  q.pushBack("b");
+  q.pushBack("c");
+  assertEqString(q.popFront().unwrap(), "a", "fifo 1");
+  assertEqString(q.popFront().unwrap(), "b", "fifo 2");
+  let st = new Deque<string>();
+  st.pushBack("a");
+  st.pushBack("b");
+  st.pushBack("c");
+  assertEqString(st.popBack().unwrap(), "c", "lifo 1");
+  assertEqString(st.popBack().unwrap(), "b", "lifo 2");
+  assertEqString(st.popBack().unwrap(), "a", "lifo 3");
+  assertEqBool(st.popBack().isNone(), true, "drained");
+  st.pushFront("z");
+  assertEqString(st.back().unwrap(), "z", "single element is both ends");
+  assertEqString(st.front().unwrap(), "z", "front of single");
+}
+
+@Test
+function dequeClearAndValue(): void {
+  let d = new Deque<int>();
+  d.pushBack(1);
+  d.pushBack(2);
+  let c = d;
+  c.pushBack(3);
+  assertEqUsize(d.size(), 2, "original unchanged");
+  assertEqUsize(c.size(), 3, "copy changed");
+  d.clear();
+  assertEqBool(d.isEmpty(), true, "cleared");
+  assertEqUsize(d.capacity(), 0, "storage released");
+  d.pushFront(9);
+  assertEq(d.front().unwrap(), 9, "usable after clear");
+}
+
+@Test
+function dequeAgainstModel(): void {
+  let d = new Deque<int>();
+  let model: int[] = [];
+  let seed: int = 11;
+  let step: int = 0;
+  while (step < 600) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 5;
+    seed = nextRand(seed);
+    const v = (seed / 16) % 1000;
+    if (op == 0 || op == 1) {
+      d.pushBack(v);
+      model.push(v);
+    } else if (op == 2) {
+      d.pushFront(v);
+      model = [v].concat(model);
+    } else if (op == 3) {
+      const r = d.popFront();
+      if (model.length == 0) {
+        assertEqBool(r.isNone(), true, "popFront empty");
+      } else {
+        assertEq(r.unwrap(), model[0], "popFront value");
+        model = model.slice(1, model.length);
+      }
+    } else {
+      const r = d.popBack();
+      if (model.length == 0) {
+        assertEqBool(r.isNone(), true, "popBack empty");
+      } else {
+        assertEq(r.unwrap(), model[model.length - 1], "popBack value");
+        model = model.slice(0, model.length - 1);
+      }
+    }
+    assertEqUsize(d.size(), model.length, "size");
+    step += 1;
+  }
+  assertEqString(joinInts(d.toArray()), joinInts(model), "same contents");
+}
+
+// ---------------------------------------------------------------- SortedMap
+
+@Test
+function sortedMapBasics(): void {
+  let m = new SortedMap<string>();
+  assertEqBool(m.isEmpty(), true, "empty");
+  assertEqBool(m.get(1).isNone() && !m.has(1), true, "get on empty");
+  assertEqBool(m.put(20, "twenty"), true, "new key");
+  assertEqBool(m.put(10, "ten"), true, "smaller key");
+  assertEqBool(m.put(30, "thirty"), true, "larger key");
+  assertEqBool(m.put(15, "fifteen"), true, "middle key");
+  assertEqUsize(m.size(), 4, "size");
+  assertEqString(joinInts(m.keyArray()), "10,15,20,30", "sorted keys");
+  assertEqString(m.valueArray().join(","), "ten,fifteen,twenty,thirty", "values follow keys");
+  assertEqString(m.get(15).unwrap(), "fifteen", "get after put");
+  assertEqBool(m.put(15, "FIFTEEN"), false, "replace");
+  assertEqUsize(m.size(), 4, "replace keeps size");
+  assertEqString(m.get(15).unwrap(), "FIFTEEN", "replaced value");
+  assertEqBool(m.get(16).isNone(), true, "absent");
+}
+
+@Test
+function sortedMapRemove(): void {
+  let m = new SortedMap<int>();
+  m.put(3, 30);
+  m.put(1, 10);
+  m.put(2, 20);
+  assertEq(m.remove(2).unwrap(), 20, "remove middle");
+  assertEqBool(m.remove(2).isNone(), true, "remove again");
+  assertEqString(joinInts(m.keyArray()), "1,3", "after remove");
+  assertEq(m.remove(1).unwrap(), 10, "remove first");
+  assertEq(m.remove(3).unwrap(), 30, "remove last");
+  assertEqBool(m.isEmpty(), true, "empty again");
+  assertEqBool(m.remove(3).isNone(), true, "remove from empty");
+  m.put(5, 50);
+  assertEq(m.get(5).unwrap(), 50, "usable after emptying");
+}
+
+@Test
+function sortedMapNeighbours(): void {
+  let m = new SortedMap<int>();
+  assertEqBool(m.floorKey(5).isNone() && m.ceilKey(5).isNone(), true, "empty");
+  assertEqBool(m.firstKey().isNone() && m.lastKey().isNone(), true, "empty ends");
+  m.put(10, 0);
+  m.put(20, 0);
+  m.put(30, 0);
+  assertEqBool(m.floorKey(9).isNone(), true, "floor below all");
+  assertEq(m.floorKey(10).unwrap(), 10, "floor exact");
+  assertEq(m.floorKey(25).unwrap(), 20, "floor between");
+  assertEq(m.floorKey(99).unwrap(), 30, "floor above all");
+  assertEq(m.ceilKey(5).unwrap(), 10, "ceil below all");
+  assertEq(m.ceilKey(20).unwrap(), 20, "ceil exact");
+  assertEq(m.ceilKey(21).unwrap(), 30, "ceil between");
+  assertEqBool(m.ceilKey(31).isNone(), true, "ceil above all");
+  assertEq(m.firstKey().unwrap(), 10, "first");
+  assertEq(m.lastKey().unwrap(), 30, "last");
+}
+
+@Test
+function sortedMapPops(): void {
+  let m = new SortedMap<string>();
+  assertEqBool(m.popFirst().isNone(), true, "popFirst on empty");
+  assertEqBool(m.popLast().isNone(), true, "popLast on empty");
+  m.put(2, "b");
+  m.put(1, "a");
+  m.put(3, "c");
+  const f: SortedEntry<string> = m.popFirst().unwrap();
+  assertEq(f.key, 1, "popFirst key");
+  assertEqString(f.value, "a", "popFirst value");
+  const l: SortedEntry<string> = m.popLast().unwrap();
+  assertEq(l.key, 3, "popLast key");
+  assertEqString(l.value, "c", "popLast value");
+  assertEqUsize(m.size(), 1, "one left");
+  assertEq(m.popLast().unwrap().key, 2, "last remaining");
+  assertEqBool(m.isEmpty(), true, "drained");
+}
+
+@Test
+function sortedMapExtremeKeys(): void {
+  let m = new SortedMap<int>();
+  m.put(-9223372036854775807, 1);
+  m.put(9223372036854775807, 2);
+  m.put(0, 3);
+  assertEqString(joinInts(m.keyArray()), "-9223372036854775807,0,9223372036854775807", "extremes sorted");
+  assertEq(m.floorKey(-1).unwrap(), -9223372036854775807, "floor of -1");
+  m.clear();
+  assertEqBool(m.isEmpty(), true, "clear");
+}
+
+@Test
+function sortedMapAgainstModel(): void {
+  let m = new SortedMap<int>();
+  let mk: int[] = [];
+  let mv: int[] = [];
+  let seed: int = 3;
+  let step: int = 0;
+  while (step < 500) {
+    seed = nextRand(seed);
+    const k = (seed / 16) % 60;
+    seed = nextRand(seed);
+    const op = (seed / 16) % 6;
+    const at = indexOfInt(mk, k);
+    if (op < 3) {
+      assertEqBool(m.put(k, step), at < 0, "put result");
+      if (at < 0) {
+        mk.push(k);
+        mv.push(step);
+      } else {
+        mv[at.toUsize()] = step;
+      }
+    } else if (op == 3) {
+      const r = m.remove(k);
+      assertEqBool(r.isSome(), at >= 0, "remove result");
+      if (at >= 0) {
+        assertEq(r.unwrap(), mv[at.toUsize()], "removed value");
+        let nk: int[] = [];
+        let nv: int[] = [];
+        let i: usize = 0;
+        while (i < mk.length) {
+          if (mk[i] != k) {
+            nk.push(mk[i]);
+            nv.push(mv[i]);
+          }
+          i += 1;
+        }
+        mk = nk;
+        mv = nv;
+      }
+    } else if (op == 4) {
+      const g = m.get(k);
+      assertEqBool(g.isSome(), at >= 0, "get presence");
+      if (at >= 0) {
+        assertEq(g.unwrap(), mv[at.toUsize()], "get value");
+      }
+    } else {
+      // floor / ceil against a linear scan
+      let fl: int = -1;
+      let ce: int = -1;
+      for (const x of mk) {
+        if (x <= k && (fl < 0 || x > fl)) {
+          fl = x;
+        }
+        if (x >= k && (ce < 0 || x < ce)) {
+          ce = x;
+        }
+      }
+      assertEq(m.floorKey(k).unwrapOr(-1), fl, "floor");
+      assertEq(m.ceilKey(k).unwrapOr(-1), ce, "ceil");
+    }
+    assertEqUsize(m.size(), mk.length, "size");
+    step += 1;
+  }
+  assertEqString(joinInts(m.keyArray()), joinInts(sortedCopy(mk)), "keys sorted like the model");
+  const ks = m.keyArray();
+  let i: usize = 0;
+  while (i < ks.length) {
+    assertEq(m.get(ks[i]).unwrap(), mv[indexOfInt(mk, ks[i]).toUsize()], "final value");
+    i += 1;
+  }
+}
+
+// ---------------------------------------------------------------- SortedStringMap
+
+@Test
+function sortedStringMapOrder(): void {
+  let m = new SortedStringMap<int>();
+  m.put("b", 2);
+  m.put("", 0);
+  m.put("ab", 3);
+  m.put("a", 1);
+  m.put("B", 9);
+  m.put("a\xff", 7);
+  assertEqString(m.keyArray().join("|"), "|B|a|ab|a\xff|b", "byte order");
+  assertEq(m.get("ab").unwrap(), 3, "get ab");
+  assertEq(m.get("").unwrap(), 0, "empty key");
+  assertEqBool(m.get("c").isNone(), true, "absent");
+  assertEqBool(m.put("a", 11), false, "replace");
+  assertEq(m.get("a").unwrap(), 11, "replaced");
+  assertEqUsize(m.size(), 6, "size");
+}
+
+@Test
+function sortedStringMapRemoveAndNeighbours(): void {
+  let m = new SortedStringMap<string>();
+  assertEqBool(m.floorKey("x").isNone() && m.ceilKey("x").isNone(), true, "empty");
+  m.put("apple", "1");
+  m.put("cherry", "3");
+  m.put("banana", "2");
+  assertEqString(m.floorKey("b").unwrap(), "apple", "floor before banana");
+  assertEqString(m.floorKey("banana").unwrap(), "banana", "floor exact");
+  assertEqString(m.ceilKey("b").unwrap(), "banana", "ceil");
+  assertEqBool(m.ceilKey("d").isNone(), true, "ceil above all");
+  assertEqBool(m.floorKey("A").isNone(), true, "floor below all");
+  assertEqString(m.firstKey().unwrap(), "apple", "first");
+  assertEqString(m.lastKey().unwrap(), "cherry", "last");
+  assertEqString(m.remove("banana").unwrap(), "2", "remove");
+  assertEqBool(m.remove("banana").isNone(), true, "remove absent");
+  const f: SortedStringEntry<string> = m.popFirst().unwrap();
+  assertEqString(f.key, "apple", "popFirst");
+  assertEqString(m.popLast().unwrap().value, "3", "popLast");
+  assertEqBool(m.popFirst().isNone(), true, "drained");
+  m.put("z", "26");
+  m.clear();
+  assertEqBool(m.isEmpty(), true, "clear");
+}
+
+@Test
+function sortedStringMapAgainstModel(): void {
+  const words = ["", "a", "aa", "ab", "b", "ba", "B", "zz", "z", "m", "mm", "a\xff", "\xff"];
+  let m = new SortedStringMap<int>();
+  let present: bool[] = [];
+  let values: int[] = [];
+  for (const w of words) {
+    present.push(false);
+    values.push(0);
+  }
+  let seed: int = 5;
+  let step: int = 0;
+  while (step < 400) {
+    seed = nextRand(seed);
+    const wi = ((seed / 16) % words.length.toInt()).toUsize();
+    seed = nextRand(seed);
+    const op = (seed / 16) % 3;
+    if (op < 2) {
+      assertEqBool(m.put(words[wi], step), !present[wi], "put result");
+      present[wi] = true;
+      values[wi] = step;
+    } else {
+      const r = m.remove(words[wi]);
+      assertEqBool(r.isSome(), present[wi], "remove result");
+      present[wi] = false;
+    }
+    step += 1;
+  }
+  assert(isStrictlyIncreasingStrings(m.keyArray()), "keys increasing");
+  let n: usize = 0;
+  let wi: usize = 0;
+  while (wi < words.length) {
+    assertEqBool(m.has(words[wi]), present[wi], "has " + words[wi]);
+    if (present[wi]) {
+      assertEq(m.get(words[wi]).unwrap(), values[wi], "value of " + words[wi]);
+      n += 1;
+    }
+    wi += 1;
+  }
+  assertEqUsize(m.size(), n, "size");
+}
+
+// ---------------------------------------------------------------- PriorityQueue
+
+@Test
+function priorityQueuePopsInOrder(): void {
+  let q = new PriorityQueue<string>();
+  assertEqBool(q.isEmpty(), true, "empty");
+  assertEqBool(q.pop().isNone(), true, "pop on empty");
+  assertEqBool(q.peek().isNone() && q.minPriority().isNone(), true, "peek on empty");
+  q.push(5, "five");
+  q.push(1, "one");
+  q.push(3, "three");
+  q.push(4, "four");
+  q.push(2, "two");
+  assertEqUsize(q.size(), 5, "size");
+  assertEq(q.minPriority().unwrap(), 1, "min");
+  assertEqString(q.peek().unwrap().value, "one", "peek");
+  assertEqUsize(q.size(), 5, "peek keeps size");
+  const e: PQEntry<string> = q.pop().unwrap();
+  assertEq(e.priority, 1, "first priority");
+  assertEqString(e.value, "one", "first value");
+  assertEqString(q.pop().unwrap().value, "two", "second");
+  assertEqString(q.pop().unwrap().value, "three", "third");
+  assertEqString(q.pop().unwrap().value, "four", "fourth");
+  assertEqString(q.pop().unwrap().value, "five", "fifth");
+  assertEqBool(q.pop().isNone(), true, "drained");
+}
+
+@Test
+function priorityQueueTiesAreFifo(): void {
+  let q = new PriorityQueue<int>();
+  let i: int = 0;
+  while (i < 20) {
+    q.push(i % 2, i);
+    i += 1;
+  }
+  let out: int[] = [];
+  while (!q.isEmpty()) {
+    out.push(q.pop().unwrap().value);
+  }
+  assertEqString(joinInts(out), "0,2,4,6,8,10,12,14,16,18,1,3,5,7,9,11,13,15,17,19", "stable among equal priorities");
+}
+
+@Test
+function priorityQueueExtremesAndClear(): void {
+  let q = new PriorityQueue<int>();
+  q.push(9223372036854775807, 1);
+  q.push(-9223372036854775807, 2);
+  q.push(0, 3);
+  assertEq(q.pop().unwrap().value, 2, "most negative first");
+  assertEq(q.pop().unwrap().value, 3, "zero");
+  assertEq(q.pop().unwrap().value, 1, "largest last");
+  q.push(1, 1);
+  q.clear();
+  assertEqBool(q.isEmpty(), true, "clear");
+  q.push(2, 2);
+  assertEq(q.pop().unwrap().value, 2, "usable after clear");
+  assertEqBool(q.allAtLeast(100), true, "allAtLeast on empty");
+  q.push(4, 0);
+  assertEqBool(q.allAtLeast(4) && !q.allAtLeast(5), true, "allAtLeast");
+}
+
+@Test
+function priorityQueueSortsLikeASort(): void {
+  let q = new PriorityQueue<int>();
+  let xs: int[] = [];
+  let seed: int = 99;
+  let i: int = 0;
+  while (i < 150) {
+    seed = nextRand(seed);
+    const p = (seed / 16) % 50;
+    xs.push(p);
+    q.push(p, p);
+    i += 1;
+  }
+  let out: int[] = [];
+  while (!q.isEmpty()) {
+    out.push(q.pop().unwrap().priority);
+  }
+  assertEqString(joinInts(out), joinInts(sortedCopy(xs)), "heap sort equals insertion sort");
+}
+
+@Test
+function priorityQueueInterleavedAgainstModel(): void {
+  let q = new PriorityQueue<int>();
+  let model: int[] = [];
+  let seed: int = 21;
+  let step: int = 0;
+  while (step < 500) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 3;
+    seed = nextRand(seed);
+    const p = (seed / 16) % 30;
+    if (op < 2) {
+      q.push(p, step);
+      model.push(p);
+    } else {
+      const r = q.pop();
+      if (model.length == 0) {
+        assertEqBool(r.isNone(), true, "pop empty");
+      } else {
+        let lo = model[0];
+        for (const x of model) {
+          if (x < lo) {
+            lo = x;
+          }
+        }
+        assertEq(r.unwrap().priority, lo, "popped the minimum");
+        let removed = false;
+        let rest: int[] = [];
+        for (const x of model) {
+          if (x == lo && !removed) {
+            removed = true;
+          } else {
+            rest.push(x);
+          }
+        }
+        model = rest;
+      }
+    }
+    assertEqUsize(q.size(), model.length, "size");
+    step += 1;
+  }
+}

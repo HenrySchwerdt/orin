@@ -1,0 +1,1135 @@
+// std:collections -- sets, a ring-buffer deque, sorted maps and a priority queue (ADR-0030 §3, layer
+// "collections"). Pure safe Orin on top of arrays and `Map`; no C, no new built-ins.
+//
+// What is generic and what is not (language limits, see docs/std.md "Limitations"):
+//   * `Map<K, V>` keys must be `int`, `usize`, `bool` or `string` *concretely* (E0400 for a type parameter), and
+//     there is no `==`, `<` or hash on a type parameter. So the sets and sorted maps are specialised by key:
+//     `IntSet` / `StringSet`, `SortedMap<V>` (int keys) / `SortedStringMap<V>` (string keys). The values and
+//     the elements of `Deque<T>` and `PriorityQueue<T>` are fully generic.
+//   * A contract cannot call a function value (E0416), so a comparator closure could not appear in the heap
+//     invariant. `PriorityQueue<T>` therefore orders by an explicit `int` priority given to `push`.
+//   * Because `==` does not exist on a type parameter, the contracts of the generic containers state sizes,
+//     membership, ordering of keys/priorities and presence, but not "the value that comes back is the one that
+//     was put in" (that needs equality on `V` / `T`). The tests check values with `int` instances and against a
+//     naive reference model.
+//
+// Contract standard (ADR-0030 §3): every class has `@Invariant`s that `--check-contracts` / `orin test` verify
+// after every public method, and every public method states `@Requires` / `@Ensures`. Helpers that contracts call
+// are loops (no closures, no recursion). All classes are values with copy-on-write storage like every class.
+//
+// Complexity summary (n = size):
+//   IntSet / StringSet        has, add, remove expected O(1); union/intersection/difference/isSubsetOf O(n + m)
+//   Deque<T>                  pushFront/pushBack/popFront/popBack/get/front/back amortised O(1); toArray O(n)
+//   SortedMap / SortedStringMap  has/get/floorKey/ceilKey/firstKey/lastKey O(log n) (binary search over a sorted
+//                             array; string keys cost O(key length) per comparison); put, remove O(n) in the worst
+//                             case (shifting), O(1) when the key is the new largest / the largest; popFirst O(n)
+//   PriorityQueue<T>          push, pop O(log n); peek, minPriority, size O(1)
+//
+// Why a sorted array and not a balanced tree: the invariant "keys strictly increasing and the same length as the
+// values" is a two-line loop, binary search is a dozen lines, and nothing about the representation is hidden from
+// the invariant. A tree would need rotation invariants (balance, parent order) that are much harder to state with
+// loop-only contract helpers; the O(n) insert is a memmove of 8-byte slots.
+
+// ---------------------------------------------------------------------------------------------- helpers
+
+// allTrue(xs): every element is true. Loop-based (contracts cannot use `every`).
+export function allTrue(xs: bool[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (!xs[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// isStrictlyIncreasing(xs): xs[0] < xs[1] < ... (so sorted and without duplicates).
+export function isStrictlyIncreasing(xs: int[]): bool {
+  let i: usize = 1;
+  while (i < xs.length) {
+    if (xs[i - 1] >= xs[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// compareStrings(a, b): -1, 0 or 1; byte-wise lexicographic order (shorter prefix first), the order of
+// `SortedStringMap`. O(min(a.length, b.length)).
+@Ensures(result >= -1 && result <= 1)
+@Ensures((result == 0) == (a.length == b.length && !differsAt(a, b)))
+export function compareStrings(a: string, b: string): int {
+  const n = a.length < b.length ? a.length : b.length;
+  let i: usize = 0;
+  while (i < n) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x < y) {
+      return -1;
+    }
+    if (x > y) {
+      return 1;
+    }
+    i += 1;
+  }
+  if (a.length < b.length) {
+    return -1;
+  }
+  if (a.length > b.length) {
+    return 1;
+  }
+  return 0;
+}
+
+// Does some byte inside the common length differ?
+function differsAt(a: string, b: string): bool {
+  const n = a.length < b.length ? a.length : b.length;
+  let i: usize = 0;
+  while (i < n) {
+    if (a.charCodeAt(i) != b.charCodeAt(i)) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+// isStrictlyIncreasingStrings(xs): compareStrings(xs[i-1], xs[i]) < 0 for all i.
+export function isStrictlyIncreasingStrings(xs: string[]): bool {
+  let i: usize = 1;
+  while (i < xs.length) {
+    if (compareStrings(xs[i - 1], xs[i]) >= 0) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------------------------------ IntSet
+
+// A set of ints on top of `Map<int, bool>`. Invariants: the map's size matches its key list and every stored flag
+// is true (a key is a member exactly when it is in the map).
+@Invariant(this.items.size == this.items.keys().length)
+@Invariant(allTrue(this.items.values()))
+export class IntSet {
+  private items: Map<int, bool> = new Map<int, bool>();
+
+  // size(): number of members. O(1).
+  @Ensures(result == this.items.keys().length)
+  size(): usize {
+    return this.items.size;
+  }
+
+  // isEmpty(): no members. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.items.size == 0;
+  }
+
+  // has(x): is x a member? Expected O(1).
+  @Ensures(result ==> this.size() > 0)
+  has(x: int): bool {
+    return this.items.has(x);
+  }
+
+  // add(x): insert x; true when it was not a member (the size grows by 1), false when it already was. Expected O(1).
+  @Ensures(this.has(x))
+  @Ensures(result == !old(this.has(x)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  add(x: int): bool {
+    if (this.items.has(x)) {
+      return false;
+    }
+    this.items.set(x, true);
+    return true;
+  }
+
+  // remove(x): delete x; true when it was a member (the size shrinks by 1). Expected O(1).
+  @Ensures(!this.has(x))
+  @Ensures(result == old(this.has(x)))
+  @Ensures(result ==> this.size() == old(this.size()) - 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  remove(x: int): bool {
+    if (!this.items.has(x)) {
+      return false;
+    }
+    this.items.delete(x);
+    return true;
+  }
+
+  // clear(): remove all members. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.items = new Map<int, bool>();
+  }
+
+  // toArray(): the members in insertion order (not sorted). O(n).
+  @Ensures(result.length == this.size())
+  toArray(): int[] {
+    return this.items.keys();
+  }
+
+  // isSubsetOf(other): every member of this is a member of other. O(n).
+  @Ensures(result ==> this.size() <= other.size())
+  @Ensures(this.size() == 0 ==> result)
+  isSubsetOf(other: IntSet): bool {
+    if (this.items.size > other.size()) {
+      return false;
+    }
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (!other.has(xs[i])) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // union(other): the members of either. O(n + m).
+  @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
+  @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
+  union(other: IntSet): IntSet {
+    let out = new IntSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      out.add(xs[i]);
+      i += 1;
+    }
+    const ys = other.toArray();
+    let j: usize = 0;
+    while (j < ys.length) {
+      out.add(ys[j]);
+      j += 1;
+    }
+    return out;
+  }
+
+  // intersection(other): the members of both. O(n).
+  @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
+  @Ensures(result.size() <= this.size() && result.size() <= other.size())
+  intersection(other: IntSet): IntSet {
+    let out = new IntSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (other.has(xs[i])) {
+        out.add(xs[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+
+  // difference(other): the members of this that are not in other. O(n).
+  @Ensures(result.isSubsetOf(this))
+  @Ensures(result.intersection(other).isEmpty())
+  @Ensures(result.size() + this.intersection(other).size() == this.size())
+  difference(other: IntSet): IntSet {
+    let out = new IntSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (!other.has(xs[i])) {
+        out.add(xs[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+}
+
+// --------------------------------------------------------------------------------------- StringSet
+
+// A set of strings on top of `Map<string, bool>`; same invariants as `IntSet`.
+@Invariant(this.items.size == this.items.keys().length)
+@Invariant(allTrue(this.items.values()))
+export class StringSet {
+  private items: Map<string, bool> = new Map<string, bool>();
+
+  // size(): number of members. O(1).
+  @Ensures(result == this.items.keys().length)
+  size(): usize {
+    return this.items.size;
+  }
+
+  // isEmpty(): no members. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.items.size == 0;
+  }
+
+  // has(x): is x a member? Expected O(1 + |x|).
+  @Ensures(result ==> this.size() > 0)
+  has(x: string): bool {
+    return this.items.has(x);
+  }
+
+  // add(x): insert x; true when it was not a member (the size grows by 1). Expected O(1 + |x|).
+  @Ensures(this.has(x))
+  @Ensures(result == !old(this.has(x)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  add(x: string): bool {
+    if (this.items.has(x)) {
+      return false;
+    }
+    this.items.set(x, true);
+    return true;
+  }
+
+  // remove(x): delete x; true when it was a member (the size shrinks by 1). Expected O(1 + |x|).
+  @Ensures(!this.has(x))
+  @Ensures(result == old(this.has(x)))
+  @Ensures(result ==> this.size() == old(this.size()) - 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  remove(x: string): bool {
+    if (!this.items.has(x)) {
+      return false;
+    }
+    this.items.delete(x);
+    return true;
+  }
+
+  // clear(): remove all members. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.items = new Map<string, bool>();
+  }
+
+  // toArray(): the members in insertion order (not sorted). O(n).
+  @Ensures(result.length == this.size())
+  toArray(): string[] {
+    return this.items.keys();
+  }
+
+  // isSubsetOf(other): every member of this is a member of other. O(n).
+  @Ensures(result ==> this.size() <= other.size())
+  @Ensures(this.size() == 0 ==> result)
+  isSubsetOf(other: StringSet): bool {
+    if (this.items.size > other.size()) {
+      return false;
+    }
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (!other.has(xs[i])) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // union(other): the members of either. O(n + m).
+  @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
+  @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
+  union(other: StringSet): StringSet {
+    let out = new StringSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      out.add(xs[i]);
+      i += 1;
+    }
+    const ys = other.toArray();
+    let j: usize = 0;
+    while (j < ys.length) {
+      out.add(ys[j]);
+      j += 1;
+    }
+    return out;
+  }
+
+  // intersection(other): the members of both. O(n).
+  @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
+  @Ensures(result.size() <= this.size() && result.size() <= other.size())
+  intersection(other: StringSet): StringSet {
+    let out = new StringSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (other.has(xs[i])) {
+        out.add(xs[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+
+  // difference(other): the members of this that are not in other. O(n).
+  @Ensures(result.isSubsetOf(this))
+  @Ensures(result.intersection(other).isEmpty())
+  @Ensures(result.size() + this.intersection(other).size() == this.size())
+  difference(other: StringSet): StringSet {
+    let out = new StringSet();
+    const xs = this.items.keys();
+    let i: usize = 0;
+    while (i < xs.length) {
+      if (!other.has(xs[i])) {
+        out.add(xs[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+}
+
+// --------------------------------------------------------------------------------------------- Deque
+
+// Is the ring `buf` consistent with (head, len)? Exactly the `len` slots head, head+1, ... (mod capacity) hold
+// `Some`, every other slot is `None`. Loop-based. O(capacity).
+export function ringConsistent<T>(buf: Option<T>[], head: usize, len: usize): bool {
+  const cap = buf.length;
+  if (cap == 0) {
+    return len == 0 && head == 0;
+  }
+  if (head >= cap || len > cap) {
+    return false;
+  }
+  let somes: usize = 0;
+  let i: usize = 0;
+  while (i < cap) {
+    if (buf[i].isSome()) {
+      somes += 1;
+    }
+    i += 1;
+  }
+  if (somes != len) {
+    return false;
+  }
+  let k: usize = 0;
+  while (k < len) {
+    if (buf[(head + k) % cap].isNone()) {
+      return false;
+    }
+    k += 1;
+  }
+  return true;
+}
+
+// A double-ended queue on a ring buffer. Slots hold `Option<T>` (the language has no uninitialised element);
+// `head` is the index of the front element, `len` the number of elements, and the invariants say that the
+// indices are in range and that exactly the `len` slots from `head` on are occupied.
+@Invariant(this.len <= this.buf.length)
+@Invariant(this.buf.length == 0 ? this.head == 0 : this.head < this.buf.length)
+@Invariant(ringConsistent(this.buf, this.head, this.len))
+export class Deque<T> {
+  private buf: Option<T>[] = [];
+  private head: usize = 0;
+  private len: usize = 0;
+
+  // size(): number of elements. O(1).
+  @Ensures(result == this.len)
+  size(): usize {
+    return this.len;
+  }
+
+  // isEmpty(): no elements. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.len == 0;
+  }
+
+  // capacity(): number of slots of the ring (0 until the first push; then 4, 8, 16, ...). O(1).
+  @Ensures(result == this.buf.length)
+  capacity(): usize {
+    return this.buf.length;
+  }
+
+  // Doubles the ring (4 slots at first) when it is full, unrolling it so that head becomes 0. O(n).
+  private grow(): void {
+    const cap = this.buf.length;
+    if (this.len < cap) {
+      return;
+    }
+    const ncap: usize = cap == 0 ? 4 : cap * 2;
+    const none: Option<T> = None;
+    let nb: Option<T>[] = [];
+    let i: usize = 0;
+    while (i < this.len) {
+      nb.push(this.buf[(this.head + i) % cap]);
+      i += 1;
+    }
+    while (nb.length < ncap) {
+      nb.push(none);
+    }
+    this.buf = nb;
+    this.head = 0;
+  }
+
+  // pushBack(x): append x. Amortised O(1).
+  @Ensures(this.size() == old(this.size()) + 1)
+  @Ensures(this.back().isSome() && this.get(this.size() - 1).isSome())
+  @Ensures(old(this.isEmpty()) ==> this.front().isSome())
+  @Ensures(this.capacity() >= old(this.capacity()))
+  pushBack(x: T): void {
+    this.grow();
+    this.buf[(this.head + this.len) % this.buf.length] = Some(x);
+    this.len += 1;
+  }
+
+  // pushFront(x): prepend x. Amortised O(1).
+  @Ensures(this.size() == old(this.size()) + 1)
+  @Ensures(this.front().isSome() && this.get(0).isSome())
+  @Ensures(old(this.isEmpty()) ==> this.back().isSome())
+  @Ensures(this.capacity() >= old(this.capacity()))
+  pushFront(x: T): void {
+    this.grow();
+    const cap = this.buf.length;
+    this.head = (this.head + cap - 1) % cap;
+    this.buf[this.head] = Some(x);
+    this.len += 1;
+  }
+
+  // popFront(): remove and return the first element, None when empty. O(1).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == 0)
+  popFront(): Option<T> {
+    if (this.len == 0) {
+      return None;
+    }
+    const v = this.buf[this.head];
+    const none: Option<T> = None;
+    this.buf[this.head] = none;
+    this.head = (this.head + 1) % this.buf.length;
+    this.len -= 1;
+    return v;
+  }
+
+  // popBack(): remove and return the last element, None when empty. O(1).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == 0)
+  popBack(): Option<T> {
+    if (this.len == 0) {
+      return None;
+    }
+    const at = (this.head + this.len - 1) % this.buf.length;
+    const v = this.buf[at];
+    const none: Option<T> = None;
+    this.buf[at] = none;
+    this.len -= 1;
+    return v;
+  }
+
+  // front(): the first element without removing it, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  front(): Option<T> {
+    if (this.len == 0) {
+      return None;
+    }
+    return this.buf[this.head];
+  }
+
+  // back(): the last element without removing it, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  back(): Option<T> {
+    if (this.len == 0) {
+      return None;
+    }
+    return this.buf[(this.head + this.len - 1) % this.buf.length];
+  }
+
+  // get(i): the i-th element from the front, None when i >= size(). O(1).
+  @Ensures(result.isSome() == (i < this.size()))
+  get(i: usize): Option<T> {
+    if (i >= this.len) {
+      return None;
+    }
+    return this.buf[(this.head + i) % this.buf.length];
+  }
+
+  // clear(): remove all elements. O(1).
+  @Ensures(this.size() == 0 && this.capacity() == 0)
+  clear(): void {
+    this.buf = [];
+    this.head = 0;
+    this.len = 0;
+  }
+
+  // toArray(): the elements front to back. O(n).
+  @Ensures(result.length == this.size())
+  toArray(): T[] {
+    let out: T[] = [];
+    let i: usize = 0;
+    while (i < this.len) {
+      out.push(this.buf[(this.head + i) % this.buf.length].unwrap());
+      i += 1;
+    }
+    return out;
+  }
+}
+
+// ------------------------------------------------------------------------------------------ SortedMap
+
+// A map from int keys to values of type V, ordered by key: parallel arrays `keys` / `vals` with the keys strictly
+// increasing (so sorted and without duplicates). Lookups are binary searches.
+@Invariant(this.keys.length == this.vals.length)
+@Invariant(isStrictlyIncreasing(this.keys))
+export class SortedMap<V> {
+  private keys: int[] = [];
+  private vals: V[] = [];
+
+  // size(): number of entries. O(1).
+  @Ensures(result == this.keys.length && result == this.vals.length)
+  size(): usize {
+    return this.keys.length;
+  }
+
+  // isEmpty(): no entries. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.keys.length == 0;
+  }
+
+  // The first index whose key is >= k (keys.length when there is none). O(log n).
+  @Ensures(result <= this.keys.length)
+  @Ensures(result < this.keys.length ==> this.keys[result] >= k)
+  @Ensures(result > 0 ==> this.keys[result - 1] < k)
+  private lowerBound(k: int): usize {
+    let lo: usize = 0;
+    let hi: usize = this.keys.length;
+    while (lo < hi) {
+      const mid = lo + (hi - lo) / 2;
+      if (this.keys[mid] < k) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  // has(k): is there an entry for k? O(log n).
+  @Ensures(result ==> this.size() > 0)
+  has(k: int): bool {
+    const i = this.lowerBound(k);
+    return i < this.keys.length && this.keys[i] == k;
+  }
+
+  // get(k): the value for k, None when absent. O(log n).
+  @Ensures(result.isSome() == this.has(k))
+  get(k: int): Option<V> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && this.keys[i] == k) {
+      return Some(this.vals[i]);
+    }
+    return None;
+  }
+
+  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
+  // replaced (size unchanged). O(log n) to find, O(n) to shift on insert.
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  put(k: int, v: V): bool {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && this.keys[i] == k) {
+      this.vals[i] = v;
+      return false;
+    }
+    this.keys.push(k);
+    this.vals.push(v);
+    let j = this.keys.length - 1;
+    while (j > i) {
+      this.keys[j] = this.keys[j - 1];
+      this.vals[j] = this.vals[j - 1];
+      j -= 1;
+    }
+    this.keys[i] = k;
+    this.vals[i] = v;
+    return true;
+  }
+
+  // remove(k): delete the entry for k and return its value, None when absent. O(log n) to find, O(n) to shift.
+  @Ensures(!this.has(k))
+  @Ensures(result.isSome() == old(this.has(k)))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == old(this.size()))
+  remove(k: int): Option<V> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length || this.keys[i] != k) {
+      return None;
+    }
+    const v = this.vals[i];
+    let j = i;
+    while (j + 1 < this.keys.length) {
+      this.keys[j] = this.keys[j + 1];
+      this.vals[j] = this.vals[j + 1];
+      j += 1;
+    }
+    this.keys.pop();
+    this.vals.pop();
+    return Some(v);
+  }
+
+  // firstKey(): the smallest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  firstKey(): Option<int> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[0]);
+  }
+
+  // lastKey(): the largest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  lastKey(): Option<int> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[this.keys.length - 1]);
+  }
+
+  // floorKey(k): the greatest key <= k, None when there is none. O(log n).
+  @Ensures(result.isSome() ==> result.unwrap() <= k && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || this.firstKey().unwrap() > k)
+  floorKey(k: int): Option<int> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && this.keys[i] == k) {
+      return Some(k);
+    }
+    if (i == 0) {
+      return None;
+    }
+    return Some(this.keys[i - 1]);
+  }
+
+  // ceilKey(k): the smallest key >= k, None when there is none. O(log n).
+  @Ensures(result.isSome() ==> result.unwrap() >= k && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || this.lastKey().unwrap() < k)
+  ceilKey(k: int): Option<int> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length) {
+      return None;
+    }
+    return Some(this.keys[i]);
+  }
+
+  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> result.unwrap().key == old(this.firstKey().unwrapOr(0)))
+  @Ensures(result.isSome() && this.size() > 0 ==> this.firstKey().unwrap() > result.unwrap().key)
+  popFirst(): Option<SortedEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[0];
+    const v = this.remove(k).unwrap();
+    return Some(SortedEntry<V> { key: k, value: v });
+  }
+
+  // popLast(): remove the entry with the largest key and return it, None when empty. O(1).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> result.unwrap().key == old(this.lastKey().unwrapOr(0)))
+  @Ensures(result.isSome() && this.size() > 0 ==> this.lastKey().unwrap() < result.unwrap().key)
+  popLast(): Option<SortedEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[this.keys.length - 1];
+    const v = this.vals[this.vals.length - 1];
+    this.keys.pop();
+    this.vals.pop();
+    return Some(SortedEntry<V> { key: k, value: v });
+  }
+
+  // keyArray(): all keys in increasing order. O(n).
+  @Ensures(result.length == this.size() && isStrictlyIncreasing(result))
+  keyArray(): int[] {
+    return this.keys;
+  }
+
+  // valueArray(): all values in key order. O(n).
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return this.vals;
+  }
+
+  // clear(): remove all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.keys = [];
+    this.vals = [];
+  }
+}
+
+// An entry returned by `popFirst` / `popLast`.
+export type SortedEntry<V> = { key: int; value: V; };
+
+// ----------------------------------------------------------------------------------- SortedStringMap
+
+// Like `SortedMap` with string keys ordered by `compareStrings`.
+@Invariant(this.keys.length == this.vals.length)
+@Invariant(isStrictlyIncreasingStrings(this.keys))
+export class SortedStringMap<V> {
+  private keys: string[] = [];
+  private vals: V[] = [];
+
+  // size(): number of entries. O(1).
+  @Ensures(result == this.keys.length && result == this.vals.length)
+  size(): usize {
+    return this.keys.length;
+  }
+
+  // isEmpty(): no entries. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.keys.length == 0;
+  }
+
+  // The first index whose key is >= k (keys.length when there is none). O(log n * key length).
+  @Ensures(result <= this.keys.length)
+  @Ensures(result < this.keys.length ==> compareStrings(this.keys[result], k) >= 0)
+  @Ensures(result > 0 ==> compareStrings(this.keys[result - 1], k) < 0)
+  private lowerBound(k: string): usize {
+    let lo: usize = 0;
+    let hi: usize = this.keys.length;
+    while (lo < hi) {
+      const mid = lo + (hi - lo) / 2;
+      if (compareStrings(this.keys[mid], k) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  // has(k): is there an entry for k? O(log n * key length).
+  @Ensures(result ==> this.size() > 0)
+  has(k: string): bool {
+    const i = this.lowerBound(k);
+    return i < this.keys.length && compareStrings(this.keys[i], k) == 0;
+  }
+
+  // get(k): the value for k, None when absent. O(log n * key length).
+  @Ensures(result.isSome() == this.has(k))
+  get(k: string): Option<V> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && compareStrings(this.keys[i], k) == 0) {
+      return Some(this.vals[i]);
+    }
+    return None;
+  }
+
+  // put(k, v): set the value for k; true when k was new (the size grows by 1). O(log n) to find, O(n) to shift.
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  put(k: string, v: V): bool {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && compareStrings(this.keys[i], k) == 0) {
+      this.vals[i] = v;
+      return false;
+    }
+    this.keys.push(k);
+    this.vals.push(v);
+    let j = this.keys.length - 1;
+    while (j > i) {
+      this.keys[j] = this.keys[j - 1];
+      this.vals[j] = this.vals[j - 1];
+      j -= 1;
+    }
+    this.keys[i] = k;
+    this.vals[i] = v;
+    return true;
+  }
+
+  // remove(k): delete the entry for k and return its value, None when absent. O(log n) to find, O(n) to shift.
+  @Ensures(!this.has(k))
+  @Ensures(result.isSome() == old(this.has(k)))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == old(this.size()))
+  remove(k: string): Option<V> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length || compareStrings(this.keys[i], k) != 0) {
+      return None;
+    }
+    const v = this.vals[i];
+    let j = i;
+    while (j + 1 < this.keys.length) {
+      this.keys[j] = this.keys[j + 1];
+      this.vals[j] = this.vals[j + 1];
+      j += 1;
+    }
+    this.keys.pop();
+    this.vals.pop();
+    return Some(v);
+  }
+
+  // firstKey(): the smallest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  firstKey(): Option<string> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[0]);
+  }
+
+  // lastKey(): the largest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  lastKey(): Option<string> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[this.keys.length - 1]);
+  }
+
+  // floorKey(k): the greatest key <= k, None when there is none. O(log n * key length).
+  @Ensures(result.isSome() ==> compareStrings(result.unwrap(), k) <= 0 && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || compareStrings(this.firstKey().unwrap(), k) > 0)
+  floorKey(k: string): Option<string> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && compareStrings(this.keys[i], k) == 0) {
+      return Some(this.keys[i]);
+    }
+    if (i == 0) {
+      return None;
+    }
+    return Some(this.keys[i - 1]);
+  }
+
+  // ceilKey(k): the smallest key >= k, None when there is none. O(log n * key length).
+  @Ensures(result.isSome() ==> compareStrings(result.unwrap(), k) >= 0 && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || compareStrings(this.lastKey().unwrap(), k) < 0)
+  ceilKey(k: string): Option<string> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length) {
+      return None;
+    }
+    return Some(this.keys[i]);
+  }
+
+  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() && this.size() > 0 ==> compareStrings(this.firstKey().unwrap(), result.unwrap().key) > 0)
+  popFirst(): Option<SortedStringEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[0];
+    const v = this.remove(k).unwrap();
+    return Some(SortedStringEntry<V> { key: k, value: v });
+  }
+
+  // popLast(): remove the entry with the largest key and return it, None when empty. O(1).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() && this.size() > 0 ==> compareStrings(this.lastKey().unwrap(), result.unwrap().key) < 0)
+  popLast(): Option<SortedStringEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[this.keys.length - 1];
+    const v = this.vals[this.vals.length - 1];
+    this.keys.pop();
+    this.vals.pop();
+    return Some(SortedStringEntry<V> { key: k, value: v });
+  }
+
+  // keyArray(): all keys in increasing order. O(n).
+  @Ensures(result.length == this.size() && isStrictlyIncreasingStrings(result))
+  keyArray(): string[] {
+    return this.keys;
+  }
+
+  // valueArray(): all values in key order. O(n).
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return this.vals;
+  }
+
+  // clear(): remove all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.keys = [];
+    this.vals = [];
+  }
+}
+
+// An entry returned by `SortedStringMap.popFirst` / `popLast`.
+export type SortedStringEntry<V> = { key: string; value: V; };
+
+// ------------------------------------------------------------------------------------- PriorityQueue
+
+// One heap slot: `seq` is the insertion number, so (priority, seq) is a strict total order and equal priorities
+// leave the queue first-in first-out.
+type HeapNode<T> = { priority: int; seq: int; value: T; };
+
+// What `pop` and `peek` return.
+export type PQEntry<T> = { priority: int; value: T; };
+
+// Does node a leave before node b? Lower priority first; equal priorities by insertion order.
+function leavesBefore<T>(a: HeapNode<T>, b: HeapNode<T>): bool {
+  return a.priority < b.priority || (a.priority == b.priority && a.seq < b.seq);
+}
+
+// isMinHeap(h): every node leaves strictly before its two children (children of i are 2i+1 and 2i+2). Loop-based.
+export function isMinHeap<T>(h: HeapNode<T>[]): bool {
+  let i: usize = 1;
+  while (i < h.length) {
+    if (!leavesBefore(h[(i - 1) / 2], h[i])) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Are all insertion numbers in 0..bound-1?
+export function seqsBelow<T>(h: HeapNode<T>[], bound: int): bool {
+  let i: usize = 0;
+  while (i < h.length) {
+    if (h[i].seq < 0 || h[i].seq >= bound) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function minInt(a: int, b: int): int {
+  return a < b ? a : b;
+}
+
+// A min-priority queue on a binary heap stored in an array. `push(priority, value)` adds a value; `pop` returns
+// the entry with the smallest priority, and among equal priorities the one pushed first. Invariants: the array is
+// a heap (a node leaves before its children) and every insertion number is below the counter `nextSeq`, which
+// never decreases, so insertion numbers are unique.
+@Invariant(isMinHeap(this.heap))
+@Invariant(seqsBelow(this.heap, this.nextSeq))
+@Invariant(this.nextSeq >= 0)
+export class PriorityQueue<T> {
+  private heap: HeapNode<T>[] = [];
+  private nextSeq: int = 0;
+
+  // size(): number of queued entries. O(1).
+  @Ensures(result == this.heap.length)
+  size(): usize {
+    return this.heap.length;
+  }
+
+  // isEmpty(): nothing queued. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.heap.length == 0;
+  }
+
+  // minPriority(): the smallest priority queued, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  minPriority(): Option<int> {
+    if (this.heap.length == 0) {
+      return None;
+    }
+    return Some(this.heap[0].priority);
+  }
+
+  // allAtLeast(p): every queued priority is >= p. O(n).
+  @Ensures(this.size() == 0 ==> result)
+  @Ensures(result && this.size() > 0 ==> this.minPriority().unwrap() >= p)
+  allAtLeast(p: int): bool {
+    let i: usize = 0;
+    while (i < this.heap.length) {
+      if (this.heap[i].priority < p) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // peek(): the entry `pop` would return, without removing it; None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> result.unwrap().priority == this.minPriority().unwrap())
+  peek(): Option<PQEntry<T>> {
+    if (this.heap.length == 0) {
+      return None;
+    }
+    return Some(PQEntry<T> { priority: this.heap[0].priority, value: this.heap[0].value });
+  }
+
+  private swap(i: usize, j: usize): void {
+    const t = this.heap[i];
+    this.heap[i] = this.heap[j];
+    this.heap[j] = t;
+  }
+
+  // push(priority, value): queue a value. O(log n).
+  @Ensures(this.size() == old(this.size()) + 1)
+  @Ensures(this.minPriority().unwrap() == minInt(priority, old(this.minPriority().unwrapOr(priority))))
+  @Ensures(this.allAtLeast(minInt(priority, old(this.minPriority().unwrapOr(priority)))))
+  push(priority: int, value: T): void {
+    this.heap.push(HeapNode<T> { priority: priority, seq: this.nextSeq, value: value });
+    this.nextSeq += 1;
+    let i = this.heap.length - 1;
+    while (i > 0) {
+      const p = (i - 1) / 2;
+      if (!leavesBefore(this.heap[i], this.heap[p])) {
+        return;
+      }
+      this.swap(i, p);
+      i = p;
+    }
+  }
+
+  // pop(): remove and return the entry with the smallest priority (the earliest pushed among equals); None when
+  // empty. The returned priority is <= every priority still queued. O(log n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isSome() ==> result.unwrap().priority == old(this.minPriority().unwrapOr(0)))
+  @Ensures(result.isSome() ==> this.allAtLeast(result.unwrap().priority))
+  @Ensures(result.isNone() ==> this.size() == 0)
+  pop(): Option<PQEntry<T>> {
+    if (this.heap.length == 0) {
+      return None;
+    }
+    const top = this.heap[0];
+    const last = this.heap.pop().unwrap();
+    const n = this.heap.length;
+    if (n > 0) {
+      this.heap[0] = last;
+      let i: usize = 0;
+      while (true) {
+        const l = 2 * i + 1;
+        const r = l + 1;
+        let m = i;
+        if (l < n && leavesBefore(this.heap[l], this.heap[m])) {
+          m = l;
+        }
+        if (r < n && leavesBefore(this.heap[r], this.heap[m])) {
+          m = r;
+        }
+        if (m == i) {
+          break;
+        }
+        this.swap(i, m);
+        i = m;
+      }
+    }
+    return Some(PQEntry<T> { priority: top.priority, value: top.value });
+  }
+
+  // clear(): drop all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.heap = [];
+  }
+}
