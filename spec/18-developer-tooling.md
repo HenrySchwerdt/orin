@@ -79,7 +79,7 @@ the LSP refine it later.
 ## 4. Orin-specific extension points (P4, design only)
 
 The analysis API reserves typed result slots (not yet populated) for:
-verification status per function/contract (VERIFIED/FAILED/UNKNOWN, spec 15), memory insights
+verification status per function/contract (VERIFIED/REFUTED/UNKNOWN/ASSUMED, spec 15, ADR-0020 D1), memory insights
 per function (allocation sites, RC ops, COW copies, verifier result — from MIR, spec 06/07),
 module-boundary violations with the violated rule (spec 04), business contract navigation
 (rule ID ↔ code ↔ tests, spec 14/15), semantic change summaries (spec 16) and review evidence

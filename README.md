@@ -172,7 +172,7 @@ the Rust unit tests); both roots produce a byte-identical compiler. See
 - Architecture and safety status: [`docs/architecture.md`](docs/architecture.md)
 - Design decisions (ADRs): [`docs/decisions/`](docs/decisions)
 - Formal model: [`docs/formal.md`](docs/formal.md) · Memory IR: [`docs/mir.md`](docs/mir.md)
-- Progress and roadmap: [`docs/progress.md`](docs/progress.md)
+- Progress: [`docs/progress.md`](docs/progress.md) · roadmap: [`docs/roadmap.md`](docs/roadmap.md) · vision: [`docs/ORIN_VISION_ARCHITECTURE_ROADMAP.md`](docs/ORIN_VISION_ARCHITECTURE_ROADMAP.md) · trusted base: [`docs/tcb.md`](docs/tcb.md)
 
 ## License
 

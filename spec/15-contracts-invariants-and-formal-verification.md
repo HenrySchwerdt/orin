@@ -38,7 +38,7 @@ OIM -> MIR -> native code          pure expressions + state/VCs
       |                               |
 Executable                       SMT / proof backend
       |                               |
-Tests / property tests       VERIFIED / FAILED / UNKNOWN
+Tests / property tests       VERIFIED / REFUTED / UNKNOWN
       +----------------+--------------+
                        |
           Review evidence & MCP summary
@@ -216,7 +216,7 @@ function discount(cents: int, premium: bool): int { ... }
   (`[verification] required = ["payments"]`). A required-but-failed or `UNKNOWN` proof fails
   that build. Runtime checking of contracts MAY be enabled per build (`--check-contracts`),
   turning violations into defined traps.
-- Results are reported per contract as VERIFIED / FAILED (with counterexample) / UNKNOWN (§5),
+- Results are reported per contract as VERIFIED / REFUTED (with counterexample) / UNKNOWN / ASSUMED (§5; full vocabulary in ADR-0020 D1),
   exposed via `orin verify --format=json`, MCP `inspect`, and LSP (spec 18 §4).
 
 ### 4.3 Loop invariants and termination
@@ -299,6 +299,9 @@ Per *property*, report exactly one of:
 - `VERIFIED`: all obligations proved under a recorded model and trusted assumptions.
 - `REFUTED`: the verifier found a genuine counterexample in the supported model (validated where feasible).
 - `UNKNOWN`: timeout, unsupported language fragment, insufficient invariants, unresolved proof.
+- `ASSUMED`: stated but deliberately not proved (`@Assume`, contracts of external systems); always listed with the result that depends on it.
+- `NEEDS_DECISION`: a required specification answer (requirement schema) is missing; a person must decide.
+- `NOT_APPLICABLE`: the property does not apply in this context, with a recorded reason.
 - `STALE`: inputs changed after evidence was created.
 - `NOT_RUN`: verification not requested.
 
