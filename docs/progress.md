@@ -2,31 +2,35 @@
 
 _Updated: 2026-10-13_
 
-## Current stage: self-hosting alpha (M3 reached)
-- The compiler in `compiler/` (~6,000 lines of Orin-B) is compiled by Stage 0 (`orin1`), compiles
-  itself (`orin2`), and `orin2` compiles it again: `stage2.c` and `stage3.c` are byte-identical
-  (`tools/bootstrap.sh`, run in CI).
-- `orin2` passes the full conformance suite (76 run + 61 error tests), also with ASan/UBSan.
-- `orin2` built with ASan/UBSan compiles itself without memory errors.
-- Self-compile time: ~0.1 s (plus the C compiler).
-- Stage 0 and Stage 1 parsers agree on 753 files (`tools/diff_parsers.py`, in CI).
+## Current stage: self-hosting alpha
+- Self-hosted compiler (`compiler/`, Orin-B) bootstraps: Stage 0 → orin1 → orin2 → stage3,
+  `stage2.c == stage3.c`; in CI (`tools/bootstrap.sh`).
+- Default pipeline: parse → load → check → **HIR → MIR → ownership verifier → C**. The verifier
+  gates every compile (ICE exit 70 on failure); the legacy HIR → C path remains for
+  differential testing (`--legacy-codegen`, `tools/diff_backends.py`).
+- Test status (all in CI, also under ASan/UBSan): 138 default conformance tests (Stage 0 and
+  orin2), 60 `tests/next` tests (orin2), 753+ parser differential files, 875 formatter checks,
+  67 verifier unit cases, JSON/analysis/LSP unit tests, VS Code grammar tests, Lean proofs.
 
-This is "self-hosting alpha" in the sense of spec.md "Definition of maturity": **not** formally
-verified; memory safety is supported by tests and sanitizers only.
-
-## Capability matrix
-| Component | Stage 0 (Rust, frozen) | Self-hosted (Orin) |
-|---|---|---|
-| Lexer/parser | done | done; differential-tested vs Stage 0 |
-| Loader/modules (E0301–E0303) | done | done |
-| Checker → HIR | done | done (same diagnostics on the error suite) |
-| C codegen + runtime | done | done (ASan-clean) |
-| Driver `check`/`compile` | done | done |
+## Capability matrix (self-hosted compiler)
+| Area | Status |
+|---|---|
+| Orin-B core (functions, records, unions, match, Option/Result/`?`, arrays, strings, modules) | done |
+| Generics (functions, records, unions, aliases; monomorphised, ADR-0007) | done |
+| Classes (ADR-0009) | in progress |
+| MIR + independent ownership verifier (docs/mir.md) | done; verifier gates compile |
+| Owned params / last-use moves / RC cancellation (ADR-0010) | in progress |
+| Formal model (Lean): RC machine safety + COW lemma | done (partial, docs/formal.md) |
+| Formal link verifier ⇒ machine safety | in progress |
+| `orin fmt`, `check --format=json` | done |
+| LSP core (pure), JSON lib, analysis facade, VS Code extension + grammar | done |
+| Live `orin lsp` (stdin), semantic index (definition/hover/references/rename) | in progress |
+| Benchmarks + runtime stats (docs/benchmarks.md) | done; Orin 1.1–2.7× C |
+| Closures, floats, maps, interfaces, annotations, MCP, LLVM backend | not started |
 
 ## Next milestones
-1. Freeze Stage 0 (bug fixes only); all new language work goes into `compiler/`.
-2. MIR + OIM memory IR and independent verifier (spec 07, ADR-0006), C backend on MIR.
-3. Language growth in the self-hosted compiler: generics (done: simple parametric generics,
-   ADR-0007, `tests/next/`), closures, classes (lowering),
-   floats, maps, interfaces, annotations — each with an ADR and conformance tests.
-4. LLVM IR backend (ADR-0006); benchmarks (spec 11); formal core calculus (spec 07); `orin mcp`.
+1. Classes + owned-param optimisation merged; benchmarks re-measured.
+2. Live LSP with navigation; then MCP (`orin mcp`) on the same analysis API.
+3. Closures/lambdas + std array API (`map`/`filter`/…), floats, `Map<K,V>`.
+4. Seed C file so the compiler source may use features beyond Orin-B (ADR pending).
+5. LLVM IR backend from MIR (ADR-0006).
