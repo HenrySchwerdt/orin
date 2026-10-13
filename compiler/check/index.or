@@ -25,7 +25,7 @@ import {
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
   Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink, CallSite,
-  SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface, kindName
+  SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface, kindName, Builtin, grantTypeName
 } from "../hir";
 
 // ---- tables ---------------------------------------------------------------------------------
@@ -1353,6 +1353,56 @@ function virtRef(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
   return x;
 }
 
+// ---- primitive I/O events (OSIG PERFORMS_IO, ADR-0027) ----------------------------------------------------
+// "<operation>|<direction>|<grant>": the operation names are compiler-owned (they do not depend on what a library calls
+// its functions); the direction is INPUT (bytes / information enter the process), OUTPUT (leave it) or CONTROL
+// (open, spawn, acquire, exit). The grant is the family of authority the call needs, or "ambient" for the calls that
+// need none (console output, exit). "" = not a primitive I/O builtin.
+function ioOpOf(b: Builtin): string {
+  return match (b) {
+    BConsoleLog => "Console.Write|OUTPUT|ambient",
+    BConsoleError => "Console.Write|OUTPUT|ambient",
+    BProcessExit => "Process.Exit|CONTROL|ambient",
+    BFsReadFile => "Fs.ReadFile|INPUT|FsGrant",
+    BFsWriteFile => "Fs.WriteFile|OUTPUT|FsGrant",
+    BFsExists => "Fs.Stat|INPUT|FsGrant",
+    BFileOpen => "Fs.Open|CONTROL|FsGrant",
+    BFileReadLine => "Fs.Read|INPUT|FsGrant",
+    BFileRead => "Fs.Read|INPUT|FsGrant",
+    BFileReadAll => "Fs.Read|INPUT|FsGrant",
+    BFileWrite => "Fs.Write|OUTPUT|FsGrant",
+    BFileWriteLine => "Fs.Write|OUTPUT|FsGrant",
+    BFileFlush => "Fs.Write|OUTPUT|FsGrant",
+    BProcessArgs => "Process.Args|INPUT|ProcessGrant",
+    BIoShell => "Process.Spawn|CONTROL|ProcessGrant",
+    BIoReadBytes => "Stdio.Read|INPUT|StdioGrant",
+    BIoReadLine => "Stdio.Read|INPUT|StdioGrant",
+    BIoWriteStdout => "Stdio.Write|OUTPUT|StdioGrant",
+    BTimeNowMillis => "Clock.Now|INPUT|ClockGrant",
+    _ => ""
+  };
+}
+
+// The std library functions that perform a primitive I/O operation or derive a grant (they are library code, so the
+// call site in user code is the only place the event is visible).
+function ioOpOfLib(name: string): string {
+  const lt = name.indexOf("<");
+  const n = lt.isSome() ? name.substring(0, lt.unwrap()) : name;
+  if (n == "$stdlib/fs.withFile" || n == "$stdlib/fs.useFile" || n == "$stdlib/fs.withFiles" || n == "$stdlib/fs.useFiles") {
+    return "Fs.Open|CONTROL|FsGrant";
+  }
+  if (n == "$stdlib/fs.withUnder" || n == "$stdlib/fs.useUnder" || n == "$stdlib/fs.withReadOnly" || n == "$stdlib/fs.useReadOnly") {
+    return "Fs.Narrow|CONTROL|FsGrant";
+  }
+  if (n == "$stdlib/process.withArgsOnly" || n == "$stdlib/process.useArgsOnly") {
+    return "Process.Narrow|CONTROL|ProcessGrant";
+  }
+  if (n.startsWith("$stdlib/host.")) {
+    return "Host.Acquire|CONTROL|Host";
+  }
+  return "";
+}
+
 // ---- call sites (OSIG) ---------------------------------------------------------------------------------
 
 function addCall(w: W, callee: Option<usize>, ev: string, via: string, sp: Span): W {
@@ -1534,8 +1584,25 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       x = hExprs(x, c, args, ty);
       x = methodRef(x, c, e, fid, args);
       x = callSite(x, c, e, fid);
+      match (c.hir) {
+        Some(p) => {
+          if (fid < p.functions.length) {
+            const op = ioOpOfLib(p.functions[fid].name);
+            if (op != "") {
+              x = addCall(x, None, "MUST", "io:" + op, e.span);
+            }
+          }
+        },
+        None => {}
+      }
     },
-    XBuiltin(_, args) => { x = hExprs(x, c, args, ty); },
+    XBuiltin(b, args) => {
+      x = hExprs(x, c, args, ty);
+      const op = ioOpOf(b);
+      if (op != "") {
+        x = addCall(x, None, "MUST", "io:" + op, e.span);
+      }
+    },
     XMutMethod(_, p, args) => {
       x = hPlace(x, c, p, ty);
       x = hExprs(x, c, args, ty);

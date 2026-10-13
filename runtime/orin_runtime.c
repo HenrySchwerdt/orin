@@ -890,6 +890,11 @@ int64_t orin_cap_acquire(int64_t host, int64_t family) {
     return grant_handle(g);
 }
 
+int64_t orin_cap_fs(int64_t host) { return orin_cap_acquire(host, GK_FS); }
+int64_t orin_cap_process(int64_t host) { return orin_cap_acquire(host, GK_PROCESS); }
+int64_t orin_cap_stdio(int64_t host) { return orin_cap_acquire(host, GK_STDIO); }
+int64_t orin_cap_clock(int64_t host) { return orin_cap_acquire(host, GK_CLOCK); }
+
 static char *dup_cstr(const char *s, size_t n) {
     char *d = (char *)xmalloc(n + 1);
     orin_platform_mem_copy(d, s, n);
@@ -936,6 +941,10 @@ int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg) {
     }
     return grant_handle(g);
 }
+
+int64_t orin_cap_under(int64_t fs, OrinObj *path) { return orin_cap_narrow(fs, 0, path); }
+int64_t orin_cap_read_only(int64_t fs) { return orin_cap_narrow(fs, 1, NULL); }
+int64_t orin_cap_args_only(int64_t proc) { return orin_cap_narrow(proc, 2, NULL); }
 
 void orin_cap_revoke(int64_t h) {
     Grant *g = grant_ref(h, -1);

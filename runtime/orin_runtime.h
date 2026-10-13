@@ -405,6 +405,14 @@ OrinObj *orin_process_args(int64_t proc); /* new string[] (without program name)
 int64_t orin_cap_host_root(void);                              /* the Host handle; reads ORIN_DENY (traps if malformed) */
 int64_t orin_cap_acquire(int64_t host, int64_t family);        /* family 1 fs, 2 process, 3 stdio, 4 clock */
 int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg); /* op 0 fs under(arg), 1 fs readOnly, 2 process argsOnly */
+/* plain-call forms of the above, one per builtin (used by both backends) */
+int64_t orin_cap_fs(int64_t host);
+int64_t orin_cap_process(int64_t host);
+int64_t orin_cap_stdio(int64_t host);
+int64_t orin_cap_clock(int64_t host);
+int64_t orin_cap_under(int64_t fs, OrinObj *path);
+int64_t orin_cap_read_only(int64_t fs);
+int64_t orin_cap_args_only(int64_t proc);
 void orin_cap_revoke(int64_t grant);                           /* end of the scope that acquired / narrowed it */
 void orin_cap_require(int64_t grant, int64_t kind, const char *what); /* traps unless valid, of `kind` and not denied */
 void orin_cap_require_spawn(int64_t proc);                     /* traps unless the process grant may spawn */
