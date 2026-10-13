@@ -237,9 +237,7 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp),
     ENew(name, targs, args) => checkNew(env, fx, span, name, targs, args, exp),
     EThis => checkThis(fx, span),
-    EArrow(ps, rte, body) => fx.cmode > 0
-      ? Err(diag("E0416", span, "closures are not allowed in a contract expression"))
-      : checkArrowExp(env, fx, span, ps, rte, body, exp)
+    EArrow(ps, rte, body) => checkArrowExp(env, fx, span, ps, rte, body, exp)
   };
 }
 
@@ -2210,8 +2208,9 @@ export type ClauseOut = { env: Env; expr: Option<HExpr>; };
 // discards the result, so contracts never reach the generated code. `cmode`: 1 `@Requires`,
 // `@Invariant`, `@Decreases`, loop clauses; 2 `@Ensures`. The expression must be `bool`
 // (`@Decreases`: `int` or `usize`, E0414); mutating method calls are rejected (E0416). The returned
-// HIR is only used by the purity pass (purity.or). Environment growth (generic instances requested
-// by the clause) is kept so function ids stay consistent.
+// HIR is only used by the purity pass (purity.or), which also judges the closures of the clause
+// (ADR-0031 A4). Environment growth (generic instances and lifted closures requested by the clause)
+// is kept so function ids stay consistent.
 export function checkClause(env: Env, fx: FnCtx, c: ContractClause, cmode: int): Result<ClauseOut, Diagnostic> {
   const none: Option<HExpr> = None;
   return match (c.expr) {
@@ -2224,7 +2223,6 @@ export function checkClause(env: Env, fx: FnCtx, c: ContractClause, cmode: int):
         _ => false
       };
       const hint: Option<Type> = isDec ? None : Some(TyBool);
-      const lifted0 = fx.env.lifted.length;
       const r = checkExpr(env, f, e, hint)?;
       if (isDec) {
         if (!isIntish(r.expr.ty)) {
@@ -2235,9 +2233,6 @@ export function checkClause(env: Env, fx: FnCtx, c: ContractClause, cmode: int):
       }
       if (r.fx.pre.length > fx.pre.length) {
         return Err(diag("E0416", e.span, "a call that mutates its receiver is not allowed in a contract expression"));
-      }
-      if (r.fx.env.lifted.length != lifted0) {
-        return Err(diag("E0416", e.span, "closures are not allowed in a contract expression"));
       }
       return Ok(ClauseOut { env: r.fx.env, expr: Some(r.expr) });
     }
