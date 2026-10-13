@@ -1,0 +1,115 @@
+// Typed, fully resolved HIR — Stage 1 shared contract (v1).
+// Mirrors bootstrap/src/hir.rs (read its invariant list; identical here). Owned by the lead
+// architect. Producer: compiler/check. Consumer: compiler/codegen.
+// Ids are indices (usize) into Program.records / unions / functions and Function.locals.
+
+import { Span } from "../diag";
+
+export type Type =
+  TyInt
+  | TyUsize
+  | TyBool
+  | TyString
+  | TyVoid
+  | TyArray(Type)
+  | TyOption(Type)
+  | TyResult(Type, Type)
+  | TyRecord(usize)
+  | TyUnion(usize);
+
+export type Program = {
+  records: RecordDef[];
+  unions: UnionDef[];
+  functions: Function[];
+  main: usize;
+};
+
+export type FieldDef = { name: string; ty: Type; };
+
+// Qualified, unique, deterministic names, e.g. "users/user.User".
+export type RecordDef = { name: string; fields: FieldDef[]; };
+
+export type UnionDef = { name: string; variants: VariantDef[]; };
+
+export type VariantDef = { name: string; payload: Type[]; };
+
+export type Function = {
+  name: string;
+  paramCount: usize;      // the first paramCount locals are the parameters
+  locals: Local[];
+  ret: Type;
+  body: HBlock;
+  span: Span;
+};
+
+export type Local = { name: string; ty: Type; mutable: bool; };
+
+export type HBlock = { stmts: HStmt[]; };
+
+export type HStmt =
+  HLet(usize, HExpr)                          // local, init
+  | HAssign(Place, Option<BinOp>, HExpr)      // place, compound op (Add..Rem) or None, value
+  | HExprStmt(HExpr)
+  | HIf(HExpr, HBlock, Option<HBlock>)
+  | HWhile(HExpr, HBlock)
+  | HForOf(usize, HExpr, HBlock)              // local, iterated array, body
+  | HBreak
+  | HContinue
+  | HReturn(Option<HExpr>)
+  | HBlockStmt(HBlock);
+
+export type Place = { root: usize; path: PlaceElem[]; ty: Type; };
+
+export type PlaceElem = PField(usize, usize) | PIndex(HExpr);   // PField(recordId, fieldIndex)
+
+export type HExpr = { kind: HExprKind; ty: Type; span: Span; };
+
+export type UnOp = UnNot | UnNeg;
+
+export type BinOp =
+  OpAdd | OpSub | OpMul | OpDiv | OpRem
+  | OpEq | OpNe | OpLt | OpLe | OpGt | OpGe
+  | OpAnd | OpOr;
+
+export type HExprKind =
+  XInt(int)
+  | XBool(bool)
+  | XStr(string)
+  | XLocal(usize)
+  | XUnary(UnOp, HExpr)
+  | XBinary(BinOp, HExpr, HExpr)
+  | XCall(usize, HExpr[])                     // function id, args
+  | XBuiltin(Builtin, HExpr[])                // receiver (if any) is args[0]
+  | XMutMethod(MutBuiltin, Place, HExpr[])
+  | XField(HExpr, usize, usize)               // base, recordId, fieldIndex
+  | XIndex(HExpr, HExpr)
+  | XRecord(usize, Option<HExpr>, FieldInitH[])   // recordId, spread, explicit fields (source order)
+  | XVariant(usize, HExpr[])                  // tag, payload; union given by HExpr.ty
+  | XArray(HExpr[])
+  | XTry(HExpr)
+  | XCond(HExpr, HExpr, HExpr)
+  | XMatch(HExpr, HArm[]);
+
+export type FieldInitH = { index: usize; value: HExpr; };
+
+// value: arm value for non-void match expressions; None if void or body diverges.
+export type HArm = { pattern: HPattern; body: HBlock; value: Option<HExpr>; };
+
+export type HPattern =
+  HPWildcard
+  | HPVariant(usize, Option<usize>[])         // tag, bindings (Some(local) or None for `_`)
+  | HPInt(int)
+  | HPStr(string)
+  | HPBool(bool);
+
+export type Builtin =
+  BConsoleLog | BConsoleError | BStringFromCharCode | BParseInt
+  | BFsReadFile | BFsWriteFile | BFsExists | BProcessArgs | BProcessExit
+  | BStrLength | BStrCharCodeAt | BStrCharAt | BStrSubstring | BStrIndexOf
+  | BStrIncludes | BStrStartsWith | BStrEndsWith | BStrSplit | BStrTrim
+  | BArrLength | BArrGet | BArrSlice | BArrConcat | BArrJoin
+  | BIntToString | BIntToUsize | BUsizeToString | BUsizeToInt | BBoolToString
+  | BOptIsSome | BOptIsNone | BOptUnwrap | BOptUnwrapOr
+  | BResIsOk | BResIsErr | BResUnwrap | BResUnwrapErr;
+
+export type MutBuiltin = MArrPush | MArrPop;
