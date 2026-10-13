@@ -59,17 +59,39 @@ MUTANTS = [
     ("collections", "deque-popFront-keeps-slot", "    const none: Option<T> = None;\n    this.buf[this.head] = none;\n    this.head = (this.head + 1) % this.buf.length;", "    this.head = (this.head + 1) % this.buf.length;"),
     ("collections", "deque-grow-no-copy-wrap", "nb.push(this.buf[(this.head + i) % cap]);", "nb.push(this.buf[i]);"),
     ("collections", "deque-popBack-wrong-slot", "const at = (this.head + this.len - 1) % this.buf.length;", "const at = (this.head + this.len) % this.buf.length;"),
-    ("collections", "sortedmap-put-skips-shift", "    while (j > i) {\n      this.keys[j] = this.keys[j - 1];\n      this.vals[j] = this.vals[j - 1];\n      j -= 1;\n    }\n    this.keys[i] = k;\n    this.vals[i] = v;\n    return true;\n  }\n\n  // remove(k): delete the entry for k and return its value, None when absent. O(log n) to find, O(n) to shift.\n  @Ensures(!this.has(k))\n  @Ensures(result.isSome() == old(this.has(k)))\n  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)\n  @Ensures(result.isNone() ==> this.size() == old(this.size()))\n  remove(k: int)", "    return true;\n  }\n\n  // remove(k): delete the entry for k and return its value, None when absent. O(log n) to find, O(n) to shift.\n  @Ensures(!this.has(k))\n  @Ensures(result.isSome() == old(this.has(k)))\n  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)\n  @Ensures(result.isNone() ==> this.size() == old(this.size()))\n  remove(k: int)"),
-    ("collections", "sortedmap-lowerBound-strict", "      if (this.keys[mid] < k) {\n        lo = mid + 1;", "      if (this.keys[mid] <= k) {\n        lo = mid + 1;"),
-    ("collections", "sortedmap-remove-keeps-value", "    this.keys.pop();\n    this.vals.pop();\n    return Some(v);\n  }\n\n  // firstKey(): the smallest key, None when empty. O(1).\n  @Ensures(result.isSome() == (this.size() > 0))\n  @Ensures(result.isSome() ==> this.has(result.unwrap()))\n  firstKey(): Option<int>", "    this.keys.pop();\n    return Some(v);\n  }\n\n  // firstKey(): the smallest key, None when empty. O(1).\n  @Ensures(result.isSome() == (this.size() > 0))\n  @Ensures(result.isSome() ==> this.has(result.unwrap()))\n  firstKey(): Option<int>"),
-    ("collections", "sortedmap-floor-returns-ceil", "    if (i == 0) {\n      return None;\n    }\n    return Some(this.keys[i - 1]);\n  }\n\n  // ceilKey(k): the smallest key >= k, None when there is none. O(log n).", "    if (i >= this.keys.length) {\n      return None;\n    }\n    return Some(this.keys[i]);\n  }\n\n  // ceilKey(k): the smallest key >= k, None when there is none. O(log n)."),
-    ("collections", "sortedstringmap-compare-reversed", "      if (compareStrings(this.keys[mid], k) < 0) {\n        lo = mid + 1;\n      } else {\n        hi = mid;\n      }\n    }\n    return lo;\n  }\n\n  // has(k): is there an entry for k? O(log n * key length).", "      if (compareStrings(this.keys[mid], k) > 0) {\n        lo = mid + 1;\n      } else {\n        hi = mid;\n      }\n    }\n    return lo;\n  }\n\n  // has(k): is there an entry for k? O(log n * key length)."),
     ("collections", "compareStrings-prefix-order", "  if (a.length < b.length) {\n    return -1;\n  }\n  if (a.length > b.length) {\n    return 1;\n  }\n  return 0;", "  if (a.length < b.length) {\n    return 1;\n  }\n  if (a.length > b.length) {\n    return -1;\n  }\n  return 0;"),
-    ("collections", "pq-push-no-sift", "      this.swap(i, p);\n      i = p;", "      i = p;"),
-    ("collections", "pq-pop-ignores-right-child", "        if (r < n && leavesBefore(this.heap[r], this.heap[m])) {\n          m = r;\n        }", ""),
-    ("collections", "pq-ties-lifo", "return a.priority < b.priority || (a.priority == b.priority && a.seq < b.seq);", "return a.priority < b.priority || (a.priority == b.priority && a.seq > b.seq);"),
-    ("collections", "pq-pop-returns-last", "const top = this.heap[0];", "const top = this.heap[this.heap.length - 1];"),
+    # ---- std:utf8, table-driven validator
+    ("utf8", "dfa-ascii-run-accepts-0x80", "while (i < n && s.charCodeAt(i) < 128) {", "while (i < n && s.charCodeAt(i) < 129) {"),
+    ("utf8", "dfa-error-position-is-end", "      if (st != 0) {\n        return start;", "      if (st != 0) {\n        return i;"),
+    ("utf8", "dfa-table-rejects-ED", "\\x00\\x0c\\x18\\x24\\x3c\\x60", "\\x00\\x0c\\x18\\x24\\x0c\\x60"),
+    ("utf8", "dfa-stops-after-accept-missing", "        if (st <= 12) {\n          break;", "        if (st < 12) {\n          break;"),
+    # ---- std:collections, B-tree (first occurrence = the int-keyed SortedMap)
+    ("collections", "btree-put-never-splits-children", "      if (this.nodes[this.nodes[x].kids[i]].keys.length == maxKeys) {", "      if (this.nodes[this.nodes[x].kids[i]].keys.length > maxKeys) {"),
+    ("collections", "btree-split-wrong-median", "const med = yk[t - 1];", "const med = yk[t];"),
+    ("collections", "btree-root-never-splits", "if (this.nodes[this.root].keys.length == maxKeys) {", "if (this.nodes[this.root].keys.length > maxKeys) {"),
+    ("collections", "btree-borrow-from-minimal-sibling", "if (ci < len && this.nodes[this.nodes[x].kids[ci + 1]].keys.length >= t) {", "if (ci < len && this.nodes[this.nodes[x].kids[ci + 1]].keys.length >= t - 1) {"),
+    ("collections", "btree-merge-leaks-node", "    this.removeKid(x, i + 1);\n    this.release(z);", "    this.removeKid(x, i + 1);"),
+    ("collections", "btree-root-not-shrunk", "    if (x == this.root && this.nodes[x].keys.length == 0) {\n      this.root = y;\n      this.release(x);\n    }", "    if (x == this.root && this.nodes[x].keys.length == 0) {\n      this.release(x);\n    }"),
+    ("collections", "btree-remove-forgets-count", "          this.removeKey(x, i);\n          this.count -= 1;", "          this.removeKey(x, i);"),
+    ("collections", "btree-remove-predecessor-key-kept", "          this.nodes[x].keys[i] = this.nodes[w].keys[last];\n          this.nodes[x].vals[i] = this.nodes[w].vals[last];\n          target = this.nodes[w].keys[last];", "          this.nodes[x].keys[i] = this.nodes[w].keys[last];\n          this.nodes[x].vals[i] = this.nodes[w].vals[last];"),
+    ("collections", "btree-lowerBound-inclusive", "    if ((keys[mid] < k)) {\n      lo = mid + 1;", "    if ((keys[mid] <= k)) {\n      lo = mid + 1;"),
+    ("collections", "btree-insertKey-values-not-shifted", "      this.nodes[id].vals[j] = this.nodes[id].vals[j - 1];\n      j -= 1;\n    }\n    this.nodes[id].keys[pos] = k;", "      j -= 1;\n    }\n    this.nodes[id].keys[pos] = k;"),
+    ("collections", "btree-floor-takes-wrong-slot", "best = Some(this.nodes[x].keys[i - 1]);", "best = Some(this.nodes[x].keys[0]);"),
+    ("collections", "btree-height-overcounts", "    id = nodes[id].kids[0];\n    h += 1;", "    id = nodes[id].kids[0];\n    h += 2;"),
+    ("collections", "btree-mergeChildren-drops-kids", "    let b: usize = 0;\n    while (b < this.nodes[z].kids.length) {", "    let b: usize = 0;\n    while (b + 1 < this.nodes[z].kids.length) {"),
+    ("collections", "btree-str-compare-reversed", "if ((compareStrings(keys[mid], k) < 0)) {", "if ((compareStrings(keys[mid], k) > 0)) {"),
+    # ---- std:collections, 4-ary heap
+    ("collections", "pq-push-no-sift", "      this.vals[i] = this.vals[par];\n      i = par;\n    }", "      this.vals[i] = this.vals[par];\n      break;\n    }"),
+    ("collections", "pq-pop-stops-sifting-early", "        if (!leavesBefore(this.prios[m], this.seqs[m], lp, ls)) {\n          break;\n        }", "        if (true) {\n          break;\n        }"),
+    ("collections", "pq-pop-ignores-fourth-child", "const end = c + 4 < n ? c + 4 : n;", "const end = c + 3 < n ? c + 3 : n;"),
+    ("collections", "pq-ties-lifo", "return p1 < p2 || (p1 == p2 && s1 < s2);", "return p1 < p2 || (p1 == p2 && s1 > s2);"),
+    ("collections", "pq-pop-returns-last", "const top = PQEntry<T> { priority: this.prios[0], value: this.vals[0] };", "const top = PQEntry<T> { priority: this.prios[this.prios.length - 1], value: this.vals[this.vals.length - 1] };"),
+    ("collections", "pq-push-wrong-parent", "      const par = (i - 1) / 4;\n      if (!leavesBefore(priority", "      const par = (i - 1) / 2;\n      if (!leavesBefore(priority"),
+    ("collections", "pq-sift-drops-value", "      this.seqs[i] = this.seqs[par];\n      this.vals[i] = this.vals[par];\n      i = par;", "      this.seqs[i] = this.seqs[par];\n      i = par;"),
 ]
+
+# further test files of a module that also run against every mutant
+EXTRA_TESTS = {"utf8": ["utf8_dfa_test"], "collections": ["sorted_btree_test"]}
 
 
 def run(orinc, test_file, extra):
@@ -101,30 +123,42 @@ def main():
         if a.module and a.module != mod:
             continue
         src = open(os.path.join(ROOT, "stdlib", mod + ".or"), encoding="utf-8").read()
-        if src.count(old) != 1:
-            print("BAD MUTANT %s/%s: pattern occurs %d times" % (mod, name, src.count(old)))
+        if src.count(old) < 1:
+            print("BAD MUTANT %s/%s: pattern not found" % (mod, name))
             return 2
         d = os.path.join(OUT, mod + "_" + name)
         os.makedirs(d)
         for m in mods:
             s = open(os.path.join(ROOT, "stdlib", m + ".or"), encoding="utf-8").read()
             if m == mod:
-                s = s.replace(old, new)
+                s = s.replace(old, new, 1)
             for k, v in rewrite.items():
                 s = s.replace('"%s"' % k, '"%s"' % v)
             open(os.path.join(d, m + ".or"), "w", encoding="utf-8").write(s)
-        t = open(os.path.join(ROOT, "tests", "std", mod + "_test.or"), encoding="utf-8").read()
+        tfiles = [mod + "_test"] + EXTRA_TESTS.get(mod, [])
+        spec = open(os.path.join(ROOT, "tests", "std", "spec_sorted.or"), encoding="utf-8").read()
         for k, v in rewrite.items():
-            t = t.replace('"%s"' % k, '"%s"' % v)
-        tf = os.path.join(d, mod + "_test.or")
-        open(tf, "w", encoding="utf-8").write(t)
-        rel = os.path.relpath(tf, ROOT)
-        code1, out1 = run(orinc, rel, [])
-        code2, out2 = run(orinc, rel, ["--no-contracts"])
-        fails1 = len(re.findall(r"^FAIL ", out1, re.M))
-        fails2 = len(re.findall(r"^FAIL ", out2, re.M))
-        viol = len(re.findall(r"contract violated", out1))
-        compile_err = code1 == 1 and fails1 == 0 and "error[" in out1
+            spec = spec.replace('"%s"' % k, '"%s"' % v)
+        open(os.path.join(d, "spec_sorted.or"), "w", encoding="utf-8").write(spec)
+        fails1 = fails2 = viol = 0
+        out1 = ""
+        code1 = 0
+        for tn in tfiles:
+            t = open(os.path.join(ROOT, "tests", "std", tn + ".or"), encoding="utf-8").read()
+            for k, v in rewrite.items():
+                t = t.replace('"%s"' % k, '"%s"' % v)
+            tf = os.path.join(d, tn + ".or")
+            open(tf, "w", encoding="utf-8").write(t)
+            rel = os.path.relpath(tf, ROOT)
+            c1, o1 = run(orinc, rel, [])
+            c2, o2 = run(orinc, rel, ["--no-contracts"])
+            fails1 += len(re.findall(r"^FAIL ", o1, re.M))
+            fails2 += len(re.findall(r"^FAIL ", o2, re.M))
+            viol += len(re.findall(r"contract violated", o1))
+            out1 += o1
+            if c1 == 1 and "error[" in o1:
+                code1 = 1
+        compile_err = code1 == 1 and fails1 == 0
         if compile_err:
             print("COMPILE ERROR in mutant %s/%s:\n%s" % (mod, name, out1[:600]))
             return 2

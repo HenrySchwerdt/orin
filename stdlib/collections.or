@@ -17,18 +17,17 @@
 // after every public method, and every public method states `@Requires` / `@Ensures`. Helpers that contracts call
 // are loops (no closures, no recursion). All classes are values with copy-on-write storage like every class.
 //
-// Complexity summary (n = size):
-//   IntSet / StringSet        has, add, remove expected O(1); union/intersection/difference/isSubsetOf O(n + m)
+// Complexity summary (n = size, t = B-tree minimum degree, default choice 16):
+//   IntSet / StringSet        has, add, remove expected O(1) (the prelude's open-addressing hash map); union O(n + m),
+//                             intersection O(min(n, m)), difference and isSubsetOf O(n)
 //   Deque<T>                  pushFront/pushBack/popFront/popBack/get/front/back amortised O(1); toArray O(n)
-//   SortedMap / SortedStringMap  has/get/floorKey/ceilKey/firstKey/lastKey O(log n) (binary search over a sorted
-//                             array; string keys cost O(key length) per comparison); put, remove O(n) in the worst
-//                             case (shifting), O(1) when the key is the new largest / the largest; popFirst O(n)
-//   PriorityQueue<T>          push, pop O(log n) (4-ary heap); peek, minPriority, size O(1)
-//
-// Why a sorted array and not a balanced tree: the invariant "keys strictly increasing and the same length as the
-// values" is a two-line loop, binary search is a dozen lines, and nothing about the representation is hidden from
-// the invariant. A tree would need rotation invariants (balance, parent order) that are much harder to state with
-// loop-only contract helpers; the O(n) insert is a memmove of 8-byte slots.
+//   SortedMap / SortedStringMap  B-tree in an arena: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/
+//                             popLast all O(t log_t n) = O(log n); keyArray/valueArray O(n); size O(1)
+//   PriorityQueue<T>          4-ary heap: push, pop O(log n); peek, minPriority, size O(1)
+// Each choice was compared with the simpler alternative it replaces (numbers in docs/std.md): B-tree vs sorted
+// array 31 ms vs 1782 ms for 20,000 random inserts + lookups + removals; 4-ary struct-of-arrays heap vs boxed binary
+// heap 122 ms vs 300 ms; table-driven UTF-8 validator vs per-sequence decoder 5 ms vs 82 ms per MB; plain-slot ring
+// vs `Option` slots 84 ms vs 128 ms.
 
 // ---------------------------------------------------------------------------------------------- helpers
 
@@ -195,18 +194,18 @@ export class IntSet {
   @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
   @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
   union(other: IntSet): IntSet {
-    let out = new IntSet();
-    const xs = this.items.keys();
+    // start from the larger set (a copy-on-write value copy) and insert only the smaller one's members
+    let out = this;
+    let small = other;
+    if (other.size() > this.items.size) {
+      out = other;
+      small = this;
+    }
+    const xs = small.toArray();
     let i: usize = 0;
     while (i < xs.length) {
       out.add(xs[i]);
       i += 1;
-    }
-    const ys = other.toArray();
-    let j: usize = 0;
-    while (j < ys.length) {
-      out.add(ys[j]);
-      j += 1;
     }
     return out;
   }
@@ -215,11 +214,14 @@ export class IntSet {
   @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
   @Ensures(result.size() <= this.size() && result.size() <= other.size())
   intersection(other: IntSet): IntSet {
+    // walk the smaller set and probe the larger one
     let out = new IntSet();
-    const xs = this.items.keys();
+    const walk = this.items.size <= other.size() ? this : other;
+    const probe = this.items.size <= other.size() ? other : this;
+    const xs = walk.toArray();
     let i: usize = 0;
     while (i < xs.length) {
-      if (other.has(xs[i])) {
+      if (probe.has(xs[i])) {
         out.add(xs[i]);
       }
       i += 1;
@@ -331,18 +333,18 @@ export class StringSet {
   @Ensures(this.isSubsetOf(result) && other.isSubsetOf(result))
   @Ensures(result.size() >= this.size() && result.size() <= this.size() + other.size())
   union(other: StringSet): StringSet {
-    let out = new StringSet();
-    const xs = this.items.keys();
+    // start from the larger set (a copy-on-write value copy) and insert only the smaller one's members
+    let out = this;
+    let small = other;
+    if (other.size() > this.items.size) {
+      out = other;
+      small = this;
+    }
+    const xs = small.toArray();
     let i: usize = 0;
     while (i < xs.length) {
       out.add(xs[i]);
       i += 1;
-    }
-    const ys = other.toArray();
-    let j: usize = 0;
-    while (j < ys.length) {
-      out.add(ys[j]);
-      j += 1;
     }
     return out;
   }
@@ -351,11 +353,14 @@ export class StringSet {
   @Ensures(result.isSubsetOf(this) && result.isSubsetOf(other))
   @Ensures(result.size() <= this.size() && result.size() <= other.size())
   intersection(other: StringSet): StringSet {
+    // walk the smaller set and probe the larger one
     let out = new StringSet();
-    const xs = this.items.keys();
+    const walk = this.items.size <= other.size() ? this : other;
+    const probe = this.items.size <= other.size() ? other : this;
+    const xs = walk.toArray();
     let i: usize = 0;
     while (i < xs.length) {
-      if (other.has(xs[i])) {
+      if (probe.has(xs[i])) {
         out.add(xs[i]);
       }
       i += 1;
@@ -383,47 +388,23 @@ export class StringSet {
 
 // --------------------------------------------------------------------------------------------- Deque
 
-// Is the ring `buf` consistent with (head, len)? Exactly the `len` slots head, head+1, ... (mod capacity) hold
-// `Some`, every other slot is `None`. Loop-based. O(capacity).
-export function ringConsistent<T>(buf: Option<T>[], head: usize, len: usize): bool {
-  const cap = buf.length;
-  if (cap == 0) {
-    return len == 0 && head == 0;
-  }
-  if (head >= cap || len > cap) {
-    return false;
-  }
-  let somes: usize = 0;
-  let i: usize = 0;
-  while (i < cap) {
-    if (buf[i].isSome()) {
-      somes += 1;
-    }
-    i += 1;
-  }
-  if (somes != len) {
-    return false;
-  }
-  let k: usize = 0;
-  while (k < len) {
-    if (buf[(head + k) % cap].isNone()) {
-      return false;
-    }
-    k += 1;
-  }
-  return true;
-}
-
-// A double-ended queue on a ring buffer. Slots hold `Option<T>` (the language has no uninitialised element);
-// `head` is the index of the front element, `len` the number of elements, and the invariants say that the
-// indices are in range and that exactly the `len` slots from `head` on are occupied.
+// A double-ended queue on a ring buffer: `buf` has `capacity` slots (0 until the first push, then 4, 8, 16, ...),
+// the element number i from the front lives in slot (head + i) mod capacity, and the ring is unrolled into a
+// buffer of twice the size when it is full. Index arithmetic wraps by one conditional subtraction (no division).
+// The language has no uninitialised slot and no default value of a type parameter, so slots that are not live hold
+// `filler`, a copy of the first element ever pushed (a popped slot is overwritten with it, so at most that one
+// value is kept alive beyond its time). Earlier versions used `Option<T>` slots, which boxes every element and made
+// the invariant "exactly the live slots are Some" statable; measured on 500,000 push/pop rounds, plain slots take
+// 84 ms against 128 ms. What the invariants can still state without equality on T is the index discipline:
+// `len <= capacity`, `head` in range, and a filler exists exactly when there is storage.
 @Invariant(this.len <= this.buf.length)
 @Invariant(this.buf.length == 0 ? this.head == 0 : this.head < this.buf.length)
-@Invariant(ringConsistent(this.buf, this.head, this.len))
+@Invariant(this.filler.isSome() == (this.buf.length > 0))
 export class Deque<T> {
-  private buf: Option<T>[] = [];
+  private buf: T[] = [];
   private head: usize = 0;
   private len: usize = 0;
+  private filler: Option<T> = None;
 
   // size(): number of elements. O(1).
   @Ensures(result == this.len)
@@ -443,22 +424,36 @@ export class Deque<T> {
     return this.buf.length;
   }
 
+  // Slot of the element number i from the front (i <= len; i = len is the slot after the back).
+  @Requires(this.buf.length > 0 && i <= this.len)
+  @Ensures(result < this.buf.length)
+  private slot(i: usize): usize {
+    const idx = this.head + i;
+    if (idx >= this.buf.length) {
+      return idx - this.buf.length;
+    }
+    return idx;
+  }
+
   // Doubles the ring (4 slots at first) when it is full, unrolling it so that head becomes 0. O(n).
-  private grow(): void {
+  private grow(x: T): void {
+    if (this.filler.isNone()) {
+      this.filler = Some(x);
+    }
     const cap = this.buf.length;
     if (this.len < cap) {
       return;
     }
     const ncap: usize = cap == 0 ? 4 : cap * 2;
-    const none: Option<T> = None;
-    let nb: Option<T>[] = [];
+    const fill = this.filler.unwrap();
+    let nb: T[] = [];
     let i: usize = 0;
     while (i < this.len) {
-      nb.push(this.buf[(this.head + i) % cap]);
+      nb.push(this.buf[this.slot(i)]);
       i += 1;
     }
     while (nb.length < ncap) {
-      nb.push(none);
+      nb.push(fill);
     }
     this.buf = nb;
     this.head = 0;
@@ -470,8 +465,8 @@ export class Deque<T> {
   @Ensures(old(this.isEmpty()) ==> this.front().isSome())
   @Ensures(this.capacity() >= old(this.capacity()))
   pushBack(x: T): void {
-    this.grow();
-    this.buf[(this.head + this.len) % this.buf.length] = Some(x);
+    this.grow(x);
+    this.buf[this.slot(this.len)] = x;
     this.len += 1;
   }
 
@@ -481,10 +476,13 @@ export class Deque<T> {
   @Ensures(old(this.isEmpty()) ==> this.back().isSome())
   @Ensures(this.capacity() >= old(this.capacity()))
   pushFront(x: T): void {
-    this.grow();
-    const cap = this.buf.length;
-    this.head = (this.head + cap - 1) % cap;
-    this.buf[this.head] = Some(x);
+    this.grow(x);
+    if (this.head == 0) {
+      this.head = this.buf.length - 1;
+    } else {
+      this.head -= 1;
+    }
+    this.buf[this.head] = x;
     this.len += 1;
   }
 
@@ -497,11 +495,13 @@ export class Deque<T> {
       return None;
     }
     const v = this.buf[this.head];
-    const none: Option<T> = None;
-    this.buf[this.head] = none;
-    this.head = (this.head + 1) % this.buf.length;
+    this.buf[this.head] = this.filler.unwrap();
+    this.head += 1;
+    if (this.head == this.buf.length) {
+      this.head = 0;
+    }
     this.len -= 1;
-    return v;
+    return Some(v);
   }
 
   // popBack(): remove and return the last element, None when empty. O(1).
@@ -512,12 +512,11 @@ export class Deque<T> {
     if (this.len == 0) {
       return None;
     }
-    const at = (this.head + this.len - 1) % this.buf.length;
+    const at = this.slot(this.len - 1);
     const v = this.buf[at];
-    const none: Option<T> = None;
-    this.buf[at] = none;
+    this.buf[at] = this.filler.unwrap();
     this.len -= 1;
-    return v;
+    return Some(v);
   }
 
   // front(): the first element without removing it, None when empty. O(1).
@@ -526,7 +525,7 @@ export class Deque<T> {
     if (this.len == 0) {
       return None;
     }
-    return this.buf[this.head];
+    return Some(this.buf[this.head]);
   }
 
   // back(): the last element without removing it, None when empty. O(1).
@@ -535,7 +534,7 @@ export class Deque<T> {
     if (this.len == 0) {
       return None;
     }
-    return this.buf[(this.head + this.len - 1) % this.buf.length];
+    return Some(this.buf[this.slot(this.len - 1)]);
   }
 
   // get(i): the i-th element from the front, None when i >= size(). O(1).
@@ -544,15 +543,16 @@ export class Deque<T> {
     if (i >= this.len) {
       return None;
     }
-    return this.buf[(this.head + i) % this.buf.length];
+    return Some(this.buf[this.slot(i)]);
   }
 
-  // clear(): remove all elements. O(1).
+  // clear(): remove all elements and release the storage. O(1).
   @Ensures(this.size() == 0 && this.capacity() == 0)
   clear(): void {
     this.buf = [];
     this.head = 0;
     this.len = 0;
+    this.filler = None;
   }
 
   // toArray(): the elements front to back. O(n).
@@ -561,7 +561,7 @@ export class Deque<T> {
     let out: T[] = [];
     let i: usize = 0;
     while (i < this.len) {
-      out.push(this.buf[(this.head + i) % this.buf.length].unwrap());
+      out.push(this.buf[this.slot(i)]);
       i += 1;
     }
     return out;
