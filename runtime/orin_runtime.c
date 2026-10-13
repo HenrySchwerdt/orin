@@ -536,9 +536,16 @@ OrinObj *orin_array_join(OrinObj *o, OrinObj *sep) {
 
 /* ---------------------------------------------------------------- I/O */
 
+/* fwrite_unlocked is a glibc extension; fall back to fwrite elsewhere (macOS, musl). */
+#if defined(__GLIBC__)
+#define ORIN_FWRITE fwrite_unlocked
+#else
+#define ORIN_FWRITE fwrite
+#endif
+
 void orin_console_log(OrinObj *s) {
     OrinString *x = (OrinString *)s;
-    fwrite_unlocked(x->data, 1, x->len, stdout);
+    ORIN_FWRITE(x->data, 1, x->len, stdout);
     putc_unlocked('\n', stdout);
 }
 
