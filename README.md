@@ -148,9 +148,25 @@ capabilities.
 
 ## Try it
 
-Download a package from [Releases](../../releases) (Linux x86-64, macOS arm64; use **v0.1.0-alpha.2** or later for the features listed here, or build from source). You need a C
-compiler (`cc`, gcc or clang) on your PATH for the default backend. An LLVM IR backend
-is also implemented; see the [build and backend documentation](docs/architecture.md).
+Orin releases are experimental pre-releases for Linux (x86-64, arm64) and macOS (arm64, Intel); use
+**v0.1.0-alpha.2** or later for the features listed here, or build from source. You need a C compiler
+(`cc`, gcc or clang) on your PATH for the default backend. An LLVM IR backend is also implemented; see the
+[build and backend documentation](docs/architecture.md). Details, options and troubleshooting:
+[docs/install.md](docs/install.md).
+
+**One line (Linux, macOS)**: downloads the release for your platform, verifies its sha256, installs to
+`~/.orin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh
+orin doctor        # checks the install and the C compiler, prints fixes
+```
+
+**Homebrew**: planned, not available yet.
+
+**Windows**: WSL2 works today ([docs/windows.md](docs/windows.md)); a native build is planned.
+
+**Manual tarball**: download a package from [Releases](../../releases) and run it in place:
 
 ```bash
 tar xzf orin-<version>-<platform>.tar.gz && cd orin-<version>-<platform>

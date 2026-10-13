@@ -20,7 +20,10 @@ mkdir -p "$OUT/docs/assets" && cp docs/assets/orin-logo-256.png "$OUT/docs/asset
 [ -f LICENSE ] && cp LICENSE "$OUT/"
 echo "$VER" > "$OUT/VERSION"
 tar -C build/dist -czf "build/dist/$NAME.tar.gz" "$NAME"
+# Checksum file next to the tarball: "<sha256>  <file name>" (sha256sum format; install.sh and SHA256SUMS use it).
+if command -v sha256sum >/dev/null 2>&1; then SUM="sha256sum"; else SUM="shasum -a 256"; fi
+(cd build/dist && $SUM "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
 # Smoke test the package.
 "$OUT/bin/orin" run "$OUT/examples/hello.or"
 "$OUT/bin/orin" test "$OUT/examples/testing.or"
-echo "packaged build/dist/$NAME.tar.gz"
+echo "packaged build/dist/$NAME.tar.gz (+ .sha256)"

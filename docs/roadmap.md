@@ -233,6 +233,17 @@ What each phase delivers:
   - HTTP, Postgres adapter, JSX
   - the payment/orders reference service
 
+## Distribution and developer tools
+
+| Item | Status |
+|---|---|
+| Release matrix: linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64; per-target bootstrap, smoke test, `.sha256`, combined `SHA256SUMS`; dry-run dispatch | done (`.github/workflows/release.yml`) |
+| `install.sh` (checksum-verified, `~/.orin`, uninstall), tested in CI against the packages (`tools/test_install.sh`) | done ([install.md](install.md)) |
+| `orin doctor` and `orin --version` in the wrapper | done (no compiler change) |
+| Homebrew tap | planned (dropped from the first distribution round) |
+| Native Windows (clang, PowerShell wrapper, zip, Scoop, winget, `install.ps1`) | planned, starts after capabilities Stage A ([windows.md](windows.md)) |
+| Notarised/signed macOS and Windows binaries; `.deb`/`.rpm`; musl (static Linux) builds | not planned yet |
+
 ## Next concrete steps
 1. (done) Interfaces and contract clauses merged.
 2. (done) Track A phase 1: OSIG schema ADR, `orin graph`, `orin diff`, HTML report (vision tickets 1, 3,
