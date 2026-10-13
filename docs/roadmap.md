@@ -14,12 +14,14 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 2. Compiler rewrite under the contract and class standard, then diagnostics and CLI polish (2a).
    The refusal protocol (ADR-0029) is part of 2a.
    **Stronger invariants (ADR-0031):** directly after rewrite 2a. This step covers:
-   - violation reports with values and blame;
-   - enforced record invariants and pure functions in contracts;
+   - violation reports with values and blame; **done** (ADR-0031 A1-A2);
+   - enforced record invariants and pure functions in contracts; **done** (A3-A5: purity is inferred, contract-internal
+     calls are unchecked; docs/contracts.md);
    - static per-method proofs of class invariants;
    - business-logic patterns: quantifiers, `sum`, conservation laws, executable specs, state
      machines, `std:decimal` and `@Property`.
 
+   ADR-0031 part A (items 1-5) is done; parts B-E remain.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections, I/O
@@ -104,8 +106,8 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 - **MIR source spans** are added during the lowering rewrite (ADR-0020 D3).
 - The Stage 0 CI jobs and the Rust crate were retired in the first post-freeze cleanup PR (branch `archive/stage0-final`, docs/bootstrap.md).
 - **Contract and class standard** (project owner, 2026-10-13): every class carries meaningful
-  `@Invariant`s, stateful logic is a class (class invariants are runtime-checked, record invariants
-  are not), every non-trivial function states real `@Requires`/`@Ensures`. Step 1 (loader/diag) is
+  `@Invariant`s, stateful logic is a class (class invariants are runtime-checked, and since ADR-0031 A3
+  record invariants too), every non-trivial function states real `@Requires`/`@Ensures`. Step 1 (loader/diag) is
   brought up to this standard in step 1b. Details: `docs/rewrite.md`.
 - **Contract gate for the compiler (planned, not implemented):** CI fails when the compiler's own
   contracts are weak or regress: strict contract coverage on (`[contracts] strict = true`, ADR-0028;

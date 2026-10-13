@@ -74,16 +74,18 @@ then executes the module's contracts on real inputs.
 
 Rules learned:
 
-* Clauses must be **pure**; the purity analysis follows calls and rejects any function that calls a
-  *function value*. Therefore a helper used in a contract must be written with loops, not with
-  `filter` / `map` / `every` (`isWellFormed`, `importCount`, `isNormalized`, `segments`,
-  `allRenderable`). The nice closure style is for the code, loops for the predicates.
-* A function must not call itself from its own contract (`@Ensures(f(result) == result)`): with
-  `--check-contracts` the recursive call goes through the wrapper and never terminates. State the
-  property structurally instead (`isNormalized(result)`) and test idempotence in a unit test.
-* Record `@Invariant`s are type-checked but **not enforced at run time** (docs/contracts.md); the same
-  property is therefore also an `@Requires` / `@Ensures` of the functions that build the value
-  (`span`, `spanTo`). Class `@Invariant`s are enforced after every non-private method.
+* Clauses must be **pure**. Since ADR-0031 A4 the purity analysis is inferred over the call graph: a helper may
+  use `every` / `some` / `map` / `filter` with a pure lambda (a lambda that calls an impure function, or a
+  function value of unknown origin, is still E0416). *Historical* (steps 1-2a): before that a helper used in a
+  contract had to be written with loops (`isWellFormed`, `importCount`, `isNormalized`, `segments`,
+  `allRenderable`); those that were not touched since are still loops.
+* A function may call itself from its own contract (`@Ensures(f(result) == result)`): since ADR-0031 A5 a call
+  inside a clause goes to the unchecked body, so it terminates. (Before, with `--check-contracts` the recursive
+  call went through the wrapper and never terminated, hence the advice "state the property structurally".)
+* Record `@Invariant`s are enforced under `--check-contracts` at every literal, field write and function result
+  (ADR-0031 A3, docs/contracts.md); the same property is still also an `@Requires` / `@Ensures` of the functions
+  that build the value (`span`, `spanTo`) where that was written before. Class `@Invariant`s are enforced after
+  every non-private method.
 * Prefer a small exported predicate over a long clause (`isValidCode`, `isRenderable`,
   `isWellFormed`): it documents the invariant once and is reused in `@Requires` and `@Ensures`.
 * A contract that cannot fail is noise. Ask "which bug would this catch?": a diagnostic whose span lies
@@ -155,8 +157,9 @@ rewritten module follows these rules (the contracts are checked by the `contract
 
 1. **Every class has at least one meaningful `@Invariant`.** State that several functions thread through (a record
    plus free functions: tables with their indexes, parallel arrays, a scope stack) becomes a class with methods where
-   that is a mechanical change, because a class `@Invariant` is checked after every non-private method and a record
-   `@Invariant` is not checked at run time at all. A class whose only job is to keep arrays in step (`Captures`,
+   that is a mechanical change, because a class `@Invariant` is checked after every non-private method (a record `@Invariant` is checked at
+   every literal, field write and function result under `--check-contracts` since ADR-0031 A3, so a record is also
+   fine when the property is a plain data rule). A class whose only job is to keep arrays in step (`Captures`,
    `TScope`) still earns its keep: the invariant is the point. Keep invariants O(1) or O(depth); a method that
    mutates may state the O(n) property in its `@Ensures` instead.
 2. **Every exported or non-trivial function has `@Requires` / `@Ensures` that state a real property:** lookup after
@@ -300,10 +303,10 @@ Friction found:
 * Class invariants run only after non-private methods, and `Loader` has one (`run`), so its invariants
   are checked once per load, not per step; a failed `run` leaves `stack` non-empty, so "stack empty" can
   only be an `@Ensures` of the success path. Finer-grained checking would need more public methods.
-* Record `@Invariant`s are not enforced, so `Diagnostic`, `Resolved`, `PreludeRoot` carry the property as
+* Record `@Invariant`s were not enforced in step 1, so `Diagnostic`, `Resolved`, `PreludeRoot` carry the property as
   documentation and as loop-based predicates (`allWellFormed`, `isWellFormedRoot`) repeated in
-  `@Requires`; runtime-checked record invariants (at literals and field assignments) would remove that
-  duplication and would have covered every module that builds `Diagnostic` by literal.
+  `@Requires`. They are runtime-checked since ADR-0031 A3 (at literals, field writes and function results), which
+  covers every module that builds `Diagnostic` by literal; the repeated `@Requires` can be dropped where wanted.
 * Pure combinators in contracts would remove ~10 hand-written loops (`allRenderable`, `allNormalized`,
   `allDistinct`, `countWarnings`, `importersOf`, ...): `xs.every(p)` is rejected as a call through a
   function value. A purity rule that accepts closures whose body is pure (or prelude `every` / `some` /
