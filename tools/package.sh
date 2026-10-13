@@ -13,6 +13,7 @@ cp runtime/*.h runtime/*.c "$OUT/lib/orin/runtime/"
 mkdir -p "$OUT/lib/orin/platform" && cp platform/*.h platform/*.c "$OUT/lib/orin/platform/"
 test -f "$OUT/lib/orin/platform/orin_platform.c" || { echo "package lacks platform/" >&2; exit 1; }
 cp -r examples "$OUT/examples"
+mkdir -p "$OUT/examples/osig" && cp -r tests/osig/accept/base tests/osig/accept/head "$OUT/examples/osig/"   # orin diff demo (README)
 cp build/bootstrap/stage2.c "$OUT/share/orin/orin-seed.c"   # self-hosted compiler as C
 cp README.md CHANGELOG.md "$OUT/"
 mkdir -p "$OUT/docs/assets" && cp docs/assets/orin-logo-256.png "$OUT/docs/assets/"
