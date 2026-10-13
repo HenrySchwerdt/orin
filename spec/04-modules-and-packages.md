@@ -58,6 +58,10 @@ allowed_dependencies = ["database", "logging"]
 
 The package manifest name `orin.toml` and keys are proposed stable defaults; exact package resolution, registry format, dependency versioning, package imports and reproducibility policy remain OPEN.
 
+**Implemented (ADR-0016):** `entry` (default `src/main.or`), `[architecture]` flags (always enforced; `false` is rejected), `[modules.<path>] allowed_dependencies`. A module is identified by its directory (containing `module.or`) relative to the entry file's directory; `.` names the root module. A module with a rule may import only the listed modules (E0501) and its own descendants; unknown module names are E0502; manifest errors are E0500 (syntax) and E0503 (invalid). The manifest is found from a package directory argument or from any file inside the package. No registry, versions or package imports in 1.0 core.
+
 ## Review/agent friendliness
+
+Implemented: `orin check --deps [--format=json]` (module dependency summary), `orin api [--check <snapshot>]` (public API snapshot; exit 1 when it differs), MCP `inspect` on a module (allowed dependencies).
 
 The compiler SHOULD emit public API snapshots and module dependency summaries in a compact form. MCP SHOULD offer change-impact and illegal-dependency explanations. Public API changes MUST be detectable by `orin check`, and optional semver-compatible API checking is a later feature.

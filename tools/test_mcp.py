@@ -242,6 +242,21 @@ def main():
     err, v, raw = c.call("inspect", {})
     check(err, "inspect without target is an error")
 
+    # ---- packages (orin.toml, spec 04): module inspect shows the rule; violations are diagnostics
+    import shutil
+    shutil.copytree(os.path.join(ROOT, "tests", "next", "packages", "shop"), os.path.join(proj, "shop"))
+    err, v, raw = c.call("inspect", {"module": "shop/src/payments/module.or", "entry": "shop/src/main.or"})
+    check(not err and v.get("allowedDependencies") == ["users", "database"] and v.get("moduleId") == "payments"
+          and v.get("package") == "shop" and v.get("moduleImports") == ["database", "users"],
+          "inspect module shows manifest rule (%s)" % raw)
+    err, v, raw = c.call("check", {"entry": "shop/src/main.or"})
+    check(not err and v.get("errors") == 0, "package checks clean (%s)" % raw)
+    write(os.path.join(proj, "shop", "src", "users", "user.or"),
+          open(os.path.join(proj, "shop", "src", "users", "user.or")).read().replace(
+              'import { hidden }', 'import { charge } from "../payments";\nimport { hidden }'))
+    err, v, raw = c.call("check", {"entry": "shop/src/main.or"})
+    check("E0501" in raw, "disallowed module dependency is reported by check (%s)" % raw)
+
     # ---- edit (rename) ----------------------------------------------------------------------
     before = open(os.path.join(proj, "lib.or")).read()
     err, v, raw = c.call("edit", {"kind": "rename", "file": "lib.or", "position": {"line": 3, "column": 20},

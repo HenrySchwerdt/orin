@@ -1,0 +1,162 @@
+// Module dependency summary (spec 04 "module dependency summaries"): for every module of the
+// loaded program, the other modules it imports, plus the manifest's allowed_dependencies rule when
+// there is one. Deterministic: modules and imports are sorted ("." first, then byte order).
+// Used by `orin check --deps` and MCP `inspect`.
+
+import { LoadedProgram } from "../loader";
+import { Json, JNull, JStr, JArr, JObj, JField, jField, stringifyJson } from "../json";
+import { Manifest, ruleIndex, displayModule } from "../package";
+
+export type ModDeps = {
+  module: string;          // module id ("." = root)
+  imports: string[];       // other modules imported by any file of this module, sorted
+  allowed: Option<string[]>;   // the manifest rule for this module, if any
+};
+
+// Byte-wise string comparison: negative, zero or positive; "." sorts before everything else.
+export function cmpStr(a: string, b: string): int {
+  if (a == b) {
+    return 0;
+  }
+  if (a == ".") {
+    return -1;
+  }
+  if (b == ".") {
+    return 1;
+  }
+  let i: usize = 0;
+  while (i < a.length && i < b.length) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x != y) {
+      return x - y;
+    }
+    i += 1;
+  }
+  return a.length.toInt() - b.length.toInt();
+}
+
+export function sortStrs(xs: string[]): string[] {
+  let out: string[] = [];
+  for (const x of xs) {
+    let at = out.length;
+    while (at > 0 && cmpStr(out[at - 1], x) > 0) {
+      at -= 1;
+    }
+    out = out.slice(0, at).concat([x]).concat(out.slice(at, out.length));
+  }
+  return out;
+}
+
+function addUnique(xs: string[], x: string): string[] {
+  let out = xs;
+  for (const y of out) {
+    if (y == x) {
+      return out;
+    }
+  }
+  out.push(x);
+  return out;
+}
+
+export function moduleDeps(prog: LoadedProgram): ModDeps[] {
+  let mods: string[] = [];
+  for (const u of prog.units) {
+    if (u.module != "") {
+      mods = addUnique(mods, u.module);
+    }
+  }
+  mods = sortStrs(mods);
+  let out: ModDeps[] = [];
+  for (const m of mods) {
+    let imps: string[] = [];
+    for (const u of prog.units) {
+      if (u.module != m) {
+        continue;
+      }
+      for (const it of u.imports) {
+        match (it) {
+          ImportUnit(k) => {
+            const tm = prog.units[k].module;
+            if (tm != "" && tm != m) {
+              imps = addUnique(imps, tm);
+            }
+          },
+          ImportStd(_) => {}
+        }
+      }
+    }
+    let allowed: Option<string[]> = None;
+    match (prog.manifest) {
+      Some(mf) => {
+        const ri = ruleIndex(mf, m);
+        if (ri.isSome()) {
+          allowed = Some(mf.rules[ri.unwrap()].allowed);
+        }
+      },
+      None => {}
+    }
+    out.push(ModDeps { module: m, imports: sortStrs(imps), allowed: allowed });
+  }
+  return out;
+}
+
+function showList(xs: string[]): string {
+  let shown: string[] = [];
+  for (const x of xs) {
+    shown.push(displayModule(x));
+  }
+  return shown.join(", ");
+}
+
+// Compact text: one line per module, `module -> a, b [allowed: x, y]`.
+export function depsText(prog: LoadedProgram, deps: ModDeps[]): string {
+  let lines: string[] = [];
+  match (prog.manifest) {
+    Some(mf) => { lines.push("package " + mf.name + " " + mf.version); },
+    None => {}
+  }
+  for (const d of deps) {
+    let line = displayModule(d.module) + " -> " + (d.imports.length == 0 ? "(none)" : showList(d.imports));
+    match (d.allowed) {
+      Some(a) => { line += " [allowed: " + (a.length == 0 ? "none" : showList(a)) + "]"; },
+      None => {}
+    }
+    lines.push(line);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function strArr(xs: string[]): Json {
+  let js: Json[] = [];
+  for (const x of xs) {
+    js.push(JStr(x));
+  }
+  return JArr(js);
+}
+
+export function depsJson(prog: LoadedProgram, deps: ModDeps[]): Json {
+  let mods: Json[] = [];
+  for (const d of deps) {
+    let fs: JField[] = [jField("module", JStr(d.module)), jField("imports", strArr(d.imports))];
+    match (d.allowed) {
+      Some(a) => { fs.push(jField("allowed", strArr(a))); },
+      None => { fs.push(jField("allowed", JNull)); }
+    }
+    mods.push(JObj(fs));
+  }
+  let top: JField[] = [];
+  match (prog.manifest) {
+    Some(mf) => {
+      top.push(jField("package", JStr(mf.name)));
+      top.push(jField("version", JStr(mf.version)));
+    },
+    None => {}
+  }
+  top.push(jField("modules", JArr(mods)));
+  return JObj(top);
+}
+
+export function depsJsonText(prog: LoadedProgram, deps: ModDeps[]): string {
+  return stringifyJson(depsJson(prog, deps)) + "\n";
+}

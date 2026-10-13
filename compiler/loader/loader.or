@@ -13,6 +13,7 @@ import { readFile, exists } from "std:fs";
 import { ImportTarget, StdModule, Unit, LoadedProgram } from "./program";
 import { normalizePath, dirname, joinPath, relativeTo, isInside } from "./path";
 import { PreludeRoot, noPreludeRoots } from "./prelude";
+import { Manifest, ModuleRule, parseManifest, edgeError, findModuleCycle, displayModule } from "../package";
 
 export type LoadResult = { program: LoadedProgram; sm: SourceMap; };
 
@@ -146,6 +147,81 @@ function importOf(item: Item): Option<ImportDecl> {
   };
 }
 
+// ---- packages (orin.toml, spec 04) ----------------------------------------------------------
+
+// The manifest governing a load. `on` is false without an orin.toml; `src` is the src root (the
+// entry file's directory when there is no manifest), against which module ids are computed.
+type PkgCtx = { on: bool; m: Manifest; src: string; };
+
+// Module id of file `p`: the directory (relative to `src`, "." for `src` itself) of the nearest
+// enclosing directory that contains a `module.or`; "" for prelude units and files outside `src`.
+function modOf(ov: SourceFile[], src: string, p: string): string {
+  if (p.startsWith("$") || !isInside(src, p)) {
+    return "";
+  }
+  let d = dirname(p);
+  while (d != src && isInside(src, d)) {
+    if (existsIn(ov, joinPath(d, "module.or"))) {
+      return relativeTo(src, d);
+    }
+    const nd = dirname(d);
+    if (nd == d) {
+      break;
+    }
+    d = nd;
+  }
+  return ".";
+}
+
+// The orin.toml governing `entry`: `entry/orin.toml` when `entry` is a package directory,
+// otherwise the nearest one in an ancestor directory of the entry file.
+function findManifest(ov: SourceFile[], entry: string): Option<string> {
+  const inDir = joinPath(entry, "orin.toml");
+  if (existsIn(ov, inDir)) {
+    return Some(inDir);
+  }
+  let d = dirname(entry);
+  while (true) {
+    const c = joinPath(d, "orin.toml");
+    if (existsIn(ov, c)) {
+      return Some(c);
+    }
+    const nd = dirname(d);
+    if (nd == d) {
+      break;
+    }
+    d = nd;
+  }
+  return None;
+}
+
+function unknownModuleDiag(sp: Span, what: string, mod: string, src: string): Diagnostic {
+  return diag("E0502", span(0, sp.start, sp.end), "unknown module `" + mod + "` in " + what
+    + ": no `" + (mod == "." ? "" : mod + "/") + "module.or` under the src root `" + src + "`");
+}
+
+function moduleExists(ov: SourceFile[], src: string, mod: string): bool {
+  return mod == "." || existsIn(ov, joinPath(src, mod + "/module.or"));
+}
+
+// E0502 for every module name in the manifest that has no `module.or` (manifest is file 0).
+function unknownModules(ov: SourceFile[], m: Manifest, src: string): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const r of m.rules) {
+    if (!moduleExists(ov, src, r.module)) {
+      out.push(unknownModuleDiag(r.span, "[modules." + r.module + "]", r.module, src));
+    }
+    let i: usize = 0;
+    while (i < r.allowed.length) {
+      if (!moduleExists(ov, src, r.allowed[i])) {
+        out.push(unknownModuleDiag(r.allowedSpans[i], "allowed_dependencies of [modules." + r.module + "]", r.allowed[i], src));
+      }
+      i += 1;
+    }
+  }
+  return out;
+}
+
 // Loads the program rooted at `entryPath`. File contents come from `overlay` (unsaved editor
 // buffers, spec 18 §2) when a path matches (compared after `normalizePath`), otherwise from
 // disk; an overlay file also counts as existing for import resolution.
@@ -158,12 +234,45 @@ export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadO
 // first in `units` (before the entry's own dependencies) and are checked, lowered and emitted
 // with the program. (The entry file keeps file id 0; prelude files get the next ids.)
 export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: PreludeRoot[]): LoadOutcome {
-  const entry = normalizePath(entryPath);
+  let entry = normalizePath(entryPath);
+  let entryDisp = entryPath;
   let ov = normalizeOverlay(overlay);
   for (const r of roots) {
     ov = ov.concat(normalizeOverlay(r.files));
   }
+  // Package manifest: `entryPath` may be a package directory, or a file inside one.
+  const noRules: ModuleRule[] = [];
+  let pk = PkgCtx { on: false, m: Manifest { file: 0, name: "", version: "", entry: "", rules: noRules }, src: dirname(entry) };
+  const tp = findManifest(ov, entry);
+  if (tp.isSome()) {
+    const tomlPath = tp.unwrap();
+    const rt = readIn(ov, tomlPath);
+    if (rt.isErr()) {
+      return failOut([SourceFile { path: tomlPath, text: "" }],
+        diag("E0301", span(0, 0, 0), "cannot read `" + tomlPath + "`: " + rt.unwrapErr()));
+    }
+    const tfiles: SourceFile[] = [SourceFile { path: tomlPath, text: rt.unwrap() }];
+    const mr = parseManifest(0, rt.unwrap());
+    if (mr.isErr()) {
+      return failOut(tfiles, mr.unwrapErr());
+    }
+    const m = mr.unwrap();
+    const mentry = joinPath(dirname(tomlPath), m.entry);
+    const src = dirname(mentry);
+    const ud = unknownModules(ov, m, src);
+    if (ud.length > 0) {
+      return LoadOutcome { sm: SourceMap { files: tfiles }, program: None, diags: ud };
+    }
+    if (joinPath(entry, "orin.toml") == tomlPath) {
+      entry = mentry;
+      entryDisp = mentry;
+    }
+    pk = PkgCtx { on: true, m: m, src: src };
+  }
   const base = dirname(entry);
+  let edgeFrom: string[] = [];
+  let edgeTo: string[] = [];
+  let edgeSpan: Span[] = [];
   let files: SourceFile[] = [];
   let nodePaths: string[] = [];   // node id == index into `files`
   let nodeState: int[] = [];      // 1 = in progress, 2 = done
@@ -186,7 +295,7 @@ export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: P
   // File waiting to be opened (the entry first, then each newly discovered import).
   let pending = true;
   let pendPath = entry;
-  let pendDisp = entryPath;
+  let pendDisp = entryDisp;
   let pendSpan = span(0, 0, 0);
 
   while (true) {
@@ -239,6 +348,7 @@ export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: P
         file: curNode,
         path: nodePaths[curNode],
         name: relName(base, nodePaths[curNode]),
+        module: modOf(ov, pk.src, nodePaths[curNode]),
         ast: curAst,
         imports: cur
       });
@@ -288,6 +398,19 @@ export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: P
       curItem += 1;
       continue;
     }
+    if (pk.on) {
+      const fm = modOf(ov, pk.src, importer);
+      const tm = modOf(ov, pk.src, res.path);
+      if (fm != "" && tm != "" && fm != tm) {
+        const ee = edgeError(pk.m, fm, tm);
+        if (ee.isSome()) {
+          return failOut(files, diag("E0501", decl.pathSpan, ee.unwrap()));
+        }
+        edgeFrom.push(fm);
+        edgeTo.push(tm);
+        edgeSpan.push(decl.pathSpan);
+      }
+    }
     const found = findNode(nodePaths, res.path);
     if (found.isNone()) {
       pending = true;
@@ -322,10 +445,29 @@ export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: P
     return failOut(files, diag("E0303", decl.pathSpan, "import cycle: " + names.join(" -> ")));
   }
 
+  if (pk.on) {
+    const cyc = findModuleCycle(edgeFrom, edgeTo);
+    if (cyc.length > 0) {
+      let shown: string[] = [];
+      for (const c of cyc) {
+        shown.push(displayModule(c));
+      }
+      // Reported at the import that closes the cycle (the last edge back to cyc[0]).
+      let at: usize = 0;
+      let k: usize = 0;
+      while (k < edgeFrom.length) {
+        if (edgeFrom[k] == cyc[cyc.length - 2] && edgeTo[k] == cyc[cyc.length - 1]) {
+          at = k;
+        }
+        k += 1;
+      }
+      return failOut(files, diag("E0303", edgeSpan[at], "module import cycle: " + shown.join(" -> ")));
+    }
+  }
   const none: Diagnostic[] = [];
   return LoadOutcome {
     sm: SourceMap { files: files },
-    program: Some(LoadedProgram { units: units, entry: units.length - 1 }),
+    program: Some(LoadedProgram { units: units, entry: units.length - 1, manifest: pk.on ? Some(pk.m) : None }),
     diags: none
   };
 }
