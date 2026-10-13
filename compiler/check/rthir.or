@@ -250,6 +250,13 @@ function isLiteral(e: HExpr): bool {
   };
 }
 
+function isFunctionValue(e: HExpr): bool {
+  return match (e.ty) {
+    TyFn(_, _) => true,
+    _ => false
+  };
+}
+
 function hasLabel(seen: string[], l: string): bool {
   for (const s of seen) {
     if (s == l) {
@@ -259,10 +266,38 @@ function hasLabel(seen: string[], l: string): bool {
   return false;
 }
 
-// `    label = value\n`, unless `e` is a literal or its label was already printed.
+// True when evaluating parts of `e` may be skipped (a conditional, `match`, `&&`, `||`).
+function hasBranch(e: HExpr): bool {
+  const here = match (e.kind) {
+    XCond(_, _, _) => true,
+    XMatch(_, _) => true,
+    XBinary(op, _, _) => match (op) {
+      OpAnd => true,
+      OpOr => true,
+      _ => false
+    },
+    _ => false
+  };
+  if (here) {
+    return true;
+  }
+  for (const k of kids(e)) {
+    if (hasBranch(k)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function termLine(c: Ctx, label: string, e: HExpr): HExpr {
+  return cat(cat(strE("    " + label + " = ", e.span), valueE(c, e)), strE("\n", e.span));
+}
+
+// `    label = value\n`, unless `e` is a literal or its label was already printed; then the `old(..)` values
+// inside `e` (evaluated with `e`, so evaluating them again is as safe as the clause was).
 function operand(c: Ctx, e: HExpr, olds: string, seen0: string[]): Rep {
   const none = strE("", e.span);
-  if (isLiteral(e)) {
+  if (isLiteral(e) || isFunctionValue(e)) {
     return Rep { e: none, seen: seen0 };
   }
   const label = labelOf(c, e, olds);
@@ -271,8 +306,22 @@ function operand(c: Ctx, e: HExpr, olds: string, seen0: string[]): Rep {
   }
   let seen = seen0;
   seen.push(label);
-  const line = cat(cat(strE("    " + label + " = ", e.span), valueE(c, e)), strE("\n", e.span));
-  return Rep { e: line, seen: seen };
+  let acc = termLine(c, label, e);
+  if (olds != "") {
+    for (const x of findOlds(e, olds, [])) {
+      const l2 = labelOf(c, x, olds);
+      if (hasLabel(seen, l2)) {
+        continue;
+      }
+      seen.push(l2);
+      if (evalSafe(x) || !hasBranch(e)) {
+        acc = cat(acc, termLine(c, l2, x));
+      } else {
+        acc = cat(acc, strE("    " + l2 + " = <not shown>\n", x.span));
+      }
+    }
+  }
+  return Rep { e: acc, seen: seen };
 }
 
 function repOperands(c: Ctx, es: HExpr[], olds: string, seen0: string[]): Rep {
@@ -430,29 +479,6 @@ function evalSafe(e: HExpr): bool {
   return true;
 }
 
-// The lines for `old(..)` values not already shown as terms.
-function repOlds(c: Ctx, p: HExpr, olds: string, seen0: string[]): Rep {
-  let acc = strE("", p.span);
-  let seen = seen0;
-  if (olds == "") {
-    return Rep { e: acc, seen: seen };
-  }
-  const found = findOlds(p, olds, []);
-  for (const x of found) {
-    const label = labelOf(c, x, olds);
-    if (hasLabel(seen, label)) {
-      continue;
-    }
-    seen.push(label);
-    if (evalSafe(x)) {
-      acc = cat(acc, cat(cat(strE("    " + label + " = ", x.span), valueE(c, x)), strE("\n", x.span)));
-    } else {
-      acc = cat(acc, strE("    " + label + " = <not shown>\n", x.span));
-    }
-  }
-  return Rep { e: acc, seen: seen };
-}
-
 // `name = value, ..` of the parameters of the current function.
 function argsE(c: Ctx): HExpr {
   const f = c.fn;
@@ -495,8 +521,7 @@ function failStmt(c: Ctx, p: HExpr, args: HExpr[]): HStmt {
     detail = cat(cat(strE("  function: " + disp + "(", sp), argsE(c)), strE(")\n", sp));
   }
   const r1 = rep(c, p, olds, []);
-  const r2 = repOlds(c, p, olds, r1.seen);
-  const terms = cat(r1.e, r2.e);
+  const terms = r1.e;
   if (!isEmptyStr(terms)) {
     detail = cat(cat(detail, strE("  values:\n", sp)), terms);
   }
