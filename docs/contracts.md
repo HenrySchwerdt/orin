@@ -89,7 +89,13 @@ the parameters) or **UNKNOWN** (with a reason; never upgraded to VERIFIED). Exit
 Reported clauses: every `@Ensures`, the `@Requires` of every called function at each call site
 (`call-precondition`), and `@Decreases` (always UNKNOWN: termination is not checked). `@Rule` ids are
 attached to the results as `rules`. JSON: `{"results":[{"function","file","line","kind","clause",
-"rules","status","reason","counterexample"}],"summary":{"verified","refuted","unknown"}}`.
+"rules","status","reason","counterexample","assumptions"}],"assumptions":[{"id","text"}],
+"summary":{"verified","refuted","unknown"}}`.
+
+Every VERIFIED result names the model assumptions it depends on (ADR-0020 D1), listed once per
+report and referenced by id from each result: `A-INT` (no i64 overflow on returning paths),
+`A-DIV` (no division/remainder by zero on returning paths), `A-PARTIAL` (termination not proved).
+The text output prints the same list after the results.
 
 Supported fragment: functions whose parameters and result are `int` or `bool`; body of `const`/`let`
 of such types, assignments and `+=` etc. to locals, `if`/`else`, `return`, blocks; expressions over
