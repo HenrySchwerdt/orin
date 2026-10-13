@@ -82,6 +82,7 @@ suites; Stage 0 is not expected to pass `next`). `tools/diff_parsers.py` skips `
   borrowed parameters), `verify`, `cemit`, `llvm`. The array API prelude is `array/array.or`
   (prelude root `$array`, embedded via `tools/embed_prelude.py`). `compiler/` itself still uses no closures (Orin-B).
 
+* Fixed-width integers and template literals (ADR-0022): `syntax/lexer.or` (`KBigInt`, `KTpl*`, brace-depth stack), `ast.or` (`EBigInt`, `ETemplate`), `hir.or` (`TyIntK`, the integer kind helpers, `BInt*` built-ins), `check/ints.or` (type names, literal fitting, conversions, `wrapping*` etc.), `check/body.or` (`checkIntLit`, `checkTemplate`, `intMethodCall`), `lower` (`rangeCheck` after narrow arithmetic), `cemit` / `llvm` (the seven built-ins), runtime `orin_int_op` / `orin_int_chk` / `orin_parse_int_k`, `fmt/printer.or` (verbatim templates), `syntax/trivia.or` (comment scan skips templates). The compiler source itself uses none of it.
 * Floats and `Map<K, V>` (ADR-0018): `syntax/lexer.or` (`KFloat`), `EFloat`, HIR `TyFloat`/`TyF32`/`XFloat` and the `BFloat*` builtins, `check/` (literal typing, `methodSig`, `Map` hooks in `types.or`/`body.or`), MIR `MFloat`/`OFloat`, `lower` (f32 rounding), `verify`, `cemit`, `llvm`, runtime `orin_float_to_string` etc.; Map and std:math are Orin prelude code (`array/map.or`, `array/math.or`). Programs using floats link with `-lm`.
 
 ## Writing efficient Orin-B (important for Stage 1 authors)

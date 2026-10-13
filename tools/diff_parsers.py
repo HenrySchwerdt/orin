@@ -31,10 +31,16 @@ PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("te
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
                 os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or"),
                 # interfaces (ADR-0019) are syntax beyond Orin-B
-                os.path.join("tests", "fmt", "interfaces.in.or"), os.path.join("tests", "fmt", "interfaces.out.or")}
+                os.path.join("tests", "fmt", "interfaces.in.or"), os.path.join("tests", "fmt", "interfaces.out.or"),
+                # template literals and integer literals above i64 max (ADR-0022) are lexical errors (E0100) in Stage 0
+                os.path.join("tests", "fmt", "templates.in.or"), os.path.join("tests", "fmt", "templates.out.or"),
+                os.path.join("tests", "parse_edge", "ok_template_nested.or")}
 # Stage 1 accepts float literals (ADR-0018); these edge cases pin Stage 0's rejection only.
 FLOAT_SKIP = {"err0100_bad_float.or", "err0100_bad_float_in_expr.or", "err0100_bad_float_second_line.or",
-              "err0100_bad_int_exp.or"}
+              "err0100_bad_int_exp.or",
+              # Stage 1 accepts integer literals up to 2^64-1 (u64, ADR-0022); these two (2^63) pin Stage 0's rejection
+              # (err0100_bad_int_overflow_u64*.or, above 2^64-1, are rejected by both)
+              "err0100_bad_int_overflow.or", "err0100_bad_int_overflow_hex.or"}
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ERR = re.compile(r"^(?:.*?):(\d+):(\d+): error\[(E\d{4})\]")
 TIMEOUT = 30
