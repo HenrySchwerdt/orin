@@ -87,8 +87,8 @@ weaker algorithm is never acceptable for that reason. A simpler version may stay
 an executable specification, with a differential or property test against the fast one.
 
 A known language gap: there are no equality, ordering or hash constraints on type parameters
-(`T extends Eq/Ord/Hash`). This forces key-specialised sets and maps, so a constraints ADR comes
-before the next std layer.
+(`T extends Eq/Ord/Hash`). This forces key-specialised sets and maps. ADR-0034 adds those
+constraints before the std I/O freeze.
 
 ### 4. JSX
 
