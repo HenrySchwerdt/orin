@@ -32,7 +32,8 @@ _Updated: 2026-10-13_
 | Interfaces (ADR-0019) | done |
 | Integers, interpolation, annotations (spec 05), resources, capabilities (ADR-0020/0021) | not started |
 | Concurrency (ADR-0017), incremental analysis | not started |
-| OSIG / `orin graph` / `orin diff`, effects, lineage, `.orcert` (ADR-0020) | not started |
+| OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
+| Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
 
 ## Next milestones
