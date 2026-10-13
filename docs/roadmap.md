@@ -14,7 +14,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 2. Compiler rewrite under the contract and class standard, then diagnostics and CLI polish (2a).
    The refusal protocol (ADR-0029) is part of 2a.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
-   - bytes and UTF-8, collections, I/O
+   - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
    - `std:net`, `std:http`
    - `std:mcp`, JSX/`std:html`
 4. **Complete the Lean proofs:**
