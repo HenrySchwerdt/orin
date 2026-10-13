@@ -8,6 +8,8 @@
 //
 // This file is shared by the CLI (`orin test`) and the MCP `test` tool.
 
+import { FsGrant } from "std:fs";
+import { ProcessGrant } from "std:process";
 import { Diagnostic, SourceMap, render, isWarning } from "../diag";
 import { loadWithRoots, preludeRoots, isInside } from "../loader";
 import { SourceFile } from "../diag";
@@ -60,8 +62,8 @@ export function shq(s: string): string {
   return "'" + s.split("'").join("'\\''") + "'";
 }
 
-function readOr(path: string): string {
-  const r = readFile(path);
+function readOr(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
   if (r.isErr()) {
     return "";
   }
@@ -107,11 +109,11 @@ function failRun(sm: SourceMap, msg: string): TestRun {
   return TestRun { sm: sm, diags: [], warnings: [], error: msg, discovered: 0, results: [] };
 }
 
-function tempDir(): Option<string> {
+function tempDir(proc: ProcessGrant): Option<string> {
   let n: usize = 0;
   while (n < 500) {
     const d = "/tmp/orin-test-" + n.toString();
-    if (shellRun("mkdir -m 700 " + shq(d) + " 2>/dev/null") == 0) {
+    if (shellRun(proc, "mkdir -m 700 " + shq(d) + " 2>/dev/null") == 0) {
       return Some(d);
     }
     n += 1;
@@ -148,9 +150,9 @@ function matches(id: string, filter: string): bool {
   return filter.length == 0 || id.includes(filter);
 }
 
-export function runTests(o: TestOpts): TestRun {
+export function runTests(fs: FsGrant, proc: ProcessGrant, o: TestOpts): TestRun {
   const none: SourceFile[] = [];
-  const loaded = loadWithRoots(o.entry, none, preludeRoots());
+  const loaded = loadWithRoots(fs, o.entry, none, preludeRoots());
   if (loaded.diags.length > 0) {
     return TestRun { sm: loaded.sm, diags: loaded.diags, warnings: [], error: "", discovered: 0, results: [] };
   }
@@ -197,32 +199,32 @@ export function runTests(o: TestOpts): TestRun {
   let dir = o.outDir;
   let ownDir = false;
   if (dir.length == 0) {
-    const t = tempDir();
+    const t = tempDir(proc);
     if (t.isNone()) {
       return failRun(sm, "cannot create a temporary directory under /tmp (use --out-dir DIR)");
     }
     dir = t.unwrap();
     ownDir = true;
   } else {
-    shellRun("mkdir -p " + shq(dir));
+    shellRun(proc, "mkdir -p " + shq(dir));
   }
   const cfile = dir + "/tests.c";
   const exe = dir + "/tests";
-  const w = writeFile(cfile, c);
+  const w = writeFile(fs, cfile, c);
   if (w.isErr()) {
     return failRun(sm, "cannot write " + cfile + ": " + w.unwrapErr());
   }
   const rt = o.runtime;
-  if (!exists(rt + "/orin_runtime.c")) {
+  if (!exists(fs, rt + "/orin_runtime.c")) {
     return failRun(sm, "runtime not found at " + rt + " (pass --runtime <dir>; the packaged `orin` launcher does this)");
   }
   const log = dir + "/cc.log";
-  const cc = shellRun(o.cc + " -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " " + shq(rt + "/../platform/orin_platform.c")
+  const cc = shellRun(proc, o.cc + " -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " " + shq(rt + "/../platform/orin_platform.c")
     + " -lm -o " + shq(exe) + " > " + shq(log) + " 2>&1");
   if (cc != 0) {
-    const text = trunc(readOr(log), 2000);
+    const text = trunc(readOr(fs, log), 2000);
     if (ownDir && !o.keep) {
-      shellRun("rm -rf " + shq(dir));
+      shellRun(proc, "rm -rf " + shq(dir));
     }
     return failRun(sm, "the C compiler failed (`" + o.cc + "`, exit " + cc.toString() + "): " + text);
   }
@@ -232,16 +234,16 @@ export function runTests(o: TestOpts): TestRun {
       continue;
     }
     const base = dir + "/t" + t.index.toString();
-    const code = shellRun(runCommand(exe, t.index, base, o.timeout));
+    const code = shellRun(proc, runCommand(exe, t.index, base, o.timeout));
     const text = sm.files[t.file].text;
     results.push(TestResult {
       test: t, path: sm.files[t.file].path, line: lineCol(text, t.start, false), col: lineCol(text, t.start, true),
       pass: code == 0, exitCode: code, reason: reasonOf(code),
-      stdout: chomp(readOr(base + ".out")), stderr: chomp(readOr(base + ".err"))
+      stdout: chomp(readOr(fs, base + ".out")), stderr: chomp(readOr(fs, base + ".err"))
     });
   }
   if (ownDir && !o.keep) {
-    shellRun("rm -rf " + shq(dir));
+    shellRun(proc, "rm -rf " + shq(dir));
   }
   return TestRun { sm: sm, diags: [], warnings: warnings, error: "", discovered: tests.length, results: results };
 }

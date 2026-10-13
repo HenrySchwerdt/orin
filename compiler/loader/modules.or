@@ -4,18 +4,19 @@ import { SourceFile, Span, Diagnostic, diag, span } from "../diag";
 import { Manifest, parseManifest } from "../package";
 import { LoadOutcome, failedLoad } from "./program";
 import { Sources } from "./sources";
+import { FsGrant } from "std:fs";
 import { dirname, joinPath, relativeTo, isInside } from "./path";
 
 // Module id of file `p`: the directory (relative to the src root `root`, "." for `root` itself) of
 // the nearest enclosing directory that contains a `module.or`; "" for prelude units and files
 // outside `root`.
-export function moduleOf(src: Sources, root: string, p: string): string {
+export function moduleOf(fs: FsGrant, src: Sources, root: string, p: string): string {
   if (p.startsWith("$") || !isInside(root, p)) {
     return "";
   }
   let d = dirname(p);
   while (d != root && isInside(root, d)) {
-    if (src.exists(joinPath(d, "module.or"))) {
+    if (src.exists(fs, joinPath(d, "module.or"))) {
       return relativeTo(root, d);
     }
     const parent = dirname(d);
@@ -29,15 +30,15 @@ export function moduleOf(src: Sources, root: string, p: string): string {
 
 // The orin.toml governing `entry`: `entry/orin.toml` when `entry` is a package directory,
 // otherwise the nearest one in an ancestor directory of the entry file.
-export function findManifest(src: Sources, entry: string): Option<string> {
+export function findManifest(fs: FsGrant, src: Sources, entry: string): Option<string> {
   const inDir = joinPath(entry, "orin.toml");
-  if (src.exists(inDir)) {
+  if (src.exists(fs, inDir)) {
     return Some(inDir);
   }
   let d = dirname(entry);
   while (true) {
     const c = joinPath(d, "orin.toml");
-    if (src.exists(c)) {
+    if (src.exists(fs, c)) {
       return Some(c);
     }
     const parent = dirname(d);
@@ -57,20 +58,20 @@ function unknownModule(sp: Span, what: string, mod: string, root: string): Diagn
   );
 }
 
-function moduleExists(src: Sources, root: string, mod: string): bool {
-  return mod == "." || src.exists(joinPath(root, mod + "/module.or"));
+function moduleExists(fs: FsGrant, src: Sources, root: string, mod: string): bool {
+  return mod == "." || src.exists(fs, joinPath(root, mod + "/module.or"));
 }
 
 // E0502 for every module name in the manifest that has no `module.or` (the manifest is file 0).
-function unknownModules(src: Sources, m: Manifest, root: string): Diagnostic[] {
+function unknownModules(fs: FsGrant, src: Sources, m: Manifest, root: string): Diagnostic[] {
   let out: Diagnostic[] = [];
   for (const r of m.rules) {
-    if (!moduleExists(src, root, r.module)) {
+    if (!moduleExists(fs, src, root, r.module)) {
       out.push(unknownModule(r.span, `[modules.${r.module}]`, r.module, root));
     }
     let i: usize = 0;
     while (i < r.allowed.length) {
-      if (!moduleExists(src, root, r.allowed[i])) {
+      if (!moduleExists(fs, src, root, r.allowed[i])) {
         out.push(
           unknownModule(
             r.allowedSpans[i],
@@ -93,8 +94,8 @@ export function manifestEntry(tomlPath: string, m: Manifest): string {
 
 // Reads and validates the manifest; the error is a complete failed outcome (with the manifest as its
 // only file) so that the diagnostics can be rendered.
-export function readManifest(src: Sources, tomlPath: string): Result<Manifest, LoadOutcome> {
-  const rt = src.read(tomlPath);
+export function readManifest(fs: FsGrant, src: Sources, tomlPath: string): Result<Manifest, LoadOutcome> {
+  const rt = src.read(fs, tomlPath);
   if (rt.isErr()) {
     const unreadable = diag(
       "E0301",
@@ -109,7 +110,7 @@ export function readManifest(src: Sources, tomlPath: string): Result<Manifest, L
     return Err(failedLoad(files, [mr.unwrapErr()]));
   }
   const m = mr.unwrap();
-  const unknown = unknownModules(src, m, dirname(manifestEntry(tomlPath, m)));
+  const unknown = unknownModules(fs, src, m, dirname(manifestEntry(tomlPath, m)));
   if (unknown.length > 0) {
     return Err(failedLoad(files, unknown));
   }

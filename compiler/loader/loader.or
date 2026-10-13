@@ -14,6 +14,7 @@ import {
 import { normalizePath, dirname, joinPath } from "./path";
 import { PreludeRoot, noPreludeRoots } from "./prelude";
 import { Sources } from "./sources";
+import { FsGrant } from "std:fs";
 import { Resolved, resolveImport, unitName } from "./resolve";
 import { moduleOf, findManifest, readManifest, manifestEntry } from "./modules";
 
@@ -53,8 +54,8 @@ class Loader {
   }
 
   // Loads the entry file and everything it imports; the entry is the last unit.
-  run(entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
-    this.visit(entry, entryDisplay)?;
+  run(fs: FsGrant, entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
+    this.visit(fs, entry, entryDisplay)?;
     this.checkModuleCycles()?;
     return Ok(LoadedProgram {
       units: this.units,
@@ -65,8 +66,8 @@ class Loader {
 
   // Opens, parses and completes the unit of file `path` (`display` is how diagnostics name it);
   // returns its index in `units`.
-  private visit(path: string, display: string): Result<usize, Diagnostic> {
-    const text = this.src.read(path);
+  private visit(fs: FsGrant, path: string, display: string): Result<usize, Diagnostic> {
+    const text = this.src.read(fs, path);
     if (text.isErr()) {
       this.files.push(SourceFile { path: display, text: "" });
       return Err(
@@ -89,7 +90,7 @@ class Loader {
     for (const item of ast.items) {
       const decl = importOf(item);
       if (decl.isSome()) {
-        imports.push(this.importTarget(path, decl.unwrap())?);
+        imports.push(this.importTarget(fs, path, decl.unwrap())?);
       }
     }
     this.stack.pop();
@@ -98,7 +99,7 @@ class Loader {
       file: file,
       path: path,
       name: unitName(this.base, path),
-      module: moduleOf(this.src, this.srcRoot, path),
+      module: moduleOf(fs, this.src, this.srcRoot, path),
       ast: ast,
       imports: imports,
     });
@@ -116,12 +117,12 @@ class Loader {
         .map(r => IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp, span: sp }));
   }
 
-  private importTarget(importer: string, decl: ImportDecl): Result<ImportTarget, Diagnostic> {
-    const res = resolveImport(this.src, importer, decl.path, decl.pathSpan, this.base)?;
+  private importTarget(fs: FsGrant, importer: string, decl: ImportDecl): Result<ImportTarget, Diagnostic> {
+    const res = resolveImport(fs, this.src, importer, decl.path, decl.pathSpan, this.base)?;
     if (res.std.isSome()) {
       return Ok(ImportStd(res.std.unwrap()));
     }
-    this.recordModuleEdge(importer, res.path, decl.pathSpan)?;
+    this.recordModuleEdge(fs, importer, res.path, decl.pathSpan)?;
     const finished = this.done.get(res.path);
     if (finished.isSome()) {
       return Ok(ImportUnit(finished.unwrap()));
@@ -135,18 +136,18 @@ class Loader {
           .map(p => unitName(this.base, p));
       return Err(diag("E0303", decl.pathSpan, `import cycle: ${chain.join(" -> ")}`));
     }
-    return Ok(ImportUnit(this.visit(res.path, res.path)?));
+    return Ok(ImportUnit(this.visit(fs, res.path, res.path)?));
   }
 
   // In a package, an import between two different modules must be allowed by the manifest (E0501);
   // allowed edges are collected for the cycle check. Prelude units and files outside the src root
   // have no module ("").
-  private recordModuleEdge(importer: string, target: string, at: Span): Result<void, Diagnostic> {
+  private recordModuleEdge(fs: FsGrant, importer: string, target: string, at: Span): Result<void, Diagnostic> {
     if (this.manifest.isNone()) {
       return Ok();
     }
-    const fromModule = moduleOf(this.src, this.srcRoot, importer);
-    const toModule = moduleOf(this.src, this.srcRoot, target);
+    const fromModule = moduleOf(fs, this.src, this.srcRoot, importer);
+    const toModule = moduleOf(fs, this.src, this.srcRoot, target);
     if (fromModule != "" && toModule != "" && fromModule != toModule) {
       const forbidden = edgeError(this.manifest.unwrap(), fromModule, toModule);
       if (forbidden.isSome()) {
@@ -193,6 +194,7 @@ function allRenderable(sm: SourceMap, ds: Diagnostic[]): bool {
 @Ensures(result.program.isSome() ==> isWellFormed(result.program.unwrap(), result.sm))
 @Ensures(allRenderable(result.sm, result.diags))
 export function loadWithRoots(
+  fs: FsGrant,
   entryPath: string,
   overlay: SourceFile[],
   roots: PreludeRoot[],
@@ -202,9 +204,9 @@ export function loadWithRoots(
   let entryDisplay = entryPath;
   let srcRoot = dirname(entry);
   let manifest: Option<Manifest> = None;
-  const tomlPath = findManifest(src, entry);
+  const tomlPath = findManifest(fs, src, entry);
   if (tomlPath.isSome()) {
-    const read = readManifest(src, tomlPath.unwrap());
+    const read = readManifest(fs, src, tomlPath.unwrap());
     if (read.isErr()) {
       return read.unwrapErr();
     }
@@ -219,7 +221,7 @@ export function loadWithRoots(
     manifest = Some(m);
   }
   let loader = new Loader(src, roots, dirname(entry), srcRoot, manifest);
-  const r = loader.run(entry, entryDisplay);
+  const r = loader.run(fs, entry, entryDisplay);
   if (r.isErr()) {
     return failedLoad(loader.files, [r.unwrapErr()]);
   }
@@ -231,16 +233,16 @@ export function loadWithRoots(
 }
 
 // Like loadWithRoots with the roots every compilation has (the array API and the Orin std modules).
-export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
-  return loadWithRoots(entryPath, overlay, noPreludeRoots());
+export function loadWithOverlay(fs: FsGrant, entryPath: string, overlay: SourceFile[]): LoadOutcome {
+  return loadWithRoots(fs, entryPath, overlay, noPreludeRoots());
 }
 
-export function loadAll(entryPath: string): LoadOutcome {
-  return loadWithOverlay(entryPath, []);
+export function loadAll(fs: FsGrant, entryPath: string): LoadOutcome {
+  return loadWithOverlay(fs, entryPath, []);
 }
 
-export function load(entryPath: string): Result<LoadResult, Diagnostic[]> {
-  const o = loadAll(entryPath);
+export function load(fs: FsGrant, entryPath: string): Result<LoadResult, Diagnostic[]> {
+  const o = loadAll(fs, entryPath);
   return match (o.program) {
     Some(p) => Ok(LoadResult { program: p, sm: o.sm }),
     None => Err(o.diags),

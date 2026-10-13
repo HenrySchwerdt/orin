@@ -16,6 +16,8 @@
 // Results per clause: VERIFIED (solver: unsat), REFUTED (sat, with a counterexample for the
 // parameters) or UNKNOWN (solver unknown / timeout / unavailable, or outside the fragment).
 
+import { FsGrant } from "std:fs";
+import { ProcessGrant } from "std:process";
 import { SourceMap } from "../diag";
 import {
   Ident, FunctionDecl, TypeExpr, TNamed, UnaryOp, BinaryOp, AssignOp, Block, Stmt, Expr, StmtKind, ExprKind, ContractClause,
@@ -691,17 +693,17 @@ type Solved = { status: string; model: string; };
 
 // Runs the solver on `query` (SMT-LIB text without check-sat); status is `unsat`, `sat`, `unknown` or
 // `error` (solver missing or crashed).
-function solve(rt0: Rt, query: string): Result<Solved, string> {
+function solve(fs: FsGrant, proc: ProcessGrant, rt0: Rt, query: string): Result<Solved, string> {
   const base = "build/contracts-vc/q" + rt0.qn.toString();
-  const w = writeFile(base + ".smt2", prelude() + query + "(check-sat)\n(get-model)\n");
+  const w = writeFile(fs, base + ".smt2", prelude() + query + "(check-sat)\n(get-model)\n");
   if (w.isErr()) {
     return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
   }
-  const rc = shellRun(rt0.z3 + " -in -T:20 < " + base + ".smt2 > " + base + ".out 2>&1");
+  const rc = shellRun(proc, rt0.z3 + " -in -T:20 < " + base + ".smt2 > " + base + ".out 2>&1");
   if (rc != 0 && rc != 1) {
     return Err("solver `" + rt0.z3 + "` could not be run (exit status " + rc.toString() + ")");
   }
-  const o = readFile(base + ".out");
+  const o = readFile(fs, base + ".out");
   if (o.isErr()) {
     return Err("cannot read solver output");
   }
@@ -798,9 +800,9 @@ function allUnknown(rt0: Rt, f: FnInfo, reason: string): Rt {
 }
 
 // Result of one solver query for a clause.
-function report(rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: string): Rt {
+function report(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: string): Rt {
   let rt = rt0;
-  const s = solve(rt, query);
+  const s = solve(fs, proc, rt, query);
   rt.qn += 1;
   match (s) {
     Err(m) => { return pushRes(rt, f, kind, c, "UNKNOWN", m, []); },
@@ -816,7 +818,7 @@ function report(rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: stri
   }
 }
 
-function verifyFn(rt0: Rt, f: FnInfo): Rt {
+function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo): Rt {
   let rt = rt0;
   const d = f.decl;
   const enss = clausesOf(d, 1);
@@ -870,7 +872,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
   // Call-site preconditions.
   for (const o of g.obls) {
     const q = queryText(g, base, o.pc, o.goal);
-    const s = solve(rt, q);
+    const s = solve(fs, proc, rt, q);
     rt.qn += 1;
     let status = "UNKNOWN";
     let reason = "";
@@ -922,7 +924,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
     if (failure != "") {
       rt = pushRes(rt, f, "ensures", c, "UNKNOWN", failure, []);
     } else {
-      rt = report(rt, f, "ensures", c, queryText(g, base, [], andAll(parts)));
+      rt = report(fs, proc, rt, f, "ensures", c, queryText(g, base, [], andAll(parts)));
     }
   }
   return rt;
@@ -932,7 +934,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
 // Driver
 // ---------------------------------------------------------------------------
 
-export function verifyContracts(prog: LoadedProgram, sm: SourceMap, z3: string): Report {
+export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, z3: string): Report {
   let fns: FnInfo[] = [];
   for (const u of prog.units) {
     if (u.name.startsWith("$")) {
@@ -946,12 +948,12 @@ export function verifyContracts(prog: LoadedProgram, sm: SourceMap, z3: string):
       }
     }
   }
-  shellRun("mkdir -p build/contracts-vc");
+  shellRun(proc, "mkdir -p build/contracts-vc");
   let rt = Rt { fns: fns, z3: z3, qn: 0, out: [] };
   for (const f of fns) {
     // Functions without clauses are still analysed (their calls of contracted functions are proof
     // obligations); if they are outside the fragment nothing is reported for them.
-    rt = verifyFn(rt, f);
+    rt = verifyFn(fs, proc, rt, f);
   }
   return Report { results: rt.out };
 }

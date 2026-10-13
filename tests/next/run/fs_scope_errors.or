@@ -1,11 +1,13 @@
 // std:fs scope API: error paths. The scope returns Err when the file cannot be opened (the body is not run) and
 // when an operation on the file failed (wrong mode), and the file is closed on every path.
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
 import { withFile, useFile, withFiles, useFiles, Read, Write, File, FsError } from "std:fs";
 
 const OK_PATH: string = "build/tests/fs_scope_errors.txt";
 
-function firstLine(path: string): Result<string, FsError> {
-  const r = withFile(path, Read, f => f.readLine());
+function firstLine(fs: FsGrant, path: string): Result<string, FsError> {
+  const r = withFile(fs, path, Read, f => f.readLine());
   return match (r) {
     Ok(l) => Ok(l.unwrapOr("<empty>")),
     Err(e) => Err(e)
@@ -13,53 +15,56 @@ function firstLine(path: string): Result<string, FsError> {
 }
 
 // `?` works on the scope result like on any other Result.
-function twoLines(path: string): Result<string, FsError> {
-  const a = withFile(path, Read, f => f.readLine().unwrapOr("-"))?;
-  const b = withFile(path, Read, f => {
+function twoLines(fs: FsGrant, path: string): Result<string, FsError> {
+  const a = withFile(fs, path, Read, f => f.readLine().unwrapOr("-"))?;
+  const b = withFile(fs, path, Read, f => {
     f.readLine();
     return f.readLine().unwrapOr("-");
   })?;
   return Ok(a + "+" + b);
 }
 
-function main(): void {
-  useFile(OK_PATH, Write, f => { f.writeLine("one"); f.writeLine("two"); }).unwrap();
+function main(host: Host): void {
+  useFs(host, fs => { run(fs); });
+}
+function run(fs: FsGrant): void {
+  useFile(fs, OK_PATH, Write, f => { f.writeLine("one"); f.writeLine("two"); }).unwrap();
 
   // open failures: the body must not run
-  const e1 = withFile("build/tests/no_such_dir/x.txt", Read, f => { return 1; });
+  const e1 = withFile(fs, "build/tests/no_such_dir/x.txt", Read, f => { return 1; });
   console.log("missing dir: " + e1.isErr().toString() + " " + e1.unwrapErr());
-  const e2 = useFile("build/tests/definitely_missing.txt", Read, f => { console.log("BODY RAN"); });
+  const e2 = useFile(fs, "build/tests/definitely_missing.txt", Read, f => { console.log("BODY RAN"); });
   console.log("missing file: " + e2.unwrapErr());
-  const e3 = useFile("build/tests", Write, f => { console.log("BODY RAN"); });
+  const e3 = useFile(fs, "build/tests", Write, f => { console.log("BODY RAN"); });
   console.log("directory: " + e3.isErr().toString());
-  const e4 = withFiles(OK_PATH, Read, "build/tests/no_such_dir/y.txt", Write, (a, b) => { console.log("BODY RAN"); return 0; });
+  const e4 = withFiles(fs, OK_PATH, Read, "build/tests/no_such_dir/y.txt", Write, (a, b) => { console.log("BODY RAN"); return 0; });
   console.log("second file missing: " + e4.unwrapErr());
-  const e5 = useFiles("build/tests/definitely_missing.txt", Read, OK_PATH, Write, (a, b) => { console.log("BODY RAN"); });
+  const e5 = useFiles(fs, "build/tests/definitely_missing.txt", Read, OK_PATH, Write, (a, b) => { console.log("BODY RAN"); });
   console.log("first file missing: " + e5.unwrapErr());
   // (e4 failed after the first file was opened: that file was closed again, so it can be opened again)
-  console.log("still readable: " + firstLine(OK_PATH).unwrap());
+  console.log("still readable: " + firstLine(fs, OK_PATH).unwrap());
 
   // wrong mode: the failed operation is reported when the scope ends; the body sees EOF / nothing
-  const w = withFile(OK_PATH, Read, f => {
+  const w = withFile(fs, OK_PATH, Read, f => {
     f.write("nope");
     return 5;
   });
   console.log("write to a read-only file: " + w.unwrapErr());
-  const r = withFile(OK_PATH, Write, f => {
+  const r = withFile(fs, OK_PATH, Write, f => {
     const l = f.readLine();
     console.log("read from a write-only file: " + l.isNone().toString());
     return 6;
   });
   console.log("scope result: " + r.unwrapErr());
-  console.log("a Write scope truncates the file: " + (withFile(OK_PATH, Read, f => f.readAll()).unwrap() == "").toString());
+  console.log("a Write scope truncates the file: " + (withFile(fs, OK_PATH, Read, f => f.readAll()).unwrap() == "").toString());
 
   // `?` in a function using the scope
-  useFile(OK_PATH, Write, f => { f.writeLine("one"); f.writeLine("two"); }).unwrap();
-  console.log(twoLines(OK_PATH).unwrap());
-  console.log(twoLines("build/tests/definitely_missing.txt").isErr().toString());
+  useFile(fs, OK_PATH, Write, f => { f.writeLine("one"); f.writeLine("two"); }).unwrap();
+  console.log(twoLines(fs, OK_PATH).unwrap());
+  console.log(twoLines(fs, "build/tests/definitely_missing.txt").isErr().toString());
 
   // a body may return a Result of its own: the scope result nests it
-  const nested = withFile(OK_PATH, Read, (f: File): Result<string, string> => {
+  const nested = withFile(fs, OK_PATH, Read, (f: File): Result<string, string> => {
     const l = f.readLine();
     if (l.isNone()) {
       return Err("empty");
