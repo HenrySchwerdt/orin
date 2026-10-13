@@ -159,6 +159,33 @@ OSIG:
 
 The process explorer must make these separate physical operations, semantic messages, process steps and field dependencies inspectable, with distinct colors/labels for checked, possible, and unknown edges. Example fixture must include **negative cases**: same topic name in different clusters, false library-provided direction, raw socket bypass disguised as Kafka, dynamic topic, different payload schemas, and revoked/insufficient broker ACL.
 
+#### Feasibility: exact socket events versus application-level meaning
+
+This design is implementable **without protocol recognition** for primitive I/O: the only permitted socket read/write paths in a strict Orin build are L0 \`Net.Accept\`, \`Net.Connect\`, \`Stream.Read(handle, buffer)\` and \`Stream.Write(handle, bytes)\` intrinsics. These have **compiler-owned stable operation IDs**, an immutable INPUT/OUTPUT direction and attached sealed handle identity. The event's direction is defined by the primitive, not an arbitrary function or type named \`read\`/\`write\`. Every call must be effect-checked through indirect calls, generics and dynamically dispatched calls; UNKNOWN prevents certification under a fail-closed policy. The runtime separately checks handle scopes/identity and emits an observed I/O event when instrumentation is enabled.
+
+For an illustrative socket exchange:
+
+\`\`\`text
+connection = listener.accept()   -> CONTROL: accept connection, not application payload
+requestBytes = connection.read() -> INPUT: actual bytes read (possibly 0/partial/EOF)
+response = service(requestBytes) -> TRANSFORM: compiler-inferred value lineage
+connection.write(response)       -> OUTPUT: actual submitted bytes (possibly partial/error)
+\`\`\`
+
+A socket is **bidirectional**; a whole \`Socket\` or \`KafkaConsumer\` object must not receive a single immutable "direction" tag. Direction attaches to each primitive operation and, separately, to checked semantic payload events. Buffering, TCP framing, TLS, retries, short writes, error branches and concurrent use must remain explicit or summarized with sound uncertainty. OSIG static analysis establishes *may/possible* flows; successful actual sends/receives require runtime evidence. A \`Stream.Write\` call is not a proof that the remote peer received the bytes.
+
+For a plain custom HTTP server over TCP, the compiler can guarantee it saw (authorized) socket \`read\` and \`write\` effects and can track value dependencies through the handler. It **cannot automatically classify** arbitrary read bytes as an HTTP request, assign a specific route or establish application-message direction without a validated HTTP parser/dispatch adapter (or explicit unverified assumptions). This is a hard acceptance boundary, not a feature to handwave.
+
+**Native threat model:** C or LLVM output can otherwise call OS APIs directly. Compiler analysis alone cannot prevent a modified compiler or hostile native dependency from emitting raw syscalls. A *strict build check* rejects visible forbidden FFI/unsafe constructs; **actual prevention** against an adversarial native binary additionally requires OS-level isolation, privilege restrictions and controlled egress, or an execution target with enforced imported I/O functions (such as an appropriately configured WASI host). Do not describe static detection as unconditional OS-level enforcement.
+
+**Feasibility milestones / tests** (concrete implementation order):
+1. A minimal in-process TCP echo server: \`accept → read → transform → write\` emits 1 input and 1 output primitive event with IDs, spans, handle identity, partial-I/O/error semantics.
+2. A wrapper \`function receive(conn) { conn.read(...) }\` propagates the primitive input effect transitively; a wrapper lying about its direction cannot alter the event.
+3. A copied/forged handle, widened remote/port scope or socket call without an authorized handle fails compilation/runtime validation.
+4. A raw TCP library is represented as **unknown protocol** while retaining all primitive input/output edges; no declaration can certify it as HTTP or Kafka without validated mapping.
+5. Two services connected through a checked protocol resource, with field-level influence, appear as joined process **candidates** only when broker/route identity is sufficiently established.
+6. Run adversarial/native-bypass tests under the selected OS isolation policy before claiming hostile binaries cannot escape I/O permissions.
+
 ### D5 — Process discovery is a separate compiler analysis
 
 A process is a **view over a rooted control/data-flow slice**, not a newly minted capability. Candidate roots: bound listener/accept, HTTP handler dispatch, Kafka receive/callback, file source, scheduled event or declared host entry point. Candidate sinks: stream/write, Kafka publish, database mutation, HTTP response, file write, process execution. A callback/async message edge may establish a new process episode or a relation between processes, not an imaginary synchronous call.
