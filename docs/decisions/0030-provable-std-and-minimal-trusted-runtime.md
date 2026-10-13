@@ -1,6 +1,6 @@
 # ADR-0030: A provable standard library on a minimal trusted runtime
 
-Status: proposed (2026-10-13). Requested by the project owner: a std that is provable from the
+Status: accepted (2026-10-13). Requested by the project owner: a std that is provable from the
 ground up, capability-gated for every input/output so that no code can escape, a large std
 (sockets, HTTP, MCP, JSX), every part bounded by invariants, and as little C as possible.
 Related: spec 19 (runtime layers L0/L1/L2, R1–R4), ADR-0021/0027 (capabilities), ADR-0020 (status
