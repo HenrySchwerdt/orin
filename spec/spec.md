@@ -31,6 +31,11 @@ The files in this folder collectively form the design contract:
 | `11-performance-and-benchmarks.md` | Rust/Go performance objective and measurement protocol |
 | `12-open-questions-and-roadmap.md` | Unresolved tradeoffs, implementation phases, release gates |
 | `13-research-references.md` | Primary research and links; scope of evidence |
+| `14-business-logic-testing.md` | Business rule scenarios, contract-to-test mapping, coverage, mutation testing |
+| `15-contracts-invariants-and-formal-verification.md` | Optional function contracts, invariants, SMT proofs, proof regression |
+| `16-semantic-change-analysis.md` | Version-to-version business behavior diffs, impact and PO-readable changes |
+| `17-feature-first-review-and-trust.md` | Feature-first review, evidence trust, human sign-off and escalation gates |
+| `18-developer-tooling.md` | Shared semantic engine, `orin check`/`fmt`/`lsp`/`mcp`, editor integration |
 
 ## Decided principles
 
@@ -69,3 +74,7 @@ Freeze a small bootstrap subset first: functions, primitives, strings, arrays, r
 - **Verified release (aspirational):** Specified trust boundary and end-to-end safety argument, including backend/runtime validation, have been established.
 
 Read `12-open-questions-and-roadmap.md` before treating any illustrative code in this spec as accepted syntax.
+
+## Cross-cutting principle: business review (from former spec-index-addition.md)
+
+> Orin SHOULD enable product owners to review *what business behavior changes*, with proof and test evidence, rather than requiring them to read source code. A low-risk change MAY be eligible for feature-only human review under explicit enterprise policy; code, security and platform review remain mandatory where risk, missing proof or policy requires them. Neither tests nor proofs establish that a business specification is complete or correct.
