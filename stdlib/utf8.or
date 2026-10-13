@@ -1,0 +1,449 @@
+// std:utf8 -- validated UTF-8 decoding and encoding, code point iteration and `Utf8String`, a string with the
+// invariant "always valid UTF-8" (ADR-0030 §3, layer "bytes and text"). Pure safe Orin.
+//
+// Background. Orin strings are byte strings (`length`, `charCodeAt` and `substring` count bytes) that are
+// *expected* to hold UTF-8 but nothing in the language enforces it. This module turns the expectation into a
+// type: a `Utf8String` can only be built from bytes that passed `validate`, so every function that takes one
+// may rely on well-formedness (RFC 3629 / Unicode Table 3-7):
+//
+//   U+0000..U+007F    00..7F
+//   U+0080..U+07FF    C2..DF 80..BF
+//   U+0800..U+0FFF    E0 A0..BF 80..BF         (E0 80..9F is an overlong form)
+//   U+1000..U+CFFF    E1..EC 80..BF 80..BF
+//   U+D000..U+D7FF    ED 80..9F 80..BF         (ED A0..BF is a surrogate, U+D800..U+DFFF)
+//   U+E000..U+FFFF    EE..EF 80..BF 80..BF
+//   U+10000..U+3FFFF  F0 90..BF 80..BF 80..BF  (F0 80..8F is an overlong form)
+//   U+40000..U+FFFFF  F1..F3 80..BF 80..BF 80..BF
+//   U+100000..U+10FFFF F4 80..8F 80..BF 80..BF (F4 90..BF is above U+10FFFF)
+//
+// Rejected, with the error kind: a continuation byte (80..BF) as first byte, or F8..FF (`InvalidLead`); C0, C1
+// and the overlong forms above (`Overlong`); surrogates (`Surrogate`); F5..F7 and F4 90..BF (`TooLarge`);
+// a sequence cut off by the end of input (`TruncatedSequence`); a missing continuation byte
+// (`InvalidContinuation`). Noncharacters (U+FFFE, U+FFFF, U+FDD0..) are valid scalar values and accepted.
+//
+// Error position. `Utf8Error.position` is the byte offset where the first invalid sequence starts, i.e. the
+// length of the longest valid prefix, and `length` the number of bytes of the maximal invalid prefix at that
+// point (1..3; for a truncated sequence the bytes left). Everything before `position` is valid UTF-8.
+//
+// Contract standard (ADR-0030 §3): `Utf8String` and `CodePointCursor` carry invariants checked after every
+// public method (`orin test`, `--check-contracts`); the constructor of `Utf8String` *always* validates, so the
+// invariant also holds in builds without contract checking. Helpers used in contracts are loops, not closures.
+//
+// Complexity: n = byte length. `validate*`, `isValidUtf8`, `codePointCount`, `codePoints`, `concat`, `trySlice`,
+// `fromCodePoints` O(n); `encodeCodePoint`, `codePointAt`, `isCharBoundary`, `byteLength` O(1);
+// `CodePointCursor.next` O(1); constructing a `Utf8String` validates, O(n).
+
+import { Bytes, ByteBuilder, bytesFromString } from "std:bytes";
+
+// ---------------------------------------------------------------------------------------------- errors
+
+export type Utf8ErrorKind = InvalidLead | TruncatedSequence | InvalidContinuation | Overlong | Surrogate | TooLarge;
+
+// position: byte offset of the first invalid sequence (the length of the longest valid prefix).
+// length: bytes of the maximal invalid prefix there (1..3). kind: why it is invalid.
+export type Utf8Error = { position: usize; length: usize; kind: Utf8ErrorKind; };
+
+// utf8ErrorMessage(e): "invalid UTF-8 at byte 3: overlong encoding". O(1).
+@Ensures(result.length > 0)
+export function utf8ErrorMessage(e: Utf8Error): string {
+  const why = match (e.kind) {
+    InvalidLead => "invalid leading byte",
+    TruncatedSequence => "truncated sequence",
+    InvalidContinuation => "invalid continuation byte",
+    Overlong => "overlong encoding",
+    Surrogate => "encoded surrogate",
+    TooLarge => "code point above U+10FFFF"
+  };
+  return `invalid UTF-8 at byte ${e.position.toString()}: ${why}`;
+}
+
+// ------------------------------------------------------------------------------------ scalar values
+
+// isScalarValue(cp): cp is a Unicode scalar value: 0..0xD7FF or 0xE000..0x10FFFF. O(1).
+@Ensures(result ==> cp >= 0 && cp <= 1114111)
+@Ensures(cp >= 55296 && cp <= 57343 ==> !result)
+export function isScalarValue(cp: int): bool {
+  return (cp >= 0 && cp < 55296) || (cp >= 57344 && cp <= 1114111);
+}
+
+// utf8Len(cp): number of UTF-8 bytes of a scalar value (1..4). O(1).
+@Requires(isScalarValue(cp))
+@Ensures(result >= 1 && result <= 4)
+@Ensures((result == 1) == (cp < 128))
+@Ensures((result == 4) == (cp >= 65536))
+export function utf8Len(cp: int): int {
+  if (cp < 128) {
+    return 1;
+  }
+  if (cp < 2048) {
+    return 2;
+  }
+  if (cp < 65536) {
+    return 3;
+  }
+  return 4;
+}
+
+// encodeCodePoint(cp): the UTF-8 bytes of a scalar value as a string; None for surrogates, values above U+10FFFF
+// and negative values. O(1).
+@Ensures(result.isSome() == isScalarValue(cp))
+@Ensures(result.isSome() ==> result.unwrap().length.toInt() == utf8Len(cp))
+@Ensures(result.isSome() ==> isValidUtf8(result.unwrap()) && decodeAt(result.unwrap(), 0) == cp)
+export function encodeCodePoint(cp: int): Option<string> {
+  if (!isScalarValue(cp)) {
+    return None;
+  }
+  if (cp < 128) {
+    return Some(String.fromCharCode(cp));
+  }
+  if (cp < 2048) {
+    return Some(String.fromCharCode(192 + cp / 64) + String.fromCharCode(128 + cp % 64));
+  }
+  if (cp < 65536) {
+    return Some(String.fromCharCode(224 + cp / 4096) + String.fromCharCode(128 + (cp / 64) % 64)
+      + String.fromCharCode(128 + cp % 64));
+  }
+  return Some(String.fromCharCode(240 + cp / 262144) + String.fromCharCode(128 + (cp / 4096) % 64)
+    + String.fromCharCode(128 + (cp / 64) % 64) + String.fromCharCode(128 + cp % 64));
+}
+
+// ------------------------------------------------------------------------------------------ scanning
+
+function isCont(c: int): bool {
+  return c >= 128 && c <= 191;
+}
+
+// Result of looking at one sequence: `kind` is None for a valid sequence of `len` bytes, else the error.
+type Seq = { len: usize; kind: Option<Utf8ErrorKind>; };
+
+function okSeq(len: usize): Seq {
+  return Seq { len: len, kind: None };
+}
+
+function badSeq(len: usize, k: Utf8ErrorKind): Seq {
+  return Seq { len: len, kind: Some(k) };
+}
+
+// Looks at the sequence starting at byte i of s (i < s.length).
+@Requires(i < s.length)
+@Ensures(result.len >= 1 && result.len <= 4 && i + result.len <= s.length)
+function scanSeq(s: string, i: usize): Seq {
+  const n = s.length;
+  const c = s.charCodeAt(i);
+  if (c < 128) {
+    return okSeq(1);
+  }
+  if (c < 192) {
+    return badSeq(1, InvalidLead);
+  }
+  if (c < 194) {
+    return badSeq(1, Overlong);
+  }
+  if (c >= 245) {
+    if (c < 248) {
+      return badSeq(1, TooLarge);
+    }
+    return badSeq(1, InvalidLead);
+  }
+  let need: usize = 1;
+  let lo2 = 128;
+  let hi2 = 191;
+  if (c >= 240) {
+    need = 3;
+    if (c == 240) {
+      lo2 = 144;
+    }
+    if (c == 244) {
+      hi2 = 143;
+    }
+  } else if (c >= 224) {
+    need = 2;
+    if (c == 224) {
+      lo2 = 160;
+    }
+    if (c == 237) {
+      hi2 = 159;
+    }
+  }
+  if (i + 1 >= n) {
+    return badSeq(1, TruncatedSequence);
+  }
+  const b2 = s.charCodeAt(i + 1);
+  if (!isCont(b2)) {
+    return badSeq(1, InvalidContinuation);
+  }
+  if (b2 < lo2 || b2 > hi2) {
+    if (c == 237) {
+      return badSeq(1, Surrogate);
+    }
+    if (c == 244) {
+      return badSeq(1, TooLarge);
+    }
+    return badSeq(1, Overlong);
+  }
+  let k: usize = 2;
+  while (k <= need) {
+    if (i + k >= n) {
+      return badSeq(k, TruncatedSequence);
+    }
+    if (!isCont(s.charCodeAt(i + k))) {
+      return badSeq(k, InvalidContinuation);
+    }
+    k += 1;
+  }
+  return okSeq(need + 1);
+}
+
+// checkUtf8(s): Ok when the bytes of `s` are well-formed UTF-8, else the first error. O(n).
+@Ensures(result.isErr() ==> result.unwrapErr().position < s.length)
+@Ensures(result.isErr() ==> result.unwrapErr().position + result.unwrapErr().length <= s.length)
+@Ensures(s.length == 0 ==> result.isOk())
+export function checkUtf8(s: string): Result<void, Utf8Error> {
+  let i: usize = 0;
+  while (i < s.length) {
+    const q = scanSeq(s, i);
+    if (q.kind.isSome()) {
+      return Err(Utf8Error { position: i, length: q.len, kind: q.kind.unwrap() });
+    }
+    i += q.len;
+  }
+  return Ok();
+}
+
+// isValidUtf8(s): are the bytes of `s` well-formed UTF-8? Loop-based, usable in contracts. O(n).
+@Ensures(s.length == 0 ==> result)
+export function isValidUtf8(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    const q = scanSeq(s, i);
+    if (q.kind.isSome()) {
+      return false;
+    }
+    i += q.len;
+  }
+  return true;
+}
+
+// Number of code points of a string that is valid UTF-8 (not re-checked: that would make callers quadratic): the bytes that are not continuation bytes. O(n).
+@Ensures(result <= s.length)
+@Ensures((result == 0) == (s.length == 0))
+function countCodePoints(s: string): usize {
+  let n: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    if (!isCont(s.charCodeAt(i))) {
+      n += 1;
+    }
+    i += 1;
+  }
+  return n;
+}
+
+// The code point of the sequence starting at byte i of s, which must be valid UTF-8 (not re-checked, see above).
+@Requires(i < s.length && !isCont(s.charCodeAt(i)))
+@Ensures(isScalarValue(result))
+function decodeAt(s: string, i: usize): int {
+  const c = s.charCodeAt(i);
+  if (c < 128) {
+    return c;
+  }
+  if (c < 224) {
+    return (c - 192) * 64 + (s.charCodeAt(i + 1) - 128);
+  }
+  if (c < 240) {
+    return (c - 224) * 4096 + (s.charCodeAt(i + 1) - 128) * 64 + (s.charCodeAt(i + 2) - 128);
+  }
+  return (c - 240) * 262144 + (s.charCodeAt(i + 1) - 128) * 4096 + (s.charCodeAt(i + 2) - 128) * 64
+    + (s.charCodeAt(i + 3) - 128);
+}
+
+// ------------------------------------------------------------------------------------------ Utf8String
+
+// A string that is valid UTF-8 by construction. Value semantics like every class: a copy is independent and
+// there is no mutating method, so the invariant cannot be broken after construction.
+@Invariant(isValidUtf8(this.text))
+export class Utf8String {
+  private text: string;
+
+  // new Utf8String(text): wraps a string that is already valid UTF-8. Traps (unwrap of an Err) on invalid
+  // input, in every build: use `validateString` / `validate` to get a Result. O(n).
+  @Requires(isValidUtf8(text))
+  constructor(text: string) {
+    this.text = checked(text);
+  }
+
+  // asString(): the text (valid UTF-8). O(1).
+  @Ensures(isValidUtf8(result))
+  asString(): string {
+    return this.text;
+  }
+
+  // byteLength(): number of bytes. O(1).
+  @Ensures(result == this.text.length)
+  byteLength(): usize {
+    return this.text.length;
+  }
+
+  // isEmpty(): no bytes (and no code points). O(1).
+  @Ensures(result == (this.byteLength() == 0))
+  isEmpty(): bool {
+    return this.text.length == 0;
+  }
+
+  // toBytes(): the UTF-8 encoding as `Bytes`. O(n).
+  @Ensures(result.length() == this.text.length)
+  toBytes(): Bytes {
+    return bytesFromString(this.text);
+  }
+
+  // codePointCount(): number of code points. Between byteLength()/4 and byteLength(). O(n).
+  @Ensures(result <= this.text.length)
+  @Ensures(result * 4 >= this.text.length)
+  codePointCount(): usize {
+    return countCodePoints(this.text);
+  }
+
+  // isCharBoundary(i): i is 0, byteLength(), or the index of the first byte of a code point. O(1).
+  @Ensures(i > this.text.length ==> !result)
+  @Ensures(i == 0 || i == this.text.length ==> result)
+  isCharBoundary(i: usize): bool {
+    if (i > this.text.length) {
+      return false;
+    }
+    if (i == this.text.length) {
+      return true;
+    }
+    return !isCont(this.text.charCodeAt(i));
+  }
+
+  // codePointAt(i): the code point starting at byte i; None unless i is a boundary before the end. O(1).
+  @Ensures(result.isSome() == (i < this.text.length && this.isCharBoundary(i)))
+  @Ensures(result.isSome() ==> isScalarValue(result.unwrap()))
+  codePointAt(i: usize): Option<int> {
+    if (i >= this.text.length || isCont(this.text.charCodeAt(i))) {
+      return None;
+    }
+    return Some(decodeAt(this.text, i));
+  }
+
+  // codePoints(): all code points in order. O(n).
+  @Ensures(result.length == this.codePointCount())
+  codePoints(): int[] {
+    let out: int[] = [];
+    let i: usize = 0;
+    while (i < this.text.length) {
+      const c = decodeAt(this.text, i);
+      out.push(c);
+      i += utf8Len(c).toUsize();
+    }
+    return out;
+  }
+
+  // concat(other): this followed by other; concatenation of valid UTF-8 is valid. O(n + m).
+  @Ensures(result.byteLength() == this.text.length + other.byteLength())
+  @Ensures(result.codePointCount() == this.codePointCount() + other.codePointCount())
+  concat(other: Utf8String): Utf8String {
+    return new Utf8String(this.text + other.asString());
+  }
+
+  // trySlice(lo, hi): the bytes [lo, hi) as a Utf8String; None unless lo <= hi <= byteLength() and both ends
+  // are code point boundaries (so the result is valid by construction). O(hi - lo).
+  @Ensures(result.isSome() == (lo <= hi && this.isCharBoundary(lo) && this.isCharBoundary(hi)))
+  @Ensures(result.isSome() ==> result.unwrap().byteLength() == hi - lo)
+  trySlice(lo: usize, hi: usize): Option<Utf8String> {
+    if (lo > hi || !this.isCharBoundary(lo) || !this.isCharBoundary(hi)) {
+      return None;
+    }
+    return Some(new Utf8String(this.text.substring(lo, hi)));
+  }
+}
+
+// Returns s when it is valid UTF-8 and traps otherwise (the guard of the `Utf8String` constructor).
+@Requires(isValidUtf8(s))
+@Ensures(result == s)
+function checked(s: string): string {
+  checkUtf8(s).unwrap();
+  return s;
+}
+
+// validateString(s): `s` as a Utf8String, or the first error. O(n).
+@Ensures(result.isOk() == isValidUtf8(s))
+@Ensures(result.isOk() ==> result.unwrap().asString() == s)
+@Ensures(result.isErr() ==> result.unwrapErr().position < s.length)
+export function validateString(s: string): Result<Utf8String, Utf8Error> {
+  const r = checkUtf8(s);
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  return Ok(new Utf8String(s));
+}
+
+// validate(b): decodes bytes to text, rejecting overlong forms, surrogates and values above U+10FFFF, with the
+// error position. O(n).
+@Ensures(result.isOk() ==> result.unwrap().byteLength() == b.length())
+@Ensures(result.isErr() ==> result.unwrapErr().position < b.length())
+export function validate(b: Bytes): Result<Utf8String, Utf8Error> {
+  return validateString(b.toRawString());
+}
+
+// encode(s): the UTF-8 bytes of a Utf8String. O(n).
+@Ensures(result.length() == s.byteLength())
+export function encode(s: Utf8String): Bytes {
+  return s.toBytes();
+}
+
+// fromCodePoints(cps): the string made of the code points; None if any is not a scalar value. O(n).
+@Ensures(result.isSome() ==> result.unwrap().codePointCount() == cps.length)
+@Ensures(cps.length == 0 ==> result.isSome() && result.unwrap().isEmpty())
+export function fromCodePoints(cps: int[]): Option<Utf8String> {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < cps.length) {
+    const e = encodeCodePoint(cps[i]);
+    if (e.isNone()) {
+      return None;
+    }
+    parts.push(e.unwrap());
+    i += 1;
+  }
+  return Some(new Utf8String(parts.join("")));
+}
+
+// --------------------------------------------------------------------------------------------- cursor
+
+// Iterates the code points of a Utf8String. The cursor always sits on a code point boundary.
+@Invariant(this.pos <= this.src.byteLength() && this.src.isCharBoundary(this.pos))
+export class CodePointCursor {
+  private src: Utf8String;
+  private pos: usize = 0;
+
+  constructor(src: Utf8String) {
+    this.src = src;
+  }
+
+  // position(): byte offset of the next code point. O(1).
+  @Ensures(result <= this.src.byteLength())
+  position(): usize {
+    return this.pos;
+  }
+
+  // hasNext(): a code point is left. O(1).
+  @Ensures(result == (this.pos < this.src.byteLength()))
+  hasNext(): bool {
+    return this.pos < this.src.byteLength();
+  }
+
+  // next(): the next code point and advance past it; None at the end. O(1).
+  @Ensures(result.isSome() == old(this.hasNext()))
+  @Ensures(result.isSome() ==> isScalarValue(result.unwrap()))
+  @Ensures(result.isSome() ==> this.position() == old(this.position()) + utf8Len(result.unwrap()).toUsize())
+  @Ensures(result.isNone() ==> this.position() == old(this.position()))
+  next(): Option<int> {
+    const c = this.src.codePointAt(this.pos);
+    if (c.isNone()) {
+      return None;
+    }
+    this.pos += utf8Len(c.unwrap()).toUsize();
+    return c;
+  }
+}
