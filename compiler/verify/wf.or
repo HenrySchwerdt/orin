@@ -1,0 +1,267 @@
+// Well-formedness of MIR (docs/mir.md "Execution model"): index ranges and operand classes. The
+// ownership rules in rules.or assume every function passed this check, so they never index out
+// of range. Each check returns an error message, or "" when the item is well-formed.
+
+import { MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase } from "../mir";
+import { UnOp, BinOp } from "../hir";
+
+// Operand/local classes.
+export const CInt: int = 0;
+export const CUsize: int = 1;
+export const CBool: int = 2;
+export const CRef: int = 3;
+export const CVoid: int = 4;
+
+export function tyClass(t: MType): int {
+  return match (t) {
+    MInt => 0,
+    MUsize => 1,
+    MBool => 2,
+    MRef => 3,
+    MVoid => 4
+  };
+}
+
+// Class of a local; callers have checked the index.
+export function localClass(f: MFunction, l: usize): int {
+  return tyClass(f.locals[l].ty);
+}
+
+// Class of a well-formed operand.
+export function opClass(f: MFunction, o: Operand): int {
+  return match (o) {
+    OLocal(l) => localClass(f, l),
+    OInt(_) => 0,
+    OUsize(_) => 1,
+    OBool(_) => 2,
+    OStr(_) => 3
+  };
+}
+
+function opOk(p: MProgram, f: MFunction, o: Operand): bool {
+  return match (o) {
+    OLocal(l) => l < f.locals.length,
+    OInt(_) => true,
+    OUsize(n) => n >= 0,
+    OBool(_) => true,
+    OStr(i) => i < p.strings.length
+  };
+}
+
+function isLocal(o: Operand, l: usize): bool {
+  return match (o) {
+    OLocal(m) => m == l,
+    _ => false
+  };
+}
+
+function opsOk(p: MProgram, f: MFunction, os: Operand[]): bool {
+  for (const o of os) {
+    if (!opOk(p, f, o)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// local `l` is in range and has class `c`
+function isCls(f: MFunction, l: usize, c: int): bool {
+  return l < f.locals.length && localClass(f, l) == c;
+}
+
+// operand is well-formed and has class `c`
+function opIs(p: MProgram, f: MFunction, o: Operand, c: int): bool {
+  return opOk(p, f, o) && opClass(f, o) == c;
+}
+
+function constsOk(p: MProgram, f: MFunction, os: Operand[], isRef: bool): bool {
+  for (const o of os) {
+    if (!opOk(p, f, o) || (opClass(f, o) == CRef) != isRef) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Operand that is a *local* of class ref (OStr is not an object that can be indexed/mutated).
+function refLocalOp(f: MFunction, o: Operand): bool {
+  return match (o) {
+    OLocal(l) => isCls(f, l, CRef),
+    _ => false
+  };
+}
+
+function binOk(f: MFunction, op: BinOp, d: usize, a: Operand, b: Operand): bool {
+  const ca = opClass(f, a);
+  const cb = opClass(f, b);
+  const cd = localClass(f, d);
+  return match (op) {
+    OpAdd => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
+    OpSub => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
+    OpMul => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
+    OpDiv => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
+    OpRem => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
+    OpEq => ca == cb && cd == CBool,
+    OpNe => ca == cb && cd == CBool,
+    OpLt => ca == cb && (ca == CInt || ca == CUsize) && cd == CBool,
+    OpLe => ca == cb && (ca == CInt || ca == CUsize) && cd == CBool,
+    OpGt => ca == cb && (ca == CInt || ca == CUsize) && cd == CBool,
+    OpGe => ca == cb && (ca == CInt || ca == CUsize) && cd == CBool,
+    OpAnd => ca == CBool && cb == CBool && cd == CBool,
+    OpOr => ca == CBool && cb == CBool && cd == CBool
+  };
+}
+
+function unOk(f: MFunction, op: UnOp, d: usize, a: Operand): bool {
+  const c = match (op) {
+    UnNot => CBool,
+    UnNeg => CInt
+  };
+  return opClass(f, a) == c && localClass(f, d) == c;
+}
+
+function callMsg(p: MProgram, f: MFunction, dst: Option<usize>, fi: usize, args: Operand[]): string {
+  if (fi >= p.functions.length) {
+    return "ICall: function index out of range";
+  }
+  const g = p.functions[fi];
+  if (args.length != g.paramCount) {
+    return "ICall: wrong number of arguments for " + g.name;
+  }
+  if (!opsOk(p, f, args)) {
+    return "ICall: bad operand";
+  }
+  let i: usize = 0;
+  while (i < args.length) {
+    if (opClass(f, args[i]) != localClass(g, i)) {
+      return "ICall: argument " + i.toString() + " has the wrong class";
+    }
+    i += 1;
+  }
+  const rc = tyClass(g.ret);
+  return match (dst) {
+    None => "",
+    Some(d) => {
+      if (d >= f.locals.length) {
+        return "ICall: destination out of range";
+      }
+      if (rc == CVoid || localClass(f, d) != rc) {
+        return "ICall: destination class does not match the callee's return type";
+      }
+      return "";
+    }
+  };
+}
+
+function optDstOk(f: MFunction, dst: Option<usize>): bool {
+  return match (dst) {
+    None => true,
+    Some(d) => d < f.locals.length
+  };
+}
+
+// Both locals in range and of class ref, and distinct.
+function refPair(f: MFunction, a: usize, b: usize): bool {
+  return isCls(f, a, CRef) && isCls(f, b, CRef) && a != b;
+}
+
+// `v` (a consumed/stored operand) must be well-formed and not the object being written.
+function valueOk(p: MProgram, f: MFunction, x: usize, v: Operand): bool {
+  return opOk(p, f, v) && !isLocal(v, x);
+}
+
+export function wfInstr(p: MProgram, f: MFunction, ins: Instr): string {
+  return match (ins) {
+    ICopy(d, o) => {
+      if (d >= f.locals.length || !opOk(p, f, o)) { return "ICopy: bad local or operand"; }
+      if (opClass(f, o) != localClass(f, d)) { return "ICopy: operand and destination classes differ"; }
+      if (localClass(f, d) == CRef && !isStr(o)) { return "ICopy of a reference local (use IMove/IDup/IBorrow)"; }
+      return "";
+    },
+    IMove(d, s) => refPair(f, d, s) ? "" : "IMove: needs two distinct reference locals",
+    IBorrow(d, s) => refPair(f, d, s) ? "" : "IBorrow: needs two distinct reference locals",
+    IDup(d, o) => (isCls(f, d, CRef) && opIs(p, f, o, CRef)) ? "" : "IDup: needs a reference destination and operand",
+    IRelease(x) => isCls(f, x, CRef) ? "" : "IRelease: needs a reference local",
+    IUnary(d, op, o) => (d < f.locals.length && opOk(p, f, o) && unOk(f, op, d, o)) ? "" : "IUnary: operand class mismatch",
+    IBinary(d, op, a, b) => {
+      if (d < f.locals.length && opOk(p, f, a) && opOk(p, f, b) && binOk(f, op, d, a, b)) { return ""; }
+      return "IBinary: operand class mismatch";
+    },
+    ICall(dst, fi, args) => callMsg(p, f, dst, fi, args),
+    IBuiltin(dst, _, args) => (optDstOk(f, dst) && opsOk(p, f, args)) ? "" : "IBuiltin: bad local or operand",
+    IStrAppend(x, y) => {
+      if (!isCls(f, x, CRef) || !opIs(p, f, y, CRef)) { return "IStrAppend: needs reference operands"; }
+      return isLocal(y, x) ? "IStrAppend: appending a string to itself" : "";
+    },
+    IStructNew(d, _, slots) => (isCls(f, d, CRef) && opsOk(p, f, slots)) ? "" : "IStructNew: bad destination or slot operand",
+    INullary(d, _) => isCls(f, d, CRef) ? "" : "INullary: destination must be a reference local",
+    ITag(d, o) => (isCls(f, d, CInt) && opIs(p, f, o, CRef)) ? "" : "ITag: needs an int destination and a reference operand",
+    IGetField(d, o, _) => (d < f.locals.length && refLocalOp(f, o)) ? "" : "IGetField: bad destination or object",
+    ISetField(x, _, v) => (isCls(f, x, CRef) && valueOk(p, f, x, v)) ? "" : "ISetField: bad object or value",
+    ITakeField(d, x, _) => refPair(f, d, x) ? "" : "ITakeField: needs two distinct reference locals",
+    IPutField(x, _, s) => refPair(f, x, s) ? "" : "IPutField: needs two distinct reference locals",
+    IMakeUnique(x) => isCls(f, x, CRef) ? "" : "IMakeUnique: needs a reference local",
+    IArrayNew(d, isRef, elems) => (isCls(f, d, CRef) && constsOk(p, f, elems, isRef)) ? "" : "IArrayNew: bad destination or element class",
+    IArrayGet(d, a, i) => (d < f.locals.length && refLocalOp(f, a) && opIs(p, f, i, CUsize)) ? "" : "IArrayGet: bad destination, array or index",
+    IArraySet(x, i, v) => (isCls(f, x, CRef) && opIs(p, f, i, CUsize) && valueOk(p, f, x, v)) ? "" : "IArraySet: bad array, index or value",
+    IArrayTake(d, x, i) => (refPair(f, d, x) && opIs(p, f, i, CUsize)) ? "" : "IArrayTake: bad destination, array or index",
+    IArrayPut(x, i, s) => (refPair(f, x, s) && opIs(p, f, i, CUsize)) ? "" : "IArrayPut: bad array, index or source",
+    IArrayPush(x, v) => (isCls(f, x, CRef) && valueOk(p, f, x, v)) ? "" : "IArrayPush: bad array or value",
+    IArrayPop(d, x) => refPair(f, d, x) ? "" : "IArrayPop: needs two distinct reference locals"
+  };
+}
+
+function isStr(o: Operand): bool {
+  return match (o) {
+    OStr(_) => true,
+    _ => false
+  };
+}
+
+function targetOk(f: MFunction, t: usize): bool {
+  return t < f.blocks.length;
+}
+
+function casesOk(f: MFunction, cs: SwitchCase[]): bool {
+  for (const c of cs) {
+    if (!targetOk(f, c.target)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function wfTerm(p: MProgram, f: MFunction, t: Terminator): string {
+  return match (t) {
+    TGoto(b) => targetOk(f, b) ? "" : "TGoto: block index out of range",
+    TBranch(o, a, b) => {
+      if (!targetOk(f, a) || !targetOk(f, b)) { return "TBranch: block index out of range"; }
+      return opIs(p, f, o, CBool) ? "" : "TBranch: condition must be a bool operand";
+    },
+    TSwitch(o, cs, d) => {
+      if (!targetOk(f, d) || !casesOk(f, cs)) { return "TSwitch: block index out of range"; }
+      return opIs(p, f, o, CInt) ? "" : "TSwitch: scrutinee must be an int operand";
+    },
+    TReturn(r) => {
+      const rc = tyClass(f.ret);
+      return match (r) {
+        None => rc == CVoid ? "" : "TReturn without a value in a non-void function",
+        Some(o) => {
+          if (rc == CVoid) { return "TReturn with a value in a void function"; }
+          return opIs(p, f, o, rc) ? "" : "TReturn: value class does not match the return type";
+        }
+      };
+    },
+    TTrap(_) => ""
+  };
+}
+
+// Function-level checks (first error, "" if fine).
+export function wfFunction(f: MFunction): string {
+  if (f.paramCount > f.locals.length) { return "paramCount exceeds the number of locals"; }
+  if (f.blocks.length == 0) { return "function has no blocks"; }
+  for (const l of f.locals) {
+    if (tyClass(l.ty) == CVoid) { return "local `" + l.name + "` has type void"; }
+  }
+  return "";
+}

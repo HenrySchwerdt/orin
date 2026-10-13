@@ -1,0 +1,291 @@
+// Test driver for the OIM ownership verifier: builds MIR programs by hand, runs `verify` and
+// checks the outcome. One line per case; exit status 1 if any case fails.
+//   orinb build compiler/tests/verify_main.or -o build/verify_main && ./build/verify_main
+
+import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
+import { BStrLength, UnOp, BinOp } from "../hir";
+import { verify, VerifyReport } from "../verify";
+import { exit } from "std:process";
+
+// ---------------------------------------------------------------- builders
+
+function lr(n: string): MLocal { return MLocal { name: n, ty: MRef }; }
+function li(n: string): MLocal { return MLocal { name: n, ty: MInt }; }
+function lu(n: string): MLocal { return MLocal { name: n, ty: MUsize }; }
+function lb(n: string): MLocal { return MLocal { name: n, ty: MBool }; }
+
+function bk(instrs: Instr[], term: Terminator): MBlock {
+  return MBlock { instrs: instrs, term: term };
+}
+
+function fn(name: string, params: usize, locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
+  return MFunction { name: name, paramCount: params, locals: locals, ret: ret, blocks: blocks };
+}
+
+function prog(fs: MFunction[]): MProgram {
+  return MProgram { functions: fs, strings: ["s"], main: 0 };
+}
+
+// Single void function `f` whose only block is `instrs; return`.
+function straight(params: usize, locals: MLocal[], instrs: Instr[]): MProgram {
+  return prog([fn("f", params, locals, MVoid, [bk(instrs, TReturn(None))])]);
+}
+
+// Function `g(p: ref): void`.
+function gVoid(): MFunction {
+  return fn("g", 1, [lr("p")], MVoid, [bk([], TReturn(None))]);
+}
+
+function ret(): Terminator { return TReturn(None); }
+function t(): Operand { return OBool(true); }
+
+// ---------------------------------------------------------------- runner
+
+// mode 0: no errors and no warnings; 1: an error containing `needle`; 2: no errors, >= 1 warning.
+function run(name: string, p: MProgram, mode: int, needle: string): bool {
+  const r: VerifyReport = verify(p);
+  let ok = false;
+  if (mode == 0) {
+    ok = r.errors.length == 0 && r.warnings.length == 0;
+  } else if (mode == 1) {
+    for (const e of r.errors) {
+      if (e.message.includes(needle)) {
+        ok = true;
+      }
+    }
+  } else {
+    ok = r.errors.length == 0 && r.warnings.length > 0;
+  }
+  if (ok) {
+    console.log("PASS " + name);
+    return true;
+  }
+  console.log("FAIL " + name);
+  for (const e of r.errors) {
+    console.log("  error " + e.func + " b" + e.block.toString() + " i" + e.instr.toString() + ": " + e.message);
+  }
+  for (const w of r.warnings) {
+    console.log("  warning " + w.func + " b" + w.block.toString() + " i" + w.instr.toString() + ": " + w.message);
+  }
+  return false;
+}
+
+function neg(name: string, p: MProgram, needle: string): bool { return run("neg " + name, p, 1, needle); }
+function pos(name: string, p: MProgram): bool { return run("pos " + name, p, 0, ""); }
+
+// ---------------------------------------------------------------- negative cases (part 1)
+
+function negatives1(): usize {
+  let bad: usize = 0;
+  const dead = "dead";
+  const uniq = "Unique";
+  const inc = "inconsistent";
+  const ok1 = neg("use after release", straight(0, [lr("a"), li("i")], [
+    IStructNew(0, 0, []), IRelease(0), ITag(1, OLocal(0))]), dead);
+  const ok2 = neg("double release", straight(0, [lr("a")], [
+    IStructNew(0, 0, []), IRelease(0), IRelease(0)]), dead);
+  const ok3 = neg("release of Param", straight(1, [lr("p")], [IRelease(0)]), "parameter");
+  const ok4 = neg("release of Borrowed", straight(1, [lr("p"), lr("b")], [
+    IGetField(1, OLocal(0), 0), IRelease(1)]), "borrowed");
+  const ok5 = neg("borrow used after source released", straight(0, [lr("a"), lr("b"), li("i")], [
+    IStructNew(0, 0, []), IBorrow(1, 0), IRelease(0), ITag(2, OLocal(1))]), dead);
+  const ok6 = neg("borrow used after source moved", straight(0, [lr("a"), lr("b"), lr("c"), li("i")], [
+    IStructNew(0, 0, []), IBorrow(1, 0), IMove(2, 0), ITag(3, OLocal(1)), IRelease(2)]), dead);
+  const ok7 = neg("borrow used after ISetField on source", straight(0, [lr("a"), lr("g"), li("i")], [
+    IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), ISetField(0, 0, OStr(0)),
+    ITag(2, OLocal(1)), IRelease(0)]), dead);
+  const ok8 = neg("borrow used after IMakeUnique on source", straight(0, [lr("a"), lr("g"), li("i")], [
+    IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), IMakeUnique(0),
+    ITag(2, OLocal(1)), IRelease(0)]), dead);
+  const ok9 = neg("borrow used after IArrayPush on source", straight(0, [lr("a"), lr("g"), li("i")], [
+    IArrayNew(0, true, [OStr(0)]), IArrayGet(1, OLocal(0), OUsize(0)), IArrayPush(0, OStr(0)),
+    ITag(2, OLocal(1)), IRelease(0)]), dead);
+  const ok10 = neg("ISetField on non-Unique", straight(0, [lr("a")], [
+    IDup(0, OStr(0)), ISetField(0, 0, OInt(1)), IRelease(0)]), uniq);
+  const ok11 = neg("Unique demoted by IDup", straight(0, [lr("a"), lr("b")], [
+    IStructNew(0, 0, [OInt(1)]), IDup(1, OLocal(0)), ISetField(0, 0, OInt(2)), IRelease(0), IRelease(1)]), uniq);
+  const ok12 = neg("Unique demoted by IBorrow", straight(0, [lr("a"), lr("b")], [
+    IStructNew(0, 0, [OInt(1)]), IBorrow(1, 0), ISetField(0, 0, OInt(2)), IRelease(0)]), uniq);
+  const ok13 = neg("take twice from same slot", straight(0, [lr("a"), lr("t"), lr("u")], [
+    IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), ITakeField(2, 0, 0)]), "taken");
+  const ok14 = neg("put into non-hole", straight(0, [lr("a"), lr("t")], [
+    IStructNew(0, 0, [OStr(0)]), IDup(1, OStr(0)), IPutField(0, 0, 1)]), "not a taken slot");
+  const ok15 = neg("return with open hole", straight(0, [lr("a"), lr("t")], [
+    IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), IRelease(1)]), "open hole");
+  const ok16 = neg("read hole via IGetField", straight(0, [lr("a"), lr("t"), lr("g")], [
+    IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), IGetField(2, OLocal(0), 0)]), "taken");
+  const ok17 = neg("join of Dead and Owned then use", prog([fn("f", 0, [lr("a"), lb("c"), li("i")], MVoid, [
+    bk([ICopy(1, t())], TBranch(OLocal(1), 1, 2)),
+    bk([IStructNew(0, 0, [])], TGoto(3)),
+    bk([], TGoto(3)),
+    bk([ITag(2, OLocal(0))], ret())])]), inc);
+  const ok18 = neg("mismatched Borrowed sources at join", prog([fn("f", 2, [lr("p"), lr("q"), lr("b"), lb("c"), li("i")], MVoid, [
+    bk([ICopy(3, t())], TBranch(OLocal(3), 1, 2)),
+    bk([IBorrow(2, 0)], TGoto(3)),
+    bk([IBorrow(2, 1)], TGoto(3)),
+    bk([ITag(4, OLocal(2))], ret())])]), inc);
+  const ok19 = neg("loop releases without re-acquiring", prog([fn("f", 0, [lr("a"), lb("c")], MVoid, [
+    bk([IStructNew(0, 0, []), ICopy(1, t())], TGoto(1)),
+    bk([IRelease(0)], TBranch(OLocal(1), 1, 2)),
+    bk([], ret())])]), inc);
+  const ok20 = neg("move from Borrowed", straight(1, [lr("p"), lr("b"), lr("c")], [
+    IGetField(1, OLocal(0), 0), IMove(2, 1)]), "borrowed");
+  const ok21 = neg("IStructNew consumes a Borrowed", straight(1, [lr("p"), lr("b"), lr("d")], [
+    IGetField(1, OLocal(0), 0), IStructNew(2, 0, [OLocal(1)])]), "borrowed");
+  if (!ok1) { bad += 1; } if (!ok2) { bad += 1; } if (!ok3) { bad += 1; } if (!ok4) { bad += 1; }
+  if (!ok5) { bad += 1; } if (!ok6) { bad += 1; } if (!ok7) { bad += 1; } if (!ok8) { bad += 1; }
+  if (!ok9) { bad += 1; } if (!ok10) { bad += 1; } if (!ok11) { bad += 1; } if (!ok12) { bad += 1; }
+  if (!ok13) { bad += 1; } if (!ok14) { bad += 1; } if (!ok15) { bad += 1; } if (!ok16) { bad += 1; }
+  if (!ok17) { bad += 1; } if (!ok18) { bad += 1; } if (!ok19) { bad += 1; } if (!ok20) { bad += 1; }
+  if (!ok21) { bad += 1; }
+  return bad;
+}
+
+// ---------------------------------------------------------------- negative cases (part 2)
+
+function negatives2(): usize {
+  let bad: usize = 0;
+  const oor = "out of range";
+  const ok1 = neg("block index out of range", prog([fn("f", 0, [li("i")], MVoid, [bk([], TGoto(5))])]), oor);
+  const ok2 = neg("destination local out of range", straight(0, [li("i")], [ICopy(9, OInt(1))]), "bad local");
+  const ok3 = neg("operand local out of range", straight(0, [li("i")], [IUnary(0, UnNeg, OLocal(4))]), "mismatch");
+  const ok4 = neg("function index out of range", straight(0, [li("i")], [ICall(None, 7, [])]), oor);
+  const ok5 = neg("call with wrong argument count", prog([
+    fn("f", 0, [li("i")], MVoid, [bk([ICall(None, 1, [])], ret())]), gVoid()]), "wrong number");
+  const ok6 = neg("call argument class mismatch", prog([
+    fn("f", 0, [li("i")], MVoid, [bk([ICopy(0, OInt(1)), ICall(None, 1, [OLocal(0)])], ret())]), gVoid()]), "wrong class");
+  const ok7 = neg("IBinary int + bool", straight(0, [li("i"), lb("b")], [
+    ICopy(1, t()), IBinary(0, OpAdd, OInt(1), OLocal(1))]), "mismatch");
+  const ok8 = neg("return a Param", prog([fn("f", 1, [lr("p")], MRef, [bk([], TReturn(Some(OLocal(0))))])]), "parameter");
+  const ok9 = neg("IStructNew consumes a local twice", straight(0, [lr("a"), lr("d")], [
+    IStructNew(0, 0, []), IStructNew(1, 0, [OLocal(0), OLocal(0)])]), "dead");
+  const ok10 = neg("write to scalar parameter", straight(1, [li("n")], [ICopy(0, OInt(1))]), "parameter");
+  const ok11 = neg("paramCount exceeds locals", straight(3, [li("n")], []), "paramCount");
+  const ok12 = neg("branch on a reference", prog([fn("f", 0, [lr("a")], MVoid, [
+    bk([IStructNew(0, 0, [])], TBranch(OLocal(0), 0, 0))])]), "bool");
+  const ok13 = neg("IMakeUnique on Param", straight(1, [lr("p")], [IMakeUnique(0)]), "parameter");
+  const ok14 = neg("call result aliasing demotes Unique", prog([
+    fn("f", 0, [lr("a"), lr("r")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), ISetField(0, 0, OInt(2)),
+      IRelease(0), IRelease(1)], ret())]),
+    fn("g", 1, [lr("p"), lr("d")], MRef, [bk([IDup(1, OLocal(0))], TReturn(Some(OLocal(1))))])]), "Unique");
+  const ok15 = neg("hole sets differ at join", prog([fn("f", 0, [lr("a"), lr("t"), lb("c")], MVoid, [
+    bk([IStructNew(0, 0, [OStr(0)]), ICopy(2, t())], TBranch(OLocal(2), 1, 2)),
+    bk([ITakeField(1, 0, 0)], TGoto(3)),
+    bk([], TGoto(3)),
+    bk([], ret())])]), "hole sets differ");
+  const ok16 = neg("use of uninitialised scalar", straight(0, [li("i"), li("j")], [
+    IBinary(1, OpAdd, OLocal(0), OInt(1))]), "dead");
+  const ok17 = neg("IArraySet on Param", straight(1, [lr("p")], [IArraySet(0, OUsize(0), OInt(1))]), "Unique");
+  const ok18 = neg("IStrAppend on Param", straight(1, [lr("p")], [IStrAppend(0, OStr(0))]), "parameter");
+  const ok19 = neg("return without value in non-void function", prog([
+    fn("f", 0, [li("i")], MRef, [bk([], TReturn(None))])]), "without a value");
+  const ok20 = neg("release of never-defined local", straight(0, [lr("a")], [IRelease(0)]), "dead");
+  const ok21 = neg("whole-object use while hole open", prog([
+    fn("f", 0, [lr("a"), lr("t")], MVoid, [bk([
+      IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), ICall(None, 1, [OLocal(0)])], ret())]),
+    gVoid()]), "open hole");
+  const ok22 = neg("index local overwritten while naming a hole", straight(0, [lr("a"), lr("t"), lu("i")], [
+    ICopy(2, OUsize(0)), IArrayNew(0, true, [OStr(0)]), IArrayTake(1, 0, OLocal(2)), ICopy(2, OUsize(1))]), "overwritten");
+  const ok23 = neg("put a Borrowed value", straight(1, [lr("p"), lr("a"), lr("t"), lr("b")], [
+    IStructNew(1, 0, [OStr(0)]), ITakeField(2, 1, 0), IGetField(3, OLocal(0), 0), IPutField(1, 0, 3)]), "borrowed");
+  const ok24 = neg("ISetField into a taken slot", straight(0, [lr("a"), lr("t")], [
+    IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), ISetField(0, 0, OStr(0))]), "taken");
+  const ok25 = neg("switch target out of range", prog([fn("f", 0, [li("i")], MVoid, [
+    bk([ICopy(0, OInt(0))], TSwitch(OLocal(0), [SwitchCase { value: 0, target: 3 }], 0))])]), oor);
+  const ok26 = neg("string literal index out of range", straight(0, [lr("a")], [IStructNew(0, 0, [OStr(5)])]), "bad");
+  if (!ok1) { bad += 1; } if (!ok2) { bad += 1; } if (!ok3) { bad += 1; } if (!ok4) { bad += 1; }
+  if (!ok5) { bad += 1; } if (!ok6) { bad += 1; } if (!ok7) { bad += 1; } if (!ok8) { bad += 1; }
+  if (!ok9) { bad += 1; } if (!ok10) { bad += 1; } if (!ok11) { bad += 1; } if (!ok12) { bad += 1; }
+  if (!ok13) { bad += 1; } if (!ok14) { bad += 1; } if (!ok15) { bad += 1; } if (!ok16) { bad += 1; }
+  if (!ok17) { bad += 1; } if (!ok18) { bad += 1; } if (!ok19) { bad += 1; } if (!ok20) { bad += 1; }
+  if (!ok21) { bad += 1; } if (!ok22) { bad += 1; } if (!ok23) { bad += 1; } if (!ok24) { bad += 1; }
+  if (!ok25) { bad += 1; } if (!ok26) { bad += 1; }
+  return bad;
+}
+
+// ---------------------------------------------------------------- positive cases
+
+function positives(): usize {
+  let bad: usize = 0;
+  const ok1 = pos("straight line", straight(0, [lr("a"), li("i")], [
+    IStructNew(0, 0, [OInt(1)]), ISetField(0, 0, OInt(2)), IGetField(1, OLocal(0), 0),
+    ITag(1, OLocal(0)), IRelease(0)]));
+  const ok2 = pos("if/else releases on both paths", prog([fn("f", 0, [lr("a"), lb("c")], MVoid, [
+    bk([IStructNew(0, 0, []), ICopy(1, t())], TBranch(OLocal(1), 1, 2)),
+    bk([IRelease(0)], TGoto(3)),
+    bk([IRelease(0)], TGoto(3)),
+    bk([], ret())])]));
+  const ok3 = pos("loop with owned local released per iteration", prog([
+    fn("f", 0, [li("i"), lb("c"), lr("a")], MVoid, [
+      bk([ICopy(0, OInt(0))], TGoto(1)),
+      bk([IBinary(1, OpLt, OLocal(0), OInt(3))], TBranch(OLocal(1), 2, 3)),
+      bk([IStructNew(2, 0, [OLocal(0)]), IRelease(2), IBinary(0, OpAdd, OLocal(0), OInt(1))], TGoto(1)),
+      bk([], ret())])]));
+  const ok4 = pos("nested field update take/makeUnique/put", straight(0, [lr("x"), lr("inner"), lr("t")], [
+    IStructNew(1, 0, [OInt(1)]), IStructNew(0, 0, [OLocal(1)]), ITakeField(2, 0, 0), IMakeUnique(2),
+    ISetField(2, 0, OInt(5)), IPutField(0, 0, 2), IRelease(0)]));
+  const ok5 = pos("early return releasing locals", prog([fn("f", 0, [lr("a"), lr("b"), lb("c")], MVoid, [
+    bk([IStructNew(0, 0, []), IStructNew(1, 0, []), ICopy(2, t())], TBranch(OLocal(2), 1, 2)),
+    bk([IRelease(0), IRelease(1)], ret()),
+    bk([IRelease(1), IRelease(0)], ret())])]));
+  const ok6 = pos("borrowed field used before source release", straight(0, [lr("a"), lr("g"), lu("n")], [
+    IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), IBuiltin(Some(2), BStrLength, [OLocal(1)]), IRelease(0)]));
+  const ok7 = pos("call passing owned, returning owned", prog([
+    fn("f", 0, [lr("a"), lr("r")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), IRelease(0), IRelease(1)], ret())]),
+    fn("g", 1, [lr("p"), lr("d")], MRef, [bk([IDup(1, OLocal(0))], TReturn(Some(OLocal(1))))])]));
+  const ok8 = pos("array take/put with index local", straight(0, [lr("a"), lr("t"), lu("i")], [
+    ICopy(2, OUsize(0)), IArrayNew(0, true, [OStr(0)]), IArrayTake(1, 0, OLocal(2)),
+    IArrayPut(0, OLocal(2), 1), IRelease(0)]));
+  const ok9 = pos("read from Param", straight(1, [lr("p"), lr("g"), li("i")], [
+    IGetField(1, OLocal(0), 0), ITag(2, OLocal(1))]));
+  const ok10 = pos("return string literal", prog([fn("f", 0, [], MRef, [bk([], TReturn(Some(OStr(0))))])]));
+  const ok11 = pos("move chain", straight(0, [lr("a"), lr("b")], [
+    IStructNew(0, 0, []), IMove(1, 0), IRelease(1)]));
+  const ok12 = pos("switch releasing in every arm", prog([fn("f", 0, [lr("a"), li("i")], MVoid, [
+    bk([IStructNew(0, 0, []), ICopy(1, OInt(0))],
+      TSwitch(OLocal(1), [SwitchCase { value: 0, target: 1 }, SwitchCase { value: 1, target: 2 }], 3)),
+    bk([IRelease(0)], ret()),
+    bk([IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])]));
+  const ok13 = pos("push in a loop (Unique joins to Owned)", prog([
+    fn("f", 0, [lr("a"), lb("c"), li("i")], MVoid, [
+      bk([IArrayNew(0, false, []), ICopy(2, OInt(0))], TGoto(1)),
+      bk([IBinary(1, OpLt, OLocal(2), OInt(3))], TBranch(OLocal(1), 2, 3)),
+      bk([IArrayPush(0, OLocal(2)), IBinary(2, OpAdd, OLocal(2), OInt(1))], TGoto(1)),
+      bk([IRelease(0)], ret())])]));
+  const ok14 = pos("dup a borrowed field and return it", prog([fn("f", 0, [lr("a"), lr("g"), lr("r")], MRef, [
+    bk([IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), IDup(2, OLocal(1)), IRelease(0)],
+      TReturn(Some(OLocal(2))))])]));
+  const ok15 = pos("IStrAppend on literal copy", straight(0, [lr("s")], [
+    ICopy(0, OStr(0)), IStrAppend(0, OStr(0)), IRelease(0)]));
+  const ok16 = pos("scalar-result call keeps Unique", prog([
+    fn("f", 0, [lr("a"), li("n")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), ISetField(0, 0, OInt(2)), IRelease(0)], ret())]),
+    fn("g", 1, [lr("p"), li("n")], MInt, [bk([ICopy(1, OInt(0))], TReturn(Some(OLocal(1))))])]));
+  const ok17 = pos("trap needs no cleanup", prog([fn("f", 0, [lr("a")], MVoid, [
+    bk([IStructNew(0, 0, [])], TTrap("boom"))])]));
+  const ok18 = pos("re-take after put", straight(0, [lr("a"), lr("t")], [
+    IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), IPutField(0, 0, 1),
+    ITakeField(1, 0, 0), IPutField(0, 0, 1), IRelease(0)]));
+  const ok19 = run("warn leak at return", straight(0, [lr("a")], [IStructNew(0, 0, [])]), 2, "");
+  const ok20 = run("warn overwritten owned local", straight(0, [lr("a")], [
+    IStructNew(0, 0, []), IStructNew(0, 0, []), IRelease(0)]), 2, "");
+  if (!ok1) { bad += 1; } if (!ok2) { bad += 1; } if (!ok3) { bad += 1; } if (!ok4) { bad += 1; }
+  if (!ok5) { bad += 1; } if (!ok6) { bad += 1; } if (!ok7) { bad += 1; } if (!ok8) { bad += 1; }
+  if (!ok9) { bad += 1; } if (!ok10) { bad += 1; } if (!ok11) { bad += 1; } if (!ok12) { bad += 1; }
+  if (!ok13) { bad += 1; } if (!ok14) { bad += 1; } if (!ok15) { bad += 1; } if (!ok16) { bad += 1; }
+  if (!ok17) { bad += 1; } if (!ok18) { bad += 1; } if (!ok19) { bad += 1; } if (!ok20) { bad += 1; }
+  return bad;
+}
+
+function main(): void {
+  const bad = negatives1() + negatives2() + positives();
+  if (bad > 0) {
+    console.log(bad.toString() + " case(s) FAILED");
+    exit(1);
+    return;
+  }
+  console.log("all cases passed");
+}

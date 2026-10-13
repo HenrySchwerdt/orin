@@ -1,0 +1,518 @@
+// Transfer functions of the ownership verifier: one rule per MIR instruction / terminator, a
+// direct transcription of docs/mir.md. Input is well-formed (wf.or). Errors and warnings are
+// appended to the context; after an error the state is updated as if the rule had succeeded
+// where that is meaningful, so one mistake does not cascade.
+
+import { MProgram, MFunction, Operand, Instr, Terminator } from "../mir";
+import {
+  VerifyIssue, State, LState, HoleEntry, mk, ownedLike, leaky, kindName, holeEq,
+  KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead
+} from "./state";
+import { CRef, localClass, opClass } from "./wf";
+
+export type Cx = {
+  prog: MProgram;
+  f: MFunction;
+  blk: usize;
+  ins: usize;
+  st: State;
+  errs: VerifyIssue[];
+  warns: VerifyIssue[];
+};
+
+// ------------------------------------------------------------------ reporting and basics
+
+function err(cx: Cx, msg: string): Cx {
+  let c = cx;
+  c.errs.push(VerifyIssue { func: c.f.name, block: c.blk, instr: c.ins, message: msg });
+  return c;
+}
+
+function warn(cx: Cx, msg: string): Cx {
+  let c = cx;
+  c.warns.push(VerifyIssue { func: c.f.name, block: c.blk, instr: c.ins, message: msg });
+  return c;
+}
+
+function nm(c: Cx, l: usize): string {
+  return "`" + c.f.locals[l].name + "`";
+}
+
+function kindOf(c: Cx, l: usize): int {
+  return c.st.ls[l].k;
+}
+
+function setLs(cx: Cx, l: usize, k: int, src: usize): Cx {
+  let c = cx;
+  c.st.ls[l] = mk(k, src);
+  return c;
+}
+
+function isRefLocal(c: Cx, l: usize): bool {
+  return localClass(c.f, l) == CRef;
+}
+
+// ------------------------------------------------------------------ holes
+
+function holeKey(o: Operand): HoleEntryKey {
+  return match (o) {
+    OLocal(l) => HoleEntryKey { sym: true, idx: l },
+    OUsize(n) => HoleEntryKey { sym: false, idx: n.toUsize() },
+    _ => HoleEntryKey { sym: false, idx: 0 }
+  };
+}
+
+type HoleEntryKey = { sym: bool; idx: usize; };
+
+function slotKey(i: usize): HoleEntryKey {
+  return HoleEntryKey { sym: false, idx: i };
+}
+
+function holeAny(c: Cx, x: usize): bool {
+  for (const h of c.st.holes) {
+    if (h.obj == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Exact hole (x, k).
+function holeHas(c: Cx, x: usize, k: HoleEntryKey): bool {
+  for (const h of c.st.holes) {
+    if (h.obj == x && h.sym == k.sym && h.idx == k.idx) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Slot k of x may be a hole: equal key, or either side is symbolic (conservative).
+function holeMay(c: Cx, x: usize, k: HoleEntryKey): bool {
+  for (const h of c.st.holes) {
+    if (h.obj == x && (h.sym || k.sym || h.idx == k.idx)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function addHole(cx: Cx, x: usize, k: HoleEntryKey): Cx {
+  let c = cx;
+  c.st.holes.push(HoleEntry { obj: x, sym: k.sym, idx: k.idx });
+  return c;
+}
+
+function removeHole(cx: Cx, x: usize, k: HoleEntryKey): Cx {
+  let c = cx;
+  let hs: HoleEntry[] = [];
+  for (const h of c.st.holes) {
+    if (!(h.obj == x && h.sym == k.sym && h.idx == k.idx)) {
+      hs.push(h);
+    }
+  }
+  c.st.holes = hs;
+  return c;
+}
+
+function dropHolesOf(cx: Cx, x: usize): Cx {
+  let c = cx;
+  let hs: HoleEntry[] = [];
+  for (const h of c.st.holes) {
+    if (h.obj != x) {
+      hs.push(h);
+    }
+  }
+  c.st.holes = hs;
+  return c;
+}
+
+// ------------------------------------------------------------------ reads, kills, definitions
+
+// Every `Borrowed(x)` alias dies when x is released, moved, consumed, mutated or redefined.
+function killBorrows(cx: Cx, x: usize): Cx {
+  let c = cx;
+  let i: usize = 0;
+  while (i < c.st.ls.length) {
+    if (c.st.ls[i].k == KBorrowed && c.st.ls[i].src == x) {
+      c.st.ls[i] = mk(KDead, 0);
+    }
+    i += 1;
+  }
+  return c;
+}
+
+// "read x requires x not Dead" (also rejects poisoned join results).
+function readLocal(cx: Cx, l: usize): Cx {
+  const k = kindOf(cx, l);
+  if (k == KDead) {
+    return err(cx, "use of " + nm(cx, l) + " which is dead (uninitialised, moved, released or invalidated)");
+  }
+  if (k == KMaybeDead || k == KMaybeLeak) {
+    return err(cx, "use of " + nm(cx, l) + " which is dead or inconsistent on some incoming path");
+  }
+  return cx;
+}
+
+// Whole-object use of a local: live, and no slot may be missing.
+function readWhole(cx: Cx, l: usize): Cx {
+  let c = readLocal(cx, l);
+  if (isRefLocal(c, l) && holeAny(c, l)) {
+    c = err(c, "whole-object use of " + nm(c, l) + " while a slot is taken (open hole)");
+  }
+  return c;
+}
+
+function readOp(cx: Cx, o: Operand): Cx {
+  return match (o) {
+    OLocal(l) => readWhole(cx, l),
+    _ => cx
+  };
+}
+
+// Owned/Unique/Imm local -> ok (returns true), else the matching error.
+function needOwned(cx: Cx, l: usize, what: string): Cx {
+  const k = kindOf(cx, l);
+  if (ownedLike(k)) {
+    return readWhole(cx, l);
+  }
+  if (k == KParam) {
+    return err(cx, what + " of parameter " + nm(cx, l) + " (parameters are borrowed for the whole call)");
+  }
+  if (k == KBorrowed) {
+    return err(cx, what + " of borrowed " + nm(cx, l));
+  }
+  return readLocal(cx, l);
+}
+
+function needUnique(cx: Cx, l: usize, what: string): Cx {
+  const k = kindOf(cx, l);
+  if (k == KUnique) {
+    return cx;
+  }
+  if (k == KDead || k == KMaybeDead || k == KMaybeLeak) {
+    return readLocal(cx, l);
+  }
+  return err(cx, what + " requires " + nm(cx, l) + " to be Unique, but it is " + kindName(k));
+}
+
+// Owned-like local ceases to exist (released or consumed): Dead, borrows invalidated.
+function kill(cx: Cx, l: usize): Cx {
+  return setLs(killBorrows(cx, l), l, KDead, 0);
+}
+
+// Consume an operand (ref slots of IStructNew, stored values, pushed values, returned values).
+// Scalars are merely read; OStr is immortal.
+function consume(cx: Cx, o: Operand): Cx {
+  return match (o) {
+    OLocal(l) => {
+      if (!isRefLocal(cx, l)) {
+        return readLocal(cx, l);
+      }
+      const k = kindOf(cx, l);
+      const c = needOwned(cx, l, "consuming");
+      if (ownedLike(k) && c.errs.length == cx.errs.length) {
+        return kill(c, l);
+      }
+      return c;
+    },
+    _ => cx
+  };
+}
+
+// Define local d (every destination goes through here).
+function def(cx: Cx, d: usize, k: int, src: usize): Cx {
+  if (d < cx.f.paramCount) {
+    return err(cx, "write to parameter " + nm(cx, d));
+  }
+  let c = cx;
+  if (leaky(kindOf(c, d))) {
+    c = warn(c, "leak: " + nm(c, d) + " is overwritten while it may still own a reference");
+  }
+  if (holeAny(c, d)) {
+    c = err(c, nm(c, d) + " is overwritten while a slot is taken (open hole)");
+    c = dropHolesOf(c, d);
+  }
+  for (const h of c.st.holes) {
+    if (h.sym && h.idx == d) {
+      c = err(c, "index local " + nm(c, d) + " is overwritten while it names an open hole");
+    }
+  }
+  return setLs(killBorrows(c, d), d, k, src);
+}
+
+// Destination of a result: Owned for references, initialised for scalars.
+function defResult(cx: Cx, d: usize): Cx {
+  return def(cx, d, isRefLocal(cx, d) ? KOwned : KInit, 0);
+}
+
+// Root a new borrow of local l depends on: l itself, or l's own root.
+function rootOf(c: Cx, l: usize): usize {
+  const s = c.st.ls[l];
+  return s.k == KBorrowed ? s.src : l;
+}
+
+// A Unique object that is aliased (borrowed whole, duplicated, passed to a call that may
+// return it) is no longer provably unique.
+function demote(cx: Cx, l: usize): Cx {
+  if (kindOf(cx, l) == KUnique) {
+    return setLs(cx, l, KOwned, 0);
+  }
+  return cx;
+}
+
+function demoteOp(cx: Cx, o: Operand): Cx {
+  return match (o) {
+    OLocal(l) => demote(cx, l),
+    _ => cx
+  };
+}
+
+// Result of a field/element read: borrowed from the root of `o` (references) or a scalar.
+function defProjection(cx: Cx, d: usize, o: Operand): Cx {
+  if (!isRefLocal(cx, d)) {
+    return def(cx, d, KInit, 0);
+  }
+  return match (o) {
+    OLocal(l) => def(cx, d, KBorrowed, rootOf(cx, l)),
+    _ => def(cx, d, KOwned, 0)
+  };
+}
+
+// ------------------------------------------------------------------ instruction rules
+
+function consumeAll(cx: Cx, os: Operand[]): Cx {
+  let c = cx;
+  for (const o of os) {
+    c = consume(c, o);
+  }
+  return c;
+}
+
+function readAll(cx: Cx, os: Operand[]): Cx {
+  let c = cx;
+  for (const o of os) {
+    c = readOp(c, o);
+  }
+  return c;
+}
+
+// ICall / IBuiltin: arguments are borrowed for the call; the result is Owned. A reference
+// result may alias an argument, so a Unique argument is demoted (docs/mir.md notes).
+function call(cx: Cx, dst: Option<usize>, args: Operand[]): Cx {
+  let c = readAll(cx, args);
+  return match (dst) {
+    None => c,
+    Some(d) => {
+      if (isRefLocal(c, d)) {
+        for (const a of args) {
+          c = demoteOp(c, a);
+        }
+      }
+      return defResult(c, d);
+    }
+  };
+}
+
+// Reading slot k of object operand o (IGetField / IArrayGet).
+function project(cx: Cx, d: usize, o: Operand, k: HoleEntryKey): Cx {
+  let c = cx;
+  match (o) {
+    OLocal(l) => {
+      c = readLocal(c, l);
+      if (holeMay(c, l, k)) {
+        c = err(c, "read of a slot of " + nm(c, l) + " that is (or may be) taken");
+      }
+    },
+    _ => {}
+  }
+  return defProjection(c, d, o);
+}
+
+// ISetField / IArraySet.
+function store(cx: Cx, x: usize, k: HoleEntryKey, v: Operand, what: string): Cx {
+  let c = needUnique(cx, x, what);
+  if (holeMay(c, x, k)) {
+    c = err(c, what + " into a slot of " + nm(c, x) + " that is (or may be) taken; use the put instruction");
+  }
+  c = consume(c, v);
+  return killBorrows(c, x);
+}
+
+// ITakeField / IArrayTake.
+function take(cx: Cx, d: usize, x: usize, k: HoleEntryKey, what: string): Cx {
+  let c = needUnique(cx, x, what);
+  if (holeMay(c, x, k)) {
+    c = err(c, what + " of a slot of " + nm(c, x) + " that is (or may be) already taken");
+  }
+  c = killBorrows(c, x);
+  c = addHole(c, x, k);
+  return def(c, d, KOwned, 0);
+}
+
+// IPutField / IArrayPut.
+function put(cx: Cx, x: usize, k: HoleEntryKey, s: usize, what: string): Cx {
+  let c = needUnique(cx, x, what);
+  if (!holeHas(c, x, k)) {
+    c = err(c, what + " into a slot of " + nm(c, x) + " that is not a taken slot");
+  }
+  c = consume(c, OLocal(s));
+  c = removeHole(c, x, k);
+  return killBorrows(c, x);
+}
+
+// IArrayPush / IArrayPop / IStrAppend: x must be owned (not Param/Borrowed); the runtime may
+// reallocate or mutate it, so borrows die and Unique is not kept.
+function mutateOwned(cx: Cx, x: usize, what: string): Cx {
+  let c = needOwned(cx, x, what);
+  c = killBorrows(c, x);
+  if (ownedLike(kindOf(c, x))) {
+    c = setLs(c, x, KOwned, 0);
+  }
+  return c;
+}
+
+export function step(cx: Cx, ins: Instr): Cx {
+  match (ins) {
+    ICopy(d, o) => {
+      return def(readOp(cx, o), d, isRefLocal(cx, d) ? KImm : KInit, 0);
+    },
+    IMove(d, s) => {
+      const k = kindOf(cx, s);
+      const c = consume(cx, OLocal(s));
+      return def(c, d, ownedLike(k) ? k : KOwned, 0);
+    },
+    IBorrow(d, s) => {
+      let c = readWhole(cx, s);
+      const r = rootOf(c, s);
+      c = demote(c, s);
+      return def(c, d, KBorrowed, r);
+    },
+    IDup(d, o) => {
+      let c = readOp(cx, o);
+      c = demoteOp(c, o);
+      return def(c, d, KOwned, 0);
+    },
+    IRelease(x) => {
+      const c = needOwned(cx, x, "release");
+      return ownedLike(kindOf(cx, x)) ? kill(c, x) : c;
+    },
+    IUnary(d, _, o) => {
+      return def(readOp(cx, o), d, KInit, 0);
+    },
+    IBinary(d, _, a, b) => {
+      return def(readOp(readOp(cx, a), b), d, KInit, 0);
+    },
+    ICall(dst, _, args) => {
+      return call(cx, dst, args);
+    },
+    IBuiltin(dst, _, args) => {
+      return call(cx, dst, args);
+    },
+    IStrAppend(x, y) => {
+      let c = readOp(cx, y);
+      match (y) {
+        OLocal(l) => {
+          if (kindOf(c, l) == KBorrowed && c.st.ls[l].src == x) {
+            c = err(c, "IStrAppend: " + nm(c, l) + " is borrowed from the string being appended to");
+          }
+        },
+        _ => {}
+      }
+      return mutateOwned(c, x, "IStrAppend");
+    },
+    IStructNew(d, _, slots) => {
+      return def(consumeAll(cx, slots), d, KUnique, 0);
+    },
+    INullary(d, _) => {
+      return def(cx, d, KImm, 0);
+    },
+    ITag(d, o) => {
+      let c = cx;
+      match (o) {
+        OLocal(l) => {
+          c = readLocal(c, l);
+        },
+        _ => {}
+      }
+      return def(c, d, KInit, 0);
+    },
+    IGetField(d, o, i) => {
+      return project(cx, d, o, slotKey(i));
+    },
+    ISetField(x, i, v) => {
+      return store(cx, x, slotKey(i), v, "ISetField");
+    },
+    ITakeField(d, x, i) => {
+      return take(cx, d, x, slotKey(i), "ITakeField");
+    },
+    IPutField(x, i, s) => {
+      return put(cx, x, slotKey(i), s, "IPutField");
+    },
+    IMakeUnique(x) => {
+      let c = needOwned(cx, x, "IMakeUnique");
+      c = killBorrows(c, x);
+      return ownedLike(kindOf(cx, x)) ? setLs(c, x, KUnique, 0) : c;
+    },
+    IArrayNew(d, _, elems) => {
+      return def(consumeAll(cx, elems), d, KUnique, 0);
+    },
+    IArrayGet(d, a, i) => {
+      return project(readOp(cx, i), d, a, holeKey(i));
+    },
+    IArraySet(x, i, v) => {
+      return store(readOp(cx, i), x, holeKey(i), v, "IArraySet");
+    },
+    IArrayTake(d, x, i) => {
+      return take(readOp(cx, i), d, x, holeKey(i), "IArrayTake");
+    },
+    IArrayPut(x, i, s) => {
+      return put(readOp(cx, i), x, holeKey(i), s, "IArrayPut");
+    },
+    IArrayPush(x, v) => {
+      return mutateOwned(consume(cx, v), x, "IArrayPush");
+    },
+    IArrayPop(d, x) => {
+      return def(mutateOwned(cx, x, "IArrayPop"), d, KOwned, 0);
+    }
+  }
+}
+
+// ------------------------------------------------------------------ terminators
+
+export function stepTerm(cx: Cx, t: Terminator): Cx {
+  match (t) {
+    TGoto(_) => {
+      return cx;
+    },
+    TBranch(o, _, _) => {
+      return readOp(cx, o);
+    },
+    TSwitch(o, _, _) => {
+      return readOp(cx, o);
+    },
+    TReturn(r) => {
+      let c = cx;
+      match (r) {
+        Some(o) => {
+          c = consume(c, o);
+        },
+        None => {}
+      }
+      let i: usize = 0;
+      while (i < c.st.ls.length) {
+        if (leaky(c.st.ls[i].k)) {
+          c = warn(c, "leak: " + nm(c, i) + " may still own a reference at return");
+        }
+        i += 1;
+      }
+      for (const h of c.st.holes) {
+        c = err(c, "return with an open hole in " + nm(c, h.obj));
+      }
+      return c;
+    },
+    TTrap(_) => {
+      return cx;
+    }
+  }
+}
