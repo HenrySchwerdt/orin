@@ -8,9 +8,9 @@ Status: living document. Owner: lead architect. Normative source of language req
 | Path | Contents |
 |---|---|
 | `spec/` | Language/product specification (authoritative). |
-| `docs/bootstrap-subset.md` | Frozen Orin-B subset compiled by Stage 0 and used to write Stage 1. |
+| `docs/bootstrap-subset.md` | Historical: the frozen Orin-B subset of the retired Stage 0 (diagnostics table still valid). |
 | `docs/decisions/` | ADRs (interpretations of OPEN points, deviations). |
-| `bootstrap/` | **Stage 0** compiler `orinb` in Rust (temporary). Orin-B → GNU C. |
+| `seed/` | The committed **seed** (generated C of the self-hosted compiler, `orin-seed.c.gz` + `SEED_INFO`), the single bootstrap root. The Rust Stage 0 is retired to branch `archive/stage0-final`. |
 | `platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `platform/tests/` (contract tests, CBMC harnesses). |
 | `runtime/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
@@ -21,15 +21,18 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `tests/next/` | Same formats (`run/`, `errors/`) for language beyond Orin-B; self-hosted compiler only (`--suite next`). |
 | `tools/` | Test runner and bootstrap scripts. |
 
-## Pipeline (Stage 0 and Stage 1 share the same shape)
+## Pipeline
 
 ```
 file.or ──lexer/parser──▶ AST ──loader (imports, module rules, DAG)──▶ units (topo-sorted)
-      ──checker (resolve + type)──▶ typed HIR ──codegen──▶ GNU C ──cc + runtime──▶ native exe
+      ──checker (resolve + type)──▶ typed HIR ──lower──▶ MIR ──verify──▶ GNU C / LLVM IR ──cc + runtime──▶ native exe
 ```
 
-Stage 0 contracts are the Rust modules `span.rs`, `diag.rs`, `ast.rs`, `hir.rs`,
-`loader.rs` (interface section). Changing them requires the lead architect.
+The former direct HIR -> C backend (`compiler/codegen/`, `--legacy-codegen`) was removed in the first
+post-freeze cleanup; HIR is lowered to MIR and emitted by `compiler/cemit` or `compiler/llvm` only.
+
+(Historical: the Stage 0 contracts were the Rust modules `span.rs`, `diag.rs`, `ast.rs`, `hir.rs`,
+`loader.rs`; they now live only on the archive branch.)
 Planned later passes (spec 09): annotation expansion and class lowering between AST and HIR;
 MIR/OIM memory IR + independent verifier between HIR and codegen.
 
@@ -50,7 +53,7 @@ MIR/OIM memory IR + independent verifier between HIR and codegen.
     may be immortal shared singletons.
 - Releasing an object to count 0 releases its reference slots, then frees it. Immortal
   objects (negative count) are never freed or counted.
-- **Ownership convention in generated code (Stage 0):** function parameters are *borrowed*;
+- **Ownership convention in generated code:** function parameters are *borrowed*;
   return values are *owned* (+1); locals own their value; storing a borrowed value
   (into a local, field, array, return) retains it; owned temporaries that are only borrowed
   are released after use. Locals are released at scope exit (including `break`, `continue`,
@@ -70,8 +73,7 @@ so `stage2.c == stage3.c` still holds):
   rules) + `strings.or`, `numbers.or`. The compiler is one native binary and cannot find files next to
   itself, so `tools/embed_prelude.py` turns each prelude directory into a generated Orin file
   (`compiler/loader/embedded_std.or`, a function returning `SourceFile[]`). Run the script after
-  editing `std/`; `tools/bootstrap.sh` fails on a stale file (`--check`). Stage 0 never sees the prelude
-  (it only compiles `compiler/`, where the embedded file is just string literals).
+  editing `std/`; `tools/bootstrap.sh` fails on a stale file (`--check`).
 - **Prelude roots (the general mechanism).** `compiler/loader/prelude.or` has `preludeRoots()`, a list
   of `PreludeRoot { entry, files }`. `loadWithRoots` (loader.or) serves every root's files from memory under
   virtual paths `$<name>/...` and adds an empty import of each root's `entry` to the program's entry
@@ -86,14 +88,14 @@ so `stage2.c == stage3.c` still holds):
   `XBuiltin` with the same signatures. `compiler/lower/prelude.or` maps the moved built-ins (table
   `preludeSlot` + `preludeNames`) to the prelude function of that name; `exprBuiltin` (lower/body.or)
   then lowers them like an `XCall`. If the program has no such function (`--c-builtins`) the built-in is
-  emitted as before, as a runtime C call. The legacy HIR -> C backend never uses the prelude.
+  emitted as before, as a runtime C call.
 - **No bloat.** `compiler/opt/prune.or` (run after the optimiser and the verifier, just before C emission)
   drops prelude functions (names starting with `$`) that are not reachable from `main` or from the
   program's own functions, renumbering calls. `orin mir` / `orin verify` do not prune, so
   `tools/verify_all.py` verifies the whole prelude. A new MIR instruction that names a function must be
   added to `callees`/`renumber` there.
 - **Flags.** `--c-builtins` keeps the C runtime path (differential testing:
-  `python3 tools/diff_backends.py --mode builtins`); `--legacy-codegen` implies it; `orin check` loads no
+  `python3 tools/diff_backends.py --mode builtins`); `orin check` loads no
   prelude.
 - **Rules for prelude code** (also in `std/module.or`): only the primitives the C runtime keeps
   (`length`, `charCodeAt`, `charAt`, `substring`, `String.fromCharCode`, `+`, array `push`/index/`length`,

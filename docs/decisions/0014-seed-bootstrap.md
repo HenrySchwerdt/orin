@@ -25,3 +25,11 @@ API — but Stage 0 cannot compile them, and extending Stage 0 is explicitly not
 - Trusting-trust note (spec 09): seeds are reproducible from the previous seed and the tagged
   source; anyone can verify a seed by re-running the chain. Diverse double-compilation (C backend
   vs LLVM backend producing the same stage3.c — already true today) is kept in CI.
+
+## Note (first post-freeze cleanup PR, added later; the decision above is unchanged)
+
+Stage 0 was retired as announced: the Rust crate, the `stage0` and `diverse-roots` CI jobs and
+`tools/bootstrap.sh --from-stage0` were removed from `main`; the archive is the branch
+`archive/stage0-final` (commit `ec1ba3e`). The seed moved from `bootstrap/seed/` to `seed/`. The seed
+refreshed at `ec1ba3e` was cross-checked against Stage 0 (byte-identical `stage2.c`) before the removal.
+What that does and does not establish for later seeds: `docs/bootstrap.md`, "Retired Stage 0".

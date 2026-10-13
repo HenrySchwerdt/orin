@@ -162,10 +162,9 @@ Editor support: see [`editors/vscode`](editors/vscode) (syntax highlighting + la
 python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all
 ```
 
-The default build needs only a C compiler, `python3`, `gzip` and `sha256sum`/`shasum` — no Rust.
-`./tools/bootstrap.sh --from-stage0` bootstraps from the Rust Stage 0 instead (needs `cargo`, as do
-the Rust unit tests); both roots produce a byte-identical compiler. See
-[`docs/bootstrap.md`](docs/bootstrap.md).
+The build needs only a C compiler, `python3`, `gzip` and `sha256sum`/`shasum`.
+The Rust Stage 0 is retired (archived on the branch `archive/stage0-final`); the committed seed is the
+single root. See [`docs/bootstrap.md`](docs/bootstrap.md).
 
 ## Learn more
 

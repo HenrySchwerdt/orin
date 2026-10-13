@@ -1,6 +1,6 @@
 /*
  * std:io runtime (stdin/stdout primitives). Header-only (static functions) so no extra object file
- * has to be linked; included by code emitted by both backends (compiler/cemit, compiler/codegen).
+ * has to be linked; included by code emitted by the C and LLVM backends (compiler/cemit, compiler/llvm).
  *
  *   orin_io_read_bytes(n)   Option<string>: exactly n bytes from stdin, None if EOF is reached first
  *   orin_io_read_line()     Option<string>: next line without "\n" / "\r\n", None at EOF

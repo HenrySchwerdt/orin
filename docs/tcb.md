@@ -14,7 +14,7 @@ today. "Trusted" means a bug there can silently break a guarantee.
 
 | Component | Trust | Evidence today | Gap |
 |---|---|---|---|
-| Lexer, parser | trusted for meaning (what was written) | conformance suites, Stage0/Stage1 parser differential (`tools/diff_parsers.py`) | no formal grammar proof |
+| Lexer, parser | trusted for meaning (what was written) | conformance suites (the Stage 0 vs Stage 1 parser differential was retired with Stage 0) | no formal grammar proof |
 | Type checker, HIR | trusted for type safety | ~420 conformance programs, error suite, fmt/LSP corpus | not verified |
 | HIR → MIR lowering, optimiser (owned params, moves, prune) | **not trusted for ownership**: output is re-checked | independent MIR ownership verifier on every compile (ICE exit 70) | lowering bugs can still change *behaviour* (not safety) |
 | MIR ownership verifier (`compiler/verify`) | trusted | Lean: soundness of the checker *transcription* for the structured MIR core (`formal/`, `check_sound`); targeted regression cases | the Orin implementation is not proved equal to the Lean transcription; MIR features outside the core (closures, vtables, floats) are checked by rules not yet in the model |
@@ -28,8 +28,8 @@ today. "Trusted" means a bug there can silently break a guarantee.
 
 | Component | Trust | Evidence |
 |---|---|---|
-| Seed C (`bootstrap/seed/orin-seed.c.gz`) | trusted unless cross-checked | diverse double root: the Rust Stage0 root and the seed root produce byte-identical `stage2.c` in CI |
-| Rust Stage0 (`bootstrap/`, frozen) | second root only | Rust toolchain is then part of that root's TCB |
+| Seed C (`seed/orin-seed.c.gz`) | trusted; single root | the seed from source commit `ec1ba3e` was cross-checked by the diverse double root (Rust Stage 0 root and seed root gave a byte-identical `stage2.c`; reproducible from branch `archive/stage0-final`, docs/bootstrap.md). Later seeds are not cross-checked by an independent root: they rest on that clean starting point, the reviewed source diff and the fixed point |
+| Rust Stage 0 (branch `archive/stage0-final`) | retired; no longer part of the build | its evidence is historical (valid for `ec1ba3e` only); the Rust toolchain is not in the TCB of the current build |
 | Fixed point | — | `stage2.c == stage3.c`; LLVM-built compiler reproduces `stage3.c` |
 
 ## Contract verification (ADR-0012 phase 2, in progress)

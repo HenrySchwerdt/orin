@@ -236,17 +236,6 @@ def main():
                  "size": sizes(os.path.join(ROOT, stage)), "build_s": bt,
                  "csize": os.path.getsize(os.path.join(ROOT, out, "out.c"))}
         print("selfcompile median %ss" % fmt_s(selfc["wall"][0]), file=sys.stderr)
-        orinb = os.path.join(ROOT, "bootstrap", "target", "release", "orinb")
-        if os.path.exists(orinb):
-            cmd = [orinb, "compile", "build/bootstrap/stage0-src/compiler/main.or", "-o", out + "/out_stage0.c"]
-            run_once(cmd)
-            walls, rss = [], []
-            for _ in range(args.runs):
-                w, m, rc, so, se = run_once(cmd)
-                walls.append(w)
-                rss.append(m)
-            selfc["stage0"] = {"wall": median_range(walls), "rss_kb": statistics.median(rss),
-                               "size": sizes(orinb)}
 
     # ------------------------------------------------------------ Markdown
     L = []
@@ -269,9 +258,6 @@ def main():
     if selfc:
         w = selfc["wall"]
         L.append("| selfcompile (orin2 compiles compiler/main.or) | %s (%s-%s) | - | - | - | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
-        if "stage0" in selfc:
-            w = selfc["stage0"]["wall"]
-            L.append("| selfcompile, reference: Rust stage-0 `orinb` | %s (%s-%s) | - | - | - | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
     L.append("")
     L.append("### Peak RSS, MiB (median of ru_maxrss; ~1 MiB process-startup floor)")
     L.append("")
@@ -283,8 +269,6 @@ def main():
     if selfc:
         extra = " |" + " - |" * (len(LANGS) - 1)
         L.append("| selfcompile (orin2) | %.1f%s" % (selfc["rss_kb"] / 1024, extra))
-        if "stage0" in selfc:
-            L.append("| selfcompile (Rust orinb) | %.1f%s" % (selfc["stage0"]["rss_kb"] / 1024, extra))
     L.append("")
     L.append("### Binary size, KiB (unstripped / stripped) and build time, seconds (single run)")
     L.append("")

@@ -1,5 +1,10 @@
 # Orin Bootstrap Subset (Orin-B) — frozen contract v1
 
+> **Historical.** This is the contract of the Rust Stage 0, which is retired (it lives on the branch
+> `archive/stage0-final`, commit `ec1ba3e`; see `docs/bootstrap.md`). `compiler/` is **no longer
+> restricted to Orin-B**: it may use any language feature the current seed compiles. The diagnostics table
+> below stays valid until it moves to `docs/diagnostics.md` in a later cleanup PR.
+
 This is the **frozen language subset** implemented by the Stage 0 compiler (`bootstrap/`, Rust)
 and used to write the Stage 1 compiler (`compiler/`, Orin). It is a strict subset of the
 language in `spec/`; every program accepted here must keep its meaning in full Orin.

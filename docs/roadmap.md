@@ -40,7 +40,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 - The rewrite uses classes, interfaces, generics, closures and `Map`. The compiler's own
   invariants are stated as contract clauses and checked in CI with `--check-contracts`.
 - **MIR source spans** are added during the lowering rewrite (ADR-0020 D3).
-- The Stage 0 CI job is retired when `compiler/` first leaves Orin-B.
+- The Stage 0 CI jobs and the Rust crate were retired in the first post-freeze cleanup PR (branch `archive/stage0-final`, docs/bootstrap.md).
 
 ### 3. Concurrency (ADR-0017)
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
