@@ -218,6 +218,7 @@ single root. See [`docs/bootstrap.md`](docs/bootstrap.md).
 
 ## Learn more
 
+- Coming from TypeScript? [Orin for TypeScript developers](docs/ts-developers.md): where code that looks the same behaves differently
 - Language specification: [`spec/`](spec/spec.md)
 - Architecture and safety status: [`docs/architecture.md`](docs/architecture.md)
 - Design decisions (ADRs): [`docs/decisions/`](docs/decisions)

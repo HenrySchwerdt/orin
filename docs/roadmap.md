@@ -44,10 +44,48 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   invariants are stated as contract clauses and checked in CI with `--check-contracts`.
 - **MIR source spans** are added during the lowering rewrite (ADR-0020 D3).
 - The Stage 0 CI jobs and the Rust crate were retired in the first post-freeze cleanup PR (branch `archive/stage0-final`, docs/bootstrap.md).
+- **Contract and class standard** (project owner, 2026-10-13): every class carries meaningful
+  `@Invariant`s, stateful logic is a class (class invariants are runtime-checked, record invariants
+  are not), every non-trivial function states real `@Requires`/`@Ensures`. Step 1 (loader/diag) is
+  brought up to this standard in step 1b. Details: `docs/rewrite.md`.
+
+### 2a. Diagnostics and CLI polish (directly after the rewrite)
+Goal (project owner, 2026-10-13): hints and CLI tooling that are a pleasure to use, built on
+the rewritten, contract-checked front end.
+- **Diagnostics:** "did you mean" for names, fields, methods, imports and TS habits
+  (`docs/ts-diagnostics.md`: `null`/`undefined`, `any`, `===`, `var`, `throw`, `extends`, union
+  types such as `type Id = int | string`, which is accepted silently today); secondary labels
+  ("declared here", "moved here"); concrete fix suggestions as machine-applicable edits (LSP code
+  actions, MCP, `orin fix`); one stable code and an `orin explain <code>` page per diagnostic
+  (`docs/diagnostics.md`); a golden test per diagnostic.
+- **CLI:** consistent subcommands and flags with `--help` and examples for each; colour and
+  terminal-width-aware output (off for non-TTY, `NO_COLOR`); `--format=json` for every command;
+  short timing summary; `orin new` (package scaffold), `orin fix`, `orin explain`; watch mode
+  for `check`/`test`; clear exit codes (documented).
+- Measured: a TS-developer task corpus (common mistakes from `docs/ts-developers.md`) where each
+  mistake must produce a diagnostic with a correct, applicable suggestion.
 
 ### 3. Concurrency (ADR-0017)
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
 primitives.
+
+### 3a. Flagship: TypeScript tooling in Orin (after concurrency)
+Goal (project owner, 2026-10-13): show that Orin is the natural language for TypeScript tooling —
+TS-familiar syntax for the community, native speed **at least on par with Go**, measured, not claimed.
+1. **Benchmark target first:** Orin formatter/parser on a large TS-like corpus vs a Go parser
+   (e.g. esbuild's); tracked in `docs/benchmarks.md`. Today Orin is about 1.5-1.6x slower than Go on
+   `nbody`/`mapfreq`; the levers are unboxing, RC elision, escape analysis (step 4) and threads (step 3).
+2. **Port the TypeScript compiler** (Apache-2.0, port with notice), staged: scanner + parser →
+   binder → checker. Not a 1:1 translation: the TS compiler relies on shared mutable graphs (parent
+   pointers, symbol back-links, caches); in Orin these become **arenas with index ids** (as in
+   swc/oxc) and `Graph<T>`. Parallel checking needs read-only sharing between tasks: `Shared<T>`
+   (post-1.0 option in ADR-0017) must be designed first (ADR).
+3. Expected findings: missing library pieces (arena collection, string interning, fast file walking)
+   and language friction — fed back into post-1.0 ADRs.
+Also: [Orin for TypeScript developers](ts-developers.md) (done): the semantic differences behind the
+familiar syntax; every example is a test (`tests/next/**/ts_dev_*.or`), so update the page with any
+language-surface ADR. Next: "did you mean" diagnostics for common TS habits — candidate list in
+[ts-diagnostics.md](ts-diagnostics.md).
 
 ### 4. Optimisation ‖ provability (in parallel)
 - **Optimisation:** unboxing, RC elision, escape analysis/stack allocation, LLVM tuning. Each step
