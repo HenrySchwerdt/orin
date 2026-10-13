@@ -1,0 +1,62 @@
+// orin — the self-hosted Orin compiler driver (Stage 1+).
+// CLI (identical to the Stage 0 `orinb` subset used by tools/):
+//   orin check <entry.or>
+//   orin compile <entry.or> -o <out.c>
+
+import { args, exit } from "std:process";
+import { writeFile } from "std:fs";
+import { SourceMap, Diagnostic, render } from "./diag";
+import { loadAll } from "./loader";
+import { check } from "./check";
+import { generate } from "./codegen";
+
+function usage(): void {
+  console.error("usage:\n  orin check <entry.or>\n  orin compile <entry.or> -o <out.c>");
+  exit(2);
+}
+
+function report(sm: SourceMap, diags: Diagnostic[]): void {
+  for (const d of diags) {
+    console.error(render(sm, d));
+  }
+  exit(1);
+}
+
+function main(): void {
+  const argv = args();
+  if (argv.length < 2) {
+    usage();
+    return;
+  }
+  const cmd = argv[0];
+  const entry = argv[1];
+  const isCompile = cmd == "compile";
+  if (!isCompile && cmd != "check") {
+    usage();
+    return;
+  }
+  if (isCompile && (argv.length < 4 || argv[2] != "-o")) {
+    usage();
+    return;
+  }
+  const loaded = loadAll(entry);
+  if (loaded.diags.length > 0) {
+    report(loaded.sm, loaded.diags);
+    return;
+  }
+  const program = loaded.program.unwrap();
+  const checked = check(program, loaded.sm);
+  if (checked.isErr()) {
+    report(loaded.sm, checked.unwrapErr());
+    return;
+  }
+  if (!isCompile) {
+    return;
+  }
+  const c = generate(checked.unwrap());
+  const written = writeFile(argv[3], c);
+  if (written.isErr()) {
+    console.error("error: cannot write " + argv[3] + ": " + written.unwrapErr());
+    exit(1);
+  }
+}
