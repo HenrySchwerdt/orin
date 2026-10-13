@@ -61,7 +61,7 @@ the rewritten, contract-checked front end.
   for `check`/`test`; clear exit codes (documented).
 - Measured: a TS-developer task corpus (common mistakes from `docs/ts-developers.md`) where each
   mistake must produce a diagnostic with a correct, applicable suggestion.
-- **Refusal protocol for agents (ADR-0029, proposed):** every error and verification result says
+- **Refusal protocol for agents (ADR-0029, accepted):** every error and verification result says
   who acts next — `FIX_CODE`, `STRENGTHEN_SPEC`, `NEEDS_DECISION` (with a pre-formulated question
   and options for the human) or `NEEDS_AUTHORITY` (grant, dependency rule, assumption or weaker
   contract: never applied by an agent itself). `orin diff` flags weakened contracts and widened

@@ -1,6 +1,6 @@
 # ADR-0029: Refusal protocol — every "no" of the toolchain says who has to act next
 
-Status: proposed (2026-10-13). Related: ADR-0020 D1 (status vocabulary, `NEEDS_DECISION`),
+Status: accepted (2026-10-13; project owner: "wir testen es mal"). Related: ADR-0020 D1 (status vocabulary, `NEEDS_DECISION`),
 ADR-0021/0027 (capabilities), ADR-0028 (contract quality), ADR-0023 (OSIG diff), vision §20a
 point 6 (governance: an agent must not silently weaken a contract or add rights to make a red
 result green).
