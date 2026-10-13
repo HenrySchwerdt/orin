@@ -17,8 +17,8 @@ import { classOfGeneric, checkClassBounds } from "./classes";
 import { hasResource, resourceNested } from "./resources";
 import {
   Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, findType,
-  findInst, originOf, isVoid, tysKey, mapGenType, isMapKeyType, showType, addInst, addBound,
-  typeInRange, typesInRange,
+  findInst, originOf, isVoid, tysKey, mapGenType, isMapKeyType, showType, addBound, boundOf,
+  isWellFormedEnv, typeEq, typeInRange, typesInRange,
 } from "./env";
 
 export const CYCLE_MSG: string = "type alias is defined in terms of itself";
@@ -33,22 +33,43 @@ export function resourceIn(span: Span, what: string): Diagnostic {
   );
 }
 
-export type TScope = { unit: usize; names: string[]; tys: Type[]; depth: usize; };
+// The scope type expressions are resolved in: the unit whose names are visible, the type parameters
+// of the enclosing generic declaration with the types they stand for (parallel arrays), and how deeply
+// generic instantiations are nested (bounded by MAX_DEPTH). A program with a duplicate type parameter is
+// reported (E0304) but still reaches the resolver, so the names are not required to be distinct.
+@Invariant(this.names.length == this.tys.length)
+export class TScope {
+  unit: usize;
+  names: string[];
+  tys: Type[];
+  depth: usize;
+
+  constructor(unit: usize, names: string[], tys: Type[], depth: usize) {
+    this.unit = unit;
+    this.names = names;
+    this.tys = tys;
+    this.depth = depth;
+  }
+}
+
 export type TyOut = { env: Env; ty: Type; };
 export type TysOut = { env: Env; tys: Type[]; };
 export type SigOut = { env: Env; params: Type[]; locals: Local[]; ret: Type; };
 export type FuncOut = { env: Env; fid: usize; };
 
+@Requires(names.length == tys.length)
+@Ensures(result.depth == 0 && result.unit == unit)
 export function scopeOf(unit: usize, names: string[], tys: Type[]): TScope {
-  return TScope { unit: unit, names: names, tys: tys, depth: 0 };
+  return new TScope(unit, names, tys, 0);
 }
 
+@Ensures(result.names.length == 0 && result.tys.length == 0)
 export function plainScope(unit: usize): TScope {
-  const names: string[] = [];
-  const tys: Type[] = [];
-  return TScope { unit: unit, names: names, tys: tys, depth: 0 };
+  return new TScope(unit, [], [], 0);
 }
 
+@Ensures(result.isSome() ==> result.unwrap() < names.length && names[result.unwrap()] == n)
+@Ensures(result.isNone() ==> !names.includes(n))
 export function indexOfName(names: string[], n: string): Option<usize> {
   return names.indexOf(n);
 }
@@ -58,12 +79,60 @@ function inStack(stack: int[], k: int): bool {
 }
 
 // A resolution result is sound: the type refers only to records / unions / interfaces of its
-// environment, and the instance indexes are as large as the instance list.
+// environment, and the environment is well-formed (the instance table fits its tables).
 export function resolvedOk(r: Result<TyOut, Diagnostic>): bool {
   return match (r) {
-    Ok(o) => typeInRange(o.env, o.ty) && o.env.instIdx.size == o.env.insts.length,
+    Ok(o) => typeInRange(o.env, o.ty) && isWellFormedEnv(o.env),
     Err(_) => true,
   };
+}
+
+// A resolved signature is sound: one parameter type and one local per declared parameter, all
+// types inside the returned environment.
+export function sigOk(decl: FunctionDecl, r: Result<SigOut, Diagnostic>): bool {
+  return match (r) {
+    Ok(o) => o.params.length == decl.params.length
+        && o.locals.length == decl.params.length
+        && typesInRange(o.env, o.params)
+        && typeInRange(o.env, o.ret)
+        && isWellFormedEnv(o.env),
+    Err(_) => true,
+  };
+}
+
+// An instantiated function is sound: its id is inside the function table, the instance is
+// registered (found again by its generic and arguments), and its type arguments are the ones asked for.
+export function funcOutOk(g: usize, args: Type[], r: Result<FuncOut, Diagnostic>): bool {
+  return match (r) {
+    Ok(o) => o.fid < o.env.funcs.length && isWellFormedEnv(o.env),
+    Err(_) => true,
+  };
+}
+
+// Every entry of `binds` that was bound stays bound (and unchanged) in `after`.
+export function bindsKept(before: Option<Type>[], after: Option<Type>[]): bool {
+  if (before.length != after.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < before.length) {
+    if (before[i].isSome()
+        && (after[i].isNone() || !typeEq(before[i].unwrap(), after[i].unwrap()))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Nothing is bound.
+export function allUnbound(binds: Option<Type>[]): bool {
+  for (const b of binds) {
+    if (b.isSome()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function ok(env: Env, ty: Type): Result<TyOut, Diagnostic> {
@@ -84,6 +153,7 @@ function depthErr(span: Span, what: string): Diagnostic {
 
 // `stack` holds the aliases currently being expanded (cycle detection): a plain alias index, or
 // -(generic id) - 1 for a generic alias.
+@Requires(idx < env.aliases.length && isWellFormedEnv(env))
 @Ensures(resolvedOk(result))
 export function aliasType(env: Env, idx: usize, stack: int[]): Result<TyOut, Diagnostic> {
   const a = env.aliases[idx];
@@ -96,6 +166,7 @@ export function aliasType(env: Env, idx: usize, stack: int[]): Result<TyOut, Dia
   return resolveTy(env, plainScope(a.unit), a.target, false, st);
 }
 
+@Requires(sc.unit < env.units.length && isWellFormedEnv(env))
 @Ensures(resolvedOk(result))
 export function resolveTy(
   env: Env,
@@ -130,6 +201,8 @@ export function resolveTy(
   };
 }
 
+@Requires(sc.unit < env.units.length && isWellFormedEnv(env))
+@Ensures(resolvedOk(result))
 export function resolveType(
   env: Env,
   sc: TScope,
@@ -290,6 +363,7 @@ function resolveMapType(
   return Ok(r);
 }
 
+@Ensures(result.length == ps.length)
 function paramNames(ps: Ident[]): string[] {
   return ps.map(p => p.name);
 }
@@ -335,12 +409,7 @@ function resolveGeneric(
       }
       let st = stack;
       st.push(key);
-      const sc2 = TScope {
-        unit: gt.unit,
-        names: paramNames(params),
-        tys: tys,
-        depth: sc.depth + 1,
-      };
+      const sc2 = new TScope(gt.unit, paramNames(params), tys, sc.depth + 1);
       return resolveTy(cur, sc2, target, false, st);
     },
     _ => instType(cur, g, tys, sc.depth, te.span),
@@ -349,7 +418,13 @@ function resolveGeneric(
 
 // The record / union instance of generic type `g` at `args`, created on first use. The instance
 // is registered before its fields are resolved so recursive types terminate.
+@Requires(g < env.gtypes.length && isWellFormedEnv(env))
+@Requires(args.length == env.gtypes[g].decl.typeParams.length && typesInRange(env, args))
 @Ensures(resolvedOk(result))
+@Ensures(match (result) {
+  Ok(o) => originOf(o.env, o.ty).isSome() && originOf(o.env, o.ty).unwrap().gid == g,
+  Err(_) => true,
+})
 export function instType(
   env: Env,
   g: usize,
@@ -391,19 +466,14 @@ export function instType(
     return Err(depthErr(span, `type \`${gt.decl.name.name}\``));
   }
   const name = `${gt.qname}<${tysKey(env, args)}>`;
-  const sc2 = TScope {
-    unit: gt.unit,
-    names: paramNames(gt.decl.typeParams),
-    tys: args,
-    depth: depth + 1,
-  };
+  const sc2 = new TScope(gt.unit, paramNames(gt.decl.typeParams), args, depth + 1);
   let e = env;
   return match (gt.decl.body) {
     DRecord(fields) => {
       const id = e.records.length;
       const none: FieldDef[] = [];
       e.records.push(RecordDef { name: name, fields: none });
-      e = addInst(e, Inst { kind: 0, gid: g, args: args, id: id, depth: depth });
+      e.insts.add(Inst { kind: 0, gid: g, args: args, id: id, depth: depth });
       let out: FieldDef[] = [];
       for (const f of fields) {
         for (const o of out) {
@@ -422,7 +492,7 @@ export function instType(
       const id = e.unions.length;
       const none: VariantDef[] = [];
       e.unions.push(UnionDef { name: name, variants: none });
-      e = addInst(e, Inst { kind: 1, gid: g, args: args, id: id, depth: depth });
+      e.insts.add(Inst { kind: 1, gid: g, args: args, id: id, depth: depth });
       let out: VariantDef[] = [];
       for (const v of vs) {
         let payload: Type[] = [];
@@ -444,6 +514,10 @@ export function instType(
 
 // A fresh opaque type for an abstract check: a field-less record named after the parameter.
 // Nothing can be done with a value of such a type except bind, pass, return and store it.
+@Ensures(match (result.ty) {
+  TyRecord(r) => r == env.records.length && result.env.records.length == env.records.length + 1,
+  _ => false,
+})
 export function mkOpaque(env: Env, name: string): TyOut {
   let e = env;
   const id = e.records.length;
@@ -454,6 +528,11 @@ export function mkOpaque(env: Env, name: string): TyOut {
 
 // An opaque type bounded by interface `iface` (`T extends I`, ADR-0019): it additionally supports the
 // methods of `I` and converts to `I`.
+@Requires(iface < env.ifaces.length)
+@Ensures(match (result.ty) {
+  TyRecord(r) => boundOf(result.env, r).isSome() && boundOf(result.env, r).unwrap() == iface,
+  _ => false,
+})
 export function mkOpaqueBound(env: Env, name: string, iface: usize): TyOut {
   const o = mkOpaque(env, name);
   const rid = match (o.ty) {
@@ -467,6 +546,8 @@ export function mkOpaqueBound(env: Env, name: string, iface: usize): TyOut {
 // Function signatures and instances
 // ---------------------------------------------------------------------------
 
+@Requires(sc.unit < env.units.length && isWellFormedEnv(env))
+@Ensures(sigOk(decl, result))
 export function resolveSig(env: Env, sc: TScope, decl: FunctionDecl): Result<SigOut, Diagnostic> {
   let cur = env;
   let params: Type[] = [];
@@ -507,6 +588,7 @@ export function resolveSig(env: Env, sc: TScope, decl: FunctionDecl): Result<Sig
 // `depth` is the instantiation depth of the *new* instance.
 // `keyHash<K>` / `keyEq<K>` of the Map prelude (array/map.or) are replaced by the function of the key class
 // (`hashInt`, `eqStr`, ...): a generic body cannot hash or compare a `K` itself (ADR-0018).
+@Ensures(result.isSome() ==> result.unwrap() < env.funcs.length)
 function keyClassFunc(env: Env, qname: string, args: Type[]): Option<usize> {
   if (qname != "$array/map.keyHash" && qname != "$array/map.keyEq" || args.length != 1) {
     return None;
@@ -533,6 +615,8 @@ function keyClassFunc(env: Env, qname: string, args: Type[]): Option<usize> {
   return None;
 }
 
+@Requires(g < env.gfuncs.length && isWellFormedEnv(env) && typesInRange(env, args))
+@Ensures(funcOutOk(g, args, result))
 export function instFunc(
   env: Env,
   g: usize,
@@ -563,7 +647,7 @@ export function instFunc(
   }
   const gf = env.gfuncs[g];
   const names = paramNames(gf.decl.typeParams);
-  const sc = TScope { unit: gf.unit, names: names, tys: args, depth: 0 };
+  const sc = new TScope(gf.unit, names, args, 0);
   const sig = resolveSig(env, sc, gf.decl)?;
   let e = sig.env;
   const id = e.funcs.length;
@@ -601,7 +685,7 @@ export function instFunc(
     cls: gf.cls,
     srcRet: srcRet,
   });
-  e = addInst(e, Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
+  e.insts.add(Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
   return Ok(FuncOut { env: e, fid: id });
 }
 
@@ -609,6 +693,7 @@ export function instFunc(
 // Unification of a callee's parameter type expressions with argument types
 // ---------------------------------------------------------------------------
 
+@Ensures(result.length == n && allUnbound(result))
 export function noBinds(n: usize): Option<Type>[] {
   let out: Option<Type>[] = [];
   while (out.length < n) {
@@ -620,6 +705,8 @@ export function noBinds(n: usize): Option<Type>[] {
 // Binds the type parameters `tp` mentioned in `te` by matching `te` against the concrete type
 // `actual`. Mismatches are ignored here (the later type check reports them); the first binding
 // of a parameter wins.
+@Requires(tp.length == binds.length)
+@Ensures(bindsKept(binds, result))
 export function unify(
   env: Env,
   unit: usize,
@@ -755,6 +842,7 @@ function unifyGeneric(
 }
 
 // True if `te` mentions a type parameter of `tp` that is still unbound.
+@Requires(tp.length == binds.length)
 export function mentionsUnbound(te: TypeExpr, tp: string[], binds: Option<Type>[]): bool {
   return match (te.kind) {
     TArray(inner) => mentionsUnbound(inner, tp, binds),

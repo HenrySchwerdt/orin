@@ -147,6 +147,39 @@ No regression: the loader is a tiny part of the time (parsing and checking domin
 lookups replaced linear searches over a few dozen files. The contract-checked compiler is slower by
 design and is not part of this comparison.
 
+## Contract and class standard (from step 2a on)
+
+The project owner's review of step 1 asked for clearly more invariants and more classes. From step 2a on every
+rewritten module follows these rules (the contracts are checked by the `contracts` CI job, the unit tests run with
+`orin test`, which checks them too):
+
+1. **Every class has at least one meaningful `@Invariant`.** State that several functions thread through (a record
+   plus free functions: tables with their indexes, parallel arrays, a scope stack) becomes a class with methods where
+   that is a mechanical change, because a class `@Invariant` is checked after every non-private method and a record
+   `@Invariant` is not checked at run time at all. A class whose only job is to keep arrays in step (`Captures`,
+   `TScope`) still earns its keep: the invariant is the point. Keep invariants O(1) or O(depth); a method that
+   mutates may state the O(n) property in its `@Ensures` instead.
+2. **Every exported or non-trivial function has `@Requires` / `@Ensures` that state a real property:** lookup after
+   bind returns the bound value, `open` / `close` change the depth by one, an index found in a table is in range and
+   points at what was asked for, an index map is as large as its array, a resolved type refers only to ids that exist,
+   a parallel-array argument has equal lengths, `declare` does not shrink the tables. Trivial one-liners (`isInt`)
+   need none.
+3. **Well-formedness helpers**: a small exported predicate written with loops (no closures, no `map` / `filter`, no
+   self-call) that is reused in `@Requires`, `@Ensures` and `@Invariant` (`marksOrdered`, `noRepeats`, `typeInRange`,
+   `isWellFormedEnv`, `sigOk`, `bindsKept`), like `isWellFormed` of the loader. Remember: a clause cannot call a function
+   value, so `instKey` / `typesId` are loops although the code around them could use `map`.
+4. **Ask of each contract which bug it would catch.** Good: `typeEq(a, b) == (typeId(a) == typeId(b))` (the two
+   notions of type identity cannot drift apart, which would corrupt the instance cache), `Insts.add` requires a fresh key
+   *and* a fresh id, `bindsKept` (unification never unbinds), `declare` fails only when the name is already in the
+   innermost scope. Not good: a clause that restates the body. When in doubt err on the side of more coverage; a clause
+   that never fails on the compiler's own sources is still worth it when the property is a real design rule.
+5. **Tests that would fail if an invariant were broken**: call sequences from outside (`open` / `bind` / `close` /
+   `lookup`, instance add / find / origin) in `compiler/tests/<module>_test.or`.
+6. **Do not state what the data does not guarantee.** A program with a duplicate type parameter is reported (E0304) but
+   still reaches the resolver, so `TScope` must not require distinct names; the first draft did, and an error test would
+   have trapped the contract-checked compiler. Run the error suites with the contract-checked compiler before you
+   believe an invariant.
+
 ## Step 2a: `check/{env,fnctx,types}.or` (the checker's foundation)
 
 Rewritten: symbol tables, scope stack, type-instance caches. `body.or`, `decls.or`, `collect.or` only got the
@@ -155,22 +188,34 @@ loading and the I/O builtins were not touched (ADR-0021 Stage A work happens the
 
 | Old | New |
 |---|---|
-| `Names { types: TypeBind[]; vals: ValBind[] }`, `findType` / `findVal` linear scans | `Names { types: Map<string, TypeEnt>; vals: Map<string, ValEnt> }` |
-| `findInst`, `originOf`: linear scan of `Env.insts` per call | `Env.instIdx` (key `kind:gid:typeIds`) and `Env.originIdx` (key `kind:id`), maintained by one function `addInst`; `typeId` is a structural key (ids, not names) |
-| `Env.bounds: OpaqueBound[]` + `boundOf` scan | `Env.bounds: Map<usize, usize>`, `addBound` |
-| `FnCtx.names / ids / marks` flat stack with linear `lookupLocal` | class `Scope` (`Map<string, Bind>` + undo log + marks), `FnCtx.scope`; `open` / `close` / `bind` / `lookup` / `inInnermost` |
+| `Names { types: TypeBind[]; vals: ValBind[] }`, `findType` / `findVal` linear scans | class `Names` over two `Map`s |
+| `findInst`, `originOf`: linear scan of `Env.insts` per call | class `Insts` with two `Map` indexes (keys `kind:gid:typeIds`, `kind:id`) maintained by `add`; `typeId` is a structural key (ids, not names) |
+| `Env.bounds: OpaqueBound[]` + `boundOf` scan; `TScope` record | `Env.bounds: Map<usize, usize>`, `addBound`; `TScope` class |
+| `FnCtx.names / ids / marks` flat stack with linear `lookupLocal`; `capNames / capTys / capIds` parallel arrays | classes `Scope` (`Map<string, Bind>` + undo log + marks, `FnCtx.scope`) and `Captures` (`FnCtx.caps`); `open` / `close` / `bind` / `lookup` / `inInnermost` |
 | two 30-field `FnCtx { .. }` literals full of `noX` consts | `blankCtx` + the two constructors set only what differs (empty array / `None` literals infer from the field type) |
 | string `+` building, index loops | template literals, `map` / `join` / `filter` / `indexOf` / `includes` |
 | `dedupDiags` O(n^2) with `diagEq` | one pass with a `Map` of diagnostic keys (`diagEq` removed, it had no other user) |
 
-Contracts (all checked by the `contracts` CI job, none fired): `Scope` `@Invariant`s (`marksOrdered`: scope marks
-non-decreasing and inside the undo log, `vis.size <= log.length`: scope balance), `addInst`
-`@Requires` (an instance is created once: its key is not yet in the index) and `@Ensures` (both indexes stay as
-large as `insts`), `@Ensures(resolvedOk(result))` on `aliasType` / `resolveTy` / `instType` (the resolved type refers
-only to records / unions / interfaces that exist in the returned environment: `typeInRange`; the index sizes
-match). ADR-0015 names "`substitute` leaves no type parameters": there is no `substitute` function in the checker (a
-type expression is resolved against a `TScope` that maps the parameter names to concrete types, so no parameter can
-survive by construction); the dangling-id check above is the corresponding property of the resolver.
+Classes (0 before, 5 now): `Names` (the per-unit name tables; `bound == types.size + vals.size`, so a silent
+overwrite shows), `Insts` (the instance table with its two indexes; both stay as large as the list; `add` requires a
+fresh key and a fresh record / union / function id), `Scope` (scope stack over a `Map` with an undo log; marks ordered
+and inside the log, `vis.size <= log.length`), `Captures` (the three parallel arrays of an arrow function's captures:
+equal lengths, names and ids distinct), `TScope` (the resolver's type-parameter scope: names and types in step).
+`Env.insts` is an `Insts`, `FnCtx.scope` a `Scope`, `FnCtx.caps` a `Captures`; the call sites that changed are
+`withEnv` (`insts.size()`), the closure lowering (`inner.caps.names`), the three `TScope` literals of `body.or` and the
+two `Names` binds of `collect.or`.
+
+Contracts: 110 clauses in the three files (0 before): `env.or` 45, `fnctx.or` 36, `types.or` 29. None fired on the
+compiler's own sources, the conformance suites or the unit tests (see the numbers in the final report of the step).
+Highlights: every resolution function (`resolveTy`, `resolveType`, `aliasType`, `instType`, `resolveSig`, `instFunc`)
+ensures `resolvedOk` / `sigOk` / `funcOutOk` (types refer only to ids that exist, ids returned are inside their tables,
+`isWellFormedEnv`), `instType` also ensures that the instance it returns is registered under the generic it was asked
+for; `unify` requires `tp.length == binds.length` and ensures `bindsKept`; `mkOpaque*` ensure the new record id and
+the bound; `declare` / `newLocal` / `lookupVar` / `pushScope` / `popScope` state their effect on the locals, scope depth
+and captures. ADR-0015 names "`substitute` leaves no type parameters": there is no `substitute` function in the checker
+(a type expression is resolved against a `TScope` that maps parameter names to concrete types, so no parameter can
+survive by construction); the dangling-id and instance-registration checks above are the corresponding properties of
+the resolver.
 
 Lessons:
 

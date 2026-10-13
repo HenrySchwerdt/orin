@@ -6,8 +6,9 @@ import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
 import { Span, diag } from "../diag";
 import { Type } from "../hir";
 import {
-  Scope, emptyNames, findType, findVal, EntRecord, VFunc, typeId, typesId, instKey, originKey,
-  dedupDiags,
+  Scope, Captures, TScope, Insts, Inst, emptyNames, findType, findVal, EntRecord, VFunc, typeId,
+  typesId, instKey, originKey, dedupDiags, noRepeats, typeEq, typesEq, noBinds, bindsKept,
+  allUnbound, indexOfName,
 } from "../check";
 
 function idOf(o: Option<usize>): int {
@@ -66,8 +67,8 @@ function scopeOverClose(): void {
 @Test
 function nameTables(): void {
   let n = emptyNames();
-  n.types.set("T", EntRecord(3));
-  n.vals.set("f", VFunc(7));
+  n.bindType("T", EntRecord(3));
+  n.bindVal("f", VFunc(7));
   assertEqBool(findType(n, "T").isSome(), true, "type found");
   assertEqBool(findType(n, "f").isSome(), false, "namespaces are separate");
   assertEqBool(findVal(n, "f").isSome(), true, "value found");
@@ -97,4 +98,144 @@ function dedupKeepsFirstOccurrence(): void {
   assertEqUsize(out.length, 2, "two distinct");
   assertEqString(out[0].message, "x", "first");
   assertEqString(out[1].message, "y", "second");
+}
+
+// ---- call sequences: the properties the contracts state, checked from outside ----------------
+
+@Test
+function scopeDepthIsBalanced(): void {
+  let s = new Scope();
+  const d0 = s.depth();
+  s.open();
+  s.open();
+  s.bind("a", 1);
+  s.open();
+  assertEqUsize(s.depth(), d0 + 3, "three opened");
+  s.close();
+  s.close();
+  s.close();
+  assertEqUsize(s.depth(), d0, "balanced after as many closes as opens");
+}
+
+@Test
+function bindThenLookupReturnsTheBinding(): void {
+  let s = new Scope();
+  const names = ["a", "b", "c", "a"];
+  let i: usize = 0;
+  while (i < names.length) {
+    s.bind(names[i], i * 10);
+    assert(idOf(s.lookup(names[i])) == (i * 10).toInt(), "lookup right after bind");
+    assertEqBool(s.inInnermost(names[i]), true, "bound name is in the innermost scope");
+    i += 1;
+  }
+  assert(idOf(s.lookup("a")) == 30, "the last binding of a name wins");
+}
+
+@Test
+function closeRestoresEveryShadowedBinding(): void {
+  let s = new Scope();
+  s.bind("x", 1);
+  s.open();
+  s.bind("x", 2);
+  s.open();
+  s.bind("x", 3);
+  assert(idOf(s.lookup("x")) == 3, "innermost");
+  s.close();
+  assert(idOf(s.lookup("x")) == 2, "middle restored");
+  assertEqBool(s.inInnermost("x"), true, "x belongs to the middle scope");
+  s.close();
+  assert(idOf(s.lookup("x")) == 1, "outer restored");
+  s.open();
+  assertEqBool(s.inInnermost("x"), false, "x is not declared in the fresh scope");
+  assert(idOf(s.lookup("x")) == 1, "but visible");
+}
+
+@Test
+function capturesAreParallelAndDistinct(): void {
+  let c = new Captures();
+  c.add("a", TyInt, 4);
+  c.add("b", TyString, 5);
+  assertEqUsize(c.size(), 2, "two captured");
+  assertEqUsize(c.names.length, c.tys.length, "names and types in step");
+  assertEqUsize(c.ids.length, c.names.length, "names and ids in step");
+  assert(idOf(c.indexOf("b")) == 1, "order of first use");
+  assert(idOf(c.indexOf("z")) == -1, "unknown");
+  assertEqBool(c.hasId(5), true, "id 5");
+  assertEqBool(c.hasId(6), false, "id 6");
+}
+
+@Test
+function instanceTableKeepsIndexesInStep(): void {
+  let t = new Insts();
+  assertEqUsize(t.size(), 0, "empty");
+  t.add(Inst { kind: 0, gid: 3, args: [TyInt], id: 7, depth: 0 });
+  t.add(Inst { kind: 0, gid: 3, args: [TyString], id: 8, depth: 0 });
+  t.add(Inst { kind: 2, gid: 3, args: [TyInt], id: 7, depth: 1 });
+  assertEqUsize(t.size(), 3, "three instances");
+  assertEqBool(t.has(0, 3, [TyInt]), true, "found by generic and arguments");
+  assertEqBool(t.has(1, 3, [TyInt]), false, "kind is part of the key");
+  assertEqBool(t.has(0, 3, [TyBool]), false, "arguments are part of the key");
+  assert(t.find(0, 3, [TyString]).unwrap().id == 8, "find returns the instance asked for");
+  assert(t.origin(0, 7).unwrap().args.length == 1, "origin by record id");
+  assert(t.origin(2, 7).unwrap().depth == 1, "a function and a record may share an id");
+  assertEqBool(t.origin(1, 7).isNone(), true, "no union 7");
+  assertEqUsize(t.at(1).id, 8, "creation order");
+}
+
+@Test
+function typeEqualityAgreesWithTypeKeys(): void {
+  const ts: Type[] = [
+    TyInt,
+    TyUsize,
+    TyBool,
+    TyString,
+    TyVoid,
+    TyRecord(1),
+    TyRecord(2),
+    TyUnion(1),
+    TyArray(TyInt),
+    TyArray(TyUsize),
+    TyOption(TyInt),
+    TyResult(TyInt, TyString),
+    TyResult(TyString, TyInt),
+    TyFn([TyInt], TyVoid),
+    TyFn([TyInt, TyInt], TyVoid),
+  ];
+  for (const a of ts) {
+    for (const b of ts) {
+      assertEqBool(typeEq(a, b), typeId(a) == typeId(b), "typeEq == same key");
+    }
+  }
+  assertEqBool(typesEq([TyInt, TyBool], [TyInt, TyBool]), true, "lists equal");
+  assertEqBool(typesEq([TyInt], [TyInt, TyBool]), false, "lists differ in length");
+}
+
+@Test
+function unificationBindsOnlyForward(): void {
+  const b = noBinds(3);
+  assertEqUsize(b.length, 3, "one slot per parameter");
+  assertEqBool(allUnbound(b), true, "nothing bound");
+  let c = b;
+  c[1] = Some(TyInt);
+  assertEqBool(bindsKept(b, c), true, "binding a slot keeps the others");
+  assertEqBool(bindsKept(c, b), false, "unbinding a slot is not allowed");
+  assert(idOf(indexOfName(["T", "U"], "U")) == 1, "type parameter position");
+  assert(idOf(indexOfName(["T", "U"], "V")) == -1, "not a parameter");
+}
+
+@Test
+function scopeRecordsKeepNamesAndTypesInStep(): void {
+  const sc = new TScope(0, ["T", "U"], [TyInt, TyBool], 2);
+  assertEqUsize(sc.names.length, sc.tys.length, "parallel");
+  assertEqUsize(sc.depth, 2, "depth");
+}
+
+@Test
+function dedupLeavesNoRepeats(): void {
+  const sp = Span { file: 0, start: 1, end: 2 };
+  const a = diag("E0400", sp, "x");
+  const b = diag("E0401", sp, "x");
+  assertEqBool(noRepeats([a, b, a]), false, "repeat detected");
+  assertEqBool(noRepeats(dedupDiags([a, b, a, b])), true, "dedup removes them");
+  assertEqUsize(dedupDiags([a, b, a, b]).length, 2, "code is part of the identity");
 }
