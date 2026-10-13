@@ -36,8 +36,8 @@ claim about Orin in general.
     Orin-B function parameters are immutable). `qsort_inplace`: iterative Lomuto with an explicit stack
     (Go and C copy the input first because Orin does a COW copy on first write).
   - `selfcompile`: `orin2 compile compiler/main.or` (~222 KB of Orin source, output 720 KB of C), the
-    only realistic workload; it has no Go/C counterpart. The Rust stage-0 compiler on the same input is
-    listed as a reference only (a different program, not an equivalent implementation). `cc` time is not included.
+    only realistic workload; it has no Go/C counterpart. (The reference row for the Rust stage-0
+    compiler was dropped when Stage 0 was retired; see docs/bootstrap.md.) `cc` time is not included.
 - **Limits**: 4 shared vCPUs in a VM, so run-to-run noise is visible in the min-max ranges; Go's GC runs on
   other cores and its wall time does not include that CPU time. No confidence intervals beyond min-max.
   Spec 11 asks for latency distributions, CPU time and Rust/Koka comparisons; those are not done.
@@ -59,7 +59,6 @@ Machine: Intel(R) Xeon(R) Processor @ 2.80GHz, 4 cores, 15.7 GiB RAM; Linux-6.18
 | strings | 0.188 (0.156-0.231) | 0.164 (0.146-0.181) | 0.081 (0.075-0.104) | 1.15x | 2.32x |
 | wordfreq | 0.234 (0.218-0.253) | 0.142 (0.138-0.152) | 0.115 (0.105-0.129) | 1.65x | 2.04x |
 | selfcompile (orin2 compiles compiler/main.or) | 0.101 (0.085-0.123) | - | - | - | - |
-| selfcompile, reference: Rust stage-0 `orinb` | 0.039 (0.036-0.046) | - | - | - | - |
 
 ### Peak RSS, MiB (median of ru_maxrss; ~1 MiB process-startup floor)
 
@@ -73,7 +72,6 @@ Machine: Intel(R) Xeon(R) Processor @ 2.80GHz, 4 cores, 15.7 GiB RAM; Linux-6.18
 | strings | 46.2 | 23.4 | 34.6  |
 | wordfreq | 2.2 | 6.6 | 1.9  |
 | selfcompile (orin2) | 15.4 | - | - |
-| selfcompile (Rust orinb) | 12.8 | - | - |
 
 ### Binary size, KiB (unstripped / stripped) and build time, seconds (single run)
 
@@ -138,8 +136,8 @@ Further data points: `qsort_func` incurs 1.78M array growth reallocations (`push
 arrays per call, capacity not pre-sized) and uses 2x C's RSS; the COW machinery itself is cheap in these
 programs (`cow_copies` is 0-1 except in the compiler, where 21k copies of 163k make_unique calls occur).
 The self-compile workload allocates 1.02M objects and performs 1.74M retains; the compiler binary built
-by Orin takes 0.10 s versus 0.04 s for the Rust stage-0 compiler on the same source (not a like-for-like
-comparison of implementations). Binary size is a strength of the C-emitting design for small programs
+by Orin takes 0.10 s (the Rust stage-0 compiler, since retired, took 0.04 s on the same source when this
+was measured; not a like-for-like comparison of implementations). Binary size is a strength of the C-emitting design for small programs
 (31 KiB vs 2.2 MiB for Go) but this mostly reflects Go's bundled runtime. Orin's end-to-end build time
 (0.4 s, dominated by `cc`) is slower than a warm `go build` here; the Go number benefits from its build cache.
 

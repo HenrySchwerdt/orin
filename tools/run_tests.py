@@ -194,7 +194,7 @@ def run_test(args, label, test):
 
 def main():
     ap = argparse.ArgumentParser(description="Orin conformance test runner")
-    ap.add_argument("--orinc", default=os.path.join("bootstrap", "target", "release", "orinb"))
+    ap.add_argument("--orinc", default=os.path.join("build", "bootstrap", "orin2"))
     ap.add_argument("--cc", default="cc")
     ap.add_argument("--filter", default="")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)

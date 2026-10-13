@@ -64,3 +64,8 @@ const g = double;                              // top-level function used as a v
   take all parameters borrowed (owned-parameter inference does not cross indirect calls).
 - Runtime: a closure is a struct object `{ code pointer (scalar slot), env (ref slot) }`.
 - Array API as builtins with closure arguments; `sort(cmp)` returns a new array (spec 08).
+
+## Note (added later)
+
+The legacy HIR -> C backend (`--legacy-codegen`) mentioned above, and in ADR-0018, 0019, 0022 and 0025,
+was removed in the first post-freeze cleanup PR; only the MIR backends (C, LLVM) remain.

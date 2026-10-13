@@ -3,7 +3,7 @@
 Run everything with
 
 ```
-python3 tools/run_tests.py --orinc bootstrap/target/release/orinb [--cc cc] [--filter substr] [--jobs N] [--sanitize]
+python3 tools/run_tests.py --orinc build/bootstrap/orin2 [--cc cc] [--filter substr] [--jobs N] [--sanitize]
 ```
 
 The tests are written against the language contract (`docs/bootstrap-subset.md`), not
