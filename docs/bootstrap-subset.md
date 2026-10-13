@@ -141,13 +141,15 @@ Global objects/functions (no import needed): `console.log(s: string): void`,
 `Result<void, E>` success value is written `Ok()`.
 
 Beyond Orin-B (self-hosted compiler only; Stage 0 rejects the import with E0301): standard module
-`std:io`, `import { readBytes, readLine, writeStdout } from "std:io";`
+`std:io`, `import { readBytes, readLine, writeStdout, shell } from "std:io";`
 - `readBytes(n: usize): Option<string>`: exactly `n` bytes from stdin, `None` if end of input is
   reached first (the bytes read so far are discarded); `readBytes(0)` is `Some("")`.
 - `readLine(): Option<string>`: the next line without its `\n` (or `\r\n`), `None` at end of input.
   A final line without a newline is returned; an empty stream yields `None`.
 - `writeStdout(s: string): void`: writes `s` to stdout without a newline and flushes. It shares
   the stdio buffer with `console.log`, so output order is preserved.
+- `shell(cmd: string): int`: runs `cmd` with `/bin/sh -c`, returns the exit status (-1 if it could not
+  run or was killed by a signal). Used by `orin mcp` (`test`/`build`, only with `--allow-exec`).
 Strings are byte strings. Used by `orin lsp` (`compiler/lsp/stdio.or`); runtime in
 `runtime/orin_runtime_io.h` (header-only, included by generated C of both backends).
 

@@ -5,7 +5,8 @@ Usage: python3 tools/bench.py [--runs N] [--only name,name] [--orinc build/boots
                               [--out results.md] [--no-selfcompile]
 
 For every directory bench/<name>/ containing main.or / main.go / main.c it
-  * builds Orin (orinc -> C -> cc -O2 with runtime/orin_runtime.c), Go (go build) and C (cc -O2),
+  * builds Orin (orinc -> C -> cc -O2 with runtime/orin_runtime.c), Orin-LLVM (orinc --backend=llvm
+    -> .ll -> clang -O2 with the runtime; skipped without clang), Go (go build) and C (cc -O2),
   * runs each binary once to verify that the stdout (the checksum lines) is identical,
   * runs each binary N times (plus one unrecorded warm-up) and records wall time and peak RSS
     (ru_maxrss of the child, via wait4),
@@ -28,6 +29,8 @@ BENCH = os.path.join(ROOT, "bench")
 BUILD = os.path.join(ROOT, "build", "bench")
 CFLAGS = ["-O2", "-w"]
 PROBE = os.path.join(BUILD, "rss_probe")
+HAVE_CLANG = shutil.which("clang") is not None
+LANGS = ("orin", "llvm", "go", "c") if HAVE_CLANG else ("orin", "go", "c")
 
 
 def sh(cmd, **kw):
@@ -170,13 +173,17 @@ def main():
             "go": [["go", "build", "-o", out + "/go", src + "/main.go"]],
             "c": [["cc"] + CFLAGS + [src + "/main.c", "-o", out + "/c"]],
         }
+        if HAVE_CLANG:
+            builds["llvm"] = [[orinc, "compile", src + "/main.or", "--backend=llvm", "-o", out + "/orin_llvm.ll"],
+                              ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c",
+                                                    "runtime/orin_runtime_llvm.c", "-o", out + "/llvm"]]
         res = {}
         for lang, cmds in builds.items():
             bt = timed_build(cmds)
             res[lang] = {"exe": os.path.join(ROOT, out, lang), "build_s": bt}
         # verify outputs
         ref = None
-        for lang in ("c", "go", "orin"):
+        for lang in ("c", "go", "orin") + (("llvm",) if HAVE_CLANG else ()):
             _, _, rc, so, se = run_once([res[lang]["exe"]])
             if rc != 0:
                 sys.exit("%s/%s exited %d: %s" % (name, lang, rc, se.decode("utf-8", "replace")))
@@ -186,7 +193,7 @@ def main():
                 mismatches.append((name, lang))
                 print("CHECKSUM MISMATCH in %s (%s)" % (name, lang), file=sys.stderr)
             res[lang]["output"] = so.decode()
-        for lang in ("orin", "go", "c"):
+        for lang in LANGS:
             r = res[lang]
             r["raw"], r["stripped"] = sizes(r["exe"])
             run_once([r["exe"]])  # warm-up
@@ -248,47 +255,51 @@ def main():
     L.append("")
     L.append("### Wall time, seconds (median; min-max in parentheses)")
     L.append("")
-    L.append("| benchmark | Orin | Go | C | Orin/Go | Orin/C |")
-    L.append("|---|---:|---:|---:|---:|---:|")
+    L.append("| benchmark | Orin (C backend) | Orin (LLVM backend) | Go | C | Orin-C/Go | Orin-C/C | Orin-LLVM/Go | Orin-LLVM/C |")
+    L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for n in names:
         r = results[n]
-        cells = ["%s (%s-%s)" % (fmt_s(r[l]["wall"][0]), fmt_s(r[l]["wall"][1]), fmt_s(r[l]["wall"][2])) for l in ("orin", "go", "c")]
-        L.append("| %s | %s | %s | %s | %.2fx | %.2fx |" % (
-            n, cells[0], cells[1], cells[2], r["orin"]["wall"][0] / r["go"]["wall"][0], r["orin"]["wall"][0] / r["c"]["wall"][0]))
+        cells = ["%s (%s-%s)" % (fmt_s(r[l]["wall"][0]), fmt_s(r[l]["wall"][1]), fmt_s(r[l]["wall"][2])) for l in LANGS]
+        cm = dict(zip(LANGS, cells))
+        lw = r["llvm"]["wall"][0] if "llvm" in r else None
+        L.append("| %s | %s | %s | %s | %s | %.2fx | %.2fx | %s | %s |" % (
+            n, cm["orin"], cm.get("llvm", "n/a"), cm["go"], cm["c"], r["orin"]["wall"][0] / r["go"]["wall"][0],
+            r["orin"]["wall"][0] / r["c"]["wall"][0],
+            "%.2fx" % (lw / r["go"]["wall"][0]) if lw else "n/a", "%.2fx" % (lw / r["c"]["wall"][0]) if lw else "n/a"))
     if selfc:
         w = selfc["wall"]
-        L.append("| selfcompile (orin2 compiles compiler/main.or) | %s (%s-%s) | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
+        L.append("| selfcompile (orin2 compiles compiler/main.or) | %s (%s-%s) | - | - | - | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
         if "stage0" in selfc:
             w = selfc["stage0"]["wall"]
-            L.append("| selfcompile, reference: Rust stage-0 `orinb` | %s (%s-%s) | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
+            L.append("| selfcompile, reference: Rust stage-0 `orinb` | %s (%s-%s) | - | - | - | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
     L.append("")
     L.append("### Peak RSS, MiB (median of ru_maxrss; ~1 MiB process-startup floor)")
     L.append("")
-    L.append("| benchmark | Orin | Go | C |")
-    L.append("|---|---:|---:|---:|")
+    L.append("| benchmark | " + " | ".join(LANGS) + " |")
+    L.append("|---|" + "---:|" * len(LANGS))
     for n in names:
         r = results[n]
-        L.append("| %s | %s |" % (n, " | ".join("%.1f" % (r[l]["rss_kb"] / 1024) for l in ("orin", "go", "c")) + " "))
+        L.append("| %s | %s |" % (n, " | ".join("%.1f" % (r[l]["rss_kb"] / 1024) for l in LANGS) + " "))
     if selfc:
-        extra = " | - | - |"
+        extra = " |" + " - |" * (len(LANGS) - 1)
         L.append("| selfcompile (orin2) | %.1f%s" % (selfc["rss_kb"] / 1024, extra))
         if "stage0" in selfc:
             L.append("| selfcompile (Rust orinb) | %.1f%s" % (selfc["stage0"]["rss_kb"] / 1024, extra))
     L.append("")
     L.append("### Binary size, KiB (unstripped / stripped) and build time, seconds (single run)")
     L.append("")
-    L.append("| benchmark | Orin | Go | C | Orin build | Go build | C build |")
-    L.append("|---|---:|---:|---:|---:|---:|---:|")
+    L.append("| benchmark | " + " | ".join(LANGS) + " | " + " | ".join(l + " build" for l in LANGS) + " |")
+    L.append("|---|" + "---:|" * (2 * len(LANGS)))
     def sz(r):
         return "%.0f / %s" % (r["raw"] / 1024, "%.0f" % (r["stripped"] / 1024) if r["stripped"] else "n/a")
     for n in names:
         r = results[n]
-        L.append("| %s | %s | %s | %s | %.2f | %.2f | %.2f |" % (
-            n, sz(r["orin"]), sz(r["go"]), sz(r["c"]), r["orin"]["build_s"], r["go"]["build_s"], r["c"]["build_s"]))
+        L.append("| %s | %s | %s |" % (n, " | ".join(sz(r[l]) for l in LANGS), " | ".join("%.2f" % r[l]["build_s"] for l in LANGS)))
     if selfc:
         raw, stripped = selfc["size"]
-        L.append("| orin2 compiler binary | %.0f / %s | - | - | %.2f | - | - |" % (
-            raw / 1024, "%.0f" % (stripped / 1024) if stripped else "n/a", selfc["build_s"]))
+        L.append("| orin2 compiler binary | %.0f / %s |%s %.2f |%s" % (
+            raw / 1024, "%.0f" % (stripped / 1024) if stripped else "n/a", " - |" * (len(LANGS) - 1), selfc["build_s"],
+            " - |" * (len(LANGS) - 1)))
     L.append("")
     L.append("### Orin runtime counters (ORIN_STATS=1; one run)")
     L.append("")
@@ -305,7 +316,7 @@ def main():
         L.append("selfcompile output C is %s bytes and %s the committed-bootstrap stage2.c." %
                  ("{:,}".format(selfc["csize"]), "identical to" if selfc["same"] else "NOT identical to"))
         L.append("")
-    L.append("Checksums: %s." % ("all outputs identical across Orin/Go/C" if not mismatches else
+    L.append("Checksums: %s." % ("all outputs identical across " + "/".join(LANGS) if not mismatches else
                                   "MISMATCH in " + ", ".join("%s/%s" % m for m in mismatches)))
     text = "\n".join(L) + "\n"
     print(text)

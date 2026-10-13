@@ -1,0 +1,115 @@
+// Built-in API entries for `inspect("Type.member")` (spec 10 "Introspection"): signature, purity,
+// complexity, allocation, failure semantics and a minimal example. Derived from
+// docs/bootstrap-subset.md §6 and the runtime (runtime/orin_runtime.c); `Array.find` is a
+// spec-level entry that the self-hosted compiler does not implement yet (status "planned").
+
+import { Json, JStr, JObj, JField, jField } from "../json";
+
+type Api = {
+  name: string; sig: string; fails: string; pure: bool; cost: string; alloc: string;
+  example: string; status: string;
+};
+
+function api(name: string, sig: string, fails: string, cost: string, alloc: string, example: string): Api {
+  return Api { name: name, sig: sig, fails: fails, pure: true, cost: cost, alloc: alloc, example: example, status: "implemented" };
+}
+
+function mutating(a: Api): Api {
+  return Api { ...a, pure: false };
+}
+
+function table(): Api[] {
+  return [
+    api("string.length", "length: usize", "never fails", "O(1)", "none", "\"abc\".length // 3"),
+    api("string.charCodeAt", "charCodeAt(i: usize): int", "traps if i >= length", "O(1)", "none", "\"A\".charCodeAt(0) // 65"),
+    api("string.charAt", "charAt(i: usize): string", "traps if i >= length", "O(1)", "allocates 1-byte string", "\"abc\".charAt(1) // \"b\""),
+    api("string.substring", "substring(a: usize, b: usize): string", "traps unless a <= b <= length", "O(b-a)", "allocates result", "\"hello\".substring(1, 3) // \"el\""),
+    api("string.indexOf", "indexOf(s: string): Option<usize>", "None when absent", "O(n*m)", "allocates Option", "\"abc\".indexOf(\"c\") // Some(2)"),
+    api("string.includes", "includes(s: string): bool", "never fails", "O(n*m)", "none", "\"abc\".includes(\"b\") // true"),
+    api("string.startsWith", "startsWith(s: string): bool", "never fails", "O(m)", "none", "\"abc\".startsWith(\"a\")"),
+    api("string.endsWith", "endsWith(s: string): bool", "never fails", "O(m)", "none", "\"abc\".endsWith(\"c\")"),
+    api("string.split", "split(sep: string): string[]", "traps if sep is empty", "O(n)", "allocates array + parts", "\"a,b\".split(\",\") // [\"a\",\"b\"]"),
+    api("string.trim", "trim(): string", "never fails", "O(n)", "allocates result", "\"  x \".trim() // \"x\""),
+    api("Array.length", "length: usize", "never fails", "O(1)", "none", "xs.length"),
+    api("Array.get", "get(i: usize): Option<T>", "None when out of range", "O(1)", "allocates Option", "xs.get(0).unwrapOr(d)"),
+    mutating(api("Array.push", "push(v: T): void", "receiver must be a mutable place (E0401)", "amortized O(1)", "may reallocate the array", "xs.push(1)")),
+    mutating(api("Array.pop", "pop(): Option<T>", "None when empty; receiver must be a mutable place (E0401)", "O(1)", "allocates Option", "xs.pop()")),
+    api("Array.slice", "slice(a: usize, b: usize): T[]", "traps unless a <= b <= length", "O(b-a)", "allocates result", "xs.slice(1, 3)"),
+    api("Array.concat", "concat(ys: T[]): T[]", "never fails", "O(n+m)", "allocates result", "xs.concat(ys)"),
+    api("Array.join", "join(sep: string): string  (receiver string[])", "never fails", "O(total bytes)", "allocates result", "[\"a\",\"b\"].join(\"-\") // \"a-b\""),
+    Api {
+      name: "Array.find", sig: "find(pred: (T) => bool): Option<T>", fails: "None when no element matches; never traps",
+      pure: true, cost: "O(n), short-circuits", alloc: "allocates Option",
+      example: "xs.find((x) => x > 2)", status: "planned (spec 08; not implemented in the self-hosted compiler: use a loop)"
+    },
+    api("int.toString", "toString(): string", "never fails", "O(digits)", "allocates result", "(42).toString()"),
+    api("int.toUsize", "toUsize(): usize", "traps if negative", "O(1)", "none", "n.toUsize()"),
+    api("usize.toString", "toString(): string", "never fails", "O(digits)", "allocates result", "n.toString()"),
+    api("usize.toInt", "toInt(): int", "traps if > i64 max", "O(1)", "none", "n.toInt()"),
+    api("bool.toString", "toString(): string", "never fails", "O(1)", "none", "true.toString()"),
+    api("Option.isSome", "isSome(): bool", "never fails", "O(1)", "none", "o.isSome()"),
+    api("Option.isNone", "isNone(): bool", "never fails", "O(1)", "none", "o.isNone()"),
+    api("Option.unwrap", "unwrap(): T", "traps on None", "O(1)", "none", "o.unwrap()"),
+    api("Option.unwrapOr", "unwrapOr(d: T): T", "never fails", "O(1)", "none", "o.unwrapOr(0)"),
+    api("Result.isOk", "isOk(): bool", "never fails", "O(1)", "none", "r.isOk()"),
+    api("Result.isErr", "isErr(): bool", "never fails", "O(1)", "none", "r.isErr()"),
+    api("Result.unwrap", "unwrap(): T", "traps on Err", "O(1)", "none", "r.unwrap()"),
+    api("Result.unwrapErr", "unwrapErr(): E", "traps on Ok", "O(1)", "none", "r.unwrapErr()"),
+    api("Result.?", "expr?  (in a function returning Result<_, E>)", "returns Err(e) early", "O(1)", "none", "const n = parse(s)?;")
+  ];
+}
+
+// Case-insensitive on the receiver ("array.find" == "Array.find"); `String.` aliases `string.`.
+function canon(q: string): string {
+  const dot = q.indexOf(".");
+  if (dot.isNone()) {
+    return q;
+  }
+  const recv = q.substring(0, dot.unwrap());
+  const rest = q.substring(dot.unwrap(), q.length);
+  const known: string[] = ["string", "Array", "int", "usize", "bool", "Option", "Result"];
+  for (const k of known) {
+    if (recvEq(recv, k)) {
+      return k + rest;
+    }
+  }
+  return q;
+}
+
+function lowerAscii(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c >= 65 && c <= 90) {
+      out += String.fromCharCode(c + 32);
+    } else {
+      out += s.charAt(i);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function recvEq(a: string, b: string): bool {
+  return lowerAscii(a) == lowerAscii(b);
+}
+
+// The entry for `q`, as compact JSON fields.
+export function apiLookup(q: string): Option<Json> {
+  const c = canon(q);
+  for (const a of table()) {
+    if (a.name == c) {
+      let fs: JField[] = [
+        jField("builtin", JStr(a.name)), jField("sig", JStr(a.sig)), jField("fails", JStr(a.fails)),
+        jField("mutates", JStr(a.pure ? "no" : "yes")),
+        jField("cost", JStr(a.cost)), jField("alloc", JStr(a.alloc)), jField("example", JStr(a.example))
+      ];
+      if (a.status != "implemented") {
+        fs.push(jField("status", JStr(a.status)));
+      }
+      return Some(JObj(fs));
+    }
+  }
+  return None;
+}
