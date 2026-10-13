@@ -4,33 +4,55 @@
 
 <h1 align="center">Orin</h1>
 
-<p align="center"><b>Native. Safe. Simple.</b><br>
-A statically typed, natively compiled language with TypeScript-familiar syntax,<br>
-memory safety without a borrow checker or garbage collector, and a self-hosted compiler.</p>
+<p align="center"><b>Build with agents. Verify with the compiler. Understand the change.</b><br>
+A TypeScript-familiar, natively compiled language for verifiable software engineering:<br>
+value semantics, ownership checking, contracts, and semantic change analysis.</p>
 
 > ⚠️ **Experimental alpha.** Orin is a research-driven language in early development. Expect
-> missing features and breaking changes. See [what works today](#status) and the
+> missing features and breaking changes. Orin is **not a drop-in TypeScript replacement** and does not
+> run arbitrary JavaScript or npm packages. See [what works today](#status) and the
 > [honest safety status](docs/architecture.md#safety-status-honest-labelling-spec-07).
 
 ---
 
 ## Why Orin?
 
-Today you usually have to pick two of three:
+AI agents can produce code quickly. The harder question is whether a change respects the
+system's invariants, security boundaries and intended behaviour — and whether reviewers can
+understand its consequences.
 
-| | Easy to write | Fast & native | Memory-safe without GC |
-|---|---|---|---|
-| TypeScript / JavaScript | ✅ | ❌ (VM, JIT) | ✅ (GC) |
-| Go / Java / C# | ✅ | ✅/〰️ | ✅ (GC) |
-| Rust | 〰️ (borrow checker, lifetimes) | ✅ | ✅ |
-| C / C++ | 〰️ | ✅ | ❌ |
+**Orin's goal is verifiable, agent-driven software development.** It combines familiar
+TypeScript-style syntax with explicit value semantics, native compilation, compiler-checked
+ownership and contracts. Its **Orin Software Intelligence Graph (OSIG)** provides a foundation
+for reviewing code changes semantically rather than only as textual diffs.
 
-**Orin aims for all three.** You write code that looks like TypeScript; the compiler produces a
-native executable and works out memory management by itself — no `free`, no lifetimes, no
-borrow annotations, no tracing garbage collector.
+Orin is **not JavaScript or TypeScript with a different backend**: it deliberately uses stricter
+semantics, and npm/Node.js compatibility is not implemented. The aim is a familiar development
+experience, not a misleading promise of full ecosystem compatibility.
 
-And because more and more code is written *with* AI agents, Orin is designed to be easy for
-both humans and agents to read, write, check and review.
+### What you can do today
+
+- Compile a statically typed Orin program to native code (C backend and an LLVM IR backend).
+- Use classes, interfaces, generics, closures, value-semantics collections, Option/Result,
+  modules and packages.
+- Check ownership in MIR, run tests, use contract clauses and verify a supported pure
+  int/bool subset with Z3; see [contracts](docs/contracts.md) and [assurance](docs/assurance.md).
+- Generate a semantic symbol/call graph and compare two program versions using
+  `orin graph` and `orin diff`, including source locations and MUST/MAY/UNKNOWN call evidence.
+  See [OSIG](docs/osig.md).
+
+### Where we're going
+
+The next major goal is **enforced capabilities and process-level data lineage**. With trusted
+I/O boundaries and protocol/resource bindings, OSIG should eventually be able to trace
+an input (such as an HTTP request or Kafka message) through service calls and field
+transformations to an external output — and show how a PR changes that process.
+The [capability design](docs/decisions/0021-capabilities-and-io-provenance.md) and
+[verifiable-software roadmap](docs/decisions/0020-verifiable-software-roadmap.md) specify this work.
+
+**These capabilities, field-level lineage, cross-service process discovery and signed
+`.orcert` attestations are planned, not shipping features.** Even when implemented,
+static analysis may report MAY or UNKNOWN rather than claiming complete certainty.
 
 ## The core ideas
 
@@ -57,18 +79,20 @@ reference-counted and copied lazily (copy-on-write). The compiler infers ownersh
 at their last use and updates in place when nothing else can observe it — so value semantics
 stay cheap. Planned next: unboxing, region allocation and more verified optimisations.
 
-**4. Safety you can check, not just trust.** Memory safety is treated as a *theorem*, not a
-marketing claim:
+**4. Safety you can check, with explicit limits.** Orin builds multiple layers of evidence rather
+than claiming complete memory-safety proof for every compiler and runtime path:
 - every compilation passes through an **independent ownership verifier** on an explicit memory IR
-  (MIR) — a compiler bug that would break memory safety is caught before code is generated;
+  (MIR) — ownership-rule violations in MIR are rejected before code generation; this does not detect every possible compiler bug;
 - a **Lean 4 formal model** proves that the reference-counting machine never touches freed
   memory, that copy-on-write never changes what aliases observe, and that code accepted by the
   ownership checker is safe (for the core of the IR so far);
-- the runtime will move into Orin itself on top of a tiny, separately verified platform layer,
-  shrinking what has to be trusted ([spec 19](spec/19-runtime-and-platform-layer.md)).
+- the runtime has an Orin standard-library layer and an L0 platform boundary; further runtime
+  implementation and verification work remains ([runtime plan](spec/19-self-hosted-runtime.md),
+  [assurance ledger](docs/assurance.md)).
 
-**5. Business rules you can prove.** Contract clauses state what code must do and are proven by
-a compiler pass (planned, [spec 15](spec/15-contracts-invariants-and-formal-verification.md)):
+**5. Business rules you can specify and selectively verify.** Contract clauses can be checked
+at runtime, and supported pure int/bool contracts can be sent to Z3. Other claims may remain
+UNKNOWN; no blanket proof of arbitrary business logic is implied ([contracts](docs/contracts.md)):
 
 ```ts
 @Invariant(this.balance >= 0)
@@ -87,8 +111,8 @@ class BankAccount {
 exports is visible, private files can't be imported from outside, and module dependencies must
 form a DAG — enforced by the compiler, so architecture doesn't erode.
 
-**7. Built for agents and editors.** One semantic engine powers the compiler, the formatter, the
-language server (`orin lsp`) and an MCP server (`orin mcp`, in progress) with compact,
+**7. Built for agents and editors.** The toolchain includes a compiler, formatter,
+language server (`orin lsp`), MCP server (`orin mcp`) and OSIG export/diff with compact,
 structured, stable diagnostics — optimised for the total effort needed to reach correct code.
 
 **8. Self-hosted.** The Orin compiler is written in Orin and compiles itself reproducibly
@@ -96,32 +120,38 @@ structured, stable diagnostics — optimised for the total effort needed to reac
 
 ## Status
 
-| Area | State |
+| Area | Status |
 |---|---|
-| Self-hosted compiler, reproducible bootstrap | ✅ |
-| Core language: functions, records, tagged unions + `match`, `Option`/`Result`/`?`, arrays, strings, modules | ✅ |
-| Generics, classes with value semantics | ✅ |
-| Memory IR + independent ownership verifier + ownership optimisation | ✅ |
-| Lean proofs: RC machine safety, copy-on-write, ownership-checker soundness (IR core) | ✅ partial |
-| `orin fmt`, `orin check --format=json`, `orin lsp`, VS Code extension | ✅ |
-| Closures + array API, LLVM backend, `orin mcp`, runtime in Orin | 🚧 in progress |
-| Packages (`orin.toml`, enforced module architecture rules, API snapshots) | ✅ |
-| Floats, maps, interfaces, annotations & contracts, concurrency | 📋 planned |
+| Self-hosted compiler, checked-in C bootstrap seed, C and LLVM IR backends | ✅ Implemented |
+| Language: classes, generics, interfaces, closures, maps, fixed-width integers, packages | ✅ Implemented |
+| Copy-on-write value semantics, MIR ownership verification, resource-safe `File` handles | ✅ Implemented; safety evidence has documented limits |
+| Formatter, diagnostics, language server, MCP, VS Code support, `orin test` | ✅ Implemented |
+| Contract clauses + SMT verification | ✅ Supported subset; not universal proof |
+| `orin graph`, `orin diff`, HTML PR report | ✅ OSIG v0.1 structural graph |
+| Compiler modernisation (ADR-0015) | 🚧 Underway |
+| Root/derived capabilities, policy enforcement, HTTP/Kafka protocol bindings | 📋 Designed; not implemented |
+| Inferred effects, field lineage, automatic cross-service process discovery | 📋 Planned |
+| Signed attestations (`.orcert`), concurrency, further optimisation | 📋 Planned |
 
-Performance today: roughly 1.1–2.7× the run time of equivalent C on our
-[benchmarks](docs/benchmarks.md) (mixed against Go). Closing that gap without weakening safety
-is a core goal.
+**Performance:** Native output does not automatically imply C-equivalent speed. Check
+[benchmarks](docs/benchmarks.md) for workload-specific measurements, and
+[assurance](docs/assurance.md) for the runtime safety/performance trade-offs.
+
+The source of truth for exact feature status is [docs/progress.md](docs/progress.md).
+The roadmap distinguishes implemented graph analysis from the future process/lineage
+capabilities.
 
 ## Try it
 
 Download a package from [Releases](../../releases) (Linux x86-64, macOS arm64). You need a C
-compiler (`cc`, gcc or clang) on your PATH — Orin currently compiles to C, LLVM is coming.
+compiler (`cc`, gcc or clang) on your PATH for the default backend. An LLVM IR backend
+is also implemented; see the [build and backend documentation](docs/architecture.md).
 
 ```bash
 tar xzf orin-<version>-<platform>.tar.gz && cd orin-<version>-<platform>
 bin/orin run examples/hello.or
 bin/orin build examples/shapes.or -o shapes && ./shapes
-bin/orin test examples/testing.or                # run the @Test functions (docs/testing.md)
+bin/orin test examples/testing.or               # run @Test functions
 bin/orin check examples/counter.or           # type-check only
 bin/orin fmt --stdout examples/generics.or   # canonical formatting
 ```
@@ -152,6 +182,20 @@ bin/orin api --check api.txt myshop/          # exit 1 if the public API changed
 A module with an `allowed_dependencies` rule may only import the listed modules (E0501); unknown
 module names in the manifest are E0502; manifest syntax errors are E0500 and invalid manifests
 E0503. The rules also apply when you check a single file inside the package (editors, MCP).
+
+### Semantic change review (OSIG)
+
+Use the structural graph and semantic diff in the current alpha:
+
+```bash
+bin/orin graph examples/shapes.or -o shapes.graph.json
+bin/orin diff --base examples/counter.or --head examples/shapes.or --format=html -o osig-diff.html
+```
+
+The diff above demonstrates the commands on different examples; in normal PR workflows,
+compare **base and head versions of the same package**. OSIG currently reports symbols,
+calls, imports, type relationships and contracts — **not** automatic HTTP/Kafka workflows
+or field-level data lineage. See [docs/osig.md](docs/osig.md).
 
 Editor support: see [`editors/vscode`](editors/vscode) (syntax highlighting + language server).
 
