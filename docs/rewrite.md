@@ -308,9 +308,11 @@ Friction found:
   `@Requires`. They are runtime-checked since ADR-0031 A3 (at literals, field writes and function results), which
   covers every module that builds `Diagnostic` by literal; the repeated `@Requires` can be dropped where wanted.
 * Pure combinators in contracts would remove ~10 hand-written loops (`allRenderable`, `allNormalized`,
-  `allDistinct`, `countWarnings`, `importersOf`, ...): `xs.every(p)` is rejected as a call through a
-  function value. A purity rule that accepts closures whose body is pure (or prelude `every` / `some` /
-  `count` marked pure) would help most.
+  `allDistinct`, `countWarnings`, `importersOf`, ...). Since ADR-0031 A4 `xs.every(p)` with a pure lambda is
+  accepted; `allNormalized`, `allRenderable`, `allWellFormed`, `allWarnings`, `anyStrictCode`, `allUnbound` and
+  `allUnitsWellFormed` were rewritten with `every` / `some` (the seed was refreshed for it). The counting and
+  nested-loop helpers (`countWarnings`, `allDistinct`, `importersOf`) stay loops: there is no `count`, and the
+  prelude has no pairwise combinator.
 * Contracts cannot call I/O, so properties of `Sources.exists` / `read` against the disk are only
   expressible through a pure `overlay` accessor; `old(this.f.length)` works, but the checker rejects
   mixing `usize` with `? 1 : 0` (int) in a clause (split into two implications).
