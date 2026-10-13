@@ -46,6 +46,23 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
 primitives.
 
+### 3a. Flagship: TypeScript tooling in Orin (after concurrency)
+Goal (project owner, 2026-10-13): show that Orin is the natural language for TypeScript tooling —
+TS-familiar syntax for the community, native speed **at least on par with Go**, measured, not claimed.
+1. **Benchmark target first:** Orin formatter/parser on a large TS-like corpus vs a Go parser
+   (e.g. esbuild's); tracked in `docs/benchmarks.md`. Today Orin is about 1.5-1.6x slower than Go on
+   `nbody`/`mapfreq`; the levers are unboxing, RC elision, escape analysis (step 4) and threads (step 3).
+2. **Port the TypeScript compiler** (Apache-2.0, port with notice), staged: scanner + parser →
+   binder → checker. Not a 1:1 translation: the TS compiler relies on shared mutable graphs (parent
+   pointers, symbol back-links, caches); in Orin these become **arenas with index ids** (as in
+   swc/oxc) and `Graph<T>`. Parallel checking needs read-only sharing between tasks: `Shared<T>`
+   (post-1.0 option in ADR-0017) must be designed first (ADR).
+3. Expected findings: missing library pieces (arena collection, string interning, fast file walking)
+   and language friction — fed back into post-1.0 ADRs.
+Also: `docs/ts-developers.md` — "Orin for TypeScript developers" (the main semantic differences behind
+the familiar syntax: value semantics, no null/any/exceptions/inheritance, integer traps, explicit
+conversions) with matching "did you mean" diagnostics.
+
 ### 4. Optimisation ‖ provability (in parallel)
 - **Optimisation:** unboxing, RC elision, escape analysis/stack allocation, LLVM tuning. Each step
   is measured (`docs/benchmarks.md`) and checked by the differential tests.
