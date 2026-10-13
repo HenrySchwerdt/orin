@@ -193,5 +193,6 @@ checked-add shape (`add; jo` with the trap in a cold section). Compiling `fib` w
 by hand takes 0.37 s vs 0.58 s, so the checks cost roughly 0.2 s of the 0.35 s gap to C; the rest is GCC inlining
 recursion in plain C. That is a compiler (range analysis) matter, not a runtime one. `wordfreq` shows a slower
 median (0.199 -> 0.335 s) in this run although its allocation profile is dominated by strings, which the freelist
-does not touch and the C/Go columns of the same run also drifted; I did not isolate whether this is noise or a real
-regression, treat it as unconfirmed.
+does not touch and the C/Go columns of the same run also drifted; A separate re-run of only `wordfreq` (9 runs) gave 0.225 s
+(0.208-0.362) for Orin, with Go and C also slower than in the first run, so it looks like noise, not a regression
+(before: 0.199 s).
