@@ -1,0 +1,105 @@
+// Import resolution: which file or std module an `import ... from "path"` names, and the module
+// boundary rule.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { StdModule } from "./program";
+import { Sources } from "./sources";
+import { normalizePath, dirname, joinPath, relativeTo, isInside } from "./path";
+
+// An import resolves to a std module implemented by the C runtime (`std` is Some, `path` is empty)
+// or to the normalized path of a source file.
+export type Resolved = { std: Option<StdModule>; path: string; };
+
+// `/`-separated path of `p` relative to `base`, without a trailing `.or`. Prelude units (virtual
+// paths, see prelude.or) keep their path: their name does not depend on the entry file.
+export function unitName(base: string, p: string): string {
+  const s = p.startsWith("$") ? p : relativeTo(base, p);
+  return s.endsWith(".or") ? s.substring(0, s.length - 3) : s;
+}
+
+// Std modules written in Orin (stdlib/, embedded as the `$stdlib` library root, see prelude.or).
+function isStdlibModule(p: string): bool {
+  return match (p) {
+    "std:fs" => true,
+    "std:path" => true,
+    "std:json" => true,
+    "std:time" => true,
+    "std:graph" => true,
+    "std:test" => true,
+    _ => false
+  };
+}
+
+// Std modules backed by the C runtime. `std:fsraw` is internal: the file primitives behind `std:fs`
+// (stdlib/fs.or); only library code may import it. `std:clock` is internal too (`std:time` wraps it).
+function runtimeModule(p: string): Option<StdModule> {
+  return match (p) {
+    "std:fsraw" => Some(StdFs),
+    "std:process" => Some(StdProcess),
+    "std:io" => Some(StdIo),
+    "std:clock" => Some(StdClock),
+    _ => None
+  };
+}
+
+function unknownStd(p: string, sp: Span): Diagnostic {
+  return diag("E0301", sp, `unknown standard module \`${p}\` (available: std:fs, std:process, std:io, std:math, std:path, std:json, std:time, std:graph, std:test)`);
+}
+
+// Resolve import path `p` of file `importer` to a std module or a normalized file path.
+// Reports E0301 (unknown module) and E0302 (module boundary).
+export function resolveImport(src: Sources, importer: string, p: string, sp: Span, base: string): Result<Resolved, Diagnostic> {
+  if (p.startsWith("$")) {
+    // The implicit import of a prelude root's entry file (added to the program's entry file by the loader).
+    return Ok(Resolved { std: None, path: normalizePath(p) });
+  }
+  if (p == "std:math") {
+    // std:math is Orin code (array/math.or, part of the embedded `$array` prelude root), loaded on demand.
+    return Ok(Resolved { std: None, path: "$array/math.or" });
+  }
+  if (p.startsWith("std:")) {
+    if (isStdlibModule(p)) {
+      return Ok(Resolved { std: None, path: `$stdlib/${p.substring(4, p.length)}.or` });
+    }
+    const m = runtimeModule(p);
+    if (m.isNone() || (p == "std:fsraw" && !importer.startsWith("$"))) {
+      return Err(unknownStd(p, sp));
+    }
+    return Ok(Resolved { std: m, path: "" });
+  }
+  const dir = dirname(importer);
+  const asFile = joinPath(dir, p + ".or");
+  const asModule = joinPath(dir, p + "/module.or");
+  let target = asFile;
+  if (!src.exists(asFile)) {
+    if (!src.exists(asModule)) {
+      return Err(diag("E0301", sp, `cannot find module \`${p}\` (tried \`${asFile}\` and \`${asModule}\`)`));
+    }
+    target = asModule;
+  }
+  const blocked = privateModuleOf(src, importer, target);
+  if (blocked.isSome()) {
+    const owner = blocked.unwrap();
+    return Err(diag("E0302", sp, `cannot import private file \`${unitName(base, target)}\` of module \`${unitName(base, owner)}\`; import the module itself`));
+  }
+  return Ok(Resolved { std: None, path: target });
+}
+
+// Module boundary rule (E0302): the directory (nearest first) of an ancestor module of `target`
+// whose `module.or` is not `target` itself and which does not contain `importer`; None when the
+// import is allowed. Walks up to the filesystem root, or to the start of a relative path.
+function privateModuleOf(src: Sources, importer: string, target: string): Option<string> {
+  let d = dirname(target);
+  while (d != ".") {
+    const m = joinPath(d, "module.or");
+    if (target != m && src.exists(m) && !isInside(d, importer)) {
+      return Some(d);
+    }
+    const parent = dirname(d);
+    if (parent == d) {
+      break;
+    }
+    d = parent;
+  }
+  return None;
+}

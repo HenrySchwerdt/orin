@@ -1,7 +1,7 @@
-// Loader output types — Stage 1 shared contract (v1). Mirrors the interface section of
-// bootstrap/src/loader.rs. Owned by the lead architect.
+// Loader output types: the loaded program (units in dependency order) and the outcome of a load.
 
-import { Module } from "../syntax";
+import { Module, Item, ImportDecl } from "../syntax";
+import { SourceFile, SourceMap, Diagnostic } from "../diag";
 import { Manifest } from "../package";
 
 // StdFs = "std:fsraw" (internal: the primitives behind std:fs, stdlib/fs.or), StdProcess = "std:process", StdIo = "std:io", StdClock = "std:clock" (internal; std:time wraps it)
@@ -20,3 +20,71 @@ export type Unit = {
 // units are topologically sorted (dependencies first, entry last); entry = index of entry.
 // `manifest` is Some when an orin.toml governs the load (its rules were enforced by the loader).
 export type LoadedProgram = { units: Unit[]; entry: usize; manifest: Option<Manifest>; };
+
+// Like a successful load, but also available on failure: `sm` holds every file read so far (so the
+// diagnostics can be rendered); `program` is Some exactly when `diags` is empty.
+export type LoadOutcome = { sm: SourceMap; program: Option<LoadedProgram>; diags: Diagnostic[]; };
+
+export function failedLoad(files: SourceFile[], diags: Diagnostic[]): LoadOutcome {
+  return LoadOutcome { sm: SourceMap { files: files }, program: None, diags: diags };
+}
+
+// The import declaration of an `import` / `export ... from` item.
+export function importOf(item: Item): Option<ImportDecl> {
+  return match (item) {
+    IImport(i) => Some(i),
+    IReExport(i) => Some(i),
+    _ => None
+  };
+}
+
+// A plain loop: closures (`filter`) would make the function impure, and contracts may only call pure ones.
+function importCount(m: Module): usize {
+  let n: usize = 0;
+  for (const it of m.items) {
+    if (importOf(it).isSome()) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+function importedUnit(t: ImportTarget): Option<usize> {
+  return match (t) {
+    ImportUnit(i) => Some(i),
+    ImportStd(_) => None
+  };
+}
+
+// The structural guarantees of a successful load (written with loops so that contracts may call it):
+// the units are in one-to-one correspondence with the files of `sm`, the entry is the last unit,
+// every unit has one import target per import item, and every unit import points at an *earlier*
+// unit. The last property is what makes the unit graph acyclic and the order topological.
+export function isWellFormed(p: LoadedProgram, sm: SourceMap): bool {
+  const n = p.units.length;
+  if (n == 0 || p.entry != n - 1 || sm.files.length != n) {
+    return false;
+  }
+  let seen: bool[] = [];
+  let k: usize = 0;
+  while (k < n) {
+    seen.push(false);
+    k += 1;
+  }
+  k = 0;
+  while (k < n) {
+    const u = p.units[k];
+    if (u.file >= n || seen[u.file] || u.imports.length != importCount(u.ast)) {
+      return false;
+    }
+    seen[u.file] = true;
+    for (const t of u.imports) {
+      const dep = importedUnit(t);
+      if (dep.isSome() && dep.unwrap() >= k) {
+        return false;
+      }
+    }
+    k += 1;
+  }
+  return true;
+}

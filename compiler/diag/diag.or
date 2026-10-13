@@ -1,57 +1,73 @@
-// Source files, spans and diagnostics — Stage 1 shared contract (v1).
-// Mirrors bootstrap/src/span.rs and diag.rs. Owned by the lead architect.
+// Source files, spans and diagnostics: the types every compiler phase reports errors with.
 
 // Half-open byte range [start, end) in file `file` (index into SourceMap.files).
+@Invariant(this.start <= this.end)
 export type Span = { file: usize; start: usize; end: usize; };
 
 export type SourceFile = { path: string; text: string; };
 
 export type SourceMap = { files: SourceFile[]; };
 
-// `code` is e.g. "E0400" (docs/bootstrap-subset.md §9).
+// `code` is "E" (error) or "W" (warning) followed by four digits, e.g. "E0400" (see isValidCode).
 export type Diagnostic = { code: string; message: string; span: Span; notes: string[]; };
 
+// A diagnostic code: one letter, `E` or `W`, then exactly four decimal digits.
+export function isValidCode(code: string): bool {
+  if (code.length != 5 || (code.charCodeAt(0) != 69 && code.charCodeAt(0) != 87)) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < 5) {
+    const c = code.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+@Requires(start <= end)
+@Ensures(result.file == file && result.start == start && result.end == end)
 export function span(file: usize, start: usize, end: usize): Span {
   return Span { file: file, start: start, end: end };
 }
 
-// Smallest span covering a and b (same file).
+// Smallest span covering a and b, which lie in the same file.
+@Requires(a.file == b.file)
+@Ensures(result.file == a.file && result.start <= a.start && result.start <= b.start)
+@Ensures(result.end >= a.end && result.end >= b.end && result.start <= result.end)
 export function spanTo(a: Span, b: Span): Span {
   const s = a.start < b.start ? a.start : b.start;
   const e = a.end > b.end ? a.end : b.end;
   return Span { file: a.file, start: s, end: e };
 }
 
+@Requires(isValidCode(code))
+@Ensures(result.code == code && result.message == message && result.notes.length == 0)
 export function diag(code: string, sp: Span, message: string): Diagnostic {
   const notes: string[] = [];
   return Diagnostic { code: code, message: message, span: sp, notes: notes };
 }
 
-// 1-based line and column (bytes) of `offset` in `text`.
-function lineOf(text: string, offset: usize): usize {
-  let line: usize = 1;
-  let i: usize = 0;
-  while (i < offset && i < text.length) {
-    if (text.charCodeAt(i) == 10) {
-      line += 1;
-    }
-    i += 1;
-  }
-  return line;
-}
+type LineCol = { line: usize; col: usize; };
 
-function colOf(text: string, offset: usize): usize {
+// 1-based line and column (both in bytes) of `offset` in `text`; an offset past the end counts as the end.
+function lineCol(text: string, offset: usize): LineCol {
+  const stop = offset < text.length ? offset : text.length;
+  let line: usize = 1;
   let col: usize = 1;
   let i: usize = 0;
-  while (i < offset && i < text.length) {
+  while (i < stop) {
     if (text.charCodeAt(i) == 10) {
+      line += 1;
       col = 1;
     } else {
       col += 1;
     }
     i += 1;
   }
-  return col;
+  return LineCol { line: line, col: col };
 }
 
 // Warnings (ADR-0024) have codes starting with `W` (W0440 = use of a deprecated symbol); they never
@@ -60,13 +76,19 @@ export function isWarning(d: Diagnostic): bool {
   return d.code.startsWith("W");
 }
 
+// True when `d` can be rendered against `sm`: its span lies in a file of the map, within the text.
+export function isRenderable(sm: SourceMap, d: Diagnostic): bool {
+  return d.span.file < sm.files.length && d.span.start <= d.span.end && d.span.start <= sm.files[d.span.file].text.length;
+}
+
 // `path:line:col: error[CODE]: message` (+ "\n  note: ..." lines); `warning[CODE]` for warnings.
+@Requires(isRenderable(sm, d))
+@Ensures(result.startsWith(sm.files[d.span.file].path + ":"))
+@Ensures(result.includes("[" + d.code + "]: " + d.message))
 export function render(sm: SourceMap, d: Diagnostic): string {
   const f = sm.files[d.span.file];
-  let s = f.path + ":" + lineOf(f.text, d.span.start).toString() + ":" + colOf(f.text, d.span.start).toString()
-    + ": " + (isWarning(d) ? "warning" : "error") + "[" + d.code + "]: " + d.message;
-  for (const n of d.notes) {
-    s += "\n  note: " + n;
-  }
-  return s;
+  const pos = lineCol(f.text, d.span.start);
+  const kind = isWarning(d) ? "warning" : "error";
+  const head = `${f.path}:${pos.line}:${pos.col}: ${kind}[${d.code}]: ${d.message}`;
+  return head + d.notes.map(n => `\n  note: ${n}`).join("");
 }
