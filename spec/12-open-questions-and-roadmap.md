@@ -14,6 +14,15 @@
 - Target: self-hosting and native performance competitive with Go/Rust.
 - Built-in MCP-based compiler introspection and targeted verification.
 
+## Resolved 2026-10-13 (implementation ADRs)
+
+- Interfaces: nominal, `implements`; bounds (static) and interface-typed values (explicit dynamic dispatch) — ADR-0016.
+- String interpolation: TypeScript template literals, primitives only — ADR-0016.
+- Class mutability: mutating methods inferred; mutability part of the public API snapshot — ADR-0009.
+- Closures: capture by value, immutable captures — ADR-0011.
+- Concurrency: isolated tasks, send = move-or-copy, structured `scope`, no shared mutable memory — ADR-0017.
+- Language 1.0 core scope and freeze — ADR-0016.
+
 ## Priority OPEN decisions
 
 1. **Precisely define observable value identity.** Are ordinary classes exclusively values, and how do resources/actors expose identity? No hidden Java reference semantics.
