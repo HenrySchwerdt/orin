@@ -15,7 +15,12 @@
     with a message that names the impure operation and its `file:line:col`;
   - calls inside a contract go to the unchecked body, so a clause that calls its own function (or an invariant that
     calls a public method) terminates; it used to recurse without end;
-  - the test runner matches `// stderr:` against the compiler's output for error tests.
+  - the test runner matches `// stderr:` against the compiler's output for error tests;
+  - compiler: `compiler/check/rthir.or` (HIR pass behind `--check-contracts`), the purity inference in
+    `compiler/check/purity.or`, the prune pass also drops unreferenced lifted closures (erased clause closures leave
+    no trace); `allNormalized`, `allRenderable`, `allWellFormed`, `allWarnings`, `anyStrictCode`, `allUnbound`,
+    `allUnitsWellFormed` now use `every` / `some`. **The seed was refreshed** (`tools/update_seed.sh`), because the
+    compiler sources now call pure closures in contracts, which the previous seed rejected (ADR-0014).
 - Contract-quality diagnostics (ADR-0028): warnings W0450-W0452 (invariant without `this`, `@Ensures` that cannot
   fail, trivially true contracts), solver-based W0460-W0462 in `orin verify --contracts`, opt-in strict coverage
   W0470/W0471 (`--strict-contracts`, `[contracts] strict = true`), and `tools/contract_mutation.py` (contract

@@ -83,7 +83,8 @@ body works); the run-time rewriting does not descend into blocks.
 
 Without flags the clauses produce no code. `tools/test_contract_erasure.py` (CI) compiles programs
 with and without their clause lines and requires byte-identical C and LLVM IR. (Known corner: a
-contract that is the only user of a generic instantiation leaves that instance in the output.)
+contract that is the only user of a generic instantiation leaves that instance in the output. The lifted
+closure functions of closures written in a clause are dropped by the prune pass, `compiler/opt/prune.or`.)
 
 ## Runtime checking: `orin compile --check-contracts`
 
