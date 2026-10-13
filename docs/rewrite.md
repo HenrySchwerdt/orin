@@ -146,3 +146,49 @@ RSS via `tools/bench.py`'s `run_once`; the machine was shared, so the spread is 
 No regression: the loader is a tiny part of the time (parsing and checking dominate), and the Map-based
 lookups replaced linear searches over a few dozen files. The contract-checked compiler is slower by
 design and is not part of this comparison.
+
+## Step 2a: `check/{env,fnctx,types}.or` (the checker's foundation)
+
+Rewritten: symbol tables, scope stack, type-instance caches. `body.or`, `decls.or`, `collect.or` only got the
+mechanical call-site updates the new interfaces need (about 10 lines); `resources.or`, the `main` checks, `std:*`
+loading and the I/O builtins were not touched (ADR-0021 Stage A work happens there).
+
+| Old | New |
+|---|---|
+| `Names { types: TypeBind[]; vals: ValBind[] }`, `findType` / `findVal` linear scans | `Names { types: Map<string, TypeEnt>; vals: Map<string, ValEnt> }` |
+| `findInst`, `originOf`: linear scan of `Env.insts` per call | `Env.instIdx` (key `kind:gid:typeIds`) and `Env.originIdx` (key `kind:id`), maintained by one function `addInst`; `typeId` is a structural key (ids, not names) |
+| `Env.bounds: OpaqueBound[]` + `boundOf` scan | `Env.bounds: Map<usize, usize>`, `addBound` |
+| `FnCtx.names / ids / marks` flat stack with linear `lookupLocal` | class `Scope` (`Map<string, Bind>` + undo log + marks), `FnCtx.scope`; `open` / `close` / `bind` / `lookup` / `inInnermost` |
+| two 30-field `FnCtx { .. }` literals full of `noX` consts | `blankCtx` + the two constructors set only what differs (empty array / `None` literals infer from the field type) |
+| string `+` building, index loops | template literals, `map` / `join` / `filter` / `indexOf` / `includes` |
+| `dedupDiags` O(n^2) with `diagEq` | one pass with a `Map` of diagnostic keys (`diagEq` removed, it had no other user) |
+
+Contracts (all checked by the `contracts` CI job, none fired): `Scope` `@Invariant`s (`marksOrdered`: scope marks
+non-decreasing and inside the undo log, `vis.size <= log.length`: scope balance), `addInst`
+`@Requires` (an instance is created once: its key is not yet in the index) and `@Ensures` (both indexes stay as
+large as `insts`), `@Ensures(resolvedOk(result))` on `aliasType` / `resolveTy` / `instType` (the resolved type refers
+only to records / unions / interfaces that exist in the returned environment: `typeInRange`; the index sizes
+match). ADR-0015 names "`substitute` leaves no type parameters": there is no `substitute` function in the checker (a
+type expression is resolved against a `TScope` that maps the parameter names to concrete types, so no parameter can
+survive by construction); the dangling-id check above is the corresponding property of the resolver.
+
+Lessons:
+
+* **The checker is not where the time goes.** gprof of `orin2 check compiler/main.or` (0.37 s of the 4 s
+  self-compile): parsing / lexing dominate (`orin_struct_new`, `orin_destroy`, `orin_str_eq` from the lexer's keyword
+  and operator tables), `findType` / `findInst` are below 1 %. The `Map` conversion is therefore design hygiene
+  (O(1) lookups, one place that maintains the indexes), not a speed-up; measured: no change beyond noise. The big
+  costs are copy-on-write copies of `Env` arrays and retain / release traffic from threading `Env` and `FnCtx` by
+  value (177 M retains per self-compile), which only the later body.or / Env-as-class steps can reduce.
+* A closure cannot mutate a captured local (`seen.set` inside `filter` does not work): dedup is a `for` loop.
+* A contract helper must not use `map` either (it calls a function value, so it is impure): `typesId` is a loop
+  because `instKey` is used in `addInst`'s `@Requires`.
+* A `Map` inside the `Env` record is copy-on-write like the arrays, so `addInst` takes `env` and returns it updated
+  like the code around it did; no extra copies showed up (`cow_copies` +12 % in the self-compile counters, `alloc_total`
+  +1.6 %, wall time within noise).
+* A class stored in a record field works with value semantics (`let f = fx; f.scope.open()` does not touch `fx`), which
+  the closure snapshot `FnCtx.outer` needs.
+* Keep the formatter off files you only touch mechanically (`collect.or`, `decls.or`): `orin fmt` reflows them
+  completely (+300 lines of diff).
+* `compiler/tests/check_env_test.or` tests `Scope`, the name tables, the type / instance keys and `dedupDiags`; for
+  that `check/module.or` exports them (module boundary E0302).

@@ -1,0 +1,100 @@
+// Unit tests of the checker's foundation: check/env.or (name tables, instance keys, dedup) and
+// check/fnctx.or (the local scope stack). Run: `orin test compiler/tests/check_env_test.or`.
+// `orin test` checks contracts at run time, so the `Scope` invariants run on every call below.
+
+import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { Span, diag } from "../diag";
+import { Type } from "../hir";
+import {
+  Scope, emptyNames, findType, findVal, EntRecord, VFunc, typeId, typesId, instKey, originKey,
+  dedupDiags,
+} from "../check";
+
+function idOf(o: Option<usize>): int {
+  return match (o) {
+    Some(i) => i.toInt(),
+    None => -1,
+  };
+}
+
+@Test
+function scopeLookupAndShadowing(): void {
+  let s = new Scope();
+  s.bind("a", 0);
+  s.bind("b", 1);
+  assertEqUsize(s.depth(), 1, "parameter scope");
+  s.open();
+  s.bind("a", 5);
+  assertEqUsize(s.depth(), 2, "opened");
+  assert(idOf(s.lookup("a")) == 5, "inner a shadows");
+  assert(idOf(s.lookup("b")) == 1, "b visible");
+  assertEqBool(s.inInnermost("a"), true, "a is inner");
+  assertEqBool(s.inInnermost("b"), false, "b is outer");
+  s.close();
+  assert(idOf(s.lookup("a")) == 0, "outer a restored");
+  assertEqBool(s.inInnermost("a"), true, "parameter scope is innermost again");
+  assertEqUsize(s.depth(), 1, "closed");
+}
+
+@Test
+function scopeNamesDieWithTheirScope(): void {
+  let s = new Scope();
+  s.open();
+  s.bind("x", 3);
+  s.open();
+  s.bind("y", 4);
+  s.close();
+  assert(idOf(s.lookup("y")) == -1, "y gone");
+  assert(idOf(s.lookup("x")) == 3, "x stays");
+  s.close();
+  assert(idOf(s.lookup("x")) == -1, "x gone");
+}
+
+// Closing more scopes than were opened forgets every name (the old flat stack did the same).
+@Test
+function scopeOverClose(): void {
+  let s = new Scope();
+  s.bind("p", 0);
+  s.close();
+  assert(idOf(s.lookup("p")) == -1, "p forgotten");
+  assertEqUsize(s.depth(), 0, "no scope open");
+  s.close();
+  s.bind("q", 1);
+  assert(idOf(s.lookup("q")) == 1, "q bound with no scope open");
+}
+
+@Test
+function nameTables(): void {
+  let n = emptyNames();
+  n.types.set("T", EntRecord(3));
+  n.vals.set("f", VFunc(7));
+  assertEqBool(findType(n, "T").isSome(), true, "type found");
+  assertEqBool(findType(n, "f").isSome(), false, "namespaces are separate");
+  assertEqBool(findVal(n, "f").isSome(), true, "value found");
+  assertEqBool(findVal(n, "T").isNone(), true, "no value T");
+}
+
+@Test
+function typeKeys(): void {
+  const rec: Type = TyRecord(2);
+  const uni: Type = TyUnion(2);
+  assertEqString(typeId(rec), "r2", "record");
+  assertEqString(typeId(uni), "n2", "union");
+  assertEqString(typeId(TyArray(TyOption(TyInt))), "[?i]", "nesting");
+  assertEqString(typesId([TyInt, TyString]), "i,s", "list");
+  assert(instKey(0, 1, [rec]) != instKey(1, 1, [rec]), "kind is part of the key");
+  assert(instKey(0, 1, [rec]) != instKey(0, 1, [uni]), "record and union with the same id differ");
+  assert(instKey(0, 1, [TyInt, TyBool]) != instKey(0, 1, [TyInt]), "arity");
+  assertEqString(originKey(2, 9), "2:9", "origin key");
+}
+
+@Test
+function dedupKeepsFirstOccurrence(): void {
+  const sp = Span { file: 0, start: 1, end: 2 };
+  const a = diag("E0400", sp, "x");
+  const b = diag("E0400", sp, "y");
+  const out = dedupDiags([a, b, a, b, a]);
+  assertEqUsize(out.length, 2, "two distinct");
+  assertEqString(out[0].message, "x", "first");
+  assertEqString(out[1].message, "y", "second");
+}
