@@ -1,0 +1,324 @@
+// Differential and stress tests of the B-tree sorted maps of std:collections. The executable specification is the
+// earlier sorted-array implementation (tests/std/spec_sorted.or): both are driven with the same random operation
+// sequences and must answer identically. With contract checking (the `orin test` default) every operation also
+// verifies the B-tree invariants: shape, occupancy t-1..2t-1, equal leaf depth, ordering and separators, key count,
+// arena and free list. Run with `--no-contracts` the results alone are compared.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool } from "std:test";
+import { SortedMap, SortedStringMap, SortedEntry, SortedStringEntry } from "std:collections";
+import { SpecSortedMap, SpecSortedStringMap } from "./spec_sorted";
+
+function nextRand(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+function joinInts(xs: int[]): string {
+  let parts: string[] = [];
+  for (const x of xs) {
+    parts.push(x.toString());
+  }
+  return parts.join(",");
+}
+
+function keyStr(k: int): string {
+  return "k" + k.toString();
+}
+
+// Drives a B-tree of minimum degree `t` and the specification with `steps` random operations on keys 0..range-1.
+function diffInt(t: usize, steps: int, range: int, seed0: int): void {
+  let a = new SortedMap<int>(t);
+  let b = new SpecSortedMap<int>();
+  let seed = seed0;
+  let step: int = 0;
+  while (step < steps) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 12;
+    seed = nextRand(seed);
+    const k = (seed / 16) % range;
+    if (op < 4) {
+      assertEqBool(a.put(k, step), b.put(k, step), "put " + k.toString());
+    } else if (op < 7) {
+      const ra = a.remove(k);
+      const rb = b.remove(k);
+      assertEqBool(ra.isSome(), rb.isSome(), "remove presence " + k.toString());
+      assertEq(ra.unwrapOr(-1), rb.unwrapOr(-1), "removed value " + k.toString());
+    } else if (op == 7) {
+      assertEqBool(a.has(k), b.has(k), "has");
+      assertEq(a.get(k).unwrapOr(-1), b.get(k).unwrapOr(-1), "get");
+    } else if (op == 8) {
+      assertEq(a.floorKey(k).unwrapOr(-1), b.floorKey(k).unwrapOr(-1), "floor " + k.toString());
+      assertEq(a.ceilKey(k).unwrapOr(-1), b.ceilKey(k).unwrapOr(-1), "ceil " + k.toString());
+    } else if (op == 9) {
+      assertEq(a.firstKey().unwrapOr(-1), b.firstKey().unwrapOr(-1), "first");
+      assertEq(a.lastKey().unwrapOr(-1), b.lastKey().unwrapOr(-1), "last");
+    } else if (op == 10) {
+      if (k % 4 == 0) {
+        const pa = a.popFirst();
+        const pb = b.popFirst();
+        assertEqBool(pa.isSome(), pb.isSome(), "popFirst presence");
+        if (pa.isSome()) {
+          assertEq(pa.unwrap().key, pb.unwrap().key, "popFirst key");
+          assertEq(pa.unwrap().value, pb.unwrap().value, "popFirst value");
+        }
+      } else if (k % 4 == 1) {
+        const pa = a.popLast();
+        const pb = b.popLast();
+        assertEqBool(pa.isSome(), pb.isSome(), "popLast presence");
+        if (pa.isSome()) {
+          assertEq(pa.unwrap().key, pb.unwrap().key, "popLast key");
+          assertEq(pa.unwrap().value, pb.unwrap().value, "popLast value");
+        }
+      } else {
+        assertEqUsize(a.size(), b.size(), "size");
+      }
+    } else {
+      if (step % 7 == 0) {
+        assertEqString(joinInts(a.keyArray()), joinInts(b.keyArray()), "keys");
+        assertEqString(joinInts(a.valueArray()), joinInts(b.valueArray()), "values");
+      }
+    }
+    assertEqUsize(a.size(), b.size(), "size after step");
+    step += 1;
+  }
+  assertEqString(joinInts(a.keyArray()), joinInts(b.keyArray()), "final keys");
+  assertEqString(joinInts(a.valueArray()), joinInts(b.valueArray()), "final values");
+}
+
+function diffStr(t: usize, steps: int, range: int, seed0: int): void {
+  let a = new SortedStringMap<int>(t);
+  let b = new SpecSortedStringMap<int>();
+  let seed = seed0;
+  let step: int = 0;
+  while (step < steps) {
+    seed = nextRand(seed);
+    const op = (seed / 16) % 10;
+    seed = nextRand(seed);
+    const k = keyStr((seed / 16) % range);
+    if (op < 4) {
+      assertEqBool(a.put(k, step), b.put(k, step), "put " + k);
+    } else if (op < 7) {
+      const ra = a.remove(k);
+      const rb = b.remove(k);
+      assertEqBool(ra.isSome(), rb.isSome(), "remove presence " + k);
+      assertEq(ra.unwrapOr(-1), rb.unwrapOr(-1), "removed value " + k);
+    } else if (op == 7) {
+      assertEq(a.get(k).unwrapOr(-1), b.get(k).unwrapOr(-1), "get " + k);
+      assertEqString(a.floorKey(k).unwrapOr("<none>"), b.floorKey(k).unwrapOr("<none>"), "floor " + k);
+      assertEqString(a.ceilKey(k).unwrapOr("<none>"), b.ceilKey(k).unwrapOr("<none>"), "ceil " + k);
+    } else if (op == 8) {
+      assertEqString(a.firstKey().unwrapOr("<none>"), b.firstKey().unwrapOr("<none>"), "first");
+      assertEqString(a.lastKey().unwrapOr("<none>"), b.lastKey().unwrapOr("<none>"), "last");
+    } else {
+      if (step % 2 == 0) {
+        const pa = a.popFirst();
+        const pb = b.popFirst();
+        assertEqBool(pa.isSome(), pb.isSome(), "popFirst presence");
+        if (pa.isSome()) {
+          assertEqString(pa.unwrap().key, pb.unwrap().key, "popFirst key");
+        }
+      } else {
+        const pa = a.popLast();
+        const pb = b.popLast();
+        assertEqBool(pa.isSome(), pb.isSome(), "popLast presence");
+        if (pa.isSome()) {
+          assertEqString(pa.unwrap().key, pb.unwrap().key, "popLast key");
+        }
+      }
+    }
+    assertEqUsize(a.size(), b.size(), "size after step");
+    step += 1;
+  }
+  assertEqString(a.keyArray().join("|"), b.keyArray().join("|"), "final keys");
+  assertEqString(joinInts(a.valueArray()), joinInts(b.valueArray()), "final values");
+}
+
+@Test
+function btreeMatchesSpecDegree2(): void {
+  diffInt(2, 700, 50, 1);
+  diffInt(2, 700, 400, 2);
+}
+
+@Test
+function btreeMatchesSpecDegree3(): void {
+  diffInt(3, 700, 80, 3);
+  diffInt(3, 700, 600, 4);
+}
+
+@Test
+function btreeMatchesSpecDegree5(): void {
+  diffInt(5, 700, 120, 5);
+  diffInt(5, 500, 1000, 6);
+}
+
+@Test
+function btreeMatchesSpecDegree16(): void {
+  diffInt(16, 800, 200, 7);
+  diffInt(16, 800, 2000, 8);
+}
+
+@Test
+function btreeMatchesSpecOnTinyKeyRanges(): void {
+  // so few keys that the tree repeatedly grows from empty, splits the root and collapses again
+  diffInt(2, 600, 4, 9);
+  diffInt(2, 600, 9, 10);
+  diffInt(3, 600, 14, 11);
+}
+
+@Test
+function stringBtreeMatchesSpec(): void {
+  diffStr(2, 500, 60, 12);
+  diffStr(3, 500, 300, 13);
+  diffStr(16, 500, 100, 14);
+}
+
+// ---------------------------------------------------------------- structured workloads
+
+function fillAscending(m: SortedMap<int>, n: int): SortedMap<int> {
+  let r = m;
+  let i: int = 0;
+  while (i < n) {
+    r.put(i, i * 10);
+    i += 1;
+  }
+  return r;
+}
+
+@Test
+function ascendingAndDescendingInsertThenRemoveInAllOrders(): void {
+  const n: int = 300;
+  // ascending insert, remove ascending
+  let a = fillAscending(new SortedMap<int>(2), n);
+  assertEqUsize(a.size(), n.toUsize(), "size after ascending fill");
+  assertEq(a.get(150).unwrap(), 1500, "value");
+  let i: int = 0;
+  while (i < n) {
+    assertEq(a.remove(i).unwrap(), i * 10, "remove ascending");
+    i += 1;
+  }
+  assertEqBool(a.isEmpty(), true, "empty after removing all");
+  assertEqUsize(a.height(), 1, "height of an emptied tree");
+  // descending insert, remove descending and from the middle outwards
+  let d = new SortedMap<int>(3);
+  i = n - 1;
+  while (i >= 0) {
+    d.put(i, i);
+    i -= 1;
+  }
+  assertEqString(joinInts(d.keyArray().slice(0, 5)), "0,1,2,3,4", "sorted although inserted backwards");
+  i = n - 1;
+  while (i >= n / 2) {
+    d.remove(i);
+    i -= 1;
+  }
+  assertEqUsize(d.size(), (n / 2).toUsize(), "half removed");
+  let j: int = n / 2 - 1;
+  let lo: int = 0;
+  while (lo <= j) {
+    assertEq(d.remove(lo).unwrap(), lo, "outside in (low)");
+    if (lo != j) {
+      assertEq(d.remove(j).unwrap(), j, "outside in (high)");
+    }
+    lo += 1;
+    j -= 1;
+  }
+  assertEqBool(d.isEmpty(), true, "all gone");
+  // the arena is reusable after the tree collapsed
+  d.put(7, 70);
+  assertEq(d.get(7).unwrap(), 70, "usable again");
+  assertEqUsize(d.size(), 1, "size");
+}
+
+@Test
+function heightIsLogarithmic(): void {
+  let m = new SortedMap<int>(2);
+  let i: int = 0;
+  while (i < 1000) {
+    m.put(i, i);
+    i += 1;
+  }
+  // t = 2: height <= 1 + log2((n + 1) / 2) = 1 + log2(500.5) < 10
+  assert(m.height() <= 10, "t=2 height bound");
+  assert(m.height() >= 5, "t=2 tree is not degenerate-flat");
+  let w = new SortedMap<int>(16);
+  i = 0;
+  while (i < 1000) {
+    w.put(i, i);
+    i += 1;
+  }
+  assert(w.height() <= 3, "t=16 height bound");
+  assertEqUsize(new SortedMap<int>(16).height(), 1, "empty tree");
+}
+
+@Test
+function btreeKeepsEntriesAcrossSplitsAndMerges(): void {
+  let m = new SortedMap<string>(2);
+  let i: int = 0;
+  while (i < 200) {
+    m.put((i * 37) % 200, "v" + i.toString());
+    i += 1;
+  }
+  assertEqUsize(m.size(), 200, "all distinct keys present");
+  i = 0;
+  while (i < 200) {
+    assertEqBool(m.has(i), true, "has " + i.toString());
+    i += 1;
+  }
+  i = 0;
+  while (i < 200) {
+    if (i % 3 != 0) {
+      assertEqBool(m.remove(i).isSome(), true, "remove " + i.toString());
+    }
+    i += 1;
+  }
+  const keys = m.keyArray();
+  assertEqUsize(keys.length, 67, "every third key remains");
+  i = 0;
+  while (i < 200) {
+    assertEqBool(m.has(i), i % 3 == 0, "membership after removals " + i.toString());
+    i += 1;
+  }
+}
+
+@Test
+function btreeIsAValue(): void {
+  let a = new SortedMap<int>(2);
+  let i: int = 0;
+  while (i < 40) {
+    a.put(i, i);
+    i += 1;
+  }
+  let b = a;
+  b.remove(10);
+  b.put(100, 100);
+  assertEqBool(a.has(10), true, "original keeps 10");
+  assertEqBool(a.has(100), false, "original has no 100");
+  assertEqBool(b.has(10), false, "copy lost 10");
+  assertEqUsize(a.size(), 40, "original size");
+  assertEqUsize(b.size(), 40, "copy size");
+}
+
+@Test
+function btreeStringKeysOrderAndRange(): void {
+  let m = new SortedStringMap<int>(2);
+  const words = ["pear", "apple", "fig", "", "zebra", "a", "ab", "abc", "b", "banana", "cherry", "date", "elder", "grape"];
+  let n: int = 0;
+  for (const w of words) {
+    m.put(w, n);
+    n += 1;
+  }
+  assertEqString(m.keyArray().join(","), ",a,ab,abc,apple,b,banana,cherry,date,elder,fig,grape,pear,zebra", "sorted");
+  assertEqString(m.floorKey("c").unwrap(), "banana", "floor c");
+  assertEqString(m.ceilKey("c").unwrap(), "cherry", "ceil c");
+  assertEqString(m.floorKey("").unwrap(), "", "floor empty key");
+  assertEqBool(m.ceilKey("zzz").isNone(), true, "ceil beyond last");
+  assertEqString(m.popFirst().unwrap().key, "", "popFirst");
+  assertEqString(m.popLast().unwrap().key, "zebra", "popLast");
+  assertEqUsize(m.size(), 12, "size");
+}
+
+@Test
+function minimumDegreeIsValidated(): void {
+  // degree 2 is the smallest legal one; the constructor's @Requires rejects 0 and 1 (checked builds)
+  let m = new SortedMap<int>(2);
+  m.put(1, 1);
+  assertEq(m.get(1).unwrap(), 1, "degree 2 works");
+}
