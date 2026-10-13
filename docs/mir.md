@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v1.5)
+# MIR and the OIM ownership verifier (v1.8)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -8,7 +8,9 @@ Changelog: v1.1 Unique-demotion across calls; v1.2 (ADR-0010) per-parameter mode
 (`MFunction.paramOwned`) and consuming call operands, produced by the optimiser `compiler/opt`;
 v1.3 (ADR-0011) closures: `IClosure` and `ICallIndirect`;
 v1.4 (ADR-0018) floats: scalar type `MFloat` (binary64; an f32 is an MFloat rounded by `IBuiltin(BF32Round)` after each operation), operand `OFloat(text)`; `IUnary(UnNeg)` and `IBinary` Add/Sub/Mul/Div/Eq/Ne/Lt/Le/Gt/Ge accept MFloat operands (IEEE, no traps; `Rem` does not); conversions and math are `IBuiltin`s; floats are plain scalars for the verifier (`Init`), stored in slots by bit pattern.
-v1.5 (ADR-0019) interfaces: `IIface`, `ICallVirtual` and `MProgram.vtables`.
+v1.5 (ADR-0019) interfaces: `IIface`, `ICallVirtual` and `MProgram.vtables`;
+v1.8 (ADR-0025) resource handles: scalar type `MHandle`, builtins `BFileOpen` / `BFileClose` / `BFileIsOpen` /
+`BFileOpenError` and the file methods, verifier states `Open` / `MaybeOpen` (see "Resource handles" below).
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -88,6 +90,41 @@ hole slot when reading that slot.
   invalidate `Borrowed(x)`; v consumed; d Owned.
 - Any operation that makes x Dead or mutates it also invalidates `Borrowed(x)`.
 - `IDup(d, x)` / `IBorrow(d, x)` where x is Unique demote x to Owned (no longer provably unique).
+
+## Resource handles (v1.8, ADR-0025)
+`MHandle` is the type of a resource handle (an open file): an `int64_t` at run time (a generation-tagged table
+index, negative for a failed open), but a *linear, non-copyable* value for the verifier. Operand class `CHandle`.
+
+Structural rules (wf, checked on every instruction, independent of the dataflow):
+- a handle local is defined **only** by `IBuiltin(Some(h), BFileOpen, [path, mode])` (the handle must be
+  bound: `None` is an error, the file would never be closed). `ICopy`, `IMove`, `IBorrow`, `IDup`, `IUnary`,
+  `IBinary`, `ICall`/`ICallIndirect`/`ICallVirtual` results, `IGetField`, `IArrayGet`, ... never define one;
+- a handle is never stored or boxed: not a slot of `IStructNew`, an element of `IArrayNew`, the value of
+  `ISetField` / `IArraySet` / `IArrayPush`, a capture of `IClosure`, nor the value of `IIface`;
+- never compared (`OpEq`/`OpNe` on handles), never a `TBranch`/`TSwitch` operand, never returned, and no function has
+  result type `MHandle`; no parameter is *owned* (owned parameters are references);
+- it is an argument of `ICall` / `ICallIndirect` / `ICallVirtual` (borrowed; `ICall` still checks the class
+  against the callee's parameter) and the first argument of the file builtins (`BFileIsOpen`, `BFileOpenError`,
+  `BFileClose`, `BFileReadLine`, `BFileRead`, `BFileReadAll`, `BFileWrite`, `BFileWriteLine`, `BFileFlush`); no
+  other builtin accepts one, and file builtins take no handle after the first argument.
+
+Dataflow rules (states in `state.or`): a handle local starts `Dead`; a handle *parameter* starts `Param`
+(borrowed for the whole call, like a reference parameter).
+- `BFileOpen -> h`: `h` becomes `Open`; if `h` was `Open`/`MaybeOpen` it is an **error** (overwritten while open:
+  the file would never be closed); a parameter cannot be a destination (existing rule).
+- `BFileClose(h)`: `h` must be `Open`, then `Dead`; closing a `Param`, a `Dead` or a `MaybeOpen` handle is an
+  **error** (only the function that opened it closes it, and exactly once).
+- any other use (call argument, file builtin): `h` must be `Open` or `Param` (reading a `Dead`/`MaybeOpen` handle is
+  an error: use after close).
+- `TReturn`: an `Open` or `MaybeOpen` handle is an **error** (not a warning like a leaked reference): every path
+  that returns must have closed it. `TTrap` has no obligation (the runtime's exit hook flushes and closes).
+- join: `Open` with `Open` is `Open`; `Open` with anything else is the poisoned `MaybeOpen`; `Dead` with `Dead` stays
+  `Dead`. (`MaybeOpen` is an error to use, close or return with, so a handle opened on one branch only must be closed
+  on that branch.)
+
+Consequence (induction over the call graph): a function that receives a handle can only pass it on; only the
+function that opened it can close it; it is closed exactly once on every path to a return and not used afterwards.
+The scope functions of `stdlib/fs.or` are the only code that opens handles. Handles never enter RC bookkeeping.
 
 ## Vtables (v1.5)
 `MProgram.vtables[i] = { name, funcs }`: the functions of one (class, interface) pair in interface-method

@@ -1,0 +1,273 @@
+// Resource rules (ADR-0025, spec 06 "External resources"): a resource handle (`File`) is not a value.
+// This pass runs on the checked HIR of every function (generic instances and lifted closures
+// included), after type checking. Together with the type-level checks at the declaration sites
+// (`resolveTy`, record fields, return types: types.or / decls.or) it enforces:
+//
+//   E0450  a resource type inside another type (array element, Option / Result / generic argument,
+//          record field, union payload, function-value result), as a function result, or as the
+//          type of a variable (only parameters may have a resource type);
+//   E0451  a resource handle used in any position but "argument of a call": it cannot be assigned
+//          or bound (no aliasing), returned, put into an aggregate, compared, converted to string or
+//          matched on;
+//   E0452  a resource handle captured by a closure.
+//
+// The MIR verifier (compiler/verify) re-establishes the same guarantees independently on the lowered
+// code, so a bug here cannot lead to a duplicated or escaping handle (docs/mir.md v1.8).
+//
+// Library exception: the std:fs implementation (units named `$stdlib/fs`) opens a file into a local
+// (`const h = fileOpen(..)`) because it is the one place that implements the scope API; the local is
+// still only ever passed as an argument. User code cannot import the raw primitives (std:fsraw, E0301).
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Type, Function, HBlock, HStmt, HExpr, Place } from "../hir";
+
+// `File` occurs in `t` somewhere other than as the type of a parameter (a parameter of type File is the
+// borrowed form; every other occurrence is a stored one).
+export function resourceNested(t: Type): bool {
+  return match (t) {
+    TyArray(x) => hasResource(x),
+    TyOption(x) => hasResource(x),
+    TyResult(a, b) => hasResource(a) || hasResource(b),
+    TyFn(ps, r) => anyNested(ps) || hasResource(r),
+    _ => false
+  };
+}
+
+function anyNested(ts: Type[]): bool {
+  for (const t of ts) {
+    if (resourceNested(t)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isFileTy(t: Type): bool {
+  return match (t) { TyFile => true, _ => false };
+}
+
+// `t` is a resource type or contains one.
+export function hasResource(t: Type): bool {
+  return isFileTy(t) || resourceNested(t);
+}
+
+type Rc = { f: Function; trusted: bool; closure: bool; diags: Diagnostic[]; };
+
+function report(cx: Rc, code: string, span: Span, msg: string): Rc {
+  let c = cx;
+  c.diags.push(diag(code, span, msg));
+  return c;
+}
+
+const ARG_ONLY: string = "a resource handle can only be passed as an argument; it cannot be assigned, bound, returned, stored, compared or converted";
+
+function isOpen(e: HExpr): bool {
+  return match (e.kind) {
+    XBuiltin(b, _) => match (b) { BFileOpen => true, _ => false },
+    _ => false
+  };
+}
+
+// The initialiser of a closure environment local: `env.field` of the lifted function's first parameter.
+function isEnvField(e: HExpr): bool {
+  return match (e.kind) {
+    XField(b, _, _) => match (b.kind) { XLocal(_) => true, _ => false },
+    _ => false
+  };
+}
+
+function exprs(cx: Rc, es: HExpr[], allow: bool): Rc {
+  let c = cx;
+  for (const e of es) {
+    c = expr(c, e, allow);
+  }
+  return c;
+}
+
+function expr(cx: Rc, e: HExpr, allow: bool): Rc {
+  let c = cx;
+  if (resourceNested(e.ty)) {
+    return report(c, "E0450", e.span, "a resource type cannot be part of another type (found a value of an array, `Option`, `Result` or function type holding a resource)");
+  }
+  if (isFileTy(e.ty) && !allow) {
+    c = report(c, "E0451", e.span, ARG_ONLY);
+  }
+  match (e.kind) {
+    XInt(_) => {},
+    XFloat(_) => {},
+    XBool(_) => {},
+    XStr(_) => {},
+    XLocal(_) => {},
+    XUnary(_, x) => { c = expr(c, x, false); },
+    XBinary(_, a, b) => {
+      c = expr(c, a, false);
+      c = expr(c, b, false);
+    },
+    XCall(_, args) => { c = exprs(c, args, true); },
+    XBuiltin(_, args) => { c = exprs(c, args, true); },
+    XMutMethod(_, p, args) => {
+      c = place(c, p);
+      c = exprs(c, args, false);
+    },
+    XField(b, _, _) => { c = expr(c, b, false); },
+    XIndex(b, i) => {
+      c = expr(c, b, false);
+      c = expr(c, i, false);
+    },
+    XRecord(_, sp, fs) => {
+      match (sp) {
+        Some(s) => { c = expr(c, s, false); },
+        None => {}
+      }
+      for (const f of fs) {
+        c = expr(c, f.value, false);
+      }
+    },
+    XVariant(_, payload) => { c = exprs(c, payload, false); },
+    XArray(xs) => { c = exprs(c, xs, false); },
+    XTry(x) => { c = expr(c, x, false); },
+    XCond(a, b, d) => {
+      c = expr(c, a, false);
+      c = expr(c, b, false);
+      c = expr(c, d, false);
+    },
+    XMatch(s, arms) => {
+      c = expr(c, s, false);
+      for (const a of arms) {
+        c = block(c, a.body);
+        match (a.value) {
+          Some(v) => { c = expr(c, v, false); },
+          None => {}
+        }
+      }
+    },
+    XClosure(_, caps) => {
+      for (const x of caps) {
+        if (isFileTy(x.ty)) {
+          c = report(c, "E0452", x.span, "a closure cannot capture a resource handle; pass it as a parameter instead (a callback of the scope API receives it)");
+        } else {
+          c = expr(c, x, false);
+        }
+      }
+    },
+    XCallIndirect(f, args) => {
+      c = expr(c, f, false);
+      c = exprs(c, args, true);
+    },
+    XIface(_, v) => { c = expr(c, v, false); },
+    XCallVirtual(r, _, args) => {
+      c = expr(c, r, false);
+      c = exprs(c, args, true);
+    }
+  }
+  return c;
+}
+
+function place(cx: Rc, p: Place): Rc {
+  let c = cx;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => { c = expr(c, ix, false); },
+      _ => {}
+    }
+  }
+  return c;
+}
+
+function block(cx: Rc, b: HBlock): Rc {
+  let c = cx;
+  for (const s of b.stmts) {
+    c = stmt(c, s);
+  }
+  return c;
+}
+
+function stmt(cx: Rc, s: HStmt): Rc {
+  let c = cx;
+  match (s) {
+    HLet(l, init) => {
+      const lt = c.f.locals[l].ty;
+      if (isFileTy(lt)) {
+        if (c.trusted && isOpen(init)) {
+          // the scope API of the std:fs library: the handle is created here and only ever passed on
+          match (init.kind) {
+            XBuiltin(_, args) => { c = exprs(c, args, false); },
+            _ => {}
+          }
+          return c;
+        }
+        if (c.closure && isEnvField(init)) {
+          return c; // the environment copy of a captured handle: reported at the closure expression (E0452)
+        }
+        return report(c, "E0450", init.span, "a resource handle cannot be stored in a variable (only parameters may have a resource type)");
+      }
+      if (resourceNested(lt)) {
+        return report(c, "E0450", init.span, "a resource type cannot be part of another type");
+      }
+      c = expr(c, init, false);
+    },
+    HAssign(p, _, v) => {
+      if (hasResource(p.ty)) {
+        c = report(c, "E0451", v.span, ARG_ONLY);
+      }
+      c = place(c, p);
+      c = expr(c, v, false);
+    },
+    HExprStmt(e) => { c = expr(c, e, false); },
+    HIf(cond, th, el) => {
+      c = expr(c, cond, false);
+      c = block(c, th);
+      match (el) {
+        Some(b) => { c = block(c, b); },
+        None => {}
+      }
+    },
+    HWhile(cond, b) => {
+      c = expr(c, cond, false);
+      c = block(c, b);
+    },
+    HForOf(_, it, b) => {
+      c = expr(c, it, false);
+      c = block(c, b);
+    },
+    HBreak => {},
+    HContinue => {},
+    HReturn(r) => {
+      match (r) {
+        Some(e) => { c = expr(c, e, false); },
+        None => {}
+      }
+    },
+    HBlockStmt(b) => { c = block(c, b); }
+  }
+  return c;
+}
+
+// Checks the finished HIR of all functions. Only reports what the declaration-site checks cannot see: results of generic instances, variable types,
+// expression types, and every use of a handle that is not "argument of a call".
+export function resourceDiags(funcs: Function[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const f of funcs) {
+    let c = Rc {
+      f: f,
+      trusted: f.name.startsWith("$stdlib/fs."),
+      closure: f.name.includes("$closure"),
+      diags: []
+    };
+    if (hasResource(f.ret)) {
+      c = report(c, "E0450", f.span, "function `" + f.name + "` would return a resource; a resource handle cannot be returned");
+    }
+    let i: usize = 0;
+    while (i < f.paramCount) {
+      if (resourceNested(f.locals[i].ty)) {
+        c = report(c, "E0450", f.span, "parameter `" + f.locals[i].name + "` of `" + f.name + "` has a resource nested in another type");
+      }
+      i += 1;
+    }
+    c = block(c, f.body);
+    for (const d of c.diags) {
+      out.push(d);
+    }
+  }
+  return out;
+}

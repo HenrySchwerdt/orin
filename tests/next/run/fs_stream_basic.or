@@ -1,0 +1,80 @@
+// std:fs streaming API (ADR-0025): write / append / readLine / read / readAll / flush through the scope API.
+import { withFile, useFile, Read, Write, Append, File } from "std:fs";
+
+const PATH: string = "build/tests/fs_stream_basic.txt";
+
+function show(label: string, v: Option<string>): void {
+  match (v) {
+    Some(s) => { console.log(label + "=[" + s.split("\r").join("<CR>") + "]"); },
+    None => { console.log(label + "=None"); }
+  }
+}
+
+function main(): void {
+  const w = useFile(PATH, Write, f => {
+    f.write("alpha\n");
+    f.writeLine("beta");
+    f.write("gam");
+    f.write("ma\r\n");
+    f.write("delta");
+    f.flush();
+  });
+  console.log("write ok: " + w.isOk().toString());
+
+  const a = useFile(PATH, Append, f => { f.writeLine(""); f.write("epsilon"); });
+  console.log("append ok: " + a.isOk().toString());
+
+  // readLine strips "\n" and "\r\n"; the last line has no terminator; EOF is None (and stays None)
+  const r = useFile(PATH, Read, f => {
+    show("l1", f.readLine());
+    show("l2", f.readLine());
+    show("l3", f.readLine());
+    show("l4", f.readLine());
+    show("l5", f.readLine());
+    show("l6", f.readLine());
+    show("l7", f.readLine());
+    show("l8", f.readLine());
+  });
+  console.log("read ok: " + r.isOk().toString());
+
+  // read(n): up to n bytes, None only at EOF, read(0) is Some("")
+  const r2 = useFile(PATH, Read, f => {
+    show("r0", f.read(0));
+    show("r4", f.read(4));
+    show("r100", f.read(100));
+    show("r5", f.read(5));
+    show("r0 at eof", f.read(0));
+  });
+  console.log("read2 ok: " + r2.isOk().toString());
+
+  // readAll returns the rest of the file; the scope returns the body's value
+  const all = withFile(PATH, Read, f => {
+    const first = f.readLine();
+    return f.readAll();
+  });
+  match (all) {
+    Ok(s) => { console.log("rest length " + s.length.toString() + ": " + s.split("\r").join("<CR>").split("\n").join("|")); },
+    Err(e) => { console.log("err " + e); }
+  }
+  const none = withFile(PATH, Read, f => {
+    f.readAll();
+    return f.readAll();
+  });
+  console.log("second readAll is empty: " + (none.unwrap() == "").toString());
+
+  // the body's value can be any type
+  const n = withFile(PATH, Read, f => {
+    let count: int = 0;
+    while (f.readLine().isSome()) {
+      count += 1;
+    }
+    return count;
+  });
+  console.log("lines: " + n.unwrap().toString());
+  const words = withFile(PATH, Read, f => f.readAll().split("\n"));
+  console.log("split: " + words.unwrap().length.toString());
+
+  // Write truncates
+  useFile(PATH, Write, f => { f.write("x"); });
+  console.log("truncated: " + withFile(PATH, Read, f => f.readAll()).unwrap());
+}

@@ -20,7 +20,7 @@ claim about Orin in general.
   Build times are a single, uncached-for-C/Orin but Go-build-cache-warm measurement and are only indicative.
 - **Orin counters**: `ORIN_STATS=1 ./prog` prints a one-line JSON summary to stderr at exit (allocations by
   kind, frees, retains, releases, COW copies vs in-place `make_unique` hits, array/string growth
-  reallocations, peak live objects/bytes). Counters are plain increments compiled in always.
+  reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). Counters are plain increments compiled in always.
   `retains`/`releases` count non-immortal objects only; `releases` includes the children released while
   destroying an object. Bytes are object + buffer capacity (approximate, not RSS).
 - **Algorithm equivalences and deliberate choices** (no cherry-picking: where a choice favours one side it is listed):

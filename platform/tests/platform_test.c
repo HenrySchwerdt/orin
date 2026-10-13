@@ -148,6 +148,69 @@ static void test_files(void) {
     if (access("/dev/full", W_OK) == 0) CHECK(orin_platform_file_write("/dev/full", 9, "x", 1) == ENOSPC);
 }
 
+static void test_streams(void) {
+    orin_platform_stream *s = (orin_platform_stream *)1;
+    char buf[64];
+    const char *p = P("stream.txt");
+    /* open errors: nothing is opened, *out is NULL */
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_READ, &s) == ENOENT && s == NULL);
+    CHECK(orin_platform_stream_open("a\0b", 3, ORIN_PLATFORM_STREAM_WRITE, &s) == ORIN_PLATFORM_EINVAL && s == NULL);
+    CHECK(orin_platform_stream_open(p, strlen(p), 7, &s) == ORIN_PLATFORM_EINVAL && s == NULL);
+    CHECK(orin_platform_stream_open(p, strlen(p), -1, &s) == ORIN_PLATFORM_EINVAL && s == NULL);
+    CHECK(orin_platform_stream_open(tmpdir, strlen(tmpdir), ORIN_PLATFORM_STREAM_WRITE, &s) == EISDIR && s == NULL);
+    const char *nd = P("no_such_dir/x");
+    CHECK(orin_platform_stream_open(nd, strlen(nd), ORIN_PLATFORM_STREAM_WRITE, &s) == ENOENT && s == NULL);
+    CHECK(access(p, F_OK) != 0); /* a failed open creates nothing */
+    /* write, flush, append, close */
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_WRITE, &s) == 0 && s != NULL);
+    CHECK(orin_platform_stream_write(s, "ab\ncd", 5) == 5 && orin_platform_stream_write(s, "", 0) == 0);
+    CHECK(orin_platform_stream_flush(s) == 0 && orin_platform_stream_error(s) == 0);
+    char *whole;
+    size_t n;
+    CHECK(orin_platform_file_read(p, strlen(p), &whole, &n) == 0 && n == 5 && memcmp(whole, "ab\ncd", 5) == 0); /* flush delivered */
+    orin_platform_free(whole);
+    CHECK(orin_platform_stream_close(s) == 0);
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_APPEND, &s) == 0);
+    CHECK(orin_platform_stream_write(s, "\nef", 3) == 3 && orin_platform_stream_close(s) == 0); /* close flushes */
+    /* read: getc, block read, short read at EOF, sticky EOF, no error */
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_READ, &s) == 0);
+    CHECK(orin_platform_stream_getc(s) == 'a' && orin_platform_stream_read(s, buf, 0) == 0);
+    CHECK(orin_platform_stream_read(s, buf, 3) == 3 && memcmp(buf, "b\nc", 3) == 0);
+    CHECK(orin_platform_stream_read(s, buf, 50) == 4 && memcmp(buf, "d\nef", 4) == 0);
+    CHECK(orin_platform_stream_read(s, buf, 5) == 0 && orin_platform_stream_getc(s) == -1 && orin_platform_stream_getc(s) == -1);
+    CHECK(orin_platform_stream_error(s) == 0 && orin_platform_stream_close(s) == 0);
+    /* WRITE truncates; a 0xff byte is a byte */
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_WRITE, &s) == 0);
+    CHECK(orin_platform_stream_write(s, "\xff", 1) == 1 && orin_platform_stream_close(s) == 0);
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_READ, &s) == 0);
+    CHECK(orin_platform_stream_getc(s) == 255 && orin_platform_stream_getc(s) == -1 && orin_platform_stream_close(s) == 0);
+    /* a large write/read round trip (buffer boundaries) */
+    size_t big = 300000;
+    char *src = (char *)malloc(big), *dst = (char *)malloc(big);
+    for (size_t i = 0; i < big; i++) src[i] = (char)(i * 7 + 3);
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_WRITE, &s) == 0);
+    CHECK(orin_platform_stream_write(s, src, big) == big && orin_platform_stream_close(s) == 0);
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_READ, &s) == 0);
+    CHECK(orin_platform_stream_read(s, dst, big + 10) == big && memcmp(src, dst, big) == 0);
+    CHECK(orin_platform_stream_close(s) == 0);
+    free(src);
+    free(dst);
+    /* errors are sticky and reported by close: reading a write-only stream, writing a read-only one */
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_WRITE, &s) == 0);
+    CHECK(orin_platform_stream_getc(s) == -1 && orin_platform_stream_error(s) == EBADF);
+    CHECK(orin_platform_stream_write(s, "x", 1) == 1); /* later operations still run; the first error stays */
+    CHECK(orin_platform_stream_error(s) == EBADF && orin_platform_stream_close(s) == EBADF);
+    CHECK(orin_platform_stream_open(p, strlen(p), ORIN_PLATFORM_STREAM_READ, &s) == 0);
+    orin_platform_stream_write(s, "x", 1);
+    CHECK(orin_platform_stream_error(s) == EBADF && orin_platform_stream_close(s) == EBADF);
+    /* disk full is reported by flush and close */
+    if (access("/dev/full", W_OK) == 0) {
+        CHECK(orin_platform_stream_open("/dev/full", 9, ORIN_PLATFORM_STREAM_WRITE, &s) == 0);
+        CHECK(orin_platform_stream_write(s, "x", 1) == 1 && orin_platform_stream_flush(s) == ENOSPC);
+        CHECK(orin_platform_stream_error(s) == ENOSPC && orin_platform_stream_close(s) == ENOSPC);
+    }
+}
+
 static int capture(void (*fn)(void), char *out, size_t cap, int fd_to_capture) {
     int pfd[2];
     if (pipe(pfd)) return -1;
@@ -285,6 +348,7 @@ int main(void) {
     test_find();
     test_fmt();
     test_files();
+    test_streams();
     test_process_and_output();
     test_stdin();
     char cmd[300];

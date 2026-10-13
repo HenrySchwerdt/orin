@@ -115,6 +115,27 @@ int64_t orin_live_count(void);
 
 void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 */
 
+/* ---------------------------------------------------------------- file resources (ADR-0025)
+ * A file handle is an int64_t: a positive generation-tagged index into a fixed table of open streams
+ * (generation * 256 + slot), or the NEGATED errno-style code of a failed open. Handles are scalars at the
+ * language level (MIR class `MHandle`); the compiler guarantees (checker rules + MIR verifier) that a handle is
+ * only passed to functions, never copied, stored, returned or compared, and is closed exactly once on every
+ * path. The runtime does not rely on that: every operation validates the handle and TRAPS ("invalid file
+ * handle") on a closed, stale or foreign one, so a compiler bug can never become memory unsafety.
+ * At most 256 files are open at the same time (open fails with EMFILE beyond that). Streams still open at
+ * process end (a trap inside the scope callback, process.exit) are flushed and closed by an exit hook. Errors
+ * of read/write/flush are sticky per file and are reported by the close that ends the scope. */
+int64_t orin_file_open(OrinObj *path, int64_t mode);  /* mode 0 read, 1 write (truncate), 2 append */
+int64_t orin_file_is_open(int64_t h);                 /* 1 if h came from a successful open, else 0 */
+OrinObj *orin_file_open_error(int64_t h);             /* string: why the open failed (h <= 0) */
+OrinObj *orin_file_close(int64_t h);                  /* Option<string>: Some(message) if any operation failed */
+OrinObj *orin_file_read_line(int64_t h);              /* Option<string>: next line without "\n"/"\r\n"; None at EOF */
+OrinObj *orin_file_read(int64_t h, uint64_t n);       /* Option<string>: up to n bytes; None at EOF (n > 0) */
+OrinObj *orin_file_read_all(int64_t h);               /* string: the rest of the file */
+void orin_file_write(int64_t h, OrinObj *s);
+void orin_file_write_line(int64_t h, OrinObj *s);     /* s followed by "\n" */
+void orin_file_flush(int64_t h);
+
 /* Opt-in statistics (plain counters, always compiled in; printed as one JSON line on stderr at
  * exit only when the environment variable ORIN_STATS=1). retains/releases count only
  * non-immortal objects. Bytes are approximate (object + buffer capacity, excluding malloc
@@ -128,6 +149,7 @@ typedef struct OrinStats {
     uint64_t string_grows;                            /* in-place string append reallocations */
     uint64_t peak_live_objs, peak_live_bytes;
     uint64_t live_bytes;
+    uint64_t file_opens, file_closes;                 /* resource handles (ADR-0025): successful opens / closes */
 } OrinStats;
 extern OrinStats orin_stats;
 

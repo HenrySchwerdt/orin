@@ -21,7 +21,7 @@ import { MType, MLocal, Operand, Instr, Terminator, SwitchCase, MFunction } from
 import { Item, buildBlocks } from "./items";
 import { preludeSlot } from "./prelude";
 import {
-  Lits, litId, isRefTy, isVoidTy, isUsizeTy, isStringTy, isF32Ty, mty, isSimple, hasEffects, armsHaveEffects
+  Lits, litId, isRefTy, isHandleTy, isVoidTy, isUsizeTy, isStringTy, isF32Ty, mty, isSimple, hasEffects, armsHaveEffects
 } from "./util";
 
 export type Cx = { prog: Program; fn: Function; nHir: usize; lits: Lits; };
@@ -1346,7 +1346,30 @@ function stBlock(cx: Cx, sc: Sc, c: Ctr, b: HBlock): SR {
   return SR { items: r.items, c: r.c, added: None };
 }
 
+// `const h = fileOpen(path, mode)` (the std:fs scope API, ADR-0025): the handle local is the destination of
+// the IBuiltin itself; a handle is never copied or moved (the verifier rejects ICopy of a handle).
+function stLetOpen(cx: Cx, sc: Sc, c: Ctr, l: usize, args: HExpr[]): SR {
+  const a = lowerArgs(cx, sc, c, args);
+  let items = a.items;
+  items.push(ii(IBuiltin(Some(l), BFileOpen, a.ops)));
+  items = items.concat(releaseOwned(a));
+  return SR { items: items, c: a.c, added: None };
+}
+
+function isFileOpen(e: HExpr): bool {
+  return match (e.kind) {
+    XBuiltin(b, _) => match (b) { BFileOpen => true, _ => false },
+    _ => false
+  };
+}
+
 function stLet(cx: Cx, sc: Sc, c: Ctr, l: usize, init: HExpr): SR {
+  if (isHandleTy(cx.fn.locals[l].ty) && isFileOpen(init)) {
+    return match (init.kind) {
+      XBuiltin(_, args) => stLetOpen(cx, sc, c, l, args),
+      _ => stLetOpen(cx, sc, c, l, [])
+    };
+  }
   const v = expr(cx, sc, c, init);
   let items = v.items;
   const ty = cx.fn.locals[l].ty;

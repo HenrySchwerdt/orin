@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- Resources and streaming `std:fs` (ADR-0025, ADR-0016 "Resources"): `File` is a non-copyable handle that can only be a
+  function parameter; scope API `withFile` / `useFile` / `withFiles` / `useFiles` (`std:fs`, unstable until capabilities)
+  with `readLine`, `read`, `readAll`, `write`, `writeLine`, `flush`; errors E0450 (resource inside another type /
+  variable / result), E0451 (handle used as a value), E0452 (captured by a closure). MIR v1.8: `MHandle` with a linear
+  open/close discipline in the verifier; platform stream primitives with contracts; runtime handle table.
 - Packages (ADR-0016, spec 04): `orin.toml` manifest (`[package]`, `[architecture]`,
   `[modules.<path>] allowed_dependencies`), enforced by the loader (E0501 disallowed import, E0502
   unknown module, E0500/E0503 manifest errors); `orin check|compile|build|run <package-dir>`;
