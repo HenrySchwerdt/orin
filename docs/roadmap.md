@@ -41,6 +41,26 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   invariants are stated as contract clauses and checked in CI with `--check-contracts`.
 - **MIR source spans** are added during the lowering rewrite (ADR-0020 D3).
 - The Stage 0 CI jobs and the Rust crate were retired in the first post-freeze cleanup PR (branch `archive/stage0-final`, docs/bootstrap.md).
+- **Contract and class standard** (project owner, 2026-10-13): every class carries meaningful
+  `@Invariant`s, stateful logic is a class (class invariants are runtime-checked, record invariants
+  are not), every non-trivial function states real `@Requires`/`@Ensures`. Step 1 (loader/diag) is
+  brought up to this standard in step 1b. Details: `docs/rewrite.md`.
+
+### 2a. Diagnostics and CLI polish (directly after the rewrite)
+Goal (project owner, 2026-10-13): hints and CLI tooling that are a pleasure to use, built on
+the rewritten, contract-checked front end.
+- **Diagnostics:** "did you mean" for names, fields, methods, imports and TS habits
+  (`docs/ts-diagnostics.md`: `null`/`undefined`, `any`, `===`, `var`, `throw`, `extends`, union
+  types such as `type Id = int | string`, which is accepted silently today); secondary labels
+  ("declared here", "moved here"); concrete fix suggestions as machine-applicable edits (LSP code
+  actions, MCP, `orin fix`); one stable code and an `orin explain <code>` page per diagnostic
+  (`docs/diagnostics.md`); a golden test per diagnostic.
+- **CLI:** consistent subcommands and flags with `--help` and examples for each; colour and
+  terminal-width-aware output (off for non-TTY, `NO_COLOR`); `--format=json` for every command;
+  short timing summary; `orin new` (package scaffold), `orin fix`, `orin explain`; watch mode
+  for `check`/`test`; clear exit codes (documented).
+- Measured: a TS-developer task corpus (common mistakes from `docs/ts-developers.md`) where each
+  mistake must produce a diagnostic with a correct, applicable suggestion.
 
 ### 3. Concurrency (ADR-0017)
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
