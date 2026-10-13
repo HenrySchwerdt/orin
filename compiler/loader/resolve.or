@@ -4,14 +4,19 @@
 import { Span, Diagnostic, diag } from "../diag";
 import { StdModule } from "./program";
 import { Sources } from "./sources";
-import { normalizePath, dirname, joinPath, relativeTo, isInside } from "./path";
+import { normalizePath, isNormalized, dirname, joinPath, relativeTo, isInside } from "./path";
 
 // An import resolves to a std module implemented by the C runtime (`std` is Some, `path` is empty)
 // or to the normalized path of a source file.
+@Invariant(this.std.isSome() ==> this.path == "")
+@Invariant(this.std.isNone() ==> isNormalized(this.path))
 export type Resolved = { std: Option<StdModule>; path: string; };
 
 // `/`-separated path of `p` relative to `base`, without a trailing `.or`. Prelude units (virtual
 // paths, see prelude.or) keep their path: their name does not depend on the entry file.
+@Requires(isNormalized(base) && isNormalized(p))
+@Ensures(p.startsWith("$") ==> p.startsWith(result) && p.length - result.length <= 3)
+@Ensures(!p.startsWith("$") ==> !result.startsWith("/"))
 export function unitName(base: string, p: string): string {
   const s = p.startsWith("$") ? p : relativeTo(base, p);
   return s.endsWith(".or") ? s.substring(0, s.length - 3) : s;
@@ -32,6 +37,8 @@ function isStdlibModule(p: string): bool {
 
 // Std modules backed by the C runtime. `std:fsraw` is internal: the file primitives behind `std:fs`
 // (stdlib/fs.or); only library code may import it. `std:clock` is internal too (`std:time` wraps it).
+// The two tables are disjoint: a module that is in both would resolve to the C runtime silently.
+@Ensures(result.isSome() ==> p.startsWith("std:") && !isStdlibModule(p) && p != "std:math")
 function runtimeModule(p: string): Option<StdModule> {
   return match (p) {
     "std:fsraw" => Some(StdFs),
@@ -42,6 +49,8 @@ function runtimeModule(p: string): Option<StdModule> {
   };
 }
 
+@Requires(sp.start <= sp.end)
+@Ensures(result.code == "E0301" && result.span.start == sp.start && result.span.end == sp.end)
 function unknownStd(p: string, sp: Span): Diagnostic {
   return diag(
     "E0301",
@@ -50,74 +59,112 @@ function unknownStd(p: string, sp: Span): Diagnostic {
   );
 }
 
-// Resolve import path `p` of file `importer` to a std module or a normalized file path.
-// Reports E0301 (unknown module) and E0302 (module boundary).
-export function resolveImport(
-  src: Sources,
-  importer: string,
-  p: string,
-  sp: Span,
-  base: string,
-): Result<Resolved, Diagnostic> {
-  if (p.startsWith("$")) {
-    // The implicit import of a prelude root's entry file (added to the program's entry file by the loader).
-    return Ok(Resolved { std: None, path: normalizePath(p) });
+// Resolves the imports of one load: knows where files come from (`src`) and the directory of the
+// entry file (`base`), which unit names are relative to.
+@Invariant(isNormalized(this.base))
+export class ImportResolver {
+  private src: Sources;
+  private base: string;
+
+  @Requires(isNormalized(base))
+  constructor(src: Sources, base: string) {
+    this.src = src;
+    this.base = base;
   }
-  if (p == "std:math") {
-    // std:math is Orin code (array/math.or, part of the embedded `$array` prelude root), loaded on demand.
-    return Ok(Resolved { std: None, path: "$array/math.or" });
+
+  // The unit name of the file at normalized path `p` (see `unitName`).
+  @Requires(isNormalized(p))
+  nameOf(p: string): string {
+    return unitName(this.base, p);
   }
-  if (p.startsWith("std:")) {
-    if (isStdlibModule(p)) {
-      return Ok(Resolved { std: None, path: `$stdlib/${p.substring(4, p.length)}.or` });
+
+  // Resolve import path `p` of file `importer` to a std module or a normalized file path.
+  // Reports E0301 (unknown module) and E0302 (module boundary).
+  //
+  // Postconditions: a source file result is a normalized path ending in `.or` (`$...` for prelude
+  // files), a std module result has no path; only a prelude file may import `std:fsraw`; every
+  // error is E0301 or E0302 at the span of the import path.
+  @Requires(isNormalized(importer) && sp.start <= sp.end)
+  @Ensures(!p.startsWith("$") && result.isOk()
+      ==> result.unwrap().std.isSome() || result.unwrap().path.endsWith(".or"))
+  @Ensures(result.isOk() ==> result.unwrap().std.isSome() == (result.unwrap().path.length == 0))
+  @Ensures(result.isOk() ==> result.unwrap().std.isNone() ==> isNormalized(result.unwrap().path))
+  @Ensures(result.isOk() && result.unwrap().std.isSome() ==> p.startsWith("std:"))
+  @Ensures(p == "std:fsraw" && !importer.startsWith("$") ==> result.isErr())
+  @Ensures(p.startsWith("$") ==> result.isOk() && result.unwrap().path == normalizePath(p))
+  @Ensures(result.isErr()
+      ==> result.unwrapErr().code == "E0301" || result.unwrapErr().code == "E0302")
+  @Ensures(result.isErr()
+      ==> result.unwrapErr().span.start == sp.start && result.unwrapErr().span.end == sp.end)
+  resolve(importer: string, p: string, sp: Span): Result<Resolved, Diagnostic> {
+    if (p.startsWith("$")) {
+      // The implicit import of a prelude root's entry file (added to the program's entry file by the loader).
+      return Ok(Resolved { std: None, path: normalizePath(p) });
     }
-    const m = runtimeModule(p);
-    if (m.isNone() || p == "std:fsraw" && !importer.startsWith("$")) {
-      return Err(unknownStd(p, sp));
+    if (p == "std:math") {
+      // std:math is Orin code (array/math.or, part of the embedded `$array` prelude root), loaded on demand.
+      return Ok(Resolved { std: None, path: "$array/math.or" });
     }
-    return Ok(Resolved { std: m, path: "" });
-  }
-  const dir = dirname(importer);
-  const asFile = joinPath(dir, p + ".or");
-  const asModule = joinPath(dir, p + "/module.or");
-  let target = asFile;
-  if (!src.exists(asFile)) {
-    if (!src.exists(asModule)) {
+    if (p.startsWith("std:")) {
+      if (isStdlibModule(p)) {
+        return Ok(Resolved { std: None, path: `$stdlib/${p.substring(4, p.length)}.or` });
+      }
+      const m = runtimeModule(p);
+      if (m.isNone() || p == "std:fsraw" && !importer.startsWith("$")) {
+        return Err(unknownStd(p, sp));
+      }
+      return Ok(Resolved { std: m, path: "" });
+    }
+    const dir = dirname(importer);
+    const asFile = joinPath(dir, p + ".or");
+    const asModule = joinPath(dir, p + "/module.or");
+    let target = asFile;
+    if (!this.src.exists(asFile)) {
+      if (!this.src.exists(asModule)) {
+        return Err(
+          diag(
+            "E0301",
+            sp,
+            `cannot find module \`${p}\` (tried \`${asFile}\` and \`${asModule}\`)`,
+          ),
+        );
+      }
+      target = asModule;
+    }
+    const blocked = this.privateModuleOf(importer, target);
+    if (blocked.isSome()) {
+      const owner = blocked.unwrap();
       return Err(
-        diag("E0301", sp, `cannot find module \`${p}\` (tried \`${asFile}\` and \`${asModule}\`)`),
+        diag(
+          "E0302",
+          sp,
+          `cannot import private file \`${this.nameOf(target)}\` of module \`${this.nameOf(owner)}\`; import the module itself`,
+        ),
       );
     }
-    target = asModule;
+    return Ok(Resolved { std: None, path: target });
   }
-  const blocked = privateModuleOf(src, importer, target);
-  if (blocked.isSome()) {
-    const owner = blocked.unwrap();
-    return Err(
-      diag(
-        "E0302",
-        sp,
-        `cannot import private file \`${unitName(base, target)}\` of module \`${unitName(base, owner)}\`; import the module itself`,
-      ),
-    );
-  }
-  return Ok(Resolved { std: None, path: target });
-}
 
-// Module boundary rule (E0302): the directory (nearest first) of an ancestor module of `target`
-// whose `module.or` is not `target` itself and which does not contain `importer`; None when the
-// import is allowed. Walks up to the filesystem root, or to the start of a relative path.
-function privateModuleOf(src: Sources, importer: string, target: string): Option<string> {
-  let d = dirname(target);
-  while (d != ".") {
-    const m = joinPath(d, "module.or");
-    if (target != m && src.exists(m) && !isInside(d, importer)) {
-      return Some(d);
+  // Module boundary rule (E0302): the directory (nearest first) of an ancestor module of `target`
+  // whose `module.or` is not `target` itself and which does not contain `importer`; None when the
+  // import is allowed. Walks up to the filesystem root, or to the start of a relative path.
+  @Requires(isNormalized(importer) && isNormalized(target))
+  @Ensures(result.isSome()
+      ==> isNormalized(result.unwrap()) && !isInside(result.unwrap(), importer))
+  @Ensures(result.isSome() ==> isInside(result.unwrap(), target))
+  private privateModuleOf(importer: string, target: string): Option<string> {
+    let d = dirname(target);
+    while (d != ".") {
+      const m = joinPath(d, "module.or");
+      if (target != m && this.src.exists(m) && !isInside(d, importer)) {
+        return Some(d);
+      }
+      const parent = dirname(d);
+      if (parent == d) {
+        break;
+      }
+      d = parent;
     }
-    const parent = dirname(d);
-    if (parent == d) {
-      break;
-    }
-    d = parent;
+    return None;
   }
-  return None;
 }

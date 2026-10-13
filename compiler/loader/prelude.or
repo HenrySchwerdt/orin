@@ -14,20 +14,88 @@ import { SourceFile } from "../diag";
 import { embeddedStdFiles } from "./embedded_std";
 import { embeddedArrayFiles } from "./embedded_array";
 import { embeddedStdlibFiles } from "./embedded_stdlib";
+import { isNormalized } from "./path";
 
+// `entry` is "" (a library root) or the virtual path of one of `files`. (Record invariants are not
+// checked at run time: `isWellFormedRoot` / `rootsWellFormed` are the checked form, used by the
+// contracts of the functions below and of `loadWithRoots`.)
+@Invariant(this.entry == "" || isNormalized(this.entry))
 export type PreludeRoot = { entry: string; files: SourceFile[]; };
 
+// True when `r` is a usable root: every file has a normalized virtual path (`$name/...`, so that it can
+// never collide with a file of the user's program), paths are unique within the root, and a non-empty
+// entry names one of the files.
+export function isWellFormedRoot(r: PreludeRoot): bool {
+  let entryFound = r.entry == "";
+  let i: usize = 0;
+  while (i < r.files.length) {
+    const p = r.files[i].path;
+    if (!p.startsWith("$") || !isNormalized(p)) {
+      return false;
+    }
+    if (p == r.entry) {
+      entryFound = true;
+    }
+    let j: usize = i + 1;
+    while (j < r.files.length) {
+      if (r.files[j].path == p) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return entryFound;
+}
+
+// Number of roots that have an entry file (those the entry unit imports implicitly).
+export function countEntries(rs: PreludeRoot[]): usize {
+  let n: usize = 0;
+  for (const r of rs) {
+    if (r.entry != "") {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+// True when every root is well formed and no two roots serve the same virtual path.
+export function rootsWellFormed(rs: PreludeRoot[]): bool {
+  let a: usize = 0;
+  while (a < rs.length) {
+    if (!isWellFormedRoot(rs[a])) {
+      return false;
+    }
+    let b: usize = a + 1;
+    while (b < rs.length) {
+      for (const f of rs[a].files) {
+        for (const g of rs[b].files) {
+          if (f.path == g.path) {
+            return false;
+          }
+        }
+      }
+      b += 1;
+    }
+    a += 1;
+  }
+  return true;
+}
+
 // The array API (closures, ADR-0011): `xs.map(f)` etc. are calls of its functions (check/body.or).
+@Ensures(isWellFormedRoot(result) && result.entry != "")
 function arrayRoot(): PreludeRoot {
   return PreludeRoot { entry: "$array/module.or", files: embeddedArrayFiles() };
 }
 
 // Std modules written in Orin (std:path, std:json, std:time, std:graph, std:test): a library root
 // without an implicit import (entry ""); the loader resolves `import ... from "std:path"` to "$stdlib/path.or".
+@Ensures(isWellFormedRoot(result) && result.entry == "")
 function stdlibRoot(): PreludeRoot {
   return PreludeRoot { entry: "", files: embeddedStdlibFiles() };
 }
 
+@Ensures(rootsWellFormed(result) && result.length == 3)
 export function preludeRoots(): PreludeRoot[] {
   return [
     PreludeRoot { entry: "$std/module.or", files: embeddedStdFiles() },
@@ -38,6 +106,7 @@ export function preludeRoots(): PreludeRoot[] {
 
 // The roots loaded even without the std prelude (--c-builtins, `check`, the language server): the
 // array API is part of the language (ADR-0011), not a library implementation detail.
+@Ensures(rootsWellFormed(result) && result.length == 2)
 export function noPreludeRoots(): PreludeRoot[] {
   return [arrayRoot(), stdlibRoot()];
 }
