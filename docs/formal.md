@@ -1,6 +1,8 @@
 # Formal memory-safety model (Lean 4)
 
-Status: first fragment, fully machine-checked, no `sorry`, no extra axioms.
+Status: two fragments, fully machine-checked, no `sorry`, no extra axioms: the memory-IR
+invariant (this file up to "Next steps") and the mechanised ownership analysis of MIR core with
+its soundness theorem (last section).
 Location: `formal/` (Lake project, Lean 4 core only, no Mathlib, toolchain pinned in
 `formal/lean-toolchain`). Check with `formal/check.sh` (runs `lake build`, rejects
 `sorry`/`admit`/`axiom`/`native_decide`/`unsafe`/`opaque`/`extern` in the sources, and audits
@@ -137,10 +139,10 @@ Assumed (stated as hypotheses or by construction, not established here):
 
 * The program is a sequence of the modelled instructions with in-range local indices and
   scalar branch conditions (outcome `ill` is not analysed; a verifier must exclude it).
-* `store` is only executed through a unique reference. Only the pattern `makeUnique x; store x ...`
-  is proven safe. For arbitrary programs, `store` into a shared object yields `bad shared`; a
-  program-level theorem that a verifier-accepted program never does so is **not** proven (it is
-  the OIM verifier's job, spec 07 item 5).
+* `store` is only executed through a unique reference. In the *first* model only the pattern
+  `makeUnique x; store x ...` is proven safe. For arbitrary programs, `store` into a shared object
+  yields `bad shared`. The program-level theorem "a verifier-accepted program never does so" is now
+  proven for a fragment of MIR, see "Mechanised ownership analysis" at the end of this file.
 * Locations are never reused (`next` only grows). A real allocator reuses addresses; this is
   sound because `WF` says no reference to freed storage exists, but the model does not prove
   anything about the allocator.
@@ -175,8 +177,190 @@ artifact. Layer label: **memory IR, partial.**
 ## Next steps (suggested)
 
 1. Calls and borrowed parameters (frame rule); function-return ownership transfer.
-2. A tiny verifier (typing judgment on the IR: ownership + uniqueness certificate) with a proof
-   that accepted programs never produce `bad` or `ill`; progress theorem.
+2. (done for a fragment, see the last section) A verifier (ownership + uniqueness analysis on the
+   IR) with a proof that accepted programs never produce `bad`. Still open: `ill` (type/null
+   confusion), progress theorem, calls, loops, arrays.
 3. Exact accounting (`rc = owners`) for the leak-free fragment.
 4. Arrays (slot count changes, push/pop), immortals.
 5. Then the source core calculus and its lowering to this IR.
+
+## Mechanised ownership analysis (MIR core): verifier-accepted code is memory-safe
+
+Status: machine-checked (`formal/check.sh` passes; no `sorry`/`admit`/`axiom`; standard axioms
+only), for a **structured fragment of MIR without calls, arrays or loops**. This closes part of the
+open obligation "verifier-accepted MIR implies machine safety". It is a proof about a Lean
+*transcription of the rules* in `docs/mir.md` (plus its implementation notes), **not** about the Orin
+source in `compiler/verify/`: the correspondence Lean `check` <-> `rules.or`/`state.or`/`verify.or`
+is manual and unverified (it is part of the trusted base, see "Findings" for the places where the
+two differ).
+
+### Headline theorem
+
+`Orin.check_sound` (`formal/Orin/Top.lean`), in words: let `p` be a function accepted by the
+checker `Orin.check`. Start the machine with the arguments in the first locals (reference arguments
+are borrowed from the caller, see "Caller contract") and all other locals dead. Then **no reachable
+machine step is `bad`**: no access to a freed or never-allocated object (so no use after free, no
+double free, no use of an invalidated borrowed alias), and no in-place store (`setField`,
+`putField`, `takeField`) into an object whose count is not 1 (so value semantics / COW is
+respected). Corollaries `check_no_use_after_free` (`bad dead`) and `check_no_shared_store`
+(`bad shared`). `ill` and `trap` outcomes are not excluded (see "What `ill` means").
+
+### Theorems (all in the `Orin` namespace)
+
+| Theorem | Plain-English statement |
+|---|---|
+| `check_sound` | accepted function + caller contract => no reachable step is `bad` (above) |
+| `check_no_use_after_free`, `check_no_shared_store` | the two components of `bad` |
+| `entry_inv` | the entry state satisfies the simulation relation under the caller contract |
+| `check_cont` / `chk_cont` | the checker (`chk`, a function) yields a derivation `Cont` of acceptance, closed under weakening so it survives the join after an `if` |
+| `sound_step`, `reach_inv`, `reach_safe` | from a configuration related to the abstract state, the next step is never `bad`; the successor is again related to some abstract state that still accepts the remaining code; hence along every run |
+| `op_const`, `op_move`, `op_borrow`, `op_dup`, `op_release`, `op_alloc`, `op_getField`, `op_setField`, `op_putField`, `op_takeField`, `op_makeUnique` | per-instruction: if the abstract rule accepts the instruction in a related state, the concrete operation is never `bad` and any resulting state is related to the abstract successor |
+| `drain_inv` | every step of the release worklist preserves the relation and is never `bad` (a freed object is never a `Borrowed` alias target, a `Unique` object, or a caller-anchored parameter) |
+| `Inv.weaken`, `joinL_fle_left`, `joinL_fle_right` | the relation is monotone in the abstract state, and the join is an upper bound of both branches (soundness of the join rule) |
+| `unique_excl` | a `Unique` local's object (count 1) is held by nothing else: no other counted local, parameter, borrowed alias, pending release, heap slot or caller reference |
+| `wf_locals`, `wf_store_take`, `wf_alloc_take`, `wf_take` (`WFx.lean`) | the old invariant `WF` is preserved by count-*moving* operations (local -> slot, local -> fresh object, slot -> local, local -> local) |
+| `ex*` / `bad*` examples (`Examples.lean`) | `decide`-checked: the checker accepts borrow/dup/release, COW update, take/put, `if` with agreeing branches; rejects double release, store into a duplicated (non-unique) object, borrowed alias used after its root is released, release/store through a parameter, `make_unique` or `move` on a borrowed alias, divergent join, open hole at return |
+
+### Files
+
+`Mir.lean` (instructions, concrete operations, step relation) -> `Check.lean` (abstract state, rules,
+holes, join, `chk`/`check`) -> `Proj.lean` (projection + relation `Inv`) -> `Sim1-7.lean` (lemmas and the
+per-instruction preservation proofs; `Sim7` = release worklist) -> `Weaken.lean` (weakening, join) ->
+`Sound.lean` (acceptance derivations, single step, runs) -> `Top.lean` (entry state, headline
+theorem) -> `Examples.lean`. `WFx.lean` adds count-moving preservation lemmas to the first model's `WF`.
+
+### The fragment
+
+Straight-line code with structured `if`/`else` and a continuation (`Code`), over the machine of
+`Machine.lean` (same heap, `WF`, release worklist).
+
+| MIR | Lean | Notes |
+|---|---|---|
+| `ICopy` of a scalar | `const` | scalar only; `OStr` immortals not modelled |
+| `IMove` | `move` | |
+| `IBorrow` | `borrow` | uncounted alias, no retain |
+| `IDup` | `dup` | retain |
+| `IRelease` | `release` | pushes the count on the worklist; freeing is `drain` |
+| `IStructNew` | macro `Code.structNew` = `alloc d n` + `setField d i yᵢ` | operands consumed left to right; operand = destination rejected (see Findings) |
+| `IGetField` | `getField d o i isRef` | no retain; `isRef` = static class of `d` (borrowed result vs scalar) |
+| `ISetField` / `IPutField` | `setField` / `putField` | same concrete operation (store, release old slot); differ in the hole rule |
+| `ITakeField` | `takeField` | slot becomes `int 0`, count moves to the destination |
+| `IMakeUnique` | `makeUnique` | the old model's `opMakeUnique` |
+| `TBranch`, join | `Code.ite` (condition = an `Init` scalar) | branches then continuation; the checker joins |
+| `TReturn` | end of code | no hole may be open (error); leaks are not tracked (warnings only in the verifier) |
+| parameters | initial kinds `Param` (reference) / `Init` (scalar) | borrowed for the whole body; never redefined |
+
+Abstract state per local: `dead | init | owned | unique | borrowed src | param | poison` (`poison`
+merges `MaybeDead`/`MaybeLeak`) plus the set of open holes `(local, slot)`. Rules are one transfer
+function per instruction (`stepL`, kinds; `stepH`, holes), a semilattice join (`jk`/`joinL`) and
+`chk`. All rules of `docs/mir.md` for the instructions above are covered, including: `Borrowed(x)`
+invalidation on release/move/consume/redefinition and on every mutating op (`setField`, `putField`,
+`takeField`, `makeUnique`); `Unique` demotion to `Owned` on `dup`/`borrow`; `Unique` required for
+`setField`/`takeField`/`putField`; the hole discipline; borrow roots (`rootOf`, borrowed-of-borrowed
+takes the root); the join rules (equal states stay, `Owned`/`Unique` join to `Owned`, everything else is
+poisoned, `Borrowed` sources must agree).
+
+**Not covered** (each is a gap in the claim "verifier-accepted MIR is safe"): `ICall`/`IBuiltin` and
+the call/`Unique` demotion rule, the interprocedural caller side of the contract below; loops and
+back edges (the worklist fixpoint of `verify.or` and its termination), `TSwitch`/`TGoto` as an
+unstructured CFG (the model has only if/else; a switch is an `ite` chain); arrays (`IArray*`,
+symbolic hole keys), strings (`IStrAppend`, `OStr`, the `Imm` kind, `INullary`), scalar ops
+(`IUnary`/`IBinary`/`ITag`, they do not touch ownership), the `MaybeLeak`/`MaybeDead`
+distinction and leak warnings, the well-formedness pass beyond index ranges and operand classes
+(modelled as in-range checks and the kind classes), `TTrap`. Also not covered: the correspondence
+of the model with `runtime/orin_runtime.c`, the code generator and the Orin implementation of the
+verifier (manual transcription).
+
+### The simulation relation `Inv ext a s` (`Proj.lean`)
+
+Abstract state `a` (kinds) and concrete state `s` are related by:
+
+* **RC soundness on the counted owners.** `projL a locals` keeps exactly the locals that `a`
+  marks `Owned`/`Unique` (all others read as the dead marker), `Pst` adds the worklist and a fixed
+  list `ext` of the caller's references. The first model's `WF` holds for this projected state:
+  every live object has `rc >= (counted locals) + (worklist entries) + (heap slots) + (caller refs)`.
+  So the proof reuses `wf_drain`, `wf_dupInto`, `wf_makeUnique`, ... of the first model.
+* `Init` locals hold scalars; every reference-kind local holds a reference.
+* `Unique x`: `x` holds a reference to a live object with count 1 (then `unique_excl`: nothing else
+  refers to it).
+* `Borrowed r` at `i`: `r` is a root (`Owned`/`Unique`/`Param`) holding `ref p`, and local `i`'s
+  value is `p` itself or lies in a slot of an object reachable from `p` (`Desc`); if `r` is `Unique`
+  the alias is not the root's own whole object. Hence a borrowed value stays live as long as no
+  object on its chain is mutated or freed. Chains are never mutated by `setField`/`takeField`/
+  `drain` because every chain object has an owner other than the unique local or the worklist entry
+  involved (`desc_owned`, `hD_unique`).
+* `Param`: the value is a caller-anchored reference, see below.
+
+The release worklist is not part of the abstract state: `drain_inv` shows its steps preserve the
+relation at any abstract state.
+
+### Caller contract (entry condition)
+
+`entry_inv`: the first `|params|` locals hold the arguments, other locals are dead, and there is a
+list `ext` of references owned by the caller (`WF <H, ext, []>`, i.e. the heap counts them) such that every
+reference argument is `ref l` with `l` below some `q` in `ext` (`Desc H q (ref l)`, in particular `l`
+itself in `ext`); scalar parameters are scalars. This models "borrowed for the whole call": either an
+owned caller local, or an uncounted alias of something below one (e.g. `f(x.field)`). It is an
+*assumption*; there is no call rule, so it is not discharged for any real call site.
+
+### What `ill` means (not excluded)
+
+`ill` marks outcomes that are not memory events in the model but would be in C: a field read whose
+slot class disagrees with the destination class (scalar into a reference local or vice versa), a
+`takeField` of a scalar slot, and (via the hole discipline) a read of a slot that was emptied by
+`takeField`. MIR has no field types (`docs/mir.md`: "Not checked: field/slot index bounds, tags"),
+so **memory safety of the compiled program additionally rests on the well-typedness of the lowering
+(HIR types)** for slot classes, and on the hole discipline for null slots. The theorem proves only
+that these are the *only* ways for an accepted program to go wrong (together with `trap`, the
+defined bounds trap): everything else is excluded by the ownership analysis alone.
+
+### Findings (discrepancies and sharpened rules)
+
+1. **Self-rooted borrow (verifier more permissive than the proof).** `IGetField(d, d, i)` with `d`
+   `Owned`, and `IBorrow(d, s)` with `s` `Borrowed(d)`, make `rules.or` compute the root *before*
+   redefining `d`, producing `Borrowed(src = d)` on `d` itself (with a leak warning for the old
+   owned reference). Neither `docs/mir.md` nor `wf.or` excludes it (`wf.or` only requires distinct
+   locals for `IBorrow`, not for `IGetField`). The old owner's count is leaked, which keeps the
+   chain alive, so it is very likely benign (I could not construct an exploit), but it violates the
+   documented invariant "`Borrowed(src)`: `src` is a local or `Param`" and falls outside what is
+   proven: the Lean checker rejects it (`rootOf src ≠ d`). Either reject it in `rules.or`/`wf.or`
+   (one comparison) or extend the invariant with a "leaked root" kind.
+2. **The role of the hole rules is null-dereference, not use-after-free.** `docs/mir.md` says a
+   hole "would leave a dangling slot". The runtime (`orin_mir_struct_take`) writes `0` into the
+   slot, and `orin_release`/`orin_destroy` are null-safe (`if (o && o->rc > 0)` / `DEC`). The theorem
+   needs none of the hole rules for `bad`; they guard reads of the emptied slot (a null
+   dereference), which the model reports as `ill`, which is not proven absent (see above). The
+   document should say "null slot", and the "open hole at return" rule is a functional-correctness
+   rule (the caller would observe a null field), not a use-after-free rule.
+3. **The `Unique` demotion on `IBorrow`/`IDup` is necessary, not merely conservative.** Without it
+   `x = Unique; b = borrow x; d = dup b; setField x ...` gives `bad shared` (count 2 on an object
+   believed unique). The proof isolates why: the relation has the invariant that a `Unique` root has
+   no whole-object `Borrowed` alias, and it holds only because `borrow` demotes the root. (Same
+   statement as the table in `docs/mir.md`; the proof shows it cannot be dropped.) By contrast the
+   invalidation of `Borrowed(x)` on `makeUnique` is not needed for safety (aliases of the old
+   object's children remain valid in the copy), it is a harmless conservative choice.
+4. **Join rule needs one more side condition, implied by an invariant.** `docs/mir.md`: "`Borrowed(src)`
+   must have equal `src` on all paths". For the proof the join must also leave `src` a root kind
+   (otherwise a borrowed alias would be rooted at a poisoned local). On reachable states this is
+   automatic (a local that is `Param` on one path is `Param` on all, a borrowed alias's root is live
+   on both), so the verifier is fine; the Lean `joinL` states it explicitly (`postK`).
+5. **`ISetField`/`IPutField` with `v = x` is rejected by `wf.or` (`valueOk`) but not mentioned in
+   `docs/mir.md`.** It is harmless for safety (the stored object becomes a self-cycle: a leak).
+   The model keeps the restriction.
+6. **`IStructNew` with an operand equal to its destination** (`d = Some(d)` style) is accepted by
+   `rules.or` (operands are consumed, then `d` defined). The model expands `IStructNew` into
+   `alloc d` + `setField d i y` and therefore rejects it. This is a restriction of the model, not a
+   known unsoundness; to cover it, model `IStructNew` as one instruction.
+7. **No call rule, hence the caller contract above is an assumption.** The `Param` rule is sound
+   *given* the contract; nothing here checks that call sites establish it (a caller passing an
+   alias of something it already invalidated, or a `Unique` it later mutates during the call).
+   The documented call rule ("a `Unique` argument is demoted to `Owned` when the result is a
+   reference") is exactly the part not mechanised.
+
+### Reading and trusting this
+
+To audit the claim read `Mir.lean` (concrete operations: do they model the runtime calls?),
+`Check.lean` (do the rules match `docs/mir.md` / `rules.or`?), the statement of `check_sound`
+and its contract in `Top.lean`; the rest is proof. A differential test of the Lean `check` against
+`compiler/verify` on generated MIR (the structured fragment) would close most of the manual-
+transcription gap.
