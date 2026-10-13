@@ -37,6 +37,9 @@
 extern "C" {
 #endif
 
+#define ORIN_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define ORIN_LIKELY(x) __builtin_expect(!!(x), 1)
+
 /* ---------------------------------------------------------------- object layout */
 
 enum { ORIN_K_STRING = 1, ORIN_K_ARRAY = 2, ORIN_K_STRUCT = 3 };
@@ -93,7 +96,7 @@ typedef struct OrinStruct {
 void orin_init(int argc, char **argv);
 /* Flush buffered stdout (called by orin_process_exit, orin_trap; call before returning from main). */
 void orin_flush(void);
-void orin_trap(const char *msg) __attribute__((noreturn));
+void orin_trap(const char *msg) __attribute__((noreturn, cold));
 /* Number of live (non-immortal) heap objects; for leak/UAF tests. */
 int64_t orin_live_count(void);
 
@@ -116,14 +119,14 @@ typedef struct OrinStats {
 extern OrinStats orin_stats;
 
 static inline void orin_retain(OrinObj *o) {
-    if (o->rc > 0) {
+    if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
         orin_stats.retains++;
     }
 }
 /* retain and return (turn a borrowed value into an owned one). */
 static inline OrinObj *orin_dup(OrinObj *o) {
-    if (o->rc > 0) {
+    if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
         orin_stats.retains++;
     }
@@ -133,78 +136,85 @@ static inline OrinObj *orin_dup(OrinObj *o) {
 static inline void orin_release(OrinObj *o) {
     if (o && o->rc > 0) {
         orin_stats.releases++;
-        if (--o->rc == 0) orin_destroy(o);
+        if (ORIN_UNLIKELY(--o->rc == 0)) orin_destroy(o);
     }
 }
 
 /* Returns o if o->rc == 1, else a shallow copy (ref children retained) and releases one
  * count of o. Consumes the caller's reference to o, returns an owned one. */
-OrinObj *orin_make_unique(OrinObj *o);
+OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path */
+static inline OrinObj *orin_make_unique(OrinObj *o) {
+    if (ORIN_LIKELY(o->rc == 1)) {
+        orin_stats.cow_inplace++;
+        return o;
+    }
+    return orin_make_unique_slow(o);
+}
 
 /* ---------------------------------------------------------------- checked arithmetic */
 
 static inline int64_t orin_add_i(int64_t a, int64_t b) {
     int64_t r;
-    if (__builtin_add_overflow(a, b, &r)) orin_trap("integer overflow");
+    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap("integer overflow");
     return r;
 }
 static inline int64_t orin_sub_i(int64_t a, int64_t b) {
     int64_t r;
-    if (__builtin_sub_overflow(a, b, &r)) orin_trap("integer overflow");
+    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap("integer overflow");
     return r;
 }
 static inline int64_t orin_mul_i(int64_t a, int64_t b) {
     int64_t r;
-    if (__builtin_mul_overflow(a, b, &r)) orin_trap("integer overflow");
+    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap("integer overflow");
     return r;
 }
 static inline int64_t orin_div_i(int64_t a, int64_t b) {
-    if (b == 0) orin_trap("division by zero");
-    if (a == INT64_MIN && b == -1) orin_trap("integer overflow");
+    if (ORIN_UNLIKELY(b == 0)) orin_trap("division by zero");
+    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap("integer overflow");
     return a / b;
 }
 static inline int64_t orin_rem_i(int64_t a, int64_t b) {
-    if (b == 0) orin_trap("modulo by zero");
-    if (a == INT64_MIN && b == -1) orin_trap("integer overflow");
+    if (ORIN_UNLIKELY(b == 0)) orin_trap("modulo by zero");
+    if (ORIN_UNLIKELY(a == INT64_MIN && b == -1)) orin_trap("integer overflow");
     return a % b;
 }
 static inline int64_t orin_neg_i(int64_t a) {
-    if (a == INT64_MIN) orin_trap("integer overflow");
+    if (ORIN_UNLIKELY(a == INT64_MIN)) orin_trap("integer overflow");
     return -a;
 }
 static inline uint64_t orin_add_u(uint64_t a, uint64_t b) {
     uint64_t r;
-    if (__builtin_add_overflow(a, b, &r)) orin_trap("usize overflow");
+    if (ORIN_UNLIKELY(__builtin_add_overflow(a, b, &r))) orin_trap("usize overflow");
     return r;
 }
 static inline uint64_t orin_sub_u(uint64_t a, uint64_t b) {
     uint64_t r;
-    if (__builtin_sub_overflow(a, b, &r)) orin_trap("usize underflow");
+    if (ORIN_UNLIKELY(__builtin_sub_overflow(a, b, &r))) orin_trap("usize underflow");
     return r;
 }
 static inline uint64_t orin_mul_u(uint64_t a, uint64_t b) {
     uint64_t r;
-    if (__builtin_mul_overflow(a, b, &r)) orin_trap("usize overflow");
+    if (ORIN_UNLIKELY(__builtin_mul_overflow(a, b, &r))) orin_trap("usize overflow");
     return r;
 }
 static inline uint64_t orin_div_u(uint64_t a, uint64_t b) {
-    if (b == 0) orin_trap("division by zero");
+    if (ORIN_UNLIKELY(b == 0)) orin_trap("division by zero");
     return a / b;
 }
 static inline uint64_t orin_rem_u(uint64_t a, uint64_t b) {
-    if (b == 0) orin_trap("modulo by zero");
+    if (ORIN_UNLIKELY(b == 0)) orin_trap("modulo by zero");
     return a % b;
 }
 static inline uint64_t orin_neg_u(uint64_t a) {
-    if (a != 0) orin_trap("usize underflow");
+    if (ORIN_UNLIKELY(a != 0)) orin_trap("usize underflow");
     return 0;
 }
 static inline uint64_t orin_int_to_usize(int64_t a) {
-    if (a < 0) orin_trap("negative int to usize");
+    if (ORIN_UNLIKELY(a < 0)) orin_trap("negative int to usize");
     return (uint64_t)a;
 }
 static inline int64_t orin_usize_to_int(uint64_t a) {
-    if (a > (uint64_t)INT64_MAX) orin_trap("usize too large for int");
+    if (ORIN_UNLIKELY(a > (uint64_t)INT64_MAX)) orin_trap("usize too large for int");
     return (int64_t)a;
 }
 
@@ -268,14 +278,30 @@ OrinObj *orin_parse_int(OrinObj *s); /* Option<int> */
 
 OrinObj *orin_array_new(uint64_t cap, int64_t is_ref);
 /* Append in place; array must be unique (rc==1). Consumes the slot's reference. */
-void orin_array_push(OrinObj *a, uint64_t slot);
+void orin_array_push_grow(OrinObj *a, uint64_t slot); /* internal: capacity exhausted */
+static inline void orin_array_push(OrinObj *o, uint64_t slot) {
+    OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(a->len == a->cap)) {
+        orin_array_push_grow(o, slot);
+        return;
+    }
+    a->items[a->len++] = slot;
+}
 /* Remove last element in place (array must be unique): Option<T> owning the element. */
 OrinObj *orin_array_pop(OrinObj *a);
 static inline uint64_t orin_array_len(const OrinObj *a) { return ((const OrinArray *)a)->len; }
 /* Borrowed element slot; traps "index out of bounds". */
-uint64_t orin_array_at(OrinObj *a, uint64_t i);
+static inline uint64_t orin_array_at(OrinObj *o, uint64_t i) {
+    OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
+    return a->items[i];
+}
 /* Pointer to element slot for in-place update (array must be unique); traps if out of range. */
-uint64_t *orin_array_slot_ptr(OrinObj *a, uint64_t i);
+static inline uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
+    OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
+    return &a->items[i];
+}
 OrinObj *orin_array_get(OrinObj *a, uint64_t i); /* Option<T> (element retained) */
 OrinObj *orin_array_slice(OrinObj *a, uint64_t from, uint64_t to);
 OrinObj *orin_array_concat(OrinObj *a, OrinObj *b);

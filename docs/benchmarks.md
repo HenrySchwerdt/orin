@@ -155,3 +155,44 @@ comparison of implementations). Binary size is a strength of the C-emitting desi
 - Fuse string concatenation chains (`a + b + c`) into one allocation; pre-size array growth for `filter`-like push loops.
 - Use unchecked arithmetic where range analysis proves no overflow (never weakening safety), and measure how
   much of `fib`'s gap overflow checks account for (e.g. by building with checks stubbed out, for diagnosis only).
+
+## Runtime fast-path optimization (runtime-only; before/after)
+
+Changes (only `runtime/orin_runtime.{h,c}`; no semantic, ABI, trap-message or counter changes; stats counters
+are bit-identical on all benchmarks except the self-compile row, whose input differs slightly because the
+compiler source was merged forward):
+
+- `orin_make_unique`, `orin_array_at`, `orin_array_slot_ptr` and `orin_array_push` are now `static inline`
+  in the header; slow paths are out of line (`orin_make_unique_slow`, `orin_array_push_grow`). Same checks,
+  same trap messages.
+- `orin_trap` is `noreturn, cold`; all trap branches (checked arithmetic, bounds, division) use
+  `__builtin_expect(..., 0)`; retain/dup/release get likely/unlikely hints.
+- Size-class freelists for struct objects (0-8 slots) and array headers, recycled in `orin_struct_new` /
+  `orin_array_new` / `orin_destroy`. Disabled automatically under AddressSanitizer / MSan
+  (`__SANITIZE_ADDRESS__`, `__has_feature`) or with `-DORIN_NO_FREELIST`, so `--sanitize` runs still see real
+  malloc/free. Freed objects are recycled, never returned to malloc (RSS follows the high-water mark of live objects).
+
+Method: `python3 tools/bench.py` (5 runs, median) on the same machine, once before and once after, each a full
+run (Go and C columns are untouched code and show the machine's run-to-run noise: e.g. Go bintrees 2.03 s vs
+2.82 s, wordfreq C 0.111 vs 0.128). Differences under about 15% should be read as noise.
+
+| benchmark | before Orin (s) | after Orin (s) | Orin/C before | Orin/C after |
+|---|---:|---:|---:|---:|
+| bintrees | 1.547 | 1.130 | 1.86x | 1.38x |
+| fib | 0.615 | 0.597 | 2.74x | 2.67x |
+| qsort_func | 0.592 | 0.387 | 2.03x | 1.14x |
+| qsort_inplace | 0.289 | 0.218 | 2.29x | 1.94x |
+| sieve | 0.500 | 0.439 | 1.75x | 1.24x |
+| strings | 0.249 | 0.188 | 2.06x | 1.74x |
+| wordfreq | 0.199 | 0.335 | 1.80x | 2.61x |
+| selfcompile | 0.108 | 0.098 | - | - |
+
+Honest reading: bintrees, qsort_func and qsort_inplace (struct/array allocation churn, in-place writes) improve
+clearly; sieve and strings modestly. `fib` does not move: its generated code was already the optimal
+checked-add shape (`add; jo` with the trap in a cold section). Compiling `fib` with the overflow checks removed
+by hand takes 0.37 s vs 0.58 s, so the checks cost roughly 0.2 s of the 0.35 s gap to C; the rest is GCC inlining
+recursion in plain C. That is a compiler (range analysis) matter, not a runtime one. `wordfreq` shows a slower
+median (0.199 -> 0.335 s) in this run although its allocation profile is dominated by strings, which the freelist
+does not touch and the C/Go columns of the same run also drifted; A separate re-run of only `wordfreq` (9 runs) gave 0.225 s
+(0.208-0.362) for Orin, with Go and C also slower than in the first run, so it looks like noise, not a regression
+(before: 0.199 s).
