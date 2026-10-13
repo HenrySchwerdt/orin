@@ -1,6 +1,6 @@
 # Assurance ledger: claims, evidence and proof debt
 
-_Updated: 2026-10-13 · ADR-0020 D7 (vision §20a, phase L0). This file is the claim-vs-evidence
+_Updated: 2026-10-13 · ADR-0020 D7 (vision §20a, phases L0, L1: C4 differential test and mutation corpus). This file is the claim-vs-evidence
 table. Update it in the same PR that changes the evidence for a claim._
 
 Every claim has two separate labels:
@@ -22,7 +22,7 @@ Reproducible builds and `stage2 == stage3` are reproducibility, not correctness.
 | C1 | The RC machine never touches freed memory (`run_safe`) | `MODEL_ONLY` | Lean, `formal/Orin/Theorems.lean`; axiom audit in CI | `orin_runtime.c` is not bound to the model (R3/R4) |
 | C2 | Copy-on-write preserves value semantics (`makeUnique_store_cow`) | `MODEL_ONLY` | Lean, `COW.lean` | same as C1 |
 | C3 | MIR accepted by the ownership checker is memory-safe (`check_sound`) | `MODEL_ONLY` for the structured MIR core | Lean, `Sound.lean`/`Top.lean` | see C4 for the implementation gap, plus: calls, loops, arrays, closures, vtables and floats are outside the model; `ill` (null/type confusion) is not excluded |
-| C4 | `compiler/verify` implements the Lean checker | `TESTED_ONLY` | hand transcription; regression cases in `compiler/tests/verify_main.or`; Finding 1 fixed | no differential test of Lean `check` against `compiler/verify` yet (L1); Findings 2–7 in `docs/formal.md` open |
+| C4 | `compiler/verify` implements the Lean checker | `TESTED_ONLY` | hand transcription; regression cases in `compiler/tests/verify_main.or`; Finding 1 fixed; **differential test** `tools/diff_verifier_lean.py` (Lean `check` run as `orin_check` vs `compiler/verify`, 12000 generated programs per CI run, verdicts agree up to one allow-listed class, Finding 6; CI `formal` job); **mutation corpus** `tools/mutate_mir.py` (about 20,000 injected ownership bugs in real MIR, none survives; CI `test` job) | structured fragment only (no calls, loops, arrays, strings, `Imm`, owned params, class-ill-typed MIR); a differential test is evidence, not a proof that the Orin source implements `check`; Findings 2-7 in `docs/formal.md` open |
 | C5 | Every compiled program is accepted by the ownership verifier | enforced on every compile; level of C3/C4 | verifier gates code generation (ICE exit 70); `tools/verify_all.py` | inherits C3/C4 |
 | C6 | Optimisations (owned params, last-use moves, prune) preserve behaviour | `TESTED_ONLY` | `diff_backends.py --mode opt`; memory safety re-checked by the verifier (C5) | no translation validation (L2 target) |
 | C7 | HIR → MIR lowering preserves source semantics | `TESTED_ONLY` | about 420 conformance programs, two backends, sanitizers | no source semantics in Lean |
@@ -43,8 +43,8 @@ Reproducible builds and `stage2 == stage3` are reproducibility, not correctness.
 
 | P | Item | Phase | Plan |
 |---|---|---|---|
-| P0 | Differential test of Lean `check` against `compiler/verify` on generated structured MIR (C4) | L1 | export the Lean checker as an executable; random MIR generator; CI step |
-| P0 | Mutation corpus: injected faults must be rejected by the verifier (drop a release, extra release, use after move, store through a shared reference) and caught by the opt-diff test | L1 | `tools/mutate_mir.py`; CI step; a mutant that survives is a finding |
+| P0 | Differential test of Lean `check` against `compiler/verify` on generated structured MIR (C4) | L1 | **done for the structured fragment** (`formal/Orin/Exec.lean`, `tools/gen_mir_fragment.py`, `tools/diff_verifier_lean.py`, `compiler/tests/verify_text.or`; CI `formal` job). Open: extend the generator with calls/owned params, loops (needs a Lean model), arrays; allow-listed class F6 (verifier accepts `IStructNew d [.. d ..]`, model rejects) still to be resolved by modelling `IStructNew` as one instruction or rejecting it in `wf.or` |
+| P0 | Mutation corpus: injected faults must be rejected by the verifier (drop a release, extra release, use after move, store through a shared reference) and caught by the opt-diff test | L1 | **partly done**: `tools/mutate_mir.py` (13 mutation classes, about 20,000 mutants of the optimised MIR of the conformance programs; CI `test` job; leaks are required to *warn*, everything else to be *rejected*, with the expected message). Not done: catching mutants by `diff_backends.py --mode opt` (behavioural detection), mutants in the optimiser itself (C6), mutants with calls/owned parameters/loop back edges beyond what occurs in the corpus |
 | P0 | Translation validator for last-use moves / owned parameters (C6) | L2 | independent checker comparing pre- and post-opt MIR; the vertical proof slice of §20a |
 | P0 | Call rule, loops, arrays in the Lean model (C3) | L3 | extends `check_sound` |
 | P0 | Runtime refinement: core dialect in Orin refines the Lean machine (C1, C2) | L4 | runtime R3/R4 (spec 19) |
