@@ -169,7 +169,7 @@ function testSymbols(f: string[]): string[] {
   }
   const bad = openFile(newWorkspace(), "/s/bad.or", "function (");
   fails = eqi(fails, "bad syms", documentSymbols(bad, "/s/bad.or").length, 0);
-  fails = eqi(fails, "kw count", keywordCompletions().length, 18);
+  fails = eqi(fails, "kw count", keywordCompletions().length, 22);
 
   // Completions: own decls (+ union variants) and imported names (+ imported variants).
   let ws2 = openFile(newWorkspace(), "/s/lib.or", "export type Shape = Circle(int) | Dot;\nexport function area(s: Shape): int { return 0; }\nfunction hidden(): void { }\n");
@@ -208,7 +208,7 @@ function testIndex(f: string[]): string[] {
     TypeAt { span: callExpr, ty: "int" },
     TypeAt { span: aUse1, ty: "int" }
   ];
-  const idx = SemanticIndex { defs: defs, refs: refs, types: types };
+  const idx = SemanticIndex { defs: defs, refs: refs, types: types, impls: [] };
 
   // definitionAt: on the call -> decl; on the decl itself -> decl; at a keyword -> none.
   const d1 = definitionAt(idx, 0, callAt.start + 1);
@@ -289,8 +289,49 @@ function testClosures(f: string[]): string[] {
   return fails;
 }
 
+// Contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses, names in
+// clauses resolve (including loop clauses).
+function testContracts(f: string[]): string[] {
+  let fails = f;
+  const text = "@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int { return a; }\nfunction main(): void {\n  let i = 0;\n  @Invariant(i >= 0)\n  while (i < 3) { i += 1; }\n  console.log(add(1).toString());\n}\n";
+  const ws = openFile(newWorkspace(), "/k/a.or", text);
+  const a = analyze(ws, "/k/a.or");
+  fails = eqi(fails, "contracts diags", a.diags.length, 0);
+  if (a.index.isNone()) {
+    return eq(fails, "contracts index", "none", "some");
+  }
+  const idx = a.index.unwrap();
+  const addUse = text.indexOf("add(1)").unwrap();
+  fails = eq(
+    fails, "hover contracts", hoverAt(idx, 0, addUse).unwrap().text,
+    "function add(a: int): int\n@Requires(a > 0)\n@Ensures(result >= a)"
+  );
+  const aDecl = text.indexOf("a: int").unwrap();
+  const aUse = text.indexOf("a > 0").unwrap();
+  fails = eq(fails, "param in @Requires", definitionAt(idx, 0, aUse).unwrapOr(span(0, 0, 0)).start.toString(), aDecl.toString());
+  const iDecl = text.indexOf("i = 0").unwrap();
+  const iUse = text.indexOf("i >= 0").unwrap();
+  fails = eq(fails, "local in loop @Invariant", definitionAt(idx, 0, iUse).unwrapOr(span(0, 0, 0)).start.toString(), iDecl.toString());
+  // Errors carry the contract codes.
+  const bad = openFile(newWorkspace(), "/k/b.or", "@Requires(a + 1)\nfunction f(a: int): int { return a; }\n");
+  const b = analyze(bad, "/k/b.or");
+  fails = eqi(fails, "E0414 n", b.diags.length, 1);
+  if (b.diags.length == 1) {
+    fails = eq(fails, "E0414", b.diags[0].code, "E0414");
+  }
+  const impure = openFile(newWorkspace(), "/k/c.or", "function p(x: int): bool { console.log(\"x\"); return true; }\n@Requires(p(a))\nfunction f(a: int): int { return a; }\n");
+  const c = analyze(impure, "/k/c.or");
+  if (c.diags.length == 1) {
+    fails = eq(fails, "E0416", c.diags[0].code, "E0416");
+  } else {
+    fails = eqi(fails, "E0416 n", c.diags.length, 1);
+  }
+  return fails;
+}
+
 function main(): void {
   let f: string[] = [];
+  f = testContracts(f);
   f = testClosures(f);
   f = testWorkspace(f);
   f = testPositions(f);

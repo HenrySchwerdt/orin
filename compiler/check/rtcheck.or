@@ -1,0 +1,544 @@
+// Optional runtime checking of contracts (`orin compile --check-contracts`, ADR-0012, spec 15 §4.2a).
+// Beyond Orin-B. A source-to-source expansion run on an already type-checked program; the normal
+// pipeline (class lowering, checking, MIR, C) then sees ordinary code. Without the flag contracts
+// are erased and none of this runs.
+//
+//   function f(a: T): R with @Requires(p) @Ensures(q)        becomes
+//   function f(a: T): R {                                    // the wrapper keeps the name
+//     if (!(p)) { $contract$fail("@Requires(p) at file:line"); }
+//     const result = $contract$body$f(a);                    // the original body
+//     if (!(q')) { $contract$fail("@Ensures(q) at file:line"); }
+//     return result;
+//   }
+//   * `old(e)` is `e` for functions (parameters are immutable); in methods it is `e` over a snapshot
+//     `old$this` of the receiver taken at entry (value semantics);
+//   * `a ==> b` is `!a || b`;
+//   * methods (non-static, non-private): the class invariants are checked after the body; same for
+//     constructors, whose invariant checks run at the end of the body and whose `@Requires` run after
+//     the leading `this.f = e;` field initialisations;
+//   * a violation prints `trap: contract violated: <clause> at <file>:<line>` and exits with 101
+//     (the same convention as every other trap).
+// Not checked at runtime (type-checked only): record-type invariants, loop invariants and `@Decreases`.
+// Every return of the body, including an early `?` return, is checked: the body is a separate function.
+
+import { Span, SourceMap } from "../diag";
+import {
+  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeExpr, TNamed, Block, Stmt, StmtKind, Expr, ExprKind,
+  EInt, EStr, EIdent, ECall, EMember, EUnary, EBinary, EThis, ETyApp, EIndex, ETry, ECond, EArray,
+  ERecord, ERecordT, EMatch, ENew, EBool, FieldInit, MatchArm, ArmBody, BExpr, BBlock,
+  SLet, SIf, SExpr, SReturn, SAssign, OpAssign, UNot, BAdd, BOr, BImplies,
+  IImport, IFunction, IClass, ClassDecl, ClassMember, MField, MCtor, MMethod, MethodDecl, CtorDecl,
+  ContractClause, CRequires, CEnsures, CInvariant
+} from "../syntax";
+import { LoadedProgram, Unit, ImportTarget, ImportUnit, ImportStd, StdProcess } from "../loader";
+
+const FAIL: string = "$contract$fail";
+const BODY: string = "$contract$body$";
+
+function mkE(k: ExprKind, sp: Span): Expr {
+  return Expr { kind: k, span: sp };
+}
+
+function mkS(k: StmtKind, sp: Span): Stmt {
+  return Stmt { kind: k, span: sp };
+}
+
+function idOf(name: string, sp: Span): Ident {
+  return Ident { name: name, span: sp };
+}
+
+function isKind(c: ContractClause, k: int): bool {
+  return match (c.kind) {
+    CRequires => k == 0,
+    CEnsures => k == 1,
+    CInvariant => k == 2,
+    _ => false
+  };
+}
+
+function ofKind(cs: ContractClause[], k: int): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const c of cs) {
+    if (isKind(c, k)) {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Expression rewriting: `==>`, `old(..)`
+// ---------------------------------------------------------------------------
+
+function rwAll(es: Expr[], inOld: bool): Expr[] {
+  let out: Expr[] = [];
+  for (const e of es) {
+    out.push(rw(e, inOld));
+  }
+  return out;
+}
+
+function rwFields(fs: FieldInit[], inOld: bool): FieldInit[] {
+  let out: FieldInit[] = [];
+  for (const f of fs) {
+    out.push(FieldInit { name: f.name, value: rw(f.value, inOld), span: f.span });
+  }
+  return out;
+}
+
+function rwSpread(o: Option<Expr>, inOld: bool): Option<Expr> {
+  return match (o) {
+    Some(x) => Some(rw(x, inOld)),
+    None => None
+  };
+}
+
+function rwArms(arms: MatchArm[], inOld: bool): MatchArm[] {
+  let out: MatchArm[] = [];
+  for (const a of arms) {
+    const b = match (a.body) {
+      BExpr(x) => BExpr(rw(x, inOld)),
+      BBlock(blk) => BBlock(blk)
+    };
+    out.push(MatchArm { pattern: a.pattern, body: b, span: a.span });
+  }
+  return out;
+}
+
+// `inOld`: inside `old(..)`: `this` denotes the entry snapshot `old$this`.
+function rw(e: Expr, inOld: bool): Expr {
+  const sp = e.span;
+  return match (e.kind) {
+    EThis => inOld ? mkE(EIdent(idOf("old$this", sp)), sp) : e,
+    EUnary(op, x) => mkE(EUnary(op, rw(x, inOld)), sp),
+    EBinary(op, l, r) => match (op) {
+      BImplies => mkE(EBinary(BOr, mkE(EUnary(UNot, rw(l, inOld)), l.span), rw(r, inOld)), sp),
+      _ => mkE(EBinary(op, rw(l, inOld), rw(r, inOld)), sp)
+    },
+    ECall(callee, args) => rwCall(e, callee, args, inOld),
+    EMember(b, n) => mkE(EMember(rw(b, inOld), n), sp),
+    EIndex(b, i) => mkE(EIndex(rw(b, inOld), rw(i, inOld)), sp),
+    ETry(x) => mkE(ETry(rw(x, inOld)), sp),
+    ECond(c, a, b) => mkE(ECond(rw(c, inOld), rw(a, inOld), rw(b, inOld)), sp),
+    EArray(xs) => mkE(EArray(rwAll(xs, inOld)), sp),
+    ERecord(n, spread, fs) => mkE(ERecord(n, rwSpread(spread, inOld), rwFields(fs, inOld)), sp),
+    ERecordT(n, tys, spread, fs) => mkE(ERecordT(n, tys, rwSpread(spread, inOld), rwFields(fs, inOld)), sp),
+    EMatch(s, arms) => mkE(EMatch(rw(s, inOld), rwArms(arms, inOld)), sp),
+    ENew(n, tys, args) => mkE(ENew(n, tys, rwAll(args, inOld)), sp),
+    _ => e
+  };
+}
+
+function rwCall(e: Expr, callee: Expr, args: Expr[], inOld: bool): Expr {
+  const isOld = match (callee.kind) {
+    EIdent(id) => id.name == "old" && args.length == 1,
+    _ => false
+  };
+  if (isOld) {
+    return rw(args[0], true);
+  }
+  return mkE(ECall(rw(callee, inOld), rwAll(args, inOld)), e.span);
+}
+
+function isEnsures(c: ContractClause): bool {
+  return isKind(c, 1);
+}
+
+// `result` of an `@Ensures` is the wrapper's local `result$` (a parameter may be called `result`).
+function renameResult(e: Expr, on: bool): Expr {
+  if (!on) {
+    return e;
+  }
+  return rn(e);
+}
+
+function rnAll(es: Expr[]): Expr[] {
+  let out: Expr[] = [];
+  for (const e of es) {
+    out.push(rn(e));
+  }
+  return out;
+}
+
+function rnFields(fs: FieldInit[]): FieldInit[] {
+  let out: FieldInit[] = [];
+  for (const f of fs) {
+    out.push(FieldInit { name: f.name, value: rn(f.value), span: f.span });
+  }
+  return out;
+}
+
+function rnSpread(o: Option<Expr>): Option<Expr> {
+  return match (o) {
+    Some(x) => Some(rn(x)),
+    None => None
+  };
+}
+
+function rnArms(arms: MatchArm[]): MatchArm[] {
+  let out: MatchArm[] = [];
+  for (const a of arms) {
+    const b = match (a.body) {
+      BExpr(x) => BExpr(rn(x)),
+      BBlock(blk) => BBlock(blk)
+    };
+    out.push(MatchArm { pattern: a.pattern, body: b, span: a.span });
+  }
+  return out;
+}
+
+function rn(e: Expr): Expr {
+  const sp = e.span;
+  return match (e.kind) {
+    EIdent(id) => id.name == "result" ? mkE(EIdent(idOf("result$", id.span)), sp) : e,
+    EUnary(op, x) => mkE(EUnary(op, rn(x)), sp),
+    EBinary(op, l, r) => mkE(EBinary(op, rn(l), rn(r)), sp),
+    ECall(c, args) => mkE(ECall(rn(c), rnAll(args)), sp),
+    EMember(b, n) => mkE(EMember(rn(b), n), sp),
+    EIndex(b, i) => mkE(EIndex(rn(b), rn(i)), sp),
+    ETry(x) => mkE(ETry(rn(x)), sp),
+    ECond(c, a, b) => mkE(ECond(rn(c), rn(a), rn(b)), sp),
+    EArray(xs) => mkE(EArray(rnAll(xs)), sp),
+    ERecord(n, spread, fs) => mkE(ERecord(n, rnSpread(spread), rnFields(fs)), sp),
+    ERecordT(n, tys, spread, fs) => mkE(ERecordT(n, tys, rnSpread(spread), rnFields(fs)), sp),
+    EMatch(s, arms) => mkE(EMatch(rn(s), rnArms(arms)), sp),
+    ENew(n, tys, args) => mkE(ENew(n, tys, rnAll(args)), sp),
+    _ => e
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Check statements
+// ---------------------------------------------------------------------------
+
+function lineOf(text: string, offset: usize): usize {
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < offset && i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      line += 1;
+    }
+    i += 1;
+  }
+  return line;
+}
+
+// `@Requires(p) at file:line`
+function clauseMessage(sm: SourceMap, c: ContractClause): string {
+  const f = sm.files[c.span.file];
+  const txt = f.text.substring(c.span.start, c.span.end).split("\n").join(" ");
+  return txt + " at " + f.path + ":" + lineOf(f.text, c.span.start).toString();
+}
+
+function mentionsOld(sm: SourceMap, cs: ContractClause[]): bool {
+  for (const c of cs) {
+    const f = sm.files[c.span.file];
+    if (f.text.substring(c.span.start, c.span.end).includes("old(")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// `if (!(e)) { $contract$fail("msg"); }` for every clause.
+function checkStmts(sm: SourceMap, cs: ContractClause[]): Stmt[] {
+  let out: Stmt[] = [];
+  for (const c of cs) {
+    match (c.expr) {
+      Some(x) => {
+        const sp = c.span;
+        const msg = mkE(EStr(clauseMessage(sm, c)), sp);
+        const fail = mkS(SExpr(mkE(ECall(mkE(EIdent(idOf(FAIL, sp)), sp), [msg]), sp)), sp);
+        const cond = mkE(EUnary(UNot, renameResult(rw(x, false), isEnsures(c))), sp);
+        out.push(mkS(SIf(cond, Block { stmts: [fail], span: sp }, None), sp));
+      },
+      None => {}
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Wrappers
+// ---------------------------------------------------------------------------
+
+function isVoidRet(r: Option<TypeExpr>): bool {
+  return match (r) {
+    None => true,
+    Some(t) => match (t.kind) {
+      TNamed(id, args) => id.name == "void" && args.length == 0,
+      _ => false
+    }
+  };
+}
+
+function argExprs(ps: Param[]): Expr[] {
+  let out: Expr[] = [];
+  for (const p of ps) {
+    out.push(mkE(EIdent(p.name), p.name.span));
+  }
+  return out;
+}
+
+function tyArgs(tps: Ident[]): TypeExpr[] {
+  let out: TypeExpr[] = [];
+  for (const t of tps) {
+    out.push(TypeExpr { kind: TNamed(t, []), span: t.span });
+  }
+  return out;
+}
+
+// The statements of a wrapper: entry checks, the call of `callee`, exit checks, `return result`.
+function wrapperBody(
+  sm: SourceMap, sp: Span, callee: Expr, params: Param[], ret: Option<TypeExpr>,
+  reqs: ContractClause[], enss: ContractClause[], invs: ContractClause[], isMethod: bool
+): Block {
+  let stmts: Stmt[] = [];
+  if (isMethod && mentionsOld(sm, enss)) {
+    stmts.push(mkS(SLet(false, idOf("old$this", sp), None, mkE(EThis, sp)), sp));
+  }
+  for (const s of checkStmts(sm, reqs)) {
+    stmts.push(s);
+  }
+  const call = mkE(ECall(callee, argExprs(params)), sp);
+  const isVoid = isVoidRet(ret);
+  if (isVoid) {
+    stmts.push(mkS(SExpr(call), sp));
+  } else {
+    stmts.push(mkS(SLet(false, idOf("result$", sp), None, call), sp));
+  }
+  for (const s of checkStmts(sm, enss)) {
+    stmts.push(s);
+  }
+  for (const s of checkStmts(sm, invs)) {
+    stmts.push(s);
+  }
+  if (!isVoid) {
+    stmts.push(mkS(SReturn(Some(mkE(EIdent(idOf("result$", sp)), sp))), sp));
+  }
+  return Block { stmts: stmts, span: sp };
+}
+
+type Wrapped = { items: Item[]; used: bool; };
+
+function wrapFunction(sm: SourceMap, f: FunctionDecl): Wrapped {
+  const reqs = ofKind(f.contracts, 0);
+  const enss = ofKind(f.contracts, 1);
+  if (reqs.length == 0 && enss.length == 0) {
+    return Wrapped { items: [IFunction(f)], used: false };
+  }
+  const bodyName = idOf(BODY + f.name.name, f.name.span);
+  const body = FunctionDecl {
+    exported: false, name: bodyName, typeParams: f.typeParams, bounds: f.bounds, params: f.params, ret: f.ret, body: f.body,
+    contracts: [], span: f.span
+  };
+  const calleeId = mkE(EIdent(bodyName), f.name.span);
+  const callee = f.typeParams.length == 0 ? calleeId : mkE(ETyApp(bodyName, tyArgs(f.typeParams)), f.name.span);
+  const wrapper = FunctionDecl {
+    exported: f.exported, name: f.name, typeParams: f.typeParams, bounds: f.bounds, params: f.params, ret: f.ret,
+    body: wrapperBody(sm, f.span, callee, f.params, f.ret, reqs, enss, [], false),
+    contracts: [], span: f.span
+  };
+  return Wrapped { items: [IFunction(wrapper), IFunction(body)], used: true };
+}
+
+type WrappedMembers = { members: ClassMember[]; used: bool; };
+
+function wrapMethod(sm: SourceMap, cname: Ident, md: MethodDecl, invs: ContractClause[]): WrappedMembers {
+  const reqs = ofKind(md.contracts, 0);
+  const enss = ofKind(md.contracts, 1);
+  const useInv = !md.isStatic && !md.priv;
+  const minv: ContractClause[] = useInv ? invs : [];
+  if (reqs.length == 0 && enss.length == 0 && minv.length == 0) {
+    return WrappedMembers { members: [MMethod(md)], used: false };
+  }
+  const bodyName = idOf(BODY + md.name.name, md.name.span);
+  const bodyM = MethodDecl {
+    priv: true, isStatic: md.isStatic, name: bodyName, typeParams: md.typeParams, params: md.params,
+    ret: md.ret, body: md.body, contracts: [], span: md.span
+  };
+  // Instance methods call the body through `this`, static methods through the class name.
+  const recv = md.isStatic ? mkE(EIdent(cname), md.span) : mkE(EThis, md.span);
+  const callee = mkE(EMember(recv, bodyName), md.span);
+  const wrapper = MethodDecl {
+    priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, params: md.params,
+    ret: md.ret, body: wrapperBody(sm, md.span, callee, md.params, md.ret, reqs, enss, minv, !md.isStatic),
+    contracts: [], span: md.span
+  };
+  return WrappedMembers { members: [MMethod(wrapper), MMethod(bodyM)], used: true };
+}
+
+// Leading `this.f = e;` statements of a constructor body (they must stay first: ADR-0009).
+function leadingFieldInits(stmts: Stmt[]): usize {
+  let k: usize = 0;
+  let go = true;
+  while (go && k < stmts.length) {
+    go = false;
+    match (stmts[k].kind) {
+      SAssign(target, op, _) => {
+        const plain = match (op) { OpAssign => true, _ => false };
+        match (target.kind) {
+          EMember(base, _) => {
+            const onThis = match (base.kind) { EThis => true, _ => false };
+            if (plain && onThis) {
+              go = true;
+            }
+          },
+          _ => {}
+        }
+      },
+      _ => {}
+    }
+    if (go) {
+      k += 1;
+    }
+  }
+  return k;
+}
+
+function wrapCtor(sm: SourceMap, k: CtorDecl, invs: ContractClause[]): CtorDecl {
+  const reqs = ofKind(k.contracts, 0);
+  if (reqs.length == 0 && invs.length == 0) {
+    return k;
+  }
+  const lead = leadingFieldInits(k.body.stmts);
+  let stmts: Stmt[] = [];
+  let i: usize = 0;
+  while (i < lead) {
+    stmts.push(k.body.stmts[i]);
+    i += 1;
+  }
+  for (const s of checkStmts(sm, reqs)) {
+    stmts.push(s);
+  }
+  while (i < k.body.stmts.length) {
+    stmts.push(k.body.stmts[i]);
+    i += 1;
+  }
+  for (const s of checkStmts(sm, invs)) {
+    stmts.push(s);
+  }
+  return CtorDecl { params: k.params, body: Block { stmts: stmts, span: k.body.span }, contracts: [], span: k.span };
+}
+
+function wrapClass(sm: SourceMap, c: ClassDecl): Wrapped {
+  const invs = ofKind(c.contracts, 2);
+  let members: ClassMember[] = [];
+  let used = false;
+  let hasCtor = false;
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        hasCtor = true;
+        const nk = wrapCtor(sm, k, invs);
+        if (nk.contracts.length != k.contracts.length || invs.length > 0) {
+          used = true;
+        }
+        members.push(MCtor(nk));
+      },
+      MMethod(md) => {
+        const w = wrapMethod(sm, c.name, md, invs);
+        if (w.used) {
+          used = true;
+        }
+        for (const x of w.members) {
+          members.push(x);
+        }
+      },
+      _ => { members.push(m); }
+    }
+  }
+  if (!hasCtor && invs.length > 0) {
+    // The implicit constructor gets an explicit (empty) one so the invariants have a place to run.
+    const k = CtorDecl { params: [], body: Block { stmts: [], span: c.span }, contracts: [], span: c.span };
+    members.push(MCtor(wrapCtor(sm, k, invs)));
+    used = true;
+  }
+  const nc = ClassDecl {
+    exported: c.exported, name: c.name, typeParams: c.typeParams, ext: c.ext, impls: c.impls, members: members,
+    contracts: [], span: c.span
+  };
+  return Wrapped { items: [IClass(nc)], used: used };
+}
+
+// `function $contract$fail(msg: string): void { console.error("trap: ..." + msg); exit(101); }`
+function failFunction(sp: Span): Item {
+  const tstr = TypeExpr { kind: TNamed(idOf("string", sp), []), span: sp };
+  const tvoid = TypeExpr { kind: TNamed(idOf("void", sp), []), span: sp };
+  const prefix = mkE(EStr("trap: contract violated: "), sp);
+  const msg = mkE(EBinary(BAdd, prefix, mkE(EIdent(idOf("msg", sp)), sp)), sp);
+  const logCall = mkE(ECall(mkE(EMember(mkE(EIdent(idOf("console", sp)), sp), idOf("error", sp)), sp), [msg]), sp);
+  const exitCall = mkE(ECall(mkE(EIdent(idOf("exit", sp)), sp), [mkE(EInt(101), sp)]), sp);
+  const body = Block { stmts: [mkS(SExpr(logCall), sp), mkS(SExpr(exitCall), sp)], span: sp };
+  return IFunction(FunctionDecl {
+    exported: false, name: idOf(FAIL, sp), typeParams: [], bounds: [], params: [Param { name: idOf("msg", sp), ty: tstr, span: sp }],
+    ret: Some(tvoid), body: body, contracts: [], span: sp
+  });
+}
+
+function importsExit(m: Module): bool {
+  for (const it of m.items) {
+    match (it) {
+      IImport(d) => {
+        for (const n of d.names) {
+          if (n.name == "exit") {
+            return true;
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  return false;
+}
+
+// Expands the contracts of every unit into runtime checks.
+export function expandContracts(prog: LoadedProgram, sm: SourceMap): LoadedProgram {
+  let units: Unit[] = [];
+  for (const u of prog.units) {
+    let items: Item[] = [];
+    let used = false;
+    for (const it of u.ast.items) {
+      match (it) {
+        IFunction(f) => {
+          const w = wrapFunction(sm, f);
+          if (w.used) {
+            used = true;
+          }
+          for (const x of w.items) {
+            items.push(x);
+          }
+        },
+        IClass(c) => {
+          const w = wrapClass(sm, c);
+          if (w.used) {
+            used = true;
+          }
+          for (const x of w.items) {
+            items.push(x);
+          }
+        },
+        _ => { items.push(it); }
+      }
+    }
+    if (!used) {
+      units.push(u);
+    } else {
+      let imports: ImportTarget[] = [];
+      for (const t of u.imports) {
+        imports.push(t);
+      }
+      const sp = Span { file: u.file, start: 0, end: 0 };
+      if (!importsExit(u.ast)) {
+        items.push(IImport(ImportDecl { names: [idOf("exit", sp)], path: "std:process", pathSpan: sp, span: sp }));
+        imports.push(ImportStd(StdProcess));
+      }
+      items.push(failFunction(sp));
+      units.push(Unit {
+        file: u.file, path: u.path, name: u.name, module: u.module,
+        ast: Module { file: u.ast.file, items: items }, imports: imports
+      });
+    }
+  }
+  return LoadedProgram { units: units, entry: prog.entry, manifest: prog.manifest };
+}

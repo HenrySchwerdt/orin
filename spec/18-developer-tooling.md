@@ -59,7 +59,7 @@ errors are left untouched and reported.
 
 ### `orin lsp` (P2)
 LSP 3.17 over stdio (JSON-RPC, `Content-Length` framing). Initial capabilities: diagnostics
-(push on open/change/save), go to definition, hover (type + signature), find references, rename
+(push on open/change/save), go to definition, hover (type + signature), find references, go to implementations (classes implementing an interface, ADR-0019), rename
 (module-aware; rejects renames that would break exports/imports or collide), document
 formatting (via `orin fmt`), completion (scope locals, module declarations, imported names,
 members/methods of the receiver type, keywords). Later: signature help, auto-imports, code

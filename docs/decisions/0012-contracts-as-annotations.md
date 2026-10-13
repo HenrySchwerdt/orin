@@ -1,7 +1,7 @@
 # ADR-0012: Contract clauses (annotation-like syntax, own language constructs); verification is a compiler pass
 
 Status: accepted (2026-10-13). Spec: `spec/15-contracts-invariants-and-formal-verification.md` §4.2a.
-Implementation: not started (needs annotation parsing — spec 05 — and a contract IR/SMT backend).
+Implementation: phase 1 (parse, resolve, type-check, erase, `--check-contracts`) and phase 2 (`orin verify --contracts`, straight-line int/bool functions via z3) done; see `docs/contracts.md`.
 
 - Canonical syntax: `@Requires(e)`, `@Ensures(e)` (with `result`, `old(e)`), `@Invariant(e)`,
   `@Decreases(e)`, `@Rule("ID")`. The keyword-clause sketch of spec 15 §4.1–4.3 is superseded as

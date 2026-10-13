@@ -6,7 +6,7 @@ import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, asStr, getF
 import { Workspace, newWorkspace, openFile, analyze, Analysis, PathDiag, fileIndexOf, offsetToPos, posToOffset,
   symbolAt, hoverAt, renameEdits, TextEdit, moduleDeps } from "../analysis";
 import { SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam,
-  SkField } from "../hir";
+  SkField, SkInterface } from "../hir";
 import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdIo, StdClock } from "../loader";
 import { Span } from "../diag";
 import { normalizePath, joinPath, dirname, loadAll } from "../loader";
@@ -312,7 +312,8 @@ function kindName(d: SymbolDef): string {
     SkConst => "const",
     SkLocal => "local",
     SkParam => "param",
-    SkField => "field"
+    SkField => "field",
+    SkInterface => "interface"
   };
 }
 
@@ -349,6 +350,25 @@ function defJson(st: McpState, a: Analysis, idx: SemanticIndex, d: SymbolDef, in
   }
   if (kindName(d) == "method") {
     fs.push(jField("mutates", JBool(d.detail.includes("mut method "))));
+  }
+  // Interfaces (ADR-0019): the classes implementing an interface, the interfaces a class implements.
+  let implBy: string[] = [];
+  let impls: string[] = [];
+  for (const l of idx.impls) {
+    if (l.iface == d.id && l.cls < idx.defs.length) {
+      const cl = spanLoc(a, idx.defs[l.cls].nameSpan);
+      implBy.push(idx.defs[l.cls].name + " at " + relPath(st, a.sm.files[idx.defs[l.cls].nameSpan.file].path) + ":"
+        + cl.line.toString() + ":" + cl.col.toString());
+    }
+    if (l.cls == d.id && l.iface < idx.defs.length) {
+      impls.push(idx.defs[l.iface].name);
+    }
+  }
+  if (implBy.length > 0) {
+    fs.push(jField("implementedBy", jstrs(implBy)));
+  }
+  if (impls.length > 0) {
+    fs.push(jField("implements", jstrs(impls)));
   }
   if (includeSource) {
     const sp = d.declSpan;

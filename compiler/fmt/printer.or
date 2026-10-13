@@ -16,8 +16,8 @@ import { Span } from "../diag";
 import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
-  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember,
-  CtorParam, FnTyParam, ArrowParam, ArrowBody
+  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ClassDecl, ClassMember,
+  CtorParam, FnTyParam, ArrowParam, ArrowBody, ContractClause, ContractKind
 } from "../syntax";
 import { Ctx, seq, bracketed, gapsHave, hasCommentIn, findChar } from "./layout";
 import { pad, quote, endCol } from "./text";
@@ -75,8 +75,27 @@ function typeParamsText(ids: Ident[]): string {
   return "<" + parts.join(", ") + ">";
 }
 
+// Type parameters with bounds: `<T extends Shape, U>` (ADR-0019).
+function typeParamsBText(ids: Ident[], bounds: Option<Ident>[]): string {
+  if (ids.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < ids.length) {
+    let t = ids[i].name;
+    if (i < bounds.length && bounds[i].isSome()) {
+      t += " extends " + bounds[i].unwrap().name;
+    }
+    parts.push(t);
+    i += 1;
+  }
+  return "<" + parts.join(", ") + ">";
+}
+
 function binLevel(op: BinaryOp): int {
   match (op) {
+    BImplies => { return 0 - 2; },
     BOr => { return 0; },
     BAnd => { return 1; },
     BEq => { return 2; },
@@ -95,6 +114,7 @@ function binLevel(op: BinaryOp): int {
 
 function binText(op: BinaryOp): string {
   match (op) {
+    BImplies => { return "==>"; },
     BOr => { return "||"; },
     BAnd => { return "&&"; },
     BEq => { return "=="; },
@@ -373,7 +393,24 @@ function collect(e: Expr, lvl: int): Chain {
   return Chain { operands: [e], ops: ops };
 }
 
+// `a ==> b` (contract expressions): right-associative, weaker than `?:`; breaks before the operator.
+function impliesText(c: Ctx, l: Expr, r: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  if (lim >= HUGE) {
+    return sub(c, l, 0, 0, 0, 0, true, HUGE) + " ==> " + sub(c, r, 0 - 1, 0, 0, 0, false, HUGE);
+  }
+  const lt = sub(c, l, 0, ind, col, 0, true, lim);
+  return lt + "\n" + pad(ind + 4) + "==> " + sub(c, r, 0 - 1, ind + 4, ind + 8, tail, false, lim);
+}
+
 function binaryText(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  match (e.kind) {
+    EBinary(op, l, r) => {
+      if (binLevel(op) < 0) {
+        return impliesText(c, l, r, ind, col, tail, lim);
+      }
+    },
+    _ => {}
+  }
   let lvl: int = 0;
   match (e.kind) {
     EBinary(op, _, _) => {
@@ -432,6 +469,7 @@ function binaryText(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: u
 function branch(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
   const isArrow = match (e.kind) {
     EArrow(_, _, _) => true,
+    EBinary(op, _, _) => binLevel(op) < 0,   // `a ==> b` (contract expressions) binds weaker than `?:`
     _ => false
   };
   if (isArrow) {
@@ -769,8 +807,40 @@ function stmtText(c: Ctx, s: Stmt, ind: usize): string {
     },
     SBlock(b) => {
       return block(c, b, ind);
+    },
+    SContract(k) => {
+      return clauseText(c, k, ind);
     }
   }
+}
+
+// `@Requires(e)` / `@Rule("ID")` (ADR-0012).
+function clauseText(c: Ctx, k: ContractClause, ind: usize): string {
+  const name = match (k.kind) {
+    CRequires => "@Requires",
+    CEnsures => "@Ensures",
+    CInvariant => "@Invariant",
+    CDecreases => "@Decreases",
+    CRule => "@Rule"
+  };
+  match (k.expr) {
+    Some(e) => {
+      const head = name + "(";
+      return head + ex(c, e, ind, ind + head.length, 1, WIDTH) + ")";
+    },
+    None => {
+      return name + "(" + quote(k.rule) + ")";
+    }
+  }
+}
+
+// The clauses of a declaration, each followed by a line break and the indentation of the declaration.
+function clausesPrefix(c: Ctx, ks: ContractClause[], ind: usize): string {
+  let out = "";
+  for (const k of ks) {
+    out += clauseText(c, k, ind) + "\n" + pad(ind);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -818,14 +888,19 @@ function importText(c: Ctx, kw: string, d: ImportDecl): string {
 }
 
 function functionText(c: Ctx, f: FunctionDecl): string {
-  const head = (f.exported ? "export " : "") + "function " + f.name.name + typeParamsText(f.typeParams);
+  const head = (f.exported ? "export " : "") + "function " + f.name.name + typeParamsBText(f.typeParams, f.bounds);
   let lo2 = f.name.span.end;
   for (const tp of f.typeParams) {
     if (tp.span.end > lo2) {
       lo2 = tp.span.end;
     }
   }
-  return signatureText(c, head, lo2, f.params, f.ret, f.body, 0);
+  for (const b of f.bounds) {
+    if (b.isSome() && b.unwrap().span.end > lo2) {
+      lo2 = b.unwrap().span.end;
+    }
+  }
+  return clausesPrefix(c, f.contracts, 0) + signatureText(c, head, lo2, f.params, f.ret, f.body, 0);
 }
 
 // `head(params): ret { body }` at indent `ind`; `lo2` is the source position after the name (and
@@ -898,7 +973,12 @@ function memberText(c: Ctx, m: ClassMember, ind: usize): string {
         ends.push(p.span.end);
         texts.push(ctorParamText(p));
       }
-      return signatureTail(c, "constructor", k.span.start + 11, starts, ends, texts, "", k.body, ind);
+      let base = k.span.start;
+      if (k.contracts.length > 0) {
+        base = k.contracts[k.contracts.length - 1].span.end;
+      }
+      const kw = c.src.substring(base, c.src.length).indexOf("constructor").unwrapOr(0);
+      return clausesPrefix(c, k.contracts, ind) + signatureTail(c, "constructor", base + kw + 11, starts, ends, texts, "", k.body, ind);
     },
     MMethod(md) => {
       const head = (md.priv ? "private " : "") + (md.isStatic ? "static " : "") + md.name.name
@@ -909,7 +989,7 @@ function memberText(c: Ctx, m: ClassMember, ind: usize): string {
           lo2 = tp.span.end;
         }
       }
-      return signatureText(c, head, lo2, md.params, md.ret, md.body, ind);
+      return clausesPrefix(c, md.contracts, ind) + signatureText(c, head, lo2, md.params, md.ret, md.body, ind);
     }
   }
 }
@@ -926,6 +1006,14 @@ function classText(c: Ctx, k: ClassDecl): string {
     head += " extends " + k.ext.unwrap().name;
     lo2 = k.ext.unwrap().span.end;
   }
+  if (k.impls.length > 0) {
+    let names: string[] = [];
+    for (const i of k.impls) {
+      names.push(i.name);
+      lo2 = i.span.end;
+    }
+    head += " implements " + names.join(", ");
+  }
   let starts: usize[] = [];
   let ends: usize[] = [];
   let texts: string[] = [];
@@ -934,6 +1022,55 @@ function classText(c: Ctx, k: ClassDecl): string {
     starts.push(sp.start);
     ends.push(sp.end);
     texts.push(memberText(c, m, 2));
+  }
+  const open = findChar(c, lo2, 123) + 1;
+  return clausesPrefix(c, k.contracts, 0) + bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
+}
+
+// An interface method signature `name(a: T): R;` (ADR-0019), wrapped like a parameter list when too long.
+function ifaceMethodText(c: Ctx, m: IfaceMethod, ind: usize): string {
+  let ret = "";
+  let close = m.span.end - 1;
+  if (m.ret.isSome()) {
+    ret = ": " + typeText(m.ret.unwrap());
+    close = m.ret.unwrap().span.start;
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const p of m.params) {
+    starts.push(p.span.start);
+    ends.push(p.span.end);
+    texts.push(p.name.name + ": " + typeText(p.ty));
+  }
+  const open = findChar(c, m.name.span.end, 40) + 1;
+  const forced = gapsHave(c, starts, ends, open, close);
+  const flat = m.name.name + "(" + texts.join(", ") + ")" + ret + ";";
+  if (!forced && ind + flat.length <= WIDTH) {
+    return flat;
+  }
+  return bracketed(c, m.name.name + "(", ")", open, close, starts, ends, texts, ind, ",") + ret + ";";
+}
+
+function interfaceText(c: Ctx, k: InterfaceDecl): string {
+  let head = (k.exported ? "export " : "") + "interface " + k.name.name + typeParamsText(k.typeParams);
+  let lo2 = k.name.span.end;
+  for (const tp of k.typeParams) {
+    if (tp.span.end > lo2) {
+      lo2 = tp.span.end;
+    }
+  }
+  if (k.ext.isSome()) {
+    head += " extends " + k.ext.unwrap().name;
+    lo2 = k.ext.unwrap().span.end;
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const m of k.methods) {
+    starts.push(m.span.start);
+    ends.push(m.span.end);
+    texts.push(ifaceMethodText(c, m, 2));
   }
   const open = findChar(c, lo2, 123) + 1;
   return bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
@@ -947,6 +1084,10 @@ function variantText(v: VariantDecl): string {
 }
 
 function typeDeclText(c: Ctx, t: TypeDecl): string {
+  return clausesPrefix(c, t.contracts, 0) + typeDeclBodyText(c, t);
+}
+
+function typeDeclBodyText(c: Ctx, t: TypeDecl): string {
   const head = (t.exported ? "export " : "") + "type " + t.name.name + typeParamsText(t.typeParams) + " =";
   const hi = t.span.end - 1;
   match (t.body) {
@@ -1015,7 +1156,8 @@ function itemSpan(it: Item): Span {
     IFunction(f) => { return f.span; },
     IType(t) => { return t.span; },
     IConst(k) => { return k.span; },
-    IClass(k) => { return k.span; }
+    IClass(k) => { return k.span; },
+    IInterface(k) => { return k.span; }
   }
 }
 
@@ -1026,7 +1168,8 @@ function itemText(c: Ctx, it: Item): string {
     IFunction(f) => { return functionText(c, f); },
     IType(t) => { return typeDeclText(c, t); },
     IConst(k) => { return constText(c, k); },
-    IClass(k) => { return classText(c, k); }
+    IClass(k) => { return classText(c, k); },
+    IInterface(k) => { return interfaceText(c, k); }
   }
 }
 

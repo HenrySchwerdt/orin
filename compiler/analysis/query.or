@@ -15,7 +15,7 @@
 //   - `SymbolDef.container` and `unit` identify the scope used for rename collision checks.
 
 import { Span } from "../diag";
-import { SemanticIndex, SymbolDef } from "../hir";
+import { SemanticIndex, SymbolDef, SkInterface } from "../hir";
 
 export type HoverInfo = { span: Span; text: string; };
 
@@ -109,6 +109,62 @@ export function hoverAt(idx: SemanticIndex, file: usize, off: usize): Option<Hov
     }
   }
   return best;
+}
+
+// Go to implementations (ADR-0019): for an interface, the classes that declare `implements` it; for an
+// interface method, the methods of those classes with the same name. Other symbols have none.
+export function implementationsOfDef(idx: SemanticIndex, def: usize): Span[] {
+  let out: Span[] = [];
+  if (def >= idx.defs.length) {
+    return out;
+  }
+  const d = idx.defs[def];
+  const isIface = match (d.kind) {
+    SkInterface => true,
+    _ => false
+  };
+  if (isIface) {
+    for (const l of idx.impls) {
+      if (l.iface == def && l.cls < idx.defs.length) {
+        out.push(idx.defs[l.cls].nameSpan);
+      }
+    }
+    return out;
+  }
+  if (d.container.isSome()) {
+    const parent = d.container.unwrap();
+    if (parent < idx.defs.length) {
+      const parentIsIface = match (idx.defs[parent].kind) {
+        SkInterface => true,
+        _ => false
+      };
+      if (parentIsIface) {
+        for (const l of idx.impls) {
+          if (l.iface == parent) {
+            for (const o of idx.defs) {
+              const inCls = match (o.container) {
+                Some(c) => c == l.cls,
+                None => false
+              };
+              if (inCls && o.name == d.name) {
+                out.push(o.nameSpan);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Implementations of the symbol at the position.
+export function implementationsAt(idx: SemanticIndex, file: usize, off: usize): Span[] {
+  const s = symbolAt(idx, file, off);
+  if (s.isNone()) {
+    return [];
+  }
+  return implementationsOfDef(idx, s.unwrap());
 }
 
 function hasSpan(spans: Span[], s: Span): bool {

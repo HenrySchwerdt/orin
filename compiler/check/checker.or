@@ -2,8 +2,8 @@
 // pipeline if it produced diagnostics (same as bootstrap/src/checker/mod.rs `check`).
 
 import { Diagnostic, SourceMap, diag } from "../diag";
-import { Ident, DAlias } from "../syntax";
-import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type } from "../hir";
+import { Ident, DAlias, FunctionDecl } from "../syntax";
+import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type, IfaceDef } from "../hir";
 import { LoadedProgram } from "../loader";
 import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
 import { collect } from "./collect";
@@ -12,9 +12,14 @@ import { newFnCtx } from "./fnctx";
 import { checkBlock } from "./body";
 import { lowerClasses, buildClassTables } from "./classes";
 import { inferClasses } from "./classfix";
-import { scopeOf, mkOpaque, resolveSig, resolveType, instType } from "./types";
+import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig, resolveType, instType } from "./types";
+import { resolveImpls, checkImpls, boundIface } from "./ifaces";
+import { checkFuncContracts, checkRecordContracts } from "./contracts";
+import { purityDiags } from "./purity";
+import { expandContracts } from "./rtcheck";
 
-type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
+// `cexprs`: the checked contract expressions of the function (ADR-0012), for the purity pass.
+type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; cexprs: HExpr[]; };
 
 // Checks one function body. `abs` marks the abstract check of a generic body (type parameters
 // are opaque types; no function instances are created). Returns the (possibly grown) environment.
@@ -22,9 +27,36 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
   if (f.mode == 6) {
     // A lifted closure function: its HIR was produced while its enclosing function was checked.
     const noErr: Option<Diagnostic> = None;
-    return FuncOut { func: env.lifted[f.cls], err: noErr, env: env };
+    return FuncOut { func: env.lifted[f.cls], err: noErr, env: env, cexprs: [] };
   }
-  const fx = newFnCtx(f, env, abs);
+  let fx0 = newFnCtx(f, env, abs);
+  let cexprs: HExpr[] = [];
+  if (f.decl.contracts.length > 0) {
+    // Contract clauses are type-checked in a forked context and erased (ADR-0012).
+    const cf = checkFuncContracts(env, f, fx0);
+    match (cf) {
+      Err(d) => {
+        return FuncOut {
+          func: Function {
+            name: f.qname,
+            paramCount: f.paramLocals.length,
+            locals: f.paramLocals,
+            ret: f.ret,
+            body: HBlock { stmts: [] },
+            span: f.decl.span
+          },
+          err: Some(d),
+          env: env,
+          cexprs: cexprs
+        };
+      },
+      Ok(o) => {
+        fx0 = o.fx;
+        cexprs = o.exprs;
+      }
+    }
+  }
+  const fx = fx0;
   const r = checkBlock(env, fx, f.decl.body);
   return match (r) {
     Err(d) => FuncOut {
@@ -37,7 +69,8 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
         span: f.decl.span
       },
       err: Some(d),
-      env: env
+      env: env,
+      cexprs: cexprs
     },
     Ok(b) => {
       let err: Option<Diagnostic> = None;
@@ -66,10 +99,19 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
           span: f.decl.span
         },
         err: err,
-        env: b.fx.env
+        env: b.fx.env,
+        cexprs: appendAll(cexprs, b.fx.cexprs)
       };
     }
   };
+}
+
+function appendAll(a: HExpr[], b: HExpr[]): HExpr[] {
+  let out = a;
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
 }
 
 type Opaques = { env: Env; names: string[]; tys: Type[]; };
@@ -88,10 +130,36 @@ function opaquesFor(env: Env, params: Ident[]): Opaques {
   return Opaques { env: e, names: names, tys: tys };
 }
 
+// Like `opaquesFor` for a generic function: a parameter with a bound (`T extends Shape`, ADR-0019)
+// gets an opaque type that carries the interface.
+function opaquesForFn(env: Env, unit: usize, decl: FunctionDecl): Result<Opaques, Diagnostic> {
+  let e = env;
+  let names: string[] = [];
+  let tys: Type[] = [];
+  let k: usize = 0;
+  while (k < decl.typeParams.length) {
+    const p = decl.typeParams[k];
+    let o = mkOpaque(e, p.name);
+    if (k < decl.bounds.length && decl.bounds[k].isSome()) {
+      const i = boundIface(e, unit, decl.bounds[k].unwrap())?;
+      o = mkOpaqueBound(e, p.name, i);
+    }
+    e = o.env;
+    names.push(p.name);
+    tys.push(o.ty);
+    k += 1;
+  }
+  return Ok(Opaques { env: e, names: names, tys: tys });
+}
+
 // Abstract check of a generic function: the body is checked once with opaque type parameters.
 function abstractFunc(env: Env, g: usize): Option<Diagnostic> {
   const gf = env.gfuncs[g];
-  const op = opaquesFor(env, gf.decl.typeParams);
+  const opr = opaquesForFn(env, gf.unit, gf.decl);
+  if (opr.isErr()) {
+    return Some(opr.unwrapErr());
+  }
+  const op = opr.unwrap();
   const sc = scopeOf(gf.unit, op.names, op.tys);
   const sig = match (resolveSig(op.env, sc, gf.decl)) {
     Ok(x) => x,
@@ -154,6 +222,18 @@ function preludeUnit(prog: LoadedProgram, name: string): int {
   return -1;
 }
 
+function ifaceDefs(env: Env): IfaceDef[] {
+  let out: IfaceDef[] = [];
+  for (const i of env.ifaces) {
+    let ms: string[] = [];
+    for (const m of i.methods) {
+      ms.push(m.name);
+    }
+    out.push(IfaceDef { name: i.name, methods: ms });
+  }
+  return out;
+}
+
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
   // Classes are lowered to records and functions first (ADR-0009).
   const lw = lowerClasses(prog);
@@ -170,7 +250,15 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   if (r.diags.length > 0) {
     return Err(dedupDiags(r.diags));
   }
-  let env = inferClasses(r.env);
+  const im = resolveImpls(r.env);
+  if (im.diags.length > 0) {
+    return Err(dedupDiags(im.diags));
+  }
+  let env = inferClasses(im.env);
+  const cd = checkImpls(env);
+  if (cd.length > 0) {
+    return Err(dedupDiags(cd));
+  }
   let diags: Diagnostic[] = [];
   // Generic declarations are checked once, abstractly, at their definition.
   let gi: usize = 0;
@@ -192,20 +280,44 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   // Ordinary functions, then the generic instances they (transitively) request: instances are
   // appended to `env.funcs` while checking, so the loop runs until the table stops growing.
   let funcs: Function[] = [];
+  let cexprs: HExpr[] = [];
+  const rc = checkRecordContracts(env, lw.prog);
+  env = rc.env;
+  for (const d of rc.diags) {
+    diags.push(d);
+  }
+  cexprs = appendAll(cexprs, rc.exprs);
   let fi: usize = 0;
   while (fi < env.funcs.length) {
     const o = checkFunc(env, env.funcs[fi], false);
     env = o.env;
     funcs.push(o.func);
+    cexprs = appendAll(cexprs, o.cexprs);
     match (o.err) {
       Some(d) => { diags.push(d); },
       None => {}
     }
     fi += 1;
   }
+  if (diags.length == 0 && cexprs.length > 0) {
+    for (const d of purityDiags(funcs, cexprs)) {
+      diags.push(d);
+    }
+  }
   if (diags.length > 0) {
     return Err(dedupDiags(diags));
   }
   const mainId = findMain(env).unwrapOr(0);
-  return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId });
+  return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId, vtables: env.vtables, ifaces: ifaceDefs(env) });
+}
+
+// `check` with runtime contract checking (`orin compile --check-contracts`, ADR-0012): the program is
+// checked as usual (so contract errors are reported once, with their own codes), expanded, and the
+// expansion is checked again.
+export function checkRuntime(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
+  const first = check(prog, sm);
+  if (first.isErr()) {
+    return first;
+  }
+  return check(expandContracts(prog, sm), sm);
 }

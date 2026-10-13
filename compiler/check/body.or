@@ -9,16 +9,19 @@
 import { Span, Diagnostic, diag } from "../diag";
 import {
   Ident, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit, MatchArm, ArmBody, TypeExpr, TNamed, TFn, AssignOp,
-  UnaryOp, BinaryOp, Pattern, TypeDecl, DRecord, DUnion, FieldDecl, FunctionDecl, Param, ArrowParam, ArrowBody
+  UnaryOp, BinaryOp, Pattern, TypeDecl, DRecord, DUnion, FieldDecl, FunctionDecl, Param, ArrowParam, ArrowBody,
+  ContractClause
 } from "../syntax";
 import {
   Type, Function, Local, FieldDef, RecordDef, VariantDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm,
   HPattern, Builtin, MutBuiltin
 } from "../hir";
 import {
-  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
-  isIntish, isFloatTy, isNumeric, isArrayTy, isFn, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq
+  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, typeEq, isInt, isUsize, isBool, isString, isVoid,
+  isIntish, isFloatTy, isNumeric, isArrayTy, isFn, isIface, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq,
+  boundOf, ifaceMethodIndex
 } from "./env";
+import { checkBounds, internVtable, recordImplements } from "./ifaces";
 import { classOfRec, findMethod, fieldIsPrivate } from "./classes";
 import {
   FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak,
@@ -96,7 +99,8 @@ function toBinOp(op: BinaryOp): BinOp {
     BGt => OpGt,
     BGe => OpGe,
     BAnd => OpAnd,
-    BOr => OpOr
+    BOr => OpOr,
+    BImplies => OpOr
   };
 }
 
@@ -141,9 +145,62 @@ function noField(env: Env, name: Ident, t: Type): Diagnostic {
 function expect(env: Env, fx: FnCtx, e: Expr, ty: Type): Result<ExprOut, Diagnostic> {
   const r = checkExpr(env, fx, e, Some(ty))?;
   if (!typeEq(r.expr.ty, ty)) {
-    return Err(mismatch(r.fx.env, e.span, ty, r.expr.ty));
+    return coerce(r, e.span, ty);
   }
   return Ok(r);
+}
+
+// The one implicit conversion of the language (ADR-0019): a value of a class type converts to an
+// interface type the class declares with `implements`. Anything else is a type mismatch.
+function coerce(r: ExprOut, span: Span, ty: Type): Result<ExprOut, Diagnostic> {
+  return match (ty) {
+    TyIface(i) => toIface(r, span, i),
+    _ => Err(mismatch(r.fx.env, span, ty, r.expr.ty))
+  };
+}
+
+function toIface(r: ExprOut, span: Span, i: usize): Result<ExprOut, Diagnostic> {
+  const env = r.fx.env;
+  match (r.expr.ty) {
+    TyRecord(rec) => {
+      const co = classOfRec(env, rec);
+      if (co.isSome()) {
+        if (!recordImplements(env, rec, i)) {
+          return Err(diag(
+            "E0417",
+            span,
+            "class `" + env.classes[co.unwrap()].name + "` does not implement interface `" + env.ifaces[i].name
+              + "`; declare `class " + env.classes[co.unwrap()].name + " implements " + env.ifaces[i].decl.name.name
+              + "` (conformance is nominal)"
+          ));
+        }
+        const vo = internVtable(env, co.unwrap(), i);
+        return done(withEnv(r.fx, vo.env), XIface(vo.id, r.expr), TyIface(i), span);
+      }
+      if (recordImplements(env, rec, i)) {
+        // the opaque type of a bounded type parameter (abstract check; the HIR is discarded)
+        return done(r.fx, XIface(0, r.expr), TyIface(i), span);
+      }
+    },
+    _ => {}
+  }
+  return Err(mismatch(env, span, TyIface(i), r.expr.ty));
+}
+
+// `s.m(args)` on an interface value, or on a value of a type parameter bounded by the interface
+// (abstract check): a call through the vtable (ADR-0019).
+function ifaceCall(
+  env: Env, b: ExprOut, span: Span, i: usize, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const info = b.fx.env.ifaces[i];
+  const so = ifaceMethodIndex(info, name.name);
+  if (so.isNone()) {
+    return Err(diag("E0405", name.span, "no method `" + name.name + "` on interface `" + info.name + "`"));
+  }
+  const slot = so.unwrap();
+  const m = info.methods[slot];
+  const a = argsExpect(env, b.fx, span, "method `" + name.name + "`", args, m.params)?;
+  return done(a.fx, XCallVirtual(b.expr, slot, a.args), m.ret, span);
 }
 
 export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
@@ -159,7 +216,7 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     ECall(callee, args) => checkCall(env, fx, span, callee, args, exp),
     EMember(base, name) => checkMember(env, fx, span, base, name),
     EIndex(base, idx) => checkIndex(env, fx, span, base, idx),
-    ETry(x) => checkTry(env, fx, span, x),
+    ETry(x) => fx.cmode > 0 ? Err(diag("E0415", span, "`?` is not allowed in a contract expression")) : checkTry(env, fx, span, x),
     ECond(c, t, f) => checkCond(env, fx, span, c, t, f, exp),
     EArray(elems) => checkArray(env, fx, span, elems, exp),
     ERecord(name, spread, fields) => checkRecord(env, fx, span, name, None, spread, fields, exp),
@@ -168,7 +225,9 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp),
     ENew(name, targs, args) => checkNew(env, fx, span, name, targs, args, exp),
     EThis => checkThis(fx, span),
-    EArrow(ps, rte, body) => checkArrowExp(env, fx, span, ps, rte, body, exp)
+    EArrow(ps, rte, body) => fx.cmode > 0
+      ? Err(diag("E0416", span, "closures are not allowed in a contract expression"))
+      : checkArrowExp(env, fx, span, ps, rte, body, exp)
   };
 }
 
@@ -352,6 +411,24 @@ function checkBinary(
   env: Env, fx: FnCtx, span: Span, op: BinaryOp, lhs: Expr, rhs: Expr, exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
   const hop = toBinOp(op);
+  const isImpl = match (op) { BImplies => true, _ => false };
+  if (isImpl) {
+    // `a ==> b` (ADR-0012) is `!a || b` (short-circuit); only valid inside contract expressions.
+    if (fx.cmode == 0) {
+      return Err(diag("E0415", span, "`==>` is only allowed inside contract expressions (@Requires, @Ensures, @Invariant, @Decreases)"));
+    }
+    const l = checkExpr(env, fx, lhs, None)?;
+    const r = checkExpr(env, l.fx, rhs, None)?;
+    if (!isBool(l.expr.ty) || !isBool(r.expr.ty)) {
+      return Err(diag(
+        "E0410",
+        span,
+        "`==>` requires `bool` operands, found `" + showType(r.fx.env, l.expr.ty) + "` and `"
+          + showType(r.fx.env, r.expr.ty) + "`"
+      ));
+    }
+    return done(r.fx, XBinary(OpOr, mk(XUnary(UnNot, l.expr), TyBool, lhs.span), r.expr), TyBool, span);
+  }
   const isLogic = match (op) { BAnd => true, BOr => true, _ => false };
   if (isLogic) {
     const l = checkExpr(env, fx, lhs, None)?;
@@ -486,6 +563,20 @@ function checkCond(
   let t: HExpr = mk(XBool(false), TyBool, span);
   let f: HExpr = mk(XBool(false), TyBool, span);
   const npre = cur.pre.length;
+  // An interface-typed context converts each branch (ADR-0019).
+  match (exp) {
+    Some(et) => {
+      if (isIface(et)) {
+        const tr = expect(env, cur, thenE, et)?;
+        const fr = expect(env, tr.fx, elsE, et)?;
+        if (fr.fx.pre.length > npre) {
+          return Err(condHoistErr(span));
+        }
+        return done(fr.fx, XCond(c.expr, tr.expr, fr.expr), et, span);
+      }
+    },
+    None => {}
+  }
   if (untypedInt(thenE) && !untypedInt(elsE)) {
     const fr = checkExpr(env, cur, elsE, exp)?;
     const tr = checkExpr(env, fr.fx, thenE, hintOf(fr.expr.ty))?;
@@ -590,7 +681,7 @@ function resolveFx(fx: FnCtx, te: TypeExpr, voidOk: bool): Result<TyFx, Diagnost
 // `fx` with its environment replaced by `e` (instances only ever grow the tables).
 function withEnv(fx: FnCtx, e: Env): FnCtx {
   if (e.insts.length == fx.env.insts.length && e.funcs.length == fx.env.funcs.length
-    && e.records.length == fx.env.records.length) {
+    && e.records.length == fx.env.records.length && e.vtables.length == fx.env.vtables.length) {
     return fx;
   }
   let f = fx;
@@ -639,6 +730,9 @@ function checkRecord(
       const r = aliasType(cur.env, i, none)?;
       cur = withEnv(cur, r.env);
       t = r.ty;
+    },
+    EntIface(_) => {
+      return Err(diag("E0400", name.span, "`" + name.name + "` is an interface, not a record type"));
     }
   }
   if (targs.isSome()) {
@@ -844,12 +938,43 @@ function argsExpect(
 function checkCall(
   env: Env, fx: FnCtx, span: Span, callee: Expr, args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
+  if (fx.cmode > 0) {
+    match (callee.kind) {
+      EIdent(id) => {
+        if (id.name == "old") {
+          return checkOld(env, fx, span, args);
+        }
+      },
+      _ => {}
+    }
+  }
   return match (callee.kind) {
     EIdent(id) => callIdent(env, fx, span, callee, id, args, exp),
     ETyApp(id, targs) => callTyApp(env, fx, span, callee, id, targs, args, exp),
     EMember(base, name) => callMember(env, fx, span, base, name, args, exp),
     _ => callValue(env, fx, span, callee, args)
   };
+}
+
+// `old(e)` in an `@Ensures` expression (ADR-0012): the value of `e` in the pre-state. Type checking
+// treats it as `e` itself (the runtime-check expansion evaluates it at entry).
+function checkOld(env: Env, fx: FnCtx, span: Span, args: Expr[]): Result<ExprOut, Diagnostic> {
+  if (fx.cmode != 2) {
+    return Err(diag(
+      "E0415",
+      span,
+      fx.cmode == 3 ? "`old(..)` cannot be nested" : "`old(..)` is only allowed in an @Ensures expression"
+    ));
+  }
+  if (args.length != 1) {
+    return Err(diag("E0404", span, "`old` expects 1 argument, found " + args.length.toString()));
+  }
+  let inner = fx;
+  inner.cmode = 3;
+  const r = checkExpr(env, inner, args[0], None)?;
+  let out = r.fx;
+  out.cmode = 2;
+  return Ok(ExprOut { fx: out, expr: r.expr });
 }
 
 // Call of a function value: `f(x)` with a local `f`, `fs[i](x)`, `g(1)(2)`, `(x => x)(3)`.
@@ -1244,6 +1369,10 @@ function callGeneric(
     },
     None => {}
   }
+  match (checkBounds(cur.env, gf.unit, gf.decl, io.tys, span)) {
+    Some(d) => { return Err(d); },
+    None => {}
+  }
   let fid: usize = 0;
   if (!cur.abs) {
     const fo = instFunc(cur.env, g, io.tys, cur.depth + 1, span)?;
@@ -1429,6 +1558,10 @@ function methodCall(
             return classMethodCall(env, b0.fx, span, base, b0, co.unwrap(), name, args);
           }
         }
+        const bd = boundOf(b0.fx.env, r);
+        if (bd.isSome()) {
+          return ifaceCall(env, b0, span, bd.unwrap(), name, args);
+        }
         if (recordHasFnField(b0.fx.env, r, n)) {
           return callFieldValue(env, b0, span, r, name, args);
         }
@@ -1437,6 +1570,9 @@ function methodCall(
         if (isArrayApi(n)) {
           return arrayApiCall(env, b0, span, t, name, args, exp);
         }
+      },
+      TyIface(i) => {
+        return ifaceCall(env, b0, span, i, name, args);
       },
       _ => {}
     }
@@ -1773,6 +1909,25 @@ export function checkBlock(env: Env, fx: FnCtx, b: Block): Result<BlockOut, Diag
   let stmts: HStmt[] = [];
   let div = false;
   for (const s of b.stmts) {
+    // Loop contract clauses (ADR-0012) are checked in the current scope and erased.
+    const isClause = match (s.kind) {
+      SContract(_) => true,
+      _ => false
+    };
+    if (isClause) {
+      match (s.kind) {
+        SContract(c) => {
+          const co = checkClause(env, cur, c, 1)?;
+          cur.env = co.env;
+          match (co.expr) {
+            Some(x) => { cur.cexprs.push(x); },
+            None => {}
+          }
+        },
+        _ => {}
+      }
+      continue;
+    }
     // Statements hoisted out of this statement's expressions (mutating method calls) go first;
     // the pending list of an enclosing statement is set aside meanwhile.
     const outer = cur.pre;
@@ -1819,6 +1974,47 @@ function checkStmt(env: Env, fx: FnCtx, s: Stmt): Result<StmtOut, Diagnostic> {
     SBlock(b) => {
       const r = checkBlock(env, fx, b)?;
       return sout(r.fx, HBlockStmt(r.block), r.div);
+    },
+    SContract(_) => Err(diag("E0200", s.span, "contract clause outside a loop context"))
+  };
+}
+
+export type ClauseOut = { env: Env; expr: Option<HExpr>; };
+
+// Type-checks one contract clause (ADR-0012, spec 15 §4.2a) in the (forked) context `fx` and
+// discards the result, so contracts never reach the generated code. `cmode`: 1 `@Requires`,
+// `@Invariant`, `@Decreases`, loop clauses; 2 `@Ensures`. The expression must be `bool`
+// (`@Decreases`: `int` or `usize`, E0414); mutating method calls are rejected (E0416). The returned
+// HIR is only used by the purity pass (purity.or). Environment growth (generic instances requested
+// by the clause) is kept so function ids stay consistent.
+export function checkClause(env: Env, fx: FnCtx, c: ContractClause, cmode: int): Result<ClauseOut, Diagnostic> {
+  const none: Option<HExpr> = None;
+  return match (c.expr) {
+    None => Ok(ClauseOut { env: fx.env, expr: none }),
+    Some(e) => {
+      let f = fx;
+      f.cmode = cmode;
+      const isDec = match (c.kind) {
+        CDecreases => true,
+        _ => false
+      };
+      const hint: Option<Type> = isDec ? None : Some(TyBool);
+      const lifted0 = fx.env.lifted.length;
+      const r = checkExpr(env, f, e, hint)?;
+      if (isDec) {
+        if (!isIntish(r.expr.ty)) {
+          return Err(diag("E0414", e.span, "@Decreases expects an `int` or `usize` measure, found `" + showType(r.fx.env, r.expr.ty) + "`"));
+        }
+      } else if (!isBool(r.expr.ty)) {
+        return Err(diag("E0414", e.span, "contract expression must be `bool`, found `" + showType(r.fx.env, r.expr.ty) + "`"));
+      }
+      if (r.fx.pre.length > fx.pre.length) {
+        return Err(diag("E0416", e.span, "a call that mutates its receiver is not allowed in a contract expression"));
+      }
+      if (r.fx.env.lifted.length != lifted0) {
+        return Err(diag("E0416", e.span, "closures are not allowed in a contract expression"));
+      }
+      return Ok(ClauseOut { env: r.fx.env, expr: Some(r.expr) });
     }
   };
 }
@@ -2336,9 +2532,11 @@ function dummyDecl(name: string, span: Span): FunctionDecl {
     exported: false,
     name: Ident { name: name, span: span },
     typeParams: noTps,
+    bounds: [],
     params: noParams,
     ret: noRet,
     body: Block { stmts: noStmts, span: span },
+    contracts: [],
     span: span
   };
 }
@@ -2690,6 +2888,10 @@ function funcValue(
           cur = r.fx;
           ret = r.ty;
         },
+        None => {}
+      }
+      match (checkBounds(cur.env, gf.unit, gf.decl, tys, span)) {
+        Some(d) => { return Err(d); },
         None => {}
       }
       if (cur.abs) {

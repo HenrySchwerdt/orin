@@ -1,0 +1,1068 @@
+// Contract verification, phase 2 (ADR-0012, spec 15): `orin verify --contracts`. Beyond Orin-B.
+//
+// Verification conditions for pure int / bool functions, discharged by an SMT solver (z3, SMT-LIB 2
+// text on stdin). Documented in docs/contracts.md. Summary of the supported fragment:
+//   * parameters and result of type `int` or `bool`;
+//   * body: `const` / `let` of int or bool, assignment and `+=` etc. to such locals, `if` / `else`,
+//     `return`, nested blocks; expressions over int / bool literals, locals, `+ - * / %`, comparisons,
+//     `&& || !`, `?:`, and calls to other functions of the same fragment (modular: the callee's
+//     `@Requires` become proof obligations at the call site, its `@Ensures` are assumed);
+//   * everything else (loops, strings, arrays, records, classes, I/O, closures, `usize`) makes the
+//     function's clauses UNKNOWN with the reason.
+// Semantics: PARTIAL correctness over unbounded mathematical integers in contracts; the program's
+// arithmetic traps on i64 overflow, division by zero, so executions that trap never return and the
+// proof assumes they do not happen (each arithmetic result is assumed to be in the i64 range and
+// each divisor non-zero, on the path where it is computed). Termination is not proved.
+// Results per clause: VERIFIED (solver: unsat), REFUTED (sat, with a counterexample for the
+// parameters) or UNKNOWN (solver unknown / timeout / unavailable, or outside the fragment).
+
+import { SourceMap } from "../diag";
+import {
+  Ident, FunctionDecl, TypeExpr, TNamed, UnaryOp, BinaryOp, AssignOp, Block, Stmt, Expr, StmtKind, ExprKind, ContractClause,
+  IFunction, SLet, SAssign, SExpr, SReturn, SIf, SBlock, SContract, SWhile, SForOf,
+  EInt, EBool, EIdent, EUnary, EBinary, ECall, ECond, UNot, UNeg,
+  BAdd, BSub, BMul, BDiv, BRem, BEq, BNe, BLt, BLe, BGt, BGe, BAnd, BOr, BImplies,
+  OpAssign, OpAddAssign, OpSubAssign, OpMulAssign, OpDivAssign, OpRemAssign,
+  CRequires, CEnsures, CDecreases, CRule
+} from "../syntax";
+import { LoadedProgram } from "../loader";
+import { writeFile, readFile } from "std:fs";
+import { shellRun } from "../lsp";
+import { jsonString } from "../tools";
+
+const I64_MIN: string = "(- 9223372036854775808)";
+const I64_MAX: string = "9223372036854775807";
+
+type FnInfo = { decl: FunctionDecl; file: string; text: string; };
+type Var = { name: string; term: string; ty: int; };       // ty: 0 int, 1 bool
+type Obl = { callee: string; line: usize; clause: string; goal: string; pc: string[]; };
+type Gen = { decls: string[]; facts: string[]; n: usize; obls: Obl[]; };
+type St = { vars: Var[]; pc: string[]; };
+type Ret = { pc: string[]; val: string; ty: int; isVoid: bool; };
+type Cx = { fns: FnInfo[]; res: Option<Var>; ens: bool; body: bool; text: string; };
+type TR = { g: Gen; t: string; ty: int; asm: string[]; };
+type Ex = { g: Gen; st: St; fall: bool; rets: Ret[]; };
+
+export type Res = {
+  fn: string; file: string; line: usize; kind: string; clause: string; rules: string[];
+  status: string; reason: string; cex: string[];
+};
+
+export type Report = { results: Res[]; };
+
+function lineOf(text: string, off: usize): usize {
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < off && i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      line += 1;
+    }
+    i += 1;
+  }
+  return line;
+}
+
+function clauseText(text: string, c: ContractClause): string {
+  return text.substring(c.span.start, c.span.end).split("\n").join(" ");
+}
+
+function lit(n: int): string {
+  if (n < 0) {
+    return "(- " + (0 - n).toString() + ")";
+  }
+  return n.toString();
+}
+
+function tyName(ty: int): string {
+  return ty == 1 ? "Bool" : "Int";
+}
+
+function inRange(t: string): string {
+  return "(and (<= " + I64_MIN + " " + t + ") (<= " + t + " " + I64_MAX + "))";
+}
+
+function guarded(guard: string, asm: string[]): string[] {
+  let out: string[] = [];
+  for (const a of asm) {
+    out.push("(=> " + guard + " " + a + ")");
+  }
+  return out;
+}
+
+function concat(a: string[], b: string[]): string[] {
+  let out: string[] = [];
+  for (const x of a) {
+    out.push(x);
+  }
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
+}
+
+function andAll(xs: string[]): string {
+  if (xs.length == 0) {
+    return "true";
+  }
+  if (xs.length == 1) {
+    return xs[0];
+  }
+  return "(and " + xs.join(" ") + ")";
+}
+
+// Type of a parameter / result annotation: 0 int, 1 bool, -1 unsupported.
+function tyOf(t: TypeExpr): int {
+  return match (t.kind) {
+    TNamed(id, args) => args.length > 0 ? -1 : (id.name == "int" ? 0 : (id.name == "bool" ? 1 : -1)),
+    _ => -1
+  };
+}
+
+function tyText(t: TypeExpr): string {
+  return match (t.kind) {
+    TNamed(id, _) => id.name,
+    _ => "a compound type"
+  };
+}
+
+function lookupVar(vars: Var[], name: string): Option<Var> {
+  let i = vars.length;
+  while (i > 0) {
+    i -= 1;
+    if (vars[i].name == name) {
+      return Some(vars[i]);
+    }
+  }
+  return None;
+}
+
+type Fresh = { g: Gen; name: string; };
+
+// A fresh SMT constant `vN` of type `ty` defined to equal `term`.
+function fresh(g0: Gen, ty: int, term: string): Fresh {
+  let g = g0;
+  const name = "v" + g.n.toString();
+  g.n += 1;
+  g.decls.push("(declare-const " + name + " " + tyName(ty) + ")");
+  g.facts.push("(= " + name + " " + term + ")");
+  return Fresh { g: g, name: name };
+}
+
+function freshFree(g0: Gen, ty: int): Fresh {
+  let g = g0;
+  const name = "c" + g.n.toString();
+  g.n += 1;
+  g.decls.push("(declare-const " + name + " " + tyName(ty) + ")");
+  return Fresh { g: g, name: name };
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------------
+
+function mk(g: Gen, t: string, ty: int, asm: string[]): Result<TR, string> {
+  return Ok(TR { g: g, t: t, ty: ty, asm: asm });
+}
+
+function findFn(fns: FnInfo[], name: string): Option<FnInfo> {
+  let found: Option<FnInfo> = None;
+  let count: usize = 0;
+  for (const f of fns) {
+    if (f.decl.name.name == name) {
+      found = Some(f);
+      count += 1;
+    }
+  }
+  if (count == 1) {
+    return found;
+  }
+  return None;
+}
+
+function tr(g: Gen, vars: Var[], pc: string[], cx: Cx, e: Expr): Result<TR, string> {
+  return match (e.kind) {
+    EInt(n) => mk(g, lit(n), 0, []),
+    EBool(b) => mk(g, b ? "true" : "false", 1, []),
+    EIdent(id) => trIdent(g, vars, cx, id.name),
+    EUnary(op, x) => trUnary(g, vars, pc, cx, op, x),
+    EBinary(op, l, r) => trBinary(g, vars, pc, cx, op, l, r),
+    ECond(c, a, b) => trCond(g, vars, pc, cx, c, a, b),
+    ECall(callee, args) => trCall(g, vars, pc, cx, callee, args, e),
+    _ => Err("unsupported expression (outside the verified fragment: int / bool arithmetic, comparisons, calls)")
+  };
+}
+
+function trIdent(g: Gen, vars: Var[], cx: Cx, name: string): Result<TR, string> {
+  const v = lookupVar(vars, name);
+  if (v.isSome()) {
+    return mk(g, v.unwrap().term, v.unwrap().ty, []);
+  }
+  if (name == "result" && cx.res.isSome()) {
+    return mk(g, cx.res.unwrap().term, cx.res.unwrap().ty, []);
+  }
+  return Err("unsupported name `" + name + "` (constants and globals are not supported)");
+}
+
+function trUnary(g: Gen, vars: Var[], pc: string[], cx: Cx, op: UnaryOp, x: Expr): Result<TR, string> {
+  const a = tr(g, vars, pc, cx, x)?;
+  return match (op) {
+    UNot => a.ty == 1 ? mk(a.g, "(not " + a.t + ")", 1, a.asm) : Err("`!` on a non-bool value"),
+    UNeg => {
+      if (a.ty != 0) {
+        return Err("`-` on a non-int value");
+      }
+      const t = "(- " + a.t + ")";
+      return mk(a.g, t, 0, concat(a.asm, [inRange(t)]));
+    }
+  };
+}
+
+function trCond(g: Gen, vars: Var[], pc: string[], cx: Cx, c: Expr, a: Expr, b: Expr): Result<TR, string> {
+  const ct = tr(g, vars, pc, cx, c)?;
+  if (ct.ty != 1) {
+    return Err("condition of `?:` is not bool");
+  }
+  const at = tr(ct.g, vars, concat(pc, [ct.t]), cx, a)?;
+  const bt = tr(at.g, vars, concat(pc, ["(not " + ct.t + ")"]), cx, b)?;
+  if (at.ty != bt.ty) {
+    return Err("branches of `?:` have different types");
+  }
+  const asm = concat(concat(ct.asm, guarded(ct.t, at.asm)), guarded("(not " + ct.t + ")", bt.asm));
+  return mk(bt.g, "(ite " + ct.t + " " + at.t + " " + bt.t + ")", at.ty, asm);
+}
+
+function smtCmp(op: BinaryOp): string {
+  return match (op) {
+    BLt => "<",
+    BLe => "<=",
+    BGt => ">",
+    BGe => ">=",
+    _ => "="
+  };
+}
+
+function trBinary(g: Gen, vars: Var[], pc: string[], cx: Cx, op: BinaryOp, l: Expr, r: Expr): Result<TR, string> {
+  const lt = tr(g, vars, pc, cx, l)?;
+  const isAnd = match (op) { BAnd => true, _ => false };
+  const isOr = match (op) { BOr => true, _ => false };
+  const isImp = match (op) { BImplies => true, _ => false };
+  if (isAnd || isOr || isImp) {
+    // The right operand is only evaluated when the left one does not decide: guard its facts.
+    const guard = isAnd || isImp ? lt.t : "(not " + lt.t + ")";
+    const rt = tr(lt.g, vars, concat(pc, [guard]), cx, r)?;
+    if (lt.ty != 1 || rt.ty != 1) {
+      return Err("`&&`, `||`, `==>` need bool operands");
+    }
+    const asm = concat(lt.asm, guarded(guard, rt.asm));
+    const term = isAnd ? "(and " + lt.t + " " + rt.t + ")" : (isOr ? "(or " + lt.t + " " + rt.t + ")" : "(=> " + lt.t + " " + rt.t + ")");
+    return mk(rt.g, term, 1, asm);
+  }
+  const rt = tr(lt.g, vars, pc, cx, r)?;
+  const asm = concat(lt.asm, rt.asm);
+  const arith = match (op) {
+    BAdd => true,
+    BSub => true,
+    BMul => true,
+    BDiv => true,
+    BRem => true,
+    _ => false
+  };
+  if (arith) {
+    if (lt.ty != 0 || rt.ty != 0) {
+      return Err("arithmetic on a non-int value");
+    }
+    const a = lt.t;
+    const b = rt.t;
+    let t = "";
+    let extra: string[] = [];
+    match (op) {
+      BAdd => { t = "(+ " + a + " " + b + ")"; },
+      BSub => { t = "(- " + a + " " + b + ")"; },
+      BMul => { t = "(* " + a + " " + b + ")"; },
+      BDiv => {
+        t = "(tdiv " + a + " " + b + ")";
+        extra.push("(not (= " + b + " 0))");
+      },
+      _ => {
+        t = "(trem " + a + " " + b + ")";
+        extra.push("(not (= " + b + " 0))");
+        extra.push(inRange("(tdiv " + a + " " + b + ")"));
+      }
+    }
+    extra.push(inRange(t));
+    return mk(rt.g, t, 0, concat(asm, extra));
+  }
+  const isEq = match (op) { BEq => true, _ => false };
+  const isNe = match (op) { BNe => true, _ => false };
+  if (isEq || isNe) {
+    if (lt.ty != rt.ty) {
+      return Err("`==` / `!=` on operands of different types");
+    }
+    const eq = "(= " + lt.t + " " + rt.t + ")";
+    return mk(rt.g, isEq ? eq : "(not " + eq + ")", 1, asm);
+  }
+  if (lt.ty != 0 || rt.ty != 0) {
+    return Err("comparison of non-int values");
+  }
+  return mk(rt.g, "(" + smtCmp(op) + " " + lt.t + " " + rt.t + ")", 1, asm);
+}
+
+function paramVars(f: FunctionDecl, terms: string[], tys: int[]): Var[] {
+  let out: Var[] = [];
+  let i: usize = 0;
+  while (i < f.params.length) {
+    out.push(Var { name: f.params[i].name.name, term: terms[i], ty: tys[i] });
+    i += 1;
+  }
+  return out;
+}
+
+// Parameter types of a function in the fragment, or the reason it is outside it.
+function paramTypes(f: FunctionDecl): Result<int[], string> {
+  let tys: int[] = [];
+  for (const p of f.params) {
+    const t = tyOf(p.ty);
+    if (t < 0) {
+      return Err("parameter `" + p.name.name + "` has type `" + tyText(p.ty) + "` (only int and bool are supported)");
+    }
+    tys.push(t);
+  }
+  return Ok(tys);
+}
+
+function retType(f: FunctionDecl): Result<int, string> {
+  return match (f.ret) {
+    None => Ok(0 - 1),
+    Some(t) => {
+      const k = tyOf(t);
+      if (k < 0) {
+        if (tyText(t) == "void") {
+          return Ok(0 - 1);
+        }
+        return Err("result type `" + tyText(t) + "` is not supported (only int and bool)");
+      }
+      return Ok(k);
+    }
+  };
+}
+
+function exprOf(c: ContractClause): Option<Expr> {
+  return c.expr;
+}
+
+function clausesOf(f: FunctionDecl, want: int): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const c of f.contracts) {
+    const k = match (c.kind) {
+      CRequires => 0,
+      CEnsures => 1,
+      CDecreases => 2,
+      _ => 3
+    };
+    if (k == want) {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+// Contract expressions of `cs` translated over `vars` (and `res`); facts about overflow are ignored
+// (contracts are over mathematical integers).
+function trClauses(g: Gen, vars: Var[], cx: Cx, cs: ContractClause[]): Result<string[], string> {
+  let out: string[] = [];
+  for (const c of cs) {
+    const e = exprOf(c);
+    if (e.isSome()) {
+      const t = tr(g, vars, [], cx, e.unwrap())?;
+      if (t.ty != 1) {
+        return Err("contract expression is not bool");
+      }
+      out.push(t.t);
+    }
+  }
+  return Ok(out);
+}
+
+// Call of a function of the fragment: modular reasoning with its contract.
+function trCall(g: Gen, vars: Var[], pc: string[], cx: Cx, callee: Expr, args: Expr[], e: Expr): Result<TR, string> {
+  const name = match (callee.kind) {
+    EIdent(id) => id.name,
+    _ => ""
+  };
+  if (name == "") {
+    return Err("unsupported call (only calls of named functions)");
+  }
+  if (name == "old" && cx.ens && args.length == 1) {
+    return tr(g, vars, pc, cx, args[0]);
+  }
+  if (!cx.body) {
+    return Err("call of `" + name + "` inside a contract expression is not supported");
+  }
+  const fo = findFn(cx.fns, name);
+  if (fo.isNone()) {
+    return Err("call of `" + name + "`: not a unique function of the program, or a built-in");
+  }
+  const f = fo.unwrap();
+  if (f.decl.typeParams.length > 0 || f.decl.params.length != args.length) {
+    return Err("call of `" + name + "`: generic or wrong arity");
+  }
+  const ptys = paramTypes(f.decl)?;
+  const rty = retType(f.decl)?;
+  if (rty < 0) {
+    return Err("call of `" + name + "`: void functions are not supported");
+  }
+  let cur = g;
+  let terms: string[] = [];
+  let asm: string[] = [];
+  let i: usize = 0;
+  while (i < args.length) {
+    const a = tr(cur, vars, pc, cx, args[i])?;
+    if (a.ty != ptys[i]) {
+      return Err("call of `" + name + "`: argument type mismatch");
+    }
+    cur = a.g;
+    terms.push(a.t);
+    asm = concat(asm, a.asm);
+    i += 1;
+  }
+  const calleeVars = paramVars(f.decl, terms, ptys);
+  const ccx = Cx { fns: cx.fns, res: None, ens: false, body: false, text: f.text };
+  const reqs = clausesOf(f.decl, 0);
+  const reqTerms = trClauses(cur, calleeVars, ccx, reqs)?;
+  // Proof obligation: the callee's preconditions hold here.
+  let k: usize = 0;
+  while (k < reqs.length) {
+    const rc = exprOf(reqs[k]);
+    if (rc.isSome()) {
+      const one = tr(cur, calleeVars, [], ccx, rc.unwrap())?;
+      cur.obls.push(Obl {
+        callee: name, line: lineOf(cx.text, e.span.start), clause: clauseText(f.text, reqs[k]), goal: one.t,
+        pc: concat(pc, asm)
+      });
+    }
+    k += 1;
+  }
+  // The result: unconstrained apart from the callee's postconditions (assumed under its preconditions).
+  const fr = freshFree(cur, rty);
+  cur = fr.g;
+  const rcx = Cx { fns: cx.fns, res: Some(Var { name: "result", term: fr.name, ty: rty }), ens: true, body: false, text: f.text };
+  const enss = trClauses(cur, calleeVars, rcx, clausesOf(f.decl, 1))?;
+  if (enss.length > 0) {
+    cur.facts.push("(=> " + andAll(reqTerms) + " " + andAll(enss) + ")");
+  }
+  return mk(cur, fr.name, rty, asm);
+}
+
+// ---------------------------------------------------------------------------
+// Statements (symbolic execution)
+// ---------------------------------------------------------------------------
+
+function tyOfLet(ann: Option<TypeExpr>, actual: int): Result<int, string> {
+  return match (ann) {
+    None => Ok(actual),
+    Some(t) => {
+      const k = tyOf(t);
+      if (k < 0) {
+        return Err("local variable of type `" + tyText(t) + "` (only int and bool are supported)");
+      }
+      if (k != actual) {
+        return Err("local variable type does not match its initialiser");
+      }
+      return Ok(k);
+    }
+  };
+}
+
+function assignIndex(vars: Var[], name: string): Option<usize> {
+  let i = vars.length;
+  while (i > 0) {
+    i -= 1;
+    if (vars[i].name == name) {
+      return Some(i);
+    }
+  }
+  return None;
+}
+
+function binOfAssign(op: AssignOp): Option<BinaryOp> {
+  return match (op) {
+    OpAssign => None,
+    OpAddAssign => Some(BAdd),
+    OpSubAssign => Some(BSub),
+    OpMulAssign => Some(BMul),
+    OpDivAssign => Some(BDiv),
+    OpRemAssign => Some(BRem)
+  };
+}
+
+function execStmts(g0: Gen, st0: St, stmts: Stmt[], cx: Cx): Result<Ex, string> {
+  let g = g0;
+  let st = st0;
+  let rets: Ret[] = [];
+  let k: usize = 0;
+  while (k < stmts.length) {
+    const s = stmts[k];
+    k += 1;
+    match (s.kind) {
+      SContract(_) => {},
+      SLet(_, name, ann, init) => {
+        const t = tr(g, st.vars, st.pc, cx, init)?;
+        const ty = tyOfLet(ann, t.ty)?;
+        const f = fresh(t.g, ty, t.t);
+        g = f.g;
+        st.pc = concat(st.pc, t.asm);
+        st.vars.push(Var { name: name.name, term: f.name, ty: ty });
+      },
+      SAssign(target, op, value) => {
+        const tn = match (target.kind) {
+          EIdent(id) => id.name,
+          _ => ""
+        };
+        if (tn == "") {
+          return Err("assignment to a field or element is not supported");
+        }
+        const idx = assignIndex(st.vars, tn);
+        if (idx.isNone()) {
+          return Err("assignment to unknown variable `" + tn + "`");
+        }
+        const bo = binOfAssign(op);
+        let rhs = value;
+        if (bo.isSome()) {
+          rhs = Expr { kind: EBinary(bo.unwrap(), target, value), span: s.span };
+        }
+        const t = tr(g, st.vars, st.pc, cx, rhs)?;
+        if (t.ty != st.vars[idx.unwrap()].ty) {
+          return Err("assignment changes the type of `" + tn + "`");
+        }
+        const f = fresh(t.g, t.ty, t.t);
+        g = f.g;
+        st.pc = concat(st.pc, t.asm);
+        st.vars[idx.unwrap()] = Var { name: tn, term: f.name, ty: t.ty };
+      },
+      SExpr(e) => {
+        const t = tr(g, st.vars, st.pc, cx, e)?;
+        g = t.g;
+        st.pc = concat(st.pc, t.asm);
+      },
+      SReturn(v) => {
+        match (v) {
+          Some(e) => {
+            const t = tr(g, st.vars, st.pc, cx, e)?;
+            g = t.g;
+            rets.push(Ret { pc: concat(st.pc, t.asm), val: t.t, ty: t.ty, isVoid: false });
+          },
+          None => {
+            rets.push(Ret { pc: st.pc, val: "", ty: 0, isVoid: true });
+          }
+        }
+        return Ok(Ex { g: g, st: st, fall: false, rets: rets });
+      },
+      SBlock(b) => {
+        const n0 = st.vars.length;
+        const r = execStmts(g, st, b.stmts, cx)?;
+        g = r.g;
+        for (const x of r.rets) {
+          rets.push(x);
+        }
+        if (!r.fall) {
+          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+        }
+        st = r.st;
+        st.vars = prefix(st.vars, n0);
+      },
+      SIf(c, thenB, els) => {
+        const r = execIf(g, st, cx, c, thenB, els)?;
+        g = r.g;
+        for (const x of r.rets) {
+          rets.push(x);
+        }
+        if (!r.fall) {
+          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+        }
+        st = r.st;
+      },
+      SWhile(_, _) => {
+        return Err("loops are not supported (no loop-invariant reasoning in v1)");
+      },
+      SForOf(_, _, _) => {
+        return Err("loops are not supported (no loop-invariant reasoning in v1)");
+      },
+      _ => {
+        return Err("unsupported statement");
+      }
+    }
+  }
+  return Ok(Ex { g: g, st: st, fall: true, rets: rets });
+}
+
+function prefix(vs: Var[], n: usize): Var[] {
+  let out: Var[] = [];
+  let i: usize = 0;
+  while (i < n && i < vs.length) {
+    out.push(vs[i]);
+    i += 1;
+  }
+  return out;
+}
+
+function tailFrom(xs: string[], n: usize): string[] {
+  let out: string[] = [];
+  let i = n;
+  while (i < xs.length) {
+    out.push(xs[i]);
+    i += 1;
+  }
+  return out;
+}
+
+function execElse(g: Gen, st: St, cx: Cx, els: Option<Stmt>): Result<Ex, string> {
+  return match (els) {
+    None => Ok(Ex { g: g, st: st, fall: true, rets: [] }),
+    Some(s) => execStmts(g, st, [s], cx)
+  };
+}
+
+function execIf(g0: Gen, st: St, cx: Cx, c: Expr, thenB: Block, els: Option<Stmt>): Result<Ex, string> {
+  const ct = tr(g0, st.vars, st.pc, cx, c)?;
+  if (ct.ty != 1) {
+    return Err("`if` condition is not bool");
+  }
+  const n0 = st.vars.length;
+  const pc0 = concat(st.pc, ct.asm);
+  const notC = "(not " + ct.t + ")";
+  const s1 = St { vars: st.vars, pc: concat(pc0, [ct.t]) };
+  const r1 = execStmts(ct.g, s1, thenB.stmts, cx)?;
+  const s2 = St { vars: st.vars, pc: concat(pc0, [notC]) };
+  const r2 = execElse(r1.g, s2, cx, els)?;
+  const rets = concat2(r1.rets, r2.rets);
+  if (!r1.fall && !r2.fall) {
+    return Ok(Ex { g: r2.g, st: s1, fall: false, rets: rets });
+  }
+  if (r1.fall && !r2.fall) {
+    return Ok(Ex { g: r2.g, st: St { vars: prefix(r1.st.vars, n0), pc: r1.st.pc }, fall: true, rets: rets });
+  }
+  if (!r1.fall && r2.fall) {
+    return Ok(Ex { g: r2.g, st: St { vars: prefix(r2.st.vars, n0), pc: r2.st.pc }, fall: true, rets: rets });
+  }
+  // Both branches fall through: merge the variables with `ite` and keep the branch facts guarded.
+  let g = r2.g;
+  let merged: Var[] = [];
+  let i: usize = 0;
+  while (i < n0) {
+    const a = r1.st.vars[i];
+    const b = r2.st.vars[i];
+    if (a.term == b.term) {
+      merged.push(a);
+    } else {
+      const f = fresh(g, a.ty, "(ite " + ct.t + " " + a.term + " " + b.term + ")");
+      g = f.g;
+      merged.push(Var { name: a.name, term: f.name, ty: a.ty });
+    }
+    i += 1;
+  }
+  const base = pc0.length + 1;
+  const pc = concat(concat(pc0, guarded(ct.t, tailFrom(r1.st.pc, base))), guarded(notC, tailFrom(r2.st.pc, base)));
+  return Ok(Ex { g: g, st: St { vars: merged, pc: pc }, fall: true, rets: rets });
+}
+
+function concat2(a: Ret[], b: Ret[]): Ret[] {
+  let out: Ret[] = [];
+  for (const x of a) {
+    out.push(x);
+  }
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Solver
+// ---------------------------------------------------------------------------
+
+function prelude(): string {
+  return "(set-option :produce-models true)\n(set-logic ALL)\n"
+    + "(define-fun tdiv ((a Int) (b Int)) Int (ite (>= a 0) (ite (>= b 0) (div a b) (- (div a (- b)))) (ite (>= b 0) (- (div (- a) b)) (div (- a) (- b)))))\n"
+    + "(define-fun trem ((a Int) (b Int)) Int (- a (* b (tdiv a b))))\n";
+}
+
+type Rt = { fns: FnInfo[]; z3: string; qn: usize; out: Res[]; };
+type Solved = { status: string; model: string; };
+
+// Runs the solver on `query` (SMT-LIB text without check-sat); status is `unsat`, `sat`, `unknown` or
+// `error` (solver missing or crashed).
+function solve(rt0: Rt, query: string): Result<Solved, string> {
+  const base = "build/contracts-vc/q" + rt0.qn.toString();
+  const w = writeFile(base + ".smt2", prelude() + query + "(check-sat)\n(get-model)\n");
+  if (w.isErr()) {
+    return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
+  }
+  const rc = shellRun(rt0.z3 + " -in -T:20 < " + base + ".smt2 > " + base + ".out 2>&1");
+  if (rc != 0 && rc != 1) {
+    return Err("solver `" + rt0.z3 + "` could not be run (exit status " + rc.toString() + ")");
+  }
+  const o = readFile(base + ".out");
+  if (o.isErr()) {
+    return Err("cannot read solver output");
+  }
+  const text = o.unwrap();
+  const nl = text.indexOf("\n");
+  const first = (nl.isSome() ? text.substring(0, nl.unwrap()) : text).trim();
+  const rest = nl.isSome() ? text.substring(nl.unwrap() + 1, text.length) : "";
+  if (first == "unsat" || first == "sat" || first == "unknown") {
+    return Ok(Solved { status: first, model: rest });
+  }
+  return Err("solver answered: " + first);
+}
+
+// Value of constant `name` in a z3 model: `(define-fun name () Int\n  5)` -> "5".
+function modelValue(model: string, name: string): string {
+  const key = "(define-fun " + name + " () ";
+  const at = model.indexOf(key);
+  if (at.isNone()) {
+    return "?";
+  }
+  let i = at.unwrap() + key.length;
+  // skip the sort
+  while (i < model.length && model.charCodeAt(i) != 32 && model.charCodeAt(i) != 10) {
+    i += 1;
+  }
+  let depth: int = 0;
+  let start = i;
+  while (i < model.length) {
+    const ch = model.charCodeAt(i);
+    if (ch == 40) {
+      depth += 1;
+    } else if (ch == 41) {
+      if (depth == 0) {
+        break;
+      }
+      depth -= 1;
+    }
+    i += 1;
+  }
+  const v = model.substring(start, i).trim().split("\n").join(" ").split("  ").join(" ");
+  if (v.startsWith("(- ") && v.endsWith(")")) {
+    return "-" + v.substring(3, v.length - 1);
+  }
+  return v;
+}
+
+function counterexample(model: string, f: FunctionDecl): string[] {
+  let out: string[] = [];
+  for (const p of f.params) {
+    out.push(p.name.name + " = " + modelValue(model, "p_" + p.name.name));
+  }
+  return out;
+}
+
+function assertAll(xs: string[]): string {
+  let s = "";
+  for (const x of xs) {
+    s += "(assert " + x + ")\n";
+  }
+  return s;
+}
+
+function queryText(g: Gen, base: string[], pc: string[], goal: string): string {
+  return concat(g.decls, []).join("\n") + "\n" + assertAll(g.facts) + assertAll(base) + assertAll(pc)
+    + "(assert (not " + goal + "))\n";
+}
+
+function rulesOf(f: FunctionDecl): string[] {
+  let out: string[] = [];
+  for (const c of f.contracts) {
+    match (c.kind) {
+      CRule => { out.push(c.rule); },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+function pushRes(rt0: Rt, f: FnInfo, kind: string, clause: ContractClause, status: string, reason: string, cex: string[]): Rt {
+  let rt = rt0;
+  rt.out.push(Res {
+    fn: f.decl.name.name, file: f.file, line: lineOf(f.text, clause.span.start), kind: kind,
+    clause: clauseText(f.text, clause), rules: rulesOf(f.decl), status: status, reason: reason, cex: cex
+  });
+  return rt;
+}
+
+function allUnknown(rt0: Rt, f: FnInfo, reason: string): Rt {
+  let rt = rt0;
+  for (const c of clausesOf(f.decl, 1)) {
+    rt = pushRes(rt, f, "ensures", c, "UNKNOWN", reason, []);
+  }
+  return rt;
+}
+
+// Result of one solver query for a clause.
+function report(rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: string): Rt {
+  let rt = rt0;
+  const s = solve(rt, query);
+  rt.qn += 1;
+  match (s) {
+    Err(m) => { return pushRes(rt, f, kind, c, "UNKNOWN", m, []); },
+    Ok(r) => {
+      if (r.status == "unsat") {
+        return pushRes(rt, f, kind, c, "VERIFIED", "", []);
+      }
+      if (r.status == "sat") {
+        return pushRes(rt, f, kind, c, "REFUTED", "", counterexample(r.model, f.decl));
+      }
+      return pushRes(rt, f, kind, c, "UNKNOWN", "solver returned unknown (timeout or incomplete theory)", []);
+    }
+  }
+}
+
+function verifyFn(rt0: Rt, f: FnInfo): Rt {
+  let rt = rt0;
+  const d = f.decl;
+  const enss = clausesOf(d, 1);
+  for (const c of clausesOf(d, 2)) {
+    rt = pushRes(rt, f, "decreases", c, "UNKNOWN", "termination measures are not checked (v1)", []);
+  }
+  if (d.typeParams.length > 0) {
+    return allUnknown(rt, f, "generic function");
+  }
+  const ptysR = paramTypes(d);
+  if (ptysR.isErr()) {
+    return allUnknown(rt, f, ptysR.unwrapErr());
+  }
+  const rtyR = retType(d);
+  if (rtyR.isErr()) {
+    return allUnknown(rt, f, rtyR.unwrapErr());
+  }
+  const ptys = ptysR.unwrap();
+  const rty = rtyR.unwrap();
+  // Entry state: parameters are free constants `p_x` in the i64 range.
+  let g = Gen { decls: [], facts: [], n: 0, obls: [] };
+  let terms: string[] = [];
+  let base: string[] = [];
+  let i: usize = 0;
+  while (i < d.params.length) {
+    const nm = "p_" + d.params[i].name.name;
+    g.decls.push("(declare-const " + nm + " " + tyName(ptys[i]) + ")");
+    if (ptys[i] == 0) {
+      base.push(inRange(nm));
+    }
+    terms.push(nm);
+    i += 1;
+  }
+  const vars = paramVars(d, terms, ptys);
+  const cx = Cx { fns: rt.fns, res: None, ens: false, body: true, text: f.text };
+  const reqR = trClauses(g, vars, cx, clausesOf(d, 0));
+  if (reqR.isErr()) {
+    return allUnknown(rt, f, "@Requires: " + reqR.unwrapErr());
+  }
+  base = concat(base, reqR.unwrap());
+  const exR = execStmts(g, St { vars: vars, pc: [] }, d.body.stmts, cx);
+  if (exR.isErr()) {
+    return allUnknown(rt, f, exR.unwrapErr());
+  }
+  const ex = exR.unwrap();
+  let rets = ex.rets;
+  if (ex.fall) {
+    rets.push(Ret { pc: ex.st.pc, val: "", ty: 0, isVoid: true });
+  }
+  g = ex.g;
+  // Call-site preconditions.
+  for (const o of g.obls) {
+    const q = queryText(g, base, o.pc, o.goal);
+    const s = solve(rt, q);
+    rt.qn += 1;
+    let status = "UNKNOWN";
+    let reason = "";
+    let cex: string[] = [];
+    match (s) {
+      Err(m) => { reason = m; },
+      Ok(r) => {
+        if (r.status == "unsat") {
+          status = "VERIFIED";
+        } else if (r.status == "sat") {
+          status = "REFUTED";
+          cex = counterexample(r.model, d);
+        } else {
+          reason = "solver returned unknown (timeout or incomplete theory)";
+        }
+      }
+    }
+    rt.out.push(Res {
+      fn: d.name.name, file: f.file, line: o.line, kind: "call-precondition",
+      clause: o.clause + " (call of " + o.callee + ")", rules: rulesOf(d), status: status, reason: reason, cex: cex
+    });
+  }
+  // Postconditions: for every return, the clause holds under the facts of that path.
+  for (const c of enss) {
+    const e = exprOf(c);
+    if (e.isNone()) {
+      continue;
+    }
+    let parts: string[] = [];
+    let failure = "";
+    for (const r of rets) {
+      let res: Option<Var> = None;
+      if (!r.isVoid) {
+        res = Some(Var { name: "result", term: r.val, ty: r.ty });
+      }
+      if (r.isVoid != (rty < 0)) {
+        failure = "return statements do not match the declared result type";
+      }
+      const ecx = Cx { fns: rt.fns, res: res, ens: true, body: false, text: f.text };
+      const t = tr(g, vars, [], ecx, e.unwrap());
+      if (t.isErr()) {
+        failure = t.unwrapErr();
+      } else if (t.unwrap().ty != 1) {
+        failure = "contract expression is not bool";
+      } else {
+        parts.push("(=> " + andAll(r.pc) + " " + t.unwrap().t + ")");
+      }
+    }
+    if (failure != "") {
+      rt = pushRes(rt, f, "ensures", c, "UNKNOWN", failure, []);
+    } else {
+      rt = report(rt, f, "ensures", c, queryText(g, base, [], andAll(parts)));
+    }
+  }
+  return rt;
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+
+export function verifyContracts(prog: LoadedProgram, sm: SourceMap, z3: string): Report {
+  let fns: FnInfo[] = [];
+  for (const u of prog.units) {
+    if (u.name.startsWith("$")) {
+      continue;
+    }
+    const f = sm.files[u.file];
+    for (const it of u.ast.items) {
+      match (it) {
+        IFunction(d) => { fns.push(FnInfo { decl: d, file: f.path, text: f.text }); },
+        _ => {}
+      }
+    }
+  }
+  shellRun("mkdir -p build/contracts-vc");
+  let rt = Rt { fns: fns, z3: z3, qn: 0, out: [] };
+  for (const f of fns) {
+    // Functions without clauses are still analysed (their calls of contracted functions are proof
+    // obligations); if they are outside the fragment nothing is reported for them.
+    rt = verifyFn(rt, f);
+  }
+  return Report { results: rt.out };
+}
+
+function jsonRes(r: Res): string {
+  let rules: string[] = [];
+  for (const x of r.rules) {
+    rules.push(jsonString(x));
+  }
+  let cex: string[] = [];
+  for (const x of r.cex) {
+    cex.push(jsonString(x));
+  }
+  return "{\"function\":" + jsonString(r.fn) + ",\"file\":" + jsonString(r.file) + ",\"line\":" + r.line.toString()
+    + ",\"kind\":" + jsonString(r.kind) + ",\"clause\":" + jsonString(r.clause) + ",\"rules\":[" + rules.join(",")
+    + "],\"status\":" + jsonString(r.status) + ",\"reason\":" + jsonString(r.reason) + ",\"counterexample\":["
+    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]}";
+}
+
+function jsonStrings(xs: string[]): string {
+  let out: string[] = [];
+  for (const x of xs) {
+    out.push(jsonString(x));
+  }
+  return out.join(",");
+}
+
+function assumptionsJson(): string {
+  const ids = assumptionIds();
+  const texts = assumptionTexts();
+  let out: string[] = [];
+  let i: usize = 0;
+  while (i < ids.length) {
+    out.push("{\"id\":" + jsonString(ids[i]) + ",\"text\":" + jsonString(texts[i]) + "}");
+    i += 1;
+  }
+  return out.join(",");
+}
+
+// Model assumptions every VERIFIED result depends on (ADR-0020 D1: a VERIFIED result names its
+// assumptions). Ids are referenced from each result; texts are listed once per report.
+function assumptionIds(): string[] {
+  return ["A-INT", "A-DIV", "A-PARTIAL"];
+}
+
+function assumptionTexts(): string[] {
+  return [
+    "integers are unbounded: no i64 overflow occurs on the paths that return",
+    "no division or remainder by zero occurs on the paths that return",
+    "partial correctness: the function is assumed to return (termination is not proved)"
+  ];
+}
+
+function assumptionsOf(r: Res): string[] {
+  if (r.status == "VERIFIED") {
+    return assumptionIds();
+  }
+  const none: string[] = [];
+  return none;
+}
+
+function count(rs: Res[], status: string): usize {
+  let n: usize = 0;
+  for (const r of rs) {
+    if (r.status == status) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+export function reportJson(rep: Report): string {
+  let items: string[] = [];
+  for (const r of rep.results) {
+    items.push(jsonRes(r));
+  }
+  return "{\"results\":[" + items.join(",") + "],\"assumptions\":[" + assumptionsJson() + "],\"summary\":{\"verified\":" + count(rep.results, "VERIFIED").toString()
+    + ",\"refuted\":" + count(rep.results, "REFUTED").toString() + ",\"unknown\":" + count(rep.results, "UNKNOWN").toString() + "}}";
+}
+
+export function reportText(rep: Report): string {
+  let lines: string[] = [];
+  for (const r of rep.results) {
+    let s = r.status + "  " + r.fn + ": " + r.clause + "  (" + r.file + ":" + r.line.toString() + ")";
+    if (r.reason != "") {
+      s += "\n    reason: " + r.reason;
+    }
+    if (r.cex.length > 0) {
+      s += "\n    counterexample: " + r.cex.join(", ");
+    }
+    lines.push(s);
+  }
+  if (count(rep.results, "VERIFIED") > 0) {
+    lines.push("VERIFIED holds under these assumptions:");
+    const ids = assumptionIds();
+    const texts = assumptionTexts();
+    let i: usize = 0;
+    while (i < ids.length) {
+      lines.push("  " + ids[i] + ": " + texts[i]);
+      i += 1;
+    }
+  }
+  lines.push("verified " + count(rep.results, "VERIFIED").toString() + ", refuted " + count(rep.results, "REFUTED").toString()
+    + ", unknown " + count(rep.results, "UNKNOWN").toString());
+  return lines.join("\n");
+}
+
+export function failedCount(rep: Report): usize {
+  return count(rep.results, "REFUTED");
+}
+
+export function unknownCount(rep: Report): usize {
+  return count(rep.results, "UNKNOWN");
+}

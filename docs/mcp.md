@@ -59,7 +59,9 @@ No source text unless `includeSource: true`.
   mutates, cost, allocation, example); `Array.find` is flagged `planned` because the self-hosted
   compiler does not implement it yet. Project symbols resolve in the program rooted at `entry`:
   `{"name","kind","sig","at":"file:line:col","exported","in","mutates"}` — `mutates` (methods only) is
-  the checker's inferred receiver mutability.
+  the checker's inferred receiver mutability. Interfaces (ADR-0019) have kind `interface` with
+  `"implementedBy":["Circle at shape.or:7:7", ..]`; a class has `"implements":["Shape", ..]`; an interface
+  method is a `method` whose `in` is the interface.
 * `module`: a file path (or unit name) in the program rooted at `entry` (default: the module itself):
   ```json
   ← {"module":"a","file":"a.or","exports":["function double(n: int): int"],"imports":[],"importedBy":["m"]}

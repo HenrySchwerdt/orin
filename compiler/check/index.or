@@ -20,12 +20,12 @@
 import { Span, SourceMap } from "../diag";
 import {
   Ident, Item, FunctionDecl, TypeDecl, ConstDecl, TypeExpr, Param, Block, Stmt, Expr, FieldInit, MatchArm,
-  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, ArrowBody
+  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, CtorDecl, ArrowBody, InterfaceDecl, ContractClause
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
-  Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex,
-  SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField
+  Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink,
+  SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface
 } from "../hir";
 
 // ---- tables ---------------------------------------------------------------------------------
@@ -56,6 +56,8 @@ type W = {
   defs: SymbolDef[];
   refs: SymbolRef[];
   types: TypeAt[];
+  impls: ImplLink[];           // `implements` links (ADR-0019)
+  bnd: usize[];                // interface defs bounding the type parameters of the generic function instance being walked
   lNames: string[];            // flat scope stack of visible locals: name, def id, HIR type
   lIds: usize[];
   lTys: Option<Type>[];
@@ -129,7 +131,17 @@ function tpList(ps: Ident[]): string {
   return "<" + parts.join(", ") + ">";
 }
 
-function funcDetail(f: FunctionDecl): string {
+// Contract clauses (ADR-0012) as written in the source, one per line, for hover texts.
+function contractText(sm: SourceMap, cs: ContractClause[]): string {
+  let out = "";
+  for (const k of cs) {
+    const f = sm.files[k.span.file];
+    out += "\n" + f.text.substring(k.span.start, k.span.end).split("\n").join(" ");
+  }
+  return out;
+}
+
+function funcDetail(f: FunctionDecl, sm: SourceMap): string {
   let ps: string[] = [];
   for (const p of f.params) {
     ps.push(p.name.name + ": " + renderTE(p.ty));
@@ -139,7 +151,7 @@ function funcDetail(f: FunctionDecl): string {
     Some(t) => { s += ": " + renderTE(t); },
     None => {}
   }
-  return s;
+  return s + contractText(sm, f.contracts);
 }
 
 // "users/user.User<int,string>" -> "User<int,string>"
@@ -180,7 +192,8 @@ function renderTy(p: Program, t: Type): string {
         parts.push(renderTy(p, t));
       }
       return "(" + parts.join(", ") + ") => " + renderTy(p, r);
-    }
+    },
+    TyIface(i) => i < p.ifaces.length ? shortName(p.ifaces[i].name) : "?"
   };
 }
 
@@ -351,16 +364,17 @@ function constDetail(k: ConstDecl): string {
   return ty.length > 0 ? "const " + k.name.name + ": " + ty : "const " + k.name.name;
 }
 
-function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
+function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
   let tqDefs = p.tqDefs;
   const id = w.defs.length;
   const head = "type " + t.name.name + tpList(t.typeParams);
+  const cdetail = contractText(sm, t.contracts);
   match (t.body) {
     DAlias(te) => {
-      w = addDef(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te));
+      w = addDef(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te) + cdetail);
     },
     DRecord(fs) => {
       let parts: string[] = [];
@@ -368,7 +382,7 @@ function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
         parts.push(f.name.name + ": " + renderTE(f.ty));
       }
       w = addDef(w, t.name.name, SkRecord, t.name.span, t.span, None, t.exported,
-        head + " = { " + parts.join("; ") + " }");
+        head + " = { " + parts.join("; ") + " }" + cdetail);
       for (const f of fs) {
         w = addDef(w, f.name.name, SkField, f.name.span, f.span, Some(id), t.exported,
           f.name.name + ": " + renderTE(f.ty));
@@ -380,7 +394,7 @@ function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
         parts.push(variantText(v.name.name, v.payload));
       }
       w = addDef(w, t.name.name, SkUnion, t.name.span, t.span, None, t.exported,
-        head + " = " + parts.join(" | "));
+        head + " = " + parts.join(" | ") + cdetail);
       for (const v of vs) {
         w = addDef(w, v.name.name, SkVariant, v.name.span, v.span, Some(id), t.exported,
           variantText(v.name.name, v.payload) + ": " + t.name.name + tpList(t.typeParams));
@@ -424,6 +438,18 @@ function classFieldCount(c: ClassDecl): usize {
   return n;
 }
 
+// Class invariants then the constructor's own clauses (the checker attaches both to the constructor).
+function allCtorClauses(c: ClassDecl, k: CtorDecl): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const x of c.contracts) {
+    out.push(x);
+  }
+  for (const x of k.contracts) {
+    out.push(x);
+  }
+  return out;
+}
+
 function paramsText(ps: Param[]): string {
   let parts: string[] = [];
   for (const p of ps) {
@@ -464,13 +490,22 @@ function methodMutating(hir: Option<Program>, qname: string, declRet: Option<Typ
   return false;
 }
 
-function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>): P1 {
+function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>, sm: SourceMap): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
   let tqDefs = p.tqDefs;
   const id = w.defs.length;
-  w = addDef(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, "class " + c.name.name);
+  let cdetail = "class " + c.name.name;
+  if (c.impls.length > 0) {
+    let ins: string[] = [];
+    for (const i of c.impls) {
+      ins.push(i.name);
+    }
+    cdetail += " implements " + ins.join(", ");
+  }
+  cdetail += contractText(sm, c.contracts);
+  w = addDef(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, cdetail);
   for (const m of c.members) {
     match (m) {
       MCtor(k) => {
@@ -496,13 +531,20 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
   for (const m of c.members) {
     match (m) {
       MCtor(k) => {
-        const nsp = Span { file: k.span.file, start: k.span.start, end: k.span.start + 11 };
+        // `constructor` follows the contract clauses (the member's span starts at the first one).
+        let kwStart = k.span.start;
+        if (k.contracts.length > 0) {
+          const after = k.contracts[k.contracts.length - 1].span.end;
+          const ftext = sm.files[k.span.file].text;
+          kwStart = after + ftext.substring(after, ftext.length).indexOf("constructor").unwrapOr(0);
+        }
+        const nsp = Span { file: k.span.file, start: kwStart, end: kwStart + 11 };
         let ps: string[] = [];
         for (const cp of k.params) {
           ps.push(cp.name.name + ": " + renderTE(cp.ty));
         }
         w = addDef(w, "constructor", SkFunction, nsp, k.span, Some(id), c.exported,
-          "constructor(" + ps.join(", ") + ")");
+          "constructor(" + ps.join(", ") + ")" + contractText(sm, k.contracts));
       },
       MMethod(md) => {
         const mutating = !md.isStatic && methodMutating(hir, unitName + "." + c.name.name + "." + md.name.name, md.ret);
@@ -512,13 +554,36 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
           Some(t) => { d += ": " + renderTE(t); },
           None => {}
         }
-        w = addDef(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d);
+        w = addDef(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d + contractText(sm, md.contracts));
       },
       MField(_) => {}
     }
   }
   tab = addT(tab, c.name.name, id, c.exported);
   tq.push(unitName + "." + c.name.name);
+  tqDefs.push(id);
+  return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
+}
+
+// Interfaces (ADR-0019): the interface is an SkInterface def ("interface I"), followed by its methods
+// (SkFunction, container = the interface) in declaration order.
+function declareInterface(p: P1, unitName: string, k: InterfaceDecl): P1 {
+  let w = p.w;
+  let tab = p.tab;
+  let tq = p.tq;
+  let tqDefs = p.tqDefs;
+  const id = w.defs.length;
+  w = addDef(w, k.name.name, SkInterface, k.name.span, k.span, None, k.exported, "interface " + k.name.name);
+  for (const m of k.methods) {
+    let d = "method " + m.name.name + "(" + paramsText(m.params) + ")";
+    match (m.ret) {
+      Some(t) => { d += ": " + renderTE(t); },
+      None => {}
+    }
+    w = addDef(w, m.name.name, SkFunction, m.name.span, m.span, Some(id), k.exported, d);
+  }
+  tab = addT(tab, k.name.name, id, k.exported);
+  tq.push(unitName + "." + k.name.name);
   tqDefs.push(id);
   return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
 }
@@ -631,7 +696,7 @@ function newW(): W {
   const tys: Option<Type>[] = [];
   const tt: Type[] = [];
   return W {
-    defs: d, refs: r, types: t, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
+    defs: d, refs: r, types: t, impls: [], bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
     hl: s, hlTy: tt, hk: 0
   };
 }
@@ -995,6 +1060,12 @@ function walkStmt(w: W, c: Ctx, s: Stmt): W {
       x = popScope(x);
     },
     SBlock(b) => { x = walkBlock(x, c, b); },
+    SContract(k) => {
+      match (k.expr) {
+        Some(e) => { x = walkExpr(x, c, e); },
+        None => {}
+      }
+    },
     _ => {}
   }
   return x;
@@ -1028,12 +1099,29 @@ function walkFunction(w: W, c: Ctx, f: FunctionDecl, fnDef: usize, hf: Option<Fu
     tps.push(t.name);
   }
   x.tps = tps;
+  for (const b of f.bounds) {
+    match (b) {
+      Some(id) => {
+        const bd = lookupType(x, c, id.name);
+        if (bd.isSome()) {
+          x = addRef(x, id.span, bd.unwrap());
+        }
+      },
+      None => {}
+    }
+  }
   x = pushScope(x);
   for (const p of f.params) {
     x = typeRefs(x, c, p.ty);
     x = declare(x, c, p.name, p.span, SkParam, "(parameter)", Some(p.ty));
   }
   x = optTypeRefs(x, c, f.ret);
+  for (const k of f.contracts) {
+    match (k.expr) {
+      Some(e) => { x = walkExpr(x, c, e); },
+      None => {}
+    }
+  }
   x = walkBlock(x, c, f.body);
   x = popScope(x);
   x.fn = None;
@@ -1097,15 +1185,26 @@ function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
       if (mname == "constructor") {
         return x;
       }
-      const cd = findName(c.tq, c.tqDefs, cname);
-      if (cd.isNone()) {
-        return x;
-      }
       let md: Option<usize> = None;
-      for (const k of children(x.defs, cd.unwrap())) {
-        const isFn = match (x.defs[k].kind) { SkFunction => true, _ => false };
-        if (isFn && x.defs[k].name == mname && md.isNone()) {
-          md = Some(k);
+      // Inside an instance of a generic function with bounded type parameters, a call of an interface
+      // method refers to the interface method, not to the method of the class of this instance.
+      for (const bd of x.bnd) {
+        for (const k of children(x.defs, bd)) {
+          if (x.defs[k].name == mname && md.isNone()) {
+            md = Some(k);
+          }
+        }
+      }
+      if (md.isNone()) {
+        const cd = findName(c.tq, c.tqDefs, cname);
+        if (cd.isNone()) {
+          return x;
+        }
+        for (const k of children(x.defs, cd.unwrap())) {
+          const isFn = match (x.defs[k].kind) { SkFunction => true, _ => false };
+          if (isFn && x.defs[k].name == mname && md.isNone()) {
+            md = Some(k);
+          }
         }
       }
       if (md.isNone()) {
@@ -1121,6 +1220,54 @@ function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
         }
         pos = args[0].span.end;
       }
+      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
+        pos += 1;
+      }
+      pos += 1;
+      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) == 32 || text.charCodeAt(pos) == 10)) {
+        pos += 1;
+      }
+      const end = pos + mname.length;
+      if (end <= sp.end && end <= text.length && text.substring(pos, end) == mname) {
+        x = addRef(x, Span { file: sp.file, start: pos, end: end }, md.unwrap());
+      }
+    },
+    None => {}
+  }
+  return x;
+}
+
+// A call through an interface value (`s.area()`): reference to the interface method declaration, at the
+// method name after the receiver.
+function virtRef(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      const iface = match (recv.ty) {
+        TyIface(i) => Some(i),
+        _ => None
+      };
+      if (iface.isNone() || iface.unwrap() >= p.ifaces.length || slot >= p.ifaces[iface.unwrap()].methods.length) {
+        return x;
+      }
+      const info = p.ifaces[iface.unwrap()];
+      const mname = info.methods[slot];
+      const idf = findName(c.tq, c.tqDefs, info.name);
+      if (idf.isNone()) {
+        return x;
+      }
+      let md: Option<usize> = None;
+      for (const k of children(x.defs, idf.unwrap())) {
+        if (x.defs[k].name == mname && md.isNone()) {
+          md = Some(k);
+        }
+      }
+      if (md.isNone()) {
+        return x;
+      }
+      const sp = e.span;
+      const text = c.sm.files[sp.file].text;
+      let pos = recv.span.end;
       while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
         pos += 1;
       }
@@ -1297,6 +1444,12 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       x = hExpr(x, c, f, ty);
       x = hExprs(x, c, args, ty);
     },
+    XIface(_, v) => { x = hExpr(x, c, v, ty); },
+    XCallVirtual(r, slot, args) => {
+      x = hExpr(x, c, r, ty);
+      x = hExprs(x, c, args, ty);
+      x = virtRef(x, c, e, r, slot);
+    },
     _ => {}
   }
   return x;
@@ -1400,6 +1553,43 @@ function dedupTypes(xs: TypeAt[]): TypeAt[] {
   return out;
 }
 
+// The interface defs bounding the type parameters of the generic function that the HIR instance
+// `unit.name<args>` was made from (ADR-0019); empty for anything else.
+function boundDefs(c: Ctx, hirName: string): usize[] {
+  let out: usize[] = [];
+  const lt = hirName.indexOf("<");
+  if (lt.isNone()) {
+    return out;
+  }
+  const base = hirName.substring(0, lt.unwrap());
+  let ui: usize = 0;
+  for (const u of c.prog.units) {
+    for (const item of u.ast.items) {
+      match (item) {
+        IFunction(f) => {
+          if (u.name + "." + f.name.name == base) {
+            for (const b of f.bounds) {
+              match (b) {
+                Some(id) => {
+                  const t = c.tabs[ui];
+                  const d = findName(t.tNames, t.tDefs, id.name);
+                  if (d.isSome()) {
+                    out.push(d.unwrap());
+                  }
+                },
+                None => {}
+              }
+            }
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
+  }
+  return out;
+}
+
 // ---- driver -------------------------------------------------------------------------------------------
 
 export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): SemanticIndex {
@@ -1419,7 +1609,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
       match (item) {
         IFunction(f) => {
           did = p.w.defs.length;
-          p.w = addDef(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f));
+          p.w = addDef(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm));
           p.tab = addV(p.tab, f.name.name, did, f.exported);
         },
         IConst(k) => {
@@ -1429,11 +1619,15 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         },
         IType(t) => {
           did = p.w.defs.length;
-          p = declareType(p, u.name, t);
+          p = declareType(p, u.name, t, sm);
         },
         IClass(cd) => {
           did = p.w.defs.length;
-          p = declareClass(p, u.name, cd, hir);
+          p = declareClass(p, u.name, cd, hir, sm);
+        },
+        IInterface(ik) => {
+          did = p.w.defs.length;
+          p = declareInterface(p, u.name, ik);
         },
         _ => {}
       }
@@ -1496,7 +1690,24 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
           w = walkExpr(w, c, kd.value);
         },
         IType(t) => { w = walkTypeDecl(w, c, t); },
+        IInterface(ik) => {
+          const none: string[] = [];
+          w.tps = none;
+          for (const m of ik.methods) {
+            for (const p of m.params) {
+              w = typeRefs(w, c, p.ty);
+            }
+            w = optTypeRefs(w, c, m.ret);
+          }
+        },
         IClass(cd) => {
+          for (const im of cd.impls) {
+            const idf = lookupType(w, c, im.name);
+            if (idf.isSome()) {
+              w = addRef(w, im.span, idf.unwrap());
+              w.impls.push(ImplLink { cls: did, iface: idf.unwrap(), span: im.span });
+            }
+          }
           // HIR functions of a class: the constructor, then the methods in member order.
           let ctorHf: Option<Function> = None;
           let explicitCtor = false;
@@ -1534,8 +1745,8 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                   ps.push(Param { name: cp.name, ty: cp.ty, span: cp.span });
                 }
                 const fd = FunctionDecl {
-                  exported: false, name: cd.name, typeParams: [], params: ps,
-                  ret: None, body: k.body, span: k.span
+                  exported: false, name: cd.name, typeParams: [], bounds: [], params: ps,
+                  ret: None, body: k.body, contracts: allCtorClauses(cd, k), span: k.span
                 };
                 match (ctorHf) {
                   Some(hf) => { w = hBlock(w, c, hf.body, true); },
@@ -1557,8 +1768,8 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 }
                 hn += 1;
                 const fd = FunctionDecl {
-                  exported: false, name: md.name, typeParams: [], params: md.params, ret: md.ret, body: md.body,
-                  span: md.span
+                  exported: false, name: md.name, typeParams: [], bounds: [], params: md.params, ret: md.ret, body: md.body,
+                  contracts: md.contracts, span: md.span
                 };
                 w = walkFunction(w, c, fd, dk, hf);
                 dk += 1;
@@ -1582,15 +1793,38 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     Some(h) => {
       while (hn < h.functions.length) {
         // Lifted closure bodies (arrow functions, ADR-0011) also contribute expression types.
+        w.bnd = boundDefs(c, h.functions[hn].name);
         w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
+        const noB: usize[] = [];
+        w.bnd = noB;
         hn += 1;
       }
     },
     None => {}
   }
+  // The hover text of an interface lists the classes that implement it (ADR-0019).
+  let impl: usize = 0;
+  while (impl < w.defs.length) {
+    match (w.defs[impl].kind) {
+      SkInterface => {
+        let names: string[] = [];
+        for (const l of w.impls) {
+          if (l.iface == impl) {
+            names.push(w.defs[l.cls].name);
+          }
+        }
+        if (names.length > 0) {
+          w.defs[impl].detail = w.defs[impl].detail + " (implemented by " + names.join(", ") + ")";
+        }
+      },
+      _ => {}
+    }
+    impl += 1;
+  }
   return SemanticIndex {
     defs: w.defs,
     refs: dedupRefs(sortRefs(w.refs)),
-    types: dedupTypes(sortTypes(w.types))
+    types: dedupTypes(sortTypes(w.types)),
+    impls: w.impls
   };
 }

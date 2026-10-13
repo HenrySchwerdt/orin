@@ -82,10 +82,21 @@ test("keywords", async () => {
 });
 
 test("reserved words are flagged illegal", async () => {
-  for (const w of ["var", "class", "interface", "enum", "new", "this", "null", "undefined", "async", "await"]) {
+  for (const w of ["var", "enum", "null", "undefined", "async", "await"]) {
     const t = await tokenize(`${w} x;`);
     assertScope(t, w, "invalid.illegal.reserved.orin");
   }
+});
+
+test("class and interface keywords", async () => {
+  const t = await tokenize(
+    "interface Shape { area(): int; }\nclass Circle implements Shape { area(): int { return 1; } }\nfunction f<T extends Shape>(x: T): Shape { return new Circle(); }"
+  );
+  assertScope(t, "interface", "storage.type.class.orin");
+  assertScope(t, "class", "storage.type.class.orin");
+  assertScope(t, "implements", "keyword.other.orin");
+  assertScope(t, "extends", "keyword.other.orin");
+  assertScope(t, "new", "keyword.other.orin");
 });
 
 test("function, type, const and let declaration names", async () => {

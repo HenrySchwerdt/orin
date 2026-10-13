@@ -26,11 +26,25 @@ COMPILE_TIMEOUT = 120
 
 HEADER_EXIT = re.compile(r"^//\s*exit:\s*(-?\d+)\s*$")
 HEADER_ERROR = re.compile(r"^//\s*error:\s*(E\d{4})\s*$")
+HEADER_FLAGS = re.compile(r"^//\s*flags:\s*(.*?)\s*$")
+HEADER_STDERR = re.compile(r"^//\s*stderr:\s*(.*?)\s*$")
 
 
 def first_line(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return f.readline().strip()
+
+
+def header_lines(path, limit=6):
+    """The leading `//` comment lines of a test (its header block)."""
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for _ in range(limit):
+            line = f.readline()
+            if not line.startswith("//"):
+                break
+            out.append(line.strip())
+    return out
 
 
 def discover(kind, subdir=""):
@@ -70,9 +84,10 @@ def run_cmd(cmd, timeout, env=None, stdin_data=None):
         return -1, "", "cannot execute %s: %s" % (cmd[0], e)
 
 
-def compile_orin(args, entry, c_out):
+def compile_orin(args, entry, c_out, flags=()):
     rel = os.path.relpath(entry, ROOT)
     extra = ["--backend=llvm"] if args.backend == "llvm" else []
+    extra += list(flags)
     return run_cmd([args.orinc, "compile", rel, "-o", c_out] + extra, COMPILE_TIMEOUT)
 
 
@@ -95,13 +110,23 @@ def run_test(args, label, test):
     c_out = os.path.join(outdir, safe + (".ll" if args.backend == "llvm" else ".c"))
     exe = os.path.join(outdir, safe + ".exe")
     hdr = first_line(entry)
+    hdrs = header_lines(entry)
+    flags = []          # `// flags: --check-contracts` (any header line): extra compiler flags
+    want_stderr = []    # `// stderr: text` (any header line): stderr of the run must contain text
+    for h in hdrs:
+        m = HEADER_FLAGS.match(h)
+        if m:
+            flags += m.group(1).split()
+        m = HEADER_STDERR.match(h)
+        if m:
+            want_stderr.append(m.group(1))
 
     if kind == "errors":
         m = HEADER_ERROR.match(hdr)
         if not m:
             return tag, False, "bad or missing '// error: E0xxx' header in first line"
         code = m.group(1)
-        rc, _, err = compile_orin(args, entry, c_out)
+        rc, _, err = compile_orin(args, entry, c_out, flags)
         if rc is None:
             return tag, False, "compiler timed out"
         if rc == 0:
@@ -112,15 +137,16 @@ def run_test(args, label, test):
 
     # run tests
     want_exit = 0
-    m = HEADER_EXIT.match(hdr)
-    if m:
-        want_exit = int(m.group(1))
+    for h in hdrs:
+        m = HEADER_EXIT.match(h)
+        if m:
+            want_exit = int(m.group(1))
     if exp is None or not os.path.isfile(exp):
         return tag, False, "missing expected output file"
     with open(exp, "r", encoding="utf-8", errors="replace") as f:
         want_out = f.read()
 
-    rc, _, err = compile_orin(args, entry, c_out)
+    rc, _, err = compile_orin(args, entry, c_out, flags)
     if rc is None:
         return tag, False, "compiler timed out"
     if rc != 0:
@@ -156,6 +182,9 @@ def run_test(args, label, test):
         problems.append("stdout differs:\n" + head("\n".join(diff), 20))
     if rc != want_exit:
         problems.append("exit status %s, expected %s" % (rc, want_exit))
+    for w in want_stderr:
+        if w not in err:
+            problems.append("stderr does not contain %r" % w)
     if problems:
         if err.strip():
             problems.append("stderr head:\n" + head(err, 8))
