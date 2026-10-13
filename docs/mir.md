@@ -68,3 +68,60 @@ decrements a count owned by the releasing local exactly once — hence no double
 (3) in-place writes happen only on Unique objects — hence aliases keep observing old values
 (value semantics, spec 03). Assumptions (TCB): the runtime implements the operations as specified;
 the C compiler and allocator are correct; the MIR → C emitter is a direct translation.
+
+## Verifier implementation notes
+Implementation: `compiler/verify/` (`wf.or` well-formedness, `state.or` abstract domain and joins,
+`rules.or` one transfer function per instruction/terminator, `verify.or` worklist fixpoint and
+reporting). Tests: `compiler/tests/verify_main.or`. Choices where the rules above were ambiguous:
+
+- **Well-formedness first.** Index ranges, operand classes (int/usize/bool/ref), `ICall` arity and
+  argument/return classes, `paramCount <= locals.length`, no `void` locals, `OUsize >= 0`. If a
+  function is not well-formed only these errors are reported (no dataflow). `IBuiltin` has no
+  signature table in MIR, so only its operand/destination indices are checked.
+  `IMove`/`IBorrow`/`ITakeField`/`IArrayTake`/`IArrayPop` need distinct source and destination;
+  `ICopy` of a reference *local* is rejected (use `IMove`/`IDup`/`IBorrow`); `IMove` is
+  reference-only.
+- **States.** Besides the five of the table: `Init` (initialised scalar), `Imm` (immortal
+  reference: `OStr` copy or `INullary`; readable, consumable, releasable, never a leak, not
+  Unique), and two poisoned join results `MaybeDead` / `MaybeLeak` (MaybeLeak: some path owns a
+  reference). Parameters start `Param` (refs) or `Init` (scalars); all other locals `Dead`.
+  Parameters (scalar ones too) can never be redefined.
+- **Joins** are a semilattice join: identical states stay; Owned-like (Owned/Unique/Imm) join to
+  Owned; every other disagreement (Dead vs anything, differing `Borrowed(src)`, Owned vs
+  Borrowed, ...) is *poisoned*. "Error if used later, otherwise Dead" is implemented lazily: any
+  read, release or consume of a poisoned local is an error at that use; redefining it repairs it.
+  Hence mismatched `Borrowed` sources are only an error when the local is used after the join
+  (slightly more permissive than the table, harmless since an unused alias is never dereferenced).
+  A poisoned MaybeLeak local still yields a leak warning at `TReturn`. Hole sets join to the
+  union, and the *edge* is reported as an error if the sets of the predecessor and the successor
+  differ. Unreachable blocks are only checked for well-formedness. Termination: in-states only
+  grow in a finite lattice (see `verify.or`).
+- **Leaks (warnings):** at `TReturn` any local still Owned/Unique/MaybeLeak, and any definition
+  that overwrites a local that may still own a reference. A discarded reference result
+  (`ICall(None, ..)` of a ref-returning function) is *not* flagged (no obligation tracked).
+- **Invalidation** of `Borrowed(x)` happens on release, move/consume, redefinition, and on every
+  mutating op including `IPutField`/`IArrayPut` and `IStrAppend`. `IGetField`/`IArrayGet` of a
+  borrowed object get the same root; of a Param the root is the Param itself. `Borrowed(x)` is
+  also dead after `IMakeUnique(x)`, `IArrayPush`, `IArrayPop`.
+- **Holes.** A hole key is a constant slot/index or a `usize` local used as array index
+  (symbolic). Reads/takes/sets use a conservative "may alias" test (any symbolic key matches
+  anything); `put` needs the identical key. Redefining a local that names an open hole is an
+  error. *Any whole-object use* of an object with an open hole (call argument, `IDup`,
+  `IBorrow`, move, release, consume, return, `IMakeUnique`, push/pop/`IStrAppend`) is an error:
+  the callee/runtime would see an empty slot. `ISetField` into a taken slot is an error (use put).
+- **Calls and uniqueness (rule strengthened).** The table says calls do not change argument
+  states. That is unsound for `Unique`: a callee can return (a dup of) its argument, leaving a
+  second reference to an object still believed Unique. The verifier therefore demotes a `Unique`
+  local passed directly as an argument of an `ICall`/`IBuiltin` **whose destination is a
+  reference** to `Owned` (re-establish with `IMakeUnique`). Scalar-result calls keep Unique.
+- `IMakeUnique`/`IArrayPush`/`IArrayPop`/`IStrAppend` accept Owned/Unique/Imm; push/pop/append
+  leave the local `Owned`, `IMakeUnique` leaves it `Unique`. `IStrAppend` rejects `y` being `x`
+  or borrowed from `x`.
+- Not checked (no type information in MIR): field/slot index bounds, tags, `ITag`/`IGetField`
+  on the right union, builtin signatures.
+
+Flaws/gaps found in the rules: (1) call/Unique aliasing above; (2) the table does not say what a
+whole-object use of an object with open holes means (treated as error); (3) "x Owned" vs `Imm`
+(immortal values) and scalar `Init`/uninitialised tracking are not in the state table;
+(4) hole identity for dynamic array indices is unspecified (symbolic keys, above);
+(5) a discarded owned call result is an unreported leak.

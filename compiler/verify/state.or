@@ -1,0 +1,121 @@
+// Abstract domain of the OIM ownership verifier (docs/mir.md, "Abstract ownership state").
+// One LState per local plus a set of open holes. The join is a semilattice join, so the fixpoint
+// iteration in verify.or terminates: in-states only ever grow, and the lattice is finite.
+
+export type VerifyIssue = { func: string; block: usize; instr: usize; message: string; };
+
+// Kinds of LState. Imm = immortal reference (OStr copy, INullary): readable, consumable,
+// releasable, never a leak. Init = initialised scalar. MaybeLeak / MaybeDead are the poisoned
+// results of a join that disagrees (MaybeLeak: some path still owns a reference); any use of a
+// poisoned local is an error, a redefinition silently repairs it.
+export const KDead: int = 0;
+export const KOwned: int = 1;
+export const KUnique: int = 2;
+export const KImm: int = 3;
+export const KBorrowed: int = 4;
+export const KParam: int = 5;
+export const KInit: int = 6;
+export const KMaybeLeak: int = 7;
+export const KMaybeDead: int = 8;
+
+// src is meaningful only for KBorrowed (the root local the alias depends on); otherwise 0.
+export type LState = { k: int; src: usize; };
+
+// A taken slot of local `obj`. Field slots and constant array indices are (sym=false, idx=slot);
+// an array index held in a usize local l is the symbolic key (sym=true, idx=l).
+export type HoleEntry = { obj: usize; sym: bool; idx: usize; };
+
+export type State = { ls: LState[]; holes: HoleEntry[]; };
+
+export function mk(k: int, src: usize): LState {
+  return LState { k: k, src: src };
+}
+
+export function ownedLike(k: int): bool {
+  return k == KOwned || k == KUnique || k == KImm;
+}
+
+// A local in this state may still hold a counted reference (Imm is immortal: not a leak).
+export function leaky(k: int): bool {
+  return k == KOwned || k == KUnique || k == KMaybeLeak;
+}
+
+export function kindName(k: int): string {
+  if (k == KDead) { return "Dead"; }
+  if (k == KOwned) { return "Owned"; }
+  if (k == KUnique) { return "Unique"; }
+  if (k == KImm) { return "Imm"; }
+  if (k == KBorrowed) { return "Borrowed"; }
+  if (k == KParam) { return "Param"; }
+  if (k == KInit) { return "Init"; }
+  if (k == KMaybeLeak) { return "MaybeDead(owned on some path)"; }
+  return "MaybeDead";
+}
+
+// Join of two per-local states. Owned-like states join to Owned (Unique/Imm information is
+// lost); identical states are kept; anything else is poisoned.
+export function joinLs(a: LState, b: LState): LState {
+  if (a.k == b.k && a.src == b.src) {
+    return a;
+  }
+  if (ownedLike(a.k) && ownedLike(b.k)) {
+    return mk(KOwned, 0);
+  }
+  if (leaky(a.k) || leaky(b.k)) {
+    return mk(KMaybeLeak, 0);
+  }
+  return mk(KMaybeDead, 0);
+}
+
+export function holeEq(a: HoleEntry, b: HoleEntry): bool {
+  return a.obj == b.obj && a.sym == b.sym && a.idx == b.idx;
+}
+
+export function holeIn(h: HoleEntry, hs: HoleEntry[]): bool {
+  for (const x of hs) {
+    if (holeEq(x, h)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function holesEq(a: HoleEntry[], b: HoleEntry[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (const h of a) {
+    if (!holeIn(h, b)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Join of hole sets is the union (the mismatch itself is reported per edge by verify.or).
+export function joinState(a: State, b: State): State {
+  let ls: LState[] = [];
+  let i: usize = 0;
+  while (i < a.ls.length) {
+    ls.push(joinLs(a.ls[i], b.ls[i]));
+    i += 1;
+  }
+  let holes = a.holes;
+  for (const h of b.holes) {
+    if (!holeIn(h, holes)) {
+      holes.push(h);
+    }
+  }
+  return State { ls: ls, holes: holes };
+}
+
+export function stateEq(a: State, b: State): bool {
+  let i: usize = 0;
+  while (i < a.ls.length) {
+    if (a.ls[i].k != b.ls[i].k || a.ls[i].src != b.ls[i].src) {
+      return false;
+    }
+    i += 1;
+  }
+  return holesEq(a.holes, b.holes);
+}

@@ -1,0 +1,179 @@
+// OIM ownership verifier driver (docs/mir.md). Per function: well-formedness (wf.or), then a
+// forward worklist dataflow over the CFG to a fixpoint (transfer functions in rules.or, joins in
+// state.or), then one reporting pass over the stable block in-states.
+//
+// Termination: in[b] is only ever replaced by join(in[b], out) and re-queued when that differs
+// from in[b]; the join is monotone and the lattice (5 kinds + poison per local, Borrowed sources
+// drawn from the finite set of locals, hole sets over a finite universe) has finite height, so
+// every in[b] changes finitely often. This holds even if a transfer function is not monotone.
+
+import { MProgram, MFunction, MBlock, Terminator } from "../mir";
+import { VerifyIssue, State, LState, mk, holesEq, joinState, stateEq, KDead, KParam, KInit } from "./state";
+import { CRef, localClass, wfInstr, wfTerm, wfFunction } from "./wf";
+import { Cx, step, stepTerm } from "./rules";
+
+export type VerifyReport = { errors: VerifyIssue[]; warnings: VerifyIssue[]; };
+
+function successors(t: Terminator): usize[] {
+  return match (t) {
+    TGoto(b) => [b],
+    TBranch(_, a, b) => [a, b],
+    TSwitch(_, cs, d) => {
+      let out: usize[] = [];
+      for (const c of cs) {
+        out.push(c.target);
+      }
+      out.push(d);
+      return out;
+    },
+    TReturn(_) => [],
+    TTrap(_) => []
+  };
+}
+
+// Parameters are Param (references) or initialised scalars; everything else starts Dead.
+function entryState(f: MFunction): State {
+  let ls: LState[] = [];
+  let i: usize = 0;
+  while (i < f.locals.length) {
+    if (i < f.paramCount) {
+      ls.push(mk(localClass(f, i) == CRef ? KParam : KInit, 0));
+    } else {
+      ls.push(mk(KDead, 0));
+    }
+    i += 1;
+  }
+  return State { ls: ls, holes: [] };
+}
+
+// Run block b from `st`; the result's st is the state after the terminator.
+function runBlock(p: MProgram, f: MFunction, b: usize, st: State): Cx {
+  let c = Cx { prog: p, f: f, blk: b, ins: 0, st: st, errs: [], warns: [] };
+  const blk = f.blocks[b];
+  let i: usize = 0;
+  while (i < blk.instrs.length) {
+    c.ins = i;
+    c = step(c, blk.instrs[i]);
+    i += 1;
+  }
+  c.ins = blk.instrs.length;
+  return stepTerm(c, blk.term);
+}
+
+function issue(f: MFunction, b: usize, i: usize, msg: string): VerifyIssue {
+  return VerifyIssue { func: f.name, block: b, instr: i, message: msg };
+}
+
+// Structural errors of function f (empty if well-formed).
+function wellFormed(p: MProgram, f: MFunction): VerifyIssue[] {
+  let out: VerifyIssue[] = [];
+  const m = wfFunction(f);
+  if (m != "") {
+    out.push(issue(f, 0, 0, m));
+    return out;
+  }
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk: MBlock = f.blocks[b];
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      const e = wfInstr(p, f, blk.instrs[i]);
+      if (e != "") {
+        out.push(issue(f, b, i, e));
+      }
+      i += 1;
+    }
+    const t = wfTerm(p, f, blk.term);
+    if (t != "") {
+      out.push(issue(f, b, blk.instrs.length, t));
+    }
+    b += 1;
+  }
+  return out;
+}
+
+// Fixpoint: the in-state of every reachable block (None = unreachable).
+function fixpoint(p: MProgram, f: MFunction): Option<State>[] {
+  let ins: Option<State>[] = [];
+  let queued: bool[] = [];
+  for (const _b of f.blocks) {
+    ins.push(None);
+    queued.push(false);
+  }
+  ins[0] = Some(entryState(f));
+  let work: usize[] = [0];
+  queued[0] = true;
+  while (work.length > 0) {
+    const b = work.pop().unwrap();
+    queued[b] = false;
+    const out = runBlock(p, f, b, ins[b].unwrap()).st;
+    for (const s of successors(f.blocks[b].term)) {
+      match (ins[s]) {
+        None => {
+          ins[s] = Some(out);
+          queued[s] = true;
+          work.push(s);
+        },
+        Some(old) => {
+          const nw = joinState(old, out);
+          if (!stateEq(nw, old)) {
+            ins[s] = Some(nw);
+            if (!queued[s]) {
+              queued[s] = true;
+              work.push(s);
+            }
+          }
+        }
+      }
+    }
+  }
+  return ins;
+}
+
+function verifyFunction(p: MProgram, f: MFunction): VerifyReport {
+  let rep = VerifyReport { errors: wellFormed(p, f), warnings: [] };
+  if (rep.errors.length > 0) {
+    return rep;
+  }
+  const ins = fixpoint(p, f);
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    match (ins[b]) {
+      None => {},
+      Some(st) => {
+        const c = runBlock(p, f, b, st);
+        for (const e of c.errs) {
+          rep.errors.push(e);
+        }
+        for (const w of c.warns) {
+          rep.warnings.push(w);
+        }
+        // Join rule: hole sets must agree on every edge into a block.
+        for (const s of successors(f.blocks[b].term)) {
+          if (!holesEq(c.st.holes, ins[s].unwrap().holes)) {
+            rep.errors.push(issue(f, b, f.blocks[b].instrs.length, "hole sets differ at the join into block " + s.toString()));
+          }
+        }
+      }
+    }
+    b += 1;
+  }
+  return rep;
+}
+
+export function verify(prog: MProgram): VerifyReport {
+  let rep = VerifyReport { errors: [], warnings: [] };
+  if (prog.main >= prog.functions.length) {
+    rep.errors.push(VerifyIssue { func: "<program>", block: 0, instr: 0, message: "main function index out of range" });
+  }
+  for (const f of prog.functions) {
+    const r = verifyFunction(prog, f);
+    for (const e of r.errors) {
+      rep.errors.push(e);
+    }
+    for (const w of r.warnings) {
+      rep.warnings.push(w);
+    }
+  }
+  return rep;
+}
