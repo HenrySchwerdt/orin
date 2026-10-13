@@ -60,9 +60,33 @@ contract clauses as compiler constructs (ADR-0012), the seed bootstrap and the C
 The vision's `@Sensitive`, `@Secret`, `@Range` etc. are compiler built-ins in the sense of ADR-0016
 (not user annotation processors); each gets an ADR when its phase starts.
 
+**D7 — Assurance levels and the compiler proof strategy (vision §20a).** Every claim carries a
+second, independent label next to its D1 status: the **assurance level** `MODEL_ONLY`,
+`TRANSLATION_VALIDATED`, `IMPLEMENTATION_VERIFIED` or `TESTED_ONLY` (bounded model checking counts
+as tested). The vision lists these together with the statuses. They are kept as two fields so that
+"VERIFIED, MODEL_ONLY" cannot be shortened to "VERIFIED". All Lean results today are `MODEL_ONLY`.
+`docs/assurance.md` is the claim-vs-evidence table and the proof-debt ledger (phase L0, done with
+this ADR).
+
+The phases are scheduled as follows:
+- **L1 (now, in parallel with the core):**
+  - a differential test of the Lean checker against `compiler/verify`;
+  - a mutation corpus that the verifier and the opt-diff must reject.
+
+  The pinned toolchain and the axiom/`sorry` audit already exist.
+- **L2 (after L1):** a translation validator for last-use moves and owned parameters, as the first
+  vertical proof slice.
+- **L3:** call rule, loops and arrays in the model, type soundness and VC soundness. Effects,
+  capability and information-flow analyses are proved within their own phase.
+- **L4:** runtime R3/R4.
+- **L5:** proof-carrying releases (phase 7).
+
+Established P0 gates fail closed. Unmet goals are listed as proof debt, not as green claims.
+
 ## Consequences
 - ADR-0016 gains a capability row; the 1.0 freeze waits for ADR-0021.
 - spec 15 / spec 18 / ADR-0015 use the D1 vocabulary.
+- `docs/assurance.md` is the claim/evidence ledger with proof debt (D7).
 - `docs/tcb.md` is the TCB inventory; it is updated whenever a component moves in or out of trust.
 - The reference payment/orders service (vision §14) is the end-to-end acceptance target for
   phases 2–7; the acceptance scenarios of vision §17 become test cases as their phase lands.
