@@ -1,0 +1,53 @@
+// Unit tests of compiler/check/quality.or (run: `orin test compiler/tests/quality_test.or`): the syntactic
+// contract-quality warnings of ADR-0028. The programs are loaded from the overlay (nothing is read from disk).
+
+import { assertEqString, assertEqBool } from "std:test";
+import { SourceFile } from "../diag";
+import { loadWithOverlay } from "../loader";
+import { qualityWarnings, allWarnings, anyStrictCode } from "../check";
+
+// The warning codes of `text` in order, space separated.
+function codes(text: string, strict: bool): string {
+  const o = loadWithOverlay("/virt/a.or", [SourceFile { path: "/virt/a.or", text: text }]);
+  return match (o.program) {
+    Some(p) => qualityWarnings(p, o.sm, strict).map(d => d.code).join(" "),
+    None => "load failed",
+  };
+}
+
+@Test
+function trivialForms(): void {
+  assertEqString(codes("@Requires(true)\nfunction f(x: int): int { return x; }\nfunction main(): void {}\n", false), "W0452", "true");
+  assertEqString(codes("@Requires(x == x)\nfunction f(x: int): int { return x; }\nfunction main(): void {}\n", false), "W0452", "x == x");
+  assertEqString(codes("@Requires(a.length >= 0)\nfunction f(a: int[]): int { return 1; }\nfunction main(): void {}\n", false), "W0452", "length");
+  assertEqString(codes("@Requires(x > 0 && true)\nfunction f(x: int): int { return x; }\nfunction main(): void {}\n", false), "W0452", "conjunct");
+}
+
+@Test
+function nonTrivialForms(): void {
+  assertEqString(codes("@Requires(x > 0)\nfunction f(x: int): int { return x; }\nfunction main(): void {}\n", false), "", "x > 0");
+  assertEqString(codes("@Requires(f == f)\nfunction g(f: float): int { return 1; }\nfunction main(): void {}\n", false), "", "float NaN test");
+  assertEqString(codes("type S = { length: int; };\n@Requires(s.length >= 0)\nfunction g(s: S): int { return 1; }\nfunction main(): void {}\n", false), "", "record field");
+}
+
+@Test
+function ensuresMustObserve(): void {
+  assertEqString(codes("@Ensures(x > 0)\nfunction f(x: int): int { return x; }\nfunction main(): void {}\n", false), "W0451", "restates input");
+  assertEqString(codes("@Ensures(result > x)\nfunction f(x: int): int { return x + 1; }\nfunction main(): void {}\n", false), "", "result");
+  assertEqString(codes("class C { n: int = 0;\n @Ensures(this.n > 0)\n set(): void { this.n = 1; } }\nfunction main(): void {}\n", false), "", "this in a method");
+}
+
+@Test
+function invariantMustMentionThis(): void {
+  assertEqString(codes("@Invariant(1 > 0)\nclass C { n: int = 0; }\nfunction main(): void {}\n", false), "W0452 W0450", "constant");
+  assertEqString(codes("@Invariant(this.n >= 0)\nclass C { n: int = 0; }\nfunction main(): void {}\n", false), "", "field");
+}
+
+@Test
+function strictOnlyWhenAsked(): void {
+  const src = "class C { n: int = 0;\n bump(): void { this.n += 1; } }\nfunction main(): void {}\n";
+  assertEqString(codes(src, false), "", "off");
+  assertEqString(codes(src, true), "W0470 W0471", "on");
+  assertEqBool(anyStrictCode([]), false, "no codes");
+  assertEqBool(allWarnings([]), true, "empty is all warnings");
+}

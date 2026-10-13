@@ -27,6 +27,8 @@ COMPILE_TIMEOUT = 120
 HEADER_EXIT = re.compile(r"^//\s*exit:\s*(-?\d+)\s*$")
 HEADER_ERROR = re.compile(r"^//\s*error:\s*(E\d{4})\s*$")
 HEADER_FLAGS = re.compile(r"^//\s*flags:\s*(.*?)\s*$")
+HEADER_WARNS = re.compile(r"^//\s*warns:\s*(.*?)\s*$")
+WARNING_CODE = re.compile(r"warning\[(W\d{4})\]")
 HEADER_STDERR = re.compile(r"^//\s*stderr:\s*(.*?)\s*$")
 
 
@@ -35,7 +37,7 @@ def first_line(path):
         return f.readline().strip()
 
 
-def header_lines(path, limit=6):
+def header_lines(path, limit=16):
     """The leading `//` comment lines of a test (its header block)."""
     out = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -112,6 +114,7 @@ def run_test(args, label, test):
     hdr = first_line(entry)
     hdrs = header_lines(entry)
     flags = []          # `// flags: --check-contracts` (any header line): extra compiler flags
+    want_warns = None   # `// warns: W0450 W0452` (or `none`): the warning codes of the compile, as a sorted list
     want_stderr = []    # `// stderr: text` (any header line): stderr of the run must contain text
     for h in hdrs:
         m = HEADER_FLAGS.match(h)
@@ -120,6 +123,9 @@ def run_test(args, label, test):
         m = HEADER_STDERR.match(h)
         if m:
             want_stderr.append(m.group(1))
+        m = HEADER_WARNS.match(h)
+        if m:
+            want_warns = [] if m.group(1) == "none" else sorted(m.group(1).split())
 
     if kind == "errors":
         m = HEADER_ERROR.match(hdr)
@@ -151,6 +157,10 @@ def run_test(args, label, test):
         return tag, False, "compiler timed out"
     if rc != 0:
         return tag, False, "compile failed (exit %s); stderr head:\n%s" % (rc, head(err))
+    if want_warns is not None:
+        got_warns = sorted(WARNING_CODE.findall(err))
+        if got_warns != want_warns:
+            return tag, False, "warnings differ: expected %s, got %s; stderr head:\n%s" % (want_warns, got_warns, head(err))
 
     if args.backend == "llvm":
         cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime"]
