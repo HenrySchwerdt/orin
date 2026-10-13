@@ -2,6 +2,8 @@
 // positions, SemanticIndex queries on a hand-built index). Prints `ok` or one line per failure.
 // Build: build/bootstrap/orin2 compile compiler/tests/analysis_test.or -o x.c && cc -O1 -w -I runtime x.c runtime/orin_runtime.c platform/orin_platform.c
 
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
 import {
   newWorkspace, openFile, changeFile, closeFile, fileText, openPaths, analyze, diagsForPath, documentSymbols,
   keywordCompletions, declCompletions, offsetToPos, posToOffset, definitionAt, hoverAt, referencesTo,
@@ -92,36 +94,36 @@ function testPositions(f: string[]): string[] {
   return fails;
 }
 
-function testAnalyze(f: string[]): string[] {
+function testAnalyze(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   // Valid file without main: no diagnostics (synthetic main).
   let ws = openFile(newWorkspace(), "/v/ok.or", "export function f(x: int): int { return x + 1; }");
-  let a = analyze(ws, "/v/ok.or");
+  let a = analyze(fs, ws, "/v/ok.or");
   fails = eqi(fails, "ok diags", a.diags.length, 0);
   fails = eqi(fails, "ok rev", a.revision.toUsize(), 1);
   // Type error, position preserved.
   ws = changeFile(ws, "/v/ok.or", "function f(): int { return true; }");
-  a = analyze(ws, "/v/ok.or");
+  a = analyze(fs, ws, "/v/ok.or");
   fails = eqi(fails, "terr n", a.diags.length, 1);
   if (a.diags.length == 1) {
     fails = eq(fails, "terr", diagLine(a.diags[0]), "/v/ok.or E0400 27-31");
   }
   // Syntax error.
   ws = changeFile(ws, "/v/ok.or", "function f( {");
-  a = analyze(ws, "/v/ok.or");
+  a = analyze(fs, ws, "/v/ok.or");
   fails = eqi(fails, "syn n", a.diags.length, 1);
   if (a.diags.length == 1) {
     fails = eq(fails, "syn code", a.diags[0].code, "E0200");
   }
   // Existing main is respected (E0412 for a wrong signature is reported).
   ws = changeFile(ws, "/v/ok.or", "function main(x: int): void { }");
-  a = analyze(ws, "/v/ok.or");
+  a = analyze(fs, ws, "/v/ok.or");
   fails = eqi(fails, "main sig n", a.diags.length, 1);
   // Cross-module: the error is in the imported file.
   ws = newWorkspace();
   ws = openFile(ws, "/v/main.or", "import { f } from \"./lib\";\nfunction main(): void { console.log(f(1).toString()); }");
   ws = openFile(ws, "/v/lib.or", "export function f(x: int): int { return \"s\"; }");
-  a = analyze(ws, "/v/main.or");
+  a = analyze(fs, ws, "/v/main.or");
   fails = eqi(fails, "x n", a.diags.length, 1);
   if (a.diags.length == 1) {
     fails = eq(fails, "x diag", diagLine(a.diags[0]), "/v/lib.or E0400 40-43");
@@ -130,18 +132,18 @@ function testAnalyze(f: string[]): string[] {
   fails = eqi(fails, "x lib", diagsForPath(a, "/v/./lib.or").length, 1);
   // Fix the imported file: clean.
   ws = changeFile(ws, "/v/lib.or", "export function f(x: int): int { return x; }");
-  a = analyze(ws, "/v/main.or");
+  a = analyze(fs, ws, "/v/main.or");
   fails = eqi(fails, "fixed", a.diags.length, 0);
   // Imported name that is not exported -> E0300 in the importer.
   ws = changeFile(ws, "/v/lib.or", "function f(x: int): int { return x; }");
-  a = analyze(ws, "/v/main.or");
+  a = analyze(fs, ws, "/v/main.or");
   fails = eqi(fails, "unexported n", a.diags.length, 1);
   if (a.diags.length == 1) {
     fails = eq(fails, "unexported", a.diags[0].code + " " + a.diags[0].path, "E0300 /v/main.or");
   }
   // Missing module.
   ws = changeFile(ws, "/v/main.or", "import { g } from \"./nothere\";\nfunction main(): void { }");
-  a = analyze(ws, "/v/main.or");
+  a = analyze(fs, ws, "/v/main.or");
   fails = eqi(fails, "missing n", a.diags.length, 1);
   if (a.diags.length == 1) {
     fails = eq(fails, "missing", a.diags[0].code, "E0301");
@@ -149,11 +151,11 @@ function testAnalyze(f: string[]): string[] {
   return fails;
 }
 
-function testSymbols(f: string[]): string[] {
+function testSymbols(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const src = "import { g } from \"./lib\";\nexport type P = { x: int; y: int; };\ntype S = A(int) | B;\ntype N = string;\nconst K: int = 3;\nfunction h(a: int, b: string): bool { return true; }\n";
   const ws = openFile(newWorkspace(), "/s/a.or", src);
-  const ss = documentSymbols(ws, "/s/a.or");
+  const ss = documentSymbols(fs, ws, "/s/a.or");
   fails = eq(fails, "top names", symNames(ss), "P,S,N,K,h");
   if (ss.length == 5) {
     fails = eq(fails, "P children", symNames(ss[0].children), "x,y");
@@ -168,13 +170,13 @@ function testSymbols(f: string[]): string[] {
       + match (ss[4].kind) { DkFunction => "fun", _ => "?" }, "recunialiconfun");
   }
   const bad = openFile(newWorkspace(), "/s/bad.or", "function (");
-  fails = eqi(fails, "bad syms", documentSymbols(bad, "/s/bad.or").length, 0);
+  fails = eqi(fails, "bad syms", documentSymbols(fs, bad, "/s/bad.or").length, 0);
   fails = eqi(fails, "kw count", keywordCompletions().length, 22);
 
   // Completions: own decls (+ union variants) and imported names (+ imported variants).
   let ws2 = openFile(newWorkspace(), "/s/lib.or", "export type Shape = Circle(int) | Dot;\nexport function area(s: Shape): int { return 0; }\nfunction hidden(): void { }\n");
   ws2 = openFile(ws2, "/s/main.or", "import { Shape, area, hidden, nothing } from \"./lib\";\ntype T = { q: int; };\nfunction main(): void { }\n");
-  const cs = declCompletions(ws2, "/s/main.or");
+  const cs = declCompletions(fs, ws2, "/s/main.or");
   fails = eq(fails, "completions", names(cs), "T,main,Shape,Circle,Dot,area,hidden,nothing");
   if (cs.length == 8) {
     fails = eq(fails, "area detail", cs[5].detail, "function area(s: Shape): int");
@@ -257,11 +259,11 @@ function testIndex(f: string[]): string[] {
 
 // Semantic index of closures (ADR-0011): arrow parameters and captured variables resolve, array
 // methods with arrow arguments check, and the types of closure bodies are indexed.
-function testClosures(f: string[]): string[] {
+function testClosures(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const text = "function main(): void {\n  const k = 3;\n  const g = (x: int): int => x + k;\n  const ys = [1, 2].map(y => y * k);\n  console.log(g(1).toString() + ys.length.toString());\n}\n";
   const ws = openFile(newWorkspace(), "/c/a.or", text);
-  const a = analyze(ws, "/c/a.or");
+  const a = analyze(fs, ws, "/c/a.or");
   fails = eqi(fails, "closure diags", a.diags.length, 0);
   if (a.index.isNone()) {
     return eq(fails, "closure index", "none", "some");
@@ -291,11 +293,11 @@ function testClosures(f: string[]): string[] {
 
 // Contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses, names in
 // clauses resolve (including loop clauses).
-function testContracts(f: string[]): string[] {
+function testContracts(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const text = "@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int { return a; }\nfunction main(): void {\n  let i = 0;\n  @Invariant(i >= 0)\n  while (i < 3) { i += 1; }\n  console.log(add(1).toString());\n}\n";
   const ws = openFile(newWorkspace(), "/k/a.or", text);
-  const a = analyze(ws, "/k/a.or");
+  const a = analyze(fs, ws, "/k/a.or");
   fails = eqi(fails, "contracts diags", a.diags.length, 0);
   if (a.index.isNone()) {
     return eq(fails, "contracts index", "none", "some");
@@ -314,13 +316,13 @@ function testContracts(f: string[]): string[] {
   fails = eq(fails, "local in loop @Invariant", definitionAt(idx, 0, iUse).unwrapOr(span(0, 0, 0)).start.toString(), iDecl.toString());
   // Errors carry the contract codes.
   const bad = openFile(newWorkspace(), "/k/b.or", "@Requires(a + 1)\nfunction f(a: int): int { return a; }\n");
-  const b = analyze(bad, "/k/b.or");
+  const b = analyze(fs, bad, "/k/b.or");
   fails = eqi(fails, "E0414 n", b.diags.length, 1);
   if (b.diags.length == 1) {
     fails = eq(fails, "E0414", b.diags[0].code, "E0414");
   }
   const impure = openFile(newWorkspace(), "/k/c.or", "function p(x: int): bool { console.log(\"x\"); return true; }\n@Requires(p(a))\nfunction f(a: int): int { return a; }\n");
-  const c = analyze(impure, "/k/c.or");
+  const c = analyze(fs, impure, "/k/c.or");
   if (c.diags.length == 1) {
     fails = eq(fails, "E0416", c.diags[0].code, "E0416");
   } else {
@@ -329,14 +331,18 @@ function testContracts(f: string[]): string[] {
   return fails;
 }
 
-function main(): void {
+function main(host: Host): void {
+  useFs(host, fs => { run(fs); });
+}
+
+function run(fs: FsGrant): void {
   let f: string[] = [];
-  f = testContracts(f);
-  f = testClosures(f);
+  f = testContracts(fs, f);
+  f = testClosures(fs, f);
   f = testWorkspace(f);
   f = testPositions(f);
-  f = testAnalyze(f);
-  f = testSymbols(f);
+  f = testAnalyze(fs, f);
+  f = testSymbols(fs, f);
   f = testIndex(f);
   if (f.length == 0) {
     console.log("ok");

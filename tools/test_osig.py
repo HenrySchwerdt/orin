@@ -241,6 +241,44 @@ def main():
     rc, h4, _ = run(orin, ["diff", "--base", "tests/osig/accept/base", "--head", "tests/osig/accept/head", "--format=html"])
     check("<script" not in h4, "no script element")
 
+    # ---- 7. primitive I/O edges (ADR-0027) ---------------------------------------------------------
+    rc, gio, err = run(orin, ["graph", "tests/osig/io/main.or"])
+    check(rc == 0, "graph of the I/O program exits 0 (%s)" % err)
+    sio = json.loads(gio)
+    perf = {(e["src"].split("::")[-1], e["dst"], e["evidence"], e["via"]) for e in sio["edges"] if e["kind"] == "PERFORMS_IO"}
+    want_io = [
+        ("load", "~io:Fs.ReadFile", "MUST", "INPUT"), ("save", "~io:Fs.WriteFile", "MUST", "OUTPUT"),
+        ("stream", "~io:Fs.Open", "MUST", "CONTROL"), ("stream", "~io:Fs.Read", "MAY", "INPUT"),   # inside a closure: MAY
+        ("tick", "~io:Clock.Now", "MUST", "INPUT"), ("run", "~io:Process.Args", "MUST", "INPUT"),
+        ("run", "~io:Process.Spawn", "MUST", "CONTROL"), ("run", "~io:Stdio.Read", "MUST", "INPUT"),
+        ("run", "~io:Console.Write", "MUST", "OUTPUT"), ("scoped", "~io:Fs.Narrow", "MUST", "CONTROL"),
+        ("main", "~io:Host.Acquire", "MUST", "CONTROL"),
+    ]
+    for w in want_io:
+        check(w in perf, "PERFORMS_IO edge %s" % (w,))
+    check(not any(src == "pure" for (src, _d, _e, _v) in perf), "a pure function has no PERFORMS_IO edge")
+    eff = {n["id"]: n for n in sio["nodes"] if n["kind"] == "Effect"}
+    check(eff["~io:Console.Write"]["sig"] == "OUTPUT; grant: ambient" and eff["~io:Fs.ReadFile"]["sig"] == "INPUT; grant: FsGrant",
+          "Effect nodes carry the direction and the grant family")
+    check(all(e["evidence"] in ("MUST", "MAY") for e in sio["edges"] if e["kind"] == "PERFORMS_IO"),
+          "primitive I/O edges are never UNKNOWN")
+    rc, gpure, _ = run(orin, ["graph", "tests/next/run/cap_pure_no_grants.or"])
+    spure = json.loads(gpure)
+    pure_io = {e["dst"] for e in spure["edges"] if e["kind"] == "PERFORMS_IO"}
+    check(pure_io == {"~io:Console.Write"}, "a pure calculation has no effect but the ambient console output (%s)" % sorted(pure_io))
+    check(not any(e["dst"].startswith("~io:") and e["dst"] != "~io:Console.Write" for e in spure["edges"]),
+          "a program without grants performs no grant-requiring I/O")
+    # the diff reports a new I/O call as a new edge
+    iobase = os.path.join(tmp, "iobase")
+    iohead = os.path.join(tmp, "iohead")
+    os.makedirs(iobase)
+    os.makedirs(iohead)
+    src_io = open(os.path.join(ROOT, "tests", "osig", "io", "main.or")).read()
+    open(os.path.join(iobase, "main.or"), "w").write(src_io)
+    open(os.path.join(iohead, "main.or"), "w").write(src_io.replace("function pure(n: int): int {\n  return n * 2;", "function pure(n: int): int {\n  console.error(\"x\");\n  return n * 2;"))
+    rc, dtext, derr = run(orin, ["diff", "--base", os.path.join(iobase, "main.or"), "--head", os.path.join(iohead, "main.or")])
+    check(rc == 0 and "+ PERFORMS_IO [MUST] (OUTPUT)" in dtext and "~io:Console.Write" in dtext, "diff shows the new primitive I/O edge (%s)" % derr)
+
     shutil.rmtree(tmp, ignore_errors=True)
     print("%d checks, %d failures" % (checks, len(failures)))
     sys.exit(1 if failures else 0)

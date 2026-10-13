@@ -16,7 +16,10 @@
 //   compile/mir/verify load the std prelude (std/, spec 19 R1) implicitly: moved built-ins call
 //   Orin code. --c-builtins skips it and keeps the C runtime path.
 
-import { args, exit } from "std:process";
+import { Host, useHost } from "std:host";
+import { FsGrant } from "std:fs";
+import { ProcessGrant, args, exit } from "std:process";
+import { StdioGrant } from "std:io";
 import { writeFile } from "std:fs";
 import { SourceMap, Diagnostic, render } from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
@@ -90,33 +93,41 @@ function runVerify(prog: MProgram, verbose: bool): usize {
   return rep.errors.length;
 }
 
-function main(): void {
-  const all = args();
+// The compiler needs the whole file system (it reads sources and writes C / LLVM IR next to them), the process grant
+// (`orin test`, `orin mcp` and `orin verify --contracts` run the C compiler and the solver; every command reads its
+// arguments) and stdio (`orin lsp`, `orin mcp`); it does not use the clock. The grants come from the host policy
+// (ORIN_DENY, ADR-0027).
+function main(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => { driver(fs, proc, stdio); });
+}
+
+function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
+  const all = args(proc);
   if (all.length >= 1 && all[0] == "fmt") {
-    const code = runFmt(all.slice(1, all.length));
+    const code = runFmt(fs, all.slice(1, all.length));
     if (code != 0) {
       exit(code);
     }
     return;
   }
   if (all.length >= 1 && all[0] == "graph") {
-    exit(runGraph(all.slice(1, all.length)));
+    exit(runGraph(fs, all.slice(1, all.length)));
     return;
   }
   if (all.length >= 1 && all[0] == "diff") {
-    exit(runDiff(all.slice(1, all.length)));
+    exit(runDiff(fs, all.slice(1, all.length)));
     return;
   }
   if (all.length >= 1 && all[0] == "lsp") {
-    exit(runLsp());
+    exit(runLsp(fs, stdio));
     return;
   }
   if (all.length >= 1 && all[0] == "test") {
-    exit(runTestCommand(all.slice(1, all.length)));
+    exit(runTestCommand(fs, proc, all.slice(1, all.length)));
     return;
   }
   if (all.length >= 1 && all[0] == "mcp") {
-    exit(runMcp(all.slice(1, all.length)));
+    exit(runMcp(fs, proc, stdio, all.slice(1, all.length)));
     return;
   }
   let json = false;
@@ -194,7 +205,7 @@ function main(): void {
   }
   const usePrelude = !cBuiltins && cmd != "check" && cmd != "api";
   const noOverlay: SourceFile[] = [];
-  const loaded = loadWithRoots(entry, noOverlay, usePrelude ? preludeRoots() : noPreludeRoots());
+  const loaded = loadWithRoots(fs, entry, noOverlay, usePrelude ? preludeRoots() : noPreludeRoots());
   if (loaded.diags.length > 0) {
     report(loaded.sm, loaded.diags, json);
     return;
@@ -211,7 +222,7 @@ function main(): void {
       console.log(snap.substring(0, snap.length - 1));
       return;
     }
-    const old = readFile(checkSnap);
+    const old = readFile(fs, checkSnap);
     if (old.isErr()) {
       console.error("error: cannot read " + checkSnap + ": " + old.unwrapErr());
       exit(2);
@@ -261,7 +272,7 @@ function main(): void {
     return;
   }
   if (cmd == "verify" && verifyContractsFlag) {
-    const rep = verifyContracts(program, loaded.sm, z3);
+    const rep = verifyContracts(fs, proc, program, loaded.sm, z3);
     console.log(json ? reportJson(rep) : reportText(rep));
     if (failedCount(rep) > 0 || (strict && unknownCount(rep) > 0)) {
       exit(1);
@@ -282,7 +293,7 @@ function main(): void {
     return;
   }
   c = llvm ? emitLlvm(pruneProgram(mir)) : emitC(pruneProgram(mir));
-  const written = writeFile(argv[3], c);
+  const written = writeFile(fs, argv[3], c);
   if (written.isErr()) {
     console.error("error: cannot write " + argv[3] + ": " + written.unwrapErr());
     exit(1);

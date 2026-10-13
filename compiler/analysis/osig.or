@@ -6,6 +6,7 @@
 // paths (file names are relative to the package's source root), no timestamps, no compiler version.
 // The `hash` is a 62-bit content fingerprint of the body, for equality checks -- not a cryptographic digest.
 
+import { FsGrant } from "std:fs";
 import { LoadedProgram, loadWithRoots, noPreludeRoots, isInside } from "../loader";
 import { SourceFile, SourceMap, Span, render } from "../diag";
 import { Item, ContractClause, ClassMember } from "../syntax";
@@ -27,7 +28,7 @@ export type OSpan = { file: string; line: usize; col: usize; endLine: usize; end
 
 export type ONode = {
   id: string;
-  kind: string;        // Package Module Function Method Class Interface Record Union Alias Const Field Variant Contract Unknown
+  kind: string;        // Package Module Function Method Class Interface Record Union Alias Const Field Variant Contract Unknown Effect
   name: string;
   module: string;      // module id ("(root)" for the root module); "" for Package and Unknown
   owner: string;       // id of the containing node ("" for none)
@@ -38,7 +39,7 @@ export type ONode = {
 };
 
 export type OEdge = {
-  kind: string;        // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT
+  kind: string;        // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT PERFORMS_IO
   src: string;
   dst: string;
   ev: string;          // MUST | MAY | UNKNOWN
@@ -49,6 +50,15 @@ export type OEdge = {
 export type OsigGraph = { schema: string; package: string; hash: string; nodes: ONode[]; edges: OEdge[]; };
 
 export const UNKNOWN_ID: string = "~unknown";
+
+function hasStr(xs: string[], s: string): bool {
+  for (const x of xs) {
+    if (x == s) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---- sorting ------------------------------------------------------------------------------------------
 
@@ -556,6 +566,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
   }
   // calls (plus the implementations of an interface method that a call may reach)
   let usesUnknown = false;
+  let seenIo: string[] = [];
   for (const c of idx.calls) {
     if (ids[c.caller] == "") {
       continue;
@@ -586,8 +597,22 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
         }
       },
       None => {
-        usesUnknown = true;
-        raw = addEdge(raw, "CALLS", ids[c.caller], UNKNOWN_ID, "UNKNOWN", c.via, sp);
+        if (c.via.startsWith("io:")) {
+          // a primitive I/O event (ADR-0027): PERFORMS_IO to a compiler-owned Effect node; the edge's `via` is the direction
+          const parts = c.via.substring(3, c.via.length).split("|");
+          const eid = "~io:" + parts[0];
+          raw = addEdge(raw, "PERFORMS_IO", ids[c.caller], eid, c.ev, parts[1], sp);
+          if (!hasStr(seenIo, eid)) {
+            seenIo.push(eid);
+            raw.nodes.push(ONode {
+              id: eid, kind: "Effect", name: parts[0], module: "", owner: "",
+              sig: parts[1] + "; grant: " + parts[2], exported: false, entry: false, span: noSpan()
+            });
+          }
+        } else {
+          usesUnknown = true;
+          raw = addEdge(raw, "CALLS", ids[c.caller], UNKNOWN_ID, "UNKNOWN", c.via, sp);
+        }
       }
     }
   }
@@ -778,21 +803,21 @@ export function parseOsig(text: string): Result<OsigGraph, string> {
 
 // The OSIG of `path`: a snapshot file (`.json`), an entry file (`.or`) or a package directory, checked with
 // the self-hosted checker (no std prelude, as `orin api`). Errors are rendered diagnostics.
-export function loadOsig(path: string): Result<OsigGraph, string> {
-  return loadOsigIn(path, "");
+export function loadOsig(fs: FsGrant, path: string): Result<OsigGraph, string> {
+  return loadOsigIn(fs, path, "");
 }
 
 // Same, but every file the program reads must lie inside `root` ("" = no restriction; MCP passes its root).
-export function loadOsigIn(path: string, root: string): Result<OsigGraph, string> {
+export function loadOsigIn(fs: FsGrant, path: string, root: string): Result<OsigGraph, string> {
   if (path.endsWith(".json")) {
-    const t = readFile(path);
+    const t = readFile(fs, path);
     if (t.isErr()) {
       return Err("cannot read " + path + ": " + t.unwrapErr());
     }
     return parseOsig(t.unwrap());
   }
   const noOverlay: SourceFile[] = [];
-  const loaded = loadWithRoots(path, noOverlay, noPreludeRoots());
+  const loaded = loadWithRoots(fs, path, noOverlay, noPreludeRoots());
   if (loaded.diags.length > 0) {
     let msgs: string[] = [];
     for (const d of loaded.diags) {

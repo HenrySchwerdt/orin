@@ -220,9 +220,21 @@ function valueOk(p: MProgram, f: MFunction, x: usize, v: Operand): bool {
 
 // ---- resource handles (v1.8, ADR-0025): the structural half of the rules (the dataflow half is in rules.or) ----
 
-// Builtins that take a handle as their first argument (every file builtin but the one that creates handles).
+// Builtins that take a handle as their first argument: the file builtins (but not the one that creates files out of
+// a path: that is an opener below) and the std I/O builtins, which take the capability grant that authorises them
+// (ADR-0027: a grant is a handle, so a grant can be neither duplicated nor stored nor returned, exactly like a file).
 function takesHandle(b: Builtin): bool {
   return match (b) {
+    BFsReadFile => true,
+    BFsWriteFile => true,
+    BFsExists => true,
+    BProcessArgs => true,
+    BIoReadBytes => true,
+    BIoReadLine => true,
+    BIoWriteStdout => true,
+    BIoShell => true,
+    BTimeNowMillis => true,
+    BGrantRevoke => true,
     BFileIsOpen => true,
     BFileOpenError => true,
     BFileClose => true,
@@ -236,8 +248,20 @@ function takesHandle(b: Builtin): bool {
   };
 }
 
+// The builtins that define a handle: they take the authorising grant as first argument (BFileOpen: the file grant;
+// BGrantFs..: the Host; BGrantUnder..: the parent grant) and nothing else that is a handle.
 function isOpenB(b: Builtin): bool {
-  return match (b) { BFileOpen => true, _ => false };
+  return match (b) {
+    BFileOpen => true,
+    BGrantFs => true,
+    BGrantProcess => true,
+    BGrantStdio => true,
+    BGrantClock => true,
+    BGrantUnder => true,
+    BGrantReadOnly => true,
+    BGrantArgsOnly => true,
+    _ => false
+  };
 }
 
 // The destination local an instruction defines, if any.
@@ -269,7 +293,7 @@ function dstOf(ins: Instr): Option<usize> {
 }
 
 // First violated handle rule of `ins` ("" if none). Runs after the other structural checks, so every index is in range.
-//   * a handle local is defined only by IBuiltin(Some(h), BFileOpen, ..): never by a copy, move, borrow, call result,
+//   * a handle local is defined only by IBuiltin(Some(h), <opener>, ..) (BFileOpen, BGrant*): never by a copy, move, borrow, call result,
 //     field/element read, arithmetic ...;
 //   * BFileOpen defines exactly a handle; the other file builtins take a handle as first argument and non-handles
 //     after it; no other builtin sees a handle (no conversion, comparison or printing of one);
@@ -281,10 +305,10 @@ function handleMsg(f: MFunction, ins: Instr): string {
         match (ins) {
           IBuiltin(_dst, b, _args) => {
             if (!isOpenB(b)) {
-              return "IBuiltin: only BFileOpen may define a resource handle";
+              return "IBuiltin: only BFileOpen and the BGrant* builtins may define a resource handle";
             }
           },
-          _ => { return "a resource handle is defined only by BFileOpen (it cannot be copied, moved, borrowed, read from a field or returned by a call)"; }
+          _ => { return "a resource handle is defined only by BFileOpen / BGrant* (it cannot be copied, moved, borrowed, read from a field or returned by a call)"; }
         }
       }
     },
@@ -293,10 +317,15 @@ function handleMsg(f: MFunction, ins: Instr): string {
   match (ins) {
     IBuiltin(dst, b, args) => {
       if (isOpenB(b)) {
-        if (!noHandles(f, args)) { return "BFileOpen: arguments cannot be resource handles"; }
+        if (args.length == 0 || !isHandleOp(f, args[0])) { return "handle-opening builtin: the first argument must be the authorising resource handle (a grant)"; }
+        let k: usize = 1;
+        while (k < args.length) {
+          if (isHandleOp(f, args[k])) { return "handle-opening builtin: only the first argument can be a resource handle"; }
+          k += 1;
+        }
         match (dst) {
-          Some(d) => { return localClass(f, d) == CHandle ? "" : "BFileOpen: the destination must be a handle local"; },
-          None => { return "BFileOpen: the handle must be bound to a local (it would never be closed)"; }
+          Some(d) => { return localClass(f, d) == CHandle ? "" : "handle-opening builtin: the destination must be a handle local"; },
+          None => { return "handle-opening builtin: the handle must be bound to a local (it would never be closed)"; }
         }
       }
       if (takesHandle(b)) {

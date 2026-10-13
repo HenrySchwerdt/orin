@@ -163,3 +163,125 @@ void harness_fmt_extremes(void) {
     n = orin_platform_fmt_i64(b, -1);
     assert(is(b, n, "-1"));
 }
+
+/* ---- host policy (ADR-0027): a typo or any character outside [a-z,] rejects the whole policy; a policy that
+ *      is accepted only contains defined family bits (never a silent "allow" through a malformed element). */
+void harness_policy_parse(void) {
+    char spec[8];
+    size_t n;
+    __CPROVER_assume(n <= 8);
+    unsigned mask = 0xdeadbeef;
+    int r = orin_platform_policy_parse(spec, n, &mask);
+    assert(r == 0 || r == ORIN_PLATFORM_EINVAL);
+    assert((mask & ~31u) == 0);
+    if (r == ORIN_PLATFORM_EINVAL) assert(mask == 0);
+    if (n == 0) assert(r == 0 && mask == 0);
+    for (size_t i = 0; i < n; i++)
+        if (!((spec[i] >= 'a' && spec[i] <= 'z') || spec[i] == ',')) assert(r == ORIN_PLATFORM_EINVAL);
+    if (r == 0 && n > 0) assert(mask != 0); /* every element named a family */
+    /* the exact names */
+    unsigned m;
+    assert(orin_platform_policy_parse("fs", 2, &m) == 0 && m == ORIN_PLATFORM_FAM_FS);
+    assert(orin_platform_policy_parse("net,clock", 9, &m) == 0 && m == (ORIN_PLATFORM_FAM_NET | ORIN_PLATFORM_FAM_CLOCK));
+    assert(orin_platform_policy_parse("fs,", 3, &m) == ORIN_PLATFORM_EINVAL);
+}
+
+/* ---- path normalisation: the result is a canonical absolute path (the form the scope check relies on):
+ *      starts with '/', no empty / "." / ".." component, no trailing '/', never longer than the input,
+ *      NUL-terminated inside the buffer (cap == plen + 1: no write past it), and idempotent. */
+enum { PN = 7 };
+static void nondet_path(char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c;
+        __CPROVER_assume(c == '/' || c == '.' || c == 'a');
+        p[i] = (char)c;
+    }
+}
+
+static void check_canonical(const char *o, size_t len) {
+    assert(len >= 1 && o[0] == '/' && o[len] == 0);
+    for (size_t i = 0; i < len; i++) assert(o[i] != 0);
+    for (size_t i = 0; i + 1 < len; i++) assert(!(o[i] == '/' && o[i + 1] == '/'));
+    if (len > 1) assert(o[len - 1] != '/');
+    size_t i = 1;
+    while (i < len) {
+        size_t s = i;
+        while (i < len && o[i] != '/') i++;
+        size_t n = i - s;
+        assert(n >= 1);
+        assert(!(n == 1 && o[s] == '.'));
+        assert(!(n == 2 && o[s] == '.' && o[s + 1] == '.'));
+        i++;
+    }
+}
+
+void harness_path_normalize(void) {
+    char p[PN];
+    size_t n;
+    __CPROVER_assume(n >= 1 && n <= PN);
+    nondet_path(p, n);
+    char o[PN + 1];
+    int64_t r = orin_platform_path_normalize(p, n, o, n + 1);
+    if (p[0] != '/') {
+        assert(r == -1);
+        return;
+    }
+    assert(r >= 1 && (size_t)r <= n);
+    check_canonical(o, (size_t)r);
+    char o2[PN + 1];
+    int64_t r2 = orin_platform_path_normalize(o, (size_t)r, o2, (size_t)r + 1);
+    assert(r2 == r);
+    for (int64_t i = 0; i < r; i++) assert(o2[i] == o[i]);
+    assert(orin_platform_path_normalize(p, n, o, n) == -1); /* too small: refused, not overrun */
+}
+
+/* ---- scope containment: agrees with the component-wise prefix definition, is reflexive and transitive
+ *      (so narrowing a scope inside a scope can never reach outside it), and "/a/bc" is not inside "/a/b". */
+static size_t comps(const char *o, size_t len, size_t *st, size_t *en) {
+    size_t k = 0, i = 1;
+    while (i < len) {
+        size_t s = i;
+        while (i < len && o[i] != '/') i++;
+        st[k] = s;
+        en[k] = i;
+        k++;
+        i++;
+    }
+    return k;
+}
+
+static int ref_within(const char *s, size_t sl, const char *p, size_t pl) {
+    size_t ss[PN], se[PN], ps[PN], pe[PN];
+    size_t sk = comps(s, sl, ss, se), pk = comps(p, pl, ps, pe);
+    if (sk > pk) return 0;
+    for (size_t k = 0; k < sk; k++) {
+        if (se[k] - ss[k] != pe[k] - ps[k]) return 0;
+        for (size_t i = 0; i < se[k] - ss[k]; i++)
+            if (s[ss[k] + i] != p[ps[k] + i]) return 0;
+    }
+    return 1;
+}
+
+static size_t nondet_norm(char *o, size_t max) {
+    char p[PN];
+    size_t n;
+    __CPROVER_assume(n >= 1 && n <= max);
+    nondet_path(p, n);
+    __CPROVER_assume(p[0] == '/');
+    int64_t r = orin_platform_path_normalize(p, n, o, n + 1);
+    assert(r >= 1);
+    return (size_t)r;
+}
+
+void harness_path_within(void) {
+    char a[PN + 1], b[PN + 1], c[PN + 1];
+    /* 4-character paths (<= 2 components): 7 characters need ~10 minutes, 5 about 2 minutes, for the three-way check */
+    size_t al = nondet_norm(a, 4), bl = nondet_norm(b, 4);
+    int w = orin_platform_path_within(a, al, b, bl);
+    assert(w == ref_within(a, al, b, bl));
+    assert(orin_platform_path_within(a, al, a, al) == 1);
+    size_t cl = nondet_norm(c, 4);
+    if (w && orin_platform_path_within(b, bl, c, cl)) assert(orin_platform_path_within(a, al, c, cl) == 1);
+    assert(orin_platform_path_within("/a/b", 4, "/a/bc", 5) == 0);
+    assert(orin_platform_path_within("/", 1, a, al) == 1);
+}

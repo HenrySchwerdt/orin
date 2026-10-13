@@ -1,9 +1,10 @@
 // std:fs -- whole-file functions and streaming file access through the scope API (ADR-0025).
 //
-// UNSTABLE (ADR-0016 amendment): the signatures of std I/O modules may change when capabilities (ADR-0021)
-// are added, most likely by one extra capability parameter (`withFile(cap, path, mode, body)`); the scope
-// shape and the `File` methods are meant to survive that change. The language rules for `File` are not
-// unstable: see below.
+// UNSTABLE (ADR-0016 two-stage freeze): std I/O stays unstable until the project owner confirms the freeze. Every
+// function that touches the file system takes the FILE-SYSTEM GRANT (`FsGrant`, ADR-0027) as its first argument:
+// `readFile(fs, path)`, `withFile(fs, path, mode, body)`. A grant comes from `main(host: Host)` through std:host
+// (`useFs(host, fs => ...)`) and can be narrowed with `withUnder` / `withReadOnly` below; the scope shape and the `File`
+// methods did not change. The language rules for `File` and for grants are not unstable: see below.
 //
 // `File` is a RESOURCE HANDLE, not a value (spec 06): it can be passed to functions (borrowed) but not stored in a
 // record / class / array / Option / Result / Map, returned, assigned to another variable, captured by a closure,
@@ -22,12 +23,20 @@
 // takes a body that returns nothing. Both exist for one file and for two files (`withFiles`, `useFiles`), which is how
 // you stream from one file to another: a handle cannot be captured by a nested scope's closure.
 //
-// Whole-file functions (unchanged): readFile(path): Result<string, string>, writeFile(path, data):
-// Result<void, string>, exists(path): bool.
+// Whole-file functions: readFile(fs, path): Result<string, string>, writeFile(fs, path, data):
+// Result<void, string>, exists(fs, path): bool. A refused operation (policy, scope, read-only) is an `Err` for the
+// functions that return a Result (and for the scope functions' open) and a trap for `exists`.
+//
+// Narrowing (ADR-0027): `withUnder(fs, dir, body)` runs `body` with a grant that only reaches paths inside `dir`
+// (compared after making both absolute and removing "." / ".." / repeated "/" -- and, for existing path prefixes,
+// after resolving symbolic links, so a link that leaves the scope does not work); `withReadOnly(fs, body)` with a
+// grant that cannot create, write or truncate. A narrowed grant never has more authority than its parent: asking for
+// a directory outside the parent's scope yields a grant that reaches nothing. Narrowed grants are handles like any
+// other (a scope parameter, no capture, no storing).
 
-import { File, fileOpen, fileIsOpen, fileOpenError, fileClose } from "std:fsraw";
+import { File, FsGrant, fileOpen, fileIsOpen, fileOpenError, fileClose, grantUnder, grantReadOnly, grantRevoke } from "std:fsraw";
 
-export { readFile, writeFile, exists, File } from "std:fsraw";
+export { readFile, writeFile, exists, File, FsGrant } from "std:fsraw";
 
 // Text of an error of this module (currently the human-readable message).
 export type FsError = string;
@@ -57,12 +66,12 @@ function firstError(a: Option<string>, b: Option<string>): Option<string> {
   };
 }
 
-// withFile<T>(path, mode, body): Result<T, FsError>
+// withFile<T>(fs, path, mode, body): Result<T, FsError>
 // Opens `path`, runs `body(file)`, closes the file, and returns `Ok(<body's value>)`; `Err(message)` if the file
 // cannot be opened (body is not called) or if any operation on it or the final flush/close failed (the body's
 // value is discarded). O(1) plus the work of `body`; at most 256 files can be open at once.
-export function withFile<T>(path: string, mode: FileMode, body: (file: File) => T): Result<T, FsError> {
-  const h = fileOpen(path, modeCode(mode));
+export function withFile<T>(fs: FsGrant, path: string, mode: FileMode, body: (file: File) => T): Result<T, FsError> {
+  const h = fileOpen(fs, path, modeCode(mode));
   if (!fileIsOpen(h)) {
     const msg = openMessage(path, h);
     fileClose(h);
@@ -76,9 +85,9 @@ export function withFile<T>(path: string, mode: FileMode, body: (file: File) => 
   };
 }
 
-// useFile(path, mode, body): Result<void, FsError> -- `withFile` for a body that returns nothing.
-export function useFile(path: string, mode: FileMode, body: (file: File) => void): Result<void, FsError> {
-  const h = fileOpen(path, modeCode(mode));
+// useFile(fs, path, mode, body): Result<void, FsError> -- `withFile` for a body that returns nothing.
+export function useFile(fs: FsGrant, path: string, mode: FileMode, body: (file: File) => void): Result<void, FsError> {
+  const h = fileOpen(fs, path, modeCode(mode));
   if (!fileIsOpen(h)) {
     const msg = openMessage(path, h);
     fileClose(h);
@@ -92,18 +101,18 @@ export function useFile(path: string, mode: FileMode, body: (file: File) => void
   };
 }
 
-// withFiles<T>(pathA, modeA, pathB, modeB, body): Result<T, FsError> -- two files open at the same time (for
+// withFiles<T>(fs, pathA, modeA, pathB, modeB, body): Result<T, FsError> -- two files open at the same time (for
 // example copying a file line by line). If the second cannot be opened the first is closed again.
 export function withFiles<T>(
-  pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => T
+  fs: FsGrant, pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => T
 ): Result<T, FsError> {
-  const a = fileOpen(pathA, modeCode(modeA));
+  const a = fileOpen(fs, pathA, modeCode(modeA));
   if (!fileIsOpen(a)) {
     const msg = openMessage(pathA, a);
     fileClose(a);
     return Err(msg);
   }
-  const b = fileOpen(pathB, modeCode(modeB));
+  const b = fileOpen(fs, pathB, modeCode(modeB));
   if (!fileIsOpen(b)) {
     const msg = openMessage(pathB, b);
     fileClose(b);
@@ -119,17 +128,17 @@ export function withFiles<T>(
   };
 }
 
-// useFiles(pathA, modeA, pathB, modeB, body): Result<void, FsError> -- `withFiles` for a body that returns nothing.
+// useFiles(fs, pathA, modeA, pathB, modeB, body): Result<void, FsError> -- `withFiles` for a body that returns nothing.
 export function useFiles(
-  pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => void
+  fs: FsGrant, pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => void
 ): Result<void, FsError> {
-  const a = fileOpen(pathA, modeCode(modeA));
+  const a = fileOpen(fs, pathA, modeCode(modeA));
   if (!fileIsOpen(a)) {
     const msg = openMessage(pathA, a);
     fileClose(a);
     return Err(msg);
   }
-  const b = fileOpen(pathB, modeCode(modeB));
+  const b = fileOpen(fs, pathB, modeCode(modeB));
   if (!fileIsOpen(b)) {
     const msg = openMessage(pathB, b);
     fileClose(b);
@@ -142,5 +151,55 @@ export function useFiles(
   return match (firstError(ea, eb)) {
     Some(m) => Err(m),
     None => Ok()
+  };
+}
+
+// withUnder<T>(fs, dir, body: (sub: FsGrant) => T): T -- a grant restricted to the directory `dir` (and below). `dir` may
+// be relative (to the working directory) or absolute. Not allowed to widen: if `dir` is not inside the scope of `fs`,
+// the result reaches nothing (every operation is refused). O(1) plus the work of `body`.
+export function withUnder<T>(fs: FsGrant, dir: string, body: (sub: FsGrant) => T): T {
+  const g = grantUnder(fs, dir);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+// useUnder(fs, dir, body) -- `withUnder` for a body that returns nothing.
+export function useUnder(fs: FsGrant, dir: string, body: (sub: FsGrant) => void): void {
+  const g = grantUnder(fs, dir);
+  body(g);
+  grantRevoke(g);
+}
+
+// withReadOnly<T>(fs, body: (ro: FsGrant) => T): T -- a grant that can read but not create, write or truncate.
+export function withReadOnly<T>(fs: FsGrant, body: (ro: FsGrant) => T): T {
+  const g = grantReadOnly(fs);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+// useReadOnly(fs, body) -- `withReadOnly` for a body that returns nothing.
+export function useReadOnly(fs: FsGrant, body: (ro: FsGrant) => void): void {
+  const g = grantReadOnly(fs);
+  body(g);
+  grantRevoke(g);
+}
+
+// withFileFs<T>(fs, path, mode, body: (file: File, fs: FsGrant) => T): Result<T, FsError> -- `withFile` whose body also
+// receives the SAME grant again as a parameter. A closure cannot capture a grant (the capture would let it outlive the
+// scope), so a body that must open further files (a nested scope, a recursive helper) gets the grant this way.
+export function withFileFs<T>(fs: FsGrant, path: string, mode: FileMode, body: (file: File, fs: FsGrant) => T): Result<T, FsError> {
+  const h = fileOpen(fs, path, modeCode(mode));
+  if (!fileIsOpen(h)) {
+    const msg = openMessage(path, h);
+    fileClose(h);
+    return Err(msg);
+  }
+  const r = body(h, fs);
+  const e = fileClose(h);
+  return match (e) {
+    Some(m) => Err(m),
+    None => Ok(r)
   };
 }

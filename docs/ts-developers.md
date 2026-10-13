@@ -299,7 +299,7 @@ error (``error[E0410]: operands have different types `string` and `int` ``), and
 | `switch (x) { case ... }` | `match (x) { 1 => ..., _ => ... }` (expression) |
 | `x as T`, `parseInt` returning NaN | `x.toU8()` (traps if it does not fit); `parseInt(s)` returns `Option<int>` |
 | `export function f` / `import { f } from "./m"` | the same; `./dir` imports `dir/module.or` |
-| `fs.readFileSync(p)` (throws) | `readFile(p)` returns `Result<string, string>` |
+| `fs.readFileSync(p)` (throws) | `readFile(fs, p)` returns `Result<string, string>`; the `fs` grant comes from `main(host: Host)` (no ambient file access, ADR-0027) |
 | `@decorator` | built-in `@Test`, `@Deprecated`, `@Inline` only |
 | `function f<T>(x: T)`, `class Box<T>` | the same; generic methods do not exist |
 | `(x: number) => number` (function type) | `(x: int) => int` |

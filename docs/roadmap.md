@@ -83,14 +83,17 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   - resources and the streaming `std:fs`
   - ~~generic classes (`class Graph<T>`), then `std:graph` on `Graph<T>`/`GraphId<T>`~~ (done, ADR-0026)
   - **all language-freeze prerequisites are done** (integers, interpolation, annotations, resources, generic classes)
-- **capabilities (language part):** ADR-0021 is to be written. It covers unforgeable handles,
-  grants at the program root, boundary declarations in `orin.toml` and enforcement in the platform
-  layer. It changes the std I/O signatures, so the std I/O freeze waits for it.
+- **capabilities (language part):** ADR-0021 Stage A is **done** ([ADR-0027](decisions/0027-stage-a-root-capabilities.md)):
+  `main(host: Host)`, grants as resource handles derived by scope functions and narrowed without amplification, the
+  std I/O functions take their grant first, enforcement in the runtime / platform layer (`ORIN_DENY`, path scopes),
+  `PERFORMS_IO` edges in the OSIG. Open questions for the owner before the std I/O freeze are listed at the end
+  of ADR-0027. Stages B-D (effect inference, library adapters, lineage, strict policy) stay with their phases.
 - **Freeze, in two stages (ADR-0016 amendment):**
   1. **Language freeze** once the "next" items are in. Syntax and semantics then change only
      through an ADR, and the compiler rewrite (step 2) starts.
-  2. **std I/O freeze** after capabilities. Until then `std:fs`, `std:process`, `std:io` and
-     `std:time` are *unstable*.
+  2. **std I/O freeze** after capabilities. Stage A has landed, so the signatures are now the
+     proposed final ones (`std:host`, `std:fs`, `std:process`, `std:io`, `std:time` take grants);
+     they stay *unstable* until the project owner confirms the freeze (ADR-0027 open questions).
 
 ### 2. Compiler rewrite with the full language (ADR-0015)
 - Refresh the seed, then rewrite module by module:
@@ -199,7 +202,7 @@ What each phase delivers:
   - still open from the phase: stable feature IDs and the feature manifest (ticket 4), MIR source mapping
     (ticket 2, with the compiler rewrite); the gate's "affected features" needs ticket 4
 - **Phase 2:**
-  - capability handles (language part)
+  - ~~capability handles (language part)~~ (done: ADR-0027; primitive `PERFORMS_IO` edges only, no transitive effects yet)
   - effect inference and transitive fixpoint
   - policy checker, `orin effects`
 - **Phase 3:**

@@ -1,0 +1,140 @@
+// std:host -- the root of authority (ADR-0021 Stage A, ADR-0027).
+//
+// UNSTABLE (ADR-0016 two-stage freeze): std I/O stays unstable until the project owner confirms the freeze.
+//
+// A program that performs I/O declares `function main(host: Host): void`. `Host` is the program's handle on the
+// machine it runs on: a RESOURCE HANDLE (ADR-0025 rules: it can only be passed as an argument; it cannot be stored in
+// a variable, record, class or array, returned, captured by a closure, copied or compared) that only the runtime
+// can create. `main()` without the parameter has NO I/O authority: every std I/O function takes a grant as its first
+// argument, so such a program cannot call one (compile error E0470).
+//
+// From the Host a program derives grants, one per family of operation (the "root operation families"):
+//   FsGrant       std:fs       open / read / write / exist files (further narrowed by `withUnder`, `withReadOnly`)
+//   ProcessGrant  std:process  `args`, `shell` (further narrowed by `withArgsOnly`: no spawning)
+//   StdioGrant    std:io       read stdin, `writeStdout`
+//   ClockGrant    std:time     `nowMillis`
+// (A NetGrant family is reserved for std:net; there is no network API yet.) `console.log` / `console.error` and
+// `exit` need no grant (ADR-0027, "ambient output"); they are still recorded as primitive OUTPUT / CONTROL events by
+// the OSIG.
+//
+// A grant is obtained only through a SCOPE function: it creates the grant, calls `body` with the grant as the body's
+// PARAMETER and revokes it when `body` returns, on every path. Because a handle cannot be captured, a nested scope
+// cannot use the outer grant: take every grant you need at once with `withHost` / `useHost`, or pass grants on as
+// arguments. Two flavours, as in std:fs: `with*` returns the body's value, `use*` takes a body that returns nothing.
+//
+// The host policy decides what the OS process may give: by default everything the process has; the environment
+// variable ORIN_DENY (a comma-separated list of: fs, process, stdio, clock, net, all) denies families. A denied family is
+// still handed out (the program type-checks and runs); every operation then reports `Err("... denied by the host
+// policy (ORIN_DENY)")` if it returns a Result, and traps ("capability denied: ...") otherwise.
+//
+// The raw primitives (grantFs, grantRevoke ... of the internal module std:fsraw) can only be used by the std
+// library: user code cannot name them (E0301), so it cannot create, copy or forge a grant.
+
+import {
+  Host, FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantFs, grantProcess, grantStdio, grantClock, grantArgsOnly, grantRevoke
+} from "std:fsraw";
+
+export { Host } from "std:fsraw";
+
+// withFs<T>(host, body: (fs: FsGrant) => T): T -- the file-system grant of the host policy (the whole file system,
+// unless the policy denies `fs`). Revoked when `body` returns.
+export function withFs<T>(host: Host, body: (fs: FsGrant) => T): T {
+  const g = grantFs(host);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+// useFs(host, body: (fs: FsGrant) => void): void -- `withFs` for a body that returns nothing.
+export function useFs(host: Host, body: (fs: FsGrant) => void): void {
+  const g = grantFs(host);
+  body(g);
+  grantRevoke(g);
+}
+
+// withProcess / useProcess: the process grant (`args`, `shell`).
+export function withProcess<T>(host: Host, body: (proc: ProcessGrant) => T): T {
+  const g = grantProcess(host);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+export function useProcess(host: Host, body: (proc: ProcessGrant) => void): void {
+  const g = grantProcess(host);
+  body(g);
+  grantRevoke(g);
+}
+
+// withStdio / useStdio: the stdin / stdout grant of std:io.
+export function withStdio<T>(host: Host, body: (stdio: StdioGrant) => T): T {
+  const g = grantStdio(host);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+export function useStdio(host: Host, body: (stdio: StdioGrant) => void): void {
+  const g = grantStdio(host);
+  body(g);
+  grantRevoke(g);
+}
+
+// withClock / useClock: the clock grant of std:time.
+export function withClock<T>(host: Host, body: (clock: ClockGrant) => T): T {
+  const g = grantClock(host);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+export function useClock(host: Host, body: (clock: ClockGrant) => void): void {
+  const g = grantClock(host);
+  body(g);
+  grantRevoke(g);
+}
+
+// withHost / useHost: all four grants at once (the usual shape of a command line program's main).
+export function withHost<T>(
+  host: Host, body: (fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant, clock: ClockGrant) => T
+): T {
+  const f = grantFs(host);
+  const p = grantProcess(host);
+  const s = grantStdio(host);
+  const c = grantClock(host);
+  const r = body(f, p, s, c);
+  grantRevoke(c);
+  grantRevoke(s);
+  grantRevoke(p);
+  grantRevoke(f);
+  return r;
+}
+
+export function useHost(
+  host: Host, body: (fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant, clock: ClockGrant) => void
+): void {
+  const f = grantFs(host);
+  const p = grantProcess(host);
+  const s = grantStdio(host);
+  const c = grantClock(host);
+  body(f, p, s, c);
+  grantRevoke(c);
+  grantRevoke(s);
+  grantRevoke(p);
+  grantRevoke(f);
+}
+
+// withArgsOnly(proc, body: (p: ProcessGrant) => T): T -- a process grant that can read `args` but not spawn (`shell`
+// traps with "capability denied"). Narrowing only restricts: the new grant never has more authority than `proc`.
+export function withArgsOnly<T>(proc: ProcessGrant, body: (p: ProcessGrant) => T): T {
+  const g = grantArgsOnly(proc);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+export function useArgsOnly(proc: ProcessGrant, body: (p: ProcessGrant) => void): void {
+  const g = grantArgsOnly(proc);
+  body(g);
+  grantRevoke(g);
+}

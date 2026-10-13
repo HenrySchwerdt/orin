@@ -16,6 +16,7 @@
 //   - definition/hover/references/rename need the checker's SemanticIndex; until the checker
 //     produces it (`indexAvailable()`) they are not advertised and answer null.
 
+import { FsGrant } from "std:fs";
 import { Json, JField, JNull, JNum, JStr, JArr, JBool, JObj, jField, asArr, getField, getStr, getInt, getBool, getArr,
   getPath, getPathStr, getPathInt, parseJson, stringifyJson } from "../json";
 import { Workspace, newWorkspace, openFile, changeFile, closeFile, openPaths, fileText, analyze, Analysis,
@@ -99,15 +100,15 @@ function none(st: LspState): LspStep {
 
 // ---- entry points -------------------------------------------------------------------------
 
-export function handleText(st: LspState, body: string): LspStep {
+export function handleText(fs: FsGrant, st: LspState, body: string): LspStep {
   const r = parseJson(body);
   if (r.isErr()) {
     return step(st, [respondError(JNull, PARSE_ERROR, "parse error: " + r.unwrapErr())]);
   }
-  return handle(st, r.unwrap());
+  return handle(fs, st, r.unwrap());
 }
 
-export function handle(st: LspState, msg: Json): LspStep {
+export function handle(fs: FsGrant, st: LspState, msg: Json): LspStep {
   if (st.exited) {
     return none(st);
   }
@@ -117,20 +118,20 @@ export function handle(st: LspState, msg: Json): LspStep {
   }
   const id = getField(msg, "id");
   if (id.isSome()) {
-    return handleRequest(st, id.unwrap(), method.unwrap(), msg);
+    return handleRequest(fs, st, id.unwrap(), method.unwrap(), msg);
   }
-  return handleNotification(st, method.unwrap(), msg);
+  return handleNotification(fs, st, method.unwrap(), msg);
 }
 
 export type Pumped = { state: LspState; rest: string; output: string; };
 
 // Feed raw bytes: decode all complete framed messages, handle them, return framed output.
-export function pump(st: LspState, buffer: string): Result<Pumped, string> {
+export function pump(fs: FsGrant, st: LspState, buffer: string): Result<Pumped, string> {
   const u = unframe(buffer)?;
   let cur = st;
   let outs: string[] = [];
   for (const body of u.messages) {
-    const s = handleText(cur, body);
+    const s = handleText(fs, cur, body);
     cur = s.state;
     for (const j of s.out) {
       outs.push(frameMessage(stringifyJson(j)));
@@ -164,7 +165,7 @@ function capabilities(st: LspState): Json {
   return JObj(caps);
 }
 
-function handleRequest(st: LspState, id: Json, method: string, msg: Json): LspStep {
+function handleRequest(fs: FsGrant, st: LspState, id: Json, method: string, msg: Json): LspStep {
   if (method == "initialize") {
     const result = JObj([
       jField("capabilities", capabilities(st)),
@@ -182,31 +183,31 @@ function handleRequest(st: LspState, id: Json, method: string, msg: Json): LspSt
     return step(LspState { ...st, shutdownRequested: true }, [respond(id, JNull)]);
   }
   if (method == "textDocument/documentSymbol") {
-    return reqDocumentSymbol(st, id, msg);
+    return reqDocumentSymbol(fs, st, id, msg);
   }
   if (method == "textDocument/completion") {
-    return reqCompletion(st, id, msg);
+    return reqCompletion(fs, st, id, msg);
   }
   if (method == "textDocument/formatting") {
-    return reqFormatting(st, id, msg);
+    return reqFormatting(fs, st, id, msg);
   }
   if (method == "textDocument/definition") {
-    return reqDefinition(st, id, msg);
+    return reqDefinition(fs, st, id, msg);
   }
   if (method == "textDocument/hover") {
-    return reqHover(st, id, msg);
+    return reqHover(fs, st, id, msg);
   }
   if (method == "textDocument/implementation") {
-    return reqImplementation(st, id, msg);
+    return reqImplementation(fs, st, id, msg);
   }
   if (method == "textDocument/references") {
-    return reqReferences(st, id, msg);
+    return reqReferences(fs, st, id, msg);
   }
   if (method == "textDocument/prepareRename") {
-    return reqPrepareRename(st, id, msg);
+    return reqPrepareRename(fs, st, id, msg);
   }
   if (method == "textDocument/rename") {
-    return reqRename(st, id, msg);
+    return reqRename(fs, st, id, msg);
   }
   return step(st, [respondError(id, METHOD_NOT_FOUND, "method not found: " + method)]);
 }
@@ -223,14 +224,14 @@ function invalidParams(st: LspState, id: Json): LspStep {
   return step(st, [respondError(id, INVALID_PARAMS, "invalid params")]);
 }
 
-function reqDocumentSymbol(st: LspState, id: Json, msg: Json): LspStep {
+function reqDocumentSymbol(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
   const p = docPath(msg);
   if (p.isNone()) {
     return invalidParams(st, id);
   }
-  const text = readText(st.ws, p.unwrap()).unwrapOr("");
+  const text = readText(fs, st.ws, p.unwrap()).unwrapOr("");
   let items: Json[] = [];
-  for (const s of documentSymbols(st.ws, p.unwrap())) {
+  for (const s of documentSymbols(fs, st.ws, p.unwrap())) {
     items.push(documentSymbolJson(text, s));
   }
   return step(st, [respond(id, JArr(items))]);
@@ -272,16 +273,16 @@ function localCompletions(x: Ctx): CompletionItem[] {
   return out;
 }
 
-function reqCompletion(st: LspState, id: Json, msg: Json): LspStep {
+function reqCompletion(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
   const p = docPath(msg);
   if (p.isNone()) {
     return invalidParams(st, id);
   }
   let items: Json[] = [];
-  for (const c of declCompletions(st.ws, p.unwrap())) {
+  for (const c of declCompletions(fs, st.ws, p.unwrap())) {
     items.push(completionJson(c));
   }
-  const lc = context(st, msg, false);
+  const lc = context(fs, st, msg, false);
   if (lc.isSome()) {
     for (const c of localCompletions(lc.unwrap())) {
       items.push(completionJson(c));
@@ -296,12 +297,12 @@ function reqCompletion(st: LspState, id: Json, msg: Json): LspStep {
   return step(st, [respond(id, JObj([jField("isIncomplete", JBool(false)), jField("items", JArr(items))]))]);
 }
 
-function reqFormatting(st: LspState, id: Json, msg: Json): LspStep {
+function reqFormatting(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
   const p = docPath(msg);
   if (p.isNone()) {
     return invalidParams(st, id);
   }
-  const t = readText(st.ws, p.unwrap());
+  const t = readText(fs, st.ws, p.unwrap());
   if (t.isNone()) {
     return invalidParams(st, id);
   }
@@ -323,30 +324,30 @@ type Ctx = { a: Analysis; idx: SemanticIndex; file: usize; off: usize; };
 // Workspace-wide queries (references, rename) need an analysis whose program contains every
 // user of the symbol: when `path` is imported by another open document, that document is used as
 // the entry instead (first match in open order); otherwise `path` is its own entry.
-function wideAnalysis(st: LspState, path: string): Analysis {
+function wideAnalysis(fs: FsGrant, st: LspState, path: string): Analysis {
   const me = normalizePath(path);
   for (const o of openPaths(st.ws)) {
     if (normalizePath(o) == me) {
       continue;
     }
-    const a = analyze(st.ws, o);
+    const a = analyze(fs, st.ws, o);
     if (a.index.isSome() && fileIndexOf(a, path).isSome()) {
       return a;
     }
   }
-  return analyze(st.ws, path);
+  return analyze(fs, st.ws, path);
 }
 
 // Analysis of the document, its semantic index and the cursor offset. None when the index is
 // not available or the params are malformed.
-function context(st: LspState, msg: Json, wide: bool): Option<Ctx> {
+function context(fs: FsGrant, st: LspState, msg: Json, wide: bool): Option<Ctx> {
   const p = docPath(msg);
   const line = getPathInt(msg, ["params", "position", "line"]);
   const ch = getPathInt(msg, ["params", "position", "character"]);
   if (p.isNone() || line.isNone() || ch.isNone() || line.unwrap() < 0 || ch.unwrap() < 0) {
     return None;
   }
-  const a = wide ? wideAnalysis(st, p.unwrap()) : analyze(st.ws, p.unwrap());
+  const a = wide ? wideAnalysis(fs, st, p.unwrap()) : analyze(fs, st.ws, p.unwrap());
   let idx: Option<SemanticIndex> = a.index;
   if (st.testIndex.isSome()) {
     idx = st.testIndex;
@@ -376,8 +377,8 @@ function locationJson(a: Analysis, sp: Span): Json {
   ]);
 }
 
-function reqDefinition(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg, false);
+function reqDefinition(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(fs, st, msg, false);
   if (c.isNone()) {
     return step(st, [respond(id, JNull)]);
   }
@@ -390,8 +391,8 @@ function reqDefinition(st: LspState, id: Json, msg: Json): LspStep {
 }
 
 // Go to implementations (ADR-0019): classes implementing the interface at the cursor, or their methods.
-function reqImplementation(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg, true);
+function reqImplementation(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(fs, st, msg, true);
   let locs: Json[] = [];
   if (c.isSome()) {
     const x = c.unwrap();
@@ -402,8 +403,8 @@ function reqImplementation(st: LspState, id: Json, msg: Json): LspStep {
   return step(st, [respond(id, JArr(locs))]);
 }
 
-function reqHover(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg, false);
+function reqHover(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(fs, st, msg, false);
   if (c.isNone()) {
     return step(st, [respond(id, JNull)]);
   }
@@ -423,8 +424,8 @@ function reqHover(st: LspState, id: Json, msg: Json): LspStep {
   ]))]);
 }
 
-function reqReferences(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg, true);
+function reqReferences(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(fs, st, msg, true);
   let locs: Json[] = [];
   if (c.isSome()) {
     const x = c.unwrap();
@@ -440,8 +441,8 @@ function reqReferences(st: LspState, id: Json, msg: Json): LspStep {
   return step(st, [respond(id, JArr(locs))]);
 }
 
-function reqPrepareRename(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg, true);
+function reqPrepareRename(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(fs, st, msg, true);
   if (c.isNone()) {
     return step(st, [respond(id, JNull)]);
   }
@@ -458,8 +459,8 @@ function reqPrepareRename(st: LspState, id: Json, msg: Json): LspStep {
   ]))]);
 }
 
-function reqRename(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg, true);
+function reqRename(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(fs, st, msg, true);
   const newName = getPathStr(msg, ["params", "newName"]);
   if (newName.isNone()) {
     return invalidParams(st, id);
@@ -511,7 +512,7 @@ function reqRename(st: LspState, id: Json, msg: Json): LspStep {
 
 // ---- notifications and diagnostics --------------------------------------------------------
 
-function handleNotification(st: LspState, method: string, msg: Json): LspStep {
+function handleNotification(fs: FsGrant, st: LspState, method: string, msg: Json): LspStep {
   if (method == "exit") {
     return none(LspState { ...st, exited: true });
   }
@@ -527,7 +528,7 @@ function handleNotification(st: LspState, method: string, msg: Json): LspStep {
     const ws = openFile(st.ws, p.unwrap(), text.unwrap());
     const st2 = LspState { ...st, ws: ws };
     const none2: string[] = [];
-    return republish(st2, none2);
+    return republish(fs, st2, none2);
   }
   if (method == "textDocument/didChange") {
     const p = docPath(msg);
@@ -547,11 +548,11 @@ function handleNotification(st: LspState, method: string, msg: Json): LspStep {
     }
     const st2 = LspState { ...st, ws: changeFile(st.ws, p.unwrap(), text.unwrap()) };
     const none2: string[] = [];
-    return republish(st2, none2);
+    return republish(fs, st2, none2);
   }
   if (method == "textDocument/didSave") {
     const none2: string[] = [];
-    return republish(st, none2);
+    return republish(fs, st, none2);
   }
   if (method == "textDocument/didClose") {
     const p = docPath(msg);
@@ -559,7 +560,7 @@ function handleNotification(st: LspState, method: string, msg: Json): LspStep {
       return none(st);
     }
     const st2 = LspState { ...st, ws: closeFile(st.ws, p.unwrap()) };
-    return republish(st2, [p.unwrap()]);
+    return republish(fs, st2, [p.unwrap()]);
   }
   return none(st);   // initialized, $/cancelRequest, workspace/*, ... are ignored
 }
@@ -576,10 +577,10 @@ function hasKey(ds: LDiag[], key: string): bool {
 }
 
 // Diagnostics of all open documents (each analysed as its own entry), de-duplicated.
-function collectDiags(ws: Workspace): LDiag[] {
+function collectDiags(fs: FsGrant, ws: Workspace): LDiag[] {
   let out: LDiag[] = [];
   for (const entry of openPaths(ws)) {
-    const a = analyze(ws, entry);
+    const a = analyze(fs, ws, entry);
     let both = a.diags;
     for (const w of a.warnings) {
       both.push(w);
@@ -614,8 +615,8 @@ function addUnique(xs: string[], x: string): string[] {
 // Recompute diagnostics and publish them for: every open document, every file that has
 // diagnostics, every file that had diagnostics published before, and `extra` (e.g. a document
 // that was just closed, so its markers are cleared).
-function republish(st: LspState, extra: string[]): LspStep {
-  const all = collectDiags(st.ws);
+function republish(fs: FsGrant, st: LspState, extra: string[]): LspStep {
+  const all = collectDiags(fs, st.ws);
   let targets: string[] = [];
   for (const p of openPaths(st.ws)) {
     targets = addUnique(targets, p);

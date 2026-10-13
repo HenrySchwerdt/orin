@@ -17,6 +17,7 @@ import {
 import { normalizePath, isNormalized, allNormalized, allDistinct, dirname, joinPath } from "./path";
 import { PreludeRoot, noPreludeRoots, rootsWellFormed, countEntries } from "./prelude";
 import { Sources } from "./sources";
+import { FsGrant } from "std:fs";
 import { ImportResolver } from "./resolve";
 import { ModuleGraph } from "./modgraph";
 import { SrcRoot, findManifest, readManifest, manifestEntry } from "./modules";
@@ -149,8 +150,8 @@ class Loader {
   @Ensures(result.isOk() ==> this.graph.acyclic())
   @Ensures(result.isErr()
       ==> this.files.length > 0 && isRenderableErr(this.files, result.unwrapErr()))
-  run(entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
-    this.visit(entry, entryDisplay)?;
+  run(fs: FsGrant, entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
+    this.visit(fs, entry, entryDisplay)?;
     this.checkModuleCycles()?;
     return Ok(LoadedProgram {
       units: this.units,
@@ -166,8 +167,8 @@ class Loader {
       ==> result.unwrap() < this.units.length && this.units[result.unwrap()].path == path)
   @Ensures(result.isOk()
       ==> this.done.has(path) && this.files[this.units[result.unwrap()].file].path == display)
-  private visit(path: string, display: string): Result<usize, Diagnostic> {
-    const text = this.src.read(path);
+  private visit(fs: FsGrant, path: string, display: string): Result<usize, Diagnostic> {
+    const text = this.src.read(fs, path);
     if (text.isErr()) {
       this.files.push(SourceFile { path: display, text: "" });
       return Err(
@@ -190,7 +191,7 @@ class Loader {
     for (const item of ast.items) {
       const decl = importOf(item);
       if (decl.isSome()) {
-        imports.push(this.importTarget(path, decl.unwrap())?);
+        imports.push(this.importTarget(fs, path, decl.unwrap())?);
       }
     }
     this.stack.pop();
@@ -199,7 +200,7 @@ class Loader {
       file: file,
       path: path,
       name: this.resolver.nameOf(path),
-      module: this.tree.moduleOf(path),
+      module: this.tree.moduleOf(fs, path),
       ast: ast,
       imports: imports,
     });
@@ -221,12 +222,16 @@ class Loader {
 
   @Requires(isNormalized(importer))
   @Ensures(result.isOk() ==> targetBelow(result.unwrap(), this.units.length))
-  private importTarget(importer: string, decl: ImportDecl): Result<ImportTarget, Diagnostic> {
-    const res = this.resolver.resolve(importer, decl.path, decl.pathSpan)?;
+  private importTarget(
+    fs: FsGrant,
+    importer: string,
+    decl: ImportDecl,
+  ): Result<ImportTarget, Diagnostic> {
+    const res = this.resolver.resolve(fs, importer, decl.path, decl.pathSpan)?;
     if (res.std.isSome()) {
       return Ok(ImportStd(res.std.unwrap()));
     }
-    this.recordModuleEdge(importer, res.path, decl.pathSpan)?;
+    this.recordModuleEdge(fs, importer, res.path, decl.pathSpan)?;
     const finished = this.done.get(res.path);
     if (finished.isSome()) {
       return Ok(ImportUnit(finished.unwrap()));
@@ -240,7 +245,7 @@ class Loader {
           .map(p => this.resolver.nameOf(p));
       return Err(diag("E0303", decl.pathSpan, `import cycle: ${chain.join(" -> ")}`));
     }
-    return Ok(ImportUnit(this.visit(res.path, res.path)?));
+    return Ok(ImportUnit(this.visit(fs, res.path, res.path)?));
   }
 
   // In a package, an import between two different modules must be allowed by the manifest (E0501);
@@ -248,11 +253,16 @@ class Loader {
   @Requires(isNormalized(importer) && isNormalized(target))
   @Ensures(this.manifest.isNone()
       ==> result.isOk() && this.graph.edgeCount() == old(this.graph.edgeCount()))
-  private recordModuleEdge(importer: string, target: string, at: Span): Result<void, Diagnostic> {
+  private recordModuleEdge(
+    fs: FsGrant,
+    importer: string,
+    target: string,
+    at: Span,
+  ): Result<void, Diagnostic> {
     if (this.manifest.isNone()) {
       return Ok();
     }
-    return this.graph.add(this.tree.moduleOf(importer), this.tree.moduleOf(target), at);
+    return this.graph.add(this.tree.moduleOf(fs, importer), this.tree.moduleOf(fs, target), at);
   }
 
   // The module graph of a package must be acyclic (E0303), reported at the import that closes the cycle.
@@ -279,6 +289,7 @@ function isRenderableErr(files: SourceFile[], d: Diagnostic): bool {
 @Ensures(overlayRespected(overlay, result))
 @Ensures(result.program.isSome() ==> importsPreludeRoots(result.program.unwrap(), roots))
 export function loadWithRoots(
+  fs: FsGrant,
   entryPath: string,
   overlay: SourceFile[],
   roots: PreludeRoot[],
@@ -288,9 +299,9 @@ export function loadWithRoots(
   let entryDisplay = entryPath;
   let srcRoot = dirname(entry);
   let manifest: Option<Manifest> = None;
-  const tomlPath = findManifest(src, entry);
+  const tomlPath = findManifest(fs, src, entry);
   if (tomlPath.isSome()) {
-    const read = readManifest(src, tomlPath.unwrap());
+    const read = readManifest(fs, src, tomlPath.unwrap());
     if (read.isErr()) {
       return read.unwrapErr();
     }
@@ -305,7 +316,7 @@ export function loadWithRoots(
     manifest = Some(m);
   }
   let loader = new Loader(src, roots, dirname(entry), srcRoot, manifest);
-  const r = loader.run(entry, entryDisplay);
+  const r = loader.run(fs, entry, entryDisplay);
   if (r.isErr()) {
     return failedLoad(loader.files, [r.unwrapErr()]);
   }
@@ -318,19 +329,23 @@ export function loadWithRoots(
 
 // Like loadWithRoots with the roots every compilation has (the array API and the Orin std modules).
 @Ensures(isValidOutcome(result) && result.sm.files.length > 0)
-export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
-  return loadWithRoots(entryPath, overlay, noPreludeRoots());
+export function loadWithOverlay(
+  fs: FsGrant,
+  entryPath: string,
+  overlay: SourceFile[],
+): LoadOutcome {
+  return loadWithRoots(fs, entryPath, overlay, noPreludeRoots());
 }
 
 @Ensures(isValidOutcome(result) && result.sm.files.length > 0)
-export function loadAll(entryPath: string): LoadOutcome {
-  return loadWithOverlay(entryPath, []);
+export function loadAll(fs: FsGrant, entryPath: string): LoadOutcome {
+  return loadWithOverlay(fs, entryPath, []);
 }
 
 @Ensures(result.isOk() ==> isWellFormed(result.unwrap().program, result.unwrap().sm))
 @Ensures(result.isErr() ==> result.unwrapErr().length > 0 && allWellFormed(result.unwrapErr()))
-export function load(entryPath: string): Result<LoadResult, Diagnostic[]> {
-  const o = loadAll(entryPath);
+export function load(fs: FsGrant, entryPath: string): Result<LoadResult, Diagnostic[]> {
+  const o = loadAll(fs, entryPath);
   return match (o.program) {
     Some(p) => Ok(LoadResult { program: p, sm: o.sm }),
     None => Err(o.diags),

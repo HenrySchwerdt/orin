@@ -3,6 +3,7 @@
 // Phase 1 limitation: a file with a syntax error has NO symbols (the parser is not error
 // tolerant); callers may answer from a cached earlier result.
 
+import { FsGrant } from "std:fs";
 import { Item, FunctionDecl, TypeDecl, ConstDecl, ImportDecl, TypeExpr, Param, FieldDecl, VariantDecl, Ident, InterfaceDecl, parse } from "../syntax";
 import { Span } from "../diag";
 import { readFile, exists } from "std:fs";
@@ -193,16 +194,16 @@ function symbolsOrEmpty(text: string): DocSymbol[] {
 }
 
 // Buffer text from the workspace overlay, else the file on disk.
-export function readText(ws: Workspace, path: string): Option<string> {
+export function readText(fs: FsGrant, ws: Workspace, path: string): Option<string> {
   const t = fileText(ws, path);
   if (t.isSome()) {
     return t;
   }
   const p = normalizePath(path);
-  if (!exists(p)) {
+  if (!exists(fs, p)) {
     return None;
   }
-  const r = readFile(p);
+  const r = readFile(fs, p);
   if (r.isErr()) {
     return None;
   }
@@ -211,8 +212,8 @@ export function readText(ws: Workspace, path: string): Option<string> {
 
 // Top-level declarations of `path` in source order (functions, types with field/variant
 // children, consts). Imports and re-exports are not symbols. Empty on read or syntax errors.
-export function documentSymbols(ws: Workspace, path: string): DocSymbol[] {
-  const t = readText(ws, path);
+export function documentSymbols(fs: FsGrant, ws: Workspace, path: string): DocSymbol[] {
+  const t = readText(fs, ws, path);
   if (t.isNone()) {
     return [];
   }
@@ -257,17 +258,17 @@ export function builtinCompletions(): CompletionItem[] {
 
 // Resolve import path `p` (as written in `import ... from "p"`) from file `fromPath` to a normalized
 // file path that exists in the workspace overlay or on disk. None for std modules/missing files.
-export function resolveModulePath(ws: Workspace, fromPath: string, p: string): Option<string> {
+export function resolveModulePath(fs: FsGrant, ws: Workspace, fromPath: string, p: string): Option<string> {
   if (p.startsWith("std:")) {
     return None;
   }
   const dir = dirname(normalizePath(fromPath));
   const c1 = joinPath(dir, p + ".or");
-  if (fileText(ws, c1).isSome() || exists(c1)) {
+  if (fileText(ws, c1).isSome() || exists(fs, c1)) {
     return Some(c1);
   }
   const c2 = joinPath(dir, p + "/module.or");
-  if (fileText(ws, c2).isSome() || exists(c2)) {
+  if (fileText(ws, c2).isSome() || exists(fs, c2)) {
     return Some(c2);
   }
   return None;
@@ -297,9 +298,9 @@ function asItem(s: DocSymbol): CompletionItem {
 // module-level constructors) plus the names of its `import { ... }` lists. Imported names
 // are described from the exporting file when it can be resolved and parsed (an imported union
 // brings its variants too, ADR-0004); otherwise they are offered as `DkImported`.
-export function declCompletions(ws: Workspace, path: string): CompletionItem[] {
+export function declCompletions(fs: FsGrant, ws: Workspace, path: string): CompletionItem[] {
   let out: CompletionItem[] = [];
-  const t = readText(ws, path);
+  const t = readText(fs, ws, path);
   if (t.isNone()) {
     return out;
   }
@@ -319,7 +320,7 @@ export function declCompletions(ws: Workspace, path: string): CompletionItem[] {
   for (const it of pr.unwrap().items) {
     match (it) {
       IImport(imp) => {
-        out = addImported(ws, path, imp, out);
+        out = addImported(fs, ws, path, imp, out);
       },
       _ => {}
     }
@@ -327,12 +328,12 @@ export function declCompletions(ws: Workspace, path: string): CompletionItem[] {
   return out;
 }
 
-function addImported(ws: Workspace, path: string, imp: ImportDecl, items: CompletionItem[]): CompletionItem[] {
+function addImported(fs: FsGrant, ws: Workspace, path: string, imp: ImportDecl, items: CompletionItem[]): CompletionItem[] {
   let out = items;
   let target: DocSymbol[] = [];
-  const mp = resolveModulePath(ws, path, imp.path);
+  const mp = resolveModulePath(fs, ws, path, imp.path);
   if (mp.isSome()) {
-    const tt = readText(ws, mp.unwrap());
+    const tt = readText(fs, ws, mp.unwrap());
     if (tt.isSome()) {
       target = symbolsOrEmpty(tt.unwrap());
     }

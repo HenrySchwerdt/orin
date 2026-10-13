@@ -59,8 +59,10 @@ No unrestricted mutable aliasing across tasks. Prefer isolated tasks, actors and
 Files, sockets, locks and DB connections are *resource handles*, not duplicable value classes. Scope-based APIs such as `File.use(path, callback)` ensure deterministic cleanup even upon `Err`. Resource escape is statically rejected or guarded by opaque trusted handles; finalizers are not a substitute for deterministic release.
 
 *Realisation (ADR-0025):* `File` is a resource type that exists only as a function parameter; the scope API is
-`withFile(path, mode, f => ...)` of `std:fs` (callback receives the handle as its parameter, release on every path);
+`withFile(fs, path, mode, f => ...)` of `std:fs` (callback receives the handle as its parameter, release on every path);
 escape is rejected by the checker (E0450/E0451/E0452) and, independently, by the MIR verifier (`MHandle`).
+*Capabilities (ADR-0021 Stage A, ADR-0027):* the grants that authorise I/O (`Host`, `FsGrant`, ...) are resource handles with
+exactly these rules; the `fs` argument above is one.
 
 ## Safety invariants (proof targets)
 

@@ -4,6 +4,7 @@
 // `ImportResolver`, `SrcRoot`) and the @Requires / @Ensures of the loader. The negative cases test the
 // predicates directly on hand-built, ill-formed values (a violated contract is a trap, not a value).
 
+import { Host, useFs } from "std:host";
 import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
 import {
   SourceFile, SourceMap, Span, Diagnostic, Diagnostics, span, diag, render, isRenderable,
@@ -157,133 +158,173 @@ function pathContractsOnEdgeCases(): void {
 // ---- Sources -------------------------------------------------------------------------------
 
 @Test
-function sourcesOverlay(): void {
-  const s = new Sources([
-    file("/v/./a.or", "first"),
-    file("/v/x/../a.or", "second"),
-    file("/v/b.or", "b"),
-    file("rel/./c.or", "c"),
-  ]);
-  assertEqUsize(s.size(), 3, "duplicates (after normalization) collapse");
-  assertEqString(s.overlay("/v/a.or").unwrap(), "first", "the first file for a path wins");
-  assertEqString(s.read("/v/a.or").unwrap(), "first", "read serves the overlay");
-  assertEqString(s.overlay("rel/c.or").unwrap(), "c", "relative paths are normalized too");
-  assert(s.overlay("/v/zzz.or").isNone(), "no overlay for an unknown path");
-  assert(s.exists("/v/b.or"), "an overlay file exists");
-  assert(!s.exists("/v/definitely/not/here.or"), "a missing file does not");
-  assert(s.read("/v/definitely/not/here.or").isErr(), "reading it fails");
-  assertEqUsize(new Sources([]).size(), 0, "empty");
+function sourcesOverlay(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const s = new Sources([
+        file("/v/./a.or", "first"),
+        file("/v/x/../a.or", "second"),
+        file("/v/b.or", "b"),
+        file("rel/./c.or", "c"),
+      ]);
+      assertEqUsize(s.size(), 3, "duplicates (after normalization) collapse");
+      assertEqString(s.overlay("/v/a.or").unwrap(), "first", "the first file for a path wins");
+      assertEqString(s.read(fs, "/v/a.or").unwrap(), "first", "read serves the overlay");
+      assertEqString(s.overlay("rel/c.or").unwrap(), "c", "relative paths are normalized too");
+      assert(s.overlay("/v/zzz.or").isNone(), "no overlay for an unknown path");
+      assert(s.exists(fs, "/v/b.or"), "an overlay file exists");
+      assert(!s.exists(fs, "/v/definitely/not/here.or"), "a missing file does not");
+      assert(s.read(fs, "/v/definitely/not/here.or").isErr(), "reading it fails");
+      assertEqUsize(new Sources([]).size(), 0, "empty");
+    },
+  );
 }
 
 @Test
-function overlayTextReachesTheProgram(): void {
-  const o = loadWithOverlay(
-    "/v/main.or",
-    [
-      file("/v/main.or", "import { a } from \"./a\";\n"),
-      file("/v/a.or", "export const a = 1;\n"),
-      file("/v/./a.or", "export const a = 2;\n"),
-    ],
+function overlayTextReachesTheProgram(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const o = loadWithOverlay(
+        fs,
+        "/v/main.or",
+        [
+          file("/v/main.or", "import { a } from \"./a\";\n"),
+          file("/v/a.or", "export const a = 1;\n"),
+          file("/v/./a.or", "export const a = 2;\n"),
+        ],
+      );
+      assertEqUsize(o.diags.length, 0, "no diagnostics");
+      const p = o.program.unwrap();
+      assertEqString(
+        o.sm.files[p.units[p.units.length - 2].file].text,
+        "export const a = 1;\n",
+        "first wins",
+      );
+      assert(isWellFormed(p, o.sm), "well formed");
+    },
   );
-  assertEqUsize(o.diags.length, 0, "no diagnostics");
-  const p = o.program.unwrap();
-  assertEqString(
-    o.sm.files[p.units[p.units.length - 2].file].text,
-    "export const a = 1;\n",
-    "first wins",
-  );
-  assert(isWellFormed(p, o.sm), "well formed");
 }
 
 // ---- ImportResolver ------------------------------------------------------------------------
 
 @Test
-function resolverStdAndFiles(): void {
-  const src = new Sources([
-    file("/v/main.or", ""),
-    file("/v/a.or", ""),
-    file("/v/m/module.or", ""),
-    file("/v/m/inner.or", ""),
-  ]);
-  const r = new ImportResolver(src, "/v");
-  const sp = span(0, 2, 5);
-  assertEqString(r.resolve("/v/main.or", "./a", sp).unwrap().path, "/v/a.or", "file");
-  assertEqString(r.resolve("/v/main.or", "./m", sp).unwrap().path, "/v/m/module.or", "module dir");
-  assertEqString(
-    r.resolve("/v/main.or", "std:math", sp).unwrap().path,
-    "$array/math.or",
-    "std:math",
+function resolverStdAndFiles(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const src = new Sources([
+        file("/v/main.or", ""),
+        file("/v/a.or", ""),
+        file("/v/m/module.or", ""),
+        file("/v/m/inner.or", ""),
+      ]);
+      const r = new ImportResolver(src, "/v");
+      const sp = span(0, 2, 5);
+      assertEqString(r.resolve(fs, "/v/main.or", "./a", sp).unwrap().path, "/v/a.or", "file");
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "./m", sp).unwrap().path,
+        "/v/m/module.or",
+        "module dir",
+      );
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "std:math", sp).unwrap().path,
+        "$array/math.or",
+        "std:math",
+      );
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "std:json", sp).unwrap().path,
+        "$stdlib/json.or",
+        "std:json",
+      );
+      const proc = r.resolve(fs, "/v/main.or", "std:process", sp).unwrap();
+      assert(proc.std.isSome() && proc.path == "", "runtime module");
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "$array/module.or", sp).unwrap().path,
+        "$array/module.or",
+        "prelude",
+      );
+      assertEqString(r.nameOf("/v/m/inner.or"), "m/inner", "name relative to the base");
+    },
   );
-  assertEqString(
-    r.resolve("/v/main.or", "std:json", sp).unwrap().path,
-    "$stdlib/json.or",
-    "std:json",
-  );
-  const proc = r.resolve("/v/main.or", "std:process", sp).unwrap();
-  assert(proc.std.isSome() && proc.path == "", "runtime module");
-  assertEqString(
-    r.resolve("/v/main.or", "$array/module.or", sp).unwrap().path,
-    "$array/module.or",
-    "prelude",
-  );
-  assertEqString(r.nameOf("/v/m/inner.or"), "m/inner", "name relative to the base");
 }
 
 @Test
-function resolverErrors(): void {
-  const src = new Sources([
-    file("/v/main.or", ""),
-    file("/v/m/module.or", ""),
-    file("/v/m/inner.or", ""),
-  ]);
-  const r = new ImportResolver(src, "/v");
-  const sp = span(0, 7, 9);
-  const missing = r.resolve("/v/main.or", "./nope", sp).unwrapErr();
-  assertEqString(missing.code, "E0301", "missing file");
-  assertEqUsize(missing.span.start, 7, "reported at the import path");
-  assertEqString(r.resolve("/v/main.or", "std:nope", sp).unwrapErr().code, "E0301", "unknown std");
-  assertEqString(
-    r.resolve("/v/main.or", "std:fsraw", sp).unwrapErr().code,
-    "E0301",
-    "std:fsraw is internal to library code",
+function resolverErrors(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const src = new Sources([
+        file("/v/main.or", ""),
+        file("/v/m/module.or", ""),
+        file("/v/m/inner.or", ""),
+      ]);
+      const r = new ImportResolver(src, "/v");
+      const sp = span(0, 7, 9);
+      const missing = r.resolve(fs, "/v/main.or", "./nope", sp).unwrapErr();
+      assertEqString(missing.code, "E0301", "missing file");
+      assertEqUsize(missing.span.start, 7, "reported at the import path");
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "std:nope", sp).unwrapErr().code,
+        "E0301",
+        "unknown std",
+      );
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "std:fsraw", sp).unwrapErr().code,
+        "E0301",
+        "std:fsraw is internal to library code",
+      );
+      assert(
+        r.resolve(fs, "$stdlib/fs.or", "std:fsraw", sp).isOk(),
+        "library code may import std:fsraw",
+      );
+      assertEqString(
+        r.resolve(fs, "/v/main.or", "./m/inner", sp).unwrapErr().code,
+        "E0302",
+        "private file",
+      );
+      assert(r.resolve(fs, "/v/m/module.or", "./inner", sp).isOk(), "inside the module itself");
+    },
   );
-  assert(r.resolve("$stdlib/fs.or", "std:fsraw", sp).isOk(), "library code may import std:fsraw");
-  assertEqString(
-    r.resolve("/v/main.or", "./m/inner", sp).unwrapErr().code,
-    "E0302",
-    "private file",
-  );
-  assert(r.resolve("/v/m/module.or", "./inner", sp).isOk(), "inside the module itself");
 }
 
 // ---- SrcRoot -------------------------------------------------------------------------------
 
 @Test
-function srcRootModules(): void {
-  const src = new Sources([
-    file("/v/main.or", ""),
-    file("/v/a/module.or", ""),
-    file("/v/a/x.or", ""),
-    file("/v/a/deep/y.or", ""),
-    file("/v/b/module.or", ""),
-    file("/v/b/inner/module.or", ""),
-    file("/v/b/inner/z.or", ""),
-    file("/v/plain/p.or", ""),
-  ]);
-  const t = new SrcRoot(src, "/v");
-  assertEqString(t.moduleOf("/v/main.or"), ".", "root module");
-  assertEqString(t.moduleOf("/v/a/x.or"), "a", "file of module a");
-  assertEqString(
-    t.moduleOf("/v/a/deep/y.or"),
-    "a",
-    "nested directory belongs to the enclosing module",
+function srcRootModules(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const src = new Sources([
+        file("/v/main.or", ""),
+        file("/v/a/module.or", ""),
+        file("/v/a/x.or", ""),
+        file("/v/a/deep/y.or", ""),
+        file("/v/b/module.or", ""),
+        file("/v/b/inner/module.or", ""),
+        file("/v/b/inner/z.or", ""),
+        file("/v/plain/p.or", ""),
+      ]);
+      const t = new SrcRoot(src, "/v");
+      assertEqString(t.moduleOf(fs, "/v/main.or"), ".", "root module");
+      assertEqString(t.moduleOf(fs, "/v/a/x.or"), "a", "file of module a");
+      assertEqString(
+        t.moduleOf(fs, "/v/a/deep/y.or"),
+        "a",
+        "nested directory belongs to the enclosing module",
+      );
+      assertEqString(t.moduleOf(fs, "/v/b/inner/z.or"), "b/inner", "nearest module wins");
+      assertEqString(t.moduleOf(fs, "/v/plain/p.or"), ".", "a directory without module.or");
+      assertEqString(t.moduleOf(fs, "/elsewhere/q.or"), "", "outside the root");
+      assertEqString(t.moduleOf(fs, "$std/module.or"), "", "prelude");
+      assert(
+        t.hasModule(fs, ".") && t.hasModule(fs, "a") && t.hasModule(fs, "b/inner"),
+        "existing modules",
+      );
+      assert(!t.hasModule(fs, "plain") && !t.hasModule(fs, "nope"), "missing modules");
+    },
   );
-  assertEqString(t.moduleOf("/v/b/inner/z.or"), "b/inner", "nearest module wins");
-  assertEqString(t.moduleOf("/v/plain/p.or"), ".", "a directory without module.or");
-  assertEqString(t.moduleOf("/elsewhere/q.or"), "", "outside the root");
-  assertEqString(t.moduleOf("$std/module.or"), "", "prelude");
-  assert(t.hasModule(".") && t.hasModule("a") && t.hasModule("b/inner"), "existing modules");
-  assert(!t.hasModule("plain") && !t.hasModule("nope"), "missing modules");
 }
 
 // ---- ModuleGraph ---------------------------------------------------------------------------
@@ -407,72 +448,102 @@ function preludeRootsAreWellFormed(): void {
 }
 
 @Test
-function preludeEntryIsImportedFirst(): void {
-  const root = PreludeRoot {
-    entry: "$r/module.or",
-    files: [file("$r/module.or", "export const r = 1;\n")],
-  };
-  const o = loadWithRoots("/v/main.or", [file("/v/main.or", "const x = 1;\n")], [root]);
-  assertEqUsize(o.diags.length, 0, "no diagnostics");
-  const p = o.program.unwrap();
-  assertEqUsize(p.units.length, 2, "prelude unit and entry");
-  assertEqString(p.units[0].name, "$r/module", "the prelude unit comes first");
-  assertEqUsize(p.units[p.entry].imports.length, 1, "implicit import");
-  assertEqUsize(o.sm.files.length, 2, "entry keeps file id 0");
-  assertEqString(o.sm.files[0].path, "/v/main.or", "entry first in the source map");
+function preludeEntryIsImportedFirst(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const root = PreludeRoot {
+        entry: "$r/module.or",
+        files: [file("$r/module.or", "export const r = 1;\n")],
+      };
+      const o = loadWithRoots(fs, "/v/main.or", [file("/v/main.or", "const x = 1;\n")], [root]);
+      assertEqUsize(o.diags.length, 0, "no diagnostics");
+      const p = o.program.unwrap();
+      assertEqUsize(p.units.length, 2, "prelude unit and entry");
+      assertEqString(p.units[0].name, "$r/module", "the prelude unit comes first");
+      assertEqUsize(p.units[p.entry].imports.length, 1, "implicit import");
+      assertEqUsize(o.sm.files.length, 2, "entry keeps file id 0");
+      assertEqString(o.sm.files[0].path, "/v/main.or", "entry first in the source map");
+    },
+  );
 }
 
 // ---- Loader invariants through the public entry point ----------------------------------------
 
 @Test
-function loaderFailureKeepsInvariants(): void {
-  // A failed load leaves open files on the stack; the class invariants must still hold.
-  const o = loadWithOverlay(
-    "/v/main.or",
-    [
-      file("/v/main.or", "import { a } from \"./a\";\n"),
-      file("/v/a.or", "import { b } from \"./b\";\n"),
-      file("/v/b.or", "import { c } from \"./nope\";\n"),
-    ],
+function loaderFailureKeepsInvariants(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      // A failed load leaves open files on the stack; the class invariants must still hold.
+      const o = loadWithOverlay(
+        fs,
+        "/v/main.or",
+        [
+          file("/v/main.or", "import { a } from \"./a\";\n"),
+          file("/v/a.or", "import { b } from \"./b\";\n"),
+          file("/v/b.or", "import { c } from \"./nope\";\n"),
+        ],
+      );
+      assertEqUsize(o.diags.length, 1, "one diagnostic");
+      assert(o.program.isNone(), "no program");
+      assert(o.sm.files.length >= 3, "files read so far (entry, a, b and the failed import)");
+      assertEqString(o.sm.files[0].path, "/v/main.or", "the entry is file 0");
+      assert(allRenderable(o.sm, o.diags), "renderable");
+    },
   );
-  assertEqUsize(o.diags.length, 1, "one diagnostic");
-  assert(o.program.isNone(), "no program");
-  assert(o.sm.files.length >= 3, "files read so far (entry, a, b and the failed import)");
-  assertEqString(o.sm.files[0].path, "/v/main.or", "the entry is file 0");
-  assert(allRenderable(o.sm, o.diags), "renderable");
 }
 
 @Test
-function packageEntryThroughDirectory(): void {
-  const o = loadWithOverlay(
-    "/v/pkg",
-    [
-      file("/v/pkg/orin.toml", "[package]\nname = \"p\"\nentry = \"src/main.or\"\n"),
-      file("/v/pkg/src/main.or", "import { u } from \"./util\";\n"),
-      file("/v/pkg/src/util.or", "export const u = 1;\n"),
-    ],
+function packageEntryThroughDirectory(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const o = loadWithOverlay(
+        fs,
+        "/v/pkg",
+        [
+          file("/v/pkg/orin.toml", "[package]\nname = \"p\"\nentry = \"src/main.or\"\n"),
+          file("/v/pkg/src/main.or", "import { u } from \"./util\";\n"),
+          file("/v/pkg/src/util.or", "export const u = 1;\n"),
+        ],
+      );
+      assertEqUsize(o.diags.length, 0, "loads");
+      const p = o.program.unwrap();
+      assertEqString(
+        p.units[p.entry].path,
+        "/v/pkg/src/main.or",
+        "the package entry is the entry unit",
+      );
+      assert(p.manifest.isSome(), "manifest recorded");
+      const unreadable = loadWithOverlay(fs, "/v/nopkg/orin.toml", []);
+      assert(unreadable.program.isNone() && unreadable.diags.length == 1, "unreadable entry");
+    },
   );
-  assertEqUsize(o.diags.length, 0, "loads");
-  const p = o.program.unwrap();
-  assertEqString(
-    p.units[p.entry].path,
-    "/v/pkg/src/main.or",
-    "the package entry is the entry unit",
-  );
-  assert(p.manifest.isSome(), "manifest recorded");
-  const unreadable = loadWithOverlay("/v/nopkg/orin.toml", []);
-  assert(unreadable.program.isNone() && unreadable.diags.length == 1, "unreadable entry");
 }
 
 @Test
-function malformedManifestIsRenderable(): void {
-  const o = loadWithOverlay("/v", [file("/v/orin.toml", "[package\n"), file("/v/main.or", "")]);
-  assert(o.program.isNone() && o.diags.length > 0, "fails");
-  assertEqUsize(o.sm.files.length, 1, "the manifest is the only file");
-  assertEqString(o.sm.files[0].path, "/v/orin.toml", "named by its path");
-  assert(allRenderable(o.sm, o.diags), "renderable");
-  const unknown = loadWithOverlay("/v", [file("/v/orin.toml", TOML), file("/v/main.or", "")]);
-  assertEqUsize(unknown.diags.length, 2, "a and b are both unknown modules");
-  assertEqString(unknown.diags[0].code, "E0502", "E0502");
-  assert(allWellFormed(unknown.diags), "well formed");
+function malformedManifestIsRenderable(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const o = loadWithOverlay(
+        fs,
+        "/v",
+        [file("/v/orin.toml", "[package\n"), file("/v/main.or", "")],
+      );
+      assert(o.program.isNone() && o.diags.length > 0, "fails");
+      assertEqUsize(o.sm.files.length, 1, "the manifest is the only file");
+      assertEqString(o.sm.files[0].path, "/v/orin.toml", "named by its path");
+      assert(allRenderable(o.sm, o.diags), "renderable");
+      const unknown = loadWithOverlay(
+        fs,
+        "/v",
+        [file("/v/orin.toml", TOML), file("/v/main.or", "")],
+      );
+      assertEqUsize(unknown.diags.length, 2, "a and b are both unknown modules");
+      assertEqString(unknown.diags[0].code, "E0502", "E0502");
+      assert(allWellFormed(unknown.diags), "well formed");
+    },
+  );
 }

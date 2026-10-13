@@ -133,7 +133,8 @@ structured, stable diagnostics — optimised for the total effort needed to reac
 | Contract clauses + SMT verification | ✅ Supported subset; not universal proof |
 | `orin graph`, `orin diff`, HTML PR report | ✅ OSIG v0.1 structural graph |
 | Compiler modernisation (ADR-0015) | 🚧 Underway |
-| Root/derived capabilities, policy enforcement, HTTP/Kafka protocol bindings | 📋 Designed; not implemented |
+| Root capabilities for the std I/O (`main(host: Host)`, narrowing, `ORIN_DENY`, path scopes; ADR-0027) | ✅ Implemented (Stage A; std I/O stays unstable until the freeze); not a sandbox against native code |
+| Derived library capabilities, policy gates, HTTP/Kafka protocol bindings | 📋 Designed; not implemented |
 | Inferred effects, field lineage, automatic cross-service process discovery | 📋 Planned |
 | Signed attestations (`.orcert`), concurrency, further optimisation | 📋 Planned |
 

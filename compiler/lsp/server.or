@@ -3,17 +3,19 @@
 // and writes the framed output. Returns the process exit code: 0 after `shutdown` + `exit`,
 // 1 for `exit` without `shutdown` or when stdin ends first.
 
+import { FsGrant } from "std:fs";
+import { StdioGrant } from "std:io";
 import { LspState, newLspState, pump, lspExitCode } from "./handler";
 import { stdinReadBytes, stdinReadLine, stdoutWrite } from "./stdio";
 
 type Msg = { text: string; ok: bool; };
 
 // Next framed message as raw bytes (headers + body), `ok` false at end of input.
-function readFrame(): Msg {
+function readFrame(stdio: StdioGrant): Msg {
   let headers: string[] = [];
   let len: int = -1;
   while (true) {
-    const l = stdinReadLine();
+    const l = stdinReadLine(stdio);
     if (l.isNone()) {
       return Msg { text: "", ok: false };
     }
@@ -36,21 +38,21 @@ function readFrame(): Msg {
   if (len < 0) {
     return Msg { text: "", ok: false };
   }
-  const body = stdinReadBytes(len.toUsize());
+  const body = stdinReadBytes(stdio, len.toUsize());
   if (body.isNone()) {
     return Msg { text: "", ok: false };
   }
   return Msg { text: headers.join("\r\n") + "\r\n\r\n" + body.unwrap(), ok: true };
 }
 
-export function runLsp(): int {
+export function runLsp(fs: FsGrant, stdio: StdioGrant): int {
   let st: LspState = newLspState();
   while (true) {
-    const m = readFrame();
+    const m = readFrame(stdio);
     if (!m.ok) {
       return 1;
     }
-    const r = pump(st, m.text);
+    const r = pump(fs, st, m.text);
     if (r.isErr()) {
       console.error("lsp: " + r.unwrapErr());
       return 1;
@@ -58,7 +60,7 @@ export function runLsp(): int {
     const p = r.unwrap();
     st = p.state;
     if (p.output.length > 0) {
-      stdoutWrite(p.output);
+      stdoutWrite(stdio, p.output);
     }
     const code = lspExitCode(st);
     if (code.isSome()) {

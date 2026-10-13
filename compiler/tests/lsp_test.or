@@ -1,6 +1,8 @@
 // Scripted LSP sessions against compiler/lsp (pure handler). Prints `ok` or one line per failure.
 // Build: build/bootstrap/orin2 compile compiler/tests/lsp_test.or -o x.c && cc -O1 -w -I runtime x.c runtime/orin_runtime.c platform/orin_platform.c
 
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
 import {
   LspState, LspStep, newLspState, withTestIndex, lspExitCode, handleText, pump, frameMessage, unframe,
   uriToPath, pathToUri, fullDocumentEdits
@@ -32,22 +34,22 @@ function has(hay: string, needle: string): string {
 
 const INIT: string = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"processId\":null,\"capabilities\":{}}}";
 
-function open(st: LspState, uri: string, text: string): LspStep {
-  return handleText(st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" + uri
+function open(fs: FsGrant, st: LspState, uri: string, text: string): LspStep {
+  return handleText(fs, st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"" + uri
     + "\",\"languageId\":\"orin\",\"version\":1,\"text\":" + jsonStr(text) + "}}}");
 }
 
-function change(st: LspState, uri: string, text: string): LspStep {
-  return handleText(st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\""
+function change(fs: FsGrant, st: LspState, uri: string, text: string): LspStep {
+  return handleText(fs, st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didChange\",\"params\":{\"textDocument\":{\"uri\":\""
     + uri + "\",\"version\":2},\"contentChanges\":[{\"text\":" + jsonStr(text) + "}]}}");
 }
 
-function close(st: LspState, uri: string): LspStep {
-  return handleText(st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"" + uri + "\"}}}");
+function close(fs: FsGrant, st: LspState, uri: string): LspStep {
+  return handleText(fs, st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didClose\",\"params\":{\"textDocument\":{\"uri\":\"" + uri + "\"}}}");
 }
 
-function req(st: LspState, id: int, method: string, params: string): LspStep {
-  return handleText(st, "{\"jsonrpc\":\"2.0\",\"id\":" + id.toString() + ",\"method\":\"" + method + "\",\"params\":" + params + "}");
+function req(fs: FsGrant, st: LspState, id: int, method: string, params: string): LspStep {
+  return handleText(fs, st, "{\"jsonrpc\":\"2.0\",\"id\":" + id.toString() + ",\"method\":\"" + method + "\",\"params\":" + params + "}");
 }
 
 // JSON string literal for `s` (escapes quotes, backslashes and newlines).
@@ -74,105 +76,105 @@ function diagNote(uri: string, diags: string): string {
   return "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"" + uri + "\",\"diagnostics\":[" + diags + "]}}";
 }
 
-function initialized(): LspState {
-  const s1 = handleText(newLspState(), INIT);
-  return handleText(s1.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
+function initialized(fs: FsGrant): LspState {
+  const s1 = handleText(fs, newLspState(), INIT);
+  return handleText(fs, s1.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
 }
 
-function testLifecycle(f: string[]): string[] {
+function testLifecycle(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   // Requests before initialize are rejected.
-  let s = handleText(newLspState(), "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/documentSymbol\",\"params\":{}}");
+  let s = handleText(fs, newLspState(), "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"textDocument/documentSymbol\",\"params\":{}}");
   fails = eq(fails, "before init", show(s), "{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32002,\"message\":\"server not initialized\"}}");
 
-  s = handleText(newLspState(), INIT);
+  s = handleText(fs, newLspState(), INIT);
   fails = eq(fails, "initialize", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},"
     + "\"documentSymbolProvider\":true,\"completionProvider\":{\"resolveProvider\":false},\"documentFormattingProvider\":true,"
     + "\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"implementationProvider\":true,\"renameProvider\":{\"prepareProvider\":true}},\"serverInfo\":{\"name\":\"orin\",\"version\":\"0.1.0\"}}}");
-  s = handleText(s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+  s = handleText(fs, s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
   fails = eq(fails, "initialized", show(s), "");
 
   // Unknown request -> MethodNotFound; unknown notification ignored; string ids are echoed.
-  s = handleText(s.state, "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"textDocument/semanticTokens/full\",\"params\":{}}");
+  s = handleText(fs, s.state, "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"textDocument/semanticTokens/full\",\"params\":{}}");
   fails = eq(fails, "method not found", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"error\":{\"code\":-32601,\"message\":\"method not found: textDocument/semanticTokens/full\"}}");
-  s = handleText(s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"$/setTrace\",\"params\":{\"value\":\"off\"}}");
+  s = handleText(fs, s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"$/setTrace\",\"params\":{\"value\":\"off\"}}");
   fails = eq(fails, "unknown notification", show(s), "");
 
   // Malformed JSON and missing params.
-  s = handleText(s.state, "{oops");
+  s = handleText(fs, s.state, "{oops");
   fails = eq(fails, "parse error", has(show(s), "\"code\":-32700"), "true");
-  s = req(s.state, 3, "textDocument/documentSymbol", "{}");
+  s = req(fs, s.state, 3, "textDocument/documentSymbol", "{}");
   fails = eq(fails, "invalid params", show(s), "{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32602,\"message\":\"invalid params\"}}");
 
   // Index-based features are not advertised/answered while the checker has no index.
-  s = req(s.state, 4, "textDocument/definition", "{\"textDocument\":{\"uri\":\"file:///t/x.or\"},\"position\":{\"line\":0,\"character\":0}}");
+  s = req(fs, s.state, 4, "textDocument/definition", "{\"textDocument\":{\"uri\":\"file:///t/x.or\"},\"position\":{\"line\":0,\"character\":0}}");
   fails = eq(fails, "definition null", show(s), "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}");
 
   // shutdown / exit.
-  s = req(s.state, 5, "shutdown", "null");
+  s = req(fs, s.state, 5, "shutdown", "null");
   fails = eq(fails, "shutdown", show(s), "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":null}");
-  s = req(s.state, 6, "textDocument/documentSymbol", "{}");
+  s = req(fs, s.state, 6, "textDocument/documentSymbol", "{}");
   fails = eq(fails, "after shutdown", has(show(s), "\"code\":-32600"), "true");
   fails = eq(fails, "no exit yet", lspExitCode(s.state).isNone().toString(), "true");
-  s = handleText(s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+  s = handleText(fs, s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
   fails = eq(fails, "exit code 0", lspExitCode(s.state).unwrapOr(-1).toString(), "0");
 
-  const abrupt = handleText(initialized(), "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+  const abrupt = handleText(fs, initialized(fs), "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
   fails = eq(fails, "exit code 1", lspExitCode(abrupt.state).unwrapOr(-1).toString(), "1");
   return fails;
 }
 
-function testDiagnostics(f: string[]): string[] {
+function testDiagnostics(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const uri = "file:///t/a.or";
-  let st = initialized();
+  let st = initialized(fs);
 
   // Valid document: empty diagnostics.
-  let s = open(st, uri, "function f(x: int): int {\n  return x;\n}\n");
+  let s = open(fs, st, uri, "function f(x: int): int {\n  return x;\n}\n");
   fails = eq(fails, "open valid", show(s), diagNote(uri, ""));
   st = s.state;
 
   // Syntax error -> E0200 at the offending token.
-  s = change(st, uri, "function f( {\n");
+  s = change(fs, st, uri, "function f( {\n");
   fails = eq(fails, "syntax", show(s), diagNote(uri,
     "{\"range\":{\"start\":{\"line\":0,\"character\":12},\"end\":{\"line\":0,\"character\":13}},\"severity\":1,\"code\":\"E0200\",\"source\":\"orin\","
     + "\"message\":\"expected identifier, found `{`\"}"));
   st = s.state;
 
   // Type error on the second line -> E0400 on `true`.
-  s = change(st, uri, "function f(): int {\n  return true;\n}\n");
+  s = change(fs, st, uri, "function f(): int {\n  return true;\n}\n");
   fails = eq(fails, "type error", show(s), diagNote(uri,
     "{\"range\":{\"start\":{\"line\":1,\"character\":9},\"end\":{\"line\":1,\"character\":13}},\"severity\":1,\"code\":\"E0400\",\"source\":\"orin\","
     + "\"message\":\"expected `int`, found `bool`\"}"));
   st = s.state;
 
   // Fixed again: cleared.
-  s = change(st, uri, "function f(): int {\n  return 1;\n}\n");
+  s = change(fs, st, uri, "function f(): int {\n  return 1;\n}\n");
   fails = eq(fails, "fixed", show(s), diagNote(uri, ""));
   st = s.state;
 
   // Save re-publishes.
-  s = handleText(st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"" + uri + "\"}}}");
+  s = handleText(fs, st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"" + uri + "\"}}}");
   fails = eq(fails, "save", show(s), diagNote(uri, ""));
 
   // Close clears.
-  s = close(st, uri);
+  s = close(fs, st, uri);
   fails = eq(fails, "close", show(s), diagNote(uri, ""));
   return fails;
 }
 
-function testCrossModule(f: string[]): string[] {
+function testCrossModule(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const ua = "file:///w/main.or";
   const ub = "file:///w/lib.or";
-  let st = initialized();
-  let s = open(st, ub, "export function g(x: int): int {\n  return \"s\";\n}\n");
+  let st = initialized(fs);
+  let s = open(fs, st, ub, "export function g(x: int): int {\n  return \"s\";\n}\n");
   st = s.state;
   // lib.or alone: its own type error.
   fails = eq(fails, "lib alone", has(show(s), "\"code\":\"E0400\""), "true");
-  s = open(st, ua, "import { g } from \"./lib\";\nfunction main(): void {\n  console.log(g(1).toString());\n}\n");
+  s = open(fs, st, ua, "import { g } from \"./lib\";\nfunction main(): void {\n  console.log(g(1).toString());\n}\n");
   st = s.state;
   // main.or has no error of its own; the error in lib.or is attached to lib.or exactly once.
   const out = show(s);
@@ -188,30 +190,30 @@ function testCrossModule(f: string[]): string[] {
   fails = eq(fails, "cross main clean", mainNote, diagNote(ua, ""));
 
   // Fix lib via a change: both documents clean.
-  s = change(st, ub, "export function g(x: int): int {\n  return x;\n}\n");
+  s = change(fs, st, ub, "export function g(x: int): int {\n  return x;\n}\n");
   st = s.state;
   fails = eq(fails, "cross fixed", show(s), diagNote(ub, "") + "\n" + diagNote(ua, ""));
 
   // Break lib's export: the importer reports E0300.
-  s = change(st, ub, "function g(x: int): int {\n  return x;\n}\n");
+  s = change(fs, st, ub, "function g(x: int): int {\n  return x;\n}\n");
   st = s.state;
   fails = eq(fails, "cross E0300", has(show(s), "\"code\":\"E0300\""), "true");
 
   // Close lib: it is cleared (and the importer still sees it through the disk fallback, which
   // does not exist here -> E0301).
-  s = close(st, ub);
+  s = close(fs, st, ub);
   fails = eq(fails, "cross close", has(show(s), "\"code\":\"E0301\""), "true");
   return fails;
 }
 
-function testQueries(f: string[]): string[] {
+function testQueries(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const uri = "file:///q/a.or";
   const src = "import { h } from \"./nothere\";\nexport type P = { x: int; };\nfunction f(a: int): int {\n  return a;\n}\n";
-  let st = initialized();
-  st = open(st, uri, src).state;
+  let st = initialized(fs);
+  st = open(fs, st, uri, src).state;
 
-  let s = req(st, 10, "textDocument/documentSymbol", "{\"textDocument\":{\"uri\":\"" + uri + "\"}}");
+  let s = req(fs, st, 10, "textDocument/documentSymbol", "{\"textDocument\":{\"uri\":\"" + uri + "\"}}");
   fails = eq(fails, "docsym", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"result\":["
     + "{\"name\":\"P\",\"detail\":\"type P (record)\",\"kind\":23,\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":28}},"
@@ -221,7 +223,7 @@ function testQueries(f: string[]): string[] {
     + "{\"name\":\"f\",\"detail\":\"function f(a: int): int\",\"kind\":12,\"range\":{\"start\":{\"line\":2,\"character\":0},\"end\":{\"line\":4,\"character\":1}},"
     + "\"selectionRange\":{\"start\":{\"line\":2,\"character\":9},\"end\":{\"line\":2,\"character\":10}},\"children\":[]}]}");
 
-  s = req(st, 11, "textDocument/completion", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":3,\"character\":2}}");
+  s = req(fs, st, 11, "textDocument/completion", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":3,\"character\":2}}");
   const c = show(s);
   fails = eq(fails, "completion head", has(c, "{\"jsonrpc\":\"2.0\",\"id\":11,\"result\":{\"isIncomplete\":false,\"items\":[{\"label\":\"P\",\"kind\":22,"), "true");
   fails = eq(fails, "completion decl", has(c, "{\"label\":\"f\",\"kind\":3,\"detail\":\"function f(a: int): int\"}"), "true");
@@ -230,7 +232,7 @@ function testQueries(f: string[]): string[] {
   fails = eq(fails, "completion builtin", has(c, "{\"label\":\"Option\""), "true");
 
   // Formatting: the real formatter answers with a list of edits (here: none, the text is canonical).
-  s = req(st, 12, "textDocument/formatting", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"options\":{\"tabSize\":2,\"insertSpaces\":true}}");
+  s = req(fs, st, 12, "textDocument/formatting", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"options\":{\"tabSize\":2,\"insertSpaces\":true}}");
   fails = eq(fails, "formatting", show(s), "{\"jsonrpc\":\"2.0\",\"id\":12,\"result\":[]}");
 
   // The edit helper used when a formatter is wired.
@@ -242,13 +244,13 @@ function testQueries(f: string[]): string[] {
 }
 
 // Interfaces (ADR-0019): document symbols and `textDocument/implementation` over a hand-built index.
-function testInterfaces(f: string[]): string[] {
+function testInterfaces(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const uri = "file:///q/shape.or";
   const text = "interface Shape {\n  area(): int;\n}\nclass Sq implements Shape {\n  area(): int { return 1; }\n}\n";
-  let st = initialized();
-  st = open(st, uri, text).state;
-  let s = req(st, 40, "textDocument/documentSymbol", "{\"textDocument\":{\"uri\":\"" + uri + "\"}}");
+  let st = initialized(fs);
+  st = open(fs, st, uri, text).state;
+  let s = req(fs, st, 40, "textDocument/documentSymbol", "{\"textDocument\":{\"uri\":\"" + uri + "\"}}");
   fails = eq(fails, "iface docsym", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":40,\"result\":["
     + "{\"name\":\"Shape\",\"detail\":\"interface Shape\",\"kind\":11,\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":2,\"character\":1}},"
@@ -266,25 +268,25 @@ function testInterfaces(f: string[]): string[] {
   const refs = [SymbolRef { span: span(0, 55, 60), def: 0 }];
   const idx = SemanticIndex { defs: defs, refs: refs, types: [], impls: [ImplLink { cls: 2, iface: 0, span: span(0, 55, 60) }], calls: [] };
   let st2 = withTestIndex(newLspState(), idx);
-  st2 = handleText(st2, INIT).state;
-  st2 = handleText(st2, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
-  st2 = open(st2, uri, text).state;
+  st2 = handleText(fs, st2, INIT).state;
+  st2 = handleText(fs, st2, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
+  st2 = open(fs, st2, uri, text).state;
   const doc = "\"textDocument\":{\"uri\":\"" + uri + "\"}";
   // On the interface name: the implementing class.
-  s = req(st2, 41, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":0,\"character\":11}}");
+  s = req(fs, st2, 41, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":0,\"character\":11}}");
   fails = eq(fails, "implementation of interface", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":41,\"result\":[{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":3,\"character\":6},\"end\":{\"line\":3,\"character\":8}}}]}");
   // On the interface method: the method of the class.
-  s = req(st2, 42, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":1,\"character\":3}}");
+  s = req(fs, st2, 42, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":1,\"character\":3}}");
   fails = eq(fails, "implementation of method", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":[{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":4,\"character\":2},\"end\":{\"line\":4,\"character\":6}}}]}");
   // On the class: nothing.
-  s = req(st2, 43, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":3,\"character\":7}}");
+  s = req(fs, st2, 43, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":3,\"character\":7}}");
   fails = eq(fails, "implementation of class", show(s), "{\"jsonrpc\":\"2.0\",\"id\":43,\"result\":[]}");
   return fails;
 }
 
-function testIndexRequests(f: string[]): string[] {
+function testIndexRequests(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const uri = "file:///q/idx.or";
   const text = "function add(a: int): int { return a; }\nfunction main(): void { add(1); }\n";
@@ -303,69 +305,69 @@ function testIndexRequests(f: string[]): string[] {
   const idx = SemanticIndex { defs: defs, refs: refs, types: types, impls: [], calls: [] };
 
   let st = withTestIndex(newLspState(), idx);
-  const init = handleText(st, INIT);
+  const init = handleText(fs, st, INIT);
   fails = eq(fails, "caps advertise", has(show(init), "\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"implementationProvider\":true,\"renameProvider\":{\"prepareProvider\":true}"), "true");
-  st = handleText(init.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
-  st = open(st, uri, text).state;
+  st = handleText(fs, init.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
+  st = open(fs, st, uri, text).state;
   const doc = "\"textDocument\":{\"uri\":\"" + uri + "\"}";
   const onCall = "\"position\":{\"line\":1,\"character\":24}";
 
-  let s = req(st, 20, "textDocument/definition", "{" + doc + "," + onCall + "}");
+  let s = req(fs, st, 20, "textDocument/definition", "{" + doc + "," + onCall + "}");
   fails = eq(fails, "definition", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":20,\"result\":{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":0,\"character\":9},\"end\":{\"line\":0,\"character\":12}}}}");
-  s = req(st, 21, "textDocument/definition", "{" + doc + ",\"position\":{\"line\":0,\"character\":2}}");
+  s = req(fs, st, 21, "textDocument/definition", "{" + doc + ",\"position\":{\"line\":0,\"character\":2}}");
   fails = eq(fails, "definition none", show(s), "{\"jsonrpc\":\"2.0\",\"id\":21,\"result\":null}");
 
-  s = req(st, 22, "textDocument/hover", "{" + doc + "," + onCall + "}");
+  s = req(fs, st, 22, "textDocument/hover", "{" + doc + "," + onCall + "}");
   fails = eq(fails, "hover", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":22,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"```orin\\nfunction add(a: int): int\\n```\"},"
     + "\"range\":{\"start\":{\"line\":1,\"character\":24},\"end\":{\"line\":1,\"character\":27}}}}");
-  s = req(st, 23, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":1,\"character\":28}}");
+  s = req(fs, st, 23, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":1,\"character\":28}}");
   fails = eq(fails, "hover type", has(show(s), "\"value\":\"```orin\\nint\\n```\""), "true");
 
-  s = req(st, 24, "textDocument/references", "{" + doc + "," + onCall + ",\"context\":{\"includeDeclaration\":true}}");
+  s = req(fs, st, 24, "textDocument/references", "{" + doc + "," + onCall + ",\"context\":{\"includeDeclaration\":true}}");
   fails = eq(fails, "references", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":24,\"result\":["
     + "{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":0,\"character\":9},\"end\":{\"line\":0,\"character\":12}}},"
     + "{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":1,\"character\":24},\"end\":{\"line\":1,\"character\":27}}}]}");
-  s = req(st, 25, "textDocument/references", "{" + doc + "," + onCall + ",\"context\":{\"includeDeclaration\":false}}");
+  s = req(fs, st, 25, "textDocument/references", "{" + doc + "," + onCall + ",\"context\":{\"includeDeclaration\":false}}");
   fails = eq(fails, "references no decl", has(show(s), "\"line\":0"), "false");
 
-  s = req(st, 26, "textDocument/prepareRename", "{" + doc + "," + onCall + "}");
+  s = req(fs, st, 26, "textDocument/prepareRename", "{" + doc + "," + onCall + "}");
   fails = eq(fails, "prepareRename", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":26,\"result\":{\"range\":{\"start\":{\"line\":1,\"character\":24},\"end\":{\"line\":1,\"character\":27}},\"placeholder\":\"add\"}}");
 
-  s = req(st, 27, "textDocument/rename", "{" + doc + "," + onCall + ",\"newName\":\"plus\"}");
+  s = req(fs, st, 27, "textDocument/rename", "{" + doc + "," + onCall + ",\"newName\":\"plus\"}");
   fails = eq(fails, "rename", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":27,\"result\":{\"changes\":{\"" + uri + "\":["
     + "{\"range\":{\"start\":{\"line\":0,\"character\":9},\"end\":{\"line\":0,\"character\":12}},\"newText\":\"plus\"},"
     + "{\"range\":{\"start\":{\"line\":1,\"character\":24},\"end\":{\"line\":1,\"character\":27}},\"newText\":\"plus\"}]}}}");
-  s = req(st, 28, "textDocument/rename", "{" + doc + "," + onCall + ",\"newName\":\"main\"}");
+  s = req(fs, st, 28, "textDocument/rename", "{" + doc + "," + onCall + ",\"newName\":\"main\"}");
   fails = eq(fails, "rename collision", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":28,\"error\":{\"code\":-32803,\"message\":\"`main` is already defined in this scope\"}}");
   return fails;
 }
 
 // `@Deprecated` (ADR-0024): a warning with the Deprecated tag on each use, and the annotation in the hover.
-function testDeprecated(f: string[]): string[] {
+function testDeprecated(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const uri = "file:///d/a.or";
   const text = "@Deprecated(\"use g\")\nfunction f(): int {\n  return 1;\n}\nfunction main(): void {\n  console.log(f().toString());\n}\n";
-  let st = initialized();
-  const s = open(st, uri, text);
+  let st = initialized(fs);
+  const s = open(fs, st, uri, text);
   st = s.state;
   fails = eq(fails, "deprecated warning", show(s), diagNote(uri,
     "{\"range\":{\"start\":{\"line\":5,\"character\":14},\"end\":{\"line\":5,\"character\":15}},\"severity\":2,\"code\":\"W0440\",\"source\":\"orin\","
     + "\"message\":\"`f` is deprecated: use g\",\"tags\":[2]}"));
-  const h = req(st, 50, "textDocument/hover", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":5,\"character\":14}}");
+  const h = req(fs, st, 50, "textDocument/hover", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":5,\"character\":14}}");
   fails = eq(fails, "deprecated hover", has(show(h), "\"value\":\"```orin\\n@Deprecated(\\\"use g\\\")\\nfunction f(): int\\n```\""), "true");
   // Errors and warnings are separate: a document without uses has no diagnostics at all.
-  const noUse = change(st, uri, "@Deprecated(\"use g\")\nfunction f(): int {\n  return 1;\n}\nfunction main(): void {\n}\n");
+  const noUse = change(fs, st, uri, "@Deprecated(\"use g\")\nfunction f(): int {\n  return 1;\n}\nfunction main(): void {\n}\n");
   fails = eq(fails, "deprecated unused", show(noUse), diagNote(uri, ""));
   return fails;
 }
 
-function testFraming(f: string[]): string[] {
+function testFraming(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   fails = eq(fails, "frame", frameMessage("{\"a\":1}"), "Content-Length: 7\r\n\r\n{\"a\":1}");
   // Multi-byte body: Content-Length counts bytes.
@@ -388,13 +390,13 @@ function testFraming(f: string[]): string[] {
   const m1 = frameMessage(INIT);
   const m2 = frameMessage("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"shutdown\"}");
   const cut = m2.length - 5;
-  let p = pump(newLspState(), m1 + m2.substring(0, cut));
+  let p = pump(fs, newLspState(), m1 + m2.substring(0, cut));
   fails = eq(fails, "pump 1", p.isOk().toString(), "true");
   if (p.isOk()) {
     const first = p.unwrap();
     fails = eq(fails, "pump 1 out", has(first.output, "\"capabilities\""), "true");
     fails = eq(fails, "pump rest", first.rest, m2.substring(0, cut));
-    const p2 = pump(first.state, first.rest + m2.substring(cut, m2.length));
+    const p2 = pump(fs, first.state, first.rest + m2.substring(cut, m2.length));
     fails = eq(fails, "pump 2", p2.unwrap().output, frameMessage("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}"));
   }
 
@@ -404,16 +406,20 @@ function testFraming(f: string[]): string[] {
   return fails;
 }
 
-function main(): void {
+function main(host: Host): void {
+  useFs(host, fs => { run(fs); });
+}
+
+function run(fs: FsGrant): void {
   let f: string[] = [];
-  f = testLifecycle(f);
-  f = testDiagnostics(f);
-  f = testCrossModule(f);
-  f = testQueries(f);
-  f = testIndexRequests(f);
-  f = testInterfaces(f);
-  f = testDeprecated(f);
-  f = testFraming(f);
+  f = testLifecycle(fs, f);
+  f = testDiagnostics(fs, f);
+  f = testCrossModule(fs, f);
+  f = testQueries(fs, f);
+  f = testIndexRequests(fs, f);
+  f = testInterfaces(fs, f);
+  f = testDeprecated(fs, f);
+  f = testFraming(fs, f);
   if (f.length == 0) {
     console.log("ok");
   } else {

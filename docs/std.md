@@ -7,11 +7,12 @@ API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
 |---|---|---|
-| `std:fs` | Orin, `stdlib/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done, **unstable** until capabilities (ADR-0016 amendment, ADR-0021); resources and streaming: ADR-0025 |
-| `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done |
+| `std:host` | Orin, `stdlib/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
+| `std:fs` | Orin, `stdlib/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
+| `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
 | `std:path` | Orin, `stdlib/path.or` | done (POSIX, lexical) |
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
-| `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; clock access **unstable** until capabilities |
+| `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; `nowMillis(clock: ClockGrant)` **unstable** (ADR-0027) |
 | `std:graph` | Orin, `stdlib/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
@@ -29,14 +30,41 @@ imported modules disappear in `compiler/opt/prune.or`. The sources use the full 
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
 unit (`$stdlib/json.Json`).
 
-The single new built-in is `nowMillis(): int` (`hir.BTimeNowMillis`, C function
+The single new built-in is `nowMillis(clock: ClockGrant): int` (`hir.BTimeNowMillis`, C function
 `orin_time_now_millis` in `runtime/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
 It is reachable as the internal module `std:clock`; `std:time` re-exports it. Use `std:time`.
 
-## std:fs (UNSTABLE: signatures may gain a capability parameter, ADR-0021)
+## std:host and capability grants (UNSTABLE until the I/O freeze, ADR-0021 Stage A, ADR-0027)
 
-Whole-file functions (unchanged): `readFile(path): Result<string, string>`, `writeFile(path, data): Result<void, string>`,
-`exists(path): bool`.
+A program that performs I/O is `function main(host: Host): void`; `main(): void` has **no I/O authority** (calling any
+std I/O function in it is a compile error, E0470). `Host` and the **grants** derived from it are resource handles
+with the rules of `File` (a parameter only; not storable, returnable, capturable, copyable: E0450-E0452, and the
+MIR verifier re-checks it). Grants come from scope functions, are revoked when the callback returns and are passed
+to every std I/O function as the first argument:
+
+```
+useHost(host, (fs, proc, stdio, clock) => ...)   // all four root grants of the host policy (withHost returns a value)
+useFs(host, fs => ...)  useProcess(host, proc => ...)  useStdio(host, stdio => ...)  useClock(host, clock => ...)
+useUnder(fs, "data", sub => ...)   // narrowing: only paths inside data/ (also withUnder<T>); never widens
+useReadOnly(fs, ro => ...)         // cannot create / write / truncate
+useArgsOnly(proc, p => ...)        // `args` but no `shell`
+```
+
+Families (ADR-0027): `FsGrant` (`std:fs`), `ProcessGrant` (`std:process`: `args`, `shell`), `StdioGrant` (`std:io`),
+`ClockGrant` (`std:time`: `nowMillis`); a network family is reserved (no `std:net` yet). **Ambient, no grant:**
+`console.log`, `console.error` and `exit` (a library without grants can therefore still write to stdout / stderr: see
+ADR-0027 D5). **Host policy:** by default every grant is what the OS process has; `ORIN_DENY=fs,process,...` (families
+`fs process stdio clock net all`) denies families: an operation that returns a `Result` returns `Err("... denied by
+the host policy (ORIN_DENY)")`, every other operation traps; a malformed `ORIN_DENY` traps at start. **Scopes:** a
+narrowed `FsGrant` compares absolute normalised paths (`..`, `.`, `//`) and resolved symbolic links, and the opened
+path is the checked one; relative paths resolve against the working directory (a filter, not a chroot). Not covered:
+races (TOCTOU), hard links and mounts, `shell` (a spawned command is outside every grant), native code. A closure
+cannot capture a grant: take all you need with `useHost`, pass grants as arguments, or use `withFileFs`.
+
+## std:fs (UNSTABLE: every function takes an `FsGrant` first, ADR-0027)
+
+Whole-file functions: `readFile(fs, path): Result<string, string>`, `writeFile(fs, path, data): Result<void, string>`,
+`exists(fs, path): bool` (traps on a denied path: a `bool` cannot carry a denial).
 
 Streaming through **resource handles** (ADR-0025, spec 06). `File` is a handle, not a value: it can only be a
 function parameter. You get one as the parameter of the callback of a scope function, which opens the file, runs
@@ -44,10 +72,13 @@ the callback and closes the file on every path:
 
 ```
 type FsError = string                       type FileMode = Read | Write | Append
-withFile<T>(path, mode, body: (file: File) => T): Result<T, FsError>
-useFile(path, mode, body: (file: File) => void): Result<void, FsError>      // body returns nothing
-withFiles<T>(pathA, modeA, pathB, modeB, body: (a: File, b: File) => T): Result<T, FsError>
-useFiles(pathA, modeA, pathB, modeB, body: (a: File, b: File) => void): Result<void, FsError>
+withFile<T>(fs, path, mode, body: (file: File) => T): Result<T, FsError>
+useFile(fs, path, mode, body: (file: File) => void): Result<void, FsError>      // body returns nothing
+withFiles<T>(fs, pathA, modeA, pathB, modeB, body: (a: File, b: File) => T): Result<T, FsError>
+useFiles(fs, pathA, modeA, pathB, modeB, body: (a: File, b: File) => void): Result<void, FsError>
+withFileFs<T>(fs, path, mode, body: (file: File, fs: FsGrant) => T): Result<T, FsError>   // the body gets the grant again (nesting)
+withUnder<T>(fs, dir, body: (sub: FsGrant) => T): T      useUnder(fs, dir, body)        // narrowing
+withReadOnly<T>(fs, body: (ro: FsGrant) => T): T         useReadOnly(fs, body)
 
 File.readLine(): Option<string>      // without "\n" / "\r\n"; None at end of file
 File.read(n: usize): Option<string>  // up to n bytes; None only at end of file (n > 0); read(0) = Some("")
@@ -65,12 +96,12 @@ a body ends the process; the runtime flushes and closes open files in its exit h
 the same time. Example:
 
 ```
-const n = withFile("log.txt", Read, f => {
+const n = withFile(fs, "log.txt", Read, f => {
   let lines: int = 0;
   while (f.readLine().isSome()) { lines += 1; }
   return lines;
 });
-useFiles("in.txt", Read, "out.txt", Write, (a, b) => { while (true) { const l = a.readLine(); if (l.isNone()) { return; } b.writeLine(l.unwrap()); } });
+useFiles(fs, "in.txt", Read, "out.txt", Write, (a, b) => { while (true) { const l = a.readLine(); if (l.isNone()) { return; } b.writeLine(l.unwrap()); } });
 ```
 
 ## std:path (POSIX, lexical)
@@ -104,7 +135,7 @@ U+FFFD); raw control characters in strings are errors; duplicate keys are kept a
 
 ## std:time
 
-`nowMillis(): int` (wall clock, ms since the Unix epoch, not monotonic). Durations are explicit-unit
+`nowMillis(clock: ClockGrant): int` (wall clock, ms since the Unix epoch, not monotonic; the grant comes from `useClock` / `useHost` of `std:host`). Durations are explicit-unit
 records `Duration { millis }`: `milliseconds/seconds/minutes/hours/days(n)`, `toMillis`, `toSeconds`,
 `addDuration`, `between(start, end)`, `plus(instant, d)`, `formatDuration` ("1h 2m 3s 5ms"). UTC calendar
 (proleptic Gregorian, no zones): `fromMillis(instant): DateTime`, `toInstant(dt): Option<int>` (validates
@@ -170,5 +201,5 @@ removed with ADR-0026; the tests were migrated.
 * No floats/`Map`: `JNum` is `int`, no `std:math`, `std:map`, edge weights, `sleep`, fractional seconds.
 * Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
-* `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close primitives behind `std:fs`; only library code may import it).
+* `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.

@@ -16,6 +16,8 @@
 // Results per clause: VERIFIED (solver: unsat), REFUTED (sat, with a counterexample for the
 // parameters) or UNKNOWN (solver unknown / timeout / unavailable, or outside the fragment).
 
+import { FsGrant } from "std:fs";
+import { ProcessGrant } from "std:process";
 import { SourceMap } from "../diag";
 import {
   Ident, FunctionDecl, TypeExpr, TNamed, UnaryOp, BinaryOp, AssignOp, Block, Stmt, Expr, StmtKind, ExprKind, ContractClause,
@@ -701,17 +703,17 @@ type Solved = { status: string; model: string; };
 
 // Runs the solver on `query` (SMT-LIB text without check-sat); status is `unsat`, `sat`, `unknown` or
 // `error` (solver missing or crashed).
-function solve(rt0: Rt, query: string): Result<Solved, string> {
+function solve(fs: FsGrant, proc: ProcessGrant, rt0: Rt, query: string): Result<Solved, string> {
   const base = "build/contracts-vc/q" + rt0.qn.toString();
-  const w = writeFile(base + ".smt2", prelude() + query + "(check-sat)\n(get-model)\n");
+  const w = writeFile(fs, base + ".smt2", prelude() + query + "(check-sat)\n(get-model)\n");
   if (w.isErr()) {
     return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
   }
-  const rc = shellRun(rt0.z3 + " -in -T:20 < " + base + ".smt2 > " + base + ".out 2>&1");
+  const rc = shellRun(proc, rt0.z3 + " -in -T:20 < " + base + ".smt2 > " + base + ".out 2>&1");
   if (rc != 0 && rc != 1) {
     return Err("solver `" + rt0.z3 + "` could not be run (exit status " + rc.toString() + ")");
   }
-  const o = readFile(base + ".out");
+  const o = readFile(fs, base + ".out");
   if (o.isErr()) {
     return Err("cannot read solver output");
   }
@@ -808,9 +810,9 @@ function allUnknown(rt0: Rt, f: FnInfo, reason: string): Rt {
 }
 
 // Result of one solver query for a clause.
-function report(rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: string): Rt {
+function report(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: string): Rt {
   let rt = rt0;
-  const s = solve(rt, query);
+  const s = solve(fs, proc, rt, query);
   rt.qn += 1;
   match (s) {
     Err(m) => { return pushRes(rt, f, kind, c, "UNKNOWN", m, []); },
@@ -834,9 +836,9 @@ type Entail = { rt: Rt; holds: bool; };
 
 // True (`holds`) exactly when the solver proves `goal` from the facts of `g` and the assumptions `base`
 // (`unsat` of the negation). `sat`, `unknown` and solver errors are all "not proved": a finding needs a proof.
-function entails(rt0: Rt, g: Gen, base: string[], goal: string): Entail {
+function entails(fs: FsGrant, proc: ProcessGrant, rt0: Rt, g: Gen, base: string[], goal: string): Entail {
   let rt = rt0;
-  const s = solve(rt, queryText(g, base, [], goal));
+  const s = solve(fs, proc, rt, queryText(g, base, [], goal));
   rt.qn += 1;
   return match (s) {
     Ok(r) => Entail { rt: rt, holds: r.status == "unsat" },
@@ -859,7 +861,7 @@ function pushWarn(rt0: Rt, f: FnInfo, code: string, kind: string, c: ContractCla
 //   W0460  clause valid with no premises (parameters in the i64 range only): it cannot fail
 //   W0461  the @Requires clauses together are unsatisfiable: the function can never be called
 //   W0462  an @Ensures that follows from the @Requires alone, whatever the result is: the body cannot violate it
-function qualityChecks(rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: string[], rty: int): Rt {
+function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: string[], rty: int): Rt {
   let rt = rt0;
   const d = f.decl;
   const reqs = clausesOf(d, 0);
@@ -877,7 +879,7 @@ function qualityChecks(rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: strin
     }
     reqTerms.push(t.unwrap().t);
     if (!isSyntacticallyTrivial(d, c)) {
-      const r = entails(rt, g, rangeBase, t.unwrap().t);
+      const r = entails(fs, proc, rt, g, rangeBase, t.unwrap().t);
       rt = r.rt;
       if (r.holds) {
         rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Requires` is valid without any premises: it excludes no input and catches no bug");
@@ -886,7 +888,7 @@ function qualityChecks(rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: strin
   }
   const withReqs = concat(rangeBase, reqTerms);
   if (reqTerms.length > 0) {
-    const u = entails(rt, g, withReqs, "false");
+    const u = entails(fs, proc, rt, g, withReqs, "false");
     rt = u.rt;
     if (u.holds) {
       return pushWarn(rt, f, W_UNSAT_REQUIRES, "unsatisfiable-requires", reqs[0], "the `@Requires` clauses of `" + d.name.name + "` are unsatisfiable: the function can never be called, and every `@Ensures` holds vacuously");
@@ -914,14 +916,14 @@ function qualityChecks(rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: strin
     if (t.isErr() || t.unwrap().ty != 1) {
       continue;
     }
-    const taut = entails(rt, g2, resBase, t.unwrap().t);
+    const taut = entails(fs, proc, rt, g2, resBase, t.unwrap().t);
     rt = taut.rt;
     if (taut.holds) {
       if (!isSyntacticallyTrivial(d, c)) {
         rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Ensures` is valid without any premises: it holds for every result and catches no bug");
       }
     } else if (reqTerms.length > 0) {
-      const imp = entails(rt, g2, concat(resBase, reqTerms), t.unwrap().t);
+      const imp = entails(fs, proc, rt, g2, concat(resBase, reqTerms), t.unwrap().t);
       rt = imp.rt;
       if (imp.holds) {
         rt = pushWarn(rt, f, W_IMPLIED_ENSURES, "implied-ensures", c, "`@Ensures` follows from the `@Requires` alone for every possible result: the body cannot violate it");
@@ -931,7 +933,7 @@ function qualityChecks(rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: strin
   return rt;
 }
 
-function verifyFn(rt0: Rt, f: FnInfo): Rt {
+function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo): Rt {
   let rt = rt0;
   const d = f.decl;
   const enss = clausesOf(d, 1);
@@ -973,7 +975,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
   }
   const rangeBase = base;
   base = concat(base, reqR.unwrap());
-  rt = qualityChecks(rt, f, g, vars, rangeBase, rty);
+  rt = qualityChecks(fs, proc, rt, f, g, vars, rangeBase, rty);
   const exR = execStmts(g, St { vars: vars, pc: [] }, d.body.stmts, cx);
   if (exR.isErr()) {
     return allUnknown(rt, f, exR.unwrapErr());
@@ -987,7 +989,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
   // Call-site preconditions.
   for (const o of g.obls) {
     const q = queryText(g, base, o.pc, o.goal);
-    const s = solve(rt, q);
+    const s = solve(fs, proc, rt, q);
     rt.qn += 1;
     let status = "UNKNOWN";
     let reason = "";
@@ -1039,7 +1041,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
     if (failure != "") {
       rt = pushRes(rt, f, "ensures", c, "UNKNOWN", failure, []);
     } else {
-      rt = report(rt, f, "ensures", c, queryText(g, base, [], andAll(parts)));
+      rt = report(fs, proc, rt, f, "ensures", c, queryText(g, base, [], andAll(parts)));
     }
   }
   return rt;
@@ -1049,7 +1051,7 @@ function verifyFn(rt0: Rt, f: FnInfo): Rt {
 // Driver
 // ---------------------------------------------------------------------------
 
-export function verifyContracts(prog: LoadedProgram, sm: SourceMap, z3: string): Report {
+export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, z3: string): Report {
   let fns: FnInfo[] = [];
   for (const u of prog.units) {
     if (u.name.startsWith("$")) {
@@ -1063,12 +1065,12 @@ export function verifyContracts(prog: LoadedProgram, sm: SourceMap, z3: string):
       }
     }
   }
-  shellRun("mkdir -p build/contracts-vc");
+  shellRun(proc, "mkdir -p build/contracts-vc");
   let rt = Rt { fns: fns, z3: z3, qn: 0, out: [], warns: [] };
   for (const f of fns) {
     // Functions without clauses are still analysed (their calls of contracted functions are proof
     // obligations); if they are outside the fragment nothing is reported for them.
-    rt = verifyFn(rt, f);
+    rt = verifyFn(fs, proc, rt, f);
   }
   return Report { results: rt.out, warnings: rt.warns };
 }

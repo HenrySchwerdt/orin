@@ -4,6 +4,7 @@
 import { Span, Diagnostic, diag } from "../diag";
 import { StdModule } from "./program";
 import { Sources } from "./sources";
+import { FsGrant } from "std:fs";
 import { normalizePath, isNormalized, dirname, joinPath, relativeTo, isInside } from "./path";
 
 // An import resolves to a std module implemented by the C runtime (`std` is Some, `path` is empty)
@@ -31,6 +32,7 @@ function isStdlibModule(p: string): bool {
     "std:time" => true,
     "std:graph" => true,
     "std:test" => true,
+    "std:host" => true,
     _ => false,
   };
 }
@@ -55,7 +57,7 @@ function unknownStd(p: string, sp: Span): Diagnostic {
   return diag(
     "E0301",
     sp,
-    `unknown standard module \`${p}\` (available: std:fs, std:process, std:io, std:math, std:path, std:json, std:time, std:graph, std:test)`,
+    `unknown standard module \`${p}\` (available: std:fs, std:process, std:io, std:math, std:path, std:json, std:time, std:graph, std:test, std:host)`,
   );
 }
 
@@ -96,7 +98,7 @@ export class ImportResolver {
       ==> result.unwrapErr().code == "E0301" || result.unwrapErr().code == "E0302")
   @Ensures(result.isErr()
       ==> result.unwrapErr().span.start == sp.start && result.unwrapErr().span.end == sp.end)
-  resolve(importer: string, p: string, sp: Span): Result<Resolved, Diagnostic> {
+  resolve(fs: FsGrant, importer: string, p: string, sp: Span): Result<Resolved, Diagnostic> {
     if (p.startsWith("$")) {
       // The implicit import of a prelude root's entry file (added to the program's entry file by the loader).
       return Ok(Resolved { std: None, path: normalizePath(p) });
@@ -119,8 +121,8 @@ export class ImportResolver {
     const asFile = joinPath(dir, p + ".or");
     const asModule = joinPath(dir, p + "/module.or");
     let target = asFile;
-    if (!this.src.exists(asFile)) {
-      if (!this.src.exists(asModule)) {
+    if (!this.src.exists(fs, asFile)) {
+      if (!this.src.exists(fs, asModule)) {
         return Err(
           diag(
             "E0301",
@@ -131,7 +133,7 @@ export class ImportResolver {
       }
       target = asModule;
     }
-    const blocked = this.privateModuleOf(importer, target);
+    const blocked = this.privateModuleOf(fs, importer, target);
     if (blocked.isSome()) {
       const owner = blocked.unwrap();
       return Err(
@@ -152,11 +154,11 @@ export class ImportResolver {
   @Ensures(result.isSome()
       ==> isNormalized(result.unwrap()) && !isInside(result.unwrap(), importer))
   @Ensures(result.isSome() ==> isInside(result.unwrap(), target))
-  private privateModuleOf(importer: string, target: string): Option<string> {
+  private privateModuleOf(fs: FsGrant, importer: string, target: string): Option<string> {
     let d = dirname(target);
     while (d != ".") {
       const m = joinPath(d, "module.or");
-      if (target != m && this.src.exists(m) && !isInside(d, importer)) {
+      if (target != m && this.src.exists(fs, m) && !isInside(d, importer)) {
         return Some(d);
       }
       const parent = dirname(d);

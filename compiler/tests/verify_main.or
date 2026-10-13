@@ -3,7 +3,10 @@
 //   build/bootstrap/orin2 build compiler/tests/verify_main.or -o build/verify_main && ./build/verify_main
 
 import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
-import { BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, UnOp, BinOp } from "../hir";
+import {
+  BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, BFsReadFile, BFsExists, BGrantFs, BGrantClock, BGrantUnder,
+  BGrantReadOnly, BGrantRevoke, BTimeNowMillis, UnOp, BinOp
+} from "../hir";
 import { verify, VerifyReport } from "../verify";
 import { exit } from "std:process";
 
@@ -542,90 +545,195 @@ function ifaceCases(): usize {
   return bad;
 }
 
-// ---------------------------------------------------------------- resource handles (v1.8, ADR-0025)
+// ---------------------------------------------------------------- resource handles (v1.8, ADR-0025; grants v1.9, ADR-0027)
 
-function opn(h: usize): Instr { return IBuiltin(Some(h), BFileOpen, [OStr(0), OInt(0)]); }
+// In v1.9 `BFileOpen` takes the file grant as its first argument. The file cases below are written without it:
+// `opn` marks the authority with the operand `OInt(-1)` and `withAuth` gives every function that opens a file a
+// leading handle parameter `auth` (a borrowed grant), shifting every local index by one.
+function so(o: Operand): Operand {
+  return match (o) { OLocal(l) => OLocal(l + 1), _ => o };
+}
+
+function sos(os: Operand[]): Operand[] {
+  let out: Operand[] = [];
+  for (const o of os) {
+    out.push(so(o));
+  }
+  return out;
+}
+
+function sd(d: Option<usize>): Option<usize> {
+  return match (d) { Some(x) => Some(x + 1), None => None };
+}
+
+function sInstr(i: Instr): Instr {
+  return match (i) {
+    ICopy(d, o) => ICopy(d + 1, so(o)),
+    IMove(d, x) => IMove(d + 1, x + 1),
+    IBorrow(d, x) => IBorrow(d + 1, x + 1),
+    IDup(d, o) => IDup(d + 1, so(o)),
+    IRelease(x) => IRelease(x + 1),
+    IUnary(d, op, o) => IUnary(d + 1, op, so(o)),
+    IBinary(d, op, a, b) => IBinary(d + 1, op, so(a), so(b)),
+    ICall(d, f, args) => ICall(sd(d), f, sos(args)),
+    IBuiltin(d, b, args) => match (b) {
+      BFileOpen => IBuiltin(sd(d), b, [OLocal(0)].concat(sos(args.slice(1, args.length)))),
+      _ => IBuiltin(sd(d), b, sos(args))
+    },
+    IStrAppend(x, o) => IStrAppend(x + 1, so(o)),
+    IStructNew(d, tag, slots) => IStructNew(d + 1, tag, sos(slots)),
+    INullary(d, tag) => INullary(d + 1, tag),
+    ITag(d, o) => ITag(d + 1, so(o)),
+    IGetField(d, o, k) => IGetField(d + 1, so(o), k),
+    ISetField(x, k, o) => ISetField(x + 1, k, so(o)),
+    ITakeField(d, x, k) => ITakeField(d + 1, x + 1, k),
+    IPutField(x, k, y) => IPutField(x + 1, k, y + 1),
+    IMakeUnique(x) => IMakeUnique(x + 1),
+    IArrayNew(d, r, os) => IArrayNew(d + 1, r, sos(os)),
+    IArrayGet(d, a, k) => IArrayGet(d + 1, so(a), so(k)),
+    IArraySet(x, k, o) => IArraySet(x + 1, so(k), so(o)),
+    IArrayTake(d, x, k) => IArrayTake(d + 1, x + 1, so(k)),
+    IArrayPut(x, k, y) => IArrayPut(x + 1, so(k), y + 1),
+    IArrayPush(x, o) => IArrayPush(x + 1, so(o)),
+    IArrayPop(d, x) => IArrayPop(d + 1, x + 1),
+    IClosure(d, f, caps) => IClosure(d + 1, f, sos(caps)),
+    ICallIndirect(d, c, args) => ICallIndirect(sd(d), so(c), sos(args)),
+    IIface(d, v, o) => IIface(d + 1, v, so(o)),
+    ICallVirtual(d, r, slot, args) => ICallVirtual(sd(d), so(r), slot, sos(args))
+  };
+}
+
+function sTerm(t0: Terminator): Terminator {
+  return match (t0) {
+    TGoto(b) => TGoto(b),
+    TBranch(o, a, b) => TBranch(so(o), a, b),
+    TSwitch(o, cs, d) => TSwitch(so(o), cs, d),
+    TReturn(r) => TReturn(match (r) { Some(o) => Some(so(o)), None => None }),
+    TTrap(m) => TTrap(m)
+  };
+}
+
+function opensFile(f: MFunction): bool {
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      const o = match (i) { IBuiltin(_, bi, _) => match (bi) { BFileOpen => true, _ => false }, _ => false };
+      if (o) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function withAuth(p0: MProgram): MProgram {
+  let fs: MFunction[] = [];
+  for (const f of p0.functions) {
+    if (!opensFile(f)) {
+      fs.push(f);
+      continue;
+    }
+    let blocks: MBlock[] = [];
+    for (const b of f.blocks) {
+      let is: Instr[] = [];
+      for (const i of b.instrs) {
+        is.push(sInstr(i));
+      }
+      blocks.push(MBlock { instrs: is, term: sTerm(b.term) });
+    }
+    fs.push(MFunction {
+      name: f.name, paramCount: f.paramCount + 1, paramOwned: [false].concat(f.paramOwned),
+      locals: [lh("auth")].concat(f.locals), ret: f.ret, blocks: blocks
+    });
+  }
+  return MProgram { functions: fs, strings: p0.strings, main: p0.main, vtables: p0.vtables, inlineFns: p0.inlineFns };
+}
+
+function hpos(name: string, p0: MProgram): bool { return pos(name, withAuth(p0)); }
+function hneg(name: string, p0: MProgram, needle: string): bool { return neg(name, withAuth(p0), needle); }
+
+function opn(h: usize): Instr { return IBuiltin(Some(h), BFileOpen, [OInt(-1), OStr(0), OInt(0)]); }
+
 function cls(h: usize, r: usize): Instr { return IBuiltin(Some(r), BFileClose, [OLocal(h)]); }
 function rdl(h: usize, r: usize): Instr { return IBuiltin(Some(r), BFileReadLine, [OLocal(h)]); }
 
 function handleCases(): usize {
   let bad: usize = 0;
   const dead = "dead";
-  const p1 = pos("open, read, close", straight(0, [lh("h"), lr("l"), lr("e")], [
+  const p1 = hpos("open, read, close", straight(0, [lh("h"), lr("l"), lr("e")], [
     opn(0), rdl(0, 1), IRelease(1), cls(0, 2), IRelease(2)]));
-  const p2 = pos("handle parameter passed to a call and a builtin (borrowed)", prog([
+  const p2 = hpos("handle parameter passed to a call and a builtin (borrowed)", prog([
     fn("f", 1, [lh("h"), lr("l"), li("i")], MVoid, [bk([ICall(None, 1, [OLocal(0)]), rdl(0, 1), IRelease(1)], ret())]),
     fn("g", 1, [lh("h")], MVoid, [bk([], ret())])]));
-  const p3 = pos("scope shape: open, indirect call with the handle, close", prog([
+  const p3 = hpos("scope shape: open, indirect call with the handle, close", prog([
     fn("f", 0, [lh("h"), lr("c"), lr("e")], MVoid, [bk([
       IClosure(1, 1, []), opn(0), ICallIndirect(None, OLocal(1), [OLocal(0)]), cls(0, 2), IRelease(2), IRelease(1)], ret())]),
     fn("l", 2, [lr("env"), lh("h")], MVoid, [bk([], ret())])]));
-  const p4 = pos("closed on both branches", prog([
+  const p4 = hpos("closed on both branches", prog([
     fn("f", 1, [lb("c"), lh("h"), lr("e")], MVoid, [
       bk([opn(1)], TBranch(OLocal(0), 1, 2)),
       bk([cls(1, 2), IRelease(2)], ret()),
       bk([cls(1, 2), IRelease(2)], ret())])]));
-  const p5 = pos("two handles open at the same time", straight(0, [lh("a"), lh("b"), lr("e1"), lr("e2")], [
+  const p5 = hpos("two handles open at the same time", straight(0, [lh("a"), lh("b"), lr("e1"), lr("e2")], [
     opn(0), opn(1), cls(1, 2), IRelease(2), cls(0, 3), IRelease(3)]));
-  const p6 = pos("trap with an open handle (the exit hook closes it)", prog([
+  const p6 = hpos("trap with an open handle (the exit hook closes it)", prog([
     fn("f", 0, [lh("h")], MVoid, [bk([opn(0)], TTrap("boom"))])]));
-  const p7 = pos("a handle can be reopened after it was closed", straight(0, [lh("h"), lr("e")], [
+  const p7 = hpos("a handle can be reopened after it was closed", straight(0, [lh("h"), lr("e")], [
     opn(0), cls(0, 1), IRelease(1), opn(0), cls(0, 1), IRelease(1)]));
-  const n1 = neg("handle never closed", straight(0, [lh("h")], [opn(0)]), "not closed");
-  const n2 = neg("handle closed on one branch only", prog([
+  const n1 = hneg("handle never closed", straight(0, [lh("h")], [opn(0)]), "not closed");
+  const n2 = hneg("handle closed on one branch only", prog([
     fn("f", 1, [lb("c"), lh("h"), lr("e")], MVoid, [
       bk([opn(1)], TBranch(OLocal(0), 1, 2)),
       bk([cls(1, 2), IRelease(2)], TGoto(3)),
       bk([], TGoto(3)),
       bk([], ret())])]), "not closed");
-  const n3 = neg("use after close", straight(0, [lh("h"), lr("e"), lr("l")], [
+  const n3 = hneg("use after close", straight(0, [lh("h"), lr("e"), lr("l")], [
     opn(0), cls(0, 1), IRelease(1), rdl(0, 2), IRelease(2)]), dead);
-  const n4 = neg("double close", straight(0, [lh("h"), lr("e"), lr("f")], [
+  const n4 = hneg("double close", straight(0, [lh("h"), lr("e"), lr("f")], [
     opn(0), cls(0, 1), IRelease(1), cls(0, 2), IRelease(2)]), "not open");
-  const n5 = neg("close of a handle parameter", prog([
+  const n5 = hneg("close of a handle parameter", prog([
     fn("f", 1, [lh("h"), lr("e")], MVoid, [bk([cls(0, 1), IRelease(1)], ret())])]), "parameter");
-  const n6 = neg("copy of a handle", straight(0, [lh("a"), lh("b"), lr("e")], [
+  const n6 = hneg("copy of a handle", straight(0, [lh("a"), lh("b"), lr("e")], [
     opn(0), ICopy(1, OLocal(0)), cls(0, 2), IRelease(2)]), "ICopy");
-  const n7 = neg("function returning a handle", prog([
+  const n7 = hneg("function returning a handle", prog([
     fn("f", 0, [lh("h")], MHandle, [bk([opn(0)], TReturn(Some(OLocal(0))))])]), "returns a resource handle");
-  const n8 = neg("handle stored in a struct", straight(0, [lh("h"), lr("s"), lr("e")], [
+  const n8 = hneg("handle stored in a struct", straight(0, [lh("h"), lr("s"), lr("e")], [
     opn(0), IStructNew(1, 0, [OLocal(0)]), IRelease(1), cls(0, 2), IRelease(2)]), "cannot be stored");
-  const n9 = neg("handle captured by a closure", prog([
+  const n9 = hneg("handle captured by a closure", prog([
     fn("f", 0, [lh("h"), lr("c"), lr("e")], MVoid, [bk([opn(0), IClosure(1, 1, [OLocal(0)]), IRelease(1), cls(0, 2), IRelease(2)], ret())]),
     lifted()]), "cannot be captured");
-  const n10 = neg("handles compared", straight(0, [lh("a"), lh("b"), lb("c"), lr("e")], [
+  const n10 = hneg("handles compared", straight(0, [lh("a"), lh("b"), lb("c"), lr("e")], [
     opn(0), opn(1), IBinary(2, OpEq, OLocal(0), OLocal(1)), cls(0, 3), IRelease(3), cls(1, 3), IRelease(3)]), "IBinary");
-  const n11 = neg("handle read from a field", straight(1, [lr("p"), lh("h")], [IGetField(1, OLocal(0), 0)]), "only by BFileOpen");
-  const n12 = neg("handle passed to a non-file builtin", straight(0, [lh("h"), lu("n"), lr("e")], [
+  const n11 = hneg("handle read from a field", straight(1, [lr("p"), lh("h")], [IGetField(1, OLocal(0), 0)]), "only by BFileOpen");
+  const n12 = hneg("handle passed to a non-file builtin", straight(0, [lh("h"), lu("n"), lr("e")], [
     opn(0), IBuiltin(Some(1), BStrLength, [OLocal(0)]), cls(0, 2), IRelease(2)]), "only be passed");
-  const n13 = neg("handle in an array", straight(0, [lh("h"), lr("a"), lr("e")], [
+  const n13 = hneg("handle in an array", straight(0, [lh("h"), lr("a"), lr("e")], [
     opn(0), IArrayNew(1, false, [OLocal(0)]), IRelease(1), cls(0, 2), IRelease(2)]), "IArrayNew");
-  const n14 = neg("handle overwritten while open", straight(0, [lh("h"), lr("e")], [
+  const n14 = hneg("handle overwritten while open", straight(0, [lh("h"), lr("e")], [
     opn(0), opn(0), cls(0, 1), IRelease(1)]), "overwritten");
-  const n15 = neg("handle pushed into an array", straight(0, [lh("h"), lr("a"), lr("e")], [
+  const n15 = hneg("handle pushed into an array", straight(0, [lh("h"), lr("a"), lr("e")], [
     opn(0), IArrayNew(1, false, []), IArrayPush(1, OLocal(0)), IRelease(1), cls(0, 2), IRelease(2)]), "IArrayPush");
-  const n16 = neg("open without a destination", straight(0, [], [IBuiltin(None, BFileOpen, [OStr(0), OInt(0)])]), "bound to a local");
-  const n17 = neg("handle parameter reopened", prog([
+  const n16 = hneg("open without a destination", straight(0, [], [IBuiltin(None, BFileOpen, [OInt(-1), OStr(0), OInt(0)])]), "bound to a local");
+  const n17 = hneg("handle parameter reopened", prog([
     fn("f", 1, [lh("h"), lr("e")], MVoid, [bk([opn(0)], ret())])]), "parameter");
-  const n18 = neg("handle moved", straight(0, [lh("a"), lh("b"), lr("e")], [
+  const n18 = hneg("handle moved", straight(0, [lh("a"), lh("b"), lr("e")], [
     opn(0), IMove(1, 0)]), "IMove");
-  const n19 = neg("closed after a join where it is open on one path", prog([
+  const n19 = hneg("closed after a join where it is open on one path", prog([
     fn("f", 1, [lb("c"), lh("h"), lr("e")], MVoid, [
       bk([opn(1)], TBranch(OLocal(0), 1, 2)),
       bk([cls(1, 2), IRelease(2)], TGoto(3)),
       bk([], TGoto(3)),
       bk([cls(1, 2), IRelease(2)], ret())])]), "some incoming paths");
-  const n20 = neg("handle result of a call", prog([
+  const n20 = hneg("handle result of a call", prog([
     fn("f", 0, [lh("h")], MVoid, [bk([ICall(Some(0), 1, [])], ret())]),
     fn("g", 0, [li("x")], MInt, [bk([], TReturn(Some(OInt(1))))])]), "ICall");
-  const n21 = neg("handle passed to a call that expects a reference", prog([
+  const n21 = hneg("handle passed to a call that expects a reference", prog([
     fn("f", 0, [lh("h"), lr("e")], MVoid, [bk([opn(0), ICall(None, 1, [OLocal(0)]), cls(0, 1), IRelease(1)], ret())]),
     gVoid()]), "wrong class");
-  const n22 = neg("handle returned from an int function", prog([
+  const n22 = hneg("handle returned from an int function", prog([
     fn("f", 0, [lh("h"), lr("e")], MInt, [bk([opn(0), cls(0, 1), IRelease(1)], TReturn(Some(OLocal(0))))])]), "TReturn");
-  const n23 = neg("handle used as a branch condition", prog([
+  const n23 = hneg("handle used as a branch condition", prog([
     fn("f", 0, [lh("h"), lr("e")], MVoid, [bk([opn(0)], TBranch(OLocal(0), 1, 1)), bk([cls(0, 1), IRelease(1)], ret())])]), "TBranch");
-  const n24 = neg("file builtin without a handle first argument", straight(0, [lr("l")], [
+  const n24 = hneg("file builtin without a handle first argument", straight(0, [lr("l")], [
     IBuiltin(Some(0), BFileReadLine, [OStr(0)])]), "first argument");
   if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
   if (!p5) { bad += 1; } if (!p6) { bad += 1; } if (!p7) { bad += 1; }
@@ -638,8 +746,82 @@ function handleCases(): usize {
   return bad;
 }
 
+
+// ---------------------------------------------------------------- capability grants (v1.9, ADR-0027)
+// A grant is a handle: the same lifecycle (opener -> use -> closer) and the same structural rules as a file. Locals:
+// `host` is the Host parameter (local 0, borrowed for the whole call).
+
+function gfs(d: usize): Instr { return IBuiltin(Some(d), BGrantFs, [OLocal(0)]); }
+function gclk(d: usize): Instr { return IBuiltin(Some(d), BGrantClock, [OLocal(0)]); }
+function gunder(d: usize, parent: usize): Instr { return IBuiltin(Some(d), BGrantUnder, [OLocal(parent), OStr(0)]); }
+function gro(d: usize, parent: usize): Instr { return IBuiltin(Some(d), BGrantReadOnly, [OLocal(parent)]); }
+function grev(g: usize): Instr { return IBuiltin(None, BGrantRevoke, [OLocal(g)]); }
+function gread(g: usize, d: usize): Instr { return IBuiltin(Some(d), BFsReadFile, [OLocal(g), OStr(0)]); }
+
+function grantCases(): usize {
+  let bad: usize = 0;
+  const p1 = pos("acquire, use, revoke", straight(1, [lh("host"), lh("fs"), lr("r")], [
+    gfs(1), gread(1, 2), IRelease(2), grev(1)]));
+  const p2 = pos("narrowing chain, revoked innermost first", straight(1, [lh("host"), lh("fs"), lh("sub"), lh("ro"), lr("r")], [
+    gfs(1), gunder(2, 1), gro(3, 2), gread(3, 4), IRelease(4), grev(3), grev(2), grev(1)]));
+  const p3 = pos("a file opened with the grant, the grant revoked after the file is closed", straight(1, [lh("host"), lh("fs"), lh("f"), lr("e")], [
+    gfs(1), IBuiltin(Some(2), BFileOpen, [OLocal(1), OStr(0), OInt(0)]), IBuiltin(Some(3), BFileClose, [OLocal(2)]), IRelease(3), grev(1)]));
+  const p4 = pos("grants are borrowed parameters of other functions", prog([
+    fn("f", 1, [lh("host"), lh("fs")], MVoid, [bk([gfs(1), ICall(None, 1, [OLocal(1)]), grev(1)], ret())]),
+    fn("g", 1, [lh("fs"), lr("r")], MVoid, [bk([gread(0, 1), IRelease(1)], ret())])]));
+  const p5 = pos("two grants of different families at once", straight(1, [lh("host"), lh("fs"), lh("clock"), li("t")], [
+    gfs(1), gclk(2), IBuiltin(Some(3), BTimeNowMillis, [OLocal(2)]), grev(2), grev(1)]));
+  const n1 = neg("grant never revoked", straight(1, [lh("host"), lh("fs")], [gfs(1)]), "not closed");
+  const n2 = neg("grant revoked twice", straight(1, [lh("host"), lh("fs")], [gfs(1), grev(1), grev(1)]), "not open");
+  const n3 = neg("use after revoke", straight(1, [lh("host"), lh("fs"), lr("r")], [gfs(1), grev(1), gread(1, 2), IRelease(2)]), "dead");
+  const n4 = neg("derived from a revoked parent", straight(1, [lh("host"), lh("fs"), lh("sub")], [gfs(1), grev(1), gunder(2, 1), grev(2)]), "dead");
+  const n5 = neg("grant duplicated", straight(1, [lh("host"), lh("fs"), lh("copy")], [gfs(1), ICopy(2, OLocal(1)), grev(1)]), "ICopy");
+  const n6 = neg("grant moved", straight(1, [lh("host"), lh("fs"), lh("copy")], [gfs(1), IMove(2, 1)]), "IMove");
+  const n7 = neg("grant stored in a struct", straight(1, [lh("host"), lh("fs"), lr("s")], [
+    gfs(1), IStructNew(2, 0, [OLocal(1)]), IRelease(2), grev(1)]), "cannot be stored");
+  const n8 = neg("grant returned", prog([
+    fn("f", 1, [lh("host"), lh("fs")], MHandle, [bk([gfs(1)], TReturn(Some(OLocal(1))))])]), "returns a resource handle");
+  const n9 = neg("grant captured by a closure", prog([
+    fn("f", 1, [lh("host"), lh("fs"), lr("c")], MVoid, [bk([gfs(1), IClosure(2, 1, [OLocal(1)]), IRelease(2), grev(1)], ret())]),
+    lifted()]), "cannot be captured");
+  const n10 = neg("grant is the result of a call (forged)", prog([
+    fn("f", 1, [lh("host"), lh("fs")], MVoid, [bk([ICall(Some(1), 1, [])], ret())]),
+    fn("g", 0, [li("x")], MInt, [bk([], TReturn(Some(OInt(1))))])]), "ICall");
+  const n11 = neg("grant read from a field (forged)", straight(1, [lr("p"), lh("fs")], [IGetField(1, OLocal(0), 0)]), "only by BFileOpen");
+  const n12 = neg("grant defined by a copy of a constant (forged)", straight(0, [lh("fs")], [ICopy(0, OInt(7))]), "ICopy");
+  const n13 = neg("opener without an authorising handle", straight(0, [lh("fs")], [IBuiltin(Some(0), BGrantFs, [OInt(1)])]), "authorising");
+  const n14 = neg("opener with a non-handle destination", straight(1, [lh("host"), li("n")], [IBuiltin(Some(1), BGrantFs, [OLocal(0)])]), "destination");
+  const n15 = neg("opener without a destination", straight(1, [lh("host")], [IBuiltin(None, BGrantFs, [OLocal(0)])]), "bound to a local");
+  const n16 = neg("std I/O builtin without a grant", straight(0, [lr("r")], [IBuiltin(Some(0), BFsReadFile, [OStr(0), OStr(0)])]), "first argument");
+  const n17 = neg("grant compared", straight(1, [lh("host"), lh("a"), lh("b"), lb("c")], [
+    gfs(1), gfs(2), IBinary(3, OpEq, OLocal(1), OLocal(2)), grev(2), grev(1)]), "IBinary");
+  const n18 = neg("grant passed to a non-grant builtin", straight(1, [lh("host"), lh("fs"), lu("n")], [
+    gfs(1), IBuiltin(Some(2), BStrLength, [OLocal(1)]), grev(1)]), "only be passed");
+  const n19 = neg("revoke of a parameter (only the scope that derived it revokes)", prog([
+    fn("f", 1, [lh("fs")], MVoid, [bk([grev(0)], ret())])]), "parameter");
+  const n20 = neg("grant overwritten while live", straight(1, [lh("host"), lh("fs")], [gfs(1), gfs(1), grev(1)]), "overwritten");
+  const n21 = neg("grant revoked on one branch only", prog([
+    fn("f", 1, [lh("host"), lb("c"), lh("fs")], MVoid, [
+      bk([gfs(2)], TBranch(OLocal(1), 1, 2)),
+      bk([grev(2)], TGoto(3)),
+      bk([], TGoto(3)),
+      bk([], ret())])]), "not closed");
+  const n22 = neg("grant in an array", straight(1, [lh("host"), lh("fs"), lr("a")], [
+    gfs(1), IArrayNew(2, false, [OLocal(1)]), IRelease(2), grev(1)]), "IArrayNew");
+  const n23 = neg("two grant arguments to a std I/O builtin", straight(1, [lh("host"), lh("fs"), lr("r")], [
+    gfs(1), IBuiltin(Some(2), BFsExists, [OLocal(1), OLocal(1)]), grev(1)]), "only the first");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; } if (!p5) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; } if (!n11) { bad += 1; } if (!n12) { bad += 1; }
+  if (!n13) { bad += 1; } if (!n14) { bad += 1; } if (!n15) { bad += 1; } if (!n16) { bad += 1; }
+  if (!n17) { bad += 1; } if (!n18) { bad += 1; } if (!n19) { bad += 1; } if (!n20) { bad += 1; }
+  if (!n21) { bad += 1; } if (!n22) { bad += 1; } if (!n23) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases();
+  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

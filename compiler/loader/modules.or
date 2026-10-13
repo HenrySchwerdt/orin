@@ -4,6 +4,7 @@ import { SourceFile, Span, Diagnostic, Diagnostics, diag, span, allRenderable } 
 import { Manifest, parseManifest } from "../package";
 import { LoadOutcome, failedLoad } from "./program";
 import { Sources } from "./sources";
+import { FsGrant } from "std:fs";
 import { isNormalized, isAbs, dirname, joinPath, relativeTo, isInside } from "./path";
 
 // The src root of a load (the directory of the entry file, or of the package's entry file) and the
@@ -27,13 +28,13 @@ export class SrcRoot {
   @Ensures(result == "" || isNormalized(result) && !isAbs(result))
   @Ensures(p.startsWith("$") || !isInside(this.root, p) ==> result == "")
   @Ensures(isInside(this.root, p) && !p.startsWith("$") ==> result != "")
-  moduleOf(p: string): string {
+  moduleOf(fs: FsGrant, p: string): string {
     if (p.startsWith("$") || !isInside(this.root, p)) {
       return "";
     }
     let d = dirname(p);
     while (d != this.root && isInside(this.root, d)) {
-      if (this.src.exists(joinPath(d, "module.or"))) {
+      if (this.src.exists(fs, joinPath(d, "module.or"))) {
         return relativeTo(this.root, d);
       }
       const parent = dirname(d);
@@ -47,22 +48,22 @@ export class SrcRoot {
 
   // True when module id `mod` ("." or a directory with a `module.or`) exists under the root.
   @Ensures(mod == "." ==> result)
-  hasModule(mod: string): bool {
-    return mod == "." || this.src.exists(joinPath(this.root, mod + "/module.or"));
+  hasModule(fs: FsGrant, mod: string): bool {
+    return mod == "." || this.src.exists(fs, joinPath(this.root, mod + "/module.or"));
   }
 
   // E0502 for every module name in the manifest that has no `module.or` (the manifest is file 0).
   // Every diagnostic lies in file 0 and the result is empty exactly when all names exist.
   @Ensures(allWellFormedIn(result, 0))
-  unknownModules(m: Manifest): Diagnostic[] {
+  unknownModules(fs: FsGrant, m: Manifest): Diagnostic[] {
     let out = new Diagnostics();
     for (const r of m.rules) {
-      if (!this.hasModule(r.module)) {
+      if (!this.hasModule(fs, r.module)) {
         out.add(unknownModule(r.span, `[modules.${r.module}]`, r.module, this.root));
       }
       let i: usize = 0;
       while (i < r.allowed.length) {
-        if (!this.hasModule(r.allowed[i])) {
+        if (!this.hasModule(fs, r.allowed[i])) {
           out.add(
             unknownModule(
               r.allowedSpans[i],
@@ -94,15 +95,15 @@ function allWellFormedIn(ds: Diagnostic[], file: usize): bool {
 @Requires(isNormalized(entry))
 @Ensures(result.isSome() ==> isNormalized(result.unwrap()) && result.unwrap().endsWith("orin.toml"))
 @Ensures(result.isSome() ==> isAbs(result.unwrap()) == isAbs(entry))
-export function findManifest(src: Sources, entry: string): Option<string> {
+export function findManifest(fs: FsGrant, src: Sources, entry: string): Option<string> {
   const inDir = joinPath(entry, "orin.toml");
-  if (src.exists(inDir)) {
+  if (src.exists(fs, inDir)) {
     return Some(inDir);
   }
   let d = dirname(entry);
   while (true) {
     const c = joinPath(d, "orin.toml");
-    if (src.exists(c)) {
+    if (src.exists(fs, c)) {
       return Some(c);
     }
     const parent = dirname(d);
@@ -140,8 +141,12 @@ export function manifestEntry(tomlPath: string, m: Manifest): string {
 @Ensures(result.isErr()
     ==> result.unwrapErr().sm.files.length == 1 && result.unwrapErr().sm.files[0].path == tomlPath)
 @Ensures(result.isErr() ==> allRenderable(result.unwrapErr().sm, result.unwrapErr().diags))
-export function readManifest(src: Sources, tomlPath: string): Result<Manifest, LoadOutcome> {
-  const rt = src.read(tomlPath);
+export function readManifest(
+  fs: FsGrant,
+  src: Sources,
+  tomlPath: string,
+): Result<Manifest, LoadOutcome> {
+  const rt = src.read(fs, tomlPath);
   if (rt.isErr()) {
     const unreadable = diag(
       "E0301",
@@ -156,7 +161,7 @@ export function readManifest(src: Sources, tomlPath: string): Result<Manifest, L
     return Err(failedLoad(files, [mr.unwrapErr()]));
   }
   const m = mr.unwrap();
-  const unknown = new SrcRoot(src, dirname(manifestEntry(tomlPath, m))).unknownModules(m);
+  const unknown = new SrcRoot(src, dirname(manifestEntry(tomlPath, m))).unknownModules(fs, m);
   if (unknown.length > 0) {
     return Err(failedLoad(files, unknown));
   }

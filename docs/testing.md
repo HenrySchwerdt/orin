@@ -21,7 +21,8 @@ orin test <file.or | package-dir> [--filter <substring>] [--format=json] [--time
 ## Writing tests
 
 * A test is a top-level function `@Test function name(): void` — no parameters, not generic (E0443
-  otherwise). It may be `export`ed or private, in any module of the program.
+  otherwise). The one exception: `@Test function name(host: Host): void` receives the `Host` (ADR-0027) so that a test
+  can derive the grants it needs (`useFs(host, fs => ...)`); a test without it has no I/O authority. It may be `export`ed or private, in any module of the program.
 * A test **fails by trapping**: a failed assertion of `std:test`, an index out of bounds, `unwrap` of
   `None`, a violated contract (tests run with runtime contract checking, ADR-0012; `--no-contracts`
   turns it off), a non-zero `exit`, a crash, or exceeding the timeout. Returning normally passes.

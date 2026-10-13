@@ -6,7 +6,7 @@
 //   E0450  a resource type inside another type (array element, Option / Result / generic argument,
 //          record field, union payload, function-value result), as a function result, or as the
 //          type of a variable (only parameters may have a resource type);
-//   E0451  a resource handle used in any position but "argument of a call": it cannot be assigned
+//   E0451  a resource handle (a `File` or a capability grant: `Host`, `FsGrant`, ... ADR-0027) used in any position but "argument of a call": it cannot be assigned
 //          or bound (no aliasing), returned, put into an aggregate, compared, converted to string or
 //          matched on;
 //   E0452  a resource handle captured by a closure.
@@ -14,7 +14,7 @@
 // The MIR verifier (compiler/verify) re-establishes the same guarantees independently on the lowered
 // code, so a bug here cannot lead to a duplicated or escaping handle (docs/mir.md v1.8).
 //
-// Library exception: the std:fs implementation (units named `$stdlib/fs`) opens a file into a local
+// Library exception: the std:fs and std:host implementations (units named `$stdlib/fs`, `$stdlib/host`) opens a file into a local
 // (`const h = fileOpen(..)`) because it is the one place that implements the scope API; the local is
 // still only ever passed as an argument. User code cannot import the raw primitives (std:fsraw, E0301).
 
@@ -43,7 +43,8 @@ function anyNested(ts: Type[]): bool {
 }
 
 export function isFileTy(t: Type): bool {
-  return match (t) { TyFile => true, _ => false };
+  // a resource handle: a file (ADR-0025) or a capability grant (ADR-0027); both obey the same rules
+  return match (t) { TyFile => true, TyGrant(_) => true, _ => false };
 }
 
 // `t` is a resource type or contains one.
@@ -63,7 +64,17 @@ const ARG_ONLY: string = "a resource handle can only be passed as an argument; i
 
 function isOpen(e: HExpr): bool {
   return match (e.kind) {
-    XBuiltin(b, _) => match (b) { BFileOpen => true, _ => false },
+    XBuiltin(b, _) => match (b) {
+      BFileOpen => true,
+      BGrantFs => true,
+      BGrantProcess => true,
+      BGrantStdio => true,
+      BGrantClock => true,
+      BGrantUnder => true,
+      BGrantReadOnly => true,
+      BGrantArgsOnly => true,
+      _ => false
+    },
     _ => false
   };
 }
@@ -191,7 +202,7 @@ function stmt(cx: Rc, s: HStmt): Rc {
         if (c.trusted && isOpen(init)) {
           // the scope API of the std:fs library: the handle is created here and only ever passed on
           match (init.kind) {
-            XBuiltin(_, args) => { c = exprs(c, args, false); },
+            XBuiltin(_, args) => { c = exprs(c, args, true); },   // the authorising grant is passed on (borrowed)
             _ => {}
           }
           return c;
@@ -250,7 +261,7 @@ export function resourceDiags(funcs: Function[]): Diagnostic[] {
   for (const f of funcs) {
     let c = Rc {
       f: f,
-      trusted: f.name.startsWith("$stdlib/fs."),
+      trusted: f.name.startsWith("$stdlib/fs.") || f.name.startsWith("$stdlib/host.") || f.name.startsWith("__orin_test_harness."),
       closure: f.name.includes("$closure"),
       diags: []
     };

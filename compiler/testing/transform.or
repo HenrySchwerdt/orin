@@ -15,7 +15,7 @@
 
 import { Diagnostic, Span } from "../diag";
 import { Ident, Module, Item, FunctionDecl, ImportDecl, parse } from "../syntax";
-import { LoadedProgram, Unit, ImportUnit, ImportStd, StdProcess } from "../loader";
+import { LoadedProgram, Unit, ImportUnit, ImportStd, StdProcess, StdFs } from "../loader";
 
 export type TestCase = {
   id: string;        // "<unit>.<function>", e.g. "math_test.addsTwo": what --filter matches and reports show
@@ -24,6 +24,7 @@ export type TestCase = {
   index: usize;      // number the harness runs it by
   file: usize;       // source file (index into the SourceMap)
   start: usize;      // byte offset of the function name in that file (for reports)
+  takesHost: bool;   // `@Test function t(host: Host)`: the harness passes the Host (ADR-0027)
 };
 
 function annotatedTest(f: FunctionDecl): bool {
@@ -79,7 +80,7 @@ export function discoverTests(prog: LoadedProgram): TestCase[] {
           if (annotatedTest(f)) {
             out.push(TestCase {
               id: u.name + "." + f.name.name, unit: u.name, name: f.name.name, index: out.length,
-              file: u.file, start: f.name.span.start
+              file: u.file, start: f.name.span.start, takesHost: f.params.length == 1
             });
           }
         },
@@ -150,11 +151,16 @@ function testFnName(i: usize): string {
 
 const HARNESS_UNIT: string = "__orin_test_harness";
 
-// The harness module (a unit inserted right before the entry): the argument handling.
+// The harness module (a unit inserted right before the entry): the argument handling. It is generated compiler code, and
+// the one place outside the std library that derives a grant from the Host: the test executable's own command line.
+// (`__orin_test_harness` is a trusted unit for compiler/check/resources.or, like `$stdlib/host`.)
 function harnessUnitSource(): string {
-  return "import { args, exit } from \"std:process\";\n"
-    + "export function __orin_test_index(): int {\n"
-    + "  const a = args();\n"
+  return "import { Host, grantProcess, grantRevoke } from \"std:fsraw\";\n"
+    + "import { args, exit } from \"std:process\";\n"
+    + "export function __orin_test_index(host: Host): int {\n"
+    + "  const p = grantProcess(host);\n"
+    + "  const a = args(p);\n"
+    + "  grantRevoke(p);\n"
     + "  if (a.length < 1) {\n"
     + "    console.error(\"usage: <test executable> <test index>\");\n"
     + "    exit(2);\n"
@@ -175,13 +181,15 @@ function harnessUnitSource(): string {
 }
 
 // The entry's dispatcher: `main` runs the one test whose index is argv[1].
-function dispatchSource(n: usize): string {
+function dispatchSource(tests: TestCase[]): string {
+  const n = tests.length;
   let s = "import { __orin_test_index, __orin_test_missing } from \"./" + HARNESS_UNIT + "\";\n"
-    + "function main(): void {\n"
-    + "  const i = __orin_test_index();\n";
+    + "import { Host } from \"std:fsraw\";\n"
+    + "function main(host: Host): void {\n"
+    + "  const i = __orin_test_index(host);\n";
   let k: usize = 0;
   while (k < n) {
-    s += "  if (i == " + k.toString() + ") {\n    " + testFnName(k) + "();\n    return;\n  }\n";
+    s += "  if (i == " + k.toString() + ") {\n    " + testFnName(k) + (tests[k].takesHost ? "(host)" : "()") + ";\n    return;\n  }\n";
     k += 1;
   }
   s += "  __orin_test_missing(i);\n}\n";
@@ -235,9 +243,9 @@ export function buildTestProgram(prog: LoadedProgram): Result<TestBuild, Diagnos
   const hm = parse(entryFile, harnessUnitSource())?;
   const harness = Unit {
     file: entryFile, path: prog.units[prog.entry].path, name: HARNESS_UNIT, module: "", ast: hm,
-    imports: [ImportStd(StdProcess)]
+    imports: [ImportStd(StdFs), ImportStd(StdProcess)]
   };
-  const dm = parse(entryFile, dispatchSource(tests.length))?;
+  const dm = parse(entryFile, dispatchSource(tests))?;
   const entryIdx = prog.entry;
   const eu = units[entryIdx];
   let items = eu.ast.items;
@@ -252,6 +260,7 @@ export function buildTestProgram(prog: LoadedProgram): Result<TestBuild, Diagnos
     items.push(it);
   }
   imports.push(ImportUnit(entryIdx));   // the harness takes the entry's index; the entry moves up by one
+  imports.push(ImportStd(StdFs));       // `import { Host } from "std:fsraw"` of the dispatcher
   units[entryIdx] = withItems(Unit { ...eu, imports: imports }, items);
   let all: Unit[] = [];
   ui = 0;

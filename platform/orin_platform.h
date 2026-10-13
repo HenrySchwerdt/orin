@@ -289,6 +289,60 @@ int orin_platform_stream_error(const orin_platform_stream *s);
     assigns *s, \fs; */
 int orin_platform_stream_close(orin_platform_stream *s);
 
+/* ---------------------------------------------------------------- host policy and path scopes (ADR-0021 Stage A, ADR-0027)
+ * The pure/OS primitives behind the capability grants of the runtime (runtime/orin_runtime.c keeps the table
+ * of grants; this layer only parses the host policy and decides path questions). Families are bits:
+ * ORIN_PLATFORM_FAM_*. A path scope is a NORMALISED ABSOLUTE path (starts with '/', no "." or ".." component,
+ * no repeated or trailing '/', except the root "/"); a path is inside a scope when it equals it or continues it
+ * at a component boundary ("/a/b" contains "/a/b/c" but not "/a/bc"). */
+#define ORIN_PLATFORM_FAM_FS 1u
+#define ORIN_PLATFORM_FAM_PROCESS 2u
+#define ORIN_PLATFORM_FAM_STDIO 4u
+#define ORIN_PLATFORM_FAM_CLOCK 8u
+#define ORIN_PLATFORM_FAM_NET 16u /* reserved for std:net (no operation uses it yet) */
+
+/*@ requires n == 0 || spec[0..n-1] readable; requires \valid(mask);
+    ensures \result == 0 ==> *mask is the OR of the families named in spec: a comma-separated list of the exact
+            names "fs", "process", "stdio", "clock", "net", "all" (= every family); the empty text names none;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> spec has an unknown name, an empty element, a space or a NUL
+            (the policy is rejected as a whole) and *mask == 0;
+    assigns *mask; */
+int orin_platform_policy_parse(const char *spec, size_t n, unsigned *mask);
+
+/*@ requires \valid(mask);
+    ensures \result == orin_platform_policy_parse(<value of the environment variable ORIN_DENY, "" if unset>, mask);
+    assigns *mask; */
+int orin_platform_policy_load(unsigned *mask);
+
+/*@ requires (plen == 0 || path[0..plen-1] readable) && \valid(out + (0..cap-1));
+    ensures \result == -1 (and out is untouched) if plen == 0, path[0] != '/', path has a NUL byte or
+            cap < plen + 1;
+    ensures \result >= 1 ==> out[0..\result-1] is the normalised absolute path denoted lexically by path ("." and
+            empty components dropped, ".." removes the previous component and is dropped at the root),
+            out[\result] == 0 and \result <= plen;
+    assigns out[0..cap-1]; */
+int64_t orin_platform_path_normalize(const char *path, size_t plen, char *out, size_t cap);
+
+/*@ requires scope and path are normalised absolute paths of lengths slen and plen (see above);
+    ensures \result == 1 <==> scope is "/" or path == scope or (path starts with scope and path[slen] == '/');
+    ensures \result == 0 otherwise;
+    assigns \nothing; */
+int orin_platform_path_within(const char *scope, size_t slen, const char *path, size_t plen);
+
+/*@ requires (plen == 0 || path[0..plen-1] readable) && \valid(out + (0..cap-1));
+    ensures a relative path is resolved against the current directory, then as orin_platform_path_normalize;
+    ensures \result == -1 on a NUL byte, an empty path, no current directory or too small a buffer, else the length;
+    assigns out[0..cap-1], \fs (reads the working directory); */
+int64_t orin_platform_path_absolute(const char *path, size_t plen, char *out, size_t cap);
+
+/*@ requires abs is a normalised absolute path of length alen && \valid(out + (0..cap-1));
+    ensures \result >= 1 ==> out is the canonical path: the longest existing prefix of abs with every symbolic link
+            resolved, followed by the (non-existing) rest of abs unchanged; out[\result] == 0;
+    ensures \result == -1 if the prefix cannot be resolved (permission, link loop, too long), if the first
+            non-existing component is a dangling symbolic link, or the buffer is too small;
+    assigns out[0..cap-1]; */
+int64_t orin_platform_path_real(const char *abs, size_t alen, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

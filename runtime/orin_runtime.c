@@ -754,9 +754,8 @@ void orin_console_error(OrinObj *s) {
 }
 
 /* Err("<what> '<path>': <reason>") */
-static OrinObj *err_result(const char *what, OrinObj *path, int code) {
+static OrinObj *err_msg(const char *what, OrinObj *path, const char *why) {
     OrinString *p = (OrinString *)path;
-    const char *why = orin_platform_error_message(code);
     size_t wl = 0, yl = 0;
     while (what[wl]) wl++;
     while (why[yl]) yl++;
@@ -774,11 +773,217 @@ static OrinObj *err_result(const char *what, OrinObj *path, int code) {
     return orin_variant1(1, 1, ORIN_SLOT(&m->h));
 }
 
-OrinObj *orin_fs_read_file(OrinObj *path) {
+static OrinObj *err_result(const char *what, OrinObj *path, int code) {
+    return err_msg(what, path, orin_platform_error_message(code));
+}
+
+static size_t strlen_(const char *s) {
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+/* ---------------------------------------------------------------- capability grants (ADR-0021 Stage A, ADR-0027)
+ * A grant is an int64_t handle like a file handle (MIR class MHandle; the compiler guarantees that it is only
+ * passed to calls and closed once, ADR-0025), tagged with bit 40 so a file handle can never be taken for a grant.
+ * Layout: GRANT_TAG | generation << 8 | slot. The runtime does not rely on the compiler: every privileged operation
+ * validates the handle (live slot, generation, kind) and TRAPS on a forged, stale, revoked or wrong-kind handle.
+ * Authority is checked at every operation: the family policy (ORIN_DENY, read once by orin_cap_host_root), the
+ * read-only flag and, for the file system, the path scope. Denial: an operation that returns a Result reports
+ * Err("... denied ..."); every other operation traps ("capability denied ..."). */
+enum { GK_HOST = 0, GK_FS = 1, GK_PROCESS = 2, GK_STDIO = 3, GK_CLOCK = 4 };
+enum { GR_SLOTS = 256, CAP_PATH = 4096 };
+enum { DEN_POLICY = 100001, DEN_SCOPE = 100002, DEN_RDONLY = 100003, DEN_RESOLVE = 100004 };
+#define GRANT_TAG ((int64_t)1 << 40)
+typedef struct {
+    int live, kind;
+    uint64_t gen;
+    int denied;    /* the host policy denies this family: every operation is refused */
+    int readonly;  /* fs: no write, no create */
+    int nospawn;   /* process: args only */
+    int empty;     /* fs: narrowed to nothing (the requested scope was not inside the parent's) */
+    char *scope;   /* fs: normalised absolute scope, NULL = the whole file system */
+    size_t slen;
+    char *rscope;  /* the same with every symbolic link resolved */
+    size_t rlen;
+} Grant;
+static Grant g_grants[GR_SLOTS];
+static unsigned g_deny;
+
+static const char *kind_name(int k) {
+    return k == GK_FS ? "fs" : k == GK_PROCESS ? "process" : k == GK_STDIO ? "stdio" : k == GK_CLOCK ? "clock" : "host";
+}
+
+static const char *den_text(int code) {
+    return code == DEN_POLICY    ? "denied by the host policy (ORIN_DENY)"
+           : code == DEN_SCOPE   ? "outside the granted file scope"
+           : code == DEN_RDONLY  ? "the file grant is read-only"
+                                 : "path cannot be resolved inside the granted scope";
+}
+
+static void trap_denied(int kind, const char *what, const char *why) {
+    char b[240];
+    size_t n = 0;
+    const char *parts[] = {"capability denied: ", kind_name(kind), " ", what, ": ", why};
+    for (int i = 0; i < 6; i++)
+        for (const char *q = parts[i]; *q && n + 1 < sizeof b; q++) b[n++] = *q;
+    b[n] = 0;
+    orin_trap(b);
+}
+
+static Grant *grant_new(int kind) {
+    for (int i = 0; i < GR_SLOTS; i++) {
+        if (!g_grants[i].live) {
+            Grant *g = &g_grants[i];
+            uint64_t gen = g->gen + 1;
+            orin_platform_mem_set(g, 0, sizeof *g);
+            g->gen = gen;
+            g->live = 1;
+            g->kind = kind;
+            return g;
+        }
+    }
+    orin_trap("too many active capability grants");
+}
+
+static int64_t grant_handle(const Grant *g) {
+    return GRANT_TAG | (int64_t)(g->gen << 8) | (int64_t)(g - g_grants);
+}
+
+/* The live grant named by h, of kind `kind` (kind < 0: any kind); traps on anything else (forged, revoked, stale,
+ * wrong kind). */
+static Grant *grant_ref(int64_t h, int kind) {
+    if ((h & ~(GRANT_TAG - 1)) == GRANT_TAG) {
+        uint64_t idx = (uint64_t)h & 255, gen = ((uint64_t)h & ((uint64_t)GRANT_TAG - 1)) >> 8;
+        Grant *g = &g_grants[idx];
+        if (g->live && g->gen == gen && (kind < 0 || g->kind == kind)) return g;
+    }
+    orin_trap("invalid capability grant (forged, revoked, or of the wrong kind)");
+}
+
+static Grant *grant_use(int64_t h, int kind, const char *what) {
+    Grant *g = grant_ref(h, kind);
+    if (g->denied) trap_denied(kind, what, den_text(DEN_POLICY));
+    return g;
+}
+
+void orin_cap_require(int64_t h, int64_t kind, const char *what) { (void)grant_use(h, (int)kind, what); }
+void orin_cap_require_spawn(int64_t h) {
+    if (grant_use(h, GK_PROCESS, "shell")->nospawn) trap_denied(GK_PROCESS, "shell", "this process grant allows args only");
+}
+
+int64_t orin_cap_host_root(void) {
+    if (orin_platform_policy_load(&g_deny) != 0)
+        orin_trap("invalid ORIN_DENY (expected a comma-separated list of: fs, process, stdio, clock, net, all)");
+    return grant_handle(grant_new(GK_HOST));
+}
+
+int64_t orin_cap_acquire(int64_t host, int64_t family) {
+    (void)grant_ref(host, GK_HOST);
+    if (family < GK_FS || family > GK_CLOCK) orin_trap("invalid capability family");
+    Grant *g = grant_new((int)family);
+    unsigned bit = family == GK_FS        ? ORIN_PLATFORM_FAM_FS
+                   : family == GK_PROCESS ? ORIN_PLATFORM_FAM_PROCESS
+                   : family == GK_STDIO   ? ORIN_PLATFORM_FAM_STDIO
+                                          : ORIN_PLATFORM_FAM_CLOCK;
+    g->denied = (g_deny & bit) != 0;
+    return grant_handle(g);
+}
+
+int64_t orin_cap_fs(int64_t host) { return orin_cap_acquire(host, GK_FS); }
+int64_t orin_cap_process(int64_t host) { return orin_cap_acquire(host, GK_PROCESS); }
+int64_t orin_cap_stdio(int64_t host) { return orin_cap_acquire(host, GK_STDIO); }
+int64_t orin_cap_clock(int64_t host) { return orin_cap_acquire(host, GK_CLOCK); }
+
+static char *dup_cstr(const char *s, size_t n) {
+    char *d = (char *)xmalloc(n + 1);
+    orin_platform_mem_copy(d, s, n);
+    d[n] = 0;
+    return d;
+}
+
+/* op 0: fs under(path); op 1: fs readOnly; op 2: process argsOnly. A narrowed grant never has more authority than
+ * its parent: the new scope is used only when it lies inside the parent's (else the parent's, if that is
+ * narrower, else nothing). */
+int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg) {
+    if (op < 0 || op > 2) orin_trap("invalid capability narrowing");
+    Grant *p = grant_ref(parent, op == 2 ? GK_PROCESS : GK_FS);
+    Grant *g = grant_new(p->kind);
+    g->denied = p->denied;
+    g->readonly = p->readonly;
+    g->nospawn = p->nospawn;
+    g->empty = p->empty;
+    if (p->scope) {
+        g->scope = dup_cstr(p->scope, p->slen);
+        g->slen = p->slen;
+        g->rscope = dup_cstr(p->rscope, p->rlen);
+        g->rlen = p->rlen;
+    }
+    if (op == 1) g->readonly = 1;
+    if (op == 2) g->nospawn = 1;
+    if (op == 0 && !g->empty) {
+        char abs[CAP_PATH + 1], real[CAP_PATH + 1];
+        int64_t al = orin_platform_path_absolute(orin_str_data(arg), (size_t)orin_str_len(arg), abs, sizeof abs);
+        int64_t rl = al > 0 ? orin_platform_path_real(abs, (size_t)al, real, sizeof real) : -1;
+        if (rl <= 0) {
+            g->empty = 1;
+        } else if (!p->scope || (orin_platform_path_within(p->scope, p->slen, abs, (size_t)al) &&
+                                 orin_platform_path_within(p->rscope, p->rlen, real, (size_t)rl))) {
+            orin_platform_free(g->scope);
+            orin_platform_free(g->rscope);
+            g->scope = dup_cstr(abs, (size_t)al);
+            g->slen = (size_t)al;
+            g->rscope = dup_cstr(real, (size_t)rl);
+            g->rlen = (size_t)rl;
+        } else if (!orin_platform_path_within(abs, (size_t)al, p->scope, p->slen)) {
+            g->empty = 1; /* disjoint from the parent's scope */
+        } /* else: the parent's scope is already inside the requested one: keep it */
+    }
+    return grant_handle(g);
+}
+
+int64_t orin_cap_under(int64_t fs, OrinObj *path) { return orin_cap_narrow(fs, 0, path); }
+int64_t orin_cap_read_only(int64_t fs) { return orin_cap_narrow(fs, 1, NULL); }
+int64_t orin_cap_args_only(int64_t proc) { return orin_cap_narrow(proc, 2, NULL); }
+
+void orin_cap_revoke(int64_t h) {
+    Grant *g = grant_ref(h, -1);
+    orin_platform_free(g->scope);
+    orin_platform_free(g->rscope);
+    g->scope = g->rscope = NULL;
+    g->live = 0;
+}
+
+/* Authorises an operation on `path` with the file grant gh. Returns 0 (and, for a scoped grant, the canonical path to
+ * use in `eff`, *scoped = 1) or a DEN_* code. The caller opens `eff`, not the original text: the checked path is the
+ * used path (a ".." behind a symbolic link cannot differ between check and use). */
+static int fs_check(int64_t gh, int write, OrinObj *path, char *eff, int *scoped) {
+    Grant *g = grant_ref(gh, GK_FS);
+    *scoped = 0;
+    if (g->denied) return DEN_POLICY;
+    if (write && g->readonly) return DEN_RDONLY;
+    if (!g->scope) return 0;
+    if (g->empty) return DEN_SCOPE;
+    char abs[CAP_PATH + 1];
+    int64_t al = orin_platform_path_absolute(orin_str_data(path), (size_t)orin_str_len(path), abs, sizeof abs);
+    if (al <= 0) return DEN_RESOLVE;
+    if (!orin_platform_path_within(g->scope, g->slen, abs, (size_t)al)) return DEN_SCOPE;
+    int64_t rl = orin_platform_path_real(abs, (size_t)al, eff, CAP_PATH + 1);
+    if (rl <= 0) return DEN_RESOLVE;
+    if (!orin_platform_path_within(g->rscope, g->rlen, eff, (size_t)rl)) return DEN_SCOPE;
+    *scoped = 1;
+    return 0;
+}
+
+OrinObj *orin_fs_read_file(int64_t gh, OrinObj *path) {
     OrinString *p = (OrinString *)path;
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check(gh, 0, path, eff, &scoped);
+    if (den) return err_msg("cannot read", path, den_text(den));
     char *buf;
     size_t len;
-    int rc = orin_platform_file_read(p->data, p->len, &buf, &len);
+    int rc = scoped ? orin_platform_file_read(eff, strlen_(eff), &buf, &len)
+                    : orin_platform_file_read(p->data, p->len, &buf, &len);
     if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
     if (rc) return err_result("cannot read", path, rc);
     OrinObj *s = orin_str_new(buf, len);
@@ -786,17 +991,25 @@ OrinObj *orin_fs_read_file(OrinObj *path) {
     return orin_variant1(0, 1, ORIN_SLOT(s));
 }
 
-OrinObj *orin_fs_write_file(OrinObj *path, OrinObj *data) {
+OrinObj *orin_fs_write_file(int64_t gh, OrinObj *path, OrinObj *data) {
     OrinString *p = (OrinString *)path, *d = (OrinString *)data;
-    int rc = orin_platform_file_write(p->data, p->len, d->data, d->len);
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check(gh, 1, path, eff, &scoped);
+    if (den) return err_msg("cannot write", path, den_text(den));
+    int rc = scoped ? orin_platform_file_write(eff, strlen_(eff), d->data, d->len)
+                    : orin_platform_file_write(p->data, p->len, d->data, d->len);
     if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
     if (rc) return err_result("cannot write", path, rc);
     return orin_ok_void();
 }
 
-int64_t orin_fs_exists(OrinObj *path) {
+/* A bool cannot carry a denial: a refused query traps (like every operation without a Result). */
+int64_t orin_fs_exists(int64_t gh, OrinObj *path) {
     OrinString *p = (OrinString *)path;
-    return orin_platform_file_exists(p->data, p->len);
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check(gh, 0, path, eff, &scoped);
+    if (den) trap_denied(GK_FS, "exists", den_text(den));
+    return scoped ? orin_platform_file_exists(eff, strlen_(eff)) : orin_platform_file_exists(p->data, p->len);
 }
 
 /* ---------------------------------------------------------------- file resources (ADR-0025) */
@@ -834,7 +1047,7 @@ static OrinObj *reason_str(const char *what, int code) {
 
 /* The slot of a valid open handle; traps on anything else (closed, stale, foreign, failed-open, 0). */
 static FileSlot *file_slot(int64_t h) {
-    if (h > 0) {
+    if (h > 0 && h < GRANT_TAG) {
         uint64_t idx = (uint64_t)h & 255, gen = (uint64_t)h >> 8;
         if (g_files[idx].s && g_files[idx].gen == gen) return &g_files[idx];
     }
@@ -845,13 +1058,17 @@ static void file_fail(FileSlot *f, int code) {
     if (f->err == 0) f->err = code;
 }
 
-int64_t orin_file_open(OrinObj *path, int64_t mode) {
+int64_t orin_file_open(int64_t gh, OrinObj *path, int64_t mode) {
     if (mode < 0 || mode > 2) return -ORIN_PLATFORM_EINVAL;
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check(gh, mode != 0, path, eff, &scoped);
+    if (den) return -(int64_t)den;
     int i = 0;
     while (i < FILE_SLOTS && g_files[i].s) i++;
     if (i == FILE_SLOTS) return -24; /* EMFILE: too many open files */
     orin_platform_stream *s;
-    int rc = orin_platform_stream_open(orin_str_data(path), (size_t)orin_str_len(path), (int)mode, &s);
+    int rc = scoped ? orin_platform_stream_open(eff, strlen_(eff), (int)mode, &s)
+                    : orin_platform_stream_open(orin_str_data(path), (size_t)orin_str_len(path), (int)mode, &s);
     if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
     if (rc) return -(int64_t)rc;
     g_files[i].s = s;
@@ -865,6 +1082,14 @@ int64_t orin_file_open(OrinObj *path, int64_t mode) {
 int64_t orin_file_is_open(int64_t h) { return h > 0; }
 
 OrinObj *orin_file_open_error(int64_t h) {
+    if (h <= -DEN_POLICY && h >= -DEN_RESOLVE) {
+        const char *t = den_text((int)-h);
+        size_t n = strlen_(t);
+        OrinString *m = str_alloc(n, 0);
+        orin_platform_mem_copy(m->data, t, n);
+        m->data[n] = 0;
+        return &m->h;
+    }
     return reason_str("", h < 0 && h > -100000 ? (int)-h : ORIN_PLATFORM_EINVAL);
 }
 
@@ -982,7 +1207,8 @@ void orin_file_flush(int64_t h) {
     if (f->mode != ORIN_PLATFORM_STREAM_READ) orin_platform_stream_flush(f->s);
 }
 
-OrinObj *orin_process_args(void) {
+OrinObj *orin_process_args(int64_t gh) {
+    (void)grant_use(gh, GK_PROCESS, "args");
     int argc = orin_platform_arg_count();
     OrinObj *arr = orin_array_new(argc > 1 ? (uint64_t)argc - 1 : 0, 1);
     for (int i = 1; i < argc; i++) {

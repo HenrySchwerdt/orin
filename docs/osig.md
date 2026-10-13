@@ -134,7 +134,14 @@ explaining path, added/removed edges, impact on entry points.
   only if the closure is called).
 - **Generics:** calls inside a generic function or a generic-class method are attributed to the generic declaration, once.
   A generic class is one `Class` node (`sig` shows `class Stack<T>`); its instantiations are not symbols (ADR-0026).
-- **Not modelled yet:** std/built-in calls, FFI, field reads/writes, data flow, effects and capabilities,
+- **Primitive I/O (ADR-0027):** every call site of a std I/O primitive (`readFile`, `File.write`, `shell`, `nowMillis`,
+  `console.log`, ...) and of the std scope functions (`withFile`, `useUnder`, `useFs`, ...) becomes a `PERFORMS_IO`
+  edge from the enclosing function to a compiler-owned `Effect` node (`~io:Fs.ReadFile`, `sig` = `INPUT; grant:
+  FsGrant`); the edge's `via` is the direction `INPUT` / `OUTPUT` / `CONTROL`, evidence `MUST` for a direct call
+  (`MAY` inside a closure). `console.*` and `exit` are `ambient` (they need no grant). These are call sites, not effect
+  summaries: a function that only *calls* one that performs I/O has no edge of its own (transitive inference is Stage B),
+  and a call through a function value is `~unknown`, so an absent edge never proves the absence of I/O.
+- **Not modelled yet:** transitive effects, FFI, field reads/writes, data flow, grant chains and runtime events,
   `std:` imports as edges. They arrive with phases 2 and 3 as additive schema versions.
 - **Renames are guesses.** Same-signature matching misses a rename with a signature change and can
   pair unrelated symbols that look alike; that is why the class is separate and labelled.

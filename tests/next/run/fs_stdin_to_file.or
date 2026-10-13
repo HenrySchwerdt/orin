@@ -1,36 +1,47 @@
 // stdin (std:io) into a file through the scope API, then back out again; and a large file round trip.
+import { Host, useHost } from "std:host";
+import { FsGrant } from "std:fs";
+import { StdioGrant } from "std:io";
 import { readLine } from "std:io";
 import { withFile, useFile, Read, Write, Append, File } from "std:fs";
 
 const PATH: string = "build/tests/fs_stdin_to_file.txt";
 const BIG: string = "build/tests/fs_stdin_big.txt";
 
-function main(): void {
-  const stored = useFile(PATH, Write, f => {
+function main(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => { run(fs, stdio); });
+}
+function run(fs: FsGrant, stdio: StdioGrant): void {
+  // a closure cannot capture the stdio grant (ADR-0027), so stdin is read before the file scope starts
+  let lines: string[] = [];
+  while (true) {
+    const l = readLine(stdio);
+    if (l.isNone()) {
+      break;
+    }
+    lines.push(l.unwrap());
+  }
+  const stored = useFile(fs, PATH, Write, f => {
     let n: int = 0;
-    while (true) {
-      const l = readLine();
-      if (l.isNone()) {
-        break;
-      }
+    for (const line of lines) {
       n += 1;
-      f.writeLine(n.toString() + ": " + l.unwrap());
+      f.writeLine(n.toString() + ": " + line);
     }
     f.writeLine("total " + n.toString());
   });
   console.log("stored: " + stored.isOk().toString());
-  const text = withFile(PATH, Read, f => f.readAll()).unwrap();
+  const text = withFile(fs, PATH, Read, f => f.readAll()).unwrap();
   console.log(text);
 
   // a large file: 100000 lines, written in one scope, counted in another, partly read in a third
-  useFile(BIG, Write, f => {
+  useFile(fs, BIG, Write, f => {
     let i: int = 0;
     while (i < 100000) {
       f.writeLine("row " + i.toString());
       i += 1;
     }
   }).unwrap();
-  const rows = withFile(BIG, Read, f => {
+  const rows = withFile(fs, BIG, Read, f => {
     let n: int = 0;
     while (f.readLine().isSome()) {
       n += 1;
@@ -38,15 +49,15 @@ function main(): void {
     return n;
   });
   console.log("rows " + rows.unwrap().toString());
-  const head = withFile(BIG, Read, f => {
+  const head = withFile(fs, BIG, Read, f => {
     f.readLine();
     f.readLine();
     return f.read(5).unwrapOr("");
   });
   console.log("head [" + head.unwrap() + "]");
-  const size = withFile(BIG, Read, f => f.readAll().length);
+  const size = withFile(fs, BIG, Read, f => f.readAll().length);
   console.log("bytes " + size.unwrap().toString());
   // read(n) with an n far bigger than the file: no allocation of n bytes
-  const huge = withFile(BIG, Read, f => f.read(1000000000000).unwrapOr("").length);
+  const huge = withFile(fs, BIG, Read, f => f.read(1000000000000).unwrapOr("").length);
   console.log("huge read " + huge.unwrap().toString());
 }

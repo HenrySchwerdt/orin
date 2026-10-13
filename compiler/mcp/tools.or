@@ -2,6 +2,8 @@
 // compiler/analysis (the same services as the language server, ADR-0008). Results are compact JSON
 // text; every tool returns a ToolOut (updated state, text, isError).
 
+import { FsGrant } from "std:fs";
+import { ProcessGrant } from "std:process";
 import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, asStr, getField, getStr, getInt, getBool } from "../json";
 import { Workspace, newWorkspace, openFile, analyze, Analysis, PathDiag, fileIndexOf, offsetToPos, posToOffset,
   symbolAt, hoverAt, renameEdits, TextEdit, moduleDeps, loadOsigIn, osigJson, diffOsig, diffText, diffJson, diffHtml,
@@ -27,8 +29,8 @@ import { apiLookup } from "./apitable";
 
 export type ToolOut = { st: McpState; text: string; err: bool; };
 
-function readOr(p: string): string {
-  const r = readFile(p);
+function readOr(fs: FsGrant, p: string): string {
+  const r = readFile(fs, p);
   if (r.isErr()) {
     return "";
   }
@@ -134,34 +136,34 @@ export function toolList(): Json[] {
 
 // ---- dispatch ------------------------------------------------------------------------------
 
-export function callTool(st: McpState, name: string, args: Json): Option<ToolOut> {
+export function callTool(fs: FsGrant, proc: ProcessGrant, st: McpState, name: string, args: Json): Option<ToolOut> {
   if (name == "check") {
-    return Some(toolCheck(st, args));
+    return Some(toolCheck(fs, st, args));
   }
   if (name == "inspect") {
-    return Some(toolInspect(st, args));
+    return Some(toolInspect(fs, st, args));
   }
   if (name == "edit") {
-    return Some(toolEdit(st, args));
+    return Some(toolEdit(fs, st, args));
   }
   if (name == "test") {
-    return Some(toolTest(st, args));
+    return Some(toolTest(fs, proc, st, args));
   }
   if (name == "build") {
-    return Some(toolBuild(st, args));
+    return Some(toolBuild(fs, proc, st, args));
   }
   if (name == "graph") {
-    return Some(toolGraph(st, args));
+    return Some(toolGraph(fs, st, args));
   }
   if (name == "diff") {
-    return Some(toolDiff(st, args));
+    return Some(toolDiff(fs, st, args));
   }
   return None;
 }
 
 // ---- graph / diff (OSIG, docs/osig.md) --------------------------------------------------------
 
-function toolGraph(st: McpState, args: Json): ToolOut {
+function toolGraph(fs: FsGrant, st: McpState, args: Json): ToolOut {
   const entry = getStr(args, "entry");
   if (entry.isNone()) {
     return fail(st, "graph: missing `entry`");
@@ -170,7 +172,7 @@ function toolGraph(st: McpState, args: Json): ToolOut {
   if (p.isErr()) {
     return fail(st, p.unwrapErr());
   }
-  const g = loadOsigIn(p.unwrap(), st.root);
+  const g = loadOsigIn(fs, p.unwrap(), st.root);
   if (g.isErr()) {
     return fail(st, g.unwrapErr());
   }
@@ -182,7 +184,7 @@ function toolGraph(st: McpState, args: Json): ToolOut {
     if (op.isErr()) {
       return fail(st, op.unwrapErr());
     }
-    const w = writeFile(op.unwrap(), snap);
+    const w = writeFile(fs, op.unwrap(), snap);
     if (w.isErr()) {
       return fail(st, "cannot write " + outRel.unwrap() + ": " + w.unwrapErr());
     }
@@ -197,7 +199,7 @@ function toolGraph(st: McpState, args: Json): ToolOut {
   return ok(st, JObj(fields));
 }
 
-function toolDiff(st: McpState, args: Json): ToolOut {
+function toolDiff(fs: FsGrant, st: McpState, args: Json): ToolOut {
   const base = getStr(args, "base");
   const head = getStr(args, "head");
   if (base.isNone() || head.isNone()) {
@@ -215,11 +217,11 @@ function toolDiff(st: McpState, args: Json): ToolOut {
   if (hp.isErr()) {
     return fail(st, hp.unwrapErr());
   }
-  const b = loadOsigIn(bp.unwrap(), st.root);
+  const b = loadOsigIn(fs, bp.unwrap(), st.root);
   if (b.isErr()) {
     return fail(st, "base: " + b.unwrapErr());
   }
-  const h = loadOsigIn(hp.unwrap(), st.root);
+  const h = loadOsigIn(fs, hp.unwrap(), st.root);
   if (h.isErr()) {
     return fail(st, "head: " + h.unwrapErr());
   }
@@ -231,7 +233,7 @@ function toolDiff(st: McpState, args: Json): ToolOut {
     if (op.isErr()) {
       return fail(st, op.unwrapErr());
     }
-    const w = writeFile(op.unwrap(), text);
+    const w = writeFile(fs, op.unwrap(), text);
     if (w.isErr()) {
       return fail(st, "cannot write " + outRel.unwrap() + ": " + w.unwrapErr());
     }
@@ -244,14 +246,14 @@ function toolDiff(st: McpState, args: Json): ToolOut {
 
 // Analyse the project rooted at `entryRel` (disk contents; the entry goes through the overlay so
 // a library entry gets the synthetic `main`, exactly as in the language server).
-function analyzeEntry(st: McpState, entryRel: string): Result<Analysis, string> {
+function analyzeEntry(fs: FsGrant, st: McpState, entryRel: string): Result<Analysis, string> {
   const p = resolvePath(st, entryRel)?;
-  const t = readFile(p);
+  const t = readFile(fs, p);
   if (t.isErr()) {
     return Err("cannot read " + entryRel);
   }
   const ws = openFile(newWorkspace(), p, t.unwrap());
-  const a = analyze(ws, p);
+  const a = analyze(fs, ws, p);
   const bad = checkAllInside(st, a);
   if (bad.isSome()) {
     return Err(bad.unwrap());
@@ -286,12 +288,12 @@ function view(d: DiagView, detailed: bool): Json {
   return JStr(compactLine(d));
 }
 
-function toolCheck(st: McpState, args: Json): ToolOut {
+function toolCheck(fs: FsGrant, st: McpState, args: Json): ToolOut {
   const entry = getStr(args, "entry");
   if (entry.isNone()) {
     return fail(st, "missing required argument: entry");
   }
-  const ar = analyzeEntry(st, entry.unwrap());
+  const ar = analyzeEntry(fs, st, entry.unwrap());
   if (ar.isErr()) {
     return fail(st, ar.unwrapErr());
   }
@@ -506,7 +508,7 @@ function addUnique(xs: string[], x: string): string[] {
 
 // ---- inspect -------------------------------------------------------------------------------
 
-function toolInspect(st: McpState, args: Json): ToolOut {
+function toolInspect(fs: FsGrant, st: McpState, args: Json): ToolOut {
   const includeSource = getBool(args, "includeSource").unwrapOr(false);
   const sym = getStr(args, "symbol");
   const mod = getStr(args, "module");
@@ -524,7 +526,7 @@ function toolInspect(st: McpState, args: Json): ToolOut {
   if (entry.isNone()) {
     return fail(st, "give one of: symbol (with entry for project symbols), module, or file+position");
   }
-  const ar = analyzeEntry(st, entry.unwrap());
+  const ar = analyzeEntry(fs, st, entry.unwrap());
   if (ar.isErr()) {
     return fail(st, ar.unwrapErr());
   }
@@ -706,7 +708,7 @@ function applyEdits(text: string, es: TextEdit[]): string {
   return t;
 }
 
-function toolEdit(st: McpState, args: Json): ToolOut {
+function toolEdit(fs: FsGrant, st: McpState, args: Json): ToolOut {
   const kind = getStr(args, "kind").unwrapOr("");
   if (kind != "rename") {
     return fail(st, "unsupported edit kind (supported: rename)");
@@ -726,7 +728,7 @@ function toolEdit(st: McpState, args: Json): ToolOut {
     return fail(st, fp.unwrapErr());
   }
   const entry = getStr(args, "entry").unwrapOr(file.unwrap());
-  const ar = analyzeEntry(st, entry);
+  const ar = analyzeEntry(fs, st, entry);
   if (ar.isErr()) {
     return fail(st, ar.unwrapErr());
   }
@@ -777,7 +779,7 @@ function toolEdit(st: McpState, args: Json): ToolOut {
   if (!indexIn(paths, a.entry)) {
     ws = openFile(ws, a.entry, a.sm.files[0].text);
   }
-  const after = analyze(ws, a.entry);
+  const after = analyze(fs, ws, a.entry);
   const valid = after.diags.length <= a.diags.length;
   let locs: string[] = [];
   for (const e of edits) {
@@ -788,7 +790,7 @@ function toolEdit(st: McpState, args: Json): ToolOut {
   if (apply && valid) {
     let i: usize = 0;
     while (i < paths.length) {
-      const w = writeFile(paths[i], texts[i]);
+      const w = writeFile(fs, paths[i], texts[i]);
       if (w.isErr()) {
         return fail(st, "cannot write " + relPath(st, paths[i]) + ": " + w.unwrapErr());
       }
@@ -812,9 +814,9 @@ function toolEdit(st: McpState, args: Json): ToolOut {
 
 type Compiled = { ok: bool; diags: DiagView[]; err: string; bytes: usize; };
 
-function compileEntry(st: McpState, entry: string, out: string): Compiled {
+function compileEntry(fs: FsGrant, st: McpState, entry: string, out: string): Compiled {
   const none: DiagView[] = [];
-  const loaded = loadAll(entry);
+  const loaded = loadAll(fs, entry);
   for (const f of loaded.sm.files) {
     if (!f.path.startsWith("$") && resolvePath(st, f.path).isErr()) {
       return Compiled { ok: false, diags: none, err: "project reads a file outside the authorized root: " + f.path, bytes: 0 };
@@ -841,7 +843,7 @@ function compileEntry(st: McpState, entry: string, out: string): Compiled {
     return Compiled { ok: false, diags: none, err: "internal compiler error: MIR ownership verification failed", bytes: 0 };
   }
   const c = emitC(mir);
-  const w = writeFile(out, c);
+  const w = writeFile(fs, out, c);
   if (w.isErr()) {
     return Compiled { ok: false, diags: none, err: "cannot write " + relPath(st, out) + ": " + w.unwrapErr(), bytes: 0 };
   }
@@ -873,19 +875,19 @@ function runtimeDir(st: McpState): string {
 }
 
 // cc invocation; returns (exit status, trimmed log).
-function ccLink(st: McpState, cfile: string, bin: string): ToolOut {
+function ccLink(fs: FsGrant, proc: ProcessGrant, st: McpState, cfile: string, bin: string): ToolOut {
   const rt = runtimeDir(st);
-  if (!exists(rt + "/orin_runtime.c")) {
+  if (!exists(fs, rt + "/orin_runtime.c")) {
     return fail(st, "runtime not found at " + rt + "; start the server with --repo <orin checkout>");
   }
   const log = bin + ".cc.log";
-  const code = shellRun("cc -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " " + shq(rt + "/../platform/orin_platform.c") + " -lm -o " + shq(bin)
+  const code = shellRun(proc, "cc -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " " + shq(rt + "/../platform/orin_platform.c") + " -lm -o " + shq(bin)
     + " > " + shq(log) + " 2>&1");
-  const text = readOr(log);
+  const text = readOr(fs, log);
   return ToolOut { st: st, text: code == 0 ? "" : trunc(text, 2000), err: code != 0 };
 }
 
-function toolBuild(st: McpState, args: Json): ToolOut {
+function toolBuild(fs: FsGrant, proc: ProcessGrant, st: McpState, args: Json): ToolOut {
   const refuse = needExec(st, "build");
   if (refuse.isSome()) {
     return refuse.unwrap();
@@ -912,23 +914,23 @@ function toolBuild(st: McpState, args: Json): ToolOut {
     }
     b = br.unwrap();
   }
-  shellRun("mkdir -p " + shq(dirname(o.unwrap())));
-  const c = compileEntry(st, e.unwrap(), o.unwrap());
+  shellRun(proc, "mkdir -p " + shq(dirname(o.unwrap())));
+  const c = compileEntry(fs, st, e.unwrap(), o.unwrap());
   if (!c.ok) {
     return diagFailure(st, c);
   }
-  let fs: JField[] = [
+  let fields: JField[] = [
     jField("ok", JBool(true)), jField("c", JStr(relPath(st, o.unwrap()))), jField("bytes", num(c.bytes))
   ];
   if (bin.isSome()) {
-    shellRun("mkdir -p " + shq(dirname(b)));
-    const l = ccLink(st, o.unwrap(), b);
+    shellRun(proc, "mkdir -p " + shq(dirname(b)));
+    const l = ccLink(fs, proc, st, o.unwrap(), b);
     if (l.err) {
       return fail(st, "cc failed: " + l.text);
     }
-    fs.push(jField("binary", JStr(relPath(st, b))));
+    fields.push(jField("binary", JStr(relPath(st, b))));
   }
-  return ok(st, JObj(fs));
+  return ok(st, JObj(fields));
 }
 
 function expectedOutPath(entry: string): string {
@@ -965,7 +967,7 @@ function firstMismatch(got: string, want: string): string {
   return "";
 }
 
-function toolTest(st: McpState, args: Json): ToolOut {
+function toolTest(fs: FsGrant, proc: ProcessGrant, st: McpState, args: Json): ToolOut {
   const refuse = needExec(st, "test");
   if (refuse.isSome()) {
     return refuse.unwrap();
@@ -973,22 +975,22 @@ function toolTest(st: McpState, args: Json): ToolOut {
   const entry = getStr(args, "entry");
   if (entry.isSome()) {
     if (getBool(args, "unit").unwrapOr(false)) {
-      return testUnits(st, entry.unwrap(), getStr(args, "filter").unwrapOr(""));
+      return testUnits(fs, proc, st, entry.unwrap(), getStr(args, "filter").unwrapOr(""));
     }
-    return testEntry(st, entry.unwrap());
+    return testEntry(fs, proc, st, entry.unwrap());
   }
-  return testSuite(st, args);
+  return testSuite(fs, proc, st, args);
 }
 
 // `@Test` functions (ADR-0024): the shared runner of `orin test`; the result is its JSON report
 // (docs/testing.md), or the compile diagnostics when the program does not build.
-function testUnits(st: McpState, entryRel: string, filter: string): ToolOut {
+function testUnits(fs: FsGrant, proc: ProcessGrant, st: McpState, entryRel: string, filter: string): ToolOut {
   const e = resolvePath(st, entryRel);
   if (e.isErr()) {
     return fail(st, e.unwrapErr());
   }
   const rt = runtimeDir(st);
-  const r = runTests(TestOpts {
+  const r = runTests(fs, proc, TestOpts {
     entry: e.unwrap(), filter: filter, runtime: rt, cc: "cc", outDir: "", keep: false, timeout: 10, contracts: true, root: st.root
   });
   if (r.diags.length > 0) {
@@ -1004,31 +1006,31 @@ function testUnits(st: McpState, entryRel: string, filter: string): ToolOut {
   return ok(st, j.unwrap());
 }
 
-function testEntry(st: McpState, entryRel: string): ToolOut {
+function testEntry(fs: FsGrant, proc: ProcessGrant, st: McpState, entryRel: string): ToolOut {
   const e = resolvePath(st, entryRel);
   if (e.isErr()) {
     return fail(st, e.unwrapErr());
   }
-  const src = readFile(e.unwrap());
+  const src = readFile(fs, e.unwrap());
   if (src.isErr()) {
     return fail(st, "cannot read " + entryRel);
   }
   const dir = joinPath(st.root, ".orin-mcp");
-  shellRun("mkdir -p " + shq(dir));
+  shellRun(proc, "mkdir -p " + shq(dir));
   const stem = dir + "/t" + hex8(hashStr(3, e.unwrap()));
-  const c = compileEntry(st, e.unwrap(), stem + ".c");
+  const c = compileEntry(fs, st, e.unwrap(), stem + ".c");
   if (!c.ok) {
     return diagFailure(st, c);
   }
-  const l = ccLink(st, stem + ".c", stem);
+  const l = ccLink(fs, proc, st, stem + ".c", stem);
   if (l.err) {
     return fail(st, "cc failed: " + l.text);
   }
-  const code = shellRun("timeout 10 " + shq(stem) + " > " + shq(stem + ".stdout") + " 2> " + shq(stem + ".stderr"));
-  const got = readOr(stem + ".stdout");
-  const errText = readOr(stem + ".stderr");
+  const code = shellRun(proc, "timeout 10 " + shq(stem) + " > " + shq(stem + ".stdout") + " 2> " + shq(stem + ".stderr"));
+  const got = readOr(fs, stem + ".stdout");
+  const errText = readOr(fs, stem + ".stderr");
   const wantExit = expectedExit(src.unwrap());
-  const want = readFile(expectedOutPath(e.unwrap()));
+  const want = readFile(fs, expectedOutPath(e.unwrap()));
   let passed = code == wantExit;
   let why = "";
   if (!passed) {
@@ -1052,26 +1054,26 @@ function testEntry(st: McpState, entryRel: string): ToolOut {
   return ok(st, JObj(fs));
 }
 
-function testSuite(st: McpState, args: Json): ToolOut {
+function testSuite(fs: FsGrant, proc: ProcessGrant, st: McpState, args: Json): ToolOut {
   const suite = getStr(args, "suite").unwrapOr("default");
   if (suite != "default" && suite != "next" && suite != "all") {
     return fail(st, "suite must be default, next or all");
   }
   const runner = joinPath(st.repo, "tools/run_tests.py");
   const orinc = joinPath(st.repo, "build/bootstrap/orin2");
-  if (!exists(runner) || !exists(orinc)) {
+  if (!exists(fs, runner) || !exists(fs, orinc)) {
     return fail(st, "conformance runner or " + orinc + " not found; start the server with --repo <orin checkout> and run tools/bootstrap.sh");
   }
   const dir = joinPath(st.root, ".orin-mcp");
-  shellRun("mkdir -p " + shq(dir));
+  shellRun(proc, "mkdir -p " + shq(dir));
   const log = dir + "/suite.log";
   let cmd = "cd " + shq(st.repo) + " && python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite " + suite;
   const filter = getStr(args, "filter");
   if (filter.isSome()) {
     cmd += " --filter " + shq(filter.unwrap());
   }
-  const code = shellRun("(" + cmd + ") > " + shq(log) + " 2>&1");
-  const outText = readOr(log);
+  const code = shellRun(proc, "(" + cmd + ") > " + shq(log) + " 2>&1");
+  const outText = readOr(fs, log);
   let failures: string[] = [];
   let passedN: int = -1;
   let failedN: int = -1;
