@@ -9,6 +9,34 @@
 #include <sys/stat.h>
 
 static int64_t g_live;
+OrinStats orin_stats;
+
+/* Accounting helpers: called wherever g_live changes / buffers are (re)allocated. */
+static inline void stat_alloc(uint64_t *kind_counter, uint64_t bytes) {
+    (*kind_counter)++;
+    orin_stats.live_bytes += bytes;
+    if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+    if ((uint64_t)g_live > orin_stats.peak_live_objs) orin_stats.peak_live_objs = (uint64_t)g_live;
+}
+
+static void stats_report(void) {
+    const char *e = getenv("ORIN_STATS");
+    if (!e || strcmp(e, "1") != 0) return;
+    const OrinStats *s = &orin_stats;
+    fprintf(stderr,
+            "{\"orin_stats\":{\"alloc_string\":%llu,\"alloc_array\":%llu,\"alloc_struct\":%llu,"
+            "\"alloc_total\":%llu,\"frees\":%llu,\"retains\":%llu,\"releases\":%llu,"
+            "\"cow_copies\":%llu,\"cow_inplace\":%llu,\"array_grows\":%llu,\"string_grows\":%llu,"
+            "\"peak_live_objs\":%llu,\"peak_live_bytes\":%llu,\"live_objs_at_exit\":%lld}}\n",
+            (unsigned long long)s->alloc_string, (unsigned long long)s->alloc_array,
+            (unsigned long long)s->alloc_struct,
+            (unsigned long long)(s->alloc_string + s->alloc_array + s->alloc_struct),
+            (unsigned long long)s->frees, (unsigned long long)s->retains,
+            (unsigned long long)s->releases, (unsigned long long)s->cow_copies,
+            (unsigned long long)s->cow_inplace, (unsigned long long)s->array_grows,
+            (unsigned long long)s->string_grows, (unsigned long long)s->peak_live_objs,
+            (unsigned long long)s->peak_live_bytes, (long long)g_live);
+}
 static int g_argc;
 static char **g_argv;
 
@@ -17,6 +45,7 @@ int64_t orin_live_count(void) { return g_live; }
 void orin_init(int argc, char **argv) {
     g_argc = argc;
     g_argv = argv;
+    atexit(stats_report);
     setvbuf(stdout, NULL, _IOFBF, 1 << 16);
 }
 
@@ -58,7 +87,10 @@ void orin_destroy(OrinObj *o) {
 #define DEC(c)                                                                                  \
     do {                                                                                        \
         OrinObj *c_ = (c);                                                                      \
-        if (c_ && c_->rc > 0 && --c_->rc == 0) PUSH(c_);                                        \
+        if (c_ && c_->rc > 0) {                                                                 \
+            orin_stats.releases++;                                                              \
+            if (--c_->rc == 0) PUSH(c_);                                                        \
+        }                                                                                       \
     } while (0)
     PUSH(o);
     while (sp) {
@@ -68,6 +100,7 @@ void orin_destroy(OrinObj *o) {
             OrinArray *a = (OrinArray *)x;
             if (a->is_ref)
                 for (uint64_t i = 0; i < a->len; i++) DEC(ORIN_REF(a->items[i]));
+            orin_stats.live_bytes -= sizeof(OrinArray) + a->cap * 8;
             free(a->items);
             break;
         }
@@ -75,12 +108,14 @@ void orin_destroy(OrinObj *o) {
             OrinStruct *s = (OrinStruct *)x;
             for (uint32_t i = 0; i < s->nslots; i++)
                 if ((s->refmask >> i) & 1) DEC(ORIN_REF(s->slots[i]));
+            orin_stats.live_bytes -= sizeof(OrinStruct) + (uint64_t)s->nslots * 8;
             break;
         }
-        default: break;
+        default: orin_stats.live_bytes -= sizeof(OrinString) + ((OrinString *)x)->cap + 1; break;
         }
         free(x);
         g_live--;
+        orin_stats.frees++;
     }
 #undef PUSH
 #undef DEC
@@ -99,6 +134,7 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     s->refmask = refmask;
     memset(s->slots, 0, (size_t)nslots * 8);
     g_live++;
+    stat_alloc(&orin_stats.alloc_struct, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     return &s->h;
 }
 
@@ -110,6 +146,8 @@ OrinObj *orin_nullary(uint32_t tag) {
         OrinObj *o = orin_struct_new(tag, 0, 0);
         o->rc = -1;
         g_live--; /* immortal: not counted */
+        orin_stats.alloc_struct--;
+        orin_stats.live_bytes -= sizeof(OrinStruct);
         tbl[tag] = o;
     }
     return tbl[tag];
@@ -144,7 +182,11 @@ uint64_t orin_res_unwrap_err(OrinObj *o) {
 /* ---------------------------------------------------------------- make_unique */
 
 OrinObj *orin_make_unique(OrinObj *o) {
-    if (o->rc == 1) return o;
+    if (o->rc == 1) {
+        orin_stats.cow_inplace++;
+        return o;
+    }
+    orin_stats.cow_copies++;
     OrinObj *r;
     switch (o->kind) {
     case ORIN_K_STRUCT: {
@@ -187,6 +229,7 @@ static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     s->cap = cap;
     s->data[len] = 0;
     g_live++;
+    stat_alloc(&orin_stats.alloc_string, sizeof(OrinString) + cap + 1);
     return s;
 }
 
@@ -216,6 +259,8 @@ OrinObj *orin_str_append(OrinObj *a, OrinObj *b) {
             if (cap < n) cap = n;
             if (cap < 16) cap = 16;
             x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            orin_stats.live_bytes += cap - x->cap;
+            orin_stats.string_grows++;
             x->cap = cap;
         }
         memcpy(x->data + x->len, y->data, y->len);
@@ -249,6 +294,8 @@ static OrinObj *char_string(unsigned c) {
         OrinObj *o = orin_str_new(&ch, 1);
         o->rc = -1;
         g_live--;
+        orin_stats.alloc_string--;
+        orin_stats.live_bytes -= sizeof(OrinString) + 2;
         tbl[c] = o;
     }
     return tbl[c];
@@ -373,6 +420,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     a->is_ref = is_ref ? 1 : 0;
     a->items = cap ? (uint64_t *)xmalloc(cap * 8) : NULL;
     g_live++;
+    stat_alloc(&orin_stats.alloc_array, sizeof(OrinArray) + cap * 8);
     return &a->h;
 }
 
@@ -381,6 +429,9 @@ void orin_array_push(OrinObj *o, uint64_t slot) {
     if (a->len == a->cap) {
         uint64_t cap = a->cap ? a->cap * 2 : 4;
         a->items = (uint64_t *)xrealloc(a->items, cap * 8);
+        orin_stats.live_bytes += (cap - a->cap) * 8;
+        if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+        orin_stats.array_grows++;
         a->cap = cap;
     }
     a->items[a->len++] = slot;
