@@ -43,3 +43,9 @@ Use Lean 4 or Rocq for mechanization; choice is OPEN. Separation logic/Iris or e
 ## Research context
 
 Relevant precedents: Perceus correctness, RustBelt semantic models of safe abstractions, CompCert verified compilation, region inference. None directly proves this design as a whole. See `13-research-references.md`.
+
+## Runtime layering (2026-10-13)
+
+To shrink the trusted computing base, the runtime is predominantly written in Orin over a minimal
+platform layer with separately verified contracts (`19-runtime-and-platform-layer.md`). Runtime
+object-model code then becomes a refinement-proof obligation instead of a trust assumption.
