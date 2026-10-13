@@ -6,13 +6,79 @@ import { Ident } from "../syntax";
 import { Type, Local, HStmt, HExpr } from "../hir";
 import { FuncInfo, Env } from "./env";
 
+// What a visible name is bound to: the local's id and the scope level it was declared at.
+type Bind = { id: usize; level: usize; };
+// What a declaration shadowed (`prev`), so that closing its scope can restore it.
+type Shadowed = { name: string; prev: Option<Bind>; };
+
+// The open scopes' start positions never decrease and lie inside the log.
+function marksOrdered(marks: usize[], logLen: usize): bool {
+  let prev: usize = 0;
+  for (const m of marks) {
+    if (m < prev || m > logLen) {
+      return false;
+    }
+    prev = m;
+  }
+  return true;
+}
+
+// The visible local names of one function body: a stack of lexical scopes over a hash table, so a
+// lookup is O(1) however deep the nesting. `vis` maps a visible name to its binding; `log` remembers
+// what every declaration shadowed, so closing a scope restores the outer binding; `marks` holds the
+// log length at the opening of each open scope (the first one, the parameters' scope, starts at 0).
+@Invariant(marksOrdered(this.marks, this.log.length))
+@Invariant(this.vis.size <= this.log.length)
+export class Scope {
+  private vis: Map<string, Bind> = new Map<string, Bind>();
+  private log: Shadowed[] = [];
+  private marks: usize[] = [0];
+
+  // Number of open scopes.
+  depth(): usize {
+    return this.marks.length;
+  }
+
+  open(): void {
+    this.marks.push(this.log.length);
+  }
+
+  // Closes the innermost scope and forgets its names; with no scope open it forgets every name.
+  close(): void {
+    const k = this.marks.pop().unwrapOr(0);
+    while (this.log.length > k) {
+      const u = this.log.pop().unwrap();
+      match (u.prev) {
+        Some(b) => { this.vis.set(u.name, b); },
+        None => { this.vis.delete(u.name); }
+      }
+    }
+  }
+
+  // Binds `name` in the innermost scope; a binding of the same name (in this or an outer scope) is
+  // shadowed until this scope closes.
+  bind(name: string, id: usize): void {
+    this.log.push(Shadowed { name: name, prev: this.vis.get(name) });
+    this.vis.set(name, Bind { id: id, level: this.marks.length });
+  }
+
+  lookup(name: string): Option<usize> {
+    const b = this.vis.get(name);
+    return b.isSome() ? Some(b.unwrap().id) : None;
+  }
+
+  // True if `name` is declared in the innermost scope.
+  inInnermost(name: string): bool {
+    const b = this.vis.get(name);
+    return b.isSome() && b.unwrap().level == this.marks.length;
+  }
+}
+
 export type FnCtx = {
   unit: usize;
   ret: Type;
   locals: Local[];
-  names: string[];     // flat scope stack: visible local names ...
-  ids: usize[];        // ... and their local ids
-  marks: usize[];      // start index (into names/ids) of each open scope
+  scope: Scope;        // the visible local names
   loops: bool[];       // one flag per enclosing loop: has a `break` targeting it been seen?
   env: Env;            // current environment: grows as generic instances are created
   tpNames: string[];   // type parameters of the function being checked ...
@@ -57,52 +123,35 @@ export type VarOut = { fx: FnCtx; id: Option<usize>; };
 export type LocalOut = { fx: FnCtx; id: usize; };
 export type LoopOut = { fx: FnCtx; broke: bool; };
 
-export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
-  let names: string[] = [];
-  let ids: usize[] = [];
-  let i: usize = 0;
-  for (const l of f.paramLocals) {
-    names.push(l.name);
-    ids.push(i);
-    i += 1;
-  }
-  const marks: usize[] = [0];
-  const loops: bool[] = [];
-  const pre: HStmt[] = [];
-  const noCapN: string[] = [];
-  const noCapT: Type[] = [];
-  const noCapI: usize[] = [];
-  const noOuter: Option<FnCtx> = None;
-  const noSeen: Option<Type> = None;
+// A context with the defaults every function starts with; the two constructors below set the rest.
+function blankCtx(unit: usize, qname: string, env: Env, locals: Local[], scope: Scope, ret: Type): FnCtx {
   return FnCtx {
-    unit: f.unit,
-    ret: f.mode == 0 ? f.ret : f.srcRet,
-    locals: f.paramLocals,
-    names: names,
-    ids: ids,
-    marks: marks,
-    loops: loops,
+    unit: unit,
+    ret: ret,
+    locals: locals,
+    scope: scope,
+    loops: [],
     env: env,
-    tpNames: f.tpNames,
-    tpTys: f.tpTys,
-    abs: abs,
-    depth: f.depth,
-    fmode: f.mode,
-    fcls: f.cls,
-    lret: f.ret,
-    pre: pre,
+    tpNames: [],
+    tpTys: [],
+    abs: false,
+    depth: 0,
+    fmode: 0,
+    fcls: 0,
+    lret: ret,
+    pre: [],
     tmps: 0,
     probe: false,
     mutThis: false,
-    outer: noOuter,
-    capNames: noCapN,
-    capTys: noCapT,
-    capIds: noCapI,
-    qname: f.qname,
+    outer: None,
+    capNames: [],
+    capTys: [],
+    capIds: [],
+    qname: qname,
     ncl: 0,
     retInfer: false,
-    retSeen: noSeen,
-    clsAcc: (f.mode >= 1 && f.mode <= 5) ? f.cls.toInt() : -1,
+    retSeen: None,
+    clsAcc: -1,
     selfName: "",
     pendLet: "",
     cmode: 0,
@@ -110,60 +159,47 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
   };
 }
 
+export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
+  let scope = new Scope();
+  let i: usize = 0;
+  for (const l of f.paramLocals) {
+    scope.bind(l.name, i);
+    i += 1;
+  }
+  let fx = blankCtx(f.unit, f.qname, env, f.paramLocals, scope, f.mode == 0 ? f.ret : f.srcRet);
+  fx.tpNames = f.tpNames;
+  fx.tpTys = f.tpTys;
+  fx.abs = abs;
+  fx.depth = f.depth;
+  fx.fmode = f.mode;
+  fx.fcls = f.cls;
+  fx.lret = f.ret;
+  fx.clsAcc = (f.mode >= 1 && f.mode <= 5) ? f.cls.toInt() : -1;
+  return fx;
+}
+
 // The context for checking the body of an arrow function created in `o`: parameters (after the
 // environment local 0) are given by name and type. `ret` is TyVoid when it has to be inferred.
 export function newClosureCtx(o: FnCtx, qname: string, names: string[], tys: Type[], ret: Type, infer: bool): FnCtx {
   let locals: Local[] = [Local { name: "env$", ty: TyVoid, mutable: false }];
-  let ns: string[] = [];
-  let ids: usize[] = [];
+  let scope = new Scope();
   let i: usize = 0;
   while (i < names.length) {
     locals.push(Local { name: names[i], ty: tys[i], mutable: false });
-    ns.push(names[i]);
-    ids.push(i + 1);
+    scope.bind(names[i], i + 1);
     i += 1;
   }
-  const marks: usize[] = [0];
-  const loops: bool[] = [];
-  const pre: HStmt[] = [];
-  const noCapN: string[] = [];
-  const noCapT: Type[] = [];
-  const noCapI: usize[] = [];
-  const noSeen: Option<Type> = None;
-  return FnCtx {
-    unit: o.unit,
-    ret: ret,
-    locals: locals,
-    names: ns,
-    ids: ids,
-    marks: marks,
-    loops: loops,
-    env: o.env,
-    tpNames: o.tpNames,
-    tpTys: o.tpTys,
-    abs: o.abs,
-    depth: o.depth,
-    fmode: 0,
-    fcls: 0,
-    lret: ret,
-    pre: pre,
-    tmps: 0,
-    probe: o.probe,
-    mutThis: false,
-    outer: Some(o),
-    capNames: noCapN,
-    capTys: noCapT,
-    capIds: noCapI,
-    qname: qname,
-    ncl: 0,
-    retInfer: infer,
-    retSeen: noSeen,
-    clsAcc: o.clsAcc,
-    selfName: o.pendLet,
-    pendLet: "",
-    cmode: 0,
-    cexprs: []
-  };
+  let fx = blankCtx(o.unit, qname, o.env, locals, scope, ret);
+  fx.tpNames = o.tpNames;
+  fx.tpTys = o.tpTys;
+  fx.abs = o.abs;
+  fx.depth = o.depth;
+  fx.probe = o.probe;
+  fx.outer = Some(o);
+  fx.retInfer = infer;
+  fx.clsAcc = o.clsAcc;
+  fx.selfName = o.pendLet;
+  return fx;
 }
 
 // Type of `name` as seen from `fx`: a local, a capture, or (through the chain of enclosing
@@ -173,12 +209,9 @@ export function varType(fx: FnCtx, name: string): Option<Type> {
   if (l.isSome()) {
     return Some(fx.locals[l.unwrap()].ty);
   }
-  let i: usize = 0;
-  while (i < fx.capNames.length) {
-    if (fx.capNames[i] == name) {
-      return Some(fx.capTys[i]);
-    }
-    i += 1;
+  const c = fx.capNames.indexOf(name);
+  if (c.isSome()) {
+    return Some(fx.capTys[c.unwrap()]);
   }
   return match (fx.outer) {
     Some(o) => varType(o, name),
@@ -197,12 +230,9 @@ export function lookupVar(fx: FnCtx, name: string): VarOut {
   if (l.isSome()) {
     return VarOut { fx: fx, id: l };
   }
-  let i: usize = 0;
-  while (i < fx.capNames.length) {
-    if (fx.capNames[i] == name) {
-      return VarOut { fx: fx, id: Some(fx.capIds[i]) };
-    }
-    i += 1;
+  const c = fx.capNames.indexOf(name);
+  if (c.isSome()) {
+    return VarOut { fx: fx, id: Some(fx.capIds[c.unwrap()]) };
   }
   match (fx.outer) {
     Some(o) => {
@@ -226,40 +256,23 @@ export function lookupVar(fx: FnCtx, name: string): VarOut {
 }
 
 export function isCapturedLocal(fx: FnCtx, id: usize): bool {
-  for (const c of fx.capIds) {
-    if (c == id) {
-      return true;
-    }
-  }
-  return false;
+  return fx.capIds.includes(id);
 }
 
 export function pushScope(fx: FnCtx): FnCtx {
   let f = fx;
-  f.marks.push(f.names.length);
+  f.scope.open();
   return f;
 }
 
 export function popScope(fx: FnCtx): FnCtx {
   let f = fx;
-  const m = f.marks.pop();
-  const k = m.unwrapOr(0);
-  while (f.names.length > k) {
-    f.names.pop();
-    f.ids.pop();
-  }
+  f.scope.close();
   return f;
 }
 
 export function lookupLocal(fx: FnCtx, name: string): Option<usize> {
-  let i = fx.names.length;
-  while (i > 0) {
-    i -= 1;
-    if (fx.names[i] == name) {
-      return Some(fx.ids[i]);
-    }
-  }
-  return None;
+  return fx.scope.lookup(name);
 }
 
 export function newLocal(fx: FnCtx, name: string, ty: Type, mutable: bool): LocalOut {
@@ -271,24 +284,15 @@ export function newLocal(fx: FnCtx, name: string, ty: Type, mutable: bool): Loca
 
 // True if `name` is already declared in the innermost scope.
 export function declaredInScope(fx: FnCtx, name: string): bool {
-  const start = fx.marks.length > 0 ? fx.marks[fx.marks.length - 1] : 0;
-  let i = fx.names.length;
-  while (i > start) {
-    i -= 1;
-    if (fx.names[i] == name) {
-      return true;
-    }
-  }
-  return false;
+  return fx.scope.inInnermost(name);
 }
 
 export function declare(fx: FnCtx, name: Ident, id: usize): Result<FnCtx, Diagnostic> {
   if (declaredInScope(fx, name.name)) {
-    return Err(diag("E0304", name.span, "`" + name.name + "` is already declared in this block"));
+    return Err(diag("E0304", name.span, `\`${name.name}\` is already declared in this block`));
   }
   let f = fx;
-  f.names.push(name.name);
-  f.ids.push(id);
+  f.scope.bind(name.name, id);
   return Ok(f);
 }
 

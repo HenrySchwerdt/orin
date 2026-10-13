@@ -13,8 +13,8 @@ import { intNamed, is128, classSuffix } from "./ints";
 import { classOfGeneric, checkClassBounds } from "./classes";
 import { hasResource, resourceNested } from "./resources";
 import {
-  Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, OpaqueBound, findType, findInst, originOf, isVoid,
-  tysKey, mapGenType, isMapKeyType, showType
+  Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, findType, findInst, originOf, isVoid,
+  tysKey, mapGenType, isMapKeyType, showType, addInst, addBound, typeInRange, typesInRange
 } from "./env";
 
 export const CYCLE_MSG: string = "type alias is defined in terms of itself";
@@ -22,7 +22,7 @@ export const MAX_DEPTH: usize = 32;
 
 // E0450 (ADR-0025): a resource type (`File`) cannot be part of another type.
 export function resourceIn(span: Span, what: string): Diagnostic {
-  return diag("E0450", span, "a resource type cannot be " + what + "; a resource handle can only be a parameter (borrowed)");
+  return diag("E0450", span, `a resource type cannot be ${what}; a resource handle can only be a parameter (borrowed)`);
 }
 
 export type TScope = { unit: usize; names: string[]; tys: Type[]; depth: usize; };
@@ -42,23 +42,20 @@ export function plainScope(unit: usize): TScope {
 }
 
 export function indexOfName(names: string[], n: string): Option<usize> {
-  let i: usize = 0;
-  while (i < names.length) {
-    if (names[i] == n) {
-      return Some(i);
-    }
-    i += 1;
-  }
-  return None;
+  return names.indexOf(n);
 }
 
 function inStack(stack: int[], k: int): bool {
-  for (const s of stack) {
-    if (s == k) {
-      return true;
-    }
-  }
-  return false;
+  return stack.includes(k);
+}
+
+// A resolution result is sound: the type refers only to records / unions / interfaces of its
+// environment, and the instance indexes are as large as the instance list.
+export function resolvedOk(r: Result<TyOut, Diagnostic>): bool {
+  return match (r) {
+    Ok(o) => typeInRange(o.env, o.ty) && o.env.instIdx.size == o.env.insts.length,
+    Err(_) => true
+  };
 }
 
 function ok(env: Env, ty: Type): Result<TyOut, Diagnostic> {
@@ -69,8 +66,7 @@ function depthErr(span: Span, what: string): Diagnostic {
   return diag(
     "E0413",
     span,
-    "generic instantiation limit exceeded: " + what + " nests deeper than " + MAX_DEPTH.toString()
-      + " (polymorphic recursion?)"
+    `generic instantiation limit exceeded: ${what} nests deeper than ${MAX_DEPTH} (polymorphic recursion?)`
   );
 }
 
@@ -80,6 +76,7 @@ function depthErr(span: Span, what: string): Diagnostic {
 
 // `stack` holds the aliases currently being expanded (cycle detection): a plain alias index, or
 // -(generic id) - 1 for a generic alias.
+@Ensures(resolvedOk(result))
 export function aliasType(env: Env, idx: usize, stack: int[]): Result<TyOut, Diagnostic> {
   const a = env.aliases[idx];
   const key = idx.toInt();
@@ -91,6 +88,7 @@ export function aliasType(env: Env, idx: usize, stack: int[]): Result<TyOut, Dia
   return resolveTy(env, plainScope(a.unit), a.target, false, st);
 }
 
+@Ensures(resolvedOk(result))
 export function resolveTy(env: Env, sc: TScope, te: TypeExpr, voidOk: bool, stack: int[]): Result<TyOut, Diagnostic> {
   return match (te.kind) {
     TArray(inner) => {
@@ -137,7 +135,7 @@ function resolveNamed(
     return Err(diag(
       "E0431",
       te.span,
-      "the 128-bit integer type `" + n + "` is not supported yet (ADR-0022); use `i64` / `u64`"
+      `the 128-bit integer type \`${n}\` is not supported yet (ADR-0022); use \`i64\` / \`u64\``
     ));
   }
   let b: Option<Type> = intNamed(n);
@@ -157,7 +155,7 @@ function resolveNamed(
   if (b.isSome()) {
     const bt = b.unwrap();
     if (args.length > 0) {
-      return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+      return Err(diag("E0400", te.span, `type \`${n}\` takes no type arguments`));
     }
     if (isVoid(bt) && !voidOk) {
       return Err(diag("E0400", te.span, "`void` is only allowed as a return type or as `T` in `Result<T, E>`"));
@@ -193,24 +191,24 @@ function resolveNamed(
         return resolveMapType(env, sc, te, name, mg.unwrap(), args, stack);
       }
     }
-    return Err(diag("E0300", name.span, "unknown type `" + n + "`"));
+    return Err(diag("E0300", name.span, `unknown type \`${n}\``));
   }
   return match (found.unwrap()) {
     EntRecord(r) => {
       if (args.length > 0) {
-        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+        return Err(diag("E0400", te.span, `type \`${n}\` takes no type arguments`));
       }
       return ok(env, TyRecord(r));
     },
     EntUnion(u) => {
       if (args.length > 0) {
-        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+        return Err(diag("E0400", te.span, `type \`${n}\` takes no type arguments`));
       }
       return ok(env, TyUnion(u));
     },
     EntAlias(i) => {
       if (args.length > 0) {
-        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+        return Err(diag("E0400", te.span, `type \`${n}\` takes no type arguments`));
       }
       return aliasType(env, i, stack);
     },
@@ -223,7 +221,7 @@ function resolveNamed(
     },
     EntBuiltin(t) => {
       if (args.length > 0) {
-        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+        return Err(diag("E0400", te.span, `type \`${n}\` takes no type arguments`));
       }
       return ok(env, t);
     }
@@ -242,7 +240,7 @@ function resolveMapType(
       return Err(diag(
         "E0400",
         te.span,
-        "`Map` keys must be `int`, `usize`, `bool` or `string`, found `" + showType(r.env, o.unwrap().args[0]) + "`"
+        `\`Map\` keys must be \`int\`, \`usize\`, \`bool\` or \`string\`, found \`${showType(r.env, o.unwrap().args[0])}\``
       ));
     }
   }
@@ -250,11 +248,7 @@ function resolveMapType(
 }
 
 function paramNames(ps: Ident[]): string[] {
-  let out: string[] = [];
-  for (const p of ps) {
-    out.push(p.name);
-  }
-  return out;
+  return ps.map(p => p.name);
 }
 
 function resolveGeneric(
@@ -266,8 +260,7 @@ function resolveGeneric(
     return Err(diag(
       "E0400",
       te.span,
-      "type `" + name.name + "` expects " + params.length.toString() + " type argument(s), found "
-        + args.length.toString()
+      `type \`${name.name}\` expects ${params.length} type argument(s), found ${args.length}`
     ));
   }
   let cur = env;
@@ -276,7 +269,7 @@ function resolveGeneric(
     const r = resolveTy(cur, sc, a, false, stack)?;
     cur = r.env;
     if (hasResource(r.ty)) {
-      return Err(resourceIn(a.span, "a type argument of `" + name.name + "`"));
+      return Err(resourceIn(a.span, `a type argument of \`${name.name}\``));
     }
     tys.push(r.ty);
   }
@@ -287,7 +280,7 @@ function resolveGeneric(
         return Err(diag("E0400", te.span, CYCLE_MSG));
       }
       if (sc.depth + 1 > MAX_DEPTH) {
-        return Err(depthErr(te.span, "alias `" + name.name + "`"));
+        return Err(depthErr(te.span, `alias \`${name.name}\``));
       }
       let st = stack;
       st.push(key);
@@ -300,6 +293,7 @@ function resolveGeneric(
 
 // The record / union instance of generic type `g` at `args`, created on first use. The instance
 // is registered before its fields are resolved so recursive types terminate.
+@Ensures(resolvedOk(result))
 export function instType(env: Env, g: usize, args: Type[], depth: usize, span: Span): Result<TyOut, Diagnostic> {
   for (const a of args) {
     if (hasResource(a)) {
@@ -328,9 +322,9 @@ export function instType(env: Env, g: usize, args: Type[], depth: usize, span: S
     }
   }
   if (depth + 1 > MAX_DEPTH) {
-    return Err(depthErr(span, "type `" + gt.decl.name.name + "`"));
+    return Err(depthErr(span, `type \`${gt.decl.name.name}\``));
   }
-  const name = gt.qname + "<" + tysKey(env, args) + ">";
+  const name = `${gt.qname}<${tysKey(env, args)}>`;
   const sc2 = TScope { unit: gt.unit, names: paramNames(gt.decl.typeParams), tys: args, depth: depth + 1 };
   let e = env;
   return match (gt.decl.body) {
@@ -338,12 +332,12 @@ export function instType(env: Env, g: usize, args: Type[], depth: usize, span: S
       const id = e.records.length;
       const none: FieldDef[] = [];
       e.records.push(RecordDef { name: name, fields: none });
-      e.insts.push(Inst { kind: 0, gid: g, args: args, id: id, depth: depth });
+      e = addInst(e, Inst { kind: 0, gid: g, args: args, id: id, depth: depth });
       let out: FieldDef[] = [];
       for (const f of fields) {
         for (const o of out) {
           if (o.name == f.name.name) {
-            return Err(diag("E0304", f.name.span, "duplicate field `" + f.name.name + "`"));
+            return Err(diag("E0304", f.name.span, `duplicate field \`${f.name.name}\``));
           }
         }
         const r = resolveType(e, sc2, f.ty, false)?;
@@ -357,7 +351,7 @@ export function instType(env: Env, g: usize, args: Type[], depth: usize, span: S
       const id = e.unions.length;
       const none: VariantDef[] = [];
       e.unions.push(UnionDef { name: name, variants: none });
-      e.insts.push(Inst { kind: 1, gid: g, args: args, id: id, depth: depth });
+      e = addInst(e, Inst { kind: 1, gid: g, args: args, id: id, depth: depth });
       let out: VariantDef[] = [];
       for (const v of vs) {
         let payload: Type[] = [];
@@ -371,7 +365,7 @@ export function instType(env: Env, g: usize, args: Type[], depth: usize, span: S
       e.unions[id] = UnionDef { name: name, variants: out };
       return ok(e, TyUnion(id));
     },
-    DAlias(_) => Err(diag("E0400", span, "type alias `" + gt.decl.name.name + "` cannot be instantiated here"))
+    DAlias(_) => Err(diag("E0400", span, `type alias \`${gt.decl.name.name}\` cannot be instantiated here`))
   };
 }
 
@@ -389,13 +383,11 @@ export function mkOpaque(env: Env, name: string): TyOut {
 // methods of `I` and converts to `I`.
 export function mkOpaqueBound(env: Env, name: string, iface: usize): TyOut {
   const o = mkOpaque(env, name);
-  let e = o.env;
   const rid = match (o.ty) {
     TyRecord(r) => r,
     _ => 0
   };
-  e.bounds.push(OpaqueBound { rec: rid, iface: iface });
-  return TyOut { env: e, ty: o.ty };
+  return TyOut { env: addBound(o.env, rid, iface), ty: o.ty };
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +401,7 @@ export function resolveSig(env: Env, sc: TScope, decl: FunctionDecl): Result<Sig
   for (const p of decl.params) {
     for (const l of locals) {
       if (l.name == p.name.name) {
-        return Err(diag("E0304", p.name.span, "duplicate parameter `" + p.name.name + "`"));
+        return Err(diag("E0304", p.name.span, `duplicate parameter \`${p.name.name}\``));
       }
     }
     const r = resolveType(cur, sc, p.ty, false)?;
@@ -451,7 +443,7 @@ function keyClassFunc(env: Env, qname: string, args: Type[]): Option<usize> {
   if (suffix == "") {
     return None;
   }
-  const target = (qname == "$array/map.keyHash" ? "$array/map.hash" : "$array/map.eq") + suffix;
+  const target = `${qname == "$array/map.keyHash" ? "$array/map.hash" : "$array/map.eq"}${suffix}`;
   let i: usize = 0;
   while (i < env.funcs.length) {
     if (env.funcs[i].qname == target) {
@@ -477,7 +469,7 @@ export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: S
     return Ok(FuncOut { env: env, fid: old.unwrap().id });
   }
   if (depth > MAX_DEPTH) {
-    return Err(depthErr(span, "function `" + env.gfuncs[g].decl.name.name + "`"));
+    return Err(depthErr(span, `function \`${env.gfuncs[g].decl.name.name}\``));
   }
   const gf = env.gfuncs[g];
   const names = paramNames(gf.decl.typeParams);
@@ -485,7 +477,7 @@ export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: S
   const sig = resolveSig(env, sc, gf.decl)?;
   let e = sig.env;
   const id = e.funcs.length;
-  const qname = gf.qname + "<" + tysKey(env, args) + ">";
+  const qname = `${gf.qname}<${tysKey(env, args)}>`;
   // The constructor and instance methods of a generic class (ADR-0026) are lowered like those of an
   // ordinary class (ADR-0009): mode 1 constructor, 2 non-mutating method, 3 mutating method returning
   // the updated receiver, 4 mutating method with a result (a `$ret` record per instance).
@@ -502,7 +494,7 @@ export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: S
       FieldDef { name: "self", ty: sig.params[0] },
       FieldDef { name: "value", ty: sig.ret }
     ];
-    e.records.push(RecordDef { name: qname + "$ret", fields: fields });
+    e.records.push(RecordDef { name: `${qname}$ret`, fields: fields });
     ret = TyRecord(rid);
   }
   e.funcs.push(FuncInfo {
@@ -519,7 +511,7 @@ export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: S
     cls: gf.cls,
     srcRet: srcRet
   });
-  e.insts.push(Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
+  e = addInst(e, Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
   return Ok(FuncOut { env: e, fid: id });
 }
 
@@ -529,10 +521,8 @@ export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: S
 
 export function noBinds(n: usize): Option<Type>[] {
   let out: Option<Type>[] = [];
-  let i: usize = 0;
-  while (i < n) {
+  while (out.length < n) {
     out.push(None);
-    i += 1;
   }
   return out;
 }
