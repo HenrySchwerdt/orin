@@ -78,7 +78,7 @@ def compile_orin(args, entry, c_out):
 
 def runtime_sources(backend):
     """C runtime sources to link; the LLVM backend also needs the out-of-line shim."""
-    srcs = [os.path.join("runtime", "orin_runtime.c")]
+    srcs = [os.path.join("runtime", "orin_runtime.c"), os.path.join("platform", "orin_platform.c")]
     if backend == "llvm":
         srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
     return srcs

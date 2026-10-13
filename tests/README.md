@@ -22,7 +22,7 @@ non-zero and prints diagnostics `path:line:col: error[CODE]: msg` on stderr. The
 is built with
 
 ```
-cc -O1 -w -I runtime <out.c> runtime/orin_runtime.c -o <exe>
+cc -O1 -w -I runtime <out.c> runtime/orin_runtime.c platform/orin_platform.c -o <exe>
 ```
 
 (`--sanitize` adds `-fsanitize=address,undefined -fno-omit-frame-pointer` and runs the

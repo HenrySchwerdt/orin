@@ -169,13 +169,13 @@ def main():
         os.makedirs(os.path.join(ROOT, out), exist_ok=True)
         builds = {
             "orin": [[orinc, "compile", src + "/main.or", "-o", out + "/orin.c"],
-                     ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "-o", out + "/orin"]],
+                     ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", out + "/orin"]],
             "go": [["go", "build", "-o", out + "/go", src + "/main.go"]],
             "c": [["cc"] + CFLAGS + [src + "/main.c", "-o", out + "/c"]],
         }
         if HAVE_CLANG:
             builds["llvm"] = [[orinc, "compile", src + "/main.or", "--backend=llvm", "-o", out + "/orin_llvm.ll"],
-                              ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c",
+                              ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c", "platform/orin_platform.c",
                                                     "runtime/orin_runtime_llvm.c", "-o", out + "/llvm"]]
         res = {}
         for lang, cmds in builds.items():
@@ -217,7 +217,7 @@ def main():
         # rebuild orin2 from its own C with the *current* runtime so counters are available.
         stage = os.path.join(out, "orin2_cur")
         bt = timed_build([[orinc, "compile", "compiler/main.or", "-o", out + "/orin2_cur.c"],
-                          ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin2_cur.c", "runtime/orin_runtime.c", "-o", stage]])
+                          ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin2_cur.c", "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", stage]])
         cmd = [os.path.join(ROOT, stage), "compile", "compiler/main.or", "-o", out + "/out.c"]
         run_once(cmd)
         walls, rss = [], []

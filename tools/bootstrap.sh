@@ -10,7 +10,7 @@ mkdir -p "$B"
 python3 tools/embed_prelude.py --check
 (cd bootstrap && cargo build --release -q)
 ORINB=bootstrap/target/release/orinb
-cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c -o "$2"; }
+cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c platform/orin_platform.c -o "$2"; }
 
 # Stage 0 does not know `std:io` (compiler/lsp/stdio.or), so stage 1 is built from a copy of the
 # compiler tree in which that one file is replaced by a stub (tools/stage0/lsp_stdio.or).

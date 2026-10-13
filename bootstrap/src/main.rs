@@ -104,6 +104,7 @@ fn main() {
                     .arg(&rt)
                     .arg(&c_path)
                     .arg(rt.join("orin_runtime.c"))
+                    .arg(rt.join("../platform/orin_platform.c"))
                     .arg("-o")
                     .arg(&out)
                     .status();

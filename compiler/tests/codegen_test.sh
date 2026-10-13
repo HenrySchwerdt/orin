@@ -13,7 +13,7 @@ fail=0
 check() {
   name=$1
   expected=$2
-  if ! $CC $FLAGS -w -I runtime "build/cg/$name.c" runtime/orin_runtime.c -o "build/cg/$name" 2>"build/cg/$name.err"; then
+  if ! $CC $FLAGS -w -I runtime "build/cg/$name.c" runtime/orin_runtime.c platform/orin_platform.c -o "build/cg/$name" 2>"build/cg/$name.err"; then
     echo "FAIL $name (cc)"; head -20 "build/cg/$name.err"; fail=$((fail + 1)); return
   fi
   actual=$("./build/cg/$name" 2>"build/cg/$name.err")
