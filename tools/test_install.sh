@@ -83,7 +83,10 @@ case $FNAME in
     ok "download + SHA256SUMS verification (ORIN_VERSION=$WANT)"
     out=$(run_install ORIN_HOME="$T/h3" ORIN_BIN_DIR="$T/b3" ORIN_BASE_URL="$URL" ORIN_VERSION="v$WANT" -- 2>&1) || fail "v-prefixed pin" "$out"
     ok "ORIN_VERSION accepts a leading v"
-    sed 's/^./0/' "$REL/SHA256SUMS" > "$REL/SHA256SUMS.bad"; mv "$REL/SHA256SUMS.bad" "$REL/SHA256SUMS"
+    # change the first hex digit to a *different* one (a plain s/^./0/ is a no-op when the hash starts with 0)
+    awk '{ c = substr($0, 1, 1); print (c == "0" ? "1" : "0") substr($0, 2) }' "$REL/SHA256SUMS" > "$REL/SHA256SUMS.bad"
+    cmp -s "$REL/SHA256SUMS" "$REL/SHA256SUMS.bad" && fail "test setup: tampered SHA256SUMS is unchanged"
+    mv "$REL/SHA256SUMS.bad" "$REL/SHA256SUMS"
     if out=$(run_install ORIN_HOME="$T/h4" ORIN_BIN_DIR="$T/b4" ORIN_BASE_URL="$URL" ORIN_VERSION="$WANT" -- 2>&1); then fail "wrong SHA256SUMS accepted"; fi
     case $out in *"sha256 mismatch"*) ;; *) fail "SHA256SUMS mismatch message" "$out" ;; esac
     [ ! -e "$T/h4" ] || fail "mismatch left files behind (download)"
