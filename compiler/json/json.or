@@ -1,0 +1,228 @@
+// JSON value type, accessors and deterministic serializer (spec 18 §3: JSON-RPC for `orin lsp`).
+//
+// Numbers: Orin-B has no floats, so `JNum` holds an `int`. Parsing (see parse.or) accepts an
+// optional fraction and TRUNCATES it toward zero (`1.9` -> 1, `-1.9` -> -1); exponent notation
+// and integers with more than 18 digits are rejected with an error message.
+//
+// Objects keep their fields in insertion order (a JField array); lookups are linear. A
+// duplicate key resolves to the FIRST occurrence in `getField`.
+//
+// Strings are Orin byte strings holding UTF-8. `stringifyJson` escapes `"` `\` and control
+// characters (< 0x20) and passes all other bytes (including UTF-8 sequences) through unchanged,
+// so output is deterministic and compact (no whitespace).
+
+export type Json = JNull | JBool(bool) | JNum(int) | JStr(string) | JArr(Json[]) | JObj(JField[]);
+
+export type JField = { key: string; value: Json; };
+
+// ---- constructors -------------------------------------------------------------------------
+
+export function jField(key: string, value: Json): JField {
+  return JField { key: key, value: value };
+}
+
+export function jObj(fields: JField[]): Json {
+  return JObj(fields);
+}
+
+// ---- accessors ----------------------------------------------------------------------------
+
+export function getField(j: Json, key: string): Option<Json> {
+  return match (j) {
+    JObj(fs) => findField(fs, key),
+    _ => None
+  };
+}
+
+function findField(fs: JField[], key: string): Option<Json> {
+  let i: usize = 0;
+  while (i < fs.length) {
+    if (fs[i].key == key) {
+      return Some(fs[i].value);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+export function asStr(j: Json): Option<string> {
+  return match (j) {
+    JStr(s) => Some(s),
+    _ => None
+  };
+}
+
+export function asInt(j: Json): Option<int> {
+  return match (j) {
+    JNum(n) => Some(n),
+    _ => None
+  };
+}
+
+export function asBool(j: Json): Option<bool> {
+  return match (j) {
+    JBool(b) => Some(b),
+    _ => None
+  };
+}
+
+export function asArr(j: Json): Option<Json[]> {
+  return match (j) {
+    JArr(a) => Some(a),
+    _ => None
+  };
+}
+
+export function isNull(j: Json): bool {
+  return match (j) {
+    JNull => true,
+    _ => false
+  };
+}
+
+export function getStr(j: Json, key: string): Option<string> {
+  const f = getField(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asStr(f.unwrap());
+}
+
+export function getInt(j: Json, key: string): Option<int> {
+  const f = getField(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asInt(f.unwrap());
+}
+
+export function getBool(j: Json, key: string): Option<bool> {
+  const f = getField(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asBool(f.unwrap());
+}
+
+export function getArr(j: Json, key: string): Option<Json[]> {
+  const f = getField(j, key);
+  if (f.isNone()) {
+    return None;
+  }
+  return asArr(f.unwrap());
+}
+
+// Follow a path of object keys: getPath(j, ["params", "textDocument", "uri"]).
+export function getPath(j: Json, path: string[]): Option<Json> {
+  let cur = j;
+  for (const k of path) {
+    const f = getField(cur, k);
+    if (f.isNone()) {
+      return None;
+    }
+    cur = f.unwrap();
+  }
+  return Some(cur);
+}
+
+export function getPathStr(j: Json, path: string[]): Option<string> {
+  const f = getPath(j, path);
+  if (f.isNone()) {
+    return None;
+  }
+  return asStr(f.unwrap());
+}
+
+export function getPathInt(j: Json, path: string[]): Option<int> {
+  const f = getPath(j, path);
+  if (f.isNone()) {
+    return None;
+  }
+  return asInt(f.unwrap());
+}
+
+// ---- serializer ---------------------------------------------------------------------------
+
+function hexDigit(n: int): string {
+  if (n < 10) {
+    return String.fromCharCode(48 + n);
+  }
+  return String.fromCharCode(87 + n);
+}
+
+export function quoteJson(s: string): string {
+  let parts: string[] = ["\""];
+  let runStart: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 34 || c == 92 || c < 32) {
+      if (i > runStart) {
+        parts.push(s.substring(runStart, i));
+      }
+      if (c == 34) {
+        parts.push("\\\"");
+      } else if (c == 92) {
+        parts.push("\\\\");
+      } else if (c == 10) {
+        parts.push("\\n");
+      } else if (c == 13) {
+        parts.push("\\r");
+      } else if (c == 9) {
+        parts.push("\\t");
+      } else {
+        parts.push("\\u00" + hexDigit(c / 16) + hexDigit(c % 16));
+      }
+      runStart = i + 1;
+    }
+    i += 1;
+  }
+  if (s.length > runStart) {
+    parts.push(s.substring(runStart, s.length));
+  }
+  parts.push("\"");
+  return parts.join("");
+}
+
+function emit(j: Json, out: string[]): string[] {
+  let o = out;
+  match (j) {
+    JNull => { o.push("null"); },
+    JBool(b) => { o.push(b ? "true" : "false"); },
+    JNum(n) => { o.push(n.toString()); },
+    JStr(s) => { o.push(quoteJson(s)); },
+    JArr(a) => {
+      o.push("[");
+      let i: usize = 0;
+      while (i < a.length) {
+        if (i > 0) {
+          o.push(",");
+        }
+        o = emit(a[i], o);
+        i += 1;
+      }
+      o.push("]");
+    },
+    JObj(fs) => {
+      o.push("{");
+      let i: usize = 0;
+      while (i < fs.length) {
+        if (i > 0) {
+          o.push(",");
+        }
+        o.push(quoteJson(fs[i].key));
+        o.push(":");
+        o = emit(fs[i].value, o);
+        i += 1;
+      }
+      o.push("}");
+    }
+  }
+  return o;
+}
+
+// Compact, deterministic serialization.
+export function stringifyJson(j: Json): string {
+  const out: string[] = [];
+  return emit(j, out).join("");
+}
