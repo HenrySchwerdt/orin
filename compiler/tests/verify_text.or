@@ -133,6 +133,17 @@ function fnIdx(s: string): usize {
 }
 
 // `call fnN(args)`, `builtin name(args)`, `callind OP(args)` with optional destination.
+// "callvirt OP#SLOT(ARGS)" (interfaces, MIR v1.5)
+function callVirtual(dst: Option<usize>, rhs: string): Instr {
+  const open = find(rhs, "(");
+  const hash = find(rhs, "#");
+  if (open < 0 || hash < 0 || hash > open) {
+    die("bad callvirt `" + rhs + "`");
+  }
+  const recv = operand(between(rhs, 9, hash));
+  return ICallVirtual(dst, recv, num(between(rhs, hash + 1, open)).toUsize(), operands(inside(tail(rhs, open), "(", ")")));
+}
+
 function callLike(dst: Option<usize>, rhs: string): Instr {
   const open = find(rhs, "(");
   if (open < 0) {
@@ -177,6 +188,12 @@ function withDst(d: usize, rhs: string): Instr {
   if (w == "borrow") { return IBorrow(d, lcl(rest)); }
   if (w == "dup") { return IDup(d, operand(rest)); }
   if (w == "call" || w == "builtin" || w == "callind") { return callLike(Some(d), rhs); }
+  if (w == "callvirt") { return callVirtual(Some(d), rhs); }
+  if (w == "iface") {
+    const tg = find(rest, " {");
+    if (tg < 0 || !rest.startsWith("vt")) { die("bad iface `" + rhs + "`"); }
+    return IIface(d, num(between(rest, 2, tg)).toUsize(), operand(inside(tail(rest, tg + 1), "{", "}")));
+  }
   if (w == "struct") {
     const tg = find(rest, " {");
     if (tg < 0) { die("bad struct `" + rhs + "`"); }
@@ -265,6 +282,9 @@ function instr(line: string): Instr {
   if (line.startsWith("call ") || line.startsWith("builtin ") || line.startsWith("callind ")) {
     return callLike(None, line);
   }
+  if (line.startsWith("callvirt ")) {
+    return callVirtual(None, line);
+  }
   die("unknown instruction `" + line + "`");
   return IMakeUnique(0);
 }
@@ -346,6 +366,7 @@ function header(line: string): MFunction {
 function parseProgram(lines: string[]): MProgram {
   let nstr: usize = 0;
   let funcs: MFunction[] = [];
+  let vts: MVTable[] = [];
   let mainIdx: usize = 0;
   let seenMain = false;
   let instrs: Instr[] = [];
@@ -362,6 +383,16 @@ function parseProgram(lines: string[]): MProgram {
       if (line.startsWith("main = fn")) {
         mainIdx = num(tail(line, 9)).toUsize();
         seenMain = true;
+      } else if (line.startsWith("vtable#")) {
+        // "vtable#N = [fnA, fnB] // name" (in index order)
+        let fs: usize[] = [];
+        for (const w of between(line, find(line, "[") + 1, find(line, "]")).split(", ")) {
+          if (w != "") {
+            fs.push(fnIdx(w));
+          }
+        }
+        const c = find(line, "// ");
+        vts.push(MVTable { name: c < 0 ? "" : tail(line, c + 3), funcs: fs });
       } else if (line.startsWith("str#")) {
         const e = find(line, " = ");
         if (e > 4) {
@@ -405,7 +436,6 @@ function parseProgram(lines: string[]): MProgram {
     strs.push("s");
     k += 1;
   }
-  const vts: MVTable[] = [];
   return MProgram { functions: funcs, strings: strs, main: mainIdx, vtables: vts };
 }
 
