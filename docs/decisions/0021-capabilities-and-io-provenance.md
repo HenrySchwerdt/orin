@@ -84,6 +84,81 @@ derive KafkaPublish(broker, topic) from Net.Connect(broker) {
 
 Kafka protocol metadata cannot be reliably inferred from raw TCP bytes in arbitrary libraries. In strict verification, topic identity and restriction require a controlled adapter / externally enforced ACL or an independently checkable proof. A network grant alone does not enforce Kafka topic restriction.
 
+### D4a — Explicit resource identities and verified bindings (the missing join key)
+
+Separate three different concepts that must **never** collapse into one:
+
+1. **Resource descriptor**: a typed, unprivileged identity for an external endpoint or logical object, e.g. \`KafkaTopic(cluster, topic)\`, \`HttpRoute(listener, method, path)\`, \`DbTable(server, database, schema, table)\`, \`FilePath(root, relativePath)\`. A package may define descriptor *types* without privileged authority. Constructing a descriptor does not grant access.
+2. **Authorized resource handle**: a platform-issued or validly narrowed **noncopyable handle**, whose sealed origin, lifetime, parent grant IDs and enforced scope are checked at primitive operations. A descriptor cannot be cast into a handle. This reuses ADR-0025 resource discipline and its \`MHandle\` model rather than inventing another ownership mechanism.
+3. **Semantic binding**: a proof/evidence-qualified association between an authorized handle/primitive event and a higher-level descriptor plus payload schema (for example, a Kafka frame decoded as \`OrderCreated\`). The descriptor is *not trusted* simply because a library supplies it.
+
+**No new root permissions** are introduced by \`resource\`. A future \`resource\` declaration is a nominal, typed description for OSIG and capability parameters—not a new way to call the OS. The precise syntax and its interaction with the completed language freeze require an ADR-approved language extension; use a typed library descriptor and versioned manifest in the first implementation. Existing \`File\` is already a noncopyable OS handle and must not be confused with \`FilePath\` or with a new \`resource\` declaration.
+
+The runtime stores the grant chain and restricted handle identity out of reach of Orin user code. The compiler models handles as scoped borrowed function parameters (as in ADR-0025). Derived typed views may only be passed/borrowed in supported scopes; they must not be stored in ordinary classes, returned, captured or copied until an explicit lifetime/ownership extension is separately reviewed. In particular, do **not** allow user-authored constructors or \`as\` casts to create a capability token. Any adapter introducing a long-lived server/consumer must have a trusted scoped lifecycle API (e.g. \`withListener(grant, port, listener => ...)\`) and an authorized host grant. Handle identity is not the same as OSIG descriptor identity.
+
+**Resource identity rules:** a semantic identity is structured and canonicalized using a namespace controlled by its protocol adapter, rather than a string-only type name:
+
+- Kafka: deployment/cluster identity + broker-enforced topic name + operation/consumer group where relevant; same topic name in two clusters is **not** one resource.
+- HTTP: host/listener identity + route method/path (routes can be parameterized, conditional and dynamically registered; do not claim a concrete route when unresolved).
+- Database: server/tenant/database/schema/table, with query and column lineage as separately inferred flow, not an unverified permission claim.
+- File: rooted and normalized path plus applicable filesystem identity; symlinks, aliases, mounts and path races require host enforcement and uncertainty handling.
+- Generic stream: sealed primitive connection/descriptor identity; protocol and message type remain UNKNOWN until a valid high-level binding is established.
+
+Two independently created descriptors with the same textual value are not automatically proven to refer to the same external object. Canonicalization and identity equality are checkable only to the level supported by the binding, deployment configuration and trusted runtime information. A dynamic expression yields a symbolic identity or UNKNOWN, not a fabricated constant.
+
+**Direction integrity:** the compiler fixes physical direction at the primitive *event*: \`Stream.Read\` = bytes enter this process; \`Stream.Write\` = bytes leave it. Connection establish/bind/accept events do not on their own prove application-payload direction. Packages cannot redefine these directions. A Kafka consumer may both read and write transport bytes (poll, acknowledgments); **logical** \`KafkaConsume\` and \`KafkaPublish\` apply only to protocol payload transfer validated by a semantic binding. Unverified adapter metadata remains DECLARED/UNKNOWN and may not suppress transport writes.
+
+A binding declares explicit linkages:
+
+\`\`\`text
+illustrative schema (NOT currently supported Orin syntax)
+resource KafkaTopic { cluster: ClusterId; name: string }
+
+binding KafkaConsumer<T>.receive {
+  descriptor = topic: KafkaTopic
+  requires = { Net.Connect(broker), Stream.Read(socket), Stream.Write(socket) }
+  source = Stream.Read(socket) -> FrameDecoder -> KafkaPayload<T> -> callback.argument[0]
+  semantic_direction = input    // accepted only if checkable; does not override primitive I/O
+  enforcement = trusted_adapter + broker_topic_acl  // must be backed by policy/evidence
+}
+
+binding KafkaProducer<T>.send {
+  descriptor = topic: KafkaTopic
+  sink = call.argument[0] -> FrameEncoder -> Stream.Write(socket)
+  semantic_direction = output
+}
+\`\`\`
+
+The **compiler**, not the library declaration, owns and propagates primitive event IDs, MIR value IDs, source spans, actual handle identity and read/write direction. An adapter can provide a semantic *mapping*, and the checker must either validate the mapping, record explicit assumptions/trust, or reject it under strict policy. It cannot relabel writes as reads, omit network egress, claim authority from a descriptor, or claim an unproven topic identity as VERIFIED.
+
+**Cross-service stitching:** a producer output and consumer input may be linked through a resource descriptor only when the normalized, sufficiently evidenced identities refer to the same broker/topic (and schema/compatibility assumptions support the typed linkage). Kafka transport uses separate service executions; OSIG shows an **asynchronous message edge**, not a direct synchronous function call or proof of delivery. Partitions, filters, consumer groups, retries, duplicates and environment-specific routing may make a potential link MAY/UNKNOWN. Two instances of the same derived *capability type* or root kind alone do not make a cross-service lineage edge.
+
+**Resource-oriented API error rules:** missing or forged authorization, resource-handle escape/copy, unauthorized narrow/widen operation, unsupported primitive use and incorrect sealed-handle association are compilation errors; invalid runtime resource grants/identity are denied by L0. A library's claimed HTTP/Kafka-specific identity with an unverified binding is **not automatically** an error in permissive compilation (the raw I/O remains visible), but is a strict-policy compilation failure when verified protocol identities are required.
+
+#### End-to-end exemplar (acceptance fixture, not current syntax)
+
+\`\`\`text
+Service A:
+  granted handle: NetworkConnect(brokerA)
+  bound resource: KafkaTopic(clusterA, "orders.created")
+  OrderPublisher.send(encode(OrderCreated{orderId, total}))
+  => primitive Stream.Write + CHECKED KafkaPublish(clusterA/orders.created)
+
+Service B:
+  granted handle: NetworkConnect(brokerA)
+  bound resource: KafkaTopic(clusterA, "orders.created")
+  CHECKED KafkaConsume -> decode(OrderCreated)
+  OrderService.validate -> OrderService.price -> Repository.save
+  => DbTable(dbA/orders) write
+
+OSIG:
+  ServiceA.OrderCreated.total -> topic(clusterA/orders.created)
+       -- asynchronous potential delivery -->
+  ServiceB.OrderCreated.total -> OrderRow.total -> dbA/orders.total
+\`\`\`
+
+The process explorer must make these separate physical operations, semantic messages, process steps and field dependencies inspectable, with distinct colors/labels for checked, possible, and unknown edges. Example fixture must include **negative cases**: same topic name in different clusters, false library-provided direction, raw socket bypass disguised as Kafka, dynamic topic, different payload schemas, and revoked/insufficient broker ACL.
+
 ### D5 — Process discovery is a separate compiler analysis
 
 A process is a **view over a rooted control/data-flow slice**, not a newly minted capability. Candidate roots: bound listener/accept, HTTP handler dispatch, Kafka receive/callback, file source, scheduled event or declared host entry point. Candidate sinks: stream/write, Kafka publish, database mutation, HTTP response, file write, process execution. A callback/async message edge may establish a new process episode or a relation between processes, not an imaginary synchronous call.
@@ -110,7 +185,7 @@ No new full proof checker is mandated by this ADR. Runtime/OS I/O isolation and 
 
 ### D7 — Staging without redesigning the compiler or breaking the freeze
 
-- **Stage A, pre-std I/O freeze:** standard primitive handle API, nonforgeability, resource restrictions, platform grant issuance and L0 checks; update unstable std I/O signatures. Define the *schema contract* for future derived capability bindings. Work within the existing two-stage freeze decision; an ADR is needed for any new post-language-freeze syntax.
+- **Stage A, pre-std I/O freeze:** standard primitive handle API, nonforgeability, resource restrictions, platform grant issuance and L0 checks; update unstable std I/O signatures. Define stable resource descriptor IDs, sealed handle provenance, primitive direction events and the *schema contract* for future derived capability bindings. Work within the existing two-stage freeze decision; an ADR is needed for any new post-language-freeze syntax.
 - **Stage B, alongside/after compiler rewrite:** effect inference / policy; source-mapped MIR; primitive boundary events, stable IDs, initial OSIG effects.
 - **Stage C:** checked library adapters for HTTP/Kafka, interprocedural object- and field-lineage, event/callback/branch tracking, process slices and clickable implementation view.
 - **Stage D:** PR process diffs, merge/history comparison, attested analysis artifacts, strict policy gates. Build reports with GitHub Actions first; browser-only WASM compilation is optional and later.
@@ -120,7 +195,7 @@ Do not build unverified protocol annotation syntax into the language until a rep
 ## Mandatory acceptance tests (before claiming process discovery)
 
 1. A pure calculation creates lineage but **zero** new capability definitions/effects.
-2. A listener can only bind an allowed port; forged root grants, widening an existing port/endpoint, or passing the wrong resource handle are rejected.
+2. A listener can only bind an allowed port; forged root grants, widening an existing port/endpoint, or passing the wrong resource handle are rejected. A resource descriptor cannot be converted into an authorized handle.
 3. A Kafka library that calls Stream.Write to an unauthorized endpoint fails a strict capability check even if it claims only KafkaConsume.
 4. A library that declares KafkaConsume(topic A) but uses raw TCP and cannot establish topic semantics is not certified as topic A; strict verified-adapter policy rejects it.
 5. A Kafka receive of OrderCreated leads via two services and a field transform to KafkaPublish(OrderProcessed): OSIG discovers input, output, and meaningful explanatory path with source links.
@@ -129,10 +204,14 @@ Do not build unverified protocol annotation syntax into the language until a rep
 8. An unauthorized FFI/native syscall path does not pass strict policy; document the separate native runtime sandbox requirement.
 9. PR adding a new egress changes effect/impact report and fails an explicit deny-egress policy; changing only implementation without observable effects does not invent an external flow change.
 10. Self-hosted CI can attest a report and external CI can do so too; signature verification authenticates provenance, not independent correctness.
+11. A library that falsely labels Stream.Write as input still produces a compiler-owned output event; its claimed semantic binding is rejected under strict policy.
+12. Two Kafka topics with identical names in different clusters must never be joined as the same resource; producer-to-consumer links are asynchronous and uncertainty-qualified.
+13. A scoped Kafka/HTTP handle cannot escape through a captured closure or class field; existing ADR-0025 resource rules remain enforced.
+14. An unverified HTTP route or dynamically chosen topic remains symbolic/UNKNOWN, not a fabricated concrete resource identity. A verified adapter can connect a listener/route or broker/topic to a typed callback and distinguish payload direction from protocol control traffic.
 
 ## Open design questions requiring follow-up
 
-- Exact Orin grammar versus versioned semantic-binding manifests; class/interface interaction; resource move/borrow semantics of narrowed handles.
+- Exact Orin grammar for eventual `resource` descriptors versus versioned semantic-binding manifests; class/interface interaction; resource move/borrow semantics of narrowed handles and scoped long-running network listeners. Note: the language freeze already occurred, so new syntax requires ADR approval.
 - Parameter refinements for DNS resolution, IP rebinding, paths, dynamic Kafka topic names, multiplexed shared connections, broker ACLs.
 - Whether verified protocol adapters are limited to audited built-ins, can ship independently verifiable proof artifacts, or rely on explicit trust policy.
 - Alias/pointer model, callback resolution, asynchronous message correlation and scalability/incremental analysis.
