@@ -364,3 +364,9 @@ To audit the claim read `Mir.lean` (concrete operations: do they model the runti
 and its contract in `Top.lean`; the rest is proof. A differential test of the Lean `check` against
 `compiler/verify` on generated MIR (the structured fragment) would close most of the manual-
 transcription gap.
+
+### Status of findings (lead, 2026-10-13)
+- Finding 1 (self-rooted borrow) — **fixed** in `compiler/verify/rules.or` (`defBorrow` rejects a
+  borrow whose root is its own destination) with two regression cases in
+  `compiler/tests/verify_main.or`; the compiler and all test programs still verify (0 errors).
+- Findings 2–7 — documentation/model notes; tracked, no code change yet.

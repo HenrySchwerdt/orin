@@ -65,6 +65,6 @@ MIR/OIM memory IR + independent verifier between HIR and codegen.
 | RC never under-counts (no UAF/double free) | Generated code: tested + ASan/UBSan on all suites and on the compiler self-compiling. Abstract machine: **proven** in Lean (`formal/`, theorem `run_safe`; rc ≥ owners invariant) — see docs/formal.md |
 | Value semantics / COW | Abstract machine: **proven** for `makeUnique; store` (`makeUnique_store_cow`); generated code: tested |
 | MIR ownership discipline | Independent verifier implemented (`compiler/verify`, docs/mir.md); lowering to MIR in progress; verifier itself not mechanically verified |
-| Link verifier ⇄ Lean model | Not proven (verifier-accepted MIR ⇒ machine safety is an open obligation) |
+| Link verifier ⇄ Lean model | **Proven for the structured MIR core** (`check_sound`: Lean checker transcribing docs/mir.md accepts ⇒ no use-after-free/double free/shared store), given a caller contract. Not covered: calls/builtins, loops, switch, arrays/strings; the Orin verifier source is not itself verified against the Lean checker (manual transcription). See docs/formal.md |
 | Source type safety (progress/preservation) | Not started |
 | Native artifact | TCB: runtime, C compiler, allocator, emitter — unverified |
