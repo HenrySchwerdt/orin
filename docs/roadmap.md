@@ -46,6 +46,12 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
 primitives.
 
+### 3a. Documentation for the TypeScript audience
+[Orin for TypeScript developers](ts-developers.md): the semantic differences that matter when
+reading agent-written code (value semantics, `Option`/`Result`, integer traps, `==` rules,
+by-value closures, nominal interfaces, resources). Each example is a test (`tests/next/**/ts_dev_*.or`),
+so it stays true. Update the page whenever a language-surface ADR changes one of those rules.
+
 ### 4. Optimisation ‖ provability (in parallel)
 - **Optimisation:** unboxing, RC elision, escape analysis/stack allocation, LLVM tuning. Each step
   is measured (`docs/benchmarks.md`) and checked by the differential tests.
