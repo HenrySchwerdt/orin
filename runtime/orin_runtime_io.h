@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <time.h>
 
 static inline OrinObj *orin_io_some_str(const char *buf, size_t len) {
     OrinObj *s = orin_str_new(buf, (uint64_t)len);
@@ -70,6 +71,13 @@ static inline OrinObj *orin_io_read_line(void) {
 static inline void orin_io_write_stdout(OrinObj *s) {
     fwrite(orin_str_data(s), 1, (size_t)orin_str_len(s), stdout);
     fflush(stdout);
+}
+
+/* Wall-clock time in milliseconds since the Unix epoch (std:time `nowMillis`). */
+static inline int64_t orin_time_now_millis(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
 }
 
 /* Runs `cmd` through /bin/sh (system(3)); returns the exit status (-1 if it could not start or

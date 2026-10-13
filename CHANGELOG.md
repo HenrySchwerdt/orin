@@ -7,6 +7,7 @@
   `orin check --deps` (module dependency summary); `orin api [--check <snapshot>]` (public API
   snapshot and change detection); MCP `inspect` module shows the manifest rule.
 - Floats (`float`, `f32`), `std:math`, built-in `Map<K, V>` (ADR-0018). Float programs link with `-lm`.
+- Std modules in Orin (ADR-0016): `std:path`, `std:json` (integers only), `std:time` (new built-in `nowMillis`), `std:graph`; see docs/std.md.
 
 ## 0.1.0-alpha.1 (2026-10-13)
 First experimental release of the self-hosted Orin compiler.
