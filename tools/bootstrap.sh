@@ -5,13 +5,17 @@
 #   tools/bootstrap.sh               seed (bootstrap/seed/orin-seed.c.gz) -> orin0 -> orin1 -> orin2 -> stage3
 #                                    (needs only a C compiler, python3, gzip, sha256sum/shasum)
 #   tools/bootstrap.sh --from-stage0 Rust Stage 0 (needs cargo) -> orin1 -> orin2 -> stage3
+#   tools/bootstrap.sh --seed-only   only seed -> build/bootstrap/orin0 (a few seconds; enough to compile
+#                                    test drivers such as compiler/tests/verify_text.or)
 set -eu
 cd "$(dirname "$0")/.."
 MODE=seed
+SEED_ONLY=
 case "${1:-}" in
   "") ;;
   --from-stage0) MODE=stage0 ;;
-  *) echo "usage: $0 [--from-stage0]" >&2; exit 2 ;;
+  --seed-only) SEED_ONLY=1 ;;
+  *) echo "usage: $0 [--from-stage0|--seed-only]" >&2; exit 2 ;;
 esac
 CC=${CC:-cc}
 CFLAGS=${CFLAGS:--O2 -w}
@@ -35,6 +39,7 @@ if [ "$MODE" = seed ]; then
   echo "[seed] sha256 ok ($got)"
   echo "[stage0] cc seed -> orin0"
   cc_link $B/seed.c $B/orin0
+  if [ -n "$SEED_ONLY" ]; then echo "[seed-only] built $B/orin0"; exit 0; fi
   echo "[stage1] orin0 compiles compiler/main.or"
   $B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link $B/stage1.c $B/orin1
 else
