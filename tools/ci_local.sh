@@ -25,4 +25,5 @@ step "lsp"                     python3 tools/test_lsp.py
 step "mcp"                     python3 tools/test_mcp.py
 step "packages"                ./tools/test_packages.sh
 step "verify all"              python3 tools/verify_all.py compiler/main.or
+step "platform layer"         sh -c 'tools/check_platform_boundary.sh && tools/verify_platform.sh'
 echo "ci_local: all steps passed"
