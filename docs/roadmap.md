@@ -63,6 +63,10 @@ primitives.
 | D Product | 6 | when phases 1–4 produce output | specs 16/17 |
 | D Product | 7 | after phase 6 | reproducible builds |
 | E Ecosystem | 8 | after step 3 | concurrency |
+| F Compiler assurance | L0 | done: `docs/assurance.md` | vision §20a, ADR-0020 D7 |
+| F Compiler assurance | L1 | **now, parallel to the core** | Lean model, `compiler/verify` |
+| F Compiler assurance | L2 | after L1 | opt pass |
+| F Compiler assurance | L3–L5 | with the rewrite, R3/R4 and phase 7 | |
 
 What each phase delivers:
 - **Phase 1 (done, MVP; tickets 1, 3, 5, 6):**
@@ -93,6 +97,12 @@ What each phase delivers:
   - semantic PR report
   - MCP `explain_*`
   - `NEEDS_DECISION`
+- **Track F (compiler assurance, ADR-0020 D7):**
+  - L1: Lean checker vs `compiler/verify` differential test, mutation corpus
+  - L2: translation validator for moves/owned parameters
+  - L3: call rule/loops/arrays in Lean, type and VC soundness
+  - L4: runtime refinement (R3/R4)
+  - L5: proof-carrying releases
 - **Phase 7:** `.orcert` with SLSA/in-toto/Sigstore and an independent checker.
 - **Phase 8:**
   - HTTP, Postgres adapter, JSX
@@ -102,5 +112,6 @@ What each phase delivers:
 1. (done) Interfaces and contract clauses merged.
 2. (done) Track A phase 1: OSIG schema ADR, `orin graph`, `orin diff`, HTML report (vision tickets 1, 3,
    5, 6). Next in the track: feature manifest (ticket 4). Ticket 2 (MIR spans) waits for the rewrite.
-3. Fixed-width integers + interpolation; then `@Test` + resources; then ADR-0021 capabilities.
-4. Release v0.1.0-alpha.2 (closures, floats, maps, interfaces, std modules).
+3. Start the Track F L1 worker (Lean-vs-verifier differential test, mutation corpus).
+4. Fixed-width integers + interpolation; then `@Test` + resources; then ADR-0021 capabilities.
+5. Release v0.1.0-alpha.2 (closures, floats, maps, interfaces, std modules).
