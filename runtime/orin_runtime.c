@@ -58,6 +58,25 @@ void orin_trap(const char *msg) {
     exit(101);
 }
 
+/* Size-class freelists for small struct objects (by slot count) and array headers. Objects are
+ * recycled, never returned to malloc. Disabled under ASan (so use-after-free is still detected)
+ * or with -DORIN_NO_FREELIST. */
+#if !defined(ORIN_NO_FREELIST)
+#if defined(__SANITIZE_ADDRESS__)
+#define ORIN_NO_FREELIST 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)
+#define ORIN_NO_FREELIST 1
+#endif
+#endif
+#endif
+#ifndef ORIN_NO_FREELIST
+enum { FL_STRUCT_CLASSES = 9 }; /* nslots 0..8 */
+typedef struct FreeNode { struct FreeNode *next; } FreeNode;
+static FreeNode *fl_struct[FL_STRUCT_CLASSES];
+static FreeNode *fl_array;
+#endif
+
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) orin_trap("out of memory");
@@ -102,6 +121,13 @@ void orin_destroy(OrinObj *o) {
                 for (uint64_t i = 0; i < a->len; i++) DEC(ORIN_REF(a->items[i]));
             orin_stats.live_bytes -= sizeof(OrinArray) + a->cap * 8;
             free(a->items);
+#ifndef ORIN_NO_FREELIST
+            ((FreeNode *)x)->next = fl_array;
+            fl_array = (FreeNode *)x;
+            g_live--;
+            orin_stats.frees++;
+            continue;
+#endif
             break;
         }
         case ORIN_K_STRUCT: {
@@ -109,6 +135,15 @@ void orin_destroy(OrinObj *o) {
             for (uint32_t i = 0; i < s->nslots; i++)
                 if ((s->refmask >> i) & 1) DEC(ORIN_REF(s->slots[i]));
             orin_stats.live_bytes -= sizeof(OrinStruct) + (uint64_t)s->nslots * 8;
+#ifndef ORIN_NO_FREELIST
+            if (s->nslots < FL_STRUCT_CLASSES) {
+                ((FreeNode *)x)->next = fl_struct[s->nslots];
+                fl_struct[s->nslots] = (FreeNode *)x;
+                g_live--;
+                orin_stats.frees++;
+                continue;
+            }
+#endif
             break;
         }
         default: orin_stats.live_bytes -= sizeof(OrinString) + ((OrinString *)x)->cap + 1; break;
@@ -125,7 +160,15 @@ void orin_destroy(OrinObj *o) {
 
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     if (nslots > 64) orin_trap("struct has more than 64 slots");
-    OrinStruct *s = (OrinStruct *)xmalloc(sizeof(OrinStruct) + (size_t)nslots * 8);
+    OrinStruct *s;
+#ifndef ORIN_NO_FREELIST
+    if (nslots < FL_STRUCT_CLASSES && fl_struct[nslots]) {
+        FreeNode *n = fl_struct[nslots];
+        fl_struct[nslots] = n->next;
+        s = (OrinStruct *)n;
+    } else
+#endif
+        s = (OrinStruct *)xmalloc(sizeof(OrinStruct) + (size_t)nslots * 8);
     s->h.rc = 1;
     s->h.kind = ORIN_K_STRUCT;
     s->h.tag = tag;
@@ -181,11 +224,7 @@ uint64_t orin_res_unwrap_err(OrinObj *o) {
 
 /* ---------------------------------------------------------------- make_unique */
 
-OrinObj *orin_make_unique(OrinObj *o) {
-    if (o->rc == 1) {
-        orin_stats.cow_inplace++;
-        return o;
-    }
+OrinObj *orin_make_unique_slow(OrinObj *o) {
     orin_stats.cow_copies++;
     OrinObj *r;
     switch (o->kind) {
@@ -411,7 +450,14 @@ OrinObj *orin_parse_int(OrinObj *s) {
 
 OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
-    OrinArray *a = (OrinArray *)xmalloc(sizeof(OrinArray));
+    OrinArray *a;
+#ifndef ORIN_NO_FREELIST
+    if (fl_array) {
+        a = (OrinArray *)fl_array;
+        fl_array = fl_array->next;
+    } else
+#endif
+        a = (OrinArray *)xmalloc(sizeof(OrinArray));
     a->h.rc = 1;
     a->h.kind = ORIN_K_ARRAY;
     a->h.tag = 0;
@@ -424,16 +470,14 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     return &a->h;
 }
 
-void orin_array_push(OrinObj *o, uint64_t slot) {
+void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     OrinArray *a = (OrinArray *)o;
-    if (a->len == a->cap) {
-        uint64_t cap = a->cap ? a->cap * 2 : 4;
-        a->items = (uint64_t *)xrealloc(a->items, cap * 8);
-        orin_stats.live_bytes += (cap - a->cap) * 8;
-        if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
-        orin_stats.array_grows++;
-        a->cap = cap;
-    }
+    uint64_t cap = a->cap ? a->cap * 2 : 4;
+    a->items = (uint64_t *)xrealloc(a->items, cap * 8);
+    orin_stats.live_bytes += (cap - a->cap) * 8;
+    if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+    orin_stats.array_grows++;
+    a->cap = cap;
     a->items[a->len++] = slot;
 }
 
@@ -441,18 +485,6 @@ OrinObj *orin_array_pop(OrinObj *o) {
     OrinArray *a = (OrinArray *)o;
     if (a->len == 0) return orin_none();
     return orin_variant1(0, a->is_ref, a->items[--a->len]);
-}
-
-uint64_t orin_array_at(OrinObj *o, uint64_t i) {
-    OrinArray *a = (OrinArray *)o;
-    if (i >= a->len) orin_trap("index out of bounds");
-    return a->items[i];
-}
-
-uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
-    OrinArray *a = (OrinArray *)o;
-    if (i >= a->len) orin_trap("index out of bounds");
-    return &a->items[i];
 }
 
 OrinObj *orin_array_get(OrinObj *o, uint64_t i) {
