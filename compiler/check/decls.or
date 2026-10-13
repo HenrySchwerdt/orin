@@ -3,8 +3,8 @@
 // `check_main` and `resolve_type` from bootstrap/src/checker/mod.rs.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Ident, TypeExpr, EInt, EFloat, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
-import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
+import { Ident, TypeExpr, EInt, EBigInt, EFloat, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
+import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local, intKindOf, kindSigned, kindNarrow, kindLo, kindHi, i64Min } from "../hir";
 import {
   Env, RecordSrc, UnionSrc, FuncInfo, ConstInfo, ConstLit, LitInt, LitStr, LitBool, LitFloat, typeEq, isVoid, showType
 } from "./env";
@@ -21,18 +21,21 @@ function resolveTypeTop(env: Env, unit: usize, te: TypeExpr, voidOk: bool): Resu
 // Constants
 // ---------------------------------------------------------------------------
 
-type LitInfo = { lit: ConstLit; ty: Type; neg: bool; };
+// `big`: an integer literal in 2^63 .. 2^64-1 (its pattern is in `lit`; only u64 / usize can hold it).
+type LitInfo = { lit: ConstLit; ty: Type; neg: bool; big: bool; };
 
 function constLit(e: Expr): Option<LitInfo> {
   return match (e.kind) {
-    EInt(n) => Some(LitInfo { lit: LitInt(n), ty: TyInt, neg: false }),
-    EFloat(t) => Some(LitInfo { lit: LitFloat(t), ty: TyFloat, neg: false }),
-    EStr(s) => Some(LitInfo { lit: LitStr(s), ty: TyString, neg: false }),
-    EBool(b) => Some(LitInfo { lit: LitBool(b), ty: TyBool, neg: false }),
+    EInt(n) => Some(LitInfo { lit: LitInt(n), ty: TyInt, neg: false, big: false }),
+    EBigInt(n) => Some(LitInfo { lit: LitInt(n), ty: TyInt, neg: false, big: true }),
+    EFloat(t) => Some(LitInfo { lit: LitFloat(t), ty: TyFloat, neg: false, big: false }),
+    EStr(s) => Some(LitInfo { lit: LitStr(s), ty: TyString, neg: false, big: false }),
+    EBool(b) => Some(LitInfo { lit: LitBool(b), ty: TyBool, neg: false, big: false }),
     EUnary(op, inner) => match (op) {
       UNeg => match (inner.kind) {
-        EInt(n) => Some(LitInfo { lit: LitInt(-n), ty: TyInt, neg: true }),
-        EFloat(t) => Some(LitInfo { lit: LitFloat("-" + t), ty: TyFloat, neg: true }),
+        EInt(n) => Some(LitInfo { lit: LitInt(-n), ty: TyInt, neg: true, big: false }),
+        EBigInt(n) => n == i64Min() ? Some(LitInfo { lit: LitInt(n), ty: TyInt, neg: true, big: false }) : None,
+        EFloat(t) => Some(LitInfo { lit: LitFloat("-" + t), ty: TyFloat, neg: true, big: false }),
         _ => None
       },
       _ => None
@@ -60,11 +63,28 @@ function resolveConst(env: Env, c: ConstInfo): Result<ConstInfo, Diagnostic> {
   if (isFloatLit(li.ty) && isF32Ty(ty)) {
     ok = true;
   }
-  if (isIntLike(li.ty) && isUsizeTy(ty)) {
-    if (li.neg) {
-      return Err(diag("E0400", vspan, "negative integer literal cannot have type `usize`"));
+  const tk = intKindOf(ty);
+  if (isIntLike(li.ty) && tk >= 0 && tk != 3) {
+    if (li.neg && !kindSigned(tk)) {
+      return Err(diag("E0400", vspan, "negative integer literal cannot have type `" + showType(env, ty) + "`"));
     }
     ok = true;
+  }
+  if (isIntLike(li.ty) && tk >= 0) {
+    // the literal's value must fit the declared type
+    const n = match (li.lit) { LitInt(v) => v, _ => 0 };
+    if (li.big && tk != 8 && tk != 9) {
+      return Err(diag("E0430", vspan, "integer literal does not fit in `" + showType(env, ty) + "`; values above 9223372036854775807 need type `u64` or `usize`"));
+    }
+    if (!li.big && kindNarrow(tk) && (n < kindLo(tk) || n > kindHi(tk))) {
+      return Err(diag("E0430", vspan, "integer literal `" + n.toString() + "` does not fit in `" + showType(env, ty) + "`"));
+    }
+    if (li.big) {
+      ok = true;
+    }
+  }
+  if (li.big && tk < 0) {
+    return Err(diag("E0430", vspan, "integer literal does not fit in `int`; values above 9223372036854775807 need type `u64` or `usize`"));
   }
   if (!ok) {
     return Err(diag("E0400", vspan, "expected `" + showType(env, ty) + "`, found `" + showType(env, li.ty) + "`"));

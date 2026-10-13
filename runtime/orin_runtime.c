@@ -454,6 +454,86 @@ OrinObj *orin_parse_int(OrinObj *s) {
     return orin_variant1(0, 0, acc);
 }
 
+/* ---------------------------------------------------------------- fixed-width integers (ADR-0022) */
+/* Kinds: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize, 5 u8, 6 u16, 7 u32, 8 u64, 9 usize. A value is passed and stored as its
+ * 64-bit pattern: sign-extended for the signed kinds, zero-extended for u8/u16/u32, plain for u64/usize. */
+
+static int kind_bits(int64_t k) {
+    switch (k) {
+    case 0: case 5: return 8;
+    case 1: case 6: return 16;
+    case 2: case 7: return 32;
+    default: return 64;
+    }
+}
+static int kind_signed(int64_t k) { return k <= 4; }
+static __int128 kind_min(int64_t k) {
+    return kind_signed(k) ? -((__int128)1 << (kind_bits(k) - 1)) : 0;
+}
+static __int128 kind_max(int64_t k) {
+    return kind_signed(k) ? (((__int128)1 << (kind_bits(k) - 1)) - 1) : (((__int128)1 << kind_bits(k)) - 1);
+}
+static __int128 int_decode(uint64_t bits, int64_t k) {
+    return (k == 8 || k == 9) ? (__int128)bits : (__int128)(int64_t)bits;
+}
+static uint64_t int_encode(__int128 v, int64_t k) {
+    return (k == 8 || k == 9) ? (uint64_t)v : (uint64_t)(int64_t)v;
+}
+/* v reduced modulo 2^bits into the kind's range. */
+static __int128 int_wrap(__int128 v, int64_t k) {
+    int b = kind_bits(k);
+    if (b == 64) return kind_signed(k) ? (__int128)(int64_t)(uint64_t)v : (__int128)(uint64_t)v;
+    uint64_t m = ((uint64_t)1 << b) - 1;
+    uint64_t u = (uint64_t)v & m;
+    if (kind_signed(k) && (u >> (b - 1))) return (__int128)(int64_t)(u | ~m);
+    return (__int128)u;
+}
+static __int128 int_exact(int64_t mode, __int128 a, __int128 b) {
+    switch (mode % 3) {
+    case 0: return a + b;
+    case 1: return a - b;
+    default: return a * b;
+    }
+}
+
+/* mode 0..2 wrapping add/sub/mul, 3..5 saturating add/sub/mul. */
+uint64_t orin_int_op(int64_t mode, uint64_t a, uint64_t b, int64_t kind) {
+    __int128 r = int_exact(mode, int_decode(a, kind), int_decode(b, kind));
+    if (mode < 3) return int_encode(int_wrap(r, kind), kind);
+    if (r < kind_min(kind)) r = kind_min(kind);
+    if (r > kind_max(kind)) r = kind_max(kind);
+    return int_encode(r, kind);
+}
+
+/* mode 0..2 checked add/sub/mul: Option of the result. */
+OrinObj *orin_int_chk(int64_t mode, uint64_t a, uint64_t b, int64_t kind) {
+    __int128 r = int_exact(mode, int_decode(a, kind), int_decode(b, kind));
+    if (r < kind_min(kind) || r > kind_max(kind)) return orin_none();
+    return orin_variant1(0, 0, int_encode(r, kind));
+}
+
+OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind) {
+    OrinString *x = (OrinString *)s;
+    uint64_t i = 0;
+    int neg = 0;
+    if (i < x->len && x->data[i] == '-') {
+        neg = 1;
+        i++;
+    }
+    if (i >= x->len) return orin_none();
+    uint64_t acc = 0;
+    for (; i < x->len; i++) {
+        char c = x->data[i];
+        if (c < '0' || c > '9') return orin_none();
+        uint64_t d = (uint64_t)(c - '0');
+        if (acc > (UINT64_MAX - d) / 10) return orin_none();
+        acc = acc * 10 + d;
+    }
+    __int128 v = neg ? -(__int128)acc : (__int128)acc;
+    if (v < kind_min(kind) || v > kind_max(kind)) return orin_none();
+    return orin_variant1(0, 0, int_encode(v, kind));
+}
+
 /* ---------------------------------------------------------------- floats (ADR-0018) */
 
 int64_t orin_float_to_int(double x) {

@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v1.5)
+# MIR and the OIM ownership verifier (v1.6)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -9,10 +9,11 @@ Changelog: v1.1 Unique-demotion across calls; v1.2 (ADR-0010) per-parameter mode
 v1.3 (ADR-0011) closures: `IClosure` and `ICallIndirect`;
 v1.4 (ADR-0018) floats: scalar type `MFloat` (binary64; an f32 is an MFloat rounded by `IBuiltin(BF32Round)` after each operation), operand `OFloat(text)`; `IUnary(UnNeg)` and `IBinary` Add/Sub/Mul/Div/Eq/Ne/Lt/Le/Gt/Ge accept MFloat operands (IEEE, no traps; `Rem` does not); conversions and math are `IBuiltin`s; floats are plain scalars for the verifier (`Init`), stored in slots by bit pattern.
 v1.5 (ADR-0019) interfaces: `IIface`, `ICallVirtual` and `MProgram.vtables`.
+v1.6 (ADR-0022) fixed-width integers: **no new type or instruction**. `i64`, `isize` and the narrow integers `i8 i16 i32 u8 u16 u32` are `MInt` (the value sign-/zero-extended), `u64` and `usize` are `MUsize`; `OUsize(n)` is the 64-bit *pattern* of the constant (a negative `n` is a value above 2^63-1; the old `OUsize >= 0` well-formedness rule is gone). After `+ - * /` and `-` on a narrow type the lowering emits `IBuiltin(BIntRange, [v, OInt lo, OInt hi])` (traps "integer overflow" outside the range); explicit conversions are `BIntConv` / `BUIntConv` / `BIntId`, `wrapping*` / `saturating*` / `checked*` are `BIntOp` / `BIntChk`, `parseI32` etc. are `BParseIntK` (operand constants carry the kind, see `hir.or`). Built-ins have no MIR signature, so the verifier needs no new rule.
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
-in order; each block ends in exactly one terminator. Scalars (`MInt`, `MUsize`, `MBool`) are plain
+in order; each block ends in exactly one terminator. Scalars (`MInt`, `MUsize`, `MBool`, `MFloat`) are plain
 values. `MRef` locals point to RC'd heap objects (runtime/orin_runtime.h). Runtime traps
 (overflow, bounds, unwrap) are safe outcomes.
 
@@ -125,7 +126,7 @@ Implementation: `compiler/verify/` (`wf.or` well-formedness, `state.or` abstract
 reporting). Tests: `compiler/tests/verify_main.or`. Choices where the rules above were ambiguous:
 
 - **Well-formedness first.** Index ranges, operand classes (int/usize/bool/ref), `ICall` arity and
-  argument/return classes, `paramCount <= locals.length`, no `void` locals, `OUsize >= 0`. If a
+  argument/return classes, `paramCount <= locals.length`, no `void` locals (`OUsize` is a 64-bit pattern since v1.6: any int is well-formed). If a
   function is not well-formed only these errors are reported (no dataflow). `IBuiltin` has no
   signature table in MIR, so only its operand/destination indices are checked.
   `IMove`/`IBorrow`/`ITakeField`/`IArrayTake`/`IArrayPop` need distinct source and destination;

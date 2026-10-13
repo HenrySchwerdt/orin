@@ -15,7 +15,7 @@
 
 import {
   Type, Program, Function, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp,
-  FieldInitH, HArm, HPattern, Builtin, MutBuiltin
+  FieldInitH, HArm, HPattern, Builtin, MutBuiltin, intKindOf, kindNarrow, kindLo, kindHi
 } from "../hir";
 import { MType, MLocal, Operand, Instr, Terminator, SwitchCase, MFunction } from "../mir";
 import { Item, buildBlocks } from "./items";
@@ -311,6 +311,28 @@ function roundsF32(b: Builtin): bool {
   };
 }
 
+// After an operation on a type narrower than 64 bits (computed in an MInt with the 64-bit checked operation):
+// trap unless the result is in the type's range (ADR-0022). `%` cannot leave the range. The `op` of a negation
+// is passed as OpSub.
+function rangeCheck(ty: Type, op: BinOp, id: usize): Item[] {
+  let out: Item[] = [];
+  const k = intKindOf(ty);
+  if (k < 0 || !kindNarrow(k)) {
+    return out;
+  }
+  const checked = match (op) {
+    OpAdd => true,
+    OpSub => true,
+    OpMul => true,
+    OpDiv => true,
+    _ => false
+  };
+  if (checked) {
+    out.push(ii(IBuiltin(Some(id), BIntRange, [OLocal(id), OInt(kindLo(k)), OInt(kindHi(k))])));
+  }
+  return out;
+}
+
 function isArithBin(op: BinOp): bool {
   return match (op) {
     OpAdd => true,
@@ -327,6 +349,7 @@ function exprUnary(cx: Cx, sc: Sc, c0: Ctr, e: HExpr, op: UnOp, x: HExpr): V {
   let items = v.items;
   items.push(t.d);
   items.push(ii(IUnary(t.id, op, v.op)));
+  items = items.concat(rangeCheck(e.ty, OpSub, t.id));
   return vScalar(items, t.id, t.c);
 }
 
@@ -366,6 +389,7 @@ function exprBinary(cx: Cx, sc: Sc, c: Ctr, e: HExpr, op: BinOp, lhs: HExpr, rhs
   const t = tm(a.c, mty(e.ty));
   items.push(t.d);
   items.push(ii(IBinary(t.id, op, a.ops[0], a.ops[1])));
+  items = items.concat(rangeCheck(e.ty, op, t.id));
   items = items.concat(releaseOwned(a));
   if (isF32Ty(e.ty) && isArithBin(op)) {
     return roundF32(items, t.id, t.c);
@@ -1194,6 +1218,7 @@ function walkPlace(c0: Ctr, place: Place, idx: Operand[], fin: Fin, ty: Type): W
           c = nw.c;
           items.push(nw.d);
           items.push(ii(IBinary(nw.id, op, OLocal(old.id), v)));
+          items = items.concat(rangeCheck(ty, op, nw.id));
           if (isF32Ty(ty)) {
             items.push(ii(IBuiltin(Some(nw.id), BF32Round, [OLocal(nw.id)])));
           }
@@ -1580,6 +1605,7 @@ function stAssign(cx: Cx, sc: Sc, c0: Ctr, place: Place, op0: Option<BinOp>, val
         },
         Some(o) => {
           items.push(ii(IBinary(root, o, OLocal(root), vop)));
+          items = items.concat(rangeCheck(ty, o, root));
           if (isF32Ty(ty)) {
             items.push(ii(IBuiltin(Some(root), BF32Round, [OLocal(root)])));
           }

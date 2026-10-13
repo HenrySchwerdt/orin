@@ -54,7 +54,7 @@ async function tokenize(src) {
 
 /** Scopes of the first token whose text is exactly `text`. */
 function scopesOf(tokens, text) {
-  const t = tokens.find((x) => x.text === text);
+  const t = tokens.find((x) => x.text === text) ?? tokens.find((x) => x.text.trim() === text);
   assert.ok(t, `token ${JSON.stringify(text)} not found in ${JSON.stringify(tokens.map((x) => x.text))}`);
   return t.scopes;
 }
@@ -177,6 +177,59 @@ test("operators and calls", async () => {
   assertScope(t, "...", "keyword.operator.spread.orin");
   assertScope(t, "f", "entity.name.function.call.orin");
   assertScope(t, "h", "entity.name.function.call.orin");
+});
+
+test("fixed-width integer and float type names", async () => {
+  const t = await tokenize("function f(a: i8, b: i16, c: i32, d: i64, e: u8, g: u16, h: u32, k: u64, m: isize, n: i128, o: u128, x: float, y: f32): void { }");
+  for (const ty of ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "i128", "u128", "float", "f32"]) {
+    assertScope(t, ty, "support.type.primitive.orin");
+  }
+  const n = await tokenize("const a = 18446744073709551615; const b = 1.5e3; const c = 2.25;");
+  assertScope(n, "18446744073709551615", "constant.numeric.decimal.orin");
+  assertScope(n, "1.5e3", "constant.numeric.float.orin");
+  assertScope(n, "2.25", "constant.numeric.float.orin");
+});
+
+test("template literals with embedded expressions", async () => {
+  const t = await tokenize("const s = `Hello ${name}, you are ${age + 1}!`;");
+  assertScope(t, "`", "string.template.orin");
+  assertScope(t, "Hello ", "string.template.orin");
+  assertScope(t, "!", "string.template.orin");
+  assertScope(t, "${", "punctuation.definition.template-expression.begin.orin");
+  assertScope(t, "name", "meta.template.expression.orin");
+  assertScope(t, "age", "meta.template.expression.orin");
+  assertScope(t, "1", "constant.numeric.decimal.orin");
+  assertScope(t, "+", "keyword.operator.arithmetic.orin");
+  // text outside `${}` is string content, not code: `if` there is not a keyword
+  const kw = await tokenize("const s = `if while ${x}`;");
+  assert.ok(!kw.some((x) => x.scopes.some((s) => s.startsWith("keyword.control"))));
+  const code = await tokenize("const s = `a ${ true ? f(1) : 2 } b`;");
+  assertScope(code, "true", "constant.language.boolean.orin");
+  assertScope(code, "f", "entity.name.function.call.orin");
+});
+
+test("template literals: escapes, nesting, braces and multiple lines", async () => {
+  const esc = await tokenize("const s = `a\\n\\`\\${x}\\q`;");
+  assertScope(esc, "\\n", "constant.character.escape.orin");
+  assertScope(esc, "\\`", "constant.character.escape.orin");
+  assertScope(esc, "\\$", "constant.character.escape.orin");
+  assertScope(esc, "\\q", "invalid.illegal.escape.orin");
+  // `${x}` after an escaped `$` is plain text
+  assert.ok(!esc.some((x) => x.scopes.includes("meta.template.expression.orin")));
+  // a nested template literal and a record literal (braces) inside an interpolation
+  const nested = await tokenize("const s = `outer ${ `inner ${y}` } ${ P { a: 1 }.a } tail`;\nconst z = 1;");
+  assertScope(nested, "inner ", "string.template.orin");
+  assertScope(nested, "y", "meta.template.expression.orin");
+  assertScope(nested, "tail", "string.template.orin");
+  assert.ok(!scopesOf(nested, "tail").includes("meta.template.expression.orin"), "`tail` is text again");
+  assertScope(nested, "z", "variable.other.constant.orin");
+  assert.ok(!scopesOf(nested, "z").some((s) => s.startsWith("string.template")), "code after the literal is not a string");
+  // multi-line: the string continues across lines until the closing backtick
+  const multi = await tokenize("const s = `line one\nline ${two}\nline three`;\nconst k = 3;");
+  assertScope(multi, "line one", "string.template.orin");
+  assertScope(multi, "two", "meta.template.expression.orin");
+  assertScope(multi, "line three", "string.template.orin");
+  assert.ok(!scopesOf(multi, "k").some((s) => s.startsWith("string.template")));
 });
 
 test("package.json contributions point at existing files", () => {

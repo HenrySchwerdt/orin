@@ -3,7 +3,7 @@
  * Object model: docs/architecture.md "Runtime object model", ADR-0002.
  *
  * VALUES
- *   int -> int64_t, usize -> uint64_t, bool -> int64_t (0/1), float / f32 -> double (an f32 is a
+ *   int / i8..i32 / u8..u32 / isize -> int64_t, usize / u64 -> uint64_t (ADR-0022), bool -> int64_t (0/1), float / f32 -> double (an f32 is a
  *   double that is exactly representable as a float; ADR-0018): unboxed scalars.
  *   Everything else (string, array, record, union, Option, Result) is an `OrinObj*`
  *   pointing at a reference-counted heap object. Generic containers store 64-bit "slots":
@@ -230,6 +230,25 @@ static inline int64_t orin_usize_to_int(uint64_t a) {
     if (ORIN_UNLIKELY(a > (uint64_t)INT64_MAX)) orin_trap("usize too large for int");
     return (int64_t)a;
 }
+
+/* Fixed-width integers (ADR-0022). Types narrower than 64 bits live in int64_t locals; after an operation the
+ * result is range-checked. Conversions trap when the value does not fit. Kinds: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize,
+ * 5 u8, 6 u16, 7 u32, 8 u64, 9 usize (see orin_runtime.c). */
+static inline int64_t orin_range_i(int64_t v, int64_t lo, int64_t hi) {
+    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap("integer overflow");
+    return v;
+}
+static inline int64_t orin_conv_i(int64_t v, int64_t lo, int64_t hi) {
+    if (ORIN_UNLIKELY(v < lo || v > hi)) orin_trap("integer conversion out of range");
+    return v;
+}
+static inline int64_t orin_conv_u(uint64_t v, int64_t hi) {
+    if (ORIN_UNLIKELY(v > (uint64_t)hi)) orin_trap("integer conversion out of range");
+    return (int64_t)v;
+}
+uint64_t orin_int_op(int64_t mode, uint64_t a, uint64_t b, int64_t kind); /* wrapping (0..2) / saturating (3..5) add sub mul */
+OrinObj *orin_int_chk(int64_t mode, uint64_t a, uint64_t b, int64_t kind); /* checked add sub mul: Option */
+OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Option of the parsed integer */
 
 /* ---------------------------------------------------------------- structs / variants */
 /* Records use tag 0. Option: Some=0 (1 slot), None=1. Result: Ok=0 (1 slot, 0 for void), Err=1. */

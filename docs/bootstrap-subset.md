@@ -229,6 +229,9 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0416 | impure contract expression: I/O or other effect, mutating call, call of a function that is not provably pure, closure — beyond Orin-B (ADR-0012) |
 | E0417 | class does not implement an interface method / type does not satisfy a bound (self-hosted compiler only, ADR-0019) |
 | E0418 | method implementing an interface method mutates its receiver (self-hosted compiler only, ADR-0019) |
+| E0430 | integer literal does not fit its type (`const x: i8 = 128`, a `u64`-only literal above 2^63-1 used as another type) — beyond Orin-B (ADR-0022) |
+| E0431 | the 128-bit integer types `i128` / `u128` (and `toI128`, `parseU128`, ...) are not supported yet — beyond Orin-B (ADR-0022) |
+| E0432 | a value that is not `string`, an integer, `float`, `f32` or `bool` interpolated in a template literal — beyond Orin-B (ADR-0022) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
 | E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |

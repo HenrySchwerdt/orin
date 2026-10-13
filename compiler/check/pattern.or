@@ -2,8 +2,8 @@
 
 import { Span, Diagnostic, diag } from "../diag";
 import { Ident, Pattern, PWildcard, PIdent, PVariant, PInt, PStr, PBool } from "../syntax";
-import { Type, VariantDef, HPattern } from "../hir";
-import { Env, showType, mismatch, isInt, isUsize, isString, isBool } from "./env";
+import { Type, VariantDef, HPattern, intKindOf, kindNarrow, kindSigned, kindLo, kindHi } from "../hir";
+import { Env, showType, mismatch, isIntish, isString, isBool } from "./env";
 import { FnCtx, newLocal, declare } from "./fnctx";
 
 export type PatOut = { fx: FnCtx; pat: HPattern; covered: bool[]; wild: bool; };
@@ -67,14 +67,19 @@ export function checkPattern(
     },
     PVariant(name, args) => checkVariantPattern(env, fx, p, name, args, sty, variants, covered, wild),
     PInt(n) => {
-      if (isInt(sty)) {
-        return Ok(PatOut { fx: fx, pat: HPInt(n), covered: covered, wild: wild });
-      }
-      if (isUsize(sty)) {
-        if (n >= 0) {
-          return Ok(PatOut { fx: fx, pat: HPInt(n), covered: covered, wild: wild });
+      if (isIntish(sty)) {
+        const k = intKindOf(sty);
+        if (n < 0 && !kindSigned(k)) {
+          return Err(diag("E0400", p.span, "negative integer literal cannot have type `" + showType(fx.env, sty) + "`"));
         }
-        return Err(diag("E0400", p.span, "negative integer literal cannot have type `usize`"));
+        if (kindNarrow(k) && (n < kindLo(k) || n > kindHi(k))) {
+          return Err(diag(
+            "E0430",
+            p.span,
+            "integer literal `" + n.toString() + "` does not fit in `" + showType(fx.env, sty) + "`"
+          ));
+        }
+        return Ok(PatOut { fx: fx, pat: HPInt(n), covered: covered, wild: wild });
       }
       return Err(literalMismatch(fx.env, p.span, sty, TyInt, isVariantScrut));
     },

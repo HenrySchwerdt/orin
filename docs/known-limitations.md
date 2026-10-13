@@ -1,4 +1,5 @@
 # Known limitations
+- Integers (ADR-0022): `i128` / `u128` are rejected (E0431); arrays of narrow integers use 8 bytes per element; `orin verify --contracts` models only `int`/`i64` and `bool`; `sort` comparators return `int`; no bitwise operators or shifts exist in the language. Template literals: no `\u` escapes, no tagged templates; the formatter prints them verbatim.
 - Orin-B only (see bootstrap-subset.md): no closures (the self-hosted compiler has them, below), floats, annotations. The
   self-hosted compiler additionally accepts simple generics (ADR-0007: no bounds, no generic
   methods, no default type arguments; instantiation depth limit 32, E0413).
