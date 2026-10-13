@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+
+## 0.1.0-alpha.2 (2026-10-13)
+Language 1.0 core complete and frozen (ADR-0016; std I/O stays unstable until capabilities, ADR-0021).
 - Generic classes (ADR-0026, ADR-0016 "Generic classes"): `class Box<T>`, `new Box<int>(1)` / inferred `new Box(1)`,
   several type parameters, nesting, bounds `class C<T extends I>` (ADR-0019), `implements` of non-generic
   interfaces, contract clauses per instantiation, cross-module use; monomorphised per instantiation by lowering to
