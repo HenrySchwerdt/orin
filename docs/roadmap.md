@@ -13,6 +13,14 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 1. Language 1.0 core and freeze (done).
 2. Compiler rewrite under the contract and class standard, then diagnostics and CLI polish (2a).
    The refusal protocol (ADR-0029) is part of 2a.
+   **Stronger invariants (ADR-0031):** directly after rewrite 2a. This step covers:
+   - violation reports with values and blame;
+   - enforced record invariants and pure functions in contracts;
+   - static per-method proofs of class invariants;
+   - business-logic patterns: quantifiers, `sum`, conservation laws, executable specs, state
+     machines, `std:decimal` and `@Property`.
+
+   The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections, I/O
    - `std:net`, `std:http`
@@ -24,6 +32,20 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      `MODEL_ONLY`;
    - all L0 functions contract-verified;
    - R3 object model in Orin, then R4 refinement proofs against the Lean machine.
+
+   **End-to-end assurance (ADR-0032)** extends this step:
+   - a Lean semantics of the source language with type soundness;
+   - per-compile translation validation of lowering, optimisation and emission, built with the
+     lowering rewrite and R3;
+   - SMT proof certificates checked by the Lean kernel, and a proof that VC generation is sound;
+   - `@Decreases` (termination) and a "no runtime errors" mode;
+   - for people:
+     - a traceable normative language reference;
+     - a per-program assurance report;
+     - decision tables as a specification form, checked for completeness and overlap;
+     - a TCB size budget enforced in CI;
+   - closing the chain to the binary: a CompCert-compatible C path, diverse double compiling
+     against the archived Stage 0, and signed `.orcert` attestations.
 5. **Concurrency** (ADR-0017), placed after R3/R4 and before the performance push:
    - *after R3*, because task heaps and the L0 thread primitives belong to the Orin core runtime.
      Built before R3, threads would be built twice, once in C and again in Orin;
