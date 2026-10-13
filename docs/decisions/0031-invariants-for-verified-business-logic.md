@@ -91,6 +91,32 @@ checkable:
     `STRENGTHEN_SPEC` candidates, never applied automatically.
 19. **Mutation survivors** (ADR-0028 tool) are turned into hints that name the missing clause.
 
+### E. Contract-driven optimisation
+
+20. **Only `VERIFIED` facts may remove a check or change a representation.** A contract that is
+    only `TESTED_ONLY` or `ASSUMED` never removes a memory-safety check, because a wrong contract
+    would then turn a logic bug into memory unsafety (finding F-shape: bounds checks are the
+    backstop).
+21. **Optimisations enabled by proved facts:**
+    - a proved index bound removes the bounds check;
+    - a proved integer range removes the overflow check and allows a narrower stored
+      representation (e.g. `u16` instead of `i64`);
+    - a proved size bound (`@Invariant(this.buf.length <= 64)`) allows inline fixed storage instead
+      of a heap array: unboxing, no allocation, no reference count;
+    - a proved `isSome()` invariant allows a tag-free `Option` field and an unchecked `unwrap`;
+    - a declared state machine removes unreachable states and their code;
+    - a proved result length (`@Ensures(result.length == a.length + b.length)`) allows one
+      exact-size allocation instead of growth;
+    - compiler-inferred uniqueness removes the copy-on-write check.
+22. **Check hoisting is allowed earlier,** because it removes no check: a runtime-checked
+    `@Requires(i < arr.length)` at the call lets the checks inside the body go. The check moves
+    and is not deleted, so a wrong contract is still caught.
+23. **Why this is sound in Orin:** value semantics mean no aliasing, so a proved fact about a
+    field cannot be invalidated through another reference.
+24. **Validation:** every such optimisation goes through translation validation (ADR-0032). The
+    validator receives the used facts as listed assumptions, and the assurance report shows which
+    check was removed on the basis of which proof.
+
 ## Honest limits
 
 - Z3 is incomplete for nonlinear arithmetic, quantifiers and strings. The goal is fewer `UNKNOWN`
@@ -110,7 +136,9 @@ checkable:
 3. `std:decimal` (16) alongside the std foundation (ADR-0030); then state machines (15) and
    `@Property` (17).
 4. D (18–19), and loop invariants (10).
-5. A reference example, `examples/ledger/`: accounts, transfers, invoices with line items,
+5. E: check hoisting (22) with the optimisation work. Proof-based removals (21) come in the
+   performance push (roadmap step 6), after B and ADR-0032 translation validation.
+6. A reference example, `examples/ledger/`: accounts, transfers, invoices with line items,
    tax/rounding and an order state machine. Every rule is stated as a contract, and the example
    reports, per clause, `VERIFIED`, `TESTED_ONLY` or `UNKNOWN`. This is the acceptance test of
    this ADR.

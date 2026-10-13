@@ -57,6 +57,15 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 6. **Performance push:**
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
+   - **contract-driven optimisation** (ADR-0031 §E). Only `VERIFIED` facts remove checks or change
+     representations, for example:
+     - bounds and overflow checks;
+     - narrower integer storage;
+     - inline storage for size-bounded arrays;
+     - tag-free `Option` fields;
+     - exact-size allocation.
+
+     Check hoisting from runtime-checked `@Requires` comes earlier.
    - every optimisation is translation-validated or proved; the goal is at least on par with Go,
      measured.
 7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
