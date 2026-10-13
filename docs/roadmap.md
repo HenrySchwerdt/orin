@@ -76,6 +76,13 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   `@Invariant`s, stateful logic is a class (class invariants are runtime-checked, record invariants
   are not), every non-trivial function states real `@Requires`/`@Ensures`. Step 1 (loader/diag) is
   brought up to this standard in step 1b. Details: `docs/rewrite.md`.
+- **Contract gate for the compiler (planned, not implemented):** CI fails when the compiler's own
+  contracts are weak or regress: strict contract coverage on (`[contracts] strict = true`, ADR-0028;
+  today `compiler/` has 0 non-strict and 2 strict findings, both in `compiler/loader`), a minimum mutation kill rate
+  (`tools/contract_mutation.py --min-kill-rate`) per module, and no regression of `VERIFIED`
+  contracts (`orin verify --contracts` results may not turn `UNKNOWN`/`REFUTED`). **Capability gate
+  (planned):** only `loader/sources` and the output module may have `PERFORMS_IO` edges (ADR-0021 effect
+  analysis, checked by `orin diff` / `orin effects`).
 
 ### 2a. Diagnostics and CLI polish (directly after the rewrite)
 Goal (project owner, 2026-10-13): hints and CLI tooling that are a pleasure to use, built on
@@ -90,6 +97,11 @@ the rewritten, contract-checked front end.
   terminal-width-aware output (off for non-TTY, `NO_COLOR`); `--format=json` for every command;
   short timing summary; `orin new` (package scaffold), `orin fix`, `orin explain`; watch mode
   for `check`/`test`; clear exit codes (documented).
+- **Contract-quality warnings (landed in part, ADR-0028):** syntactic warnings W0450-W0452 in every
+  `check`/`compile`/LSP run, solver-based W0460-W0462 in `orin verify --contracts`, opt-in strict
+  coverage W0470/W0471 (`--strict-contracts`, `[contracts] strict`), and the mutation tool
+  `tools/contract_mutation.py`. Missing: `orin explain` pages and golden `fix` edits for them, strict
+  mode for loop invariants, and warnings from the MCP `check` tool.
 - Measured: a TS-developer task corpus (common mistakes from `docs/ts-developers.md`) where each
   mistake must produce a diagnostic with a correct, applicable suggestion.
 - **Refusal protocol for agents (ADR-0029, accepted):** every error and verification result says
