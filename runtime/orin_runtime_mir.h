@@ -18,6 +18,7 @@ static inline uint64_t orin_mir_struct_take(OrinObj *o, uint32_t i) {
 
 /* Overwrite slot i (object must be unique), releasing the old value if the slot is a reference. */
 static inline void orin_mir_struct_replace(OrinObj *o, uint32_t i, uint64_t slot) {
+    orin_chk_slot(o, i);
     OrinStruct *s = (OrinStruct *)o;
     uint64_t old = s->slots[i];
     s->slots[i] = slot;
