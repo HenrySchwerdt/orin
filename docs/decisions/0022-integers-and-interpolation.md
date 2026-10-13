@@ -74,6 +74,8 @@ pass them as `int64_t` / `uint64_t` exactly as `int` / `usize`.
 
 ### 128-bit: not in 1.0 (error E0431)
 
+Decided with the project owner (2026-10-13): post-1.0, recorded in ADR-0016.
+
 `i128` / `u128` are accepted by the lexer as identifiers but rejected with **`E0431`** ("the 128-bit integer type is not
 supported yet") wherever a type is resolved, and `toI128` / `toU128` / `parseI128` / `parseU128` give the same error. Reason: the C
 backend could use `__int128` and LLVM `i128`, but the 128-bit value has no home in the existing design: every storage
