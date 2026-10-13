@@ -1,12 +1,13 @@
 // orin — the self-hosted Orin compiler driver (Stage 1+).
 //   orin check [--format=json] [--deps] <entry.or | package-dir>
 //   orin api [--check <snapshot>] <entry.or | package-dir>   public API snapshot / change detection
-//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--c-builtins]
+//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--c-builtins] [--check-contracts]
 //       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
 //   orin lsp                 language server on stdio (spec 18)
 //   orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]   MCP server on stdio (spec 10)
 //   orin mir <entry.or>      print the MIR
+//   orin verify --contracts [--format=json] [--z3 PATH] [--strict] <entry.or>   verify contracts with z3 (docs/contracts.md)
 //   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
 //   (compile/mir/verify run the MIR optimiser, compiler/opt, unless --no-opt is given)
 //   compile/mir/verify load the std prelude (std/, spec 19 R1) implicitly: moved built-ins call
@@ -17,7 +18,8 @@ import { writeFile } from "std:fs";
 import { SourceMap, Diagnostic, render } from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
-import { check, checkWithIndex } from "./check";
+import { check, checkWithIndex, checkRuntime } from "./check";
+import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
 import { moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff } from "./analysis";
 import { readFile } from "std:fs";
 import { generate, supportsLegacy } from "./codegen";
@@ -32,7 +34,7 @@ import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] [--deps] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin mir <entry.or>\n  orin verify <entry.or>");
+  console.error("usage:\n  orin check [--format=json] [--deps] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
   exit(2);
 }
 
@@ -86,6 +88,11 @@ function main(): void {
   let noOpt = false;
   let llvm = false;
   let cBuiltins = false;
+  let checkContracts = false;
+  let verifyContractsFlag = false;
+  let strict = false;
+  let z3 = "z3";
+  let expectZ3 = false;
   let deps = false;
   let checkSnap = "";
   let haveSnap = false;
@@ -94,7 +101,18 @@ function main(): void {
   while (ai < all.length) {
     const a = all[ai];
     ai += 1;
-    if (a == "--deps") {
+    if (expectZ3) {
+      z3 = a;
+      expectZ3 = false;
+    } else if (a == "--z3") {
+      expectZ3 = true;
+    } else if (a == "--contracts") {
+      verifyContractsFlag = true;
+    } else if (a == "--strict") {
+      strict = true;
+    } else if (a == "--check-contracts") {
+      checkContracts = true;
+    } else if (a == "--deps") {
       deps = true;
     } else if (a == "--check") {
       if (ai >= all.length) {
@@ -173,7 +191,7 @@ function main(): void {
     exit(1);
     return;
   }
-  const checked = check(program, loaded.sm);
+  const checked = checkContracts ? checkRuntime(program, loaded.sm) : check(program, loaded.sm);
   if (checked.isErr()) {
     report(loaded.sm, checked.unwrapErr(), json);
     return;
@@ -188,6 +206,14 @@ function main(): void {
   }
   if (cmd == "mir") {
     console.log(printProgram(noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()))));
+    return;
+  }
+  if (cmd == "verify" && verifyContractsFlag) {
+    const rep = verifyContracts(program, loaded.sm, z3);
+    console.log(json ? reportJson(rep) : reportText(rep));
+    if (failedCount(rep) > 0 || (strict && unknownCount(rep) > 0)) {
+      exit(1);
+    }
     return;
   }
   if (cmd == "verify") {

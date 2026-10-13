@@ -24,6 +24,8 @@ CLASS_SYNTAX_SKIP = {"err0200_reserved_class.or", "err0200_reserved_new.or", "er
                      "err0200_reserved_interface.or", "err0100_bad_char_amp.or", "err0100_bad_char_amp_end.or"}
 # The array prelude (ADR-0011) is written with closures, syntax beyond Orin-B that Stage 0 rejects.
 PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("tests", "fmt", "closures.out.or"),
+                # contract clauses (ADR-0012) are beyond Orin-B: Stage 0 rejects `@`
+                os.path.join("tests", "fmt", "contracts.in.or"), os.path.join("tests", "fmt", "contracts.out.or"),
                 os.path.join("tests", "fmt", "floats.in.or"), os.path.join("tests", "fmt", "floats.out.or"),
                 # these pin Stage 0's rejection of arrow functions, which Stage 1 now accepts
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
@@ -90,7 +92,7 @@ def collect(extra):
         for dp, dn, fn in os.walk(r):
             # tests/next uses syntax beyond Orin-B (generics) that Stage 0 rejects with E0200.
             dn[:] = [d for d in dn if d not in ("target", "build", ".git")
-                     and os.path.join(dp, d) != os.path.join(ROOT, "tests", "next")]
+                     and os.path.join(dp, d) not in (os.path.join(ROOT, "tests", "next"), os.path.join(ROOT, "tests", "contracts"))]
             for n in fn:
                 if n.endswith(".or"):
                     files.append(os.path.join(dp, n))

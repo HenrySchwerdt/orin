@@ -10,7 +10,8 @@ import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
   UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind,
-  InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam, ArrowBody
+  InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam, ArrowBody,
+  ContractKind, ContractClause
 } from "./ast";
 import { Token, TokKind, lex } from "./lexer";
 
@@ -28,6 +29,8 @@ type ExprRes = { expr: Expr; pos: usize; };
 type ExprsRes = { exprs: Expr[]; pos: usize; };
 type TypeArgsRes = { tys: TypeExpr[]; pos: usize; };
 type PatRes = { pat: Pattern; pos: usize; };
+type ClauseRes = { clause: ContractClause; pos: usize; };
+type ClausesRes = { clauses: ContractClause[]; pos: usize; };
 
 // ---------------------------------------------------------------------------
 // Token helpers
@@ -250,6 +253,135 @@ function parseTypeParams(toks: Token[], pos: usize): Result<IdentsRes, Diagnosti
 }
 
 // ---------------------------------------------------------------------------
+// Contract clauses (beyond Orin-B, ADR-0012, spec 15 §4.2a)
+// ---------------------------------------------------------------------------
+// `@Requires(e)`, `@Ensures(e)`, `@Invariant(e)`, `@Decreases(e)`, `@Rule("ID")` look like annotations
+// but are dedicated, reserved constructs with their own productions and AST node (ContractClause).
+// Any other `@Name` is an annotation (spec 05), which is not implemented: E0408.
+
+function clauseName(k: ContractKind): string {
+  return match (k) {
+    CRequires => "@Requires",
+    CEnsures => "@Ensures",
+    CInvariant => "@Invariant",
+    CDecreases => "@Decreases",
+    CRule => "@Rule"
+  };
+}
+
+// Declaration targets of a clause: 0 function, 1 method, 2 constructor, 3 class, 4 record type,
+// 5 other type, 6 loop.
+function clauseAllowed(k: ContractKind, target: int): bool {
+  return match (k) {
+    CRequires => target <= 2,
+    CEnsures => target <= 1,
+    CInvariant => target == 3 || target == 4 || target == 6,
+    CDecreases => target <= 1 || target == 6,
+    CRule => target <= 5
+  };
+}
+
+function targetName(target: int): string {
+  if (target == 0) {
+    return "a function";
+  }
+  if (target == 1) {
+    return "a method";
+  }
+  if (target == 2) {
+    return "a constructor";
+  }
+  if (target == 3) {
+    return "a class";
+  }
+  if (target == 4) {
+    return "a record type";
+  }
+  if (target == 5) {
+    return "a type declaration";
+  }
+  if (target == 6) {
+    return "a loop";
+  }
+  return "this declaration";
+}
+
+// Placement is part of the grammar: E0200 when a clause precedes the wrong kind of declaration.
+function checkPlacement(cs: ContractClause[], target: int): Result<bool, Diagnostic> {
+  for (const c of cs) {
+    if (!clauseAllowed(c.kind, target)) {
+      return Err(diag("E0200", c.span, "contract clause `" + clauseName(c.kind) + "` cannot be applied to " + targetName(target)));
+    }
+  }
+  return Ok(true);
+}
+
+// pos at `@`.
+function parseClause(toks: Token[], pos: usize): Result<ClauseRes, Diagnostic> {
+  const at = tokAt(toks, pos).span;
+  if (!isIdentTok(toks, pos + 1)) {
+    return Err(errExpected(toks, pos + 1, "a contract clause name after `@`"));
+  }
+  const nt = tokAt(toks, pos + 1);
+  let kind: ContractKind = CRequires;
+  if (nt.text == "Requires") {
+    kind = CRequires;
+  } else if (nt.text == "Ensures") {
+    kind = CEnsures;
+  } else if (nt.text == "Invariant") {
+    kind = CInvariant;
+  } else if (nt.text == "Decreases") {
+    kind = CDecreases;
+  } else if (nt.text == "Rule") {
+    kind = CRule;
+  } else {
+    return Err(diag(
+      "E0408", spanTo(at, nt.span),
+      "annotations are not supported yet (spec 05): `@" + nt.text
+        + "`; only the contract clauses @Requires, @Ensures, @Invariant, @Decreases and @Rule exist"
+    ));
+  }
+  let p = expectP(toks, pos + 2, "(")?;
+  let ex: Option<Expr> = None;
+  let rule = "";
+  const isRule = match (kind) {
+    CRule => true,
+    _ => false
+  };
+  if (isRule) {
+    const st = tokAt(toks, p);
+    const isStr = match (st.kind) {
+      KStr => true,
+      _ => false
+    };
+    if (!isStr) {
+      return Err(errExpected(toks, p, "a string literal (rule id)"));
+    }
+    rule = st.text;
+    p += 1;
+  } else {
+    const e = parseExpr(toks, p)?;
+    ex = Some(e.expr);
+    p = e.pos;
+  }
+  p = expectP(toks, p, ")")?;
+  const c = ContractClause { kind: kind, expr: ex, rule: rule, span: spanTo(at, lastSpan(toks, p)) };
+  return Ok(ClauseRes { clause: c, pos: p });
+}
+
+// One or more clauses; pos at the first `@`.
+function parseClauses(toks: Token[], pos: usize): Result<ClausesRes, Diagnostic> {
+  let p = pos;
+  let cs: ContractClause[] = [];
+  while (isP(toks, p, "@")) {
+    const c = parseClause(toks, p)?;
+    cs.push(c.clause);
+    p = c.pos;
+  }
+  return Ok(ClausesRes { clauses: cs, pos: p });
+}
+
+// ---------------------------------------------------------------------------
 // Items
 // ---------------------------------------------------------------------------
 
@@ -289,32 +421,50 @@ function parseImportDecl(toks: Token[], pos: usize): Result<ImportRes, Diagnosti
 }
 
 function parseItem(toks: Token[], pos: usize): Result<ItemRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  if (isKw(toks, pos, "import")) {
-    const r = parseImportDecl(toks, pos)?;
+  let cls: ContractClause[] = [];
+  let p0 = pos;
+  if (isP(toks, pos, "@")) {
+    const cr = parseClauses(toks, pos)?;
+    cls = cr.clauses;
+    p0 = cr.pos;
+  }
+  const start = cls.length > 0 ? cls[0].span : tokAt(toks, p0).span;
+  if (isKw(toks, p0, "import")) {
+    if (cls.length > 0) {
+      return Err(diag("E0200", cls[0].span, "contract clauses cannot precede an import"));
+    }
+    const r = parseImportDecl(toks, p0)?;
     return Ok(ItemRes { item: IImport(r.decl), pos: r.pos });
   }
-  let p = pos;
+  let p = p0;
   let exported = false;
   if (isKw(toks, p, "export")) {
     exported = true;
     p += 1;
     if (isP(toks, p, "{")) {
-      const r = parseImportDecl(toks, pos)?;
+      if (cls.length > 0) {
+        return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a re-export"));
+      }
+      const r = parseImportDecl(toks, p0)?;
       return Ok(ItemRes { item: IReExport(r.decl), pos: r.pos });
     }
   }
   if (isKw(toks, p, "function")) {
-    return parseFunction(toks, p, exported, start);
+    checkPlacement(cls, 0)?;
+    return parseFunction(toks, p, exported, start, cls);
   }
   if (isKw(toks, p, "type")) {
-    return parseTypeDecl(toks, p, exported, start);
+    return parseTypeDecl(toks, p, exported, start, cls);
   }
   if (isKw(toks, p, "const")) {
+    if (cls.length > 0) {
+      return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a constant"));
+    }
     return parseConstDecl(toks, p, exported, start);
   }
   if (isKw(toks, p, "class")) {
-    return parseClass(toks, p, exported, start);
+    checkPlacement(cls, 3)?;
+    return parseClass(toks, p, exported, start, cls);
   }
   if (isKw(toks, p, "interface")) {
     return parseInterface(toks, p, exported, start);
@@ -352,7 +502,7 @@ function parseSigBody(toks: Token[], pos: usize): Result<SigRes, Diagnostic> {
 }
 
 // pos at `function`; `start` is the span of the item's first token.
-function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParamsB(toks, name.pos)?;
   const sg = parseSigBody(toks, tps.pos)?;
@@ -364,6 +514,7 @@ function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span): 
     params: sg.params,
     ret: sg.ret,
     body: sg.body,
+    contracts: cls,
     span: spanTo(start, sg.body.span)
   };
   return Ok(ItemRes { item: IFunction(decl), pos: sg.pos });
@@ -392,7 +543,7 @@ function isIdentTok(toks: Token[], pos: usize): bool {
 }
 
 // pos at `class`.
-function parseClass(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+function parseClass(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParams(toks, name.pos)?;
   let p = tps.pos;
@@ -431,6 +582,7 @@ function parseClass(toks: Token[], pos: usize, exported: bool, start: Span): Res
     ext: ext,
     impls: impls,
     members: members,
+    contracts: cls,
     span: spanTo(start, lastSpan(toks, p))
   };
   return Ok(ItemRes { item: IClass(decl), pos: p });
@@ -502,8 +654,14 @@ function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span):
 // One class member; modifiers (`public`, `private`, `static`) are contextual keywords that only
 // count when another identifier follows.
 function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
+  let cls: ContractClause[] = [];
   let p = pos;
+  if (isP(toks, pos, "@")) {
+    const cr = parseClauses(toks, pos)?;
+    cls = cr.clauses;
+    p = cr.pos;
+  }
+  const start = cls.length > 0 ? cls[0].span : tokAt(toks, p).span;
   let priv = false;
   let isStatic = false;
   let mods: usize = 0;
@@ -524,9 +682,11 @@ function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
   const name = parseIdent(toks, p)?;
   p = name.pos;
   if (isP(toks, p, "(") && name.id.name == "constructor" && mods == 0) {
-    return parseCtor(toks, p, start);
+    checkPlacement(cls, 2)?;
+    return parseCtor(toks, p, start, cls);
   }
   if (isP(toks, p, "(") || isP(toks, p, "<")) {
+    checkPlacement(cls, 1)?;
     const tps = parseTypeParams(toks, p)?;
     const sg = parseSigBody(toks, tps.pos)?;
     const md = MethodDecl {
@@ -537,11 +697,15 @@ function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
       params: sg.params,
       ret: sg.ret,
       body: sg.body,
+      contracts: cls,
       span: spanTo(start, sg.body.span)
     };
     return Ok(MemberRes { member: MMethod(md), pos: sg.pos });
   }
   if (isP(toks, p, ":")) {
+    if (cls.length > 0) {
+      return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to a field"));
+    }
     if (isStatic) {
       return Err(diag("E0408", spanTo(start, name.id.span), "static fields are not supported (ADR-0009)"));
     }
@@ -561,7 +725,7 @@ function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
 }
 
 // pos at the `(` after `constructor`.
-function parseCtor(toks: Token[], pos: usize, start: Span): Result<MemberRes, Diagnostic> {
+function parseCtor(toks: Token[], pos: usize, start: Span, cls: ContractClause[]): Result<MemberRes, Diagnostic> {
   let p = pos + 1;
   let params: CtorParam[] = [];
   while (!isP(toks, p, ")")) {
@@ -588,22 +752,28 @@ function parseCtor(toks: Token[], pos: usize, start: Span): Result<MemberRes, Di
     }
   }
   const body = parseBlock(toks, p + 1)?;
-  const cd = CtorDecl { params: params, body: body.block, span: spanTo(start, body.block.span) };
+  const cd = CtorDecl { params: params, body: body.block, contracts: cls, span: spanTo(start, body.block.span) };
   return Ok(MemberRes { member: MCtor(cd), pos: body.pos });
 }
 
 // pos at `type`.
-function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParams(toks, name.pos)?;
   const eq = expectP(toks, tps.pos, "=")?;
   const body = parseTypeBody(toks, eq)?;
   const p = expectP(toks, body.pos, ";")?;
+  const isRecord = match (body.body) {
+    DRecord(_) => true,
+    _ => false
+  };
+  checkPlacement(cls, isRecord ? 4 : 5)?;
   const decl = TypeDecl {
     exported: exported,
     name: name.id,
     typeParams: tps.ids,
     body: body.body,
+    contracts: cls,
     span: spanTo(start, lastSpan(toks, p))
   };
   return Ok(ItemRes { item: IType(decl), pos: p });
@@ -735,6 +905,18 @@ function parseBlock(toks: Token[], pos: usize): Result<BlockRes, Diagnostic> {
   while (!isP(toks, p, "}")) {
     if (isEof(toks, p)) {
       return Err(errExpected(toks, p, "`}`"));
+    }
+    if (isP(toks, p, "@")) {
+      // Loop contract clauses: one SContract statement per clause, directly before the loop.
+      const cr = parseClauses(toks, p)?;
+      checkPlacement(cr.clauses, 6)?;
+      for (const c of cr.clauses) {
+        stmts.push(Stmt { kind: SContract(c), span: c.span });
+      }
+      p = cr.pos;
+      if (!isKw(toks, p, "while") && !isKw(toks, p, "for")) {
+        return Err(errExpected(toks, p, "`while` or `for` after a loop contract clause"));
+      }
     }
     const s = parseStmt(toks, p)?;
     stmts.push(s.stmt);
@@ -934,7 +1116,15 @@ function parseExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
   if (k == 2) {
     return parseArrow(toks, pos, true);
   }
-  return parseCond(toks, pos);
+  const c = parseCond(toks, pos)?;
+  if (isP(toks, c.pos, "==>")) {
+    // `a ==> b`: implication, right-associative, lower than `?:`. Only valid inside contract
+    // expressions; the checker rejects it elsewhere (E0415).
+    const r = parseExpr(toks, c.pos + 1)?;
+    const sp = spanTo(c.expr.span, r.expr.span);
+    return Ok(ExprRes { expr: mkExpr(EBinary(BImplies, c.expr, r.expr), sp), pos: r.pos });
+  }
+  return Ok(c);
 }
 
 // Index of the `)` matching the `(` at `pos` (counting only parentheses), or the end of input.

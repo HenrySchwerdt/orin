@@ -38,6 +38,10 @@
 //            | (match@S EXPR ARMLINE*)  each arm on its own line, indented 2 deeper:
 //                  (arm PAT EXPR_OR_BLOCK)
 //   PAT     := _ | (pident NAME) | (pvariant NAME PAT*) | (pint N) | (pstr "escaped") | (pbool B)
+//   Contract clauses (beyond Orin-B, ADR-0012) appear only when present:
+//            ITEM/MEMBER ... (contracts CLAUSE*) before the closing ")" of fn / type / class / ctor / method,
+//            STMT := (contract@S KIND EXPR_OR_STR) before a loop       KIND := requires | ensures | invariant
+//            | decreases | rule;  EXPR also has (binary@S ==> EXPR EXPR)
 //   S       := "@" start "-" end              byte offsets, half-open [start, end)
 //
 // Notes:
@@ -54,7 +58,7 @@ import {
   VariantDecl, ConstDecl,
   TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp, BinaryOp,
   ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, CtorParam, Param,
-  FnTyParam, ArrowParam, ArrowBody
+  FnTyParam, ArrowParam, ArrowBody, ContractClause
 } from "../syntax";
 import { Span } from "../diag";
 
@@ -162,7 +166,7 @@ function dumpClass(c: ClassDecl): string {
     None => "-"
   };
   return "(class " + expWord(c.exported) + " " + c.name.name + " (tparams" + namesTail(c.typeParams) + ") " + ext
-    + " (implements" + namesTail(c.impls) + ")" + parts.join("") + ")";
+    + " (implements" + namesTail(c.impls) + ")" + parts.join("") + contractsTail(c.contracts) + ")";
 }
 
 function dumpInterface(k: InterfaceDecl): string {
@@ -210,20 +214,47 @@ function dumpCtorParam(p: CtorParam): string {
 function dumpMember(m: ClassMember): string {
   return match (m) {
     MField(f) => "(cfield " + accWord(f.priv) + " " + f.name.name + " " + dumpType(f.ty) + " " + optExpr(f.init, "  ") + ")",
-    MCtor(c) => dumpCtor(c.params, c.body),
-    MMethod(md) => dumpMethod(md.priv, md.isStatic, md.name, md.typeParams, md.params, md.ret, md.body)
+    MCtor(c) => dumpCtor(c.params, c.body, c.contracts),
+    MMethod(md) => dumpMethod(md.priv, md.isStatic, md.name, md.typeParams, md.params, md.ret, md.body, md.contracts)
   };
 }
 
-function dumpCtor(params: CtorParam[], body: Block): string {
+// ` (contracts (kind@S ..)..)`, or "" when there are none.
+function contractsTail(cs: ContractClause[]): string {
+  if (cs.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  for (const c of cs) {
+    parts.push(dumpClause(c));
+  }
+  return " (contracts " + parts.join(" ") + ")";
+}
+
+function dumpClause(c: ContractClause): string {
+  const kind = match (c.kind) {
+    CRequires => "requires",
+    CEnsures => "ensures",
+    CInvariant => "invariant",
+    CDecreases => "decreases",
+    CRule => "rule"
+  };
+  const arg = match (c.expr) {
+    Some(e) => dumpExpr(e, "  "),
+    None => quote(c.rule)
+  };
+  return "(" + kind + spanStr(c.span) + " " + arg + ")";
+}
+
+function dumpCtor(params: CtorParam[], body: Block, cs: ContractClause[]): string {
   let ps: string[] = [];
   for (const p of params) {
     ps.push(dumpCtorParam(p));
   }
-  return "(ctor (cparams" + joinTail(ps) + ") " + dumpBlock(body, "  ") + ")";
+  return "(ctor (cparams" + joinTail(ps) + ") " + dumpBlock(body, "  ") + contractsTail(cs) + ")";
 }
 
-function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], params: Param[], ret: Option<TypeExpr>, body: Block): string {
+function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], params: Param[], ret: Option<TypeExpr>, body: Block, cs: ContractClause[]): string {
   let ps: string[] = [];
   for (const p of params) {
     ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
@@ -233,7 +264,7 @@ function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], param
     kind = "static";
   }
   return "(method " + accWord(priv) + " " + kind + " " + name.name + " (tparams" + namesTail(tps) + ") (params"
-    + joinTail(ps) + ") " + optType(ret) + " " + dumpBlock(body, "  ") + ")";
+    + joinTail(ps) + ") " + optType(ret) + " " + dumpBlock(body, "  ") + contractsTail(cs) + ")";
 }
 
 function dumpFn(f: FunctionDecl): string {
@@ -242,12 +273,12 @@ function dumpFn(f: FunctionDecl): string {
     ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
   }
   return "(fn " + expWord(f.exported) + " " + f.name.name + " (tparams" + tparamsTail(f.typeParams, f.bounds) + ") (params"
-    + joinTail(ps) + ") " + optType(f.ret) + " " + dumpBlock(f.body, "") + ")";
+    + joinTail(ps) + ") " + optType(f.ret) + " " + dumpBlock(f.body, "") + contractsTail(f.contracts) + ")";
 }
 
 function dumpTypeDecl(t: TypeDecl): string {
   return "(type " + expWord(t.exported) + " " + t.name.name + " (tparams" + namesTail(t.typeParams) + ") "
-    + dumpTypeBody(t.body) + ")";
+    + dumpTypeBody(t.body) + contractsTail(t.contracts) + ")";
 }
 
 function dumpTypeBody(b: TypeDeclBody): string {
@@ -383,7 +414,8 @@ function dumpStmt(s: Stmt, ind: string): string {
     SForOf(name, it, body) => "(for" + sp + " " + name.name + " " + dumpExpr(it, ind) + " " + dumpBlock(body, ind) + ")",
     SBreak => "(break" + sp + ")",
     SContinue => "(continue" + sp + ")",
-    SBlock(b) => "(sblock" + sp + " " + dumpBlock(b, ind) + ")"
+    SBlock(b) => "(sblock" + sp + " " + dumpBlock(b, ind) + ")",
+    SContract(c) => "(contract" + sp + " " + dumpClause(c) + ")"
   };
 }
 
@@ -412,7 +444,8 @@ function binaryStr(op: BinaryOp): string {
     BGt => ">",
     BGe => ">=",
     BAnd => "&&",
-    BOr => "||"
+    BOr => "||",
+    BImplies => "==>"
   };
 }
 

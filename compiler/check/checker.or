@@ -14,8 +14,12 @@ import { lowerClasses, buildClassTables } from "./classes";
 import { inferClasses } from "./classfix";
 import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig, resolveType, instType } from "./types";
 import { resolveImpls, checkImpls, boundIface } from "./ifaces";
+import { checkFuncContracts, checkRecordContracts } from "./contracts";
+import { purityDiags } from "./purity";
+import { expandContracts } from "./rtcheck";
 
-type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
+// `cexprs`: the checked contract expressions of the function (ADR-0012), for the purity pass.
+type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; cexprs: HExpr[]; };
 
 // Checks one function body. `abs` marks the abstract check of a generic body (type parameters
 // are opaque types; no function instances are created). Returns the (possibly grown) environment.
@@ -23,9 +27,36 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
   if (f.mode == 6) {
     // A lifted closure function: its HIR was produced while its enclosing function was checked.
     const noErr: Option<Diagnostic> = None;
-    return FuncOut { func: env.lifted[f.cls], err: noErr, env: env };
+    return FuncOut { func: env.lifted[f.cls], err: noErr, env: env, cexprs: [] };
   }
-  const fx = newFnCtx(f, env, abs);
+  let fx0 = newFnCtx(f, env, abs);
+  let cexprs: HExpr[] = [];
+  if (f.decl.contracts.length > 0) {
+    // Contract clauses are type-checked in a forked context and erased (ADR-0012).
+    const cf = checkFuncContracts(env, f, fx0);
+    match (cf) {
+      Err(d) => {
+        return FuncOut {
+          func: Function {
+            name: f.qname,
+            paramCount: f.paramLocals.length,
+            locals: f.paramLocals,
+            ret: f.ret,
+            body: HBlock { stmts: [] },
+            span: f.decl.span
+          },
+          err: Some(d),
+          env: env,
+          cexprs: cexprs
+        };
+      },
+      Ok(o) => {
+        fx0 = o.fx;
+        cexprs = o.exprs;
+      }
+    }
+  }
+  const fx = fx0;
   const r = checkBlock(env, fx, f.decl.body);
   return match (r) {
     Err(d) => FuncOut {
@@ -38,7 +69,8 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
         span: f.decl.span
       },
       err: Some(d),
-      env: env
+      env: env,
+      cexprs: cexprs
     },
     Ok(b) => {
       let err: Option<Diagnostic> = None;
@@ -67,10 +99,19 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
           span: f.decl.span
         },
         err: err,
-        env: b.fx.env
+        env: b.fx.env,
+        cexprs: appendAll(cexprs, b.fx.cexprs)
       };
     }
   };
+}
+
+function appendAll(a: HExpr[], b: HExpr[]): HExpr[] {
+  let out = a;
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
 }
 
 type Opaques = { env: Env; names: string[]; tys: Type[]; };
@@ -239,20 +280,44 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   // Ordinary functions, then the generic instances they (transitively) request: instances are
   // appended to `env.funcs` while checking, so the loop runs until the table stops growing.
   let funcs: Function[] = [];
+  let cexprs: HExpr[] = [];
+  const rc = checkRecordContracts(env, lw.prog);
+  env = rc.env;
+  for (const d of rc.diags) {
+    diags.push(d);
+  }
+  cexprs = appendAll(cexprs, rc.exprs);
   let fi: usize = 0;
   while (fi < env.funcs.length) {
     const o = checkFunc(env, env.funcs[fi], false);
     env = o.env;
     funcs.push(o.func);
+    cexprs = appendAll(cexprs, o.cexprs);
     match (o.err) {
       Some(d) => { diags.push(d); },
       None => {}
     }
     fi += 1;
   }
+  if (diags.length == 0 && cexprs.length > 0) {
+    for (const d of purityDiags(funcs, cexprs)) {
+      diags.push(d);
+    }
+  }
   if (diags.length > 0) {
     return Err(dedupDiags(diags));
   }
   const mainId = findMain(env).unwrapOr(0);
   return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId, vtables: env.vtables, ifaces: ifaceDefs(env) });
+}
+
+// `check` with runtime contract checking (`orin compile --check-contracts`, ADR-0012): the program is
+// checked as usual (so contract errors are reported once, with their own codes), expanded, and the
+// expansion is checked again.
+export function checkRuntime(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
+  const first = check(prog, sm);
+  if (first.isErr()) {
+    return first;
+  }
+  return check(expandContracts(prog, sm), sm);
 }
