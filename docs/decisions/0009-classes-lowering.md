@@ -45,3 +45,12 @@ No inheritance (`extends` → E0408), no `protected`, no getters/setters, no ove
 - Performance: the receiver is passed and returned; with owned-parameter inference and last-use
   moves (ADR-0010) the update is in place when unshared. Before ADR-0010 lands, each mutating
   call may copy the object shallowly (correct, slower).
+
+## Amendment (2026-10-13): explicit `mut` marker
+Mutating methods are **declared** with the `mut` modifier (`mut withdraw(amount: int): void`)
+instead of being inferred. Reason: whether a method mutates its receiver is part of the class's
+public API (spec 04 API snapshots, spec 15 frame conditions); inference would let a body edit
+silently change which call sites are legal. Rules: assigning to a `this` place, calling a mutating
+builtin on a `this` place, or calling a `mut` method on `this` inside a non-`mut` method → E0401
+with a hint to add `mut`; `mut` on a static method or constructor → E0400. Calling a `mut` method
+requires a mutable receiver place (unchanged). Lowering is unchanged.

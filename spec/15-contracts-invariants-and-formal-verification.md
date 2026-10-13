@@ -147,6 +147,56 @@ This is a **design sketch**, not final parsing syntax: mutable `this`, contracts
 
 An invariant MUST be established by construction and preserved by every accessible state transition. A constructor is not allowed to expose an object before invariants hold. Private fields cannot be mutated by uncontrolled outside aliases. OIM value semantics help, but **do not replace** proof of the state invariant.
 
+### 4.2a Canonical surface syntax: contract annotations (decision 2026-10-13, ADR-0012)
+
+The keyword clauses in §4.1–§4.3 are superseded as surface syntax by **compiler built-in
+annotations** (spec 05 category 1). Semantics are unchanged. One canonical form:
+
+```typescript
+@Invariant(this.balance >= 0)
+class BankAccount {
+  balance: int;
+
+  @Requires(initialBalance >= 0)
+  constructor(initialBalance: int) {
+    this.balance = initialBalance;
+  }
+
+  @Requires(amount > 0 && amount <= this.balance)
+  @Ensures(this.balance == old(this.balance) - amount)
+  mut withdraw(amount: int): void {
+    this.balance -= amount;
+  }
+}
+
+@Requires(cents >= 0)
+@Ensures(result >= 0 && result <= cents)
+function discount(cents: int, premium: bool): int { ... }
+```
+
+| Annotation | Target | Meaning |
+|---|---|---|
+| `@Requires(e)` | function, method, constructor | precondition; may mention parameters and (methods) `this` |
+| `@Ensures(e)` | function, method | postcondition; may mention `result`, parameters, `this`, `old(e)` |
+| `@Invariant(e)` | class/record; loop (statement annotation before `while`/`for`) | state / loop invariant |
+| `@Decreases(e)` | loop, recursive function | termination measure |
+| `@Rule("SHOP-001")` | any declaration | traceability to a business rule (spec 14) |
+
+- Contract expressions are **pure Orin expressions** (no calls to non-pure functions, no
+  mutation, no allocation-observable effects); `old(e)` only in `@Ensures`; `==>` implication is
+  available only inside contract expressions. Quantifiers (`forall`/`exists`) are OPEN.
+- Mutating methods are marked with `mut` (spec 03, ADR-0009 amendment); `old(this.f)` refers to
+  the receiver value before the call — under value semantics this is simply the input snapshot.
+- **Compiler integration:** every build parses, resolves and *type-checks* contract expressions
+  (so they never rot), and erases them from release code. The proof itself is a compiler pass
+  (`check → contract IR → VC generation → SMT/proof backend`) run by `orin verify`, by
+  `orin build --verify`, or automatically for modules whose `orin.toml` policy requires it
+  (`[verification] required = ["payments"]`). A required-but-failed or `UNKNOWN` proof fails
+  that build. Runtime checking of contracts MAY be enabled per build (`--check-contracts`),
+  turning violations into defined traps.
+- Results are reported per contract as VERIFIED / FAILED (with counterexample) / UNKNOWN (§5),
+  exposed via `orin verify --format=json`, MCP `inspect`, and LSP (spec 18 §4).
+
 ### 4.3 Loop invariants and termination
 
 For imperative verification, the compiler SHOULD support:
