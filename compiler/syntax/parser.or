@@ -298,40 +298,47 @@ function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span): 
   return Ok(ItemRes { item: IType(decl), pos: p });
 }
 
-// Right side of `type N = ...`: `{..}` record; any `|` or `Name(..)` member -> union; else alias.
+// Right side of `type N = ...`: `{..}` record; `Name(..)` or any `|` -> union; else alias.
+// Mirrors Stage 0: the first member is parsed as a type; a following `|` makes it a union,
+// in which case it must be a bare `Name`. A leading `|` is not accepted.
 function parseTypeBody(toks: Token[], pos: usize): Result<BodyRes, Diagnostic> {
   if (isP(toks, pos, "{")) {
     return parseRecordBody(toks, pos);
   }
   let p = pos;
-  let isUnion = false;
-  if (isP(toks, p, "|")) {
-    isUnion = true;
-    p += 1;
-  } else {
-    const first = tokAt(toks, p);
-    const isName = match (first.kind) {
-      KIdent => true,
-      _ => false
-    };
-    if (isName && (isP(toks, p + 1, "(") || isP(toks, p + 1, "|"))) {
-      isUnion = true;
-    }
-  }
-  if (!isUnion) {
-    const t = parseType(toks, p)?;
-    return Ok(BodyRes { body: DAlias(t.ty), pos: t.pos });
-  }
   let variants: VariantDecl[] = [];
-  while (true) {
+  const first = tokAt(toks, p);
+  const isName = match (first.kind) {
+    KIdent => true,
+    _ => false
+  };
+  if (isName && isP(toks, p + 1, "(")) {
     const v = parseVariant(toks, p)?;
     variants.push(v.variant);
     p = v.pos;
-    if (isP(toks, p, "|")) {
-      p += 1;
-    } else {
-      break;
+  } else {
+    const t = parseType(toks, p)?;
+    if (!isP(toks, t.pos, "|")) {
+      return Ok(BodyRes { body: DAlias(t.ty), pos: t.pos });
     }
+    const bare = match (t.ty.kind) {
+      TNamed(id, args) => args.length == 0,
+      TArray(_) => false
+    };
+    if (!bare) {
+      return Err(diag("E0200", t.ty.span, "union members must be `Name` or `Name(T, ...)`"));
+    }
+    const nm = match (t.ty.kind) {
+      TNamed(id, args) => id,
+      TArray(_) => Ident { name: "", span: t.ty.span }
+    };
+    variants.push(VariantDecl { name: nm, payload: [], span: t.ty.span });
+    p = t.pos;
+  }
+  while (isP(toks, p, "|")) {
+    const v = parseVariant(toks, p + 1)?;
+    variants.push(v.variant);
+    p = v.pos;
   }
   return Ok(BodyRes { body: DUnion(variants), pos: p });
 }
@@ -357,17 +364,20 @@ function parseVariant(toks: Token[], pos: usize): Result<VariantRes, Diagnostic>
   let payload: TypeExpr[] = [];
   if (isP(toks, p, "(")) {
     p += 1;
-    while (!isP(toks, p, ")")) {
+    while (true) {
       const t = parseType(toks, p)?;
       payload.push(t.ty);
       p = t.pos;
       if (isP(toks, p, ",")) {
         p += 1;
-      } else if (!isP(toks, p, ")")) {
-        return Err(errExpected(toks, p, "`,` or `)`"));
+        if (isP(toks, p, ")")) {
+          break;
+        }
+      } else {
+        break;
       }
     }
-    p += 1;
+    p = expectP(toks, p, ")")?;
   }
   const v = VariantDecl { name: name.id, payload: payload, span: spanTo(name.id.span, lastSpan(toks, p)) };
   return Ok(VariantRes { variant: v, pos: p });
@@ -521,11 +531,7 @@ function parseWhile(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
 function parseFor(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
   const start = tokAt(toks, pos).span;
   let p = expectP(toks, pos + 1, "(")?;
-  if (isKw(toks, p, "const") || isKw(toks, p, "let")) {
-    p += 1;
-  } else {
-    return Err(errExpected(toks, p, "`const`"));
-  }
+  p = expectKw(toks, p, "const")?;
   const name = parseIdent(toks, p)?;
   p = expectKw(toks, name.pos, "of")?;
   const iter = parseExpr(toks, p)?;
@@ -808,10 +814,13 @@ function parsePrimary(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
   }
 }
 
-// `( e )` or `[a, b]`. Parentheses produce no node: the result is the inner expression.
+// `( e )` or `[a, b]`. Parentheses produce no node: the result is the inner expression with
+// its span widened to include the parentheses (as Stage 0 does).
 function parsePunctExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
   if (isP(toks, pos, "(")) {
-    return parseParenExpr(toks, pos);
+    const inner = parseParenExpr(toks, pos)?;
+    const wide = spanTo(tokAt(toks, pos).span, lastSpan(toks, inner.pos));
+    return Ok(ExprRes { expr: mkExpr(inner.expr.kind, wide), pos: inner.pos });
   }
   if (isP(toks, pos, "[")) {
     const xs = parseExprList(toks, pos, "]")?;
@@ -934,8 +943,11 @@ function parsePattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
     KPunct => {
       // Negative integer literal pattern.
       const nt = tokAt(toks, pos + 1);
-      if (isP(toks, pos, "-") && isKindInt(nt)) {
-        return mkPat(PInt(0 - nt.value), spanTo(t.span, nt.span), pos + 2);
+      if (isP(toks, pos, "-")) {
+        if (isKindInt(nt)) {
+          return mkPat(PInt(0 - nt.value), spanTo(t.span, nt.span), pos + 2);
+        }
+        return Err(errExpected(toks, pos + 1, "integer after `-` in pattern"));
       }
       return Err(errExpected(toks, pos, "pattern"));
     },
@@ -945,7 +957,8 @@ function parsePattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
   }
 }
 
-// `_`, `Name`, or `Name(a, _)` (sub-patterns are bindings or `_`).
+// `_`, `Name`, or `Name(p, ..)`. Nested patterns are accepted here (as in Stage 0); Orin-B's
+// restriction to bindings and `_` is enforced later, by the checker.
 function parseIdentPattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
   const nm = parseIdent(toks, pos)?;
   if (nm.id.name == "_") {
@@ -957,12 +970,8 @@ function parseIdentPattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic
   let p = nm.pos + 1;
   let subs: Pattern[] = [];
   while (!isP(toks, p, ")")) {
-    const sub = parseIdent(toks, p)?;
-    if (sub.id.name == "_") {
-      subs.push(Pattern { kind: PWildcard, span: sub.id.span });
-    } else {
-      subs.push(Pattern { kind: PIdent(sub.id), span: sub.id.span });
-    }
+    const sub = parsePattern(toks, p)?;
+    subs.push(sub.pat);
     p = sub.pos;
     if (isP(toks, p, ",")) {
       p += 1;

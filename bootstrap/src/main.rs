@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod ast;
+mod astdump;
 mod checker;
 mod codegen;
 mod diag;
@@ -68,6 +69,17 @@ fn main() {
             let fid = sm.add(input.clone(), text.clone());
             match parser::parse(fid, &text) {
                 Ok(m) => println!("{:#?}", m.items),
+                Err(d) => report(&d, &sm),
+            }
+        }
+        "dump-ast" => {
+            let text = std::fs::read_to_string(&input).unwrap_or_else(|e| {
+                eprintln!("error: cannot read {}: {}", input.display(), e);
+                exit(1)
+            });
+            let fid = sm.add(input.clone(), text.clone());
+            match parser::parse(fid, &text) {
+                Ok(m) => print!("{}", astdump::dump(&m)),
                 Err(d) => report(&d, &sm),
             }
         }
