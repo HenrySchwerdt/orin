@@ -1,29 +1,35 @@
 // orin — the self-hosted Orin compiler driver (Stage 1+).
 //   orin check [--format=json] <entry.or>
-//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify]
-//       default pipeline: HIR -> MIR -> ownership verifier -> C
+//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--c-builtins]
+//       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
 //   orin lsp                 language server on stdio (spec 18)
+//   orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]   MCP server on stdio (spec 10)
 //   orin mir <entry.or>      print the MIR
 //   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
 //   (compile/mir/verify run the MIR optimiser, compiler/opt, unless --no-opt is given)
+//   compile/mir/verify load the std prelude (std/, spec 19 R1) implicitly: moved built-ins call
+//   Orin code. --c-builtins (implied by --legacy-codegen) skips it and keeps the C runtime path.
 
 import { args, exit } from "std:process";
 import { writeFile } from "std:fs";
 import { SourceMap, Diagnostic, render } from "./diag";
-import { loadAll } from "./loader";
+import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
+import { SourceFile } from "./diag";
 import { check } from "./check";
 import { generate } from "./codegen";
 import { lower } from "./lower";
 import { emitC } from "./cemit";
+import { emitLlvm } from "./llvm";
 import { MProgram, printProgram } from "./mir";
 import { verify } from "./verify";
-import { optimize } from "./opt";
+import { optimize, pruneProgram } from "./opt";
 import { runFmt, printDiagnosticsJson } from "./tools";
 import { runLsp } from "./lsp";
+import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mir <entry.or>\n  orin verify <entry.or>");
+  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin mir <entry.or>\n  orin verify <entry.or>");
   exit(2);
 }
 
@@ -67,10 +73,16 @@ function main(): void {
     exit(runLsp());
     return;
   }
+  if (all.length >= 1 && all[0] == "mcp") {
+    exit(runMcp(all.slice(1, all.length)));
+    return;
+  }
   let json = false;
   let legacy = false;
   let noVerify = false;
   let noOpt = false;
+  let llvm = false;
+  let cBuiltins = false;
   let argv: string[] = [];
   for (const a of all) {
     if (a == "--format=json") {
@@ -81,6 +93,12 @@ function main(): void {
       noVerify = true;
     } else if (a == "--no-opt") {
       noOpt = true;
+    } else if (a == "--backend=llvm") {
+      llvm = true;
+    } else if (a == "--backend=c") {
+      llvm = false;
+    } else if (a == "--c-builtins") {
+      cBuiltins = true;
     } else {
       argv.push(a);
     }
@@ -100,7 +118,9 @@ function main(): void {
     usage();
     return;
   }
-  const loaded = loadAll(entry);
+  const usePrelude = !cBuiltins && !legacy && cmd != "check";
+  const noOverlay: SourceFile[] = [];
+  const loaded = loadWithRoots(entry, noOverlay, usePrelude ? preludeRoots() : noPreludeRoots());
   if (loaded.diags.length > 0) {
     report(loaded.sm, loaded.diags, json);
     return;
@@ -134,7 +154,7 @@ function main(): void {
       exit(70);
       return;
     }
-    c = emitC(mir);
+    c = llvm ? emitLlvm(pruneProgram(mir)) : emitC(pruneProgram(mir));
   }
   const written = writeFile(argv[3], c);
   if (written.isErr()) {

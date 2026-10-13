@@ -7,11 +7,12 @@
 // parents' states sit on parallel stacks (sNode/sAst/sItem/sImps), so every array is grown
 // in a `let` local that owns it.
 
-import { Module, Item, ImportDecl, parse } from "../syntax";
+import { Module, Item, ImportDecl, Ident, parse } from "../syntax";
 import { Span, SourceMap, SourceFile, Diagnostic, diag, span } from "../diag";
 import { readFile, exists } from "std:fs";
 import { ImportTarget, StdModule, Unit, LoadedProgram } from "./program";
 import { normalizePath, dirname, joinPath, relativeTo, isInside } from "./path";
+import { PreludeRoot, noPreludeRoots } from "./prelude";
 
 export type LoadResult = { program: LoadedProgram; sm: SourceMap; };
 
@@ -60,6 +61,10 @@ function failOut(files: SourceFile[], d: Diagnostic): LoadOutcome {
 
 // `/`-separated path of `p` relative to `base`, without a trailing `.or`.
 function relName(base: string, p: string): string {
+  if (p.startsWith("$")) {
+    // Prelude unit (virtual path, see prelude.or): its name does not depend on the entry file.
+    return p.endsWith(".or") ? p.substring(0, p.length - 3) : p;
+  }
   const s = relativeTo(base, p);
   if (s.endsWith(".or")) {
     return s.substring(0, s.length - 3);
@@ -83,6 +88,10 @@ function stdKind(p: string): int {
 // Resolve import path `p` of file `importer` (in directory `dir`) to a normalized file path,
 // or to a std module. Reports E0301 and E0302.
 function resolveImport(ov: SourceFile[], importer: string, dir: string, p: string, sp: Span, base: string): Result<Resolved, Diagnostic> {
+  if (p.startsWith("$")) {
+    // The implicit import of a prelude root's entry file (added to the program's entry file below).
+    return Ok(Resolved { std: 0, path: normalizePath(p) });
+  }
   if (p.startsWith("std:")) {
     const k = stdKind(p);
     if (k == 0) {
@@ -141,8 +150,19 @@ function importOf(item: Item): Option<ImportDecl> {
 // buffers, spec 18 §2) when a path matches (compared after `normalizePath`), otherwise from
 // disk; an overlay file also counts as existing for import resolution.
 export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
+  return loadWithRoots(entryPath, overlay, noPreludeRoots());
+}
+
+// Like loadWithOverlay, but every prelude root's files are served from memory and each root's
+// entry file is imported (with no names) by the program's entry file, so the prelude units come
+// first in `units` (before the entry's own dependencies) and are checked, lowered and emitted
+// with the program. (The entry file keeps file id 0; prelude files get the next ids.)
+export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: PreludeRoot[]): LoadOutcome {
   const entry = normalizePath(entryPath);
-  const ov = normalizeOverlay(overlay);
+  let ov = normalizeOverlay(overlay);
+  for (const r of roots) {
+    ov = ov.concat(normalizeOverlay(r.files));
+  }
   const base = dirname(entry);
   let files: SourceFile[] = [];
   let nodePaths: string[] = [];   // node id == index into `files`
@@ -197,6 +217,16 @@ export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadO
       haveCur = true;
       curNode = id;
       curAst = pr.unwrap();
+      if (files.length == 1) {
+        // The entry file: add the implicit prelude imports in front of its own items.
+        let implicit: Item[] = [];
+        for (const r of roots) {
+          const sp0 = span(id, 0, 0);
+          const none: Ident[] = [];
+          implicit.push(IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp0, span: sp0 }));
+        }
+        curAst = Module { file: curAst.file, items: implicit.concat(curAst.items) };
+      }
       curItem = 0;
       cur = [];
       pending = false;

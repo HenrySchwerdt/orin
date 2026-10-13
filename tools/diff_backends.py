@@ -2,11 +2,18 @@
 """Differential test of the two Stage 1 backends: for every tests/run program, compile with the
 MIR backend (default) and with `--legacy-codegen`, build and run both, compare stdout + exit code.
 
+With `--mode llvm` it compares the C backend (default) against the LLVM IR backend
+(`--backend=llvm`, built with clang -O2 + runtime/orin_runtime_llvm.c) over tests/run and
+tests/next/run (ADR-0006).
+With `--mode builtins` it compares the default pipeline (library built-ins implemented by the Orin
+std prelude, spec 19 R1) against `--c-builtins` (the C runtime implementations) over tests/run and
+tests/next/run (works with --sanitize too).
+
 With `--mode opt` it instead compares the optimised MIR pipeline (default) against `--no-opt`
 (ADR-0010) over tests/run and tests/next/run.
 
 Usage: python3 tools/diff_backends.py [--orinc build/bootstrap/orin2] [--cc cc] [--filter s]
-                                      [--sanitize] [--mode backends|opt]
+                                      [--sanitize] [--mode backends|opt|llvm|builtins]
 """
 import argparse
 import os
@@ -41,16 +48,22 @@ def sh(cmd, timeout):
         return None, b"", b"timeout"
 
 
-def build_and_run(args, name, entry, tag, extra):
-    c = os.path.join(OUT, "%s.%s.c" % (name, tag))
+def build_and_run(args, name, entry, tag, extra, llvm=False):
+    c = os.path.join(OUT, "%s.%s.%s" % (name, tag, "ll" if llvm else "c"))
     exe = os.path.join(OUT, "%s.%s.exe" % (name, tag))
     rc, _, err = sh([args.orinc, "compile", os.path.relpath(entry, ROOT), "-o", c] + extra, 120)
     if rc != 0:
         return ("compile-fail", err.decode("utf-8", "replace")[:300])
-    cc = [args.cc, "-O1", "-w", "-I", "runtime"]
+    if llvm:
+        cc = ["clang", "-O2", "-w", "-I", "runtime"]
+    else:
+        cc = [args.cc, "-O1", "-w", "-I", "runtime"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    rc, _, err = sh(cc + [c, os.path.join("runtime", "orin_runtime.c"), "-o", exe], 120)
+    srcs = [os.path.join("runtime", "orin_runtime.c")]
+    if llvm:
+        srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
+    rc, _, err = sh(cc + [c] + srcs + ["-o", exe], 120)
     if rc != 0:
         return ("cc-fail", err.decode("utf-8", "replace")[:300])
     rc, out, _ = sh([os.path.join(ROOT, exe)], 10)
@@ -63,19 +76,20 @@ def main():
     ap.add_argument("--cc", default="cc")
     ap.add_argument("--filter", default="")
     ap.add_argument("--sanitize", action="store_true")
-    ap.add_argument("--mode", choices=["backends", "opt"], default="backends")
+    ap.add_argument("--mode", choices=["backends", "opt", "llvm", "builtins"], default="backends")
     args = ap.parse_args()
     if not os.path.isabs(args.orinc):
         args.orinc = os.path.join(ROOT, args.orinc)
     os.makedirs(os.path.join(ROOT, OUT), exist_ok=True)
-    suites = ("run", os.path.join("next", "run")) if args.mode == "opt" else ("run",)
+    suites = ("run", os.path.join("next", "run")) if args.mode in ("opt", "llvm", "builtins") else ("run",)
     tests = [t for t in entries(suites) if args.filter in t[0]]
-    old_flags = ["--no-opt"] if args.mode == "opt" else ["--legacy-codegen"]
+    old_flags = {"opt": ["--no-opt"], "llvm": ["--backend=llvm"], "builtins": ["--c-builtins"]}.get(args.mode, ["--legacy-codegen"])
+    old_is_llvm = args.mode == "llvm"
 
     def work(t):
         name, entry = t
         a = build_and_run(args, name, entry, "new", [])
-        b = build_and_run(args, name, entry, "old", old_flags)
+        b = build_and_run(args, name, entry, "old", old_flags, old_is_llvm)
         return name, a, b
 
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:

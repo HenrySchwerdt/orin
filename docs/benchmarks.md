@@ -234,3 +234,65 @@ Generated C size of the compiler: 2,014,725 bytes with `--no-opt`, 2,071,261 wit
 temporaries and release edges), and the optimisation does not change the benchmark programs' C size noticeably.
 In the compiler's own run the optimised compiler is not measurably faster as a program yet (it has few owned-parameter
 patterns); the gain is asymptotic (state-threading code) rather than constant-factor.
+
+
+## LLVM IR backend (ADR-0006): C backend vs LLVM backend vs Go vs C
+
+Method: `python3 tools/bench.py` (5 runs, median after 1 warm-up), 4-core 2.8 GHz Xeon VM, Ubuntu clang 18.1.3
+(`clang -O2 -w` on the emitted `.ll` plus `runtime/orin_runtime.c` and the shim `runtime/orin_runtime_llvm.c`),
+gcc 13.3 for the C backend and the C reference, Go 1.24.7. The VM was noisy (min-max ranges of 20-40% within one
+cell), so differences below roughly 25% are not significant. Checksums are identical across all columns.
+
+| benchmark | Orin (C backend) | Orin (LLVM backend) | Go | C | Orin-C/Go | Orin-C/C | Orin-LLVM/Go | Orin-LLVM/C |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bintrees | 1.564 (1.356-1.604) | 1.318 (0.999-1.371) | 3.552 (3.244-3.934) | 0.816 (0.779-0.897) | 0.44x | 1.92x | 0.37x | 1.61x |
+| fib | 0.504 (0.358-0.514) | 1.026 (0.880-1.231) | 0.789 (0.759-0.900) | 0.483 (0.427-0.513) | 0.64x | 1.04x | 1.30x | 2.12x |
+| qsort_func | 0.571 (0.436-0.636) | 0.623 (0.586-0.677) | 1.105 (0.913-1.365) | 0.467 (0.376-0.520) | 0.52x | 1.22x | 0.56x | 1.33x |
+| qsort_inplace | 0.431 (0.312-0.484) | 0.283 (0.218-0.367) | 0.328 (0.268-0.447) | 0.263 (0.209-0.328) | 1.31x | 1.64x | 0.86x | 1.07x |
+| sieve | 0.570 (0.536-0.634) | 0.465 (0.402-0.492) | 1.288 (0.948-1.540) | 0.457 (0.379-0.572) | 0.44x | 1.25x | 0.36x | 1.02x |
+| strings | 0.303 (0.244-0.387) | 0.373 (0.306-0.443) | 0.174 (0.125-0.280) | 0.186 (0.113-0.239) | 1.74x | 1.63x | 2.14x | 2.01x |
+| wordfreq | 0.436 (0.376-0.496) | 0.254 (0.244-0.436) | 0.207 (0.171-0.389) | 0.213 (0.139-0.223) | 2.11x | 2.04x | 1.23x | 1.19x |
+
+Notes.
+- The LLVM backend emits the hot runtime operations (retain/release, make_unique fast path, field/array slot
+  access, array push, checked arithmetic via `llvm.*.with.overflow`) as `alwaysinline` IR, so they are optimised
+  together with the program; everything else calls the C runtime. It therefore does **not** maintain the
+  `ORIN_STATS` retain/release/cow-in-place counters (allocation counters, which live in the C runtime, still work).
+- LLVM wins where the code is dominated by inlinable field/array/RC traffic (bintrees, qsort_inplace, sieve,
+  wordfreq) and loses on `fib` (about 2x slower than gcc: gcc inlines the recursion two levels deep, LLVM keeps
+  the checked-add after both calls; the IR itself is optimal, the sub overflow check is proven away) and `strings`
+  (dominated by runtime calls, no inlining across the C/IR boundary without LTO). Closing these is a runtime-in-IR
+  (spec 19) / LTO matter, not an emitter one.
+- Binary size: 36 KiB (30 KiB stripped) vs 32 (26) for the C backend. The compiler built through LLVM
+  (`orin compile compiler/main.or --backend=llvm`, 8.1 MB of `.ll`, `clang -O2` about 20 s) is 729 KiB vs 1056 KiB
+  and compiles `compiler/main.or` in 1.2-1.6 s, the same as the C-built one within noise (1.5 s). It reproduces the
+  C backend's `stage3.c` byte for byte, and its own `--backend=llvm` output is byte-identical to the `.ll` it was
+  built from (fixed point).
+
+## R1: library string/number functions in Orin (spec 19, ADR-0013)
+
+What changed: `split`, `trim`, `indexOf`, `includes`, `startsWith`, `endsWith`, `parseInt`,
+`int/usize/bool.toString()` and `string[].join` are no longer runtime C calls but Orin functions of the std
+prelude (`std/`), compiled with every program (only the reachable ones are emitted). `orin_str_char_code_at` became
+`static inline`. Method: `tools/bench.py` with the pre-change `orin2` (copy of the binary built before R1) against the
+R1 `orin2`, same machine, back to back; the machine was shared and busy (load average 6-16 on 4 vCPUs, other
+jobs running), so only differences well above the Go/C columns' own drift are meaningful.
+
+| benchmark | before Orin median (s) | after Orin median (s) | note |
+|---|---:|---:|---|
+| strings (9 runs) | 0.164 (0.151-0.195) | 0.178 (0.154-0.217) | Go column of the same two runs: 0.131 vs 0.164 |
+| strings (15 runs, repeated twice) | 0.161 / 0.165 | 0.168 / 0.177 | +4% to +7%: within the 15% bar, consistent sign |
+| wordfreq (9 runs) | 0.233 (0.209-0.296) | 0.175 (0.169-0.199) | faster; `toString` of small ints no longer allocates (immortal one-char strings) |
+| selfcompile: `orin2` built with `--c-builtins` vs with the prelude, 14 runs each | 1.082 (1.004-1.467) | 1.163 (0.981-1.362) | +7% median, ranges overlap; same workload, the compiler itself uses these functions heavily |
+
+Counters (deterministic): strings: allocations 2,500,013 -> 2,500,003, `cow_inplace` 0 -> 500,001 (appends into
+the freshly built `join`/`toString` strings are in place), `string_grows` 20 -> 40, peak live bytes 39.9 MB -> 42.4 MB
+(`join` grows its result geometrically instead of allocating the exact size once, so it keeps spare capacity);
+wordfreq: allocations 2,006,031 -> 2,003,865, peak live bytes unchanged. Peak RSS unchanged (strings 46.2 -> 45.9
+MiB, wordfreq 2.4 -> 2.2 MiB). The generated C of the compiler grows from 2,834,084 to 2,850,660 bytes.
+
+Reading: no regression above 15%. The only plausible slowdown (strings, a few percent) comes from `join` (repeated
+append instead of one exact-size allocation) and from `int.toString()` going through a per-digit `fromCharCode` +
+append instead of one `snprintf`; `split` and `indexOf` use a first-byte scan in Orin where C used `memmem`, which
+did not show up in these workloads (short separators). Likely follow-ups: a runtime primitive to build a string
+from a byte array (would let `join`/`toString` allocate once), and inlining of `substring`/`fromCharCode`.

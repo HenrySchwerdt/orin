@@ -320,12 +320,6 @@ int64_t orin_str_eq(OrinObj *a, OrinObj *b) {
     return x->len == y->len && memcmp(x->data, y->data, x->len) == 0;
 }
 
-int64_t orin_str_char_code_at(OrinObj *s, uint64_t i) {
-    OrinString *x = (OrinString *)s;
-    if (i >= x->len) orin_trap("charCodeAt index out of range");
-    return (unsigned char)x->data[i];
-}
-
 static OrinObj *char_string(unsigned c) {
     static OrinObj *tbl[256];
     if (!tbl[c]) {

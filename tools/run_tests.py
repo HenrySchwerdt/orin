@@ -3,6 +3,7 @@
 
 Usage: python3 tools/run_tests.py --orinc <compiler> [--cc cc] [--filter substr]
                                   [--jobs N] [--sanitize] [--suite default|next|all]
+                                  [--backend c|llvm]
 
 Suites: `default` = tests/run + tests/errors (the Orin-B contract, every compiler stage);
 `next` = tests/next/run + tests/next/errors (language beyond Orin-B, self-hosted compiler only);
@@ -71,7 +72,16 @@ def run_cmd(cmd, timeout, env=None, stdin_data=None):
 
 def compile_orin(args, entry, c_out):
     rel = os.path.relpath(entry, ROOT)
-    return run_cmd([args.orinc, "compile", rel, "-o", c_out], COMPILE_TIMEOUT)
+    extra = ["--backend=llvm"] if args.backend == "llvm" else []
+    return run_cmd([args.orinc, "compile", rel, "-o", c_out] + extra, COMPILE_TIMEOUT)
+
+
+def runtime_sources(backend):
+    """C runtime sources to link; the LLVM backend also needs the out-of-line shim."""
+    srcs = [os.path.join("runtime", "orin_runtime.c")]
+    if backend == "llvm":
+        srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
+    return srcs
 
 
 def run_test(args, label, test):
@@ -82,7 +92,7 @@ def run_test(args, label, test):
     safe = name.replace(os.sep, "_")
     outdir = os.path.join(BUILD, label)
     os.makedirs(os.path.join(ROOT, outdir), exist_ok=True)
-    c_out = os.path.join(outdir, safe + ".c")
+    c_out = os.path.join(outdir, safe + (".ll" if args.backend == "llvm" else ".c"))
     exe = os.path.join(outdir, safe + ".exe")
     hdr = first_line(entry)
 
@@ -116,10 +126,13 @@ def run_test(args, label, test):
     if rc != 0:
         return tag, False, "compile failed (exit %s); stderr head:\n%s" % (rc, head(err))
 
-    cc = [args.cc, "-O1", "-w", "-I", "runtime"]
+    if args.backend == "llvm":
+        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime"]
+    else:
+        cc = [args.cc, "-O1", "-w", "-I", "runtime"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    cc += [c_out, os.path.join("runtime", "orin_runtime.c"), "-o", exe]
+    cc += [c_out] + runtime_sources(args.backend) + ["-o", exe]
     rc, _, err = run_cmd(cc, COMPILE_TIMEOUT)
     if rc != 0:
         return tag, False, "C compilation failed (exit %s); stderr head:\n%s" % (rc, head(err))
@@ -159,6 +172,8 @@ def main():
     ap.add_argument("--sanitize", action="store_true")
     ap.add_argument("--suite", choices=["default", "next", "all"], default="default",
                     help="default: tests/run + tests/errors; next: tests/next/*; all: both")
+    ap.add_argument("--backend", choices=["c", "llvm"], default="c",
+                    help="c: emit C (default); llvm: emit LLVM IR and build with clang")
     args = ap.parse_args()
 
     if not os.path.isabs(args.orinc) and os.sep in args.orinc:

@@ -48,6 +48,47 @@ Documentation MUST state for each runtime function which layer it is in and whic
   `runtime/orin_runtime.c` (split, trim, indexOf/includes, parseInt, int/usize→string, join,
   slice/concat helpers) into Orin modules compiled with every program; keep C versions only where
   Stage 0 needs them. Differential tests old vs new; benchmarks.
+  **Status: done (2026-10-13).** The implementation lives in `std/` (repo root; embedded into the
+  compiler by `tools/embed_prelude.py`, loaded implicitly via the general "prelude roots" mechanism,
+  see docs/architecture.md "Preludes"). The checker keeps the same surface API; lowering maps the
+  moved built-ins to calls of the prelude functions; unreachable prelude functions are pruned from the
+  emitted C. The C versions stay in `runtime/orin_runtime.c` because Stage 0 (frozen) and
+  `--c-builtins` (the differential-test path, `tools/diff_backends.py --mode builtins`) still use
+  them. Slice/concat/get of arrays were **not** moved: they are generic over the element type, and
+  the prelude has no way to be instantiated per element type without generics-in-prelude (checker
+  instance requests) or the R3 core dialect (raw slot copies). `substring` stays in C as a primitive
+  (it defines the bounds trap and allocates). Measured effect: docs/benchmarks.md "R1".
+
+### Inventory (state after R1)
+
+Layer = the layer the function belongs to in the target design (section 2). Assurance labels follow
+spec 07: *safe Orin* (language guarantees, MIR-verified), *tested only*, *trusted* (C).
+
+| Function (runtime/orin_runtime.{h,c}) | Layer | Status after R1 |
+|---|---|---|
+| `orin_str_index_of`, `orin_str_includes` | L2 | moved: `std/strings.or` `strIndexOf`, `strIncludes` (naive scan with first-byte filter instead of `memmem`); C copy kept for Stage 0 / `--c-builtins` |
+| `orin_str_starts_with`, `orin_str_ends_with` | L2 | moved: `strStartsWith`, `strEndsWith`; C copy kept |
+| `orin_str_split` | L2 | moved: `strSplit` (empty separator still traps `split with empty separator`, status 101, via `console.error` + `process.exit(101)`); C copy kept |
+| `orin_str_trim` | L2 | moved: `strTrim`; C copy kept |
+| `orin_array_join` | L2 | moved: `strJoin` (grows the result by repeated in-place append instead of a pre-sized buffer); C copy kept |
+| `orin_parse_int` | L2 | moved: `std/numbers.or` `strParseInt` (overflow checks done by hand; same accepted syntax); C copy kept |
+| `orin_int_to_string`, `orin_usize_to_string`, `orin_bool_to_string` | L2 | moved: `intToString`, `usizeToString`, `boolToString` (no `snprintf`); C copies kept |
+| `orin_str_char_code_at` | L1 primitive | stays in C; now `static inline` in the header (the prelude loops over it) |
+| `orin_str_char_at`, `orin_str_substring`, `orin_string_from_char_code` | L1 primitive | stay in C: allocation, bounds traps, shared 1-byte immortals |
+| `orin_str_new`, `orin_str_concat`, `orin_str_append`, `orin_str_eq`, `orin_str_len`, `orin_str_data` | L1 | stay in C until R3 (object model, allocation, in-place append) |
+| `orin_array_get`, `orin_array_slice`, `orin_array_concat` | L1 / L2 (generic) | stay in C: generic over the element type (see above); candidates for the array-API prelude or R3 |
+| `orin_array_new`, `orin_array_push(_grow)`, `orin_array_pop`, `orin_array_len/at/slot_ptr` | L1 | stay in C until R3 |
+| `orin_struct_*`, `orin_nullary`, `orin_variant1`, `orin_opt_unwrap`, `orin_res_unwrap(_err)`, `orin_tag` | L1 | stay in C until R3 |
+| `orin_retain/dup/release/destroy`, `orin_make_unique(_slow)`, freelists, `orin_live_count`, `OrinStats` | L1 | stay in C until R3 |
+| checked arithmetic and conversions (`orin_add_i` ... `orin_usize_to_int`) | L1 (codegen intrinsics) | stay in C (inline), R3 |
+| `orin_trap`, `orin_init`, `orin_flush` | L0 | stay in C (R2 carves them into `platform/`) |
+| `orin_console_log/error`, `orin_fs_read_file/write_file/exists`, `orin_process_args/exit`, `orin_runtime_io.h` (`std:io`) | L0 | stay in C (R2) |
+
+Labels: the prelude code is *safe Orin* (type-checked, MIR ownership-verified: `tools/verify_all.py`
+covers all of it) with functional behaviour *tested only* (differential tests against the C versions
+over all run suites, ASan/UBSan, plus `tests/run/std_prelude_edges.or`); everything still in C is
+*trusted/tested only*. Observable differences: none intended; the trap for `split` with an empty
+separator is raised through `process.exit(101)` after printing the same message.
 - **R2 — carve out L0:** split the remaining C into `platform/` (the closed list) and the object
   model; write L0 contracts.
 - **R3 — core dialect:** add core intrinsics (raw address type, load/store, size_of, header

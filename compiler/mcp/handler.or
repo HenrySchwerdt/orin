@@ -1,0 +1,99 @@
+// MCP (protocol revision 2025-06-18) JSON-RPC handling as pure functions: one decoded message in,
+// zero or more messages out. Transport (newline-delimited JSON on stdio) is in server.or.
+
+import { Json, JNull, JNum, JStr, JArr, JObj, JBool, jField, getField, getStr, getPath, parseJson } from "../json";
+import { McpState } from "./util";
+import { toolList, callTool } from "./tools";
+
+export const PROTOCOL_VERSION: string = "2025-06-18";
+
+export type McpStep = { st: McpState; out: Json[]; };
+
+function respond(id: Json, result: Json): Json {
+  return JObj([jField("jsonrpc", JStr("2.0")), jField("id", id), jField("result", result)]);
+}
+
+function respondError(id: Json, code: int, message: string): Json {
+  return JObj([
+    jField("jsonrpc", JStr("2.0")), jField("id", id),
+    jField("error", JObj([jField("code", JNum(code)), jField("message", JStr(message))]))
+  ]);
+}
+
+function step(st: McpState, out: Json[]): McpStep {
+  return McpStep { st: st, out: out };
+}
+
+function quiet(st: McpState): McpStep {
+  const out: Json[] = [];
+  return McpStep { st: st, out: out };
+}
+
+export function handleText(st: McpState, body: string): McpStep {
+  const r = parseJson(body);
+  if (r.isErr()) {
+    return step(st, [respondError(JNull, -32700, "parse error: " + r.unwrapErr())]);
+  }
+  return handle(st, r.unwrap());
+}
+
+function toolResult(text: string, isError: bool): Json {
+  return JObj([
+    jField("content", JArr([JObj([jField("type", JStr("text")), jField("text", JStr(text))])])),
+    jField("isError", JBool(isError))
+  ]);
+}
+
+export function handle(st: McpState, msg: Json): McpStep {
+  const method = getStr(msg, "method");
+  if (method.isNone()) {
+    return quiet(st);          // response from the client or garbage: we send no requests
+  }
+  const idf = getField(msg, "id");
+  if (idf.isNone()) {
+    // Notifications (notifications/initialized, notifications/cancelled, ...): no response.
+    return quiet(st);
+  }
+  const id = idf.unwrap();
+  const m = method.unwrap();
+  if (m == "initialize") {
+    const result = JObj([
+      jField("protocolVersion", JStr(PROTOCOL_VERSION)),
+      jField("capabilities", JObj([jField("tools", JObj([jField("listChanged", JBool(false))]))])),
+      jField("serverInfo", JObj([jField("name", JStr("orin")), jField("version", JStr("0.1.0"))])),
+      jField("instructions", JStr("Orin compiler tools. check: diagnostics (pass sinceRevision for deltas); inspect: signatures/modules/built-in API without source; edit: validated rename (dry run unless apply); test/build need --allow-exec."))
+    ]);
+    return step(McpState { ...st, inited: true }, [respond(id, result)]);
+  }
+  if (m == "ping") {
+    return step(st, [respond(id, JObj([]))]);
+  }
+  if (!st.inited) {
+    return step(st, [respondError(id, -32002, "server not initialized")]);
+  }
+  if (m == "tools/list") {
+    return step(st, [respond(id, JObj([jField("tools", JArr(toolList()))]))]);
+  }
+  if (m == "tools/call") {
+    const name = getPath(msg, ["params", "name"]);
+    if (name.isNone()) {
+      return step(st, [respondError(id, -32602, "missing params.name")]);
+    }
+    const n = getStr(getPath(msg, ["params"]).unwrap(), "name");
+    if (n.isNone()) {
+      return step(st, [respondError(id, -32602, "params.name must be a string")]);
+    }
+    let args: Json = JObj([]);
+    const a = getPath(msg, ["params", "arguments"]);
+    if (a.isSome()) {
+      args = a.unwrap();
+    }
+    const r = callTool(st, n.unwrap(), args);
+    if (r.isNone()) {
+      return step(st, [respondError(id, -32602, "unknown tool: " + n.unwrap())]);
+    }
+    const o = r.unwrap();
+    return step(o.st, [respond(id, toolResult(o.text, o.err))]);
+  }
+  return step(st, [respondError(id, -32601, "method not found: " + m)]);
+}
