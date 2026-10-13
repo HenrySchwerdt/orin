@@ -2,11 +2,15 @@
 """Differential test of the two Stage 1 backends: for every tests/run program, compile with the
 MIR backend (default) and with `--legacy-codegen`, build and run both, compare stdout + exit code.
 
+With `--mode builtins` it compares the default pipeline (library built-ins implemented by the Orin
+std prelude, spec 19 R1) against `--c-builtins` (the C runtime implementations) over tests/run and
+tests/next/run (works with --sanitize too).
+
 With `--mode opt` it instead compares the optimised MIR pipeline (default) against `--no-opt`
 (ADR-0010) over tests/run and tests/next/run.
 
 Usage: python3 tools/diff_backends.py [--orinc build/bootstrap/orin2] [--cc cc] [--filter s]
-                                      [--sanitize] [--mode backends|opt]
+                                      [--sanitize] [--mode backends|opt|builtins]
 """
 import argparse
 import os
@@ -63,14 +67,14 @@ def main():
     ap.add_argument("--cc", default="cc")
     ap.add_argument("--filter", default="")
     ap.add_argument("--sanitize", action="store_true")
-    ap.add_argument("--mode", choices=["backends", "opt"], default="backends")
+    ap.add_argument("--mode", choices=["backends", "opt", "builtins"], default="backends")
     args = ap.parse_args()
     if not os.path.isabs(args.orinc):
         args.orinc = os.path.join(ROOT, args.orinc)
     os.makedirs(os.path.join(ROOT, OUT), exist_ok=True)
-    suites = ("run", os.path.join("next", "run")) if args.mode == "opt" else ("run",)
+    suites = ("run", os.path.join("next", "run")) if args.mode in ("opt", "builtins") else ("run",)
     tests = [t for t in entries(suites) if args.filter in t[0]]
-    old_flags = ["--no-opt"] if args.mode == "opt" else ["--legacy-codegen"]
+    old_flags = {"opt": ["--no-opt"], "builtins": ["--c-builtins"]}.get(args.mode, ["--legacy-codegen"])
 
     def work(t):
         name, entry = t

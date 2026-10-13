@@ -13,6 +13,7 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `bootstrap/` | **Stage 0** compiler `orinb` in Rust (temporary). Orin-B → GNU C. |
 | `runtime/` | C runtime `orin_runtime.{h,c}` shared by all stages' generated code. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
+| `std/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
 | `tests/next/` | Same formats (`run/`, `errors/`) for language beyond Orin-B; self-hosted compiler only (`--suite next`). |
@@ -57,11 +58,52 @@ MIR/OIM memory IR + independent verifier between HIR and codegen.
 - Checked arithmetic uses `__builtin_*_overflow`; traps call `orin_trap(msg)` → stderr
   `trap: msg`, exit 101.
 
+## Preludes (std in Orin, spec 19 R1)
+
+A **prelude** is a directory of ordinary Orin sources that the self-hosted compiler loads implicitly
+into every program, so library logic can be written in Orin instead of C. Mechanism (all deterministic,
+so `stage2.c == stage3.c` still holds):
+
+- **Source and embedding.** `std/` (repo root) holds the std prelude: `module.or` (entry, lists the
+  rules) + `strings.or`, `numbers.or`. The compiler is one native binary and cannot find files next to
+  itself, so `tools/embed_prelude.py` turns each prelude directory into a generated Orin file
+  (`compiler/loader/embedded_std.or`, a function returning `SourceFile[]`). Run the script after
+  editing `std/`; `tools/bootstrap.sh` fails on a stale file (`--check`). Stage 0 never sees the prelude
+  (it only compiles `compiler/`, where the embedded file is just string literals).
+- **Prelude roots (the general mechanism).** `compiler/loader/prelude.or` has `preludeRoots()`, a list
+  of `PreludeRoot { entry, files }`. `loadWithRoots` (loader.or) serves every root's files from memory under
+  virtual paths `$<name>/...` and adds an empty import of each root's `entry` to the program's entry
+  file, so the prelude units come first in the topologically sorted unit list. Unit names are the
+  virtual path without `.or` (`$std/strings`), so qualified function names are stable
+  (`$std/strings.strSplit`). **The leading `$` marks prelude code** everywhere downstream. To add another
+  prelude (e.g. closures + the array API): put the sources in their own directory, add a row to
+  `PRELUDES` in `tools/embed_prelude.py`, add one `PreludeRoot` in `preludeRoots()`; nothing else in the
+  loader changes. (Separate directory, separate embedded file, one line each in two shared lists: the two
+  preludes merge without touching each other's files.)
+- **Lowering.** The checker is untouched: `s.split(x)`, `parseInt(s)`, `n.toString()` ... still check to
+  `XBuiltin` with the same signatures. `compiler/lower/prelude.or` maps the moved built-ins (table
+  `preludeSlot` + `preludeNames`) to the prelude function of that name; `exprBuiltin` (lower/body.or)
+  then lowers them like an `XCall`. If the program has no such function (`--c-builtins`) the built-in is
+  emitted as before, as a runtime C call. The legacy HIR -> C backend never uses the prelude.
+- **No bloat.** `compiler/opt/prune.or` (run after the optimiser and the verifier, just before C emission)
+  drops prelude functions (names starting with `$`) that are not reachable from `main` or from the
+  program's own functions, renumbering calls. `orin mir` / `orin verify` do not prune, so
+  `tools/verify_all.py` verifies the whole prelude. A new MIR instruction that names a function must be
+  added to `callees`/`renumber` there.
+- **Flags.** `--c-builtins` keeps the C runtime path (differential testing:
+  `python3 tools/diff_backends.py --mode builtins`); `--legacy-codegen` implies it; `orin check` loads no
+  prelude.
+- **Rules for prelude code** (also in `std/module.or`): only the primitives the C runtime keeps
+  (`length`, `charCodeAt`, `charAt`, `substring`, `String.fromCharCode`, `+`, array `push`/index/`length`,
+  console, `process.exit`); never call a built-in that is itself implemented in the prelude (the lowering
+  would make it a recursive call); keep within what the self-hosted compiler accepts.
+
 ## Safety status (honest labelling, spec 07)
 
 | Property | Status |
 |---|---|
 | Bounds-checked indexing, checked arithmetic | Implemented in runtime/codegen; tested only |
+| Library string/number functions (R1) | Safe Orin in `std/` (checked by the compiler, verified by the MIR verifier, `tools/verify_all.py`); functional behaviour tested only, differentially against the C implementations |
 | RC never under-counts (no UAF/double free) | Generated code: tested + ASan/UBSan on all suites and on the compiler self-compiling. Abstract machine: **proven** in Lean (`formal/`, theorem `run_safe`; rc ≥ owners invariant) — see docs/formal.md |
 | Value semantics / COW | Abstract machine: **proven** for `makeUnique; store` (`makeUnique_store_cow`); generated code: tested |
 | MIR ownership discipline | Independent verifier implemented (`compiler/verify`, docs/mir.md); lowering to MIR in progress; verifier itself not mechanically verified |
