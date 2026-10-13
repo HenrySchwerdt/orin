@@ -73,6 +73,13 @@ cp -r "$SHOP" "$T/shop6"
 printf '\n[modules.users\n' >> "$T/shop6/orin.toml"
 $ORIN2 check "$T/shop6" 2>&1 | grep -q 'orin.toml:[0-9]*:[0-9]*: error\[E0500\]' && ok "E0500 manifest syntax error with line" || bad "E0500 manifest syntax error"
 
+# 4b. `[contracts] strict = true` (ADR-0028) turns the strict contract-coverage warnings on, never an error
+cp -r "$SHOP" "$T/shop7"
+$ORIN2 check "$T/shop7" 2>&1 | grep -q 'warning\[W047' && bad "strict warnings are off without [contracts] strict" || ok "no strict warnings by default"
+printf '\n[contracts]\nstrict = true\n' >> "$T/shop7/orin.toml"
+$ORIN2 check "$T/shop7" 2>&1 | grep -q 'warning\[W047' && ok "[contracts] strict = true enables strict warnings" || bad "[contracts] strict = true"
+$ORIN2 check "$T/shop7" > /dev/null 2>&1 && ok "strict warnings do not fail the check" || bad "strict warnings must not fail"
+
 # 5. launcher: orin build / orin run with a package directory
 D="$T/dist"
 mkdir -p "$D/bin" "$D/libexec" "$D/lib/orin"
