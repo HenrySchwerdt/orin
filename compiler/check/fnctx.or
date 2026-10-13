@@ -1,0 +1,113 @@
+// Per-function checking context: locals, scope stack and loop stack. Functions take a context
+// and return the updated one (values are copy-on-write).
+
+import { Diagnostic, diag } from "../diag";
+import { Ident } from "../syntax";
+import { Type, Local } from "../hir";
+import { FuncInfo } from "./env";
+
+export type FnCtx = {
+  unit: usize;
+  ret: Type;
+  locals: Local[];
+  names: string[];     // flat scope stack: visible local names ...
+  ids: usize[];        // ... and their local ids
+  marks: usize[];      // start index (into names/ids) of each open scope
+  loops: bool[];       // one flag per enclosing loop: has a `break` targeting it been seen?
+};
+
+export type LocalOut = { fx: FnCtx; id: usize; };
+export type LoopOut = { fx: FnCtx; broke: bool; };
+
+export function newFnCtx(f: FuncInfo): FnCtx {
+  let names: string[] = [];
+  let ids: usize[] = [];
+  let i: usize = 0;
+  for (const l of f.paramLocals) {
+    names.push(l.name);
+    ids.push(i);
+    i += 1;
+  }
+  const marks: usize[] = [0];
+  const loops: bool[] = [];
+  return FnCtx { unit: f.unit, ret: f.ret, locals: f.paramLocals, names: names, ids: ids, marks: marks, loops: loops };
+}
+
+export function pushScope(fx: FnCtx): FnCtx {
+  let f = fx;
+  f.marks.push(f.names.length);
+  return f;
+}
+
+export function popScope(fx: FnCtx): FnCtx {
+  let f = fx;
+  const m = f.marks.pop();
+  const k = m.unwrapOr(0);
+  while (f.names.length > k) {
+    f.names.pop();
+    f.ids.pop();
+  }
+  return f;
+}
+
+export function lookupLocal(fx: FnCtx, name: string): Option<usize> {
+  let i = fx.names.length;
+  while (i > 0) {
+    i -= 1;
+    if (fx.names[i] == name) {
+      return Some(fx.ids[i]);
+    }
+  }
+  return None;
+}
+
+export function newLocal(fx: FnCtx, name: string, ty: Type, mutable: bool): LocalOut {
+  let f = fx;
+  const id = f.locals.length;
+  f.locals.push(Local { name: name, ty: ty, mutable: mutable });
+  return LocalOut { fx: f, id: id };
+}
+
+// True if `name` is already declared in the innermost scope.
+export function declaredInScope(fx: FnCtx, name: string): bool {
+  const start = fx.marks.length > 0 ? fx.marks[fx.marks.length - 1] : 0;
+  let i = fx.names.length;
+  while (i > start) {
+    i -= 1;
+    if (fx.names[i] == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function declare(fx: FnCtx, name: Ident, id: usize): Result<FnCtx, Diagnostic> {
+  if (declaredInScope(fx, name.name)) {
+    return Err(diag("E0304", name.span, "`" + name.name + "` is already declared in this block"));
+  }
+  let f = fx;
+  f.names.push(name.name);
+  f.ids.push(id);
+  return Ok(f);
+}
+
+export function pushLoop(fx: FnCtx): FnCtx {
+  let f = fx;
+  f.loops.push(false);
+  return f;
+}
+
+export function popLoop(fx: FnCtx): LoopOut {
+  let f = fx;
+  const b = f.loops.pop();
+  return LoopOut { fx: f, broke: b.unwrapOr(false) };
+}
+
+// Records a `break` for the innermost loop; the caller has checked that a loop exists.
+export function markBreak(fx: FnCtx): FnCtx {
+  let f = fx;
+  if (f.loops.length > 0) {
+    f.loops[f.loops.length - 1] = true;
+  }
+  return f;
+}

@@ -1,0 +1,145 @@
+// Match patterns. Port of `FnCx::pattern` from bootstrap/src/checker/mod.rs.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Ident, Pattern, PWildcard, PIdent, PVariant, PInt, PStr, PBool } from "../syntax";
+import { Type, VariantDef, HPattern } from "../hir";
+import { Env, showType, mismatch, isInt, isUsize, isString, isBool } from "./env";
+import { FnCtx, newLocal, declare } from "./fnctx";
+
+export type PatOut = { fx: FnCtx; pat: HPattern; covered: bool[]; wild: bool; };
+
+function findVariant(vs: VariantDef[], name: string): Option<usize> {
+  let i: usize = 0;
+  for (const v of vs) {
+    if (v.name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function markCovered(covered: bool[], idx: usize): bool[] {
+  let c = covered;
+  c[idx] = true;
+  return c;
+}
+
+// Literal pattern of the wrong type: E0402 on a variant scrutinee, else E0400.
+function literalMismatch(env: Env, sp: Span, sty: Type, found: Type, isVariantScrut: bool): Diagnostic {
+  if (isVariantScrut) {
+    return diag("E0402", sp, "literal pattern on a variant scrutinee");
+  }
+  return mismatch(env, sp, sty, found);
+}
+
+export function checkPattern(
+  env: Env,
+  fx: FnCtx,
+  p: Pattern,
+  sty: Type,
+  variants: Option<VariantDef[]>,
+  covered: bool[],
+  wild: bool
+): Result<PatOut, Diagnostic> {
+  const isVariantScrut = variants.isSome();
+  return match (p.kind) {
+    PWildcard => Ok(PatOut { fx: fx, pat: HPWildcard, covered: covered, wild: true }),
+    PIdent(id) => {
+      if (!isVariantScrut) {
+        return Err(diag("E0402", p.span, "variant pattern used on a scalar scrutinee"));
+      }
+      const vs = variants.unwrap();
+      const idxo = findVariant(vs, id.name);
+      if (idxo.isNone()) {
+        return Err(diag("E0405", id.span, "`" + id.name + "` is not a variant of `" + showType(env, sty) + "`"));
+      }
+      const idx = idxo.unwrap();
+      if (vs[idx].payload.length > 0) {
+        return Err(diag(
+          "E0402",
+          p.span,
+          "variant `" + id.name + "` has " + vs[idx].payload.length.toString() + " field(s); pattern binds none"
+        ));
+      }
+      const none: Option<usize>[] = [];
+      return Ok(PatOut { fx: fx, pat: HPVariant(idx, none), covered: markCovered(covered, idx), wild: wild });
+    },
+    PVariant(name, args) => checkVariantPattern(env, fx, p, name, args, sty, variants, covered, wild),
+    PInt(n) => {
+      if (isInt(sty)) {
+        return Ok(PatOut { fx: fx, pat: HPInt(n), covered: covered, wild: wild });
+      }
+      if (isUsize(sty)) {
+        if (n >= 0) {
+          return Ok(PatOut { fx: fx, pat: HPInt(n), covered: covered, wild: wild });
+        }
+        return Err(diag("E0400", p.span, "negative integer literal cannot have type `usize`"));
+      }
+      return Err(literalMismatch(env, p.span, sty, TyInt, isVariantScrut));
+    },
+    PStr(s) => {
+      if (isString(sty)) {
+        return Ok(PatOut { fx: fx, pat: HPStr(s), covered: covered, wild: wild });
+      }
+      return Err(literalMismatch(env, p.span, sty, TyString, isVariantScrut));
+    },
+    PBool(b) => {
+      if (isBool(sty)) {
+        return Ok(PatOut { fx: fx, pat: HPBool(b), covered: covered, wild: wild });
+      }
+      return Err(literalMismatch(env, p.span, sty, TyBool, isVariantScrut));
+    }
+  };
+}
+
+function checkVariantPattern(
+  env: Env,
+  fx0: FnCtx,
+  p: Pattern,
+  name: Ident,
+  args: Pattern[],
+  sty: Type,
+  variants: Option<VariantDef[]>,
+  covered: bool[],
+  wild: bool
+): Result<PatOut, Diagnostic> {
+  if (variants.isNone()) {
+    return Err(diag("E0402", p.span, "variant pattern used on a scalar scrutinee"));
+  }
+  const vs = variants.unwrap();
+  const idxo = findVariant(vs, name.name);
+  if (idxo.isNone()) {
+    return Err(diag("E0405", name.span, "`" + name.name + "` is not a variant of `" + showType(env, sty) + "`"));
+  }
+  const idx = idxo.unwrap();
+  const payload = vs[idx].payload;
+  if (payload.length != args.length) {
+    return Err(diag(
+      "E0402",
+      p.span,
+      "variant `" + name.name + "` has " + payload.length.toString() + " field(s), pattern has "
+        + args.length.toString()
+    ));
+  }
+  let fx = fx0;
+  let bindings: Option<usize>[] = [];
+  let i: usize = 0;
+  for (const sub of args) {
+    match (sub.kind) {
+      PWildcard => {
+        bindings.push(None);
+      },
+      PIdent(b) => {
+        const nl = newLocal(fx, b.name, payload[i], false);
+        fx = declare(nl.fx, b, nl.id)?;
+        bindings.push(Some(nl.id));
+      },
+      _ => {
+        return Err(diag("E0402", sub.span, "sub-patterns must be a binding name or `_` in Orin-B"));
+      }
+    }
+    i += 1;
+  }
+  return Ok(PatOut { fx: fx, pat: HPVariant(idx, bindings), covered: markCovered(covered, idx), wild: wild });
+}

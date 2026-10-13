@@ -1,0 +1,259 @@
+// Phase 1: collection of declarations, imports and re-exports.
+// Port of `Checker::collect` (bootstrap/src/checker/mod.rs). Ids are dense and assigned in unit
+// order (dependencies first), then declaration order.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantDecl } from "../syntax";
+import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
+import { LoadedProgram, ImportTarget, ImportUnit, ImportStd, StdModule, StdFs, StdProcess } from "../loader";
+import {
+  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, VFunc, VConst, VVariant, VStd, TypeBind, ValBind,
+  Names, UnitInfo, AliasInfo, FuncInfo, ConstInfo, ConstLit, LitInt, Env, RecordSrc, UnionSrc,
+  typeEntEq, valEntEq, findType, findVal, emptyNames, isBuiltinTypeName
+} from "./env";
+
+export type Collected = {
+  env: Env;
+  recordSrc: RecordSrc[];
+  unionSrc: UnionSrc[];
+  diags: Diagnostic[];
+};
+
+type AddTypeOut = { names: Names; err: Option<Diagnostic>; };
+
+function addType(names: Names, name: string, ent: TypeEnt, span: Span): AddTypeOut {
+  const old = findType(names, name);
+  return match (old) {
+    Some(o) => AddTypeOut {
+      names: names,
+      err: typeEntEq(o, ent) ? None : Some(diag("E0304", span, "duplicate definition of type `" + name + "`"))
+    },
+    None => addTypeNew(names, name, ent)
+  };
+}
+
+function addTypeNew(names: Names, name: string, ent: TypeEnt): AddTypeOut {
+  let n = names;
+  n.types.push(TypeBind { name: name, ent: ent });
+  return AddTypeOut { names: n, err: None };
+}
+
+function addVal(names: Names, name: string, ent: ValEnt, span: Span): AddTypeOut {
+  const old = findVal(names, name);
+  return match (old) {
+    Some(o) => AddTypeOut {
+      names: names,
+      err: valEntEq(o, ent) ? None : Some(diag("E0304", span, "duplicate definition of `" + name + "`"))
+    },
+    None => addValNew(names, name, ent)
+  };
+}
+
+function addValNew(names: Names, name: string, ent: ValEnt): AddTypeOut {
+  let n = names;
+  n.vals.push(ValBind { name: name, ent: ent });
+  return AddTypeOut { names: n, err: None };
+}
+
+type Lookup = { t: Option<TypeEnt>; v: Option<ValEnt>; };
+
+function stdLookup(m: StdModule, name: string): Option<ValEnt> {
+  return match (m) {
+    StdFs => name == "readFile" ? Some(VStd(BFsReadFile))
+      : (name == "writeFile" ? Some(VStd(BFsWriteFile))
+      : (name == "exists" ? Some(VStd(BFsExists)) : None)),
+    StdProcess => name == "args" ? Some(VStd(BProcessArgs))
+      : (name == "exit" ? Some(VStd(BProcessExit)) : None)
+  };
+}
+
+function exportLookup(exports: Names[], target: ImportTarget, name: string): Lookup {
+  return match (target) {
+    ImportUnit(j) => j < exports.length
+      ? Lookup { t: findType(exports[j], name), v: findVal(exports[j], name) }
+      : Lookup { t: None, v: None },
+    ImportStd(m) => Lookup { t: None, v: stdLookup(m, name) }
+  };
+}
+
+export function collect(prog: LoadedProgram): Collected {
+  let diags: Diagnostic[] = [];
+  let units: UnitInfo[] = [];
+  let exportsAll: Names[] = [];
+  let aliases: AliasInfo[] = [];
+  let records: RecordDef[] = [];
+  let recordSrc: RecordSrc[] = [];
+  let unions: UnionDef[] = [];
+  let unionSrc: UnionSrc[] = [];
+  let funcs: FuncInfo[] = [];
+  let consts: ConstInfo[] = [];
+  const noTypes: Type[] = [];
+  const noLocals: Local[] = [];
+  let ui: usize = 0;
+  for (const unit of prog.units) {
+    let scope = emptyNames();
+    let exports = emptyNames();
+    for (const item of unit.ast.items) {
+      match (item) {
+        IFunction(f) => {
+          if (f.typeParams.length > 0) {
+            diags.push(diag("E0408", f.typeParams[0].span, "generic functions are not supported in Orin-B"));
+          }
+          const id = funcs.length;
+          funcs.push(FuncInfo {
+            unit: ui,
+            qname: unit.name + "." + f.name.name,
+            decl: f,
+            params: noTypes,
+            paramLocals: noLocals,
+            ret: TyVoid
+          });
+          const a = addVal(scope, f.name.name, VFunc(id), f.name.span);
+          scope = a.names;
+          match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+          if (f.exported) {
+            const b = addVal(exports, f.name.name, VFunc(id), f.name.span);
+            exports = b.names;
+            match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+          }
+        },
+        IConst(c) => {
+          const id = consts.length;
+          consts.push(ConstInfo { unit: ui, decl: c, ty: TyVoid, lit: LitInt(0) });
+          const a = addVal(scope, c.name.name, VConst(id), c.name.span);
+          scope = a.names;
+          match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+          if (c.exported) {
+            const b = addVal(exports, c.name.name, VConst(id), c.name.span);
+            exports = b.names;
+            match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+          }
+        },
+        IType(t) => {
+          if (t.typeParams.length > 0) {
+            diags.push(diag("E0408", t.typeParams[0].span, "generic types are not supported in Orin-B"));
+          }
+          if (isBuiltinTypeName(t.name.name)) {
+            diags.push(diag("E0304", t.name.span, "`" + t.name.name + "` is a built-in type name"));
+          } else {
+            const qname = unit.name + "." + t.name.name;
+            let ent: TypeEnt = EntAlias(0);
+            match (t.body) {
+              DAlias(te) => {
+                ent = EntAlias(aliases.length);
+                aliases.push(AliasInfo { unit: ui, target: te });
+              },
+              DRecord(fields) => {
+                ent = EntRecord(records.length);
+                const nf: FieldDef[] = [];
+                records.push(RecordDef { name: qname, fields: nf });
+                recordSrc.push(RecordSrc { unit: ui, fields: fields });
+              },
+              DUnion(vs) => {
+                const uid = unions.length;
+                ent = EntUnion(uid);
+                let vdefs: VariantDef[] = [];
+                for (const v of vs) {
+                  vdefs.push(VariantDef { name: v.name.name, payload: noTypes });
+                }
+                unions.push(UnionDef { name: qname, variants: vdefs });
+                unionSrc.push(UnionSrc { unit: ui, variants: vs });
+                let tag: usize = 0;
+                for (const v of vs) {
+                  const a = addVal(scope, v.name.name, VVariant(uid, tag), v.name.span);
+                  scope = a.names;
+                  match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+                  if (t.exported) {
+                    const b = addVal(exports, v.name.name, VVariant(uid, tag), v.name.span);
+                    exports = b.names;
+                    match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+                  }
+                  tag += 1;
+                }
+              }
+            }
+            const a = addType(scope, t.name.name, ent, t.name.span);
+            scope = a.names;
+            match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+            if (t.exported) {
+              const b = addType(exports, t.name.name, ent, t.name.span);
+              exports = b.names;
+              match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+            }
+          }
+        },
+        IImport(_) => {},
+        IReExport(_) => {}
+      }
+    }
+    // Imports and re-exports.
+    let imp: usize = 0;
+    for (const item of unit.ast.items) {
+      let isImport = false;
+      let isReexport = false;
+      let names: Ident[] = [];
+      let path = "";
+      match (item) {
+        IImport(d) => { isImport = true; names = d.names; path = d.path; },
+        IReExport(d) => { isImport = true; isReexport = true; names = d.names; path = d.path; },
+        _ => {}
+      }
+      if (isImport) {
+        const hasTarget = imp < unit.imports.length;
+        if (!hasTarget) {
+          const sp = names.length > 0 ? names[0].span : Span { file: unit.file, start: 0, end: 0 };
+          diags.push(diag("E0300", sp, "module `" + path + "` was not resolved by the loader"));
+        } else {
+          const target = unit.imports[imp];
+          for (const n of names) {
+            const lk = exportLookup(exportsAll, target, n.name);
+            if (lk.t.isNone() && lk.v.isNone()) {
+              diags.push(diag("E0300", n.span, "`" + n.name + "` is not exported by `" + path + "`"));
+            } else {
+              if (lk.t.isSome()) {
+                const te = lk.t.unwrap();
+                const r = addType(isReexport ? exports : scope, n.name, te, n.span);
+                if (isReexport) { exports = r.names; } else { scope = r.names; }
+                match (r.err) { Some(d) => { diags.push(d); }, None => {} }
+              }
+              if (lk.v.isSome()) {
+                const ve = lk.v.unwrap();
+                const r = addVal(isReexport ? exports : scope, n.name, ve, n.span);
+                if (isReexport) { exports = r.names; } else { scope = r.names; }
+                match (r.err) { Some(d) => { diags.push(d); }, None => {} }
+              }
+              if (lk.t.isSome()) {
+                match (lk.t.unwrap()) {
+                  EntUnion(u) => {
+                    let tag: usize = 0;
+                    for (const v of unions[u].variants) {
+                      const r = addVal(isReexport ? exports : scope, v.name, VVariant(u, tag), n.span);
+                      if (isReexport) { exports = r.names; } else { scope = r.names; }
+                      match (r.err) { Some(d) => { diags.push(d); }, None => {} }
+                      tag += 1;
+                    }
+                  },
+                  _ => {}
+                }
+              }
+            }
+          }
+        }
+        imp += 1;
+      }
+    }
+    units.push(UnitInfo { name: unit.name, file: unit.file, scope: scope });
+    exportsAll.push(exports);
+    ui += 1;
+  }
+  const env = Env {
+    units: units,
+    aliases: aliases,
+    records: records,
+    unions: unions,
+    funcs: funcs,
+    consts: consts,
+    entry: prog.entry
+  };
+  return Collected { env: env, recordSrc: recordSrc, unionSrc: unionSrc, diags: diags };
+}

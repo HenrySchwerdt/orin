@@ -1,0 +1,1218 @@
+// Function body checking: statements, places, expressions, calls and match.
+// Port of `FnCx` (bootstrap/src/checker/mod.rs). All of these functions are mutually recursive
+// (match arms contain blocks, blocks contain expressions), so they live in one file; the
+// non-recursive parts are in env.or, fnctx.or, builtins.or and pattern.or.
+//
+// Every function takes the read-only `Env` and the function context `FnCtx` and returns the
+// updated context together with its result. Errors abort the whole function body.
+
+import { Span, Diagnostic, diag } from "../diag";
+import {
+  Ident, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit, MatchArm, ArmBody, TypeExpr, AssignOp,
+  UnaryOp, BinaryOp, Pattern
+} from "../syntax";
+import {
+  Type, FieldDef, VariantDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm,
+  HPattern, Builtin, MutBuiltin
+} from "../hir";
+import {
+  Env, ValEnt, ConstLit, typeEq, isInt, isUsize, isBool, isString, isVoid, isIntish, isArrayTy,
+  expIsUsize, showType, mismatch, globalVal
+} from "./env";
+import {
+  FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak
+} from "./fnctx";
+import { builtinSig, methodSig, Sig, MSig } from "./builtins";
+import { checkPattern, PatOut } from "./pattern";
+import { resolveType, resolveTypeNameTop } from "./decls";
+
+export type ExprOut = { fx: FnCtx; expr: HExpr; };
+export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
+type ArgsOut = { fx: FnCtx; args: HExpr[]; };
+type PairOut = { fx: FnCtx; l: HExpr; r: HExpr; };
+type PlaceOut = { fx: FnCtx; place: Place; mutable: bool; rootName: string; };
+type StmtOut = { fx: FnCtx; stmt: HStmt; div: bool; };
+type MatchOut = { fx: FnCtx; expr: HExpr; div: bool; };
+type LetInit = { fx: FnCtx; expr: HExpr; ty: Type; };
+type ElseOut = { fx: FnCtx; block: Option<HBlock>; div: bool; };
+
+function mk(kind: HExprKind, ty: Type, span: Span): HExpr {
+  return HExpr { kind: kind, ty: ty, span: span };
+}
+
+function done(fx: FnCtx, kind: HExprKind, ty: Type, span: Span): Result<ExprOut, Diagnostic> {
+  return Ok(ExprOut { fx: fx, expr: mk(kind, ty, span) });
+}
+
+function noExprs(): HExpr[] {
+  const xs: HExpr[] = [];
+  return xs;
+}
+
+// ---------------------------------------------------------------------------
+// Syntactic helpers
+// ---------------------------------------------------------------------------
+
+function isArithOp(op: BinaryOp): bool {
+  return match (op) {
+    BAdd => true,
+    BSub => true,
+    BMul => true,
+    BDiv => true,
+    BRem => true,
+    _ => false
+  };
+}
+
+// Syntactic "untyped integer expression": adopts the type demanded by context.
+function untypedInt(e: Expr): bool {
+  return match (e.kind) {
+    EInt(_) => true,
+    EUnary(op, x) => match (op) { UNeg => untypedInt(x), _ => false },
+    EBinary(op, l, r) => isArithOp(op) && untypedInt(l) && untypedInt(r),
+    _ => false
+  };
+}
+
+function toBinOp(op: BinaryOp): BinOp {
+  return match (op) {
+    BAdd => OpAdd,
+    BSub => OpSub,
+    BMul => OpMul,
+    BDiv => OpDiv,
+    BRem => OpRem,
+    BEq => OpEq,
+    BNe => OpNe,
+    BLt => OpLt,
+    BLe => OpLe,
+    BGt => OpGt,
+    BGe => OpGe,
+    BAnd => OpAnd,
+    BOr => OpOr
+  };
+}
+
+function intishHint(exp: Option<Type>): Option<Type> {
+  return match (exp) {
+    Some(t) => isIntish(t) ? Some(t) : None,
+    None => None
+  };
+}
+
+function hintOf(t: Type): Option<Type> {
+  return isIntish(t) ? Some(t) : None;
+}
+
+function fieldIndex(fields: FieldDef[], name: string): Option<usize> {
+  let i: usize = 0;
+  for (const f of fields) {
+    if (f.name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function noField(env: Env, name: Ident, t: Type): Diagnostic {
+  return diag("E0405", name.span, "no field `" + name.name + "` on type `" + showType(env, t) + "`");
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------------
+
+function expect(env: Env, fx: FnCtx, e: Expr, ty: Type): Result<ExprOut, Diagnostic> {
+  const r = checkExpr(env, fx, e, Some(ty))?;
+  if (!typeEq(r.expr.ty, ty)) {
+    return Err(mismatch(env, e.span, ty, r.expr.ty));
+  }
+  return Ok(r);
+}
+
+export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
+  const span = e.span;
+  return match (e.kind) {
+    EInt(n) => done(fx, XInt(n), expIsUsize(exp) ? TyUsize : TyInt, span),
+    EStr(s) => done(fx, XStr(s), TyString, span),
+    EBool(b) => done(fx, XBool(b), TyBool, span),
+    EIdent(id) => checkIdent(env, fx, id, exp, span),
+    EUnary(op, x) => checkUnary(env, fx, span, op, x, exp),
+    EBinary(op, l, r) => checkBinary(env, fx, span, op, l, r, exp),
+    ECall(callee, args) => checkCall(env, fx, span, callee, args, exp),
+    EMember(base, name) => checkMember(env, fx, span, base, name),
+    EIndex(base, idx) => checkIndex(env, fx, span, base, idx),
+    ETry(x) => checkTry(env, fx, span, x),
+    ECond(c, t, f) => checkCond(env, fx, span, c, t, f, exp),
+    EArray(elems) => checkArray(env, fx, span, elems, exp),
+    ERecord(name, spread, fields) => checkRecord(env, fx, span, name, spread, fields),
+    EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp)
+  };
+}
+
+function checkMatchExpr(
+  env: Env, fx: FnCtx, span: Span, scrut: Expr, arms: MatchArm[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const r = checkMatch(env, fx, span, scrut, arms, exp, false)?;
+  return Ok(ExprOut { fx: r.fx, expr: r.expr });
+}
+
+function constKind(lit: ConstLit): HExprKind {
+  return match (lit) {
+    LitInt(n) => XInt(n),
+    LitStr(s) => XStr(s),
+    LitBool(b) => XBool(b)
+  };
+}
+
+function checkIdent(env: Env, fx: FnCtx, id: Ident, exp: Option<Type>, span: Span): Result<ExprOut, Diagnostic> {
+  const lo = lookupLocal(fx, id.name);
+  if (lo.isSome()) {
+    const l = lo.unwrap();
+    return done(fx, XLocal(l), fx.locals[l].ty, span);
+  }
+  const g = globalVal(env, fx.unit, id.name);
+  if (g.isSome()) {
+    return identVal(env, fx, g.unwrap(), id, span);
+  }
+  if (id.name == "None") {
+    return noneLit(env, fx, exp, span);
+  }
+  if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
+    return Err(diag("E0404", span, "`" + id.name + "` must be called with arguments"));
+  }
+  return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+}
+
+function identVal(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span): Result<ExprOut, Diagnostic> {
+  return match (ent) {
+    VConst(i) => done(fx, constKind(env.consts[i].lit), env.consts[i].ty, span),
+    VVariant(u, tag) => {
+      const def = env.unions[u].variants[tag];
+      if (def.payload.length > 0) {
+        return Err(diag(
+          "E0404",
+          span,
+          "variant `" + def.name + "` expects " + def.payload.length.toString() + " argument(s)"
+        ));
+      }
+      return done(fx, XVariant(tag, noExprs()), TyUnion(u), span);
+    },
+    VFunc(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value")),
+    VStd(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value"))
+  };
+}
+
+function noneLit(env: Env, fx: FnCtx, exp: Option<Type>, span: Span): Result<ExprOut, Diagnostic> {
+  return match (exp) {
+    Some(t) => match (t) {
+      TyOption(inner) => done(fx, XVariant(1, noExprs()), TyOption(inner), span),
+      _ => Err(diag("E0400", span, "expected `" + showType(env, t) + "`, found an `Option`"))
+    },
+    None => Err(diag("E0407", span, "cannot infer the type of `None`; add a type annotation"))
+  };
+}
+
+function checkUnary(
+  env: Env, fx: FnCtx, span: Span, op: UnaryOp, inner: Expr, exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  return match (op) {
+    UNeg => checkNeg(env, fx, span, inner, exp),
+    UNot => {
+      const o = checkExpr(env, fx, inner, None)?;
+      if (!isBool(o.expr.ty)) {
+        return Err(diag("E0410", span, "`!` requires `bool`, found `" + showType(env, o.expr.ty) + "`"));
+      }
+      return done(o.fx, XUnary(UnNot, o.expr), TyBool, span);
+    }
+  };
+}
+
+function intLitValue(e: Expr): Option<int> {
+  return match (e.kind) {
+    EInt(n) => Some(n),
+    _ => None
+  };
+}
+
+function checkNeg(env: Env, fx: FnCtx, span: Span, inner: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
+  const lit = intLitValue(inner);
+  if (lit.isSome()) {
+    if (expIsUsize(exp)) {
+      return Err(diag("E0400", span, "negative integer literal cannot have type `usize`"));
+    }
+    return done(fx, XInt(-lit.unwrap()), TyInt, span);
+  }
+  const o = checkExpr(env, fx, inner, None)?;
+  if (!isInt(o.expr.ty)) {
+    return Err(diag("E0410", span, "cannot negate a value of type `" + showType(env, o.expr.ty) + "`"));
+  }
+  return done(o.fx, XUnary(UnNeg, o.expr), TyInt, span);
+}
+
+function checkOperands(
+  env: Env, fx: FnCtx, lhs: Expr, rhs: Expr, hint: Option<Type>
+): Result<PairOut, Diagnostic> {
+  if (untypedInt(lhs) && !untypedInt(rhs)) {
+    const r = checkExpr(env, fx, rhs, hint)?;
+    const l = checkExpr(env, r.fx, lhs, hintOf(r.expr.ty))?;
+    return Ok(PairOut { fx: l.fx, l: l.expr, r: r.expr });
+  }
+  const l = checkExpr(env, fx, lhs, hint)?;
+  const h: Option<Type> = untypedInt(rhs) ? hintOf(l.expr.ty) : None;
+  const r = checkExpr(env, l.fx, rhs, h)?;
+  return Ok(PairOut { fx: r.fx, l: l.expr, r: r.expr });
+}
+
+function checkBinary(
+  env: Env, fx: FnCtx, span: Span, op: BinaryOp, lhs: Expr, rhs: Expr, exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const hop = toBinOp(op);
+  const isLogic = match (op) { BAnd => true, BOr => true, _ => false };
+  if (isLogic) {
+    const l = checkExpr(env, fx, lhs, None)?;
+    const r = checkExpr(env, l.fx, rhs, None)?;
+    if (!isBool(l.expr.ty) || !isBool(r.expr.ty)) {
+      return Err(diag(
+        "E0410",
+        span,
+        "`&&`/`||` require `bool` operands, found `" + showType(env, l.expr.ty) + "` and `"
+          + showType(env, r.expr.ty) + "`"
+      ));
+    }
+    return done(r.fx, XBinary(hop, l.expr, r.expr), TyBool, span);
+  }
+  const arith = isArithOp(op);
+  const hint: Option<Type> = arith ? intishHint(exp) : None;
+  const p = checkOperands(env, fx, lhs, rhs, hint)?;
+  const lt = p.l.ty;
+  const rt = p.r.ty;
+  if (!typeEq(lt, rt) && isIntish(lt) && isIntish(rt)) {
+    return Err(diag(
+      "E0400",
+      span,
+      "cannot mix `" + showType(env, lt) + "` and `" + showType(env, rt) + "`; convert explicitly"
+    ));
+  }
+  if (!typeEq(lt, rt)) {
+    return Err(diag(
+      "E0410",
+      span,
+      "operands have different types `" + showType(env, lt) + "` and `" + showType(env, rt) + "`"
+    ));
+  }
+  const ok = match (op) {
+    BAdd => isIntish(lt) || isString(lt),
+    BSub => isIntish(lt),
+    BMul => isIntish(lt),
+    BDiv => isIntish(lt),
+    BRem => isIntish(lt),
+    BEq => isIntish(lt) || isBool(lt) || isString(lt),
+    BNe => isIntish(lt) || isBool(lt) || isString(lt),
+    _ => isIntish(lt)
+  };
+  if (!ok) {
+    return Err(diag("E0410", span, "operator is not defined for type `" + showType(env, lt) + "`"));
+  }
+  return done(p.fx, XBinary(hop, p.l, p.r), arith ? lt : TyBool, span);
+}
+
+function checkMember(env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident): Result<ExprOut, Diagnostic> {
+  const b = checkExpr(env, fx, base, None)?;
+  const t = b.expr.ty;
+  if (name.name == "length") {
+    if (isString(t)) {
+      return done(b.fx, XBuiltin(BStrLength, [b.expr]), TyUsize, span);
+    }
+    if (isArrayTy(t)) {
+      return done(b.fx, XBuiltin(BArrLength, [b.expr]), TyUsize, span);
+    }
+  }
+  return match (t) {
+    TyRecord(r) => {
+      const def = env.records[r];
+      const io = fieldIndex(def.fields, name.name);
+      if (io.isNone()) {
+        return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
+      }
+      const i = io.unwrap();
+      return done(b.fx, XField(b.expr, r, i), def.fields[i].ty, span);
+    },
+    _ => Err(noField(env, name, t))
+  };
+}
+
+function checkIndex(env: Env, fx: FnCtx, span: Span, base: Expr, index: Expr): Result<ExprOut, Diagnostic> {
+  const b = checkExpr(env, fx, base, None)?;
+  return match (b.expr.ty) {
+    TyArray(t) => {
+      const i = expect(env, b.fx, index, TyUsize)?;
+      return done(i.fx, XIndex(b.expr, i.expr), t, span);
+    },
+    _ => Err(diag("E0400", span, "cannot index into type `" + showType(env, b.expr.ty) + "`"))
+  };
+}
+
+function checkTry(env: Env, fx: FnCtx, span: Span, inner: Expr): Result<ExprOut, Diagnostic> {
+  const o = checkExpr(env, fx, inner, None)?;
+  return match (o.expr.ty) {
+    TyResult(t, et) => {
+      match (fx.ret) {
+        TyResult(_, e2) => {
+          if (!typeEq(e2, et)) {
+            return Err(diag(
+              "E0406",
+              span,
+              "error type `" + showType(env, et) + "` does not match the function's error type `"
+                + showType(env, e2) + "`"
+            ));
+          }
+        },
+        _ => {
+          return Err(diag(
+            "E0406",
+            span,
+            "`?` used in a function returning `" + showType(env, fx.ret) + "`, not a `Result`"
+          ));
+        }
+      }
+      return done(o.fx, XTry(o.expr), t, span);
+    },
+    _ => Err(diag("E0406", span, "`?` requires a `Result`, found `" + showType(env, o.expr.ty) + "`"))
+  };
+}
+
+function checkCond(
+  env: Env, fx: FnCtx, span: Span, cond: Expr, thenE: Expr, elsE: Expr, exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const c = expect(env, fx, cond, TyBool)?;
+  let cur = c.fx;
+  let t: HExpr = mk(XBool(false), TyBool, span);
+  let f: HExpr = mk(XBool(false), TyBool, span);
+  if (untypedInt(thenE) && !untypedInt(elsE)) {
+    const fr = checkExpr(env, cur, elsE, exp)?;
+    const tr = checkExpr(env, fr.fx, thenE, hintOf(fr.expr.ty))?;
+    cur = tr.fx;
+    t = tr.expr;
+    f = fr.expr;
+  } else {
+    const tr = checkExpr(env, cur, thenE, exp)?;
+    const h = untypedInt(elsE) && isIntish(tr.expr.ty) ? Some(tr.expr.ty) : exp;
+    const fr = checkExpr(env, tr.fx, elsE, h)?;
+    cur = fr.fx;
+    t = tr.expr;
+    f = fr.expr;
+  }
+  if (!typeEq(t.ty, f.ty)) {
+    return Err(diag(
+      "E0400",
+      elsE.span,
+      "branches of conditional have different types `" + showType(env, t.ty) + "` and `"
+        + showType(env, f.ty) + "`"
+    ));
+  }
+  return done(cur, XCond(c.expr, t, f), t.ty, span);
+}
+
+function checkArray(
+  env: Env, fx: FnCtx, span: Span, elems: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  let cur = fx;
+  let pre: Option<HExpr>[] = [];
+  for (const _e of elems) {
+    pre.push(None);
+  }
+  let elemTy: Type = TyInt;
+  let fromExp = false;
+  match (exp) {
+    Some(t) => {
+      match (t) {
+        TyArray(et) => {
+          elemTy = et;
+          fromExp = true;
+        },
+        _ => {}
+      }
+    },
+    None => {}
+  }
+  if (!fromExp) {
+    if (elems.length == 0) {
+      return Err(diag("E0407", span, "cannot infer the element type of `[]`; add a type annotation"));
+    }
+    let k: usize = 0;
+    let found = false;
+    while (k < elems.length && !found) {
+      if (!untypedInt(elems[k])) {
+        found = true;
+      } else {
+        k += 1;
+      }
+    }
+    if (found) {
+      const he = checkExpr(env, cur, elems[k], None)?;
+      cur = he.fx;
+      elemTy = he.expr.ty;
+      pre[k] = Some(he.expr);
+    }
+  }
+  if (isVoid(elemTy)) {
+    return Err(diag("E0400", span, "array elements cannot be `void`"));
+  }
+  let out: HExpr[] = [];
+  let i: usize = 0;
+  for (const e of elems) {
+    match (pre[i]) {
+      Some(he) => { out.push(he); },
+      None => {
+        const r = expect(env, cur, e, elemTy)?;
+        cur = r.fx;
+        out.push(r.expr);
+      }
+    }
+    i += 1;
+  }
+  return done(cur, XArray(out), TyArray(elemTy), span);
+}
+
+function checkRecord(
+  env: Env, fx: FnCtx, span: Span, name: Ident, spread: Option<Expr>, fields: FieldInit[]
+): Result<ExprOut, Diagnostic> {
+  const t = resolveTypeNameTop(env, fx.unit, name)?;
+  const rid = match (t) {
+    TyRecord(r) => r,
+    _ => {
+      return Err(diag(
+        "E0400",
+        name.span,
+        "`" + name.name + "` is not a record type (it is `" + showType(env, t) + "`)"
+      ));
+    }
+  };
+  const def = env.records[rid];
+  let cur = fx;
+  let sp: Option<HExpr> = None;
+  match (spread) {
+    Some(s) => {
+      const r = expect(env, cur, s, TyRecord(rid))?;
+      cur = r.fx;
+      sp = Some(r.expr);
+    },
+    None => {}
+  }
+  let seen: bool[] = [];
+  for (const _f of def.fields) {
+    seen.push(false);
+  }
+  let out: FieldInitH[] = [];
+  for (const f of fields) {
+    const io = fieldIndex(def.fields, f.name.name);
+    if (io.isNone()) {
+      return Err(diag("E0411", f.name.span, "record `" + def.name + "` has no field `" + f.name.name + "`"));
+    }
+    const idx = io.unwrap();
+    if (seen[idx]) {
+      return Err(diag("E0411", f.name.span, "field `" + f.name.name + "` given more than once"));
+    }
+    seen[idx] = true;
+    const v = expect(env, cur, f.value, def.fields[idx].ty)?;
+    cur = v.fx;
+    out.push(FieldInitH { index: idx, value: v.expr });
+  }
+  if (sp.isNone()) {
+    let missing: string[] = [];
+    let i: usize = 0;
+    for (const fd of def.fields) {
+      if (!seen[i]) {
+        missing.push(fd.name);
+      }
+      i += 1;
+    }
+    if (missing.length > 0) {
+      return Err(diag("E0411", span, "missing field(s) in record literal: " + missing.join(", ")));
+    }
+  }
+  return done(cur, XRecord(rid, sp, out), TyRecord(rid), span);
+}
+
+// ---------------------------------------------------------------------------
+// Calls
+// ---------------------------------------------------------------------------
+
+function argsExpect(
+  env: Env, fx: FnCtx, span: Span, what: string, args: Expr[], params: Type[]
+): Result<ArgsOut, Diagnostic> {
+  if (args.length != params.length) {
+    return Err(diag(
+      "E0404",
+      span,
+      what + " expects " + params.length.toString() + " argument(s), found " + args.length.toString()
+    ));
+  }
+  let cur = fx;
+  let out: HExpr[] = [];
+  let i: usize = 0;
+  for (const a of args) {
+    const r = expect(env, cur, a, params[i])?;
+    cur = r.fx;
+    out.push(r.expr);
+    i += 1;
+  }
+  return Ok(ArgsOut { fx: cur, args: out });
+}
+
+function checkCall(
+  env: Env, fx: FnCtx, span: Span, callee: Expr, args: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  return match (callee.kind) {
+    EIdent(id) => callIdent(env, fx, span, callee, id, args, exp),
+    EMember(base, name) => callMember(env, fx, span, base, name, args),
+    _ => Err(diag("E0400", callee.span, "expression is not callable"))
+  };
+}
+
+function callIdent(
+  env: Env, fx: FnCtx, span: Span, callee: Expr, id: Ident, args: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  if (lookupLocal(fx, id.name).isSome()) {
+    return Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"));
+  }
+  const g = globalVal(env, fx.unit, id.name);
+  if (g.isNone()) {
+    if (id.name == "parseInt") {
+      return callBuiltin(env, fx, span, "function `parseInt`", BParseInt, args);
+    }
+    if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
+      return builtinCtor(env, fx, span, id.name, args, exp);
+    }
+    return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+  }
+  return match (g.unwrap()) {
+    VFunc(fid) => {
+      const f = env.funcs[fid];
+      const a = argsExpect(env, fx, span, "function `" + id.name + "`", args, f.params)?;
+      return done(a.fx, XCall(fid, a.args), f.ret, span);
+    },
+    VVariant(u, tag) => {
+      const v = env.unions[u].variants[tag];
+      const a = argsExpect(env, fx, span, "variant `" + v.name + "`", args, v.payload)?;
+      return done(a.fx, XVariant(tag, a.args), TyUnion(u), span);
+    },
+    VStd(b) => callBuiltin(env, fx, span, "function `" + id.name + "`", b, args),
+    VConst(_) => Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"))
+  };
+}
+
+function callBuiltin(
+  env: Env, fx: FnCtx, span: Span, what: string, b: Builtin, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const sig = builtinSig(b);
+  const a = argsExpect(env, fx, span, what, args, sig.params)?;
+  return done(a.fx, XBuiltin(b, a.args), sig.ret, span);
+}
+
+function callMember(
+  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  match (base.kind) {
+    EIdent(bid) => {
+      const special = (bid.name == "console" || bid.name == "String")
+        && lookupLocal(fx, bid.name).isNone()
+        && globalVal(env, fx.unit, bid.name).isNone();
+      if (special) {
+        let b: Option<Builtin> = None;
+        if (bid.name == "console" && name.name == "log") {
+          b = Some(BConsoleLog);
+        } else if (bid.name == "console" && name.name == "error") {
+          b = Some(BConsoleError);
+        } else if (bid.name == "String" && name.name == "fromCharCode") {
+          b = Some(BStringFromCharCode);
+        }
+        if (b.isNone()) {
+          return Err(diag("E0405", name.span, "`" + bid.name + "` has no member `" + name.name + "`"));
+        }
+        return callBuiltin(env, fx, span, "`" + bid.name + "." + name.name + "`", b.unwrap(), args);
+      }
+    },
+    _ => {}
+  }
+  return methodCall(env, fx, span, base, name, args);
+}
+
+function builtinCtor(
+  env: Env, fx: FnCtx, span: Span, name: string, args: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  if (name == "Some") {
+    return someCtor(env, fx, span, args, exp);
+  }
+  if (exp.isNone()) {
+    // Ok(x) / Err(x) cannot infer the other type parameter.
+    let cur = fx;
+    for (const a of args) {
+      const r = checkExpr(env, cur, a, None)?;
+      cur = r.fx;
+    }
+    if (name == "Ok") {
+      return Err(diag("E0407", span, "cannot infer the error type of `Ok(..)`; add a type annotation"));
+    }
+    return Err(diag("E0407", span, "cannot infer the success type of `Err(..)`; add a type annotation"));
+  }
+  const et = exp.unwrap();
+  return match (et) {
+    TyResult(t, e) => name == "Ok" ? okCtor(env, fx, span, args, t, e) : errCtor(env, fx, span, args, t, e),
+    _ => Err(diag("E0400", span, "expected `" + showType(env, et) + "`, found a `Result`"))
+  };
+}
+
+function someCtor(env: Env, fx: FnCtx, span: Span, args: Expr[], exp: Option<Type>): Result<ExprOut, Diagnostic> {
+  if (args.length != 1) {
+    return Err(diag("E0404", span, "`Some` expects 1 argument, found " + args.length.toString()));
+  }
+  let inner: Option<Type> = None;
+  match (exp) {
+    Some(t) => {
+      match (t) {
+        TyOption(x) => { inner = Some(x); },
+        _ => {}
+      }
+    },
+    None => {}
+  }
+  const p = match (inner) {
+    Some(x) => expect(env, fx, args[0], x)?,
+    None => checkExpr(env, fx, args[0], None)?
+  };
+  if (isVoid(p.expr.ty)) {
+    return Err(diag("E0400", args[0].span, "`Option<void>` is not allowed"));
+  }
+  return done(p.fx, XVariant(0, [p.expr]), TyOption(p.expr.ty), span);
+}
+
+function okCtor(
+  env: Env, fx: FnCtx, span: Span, args: Expr[], t: Type, e: Type
+): Result<ExprOut, Diagnostic> {
+  const want: usize = isVoid(t) ? 0 : 1;
+  if (args.length != want) {
+    return Err(diag("E0404", span, "`Ok` expects " + want.toString() + " argument(s), found " + args.length.toString()));
+  }
+  if (want == 0) {
+    return done(fx, XVariant(0, noExprs()), TyResult(t, e), span);
+  }
+  const p = expect(env, fx, args[0], t)?;
+  return done(p.fx, XVariant(0, [p.expr]), TyResult(t, e), span);
+}
+
+function errCtor(
+  env: Env, fx: FnCtx, span: Span, args: Expr[], t: Type, e: Type
+): Result<ExprOut, Diagnostic> {
+  if (args.length != 1) {
+    return Err(diag("E0404", span, "`Err` expects 1 argument, found " + args.length.toString()));
+  }
+  const p = expect(env, fx, args[0], e)?;
+  return done(p.fx, XVariant(1, [p.expr]), TyResult(t, e), span);
+}
+
+function isPlaceShaped(fx: FnCtx, base: Expr): bool {
+  return match (base.kind) {
+    EIdent(id) => lookupLocal(fx, id.name).isSome(),
+    EMember(_, _) => true,
+    EIndex(_, _) => true,
+    _ => false
+  };
+}
+
+function methodCall(
+  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const n = name.name;
+  if (n == "push" || n == "pop") {
+    return mutMethodCall(env, fx, span, base, name, args);
+  }
+  const b = checkExpr(env, fx, base, None)?;
+  const so = methodSig(b.expr.ty, n);
+  if (so.isNone()) {
+    return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(env, b.expr.ty) + "`"));
+  }
+  const s = so.unwrap();
+  const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, s.params)?;
+  let all: HExpr[] = [b.expr];
+  for (const x of a.args) {
+    all.push(x);
+  }
+  return done(a.fx, XBuiltin(s.op, all), s.ret, span);
+}
+
+function mutMethodCall(
+  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const n = name.name;
+  if (isPlaceShaped(fx, base)) {
+    const pi = checkPlace(env, fx, base)?;
+    return match (pi.place.ty) {
+      TyArray(t) => {
+        if (!pi.mutable) {
+          return Err(diag(
+            "E0401",
+            base.span,
+            "cannot call `" + n + "` on `" + pi.rootName + "`: it is not declared with `let`"
+          ));
+        }
+        const isPush = n == "push";
+        const params: Type[] = isPush ? [t] : [];
+        const a = argsExpect(env, pi.fx, span, "method `" + n + "`", args, params)?;
+        const op: MutBuiltin = isPush ? MArrPush : MArrPop;
+        const ret: Type = isPush ? TyVoid : TyOption(t);
+        return done(a.fx, XMutMethod(op, pi.place, a.args), ret, span);
+      },
+      _ => Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(env, pi.place.ty) + "`"))
+    };
+  }
+  const b = checkExpr(env, fx, base, None)?;
+  if (isArrayTy(b.expr.ty)) {
+    return Err(diag("E0401", base.span, "receiver of `" + n + "` must be a mutable place"));
+  }
+  return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(env, b.expr.ty) + "`"));
+}
+
+// ---------------------------------------------------------------------------
+// Places
+// ---------------------------------------------------------------------------
+
+function extendPath(p: Place, elem: PlaceElem, ty: Type): Place {
+  let path = p.path;
+  path.push(elem);
+  return Place { root: p.root, path: path, ty: ty };
+}
+
+function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> {
+  return match (e.kind) {
+    EIdent(id) => {
+      const lo = lookupLocal(fx, id.name);
+      if (lo.isSome()) {
+        const l = lo.unwrap();
+        const loc = fx.locals[l];
+        const path: PlaceElem[] = [];
+        return Ok(PlaceOut {
+          fx: fx,
+          place: Place { root: l, path: path, ty: loc.ty },
+          mutable: loc.mutable,
+          rootName: id.name
+        });
+      }
+      if (globalVal(env, fx.unit, id.name).isSome()) {
+        return Err(diag("E0401", e.span, "cannot assign to `" + id.name + "`"));
+      }
+      return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+    },
+    EMember(base, name) => {
+      const p = checkPlace(env, fx, base)?;
+      return match (p.place.ty) {
+        TyRecord(r) => {
+          const def = env.records[r];
+          const io = fieldIndex(def.fields, name.name);
+          if (io.isNone()) {
+            return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
+          }
+          const i = io.unwrap();
+          return Ok(PlaceOut {
+            fx: p.fx,
+            place: extendPath(p.place, PField(r, i), def.fields[i].ty),
+            mutable: p.mutable,
+            rootName: p.rootName
+          });
+        },
+        TyString => name.name == "length"
+          ? Err(diag("E0401", e.span, "`length` is read-only"))
+          : Err(noField(env, name, p.place.ty)),
+        TyArray(_) => name.name == "length"
+          ? Err(diag("E0401", e.span, "`length` is read-only"))
+          : Err(noField(env, name, p.place.ty)),
+        _ => Err(noField(env, name, p.place.ty))
+      };
+    },
+    EIndex(base, index) => {
+      const p = checkPlace(env, fx, base)?;
+      return match (p.place.ty) {
+        TyArray(t) => {
+          const idx = expect(env, p.fx, index, TyUsize)?;
+          return Ok(PlaceOut {
+            fx: idx.fx,
+            place: extendPath(p.place, PIndex(idx.expr), t),
+            mutable: p.mutable,
+            rootName: p.rootName
+          });
+        },
+        _ => Err(diag("E0400", e.span, "cannot index into type `" + showType(env, p.place.ty) + "`"))
+      };
+    },
+    _ => Err(diag("E0401", e.span, "expression is not an assignable place"))
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Match
+// ---------------------------------------------------------------------------
+
+function variantsOf(env: Env, t: Type): Option<VariantDef[]> {
+  return match (t) {
+    TyUnion(u) => Some(env.unions[u].variants),
+    TyOption(x) => Some([VariantDef { name: "Some", payload: [x] }, VariantDef { name: "None", payload: noTypes() }]),
+    TyResult(a, b) => Some([
+      VariantDef { name: "Ok", payload: isVoid(a) ? noTypes() : [a] },
+      VariantDef { name: "Err", payload: [b] }
+    ]),
+    _ => None
+  };
+}
+
+function noTypes(): Type[] {
+  const xs: Type[] = [];
+  return xs;
+}
+
+function isLiteralScrut(t: Type): bool {
+  return isIntish(t) || isString(t) || isBool(t);
+}
+
+function exprAsMatch(e: Expr): Option<Expr> {
+  return match (e.kind) {
+    EMatch(_, _) => Some(e),
+    _ => None
+  };
+}
+
+// One match arm: returns the arm plus whether it diverges and the (possibly inferred) target type.
+type ArmOut = { fx: FnCtx; arm: HArm; div: bool; target: Option<Type>; covered: bool[]; wild: bool; };
+
+function checkArm(
+  env: Env, fx0: FnCtx, arm: MatchArm, sty: Type, variants: Option<VariantDef[]>, covered: bool[],
+  wild: bool, target: Option<Type>, stmtPos: bool
+): Result<ArmOut, Diagnostic> {
+  const fx1 = pushScope(fx0);
+  const po = checkPattern(env, fx1, arm.pattern, sty, variants, covered, wild)?;
+  let cur = po.fx;
+  let body: HBlock = HBlock { stmts: [] };
+  let value: Option<HExpr> = None;
+  let div = false;
+  let tgt = target;
+  match (arm.body) {
+    BExpr(e) => {
+      if (stmtPos) {
+        let he: HExpr = mk(XBool(false), TyBool, e.span);
+        match (e.kind) {
+          EMatch(sc, inner) => {
+            const m = checkMatch(env, cur, e.span, sc, inner, None, true)?;
+            cur = m.fx;
+            he = m.expr;
+            div = m.div;
+          },
+          _ => {
+            const r = checkExpr(env, cur, e, None)?;
+            cur = r.fx;
+            he = r.expr;
+          }
+        }
+        body = HBlock { stmts: [HExprStmt(he)] };
+      } else {
+        match (tgt) {
+          Some(t) => {
+            const r = expect(env, cur, e, t)?;
+            cur = r.fx;
+            value = Some(r.expr);
+          },
+          None => {
+            const r = checkExpr(env, cur, e, None)?;
+            cur = r.fx;
+            tgt = Some(r.expr.ty);
+            value = Some(r.expr);
+          }
+        }
+      }
+    },
+    BBlock(b) => {
+      const bo = checkBlock(env, cur, b)?;
+      cur = bo.fx;
+      if (!stmtPos && !bo.div) {
+        let d = diag(
+          "E0400",
+          b.span,
+          "block arm of a match used as an expression must end in `return`, `break` or `continue`"
+        );
+        d.notes.push("a block arm has no value; use an expression arm to produce a value");
+        return Err(d);
+      }
+      body = bo.block;
+      div = bo.div;
+    }
+  }
+  cur = popScope(cur);
+  return Ok(ArmOut {
+    fx: cur,
+    arm: HArm { pattern: po.pat, body: body, value: value },
+    div: div,
+    target: tgt,
+    covered: po.covered,
+    wild: po.wild
+  });
+}
+
+function checkMatch(
+  env: Env, fx: FnCtx, span: Span, scrut: Expr, arms: MatchArm[], exp: Option<Type>, stmtPos: bool
+): Result<MatchOut, Diagnostic> {
+  const s = checkExpr(env, fx, scrut, None)?;
+  const sty = s.expr.ty;
+  const variants = variantsOf(env, sty);
+  if (variants.isNone() && !isLiteralScrut(sty)) {
+    return Err(diag("E0402", scrut.span, "cannot match on a value of type `" + showType(env, sty) + "`"));
+  }
+  let covered: bool[] = [];
+  if (variants.isSome()) {
+    for (const _v of variants.unwrap()) {
+      covered.push(false);
+    }
+  }
+  let wild = false;
+  let target: Option<Type> = stmtPos ? Some(TyVoid) : exp;
+  let cur = s.fx;
+  let harms: HArm[] = [];
+  let allDiv = true;
+  for (const arm of arms) {
+    const r = checkArm(env, cur, arm, sty, variants, covered, wild, target, stmtPos)?;
+    cur = r.fx;
+    target = r.target;
+    allDiv = allDiv && r.div;
+    harms.push(r.arm);
+    covered = r.covered;
+    wild = r.wild;
+  }
+  if (!wild) {
+    if (variants.isSome()) {
+      let missing: string[] = [];
+      let i: usize = 0;
+      for (const v of variants.unwrap()) {
+        if (!covered[i]) {
+          missing.push(v.name);
+        }
+        i += 1;
+      }
+      if (missing.length > 0) {
+        return Err(diag("E0402", span, "non-exhaustive match: missing " + missing.join(", ")));
+      }
+    } else {
+      return Err(diag("E0402", span, "match on a scalar value requires a `_` arm"));
+    }
+  }
+  if (target.isNone()) {
+    return Err(diag("E0407", span, "cannot infer the type of a match whose arms all diverge"));
+  }
+  const ty = target.unwrap();
+  const div = stmtPos && arms.length > 0 && allDiv;
+  return Ok(MatchOut { fx: cur, expr: mk(XMatch(s.expr, harms), ty, span), div: div });
+}
+
+// ---------------------------------------------------------------------------
+// Statements
+// ---------------------------------------------------------------------------
+
+export function checkBlock(env: Env, fx: FnCtx, b: Block): Result<BlockOut, Diagnostic> {
+  let cur = pushScope(fx);
+  let stmts: HStmt[] = [];
+  let div = false;
+  for (const s of b.stmts) {
+    const r = checkStmt(env, cur, s)?;
+    cur = r.fx;
+    stmts.push(r.stmt);
+    div = r.div;
+  }
+  cur = popScope(cur);
+  return Ok(BlockOut { fx: cur, block: HBlock { stmts: stmts }, div: div });
+}
+
+function sout(fx: FnCtx, stmt: HStmt, div: bool): Result<StmtOut, Diagnostic> {
+  return Ok(StmtOut { fx: fx, stmt: stmt, div: div });
+}
+
+function checkStmt(env: Env, fx: FnCtx, s: Stmt): Result<StmtOut, Diagnostic> {
+  return match (s.kind) {
+    SLet(mutable, name, ty, init) => stmtLet(env, fx, mutable, name, ty, init),
+    SAssign(target, op, value) => stmtAssign(env, fx, target, op, value),
+    SExpr(e) => stmtExpr(env, fx, e),
+    SReturn(v) => stmtReturn(env, fx, s.span, v),
+    SIf(c, thenB, els) => stmtIf(env, fx, c, thenB, els),
+    SWhile(c, body) => stmtWhile(env, fx, c, body),
+    SForOf(name, iter, body) => stmtForOf(env, fx, name, iter, body),
+    SBreak => {
+      if (fx.loops.length == 0) {
+        return Err(diag("E0409", s.span, "`break` outside of a loop"));
+      }
+      return sout(markBreak(fx), HBreak, true);
+    },
+    SContinue => {
+      if (fx.loops.length == 0) {
+        return Err(diag("E0409", s.span, "`continue` outside of a loop"));
+      }
+      return sout(fx, HContinue, true);
+    },
+    SBlock(b) => {
+      const r = checkBlock(env, fx, b)?;
+      return sout(r.fx, HBlockStmt(r.block), r.div);
+    }
+  };
+}
+
+function letInit(env: Env, fx: FnCtx, ty: Option<TypeExpr>, init: Expr): Result<LetInit, Diagnostic> {
+  return match (ty) {
+    Some(te) => {
+      const t = resolveType(env, fx.unit, te, false)?;
+      const e = expect(env, fx, init, t)?;
+      return Ok(LetInit { fx: e.fx, expr: e.expr, ty: t });
+    },
+    None => {
+      const e = checkExpr(env, fx, init, None)?;
+      return Ok(LetInit { fx: e.fx, expr: e.expr, ty: e.expr.ty });
+    }
+  };
+}
+
+function stmtLet(
+  env: Env, fx: FnCtx, mutable: bool, name: Ident, ty: Option<TypeExpr>, init: Expr
+): Result<StmtOut, Diagnostic> {
+  const li = letInit(env, fx, ty, init)?;
+  if (isVoid(li.ty)) {
+    return Err(diag("E0400", init.span, "cannot bind a `void` value to a variable"));
+  }
+  if (declaredInScope(li.fx, name.name)) {
+    return Err(diag("E0304", name.span, "`" + name.name + "` is already declared in this block"));
+  }
+  const nl = newLocal(li.fx, name.name, li.ty, mutable);
+  const f2 = declare(nl.fx, name, nl.id)?;
+  return sout(f2, HLet(nl.id, li.expr), false);
+}
+
+function assignOpOf(op: AssignOp): Option<BinOp> {
+  return match (op) {
+    OpAssign => None,
+    OpAddAssign => Some(OpAdd),
+    OpSubAssign => Some(OpSub),
+    OpMulAssign => Some(OpMul),
+    OpDivAssign => Some(OpDiv),
+    OpRemAssign => Some(OpRem)
+  };
+}
+
+function isAddOp(o: BinOp): bool {
+  return match (o) { OpAdd => true, _ => false };
+}
+
+function stmtAssign(env: Env, fx: FnCtx, target: Expr, op: AssignOp, value: Expr): Result<StmtOut, Diagnostic> {
+  const pi = checkPlace(env, fx, target)?;
+  if (!pi.mutable) {
+    return Err(diag(
+      "E0401",
+      target.span,
+      "cannot assign to `" + pi.rootName + "`: it is not declared with `let`"
+    ));
+  }
+  const pty = pi.place.ty;
+  const hop = assignOpOf(op);
+  if (hop.isSome()) {
+    const o = hop.unwrap();
+    const ok = isIntish(pty) || (isAddOp(o) && isString(pty));
+    if (!ok) {
+      return Err(diag(
+        "E0410",
+        target.span,
+        "compound assignment is not defined for type `" + showType(env, pty) + "`"
+      ));
+    }
+  }
+  const v = expect(env, pi.fx, value, pty)?;
+  return sout(v.fx, HAssign(pi.place, hop, v.expr), false);
+}
+
+function stmtExpr(env: Env, fx: FnCtx, e: Expr): Result<StmtOut, Diagnostic> {
+  return match (e.kind) {
+    EMatch(sc, arms) => {
+      const m = checkMatch(env, fx, e.span, sc, arms, None, true)?;
+      return sout(m.fx, HExprStmt(m.expr), m.div);
+    },
+    _ => {
+      const r = checkExpr(env, fx, e, None)?;
+      return sout(r.fx, HExprStmt(r.expr), false);
+    }
+  };
+}
+
+function stmtReturn(env: Env, fx: FnCtx, span: Span, v: Option<Expr>): Result<StmtOut, Diagnostic> {
+  return match (v) {
+    None => {
+      if (!isVoid(fx.ret)) {
+        return Err(diag("E0400", span, "`return;` in a function returning `" + showType(env, fx.ret) + "`"));
+      }
+      return sout(fx, HReturn(None), true);
+    },
+    Some(e) => {
+      if (isVoid(fx.ret)) {
+        return Err(diag("E0400", e.span, "cannot return a value from a function returning `void`"));
+      }
+      const r = expect(env, fx, e, fx.ret)?;
+      return sout(r.fx, HReturn(Some(r.expr)), true);
+    }
+  };
+}
+
+function elseBranch(env: Env, fx: FnCtx, els: Option<Stmt>): Result<ElseOut, Diagnostic> {
+  return match (els) {
+    None => Ok(ElseOut { fx: fx, block: None, div: false }),
+    Some(es) => match (es.kind) {
+      SBlock(b) => {
+        const r = checkBlock(env, fx, b)?;
+        return Ok(ElseOut { fx: r.fx, block: Some(r.block), div: r.div });
+      },
+      _ => {
+        const r = checkStmt(env, fx, es)?;
+        return Ok(ElseOut { fx: r.fx, block: Some(HBlock { stmts: [r.stmt] }), div: r.div });
+      }
+    }
+  };
+}
+
+function stmtIf(env: Env, fx: FnCtx, cond: Expr, thenB: Block, els: Option<Stmt>): Result<StmtOut, Diagnostic> {
+  const c = expect(env, fx, cond, TyBool)?;
+  const t = checkBlock(env, c.fx, thenB)?;
+  const e = elseBranch(env, t.fx, els)?;
+  const div = t.div && els.isSome() && e.div;
+  return sout(e.fx, HIf(c.expr, t.block, e.block), div);
+}
+
+function isTrueLit(e: HExpr): bool {
+  return match (e.kind) {
+    XBool(b) => b,
+    _ => false
+  };
+}
+
+function stmtWhile(env: Env, fx: FnCtx, cond: Expr, body: Block): Result<StmtOut, Diagnostic> {
+  const c = expect(env, fx, cond, TyBool)?;
+  const b = checkBlock(env, pushLoop(c.fx), body)?;
+  const lp = popLoop(b.fx);
+  return sout(lp.fx, HWhile(c.expr, b.block), isTrueLit(c.expr) && !lp.broke);
+}
+
+function stmtForOf(env: Env, fx: FnCtx, name: Ident, iter: Expr, body: Block): Result<StmtOut, Diagnostic> {
+  const it = checkExpr(env, fx, iter, None)?;
+  return match (it.expr.ty) {
+    TyArray(elem) => {
+      const nl = newLocal(pushScope(it.fx), name.name, elem, false);
+      const f2 = declare(nl.fx, name, nl.id)?;
+      const b = checkBlock(env, pushLoop(f2), body)?;
+      const lp = popLoop(b.fx);
+      return sout(popScope(lp.fx), HForOf(nl.id, it.expr, b.block), false);
+    },
+    _ => Err(diag(
+      "E0400",
+      iter.span,
+      "`for ... of` requires an array, found `" + showType(env, it.expr.ty) + "`"
+    ))
+  };
+}

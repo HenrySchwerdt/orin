@@ -1,0 +1,79 @@
+// Checker driver: collect -> resolve declarations -> check bodies. Each phase stops the
+// pipeline if it produced diagnostics (same as bootstrap/src/checker/mod.rs `check`).
+
+import { Diagnostic, SourceMap, diag } from "../diag";
+import { Program, Function, HBlock } from "../hir";
+import { LoadedProgram } from "../loader";
+import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
+import { collect } from "./collect";
+import { resolveDecls, findMain } from "./decls";
+import { newFnCtx } from "./fnctx";
+import { checkBlock } from "./body";
+
+type FuncOut = { func: Function; err: Option<Diagnostic>; };
+
+function checkFunc(env: Env, f: FuncInfo): FuncOut {
+  const fx = newFnCtx(f);
+  const r = checkBlock(env, fx, f.decl.body);
+  return match (r) {
+    Err(d) => FuncOut {
+      func: Function {
+        name: f.qname,
+        paramCount: f.paramLocals.length,
+        locals: f.paramLocals,
+        ret: f.ret,
+        body: HBlock { stmts: [] },
+        span: f.decl.span
+      },
+      err: Some(d)
+    },
+    Ok(b) => {
+      let err: Option<Diagnostic> = None;
+      if (!isVoid(f.ret) && !b.div) {
+        err = Some(diag(
+          "E0403",
+          f.decl.name.span,
+          "function `" + f.decl.name.name + "` does not return a value on every path"
+        ));
+      }
+      return FuncOut {
+        func: Function {
+          name: f.qname,
+          paramCount: f.paramLocals.length,
+          locals: b.fx.locals,
+          ret: f.ret,
+          body: b.block,
+          span: f.decl.span
+        },
+        err: err
+      };
+    }
+  };
+}
+
+export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
+  const c = collect(prog);
+  if (c.diags.length > 0) {
+    return Err(dedupDiags(c.diags));
+  }
+  const r = resolveDecls(c.env, c.recordSrc, c.unionSrc);
+  if (r.diags.length > 0) {
+    return Err(dedupDiags(r.diags));
+  }
+  const env = r.env;
+  let diags: Diagnostic[] = [];
+  let funcs: Function[] = [];
+  for (const f of env.funcs) {
+    const o = checkFunc(env, f);
+    funcs.push(o.func);
+    match (o.err) {
+      Some(d) => { diags.push(d); },
+      None => {}
+    }
+  }
+  if (diags.length > 0) {
+    return Err(dedupDiags(diags));
+  }
+  const mainId = findMain(env).unwrapOr(0);
+  return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId });
+}
