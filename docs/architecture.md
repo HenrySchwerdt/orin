@@ -11,8 +11,10 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `docs/bootstrap-subset.md` | Frozen Orin-B subset compiled by Stage 0 and used to write Stage 1. |
 | `docs/decisions/` | ADRs (interpretations of OPEN points, deviations). |
 | `bootstrap/` | **Stage 0** compiler `orinb` in Rust (temporary). Orin-B → GNU C. |
-| `runtime/` | C runtime `orin_runtime.{h,c}` shared by all stages' generated code. |
+| `platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `platform/tests/` (contract tests, CBMC harnesses). |
+| `runtime/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
+| `stdlib/` | **Std modules in Orin** (`std:path`, `std:json`, `std:time`, `std:graph`): embedded library root, see docs/std.md. |
 | `std/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
@@ -98,6 +100,21 @@ so `stage2.c == stage3.c` still holds):
   console, `process.exit`); never call a built-in that is itself implemented in the prelude (the lowering
   would make it a recursive call); keep within what the self-hosted compiler accepts.
 
+## Platform layer (spec 19 R2)
+
+Everything the runtime needs from the OS or libc goes through `platform/orin_platform.h`: memory
+(`alloc`/`realloc`/`free`, `mem_copy/move/set/cmp/find`), decimal formatting, process (`init`, `arg_count/arg`,
+`getenv`, `at_exit`, `exit`, `abort`, `shell`), byte I/O (`write`, `write_line`, `flush`, `stdin_read`,
+`stdin_getc`) and whole-file operations (`file_read/write/exists`, `error_message`). `runtime/*.{c,h}` include only
+freestanding headers (`stddef.h`, `stdint.h`) plus the platform header; `tools/check_platform_boundary.sh`
+(run in CI) fails on any direct libc call or libc include in `runtime/`. The runtime includes the header as
+`../platform/orin_platform.h`, so `platform/` must be a sibling directory of `runtime/` in a checkout and in
+a package (`lib/orin/runtime`, `lib/orin/platform`); every link line is
+`cc -I runtime out.c runtime/orin_runtime.c platform/orin_platform.c`. The memory primitives are `static inline`
+in the header (no cost on hot paths); everything else is out of line. The platform layer owns the process-wide
+stdout buffer and the argv copy; the runtime keeps no libc state. Contracts, status labels and verification:
+docs/formal.md "L0 platform layer".
+
 ## Safety status (honest labelling, spec 07)
 
 | Property | Status |
@@ -109,4 +126,5 @@ so `stage2.c == stage3.c` still holds):
 | MIR ownership discipline | Independent verifier implemented (`compiler/verify`, docs/mir.md); lowering to MIR in progress; verifier itself not mechanically verified |
 | Link verifier ⇄ Lean model | **Proven for the structured MIR core** (`check_sound`: Lean checker transcribing docs/mir.md accepts ⇒ no use-after-free/double free/shared store), given a caller contract. Not covered: calls/builtins, loops, switch, arrays/strings; the Orin verifier source is not itself verified against the Lean checker (manual transcription). See docs/formal.md |
 | Source type safety (progress/preservation) | Not started |
+| L0 platform layer (`platform/`) | Contracts written (ACSL-style); memory/string/format primitives bounded-verified with CBMC; I/O, process and file primitives tested only (docs/formal.md) |
 | Native artifact | TCB: runtime, C compiler, allocator, emitter — unverified |

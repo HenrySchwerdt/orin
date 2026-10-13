@@ -1,0 +1,260 @@
+// Map<K, V> prelude (spec 08 std:map, ADR-0018): a value-semantics hash map written in Orin.
+//
+// This file is part of the `$array` prelude root (unit `$array/map`, always loaded; see array/module.or).
+// User code never imports it: the checker maps the type names `Map` / `MapEntry` to the generic records
+// below, `new Map<K, V>()` to `mapNew`, and `m.get(k)` etc. to the functions below with the receiver as
+// first argument (check/body.or, mapMethodCall). Keys are `int`, `usize`, `bool` or `string` (validated by the
+// checker when the type is written, E0400).
+//
+// Representation (copy-on-write like every record/array): insertion-ordered entry arrays plus an
+// open-addressing index table of entry numbers with linear probing.
+//   _keys / _vals / _live   entry i: its key, value and whether it is still present (deleted entries stay
+//                           as tombstones until the next rebuild, so `_keys.length - size` entries are dead)
+//   _tab                    index table (length 0 or a power of two >= 8): entry number or -1 (empty);
+//                           the entry count (incl. dead ones) never exceeds half of its length
+//   size                    number of live entries
+// Mutating operations take the map and return the updated map (the caller assigns it back, ADR-0009 style
+// lowering `m = mapSet(m, k, v)`); with owned parameters (ADR-0010) a unique map is updated in place.
+// Expected O(1) get/has/set/delete; keys/values/entries O(n); a rebuild (growth, or compaction when more
+// than half of the entries are dead) is amortised O(1) per insertion.
+
+export type Map<K, V> = {
+  size: usize;
+  _keys: K[];
+  _vals: V[];
+  _live: bool[];
+  _tab: int[];
+};
+
+export type MapEntry<K, V> = { key: K; value: V; };
+
+// ---------------------------------------------------------------- key classes
+// `keyHash` / `keyEq` are placeholders: a generic body cannot compare or hash a `K`, so the checker
+// replaces an instance `keyHash<int>` by `hashInt`, `keyHash<string>` by `hashStr`, ... (check/types.or,
+// instFunc). The bodies below are only ever type-checked (abstractly), never run.
+export function keyHash<K>(k: K): usize {
+  return 0;
+}
+
+export function keyEq<K>(a: K, b: K): bool {
+  return false;
+}
+
+// Hashes are < 2^32 and never trap: all intermediate products stay below 2^64.
+export function hashInt(k: int): usize {
+  let r = k % 2147483647;
+  if (r < 0) {
+    r += 2147483647;
+  }
+  return (r.toUsize() * 2654435761) % 4294967291;
+}
+
+export function hashUsize(k: usize): usize {
+  return ((k % 2147483647) * 2654435761) % 4294967291;
+}
+
+export function hashBool(k: bool): usize {
+  return k ? 1 : 0;
+}
+
+export function hashStr(s: string): usize {
+  let h: usize = 5381;
+  const n = s.length;
+  let i: usize = 0;
+  while (i < n) {
+    h = (h * 131 + s.charCodeAt(i).toUsize()) % 1000000007;
+    i += 1;
+  }
+  return h;
+}
+
+export function eqInt(a: int, b: int): bool {
+  return a == b;
+}
+
+export function eqUsize(a: usize, b: usize): bool {
+  return a == b;
+}
+
+export function eqBool(a: bool, b: bool): bool {
+  return a == b;
+}
+
+export function eqStr(a: string, b: string): bool {
+  return a == b;
+}
+
+// ---------------------------------------------------------------- table
+// Entry number of the live entry with key `k`, or -1.
+function findEntry<K, V>(m: Map<K, V>, k: K): int {
+  const cap = m._tab.length;
+  if (cap == 0) {
+    return -1;
+  }
+  let i = keyHash(k) % cap;
+  while (true) {
+    const e = m._tab[i];
+    if (e < 0) {
+      return -1;
+    }
+    const u = e.toUsize();
+    if (m._live[u] && keyEq(m._keys[u], k)) {
+      return e;
+    }
+    i += 1;
+    if (i == cap) {
+      i = 0;
+    }
+  }
+  return -1;
+}
+
+// Index table of the live entries of `ks` / `live` with `cap` slots (a power of two, load <= 1/2).
+function buildTab<K>(ks: K[], live: bool[], cap: usize): int[] {
+  let tab: int[] = [];
+  let j: usize = 0;
+  while (j < cap) {
+    tab.push(-1);
+    j += 1;
+  }
+  let e: usize = 0;
+  while (e < ks.length) {
+    if (live[e]) {
+      let i = keyHash(ks[e]) % cap;
+      while (tab[i] >= 0) {
+        i += 1;
+        if (i == cap) {
+          i = 0;
+        }
+      }
+      tab[i] = e.toInt();
+    }
+    e += 1;
+  }
+  return tab;
+}
+
+function tabCapFor(entries: usize): usize {
+  let cap: usize = 8;
+  while (cap < entries * 4) {
+    cap = cap * 2;
+  }
+  return cap;
+}
+
+// The map with dead entries dropped (insertion order kept) and an index table sized for `extra` more
+// entries. Returns `m` itself (updated in place when unique) when there is nothing to compact.
+function rebuild<K, V>(m: Map<K, V>, extra: usize): Map<K, V> {
+  let r = m;
+  if (r._keys.length == r.size) {
+    r._tab = buildTab(r._keys, r._live, tabCapFor(r.size + extra));
+    return r;
+  }
+  let ks: K[] = [];
+  let vs: V[] = [];
+  let lv: bool[] = [];
+  let i: usize = 0;
+  while (i < r._keys.length) {
+    if (r._live[i]) {
+      ks.push(r._keys[i]);
+      vs.push(r._vals[i]);
+      lv.push(true);
+    }
+    i += 1;
+  }
+  const tab = buildTab(ks, lv, tabCapFor(ks.length + extra));
+  return Map { size: ks.length, _keys: ks, _vals: vs, _live: lv, _tab: tab };
+}
+
+// ---------------------------------------------------------------- API
+export function mapNew<K, V>(): Map<K, V> {
+  return Map { size: 0, _keys: [], _vals: [], _live: [], _tab: [] };
+}
+
+export function mapGet<K, V>(m: Map<K, V>, k: K): Option<V> {
+  const e = findEntry(m, k);
+  if (e < 0) {
+    return None;
+  }
+  return Some(m._vals[e.toUsize()]);
+}
+
+export function mapHas<K, V>(m: Map<K, V>, k: K): bool {
+  return findEntry(m, k) >= 0;
+}
+
+export function mapSet<K, V>(m: Map<K, V>, k: K, v: V): Map<K, V> {
+  let r = m;
+  const at = findEntry(r, k);
+  if (at >= 0) {
+    r._vals[at.toUsize()] = v;
+    return r;
+  }
+  if ((r._keys.length + 1) * 2 > r._tab.length) {
+    r = rebuild(r, 1);
+  }
+  const cap = r._tab.length;
+  let i = keyHash(k) % cap;
+  while (r._tab[i] >= 0) {
+    i += 1;
+    if (i == cap) {
+      i = 0;
+    }
+  }
+  r._tab[i] = r._keys.length.toInt();
+  r._keys.push(k);
+  r._vals.push(v);
+  r._live.push(true);
+  r.size += 1;
+  return r;
+}
+
+export function mapDelete<K, V>(m: Map<K, V>, k: K): Map<K, V> {
+  let r = m;
+  const at = findEntry(r, k);
+  if (at < 0) {
+    return r;
+  }
+  r._live[at.toUsize()] = false;
+  r.size -= 1;
+  if (r._keys.length > 16 && r.size * 2 < r._keys.length) {
+    r = rebuild(r, 0);
+  }
+  return r;
+}
+
+export function mapKeys<K, V>(m: Map<K, V>): K[] {
+  let out: K[] = [];
+  let i: usize = 0;
+  while (i < m._keys.length) {
+    if (m._live[i]) {
+      out.push(m._keys[i]);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+export function mapValues<K, V>(m: Map<K, V>): V[] {
+  let out: V[] = [];
+  let i: usize = 0;
+  while (i < m._keys.length) {
+    if (m._live[i]) {
+      out.push(m._vals[i]);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+export function mapEntries<K, V>(m: Map<K, V>): MapEntry<K, V>[] {
+  let out: MapEntry<K, V>[] = [];
+  let i: usize = 0;
+  while (i < m._keys.length) {
+    if (m._live[i]) {
+      out.push(MapEntry { key: m._keys[i], value: m._vals[i] });
+    }
+    i += 1;
+  }
+  return out;
+}

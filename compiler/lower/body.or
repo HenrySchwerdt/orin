@@ -21,7 +21,7 @@ import { MType, MLocal, Operand, Instr, Terminator, SwitchCase, MFunction } from
 import { Item, buildBlocks } from "./items";
 import { preludeSlot } from "./prelude";
 import {
-  Lits, litId, isRefTy, isVoidTy, isUsizeTy, isStringTy, mty, isSimple, hasEffects, armsHaveEffects
+  Lits, litId, isRefTy, isVoidTy, isUsizeTy, isStringTy, isF32Ty, mty, isSimple, hasEffects, armsHaveEffects
 } from "./util";
 
 export type Cx = { prog: Program; fn: Function; nHir: usize; lits: Lits; };
@@ -248,6 +248,7 @@ function lowerArgs(cx: Cx, sc: Sc, c0: Ctr, es: HExpr[]): Args {
 export function expr(cx: Cx, sc: Sc, c: Ctr, e: HExpr): V {
   return match (e.kind) {
     XInt(v) => vConst(isUsizeTy(e.ty) ? OUsize(v) : OInt(v), c),
+    XFloat(t) => exprFloatLit(c, e, t),
     XBool(b) => vConst(OBool(b), c),
     XStr(s) => vConst(OStr(litId(cx.lits, s)), c),
     XLocal(l) => exprLocal(cx, c, l, e.ty),
@@ -274,6 +275,48 @@ function exprLocal(cx: Cx, c: Ctr, l: usize, ty: Type): V {
   const stable = !cx.fn.locals[l].mutable;
   const k: Kind = isRefTy(ty) ? KB : KS;
   return V { items: none, op: OLocal(l), k: k, root: l, stable: stable, c: c };
+}
+
+// A float literal; an f32 literal is rounded to binary32 (decimal -> double -> float, ADR-0018).
+function exprFloatLit(c: Ctr, e: HExpr, text: string): V {
+  if (!isF32Ty(e.ty)) {
+    return vConst(OFloat(text), c);
+  }
+  const t = tm(c, MFloat);
+  let items: Item[] = [];
+  items.push(t.d);
+  items.push(ii(IBuiltin(Some(t.id), BF32Round, [OFloat(text)])));
+  return vScalar(items, t.id, t.c);
+}
+
+// After an operation whose f32 result was computed in binary64: round to binary32 (ADR-0018).
+function roundF32(items0: Item[], id: usize, c: Ctr): V {
+  let items = items0;
+  const r = tm(c, MFloat);
+  items.push(r.d);
+  items.push(ii(IBuiltin(Some(r.id), BF32Round, [OLocal(id)])));
+  return vScalar(items, r.id, r.c);
+}
+
+// Builtins whose result may need rounding when it is an f32 (the others are exact on f32 inputs).
+function roundsF32(b: Builtin): bool {
+  return match (b) {
+    BFloatSqrt => true,
+    BFloatPow => true,
+    BIntToFloat => true,
+    BUsizeToFloat => true,
+    _ => false
+  };
+}
+
+function isArithBin(op: BinOp): bool {
+  return match (op) {
+    OpAdd => true,
+    OpSub => true,
+    OpMul => true,
+    OpDiv => true,
+    _ => false
+  };
 }
 
 function exprUnary(cx: Cx, sc: Sc, c0: Ctr, e: HExpr, op: UnOp, x: HExpr): V {
@@ -322,6 +365,9 @@ function exprBinary(cx: Cx, sc: Sc, c: Ctr, e: HExpr, op: BinOp, lhs: HExpr, rhs
   items.push(t.d);
   items.push(ii(IBinary(t.id, op, a.ops[0], a.ops[1])));
   items = items.concat(releaseOwned(a));
+  if (isF32Ty(e.ty) && isArithBin(op)) {
+    return roundF32(items, t.id, t.c);
+  }
   return vScalar(items, t.id, t.c);
 }
 
@@ -517,6 +563,9 @@ function exprBuiltin(cx: Cx, sc: Sc, c: Ctr, e: HExpr, b: Builtin, args: HExpr[]
   items = items.concat(releaseOwned(a));
   if (isRefTy(e.ty)) {
     return vOwned(items, t.id, t.c);
+  }
+  if (isF32Ty(e.ty) && roundsF32(b)) {
+    return roundF32(items, t.id, t.c);
   }
   return vScalar(items, t.id, t.c);
 }
@@ -1101,6 +1150,9 @@ function walkPlace(c0: Ctr, place: Place, idx: Operand[], fin: Fin, ty: Type): W
           c = nw.c;
           items.push(nw.d);
           items.push(ii(IBinary(nw.id, op, OLocal(old.id), v)));
+          if (isF32Ty(ty)) {
+            items.push(ii(IBuiltin(Some(nw.id), BF32Round, [OLocal(nw.id)])));
+          }
           match (el) {
             PField(_, i) => {
               items.push(ii(ISetField(cur, i, OLocal(nw.id))));
@@ -1484,6 +1536,9 @@ function stAssign(cx: Cx, sc: Sc, c0: Ctr, place: Place, op0: Option<BinOp>, val
         },
         Some(o) => {
           items.push(ii(IBinary(root, o, OLocal(root), vop)));
+          if (isF32Ty(ty)) {
+            items.push(ii(IBuiltin(Some(root), BF32Round, [OLocal(root)])));
+          }
         }
       }
     } else {

@@ -1,0 +1,188 @@
+// std:path -- lexical POSIX path utilities (spec 08, ADR-0016).
+//
+// Semantics (documented once, for every function):
+//   * Paths are byte strings with "/" as the only separator (POSIX). There is no Windows
+//     handling, no filesystem access, no symlink resolution and no current directory: every
+//     function is pure and lexical. Results follow Node's `path.posix` where Node has an
+//     equivalent function.
+//   * A path is absolute when it starts with "/".
+//   * Every function is total (never traps, never returns Result); odd input such as "" or
+//     "///" is handled as documented per function.
+//   * Complexity: all functions are O(n) in the total length of their input and allocate O(n).
+
+// Non-empty segments of `p` in order (no "." / ".." processing).
+function splitSegments(p: string): string[] {
+  let out: string[] = [];
+  for (const s of p.split("/")) {
+    if (s.length > 0) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+// isAbsolute(p: string): bool
+// True when `p` starts with "/". `isAbsolute("")` is false.
+export function isAbsolute(p: string): bool {
+  return p.length > 0 && p.charCodeAt(0) == 47;
+}
+
+// normalize(p: string): string
+// Resolves "." and ".." segments lexically and collapses repeated separators.
+//   * "" normalizes to "."; a relative path that reduces to nothing is "." ("a/.." -> ".").
+//   * ".." that would climb above the root of an absolute path is dropped ("/.." -> "/");
+//     in a relative path leading ".." segments are kept ("../a", "a/../.." -> "..").
+//   * A trailing separator is preserved ("a//b/" -> "a/b/", "./" -> "./"); the root is "/".
+// Examples: normalize("/a/./b/../c") == "/a/c"; normalize("a//b") == "a/b".
+export function normalize(p: string): string {
+  if (p.length == 0) {
+    return ".";
+  }
+  const abs = isAbsolute(p);
+  const trailing = p.charCodeAt(p.length - 1) == 47;
+  let out: string[] = [];
+  for (const s of splitSegments(p)) {
+    if (s == ".") {
+      continue;
+    }
+    if (s == "..") {
+      if (out.length > 0 && out[out.length - 1] != "..") {
+        out.pop();
+      } else if (!abs) {
+        out.push("..");
+      }
+      continue;
+    }
+    out.push(s);
+  }
+  const body = out.join("/");
+  if (abs) {
+    if (body.length == 0) {
+      return "/";
+    }
+    return trailing ? "/" + body + "/" : "/" + body;
+  }
+  if (body.length == 0) {
+    return trailing ? "./" : ".";
+  }
+  return trailing ? body + "/" : body;
+}
+
+// join(parts: string[]): string
+// Joins the non-empty `parts` with "/" and normalizes the result (see `normalize`). An empty
+// list, or a list of empty strings, gives ".". Like Node, a later absolute part does NOT reset
+// the path: join(["a", "/b"]) == "a/b" (use `resolveAgainst` to get reset semantics).
+// Examples: join(["/a", "b", "../c"]) == "/a/c"; join(["a", "", "b/"]) == "a/b/".
+export function join(parts: string[]): string {
+  let kept: string[] = [];
+  for (const q of parts) {
+    if (q.length > 0) {
+      kept.push(q);
+    }
+  }
+  if (kept.length == 0) {
+    return ".";
+  }
+  return normalize(kept.join("/"));
+}
+
+// resolveAgainst(base: string, p: string): string
+// `p` normalized when `p` is absolute, otherwise join([base, p]). Pure: there is no implicit
+// current directory, so `base` must be supplied by the caller.
+export function resolveAgainst(base: string, p: string): string {
+  if (isAbsolute(p)) {
+    return normalize(p);
+  }
+  return join([base, p]);
+}
+
+// End offset (exclusive) of `p` after dropping trailing "/" characters; 0 when `p` is all "/".
+function endWithoutSlashes(p: string): usize {
+  let e = p.length;
+  while (e > 0 && p.charCodeAt(e - 1) == 47) {
+    e -= 1;
+  }
+  return e;
+}
+
+// Start offset of the last segment of p[0..e) (the position after the last "/" before e).
+function lastSegmentStart(p: string, e: usize): usize {
+  let i = e;
+  while (i > 0 && p.charCodeAt(i - 1) != 47) {
+    i -= 1;
+  }
+  return i;
+}
+
+// dirname(p: string): string
+// The directory part of `p`, ignoring trailing separators; the path is NOT normalized.
+//   dirname("/a/b/c") == "/a/b"; dirname("/a/b/") == "/a"; dirname("a") == "."; dirname("") == ".";
+//   dirname("/a") == "/"; dirname("/") == "/"; dirname("a//b") == "a"; dirname("a/./b") == "a/.".
+export function dirname(p: string): string {
+  const e = endWithoutSlashes(p);
+  if (e == 0) {
+    return p.length > 0 ? "/" : ".";
+  }
+  const s = lastSegmentStart(p, e);
+  if (s == 0) {
+    return ".";
+  }
+  const d = endWithoutSlashes(p.substring(0, s));
+  if (d == 0) {
+    return "/";
+  }
+  return p.substring(0, d);
+}
+
+// basename(p: string): string
+// The last segment of `p`, ignoring trailing separators. basename("/a/b.txt") == "b.txt";
+// basename("a/b/") == "b"; basename("/") == ""; basename("") == "".
+export function basename(p: string): string {
+  const e = endWithoutSlashes(p);
+  if (e == 0) {
+    return "";
+  }
+  return p.substring(lastSegmentStart(p, e), e);
+}
+
+// extension(p: string): string
+// The extension of the basename including the leading dot, or "" when there is none (Node's
+// `extname`): extension("a/b.txt") == ".txt"; extension("a.tar.gz") == ".gz";
+// extension(".bashrc") == ""; extension("a.") == "."; extension("a") == ""; extension("..") == "".
+export function extension(p: string): string {
+  const b = basename(p);
+  let i = b.length;
+  while (i > 0) {
+    if (b.charCodeAt(i - 1) == 46) {
+      // i-1 is the last dot; a dot at offset 0 (".bashrc") or the name ".." has no extension.
+      if (i == 1 || b == "..") {
+        return "";
+      }
+      return b.substring(i - 1, b.length);
+    }
+    i -= 1;
+  }
+  return "";
+}
+
+// stem(p: string): string
+// The basename without its extension: stem("a/b.txt") == "b"; stem(".bashrc") == ".bashrc";
+// stem("a.tar.gz") == "a.tar".
+export function stem(p: string): string {
+  const b = basename(p);
+  const x = extension(p);
+  return b.substring(0, b.length - x.length);
+}
+
+// withExtension(p: string, ext: string): string
+// Replaces the extension of the basename of `p` by `ext` (which must include the dot, or be ""
+// to remove it). Trailing separators are dropped: withExtension("a/b.txt", ".md") == "a/b.md".
+// For "" or "/" (no basename) the result is `p + ext`.
+export function withExtension(p: string, ext: string): string {
+  const e = endWithoutSlashes(p);
+  if (e == 0) {
+    return p + ext;
+  }
+  const x = extension(p);
+  return p.substring(0, e - x.length) + ext;
+}

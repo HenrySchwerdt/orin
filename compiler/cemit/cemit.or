@@ -29,10 +29,18 @@ function isUsizeT(t: MType): bool {
   };
 }
 
+function isFloatT(t: MType): bool {
+  return match (t) {
+    MFloat => true,
+    _ => false
+  };
+}
+
 function cty(t: MType): string {
   return match (t) {
     MInt => "int64_t",
     MBool => "int64_t",
+    MFloat => "double",
     MUsize => "uint64_t",
     MVoid => "void",
     MRef => "OrinObj *"
@@ -43,12 +51,18 @@ function fromSlot(t: MType, code: string): string {
   if (isRefT(t)) {
     return "ORIN_REF(" + code + ")";
   }
+  if (isFloatT(t)) {
+    return "orin_s2f(" + code + ")";
+  }
   return "((" + cty(t) + ")(" + code + "))";
 }
 
 function toSlot(t: MType, code: string): string {
   if (isRefT(t)) {
     return "ORIN_SLOT(" + code + ")";
+  }
+  if (isFloatT(t)) {
+    return "orin_f2s(" + code + ")";
   }
   return "((uint64_t)(" + code + "))";
 }
@@ -126,6 +140,7 @@ function opTy(fx: Fx, o: Operand): MType {
     OInt(_) => MInt,
     OUsize(_) => MUsize,
     OBool(_) => MBool,
+    OFloat(_) => MFloat,
     OStr(_) => MRef
   };
 }
@@ -143,6 +158,7 @@ function opC(o: Operand): string {
     OInt(v) => intCode(v),
     OUsize(v) => "((uint64_t)" + v.toString() + "ULL)",
     OBool(b) => b ? "1" : "0",
+    OFloat(t) => "(" + t + ")",
     OStr(i) => "orin_s" + u(i)
   };
 }
@@ -182,12 +198,23 @@ function arith(op: BinOp, usz: bool, a: string, b: string): string {
   return "orin_" + name + "_" + suffix + "(" + a + ", " + b + ")";
 }
 
-function binaryC(op: BinOp, ref: bool, usz: bool, a: string, b: string): string {
+// IEEE arithmetic on doubles: plain C operators, no traps.
+function floatArith(op: BinOp, a: string, b: string): string {
+  const s = match (op) {
+    OpAdd => "+",
+    OpSub => "-",
+    OpMul => "*",
+    _ => "/"
+  };
+  return "(" + a + " " + s + " " + b + ")";
+}
+
+function binaryC(op: BinOp, ref: bool, usz: bool, flt: bool, a: string, b: string): string {
   return match (op) {
-    OpAdd => arith(op, usz, a, b),
-    OpSub => arith(op, usz, a, b),
-    OpMul => arith(op, usz, a, b),
-    OpDiv => arith(op, usz, a, b),
+    OpAdd => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpSub => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpMul => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpDiv => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
     OpRem => arith(op, usz, a, b),
     OpEq => ref ? "orin_str_eq(" + a + ", " + b + ")" : "(" + a + " == " + b + ")",
     OpNe => ref ? "(!orin_str_eq(" + a + ", " + b + "))" : "(" + a + " != " + b + ")",
@@ -229,6 +256,7 @@ function builtinC(op: Builtin, a: string[], rt: MType): string {
     BIoReadLine => "orin_io_read_line()",
     BIoWriteStdout => c1("orin_io_write_stdout", a),
     BIoShell => c1("orin_io_shell", a),
+    BTimeNowMillis => "orin_time_now_millis()",
     BStrLength => c1("orin_str_len", a),
     BStrCharCodeAt => c2("orin_str_char_code_at", a),
     BStrCharAt => c2("orin_str_char_at", a),
@@ -256,7 +284,23 @@ function builtinC(op: Builtin, a: string[], rt: MType): string {
     BOptUnwrap => dupIf(rt, fromSlot(rt, c1("orin_opt_unwrap", a))),
     BOptUnwrapOr => dupIf(rt, "(orin_tag(" + a[0] + ") == 0 ? " + fromSlot(rt, "orin_struct_get(" + a[0] + ", 0)") + " : " + a[1] + ")"),
     BResUnwrap => dupIf(rt, fromSlot(rt, c1("orin_res_unwrap", a))),
-    BResUnwrapErr => dupIf(rt, fromSlot(rt, c1("orin_res_unwrap_err", a)))
+    BResUnwrapErr => dupIf(rt, fromSlot(rt, c1("orin_res_unwrap_err", a))),
+    BParseFloat => c1("orin_parse_float", a),
+    BFloatToString => c1("orin_float_to_string", a),
+    BF32ToString => c1("orin_f32_to_string", a),
+    BIntToFloat => "((double)(" + a[0] + "))",
+    BUsizeToFloat => "((double)(" + a[0] + "))",
+    BFloatToInt => c1("orin_float_to_int", a),
+    BF32Round => "((double)(float)(" + a[0] + "))",
+    BF32ToFloat => "(" + a[0] + ")",
+    BFloatFloor => c1("__builtin_floor", a),
+    BFloatCeil => c1("__builtin_ceil", a),
+    BFloatRound => c1("__builtin_round", a),
+    BFloatSqrt => c1("__builtin_sqrt", a),
+    BFloatAbs => c1("__builtin_fabs", a),
+    BFloatPow => c2("__builtin_pow", a),
+    BFloatIsNaN => "((int64_t)(!!__builtin_isnan(" + a[0] + ")))",
+    BFloatIsFinite => "((int64_t)(!!__builtin_isfinite(" + a[0] + ")))"
   };
 }
 
@@ -285,8 +329,8 @@ function instrC(fx: Fx, i: Instr): string {
     IBorrow(d, s) => lname(d) + " = " + lname(s) + ";",
     IDup(d, o) => lname(d) + " = orin_dup(" + opC(o) + ");",
     IRelease(x) => "orin_release(" + lname(x) + ");",
-    IUnary(d, op, o) => lname(d) + " = " + unaryC(op, isUsizeT(fx.f.locals[d].ty), opC(o)) + ";",
-    IBinary(d, op, a, b) => lname(d) + " = " + binaryC(op, isRefT(opTy(fx, a)), isUsizeT(opTy(fx, a)), opC(a), opC(b)) + ";",
+    IUnary(d, op, o) => lname(d) + " = " + unaryC(op, isUsizeT(fx.f.locals[d].ty), isFloatT(fx.f.locals[d].ty), opC(o)) + ";",
+    IBinary(d, op, a, b) => lname(d) + " = " + binaryC(op, isRefT(opTy(fx, a)), isUsizeT(opTy(fx, a)), isFloatT(opTy(fx, a)), opC(a), opC(b)) + ";",
     ICall(d, f, args) => callC(fx, d, f, args),
     IBuiltin(d, b, args) => builtinInstr(fx, d, b, args),
     IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
@@ -310,10 +354,10 @@ function instrC(fx: Fx, i: Instr): string {
   };
 }
 
-function unaryC(op: UnOp, usz: bool, a: string): string {
+function unaryC(op: UnOp, usz: bool, flt: bool, a: string): string {
   return match (op) {
     UnNot => "(!" + a + ")",
-    UnNeg => usz ? "orin_neg_u(" + a + ")" : "orin_neg_i(" + a + ")"
+    UnNeg => flt ? "(-" + a + ")" : (usz ? "orin_neg_u(" + a + ")" : "orin_neg_i(" + a + ")")
   };
 }
 
@@ -464,6 +508,17 @@ function genFunction(fx: Fx, sig: string): string {
   return out.join("");
 }
 
+function usesFloat(prog: MProgram): bool {
+  for (const f of prog.functions) {
+    for (const l of f.locals) {
+      if (isFloatT(l.ty)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 export function emitC(prog: MProgram): string {
   let names: string[] = [];
   let i: usize = 0;
@@ -479,6 +534,10 @@ export function emitC(prog: MProgram): string {
   }
   let out: string[] = [];
   out.push("/* Generated by orinc (Orin Stage 1, MIR backend). Do not edit. */\n#include \"orin_runtime.h\"\n#include \"orin_runtime_mir.h\"\n#include \"orin_runtime_io.h\"\n\n");
+  if (usesFloat(prog)) {
+    // Programs with floats: no fused multiply-add (bit-identical results across backends); link with -lm.
+    out.push("#pragma STDC FP_CONTRACT OFF\n\n");
+  }
   i = 0;
   while (i < prog.strings.length) {
     const s = prog.strings[i];

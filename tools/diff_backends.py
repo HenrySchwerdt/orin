@@ -60,10 +60,10 @@ def build_and_run(args, name, entry, tag, extra, llvm=False):
         cc = [args.cc, "-O1", "-w", "-I", "runtime"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    srcs = [os.path.join("runtime", "orin_runtime.c")]
+    srcs = [os.path.join("runtime", "orin_runtime.c"), os.path.join("platform", "orin_platform.c")]
     if llvm:
         srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
-    rc, _, err = sh(cc + [c] + srcs + ["-o", exe], 120)
+    rc, _, err = sh(cc + [c] + srcs + ["-lm", "-o", exe], 120)
     if rc != 0:
         return ("cc-fail", err.decode("utf-8", "replace")[:300])
     rc, out, _ = sh([os.path.join(ROOT, exe)], 10)
