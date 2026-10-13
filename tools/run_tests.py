@@ -57,10 +57,11 @@ def head(text, lines=15, chars=1500):
     return out[:chars]
 
 
-def run_cmd(cmd, timeout, env=None):
+def run_cmd(cmd, timeout, env=None, stdin_data=None):
     try:
+        extra = {"input": stdin_data} if stdin_data is not None else {"stdin": subprocess.DEVNULL}
         r = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=timeout, env=env)
+                           timeout=timeout, env=env, **extra)
         return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
     except subprocess.TimeoutExpired as e:
         return None, (e.stdout or b"").decode("utf-8", "replace"), (e.stderr or b"").decode("utf-8", "replace")
@@ -126,7 +127,13 @@ def run_test(args, label, test):
     env = dict(os.environ)
     if args.sanitize:
         env["ASAN_OPTIONS"] = "detect_leaks=0"
-    rc, out, err = run_cmd([os.path.join(ROOT, exe)], RUN_TIMEOUT, env=env)
+    # Optional stdin: `name.in` next to `name.or`, or `input.in` next to `main.or`.
+    stdin_data = None
+    in_path = os.path.join(os.path.dirname(entry), "input.in" if os.path.basename(entry) == "main.or" else name + ".in")
+    if os.path.isfile(in_path):
+        with open(in_path, "rb") as f:
+            stdin_data = f.read()
+    rc, out, err = run_cmd([os.path.join(ROOT, exe)], RUN_TIMEOUT, env=env, stdin_data=stdin_data)
     if rc is None:
         return tag, False, "executable timed out after %d s" % RUN_TIMEOUT
     problems = []
