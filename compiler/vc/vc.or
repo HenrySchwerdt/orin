@@ -1073,6 +1073,108 @@ export function verifyContracts(prog: LoadedProgram, sm: SourceMap, z3: string):
   return Report { results: rt.out, warnings: rt.warns };
 }
 
+// ---------------------------------------------------------------------------
+// Refusal protocol (ADR-0029 §1-3): who has to act on a result
+// ---------------------------------------------------------------------------
+
+type Opt = { edit: string; changesSpec: bool; widensAuthority: bool; };
+
+// `FIX_CODE` | `STRENGTHEN_SPEC` | `NEEDS_DECISION`, or "" for a VERIFIED result (nothing to do).
+//   REFUTED call-precondition        FIX_CODE        (the caller passes an argument the callee forbids)
+//   REFUTED contract of the function NEEDS_DECISION  (the body or the contract is wrong; only a human knows which)
+//   UNKNOWN                          STRENGTHEN_SPEC (loop, missing callee contract, unsupported fragment, solver limit)
+// NEEDS_AUTHORITY does not arise here: no verification result needs a grant or a dependency rule.
+function actionOf(r: Res): string {
+  if (r.status == "REFUTED") {
+    return r.kind == "call-precondition" ? "FIX_CODE" : "NEEDS_DECISION";
+  }
+  return r.status == "UNKNOWN" ? "STRENGTHEN_SPEC" : "";
+}
+
+// The inputs of a counterexample as a condition: `x == 1 && y == 2`.
+function cexCondition(r: Res): string {
+  let parts: string[] = [];
+  for (const c of r.cex) {
+    parts.push(c.split(" = ").join(" == "));
+  }
+  return parts.join(" && ");
+}
+
+function callOf(r: Res): string {
+  let parts: string[] = [];
+  for (const c of r.cex) {
+    parts.push(c);
+  }
+  return r.fn + "(" + parts.join(", ") + ")";
+}
+
+// A precondition that excludes exactly the counterexample, or "" when there is none.
+function candidatePrecondition(r: Res): string {
+  if (r.status != "REFUTED" || r.kind == "call-precondition" || r.cex.length == 0) {
+    return "";
+  }
+  return "@Requires(!(" + cexCondition(r) + "))";
+}
+
+// The question of a NEEDS_DECISION result, one sentence a human can answer without reading the code.
+function questionOf(r: Res): string {
+  if (actionOf(r) != "NEEDS_DECISION") {
+    return "";
+  }
+  const at = r.cex.length > 0 ? callOf(r) + " violates " : r.fn + " violates ";
+  return at + r.clause + ". Is the body wrong (fix it), is this input meant to be excluded (add a precondition), or is the contract itself wrong (change it)?";
+}
+
+function optionsOf(r: Res): Opt[] {
+  let out: Opt[] = [];
+  if (actionOf(r) != "NEEDS_DECISION") {
+    return out;
+  }
+  out.push(Opt { edit: "change the body of `" + r.fn + "` so that " + r.clause + " holds for this input", changesSpec: false, widensAuthority: false });
+  const cand = candidatePrecondition(r);
+  if (cand != "") {
+    out.push(Opt { edit: "add `" + cand + "` to `" + r.fn + "` (callers must then establish it)", changesSpec: true, widensAuthority: false });
+  }
+  out.push(Opt { edit: "weaken or remove " + r.clause + " (a weaker guarantee)", changesSpec: true, widensAuthority: true });
+  return out;
+}
+
+// Contract suggestions for a STRENGTHEN_SPEC / NEEDS_DECISION result. They are suggestions, never
+// verified. UNKNOWN results carry none: the solver gives no counterexample to derive one from.
+function candidatesOf(r: Res): string[] {
+  let out: string[] = [];
+  const c = candidatePrecondition(r);
+  if (c != "") {
+    out.push(c);
+  }
+  return out;
+}
+
+function jsonBool(b: bool): string {
+  return b ? "true" : "false";
+}
+
+function jsonOptions(os: Opt[]): string {
+  let out: string[] = [];
+  for (const o of os) {
+    out.push("{\"edit\":" + jsonString(o.edit) + ",\"changes_spec\":" + jsonBool(o.changesSpec) + ",\"widens_authority\":" + jsonBool(o.widensAuthority) + "}");
+  }
+  return out.join(",");
+}
+
+function jsonAction(a: string): string {
+  return a == "" ? "null" : jsonString(a);
+}
+
+// The ADR-0029 fields of a result: `action`, `question`, `options`, `candidates`, `evidence`.
+function protocolJson(r: Res): string {
+  const loc = r.file + ":" + r.line.toString();
+  return "\"action\":" + jsonAction(actionOf(r)) + ",\"question\":" + (questionOf(r) == "" ? "null" : jsonString(questionOf(r)))
+    + ",\"options\":[" + jsonOptions(optionsOf(r)) + "],\"candidates\":[" + jsonStrings(candidatesOf(r))
+    + "],\"evidence\":{\"clause\":" + jsonString(r.clause) + ",\"location\":" + jsonString(loc) + ",\"counterexample\":["
+    + jsonStrings(r.cex) + "]}";
+}
+
 function jsonRes(r: Res): string {
   let rules: string[] = [];
   for (const x of r.rules) {
@@ -1085,7 +1187,7 @@ function jsonRes(r: Res): string {
   return "{\"function\":" + jsonString(r.fn) + ",\"file\":" + jsonString(r.file) + ",\"line\":" + r.line.toString()
     + ",\"kind\":" + jsonString(r.kind) + ",\"clause\":" + jsonString(r.clause) + ",\"rules\":[" + rules.join(",")
     + "],\"status\":" + jsonString(r.status) + ",\"reason\":" + jsonString(r.reason) + ",\"counterexample\":["
-    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]}";
+    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]," + protocolJson(r) + "}";
 }
 
 function jsonStrings(xs: string[]): string {
@@ -1133,7 +1235,7 @@ function assumptionsOf(r: Res): string[] {
 function jsonWarn(w: QWarn): string {
   return "{\"code\":" + jsonString(w.code) + ",\"function\":" + jsonString(w.fn) + ",\"file\":" + jsonString(w.file)
     + ",\"line\":" + w.line.toString() + ",\"kind\":" + jsonString(w.kind) + ",\"clause\":" + jsonString(w.clause)
-    + ",\"message\":" + jsonString(w.message) + ",\"status\":" + jsonString(w.status) + ",\"assumptions\":[]}";
+    + ",\"message\":" + jsonString(w.message) + ",\"status\":" + jsonString(w.status) + ",\"assumptions\":[],\"action\":\"STRENGTHEN_SPEC\"}";
 }
 
 function count(rs: Res[], status: string): usize {
@@ -1170,6 +1272,20 @@ export function reportText(rep: Report): string {
     if (r.cex.length > 0) {
       s += "\n    counterexample: " + r.cex.join(", ");
     }
+    if (actionOf(r) != "") {
+      s += "\n    action: " + actionOf(r);
+    }
+    if (questionOf(r) != "") {
+      s += "\n    question: " + questionOf(r);
+      let k: usize = 1;
+      for (const o of optionsOf(r)) {
+        s += "\n    option " + k.toString() + ": " + o.edit + " (changes_spec: " + jsonBool(o.changesSpec) + ", widens_authority: " + jsonBool(o.widensAuthority) + ")";
+        k += 1;
+      }
+    }
+    for (const c of candidatesOf(r)) {
+      s += "\n    candidate: " + c;
+    }
     lines.push(s);
   }
   if (count(rep.results, "VERIFIED") > 0) {
@@ -1183,7 +1299,7 @@ export function reportText(rep: Report): string {
     }
   }
   for (const w of rep.warnings) {
-    lines.push("warning[" + w.code + "]  " + w.fn + ": " + w.clause + "  (" + w.file + ":" + w.line.toString() + ")\n    " + w.message);
+    lines.push("warning[" + w.code + "]  " + w.fn + ": " + w.clause + "  (" + w.file + ":" + w.line.toString() + ")\n    " + w.message + "\n    action: STRENGTHEN_SPEC");
   }
   lines.push("verified " + count(rep.results, "VERIFIED").toString() + ", refuted " + count(rep.results, "REFUTED").toString()
     + ", unknown " + count(rep.results, "UNKNOWN").toString());
