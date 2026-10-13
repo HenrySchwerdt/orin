@@ -352,6 +352,43 @@ def run(exe):
     check("y: int" in hover("y: 2", 0), "rich: hover field (%r)" % hover("y: 2", 0))
     check("Pos" in hover("pos.x)", 0, 1) or "int" in hover("pos.x)", 0, 1), "rich: hover member (%r)" % hover("pos.x)", 0, 1))
 
+    # ---- template literals and fixed-width integers (ADR-0022): identifiers inside `${...}` resolve ----
+    tpl = os.path.join(tmp, "tpl.or")
+    tpl_text = (
+        "type P = { x: i32; };\n\n"
+        "function greet(name: string, age: u8): string {\n"
+        "  return `Hello ${name}, you are ${age + 1} (${`${name}!`})`;\n"
+        "}\n\n"
+        "function main(): void {\n"
+        "  const p = P { x: 5 };\n"
+        "  console.log(greet(\"Ann\", 7) + `${p.x}`);\n"
+        "}\n")
+    open_doc(c, tpl, tpl_text)
+    d = sync(c, uri_of(tpl))
+    check(d == [], "template: no diagnostics (got %r)" % (d,))
+    r = c.request("textDocument/definition", td(tpl, pos_of(tpl_text, "name}", 0)))
+    locs = r.get("result") or []
+    if isinstance(locs, dict):
+        locs = [locs]
+    check(len(locs) == 1 and locs[0]["range"]["start"] == pos_of(tpl_text, "name:", 0),
+          "template: go to definition of a parameter used in ${} (got %r)" % (locs,))
+    r = c.request("textDocument/references", {**td(tpl, pos_of(tpl_text, "name:", 0)), "context": {"includeDeclaration": True}})
+    check(len(r.get("result") or []) == 3, "template: references of a parameter (decl + 2 in ${}) -> %d" % len(r.get("result") or []))
+    r = c.request("textDocument/hover", td(tpl, pos_of(tpl_text, "age + 1", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("u8" in hv, "template: hover of a parameter inside ${} (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(tpl, pos_of(tpl_text, "p.x}", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("P" in hv, "template: hover of a local inside ${} (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(tpl, pos_of(tpl_text, "x: i32", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("i32" in hv, "integers: hover of a field of type i32 (got %r)" % (hv,))
+    tpl_bad = tpl_text.replace("`${p.x}`", "`${p}`")
+    change_doc(c, tpl, tpl_bad, 2)
+    d = sync(c, uri_of(tpl))
+    check(len(d) == 1 and d[0].get("code") == "E0432" and d[0]["range"]["start"] == pos_of(tpl_bad, "p}`", 0),
+          "template: diagnostic E0432 on an interpolated record, located at the expression (got %r)" % (d,))
+
     # ---- contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses ----
     kc = os.path.join(tmp, "contracts.or")
     kc_good = ("@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int {\n  return a;\n}\n\n"

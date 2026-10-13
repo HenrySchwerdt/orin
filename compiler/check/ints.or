@@ -1,0 +1,190 @@
+// Fixed-width integer helpers of the checker (ADR-0022): type names, literal fitting, explicit conversions and
+// the integer built-in methods. Kind numbers are those of hir.or (`intKindOf`): 0 i8, 1 i16, 2 i32, 3 i64 (= int),
+// 4 isize, 5 u8, 6 u16, 7 u32, 8 u64, 9 usize.
+
+import { Span } from "../diag";
+import { Type, HExpr, HExprKind, Builtin, intKindOf, kindType, kindName, kindSigned, kindNarrow, kindUnsigned64, kindLo, kindHi } from "../hir";
+
+// The integer type named `n`, if any. `i128` / `u128` are recognised by `is128` and rejected by the caller.
+export function intNamed(n: string): Option<Type> {
+  if (n == "int" || n == "i64") {
+    return Some(TyInt);
+  }
+  if (n == "usize") {
+    return Some(TyUsize);
+  }
+  const names = ["i8", "i16", "i32", "i64", "isize", "u8", "u16", "u32", "u64", "usize"];
+  let k: usize = 0;
+  while (k < names.length) {
+    if (names[k] == n) {
+      return Some(kindType(k.toInt()));
+    }
+    k += 1;
+  }
+  return None;
+}
+
+export function is128(n: string): bool {
+  return n == "i128" || n == "u128";
+}
+
+// The type of an integer literal: the expected type when it is an integer type, else `int`.
+export function litTypeOf(exp: Option<Type>): Type {
+  return match (exp) {
+    Some(t) => intKindOf(t) >= 0 ? t : TyInt,
+    None => TyInt
+  };
+}
+
+// Does the (mathematical) integer value `n` (a non-negative literal, or a negated one when `neg`) fit in the type?
+// Literals up to 2^63-1 are plain ints; the u64 / usize range above that is the EBigInt literal.
+export function litFits(n: int, neg: bool, t: Type): bool {
+  const k = intKindOf(t);
+  if (k < 0) {
+    return false;
+  }
+  if (neg) {
+    return kindSigned(k) && (!kindNarrow(k) || 0 - n >= kindLo(k));
+  }
+  if (kindNarrow(k)) {
+    return n <= kindHi(k);
+  }
+  return true;
+}
+
+export function rangeText(k: int): string {
+  if (kindUnsigned64(k)) {
+    return "0 to 18446744073709551615";
+  }
+  return kindLo(k).toString() + " to " + kindHi(k).toString();
+}
+
+function mk(kind: HExprKind, ty: Type, span: Span): HExpr {
+  return HExpr { kind: kind, ty: ty, span: span };
+}
+
+function intLit(v: int, span: Span): HExpr {
+  return mk(XInt(v), TyInt, span);
+}
+
+// The kind named by a conversion method `toI8` .. `toUsize` (and `toInt`), else -1.
+export function convMethodKind(name: string): int {
+  if (name == "toInt") {
+    return 3;
+  }
+  const names = ["toI8", "toI16", "toI32", "toI64", "toIsize", "toU8", "toU16", "toU32", "toU64", "toUsize"];
+  let k: usize = 0;
+  while (k < names.length) {
+    if (names[k] == name) {
+      return k.toInt();
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+// Explicit conversion of the integer expression `e` to kind `dk` (traps when the value does not fit).
+export function convExpr(e: HExpr, dk: int, span: Span): HExpr {
+  const sk = intKindOf(e.ty);
+  const dt = kindType(dk);
+  if (sk == dk) {
+    return mk(e.kind, dt, span);
+  }
+  if (sk == 3 && dk == 9) {
+    return mk(XBuiltin(BIntToUsize, [e]), dt, span);
+  }
+  if (sk == 9 && dk == 3) {
+    return mk(XBuiltin(BUsizeToInt, [e]), dt, span);
+  }
+  const srcU = kindUnsigned64(sk);
+  const dstU = kindUnsigned64(dk);
+  if (srcU && dstU) {
+    return mk(XBuiltin(BIntId, [e]), dt, span);
+  }
+  if (srcU) {
+    // u64 / usize -> signed or narrow: unsigned compare against the upper bound
+    return mk(XBuiltin(BUIntConv, [e, intLit(kindHi(dk), span)]), dt, span);
+  }
+  if (dstU) {
+    // signed pattern -> u64 / usize: only non-negative values fit (the unsigned narrow kinds always do)
+    if (sk >= 5) {
+      return mk(XBuiltin(BIntId, [e]), dt, span);
+    }
+    return mk(XBuiltin(BIntConv, [e, intLit(0, span), intLit(9223372036854775807, span)]), dt, span);
+  }
+  // both are MInt values: no check when the source range is inside the target range
+  if (kindLo(dk) <= kindLo(sk) && kindHi(sk) <= kindHi(dk)) {
+    return mk(XBuiltin(BIntId, [e]), dt, span);
+  }
+  return mk(XBuiltin(BIntConv, [e, intLit(kindLo(dk), span), intLit(kindHi(dk), span)]), dt, span);
+}
+
+// `a.wrappingAdd(b)` etc.: the mode of the method and whether it returns an Option (`checked*`).
+// wrapping 0..2, saturating 3..5, checked 0..2 (add, sub, mul order); -1 if `name` is not one of them.
+export function arithMethodMode(name: string): int {
+  const ops = ["Add", "Sub", "Mul"];
+  let i: usize = 0;
+  while (i < 3) {
+    if (name == "wrapping" + ops[i]) {
+      return i.toInt();
+    }
+    if (name == "saturating" + ops[i]) {
+      return i.toInt() + 3;
+    }
+    if (name == "checked" + ops[i]) {
+      return i.toInt() + 6;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// The built-in call for an arithmetic method; `mode` is the result of arithMethodMode.
+export function arithExpr(mode: int, a: HExpr, b: HExpr, span: Span): HExpr {
+  const k = intKindOf(a.ty);
+  if (mode >= 6) {
+    return mk(XBuiltin(BIntChk, [intLit(mode - 6, span), a, b, intLit(k, span)]), TyOption(a.ty), span);
+  }
+  return mk(XBuiltin(BIntOp, [intLit(mode, span), a, b, intLit(k, span)]), a.ty, span);
+}
+
+// `parseI32(s)` etc.: the kind, or -1.
+export function parseFnKind(name: string): int {
+  const names = ["parseI8", "parseI16", "parseI32", "parseI64", "parseIsize", "parseU8", "parseU16", "parseU32", "parseU64", "parseUsize"];
+  let k: usize = 0;
+  while (k < names.length) {
+    if (names[k] == name) {
+      return k.toInt();
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+// `parseI32(s)`: Option of the parsed value.
+export function parseExpr(s: HExpr, k: int, span: Span): HExpr {
+  return mk(XBuiltin(BParseIntK, [s, intLit(k, span)]), TyOption(kindType(k)), span);
+}
+
+// Suffix of the prelude helpers (`indexOfInt`, `hashUsize`, ...) that serve an integer type: every type held
+// in an MInt uses the `int` helpers, u64 / usize the `usize` helpers; "" for non-integers.
+export function classSuffix(t: Type): string {
+  const k = intKindOf(t);
+  if (k < 0) {
+    return "";
+  }
+  return kindUnsigned64(k) ? "Usize" : "Int";
+}
+
+// The trap-free methods of the integer receiver type `t` that map to a single builtin: toString, toFloat, toF32.
+export function intToStringOp(t: Type): Builtin {
+  return kindUnsigned64(intKindOf(t)) ? BUsizeToString : BIntToString;
+}
+
+export function intToFloatOp(t: Type): Builtin {
+  return kindUnsigned64(intKindOf(t)) ? BUsizeToFloat : BIntToFloat;
+}
+
+export function typeNameOf(t: Type): string {
+  return kindName(intKindOf(t));
+}

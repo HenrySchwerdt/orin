@@ -96,11 +96,39 @@ Compiles through the MIR pipeline to C at `out`; with `binary` also links it wit
 `<repo>/runtime`. `{"ok":true,"c":"build/main.c","bytes":58213,"binary":"build/main"}`; compile
 errors return `{"ok":false,"errors":N,"diags":[...]}` in the `check` compact format.
 
+### `graph` {entry, full?, out?}
+
+OSIG snapshot (`docs/osig.md`, ADR-0023) of the checked program rooted at `entry` (a file or a package
+directory): symbols, modules, `CALLS` edges with `MUST`/`MAY`/`UNKNOWN` evidence, imports, implements,
+type references, contract clauses. Same engine as `orin graph`. Returns the summary
+`{"schema","package","hash","nodes","edges"}`; `full: true` adds `"snapshot"` (the deterministic
+snapshot text); `out` also writes it to a file inside the root. A project with errors is a tool error
+carrying the rendered diagnostics.
+
+```json
+→ {"entry":"shop"}
+← {"schema":"osig/0.1","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
+```
+
+### `diff` {base, head, format?, out?}
+
+Compares two OSIG snapshots (`base`, `head`: package directory, entry `.or` file or a snapshot `.json`
+written by `graph`): changed / added / removed symbols, added / removed call, import, implements and
+type-reference edges, **heuristic** rename candidates (never identity), and for every changed symbol and
+every new call the entry points that reach it with the explaining path and per-hop evidence. `format`:
+`json` (default, `osig-diff/0.1`), `text` or `html` (one self-contained file); `out` writes the report
+inside the root and returns `{"written","differences"}`. Same engine as `orin diff`.
+
+```json
+→ {"base":"acme-base","head":"acme-head"}
+← {"schema":"osig-diff/0.1","differences":true,"summary":{"added":4,"removed":1,"changed":1,...},"changedSymbols":[...],"possibleRenames":[{"heuristic":true,...}],"newCallPaths":[...],...}
+```
+
 ## Security model
 
 * Reads and writes are confined to `--root` (lexical normalisation; **symlinks are not resolved**, so a
   symlink inside the root can point out of it — run with a root you trust or inside a sandbox).
-* A project that imports a file outside the root is refused for `check`/`inspect`/`edit`/`build`.
+* A project that imports a file outside the root is refused for `check`/`inspect`/`edit`/`build`/`graph`/`diff`.
 * `test`/`build` run `cc` and project code with the server's privileges: they are off unless
   `--allow-exec` is given. Even then the process is not sandboxed; run the server in a container for
   untrusted projects. Temporary artifacts go to `<root>/.orin-mcp/`.

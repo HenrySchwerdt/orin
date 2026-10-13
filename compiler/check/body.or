@@ -14,10 +14,10 @@ import {
 } from "../syntax";
 import {
   Type, Function, Local, FieldDef, RecordDef, VariantDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm,
-  HPattern, Builtin, MutBuiltin
+  HPattern, Builtin, MutBuiltin, intKindOf, kindType, kindSigned, kindUnsigned64, i64Min
 } from "../hir";
 import {
-  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, typeEq, isInt, isUsize, isBool, isString, isVoid,
+  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, typeEq, isInt, isUsize, isSignedInt, isBool, isString, isVoid,
   isIntish, isFloatTy, isNumeric, isArrayTy, isFn, isIface, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq,
   boundOf, ifaceMethodIndex
 } from "./env";
@@ -29,6 +29,10 @@ import {
 } from "./fnctx";
 import { builtinSig, methodSig, Sig, MSig } from "./builtins";
 import { checkPattern, PatOut } from "./pattern";
+import {
+  litTypeOf, litFits, rangeText, convMethodKind, convExpr, arithMethodMode, arithExpr, parseFnKind, parseExpr, classSuffix,
+  intToStringOp
+} from "./ints";
 import {
   TScope, resolveType, aliasType, instType, instFunc, unify, noBinds, mentionsUnbound, indexOfName, scopeOf
 } from "./types";
@@ -78,6 +82,7 @@ function isArithOp(op: BinaryOp): bool {
 function untypedInt(e: Expr): bool {
   return match (e.kind) {
     EInt(_) => true,
+    EBigInt(_) => true,
     EFloat(_) => true,
     EUnary(op, x) => match (op) { UNeg => untypedInt(x), _ => false },
     EBinary(op, l, r) => isArithOp(op) && untypedInt(l) && untypedInt(r),
@@ -206,7 +211,9 @@ function ifaceCall(
 export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
   const span = e.span;
   return match (e.kind) {
-    EInt(n) => done(fx, XInt(n), expIsUsize(exp) ? TyUsize : TyInt, span),
+    EInt(n) => checkIntLit(env, fx, n, exp, span),
+    EBigInt(n) => checkBigIntLit(env, fx, n, exp, span),
+    ETemplate(parts, xs) => checkTemplate(env, fx, span, parts, xs),
     EFloat(t) => done(fx, XFloat(t), expIsF32(exp) ? TyF32 : TyFloat, span),
     EStr(s) => done(fx, XStr(s), TyString, span),
     EBool(b) => done(fx, XBool(b), TyBool, span),
@@ -228,6 +235,94 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     EArrow(ps, rte, body) => fx.cmode > 0
       ? Err(diag("E0416", span, "closures are not allowed in a contract expression"))
       : checkArrowExp(env, fx, span, ps, rte, body, exp)
+  };
+}
+
+// An integer literal adopts the expected integer type (ADR-0022); it must fit.
+function checkIntLit(env: Env, fx: FnCtx, n: int, exp: Option<Type>, span: Span): Result<ExprOut, Diagnostic> {
+  const t = litTypeOf(exp);
+  if (!litFits(n, false, t)) {
+    return Err(litRange(fx.env, span, n.toString(), t));
+  }
+  return done(fx, XInt(n), t, span);
+}
+
+function litRange(env: Env, span: Span, text: string, t: Type): Diagnostic {
+  return diag(
+    "E0430",
+    span,
+    "integer literal `" + text + "` does not fit in `" + showType(env, t) + "` (" + rangeText(intKindOf(t)) + ")"
+  );
+}
+
+// A literal in 2^63 .. 2^64-1 (the lexer holds its 64-bit pattern): only `u64` and `usize` have room for it.
+function checkBigIntLit(env: Env, fx: FnCtx, n: int, exp: Option<Type>, span: Span): Result<ExprOut, Diagnostic> {
+  const t = litTypeOf(exp);
+  const k = intKindOf(t);
+  if (k != 8 && k != 9) {
+    return Err(diag(
+      "E0430",
+      span,
+      "integer literal does not fit in `" + showType(fx.env, t) + "`; values above 9223372036854775807 need type `u64` or `usize`"
+    ));
+  }
+  return done(fx, XInt(n), t, span);
+}
+
+// `${e}` of a template literal: `string`, integers, `float`, `f32` and `bool` convert implicitly (ADR-0022).
+function interpolated(env: Env, e: HExpr, span: Span): Result<HExpr, Diagnostic> {
+  const t = e.ty;
+  if (isString(t)) {
+    return Ok(e);
+  }
+  if (isIntish(t)) {
+    return Ok(mk(XBuiltin(intToStringOp(t), [e]), TyString, span));
+  }
+  const op: Option<Builtin> = match (t) {
+    TyFloat => Some(BFloatToString),
+    TyF32 => Some(BF32ToString),
+    TyBool => Some(BBoolToString),
+    _ => None
+  };
+  if (op.isSome()) {
+    return Ok(mk(XBuiltin(op.unwrap(), [e]), TyString, span));
+  }
+  return Err(diag(
+    "E0432",
+    span,
+    "cannot interpolate a value of type `" + showType(env, t)
+      + "` in a template literal; only `string`, integers, `float`, `f32` and `bool` convert implicitly, convert it explicitly (call `.toString()`)"
+  ));
+}
+
+// A template literal: the parts and the interpolated values are concatenated left to right with `+` on strings,
+// which the lowering turns into appends onto one fresh buffer (linear, no repeated copying).
+function checkTemplate(env: Env, fx: FnCtx, span: Span, parts: string[], xs: Expr[]): Result<ExprOut, Diagnostic> {
+  let cur = fx;
+  let acc: Option<HExpr> = None;
+  let i: usize = 0;
+  while (i < parts.length) {
+    if (parts[i].length > 0) {
+      const piece = mk(XStr(parts[i]), TyString, span);
+      acc = match (acc) {
+        Some(a) => Some(mk(XBinary(OpAdd, a, piece), TyString, span)),
+        None => Some(piece)
+      };
+    }
+    if (i < xs.length) {
+      const r = checkExpr(env, cur, xs[i], None)?;
+      cur = r.fx;
+      const h = interpolated(cur.env, r.expr, xs[i].span)?;
+      acc = match (acc) {
+        Some(a) => Some(mk(XBinary(OpAdd, a, h), TyString, span)),
+        None => Some(h)
+      };
+    }
+    i += 1;
+  }
+  return match (acc) {
+    Some(a) => Ok(ExprOut { fx: cur, expr: a }),
+    None => done(cur, XStr(""), TyString, span)
   };
 }
 
@@ -375,10 +470,26 @@ function isFloatHint(exp: Option<Type>): bool {
 function checkNeg(env: Env, fx: FnCtx, span: Span, inner: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
   const lit = intLitValue(inner);
   if (lit.isSome()) {
-    if (expIsUsize(exp)) {
-      return Err(diag("E0400", span, "negative integer literal cannot have type `usize`"));
+    const t = litTypeOf(exp);
+    if (!kindSigned(intKindOf(t))) {
+      return Err(diag("E0400", span, "negative integer literal cannot have type `" + showType(fx.env, t) + "`"));
     }
-    return done(fx, XInt(-lit.unwrap()), TyInt, span);
+    if (!litFits(lit.unwrap(), true, t)) {
+      return Err(litRange(fx.env, span, "-" + lit.unwrap().toString(), t));
+    }
+    return done(fx, XInt(-lit.unwrap()), t, span);
+  }
+  match (inner.kind) {
+    EBigInt(n) => {
+      // only -9223372036854775808 is representable: the minimum of int / isize
+      const t = litTypeOf(exp);
+      const k = intKindOf(t);
+      if (n == i64Min() && (k == 3 || k == 4)) {
+        return done(fx, XInt(n), t, span);
+      }
+      return Err(diag("E0430", span, "negative integer literal does not fit in `" + showType(fx.env, t) + "`"));
+    },
+    _ => {}
   }
   match (inner.kind) {
     EFloat(t) => {
@@ -387,7 +498,7 @@ function checkNeg(env: Env, fx: FnCtx, span: Span, inner: Expr, exp: Option<Type
     _ => {}
   }
   const o = checkExpr(env, fx, inner, (untypedInt(inner) && isFloatHint(exp)) ? exp : None)?;
-  if (!isInt(o.expr.ty) && !isFloatTy(o.expr.ty)) {
+  if (!isSignedInt(o.expr.ty) && !isFloatTy(o.expr.ty)) {
     return Err(diag("E0410", span, "cannot negate a value of type `" + showType(o.fx.env, o.expr.ty) + "`"));
   }
   return done(o.fx, XUnary(UnNeg, o.expr), o.expr.ty, span);
@@ -1004,6 +1115,14 @@ function callIdent(
     if (id.name == "parseInt") {
       return callBuiltin(env, fx, span, "function `parseInt`", BParseInt, args);
     }
+    if (id.name == "parseI128" || id.name == "parseU128") {
+      return Err(diag("E0431", id.span, "the 128-bit integer types are not supported yet (ADR-0022); use `parseI64` / `parseU64`"));
+    }
+    const pk = parseFnKind(id.name);
+    if (pk >= 0) {
+      const a = argsExpect(env, fx, span, "function `" + id.name + "`", args, [TyString])?;
+      return done(a.fx, parseExpr(a.args[0], pk, span).kind, TyOption(kindType(pk)), span);
+    }
     if (id.name == "parseFloat") {
       return callBuiltin(env, fx, span, "function `parseFloat`", BParseFloat, args);
     }
@@ -1581,6 +1700,12 @@ function methodCall(
     return mutMethodCall(env, fx, span, base, name, args);
   }
   const b = bo?;
+  if (isIntish(b.expr.ty)) {
+    const im = intMethodCall(env, b, span, name, args)?;
+    if (im.isSome()) {
+      return Ok(im.unwrap());
+    }
+  }
   const so = methodSig(b.expr.ty, n);
   if (so.isNone()) {
     return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(b.fx.env, b.expr.ty) + "`"));
@@ -1592,6 +1717,31 @@ function methodCall(
     all.push(x);
   }
   return done(a.fx, XBuiltin(s.op, all), s.ret, span);
+}
+
+// Methods of the integer types (ADR-0022) that need constants or the receiver type: explicit conversions
+// (`toI32()`, `toUsize()`, `toInt()`, ...) and `wrapping*` / `saturating*` / `checked*` `Add` / `Sub` / `Mul`.
+// None when `name` is not one of them (the plain built-in methods are in builtins.or).
+function intMethodCall(
+  env: Env, b: ExprOut, span: Span, name: Ident, args: Expr[]
+): Result<Option<ExprOut>, Diagnostic> {
+  const n = name.name;
+  if (n == "toI128" || n == "toU128") {
+    return Err(diag("E0431", name.span, "the 128-bit integer types are not supported yet (ADR-0022); use `toI64()` / `toU64()`"));
+  }
+  const dk = convMethodKind(n);
+  if (dk >= 0) {
+    const none: Type[] = [];
+    const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, none)?;
+    return Ok(Some(ExprOut { fx: a.fx, expr: convExpr(b.expr, dk, span) }));
+  }
+  const mode = arithMethodMode(n);
+  if (mode >= 0) {
+    const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, [b.expr.ty])?;
+    return Ok(Some(ExprOut { fx: a.fx, expr: arithExpr(mode, b.expr, a.args[0], span) }));
+  }
+  const none2: Option<ExprOut> = None;
+  return Ok(none2);
 }
 
 function mutMethodCall(
@@ -2416,6 +2566,9 @@ function pureH(e: HExpr): bool {
         BStrLength => true,
         BIntToUsize => true,
         BUsizeToInt => true,
+        BIntConv => true,
+        BUIntConv => true,
+        BIntId => true,
         _ => false
       };
       for (const x of xs) {
@@ -2942,9 +3095,11 @@ function isArrayApi(n: string): bool {
 }
 
 function elemSuffix(elem: Type): string {
+  const cs = classSuffix(elem);
+  if (cs != "") {
+    return cs;
+  }
   return match (elem) {
-    TyInt => "Int",
-    TyUsize => "Usize",
     TyBool => "Bool",
     TyString => "Str",
     _ => ""
@@ -2962,7 +3117,7 @@ function arrayApiCall(
       return Err(diag(
         "E0405",
         name.span,
-        "method `" + n + "` is only available on arrays of `int`, `usize`, `bool` or `string`, not `"
+        "method `" + n + "` is only available on arrays of integers, `bool` or `string`, not `"
           + showType(b.fx.env, TyArray(elem)) + "`"
       ));
     }
@@ -2972,7 +3127,8 @@ function arrayApiCall(
   if (env.prelude < 0) {
     return Err(noMethod);
   }
-  return preludeCall(env, b, span, env.prelude.toUsize(), fname, n, noMethod, args, noPre(args.length), exp);
+  const argTy: Option<Type> = (n == "indexOf" || n == "includes") && isIntish(elem) ? Some(elem) : None;
+  return preludeCall(env, b, span, env.prelude.toUsize(), fname, n, noMethod, args, noPre(args.length), exp, argTy);
 }
 
 function noPre(n: usize): Option<HExpr>[] {
@@ -2990,7 +3146,7 @@ function noPre(n: usize): Option<HExpr>[] {
 // arguments inferred; non-generic ones are called directly.
 function preludeCall(
   env: Env, b: ExprOut, span: Span, unit: usize, fname: string, n: string, noMethod: Diagnostic,
-  args: Expr[], argPre: Option<HExpr>[], exp: Option<Type>
+  args: Expr[], argPre: Option<HExpr>[], exp: Option<Type>, argTy: Option<Type>
 ): Result<ExprOut, Diagnostic> {
   const ent = findVal(env.units[unit].scope, fname);
   if (ent.isNone()) {
@@ -3044,7 +3200,9 @@ function preludeCall(
     },
     VFunc(fid) => {
       const f = b.fx.env.funcs[fid];
-      const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, tailTypes(f.params))?;
+      // the helpers of a type class serve every integer type of that class: the argument has the element type
+      const ptys: Type[] = argTy.isSome() ? [argTy.unwrap()] : tailTypes(f.params);
+      const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, ptys)?;
       let all: HExpr[] = [b.expr];
       for (const x of a.args) {
         all.push(x);
@@ -3151,7 +3309,8 @@ function mapMethodCall(
     fname = "mapEntries";
   }
   if (fname != "") {
-    return preludeCall(env, b, span, unit, fname, n, noMethod, args, noPre(args.length), exp);
+    const noTy: Option<Type> = None;
+    return preludeCall(env, b, span, unit, fname, n, noMethod, args, noPre(args.length), exp, noTy);
   }
   if (n == "set" || n == "delete") {
     return mapMutCall(env, b, span, base, name, args, inst);

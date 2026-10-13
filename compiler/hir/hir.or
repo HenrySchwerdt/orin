@@ -8,6 +8,8 @@ import { Span } from "../diag";
 export type Type =
   TyInt
   | TyUsize
+  | TyIntK(usize)                 // the other fixed-width integers (ADR-0022), by kind: 0 i8, 1 i16, 2 i32, 4 isize,
+                                  // 5 u8, 6 u16, 7 u32, 8 u64 (3 = `int` = i64 is TyInt, 9 = usize is TyUsize)
   | TyBool
   | TyFloat                       // IEEE-754 binary64 (ADR-0018)
   | TyF32                         // IEEE-754 binary32
@@ -142,6 +144,95 @@ export type Builtin =
   // exactly representable in binary32; lowering rounds after every builtin whose result type is f32) ---
   | BParseFloat | BFloatToString | BF32ToString | BIntToFloat | BUsizeToFloat | BFloatToInt | BF32Round
   | BF32ToFloat | BFloatFloor | BFloatCeil | BFloatRound | BFloatSqrt | BFloatAbs | BFloatPow
-  | BFloatIsNaN | BFloatIsFinite;
+  | BFloatIsNaN | BFloatIsFinite
+  // --- fixed-width integers (ADR-0022). A value of an integer type narrower than 64 bits, `isize` and `i64` is an
+  // MInt holding its (sign- or zero-extended) value; `u64` / `usize` are MUsize. Args after the first are constants. ---
+  // BIntRange(v, lo, hi): v, trap "integer overflow" unless lo <= v <= hi (after an operation on a narrow type)
+  // BIntConv(v, lo, hi): like BIntRange for a conversion from a signed-pattern value, trap "integer conversion out of range"
+  // BUIntConv(v, hi): conversion from a u64 / usize value (unsigned compare v <= hi)
+  // BIntId(v): v unchanged (conversion that cannot fail)
+  // BIntOp(mode, a, b, kind): wrapping (modes 0..2 add sub mul) / saturating (3..5) arithmetic of integer kind `kind`
+  // BIntChk(mode, a, b, kind): checked add / sub / mul (modes 0..2): Option of the result
+  // BParseIntK(s, kind): Option of the integer of kind `kind` parsed from s
+  | BIntRange | BIntConv | BUIntConv | BIntId | BIntOp | BIntChk | BParseIntK;
 
 export type MutBuiltin = MArrPush | MArrPop;
+
+// ---------------------------------------------------------------------------
+// Integer kinds (ADR-0022). Kind numbers: 0 i8, 1 i16, 2 i32, 3 i64 (= `int`), 4 isize, 5 u8, 6 u16, 7 u32,
+// 8 u64, 9 usize. The runtime (`orin_int_op` etc.) uses the same numbers.
+// ---------------------------------------------------------------------------
+
+// The kind of an integer type, or -1.
+export function intKindOf(t: Type): int {
+  return match (t) {
+    TyInt => 3,
+    TyUsize => 9,
+    TyIntK(k) => k.toInt(),
+    _ => -1
+  };
+}
+
+export function kindType(k: int): Type {
+  if (k == 3) {
+    return TyInt;
+  }
+  if (k == 9) {
+    return TyUsize;
+  }
+  return TyIntK(k.toUsize());
+}
+
+export function kindName(k: int): string {
+  const names = ["i8", "i16", "i32", "int", "isize", "u8", "u16", "u32", "u64", "usize"];
+  return names[k.toUsize()];
+}
+
+export function kindSigned(k: int): bool {
+  return k <= 4;
+}
+
+// Types narrower than 64 bits: kept in an MInt and range-checked after every operation.
+export function kindNarrow(k: int): bool {
+  return k == 0 || k == 1 || k == 2 || k == 5 || k == 6 || k == 7;
+}
+
+// Machine class: true for u64 / usize (an MUsize), false for the others (an MInt).
+export function kindUnsigned64(k: int): bool {
+  return k == 8 || k == 9;
+}
+
+export function kindBits(k: int): int {
+  if (k == 0 || k == 5) {
+    return 8;
+  }
+  if (k == 1 || k == 6) {
+    return 16;
+  }
+  if (k == 2 || k == 7) {
+    return 32;
+  }
+  return 64;
+}
+
+export function i64Min(): int {
+  return -9223372036854775807 - 1;
+}
+
+// Smallest value of the kind as an int (0 for the unsigned kinds).
+export function kindLo(k: int): int {
+  if (!kindSigned(k)) {
+    return 0;
+  }
+  const b = kindBits(k);
+  return b == 8 ? -128 : (b == 16 ? -32768 : (b == 32 ? -2147483648 : i64Min()));
+}
+
+// Largest value of the kind as an int; for u64 / usize it is the pattern of 2^64-1, i.e. -1 (compare unsigned).
+export function kindHi(k: int): int {
+  const b = kindBits(k);
+  if (kindSigned(k)) {
+    return b == 8 ? 127 : (b == 16 ? 32767 : (b == 32 ? 2147483647 : 9223372036854775807));
+  }
+  return b == 8 ? 255 : (b == 16 ? 65535 : (b == 32 ? 4294967295 : -1));
+}

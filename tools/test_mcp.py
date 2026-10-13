@@ -166,7 +166,7 @@ def main():
     check(r["result"] == {}, "ping")
     r = c.request("tools/list")
     tools = {t["name"]: t for t in r["result"]["tools"]}
-    check(set(tools) == {"check", "inspect", "edit", "test", "build"}, "tool names: %s" % sorted(tools))
+    check(set(tools) == {"check", "inspect", "edit", "test", "build", "graph", "diff"}, "tool names: %s" % sorted(tools))
     for t in tools.values():
         sch = t["inputSchema"]
         check(sch["type"] == "object" and "properties" in sch and t["description"], "schema for " + t["name"])
@@ -292,6 +292,35 @@ def main():
           "twice(p.x)" in open(os.path.join(proj, "main.or")).read(), "files rewritten")
     err, v, raw = c.call("check", {"entry": "main.or"})
     check(v["errors"] == 0, "project still valid after rename (%s)" % raw)
+
+    # ---- graph / diff (OSIG, docs/osig.md) -----------------------------------------------------
+    import shutil
+    for side in ("base", "head"):
+        shutil.copytree(os.path.join(ROOT, "tests", "osig", "accept", side), os.path.join(proj, "osig", side))
+    err, v, raw = c.call("graph", {"entry": "osig/head"})
+    check(not err and v["schema"] == "osig/0.1" and v["package"] == "acme" and v["hash"].startswith("h62:")
+          and v["nodes"] > 5 and v["edges"] > 5 and "snapshot" not in v, "graph summary (%s)" % raw)
+    err, v2, raw = c.call("graph", {"entry": "osig/head", "full": True, "out": "osig/head.json"})
+    check(not err and v2["hash"] == v["hash"] and json.loads(v2["snapshot"])["hash"] == v["hash"], "graph full is deterministic")
+    check(os.path.exists(os.path.join(proj, "osig", "head.json")), "graph out written inside the root")
+    err, d, raw = c.call("diff", {"base": "osig/base", "head": "osig/head"})
+    check(not err and d["schema"] == "osig-diff/0.1" and d["differences"] is True, "diff json (%s)" % raw[:200])
+    check([c_["id"] for c_ in d["changedSymbols"]] == ["acme:orders::checkout"] and d["changedSymbols"][0]["aspects"] == ["signature"],
+          "diff: API signature change")
+    check(len(d["possibleRenames"]) == 1 and d["possibleRenames"][0]["heuristic"] is True
+          and d["possibleRenames"][0]["from"].endswith("applyDiscount"), "diff: rename is heuristic")
+    check(any(f["edge"]["dst"] == "acme:audit::record" for f in d["newCallPaths"]), "diff: new call path")
+    err, t, raw = c.call("diff", {"base": "osig/base", "head": "osig/head.json", "format": "text"})
+    check(not err and "possible renames (HEURISTIC" in raw and "<- NEW" in raw, "diff text, head from a snapshot file")
+    err, t, raw = c.call("diff", {"base": "osig/head", "head": "osig/head.json", "format": "text"})
+    check(not err and "no differences" in raw, "diff of identical graphs reports nothing")
+    err, t, raw = c.call("diff", {"base": "osig/base", "head": "osig/head", "format": "html", "out": "osig/r.html"})
+    check(not err and t["written"] == "osig/r.html" and "<!doctype html>" in open(os.path.join(proj, "osig", "r.html")).read(),
+          "diff html written")
+    err, t, raw = c.call("graph", {"entry": "../outside.or"})
+    check(err and "outside the authorized root" in raw, "graph outside root refused")
+    err, t, raw = c.call("diff", {"base": "osig/base", "head": "../outside.or"})
+    check(err and "outside the authorized root" in raw, "diff outside root refused")
 
     # ---- security ---------------------------------------------------------------------------
     err, v, raw = c.call("check", {"entry": "../outside.or"})

@@ -1,11 +1,35 @@
 name: ci
 
+# push: only main (a PR branch is tested by its pull_request event, not twice).
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A newer push to the same PR cancels the run that is still going.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  # Seed bootstrap once; the later jobs reuse the compiler (build/bootstrap) as an artifact.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Seed bootstrap (seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance)
+        run: ./tools/bootstrap.sh
+      - name: Pack compiler
+        run: tar -czf bootstrap.tgz build/bootstrap/orin2 build/bootstrap/stage2.c
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap
+          path: bootstrap.tgz
+          retention-days: 3
+
+  # Rust Stage 0: its own suites, the parser differential and the second bootstrap root.
+  stage0:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,48 +45,134 @@ jobs:
         run: python3 tools/run_tests.py --orinc bootstrap/target/release/orinb --sanitize
       - name: Parser differential test (Stage 0 vs Stage 1)
         run: python3 tools/diff_parsers.py
-      - name: Seed bootstrap (seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance)
-        run: ./tools/bootstrap.sh
-      - name: Stage 0 bootstrap (Rust root) and diverse-roots check (stage2.c byte-identical)
+      - name: Stage 0 bootstrap (Rust root)
         run: |
-          cp build/bootstrap/stage2.c build/stage2-from-seed.c
           ./tools/bootstrap.sh --from-stage0
-          cmp build/stage2-from-seed.c build/bootstrap/stage2.c
+          cp build/bootstrap/stage2.c stage2-from-stage0.c
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage2-from-stage0
+          path: stage2-from-stage0.c
+          retention-days: 3
+
+  diverse-roots:
+    needs: [build, stage0]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - uses: actions/download-artifact@v4
+        with: { name: stage2-from-stage0 }
+      - name: stage2.c byte-identical from the seed root and the Rust root
+        run: |
+          tar -xzf bootstrap.tgz
+          cmp build/bootstrap/stage2.c stage2-from-stage0.c
+
+  sanitize:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
       - name: Conformance tests with self-hosted compiler (ASan + UBSan)
         run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --sanitize
-      - name: Release packaging smoke test
-        run: ./tools/package.sh 0.0.0-ci linux-x86_64
-      - name: MIR backend vs legacy backend
-        run: python3 tools/diff_backends.py
+
+  llvm:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
       - name: LLVM IR backend (conformance, all suites; clang is preinstalled on ubuntu-latest)
         run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --backend llvm
       - name: C backend vs LLVM backend (differential)
         run: python3 tools/diff_backends.py --mode llvm
+
+  backends:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
+      - name: MIR backend vs legacy backend
+        run: python3 tools/diff_backends.py
       - name: Std prelude (Orin) vs C runtime built-ins (spec 19 R1)
         run: python3 tools/diff_backends.py --mode builtins
-      - name: Platform boundary (no direct libc in runtime/) and L0 platform layer (tests, size budget, CBMC)
-        run: |
-          sudo apt-get install -y cbmc
-          tools/check_platform_boundary.sh
-          REQUIRE_CBMC=1 tools/verify_platform.sh
+      - name: Release packaging smoke test
+        run: ./tools/package.sh 0.0.0-ci linux-x86_64
+      - name: Packages (orin.toml, module rules, orin check --deps, orin api, launcher)
+        run: ./tools/test_packages.sh
+
+  tooling:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
       - name: Formatter (goldens, idempotence, AST + comment preservation, JSON diagnostics)
         run: python3 tools/test_fmt.py
-      - name: Contract erasure (generated C and LLVM IR identical with and without contract clauses)
-        run: python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2
-      - name: Contract verification (orin verify --contracts with z3)
-        run: |
-          pip install z3-solver
-          python3 tools/test_verify_contracts.py --require-z3
       - name: Tooling unit tests (JSON, analysis, LSP)
         run: ./tools/test_tooling.sh
       - name: Language server end to end (orin lsp over stdio)
         run: python3 tools/test_lsp.py
       - name: MCP server end to end (orin mcp over stdio)
         run: python3 tools/test_mcp.py
-      - name: Packages (orin.toml, module rules, orin check --deps, orin api, launcher)
-        run: ./tools/test_packages.sh
+      - name: OSIG (orin graph / orin diff - golden, determinism, evidence classes, rename + signature change + new call path)
+        run: python3 tools/test_osig.py --orin build/bootstrap/orin2
+      - name: OSIG diff report of the pull request (report only, never fails the build)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          LINK_BASE: https://github.com/${{ github.repository }}/blob/${{ github.sha }}/compiler
+        run: |
+          mkdir -p build/osig
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git worktree add build/osig/base "$BASE_SHA"
+          build/bootstrap/orin2 diff --base build/osig/base/compiler/main.or --head compiler/main.or \
+            --format=html --link-base "$LINK_BASE" -o build/osig/osig-diff.html
+          build/bootstrap/orin2 diff --base build/osig/base/compiler/main.or --head compiler/main.or \
+            -o build/osig/osig-diff.txt
+          { echo '### OSIG diff of compiler/ (report only; full report in the osig-diff-report artifact)'; echo '```'; head -60 build/osig/osig-diff.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload OSIG diff report
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osig-diff-report
+          path: |
+            build/osig/osig-diff.html
+            build/osig/osig-diff.txt
+          if-no-files-found: ignore
+
+  assurance:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
       - name: Mutation corpus (injected ownership bugs must be rejected by the verifier, docs/assurance.md P0)
         run: python3 tools/mutate_mir.py
+      - name: Contract erasure (generated C and LLVM IR identical with and without contract clauses)
+        run: python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2
+      - name: Contract verification (orin verify --contracts with z3)
+        run: |
+          pip install z3-solver
+          python3 tools/test_verify_contracts.py --require-z3
+      - name: Platform boundary (no direct libc in runtime/) and L0 platform layer (tests, size budget, CBMC)
+        run: |
+          sudo apt-get install -y cbmc
+          tools/check_platform_boundary.sh
+          REQUIRE_CBMC=1 tools/verify_platform.sh
 
   vscode:
     runs-on: ubuntu-latest

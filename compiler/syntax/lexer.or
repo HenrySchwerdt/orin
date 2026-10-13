@@ -8,9 +8,14 @@ import { Span, Diagnostic, span, diag } from "../diag";
 // spelling is in `Token.text` (e.g. KPunct with text "=>", KKeyword with text "let").
 // Reserved words (`var`, `class`, ...) are KKeyword too; the parser rejects them.
 // KFloat (beyond Orin-B, ADR-0018): `text` is the canonical spelling, always with a `.` (`1e9` -> `1.0e9`).
-export type TokKind = KIdent | KKeyword | KInt | KFloat | KStr | KPunct | KEof;
+// KBigInt (ADR-0022): an integer literal in 2^63 .. 2^64-1 (a `u64` value); `value` holds the 64-bit pattern
+// as a (negative) int. Template literals (ADR-0022) are lexed into KTplFull (`...` without interpolation), or
+// KTplHead (`...${), zero or more KTplMid (}...${), and KTplTail (}...`) with the expression tokens in between;
+// `text` is the cooked (unescaped) text of that chunk, the span covers the delimiters.
+export type TokKind = KIdent | KKeyword | KInt | KBigInt | KFloat | KStr | KPunct | KEof | KTplFull | KTplHead | KTplMid | KTplTail;
 
-// `text`: source spelling; for KStr the unescaped bytes. `value`: integer value for KInt, else 0.
+// `text`: source spelling; for KStr and the template kinds the unescaped bytes. `value`: integer value for KInt /
+// KBigInt, else 0.
 export type Token = { kind: TokKind; text: string; span: Span; value: int; };
 
 type LexRes = { tok: Token; end: usize; };
@@ -120,6 +125,25 @@ function digitsValue(src: string, a: usize, b: usize, base: int): int {
   return v;
 }
 
+// Value of the digits src[a..b) (at least one, base 10 or 16) when it lies in 2^63 .. 2^64-1, as the 64-bit
+// pattern (a negative int); None if it exceeds 2^64-1. The caller knows it exceeds i64 max. The last digit is
+// split off so that no intermediate overflows: value = 2 * (prefix * base/2) + d, pattern = value - 2^64.
+function bigDigitsValue(src: string, a: usize, b: usize, base: int): Option<int> {
+  const prefix = digitsValue(src, a, b - 1, base);
+  const half = base / 2;
+  if (prefix < 0 || prefix > INT_MAX / half) {
+    return None;
+  }
+  const d = hexVal(src.charCodeAt(b - 1));
+  const x = prefix * half;
+  const y = x - INT_MAX - 1;
+  const t = y + d;
+  if (t > -1 - y) {
+    return None;   // 2*y + d would be >= 0, i.e. the literal exceeds 2^64-1
+  }
+  return Some(y + t);
+}
+
 function lexNumber(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
   const n = src.length;
   let base: int = 10;
@@ -145,11 +169,18 @@ function lexNumber(file: usize, src: string, start: usize): Result<LexRes, Diagn
     return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
   }
   const v = digitsValue(src, dstart, i, base);
+  let big: Option<int> = None;
   if (v < 0) {
-    return Err(diag("E0100", span(file, start, i), "integer literal does not fit in i64"));
+    big = bigDigitsValue(src, dstart, i, base);
+    if (big.isNone()) {
+      return Err(diag("E0100", span(file, start, i), "integer literal does not fit in 64 bits (the largest is 18446744073709551615)"));
+    }
   }
   if (base == 16 && i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
     return Err(diag("E0100", span(file, start, i + 1), "hexadecimal float literals are not supported"));
+  }
+  if (big.isSome()) {
+    return Ok(LexRes { tok: mkTok(KBigInt, src.substring(start, i), file, start, i, big.unwrap()), end: i });
   }
   return Ok(LexRes { tok: mkTok(KInt, src.substring(start, i), file, start, i, v), end: i });
 }
@@ -313,6 +344,70 @@ function lexString(file: usize, src: string, start: usize): Result<LexRes, Diagn
   return Ok(LexRes { tok: mkTok(KStr, parts.join(""), file, start, i, 0), end: i });
 }
 
+// One chunk of a template literal (ADR-0022), starting at `start` just after the opening backtick or the `}`
+// that closes an interpolation. Scans the cooked text up to the closing backtick (`ended`) or a `${`.
+// `open` is the offset of the delimiter that began the chunk (for error spans). Escapes: those of string
+// literals plus `\``, `\$`; a raw newline is kept (CRLF becomes LF); a `$` not followed by `{` is literal.
+type TplChunk = { text: string; end: usize; ended: bool; };
+
+function lexTemplateChunk(file: usize, src: string, open: usize, start: usize): Result<TplChunk, Diagnostic> {
+  const n = src.length;
+  let parts: string[] = [];
+  let i = start;
+  let run = i;
+  while (true) {
+    if (i >= n) {
+      return Err(diag("E0100", span(file, open, open + 1), "unterminated template literal"));
+    }
+    const c = src.charCodeAt(i);
+    if (c == 96) {
+      parts.push(src.substring(run, i));
+      return Ok(TplChunk { text: parts.join(""), end: i + 1, ended: true });
+    }
+    if (c == 36 && i + 1 < n && src.charCodeAt(i + 1) == 123) {
+      parts.push(src.substring(run, i));
+      return Ok(TplChunk { text: parts.join(""), end: i + 2, ended: false });
+    }
+    if (c == 13 && i + 1 < n && src.charCodeAt(i + 1) == 10) {
+      parts.push(src.substring(run, i));
+      i += 1;
+      run = i;
+    } else if (c == 92) {
+      parts.push(src.substring(run, i));
+      if (i + 1 >= n) {
+        return Err(diag("E0100", span(file, open, n), "unterminated template literal"));
+      }
+      const e = src.charCodeAt(i + 1);
+      let code = simpleEscape(e);
+      let adv: usize = 2;
+      if (e == 96 || e == 36) {
+        code = e;
+      }
+      if (e == 120) {
+        if (i + 3 >= n) {
+          return Err(diag("E0100", span(file, i, n), "invalid \\x escape"));
+        }
+        const h1 = hexVal(src.charCodeAt(i + 2));
+        const h2 = hexVal(src.charCodeAt(i + 3));
+        if (h1 < 0 || h2 < 0) {
+          return Err(diag("E0100", span(file, i, i + 4), "invalid \\x escape"));
+        }
+        code = h1 * 16 + h2;
+        adv = 4;
+      }
+      if (code < 0) {
+        return Err(diag("E0100", span(file, i, i + 2), "unknown escape sequence"));
+      }
+      parts.push(String.fromCharCode(code));
+      i += adv;
+      run = i;
+    } else {
+      i += 1;
+    }
+  }
+  return Err(diag("E0100", span(file, open, open + 1), "unterminated template literal"));
+}
+
 // A `.` right after an identifier, `)` or `]` is a member access (`a.1` is then a parse error, not a float).
 function isMemberBase(c: int): bool {
   return isAlpha(c) || isDigit(c) || c == 41 || c == 93;
@@ -360,6 +455,8 @@ export function lex(file: usize, src: string): Result<Token[], Diagnostic> {
   let toks: Token[] = [];
   const n = src.length;
   let i: usize = 0;
+  // brace depth inside each open `${ ... }` of a template literal (innermost last)
+  let depth: int[] = [];
   while (true) {
     i = skipTrivia(file, src, i)?;
     if (i >= n) {
@@ -394,9 +491,36 @@ export function lex(file: usize, src: string): Result<Token[], Diagnostic> {
       i = r.end;
       continue;
     }
+    if (c == 96) {
+      const ch = lexTemplateChunk(file, src, i, i + 1)?;
+      toks.push(mkTok(ch.ended ? KTplFull : KTplHead, ch.text, file, i, ch.end, 0));
+      if (!ch.ended) {
+        depth.push(0);
+      }
+      i = ch.end;
+      continue;
+    }
+    if (c == 123 && depth.length > 0) {
+      depth[depth.length - 1] += 1;
+    }
+    if (c == 125 && depth.length > 0) {
+      if (depth[depth.length - 1] == 0) {
+        const ch = lexTemplateChunk(file, src, i, i + 1)?;
+        toks.push(mkTok(ch.ended ? KTplTail : KTplMid, ch.text, file, i, ch.end, 0));
+        if (ch.ended) {
+          depth.pop();
+        }
+        i = ch.end;
+        continue;
+      }
+      depth[depth.length - 1] -= 1;
+    }
     const r = lexPunct(file, src, i)?;
     toks.push(r.tok);
     i = r.end;
+  }
+  if (depth.length > 0) {
+    return Err(diag("E0100", span(file, n, n), "unterminated template literal interpolation (missing `}`)"));
   }
   toks.push(mkTok(KEof, "", file, n, n, 0));
   return Ok(toks);

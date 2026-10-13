@@ -24,8 +24,8 @@ import {
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
-  Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink,
-  SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface
+  Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink, CallSite,
+  SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface, kindName
 } from "../hir";
 
 // ---- tables ---------------------------------------------------------------------------------
@@ -49,6 +49,9 @@ type Ctx = {
   recDef: Option<usize>[];     // HIR record id -> its SkRecord def
   tq: string[];                // qualified type name ("unit.Name") -> def, for classes' method references
   tqDefs: usize[];
+  fnDef: Option<usize>[];      // HIR function id -> the def it was lowered from (generic instances and lifted closures: the
+                               // enclosing generic function / function / method; function-value wrappers: the wrapped function)
+  fnKind: usize[];             // HIR function id -> 0 ordinary or generic instance, 1 lifted closure body, 2 function-value wrapper
 };
 
 // Mutable walker state.
@@ -57,6 +60,9 @@ type W = {
   refs: SymbolRef[];
   types: TypeAt[];
   impls: ImplLink[];           // `implements` links (ADR-0019)
+  calls: CallSite[];           // call sites (OSIG CALLS edges)
+  cur: Option<usize>;          // caller def of the HIR body being walked
+  curMay: bool;                // the body is a lifted closure: its calls are MAY edges of the enclosing function
   bnd: usize[];                // interface defs bounding the type parameters of the generic function instance being walked
   lNames: string[];            // flat scope stack of visible locals: name, def id, HIR type
   lIds: usize[];
@@ -176,6 +182,7 @@ function renderTy(p: Program, t: Type): string {
   return match (t) {
     TyInt => "int",
     TyUsize => "usize",
+    TyIntK(k) => kindName(k.toInt()),
     TyBool => "bool",
     TyFloat => "float",
     TyF32 => "f32",
@@ -354,6 +361,7 @@ function constDetail(k: ConstDecl): string {
     None => {
       ty = match (k.value.kind) {
         EInt(_) => "int",
+        EBigInt(_) => "u64",
         EFloat(_) => "float",
         EStr(_) => "string",
         EBool(_) => "bool",
@@ -696,7 +704,7 @@ function newW(): W {
   const tys: Option<Type>[] = [];
   const tt: Type[] = [];
   return W {
-    defs: d, refs: r, types: t, impls: [], bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
+    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
     hl: s, hlTy: tt, hk: 0
   };
 }
@@ -842,6 +850,7 @@ function walkExpr(w: W, c: Ctx, e: Expr): W {
       x = walkExpr(x, c, d);
     },
     EArray(es) => { x = walkExprs(x, c, es); },
+    ETemplate(_, es) => { x = walkExprs(x, c, es); },
     ERecord(tn, sp, fs) => { x = walkRecordInits(x, c, tn, sp, fs); },
     ETyApp(id, targs) => {
       const d = lookupVal(x, c, id.name);
@@ -1285,6 +1294,96 @@ function virtRef(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
   return x;
 }
 
+// ---- call sites (OSIG) ---------------------------------------------------------------------------------
+
+function addCall(w: W, callee: Option<usize>, ev: string, via: string, sp: Span): W {
+  let x = w;
+  match (x.cur) {
+    Some(cl) => {
+      x.calls.push(CallSite { caller: cl, callee: callee, ev: x.curMay && ev == "MUST" ? "MAY" : ev, via: via, span: sp });
+    },
+    None => {}
+  }
+  return x;
+}
+
+function isContained(w: W, d: usize): bool {
+  return match (w.defs[d].container) {
+    Some(_) => true,
+    None => false
+  };
+}
+
+// A direct call (XCall) of a function, method or constructor. Inside an instance of a generic function
+// with bounded type parameters the call of a method of the instance's class is a call of the interface method.
+function callSite(w: W, c: Ctx, e: HExpr, fid: usize): W {
+  let x = w;
+  if (fid >= c.fnDef.length || c.fnKind[fid] != 0) {
+    return x;
+  }
+  match (c.fnDef[fid]) {
+    Some(d) => {
+      let callee = d;
+      let via = isContained(x, d) ? (x.defs[d].name == "constructor" ? "constructor" : "method") : "direct";
+      if (x.defs[d].name == "constructor" || x.defs[d].container.isNone() && x.defs[d].detail.startsWith("class ")) {
+        via = "constructor";
+      }
+      if (isContained(x, d)) {
+        for (const bd of x.bnd) {
+          for (const k of children(x.defs, bd)) {
+            if (x.defs[k].name == x.defs[d].name) {
+              callee = k;
+              via = "bound";
+            }
+          }
+        }
+      }
+      x = addCall(x, Some(callee), "MUST", via, e.span);
+    },
+    None => {}
+  }
+  return x;
+}
+
+// A call through an interface value: the interface method.
+function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      match (recv.ty) {
+        TyIface(i) => {
+          if (i < p.ifaces.length && slot < p.ifaces[i].methods.length) {
+            const idf = findName(c.tq, c.tqDefs, p.ifaces[i].name);
+            if (idf.isSome()) {
+              for (const k of children(x.defs, idf.unwrap())) {
+                if (x.defs[k].name == p.ifaces[i].methods[slot]) {
+                  x = addCall(x, Some(k), "MUST", "virtual", e.span);
+                  return x;
+                }
+              }
+            }
+          }
+        },
+        _ => {}
+      }
+    },
+    None => {}
+  }
+  return addCall(x, None, "UNKNOWN", "indirect", e.span);
+}
+
+// A function used as a value (the lifted wrapper `f$closure`, ADR-0011): the wrapped function may be
+// called wherever the value flows.
+function valueRef(w: W, c: Ctx, e: HExpr, fid: usize): W {
+  if (fid < c.fnDef.length && c.fnKind[fid] == 2) {
+    match (c.fnDef[fid]) {
+      Some(d) => { return addCall(w, Some(d), "MAY", "value", e.span); },
+      None => {}
+    }
+  }
+  return w;
+}
+
 function litKind(e: HExpr): bool {
   return match (e.kind) {
     XInt(_) => true,
@@ -1375,6 +1474,7 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
     XCall(fid, args) => {
       x = hExprs(x, c, args, ty);
       x = methodRef(x, c, e, fid, args);
+      x = callSite(x, c, e, fid);
     },
     XBuiltin(_, args) => { x = hExprs(x, c, args, ty); },
     XMutMethod(_, p, args) => {
@@ -1439,16 +1539,21 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
         }
       }
     },
-    XClosure(_, caps) => { x = hExprs(x, c, caps, ty); },
+    XClosure(fid, caps) => {
+      x = hExprs(x, c, caps, ty);
+      x = valueRef(x, c, e, fid);
+    },
     XCallIndirect(f, args) => {
       x = hExpr(x, c, f, ty);
       x = hExprs(x, c, args, ty);
+      x = addCall(x, None, "UNKNOWN", "indirect", e.span);
     },
     XIface(_, v) => { x = hExpr(x, c, v, ty); },
     XCallVirtual(r, slot, args) => {
       x = hExpr(x, c, r, ty);
       x = hExprs(x, c, args, ty);
       x = virtRef(x, c, e, r, slot);
+      x = virtCall(x, c, e, r, slot);
     },
     _ => {}
   }
@@ -1590,6 +1695,49 @@ function boundDefs(c: Ctx, hirName: string): usize[] {
   return out;
 }
 
+// Qualified HIR names ("unit.f", "unit.C.m", "unit.C.constructor") of the functions, methods and constructors
+// of the program, with their defs. A class without explicit constructor maps `constructor` to the class def.
+type FnNames = { names: string[]; defs: usize[]; };
+
+function functionNames(prog: LoadedProgram, tabs: UnitTab[], defs: SymbolDef[]): FnNames {
+  let names: string[] = [];
+  let ds: usize[] = [];
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    let k: usize = 0;
+    for (const item of u.ast.items) {
+      const did = tabs[ui].itemDefs[k];
+      k += 1;
+      match (item) {
+        IFunction(f) => {
+          names.push(u.name + "." + f.name.name);
+          ds.push(did);
+        },
+        IClass(cd) => {
+          let explicitCtor = false;
+          for (const m of children(defs, did)) {
+            const isFn = match (defs[m].kind) { SkFunction => true, _ => false };
+            if (isFn) {
+              names.push(u.name + "." + cd.name.name + "." + defs[m].name);
+              ds.push(m);
+              if (defs[m].name == "constructor") {
+                explicitCtor = true;
+              }
+            }
+          }
+          if (!explicitCtor) {
+            names.push(u.name + "." + cd.name.name + ".constructor");
+            ds.push(did);
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
+  }
+  return FnNames { names: names, defs: ds };
+}
+
 // ---- driver -------------------------------------------------------------------------------------------
 
 export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): SemanticIndex {
@@ -1656,7 +1804,32 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     },
     None => {}
   }
-  const c = Ctx { prog: prog, sm: sm, tabs: tabs, hir: hir, recDef: recDef, tq: tq, tqDefs: tqDefs };
+  let fnDef: Option<usize>[] = [];
+  let fnKind: usize[] = [];
+  match (hir) {
+    Some(h) => {
+      const fq = functionNames(prog, tabs, w.defs);
+      for (const f of h.functions) {
+        let nm = f.name;
+        let kind: usize = 0;
+        const ci = nm.indexOf("$closure");
+        if (ci.isSome()) {
+          kind = ci.unwrap() + 8 == nm.length ? 2 : 1;
+          nm = nm.substring(0, ci.unwrap());
+        }
+        const lt = nm.indexOf("<");
+        if (lt.isSome()) {
+          nm = nm.substring(0, lt.unwrap());
+        }
+        fnDef.push(findName(fq.names, fq.defs, nm));
+        fnKind.push(kind);
+      }
+    },
+    None => {}
+  }
+  const c = Ctx {
+    prog: prog, sm: sm, tabs: tabs, hir: hir, recDef: recDef, tq: tq, tqDefs: tqDefs, fnDef: fnDef, fnKind: fnKind
+  };
   // Pass 2: bodies.
   let hn: usize = 0;     // next ordinary (non-generic) HIR function
   ui = 0;
@@ -1674,7 +1847,9 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
               Some(h) => {
                 if (hn < h.functions.length && h.functions[hn].name == u.name + "." + f.name.name) {
                   hf = Some(h.functions[hn]);
+                  w.cur = Some(did);
                   w = hBlock(w, c, h.functions[hn].body, true);
+                  w.cur = None;
                 }
               },
               None => {}
@@ -1749,7 +1924,11 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                   ret: None, body: k.body, contracts: allCtorClauses(cd, k), span: k.span
                 };
                 match (ctorHf) {
-                  Some(hf) => { w = hBlock(w, c, hf.body, true); },
+                  Some(hf) => {
+                    w.cur = Some(dk);
+                    w = hBlock(w, c, hf.body, true);
+                    w.cur = None;
+                  },
                   None => {}
                 }
                 w = walkFunction(w, c, fd, dk, ctorHf);
@@ -1761,7 +1940,9 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                   Some(h) => {
                     if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
                       hf = Some(h.functions[hn]);
+                      w.cur = Some(dk);
                       w = hBlock(w, c, h.functions[hn].body, true);
+                      w.cur = None;
                     }
                   },
                   None => {}
@@ -1778,7 +1959,11 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
           }
           if (!explicitCtor) {
             match (ctorHf) {
-              Some(hf) => { w = hBlock(w, c, hf.body, false); },
+              Some(hf) => {
+                w.cur = Some(did);
+                w = hBlock(w, c, hf.body, false);
+                w.cur = None;
+              },
               None => {}
             }
           }
@@ -1794,7 +1979,11 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
       while (hn < h.functions.length) {
         // Lifted closure bodies (arrow functions, ADR-0011) also contribute expression types.
         w.bnd = boundDefs(c, h.functions[hn].name);
+        w.cur = c.fnKind[hn] == 2 ? None : c.fnDef[hn];
+        w.curMay = c.fnKind[hn] == 1;
         w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
+        w.cur = None;
+        w.curMay = false;
         const noB: usize[] = [];
         w.bnd = noB;
         hn += 1;
@@ -1825,6 +2014,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     defs: w.defs,
     refs: dedupRefs(sortRefs(w.refs)),
     types: dedupTypes(sortTypes(w.types)),
-    impls: w.impls
+    impls: w.impls,
+    calls: w.calls
   };
 }

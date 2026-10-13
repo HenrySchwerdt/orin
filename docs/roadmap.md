@@ -74,11 +74,13 @@ primitives.
 | F Compiler assurance | L3–L5 | with the rewrite, R3/R4 and phase 7 | |
 
 What each phase delivers:
-- **Phase 1:**
-  - OSIG schema v0.1 (ADR)
-  - `orin graph`
-  - `orin diff --base --head`
-  - static HTML PR report as a CI artifact
+- **Phase 1 (done, MVP; tickets 1, 3, 5, 6):**
+  - OSIG schema v0.1 ([ADR-0023](decisions/0023-osig-schema-v0.1.md))
+  - `orin graph` ([osig.md](osig.md))
+  - `orin diff --base --head` (text/JSON/HTML), heuristic renames, reverse impact with explaining path
+  - static HTML PR report as a CI artifact (report only); MCP `graph` / `diff`
+  - still open from the phase: stable feature IDs and the feature manifest (ticket 4), MIR source mapping
+    (ticket 2, with the compiler rewrite); the gate's "affected features" needs ticket 4
 - **Phase 2:**
   - capability handles (language part)
   - effect inference and transitive fixpoint
@@ -113,8 +115,8 @@ What each phase delivers:
 
 ## Next concrete steps
 1. (done) Interfaces and contract clauses merged.
-2. Start the Track A worker: OSIG schema ADR, `orin graph` and `orin diff` (vision tickets 1, 3,
-   5). Ticket 2 (MIR spans) waits for the rewrite.
+2. (done) Track A phase 1: OSIG schema ADR, `orin graph`, `orin diff`, HTML report (vision tickets 1, 3,
+   5, 6). Next in the track: feature manifest (ticket 4). Ticket 2 (MIR spans) waits for the rewrite.
 3. Start the Track F L1 worker (Lean-vs-verifier differential test, mutation corpus).
 4. Fixed-width integers + interpolation; then `@Test` + resources; then ADR-0021 capabilities.
 5. Release v0.1.0-alpha.2 (closures, floats, maps, interfaces, std modules).

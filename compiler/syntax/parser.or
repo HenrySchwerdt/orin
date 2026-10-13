@@ -78,6 +78,10 @@ function describe(t: Token): string {
   return match (t.kind) {
     KEof => "end of file",
     KStr => "string literal",
+    KTplFull => "template literal",
+    KTplHead => "template literal",
+    KTplMid => "`}` in a template literal",
+    KTplTail => "`}` in a template literal",
     _ => "`" + t.text + "`"
   };
 }
@@ -1391,17 +1395,64 @@ function parsePostfix(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
   return Ok(ExprRes { expr: e, pos: p });
 }
 
+// A template literal with interpolations (ADR-0022), at its KTplHead token: `head expr (mid expr)* tail`.
+function parseTemplate(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const head = tokAt(toks, pos);
+  let parts: string[] = [head.text];
+  let exprs: Expr[] = [];
+  let p = pos + 1;
+  while (true) {
+    const e = parseExpr(toks, p)?;
+    exprs.push(e.expr);
+    p = e.pos;
+    const t = tokAt(toks, p);
+    const isMid = match (t.kind) {
+      KTplMid => true,
+      _ => false
+    };
+    const isTail = match (t.kind) {
+      KTplTail => true,
+      _ => false
+    };
+    if (!isMid && !isTail) {
+      return Err(errExpected(toks, p, "`}` to close the interpolation"));
+    }
+    parts.push(t.text);
+    p += 1;
+    if (isTail) {
+      return Ok(ExprRes { expr: mkExpr(ETemplate(parts, exprs), spanTo(head.span, t.span)), pos: p });
+    }
+  }
+  return Err(errExpected(toks, p, "template literal"));
+}
+
 function parsePrimary(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
   const t = tokAt(toks, pos);
   match (t.kind) {
     KInt => {
       return Ok(ExprRes { expr: mkExpr(EInt(t.value), t.span), pos: pos + 1 });
     },
+    KBigInt => {
+      return Ok(ExprRes { expr: mkExpr(EBigInt(t.value), t.span), pos: pos + 1 });
+    },
     KFloat => {
       return Ok(ExprRes { expr: mkExpr(EFloat(t.text), t.span), pos: pos + 1 });
     },
     KStr => {
       return Ok(ExprRes { expr: mkExpr(EStr(t.text), t.span), pos: pos + 1 });
+    },
+    KTplFull => {
+      const none: Expr[] = [];
+      return Ok(ExprRes { expr: mkExpr(ETemplate([t.text], none), t.span), pos: pos + 1 });
+    },
+    KTplHead => {
+      return parseTemplate(toks, pos);
+    },
+    KTplMid => {
+      return Err(errExpected(toks, pos, "expression"));
+    },
+    KTplTail => {
+      return Err(errExpected(toks, pos, "expression"));
     },
     KIdent => {
       return parseIdentExpr(toks, pos);
@@ -1611,6 +1662,21 @@ function parsePattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
     },
     KFloat => {
       return Err(errExpected(toks, pos, "pattern (float literals cannot be matched)"));
+    },
+    KBigInt => {
+      return Err(errExpected(toks, pos, "pattern (integer literal too large for a pattern)"));
+    },
+    KTplFull => {
+      return Err(errExpected(toks, pos, "pattern (template literals cannot be matched)"));
+    },
+    KTplHead => {
+      return Err(errExpected(toks, pos, "pattern (template literals cannot be matched)"));
+    },
+    KTplMid => {
+      return Err(errExpected(toks, pos, "pattern"));
+    },
+    KTplTail => {
+      return Err(errExpected(toks, pos, "pattern"));
     },
     KStr => {
       return mkPat(PStr(t.text), t.span, pos + 1);
