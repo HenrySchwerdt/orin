@@ -8,6 +8,37 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 
 ## Backbone
 
+**Order** (project owner, 2026-10-13). The numbered sections below give the details.
+
+1. Language 1.0 core and freeze (done).
+2. Compiler rewrite under the contract and class standard, then diagnostics and CLI polish (2a).
+   The refusal protocol (ADR-0029) is part of 2a.
+3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
+   - bytes and UTF-8, collections, I/O
+   - `std:net`, `std:http`
+   - `std:mcp`, JSX/`std:html`
+4. **Complete the Lean proofs:**
+   - shape check in the verifier and the model (finding F-shape);
+   - the model covers closures, vtables, floats and resource handles;
+   - a binding between the real verifier and the Lean checker, so the result is no longer
+     `MODEL_ONLY`;
+   - all L0 functions contract-verified;
+   - R3 object model in Orin, then R4 refinement proofs against the Lean machine.
+5. **Concurrency** (ADR-0017), placed after R3/R4 and before the performance push:
+   - *after R3*, because task heaps and the L0 thread primitives belong to the Orin core runtime.
+     Built before R3, threads would be built twice, once in C and again in Orin;
+   - isolated tasks with send = move-or-copy keep reference counting non-atomic. The proofs then
+     extend by "disjoint heaps, send transfers ownership" instead of a new memory model;
+   - *before performance*, because allocation, RC elision and escape analysis depend on the
+     threading model, and the comparison with Go needs parallelism;
+   - the HTTP server becomes concurrent here.
+6. **Performance push:**
+   - unboxing, RC elision, escape analysis and region/stack allocation;
+   - LLVM tuning and a parallel compiler;
+   - every optimisation is translation-validated or proved; the goal is at least on par with Go,
+     measured.
+7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
+
 ### 1. Language 1.0 core (ADR-0016), then a two-stage freeze
 - **done:**
   - generics, classes, closures, array API
@@ -81,7 +112,7 @@ the rewritten, contract-checked front end.
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
 primitives.
 
-### 3a. Flagship: TypeScript tooling in Orin (after concurrency)
+### 3a. Flagship: TypeScript tooling in Orin (deferred until a GitHub organisation exists)
 Goal (project owner, 2026-10-13): show that Orin is the natural language for TypeScript tooling —
 TS-familiar syntax for the community, native speed **at least on par with Go**, measured, not claimed.
 1. **Benchmark target first:** Orin formatter/parser on a large TS-like corpus vs a Go parser
