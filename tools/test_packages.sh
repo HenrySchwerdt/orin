@@ -79,6 +79,7 @@ mkdir -p "$D/bin" "$D/libexec" "$D/lib/orin"
 cp dist/orin "$D/bin/orin"
 cp "$ORIN2" "$D/libexec/orin"
 cp -r runtime "$D/lib/orin/runtime"
+cp -r platform "$D/lib/orin/platform"
 echo 0.0.0-test > "$D/VERSION"
 (cd "$T" && "dist/bin/orin" build "../../$SHOP" -o shop-built)
 got=$("$T/shop-built")
