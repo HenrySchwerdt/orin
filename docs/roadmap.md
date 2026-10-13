@@ -8,7 +8,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 
 ## Backbone
 
-### 1. Language 1.0 core (ADR-0016), then freeze
+### 1. Language 1.0 core (ADR-0016), then a two-stage freeze
 - **done:**
   - generics, classes, closures, array API
   - floats/`f32`, `Map<K,V>`
@@ -20,10 +20,15 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   - fixed-width integers and template-literal interpolation
   - `@Test`/`orin test`, `@Deprecated`, `@Inline`
   - resources and the streaming `std:fs`
+  - generic classes (`class Graph<T>`), then `std:graph` on `Graph<T>`/`GraphId<T>`
 - **capabilities (language part):** ADR-0021 is to be written. It covers unforgeable handles,
   grants at the program root, boundary declarations in `orin.toml` and enforcement in the platform
-  layer. It must land before the freeze because it changes the std I/O signatures.
-- **freeze:** after these, the language surface only changes through an ADR.
+  layer. It changes the std I/O signatures, so the std I/O freeze waits for it.
+- **Freeze, in two stages (ADR-0016 amendment):**
+  1. **Language freeze** once the "next" items are in. Syntax and semantics then change only
+     through an ADR, and the compiler rewrite (step 2) starts.
+  2. **std I/O freeze** after capabilities. Until then `std:fs`, `std:process`, `std:io` and
+     `std:time` are *unstable*.
 
 ### 2. Compiler rewrite with the full language (ADR-0015)
 - Refresh the seed, then rewrite module by module:
@@ -56,7 +61,7 @@ primitives.
 | Track | Phase | When | Builds on |
 |---|---|---|---|
 | A Graph | 1 | **now, parallel to the core** | semantic index, `orin api` |
-| B Security | 2 | language part before the freeze; inference/policy after step 2 | resources, `orin.toml` rules, platform layer |
+| B Security | 2 | language part before the std I/O freeze; inference/policy after step 2 | resources, `orin.toml` rules, platform layer |
 | B Security | 3 | after step 2 | MIR source spans, effects |
 | C Formal | 4 | running | ADR-0012 |
 | E Ecosystem | 5 | after the freeze | capabilities, std:json |

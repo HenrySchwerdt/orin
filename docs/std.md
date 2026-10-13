@@ -7,12 +7,13 @@ API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
 |---|---|---|
-| `std:fs`, `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done |
+| `std:fs`, `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done, **unstable** until capabilities (ADR-0016 amendment, ADR-0021) |
 | `std:path` | Orin, `stdlib/path.or` | done (POSIX, lexical) |
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
-| `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep` |
-| `std:graph` | Orin, `stdlib/graph.or` | done (functional API) |
-| `std:math`, `std:map` | | waiting for floats / `Map` (`TODO(after floats/map)`) |
+| `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; clock access **unstable** until capabilities |
+| `std:graph` | Orin, `stdlib/graph.or` | stop-gap functional API; becomes `Graph<T>`/`GraphId<T>` with generic classes |
+| `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
+| `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
 
 ## How the Orin-written modules are organised
 

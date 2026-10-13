@@ -1,0 +1,485 @@
+// Batch driver: run the OIM ownership verifier on MIR given in the textual form printed by
+// `orin mir` (compiler/mir/print.or). Used by tools/diff_verifier_lean.py (differential test
+// against the Lean checker) and tools/mutate_mir.py (mutation corpus).
+//
+//   orin compile compiler/tests/verify_text.or -o build/verify_text.c && cc ... && \
+//     ./build/verify_text <file>        (file: programs, each preceded by a line `=== <name>`;
+//                                        without a `===` line the whole file is one program `-`)
+//
+// Output, one line per program, tab separated:
+//   <name> ACCEPT <warning count>
+//   <name> REJECT <error count> <error 1> <error 2> ...      (error = fN:bB:iI: message)
+//
+// The parser is the inverse of the printer except that built-in names are not mapped back (every
+// IBuiltin becomes a call of a fixed non-mutating built-in: the verifier treats all built-ins
+// alike) and the contents of string literals are dropped (only their number matters).
+// Malformed input exits with status 2 and a message on stderr.
+
+import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, MVTable } from "../mir";
+import { Builtin, UnOp, BinOp } from "../hir";
+import { verify, VerifyReport } from "../verify";
+import { readFile } from "std:fs";
+import { args, exit } from "std:process";
+
+function die(msg: string): void {
+  console.error("verify_text: " + msg);
+  exit(2);
+}
+
+function find(s: string, sub: string): int {
+  return match (s.indexOf(sub)) {
+    Some(i) => i.toInt(),
+    None => -1
+  };
+}
+
+// s[a..] / s[a..b] with int bounds.
+function tail(s: string, a: int): string {
+  return s.substring(a.toUsize(), s.length);
+}
+
+function between(s: string, a: int, b: int): string {
+  return s.substring(a.toUsize(), b.toUsize());
+}
+
+function num(s: string): int {
+  return match (parseInt(s.trim())) {
+    Some(v) => v,
+    None => {
+      die("bad number `" + s + "`");
+      return 0;
+    }
+  };
+}
+
+function lcl(s: string): usize {
+  const t = s.trim();
+  if (!t.startsWith("l")) {
+    die("bad local `" + s + "`");
+  }
+  return num(tail(t, 1)).toUsize();
+}
+
+function blk(s: string): usize {
+  const t = s.trim();
+  if (!t.startsWith("b")) {
+    die("bad block `" + s + "`");
+  }
+  return num(tail(t, 1)).toUsize();
+}
+
+function operand(s0: string): Operand {
+  const s = s0.trim();
+  if (s.startsWith("l")) { return OLocal(lcl(s)); }
+  if (s.startsWith("str#")) { return OStr(num(tail(s, 4)).toUsize()); }
+  if (s == "true") { return OBool(true); }
+  if (s == "false") { return OBool(false); }
+  if (s.startsWith("f")) { return OFloat(tail(s, 1)); }
+  if (s.endsWith("u")) { return OUsize(num(between(s, 0, s.length.toInt() - 1))); }
+  return OInt(num(s));
+}
+
+function operands(s0: string): Operand[] {
+  const s = s0.trim();
+  let out: Operand[] = [];
+  if (s == "") {
+    return out;
+  }
+  for (const p of s.split(", ")) {
+    out.push(operand(p));
+  }
+  return out;
+}
+
+// text between the first `open` and the matching last `close` (a trailing char).
+function inside(s: string, open: string, close: string): string {
+  const a = find(s, open);
+  if (a < 0 || !s.endsWith(close)) {
+    die("expected " + open + " ... " + close + " in `" + s + "`");
+    return "";
+  }
+  return between(s, a + 1, s.length.toInt() - 1);
+}
+
+function unOp(w: string): Option<UnOp> {
+  if (w == "not") { return Some(UnNot); }
+  if (w == "neg") { return Some(UnNeg); }
+  return None;
+}
+
+function binOp(w: string): Option<BinOp> {
+  if (w == "add") { return Some(OpAdd); }
+  if (w == "sub") { return Some(OpSub); }
+  if (w == "mul") { return Some(OpMul); }
+  if (w == "div") { return Some(OpDiv); }
+  if (w == "rem") { return Some(OpRem); }
+  if (w == "eq") { return Some(OpEq); }
+  if (w == "ne") { return Some(OpNe); }
+  if (w == "lt") { return Some(OpLt); }
+  if (w == "le") { return Some(OpLe); }
+  if (w == "gt") { return Some(OpGt); }
+  if (w == "ge") { return Some(OpGe); }
+  if (w == "and") { return Some(OpAnd); }
+  if (w == "or") { return Some(OpOr); }
+  return None;
+}
+
+function fnIdx(s: string): usize {
+  const t = s.trim();
+  if (!t.startsWith("fn")) {
+    die("bad function reference `" + s + "`");
+  }
+  return num(tail(t, 2)).toUsize();
+}
+
+// `call fnN(args)`, `builtin name(args)`, `callind OP(args)` with optional destination.
+// "callvirt OP#SLOT(ARGS)" (interfaces, MIR v1.5)
+function callVirtual(dst: Option<usize>, rhs: string): Instr {
+  const open = find(rhs, "(");
+  const hash = find(rhs, "#");
+  if (open < 0 || hash < 0 || hash > open) {
+    die("bad callvirt `" + rhs + "`");
+  }
+  const recv = operand(between(rhs, 9, hash));
+  return ICallVirtual(dst, recv, num(between(rhs, hash + 1, open)).toUsize(), operands(inside(tail(rhs, open), "(", ")")));
+}
+
+function callLike(dst: Option<usize>, rhs: string): Instr {
+  const open = find(rhs, "(");
+  if (open < 0) {
+    die("bad call `" + rhs + "`");
+  }
+  const argText = inside(tail(rhs, open), "(", ")");
+  const head = between(rhs, 0, open);
+  if (rhs.startsWith("call ")) {
+    return ICall(dst, fnIdx(tail(head, 5)), operands(argText));
+  }
+  if (rhs.startsWith("builtin ")) {
+    return IBuiltin(dst, BArrLength, operands(argText));
+  }
+  return ICallIndirect(dst, operand(tail(head, 8)), operands(argText));
+}
+
+// local `x` and slot index of "lX.I".
+function slotRef(s: string): usize[] {
+  const d = find(s, ".");
+  if (d < 0) {
+    die("bad slot reference `" + s + "`");
+  }
+  return [lcl(between(s, 0, d)), num(tail(s, d + 1)).toUsize()];
+}
+
+// "OP[IDX]" -> [OP text, IDX text]
+function indexRef(s: string): string[] {
+  const o = find(s, "[");
+  if (o < 0 || !s.endsWith("]")) {
+    die("bad index reference `" + s + "`");
+  }
+  return [between(s, 0, o), between(s, o + 1, s.length.toInt() - 1)];
+}
+
+// Instruction with a destination: rhs is the text after `lD = `.
+function withDst(d: usize, rhs: string): Instr {
+  const sp = find(rhs, " ");
+  const w = sp < 0 ? rhs : between(rhs, 0, sp);
+  const rest = sp < 0 ? "" : tail(rhs, sp + 1);
+  if (w == "copy") { return ICopy(d, operand(rest)); }
+  if (w == "move") { return IMove(d, lcl(rest)); }
+  if (w == "borrow") { return IBorrow(d, lcl(rest)); }
+  if (w == "dup") { return IDup(d, operand(rest)); }
+  if (w == "call" || w == "builtin" || w == "callind") { return callLike(Some(d), rhs); }
+  if (w == "callvirt") { return callVirtual(Some(d), rhs); }
+  if (w == "iface") {
+    const tg = find(rest, " {");
+    if (tg < 0 || !rest.startsWith("vt")) { die("bad iface `" + rhs + "`"); }
+    return IIface(d, num(between(rest, 2, tg)).toUsize(), operand(inside(tail(rest, tg + 1), "{", "}")));
+  }
+  if (w == "struct") {
+    const tg = find(rest, " {");
+    if (tg < 0) { die("bad struct `" + rhs + "`"); }
+    return IStructNew(d, num(tail(between(rest, 0, tg), 3)).toUsize(), operands(inside(tail(rest, tg + 1), "{", "}")));
+  }
+  if (w == "nullary") { return INullary(d, num(tail(rest, 3)).toUsize()); }
+  if (w == "tag") { return ITag(d, operand(rest)); }
+  if (w == "getfield") {
+    const dot = find(rest, ".");
+    if (dot < 0) { die("bad getfield `" + rhs + "`"); }
+    return IGetField(d, operand(between(rest, 0, dot)), num(tail(rest, dot + 1)).toUsize());
+  }
+  if (w == "takefield") {
+    const r = slotRef(rest);
+    return ITakeField(d, r[0], r[1]);
+  }
+  if (w == "arraynew") {
+    const isRef = rest.startsWith("ref ");
+    return IArrayNew(d, isRef, operands(inside(tail(rest, 4), "[", "]")));
+  }
+  if (w == "arrayget") {
+    const r = indexRef(rest);
+    return IArrayGet(d, operand(r[0]), operand(r[1]));
+  }
+  if (w == "arraytake") {
+    const r = indexRef(rest);
+    return IArrayTake(d, lcl(r[0]), operand(r[1]));
+  }
+  if (w == "arraypop") { return IArrayPop(d, lcl(rest)); }
+  if (w == "closure") {
+    const tg = find(rest, " {");
+    if (tg < 0) { die("bad closure `" + rhs + "`"); }
+    return IClosure(d, fnIdx(between(rest, 0, tg)), operands(inside(tail(rest, tg + 1), "{", "}")));
+  }
+  match (unOp(w)) {
+    Some(op) => { return IUnary(d, op, operand(rest)); },
+    None => {}
+  }
+  match (binOp(w)) {
+    Some(op) => {
+      const ab = rest.split(", ");
+      if (ab.length != 2) { die("bad binary `" + rhs + "`"); }
+      return IBinary(d, op, operand(ab[0]), operand(ab[1]));
+    },
+    None => {}
+  }
+  die("unknown instruction `" + rhs + "`");
+  return IMakeUnique(0);
+}
+
+function instr(line: string): Instr {
+  const eq = find(line, " = ");
+  if (line.startsWith("l") && eq > 0 && !line.startsWith("setfield") && !line.startsWith("putfield")) {
+    return withDst(lcl(between(line, 0, eq)), tail(line, eq + 3));
+  }
+  if (line.startsWith("release ")) { return IRelease(lcl(tail(line, 8))); }
+  if (line.startsWith("makeunique ")) { return IMakeUnique(lcl(tail(line, 11))); }
+  if (line.startsWith("strappend ")) {
+    const p = tail(line, 10).split(", ");
+    if (p.length != 2) { die("bad strappend `" + line + "`"); }
+    return IStrAppend(lcl(p[0]), operand(p[1]));
+  }
+  if (line.startsWith("setfield ") || line.startsWith("putfield ")) {
+    const p = tail(line, 9).split(" = ");
+    if (p.length != 2) { die("bad field store `" + line + "`"); }
+    const r = slotRef(p[0]);
+    if (line.startsWith("setfield ")) {
+      return ISetField(r[0], r[1], operand(p[1]));
+    }
+    return IPutField(r[0], r[1], lcl(p[1]));
+  }
+  if (line.startsWith("arrayset ") || line.startsWith("arrayput ")) {
+    const p = tail(line, 9).split(" = ");
+    if (p.length != 2) { die("bad array store `" + line + "`"); }
+    const r = indexRef(p[0]);
+    if (line.startsWith("arrayset ")) {
+      return IArraySet(lcl(r[0]), operand(r[1]), operand(p[1]));
+    }
+    return IArrayPut(lcl(r[0]), operand(r[1]), lcl(p[1]));
+  }
+  if (line.startsWith("arraypush ")) {
+    const p = tail(line, 10).split(", ");
+    if (p.length != 2) { die("bad arraypush `" + line + "`"); }
+    return IArrayPush(lcl(p[0]), operand(p[1]));
+  }
+  if (line.startsWith("call ") || line.startsWith("builtin ") || line.startsWith("callind ")) {
+    return callLike(None, line);
+  }
+  if (line.startsWith("callvirt ")) {
+    return callVirtual(None, line);
+  }
+  die("unknown instruction `" + line + "`");
+  return IMakeUnique(0);
+}
+
+function isTerm(line: string): bool {
+  return line.startsWith("goto ") || line.startsWith("branch ") || line.startsWith("switch ")
+    || line == "return" || line.startsWith("return ") || line.startsWith("trap ");
+}
+
+function term(line: string): Terminator {
+  if (line.startsWith("goto ")) { return TGoto(blk(tail(line, 5))); }
+  if (line.startsWith("branch ")) {
+    const rest = tail(line, 7);
+    const q = find(rest, " ? ");
+    const c = find(rest, " : ");
+    if (q < 0 || c < 0) { die("bad branch `" + line + "`"); }
+    return TBranch(operand(between(rest, 0, q)), blk(between(rest, q + 3, c)), blk(tail(rest, c + 3)));
+  }
+  if (line.startsWith("switch ")) {
+    const rest = tail(line, 7);
+    const o = find(rest, " [");
+    const d = find(rest, "] default ");
+    if (o < 0 || d < 0) { die("bad switch `" + line + "`"); }
+    let cases: SwitchCase[] = [];
+    const body = between(rest, o + 2, d).trim();
+    if (body != "") {
+      for (const c of body.split(", ")) {
+        const a = c.split(" -> ");
+        if (a.length != 2) { die("bad switch case `" + c + "`"); }
+        cases.push(SwitchCase { value: num(a[0]), target: blk(a[1]) });
+      }
+    }
+    return TSwitch(operand(between(rest, 0, o)), cases, blk(tail(rest, d + 10)));
+  }
+  if (line == "return") { return TReturn(None); }
+  if (line.startsWith("return ")) { return TReturn(Some(operand(tail(line, 7)))); }
+  return TTrap(line);
+}
+
+function mtype(s: string): MType {
+  if (s == "int") { return MInt; }
+  if (s == "usize") { return MUsize; }
+  if (s == "bool") { return MBool; }
+  if (s == "float") { return MFloat; }
+  if (s == "ref") { return MRef; }
+  if (s == "void") { return MVoid; }
+  die("unknown type `" + s + "`");
+  return MVoid;
+}
+
+// "fnN name (params P[, owned l0 l2]) -> ty": the function without locals and blocks.
+function header(line: string): MFunction {
+  const a = find(line, " ");
+  const p = find(line, " (params ");
+  const c = find(line, ") -> ");
+  if (a < 0 || p < 0 || c < 0) {
+    die("bad function header `" + line + "`");
+  }
+  const name = between(line, a + 1, p);
+  const inner = between(line, p + 9, c);
+  const parts = inner.split(", owned ");
+  const count = num(parts[0]).toUsize();
+  let owned: bool[] = [];
+  let i: usize = 0;
+  while (i < count) {
+    owned.push(false);
+    i += 1;
+  }
+  if (parts.length == 2) {
+    for (const o of parts[1].split(" ")) {
+      if (o != "") {
+        owned[lcl(o)] = true;
+      }
+    }
+  }
+  return MFunction { name: name, paramCount: count, paramOwned: owned, locals: [], ret: mtype(tail(line, c + 5).trim()), blocks: [] };
+}
+
+function parseProgram(lines: string[]): MProgram {
+  let nstr: usize = 0;
+  let funcs: MFunction[] = [];
+  let vts: MVTable[] = [];
+  let mainIdx: usize = 0;
+  let seenMain = false;
+  let instrs: Instr[] = [];
+  let inBlock = false;
+  let i: usize = 0;
+  while (i < lines.length) {
+    const raw = lines[i];
+    i += 1;
+    const line = raw.trim();
+    if (line == "") {
+      continue;
+    }
+    if (!seenMain) {
+      if (line.startsWith("main = fn")) {
+        mainIdx = num(tail(line, 9)).toUsize();
+        seenMain = true;
+      } else if (line.startsWith("vtable#")) {
+        // "vtable#N = [fnA, fnB] // name" (in index order)
+        let fs: usize[] = [];
+        for (const w of between(line, find(line, "[") + 1, find(line, "]")).split(", ")) {
+          if (w != "") {
+            fs.push(fnIdx(w));
+          }
+        }
+        const c = find(line, "// ");
+        vts.push(MVTable { name: c < 0 ? "" : tail(line, c + 3), funcs: fs });
+      } else if (line.startsWith("str#")) {
+        const e = find(line, " = ");
+        if (e > 4) {
+          const k = num(between(line, 4, e)).toUsize() + 1;
+          if (k > nstr) {
+            nstr = k;
+          }
+        }
+      }
+      continue;
+    }
+    if (line.startsWith("fn") && find(line, " (params ") > 0) {
+      funcs.push(header(line));
+      inBlock = false;
+    } else if (line.startsWith("locals:")) {
+      let ls: MLocal[] = [];
+      for (const w of tail(line, 7).split(" ")) {
+        if (w != "") {
+          const c = find(w, ":");
+          if (c < 0) { die("bad local declaration `" + w + "`"); }
+          ls.push(MLocal { name: between(w, 0, c), ty: mtype(tail(w, c + 1)) });
+        }
+      }
+      funcs[funcs.length - 1].locals = ls;
+    } else if (line.startsWith("b") && line.endsWith(":") && find(line, " ") < 0) {
+      instrs = [];
+      inBlock = true;
+    } else if (inBlock && isTerm(line)) {
+      funcs[funcs.length - 1].blocks.push(MBlock { instrs: instrs, term: term(line) });
+      instrs = [];
+      inBlock = false;
+    } else if (inBlock) {
+      instrs.push(instr(line));
+    } else {
+      die("unexpected line `" + line + "`");
+    }
+  }
+  let strs: string[] = [];
+  let k: usize = 0;
+  while (k < nstr) {
+    strs.push("s");
+    k += 1;
+  }
+  return MProgram { functions: funcs, strings: strs, main: mainIdx, vtables: vts };
+}
+
+function runOne(name: string, lines: string[]): void {
+  const r: VerifyReport = verify(parseProgram(lines));
+  if (r.errors.length == 0) {
+    console.log(name + "\tACCEPT\t" + r.warnings.length.toString());
+    return;
+  }
+  let out = name + "\tREJECT\t" + r.errors.length.toString();
+  for (const e of r.errors) {
+    out += "\t" + e.func + ":b" + e.block.toString() + ":i" + e.instr.toString() + ": " + e.message;
+  }
+  console.log(out);
+}
+
+function main(): void {
+  const a = args();
+  if (a.length != 1) {
+    die("usage: verify_text <file>");
+    return;
+  }
+  const text = readFile(a[0]);
+  if (text.isErr()) {
+    die("cannot read " + a[0] + ": " + text.unwrapErr());
+    return;
+  }
+  let name = "-";
+  let cur: string[] = [];
+  let have = false;
+  for (const l of text.unwrap().split("\n")) {
+    if (l.startsWith("=== ")) {
+      if (have) {
+        runOne(name, cur);
+      }
+      name = tail(l, 4).trim();
+      cur = [];
+      have = true;
+    } else {
+      cur.push(l);
+      have = true;
+    }
+  }
+  if (have && (name != "-" || cur.length > 0)) {
+    runOne(name, cur);
+  }
+}

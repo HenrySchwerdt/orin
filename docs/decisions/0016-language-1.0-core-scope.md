@@ -3,6 +3,15 @@
 Status: accepted (2026-10-13). After the core is complete the language surface is **frozen**
 (only bug fixes and ADR-approved additions) and work shifts to optimisation and provability.
 
+**Amendment (2026-10-13): two-stage freeze** (decided with the project owner).
+1. **Language freeze:** taken as soon as integers, interpolation, `@Test`/`@Deprecated`/`@Inline`,
+   resources and generic classes are in. From then on, syntax and semantics change only through
+   an ADR, and the compiler rewrite (ADR-0015) starts.
+2. **std I/O freeze:** taken after capabilities (ADR-0021). Until then `std:fs`, `std:process`,
+   `std:io` and `std:time` are marked *unstable*. Capabilities may change their signatures; that is
+   library API, not syntax. Any syntax capabilities need goes through an ADR, like every
+   post-freeze change.
+
 ## In the 1.0 core
 | Area | Decision |
 |---|---|
@@ -16,7 +25,8 @@ Status: accepted (2026-10-13). After the core is complete the language surface i
 | **Graph<T>/GraphId<T>** | std library type (Orin) with generational, graph-tagged IDs; stale/foreign IDs → `Err` (spec 06 cycle rule). |
 | **Packages** (spec 04) | `orin.toml` manifest: package name, module architecture rules (`allowed_dependencies`), entry point; `orin build`/`check` from a package root. No registry/versions in 1.0 core (post-1.0). |
 | **std** | `std:fs`, `std:process`, `std:io`, `std:math`, `std:path`, `std:time`, `std:json` (`parse` into a `Json` union + typed helpers; codegen-based `parse<T>` needs annotations → post-1.0), `std:map`. HTTP is post-1.0. |
-| **Capabilities** (ADR-0020 D4) | language part only: unforgeable capability handles granted at the program root, boundary declarations in `orin.toml`, enforcement in the L0 platform layer; std I/O APIs take handles. Designed in ADR-0021 (pending) — **the freeze waits for it**. Effect inference/policy checking come after the freeze. |
+| **Capabilities** (ADR-0020 D4) | language part only: unforgeable capability handles granted at the program root, boundary declarations in `orin.toml`, enforcement in the L0 platform layer; std I/O APIs take handles. Designed in ADR-0021 (pending) — the **std I/O freeze** (stage 2) waits for it, the language freeze does not. Effect inference/policy checking come after the freeze. |
+| **Generic classes** | `class Box<T> { ... }`, monomorphised like generic functions (ADR-0007), with bounds `T extends I` (ADR-0019). Needed for `Graph<T>`/`GraphId<T>`, whose current `std:graph` is a stop-gap functional API with a caller-supplied tag. |
 | **Concurrency** | **designed now** (ADR-0017), implemented after the core freeze but before 1.0 final. |
 
 ## Explicitly post-1.0

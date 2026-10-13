@@ -122,7 +122,7 @@ the C compiler and allocator are correct; the MIR → C emitter is a direct tran
 ## Verifier implementation notes
 Implementation: `compiler/verify/` (`wf.or` well-formedness, `state.or` abstract domain and joins,
 `rules.or` one transfer function per instruction/terminator, `verify.or` worklist fixpoint and
-reporting). Tests: `compiler/tests/verify_main.or`. Choices where the rules above were ambiguous:
+reporting). Tests: `compiler/tests/verify_main.or` (hand-written cases), `compiler/tests/verify_text.or` (batch driver over textual MIR: differential test against the Lean checker, `tools/diff_verifier_lean.py`, and mutation corpus, `tools/mutate_mir.py`). Choices where the rules above were ambiguous:
 
 - **Well-formedness first.** Index ranges, operand classes (int/usize/bool/ref), `ICall` arity and
   argument/return classes, `paramCount <= locals.length`, no `void` locals, `OUsize >= 0`. If a

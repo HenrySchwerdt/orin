@@ -28,4 +28,12 @@ step "verify all"              python3 tools/verify_all.py compiler/main.or
 step "contract erasure"        python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2
 step "contract verification"   python3 tools/test_verify_contracts.py --require-z3 --orinc build/bootstrap/orin2
 step "platform layer"         sh -c 'tools/check_platform_boundary.sh && tools/verify_platform.sh'
+step "mutation corpus"         python3 tools/mutate_mir.py
+# The differential test needs Lean (the CI `formal` job); skipped when elan/lake is not installed.
+if PATH="$HOME/.elan/bin:$PATH" command -v lake >/dev/null 2>&1; then
+  step "formal (check.sh, exe)"  sh -c 'export PATH="$HOME/.elan/bin:$PATH"; cd formal && ./check.sh | tail -1 && lake build orin_check | tail -1'
+  step "diff verifier vs Lean"   python3 tools/diff_verifier_lean.py
+else
+  echo "diff verifier vs Lean      SKIPPED (lake not installed; runs in the CI formal job)"
+fi
 echo "ci_local: all steps passed"

@@ -365,6 +365,52 @@ and its contract in `Top.lean`; the rest is proof. A differential test of the Le
 `compiler/verify` on generated MIR (the structured fragment) would close most of the manual-
 transcription gap.
 
+### Executable checker and differential test (C4)
+
+`formal/Orin/Exec.lean` makes `Orin.check` executable (`lake build orin_check`, binary
+`formal/.lake/build/bin/orin_check`). It parses programs of the fragment above in a line-based text
+format (`prog NAME N PARAMS`, one mnemonic per line, `if C` / `else` / `end`, `endprog`) and prints
+`ACCEPT` or `REJECT <first rejected instruction>` per program. The verdict is `Orin.check` itself; the
+parser and the reason report (`diag`, which reuses `stepA`/`joinS` and is cross-checked against
+`check` at run time) are the only new code. No definition, theorem or proof was changed; the
+escape-hatch scan and the axiom audit of `check.sh` cover `Exec.lean`.
+
+`tools/gen_mir_fragment.py` generates random programs of exactly the fragment (deterministic seed;
+a small tracker biases the sampling so that about 40 percent of programs are accepted, and 10 percent of the
+steps ignore it) in two forms: the Lean text and the textual MIR printed by `orin mir`.
+`compiler/tests/verify_text.or` is a batch driver that parses that MIR text and runs the real
+`compiler/verify`. `tools/diff_verifier_lean.py` runs both on N programs plus two random prefixes of
+each (so the position of the first fault is compared, not only its existence) and compares the
+ACCEPT/REJECT verdicts. CI (`formal` job) runs it with 4000 base programs, 12000 checks in total, in about 10 seconds
+(the compiler for the driver comes from the seed, `tools/bootstrap.sh --seed-only`).
+
+What it showed (seed 20261013 plus a one-off run of 120000 programs with seed 7): the verdicts agree
+on every program, with exactly one class of divergence, Finding 6 (`IStructNew` whose operand list
+contains its destination): **the verifier accepts, the model rejects**. This is the dangerous
+direction; it is allow-listed in the tool, and the allow-list entry only excuses a divergence if the
+Lean verdict on a rewritten program (`release d`, then the struct without `d`, which has the same
+abstract effect) equals the verifier's verdict. The rewrite shows that the *abstract* rule matches; the concrete memory
+safety of this construct (the count of `d` moves into the new object's slot, `d` is overwritten)
+is plausible but not covered by `check_sound`. No divergence in the other direction was found, and
+nothing else was found in 120000 programs, including after the fix of Finding 1. Finding 5
+(`setField`/`putField` with `v == x`) is not a divergence: `wf.or` and the model both reject it.
+Sanity check of the test itself: removing the `Unique` demotion from the verifier's `IDup` rule is
+detected (5 diverging programs among 2000).
+
+Limits: the generator produces class-correct programs only (the model has no types); no calls,
+loops, arrays, strings, `Imm`, owned parameters or `MaybeLeak`/`MaybeDead` distinction; the verifier's leak warnings
+are not compared. The tracker used by the generator is a third transcription of the rules, used for
+sampling only. A differential test samples; it does not prove that `compiler/verify` implements `check`.
+
+Mutation corpus (`tools/mutate_mir.py`): see `docs/assurance.md`. It takes the optimised MIR of the conformance
+programs, injects single ownership bugs (drop or duplicate a release, read after release / move /
+consumption, store through a duplicated or borrowed reference, drop a `makeUnique` before a store,
+release or move a borrowed parameter, release a borrowed projection, drop a `dup`) and requires the
+verifier to reject (leak-class mutants: to warn). Mutants that are semantically benign at the site
+(an immortal literal that is released, a leak on a path that only traps, a `makeUnique` of an
+object that is already unique per an independent dataflow in the tool) are classified with a reason and
+counted separately.
+
 ### Status of findings (lead, 2026-10-13)
 - Finding 1 (self-rooted borrow) — **fixed** in `compiler/verify/rules.or` (`defBorrow` rejects a
   borrow whose root is its own destination) with two regression cases in
