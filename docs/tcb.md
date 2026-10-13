@@ -3,6 +3,9 @@
 _Updated: 2026-10-13 · ADR-0020 (vision phase 0). Update this file whenever a component moves in
 or out of trust._
 
+Which claim rests on which evidence, and at which assurance level, is in
+[assurance.md](assurance.md).
+
 A guarantee Orin reports ("memory safe", "VERIFIED") holds only if every component it rests on is
 correct. This table lists those components, how much each is trusted, and what evidence exists
 today. "Trusted" means a bug there can silently break a guarantee.
