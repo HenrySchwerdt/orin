@@ -34,6 +34,17 @@ User annotation processors/codegen, generic interfaces & bounds beyond single in
 methods, `Shared<T>` (atomic RC) values, async/await syntax, package registry/versioning, HTTP,
 incremental analysis engine, `i128`/`u128` (additive; E0431 until then), inheritance (never planned).
 
+**Bit operators — post-1.0, reserved now** (decided with the project owner, 2026-10-13). `&`, `|`,
+`^`, `~`, `<<`, `>>` on integers are an additive extension (today they are errors on numbers, so no
+program can change meaning). Reserved semantics so nothing else claims these tokens:
+- integer operands only, same type on both sides (no implicit width mixing, like `+`);
+- shifts by a negative amount or by >= the bit width **trap** (no C-style undefined behaviour);
+  `>>` is arithmetic on signed, logical on unsigned types;
+- `|` keeps its meaning in type position (unions), `&` stays reserved in type position for
+  multiple bounds (`T extends A & B`, E0408 today);
+- the lexer never produces a `>>` token in type context (`Box<Box<int>>`, ADR-0026); a shift
+  operator, when added, is recognised in expression context only.
+
 ## Definition of "core complete"
 All rows above implemented with conformance tests (default + `tests/next`), formatter/LSP/MCP
 support, both backends, verifier-clean, documented in `docs/` and reflected in the spec files;
