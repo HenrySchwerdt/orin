@@ -29,7 +29,7 @@
 // public method (`orin test`, `--check-contracts`); the constructor of `Utf8String` *always* validates, so the
 // invariant also holds in builds without contract checking. Helpers used in contracts are loops, not closures.
 //
-// Complexity: n = byte length. `validate*`, `isValidUtf8`, `codePointCount`, `codePoints`, `concat`, `trySlice`,
+// Complexity: n = byte length. `validate*`, `isValidUtf8` (one table-driven pass, no allocation), `codePointCount`, `codePoints`, `concat`, `trySlice`,
 // `fromCodePoints` O(n); `encodeCodePoint`, `codePointAt`, `isCharBoundary`, `byteLength` O(1);
 // `CodePointCursor.next` O(1); constructing a `Utf8String` validates, O(n).
 
@@ -194,34 +194,63 @@ function scanSeq(s: string, i: usize): Seq {
   return okSeq(need + 1);
 }
 
+// The validator is table-driven (Bjoern Hoehrmann's UTF-8 DFA, 12 byte classes x 9 states, accepting state 0,
+// rejecting state 12; the tables are string constants because Orin has no constant arrays). Runs of ASCII bytes
+// are skipped without table lookups. `scanSeq` (above) is only used on the error path, to classify the first bad
+// sequence; the tests check the DFA against it on every 1- and 2-byte input and on boundary-heavy 3- and 4-byte
+// inputs. Class table: 256 entries indexed by the byte; transition table: next = NEXT[state + class].
+const UTF8_CLASS: string = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x08\x08\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x0a\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x03\x04\x03\x03\x0b\x06\x06\x06\x05\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08\x08";
+const UTF8_NEXT: string = "\x00\x0c\x18\x24\x3c\x60\x54\x0c\x0c\x0c\x30\x48\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x00\x0c\x0c\x0c\x0c\x0c\x00\x0c\x00\x0c\x0c\x0c\x18\x0c\x0c\x0c\x0c\x0c\x18\x0c\x18\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x18\x0c\x0c\x0c\x0c\x0c\x18\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x18\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x24\x0c\x24\x0c\x0c\x0c\x24\x0c\x0c\x0c\x0c\x0c\x24\x0c\x24\x0c\x0c\x0c\x24\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c\x0c";
+
+// validPrefix(s): the length of the longest prefix of s that is valid UTF-8 and ends on a sequence boundary:
+// s.length when s is valid, else the offset of the first invalid (or cut-off) sequence. One pass, O(n), no
+// allocation. The spec decoder `scanSeq` agrees at the returned offset (checked by the contract).
+@Ensures(result <= s.length)
+@Ensures(result < s.length ==> scanSeq(s, result).kind.isSome())
+function validPrefix(s: string): usize {
+  const n = s.length;
+  let i: usize = 0;
+  while (i < n) {
+    if (s.charCodeAt(i) < 128) {
+      i += 1;
+      while (i < n && s.charCodeAt(i) < 128) {
+        i += 1;
+      }
+    } else {
+      const start = i;
+      let st = 0;
+      while (i < n) {
+        st = UTF8_NEXT.charCodeAt((st + UTF8_CLASS.charCodeAt(s.charCodeAt(i).toUsize())).toUsize());
+        i += 1;
+        if (st <= 12) {
+          break;
+        }
+      }
+      if (st != 0) {
+        return start;
+      }
+    }
+  }
+  return n;
+}
+
 // checkUtf8(s): Ok when the bytes of `s` are well-formed UTF-8, else the first error. O(n).
 @Ensures(result.isErr() ==> result.unwrapErr().position < s.length)
 @Ensures(result.isErr() ==> result.unwrapErr().position + result.unwrapErr().length <= s.length)
 @Ensures(s.length == 0 ==> result.isOk())
 export function checkUtf8(s: string): Result<void, Utf8Error> {
-  let i: usize = 0;
-  while (i < s.length) {
-    const q = scanSeq(s, i);
-    if (q.kind.isSome()) {
-      return Err(Utf8Error { position: i, length: q.len, kind: q.kind.unwrap() });
-    }
-    i += q.len;
+  const p = validPrefix(s);
+  if (p == s.length) {
+    return Ok();
   }
-  return Ok();
+  const q = scanSeq(s, p);
+  return Err(Utf8Error { position: p, length: q.len, kind: q.kind.unwrap() });
 }
 
-// isValidUtf8(s): are the bytes of `s` well-formed UTF-8? Loop-based, usable in contracts. O(n).
+// isValidUtf8(s): are the bytes of `s` well-formed UTF-8? Usable in contracts. O(n).
 @Ensures(s.length == 0 ==> result)
 export function isValidUtf8(s: string): bool {
-  let i: usize = 0;
-  while (i < s.length) {
-    const q = scanSeq(s, i);
-    if (q.kind.isSome()) {
-      return false;
-    }
-    i += q.len;
-  }
-  return true;
+  return validPrefix(s) == s.length;
 }
 
 // Number of code points of a string that is valid UTF-8 (not re-checked: that would make callers quadratic): the bytes that are not continuation bytes. O(n).
