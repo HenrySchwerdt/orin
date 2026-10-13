@@ -135,25 +135,29 @@ Global objects/functions (no import needed): `console.log(s: string): void`,
 `console.error(s: string): void`, `String.fromCharCode(c: int): string`,
 `parseInt(s: string): Option<int>` (decimal, optional leading `-`, no whitespace).
 
-`import { readFile, writeFile, exists } from "std:fs";`
-- `readFile(path: string): Result<string, string>`
-- `writeFile(path: string, data: string): Result<void, string>`
-- `exists(path: string): bool`
+**Since ADR-0027 (capability grants) every function below that touches the outside world takes the grant that
+authorises it as its first argument; the grant comes from `main(host: Host)` through `std:host`.** The signatures are the
+ones listed here with the extra leading parameter; `main()` without `host` has no I/O authority (E0470).
 
-`import { args, exit } from "std:process";`
-- `args(): string[]` (excludes the program name); `exit(code: int): void`.
+`import { readFile, writeFile, exists, FsGrant } from "std:fs";`
+- `readFile(fs: FsGrant, path: string): Result<string, string>`
+- `writeFile(fs: FsGrant, path: string, data: string): Result<void, string>`
+- `exists(fs: FsGrant, path: string): bool`
+
+`import { args, exit, ProcessGrant } from "std:process";`
+- `args(proc: ProcessGrant): string[]` (excludes the program name); `exit(code: int): void` (needs no grant).
 
 `Result<void, E>` success value is written `Ok()`.
 
 Beyond Orin-B (self-hosted compiler only; Stage 0 rejects the import with E0301): standard module
-`std:io`, `import { readBytes, readLine, writeStdout, shell } from "std:io";`
-- `readBytes(n: usize): Option<string>`: exactly `n` bytes from stdin, `None` if end of input is
+`std:io`, `import { readBytes, readLine, writeStdout, shell } from "std:io";` (a `StdioGrant` first; `shell` takes the `ProcessGrant`)
+- `readBytes(stdio, n: usize): Option<string>`: exactly `n` bytes from stdin, `None` if end of input is
   reached first (the bytes read so far are discarded); `readBytes(0)` is `Some("")`.
-- `readLine(): Option<string>`: the next line without its `\n` (or `\r\n`), `None` at end of input.
+- `readLine(stdio): Option<string>`: the next line without its `\n` (or `\r\n`), `None` at end of input.
   A final line without a newline is returned; an empty stream yields `None`.
-- `writeStdout(s: string): void`: writes `s` to stdout without a newline and flushes. It shares
+- `writeStdout(stdio, s: string): void`: writes `s` to stdout without a newline and flushes. It shares
   the stdio buffer with `console.log`, so output order is preserved.
-- `shell(cmd: string): int`: runs `cmd` with `/bin/sh -c`, returns the exit status (-1 if it could not
+- `shell(proc, cmd: string): int`: runs `cmd` with `/bin/sh -c`, returns the exit status (-1 if it could not
   run or was killed by a signal). Used by `orin mcp` (`test`/`build`, only with `--allow-exec`).
 Strings are byte strings. Used by `orin lsp` (`compiler/lsp/stdio.or`); runtime in
 `runtime/orin_runtime_io.h` (header-only, included by generated C of both backends).

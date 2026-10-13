@@ -23,10 +23,10 @@ Use **JavaScript/TypeScript-familiar names** and predictably typed signatures. A
 Example:
 
 ```typescript
-import { readFile } from "std:fs";
+import { readFile, FsGrant } from "std:fs";
 import { parse } from "std:json";
-function loadUsers(path: string): Result<User[], AppError> {
-  const text = readFile(path)?;
+function loadUsers(fs: FsGrant, path: string): Result<User[], AppError> {
+  const text = readFile(fs, path)?;
   return parse<User[]>(text);
 }
 ```
