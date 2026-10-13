@@ -1,518 +1,248 @@
-// Module loader (single implementation; `loadAll` = `loadWithOverlay` with an empty overlay): reads files, parses them, resolves imports, enforces module boundaries
-// (E0302) and acyclicity (E0303). Port of bootstrap/src/loader.rs with the same diagnostics,
-// the same topological order (DFS in import order, dependencies first, entry last) and the
-// same unit names. Paths are normalized lexically (see path.or), not canonicalized.
+// Module loader: reads files, parses them, resolves imports, enforces module boundaries (E0302),
+// acyclicity of files (E0303) and the module rules of a package (E0501, E0502, E0303).
 //
-// The DFS is iterative: the current file's state lives in locals of `loadAll`, and the
-// parents' states sit on parallel stacks (sNode/sAst/sItem/sImps), so every array is grown
-// in a `let` local that owns it.
+// The units come out in dependency order: a depth-first walk in import order, a unit being
+// completed (and numbered) after all its imports, the entry last. File paths are normalized
+// lexically (see path.or), not canonicalized.
 
 import { Module, Item, ImportDecl, Ident, parse } from "../syntax";
-import { Span, SourceMap, SourceFile, Diagnostic, diag, span } from "../diag";
-import { readFile, exists } from "std:fs";
-import { ImportTarget, StdModule, Unit, LoadedProgram } from "./program";
-import { normalizePath, dirname, joinPath, relativeTo, isInside } from "./path";
+import { Span, SourceMap, SourceFile, Diagnostic, diag, span, isRenderable } from "../diag";
+import { Manifest, edgeError, findModuleCycle, displayModule } from "../package";
+import {
+  ImportTarget, StdModule, Unit, LoadedProgram, LoadOutcome, failedLoad, importOf, isWellFormed,
+} from "./program";
+import { normalizePath, dirname, joinPath } from "./path";
 import { PreludeRoot, noPreludeRoots } from "./prelude";
-import { Manifest, ModuleRule, parseManifest, edgeError, findModuleCycle, displayModule } from "../package";
+import { Sources } from "./sources";
+import { Resolved, resolveImport, unitName } from "./resolve";
+import { moduleOf, findManifest, readManifest, manifestEntry } from "./modules";
 
 export type LoadResult = { program: LoadedProgram; sm: SourceMap; };
 
-// Like LoadResult, but also available on failure: `sm` holds every file read so far (so the
-// diagnostics can be rendered); `program` is Some exactly when `diags` is empty.
-export type LoadOutcome = { sm: SourceMap; program: Option<LoadedProgram>; diags: Diagnostic[]; };
+// An import between two different modules of a package, kept to check the module graph for cycles.
+type ModuleEdge = { importer: string; imported: string; at: Span; };
 
-// Overlay entries with normalized paths (so lookups are plain string comparisons).
-function normalizeOverlay(overlay: SourceFile[]): SourceFile[] {
-  let out: SourceFile[] = [];
-  for (const f of overlay) {
-    out.push(SourceFile { path: normalizePath(f.path), text: f.text });
+// One load of a program. `files` and `units` are filled while walking the import graph; after a
+// failed `run`, `files` holds every file read so far (the entry first, then in discovery order).
+@Invariant(this.units.length == this.done.size)
+@Invariant(this.done.size + this.stack.length <= this.files.length)
+class Loader {
+  files: SourceFile[] = [];
+  private units: Unit[] = [];
+  private done: Map<string, usize> = new Map<string, usize>(); // file path -> index in `units`
+  private stack: string[] = []; // files being loaded (their imports are not complete yet)
+  private edges: ModuleEdge[] = [];
+  private src: Sources;
+  private roots: PreludeRoot[];
+  private base: string; // directory of the entry file; unit names are relative to it
+  private srcRoot: string; // module ids are relative to this directory
+  private manifest: Option<Manifest>;
+
+  constructor(
+    src: Sources,
+    roots: PreludeRoot[],
+    base: string,
+    srcRoot: string,
+    manifest: Option<Manifest>,
+  ) {
+    this.src = src;
+    this.roots = roots;
+    this.base = base;
+    this.srcRoot = srcRoot;
+    this.manifest = manifest;
   }
-  return out;
-}
 
-function findIn(ov: SourceFile[], p: string): Option<usize> {
-  let i: usize = 0;
-  while (i < ov.length) {
-    if (ov[i].path == p) {
-      return Some(i);
+  // Loads the entry file and everything it imports; the entry is the last unit.
+  run(entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
+    this.visit(entry, entryDisplay)?;
+    this.checkModuleCycles()?;
+    return Ok(LoadedProgram {
+      units: this.units,
+      entry: this.units.length - 1,
+      manifest: this.manifest,
+    });
+  }
+
+  // Opens, parses and completes the unit of file `path` (`display` is how diagnostics name it);
+  // returns its index in `units`.
+  private visit(path: string, display: string): Result<usize, Diagnostic> {
+    const text = this.src.read(path);
+    if (text.isErr()) {
+      this.files.push(SourceFile { path: display, text: "" });
+      return Err(
+        diag(
+          "E0301",
+          span(this.files.length - 1, 0, 0),
+          `cannot read \`${path}\`: ${text.unwrapErr()}`,
+        ),
+      );
     }
-    i += 1;
-  }
-  return None;
-}
-
-function existsIn(ov: SourceFile[], p: string): bool {
-  return findIn(ov, p).isSome() || exists(p);
-}
-
-function readIn(ov: SourceFile[], p: string): Result<string, string> {
-  const k = findIn(ov, p);
-  if (k.isSome()) {
-    return Ok(ov[k.unwrap()].text);
-  }
-  return readFile(p);
-}
-
-type Resolved = { std: int; path: string; };
-
-function failOut(files: SourceFile[], d: Diagnostic): LoadOutcome {
-  const ds: Diagnostic[] = [d];
-  return LoadOutcome { sm: SourceMap { files: files }, program: None, diags: ds };
-}
-
-// `/`-separated path of `p` relative to `base`, without a trailing `.or`.
-function relName(base: string, p: string): string {
-  if (p.startsWith("$")) {
-    // Prelude unit (virtual path, see prelude.or): its name does not depend on the entry file.
-    return p.endsWith(".or") ? p.substring(0, p.length - 3) : p;
-  }
-  const s = relativeTo(base, p);
-  if (s.endsWith(".or")) {
-    return s.substring(0, s.length - 3);
-  }
-  return s;
-}
-
-function stdKind(p: string): int {
-  if (p == "std:fsraw") {
-    // Internal: the C-runtime file primitives behind `std:fs` (stdlib/fs.or). Only library code may import it.
-    return 1;
-  }
-  if (p == "std:process") {
-    return 2;
-  }
-  if (p == "std:io") {
-    return 3;
-  }
-  if (p == "std:clock") {
-    return 4;
-  }
-  return 0;
-}
-
-// Std modules written in Orin (stdlib/, embedded as the `$stdlib` library root, see prelude.or):
-// "std:path" resolves to the unit "$stdlib/path". Empty when `p` is not one of them.
-function stdlibFile(p: string): string {
-  if (p == "std:fs" || p == "std:path" || p == "std:json" || p == "std:time" || p == "std:graph" || p == "std:test") {
-    return "$stdlib/" + p.substring(4, p.length) + ".or";
-  }
-  return "";
-}
-
-// Resolve import path `p` of file `importer` (in directory `dir`) to a normalized file path,
-// or to a std module. Reports E0301 and E0302.
-function resolveImport(ov: SourceFile[], importer: string, dir: string, p: string, sp: Span, base: string): Result<Resolved, Diagnostic> {
-  if (p.startsWith("$")) {
-    // The implicit import of a prelude root's entry file (added to the program's entry file below).
-    return Ok(Resolved { std: 0, path: normalizePath(p) });
-  }
-  if (p == "std:math") {
-    // std:math is Orin code (array/math.or, part of the embedded `$array` prelude root), loaded on demand.
-    return Ok(Resolved { std: 0, path: normalizePath("$array/math.or") });
-  }
-  if (p.startsWith("std:")) {
-    const lf = stdlibFile(p);
-    if (lf != "") {
-      return Ok(Resolved { std: 0, path: lf });
+    const file = this.files.length;
+    this.files.push(SourceFile { path: display, text: text.unwrap() });
+    const parsed = parse(file, text.unwrap())?;
+    // The entry file also gets the implicit imports of the prelude roots, in front of its own items.
+    const ast = file == 0
+        ? Module { file: parsed.file, items: this.preludeImports(file).concat(parsed.items) }
+        : parsed;
+    this.stack.push(path);
+    let imports: ImportTarget[] = [];
+    for (const item of ast.items) {
+      const decl = importOf(item);
+      if (decl.isSome()) {
+        imports.push(this.importTarget(path, decl.unwrap())?);
+      }
     }
-    const k = stdKind(p);
-    if (k == 1 && !importer.startsWith("$")) {
-      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process, std:io, std:math, std:path, std:json, std:time, std:graph, std:test)"));
-    }
-    if (k == 0) {
-      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process, std:io, std:math, std:path, std:json, std:time, std:graph, std:test)"));
-    }
-    return Ok(Resolved { std: k, path: "" });
-  }
-  const c1 = joinPath(dir, p + ".or");
-  const c2 = joinPath(dir, p + "/module.or");
-  let target = c1;
-  if (!existsIn(ov, c1)) {
-    if (!existsIn(ov, c2)) {
-      return Err(diag("E0301", sp, "cannot find module `" + p + "` (tried `" + c1 + "` and `" + c2 + "`)"));
-    }
-    target = c2;
+    this.stack.pop();
+    const index = this.units.length;
+    this.units.push(Unit {
+      file: file,
+      path: path,
+      name: unitName(this.base, path),
+      module: moduleOf(this.src, this.srcRoot, path),
+      ast: ast,
+      imports: imports,
+    });
+    this.done.set(path, index);
+    return Ok(index);
   }
 
-  // Module boundary rule (E0302): walk the ancestor directories of the target (stopping at
-  // the filesystem root, or at the start of a relative path).
-  let d = dirname(target);
-  while (d != ".") {
-    const m = joinPath(d, "module.or");
-    if (target != m && existsIn(ov, m) && !isInside(d, importer)) {
-      return Err(diag("E0302", sp, "cannot import private file `" + relName(base, target)
-        + "` of module `" + relName(base, d) + "`; import the module itself"));
-    }
-    const nd = dirname(d);
-    if (nd == d) {
-      break;
-    }
-    d = nd;
+  // `import {} from "<entry>"` for every prelude root that has an entry file (library roots such as
+  // std:path are served from memory and imported on demand).
+  private preludeImports(file: usize): Item[] {
+    const sp = span(file, 0, 0);
+    const none: Ident[] = [];
+    return this.roots
+        .filter(r => r.entry != "")
+        .map(r => IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp, span: sp }));
   }
-  return Ok(Resolved { std: 0, path: target });
+
+  private importTarget(importer: string, decl: ImportDecl): Result<ImportTarget, Diagnostic> {
+    const res = resolveImport(this.src, importer, decl.path, decl.pathSpan, this.base)?;
+    if (res.std.isSome()) {
+      return Ok(ImportStd(res.std.unwrap()));
+    }
+    this.recordModuleEdge(importer, res.path, decl.pathSpan)?;
+    const finished = this.done.get(res.path);
+    if (finished.isSome()) {
+      return Ok(ImportUnit(finished.unwrap()));
+    }
+    const open = this.stack.indexOf(res.path);
+    if (open.isSome()) {
+      // Import cycle: the stack from the file being re-entered, then that file again.
+      const chain = this.stack
+          .slice(open.unwrap(), this.stack.length)
+          .concat([res.path])
+          .map(p => unitName(this.base, p));
+      return Err(diag("E0303", decl.pathSpan, `import cycle: ${chain.join(" -> ")}`));
+    }
+    return Ok(ImportUnit(this.visit(res.path, res.path)?));
+  }
+
+  // In a package, an import between two different modules must be allowed by the manifest (E0501);
+  // allowed edges are collected for the cycle check. Prelude units and files outside the src root
+  // have no module ("").
+  private recordModuleEdge(importer: string, target: string, at: Span): Result<void, Diagnostic> {
+    if (this.manifest.isNone()) {
+      return Ok();
+    }
+    const fromModule = moduleOf(this.src, this.srcRoot, importer);
+    const toModule = moduleOf(this.src, this.srcRoot, target);
+    if (fromModule != "" && toModule != "" && fromModule != toModule) {
+      const forbidden = edgeError(this.manifest.unwrap(), fromModule, toModule);
+      if (forbidden.isSome()) {
+        return Err(diag("E0501", at, forbidden.unwrap()));
+      }
+      this.edges.push(ModuleEdge { importer: fromModule, imported: toModule, at: at });
+    }
+    return Ok();
+  }
+
+  // The module graph of a package must be acyclic (E0303), reported at the import that closes the
+  // cycle: the last edge back to the cycle's first module.
+  private checkModuleCycles(): Result<void, Diagnostic> {
+    const cycle = findModuleCycle(this.edges.map(e => e.importer), this.edges.map(e => e.imported));
+    if (cycle.length == 0) {
+      return Ok();
+    }
+    const last = cycle[cycle.length - 1];
+    const beforeLast = cycle[cycle.length - 2];
+    const closing = this.edges.filter(e => e.importer == beforeLast && e.imported == last);
+    const shown = cycle.map(m => displayModule(m)).join(" -> ");
+    return Err(diag("E0303", closing[closing.length - 1].at, `module import cycle: ${shown}`));
+  }
 }
 
-function findNode(paths: string[], p: string): Option<usize> {
-  let i: usize = 0;
-  while (i < paths.length) {
-    if (paths[i] == p) {
-      return Some(i);
+// True when every diagnostic can be rendered against `sm`.
+function allRenderable(sm: SourceMap, ds: Diagnostic[]): bool {
+  for (const d of ds) {
+    if (!isRenderable(sm, d)) {
+      return false;
     }
-    i += 1;
   }
-  return None;
+  return true;
 }
 
-function importOf(item: Item): Option<ImportDecl> {
-  return match (item) {
-    IImport(i) => Some(i),
-    IReExport(i) => Some(i),
-    _ => None
+// Loads the program rooted at `entryPath`, which may also be a package directory (orin.toml) or a
+// file inside one. File contents come from `overlay` (unsaved editor buffers, spec 18 §2) when a
+// path matches (compared after `normalizePath`), otherwise from disk; an overlay file also counts as
+// existing for import resolution. Every prelude root's files are served from memory and each root's
+// entry file is imported (with no names) by the program's entry file, so the prelude units come
+// first in `units` (before the entry's own dependencies) and are checked, lowered and emitted with
+// the program. (The entry file keeps file id 0; prelude files get the next ids.)
+@Ensures(result.program.isSome() == (result.diags.length == 0))
+@Ensures(result.program.isSome() ==> isWellFormed(result.program.unwrap(), result.sm))
+@Ensures(allRenderable(result.sm, result.diags))
+export function loadWithRoots(
+  entryPath: string,
+  overlay: SourceFile[],
+  roots: PreludeRoot[],
+): LoadOutcome {
+  const src = new Sources(roots.reduce((all, r) => all.concat(r.files), overlay));
+  let entry = normalizePath(entryPath);
+  let entryDisplay = entryPath;
+  let srcRoot = dirname(entry);
+  let manifest: Option<Manifest> = None;
+  const tomlPath = findManifest(src, entry);
+  if (tomlPath.isSome()) {
+    const read = readManifest(src, tomlPath.unwrap());
+    if (read.isErr()) {
+      return read.unwrapErr();
+    }
+    const m = read.unwrap();
+    const packageEntry = manifestEntry(tomlPath.unwrap(), m);
+    srcRoot = dirname(packageEntry);
+    if (joinPath(entry, "orin.toml") == tomlPath.unwrap()) {
+      // `entryPath` named the package directory: start at the package's entry file.
+      entry = packageEntry;
+      entryDisplay = packageEntry;
+    }
+    manifest = Some(m);
+  }
+  let loader = new Loader(src, roots, dirname(entry), srcRoot, manifest);
+  const r = loader.run(entry, entryDisplay);
+  if (r.isErr()) {
+    return failedLoad(loader.files, [r.unwrapErr()]);
+  }
+  return LoadOutcome {
+    sm: SourceMap { files: loader.files },
+    program: Some(r.unwrap()),
+    diags: [],
   };
 }
 
-// ---- packages (orin.toml, spec 04) ----------------------------------------------------------
-
-// The manifest governing a load. `on` is false without an orin.toml; `src` is the src root (the
-// entry file's directory when there is no manifest), against which module ids are computed.
-type PkgCtx = { on: bool; m: Manifest; src: string; };
-
-// Module id of file `p`: the directory (relative to `src`, "." for `src` itself) of the nearest
-// enclosing directory that contains a `module.or`; "" for prelude units and files outside `src`.
-function modOf(ov: SourceFile[], src: string, p: string): string {
-  if (p.startsWith("$") || !isInside(src, p)) {
-    return "";
-  }
-  let d = dirname(p);
-  while (d != src && isInside(src, d)) {
-    if (existsIn(ov, joinPath(d, "module.or"))) {
-      return relativeTo(src, d);
-    }
-    const nd = dirname(d);
-    if (nd == d) {
-      break;
-    }
-    d = nd;
-  }
-  return ".";
-}
-
-// The orin.toml governing `entry`: `entry/orin.toml` when `entry` is a package directory,
-// otherwise the nearest one in an ancestor directory of the entry file.
-function findManifest(ov: SourceFile[], entry: string): Option<string> {
-  const inDir = joinPath(entry, "orin.toml");
-  if (existsIn(ov, inDir)) {
-    return Some(inDir);
-  }
-  let d = dirname(entry);
-  while (true) {
-    const c = joinPath(d, "orin.toml");
-    if (existsIn(ov, c)) {
-      return Some(c);
-    }
-    const nd = dirname(d);
-    if (nd == d) {
-      break;
-    }
-    d = nd;
-  }
-  return None;
-}
-
-function unknownModuleDiag(sp: Span, what: string, mod: string, src: string): Diagnostic {
-  return diag("E0502", span(0, sp.start, sp.end), "unknown module `" + mod + "` in " + what
-    + ": no `" + (mod == "." ? "" : mod + "/") + "module.or` under the src root `" + src + "`");
-}
-
-function moduleExists(ov: SourceFile[], src: string, mod: string): bool {
-  return mod == "." || existsIn(ov, joinPath(src, mod + "/module.or"));
-}
-
-// E0502 for every module name in the manifest that has no `module.or` (manifest is file 0).
-function unknownModules(ov: SourceFile[], m: Manifest, src: string): Diagnostic[] {
-  let out: Diagnostic[] = [];
-  for (const r of m.rules) {
-    if (!moduleExists(ov, src, r.module)) {
-      out.push(unknownModuleDiag(r.span, "[modules." + r.module + "]", r.module, src));
-    }
-    let i: usize = 0;
-    while (i < r.allowed.length) {
-      if (!moduleExists(ov, src, r.allowed[i])) {
-        out.push(unknownModuleDiag(r.allowedSpans[i], "allowed_dependencies of [modules." + r.module + "]", r.allowed[i], src));
-      }
-      i += 1;
-    }
-  }
-  return out;
-}
-
-// Loads the program rooted at `entryPath`. File contents come from `overlay` (unsaved editor
-// buffers, spec 18 §2) when a path matches (compared after `normalizePath`), otherwise from
-// disk; an overlay file also counts as existing for import resolution.
+// Like loadWithRoots with the roots every compilation has (the array API and the Orin std modules).
 export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
   return loadWithRoots(entryPath, overlay, noPreludeRoots());
 }
 
-// Like loadWithOverlay, but every prelude root's files are served from memory and each root's
-// entry file is imported (with no names) by the program's entry file, so the prelude units come
-// first in `units` (before the entry's own dependencies) and are checked, lowered and emitted
-// with the program. (The entry file keeps file id 0; prelude files get the next ids.)
-export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: PreludeRoot[]): LoadOutcome {
-  let entry = normalizePath(entryPath);
-  let entryDisp = entryPath;
-  let ov = normalizeOverlay(overlay);
-  for (const r of roots) {
-    ov = ov.concat(normalizeOverlay(r.files));
-  }
-  // Package manifest: `entryPath` may be a package directory, or a file inside one.
-  const noRules: ModuleRule[] = [];
-  let pk = PkgCtx { on: false, m: Manifest { file: 0, name: "", version: "", entry: "", rules: noRules }, src: dirname(entry) };
-  const tp = findManifest(ov, entry);
-  if (tp.isSome()) {
-    const tomlPath = tp.unwrap();
-    const rt = readIn(ov, tomlPath);
-    if (rt.isErr()) {
-      return failOut([SourceFile { path: tomlPath, text: "" }],
-        diag("E0301", span(0, 0, 0), "cannot read `" + tomlPath + "`: " + rt.unwrapErr()));
-    }
-    const tfiles: SourceFile[] = [SourceFile { path: tomlPath, text: rt.unwrap() }];
-    const mr = parseManifest(0, rt.unwrap());
-    if (mr.isErr()) {
-      return failOut(tfiles, mr.unwrapErr());
-    }
-    const m = mr.unwrap();
-    const mentry = joinPath(dirname(tomlPath), m.entry);
-    const src = dirname(mentry);
-    const ud = unknownModules(ov, m, src);
-    if (ud.length > 0) {
-      return LoadOutcome { sm: SourceMap { files: tfiles }, program: None, diags: ud };
-    }
-    if (joinPath(entry, "orin.toml") == tomlPath) {
-      entry = mentry;
-      entryDisp = mentry;
-    }
-    pk = PkgCtx { on: true, m: m, src: src };
-  }
-  const base = dirname(entry);
-  let edgeFrom: string[] = [];
-  let edgeTo: string[] = [];
-  let edgeSpan: Span[] = [];
-  let files: SourceFile[] = [];
-  let nodePaths: string[] = [];   // node id == index into `files`
-  let nodeState: int[] = [];      // 1 = in progress, 2 = done
-  let nodeUnit: usize[] = [];     // unit index once done
-  let units: Unit[] = [];
-
-  // Parent frames (innermost last).
-  let sNode: usize[] = [];
-  let sAst: Module[] = [];
-  let sItem: usize[] = [];
-  let sImps: ImportTarget[][] = [];
-
-  // Current frame.
-  let haveCur = false;
-  let curNode: usize = 0;
-  let curAst = Module { file: 0, items: [] };
-  let curItem: usize = 0;
-  let cur: ImportTarget[] = [];
-
-  // File waiting to be opened (the entry first, then each newly discovered import).
-  let pending = true;
-  let pendPath = entry;
-  let pendDisp = entryDisp;
-  let pendSpan = span(0, 0, 0);
-
-  while (true) {
-    if (pending) {
-      const rf = readIn(ov, pendPath);
-      if (rf.isErr()) {
-        files.push(SourceFile { path: pendDisp, text: "" });
-        const f = files.length - 1;
-        return failOut(files, diag("E0301", span(f, 0, 0),
-          "cannot read `" + pendPath + "`: " + rf.unwrapErr()));
-      }
-      const src = rf.unwrap();
-      files.push(SourceFile { path: pendDisp, text: src });
-      const id = files.length - 1;
-      const pr = parse(id, src);
-      if (pr.isErr()) {
-        return failOut(files, pr.unwrapErr());
-      }
-      nodePaths.push(pendPath);
-      nodeState.push(1);
-      nodeUnit.push(0);
-      if (haveCur) {
-        sNode.push(curNode);
-        sAst.push(curAst);
-        sItem.push(curItem);
-        sImps.push(cur);
-      }
-      haveCur = true;
-      curNode = id;
-      curAst = pr.unwrap();
-      if (files.length == 1) {
-        // The entry file: add the implicit prelude imports in front of its own items.
-        let implicit: Item[] = [];
-        for (const r of roots) {
-          if (r.entry == "") {
-            continue;   // library root (std:path, ...): served from memory, imported on demand
-          }
-          const sp0 = span(id, 0, 0);
-          const none: Ident[] = [];
-          implicit.push(IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp0, span: sp0 }));
-        }
-        curAst = Module { file: curAst.file, items: implicit.concat(curAst.items) };
-      }
-      curItem = 0;
-      cur = [];
-      pending = false;
-    }
-
-    if (curItem >= curAst.items.length) {
-      // All imports resolved: the unit is complete.
-      const ui = units.length;
-      units.push(Unit {
-        file: curNode,
-        path: nodePaths[curNode],
-        name: relName(base, nodePaths[curNode]),
-        module: modOf(ov, pk.src, nodePaths[curNode]),
-        ast: curAst,
-        imports: cur
-      });
-      nodeState[curNode] = 2;
-      nodeUnit[curNode] = ui;
-      if (sNode.length == 0) {
-        break;
-      }
-      // (Each pop result is bound to a const first: Stage 0 codegen miscompiles a scalar
-      // `let` assignment whose right-hand side contains a mutating call.)
-      const pn = sNode.pop().unwrap();
-      const pi = sItem.pop().unwrap();
-      const pa = sAst.pop().unwrap();
-      const pc = sImps.pop().unwrap();
-      curNode = pn;
-      curItem = pi + 1;
-      curAst = pa;
-      cur = pc;
-      cur.push(ImportUnit(ui));
-      continue;
-    }
-
-    const imp = importOf(curAst.items[curItem]);
-    if (imp.isNone()) {
-      curItem += 1;
-      continue;
-    }
-    const decl = imp.unwrap();
-    const importer = nodePaths[curNode];
-    const rr = resolveImport(ov, importer, dirname(importer), decl.path, decl.pathSpan, base);
-    if (rr.isErr()) {
-      return failOut(files, rr.unwrapErr());
-    }
-    const res = rr.unwrap();
-    if (res.std == 1) {
-      cur.push(ImportStd(StdFs));
-      curItem += 1;
-      continue;
-    }
-    if (res.std == 2) {
-      cur.push(ImportStd(StdProcess));
-      curItem += 1;
-      continue;
-    }
-    if (res.std == 3) {
-      cur.push(ImportStd(StdIo));
-      curItem += 1;
-      continue;
-    }
-    if (res.std == 4) {
-      cur.push(ImportStd(StdClock));
-      curItem += 1;
-      continue;
-    }
-    if (pk.on) {
-      const fm = modOf(ov, pk.src, importer);
-      const tm = modOf(ov, pk.src, res.path);
-      if (fm != "" && tm != "" && fm != tm) {
-        const ee = edgeError(pk.m, fm, tm);
-        if (ee.isSome()) {
-          return failOut(files, diag("E0501", decl.pathSpan, ee.unwrap()));
-        }
-        edgeFrom.push(fm);
-        edgeTo.push(tm);
-        edgeSpan.push(decl.pathSpan);
-      }
-    }
-    const found = findNode(nodePaths, res.path);
-    if (found.isNone()) {
-      pending = true;
-      pendPath = res.path;
-      pendDisp = res.path;
-      pendSpan = decl.pathSpan;
-      continue;
-    }
-    const n = found.unwrap();
-    if (nodeState[n] == 2) {
-      cur.push(ImportUnit(nodeUnit[n]));
-      curItem += 1;
-      continue;
-    }
-    // In progress: import cycle. The DFS stack is the parent frames plus the current file.
-    const chain = sNode.concat([curNode]);
-    let start: usize = 0;
-    let k: usize = 0;
-    while (k < chain.length) {
-      if (chain[k] == n) {
-        start = k;
-      }
-      k += 1;
-    }
-    let names: string[] = [];
-    let q = start;
-    while (q < chain.length) {
-      names.push(relName(base, nodePaths[chain[q]]));
-      q += 1;
-    }
-    names.push(relName(base, res.path));
-    return failOut(files, diag("E0303", decl.pathSpan, "import cycle: " + names.join(" -> ")));
-  }
-
-  if (pk.on) {
-    const cyc = findModuleCycle(edgeFrom, edgeTo);
-    if (cyc.length > 0) {
-      let shown: string[] = [];
-      for (const c of cyc) {
-        shown.push(displayModule(c));
-      }
-      // Reported at the import that closes the cycle (the last edge back to cyc[0]).
-      let at: usize = 0;
-      let k: usize = 0;
-      while (k < edgeFrom.length) {
-        if (edgeFrom[k] == cyc[cyc.length - 2] && edgeTo[k] == cyc[cyc.length - 1]) {
-          at = k;
-        }
-        k += 1;
-      }
-      return failOut(files, diag("E0303", edgeSpan[at], "module import cycle: " + shown.join(" -> ")));
-    }
-  }
-  const none: Diagnostic[] = [];
-  return LoadOutcome {
-    sm: SourceMap { files: files },
-    program: Some(LoadedProgram { units: units, entry: units.length - 1, manifest: pk.on ? Some(pk.m) : None }),
-    diags: none
-  };
-}
-
 export function loadAll(entryPath: string): LoadOutcome {
-  const none: SourceFile[] = [];
-  return loadWithOverlay(entryPath, none);
+  return loadWithOverlay(entryPath, []);
 }
 
 export function load(entryPath: string): Result<LoadResult, Diagnostic[]> {
   const o = loadAll(entryPath);
   return match (o.program) {
     Some(p) => Ok(LoadResult { program: p, sm: o.sm }),
-    None => Err(o.diags)
+    None => Err(o.diags),
   };
 }

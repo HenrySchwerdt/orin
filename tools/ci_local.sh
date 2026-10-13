@@ -17,6 +17,7 @@ step "lsp"                     python3 tools/test_lsp.py
 step "mcp"                     python3 tools/test_mcp.py
 step "packages"                ./tools/test_packages.sh
 step "osig graph/diff"         python3 tools/test_osig.py --orin build/bootstrap/orin2
+step "compiler contracts"      tools/test_compiler_contracts.sh
 step "verify all"              python3 tools/verify_all.py compiler/main.or
 step "contract erasure"        python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2
 step "annotation erasure"      python3 tools/test_annotation_erasure.py --orinc build/bootstrap/orin2
