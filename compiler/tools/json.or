@@ -1,0 +1,95 @@
+// JSON rendering of diagnostics (`--format=json`, spec 18 §3): one object per line.
+
+import { SourceMap, Diagnostic } from "../diag";
+import { isValidUtf8 } from "../fmt";
+
+const HEX: string = "0123456789abcdef";
+
+function u4(c: int): string {
+  const a = c / 4096;
+  const b = (c / 256) % 16;
+  const d = (c / 16) % 16;
+  const e = c % 16;
+  return "\\u" + HEX.charAt(a.toUsize()) + HEX.charAt(b.toUsize()) + HEX.charAt(d.toUsize()) + HEX.charAt(e.toUsize());
+}
+
+// JSON string literal (with quotes). Control bytes become \u00XX; bytes >= 0x80 pass through when
+// the text is valid UTF-8, else each is written as the code point U+0080..U+00FF.
+export function jsonString(s: string): string {
+  const utf8 = isValidUtf8(s);
+  let parts: string[] = ["\""];
+  let run: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const ch = s.charCodeAt(i);
+    let rep = "";
+    if (ch == 34) {
+      rep = "\\\"";
+    } else if (ch == 92) {
+      rep = "\\\\";
+    } else if (ch == 10) {
+      rep = "\\n";
+    } else if (ch == 13) {
+      rep = "\\r";
+    } else if (ch == 9) {
+      rep = "\\t";
+    } else if (ch == 8) {
+      rep = "\\b";
+    } else if (ch == 12) {
+      rep = "\\f";
+    } else if (ch < 32 || (ch >= 128 && !utf8)) {
+      rep = u4(ch);
+    }
+    if (rep != "") {
+      parts.push(s.substring(run, i));
+      parts.push(rep);
+      run = i + 1;
+    }
+    i += 1;
+  }
+  parts.push(s.substring(run, s.length));
+  parts.push("\"");
+  return parts.join("");
+}
+
+type LineCol = { line: usize; col: usize; };
+
+// 1-based line and column (in bytes) of `offset`.
+function lineCol(text: string, offset: usize): LineCol {
+  let line: usize = 1;
+  let col: usize = 1;
+  let i: usize = 0;
+  while (i < offset && i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      line += 1;
+      col = 1;
+    } else {
+      col += 1;
+    }
+    i += 1;
+  }
+  return LineCol { line: line, col: col };
+}
+
+// {"code":"E0400","severity":"error","file":"a.or","line":3,"col":5,"endLine":3,"endCol":9,
+//  "message":"...","notes":[]} on a single line. `endLine`/`endCol` is the exclusive end position.
+export function formatDiagnosticJson(sm: SourceMap, d: Diagnostic): string {
+  const f = sm.files[d.span.file];
+  const a = lineCol(f.text, d.span.start);
+  const b = lineCol(f.text, d.span.end);
+  let notes: string[] = [];
+  for (const n of d.notes) {
+    notes.push(jsonString(n));
+  }
+  return "{\"code\":" + jsonString(d.code) + ",\"severity\":\"error\",\"file\":" + jsonString(f.path)
+    + ",\"line\":" + a.line.toString() + ",\"col\":" + a.col.toString() + ",\"endLine\":" + b.line.toString()
+    + ",\"endCol\":" + b.col.toString() + ",\"message\":" + jsonString(d.message) + ",\"notes\":["
+    + notes.join(",") + "]}";
+}
+
+// One JSON object per line on stdout, in the order given.
+export function printDiagnosticsJson(sm: SourceMap, diags: Diagnostic[]): void {
+  for (const d of diags) {
+    console.log(formatDiagnosticJson(sm, d));
+  }
+}
