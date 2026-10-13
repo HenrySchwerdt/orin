@@ -39,3 +39,9 @@
   modules the entry loads, builds with the C backend and needs a C compiler. `@Deprecated` warnings are not listed
   by the MCP `check` tool. `@Inline` is a hint (a recursive `@Inline` function is E0444; calls through function
   values and interface methods are not followed by that check).
+- Capability grants (ADR-0027, std I/O unstable until the freeze): a grant is a resource handle, so it is a scope-function
+  parameter only: a closure cannot capture one (E0452; take all grants with `useHost`, pass them as arguments, or use
+  `withFileFs`), there is no `host.fs()` returning a grant, and at most 256 grants are live at once. `console.*` and
+  `exit` need no grant (ambient output). Path scopes are checked lexically and through symbolic links at the time of the
+  operation (no protection against races, hard links or mounts); `shell` is outside every grant; a denied
+  operation that cannot return an `Err` traps; the network and environment families are reserved only.

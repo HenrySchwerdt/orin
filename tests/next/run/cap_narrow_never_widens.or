@@ -1,0 +1,41 @@
+// Narrowing only restricts (ADR-0021 D2): a scope outside the parent's yields a grant that reaches nothing, a scope
+// that contains the parent's keeps the parent's, `readOnly` stays read-only however it is narrowed further.
+import { Host, useFs } from "std:host";
+import { FsGrant, readFile, writeFile, useUnder, useReadOnly } from "std:fs";
+
+const A: string = "build/tests/cap_narrow";
+
+function ok(r: Result<string, string>): string {
+  return r.isOk() ? "ok" : "denied";
+}
+
+function okW(r: Result<void, string>): string {
+  return r.isOk() ? "ok" : "denied";
+}
+
+function main(host: Host): void {
+  useFs(host, fs => { run(fs); });
+}
+
+function run(fs: FsGrant): void {
+  writeFile(fs, A + "-a.txt", "a").unwrap();
+  writeFile(fs, A + "-b.txt", "b").unwrap();
+  useUnder(fs, "build/tests", tests => {
+    console.log("parent reads: " + ok(readFile(tests, A + "-a.txt")));
+    useUnder(tests, "/etc", etc => {
+      console.log("outside the parent, passwd: " + ok(readFile(etc, "/etc/passwd")));
+      console.log("outside the parent, own file: " + ok(readFile(etc, A + "-a.txt")));
+    });
+    useUnder(tests, "/", wide => {
+      console.log("wider than the parent keeps the parent: " + ok(readFile(wide, "/etc/passwd")) + " " + ok(readFile(wide, A + "-a.txt")));
+    });
+    useReadOnly(tests, ro => {
+      console.log("read-only reads: " + ok(readFile(ro, A + "-a.txt")));
+      console.log("read-only writes: " + okW(writeFile(ro, A + "-c.txt", "c")));
+      useUnder(ro, "build/tests", again => {
+        console.log("narrowed read-only writes: " + okW(writeFile(again, A + "-c.txt", "c")));
+      });
+    });
+  });
+  console.log("c exists: " + ok(readFile(fs, A + "-c.txt")));
+}

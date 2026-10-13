@@ -1,6 +1,22 @@
 # Changelog
 
 ## Unreleased
+- **Capabilities, Stage A (ADR-0021 addendum, ADR-0027).** Standard I/O now needs a *grant*. Programs that do I/O are
+  `function main(host: Host): void`; `Host` and every grant (`FsGrant`, `ProcessGrant`, `StdioGrant`, `ClockGrant`) are
+  resource handles with the rules of `File` (only a parameter; E0450-E0452; the MIR verifier re-checks). Grants are derived
+  by the scope functions of the new `std:host` (`useHost`, `useFs`, ...) and narrowed without amplification
+  (`useUnder(fs, dir, ...)`, `useReadOnly`, `useArgsOnly`). **Breaking (std I/O is unstable):** `readFile(fs, path)`,
+  `writeFile(fs, ..)`, `exists(fs, ..)`, `withFile/useFile/withFiles/useFiles(fs, ..)`, `args(proc)`, `shell(proc, cmd)`,
+  `readLine(stdio)`, `readBytes(stdio, n)`, `writeStdout(stdio, s)`, `nowMillis(clock)`; `main()` without `host` has no I/O
+  authority (E0470); new errors E0470 (missing grant), E0471 (wrong family), E0472 (`main` takes another grant);
+  `@Test` functions may take `host: Host`. `console.log` / `console.error` / `exit` stay grant-free (ambient; recorded as
+  OSIG events). Runtime: tagged, generation-checked grant table; host policy `ORIN_DENY=fs,process,stdio,clock,net,all`
+  (a malformed value traps at start; a denied `Result` operation is `Err`, every other operation traps); path scopes
+  compare normalised absolute paths and resolved symbolic links and open the checked path; the compiler itself takes its
+  grants from `main(host)`. L0 platform: `orin_platform_policy_*`, `orin_platform_path_*` with contracts, tests and CBMC
+  harnesses. MIR v1.9 (`BGrant*` builtins, grants first in every std I/O builtin). OSIG: `PERFORMS_IO` edges to `Effect`
+  nodes (primitive call sites only). Seed refreshed through a bridge compiler (ADR-0027, "Bootstrap note"). Not covered:
+  TOCTOU, hard links, mounts, `shell`, native code. Open questions for the owner: ADR-0027.
 
 ## 0.1.0-alpha.2 (2026-10-13)
 Language 1.0 core complete and frozen (ADR-0016; std I/O stays unstable until capabilities, ADR-0021).

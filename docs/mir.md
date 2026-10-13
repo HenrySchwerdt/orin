@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v1.8)
+# MIR and the OIM ownership verifier (v1.9)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -13,6 +13,12 @@ v1.6 (ADR-0022) fixed-width integers: **no new type or instruction**. `i64`, `is
 v1.7 (ADR-0024) `MProgram.inlineFns`: the names of the `@Inline` functions, a backend hint (C `static inline`, LLVM `alwaysinline`) with no effect on the verifier or on semantics.
 v1.8 (ADR-0025) resource handles: scalar type `MHandle`, builtins `BFileOpen` / `BFileClose` / `BFileIsOpen` /
 `BFileOpenError` and the file methods, verifier states `Open` / `MaybeOpen` (see "Resource handles" below).
+v1.9 (ADR-0021 Stage A, ADR-0027) capability grants: **no new type or instruction**. A grant is an `MHandle` with exactly the
+discipline of a file handle. New builtins: the openers `BGrantFs` / `BGrantProcess` / `BGrantStdio` / `BGrantClock`
+(`[host]`), `BGrantUnder` (`[fs, path]`), `BGrantReadOnly` (`[fs]`), `BGrantArgsOnly` (`[proc]`), the closer `BGrantRevoke`.
+`BFileOpen` is now `[fs, path, mode]`, and every std I/O builtin (`BFsReadFile`, `BFsWriteFile`, `BFsExists`,
+`BProcessArgs`, `BIoShell`, `BIoReadBytes`, `BIoReadLine`, `BIoWriteStdout`, `BTimeNowMillis`) takes its grant as the
+first argument. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -98,8 +104,9 @@ hole slot when reading that slot.
 index, negative for a failed open), but a *linear, non-copyable* value for the verifier. Operand class `CHandle`.
 
 Structural rules (wf, checked on every instruction, independent of the dataflow):
-- a handle local is defined **only** by `IBuiltin(Some(h), BFileOpen, [path, mode])` (the handle must be
-  bound: `None` is an error, the file would never be closed). `ICopy`, `IMove`, `IBorrow`, `IDup`, `IUnary`,
+- a handle local is defined **only** by `IBuiltin(Some(h), <opener>, [authority, ...])` where the opener is `BFileOpen`
+  or a `BGrant*` builtin and its first argument is the handle that authorises it (v1.9); the other arguments are not
+  handles (the handle must be bound: `None` is an error, it would never be closed). `ICopy`, `IMove`, `IBorrow`, `IDup`, `IUnary`,
   `IBinary`, `ICall`/`ICallIndirect`/`ICallVirtual` results, `IGetField`, `IArrayGet`, ... never define one;
 - a handle is never stored or boxed: not a slot of `IStructNew`, an element of `IArrayNew`, the value of
   `ISetField` / `IArraySet` / `IArrayPush`, a capture of `IClosure`, nor the value of `IIface`;
@@ -107,14 +114,16 @@ Structural rules (wf, checked on every instruction, independent of the dataflow)
   result type `MHandle`; no parameter is *owned* (owned parameters are references);
 - it is an argument of `ICall` / `ICallIndirect` / `ICallVirtual` (borrowed; `ICall` still checks the class
   against the callee's parameter) and the first argument of the file builtins (`BFileIsOpen`, `BFileOpenError`,
-  `BFileClose`, `BFileReadLine`, `BFileRead`, `BFileReadAll`, `BFileWrite`, `BFileWriteLine`, `BFileFlush`); no
-  other builtin accepts one, and file builtins take no handle after the first argument.
+  `BFileClose`, `BFileReadLine`, `BFileRead`, `BFileReadAll`, `BFileWrite`, `BFileWriteLine`, `BFileFlush`), of the
+  std I/O builtins listed in v1.9 and of `BGrantRevoke`; no other builtin accepts one, and these builtins take no
+  handle after the first argument.
 
 Dataflow rules (states in `state.or`): a handle local starts `Dead`; a handle *parameter* starts `Param`
 (borrowed for the whole call, like a reference parameter).
-- `BFileOpen -> h`: `h` becomes `Open`; if `h` was `Open`/`MaybeOpen` it is an **error** (overwritten while open:
+- `BFileOpen -> h` and every `BGrant*` opener `-> h`: `h` becomes `Open` (the authorising first argument is read: it
+  must be `Open` or `Param`, so a derived handle cannot outlive its parent within a function); if `h` was `Open`/`MaybeOpen` it is an **error** (overwritten while open:
   the file would never be closed); a parameter cannot be a destination (existing rule).
-- `BFileClose(h)`: `h` must be `Open`, then `Dead`; closing a `Param`, a `Dead` or a `MaybeOpen` handle is an
+- `BFileClose(h)` / `BGrantRevoke(h)`: `h` must be `Open`, then `Dead`; closing a `Param`, a `Dead` or a `MaybeOpen` handle is an
   **error** (only the function that opened it closes it, and exactly once).
 - any other use (call argument, file builtin): `h` must be `Open` or `Param` (reading a `Dead`/`MaybeOpen` handle is
   an error: use after close).
@@ -126,7 +135,7 @@ Dataflow rules (states in `state.or`): a handle local starts `Dead`; a handle *p
 
 Consequence (induction over the call graph): a function that receives a handle can only pass it on; only the
 function that opened it can close it; it is closed exactly once on every path to a return and not used afterwards.
-The scope functions of `stdlib/fs.or` are the only code that opens handles. Handles never enter RC bookkeeping.
+The scope functions of `stdlib/fs.or` and `stdlib/host.or` are the only code that opens handles (the harness generated by `orin test` is the one exception: it derives the process grant of the test executable). Handles never enter RC bookkeeping.
 
 ## Vtables (v1.5)
 `MProgram.vtables[i] = { name, funcs }`: the functions of one (class, interface) pair in interface-method

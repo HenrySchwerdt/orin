@@ -12,3 +12,4 @@ done
 # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
 $ORIN2 test compiler/tests/loader_test.or --runtime runtime
 sh tools/test_resources.sh
+sh tools/test_capabilities.sh
