@@ -164,7 +164,7 @@ def run(exe):
     r = c.request("initialize", {"processId": None, "rootUri": uri_of(tmp), "capabilities": {}})
     caps = r["result"]["capabilities"]
     for k in ["textDocumentSync", "documentSymbolProvider", "completionProvider", "documentFormattingProvider",
-              "definitionProvider", "hoverProvider", "referencesProvider", "renameProvider"]:
+              "definitionProvider", "hoverProvider", "referencesProvider", "implementationProvider", "renameProvider"]:
         check(k in caps, "initialize: capability %s advertised" % k)
     check(r["result"]["serverInfo"]["name"] == "orin", "initialize: serverInfo.name")
     c.notify("initialized", {})
@@ -399,6 +399,68 @@ def run(exe):
     changes = (r.get("result") or {}).get("changes", {})
     check(len(changes.get(uri_of(clib), [])) == 1 and len(changes.get(uri_of(cmain), [])) == 2,
           "classes: rename class (decl in clib; import + new in cmain) (%r)" % ({k: len(v) for k, v in changes.items()},))
+
+    # ---- interfaces across files (ADR-0019): definition, hover, references, implementations ----
+    ilib = os.path.join(tmp, "ilib.or")
+    imain = os.path.join(tmp, "imain.or")
+    ilib_text = ("export interface Shape {\n  area(): int;\n}\n\n"
+                 "export class Square implements Shape {\n  constructor(public s: int) {}\n"
+                 "  area(): int {\n    return this.s * this.s;\n  }\n}\n")
+    imain_text = ('import { Shape, Square } from "./ilib";\n\n'
+                  "function total<T extends Shape>(xs: T[]): int {\n"
+                  "  let t = 0;\n  for (const x of xs) {\n    t += x.area();\n  }\n  return t;\n}\n\n"
+                  "function main(): void {\n"
+                  "  const s: Shape = new Square(3);\n"
+                  "  console.log(s.area().toString());\n"
+                  "  console.log(total([new Square(2)]).toString());\n"
+                  "}\n")
+    with open(ilib, "w") as f:
+        f.write(ilib_text)
+    open_doc(c, imain, imain_text)
+    d = sync(c, uri_of(imain))
+    check(d == [], "interfaces: imain.or has no diagnostics (got %r)" % (d,))
+    # definition of `Shape` in a type position jumps to the interface
+    r = c.request("textDocument/definition", td(imain, pos_of(imain_text, "Shape =", 0, 1)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(ilib) and loc["range"]["start"] == pos_of(ilib_text, "Shape", 0),
+          "interfaces: definition of an interface type jumps to the declaration (got %r)" % (loc,))
+    # definition of an interface method call (through an interface value) jumps to the interface method
+    r = c.request("textDocument/definition", td(imain, pos_of(imain_text, "area().toString", 0, 1)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(ilib) and loc["range"]["start"] == pos_of(ilib_text, "area", 0),
+          "interfaces: definition of s.area() jumps to the interface method (got %r)" % (loc,))
+    # ... and so does a call on a bounded type parameter
+    r = c.request("textDocument/definition", td(imain, pos_of(imain_text, "x.area", 0, 3)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(ilib) and loc["range"]["start"] == pos_of(ilib_text, "area", 0),
+          "interfaces: definition of x.area() on T extends Shape jumps to the interface method (got %r)" % (loc,))
+    # the bound itself is a reference to the interface
+    r = c.request("textDocument/definition", td(imain, pos_of(imain_text, "extends Shape", 0, 9)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(ilib), "interfaces: definition of a bound (got %r)" % (loc,))
+    # hover on the interface lists its implementations
+    r = c.request("textDocument/hover", td(imain, pos_of(imain_text, "Shape =", 0, 1)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("interface Shape" in hv and "implemented by Square" in hv, "interfaces: hover lists implementations (got %r)" % (hv,))
+    # go to implementations: of the interface, and of its method
+    r = c.request("textDocument/implementation", td(imain, pos_of(imain_text, "Shape =", 0, 1)))
+    locs = r.get("result") or []
+    check(len(locs) == 1 and locs[0]["uri"] == uri_of(ilib) and locs[0]["range"]["start"] == pos_of(ilib_text, "Square", 0),
+          "interfaces: implementation of an interface -> the class (got %r)" % (locs,))
+    r = c.request("textDocument/implementation", td(imain, pos_of(imain_text, "area().toString", 0, 1)))
+    locs = r.get("result") or []
+    check(len(locs) == 1 and locs[0]["uri"] == uri_of(ilib) and locs[0]["range"]["start"] == pos_of(ilib_text, "area", 1),
+          "interfaces: implementation of an interface method -> the class method (got %r)" % (locs,))
+    # references of the interface method: declaration + both calls (virtual and via the bound)
+    r = c.request("textDocument/references", {**td(imain, pos_of(imain_text, "area().toString", 0, 1)),
+                                              "context": {"includeDeclaration": True}})
+    locs = r.get("result") or []
+    check(len(locs) == 3, "interfaces: method references (decl + s.area + x.area) (got %d)" % len(locs))
+    # document symbols list the interface with its methods
+    r = c.request("textDocument/documentSymbol", {"textDocument": {"uri": uri_of(ilib)}})
+    syms = r.get("result") or []
+    check(any(x["name"] == "Shape" and x["kind"] == 11 and [k["name"] for k in x["children"]] == ["area"] for x in syms),
+          "interfaces: document symbol Shape(interface) with child area (got %r)" % (syms,))
 
     # ---- shutdown / exit --------------------------------------------------------------------
     r = c.request("shutdown", None)

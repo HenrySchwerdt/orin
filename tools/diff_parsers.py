@@ -19,13 +19,17 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Stage 1 accepts class syntax (ADR-0009: `class`, `new`, `this`), which Stage 0 rejects with E0200;
 # these edge cases pin Stage 0's behaviour only.
-CLASS_SYNTAX_SKIP = {"err0200_reserved_class.or", "err0200_reserved_new.or", "err0200_reserved_this.or"}
+CLASS_SYNTAX_SKIP = {"err0200_reserved_class.or", "err0200_reserved_new.or", "err0200_reserved_this.or",
+                     # Stage 1 accepts interfaces (ADR-0019) and lexes a lone `&` (for the E0408 of `T extends A & B`)
+                     "err0200_reserved_interface.or", "err0100_bad_char_amp.or", "err0100_bad_char_amp_end.or"}
 # The array prelude (ADR-0011) is written with closures, syntax beyond Orin-B that Stage 0 rejects.
 PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("tests", "fmt", "closures.out.or"),
                 os.path.join("tests", "fmt", "floats.in.or"), os.path.join("tests", "fmt", "floats.out.or"),
                 # these pin Stage 0's rejection of arrow functions, which Stage 1 now accepts
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
-                os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or")}
+                os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or"),
+                # interfaces (ADR-0019) are syntax beyond Orin-B
+                os.path.join("tests", "fmt", "interfaces.in.or"), os.path.join("tests", "fmt", "interfaces.out.or")}
 # Stage 1 accepts float literals (ADR-0018); these edge cases pin Stage 0's rejection only.
 FLOAT_SKIP = {"err0100_bad_float.or", "err0100_bad_float_in_expr.or", "err0100_bad_float_second_line.or",
               "err0100_bad_int_exp.or"}

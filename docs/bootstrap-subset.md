@@ -224,6 +224,8 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0411 | missing/duplicate/unknown record literal field |
 | E0412 | invalid or missing `main` |
 | E0413 | generic instantiation limit exceeded (self-hosted compiler only, ADR-0007) |
+| E0417 | class does not implement an interface method / type does not satisfy a bound (self-hosted compiler only, ADR-0019) |
+| E0418 | method implementing an interface method mutates its receiver (self-hosted compiler only, ADR-0019) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
 | E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |

@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v1.3)
+# MIR and the OIM ownership verifier (v1.5)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -8,6 +8,7 @@ Changelog: v1.1 Unique-demotion across calls; v1.2 (ADR-0010) per-parameter mode
 (`MFunction.paramOwned`) and consuming call operands, produced by the optimiser `compiler/opt`;
 v1.3 (ADR-0011) closures: `IClosure` and `ICallIndirect`;
 v1.4 (ADR-0018) floats: scalar type `MFloat` (binary64; an f32 is an MFloat rounded by `IBuiltin(BF32Round)` after each operation), operand `OFloat(text)`; `IUnary(UnNeg)` and `IBinary` Add/Sub/Mul/Div/Eq/Ne/Lt/Le/Gt/Ge accept MFloat operands (IEEE, no traps; `Rem` does not); conversions and math are `IBuiltin`s; floats are plain scalars for the verifier (`Init`), stored in slots by bit pattern.
+v1.5 (ADR-0019) interfaces: `IIface`, `ICallVirtual` and `MProgram.vtables`.
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -72,12 +73,30 @@ hole slot when reading that slot.
   result d is Owned (references) or initialised (scalars). As for `ICall`, a `Unique` operand is demoted
   to `Owned` when the call has a reference result. MIR has no signature for indirect calls, so only
   operand classes are checked (callee must be a reference local); the checker guarantees the types.
+- `IIface(d, vt, v)` (v1.5): the boxed value `v` is consumed exactly like a slot of `IStructNew` (Owned/Unique
+  local → Dead, `OStr` allowed, Borrowed/Param is an **error**); d Unique. `vt` indexes `MProgram.vtables`.
+  Runtime layout: a struct `{ vtable pointer (scalar slot 0), boxed value (reference slot 1) }`; the vtable
+  pointer is the address of a static table of function pointers.
+- `ICallVirtual(d, r, slot, args)` (v1.5): the interface value `r` (a reference local) and all `args` are
+  **borrowed** for the call; the callee is `vtable[slot]`, invoked as `f(boxed, args..)`; the result d is
+  Owned (references) or initialised (scalars). As for `ICall`/`ICallIndirect`, a `Unique` operand is demoted
+  to `Owned` when the call has a reference result. MIR has no signature for virtual calls, so only operand
+  classes are checked; the checker guarantees the types.
 - `IMakeUnique(x)`: x Owned/Unique → Unique; invalidates `Borrowed(x)` locals (the object may be
   replaced).
 - `IArrayPush(x, v)` / `IArrayPop(d, x)`: x Owned/Unique (→ Owned: the runtime may reallocate);
   invalidate `Borrowed(x)`; v consumed; d Owned.
 - Any operation that makes x Dead or mutates it also invalidates `Borrowed(x)`.
 - `IDup(d, x)` / `IBorrow(d, x)` where x is Unique demote x to Owned (no longer provably unique).
+
+## Vtables (v1.5)
+`MProgram.vtables[i] = { name, funcs }`: the functions of one (class, interface) pair in interface-method
+order. Well-formedness (checked once per vtable by the verifier, whether or not an `IIface` uses it): every
+entry is a function index in range, its first parameter is a reference (the boxed class value) and **all its
+parameters are borrowed** (`paramOwned` all false). The optimiser never makes the parameters of a vtable entry
+owned and never prunes it (compare closure targets); C and LLVM emit each table as a constant array.
+A function may be both an `ICall` target and a vtable entry (a class method called directly and through an
+interface).
 
 ## Terminators
 - `TReturn(Some(o))`: ref o must be Owned/Unique (→ consumed) or OStr. At every return, no local

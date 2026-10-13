@@ -16,7 +16,7 @@ import { Span } from "../diag";
 import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
-  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember,
+  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ClassDecl, ClassMember,
   CtorParam, FnTyParam, ArrowParam, ArrowBody
 } from "../syntax";
 import { Ctx, seq, bracketed, gapsHave, hasCommentIn, findChar } from "./layout";
@@ -71,6 +71,24 @@ function typeParamsText(ids: Ident[]): string {
   let parts: string[] = [];
   for (const id of ids) {
     parts.push(id.name);
+  }
+  return "<" + parts.join(", ") + ">";
+}
+
+// Type parameters with bounds: `<T extends Shape, U>` (ADR-0019).
+function typeParamsBText(ids: Ident[], bounds: Option<Ident>[]): string {
+  if (ids.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < ids.length) {
+    let t = ids[i].name;
+    if (i < bounds.length && bounds[i].isSome()) {
+      t += " extends " + bounds[i].unwrap().name;
+    }
+    parts.push(t);
+    i += 1;
   }
   return "<" + parts.join(", ") + ">";
 }
@@ -818,11 +836,16 @@ function importText(c: Ctx, kw: string, d: ImportDecl): string {
 }
 
 function functionText(c: Ctx, f: FunctionDecl): string {
-  const head = (f.exported ? "export " : "") + "function " + f.name.name + typeParamsText(f.typeParams);
+  const head = (f.exported ? "export " : "") + "function " + f.name.name + typeParamsBText(f.typeParams, f.bounds);
   let lo2 = f.name.span.end;
   for (const tp of f.typeParams) {
     if (tp.span.end > lo2) {
       lo2 = tp.span.end;
+    }
+  }
+  for (const b of f.bounds) {
+    if (b.isSome() && b.unwrap().span.end > lo2) {
+      lo2 = b.unwrap().span.end;
     }
   }
   return signatureText(c, head, lo2, f.params, f.ret, f.body, 0);
@@ -926,6 +949,14 @@ function classText(c: Ctx, k: ClassDecl): string {
     head += " extends " + k.ext.unwrap().name;
     lo2 = k.ext.unwrap().span.end;
   }
+  if (k.impls.length > 0) {
+    let names: string[] = [];
+    for (const i of k.impls) {
+      names.push(i.name);
+      lo2 = i.span.end;
+    }
+    head += " implements " + names.join(", ");
+  }
   let starts: usize[] = [];
   let ends: usize[] = [];
   let texts: string[] = [];
@@ -934,6 +965,55 @@ function classText(c: Ctx, k: ClassDecl): string {
     starts.push(sp.start);
     ends.push(sp.end);
     texts.push(memberText(c, m, 2));
+  }
+  const open = findChar(c, lo2, 123) + 1;
+  return bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
+}
+
+// An interface method signature `name(a: T): R;` (ADR-0019), wrapped like a parameter list when too long.
+function ifaceMethodText(c: Ctx, m: IfaceMethod, ind: usize): string {
+  let ret = "";
+  let close = m.span.end - 1;
+  if (m.ret.isSome()) {
+    ret = ": " + typeText(m.ret.unwrap());
+    close = m.ret.unwrap().span.start;
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const p of m.params) {
+    starts.push(p.span.start);
+    ends.push(p.span.end);
+    texts.push(p.name.name + ": " + typeText(p.ty));
+  }
+  const open = findChar(c, m.name.span.end, 40) + 1;
+  const forced = gapsHave(c, starts, ends, open, close);
+  const flat = m.name.name + "(" + texts.join(", ") + ")" + ret + ";";
+  if (!forced && ind + flat.length <= WIDTH) {
+    return flat;
+  }
+  return bracketed(c, m.name.name + "(", ")", open, close, starts, ends, texts, ind, ",") + ret + ";";
+}
+
+function interfaceText(c: Ctx, k: InterfaceDecl): string {
+  let head = (k.exported ? "export " : "") + "interface " + k.name.name + typeParamsText(k.typeParams);
+  let lo2 = k.name.span.end;
+  for (const tp of k.typeParams) {
+    if (tp.span.end > lo2) {
+      lo2 = tp.span.end;
+    }
+  }
+  if (k.ext.isSome()) {
+    head += " extends " + k.ext.unwrap().name;
+    lo2 = k.ext.unwrap().span.end;
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const m of k.methods) {
+    starts.push(m.span.start);
+    ends.push(m.span.end);
+    texts.push(ifaceMethodText(c, m, 2));
   }
   const open = findChar(c, lo2, 123) + 1;
   return bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
@@ -1015,7 +1095,8 @@ function itemSpan(it: Item): Span {
     IFunction(f) => { return f.span; },
     IType(t) => { return t.span; },
     IConst(k) => { return k.span; },
-    IClass(k) => { return k.span; }
+    IClass(k) => { return k.span; },
+    IInterface(k) => { return k.span; }
   }
 }
 
@@ -1026,7 +1107,8 @@ function itemText(c: Ctx, it: Item): string {
     IFunction(f) => { return functionText(c, f); },
     IType(t) => { return typeDeclText(c, t); },
     IConst(k) => { return constText(c, k); },
-    IClass(k) => { return classText(c, k); }
+    IClass(k) => { return classText(c, k); },
+    IInterface(k) => { return interfaceText(c, k); }
   }
 }
 

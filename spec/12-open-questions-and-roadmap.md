@@ -16,7 +16,7 @@
 
 ## Resolved 2026-10-13 (implementation ADRs)
 
-- Interfaces: nominal, `implements`; bounds (static) and interface-typed values (explicit dynamic dispatch) — ADR-0016.
+- Interfaces: nominal, `implements`; bounds (static) and interface-typed values (explicit dynamic dispatch) — ADR-0016, implemented in ADR-0019.
 - String interpolation: TypeScript template literals, primitives only — ADR-0016.
 - Class mutability: mutating methods inferred; mutability part of the public API snapshot — ADR-0009.
 - Closures: capture by value, immutable captures — ADR-0011.
@@ -28,7 +28,7 @@
 1. **Precisely define observable value identity.** Are ordinary classes exclusively values, and how do resources/actors expose identity? No hidden Java reference semantics.
 2. **Function parameter and closure semantics.** Copy/retain/consume internal semantics, captures, equality, deterministic destruction and effects.
 3. **Class mutability syntax.** Define whether `this` mutation requires `let` receiver only and how it lowers to value replacement.
-4. **Interfaces.** Nominal vs structural conformance and explicit dynamic dispatch; avoid trait-style complexity.
+4. ~~**Interfaces.**~~ Resolved: nominal conformance, static bounds and vtable-based interface values (ADR-0016, ADR-0019).
 5. **Async concurrency.** Structured tasks, message passing, failure/cleanup and predictable `Result` behavior.
 6. **Resource types.** Scope APIs, non-copyable handles, FFI and opaque identity; prove escape restrictions.
 7. **Cycle control.** Formal DAG invariant for owning object references, Graph ID semantics, behavior under graph cloning.
