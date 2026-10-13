@@ -8,6 +8,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 ORIN2=${ORIN2:-build/bootstrap/orin2}
+python3 tools/gen_sorted_map.py --check   # SortedMap / SortedStringMap are generated from tools/sorted_map.tmpl
 for t in tests/std/*_test.or; do
   for flag in "" "--no-contracts"; do
     out=$($ORIN2 test "$t" $flag 2>&1) || { echo "$out" | grep -v '^PASS'; echo "[std] FAIL $t $flag"; exit 1; }
