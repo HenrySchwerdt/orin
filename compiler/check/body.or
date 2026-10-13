@@ -19,6 +19,7 @@ import {
   Env, ValEnt, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
   isIntish, isArrayTy, expIsUsize, showType, mismatch, globalVal, findType, originOf
 } from "./env";
+import { classOfRec, findMethod, fieldIsPrivate } from "./classes";
 import {
   FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak
 } from "./fnctx";
@@ -152,7 +153,9 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     ERecord(name, spread, fields) => checkRecord(env, fx, span, name, None, spread, fields, exp),
     ERecordT(name, targs, spread, fields) => checkRecord(env, fx, span, name, Some(targs), spread, fields, exp),
     ETyApp(_, _) => Err(diag("E0400", span, "type arguments are only allowed on a call or a record literal")),
-    EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp)
+    EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp),
+    ENew(name, targs, args) => checkNew(env, fx, span, name, targs, args),
+    EThis => checkThis(fx, span)
   };
 }
 
@@ -280,6 +283,9 @@ function checkBinary(
   if (isLogic) {
     const l = checkExpr(env, fx, lhs, None)?;
     const r = checkExpr(env, l.fx, rhs, None)?;
+    if (r.fx.pre.length > l.fx.pre.length) {
+      return Err(condHoistErr(rhs.span));
+    }
     if (!isBool(l.expr.ty) || !isBool(r.expr.ty)) {
       return Err(diag(
         "E0410",
@@ -344,6 +350,7 @@ function checkMember(env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident): 
         return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
       }
       const i = io.unwrap();
+      checkFieldAccess(b.fx, r, name)?;
       return done(b.fx, XField(b.expr, r, i), def.fields[i].ty, span);
     },
     _ => Err(noField(fx.env, name, t))
@@ -397,6 +404,7 @@ function checkCond(
   let cur = c.fx;
   let t: HExpr = mk(XBool(false), TyBool, span);
   let f: HExpr = mk(XBool(false), TyBool, span);
+  const npre = cur.pre.length;
   if (untypedInt(thenE) && !untypedInt(elsE)) {
     const fr = checkExpr(env, cur, elsE, exp)?;
     const tr = checkExpr(env, fr.fx, thenE, hintOf(fr.expr.ty))?;
@@ -410,6 +418,9 @@ function checkCond(
     cur = fr.fx;
     t = tr.expr;
     f = fr.expr;
+  }
+  if (cur.pre.length > npre) {
+    return Err(condHoistErr(span));
   }
   if (!typeEq(t.ty, f.ty)) {
     return Err(diag(
@@ -555,6 +566,14 @@ function checkRecord(
       ));
     }
   };
+  const co = classOfRec(cur.env, rid);
+  if (co.isSome() && !inClass(cur, co.unwrap())) {
+    return Err(diag(
+      "E0408",
+      name.span,
+      "class `" + name.name + "` cannot be built with a record literal outside its own body; use `new " + name.name + "(..)`"
+    ));
+  }
   return checkRecordOf(env, cur, span, rid, spread, fields);
 }
 
@@ -1079,6 +1098,20 @@ function callMember(
         }
         return callBuiltin(env, fx, span, "`" + bid.name + "." + name.name + "`", b.unwrap(), args);
       }
+      if (lookupLocal(fx, bid.name).isNone() && globalVal(env, fx.unit, bid.name).isNone()) {
+        const te = findType(env.units[fx.unit].scope, bid.name);
+        if (te.isSome()) {
+          match (te.unwrap()) {
+            EntRecord(r) => {
+              const co = classOfRec(fx.env, r);
+              if (co.isSome()) {
+                return staticCall(env, fx, span, co.unwrap(), name, args);
+              }
+            },
+            _ => {}
+          }
+        }
+      }
     },
     _ => {}
   }
@@ -1161,6 +1194,7 @@ function errCtor(
 function isPlaceShaped(fx: FnCtx, base: Expr): bool {
   return match (base.kind) {
     EIdent(id) => lookupLocal(fx, id.name).isSome(),
+    EThis => true,
     EMember(_, _) => true,
     EIndex(_, _) => true,
     _ => false
@@ -1171,10 +1205,23 @@ function methodCall(
   env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[]
 ): Result<ExprOut, Diagnostic> {
   const n = name.name;
+  const bo = checkExpr(env, fx, base, None);
+  if (bo.isOk()) {
+    const b0 = bo.unwrap();
+    match (b0.expr.ty) {
+      TyRecord(r) => {
+        const co = classOfRec(b0.fx.env, r);
+        if (co.isSome()) {
+          return classMethodCall(env, b0.fx, span, base, b0, co.unwrap(), name, args);
+        }
+      },
+      _ => {}
+    }
+  }
   if (n == "push" || n == "pop") {
     return mutMethodCall(env, fx, span, base, name, args);
   }
-  const b = checkExpr(env, fx, base, None)?;
+  const b = bo?;
   const so = methodSig(b.expr.ty, n);
   if (so.isNone()) {
     return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(b.fx.env, b.expr.ty) + "`"));
@@ -1205,7 +1252,7 @@ function mutMethodCall(
         }
         const isPush = n == "push";
         const params: Type[] = isPush ? [t] : [];
-        const a = argsExpect(env, pi.fx, span, "method `" + n + "`", args, params)?;
+        const a = argsExpect(env, markMut(pi.fx, pi.place), span, "method `" + n + "`", args, params)?;
         const op: MutBuiltin = isPush ? MArrPush : MArrPop;
         const ret: Type = isPush ? TyVoid : TyOption(t);
         return done(a.fx, XMutMethod(op, pi.place, a.args), ret, span);
@@ -1250,6 +1297,20 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
       }
       return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
     },
+    EThis => {
+      const lo = lookupLocal(fx, "this");
+      if (lo.isNone()) {
+        return Err(thisErr(fx, e.span));
+      }
+      const l = lo.unwrap();
+      const path: PlaceElem[] = [];
+      return Ok(PlaceOut {
+        fx: fx,
+        place: Place { root: l, path: path, ty: fx.locals[l].ty },
+        mutable: fx.locals[l].mutable,
+        rootName: "this"
+      });
+    },
     EMember(base, name) => {
       const p = checkPlace(env, fx, base)?;
       return match (p.place.ty) {
@@ -1259,6 +1320,7 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
           if (io.isNone()) {
             return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
           }
+          checkFieldAccess(p.fx, r, name)?;
           const i = io.unwrap();
           return Ok(PlaceOut {
             fx: p.fx,
@@ -1337,6 +1399,9 @@ function checkArm(
   const fx1 = pushScope(fx0);
   const po = checkPattern(env, fx1, arm.pattern, sty, variants, covered, wild)?;
   let cur = po.fx;
+  const outerPre = cur.pre;
+  const noPre: HStmt[] = [];
+  cur.pre = noPre;
   let body: HBlock = HBlock { stmts: [] };
   let value: Option<HExpr> = None;
   let div = false;
@@ -1358,7 +1423,7 @@ function checkArm(
             he = r.expr;
           }
         }
-        body = HBlock { stmts: [HExprStmt(he)] };
+        body = isNop(he) ? HBlock { stmts: [] } : HBlock { stmts: [HExprStmt(he)] };
       } else {
         match (tgt) {
           Some(t) => {
@@ -1391,6 +1456,17 @@ function checkArm(
       div = bo.div;
     }
   }
+  if (cur.pre.length > 0) {
+    let all: HStmt[] = [];
+    for (const h of cur.pre) {
+      all.push(h);
+    }
+    for (const h of body.stmts) {
+      all.push(h);
+    }
+    body = HBlock { stmts: all };
+  }
+  cur.pre = outerPre;
   cur = popScope(cur);
   return Ok(ArmOut {
     fx: cur,
@@ -1465,8 +1541,17 @@ export function checkBlock(env: Env, fx: FnCtx, b: Block): Result<BlockOut, Diag
   let stmts: HStmt[] = [];
   let div = false;
   for (const s of b.stmts) {
+    // Statements hoisted out of this statement's expressions (mutating method calls) go first;
+    // the pending list of an enclosing statement is set aside meanwhile.
+    const outer = cur.pre;
+    const none: HStmt[] = [];
+    cur.pre = none;
     const r = checkStmt(env, cur, s)?;
     cur = r.fx;
+    for (const h of cur.pre) {
+      stmts.push(h);
+    }
+    cur.pre = outer;
     stmts.push(r.stmt);
     div = r.div;
   }
@@ -1573,7 +1658,7 @@ function stmtAssign(env: Env, fx: FnCtx, target: Expr, op: AssignOp, value: Expr
       ));
     }
   }
-  const v = expect(env, pi.fx, value, pty)?;
+  const v = expect(env, markMut(pi.fx, pi.place), value, pty)?;
   return sout(v.fx, HAssign(pi.place, hop, v.expr), false);
 }
 
@@ -1585,6 +1670,9 @@ function stmtExpr(env: Env, fx: FnCtx, e: Expr): Result<StmtOut, Diagnostic> {
     },
     _ => {
       const r = checkExpr(env, fx, e, None)?;
+      if (isNop(r.expr)) {
+        return sout(r.fx, HBlockStmt(HBlock { stmts: [] }), false);
+      }
       return sout(r.fx, HExprStmt(r.expr), false);
     }
   };
@@ -1596,6 +1684,9 @@ function stmtReturn(env: Env, fx: FnCtx, span: Span, v: Option<Expr>): Result<St
       if (!isVoid(fx.ret)) {
         return Err(diag("E0400", span, "`return;` in a function returning `" + showType(fx.env, fx.ret) + "`"));
       }
+      if (fx.fmode == 1 || fx.fmode == 3) {
+        return sout(fx, HReturn(Some(thisRead(fx, span))), true);
+      }
       return sout(fx, HReturn(None), true);
     },
     Some(e) => {
@@ -1603,6 +1694,22 @@ function stmtReturn(env: Env, fx: FnCtx, span: Span, v: Option<Expr>): Result<St
         return Err(diag("E0400", e.span, "cannot return a value from a function returning `void`"));
       }
       const r = expect(env, fx, e, fx.ret)?;
+      if (fx.fmode == 4) {
+        const rid = match (fx.lret) { TyRecord(x) => x, _ => 0 };
+        // The result is computed first (it may mutate `this`), then `this` is read.
+        let f1 = r.fx;
+        const nl = newLocal(f1, "$v" + f1.tmps.toString(), r.expr.ty, false);
+        f1 = nl.fx;
+        f1.tmps += 1;
+        f1.pre.push(HLet(nl.id, r.expr));
+        const val = mk(XLocal(nl.id), r.expr.ty, span);
+        const wrapped = mk(
+          XRecord(rid, None, [FieldInitH { index: 0, value: thisRead(f1, span) }, FieldInitH { index: 1, value: val }]),
+          fx.lret,
+          span
+        );
+        return sout(f1, HReturn(Some(wrapped)), true);
+      }
       return sout(r.fx, HReturn(Some(r.expr)), true);
     }
   };
@@ -1617,8 +1724,19 @@ function elseBranch(env: Env, fx: FnCtx, els: Option<Stmt>): Result<ElseOut, Dia
         return Ok(ElseOut { fx: r.fx, block: Some(r.block), div: r.div });
       },
       _ => {
-        const r = checkStmt(env, fx, es)?;
-        return Ok(ElseOut { fx: r.fx, block: Some(HBlock { stmts: [r.stmt] }), div: r.div });
+        const outer = fx.pre;
+        let f0 = fx;
+        const none: HStmt[] = [];
+        f0.pre = none;
+        const r = checkStmt(env, f0, es)?;
+        let stmts: HStmt[] = [];
+        for (const h of r.fx.pre) {
+          stmts.push(h);
+        }
+        stmts.push(r.stmt);
+        let f1 = r.fx;
+        f1.pre = outer;
+        return Ok(ElseOut { fx: f1, block: Some(HBlock { stmts: stmts }), div: r.div });
       }
     }
   };
@@ -1641,6 +1759,9 @@ function isTrueLit(e: HExpr): bool {
 
 function stmtWhile(env: Env, fx: FnCtx, cond: Expr, body: Block): Result<StmtOut, Diagnostic> {
   const c = expect(env, fx, cond, TyBool)?;
+  if (c.fx.pre.length > fx.pre.length) {
+    return Err(condHoistErr(cond.span));
+  }
   const b = checkBlock(env, pushLoop(c.fx), body)?;
   const lp = popLoop(b.fx);
   return sout(lp.fx, HWhile(c.expr, b.block), isTrueLit(c.expr) && !lp.broke);
@@ -1662,4 +1783,247 @@ function stmtForOf(env: Env, fx: FnCtx, name: Ident, iter: Expr, body: Block): R
       "`for ... of` requires an array, found `" + showType(it.fx.env, it.expr.ty) + "`"
     ))
   };
+}
+
+// ---------------------------------------------------------------------------
+// Classes (beyond Orin-B, ADR-0009)
+// ---------------------------------------------------------------------------
+
+// The void marker returned for a hoisted mutating call: the statement `p = C.m(p, ..)` is already in
+// `fx.pre`; a statement whose expression is this marker emits nothing more.
+function isNop(e: HExpr): bool {
+  return match (e.kind) {
+    XBool(_) => isVoid(e.ty),
+    _ => false
+  };
+}
+
+function nopExpr(span: Span): HExpr {
+  return mk(XBool(false), TyVoid, span);
+}
+
+function condHoistErr(span: Span): Diagnostic {
+  return diag(
+    "E0408",
+    span,
+    "a call to a mutating method is not allowed in a conditionally evaluated expression (`&&`/`||` operand, `?:` branch, `while` condition); move it into its own statement"
+  );
+}
+
+// True inside the constructor / methods of class `c` (private members are visible there).
+function inClass(fx: FnCtx, c: usize): bool {
+  return fx.fmode != 0 && fx.fcls == c;
+}
+
+function thisErr(fx: FnCtx, span: Span): Diagnostic {
+  if (fx.fmode == 1) {
+    return diag("E0300", span, "`this` cannot be used before every field is initialized by the leading `this.f = e;` statements of the constructor");
+  }
+  if (fx.fmode == 5) {
+    return diag("E0300", span, "`this` is not available in a static method");
+  }
+  return diag("E0300", span, "`this` can only be used inside a class constructor or method");
+}
+
+function thisRead(fx: FnCtx, span: Span): HExpr {
+  const l = lookupLocal(fx, "this").unwrapOr(0);
+  return mk(XLocal(l), fx.locals[l].ty, span);
+}
+
+function checkThis(fx: FnCtx, span: Span): Result<ExprOut, Diagnostic> {
+  const lo = lookupLocal(fx, "this");
+  if (lo.isNone()) {
+    return Err(thisErr(fx, span));
+  }
+  const l = lo.unwrap();
+  return done(fx, XLocal(l), fx.locals[l].ty, span);
+}
+
+function checkFieldAccess(fx: FnCtx, r: usize, name: Ident): Result<bool, Diagnostic> {
+  const co = classOfRec(fx.env, r);
+  if (co.isSome()) {
+    const c = co.unwrap();
+    const ci = fx.env.classes[c];
+    if (fieldIsPrivate(ci, name.name) && !inClass(fx, c)) {
+      return Err(diag("E0405", name.span, "field `" + name.name + "` of class `" + ci.name + "` is private"));
+    }
+  }
+  return Ok(true);
+}
+
+// Records that the `this` of the method being analysed is mutated through `place`.
+function markMut(fx: FnCtx, place: Place): FnCtx {
+  const t = lookupLocal(fx, "this");
+  if (t.isSome() && t.unwrap() == place.root) {
+    let f = fx;
+    f.mutThis = true;
+    return f;
+  }
+  return fx;
+}
+
+function checkNew(
+  env: Env, fx: FnCtx, span: Span, name: Ident, targs: TypeExpr[], args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  if (targs.length > 0) {
+    return Err(diag("E0408", name.span, "generic classes are not supported yet (ADR-0009)"));
+  }
+  const found = findType(env.units[fx.unit].scope, name.name);
+  if (found.isNone()) {
+    return Err(diag("E0300", name.span, "unknown class `" + name.name + "`"));
+  }
+  const co = match (found.unwrap()) {
+    EntRecord(r) => classOfRec(fx.env, r),
+    _ => None
+  };
+  if (co.isNone()) {
+    return Err(diag("E0400", name.span, "`" + name.name + "` is not a class"));
+  }
+  const ci = fx.env.classes[co.unwrap()];
+  const f = fx.env.funcs[ci.ctor];
+  const a = argsExpect(env, fx, span, "constructor of `" + name.name + "`", args, f.params)?;
+  return done(a.fx, XCall(ci.ctor, a.args), TyRecord(ci.rec), span);
+}
+
+function tailTypes(ts: Type[]): Type[] {
+  let out: Type[] = [];
+  let i: usize = 1;
+  while (i < ts.length) {
+    out.push(ts[i]);
+    i += 1;
+  }
+  return out;
+}
+
+function staticCall(
+  env: Env, fx: FnCtx, span: Span, c: usize, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const ci = fx.env.classes[c];
+  const mo = findMethod(ci, name.name);
+  if (mo.isNone()) {
+    return Err(diag("E0405", name.span, "class `" + ci.name + "` has no static method `" + name.name + "`"));
+  }
+  const mi = ci.methods[mo.unwrap()];
+  if (mi.priv && !inClass(fx, c)) {
+    return Err(diag("E0405", name.span, "method `" + name.name + "` of class `" + ci.name + "` is private"));
+  }
+  if (!mi.isStatic) {
+    return Err(diag("E0405", name.span, "`" + name.name + "` is an instance method of `" + ci.name + "`; call it on a value"));
+  }
+  const f = fx.env.funcs[mi.fid];
+  const a = argsExpect(env, fx, span, "method `" + name.name + "`", args, f.params)?;
+  return done(a.fx, XCall(mi.fid, a.args), f.ret, span);
+}
+
+// Receiver index expressions are evaluated twice by the lowering `p = C.m(p, ..)`; only
+// side-effect-free ones are accepted.
+function pureH(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XLocal(_) => true,
+    XField(b, _, _) => pureH(b),
+    XIndex(a, i) => pureH(a) && pureH(i),
+    XUnary(_, a) => pureH(a),
+    XBinary(_, a, b) => pureH(a) && pureH(b),
+    XBuiltin(b, xs) => {
+      let ok = match (b) {
+        BArrLength => true,
+        BStrLength => true,
+        BIntToUsize => true,
+        BUsizeToInt => true,
+        _ => false
+      };
+      for (const x of xs) {
+        ok = ok && pureH(x);
+      }
+      return ok;
+    },
+    _ => false
+  };
+}
+
+function purePlace(p: Place): bool {
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        if (!pureH(ix)) {
+          return false;
+        }
+      },
+      PField(_, _) => {}
+    }
+  }
+  return true;
+}
+
+// `recv.m(args)` where the receiver has class type `c` (already checked as `b`).
+function classMethodCall(
+  env: Env, fx0: FnCtx, span: Span, base: Expr, b: ExprOut, c: usize, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const ci = fx0.env.classes[c];
+  const mo = findMethod(ci, name.name);
+  if (mo.isNone()) {
+    return Err(diag("E0405", name.span, "no method `" + name.name + "` on class `" + ci.name + "`"));
+  }
+  const mi = ci.methods[mo.unwrap()];
+  if (mi.priv && !inClass(fx0, c)) {
+    return Err(diag("E0405", name.span, "method `" + name.name + "` of class `" + ci.name + "` is private"));
+  }
+  if (mi.isStatic) {
+    return Err(diag("E0405", name.span, "`" + name.name + "` is a static method; call it as `" + ci.name + "." + name.name + "(..)`"));
+  }
+  const f = fx0.env.funcs[mi.fid];
+  const a = argsExpect(env, fx0, span, "method `" + name.name + "`", args, tailTypes(f.params))?;
+  let all: HExpr[] = [b.expr];
+  for (const x of a.args) {
+    all.push(x);
+  }
+  if (!mi.mutating) {
+    return done(a.fx, XCall(mi.fid, all), f.srcRet, span);
+  }
+  if (!isPlaceShaped(a.fx, base)) {
+    return Err(diag(
+      "E0401",
+      base.span,
+      "receiver of mutating method `" + name.name + "` must be a mutable place (a `let` variable, field or element)"
+    ));
+  }
+  const pi = checkPlace(env, a.fx, base)?;
+  if (!pi.mutable) {
+    return Err(diag(
+      "E0401",
+      base.span,
+      "cannot call mutating method `" + name.name + "` on `" + pi.rootName + "`: it is not declared with `let`"
+    ));
+  }
+  let fx = markMut(pi.fx, pi.place);
+  if (fx.probe) {
+    if (mi.hasRet) {
+      return done(fx, XCall(mi.fid, noExprs()), f.srcRet, span);
+    }
+    return Ok(ExprOut { fx: fx, expr: nopExpr(span) });
+  }
+  if (!purePlace(pi.place)) {
+    return Err(diag(
+      "E0408",
+      base.span,
+      "the receiver of mutating method `" + name.name + "` must not contain index expressions with side effects"
+    ));
+  }
+  const call = mk(XCall(mi.fid, all), f.ret, span);
+  if (!mi.hasRet) {
+    fx.pre.push(HAssign(pi.place, None, call));
+    return Ok(ExprOut { fx: fx, expr: nopExpr(span) });
+  }
+  const tmpName = "$r" + fx.tmps.toString();
+  fx.tmps += 1;
+  const nl = newLocal(fx, tmpName, f.ret, false);
+  fx = nl.fx;
+  const tmp = mk(XLocal(nl.id), f.ret, span);
+  fx.pre.push(HLet(nl.id, call));
+  const selfTy = TyRecord(ci.rec);
+  fx.pre.push(HAssign(pi.place, None, mk(XField(tmp, mi.retRec, 0), selfTy, span)));
+  return done(fx, XField(tmp, mi.retRec, 1), f.srcRet, span);
 }

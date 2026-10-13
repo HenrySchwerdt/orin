@@ -16,7 +16,8 @@ import { Span } from "../diag";
 import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
-  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind
+  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember,
+  CtorParam
 } from "../syntax";
 import { Ctx, seq, bracketed, gapsHave, hasCommentIn, findChar } from "./layout";
 import { pad, quote, endCol } from "./text";
@@ -274,6 +275,13 @@ function exBreak(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usiz
     },
     EMatch(scrut, arms) => {
       return matchText(c, e, scrut, arms, ind, col, lim);
+    },
+    ENew(nm, tys, args) => {
+      const cs = tys.length == 0 ? "new " + nm.name : "new " + nm.name + "<" + joinTypes(tys) + ">";
+      return callArgs(c, e, cs, nm.span.end, args, ind, col, tail, lim);
+    },
+    EThis => {
+      return "this";
     }
   }
 }
@@ -702,32 +710,124 @@ function importText(c: Ctx, kw: string, d: ImportDecl): string {
 
 function functionText(c: Ctx, f: FunctionDecl): string {
   const head = (f.exported ? "export " : "") + "function " + f.name.name + typeParamsText(f.typeParams);
-  let ret = "";
-  if (f.ret.isSome()) {
-    ret = ": " + typeText(f.ret.unwrap());
-  }
-  let starts: usize[] = [];
-  let ends: usize[] = [];
-  let texts: string[] = [];
   let lo2 = f.name.span.end;
   for (const tp of f.typeParams) {
     if (tp.span.end > lo2) {
       lo2 = tp.span.end;
     }
   }
-  for (const p of f.params) {
+  return signatureText(c, head, lo2, f.params, f.ret, f.body, 0);
+}
+
+// `head(params): ret { body }` at indent `ind`; `lo2` is the source position after the name (and
+// type parameters), where the search for the opening parenthesis starts.
+function signatureText(c: Ctx, head: string, lo2: usize, params: Param[], ret0: Option<TypeExpr>, body: Block, ind: usize): string {
+  let ret = "";
+  if (ret0.isSome()) {
+    ret = ": " + typeText(ret0.unwrap());
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const p of params) {
     starts.push(p.span.start);
     ends.push(p.span.end);
     texts.push(p.name.name + ": " + typeText(p.ty));
   }
+  return signatureTail(c, head, lo2, starts, ends, texts, ret, body, ind);
+}
+
+function signatureTail(c: Ctx, head: string, lo2: usize, starts: usize[], ends: usize[], texts: string[], ret: string, body: Block, ind: usize): string {
   const open = findChar(c, lo2, 40) + 1;
-  const close = f.body.span.start;
+  const close = body.span.start;
   const forced = gapsHave(c, starts, ends, open, close);
   const flat = head + "(" + texts.join(", ") + ")" + ret + " ";
-  if (!forced && flat.length + 1 <= WIDTH) {
-    return flat + block(c, f.body, 0);
+  if (!forced && ind + flat.length + 1 <= WIDTH) {
+    return flat + block(c, body, ind);
   }
-  return bracketed(c, head + "(", ")", open, close, starts, ends, texts, 0, ",") + ret + " " + block(c, f.body, 0);
+  return bracketed(c, head + "(", ")", open, close, starts, ends, texts, ind, ",") + ret + " " + block(c, body, ind);
+}
+
+// ---------------------------------------------------------------------------
+// Classes (ADR-0009)
+// ---------------------------------------------------------------------------
+
+function ctorParamText(p: CtorParam): string {
+  let acc = "";
+  if (p.access == 1) {
+    acc = "public ";
+  } else if (p.access == 2) {
+    acc = "private ";
+  }
+  return acc + p.name.name + ": " + typeText(p.ty);
+}
+
+function memberSpan(m: ClassMember): Span {
+  match (m) {
+    MField(f) => { return f.span; },
+    MCtor(k) => { return k.span; },
+    MMethod(md) => { return md.span; }
+  }
+}
+
+function memberText(c: Ctx, m: ClassMember, ind: usize): string {
+  match (m) {
+    MField(f) => {
+      let t = (f.priv ? "private " : "") + f.name.name + ": " + typeText(f.ty);
+      if (f.init.isSome()) {
+        t += " = ";
+        t += ex(c, f.init.unwrap(), ind, ind + t.length, 1, WIDTH);
+      }
+      return t + ";";
+    },
+    MCtor(k) => {
+      let starts: usize[] = [];
+      let ends: usize[] = [];
+      let texts: string[] = [];
+      for (const p of k.params) {
+        starts.push(p.span.start);
+        ends.push(p.span.end);
+        texts.push(ctorParamText(p));
+      }
+      return signatureTail(c, "constructor", k.span.start + 11, starts, ends, texts, "", k.body, ind);
+    },
+    MMethod(md) => {
+      const head = (md.priv ? "private " : "") + (md.isStatic ? "static " : "") + md.name.name
+        + typeParamsText(md.typeParams);
+      let lo2 = md.name.span.end;
+      for (const tp of md.typeParams) {
+        if (tp.span.end > lo2) {
+          lo2 = tp.span.end;
+        }
+      }
+      return signatureText(c, head, lo2, md.params, md.ret, md.body, ind);
+    }
+  }
+}
+
+function classText(c: Ctx, k: ClassDecl): string {
+  let head = (k.exported ? "export " : "") + "class " + k.name.name + typeParamsText(k.typeParams);
+  let lo2 = k.name.span.end;
+  for (const tp of k.typeParams) {
+    if (tp.span.end > lo2) {
+      lo2 = tp.span.end;
+    }
+  }
+  if (k.ext.isSome()) {
+    head += " extends " + k.ext.unwrap().name;
+    lo2 = k.ext.unwrap().span.end;
+  }
+  let starts: usize[] = [];
+  let ends: usize[] = [];
+  let texts: string[] = [];
+  for (const m of k.members) {
+    const sp = memberSpan(m);
+    starts.push(sp.start);
+    ends.push(sp.end);
+    texts.push(memberText(c, m, 2));
+  }
+  const open = findChar(c, lo2, 123) + 1;
+  return bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
 }
 
 function variantText(v: VariantDecl): string {
@@ -805,7 +905,8 @@ function itemSpan(it: Item): Span {
     IReExport(d) => { return d.span; },
     IFunction(f) => { return f.span; },
     IType(t) => { return t.span; },
-    IConst(k) => { return k.span; }
+    IConst(k) => { return k.span; },
+    IClass(k) => { return k.span; }
   }
 }
 
@@ -815,7 +916,8 @@ function itemText(c: Ctx, it: Item): string {
     IReExport(d) => { return importText(c, "export", d); },
     IFunction(f) => { return functionText(c, f); },
     IType(t) => { return typeDeclText(c, t); },
-    IConst(k) => { return constText(c, k); }
+    IConst(k) => { return constText(c, k); },
+    IClass(k) => { return classText(c, k); }
   }
 }
 
