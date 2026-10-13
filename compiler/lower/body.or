@@ -265,7 +265,9 @@ export function expr(cx: Cx, sc: Sc, c: Ctr, e: HExpr): V {
     XCond(a, b, d) => exprCond(cx, sc, c, e, a, b, d),
     XMatch(s, arms) => exprMatch(cx, sc, c, e, s, arms),
     XClosure(f, caps) => exprClosure(cx, sc, c, f, caps),
-    XCallIndirect(f, args) => exprCallIndirect(cx, sc, c, e, f, args)
+    XCallIndirect(f, args) => exprCallIndirect(cx, sc, c, e, f, args),
+    XIface(vt, v) => exprIface(cx, sc, c, vt, v),
+    XCallVirtual(r, slot, args) => exprCallVirtual(cx, sc, c, e, r, slot, args)
   };
 }
 
@@ -415,6 +417,48 @@ function exprCallIndirect(cx: Cx, sc: Sc, c: Ctr, e: HExpr, callee: HExpr, args:
   const t = tm(a.c, mty(e.ty));
   items.push(t.d);
   items.push(ii(ICallIndirect(Some(t.id), f, rest)));
+  items = items.concat(releaseOwned(a));
+  if (isRefTy(e.ty)) {
+    return vOwned(items, t.id, t.c);
+  }
+  return vScalar(items, t.id, t.c);
+}
+
+// An interface value (ADR-0019): the class value is consumed like the slot of a variant (IIface,
+// docs/mir.md v1.4); the vtable is `MProgram.vtables[vt]`.
+function exprIface(cx: Cx, sc: Sc, c: Ctr, vt: usize, v: HExpr): V {
+  const a = lowerArgs(cx, sc, c, [v]);
+  const o = ownAll(a.c, a, [v.ty], a.items);
+  let items = o.items;
+  const t = tm(o.c, MRef);
+  items.push(t.d);
+  items.push(ii(IIface(t.id, vt, o.ops[0])));
+  return vOwned(items, t.id, t.c);
+}
+
+// A call through the vtable of an interface value: receiver first, then the arguments; all borrowed.
+function exprCallVirtual(cx: Cx, sc: Sc, c: Ctr, e: HExpr, recv: HExpr, slot: usize, args: HExpr[]): V {
+  let es: HExpr[] = [recv];
+  for (const x of args) {
+    es.push(x);
+  }
+  const a = lowerArgs(cx, sc, c, es);
+  let items = a.items;
+  const r = a.ops[0];
+  let rest: Operand[] = [];
+  let i: usize = 1;
+  while (i < a.ops.length) {
+    rest.push(a.ops[i]);
+    i += 1;
+  }
+  if (isVoidTy(e.ty)) {
+    items.push(ii(ICallVirtual(None, r, slot, rest)));
+    items = items.concat(releaseOwned(a));
+    return vVoid(items, a.c);
+  }
+  const t = tm(a.c, mty(e.ty));
+  items.push(t.d);
+  items.push(ii(ICallVirtual(Some(t.id), r, slot, rest)));
   items = items.concat(releaseOwned(a));
   if (isRefTy(e.ty)) {
     return vOwned(items, t.id, t.c);

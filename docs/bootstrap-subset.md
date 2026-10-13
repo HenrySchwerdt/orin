@@ -224,6 +224,8 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0411 | missing/duplicate/unknown record literal field |
 | E0412 | invalid or missing `main` |
 | E0413 | generic instantiation limit exceeded (self-hosted compiler only, ADR-0007) |
+| E0417 | class does not implement an interface method / type does not satisfy a bound (self-hosted compiler only, ADR-0019) |
+| E0418 | method implementing an interface method mutates its receiver (self-hosted compiler only, ADR-0019) |
 
 ## 10. Clarifications (v1.1, from conformance-suite review)
 

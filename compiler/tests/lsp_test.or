@@ -6,7 +6,7 @@ import {
   uriToPath, pathToUri, fullDocumentEdits
 } from "../lsp";
 import { Json, stringifyJson } from "../json";
-import { SemanticIndex, SymbolDef, SymbolRef, TypeAt, SkFunction, SkParam } from "../hir";
+import { SemanticIndex, SymbolDef, SymbolRef, TypeAt, ImplLink, SkFunction, SkParam, SkRecord, SkInterface } from "../hir";
 import { span } from "../diag";
 import { exit } from "std:process";
 
@@ -89,7 +89,7 @@ function testLifecycle(f: string[]): string[] {
   fails = eq(fails, "initialize", show(s),
     "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":false}},"
     + "\"documentSymbolProvider\":true,\"completionProvider\":{\"resolveProvider\":false},\"documentFormattingProvider\":true,"
-    + "\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true}},\"serverInfo\":{\"name\":\"orin\",\"version\":\"0.1.0\"}}}");
+    + "\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"implementationProvider\":true,\"renameProvider\":{\"prepareProvider\":true}},\"serverInfo\":{\"name\":\"orin\",\"version\":\"0.1.0\"}}}");
   s = handleText(s.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
   fails = eq(fails, "initialized", show(s), "");
 
@@ -241,6 +241,49 @@ function testQueries(f: string[]): string[] {
   return fails;
 }
 
+// Interfaces (ADR-0019): document symbols and `textDocument/implementation` over a hand-built index.
+function testInterfaces(f: string[]): string[] {
+  let fails = f;
+  const uri = "file:///q/shape.or";
+  const text = "interface Shape {\n  area(): int;\n}\nclass Sq implements Shape {\n  area(): int { return 1; }\n}\n";
+  let st = initialized();
+  st = open(st, uri, text).state;
+  let s = req(st, 40, "textDocument/documentSymbol", "{\"textDocument\":{\"uri\":\"" + uri + "\"}}");
+  fails = eq(fails, "iface docsym", show(s),
+    "{\"jsonrpc\":\"2.0\",\"id\":40,\"result\":["
+    + "{\"name\":\"Shape\",\"detail\":\"interface Shape\",\"kind\":11,\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":2,\"character\":1}},"
+    + "\"selectionRange\":{\"start\":{\"line\":0,\"character\":10},\"end\":{\"line\":0,\"character\":15}},\"children\":["
+    + "{\"name\":\"area\",\"detail\":\"method area(): int\",\"kind\":12,\"range\":{\"start\":{\"line\":1,\"character\":2},\"end\":{\"line\":1,\"character\":14}},"
+    + "\"selectionRange\":{\"start\":{\"line\":1,\"character\":2},\"end\":{\"line\":1,\"character\":6}},\"children\":[]}]}]}");
+
+  // Spans (file 0): `Shape` 10..15, `area` 20..24; class `Sq` 41..43, its `Shape` 55..60, its `area` 65..69.
+  const defs = [
+    SymbolDef { id: 0, name: "Shape", kind: SkInterface, nameSpan: span(0, 10, 15), declSpan: span(0, 0, 34), unit: 0, container: None, exported: false, detail: "interface Shape (implemented by Sq)" },
+    SymbolDef { id: 1, name: "area", kind: SkFunction, nameSpan: span(0, 20, 24), declSpan: span(0, 20, 32), unit: 0, container: Some(0), exported: false, detail: "method area(): int" },
+    SymbolDef { id: 2, name: "Sq", kind: SkRecord, nameSpan: span(0, 41, 43), declSpan: span(0, 35, 93), unit: 0, container: None, exported: false, detail: "class Sq implements Shape" },
+    SymbolDef { id: 3, name: "area", kind: SkFunction, nameSpan: span(0, 65, 69), declSpan: span(0, 65, 91), unit: 0, container: Some(2), exported: false, detail: "method area(): int" }
+  ];
+  const refs = [SymbolRef { span: span(0, 55, 60), def: 0 }];
+  const idx = SemanticIndex { defs: defs, refs: refs, types: [], impls: [ImplLink { cls: 2, iface: 0, span: span(0, 55, 60) }] };
+  let st2 = withTestIndex(newLspState(), idx);
+  st2 = handleText(st2, INIT).state;
+  st2 = handleText(st2, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
+  st2 = open(st2, uri, text).state;
+  const doc = "\"textDocument\":{\"uri\":\"" + uri + "\"}";
+  // On the interface name: the implementing class.
+  s = req(st2, 41, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":0,\"character\":11}}");
+  fails = eq(fails, "implementation of interface", show(s),
+    "{\"jsonrpc\":\"2.0\",\"id\":41,\"result\":[{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":3,\"character\":6},\"end\":{\"line\":3,\"character\":8}}}]}");
+  // On the interface method: the method of the class.
+  s = req(st2, 42, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":1,\"character\":3}}");
+  fails = eq(fails, "implementation of method", show(s),
+    "{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":[{\"uri\":\"" + uri + "\",\"range\":{\"start\":{\"line\":4,\"character\":2},\"end\":{\"line\":4,\"character\":6}}}]}");
+  // On the class: nothing.
+  s = req(st2, 43, "textDocument/implementation", "{" + doc + ",\"position\":{\"line\":3,\"character\":7}}");
+  fails = eq(fails, "implementation of class", show(s), "{\"jsonrpc\":\"2.0\",\"id\":43,\"result\":[]}");
+  return fails;
+}
+
 function testIndexRequests(f: string[]): string[] {
   let fails = f;
   const uri = "file:///q/idx.or";
@@ -257,11 +300,11 @@ function testIndexRequests(f: string[]): string[] {
     SymbolRef { span: span(0, l1 + 24, l1 + 27), def: 0 }
   ];
   const types = [TypeAt { span: span(0, l1 + 24, l1 + 30), ty: "int" }];
-  const idx = SemanticIndex { defs: defs, refs: refs, types: types };
+  const idx = SemanticIndex { defs: defs, refs: refs, types: types, impls: [] };
 
   let st = withTestIndex(newLspState(), idx);
   const init = handleText(st, INIT);
-  fails = eq(fails, "caps advertise", has(show(init), "\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true}"), "true");
+  fails = eq(fails, "caps advertise", has(show(init), "\"definitionProvider\":true,\"hoverProvider\":true,\"referencesProvider\":true,\"implementationProvider\":true,\"renameProvider\":{\"prepareProvider\":true}"), "true");
   st = handleText(init.state, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}").state;
   st = open(st, uri, text).state;
   const doc = "\"textDocument\":{\"uri\":\"" + uri + "\"}";
@@ -349,6 +392,7 @@ function main(): void {
   f = testCrossModule(f);
   f = testQueries(f);
   f = testIndexRequests(f);
+  f = testInterfaces(f);
   f = testFraming(f);
   if (f.length == 0) {
     console.log("ok");

@@ -2,8 +2,8 @@
 // pipeline if it produced diagnostics (same as bootstrap/src/checker/mod.rs `check`).
 
 import { Diagnostic, SourceMap, diag } from "../diag";
-import { Ident, DAlias } from "../syntax";
-import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type } from "../hir";
+import { Ident, DAlias, FunctionDecl } from "../syntax";
+import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type, IfaceDef } from "../hir";
 import { LoadedProgram } from "../loader";
 import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
 import { collect } from "./collect";
@@ -12,7 +12,8 @@ import { newFnCtx } from "./fnctx";
 import { checkBlock } from "./body";
 import { lowerClasses, buildClassTables } from "./classes";
 import { inferClasses } from "./classfix";
-import { scopeOf, mkOpaque, resolveSig, resolveType, instType } from "./types";
+import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig, resolveType, instType } from "./types";
+import { resolveImpls, checkImpls, boundIface } from "./ifaces";
 
 type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
 
@@ -88,10 +89,36 @@ function opaquesFor(env: Env, params: Ident[]): Opaques {
   return Opaques { env: e, names: names, tys: tys };
 }
 
+// Like `opaquesFor` for a generic function: a parameter with a bound (`T extends Shape`, ADR-0019)
+// gets an opaque type that carries the interface.
+function opaquesForFn(env: Env, unit: usize, decl: FunctionDecl): Result<Opaques, Diagnostic> {
+  let e = env;
+  let names: string[] = [];
+  let tys: Type[] = [];
+  let k: usize = 0;
+  while (k < decl.typeParams.length) {
+    const p = decl.typeParams[k];
+    let o = mkOpaque(e, p.name);
+    if (k < decl.bounds.length && decl.bounds[k].isSome()) {
+      const i = boundIface(e, unit, decl.bounds[k].unwrap())?;
+      o = mkOpaqueBound(e, p.name, i);
+    }
+    e = o.env;
+    names.push(p.name);
+    tys.push(o.ty);
+    k += 1;
+  }
+  return Ok(Opaques { env: e, names: names, tys: tys });
+}
+
 // Abstract check of a generic function: the body is checked once with opaque type parameters.
 function abstractFunc(env: Env, g: usize): Option<Diagnostic> {
   const gf = env.gfuncs[g];
-  const op = opaquesFor(env, gf.decl.typeParams);
+  const opr = opaquesForFn(env, gf.unit, gf.decl);
+  if (opr.isErr()) {
+    return Some(opr.unwrapErr());
+  }
+  const op = opr.unwrap();
   const sc = scopeOf(gf.unit, op.names, op.tys);
   const sig = match (resolveSig(op.env, sc, gf.decl)) {
     Ok(x) => x,
@@ -149,6 +176,18 @@ function arrayPreludeUnit(prog: LoadedProgram): int {
   return -1;
 }
 
+function ifaceDefs(env: Env): IfaceDef[] {
+  let out: IfaceDef[] = [];
+  for (const i of env.ifaces) {
+    let ms: string[] = [];
+    for (const m of i.methods) {
+      ms.push(m.name);
+    }
+    out.push(IfaceDef { name: i.name, methods: ms });
+  }
+  return out;
+}
+
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
   // Classes are lowered to records and functions first (ADR-0009).
   const lw = lowerClasses(prog);
@@ -164,7 +203,15 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   if (r.diags.length > 0) {
     return Err(dedupDiags(r.diags));
   }
-  let env = inferClasses(r.env);
+  const im = resolveImpls(r.env);
+  if (im.diags.length > 0) {
+    return Err(dedupDiags(im.diags));
+  }
+  let env = inferClasses(im.env);
+  const cd = checkImpls(env);
+  if (cd.length > 0) {
+    return Err(dedupDiags(cd));
+  }
   let diags: Diagnostic[] = [];
   // Generic declarations are checked once, abstractly, at their definition.
   let gi: usize = 0;
@@ -201,5 +248,5 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
     return Err(dedupDiags(diags));
   }
   const mainId = findMain(env).unwrapOr(0);
-  return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId });
+  return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId, vtables: env.vtables, ifaces: ifaceDefs(env) });
 }

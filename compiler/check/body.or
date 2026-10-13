@@ -16,9 +16,11 @@ import {
   HPattern, Builtin, MutBuiltin
 } from "../hir";
 import {
-  Env, ValEnt, FuncInfo, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
-  isIntish, isArrayTy, isFn, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq
+  Env, ValEnt, FuncInfo, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, EntIface, typeEq, isInt, isUsize, isBool, isString, isVoid,
+  isIntish, isArrayTy, isFn, isIface, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq,
+  boundOf, ifaceMethodIndex
 } from "./env";
+import { checkBounds, internVtable, recordImplements } from "./ifaces";
 import { classOfRec, findMethod, fieldIsPrivate } from "./classes";
 import {
   FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak,
@@ -131,9 +133,62 @@ function noField(env: Env, name: Ident, t: Type): Diagnostic {
 function expect(env: Env, fx: FnCtx, e: Expr, ty: Type): Result<ExprOut, Diagnostic> {
   const r = checkExpr(env, fx, e, Some(ty))?;
   if (!typeEq(r.expr.ty, ty)) {
-    return Err(mismatch(r.fx.env, e.span, ty, r.expr.ty));
+    return coerce(r, e.span, ty);
   }
   return Ok(r);
+}
+
+// The one implicit conversion of the language (ADR-0019): a value of a class type converts to an
+// interface type the class declares with `implements`. Anything else is a type mismatch.
+function coerce(r: ExprOut, span: Span, ty: Type): Result<ExprOut, Diagnostic> {
+  return match (ty) {
+    TyIface(i) => toIface(r, span, i),
+    _ => Err(mismatch(r.fx.env, span, ty, r.expr.ty))
+  };
+}
+
+function toIface(r: ExprOut, span: Span, i: usize): Result<ExprOut, Diagnostic> {
+  const env = r.fx.env;
+  match (r.expr.ty) {
+    TyRecord(rec) => {
+      const co = classOfRec(env, rec);
+      if (co.isSome()) {
+        if (!recordImplements(env, rec, i)) {
+          return Err(diag(
+            "E0417",
+            span,
+            "class `" + env.classes[co.unwrap()].name + "` does not implement interface `" + env.ifaces[i].name
+              + "`; declare `class " + env.classes[co.unwrap()].name + " implements " + env.ifaces[i].decl.name.name
+              + "` (conformance is nominal)"
+          ));
+        }
+        const vo = internVtable(env, co.unwrap(), i);
+        return done(withEnv(r.fx, vo.env), XIface(vo.id, r.expr), TyIface(i), span);
+      }
+      if (recordImplements(env, rec, i)) {
+        // the opaque type of a bounded type parameter (abstract check; the HIR is discarded)
+        return done(r.fx, XIface(0, r.expr), TyIface(i), span);
+      }
+    },
+    _ => {}
+  }
+  return Err(mismatch(env, span, TyIface(i), r.expr.ty));
+}
+
+// `s.m(args)` on an interface value, or on a value of a type parameter bounded by the interface
+// (abstract check): a call through the vtable (ADR-0019).
+function ifaceCall(
+  env: Env, b: ExprOut, span: Span, i: usize, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const info = b.fx.env.ifaces[i];
+  const so = ifaceMethodIndex(info, name.name);
+  if (so.isNone()) {
+    return Err(diag("E0405", name.span, "no method `" + name.name + "` on interface `" + info.name + "`"));
+  }
+  const slot = so.unwrap();
+  const m = info.methods[slot];
+  const a = argsExpect(env, b.fx, span, "method `" + name.name + "`", args, m.params)?;
+  return done(a.fx, XCallVirtual(b.expr, slot, a.args), m.ret, span);
 }
 
 export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
@@ -456,6 +511,20 @@ function checkCond(
   let t: HExpr = mk(XBool(false), TyBool, span);
   let f: HExpr = mk(XBool(false), TyBool, span);
   const npre = cur.pre.length;
+  // An interface-typed context converts each branch (ADR-0019).
+  match (exp) {
+    Some(et) => {
+      if (isIface(et)) {
+        const tr = expect(env, cur, thenE, et)?;
+        const fr = expect(env, tr.fx, elsE, et)?;
+        if (fr.fx.pre.length > npre) {
+          return Err(condHoistErr(span));
+        }
+        return done(fr.fx, XCond(c.expr, tr.expr, fr.expr), et, span);
+      }
+    },
+    None => {}
+  }
   if (untypedInt(thenE) && !untypedInt(elsE)) {
     const fr = checkExpr(env, cur, elsE, exp)?;
     const tr = checkExpr(env, fr.fx, thenE, hintOf(fr.expr.ty))?;
@@ -554,7 +623,7 @@ function resolveFx(fx: FnCtx, te: TypeExpr, voidOk: bool): Result<TyFx, Diagnost
 // `fx` with its environment replaced by `e` (instances only ever grow the tables).
 function withEnv(fx: FnCtx, e: Env): FnCtx {
   if (e.insts.length == fx.env.insts.length && e.funcs.length == fx.env.funcs.length
-    && e.records.length == fx.env.records.length) {
+    && e.records.length == fx.env.records.length && e.vtables.length == fx.env.vtables.length) {
     return fx;
   }
   let f = fx;
@@ -603,6 +672,9 @@ function checkRecord(
       const r = aliasType(cur.env, i, none)?;
       cur = withEnv(cur, r.env);
       t = r.ty;
+    },
+    EntIface(_) => {
+      return Err(diag("E0400", name.span, "`" + name.name + "` is an interface, not a record type"));
     }
   }
   if (targs.isSome()) {
@@ -1205,6 +1277,10 @@ function callGeneric(
     },
     None => {}
   }
+  match (checkBounds(cur.env, gf.unit, gf.decl, io.tys, span)) {
+    Some(d) => { return Err(d); },
+    None => {}
+  }
   let fid: usize = 0;
   if (!cur.abs) {
     const fo = instFunc(cur.env, g, io.tys, cur.depth + 1, span)?;
@@ -1386,6 +1462,10 @@ function methodCall(
             return classMethodCall(env, b0.fx, span, base, b0, co.unwrap(), name, args);
           }
         }
+        const bd = boundOf(b0.fx.env, r);
+        if (bd.isSome()) {
+          return ifaceCall(env, b0, span, bd.unwrap(), name, args);
+        }
         if (recordHasFnField(b0.fx.env, r, n)) {
           return callFieldValue(env, b0, span, r, name, args);
         }
@@ -1394,6 +1474,9 @@ function methodCall(
         if (isArrayApi(n)) {
           return arrayApiCall(env, b0, span, t, name, args, exp);
         }
+      },
+      TyIface(i) => {
+        return ifaceCall(env, b0, span, i, name, args);
       },
       _ => {}
     }
@@ -2283,6 +2366,7 @@ function dummyDecl(name: string, span: Span): FunctionDecl {
     exported: false,
     name: Ident { name: name, span: span },
     typeParams: noTps,
+    bounds: [],
     params: noParams,
     ret: noRet,
     body: Block { stmts: noStmts, span: span },
@@ -2637,6 +2721,10 @@ function funcValue(
           cur = r.fx;
           ret = r.ty;
         },
+        None => {}
+      }
+      match (checkBounds(cur.env, gf.unit, gf.decl, tys, span)) {
+        Some(d) => { return Err(d); },
         None => {}
       }
       if (cur.abs) {

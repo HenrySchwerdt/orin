@@ -16,7 +16,7 @@
   `includes` only for `int`, `usize`, `bool`, `string` elements (E0405 otherwise); `sort` is O(n log n) with
   O(n) extra allocation per level; the callbacks' integer results must be `int` (`.toInt()` on lengths).
 - Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic classes or
-  methods (E0408), static fields, getters/setters, interfaces, `protected`. Private members are
+  methods (E0408), static fields, getters/setters, `protected`. Private members are
   checked at compile time (E0405). Constructors initialise fields only through leading `this.f = e;`
   statements, parameter properties and field initializers (else E0411; `this` is unavailable until
   then, E0300). Mutating methods are inferred; every mutating call copies the receiver shallowly until
@@ -25,3 +25,11 @@
   `while` conditions (E0408), runs before the other operands of the same statement, and its receiver
   may not contain side-effecting index expressions (E0408). Class values cannot be built with record
   literals outside their class (E0408). Method hover types on the call expression show the lowered type.
+- Interfaces (ADR-0019, self-hosted compiler only): nominal conformance (`implements`), method signatures only
+  (no fields, default methods, `extends`, type parameters: E0408), non-mutating methods only (a mutating
+  implementation is E0418), one bound per type parameter (`T extends A & B` is E0408). A class converts
+  implicitly to the interfaces it declares (the only implicit conversion; not lifted over arrays); no
+  downcasts, no `instanceof`, `==` on interface values is E0410. Interface values are boxed (one allocation
+  per conversion, one indirect call per method call); the legacy `--legacy-codegen` backend rejects programs
+  that use interfaces. Go-to-definition from a call on a bounded type parameter inside a generic body
+  resolves to the interface method; hover shows the implementations of an interface.

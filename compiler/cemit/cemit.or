@@ -306,7 +306,9 @@ function instrC(fx: Fx, i: Instr): string {
     IArrayPush(x, v) => lname(x) + " = orin_mir_array_push(" + lname(x) + ", " + slotOf(fx, v) + ");",
     IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); " + lname(d) + " = orin_array_pop(" + lname(x) + ");",
     IClosure(d, f, caps) => closureC(fx, d, f, caps),
-    ICallIndirect(d, f, args) => callIndirectC(fx, d, f, args)
+    ICallIndirect(d, f, args) => callIndirectC(fx, d, f, args),
+    IIface(d, vt, v) => ifaceC(fx, d, vt, v),
+    ICallVirtual(d, r, slot, args) => callVirtualC(fx, d, r, slot, args)
   };
 }
 
@@ -393,6 +395,36 @@ function callIndirectC(fx: Fx, d: Option<usize>, f: Operand, args: Operand[]): s
   }
   sig += ")";
   const call = "((" + sig + ")(uintptr_t)orin_struct_get(" + c + ", 0))(" + cargs.join(", ") + ")";
+  return match (d) {
+    Some(x) => lname(x) + " = " + call + ";",
+    None => call + ";"
+  };
+}
+
+// An interface value (docs/mir.md v1.4, ADR-0019): a struct `{ vtable pointer (scalar slot 0), boxed value
+// (reference slot 1) }`; the vtable is the static table `orin_vtN`.
+function ifaceC(fx: Fx, d: usize, vt: usize, v: Operand): string {
+  const n = lname(d);
+  return n + " = orin_struct_new(0, 2, 2ULL); orin_struct_set(" + n + ", 0, (uint64_t)(uintptr_t)orin_vt" + u(vt)
+    + "); orin_struct_set(" + n + ", 1, " + slotOf(fx, v) + ");";
+}
+
+// Call through the vtable of an interface value: entry `slot`, cast to the C type implied by the operand
+// and destination types (the boxed value first).
+function callVirtualC(fx: Fx, d: Option<usize>, r: Operand, slot: usize, args: Operand[]): string {
+  const c = opC(r);
+  const rt = match (d) {
+    Some(x) => cty(fx.f.locals[x].ty),
+    None => "void"
+  };
+  let sig = rt + " (*)(OrinObj *";
+  let cargs: string[] = ["ORIN_REF(orin_struct_get(" + c + ", 1))"];
+  for (const a of args) {
+    sig += ", " + cty(opTy(fx, a));
+    cargs.push(opC(a));
+  }
+  sig += ")";
+  const call = "((" + sig + ")(((void *const *)(uintptr_t)orin_struct_get(" + c + ", 0))[" + u(slot) + "]))(" + cargs.join(", ") + ")";
   return match (d) {
     Some(x) => lname(x) + " = " + call + ";",
     None => call + ";"
@@ -488,6 +520,19 @@ export function emitC(prog: MProgram): string {
   out.push("\n");
   for (const sg of sigs) {
     out.push(sg + ";\n");
+  }
+  out.push("\n");
+  i = 0;
+  while (i < prog.vtables.length) {
+    let fs: string[] = [];
+    for (const g of prog.vtables[i].funcs) {
+      fs.push("(void *)&" + names[g]);
+    }
+    if (fs.length == 0) {
+      fs.push("NULL");
+    }
+    out.push("static void *const orin_vt" + u(i) + "[] = { " + fs.join(", ") + " }; /* " + commentSafe(prog.vtables[i].name) + " */\n");
+    i += 1;
   }
   out.push("\n");
   i = 0;

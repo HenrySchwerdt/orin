@@ -2,7 +2,7 @@
 // checks the outcome. One line per case; exit status 1 if any case fails.
 //   orinb build compiler/tests/verify_main.or -o build/verify_main && ./build/verify_main
 
-import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
+import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
 import { BStrLength, UnOp, BinOp } from "../hir";
 import { verify, VerifyReport } from "../verify";
 import { exit } from "std:process";
@@ -38,7 +38,7 @@ function fnO(name: string, owned: bool[], locals: MLocal[], ret: MType, blocks: 
 }
 
 function prog(fs: MFunction[]): MProgram {
-  return MProgram { functions: fs, strings: ["s"], main: 0 };
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: [] };
 }
 
 // Single void function `f` whose only block is `instrs; return`.
@@ -470,8 +470,79 @@ function closureCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- interfaces (v1.4, ADR-0019)
+
+function progVt(fs: MFunction[], vts: MVTable[]): MProgram {
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: vts };
+}
+
+// Method `m(this: ref, x: int): int` implementing an interface method (all parameters borrowed).
+function method(): MFunction {
+  return fn("C.m", 2, [lr("this"), li("x")], MInt, [bk([], TReturn(Some(OInt(1))))]);
+}
+
+function vt(fs: usize[]): MVTable {
+  return MVTable { name: "C as I", funcs: fs };
+}
+
+function ifaceCases(): usize {
+  let bad: usize = 0;
+  const dead = "dead";
+  const p1 = pos("interface value built, called and released", progVt([
+    fn("f", 0, [lr("a"), lr("v"), li("r")], MVoid, [bk([
+      IStructNew(0, 0, []), IIface(1, 0, OLocal(0)), ICallVirtual(Some(2), OLocal(1), 0, [OInt(5)]), IRelease(1)], ret())]),
+    method()], [vt([1])]));
+  const p2 = pos("interface value returned to the caller", progVt([
+    fn("f", 0, [lr("a"), lr("v")], MRef, [bk([
+      IStructNew(0, 0, []), IIface(1, 0, OLocal(0))], TReturn(Some(OLocal(1))))]),
+    method()], [vt([1])]));
+  const p3 = pos("borrowed receiver and argument", progVt([
+    fn("f", 2, [lr("v"), li("n"), li("r")], MVoid, [bk([
+      ICallVirtual(Some(2), OLocal(0), 0, [OLocal(1)])], ret())]),
+    method()], [vt([1])]));
+  const p4 = pos("string constant boxed", progVt([
+    fn("f", 0, [lr("v")], MRef, [bk([IIface(0, 0, OStr(0))], TReturn(Some(OLocal(0))))]),
+    method()], [vt([1])]));
+  const n1 = neg("boxed value used after IIface consumed it", progVt([
+    fn("f", 0, [lr("a"), lr("v"), li("i")], MVoid, [bk([
+      IStructNew(0, 0, []), IIface(1, 0, OLocal(0)), ITag(2, OLocal(0)), IRelease(1)], ret())]),
+    method()], [vt([1])]), dead);
+  const n2 = neg("boxing a Borrowed local", progVt([
+    fn("f", 1, [lr("p"), lr("b"), lr("v")], MVoid, [bk([
+      IGetField(1, OLocal(0), 0), IIface(2, 0, OLocal(1))], ret())]),
+    method()], [vt([1])]), "borrowed");
+  const n3 = neg("virtual call of a released interface value", progVt([
+    fn("f", 0, [lr("a"), lr("v")], MVoid, [bk([
+      IStructNew(0, 0, []), IIface(1, 0, OLocal(0)), IRelease(1), ICallVirtual(None, OLocal(1), 0, [OInt(1)])], ret())]),
+    method()], [vt([1])]), dead);
+  const n4 = neg("vtable index out of range", progVt([
+    fn("f", 0, [lr("a"), lr("v")], MVoid, [bk([IStructNew(0, 0, []), IIface(1, 3, OLocal(0))], ret())]),
+    method()], [vt([1])]), "vtable index");
+  const n5 = neg("vtable entry with an owned parameter", progVt([
+    fn("f", 0, [lr("a"), lr("v")], MVoid, [bk([IStructNew(0, 0, []), IIface(1, 0, OLocal(0)), IRelease(1)], ret())]),
+    fnO("C.m", [true, false], [lr("this"), li("x")], MInt, [bk([IRelease(0)], TReturn(Some(OInt(1))))])],
+    [vt([1])]), "borrowed parameters");
+  const n6 = neg("vtable entry out of range", progVt([
+    fn("f", 0, [lr("a")], MVoid, [bk([], ret())]),
+    method()], [vt([7])]), "out of range");
+  const n7 = neg("vtable entry without a reference receiver", progVt([
+    fn("f", 0, [lr("a")], MVoid, [bk([], ret())]),
+    fn("C.m", 1, [li("x")], MInt, [bk([], TReturn(Some(OInt(1))))])], [vt([1])]), "first parameter");
+  const n8 = neg("virtual callee is not a reference", straight(0, [li("c")], [ICopy(0, OInt(1)), ICallVirtual(None, OLocal(0), 0, [])]), "interface value");
+  const n9 = neg("Unique argument demoted by a virtual call with a reference result", progVt([
+    fn("f", 0, [lr("a"), lr("v"), lr("x"), lr("r")], MVoid, [bk([
+      IStructNew(0, 0, []), IIface(1, 0, OLocal(0)), IStructNew(2, 0, [OInt(1)]), ICallVirtual(Some(3), OLocal(1), 0, [OLocal(2)]),
+      ISetField(2, 0, OInt(2)), IRelease(2), IRelease(3), IRelease(1)], ret())]),
+    fn("C.m", 2, [lr("this"), lr("y")], MRef, [bk([IDup(2, OLocal(1))], TReturn(Some(OLocal(2))))])], [vt([1])]), "Unique");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases();
+  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

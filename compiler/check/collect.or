@@ -4,12 +4,12 @@
 
 import { Span, Diagnostic, diag } from "../diag";
 import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantDecl } from "../syntax";
-import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local, Function } from "../hir";
+import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local, Function, VTable } from "../hir";
 import { LoadedProgram, ImportTarget, ImportUnit, ImportStd, StdModule, StdFs, StdProcess, StdIo } from "../loader";
 import {
-  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, EntGen, VFunc, VConst, VVariant, VStd, VGFunc, VGVariant,
+  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, EntGen, EntIface, IfaceInfo, IfaceSig, VFunc, VConst, VVariant, VStd, VGFunc, VGVariant,
   TypeBind, ValBind, Names, UnitInfo, AliasInfo, FuncInfo, ConstInfo, ConstLit, LitInt, Env, RecordSrc,
-  UnionSrc, GenType, GenFunc, Inst, ClassInfo, typeEntEq, valEntEq, findType, findVal, emptyNames, isBuiltinTypeName
+  UnionSrc, GenType, GenFunc, Inst, ClassInfo, OpaqueBound, typeEntEq, valEntEq, findType, findVal, emptyNames, isBuiltinTypeName
 } from "./env";
 
 export type Collected = {
@@ -111,6 +111,7 @@ export function collect(prog: LoadedProgram): Collected {
   let gtypes: GenType[] = [];
   let gfuncs: GenFunc[] = [];
   let consts: ConstInfo[] = [];
+  let ifaces: IfaceInfo[] = [];
   const noNames: string[] = [];
   const noInsts: Inst[] = [];
   const noClasses: ClassInfo[] = [];
@@ -247,7 +248,41 @@ export function collect(prog: LoadedProgram): Collected {
         },
         IImport(_) => {},
         IReExport(_) => {},
-        IClass(_) => {}    // lowered to a record and functions before collection (classes.or)
+        IClass(_) => {},   // lowered to a record and functions before collection (classes.or)
+        IInterface(k) => {
+          if (isBuiltinTypeName(k.name.name)) {
+            diags.push(diag("E0304", k.name.span, "`" + k.name.name + "` is a built-in type name"));
+          }
+          if (k.typeParams.length > 0) {
+            diags.push(diag("E0408", k.typeParams[0].span, "generic interfaces are not supported in Orin 1.0 (ADR-0019)"));
+          }
+          match (k.ext) {
+            Some(b) => {
+              diags.push(diag("E0408", b.span, "interface inheritance (`extends`) is not supported in Orin 1.0 (ADR-0019)"));
+            },
+            None => {}
+          }
+          let seenM: string[] = [];
+          for (const m of k.methods) {
+            for (const q of seenM) {
+              if (q == m.name.name) {
+                diags.push(diag("E0304", m.name.span, "duplicate method `" + m.name.name + "` in interface `" + k.name.name + "`"));
+              }
+            }
+            seenM.push(m.name.name);
+          }
+          const ent = EntIface(ifaces.length);
+          const noSigs: IfaceSig[] = [];
+          ifaces.push(IfaceInfo { name: unit.name + "." + k.name.name, unit: ui, decl: k, methods: noSigs });
+          const a = addType(scope, k.name.name, ent, k.name.span);
+          scope = a.names;
+          match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+          if (k.exported) {
+            const b = addType(exports, k.name.name, ent, k.name.span);
+            exports = b.names;
+            match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+          }
+        }
       }
     }
     // Imports and re-exports.
@@ -325,6 +360,8 @@ export function collect(prog: LoadedProgram): Collected {
     ui += 1;
   }
   const noLifted: Function[] = [];
+  const noBounds: OpaqueBound[] = [];
+  const noVts: VTable[] = [];
   const env = Env {
     units: units,
     aliases: aliases,
@@ -337,6 +374,9 @@ export function collect(prog: LoadedProgram): Collected {
     gfuncs: gfuncs,
     insts: noInsts,
     classes: noClasses,
+    ifaces: ifaces,
+    bounds: noBounds,
+    vtables: noVts,
     lifted: noLifted,
     prelude: -1
   };

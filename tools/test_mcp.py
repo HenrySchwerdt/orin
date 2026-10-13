@@ -102,7 +102,7 @@ export function double(n: int): int {
   return n * 2;
 }
 
-export class Counter {
+export class Counter implements Gauge {
   n: int = 0;
   bump(): void {
     this.n = this.n + 1;
@@ -110,6 +110,10 @@ export class Counter {
   peek(): int {
     return this.n;
   }
+}
+
+export interface Gauge {
+  peek(): int;
 }
 """
 
@@ -226,6 +230,15 @@ def main():
     check(not err and v["kind"] == "method" and v["mutates"] is True, "mutating method inferred (%s)" % raw)
     err, v, raw = c.call("inspect", {"symbol": "Counter.peek", "entry": "main.or"})
     check(not err and v["mutates"] is False, "non-mutating method (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "Gauge", "entry": "main.or"})
+    check(not err and v["kind"] == "interface" and v["implementedBy"][0].startswith("Counter at lib.or:"),
+          "interface lists its implementations (%s)" % raw)
+    check("implemented by Counter" in v["sig"], "interface signature shows implementations (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "Gauge.peek", "entry": "main.or"})
+    check(not err and v["kind"] == "method" and v["in"] == "Gauge" and v["mutates"] is False,
+          "interface method (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "Counter", "entry": "main.or"})
+    check(not err and v["kind"] == "class" and v["implements"] == ["Gauge"], "class lists the interfaces it implements (%s)" % raw)
     err, v, raw = c.call("inspect", {"symbol": "Nope", "entry": "main.or"})
     check(err and "not found" in raw, "unknown symbol")
     err, v, raw = c.call("inspect", {"module": "lib.or", "entry": "main.or"})

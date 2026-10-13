@@ -665,6 +665,48 @@ function callIndirectI(fx: Fx, p: string, d: Option<usize>, f: Operand, args: Op
   };
 }
 
+// Interface value (docs/mir.md v1.4, ADR-0019): struct { vtable pointer (scalar slot 0), boxed value
+// (reference slot 1) }; the vtable is the constant table `@orin_vtN`.
+function ifaceI(fx: Fx, p: string, d: usize, vt: usize, v: Operand): string {
+  let s = loadsOf(fx, p, [v]);
+  const n = p + "n";
+  s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+  s += slotGep(p + "c0", n, 0) + "  store ptr @orin_vt" + u(vt) + ", ptr " + p + "c0\n";
+  s += slotGep(p + "c1", n, 1) + "  store " + targ(fx, p, 0, v) + ", ptr " + p + "c1\n";
+  return s + st(fx, d, n);
+}
+
+// Call through the vtable of an interface value: load the table and the boxed value, call entry `slot`
+// with the boxed value first.
+function callVirtualI(fx: Fx, p: string, d: Option<usize>, r: Operand, slot: usize, args: Operand[]): string {
+  let s = ld(fx, p, 0, r);
+  let all: string[] = [];
+  let k: usize = 0;
+  while (k < args.length) {
+    s += ld(fx, p, k + 1, args[k]);
+    all.push(targ(fx, p, k + 1, args[k]));
+    k += 1;
+  }
+  const cv = ov(p, 0, r);
+  s += slotGep(p + "c0", cv, 0) + "  " + p + "vt = load ptr, ptr " + p + "c0\n";
+  s += slotGep(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+  s += "  " + p + "fg = getelementptr inbounds ptr, ptr " + p + "vt, i64 " + u(slot) + "\n";
+  s += "  " + p + "fp = load ptr, ptr " + p + "fg\n";
+  const rt = match (d) {
+    Some(x) => lty(fx.f.locals[x].ty),
+    None => "void"
+  };
+  let argl = "ptr " + p + "ev";
+  if (all.length > 0) {
+    argl += ", " + all.join(", ");
+  }
+  const call = "call " + rt + " " + p + "fp(" + argl + ")\n";
+  return s + match (d) {
+    Some(x) => "  " + p + "r = " + call + st(fx, x, p + "r"),
+    None => "  " + call
+  };
+}
+
 function arrayNewI(fx: Fx, p: string, d: usize, isRef: bool, es: Operand[]): string {
   let s = loadsOf(fx, p, es);
   const n = p + "n";
@@ -729,7 +771,9 @@ function instrI(fx: Fx, p: string, i: Instr): string {
     IArrayPop(d, x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n"
       + st(fx, x, p + "u") + "  " + p + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + st(fx, d, p + "r"),
     IClosure(d, f, caps) => closureI(fx, p, d, f, caps),
-    ICallIndirect(d, f, args) => callIndirectI(fx, p, d, f, args)
+    ICallIndirect(d, f, args) => callIndirectI(fx, p, d, f, args),
+    IIface(d, vt, v) => ifaceI(fx, p, d, vt, v),
+    ICallVirtual(d, r, slot, args) => callVirtualI(fx, p, d, r, slot, args)
   };
 }
 
@@ -823,6 +867,18 @@ export function emitLlvm(prog: MProgram): string {
   i = 0;
   while (i < prog.strings.length) {
     out.push(strGlobal(i, prog.strings[i]));
+    i += 1;
+  }
+  i = 0;
+  while (i < prog.vtables.length) {
+    let fs: string[] = [];
+    for (const g of prog.vtables[i].funcs) {
+      fs.push("ptr @" + names[g]);
+    }
+    if (fs.length == 0) {
+      fs.push("ptr null");
+    }
+    out.push("@orin_vt" + u(i) + " = private unnamed_addr constant [" + u(fs.length) + " x ptr] [" + fs.join(", ") + "]\n");
     i += 1;
   }
   out.push("\n");
