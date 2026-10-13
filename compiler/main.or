@@ -1,9 +1,9 @@
 // orin — the self-hosted Orin compiler driver (Stage 1+).
-//   orin check [--format=json] [--deps] <entry.or | package-dir>
+//   orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>
 //   orin api [--check <snapshot>] <entry.or | package-dir>   public API snapshot / change detection
 //   orin graph <entry.or | package-dir> [-o out.json]   OSIG snapshot (docs/osig.md)
 //   orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html]   OSIG diff report
-//   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--check-contracts]
+//   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--check-contracts] [--strict-contracts]
 //       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
 //   orin lsp                 language server on stdio (spec 18)
@@ -21,7 +21,7 @@ import { writeFile } from "std:fs";
 import { SourceMap, Diagnostic, render } from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
-import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated } from "./check";
+import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts } from "./check";
 import { runTestCommand, hasTests, eraseTests } from "./testing";
 import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
@@ -38,7 +38,7 @@ import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] [--deps] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
+  console.error("usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
   exit(2);
 }
 
@@ -54,13 +54,18 @@ function report(sm: SourceMap, diags: Diagnostic[], json: bool): void {
   exit(1);
 }
 
-// Prints the warnings of the program (`@Deprecated` uses, ADR-0024) without failing: to stderr as text, or
-// as JSON objects on stdout with --format=json.
-function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool): void {
-  if (!hasDeprecated(program)) {
+// Prints the warnings of the program without failing: `@Deprecated` uses (ADR-0024) and contract-quality
+// warnings (ADR-0028; the strict ones when `strictFlag` or `[contracts] strict = true` is set), to stderr as
+// text, or as JSON objects on stdout with --format=json.
+function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool, strictFlag: bool): void {
+  let ws: Diagnostic[] = [];
+  if (hasDeprecated(program)) {
+    ws = deprecationWarnings(program, checkWithIndex(program, sm).index);
+  }
+  ws = ws.concat(qualityWarnings(program, sm, strictContracts(program, strictFlag)));
+  if (ws.length == 0) {
     return;
   }
-  const ws = deprecationWarnings(program, checkWithIndex(program, sm).index);
   if (json) {
     printDiagnosticsJson(sm, ws);
     return;
@@ -122,6 +127,7 @@ function main(): void {
   let checkContracts = false;
   let verifyContractsFlag = false;
   let strict = false;
+  let strictContractsFlag = false;
   let z3 = "z3";
   let expectZ3 = false;
   let deps = false;
@@ -141,6 +147,8 @@ function main(): void {
       verifyContractsFlag = true;
     } else if (a == "--strict") {
       strict = true;
+    } else if (a == "--strict-contracts") {
+      strictContractsFlag = true;
     } else if (a == "--check-contracts") {
       checkContracts = true;
     } else if (a == "--deps") {
@@ -229,7 +237,7 @@ function main(): void {
       report(loaded.sm, full.unwrapErr(), json);
       return;
     }
-    printWarnings(program, loaded.sm, json);
+    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
     program = eraseTests(program);
   }
   const checked = checkContracts ? checkRuntime(program, loaded.sm) : check(program, loaded.sm);
@@ -238,7 +246,7 @@ function main(): void {
     return;
   }
   if (!withTests) {
-    printWarnings(program, loaded.sm, json);
+    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
   }
   if (cmd == "check") {
     if (deps) {
