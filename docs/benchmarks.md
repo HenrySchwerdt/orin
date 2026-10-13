@@ -297,7 +297,7 @@ append instead of one `snprintf`; `split` and `indexOf` use a first-byte scan in
 did not show up in these workloads (short separators). Likely follow-ups: a runtime primitive to build a string
 from a byte array (would let `join`/`toString` allocate once), and inlining of `substring`/`fromCharCode`.
 
-## Floats and Map (ADR-0015)
+## Floats and Map (ADR-0018)
 
 Two benchmarks were added: `nbody` (5 bodies, 1,000,000 steps, `float[]` struct-of-arrays, `sqrt` from
 `std:math`) and `mapfreq` (1,000,000 `Map<string, int>` updates over 50,000 keys; Go `map`, C open-addressing

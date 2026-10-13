@@ -440,7 +440,7 @@ OrinObj *orin_parse_int(OrinObj *s) {
     return orin_variant1(0, 0, acc);
 }
 
-/* ---------------------------------------------------------------- floats (ADR-0015) */
+/* ---------------------------------------------------------------- floats (ADR-0018) */
 
 int64_t orin_float_to_int(double x) {
     /* int64 range is [-2^63, 2^63); both bounds are exactly representable as doubles. */

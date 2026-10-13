@@ -1,4 +1,4 @@
-# ADR-0015: Floating-point numbers (`float`, `f32`) and the built-in `Map<K, V>`
+# ADR-0018: Floating-point numbers (`float`, `f32`) and the built-in `Map<K, V>`
 
 Status: accepted (2026-10-13). Scope: the self-hosted compiler (`compiler/`), the C runtime, the
 std prelude. Stage 0 is frozen and rejects all of this; the compiler's own source stays Orin-B

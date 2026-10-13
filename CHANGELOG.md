@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- Floats (`float`, `f32`), `std:math`, built-in `Map<K, V>` (ADR-0015). Float programs link with `-lm`.
+- Floats (`float`, `f32`), `std:math`, built-in `Map<K, V>` (ADR-0018). Float programs link with `-lm`.
 
 ## 0.1.0-alpha.1 (2026-10-13)
 First experimental release of the self-hosted Orin compiler.

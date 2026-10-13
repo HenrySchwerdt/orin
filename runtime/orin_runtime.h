@@ -4,7 +4,7 @@
  *
  * VALUES
  *   int -> int64_t, usize -> uint64_t, bool -> int64_t (0/1), float / f32 -> double (an f32 is a
- *   double that is exactly representable as a float; ADR-0015): unboxed scalars.
+ *   double that is exactly representable as a float; ADR-0018): unboxed scalars.
  *   Everything else (string, array, record, union, Option, Result) is an `OrinObj*`
  *   pointing at a reference-counted heap object. Generic containers store 64-bit "slots":
  *   a scalar's bits or a pointer (ORIN_SLOT / ORIN_REF convert).
@@ -76,7 +76,7 @@ typedef struct OrinStruct {
 
 #define ORIN_SLOT(p) ((uint64_t)(uintptr_t)(p)) /* reference -> slot */
 
-/* float <-> slot: the 64-bit pattern of the double (ADR-0015). */
+/* float <-> slot: the 64-bit pattern of the double (ADR-0018). */
 static inline uint64_t orin_f2s(double d) {
     union { double d; uint64_t u; } v;
     v.d = d;
@@ -291,7 +291,7 @@ OrinObj *orin_int_to_string(int64_t v);
 OrinObj *orin_usize_to_string(uint64_t v);
 OrinObj *orin_bool_to_string(int64_t v);
 OrinObj *orin_parse_int(OrinObj *s); /* Option<int> */
-/* Floats (ADR-0015). toString: shortest round-tripping digits, JavaScript-like layout (see the ADR). */
+/* Floats (ADR-0018). toString: shortest round-tripping digits, JavaScript-like layout (see the ADR). */
 OrinObj *orin_float_to_string(double x);
 OrinObj *orin_f32_to_string(double x); /* x holds a binary32 value */
 OrinObj *orin_parse_float(OrinObj *s);  /* Option<float> */
