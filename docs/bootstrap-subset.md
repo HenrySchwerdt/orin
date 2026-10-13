@@ -248,6 +248,14 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0444 | `@Inline` function that is part of a call cycle (recursive) — beyond Orin-B (ADR-0024) |
 | E0445 | a `@Test` function is called or used as a value (tests are only run by `orin test` and erased from ordinary builds) — beyond Orin-B (ADR-0024) |
 | W0440 | **warning** (never fails a build): use of a `@Deprecated` symbol; printed as `warning[W0440]`, JSON `"severity":"warning"`, LSP severity 2 with the Deprecated tag — beyond Orin-B (ADR-0024) |
+| W0450 | **warning**: `@Invariant` of a class or record that mentions no `this` (constrains no state) — beyond Orin-B (ADR-0028) |
+| W0451 | **warning**: `@Ensures` that mentions neither `result` nor (non-static method) `this`; parameters are immutable, so it cannot fail — beyond Orin-B (ADR-0028) |
+| W0452 | **warning**: syntactically trivially true contract (`true`, `x == x`, `x <= x`, `x >= x`, `a.length >= 0`, `s.length >= 0`, `m.size >= 0`, literal comparisons) — beyond Orin-B (ADR-0028) |
+| W0460 | **warning** (`orin verify --contracts`, solver-proved): clause valid without premises — beyond Orin-B (ADR-0028) |
+| W0461 | **warning** (`orin verify --contracts`): the `@Requires` of a function are unsatisfiable — beyond Orin-B (ADR-0028) |
+| W0462 | **warning** (`orin verify --contracts`): `@Ensures` implied by the `@Requires` alone — beyond Orin-B (ADR-0028) |
+| W0470 | **warning**, strict mode only: class with state and no `@Invariant` — beyond Orin-B (ADR-0028) |
+| W0471 | **warning**, strict mode only: public method that mutates `this` and has no `@Ensures` — beyond Orin-B (ADR-0028) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
 | E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |

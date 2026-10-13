@@ -115,6 +115,60 @@ and loop invariants are not proved (loops are outside the fragment). VERIFIED th
 all inputs satisfying `@Requires`, if the function returns normally then the `@Ensures` holds,
 assuming the callee contracts hold.
 
+## Contract quality (ADR-0028)
+
+A contract that cannot fail catches no bug. The compiler reports weak or meaningless contracts as
+**warnings** (never an error, never a changed exit status; `warning[W....]` in text, `"severity":"warning"` in
+JSON, severity 2 in the LSP). All carry the action `STRENGTHEN_SPEC` (ADR-0029) in JSON.
+
+Syntactic, always on in `orin check` / `compile` / `test` / LSP (`compiler/check/quality.or`):
+
+| Code | Condition |
+|---|---|
+| W0450 | `@Invariant` of a class or record type that contains no `this` (so no field): it constrains no state |
+| W0451 | `@Ensures` that does not mention `result` and, in a non-static method, `this`. Parameters are immutable, so such a clause only restates the input (move it to `@Requires`) |
+| W0452 | a contract expression (also loop invariants) that is trivially true: `true`, `x == x`, `x <= x`, `x >= x`, `a.length >= 0`, `s.length >= 0`, `m.size >= 0`, a comparison of two literals that holds; also a trivially true conjunct of `&&`, consequent of `==>` or side of `\|\|` |
+
+`x == x` is only reported when the operand has a declared non-float scalar or string type (it is a NaN test for
+floats), and `.length` / `.size` only when the receiver is a parameter, `this` field or `result` of a declared
+array, string or `Map` type; where the type is not known the pass is silent.
+
+In `orin verify --contracts` (only for what the solver fragment supports; otherwise nothing is reported). The
+`warnings` array of the JSON report and the `warning[...]` lines of the text report; each has `status`
+`VERIFIED` (the finding is proved), `kind` and `action`:
+
+| Code | Finding |
+|---|---|
+| W0460 | the clause is valid without any premise (parameters in the i64 range only): a tautology |
+| W0461 | the `@Requires` clauses of a function are unsatisfiable: it can never be called |
+| W0462 | an `@Ensures` follows from the `@Requires` alone, for every possible result: the body cannot violate it |
+
+Strict contract coverage (opt-in: `--strict-contracts` or `[contracts] strict = true` in `orin.toml`; the
+compiler itself does not use it yet): W0470 class with state (a field) and no `@Invariant`; W0471 public,
+non-static method that mutates `this` and has no `@Ensures`.
+
+**Contract strength:** `python3 tools/contract_mutation.py FILE.or` mutates the function bodies (operators,
+literals, dropped statements), runs the `@Test` functions with contract checking and reports per function how
+many mutants were killed by a contract or a test and which survived (see `examples/contract_mutation.or`).
+A survivor means the contracts and tests do not notice the changed behaviour (or the mutant is equivalent).
+Honest limits: a strong contract is still not proof that the specification is the right one.
+
+## Refusal protocol fields of `orin verify --contracts` (ADR-0029)
+
+Every JSON result also has `action` (`FIX_CODE`, `STRENGTHEN_SPEC`, `NEEDS_DECISION`, or `null` for `VERIFIED`),
+`question` (string or `null`), `options` (list of `{"edit","changes_spec","widens_authority"}`), `candidates`
+(suggested contracts, never verified) and `evidence` (`clause`, `location`, `counterexample`). The text report
+prints `action:`, `question:`, `option N:` and `candidate:` lines.
+
+| Result | `action` |
+|---|---|
+| REFUTED `call-precondition` | `FIX_CODE` (the caller passes an argument the callee forbids) |
+| REFUTED contract of the function itself | `NEEDS_DECISION`: question plus options (fix the body; add the precondition that excludes the counterexample, `changes_spec`; weaken the contract, `changes_spec` and `widens_authority`) |
+| UNKNOWN | `STRENGTHEN_SPEC` with the `reason`; no candidates (the solver gives no counterexample) |
+
+An agent facing `NEEDS_DECISION` or `NEEDS_AUTHORITY` must ask the user the question with its options and must
+not weaken contracts, add assumptions or widen grants to make a result pass.
+
 ## Known limitations
 
 - Loop invariants / `@Decreases` and record invariants are only type-checked.

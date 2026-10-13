@@ -11,5 +11,6 @@ for t in path_test json_test analysis_test lsp_test verify_main package_test; do
 done
 # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
 $ORIN2 test compiler/tests/loader_test.or --runtime runtime
+$ORIN2 test compiler/tests/quality_test.or --runtime runtime
 sh tools/test_resources.sh
 sh tools/test_capabilities.sh

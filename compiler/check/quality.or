@@ -1,0 +1,751 @@
+// Contract-quality warnings, syntactic part (ADR-0028). Beyond Orin-B.
+//
+// A contract that cannot fail catches no bug. This pass finds the contracts that are weak or
+// meaningless by looking at the AST only (the Z3-based part lives in compiler/vc/vc.or and runs in
+// `orin verify --contracts`). Like W0440 (deprecated.or) the findings are warnings: ordinary
+// `Diagnostic`s whose code starts with `W`; they never change the exit status.
+//
+//   W0450  `@Invariant` that does not mention `this` (so it constrains no field)
+//   W0451  `@Ensures` that cannot be violated by the function (mentions neither `result` nor, in a
+//          non-static method, `this`; parameters are immutable, so it only restates the input)
+//   W0452  a contract expression that is trivially true (`true`, `x == x`, `x <= x`, `x >= x`,
+//          `a.length >= 0`, `s.length >= 0`, `m.size >= 0`), also as a conjunct of `&&`, as the
+//          consequent of `==>` or as a side of `||`
+//   strict mode only (`--strict-contracts`, `[contracts] strict = true`):
+//   W0470  class with state (a field) and no `@Invariant`
+//   W0471  public, non-static method that mutates `this` and has no `@Ensures`
+//
+// Honest limits: the pass is purely syntactic. Types are known only from declared parameter / field /
+// result types (`x == x` is only reported for operands of a known non-float scalar or string type,
+// because `x == x` is false for NaN; `a.length >= 0` only when `a` is a parameter, `this` field or
+// `result` of a declared array, string or `Map` type). Where the type is not known nothing is
+// reported. W0471 detects mutation by assignments to places rooted at `this`, `push` / `pop` / `set` /
+// `delete` / `clear` / `remove` / `add` / `insert` on such places, and calls of other mutating methods of
+// the same class; mutation through other paths is not seen (the warning is then missing, never wrong
+// by construction of the heuristic's name list).
+// Diagnostics are in source order (units in loader order), so output is deterministic.
+
+import { Span, SourceMap, Diagnostic, diag, isWarning } from "../diag";
+import { LoadedProgram } from "../loader";
+import {
+  Param, TypeExpr, Block, Stmt, Expr, FieldInit, MatchArm, BinaryOp, ContractClause, ClassDecl, MethodDecl, CtorDecl,
+  FunctionDecl, TypeDecl, Item,
+} from "../syntax";
+
+export const INVARIANT_NO_THIS: string = "W0450";
+export const ENSURES_UNOBSERVED: string = "W0451";
+export const TRIVIAL_CONTRACT: string = "W0452";
+export const CLASS_NO_INVARIANT: string = "W0470";
+export const MUTATOR_NO_ENSURES: string = "W0471";
+
+// True when every diagnostic of `ds` is a warning (a loop, so contracts may call it).
+export function allWarnings(ds: Diagnostic[]): bool {
+  for (const d of ds) {
+    if (!isWarning(d)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isStrictCode(code: string): bool {
+  return code == CLASS_NO_INVARIANT || code == MUTATOR_NO_ENSURES;
+}
+
+// True when some diagnostic of `ds` is a strict-mode warning (W0470, W0471).
+export function anyStrictCode(ds: Diagnostic[]): bool {
+  for (const d of ds) {
+    if (isStrictCode(d.code)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Which declared names are in scope of the clauses being examined, to know types of operands.
+type Scope = { params: Param[]; ret: Option<TypeExpr>; fields: FieldTy[]; isMethod: bool; };
+type FieldTy = { name: string; ty: TypeExpr; };
+
+// Kinds of operand types: 0 unknown, 1 non-float scalar (integer, bool), 2 float, 3 array, 4 string, 5 Map.
+function typeKind(t: TypeExpr): int {
+  return match (t.kind) {
+    TArray(_) => 3,
+    TFn(_, _) => 0,
+    TNamed(id, args) => namedKind(id.name, args.length)
+  };
+}
+
+function namedKind(n: string, nargs: usize): int {
+  if (nargs == 0) {
+    if (n == "float" || n == "f32") {
+      return 2;
+    }
+    if (n == "string") {
+      return 4;
+    }
+    if (n == "bool" || n == "int" || n == "usize" || n == "i8" || n == "i16" || n == "i32" || n == "i64"
+      || n == "u8" || n == "u16" || n == "u32" || n == "u64") {
+      return 1;
+    }
+    return 0;
+  }
+  return n == "Map" ? 5 : 0;
+}
+
+function paramKind(ps: Param[], name: string): int {
+  for (const p of ps) {
+    if (p.name.name == name) {
+      return typeKind(p.ty);
+    }
+  }
+  return 0;
+}
+
+function fieldKind(fs: FieldTy[], name: string): int {
+  for (const f of fs) {
+    if (f.name == name) {
+      return typeKind(f.ty);
+    }
+  }
+  return 0;
+}
+
+function exprKind(sc: Scope, e: Expr): int {
+  return match (e.kind) {
+    EInt(_) => 1,
+    EBigInt(_) => 1,
+    EBool(_) => 1,
+    EStr(_) => 4,
+    EFloat(_) => 2,
+    EIdent(id) => identKind(sc, id.name),
+    EMember(recv, f) => memberKind(sc, recv, f.name),
+    _ => 0
+  };
+}
+
+function identKind(sc: Scope, name: string): int {
+  if (name == "result") {
+    return match (sc.ret) {
+      Some(t) => typeKind(t),
+      None => 0
+    };
+  }
+  return paramKind(sc.params, name);
+}
+
+function memberKind(sc: Scope, recv: Expr, f: string): int {
+  const isThis = match (recv.kind) {
+    EThis => true,
+    _ => false
+  };
+  return isThis ? fieldKind(sc.fields, f) : 0;
+}
+
+// Structural equality of the simple operand forms (identifiers, `this`, member access, literals).
+function sameExpr(a: Expr, b: Expr): bool {
+  return match (a.kind) {
+    EInt(x) => match (b.kind) { EInt(y) => x == y, _ => false },
+    EBool(x) => match (b.kind) { EBool(y) => x == y, _ => false },
+    EStr(x) => match (b.kind) { EStr(y) => x == y, _ => false },
+    EThis => match (b.kind) { EThis => true, _ => false },
+    EIdent(x) => match (b.kind) { EIdent(y) => x.name == y.name, _ => false },
+    EMember(r1, f1) => match (b.kind) { EMember(r2, f2) => f1.name == f2.name && sameExpr(r1, r2), _ => false },
+    _ => false
+  };
+}
+
+function isIntZero(e: Expr): bool {
+  return match (e.kind) {
+    EInt(n) => n == 0,
+    _ => false
+  };
+}
+
+// `x.length` of an array / string, `m.size` of a Map: never negative.
+function isCount(sc: Scope, e: Expr): bool {
+  return match (e.kind) {
+    EMember(recv, f) => countOf(sc, recv, f.name),
+    _ => false
+  };
+}
+
+function countOf(sc: Scope, recv: Expr, f: string): bool {
+  const k = exprKind(sc, recv);
+  if (f == "length") {
+    return k == 3 || k == 4;
+  }
+  return f == "size" && k == 5;
+}
+
+// 0 other, 1 `==`, 2 `>=`, 3 `<=`, 4 `&&`, 5 `||`, 6 `==>`, 7 `<`, 8 `>`, 9 `!=`
+function opClass(op: BinaryOp): int {
+  return match (op) {
+    BEq => 1,
+    BLe => 3,
+    BGe => 2,
+    BAnd => 4,
+    BOr => 5,
+    BImplies => 6,
+    BLt => 7,
+    BGt => 8,
+    BNe => 9,
+    _ => 0
+  };
+}
+
+// True when `a <op> b` holds for two integer literals (`cls` is the opClass of a comparison).
+function literalComparison(cls: int, l: Expr, r: Expr): bool {
+  const a = match (l.kind) { EInt(n) => Some(n), _ => None };
+  const b = match (r.kind) { EInt(n) => Some(n), _ => None };
+  if (a.isNone() || b.isNone()) {
+    return false;
+  }
+  const x = a.unwrap();
+  const y = b.unwrap();
+  return match (cls) {
+    1 => x == y,
+    2 => x >= y,
+    3 => x <= y,
+    7 => x < y,
+    8 => x > y,
+    9 => x != y,
+    _ => false
+  };
+}
+
+// True when `e` itself (not a sub-expression) is one of the trivially true forms.
+function isTrivialAtom(sc: Scope, e: Expr): bool {
+  return match (e.kind) {
+    EBool(b) => b,
+    EBinary(op, l, r) => binaryTrivial(sc, opClass(op), l, r),
+    _ => false
+  };
+}
+
+function binaryTrivial(sc: Scope, cls: int, l: Expr, r: Expr): bool {
+  if (literalComparison(cls, l, r)) {
+    return true;
+  }
+  if (cls >= 1 && cls <= 3 && sameExpr(l, r)) {
+    const k = exprKind(sc, l);
+    if (k == 1 || k == 4) {
+      return true;
+    }
+  }
+  if (cls == 2 && isIntZero(r) && isCount(sc, l)) {
+    return true;
+  }
+  return cls == 3 && isIntZero(l) && isCount(sc, r);
+}
+
+// The first trivially true part of `e`: `e` itself, a conjunct of `&&`, or the whole of an `a ==> T`
+// / `a || T` / `T || a`.
+function findTrivial(sc: Scope, e: Expr): Option<Expr> {
+  if (isTrivialAtom(sc, e)) {
+    return Some(e);
+  }
+  return match (e.kind) {
+    EBinary(op, l, r) => trivialInBinary(sc, e, opClass(op), l, r),
+    _ => None
+  };
+}
+
+function trivialInBinary(sc: Scope, e: Expr, cls: int, l: Expr, r: Expr): Option<Expr> {
+  if (cls == 4) {
+    const a = findTrivial(sc, l);
+    return a.isSome() ? a : findTrivial(sc, r);
+  }
+  if (cls == 5) {
+    return findTrivial(sc, l).isSome() || findTrivial(sc, r).isSome() ? Some(e) : None;
+  }
+  if (cls == 6) {
+    return findTrivial(sc, r).isSome() ? Some(e) : None;
+  }
+  return None;
+}
+
+// What `mentions` looks for: 0 `this`, 1 the name `result`.
+// Sub-expressions the walk cannot see into (match arms with block bodies, closures) count as a
+// mention, so no warning is issued for them.
+function mentions(e: Expr, what: int): bool {
+  return match (e.kind) {
+    EThis => what == 0,
+    EIdent(id) => what == 1 && id.name == "result",
+    EUnary(_, x) => mentions(x, what),
+    EBinary(_, l, r) => mentions(l, what) || mentions(r, what),
+    ECall(callee, args) => mentions(callee, what) || anyMention(args, what),
+    EMember(x, _) => mentions(x, what),
+    EIndex(x, i) => mentions(x, what) || mentions(i, what),
+    ETry(x) => mentions(x, what),
+    ECond(c, a, b) => mentions(c, what) || mentions(a, what) || mentions(b, what),
+    EArray(xs) => anyMention(xs, what),
+    ERecord(_, spread, fs) => mentionsRecord(spread, fs, what),
+    ERecordT(_, _, spread, fs) => mentionsRecord(spread, fs, what),
+    EMatch(x, arms) => mentions(x, what) || armsMention(arms, what),
+    ETemplate(_, xs) => anyMention(xs, what),
+    ENew(_, _, xs) => anyMention(xs, what),
+    EArrow(_, _, _) => true,
+    _ => false
+  };
+}
+
+function anyMention(xs: Expr[], what: int): bool {
+  for (const x of xs) {
+    if (mentions(x, what)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function mentionsRecord(spread: Option<Expr>, fs: FieldInit[], what: int): bool {
+  const s = match (spread) {
+    Some(x) => mentions(x, what),
+    None => false
+  };
+  if (s) {
+    return true;
+  }
+  for (const f of fs) {
+    if (mentions(f.value, what)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function armsMention(arms: MatchArm[], what: int): bool {
+  for (const a of arms) {
+    const m = match (a.body) {
+      BExpr(x) => mentions(x, what),
+      BBlock(_) => true
+    };
+    if (m) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function kindOfClause(c: ContractClause): int {
+  return match (c.kind) {
+    CRequires => 0,
+    CEnsures => 1,
+    CInvariant => 2,
+    CDecreases => 3,
+    CRule => 4
+  };
+}
+
+function snippet(sm: SourceMap, sp: Span): string {
+  const t = sm.files[sp.file].text.substring(sp.start, sp.end).split("\n").join(" ");
+  return t.length > 60 ? t.substring(0, 57) + "..." : t;
+}
+
+// ---------------------------------------------------------------------------
+// Mutation of `this` (strict mode, W0471)
+// ---------------------------------------------------------------------------
+
+function rootsAtThis(e: Expr): bool {
+  return match (e.kind) {
+    EThis => true,
+    EMember(x, _) => rootsAtThis(x),
+    EIndex(x, _) => rootsAtThis(x),
+    _ => false
+  };
+}
+
+function isCollectionMutator(n: string): bool {
+  return n == "push" || n == "pop" || n == "set" || n == "delete" || n == "clear" || n == "remove" || n == "add"
+    || n == "insert";
+}
+
+function isThisExpr(e: Expr): bool {
+  return match (e.kind) {
+    EThis => true,
+    _ => false
+  };
+}
+
+function callMutates(callee: Expr, args: Expr[], mutating: string[]): bool {
+  const hit = match (callee.kind) {
+    EMember(recv, f) => (rootsAtThis(recv) && isCollectionMutator(f.name))
+      || (isThisExpr(recv) && mutating.indexOf(f.name).isSome()),
+    _ => false
+  };
+  return hit || exprsMutate(args, mutating) || exprMutates(callee, mutating);
+}
+
+function exprsMutate(xs: Expr[], mutating: string[]): bool {
+  for (const x of xs) {
+    if (exprMutates(x, mutating)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function exprMutates(e: Expr, mutating: string[]): bool {
+  return match (e.kind) {
+    ECall(callee, args) => callMutates(callee, args, mutating),
+    EUnary(_, x) => exprMutates(x, mutating),
+    EBinary(_, l, r) => exprMutates(l, mutating) || exprMutates(r, mutating),
+    EMember(x, _) => exprMutates(x, mutating),
+    EIndex(x, i) => exprMutates(x, mutating) || exprMutates(i, mutating),
+    ETry(x) => exprMutates(x, mutating),
+    ECond(c, a, b) => exprMutates(c, mutating) || exprMutates(a, mutating) || exprMutates(b, mutating),
+    EArray(xs) => exprsMutate(xs, mutating),
+    ETemplate(_, xs) => exprsMutate(xs, mutating),
+    ENew(_, _, xs) => exprsMutate(xs, mutating),
+    EMatch(x, arms) => exprMutates(x, mutating) || armsMutate(arms, mutating),
+    _ => false
+  };
+}
+
+function armsMutate(arms: MatchArm[], mutating: string[]): bool {
+  for (const a of arms) {
+    const m = match (a.body) {
+      BExpr(x) => exprMutates(x, mutating),
+      BBlock(b) => blockMutates(b, mutating)
+    };
+    if (m) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function blockMutates(b: Block, mutating: string[]): bool {
+  for (const s of b.stmts) {
+    if (stmtMutates(s, mutating)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stmtMutates(s: Stmt, mutating: string[]): bool {
+  return match (s.kind) {
+    SLet(_, _, _, init) => exprMutates(init, mutating),
+    SAssign(target, _, value) => rootsAtThis(target) || exprMutates(value, mutating),
+    SExpr(x) => exprMutates(x, mutating),
+    SReturn(v) => match (v) { Some(x) => exprMutates(x, mutating), None => false },
+    SIf(c, t, els) => exprMutates(c, mutating) || blockMutates(t, mutating) || elseMutates(els, mutating),
+    SWhile(c, b) => exprMutates(c, mutating) || blockMutates(b, mutating),
+    SForOf(_, x, b) => exprMutates(x, mutating) || blockMutates(b, mutating),
+    SBlock(b) => blockMutates(b, mutating),
+    _ => false
+  };
+}
+
+function elseMutates(els: Option<Stmt>, mutating: string[]): bool {
+  return match (els) {
+    Some(s) => stmtMutates(s, mutating),
+    None => false
+  };
+}
+
+function methodsOf(c: ClassDecl): MethodDecl[] {
+  let out: MethodDecl[] = [];
+  for (const m of c.members) {
+    match (m) {
+      MMethod(md) => { out.push(md); },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+// Names of the non-static methods of `c` that mutate `this`: a fixpoint, because a method that calls a
+// mutating method of the same class mutates too.
+function mutatingMethods(c: ClassDecl): string[] {
+  const ms = methodsOf(c);
+  let names: string[] = [];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const m of ms) {
+      if (!m.isStatic && names.indexOf(m.name.name).isNone() && blockMutates(m.body, names)) {
+        names.push(m.name.name);
+        changed = true;
+      }
+    }
+  }
+  return names;
+}
+
+// ---------------------------------------------------------------------------
+// The scan
+// ---------------------------------------------------------------------------
+
+function classFields(c: ClassDecl): FieldTy[] {
+  let out: FieldTy[] = [];
+  for (const m of c.members) {
+    match (m) {
+      MField(f) => { out.push(FieldTy { name: f.name.name, ty: f.ty }); },
+      MCtor(k) => {
+        for (const p of k.params) {
+          if (p.access != 0) {
+            out.push(FieldTy { name: p.name.name, ty: p.ty });
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+function hasInvariant(cs: ContractClause[]): bool {
+  for (const c of cs) {
+    if (kindOfClause(c) == 2) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasEnsures(cs: ContractClause[]): bool {
+  for (const c of cs) {
+    if (kindOfClause(c) == 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Loop clauses (`@Invariant(e)` before `while` / `for`) of a block, nested blocks included.
+function loopClauses(stmts: Stmt[]): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const s of stmts) {
+    match (s.kind) {
+      SContract(c) => { out.push(c); },
+      SIf(_, t, els) => {
+        out = out.concat(loopClauses(t.stmts));
+        match (els) {
+          Some(e) => { out = out.concat(loopClauses([e])); },
+          None => {}
+        }
+      },
+      SWhile(_, b) => { out = out.concat(loopClauses(b.stmts)); },
+      SForOf(_, _, b) => { out = out.concat(loopClauses(b.stmts)); },
+      SBlock(b) => { out = out.concat(loopClauses(b.stmts)); },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+@Invariant(allWarnings(this.out))
+class QualityScan {
+  private sm: SourceMap;
+  private strict: bool;
+  private out: Diagnostic[] = [];
+
+  constructor(sm: SourceMap, strict: bool) {
+    this.sm = sm;
+    this.strict = strict;
+  }
+
+  warnings(): Diagnostic[] {
+    return this.out;
+  }
+
+  private warn(code: string, sp: Span, msg: string): void {
+    this.out.push(diag(code, sp, msg));
+  }
+
+  // W0452 for one clause expression.
+  private trivial(sc: Scope, c: ContractClause): void {
+    match (c.expr) {
+      Some(e) => {
+        match (findTrivial(sc, e)) {
+          Some(t) => {
+            this.warn(
+              TRIVIAL_CONTRACT,
+              t.span,
+              `\`${snippet(this.sm, t.span)}\` is always true, so this contract can never fail and catches no bug`,
+            );
+          },
+          None => {}
+        }
+      },
+      None => {}
+    }
+  }
+
+  // The clauses of a function, method or constructor.
+  private clauses(sc: Scope, cs: ContractClause[], isCtor: bool): void {
+    for (const c of cs) {
+      const k = kindOfClause(c);
+      if (k > 2) {
+        continue;
+      }
+      this.trivial(sc, c);
+      if (k == 1 && !isCtor) {
+        this.ensures(sc, c);
+      }
+    }
+  }
+
+  // W0451: an `@Ensures` the function cannot violate.
+  private ensures(sc: Scope, c: ContractClause): void {
+    match (c.expr) {
+      Some(e) => {
+        const seesResult = mentions(e, 1);
+        const seesThis = sc.isMethod && mentions(e, 0);
+        if (!seesResult && !seesThis) {
+          const what = sc.isMethod ? "mentions neither `result` nor `this`" : "does not mention `result`";
+          this.warn(
+            ENSURES_UNOBSERVED,
+            e.span,
+            `\`@Ensures(${snippet(this.sm, e.span)})\` ${what}: parameters cannot change, so it only restates the input; relate it to the result or move it to @Requires`,
+          );
+        }
+      },
+      None => {}
+    }
+  }
+
+  // W0450 and W0452 for the `@Invariant`s of a class or record type.
+  private invariants(sc: Scope, cs: ContractClause[]): void {
+    for (const c of cs) {
+      if (kindOfClause(c) != 2) {
+        continue;
+      }
+      this.trivial(sc, c);
+      match (c.expr) {
+        Some(e) => {
+          if (!mentions(e, 0)) {
+            this.warn(
+              INVARIANT_NO_THIS,
+              e.span,
+              `\`@Invariant(${snippet(this.sm, e.span)})\` mentions no field of \`this\`, so it constrains no state`,
+            );
+          }
+        },
+        None => {}
+      }
+    }
+  }
+
+  private loops(body: Block): void {
+    const none: Scope = Scope { params: [], ret: None, fields: [], isMethod: false };
+    for (const c of loopClauses(body.stmts)) {
+      if (kindOfClause(c) <= 2) {
+        this.trivial(none, c);
+      }
+    }
+  }
+
+  private func(f: FunctionDecl): void {
+    const sc = Scope { params: f.params, ret: f.ret, fields: [], isMethod: false };
+    this.clauses(sc, f.contracts, false);
+    this.loops(f.body);
+  }
+
+  private record(t: TypeDecl): void {
+    let fs: FieldTy[] = [];
+    match (t.body) {
+      DRecord(fields) => {
+        for (const f of fields) {
+          fs.push(FieldTy { name: f.name.name, ty: f.ty });
+        }
+      },
+      _ => {}
+    }
+    this.invariants(Scope { params: [], ret: None, fields: fs, isMethod: false }, t.contracts);
+  }
+
+  private method(c: ClassDecl, m: MethodDecl, fields: FieldTy[], mutating: string[]): void {
+    const sc = Scope { params: m.params, ret: m.ret, fields: fields, isMethod: !m.isStatic };
+    this.clauses(sc, m.contracts, false);
+    this.loops(m.body);
+    if (this.strict && !m.priv && !m.isStatic && mutating.indexOf(m.name.name).isSome() && !hasEnsures(m.contracts)) {
+      this.warn(
+        MUTATOR_NO_ENSURES,
+        m.name.span,
+        `public method \`${c.name.name}.${m.name.name}\` mutates \`this\` but has no @Ensures (strict contracts)`,
+      );
+    }
+  }
+
+  private ctor(k: CtorDecl, fields: FieldTy[]): void {
+    let ps: Param[] = [];
+    for (const p of k.params) {
+      ps.push(Param { name: p.name, ty: p.ty, span: p.span });
+    }
+    this.clauses(Scope { params: ps, ret: None, fields: fields, isMethod: true }, k.contracts, true);
+    this.loops(k.body);
+  }
+
+  private cls(c: ClassDecl): void {
+    const fields = classFields(c);
+    this.invariants(Scope { params: [], ret: None, fields: fields, isMethod: false }, c.contracts);
+    if (this.strict && fields.length > 0 && !hasInvariant(c.contracts)) {
+      this.warn(
+        CLASS_NO_INVARIANT,
+        c.name.span,
+        `class \`${c.name.name}\` has state but no @Invariant (strict contracts)`,
+      );
+    }
+    let mutating: string[] = [];
+    if (this.strict) {
+      mutating = mutatingMethods(c);
+    }
+    for (const m of c.members) {
+      match (m) {
+        MCtor(k) => { this.ctor(k, fields); },
+        MMethod(md) => { this.method(c, md, fields, mutating); },
+        _ => {}
+      }
+    }
+  }
+
+  // Scans one top-level item; findings are only ever added.
+  @Ensures(this.out.length >= old(this.out.length))
+  item(it: Item): void {
+    match (it) {
+      IFunction(f) => { this.func(f); },
+      IType(t) => { this.record(t); },
+      IClass(c) => { this.cls(c); },
+      _ => {}
+    }
+  }
+}
+
+// The contract-quality warnings of every user unit of `prog` (std and prelude units, whose names start
+// with `$`, are skipped). Without `strict` no W047x warning is produced.
+@Ensures(allWarnings(result))
+@Ensures(strict || !anyStrictCode(result))
+export function qualityWarnings(prog: LoadedProgram, sm: SourceMap, strict: bool): Diagnostic[] {
+  let scan = new QualityScan(sm, strict);
+  for (const u of prog.units) {
+    if (u.name.startsWith("$")) {
+      continue;
+    }
+    for (const it of u.ast.items) {
+      scan.item(it);
+    }
+  }
+  return scan.warnings();
+}
+
+// True when clause `c` of function `f` is syntactically trivially true (W0452): `orin verify --contracts`
+// does not repeat such a clause as a solver finding.
+export function isSyntacticallyTrivial(f: FunctionDecl, c: ContractClause): bool {
+  const sc = Scope { params: f.params, ret: f.ret, fields: [], isMethod: false };
+  return match (c.expr) {
+    Some(e) => findTrivial(sc, e).isSome(),
+    None => false
+  };
+}
+
+// True when strict contract coverage is on for `prog`: asked for on the command line or by the
+// manifest (`[contracts] strict = true`).
+export function strictContracts(prog: LoadedProgram, flag: bool): bool {
+  return match (prog.manifest) {
+    Some(m) => flag || m.strictContracts,
+    None => flag
+  };
+}

@@ -28,6 +28,7 @@ import {
   CRequires, CEnsures, CDecreases, CRule
 } from "../syntax";
 import { LoadedProgram } from "../loader";
+import { isSyntacticallyTrivial } from "../check";
 import { writeFile, readFile } from "std:fs";
 import { shellRun } from "../lsp";
 import { jsonString } from "../tools";
@@ -50,7 +51,16 @@ export type Res = {
   status: string; reason: string; cex: string[];
 };
 
-export type Report = { results: Res[]; };
+// A contract-quality finding proved by the solver (ADR-0028). `status` is the status of the *finding*:
+// `VERIFIED` means the solver proved the clause is vacuous (tautology / unsatisfiable / implied by the
+// preconditions). Unproved candidates are not reported at all.
+export type QWarn = { code: string; fn: string; file: string; line: usize; kind: string; clause: string; message: string; status: string; };
+
+export type Report = { results: Res[]; warnings: QWarn[]; };
+
+const W_TAUTOLOGY: string = "W0460";
+const W_UNSAT_REQUIRES: string = "W0461";
+const W_IMPLIED_ENSURES: string = "W0462";
 
 function lineOf(text: string, off: usize): usize {
   let line: usize = 1;
@@ -688,7 +698,7 @@ function prelude(): string {
     + "(define-fun trem ((a Int) (b Int)) Int (- a (* b (tdiv a b))))\n";
 }
 
-type Rt = { fns: FnInfo[]; z3: string; qn: usize; out: Res[]; };
+type Rt = { fns: FnInfo[]; z3: string; qn: usize; out: Res[]; warns: QWarn[]; };
 type Solved = { status: string; model: string; };
 
 // Runs the solver on `query` (SMT-LIB text without check-sat); status is `unsat`, `sat`, `unknown` or
@@ -818,6 +828,111 @@ function report(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, kind: strin
   }
 }
 
+// ---------------------------------------------------------------------------
+// Contract quality (ADR-0028): vacuous clauses, proved by the solver
+// ---------------------------------------------------------------------------
+
+type Entail = { rt: Rt; holds: bool; };
+
+// True (`holds`) exactly when the solver proves `goal` from the facts of `g` and the assumptions `base`
+// (`unsat` of the negation). `sat`, `unknown` and solver errors are all "not proved": a finding needs a proof.
+function entails(fs: FsGrant, proc: ProcessGrant, rt0: Rt, g: Gen, base: string[], goal: string): Entail {
+  let rt = rt0;
+  const s = solve(fs, proc, rt, queryText(g, base, [], goal));
+  rt.qn += 1;
+  return match (s) {
+    Ok(r) => Entail { rt: rt, holds: r.status == "unsat" },
+    Err(_) => Entail { rt: rt, holds: false }
+  };
+}
+
+function pushWarn(rt0: Rt, f: FnInfo, code: string, kind: string, c: ContractClause, message: string): Rt {
+  let rt = rt0;
+  rt.warns.push(QWarn {
+    code: code, fn: f.decl.name.name, file: f.file, line: lineOf(f.text, c.span.start), kind: kind,
+    clause: clauseText(f.text, c), message: message, status: "VERIFIED"
+  });
+  return rt;
+}
+
+// The contract-quality checks of one function in the supported fragment. They concern the clauses only
+// (not the body), so they run before the body is examined. A clause the fragment cannot translate is skipped
+// silently: a warning is only issued with a solver proof.
+//   W0460  clause valid with no premises (parameters in the i64 range only): it cannot fail
+//   W0461  the @Requires clauses together are unsatisfiable: the function can never be called
+//   W0462  an @Ensures that follows from the @Requires alone, whatever the result is: the body cannot violate it
+function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: string[], rty: int): Rt {
+  let rt = rt0;
+  const d = f.decl;
+  const reqs = clausesOf(d, 0);
+  const enss = clausesOf(d, 1);
+  const cx = Cx { fns: rt.fns, res: None, ens: false, body: true, text: f.text };
+  let reqTerms: string[] = [];
+  for (const c of reqs) {
+    const e = exprOf(c);
+    if (e.isNone()) {
+      continue;
+    }
+    const t = tr(g, vars, [], cx, e.unwrap());
+    if (t.isErr() || t.unwrap().ty != 1) {
+      return rt;
+    }
+    reqTerms.push(t.unwrap().t);
+    if (!isSyntacticallyTrivial(d, c)) {
+      const r = entails(fs, proc, rt, g, rangeBase, t.unwrap().t);
+      rt = r.rt;
+      if (r.holds) {
+        rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Requires` is valid without any premises: it excludes no input and catches no bug");
+      }
+    }
+  }
+  const withReqs = concat(rangeBase, reqTerms);
+  if (reqTerms.length > 0) {
+    const u = entails(fs, proc, rt, g, withReqs, "false");
+    rt = u.rt;
+    if (u.holds) {
+      return pushWarn(rt, f, W_UNSAT_REQUIRES, "unsatisfiable-requires", reqs[0], "the `@Requires` clauses of `" + d.name.name + "` are unsatisfiable: the function can never be called, and every `@Ensures` holds vacuously");
+    }
+  }
+  // `result` is a fresh unconstrained value: what holds for all of them cannot be violated by the body.
+  let g2 = g;
+  let res: Option<Var> = None;
+  let resBase = rangeBase;
+  if (rty >= 0) {
+    const fr = freshFree(g2, rty);
+    g2 = fr.g;
+    res = Some(Var { name: "result", term: fr.name, ty: rty });
+    if (rty == 0) {
+      resBase = concat(rangeBase, [inRange(fr.name)]);
+    }
+  }
+  const ecx = Cx { fns: rt.fns, res: res, ens: true, body: false, text: f.text };
+  for (const c of enss) {
+    const e = exprOf(c);
+    if (e.isNone()) {
+      continue;
+    }
+    const t = tr(g2, vars, [], ecx, e.unwrap());
+    if (t.isErr() || t.unwrap().ty != 1) {
+      continue;
+    }
+    const taut = entails(fs, proc, rt, g2, resBase, t.unwrap().t);
+    rt = taut.rt;
+    if (taut.holds) {
+      if (!isSyntacticallyTrivial(d, c)) {
+        rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Ensures` is valid without any premises: it holds for every result and catches no bug");
+      }
+    } else if (reqTerms.length > 0) {
+      const imp = entails(fs, proc, rt, g2, concat(resBase, reqTerms), t.unwrap().t);
+      rt = imp.rt;
+      if (imp.holds) {
+        rt = pushWarn(rt, f, W_IMPLIED_ENSURES, "implied-ensures", c, "`@Ensures` follows from the `@Requires` alone for every possible result: the body cannot violate it");
+      }
+    }
+  }
+  return rt;
+}
+
 function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo): Rt {
   let rt = rt0;
   const d = f.decl;
@@ -858,7 +973,9 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo): Rt {
   if (reqR.isErr()) {
     return allUnknown(rt, f, "@Requires: " + reqR.unwrapErr());
   }
+  const rangeBase = base;
   base = concat(base, reqR.unwrap());
+  rt = qualityChecks(fs, proc, rt, f, g, vars, rangeBase, rty);
   const exR = execStmts(g, St { vars: vars, pc: [] }, d.body.stmts, cx);
   if (exR.isErr()) {
     return allUnknown(rt, f, exR.unwrapErr());
@@ -949,13 +1066,115 @@ export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedPro
     }
   }
   shellRun(proc, "mkdir -p build/contracts-vc");
-  let rt = Rt { fns: fns, z3: z3, qn: 0, out: [] };
+  let rt = Rt { fns: fns, z3: z3, qn: 0, out: [], warns: [] };
   for (const f of fns) {
     // Functions without clauses are still analysed (their calls of contracted functions are proof
     // obligations); if they are outside the fragment nothing is reported for them.
     rt = verifyFn(fs, proc, rt, f);
   }
-  return Report { results: rt.out };
+  return Report { results: rt.out, warnings: rt.warns };
+}
+
+// ---------------------------------------------------------------------------
+// Refusal protocol (ADR-0029 §1-3): who has to act on a result
+// ---------------------------------------------------------------------------
+
+type Opt = { edit: string; changesSpec: bool; widensAuthority: bool; };
+
+// `FIX_CODE` | `STRENGTHEN_SPEC` | `NEEDS_DECISION`, or "" for a VERIFIED result (nothing to do).
+//   REFUTED call-precondition        FIX_CODE        (the caller passes an argument the callee forbids)
+//   REFUTED contract of the function NEEDS_DECISION  (the body or the contract is wrong; only a human knows which)
+//   UNKNOWN                          STRENGTHEN_SPEC (loop, missing callee contract, unsupported fragment, solver limit)
+// NEEDS_AUTHORITY does not arise here: no verification result needs a grant or a dependency rule.
+function actionOf(r: Res): string {
+  if (r.status == "REFUTED") {
+    return r.kind == "call-precondition" ? "FIX_CODE" : "NEEDS_DECISION";
+  }
+  return r.status == "UNKNOWN" ? "STRENGTHEN_SPEC" : "";
+}
+
+// The inputs of a counterexample as a condition: `x == 1 && y == 2`.
+function cexCondition(r: Res): string {
+  let parts: string[] = [];
+  for (const c of r.cex) {
+    parts.push(c.split(" = ").join(" == "));
+  }
+  return parts.join(" && ");
+}
+
+function callOf(r: Res): string {
+  let parts: string[] = [];
+  for (const c of r.cex) {
+    parts.push(c);
+  }
+  return r.fn + "(" + parts.join(", ") + ")";
+}
+
+// A precondition that excludes exactly the counterexample, or "" when there is none.
+function candidatePrecondition(r: Res): string {
+  if (r.status != "REFUTED" || r.kind == "call-precondition" || r.cex.length == 0) {
+    return "";
+  }
+  return "@Requires(!(" + cexCondition(r) + "))";
+}
+
+// The question of a NEEDS_DECISION result, one sentence a human can answer without reading the code.
+function questionOf(r: Res): string {
+  if (actionOf(r) != "NEEDS_DECISION") {
+    return "";
+  }
+  const at = r.cex.length > 0 ? callOf(r) + " violates " : r.fn + " violates ";
+  return at + r.clause + ". Is the body wrong (fix it), is this input meant to be excluded (add a precondition), or is the contract itself wrong (change it)?";
+}
+
+function optionsOf(r: Res): Opt[] {
+  let out: Opt[] = [];
+  if (actionOf(r) != "NEEDS_DECISION") {
+    return out;
+  }
+  out.push(Opt { edit: "change the body of `" + r.fn + "` so that " + r.clause + " holds for this input", changesSpec: false, widensAuthority: false });
+  const cand = candidatePrecondition(r);
+  if (cand != "") {
+    out.push(Opt { edit: "add `" + cand + "` to `" + r.fn + "` (callers must then establish it)", changesSpec: true, widensAuthority: false });
+  }
+  out.push(Opt { edit: "weaken or remove " + r.clause + " (a weaker guarantee)", changesSpec: true, widensAuthority: true });
+  return out;
+}
+
+// Contract suggestions for a STRENGTHEN_SPEC / NEEDS_DECISION result. They are suggestions, never
+// verified. UNKNOWN results carry none: the solver gives no counterexample to derive one from.
+function candidatesOf(r: Res): string[] {
+  let out: string[] = [];
+  const c = candidatePrecondition(r);
+  if (c != "") {
+    out.push(c);
+  }
+  return out;
+}
+
+function jsonBool(b: bool): string {
+  return b ? "true" : "false";
+}
+
+function jsonOptions(os: Opt[]): string {
+  let out: string[] = [];
+  for (const o of os) {
+    out.push("{\"edit\":" + jsonString(o.edit) + ",\"changes_spec\":" + jsonBool(o.changesSpec) + ",\"widens_authority\":" + jsonBool(o.widensAuthority) + "}");
+  }
+  return out.join(",");
+}
+
+function jsonAction(a: string): string {
+  return a == "" ? "null" : jsonString(a);
+}
+
+// The ADR-0029 fields of a result: `action`, `question`, `options`, `candidates`, `evidence`.
+function protocolJson(r: Res): string {
+  const loc = r.file + ":" + r.line.toString();
+  return "\"action\":" + jsonAction(actionOf(r)) + ",\"question\":" + (questionOf(r) == "" ? "null" : jsonString(questionOf(r)))
+    + ",\"options\":[" + jsonOptions(optionsOf(r)) + "],\"candidates\":[" + jsonStrings(candidatesOf(r))
+    + "],\"evidence\":{\"clause\":" + jsonString(r.clause) + ",\"location\":" + jsonString(loc) + ",\"counterexample\":["
+    + jsonStrings(r.cex) + "]}";
 }
 
 function jsonRes(r: Res): string {
@@ -970,7 +1189,7 @@ function jsonRes(r: Res): string {
   return "{\"function\":" + jsonString(r.fn) + ",\"file\":" + jsonString(r.file) + ",\"line\":" + r.line.toString()
     + ",\"kind\":" + jsonString(r.kind) + ",\"clause\":" + jsonString(r.clause) + ",\"rules\":[" + rules.join(",")
     + "],\"status\":" + jsonString(r.status) + ",\"reason\":" + jsonString(r.reason) + ",\"counterexample\":["
-    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]}";
+    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]," + protocolJson(r) + "}";
 }
 
 function jsonStrings(xs: string[]): string {
@@ -1015,6 +1234,12 @@ function assumptionsOf(r: Res): string[] {
   return none;
 }
 
+function jsonWarn(w: QWarn): string {
+  return "{\"code\":" + jsonString(w.code) + ",\"function\":" + jsonString(w.fn) + ",\"file\":" + jsonString(w.file)
+    + ",\"line\":" + w.line.toString() + ",\"kind\":" + jsonString(w.kind) + ",\"clause\":" + jsonString(w.clause)
+    + ",\"message\":" + jsonString(w.message) + ",\"status\":" + jsonString(w.status) + ",\"assumptions\":[],\"action\":\"STRENGTHEN_SPEC\"}";
+}
+
 function count(rs: Res[], status: string): usize {
   let n: usize = 0;
   for (const r of rs) {
@@ -1030,7 +1255,12 @@ export function reportJson(rep: Report): string {
   for (const r of rep.results) {
     items.push(jsonRes(r));
   }
-  return "{\"results\":[" + items.join(",") + "],\"assumptions\":[" + assumptionsJson() + "],\"summary\":{\"verified\":" + count(rep.results, "VERIFIED").toString()
+  let warns: string[] = [];
+  for (const w of rep.warnings) {
+    warns.push(jsonWarn(w));
+  }
+  return "{\"results\":[" + items.join(",") + "],\"assumptions\":[" + assumptionsJson() + "],\"warnings\":[" + warns.join(",")
+    + "],\"summary\":{\"verified\":" + count(rep.results, "VERIFIED").toString()
     + ",\"refuted\":" + count(rep.results, "REFUTED").toString() + ",\"unknown\":" + count(rep.results, "UNKNOWN").toString() + "}}";
 }
 
@@ -1044,6 +1274,20 @@ export function reportText(rep: Report): string {
     if (r.cex.length > 0) {
       s += "\n    counterexample: " + r.cex.join(", ");
     }
+    if (actionOf(r) != "") {
+      s += "\n    action: " + actionOf(r);
+    }
+    if (questionOf(r) != "") {
+      s += "\n    question: " + questionOf(r);
+      let k: usize = 1;
+      for (const o of optionsOf(r)) {
+        s += "\n    option " + k.toString() + ": " + o.edit + " (changes_spec: " + jsonBool(o.changesSpec) + ", widens_authority: " + jsonBool(o.widensAuthority) + ")";
+        k += 1;
+      }
+    }
+    for (const c of candidatesOf(r)) {
+      s += "\n    candidate: " + c;
+    }
     lines.push(s);
   }
   if (count(rep.results, "VERIFIED") > 0) {
@@ -1055,6 +1299,9 @@ export function reportText(rep: Report): string {
       lines.push("  " + ids[i] + ": " + texts[i]);
       i += 1;
     }
+  }
+  for (const w of rep.warnings) {
+    lines.push("warning[" + w.code + "]  " + w.fn + ": " + w.clause + "  (" + w.file + ":" + w.line.toString() + ")\n    " + w.message + "\n    action: STRENGTHEN_SPEC");
   }
   lines.push("verified " + count(rep.results, "VERIFIED").toString() + ", refuted " + count(rep.results, "REFUTED").toString()
     + ", unknown " + count(rep.results, "UNKNOWN").toString());
