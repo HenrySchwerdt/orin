@@ -7,7 +7,8 @@ import { Span, Diagnostic, span, diag } from "../diag";
 // Token classes. Punctuation and keywords share one class each; the exact
 // spelling is in `Token.text` (e.g. KPunct with text "=>", KKeyword with text "let").
 // Reserved words (`var`, `class`, ...) are KKeyword too; the parser rejects them.
-export type TokKind = KIdent | KKeyword | KInt | KStr | KPunct | KEof;
+// KFloat (beyond Orin-B, ADR-0015): `text` is the canonical spelling, always with a `.` (`1e9` -> `1.0e9`).
+export type TokKind = KIdent | KKeyword | KInt | KFloat | KStr | KPunct | KEof;
 
 // `text`: source spelling; for KStr the unescaped bytes. `value`: integer value for KInt, else 0.
 export type Token = { kind: TokKind; text: string; span: Span; value: int; };
@@ -147,10 +148,97 @@ function lexNumber(file: usize, src: string, start: usize): Result<LexRes, Diagn
   if (v < 0) {
     return Err(diag("E0100", span(file, start, i), "integer literal does not fit in i64"));
   }
-  if (i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
-    return Err(diag("E0100", span(file, start, i + 1), "float literals are not supported in Orin-B"));
+  if (base == 16 && i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
+    return Err(diag("E0100", span(file, start, i + 1), "hexadecimal float literals are not supported"));
   }
   return Ok(LexRes { tok: mkTok(KInt, src.substring(start, i), file, start, i, v), end: i });
+}
+
+// Float literal (ADR-0015): `D+ . D+ [exp]` or `D+ exp` with exp = `(e|E) [+-]? D+`, starting at `start`
+// (the first digit). Returns None when the text at `start` is not a float literal (so it is an integer).
+function lexFloat(file: usize, src: string, start: usize): Result<Option<LexRes>, Diagnostic> {
+  const n = src.length;
+  let i = start;
+  while (i < n && isDigit(src.charCodeAt(i))) {
+    i += 1;
+  }
+  const intEnd = i;
+  let fracStart = i;
+  let fracEnd = i;
+  let hasFrac = false;
+  if (i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
+    hasFrac = true;
+    fracStart = i + 1;
+    i += 1;
+    while (i < n && isDigit(src.charCodeAt(i))) {
+      i += 1;
+    }
+    fracEnd = i;
+  }
+  let hasExp = false;
+  let expSign = "";
+  let expStart = i;
+  let expEnd = i;
+  if (i < n && (src.charCodeAt(i) == 101 || src.charCodeAt(i) == 69)) {
+    let j = i + 1;
+    let sg = "";
+    if (j < n && (src.charCodeAt(j) == 43 || src.charCodeAt(j) == 45)) {
+      sg = src.charAt(j);
+      j += 1;
+    }
+    if (j < n && isDigit(src.charCodeAt(j))) {
+      hasExp = true;
+      expSign = sg;
+      expStart = j;
+      while (j < n && isDigit(src.charCodeAt(j))) {
+        j += 1;
+      }
+      expEnd = j;
+      i = j;
+    }
+  }
+  if (!hasFrac && !hasExp) {
+    const none: Option<LexRes> = None;
+    return Ok(none);
+  }
+  if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
+    return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+  }
+  // Range: decimal magnitude of the value must not exceed 308 (no float arithmetic here, so estimate
+  // from the number of significant integer digits and the exponent).
+  let intDigits: usize = 0;
+  let seenNonZero = false;
+  let k = start;
+  while (k < intEnd) {
+    if (src.charCodeAt(k) != 48) {
+      seenNonZero = true;
+    }
+    if (seenNonZero) {
+      intDigits += 1;
+    }
+    k += 1;
+  }
+  if (hasExp) {
+    if (expEnd - expStart > 4) {
+      return Err(diag("E0100", span(file, start, i), "float literal exponent out of range"));
+    }
+    const ev = digitsValue(src, expStart, expEnd, 10);
+    if (seenNonZero && expSign != "-" && intDigits.toInt() - 1 + ev > 308) {
+      return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+    }
+  } else if (intDigits > 309) {
+    return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+  }
+  let text = src.substring(start, intEnd) + ".";
+  if (hasFrac) {
+    text += src.substring(fracStart, fracEnd);
+  } else {
+    text += "0";
+  }
+  if (hasExp) {
+    text += "e" + expSign + src.substring(expStart, expEnd);
+  }
+  return Ok(Some(LexRes { tok: mkTok(KFloat, text, file, start, i, 0), end: i }));
 }
 
 // Character code for a simple escape letter (`n t r 0 \ " '`), or -1.
@@ -234,6 +322,9 @@ function lexPunct(file: usize, src: string, start: usize): Result<LexRes, Diagno
   }
   const ch = src.charAt(start);
   let len: usize = 0;
+  if (c == 46 && isDigit(c2)) {
+    return Err(diag("E0100", span(file, start, start + 2), "a float literal needs a digit before the decimal point (write `0" + src.substring(start, start + 2) + "`)"));
+  }
   if (c == 46 && c2 == 46) {
     if (start + 2 < n && src.charCodeAt(start + 2) == 46) {
       len = 3;
@@ -273,6 +364,16 @@ export function lex(file: usize, src: string): Result<Token[], Diagnostic> {
       continue;
     }
     if (isDigit(c)) {
+      const isHex = c == 48 && i + 1 < n && (src.charCodeAt(i + 1) == 120 || src.charCodeAt(i + 1) == 88);
+      if (!isHex) {
+        const fr = lexFloat(file, src, i)?;
+        if (fr.isSome()) {
+          const f = fr.unwrap();
+          toks.push(f.tok);
+          i = f.end;
+          continue;
+        }
+      }
       const r = lexNumber(file, src, i)?;
       toks.push(r.tok);
       i = r.end;

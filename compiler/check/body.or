@@ -16,8 +16,8 @@ import {
   HPattern, Builtin, MutBuiltin
 } from "../hir";
 import {
-  Env, ValEnt, FuncInfo, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
-  isIntish, isArrayTy, isFn, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq
+  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
+  isIntish, isFloatTy, isNumeric, isArrayTy, isFn, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq
 } from "./env";
 import { classOfRec, findMethod, fieldIsPrivate } from "./classes";
 import {
@@ -70,10 +70,12 @@ function isArithOp(op: BinaryOp): bool {
   };
 }
 
-// Syntactic "untyped integer expression": adopts the type demanded by context.
+// Syntactic "untyped numeric literal expression": adopts the type demanded by context (an integer
+// literal an int type, a float literal a float type; there is no conversion between the two, ADR-0015).
 function untypedInt(e: Expr): bool {
   return match (e.kind) {
     EInt(_) => true,
+    EFloat(_) => true,
     EUnary(op, x) => match (op) { UNeg => untypedInt(x), _ => false },
     EBinary(op, l, r) => isArithOp(op) && untypedInt(l) && untypedInt(r),
     _ => false
@@ -100,13 +102,21 @@ function toBinOp(op: BinaryOp): BinOp {
 
 function intishHint(exp: Option<Type>): Option<Type> {
   return match (exp) {
-    Some(t) => isIntish(t) ? Some(t) : None,
+    Some(t) => isNumeric(t) ? Some(t) : None,
     None => None
   };
 }
 
 function hintOf(t: Type): Option<Type> {
-  return isIntish(t) ? Some(t) : None;
+  return isNumeric(t) ? Some(t) : None;
+}
+
+// Expected type of a float literal: `f32` when the context says so, else `float`.
+function expIsF32(exp: Option<Type>): bool {
+  return match (exp) {
+    Some(t) => match (t) { TyF32 => true, _ => false },
+    None => false
+  };
 }
 
 function fieldIndex(fields: FieldDef[], name: string): Option<usize> {
@@ -140,6 +150,7 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
   const span = e.span;
   return match (e.kind) {
     EInt(n) => done(fx, XInt(n), expIsUsize(exp) ? TyUsize : TyInt, span),
+    EFloat(t) => done(fx, XFloat(t), expIsF32(exp) ? TyF32 : TyFloat, span),
     EStr(s) => done(fx, XStr(s), TyString, span),
     EBool(b) => done(fx, XBool(b), TyBool, span),
     EIdent(id) => checkIdent(env, fx, id, exp, span),
@@ -155,7 +166,7 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     ERecordT(name, targs, spread, fields) => checkRecord(env, fx, span, name, Some(targs), spread, fields, exp),
     ETyApp(_, _) => Err(diag("E0400", span, "type arguments are only allowed on a call or a record literal")),
     EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp),
-    ENew(name, targs, args) => checkNew(env, fx, span, name, targs, args),
+    ENew(name, targs, args) => checkNew(env, fx, span, name, targs, args, exp),
     EThis => checkThis(fx, span),
     EArrow(ps, rte, body) => checkArrowExp(env, fx, span, ps, rte, body, exp)
   };
@@ -186,7 +197,8 @@ function constKind(lit: ConstLit): HExprKind {
   return match (lit) {
     LitInt(n) => XInt(n),
     LitStr(s) => XStr(s),
-    LitBool(b) => XBool(b)
+    LitBool(b) => XBool(b),
+    LitFloat(t) => XFloat(t)
   };
 }
 
@@ -294,6 +306,13 @@ function intLitValue(e: Expr): Option<int> {
   };
 }
 
+function isFloatHint(exp: Option<Type>): bool {
+  return match (exp) {
+    Some(t) => isFloatTy(t),
+    None => false
+  };
+}
+
 function checkNeg(env: Env, fx: FnCtx, span: Span, inner: Expr, exp: Option<Type>): Result<ExprOut, Diagnostic> {
   const lit = intLitValue(inner);
   if (lit.isSome()) {
@@ -302,11 +321,17 @@ function checkNeg(env: Env, fx: FnCtx, span: Span, inner: Expr, exp: Option<Type
     }
     return done(fx, XInt(-lit.unwrap()), TyInt, span);
   }
-  const o = checkExpr(env, fx, inner, None)?;
-  if (!isInt(o.expr.ty)) {
+  match (inner.kind) {
+    EFloat(t) => {
+      return done(fx, XFloat("-" + t), expIsF32(exp) ? TyF32 : TyFloat, span);
+    },
+    _ => {}
+  }
+  const o = checkExpr(env, fx, inner, (untypedInt(inner) && isFloatHint(exp)) ? exp : None)?;
+  if (!isInt(o.expr.ty) && !isFloatTy(o.expr.ty)) {
     return Err(diag("E0410", span, "cannot negate a value of type `" + showType(o.fx.env, o.expr.ty) + "`"));
   }
-  return done(o.fx, XUnary(UnNeg, o.expr), TyInt, span);
+  return done(o.fx, XUnary(UnNeg, o.expr), o.expr.ty, span);
 }
 
 function checkOperands(
@@ -349,7 +374,7 @@ function checkBinary(
   const p = checkOperands(env, fx, lhs, rhs, hint)?;
   const lt = p.l.ty;
   const rt = p.r.ty;
-  if (!typeEq(lt, rt) && isIntish(lt) && isIntish(rt)) {
+  if (!typeEq(lt, rt) && isNumeric(lt) && isNumeric(rt)) {
     return Err(diag(
       "E0400",
       span,
@@ -364,14 +389,14 @@ function checkBinary(
     ));
   }
   const ok = match (op) {
-    BAdd => isIntish(lt) || isString(lt),
-    BSub => isIntish(lt),
-    BMul => isIntish(lt),
-    BDiv => isIntish(lt),
+    BAdd => isIntish(lt) || isFloatTy(lt) || isString(lt),
+    BSub => isIntish(lt) || isFloatTy(lt),
+    BMul => isIntish(lt) || isFloatTy(lt),
+    BDiv => isIntish(lt) || isFloatTy(lt),
     BRem => isIntish(lt),
-    BEq => isIntish(lt) || isBool(lt) || isString(lt),
-    BNe => isIntish(lt) || isBool(lt) || isString(lt),
-    _ => isIntish(lt)
+    BEq => isIntish(lt) || isFloatTy(lt) || isBool(lt) || isString(lt),
+    BNe => isIntish(lt) || isFloatTy(lt) || isBool(lt) || isString(lt),
+    _ => isIntish(lt) || isFloatTy(lt)
   };
   if (!ok) {
     if (isFn(lt)) {
@@ -380,6 +405,11 @@ function checkBinary(
     return Err(diag("E0410", span, "operator is not defined for type `" + showType(p.fx.env, lt) + "`"));
   }
   return done(p.fx, XBinary(hop, p.l, p.r), arith ? lt : TyBool, span);
+}
+
+// `t` is a Map instance and the code being checked is not the Map prelude itself (which owns the fields).
+function outsideMapPrelude(fx: FnCtx, t: Type): bool {
+  return fx.unit.toInt() != fx.env.mapUnit && mapOrigin(fx.env, t).isSome();
 }
 
 function checkMember(env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident): Result<ExprOut, Diagnostic> {
@@ -397,8 +427,8 @@ function checkMember(env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident): 
     TyRecord(r) => {
       const def = b.fx.env.records[r];
       const io = fieldIndex(def.fields, name.name);
-      if (io.isNone()) {
-        return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
+      if (io.isNone() || (name.name != "size" && outsideMapPrelude(b.fx, t))) {
+        return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + showType(b.fx.env, t) + "`"));
       }
       const i = io.unwrap();
       checkFieldAccess(b.fx, r, name)?;
@@ -524,6 +554,12 @@ function checkArray(
       cur = he.fx;
       elemTy = he.expr.ty;
       pre[k] = Some(he.expr);
+    } else {
+      // only untyped literals: the first one decides (`int`, or `float` for a float literal)
+      const he = checkExpr(env, cur, elems[0], None)?;
+      cur = he.fx;
+      elemTy = he.expr.ty;
+      pre[0] = Some(he.expr);
     }
   }
   if (isVoid(elemTy)) {
@@ -842,6 +878,9 @@ function callIdent(
   if (g.isNone()) {
     if (id.name == "parseInt") {
       return callBuiltin(env, fx, span, "function `parseInt`", BParseInt, args);
+    }
+    if (id.name == "parseFloat") {
+      return callBuiltin(env, fx, span, "function `parseFloat`", BParseFloat, args);
     }
     if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
       return builtinCtor(env, fx, span, id.name, args, exp);
@@ -1379,6 +1418,10 @@ function methodCall(
     const b0 = bo.unwrap();
     match (b0.expr.ty) {
       TyRecord(r) => {
+        const mo = mapOrigin(b0.fx.env, b0.expr.ty);
+        if (mo.isSome()) {
+          return mapMethodCall(env, b0, span, base, name, args, exp, mo.unwrap());
+        }
         const co = classOfRec(b0.fx.env, r);
         if (co.isSome()) {
           const mo = findMethod(b0.fx.env.classes[co.unwrap()], n);
@@ -1501,6 +1544,9 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
       const p = checkPlace(env, fx, base)?;
       return match (p.place.ty) {
         TyRecord(r) => {
+          if (outsideMapPrelude(p.fx, p.place.ty)) {
+            return Err(diag("E0401", e.span, "`" + name.name + "` is read-only: a `Map` changes only through `set` and `delete`"));
+          }
           const def = p.fx.env.records[r];
           const io = fieldIndex(def.fields, name.name);
           if (io.isNone()) {
@@ -1831,6 +1877,10 @@ function assignOpOf(op: AssignOp): Option<BinOp> {
   };
 }
 
+function isRemOp(o: BinOp): bool {
+  return match (o) { OpRem => true, _ => false };
+}
+
 function isAddOp(o: BinOp): bool {
   return match (o) { OpAdd => true, _ => false };
 }
@@ -1848,7 +1898,7 @@ function stmtAssign(env: Env, fx: FnCtx, target: Expr, op: AssignOp, value: Expr
   const hop = assignOpOf(op);
   if (hop.isSome()) {
     const o = hop.unwrap();
-    const ok = isIntish(pty) || (isAddOp(o) && isString(pty));
+    const ok = isIntish(pty) || (isFloatTy(pty) && !isRemOp(o)) || (isAddOp(o) && isString(pty));
     if (!ok) {
       return Err(diag(
         "E0410",
@@ -2097,8 +2147,11 @@ function markMut(fx: FnCtx, place: Place): FnCtx {
 }
 
 function checkNew(
-  env: Env, fx: FnCtx, span: Span, name: Ident, targs: TypeExpr[], args: Expr[]
+  env: Env, fx: FnCtx, span: Span, name: Ident, targs: TypeExpr[], args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
+  if (name.name == "Map" && findType(env.units[fx.unit].scope, "Map").isNone() && env.mapUnit >= 0) {
+    return newMap(env, fx, span, targs, args, exp);
+  }
   if (targs.length > 0) {
     return Err(diag("E0408", name.span, "generic classes are not supported yet (ADR-0009)"));
   }
@@ -2717,7 +2770,27 @@ function arrayApiCall(
   if (env.prelude < 0) {
     return Err(noMethod);
   }
-  const ent = findVal(env.units[env.prelude.toUsize()].scope, fname);
+  return preludeCall(env, b, span, env.prelude.toUsize(), fname, n, noMethod, args, noPre(args.length), exp);
+}
+
+function noPre(n: usize): Option<HExpr>[] {
+  let out: Option<HExpr>[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(None);
+    i += 1;
+  }
+  return out;
+}
+
+// Call of the prelude function `fname` of unit `unit` with the checked receiver `b` as first argument and
+// `args` as the others (`argPre[i]` may hold an already checked argument). Generic functions get their type
+// arguments inferred; non-generic ones are called directly.
+function preludeCall(
+  env: Env, b: ExprOut, span: Span, unit: usize, fname: string, n: string, noMethod: Diagnostic,
+  args: Expr[], argPre: Option<HExpr>[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const ent = findVal(env.units[unit].scope, fname);
   if (ent.isNone()) {
     return Err(noMethod);
   }
@@ -2736,11 +2809,13 @@ function arrayApiCall(
         ptes.push(p.ty);
       }
       // The receiver is argument 0 (already checked; its source expression is not used).
-      let all: Expr[] = [Expr { kind: EIdent(name), span: b.expr.span }];
+      let all: Expr[] = [Expr { kind: EIdent(Ident { name: n, span: span }), span: b.expr.span }];
       let pre: Option<HExpr>[] = [Some(b.expr)];
+      let ai: usize = 0;
       for (const a of args) {
         all.push(a);
-        pre.push(None);
+        pre.push(argPre[ai]);
+        ai += 1;
       }
       const noExplicit: Option<TypeExpr[]> = None;
       const io = inferPre(
@@ -2776,4 +2851,174 @@ function arrayApiCall(
     },
     _ => Err(noMethod)
   };
+}
+
+// ---------------------------------------------------------------------------
+// Map<K, V> (spec 08 std:map, ADR-0015): methods are functions of the Map prelude (array/map.or).
+// ---------------------------------------------------------------------------
+
+type FidFx = { fx: FnCtx; fid: usize; };
+
+// Instance of the generic Map-prelude function `fname` at `tys` (a dummy id in an abstract check).
+function mapFunc(fx: FnCtx, span: Span, fname: string, tys: Type[]): Result<FidFx, Diagnostic> {
+  if (fx.abs) {
+    return Ok(FidFx { fx: fx, fid: 0 });
+  }
+  const ent = findVal(fx.env.units[fx.env.mapUnit.toUsize()].scope, fname);
+  if (ent.isSome()) {
+    match (ent.unwrap()) {
+      VGFunc(g) => {
+        const fo = instFunc(fx.env, g, tys, fx.depth + 1, span)?;
+        return Ok(FidFx { fx: withEnv(fx, fo.env), fid: fo.fid });
+      },
+      _ => {}
+    }
+  }
+  return Err(diag("E0405", span, "internal error: the Map prelude has no function `" + fname + "`"));
+}
+
+function mapKeyErr(env: Env, span: Span, kt: Type): Diagnostic {
+  return diag("E0400", span, "`Map` keys must be `int`, `usize`, `bool` or `string`, found `" + showType(env, kt) + "`");
+}
+
+// `new Map<K, V>()`; the type arguments may be omitted when the expected type is a Map.
+function newMap(
+  env: Env, fx: FnCtx, span: Span, targs: TypeExpr[], args: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  if (args.length != 0) {
+    return Err(diag("E0404", span, "`new Map` takes no arguments, found " + args.length.toString()));
+  }
+  let cur = fx;
+  let kt: Type = TyVoid;
+  let vt: Type = TyVoid;
+  if (targs.length == 2) {
+    const k = resolveFx(cur, targs[0], false)?;
+    cur = k.fx;
+    kt = k.ty;
+    const v = resolveFx(cur, targs[1], false)?;
+    cur = v.fx;
+    vt = v.ty;
+  } else if (targs.length == 0) {
+    let found = false;
+    match (exp) {
+      Some(t) => {
+        const mo = mapOrigin(cur.env, t);
+        if (mo.isSome()) {
+          kt = mo.unwrap().args[0];
+          vt = mo.unwrap().args[1];
+          found = true;
+        }
+      },
+      None => {}
+    }
+    if (!found) {
+      return Err(diag(
+        "E0407", span,
+        "cannot infer the type arguments of `new Map()`; write `new Map<K, V>()` or add a type annotation"
+      ));
+    }
+  } else {
+    return Err(diag("E0400", span, "`Map` takes exactly two type arguments"));
+  }
+  if (!isMapKeyType(kt)) {
+    return Err(mapKeyErr(cur.env, span, kt));
+  }
+  const gm = mapGenType(cur.env, "Map").unwrap();
+  const inst = instType(cur.env, gm, [kt, vt], 0, span)?;
+  cur = withEnv(cur, inst.env);
+  const fo = mapFunc(cur, span, "mapNew", [kt, vt])?;
+  return done(fo.fx, XCall(fo.fid, noExprs()), inst.ty, span);
+}
+
+function mapMethodCall(
+  env: Env, b: ExprOut, span: Span, base: Expr, name: Ident, args: Expr[], exp: Option<Type>, inst: Inst
+): Result<ExprOut, Diagnostic> {
+  const n = name.name;
+  const unit = b.fx.env.mapUnit.toUsize();
+  const noMethod = diag("E0405", name.span, "no method `" + n + "` on type `" + showType(b.fx.env, b.expr.ty) + "`");
+  let fname = "";
+  if (n == "get") {
+    fname = "mapGet";
+  } else if (n == "has") {
+    fname = "mapHas";
+  } else if (n == "keys") {
+    fname = "mapKeys";
+  } else if (n == "values") {
+    fname = "mapValues";
+  } else if (n == "entries") {
+    fname = "mapEntries";
+  }
+  if (fname != "") {
+    return preludeCall(env, b, span, unit, fname, n, noMethod, args, noPre(args.length), exp);
+  }
+  if (n == "set" || n == "delete") {
+    return mapMutCall(env, b, span, base, name, args, inst);
+  }
+  return Err(noMethod);
+}
+
+// `m.set(k, v)` / `m.delete(k)`: the receiver is a mutable place; the call becomes `m = mapSet(m, k, v)`
+// (a statement hoisted before the current one, like mutating class methods, ADR-0009).
+function mapMutCall(
+  env: Env, b: ExprOut, span: Span, base: Expr, name: Ident, args: Expr[], inst: Inst
+): Result<ExprOut, Diagnostic> {
+  const n = name.name;
+  const isSet = n == "set";
+  const kt = inst.args[0];
+  const vt = inst.args[1];
+  const params: Type[] = isSet ? [kt, vt] : [kt];
+  if (!isPlaceShaped(b.fx, base)) {
+    return Err(diag(
+      "E0401",
+      base.span,
+      "receiver of `" + n + "` must be a mutable place (a `let` variable, field or element)"
+    ));
+  }
+  const pi = checkPlace(env, b.fx, base)?;
+  if (!pi.mutable) {
+    return Err(diag(
+      "E0401",
+      base.span,
+      "cannot call `" + n + "` on `" + pi.rootName + "`: it is not declared with `let`"
+    ));
+  }
+  const a = argsExpect(env, markMut(pi.fx, pi.place), span, "method `" + n + "`", args, params)?;
+  let fx = a.fx;
+  if (fx.probe) {
+    if (isSet) {
+      return Ok(ExprOut { fx: fx, expr: nopExpr(span) });
+    }
+    return done(fx, XBool(false), TyBool, span);
+  }
+  if (!purePlace(pi.place)) {
+    return Err(diag(
+      "E0408",
+      base.span,
+      "the receiver of `" + n + "` must not contain index expressions with side effects"
+    ));
+  }
+  const mapTy = b.expr.ty;
+  const kv: Type[] = [kt, vt];
+  if (isSet) {
+    const fo = mapFunc(fx, span, "mapSet", kv)?;
+    fx = fo.fx;
+    const call = mk(XCall(fo.fid, [b.expr, a.args[0], a.args[1]]), mapTy, span);
+    fx.pre.push(HAssign(pi.place, None, call));
+    return Ok(ExprOut { fx: fx, expr: nopExpr(span) });
+  }
+  // delete: the key is evaluated once into a temporary; the result is `has` taken before the removal.
+  const hasF = mapFunc(fx, span, "mapHas", kv)?;
+  const delF = mapFunc(hasF.fx, span, "mapDelete", kv)?;
+  fx = delF.fx;
+  const kl = newLocal(fx, "$k" + fx.tmps.toString(), kt, false);
+  fx = kl.fx;
+  fx.tmps += 1;
+  const rl = newLocal(fx, "$r" + fx.tmps.toString(), TyBool, false);
+  fx = rl.fx;
+  fx.tmps += 1;
+  const kx = mk(XLocal(kl.id), kt, span);
+  fx.pre.push(HLet(kl.id, a.args[0]));
+  fx.pre.push(HLet(rl.id, mk(XCall(hasF.fid, [b.expr, kx]), TyBool, span)));
+  fx.pre.push(HAssign(pi.place, None, mk(XCall(delF.fid, [b.expr, kx]), mapTy, span)));
+  return done(fx, XLocal(rl.id), TyBool, span);
 }

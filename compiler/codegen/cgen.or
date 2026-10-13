@@ -82,6 +82,7 @@ function larm(a: HArm): string[] {
 function lexpr(e: HExpr): string[] {
   return match (e.kind) {
     XInt(_) => [],
+    XFloat(_) => [],
     XBool(_) => [],
     XStr(s) => [s],
     XLocal(_) => [],
@@ -155,10 +156,54 @@ function signature(name: string, f: Function): string {
 // The legacy backend (--legacy-codegen) predates closures (ADR-0011) and does not implement them.
 // Lifted closure functions (arrow bodies, function-value wrappers) are named `...$closure<N>` /
 // `...$closure`; a program that has one is rejected by the driver with an internal-error message.
+function hasFloat(t: Type): bool {
+  return match (t) {
+    TyFloat => true,
+    TyF32 => true,
+    TyArray(e) => hasFloat(e),
+    TyOption(e) => hasFloat(e),
+    TyResult(a, b) => hasFloat(a) || hasFloat(b),
+    TyFn(ps, r) => {
+      for (const p of ps) {
+        if (hasFloat(p)) {
+          return true;
+        }
+      }
+      return hasFloat(r);
+    },
+    _ => false
+  };
+}
+
+// The legacy backend supports neither closures (ADR-0011) nor floats (ADR-0015).
 export function supportsLegacy(prog: Program): bool {
   for (const f of prog.functions) {
     if (f.name.includes("$closure")) {
       return false;
+    }
+    if (hasFloat(f.ret)) {
+      return false;
+    }
+    for (const l of f.locals) {
+      if (hasFloat(l.ty)) {
+        return false;
+      }
+    }
+  }
+  for (const r of prog.records) {
+    for (const fl of r.fields) {
+      if (hasFloat(fl.ty)) {
+        return false;
+      }
+    }
+  }
+  for (const u of prog.unions) {
+    for (const v of u.variants) {
+      for (const t of v.payload) {
+        if (hasFloat(t)) {
+          return false;
+        }
+      }
     }
   }
   return true;

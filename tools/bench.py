@@ -169,14 +169,14 @@ def main():
         os.makedirs(os.path.join(ROOT, out), exist_ok=True)
         builds = {
             "orin": [[orinc, "compile", src + "/main.or", "-o", out + "/orin.c"],
-                     ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "-o", out + "/orin"]],
+                     ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "-lm", "-o", out + "/orin"]],
             "go": [["go", "build", "-o", out + "/go", src + "/main.go"]],
-            "c": [["cc"] + CFLAGS + [src + "/main.c", "-o", out + "/c"]],
+            "c": [["cc"] + CFLAGS + [src + "/main.c", "-lm", "-o", out + "/c"]],
         }
         if HAVE_CLANG:
             builds["llvm"] = [[orinc, "compile", src + "/main.or", "--backend=llvm", "-o", out + "/orin_llvm.ll"],
                               ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c",
-                                                    "runtime/orin_runtime_llvm.c", "-o", out + "/llvm"]]
+                                                    "runtime/orin_runtime_llvm.c", "-lm", "-o", out + "/llvm"]]
         res = {}
         for lang, cmds in builds.items():
             bt = timed_build(cmds)

@@ -25,6 +25,8 @@ PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("te
                 # these pin Stage 0's rejection of arrow functions, which Stage 1 now accepts
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
                 os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or")}
+# Stage 1 accepts float literals (ADR-0015); these edge cases pin Stage 0's rejection only.
+FLOAT_SKIP = {"err0100_bad_float.or", "err0100_bad_float_in_expr.or", "err0100_bad_float_second_line.or"}
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ERR = re.compile(r"^(?:.*?):(\d+):(\d+): error\[(E\d{4})\]")
 TIMEOUT = 30
@@ -86,7 +88,7 @@ def collect(extra):
             for n in fn:
                 if n.endswith(".or"):
                     files.append(os.path.join(dp, n))
-    files = [f for f in files if os.path.basename(f) not in CLASS_SYNTAX_SKIP
+    files = [f for f in files if os.path.basename(f) not in CLASS_SYNTAX_SKIP | FLOAT_SKIP
              and os.path.relpath(f, ROOT) not in PRELUDE_SKIP]
     return sorted(set(os.path.relpath(f, ROOT) if f.startswith(ROOT) else f for f in files))
 

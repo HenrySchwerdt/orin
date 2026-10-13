@@ -12,11 +12,11 @@
 
 ## Numerics
 
-Integer literals adopt an expected integer type if representable; otherwise default to `int`. Floating literals adopt a compatible expected float type if representable under the accepted literal rules; otherwise default to `float`. **OPEN:** exact literal-rounding semantics for `f32` and `f64` (round-to-nearest is the candidate).
+Integer literals adopt an expected integer type if representable; otherwise default to `int`. Floating literals adopt a compatible expected float type if representable under the accepted literal rules; otherwise default to `float`. Float literals are `1.5`, `1e9`, `2.5e-3` (no `.5`/`1.`); a literal is rounded to nearest (an `f32` literal via binary64, i.e. twice). There is no int/float literal coercion. Implemented in the self-hosted compiler: ADR-0015.
 
 No implicit casts between already-typed numeric values. Ordinary integer arithmetic is checked; overflow/zero-divide causes a *defined trap* rather than UB. Use `checkedAdd` (returns `Option<T>`), `wrappingAdd`, etc. where defined. The compiler can remove checks only when it proves them redundant. No silent truncation.
 
-`float` follows defined IEEE-754 behavior, including NaN/infinities. Monetary APIs SHOULD use integer minor units or a separately designed decimal abstraction, not floating-point approximations.
+`float` follows defined IEEE-754 behavior, including NaN/infinities (no traps; `NaN != NaN`; no `%`); `f.toInt()` truncates and traps on NaN/out-of-range; `toString` prints the shortest round-tripping digits (ADR-0015). Monetary APIs SHOULD use integer minor units or a separately designed decimal abstraction, not floating-point approximations.
 
 ## Type system
 

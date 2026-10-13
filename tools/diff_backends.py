@@ -63,7 +63,7 @@ def build_and_run(args, name, entry, tag, extra, llvm=False):
     srcs = [os.path.join("runtime", "orin_runtime.c")]
     if llvm:
         srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
-    rc, _, err = sh(cc + [c] + srcs + ["-o", exe], 120)
+    rc, _, err = sh(cc + [c] + srcs + ["-lm", "-o", exe], 120)
     if rc != 0:
         return ("cc-fail", err.decode("utf-8", "replace")[:300])
     rc, out, _ = sh([os.path.join(ROOT, exe)], 10)

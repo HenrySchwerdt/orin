@@ -2,7 +2,8 @@
 // same trap messages, same ownership operations. Output is deterministic for a given MIR.
 //
 // Scheme:
-//   * int, usize and bool are i64 (usize compares unsigned); references are `ptr`.
+//   * int, usize and bool are i64 (usize compares unsigned); float / f32 are `double` (ADR-0015: slots
+//     hold the bit pattern, stored and loaded as `double` directly); references are `ptr`.
 //   * every MIR local is an `alloca` in a synthetic `entry` block (LLVM's mem2reg/SROA builds SSA);
 //     MIR block i is the LLVM block `B<i>`. Instructions that need control flow inside a block
 //     (unwrap_or) add extra blocks with unique names derived from the instruction position.
@@ -43,10 +44,18 @@ function isUsizeT(t: MType): bool {
   };
 }
 
+function isFloatT(t: MType): bool {
+  return match (t) {
+    MFloat => true,
+    _ => false
+  };
+}
+
 function lty(t: MType): string {
   return match (t) {
     MVoid => "void",
     MRef => "ptr",
+    MFloat => "double",
     _ => "i64"
   };
 }
@@ -273,6 +282,16 @@ function declares(): string {
     "declare ptr @orin_int_to_string(i64)",
     "declare ptr @orin_usize_to_string(i64)",
     "declare ptr @orin_bool_to_string(i64)",
+    "declare ptr @orin_parse_float(ptr)",
+    "declare ptr @orin_float_to_string(double)",
+    "declare ptr @orin_f32_to_string(double)",
+    "declare i64 @orin_float_to_int(double)",
+    "declare double @llvm.floor.f64(double)",
+    "declare double @llvm.ceil.f64(double)",
+    "declare double @llvm.round.f64(double)",
+    "declare double @llvm.sqrt.f64(double)",
+    "declare double @llvm.fabs.f64(double)",
+    "declare double @llvm.pow.f64(double, double)",
     "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)",
     "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)",
     "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)",
@@ -291,6 +310,7 @@ function opTy(fx: Fx, o: Operand): MType {
     OInt(_) => MInt,
     OUsize(_) => MUsize,
     OBool(_) => MBool,
+    OFloat(_) => MFloat,
     OStr(_) => MRef
   };
 }
@@ -302,6 +322,7 @@ function ov(p: string, n: usize, o: Operand): string {
     OInt(v) => v.toString(),
     OUsize(v) => v.toString(),
     OBool(b) => b ? "1" : "0",
+    OFloat(t) => t,
     OStr(i) => "@orin_s" + u(i)
   };
 }
@@ -351,11 +372,14 @@ function asSlot(fx: Fx, p: string, n: usize, o: Operand): string {
   if (isRefT(opTy(fx, o))) {
     return "  " + p + "q" + u(n) + " = ptrtoint ptr " + ov(p, n, o) + " to i64\n";
   }
+  if (isFloatT(opTy(fx, o))) {
+    return "  " + p + "q" + u(n) + " = bitcast double " + ov(p, n, o) + " to i64\n";
+  }
   return "";
 }
 
 function slotVal(fx: Fx, p: string, n: usize, o: Operand): string {
-  if (isRefT(opTy(fx, o))) {
+  if (isRefT(opTy(fx, o)) || isFloatT(opTy(fx, o))) {
     return p + "q" + u(n);
   }
   return ov(p, n, o);
@@ -407,8 +431,37 @@ function cmpPred(op: BinOp, usz: bool): string {
   };
 }
 
+function fcmpPred(op: BinOp): string {
+  return match (op) {
+    OpEq => "oeq",
+    OpNe => "une",
+    OpLt => "olt",
+    OpLe => "ole",
+    OpGt => "ogt",
+    _ => "oge"
+  };
+}
+
+// IEEE operations on doubles: no traps; `!=` is true for NaN (une), every other comparison false.
+function binaryF(fx: Fx, p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
+  const va = ov(p, 0, a);
+  const vb = ov(p, 1, b);
+  const r = p + "r";
+  const pre = ld(fx, p, 0, a) + ld(fx, p, 1, b);
+  return pre + match (op) {
+    OpAdd => "  " + r + " = fadd double " + va + ", " + vb + "\n" + st(fx, d, r),
+    OpSub => "  " + r + " = fsub double " + va + ", " + vb + "\n" + st(fx, d, r),
+    OpMul => "  " + r + " = fmul double " + va + ", " + vb + "\n" + st(fx, d, r),
+    OpDiv => "  " + r + " = fdiv double " + va + ", " + vb + "\n" + st(fx, d, r),
+    _ => "  " + p + "c = fcmp " + fcmpPred(op) + " double " + va + ", " + vb + "\n  " + r + " = zext i1 " + p + "c to i64\n" + st(fx, d, r)
+  };
+}
+
 function binaryI(fx: Fx, p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
   const t = opTy(fx, a);
+  if (isFloatT(t)) {
+    return binaryF(fx, p, d, op, a, b);
+  }
   const va = ov(p, 0, a);
   const vb = ov(p, 1, b);
   const r = p + "r";
@@ -449,6 +502,9 @@ function callBin(r: string, fn: string, a: string, b: string): string {
 function unaryI(fx: Fx, p: string, d: usize, op: UnOp, o: Operand): string {
   const v = ov(p, 0, o);
   const pre = ld(fx, p, 0, o);
+  if (isFloatT(fx.f.locals[d].ty)) {
+    return pre + "  " + p + "r = fneg double " + v + "\n" + st(fx, d, p + "r");
+  }
   return pre + match (op) {
     UnNot => "  " + p + "c = icmp eq i64 " + v + ", 0\n  " + p + "r = zext i1 " + p + "c to i64\n" + st(fx, d, p + "r"),
     UnNeg => "  " + p + "r = call i64 @orinl_" + (isUsizeT(fx.f.locals[d].ty) ? "neg_u" : "neg_i") + "(i64 " + v + ")\n" + st(fx, d, p + "r")
@@ -487,6 +543,10 @@ function bname(op: Builtin): string {
     BIntToString => "orin_int_to_string",
     BUsizeToString => "orin_usize_to_string",
     BBoolToString => "orin_bool_to_string",
+    BParseFloat => "orin_parse_float",
+    BFloatToString => "orin_float_to_string",
+    BF32ToString => "orin_f32_to_string",
+    BFloatToInt => "orin_float_to_int",
     BIntToUsize => "orinl_int_to_usize",
     BUsizeToInt => "orinl_usize_to_int",
     _ => ""
@@ -507,6 +567,7 @@ function bret(op: Builtin): string {
     BStrEndsWith => "i64",
     BIntToUsize => "i64",
     BUsizeToInt => "i64",
+    BFloatToInt => "i64",
     _ => "ptr"
   };
 }
@@ -539,6 +600,22 @@ function builtinR(fx: Fx, p: string, b: Builtin, args: Operand[], rt: MType): R 
     BOptUnwrap => unwrapR(p, "orin_opt_unwrap", a0, rt),
     BResUnwrap => unwrapR(p, "orin_res_unwrap", a0, rt),
     BResUnwrapErr => unwrapR(p, "orin_res_unwrap_err", a0, rt),
+    BIntToFloat => R { text: "  " + r + " = sitofp i64 " + a0 + " to double\n", val: r },
+    BUsizeToFloat => R { text: "  " + r + " = uitofp i64 " + a0 + " to double\n", val: r },
+    BF32Round => R { text: "  " + p + "f = fptrunc double " + a0 + " to float\n  " + r + " = fpext float " + p + "f to double\n", val: r },
+    BF32ToFloat => R { text: "", val: a0 },
+    BFloatFloor => R { text: "  " + r + " = call double @llvm.floor.f64(double " + a0 + ")\n", val: r },
+    BFloatCeil => R { text: "  " + r + " = call double @llvm.ceil.f64(double " + a0 + ")\n", val: r },
+    BFloatRound => R { text: "  " + r + " = call double @llvm.round.f64(double " + a0 + ")\n", val: r },
+    BFloatSqrt => R { text: "  " + r + " = call double @llvm.sqrt.f64(double " + a0 + ")\n", val: r },
+    BFloatAbs => R { text: "  " + r + " = call double @llvm.fabs.f64(double " + a0 + ")\n", val: r },
+    BFloatPow => R { text: "  " + r + " = call double @llvm.pow.f64(double " + a0 + ", double " + ov(p, 1, args[1]) + ")\n", val: r },
+    BFloatIsNaN => R { text: "  " + p + "c = fcmp uno double " + a0 + ", " + a0 + "\n  " + r + " = zext i1 " + p + "c to i64\n", val: r },
+    BFloatIsFinite => R {
+      text: "  " + p + "a = call double @llvm.fabs.f64(double " + a0 + ")\n  " + p + "c = fcmp olt double " + p + "a, 0x7FF0000000000000\n  "
+        + r + " = zext i1 " + p + "c to i64\n",
+      val: r
+    },
     _ => unwrapOrR(fx, p, a0, args[1], rt)
   };
 }
@@ -557,12 +634,15 @@ function tagIs(p: string, a0: string, k: usize): R {
 
 function unwrapR(p: string, fn: string, a0: string, rt: MType): R {
   const call = "  " + p + "r = call i64 @" + fn + "(ptr " + a0 + ")\n";
+  if (isFloatT(rt)) {
+    return R { text: call + "  " + p + "f = bitcast i64 " + p + "r to double\n", val: p + "f" };
+  }
   const d = dupIf(rt, p, p + "r");
   return R { text: call + d.text, val: d.val };
 }
 
 function unwrapOrR(fx: Fx, p: string, a0: string, dflt: Operand, rt: MType): R {
-  const ty = isRefT(rt) ? "ptr" : "i64";
+  const ty = isRefT(rt) ? "ptr" : (isFloatT(rt) ? "double" : "i64");
   const lt = lbl(p, "Lt");
   const lf = lbl(p, "Lf");
   const lj = lbl(p, "Lj");
@@ -683,7 +763,7 @@ function replaceI(fx: Fx, p: string, slot: string, n: usize, v: Operand): string
   if (isRefT(opTy(fx, v))) {
     return "  " + p + "old = load ptr, ptr " + slot + "\n  store ptr " + ov(p, n, v) + ", ptr " + slot + "\n  call void @orinl_release(ptr " + p + "old)\n";
   }
-  return "  store i64 " + ov(p, n, v) + ", ptr " + slot + "\n";
+  return "  store " + lty(opTy(fx, v)) + " " + ov(p, n, v) + ", ptr " + slot + "\n";
 }
 
 function instrI(fx: Fx, p: string, i: Instr): string {
@@ -779,7 +859,7 @@ function genFunction(fx: Fx, name: string): string {
     const t = lty(f.locals[i].ty);
     out.push("  %l" + u(i) + " = alloca " + t + ", align 8\n");
     if (i >= f.paramCount) {
-      out.push("  store " + t + " " + (isRefT(f.locals[i].ty) ? "null" : "0") + ", ptr %l" + u(i) + "\n");
+      out.push("  store " + t + " " + (isRefT(f.locals[i].ty) ? "null" : (isFloatT(f.locals[i].ty) ? "0.0" : "0")) + ", ptr %l" + u(i) + "\n");
     }
     i += 1;
   }

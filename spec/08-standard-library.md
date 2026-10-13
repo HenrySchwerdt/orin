@@ -10,13 +10,13 @@ Use **JavaScript/TypeScript-familiar names** and predictably typed signatures. A
 |---|---|---|
 | `std:array` | `map`, `filter`, `find`, `reduce`, `some`, `every`, `get`, `sort` | `find/get: Option<T>` |
 | `std:string` | `split`, `trim`, `includes`, `replace`, `toLowerCase`, `join` | fallible variants return `Result` |
-| `std:map` | `get`, `set`, `has`, `delete`, `keys`, `values` | `get: Option<V>` |
+| `std:map` | `new Map<K,V>()`, `get`, `set`, `has`, `delete`, `size`, `keys`, `values`, `entries` (built in, no import; keys int/usize/bool/string; insertion order; value semantics; Orin prelude `array/map.or`, ADR-0015) | `get: Option<V>` |
 | `std:json` | `parse<T>`, `stringify` | `Result<_, JsonError>` where fallible |
 | `std:fs` | `readFile`, `writeFile`, `exists` | `Result<_, FileError>` |
 | `std:path` | `join`, `basename`, `extension` | typed, platform-aware |
 | `std:http` | `get`, `post`, `serve` | `Result<_, HttpError>` |
 | `std:time` | `now`, `sleep`, `duration` | explicit units |
-| `std:math` | `min`, `max`, `abs`, `sqrt` | explicitly defined edge cases |
+| `std:math` | `min`, `max`, `abs`, `sqrt`, `pow`, `floor`, `ceil`, `round`, `PI`, `E` (float only; `array/math.or`, ADR-0015) | IEEE edge cases defined in the file header |
 | `std:task` | `spawn`, `all`, `parallelMap` | isolated tasks/errors |
 | `std:system` | safe native buffers, handles, atomics | isolated trusted implementation |
 

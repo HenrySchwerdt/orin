@@ -132,7 +132,7 @@ def run_test(args, label, test):
         cc = [args.cc, "-O1", "-w", "-I", "runtime"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    cc += [c_out] + runtime_sources(args.backend) + ["-o", exe]
+    cc += [c_out] + runtime_sources(args.backend) + ["-lm", "-o", exe]
     rc, _, err = run_cmd(cc, COMPILE_TIMEOUT)
     if rc != 0:
         return tag, False, "C compilation failed (exit %s); stderr head:\n%s" % (rc, head(err))

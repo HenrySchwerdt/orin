@@ -11,7 +11,7 @@ import { Ident, TypeExpr, TNamed, TArray, TFn, TypeDeclBody, DAlias, DRecord, DU
 import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import {
   Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, findType, findInst, originOf, isVoid,
-  tysKey
+  tysKey, mapGenType, isMapKeyType, showType
 } from "./env";
 
 export const CYCLE_MSG: string = "type alias is defined in terms of itself";
@@ -126,6 +126,10 @@ function resolveNamed(
     b = Some(TyUsize);
   } else if (n == "bool") {
     b = Some(TyBool);
+  } else if (n == "float") {
+    b = Some(TyFloat);
+  } else if (n == "f32") {
+    b = Some(TyF32);
   } else if (n == "string") {
     b = Some(TyString);
   } else if (n == "void") {
@@ -158,6 +162,12 @@ function resolveNamed(
   }
   const found = findType(env.units[sc.unit].scope, n);
   if (found.isNone()) {
+    if (n == "Map" || n == "MapEntry") {
+      const mg = mapGenType(env, n);
+      if (mg.isSome()) {
+        return resolveMapType(env, sc, te, name, mg.unwrap(), args, stack);
+      }
+    }
     return Err(diag("E0300", name.span, "unknown type `" + n + "`"));
   }
   return match (found.unwrap()) {
@@ -181,6 +191,25 @@ function resolveNamed(
     },
     EntGen(g) => resolveGeneric(env, sc, te, name, g, args, stack)
   };
+}
+
+// `Map<K, V>` / `MapEntry<K, V>` written in user code (ADR-0015): the generic records of the Map prelude;
+// the key type of a Map must be int, usize, bool or string.
+function resolveMapType(
+  env: Env, sc: TScope, te: TypeExpr, name: Ident, g: usize, args: TypeExpr[], stack: int[]
+): Result<TyOut, Diagnostic> {
+  const r = resolveGeneric(env, sc, te, name, g, args, stack)?;
+  if (name.name == "Map") {
+    const o = originOf(r.env, r.ty);
+    if (o.isSome() && o.unwrap().args.length > 0 && !isMapKeyType(o.unwrap().args[0])) {
+      return Err(diag(
+        "E0400",
+        te.span,
+        "`Map` keys must be `int`, `usize`, `bool` or `string`, found `" + showType(r.env, o.unwrap().args[0]) + "`"
+      ));
+    }
+  }
+  return Ok(r);
 }
 
 function paramNames(ps: Ident[]): string[] {
@@ -334,7 +363,38 @@ export function resolveSig(env: Env, sc: TScope, decl: FunctionDecl): Result<Sig
 
 // The function instance of generic function `g` at `args` (new function id on first use).
 // `depth` is the instantiation depth of the *new* instance.
+// `keyHash<K>` / `keyEq<K>` of the Map prelude (array/map.or) are replaced by the function of the key class
+// (`hashInt`, `eqStr`, ...): a generic body cannot hash or compare a `K` itself (ADR-0015).
+function keyClassFunc(env: Env, qname: string, args: Type[]): Option<usize> {
+  if ((qname != "$array/map.keyHash" && qname != "$array/map.keyEq") || args.length != 1) {
+    return None;
+  }
+  const suffix = match (args[0]) {
+    TyInt => "Int",
+    TyUsize => "Usize",
+    TyBool => "Bool",
+    TyString => "Str",
+    _ => ""
+  };
+  if (suffix == "") {
+    return None;
+  }
+  const target = (qname == "$array/map.keyHash" ? "$array/map.hash" : "$array/map.eq") + suffix;
+  let i: usize = 0;
+  while (i < env.funcs.length) {
+    if (env.funcs[i].qname == target) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
 export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: Span): Result<FuncOut, Diagnostic> {
+  const redirect = keyClassFunc(env, env.gfuncs[g].qname, args);
+  if (redirect.isSome()) {
+    return Ok(FuncOut { env: env, fid: redirect.unwrap() });
+  }
   const old = findInst(env, 2, g, args);
   if (old.isSome()) {
     return Ok(FuncOut { env: env, fid: old.unwrap().id });
@@ -440,6 +500,12 @@ function unifyNamed(
   }
   const found = findType(env.units[unit].scope, n);
   if (found.isNone()) {
+    if (n == "Map" || n == "MapEntry") {
+      const mg = mapGenType(env, n);
+      if (mg.isSome()) {
+        return unifyGeneric(env, unit, mg.unwrap(), args, actual, tp, b);
+      }
+    }
     return b;
   }
   return match (found.unwrap()) {
