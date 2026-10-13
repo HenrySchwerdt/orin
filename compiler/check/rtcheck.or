@@ -23,17 +23,21 @@
 
 import { Span, SourceMap } from "../diag";
 import {
-  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeExpr, TNamed, Block, Stmt, StmtKind, Expr, ExprKind,
+  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDeclBody, DRecord, TypeExpr, TNamed, Block, Stmt, StmtKind, Expr, ExprKind,
   EInt, ETemplate, EStr, EIdent, ECall, EMember, EUnary, EBinary, EThis, ETyApp, EIndex, ETry, ECond, EArray,
-  ERecord, ERecordT, EMatch, ENew, EBool, FieldInit, MatchArm, ArmBody, BExpr, BBlock,
+  ERecord, ERecordT, EMatch, ENew, EBool, EArrow, ArrowParam, ArrowBody, AExpr, ABlock, FieldInit, MatchArm, ArmBody, BExpr, BBlock,
   SLet, SIf, SExpr, SReturn, SAssign, OpAssign, UNot, BAdd, BOr, BImplies,
-  IImport, IFunction, IClass, ClassDecl, ClassMember, MField, MCtor, MMethod, MethodDecl, CtorDecl,
+  IImport, IFunction, IClass, IType, TypeDecl, parse, ClassDecl, ClassMember, MField, MCtor, MMethod, MethodDecl, CtorDecl,
   ContractClause, CRequires, CEnsures, CInvariant
 } from "../syntax";
 import { LoadedProgram, Unit, ImportTarget, ImportUnit, ImportStd, StdProcess } from "../loader";
 
 const FAIL: string = "$contract$fail";
 const BODY: string = "$contract$body$";
+const SITE: string = "$contract$site$";   // checking wrapper that takes the caller's location (functions with @Requires)
+const SITE_PARAM: string = "$site";
+const REC: string = "$contract$rec$";     // invariant check of a record type
+const THIS_PARAM: string = "this$";
 
 function mkE(k: ExprKind, sp: Span): Expr {
   return Expr { kind: k, span: sp };
@@ -70,34 +74,34 @@ function ofKind(cs: ContractClause[], k: int): ContractClause[] {
 // Expression rewriting: `==>`, `old(..)`
 // ---------------------------------------------------------------------------
 
-function rwAll(es: Expr[], inOld: bool): Expr[] {
+function rwAll(es: Expr[], th: string): Expr[] {
   let out: Expr[] = [];
   for (const e of es) {
-    out.push(rw(e, inOld));
+    out.push(rw(e, th));
   }
   return out;
 }
 
-function rwFields(fs: FieldInit[], inOld: bool): FieldInit[] {
+function rwFields(fs: FieldInit[], th: string): FieldInit[] {
   let out: FieldInit[] = [];
   for (const f of fs) {
-    out.push(FieldInit { name: f.name, value: rw(f.value, inOld), span: f.span });
+    out.push(FieldInit { name: f.name, value: rw(f.value, th), span: f.span });
   }
   return out;
 }
 
-function rwSpread(o: Option<Expr>, inOld: bool): Option<Expr> {
+function rwSpread(o: Option<Expr>, th: string): Option<Expr> {
   return match (o) {
-    Some(x) => Some(rw(x, inOld)),
+    Some(x) => Some(rw(x, th)),
     None => None
   };
 }
 
-function rwArms(arms: MatchArm[], inOld: bool): MatchArm[] {
+function rwArms(arms: MatchArm[], th: string): MatchArm[] {
   let out: MatchArm[] = [];
   for (const a of arms) {
     const b = match (a.body) {
-      BExpr(x) => BExpr(rw(x, inOld)),
+      BExpr(x) => BExpr(rw(x, th)),
       BBlock(blk) => BBlock(blk)
     };
     out.push(MatchArm { pattern: a.pattern, body: b, span: a.span });
@@ -105,40 +109,51 @@ function rwArms(arms: MatchArm[], inOld: bool): MatchArm[] {
   return out;
 }
 
-// `inOld`: inside `old(..)`: `this` denotes the entry snapshot `old$this`.
-function rw(e: Expr, inOld: bool): Expr {
+// `th`: what `this` denotes ("" keeps it; inside `old(..)` it is the entry snapshot `old$this`; in a record
+// invariant check it is the parameter `this$`).
+function rw(e: Expr, th: string): Expr {
   const sp = e.span;
   return match (e.kind) {
-    EThis => inOld ? mkE(EIdent(idOf("old$this", sp)), sp) : e,
-    EUnary(op, x) => mkE(EUnary(op, rw(x, inOld)), sp),
+    EThis => th == "" ? e : mkE(EIdent(idOf(th, sp)), sp),
+    EUnary(op, x) => mkE(EUnary(op, rw(x, th)), sp),
     EBinary(op, l, r) => match (op) {
-      BImplies => mkE(EBinary(BOr, mkE(EUnary(UNot, rw(l, inOld)), l.span), rw(r, inOld)), sp),
-      _ => mkE(EBinary(op, rw(l, inOld), rw(r, inOld)), sp)
+      BImplies => mkE(EBinary(BOr, mkE(EUnary(UNot, rw(l, th)), l.span), rw(r, th)), sp),
+      _ => mkE(EBinary(op, rw(l, th), rw(r, th)), sp)
     },
-    ECall(callee, args) => rwCall(e, callee, args, inOld),
-    EMember(b, n) => mkE(EMember(rw(b, inOld), n), sp),
-    EIndex(b, i) => mkE(EIndex(rw(b, inOld), rw(i, inOld)), sp),
-    ETry(x) => mkE(ETry(rw(x, inOld)), sp),
-    ECond(c, a, b) => mkE(ECond(rw(c, inOld), rw(a, inOld), rw(b, inOld)), sp),
-    EArray(xs) => mkE(EArray(rwAll(xs, inOld)), sp),
-    ETemplate(ps, xs) => mkE(ETemplate(ps, rwAll(xs, inOld)), sp),
-    ERecord(n, spread, fs) => mkE(ERecord(n, rwSpread(spread, inOld), rwFields(fs, inOld)), sp),
-    ERecordT(n, tys, spread, fs) => mkE(ERecordT(n, tys, rwSpread(spread, inOld), rwFields(fs, inOld)), sp),
-    EMatch(s, arms) => mkE(EMatch(rw(s, inOld), rwArms(arms, inOld)), sp),
-    ENew(n, tys, args) => mkE(ENew(n, tys, rwAll(args, inOld)), sp),
+    ECall(callee, args) => rwCall(e, callee, args, th),
+    EMember(b, n) => mkE(EMember(rw(b, th), n), sp),
+    EIndex(b, i) => mkE(EIndex(rw(b, th), rw(i, th)), sp),
+    ETry(x) => mkE(ETry(rw(x, th)), sp),
+    ECond(c, a, b) => mkE(ECond(rw(c, th), rw(a, th), rw(b, th)), sp),
+    EArray(xs) => mkE(EArray(rwAll(xs, th)), sp),
+    ETemplate(ps, xs) => mkE(ETemplate(ps, rwAll(xs, th)), sp),
+    ERecord(n, spread, fs) => mkE(ERecord(n, rwSpread(spread, th), rwFields(fs, th)), sp),
+    ERecordT(n, tys, spread, fs) => mkE(ERecordT(n, tys, rwSpread(spread, th), rwFields(fs, th)), sp),
+    EMatch(s, arms) => mkE(EMatch(rw(s, th), rwArms(arms, th)), sp),
+    ENew(n, tys, args) => mkE(ENew(n, tys, rwAll(args, th)), sp),
+    EArrow(ps, rte, body) => mkE(EArrow(ps, rte, rwArrow(body, th)), sp),
     _ => e
   };
 }
 
-function rwCall(e: Expr, callee: Expr, args: Expr[], inOld: bool): Expr {
+// A closure with an expression body is rewritten like any other expression; a block body is left alone
+// (`result`, `this` and `old` inside it are not supported: docs/contracts.md).
+function rwArrow(b: ArrowBody, th: string): ArrowBody {
+  return match (b) {
+    AExpr(x) => AExpr(rw(x, th)),
+    ABlock(blk) => ABlock(blk)
+  };
+}
+
+function rwCall(e: Expr, callee: Expr, args: Expr[], th: string): Expr {
   const isOld = match (callee.kind) {
     EIdent(id) => id.name == "old" && args.length == 1,
     _ => false
   };
   if (isOld) {
-    return rw(args[0], true);
+    return rw(args[0], "old$this");
   }
-  return mkE(ECall(rw(callee, inOld), rwAll(args, inOld)), e.span);
+  return mkE(ECall(rw(callee, th), rwAll(args, th)), e.span);
 }
 
 function isEnsures(c: ContractClause): bool {
@@ -205,8 +220,98 @@ function rn(e: Expr): Expr {
     ERecordT(n, tys, spread, fs) => mkE(ERecordT(n, tys, rnSpread(spread), rnFields(fs)), sp),
     EMatch(s, arms) => mkE(EMatch(rn(s), rnArms(arms)), sp),
     ENew(n, tys, args) => mkE(ENew(n, tys, rnAll(args)), sp),
+    EArrow(ps, rte, body) => rnArrow(e, ps, rte, body),
     _ => e
   };
+}
+
+// A closure parameter called `result` hides the result: the body is left alone then.
+function rnArrow(e: Expr, ps: ArrowParam[], rte: Option<TypeExpr>, body: ArrowBody): Expr {
+  for (const p of ps) {
+    if (p.name.name == "result") {
+      return e;
+    }
+  }
+  return match (body) {
+    AExpr(x) => mkE(EArrow(ps, rte, AExpr(rn(x))), e.span),
+    ABlock(_) => e
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Old-value spans: where the `old(..)` arguments of a clause are (the HIR pass prints their values)
+// ---------------------------------------------------------------------------
+
+function spanKey(sp: Span): string {
+  return sp.file.toString() + ":" + sp.start.toString() + ":" + sp.end.toString() + ";";
+}
+
+function osAll(es: Expr[]): string {
+  let out = "";
+  for (const e of es) {
+    out = out + os(e);
+  }
+  return out;
+}
+
+function osSpread(o: Option<Expr>): string {
+  return match (o) {
+    Some(x) => os(x),
+    None => ""
+  };
+}
+
+function osFields(fs: FieldInit[]): string {
+  let out = "";
+  for (const f of fs) {
+    out = out + os(f.value);
+  }
+  return out;
+}
+
+function osArms(arms: MatchArm[]): string {
+  let out = "";
+  for (const a of arms) {
+    out = out + match (a.body) {
+      BExpr(x) => os(x),
+      BBlock(_) => ""
+    };
+  }
+  return out;
+}
+
+function os(e: Expr): string {
+  return match (e.kind) {
+    EUnary(_, x) => os(x),
+    EBinary(_, l, r) => os(l) + os(r),
+    ECall(callee, args) => osCall(callee, args),
+    EMember(b, _) => os(b),
+    EIndex(b, i) => os(b) + os(i),
+    ETry(x) => os(x),
+    ECond(c, a, b) => os(c) + os(a) + os(b),
+    EArray(xs) => osAll(xs),
+    ETemplate(_, xs) => osAll(xs),
+    ERecord(_, spread, fs) => osSpread(spread) + osFields(fs),
+    ERecordT(_, _, spread, fs) => osSpread(spread) + osFields(fs),
+    EMatch(s, arms) => os(s) + osArms(arms),
+    ENew(_, _, args) => osAll(args),
+    EArrow(_, _, body) => match (body) {
+      AExpr(x) => os(x),
+      ABlock(_) => ""
+    },
+    _ => ""
+  };
+}
+
+function osCall(callee: Expr, args: Expr[]): string {
+  const isOld = match (callee.kind) {
+    EIdent(id) => id.name == "old" && args.length == 1,
+    _ => false
+  };
+  if (isOld) {
+    return spanKey(args[0].span);
+  }
+  return os(callee) + osAll(args);
 }
 
 // ---------------------------------------------------------------------------
@@ -242,22 +347,31 @@ function mentionsOld(sm: SourceMap, cs: ContractClause[]): bool {
   return false;
 }
 
-// `if (!(e)) { $contract$fail("msg"); }` for every clause.
-function checkStmts(sm: SourceMap, cs: ContractClause[]): Stmt[] {
+// `if (!(e)) { $contract$fail("msg", site, "old spans", ""); }` for every clause. `site` is the expression
+// for the call site (an empty string, or the `$site` parameter of the checking wrapper); `th` is what
+// `this` denotes in the clause ("" = itself). The last two arguments are filled in by the HIR pass
+// (rthir.or), which knows the types: the stub `$contract$fail` has no body.
+function checkStmts(sm: SourceMap, cs: ContractClause[], site: Expr, th: string): Stmt[] {
   let out: Stmt[] = [];
   for (const c of cs) {
     match (c.expr) {
       Some(x) => {
         const sp = c.span;
         const msg = mkE(EStr(clauseMessage(sm, c)), sp);
-        const fail = mkS(SExpr(mkE(ECall(mkE(EIdent(idOf(FAIL, sp)), sp), [msg]), sp)), sp);
-        const cond = mkE(EUnary(UNot, renameResult(rw(x, false), isEnsures(c))), sp);
+        const olds = mkE(EStr(isEnsures(c) ? oldSpans(x) : ""), sp);
+        const detail = mkE(EStr(""), sp);
+        const fail = mkS(SExpr(mkE(ECall(mkE(EIdent(idOf(FAIL, sp)), sp), [msg, site, olds, detail]), sp)), sp);
+        const cond = mkE(EUnary(UNot, renameResult(rw(x, th), isEnsures(c))), sp);
         out.push(mkS(SIf(cond, Block { stmts: [fail], span: sp }, None), sp));
       },
       None => {}
     }
   }
   return out;
+}
+
+function oldSpans(e: Expr): string {
+  return os(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,16 +404,33 @@ function tyArgs(tps: Ident[]): TypeExpr[] {
   return out;
 }
 
+function stringType(sp: Span): TypeExpr {
+  return TypeExpr { kind: TNamed(idOf("string", sp), []), span: sp };
+}
+
+function siteParam(sp: Span): Param {
+  return Param { name: idOf(SITE_PARAM, sp), ty: stringType(sp), span: sp };
+}
+
+// The parameters of a checking wrapper that receives the call site: `$site: string` first.
+function withSiteParam(ps: Param[], sp: Span): Param[] {
+  let out: Param[] = [siteParam(sp)];
+  for (const p of ps) {
+    out.push(p);
+  }
+  return out;
+}
+
 // The statements of a wrapper: entry checks, the call of `callee`, exit checks, `return result`.
 function wrapperBody(
   sm: SourceMap, sp: Span, callee: Expr, params: Param[], ret: Option<TypeExpr>,
-  reqs: ContractClause[], enss: ContractClause[], invs: ContractClause[], isMethod: bool
+  reqs: ContractClause[], enss: ContractClause[], invs: ContractClause[], isMethod: bool, site: Expr
 ): Block {
   let stmts: Stmt[] = [];
   if (isMethod && mentionsOld(sm, enss)) {
     stmts.push(mkS(SLet(false, idOf("old$this", sp), None, mkE(EThis, sp)), sp));
   }
-  for (const s of checkStmts(sm, reqs)) {
+  for (const s of checkStmts(sm, reqs, site, "")) {
     stmts.push(s);
   }
   const call = mkE(ECall(callee, argExprs(params)), sp);
@@ -309,14 +440,32 @@ function wrapperBody(
   } else {
     stmts.push(mkS(SLet(false, idOf("result$", sp), None, call), sp));
   }
-  for (const s of checkStmts(sm, enss)) {
+  for (const s of checkStmts(sm, enss, site, "")) {
     stmts.push(s);
   }
-  for (const s of checkStmts(sm, invs)) {
+  for (const s of checkStmts(sm, invs, site, "")) {
     stmts.push(s);
   }
   if (!isVoid) {
     stmts.push(mkS(SReturn(Some(mkE(EIdent(idOf("result$", sp)), sp))), sp));
+  }
+  return Block { stmts: stmts, span: sp };
+}
+
+// The forwarder `f(a) { return $contract$site$f("", a); }`: the callers the HIR pass rewrites pass their
+// location instead of "" (rthir.or); function values and virtual calls keep the forwarder.
+function forwarderBody(sp: Span, callee: Expr, params: Param[], ret: Option<TypeExpr>): Block {
+  let args: Expr[] = [];
+  args.push(mkE(EStr(""), sp));
+  for (const a of argExprs(params)) {
+    args.push(a);
+  }
+  const call = mkE(ECall(callee, args), sp);
+  let stmts: Stmt[] = [];
+  if (isVoidRet(ret)) {
+    stmts.push(mkS(SExpr(call), sp));
+  } else {
+    stmts.push(mkS(SReturn(Some(call)), sp));
   }
   return Block { stmts: stmts, span: sp };
 }
@@ -336,12 +485,29 @@ function wrapFunction(sm: SourceMap, f: FunctionDecl): Wrapped {
   };
   const calleeId = mkE(EIdent(bodyName), f.name.span);
   const callee = f.typeParams.length == 0 ? calleeId : mkE(ETyApp(bodyName, tyArgs(f.typeParams)), f.name.span);
-  const wrapper = FunctionDecl {
+  if (reqs.length == 0) {
+    const wrapper = FunctionDecl {
+      exported: f.exported, name: f.name, typeParams: f.typeParams, bounds: f.bounds, params: f.params, ret: f.ret,
+      body: wrapperBody(sm, f.span, callee, f.params, f.ret, reqs, enss, [], false, mkE(EStr(""), f.span)),
+      contracts: [], annotations: f.annotations, span: f.span
+    };
+    return Wrapped { items: [IFunction(wrapper), IFunction(body)], used: true };
+  }
+  // With a @Requires: the checking wrapper takes the caller's location.
+  const siteName = idOf(SITE + f.name.name, f.name.span);
+  const siteId = mkE(EIdent(siteName), f.name.span);
+  const siteCallee = f.typeParams.length == 0 ? siteId : mkE(ETyApp(siteName, tyArgs(f.typeParams)), f.name.span);
+  const checking = FunctionDecl {
+    exported: false, name: siteName, typeParams: f.typeParams, bounds: f.bounds, params: withSiteParam(f.params, f.span), ret: f.ret,
+    body: wrapperBody(sm, f.span, callee, f.params, f.ret, reqs, enss, [], false, mkE(EIdent(idOf(SITE_PARAM, f.span)), f.span)),
+    contracts: [], annotations: [], span: f.span
+  };
+  const forwarder = FunctionDecl {
     exported: f.exported, name: f.name, typeParams: f.typeParams, bounds: f.bounds, params: f.params, ret: f.ret,
-    body: wrapperBody(sm, f.span, callee, f.params, f.ret, reqs, enss, [], false),
+    body: forwarderBody(f.span, siteCallee, f.params, f.ret),
     contracts: [], annotations: f.annotations, span: f.span
   };
-  return Wrapped { items: [IFunction(wrapper), IFunction(body)], used: true };
+  return Wrapped { items: [IFunction(forwarder), IFunction(checking), IFunction(body)], used: true };
 }
 
 type WrappedMembers = { members: ClassMember[]; used: bool; };
@@ -362,12 +528,28 @@ function wrapMethod(sm: SourceMap, cname: Ident, md: MethodDecl, invs: ContractC
   // Instance methods call the body through `this`, static methods through the class name.
   const recv = md.isStatic ? mkE(EIdent(cname), md.span) : mkE(EThis, md.span);
   const callee = mkE(EMember(recv, bodyName), md.span);
-  const wrapper = MethodDecl {
+  if (reqs.length == 0) {
+    const wrapper = MethodDecl {
+      priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, params: md.params,
+      ret: md.ret, body: wrapperBody(sm, md.span, callee, md.params, md.ret, reqs, enss, minv, !md.isStatic, mkE(EStr(""), md.span)),
+      contracts: [], annotations: md.annotations, span: md.span
+    };
+    return WrappedMembers { members: [MMethod(wrapper), MMethod(bodyM)], used: true };
+  }
+  const siteName = idOf(SITE + md.name.name, md.name.span);
+  const siteCallee = mkE(EMember(recv, siteName), md.span);
+  const checking = MethodDecl {
+    priv: true, isStatic: md.isStatic, name: siteName, typeParams: md.typeParams, params: withSiteParam(md.params, md.span),
+    ret: md.ret,
+    body: wrapperBody(sm, md.span, callee, md.params, md.ret, reqs, enss, minv, !md.isStatic, mkE(EIdent(idOf(SITE_PARAM, md.span)), md.span)),
+    contracts: [], annotations: [], span: md.span
+  };
+  const forwarder = MethodDecl {
     priv: md.priv, isStatic: md.isStatic, name: md.name, typeParams: md.typeParams, params: md.params,
-    ret: md.ret, body: wrapperBody(sm, md.span, callee, md.params, md.ret, reqs, enss, minv, !md.isStatic),
+    ret: md.ret, body: forwarderBody(md.span, siteCallee, md.params, md.ret),
     contracts: [], annotations: md.annotations, span: md.span
   };
-  return WrappedMembers { members: [MMethod(wrapper), MMethod(bodyM)], used: true };
+  return WrappedMembers { members: [MMethod(forwarder), MMethod(checking), MMethod(bodyM)], used: true };
 }
 
 // Leading `this.f = e;` statements of a constructor body (they must stay first: ADR-0009).
@@ -406,18 +588,19 @@ function wrapCtor(sm: SourceMap, k: CtorDecl, invs: ContractClause[]): CtorDecl 
   const lead = leadingFieldInits(k.body.stmts);
   let stmts: Stmt[] = [];
   let i: usize = 0;
+  const noSite = mkE(EStr(""), k.span);
   while (i < lead) {
     stmts.push(k.body.stmts[i]);
     i += 1;
   }
-  for (const s of checkStmts(sm, reqs)) {
+  for (const s of checkStmts(sm, reqs, noSite, "")) {
     stmts.push(s);
   }
   while (i < k.body.stmts.length) {
     stmts.push(k.body.stmts[i]);
     i += 1;
   }
-  for (const s of checkStmts(sm, invs)) {
+  for (const s of checkStmts(sm, invs, noSite, "")) {
     stmts.push(s);
   }
   return CtorDecl { params: k.params, body: Block { stmts: stmts, span: k.body.span }, contracts: [], span: k.span };
@@ -463,19 +646,101 @@ function wrapClass(sm: SourceMap, c: ClassDecl): Wrapped {
   return Wrapped { items: [IClass(nc)], used: used };
 }
 
-// `function $contract$fail(msg: string): void { console.error("trap: ..." + msg); exit(101); }`
-function failFunction(sp: Span): Item {
-  const tstr = TypeExpr { kind: TNamed(idOf("string", sp), []), span: sp };
+// The invariant of a record type `type R = { .. }` (ADR-0031 A3): the function
+// `$contract$rec$R($site: string, this$: R): R` checks the clauses and returns its argument. The HIR pass
+// (rthir.or) puts a call around every record literal, after every field assignment and at the return of
+// every function that returns an `R`. Generic records are not supported (E0408).
+function recordCheck(sm: SourceMap, td: TypeDecl): Option<Item> {
+  const invs = ofKind(td.contracts, 2);
+  const isRecord = match (td.body) {
+    DRecord(_) => true,
+    _ => false
+  };
+  if (invs.length == 0 || !isRecord || td.typeParams.length > 0) {
+    return None;
+  }
+  const sp = td.span;
+  const rty = TypeExpr { kind: TNamed(td.name, []), span: sp };
+  const self = idOf(THIS_PARAM, sp);
+  const site = mkE(EIdent(idOf(SITE_PARAM, sp)), sp);
+  let stmts: Stmt[] = checkStmts(sm, invs, site, THIS_PARAM);
+  stmts.push(mkS(SReturn(Some(mkE(EIdent(self), sp))), sp));
+  return Some(IFunction(FunctionDecl {
+    exported: false, name: idOf(REC + td.name.name, td.name.span), typeParams: [], bounds: [],
+    params: [siteParam(sp), Param { name: self, ty: rty, span: sp }], ret: Some(rty),
+    body: Block { stmts: stmts, span: sp }, contracts: [], annotations: [], span: sp
+  }));
+}
+
+// The stub the check statements call: the HIR pass replaces every call with one of `contract__fail`
+// (below), so the stub needs no body and no imports.
+function failStub(sp: Span): Item {
+  const tstr = stringType(sp);
   const tvoid = TypeExpr { kind: TNamed(idOf("void", sp), []), span: sp };
-  const prefix = mkE(EStr("trap: contract violated: "), sp);
-  const msg = mkE(EBinary(BAdd, prefix, mkE(EIdent(idOf("msg", sp)), sp)), sp);
-  const logCall = mkE(ECall(mkE(EMember(mkE(EIdent(idOf("console", sp)), sp), idOf("error", sp)), sp), [msg]), sp);
-  const exitCall = mkE(ECall(mkE(EIdent(idOf("exit", sp)), sp), [mkE(EInt(101), sp)]), sp);
-  const body = Block { stmts: [mkS(SExpr(logCall), sp), mkS(SExpr(exitCall), sp)], span: sp };
+  const params: Param[] = [
+    Param { name: idOf("msg", sp), ty: tstr, span: sp },
+    Param { name: idOf("site", sp), ty: tstr, span: sp },
+    Param { name: idOf("olds", sp), ty: tstr, span: sp },
+    Param { name: idOf("detail", sp), ty: tstr, span: sp }
+  ];
   return IFunction(FunctionDecl {
-    exported: false, name: idOf(FAIL, sp), typeParams: [], bounds: [], params: [Param { name: idOf("msg", sp), ty: tstr, span: sp }],
-    ret: Some(tvoid), body: body, contracts: [], annotations: [], span: sp
+    exported: false, name: idOf(FAIL, sp), typeParams: [], bounds: [], params: params,
+    ret: Some(tvoid), body: Block { stmts: [], span: sp }, contracts: [], annotations: [], span: sp
   });
+}
+
+// Orin source of the run-time support, added once to the first unit that has contracts (the HIR pass finds
+// the functions by name). `contract__fail` prints the report (docs/contracts.md "Violation reports"): the
+// first line is `trap: contract violated: <clause> at <file>:<line>`, then the lines of `detail` (the
+// function and its arguments, the values of the clause's terms, the `old` values; built by the HIR pass),
+// then blame and action (ADR-0029). The status is 101 like every other trap.
+function supportText(): string {
+  return `
+function contract__showInt(x: int): string { return x.toString(); }
+function contract__showUsize(x: usize): string { return x.toString(); }
+function contract__showBool(x: bool): string { return x ? "true" : "false"; }
+function contract__showFloat(x: float): string { return x.toString(); }
+function contract__showF32(x: f32): string { return x.toString(); }
+function contract__showStr(s: string): string {
+  if (s.length > 40) {
+    return "\\"" + s.substring(0, 40) + "...\\" (length " + s.length.toString() + ")";
+  }
+  return "\\"" + s + "\\"";
+}
+function contract__showLen(ty: string, n: usize): string { return ty + " of length " + n.toString(); }
+function contract__fail(msg: string, site: string, fname: string, detail: string): void {
+  let out = "trap: contract violated: " + msg + "\\n" + detail;
+  if (msg.startsWith("@Requires")) {
+    if (site != "") {
+      out = out + "  blame: the caller, at " + site + "\\n";
+    } else {
+      out = out + "  blame: the caller of " + fname + " (call site not available: called through a function value, an interface or a constructor)\\n";
+    }
+    out = out + "  action: FIX_CODE (caller)";
+  } else {
+    if (fname.startsWith("record ")) {
+      out = out + "  blame: the code that built this value" + (site != "" ? ", at " + site : "") + "\\n";
+    } else {
+      out = out + "  blame: the callee " + fname + "\\n";
+    }
+    out = out + "  action: NEEDS_DECISION\\n";
+    out = out + "  question: " + fname + " breaks " + msg + ". Is the code wrong, or is the contract?\\n";
+    out = out + "  option 1: fix the code (the specification stays)\\n";
+    out = out + "  option 2: add a precondition that excludes this call (changes the specification)\\n";
+    out = out + "  option 3: change the clause (changes the specification)";
+  }
+  console.error(out);
+  exit(101);
+}
+`;
+}
+
+function supportItems(file: usize): Item[] {
+  const m = parse(file, supportText());
+  return match (m) {
+    Ok(mod) => mod.items,
+    Err(_) => []
+  };
 }
 
 function importsExit(m: Module): bool {
@@ -497,6 +762,7 @@ function importsExit(m: Module): bool {
 // Expands the contracts of every unit into runtime checks.
 export function expandContracts(prog: LoadedProgram, sm: SourceMap): LoadedProgram {
   let units: Unit[] = [];
+  let supportDone = false;
   for (const u of prog.units) {
     let items: Item[] = [];
     let used = false;
@@ -520,6 +786,16 @@ export function expandContracts(prog: LoadedProgram, sm: SourceMap): LoadedProgr
             items.push(x);
           }
         },
+        IType(td) => {
+          items.push(it);
+          match (recordCheck(sm, td)) {
+            Some(x) => {
+              items.push(x);
+              used = true;
+            },
+            None => {}
+          }
+        },
         _ => { items.push(it); }
       }
     }
@@ -535,7 +811,13 @@ export function expandContracts(prog: LoadedProgram, sm: SourceMap): LoadedProgr
         items.push(IImport(ImportDecl { names: [idOf("exit", sp)], path: "std:process", pathSpan: sp, span: sp }));
         imports.push(ImportStd(StdProcess));
       }
-      items.push(failFunction(sp));
+      items.push(failStub(sp));
+      if (!supportDone) {
+        supportDone = true;
+        for (const x of supportItems(u.file)) {
+          items.push(x);
+        }
+      }
       units.push(Unit {
         file: u.file, path: u.path, name: u.name, module: u.module,
         ast: Module { file: u.ast.file, items: items }, imports: imports
