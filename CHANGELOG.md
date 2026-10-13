@@ -6,6 +6,7 @@
   unknown module, E0500/E0503 manifest errors); `orin check|compile|build|run <package-dir>`;
   `orin check --deps` (module dependency summary); `orin api [--check <snapshot>]` (public API
   snapshot and change detection); MCP `inspect` module shows the manifest rule.
+- Floats (`float`, `f32`), `std:math`, built-in `Map<K, V>` (ADR-0018). Float programs link with `-lm`.
 
 ## 0.1.0-alpha.1 (2026-10-13)
 First experimental release of the self-hosted Orin compiler.

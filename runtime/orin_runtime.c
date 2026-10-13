@@ -440,6 +440,99 @@ OrinObj *orin_parse_int(OrinObj *s) {
     return orin_variant1(0, 0, acc);
 }
 
+/* ---------------------------------------------------------------- floats (ADR-0018) */
+
+int64_t orin_float_to_int(double x) {
+    /* int64 range is [-2^63, 2^63); both bounds are exactly representable as doubles. */
+    if (!(x >= -9223372036854775808.0 && x < 9223372036854775808.0)) orin_trap("float to int out of range");
+    return (int64_t)x;
+}
+
+/* Shortest digits that round-trip (precision search over %.{p-1}e), laid out like JavaScript:
+ * positional for -7 < exp10 < 21, else d.ddde+XX. Integral values keep a ".0". */
+static OrinObj *float_to_string(double x, int is_f32) {
+    char out[64];
+    size_t n = 0;
+    if (x != x) return orin_str_new("NaN", 3);
+    if (x == __builtin_inf()) return orin_str_new("Infinity", 8);
+    if (x == -__builtin_inf()) return orin_str_new("-Infinity", 9);
+    int neg = __builtin_signbit(x) != 0;
+    if (neg) x = -x;
+    if (x == 0.0) return neg ? orin_str_new("-0.0", 4) : orin_str_new("0.0", 3);
+    char buf[64];
+    int maxp = is_f32 ? 9 : 17;
+    for (int p = 1; p <= maxp; p++) {
+        snprintf(buf, sizeof buf, "%.*e", p - 1, x);
+        if (is_f32 ? ((double)strtof(buf, NULL) == x) : (strtod(buf, NULL) == x)) break;
+    }
+    char digits[32];
+    int nd = 0;
+    const char *q = buf;
+    for (; *q && *q != 'e'; q++) {
+        if (*q >= '0' && *q <= '9') digits[nd++] = *q;
+    }
+    int k = (*q == 'e') ? atoi(q + 1) : 0;
+    if (neg) out[n++] = '-';
+    if (k > -7 && k < 21) {
+        if (k >= 0) {
+            for (int i = 0; i <= k; i++) out[n++] = i < nd ? digits[i] : '0';
+            out[n++] = '.';
+            if (nd > k + 1) {
+                for (int i = k + 1; i < nd; i++) out[n++] = digits[i];
+            } else {
+                out[n++] = '0';
+            }
+        } else {
+            out[n++] = '0';
+            out[n++] = '.';
+            for (int i = 0; i < -k - 1; i++) out[n++] = '0';
+            for (int i = 0; i < nd; i++) out[n++] = digits[i];
+        }
+    } else {
+        out[n++] = digits[0];
+        if (nd > 1) {
+            out[n++] = '.';
+            for (int i = 1; i < nd; i++) out[n++] = digits[i];
+        }
+        out[n++] = 'e';
+        out[n++] = k < 0 ? '-' : '+';
+        n += (size_t)snprintf(out + n, sizeof out - n, "%d", k < 0 ? -k : k);
+    }
+    return orin_str_new(out, n);
+}
+
+OrinObj *orin_float_to_string(double x) { return float_to_string(x, 0); }
+OrinObj *orin_f32_to_string(double x) { return float_to_string(x, 1); }
+
+/* `-? D+ (. D+)? ([eE] [+-]? D+)?`, or `Infinity`, `-Infinity`, `NaN`; nothing else. */
+OrinObj *orin_parse_float(OrinObj *s) {
+    OrinString *x = (OrinString *)s;
+    const char *d = x->data;
+    uint64_t n = x->len, i = 0;
+    if (n == 3 && memcmp(d, "NaN", 3) == 0) return orin_variant1(0, 0, orin_f2s(strtod("nan", NULL)));
+    if (n == 8 && memcmp(d, "Infinity", 8) == 0) return orin_variant1(0, 0, orin_f2s(strtod("inf", NULL)));
+    if (n == 9 && memcmp(d, "-Infinity", 9) == 0) return orin_variant1(0, 0, orin_f2s(-strtod("inf", NULL)));
+    if (i < n && d[i] == '-') i++;
+    uint64_t ds = i;
+    while (i < n && d[i] >= '0' && d[i] <= '9') i++;
+    if (i == ds) return orin_none();
+    if (i < n && d[i] == '.') {
+        i++;
+        uint64_t fs = i;
+        while (i < n && d[i] >= '0' && d[i] <= '9') i++;
+        if (i == fs) return orin_none();
+    }
+    if (i < n && (d[i] == 'e' || d[i] == 'E')) {
+        i++;
+        if (i < n && (d[i] == '+' || d[i] == '-')) i++;
+        uint64_t es = i;
+        while (i < n && d[i] >= '0' && d[i] <= '9') i++;
+        if (i == es) return orin_none();
+    }
+    if (i != n) return orin_none();
+    return orin_variant1(0, 0, orin_f2s(strtod(d, NULL))); /* data is NUL-terminated */
+}
+
 /* ---------------------------------------------------------------- arrays */
 
 OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {

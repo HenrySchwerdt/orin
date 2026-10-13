@@ -296,3 +296,19 @@ append instead of one exact-size allocation) and from `int.toString()` going thr
 append instead of one `snprintf`; `split` and `indexOf` use a first-byte scan in Orin where C used `memmem`, which
 did not show up in these workloads (short separators). Likely follow-ups: a runtime primitive to build a string
 from a byte array (would let `join`/`toString` allocate once), and inlining of `substring`/`fromCharCode`.
+
+## Floats and Map (ADR-0018)
+
+Two benchmarks were added: `nbody` (5 bodies, 1,000,000 steps, `float[]` struct-of-arrays, `sqrt` from
+`std:math`) and `mapfreq` (1,000,000 `Map<string, int>` updates over 50,000 keys; Go `map`, C open-addressing
+table). Same machine and method as above (3 runs, median, `-O2`, programs link with `-lm`); all four outputs are
+byte-identical.
+
+| benchmark | Orin C backend (s) | Orin LLVM (s) | Go (s) | C (s) | Orin-C/Go | Orin-C/C |
+|---|---:|---:|---:|---:|---:|---:|
+| nbody | 0.344 | 0.321 | 0.228 | 0.197 | 1.51x | 1.75x |
+| mapfreq | 0.749 | 0.783 | 0.471 | 0.472 | 1.59x | 1.59x |
+
+Counters: nbody 13 allocations in total (floats are unboxed scalars, 75,000,003 in-place array updates, 0 COW copies);
+mapfreq 0 COW copies (a unique map is updated in place through the owned-parameter optimisation), peak 8.0 MB.
+The Map is Orin prelude code (hash table over arrays), not a C object.
