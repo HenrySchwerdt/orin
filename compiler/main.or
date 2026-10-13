@@ -1,7 +1,10 @@
 // orin — the self-hosted Orin compiler driver (Stage 1+).
-// CLI (identical to the Stage 0 `orinb` subset used by tools/):
-//   orin check <entry.or>
-//   orin compile <entry.or> -o <out.c>
+//   orin check [--format=json] <entry.or>
+//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify]
+//       default pipeline: HIR -> MIR -> ownership verifier -> C
+//   orin fmt [--check] [--stdout] <file.or>...
+//   orin mir <entry.or>      print the MIR
+//   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
 
 import { args, exit } from "std:process";
 import { writeFile } from "std:fs";
@@ -9,10 +12,14 @@ import { SourceMap, Diagnostic, render } from "./diag";
 import { loadAll } from "./loader";
 import { check } from "./check";
 import { generate } from "./codegen";
+import { lower } from "./lower";
+import { emitC } from "./cemit";
+import { MProgram, printProgram } from "./mir";
+import { verify } from "./verify";
 import { runFmt, printDiagnosticsJson } from "./tools";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c>\n  orin fmt [--check] [--stdout] <file.or>...");
+  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin mir <entry.or>\n  orin verify <entry.or>");
   exit(2);
 }
 
@@ -28,6 +35,21 @@ function report(sm: SourceMap, diags: Diagnostic[], json: bool): void {
   exit(1);
 }
 
+// Runs the verifier; prints errors (and warnings when `verbose`). Returns the error count.
+function runVerify(prog: MProgram, verbose: bool): usize {
+  const rep = verify(prog);
+  for (const d of rep.errors) {
+    console.error("verify error: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+  }
+  if (verbose) {
+    for (const d of rep.warnings) {
+      console.log("warning: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+    }
+    console.log("verify: " + rep.errors.length.toString() + " errors, " + rep.warnings.length.toString() + " warnings");
+  }
+  return rep.errors.length;
+}
+
 function main(): void {
   const all = args();
   if (all.length >= 1 && all[0] == "fmt") {
@@ -38,10 +60,16 @@ function main(): void {
     return;
   }
   let json = false;
+  let legacy = false;
+  let noVerify = false;
   let argv: string[] = [];
   for (const a of all) {
     if (a == "--format=json") {
       json = true;
+    } else if (a == "--legacy-codegen") {
+      legacy = true;
+    } else if (a == "--no-verify") {
+      noVerify = true;
     } else {
       argv.push(a);
     }
@@ -53,7 +81,7 @@ function main(): void {
   const cmd = argv[0];
   const entry = argv[1];
   const isCompile = cmd == "compile";
-  if (!isCompile && cmd != "check") {
+  if (!isCompile && cmd != "check" && cmd != "mir" && cmd != "verify") {
     usage();
     return;
   }
@@ -72,10 +100,31 @@ function main(): void {
     report(loaded.sm, checked.unwrapErr(), json);
     return;
   }
-  if (!isCompile) {
+  if (cmd == "check") {
     return;
   }
-  const c = generate(checked.unwrap());
+  if (cmd == "mir") {
+    console.log(printProgram(lower(checked.unwrap())));
+    return;
+  }
+  if (cmd == "verify") {
+    if (runVerify(lower(checked.unwrap()), true) > 0) {
+      exit(1);
+    }
+    return;
+  }
+  let c = "";
+  if (legacy) {
+    c = generate(checked.unwrap());
+  } else {
+    const mir = lower(checked.unwrap());
+    if (!noVerify && runVerify(mir, false) > 0) {
+      console.error("error: internal compiler error: MIR ownership verification failed");
+      exit(70);
+      return;
+    }
+    c = emitC(mir);
+  }
   const written = writeFile(argv[3], c);
   if (written.isErr()) {
     console.error("error: cannot write " + argv[3] + ": " + written.unwrapErr());
