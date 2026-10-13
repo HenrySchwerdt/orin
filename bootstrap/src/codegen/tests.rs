@@ -148,8 +148,19 @@ fn runtime_obj(asan: bool) -> &'static Path {
     cell.get_or_init(|| {
         let d = work_dir();
         let o = d.join("orin_runtime.o");
+        // One object from a tiny unity file: runtime + L0 platform layer (platform/, spec 19 R2).
+        let unity = d.join(if asan { "unity_asan.c" } else { "unity.c" });
+        std::fs::write(
+            &unity,
+            format!(
+                "#include \"{}\"\n#include \"{}\"\n",
+                runtime_dir().join("orin_runtime.c").display(),
+                runtime_dir().join("../platform/orin_platform.c").display()
+            ),
+        )
+        .unwrap();
         let mut c = Command::new("cc");
-        c.arg("-c").arg("-g").arg("-I").arg(runtime_dir()).arg(runtime_dir().join("orin_runtime.c")).arg("-o").arg(&o);
+        c.arg("-c").arg("-g").arg("-I").arg(runtime_dir()).arg(&unity).arg("-o").arg(&o);
         if asan {
             c.arg("-fsanitize=address,undefined");
         }
@@ -860,7 +871,7 @@ fn runtime_c_tests() {
     for asan in [false, true] {
         let exe = d.join(if asan { "rt_asan" } else { "rt" });
         let mut c = Command::new("cc");
-        c.args(["-Wall", "-Wextra", "-g", "-I"]).arg(runtime_dir()).arg(runtime_dir().join("tests/runtime_test.c")).arg(runtime_dir().join("orin_runtime.c")).arg("-o").arg(&exe);
+        c.args(["-Wall", "-Wextra", "-g", "-I"]).arg(runtime_dir()).arg(runtime_dir().join("tests/runtime_test.c")).arg(runtime_dir().join("orin_runtime.c")).arg(runtime_dir().join("../platform/orin_platform.c")).arg("-o").arg(&exe);
         if asan {
             c.arg("-fsanitize=address,undefined");
         }

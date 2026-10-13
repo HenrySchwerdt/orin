@@ -13,11 +13,7 @@
 #define ORIN_RUNTIME_IO_H
 
 #include "orin_runtime.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/wait.h>
-#include <time.h>
+#include "../platform/orin_platform.h"
 
 static inline OrinObj *orin_io_some_str(const char *buf, size_t len) {
     OrinObj *s = orin_str_new(buf, (uint64_t)len);
@@ -26,74 +22,57 @@ static inline OrinObj *orin_io_some_str(const char *buf, size_t len) {
 
 static inline OrinObj *orin_io_read_bytes(uint64_t n) {
     if (n == 0) return orin_io_some_str("", 0);
-    char *buf = (char *)malloc(n);
+    char *buf = (char *)orin_platform_alloc(n);
     if (!buf) orin_trap("out of memory");
-    size_t got = 0;
-    while (got < n) {
-        size_t k = fread(buf + got, 1, (size_t)(n - got), stdin);
-        if (k == 0) break;
-        got += k;
-    }
+    size_t got = orin_platform_stdin_read(buf, (size_t)n);
     if (got < n) {
-        free(buf);
+        orin_platform_free(buf);
         return orin_none();
     }
     OrinObj *r = orin_io_some_str(buf, got);
-    free(buf);
+    orin_platform_free(buf);
     return r;
 }
 
 static inline OrinObj *orin_io_read_line(void) {
     size_t cap = 128, len = 0;
-    char *buf = (char *)malloc(cap);
+    char *buf = (char *)orin_platform_alloc(cap);
     if (!buf) orin_trap("out of memory");
     int c, any = 0;
-    while ((c = getc(stdin)) != EOF) {
+    while ((c = orin_platform_stdin_getc()) >= 0) {
         any = 1;
         if (c == '\n') break;
         if (len == cap) {
             cap *= 2;
-            buf = (char *)realloc(buf, cap);
+            buf = (char *)orin_platform_realloc(buf, cap);
             if (!buf) orin_trap("out of memory");
         }
         buf[len++] = (char)c;
     }
     if (!any) {
-        free(buf);
+        orin_platform_free(buf);
         return orin_none();
     }
     if (len > 0 && buf[len - 1] == '\r') len--;
     OrinObj *r = orin_io_some_str(buf, len);
-    free(buf);
+    orin_platform_free(buf);
     return r;
 }
 
 static inline void orin_io_write_stdout(OrinObj *s) {
-    fwrite(orin_str_data(s), 1, (size_t)orin_str_len(s), stdout);
-    fflush(stdout);
+    orin_platform_write(ORIN_PLATFORM_STDOUT, orin_str_data(s), (size_t)orin_str_len(s));
+    orin_platform_flush();
 }
 
 /* Wall-clock time in milliseconds since the Unix epoch (std:time `nowMillis`). */
 static inline int64_t orin_time_now_millis(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+    return orin_platform_now_millis();
 }
 
 /* Runs `cmd` through /bin/sh (system(3)); returns the exit status (-1 if it could not start or
  * was killed by a signal). Used by `orin mcp` (test/build) behind --allow-exec. */
 static inline int64_t orin_io_shell(OrinObj *cmd) {
-    fflush(stdout);
-    size_t n = (size_t)orin_str_len(cmd);
-    char *buf = (char *)malloc(n + 1);
-    if (!buf) orin_trap("out of memory");
-    memcpy(buf, orin_str_data(cmd), n);
-    buf[n] = 0;
-    int r = system(buf);
-    free(buf);
-    if (r == -1) return -1;
-    if (WIFEXITED(r)) return (int64_t)WEXITSTATUS(r);
-    return -1;
+    return orin_platform_shell(orin_str_data(cmd), (size_t)orin_str_len(cmd));
 }
 
 #endif

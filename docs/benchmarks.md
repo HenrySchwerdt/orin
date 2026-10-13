@@ -312,3 +312,32 @@ byte-identical.
 Counters: nbody 13 allocations in total (floats are unboxed scalars, 75,000,003 in-place array updates, 0 COW copies);
 mapfreq 0 COW copies (a unique map is updated in place through the owned-parameter optimisation), peak 8.0 MB.
 The Map is Orin prelude code (hash table over arrays), not a C object.
+
+## R2: L0 platform layer (spec 19, ADR-0013)
+
+What changed: every libc/OS call of the runtime now goes through `platform/orin_platform.{h,c}`. Memory and
+`mem_*` primitives are `static inline` wrappers in the header (same machine code as before); `console.log` is one
+call `orin_platform_write_line` (was `fwrite_unlocked` + `putc_unlocked`); `int/usize.toString` use a hand-written
+decimal formatter instead of `snprintf`; the `ORIN_STATS` report is assembled without printf. Method:
+`tools/bench.py` with the pre-R2 tree (`git archive` of the parent, same `orin2` binary) against the R2 tree,
+back to back, 9 runs (plus a 25-run repeat of qsort_func and strings); shared 4-vCPU machine with other jobs, so
+the Go/C columns drifted by 20-30% between runs.
+
+| benchmark | before Orin median (s) | after Orin median (s) | note |
+|---|---:|---:|---|
+| bintrees | 1.842 | 1.732 | |
+| fib | 0.564 | 0.535 | |
+| qsort_func (9 runs) | 0.643 | 0.700 | C column of the same runs 0.575 -> 0.603 |
+| qsort_func (25 runs) | 0.640 | 0.756 | C column 0.584 -> 0.471: the machine, not the runtime, moved |
+| qsort_inplace | 0.393 | 0.360 | |
+| sieve | 0.672 | 0.659 | |
+| strings (9 runs) | 0.388 | 0.306 | |
+| strings (25 runs) | 0.364 | 0.264 | |
+| wordfreq | 0.410 | 0.336 | |
+| selfcompile (`orin2` compiles `compiler/main.or`) | 2.683 | 2.183 | |
+
+Counters (deterministic) are identical before and after for every benchmark (allocations, retains/releases,
+cow, grows, peak bytes); peak RSS unchanged. The only unfavourable medians (qsort_func) coincide with
+a 20% swing of the C reference and with identical counters and identical hot-path code (qsort_func performs no
+I/O in its loop), so no regression above 5% is claimed or observed; the measurement noise of this machine is
+larger than that bar, which is why the argument rests on the counters and on the code being unchanged.

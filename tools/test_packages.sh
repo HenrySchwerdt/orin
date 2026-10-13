@@ -17,7 +17,7 @@ bad() { echo "FAIL $1"; fail=1; }
 # 1. package directory: check, compile, run
 $ORIN2 check "$SHOP" && ok "check <package-dir>" || bad "check <package-dir>"
 $ORIN2 compile "$SHOP" -o "$T/shop.c"
-cc -O1 -w -I runtime "$T/shop.c" runtime/orin_runtime.c -o "$T/shop-exe"
+cc -O1 -w -I runtime "$T/shop.c" runtime/orin_runtime.c platform/orin_platform.c -lm -o "$T/shop-exe"
 got=$("$T/shop-exe")
 want=$(printf 'user 7 bob (internal)\n332')
 [ "$got" = "$want" ] && ok "compile+run <package-dir>" || bad "compile+run <package-dir> (got: $got)"

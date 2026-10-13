@@ -19,7 +19,7 @@ B=build/bootstrap
 SEED_DIR=${ORIN_SEED_DIR:-bootstrap/seed}
 mkdir -p "$B"
 python3 tools/embed_prelude.py --check
-cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c -o "$2"; }
+cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c platform/orin_platform.c -o "$2"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 
 if [ "$MODE" = seed ]; then
