@@ -92,7 +92,7 @@ def collect(extra):
         for dp, dn, fn in os.walk(r):
             # tests/next uses syntax beyond Orin-B (generics) that Stage 0 rejects with E0200.
             dn[:] = [d for d in dn if d not in ("target", "build", ".git")
-                     and os.path.join(dp, d) not in (os.path.join(ROOT, "tests", "next"), os.path.join(ROOT, "tests", "contracts"))]
+                     and os.path.join(dp, d) not in (os.path.join(ROOT, "tests", "next"), os.path.join(ROOT, "tests", "contracts"), os.path.join(ROOT, "tests", "osig"))]
             for n in fn:
                 if n.endswith(".or"):
                     files.append(os.path.join(dp, n))
