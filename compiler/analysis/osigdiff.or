@@ -1,0 +1,483 @@
+// `orin diff` (ADR-0023, docs/osig.md): the comparison of two OSIG snapshots. Symbols are matched by their
+// stable id; renames and moves are a separate HEURISTIC class (never asserted as identity); reverse impact
+// walks the head graph backwards from every changed symbol to the entry points that reach it, with the
+// explaining path. Absence of an edge is never proof of absence: calls through function values are
+// MAY/UNKNOWN edges and a function reachable only that way may be missing from an impact list.
+
+import { OsigGraph, ONode, OEdge, OSpan, sortOrder } from "./osig";
+import { cmpStr } from "./modgraph";
+
+export type SymChange = { id: string; kind: string; aspects: string[]; before: string; after: string; node: ONode; };
+
+// One hop of an explaining path: the node reached and the edge that leads to it from the previous step
+// (kind "" for the first step, the entry point).
+export type PathStep = { node: string; via: string; ev: string; span: OSpan; };
+
+export type ImpactPath = { steps: PathStep[]; ev: string; };
+
+// Entry points that reach `target` (changed symbol, or the caller of an added / removed call edge).
+export type Reach = { target: string; paths: ImpactPath[]; truncated: bool; };
+
+export type EdgeFinding = { edge: OEdge; reach: Reach; };
+
+export type Rename = { was: string; now: string; kind: string; basis: string[]; confidence: string; ambiguous: bool; };
+
+export type OsigDiff = {
+  base: OsigGraph;
+  head: OsigGraph;
+  identical: bool;               // equal hashes
+  addedSyms: ONode[];
+  removedSyms: ONode[];
+  changed: SymChange[];
+  renames: Rename[];
+  addedEdges: OEdge[];           // CALLS IMPORTS IMPLEMENTS REFERENCES_TYPE (structure follows from the symbols)
+  removedEdges: OEdge[];
+  newPaths: EdgeFinding[];       // added CALLS edges, with the entry points of the head graph that reach their caller
+  goneCalls: EdgeFinding[];      // removed CALLS edges, with the entry points of the base graph that reached their caller
+  impact: Reach[];               // per changed symbol, in the head graph
+  truncated: bool;               // findings capped at MAX_FINDINGS
+};
+
+export const MAX_FINDINGS: usize = 100;
+const MAX_ENTRIES: usize = 5;
+
+export function isStructural(kind: string): bool {
+  return kind == "DEFINES" || kind == "HAS_FIELD" || kind == "HAS_CONTRACT";
+}
+
+// ---- graph index ----------------------------------------------------------------------------------------
+
+type Ix = { g: OsigGraph; ids: string[]; inKeys: string[]; inOrder: usize[]; outKeys: string[]; outOrder: usize[]; };
+
+function indexOf(g: OsigGraph): Ix {
+  let ids: string[] = [];
+  for (const n of g.nodes) {
+    ids.push(n.id);
+  }
+  let dk: string[] = [];
+  let sk: string[] = [];
+  for (const e of g.edges) {
+    dk.push(e.dst);
+    sk.push(e.src);
+  }
+  const io = sortOrder(dk);
+  const oo = sortOrder(sk);
+  let ik: string[] = [];
+  for (const i of io) {
+    ik.push(dk[i]);
+  }
+  let ok: string[] = [];
+  for (const i of oo) {
+    ok.push(sk[i]);
+  }
+  return Ix { g: g, ids: ids, inKeys: ik, inOrder: io, outKeys: ok, outOrder: oo };
+}
+
+// First position in sorted `keys` that is >= k.
+function lowerBound(keys: string[], k: string): usize {
+  let lo: usize = 0;
+  let hi: usize = keys.length;
+  while (lo < hi) {
+    const mid = (lo + hi) / 2;
+    if (cmpStr(keys[mid], k) < 0) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+function findNode(ix: Ix, id: string): Option<usize> {
+  const p = lowerBound(ix.ids, id);
+  if (p < ix.ids.length && ix.ids[p] == id) {
+    return Some(p);
+  }
+  return None;
+}
+
+function edgesOf(keys: string[], order: usize[], id: string): usize[] {
+  let out: usize[] = [];
+  let p = lowerBound(keys, id);
+  while (p < keys.length && keys[p] == id) {
+    out.push(order[p]);
+    p += 1;
+  }
+  return out;
+}
+
+function rank(ev: string): usize {
+  if (ev == "MUST") {
+    return 0;
+  }
+  if (ev == "MAY") {
+    return 1;
+  }
+  return 2;
+}
+
+function weakest(a: string, b: string): string {
+  return rank(b) > rank(a) ? b : a;
+}
+
+// ---- reverse reachability --------------------------------------------------------------------------------
+
+function ownerEdgeKind(kind: string): string {
+  if (kind == "Field") {
+    return "HAS_FIELD";
+  }
+  if (kind == "Contract") {
+    return "HAS_CONTRACT";
+  }
+  return "DEFINES";
+}
+
+// Entry points that reach `target` (breadth first, backwards over CALLS and REFERENCES_TYPE edges, and from a
+// field, variant or contract clause to its owner). At most MAX_ENTRIES paths; the target itself counts when it
+// is an entry point.
+function reach(ix: Ix, target: string): Reach {
+  const n = ix.ids.length;
+  let seen: bool[] = [];
+  let parent: usize[] = [];
+  let pedge: usize[] = [];     // edge index into g.edges, or n_edges for the owner hop
+  let k: usize = 0;
+  while (k < n) {
+    seen.push(false);
+    parent.push(0);
+    pedge.push(0);
+    k += 1;
+  }
+  const none = ix.g.edges.length;
+  let paths: ImpactPath[] = [];
+  let truncated = false;
+  const t = findNode(ix, target);
+  if (t.isNone()) {
+    return Reach { target: target, paths: paths, truncated: false };
+  }
+  let queue: usize[] = [t.unwrap()];
+  seen[t.unwrap()] = true;
+  let qi: usize = 0;
+  while (qi < queue.length) {
+    const cur = queue[qi];
+    qi += 1;
+    const node = ix.g.nodes[cur];
+    if (node.entry) {
+      if (paths.length >= MAX_ENTRIES) {
+        truncated = true;
+        break;
+      }
+      // forward path from `cur` to the target
+      let steps: PathStep[] = [PathStep { node: node.id, via: "", ev: "", span: node.span }];
+      let ev = "MUST";
+      let at = cur;
+      while (at != t.unwrap()) {
+        const nx = parent[at];
+        if (pedge[at] == none) {
+          steps.push(PathStep { node: ix.g.nodes[nx].id, via: ownerEdgeKind(ix.g.nodes[nx].kind), ev: "MUST", span: ix.g.nodes[nx].span });
+        } else {
+          const e = ix.g.edges[pedge[at]];
+          steps.push(PathStep { node: ix.g.nodes[nx].id, via: e.kind + (e.via == "" ? "" : "/" + e.via), ev: e.ev, span: e.span });
+          ev = weakest(ev, e.ev);
+        }
+        at = nx;
+      }
+      paths.push(ImpactPath { steps: steps, ev: ev });
+    }
+    // incoming CALLS / REFERENCES_TYPE edges
+    for (const ei of edgesOf(ix.inKeys, ix.inOrder, node.id)) {
+      const e = ix.g.edges[ei];
+      if (e.kind == "CALLS" || e.kind == "REFERENCES_TYPE") {
+        const s = findNode(ix, e.src);
+        if (s.isSome() && !seen[s.unwrap()]) {
+          seen[s.unwrap()] = true;
+          parent[s.unwrap()] = cur;
+          pedge[s.unwrap()] = ei;
+          queue.push(s.unwrap());
+        }
+      }
+    }
+    if (node.kind == "Field" || node.kind == "Variant" || node.kind == "Contract") {
+      const o = findNode(ix, node.owner);
+      if (o.isSome() && !seen[o.unwrap()]) {
+        seen[o.unwrap()] = true;
+        parent[o.unwrap()] = cur;
+        pedge[o.unwrap()] = none;
+        queue.push(o.unwrap());
+      }
+    }
+  }
+  return Reach { target: target, paths: paths, truncated: truncated };
+}
+
+// ---- comparison ------------------------------------------------------------------------------------------
+
+function stripMut(sig: string): string {
+  return sig.startsWith("mut method ") ? "method " + sig.substring(11, sig.length) : sig;
+}
+
+function compareNode(a: ONode, b: ONode): Option<SymChange> {
+  let aspects: string[] = [];
+  if (a.kind != b.kind) {
+    aspects.push("kind");
+  }
+  if (a.sig != b.sig) {
+    if (a.kind == "Contract") {
+      aspects.push("contract");
+    } else if (stripMut(a.sig) == stripMut(b.sig) && a.kind == b.kind) {
+      aspects.push("mutability");
+    } else {
+      aspects.push("signature");
+    }
+  }
+  if (a.exported != b.exported) {
+    aspects.push("visibility");
+  }
+  if (a.entry != b.entry) {
+    aspects.push("entry-point");
+  }
+  if (aspects.length == 0) {
+    return None;
+  }
+  return Some(SymChange { id: b.id, kind: b.kind, aspects: aspects, before: a.sig, after: b.sig, node: b });
+}
+
+function comparable(n: ONode): bool {
+  return n.kind != "Package" && n.kind != "Unknown";
+}
+
+// The signature with the symbol's own name replaced by `_` (first occurrence), for rename matching.
+function normSig(n: ONode): string {
+  const at = n.sig.indexOf(n.name);
+  if (at.isNone()) {
+    return n.sig;
+  }
+  return n.sig.substring(0, at.unwrap()) + "_" + n.sig.substring(at.unwrap() + n.name.length, n.sig.length);
+}
+
+function targetsOf(ix: Ix, id: string): string[] {
+  let out: string[] = [];
+  for (const ei of edgesOf(ix.outKeys, ix.outOrder, id)) {
+    const e = ix.g.edges[ei];
+    if (e.kind == "CALLS" && e.ev != "UNKNOWN") {
+      out.push(e.dst);
+    }
+  }
+  return out;
+}
+
+function sameSet(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (const x of a) {
+    let found = false;
+    for (const y of b) {
+      if (x == y) {
+        found = true;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasId(ns: ONode[], id: string): bool {
+  for (const n of ns) {
+    if (n.id == id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Renames / moves among the removed and added symbols: same kind, same signature modulo the name, and the
+// same owner (or an owner that was itself removed / added). A candidate is never an identity claim:
+// confidence "high" = unique match with the same callees, "medium" = unique match, "low" = ambiguous.
+function findRenames(bx: Ix, hx: Ix, removed: ONode[], added: ONode[]): Rename[] {
+  let out: Rename[] = [];
+  for (const r of removed) {
+    if (r.kind == "Contract" || r.kind == "Module") {
+      continue;
+    }
+    let cands: ONode[] = [];
+    for (const a of added) {
+      if (a.kind == r.kind && normSig(a) == normSig(r)) {
+        const ownerOk = a.owner == r.owner || (hasId(removed, r.owner) && hasId(added, a.owner));
+        if (ownerOk) {
+          cands.push(a);
+        }
+      }
+    }
+    for (const a of cands) {
+      let basis: string[] = [];
+      if (a.name != r.name) {
+        basis.push("same signature modulo name");
+      } else {
+        basis.push("same name and signature, different module or owner");
+      }
+      const bt = targetsOf(bx, r.id);
+      const ht = targetsOf(hx, a.id);
+      let confidence = "medium";
+      if (bt.length > 0 && sameSet(bt, ht)) {
+        basis.push("same callees");
+        confidence = "high";
+      }
+      let others: usize = 0;
+      for (const r2 of removed) {
+        if (r2.kind == r.kind && normSig(r2) == normSig(a) && r2.id != r.id) {
+          others += 1;
+        }
+      }
+      const ambiguous = cands.length > 1 || others > 0;
+      if (ambiguous) {
+        confidence = "low";
+      }
+      out.push(Rename { was: r.id, now: a.id, kind: r.kind, basis: basis, confidence: confidence, ambiguous: ambiguous });
+    }
+  }
+  return out;
+}
+
+function cacheIndex(keys: string[], id: string): Option<usize> {
+  let i: usize = 0;
+  while (i < keys.length) {
+    if (keys[i] == id) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function edgeKeyOf(e: OEdge): string {
+  return e.kind + "|" + e.src + "|" + e.dst + "|" + e.ev + "|" + e.via;
+}
+
+export function diffOsig(base: OsigGraph, head: OsigGraph): OsigDiff {
+  const bx = indexOf(base);
+  const hx = indexOf(head);
+  let added: ONode[] = [];
+  let removed: ONode[] = [];
+  let changed: SymChange[] = [];
+  // merge join of the two sorted node lists
+  let i: usize = 0;
+  let j: usize = 0;
+  while (i < base.nodes.length || j < head.nodes.length) {
+    if (i < base.nodes.length && !comparable(base.nodes[i])) {
+      i += 1;
+    } else if (j < head.nodes.length && !comparable(head.nodes[j])) {
+      j += 1;
+    } else if (i >= base.nodes.length) {
+      added.push(head.nodes[j]);
+      j += 1;
+    } else if (j >= head.nodes.length) {
+      removed.push(base.nodes[i]);
+      i += 1;
+    } else {
+      const c = cmpStr(base.nodes[i].id, head.nodes[j].id);
+      if (c == 0) {
+        const ch = compareNode(base.nodes[i], head.nodes[j]);
+        if (ch.isSome()) {
+          changed.push(ch.unwrap());
+        }
+        i += 1;
+        j += 1;
+      } else if (c < 0) {
+        removed.push(base.nodes[i]);
+        i += 1;
+      } else {
+        added.push(head.nodes[j]);
+        j += 1;
+      }
+    }
+  }
+  // edges (structural edges follow from the symbol lists)
+  let addedE: OEdge[] = [];
+  let removedE: OEdge[] = [];
+  i = 0;
+  j = 0;
+  while (i < base.edges.length || j < head.edges.length) {
+    if (i < base.edges.length && isStructural(base.edges[i].kind)) {
+      i += 1;
+    } else if (j < head.edges.length && isStructural(head.edges[j].kind)) {
+      j += 1;
+    } else if (i >= base.edges.length) {
+      addedE.push(head.edges[j]);
+      j += 1;
+    } else if (j >= head.edges.length) {
+      removedE.push(base.edges[i]);
+      i += 1;
+    } else {
+      const c = cmpStr(edgeKeyOf(base.edges[i]), edgeKeyOf(head.edges[j]));
+      if (c == 0) {
+        i += 1;
+        j += 1;
+      } else if (c < 0) {
+        removedE.push(base.edges[i]);
+        i += 1;
+      } else {
+        addedE.push(head.edges[j]);
+        j += 1;
+      }
+    }
+  }
+  let truncated = false;
+  // new call paths: for every added CALLS edge, the entry points of the head graph that reach its caller
+  let newPaths: EdgeFinding[] = [];
+  let ck: string[] = [];
+  let cv: Reach[] = [];
+  for (const e of addedE) {
+    if (e.kind == "CALLS") {
+      if (newPaths.length >= MAX_FINDINGS) {
+        truncated = true;
+        break;
+      }
+      const hit = cacheIndex(ck, e.src);
+      const r = hit.isSome() ? cv[hit.unwrap()] : reach(hx, e.src);
+      if (hit.isNone()) {
+        ck.push(e.src);
+        cv.push(r);
+      }
+      newPaths.push(EdgeFinding { edge: e, reach: r });
+    }
+  }
+  let gone: EdgeFinding[] = [];
+  let gk: string[] = [];
+  let gv: Reach[] = [];
+  for (const e of removedE) {
+    if (e.kind == "CALLS") {
+      if (gone.length >= MAX_FINDINGS) {
+        truncated = true;
+        break;
+      }
+      const hit = cacheIndex(gk, e.src);
+      const r = hit.isSome() ? gv[hit.unwrap()] : reach(bx, e.src);
+      if (hit.isNone()) {
+        gk.push(e.src);
+        gv.push(r);
+      }
+      gone.push(EdgeFinding { edge: e, reach: r });
+    }
+  }
+  let impact: Reach[] = [];
+  for (const c of changed) {
+    if (impact.length >= MAX_FINDINGS) {
+      truncated = true;
+      break;
+    }
+    impact.push(reach(hx, c.id));
+  }
+  return OsigDiff {
+    base: base, head: head, identical: base.hash == head.hash, addedSyms: added, removedSyms: removed, changed: changed,
+    renames: findRenames(bx, hx, removed, added), addedEdges: addedE, removedEdges: removedE, newPaths: newPaths,
+    goneCalls: gone, impact: impact, truncated: truncated
+  };
+}
+
+// True when the two snapshots differ in anything the report lists.
+export function hasDifferences(d: OsigDiff): bool {
+  return d.addedSyms.length > 0 || d.removedSyms.length > 0 || d.changed.length > 0 || d.addedEdges.length > 0
+    || d.removedEdges.length > 0;
+}

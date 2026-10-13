@@ -1,0 +1,112 @@
+// Command line of `orin graph` and `orin diff` (docs/osig.md).
+//   orin graph <file.or | package-dir> [-o out.json]
+//   orin diff --base <dir | file.or | snapshot.json> --head <dir | file.or | snapshot.json>
+//             [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]
+
+import { writeFile } from "std:fs";
+import { loadOsig, osigJson } from "./osig";
+import { diffOsig, hasDifferences } from "./osigdiff";
+import { diffText, diffJson, diffHtml } from "./osigreport";
+
+function writeOut(text: string, out: string): int {
+  if (out == "") {
+    console.log(text.substring(0, text.length - 1));
+    return 0;
+  }
+  const w = writeFile(out, text);
+  if (w.isErr()) {
+    console.error("error: cannot write " + out + ": " + w.unwrapErr());
+    return 1;
+  }
+  return 0;
+}
+
+function usage(): int {
+  console.error("usage:\n  orin graph <file.or | package-dir> [-o out.json]\n  orin diff --base <dir | .or | .json> --head <dir | .or | .json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]");
+  return 2;
+}
+
+export function runGraph(argv: string[]): int {
+  let path = "";
+  let out = "";
+  let i: usize = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    i += 1;
+    if (a == "-o") {
+      if (i >= argv.length) {
+        return usage();
+      }
+      out = argv[i];
+      i += 1;
+    } else if (path == "" && !a.startsWith("-")) {
+      path = a;
+    } else {
+      return usage();
+    }
+  }
+  if (path == "") {
+    return usage();
+  }
+  const g = loadOsig(path);
+  if (g.isErr()) {
+    console.error(g.unwrapErr());
+    return 1;
+  }
+  return writeOut(osigJson(g.unwrap()), out);
+}
+
+export function runDiff(argv: string[]): int {
+  let base = "";
+  let head = "";
+  let out = "";
+  let format = "text";
+  let linkBase = "";
+  let exitCode = false;
+  let i: usize = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    i += 1;
+    if (a == "--base" || a == "--head" || a == "-o" || a == "--link-base") {
+      if (i >= argv.length) {
+        return usage();
+      }
+      if (a == "--base") {
+        base = argv[i];
+      } else if (a == "--head") {
+        head = argv[i];
+      } else if (a == "-o") {
+        out = argv[i];
+      } else {
+        linkBase = argv[i];
+      }
+      i += 1;
+    } else if (a.startsWith("--format=")) {
+      format = a.substring(9, a.length);
+    } else if (a == "--exit-code") {
+      exitCode = true;
+    } else {
+      return usage();
+    }
+  }
+  if (base == "" || head == "" || (format != "json" && format != "text" && format != "html")) {
+    return usage();
+  }
+  const b = loadOsig(base);
+  if (b.isErr()) {
+    console.error("error: base: " + b.unwrapErr());
+    return 1;
+  }
+  const h = loadOsig(head);
+  if (h.isErr()) {
+    console.error("error: head: " + h.unwrapErr());
+    return 1;
+  }
+  const d = diffOsig(b.unwrap(), h.unwrap());
+  const text = format == "json" ? diffJson(d) : (format == "html" ? diffHtml(d, linkBase) : diffText(d));
+  const rc = writeOut(text, out);
+  if (rc != 0) {
+    return rc;
+  }
+  return exitCode && hasDifferences(d) ? 1 : 0;
+}

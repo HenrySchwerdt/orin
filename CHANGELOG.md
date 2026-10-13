@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- OSIG (ADR-0023, docs/osig.md): `orin graph <entry|package-dir> [-o out.json]` exports the deterministic
+  Orin Software Intelligence Graph (schema `osig/0.1`: packages, modules, functions, methods, classes,
+  interfaces, types, fields, variants, contract clauses; edges `DEFINES`, `IMPORTS`, `CALLS` with
+  `MUST`/`MAY`/`UNKNOWN` evidence, `IMPLEMENTS`, `HAS_FIELD`, `REFERENCES_TYPE`, `HAS_CONTRACT`; stable ids,
+  source spans, snapshot hash). `orin diff --base --head [--format=text|json|html]` compares two snapshots:
+  changed/added/removed symbols, added/removed edges, heuristic rename candidates, reverse impact with the
+  explaining path from entry points; the HTML report is one self-contained file. MCP tools `graph` and
+  `diff`. `SemanticIndex` gains `calls` (call sites from the typed HIR). CI uploads the diff report of a
+  pull request as an artifact (report only). `orin api --check` is unchanged.
 - Packages (ADR-0016, spec 04): `orin.toml` manifest (`[package]`, `[architecture]`,
   `[modules.<path>] allowed_dependencies`), enforced by the loader (E0501 disallowed import, E0502
   unknown module, E0500/E0503 manifest errors); `orin check|compile|build|run <package-dir>`;

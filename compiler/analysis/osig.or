@@ -1,0 +1,820 @@
+// OSIG snapshot (ADR-0023, docs/osig.md): the Orin Software Intelligence Graph of one compile, grown from
+// the semantic index (ADR-0008, ADR-0020 D2) -- definitions, references, `implements` links and the call
+// sites recorded from the typed HIR. `orin graph` serialises it, `orin diff` compares two of them.
+//
+// Deterministic: nodes sorted by id, edges sorted by (kind, source, target, evidence, via), no absolute
+// paths (file names are relative to the package's source root), no timestamps, no compiler version.
+// The `hash` is a 62-bit content fingerprint of the body, for equality checks -- not a cryptographic digest.
+
+import { LoadedProgram, loadWithRoots, noPreludeRoots, isInside } from "../loader";
+import { SourceFile, SourceMap, Span, render } from "../diag";
+import { Item, ContractClause, ClassMember } from "../syntax";
+import { checkWithIndex } from "../check";
+import {
+  SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField,
+  SkInterface
+} from "../hir";
+import { displayModule } from "../package";
+import { Json, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson, parseJson, getStr, getInt, getBool, getArr,
+  getField } from "../json";
+import { readFile } from "std:fs";
+import { cmpStr } from "./modgraph";
+
+export const OSIG_SCHEMA: string = "osig/0.1";
+
+// 1-based line and column (columns count bytes) of the start and end of a source range.
+export type OSpan = { file: string; line: usize; col: usize; endLine: usize; endCol: usize; };
+
+export type ONode = {
+  id: string;
+  kind: string;        // Package Module Function Method Class Interface Record Union Alias Const Field Variant Contract Unknown
+  name: string;
+  module: string;      // module id ("(root)" for the root module); "" for Package and Unknown
+  owner: string;       // id of the containing node ("" for none)
+  sig: string;         // rendered signature (Contract: the clause text)
+  exported: bool;
+  entry: bool;         // an entry point: `main`, exported functions, exported public methods and constructors
+  span: OSpan;
+};
+
+export type OEdge = {
+  kind: string;        // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT
+  src: string;
+  dst: string;
+  ev: string;          // MUST | MAY | UNKNOWN
+  via: string;         // "" or the call route: direct method virtual bound impl value indirect
+  span: OSpan;         // first occurrence
+};
+
+export type OsigGraph = { schema: string; package: string; hash: string; nodes: ONode[]; edges: OEdge[]; };
+
+export const UNKNOWN_ID: string = "~unknown";
+
+// ---- sorting ------------------------------------------------------------------------------------------
+
+// Stable merge sort: the indices of `keys` in ascending byte order.
+export function sortOrder(keys: string[]): usize[] {
+  const n = keys.length;
+  let a: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    a.push(i);
+    i += 1;
+  }
+  let width: usize = 1;
+  while (width < n) {
+    let b: usize[] = [];
+    let lo: usize = 0;
+    while (lo < n) {
+      const mid = lo + width < n ? lo + width : n;
+      const hi = lo + 2 * width < n ? lo + 2 * width : n;
+      let x = lo;
+      let y = mid;
+      while (x < mid && y < hi) {
+        if (cmpStr(keys[a[y]], keys[a[x]]) < 0) {
+          b.push(a[y]);
+          y += 1;
+        } else {
+          b.push(a[x]);
+          x += 1;
+        }
+      }
+      while (x < mid) {
+        b.push(a[x]);
+        x += 1;
+      }
+      while (y < hi) {
+        b.push(a[y]);
+        y += 1;
+      }
+      lo = hi;
+    }
+    a = b;
+    width = width * 2;
+  }
+  return a;
+}
+
+// ---- spans ------------------------------------------------------------------------------------------------
+
+function lineStarts(text: string): usize[] {
+  let out: usize[] = [0];
+  let i: usize = 0;
+  while (i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      out.push(i + 1);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+// Index of the last line start <= off.
+function lineOf(starts: usize[], off: usize): usize {
+  let lo: usize = 0;
+  let hi: usize = starts.length;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) / 2;
+    if (starts[mid] <= off) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+type Mapper = { paths: string[]; starts: usize[][]; };
+
+function mkSpan(m: Mapper, sp: Span): OSpan {
+  if (sp.file >= m.paths.length) {
+    return OSpan { file: "", line: 0, col: 0, endLine: 0, endCol: 0 };
+  }
+  const st = m.starts[sp.file];
+  const l1 = lineOf(st, sp.start);
+  const l2 = lineOf(st, sp.end);
+  return OSpan {
+    file: m.paths[sp.file], line: l1 + 1, col: sp.start - st[l1] + 1, endLine: l2 + 1, endCol: sp.end - st[l2] + 1
+  };
+}
+
+function noSpan(): OSpan {
+  return OSpan { file: "", line: 0, col: 0, endLine: 0, endCol: 0 };
+}
+
+// ---- building ---------------------------------------------------------------------------------------------
+
+function isLocalDef(d: SymbolDef): bool {
+  return match (d.kind) {
+    SkLocal => true,
+    SkParam => true,
+    _ => false
+  };
+}
+
+function isTypeDef(d: SymbolDef): bool {
+  return match (d.kind) {
+    SkRecord => true,
+    SkUnion => true,
+    SkAlias => true,
+    SkInterface => true,
+    _ => false
+  };
+}
+
+function firstLine(s: string): string {
+  const nl = s.indexOf("\n");
+  return nl.isSome() ? s.substring(0, nl.unwrap()) : s;
+}
+
+function kindOfDef(d: SymbolDef): string {
+  return match (d.kind) {
+    SkFunction => d.container.isSome() ? "Method" : "Function",
+    SkRecord => d.detail.startsWith("class ") ? "Class" : "Record",
+    SkUnion => "Union",
+    SkAlias => "Alias",
+    SkConst => "Const",
+    SkField => "Field",
+    SkVariant => "Variant",
+    SkInterface => "Interface",
+    _ => ""
+  };
+}
+
+function oneLine(s: string): string {
+  return s.split("\n").join(" ").split("\r").join(" ").trim();
+}
+
+function contractKind(k: ContractClause): string {
+  return match (k.kind) {
+    CRequires => "requires",
+    CEnsures => "ensures",
+    CInvariant => "invariant",
+    CDecreases => "decreases",
+    CRule => "rule"
+  };
+}
+
+type Raw = { edges: OEdge[]; keys: string[]; nodes: ONode[]; };
+
+function edgeKey(e: OEdge): string {
+  return e.kind + "|" + e.src + "|" + e.dst + "|" + e.ev + "|" + e.via;
+}
+
+function addEdge(r: Raw, kind: string, src: string, dst: string, ev: string, via: string, sp: OSpan): Raw {
+  let x = r;
+  if (src == "" || dst == "" || src == dst) {
+    return x;
+  }
+  const e = OEdge { kind: kind, src: src, dst: dst, ev: ev, via: via, span: sp };
+  x.edges.push(e);
+  x.keys.push(edgeKey(e));
+  return x;
+}
+
+function spanBefore(a: OSpan, b: OSpan): bool {
+  if (a.file != b.file) {
+    return cmpStr(a.file, b.file) < 0;
+  }
+  return a.line < b.line || (a.line == b.line && a.col < b.col);
+}
+
+// Sort the raw edges and keep one per key: the occurrence with the smallest span.
+function finishEdges(r: Raw): OEdge[] {
+  const order = sortOrder(r.keys);
+  let out: OEdge[] = [];
+  let i: usize = 0;
+  while (i < order.length) {
+    let best = r.edges[order[i]];
+    const k = r.keys[order[i]];
+    let j = i + 1;
+    while (j < order.length && r.keys[order[j]] == k) {
+      if (spanBefore(r.edges[order[j]].span, best.span)) {
+        best = r.edges[order[j]];
+      }
+      j += 1;
+    }
+    out.push(best);
+    i = j;
+  }
+  return out;
+}
+
+function containsSpan(outer: Span, inner: Span): bool {
+  return outer.file == inner.file && outer.start <= inner.start && inner.end <= outer.end;
+}
+
+// The OSIG of a successfully checked program.
+export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap): OsigGraph {
+  let pkg = "_";
+  let prefix = "";
+  match (prog.manifest) {
+    Some(mf) => {
+      pkg = mf.name;
+      let si: usize = 0;
+      while (si < mf.entry.length) {
+        if (mf.entry.charCodeAt(si) == 47) {
+          prefix = mf.entry.substring(0, si + 1);
+        }
+        si += 1;
+      }
+    },
+    None => {}
+  }
+  // file id -> path relative to the source root, line tables
+  let paths: string[] = [];
+  let starts: usize[][] = [];
+  let fi: usize = 0;
+  while (fi < sm.files.length) {
+    paths.push("");
+    starts.push(lineStarts(sm.files[fi].text));
+    fi += 1;
+  }
+  for (const u of prog.units) {
+    if (u.file < paths.length) {
+      paths[u.file] = prefix + u.name + ".or";
+    }
+  }
+  const mp = Mapper { paths: paths, starts: starts };
+  const nd = idx.defs.length;
+
+  // ids of the defs ("" = not part of the graph): top-level first (collisions between files of one module
+  // get the file name appended), then members.
+  let ids: string[] = [];
+  let mods: string[] = [];
+  let k: usize = 0;
+  while (k < nd) {
+    ids.push("");
+    mods.push("");
+    k += 1;
+  }
+  let topKeys: string[] = [];
+  let topDefs: usize[] = [];
+  for (const d of idx.defs) {
+    const u = prog.units[d.unit];
+    if (isLocalDef(d) || u.module == "") {
+      continue;
+    }
+    mods[d.id] = displayModule(u.module);
+    if (d.container.isNone()) {
+      topKeys.push(pkg + ":" + mods[d.id] + "::" + d.name);
+      topDefs.push(d.id);
+    }
+  }
+  const topOrder = sortOrder(topKeys);
+  let t: usize = 0;
+  while (t < topOrder.length) {
+    let e = t + 1;
+    while (e < topOrder.length && topKeys[topOrder[e]] == topKeys[topOrder[t]]) {
+      e += 1;
+    }
+    let q = t;
+    while (q < e) {
+      const did = topDefs[topOrder[q]];
+      ids[did] = e - t > 1 ? topKeys[topOrder[q]] + "~" + prog.units[idx.defs[did].unit].name : topKeys[topOrder[q]];
+      q += 1;
+    }
+    t = e;
+  }
+  for (const d of idx.defs) {
+    if (isLocalDef(d) || mods[d.id] == "") {
+      continue;
+    }
+    match (d.container) {
+      Some(c) => {
+        if (ids[c] != "") {
+          ids[d.id] = ids[c] + "." + d.name;
+        }
+      },
+      None => {}
+    }
+  }
+  // members of each def
+  let kids: usize[][] = [];
+  k = 0;
+  while (k < nd) {
+    kids.push([]);
+    k += 1;
+  }
+  for (const d of idx.defs) {
+    match (d.container) {
+      Some(c) => {
+        if (ids[d.id] != "") {
+          kids[c].push(d.id);
+        }
+      },
+      None => {}
+    }
+  }
+
+  const pkgId = pkg;
+  let raw = Raw { edges: [], keys: [], nodes: [] };
+  raw.nodes.push(ONode {
+    id: pkgId, kind: "Package", name: pkg, module: "", owner: "", sig: "", exported: false, entry: false, span: noSpan()
+  });
+  // modules
+  let modNames: string[] = [];
+  for (const u of prog.units) {
+    if (u.module != "") {
+      const dm = displayModule(u.module);
+      let seen = false;
+      for (const m of modNames) {
+        if (m == dm) {
+          seen = true;
+        }
+      }
+      if (!seen) {
+        modNames.push(dm);
+      }
+    }
+  }
+  for (const m of modNames) {
+    const mid = pkg + ":" + m;
+    raw.nodes.push(ONode { id: mid, kind: "Module", name: m, module: m, owner: pkgId, sig: "", exported: false, entry: false, span: noSpan() });
+    raw = addEdge(raw, "DEFINES", pkgId, mid, "MUST", "", noSpan());
+  }
+  // definitions
+  for (const d of idx.defs) {
+    const id = ids[d.id];
+    if (id == "") {
+      continue;
+    }
+    const kind = kindOfDef(d);
+    let owner = pkg + ":" + mods[d.id];
+    match (d.container) {
+      Some(c) => { owner = ids[c]; },
+      None => {}
+    }
+    const priv = d.detail.startsWith("private ");
+    const member = d.container.isSome();
+    const isIfaceMember = match (d.container) {
+      Some(c) => match (idx.defs[c].kind) { SkInterface => true, _ => false },
+      None => false
+    };
+    const exported = member ? d.exported && !priv : d.exported;
+    let entry = false;
+    if (kind == "Function") {
+      entry = d.exported || (d.name == "main" && d.unit == prog.entry);
+    } else if (kind == "Method") {
+      entry = exported && !isIfaceMember;
+    }
+    raw.nodes.push(ONode {
+      id: id, kind: kind, name: d.name, module: mods[d.id], owner: owner, sig: firstLine(d.detail), exported: exported,
+      entry: entry, span: mkSpan(mp, d.declSpan)
+    });
+    if (kind == "Field") {
+      raw = addEdge(raw, "HAS_FIELD", owner, id, "MUST", "", mkSpan(mp, d.declSpan));
+    } else {
+      raw = addEdge(raw, "DEFINES", owner, id, "MUST", "", mkSpan(mp, d.declSpan));
+    }
+  }
+  // contracts, from the AST (same order as the defs: top-level items in order, class members in order)
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    if (u.module != "") {
+      let tops: usize[] = [];
+      for (const d of idx.defs) {
+        if (d.unit == ui && d.container.isNone() && !isLocalDef(d)) {
+          tops.push(d.id);
+        }
+      }
+      let ti: usize = 0;
+      for (const item of u.ast.items) {
+        let hasDef = true;
+        let cs: ContractClause[] = [];
+        let members: ClassMember[] = [];
+        let isClass = false;
+        match (item) {
+          IImport(_) => { hasDef = false; },
+          IReExport(_) => { hasDef = false; },
+          IFunction(f) => { cs = f.contracts; },
+          IType(td) => { cs = td.contracts; },
+          IClass(cd) => { cs = cd.contracts; members = cd.members; isClass = true; },
+          _ => {}
+        }
+        if (hasDef && ti < tops.length) {
+          const owner = tops[ti];
+          raw = addContracts(raw, mp, sm, ids[owner], mods[owner], cs);
+          if (isClass) {
+            let fns: usize[] = [];
+            for (const m of kids[owner]) {
+              const isFn = match (idx.defs[m].kind) { SkFunction => true, _ => false };
+              if (isFn) {
+                fns.push(m);
+              }
+            }
+            let fk: usize = 0;
+            for (const m of members) {
+              let mc: ContractClause[] = [];
+              let isFn = true;
+              match (m) {
+                MCtor(ct) => { mc = ct.contracts; },
+                MMethod(md) => { mc = md.contracts; },
+                MField(_) => { isFn = false; }
+              }
+              if (isFn) {
+                if (fk < fns.length) {
+                  raw = addContracts(raw, mp, sm, ids[fns[fk]], mods[fns[fk]], mc);
+                }
+                fk += 1;
+              }
+            }
+          }
+        }
+        if (hasDef) {
+          ti += 1;
+        }
+      }
+    }
+    ui += 1;
+  }
+  // imports between modules
+  for (const u of prog.units) {
+    if (u.module != "") {
+      let ik: usize = 0;
+      for (const item of u.ast.items) {
+        let isImp = false;
+        let sp = Span { file: 0, start: 0, end: 0 };
+        match (item) {
+          IImport(decl) => { isImp = true; sp = decl.span; },
+          IReExport(decl) => { isImp = true; sp = decl.span; },
+          _ => {}
+        }
+        if (isImp) {
+          if (ik < u.imports.length) {
+            match (u.imports[ik]) {
+              ImportUnit(t) => {
+                if (prog.units[t].module != u.module && prog.units[t].module != "") {
+                  raw = addEdge(raw, "IMPORTS", pkg + ":" + displayModule(u.module), pkg + ":" + displayModule(prog.units[t].module),
+                    "MUST", "", mkSpan(mp, sp));
+                }
+              },
+              ImportStd(_) => {}
+            }
+          }
+          ik += 1;
+        }
+      }
+    }
+  }
+  // implements
+  for (const l of idx.impls) {
+    raw = addEdge(raw, "IMPLEMENTS", ids[l.cls], ids[l.iface], "MUST", "", mkSpan(mp, l.span));
+  }
+  // references to types, from the innermost enclosing declaration
+  let tops: usize[][] = [];
+  fi = 0;
+  while (fi < sm.files.length) {
+    tops.push([]);
+    fi += 1;
+  }
+  for (const d of idx.defs) {
+    if (d.container.isNone() && ids[d.id] != "" && d.declSpan.file < tops.length) {
+      tops[d.declSpan.file].push(d.id);
+    }
+  }
+  for (const r of idx.refs) {
+    const td = idx.defs[r.def];
+    const isVariant = match (td.kind) { SkVariant => true, _ => false };
+    if (!isTypeDef(td) && !isVariant) {
+      continue;
+    }
+    let target = r.def;
+    match (td.container) {
+      Some(c) => { target = c; },
+      None => {}
+    }
+    if (ids[target] == "" || r.span.file >= tops.length) {
+      continue;
+    }
+    let owner: Option<usize> = None;
+    for (const tp of tops[r.span.file]) {
+      if (owner.isNone() && containsSpan(idx.defs[tp].declSpan, r.span)) {
+        owner = Some(tp);
+      }
+    }
+    match (owner) {
+      Some(o) => {
+        let inner = o;
+        for (const m of kids[o]) {
+          if (containsSpan(idx.defs[m].declSpan, r.span)) {
+            inner = m;
+          }
+        }
+        let viaImpl = false;
+        for (const l of idx.impls) {
+          if (l.cls == inner && l.iface == target) {
+            viaImpl = true;
+          }
+        }
+        if (!viaImpl) {
+          raw = addEdge(raw, "REFERENCES_TYPE", ids[inner], ids[target], "MUST", "", mkSpan(mp, r.span));
+        }
+      },
+      None => {}
+    }
+  }
+  // calls (plus the implementations of an interface method that a call may reach)
+  let usesUnknown = false;
+  for (const c of idx.calls) {
+    if (ids[c.caller] == "") {
+      continue;
+    }
+    const sp = mkSpan(mp, c.span);
+    match (c.callee) {
+      Some(d) => {
+        if (ids[d] == "") {
+          continue;
+        }
+        raw = addEdge(raw, "CALLS", ids[c.caller], ids[d], c.ev, c.via, sp);
+        match (idx.defs[d].container) {
+          Some(ct) => {
+            const isIface = match (idx.defs[ct].kind) { SkInterface => true, _ => false };
+            if (isIface) {
+              for (const l of idx.impls) {
+                if (l.iface == ct) {
+                  for (const m of kids[l.cls]) {
+                    if (idx.defs[m].name == idx.defs[d].name) {
+                      raw = addEdge(raw, "CALLS", ids[c.caller], ids[m], "MAY", "impl", sp);
+                    }
+                  }
+                }
+              }
+            }
+          },
+          None => {}
+        }
+      },
+      None => {
+        usesUnknown = true;
+        raw = addEdge(raw, "CALLS", ids[c.caller], UNKNOWN_ID, "UNKNOWN", c.via, sp);
+      }
+    }
+  }
+  if (usesUnknown) {
+    raw.nodes.push(ONode {
+      id: UNKNOWN_ID, kind: "Unknown", name: "function value", module: "", owner: "",
+      sig: "target of a call through a function value is not known statically", exported: false, entry: false, span: noSpan()
+    });
+  }
+  // sort
+  let nkeys: string[] = [];
+  for (const n of raw.nodes) {
+    nkeys.push(n.id);
+  }
+  let nodes: ONode[] = [];
+  for (const o of sortOrder(nkeys)) {
+    nodes.push(raw.nodes[o]);
+  }
+  let g = OsigGraph { schema: OSIG_SCHEMA, package: pkg, hash: "", nodes: nodes, edges: finishEdges(raw) };
+  g.hash = hashGraph(g);
+  return g;
+}
+
+function addContracts(r: Raw, mp: Mapper, sm: SourceMap, owner: string, module: string, cs: ContractClause[]): Raw {
+  let x = r;
+  if (owner == "") {
+    return x;
+  }
+  let counts: string[] = [];
+  for (const c of cs) {
+    const kind = contractKind(c);
+    let n: usize = 0;
+    for (const prev of counts) {
+      if (prev == kind) {
+        n += 1;
+      }
+    }
+    counts.push(kind);
+    const id = owner + "@" + kind + "#" + n.toString();
+    const sp = mkSpan(mp, c.span);
+    x.nodes.push(ONode {
+      id: id, kind: "Contract", name: kind, module: module, owner: owner,
+      sig: oneLine(sm.files[c.span.file].text.substring(c.span.start, c.span.end)), exported: false, entry: false, span: sp
+    });
+    x = addEdge(x, "HAS_CONTRACT", owner, id, "MUST", "", sp);
+  }
+  return x;
+}
+
+// ---- serialisation ------------------------------------------------------------------------------------------
+
+function spanJson(s: OSpan): Json {
+  return JObj([
+    jField("file", JStr(s.file)), jField("line", JNum(s.line.toInt())), jField("col", JNum(s.col.toInt())),
+    jField("endLine", JNum(s.endLine.toInt())), jField("endCol", JNum(s.endCol.toInt()))
+  ]);
+}
+
+function nodeLine(n: ONode): string {
+  return stringifyJson(JObj([
+    jField("id", JStr(n.id)), jField("kind", JStr(n.kind)), jField("name", JStr(n.name)), jField("module", JStr(n.module)),
+    jField("owner", JStr(n.owner)), jField("sig", JStr(n.sig)), jField("exported", JBool(n.exported)),
+    jField("entry", JBool(n.entry)), jField("span", spanJson(n.span))
+  ]));
+}
+
+function edgeLine(e: OEdge): string {
+  return stringifyJson(JObj([
+    jField("kind", JStr(e.kind)), jField("src", JStr(e.src)), jField("dst", JStr(e.dst)), jField("evidence", JStr(e.ev)),
+    jField("via", JStr(e.via)), jField("span", spanJson(e.span))
+  ]));
+}
+
+function hexDigit(n: int): string {
+  return String.fromCharCode(n < 10 ? 48 + n : 87 + n);
+}
+
+function hex8(h0: int): string {
+  let h = h0;
+  let out = "";
+  let i = 0;
+  while (i < 8) {
+    out = hexDigit(h % 16) + out;
+    h = h / 16;
+    i += 1;
+  }
+  return out;
+}
+
+function hashOf(parts: string[]): string {
+  let a = 7;
+  let b = 11;
+  for (const s of parts) {
+    let i: usize = 0;
+    while (i < s.length) {
+      const c = s.charCodeAt(i) + 1;
+      a = (a * 131 + c) % 2147483647;
+      b = (b * 257 + c * 3 + 1) % 2147483629;
+      i += 1;
+    }
+    a = (a * 131 + 10) % 2147483647;
+    b = (b * 257 + 31) % 2147483629;
+  }
+  return "h62:" + hex8(a) + hex8(b);
+}
+
+// The fingerprint of the body (schema, package, nodes, edges).
+export function hashGraph(g: OsigGraph): string {
+  let parts: string[] = [g.schema, g.package];
+  for (const n of g.nodes) {
+    parts.push(nodeLine(n));
+  }
+  for (const e of g.edges) {
+    parts.push(edgeLine(e));
+  }
+  return hashOf(parts);
+}
+
+// The snapshot text: one node / edge per line, one trailing newline.
+export function osigJson(g: OsigGraph): string {
+  let lines: string[] = ["{"];
+  lines.push("\"schema\": " + stringifyJson(JStr(g.schema)) + ",");
+  lines.push("\"package\": " + stringifyJson(JStr(g.package)) + ",");
+  lines.push("\"hash\": " + stringifyJson(JStr(g.hash)) + ",");
+  lines.push("\"nodes\": [");
+  let i: usize = 0;
+  while (i < g.nodes.length) {
+    lines.push("  " + nodeLine(g.nodes[i]) + (i + 1 < g.nodes.length ? "," : ""));
+    i += 1;
+  }
+  lines.push("],");
+  lines.push("\"edges\": [");
+  i = 0;
+  while (i < g.edges.length) {
+    lines.push("  " + edgeLine(g.edges[i]) + (i + 1 < g.edges.length ? "," : ""));
+    i += 1;
+  }
+  lines.push("]");
+  lines.push("}");
+  return lines.join("\n") + "\n";
+}
+
+// ---- reading ------------------------------------------------------------------------------------------------
+
+function spanOf(j: Json): OSpan {
+  match (getField(j, "span")) {
+    Some(s) => {
+      return OSpan {
+        file: getStr(s, "file").unwrapOr(""), line: getInt(s, "line").unwrapOr(0).toUsize(), col: getInt(s, "col").unwrapOr(0).toUsize(),
+        endLine: getInt(s, "endLine").unwrapOr(0).toUsize(), endCol: getInt(s, "endCol").unwrapOr(0).toUsize()
+      };
+    },
+    None => { return noSpan(); }
+  }
+}
+
+// Parse a snapshot produced by `orin graph`; verifies the schema major version and the hash.
+export function parseOsig(text: string): Result<OsigGraph, string> {
+  const j = parseJson(text)?;
+  const schema = getStr(j, "schema").unwrapOr("");
+  if (!schema.startsWith("osig/0.")) {
+    return Err("not an OSIG snapshot (schema \"" + schema + "\", this tool reads osig/0.x)");
+  }
+  let nodes: ONode[] = [];
+  const noJ: Json[] = [];
+  for (const n of getArr(j, "nodes").unwrapOr(noJ)) {
+    nodes.push(ONode {
+      id: getStr(n, "id").unwrapOr(""), kind: getStr(n, "kind").unwrapOr(""), name: getStr(n, "name").unwrapOr(""),
+      module: getStr(n, "module").unwrapOr(""), owner: getStr(n, "owner").unwrapOr(""), sig: getStr(n, "sig").unwrapOr(""),
+      exported: getBool(n, "exported").unwrapOr(false), entry: getBool(n, "entry").unwrapOr(false), span: spanOf(n)
+    });
+  }
+  let edges: OEdge[] = [];
+  for (const e of getArr(j, "edges").unwrapOr(noJ)) {
+    edges.push(OEdge {
+      kind: getStr(e, "kind").unwrapOr(""), src: getStr(e, "src").unwrapOr(""), dst: getStr(e, "dst").unwrapOr(""),
+      ev: getStr(e, "evidence").unwrapOr(""), via: getStr(e, "via").unwrapOr(""), span: spanOf(e)
+    });
+  }
+  const g = OsigGraph { schema: schema, package: getStr(j, "package").unwrapOr(""), hash: getStr(j, "hash").unwrapOr(""), nodes: nodes, edges: edges };
+  if (hashGraph(g) != g.hash) {
+    return Err("snapshot hash mismatch: the file was edited or truncated");
+  }
+  return Ok(g);
+}
+
+// ---- loading ------------------------------------------------------------------------------------------------
+
+// The OSIG of `path`: a snapshot file (`.json`), an entry file (`.or`) or a package directory, checked with
+// the self-hosted checker (no std prelude, as `orin api`). Errors are rendered diagnostics.
+export function loadOsig(path: string): Result<OsigGraph, string> {
+  return loadOsigIn(path, "");
+}
+
+// Same, but every file the program reads must lie inside `root` ("" = no restriction; MCP passes its root).
+export function loadOsigIn(path: string, root: string): Result<OsigGraph, string> {
+  if (path.endsWith(".json")) {
+    const t = readFile(path);
+    if (t.isErr()) {
+      return Err("cannot read " + path + ": " + t.unwrapErr());
+    }
+    return parseOsig(t.unwrap());
+  }
+  const noOverlay: SourceFile[] = [];
+  const loaded = loadWithRoots(path, noOverlay, noPreludeRoots());
+  if (loaded.diags.length > 0) {
+    let msgs: string[] = [];
+    for (const d of loaded.diags) {
+      msgs.push(render(loaded.sm, d));
+    }
+    return Err(msgs.join("\n"));
+  }
+  if (root != "") {
+    for (const f of loaded.sm.files) {
+      if (!f.path.startsWith("$") && !isInside(root, f.path)) {
+        return Err("project reads a file outside the authorized root: " + f.path);
+      }
+    }
+  }
+  const program = loaded.program.unwrap();
+  const ci = checkWithIndex(program, loaded.sm);
+  if (ci.result.isErr()) {
+    let msgs: string[] = [];
+    for (const d of ci.result.unwrapErr()) {
+      msgs.push(render(loaded.sm, d));
+    }
+    return Err(msgs.join("\n"));
+  }
+  return Ok(buildOsig(program, ci.index, loaded.sm));
+}

@@ -4,7 +4,8 @@
 
 import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, asStr, getField, getStr, getInt, getBool } from "../json";
 import { Workspace, newWorkspace, openFile, analyze, Analysis, PathDiag, fileIndexOf, offsetToPos, posToOffset,
-  symbolAt, hoverAt, renameEdits, TextEdit, moduleDeps } from "../analysis";
+  symbolAt, hoverAt, renameEdits, TextEdit, moduleDeps, loadOsigIn, osigJson, diffOsig, diffText, diffJson, diffHtml,
+  hasDifferences } from "../analysis";
 import { SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam,
   SkField, SkInterface } from "../hir";
 import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdIo, StdClock } from "../loader";
@@ -109,7 +110,22 @@ export function toolList(): Json[] {
         jField("entry", prop("string", "entry .or file")),
         jField("out", prop("string", "output C file path (inside the root)")),
         jField("binary", prop("string", "also link a native executable at this path (inside the root)"))
-      ], ["entry", "out"]))
+      ], ["entry", "out"])),
+    tool("graph",
+      "OSIG snapshot (docs/osig.md) of the checked program rooted at entry (file or package dir): symbols, modules, calls (MUST/MAY/UNKNOWN evidence), imports, implements, type references, contracts. Returns schema, package, hash and counts; full=true adds the deterministic snapshot JSON; out writes it to a file inside the root.",
+      schema([
+        jField("entry", prop("string", "entry .or file or package directory, relative to the server root")),
+        jField("full", prop("boolean", "include the snapshot JSON (default false: summary only)")),
+        jField("out", prop("string", "also write the snapshot to this file (inside the root)"))
+      ], ["entry"])),
+    tool("diff",
+      "Compare two OSIG snapshots (base, head: package dir, entry .or file or a snapshot .json from graph): changed/added/removed symbols, added/removed call and import edges, HEURISTIC rename candidates, and the entry points that reach changed symbols and new calls, with the explaining path. Absence of an edge is not proof of absence.",
+      schema([
+        jField("base", prop("string", "base package dir / entry file / snapshot .json")),
+        jField("head", prop("string", "head package dir / entry file / snapshot .json")),
+        jField("format", enumProp(["json", "text", "html"], "report format (default json)")),
+        jField("out", prop("string", "write the report to this file (inside the root) instead of returning it"))
+      ], ["base", "head"]))
   ];
 }
 
@@ -131,7 +147,94 @@ export function callTool(st: McpState, name: string, args: Json): Option<ToolOut
   if (name == "build") {
     return Some(toolBuild(st, args));
   }
+  if (name == "graph") {
+    return Some(toolGraph(st, args));
+  }
+  if (name == "diff") {
+    return Some(toolDiff(st, args));
+  }
   return None;
+}
+
+// ---- graph / diff (OSIG, docs/osig.md) --------------------------------------------------------
+
+function toolGraph(st: McpState, args: Json): ToolOut {
+  const entry = getStr(args, "entry");
+  if (entry.isNone()) {
+    return fail(st, "graph: missing `entry`");
+  }
+  const p = resolvePath(st, entry.unwrap());
+  if (p.isErr()) {
+    return fail(st, p.unwrapErr());
+  }
+  const g = loadOsigIn(p.unwrap(), st.root);
+  if (g.isErr()) {
+    return fail(st, g.unwrapErr());
+  }
+  const gr = g.unwrap();
+  const snap = osigJson(gr);
+  const outRel = getStr(args, "out");
+  if (outRel.isSome()) {
+    const op = resolvePath(st, outRel.unwrap());
+    if (op.isErr()) {
+      return fail(st, op.unwrapErr());
+    }
+    const w = writeFile(op.unwrap(), snap);
+    if (w.isErr()) {
+      return fail(st, "cannot write " + outRel.unwrap() + ": " + w.unwrapErr());
+    }
+  }
+  let fields: JField[] = [
+    jField("schema", JStr(gr.schema)), jField("package", JStr(gr.package)), jField("hash", JStr(gr.hash)),
+    jField("nodes", num(gr.nodes.length)), jField("edges", num(gr.edges.length))
+  ];
+  if (getBool(args, "full").unwrapOr(false)) {
+    fields.push(jField("snapshot", JStr(snap)));
+  }
+  return ok(st, JObj(fields));
+}
+
+function toolDiff(st: McpState, args: Json): ToolOut {
+  const base = getStr(args, "base");
+  const head = getStr(args, "head");
+  if (base.isNone() || head.isNone()) {
+    return fail(st, "diff: missing `base` or `head`");
+  }
+  const fmt = getStr(args, "format").unwrapOr("json");
+  if (fmt != "json" && fmt != "text" && fmt != "html") {
+    return fail(st, "diff: format must be json, text or html");
+  }
+  const bp = resolvePath(st, base.unwrap());
+  if (bp.isErr()) {
+    return fail(st, bp.unwrapErr());
+  }
+  const hp = resolvePath(st, head.unwrap());
+  if (hp.isErr()) {
+    return fail(st, hp.unwrapErr());
+  }
+  const b = loadOsigIn(bp.unwrap(), st.root);
+  if (b.isErr()) {
+    return fail(st, "base: " + b.unwrapErr());
+  }
+  const h = loadOsigIn(hp.unwrap(), st.root);
+  if (h.isErr()) {
+    return fail(st, "head: " + h.unwrapErr());
+  }
+  const d = diffOsig(b.unwrap(), h.unwrap());
+  const text = fmt == "json" ? diffJson(d) : (fmt == "html" ? diffHtml(d, "") : diffText(d));
+  const outRel = getStr(args, "out");
+  if (outRel.isSome()) {
+    const op = resolvePath(st, outRel.unwrap());
+    if (op.isErr()) {
+      return fail(st, op.unwrapErr());
+    }
+    const w = writeFile(op.unwrap(), text);
+    if (w.isErr()) {
+      return fail(st, "cannot write " + outRel.unwrap() + ": " + w.unwrapErr());
+    }
+    return ok(st, JObj([jField("written", JStr(outRel.unwrap())), jField("differences", JBool(hasDifferences(d)))]));
+  }
+  return ToolOut { st: st, text: text, err: false };
 }
 
 // ---- analysis helper -----------------------------------------------------------------------
