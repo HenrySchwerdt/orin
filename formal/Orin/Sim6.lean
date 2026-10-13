@@ -175,6 +175,7 @@ theorem op_set_core {x i v : Nat} {a1 : List AS} (hI : Inv ext a s) (hx : x < a.
       hkinds.1 hkinds.2
       (hU_unique hI (T := fun j => j = x ∨ j = v) (Or.inl rfl) hu hl hob hrc hH)
       (hD_unique hI (T := fun j => j = x ∨ j = v) (Or.inl rfl) hu hl hob hrc hH)
+      (hDp_unique hI (T := fun j => j = x ∨ j = v) (Or.inl rfl) hu hl hob hrc hH)
     refine ⟨by rw [killB_length, hlenA1, hlen1]; exact hI.len, hwf, fun j => ?_⟩
     by_cases hj : j = x ∨ j = v
     · rcases hj with hj | hj
@@ -319,6 +320,7 @@ theorem op_takeField {d x i : Nat} (hI : Inv ext a s)
           hkinds.1 hkinds.2
           (hU_unique hI (T := fun j => j = d ∨ j = x) (Or.inr rfl) hu hl hob hrc hH)
           (hD_unique hI (T := fun j => j = d ∨ j = x) (Or.inr rfl) hu hl hob hrc hH)
+          (hDp_unique hI (T := fun j => j = d ∨ j = x) (Or.inr rfl) hu hl hob hrc hH)
         refine ⟨by simp [length_defK, killB_length, takeSt, St.setL]; exact hI.len, ?_, fun j => ?_⟩
         · rw [hP]
           have := wf_take (Pst ext a s) hI.wf d (by rw [Pst_locals_length]; omega) l ob hoP i
@@ -390,7 +392,7 @@ theorem op_makeUnique {x : Nat} (hI : Inv ext a s)
             (fun _ _ => rfl)
             (defK_hk0 a a x _ hx (fun i => Or.inl rfl))
             (defK_hk1 a a x _ hx (fun i => Or.inl rfl))
-            (hU_same rfl) (hD_same rfl) j hj
+            (hU_same rfl) (hD_same rfl) (hDp_same rfl) j hj
     · -- shared: copy
       have hfl : ob.fields.all s.heap.liveb = true := by
         rw [List.all_eq_true]
@@ -455,12 +457,17 @@ theorem op_makeUnique {x : Nat} (hI : Inv ext a s)
               have hc0 : ob.fields.count (.ref l') = 0 := by
                 rw [List.count_eq_zero]
                 intro hm
-                exact (unique_excl hI hui hl' ho' hrc').2.2.2 l ob hob _ hm rfl
+                exact (unique_excl hI hui hl' ho' hrc').2.2.2.1 l ob hob _ hm rfl
               refine ⟨o'', by rw [hheap]; exact ho'', ?_⟩
               simp [Ne.symm hll] at hr
               omega)
             (by
               intro i r p _ _ _ _ _ hd
+              refine desc_mono (fun k o' _ ho' => ?_) hd
+              obtain ⟨o'', ho'', hf, _⟩ := hkeep k o' ho'
+              exact ⟨o'', by rw [hheap]; exact ho'', hf⟩)
+            (by
+              intro i p _ _ _ _ hd
               refine desc_mono (fun k o' _ ho' => ?_) hd
               obtain ⟨o'', ho'', hf, _⟩ := hkeep k o' ho'
               exact ⟨o'', by rw [hheap]; exact ho'', hf⟩) j hj

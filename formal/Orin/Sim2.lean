@@ -69,7 +69,9 @@ theorem cl_frame (T : Nat → Prop)
     (hU : ∀ i l o, ¬T i → gk a i = .unique → gk a' i = .unique → s.get i = .ref l →
       s.heap.objs l = some o → o.rc = 1 → ∃ o', s'.heap.objs l = some o' ∧ o'.rc = 1)
     (hD : ∀ i r p, ¬T i → ¬T r → gk a i = .borrowed r → gk a' i = .borrowed r →
-      s.get r = .ref p → Desc s.heap p (s.get i) → Desc s'.heap p (s.get i)) :
+      s.get r = .ref p → Desc s.heap p (s.get i) → Desc s'.heap p (s.get i))
+    (hDp : ∀ i p, ¬T i → gk a i = .param → gk a' i = .param → Val.ref p ∈ ext →
+      Desc s.heap p (s.get i) → Desc s'.heap p (s.get i)) :
     ∀ i, ¬T i → ClAt ext a' s' i := by
   intro i hi
   have hkk := hk0 i hi
@@ -92,9 +94,10 @@ theorem cl_frame (T : Nat → Prop)
     · rw [e] at h; cases h
   · intro h
     rcases hkk with e | ⟨x, _, _, e⟩ | ⟨_, e⟩
-    · rw [e] at h
-      have := (hcl i).prm h
-      rw [hloc i hi]; exact this
+    · have h2 := h
+      rw [e] at h
+      obtain ⟨p, hp, hd⟩ := (hcl i).prm h
+      exact ⟨p, hp, by rw [hloc i hi]; exact hDp i p hi h h2 hp hd⟩
     · rw [e] at h; cases h
     · rw [e] at h; cases h
   · intro r h
@@ -145,6 +148,19 @@ theorem hD_fields {T : Nat → Prop}
     ∀ i r p, ¬T i → ¬T r → gk a i = .borrowed r → gk a' i = .borrowed r → s.get r = .ref p →
       Desc s.heap p (s.get i) → Desc s'.heap p (s.get i) := by
   intro i r p _ _ _ _ _ hd
+  exact desc_mono (fun k o _ ho => hH k o ho) hd
+
+theorem hDp_same {T : Nat → Prop} (hH : s'.heap = s.heap) :
+    ∀ i p, ¬T i → gk a i = .param → gk a' i = .param → Val.ref p ∈ ext →
+      Desc s.heap p (s.get i) → Desc s'.heap p (s.get i) := by
+  intro i p _ _ _ _ hd
+  rw [hH]; exact hd
+
+theorem hDp_fields {T : Nat → Prop}
+    (hH : ∀ k o, s.heap.objs k = some o → ∃ o', s'.heap.objs k = some o' ∧ o'.fields = o.fields) :
+    ∀ i p, ¬T i → gk a i = .param → gk a' i = .param → Val.ref p ∈ ext →
+      Desc s.heap p (s.get i) → Desc s'.heap p (s.get i) := by
+  intro i p _ _ _ _ hd
   exact desc_mono (fun k o _ ho => hH k o ho) hd
 
 end Orin

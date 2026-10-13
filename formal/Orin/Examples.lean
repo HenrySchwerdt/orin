@@ -73,7 +73,29 @@ def badJoin : Prog :=
       .ite 0 (.op (.release 1) .nil) .nil <|
       .op (.release 1) .nil }
 
+/-- `make_unique` on a borrowed alias (not owned) -/
+def badMakeUniqueBorrowed : Prog :=
+  { n := 2, params := [true], code := .op (.borrow 1 0) (.op (.makeUnique 1) .nil) }
+
+/-- in-place store into a parameter -/
+def badStoreIntoParam : Prog :=
+  { n := 2, params := [true], code := .op (.alloc 1 0) (.op (.setField 0 0 1) .nil) }
+
+/-- moving out of a borrowed alias -/
+def badMoveBorrowed : Prog :=
+  { n := 3, params := [true],
+    code := .op (.getField 1 0 0 true) (.op (.move 2 1) .nil) }
+
+/-- reading a taken slot's owner after the hole was never filled: open hole at return -/
+def badOpenHole : Prog :=
+  { n := 3, params := [],
+    code := .op (.alloc 0 0) <| Code.structNew 1 [0] <| .op (.takeField 2 1 0) .nil }
+
 example : check exBorrowDup = true := by decide
+example : check badMakeUniqueBorrowed = false := by decide
+example : check badStoreIntoParam = false := by decide
+example : check badMoveBorrowed = false := by decide
+example : check badOpenHole = false := by decide
 example : check exCow = true := by decide
 example : check exTakePut = true := by decide
 example : check exIf = true := by decide

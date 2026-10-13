@@ -41,7 +41,7 @@ theorem op_const {d : Nat} {n : Int} (hI : Inv ext a s)
         hI.cl (fun i hi => get_other s _ d _ hdl hs' i hi)
         (defK_hk0 a a d _ (hI.len ▸ hdl) (fun i => Or.inl rfl))
         (defK_hk1 a a d _ (hI.len ▸ hdl) (fun i => Or.inl rfl))
-        (hU_same rfl) (hD_same rfl)
+        (hU_same rfl) (hD_same rfl) (hDp_same rfl)
       intro i
       by_cases hi : i = d
       · subst hi
@@ -83,7 +83,7 @@ theorem op_release {x : Nat} (hI : Inv ext a s)
         hI.cl (fun i hi => get_other s _ x _ hxl hs' i hi)
         (defK_hk0 a a x .dead (hI.len ▸ hxl) (fun i => Or.inl rfl))
         (defK_hk1 a a x .dead (hI.len ▸ hxl) (fun i => Or.inl rfl))
-        (hU_same rfl) (hD_same rfl)
+        (hU_same rfl) (hD_same rfl) (hDp_same rfl)
       intro i
       by_cases hi : i = x
       · subst hi
@@ -197,7 +197,7 @@ theorem op_move {d x : Nat} (hI : Inv ext a s)
       have hF := cl_frame (T := fun i => i = d ∨ i = x)
         (a' := defK (defK a x .dead) d (gk a x))
         (s' := { s with locals := (s.locals.set d (s.get x)).set x (.int 0) })
-        hI.cl hloc hk0 hk1 (hU_same rfl) (hD_same rfl)
+        hI.cl hloc hk0 hk1 (hU_same rfl) (hD_same rfl) (hDp_same rfl)
       intro i
       by_cases hi : i = d ∨ i = x
       · rcases hi with hi | hi
@@ -267,7 +267,7 @@ theorem op_borrow {d x : Nat} (hI : Inv ext a s)
         hI.cl (fun i hi => get_other s _ d _ hdl hs' i hi)
         (defK_hk0 a (demote a x) d _ hd1 hdk0)
         (defK_hk1 a (demote a x) d _ hd1 hdk0)
-        (hU_same rfl) (hD_same rfl)
+        (hU_same rfl) (hD_same rfl) (hDp_same rfl)
       intro i
       by_cases hi : i = d
       · subst hi
@@ -361,6 +361,7 @@ theorem op_dup {d x : Nat} (hI : Inv ext a s)
           refine ⟨_, Heap.bump_objs_some s.heap [s.get x] l o ho, ?_⟩
           simp [count_single, hne, hrc])
         (hD_fields (fun k o ho => ⟨_, Heap.bump_objs_some s.heap [s.get x] k o ho, rfl⟩))
+        (hDp_fields (fun k o ho => ⟨_, Heap.bump_objs_some s.heap [s.get x] k o ho, rfl⟩))
       intro i
       by_cases hi : i = d
       · subst hi

@@ -4,8 +4,9 @@ import Orin.Sound
 # Headline theorem: verifier-accepted MIR (core fragment) never reaches `bad`
 
 `check_sound`: let `p` be accepted by `check`. Start the machine in any state in which the first
-`|params|` locals hold the arguments (references borrowed from the caller, whose own counts are
-recorded in the list `ext` and accounted for by the heap: `WF ⟨H, ext, []⟩`; scalars for scalar
+`|params|` locals hold the arguments (reference arguments are borrowed from the caller: each is a
+reference `l` lying at or below some reference `q` that the caller owns, recorded in the list `ext`
+and accounted for by the heap, `WF ⟨H, ext, []⟩`, `Desc H q (ref l)`; scalar arguments for scalar
 parameters) and all other locals are dead.  Then no reachable configuration takes a `bad` step:
 no access to a freed or never-allocated object (use after free, double free), and no in-place store
 into an object whose reference count is not 1 (no mutation through a shared alias).
@@ -50,7 +51,8 @@ theorem gk_entry (p : Prog) (i : Nat) :
 
 theorem entry_inv (p : Prog) (hn : p.params.length ≤ p.n) (ext : List Val) (H : Heap)
     (vals : List Val) (hlen : vals.length = p.params.length) (hext : WF ⟨H, ext, []⟩)
-    (href : ∀ i : Nat, p.params[i]? = some true → ∃ l, vals[i]? = some (Val.ref l) ∧ Val.ref l ∈ ext)
+    (href : ∀ i : Nat, p.params[i]? = some true →
+      ∃ l q, vals[i]? = some (Val.ref l) ∧ Val.ref q ∈ ext ∧ Desc H q (Val.ref l))
     (hsc : ∀ i : Nat, p.params[i]? = some false → ∃ n, vals[i]? = some (Val.int n)) :
     Inv ext p.entry.ls (initSt p H vals) := by
   have hlenE : p.entry.ls.length = p.n := by
@@ -105,13 +107,13 @@ theorem entry_inv (p : Prog) (hn : p.params.length ≤ p.n) (ext : List Val) (H 
         rw [hget i hi]; simp [List.getD_eq_getElem?_getD, hvn]
       | true =>
         rw [hpi] at hk
-        obtain ⟨l, hvl, hmem⟩ := href i hpi
+        obtain ⟨l, q, hvl, hmem, hdesc⟩ := href i hpi
         have hg : (initSt p H vals).get i = .ref l := by
           rw [hget i hi]; simp [List.getD_eq_getElem?_getD, hvl]
         refine ⟨?_, ?_, ?_, ?_, ?_⟩
         · intro e; simp [hk] at e
         · intro e; simp [hk] at e
-        · intro _; rw [hg]; exact hmem
+        · intro _; exact ⟨q, hmem, by rw [hg]; exact hdesc⟩
         · intro r e; simp [hk] at e
         · intro _; exact ⟨l, hg⟩
 
@@ -120,7 +122,8 @@ no use after free / double free (`bad dead`) and no in-place store into a shared
 (`bad shared`), from any entry state satisfying the caller contract. -/
 theorem check_sound (p : Prog) (hp : check p = true) (ext : List Val) (H : Heap)
     (vals : List Val) (hlen : vals.length = p.params.length) (hext : WF ⟨H, ext, []⟩)
-    (href : ∀ i : Nat, p.params[i]? = some true → ∃ l, vals[i]? = some (Val.ref l) ∧ Val.ref l ∈ ext)
+    (href : ∀ i : Nat, p.params[i]? = some true →
+      ∃ l q, vals[i]? = some (Val.ref l) ∧ Val.ref q ∈ ext ∧ Desc H q (Val.ref l))
     (hsc : ∀ i : Nat, p.params[i]? = some false → ∃ n, vals[i]? = some (Val.int n))
     {c : Code × St} (hr : MReach (p.code, initSt p H vals) c) :
     ∀ k, mstep c ≠ some (.bad k) := by
@@ -129,7 +132,8 @@ theorem check_sound (p : Prog) (hp : check p = true) (ext : List Val) (H : Heap)
 
 theorem check_no_use_after_free (p : Prog) (hp : check p = true) (ext : List Val) (H : Heap)
     (vals : List Val) (hlen : vals.length = p.params.length) (hext : WF ⟨H, ext, []⟩)
-    (href : ∀ i : Nat, p.params[i]? = some true → ∃ l, vals[i]? = some (Val.ref l) ∧ Val.ref l ∈ ext)
+    (href : ∀ i : Nat, p.params[i]? = some true →
+      ∃ l q, vals[i]? = some (Val.ref l) ∧ Val.ref q ∈ ext ∧ Desc H q (Val.ref l))
     (hsc : ∀ i : Nat, p.params[i]? = some false → ∃ n, vals[i]? = some (Val.int n))
     {c : Code × St} (hr : MReach (p.code, initSt p H vals) c) :
     mstep c ≠ some (.bad .dead) :=
@@ -137,7 +141,8 @@ theorem check_no_use_after_free (p : Prog) (hp : check p = true) (ext : List Val
 
 theorem check_no_shared_store (p : Prog) (hp : check p = true) (ext : List Val) (H : Heap)
     (vals : List Val) (hlen : vals.length = p.params.length) (hext : WF ⟨H, ext, []⟩)
-    (href : ∀ i : Nat, p.params[i]? = some true → ∃ l, vals[i]? = some (Val.ref l) ∧ Val.ref l ∈ ext)
+    (href : ∀ i : Nat, p.params[i]? = some true →
+      ∃ l q, vals[i]? = some (Val.ref l) ∧ Val.ref q ∈ ext ∧ Desc H q (Val.ref l))
     (hsc : ∀ i : Nat, p.params[i]? = some false → ∃ n, vals[i]? = some (Val.int n))
     {c : Code × St} (hr : MReach (p.code, initSt p H vals) c) :
     mstep c ≠ some (.bad .shared) :=

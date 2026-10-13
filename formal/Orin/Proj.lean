@@ -82,8 +82,9 @@ structure ClAt (ext : List Val) (a : List AS) (s : St) (i : Nat) : Prop where
   ini : gk a i = .init → ∃ n, s.get i = .int n
   /-- `Unique` locals hold a reference to a count-1 object -/
   uniq : gk a i = .unique → ∃ l o, s.get i = .ref l ∧ s.heap.objs l = some o ∧ o.rc = 1
-  /-- `Param` locals hold a reference owned by the caller -/
-  prm : gk a i = .param → s.get i ∈ ext
+  /-- `Param` locals hold a reference anchored by the caller: the caller owns a reference `p`
+  (a member of `ext`), and the parameter is `p` itself or lies in a slot reachable from it -/
+  prm : gk a i = .param → ∃ p, Val.ref p ∈ ext ∧ Desc s.heap p (s.get i)
   /-- `Borrowed r`: `r` is a root (counted or parameter) holding `ref p`, and the alias lies in
   the `Desc` chain of `p`; a root that is `Unique` is not aliased by its own whole object -/
   bor : ∀ r, gk a i = .borrowed r → (gk a r).isRoot = true ∧ ∃ p, s.get r = .ref p ∧

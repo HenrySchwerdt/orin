@@ -42,7 +42,26 @@ theorem hD_unique {T : Nat → Prop} (hI : Inv ext a s) {x l : Nat} {o : Obj} (h
     · have hpk : p = k := by injection he with h; exact h.symm
       subst hpk
       exact hex.1 r hrx hroot hp
-    · exact hex.2.2.2 m o'' ho'' _ hw rfl
+    · exact hex.2.2.2.1 m o'' ho'' _ hw rfl
+  exact ⟨o', by rw [hH k hkl]; exact ho', rfl⟩
+
+/-- ... and likewise for the caller-anchored parameters. -/
+theorem hDp_unique {T : Nat → Prop} (hI : Inv ext a s) {x l : Nat} {o : Obj} (hTx : T x)
+    (hu : gk a x = .unique) (hl : s.get x = .ref l) (ho : s.heap.objs l = some o)
+    (hrc : o.rc = 1) (hH : ∀ k, k ≠ l → s'.heap.objs k = s.heap.objs k) :
+    ∀ i p, ¬T i → gk a i = .param → gk a' i = .param → Val.ref p ∈ ext →
+      Desc s.heap p (s.get i) → Desc s'.heap p (s.get i) := by
+  intro i p _ _ _ hp hd
+  have hex := unique_excl hI hu hl ho hrc
+  refine desc_mono (fun k o' hk ho' => ?_) hd
+  have hkl : k ≠ l := by
+    intro e
+    subst e
+    rcases desc_cases hk with he | ⟨m, o'', ho'', hw, _⟩
+    · have hpk : p = k := by injection he with h; exact h.symm
+      subst hpk
+      exact hex.2.2.2.2 _ hp rfl
+    · exact hex.2.2.2.1 m o'' ho'' _ hw rfl
   exact ⟨o', by rw [hH k hkl]; exact ho', rfl⟩
 
 theorem alloc_objs_old (H : Heap) (fs : List Val) (k : Nat) (hk : k ≠ H.next) :
@@ -105,6 +124,12 @@ theorem op_alloc {d n : Nat} (hI : Inv ext a s)
           exact ⟨o', by
             show (s.heap.alloc _).1.objs k = _
             rw [alloc_objs_old _ _ _ (hold k o' ho')]; exact ho', rfl⟩)
+        (by
+          intro i p _ _ _ _ hd
+          refine desc_mono (fun k o' _ ho' => ?_) hd
+          exact ⟨o', by
+            show (s.heap.alloc _).1.objs k = _
+            rw [alloc_objs_old _ _ _ (hold k o' ho')]; exact ho', rfl⟩)
       intro i
       by_cases hi : i = d
       · subst hi
@@ -134,7 +159,7 @@ theorem def_uncounted {d : Nat} (hI : Inv ext a s) (hd : d < a.length) (k : AS)
       hI.cl (fun i hi => get_other s _ d _ hdl hs' i hi)
       (defK_hk0 a a d _ (hI.len ▸ hdl) (fun i => Or.inl rfl))
       (defK_hk1 a a d _ (hI.len ▸ hdl) (fun i => Or.inl rfl))
-      (hU_same rfl) (hD_same rfl) i hi
+      (hU_same rfl) (hD_same rfl) (hDp_same rfl) i hi
 
 theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
     (h : stepL np a (.getField d o i r) = some a') : OpSafe ext a' (opGetField s d o i r) := by
@@ -228,7 +253,7 @@ theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
                   rw [hp] at hl'
                   have hpl : p = l' := by injection hl'
                   subst hpl
-                  exact (unique_excl hI hu hp ho' hrc').2.2.2 lo obj hobj w hwmem hweq
+                  exact (unique_excl hI hu hp ho' hrc').2.2.2.1 lo obj hobj w hwmem hweq
               | owned | unique | param =>
                 have hrr : rootOf a o = o := by simp [rootOf, hk]
                 rw [hrr] at hroot ⊢
@@ -244,7 +269,7 @@ theorem op_getField {d o i : Nat} {r : Bool} (hI : Inv ext a s)
                   rw [hlo] at hl'
                   have hpl : lo = l' := by injection hl'
                   subst hpl
-                  exact (unique_excl hI hu hlo ho' hrc').2.2.2 lo obj hobj w hwmem hweq
+                  exact (unique_excl hI hu hlo ho' hrc').2.2.2.1 lo obj hobj w hwmem hweq
               | _ => rw [hk] at hrefo; simp [AS.isRef] at hrefo
             · exact hcl i' hi'
           · simp at h

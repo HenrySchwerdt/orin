@@ -10,10 +10,15 @@ import Orin.Mir
 instruction (`compiler/verify/rules.or`), `stepH` the hole-set discipline, `joinS` the join at
 the end of an `if`/`else`, `chk` the checker and `check` the whole-program decision.
 
-Differences from the Orin implementation are listed in `docs/formal.md` (section "Mechanised
-ownership analysis"); the only ones that make this checker *stricter* are
-`d ≠ rootOf(src)` for borrows (the verifier accepts the self-rooted result with a leak
-warning) and that a join keeps `Borrowed(r)` only when `r` joins to a root state.
+This is a transcription of the *rules* (`docs/mir.md` plus its implementation notes), not a
+verification of the Orin source of the verifier.  Differences, all of which make this checker
+stricter or are encoding choices, are listed in `docs/formal.md` (section "Mechanised ownership
+analysis"): (1) a borrow/projection result may not be rooted at its own destination
+(`rootOf src ≠ d`; the verifier accepts the self-rooted `Borrowed(d)` with a leak warning),
+(2) a join keeps `Borrowed(r)` only when `r` joins to a root kind, (3) `IStructNew` is the macro
+`alloc` + `setField`s, so an operand equal to the destination is rejected, (4) `setField`/`putField`
+reject `v = x` (as `wf.or` does), (5) there are no leak warnings and `MaybeDead`/`MaybeLeak` are
+one kind `poison`.
 -/
 
 namespace Orin
