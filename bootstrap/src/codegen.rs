@@ -399,6 +399,11 @@ impl FnGen<'_, '_> {
     /// final object itself) and `_s` points at the final slot.
     fn place_walk(&mut self, p: &Place, idx: &[Option<String>], whole: bool, out: &mut String) {
         let r = p.root.0;
+        if p.path.is_empty() && !whole {
+            // Plain local assignment: nothing to make unique (the root may be a scalar).
+            out.push_str("OrinObj *_c = 0; uint64_t *_s = 0; (void)_c; (void)_s;\n");
+            return;
+        }
         let _ = writeln!(out, "l{r} = orin_make_unique(l{r});\nOrinObj *_c = l{r}; uint64_t *_s = 0; (void)_s;");
         let n = p.path.len();
         for (k, el) in p.path.iter().enumerate() {
