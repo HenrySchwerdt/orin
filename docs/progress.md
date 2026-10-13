@@ -2,21 +2,30 @@
 
 _Updated: 2026-10-13_
 
-## Current stage
-**M1 reached:** Stage 0 (`orinb`, Rust) compiles Orin-B to C and passes the conformance suite
-(75 run + 61 error tests), also under ASan/UBSan. Stage 1 (Orin) components are being written;
-the Stage 1 parser already compiles with Stage 0 and runs natively.
+## Current stage: self-hosting alpha (M3 reached)
+- The compiler in `compiler/` (~6,000 lines of Orin-B) is compiled by Stage 0 (`orin1`), compiles
+  itself (`orin2`), and `orin2` compiles it again: `stage2.c` and `stage3.c` are byte-identical
+  (`tools/bootstrap.sh`, run in CI).
+- `orin2` passes the full conformance suite (76 run + 61 error tests), also with ASan/UBSan.
+- `orin2` built with ASan/UBSan compiles itself without memory errors.
+- Self-compile time: ~0.1 s (plus the C compiler).
+- Stage 0 and Stage 1 parsers agree on 753 files (`tools/diff_parsers.py`, in CI).
+
+This is "self-hosting alpha" in the sense of spec.md "Definition of maturity": **not** formally
+verified; memory safety is supported by tests and sanitizers only.
 
 ## Capability matrix
-| Component | Stage 0 (Rust) | Stage 1 (Orin) |
+| Component | Stage 0 (Rust, frozen) | Self-hosted (Orin) |
 |---|---|---|
-| Lexer/parser | done (50 unit tests) | written; compiles & runs; differential test pending |
-| Loader/modules (E0301–E0303) | done | in progress |
-| Checker → HIR | done (54 unit tests) | in progress |
-| C codegen + runtime | done (18 tests, ASan) | not started |
-| Driver (`compile`) | done | not started |
-| Conformance suite | 136/136 pass | – |
+| Lexer/parser | done | done; differential-tested vs Stage 0 |
+| Loader/modules (E0301–E0303) | done | done |
+| Checker → HIR | done | done (same diagnostics on the error suite) |
+| C codegen + runtime | done | done (ASan-clean) |
+| Driver `check`/`compile` | done | done |
 
 ## Next milestones
-- M2: Stage 1 compiler complete (`compiler/main.or`), passing the conformance suite when built by Stage 0.
-- M3: Stage 2 / Stage 3 bootstrap with byte-identical C output, in CI.
+1. Freeze Stage 0 (bug fixes only); all new language work goes into `compiler/`.
+2. MIR + OIM memory IR and independent verifier (spec 07, ADR-0006), C backend on MIR.
+3. Language growth in the self-hosted compiler: generics, closures, classes (lowering),
+   floats, maps, interfaces, annotations — each with an ADR and conformance tests.
+4. LLVM IR backend (ADR-0006); benchmarks (spec 11); formal core calculus (spec 07); `orin mcp`.
