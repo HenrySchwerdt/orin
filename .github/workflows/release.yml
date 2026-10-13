@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            plat: linux-x86_64
+          - os: macos-14
+            plat: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bootstrap (stage0 -> orin1 -> orin2 -> stage3, compare, conformance)
+        run: ./tools/bootstrap.sh
+      - name: Full conformance suite with the self-hosted compiler
+        run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all
+      - name: Package
+        run: ./tools/package.sh "${GITHUB_REF_NAME#v}" "${{ matrix.plat }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orin-${{ matrix.plat }}
+          path: build/dist/*.tar.gz
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --prerelease --title "Orin $GITHUB_REF_NAME (experimental)" \
+            --notes-file CHANGELOG.md
