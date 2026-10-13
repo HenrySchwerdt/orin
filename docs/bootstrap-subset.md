@@ -224,6 +224,10 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0411 | missing/duplicate/unknown record literal field |
 | E0412 | invalid or missing `main` |
 | E0413 | generic instantiation limit exceeded (self-hosted compiler only, ADR-0007) |
+| E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
+| E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
+| E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |
+| E0503 | invalid `orin.toml` (unknown key/table, wrong value type, missing `[package] name`, an `[architecture]` flag set to `false`) (beyond Orin-B) |
 
 ## 10. Clarifications (v1.1, from conformance-suite review)
 

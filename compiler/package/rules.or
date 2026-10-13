@@ -1,0 +1,91 @@
+// Architecture rules of a package (spec 04): which module may import which, and module-level
+// import cycles. Pure functions over module ids (directory relative to the src root, "." = root).
+
+import { Manifest, ruleIndex } from "./manifest";
+
+export function displayModule(m: string): string {
+  return m == "." ? "(root)" : m;
+}
+
+function listHas(xs: string[], x: string): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// `Some(message)` when module `src` may not import module `dst` under the manifest's
+// `allowed_dependencies` rule for `src` (E0501); `None` when allowed or when `src` has no rule.
+// A module may always import its own descendant modules (`users` -> `users/internal`).
+export function edgeError(m: Manifest, src: string, dst: string): Option<string> {
+  const ri = ruleIndex(m, src);
+  if (ri.isNone()) {
+    return None;
+  }
+  const rule = m.rules[ri.unwrap()];
+  if (listHas(rule.allowed, dst)) {
+    return None;
+  }
+  if (src != "." && dst.startsWith(src + "/")) {
+    return None;
+  }
+  const shown = rule.allowed.length == 0 ? "none" : rule.allowed.join(", ");
+  return Some("module `" + displayModule(src) + "` must not import module `" + displayModule(dst)
+    + "`: it is not in allowed_dependencies of [modules." + (src == "." ? "\".\"" : src.split("/").join(".")) + "] in orin.toml (allowed: " + shown + ")");
+}
+
+// A cycle among the module edges (`src[i]` imports `dst[i]`, self edges ignored) as the list of
+// module ids `a, b, ..., a`, or an empty list when the graph is acyclic. Deterministic: the first
+// edge (in order) that lies on a cycle.
+export function findModuleCycle(src: string[], dst: string[]): string[] {
+  let e: usize = 0;
+  while (e < src.length) {
+    if (src[e] != dst[e]) {
+      // BFS from dst[e] looking for src[e].
+      let nodes: string[] = [dst[e]];
+      let parent: int[] = [-1];
+      let head: usize = 0;
+      let found: int = -1;
+      while (head < nodes.length && found < 0) {
+        const cur = nodes[head];
+        let k: usize = 0;
+        while (k < src.length) {
+          if (src[k] == cur && dst[k] != cur && !listHas(nodes, dst[k])) {
+            nodes.push(dst[k]);
+            parent.push(head.toInt());
+            if (dst[k] == src[e]) {
+              found = (nodes.length - 1).toInt();
+              break;
+            }
+          }
+          k += 1;
+        }
+        head += 1;
+      }
+      if (found < 0 && dst[e] == src[e]) {
+        found = 0;
+      }
+      if (found >= 0) {
+        let path: string[] = [];
+        let at = found;
+        while (at >= 0) {
+          path.push(nodes[at.toUsize()]);
+          at = parent[at.toUsize()];
+        }
+        // `path` runs backwards from src[e] to dst[e]; the cycle is src[e] -> dst[e] ... -> src[e].
+        let out: string[] = [src[e]];
+        let q = path.length;
+        while (q > 0) {
+          q -= 1;
+          out.push(path[q]);
+        }
+        return out;
+      }
+    }
+    e += 1;
+  }
+  const none: string[] = [];
+  return none;
+}

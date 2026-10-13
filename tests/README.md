@@ -50,3 +50,11 @@ executable with `ASAN_OPTIONS=detect_leaks=0`). Build products live under `build
 
 A per-category and total `passed/failed` summary; for each failure the diff head (stdout
 mismatch), exit status, or compiler/C stderr head. Exit status is non-zero if any test fails.
+
+## Packages
+
+`tests/next/run/package_modules/` and `tests/next/errors/e05*/` are multi-file tests whose
+directory carries an `orin.toml` with `entry = "main.or"` (so the runner's `main.or` convention
+works); the loader finds the manifest from the entry file. `tools/test_packages.sh` tests the
+default layout (`tests/next/packages/shop`, entry `src/main.or`), package-directory arguments,
+`orin check --deps` and `orin api [--check]`.
