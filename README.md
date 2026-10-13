@@ -140,3 +140,7 @@ python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all
 - Design decisions (ADRs): [`docs/decisions/`](docs/decisions)
 - Formal model: [`docs/formal.md`](docs/formal.md) · Memory IR: [`docs/mir.md`](docs/mir.md)
 - Progress and roadmap: [`docs/progress.md`](docs/progress.md)
+
+## License
+
+Orin is released under the [MIT License](LICENSE).
