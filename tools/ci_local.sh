@@ -22,6 +22,7 @@ step "verify all"              python3 tools/verify_all.py compiler/main.or
 step "contract erasure"        python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2
 step "annotation erasure"      python3 tools/test_annotation_erasure.py --orinc build/bootstrap/orin2
 step "annotations, orin test"  python3 tools/test_annotations.py --orinc build/bootstrap/orin2
+step "provable std (tests+mutants)" tools/test_std.sh --mutate
 step "contract verification"   python3 tools/test_verify_contracts.py --require-z3 --orinc build/bootstrap/orin2
 step "platform layer"         sh -c 'tools/check_platform_boundary.sh && tools/verify_platform.sh'
 step "runtime unit tests"      sh -c 'cc -g -fsanitize=address,undefined -I runtime runtime/tests/runtime_test.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/runtime_test && build/runtime_test'
