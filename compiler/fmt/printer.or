@@ -17,7 +17,7 @@ import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
   UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember,
-  CtorParam
+  CtorParam, FnTyParam, ArrowParam, ArrowBody
 } from "../syntax";
 import { Ctx, seq, bracketed, gapsHave, hasCommentIn, findChar } from "./layout";
 import { pad, quote, endCol } from "./text";
@@ -48,7 +48,18 @@ function typeText(t: TypeExpr): string {
       return id.name + "<" + joinTypes(args) + ">";
     },
     TArray(el) => {
-      return typeText(el) + "[]";
+      const inner = typeText(el);
+      match (el.kind) {
+        TFn(_, _) => { return "(" + inner + ")[]"; },
+        _ => { return inner + "[]"; }
+      }
+    },
+    TFn(ps, ret) => {
+      let parts: string[] = [];
+      for (const p of ps) {
+        parts.push(p.name.name + ": " + typeText(p.ty));
+      }
+      return "(" + parts.join(", ") + ") => " + typeText(ret);
     }
   }
 }
@@ -183,6 +194,7 @@ function prec(e: Expr): int {
     EMember(_, _) => { return 8; },
     EIndex(_, _) => { return 8; },
     ETry(_) => { return 8; },
+    EArrow(_, _, _) => { return 0 - 1; },
     _ => { return 9; }
   }
 }
@@ -282,6 +294,39 @@ function exBreak(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usiz
     },
     EThis => {
       return "this";
+    },
+    EArrow(ps, ret, body) => {
+      return arrowText(c, ps, ret, body, ind, col, tail, lim);
+    }
+  }
+}
+
+// `x => e`, `(x: T, y) : R => e`, with a block body when written with one.
+function arrowText(c: Ctx, ps: ArrowParam[], ret: Option<TypeExpr>, body: ArrowBody, ind: usize, col: usize, tail: usize, lim: usize): string {
+  let head = "";
+  if (ps.length == 1 && ps[0].ty.isNone() && ret.isNone()) {
+    head = ps[0].name.name + " =>";
+  } else {
+    let parts: string[] = [];
+    for (const p of ps) {
+      if (p.ty.isSome()) {
+        parts.push(p.name.name + ": " + typeText(p.ty.unwrap()));
+      } else {
+        parts.push(p.name.name);
+      }
+    }
+    head = "(" + parts.join(", ") + ")";
+    if (ret.isSome()) {
+      head += ": " + typeText(ret.unwrap());
+    }
+    head += " =>";
+  }
+  match (body) {
+    AExpr(x) => {
+      return head + " " + ex(c, x, ind, col + head.length + 1, tail, lim);
+    },
+    ABlock(b) => {
+      return head + " " + block(c, b, ind);
     }
   }
 }
@@ -359,13 +404,25 @@ function binaryText(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: u
   return lines.join("\n");
 }
 
+// A branch of `c ? a : b`; an arrow function there needs parentheses (its body would swallow the `:`).
+function branch(c: Ctx, e: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
+  const isArrow = match (e.kind) {
+    EArrow(_, _, _) => true,
+    _ => false
+  };
+  if (isArrow) {
+    return "(" + ex(c, e, ind, col + 1, tail + 1, lim) + ")";
+  }
+  return ex(c, e, ind, col, tail, lim);
+}
+
 function condText(c: Ctx, cd: Expr, a: Expr, b: Expr, ind: usize, col: usize, tail: usize, lim: usize): string {
   if (lim >= HUGE) {
-    return sub(c, cd, 1, 0, 0, 0, false, HUGE) + " ? " + ex(c, a, 0, 0, 0, HUGE) + " : " + ex(c, b, 0, 0, 0, HUGE);
+    return sub(c, cd, 1, 0, 0, 0, false, HUGE) + " ? " + branch(c, a, 0, 0, 0, HUGE) + " : " + branch(c, b, 0, 0, 0, HUGE);
   }
   const p = pad(ind + 4);
-  return sub(c, cd, 1, ind, col, 0, false, lim) + "\n" + p + "? " + ex(c, a, ind + 4, ind + 6, 0, lim) + "\n" + p
-    + ": " + ex(c, b, ind + 4, ind + 6, tail, lim);
+  return sub(c, cd, 1, ind, col, 0, false, lim) + "\n" + p + "? " + branch(c, a, ind + 4, ind + 6, 0, lim) + "\n" + p
+    + ": " + branch(c, b, ind + 4, ind + 6, tail, lim);
 }
 
 function callText(c: Ctx, e: Expr, callee: Expr, args: Expr[], ind: usize, col: usize, tail: usize, lim: usize): string {
@@ -406,10 +463,38 @@ function callArgs(c: Ctx, e: Expr, cs: string, calleeEnd: usize, args: Expr[], i
     const hug = match (args[0].kind) {
       ERecord(_, _, _) => true,
       EArray(_) => true,
+      EArrow(_, _, b) => match (b) { ABlock(_) => true, _ => false },
       _ => false
     };
     if (hug) {
       return cs + "(" + ex(c, args[0], ind, endCol(cs, col) + 1, tail + 1, lim) + ")";
+    }
+  }
+  if (args.length >= 2 && !forced) {
+    // A block arrow function first, followed by short arguments: `xs.reduce((a, x) => { .. }, 0)`.
+    const firstBlock = match (args[0].kind) {
+      EArrow(_, _, b) => match (b) {
+        ABlock(_) => true,
+        _ => false
+      },
+      _ => false
+    };
+    if (firstBlock) {
+      let rest: string[] = [];
+      let multi = false;
+      let i: usize = 1;
+      while (i < args.length) {
+        const r = ex(c, args[i], 0, 0, 0, HUGE);
+        if (r.includes("\n")) {
+          multi = true;
+        }
+        rest.push(r);
+        i += 1;
+      }
+      if (!multi) {
+        const restText = ", " + rest.join(", ");
+        return cs + "(" + ex(c, args[0], ind, endCol(cs, col) + 1, restText.length + 1 + tail, lim) + restText + ")";
+      }
     }
   }
   let texts: string[] = [];

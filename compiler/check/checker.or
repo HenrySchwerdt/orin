@@ -2,9 +2,10 @@
 // pipeline if it produced diagnostics (same as bootstrap/src/checker/mod.rs `check`).
 
 import { Diagnostic, SourceMap, diag } from "../diag";
-import { Ident, DAlias } from "../syntax";
+import { Ident, DAlias, parse } from "../syntax";
 import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type } from "../hir";
-import { LoadedProgram } from "../loader";
+import { LoadedProgram, Unit, ImportTarget } from "../loader";
+import { preludeArraySource } from "../prelude";
 import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
 import { collect } from "./collect";
 import { resolveDecls, findMain } from "./decls";
@@ -19,6 +20,11 @@ type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
 // Checks one function body. `abs` marks the abstract check of a generic body (type parameters
 // are opaque types; no function instances are created). Returns the (possibly grown) environment.
 function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
+  if (f.mode == 6) {
+    // A lifted closure function: its HIR was produced while its enclosing function was checked.
+    const noErr: Option<Diagnostic> = None;
+    return FuncOut { func: env.lifted[f.cls], err: noErr, env: env };
+  }
   const fx = newFnCtx(f, env, abs);
   const r = checkBlock(env, fx, f.decl.body);
   return match (r) {
@@ -131,15 +137,40 @@ function abstractType(env: Env, g: usize): Option<Diagnostic> {
   }
 }
 
-export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
+// The array prelude (compiler/prelude/array.or) as a hidden last unit `std:array`: the array methods
+// (`map`, `filter`, ...) are calls of its functions. Its spans use a file index one past the
+// source map's files. Returns the program unchanged (and `injected == false`) if the prelude does
+// not parse, which only a broken build can cause.
+type Injected = { prog: LoadedProgram; injected: bool; };
+
+function injectPrelude(prog: LoadedProgram, sm: SourceMap): Injected {
+  const file = sm.files.length;
+  const r = parse(file, preludeArraySource());
+  return match (r) {
+    Ok(m) => {
+      let units = prog.units;
+      const none: ImportTarget[] = [];
+      units.push(Unit { file: file, path: "std:array", name: "std:array", ast: m, imports: none });
+      return Injected { prog: LoadedProgram { units: units, entry: prog.entry }, injected: true };
+    },
+    Err(_) => Injected { prog: prog, injected: false }
+  };
+}
+
+export function check(prog0: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
+  const inj = injectPrelude(prog0, sm);
+  const prog = inj.prog;
   // Classes are lowered to records and functions first (ADR-0009).
   const lw = lowerClasses(prog);
   if (lw.diags.length > 0) {
     return Err(dedupDiags(lw.diags));
   }
-  const c = collect(lw.prog);
+  let c = collect(lw.prog);
   if (c.diags.length > 0) {
     return Err(dedupDiags(c.diags));
+  }
+  if (inj.injected) {
+    c.env.prelude = (lw.prog.units.length - 1).toInt();
   }
   const r = resolveDecls(buildClassTables(c.env, lw.classes), c.recordSrc, c.unionSrc);
   if (r.diags.length > 0) {

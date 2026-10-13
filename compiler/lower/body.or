@@ -262,7 +262,9 @@ export function expr(cx: Cx, sc: Sc, c: Ctr, e: HExpr): V {
     XArray(xs) => exprArray(cx, sc, c, e, xs),
     XTry(x) => exprTry(cx, sc, c, e, x),
     XCond(a, b, d) => exprCond(cx, sc, c, e, a, b, d),
-    XMatch(s, arms) => exprMatch(cx, sc, c, e, s, arms)
+    XMatch(s, arms) => exprMatch(cx, sc, c, e, s, arms),
+    XClosure(f, caps) => exprClosure(cx, sc, c, f, caps),
+    XCallIndirect(f, args) => exprCallIndirect(cx, sc, c, e, f, args)
   };
 }
 
@@ -367,6 +369,51 @@ function exprCall(cx: Cx, sc: Sc, c: Ctr, e: HExpr, f: usize, args: HExpr[]): V 
   const t = tm(a.c, mty(e.ty));
   items.push(t.d);
   items.push(ii(ICall(Some(t.id), f, a.ops)));
+  items = items.concat(releaseOwned(a));
+  if (isRefTy(e.ty)) {
+    return vOwned(items, t.id, t.c);
+  }
+  return vScalar(items, t.id, t.c);
+}
+
+// A closure: the captured values are consumed like the slots of a variant (IClosure, docs/mir.md v1.3).
+function exprClosure(cx: Cx, sc: Sc, c: Ctr, f: usize, caps: HExpr[]): V {
+  const a = lowerArgs(cx, sc, c, caps);
+  let tys: Type[] = [];
+  for (const x of caps) {
+    tys.push(x.ty);
+  }
+  const o = ownAll(a.c, a, tys, a.items);
+  let items = o.items;
+  const t = tm(o.c, MRef);
+  items.push(t.d);
+  items.push(ii(IClosure(t.id, f, o.ops)));
+  return vOwned(items, t.id, t.c);
+}
+
+// A call of a function value: the callee is evaluated first, then the arguments; all are borrowed.
+function exprCallIndirect(cx: Cx, sc: Sc, c: Ctr, e: HExpr, callee: HExpr, args: HExpr[]): V {
+  let es: HExpr[] = [callee];
+  for (const x of args) {
+    es.push(x);
+  }
+  const a = lowerArgs(cx, sc, c, es);
+  let items = a.items;
+  const f = a.ops[0];
+  let rest: Operand[] = [];
+  let i: usize = 1;
+  while (i < a.ops.length) {
+    rest.push(a.ops[i]);
+    i += 1;
+  }
+  if (isVoidTy(e.ty)) {
+    items.push(ii(ICallIndirect(None, f, rest)));
+    items = items.concat(releaseOwned(a));
+    return vVoid(items, a.c);
+  }
+  const t = tm(a.c, mty(e.ty));
+  items.push(t.d);
+  items.push(ii(ICallIndirect(Some(t.id), f, rest)));
   items = items.concat(releaseOwned(a));
   if (isRefTy(e.ty)) {
     return vOwned(items, t.id, t.c);

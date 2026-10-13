@@ -10,7 +10,7 @@ import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
   UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind,
-  ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl
+  ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam, ArrowBody
 } from "./ast";
 import { Token, TokKind, lex } from "./lexer";
 
@@ -130,8 +130,55 @@ function parseIdent(toks: Token[], pos: usize): Result<IdentRes, Diagnostic> {
 // Types
 // ---------------------------------------------------------------------------
 
-// `Name`, `Name<A, B>`, followed by any number of `[]`.
+// True if the tokens at `pos` start a function type: `(` followed by `)` or `name :`.
+function isFnTypeStart(toks: Token[], pos: usize): bool {
+  if (!isP(toks, pos, "(")) {
+    return false;
+  }
+  if (isP(toks, pos + 1, ")")) {
+    return true;
+  }
+  return isIdentTok(toks, pos + 1) && isP(toks, pos + 2, ":");
+}
+
+// `(a: T, b: U) => R` (beyond Orin-B, ADR-0011) or a parenthesised type `(T)` followed by any
+// number of `[]`; `pos` is at the `(`.
+function parseParenType(toks: Token[], pos: usize): Result<TypeRes, Diagnostic> {
+  if (isFnTypeStart(toks, pos)) {
+    let p = pos + 1;
+    let ps: FnTyParam[] = [];
+    while (!isP(toks, p, ")")) {
+      const pn = parseIdent(toks, p)?;
+      const colon = expectP(toks, pn.pos, ":")?;
+      const pt = parseType(toks, colon)?;
+      ps.push(FnTyParam { name: pn.id, ty: pt.ty });
+      p = pt.pos;
+      if (isP(toks, p, ",")) {
+        p += 1;
+      } else if (!isP(toks, p, ")")) {
+        return Err(errExpected(toks, p, "`,` or `)`"));
+      }
+    }
+    p = expectP(toks, p + 1, "=>")?;
+    const rt = parseType(toks, p)?;
+    const ty = TypeExpr { kind: TFn(ps, rt.ty), span: spanTo(tokAt(toks, pos).span, rt.ty.span) };
+    return Ok(TypeRes { ty: ty, pos: rt.pos });
+  }
+  const inner = parseType(toks, pos + 1)?;
+  let p = expectP(toks, inner.pos, ")")?;
+  let ty = TypeExpr { kind: inner.ty.kind, span: spanTo(tokAt(toks, pos).span, lastSpan(toks, p)) };
+  while (isP(toks, p, "[") && isP(toks, p + 1, "]")) {
+    p += 2;
+    ty = TypeExpr { kind: TArray(ty), span: spanTo(ty.span, lastSpan(toks, p)) };
+  }
+  return Ok(TypeRes { ty: ty, pos: p });
+}
+
+// `Name`, `Name<A, B>`, followed by any number of `[]`; or a function type (see above).
 function parseType(toks: Token[], pos: usize): Result<TypeRes, Diagnostic> {
+  if (isP(toks, pos, "(")) {
+    return parseParenType(toks, pos);
+  }
   const nm = parseIdent(toks, pos)?;
   let p = nm.pos;
   let args: TypeExpr[] = [];
@@ -481,14 +528,16 @@ function parseTypeBody(toks: Token[], pos: usize): Result<BodyRes, Diagnostic> {
     }
     const bare = match (t.ty.kind) {
       TNamed(id, args) => args.length == 0,
-      TArray(_) => false
+      TArray(_) => false,
+      TFn(_, _) => false
     };
     if (!bare) {
       return Err(diag("E0200", t.ty.span, "union members must be `Name` or `Name(T, ...)`"));
     }
     const nm = match (t.ty.kind) {
       TNamed(id, args) => id,
-      TArray(_) => Ident { name: "", span: t.ty.span }
+      TArray(_) => Ident { name: "", span: t.ty.span },
+      TFn(_, _) => Ident { name: "", span: t.ty.span }
     };
     variants.push(VariantDecl { name: nm, payload: [], span: t.ty.span });
     p = t.pos;
@@ -772,7 +821,105 @@ function mkExpr(kind: ExprKind, sp: Span): Expr {
 }
 
 function parseExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  const k = arrowStart(toks, pos);
+  if (k == 1) {
+    return parseArrow(toks, pos, false);
+  }
+  if (k == 2) {
+    return parseArrow(toks, pos, true);
+  }
   return parseCond(toks, pos);
+}
+
+// Index of the `)` matching the `(` at `pos` (counting only parentheses), or the end of input.
+function matchingParen(toks: Token[], pos: usize): usize {
+  let depth: usize = 0;
+  let p = pos;
+  while (p < toks.length) {
+    if (isP(toks, p, "(")) {
+      depth += 1;
+    } else if (isP(toks, p, ")")) {
+      depth -= 1;
+      if (depth == 0) {
+        return p;
+      }
+    } else if (isEof(toks, p)) {
+      return p;
+    }
+    p += 1;
+  }
+  return p;
+}
+
+// Does an arrow function start at `pos`? 1: `name =>`; 2: `( .. ) [: R] =>`; 0: no (beyond Orin-B,
+// ADR-0011).
+function arrowStart(toks: Token[], pos: usize): int {
+  if (isIdentTok(toks, pos)) {
+    return isP(toks, pos + 1, "=>") ? 1 : 0;
+  }
+  if (!isP(toks, pos, "(")) {
+    return 0;
+  }
+  const q = matchingParen(toks, pos);
+  if (!isP(toks, q, ")")) {
+    return 0;
+  }
+  if (isP(toks, q + 1, "=>")) {
+    return 2;
+  }
+  if (isP(toks, q + 1, ":")) {
+    const rt = parseType(toks, q + 2);
+    if (rt.isOk() && isP(toks, rt.unwrap().pos, "=>")) {
+      return 2;
+    }
+  }
+  return 0;
+}
+
+// `x => body`, `(x: T, y) [: R] => body`; the body is a block when it starts with `{`.
+function parseArrow(toks: Token[], pos: usize, parens: bool): Result<ExprRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  let p = pos;
+  let ps: ArrowParam[] = [];
+  let ret: Option<TypeExpr> = None;
+  if (!parens) {
+    const nm = parseIdent(toks, p)?;
+    ps.push(ArrowParam { name: nm.id, ty: None, span: nm.id.span });
+    p = nm.pos;
+  } else {
+    p += 1;
+    while (!isP(toks, p, ")")) {
+      const pn = parseIdent(toks, p)?;
+      p = pn.pos;
+      let pty: Option<TypeExpr> = None;
+      let psp = pn.id.span;
+      if (isP(toks, p, ":")) {
+        const pt = parseType(toks, p + 1)?;
+        pty = Some(pt.ty);
+        psp = spanTo(pn.id.span, pt.ty.span);
+        p = pt.pos;
+      }
+      ps.push(ArrowParam { name: pn.id, ty: pty, span: psp });
+      if (isP(toks, p, ",")) {
+        p += 1;
+      } else if (!isP(toks, p, ")")) {
+        return Err(errExpected(toks, p, "`,` or `)`"));
+      }
+    }
+    p += 1;
+    if (isP(toks, p, ":")) {
+      const rt = parseType(toks, p + 1)?;
+      ret = Some(rt.ty);
+      p = rt.pos;
+    }
+  }
+  p = expectP(toks, p, "=>")?;
+  if (isP(toks, p, "{")) {
+    const b = parseBlock(toks, p)?;
+    return Ok(ExprRes { expr: mkExpr(EArrow(ps, ret, ABlock(b.block)), spanTo(start, b.block.span)), pos: b.pos });
+  }
+  const e = parseExpr(toks, p)?;
+  return Ok(ExprRes { expr: mkExpr(EArrow(ps, ret, AExpr(e.expr)), spanTo(start, e.expr.span)), pos: e.pos });
 }
 
 // `c ? a : b` (right-associative, lowest precedence). A `?` that reaches here was not

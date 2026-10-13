@@ -8,20 +8,21 @@
 
 import { Span, Diagnostic, diag } from "../diag";
 import {
-  Ident, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit, MatchArm, ArmBody, TypeExpr, TNamed, AssignOp,
-  UnaryOp, BinaryOp, Pattern, TypeDecl, DRecord, DUnion, FieldDecl
+  Ident, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit, MatchArm, ArmBody, TypeExpr, TNamed, TFn, AssignOp,
+  UnaryOp, BinaryOp, Pattern, TypeDecl, DRecord, DUnion, FieldDecl, FunctionDecl, Param, ArrowParam, ArrowBody
 } from "../syntax";
 import {
-  Type, FieldDef, VariantDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm,
+  Type, Function, Local, FieldDef, RecordDef, VariantDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm,
   HPattern, Builtin, MutBuiltin
 } from "../hir";
 import {
-  Env, ValEnt, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
-  isIntish, isArrayTy, expIsUsize, showType, mismatch, globalVal, findType, originOf
+  Env, ValEnt, FuncInfo, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
+  isIntish, isArrayTy, isFn, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq
 } from "./env";
 import { classOfRec, findMethod, fieldIsPrivate } from "./classes";
 import {
-  FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak
+  FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak,
+  newClosureCtx, lookupVar, isVisibleVar, isCapturedLocal
 } from "./fnctx";
 import { builtinSig, methodSig, Sig, MSig } from "./builtins";
 import { checkPattern, PatOut } from "./pattern";
@@ -155,7 +156,22 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     ETyApp(_, _) => Err(diag("E0400", span, "type arguments are only allowed on a call or a record literal")),
     EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp),
     ENew(name, targs, args) => checkNew(env, fx, span, name, targs, args),
-    EThis => checkThis(fx, span)
+    EThis => checkThis(fx, span),
+    EArrow(ps, rte, body) => checkArrowExp(env, fx, span, ps, rte, body, exp)
+  };
+}
+
+function checkArrowExp(
+  env: Env, fx: FnCtx, span: Span, ps: ArrowParam[], rte: Option<TypeExpr>, body: ArrowBody, exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const noP: Option<Type[]> = None;
+  const noR: Option<Type> = None;
+  return match (exp) {
+    Some(t) => match (t) {
+      TyFn(eps, er) => checkArrow(env, fx, span, ps, rte, body, Some(eps), Some(er)),
+      _ => checkArrow(env, fx, span, ps, rte, body, noP, noR)
+    },
+    None => checkArrow(env, fx, span, ps, rte, body, noP, noR)
   };
 }
 
@@ -175,10 +191,10 @@ function constKind(lit: ConstLit): HExprKind {
 }
 
 function checkIdent(env: Env, fx: FnCtx, id: Ident, exp: Option<Type>, span: Span): Result<ExprOut, Diagnostic> {
-  const lo = lookupLocal(fx, id.name);
-  if (lo.isSome()) {
-    const l = lo.unwrap();
-    return done(fx, XLocal(l), fx.locals[l].ty, span);
+  const lv = lookupVar(fx, id.name);
+  if (lv.id.isSome()) {
+    const l = lv.id.unwrap();
+    return done(lv.fx, XLocal(l), lv.fx.locals[l].ty, span);
   }
   const g = globalVal(env, fx.unit, id.name);
   if (g.isSome()) {
@@ -190,7 +206,39 @@ function checkIdent(env: Env, fx: FnCtx, id: Ident, exp: Option<Type>, span: Spa
   if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
     return Err(diag("E0404", span, "`" + id.name + "` must be called with arguments"));
   }
-  return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+  return Err(unresolved(fx, id));
+}
+
+// E0300 for an unknown name; inside `const f = (..) => ..` the name `f` itself gets a hint.
+function unresolved(fx: FnCtx, id: Ident): Diagnostic {
+  if (fx.selfName != "" && id.name == fx.selfName) {
+    return diag(
+      "E0300",
+      id.span,
+      "a closure cannot refer to itself (`" + id.name + "` is not defined inside its own initialiser); use a top-level function for recursion"
+    );
+  }
+  return diag("E0300", id.span, "unresolved name `" + id.name + "`");
+}
+
+// The parameter / result types of an expected function type, if `exp` is one.
+function expFn(exp: Option<Type>): Option<Type> {
+  return match (exp) {
+    Some(t) => isFn(t) ? Some(t) : None,
+    None => None
+  };
+}
+
+function funcValueOf(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span, exp: Option<Type>): Result<ExprOut, Diagnostic> {
+  const noP: Option<Type[]> = None;
+  const noR: Option<Type> = None;
+  return match (expFn(exp)) {
+    Some(t) => match (t) {
+      TyFn(eps, er) => funcValue(env, fx, span, ent, id, Some(eps), Some(er)),
+      _ => funcValue(env, fx, span, ent, id, noP, noR)
+    },
+    None => funcValue(env, fx, span, ent, id, noP, noR)
+  };
 }
 
 function identVal(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span, exp: Option<Type>): Result<ExprOut, Diagnostic> {
@@ -208,8 +256,8 @@ function identVal(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span, exp: 
       return done(fx, XVariant(tag, noExprs()), TyUnion(u), span);
     },
     VGVariant(g, tag) => genericVariant(env, fx, span, g, tag, None, [], exp),
-    VGFunc(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value")),
-    VFunc(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value")),
+    VGFunc(_) => funcValueOf(env, fx, ent, id, span, exp),
+    VFunc(_) => funcValueOf(env, fx, ent, id, span, exp),
     VStd(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value"))
   };
 }
@@ -326,6 +374,9 @@ function checkBinary(
     _ => isIntish(lt)
   };
   if (!ok) {
+    if (isFn(lt)) {
+      return Err(diag("E0410", span, "function values cannot be compared (type `" + showType(p.fx.env, lt) + "`)"));
+    }
     return Err(diag("E0410", span, "operator is not defined for type `" + showType(p.fx.env, lt) + "`"));
   }
   return done(p.fx, XBinary(hop, p.l, p.r), arith ? lt : TyBool, span);
@@ -502,7 +553,8 @@ function resolveFx(fx: FnCtx, te: TypeExpr, voidOk: bool): Result<TyFx, Diagnost
 
 // `fx` with its environment replaced by `e` (instances only ever grow the tables).
 function withEnv(fx: FnCtx, e: Env): FnCtx {
-  if (e.insts.length == fx.env.insts.length) {
+  if (e.insts.length == fx.env.insts.length && e.funcs.length == fx.env.funcs.length
+    && e.records.length == fx.env.records.length) {
     return fx;
   }
   let f = fx;
@@ -759,16 +811,32 @@ function checkCall(
   return match (callee.kind) {
     EIdent(id) => callIdent(env, fx, span, callee, id, args, exp),
     ETyApp(id, targs) => callTyApp(env, fx, span, callee, id, targs, args, exp),
-    EMember(base, name) => callMember(env, fx, span, base, name, args),
-    _ => Err(diag("E0400", callee.span, "expression is not callable"))
+    EMember(base, name) => callMember(env, fx, span, base, name, args, exp),
+    _ => callValue(env, fx, span, callee, args)
+  };
+}
+
+// Call of a function value: `f(x)` with a local `f`, `fs[i](x)`, `g(1)(2)`, `(x => x)(3)`.
+function callValue(env: Env, fx: FnCtx, span: Span, callee: Expr, args: Expr[]): Result<ExprOut, Diagnostic> {
+  const c = checkExpr(env, fx, callee, None)?;
+  return match (c.expr.ty) {
+    TyFn(ps, r) => {
+      const a = argsExpect(env, c.fx, span, "function value", args, ps)?;
+      return done(a.fx, XCallIndirect(c.expr, a.args), r, span);
+    },
+    _ => match (callee.kind) {
+      EIdent(id) => Err(diag("E0400", callee.span, "`" + id.name + "` is not a function")),
+      _ => Err(diag("E0400", callee.span, "expression is not callable"))
+    }
   };
 }
 
 function callIdent(
   env: Env, fx: FnCtx, span: Span, callee: Expr, id: Ident, args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
-  if (lookupLocal(fx, id.name).isSome()) {
-    return Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"));
+  const lv = lookupVar(fx, id.name);
+  if (lv.id.isSome()) {
+    return callValue(env, lv.fx, span, callee, args);
   }
   const g = globalVal(env, fx.unit, id.name);
   if (g.isNone()) {
@@ -778,7 +846,7 @@ function callIdent(
     if (id.name == "Some" || id.name == "Ok" || id.name == "Err") {
       return builtinCtor(env, fx, span, id.name, args, exp);
     }
-    return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+    return Err(unresolved(fx, id));
   }
   return match (g.unwrap()) {
     VGFunc(gi) => callGeneric(env, fx, span, gi, id, None, args, exp),
@@ -806,8 +874,8 @@ function callIdent(
 function callTyApp(
   env: Env, fx: FnCtx, span: Span, callee: Expr, id: Ident, targs: TypeExpr[], args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
-  if (lookupLocal(fx, id.name).isSome()) {
-    return Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"));
+  if (isVisibleVar(fx, id.name)) {
+    return Err(diag("E0400", callee.span, "`" + id.name + "` is not generic and takes no type arguments"));
   }
   const g = globalVal(env, fx.unit, id.name);
   if (g.isNone()) {
@@ -844,6 +912,94 @@ function bindsOrVoid(binds: Option<Type>[]): Type[] {
 function infer(
   env: Env, fx0: FnCtx, span: Span, what: string, unit: usize, tps: Ident[], paramTEs: TypeExpr[],
   retTE: Option<TypeExpr>, args: Expr[], exp: Option<Type>, explicit: Option<TypeExpr[]>
+): Result<InferOut, Diagnostic> {
+  let pre: Option<HExpr>[] = [];
+  for (const _a of args) {
+    pre.push(None);
+  }
+  return inferPre(env, fx0, span, what, unit, tps, paramTEs, retTE, args, exp, explicit, pre);
+}
+
+// An argument that is typed on its own because its parameter type still mentions unbound type
+// parameters. An arrow function whose expected parameter types are all known (but not its result,
+// e.g. `xs.map(x => x + 1)`) is checked against them; its type then binds the result parameter.
+function checkLoose(
+  env: Env, fx: FnCtx, a: Expr, te: TypeExpr, unit: usize, tp: string[], binds: Option<Type>[]
+): Result<ExprOut, Diagnostic> {
+  match (te.kind) {
+    TFn(pts, _) => {
+      match (a.kind) {
+        EArrow(ps, rte, body) => {
+          if (ps.length == pts.length) {
+            // Parameter types: from the expected type where its type parameters are known, else
+            // from the arrow's own annotation (an unannotated parameter then needs the fallback).
+            let cur = fx;
+            let tys: Type[] = [];
+            let ok = true;
+            let i: usize = 0;
+            while (i < pts.length && ok) {
+              if (!mentionsUnbound(pts[i].ty, tp, binds)) {
+                const r = resolveBound(cur, unit, tp, bindsOrVoid(binds), pts[i].ty, false)?;
+                cur = r.fx;
+                tys.push(r.ty);
+              } else {
+                match (ps[i].ty) {
+                  Some(ate) => {
+                    const r = resolveFx(cur, ate, false)?;
+                    cur = r.fx;
+                    tys.push(r.ty);
+                  },
+                  None => {
+                    ok = false;
+                  }
+                }
+              }
+              i += 1;
+            }
+            if (ok) {
+              const noR: Option<Type> = None;
+              return checkArrow(env, cur, a.span, ps, rte, body, Some(tys), noR);
+            }
+          }
+        },
+        EIdent(id) => {
+          let known = true;
+          for (const p of pts) {
+            if (mentionsUnbound(p.ty, tp, binds)) {
+              known = false;
+            }
+          }
+          if (known && !isVisibleVar(fx, id.name)) {
+            const g = globalVal(env, fx.unit, id.name);
+            if (g.isSome()) {
+              let cur = fx;
+              let tys: Type[] = [];
+              for (const p of pts) {
+                const r = resolveBound(cur, unit, tp, bindsOrVoid(binds), p.ty, false)?;
+                cur = r.fx;
+                tys.push(r.ty);
+              }
+              const noR: Option<Type> = None;
+              match (g.unwrap()) {
+                VFunc(_) => { return funcValue(env, cur, a.span, g.unwrap(), id, Some(tys), noR); },
+                VGFunc(_) => { return funcValue(env, cur, a.span, g.unwrap(), id, Some(tys), noR); },
+                _ => {}
+              }
+            }
+          }
+        },
+        _ => {}
+      }
+    },
+    _ => {}
+  }
+  return checkExpr(env, fx, a, None);
+}
+
+// `infer` where some arguments are already checked (`pre[i]`, e.g. the receiver of a method call).
+function inferPre(
+  env: Env, fx0: FnCtx, span: Span, what: string, unit: usize, tps: Ident[], paramTEs: TypeExpr[],
+  retTE: Option<TypeExpr>, args: Expr[], exp: Option<Type>, explicit: Option<TypeExpr[]>, pre: Option<HExpr>[]
 ): Result<InferOut, Diagnostic> {
   if (args.length != paramTEs.length) {
     return Err(diag(
@@ -888,11 +1044,24 @@ function infer(
   for (const _a of args) {
     outArgs.push(None);
   }
+  let pi: usize = 0;
+  while (pi < args.length) {
+    match (pre[pi]) {
+      Some(h) => {
+        outArgs[pi] = Some(h);
+        binds = unify(fx.env, unit, paramTEs[pi], h.ty, tp, binds);
+      },
+      None => {}
+    }
+    pi += 1;
+  }
   let deferred: usize[] = [];
   let i: usize = 0;
   while (i < args.length) {
     const te = paramTEs[i];
-    if (!mentionsUnbound(te, tp, binds)) {
+    if (outArgs[i].isSome()) {
+      // already checked
+    } else if (!mentionsUnbound(te, tp, binds)) {
       const pt = resolveBound(fx, unit, tp, bindsOrVoid(binds), te, false)?;
       const r = expect(env, pt.fx, args[i], pt.ty)?;
       fx = r.fx;
@@ -900,7 +1069,7 @@ function infer(
     } else if (untypedInt(args[i])) {
       deferred.push(i);
     } else {
-      match (checkExpr(env, fx, args[i], None)) {
+      match (checkLoose(env, fx, args[i], te, unit, tp, binds)) {
         Ok(r) => {
           fx = r.fx;
           outArgs[i] = Some(r.expr);
@@ -935,7 +1104,7 @@ function infer(
       } else if (untypedInt(args[di])) {
         rest.push(di);
       } else {
-        match (checkExpr(env, fx, args[di], None)) {
+        match (checkLoose(env, fx, args[di], te, unit, tp, binds)) {
           Ok(r) => {
             fx = r.fx;
             outArgs[di] = Some(r.expr);
@@ -1077,12 +1246,12 @@ function callBuiltin(
 }
 
 function callMember(
-  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[]
+  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
   match (base.kind) {
     EIdent(bid) => {
       const special = (bid.name == "console" || bid.name == "String")
-        && lookupLocal(fx, bid.name).isNone()
+        && !isVisibleVar(fx, bid.name)
         && globalVal(env, fx.unit, bid.name).isNone();
       if (special) {
         let b: Option<Builtin> = None;
@@ -1098,7 +1267,7 @@ function callMember(
         }
         return callBuiltin(env, fx, span, "`" + bid.name + "." + name.name + "`", b.unwrap(), args);
       }
-      if (lookupLocal(fx, bid.name).isNone() && globalVal(env, fx.unit, bid.name).isNone()) {
+      if (!isVisibleVar(fx, bid.name) && globalVal(env, fx.unit, bid.name).isNone()) {
         const te = findType(env.units[fx.unit].scope, bid.name);
         if (te.isSome()) {
           match (te.unwrap()) {
@@ -1115,7 +1284,7 @@ function callMember(
     },
     _ => {}
   }
-  return methodCall(env, fx, span, base, name, args);
+  return methodCall(env, fx, span, base, name, args, exp);
 }
 
 function builtinCtor(
@@ -1193,7 +1362,7 @@ function errCtor(
 
 function isPlaceShaped(fx: FnCtx, base: Expr): bool {
   return match (base.kind) {
-    EIdent(id) => lookupLocal(fx, id.name).isSome(),
+    EIdent(id) => isVisibleVar(fx, id.name),
     EThis => true,
     EMember(_, _) => true,
     EIndex(_, _) => true,
@@ -1202,7 +1371,7 @@ function isPlaceShaped(fx: FnCtx, base: Expr): bool {
 }
 
 function methodCall(
-  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[]
+  env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident, args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
   const n = name.name;
   const bo = checkExpr(env, fx, base, None);
@@ -1212,7 +1381,18 @@ function methodCall(
       TyRecord(r) => {
         const co = classOfRec(b0.fx.env, r);
         if (co.isSome()) {
-          return classMethodCall(env, b0.fx, span, base, b0, co.unwrap(), name, args);
+          const mo = findMethod(b0.fx.env.classes[co.unwrap()], n);
+          if (mo.isSome() || !recordHasFnField(b0.fx.env, r, n)) {
+            return classMethodCall(env, b0.fx, span, base, b0, co.unwrap(), name, args);
+          }
+        }
+        if (recordHasFnField(b0.fx.env, r, n)) {
+          return callFieldValue(env, b0, span, r, name, args);
+        }
+      },
+      TyArray(t) => {
+        if (isArrayApi(n)) {
+          return arrayApiCall(env, b0, span, t, name, args, exp);
         }
       },
       _ => {}
@@ -1280,9 +1460,12 @@ function extendPath(p: Place, elem: PlaceElem, ty: Type): Place {
 function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> {
   return match (e.kind) {
     EIdent(id) => {
-      const lo = lookupLocal(fx, id.name);
-      if (lo.isSome()) {
-        const l = lo.unwrap();
+      const lv = lookupVar(fx, id.name);
+      if (lv.id.isSome() && isCapturedLocal(lv.fx, lv.id.unwrap())) {
+        return Err(capturedErr(e.span, id.name));
+      }
+      if (lv.id.isSome()) {
+        const l = lv.id.unwrap();
         const loc = fx.locals[l];
         const path: PlaceElem[] = [];
         return Ok(PlaceOut {
@@ -1298,11 +1481,14 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
       return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
     },
     EThis => {
-      const lo = lookupLocal(fx, "this");
-      if (lo.isNone()) {
+      const lv = lookupVar(fx, "this");
+      if (lv.id.isNone()) {
         return Err(thisErr(fx, e.span));
       }
-      const l = lo.unwrap();
+      if (isCapturedLocal(lv.fx, lv.id.unwrap())) {
+        return Err(capturedErr(e.span, "this"));
+      }
+      const l = lv.id.unwrap();
       const path: PlaceElem[] = [];
       return Ok(PlaceOut {
         fx: fx,
@@ -1606,10 +1792,23 @@ function letInit(env: Env, fx: FnCtx, ty: Option<TypeExpr>, init: Expr): Result<
   };
 }
 
+function isArrowExpr(e: Expr): bool {
+  return match (e.kind) {
+    EArrow(_, _, _) => true,
+    _ => false
+  };
+}
+
 function stmtLet(
-  env: Env, fx: FnCtx, mutable: bool, name: Ident, ty: Option<TypeExpr>, init: Expr
+  env: Env, fx0: FnCtx, mutable: bool, name: Ident, ty: Option<TypeExpr>, init: Expr
 ): Result<StmtOut, Diagnostic> {
-  const li = letInit(env, fx, ty, init)?;
+  let fx = fx0;
+  if (isArrowExpr(init)) {
+    fx.pendLet = name.name;
+  }
+  const li0 = letInit(env, fx, ty, init)?;
+  let li = li0;
+  li.fx.pendLet = "";
   if (isVoid(li.ty)) {
     return Err(diag("E0400", init.span, "cannot bind a `void` value to a variable"));
   }
@@ -1678,7 +1877,42 @@ function stmtExpr(env: Env, fx: FnCtx, e: Expr): Result<StmtOut, Diagnostic> {
   };
 }
 
+// `return` in an arrow function block body whose result type is still to be inferred (the first
+// `return` fixes it; later ones must agree).
+function returnInfer(env: Env, fx: FnCtx, span: Span, v: Option<Expr>): Result<StmtOut, Diagnostic> {
+  return match (v) {
+    None => {
+      match (fx.retSeen) {
+        Some(t) => {
+          if (!isVoid(t)) {
+            return Err(diag("E0400", span, "`return;` in a closure returning `" + showType(fx.env, t) + "`"));
+          }
+        },
+        None => {}
+      }
+      let f = fx;
+      f.retSeen = Some(TyVoid);
+      return sout(f, HReturn(None), true);
+    },
+    Some(e) => {
+      const r = match (fx.retSeen) {
+        Some(t) => expect(env, fx, e, t)?,
+        None => checkExpr(env, fx, e, None)?
+      };
+      if (isVoid(r.expr.ty)) {
+        return Err(diag("E0400", e.span, "cannot return a value of type `void`"));
+      }
+      let f = r.fx;
+      f.retSeen = Some(r.expr.ty);
+      return sout(f, HReturn(Some(r.expr)), true);
+    }
+  };
+}
+
 function stmtReturn(env: Env, fx: FnCtx, span: Span, v: Option<Expr>): Result<StmtOut, Diagnostic> {
+  if (fx.retInfer) {
+    return returnInfer(env, fx, span, v);
+  }
   return match (v) {
     None => {
       if (!isVoid(fx.ret)) {
@@ -1812,7 +2046,7 @@ function condHoistErr(span: Span): Diagnostic {
 
 // True inside the constructor / methods of class `c` (private members are visible there).
 function inClass(fx: FnCtx, c: usize): bool {
-  return fx.fmode != 0 && fx.fcls == c;
+  return fx.clsAcc == c.toInt();
 }
 
 function thisErr(fx: FnCtx, span: Span): Diagnostic {
@@ -1831,12 +2065,12 @@ function thisRead(fx: FnCtx, span: Span): HExpr {
 }
 
 function checkThis(fx: FnCtx, span: Span): Result<ExprOut, Diagnostic> {
-  const lo = lookupLocal(fx, "this");
-  if (lo.isNone()) {
+  const lv = lookupVar(fx, "this");
+  if (lv.id.isNone()) {
     return Err(thisErr(fx, span));
   }
-  const l = lo.unwrap();
-  return done(fx, XLocal(l), fx.locals[l].ty, span);
+  const l = lv.id.unwrap();
+  return done(lv.fx, XLocal(l), lv.fx.locals[l].ty, span);
 }
 
 function checkFieldAccess(fx: FnCtx, r: usize, name: Ident): Result<bool, Diagnostic> {
@@ -2026,4 +2260,520 @@ function classMethodCall(
   const selfTy = TyRecord(ci.rec);
   fx.pre.push(HAssign(pi.place, None, mk(XField(tmp, mi.retRec, 0), selfTy, span)));
   return done(fx, XField(tmp, mi.retRec, 1), f.srcRet, span);
+}
+
+// ---------------------------------------------------------------------------
+// Closures and function values (beyond Orin-B, ADR-0011)
+// ---------------------------------------------------------------------------
+
+function capturedErr(span: Span, name: string): Diagnostic {
+  return diag(
+    "E0401",
+    span,
+    "cannot modify `" + name + "`: it is captured by a closure, and closures capture variables by value (a snapshot taken when the closure is created)"
+  );
+}
+
+function dummyDecl(name: string, span: Span): FunctionDecl {
+  const noTps: Ident[] = [];
+  const noParams: Param[] = [];
+  const noRet: Option<TypeExpr> = None;
+  const noStmts: Stmt[] = [];
+  return FunctionDecl {
+    exported: false,
+    name: Ident { name: name, span: span },
+    typeParams: noTps,
+    params: noParams,
+    ret: noRet,
+    body: Block { stmts: noStmts, span: span },
+    span: span
+  };
+}
+
+type LiftOut = { env: Env; fid: usize; };
+
+// Registers the HIR of a lifted function (an arrow body or a function-value wrapper) in the
+// environment, as function `fid` (FuncInfo.mode 6: its HIR is already checked).
+function registerLifted(fx: FnCtx, env0: Env, fn: Function, ptys: Type[], span: Span): LiftOut {
+  let e = env0;
+  const lid = e.lifted.length;
+  e.lifted.push(fn);
+  const fid = e.funcs.length;
+  let pl: Local[] = [];
+  let k: usize = 0;
+  while (k < fn.paramCount) {
+    pl.push(fn.locals[k]);
+    k += 1;
+  }
+  e.funcs.push(FuncInfo {
+    unit: fx.unit,
+    qname: fn.name,
+    decl: dummyDecl(fn.name, span),
+    params: ptys,
+    paramLocals: pl,
+    ret: fn.ret,
+    tpNames: fx.tpNames,
+    tpTys: fx.tpTys,
+    depth: fx.depth,
+    mode: 6,
+    cls: lid,
+    srcRet: TyVoid
+  });
+  return LiftOut { env: e, fid: fid };
+}
+
+// `fx` with its environment replaced (closure conversion adds records and functions).
+function setEnv(fx: FnCtx, e: Env): FnCtx {
+  let f = fx;
+  f.env = e;
+  return f;
+}
+
+// An arrow function: `expP` / `expR` are the parameter and result types of the expected function
+// type, when known. The body is checked as a new function (closure conversion): its first parameter
+// is the environment record holding the captured variables, which are bound to immutable locals
+// at entry. The result is `XClosure(lifted, captures)`.
+function checkArrow(
+  env: Env, fx: FnCtx, span: Span, ps: ArrowParam[], retTE: Option<TypeExpr>, body: ArrowBody,
+  expP: Option<Type[]>, expR: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  let cur = fx;
+  match (expP) {
+    Some(eps) => {
+      if (eps.length != ps.length) {
+        return Err(diag(
+          "E0404",
+          span,
+          "this function value is expected to take " + eps.length.toString() + " argument(s), the arrow function has "
+            + ps.length.toString() + " parameter(s)"
+        ));
+      }
+    },
+    None => {}
+  }
+  let ptys: Type[] = [];
+  let names: string[] = [];
+  let i: usize = 0;
+  for (const p of ps) {
+    for (const n of names) {
+      if (n == p.name.name) {
+        return Err(diag("E0304", p.name.span, "duplicate parameter `" + p.name.name + "`"));
+      }
+    }
+    let t: Type = TyInt;
+    match (p.ty) {
+      Some(te) => {
+        const r = resolveFx(cur, te, false)?;
+        cur = r.fx;
+        t = r.ty;
+        match (expP) {
+          Some(eps) => {
+            if (!typeEq(eps[i], t)) {
+              return Err(mismatch(cur.env, p.span, eps[i], t));
+            }
+          },
+          None => {}
+        }
+      },
+      None => {
+        match (expP) {
+          Some(eps) => {
+            t = eps[i];
+          },
+          None => {
+            return Err(diag(
+              "E0407",
+              p.name.span,
+              "cannot infer the type of parameter `" + p.name.name + "`; add a type annotation"
+            ));
+          }
+        }
+      }
+    }
+    ptys.push(t);
+    names.push(p.name.name);
+    i += 1;
+  }
+  let ret: Type = TyVoid;
+  let known = false;
+  match (retTE) {
+    Some(te) => {
+      const r = resolveFx(cur, te, true)?;
+      cur = r.fx;
+      ret = r.ty;
+      known = true;
+    },
+    None => {
+      match (expR) {
+        Some(t) => {
+          ret = t;
+          known = true;
+        },
+        None => {}
+      }
+    }
+  }
+  const isBlock = match (body) {
+    ABlock(_) => true,
+    AExpr(_) => false
+  };
+  const lname = cur.qname + "$closure" + cur.ncl.toString();
+  let inner = newClosureCtx(cur, lname, names, ptys, ret, !known && isBlock);
+  let stmts: HStmt[] = [];
+  let finalRet = ret;
+  match (body) {
+    AExpr(e) => {
+      if (known && isVoid(ret)) {
+        const so = stmtExpr(env, inner, e)?;
+        inner = so.fx;
+        stmts = [so.stmt];
+      } else {
+        const r = known ? expect(env, inner, e, ret)? : checkExpr(env, inner, e, None)?;
+        inner = r.fx;
+        if (isVoid(r.expr.ty)) {
+          finalRet = TyVoid;
+          stmts = isNop(r.expr) ? [] : [HExprStmt(r.expr)];
+        } else {
+          finalRet = r.expr.ty;
+          stmts = [HReturn(Some(r.expr))];
+        }
+      }
+      if (inner.pre.length > 0) {
+        let all: HStmt[] = [];
+        for (const h of inner.pre) {
+          all.push(h);
+        }
+        for (const h of stmts) {
+          all.push(h);
+        }
+        stmts = all;
+        const none: HStmt[] = [];
+        inner.pre = none;
+      }
+    },
+    ABlock(b) => {
+      const bo = checkBlock(env, inner, b)?;
+      inner = bo.fx;
+      stmts = bo.block.stmts;
+      if (!known) {
+        finalRet = inner.retSeen.unwrapOr(TyVoid);
+      }
+      if (!isVoid(finalRet) && !bo.div) {
+        return Err(diag("E0403", span, "the closure does not return a value on every path"));
+      }
+    }
+  }
+  // Environment record, entry prologue, lifted function.
+  let e = inner.env;
+  const rid = e.records.length;
+  let fields: FieldDef[] = [];
+  let k: usize = 0;
+  while (k < inner.capNames.length) {
+    fields.push(FieldDef { name: inner.capNames[k], ty: inner.capTys[k] });
+    k += 1;
+  }
+  e.records.push(RecordDef { name: lname + "$env", fields: fields });
+  const envTy = TyRecord(rid);
+  let all: HStmt[] = [];
+  k = 0;
+  while (k < inner.capNames.length) {
+    const base = mk(XLocal(0), envTy, span);
+    all.push(HLet(inner.capIds[k], mk(XField(base, rid, k), inner.capTys[k], span)));
+    k += 1;
+  }
+  for (const h of stmts) {
+    all.push(h);
+  }
+  let locals = inner.locals;
+  locals[0] = Local { name: "env$", ty: envTy, mutable: false };
+  const fn = Function {
+    name: lname,
+    paramCount: 1 + ps.length,
+    locals: locals,
+    ret: finalRet,
+    body: HBlock { stmts: all },
+    span: span
+  };
+  let pfull: Type[] = [envTy];
+  for (const t of ptys) {
+    pfull.push(t);
+  }
+  const lo = registerLifted(inner, e, fn, pfull, span);
+  // Back in the enclosing function: evaluate the captured variables there.
+  let out = setEnv(cur, lo.env);
+  out.ncl += 1;
+  let caps: HExpr[] = [];
+  for (const nm of inner.capNames) {
+    const v = lookupVar(out, nm);
+    out = v.fx;
+    const id = v.id.unwrap();
+    caps.push(mk(XLocal(id), out.locals[id].ty, span));
+  }
+  return done(out, XClosure(lo.fid, caps), TyFn(ptys, finalRet), span);
+}
+
+// The lifted wrapper `f$closure(env, a, ..) { return f(a, ..); }` of function `fid`, so that the
+// function can be used as a value. Created once per function.
+function wrapFunc(fx: FnCtx, span: Span, fid: usize): Result<ExprOut, Diagnostic> {
+  const f = fx.env.funcs[fid];
+  if (f.mode != 0) {
+    return Err(diag("E0400", span, "function `" + f.decl.name.name + "` cannot be used as a value"));
+  }
+  const wname = f.qname + "$closure";
+  let wid: usize = 0;
+  let found = false;
+  let k: usize = 0;
+  while (k < fx.env.funcs.length && !found) {
+    if (fx.env.funcs[k].mode == 6 && fx.env.funcs[k].qname == wname) {
+      wid = k;
+      found = true;
+    }
+    k += 1;
+  }
+  let cur = fx;
+  if (!found) {
+    let e = cur.env;
+    const rid = e.records.length;
+    const none: FieldDef[] = [];
+    e.records.push(RecordDef { name: wname + "$env", fields: none });
+    const envTy = TyRecord(rid);
+    let locals: Local[] = [Local { name: "env$", ty: envTy, mutable: false }];
+    let args: HExpr[] = [];
+    let pfull: Type[] = [envTy];
+    let i: usize = 0;
+    while (i < f.params.length) {
+      locals.push(Local { name: "a" + i.toString(), ty: f.params[i], mutable: false });
+      args.push(mk(XLocal(i + 1), f.params[i], span));
+      pfull.push(f.params[i]);
+      i += 1;
+    }
+    const call = mk(XCall(fid, args), f.ret, span);
+    const st: HStmt = isVoid(f.ret) ? HExprStmt(call) : HReturn(Some(call));
+    const fn = Function {
+      name: wname,
+      paramCount: 1 + f.params.length,
+      locals: locals,
+      ret: f.ret,
+      body: HBlock { stmts: [st] },
+      span: span
+    };
+    const lo = registerLifted(cur, e, fn, pfull, span);
+    cur = setEnv(cur, lo.env);
+    wid = lo.fid;
+  }
+  const noCaps: HExpr[] = [];
+  return done(cur, XClosure(wid, noCaps), TyFn(f.params, f.ret), span);
+}
+
+// A top-level function used as a value. A generic function needs its type arguments from the
+// expected function type: `expP` / `expR` (parameter types, and the result type when known).
+function funcValue(
+  env: Env, fx: FnCtx, span: Span, ent: ValEnt, id: Ident, expP: Option<Type[]>, expR: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  return match (ent) {
+    VFunc(fid) => wrapFunc(fx, span, fid),
+    VGFunc(g) => {
+      const gf = env.gfuncs[g];
+      const tp = paramNameList(gf.decl.typeParams);
+      let binds = noBinds(tp.length);
+      match (expP) {
+        Some(eps) => {
+          if (eps.length != gf.decl.params.length) {
+            return Err(diag(
+              "E0404",
+              span,
+              "function `" + id.name + "` takes " + gf.decl.params.length.toString() + " argument(s), the expected function type has "
+                + eps.length.toString()
+            ));
+          }
+          let i: usize = 0;
+          while (i < eps.length) {
+            binds = unify(fx.env, gf.unit, gf.decl.params[i].ty, eps[i], tp, binds);
+            i += 1;
+          }
+        },
+        None => {}
+      }
+      match (expR) {
+        Some(er) => {
+          match (gf.decl.ret) {
+            Some(rt) => {
+              binds = unify(fx.env, gf.unit, rt, er, tp, binds);
+            },
+            None => {}
+          }
+        },
+        None => {}
+      }
+      let tys: Type[] = [];
+      let bi: usize = 0;
+      for (const b of binds) {
+        match (b) {
+          Some(t) => {
+            tys.push(t);
+          },
+          None => {
+            return Err(diag(
+              "E0407",
+              span,
+              "cannot infer type argument `" + tp[bi] + "` of function `" + id.name
+                + "` used as a value; its type arguments come from the expected function type, add a type annotation"
+            ));
+          }
+        }
+        bi += 1;
+      }
+      let cur = fx;
+      let ptys: Type[] = [];
+      for (const p of gf.decl.params) {
+        const r = resolveBound(cur, gf.unit, tp, tys, p.ty, false)?;
+        cur = r.fx;
+        ptys.push(r.ty);
+      }
+      let ret: Type = TyVoid;
+      match (gf.decl.ret) {
+        Some(rte) => {
+          const r = resolveBound(cur, gf.unit, tp, tys, rte, true)?;
+          cur = r.fx;
+          ret = r.ty;
+        },
+        None => {}
+      }
+      if (cur.abs) {
+        const noCaps: HExpr[] = [];
+        return done(cur, XClosure(0, noCaps), TyFn(ptys, ret), span);
+      }
+      const fo = instFunc(cur.env, g, tys, cur.depth + 1, span)?;
+      cur = withEnv(cur, fo.env);
+      return wrapFunc(cur, span, fo.fid);
+    },
+    _ => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value"))
+  };
+}
+
+function recordHasFnField(env: Env, r: usize, name: string): bool {
+  const io = fieldIndex(env.records[r].fields, name);
+  if (io.isNone()) {
+    return false;
+  }
+  return isFn(env.records[r].fields[io.unwrap()].ty);
+}
+
+// `r.f(args)` where field `f` of record `r` has a function type.
+function callFieldValue(
+  env: Env, b: ExprOut, span: Span, r: usize, name: Ident, args: Expr[]
+): Result<ExprOut, Diagnostic> {
+  const def = b.fx.env.records[r];
+  const i = fieldIndex(def.fields, name.name).unwrap();
+  checkFieldAccess(b.fx, r, name)?;
+  const callee = mk(XField(b.expr, r, i), def.fields[i].ty, span);
+  return match (def.fields[i].ty) {
+    TyFn(ps, ret) => {
+      const a = argsExpect(env, b.fx, span, "function value `" + name.name + "`", args, ps)?;
+      return done(a.fx, XCallIndirect(callee, a.args), ret, span);
+    },
+    _ => Err(diag("E0400", span, "`" + name.name + "` is not a function"))
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Array API (spec 08): methods implemented as functions of the injected prelude
+// (compiler/prelude/array.or), called with the receiver as first argument.
+// ---------------------------------------------------------------------------
+
+function isArrayApi(n: string): bool {
+  return n == "map" || n == "filter" || n == "find" || n == "findIndex" || n == "some" || n == "every"
+    || n == "reduce" || n == "forEach" || n == "sort" || n == "indexOf" || n == "includes";
+}
+
+function elemSuffix(elem: Type): string {
+  return match (elem) {
+    TyInt => "Int",
+    TyUsize => "Usize",
+    TyBool => "Bool",
+    TyString => "Str",
+    _ => ""
+  };
+}
+
+function arrayApiCall(
+  env: Env, b: ExprOut, span: Span, elem: Type, name: Ident, args: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const n = name.name;
+  let fname = n;
+  if (n == "indexOf" || n == "includes") {
+    const suffix = elemSuffix(elem);
+    if (suffix == "") {
+      return Err(diag(
+        "E0405",
+        name.span,
+        "method `" + n + "` is only available on arrays of `int`, `usize`, `bool` or `string`, not `"
+          + showType(b.fx.env, TyArray(elem)) + "`"
+      ));
+    }
+    fname = n + suffix;
+  }
+  const noMethod = diag("E0405", name.span, "no method `" + n + "` on type `" + showType(b.fx.env, TyArray(elem)) + "`");
+  if (env.prelude < 0) {
+    return Err(noMethod);
+  }
+  const ent = findVal(env.units[env.prelude.toUsize()].scope, fname);
+  if (ent.isNone()) {
+    return Err(noMethod);
+  }
+  return match (ent.unwrap()) {
+    VGFunc(g) => {
+      const gf = env.gfuncs[g];
+      if (args.length + 1 != gf.decl.params.length) {
+        return Err(diag(
+          "E0404",
+          span,
+          "method `" + n + "` expects " + (gf.decl.params.length - 1).toString() + " argument(s), found " + args.length.toString()
+        ));
+      }
+      let ptes: TypeExpr[] = [];
+      for (const p of gf.decl.params) {
+        ptes.push(p.ty);
+      }
+      // The receiver is argument 0 (already checked; its source expression is not used).
+      let all: Expr[] = [Expr { kind: EIdent(name), span: b.expr.span }];
+      let pre: Option<HExpr>[] = [Some(b.expr)];
+      for (const a of args) {
+        all.push(a);
+        pre.push(None);
+      }
+      const noExplicit: Option<TypeExpr[]> = None;
+      const io = inferPre(
+        env, b.fx, span, "method `" + n + "`", gf.unit, gf.decl.typeParams, ptes, gf.decl.ret, all, exp,
+        noExplicit, pre
+      )?;
+      let cur = io.fx;
+      let ret: Type = TyVoid;
+      match (gf.decl.ret) {
+        Some(rte) => {
+          const r = resolveBound(cur, gf.unit, paramNameList(gf.decl.typeParams), io.tys, rte, true)?;
+          cur = r.fx;
+          ret = r.ty;
+        },
+        None => {}
+      }
+      let fid: usize = 0;
+      if (!cur.abs) {
+        const fo = instFunc(cur.env, g, io.tys, cur.depth + 1, span)?;
+        cur = withEnv(cur, fo.env);
+        fid = fo.fid;
+      }
+      return done(cur, XCall(fid, io.args), ret, span);
+    },
+    VFunc(fid) => {
+      const f = b.fx.env.funcs[fid];
+      const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, tailTypes(f.params))?;
+      let all: HExpr[] = [b.expr];
+      for (const x of a.args) {
+        all.push(x);
+      }
+      return done(a.fx, XCall(fid, all), f.ret, span);
+    },
+    _ => Err(noMethod)
+  };
 }

@@ -255,8 +255,43 @@ function testIndex(f: string[]): string[] {
   return fails;
 }
 
+// Semantic index of closures (ADR-0011): arrow parameters and captured variables resolve, array
+// methods with arrow arguments check, and the types of closure bodies are indexed.
+function testClosures(f: string[]): string[] {
+  let fails = f;
+  const text = "function main(): void {\n  const k = 3;\n  const g = (x: int): int => x + k;\n  const ys = [1, 2].map(y => y * k);\n  console.log(g(1).toString() + ys.length.toString());\n}\n";
+  const ws = openFile(newWorkspace(), "/c/a.or", text);
+  const a = analyze(ws, "/c/a.or");
+  fails = eqi(fails, "closure diags", a.diags.length, 0);
+  if (a.index.isNone()) {
+    return eq(fails, "closure index", "none", "some");
+  }
+  const idx = a.index.unwrap();
+  const kDecl = text.indexOf("k = 3").unwrap();
+  const xDecl = text.indexOf("x: int").unwrap();
+  const xUse = text.indexOf("x + k").unwrap();
+  const kUse = xUse + 4;
+  const yDecl = text.indexOf("y =>").unwrap();
+  const yUse = text.indexOf("y * k").unwrap();
+  const kUse2 = yUse + 4;
+  const gUse = text.indexOf("g(1)").unwrap();
+  const gDecl = text.indexOf("g = ").unwrap();
+  fails = eq(fails, "x use -> param", definitionAt(idx, 0, xUse).unwrapOr(span(0, 0, 0)).start.toString(), xDecl.toString());
+  fails = eq(fails, "k captured", definitionAt(idx, 0, kUse).unwrapOr(span(0, 0, 0)).start.toString(), kDecl.toString());
+  fails = eq(fails, "y use -> param", definitionAt(idx, 0, yUse).unwrapOr(span(0, 0, 0)).start.toString(), yDecl.toString());
+  fails = eq(fails, "k captured (2)", definitionAt(idx, 0, kUse2).unwrapOr(span(0, 0, 0)).start.toString(), kDecl.toString());
+  fails = eq(fails, "g call -> decl", definitionAt(idx, 0, gUse).unwrapOr(span(0, 0, 0)).start.toString(), gDecl.toString());
+  fails = eqi(fails, "refs to k", referencesTo(idx, 0, kDecl, false).length, 2);
+  fails = eq(fails, "hover g", hoverAt(idx, 0, gDecl).unwrap().text, "const g: (int) => int");
+  // hover on the arrow expression itself: its function type
+  const arrow = text.indexOf("=> x + k").unwrap();
+  fails = eq(fails, "hover arrow", hoverAt(idx, 0, arrow).unwrap().text, "(int) => int");
+  return fails;
+}
+
 function main(): void {
   let f: string[] = [];
+  f = testClosures(f);
   f = testWorkspace(f);
   f = testPositions(f);
   f = testAnalyze(f);

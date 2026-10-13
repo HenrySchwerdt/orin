@@ -385,8 +385,88 @@ function ownedCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- closures (v1.3, ADR-0011)
+
+// Lifted function `l(env: ref, x: int): void` (all parameters borrowed).
+function lifted(): MFunction {
+  return fn("l", 2, [lr("env"), li("x")], MVoid, [bk([], TReturn(None))]);
+}
+
+// Lifted function `lr(env: ref): ref` returning a fresh object.
+function liftedRef(): MFunction {
+  return fn("lr", 1, [lr("env"), lr("a"), lr("b")], MRef, [bk([IStructNew(1, 0, []), IMove(2, 1)], TReturn(Some(OLocal(2))))]);
+}
+
+function closureCases(): usize {
+  let bad: usize = 0;
+  const dead = "dead";
+  const p1 = pos("closure without captures, called and released", prog([
+    fn("f", 0, [lr("c")], MVoid, [bk([
+      IClosure(0, 1, []), ICallIndirect(None, OLocal(0), [OInt(3)]), IRelease(0)], ret())]),
+    lifted()]));
+  const p2 = pos("captures are consumed by IClosure", prog([
+    fn("f", 0, [lr("a"), lr("c")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), IClosure(1, 1, [OLocal(0), OInt(2)]), ICallIndirect(None, OLocal(1), [OInt(0)]),
+      IRelease(1)], ret())]),
+    lifted()]));
+  const p3 = pos("indirect call with a reference result is Owned", prog([
+    fn("f", 0, [lr("c"), lr("r")], MVoid, [bk([
+      IClosure(0, 1, []), ICallIndirect(Some(1), OLocal(0), []), IRelease(1), IRelease(0)], ret())]),
+    liftedRef()]));
+  const p4 = pos("borrowed argument and borrowed callee", prog([
+    fn("f", 2, [lr("c"), lr("p"), lr("b")], MVoid, [bk([
+      IGetField(2, OLocal(1), 0), ICallIndirect(None, OLocal(0), [OLocal(2)])], ret())]),
+    fn("l", 2, [lr("env"), lr("y")], MVoid, [bk([], TReturn(None))])]));
+  const p5 = pos("closure returned to the caller", prog([
+    fn("f", 0, [lr("c")], MRef, [bk([IClosure(0, 1, [])], TReturn(Some(OLocal(0))))]),
+    lifted()]));
+  const w1 = run("warn closure never released", prog([
+    fn("f", 0, [lr("c")], MVoid, [bk([IClosure(0, 1, [])], ret())]),
+    lifted()]), 2, "");
+  const n1 = neg("capture used after IClosure consumed it", prog([
+    fn("f", 0, [lr("a"), lr("c"), li("i")], MVoid, [bk([
+      IStructNew(0, 0, []), IClosure(1, 1, [OLocal(0)]), ITag(2, OLocal(0)), IRelease(1)], ret())]),
+    lifted()]), dead);
+  const n2 = neg("capture of a Borrowed local", prog([
+    fn("f", 1, [lr("p"), lr("b"), lr("c")], MVoid, [bk([
+      IGetField(1, OLocal(0), 0), IClosure(2, 1, [OLocal(1)])], ret())]),
+    lifted()]), "borrowed");
+  const n3 = neg("indirect call of a released closure", prog([
+    fn("f", 0, [lr("c")], MVoid, [bk([IClosure(0, 1, []), IRelease(0), ICallIndirect(None, OLocal(0), [OInt(1)])], ret())]),
+    lifted()]), dead);
+  const n4 = neg("indirect call with a dead argument", prog([
+    fn("f", 0, [lr("c"), lr("a")], MVoid, [bk([
+      IClosure(0, 1, []), ICallIndirect(None, OLocal(0), [OLocal(1)]), IRelease(0)], ret())]),
+    fn("l", 2, [lr("env"), lr("y")], MVoid, [bk([], TReturn(None))])]), dead);
+  const n5 = neg("lifted function with an owned parameter", prog([
+    fn("f", 0, [lr("c")], MVoid, [bk([IClosure(0, 1, []), IRelease(0)], ret())]),
+    fnO("l", [true, false], [lr("env"), li("x")], MVoid, [bk([IRelease(0)], TReturn(None))])]), "borrowed parameters");
+  const n6 = neg("closure function index out of range", straight(0, [lr("c")], [IClosure(0, 9, [])]), "out of range");
+  const n7 = neg("lifted function without an environment parameter", prog([
+    fn("f", 0, [lr("c")], MVoid, [bk([IClosure(0, 1, []), IRelease(0)], ret())]),
+    fn("l", 1, [li("x")], MVoid, [bk([], TReturn(None))])]), "environment");
+  const n8 = neg("callee is not a reference", straight(0, [li("c")], [ICopy(0, OInt(1)), ICallIndirect(None, OLocal(0), [])]), "callee");
+  const n9 = neg("closure released twice", prog([
+    fn("f", 0, [lr("c")], MVoid, [bk([IClosure(0, 1, []), IRelease(0), IRelease(0)], ret())]),
+    lifted()]), dead);
+  const n10 = neg("Unique argument demoted by an indirect call with a reference result", prog([
+    fn("f", 0, [lr("c"), lr("a"), lr("r")], MVoid, [bk([
+      IClosure(0, 1, []), IStructNew(1, 0, [OInt(1)]), ICallIndirect(Some(2), OLocal(0), [OLocal(1)]),
+      ISetField(1, 0, OInt(2)), IRelease(1), IRelease(2), IRelease(0)], ret())]),
+    fn("lr", 2, [lr("env"), lr("y")], MRef, [bk([IDup(2, OLocal(1))], TReturn(Some(OLocal(2))))])]), "Unique");
+  const n11 = neg("owned capture of a Param", prog([
+    fn("f", 1, [lr("p"), lr("c")], MVoid, [bk([IClosure(1, 1, [OLocal(0)])], ret())]),
+    lifted()]), "parameter");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
+  if (!p5) { bad += 1; } if (!w1) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; } if (!n11) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases();
+  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);
