@@ -2,6 +2,7 @@
 // `orin test` runs with runtime contract checking, so the contracts of both modules are exercised too.
 // The loader is driven through the overlay with virtual paths below /virt (nothing is read from disk).
 
+import { Host, useFs } from "std:host";
 import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
 import {
   SourceFile, Diagnostic, SourceMap, span, spanTo, diag, render, isValidCode,
@@ -101,8 +102,9 @@ function pathProperties(): void {
 // ---- loader --------------------------------------------------------------------------------
 
 @Test
-function dependenciesComeFirst(): void {
-  const o = loadWithOverlay(
+function dependenciesComeFirst(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, 
     "/virt/main.or",
     [
       file("/virt/main.or", "import { a } from \"./a\";\nimport { b } from \"./b\";\n"),
@@ -114,20 +116,24 @@ function dependenciesComeFirst(): void {
   assertEqUsize(o.diags.length, 0, "no diagnostics");
   assertEqString(userUnits(o), "c a b main", "order: shared dependency once, entry last");
   assertEqString(o.sm.files[0].path, "/virt/main.or", "the entry keeps file id 0");
+  });
 }
 
 @Test
-function overlayShadowsAndFirstWins(): void {
-  const o = loadWithOverlay(
+function overlayShadowsAndFirstWins(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, 
     "/virt/main.or",
     [file("/virt/main.or", "const x = 1;\n"), file("/virt/./main.or", "const x = 2;\n")],
   );
   assertEqString(o.sm.files[0].text, "const x = 1;\n", "first entry for a normalized path wins");
+  });
 }
 
 @Test
-function missingModule(): void {
-  const o = loadWithOverlay(
+function missingModule(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, 
     "/virt/main.or",
     [file("/virt/main.or", "import { a } from \"./nope\";\n")],
   );
@@ -141,20 +147,24 @@ function missingModule(): void {
     "/virt/main.or",
     "the files read so far are in the source map",
   );
+  });
 }
 
 @Test
-function unknownStdModule(): void {
-  const o = loadWithOverlay(
+function unknownStdModule(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, 
     "/virt/main.or",
     [file("/virt/main.or", "import { x } from \"std:nope\";\n")],
   );
   assert(firstDiag(o).includes("error[E0301]: unknown standard module `std:nope`"), "E0301");
+  });
 }
 
 @Test
-function importCycle(): void {
-  const o = loadWithOverlay(
+function importCycle(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, 
     "/virt/main.or",
     [
       file("/virt/main.or", "import { a } from \"./a\";\n"),
@@ -167,11 +177,13 @@ function importCycle(): void {
     "E0303: " + firstDiag(o),
   );
   assertEqUsize(o.diags.length, 1, "one diagnostic");
+  });
 }
 
 @Test
-function privateFileOfModule(): void {
-  const o = loadWithOverlay(
+function privateFileOfModule(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, 
     "/virt/main.or",
     [
       file("/virt/main.or", "import { s } from \"./lib/secret\";\n"),
@@ -185,7 +197,7 @@ function privateFileOfModule(): void {
     ),
     "E0302: " + firstDiag(o),
   );
-  const ok = loadWithOverlay(
+  const ok = loadWithOverlay(fs, 
     "/virt/main.or",
     [
       file("/virt/main.or", "import { s } from \"./lib\";\n"),
@@ -194,20 +206,24 @@ function privateFileOfModule(): void {
     ],
   );
   assertEqString(userUnits(ok), "lib/secret lib/module main", "the module itself may be imported");
+  });
 }
 
 @Test
-function syntaxErrorKeepsFile(): void {
-  const o = loadWithOverlay("/virt/main.or", [file("/virt/main.or", "const = ;\n")]);
+function syntaxErrorKeepsFile(host: Host): void {
+  useFs(host, fs => {
+  const o = loadWithOverlay(fs, "/virt/main.or", [file("/virt/main.or", "const = ;\n")]);
   assertEqUsize(o.diags.length, 1, "diagnostic");
   assertEqUsize(o.sm.files.length, 1, "the unparsable file is in the source map");
   assert(o.program.isNone(), "no program");
+  });
 }
 
 const TOML: string = "[package]\nname = \"p\"\nentry = \"main.or\"\n\n[modules.a]\nallowed_dependencies = [\"b\"]\n";
 
 @Test
-function packageRules(): void {
+function packageRules(host: Host): void {
+  useFs(host, fs => {
   const base = [
     file("/virt/orin.toml", TOML),
     file("/virt/main.or", "import { a } from \"./a\";\n"),
@@ -215,12 +231,12 @@ function packageRules(): void {
     file("/virt/b/module.or", "export const b = 1;\n"),
     file("/virt/c/module.or", "export const c = 1;\n"),
   ];
-  const o = loadWithOverlay("/virt", base);
+  const o = loadWithOverlay(fs, "/virt", base);
   assert(
     firstDiag(o).includes("error[E0501]: module `a` must not import module `c`"),
     "E0501: " + firstDiag(o),
   );
-  const unknown = loadWithOverlay(
+  const unknown = loadWithOverlay(fs, 
     "/virt",
     [file("/virt/orin.toml", TOML), file("/virt/main.or", "")],
   );
@@ -228,7 +244,7 @@ function packageRules(): void {
     firstDiag(unknown).includes("error[E0502]: unknown module `a` in [modules.a]"),
     "E0502: " + firstDiag(unknown),
   );
-  const fine = loadWithOverlay(
+  const fine = loadWithOverlay(fs, 
     "/virt",
     [
       file("/virt/orin.toml", TOML),
@@ -245,12 +261,14 @@ function packageRules(): void {
     "unit names relative to the entry directory",
   );
   assert(fine.program.unwrap().manifest.isSome(), "manifest recorded");
+  });
 }
 
 @Test
-function moduleCycle(): void {
+function moduleCycle(host: Host): void {
+  useFs(host, fs => {
   const toml = "[package]\nname = \"p\"\nentry = \"main.or\"\n\n[modules.a]\nallowed_dependencies = [\"b\"]\n\n[modules.b]\nallowed_dependencies = [\"a\"]\n";
-  const o = loadWithOverlay(
+  const o = loadWithOverlay(fs, 
     "/virt",
     [
       file("/virt/orin.toml", toml),
@@ -264,4 +282,5 @@ function moduleCycle(): void {
     ],
   );
   assert(o.diags.length == 1 && o.diags[0].code == "E0303", "one E0303: " + firstDiag(o));
+  });
 }
