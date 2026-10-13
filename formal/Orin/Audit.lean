@@ -19,3 +19,29 @@ import Orin
 #print axioms Orin.makeUnique_store_cow
 #print axioms Orin.makeUnique_store_run
 #print axioms Orin.wf_init
+
+-- ownership checker soundness (Mir, Check, Proj, Sim1-7, Weaken, Sound, Top)
+#print axioms Orin.op_const
+#print axioms Orin.op_move
+#print axioms Orin.op_borrow
+#print axioms Orin.op_dup
+#print axioms Orin.op_release
+#print axioms Orin.op_alloc
+#print axioms Orin.op_getField
+#print axioms Orin.op_setField
+#print axioms Orin.op_putField
+#print axioms Orin.op_takeField
+#print axioms Orin.op_makeUnique
+#print axioms Orin.drain_inv
+#print axioms Orin.Inv.weaken
+#print axioms Orin.joinL_fle_left
+#print axioms Orin.joinL_fle_right
+#print axioms Orin.unique_excl
+#print axioms Orin.chk_cont
+#print axioms Orin.sound_step
+#print axioms Orin.reach_inv
+#print axioms Orin.reach_safe
+#print axioms Orin.entry_inv
+#print axioms Orin.check_sound
+#print axioms Orin.check_no_use_after_free
+#print axioms Orin.check_no_shared_store
