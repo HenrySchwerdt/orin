@@ -8,23 +8,25 @@
 
 import { Span, Diagnostic, diag } from "../diag";
 import {
-  Ident, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit, MatchArm, ArmBody, TypeExpr, AssignOp,
-  UnaryOp, BinaryOp, Pattern
+  Ident, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit, MatchArm, ArmBody, TypeExpr, TNamed, AssignOp,
+  UnaryOp, BinaryOp, Pattern, TypeDecl, DRecord, DUnion, FieldDecl
 } from "../syntax";
 import {
   Type, FieldDef, VariantDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm,
   HPattern, Builtin, MutBuiltin
 } from "../hir";
 import {
-  Env, ValEnt, ConstLit, typeEq, isInt, isUsize, isBool, isString, isVoid, isIntish, isArrayTy,
-  expIsUsize, showType, mismatch, globalVal
+  Env, ValEnt, ConstLit, EntRecord, EntUnion, EntAlias, EntGen, typeEq, isInt, isUsize, isBool, isString, isVoid,
+  isIntish, isArrayTy, expIsUsize, showType, mismatch, globalVal, findType, originOf
 } from "./env";
 import {
   FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak
 } from "./fnctx";
 import { builtinSig, methodSig, Sig, MSig } from "./builtins";
 import { checkPattern, PatOut } from "./pattern";
-import { resolveType, resolveTypeNameTop } from "./decls";
+import {
+  TScope, resolveType, aliasType, instType, instFunc, unify, noBinds, mentionsUnbound, indexOfName, scopeOf
+} from "./types";
 
 export type ExprOut = { fx: FnCtx; expr: HExpr; };
 export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
@@ -35,6 +37,8 @@ type StmtOut = { fx: FnCtx; stmt: HStmt; div: bool; };
 type MatchOut = { fx: FnCtx; expr: HExpr; div: bool; };
 type LetInit = { fx: FnCtx; expr: HExpr; ty: Type; };
 type ElseOut = { fx: FnCtx; block: Option<HBlock>; div: bool; };
+type TyFx = { fx: FnCtx; ty: Type; };
+type InferOut = { fx: FnCtx; tys: Type[]; args: HExpr[]; };
 
 function mk(kind: HExprKind, ty: Type, span: Span): HExpr {
   return HExpr { kind: kind, ty: ty, span: span };
@@ -125,7 +129,7 @@ function noField(env: Env, name: Ident, t: Type): Diagnostic {
 function expect(env: Env, fx: FnCtx, e: Expr, ty: Type): Result<ExprOut, Diagnostic> {
   const r = checkExpr(env, fx, e, Some(ty))?;
   if (!typeEq(r.expr.ty, ty)) {
-    return Err(mismatch(env, e.span, ty, r.expr.ty));
+    return Err(mismatch(r.fx.env, e.span, ty, r.expr.ty));
   }
   return Ok(r);
 }
@@ -145,7 +149,9 @@ export function checkExpr(env: Env, fx: FnCtx, e: Expr, exp: Option<Type>): Resu
     ETry(x) => checkTry(env, fx, span, x),
     ECond(c, t, f) => checkCond(env, fx, span, c, t, f, exp),
     EArray(elems) => checkArray(env, fx, span, elems, exp),
-    ERecord(name, spread, fields) => checkRecord(env, fx, span, name, spread, fields),
+    ERecord(name, spread, fields) => checkRecord(env, fx, span, name, None, spread, fields, exp),
+    ERecordT(name, targs, spread, fields) => checkRecord(env, fx, span, name, Some(targs), spread, fields, exp),
+    ETyApp(_, _) => Err(diag("E0400", span, "type arguments are only allowed on a call or a record literal")),
     EMatch(s, arms) => checkMatchExpr(env, fx, span, s, arms, exp)
   };
 }
@@ -173,7 +179,7 @@ function checkIdent(env: Env, fx: FnCtx, id: Ident, exp: Option<Type>, span: Spa
   }
   const g = globalVal(env, fx.unit, id.name);
   if (g.isSome()) {
-    return identVal(env, fx, g.unwrap(), id, span);
+    return identVal(env, fx, g.unwrap(), id, span, exp);
   }
   if (id.name == "None") {
     return noneLit(env, fx, exp, span);
@@ -184,11 +190,11 @@ function checkIdent(env: Env, fx: FnCtx, id: Ident, exp: Option<Type>, span: Spa
   return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
 }
 
-function identVal(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span): Result<ExprOut, Diagnostic> {
+function identVal(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span, exp: Option<Type>): Result<ExprOut, Diagnostic> {
   return match (ent) {
     VConst(i) => done(fx, constKind(env.consts[i].lit), env.consts[i].ty, span),
     VVariant(u, tag) => {
-      const def = env.unions[u].variants[tag];
+      const def = fx.env.unions[u].variants[tag];
       if (def.payload.length > 0) {
         return Err(diag(
           "E0404",
@@ -198,6 +204,8 @@ function identVal(env: Env, fx: FnCtx, ent: ValEnt, id: Ident, span: Span): Resu
       }
       return done(fx, XVariant(tag, noExprs()), TyUnion(u), span);
     },
+    VGVariant(g, tag) => genericVariant(env, fx, span, g, tag, None, [], exp),
+    VGFunc(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value")),
     VFunc(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value")),
     VStd(_) => Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value"))
   };
@@ -207,7 +215,7 @@ function noneLit(env: Env, fx: FnCtx, exp: Option<Type>, span: Span): Result<Exp
   return match (exp) {
     Some(t) => match (t) {
       TyOption(inner) => done(fx, XVariant(1, noExprs()), TyOption(inner), span),
-      _ => Err(diag("E0400", span, "expected `" + showType(env, t) + "`, found an `Option`"))
+      _ => Err(diag("E0400", span, "expected `" + showType(fx.env, t) + "`, found an `Option`"))
     },
     None => Err(diag("E0407", span, "cannot infer the type of `None`; add a type annotation"))
   };
@@ -221,7 +229,7 @@ function checkUnary(
     UNot => {
       const o = checkExpr(env, fx, inner, None)?;
       if (!isBool(o.expr.ty)) {
-        return Err(diag("E0410", span, "`!` requires `bool`, found `" + showType(env, o.expr.ty) + "`"));
+        return Err(diag("E0410", span, "`!` requires `bool`, found `" + showType(o.fx.env, o.expr.ty) + "`"));
       }
       return done(o.fx, XUnary(UnNot, o.expr), TyBool, span);
     }
@@ -245,7 +253,7 @@ function checkNeg(env: Env, fx: FnCtx, span: Span, inner: Expr, exp: Option<Type
   }
   const o = checkExpr(env, fx, inner, None)?;
   if (!isInt(o.expr.ty)) {
-    return Err(diag("E0410", span, "cannot negate a value of type `" + showType(env, o.expr.ty) + "`"));
+    return Err(diag("E0410", span, "cannot negate a value of type `" + showType(o.fx.env, o.expr.ty) + "`"));
   }
   return done(o.fx, XUnary(UnNeg, o.expr), TyInt, span);
 }
@@ -276,8 +284,8 @@ function checkBinary(
       return Err(diag(
         "E0410",
         span,
-        "`&&`/`||` require `bool` operands, found `" + showType(env, l.expr.ty) + "` and `"
-          + showType(env, r.expr.ty) + "`"
+        "`&&`/`||` require `bool` operands, found `" + showType(r.fx.env, l.expr.ty) + "` and `"
+          + showType(r.fx.env, r.expr.ty) + "`"
       ));
     }
     return done(r.fx, XBinary(hop, l.expr, r.expr), TyBool, span);
@@ -291,14 +299,14 @@ function checkBinary(
     return Err(diag(
       "E0400",
       span,
-      "cannot mix `" + showType(env, lt) + "` and `" + showType(env, rt) + "`; convert explicitly"
+      "cannot mix `" + showType(p.fx.env, lt) + "` and `" + showType(p.fx.env, rt) + "`; convert explicitly"
     ));
   }
   if (!typeEq(lt, rt)) {
     return Err(diag(
       "E0410",
       span,
-      "operands have different types `" + showType(env, lt) + "` and `" + showType(env, rt) + "`"
+      "operands have different types `" + showType(p.fx.env, lt) + "` and `" + showType(p.fx.env, rt) + "`"
     ));
   }
   const ok = match (op) {
@@ -312,7 +320,7 @@ function checkBinary(
     _ => isIntish(lt)
   };
   if (!ok) {
-    return Err(diag("E0410", span, "operator is not defined for type `" + showType(env, lt) + "`"));
+    return Err(diag("E0410", span, "operator is not defined for type `" + showType(p.fx.env, lt) + "`"));
   }
   return done(p.fx, XBinary(hop, p.l, p.r), arith ? lt : TyBool, span);
 }
@@ -330,7 +338,7 @@ function checkMember(env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident): 
   }
   return match (t) {
     TyRecord(r) => {
-      const def = env.records[r];
+      const def = b.fx.env.records[r];
       const io = fieldIndex(def.fields, name.name);
       if (io.isNone()) {
         return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
@@ -338,7 +346,7 @@ function checkMember(env: Env, fx: FnCtx, span: Span, base: Expr, name: Ident): 
       const i = io.unwrap();
       return done(b.fx, XField(b.expr, r, i), def.fields[i].ty, span);
     },
-    _ => Err(noField(env, name, t))
+    _ => Err(noField(fx.env, name, t))
   };
 }
 
@@ -349,7 +357,7 @@ function checkIndex(env: Env, fx: FnCtx, span: Span, base: Expr, index: Expr): R
       const i = expect(env, b.fx, index, TyUsize)?;
       return done(i.fx, XIndex(b.expr, i.expr), t, span);
     },
-    _ => Err(diag("E0400", span, "cannot index into type `" + showType(env, b.expr.ty) + "`"))
+    _ => Err(diag("E0400", span, "cannot index into type `" + showType(b.fx.env, b.expr.ty) + "`"))
   };
 }
 
@@ -363,8 +371,8 @@ function checkTry(env: Env, fx: FnCtx, span: Span, inner: Expr): Result<ExprOut,
             return Err(diag(
               "E0406",
               span,
-              "error type `" + showType(env, et) + "` does not match the function's error type `"
-                + showType(env, e2) + "`"
+              "error type `" + showType(o.fx.env, et) + "` does not match the function's error type `"
+                + showType(o.fx.env, e2) + "`"
             ));
           }
         },
@@ -372,13 +380,13 @@ function checkTry(env: Env, fx: FnCtx, span: Span, inner: Expr): Result<ExprOut,
           return Err(diag(
             "E0406",
             span,
-            "`?` used in a function returning `" + showType(env, fx.ret) + "`, not a `Result`"
+            "`?` used in a function returning `" + showType(fx.env, fx.ret) + "`, not a `Result`"
           ));
         }
       }
       return done(o.fx, XTry(o.expr), t, span);
     },
-    _ => Err(diag("E0406", span, "`?` requires a `Result`, found `" + showType(env, o.expr.ty) + "`"))
+    _ => Err(diag("E0406", span, "`?` requires a `Result`, found `" + showType(o.fx.env, o.expr.ty) + "`"))
   };
 }
 
@@ -407,8 +415,8 @@ function checkCond(
     return Err(diag(
       "E0400",
       elsE.span,
-      "branches of conditional have different types `" + showType(env, t.ty) + "` and `"
-        + showType(env, f.ty) + "`"
+      "branches of conditional have different types `" + showType(fx.env, t.ty) + "` and `"
+        + showType(fx.env, f.ty) + "`"
     ));
   }
   return done(cur, XCond(c.expr, t, f), t.ty, span);
@@ -475,21 +483,186 @@ function checkArray(
   return done(cur, XArray(out), TyArray(elemTy), span);
 }
 
+function resolveFx(fx: FnCtx, te: TypeExpr, voidOk: bool): Result<TyFx, Diagnostic> {
+  const sc = TScope { unit: fx.unit, names: fx.tpNames, tys: fx.tpTys, depth: 0 };
+  const r = resolveType(fx.env, sc, te, voidOk)?;
+  return Ok(TyFx { fx: withEnv(fx, r.env), ty: r.ty });
+}
+
+// `fx` with its environment replaced by `e` (instances only ever grow the tables).
+function withEnv(fx: FnCtx, e: Env): FnCtx {
+  if (e.insts.length == fx.env.insts.length) {
+    return fx;
+  }
+  let f = fx;
+  f.env = e;
+  return f;
+}
+
+// `Name<P1, ..., Pn>` for a generic declaration: the "return type" of its constructors.
+function selfTypeExpr(d: TypeDecl): TypeExpr {
+  let args: TypeExpr[] = [];
+  for (const p of d.typeParams) {
+    args.push(TypeExpr { kind: TNamed(p, []), span: p.span });
+  }
+  return TypeExpr { kind: TNamed(d.name, args), span: d.name.span };
+}
+
+function paramNameList(ps: Ident[]): string[] {
+  let out: string[] = [];
+  for (const p of ps) {
+    out.push(p.name);
+  }
+  return out;
+}
+
 function checkRecord(
-  env: Env, fx: FnCtx, span: Span, name: Ident, spread: Option<Expr>, fields: FieldInit[]
+  env: Env, fx: FnCtx, span: Span, name: Ident, targs: Option<TypeExpr[]>, spread: Option<Expr>,
+  fields: FieldInit[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
-  const t = resolveTypeNameTop(env, fx.unit, name)?;
+  if (indexOfName(fx.tpNames, name.name).isSome()) {
+    return Err(diag("E0400", name.span, "`" + name.name + "` is a type parameter, not a record type"));
+  }
+  const found = findType(env.units[fx.unit].scope, name.name);
+  if (found.isNone()) {
+    return Err(diag("E0300", name.span, "unknown type `" + name.name + "`"));
+  }
+  let cur = fx;
+  let t: Type = TyVoid;
+  match (found.unwrap()) {
+    EntGen(g) => {
+      return checkGenericRecord(env, fx, span, g, name, targs, spread, fields, exp);
+    },
+    EntRecord(r) => { t = TyRecord(r); },
+    EntUnion(u) => { t = TyUnion(u); },
+    EntAlias(i) => {
+      const none: int[] = [];
+      const r = aliasType(cur.env, i, none)?;
+      cur = withEnv(cur, r.env);
+      t = r.ty;
+    }
+  }
+  if (targs.isSome()) {
+    return Err(diag("E0400", name.span, "type `" + name.name + "` is not generic"));
+  }
   const rid = match (t) {
     TyRecord(r) => r,
     _ => {
       return Err(diag(
         "E0400",
         name.span,
-        "`" + name.name + "` is not a record type (it is `" + showType(env, t) + "`)"
+        "`" + name.name + "` is not a record type (it is `" + showType(cur.env, t) + "`)"
       ));
     }
   };
-  const def = env.records[rid];
+  return checkRecordOf(env, cur, span, rid, spread, fields);
+}
+
+function fieldDeclIndex(fields: FieldDecl[], name: string): Option<usize> {
+  let i: usize = 0;
+  for (const f of fields) {
+    if (f.name.name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// Record literal of a generic record type: the instance comes from the spread, the explicit type
+// arguments, the expected type or the field values (in that order of authority).
+function checkGenericRecord(
+  env: Env, fx: FnCtx, span: Span, g: usize, name: Ident, targs: Option<TypeExpr[]>, spread: Option<Expr>,
+  fields: FieldInit[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const gt = env.gtypes[g];
+  const fdecls = match (gt.decl.body) {
+    DRecord(fs) => fs,
+    _ => {
+      return Err(diag("E0400", name.span, "`" + name.name + "` is not a record type"));
+    }
+  };
+  match (spread) {
+    Some(se) => {
+      const s = checkExpr(env, fx, se, None)?;
+      const o = originOf(s.fx.env, s.expr.ty);
+      let ok = false;
+      let rid: usize = 0;
+      match (o) {
+        Some(inst) => {
+          if (inst.kind == 0 && inst.gid == g) {
+            ok = true;
+            rid = inst.id;
+          }
+        },
+        None => {}
+      }
+      if (!ok) {
+        return Err(diag(
+          "E0400", se.span,
+          "spread of `" + name.name + "` literal must be an instance of `" + name.name + "`, found `"
+            + showType(s.fx.env, s.expr.ty) + "`"
+        ));
+      }
+      return checkRecordOf(env, s.fx, span, rid, spread, fields);
+    },
+    None => {}
+  }
+  let idxs: usize[] = [];
+  let seen: bool[] = [];
+  for (const _f of fdecls) {
+    seen.push(false);
+  }
+  let ptes: TypeExpr[] = [];
+  let vals: Expr[] = [];
+  for (const f of fields) {
+    const io = fieldDeclIndex(fdecls, f.name.name);
+    if (io.isNone()) {
+      return Err(diag("E0411", f.name.span, "record `" + name.name + "` has no field `" + f.name.name + "`"));
+    }
+    const idx = io.unwrap();
+    if (seen[idx]) {
+      return Err(diag("E0411", f.name.span, "field `" + f.name.name + "` given more than once"));
+    }
+    seen[idx] = true;
+    idxs.push(idx);
+    ptes.push(fdecls[idx].ty);
+    vals.push(f.value);
+  }
+  let missing: string[] = [];
+  let k: usize = 0;
+  for (const fd of fdecls) {
+    if (!seen[k]) {
+      missing.push(fd.name.name);
+    }
+    k += 1;
+  }
+  if (missing.length > 0) {
+    return Err(diag("E0411", span, "missing field(s) in record literal: " + missing.join(", ")));
+  }
+  const io = infer(
+    env, fx, span, "record `" + name.name + "`", gt.unit, gt.decl.typeParams, ptes,
+    Some(selfTypeExpr(gt.decl)), vals, exp, targs
+  )?;
+  const inst = instType(io.fx.env, g, io.tys, 0, span)?;
+  const f2 = withEnv(io.fx, inst.env);
+  const rid = match (inst.ty) {
+    TyRecord(r) => r,
+    _ => 0
+  };
+  let out: FieldInitH[] = [];
+  let i: usize = 0;
+  while (i < idxs.length) {
+    out.push(FieldInitH { index: idxs[i], value: io.args[i] });
+    i += 1;
+  }
+  return done(f2, XRecord(rid, None, out), TyRecord(rid), span);
+}
+
+function checkRecordOf(
+  env: Env, fx: FnCtx, span: Span, rid: usize, spread: Option<Expr>, fields: FieldInit[]
+): Result<ExprOut, Diagnostic> {
+  const def = fx.env.records[rid];
   let cur = fx;
   let sp: Option<HExpr> = None;
   match (spread) {
@@ -566,6 +739,7 @@ function checkCall(
 ): Result<ExprOut, Diagnostic> {
   return match (callee.kind) {
     EIdent(id) => callIdent(env, fx, span, callee, id, args, exp),
+    ETyApp(id, targs) => callTyApp(env, fx, span, callee, id, targs, args, exp),
     EMember(base, name) => callMember(env, fx, span, base, name, args),
     _ => Err(diag("E0400", callee.span, "expression is not callable"))
   };
@@ -588,18 +762,290 @@ function callIdent(
     return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
   }
   return match (g.unwrap()) {
+    VGFunc(gi) => callGeneric(env, fx, span, gi, id, None, args, exp),
+    VGVariant(gi, tag) => genericVariant(env, fx, span, gi, tag, None, args, exp),
     VFunc(fid) => {
-      const f = env.funcs[fid];
+      const f = fx.env.funcs[fid];
       const a = argsExpect(env, fx, span, "function `" + id.name + "`", args, f.params)?;
       return done(a.fx, XCall(fid, a.args), f.ret, span);
     },
     VVariant(u, tag) => {
-      const v = env.unions[u].variants[tag];
+      const v = fx.env.unions[u].variants[tag];
       const a = argsExpect(env, fx, span, "variant `" + v.name + "`", args, v.payload)?;
       return done(a.fx, XVariant(tag, a.args), TyUnion(u), span);
     },
     VStd(b) => callBuiltin(env, fx, span, "function `" + id.name + "`", b, args),
     VConst(_) => Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"))
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// Generic calls (beyond Orin-B, ADR-0007)
+// ---------------------------------------------------------------------------
+
+function callTyApp(
+  env: Env, fx: FnCtx, span: Span, callee: Expr, id: Ident, targs: TypeExpr[], args: Expr[], exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  if (lookupLocal(fx, id.name).isSome()) {
+    return Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"));
+  }
+  const g = globalVal(env, fx.unit, id.name);
+  if (g.isNone()) {
+    return Err(diag("E0300", id.span, "unresolved name `" + id.name + "`"));
+  }
+  return match (g.unwrap()) {
+    VGFunc(gi) => callGeneric(env, fx, span, gi, id, Some(targs), args, exp),
+    VGVariant(gi, tag) => genericVariant(env, fx, span, gi, tag, Some(targs), args, exp),
+    _ => Err(diag("E0400", callee.span, "`" + id.name + "` is not generic and takes no type arguments"))
+  };
+}
+
+// Resolves a parameter / result type expression of a generic callee with its type parameters
+// bound to `tys` (only mentioned parameters need to be real).
+function resolveBound(fx: FnCtx, unit: usize, tp: string[], tys: Type[], te: TypeExpr, voidOk: bool): Result<TyFx, Diagnostic> {
+  const sc = TScope { unit: unit, names: tp, tys: tys, depth: 0 };
+  const r = resolveType(fx.env, sc, te, voidOk)?;
+  return Ok(TyFx { fx: withEnv(fx, r.env), ty: r.ty });
+}
+
+function bindsOrVoid(binds: Option<Type>[]): Type[] {
+  let out: Type[] = [];
+  for (const b of binds) {
+    out.push(b.unwrapOr(TyVoid));
+  }
+  return out;
+}
+
+// Infers the type arguments of a call to a generic callee (function, variant constructor or
+// record literal) and checks the arguments. Order of authority: explicit type arguments; else
+// the expected type; then the arguments left to right (arguments that cannot be typed alone,
+// such as `[]` or `None`, and bare integer literals are deferred until the others are known).
+// Returns the type arguments and the checked arguments in source order.
+function infer(
+  env: Env, fx0: FnCtx, span: Span, what: string, unit: usize, tps: Ident[], paramTEs: TypeExpr[],
+  retTE: Option<TypeExpr>, args: Expr[], exp: Option<Type>, explicit: Option<TypeExpr[]>
+): Result<InferOut, Diagnostic> {
+  if (args.length != paramTEs.length) {
+    return Err(diag(
+      "E0404",
+      span,
+      what + " expects " + paramTEs.length.toString() + " argument(s), found " + args.length.toString()
+    ));
+  }
+  const tp = paramNameList(tps);
+  let fx = fx0;
+  let binds = noBinds(tp.length);
+  match (explicit) {
+    Some(ts) => {
+      if (ts.length != tp.length) {
+        return Err(diag(
+          "E0400",
+          span,
+          what + " expects " + tp.length.toString() + " type argument(s), found " + ts.length.toString()
+        ));
+      }
+      let k: usize = 0;
+      for (const t of ts) {
+        const r = resolveFx(fx, t, false)?;
+        fx = r.fx;
+        binds[k] = Some(r.ty);
+        k += 1;
+      }
+    },
+    None => {
+      match (exp) {
+        Some(et) => {
+          match (retTE) {
+            Some(rt) => { binds = unify(fx.env, unit, rt, et, tp, binds); },
+            None => {}
+          }
+        },
+        None => {}
+      }
+    }
+  }
+  let outArgs: Option<HExpr>[] = [];
+  for (const _a of args) {
+    outArgs.push(None);
+  }
+  let deferred: usize[] = [];
+  let i: usize = 0;
+  while (i < args.length) {
+    const te = paramTEs[i];
+    if (!mentionsUnbound(te, tp, binds)) {
+      const pt = resolveBound(fx, unit, tp, bindsOrVoid(binds), te, false)?;
+      const r = expect(env, pt.fx, args[i], pt.ty)?;
+      fx = r.fx;
+      outArgs[i] = Some(r.expr);
+    } else if (untypedInt(args[i])) {
+      deferred.push(i);
+    } else {
+      match (checkExpr(env, fx, args[i], None)) {
+        Ok(r) => {
+          fx = r.fx;
+          outArgs[i] = Some(r.expr);
+          binds = unify(fx.env, unit, te, r.expr.ty, tp, binds);
+        },
+        Err(d) => {
+          if (d.code == "E0407") {
+            deferred.push(i);
+          } else {
+            return Err(d);
+          }
+        }
+      }
+    }
+    i += 1;
+  }
+  // Deferred arguments: resolvable ones are checked against their parameter; others are typed on
+  // their own. Bare integer literals (default `int`) go last, one at a time.
+  let pending = deferred;
+  while (pending.length > 0) {
+    let progress = false;
+    let rest: usize[] = [];
+    let firstErr: Option<Diagnostic> = None;
+    for (const di of pending) {
+      const te = paramTEs[di];
+      if (!mentionsUnbound(te, tp, binds)) {
+        const pt = resolveBound(fx, unit, tp, bindsOrVoid(binds), te, false)?;
+        const r = expect(env, pt.fx, args[di], pt.ty)?;
+        fx = r.fx;
+        outArgs[di] = Some(r.expr);
+        progress = true;
+      } else if (untypedInt(args[di])) {
+        rest.push(di);
+      } else {
+        match (checkExpr(env, fx, args[di], None)) {
+          Ok(r) => {
+            fx = r.fx;
+            outArgs[di] = Some(r.expr);
+            binds = unify(fx.env, unit, te, r.expr.ty, tp, binds);
+            progress = true;
+          },
+          Err(d) => {
+            if (d.code != "E0407") {
+              return Err(d);
+            }
+            if (firstErr.isNone()) {
+              firstErr = Some(d);
+            }
+            rest.push(di);
+          }
+        }
+      }
+    }
+    if (!progress) {
+      let lit: Option<usize> = None;
+      for (const di of rest) {
+        if (lit.isNone() && untypedInt(args[di])) {
+          lit = Some(di);
+        }
+      }
+      if (lit.isNone()) {
+        return Err(firstErr.unwrap());
+      }
+      const li = lit.unwrap();
+      const r = checkExpr(env, fx, args[li], None)?;
+      fx = r.fx;
+      outArgs[li] = Some(r.expr);
+      binds = unify(fx.env, unit, paramTEs[li], r.expr.ty, tp, binds);
+      let rest2: usize[] = [];
+      for (const di of rest) {
+        if (di != li) {
+          rest2.push(di);
+        }
+      }
+      rest = rest2;
+    }
+    pending = rest;
+  }
+  let tys: Type[] = [];
+  let bi: usize = 0;
+  for (const b of binds) {
+    match (b) {
+      Some(t) => {
+        if (isVoid(t)) {
+          return Err(diag("E0400", span, "type argument `" + tp[bi] + "` of " + what + " cannot be `void`"));
+        }
+        tys.push(t);
+      },
+      None => {
+        return Err(diag(
+          "E0407",
+          span,
+          "cannot infer type argument `" + tp[bi] + "` of " + what + "; add explicit type arguments or a type annotation"
+        ));
+      }
+    }
+    bi += 1;
+  }
+  let hargs: HExpr[] = [];
+  let j: usize = 0;
+  for (const oa of outArgs) {
+    const he = oa.unwrap();
+    const pt = resolveBound(fx, unit, tp, tys, paramTEs[j], false)?;
+    fx = pt.fx;
+    if (!typeEq(he.ty, pt.ty)) {
+      return Err(mismatch(fx.env, args[j].span, pt.ty, he.ty));
+    }
+    hargs.push(he);
+    j += 1;
+  }
+  return Ok(InferOut { fx: fx, tys: tys, args: hargs });
+}
+
+function callGeneric(
+  env: Env, fx: FnCtx, span: Span, g: usize, id: Ident, explicit: Option<TypeExpr[]>, args: Expr[],
+  exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const gf = env.gfuncs[g];
+  let ptes: TypeExpr[] = [];
+  for (const p of gf.decl.params) {
+    ptes.push(p.ty);
+  }
+  const io = infer(
+    env, fx, span, "function `" + id.name + "`", gf.unit, gf.decl.typeParams, ptes, gf.decl.ret, args, exp, explicit
+  )?;
+  let cur = io.fx;
+  let ret: Type = TyVoid;
+  match (gf.decl.ret) {
+    Some(rte) => {
+      const r = resolveBound(cur, gf.unit, paramNameList(gf.decl.typeParams), io.tys, rte, true)?;
+      cur = r.fx;
+      ret = r.ty;
+    },
+    None => {}
+  }
+  let fid: usize = 0;
+  if (!cur.abs) {
+    const fo = instFunc(cur.env, g, io.tys, cur.depth + 1, span)?;
+    cur = withEnv(cur, fo.env);
+    fid = fo.fid;
+  }
+  return done(cur, XCall(fid, io.args), ret, span);
+}
+
+function genericVariant(
+  env: Env, fx: FnCtx, span: Span, g: usize, tag: usize, explicit: Option<TypeExpr[]>, args: Expr[],
+  exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
+  const gt = env.gtypes[g];
+  const vs = match (gt.decl.body) {
+    DUnion(x) => x,
+    _ => {
+      return Err(diag("E0400", span, "not a variant constructor"));
+    }
+  };
+  const v = vs[tag];
+  const io = infer(
+    env, fx, span, "variant `" + v.name.name + "`", gt.unit, gt.decl.typeParams, v.payload,
+    Some(selfTypeExpr(gt.decl)), args, exp, explicit
+  )?;
+  const inst = instType(io.fx.env, g, io.tys, 0, span)?;
+  return match (inst.ty) {
+    TyUnion(u) => done(withEnv(io.fx, inst.env), XVariant(tag, io.args), TyUnion(u), span),
+    _ => Err(diag("E0400", span, "not a variant constructor"))
   };
 }
 
@@ -660,7 +1106,7 @@ function builtinCtor(
   const et = exp.unwrap();
   return match (et) {
     TyResult(t, e) => name == "Ok" ? okCtor(env, fx, span, args, t, e) : errCtor(env, fx, span, args, t, e),
-    _ => Err(diag("E0400", span, "expected `" + showType(env, et) + "`, found a `Result`"))
+    _ => Err(diag("E0400", span, "expected `" + showType(fx.env, et) + "`, found a `Result`"))
   };
 }
 
@@ -731,7 +1177,7 @@ function methodCall(
   const b = checkExpr(env, fx, base, None)?;
   const so = methodSig(b.expr.ty, n);
   if (so.isNone()) {
-    return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(env, b.expr.ty) + "`"));
+    return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(b.fx.env, b.expr.ty) + "`"));
   }
   const s = so.unwrap();
   const a = argsExpect(env, b.fx, span, "method `" + n + "`", args, s.params)?;
@@ -764,14 +1210,14 @@ function mutMethodCall(
         const ret: Type = isPush ? TyVoid : TyOption(t);
         return done(a.fx, XMutMethod(op, pi.place, a.args), ret, span);
       },
-      _ => Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(env, pi.place.ty) + "`"))
+      _ => Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(pi.fx.env, pi.place.ty) + "`"))
     };
   }
   const b = checkExpr(env, fx, base, None)?;
   if (isArrayTy(b.expr.ty)) {
     return Err(diag("E0401", base.span, "receiver of `" + n + "` must be a mutable place"));
   }
-  return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(env, b.expr.ty) + "`"));
+  return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(b.fx.env, b.expr.ty) + "`"));
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +1254,7 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
       const p = checkPlace(env, fx, base)?;
       return match (p.place.ty) {
         TyRecord(r) => {
-          const def = env.records[r];
+          const def = p.fx.env.records[r];
           const io = fieldIndex(def.fields, name.name);
           if (io.isNone()) {
             return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
@@ -823,11 +1269,11 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
         },
         TyString => name.name == "length"
           ? Err(diag("E0401", e.span, "`length` is read-only"))
-          : Err(noField(env, name, p.place.ty)),
+          : Err(noField(fx.env, name, p.place.ty)),
         TyArray(_) => name.name == "length"
           ? Err(diag("E0401", e.span, "`length` is read-only"))
-          : Err(noField(env, name, p.place.ty)),
-        _ => Err(noField(env, name, p.place.ty))
+          : Err(noField(fx.env, name, p.place.ty)),
+        _ => Err(noField(fx.env, name, p.place.ty))
       };
     },
     EIndex(base, index) => {
@@ -842,7 +1288,7 @@ function checkPlace(env: Env, fx: FnCtx, e: Expr): Result<PlaceOut, Diagnostic> 
             rootName: p.rootName
           });
         },
-        _ => Err(diag("E0400", e.span, "cannot index into type `" + showType(env, p.place.ty) + "`"))
+        _ => Err(diag("E0400", e.span, "cannot index into type `" + showType(p.fx.env, p.place.ty) + "`"))
       };
     },
     _ => Err(diag("E0401", e.span, "expression is not an assignable place"))
@@ -961,9 +1407,9 @@ function checkMatch(
 ): Result<MatchOut, Diagnostic> {
   const s = checkExpr(env, fx, scrut, None)?;
   const sty = s.expr.ty;
-  const variants = variantsOf(env, sty);
+  const variants = variantsOf(s.fx.env, sty);
   if (variants.isNone() && !isLiteralScrut(sty)) {
-    return Err(diag("E0402", scrut.span, "cannot match on a value of type `" + showType(env, sty) + "`"));
+    return Err(diag("E0402", scrut.span, "cannot match on a value of type `" + showType(fx.env, sty) + "`"));
   }
   let covered: bool[] = [];
   if (variants.isSome()) {
@@ -1063,8 +1509,9 @@ function checkStmt(env: Env, fx: FnCtx, s: Stmt): Result<StmtOut, Diagnostic> {
 function letInit(env: Env, fx: FnCtx, ty: Option<TypeExpr>, init: Expr): Result<LetInit, Diagnostic> {
   return match (ty) {
     Some(te) => {
-      const t = resolveType(env, fx.unit, te, false)?;
-      const e = expect(env, fx, init, t)?;
+      const tr = resolveFx(fx, te, false)?;
+      const t = tr.ty;
+      const e = expect(env, tr.fx, init, t)?;
       return Ok(LetInit { fx: e.fx, expr: e.expr, ty: t });
     },
     None => {
@@ -1122,7 +1569,7 @@ function stmtAssign(env: Env, fx: FnCtx, target: Expr, op: AssignOp, value: Expr
       return Err(diag(
         "E0410",
         target.span,
-        "compound assignment is not defined for type `" + showType(env, pty) + "`"
+        "compound assignment is not defined for type `" + showType(fx.env, pty) + "`"
       ));
     }
   }
@@ -1147,7 +1594,7 @@ function stmtReturn(env: Env, fx: FnCtx, span: Span, v: Option<Expr>): Result<St
   return match (v) {
     None => {
       if (!isVoid(fx.ret)) {
-        return Err(diag("E0400", span, "`return;` in a function returning `" + showType(env, fx.ret) + "`"));
+        return Err(diag("E0400", span, "`return;` in a function returning `" + showType(fx.env, fx.ret) + "`"));
       }
       return sout(fx, HReturn(None), true);
     },
@@ -1212,7 +1659,7 @@ function stmtForOf(env: Env, fx: FnCtx, name: Ident, iter: Expr, body: Block): R
     _ => Err(diag(
       "E0400",
       iter.span,
-      "`for ... of` requires an array, found `" + showType(env, it.expr.ty) + "`"
+      "`for ... of` requires an array, found `" + showType(it.fx.env, it.expr.ty) + "`"
     ))
   };
 }

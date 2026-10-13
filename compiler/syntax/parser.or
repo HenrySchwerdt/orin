@@ -24,6 +24,7 @@ type BlockRes = { block: Block; pos: usize; };
 type StmtRes = { stmt: Stmt; pos: usize; };
 type ExprRes = { expr: Expr; pos: usize; };
 type ExprsRes = { exprs: Expr[]; pos: usize; };
+type TypeArgsRes = { tys: TypeExpr[]; pos: usize; };
 type PatRes = { pat: Pattern; pos: usize; };
 
 // ---------------------------------------------------------------------------
@@ -841,17 +842,59 @@ function parseKeywordExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic
   return Err(errExpected(toks, pos, "expression"));
 }
 
-// Identifier, or record literal when directly followed by `{`.
+// `<T, U>` list of type arguments at `pos`, or None if the tokens there are not a well-formed
+// list (the caller then treats `<` as a comparison). Never reports errors.
+function tryTypeArgs(toks: Token[], pos: usize): Option<TypeArgsRes> {
+  if (!isP(toks, pos, "<")) {
+    return None;
+  }
+  let p = pos + 1;
+  let tys: TypeExpr[] = [];
+  while (true) {
+    const r = parseType(toks, p);
+    if (r.isErr()) {
+      return None;
+    }
+    const a = r.unwrap();
+    tys.push(a.ty);
+    p = a.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else {
+      break;
+    }
+  }
+  if (!isP(toks, p, ">")) {
+    return None;
+  }
+  return Some(TypeArgsRes { tys: tys, pos: p + 1 });
+}
+
+// Identifier, record literal when directly followed by `{`, or (beyond Orin-B) a generic
+// form `name<types>(` / `Name<types> {` -- decided by backtracking (ADR-0007).
 function parseIdentExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
   const nm = parseIdent(toks, pos)?;
   if (isP(toks, nm.pos, "{")) {
-    return parseRecordLit(toks, nm);
+    return parseRecordLit(toks, nm, []);
+  }
+  if (isP(toks, nm.pos, "<")) {
+    const ta = tryTypeArgs(toks, nm.pos);
+    if (ta.isSome()) {
+      const targs = ta.unwrap();
+      if (isP(toks, targs.pos, "(")) {
+        const sp = spanTo(nm.id.span, lastSpan(toks, targs.pos));
+        return Ok(ExprRes { expr: mkExpr(ETyApp(nm.id, targs.tys), sp), pos: targs.pos });
+      }
+      if (isP(toks, targs.pos, "{")) {
+        return parseRecordLit(toks, IdentRes { id: nm.id, pos: targs.pos }, targs.tys);
+      }
+    }
   }
   return Ok(ExprRes { expr: mkExpr(EIdent(nm.id), nm.id.span), pos: nm.pos });
 }
 
 // `Name { ...spread, a: e, b: e }`; `nm.pos` is at the `{`.
-function parseRecordLit(toks: Token[], nm: IdentRes): Result<ExprRes, Diagnostic> {
+function parseRecordLit(toks: Token[], nm: IdentRes, targs: TypeExpr[]): Result<ExprRes, Diagnostic> {
   let p = nm.pos + 1;
   let spread: Option<Expr> = None;
   if (isP(toks, p, "...")) {
@@ -879,6 +922,9 @@ function parseRecordLit(toks: Token[], nm: IdentRes): Result<ExprRes, Diagnostic
   }
   p += 1;
   const sp = spanTo(nm.id.span, lastSpan(toks, p));
+  if (targs.length > 0) {
+    return Ok(ExprRes { expr: mkExpr(ERecordT(nm.id, targs, spread, fields), sp), pos: p });
+  }
   return Ok(ExprRes { expr: mkExpr(ERecord(nm.id, spread, fields), sp), pos: p });
 }
 

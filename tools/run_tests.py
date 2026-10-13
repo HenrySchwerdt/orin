@@ -2,7 +2,11 @@
 """Orin conformance test runner (stdlib only).
 
 Usage: python3 tools/run_tests.py --orinc <compiler> [--cc cc] [--filter substr]
-                                  [--jobs N] [--sanitize]
+                                  [--jobs N] [--sanitize] [--suite default|next|all]
+
+Suites: `default` = tests/run + tests/errors (the Orin-B contract, every compiler stage);
+`next` = tests/next/run + tests/next/errors (language beyond Orin-B, self-hosted compiler only);
+`all` = both.
 
 See tests/README.md for the test formats.
 """
@@ -28,9 +32,9 @@ def first_line(path):
         return f.readline().strip()
 
 
-def discover(kind):
+def discover(kind, subdir=""):
     """Return list of (name, entry_path, expected_path_or_None)."""
-    base = os.path.join(ROOT, "tests", kind)
+    base = os.path.join(ROOT, "tests", subdir, kind)
     tests = []
     if not os.path.isdir(base):
         return tests
@@ -69,11 +73,13 @@ def compile_orin(args, entry, c_out):
     return run_cmd([args.orinc, "compile", rel, "-o", c_out], COMPILE_TIMEOUT)
 
 
-def run_test(args, kind, test):
+def run_test(args, label, test):
+    # label is "run", "errors", "next/run" or "next/errors"
     name, entry, exp = test
-    tag = "%s/%s" % (kind, name)
+    tag = "%s/%s" % (label, name)
+    kind = label.split("/")[-1]
     safe = name.replace(os.sep, "_")
-    outdir = os.path.join(BUILD, kind)
+    outdir = os.path.join(BUILD, label)
     os.makedirs(os.path.join(ROOT, outdir), exist_ok=True)
     c_out = os.path.join(outdir, safe + ".c")
     exe = os.path.join(outdir, safe + ".exe")
@@ -144,17 +150,24 @@ def main():
     ap.add_argument("--filter", default="")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--sanitize", action="store_true")
+    ap.add_argument("--suite", choices=["default", "next", "all"], default="default",
+                    help="default: tests/run + tests/errors; next: tests/next/*; all: both")
     args = ap.parse_args()
 
     if not os.path.isabs(args.orinc) and os.sep in args.orinc:
         args.orinc = os.path.join(ROOT, args.orinc)
     os.makedirs(os.path.join(ROOT, BUILD), exist_ok=True)
 
+    labels = []
+    if args.suite in ("default", "all"):
+        labels += [("run", ""), ("errors", "")]
+    if args.suite in ("next", "all"):
+        labels += [("next/run", "next"), ("next/errors", "next")]
     jobs = []
-    for kind in ("run", "errors"):
-        for t in discover(kind):
-            if args.filter in "%s/%s" % (kind, t[0]):
-                jobs.append((kind, t))
+    for label, sub in labels:
+        for t in discover(label.split("/")[-1], sub):
+            if args.filter in "%s/%s" % (label, t[0]):
+                jobs.append((label, t))
     if not jobs:
         print("no tests matched")
         return 1
@@ -173,10 +186,10 @@ def main():
         print("FAIL %s" % tag)
         for line in detail.splitlines():
             print("    " + line)
-    for kind in ("run", "errors"):
-        rs = [r for r in results if r[0].startswith(kind + "/")]
+    for label, _ in labels:
+        rs = [r for r in results if r[0].startswith(label + "/")]
         if rs:
-            print("%-6s %d passed, %d failed" % (kind, sum(1 for r in rs if r[1]), sum(1 for r in rs if not r[1])))
+            print("%-11s %d passed, %d failed" % (label, sum(1 for r in rs if r[1]), sum(1 for r in rs if not r[1])))
     print("TOTAL  %d passed, %d failed" % (len(results) - len(failed), len(failed)))
     return 1 if failed else 0
 

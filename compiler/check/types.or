@@ -1,0 +1,481 @@
+// Type resolution, generic instantiation (monomorphization of types and function signatures)
+// and type-argument unification. Beyond Orin-B: see docs/decisions/0007-generics-monomorphization.md.
+//
+// Type expressions are resolved in a `TScope`: the unit whose names are visible plus the
+// bindings of the enclosing generic declaration's type parameters. Resolving a generic type
+// application creates (or finds) a concrete record / union instance in the environment, so
+// resolution returns the possibly grown `Env` together with the type.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Ident, TypeExpr, TNamed, TArray, TypeDeclBody, DAlias, DRecord, DUnion, FunctionDecl, FieldDecl, VariantDecl } from "../syntax";
+import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
+import {
+  Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, findType, findInst, originOf, isVoid,
+  tysKey
+} from "./env";
+
+export const CYCLE_MSG: string = "type alias is defined in terms of itself";
+export const MAX_DEPTH: usize = 32;
+
+export type TScope = { unit: usize; names: string[]; tys: Type[]; depth: usize; };
+export type TyOut = { env: Env; ty: Type; };
+export type TysOut = { env: Env; tys: Type[]; };
+export type SigOut = { env: Env; params: Type[]; locals: Local[]; ret: Type; };
+export type FuncOut = { env: Env; fid: usize; };
+
+export function scopeOf(unit: usize, names: string[], tys: Type[]): TScope {
+  return TScope { unit: unit, names: names, tys: tys, depth: 0 };
+}
+
+export function plainScope(unit: usize): TScope {
+  const names: string[] = [];
+  const tys: Type[] = [];
+  return TScope { unit: unit, names: names, tys: tys, depth: 0 };
+}
+
+export function indexOfName(names: string[], n: string): Option<usize> {
+  let i: usize = 0;
+  while (i < names.length) {
+    if (names[i] == n) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function inStack(stack: int[], k: int): bool {
+  for (const s of stack) {
+    if (s == k) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ok(env: Env, ty: Type): Result<TyOut, Diagnostic> {
+  return Ok(TyOut { env: env, ty: ty });
+}
+
+function depthErr(span: Span, what: string): Diagnostic {
+  return diag(
+    "E0413",
+    span,
+    "generic instantiation limit exceeded: " + what + " nests deeper than " + MAX_DEPTH.toString()
+      + " (polymorphic recursion?)"
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------
+
+// `stack` holds the aliases currently being expanded (cycle detection): a plain alias index, or
+// -(generic id) - 1 for a generic alias.
+export function aliasType(env: Env, idx: usize, stack: int[]): Result<TyOut, Diagnostic> {
+  const a = env.aliases[idx];
+  const key = idx.toInt();
+  if (inStack(stack, key)) {
+    return Err(diag("E0400", a.target.span, CYCLE_MSG));
+  }
+  let st = stack;
+  st.push(key);
+  return resolveTy(env, plainScope(a.unit), a.target, false, st);
+}
+
+export function resolveTy(env: Env, sc: TScope, te: TypeExpr, voidOk: bool, stack: int[]): Result<TyOut, Diagnostic> {
+  return match (te.kind) {
+    TArray(inner) => {
+      const r = resolveTy(env, sc, inner, false, stack)?;
+      return ok(r.env, TyArray(r.ty));
+    },
+    TNamed(name, args) => resolveNamed(env, sc, te, name, args, voidOk, stack)
+  };
+}
+
+export function resolveType(env: Env, sc: TScope, te: TypeExpr, voidOk: bool): Result<TyOut, Diagnostic> {
+  const stack: int[] = [];
+  return resolveTy(env, sc, te, voidOk, stack);
+}
+
+function resolveNamed(
+  env: Env, sc: TScope, te: TypeExpr, name: Ident, args: TypeExpr[], voidOk: bool, stack: int[]
+): Result<TyOut, Diagnostic> {
+  const n = name.name;
+  if (args.length == 0) {
+    const k = indexOfName(sc.names, n);
+    if (k.isSome()) {
+      return ok(env, sc.tys[k.unwrap()]);
+    }
+  }
+  let b: Option<Type> = None;
+  if (n == "int") {
+    b = Some(TyInt);
+  } else if (n == "usize") {
+    b = Some(TyUsize);
+  } else if (n == "bool") {
+    b = Some(TyBool);
+  } else if (n == "string") {
+    b = Some(TyString);
+  } else if (n == "void") {
+    b = Some(TyVoid);
+  }
+  if (b.isSome()) {
+    const bt = b.unwrap();
+    if (args.length > 0) {
+      return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+    }
+    if (isVoid(bt) && !voidOk) {
+      return Err(diag("E0400", te.span, "`void` is only allowed as a return type or as `T` in `Result<T, E>`"));
+    }
+    return ok(env, bt);
+  }
+  if (n == "Option") {
+    if (args.length != 1) {
+      return Err(diag("E0400", te.span, "`Option` takes exactly one type argument"));
+    }
+    const t = resolveTy(env, sc, args[0], false, stack)?;
+    return ok(t.env, TyOption(t.ty));
+  }
+  if (n == "Result") {
+    if (args.length != 2) {
+      return Err(diag("E0400", te.span, "`Result` takes exactly two type arguments"));
+    }
+    const t = resolveTy(env, sc, args[0], true, stack)?;
+    const e = resolveTy(t.env, sc, args[1], false, stack)?;
+    return ok(e.env, TyResult(t.ty, e.ty));
+  }
+  const found = findType(env.units[sc.unit].scope, n);
+  if (found.isNone()) {
+    return Err(diag("E0300", name.span, "unknown type `" + n + "`"));
+  }
+  return match (found.unwrap()) {
+    EntRecord(r) => {
+      if (args.length > 0) {
+        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+      }
+      return ok(env, TyRecord(r));
+    },
+    EntUnion(u) => {
+      if (args.length > 0) {
+        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+      }
+      return ok(env, TyUnion(u));
+    },
+    EntAlias(i) => {
+      if (args.length > 0) {
+        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+      }
+      return aliasType(env, i, stack);
+    },
+    EntGen(g) => resolveGeneric(env, sc, te, name, g, args, stack)
+  };
+}
+
+function paramNames(ps: Ident[]): string[] {
+  let out: string[] = [];
+  for (const p of ps) {
+    out.push(p.name);
+  }
+  return out;
+}
+
+function resolveGeneric(
+  env: Env, sc: TScope, te: TypeExpr, name: Ident, g: usize, args: TypeExpr[], stack: int[]
+): Result<TyOut, Diagnostic> {
+  const gt = env.gtypes[g];
+  const params = gt.decl.typeParams;
+  if (args.length != params.length) {
+    return Err(diag(
+      "E0400",
+      te.span,
+      "type `" + name.name + "` expects " + params.length.toString() + " type argument(s), found "
+        + args.length.toString()
+    ));
+  }
+  let cur = env;
+  let tys: Type[] = [];
+  for (const a of args) {
+    const r = resolveTy(cur, sc, a, false, stack)?;
+    cur = r.env;
+    tys.push(r.ty);
+  }
+  return match (gt.decl.body) {
+    DAlias(target) => {
+      const key = 0 - g.toInt() - 1;
+      if (inStack(stack, key)) {
+        return Err(diag("E0400", te.span, CYCLE_MSG));
+      }
+      if (sc.depth + 1 > MAX_DEPTH) {
+        return Err(depthErr(te.span, "alias `" + name.name + "`"));
+      }
+      let st = stack;
+      st.push(key);
+      const sc2 = TScope { unit: gt.unit, names: paramNames(params), tys: tys, depth: sc.depth + 1 };
+      return resolveTy(cur, sc2, target, false, st);
+    },
+    _ => instType(cur, g, tys, sc.depth, te.span)
+  };
+}
+
+// The record / union instance of generic type `g` at `args`, created on first use. The instance
+// is registered before its fields are resolved so recursive types terminate.
+export function instType(env: Env, g: usize, args: Type[], depth: usize, span: Span): Result<TyOut, Diagnostic> {
+  const gt = env.gtypes[g];
+  const isRec = match (gt.decl.body) {
+    DRecord(_) => true,
+    _ => false
+  };
+  const kind: int = isRec ? 0 : 1;
+  const old = findInst(env, kind, g, args);
+  if (old.isSome()) {
+    const i = old.unwrap();
+    return ok(env, isRec ? TyRecord(i.id) : TyUnion(i.id));
+  }
+  if (depth + 1 > MAX_DEPTH) {
+    return Err(depthErr(span, "type `" + gt.decl.name.name + "`"));
+  }
+  const name = gt.qname + "<" + tysKey(env, args) + ">";
+  const sc2 = TScope { unit: gt.unit, names: paramNames(gt.decl.typeParams), tys: args, depth: depth + 1 };
+  let e = env;
+  return match (gt.decl.body) {
+    DRecord(fields) => {
+      const id = e.records.length;
+      const none: FieldDef[] = [];
+      e.records.push(RecordDef { name: name, fields: none });
+      e.insts.push(Inst { kind: 0, gid: g, args: args, id: id, depth: depth });
+      let out: FieldDef[] = [];
+      for (const f of fields) {
+        for (const o of out) {
+          if (o.name == f.name.name) {
+            return Err(diag("E0304", f.name.span, "duplicate field `" + f.name.name + "`"));
+          }
+        }
+        const r = resolveType(e, sc2, f.ty, false)?;
+        e = r.env;
+        out.push(FieldDef { name: f.name.name, ty: r.ty });
+      }
+      e.records[id] = RecordDef { name: name, fields: out };
+      return ok(e, TyRecord(id));
+    },
+    DUnion(vs) => {
+      const id = e.unions.length;
+      const none: VariantDef[] = [];
+      e.unions.push(UnionDef { name: name, variants: none });
+      e.insts.push(Inst { kind: 1, gid: g, args: args, id: id, depth: depth });
+      let out: VariantDef[] = [];
+      for (const v of vs) {
+        let payload: Type[] = [];
+        for (const te of v.payload) {
+          const r = resolveType(e, sc2, te, false)?;
+          e = r.env;
+          payload.push(r.ty);
+        }
+        out.push(VariantDef { name: v.name.name, payload: payload });
+      }
+      e.unions[id] = UnionDef { name: name, variants: out };
+      return ok(e, TyUnion(id));
+    },
+    DAlias(_) => Err(diag("E0400", span, "type alias `" + gt.decl.name.name + "` cannot be instantiated here"))
+  };
+}
+
+// A fresh opaque type for an abstract check: a field-less record named after the parameter.
+// Nothing can be done with a value of such a type except bind, pass, return and store it.
+export function mkOpaque(env: Env, name: string): TyOut {
+  let e = env;
+  const id = e.records.length;
+  const none: FieldDef[] = [];
+  e.records.push(RecordDef { name: name, fields: none });
+  return TyOut { env: e, ty: TyRecord(id) };
+}
+
+// ---------------------------------------------------------------------------
+// Function signatures and instances
+// ---------------------------------------------------------------------------
+
+export function resolveSig(env: Env, sc: TScope, decl: FunctionDecl): Result<SigOut, Diagnostic> {
+  let cur = env;
+  let params: Type[] = [];
+  let locals: Local[] = [];
+  for (const p of decl.params) {
+    for (const l of locals) {
+      if (l.name == p.name.name) {
+        return Err(diag("E0304", p.name.span, "duplicate parameter `" + p.name.name + "`"));
+      }
+    }
+    const r = resolveType(cur, sc, p.ty, false)?;
+    cur = r.env;
+    locals.push(Local { name: p.name.name, ty: r.ty, mutable: false });
+    params.push(r.ty);
+  }
+  let ret: Type = TyVoid;
+  match (decl.ret) {
+    Some(te) => {
+      const r = resolveType(cur, sc, te, true)?;
+      cur = r.env;
+      ret = r.ty;
+    },
+    None => {}
+  }
+  return Ok(SigOut { env: cur, params: params, locals: locals, ret: ret });
+}
+
+// The function instance of generic function `g` at `args` (new function id on first use).
+// `depth` is the instantiation depth of the *new* instance.
+export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: Span): Result<FuncOut, Diagnostic> {
+  const old = findInst(env, 2, g, args);
+  if (old.isSome()) {
+    return Ok(FuncOut { env: env, fid: old.unwrap().id });
+  }
+  if (depth > MAX_DEPTH) {
+    return Err(depthErr(span, "function `" + env.gfuncs[g].decl.name.name + "`"));
+  }
+  const gf = env.gfuncs[g];
+  const names = paramNames(gf.decl.typeParams);
+  const sc = TScope { unit: gf.unit, names: names, tys: args, depth: 0 };
+  const sig = resolveSig(env, sc, gf.decl)?;
+  let e = sig.env;
+  const id = e.funcs.length;
+  e.funcs.push(FuncInfo {
+    unit: gf.unit,
+    qname: gf.qname + "<" + tysKey(env, args) + ">",
+    decl: gf.decl,
+    params: sig.params,
+    paramLocals: sig.locals,
+    ret: sig.ret,
+    tpNames: names,
+    tpTys: args,
+    depth: depth
+  });
+  e.insts.push(Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
+  return Ok(FuncOut { env: e, fid: id });
+}
+
+// ---------------------------------------------------------------------------
+// Unification of a callee's parameter type expressions with argument types
+// ---------------------------------------------------------------------------
+
+export function noBinds(n: usize): Option<Type>[] {
+  let out: Option<Type>[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(None);
+    i += 1;
+  }
+  return out;
+}
+
+// Binds the type parameters `tp` mentioned in `te` by matching `te` against the concrete type
+// `actual`. Mismatches are ignored here (the later type check reports them); the first binding
+// of a parameter wins.
+export function unify(env: Env, unit: usize, te: TypeExpr, actual: Type, tp: string[], binds: Option<Type>[]): Option<Type>[] {
+  return match (te.kind) {
+    TArray(inner) => match (actual) {
+      TyArray(a) => unify(env, unit, inner, a, tp, binds),
+      _ => binds
+    },
+    TNamed(name, args) => unifyNamed(env, unit, name, args, actual, tp, binds)
+  };
+}
+
+function unifyNamed(
+  env: Env, unit: usize, name: Ident, args: TypeExpr[], actual: Type, tp: string[], binds: Option<Type>[]
+): Option<Type>[] {
+  const n = name.name;
+  let b = binds;
+  if (args.length == 0) {
+    const k = indexOfName(tp, n);
+    if (k.isSome()) {
+      if (!isVoid(actual)) {
+        const i = k.unwrap();
+        match (b[i]) {
+          None => { b[i] = Some(actual); },
+          Some(_) => {}
+        }
+      }
+      return b;
+    }
+  }
+  if (n == "Option" && args.length == 1) {
+    return match (actual) {
+      TyOption(a) => unify(env, unit, args[0], a, tp, b),
+      _ => b
+    };
+  }
+  if (n == "Result" && args.length == 2) {
+    return match (actual) {
+      TyResult(x, y) => unify(env, unit, args[1], y, tp, unify(env, unit, args[0], x, tp, b)),
+      _ => b
+    };
+  }
+  const found = findType(env.units[unit].scope, n);
+  if (found.isNone()) {
+    return b;
+  }
+  return match (found.unwrap()) {
+    EntGen(g) => unifyGeneric(env, unit, g, args, actual, tp, b),
+    _ => b
+  };
+}
+
+function unifyGeneric(
+  env: Env, unit: usize, g: usize, args: TypeExpr[], actual: Type, tp: string[], binds: Option<Type>[]
+): Option<Type>[] {
+  const gt = env.gtypes[g];
+  let b = binds;
+  if (args.length != gt.decl.typeParams.length) {
+    return b;
+  }
+  match (gt.decl.body) {
+    DAlias(target) => {
+      // Match the alias body against `actual` to learn the alias parameters, then match the
+      // written arguments against those.
+      const gp = paramNames(gt.decl.typeParams);
+      const ab = unify(env, gt.unit, target, actual, gp, noBinds(gp.length));
+      let i: usize = 0;
+      while (i < args.length) {
+        match (ab[i]) {
+          Some(t) => { b = unify(env, unit, args[i], t, tp, b); },
+          None => {}
+        }
+        i += 1;
+      }
+    },
+    _ => {
+      const o = originOf(env, actual);
+      if (o.isSome()) {
+        const inst = o.unwrap();
+        if (inst.gid == g) {
+          let i: usize = 0;
+          while (i < args.length && i < inst.args.length) {
+            b = unify(env, unit, args[i], inst.args[i], tp, b);
+            i += 1;
+          }
+        }
+      }
+    }
+  }
+  return b;
+}
+
+// True if `te` mentions a type parameter of `tp` that is still unbound.
+export function mentionsUnbound(te: TypeExpr, tp: string[], binds: Option<Type>[]): bool {
+  return match (te.kind) {
+    TArray(inner) => mentionsUnbound(inner, tp, binds),
+    TNamed(name, args) => {
+      if (args.length == 0) {
+        const k = indexOfName(tp, name.name);
+        if (k.isSome()) {
+          return binds[k.unwrap()].isNone();
+        }
+      }
+      for (const a of args) {
+        if (mentionsUnbound(a, tp, binds)) {
+          return true;
+        }
+      }
+      return false;
+    }
+  };
+}

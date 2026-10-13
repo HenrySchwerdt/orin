@@ -7,9 +7,9 @@ import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantD
 import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import { LoadedProgram, ImportTarget, ImportUnit, ImportStd, StdModule, StdFs, StdProcess } from "../loader";
 import {
-  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, VFunc, VConst, VVariant, VStd, TypeBind, ValBind,
-  Names, UnitInfo, AliasInfo, FuncInfo, ConstInfo, ConstLit, LitInt, Env, RecordSrc, UnionSrc,
-  typeEntEq, valEntEq, findType, findVal, emptyNames, isBuiltinTypeName
+  TypeEnt, ValEnt, EntRecord, EntUnion, EntAlias, EntGen, VFunc, VConst, VVariant, VStd, VGFunc, VGVariant,
+  TypeBind, ValBind, Names, UnitInfo, AliasInfo, FuncInfo, ConstInfo, ConstLit, LitInt, Env, RecordSrc,
+  UnionSrc, GenType, GenFunc, Inst, typeEntEq, valEntEq, findType, findVal, emptyNames, isBuiltinTypeName
 } from "./env";
 
 export type Collected = {
@@ -55,6 +55,24 @@ function addValNew(names: Names, name: string, ent: ValEnt): AddTypeOut {
   return AddTypeOut { names: n, err: None };
 }
 
+// Type parameter lists: names must be distinct and must not reuse a built-in type name.
+function checkTypeParams(ps: Ident[]): Diagnostic[] {
+  let diags: Diagnostic[] = [];
+  let seen: string[] = [];
+  for (const p of ps) {
+    if (isBuiltinTypeName(p.name)) {
+      diags.push(diag("E0408", p.span, "type parameter `" + p.name + "` reuses a built-in type name"));
+    }
+    for (const q of seen) {
+      if (q == p.name) {
+        diags.push(diag("E0304", p.span, "duplicate type parameter `" + p.name + "`"));
+      }
+    }
+    seen.push(p.name);
+  }
+  return diags;
+}
+
 type Lookup = { t: Option<TypeEnt>; v: Option<ValEnt>; };
 
 function stdLookup(m: StdModule, name: string): Option<ValEnt> {
@@ -86,7 +104,11 @@ export function collect(prog: LoadedProgram): Collected {
   let unions: UnionDef[] = [];
   let unionSrc: UnionSrc[] = [];
   let funcs: FuncInfo[] = [];
+  let gtypes: GenType[] = [];
+  let gfuncs: GenFunc[] = [];
   let consts: ConstInfo[] = [];
+  const noNames: string[] = [];
+  const noInsts: Inst[] = [];
   const noTypes: Type[] = [];
   const noLocals: Local[] = [];
   let ui: usize = 0;
@@ -96,23 +118,29 @@ export function collect(prog: LoadedProgram): Collected {
     for (const item of unit.ast.items) {
       match (item) {
         IFunction(f) => {
+          let ent: ValEnt = VFunc(funcs.length);
           if (f.typeParams.length > 0) {
-            diags.push(diag("E0408", f.typeParams[0].span, "generic functions are not supported in Orin-B"));
+            for (const d of checkTypeParams(f.typeParams)) { diags.push(d); }
+            ent = VGFunc(gfuncs.length);
+            gfuncs.push(GenFunc { unit: ui, qname: unit.name + "." + f.name.name, decl: f });
+          } else {
+            funcs.push(FuncInfo {
+              unit: ui,
+              qname: unit.name + "." + f.name.name,
+              decl: f,
+              params: noTypes,
+              paramLocals: noLocals,
+              ret: TyVoid,
+              tpNames: noNames,
+              tpTys: noTypes,
+              depth: 0
+            });
           }
-          const id = funcs.length;
-          funcs.push(FuncInfo {
-            unit: ui,
-            qname: unit.name + "." + f.name.name,
-            decl: f,
-            params: noTypes,
-            paramLocals: noLocals,
-            ret: TyVoid
-          });
-          const a = addVal(scope, f.name.name, VFunc(id), f.name.span);
+          const a = addVal(scope, f.name.name, ent, f.name.span);
           scope = a.names;
           match (a.err) { Some(d) => { diags.push(d); }, None => {} }
           if (f.exported) {
-            const b = addVal(exports, f.name.name, VFunc(id), f.name.span);
+            const b = addVal(exports, f.name.name, ent, f.name.span);
             exports = b.names;
             match (b.err) { Some(d) => { diags.push(d); }, None => {} }
           }
@@ -130,11 +158,38 @@ export function collect(prog: LoadedProgram): Collected {
           }
         },
         IType(t) => {
-          if (t.typeParams.length > 0) {
-            diags.push(diag("E0408", t.typeParams[0].span, "generic types are not supported in Orin-B"));
-          }
           if (isBuiltinTypeName(t.name.name)) {
             diags.push(diag("E0304", t.name.span, "`" + t.name.name + "` is a built-in type name"));
+          } else if (t.typeParams.length > 0) {
+            for (const d of checkTypeParams(t.typeParams)) { diags.push(d); }
+            const gid = gtypes.length;
+            gtypes.push(GenType { unit: ui, qname: unit.name + "." + t.name.name, decl: t });
+            const ent = EntGen(gid);
+            match (t.body) {
+              DUnion(vs) => {
+                let tag: usize = 0;
+                for (const v of vs) {
+                  const a = addVal(scope, v.name.name, VGVariant(gid, tag), v.name.span);
+                  scope = a.names;
+                  match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+                  if (t.exported) {
+                    const b = addVal(exports, v.name.name, VGVariant(gid, tag), v.name.span);
+                    exports = b.names;
+                    match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+                  }
+                  tag += 1;
+                }
+              },
+              _ => {}
+            }
+            const a = addType(scope, t.name.name, ent, t.name.span);
+            scope = a.names;
+            match (a.err) { Some(d) => { diags.push(d); }, None => {} }
+            if (t.exported) {
+              const b = addType(exports, t.name.name, ent, t.name.span);
+              exports = b.names;
+              match (b.err) { Some(d) => { diags.push(d); }, None => {} }
+            }
           } else {
             const qname = unit.name + "." + t.name.name;
             let ent: TypeEnt = EntAlias(0);
@@ -233,6 +288,20 @@ export function collect(prog: LoadedProgram): Collected {
                       tag += 1;
                     }
                   },
+                  EntGen(g) => {
+                    match (gtypes[g].decl.body) {
+                      DUnion(vs) => {
+                        let tag: usize = 0;
+                        for (const v of vs) {
+                          const r = addVal(isReexport ? exports : scope, v.name.name, VGVariant(g, tag), n.span);
+                          if (isReexport) { exports = r.names; } else { scope = r.names; }
+                          match (r.err) { Some(d) => { diags.push(d); }, None => {} }
+                          tag += 1;
+                        }
+                      },
+                      _ => {}
+                    }
+                  },
                   _ => {}
                 }
               }
@@ -253,7 +322,10 @@ export function collect(prog: LoadedProgram): Collected {
     unions: unions,
     funcs: funcs,
     consts: consts,
-    entry: prog.entry
+    entry: prog.entry,
+    gtypes: gtypes,
+    gfuncs: gfuncs,
+    insts: noInsts
   };
   return Collected { env: env, recordSrc: recordSrc, unionSrc: unionSrc, diags: diags };
 }

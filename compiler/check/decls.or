@@ -3,120 +3,17 @@
 // `check_main` and `resolve_type` from bootstrap/src/checker/mod.rs.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Ident, TypeExpr, TNamed, TArray, EInt, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
+import { Ident, TypeExpr, EInt, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
 import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import {
-  Env, RecordSrc, UnionSrc, FuncInfo, ConstInfo, ConstLit, LitInt, LitStr, LitBool, EntRecord, EntUnion,
-  EntAlias, findType, typeEq, isVoid, showType
+  Env, RecordSrc, UnionSrc, FuncInfo, ConstInfo, ConstLit, LitInt, LitStr, LitBool, typeEq, isVoid, showType
 } from "./env";
+import { CYCLE_MSG, TyOut, aliasType, resolveType, plainScope } from "./types";
 
-const CYCLE_MSG: string = "type alias is defined in terms of itself";
-
-function inStack(stack: usize[], i: usize): bool {
-  for (const s of stack) {
-    if (s == i) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// `stack` holds the aliases currently being resolved (cycle detection).
-function aliasType(env: Env, idx: usize, stack: usize[]): Result<Type, Diagnostic> {
-  const a = env.aliases[idx];
-  if (inStack(stack, idx)) {
-    return Err(diag("E0400", a.target.span, CYCLE_MSG));
-  }
-  let st = stack;
-  st.push(idx);
-  return resolveTypeIn(env, a.unit, a.target, false, st);
-}
-
-function resolveTypeName(env: Env, unit: usize, name: Ident, stack: usize[]): Result<Type, Diagnostic> {
-  const found = findType(env.units[unit].scope, name.name);
-  return match (found) {
-    Some(ent) => match (ent) {
-      EntRecord(r) => Ok(TyRecord(r)),
-      EntUnion(u) => Ok(TyUnion(u)),
-      EntAlias(i) => aliasType(env, i, stack)
-    },
-    None => Err(diag("E0300", name.span, "unknown type `" + name.name + "`"))
-  };
-}
-
-function resolveTypeIn(env: Env, unit: usize, te: TypeExpr, voidOk: bool, stack: usize[]): Result<Type, Diagnostic> {
-  return match (te.kind) {
-    TArray(inner) => resolveArray(env, unit, inner, stack),
-    TNamed(name, args) => resolveNamed(env, unit, te, name, args, voidOk, stack)
-  };
-}
-
-function resolveArray(env: Env, unit: usize, inner: TypeExpr, stack: usize[]): Result<Type, Diagnostic> {
-  const t = resolveTypeIn(env, unit, inner, false, stack)?;
-  return Ok(TyArray(t));
-}
-
-function resolveNamed(
-  env: Env,
-  unit: usize,
-  te: TypeExpr,
-  name: Ident,
-  args: TypeExpr[],
-  voidOk: bool,
-  stack: usize[]
-): Result<Type, Diagnostic> {
-  const n = name.name;
-  let b: Option<Type> = None;
-  if (n == "int") {
-    b = Some(TyInt);
-  } else if (n == "usize") {
-    b = Some(TyUsize);
-  } else if (n == "bool") {
-    b = Some(TyBool);
-  } else if (n == "string") {
-    b = Some(TyString);
-  } else if (n == "void") {
-    b = Some(TyVoid);
-  }
-  if (b.isSome()) {
-    const bt = b.unwrap();
-    if (args.length > 0) {
-      return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
-    }
-    if (isVoid(bt) && !voidOk) {
-      return Err(diag("E0400", te.span, "`void` is only allowed as a return type or as `T` in `Result<T, E>`"));
-    }
-    return Ok(bt);
-  }
-  if (n == "Option") {
-    if (args.length != 1) {
-      return Err(diag("E0400", te.span, "`Option` takes exactly one type argument"));
-    }
-    const t = resolveTypeIn(env, unit, args[0], false, stack)?;
-    return Ok(TyOption(t));
-  }
-  if (n == "Result") {
-    if (args.length != 2) {
-      return Err(diag("E0400", te.span, "`Result` takes exactly two type arguments"));
-    }
-    const t = resolveTypeIn(env, unit, args[0], true, stack)?;
-    const e = resolveTypeIn(env, unit, args[1], false, stack)?;
-    return Ok(TyResult(t, e));
-  }
-  if (args.length > 0) {
-    return Err(diag("E0408", te.span, "generic types are not supported in Orin-B"));
-  }
-  return resolveTypeName(env, unit, name, stack);
-}
-
-export function resolveType(env: Env, unit: usize, te: TypeExpr, voidOk: bool): Result<Type, Diagnostic> {
-  const stack: usize[] = [];
-  return resolveTypeIn(env, unit, te, voidOk, stack);
-}
-
-export function resolveTypeNameTop(env: Env, unit: usize, name: Ident): Result<Type, Diagnostic> {
-  const stack: usize[] = [];
-  return resolveTypeName(env, unit, name, stack);
+// Resolves a type annotation that cannot involve generics' state (top-level const types).
+function resolveTypeTop(env: Env, unit: usize, te: TypeExpr, voidOk: bool): Result<Type, Diagnostic> {
+  const r = resolveType(env, plainScope(unit), te, voidOk)?;
+  return Ok(r.ty);
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +49,7 @@ function resolveConst(env: Env, c: ConstInfo): Result<ConstInfo, Diagnostic> {
   let ty = li.ty;
   match (c.decl.ty) {
     Some(te) => {
-      ty = resolveType(env, c.unit, te, false)?;
+      ty = resolveTypeTop(env, c.unit, te, false)?;
     },
     None => {}
   }
@@ -194,8 +91,10 @@ function hasCycleDiag(ds: Diagnostic[]): bool {
 
 function resolveFunc(env: Env, f: FuncInfo, diags: Diagnostic[]): FuncResolved {
   let ds = diags;
+  let cur = env;
   let params: Type[] = [];
   let locals: Local[] = [];
+  const sc = plainScope(f.unit);
   for (const p of f.decl.params) {
     let dup = false;
     for (const l of locals) {
@@ -206,10 +105,11 @@ function resolveFunc(env: Env, f: FuncInfo, diags: Diagnostic[]): FuncResolved {
     if (dup) {
       ds.push(diag("E0304", p.name.span, "duplicate parameter `" + p.name.name + "`"));
     }
-    match (resolveType(env, f.unit, p.ty, false)) {
-      Ok(t) => {
-        locals.push(Local { name: p.name.name, ty: t, mutable: false });
-        params.push(t);
+    match (resolveType(cur, sc, p.ty, false)) {
+      Ok(r) => {
+        cur = r.env;
+        locals.push(Local { name: p.name.name, ty: r.ty, mutable: false });
+        params.push(r.ty);
       },
       Err(d) => { ds.push(d); }
     }
@@ -217,8 +117,11 @@ function resolveFunc(env: Env, f: FuncInfo, diags: Diagnostic[]): FuncResolved {
   let ret: Type = TyVoid;
   match (f.decl.ret) {
     Some(te) => {
-      match (resolveType(env, f.unit, te, true)) {
-        Ok(t) => { ret = t; },
+      match (resolveType(cur, sc, te, true)) {
+        Ok(r) => {
+          cur = r.env;
+          ret = r.ty;
+        },
         Err(d) => { ds.push(d); }
       }
     },
@@ -230,12 +133,15 @@ function resolveFunc(env: Env, f: FuncInfo, diags: Diagnostic[]): FuncResolved {
     decl: f.decl,
     params: params,
     paramLocals: locals,
-    ret: ret
+    ret: ret,
+    tpNames: f.tpNames,
+    tpTys: f.tpTys,
+    depth: f.depth
   };
-  return FuncResolved { func: nf, diags: ds };
+  return FuncResolved { env: cur, func: nf, diags: ds };
 }
 
-type FuncResolved = { func: FuncInfo; diags: Diagnostic[]; };
+type FuncResolved = { env: Env; func: FuncInfo; diags: Diagnostic[]; };
 
 export function findMain(env: Env): Option<usize> {
   let i: usize = 0;
@@ -248,13 +154,16 @@ export function findMain(env: Env): Option<usize> {
   return None;
 }
 
-export function resolveDecls(env: Env, recordSrc: RecordSrc[], unionSrc: UnionSrc[]): Resolved {
+export function resolveDecls(env0: Env, recordSrc: RecordSrc[], unionSrc: UnionSrc[]): Resolved {
   let diags: Diagnostic[] = [];
+  // `cur` threads the environment: resolving a generic type application may append instances.
+  let cur = env0;
   // Aliases first (also detects cycles among unused aliases).
   let ai: usize = 0;
-  while (ai < env.aliases.length) {
-    match (aliasType(env, ai, [])) {
-      Ok(_) => {},
+  while (ai < env0.aliases.length) {
+    const none: int[] = [];
+    match (aliasType(cur, ai, none)) {
+      Ok(r) => { cur = r.env; },
       Err(d) => {
         if (!(d.message == CYCLE_MSG && hasCycleDiag(diags))) {
           diags.push(d);
@@ -264,10 +173,11 @@ export function resolveDecls(env: Env, recordSrc: RecordSrc[], unionSrc: UnionSr
     ai += 1;
   }
   // Record fields.
-  let records: RecordDef[] = [];
+  const nrec = env0.records.length;
   let ri: usize = 0;
-  while (ri < env.records.length) {
+  while (ri < nrec) {
     const src = recordSrc[ri];
+    const sc = plainScope(src.unit);
     let out: FieldDef[] = [];
     for (const f of src.fields) {
       let dup = false;
@@ -279,38 +189,45 @@ export function resolveDecls(env: Env, recordSrc: RecordSrc[], unionSrc: UnionSr
       if (dup) {
         diags.push(diag("E0304", f.name.span, "duplicate field `" + f.name.name + "`"));
       } else {
-        match (resolveType(env, src.unit, f.ty, false)) {
-          Ok(t) => { out.push(FieldDef { name: f.name.name, ty: t }); },
+        match (resolveType(cur, sc, f.ty, false)) {
+          Ok(r) => {
+            cur = r.env;
+            out.push(FieldDef { name: f.name.name, ty: r.ty });
+          },
           Err(d) => { diags.push(d); }
         }
       }
     }
-    records.push(RecordDef { name: env.records[ri].name, fields: out });
+    cur.records[ri] = RecordDef { name: env0.records[ri].name, fields: out };
     ri += 1;
   }
   // Union payloads.
-  let unions: UnionDef[] = [];
+  const nuni = env0.unions.length;
   let ui: usize = 0;
-  while (ui < env.unions.length) {
+  while (ui < nuni) {
     const src = unionSrc[ui];
+    const sc = plainScope(src.unit);
     let vdefs: VariantDef[] = [];
     for (const v of src.variants) {
       let payload: Type[] = [];
       for (const te of v.payload) {
-        match (resolveType(env, src.unit, te, false)) {
-          Ok(t) => { payload.push(t); },
+        match (resolveType(cur, sc, te, false)) {
+          Ok(r) => {
+            cur = r.env;
+            payload.push(r.ty);
+          },
           Err(d) => { diags.push(d); }
         }
       }
       vdefs.push(VariantDef { name: v.name.name, payload: payload });
     }
-    unions.push(UnionDef { name: env.unions[ui].name, variants: vdefs });
+    cur.unions[ui] = UnionDef { name: env0.unions[ui].name, variants: vdefs };
     ui += 1;
   }
   // Consts.
   let consts: ConstInfo[] = [];
-  for (const c of env.consts) {
-    match (resolveConst(env, c)) {
+  for (const c of env0.consts) {
+    match (resolveConst(cur, c)) {
       Ok(r) => { consts.push(r); },
       Err(d) => {
         diags.push(d);
@@ -318,21 +235,25 @@ export function resolveDecls(env: Env, recordSrc: RecordSrc[], unionSrc: UnionSr
       }
     }
   }
-  // Function signatures.
+  // Function signatures (ordinary functions; generic ones are resolved per instance).
   let funcs: FuncInfo[] = [];
-  for (const f of env.funcs) {
-    const r = resolveFunc(env, f, diags);
+  for (const f of env0.funcs) {
+    const r = resolveFunc(cur, f, diags);
     diags = r.diags;
+    cur = r.env;
     funcs.push(r.func);
   }
   const env2 = Env {
-    units: env.units,
-    aliases: env.aliases,
-    records: records,
-    unions: unions,
+    units: env0.units,
+    aliases: env0.aliases,
+    records: cur.records,
+    unions: cur.unions,
     funcs: funcs,
     consts: consts,
-    entry: env.entry
+    entry: env0.entry,
+    gtypes: env0.gtypes,
+    gfuncs: env0.gfuncs,
+    insts: cur.insts
   };
   // `main` check.
   const entryUnit = env2.units[env2.entry];

@@ -2,18 +2,22 @@
 // pipeline if it produced diagnostics (same as bootstrap/src/checker/mod.rs `check`).
 
 import { Diagnostic, SourceMap, diag } from "../diag";
-import { Program, Function, HBlock } from "../hir";
+import { Ident, DAlias } from "../syntax";
+import { Program, Function, HBlock, Type } from "../hir";
 import { LoadedProgram } from "../loader";
 import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
 import { collect } from "./collect";
 import { resolveDecls, findMain } from "./decls";
 import { newFnCtx } from "./fnctx";
 import { checkBlock } from "./body";
+import { scopeOf, mkOpaque, resolveSig, resolveType, instType } from "./types";
 
-type FuncOut = { func: Function; err: Option<Diagnostic>; };
+type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
 
-function checkFunc(env: Env, f: FuncInfo): FuncOut {
-  const fx = newFnCtx(f);
+// Checks one function body. `abs` marks the abstract check of a generic body (type parameters
+// are opaque types; no function instances are created). Returns the (possibly grown) environment.
+function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
+  const fx = newFnCtx(f, env, abs);
   const r = checkBlock(env, fx, f.decl.body);
   return match (r) {
     Err(d) => FuncOut {
@@ -25,7 +29,8 @@ function checkFunc(env: Env, f: FuncInfo): FuncOut {
         body: HBlock { stmts: [] },
         span: f.decl.span
       },
-      err: Some(d)
+      err: Some(d),
+      env: env
     },
     Ok(b) => {
       let err: Option<Diagnostic> = None;
@@ -45,10 +50,72 @@ function checkFunc(env: Env, f: FuncInfo): FuncOut {
           body: b.block,
           span: f.decl.span
         },
-        err: err
+        err: err,
+        env: b.fx.env
       };
     }
   };
+}
+
+type Opaques = { env: Env; names: string[]; tys: Type[]; };
+
+// One opaque type per type parameter, appended to a scratch copy of the environment.
+function opaquesFor(env: Env, params: Ident[]): Opaques {
+  let e = env;
+  let names: string[] = [];
+  let tys: Type[] = [];
+  for (const p of params) {
+    const o = mkOpaque(e, p.name);
+    e = o.env;
+    names.push(p.name);
+    tys.push(o.ty);
+  }
+  return Opaques { env: e, names: names, tys: tys };
+}
+
+// Abstract check of a generic function: the body is checked once with opaque type parameters.
+function abstractFunc(env: Env, g: usize): Option<Diagnostic> {
+  const gf = env.gfuncs[g];
+  const op = opaquesFor(env, gf.decl.typeParams);
+  const sc = scopeOf(gf.unit, op.names, op.tys);
+  const sig = match (resolveSig(op.env, sc, gf.decl)) {
+    Ok(x) => x,
+    Err(d) => {
+      return Some(d);
+    }
+  };
+  const f = FuncInfo {
+    unit: gf.unit,
+    qname: gf.qname,
+    decl: gf.decl,
+    params: sig.params,
+    paramLocals: sig.locals,
+    ret: sig.ret,
+    tpNames: op.names,
+    tpTys: op.tys,
+    depth: 0
+  };
+  return checkFunc(sig.env, f, true).err;
+}
+
+// Abstract check of a generic type declaration: its field / payload types must resolve.
+function abstractType(env: Env, g: usize): Option<Diagnostic> {
+  const gt = env.gtypes[g];
+  const op = opaquesFor(env, gt.decl.typeParams);
+  match (gt.decl.body) {
+    DAlias(target) => {
+      match (resolveType(op.env, scopeOf(gt.unit, op.names, op.tys), target, false)) {
+        Err(d) => { return Some(d); },
+        Ok(_) => { return None; }
+      }
+    },
+    _ => {
+      match (instType(op.env, g, op.tys, 0, gt.decl.name.span)) {
+        Err(d) => { return Some(d); },
+        Ok(_) => { return None; }
+      }
+    }
+  }
 }
 
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
@@ -60,16 +127,38 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   if (r.diags.length > 0) {
     return Err(dedupDiags(r.diags));
   }
-  const env = r.env;
+  let env = r.env;
   let diags: Diagnostic[] = [];
+  // Generic declarations are checked once, abstractly, at their definition.
+  let gi: usize = 0;
+  while (gi < env.gtypes.length) {
+    match (abstractType(env, gi)) {
+      Some(d) => { diags.push(d); },
+      None => {}
+    }
+    gi += 1;
+  }
+  gi = 0;
+  while (gi < env.gfuncs.length) {
+    match (abstractFunc(env, gi)) {
+      Some(d) => { diags.push(d); },
+      None => {}
+    }
+    gi += 1;
+  }
+  // Ordinary functions, then the generic instances they (transitively) request: instances are
+  // appended to `env.funcs` while checking, so the loop runs until the table stops growing.
   let funcs: Function[] = [];
-  for (const f of env.funcs) {
-    const o = checkFunc(env, f);
+  let fi: usize = 0;
+  while (fi < env.funcs.length) {
+    const o = checkFunc(env, env.funcs[fi], false);
+    env = o.env;
     funcs.push(o.func);
     match (o.err) {
       Some(d) => { diags.push(d); },
       None => {}
     }
+    fi += 1;
   }
   if (diags.length > 0) {
     return Err(dedupDiags(diags));

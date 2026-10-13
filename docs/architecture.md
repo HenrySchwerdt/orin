@@ -15,6 +15,7 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
+| `tests/next/` | Same formats (`run/`, `errors/`) for language beyond Orin-B; self-hosted compiler only (`--suite next`). |
 | `tools/` | Test runner and bootstrap scripts. |
 
 ## Pipeline (Stage 0 and Stage 1 share the same shape)
