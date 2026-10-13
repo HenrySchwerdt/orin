@@ -1,0 +1,290 @@
+// Owned-parameter inference and the callee-side rewrite (ADR-0010).
+//
+// A reference parameter p of f is *owned* when some use of p is its last use and consumes a
+// counted reference: `IDup(d, p)` (the callee would retain the parameter to store, return or
+// mutate it) or an argument of a call whose parameter is itself owned. For an owned p:
+//   - the consuming last use takes the reference (IDup -> IMove, call operand consumed);
+//   - on every other path the reference is released right after the last use of p (or of anything
+//     borrowed from p), on the edge into a block where p is no longer live, or at entry if p is
+//     never used.
+// Liveness is alias-aware (a use of a borrowed projection of p counts as a use of p), which keeps
+// the release after every use of an alias that the verifier would otherwise see dead.
+
+import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr, Terminator, SwitchCase } from "../mir";
+import {
+  instrUses, successors, contains, ancestors, affects, usesAffecting, termUsesAffecting,
+  entryHasPredecessor, isRefTy
+} from "./analysis";
+
+export type PLive = { liveIn: bool[]; liveOut: bool[]; };
+
+function isLocalOp(o: Operand, l: usize): bool {
+  return match (o) {
+    OLocal(m) => m == l,
+    _ => false
+  };
+}
+
+// Backward liveness of parameter p (no kills: parameters are never redefined).
+export function paramLiveness(f: MFunction, anc: usize[][], p: usize): PLive {
+  const nb = f.blocks.length;
+  let usedIn: bool[] = [];
+  let liveIn: bool[] = [];
+  let liveOut: bool[] = [];
+  let b: usize = 0;
+  while (b < nb) {
+    let u = termUsesAffecting(anc, f.blocks[b].term, p);
+    for (const ins of f.blocks[b].instrs) {
+      if (!u && usesAffecting(anc, ins, p)) {
+        u = true;
+      }
+    }
+    usedIn.push(u);
+    liveIn.push(u);
+    liveOut.push(false);
+    b += 1;
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    b = nb;
+    while (b > 0) {
+      b -= 1;
+      let out = false;
+      for (const s of successors(f.blocks[b].term)) {
+        if (liveIn[s]) {
+          out = true;
+        }
+      }
+      if (out != liveOut[b]) {
+        liveOut[b] = out;
+        changed = true;
+      }
+      if (out && !liveIn[b]) {
+        liveIn[b] = true;
+        changed = true;
+      }
+    }
+  }
+  return PLive { liveIn: liveIn, liveOut: liveOut };
+}
+
+// la[i] = p is live after instruction i of the block.
+function liveAfter(blk: MBlock, anc: usize[][], p: usize, out: bool): bool[] {
+  let live = out || termUsesAffecting(anc, blk.term, p);
+  let la: bool[] = [];
+  let i: usize = 0;
+  while (i < blk.instrs.length) {
+    la.push(false);
+    i += 1;
+  }
+  i = blk.instrs.length;
+  while (i > 0) {
+    i -= 1;
+    la[i] = live;
+    if (!live && usesAffecting(anc, blk.instrs[i], p)) {
+      live = true;
+    }
+  }
+  return la;
+}
+
+// p occurs exactly once among the call arguments and nothing else passed to the call may be
+// borrowed from p (the callee could release its owned argument while reading the alias).
+function cleanCall(anc: usize[][], args: Operand[], p: usize): bool {
+  let n: usize = 0;
+  for (const a of args) {
+    match (a) {
+      OLocal(l) => {
+        if (l == p) {
+          n += 1;
+        } else if (affects(anc, l, p)) {
+          return false;
+        }
+      },
+      _ => {}
+    }
+  }
+  return n == 1;
+}
+
+export type CallSite = { callee: usize; pos: usize; };
+
+// Where parameter p of f is consumed at its last use.
+export type PSites = { ok: bool; dup: bool; calls: CallSite[]; };
+
+export function scanSites(f: MFunction, p: usize): PSites {
+  let r = PSites { ok: false, dup: false, calls: [] };
+  if (!isRefTy(f.locals[p].ty) || entryHasPredecessor(f)) {
+    return r;
+  }
+  const anc = ancestors(f);
+  for (const blk of f.blocks) {
+    if (termUsesAffecting(anc, blk.term, p)) {
+      return r;
+    }
+  }
+  r.ok = true;
+  const lv = paramLiveness(f, anc, p);
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    const la = liveAfter(blk, anc, p, lv.liveOut[b]);
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      if (!la[i]) {
+        match (blk.instrs[i]) {
+          IDup(_, o) => {
+            if (isLocalOp(o, p)) {
+              r.dup = true;
+            }
+          },
+          ICall(_, g, args) => {
+            if (cleanCall(anc, args, p)) {
+              let j: usize = 0;
+              while (j < args.length) {
+                if (isLocalOp(args[j], p)) {
+                  r.calls.push(CallSite { callee: g, pos: j });
+                }
+                j += 1;
+              }
+            }
+          },
+          _ => {}
+        }
+      }
+      i += 1;
+    }
+    b += 1;
+  }
+  return r;
+}
+
+type RU = { pre: Instr[]; main: Instr; consumed: bool; };
+
+// Rewrite one instruction that uses p. `dead`: p is not live after it. `tmp`: index the first
+// temporary local would get (one per element of `pre`).
+function rewriteUse(prog: MProgram, anc: usize[][], ins: Instr, p: usize, dead: bool, tmp: usize): RU {
+  return match (ins) {
+    IDup(d, o) => {
+      if (dead && isLocalOp(o, p)) {
+        return RU { pre: [], main: IMove(d, p), consumed: true };
+      }
+      return RU { pre: [], main: ins, consumed: false };
+    },
+    ICall(dst, g, args) => {
+      const owned = prog.functions[g].paramOwned;
+      const clean = cleanCall(anc, args, p);
+      let pre: Instr[] = [];
+      let nargs: Operand[] = [];
+      let consumed = false;
+      let j: usize = 0;
+      while (j < args.length) {
+        const a = args[j];
+        if (isLocalOp(a, p) && j < owned.length && owned[j]) {
+          if (dead && clean) {
+            nargs.push(a);
+            consumed = true;
+          } else {
+            const t = tmp + pre.length;
+            pre.push(IDup(t, a));
+            nargs.push(OLocal(t));
+          }
+        } else {
+          nargs.push(a);
+        }
+        j += 1;
+      }
+      return RU { pre: pre, main: ICall(dst, g, nargs), consumed: consumed };
+    },
+    _ => RU { pre: [], main: ins, consumed: false }
+  };
+}
+
+// Make parameter p (already flagged owned in prog) own its reference in f's body.
+export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction {
+  const anc = ancestors(f);
+  const lv = paramLiveness(f, anc, p);
+  const nb = f.blocks.length;
+  let locals = f.locals;
+  let blocks: MBlock[] = [];
+  let extra: MBlock[] = [];
+  let b: usize = 0;
+  while (b < nb) {
+    const blk = f.blocks[b];
+    const la = liveAfter(blk, anc, p, lv.liveOut[b]);
+    let out: Instr[] = [];
+    if (b == 0 && !lv.liveIn[0]) {
+      out.push(IRelease(p));
+    }
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      const ins = blk.instrs[i];
+      if (!usesAffecting(anc, ins, p)) {
+        out.push(ins);
+      } else {
+        const dead = !la[i];
+        const ru = rewriteUse(prog, anc, ins, p, dead, locals.length);
+        for (const pi of ru.pre) {
+          locals.push(MLocal { name: "_", ty: MRef });
+          out.push(pi);
+        }
+        out.push(ru.main);
+        if (dead && !ru.consumed) {
+          out.push(IRelease(p));
+        }
+      }
+      i += 1;
+    }
+    // Edges from a block where p is live into a block where it is not: release on the edge.
+    let term = blk.term;
+    if (lv.liveOut[b]) {
+      match (blk.term) {
+        TBranch(c, x, y) => {
+          let nx = x;
+          let ny = y;
+          if (!lv.liveIn[x]) {
+            extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(x) });
+            nx = nb + extra.length - 1;
+          }
+          if (!lv.liveIn[y]) {
+            extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(y) });
+            ny = nb + extra.length - 1;
+          }
+          term = TBranch(c, nx, ny);
+        },
+        TSwitch(o, cs, d) => {
+          let ncs: SwitchCase[] = [];
+          for (const k of cs) {
+            let t = k.target;
+            if (!lv.liveIn[t]) {
+              extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(t) });
+              t = nb + extra.length - 1;
+            }
+            ncs.push(SwitchCase { value: k.value, target: t });
+          }
+          let nd = d;
+          if (!lv.liveIn[d]) {
+            extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(d) });
+            nd = nb + extra.length - 1;
+          }
+          term = TSwitch(o, ncs, nd);
+        },
+        _ => {}
+      }
+    }
+    blocks.push(MBlock { instrs: out, term: term });
+    b += 1;
+  }
+  for (const e of extra) {
+    blocks.push(e);
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    locals: locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}

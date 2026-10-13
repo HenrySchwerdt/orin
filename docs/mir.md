@@ -1,8 +1,11 @@
-# MIR and the OIM ownership verifier (v1)
+# MIR and the OIM ownership verifier (v1.2)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
 checker of its ownership discipline. It is deliberately small and does not trust the lowering.
+
+Changelog: v1.1 Unique-demotion across calls; v1.2 (ADR-0010) per-parameter modes
+(`MFunction.paramOwned`) and consuming call operands, produced by the optimiser `compiler/opt`.
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -17,7 +20,12 @@ values. `MRef` locals point to RC'd heap objects (runtime/orin_runtime.h). Runti
 | `Owned` | holds one counted reference; must eventually be released, moved, consumed or returned (a leak is reported as a warning, not an error — leaks are memory-safe) |
 | `Unique` | `Owned` and known to be the only reference (after `IMakeUnique`, `IStructNew`, `IArrayNew`) |
 | `Borrowed(src)` | uncounted alias, valid while `src` is live and unmodified; `src` is a local or `Param` |
-| `Param` | parameters: borrowed from the caller for the whole call |
+| `Param` | **borrowed** parameters: borrowed from the caller for the whole call |
+
+Parameters have a mode, `MFunction.paramOwned[i]` (one flag per parameter; `false` = borrowed, the
+default and all that lowering emits). An **owned** reference parameter starts `Owned` (not `Param`):
+the callee holds one counted reference and must consume (move/store/return) or release it exactly
+like any Owned local; leaking it is a warning. Scalar parameters are never owned.
 
 Plus per-local **hole sets** (slot indices taken by `ITakeField`/`IArrayTake` not yet put back).
 
@@ -29,10 +37,17 @@ hole slot when reading that slot.
 - `IDup(d, o)`: o live → d Owned.
 - `IRelease(x)`: x Owned/Unique → Dead. Releasing Param/Borrowed/Dead is an **error**.
 - `ICall`/`IBuiltin`: all ref args live (any of Owned/Unique/Borrowed/Param/OStr); d Owned.
-  A call does not change argument states (borrowed for the call), **except** that a `Unique`
+  **v1.2:** an `ICall` operand in an *owned-parameter position* (`callee.paramOwned[i]`) is
+  CONSUMED: Owned/Unique/Imm local -> Dead (and its `Borrowed` aliases die), `OStr` allowed,
+  Borrowed/Param (a borrowed parameter of the caller) is an **error**; a local consumed twice in one
+  call is an error (second use is Dead). A borrowed-position operand of the same call may not be the
+  consumed local or a `Borrowed` alias of it (the callee could release the object while reading the
+  alias): **error**. `IBuiltin` operands are all borrowed (no builtin takes ownership).
+  Otherwise a call does not change argument states (borrowed for the call), **except** that a `Unique`
   ref argument is demoted to `Owned` when the call has a ref-typed result: the callee may return
   a retained alias of its argument, so uniqueness is no longer provable (found by the verifier;
-  v1.1). Lowering must re-`IMakeUnique` before mutating such a local.
+  v1.1). Lowering must re-`IMakeUnique` before mutating such a local. The demotion applies to
+  borrowed positions only (consumed operands are Dead afterwards).
 - `IStrAppend(x, y)`: x Owned/Unique (stays Owned); y live.
 - `IStructNew(d, tag, slots)`, `IArrayNew(d, isRef, elems)`: each ref operand Owned/Unique local
   (→ Dead) or OStr; d Unique.
@@ -88,7 +103,9 @@ reporting). Tests: `compiler/tests/verify_main.or`. Choices where the rules abov
   reference: `OStr` copy or `INullary`; readable, consumable, releasable, never a leak, not
   Unique), and two poisoned join results `MaybeDead` / `MaybeLeak` (MaybeLeak: some path owns a
   reference). Parameters start `Param` (refs) or `Init` (scalars); all other locals `Dead`.
-  Parameters (scalar ones too) can never be redefined.
+  Owned reference parameters start `Owned`. Parameters (scalar ones too) can never be redefined
+  (an owned parameter may be moved/consumed/released, just not assigned).
+  Well-formedness adds: `paramOwned.length == paramCount`, owned parameters are references.
 - **Joins** are a semilattice join: identical states stay; Owned-like (Owned/Unique/Imm) join to
   Owned; every other disagreement (Dead vs anything, differing `Borrowed(src)`, Owned vs
   Borrowed, ...) is *poisoned*. "Error if used later, otherwise Dead" is implemented lazily: any

@@ -1,0 +1,283 @@
+// Call-site rewrite (stage 2) and dup/release cancellation (stage 3) of the MIR optimiser.
+//
+// Stage 2: an argument in an owned-parameter position must be consumed, so a *local* (not a
+// parameter: parameters are handled in params.or) is retained into a fresh temporary that the call
+// consumes: `tmp = dup x; call g(.. tmp ..)`. When x was Unique and the call has no reference
+// result (so the verifier would have kept x Unique across a borrowed call) and x is still needed,
+// `makeunique x` re-establishes uniqueness after the call.
+//
+// Stage 3 (peephole, block-local, verifiably safe by construction):
+//   d = dup x; ...; release x      (nothing in between touches x or anything borrowed from x)
+//        =>  d = move x            -- the last-use move: no retain, no release
+//   d = dup x; ...; release d      (nothing in between touches d)
+//        =>  (both removed)
+
+import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr } from "../mir";
+import { State, Cx, step, blockInStates, KUnique } from "../verify";
+import { instrDef, contains, ancestors, usesAffecting, isRefTy } from "./analysis";
+
+function isOwnedPos(owned: bool[], j: usize): bool {
+  return j < owned.length && owned[j];
+}
+
+// Is there a call in f with an owned-position argument that is a reference local other than an
+// owned parameter of f itself (`self`; those are handled in params.or)?
+function stage2Local(f: MFunction, self: bool[], x: usize): bool {
+  if (!isRefTy(f.locals[x].ty)) {
+    return false;
+  }
+  return x >= f.paramCount || !self[x];
+}
+
+function needsCallDups(prog: MProgram, f: MFunction, self: bool[]): bool {
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        ICall(_, g, args) => {
+          const owned = prog.functions[g].paramOwned;
+          let j: usize = 0;
+          while (j < args.length) {
+            if (isOwnedPos(owned, j)) {
+              match (args[j]) {
+                OLocal(x) => {
+                  if (stage2Local(f, self, x)) {
+                    return true;
+                  }
+                },
+                _ => {}
+              }
+            }
+            j += 1;
+          }
+        },
+        _ => {}
+      }
+    }
+  }
+  return false;
+}
+
+// Index of `release x` after position `start` in the block with no intervening use or redefinition
+// of x (or of anything borrowed from x) within a bounded window.
+function findRelease(instrs: Instr[], gone: bool[], start: usize, x: usize, anc: usize[][]): Option<usize> {
+  let j = start;
+  const end = start + 256 < instrs.length ? start + 256 : instrs.length;
+  while (j < end) {
+    if (!gone[j]) {
+      const ins = instrs[j];
+      match (ins) {
+        IRelease(y) => {
+          if (y == x) {
+            return Some(j);
+          }
+        },
+        _ => {}
+      }
+      if (usesAffecting(anc, ins, x)) {
+        return None;
+      }
+      match (instrDef(ins)) {
+        Some(d) => {
+          if (d == x) {
+            return None;
+          }
+        },
+        None => {}
+      }
+    }
+    j += 1;
+  }
+  return None;
+}
+
+function isRefDst(f: MFunction, dst: Option<usize>): bool {
+  return match (dst) {
+    Some(d) => isRefTy(f.locals[d].ty),
+    None => false
+  };
+}
+
+// Stage 2. `orig` is the unmodified program (all parameters borrowed) used for ownership states;
+// `prog` carries the inferred parameter modes of the callees.
+export function insertCallDups(prog: MProgram, orig: MProgram, f: MFunction, self: bool[]): MFunction {
+  if (!needsCallDups(prog, f, self)) {
+    return f;
+  }
+  const anc = ancestors(f);
+  const states = blockInStates(orig, f);
+  let locals = f.locals;
+  let blocks: MBlock[] = [];
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    let out: Instr[] = [];
+    let st: Option<State> = states[b];
+    let gone: bool[] = [];
+    for (const _x of blk.instrs) {
+      gone.push(false);
+    }
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      const ins = blk.instrs[i];
+      let handled = false;
+      match (ins) {
+        ICall(dst, g, args) => {
+          const owned = prog.functions[g].paramOwned;
+          let pre: Instr[] = [];
+          let post: Instr[] = [];
+          let nargs: Operand[] = [];
+          let j: usize = 0;
+          while (j < args.length) {
+            let a = args[j];
+            if (isOwnedPos(owned, j)) {
+              match (a) {
+                OLocal(x) => {
+                  if (stage2Local(f, self, x)) {
+                    const t = locals.length;
+                    locals.push(MLocal { name: "_", ty: MRef });
+                    pre.push(IDup(t, a));
+                    a = OLocal(t);
+                    if (!isRefDst(f, dst)) {
+                      match (st) {
+                        Some(s) => {
+                          if (s.ls[x].k == KUnique) {
+                            match (findRelease(blk.instrs, gone, i + 1, x, anc)) {
+                              Some(_) => {},
+                              None => {
+                                post.push(IMakeUnique(x));
+                              }
+                            }
+                          }
+                        },
+                        None => {}
+                      }
+                    }
+                  }
+                },
+                _ => {}
+              }
+            }
+            nargs.push(a);
+            j += 1;
+          }
+          if (pre.length > 0) {
+            handled = true;
+            for (const x of pre) {
+              out.push(x);
+            }
+            out.push(ICall(dst, g, nargs));
+            for (const x of post) {
+              out.push(x);
+            }
+          }
+        },
+        _ => {}
+      }
+      if (!handled) {
+        out.push(ins);
+      }
+      // advance the replayed verifier state over the *original* instruction
+      match (st) {
+        Some(s) => {
+          const c = step(Cx { prog: orig, f: f, blk: b, ins: i, st: s, errs: [], warns: [] }, ins);
+          st = Some(c.st);
+        },
+        None => {}
+      }
+      i += 1;
+    }
+    blocks.push(MBlock { instrs: out, term: blk.term });
+    b += 1;
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    locals: locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
+
+function hasDup(f: MFunction): bool {
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IDup(_, _) => {
+          return true;
+        },
+        _ => {}
+      }
+    }
+  }
+  return false;
+}
+
+// Stage 3.
+export function peephole(f: MFunction): MFunction {
+  if (!hasDup(f)) {
+    return f;
+  }
+  const anc = ancestors(f);
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    let instrs = blk.instrs;
+    let gone: bool[] = [];
+    for (const _x of instrs) {
+      gone.push(false);
+    }
+    let i: usize = 0;
+    while (i < instrs.length) {
+      if (!gone[i]) {
+        match (instrs[i]) {
+          IDup(d, o) => {
+            let done = false;
+            match (o) {
+              OLocal(x) => {
+                if (x != d && x >= f.paramCount) {
+                  match (findRelease(instrs, gone, i + 1, x, anc)) {
+                    Some(r) => {
+                      instrs[i] = IMove(d, x);
+                      gone[r] = true;
+                      done = true;
+                    },
+                    None => {}
+                  }
+                }
+              },
+              _ => {}
+            }
+            if (!done) {
+              match (findRelease(instrs, gone, i + 1, d, anc)) {
+                Some(r) => {
+                  gone[i] = true;
+                  gone[r] = true;
+                },
+                None => {}
+              }
+            }
+          },
+          _ => {}
+        }
+      }
+      i += 1;
+    }
+    let out: Instr[] = [];
+    i = 0;
+    while (i < instrs.length) {
+      if (!gone[i]) {
+        out.push(instrs[i]);
+      }
+      i += 1;
+    }
+    blocks.push(MBlock { instrs: out, term: blk.term });
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    locals: f.locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}

@@ -19,7 +19,22 @@ function bk(instrs: Instr[], term: Terminator): MBlock {
 }
 
 function fn(name: string, params: usize, locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
-  return MFunction { name: name, paramCount: params, locals: locals, ret: ret, blocks: blocks };
+  return MFunction { name: name, paramCount: params, paramOwned: noOwned(params), locals: locals, ret: ret, blocks: blocks };
+}
+
+function noOwned(n: usize): bool[] {
+  let out: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(false);
+    i += 1;
+  }
+  return out;
+}
+
+// Like `fn` but with explicit per-parameter ownership modes.
+function fnO(name: string, owned: bool[], locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
+  return MFunction { name: name, paramCount: owned.length, paramOwned: owned, locals: locals, ret: ret, blocks: blocks };
 }
 
 function prog(fs: MFunction[]): MProgram {
@@ -280,8 +295,98 @@ function positives(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- owned parameters (v1.2)
+
+// g(owned p): void, releasing p.
+function gOwnedRel(): MFunction {
+  return fnO("g", [true], [lr("p")], MVoid, [bk([IRelease(0)], TReturn(None))]);
+}
+
+// g2(owned p, borrowed q): void, releasing p.
+function g2(): MFunction {
+  return fnO("g2", [true, false], [lr("p"), lr("q")], MVoid, [bk([IRelease(0)], TReturn(None))]);
+}
+
+function ownedCases(): usize {
+  let bad: usize = 0;
+  const dead = "dead";
+  const p1 = pos("owned param returned via move", prog([
+    fnO("f", [true], [lr("p"), lr("r")], MRef, [bk([IMove(1, 0)], TReturn(Some(OLocal(1))))])]));
+  const p2 = pos("owned param released", prog([gOwnedRel()]));
+  const p3 = pos("owned param released on both branches", prog([
+    fnO("f", [true], [lr("p"), lb("c")], MVoid, [
+      bk([ICopy(1, t())], TBranch(OLocal(1), 1, 2)),
+      bk([IRelease(0)], ret()),
+      bk([IRelease(0)], ret())])]));
+  const p4 = pos("owned local consumed by call", prog([
+    fn("f", 0, [lr("a")], MVoid, [bk([IStructNew(0, 0, []), ICall(None, 1, [OLocal(0)])], ret())]),
+    gOwnedRel()]));
+  const p5 = pos("Unique local consumed by call", prog([
+    fn("f", 0, [lr("a")], MVoid, [bk([IStructNew(0, 0, [OInt(1)]), ICall(None, 1, [OLocal(0)])], ret())]),
+    gOwnedRel()]));
+  const p6 = pos("string literal passed to owned position", prog([
+    fn("f", 0, [], MVoid, [bk([ICall(None, 1, [OStr(0)])], ret())]),
+    gOwnedRel()]));
+  const p7 = pos("dup then consume, original still usable", prog([
+    fn("f", 0, [lr("a"), lr("t"), li("i")], MVoid, [bk([
+      IStructNew(0, 0, []), IDup(1, OLocal(0)), ICall(None, 1, [OLocal(1)]), ITag(2, OLocal(0)), IRelease(0)], ret())]),
+    gOwnedRel()]));
+  const p8 = pos("owned and borrowed positions with distinct locals", prog([
+    fn("f", 0, [lr("a"), lr("b")], MVoid, [bk([
+      IStructNew(0, 0, []), IStructNew(1, 0, []), ICall(None, 1, [OLocal(0), OLocal(1)]), IRelease(1)], ret())]),
+    g2()]));
+  const p9 = pos("borrowed param dup'd and consumed", prog([
+    fn("f", 1, [lr("p"), lr("t")], MVoid, [bk([IDup(1, OLocal(0)), ICall(None, 1, [OLocal(1)])], ret())]),
+    gOwnedRel()]));
+  const p10 = run("warn owned param never consumed", prog([
+    fnO("f", [true], [lr("p")], MVoid, [bk([], ret())])]), 2, "");
+  const n1 = neg("borrowed Param passed to owned position", prog([
+    fn("f", 1, [lr("p")], MVoid, [bk([ICall(None, 1, [OLocal(0)])], ret())]),
+    gOwnedRel()]), "parameter");
+  const n2 = neg("Borrowed local passed to owned position", prog([
+    fn("f", 0, [lr("a"), lr("b")], MVoid, [bk([
+      IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), ICall(None, 1, [OLocal(1)]), IRelease(0)], ret())]),
+    gOwnedRel()]), "borrowed");
+  const n3 = neg("use after consumption by call", prog([
+    fn("f", 0, [lr("a"), li("i")], MVoid, [bk([
+      IStructNew(0, 0, []), ICall(None, 1, [OLocal(0)]), ITag(1, OLocal(0))], ret())]),
+    gOwnedRel()]), dead);
+  const n4 = neg("release after consumption by call", prog([
+    fn("f", 0, [lr("a")], MVoid, [bk([
+      IStructNew(0, 0, []), ICall(None, 1, [OLocal(0)]), IRelease(0)], ret())]),
+    gOwnedRel()]), dead);
+  const n5 = neg("owned param used after move", prog([
+    fnO("f", [true], [lr("p"), lr("r"), li("i")], MVoid, [bk([IMove(1, 0), ITag(2, OLocal(0)), IRelease(1)], ret())])]), dead);
+  const n6 = neg("owned param released twice", prog([
+    fnO("f", [true], [lr("p")], MVoid, [bk([IRelease(0), IRelease(0)], ret())])]), dead);
+  const n7 = neg("same local in owned and borrowed position", prog([
+    fn("f", 0, [lr("a")], MVoid, [bk([IStructNew(0, 0, []), ICall(None, 1, [OLocal(0), OLocal(0)])], ret())]),
+    g2()]), "aliases");
+  const n8 = neg("borrowed alias of the consumed argument", prog([
+    fn("f", 0, [lr("a"), lr("b")], MVoid, [bk([
+      IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), ICall(None, 1, [OLocal(0), OLocal(1)])], ret())]),
+    g2()]), "aliases");
+  const n9 = neg("same local consumed twice", prog([
+    fn("f", 0, [lr("a")], MVoid, [bk([IStructNew(0, 0, []), ICall(None, 1, [OLocal(0), OLocal(0)])], ret())]),
+    fnO("h", [true, true], [lr("p"), lr("q")], MVoid, [bk([IRelease(0), IRelease(1)], ret())])]), dead);
+  const n10 = neg("paramOwned length differs", prog([
+    MFunction { name: "f", paramCount: 1, paramOwned: [], locals: [lr("p")], ret: MVoid, blocks: [bk([], ret())] }]), "paramOwned");
+  const n11 = neg("owned scalar parameter", prog([
+    fnO("f", [true], [li("n")], MVoid, [bk([], ret())])]), "not a reference");
+  const n12 = neg("borrow of owned param used after it is consumed", prog([
+    fnO("f", [true], [lr("p"), lr("b"), lr("r"), li("i")], MVoid, [bk([
+      IBorrow(1, 0), IMove(2, 0), ITag(3, OLocal(1)), IRelease(2)], ret())])]), dead);
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
+  if (!p5) { bad += 1; } if (!p6) { bad += 1; } if (!p7) { bad += 1; } if (!p8) { bad += 1; }
+  if (!p9) { bad += 1; } if (!p10) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; } if (!n11) { bad += 1; } if (!n12) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives();
+  const bad = negatives1() + negatives2() + positives() + ownedCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);
