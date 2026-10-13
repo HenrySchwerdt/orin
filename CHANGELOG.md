@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0-alpha.1 (unreleased)
+## 0.1.0-alpha.1 (2026-10-13)
 First experimental release of the self-hosted Orin compiler.
 - Self-hosted compiler (Orin), reproducible bootstrap (stage2 == stage3).
 - Language: Orin-B core, generics, classes with value semantics.
