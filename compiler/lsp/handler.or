@@ -20,10 +20,11 @@ import { Json, JField, JNull, JNum, JStr, JArr, JBool, JObj, jField, asArr, getF
   getPath, getPathStr, getPathInt, parseJson, stringifyJson } from "../json";
 import { Workspace, newWorkspace, openFile, changeFile, closeFile, openPaths, fileText, analyze, Analysis,
   PathDiag, fileIndexOf, indexAvailable, documentSymbols, readText, declCompletions, keywordCompletions,
-  builtinCompletions, CompletionItem, posToOffset, definitionAt, hoverAt, referencesTo, renameEdits,
+  builtinCompletions, CompletionItem, DkLocal, posToOffset, definitionAt, hoverAt, referencesTo, renameEdits,
   symbolSpanAt, TextEdit } from "../analysis";
 import { SemanticIndex } from "../hir";
 import { Span } from "../diag";
+import { normalizePath } from "../loader";
 import { frameMessage, unframe } from "./frame";
 import { formatAvailable, formatDocument } from "./format";
 import { uriToPath, pathToUri } from "./uri";
@@ -231,6 +232,42 @@ function reqDocumentSymbol(st: LspState, id: Json, msg: Json): LspStep {
   return step(st, [respond(id, JArr(items))]);
 }
 
+// Parameters and locals of the function around the cursor that are declared before it
+// (scope-insensitive approximation: sibling blocks are included).
+function localCompletions(x: Ctx): CompletionItem[] {
+  let out: CompletionItem[] = [];
+  let seen: string[] = [];
+  for (const d of x.idx.defs) {
+    const isLocal = match (d.kind) {
+      SkLocal => true,
+      SkParam => true,
+      _ => false
+    };
+    if (!isLocal || d.nameSpan.file != x.file || d.nameSpan.start >= x.off) {
+      continue;
+    }
+    const inFn = match (d.container) {
+      Some(f) => f < x.idx.defs.length && x.idx.defs[f].declSpan.file == x.file
+        && x.idx.defs[f].declSpan.start <= x.off && x.off <= x.idx.defs[f].declSpan.end,
+      None => false
+    };
+    if (!inFn) {
+      continue;
+    }
+    let dup = false;
+    for (const s of seen) {
+      if (s == d.name) {
+        dup = true;
+      }
+    }
+    if (!dup) {
+      seen.push(d.name);
+      out.push(CompletionItem { label: d.name, kind: DkLocal, detail: d.detail });
+    }
+  }
+  return out;
+}
+
 function reqCompletion(st: LspState, id: Json, msg: Json): LspStep {
   const p = docPath(msg);
   if (p.isNone()) {
@@ -239,6 +276,12 @@ function reqCompletion(st: LspState, id: Json, msg: Json): LspStep {
   let items: Json[] = [];
   for (const c of declCompletions(st.ws, p.unwrap())) {
     items.push(completionJson(c));
+  }
+  const lc = context(st, msg, false);
+  if (lc.isSome()) {
+    for (const c of localCompletions(lc.unwrap())) {
+      items.push(completionJson(c));
+    }
   }
   for (const c of keywordCompletions()) {
     items.push(completionJson(c));
@@ -273,16 +316,33 @@ function reqFormatting(st: LspState, id: Json, msg: Json): LspStep {
 
 type Ctx = { a: Analysis; idx: SemanticIndex; file: usize; off: usize; };
 
+// Workspace-wide queries (references, rename) need an analysis whose program contains every
+// user of the symbol: when `path` is imported by another open document, that document is used as
+// the entry instead (first match in open order); otherwise `path` is its own entry.
+function wideAnalysis(st: LspState, path: string): Analysis {
+  const me = normalizePath(path);
+  for (const o of openPaths(st.ws)) {
+    if (normalizePath(o) == me) {
+      continue;
+    }
+    const a = analyze(st.ws, o);
+    if (a.index.isSome() && fileIndexOf(a, path).isSome()) {
+      return a;
+    }
+  }
+  return analyze(st.ws, path);
+}
+
 // Analysis of the document, its semantic index and the cursor offset. None when the index is
 // not available or the params are malformed.
-function context(st: LspState, msg: Json): Option<Ctx> {
+function context(st: LspState, msg: Json, wide: bool): Option<Ctx> {
   const p = docPath(msg);
   const line = getPathInt(msg, ["params", "position", "line"]);
   const ch = getPathInt(msg, ["params", "position", "character"]);
   if (p.isNone() || line.isNone() || ch.isNone() || line.unwrap() < 0 || ch.unwrap() < 0) {
     return None;
   }
-  const a = analyze(st.ws, p.unwrap());
+  const a = wide ? wideAnalysis(st, p.unwrap()) : analyze(st.ws, p.unwrap());
   let idx: Option<SemanticIndex> = a.index;
   if (st.testIndex.isSome()) {
     idx = st.testIndex;
@@ -313,7 +373,7 @@ function locationJson(a: Analysis, sp: Span): Json {
 }
 
 function reqDefinition(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg);
+  const c = context(st, msg, false);
   if (c.isNone()) {
     return step(st, [respond(id, JNull)]);
   }
@@ -326,7 +386,7 @@ function reqDefinition(st: LspState, id: Json, msg: Json): LspStep {
 }
 
 function reqHover(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg);
+  const c = context(st, msg, false);
   if (c.isNone()) {
     return step(st, [respond(id, JNull)]);
   }
@@ -347,7 +407,7 @@ function reqHover(st: LspState, id: Json, msg: Json): LspStep {
 }
 
 function reqReferences(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg);
+  const c = context(st, msg, true);
   let locs: Json[] = [];
   if (c.isSome()) {
     const x = c.unwrap();
@@ -364,7 +424,7 @@ function reqReferences(st: LspState, id: Json, msg: Json): LspStep {
 }
 
 function reqPrepareRename(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg);
+  const c = context(st, msg, true);
   if (c.isNone()) {
     return step(st, [respond(id, JNull)]);
   }
@@ -382,7 +442,7 @@ function reqPrepareRename(st: LspState, id: Json, msg: Json): LspStep {
 }
 
 function reqRename(st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(st, msg);
+  const c = context(st, msg, true);
   const newName = getPathStr(msg, ["params", "newName"]);
   if (newName.isNone()) {
     return invalidParams(st, id);
@@ -391,6 +451,10 @@ function reqRename(st: LspState, id: Json, msg: Json): LspStep {
     return step(st, [respondError(id, REQUEST_FAILED, "no semantic information available for rename")]);
   }
   const x = c.unwrap();
+  if (st.testIndex.isNone() && x.a.diags.length > 0) {
+    // The index is partial while the program has errors (type-dependent references are missing).
+    return step(st, [respondError(id, REQUEST_FAILED, "fix the errors in the workspace before renaming")]);
+  }
   const r = renameEdits(x.idx, x.file, x.off, newName.unwrap());
   if (r.isErr()) {
     return step(st, [respondError(id, REQUEST_FAILED, r.unwrapErr())]);

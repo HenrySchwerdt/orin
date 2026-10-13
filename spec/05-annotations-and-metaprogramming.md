@@ -45,3 +45,10 @@ Parse -> name resolution -> annotation collection -> bounded expansion -> re-res
 ## OPEN
 
 Exact annotation-definition syntax, metadata retention policies, hygienic symbol generation, plugin distribution/permissions, evaluation order and interaction with generic specialization remain unresolved. `@Get`, `@Service`, etc. are framework conventions built atop the annotation mechanism, NOT all mandatory compiler keywords.
+
+## Contract clauses are not annotations (2026-10-13)
+
+`@Requires`, `@Ensures`, `@Invariant`, `@Decreases` and `@Rule` share the `@` spelling but are
+**core-language contract clauses** (spec 15 §4.2a, ADR-0012), not annotations. Their names are
+reserved; annotation definitions, imports and expansions cannot declare, shadow, generate, remove
+or rewrite them. Annotation processors MAY read them through a read-only API.

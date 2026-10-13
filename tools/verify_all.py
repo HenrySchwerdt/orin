@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Run `orin verify` (MIR ownership verifier) on every tests/run program and optionally on
-extra entries (e.g. compiler/main.or). Reports error and warning totals.
+"""Run `orin verify` (MIR ownership verifier, on the optimised MIR; pass --no-opt to skip the
+optimiser) on every tests/run and tests/next/run program and optionally on extra entries (e.g.
+compiler/main.or). Reports error and warning totals.
 
 Usage: python3 tools/verify_all.py [--orinc build/bootstrap/orin2] [-v] [extra.or ...]
 """
@@ -15,15 +16,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def entries():
-    base = os.path.join(ROOT, "tests", "run")
     out = []
-    for e in sorted(os.listdir(base)):
-        p = os.path.join(base, e)
-        if os.path.isdir(p):
-            if os.path.isfile(os.path.join(p, "main.or")):
-                out.append(os.path.join(p, "main.or"))
-        elif e.endswith(".or"):
-            out.append(p)
+    for suite in ("run", os.path.join("next", "run")):
+        base = os.path.join(ROOT, "tests", suite)
+        for e in sorted(os.listdir(base)):
+            p = os.path.join(base, e)
+            if os.path.isdir(p):
+                if os.path.isfile(os.path.join(p, "main.or")):
+                    out.append(os.path.join(p, "main.or"))
+            elif e.endswith(".or"):
+                out.append(p)
     return out
 
 
@@ -31,13 +33,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--orinc", default=os.path.join("build", "bootstrap", "orin2"))
     ap.add_argument("-v", action="store_true")
+    ap.add_argument("--no-opt", action="store_true")
     ap.add_argument("extra", nargs="*")
     args = ap.parse_args()
     orinc = os.path.join(ROOT, args.orinc) if not os.path.isabs(args.orinc) else args.orinc
     files = entries() + [os.path.join(ROOT, x) for x in args.extra]
 
     def work(f):
-        r = subprocess.run([orinc, "verify", os.path.relpath(f, ROOT)], cwd=ROOT,
+        r = subprocess.run([orinc, "verify"] + (["--no-opt"] if args.no_opt else []) + [os.path.relpath(f, ROOT)], cwd=ROOT,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
         return f, r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
 

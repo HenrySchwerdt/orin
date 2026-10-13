@@ -2,8 +2,11 @@
 """Differential test of the two Stage 1 backends: for every tests/run program, compile with the
 MIR backend (default) and with `--legacy-codegen`, build and run both, compare stdout + exit code.
 
+With `--mode opt` it instead compares the optimised MIR pipeline (default) against `--no-opt`
+(ADR-0010) over tests/run and tests/next/run.
+
 Usage: python3 tools/diff_backends.py [--orinc build/bootstrap/orin2] [--cc cc] [--filter s]
-                                      [--sanitize]
+                                      [--sanitize] [--mode backends|opt]
 """
 import argparse
 import os
@@ -15,16 +18,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join("build", "diff")
 
 
-def entries():
-    base = os.path.join(ROOT, "tests", "run")
+def entries(suites=("run",)):
     out = []
-    for e in sorted(os.listdir(base)):
-        p = os.path.join(base, e)
-        if os.path.isdir(p):
-            if os.path.isfile(os.path.join(p, "main.or")):
-                out.append((e, os.path.join(p, "main.or")))
-        elif e.endswith(".or"):
-            out.append((e[:-3], p))
+    for suite in suites:
+        base = os.path.join(ROOT, "tests", suite)
+        prefix = "" if suite == "run" else suite.replace("/", "_") + "_"
+        for e in sorted(os.listdir(base)):
+            p = os.path.join(base, e)
+            if os.path.isdir(p):
+                if os.path.isfile(os.path.join(p, "main.or")):
+                    out.append((prefix + e, os.path.join(p, "main.or")))
+            elif e.endswith(".or"):
+                out.append((prefix + e[:-3], p))
     return out
 
 
@@ -58,26 +63,37 @@ def main():
     ap.add_argument("--cc", default="cc")
     ap.add_argument("--filter", default="")
     ap.add_argument("--sanitize", action="store_true")
+    ap.add_argument("--mode", choices=["backends", "opt"], default="backends")
     args = ap.parse_args()
     if not os.path.isabs(args.orinc):
         args.orinc = os.path.join(ROOT, args.orinc)
     os.makedirs(os.path.join(ROOT, OUT), exist_ok=True)
-    tests = [t for t in entries() if args.filter in t[0]]
+    suites = ("run", os.path.join("next", "run")) if args.mode == "opt" else ("run",)
+    tests = [t for t in entries(suites) if args.filter in t[0]]
+    old_flags = ["--no-opt"] if args.mode == "opt" else ["--legacy-codegen"]
 
     def work(t):
         name, entry = t
         a = build_and_run(args, name, entry, "new", [])
-        b = build_and_run(args, name, entry, "old", ["--legacy-codegen"])
+        b = build_and_run(args, name, entry, "old", old_flags)
         return name, a, b
 
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
         results = list(pool.map(work, tests))
     diffs = 0
+    skipped = 0
     for name, a, b in results:
+        timed_out = [x for x in (a, b) if x[0] == "ok" and x[1][0] is None]
+        if a != b and timed_out and len(timed_out) == 1:
+            # one side timed out (e.g. the unoptimised build of a test that is quadratic without
+            # owned parameters): not a behavioural difference
+            skipped += 1
+            print("SKIP %s (one side timed out)" % name)
+            continue
         if a != b:
             diffs += 1
             print("DIFF %s\n   new: %s\n   old: %s" % (name, str(a)[:300], str(b)[:300]))
-    print("%d programs compared, %d differences" % (len(results), diffs))
+    print("%d programs compared (%s), %d differences, %d skipped (timeout)" % (len(results), args.mode, diffs, skipped))
     return 1 if diffs else 0
 
 

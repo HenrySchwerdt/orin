@@ -196,3 +196,41 @@ median (0.199 -> 0.335 s) in this run although its allocation profile is dominat
 does not touch and the C/Go columns of the same run also drifted; A separate re-run of only `wordfreq` (9 runs) gave 0.225 s
 (0.208-0.362) for Orin, with Go and C also slower than in the first run, so it looks like noise, not a regression
 (before: 0.199 s).
+
+
+## MIR optimiser: owned parameters, last-use moves, RC cancellation (ADR-0010)
+
+Method: `python3 tools/bench.py` (5 runs, median), once with the pre-change `orin2` and once with the
+optimising `orin2`, same machine, back to back. The machine was noisy (the untouched C/Go columns moved by
+up to 75%, e.g. C bintrees 0.69 s vs 1.22 s), so wall times of the Orin column are not comparable between the
+two runs; the runtime counters are deterministic and are the reliable evidence. Benchmark checksums are
+identical in both runs.
+
+| benchmark | retains before -> after | releases before -> after | cow_copies | peak_live_bytes before -> after |
+|---|---:|---:|---:|---:|
+| bintrees | 0 -> 0 | 33,405,907 -> 33,405,907 | 0 -> 0 | 12,582,816 -> 12,582,816 |
+| fib | 0 -> 0 | 2 -> 2 | 0 -> 0 | 108 -> 108 |
+| qsort_func | 477,782 -> 1 | 2,866,692 -> 2,388,911 | 0 -> 0 | 55,859,744 -> 28,520,120 |
+| qsort_inplace | 1 -> 1 | 1,355,404 -> 1,355,404 | 1 -> 1 | 16,389,304 -> 16,389,304 |
+| sieve | 0 -> 0 | 3 -> 3 | 0 -> 0 | 134,217,776 -> 134,217,776 |
+| strings | 0 -> 0 | 2,500,013 -> 2,500,013 | 0 -> 0 | 39,885,237 -> 39,885,237 |
+| wordfreq | 6,025 -> 5,001 | 2,012,056 -> 2,011,032 | 0 -> 0 | 595,615 -> 595,615 |
+
+Wall times (noisy run, Orin median s, before -> after): bintrees 0.993 -> 1.242, fib 0.304 -> 0.451,
+qsort_func 0.410 -> 0.438, qsort_inplace 0.192 -> 0.251, sieve 0.344 -> 0.411, strings 0.159 -> 0.232,
+wordfreq 0.227 -> 0.242. Benchmarks whose counters did not change generate identical C, so these differences are
+pure machine noise (the C reference column slowed down by a similar factor); only `qsort_func` (all 477k retains and
+about 0.48M releases removed, peak live bytes halved) is actually affected. No benchmark got slower in work done.
+
+Quadratic case (tests/next/run/owned_param_linear.or: `st = add(st, i)` x 200,000, `add` does `let t = s; t.items.push(x)`):
+`--no-opt`: cow_copies 400,000, retains 400,000, allocs 400,005, array_grows 200,000 (quadratic: it exceeds the
+10 s test timeout under ASan); optimised: cow_copies 0, retains 0, allocs 5, cow_inplace 600,000 (linear, milliseconds).
+
+Self-compile (orin2 compiling compiler/main.or), same binary, 5 runs each: 2.45 s with `--no-opt`, 4.7 s with the
+optimiser, i.e. the optimiser pass itself costs about 0.45 s per compile of the 2.5 MB-C compiler (roughly +90%;
+its flow-insensitive alias relation and per-parameter liveness are unoptimised Orin). Counters for that compile:
+retains 21.7M -> 40.8M, cow_copies 216k -> 371k (the extra work is the optimiser's own array traffic).
+Generated C size of the compiler: 2,014,725 bytes with `--no-opt`, 2,071,261 with optimisation (+2.8%; extra
+temporaries and release edges), and the optimisation does not change the benchmark programs' C size noticeably.
+In the compiler's own run the optimised compiler is not measurably faster as a program yet (it has few owned-parameter
+patterns); the gain is asymptotic (state-threading code) rather than constant-factor.

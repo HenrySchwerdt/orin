@@ -1,0 +1,84 @@
+// MIR optimiser driver (ADR-0010, docs/mir.md v1.2). Input: a verified MIR program with all
+// parameters borrowed. Output: an equivalent MIR program that passes the verifier.
+//   1. parameter-mode inference: interprocedural fixpoint starting from "all borrowed";
+//      parameter k of f becomes owned when f consumes it at a last use (IDup or an owned
+//      position of a callee). Modes only ever flip borrowed -> owned, in function/parameter
+//      order, so the result is deterministic and the iteration terminates.
+//   2. per function: call-site argument retains (calls.or), callee-side owned-parameter rewrite
+//      (params.or), dup/release cancellation (calls.or).
+
+import { MProgram, MFunction } from "../mir";
+import { PSites, scanSites, rewriteParam } from "./params";
+import { insertCallDups, peephole } from "./calls";
+
+function ownedAny(f: MFunction): bool {
+  for (const o of f.paramOwned) {
+    if (o) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function optimize(p: MProgram): MProgram {
+  let q = p;
+  let sites: PSites[][] = [];
+  for (const f of p.functions) {
+    let row: PSites[] = [];
+    let k: usize = 0;
+    while (k < f.paramCount) {
+      row.push(scanSites(f, k));
+      k += 1;
+    }
+    sites.push(row);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    let fi: usize = 0;
+    while (fi < sites.length) {
+      let k: usize = 0;
+      while (k < sites[fi].length) {
+        const s = sites[fi][k];
+        if (s.ok && !q.functions[fi].paramOwned[k]) {
+          let want = s.dup;
+          for (const c of s.calls) {
+            if (c.pos < q.functions[c.callee].paramOwned.length && q.functions[c.callee].paramOwned[c.pos]) {
+              want = true;
+            }
+          }
+          if (want) {
+            q.functions[fi].paramOwned[k] = true;
+            changed = true;
+          }
+        }
+        k += 1;
+      }
+      fi += 1;
+    }
+  }
+  let fns: MFunction[] = [];
+  let fi: usize = 0;
+  while (fi < p.functions.length) {
+    const owned = q.functions[fi].paramOwned;
+    let f = insertCallDups(q, p, p.functions[fi], owned);
+    let k: usize = 0;
+    while (k < owned.length) {
+      if (owned[k]) {
+        f = rewriteParam(q, f, k);
+      }
+      k += 1;
+    }
+    f = peephole(f);
+    fns.push(MFunction {
+      name: f.name,
+      paramCount: f.paramCount,
+      paramOwned: owned,
+      locals: f.locals,
+      ret: f.ret,
+      blocks: f.blocks
+    });
+    fi += 1;
+  }
+  return MProgram { functions: fns, strings: p.strings, main: p.main };
+}

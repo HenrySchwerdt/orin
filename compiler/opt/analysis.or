@@ -1,0 +1,236 @@
+// Shared analyses for the MIR optimiser: operand/local use and definition sets, the alias
+// ("ancestor") relation between borrowed locals and the locals they borrow from, successors.
+
+import { MType, MFunction, Operand, Instr, Terminator, SwitchCase } from "../mir";
+
+function lo(o: Operand): usize[] {
+  return match (o) {
+    OLocal(l) => [l],
+    _ => []
+  };
+}
+
+function los(os: Operand[]): usize[] {
+  let out: usize[] = [];
+  for (const o of os) {
+    match (o) {
+      OLocal(l) => {
+        out.push(l);
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+// Locals read (or mutated through) by an instruction, including IRelease.
+export function instrUses(i: Instr): usize[] {
+  return match (i) {
+    ICopy(_, o) => lo(o),
+    IMove(_, s) => [s],
+    IBorrow(_, s) => [s],
+    IDup(_, o) => lo(o),
+    IRelease(x) => [x],
+    IUnary(_, _, o) => lo(o),
+    IBinary(_, _, a, b) => lo(a).concat(lo(b)),
+    ICall(_, _, args) => los(args),
+    IBuiltin(_, _, args) => los(args),
+    IStrAppend(x, y) => [x].concat(lo(y)),
+    IStructNew(_, _, s) => los(s),
+    INullary(_, _) => [],
+    ITag(_, o) => lo(o),
+    IGetField(_, o, _) => lo(o),
+    ISetField(x, _, v) => [x].concat(lo(v)),
+    ITakeField(_, x, _) => [x],
+    IPutField(x, _, s) => [x, s],
+    IMakeUnique(x) => [x],
+    IArrayNew(_, _, es) => los(es),
+    IArrayGet(_, a, k) => lo(a).concat(lo(k)),
+    IArraySet(x, k, v) => [x].concat(lo(k)).concat(lo(v)),
+    IArrayTake(_, x, k) => [x].concat(lo(k)),
+    IArrayPut(x, k, s) => [x, s].concat(lo(k)),
+    IArrayPush(x, v) => [x].concat(lo(v)),
+    IArrayPop(_, x) => [x]
+  };
+}
+
+// The local an instruction (re)defines, if any.
+export function instrDef(i: Instr): Option<usize> {
+  return match (i) {
+    ICopy(d, _) => Some(d),
+    IMove(d, _) => Some(d),
+    IBorrow(d, _) => Some(d),
+    IDup(d, _) => Some(d),
+    IUnary(d, _, _) => Some(d),
+    IBinary(d, _, _, _) => Some(d),
+    ICall(d, _, _) => d,
+    IBuiltin(d, _, _) => d,
+    IStructNew(d, _, _) => Some(d),
+    INullary(d, _) => Some(d),
+    ITag(d, _) => Some(d),
+    IGetField(d, _, _) => Some(d),
+    ITakeField(d, _, _) => Some(d),
+    IArrayNew(d, _, _) => Some(d),
+    IArrayGet(d, _, _) => Some(d),
+    IArrayTake(d, _, _) => Some(d),
+    IArrayPop(d, _) => Some(d),
+    _ => None
+  };
+}
+
+export function termUses(t: Terminator): usize[] {
+  return match (t) {
+    TGoto(_) => [],
+    TBranch(o, _, _) => lo(o),
+    TSwitch(o, _, _) => lo(o),
+    TReturn(r) => match (r) {
+      Some(o) => lo(o),
+      None => []
+    },
+    TTrap(_) => []
+  };
+}
+
+export function successors(t: Terminator): usize[] {
+  return match (t) {
+    TGoto(b) => [b],
+    TBranch(_, a, b) => [a, b],
+    TSwitch(_, cs, d) => {
+      let out: usize[] = [];
+      for (const c of cs) {
+        out.push(c.target);
+      }
+      out.push(d);
+      return out;
+    },
+    TReturn(_) => [],
+    TTrap(_) => []
+  };
+}
+
+export function isRefTy(t: MType): bool {
+  return match (t) {
+    MRef => true,
+    _ => false
+  };
+}
+
+export function contains(xs: usize[], x: usize): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Source local of a borrowed projection `d = obj`, when d is a reference and obj a local.
+function edgeSrc(f: MFunction, d: usize, o: Operand): Option<usize> {
+  return match (o) {
+    OLocal(l) => isRefTy(f.locals[d].ty) ? Some(l) : None,
+    _ => None
+  };
+}
+
+// anc[d] = every local d may (transitively) be a borrowed projection of: sources of IBorrow /
+// IGetField / IArrayGet into a reference local, closed under the relation. Flow-insensitive, so
+// it over-approximates (a reused local counts as derived everywhere), which is the safe side.
+export function ancestors(f: MFunction): usize[][] {
+  const n = f.locals.length;
+  let anc: usize[][] = [];
+  let k: usize = 0;
+  while (k < n) {
+    anc.push([]);
+    k += 1;
+  }
+  let ed: usize[] = [];
+  let eo: usize[] = [];
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IBorrow(d, s) => {
+          ed.push(d);
+          eo.push(s);
+        },
+        IGetField(d, o, _) => {
+          match (edgeSrc(f, d, o)) {
+            Some(l) => {
+              ed.push(d);
+              eo.push(l);
+            },
+            None => {}
+          }
+        },
+        IArrayGet(d, o, _) => {
+          match (edgeSrc(f, d, o)) {
+            Some(l) => {
+              ed.push(d);
+              eo.push(l);
+            },
+            None => {}
+          }
+        },
+        _ => {}
+      }
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    let e: usize = 0;
+    while (e < ed.length) {
+      const d = ed[e];
+      const o = eo[e];
+      let cur = anc[d];
+      if (!contains(cur, o)) {
+        cur.push(o);
+        changed = true;
+      }
+      for (const a of anc[o]) {
+        if (!contains(cur, a)) {
+          cur.push(a);
+          changed = true;
+        }
+      }
+      anc[d] = cur;
+      e += 1;
+    }
+  }
+  return anc;
+}
+
+// Does a use of local u count as a use of x (u is x or may be borrowed from x)?
+export function affects(anc: usize[][], u: usize, x: usize): bool {
+  return u == x || contains(anc[u], x);
+}
+
+// Does the instruction use x or something borrowed from x?
+export function usesAffecting(anc: usize[][], ins: Instr, x: usize): bool {
+  for (const u of instrUses(ins)) {
+    if (affects(anc, u, x)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function termUsesAffecting(anc: usize[][], t: Terminator, x: usize): bool {
+  for (const u of termUses(t)) {
+    if (affects(anc, u, x)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Is block 0 the target of some terminator?
+export function entryHasPredecessor(f: MFunction): bool {
+  for (const blk of f.blocks) {
+    for (const s of successors(blk.term)) {
+      if (s == 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}

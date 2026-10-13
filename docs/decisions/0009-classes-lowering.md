@@ -45,3 +45,12 @@ No inheritance (`extends` → E0408), no `protected`, no getters/setters, no ove
 - Performance: the receiver is passed and returned; with owned-parameter inference and last-use
   moves (ADR-0010) the update is in place when unshared. Before ADR-0010 lands, each mutating
   call may copy the object shallowly (correct, slower).
+
+## Amendment (2026-10-13): mutability stays inferred; it is part of the API surface
+An explicit `mut` marker was considered and **rejected** (project owner preference: avoid extra
+syntax where the compiler can infer it). Mutating methods remain inferred. To keep the API
+stability that a marker would give, the inferred mutability of every exported method is part of
+the module's **public API snapshot** (spec 04): `orin check` reports a change in it as a public API
+change, and tooling (hover, `inspect`, docs) shows it (e.g. `mutating method withdraw(...)`).
+Contract clauses use the same inferred information (`old(this...)` in `@Ensures` on a mutating
+method; spec 15).

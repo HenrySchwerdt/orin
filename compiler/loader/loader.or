@@ -1,4 +1,4 @@
-// Module loader: reads files, parses them, resolves imports, enforces module boundaries
+// Module loader (single implementation; `loadAll` = `loadWithOverlay` with an empty overlay): reads files, parses them, resolves imports, enforces module boundaries
 // (E0302) and acyclicity (E0303). Port of bootstrap/src/loader.rs with the same diagnostics,
 // the same topological order (DFS in import order, dependencies first, entry last) and the
 // same unit names. Paths are normalized lexically (see path.or), not canonicalized.
@@ -18,6 +18,38 @@ export type LoadResult = { program: LoadedProgram; sm: SourceMap; };
 // Like LoadResult, but also available on failure: `sm` holds every file read so far (so the
 // diagnostics can be rendered); `program` is Some exactly when `diags` is empty.
 export type LoadOutcome = { sm: SourceMap; program: Option<LoadedProgram>; diags: Diagnostic[]; };
+
+// Overlay entries with normalized paths (so lookups are plain string comparisons).
+function normalizeOverlay(overlay: SourceFile[]): SourceFile[] {
+  let out: SourceFile[] = [];
+  for (const f of overlay) {
+    out.push(SourceFile { path: normalizePath(f.path), text: f.text });
+  }
+  return out;
+}
+
+function findIn(ov: SourceFile[], p: string): Option<usize> {
+  let i: usize = 0;
+  while (i < ov.length) {
+    if (ov[i].path == p) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function existsIn(ov: SourceFile[], p: string): bool {
+  return findIn(ov, p).isSome() || exists(p);
+}
+
+function readIn(ov: SourceFile[], p: string): Result<string, string> {
+  const k = findIn(ov, p);
+  if (k.isSome()) {
+    return Ok(ov[k.unwrap()].text);
+  }
+  return readFile(p);
+}
 
 type Resolved = { std: int; path: string; };
 
@@ -42,24 +74,27 @@ function stdKind(p: string): int {
   if (p == "std:process") {
     return 2;
   }
+  if (p == "std:io") {
+    return 3;
+  }
   return 0;
 }
 
 // Resolve import path `p` of file `importer` (in directory `dir`) to a normalized file path,
 // or to a std module. Reports E0301 and E0302.
-function resolveImport(importer: string, dir: string, p: string, sp: Span, base: string): Result<Resolved, Diagnostic> {
+function resolveImport(ov: SourceFile[], importer: string, dir: string, p: string, sp: Span, base: string): Result<Resolved, Diagnostic> {
   if (p.startsWith("std:")) {
     const k = stdKind(p);
     if (k == 0) {
-      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process)"));
+      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process, std:io)"));
     }
     return Ok(Resolved { std: k, path: "" });
   }
   const c1 = joinPath(dir, p + ".or");
   const c2 = joinPath(dir, p + "/module.or");
   let target = c1;
-  if (!exists(c1)) {
-    if (!exists(c2)) {
+  if (!existsIn(ov, c1)) {
+    if (!existsIn(ov, c2)) {
       return Err(diag("E0301", sp, "cannot find module `" + p + "` (tried `" + c1 + "` and `" + c2 + "`)"));
     }
     target = c2;
@@ -70,7 +105,7 @@ function resolveImport(importer: string, dir: string, p: string, sp: Span, base:
   let d = dirname(target);
   while (d != ".") {
     const m = joinPath(d, "module.or");
-    if (target != m && exists(m) && !isInside(d, importer)) {
+    if (target != m && existsIn(ov, m) && !isInside(d, importer)) {
       return Err(diag("E0302", sp, "cannot import private file `" + relName(base, target)
         + "` of module `" + relName(base, d) + "`; import the module itself"));
     }
@@ -102,8 +137,12 @@ function importOf(item: Item): Option<ImportDecl> {
   };
 }
 
-export function loadAll(entryPath: string): LoadOutcome {
+// Loads the program rooted at `entryPath`. File contents come from `overlay` (unsaved editor
+// buffers, spec 18 §2) when a path matches (compared after `normalizePath`), otherwise from
+// disk; an overlay file also counts as existing for import resolution.
+export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
   const entry = normalizePath(entryPath);
+  const ov = normalizeOverlay(overlay);
   const base = dirname(entry);
   let files: SourceFile[] = [];
   let nodePaths: string[] = [];   // node id == index into `files`
@@ -132,7 +171,7 @@ export function loadAll(entryPath: string): LoadOutcome {
 
   while (true) {
     if (pending) {
-      const rf = readFile(pendPath);
+      const rf = readIn(ov, pendPath);
       if (rf.isErr()) {
         files.push(SourceFile { path: pendDisp, text: "" });
         const f = files.length - 1;
@@ -199,7 +238,7 @@ export function loadAll(entryPath: string): LoadOutcome {
     }
     const decl = imp.unwrap();
     const importer = nodePaths[curNode];
-    const rr = resolveImport(importer, dirname(importer), decl.path, decl.pathSpan, base);
+    const rr = resolveImport(ov, importer, dirname(importer), decl.path, decl.pathSpan, base);
     if (rr.isErr()) {
       return failOut(files, rr.unwrapErr());
     }
@@ -211,6 +250,11 @@ export function loadAll(entryPath: string): LoadOutcome {
     }
     if (res.std == 2) {
       cur.push(ImportStd(StdProcess));
+      curItem += 1;
+      continue;
+    }
+    if (res.std == 3) {
+      cur.push(ImportStd(StdIo));
       curItem += 1;
       continue;
     }
@@ -254,6 +298,11 @@ export function loadAll(entryPath: string): LoadOutcome {
     program: Some(LoadedProgram { units: units, entry: units.length - 1 }),
     diags: none
   };
+}
+
+export function loadAll(entryPath: string): LoadOutcome {
+  const none: SourceFile[] = [];
+  return loadWithOverlay(entryPath, none);
 }
 
 export function load(entryPath: string): Result<LoadResult, Diagnostic[]> {
