@@ -1,0 +1,153 @@
+// `@Deprecated("message")` warnings (ADR-0024). Beyond Orin-B.
+//
+// Deprecation is a tooling diagnostic, not a type-checking rule: the program is valid and compiles.
+// The warning W0440 is derived from the semantic index (ADR-0008): every reference to a definition
+// marked deprecated is reported, except
+//   * inside the deprecated declaration itself (a recursive call, the declaration's own name), and
+//   * inside any other deprecated declaration (code that is itself being phased out may keep using
+//     other deprecated symbols), and
+//   * in the name list of an `import` / re-export (the uses that follow are what is reported).
+// Diagnostics are in source order of the index (files in loader order), so output is deterministic.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { LoadedProgram } from "../loader";
+import { Annotation, ClassMember, IfaceMethod } from "../syntax";
+import { SemanticIndex, SkFunction, SkRecord, SkInterface } from "../hir";
+
+export const DEPRECATED_CODE: string = "W0440";
+
+function inside(inner: Span, outer: Span): bool {
+  return inner.file == outer.file && inner.start >= outer.start && inner.end <= outer.end;
+}
+
+// True when any declaration of the program is annotated `@Deprecated` (cheap pre-check on the AST,
+// so programs without deprecations never pay for building the index).
+export function hasDeprecated(prog: LoadedProgram): bool {
+  for (const u of prog.units) {
+    if (u.name.startsWith("$")) {
+      continue;
+    }
+    for (const it of u.ast.items) {
+      const found = match (it) {
+        IFunction(f) => anyDeprecated(f.annotations),
+        IType(t) => anyDeprecated(t.annotations),
+        IClass(c) => classHasDeprecated(c.annotations, c.members),
+        IInterface(k) => ifaceHasDeprecated(k.annotations, k.methods),
+        _ => false
+      };
+      if (found) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function anyDeprecated(as: Annotation[]): bool {
+  for (const a of as) {
+    const d = match (a.kind) {
+      ADeprecated => true,
+      _ => false
+    };
+    if (d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function classHasDeprecated(as: Annotation[], ms: ClassMember[]): bool {
+  if (anyDeprecated(as)) {
+    return true;
+  }
+  for (const m of ms) {
+    const d = match (m) {
+      MMethod(md) => anyDeprecated(md.annotations),
+      _ => false
+    };
+    if (d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function ifaceHasDeprecated(as: Annotation[], ms: IfaceMethod[]): bool {
+  if (anyDeprecated(as)) {
+    return true;
+  }
+  for (const m of ms) {
+    if (anyDeprecated(m.annotations)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function importSpans(prog: LoadedProgram): Span[] {
+  let out: Span[] = [];
+  for (const u of prog.units) {
+    for (const it of u.ast.items) {
+      match (it) {
+        IImport(d) => { out.push(d.span); },
+        IReExport(d) => { out.push(d.span); },
+        _ => {}
+      }
+    }
+  }
+  return out;
+}
+
+export function deprecationWarnings(prog: LoadedProgram, idx: SemanticIndex): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  let depDecls: Span[] = [];
+  for (const d of idx.defs) {
+    if (d.deprecated.isSome()) {
+      depDecls.push(d.declSpan);
+    }
+  }
+  if (depDecls.length == 0) {
+    return out;
+  }
+  const imports = importSpans(prog);
+  for (const r of idx.refs) {
+    const d = idx.defs[r.def];
+    if (d.deprecated.isNone()) {
+      continue;
+    }
+    let skip = false;
+    for (const ds of depDecls) {
+      if (inside(r.span, ds)) {
+        skip = true;
+      }
+    }
+    for (const isp of imports) {
+      if (inside(r.span, isp)) {
+        skip = true;
+      }
+    }
+    if (skip) {
+      continue;
+    }
+    let name = d.name;
+    match (d.container) {
+      Some(c) => {
+        const method = match (d.kind) {
+          SkFunction => match (idx.defs[c].kind) {
+            SkRecord => true,
+            SkInterface => true,
+            _ => false
+          },
+          _ => false
+        };
+        if (method) {
+          name = idx.defs[c].name + "." + d.name;
+        }
+      },
+      None => {}
+    }
+    const msg = d.deprecated.unwrap();
+    out.push(diag(DEPRECATED_CODE, r.span, "`" + name + "` is deprecated" + (msg.length > 0 ? ": " + msg : "")));
+  }
+  return out;
+}

@@ -88,4 +88,11 @@ got=$("$D/bin/orin" run "$SHOP")
 [ "$got" = "$want" ] && ok "launcher: orin run <package-dir>" || bad "launcher: orin run <package-dir>"
 (cd "$T" && "dist/bin/orin" build "../../$SHOP") && [ -x "$T/shop" ] && ok "launcher: default output name is the directory name" || bad "launcher: default output name"
 
+# 6. launcher: orin test (the launcher passes its own runtime directory and C compiler)
+got=$(cd "$T" && "dist/bin/orin" test ../../tests/next/orin_test/pass.or | tail -1)
+[ "$got" = "3 passed, 0 failed" ] && ok "launcher: orin test <file>" || bad "launcher: orin test <file> (got: $got)"
+got=$("$D/bin/orin" test tests/next/orin_test/pkg | tail -1)
+[ "$got" = "4 passed, 1 failed" ] && ok "launcher: orin test <package-dir> (one failing test)" || bad "launcher: orin test <package-dir> (got: $got)"
+if "$D/bin/orin" test tests/next/orin_test/pkg > /dev/null 2>&1; then bad "launcher: orin test exit status for failures"; else ok "launcher: orin test exits 1 on failures"; fi
+
 [ "$fail" = 0 ] && echo "packages: all ok" || { echo "packages: FAILED"; exit 1; }

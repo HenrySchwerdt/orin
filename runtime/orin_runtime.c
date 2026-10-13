@@ -48,6 +48,8 @@ static void stats_report(void) {
     rep_u(&r, ",\"string_grows\":", s->string_grows);
     rep_u(&r, ",\"peak_live_objs\":", s->peak_live_objs);
     rep_u(&r, ",\"peak_live_bytes\":", s->peak_live_bytes);
+    rep_u(&r, ",\"file_opens\":", s->file_opens);
+    rep_u(&r, ",\"file_closes\":", s->file_closes);
     rep_s(&r, ",\"live_objs_at_exit\":");
     r.n += orin_platform_fmt_i64(r.b + r.n, g_live);
     rep_s(&r, "}}");
@@ -55,9 +57,12 @@ static void stats_report(void) {
 }
 int64_t orin_live_count(void) { return g_live; }
 
+static void files_at_exit(void);
+
 void orin_init(int argc, char **argv) {
     orin_platform_init(argc, argv);
     orin_platform_at_exit(stats_report);
+    orin_platform_at_exit(files_at_exit); /* runs before stats_report: the counters include the closes */
 }
 
 void orin_flush(void) { orin_platform_flush(); }
@@ -788,6 +793,189 @@ OrinObj *orin_fs_write_file(OrinObj *path, OrinObj *data) {
 int64_t orin_fs_exists(OrinObj *path) {
     OrinString *p = (OrinString *)path;
     return orin_platform_file_exists(p->data, p->len);
+}
+
+/* ---------------------------------------------------------------- file resources (ADR-0025) */
+
+enum { FILE_SLOTS = 256 };
+typedef struct {
+    orin_platform_stream *s; /* NULL = free */
+    uint64_t gen;            /* incremented on every open of the slot; never 0 while open */
+    int mode;                /* ORIN_PLATFORM_STREAM_* */
+    int err;                 /* first runtime-detected error (wrong mode); 0 = none */
+} FileSlot;
+static FileSlot g_files[FILE_SLOTS];
+
+static void files_at_exit(void) {
+    for (int i = 0; i < FILE_SLOTS; i++) {
+        if (g_files[i].s) {
+            orin_platform_stream_close(g_files[i].s); /* flushes buffered bytes */
+            g_files[i].s = NULL;
+            orin_stats.file_closes++;
+        }
+    }
+}
+
+static OrinObj *reason_str(const char *what, int code) {
+    const char *why = orin_platform_error_message(code);
+    size_t wl = 0, yl = 0;
+    while (what[wl]) wl++;
+    while (why[yl]) yl++;
+    OrinString *m = str_alloc(wl + yl, 0);
+    orin_platform_mem_copy(m->data, what, wl);
+    orin_platform_mem_copy(m->data + wl, why, yl);
+    m->data[wl + yl] = 0;
+    return &m->h;
+}
+
+/* The slot of a valid open handle; traps on anything else (closed, stale, foreign, failed-open, 0). */
+static FileSlot *file_slot(int64_t h) {
+    if (h > 0) {
+        uint64_t idx = (uint64_t)h & 255, gen = (uint64_t)h >> 8;
+        if (g_files[idx].s && g_files[idx].gen == gen) return &g_files[idx];
+    }
+    orin_trap("invalid file handle (closed, stale or failed to open)");
+}
+
+static void file_fail(FileSlot *f, int code) {
+    if (f->err == 0) f->err = code;
+}
+
+int64_t orin_file_open(OrinObj *path, int64_t mode) {
+    if (mode < 0 || mode > 2) return -ORIN_PLATFORM_EINVAL;
+    int i = 0;
+    while (i < FILE_SLOTS && g_files[i].s) i++;
+    if (i == FILE_SLOTS) return -24; /* EMFILE: too many open files */
+    orin_platform_stream *s;
+    int rc = orin_platform_stream_open(orin_str_data(path), (size_t)orin_str_len(path), (int)mode, &s);
+    if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) return -(int64_t)rc;
+    g_files[i].s = s;
+    g_files[i].gen++;
+    g_files[i].mode = (int)mode;
+    g_files[i].err = 0;
+    orin_stats.file_opens++;
+    return (int64_t)((g_files[i].gen << 8) | (uint64_t)i);
+}
+
+int64_t orin_file_is_open(int64_t h) { return h > 0; }
+
+OrinObj *orin_file_open_error(int64_t h) {
+    return reason_str("", h < 0 && h > -100000 ? (int)-h : ORIN_PLATFORM_EINVAL);
+}
+
+OrinObj *orin_file_close(int64_t h) {
+    if (h <= 0) return orin_none(); /* nothing was opened: nothing to release */
+    FileSlot *f = file_slot(h);
+    int rc = orin_platform_stream_close(f->s);
+    int code = f->err ? f->err : rc;
+    f->s = NULL;
+    orin_stats.file_closes++;
+    if (code == 0) return orin_none();
+    return orin_variant1(0, 1, ORIN_SLOT(reason_str("I/O error: ", code)));
+}
+
+/* Reads up to n bytes (n may be huge): grows the buffer as data arrives. Returns the byte count. */
+static OrinObj *file_read_upto(FileSlot *f, uint64_t n, int *any) {
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)orin_platform_alloc(cap);
+    if (!buf) orin_trap("out of memory");
+    while ((uint64_t)len < n) {
+        if (len == cap) {
+            if (cap > SIZE_MAX / 2) orin_trap("out of memory");
+            cap *= 2;
+            buf = (char *)orin_platform_realloc(buf, cap);
+            if (!buf) orin_trap("out of memory");
+        }
+        size_t want = cap - len;
+        if ((uint64_t)want > n - (uint64_t)len) want = (size_t)(n - (uint64_t)len);
+        size_t got = orin_platform_stream_read(f->s, buf + len, want);
+        len += got;
+        if (got < want) break; /* EOF or error */
+    }
+    *any = len > 0;
+    OrinObj *r = orin_str_new(buf, len);
+    orin_platform_free(buf);
+    return r;
+}
+
+OrinObj *orin_file_read_line(int64_t h) {
+    FileSlot *f = file_slot(h);
+    if (f->mode != ORIN_PLATFORM_STREAM_READ) {
+        file_fail(f, 9); /* EBADF */
+        return orin_none();
+    }
+    size_t cap = 128, len = 0;
+    char *buf = (char *)orin_platform_alloc(cap);
+    if (!buf) orin_trap("out of memory");
+    int c, any = 0;
+    while ((c = orin_platform_stream_getc(f->s)) >= 0) {
+        any = 1;
+        if (c == '\n') break;
+        if (len == cap) {
+            cap *= 2;
+            buf = (char *)orin_platform_realloc(buf, cap);
+            if (!buf) orin_trap("out of memory");
+        }
+        buf[len++] = (char)c;
+    }
+    if (!any) {
+        orin_platform_free(buf);
+        return orin_none();
+    }
+    if (len > 0 && buf[len - 1] == '\r') len--;
+    OrinObj *s = orin_str_new(buf, len);
+    orin_platform_free(buf);
+    return orin_variant1(0, 1, ORIN_SLOT(s));
+}
+
+OrinObj *orin_file_read(int64_t h, uint64_t n) {
+    FileSlot *f = file_slot(h);
+    if (f->mode != ORIN_PLATFORM_STREAM_READ) {
+        file_fail(f, 9);
+        return orin_none();
+    }
+    int any;
+    OrinObj *s = file_read_upto(f, n, &any);
+    if (n > 0 && !any) {
+        orin_release(s);
+        return orin_none();
+    }
+    return orin_variant1(0, 1, ORIN_SLOT(s));
+}
+
+OrinObj *orin_file_read_all(int64_t h) {
+    FileSlot *f = file_slot(h);
+    if (f->mode != ORIN_PLATFORM_STREAM_READ) {
+        file_fail(f, 9);
+        return orin_str_new("", 0);
+    }
+    int any;
+    return file_read_upto(f, UINT64_MAX, &any);
+}
+
+void orin_file_write(int64_t h, OrinObj *s) {
+    FileSlot *f = file_slot(h);
+    if (f->mode == ORIN_PLATFORM_STREAM_READ) {
+        file_fail(f, 9);
+        return;
+    }
+    orin_platform_stream_write(f->s, orin_str_data(s), (size_t)orin_str_len(s));
+}
+
+void orin_file_write_line(int64_t h, OrinObj *s) {
+    FileSlot *f = file_slot(h);
+    if (f->mode == ORIN_PLATFORM_STREAM_READ) {
+        file_fail(f, 9);
+        return;
+    }
+    orin_platform_stream_write(f->s, orin_str_data(s), (size_t)orin_str_len(s));
+    orin_platform_stream_write(f->s, "\n", 1);
+}
+
+void orin_file_flush(int64_t h) {
+    FileSlot *f = file_slot(h);
+    if (f->mode != ORIN_PLATFORM_STREAM_READ) orin_platform_stream_flush(f->s);
 }
 
 OrinObj *orin_process_args(void) {

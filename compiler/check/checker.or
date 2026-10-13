@@ -16,7 +16,9 @@ import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig, resolveType, instType } f
 import { resolveImpls, checkImpls, boundIface } from "./ifaces";
 import { checkFuncContracts, checkRecordContracts } from "./contracts";
 import { purityDiags } from "./purity";
+import { resourceDiags } from "./resources";
 import { expandContracts } from "./rtcheck";
+import { testSignatureDiags, inlineCycleDiags, hasInline } from "./annotations";
 
 // `cexprs`: the checked contract expressions of the function (ADR-0012), for the purity pass.
 type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; cexprs: HExpr[]; };
@@ -235,6 +237,10 @@ function ifaceDefs(env: Env): IfaceDef[] {
 }
 
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
+  const sigs = testSignatureDiags(prog);
+  if (sigs.length > 0) {
+    return Err(sigs);
+  }
   // Classes are lowered to records and functions first (ADR-0009).
   const lw = lowerClasses(prog);
   if (lw.diags.length > 0) {
@@ -299,8 +305,28 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
     }
     fi += 1;
   }
+  if (diags.length == 0) {
+    for (const d of resourceDiags(funcs)) {
+      diags.push(d);
+    }
+  }
   if (diags.length == 0 && cexprs.length > 0) {
     for (const d of purityDiags(funcs, cexprs)) {
+      diags.push(d);
+    }
+  }
+  // `@Inline` (ADR-0024): the hint travels by function name; a function in a call cycle is rejected.
+  let inl: bool[] = [];
+  let inlineFns: string[] = [];
+  for (const fi2 of env.funcs) {
+    const h = fi2.mode != 6 && hasInline(fi2.decl.annotations);
+    inl.push(h);
+    if (h) {
+      inlineFns.push(fi2.qname);
+    }
+  }
+  if (diags.length == 0 && inlineFns.length > 0) {
+    for (const d of inlineCycleDiags(funcs, inl)) {
       diags.push(d);
     }
   }
@@ -308,7 +334,10 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
     return Err(dedupDiags(diags));
   }
   const mainId = findMain(env).unwrapOr(0);
-  return Ok(Program { records: env.records, unions: env.unions, functions: funcs, main: mainId, vtables: env.vtables, ifaces: ifaceDefs(env) });
+  return Ok(Program {
+    records: env.records, unions: env.unions, functions: funcs, main: mainId, vtables: env.vtables, ifaces: ifaceDefs(env),
+    inlineFns: inlineFns
+  });
 }
 
 // `check` with runtime contract checking (`orin compile --check-contracts`, ADR-0012): the program is

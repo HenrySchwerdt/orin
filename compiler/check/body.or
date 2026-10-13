@@ -17,7 +17,7 @@ import {
   HPattern, Builtin, MutBuiltin, intKindOf, kindType, kindSigned, kindUnsigned64, i64Min
 } from "../hir";
 import {
-  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, typeEq, isInt, isUsize, isSignedInt, isBool, isString, isVoid,
+  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isInt, isUsize, isSignedInt, isBool, isString, isVoid,
   isIntish, isFloatTy, isNumeric, isArrayTy, isFn, isIface, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq,
   boundOf, ifaceMethodIndex
 } from "./env";
@@ -28,6 +28,7 @@ import {
   newClosureCtx, lookupVar, isVisibleVar, isCapturedLocal
 } from "./fnctx";
 import { builtinSig, methodSig, Sig, MSig } from "./builtins";
+import { hasResource } from "./resources";
 import { checkPattern, PatOut } from "./pattern";
 import {
   litTypeOf, litFits, rangeText, convMethodKind, convExpr, arithMethodMode, arithExpr, parseFnKind, parseExpr, classSuffix,
@@ -844,6 +845,9 @@ function checkRecord(
     },
     EntIface(_) => {
       return Err(diag("E0400", name.span, "`" + name.name + "` is an interface, not a record type"));
+    },
+    EntBuiltin(_) => {
+      return Err(diag("E0400", name.span, "`" + name.name + "` is a built-in resource type, not a record type"));
     }
   }
   if (targs.isSome()) {
@@ -1103,6 +1107,21 @@ function callValue(env: Env, fx: FnCtx, span: Span, callee: Expr, args: Expr[]):
   };
 }
 
+// `@Test` functions are entry points of `orin test` and are erased from ordinary builds (ADR-0024), so
+// no code may refer to them.
+function testGuard(f: FuncInfo, span: Span): Result<bool, Diagnostic> {
+  for (const a of f.decl.annotations) {
+    const isTest = match (a.kind) {
+      ATest => true,
+      _ => false
+    };
+    if (isTest) {
+      return Err(diag("E0445", span, "`@Test` function `" + f.decl.name.name + "` cannot be called or used as a value: it is only run by `orin test` and erased from ordinary builds"));
+    }
+  }
+  return Ok(true);
+}
+
 function callIdent(
   env: Env, fx: FnCtx, span: Span, callee: Expr, id: Ident, args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
@@ -1136,6 +1155,7 @@ function callIdent(
     VGVariant(gi, tag) => genericVariant(env, fx, span, gi, tag, None, args, exp),
     VFunc(fid) => {
       const f = fx.env.funcs[fid];
+      testGuard(f, span)?;
       const a = argsExpect(env, fx, span, "function `" + id.name + "`", args, f.params)?;
       return done(a.fx, XCall(fid, a.args), f.ret, span);
     },
@@ -2690,6 +2710,7 @@ function dummyDecl(name: string, span: Span): FunctionDecl {
     ret: noRet,
     body: Block { stmts: noStmts, span: span },
     contracts: [],
+    annotations: [],
     span: span
   };
 }
@@ -2867,6 +2888,9 @@ function checkArrow(
       }
     }
   }
+  if (hasResource(finalRet)) {
+    return Err(diag("E0450", span, "a closure cannot return a resource handle (it can only be passed to functions, borrowed)"));
+  }
   // Environment record, entry prologue, lifted function.
   let e = inner.env;
   const rid = e.records.length;
@@ -2975,7 +2999,10 @@ function funcValue(
   env: Env, fx: FnCtx, span: Span, ent: ValEnt, id: Ident, expP: Option<Type[]>, expR: Option<Type>
 ): Result<ExprOut, Diagnostic> {
   return match (ent) {
-    VFunc(fid) => wrapFunc(fx, span, fid),
+    VFunc(fid) => {
+      testGuard(fx.env.funcs[fid], span)?;
+      return wrapFunc(fx, span, fid);
+    },
     VGFunc(g) => {
       const gf = env.gfuncs[g];
       const tp = paramNameList(gf.decl.typeParams);

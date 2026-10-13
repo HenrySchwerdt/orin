@@ -4,11 +4,12 @@
 // where that is meaningful, so one mistake does not cascade.
 
 import { MProgram, MFunction, Operand, Instr, Terminator } from "../mir";
+import { Builtin } from "../hir";
 import {
   VerifyIssue, State, LState, HoleEntry, mk, ownedLike, leaky, kindName, holeEq,
-  KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead
+  KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen
 } from "./state";
-import { CRef, localClass, opClass } from "./wf";
+import { CRef, CHandle, localClass, opClass } from "./wf";
 
 export type Cx = {
   prog: MProgram;
@@ -150,6 +151,9 @@ function readLocal(cx: Cx, l: usize): Cx {
   }
   if (k == KMaybeDead || k == KMaybeLeak) {
     return err(cx, "use of " + nm(cx, l) + " which is dead or inconsistent on some incoming path");
+  }
+  if (k == KMaybeOpen) {
+    return err(cx, "use of resource handle " + nm(cx, l) + " which is open on some incoming paths and closed (or never opened) on others");
   }
   return cx;
 }
@@ -425,6 +429,58 @@ function mutateOwned(cx: Cx, x: usize, what: string): Cx {
   return c;
 }
 
+// ------------------------------------------------------------------ resource handles (v1.8, ADR-0025)
+// Lifecycle of a handle local: Dead --BFileOpen--> Open --BFileClose--> Dead. A parameter handle is Param
+// (borrowed): it can be used but not closed. Uses (call arguments, file builtins) need Open or Param.
+// A function must not return while a handle is Open (error, not a warning) and must not overwrite one.
+
+function isHandleLocal(c: Cx, l: usize): bool {
+  return localClass(c.f, l) == CHandle;
+}
+
+function openHandle(cx: Cx, d: usize, args: Operand[]): Cx {
+  let c = readAll(cx, args);
+  const k = kindOf(c, d);
+  if (k == KOpen || k == KMaybeOpen) {
+    c = err(c, "resource handle " + nm(c, d) + " is overwritten while it is (or may be) still open: the file would never be closed");
+  }
+  return def(c, d, KOpen, 0);
+}
+
+function closeHandle(cx: Cx, dst: Option<usize>, args: Operand[]): Cx {
+  let c = cx;
+  match (args[0]) {
+    OLocal(h) => {
+      const k = kindOf(c, h);
+      if (k == KOpen) {
+        c = setLs(c, h, KDead, 0);
+      } else if (k == KParam) {
+        c = err(c, "close of parameter " + nm(c, h) + ": a handle is closed only by the scope that opened it");
+      } else if (k == KMaybeOpen) {
+        c = err(c, "close of " + nm(c, h) + " which is not open on some incoming paths (it could be closed twice)");
+      } else {
+        c = err(c, "close of " + nm(c, h) + " which is not open (already closed, or never opened)");
+      }
+    },
+    _ => {}
+  }
+  return match (dst) {
+    None => c,
+    Some(d) => defResult(c, d)
+  };
+}
+
+function builtinStep(cx: Cx, dst: Option<usize>, b: Builtin, args: Operand[]): Cx {
+  return match (b) {
+    BFileOpen => match (dst) {
+      Some(d) => openHandle(cx, d, args),
+      None => cx
+    },
+    BFileClose => closeHandle(readAll(cx, args), dst, args),
+    _ => call(cx, dst, args)
+  };
+}
+
 export function step(cx: Cx, ins: Instr): Cx {
   match (ins) {
     ICopy(d, o) => {
@@ -459,8 +515,8 @@ export function step(cx: Cx, ins: Instr): Cx {
     ICall(dst, fi, args) => {
       return callOwned(cx, dst, args, cx.prog.functions[fi].paramOwned);
     },
-    IBuiltin(dst, _, args) => {
-      return call(cx, dst, args);
+    IBuiltin(dst, b, args) => {
+      return builtinStep(cx, dst, b, args);
     },
     IStrAppend(x, y) => {
       let c = readOp(cx, y);
@@ -568,6 +624,9 @@ export function stepTerm(cx: Cx, t: Terminator): Cx {
       while (i < c.st.ls.length) {
         if (leaky(c.st.ls[i].k)) {
           c = warn(c, "leak: " + nm(c, i) + " may still own a reference at return");
+        }
+        if (c.st.ls[i].k == KOpen || c.st.ls[i].k == KMaybeOpen) {
+          c = err(c, "resource handle " + nm(c, i) + " is not closed on this path: every opened file must be closed before the function returns");
         }
         i += 1;
       }

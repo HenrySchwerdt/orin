@@ -15,7 +15,7 @@
 import { Module, Item, parse } from "../syntax";
 import { Diagnostic, SourceMap, SourceFile } from "../diag";
 import { LoadedProgram, loadWithOverlay, normalizePath } from "../loader";
-import { checkWithIndex } from "../check";
+import { checkWithIndex, deprecationWarnings } from "../check";
 import { SemanticIndex } from "../hir";
 import { Workspace } from "./workspace";
 
@@ -33,7 +33,8 @@ export type Analysis = {
   revision: int;               // workspace revision this result was computed at
   entry: string;               // normalized entry path
   sm: SourceMap;               // every file read (index == Span.file); entry is file 0
-  diags: PathDiag[];
+  diags: PathDiag[];           // errors only
+  warnings: PathDiag[];        // warnings (W codes, ADR-0024), e.g. uses of deprecated symbols; never stop compilation
   program: Option<LoadedProgram>;   // Some when loading succeeded (even if checking failed)
   // Semantic index (defs/refs/types, hir/index.or). Some whenever loading succeeded; partial when
   // checking failed (see check/index.or).
@@ -46,16 +47,17 @@ export function indexAvailable(): bool {
   return true;
 }
 
-type CheckRes = { diags: Diagnostic[]; index: SemanticIndex; };
+type CheckRes = { diags: Diagnostic[]; warnings: Diagnostic[]; index: SemanticIndex; };
 
 // Isolation point for the checker API: the only place that calls the checker. The index is
 // produced even when checking fails (partial: type-dependent entries are missing then).
 function runCheck(prog: LoadedProgram, sm: SourceMap): CheckRes {
   const r = checkWithIndex(prog, sm);
   const none: Diagnostic[] = [];
+  const warns = deprecationWarnings(prog, r.index);
   return match (r.result) {
-    Ok(_) => CheckRes { diags: none, index: r.index },
-    Err(ds) => CheckRes { diags: ds, index: r.index }
+    Ok(_) => CheckRes { diags: none, warnings: warns, index: r.index },
+    Err(ds) => CheckRes { diags: ds, warnings: warns, index: r.index }
   };
 }
 
@@ -145,6 +147,7 @@ export function analyze(ws: Workspace, entryPath: string): Analysis {
       entry: entry,
       sm: sm,
       diags: convert(sm, lo.diags, prep.origLen),
+      warnings: [],
       program: None,
       index: None
     };
@@ -153,6 +156,7 @@ export function analyze(ws: Workspace, entryPath: string): Analysis {
   const cr = runCheck(prog, lo.sm);
   return Analysis {
     revision: ws.revision, entry: entry, sm: sm, diags: convert(sm, cr.diags, prep.origLen),
+    warnings: convert(sm, cr.warnings, prep.origLen),
     program: Some(prog), index: Some(cr.index)
   };
 }

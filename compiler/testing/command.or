@@ -1,0 +1,113 @@
+// `orin test [--filter <substring>] [--format=json] <file.or | package-dir>` (ADR-0024, docs/testing.md).
+//
+//   --filter S         run only the tests whose id (`<module>.<function>`) contains S
+//   --format=json      one JSON object on stdout (stable key order, no timings) instead of text
+//   --runtime DIR      directory with the C runtime (default: ./runtime; the `orin` launcher passes its own)
+//   --cc CMD           C compiler command, flags allowed (default: cc)
+//   --out-dir DIR      build here and keep the files (default: a temporary directory, removed afterwards)
+//   --keep             keep the temporary build directory
+//   --no-contracts     build without runtime contract checking (default: contract clauses are checked, ADR-0012)
+//   --timeout SECONDS  per test (default 10, 0 = unlimited; needs `timeout(1)`, silently skipped without it)
+//
+// Exit status: 0 all selected tests passed (or none exist), 1 a test failed or the program does not
+// compile, 2 usage.
+
+import { SourceMap, render } from "../diag";
+import { printDiagnosticsJson } from "../tools";
+import { quoteJson } from "../json";
+import { TestOpts, TestRun, runTests, reportText, reportJson, runOk } from "./runner";
+
+function usage(): int {
+  console.error("usage: orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] [--out-dir <dir>] [--keep] [--no-contracts] [--timeout <seconds>] <file.or | package-dir>");
+  return 2;
+}
+
+export function runTestCommand(args: string[]): int {
+  let filter = "";
+  let json = false;
+  let runtime = "runtime";
+  let cc = "cc";
+  let outDir = "";
+  let keep = false;
+  let contracts = true;
+  let timeout: int = 10;
+  let entry = "";
+  let i: usize = 0;
+  while (i < args.length) {
+    const a = args[i];
+    i += 1;
+    if (a == "--format=json") {
+      json = true;
+    } else if (a == "--keep") {
+      keep = true;
+    } else if (a == "--no-contracts") {
+      contracts = false;
+    } else if (a == "--filter" || a == "--runtime" || a == "--cc" || a == "--out-dir" || a == "--timeout") {
+      if (i >= args.length) {
+        return usage();
+      }
+      const v = args[i];
+      i += 1;
+      if (a == "--filter") {
+        filter = v;
+      } else if (a == "--runtime") {
+        runtime = v;
+      } else if (a == "--cc") {
+        cc = v;
+      } else if (a == "--out-dir") {
+        outDir = v;
+      } else {
+        const n = parseInt(v);
+        if (n.isNone() || n.unwrap() < 0) {
+          console.error("error: --timeout needs a number of seconds");
+          return 2;
+        }
+        timeout = n.unwrap();
+      }
+    } else if (a.startsWith("-")) {
+      console.error("error: unknown option " + a);
+      return usage();
+    } else if (entry.length == 0) {
+      entry = a;
+    } else {
+      return usage();
+    }
+  }
+  if (entry.length == 0) {
+    return usage();
+  }
+  const r = runTests(TestOpts {
+    entry: entry, filter: filter, runtime: runtime, cc: cc, outDir: outDir, keep: keep, timeout: timeout, contracts: contracts, root: ""
+  });
+  return finish(r, json);
+}
+
+function finish(r: TestRun, json: bool): int {
+  if (r.diags.length > 0) {
+    if (json) {
+      printDiagnosticsJson(r.sm, r.diags);
+    } else {
+      for (const d of r.diags) {
+        console.error(render(r.sm, d));
+      }
+    }
+    return 1;
+  }
+  if (r.error.length > 0) {
+    if (json) {
+      console.log("{\"ok\":false,\"error\":" + quoteJson(r.error) + "}");
+    } else {
+      console.error("error: " + r.error);
+    }
+    return 1;
+  }
+  if (json) {
+    console.log(reportJson(r));
+  } else {
+    for (const d of r.warnings) {
+      console.error(render(r.sm, d));
+    }
+    console.log(reportText(r));
+  }
+  return runOk(r) ? 0 : 1;
+}

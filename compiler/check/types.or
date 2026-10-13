@@ -10,13 +10,19 @@ import { Span, Diagnostic, diag } from "../diag";
 import { Ident, TypeExpr, TNamed, TArray, TFn, TypeDeclBody, DAlias, DRecord, DUnion, FunctionDecl, FieldDecl, VariantDecl } from "../syntax";
 import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import { intNamed, is128, classSuffix } from "./ints";
+import { hasResource, resourceNested } from "./resources";
 import {
-  Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, OpaqueBound, findType, findInst, originOf, isVoid,
+  Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, OpaqueBound, findType, findInst, originOf, isVoid,
   tysKey, mapGenType, isMapKeyType, showType
 } from "./env";
 
 export const CYCLE_MSG: string = "type alias is defined in terms of itself";
 export const MAX_DEPTH: usize = 32;
+
+// E0450 (ADR-0025): a resource type (`File`) cannot be part of another type.
+export function resourceIn(span: Span, what: string): Diagnostic {
+  return diag("E0450", span, "a resource type cannot be " + what + "; a resource handle can only be a parameter (borrowed)");
+}
 
 export type TScope = { unit: usize; names: string[]; tys: Type[]; depth: usize; };
 export type TyOut = { env: Env; ty: Type; };
@@ -88,6 +94,9 @@ export function resolveTy(env: Env, sc: TScope, te: TypeExpr, voidOk: bool, stac
   return match (te.kind) {
     TArray(inner) => {
       const r = resolveTy(env, sc, inner, false, stack)?;
+      if (hasResource(r.ty)) {
+        return Err(resourceIn(te.span, "an array element"));
+      }
       return ok(r.env, TyArray(r.ty));
     },
     TNamed(name, args) => resolveNamed(env, sc, te, name, args, voidOk, stack),
@@ -100,6 +109,9 @@ export function resolveTy(env: Env, sc: TScope, te: TypeExpr, voidOk: bool, stac
         tys.push(r.ty);
       }
       const rr = resolveTy(cur, sc, ret, true, stack)?;
+      if (hasResource(rr.ty)) {
+        return Err(resourceIn(te.span, "the result of a function type"));
+      }
       return ok(rr.env, TyFn(tys, rr.ty));
     }
   };
@@ -156,6 +168,9 @@ function resolveNamed(
       return Err(diag("E0400", te.span, "`Option` takes exactly one type argument"));
     }
     const t = resolveTy(env, sc, args[0], false, stack)?;
+    if (hasResource(t.ty)) {
+      return Err(resourceIn(te.span, "the type argument of `Option`"));
+    }
     return ok(t.env, TyOption(t.ty));
   }
   if (n == "Result") {
@@ -164,6 +179,9 @@ function resolveNamed(
     }
     const t = resolveTy(env, sc, args[0], true, stack)?;
     const e = resolveTy(t.env, sc, args[1], false, stack)?;
+    if (hasResource(t.ty) || hasResource(e.ty)) {
+      return Err(resourceIn(te.span, "a type argument of `Result`"));
+    }
     return ok(e.env, TyResult(t.ty, e.ty));
   }
   const found = findType(env.units[sc.unit].scope, n);
@@ -201,6 +219,12 @@ function resolveNamed(
         return Err(diag("E0408", te.span, "generic interfaces are not supported in Orin 1.0 (ADR-0019)"));
       }
       return ok(env, TyIface(i));
+    },
+    EntBuiltin(t) => {
+      if (args.length > 0) {
+        return Err(diag("E0400", te.span, "type `" + n + "` takes no type arguments"));
+      }
+      return ok(env, t);
     }
   };
 }
@@ -250,6 +274,9 @@ function resolveGeneric(
   for (const a of args) {
     const r = resolveTy(cur, sc, a, false, stack)?;
     cur = r.env;
+    if (hasResource(r.ty)) {
+      return Err(resourceIn(a.span, "a type argument of `" + name.name + "`"));
+    }
     tys.push(r.ty);
   }
   return match (gt.decl.body) {
@@ -273,6 +300,11 @@ function resolveGeneric(
 // The record / union instance of generic type `g` at `args`, created on first use. The instance
 // is registered before its fields are resolved so recursive types terminate.
 export function instType(env: Env, g: usize, args: Type[], depth: usize, span: Span): Result<TyOut, Diagnostic> {
+  for (const a of args) {
+    if (hasResource(a)) {
+      return Err(resourceIn(span, "a type argument of a generic type (it was inferred as a resource)"));
+    }
+  }
   const gt = env.gtypes[g];
   const isRec = match (gt.decl.body) {
     DRecord(_) => true,
@@ -378,6 +410,9 @@ export function resolveSig(env: Env, sc: TScope, decl: FunctionDecl): Result<Sig
   match (decl.ret) {
     Some(te) => {
       const r = resolveType(cur, sc, te, true)?;
+      if (hasResource(r.ty)) {
+        return Err(diag("E0450", te.span, "a function cannot return a resource; a resource handle can only be passed to functions (borrowed)"));
+      }
       cur = r.env;
       ret = r.ty;
     },
@@ -417,6 +452,11 @@ function keyClassFunc(env: Env, qname: string, args: Type[]): Option<usize> {
 }
 
 export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: Span): Result<FuncOut, Diagnostic> {
+  for (const a of args) {
+    if (hasResource(a)) {
+      return Err(resourceIn(span, "a type argument of a generic function (it was inferred as a resource; a callback or generic function cannot return or wrap a handle)"));
+    }
+  }
   const redirect = keyClassFunc(env, env.gfuncs[g].qname, args);
   if (redirect.isSome()) {
     return Ok(FuncOut { env: env, fid: redirect.unwrap() });

@@ -20,8 +20,8 @@ Status: accepted (2026-10-13). After the core is complete the language surface i
 | **Integers** | full spec-02 set: `i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 isize usize`, `int = i64`; literals adopt expected type; explicit conversions only (`x.toI32()` … trapping, `wrapping*`/`checked*`/`saturating*` methods); overflow traps by default. **Implemented (ADR-0022)** except `i128`/`u128`, which are rejected with E0431 (64-bit slots). **Decided with the project owner (2026-10-13): 128-bit integers are post-1.0** — an additive extension, the language freeze does not wait for them. |
 | **Interfaces** (OPEN #4) | **nominal**: `interface Shape { area(): float; }`, conformance declared with `class Circle implements Shape`. Two uses: (1) generic bounds `function total<T extends Shape>(xs: T[])` — static dispatch, monomorphised; (2) interface-typed values `const s: Shape = circle` — **explicit dynamic dispatch** via a vtable object; cost documented (one indirect call, one box). No default methods, no interface inheritance, no generic interfaces in 1.0 core (post-1.0). |
 | **String interpolation** (OPEN) | TypeScript template literals `` `Hello ${name}, you are ${age}` ``; interpolated expressions must be `string`, integer, float or `bool` (implicit `toString` only for these); other types → error (call `.toString()` explicitly). One canonical form; `+` concatenation stays valid. **Implemented (ADR-0022)** |
-| **Annotations** (spec 05) | 1.0 core ships compiler built-ins only: `@Test` (with `orin test` runner), `@Deprecated("msg")`, `@Inline`. User-defined annotation processors are **post-1.0**. Contract clauses are separate constructs (ADR-0012). |
-| **Resources** (spec 06) | resource types are non-copyable handles: may be passed to functions (borrowed) but not stored in values, returned, captured by closures or put in collections; scope API `File.open(path, f => ...)` releases deterministically, also on `Err`/trap paths. `std:fs` streaming file API built on it. |
+| **Annotations** (spec 05) | 1.0 core ships compiler built-ins only: `@Test` (with `orin test` runner), `@Deprecated("msg")`, `@Inline`. User-defined annotation processors are **post-1.0**. Contract clauses are separate constructs (ADR-0012). **Done (ADR-0024, 2026-10-13):** `@Test` + `orin test` + `std:test`, `@Deprecated` (warning W0440, LSP tag, API snapshot), `@Inline` (both backends). |
+| **Resources** (spec 06) — **done, ADR-0025** | resource types are non-copyable handles: may be passed to functions (borrowed) but not stored in values, returned, captured by closures or put in collections; scope API `File.open(path, f => ...)` releases deterministically, also on `Err`/trap paths. `std:fs` streaming file API built on it (spelled `withFile(path, mode, f => ...)`, ADR-0025; `std:fs` is unstable until capabilities). |
 | **Graph<T>/GraphId<T>** | std library type (Orin) with generational, graph-tagged IDs; stale/foreign IDs → `Err` (spec 06 cycle rule). |
 | **Packages** (spec 04) | `orin.toml` manifest: package name, module architecture rules (`allowed_dependencies`), entry point; `orin build`/`check` from a package root. No registry/versions in 1.0 core (post-1.0). |
 | **std** | `std:fs`, `std:process`, `std:io`, `std:math`, `std:path`, `std:time`, `std:json` (`parse` into a `Json` union + typed helpers; codegen-based `parse<T>` needs annotations → post-1.0), `std:map`. HTTP is post-1.0. |
@@ -33,6 +33,17 @@ Status: accepted (2026-10-13). After the core is complete the language surface i
 User annotation processors/codegen, generic interfaces & bounds beyond single interfaces, default
 methods, `Shared<T>` (atomic RC) values, async/await syntax, package registry/versioning, HTTP,
 incremental analysis engine, `i128`/`u128` (additive; E0431 until then), inheritance (never planned).
+
+**Bit operators — post-1.0, reserved now** (decided with the project owner, 2026-10-13). `&`, `|`,
+`^`, `~`, `<<`, `>>` on integers are an additive extension (today they are errors on numbers, so no
+program can change meaning). Reserved semantics so nothing else claims these tokens:
+- integer operands only, same type on both sides (no implicit width mixing, like `+`);
+- shifts by a negative amount or by >= the bit width **trap** (no C-style undefined behaviour);
+  `>>` is arithmetic on signed, logical on unsigned types;
+- `|` keeps its meaning in type position (unions), `&` stays reserved in type position for
+  multiple bounds (`T extends A & B`, E0408 today);
+- the lexer never produces a `>>` token in type context (`Box<Box<int>>`, ADR-0026); a shift
+  operator, when added, is recognised in expression context only.
 
 ## Definition of "core complete"
 All rows above implemented with conformance tests (default + `tests/next`), formatter/LSP/MCP
