@@ -32,6 +32,8 @@ PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("te
                 os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or"),
                 # interfaces (ADR-0019) are syntax beyond Orin-B
                 os.path.join("tests", "fmt", "interfaces.in.or"), os.path.join("tests", "fmt", "interfaces.out.or"),
+                # generic classes (ADR-0026) are syntax beyond Orin-B
+                os.path.join("tests", "fmt", "genclasses.in.or"), os.path.join("tests", "fmt", "genclasses.out.or"),
                 # template literals and integer literals above i64 max (ADR-0022) are lexical errors (E0100) in Stage 0
                 os.path.join("tests", "fmt", "templates.in.or"), os.path.join("tests", "fmt", "templates.out.or"),
                 os.path.join("tests", "parse_edge", "ok_template_nested.or")}

@@ -1,0 +1,120 @@
+// Mutation inference for generic classes (ADR-0009 + ADR-0026): inferred once on the abstract body, the
+// same for every instantiation; mutating methods with and without a result; mutation through `this`
+// methods, through fields that are themselves generic class values, and `?` inside a mutating method.
+class Counter {
+  n: int = 0;
+  bump(): void {
+    this.n += 1;
+  }
+}
+
+class Stack<T> {
+  items: T[] = [];
+  hist: Counter = new Counter();
+  limit: usize;
+  constructor(limit: usize) {
+    this.limit = limit;
+  }
+  // mutating, void
+  push(x: T): void {
+    this.items.push(x);
+    this.hist.bump();
+  }
+  // mutating through another mutating method of this class
+  pushTwice(x: T): void {
+    this.push(x);
+    this.push(x);
+  }
+  // mutating with a result
+  pop(): Option<T> {
+    return this.items.pop();
+  }
+  // mutating with a result, `?` and early error returns
+  tryPush(x: T): Result<usize, string> {
+    this.check()?;
+    this.items.push(x);
+    return Ok(this.items.length);
+  }
+  tryPop(): Result<T, string> {
+    const v = this.items.pop();
+    return match (v) {
+      Some(x) => Ok(x),
+      None => Err("empty")
+    };
+  }
+  tryPopTwice(): Result<T, string> {
+    this.tryPop()?;
+    return this.tryPop();
+  }
+  // not mutating
+  check(): Result<void, string> {
+    if (this.items.length >= this.limit) {
+      return Err("full");
+    }
+    return Ok();
+  }
+  size(): usize {
+    return this.items.length;
+  }
+  pushes(): int {
+    return this.hist.n;
+  }
+}
+
+// a generic class that mutates a field of another generic class
+class Pump<T> {
+  target: Stack<T>;
+  fed: int = 0;
+  constructor(target: Stack<T>) {
+    this.target = target;
+  }
+  feed(x: T): void {
+    this.target.push(x);
+    this.fed += 1;
+  }
+  peek(): usize {
+    return this.target.size();
+  }
+}
+
+function describe(r: Result<usize, string>): string {
+  return match (r) {
+    Ok(n) => "ok" + n.toString(),
+    Err(e) => e
+  };
+}
+
+function main(): void {
+  let s = new Stack<int>(3);
+  s.push(1);
+  s.pushTwice(2);
+  console.log(s.size().toString() + " " + s.pushes().toString());
+  const top = s.pop();
+  console.log(top.unwrap().toString() + " " + s.size().toString());
+  console.log(describe(s.tryPush(9)));
+  console.log(describe(s.tryPush(10)));
+  console.log(s.size().toString());
+  // the same method on another instantiation behaves identically
+  let t = new Stack<string>(1);
+  console.log(describe(t.tryPush("a")));
+  console.log(describe(t.tryPush("b")));
+  console.log(t.size().toString());
+  // `?` that forwards the error of the first call; the receiver changes made before it stay
+  let u = new Stack<int>(5);
+  u.push(1);
+  console.log(match (u.tryPopTwice()) { Ok(v) => v.toString(), Err(e) => e });
+  console.log(u.size().toString());
+  u.push(1);
+  u.push(2);
+  console.log(match (u.tryPopTwice()) { Ok(v) => v.toString(), Err(e) => e });
+  console.log(u.size().toString());
+  // mutation through a field holding a generic class value
+  let p = new Pump(new Stack<int>(9));
+  p.feed(1);
+  p.feed(2);
+  console.log(p.fed.toString() + " " + p.peek().toString() + " " + p.target.size().toString());
+  // copies are independent
+  const q = p;
+  p.feed(3);
+  console.log(q.peek().toString() + " " + p.peek().toString());
+}

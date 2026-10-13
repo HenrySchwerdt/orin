@@ -1,0 +1,84 @@
+// Generic declarations checked abstractly (ADR-0007) and the generic-class pieces that depend on it
+// (ADR-0026). Beyond Orin-B.
+//
+// A type parameter is checked as an *opaque* type: a field-less record in a scratch copy of the
+// environment (`T extends I`: an opaque type that carries the interface). `abstractInfo` builds the
+// FuncInfo of a generic function in that scratch environment; for the constructor and the instance
+// methods of a generic class the FuncInfo also carries the class mode (ADR-0009), so private members,
+// `this` and mutation inference work in the abstract check exactly as in an ordinary class.
+
+import { Diagnostic } from "../diag";
+import { Ident, FunctionDecl } from "../syntax";
+import { Type } from "../hir";
+import { Env, FuncInfo } from "./env";
+import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig } from "./types";
+import { boundIface } from "./classes";
+
+export type Opaques = { env: Env; names: string[]; tys: Type[]; };
+
+// One opaque type per type parameter, appended to a scratch copy of the environment.
+export function opaquesFor(env: Env, params: Ident[]): Opaques {
+  let e = env;
+  let names: string[] = [];
+  let tys: Type[] = [];
+  for (const p of params) {
+    const o = mkOpaque(e, p.name);
+    e = o.env;
+    names.push(p.name);
+    tys.push(o.ty);
+  }
+  return Opaques { env: e, names: names, tys: tys };
+}
+
+// Like `opaquesFor`, with the bounds `T extends Shape` (ADR-0019) of `bounds` (parallel to `params`): a
+// bounded parameter gets an opaque type that carries the interface. `unit` is the unit that names the bounds.
+export function opaquesBounded(env: Env, unit: usize, params: Ident[], bounds: Option<Ident>[]): Result<Opaques, Diagnostic> {
+  let e = env;
+  let names: string[] = [];
+  let tys: Type[] = [];
+  let k: usize = 0;
+  while (k < params.length) {
+    const p = params[k];
+    let o = mkOpaque(e, p.name);
+    if (k < bounds.length && bounds[k].isSome()) {
+      const i = boundIface(e, unit, bounds[k].unwrap())?;
+      o = mkOpaqueBound(e, p.name, i);
+    }
+    e = o.env;
+    names.push(p.name);
+    tys.push(o.ty);
+    k += 1;
+  }
+  return Ok(Opaques { env: e, names: names, tys: tys });
+}
+
+export function opaquesForFn(env: Env, unit: usize, decl: FunctionDecl): Result<Opaques, Diagnostic> {
+  return opaquesBounded(env, unit, decl.typeParams, decl.bounds);
+}
+
+export type AbsInfo = { env: Env; f: FuncInfo; };
+
+// The FuncInfo of generic function `g` with opaque type parameters, in a scratch environment. For the
+// constructor and methods of a generic class the lowered result types are not needed (the abstract
+// check keeps no HIR), so `ret` is the source result type; a constructor's `srcRet` is void.
+export function abstractInfo(env: Env, g: usize): Result<AbsInfo, Diagnostic> {
+  const gf = env.gfuncs[g];
+  const op = opaquesForFn(env, gf.unit, gf.decl)?;
+  const sc = scopeOf(gf.unit, op.names, op.tys);
+  const sig = resolveSig(op.env, sc, gf.decl)?;
+  const f = FuncInfo {
+    unit: gf.unit,
+    qname: gf.qname,
+    decl: gf.decl,
+    params: sig.params,
+    paramLocals: sig.locals,
+    ret: sig.ret,
+    tpNames: op.names,
+    tpTys: op.tys,
+    depth: 0,
+    mode: gf.mode,
+    cls: gf.cls,
+    srcRet: gf.mode == 1 ? TyVoid : sig.ret
+  };
+  return Ok(AbsInfo { env: sig.env, f: f });
+}

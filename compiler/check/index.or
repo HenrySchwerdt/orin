@@ -126,6 +126,24 @@ function renderTE(t: TypeExpr): string {
   };
 }
 
+// `<T extends Shape, U>`: type parameters with their bounds (generic classes, ADR-0026).
+function tpListB(ps: Ident[], bounds: Option<Ident>[]): string {
+  if (ps.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < ps.length) {
+    let t = ps[i].name;
+    if (i < bounds.length && bounds[i].isSome()) {
+      t += " extends " + bounds[i].unwrap().name;
+    }
+    parts.push(t);
+    i += 1;
+  }
+  return "<" + parts.join(", ") + ">";
+}
+
 function tpList(ps: Ident[]): string {
   if (ps.length == 0) {
     return "";
@@ -471,6 +489,12 @@ function paramsText(ps: Param[]): string {
 function methodMutating(hir: Option<Program>, qname: string, declRet: Option<TypeExpr>): bool {
   match (hir) {
     Some(h) => {
+      // the checker's table (the only source for methods of generic classes, which have no function until used)
+      for (const n of h.mutating) {
+        if (n == qname) {
+          return true;
+        }
+      }
       for (const f of h.functions) {
         if (f.name == qname && f.paramCount > 0 && f.locals[0].name == "this$") {
           match (f.ret) {
@@ -504,7 +528,7 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
   let tq = p.tq;
   let tqDefs = p.tqDefs;
   const id = w.defs.length;
-  let cdetail = "class " + c.name.name;
+  let cdetail = "class " + c.name.name + tpListB(c.typeParams, c.bounds);
   if (c.impls.length > 0) {
     let ins: string[] = [];
     for (const i of c.impls) {
@@ -1178,10 +1202,16 @@ function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
         return x;
       }
       const f = p.functions[fid];
+      // instances of generic functions / generic-class methods are named `unit.C.m<args>`
+      let fname = f.name;
+      const lt = fname.indexOf("<");
+      if (lt.isSome()) {
+        fname = fname.substring(0, lt.unwrap());
+      }
       let dot: Option<usize> = None;
       let di: usize = 0;
-      while (di < f.name.length) {
-        if (f.name.charCodeAt(di) == 46) {
+      while (di < fname.length) {
+        if (fname.charCodeAt(di) == 46) {
           dot = Some(di);
         }
         di += 1;
@@ -1189,8 +1219,8 @@ function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
       if (dot.isNone()) {
         return x;
       }
-      const mname = f.name.substring(dot.unwrap() + 1, f.name.length);
-      const cname = f.name.substring(0, dot.unwrap());
+      const mname = fname.substring(dot.unwrap() + 1, fname.length);
+      const cname = fname.substring(0, dot.unwrap());
       if (mname == "constructor") {
         return x;
       }
@@ -1687,6 +1717,23 @@ function boundDefs(c: Ctx, hirName: string): usize[] {
             }
           }
         },
+        IClass(cd) => {
+          // the constructor and instance methods of a generic class (ADR-0026) carry the bounds of the class
+          if (base.startsWith(u.name + "." + cd.name.name + ".")) {
+            for (const b of cd.bounds) {
+              match (b) {
+                Some(id) => {
+                  const t = c.tabs[ui];
+                  const d = findName(t.tNames, t.tDefs, id.name);
+                  if (d.isSome()) {
+                    out.push(d.unwrap());
+                  }
+                },
+                None => {}
+              }
+            }
+          }
+        },
         _ => {}
       }
     }
@@ -1884,17 +1931,22 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
             }
           }
           // HIR functions of a class: the constructor, then the methods in member order.
+          // A generic class (ADR-0026): its constructor and instance methods are generic functions (instances
+          // come after the ordinary functions); only its static methods are in this sequence.
+          const genericCls = cd.typeParams.length > 0;
           let ctorHf: Option<Function> = None;
           let explicitCtor = false;
-          match (hir) {
-            Some(h) => {
-              if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + ".constructor") {
-                ctorHf = Some(h.functions[hn]);
-              }
-            },
-            None => {}
+          if (!genericCls) {
+            match (hir) {
+              Some(h) => {
+                if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + ".constructor") {
+                  ctorHf = Some(h.functions[hn]);
+                }
+              },
+              None => {}
+            }
+            hn += 1;
           }
-          hn += 1;
           for (const m of cd.members) {
             match (m) {
               MCtor(_) => { explicitCtor = true; },
@@ -1902,11 +1954,26 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
             }
           }
           let dk = did + 1 + classFieldCount(cd);
-          const none: string[] = [];
-          w.tps = none;
+          let ctps: string[] = [];
+          for (const t of cd.typeParams) {
+            ctps.push(t.name);
+          }
+          w.tps = ctps;
+          for (const b of cd.bounds) {
+            match (b) {
+              Some(id) => {
+                const bd = lookupType(w, c, id.name);
+                if (bd.isSome()) {
+                  w = addRef(w, id.span, bd.unwrap());
+                }
+              },
+              None => {}
+            }
+          }
           for (const m of cd.members) {
             match (m) {
               MField(f) => {
+                w.tps = ctps;
                 w = typeRefs(w, c, f.ty);
                 match (f.init) {
                   Some(ie) => { w = walkExpr(w, c, ie); },
@@ -1915,12 +1982,13 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
               },
               MCtor(k) => {
                 let ps: Param[] = [];
+                w.tps = ctps;
                 for (const cp of k.params) {
                   w = typeRefs(w, c, cp.ty);
                   ps.push(Param { name: cp.name, ty: cp.ty, span: cp.span });
                 }
                 const fd = FunctionDecl {
-                  exported: false, name: cd.name, typeParams: [], bounds: [], params: ps,
+                  exported: false, name: cd.name, typeParams: cd.typeParams, bounds: [], params: ps,
                   ret: None, body: k.body, contracts: allCtorClauses(cd, k), span: k.span
                 };
                 match (ctorHf) {
@@ -1936,21 +2004,24 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
               },
               MMethod(md) => {
                 let hf: Option<Function> = None;
-                match (hir) {
-                  Some(h) => {
-                    if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
-                      hf = Some(h.functions[hn]);
-                      w.cur = Some(dk);
-                      w = hBlock(w, c, h.functions[hn].body, true);
-                      w.cur = None;
-                    }
-                  },
-                  None => {}
+                const inSeq = !genericCls || md.isStatic;
+                if (inSeq) {
+                  match (hir) {
+                    Some(h) => {
+                      if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
+                        hf = Some(h.functions[hn]);
+                        w.cur = Some(dk);
+                        w = hBlock(w, c, h.functions[hn].body, true);
+                        w.cur = None;
+                      }
+                    },
+                    None => {}
+                  }
+                  hn += 1;
                 }
-                hn += 1;
                 const fd = FunctionDecl {
-                  exported: false, name: md.name, typeParams: [], bounds: [], params: md.params, ret: md.ret, body: md.body,
-                  contracts: md.contracts, span: md.span
+                  exported: false, name: md.name, typeParams: md.isStatic ? [] : cd.typeParams, bounds: [], params: md.params,
+                  ret: md.ret, body: md.body, contracts: md.contracts, span: md.span
                 };
                 w = walkFunction(w, c, fd, dk, hf);
                 dk += 1;

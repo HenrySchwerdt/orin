@@ -518,6 +518,64 @@ def run(exe):
     check(any(x["name"] == "Shape" and x["kind"] == 11 and [k["name"] for k in x["children"]] == ["area"] for x in syms),
           "interfaces: document symbol Shape(interface) with child area (got %r)" % (syms,))
 
+    # ---- generic classes across files (ADR-0026): definition, hover, references, rename -----------
+    glib = os.path.join(tmp, "glib.or")
+    gmain = os.path.join(tmp, "gmain.or")
+    glib_text = ("export interface Shape {\n  area(): int;\n}\n\n"
+                 "export class Cell<T extends Shape> {\n  items: T[] = [];\n"
+                 "  add(x: T): void {\n    this.items.push(x);\n  }\n"
+                 "  total(): int {\n    let t = 0;\n    for (const i of this.items) {\n      t += i.area();\n    }\n    return t;\n  }\n}\n")
+    gmain_text = ('import { Shape, Cell } from "./glib";\n\n'
+                  "class Sq implements Shape {\n  constructor(public s: int) {}\n"
+                  "  area(): int {\n    return this.s * this.s;\n  }\n}\n\n"
+                  "function main(): void {\n"
+                  "  let c = new Cell<Sq>();\n"
+                  "  c.add(new Sq(2));\n"
+                  "  console.log(c.total().toString());\n"
+                  "  console.log(c.items.length.toString());\n"
+                  "}\n")
+    with open(glib, "w") as f:
+        f.write(glib_text)
+    open_doc(c, gmain, gmain_text)
+    d = sync(c, uri_of(gmain))
+    check(d == [], "generic classes: gmain.or has no diagnostics (got %r)" % (d,))
+    add = pos_of(gmain_text, "add(new", 0, 1)
+    r = c.request("textDocument/definition", td(gmain, add))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(glib) and loc["range"]["start"] == pos_of(glib_text, "add", 0),
+          "generic classes: definition of a method call jumps to the generic class's method (got %r)" % (loc,))
+    r = c.request("textDocument/definition", td(gmain, pos_of(gmain_text, "Cell<Sq>", 0, 1)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(glib) and loc["range"]["start"] == pos_of(glib_text, "Cell", 0),
+          "generic classes: definition of `new Cell<Sq>` jumps to the class (got %r)" % (loc,))
+    r = c.request("textDocument/hover", td(gmain, add))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("mut method add(x: T): void" in hv, "generic classes: hover shows the inferred mutability (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(gmain, pos_of(gmain_text, "total()", 0, 1)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("method total(): int" in hv and "mut" not in hv, "generic classes: non-mutating method hover (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(gmain, pos_of(gmain_text, "Cell<Sq>", 0, 1)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("class Cell<T extends Shape>" in hv, "generic classes: hover on the class shows type parameters and bounds (got %r)" % (hv,))
+    r = c.request("textDocument/references", {**td(gmain, add), "context": {"includeDeclaration": True}})
+    locs = r.get("result") or []
+    check(len(locs) == 2 and uri_of(glib) in set(l["uri"] for l in locs), "generic classes: method references (decl + call) (got %d)" % len(locs))
+    r = c.request("textDocument/references", {**td(gmain, pos_of(gmain_text, "items.length", 0)), "context": {"includeDeclaration": True}})
+    locs = r.get("result") or []
+    check(len(locs) >= 3, "generic classes: field references (decl, this.items x2, c.items) (got %d)" % len(locs))
+    r = c.request("textDocument/definition", td(gmain, pos_of(gmain_text, "items.length", 0)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(glib) and loc["range"]["start"] == pos_of(glib_text, "items", 0),
+          "generic classes: definition of a field of an instance (got %r)" % (loc,))
+    r = c.request("textDocument/definition", td(glib, pos_of(glib_text, "extends Shape", 0, 9)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(glib) and loc["range"]["start"] == pos_of(glib_text, "Shape", 0),
+          "generic classes: definition of a class type parameter bound (got %r)" % (loc,))
+    r = c.request("textDocument/rename", {**td(gmain, add), "newName": "put"})
+    changes = (r.get("result") or {}).get("changes", {})
+    check(len(changes.get(uri_of(glib), [])) == 1 and len(changes.get(uri_of(gmain), [])) == 1,
+          "generic classes: rename method in both files (%r)" % ({k: len(v) for k, v in changes.items()},))
+
     # ---- shutdown / exit --------------------------------------------------------------------
     r = c.request("shutdown", None)
     check(r.get("result", 0) is None and "error" not in r, "shutdown: null result")
