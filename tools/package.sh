@@ -13,6 +13,7 @@ cp runtime/*.h runtime/*.c "$OUT/lib/orin/runtime/"
 cp -r examples "$OUT/examples"
 cp build/bootstrap/stage2.c "$OUT/share/orin/orin-seed.c"   # self-hosted compiler as C
 cp README.md CHANGELOG.md "$OUT/"
+mkdir -p "$OUT/docs/assets" && cp docs/assets/orin-logo-256.png "$OUT/docs/assets/"
 [ -f LICENSE ] && cp LICENSE "$OUT/"
 echo "$VER" > "$OUT/VERSION"
 tar -C build/dist -czf "build/dist/$NAME.tar.gz" "$NAME"
