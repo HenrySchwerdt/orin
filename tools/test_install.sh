@@ -113,7 +113,7 @@ if out=$(CC=orin-no-such-cc "$T/b6/orin" doctor 2>&1); then fail "doctor must fa
 case $out in *"[FAIL] C compiler"*"fix:"*) ok "orin doctor fails with an actionable fix when the compiler is missing" ;; *) fail "doctor fail output" "$out" ;; esac
 
 # 9. doctor: broken layout
-cp -R "$H/current" "$T/broken"; rm -rf "$T/broken/lib"
+mkdir "$T/broken"; cp -R "$H/current/." "$T/broken"; rm -rf "$T/broken/lib"
 if out=$("$T/broken/bin/orin" doctor 2>&1); then fail "doctor must fail on a broken layout" "$out"; fi
 case $out in *"install layout: missing"*) ok "orin doctor detects a broken layout" ;; *) fail "layout message" "$out" ;; esac
 

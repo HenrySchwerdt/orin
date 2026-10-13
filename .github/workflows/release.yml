@@ -1,6 +1,6 @@
 name: release
 
-# Tag push (v*): build all four targets, publish a GitHub pre-release, update the Homebrew tap.
+# Tag push (v*): build all four targets and publish a GitHub pre-release.
 # Manual run: same build; with dry_run (the default) nothing is published, the packages stay as
 # workflow artifacts. Untick dry_run to publish release v<version> from the selected ref.
 on:
@@ -13,7 +13,7 @@ on:
         required: true
         default: "0.0.0-dryrun"
       dry_run:
-        description: "Dry run: build, package, test and render everything, but do not publish a release or touch the tap"
+        description: "Dry run: build, package, test and render everything, but do not publish a release"
         type: boolean
         default: true
 
@@ -64,15 +64,13 @@ jobs:
             build/dist/*.tar.gz.sha256
           if-no-files-found: error
 
-  # Combines the four packages: SHA256SUMS, an install.sh run against the real combined checksums,
-  # the rendered Homebrew formula. Publishes the GitHub pre-release unless this is a dry run.
+  # Combines the four packages: SHA256SUMS, an install.sh run against the real combined checksums.
+  # Publishes the GitHub pre-release unless this is a dry run.
   release:
     needs: package
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    outputs:
-      tap: ${{ steps.tap.outputs.enabled }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -102,20 +100,10 @@ jobs:
           test "$("$ORIN_BIN_DIR/orin" --version)" = "$ver"
           "$ORIN_BIN_DIR/orin" doctor
           sh install.sh --uninstall
-      - name: Render the Homebrew formula
-        run: |
-          python3 tools/test_render_homebrew.py
-          python3 tools/render_homebrew.py --version "${TAG#v}" --sums dist/SHA256SUMS -o orin.rb
-          ruby -c orin.rb
-          cat orin.rb
       - uses: actions/upload-artifact@v4
         with:
           name: SHA256SUMS
           path: dist/SHA256SUMS
-      - uses: actions/upload-artifact@v4
-        with:
-          name: homebrew-formula
-          path: orin.rb
       - name: Create GitHub pre-release
         if: env.DRY_RUN != 'true'
         env:
@@ -127,37 +115,4 @@ jobs:
       - name: Dry run summary
         if: env.DRY_RUN == 'true'
         run: |
-          echo "Dry run, nothing published. Packages, SHA256SUMS and the formula are in the workflow artifacts." | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Is the Homebrew tap configured?
-        id: tap
-        env:
-          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          if [ "$DRY_RUN" != 'true' ] && [ -n "$TOKEN" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else echo "enabled=false" >> "$GITHUB_OUTPUT"; fi
-
-  # Skipped unless the secret HOMEBREW_TAP_TOKEN exists (and this is not a dry run).
-  # The tap repository HenrySchwerdt/homebrew-orin must exist first; see docs/install.md.
-  homebrew:
-    needs: release
-    if: needs.release.outputs.tap == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: homebrew-formula
-          path: formula
-      - name: Push the formula to the tap
-        env:
-          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          git clone "https://x-access-token:${TOKEN}@github.com/HenrySchwerdt/homebrew-orin.git" tap
-          mkdir -p tap/Formula
-          cp formula/orin.rb tap/Formula/orin.rb
-          cd tap
-          git add Formula/orin.rb
-          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
-          git config user.name "orin-release[bot]"
-          git config user.email "orin-release@users.noreply.github.com"
-          git commit -m "orin ${TAG#v}"
-          git push origin HEAD
+          echo "Dry run, nothing published. Packages and SHA256SUMS are in the workflow artifacts." | tee -a "$GITHUB_STEP_SUMMARY"
