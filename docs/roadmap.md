@@ -47,7 +47,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   brought up to this standard in step 1b. Details: `docs/rewrite.md`.
 - **Contract gate for the compiler (planned, not implemented):** CI fails when the compiler's own
   contracts are weak or regress: strict contract coverage on (`[contracts] strict = true`, ADR-0028;
-  today `compiler/` has 0 non-strict and 3 strict findings), a minimum mutation kill rate
+  today `compiler/` has 0 non-strict and 2 strict findings, both in `compiler/loader`), a minimum mutation kill rate
   (`tools/contract_mutation.py --min-kill-rate`) per module, and no regression of `VERIFIED`
   contracts (`orin verify --contracts` results may not turn `UNKNOWN`/`REFUTED`). **Capability gate
   (planned):** only `loader/sources` and the output module may have `PERFORMS_IO` edges (ADR-0021 effect
