@@ -1,0 +1,823 @@
+// Expression / statement / place code generation (typed HIR -> GNU C). Port of FnGen in
+// bootstrap/src/codegen.rs.
+//
+// State threading: Orin-B has no mutable references, so the Rust `FnGen` fields become
+// explicit values: `n` is the temporary counter (every function takes it and returns the
+// next one), `Sc.vars` is the flat list of owned C variables in scope (the Rust scope stack,
+// innermost last) and `Sc.loopMark` is the index into `vars` where `break`/`continue` start
+// releasing. String literal ids come from the precomputed table in `Env.lits`.
+//
+// Ownership discipline (docs/architecture.md): parameters borrowed, results owned (+1),
+// locals own their value, storing a borrowed value retains it, owned temporaries that are
+// only borrowed are released after use, locals are released at scope exit/break/continue/return.
+
+import {
+  Type, Program, Function, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, UnOp, BinOp,
+  FieldInitH, HArm, HPattern, Builtin, MutBuiltin
+} from "../hir";
+import {
+  Lits, CKind, CK, isRef, isVoid, isUsize, isString, cty, fromSlot, toSlot, maskOf,
+  fieldTypes, commentSafe, litId, isSimple, hasEffects, arith, binary, builtinCall
+} from "./cutil";
+
+export type Env = { prog: Program; names: string[]; func: Function; lits: Lits; };
+
+// vars: owned C variables in scope, innermost last. loopMark: where break/continue release from.
+type Sc = { vars: string[]; loopMark: usize; };
+
+// C expression text + ownership of its (non-scalar) value; `next` = temporary counter after it.
+type Val = { code: string; owned: bool; imm: bool; next: usize; };
+type Cons = { code: string; next: usize; };
+type SRes = { text: string; next: usize; added: string; };
+type BRes = { text: string; next: usize; };
+type Seqs = { text: string; next: usize; vars: string[]; };
+type Idx = { text: string; names: string[]; next: usize; };
+// Phase 1 of the Rust `seq`: evaluated argument names and the ({ ... wrapper prefix.
+type Seq = { tmp: bool; names: string[]; prefix: string; releases: string; id: usize; next: usize; };
+
+function u(n: usize): string {
+  return n.toString();
+}
+
+function vOwned(code: string, n: usize): Val {
+  return Val { code: code, owned: true, imm: false, next: n };
+}
+
+function vBorrowed(code: string, n: usize): Val {
+  return Val { code: code, owned: false, imm: false, next: n };
+}
+
+function vImm(code: string, n: usize): Val {
+  return Val { code: code, owned: false, imm: true, next: n };
+}
+
+// Release statements for every variable in vars[from..], innermost first.
+function releaseFrom(vars: string[], lo: usize): string {
+  let s = "";
+  let i = vars.length;
+  while (i > lo) {
+    i -= 1;
+    s += "orin_release(" + vars[i] + "); ";
+  }
+  return s;
+}
+
+// ---------------------------------------------------------------- functions
+
+export function genFunction(env: Env, sig: string): string {
+  const f = env.func;
+  let out = sig + " {\n";
+  let i = f.paramCount;
+  while (i < f.locals.length) {
+    const l = f.locals[i];
+    const init = isRef(l.ty) ? "NULL" : "0";
+    out += "  " + cty(l.ty) + " l" + u(i) + " = " + init + "; /* " + commentSafe(l.name) + " */\n";
+    i += 1;
+  }
+  const none: string[] = [];
+  const r = stmtSeq(env, none, 0, 0, f.body.stmts);
+  out += r.text;
+  out += releaseFrom(r.vars, 0);
+  if (!isVoid(f.ret)) {
+    out += "  orin_trap(\"missing return\");\n";
+  }
+  out += "}\n";
+  return out;
+}
+
+// ---------------------------------------------------------------- statements
+
+function stmtSeq(env: Env, vars0: string[], loopMark: usize, n0: usize, stmts: HStmt[]): Seqs {
+  let vars = vars0;
+  let out = "";
+  let n = n0;
+  for (const st of stmts) {
+    const r = stmt(env, Sc { vars: vars, loopMark: loopMark }, n, st);
+    out += r.text;
+    n = r.next;
+    if (r.added.length > 0) {
+      vars.push(r.added);
+    }
+  }
+  return Seqs { text: out, next: n, vars: vars };
+}
+
+function block(env: Env, sc: Sc, n: usize, b: HBlock): BRes {
+  const mark = sc.vars.length;
+  const r = stmtSeq(env, sc.vars, sc.loopMark, n, b.stmts);
+  return BRes { text: "{\n" + r.text + releaseFrom(r.vars, mark) + "\n}\n", next: r.next };
+}
+
+function stmt(env: Env, sc: Sc, n: usize, st: HStmt): SRes {
+  return match (st) {
+    HLet(l, init) => stLet(env, sc, n, l, init),
+    HAssign(p, op, v) => stAssign(env, sc, n, p, op, v),
+    HExprStmt(e) => stExpr(env, sc, n, e),
+    HIf(c, t, el) => stIf(env, sc, n, c, t, el),
+    HWhile(c, b) => stWhile(env, sc, n, c, b),
+    HForOf(l, it, b) => stForOf(env, sc, n, l, it, b),
+    HBreak => SRes { text: releaseFrom(sc.vars, sc.loopMark) + "break;\n", next: n, added: "" },
+    HContinue => SRes { text: releaseFrom(sc.vars, sc.loopMark) + "continue;\n", next: n, added: "" },
+    HReturn(e) => stReturn(env, sc, n, e),
+    HBlockStmt(b) => stBlock(env, sc, n, b)
+  };
+}
+
+function stBlock(env: Env, sc: Sc, n: usize, b: HBlock): SRes {
+  const r = block(env, sc, n, b);
+  return SRes { text: r.text, next: r.next, added: "" };
+}
+
+function stLet(env: Env, sc: Sc, n: usize, l: usize, init: HExpr): SRes {
+  const ty = env.func.locals[l].ty;
+  const v = consume(env, sc, n, init);
+  const added = isRef(ty) ? "l" + u(l) : "";
+  return SRes { text: "l" + u(l) + " = " + v.code + ";\n", next: v.next, added: added };
+}
+
+function stExpr(env: Env, sc: Sc, n: usize, e: HExpr): SRes {
+  const v = expr(env, sc, n, e);
+  let text = "(void)(" + v.code + ");\n";
+  if (isVoid(e.ty)) {
+    text = v.code + ";\n";
+  } else if (v.owned && isRef(e.ty)) {
+    text = "orin_release(" + v.code + ");\n";
+  }
+  return SRes { text: text, next: v.next, added: "" };
+}
+
+function stIf(env: Env, sc: Sc, n: usize, cond: HExpr, th: HBlock, el: Option<HBlock>): SRes {
+  const c = expr(env, sc, n, cond);
+  let text = "if (" + c.code + ") \n";
+  const t = block(env, sc, c.next, th);
+  text += t.text;
+  let nx = t.next;
+  match (el) {
+    Some(b) => {
+      const e2 = block(env, sc, nx, b);
+      text += "else " + e2.text;
+      nx = e2.next;
+    },
+    None => {}
+  }
+  return SRes { text: text, next: nx, added: "" };
+}
+
+function stWhile(env: Env, sc: Sc, n: usize, cond: HExpr, b: HBlock): SRes {
+  const c = expr(env, sc, n, cond);
+  const body = block(env, Sc { vars: sc.vars, loopMark: sc.vars.length }, c.next, b);
+  return SRes { text: "while (" + c.code + ") \n" + body.text, next: body.next, added: "" };
+}
+
+function stForOf(env: Env, sc: Sc, n: usize, local: usize, iter: HExpr, b: HBlock): SRes {
+  const id = n + 1;
+  const it = "_it" + u(id);
+  const ix = "_i" + u(id);
+  const lty = env.func.locals[local].ty;
+  const src = consume(env, sc, id, iter);
+  let text = "{\nOrinObj *" + it + " = " + src.code + ";\n";
+  let vars = sc.vars;
+  vars.push(it);
+  const mark = vars.length;
+  text += "for (uint64_t " + ix + " = 0; " + ix + " < orin_array_len(" + it + "); " + ix + "++) {\n";
+  const elem = fromSlot(lty, "orin_array_at(" + it + ", " + ix + ")");
+  const lname = "l" + u(local);
+  if (isRef(lty)) {
+    text += lname + " = orin_dup(" + elem + ");\n";
+    vars.push(lname);
+  } else {
+    text += lname + " = " + elem + ";\n";
+  }
+  const r = stmtSeq(env, vars, mark, src.next, b.stmts);
+  text += r.text;
+  text += releaseFrom(r.vars, mark);
+  text += "\n}\n";
+  text += "orin_release(" + it + ");\n}\n";
+  return SRes { text: text, next: r.next, added: "" };
+}
+
+function stReturn(env: Env, sc: Sc, n: usize, e: Option<HExpr>): SRes {
+  const rel = releaseFrom(sc.vars, 0);
+  return match (e) {
+    Some(x) => stReturnVal(env, sc, n, x, rel),
+    None => SRes { text: rel + "return;\n", next: n, added: "" }
+  };
+}
+
+function stReturnVal(env: Env, sc: Sc, n: usize, x: HExpr, rel: string): SRes {
+  if (!isVoid(env.func.ret)) {
+    const v = consume(env, sc, n, x);
+    return SRes {
+      text: "{ " + cty(env.func.ret) + " _rv = " + v.code + "; " + rel + "return _rv; }\n",
+      next: v.next,
+      added: ""
+    };
+  }
+  const v = expr(env, sc, n, x);
+  return SRes { text: v.code + ";\n" + rel + "return;\n", next: v.next, added: "" };
+}
+
+// ---------------------------------------------------------------- places and assignment
+
+// Temporaries for the index expressions of `p` (evaluated once, in path order).
+function placeIndices(env: Env, sc: Sc, n0: usize, p: Place): Idx {
+  let names: string[] = [];
+  let text = "";
+  let n = n0;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        const id = n + 1;
+        const v = expr(env, sc, id, ix);
+        n = v.next;
+        text += "uint64_t _pi" + u(id) + " = " + v.code + ";\n";
+        names.push("_pi" + u(id));
+      },
+      PField(_, _) => {
+        names.push("");
+      }
+    }
+  }
+  return Idx { text: text, names: names, next: n };
+}
+
+// Make every object on the path unique (writing replacements back into their parents).
+// Afterwards `_c` is the container of the final element (or, with `whole`, the unique final
+// object itself) and `_s` points at the final slot.
+function placeWalk(p: Place, idx: string[], whole: bool): string {
+  const r = "l" + u(p.root);
+  if (p.path.length == 0 && !whole) {
+    // Plain local assignment: nothing to make unique (the root may be a scalar).
+    return "OrinObj *_c = 0; uint64_t *_s = 0; (void)_c; (void)_s;\n";
+  }
+  let s = r + " = orin_make_unique(" + r + ");\nOrinObj *_c = " + r + "; uint64_t *_s = 0; (void)_s;\n";
+  const cnt = p.path.length;
+  let k: usize = 0;
+  while (k < cnt) {
+    match (p.path[k]) {
+      PField(_, index) => {
+        s += "_s = orin_struct_slot_ptr(_c, " + u(index) + ");\n";
+      },
+      PIndex(_) => {
+        s += "_s = orin_array_slot_ptr(_c, " + idx[k] + ");\n";
+      }
+    }
+    if (k + 1 < cnt || whole) {
+      s += "_c = orin_make_unique(ORIN_REF(*_s)); *_s = ORIN_SLOT(_c);\n";
+    }
+    k += 1;
+  }
+  return s;
+}
+
+function isAddOp(op: BinOp): bool {
+  return match (op) { OpAdd => true, _ => false };
+}
+
+function isLocalId(e: HExpr, id: usize): bool {
+  return match (e.kind) {
+    XLocal(l) => l == id,
+    _ => false
+  };
+}
+
+function stAssign(env: Env, sc: Sc, n0: usize, place: Place, op0: Option<BinOp>, value0: HExpr): SRes {
+  const ty = place.ty;
+  const rn = "l" + u(place.root);
+  let op = op0;
+  let value = value0;
+  // `s = s + x` on a string local is an append.
+  if (op0.isNone() && isString(ty) && place.path.length == 0) {
+    match (value0.kind) {
+      XBinary(bo, lhs, rhs) => {
+        if (isAddOp(bo) && isLocalId(lhs, place.root)) {
+          op = Some(OpAdd);
+          value = rhs;
+        }
+      },
+      _ => {}
+    }
+  }
+  // Fast path: scalar root local.
+  if (place.path.length == 0 && !isRef(ty) && !hasEffects(value)) {
+    const v = expr(env, sc, n0, value);
+    const text = match (op) {
+      None => rn + " = " + v.code + ";\n",
+      Some(o) => rn + " = " + arith(o, ty, rn, v.code) + ";\n"
+    };
+    return SRes { text: text, next: v.next, added: "" };
+  }
+  let out = "{\n";
+  const idx = placeIndices(env, sc, n0, place);
+  out += idx.text;
+  const vc = consume(env, sc, idx.next, value);
+  out += cty(value.ty) + " _v = " + vc.code + ";\n";
+  out += placeWalk(place, idx.names, false);
+  // lvalue accessors
+  const direct = place.path.length == 0;
+  const rd = direct ? rn : fromSlot(ty, "*_s");
+  const wrV = assignTo(direct, rn, ty, "_v");
+  match (op) {
+    None => {
+      if (isRef(ty)) {
+        out += "OrinObj *_o = " + rd + "; " + wrV + " orin_release(_o);\n";
+      } else {
+        out += wrV + "\n";
+      }
+    },
+    Some(o) => {
+      if (isAddOp(o) && isString(ty)) {
+        // Consumes the current value (held only by this slot); the result replaces it.
+        out += assignTo(direct, rn, ty, "orin_str_append(" + rd + ", _v)") + " orin_release(_v);\n";
+      } else {
+        out += assignTo(direct, rn, ty, arith(o, ty, rd, "_v")) + "\n";
+      }
+    }
+  }
+  out += "}\n";
+  return SRes { text: out, next: vc.next, added: "" };
+}
+
+function assignTo(direct: bool, rn: string, ty: Type, v: string): string {
+  if (direct) {
+    return rn + " = " + v + ";";
+  }
+  return "*_s = " + toSlot(ty, v) + ";";
+}
+
+// ---------------------------------------------------------------- expressions
+
+// Compile `e` to an owned (+1) value.
+function consume(env: Env, sc: Sc, n: usize, e: HExpr): Cons {
+  const v = expr(env, sc, n, e);
+  return Cons { code: consumeVal(v, e.ty), next: v.next };
+}
+
+function consumeVal(v: Val, ty: Type): string {
+  if (!isRef(ty) || v.owned || v.imm) {
+    return v.code;
+  }
+  return "orin_dup(" + v.code + ")";
+}
+
+function kindIsFresh(k: CKind): bool {
+  return match (k) { CkFresh => true, _ => false };
+}
+
+// Evaluate `args` left to right (Rust `seq`, phase 1). Non-consumed owned temporaries are
+// released afterwards by seqFinish; a result borrowed from them is retained first.
+function seqPrep(env: Env, sc: Sc, n0: usize, args: HExpr[]): Seq {
+  let vals: Val[] = [];
+  let n = n0;
+  for (const a of args) {
+    const v = expr(env, sc, n, a);
+    n = v.next;
+    vals.push(v);
+  }
+  const cnt = args.length;
+  let nonsimple: usize = 0;
+  let anyEff = false;
+  let eff: bool[] = [];
+  for (const a of args) {
+    if (!isSimple(a)) {
+      nonsimple += 1;
+    }
+    const h = hasEffects(a);
+    eff.push(h);
+    if (h) {
+      anyEff = true;
+    }
+  }
+  // later[i]: some argument after i has effects
+  let later: bool[] = [];
+  let acc = false;
+  let j: usize = 0;
+  while (j < cnt) {
+    later.push(false);
+    j += 1;
+  }
+  j = cnt;
+  while (j > 0) {
+    j -= 1;
+    later[j] = acc;
+    if (eff[j]) {
+      acc = true;
+    }
+  }
+  let anyOwnedBorrow = false;
+  let anyPin = false;
+  let pin: bool[] = [];
+  let i: usize = 0;
+  while (i < cnt) {
+    const r = isRef(args[i].ty);
+    if (r && vals[i].owned) {
+      anyOwnedBorrow = true;
+    }
+    const p = r && !vals[i].owned && !vals[i].imm && later[i];
+    pin.push(p);
+    if (p) {
+      anyPin = true;
+    }
+    i += 1;
+  }
+  const needTmp = anyOwnedBorrow || anyPin || nonsimple >= 2 || (nonsimple == 1 && anyEff);
+  let names: string[] = [];
+  if (!needTmp) {
+    for (const v of vals) {
+      names.push(v.code);
+    }
+    return Seq { tmp: false, names: names, prefix: "", releases: "", id: 0, next: n };
+  }
+  const id = n + 1;
+  let s = "({ ";
+  let releases = "";
+  i = 0;
+  while (i < cnt) {
+    const v = vals[i];
+    const ty = args[i].ty;
+    const name = "_t" + u(id) + "_" + u(i);
+    let init = v.code;
+    if (isRef(ty) && (v.owned || pin[i])) {
+      if (!v.owned) {
+        init = "orin_dup(" + v.code + ")";
+      }
+      releases += "orin_release(" + name + "); ";
+    }
+    s += cty(ty) + " " + name + " = " + init + "; ";
+    names.push(name);
+    i += 1;
+  }
+  return Seq { tmp: true, names: names, prefix: s, releases: releases, id: id, next: id };
+}
+
+// Rust `seq`, phase 2: wrap `code` (built from p.names) according to its kind.
+function seqFinish(p: Seq, rty: Type, code: string, kind: CKind): Val {
+  if (!p.tmp) {
+    if (kindIsFresh(kind) && isRef(rty)) {
+      return vOwned(code, p.next);
+    }
+    return vBorrowed(code, p.next);
+  }
+  const id = u(p.id);
+  const r = "_r" + id;
+  return match (kind) {
+    CkVoid => vBorrowed(p.prefix + code + "; " + p.releases + "(void)0; })", p.next),
+    CkFresh => seqResult(p, rty, r, code, isRef(rty)),
+    CkBorrowed => seqBorrowed(p, rty, r, code)
+  };
+}
+
+function seqResult(p: Seq, rty: Type, r: string, code: string, owned: bool): Val {
+  const s = p.prefix + cty(rty) + " " + r + " = " + code + "; " + p.releases + r + "; })";
+  return Val { code: s, owned: owned, imm: false, next: p.next };
+}
+
+function seqBorrowed(p: Seq, rty: Type, r: string, code: string): Val {
+  if (p.releases.length == 0 || !isRef(rty)) {
+    return seqResult(p, rty, r, code, false);
+  }
+  return seqResult(p, rty, r, "orin_dup(" + code + ")", true);
+}
+
+function intCode(v: int, ty: Type): string {
+  if (isUsize(ty)) {
+    return "((uint64_t)" + v.toString() + "ULL)";
+  }
+  if (v == -9223372036854775807 - 1) {
+    return "INT64_MIN";
+  }
+  return "((int64_t)" + v.toString() + "LL)";
+}
+
+function expr(env: Env, sc: Sc, n: usize, e: HExpr): Val {
+  return match (e.kind) {
+    XInt(v) => vBorrowed(intCode(v, e.ty), n),
+    XBool(b) => vBorrowed(b ? "1" : "0", n),
+    XStr(s) => vImm("orin_s" + u(litId(env.lits, s)), n),
+    XLocal(l) => vBorrowed("l" + u(l), n),
+    XUnary(op, x) => exprUnary(env, sc, n, e, op, x),
+    XBinary(op, a, b) => exprBinary(env, sc, n, e, op, a, b),
+    XCall(f, args) => exprCall(env, sc, n, e, f, args),
+    XBuiltin(op, args) => exprBuiltin(env, sc, n, e, op, args),
+    XMutMethod(op, place, args) => exprMutMethod(env, sc, n, op, place, args),
+    XField(b, _, idx) => exprField(env, sc, n, e, b, idx),
+    XIndex(b, i) => exprIndex(env, sc, n, e, b, i),
+    XRecord(r, spread, fields) => exprRecord(env, sc, n, r, spread, fields),
+    XVariant(tag, payload) => exprVariant(env, sc, n, tag, payload),
+    XArray(xs) => exprArray(env, sc, n, e, xs),
+    XTry(x) => exprTry(env, sc, n, x, e.ty),
+    XCond(c, a, b) => exprCond(env, sc, n, e, c, a, b),
+    XMatch(s, arms) => exprMatch(env, sc, n, s, arms, e.ty)
+  };
+}
+
+function exprUnary(env: Env, sc: Sc, n: usize, e: HExpr, op: UnOp, x: HExpr): Val {
+  const v = expr(env, sc, n, x);
+  const code = match (op) {
+    UnNot => "(!" + v.code + ")",
+    UnNeg => isUsize(e.ty) ? "orin_neg_u(" + v.code + ")" : "orin_neg_i(" + v.code + ")"
+  };
+  return vBorrowed(code, v.next);
+}
+
+function exprBinary(env: Env, sc: Sc, n: usize, e: HExpr, op: BinOp, lhs: HExpr, rhs: HExpr): Val {
+  const logical = match (op) {
+    OpAnd => "&&",
+    OpOr => "||",
+    _ => ""
+  };
+  if (logical.length > 0) {
+    const a = expr(env, sc, n, lhs);
+    const b = expr(env, sc, a.next, rhs);
+    return vBorrowed("(" + a.code + " " + logical + " " + b.code + ")", b.next);
+  }
+  const args: HExpr[] = [lhs, rhs];
+  const p = seqPrep(env, sc, n, args);
+  return seqFinish(p, e.ty, binary(op, lhs.ty, p.names[0], p.names[1]), CkFresh);
+}
+
+function exprCall(env: Env, sc: Sc, n: usize, e: HExpr, f: usize, args: HExpr[]): Val {
+  const p = seqPrep(env, sc, n, args);
+  const code = env.names[f] + "(" + p.names.join(", ") + ")";
+  return seqFinish(p, e.ty, code, isVoid(e.ty) ? CkVoid : CkFresh);
+}
+
+function exprBuiltin(env: Env, sc: Sc, n: usize, e: HExpr, op: Builtin, args: HExpr[]): Val {
+  const p = seqPrep(env, sc, n, args);
+  const ck = builtinCall(op, p.names, e.ty);
+  return seqFinish(p, e.ty, ck.code, ck.kind);
+}
+
+function exprField(env: Env, sc: Sc, n: usize, e: HExpr, base: HExpr, idx: usize): Val {
+  const args: HExpr[] = [base];
+  const p = seqPrep(env, sc, n, args);
+  const code = fromSlot(e.ty, "orin_struct_get(" + p.names[0] + ", " + u(idx) + ")");
+  return seqFinish(p, e.ty, code, CkBorrowed);
+}
+
+function exprIndex(env: Env, sc: Sc, n: usize, e: HExpr, base: HExpr, ix: HExpr): Val {
+  const args: HExpr[] = [base, ix];
+  const p = seqPrep(env, sc, n, args);
+  const code = fromSlot(e.ty, "orin_array_at(" + p.names[0] + ", " + p.names[1] + ")");
+  return seqFinish(p, e.ty, code, CkBorrowed);
+}
+
+function containsIndex(fields: FieldInitH[], i: usize): bool {
+  for (const f of fields) {
+    if (f.index == i) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function exprRecord(env: Env, sc: Sc, n: usize, rid: usize, spread: Option<HExpr>, fields: FieldInitH[]): Val {
+  const def = env.prog.records[rid];
+  const nf = def.fields.length;
+  const mask = maskOf(fieldTypes(def.fields));
+  const id = n + 1;
+  const ids = u(id);
+  let cur = id;
+  let s = "({ ";
+  let spOwned = false;
+  let hasSpread = false;
+  match (spread) {
+    Some(sp) => {
+      const v = expr(env, sc, cur, sp);
+      cur = v.next;
+      spOwned = v.owned;
+      hasSpread = true;
+      s += "OrinObj *_sp" + ids + " = " + v.code + "; ";
+    },
+    None => {}
+  }
+  s += "OrinObj *_r" + ids + " = orin_struct_new(0, " + u(nf) + ", " + u(mask) + "ULL); ";
+  if (hasSpread) {
+    let i: usize = 0;
+    while (i < nf) {
+      if (!containsIndex(fields, i)) {
+        s += "orin_struct_copy_slot(_r" + ids + ", " + u(i) + ", _sp" + ids + ", " + u(i) + "); ";
+      }
+      i += 1;
+    }
+  }
+  for (const f of fields) {
+    const c = consume(env, sc, cur, f.value);
+    cur = c.next;
+    s += "orin_struct_set(_r" + ids + ", " + u(f.index) + ", " + toSlot(f.value.ty, c.code) + "); ";
+  }
+  if (spOwned) {
+    s += "orin_release(_sp" + ids + "); ";
+  }
+  s += "_r" + ids + "; })";
+  return vOwned(s, cur);
+}
+
+function exprVariant(env: Env, sc: Sc, n: usize, tag: usize, payload: HExpr[]): Val {
+  if (payload.length == 0) {
+    return vImm("orin_nullary(" + u(tag) + ")", n);
+  }
+  let tys: Type[] = [];
+  for (const p of payload) {
+    tys.push(p.ty);
+  }
+  const mask = maskOf(tys);
+  const id = n + 1;
+  const ids = u(id);
+  let cur = id;
+  let s = "({ OrinObj *_v" + ids + " = orin_struct_new(" + u(tag) + ", " + u(payload.length) + ", " + u(mask) + "ULL); ";
+  let i: usize = 0;
+  for (const p of payload) {
+    const c = consume(env, sc, cur, p);
+    cur = c.next;
+    s += "orin_struct_set(_v" + ids + ", " + u(i) + ", " + toSlot(p.ty, c.code) + "); ";
+    i += 1;
+  }
+  s += "_v" + ids + "; })";
+  return vOwned(s, cur);
+}
+
+function exprArray(env: Env, sc: Sc, n: usize, e: HExpr, xs: HExpr[]): Val {
+  const elemRef = match (e.ty) {
+    TyArray(t) => isRef(t),
+    _ => false
+  };
+  const id = n + 1;
+  const ids = u(id);
+  let cur = id;
+  let s = "({ OrinObj *_a" + ids + " = orin_array_new(" + u(xs.length) + ", " + (elemRef ? "1" : "0") + "); ";
+  for (const x of xs) {
+    const c = consume(env, sc, cur, x);
+    cur = c.next;
+    s += "orin_array_push(_a" + ids + ", " + toSlot(x.ty, c.code) + "); ";
+  }
+  s += "_a" + ids + "; })";
+  return vOwned(s, cur);
+}
+
+function exprMutMethod(env: Env, sc: Sc, n: usize, op: MutBuiltin, place: Place, args: HExpr[]): Val {
+  let s = "({ ";
+  const idx = placeIndices(env, sc, n, place);
+  s += idx.text;
+  return match (op) {
+    MArrPush => mutPush(env, sc, place, args, idx, s),
+    MArrPop => vOwned(s + placeWalk(place, idx.names, true) + "orin_array_pop(_c); })", idx.next)
+  };
+}
+
+function mutPush(env: Env, sc: Sc, place: Place, args: HExpr[], idx: Idx, prefix: string): Val {
+  let s = prefix;
+  const c = consume(env, sc, idx.next, args[0]);
+  s += cty(args[0].ty) + " _v = " + c.code + "; ";
+  s += placeWalk(place, idx.names, true);
+  s += "orin_array_push(_c, " + toSlot(args[0].ty, "_v") + "); (void)0; })";
+  return vBorrowed(s, c.next);
+}
+
+function exprTry(env: Env, sc: Sc, n: usize, inner: HExpr, ty: Type): Val {
+  const errTy = match (inner.ty) {
+    TyResult(_, er) => er,
+    _ => TyVoid
+  };
+  const v = expr(env, sc, n, inner);
+  const id = v.next + 1;
+  const ids = u(id);
+  const t = "_tr" + ids;
+  const relT = v.owned ? "orin_release(" + t + "); " : "";
+  const errSlot = "orin_struct_get(" + t + ", 0)";
+  const errDup = isRef(errTy) ? "ORIN_SLOT(orin_dup(ORIN_REF(" + errSlot + ")))" : errSlot;
+  const mask = isRef(errTy) ? "1" : "0";
+  let s = "({ OrinObj *" + t + " = " + v.code + "; ";
+  s += "if (orin_tag(" + t + ") == 1) { OrinObj *_er" + ids + " = orin_variant1(1, " + mask + ", " + errDup + "); "
+    + relT + releaseFrom(sc.vars, 0) + "return _er" + ids + "; } ";
+  if (isVoid(ty)) {
+    return vBorrowed(s + relT + "(void)0; })", id);
+  }
+  if (isRef(ty)) {
+    s += "OrinObj *_ok" + ids + " = orin_dup(ORIN_REF(orin_struct_get(" + t + ", 0))); " + relT + "_ok" + ids + "; })";
+    return vOwned(s, id);
+  }
+  s += cty(ty) + " _ok" + ids + " = " + fromSlot(ty, "orin_struct_get(" + t + ", 0)") + "; " + relT + "_ok" + ids + "; })";
+  return vBorrowed(s, id);
+}
+
+function exprCond(env: Env, sc: Sc, n: usize, e: HExpr, cond: HExpr, th: HExpr, el: HExpr): Val {
+  const c = expr(env, sc, n, cond);
+  const a = expr(env, sc, c.next, th);
+  const b = expr(env, sc, a.next, el);
+  if (!isRef(e.ty) || (!a.owned && !b.owned)) {
+    return vBorrowed("(" + c.code + " ? " + a.code + " : " + b.code + ")", b.next);
+  }
+  return vOwned("(" + c.code + " ? " + consumeVal(a, e.ty) + " : " + consumeVal(b, e.ty) + ")", b.next);
+}
+
+// Condition of a match arm; "" for the wildcard.
+function patCond(env: Env, p: HPattern, sn: string, sty: Type): string {
+  return match (p) {
+    HPWildcard => "",
+    HPVariant(tag, _) => "orin_tag(" + sn + ") == " + u(tag),
+    HPInt(v) => isUsize(sty) ? sn + " == (uint64_t)" + v.toString() + "ULL" : sn + " == (int64_t)" + v.toString() + "LL",
+    HPBool(b) => sn + " == " + (b ? "1" : "0"),
+    HPStr(lit) => "orin_str_eq(" + sn + ", orin_s" + u(litId(env.lits, lit)) + ")"
+  };
+}
+
+// Binding assignments for a variant pattern; pushes owned bindings onto `vars`.
+function armBindings(env: Env, p: HPattern, sn: string, vars: string[]): Cons2 {
+  let s = "";
+  let vs = vars;
+  match (p) {
+    HPVariant(_, bindings) => {
+      let k: usize = 0;
+      for (const b of bindings) {
+        match (b) {
+          Some(l) => {
+            const lt = env.func.locals[l].ty;
+            const slot = "orin_struct_get(" + sn + ", " + u(k) + ")";
+            if (isRef(lt)) {
+              s += "l" + u(l) + " = orin_dup(ORIN_REF(" + slot + ")); ";
+              vs.push("l" + u(l));
+            } else {
+              s += "l" + u(l) + " = " + fromSlot(lt, slot) + "; ";
+            }
+          },
+          None => {}
+        }
+        k += 1;
+      }
+    },
+    _ => {}
+  }
+  return Cons2 { text: s, vars: vs };
+}
+
+type Cons2 = { text: string; vars: string[]; };
+
+function exprMatch(env: Env, sc: Sc, n: usize, scrut: HExpr, arms: HArm[], ty: Type): Val {
+  const id = n + 1;
+  const ids = u(id);
+  const sv = expr(env, sc, id, scrut);
+  let cur = sv.next;
+  const sn = "_ms" + ids;
+  const mv = "_mv" + ids;
+  const hasVal = !isVoid(ty);
+  let s = "({ ";
+  if (hasVal) {
+    s += cty(ty) + " " + mv + "; ";
+  }
+  s += cty(scrut.ty) + " " + sn + " = " + sv.code + "; ";
+  const ownScrut = sv.owned && isRef(scrut.ty);
+  let base = sc.vars;
+  if (ownScrut) {
+    base.push(sn);
+  }
+  let closed = false;
+  let i: usize = 0;
+  while (i < arms.length && !closed) {
+    const arm = arms[i];
+    const cond = patCond(env, arm.pattern, sn, scrut.ty);
+    if (cond.length > 0) {
+      s += (i == 0 ? "if (" : " else if (") + cond + ") { ";
+    } else {
+      s += i == 0 ? "{ " : " else { ";
+      closed = true;
+    }
+    const mark = base.length;
+    const bd = armBindings(env, arm.pattern, sn, base);
+    s += bd.text;
+    const body = stmtSeq(env, bd.vars, sc.loopMark, cur, arm.body.stmts);
+    s += body.text;
+    cur = body.next;
+    const asc = Sc { vars: body.vars, loopMark: sc.loopMark };
+    match (arm.value) {
+      Some(v) => {
+        if (hasVal) {
+          const c = consume(env, asc, cur, v);
+          cur = c.next;
+          s += mv + " = " + c.code + "; ";
+        } else {
+          const vv = expr(env, asc, cur, v);
+          cur = vv.next;
+          s += "(void)(" + vv.code + "); ";
+        }
+      },
+      None => {}
+    }
+    s += releaseFrom(body.vars, mark);
+    s += "}";
+    i += 1;
+  }
+  if (!closed) {
+    s += " else { orin_trap(\"non-exhaustive match\"); }";
+  }
+  s += " ";
+  if (ownScrut) {
+    s += "orin_release(" + sn + "); ";
+  }
+  if (hasVal) {
+    s += mv + "; })";
+  } else {
+    s += "(void)0; })";
+  }
+  return Val { code: s, owned: hasVal && isRef(ty), imm: false, next: cur };
+}

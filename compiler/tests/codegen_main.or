@@ -1,0 +1,373 @@
+// Codegen test driver: builds small typed HIR programs by hand (the Stage 1 checker is not
+// ready), runs `generate` on them and writes build/cg/<name>.c. compiler/tests/codegen_test.sh
+// compiles and runs each file and compares stdout.
+
+import { generate } from "../codegen";
+import { Span } from "../diag";
+import {
+  Type, Program, FieldDef, RecordDef, UnionDef, VariantDef, Function, Local, HBlock, HStmt, Place,
+  PlaceElem, HExpr, HExprKind, UnOp, BinOp, FieldInitH, HArm, HPattern, Builtin, MutBuiltin
+} from "../hir";
+import { writeFile } from "std:fs";
+
+// ---------------------------------------------------------------- builders
+
+function sp(): Span {
+  return Span { file: 0, start: 0, end: 0 };
+}
+
+function ex(k: HExprKind, t: Type): HExpr {
+  return HExpr { kind: k, ty: t, span: sp() };
+}
+
+function eInt(n: int): HExpr {
+  return ex(XInt(n), TyInt);
+}
+
+function eUs(n: int): HExpr {
+  return ex(XInt(n), TyUsize);
+}
+
+function eStr(s: string): HExpr {
+  return ex(XStr(s), TyString);
+}
+
+function eLoc(i: usize, t: Type): HExpr {
+  return ex(XLocal(i), t);
+}
+
+function eBin(op: BinOp, a: HExpr, b: HExpr, t: Type): HExpr {
+  return ex(XBinary(op, a, b), t);
+}
+
+function eAdd(a: HExpr, b: HExpr): HExpr {
+  return eBin(OpAdd, a, b, TyInt);
+}
+
+function eBi(b: Builtin, args: HExpr[], t: Type): HExpr {
+  return ex(XBuiltin(b, args), t);
+}
+
+function eLog(e: HExpr): HExpr {
+  return eBi(BConsoleLog, [e], TyVoid);
+}
+
+function sLog(e: HExpr): HStmt {
+  return HExprStmt(eLog(e));
+}
+
+// console.log(<int expr>.toString())
+function sLogInt(e: HExpr): HStmt {
+  return sLog(eBi(BIntToString, [e], TyString));
+}
+
+function eCall(f: usize, args: HExpr[], t: Type): HExpr {
+  return ex(XCall(f, args), t);
+}
+
+function blk(ss: HStmt[]): HBlock {
+  return HBlock { stmts: ss };
+}
+
+function lc(name: string, t: Type): Local {
+  return Local { name: name, ty: t, mutable: true };
+}
+
+function fn(name: string, params: usize, locals: Local[], ret: Type, ss: HStmt[]): Function {
+  return Function { name: name, paramCount: params, locals: locals, ret: ret, body: blk(ss), span: sp() };
+}
+
+function pl(root: usize, path: PlaceElem[], t: Type): Place {
+  return Place { root: root, path: path, ty: t };
+}
+
+function pLoc(root: usize, t: Type): Place {
+  const path: PlaceElem[] = [];
+  return pl(root, path, t);
+}
+
+function arm(p: HPattern, body: HStmt[], v: Option<HExpr>): HArm {
+  return HArm { pattern: p, body: blk(body), value: v };
+}
+
+function field(name: string, t: Type): FieldDef {
+  return FieldDef { name: name, ty: t };
+}
+
+function prog(records: RecordDef[], unions: UnionDef[], fns: Function[], mainIdx: usize): Program {
+  return Program { records: records, unions: unions, functions: fns, main: mainIdx };
+}
+
+function noRecords(): RecordDef[] {
+  return [];
+}
+
+function noUnions(): UnionDef[] {
+  return [];
+}
+
+function emit(name: string, p: Program): void {
+  const a = generate(p);
+  const b = generate(p);
+  if (a != b) {
+    console.error("nondeterministic output for " + name);
+  }
+  const r = writeFile("build/cg/" + name + ".c", a);
+  if (r.isErr()) {
+    console.error("cannot write " + name + ": " + r.unwrapErr());
+  }
+}
+
+// ---------------------------------------------------------------- programs
+
+function progHello(): Program {
+  const m = fn("main", 0, [], TyVoid, [sLog(eStr("hello"))]);
+  return prog(noRecords(), noUnions(), [m], 0);
+}
+
+function progArith(): Program {
+  const neg17 = ex(XUnary(UnNeg, eInt(17)), TyInt);
+  const neg17b = ex(XUnary(UnNeg, eInt(17)), TyInt);
+  const m = fn("main", 0, [], TyVoid, [
+    sLogInt(eAdd(eInt(2), eBin(OpMul, eInt(3), eInt(4), TyInt))),
+    sLogInt(eBin(OpDiv, neg17, eInt(5), TyInt)),
+    sLogInt(eBin(OpRem, neg17b, eInt(5), TyInt)),
+    sLog(eBi(BUsizeToString, [eBin(OpSub, eUs(7), eUs(2), TyUsize)], TyString)),
+    sLog(eBi(BBoolToString, [eBin(OpLt, eInt(3), eInt(4), TyBool)], TyString)),
+    sLog(eBi(BBoolToString, [eBin(OpAnd, ex(XBool(true), TyBool), eBin(OpEq, eStr("a"), eStr("b"), TyBool), TyBool)], TyString))
+  ]);
+  return prog(noRecords(), noUnions(), [m], 0);
+}
+
+// fib + while loop with break/continue.
+function progLoop(): Program {
+  const fib = fn("fib", 1, [lc("n", TyInt)], TyInt, [
+    HIf(eBin(OpLt, eLoc(0, TyInt), eInt(2), TyBool), blk([HReturn(Some(eLoc(0, TyInt)))]), None),
+    HReturn(Some(eAdd(
+      eCall(0, [eBin(OpSub, eLoc(0, TyInt), eInt(1), TyInt)], TyInt),
+      eCall(0, [eBin(OpSub, eLoc(0, TyInt), eInt(2), TyInt)], TyInt))))
+  ]);
+  const i = eLoc(0, TyInt);
+  const sum = eLoc(1, TyInt);
+  const body: HStmt[] = [
+    HAssign(pLoc(0, TyInt), Some(OpAdd), eInt(1)),
+    HIf(eBin(OpEq, eBin(OpRem, i, eInt(2), TyInt), eInt(0), TyBool), blk([HContinue]), None),
+    HIf(eBin(OpGt, i, eInt(9), TyBool), blk([HBreak]), None),
+    HAssign(pLoc(1, TyInt), Some(OpAdd), i)
+  ];
+  const m = fn("main", 0, [lc("i", TyInt), lc("sum", TyInt)], TyVoid, [
+    HLet(0, eInt(0)),
+    HLet(1, eInt(0)),
+    HWhile(eBin(OpLt, i, eInt(100), TyBool), blk(body)),
+    sLogInt(sum),
+    sLogInt(eCall(0, [eInt(15)], TyInt))
+  ]);
+  return prog(noRecords(), noUnions(), [fib, m], 1);
+}
+
+// Records: COW, nested field assignment, record update, string field append.
+function progRecords(): Program {
+  const point = RecordDef { name: "Point", fields: [field("x", TyInt), field("y", TyInt)] };
+  const person = RecordDef { name: "Person", fields: [field("name", TyString), field("pos", TyRecord(0))] };
+  const tp = TyRecord(0);
+  const tq = TyRecord(1);
+  const p = eLoc(0, tp);
+  const q = eLoc(1, tp);
+  const per = eLoc(2, tq);
+  const r = eLoc(3, tp);
+  const fx = ex(XField(p, 0, 0), TyInt);
+  const mk = ex(XRecord(0, None, [FieldInitH { index: 0, value: eInt(1) }, FieldInitH { index: 1, value: eInt(2) }]), tp);
+  const upd = ex(XRecord(0, Some(p), [FieldInitH { index: 1, value: eInt(7) }]), tp);
+  const mkp = ex(XRecord(1, None, [FieldInitH { index: 0, value: eStr("bob") }, FieldInitH { index: 1, value: p }]), tq);
+  const posY: PlaceElem[] = [PField(1, 1), PField(0, 1)];
+  const nameP: PlaceElem[] = [PField(1, 0)];
+  const m = fn("main", 0, [lc("p", tp), lc("q", tp), lc("per", tq), lc("r", tp)], TyVoid, [
+    HLet(0, mk),
+    HLet(1, p),
+    HAssign(pl(0, [PField(0, 0)], TyInt), None, eInt(10)),
+    sLogInt(fx),
+    sLogInt(ex(XField(q, 0, 0), TyInt)),
+    HLet(2, mkp),
+    HAssign(pl(2, posY, TyInt), None, eInt(42)),
+    sLogInt(ex(XField(ex(XField(per, 1, 1), tp), 0, 1), TyInt)),
+    sLogInt(ex(XField(p, 0, 1), TyInt)),
+    HLet(3, upd),
+    sLogInt(ex(XField(r, 0, 0), TyInt)),
+    sLogInt(ex(XField(r, 0, 1), TyInt)),
+    HAssign(pl(2, nameP, TyString), Some(OpAdd), eStr("!")),
+    sLog(ex(XField(per, 1, 0), TyString))
+  ]);
+  return prog([point, person], noUnions(), [m], 0);
+}
+
+// Tagged union match (expression and statement), int and string literal patterns.
+function progUnion(): Program {
+  const shape = UnionDef {
+    name: "Shape",
+    variants: [
+      VariantDef { name: "Circle", payload: [TyInt] },
+      VariantDef { name: "Rect", payload: [TyInt, TyInt] },
+      VariantDef { name: "Empty", payload: [] }
+    ]
+  };
+  const ts = TyUnion(0);
+  const s = eLoc(0, ts);
+  const r = eLoc(1, TyInt);
+  const w = eLoc(2, TyInt);
+  const h = eLoc(3, TyInt);
+  const arms: HArm[] = [
+    arm(HPVariant(0, [Some(1)]), [], Some(eBin(OpMul, eBin(OpMul, r, r, TyInt), eInt(3), TyInt))),
+    arm(HPVariant(1, [Some(2), Some(3)]), [], Some(eBin(OpMul, w, h, TyInt))),
+    arm(HPVariant(2, []), [], Some(eInt(0)))
+  ];
+  const area = fn("area", 1, [lc("s", ts), lc("r", TyInt), lc("w", TyInt), lc("h", TyInt)], TyInt, [
+    HReturn(Some(ex(XMatch(s, arms), TyInt)))
+  ]);
+  const n = eLoc(0, TyInt);
+  const descArms: HArm[] = [
+    arm(HPInt(1), [], Some(eStr("one"))),
+    arm(HPInt(2), [], Some(eStr("two"))),
+    arm(HPWildcard, [], Some(eStr("many")))
+  ];
+  const desc = fn("describe", 1, [lc("n", TyInt)], TyString, [
+    HReturn(Some(ex(XMatch(n, descArms), TyString)))
+  ]);
+  const cs = eLoc(0, TyString);
+  const clsArms: HArm[] = [
+    arm(HPStr("a"), [], Some(eInt(1))),
+    arm(HPStr("b"), [], Some(eInt(2))),
+    arm(HPWildcard, [], Some(eInt(0)))
+  ];
+  const cls = fn("classify", 1, [lc("s", TyString)], TyInt, [
+    HReturn(Some(ex(XMatch(cs, clsArms), TyInt)))
+  ]);
+  const circle = ex(XVariant(0, [eInt(2)]), ts);
+  const rect = ex(XVariant(1, [eInt(3), eInt(5)]), ts);
+  const empty = ex(XVariant(2, []), ts);
+  // statement match with a side-effecting arm
+  const stmtArms: HArm[] = [
+    arm(HPVariant(0, [Some(1)]), [sLogInt(r)], None),
+    arm(HPWildcard, [sLog(eStr("not circle"))], None)
+  ];
+  const m = fn("main", 0, [lc("s", ts), lc("r", TyInt)], TyVoid, [
+    sLogInt(eCall(0, [circle], TyInt)),
+    sLogInt(eCall(0, [rect], TyInt)),
+    sLogInt(eCall(0, [empty], TyInt)),
+    sLog(eCall(1, [eInt(1)], TyString)),
+    sLog(eCall(1, [eInt(2)], TyString)),
+    sLog(eCall(1, [eInt(9)], TyString)),
+    sLogInt(eCall(2, [eStr("b")], TyInt)),
+    sLogInt(eCall(2, [eStr("zz")], TyInt)),
+    HLet(0, ex(XVariant(0, [eInt(77)]), ts)),
+    HExprStmt(ex(XMatch(s, stmtArms), TyVoid)),
+    HAssign(pLoc(0, ts), None, empty),
+    HExprStmt(ex(XMatch(s, stmtArms), TyVoid))
+  ]);
+  return prog(noRecords(), [shape], [area, desc, cls, m], 3);
+}
+
+// Result + `?`, Option, unwrapOr.
+function progTry(): Program {
+  const tr = TyResult(TyInt, TyString);
+  const x = eLoc(0, TyInt);
+  const f = fn("f", 1, [lc("x", TyInt)], tr, [
+    HIf(eBin(OpLt, x, eInt(0), TyBool), blk([HReturn(Some(ex(XVariant(1, [eStr("neg")]), tr)))]), None),
+    HReturn(Some(ex(XVariant(0, [eBin(OpMul, x, eInt(2), TyInt)]), tr)))
+  ]);
+  const g = fn("g", 1, [lc("x", TyInt), lc("v", TyInt)], tr, [
+    HLet(1, ex(XTry(eCall(0, [x], tr)), TyInt)),
+    HReturn(Some(ex(XVariant(0, [eAdd(eLoc(1, TyInt), eInt(1))]), tr)))
+  ]);
+  const arms1: HArm[] = [
+    arm(HPVariant(0, [Some(0)]), [sLogInt(eLoc(0, TyInt))], None),
+    arm(HPVariant(1, [Some(1)]), [sLog(eLoc(1, TyString))], None)
+  ];
+  const to = TyOption(TyInt);
+  const arms2: HArm[] = [
+    arm(HPVariant(0, [Some(0)]), [sLogInt(eLoc(0, TyInt))], None),
+    arm(HPVariant(1, []), [sLog(eStr("none"))], None)
+  ];
+  const m = fn("main", 0, [lc("v", TyInt), lc("e", TyString)], TyVoid, [
+    HExprStmt(ex(XMatch(eCall(1, [eInt(5)], tr), arms1), TyVoid)),
+    HExprStmt(ex(XMatch(eCall(1, [ex(XUnary(UnNeg, eInt(1)), TyInt)], tr), arms1), TyVoid)),
+    HExprStmt(ex(XMatch(eBi(BParseInt, [eStr("42")], to), arms2), TyVoid)),
+    HExprStmt(ex(XMatch(eBi(BParseInt, [eStr("x")], to), arms2), TyVoid)),
+    sLogInt(eBi(BOptUnwrapOr, [eBi(BParseInt, [eStr("x")], to), eInt(7)], TyInt)),
+    sLog(eBi(BBoolToString, [eBi(BResIsOk, [eCall(1, [eInt(1)], tr)], TyBool)], TyString))
+  ]);
+  return prog(noRecords(), noUnions(), [f, g, m], 2);
+}
+
+// for-of, string append, array push/pop/index assign, COW of arrays.
+function progForOf(): Program {
+  const tsa = TyArray(TyString);
+  const tia = TyArray(TyInt);
+  const xs = eLoc(0, tsa);
+  const s = eLoc(1, TyString);
+  const acc = eLoc(2, TyString);
+  const nums = eLoc(3, tia);
+  const n = eLoc(4, TyInt);
+  const total = eLoc(5, TyInt);
+  const popped = eLoc(6, TyOption(TyInt));
+  const ys = eLoc(7, tia);
+  const idx1: PlaceElem[] = [PIndex(eUs(1))];
+  const locals = [
+    lc("xs", tsa), lc("s", TyString), lc("acc", TyString), lc("nums", tia), lc("n", TyInt),
+    lc("total", TyInt), lc("popped", TyOption(TyInt)), lc("ys", tia)
+  ];
+  const m = fn("main", 0, locals, TyVoid, [
+    HLet(0, ex(XArray([eStr("a"), eStr("b"), eStr("c")]), tsa)),
+    HLet(2, eStr("")),
+    HForOf(1, xs, blk([
+      HAssign(pLoc(2, TyString), None, eBin(OpAdd, acc, s, TyString)),
+      HAssign(pLoc(2, TyString), None, eBin(OpAdd, acc, eStr(","), TyString))
+    ])),
+    sLog(acc),
+    sLog(eBi(BArrJoin, [xs, eStr("-")], TyString)),
+    HLet(3, ex(XArray([eInt(1), eInt(2), eInt(3)]), tia)),
+    HExprStmt(ex(XMutMethod(MArrPush, pLoc(3, tia), [eInt(4)]), TyVoid)),
+    HAssign(pl(3, idx1, TyInt), None, eInt(20)),
+    HLet(5, eInt(0)),
+    HForOf(4, nums, blk([HAssign(pLoc(5, TyInt), Some(OpAdd), n)])),
+    sLogInt(total),
+    sLog(eBi(BUsizeToString, [eBi(BArrLength, [nums], TyUsize)], TyString)),
+    HLet(6, ex(XMutMethod(MArrPop, pLoc(3, tia), []), TyOption(TyInt))),
+    sLogInt(eBi(BOptUnwrap, [popped], TyInt)),
+    HLet(7, nums),
+    HExprStmt(ex(XMutMethod(MArrPush, pLoc(3, tia), [eInt(9)]), TyVoid)),
+    sLog(eBi(BUsizeToString, [eBi(BArrLength, [ys], TyUsize)], TyString)),
+    sLog(eBi(BUsizeToString, [eBi(BArrLength, [nums], TyUsize)], TyString)),
+    sLogInt(ex(XIndex(nums, eUs(1)), TyInt)),
+    HForOf(1, xs, blk([
+      HIf(eBin(OpEq, s, eStr("b"), TyBool), blk([HBreak]), None),
+      sLog(s)
+    ]))
+  ]);
+  return prog(noRecords(), noUnions(), [m], 0);
+}
+
+// String literals needing escapes, dedup, conditional, builtins.
+function progStrings(): Program {
+  const lit = "say \"hi\"\n\\ ?x\x01\x7F";
+  const m = fn("main", 0, [lc("s", TyString)], TyVoid, [
+    HLet(0, eStr(lit)),
+    sLog(eBi(BStrSubstring, [eLoc(0, TyString), eUs(0), eUs(8)], TyString)),
+    sLog(ex(XCond(eBin(OpGt, eInt(3), eInt(2), TyBool), eStr("yes"), eStr("no")), TyString)),
+    sLog(eBi(BBoolToString, [eBin(OpEq, eStr(lit), eLoc(0, TyString), TyBool)], TyString)),
+    sLogInt(eBi(BStrCharCodeAt, [eStr("A"), eUs(0)], TyInt)),
+    sLog(eBin(OpAdd, eBi(BStrCharAt, [eStr("xyz"), eUs(1)], TyString), eStr("!"), TyString)),
+    sLog(eBi(BIntToString, [eBi(BUsizeToInt, [eBi(BStrLength, [eLoc(0, TyString)], TyUsize)], TyInt)], TyString))
+  ]);
+  return prog(noRecords(), noUnions(), [m], 0);
+}
+
+function main(): void {
+  emit("hello", progHello());
+  emit("arith", progArith());
+  emit("loop", progLoop());
+  emit("records", progRecords());
+  emit("union", progUnion());
+  emit("try", progTry());
+  emit("forof", progForOf());
+  emit("strings", progStrings());
+}
