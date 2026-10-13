@@ -21,8 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 # these edge cases pin Stage 0's behaviour only.
 CLASS_SYNTAX_SKIP = {"err0200_reserved_class.or", "err0200_reserved_new.or", "err0200_reserved_this.or"}
 # The array prelude (ADR-0011) is written with closures, syntax beyond Orin-B that Stage 0 rejects.
-PRELUDE_SKIP = {os.path.join("compiler", "prelude", "array.or"),
-                os.path.join("tests", "fmt", "closures.in.or"), os.path.join("tests", "fmt", "closures.out.or"),
+PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("tests", "fmt", "closures.out.or"),
                 # these pin Stage 0's rejection of arrow functions, which Stage 1 now accepts
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
                 os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or")}

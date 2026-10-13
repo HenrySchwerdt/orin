@@ -2,10 +2,9 @@
 // pipeline if it produced diagnostics (same as bootstrap/src/checker/mod.rs `check`).
 
 import { Diagnostic, SourceMap, diag } from "../diag";
-import { Ident, DAlias, parse } from "../syntax";
+import { Ident, DAlias } from "../syntax";
 import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type } from "../hir";
-import { LoadedProgram, Unit, ImportTarget } from "../loader";
-import { preludeArraySource } from "../prelude";
+import { LoadedProgram } from "../loader";
 import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
 import { collect } from "./collect";
 import { resolveDecls, findMain } from "./decls";
@@ -137,29 +136,20 @@ function abstractType(env: Env, g: usize): Option<Diagnostic> {
   }
 }
 
-// The array prelude (compiler/prelude/array.or) as a hidden last unit `std:array`: the array methods
-// (`map`, `filter`, ...) are calls of its functions. Its spans use a file index one past the
-// source map's files. Returns the program unchanged (and `injected == false`) if the prelude does
-// not parse, which only a broken build can cause.
-type Injected = { prog: LoadedProgram; injected: bool; };
-
-function injectPrelude(prog: LoadedProgram, sm: SourceMap): Injected {
-  const file = sm.files.length;
-  const r = parse(file, preludeArraySource());
-  return match (r) {
-    Ok(m) => {
-      let units = prog.units;
-      const none: ImportTarget[] = [];
-      units.push(Unit { file: file, path: "std:array", name: "std:array", ast: m, imports: none });
-      return Injected { prog: LoadedProgram { units: units, entry: prog.entry }, injected: true };
-    },
-    Err(_) => Injected { prog: prog, injected: false }
-  };
+// Unit index of the array prelude (`array/array.or`, loaded implicitly as unit `$array/array`; see
+// compiler/loader/prelude.or), or -1 when the program was loaded without preludes.
+function arrayPreludeUnit(prog: LoadedProgram): int {
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (prog.units[i].name == "$array/array") {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
 }
 
-export function check(prog0: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
-  const inj = injectPrelude(prog0, sm);
-  const prog = inj.prog;
+export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
   // Classes are lowered to records and functions first (ADR-0009).
   const lw = lowerClasses(prog);
   if (lw.diags.length > 0) {
@@ -169,9 +159,7 @@ export function check(prog0: LoadedProgram, sm: SourceMap): Result<Program, Diag
   if (c.diags.length > 0) {
     return Err(dedupDiags(c.diags));
   }
-  if (inj.injected) {
-    c.env.prelude = (lw.prog.units.length - 1).toInt();
-  }
+  c.env.prelude = arrayPreludeUnit(lw.prog);
   const r = resolveDecls(buildClassTables(c.env, lw.classes), c.recordSrc, c.unionSrc);
   if (r.diags.length > 0) {
     return Err(dedupDiags(r.diags));

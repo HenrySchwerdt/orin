@@ -4,7 +4,7 @@
  * The textual IR emitted by `orin compile --backend=llvm` implements the small hot operations
  * (retain/release, field and array access, checked arithmetic) itself, against the object layout
  * asserted below, and calls the existing C runtime for everything else. The only header-inline
- * runtime functions it cannot express as IR are the std:io primitives; they are exported here.
+ * runtime functions it cannot express as IR (std:io primitives, string byte access) are exported here.
  * Nothing in this file changes runtime semantics.
  */
 #include "orin_runtime.h"
@@ -25,3 +25,5 @@ _Static_assert(offsetof(OrinStruct, slots) == 32, "OrinStruct.slots");
 OrinObj *orinl_io_read_bytes(uint64_t n) { return orin_io_read_bytes(n); }
 OrinObj *orinl_io_read_line(void) { return orin_io_read_line(); }
 void orinl_io_write_stdout(OrinObj *s) { orin_io_write_stdout(s); }
+int64_t orinl_io_shell(OrinObj *cmd) { return orin_io_shell(cmd); }
+int64_t orinl_str_char_code_at(OrinObj *s, uint64_t i) { return orin_str_char_code_at(s, i); }

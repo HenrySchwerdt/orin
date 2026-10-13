@@ -268,3 +268,31 @@ Notes.
   and compiles `compiler/main.or` in 1.2-1.6 s, the same as the C-built one within noise (1.5 s). It reproduces the
   C backend's `stage3.c` byte for byte, and its own `--backend=llvm` output is byte-identical to the `.ll` it was
   built from (fixed point).
+
+## R1: library string/number functions in Orin (spec 19, ADR-0013)
+
+What changed: `split`, `trim`, `indexOf`, `includes`, `startsWith`, `endsWith`, `parseInt`,
+`int/usize/bool.toString()` and `string[].join` are no longer runtime C calls but Orin functions of the std
+prelude (`std/`), compiled with every program (only the reachable ones are emitted). `orin_str_char_code_at` became
+`static inline`. Method: `tools/bench.py` with the pre-change `orin2` (copy of the binary built before R1) against the
+R1 `orin2`, same machine, back to back; the machine was shared and busy (load average 6-16 on 4 vCPUs, other
+jobs running), so only differences well above the Go/C columns' own drift are meaningful.
+
+| benchmark | before Orin median (s) | after Orin median (s) | note |
+|---|---:|---:|---|
+| strings (9 runs) | 0.164 (0.151-0.195) | 0.178 (0.154-0.217) | Go column of the same two runs: 0.131 vs 0.164 |
+| strings (15 runs, repeated twice) | 0.161 / 0.165 | 0.168 / 0.177 | +4% to +7%: within the 15% bar, consistent sign |
+| wordfreq (9 runs) | 0.233 (0.209-0.296) | 0.175 (0.169-0.199) | faster; `toString` of small ints no longer allocates (immortal one-char strings) |
+| selfcompile: `orin2` built with `--c-builtins` vs with the prelude, 14 runs each | 1.082 (1.004-1.467) | 1.163 (0.981-1.362) | +7% median, ranges overlap; same workload, the compiler itself uses these functions heavily |
+
+Counters (deterministic): strings: allocations 2,500,013 -> 2,500,003, `cow_inplace` 0 -> 500,001 (appends into
+the freshly built `join`/`toString` strings are in place), `string_grows` 20 -> 40, peak live bytes 39.9 MB -> 42.4 MB
+(`join` grows its result geometrically instead of allocating the exact size once, so it keeps spare capacity);
+wordfreq: allocations 2,006,031 -> 2,003,865, peak live bytes unchanged. Peak RSS unchanged (strings 46.2 -> 45.9
+MiB, wordfreq 2.4 -> 2.2 MiB). The generated C of the compiler grows from 2,834,084 to 2,850,660 bytes.
+
+Reading: no regression above 15%. The only plausible slowdown (strings, a few percent) comes from `join` (repeated
+append instead of one exact-size allocation) and from `int.toString()` going through a per-digit `fromCharCode` +
+append instead of one `snprintf`; `split` and `indexOf` use a first-byte scan in Orin where C used `memmem`, which
+did not show up in these workloads (short separators). Likely follow-ups: a runtime primitive to build a string
+from a byte array (would let `join`/`toString` allocate once), and inlining of `substring`/`fromCharCode`.
