@@ -2,29 +2,60 @@
 
 import { SourceFile } from "../diag";
 import { readFile, exists, FsGrant } from "std:fs";
-import { normalizePath } from "./path";
+import { normalizePath, isNormalized, allNormalized } from "./path";
 
 // In-memory files (unsaved editor buffers, spec 18 §2, and the embedded prelude roots) plus the
 // disk. Paths are compared after `normalizePath`; an in-memory file also counts as existing.
+//
+// `paths` lists the keys of `mem` in insertion order. It is redundant on purpose: the invariants tie
+// it to the map, so a key that was stored without normalizing (which a lookup by a normalized path
+// could never find) or a duplicate that overwrote an earlier file breaks them.
+@Invariant(this.paths.length == this.mem.size)
+@Invariant(allNormalized(this.paths))
+@Invariant(this.mem.size <= this.given)
 export class Sources {
   private mem: Map<string, string> = new Map<string, string>();
+  private paths: string[] = [];
+  private given: usize = 0; // number of files passed to the constructor (>= mem.size: duplicates are dropped)
 
   // `files` in priority order: when several have the same normalized path, the first one wins.
   constructor(files: SourceFile[]) {
+    this.given = files.length;
     for (const f of files) {
       const p = normalizePath(f.path);
       if (!this.mem.has(p)) {
         this.mem.set(p, f.text);
+        this.paths.push(p);
       }
     }
   }
 
-  // `p` must already be normalized. Disk access needs the file-system grant `fs` (ADR-0027): a class cannot hold a
-  // grant, so every method that may touch the disk takes it as a parameter.
+  // The in-memory text of the file at normalized path `p`, None when only the disk could have it.
+  // (Pure: usable in contracts, unlike `read` and `exists`, which may touch the disk.)
+  @Requires(isNormalized(p))
+  @Ensures(result.isSome() == this.mem.has(p))
+  overlay(p: string): Option<string> {
+    return this.mem.get(p);
+  }
+
+  // The number of distinct in-memory files.
+  @Ensures(result == this.paths.length)
+  size(): usize {
+    return this.paths.length;
+  }
+
+  // `p` must already be normalized.
+  // Disk access needs the file-system grant `fs` (ADR-0027): a class cannot hold a grant, so every method that may touch
+  // the disk takes it as a parameter.
+  @Requires(isNormalized(p))
+  @Ensures(this.mem.has(p) ==> result)
   exists(fs: FsGrant, p: string): bool {
     return this.mem.has(p) || exists(fs, p);
   }
 
+  // The overlay text when there is one (the disk is not consulted), otherwise the file on disk.
+  @Requires(isNormalized(p))
+  @Ensures(this.mem.has(p) ==> result.isOk() && result.unwrap() == this.mem.get(p).unwrap())
   read(fs: FsGrant, p: string): Result<string, string> {
     const m = this.mem.get(p);
     return m.isSome() ? Ok(m.unwrap()) : readFile(fs, p);
