@@ -238,3 +238,83 @@ Lessons:
   completely (+300 lines of diff).
 * `compiler/tests/check_env_test.or` tests `Scope`, the name tables, the type / instance keys and `dedupDiags`; for
   that `check/module.or` exports them (module boundary E0302).
+
+## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
+
+Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving
+(`tools/diff_compilers.py`: 1304 inputs x 3 modes, 0 differences; `stage2.c == stage3.c`; the
+contract-checked compiler self-compiles to byte-identical C and passes all 713 conformance tests, no
+contract fired; `ci_local.sh` green).
+
+Contract clauses (`@Requires` + `@Ensures` + `@Invariant`, `grep -c`; lines without the generated
+`embedded_*.or`):
+
+| file | lines | clauses before -> after |
+|---|---|---|
+| diag/diag.or | 96 -> 211 | 11 -> 31 |
+| loader/loader.or | 248 -> 338 | 5 -> 32 |
+| loader/modules.or | 117 -> 164 | 0 -> 20 |
+| loader/modgraph.or (new) | 0 -> 170 | 0 -> 10 |
+| loader/path.or | 147 -> 186 | 6 -> 16 |
+| loader/prelude.or | 43 -> 112 | 0 -> 5 |
+| loader/program.or | 90 -> 187 | 0 -> 6 |
+| loader/resolve.or | 123 -> 170 | 0 -> 23 |
+| loader/sources.or | 31 -> 61 | 0 -> 10 |
+| **total** | 905 -> 1621 | **22 -> 153** |
+
+Classes: 2 -> 6. New: `Diagnostics` (collector, redundant counters tied to the list by invariants),
+`ImportResolver` (was `resolveImport(src, ..., base)` + `privateModuleOf`), `SrcRoot` (module ids and
+module existence under a src root, was `moduleOf(src, root, ..)` / `moduleExists` / `unknownModules`),
+`ModuleGraph` (module edges + manifest rules + cycle check, was a record array and two methods of
+`Loader`). `Sources` and `Loader` got stronger invariants (`Sources` tracks its keys in a list so that
+"all keys normalized, no key lost to a duplicate" is checkable; `Loader` checks that `done` indexes
+exactly the units, units are topological with unique normalized paths, open files are distinct and
+not completed). Plain records stay records (`Span`, `Diagnostic`, `Unit`, `LoadedProgram`, ...): they
+are built by literals in other modules, so their invariants are documentation plus the constructor
+functions' contracts.
+
+Properties now stated (each answers "which bug would this catch?"): diagnostic spans lie in the file
+(`failedLoad`, `loadWithRoots`, `readManifest` require/ensure `allRenderable`); `render` output starts
+with the path, names the right severity and contains every note; `lineCol` is 1-based and bounded by
+the text; `normalizePath` results are normalized (no `..` in absolute results, never longer than the
+input); `relativeTo` round-trips through `joinPath`; `isInside` of the root; resolved imports are
+normalized `.or` paths or runtime modules, `std:fsraw` only from prelude code, errors are E0301 / E0302
+at the import span; `Sources` overlay lookups return the first overlay value; the unit list is
+topological, file ids are a permutation with the entry as file 0, paths and names are unique, prelude
+units have the empty module id; the entry unit starts with one import per prelude root; every unit whose
+path is in the overlay has the overlay text; the module graph is acyclic on success, checked by an
+independent Kahn-style `isAcyclic` against `findModuleCycle` (an error exactly when the graph is cyclic);
+prelude roots are well formed (virtual `$` paths, unique, entry is one of the files).
+
+Tests: `compiler/tests/loader_classes_test.or` (19 `@Test`s) drives every new class and the predicates
+on hand-built ill-formed values (a violated contract is a trap, so negative cases test the predicates).
+Mutation check: storing an unnormalized key in `Sources`, or letting a duplicate overwrite the first file,
+makes `sourcesOverlay` and `overlayTextReachesTheProgram` trap.
+
+Selfcompile wall time (`orin2 compile compiler/main.or`, 12 interleaved runs after a warm-up, shared
+machine): baseline compiler on the old tree median 4.90 s (4.47-5.69), new compiler on the new tree
+median 4.90 s (4.39-5.68): no regression (contracts are erased in normal builds).
+
+Friction found:
+
+* Class invariants run only after non-private methods, and `Loader` has one (`run`), so its invariants
+  are checked once per load, not per step; a failed `run` leaves `stack` non-empty, so "stack empty" can
+  only be an `@Ensures` of the success path. Finer-grained checking would need more public methods.
+* Record `@Invariant`s are not enforced, so `Diagnostic`, `Resolved`, `PreludeRoot` carry the property as
+  documentation and as loop-based predicates (`allWellFormed`, `isWellFormedRoot`) repeated in
+  `@Requires`; runtime-checked record invariants (at literals and field assignments) would remove that
+  duplication and would have covered every module that builds `Diagnostic` by literal.
+* Pure combinators in contracts would remove ~10 hand-written loops (`allRenderable`, `allNormalized`,
+  `allDistinct`, `countWarnings`, `importersOf`, ...): `xs.every(p)` is rejected as a call through a
+  function value. A purity rule that accepts closures whose body is pure (or prelude `every` / `some` /
+  `count` marked pure) would help most.
+* Contracts cannot call I/O, so properties of `Sources.exists` / `read` against the disk are only
+  expressible through a pure `overlay` accessor; `old(this.f.length)` works, but the checker rejects
+  mixing `usize` with `? 1 : 0` (int) in a clause (split into two implications).
+* A mutating method call inside `&&` / `||` operands of a test (`g.add(..).isOk() && g.add(..).isOk()`)
+  is E0408; the unit tests need one statement per call.
+* A contract that is too precise for a *propagating* private method fails in the first test that has a
+  nested error (`importTarget` returns errors of the files it visits): state error properties only where
+  the error is created.
+* Still not statable: idempotence of `normalizePath`, and `isNormalized(p) == (normalizePath(p) == p)`:
+  a self- or mutual call from a contract does not terminate under `--check-contracts` (tested instead).

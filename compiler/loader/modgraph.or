@@ -1,0 +1,170 @@
+// The module graph of a package (orin.toml): which module imports which, checked against the
+// manifest's `allowed_dependencies` (E0501) and for cycles (E0303; `acyclic_modules` is always on).
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Manifest, edgeError, findModuleCycle, displayModule } from "../package";
+
+// An import between two different modules of a package, kept to check the module graph for cycles.
+export type ModuleEdge = { importer: string; imported: string; at: Span; };
+
+// True when every edge joins two different, non-empty module ids ("" is the prelude / outside the src
+// root and never takes part) and its span is not inverted.
+export function edgesWellFormed(edges: ModuleEdge[]): bool {
+  for (const e of edges) {
+    if (e.importer == "" || e.imported == "" || e.importer == e.imported || e.at.start > e.at.end) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when the manifest allows every edge (E0501 rules); every recorded edge was checked on entry.
+export function edgesAllowed(m: Manifest, edges: ModuleEdge[]): bool {
+  for (const e of edges) {
+    if (edgeError(m, e.importer, e.imported).isSome()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when module graph `edges` has no directed cycle. Independent of `findModuleCycle` (which
+// finds one): repeatedly remove a module that no remaining edge points at (Kahn's algorithm); the
+// graph is acyclic exactly when everything can be removed. Loops only, so contracts may call it.
+export function isAcyclic(edges: ModuleEdge[]): bool {
+  let alive: bool[] = [];
+  for (const e of edges) {
+    alive.push(true);
+  }
+  let left: usize = edges.length;
+  let progress = true;
+  while (left > 0 && progress) {
+    progress = false;
+    let i: usize = 0;
+    while (i < edges.length) {
+      if (alive[i]) {
+        // The edge i can be dropped when its importer is not imported by any remaining edge.
+        let pointedAt = false;
+        let j: usize = 0;
+        while (j < edges.length) {
+          if (alive[j] && edges[j].imported == edges[i].importer) {
+            pointedAt = true;
+            break;
+          }
+          j += 1;
+        }
+        if (!pointedAt) {
+          alive[i] = false;
+          left -= 1;
+          progress = true;
+        }
+      }
+      i += 1;
+    }
+  }
+  return left == 0;
+}
+
+// True when `cycle` (module ids `a, b, ..., a`) is a closed walk along edges of `edges`.
+export function isCycleOf(edges: ModuleEdge[], cycle: string[]): bool {
+  if (cycle.length < 3 || cycle[0] != cycle[cycle.length - 1]) {
+    return false;
+  }
+  let k: usize = 0;
+  while (k + 1 < cycle.length) {
+    let found = false;
+    for (const e of edges) {
+      if (e.importer == cycle[k] && e.imported == cycle[k + 1]) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+    k += 1;
+  }
+  return true;
+}
+
+// The importer / imported module ids of `edges` as the parallel arrays the package API takes.
+function importersOf(edges: ModuleEdge[]): string[] {
+  let out: string[] = [];
+  for (const e of edges) {
+    out.push(e.importer);
+  }
+  return out;
+}
+
+function importedOf(edges: ModuleEdge[]): string[] {
+  let out: string[] = [];
+  for (const e of edges) {
+    out.push(e.imported);
+  }
+  return out;
+}
+
+// The edges of one load. Without a manifest (a plain file, not a package) nothing is recorded: the
+// module rules do not apply.
+@Invariant(edgesWellFormed(this.edges))
+@Invariant(this.manifest.isNone() ==> this.edges.length == 0)
+@Invariant(this.manifest.isSome() ==> edgesAllowed(this.manifest.unwrap(), this.edges))
+export class ModuleGraph {
+  private manifest: Option<Manifest>;
+  private edges: ModuleEdge[] = [];
+
+  constructor(manifest: Option<Manifest>) {
+    this.manifest = manifest;
+  }
+
+  @Ensures(result == this.edges.length)
+  edgeCount(): usize {
+    return this.edges.length;
+  }
+
+  // In a package, an import from module `from_` to module `to` must be allowed by the manifest
+  // (E0501); allowed edges are recorded for the cycle check. Prelude units and files outside the src
+  // root have no module ("") and, like imports within one module, are not recorded.
+  @Ensures(result.isErr()
+      ==> result.unwrapErr().code == "E0501" && this.edges.length == old(this.edges.length))
+  @Ensures(result.isOk() && this.manifest.isSome() && from_ != "" && to != "" && from_ != to
+      ==> this.edges.length == old(this.edges.length) + 1)
+  @Ensures(result.isOk() && (this.manifest.isNone() || from_ == "" || to == "" || from_ == to)
+      ==> this.edges.length == old(this.edges.length))
+  add(from_: string, to: string, at: Span): Result<void, Diagnostic> {
+    if (this.manifest.isNone()) {
+      return Ok();
+    }
+    if (from_ != "" && to != "" && from_ != to) {
+      const forbidden = edgeError(this.manifest.unwrap(), from_, to);
+      if (forbidden.isSome()) {
+        return Err(diag("E0501", at, forbidden.unwrap()));
+      }
+      this.edges.push(ModuleEdge { importer: from_, imported: to, at: at });
+    }
+    return Ok();
+  }
+
+  // True when the recorded module graph has no cycle (`acyclic_modules`).
+  @Ensures(result == isAcyclic(this.edges))
+  acyclic(): bool {
+    return isAcyclic(this.edges);
+  }
+
+  // The module graph of a package must be acyclic (E0303), reported at the import that closes the
+  // cycle: the last edge back to the cycle's first module. The two cycle algorithms (`findModuleCycle`
+  // here, `isAcyclic` in the contract) must agree: an error exactly when the graph has a cycle.
+  @Ensures(result.isErr() == !isAcyclic(this.edges))
+  @Ensures(result.isErr() ==> result.unwrapErr().code == "E0303")
+  checkCycles(): Result<void, Diagnostic> {
+    const cycle = findModuleCycle(importersOf(this.edges), importedOf(this.edges));
+    if (cycle.length == 0) {
+      return Ok();
+    }
+    const last = cycle[cycle.length - 1];
+    const beforeLast = cycle[cycle.length - 2];
+    const closing = this.edges.filter(e => e.importer == beforeLast && e.imported == last);
+    const shown = cycle.map(m => displayModule(m)).join(" -> ");
+    return Err(diag("E0303", closing[closing.length - 1].at, `module import cycle: ${shown}`));
+  }
+}

@@ -6,38 +6,125 @@
 // lexically (see path.or), not canonicalized.
 
 import { Module, Item, ImportDecl, Ident, parse } from "../syntax";
-import { Span, SourceMap, SourceFile, Diagnostic, diag, span, isRenderable } from "../diag";
-import { Manifest, edgeError, findModuleCycle, displayModule } from "../package";
+import {
+  Span, SourceMap, SourceFile, Diagnostic, diag, span, allRenderable, allWellFormed,
+} from "../diag";
+import { Manifest } from "../package";
 import {
   ImportTarget, StdModule, Unit, LoadedProgram, LoadOutcome, failedLoad, importOf, isWellFormed,
+  isValidOutcome, isTopological, allUnitsWellFormed, targetBelow,
 } from "./program";
-import { normalizePath, dirname, joinPath } from "./path";
-import { PreludeRoot, noPreludeRoots } from "./prelude";
+import { normalizePath, isNormalized, allNormalized, allDistinct, dirname, joinPath } from "./path";
+import { PreludeRoot, noPreludeRoots, rootsWellFormed, countEntries } from "./prelude";
 import { Sources } from "./sources";
-import { Resolved, resolveImport, unitName } from "./resolve";
-import { moduleOf, findManifest, readManifest, manifestEntry } from "./modules";
+import { ImportResolver } from "./resolve";
+import { ModuleGraph } from "./modgraph";
+import { SrcRoot, findManifest, readManifest, manifestEntry } from "./modules";
 
 export type LoadResult = { program: LoadedProgram; sm: SourceMap; };
 
-// An import between two different modules of a package, kept to check the module graph for cycles.
-type ModuleEdge = { importer: string; imported: string; at: Span; };
+// True when unit `i` of `units` is the one `done` records for its path, for every unit: the index
+// map and the unit list describe the same set of files.
+function unitsIndexed(units: Unit[], done: Map<string, usize>): bool {
+  let i: usize = 0;
+  while (i < units.length) {
+    const at = done.get(units[i].path);
+    if (at.isNone() || at.unwrap() != i) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// True when none of the files in `open` has been completed (`done`): a file is either being loaded
+// or finished, never both (this is what lets a re-entered open file be reported as a cycle).
+function noneDone(open: string[], done: Map<string, usize>): bool {
+  for (const p of open) {
+    if (done.has(p)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when the entry unit of `p` starts with one unit import per prelude root that has an entry
+// file, in root order, each naming that root's entry file (the loader prepends them to the entry's
+// own items, so the prelude units sort before everything the program imports).
+function importsPreludeRoots(p: LoadedProgram, roots: PreludeRoot[]): bool {
+  if (p.entry >= p.units.length) {
+    return false;
+  }
+  const imps = p.units[p.entry].imports;
+  let k: usize = 0;
+  for (const r of roots) {
+    if (r.entry != "") {
+      if (k >= imps.length) {
+        return false;
+      }
+      const ok = match (imps[k]) {
+        ImportUnit(u) => u < p.units.length && p.units[u].path == normalizePath(r.entry),
+        ImportStd(_) => false,
+      };
+      if (!ok) {
+        return false;
+      }
+      k += 1;
+    }
+  }
+  return true;
+}
+
+// The text of the first overlay file whose normalized path is `path` (the one `Sources` serves).
+function firstOverlayText(overlay: SourceFile[], path: string): Option<string> {
+  for (const f of overlay) {
+    if (normalizePath(f.path) == path) {
+      return Some(f.text);
+    }
+  }
+  return None;
+}
+
+// True when every loaded unit whose path is in the overlay has the text of the first such overlay
+// file: unsaved editor buffers shadow the disk, and the first of several duplicates wins.
+function overlayRespected(overlay: SourceFile[], o: LoadOutcome): bool {
+  if (o.program.isNone()) {
+    return true;
+  }
+  for (const u of o.program.unwrap().units) {
+    const t = firstOverlayText(overlay, u.path);
+    if (t.isSome() && o.sm.files[u.file].text != t.unwrap()) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // One load of a program. `files` and `units` are filled while walking the import graph; after a
 // failed `run`, `files` holds every file read so far (the entry first, then in discovery order).
+//
+// The invariants hold after every `run` (also a failed one, which leaves `stack` non-empty): the
+// units are in dependency order with unique, normalized paths; `done` indexes exactly the units;
+// `stack` holds distinct files that are not completed; without a manifest no module edge exists.
 @Invariant(this.units.length == this.done.size)
 @Invariant(this.done.size + this.stack.length <= this.files.length)
+@Invariant(unitsIndexed(this.units, this.done))
+@Invariant(isTopological(this.units) && allUnitsWellFormed(this.units))
+@Invariant(allNormalized(this.stack) && allDistinct(this.stack) && noneDone(this.stack, this.done))
+@Invariant(this.manifest.isNone() ==> this.graph.edgeCount() == 0)
 class Loader {
   files: SourceFile[] = [];
   private units: Unit[] = [];
   private done: Map<string, usize> = new Map<string, usize>(); // file path -> index in `units`
   private stack: string[] = []; // files being loaded (their imports are not complete yet)
-  private edges: ModuleEdge[] = [];
+  private graph: ModuleGraph;
   private src: Sources;
   private roots: PreludeRoot[];
-  private base: string; // directory of the entry file; unit names are relative to it
-  private srcRoot: string; // module ids are relative to this directory
+  private resolver: ImportResolver; // knows the entry file's directory; unit names are relative to it
+  private tree: SrcRoot; // module ids are relative to its root
   private manifest: Option<Manifest>;
 
+  @Requires(isNormalized(base) && isNormalized(srcRoot))
   constructor(
     src: Sources,
     roots: PreludeRoot[],
@@ -47,12 +134,21 @@ class Loader {
   ) {
     this.src = src;
     this.roots = roots;
-    this.base = base;
-    this.srcRoot = srcRoot;
+    this.resolver = new ImportResolver(src, base);
+    this.tree = new SrcRoot(src, srcRoot);
+    this.graph = new ModuleGraph(manifest);
     this.manifest = manifest;
   }
 
   // Loads the entry file and everything it imports; the entry is the last unit.
+  @Requires(isNormalized(entry))
+  @Ensures(result.isOk() ==> this.stack.length == 0 && this.files.length == this.units.length)
+  @Ensures(result.isOk() ==> isWellFormed(result.unwrap(), SourceMap { files: this.files }))
+  @Ensures(result.isOk() ==> result.unwrap().manifest.isSome() == this.manifest.isSome())
+  @Ensures(result.isOk() ==> importsPreludeRoots(result.unwrap(), this.roots))
+  @Ensures(result.isOk() ==> this.graph.acyclic())
+  @Ensures(result.isErr()
+      ==> this.files.length > 0 && isRenderableErr(this.files, result.unwrapErr()))
   run(entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
     this.visit(entry, entryDisplay)?;
     this.checkModuleCycles()?;
@@ -65,6 +161,11 @@ class Loader {
 
   // Opens, parses and completes the unit of file `path` (`display` is how diagnostics name it);
   // returns its index in `units`.
+  @Requires(isNormalized(path) && !this.done.has(path))
+  @Ensures(result.isOk()
+      ==> result.unwrap() < this.units.length && this.units[result.unwrap()].path == path)
+  @Ensures(result.isOk()
+      ==> this.done.has(path) && this.files[this.units[result.unwrap()].file].path == display)
   private visit(path: string, display: string): Result<usize, Diagnostic> {
     const text = this.src.read(path);
     if (text.isErr()) {
@@ -97,8 +198,8 @@ class Loader {
     this.units.push(Unit {
       file: file,
       path: path,
-      name: unitName(this.base, path),
-      module: moduleOf(this.src, this.srcRoot, path),
+      name: this.resolver.nameOf(path),
+      module: this.tree.moduleOf(path),
       ast: ast,
       imports: imports,
     });
@@ -108,6 +209,8 @@ class Loader {
 
   // `import {} from "<entry>"` for every prelude root that has an entry file (library roots such as
   // std:path are served from memory and imported on demand).
+  @Requires(file == 0)
+  @Ensures(result.length == countEntries(this.roots))
   private preludeImports(file: usize): Item[] {
     const sp = span(file, 0, 0);
     const none: Ident[] = [];
@@ -116,8 +219,10 @@ class Loader {
         .map(r => IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp, span: sp }));
   }
 
+  @Requires(isNormalized(importer))
+  @Ensures(result.isOk() ==> targetBelow(result.unwrap(), this.units.length))
   private importTarget(importer: string, decl: ImportDecl): Result<ImportTarget, Diagnostic> {
-    const res = resolveImport(this.src, importer, decl.path, decl.pathSpan, this.base)?;
+    const res = this.resolver.resolve(importer, decl.path, decl.pathSpan)?;
     if (res.std.isSome()) {
       return Ok(ImportStd(res.std.unwrap()));
     }
@@ -132,54 +237,33 @@ class Loader {
       const chain = this.stack
           .slice(open.unwrap(), this.stack.length)
           .concat([res.path])
-          .map(p => unitName(this.base, p));
+          .map(p => this.resolver.nameOf(p));
       return Err(diag("E0303", decl.pathSpan, `import cycle: ${chain.join(" -> ")}`));
     }
     return Ok(ImportUnit(this.visit(res.path, res.path)?));
   }
 
   // In a package, an import between two different modules must be allowed by the manifest (E0501);
-  // allowed edges are collected for the cycle check. Prelude units and files outside the src root
-  // have no module ("").
+  // allowed edges are collected for the cycle check (see ModuleGraph).
+  @Requires(isNormalized(importer) && isNormalized(target))
+  @Ensures(this.manifest.isNone()
+      ==> result.isOk() && this.graph.edgeCount() == old(this.graph.edgeCount()))
   private recordModuleEdge(importer: string, target: string, at: Span): Result<void, Diagnostic> {
     if (this.manifest.isNone()) {
       return Ok();
     }
-    const fromModule = moduleOf(this.src, this.srcRoot, importer);
-    const toModule = moduleOf(this.src, this.srcRoot, target);
-    if (fromModule != "" && toModule != "" && fromModule != toModule) {
-      const forbidden = edgeError(this.manifest.unwrap(), fromModule, toModule);
-      if (forbidden.isSome()) {
-        return Err(diag("E0501", at, forbidden.unwrap()));
-      }
-      this.edges.push(ModuleEdge { importer: fromModule, imported: toModule, at: at });
-    }
-    return Ok();
+    return this.graph.add(this.tree.moduleOf(importer), this.tree.moduleOf(target), at);
   }
 
-  // The module graph of a package must be acyclic (E0303), reported at the import that closes the
-  // cycle: the last edge back to the cycle's first module.
+  // The module graph of a package must be acyclic (E0303), reported at the import that closes the cycle.
   private checkModuleCycles(): Result<void, Diagnostic> {
-    const cycle = findModuleCycle(this.edges.map(e => e.importer), this.edges.map(e => e.imported));
-    if (cycle.length == 0) {
-      return Ok();
-    }
-    const last = cycle[cycle.length - 1];
-    const beforeLast = cycle[cycle.length - 2];
-    const closing = this.edges.filter(e => e.importer == beforeLast && e.imported == last);
-    const shown = cycle.map(m => displayModule(m)).join(" -> ");
-    return Err(diag("E0303", closing[closing.length - 1].at, `module import cycle: ${shown}`));
+    return this.graph.checkCycles();
   }
 }
 
-// True when every diagnostic can be rendered against `sm`.
-function allRenderable(sm: SourceMap, ds: Diagnostic[]): bool {
-  for (const d of ds) {
-    if (!isRenderable(sm, d)) {
-      return false;
-    }
-  }
-  return true;
+// True when the single diagnostic `d` of a failed load can be rendered against the files read so far.
+function isRenderableErr(files: SourceFile[], d: Diagnostic): bool {
+  return allRenderable(SourceMap { files: files }, [d]);
 }
 
 // Loads the program rooted at `entryPath`, which may also be a package directory (orin.toml) or a
@@ -189,9 +273,11 @@ function allRenderable(sm: SourceMap, ds: Diagnostic[]): bool {
 // entry file is imported (with no names) by the program's entry file, so the prelude units come
 // first in `units` (before the entry's own dependencies) and are checked, lowered and emitted with
 // the program. (The entry file keeps file id 0; prelude files get the next ids.)
-@Ensures(result.program.isSome() == (result.diags.length == 0))
-@Ensures(result.program.isSome() ==> isWellFormed(result.program.unwrap(), result.sm))
-@Ensures(allRenderable(result.sm, result.diags))
+@Requires(rootsWellFormed(roots))
+@Ensures(isValidOutcome(result))
+@Ensures(result.sm.files.length > 0 && allWellFormed(result.diags))
+@Ensures(overlayRespected(overlay, result))
+@Ensures(result.program.isSome() ==> importsPreludeRoots(result.program.unwrap(), roots))
 export function loadWithRoots(
   entryPath: string,
   overlay: SourceFile[],
@@ -231,14 +317,18 @@ export function loadWithRoots(
 }
 
 // Like loadWithRoots with the roots every compilation has (the array API and the Orin std modules).
+@Ensures(isValidOutcome(result) && result.sm.files.length > 0)
 export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
   return loadWithRoots(entryPath, overlay, noPreludeRoots());
 }
 
+@Ensures(isValidOutcome(result) && result.sm.files.length > 0)
 export function loadAll(entryPath: string): LoadOutcome {
   return loadWithOverlay(entryPath, []);
 }
 
+@Ensures(result.isOk() ==> isWellFormed(result.unwrap().program, result.unwrap().sm))
+@Ensures(result.isErr() ==> result.unwrapErr().length > 0 && allWellFormed(result.unwrapErr()))
 export function load(entryPath: string): Result<LoadResult, Diagnostic[]> {
   const o = loadAll(entryPath);
   return match (o.program) {
