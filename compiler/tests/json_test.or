@@ -1,0 +1,98 @@
+// Assertions for compiler/json. Prints `ok` or one line per failure (exit 1).
+// Build: build/bootstrap/orin2 compile compiler/tests/json_test.or -o x.c && cc -O1 -w -I runtime x.c runtime/orin_runtime.c
+
+import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, parseJson, stringifyJson, getField, getStr, getInt, getBool, getArr, getPathStr, getPathInt } from "../json";
+import { exit } from "std:process";
+
+function eq(fails: string[], what: string, got: string, want: string): string[] {
+  let f = fails;
+  if (got != want) {
+    f.push(what + ": got `" + got + "`, want `" + want + "`");
+  }
+  return f;
+}
+
+// Parse then re-serialize (or the error text).
+function rt(s: string): string {
+  const r = parseJson(s);
+  return match (r) {
+    Ok(j) => stringifyJson(j),
+    Err(e) => "ERR " + e
+  };
+}
+
+function main(): void {
+  let f: string[] = [];
+  f = eq(f, "null", rt("null"), "null");
+  f = eq(f, "true", rt(" true "), "true");
+  f = eq(f, "false", rt("false"), "false");
+  f = eq(f, "int", rt("42"), "42");
+  f = eq(f, "neg", rt("-7"), "-7");
+  f = eq(f, "zero", rt("0"), "0");
+  f = eq(f, "frac trunc", rt("1.9"), "1");
+  f = eq(f, "neg frac trunc", rt("-1.9"), "-1");
+  f = eq(f, "exp", rt("1e3"), "ERR exponent notation is not supported at offset 1");
+  f = eq(f, "big", rt("1234567890123456789"), "ERR integer too large at offset 0");
+  f = eq(f, "18 digits", rt("123456789012345678"), "123456789012345678");
+  f = eq(f, "string", rt("\"hi\""), "\"hi\"");
+  f = eq(f, "escapes", rt("\"a\\nb\\t\\\"q\\\"\\\\ \\/\""), "\"a\\nb\\t\\\"q\\\"\\\\ /\"");
+  f = eq(f, "ctl out", rt("\"\\u0001\\b\""), "\"\\u0001\\u0008\"");
+  f = eq(f, "u 2byte", rt("\"\\u00e9\""), "\"\xc3\xa9\"");
+  f = eq(f, "u 3byte", rt("\"\\u20ac\""), "\"\xe2\x82\xac\"");
+  f = eq(f, "u surrogate pair", rt("\"\\ud83d\\ude00\""), "\"\xf0\x9f\x98\x80\"");
+  f = eq(f, "u lone high", rt("\"\\ud83dx\""), "\"\xef\xbf\xbdx\"");
+  f = eq(f, "u lone low", rt("\"\\ude00\""), "\"\xef\xbf\xbd\"");
+  f = eq(f, "utf8 passthrough", rt("\"\xc3\xa9\""), "\"\xc3\xa9\"");
+  f = eq(f, "empty arr", rt("[ ]"), "[]");
+  f = eq(f, "empty obj", rt("{ }"), "{}");
+  f = eq(f, "nested", rt(" { \"a\" : [1, 2, {\"b\":null}], \"c\": \"d\" } "), "{\"a\":[1,2,{\"b\":null}],\"c\":\"d\"}");
+  f = eq(f, "err trailing", rt("1 2"), "ERR trailing characters at offset 2");
+  f = eq(f, "err empty", rt(""), "ERR unexpected end of input at offset 0");
+  f = eq(f, "err unterminated str", rt("\"abc"), "ERR unterminated string at offset 0");
+  f = eq(f, "err arr", rt("[1 2]"), "ERR expected `,` or `]` at offset 3");
+  f = eq(f, "err obj key", rt("{1:2}"), "ERR expected string key at offset 1");
+  f = eq(f, "err trailing comma", rt("[1,]"), "ERR unexpected character at offset 3");
+  f = eq(f, "err bad lit", rt("tru"), "ERR unexpected character at offset 0");
+  f = eq(f, "err bad escape", rt("\"\\q\""), "ERR invalid escape at offset 1");
+  f = eq(f, "err ctl", rt("\"a\nb\""), "ERR control character in string at offset 2");
+
+  // Deep nesting is rejected rather than overflowing the stack.
+  let deep = "";
+  let i = 0;
+  while (i < 300) {
+    deep += "[";
+    i += 1;
+  }
+  f = eq(f, "deep", rt(deep).substring(0, 22), "ERR nesting too deep a");
+
+  // Accessors.
+  const pr = parseJson("{\"id\":3,\"method\":\"m\",\"ok\":true,\"xs\":[1,2],\"p\":{\"q\":{\"r\":\"deep\",\"n\":9}}}");
+  match (pr) {
+    Err(e) => { f.push("accessor parse: " + e); },
+    Ok(j) => {
+      f = eq(f, "getInt", getInt(j, "id").unwrapOr(-1).toString(), "3");
+      f = eq(f, "getStr", getStr(j, "method").unwrapOr("?"), "m");
+      f = eq(f, "getBool", getBool(j, "ok").unwrapOr(false).toString(), "true");
+      f = eq(f, "getArr", getArr(j, "xs").unwrap().length.toString(), "2");
+      f = eq(f, "missing", getStr(j, "nope").isNone().toString(), "true");
+      f = eq(f, "wrong type", getStr(j, "id").isNone().toString(), "true");
+      f = eq(f, "path str", getPathStr(j, ["p", "q", "r"]).unwrapOr("?"), "deep");
+      f = eq(f, "path int", getPathInt(j, ["p", "q", "n"]).unwrapOr(-1).toString(), "9");
+      f = eq(f, "path missing", getPathStr(j, ["p", "z", "r"]).isNone().toString(), "true");
+    }
+  }
+
+  // Serializer on constructed values.
+  const built = JObj([JField { key: "k\"", value: JArr([JNum(1), JStr("a\x01"), JBool(false), JNull]) }]);
+  f = eq(f, "build", stringifyJson(built), "{\"k\\\"\":[1,\"a\\u0001\",false,null]}");
+  f = eq(f, "dup key first", getStr(JObj([JField { key: "a", value: JStr("1") }, JField { key: "a", value: JStr("2") }]), "a").unwrap(), "1");
+
+  if (f.length == 0) {
+    console.log("ok");
+  } else {
+    for (const m of f) {
+      console.log("FAIL " + m);
+    }
+    exit(1);
+  }
+}

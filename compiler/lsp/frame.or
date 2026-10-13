@@ -1,0 +1,64 @@
+// LSP base-protocol framing (`Content-Length: N\r\n\r\n<body>`) as pure string functions.
+// Strings are byte strings, so N is `body.length` (UTF-8 bytes) as the protocol requires.
+
+export type Unframed = { messages: string[]; rest: string; };
+
+export function frameMessage(body: string): string {
+  return "Content-Length: " + body.length.toString() + "\r\n\r\n" + body;
+}
+
+function lower(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c >= 65 && c <= 90) {
+      out += String.fromCharCode(c + 32);
+    } else {
+      out += s.charAt(i);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+// Content-Length value from a header block (`Name: value` lines separated by CRLF), if present.
+function contentLength(header: string): Result<int, string> {
+  for (const line of header.split("\r\n")) {
+    const k = line.indexOf(":");
+    if (k.isSome()) {
+      const name = lower(line.substring(0, k.unwrap()).trim());
+      if (name == "content-length") {
+        const v = parseInt(line.substring(k.unwrap() + 1, line.length).trim());
+        if (v.isNone() || v.unwrap() < 0) {
+          return Err("invalid Content-Length header");
+        }
+        return Ok(v.unwrap());
+      }
+    }
+  }
+  return Err("missing Content-Length header");
+}
+
+// Extract every complete message from `buf`. `rest` holds the trailing incomplete bytes (to be
+// prepended to the next read). Err on a malformed header block.
+export function unframe(buf: string): Result<Unframed, string> {
+  let messages: string[] = [];
+  let pos: usize = 0;
+  while (true) {
+    const tail = buf.substring(pos, buf.length);
+    const he = tail.indexOf("\r\n\r\n");
+    if (he.isNone()) {
+      break;
+    }
+    const n = contentLength(tail.substring(0, he.unwrap()))?;
+    const bodyStart = he.unwrap() + 4;
+    const total = bodyStart + n.toUsize();
+    if (tail.length < total) {
+      break;
+    }
+    messages.push(tail.substring(bodyStart, total));
+    pos += total;
+  }
+  return Ok(Unframed { messages: messages, rest: buf.substring(pos, buf.length) });
+}

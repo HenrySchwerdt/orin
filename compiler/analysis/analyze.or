@@ -1,0 +1,184 @@
+// Whole-program analysis (spec 18 §2, Phase 1: recompute everything on each call).
+//
+// `analyze(ws, entry)` loads the program rooted at `entry` through the workspace overlay,
+// type-checks it and returns all diagnostics keyed by file path, tagged with the workspace
+// revision. Diagnostics are deterministic: loader/checker order is preserved.
+//
+// Entry convention: an editor document is analysed as its own entry (Phase 1). The checker
+// requires the entry file to define `main` (E0412) and stops before checking bodies when it is
+// missing, which would hide every type error in a library module. `analyze` therefore appends a
+// synthetic `function main(): void {}` to the ENTRY text when the entry parses but defines no
+// `main`; the appended region is past the real end of the file, any diagnostic located there is
+// dropped, and the SourceMap keeps the original text. (Entries that fail to parse are left alone:
+// the syntax error is the only diagnostic anyway.)
+
+import { Module, Item, parse } from "../syntax";
+import { Diagnostic, SourceMap, SourceFile } from "../diag";
+import { LoadedProgram, loadWithOverlay, normalizePath } from "../loader";
+import { check } from "../check";
+import { SemanticIndex } from "../hir";
+import { Workspace } from "./workspace";
+
+// A diagnostic with its file path and byte range [start, end).
+export type PathDiag = {
+  path: string;
+  code: string;
+  message: string;
+  start: usize;
+  end: usize;
+  notes: string[];
+};
+
+export type Analysis = {
+  revision: int;               // workspace revision this result was computed at
+  entry: string;               // normalized entry path
+  sm: SourceMap;               // every file read (index == Span.file); entry is file 0
+  diags: PathDiag[];
+  program: Option<LoadedProgram>;   // Some when loading succeeded (even if checking failed)
+  // Semantic index (defs/refs/types, hir/index.or). None until the checker produces it; see
+  // `indexAvailable`.
+  index: Option<SemanticIndex>;
+};
+
+// True once `runCheck` can return a SemanticIndex. The lead flips this when the checker gains
+// a producer; the LSP only advertises definition/hover/references/rename when it is true.
+export function indexAvailable(): bool {
+  return false;
+}
+
+// Isolation point for the checker API: the only place that calls `check`. When the checker
+// returns `{ program, index }`, return `Ok(Some(index))` here.
+function runCheck(prog: LoadedProgram, sm: SourceMap): Result<Option<SemanticIndex>, Diagnostic[]> {
+  const r = check(prog, sm);
+  return match (r) {
+    Ok(_) => Ok(None),
+    Err(ds) => Err(ds)
+  };
+}
+
+function definesMain(m: Module): bool {
+  for (const it of m.items) {
+    const found = match (it) {
+      IFunction(f) => f.name.name == "main",
+      _ => false
+    };
+    if (found) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const SYNTHETIC_MAIN: string = "\nfunction main(): void {}\n";
+
+// Overlay for loading: the workspace buffers, with the entry buffer (or its disk text, via
+// `entryText`) extended by a synthetic main when needed. Returns the overlay and the original
+// entry text length (or -1 if untouched).
+type Prepared = { files: SourceFile[]; origLen: int; origText: string; };
+
+function prepare(ws: Workspace, entry: string, entryText: Option<string>): Prepared {
+  let files: SourceFile[] = [];
+  let origLen: int = -1;
+  let origText = "";
+  let text: Option<string> = entryText;
+  for (const f of ws.files) {
+    if (f.path == entry) {
+      text = Some(f.text);
+    } else {
+      files.push(f);
+    }
+  }
+  if (text.isSome()) {
+    const t = text.unwrap();
+    const pr = parse(0, t);
+    if (pr.isOk() && !definesMain(pr.unwrap())) {
+      files.push(SourceFile { path: entry, text: t + SYNTHETIC_MAIN });
+      origLen = t.length.toInt();
+      origText = t;
+    } else {
+      files.push(SourceFile { path: entry, text: t });
+    }
+  }
+  return Prepared { files: files, origLen: origLen, origText: origText };
+}
+
+function convert(sm: SourceMap, ds: Diagnostic[], origLen: int): PathDiag[] {
+  let out: PathDiag[] = [];
+  for (const d of ds) {
+    if (origLen >= 0 && d.span.file == 0 && d.span.start.toInt() >= origLen) {
+      continue;
+    }
+    let end = d.span.end;
+    if (origLen >= 0 && d.span.file == 0 && end.toInt() > origLen) {
+      end = origLen.toUsize();
+    }
+    out.push(PathDiag {
+      path: sm.files[d.span.file].path,
+      code: d.code,
+      message: d.message,
+      start: d.span.start,
+      end: end,
+      notes: d.notes
+    });
+  }
+  return out;
+}
+
+export function analyze(ws: Workspace, entryPath: string): Analysis {
+  const entry = normalizePath(entryPath);
+  // Entry text comes from the overlay; when absent the loader reads the disk and no synthetic
+  // main is added (the on-disk entry is expected to be a real program).
+  const prep = prepare(ws, entry, None);
+  const lo = loadWithOverlay(entry, prep.files);
+  let sm = lo.sm;
+  if (prep.origLen >= 0 && sm.files.length > 0) {
+    let files = sm.files;
+    files[0] = SourceFile { path: files[0].path, text: prep.origText };
+    sm = SourceMap { files: files };
+  }
+  if (lo.diags.length > 0) {
+    return Analysis {
+      revision: ws.revision,
+      entry: entry,
+      sm: sm,
+      diags: convert(sm, lo.diags, prep.origLen),
+      program: None,
+      index: None
+    };
+  }
+  const prog = lo.program.unwrap();
+  return match (runCheck(prog, lo.sm)) {
+    Ok(idx) => Analysis {
+      revision: ws.revision, entry: entry, sm: sm, diags: [], program: Some(prog), index: idx
+    },
+    Err(ds) => Analysis {
+      revision: ws.revision, entry: entry, sm: sm, diags: convert(sm, ds, prep.origLen),
+      program: Some(prog), index: None
+    }
+  };
+}
+
+// Diagnostics located in `path` (normalized comparison).
+export function diagsForPath(a: Analysis, path: string): PathDiag[] {
+  const p = normalizePath(path);
+  let out: PathDiag[] = [];
+  for (const d of a.diags) {
+    if (d.path == p) {
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+// Index of `path` in the analysis SourceMap (the `file` of its spans), if it was read.
+export function fileIndexOf(a: Analysis, path: string): Option<usize> {
+  const p = normalizePath(path);
+  let i: usize = 0;
+  while (i < a.sm.files.length) {
+    if (a.sm.files[i].path == p) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}

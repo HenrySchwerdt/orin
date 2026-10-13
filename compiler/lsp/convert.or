@@ -1,0 +1,102 @@
+// Analysis results -> LSP JSON shapes.
+//
+// Positions: `line` is 0-based and `character` counts UTF-16 code units (analysis/pos.or handles
+// UTF-8 multi-byte text correctly: 1 unit per code point, 2 for astral code points).
+
+import { Json, JNum, JStr, JArr, JBool, JObj, jField } from "../json";
+import { Pos, offsetToPos, DocSymbol, CompletionItem, DeclKind, PathDiag } from "../analysis";
+
+export function posJson(p: Pos): Json {
+  return JObj([jField("line", JNum(p.line.toInt())), jField("character", JNum(p.character.toInt()))]);
+}
+
+export function rangeJson(text: string, start: usize, end: usize): Json {
+  return JObj([
+    jField("start", posJson(offsetToPos(text, start))),
+    jField("end", posJson(offsetToPos(text, end)))
+  ]);
+}
+
+// LSP SymbolKind.
+function symbolKindNum(k: DeclKind): int {
+  return match (k) {
+    DkFunction => 12,
+    DkRecord => 23,
+    DkUnion => 10,
+    DkAlias => 5,
+    DkConst => 14,
+    DkField => 8,
+    DkVariant => 22,
+    _ => 13
+  };
+}
+
+// LSP CompletionItemKind.
+function completionKindNum(k: DeclKind): int {
+  return match (k) {
+    DkFunction => 3,
+    DkRecord => 22,
+    DkUnion => 13,
+    DkAlias => 7,
+    DkConst => 21,
+    DkField => 5,
+    DkVariant => 20,
+    DkKeyword => 14,
+    DkBuiltinType => 22,
+    DkImported => 6
+  };
+}
+
+export function documentSymbolJson(text: string, s: DocSymbol): Json {
+  let kids: Json[] = [];
+  for (const c of s.children) {
+    kids.push(documentSymbolJson(text, c));
+  }
+  return JObj([
+    jField("name", JStr(s.name)),
+    jField("detail", JStr(s.detail)),
+    jField("kind", JNum(symbolKindNum(s.kind))),
+    jField("range", rangeJson(text, s.span.start, s.span.end)),
+    jField("selectionRange", rangeJson(text, s.nameSpan.start, s.nameSpan.end)),
+    jField("children", JArr(kids))
+  ]);
+}
+
+export function completionJson(c: CompletionItem): Json {
+  return JObj([
+    jField("label", JStr(c.label)),
+    jField("kind", JNum(completionKindNum(c.kind))),
+    jField("detail", JStr(c.detail))
+  ]);
+}
+
+// Zero-width diagnostics are widened by one byte (when possible) so editors can draw them.
+export function diagnosticJson(text: string, d: PathDiag): Json {
+  let end = d.end;
+  if (end <= d.start && d.start < text.length) {
+    end = d.start + 1;
+  }
+  let msg = d.message;
+  for (const n of d.notes) {
+    msg += "\nnote: " + n;
+  }
+  return JObj([
+    jField("range", rangeJson(text, d.start, end)),
+    jField("severity", JNum(1)),
+    jField("code", JStr(d.code)),
+    jField("source", JStr("orin")),
+    jField("message", JStr(msg))
+  ]);
+}
+
+// A single edit replacing the whole document (the result shape of `textDocument/formatting`
+// when the formatted text differs from the original).
+export function fullDocumentEdits(text: string, newText: string): Json[] {
+  if (text == newText) {
+    return [];
+  }
+  return [JObj([
+    jField("range", rangeJson(text, 0, text.length)),
+    jField("newText", JStr(newText))
+  ])];
+}

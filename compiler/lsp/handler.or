@@ -1,0 +1,563 @@
+// Language Server Protocol message handling as PURE functions (spec 18 §3).
+//
+//   handle(state, msg) -> { state, out }     one decoded JSON-RPC message in, messages out
+//   handleText(state, body)                  same, from the raw JSON text (parse errors -> -32700)
+//   pump(state, buffer)                      Content-Length framed bytes in -> framed bytes out
+//
+// The stdio loop (reading stdin, writing stdout) is NOT here: the driver appends bytes to a
+// buffer, calls `pump`, writes `output`, keeps `rest` as the new buffer and stops when
+// `lspExitCode(state)` is Some.
+//
+// Phase 1 behaviour:
+//   - Full-text sync. Every open document is its own analysis entry; on every change ALL open
+//     documents are re-analysed and `publishDiagnostics` is sent for each open document, for
+//     every other file that has diagnostics, and (empty) for files whose diagnostics went away.
+//   - Only `file://` URIs are handled (others are ignored). Positions are UTF-16 based.
+//   - definition/hover/references/rename need the checker's SemanticIndex; until the checker
+//     produces it (`indexAvailable()`) they are not advertised and answer null.
+
+import { Json, JField, JNull, JNum, JStr, JArr, JBool, JObj, jField, asArr, getField, getStr, getInt, getBool, getArr,
+  getPath, getPathStr, getPathInt, parseJson, stringifyJson } from "../json";
+import { Workspace, newWorkspace, openFile, changeFile, closeFile, openPaths, fileText, analyze, Analysis,
+  PathDiag, fileIndexOf, indexAvailable, documentSymbols, readText, declCompletions, keywordCompletions,
+  builtinCompletions, CompletionItem, posToOffset, definitionAt, hoverAt, referencesTo, renameEdits,
+  symbolSpanAt, TextEdit } from "../analysis";
+import { SemanticIndex } from "../hir";
+import { Span } from "../diag";
+import { frameMessage, unframe } from "./frame";
+import { formatAvailable, formatDocument } from "./format";
+import { uriToPath, pathToUri } from "./uri";
+import { rangeJson, documentSymbolJson, completionJson, diagnosticJson, fullDocumentEdits } from "./convert";
+
+export type LspState = {
+  ws: Workspace;
+  inited: bool;               // `initialize` received
+  shutdownRequested: bool;
+  exited: bool;               // `exit` received
+  published: string[];        // paths that currently have non-empty diagnostics published
+  // Test seam: when Some, used instead of `Analysis.index` (the checker does not produce one
+  // yet). Remove once the checker side table exists.
+  testIndex: Option<SemanticIndex>;
+};
+
+export type LspStep = { state: LspState; out: Json[]; };
+
+export function newLspState(): LspState {
+  const none: string[] = [];
+  return LspState {
+    ws: newWorkspace(), inited: false, shutdownRequested: false, exited: false,
+    published: none, testIndex: None
+  };
+}
+
+export function withTestIndex(st: LspState, idx: SemanticIndex): LspState {
+  return LspState { ...st, testIndex: Some(idx) };
+}
+
+// Process exit code once `exit` was received: 0 after a prior `shutdown`, else 1.
+export function lspExitCode(st: LspState): Option<int> {
+  if (!st.exited) {
+    return None;
+  }
+  return Some(st.shutdownRequested ? 0 : 1);
+}
+
+// ---- JSON-RPC envelopes -------------------------------------------------------------------
+
+function respond(id: Json, result: Json): Json {
+  return JObj([jField("jsonrpc", JStr("2.0")), jField("id", id), jField("result", result)]);
+}
+
+function respondError(id: Json, code: int, message: string): Json {
+  return JObj([
+    jField("jsonrpc", JStr("2.0")),
+    jField("id", id),
+    jField("error", JObj([jField("code", JNum(code)), jField("message", JStr(message))]))
+  ]);
+}
+
+function notification(method: string, params: Json): Json {
+  return JObj([jField("jsonrpc", JStr("2.0")), jField("method", JStr(method)), jField("params", params)]);
+}
+
+const PARSE_ERROR: int = -32700;
+const INVALID_REQUEST: int = -32600;
+const METHOD_NOT_FOUND: int = -32601;
+const INVALID_PARAMS: int = -32602;
+const SERVER_NOT_INITIALIZED: int = -32002;
+const REQUEST_FAILED: int = -32803;
+
+function step(st: LspState, out: Json[]): LspStep {
+  return LspStep { state: st, out: out };
+}
+
+function none(st: LspState): LspStep {
+  const out: Json[] = [];
+  return LspStep { state: st, out: out };
+}
+
+// ---- entry points -------------------------------------------------------------------------
+
+export function handleText(st: LspState, body: string): LspStep {
+  const r = parseJson(body);
+  if (r.isErr()) {
+    return step(st, [respondError(JNull, PARSE_ERROR, "parse error: " + r.unwrapErr())]);
+  }
+  return handle(st, r.unwrap());
+}
+
+export function handle(st: LspState, msg: Json): LspStep {
+  if (st.exited) {
+    return none(st);
+  }
+  const method = getStr(msg, "method");
+  if (method.isNone()) {
+    return none(st);   // a response from the client (we send no requests) or garbage
+  }
+  const id = getField(msg, "id");
+  if (id.isSome()) {
+    return handleRequest(st, id.unwrap(), method.unwrap(), msg);
+  }
+  return handleNotification(st, method.unwrap(), msg);
+}
+
+export type Pumped = { state: LspState; rest: string; output: string; };
+
+// Feed raw bytes: decode all complete framed messages, handle them, return framed output.
+export function pump(st: LspState, buffer: string): Result<Pumped, string> {
+  const u = unframe(buffer)?;
+  let cur = st;
+  let outs: string[] = [];
+  for (const body of u.messages) {
+    const s = handleText(cur, body);
+    cur = s.state;
+    for (const j of s.out) {
+      outs.push(frameMessage(stringifyJson(j)));
+    }
+  }
+  return Ok(Pumped { state: cur, rest: u.rest, output: outs.join("") });
+}
+
+// ---- requests -----------------------------------------------------------------------------
+
+function capabilities(st: LspState): Json {
+  let caps: JField[] = [
+    jField("textDocumentSync", JObj([
+      jField("openClose", JBool(true)),
+      jField("change", JNum(1)),
+      jField("save", JObj([jField("includeText", JBool(false))]))
+    ])),
+    jField("documentSymbolProvider", JBool(true)),
+    jField("completionProvider", JObj([jField("resolveProvider", JBool(false))]))
+  ];
+  if (formatAvailable()) {
+    caps.push(jField("documentFormattingProvider", JBool(true)));
+  }
+  if (indexAvailable() || st.testIndex.isSome()) {
+    caps.push(jField("definitionProvider", JBool(true)));
+    caps.push(jField("hoverProvider", JBool(true)));
+    caps.push(jField("referencesProvider", JBool(true)));
+    caps.push(jField("renameProvider", JObj([jField("prepareProvider", JBool(true))])));
+  }
+  return JObj(caps);
+}
+
+function handleRequest(st: LspState, id: Json, method: string, msg: Json): LspStep {
+  if (method == "initialize") {
+    const result = JObj([
+      jField("capabilities", capabilities(st)),
+      jField("serverInfo", JObj([jField("name", JStr("orin")), jField("version", JStr("0.1.0"))]))
+    ]);
+    return step(LspState { ...st, inited: true }, [respond(id, result)]);
+  }
+  if (!st.inited) {
+    return step(st, [respondError(id, SERVER_NOT_INITIALIZED, "server not initialized")]);
+  }
+  if (st.shutdownRequested) {
+    return step(st, [respondError(id, INVALID_REQUEST, "server is shutting down")]);
+  }
+  if (method == "shutdown") {
+    return step(LspState { ...st, shutdownRequested: true }, [respond(id, JNull)]);
+  }
+  if (method == "textDocument/documentSymbol") {
+    return reqDocumentSymbol(st, id, msg);
+  }
+  if (method == "textDocument/completion") {
+    return reqCompletion(st, id, msg);
+  }
+  if (method == "textDocument/formatting") {
+    return reqFormatting(st, id, msg);
+  }
+  if (method == "textDocument/definition") {
+    return reqDefinition(st, id, msg);
+  }
+  if (method == "textDocument/hover") {
+    return reqHover(st, id, msg);
+  }
+  if (method == "textDocument/references") {
+    return reqReferences(st, id, msg);
+  }
+  if (method == "textDocument/prepareRename") {
+    return reqPrepareRename(st, id, msg);
+  }
+  if (method == "textDocument/rename") {
+    return reqRename(st, id, msg);
+  }
+  return step(st, [respondError(id, METHOD_NOT_FOUND, "method not found: " + method)]);
+}
+
+function docPath(msg: Json): Option<string> {
+  const u = getPathStr(msg, ["params", "textDocument", "uri"]);
+  if (u.isNone()) {
+    return None;
+  }
+  return uriToPath(u.unwrap());
+}
+
+function invalidParams(st: LspState, id: Json): LspStep {
+  return step(st, [respondError(id, INVALID_PARAMS, "invalid params")]);
+}
+
+function reqDocumentSymbol(st: LspState, id: Json, msg: Json): LspStep {
+  const p = docPath(msg);
+  if (p.isNone()) {
+    return invalidParams(st, id);
+  }
+  const text = readText(st.ws, p.unwrap()).unwrapOr("");
+  let items: Json[] = [];
+  for (const s of documentSymbols(st.ws, p.unwrap())) {
+    items.push(documentSymbolJson(text, s));
+  }
+  return step(st, [respond(id, JArr(items))]);
+}
+
+function reqCompletion(st: LspState, id: Json, msg: Json): LspStep {
+  const p = docPath(msg);
+  if (p.isNone()) {
+    return invalidParams(st, id);
+  }
+  let items: Json[] = [];
+  for (const c of declCompletions(st.ws, p.unwrap())) {
+    items.push(completionJson(c));
+  }
+  for (const c of keywordCompletions()) {
+    items.push(completionJson(c));
+  }
+  for (const c of builtinCompletions()) {
+    items.push(completionJson(c));
+  }
+  return step(st, [respond(id, JObj([jField("isIncomplete", JBool(false)), jField("items", JArr(items))]))]);
+}
+
+function reqFormatting(st: LspState, id: Json, msg: Json): LspStep {
+  const p = docPath(msg);
+  if (p.isNone()) {
+    return invalidParams(st, id);
+  }
+  const t = readText(st.ws, p.unwrap());
+  if (t.isNone()) {
+    return invalidParams(st, id);
+  }
+  if (!formatAvailable()) {
+    const none: Json[] = [];
+    return step(st, [respond(id, JArr(none))]);   // stub: no edits
+  }
+  const r = formatDocument(t.unwrap());
+  if (r.isErr()) {
+    return step(st, [respondError(id, REQUEST_FAILED, r.unwrapErr())]);
+  }
+  return step(st, [respond(id, JArr(fullDocumentEdits(t.unwrap(), r.unwrap())))]);
+}
+
+// ---- index-based requests -----------------------------------------------------------------
+
+type Ctx = { a: Analysis; idx: SemanticIndex; file: usize; off: usize; };
+
+// Analysis of the document, its semantic index and the cursor offset. None when the index is
+// not available or the params are malformed.
+function context(st: LspState, msg: Json): Option<Ctx> {
+  const p = docPath(msg);
+  const line = getPathInt(msg, ["params", "position", "line"]);
+  const ch = getPathInt(msg, ["params", "position", "character"]);
+  if (p.isNone() || line.isNone() || ch.isNone() || line.unwrap() < 0 || ch.unwrap() < 0) {
+    return None;
+  }
+  const a = analyze(st.ws, p.unwrap());
+  let idx: Option<SemanticIndex> = a.index;
+  if (st.testIndex.isSome()) {
+    idx = st.testIndex;
+  }
+  if (idx.isNone()) {
+    return None;
+  }
+  const fi = fileIndexOf(a, p.unwrap());
+  if (fi.isNone()) {
+    return None;
+  }
+  const text = a.sm.files[fi.unwrap()].text;
+  return Some(Ctx {
+    a: a, idx: idx.unwrap(), file: fi.unwrap(),
+    off: posToOffset(text, line.unwrap().toUsize(), ch.unwrap().toUsize())
+  });
+}
+
+function spanText(a: Analysis, sp: Span): string {
+  return a.sm.files[sp.file].text;
+}
+
+function locationJson(a: Analysis, sp: Span): Json {
+  return JObj([
+    jField("uri", JStr(pathToUri(a.sm.files[sp.file].path))),
+    jField("range", rangeJson(spanText(a, sp), sp.start, sp.end))
+  ]);
+}
+
+function reqDefinition(st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(st, msg);
+  if (c.isNone()) {
+    return step(st, [respond(id, JNull)]);
+  }
+  const x = c.unwrap();
+  const d = definitionAt(x.idx, x.file, x.off);
+  if (d.isNone()) {
+    return step(st, [respond(id, JNull)]);
+  }
+  return step(st, [respond(id, locationJson(x.a, d.unwrap()))]);
+}
+
+function reqHover(st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(st, msg);
+  if (c.isNone()) {
+    return step(st, [respond(id, JNull)]);
+  }
+  const x = c.unwrap();
+  const h = hoverAt(x.idx, x.file, x.off);
+  if (h.isNone()) {
+    return step(st, [respond(id, JNull)]);
+  }
+  const info = h.unwrap();
+  const contents = JObj([
+    jField("kind", JStr("markdown")),
+    jField("value", JStr("```orin\n" + info.text + "\n```"))
+  ]);
+  return step(st, [respond(id, JObj([
+    jField("contents", contents),
+    jField("range", rangeJson(spanText(x.a, info.span), info.span.start, info.span.end))
+  ]))]);
+}
+
+function reqReferences(st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(st, msg);
+  let locs: Json[] = [];
+  if (c.isSome()) {
+    const x = c.unwrap();
+    let includeDecl = false;
+    const ctx = getPath(msg, ["params", "context"]);
+    if (ctx.isSome()) {
+      includeDecl = getBool(ctx.unwrap(), "includeDeclaration").unwrapOr(false);
+    }
+    for (const sp of referencesTo(x.idx, x.file, x.off, includeDecl)) {
+      locs.push(locationJson(x.a, sp));
+    }
+  }
+  return step(st, [respond(id, JArr(locs))]);
+}
+
+function reqPrepareRename(st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(st, msg);
+  if (c.isNone()) {
+    return step(st, [respond(id, JNull)]);
+  }
+  const x = c.unwrap();
+  const s = symbolSpanAt(x.idx, x.file, x.off);
+  if (s.isNone()) {
+    return step(st, [respond(id, JNull)]);
+  }
+  const sp = s.unwrap();
+  const text = spanText(x.a, sp);
+  return step(st, [respond(id, JObj([
+    jField("range", rangeJson(text, sp.start, sp.end)),
+    jField("placeholder", JStr(text.substring(sp.start, sp.end)))
+  ]))]);
+}
+
+function reqRename(st: LspState, id: Json, msg: Json): LspStep {
+  const c = context(st, msg);
+  const newName = getPathStr(msg, ["params", "newName"]);
+  if (newName.isNone()) {
+    return invalidParams(st, id);
+  }
+  if (c.isNone()) {
+    return step(st, [respondError(id, REQUEST_FAILED, "no semantic information available for rename")]);
+  }
+  const x = c.unwrap();
+  const r = renameEdits(x.idx, x.file, x.off, newName.unwrap());
+  if (r.isErr()) {
+    return step(st, [respondError(id, REQUEST_FAILED, r.unwrapErr())]);
+  }
+  // Group edits by file, in order of first appearance.
+  let files: usize[] = [];
+  let lists: Json[][] = [];
+  for (const e of r.unwrap()) {
+    let k: usize = 0;
+    let found = false;
+    while (k < files.length) {
+      if (files[k] == e.span.file) {
+        found = true;
+        break;
+      }
+      k += 1;
+    }
+    if (!found) {
+      files.push(e.span.file);
+      const empty: Json[] = [];
+      lists.push(empty);
+      k = files.length - 1;
+    }
+    lists[k].push(JObj([
+      jField("range", rangeJson(spanText(x.a, e.span), e.span.start, e.span.end)),
+      jField("newText", JStr(e.newText))
+    ]));
+  }
+  let changes: JField[] = [];
+  let i: usize = 0;
+  while (i < files.length) {
+    changes.push(jField(pathToUri(x.a.sm.files[files[i]].path), JArr(lists[i])));
+    i += 1;
+  }
+  return step(st, [respond(id, JObj([jField("changes", JObj(changes))]))]);
+}
+
+// ---- notifications and diagnostics --------------------------------------------------------
+
+function handleNotification(st: LspState, method: string, msg: Json): LspStep {
+  if (method == "exit") {
+    return none(LspState { ...st, exited: true });
+  }
+  if (!st.inited || st.shutdownRequested) {
+    return none(st);
+  }
+  if (method == "textDocument/didOpen") {
+    const p = docPath(msg);
+    const text = getPathStr(msg, ["params", "textDocument", "text"]);
+    if (p.isNone() || text.isNone()) {
+      return none(st);
+    }
+    const ws = openFile(st.ws, p.unwrap(), text.unwrap());
+    const st2 = LspState { ...st, ws: ws };
+    const none2: string[] = [];
+    return republish(st2, none2);
+  }
+  if (method == "textDocument/didChange") {
+    const p = docPath(msg);
+    const changes = getPath(msg, ["params", "contentChanges"]);
+    if (p.isNone() || changes.isNone()) {
+      return none(st);
+    }
+    const itemsOpt = asArr(changes.unwrap());
+    if (itemsOpt.isNone() || itemsOpt.unwrap().length == 0) {
+      return none(st);
+    }
+    const items = itemsOpt.unwrap();
+    // Full sync: the last change carries the whole document.
+    const text = getStr(items[items.length - 1], "text");
+    if (text.isNone()) {
+      return none(st);
+    }
+    const st2 = LspState { ...st, ws: changeFile(st.ws, p.unwrap(), text.unwrap()) };
+    const none2: string[] = [];
+    return republish(st2, none2);
+  }
+  if (method == "textDocument/didSave") {
+    const none2: string[] = [];
+    return republish(st, none2);
+  }
+  if (method == "textDocument/didClose") {
+    const p = docPath(msg);
+    if (p.isNone()) {
+      return none(st);
+    }
+    const st2 = LspState { ...st, ws: closeFile(st.ws, p.unwrap()) };
+    return republish(st2, [p.unwrap()]);
+  }
+  return none(st);   // initialized, $/cancelRequest, workspace/*, ... are ignored
+}
+
+type LDiag = { path: string; key: string; json: Json; };
+
+function hasKey(ds: LDiag[], key: string): bool {
+  for (const d of ds) {
+    if (d.key == key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Diagnostics of all open documents (each analysed as its own entry), de-duplicated.
+function collectDiags(ws: Workspace): LDiag[] {
+  let out: LDiag[] = [];
+  for (const entry of openPaths(ws)) {
+    const a = analyze(ws, entry);
+    for (const d of a.diags) {
+      const key = d.path + "|" + d.code + "|" + d.start.toString() + "|" + d.end.toString() + "|" + d.message;
+      if (hasKey(out, key)) {
+        continue;
+      }
+      const fi = fileIndexOf(a, d.path);
+      let text = "";
+      if (fi.isSome()) {
+        text = a.sm.files[fi.unwrap()].text;
+      }
+      out.push(LDiag { path: d.path, key: key, json: diagnosticJson(text, d) });
+    }
+  }
+  return out;
+}
+
+function addUnique(xs: string[], x: string): string[] {
+  let out = xs;
+  for (const y of xs) {
+    if (y == x) {
+      return out;
+    }
+  }
+  out.push(x);
+  return out;
+}
+
+// Recompute diagnostics and publish them for: every open document, every file that has
+// diagnostics, every file that had diagnostics published before, and `extra` (e.g. a document
+// that was just closed, so its markers are cleared).
+function republish(st: LspState, extra: string[]): LspStep {
+  const all = collectDiags(st.ws);
+  let targets: string[] = [];
+  for (const p of openPaths(st.ws)) {
+    targets = addUnique(targets, p);
+  }
+  let nowPublished: string[] = [];
+  for (const d of all) {
+    targets = addUnique(targets, d.path);
+    nowPublished = addUnique(nowPublished, d.path);
+  }
+  for (const p of st.published) {
+    targets = addUnique(targets, p);
+  }
+  for (const p of extra) {
+    targets = addUnique(targets, p);
+  }
+  let out: Json[] = [];
+  for (const t of targets) {
+    let arr: Json[] = [];
+    for (const d of all) {
+      if (d.path == t) {
+        arr.push(d.json);
+      }
+    }
+    out.push(notification("textDocument/publishDiagnostics", JObj([
+      jField("uri", JStr(pathToUri(t))),
+      jField("diagnostics", JArr(arr))
+    ])));
+  }
+  return step(LspState { ...st, published: nowPublished }, out);
+}

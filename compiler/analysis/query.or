@@ -1,0 +1,233 @@
+// Queries over the checker's SemanticIndex (hir/index.or): go to definition, hover, find
+// references, rename. Pure functions; `file` is a SourceMap file index (Span.file) and `off` a
+// byte offset in that file. Spans compare as closed ranges [start, end] so a cursor placed just
+// after an identifier still selects it (the usual editor convention).
+//
+// The producer of the index is the checker; until it is wired (`indexAvailable()` in analyze.or)
+// `Analysis.index` is None and callers answer "no result". Everything here is tested against a
+// hand-built index (compiler/tests/analysis_test.or).
+//
+// Contract assumptions about the index (see hir/index.or):
+//   - `refs` contains one entry per resolved identifier occurrence; the defining identifier
+//     itself (`SymbolDef.nameSpan`) may or may not also appear as a ref — results are
+//     de-duplicated by span either way.
+//   - A ref's `def` indexes `defs`; invalid ids are ignored.
+//   - `SymbolDef.container` and `unit` identify the scope used for rename collision checks.
+
+import { Span } from "../diag";
+import { SemanticIndex, SymbolDef } from "../hir";
+
+export type HoverInfo = { span: Span; text: string; };
+
+// A text replacement of a source span.
+export type TextEdit = { span: Span; newText: string; };
+
+function covers(sp: Span, file: usize, off: usize): bool {
+  return sp.file == file && sp.start <= off && off <= sp.end;
+}
+
+function width(sp: Span): usize {
+  return sp.end - sp.start;
+}
+
+type Hit = { def: usize; span: Span; };
+
+// The definition id and occurrence span of the narrowest symbol occurrence (reference or
+// defining name) at the position.
+function hitAt(idx: SemanticIndex, file: usize, off: usize): Option<Hit> {
+  let best: Option<Hit> = None;
+  for (const r of idx.refs) {
+    if (r.def < idx.defs.length && covers(r.span, file, off)) {
+      const better = match (best) {
+        None => true,
+        Some(b) => width(r.span) < width(b.span)
+      };
+      if (better) {
+        best = Some(Hit { def: r.def, span: r.span });
+      }
+    }
+  }
+  for (const d of idx.defs) {
+    if (covers(d.nameSpan, file, off)) {
+      const better = match (best) {
+        None => true,
+        Some(b) => width(d.nameSpan) < width(b.span)
+      };
+      if (better) {
+        best = Some(Hit { def: d.id, span: d.nameSpan });
+      }
+    }
+  }
+  return best;
+}
+
+// Definition id of the symbol at the position.
+export function symbolAt(idx: SemanticIndex, file: usize, off: usize): Option<usize> {
+  const h = hitAt(idx, file, off);
+  if (h.isNone()) {
+    return None;
+  }
+  return Some(h.unwrap().def);
+}
+
+// Span of the symbol occurrence at the position (the `prepareRename` range).
+export function symbolSpanAt(idx: SemanticIndex, file: usize, off: usize): Option<Span> {
+  const h = hitAt(idx, file, off);
+  if (h.isNone()) {
+    return None;
+  }
+  return Some(h.unwrap().span);
+}
+
+// Go to definition: the span of the defining identifier.
+export function definitionAt(idx: SemanticIndex, file: usize, off: usize): Option<Span> {
+  const h = hitAt(idx, file, off);
+  if (h.isNone()) {
+    return None;
+  }
+  return Some(idx.defs[h.unwrap().def].nameSpan);
+}
+
+// Hover: the symbol's rendered signature/type if the position is on a symbol occurrence,
+// else the rendered type of the narrowest typed expression span covering it.
+export function hoverAt(idx: SemanticIndex, file: usize, off: usize): Option<HoverInfo> {
+  const h = hitAt(idx, file, off);
+  if (h.isSome()) {
+    const hit = h.unwrap();
+    return Some(HoverInfo { span: hit.span, text: idx.defs[hit.def].detail });
+  }
+  let best: Option<HoverInfo> = None;
+  for (const t of idx.types) {
+    if (covers(t.span, file, off)) {
+      const better = match (best) {
+        None => true,
+        Some(b) => width(t.span) < width(b.span)
+      };
+      if (better) {
+        best = Some(HoverInfo { span: t.span, text: t.ty });
+      }
+    }
+  }
+  return best;
+}
+
+function hasSpan(spans: Span[], s: Span): bool {
+  for (const x of spans) {
+    if (x.file == s.file && x.start == s.start && x.end == s.end) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// All occurrences of definition `def`: its defining identifier first (when `includeDecl`),
+// then every reference in index (source) order. De-duplicated by span.
+export function referencesOfDef(idx: SemanticIndex, def: usize, includeDecl: bool): Span[] {
+  let out: Span[] = [];
+  if (def >= idx.defs.length) {
+    return out;
+  }
+  const decl = idx.defs[def].nameSpan;
+  if (includeDecl) {
+    out.push(decl);
+  }
+  for (const r of idx.refs) {
+    if (r.def == def && !hasSpan(out, r.span) && (includeDecl || !(r.span.file == decl.file && r.span.start == decl.start && r.span.end == decl.end))) {
+      out.push(r.span);
+    }
+  }
+  return out;
+}
+
+// Find references of the symbol at the position.
+export function referencesTo(idx: SemanticIndex, file: usize, off: usize, includeDecl: bool): Span[] {
+  const s = symbolAt(idx, file, off);
+  if (s.isNone()) {
+    return [];
+  }
+  return referencesOfDef(idx, s.unwrap(), includeDecl);
+}
+
+// ---- rename -------------------------------------------------------------------------------
+
+function isIdentChar(c: int, first: bool): bool {
+  if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+    return true;
+  }
+  return !first && c >= 48 && c <= 57;
+}
+
+function reservedWords(): string[] {
+  return [
+    "const", "let", "function", "return", "if", "else", "while", "for", "of", "break", "continue",
+    "type", "import", "export", "from", "match", "true", "false", "var", "class", "interface",
+    "enum", "new", "this", "null", "undefined", "async", "await"
+  ];
+}
+
+// None when `s` is a legal Orin identifier, else the reason.
+export function identError(s: string): Option<string> {
+  if (s.length == 0) {
+    return Some("name is empty");
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    if (!isIdentChar(s.charCodeAt(i), i == 0)) {
+      return Some("`" + s + "` is not a valid identifier");
+    }
+    i += 1;
+  }
+  for (const k of reservedWords()) {
+    if (k == s) {
+      return Some("`" + s + "` is a reserved word");
+    }
+  }
+  return None;
+}
+
+function sameContainer(a: Option<usize>, b: Option<usize>): bool {
+  return match (a) {
+    None => b.isNone(),
+    Some(x) => match (b) {
+      None => false,
+      Some(y) => x == y
+    }
+  };
+}
+
+function collides(idx: SemanticIndex, d: SymbolDef, newName: string): bool {
+  for (const o of idx.defs) {
+    if (o.id != d.id && o.name == newName && o.unit == d.unit && sameContainer(o.container, d.container)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Rename the symbol at the position: edits for the defining identifier and every reference
+// (including import-list names and uses in other files, which the index records as refs).
+// Rejected when the new name is not an identifier, is reserved or unchanged, or collides with
+// another definition in the same unit and container (conservative: same-scope names of any kind).
+// Not checked (needs per-unit scope data): clashes with names imported into other units.
+export function renameEdits(idx: SemanticIndex, file: usize, off: usize, newName: string): Result<TextEdit[], string> {
+  const s = symbolAt(idx, file, off);
+  if (s.isNone()) {
+    return Err("no renameable symbol at this position");
+  }
+  const d = idx.defs[s.unwrap()];
+  const bad = identError(newName);
+  if (bad.isSome()) {
+    return Err(bad.unwrap());
+  }
+  if (newName == d.name) {
+    return Err("the new name is identical to the old name");
+  }
+  if (collides(idx, d, newName)) {
+    return Err("`" + newName + "` is already defined in this scope");
+  }
+  let edits: TextEdit[] = [];
+  for (const sp of referencesOfDef(idx, d.id, true)) {
+    edits.push(TextEdit { span: sp, newText: newName });
+  }
+  return Ok(edits);
+}

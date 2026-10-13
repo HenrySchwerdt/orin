@@ -1,0 +1,287 @@
+// Overlay loader: `loadWithOverlay(entry, overlay)` behaves exactly like `loadAll` (loader.or)
+// except that file contents come from `overlay` (unsaved editor buffers, spec 18 §2) when a
+// path matches (compared after `normalizePath`), and otherwise from disk. An overlay file also
+// counts as existing for import resolution even when it is not on disk.
+//
+// TODO(lead): this file DUPLICATES loader.or (the DFS, resolveImport, relName) because those
+// functions read the disk directly and loader.or may not be edited by the tooling worker.
+// Factor out: give loader.or a `FileSource` parameter (read/exists) and make `loadAll` =
+// `loadWith(entry, diskSource)`; then delete this file's copy of the algorithm.
+
+import { Module, Item, ImportDecl, parse } from "../syntax";
+import { Span, SourceMap, SourceFile, Diagnostic, diag, span } from "../diag";
+import { readFile, exists } from "std:fs";
+import { ImportTarget, StdModule, Unit, LoadedProgram } from "./program";
+import { LoadOutcome } from "./loader";
+import { normalizePath, dirname, joinPath, relativeTo, isInside } from "./path";
+
+// Overlay entries with normalized paths (so lookups are plain string comparisons).
+function normalizeOverlay(overlay: SourceFile[]): SourceFile[] {
+  let out: SourceFile[] = [];
+  for (const f of overlay) {
+    out.push(SourceFile { path: normalizePath(f.path), text: f.text });
+  }
+  return out;
+}
+
+function findIn(ov: SourceFile[], p: string): Option<usize> {
+  let i: usize = 0;
+  while (i < ov.length) {
+    if (ov[i].path == p) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function existsIn(ov: SourceFile[], p: string): bool {
+  return findIn(ov, p).isSome() || exists(p);
+}
+
+function readIn(ov: SourceFile[], p: string): Result<string, string> {
+  const k = findIn(ov, p);
+  if (k.isSome()) {
+    return Ok(ov[k.unwrap()].text);
+  }
+  return readFile(p);
+}
+
+type Resolved = { std: int; path: string; };
+
+function failOut(files: SourceFile[], d: Diagnostic): LoadOutcome {
+  const ds: Diagnostic[] = [d];
+  return LoadOutcome { sm: SourceMap { files: files }, program: None, diags: ds };
+}
+
+// `/`-separated path of `p` relative to `base`, without a trailing `.or`.
+function relName(base: string, p: string): string {
+  const s = relativeTo(base, p);
+  if (s.endsWith(".or")) {
+    return s.substring(0, s.length - 3);
+  }
+  return s;
+}
+
+function stdKind(p: string): int {
+  if (p == "std:fs") {
+    return 1;
+  }
+  if (p == "std:process") {
+    return 2;
+  }
+  return 0;
+}
+
+// Resolve import path `p` of file `importer` (in directory `dir`) to a normalized file path,
+// or to a std module. Reports E0301 and E0302.
+function resolveImport(ov: SourceFile[], importer: string, dir: string, p: string, sp: Span, base: string): Result<Resolved, Diagnostic> {
+  if (p.startsWith("std:")) {
+    const k = stdKind(p);
+    if (k == 0) {
+      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process)"));
+    }
+    return Ok(Resolved { std: k, path: "" });
+  }
+  const c1 = joinPath(dir, p + ".or");
+  const c2 = joinPath(dir, p + "/module.or");
+  let target = c1;
+  if (!existsIn(ov, c1)) {
+    if (!existsIn(ov, c2)) {
+      return Err(diag("E0301", sp, "cannot find module `" + p + "` (tried `" + c1 + "` and `" + c2 + "`)"));
+    }
+    target = c2;
+  }
+
+  // Module boundary rule (E0302): walk the ancestor directories of the target (stopping at
+  // the filesystem root, or at the start of a relative path).
+  let d = dirname(target);
+  while (d != ".") {
+    const m = joinPath(d, "module.or");
+    if (target != m && existsIn(ov, m) && !isInside(d, importer)) {
+      return Err(diag("E0302", sp, "cannot import private file `" + relName(base, target)
+        + "` of module `" + relName(base, d) + "`; import the module itself"));
+    }
+    const nd = dirname(d);
+    if (nd == d) {
+      break;
+    }
+    d = nd;
+  }
+  return Ok(Resolved { std: 0, path: target });
+}
+
+function findNode(paths: string[], p: string): Option<usize> {
+  let i: usize = 0;
+  while (i < paths.length) {
+    if (paths[i] == p) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function importOf(item: Item): Option<ImportDecl> {
+  return match (item) {
+    IImport(i) => Some(i),
+    IReExport(i) => Some(i),
+    _ => None
+  };
+}
+
+export function loadWithOverlay(entryPath: string, overlay: SourceFile[]): LoadOutcome {
+  const entry = normalizePath(entryPath);
+  const ov = normalizeOverlay(overlay);
+  const base = dirname(entry);
+  let files: SourceFile[] = [];
+  let nodePaths: string[] = [];   // node id == index into `files`
+  let nodeState: int[] = [];      // 1 = in progress, 2 = done
+  let nodeUnit: usize[] = [];     // unit index once done
+  let units: Unit[] = [];
+
+  // Parent frames (innermost last).
+  let sNode: usize[] = [];
+  let sAst: Module[] = [];
+  let sItem: usize[] = [];
+  let sImps: ImportTarget[][] = [];
+
+  // Current frame.
+  let haveCur = false;
+  let curNode: usize = 0;
+  let curAst = Module { file: 0, items: [] };
+  let curItem: usize = 0;
+  let cur: ImportTarget[] = [];
+
+  // File waiting to be opened (the entry first, then each newly discovered import).
+  let pending = true;
+  let pendPath = entry;
+  let pendDisp = entryPath;
+  let pendSpan = span(0, 0, 0);
+
+  while (true) {
+    if (pending) {
+      const rf = readIn(ov, pendPath);
+      if (rf.isErr()) {
+        files.push(SourceFile { path: pendDisp, text: "" });
+        const f = files.length - 1;
+        return failOut(files, diag("E0301", span(f, 0, 0),
+          "cannot read `" + pendPath + "`: " + rf.unwrapErr()));
+      }
+      const src = rf.unwrap();
+      files.push(SourceFile { path: pendDisp, text: src });
+      const id = files.length - 1;
+      const pr = parse(id, src);
+      if (pr.isErr()) {
+        return failOut(files, pr.unwrapErr());
+      }
+      nodePaths.push(pendPath);
+      nodeState.push(1);
+      nodeUnit.push(0);
+      if (haveCur) {
+        sNode.push(curNode);
+        sAst.push(curAst);
+        sItem.push(curItem);
+        sImps.push(cur);
+      }
+      haveCur = true;
+      curNode = id;
+      curAst = pr.unwrap();
+      curItem = 0;
+      cur = [];
+      pending = false;
+    }
+
+    if (curItem >= curAst.items.length) {
+      // All imports resolved: the unit is complete.
+      const ui = units.length;
+      units.push(Unit {
+        file: curNode,
+        path: nodePaths[curNode],
+        name: relName(base, nodePaths[curNode]),
+        ast: curAst,
+        imports: cur
+      });
+      nodeState[curNode] = 2;
+      nodeUnit[curNode] = ui;
+      if (sNode.length == 0) {
+        break;
+      }
+      // (Each pop result is bound to a const first: Stage 0 codegen miscompiles a scalar
+      // `let` assignment whose right-hand side contains a mutating call.)
+      const pn = sNode.pop().unwrap();
+      const pi = sItem.pop().unwrap();
+      const pa = sAst.pop().unwrap();
+      const pc = sImps.pop().unwrap();
+      curNode = pn;
+      curItem = pi + 1;
+      curAst = pa;
+      cur = pc;
+      cur.push(ImportUnit(ui));
+      continue;
+    }
+
+    const imp = importOf(curAst.items[curItem]);
+    if (imp.isNone()) {
+      curItem += 1;
+      continue;
+    }
+    const decl = imp.unwrap();
+    const importer = nodePaths[curNode];
+    const rr = resolveImport(ov, importer, dirname(importer), decl.path, decl.pathSpan, base);
+    if (rr.isErr()) {
+      return failOut(files, rr.unwrapErr());
+    }
+    const res = rr.unwrap();
+    if (res.std == 1) {
+      cur.push(ImportStd(StdFs));
+      curItem += 1;
+      continue;
+    }
+    if (res.std == 2) {
+      cur.push(ImportStd(StdProcess));
+      curItem += 1;
+      continue;
+    }
+    const found = findNode(nodePaths, res.path);
+    if (found.isNone()) {
+      pending = true;
+      pendPath = res.path;
+      pendDisp = res.path;
+      pendSpan = decl.pathSpan;
+      continue;
+    }
+    const n = found.unwrap();
+    if (nodeState[n] == 2) {
+      cur.push(ImportUnit(nodeUnit[n]));
+      curItem += 1;
+      continue;
+    }
+    // In progress: import cycle. The DFS stack is the parent frames plus the current file.
+    const chain = sNode.concat([curNode]);
+    let start: usize = 0;
+    let k: usize = 0;
+    while (k < chain.length) {
+      if (chain[k] == n) {
+        start = k;
+      }
+      k += 1;
+    }
+    let names: string[] = [];
+    let q = start;
+    while (q < chain.length) {
+      names.push(relName(base, nodePaths[chain[q]]));
+      q += 1;
+    }
+    names.push(relName(base, res.path));
+    return failOut(files, diag("E0303", decl.pathSpan, "import cycle: " + names.join(" -> ")));
+  }
+
+  const none: Diagnostic[] = [];
+  return LoadOutcome {
+    sm: SourceMap { files: files },
+    program: Some(LoadedProgram { units: units, entry: units.length - 1 }),
+    diags: none
+  };
+}
+
