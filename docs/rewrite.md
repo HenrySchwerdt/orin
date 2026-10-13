@@ -228,9 +228,10 @@ Lessons:
 * A closure cannot mutate a captured local (`seen.set` inside `filter` does not work): dedup is a `for` loop.
 * A contract helper must not use `map` either (it calls a function value, so it is impure): `typesId` is a loop
   because `instKey` is used in `addInst`'s `@Requires`.
-* A `Map` inside the `Env` record is copy-on-write like the arrays, so `addInst` takes `env` and returns it updated
-  like the code around it did; no extra copies showed up (`cow_copies` +12 % in the self-compile counters, `alloc_total`
-  +1.6 %, wall time within noise).
+* A `Map` / class inside the `Env` record is copy-on-write like the arrays: `e.insts.add(..)` on a local copy of
+  `env` costs what `e.records.push(..)` did; no extra copies showed up (wall time within noise).
+* The contract-checked self-compile is about 1.5x slower (6.1 s vs 4 s) with the 110 clauses; the O(n) properties are
+  therefore stated only in mutating methods' `@Ensures`, and class invariants stay O(1).
 * A class stored in a record field works with value semantics (`let f = fx; f.scope.open()` does not touch `fx`), which
   the closure snapshot `FnCtx.outer` needs.
 * Keep the formatter off files you only touch mechanically (`collect.or`, `decls.or`): `orin fmt` reflows them
