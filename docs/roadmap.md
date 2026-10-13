@@ -19,7 +19,8 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 - **next:**
   - fixed-width integers and template-literal interpolation
   - resources and the streaming `std:fs`
-  - generic classes (`class Graph<T>`), then `std:graph` on `Graph<T>`/`GraphId<T>`
+  - ~~generic classes (`class Graph<T>`), then `std:graph` on `Graph<T>`/`GraphId<T>`~~ (done, ADR-0026)
+  - **all language-freeze prerequisites are done** (integers, interpolation, annotations, resources, generic classes)
 - **capabilities (language part):** ADR-0021 is to be written. It covers unforgeable handles,
   grants at the program root, boundary declarations in `orin.toml` and enforcement in the platform
   layer. It changes the std I/O signatures, so the std I/O freeze waits for it.

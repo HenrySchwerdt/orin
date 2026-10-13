@@ -18,7 +18,7 @@ let a = new Counter(0);  const b = a;  a.increment();   // a.value == 1, b.value
 Also accepted: TS parameter properties `constructor(public value: int, private name: string) {}`.
 `public` is the default for members; `private` members are accessible only inside the class body.
 No inheritance (`extends` → E0408), no `protected`, no getters/setters, no overloads, no
-`abstract`, no generic classes/methods yet (E0408), no class expressions. `this` outside a class
+`abstract`, no generic methods (E0460); generic classes: ADR-0026, no class expressions. `this` outside a class
 → E0300.
 
 ## Semantics

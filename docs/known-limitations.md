@@ -16,8 +16,7 @@
   the legacy backend (`--legacy-codegen`) rejects programs with closures. Array methods: `indexOf` /
   `includes` only for `int`, `usize`, `bool`, `string` elements (E0405 otherwise); `sort` is O(n log n) with
   O(n) extra allocation per level; the callbacks' integer results must be `int` (`.toInt()` on lengths).
-- Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic classes or
-  methods (E0408), static fields, getters/setters, `protected`. Private members are
+- Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic methods (E0460), static fields, getters/setters, `protected`. Private members are
   checked at compile time (E0405). Constructors initialise fields only through leading `this.f = e;`
   statements, parameter properties and field initializers (else E0411; `this` is unavailable until
   then, E0300). Mutating methods are inferred; every mutating call copies the receiver shallowly until
@@ -26,6 +25,9 @@
   `while` conditions (E0408), runs before the other operands of the same statement, and its receiver
   may not contain side-effecting index expressions (E0408). Class values cannot be built with record
   literals outside their class (E0408). Method hover types on the call expression show the lowered type.
+- Generic classes (ADR-0026): no generic methods (E0460); static methods cannot use the class type parameters
+  (E0461); one interface bound per parameter; instances are created on demand, so an instance method that is never
+  called is only checked abstractly; a `?` in a mutating method with a result is hoisted like a mutating call.
 - Interfaces (ADR-0019, self-hosted compiler only): nominal conformance (`implements`), method signatures only
   (no fields, default methods, `extends`, type parameters: E0408), non-mutating methods only (a mutating
   implementation is E0418), one bound per type parameter (`T extends A & B` is E0408). A class converts

@@ -12,7 +12,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:path` | Orin, `stdlib/path.or` | done (POSIX, lexical) |
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
 | `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; clock access **unstable** until capabilities |
-| `std:graph` | Orin, `stdlib/graph.or` | stop-gap functional API; becomes `Graph<T>`/`GraphId<T>` with generic classes |
+| `std:graph` | Orin, `stdlib/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
@@ -124,35 +124,51 @@ Orin has no generic equality or `toString`.
 
 ## std:graph (spec 06 cyclic graphs)
 
-A graph owner holds the nodes; edges are checked, non-owning ids, so no owning cycle ever exists.
+A graph owner holds the nodes; edges are checked, non-owning ids, so no owning cycle ever exists. `Graph<T>` is a
+generic class (ADR-0026) and, like every class, a value: a copy is independent.
 
 ```
-type GraphId<T> = { tag: int; index: usize; gen: int }     // create only through add
+type GraphId<T> = { tag: int; index: usize; gen: int }     // obtain only through add (T is phantom)
 type GraphError = StaleId | ForeignId
-newGraph<T>(tag: int): Graph<T>
-add(g, value): Added<T>                         // { graph, id }
-get(g, id): Result<T, GraphError>
-set(g, id, value) / remove(g, id) / addEdge(g, a, b): Result<Graph<T>, GraphError>
-neighbors(g, id): Result<GraphId<T>[], GraphError>
-size(g), contains(g, id), ids(g), graphErrorMessage(e)
+class Graph<T> {
+  constructor(tag: int)
+  size(): usize                                   contains(id): bool
+  add(value: T): GraphId<T>                       // mutating, never fails
+  get(id): Result<T, GraphError>
+  set(id, value): Result<void, GraphError>        // mutating
+  remove(id): Result<T, GraphError>               // mutating; returns the removed value
+  addEdge(a, b): Result<void, GraphError>         // mutating, directed
+  neighbors(id): Result<GraphId<T>[], GraphError>
+  ids(): GraphId<T>[]
+}
+graphErrorMessage(e: GraphError): string
 ```
 
-Ids carry the graph tag, slot index and slot generation. `remove` bumps the generation, so every copy
-of the removed node's id is stale (`Err(StaleId)`) even after the slot is reused; an id of another graph
-(different tag, or an index beyond the graph) is `Err(ForeignId)`. Edges to removed nodes dangle and are
-skipped by `neighbors`.
+```ts
+import { Graph } from "std:graph";
+let g = new Graph<string>(1);
+const a = g.add("alpha");
+const b = g.add("beta");
+g.addEdge(a, b).unwrap();
+g.remove(a).unwrap();            // `a` is now stale: g.get(a) is Err(StaleId)
+```
 
-**Value semantics, functional API.** Classes cannot be generic yet (ADR-0009), so `Graph<T>` is a generic
-record with free functions instead of the method syntax `g.add(v)` of spec 06; operations that change the
-graph return the new graph and leave the argument untouched (an older copy keeps its nodes). Changing
-operations are O(nodes) until in-place mutation of owned values lands (ADR-0010). The tag is passed by
-the caller (`newGraph(tag)`): the language has no process-wide counter for automatic unique tags;
-use a different tag per logical graph.
+Ids carry the graph tag, slot index and slot generation. `remove` bumps the generation, so every copy of the
+removed node's id is stale (`Err(StaleId)`) even after the slot is reused (freed slots are reused through a free
+list); an id of another graph (different tag, or an index beyond the graph) is `Err(ForeignId)`. Edges to removed
+nodes dangle and are skipped by `neighbors`. A failed operation leaves the graph unchanged. Fields are private.
+
+**Value semantics.** `const h = g;` keeps the old nodes while `g` changes (an id removed in `g` is still valid in the
+older `h`: ids identify a node of one *tag*). Mutating methods update in place when the graph is not shared, so
+`add`, `get`, `set`, `remove`, `addEdge` are O(1); a shared graph is copied on the first change. The tag is passed
+by the caller (`new Graph<T>(tag)`): the language has no process-wide counter for automatic unique tags; use a
+different tag per logical graph. The old functional API (`newGraph`, `add(g, v)` returning `{graph, id}`, ...) was
+removed with ADR-0026; the tests were migrated.
 
 ## Limitations
 
 * No floats/`Map`: `JNum` is `int`, no `std:math`, `std:map`, edge weights, `sleep`, fractional seconds.
-* Generic classes/methods do not exist yet, hence the functional `std:graph` API.
+* Generic methods do not exist (E0460); `Graph<T>` has no edge weights and needs a caller-supplied tag.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close primitives behind `std:fs`; only library code may import it).
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
