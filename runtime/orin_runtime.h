@@ -275,7 +275,7 @@ OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Opt
 /* ---------------------------------------------------------------- structs / variants */
 /* Records use tag 0. Option: Some=0 (1 slot), None=1. Result: Ok=0 (1 slot, 0 for void), Err=1. */
 
-/* New struct with all slots zero (null refs). Fill with orin_struct_set (init only). */
+/* New struct with all slots zero (null refs). Fill with orin_struct_init (init only). */
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask);
 /* Shared immortal singleton for a payload-less variant. */
 OrinObj *orin_nullary(uint32_t tag);
@@ -283,16 +283,32 @@ OrinObj *orin_nullary(uint32_t tag);
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot);
 /* dst.slots[i] = src.slots[j], retaining it if it is a reference. dst slot must be empty. */
 void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j);
-/* Initialising store (no release of the old value; consumes `slot`'s reference). */
-static inline void orin_struct_set(OrinObj *o, uint32_t i, uint64_t slot) {
+/* Defence in depth (docs/assurance.md, finding "shape confusion"): every field access on an object of unknown
+ * provenance checks that it is a struct and that the slot index is below its slot count, so a lowering bug that
+ * confuses value shapes becomes a clean trap instead of an out-of-bounds read or write. The ownership verifier
+ * does not check value shapes. The LLVM backend does the same check in its inline helper @orinl_slot. */
+void orin_trap_shape(void) __attribute__((noreturn, cold));
+static inline void orin_chk_slot(const OrinObj *o, uint32_t i) {
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_STRUCT || i >= ((const OrinStruct *)o)->nslots)) orin_trap_shape();
+}
+/* Initialising store into an object that orin_struct_new just returned in the same code sequence with a constant
+ * slot count (the emitters pass the index from the same MIR instruction): in bounds by construction, unchecked. */
+static inline void orin_struct_init(OrinObj *o, uint32_t i, uint64_t slot) {
     ((OrinStruct *)o)->slots[i] = slot;
 }
-/* Borrowed slot read. */
+/* Store (no release of the old value; consumes `slot`'s reference). Checked. */
+static inline void orin_struct_set(OrinObj *o, uint32_t i, uint64_t slot) {
+    orin_chk_slot(o, i);
+    ((OrinStruct *)o)->slots[i] = slot;
+}
+/* Borrowed slot read. Checked. */
 static inline uint64_t orin_struct_get(const OrinObj *o, uint32_t i) {
+    orin_chk_slot(o, i);
     return ((const OrinStruct *)o)->slots[i];
 }
-/* Pointer to slot i for in-place update (object must already be unique). */
+/* Pointer to slot i for in-place update (object must already be unique). Checked. */
 static inline uint64_t *orin_struct_slot_ptr(OrinObj *o, uint32_t i) {
+    orin_chk_slot(o, i);
     return &((OrinStruct *)o)->slots[i];
 }
 static inline uint32_t orin_tag(const OrinObj *o) { return o->tag; }
@@ -345,6 +361,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref);
 void orin_array_push_grow(OrinObj *a, uint64_t slot); /* internal: capacity exhausted */
 static inline void orin_array_push(OrinObj *o, uint64_t slot) {
     OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY)) orin_trap_shape();
     if (ORIN_UNLIKELY(a->len == a->cap)) {
         orin_array_push_grow(o, slot);
         return;
@@ -357,12 +374,14 @@ static inline uint64_t orin_array_len(const OrinObj *a) { return ((const OrinArr
 /* Borrowed element slot; traps "index out of bounds". */
 static inline uint64_t orin_array_at(OrinObj *o, uint64_t i) {
     OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY)) orin_trap_shape();
     if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
     return a->items[i];
 }
 /* Pointer to element slot for in-place update (array must be unique); traps if out of range. */
 static inline uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
     OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY)) orin_trap_shape();
     if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
     return &a->items[i];
 }

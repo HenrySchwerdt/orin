@@ -341,3 +341,49 @@ cow, grows, peak bytes); peak RSS unchanged. The only unfavourable medians (qsor
 a 20% swing of the C reference and with identical counters and identical hot-path code (qsort_func performs no
 I/O in its loop), so no regression above 5% is claimed or observed; the measurement noise of this machine is
 larger than that bar, which is why the argument rests on the counters and on the code being unchanged.
+
+## Cost of the field bounds checks (shape-confusion backstop)
+
+Change measured: every struct/variant slot access checks `kind == struct && index < nslots` (runtime inline
+accessors, `orin_mir_struct_*`, LLVM `@orinl_slot`), array slot access and push check `kind == array`;
+initialising stores into a fresh `orin_struct_new` stay unchecked (docs/assurance.md F-shape). Same machine as above.
+
+Method: the base (the commit before the change) and the changed tree were bootstrapped separately.
+`tools/bench.py --runs 7` was run base, new, base, new (two rounds each, 7 runs per cell after one warm-up).
+Then the already built benchmark binaries were run alternately base/new (15 runs each, interleaved, to cancel
+drift), and selfcompile (`orin2 compile compiler/main.or`) was run interleaved 10 times per session.
+
+Interleaved A/B of the built benchmark binaries, median seconds; ratio = new / base:
+
+| benchmark | C base | C new | C ratio | LLVM base | LLVM new | LLVM ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| bintrees | 1.077 | 1.031 | 0.96 | 0.788 | 0.830 | 1.05 |
+| fib | 0.326 | 0.319 | 0.98 | 0.562 | 0.538 | 0.96 |
+| mapfreq | 0.358 | 0.372 | 1.04 | 0.279 | 0.299 | 1.07 |
+| nbody | 0.217 | 0.226 | 1.04 | 0.166 | 0.209 | 1.27 |
+| qsort_func | 0.410 | 0.415 | 1.01 | 0.408 | 0.397 | 0.97 |
+| qsort_inplace | 0.190 | 0.199 | 1.05 | 0.153 | 0.165 | 1.08 |
+| sieve | 0.340 | 0.353 | 1.04 | 0.322 | 0.331 | 1.03 |
+| strings | 0.185 | 0.186 | 1.01 | 0.158 | 0.161 | 1.02 |
+| wordfreq | 0.219 | 0.201 | 0.92 | 0.199 | 0.198 | 1.00 |
+
+Noise: the min-max range of one cell is 20-40% of its median on this shared VM, so differences below about 10%
+are not distinguishable from noise. The two `bench.py` rounds disagree with each other by up to 30% per cell in
+both directions (C-backend strings 0.63x and 1.05x, qsort_inplace 0.99x and 1.28x). Reading: the checks are not
+measurable on the micro-benchmarks (C backend: all ratios within -8%..+5%). LLVM `nbody` (float records, hot field
+loads) is the one consistent outlier (+27% interleaved; +12% and -0.5% in the two `bench.py` rounds), so budget
+up to about 25% on field-heavy numeric loops.
+
+selfcompile (the realistic pointer-chasing workload: the compiler walking ASTs and MIR), interleaved: base
+3.10-3.69 s median, new 3.82-4.51 s median across separate sessions, **+22% to +24%** (`bench.py` rounds, less
+controlled: 1.53x and 1.39x). Ablation in one session (the changed `stage2.c` built with a modified runtime
+header): full check 1.23x, `nslots` check only 1.13x, `kind | nslots` as one branch 1.23x. The kind check is about
+10 points of the cost; it was kept because without it a string or array read as a struct passes the `nslots` test.
+
+Peak RSS is unchanged; binary size changes by a few hundred bytes (inline checks, one out-of-line trap function).
+
+Elision: none on reads. Unchecked `orin_struct_init` is used only for the initialising stores that follow
+`orin_struct_new(tag, n, ...)` for the same instruction (`IStructNew` operands, closure and interface construction,
+variant payloads in the legacy codegen), where the index is a loop counter below the constant `n` passed to the
+allocation; the LLVM closure/interface constructors use the same reasoning (`slotGep`). Everything else is checked,
+including `IPutField` (a put after a take) and struct-literal/update stores in the legacy codegen.

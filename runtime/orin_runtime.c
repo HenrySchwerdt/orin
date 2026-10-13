@@ -217,6 +217,8 @@ OrinObj *orin_nullary(uint32_t tag) {
     return tbl[tag];
 }
 
+void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
+
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;
@@ -224,6 +226,8 @@ OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
 }
 
 void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j) {
+    orin_chk_slot(dst, i);
+    orin_chk_slot(src, j);
     OrinStruct *d = (OrinStruct *)dst;
     uint64_t v = ((OrinStruct *)src)->slots[j];
     if ((d->refmask >> i) & 1) orin_retain(ORIN_REF(v));

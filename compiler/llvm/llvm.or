@@ -229,14 +229,27 @@ function prelude(): string {
     + "  %rc = load i64, ptr %o\n  %u = icmp eq i64 %rc, 1\n  br i1 %u, label %fast, label %slow\n"
     + "slow:\n  %r = call ptr @orin_make_unique_slow(ptr %o)\n  ret ptr %r\n"
     + "fast:\n  ret ptr %o\n}\n";
+  p += "define internal ptr @orinl_slot(ptr %o, i64 %ix) alwaysinline nounwind {\n"
+    + "  %kp = getelementptr inbounds i8, ptr %o, i64 8\n  %kind = load i32, ptr %kp\n"
+    + "  %np = getelementptr inbounds i8, ptr %o, i64 16\n  %n = load i32, ptr %np\n  %n64 = zext i32 %n to i64\n"
+    + "  %sk = icmp ne i32 %kind, 3\n  %oob = icmp uge i64 %ix, %n64\n  %bad = or i1 %sk, %oob\n"
+    + "  br i1 %bad, label %t, label %k\n"
+    + "t:\n  call void @orin_trap_shape()\n  unreachable\n"
+    + "k:\n  %off = mul i64 %ix, 8\n  %o2 = add i64 %off, 32\n  %p = getelementptr inbounds i8, ptr %o, i64 %o2\n  ret ptr %p\n}\n";
   p += "define internal ptr @orinl_array_slot(ptr %a, i64 %i) alwaysinline nounwind {\n"
-    + "  %lp = getelementptr inbounds i8, ptr %a, i64 16\n  %len = load i64, ptr %lp\n"
+    + "  %kp = getelementptr inbounds i8, ptr %a, i64 8\n  %kind = load i32, ptr %kp\n  %nk = icmp ne i32 %kind, 2\n"
+    + "  br i1 %nk, label %ts, label %kk\n"
+    + "ts:\n  call void @orin_trap_shape()\n  unreachable\n"
+    + "kk:\n  %lp = getelementptr inbounds i8, ptr %a, i64 16\n  %len = load i64, ptr %lp\n"
     + "  %oob = icmp uge i64 %i, %len\n  br i1 %oob, label %t, label %k\n"
     + "t:\n  call void @orin_trap(ptr @.m7)\n  unreachable\n"
     + "k:\n  %ip = getelementptr inbounds i8, ptr %a, i64 40\n  %items = load ptr, ptr %ip\n"
     + "  %p = getelementptr inbounds i64, ptr %items, i64 %i\n  ret ptr %p\n}\n";
   p += "define internal void @orinl_array_push(ptr %a, i64 %slot) alwaysinline nounwind {\n"
-    + "  %lp = getelementptr inbounds i8, ptr %a, i64 16\n  %cp = getelementptr inbounds i8, ptr %a, i64 24\n"
+    + "  %kp = getelementptr inbounds i8, ptr %a, i64 8\n  %kind = load i32, ptr %kp\n  %nk = icmp ne i32 %kind, 2\n"
+    + "  br i1 %nk, label %ts, label %kk\n"
+    + "ts:\n  call void @orin_trap_shape()\n  unreachable\n"
+    + "kk:\n  %lp = getelementptr inbounds i8, ptr %a, i64 16\n  %cp = getelementptr inbounds i8, ptr %a, i64 24\n"
     + "  %len = load i64, ptr %lp\n  %cap = load i64, ptr %cp\n  %full = icmp eq i64 %len, %cap\n"
     + "  br i1 %full, label %grow, label %ok\n"
     + "grow:\n  call void @orin_array_push_grow(ptr %a, i64 %slot)\n  ret void\n"
@@ -255,6 +268,7 @@ function declares(): string {
     "declare ptr @orin_make_unique_slow(ptr)",
     "declare ptr @orin_struct_new(i32, i32, i64)",
     "declare ptr @orin_nullary(i32)",
+    "declare void @orin_trap_shape()",
     "declare i64 @orin_opt_unwrap(ptr)",
     "declare i64 @orin_res_unwrap(ptr)",
     "declare i64 @orin_res_unwrap_err(ptr)",
@@ -387,8 +401,16 @@ function st(fx: Fx, d: usize, val: string): string {
   return "  store " + lty(fx.f.locals[d].ty) + " " + val + ", ptr %l" + u(d) + "\n";
 }
 
+// Unchecked slot address: only for an object that `orin_struct_new` just returned in the same instruction
+// sequence with a constant slot count that covers `k` (closure and interface construction).
 function slotGep(name: string, base: string, k: usize): string {
   return "  " + name + " = getelementptr inbounds i8, ptr " + base + ", i64 " + u(32 + 8 * k) + "\n";
+}
+
+// Checked slot address for an object of unknown provenance: traps unless it is a struct with more than `k` slots
+// (defence in depth against shape confusion, same check as `orin_chk_slot` in the C runtime).
+function slotChk(name: string, base: string, k: usize): string {
+  return "  " + name + " = call ptr @orinl_slot(ptr " + base + ", i64 " + u(k) + ")\n";
 }
 
 // Slot value as an i64 for the array push helper (references are converted).
@@ -700,7 +722,7 @@ function unwrapOrR(fx: Fx, p: string, a0: string, dflt: Operand, rt: MType): R {
   const lj = lbl(p, "Lj");
   const text = "  " + p + "g = getelementptr inbounds i8, ptr " + a0 + ", i64 12\n  " + p + "t = load i32, ptr " + p + "g\n"
     + "  " + p + "c = icmp eq i32 " + p + "t, 0\n  br i1 " + p + "c, label %" + lt + ", label %" + lf + "\n"
-    + lt + ":\n" + slotGep(p + "s", a0, 0) + "  " + p + "v = load " + ty + ", ptr " + p + "s\n  br label %" + lj + "\n"
+    + lt + ":\n" + slotChk(p + "s", a0, 0) + "  " + p + "v = load " + ty + ", ptr " + p + "s\n  br label %" + lj + "\n"
     + lf + ":\n  br label %" + lj + "\n"
     + lj + ":\n  " + p + "m = phi " + ty + " [ " + p + "v, %" + lt + " ], [ " + ov(p, 1, dflt) + ", %" + lf + " ]\n";
   if (isRefT(rt)) {
@@ -780,8 +802,8 @@ function callIndirectI(fx: Fx, p: string, d: Option<usize>, f: Operand, args: Op
     k += 1;
   }
   const cv = ov(p, 0, f);
-  s += slotGep(p + "c0", cv, 0) + "  " + p + "fp = load ptr, ptr " + p + "c0\n";
-  s += slotGep(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+  s += slotChk(p + "c0", cv, 0) + "  " + p + "fp = load ptr, ptr " + p + "c0\n";
+  s += slotChk(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
   const rt = match (d) {
     Some(x) => lty(fx.f.locals[x].ty),
     None => "void"
@@ -820,8 +842,8 @@ function callVirtualI(fx: Fx, p: string, d: Option<usize>, r: Operand, slot: usi
     k += 1;
   }
   const cv = ov(p, 0, r);
-  s += slotGep(p + "c0", cv, 0) + "  " + p + "vt = load ptr, ptr " + p + "c0\n";
-  s += slotGep(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+  s += slotChk(p + "c0", cv, 0) + "  " + p + "vt = load ptr, ptr " + p + "c0\n";
+  s += slotChk(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
   s += "  " + p + "fg = getelementptr inbounds ptr, ptr " + p + "vt, i64 " + u(slot) + "\n";
   s += "  " + p + "fp = load ptr, ptr " + p + "fg\n";
   const rt = match (d) {
@@ -877,14 +899,14 @@ function instrI(fx: Fx, p: string, i: Instr): string {
     INullary(d, t) => "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + st(fx, d, p + "r"),
     ITag(d, o) => ld(fx, p, 0, o) + "  " + p + "g = getelementptr inbounds i8, ptr " + ov(p, 0, o) + ", i64 12\n  "
       + p + "t = load i32, ptr " + p + "g\n  " + p + "r = zext i32 " + p + "t to i64\n" + st(fx, d, p + "r"),
-    IGetField(d, o, k) => ld(fx, p, 0, o) + slotGep(p + "g", ov(p, 0, o), k)
+    IGetField(d, o, k) => ld(fx, p, 0, o) + slotChk(p + "g", ov(p, 0, o), k)
       + "  " + p + "r = load " + lty(fx.f.locals[d].ty) + ", ptr " + p + "g\n" + st(fx, d, p + "r"),
-    ISetField(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + ld(fx, p, 1, v) + slotGep(p + "g", p + "x", k)
+    ISetField(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + ld(fx, p, 1, v) + slotChk(p + "g", p + "x", k)
       + replaceI(fx, p, p + "g", 1, v),
-    ITakeField(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + slotGep(p + "g", p + "x", k)
+    ITakeField(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + slotChk(p + "g", p + "x", k)
       + "  " + p + "r = load ptr, ptr " + p + "g\n  store ptr null, ptr " + p + "g\n" + st(fx, d, p + "r"),
     IPutField(x, k, s) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p + "s = load ptr, ptr %l" + u(s) + "\n"
-      + slotGep(p + "g", p + "x", k) + "  store ptr " + p + "s, ptr " + p + "g\n",
+      + slotChk(p + "g", p + "x", k) + "  store ptr " + p + "s, ptr " + p + "g\n",
     IMakeUnique(x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p + "r = call ptr @orinl_make_unique(ptr " + p + "x)\n" + st(fx, x, p + "r"),
     IArrayNew(d, r, es) => arrayNewI(fx, p, d, r, es),
     IArrayGet(d, a, k) => ld(fx, p, 0, a) + ld(fx, p, 1, k)
