@@ -24,7 +24,7 @@ invariants as contract clauses:
 - **Checking:** CI builds an extra compiler with `--check-contracts` and runs the full test suite
   and the bootstrap with it (contracts become traps); normal builds erase them (zero cost). Pure
   functions with supported contracts are additionally sent to `orin verify --contracts` once
-  phase 2 exists; results are reported per clause (VERIFIED / FAILED / UNKNOWN), never as
+  phase 2 exists; results are reported per clause (VERIFIED / REFUTED / UNKNOWN / ASSUMED, ADR-0020 D1), never as
   "the compiler is proven".
 
 ## Rules for the rewrite
