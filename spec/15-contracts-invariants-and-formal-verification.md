@@ -167,7 +167,7 @@ class BankAccount {
 
   @Requires(amount > 0 && amount <= this.balance)
   @Ensures(this.balance == old(this.balance) - amount)
-  mut withdraw(amount: int): void {
+  withdraw(amount: int): void {
     this.balance -= amount;
   }
 }
@@ -207,8 +207,8 @@ function discount(cents: int, premium: bool): int { ... }
 - Contract expressions are **pure Orin expressions** (no calls to non-pure functions, no
   mutation, no allocation-observable effects); `old(e)` only in `@Ensures`; `==>` implication is
   available only inside contract expressions. Quantifiers (`forall`/`exists`) are OPEN.
-- Mutating methods are marked with `mut` (spec 03, ADR-0009 amendment); `old(this.f)` refers to
-  the receiver value before the call — under value semantics this is simply the input snapshot.
+- Mutating methods are inferred by the compiler (spec 03, ADR-0009); `old(this.f)` refers to the
+  receiver value before the call — under value semantics this is simply the input snapshot.
 - **Compiler integration:** every build parses, resolves and *type-checks* contract expressions
   (so they never rot), and erases them from release code. The proof itself is a compiler pass
   (`check → contract IR → VC generation → SMT/proof backend`) run by `orin verify`, by
