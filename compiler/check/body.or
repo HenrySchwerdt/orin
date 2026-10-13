@@ -992,6 +992,21 @@ function callValue(env: Env, fx: FnCtx, span: Span, callee: Expr, args: Expr[]):
   };
 }
 
+// `@Test` functions are entry points of `orin test` and are erased from ordinary builds (ADR-0024), so
+// no code may refer to them.
+function testGuard(f: FuncInfo, span: Span): Result<bool, Diagnostic> {
+  for (const a of f.decl.annotations) {
+    const isTest = match (a.kind) {
+      ATest => true,
+      _ => false
+    };
+    if (isTest) {
+      return Err(diag("E0445", span, "`@Test` function `" + f.decl.name.name + "` cannot be called or used as a value: it is only run by `orin test` and erased from ordinary builds"));
+    }
+  }
+  return Ok(true);
+}
+
 function callIdent(
   env: Env, fx: FnCtx, span: Span, callee: Expr, id: Ident, args: Expr[], exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
@@ -1017,6 +1032,7 @@ function callIdent(
     VGVariant(gi, tag) => genericVariant(env, fx, span, gi, tag, None, args, exp),
     VFunc(fid) => {
       const f = fx.env.funcs[fid];
+      testGuard(f, span)?;
       const a = argsExpect(env, fx, span, "function `" + id.name + "`", args, f.params)?;
       return done(a.fx, XCall(fid, a.args), f.ret, span);
     },
@@ -2537,6 +2553,7 @@ function dummyDecl(name: string, span: Span): FunctionDecl {
     ret: noRet,
     body: Block { stmts: noStmts, span: span },
     contracts: [],
+    annotations: [],
     span: span
   };
 }
@@ -2822,7 +2839,10 @@ function funcValue(
   env: Env, fx: FnCtx, span: Span, ent: ValEnt, id: Ident, expP: Option<Type[]>, expR: Option<Type>
 ): Result<ExprOut, Diagnostic> {
   return match (ent) {
-    VFunc(fid) => wrapFunc(fx, span, fid),
+    VFunc(fid) => {
+      testGuard(fx.env.funcs[fid], span)?;
+      return wrapFunc(fx, span, fid);
+    },
     VGFunc(g) => {
       const gf = env.gfuncs[g];
       const tp = paramNameList(gf.decl.typeParams);

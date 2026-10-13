@@ -1,0 +1,116 @@
+// Checks of the built-in annotations (ADR-0024, spec 05). Beyond Orin-B.
+//
+// Placement, argument and duplicate rules are part of the grammar (syntax/parser.or: E0440, E0441,
+// E0442). What needs more than syntax is here:
+//   * `@Test` functions take no parameters, are not generic and return `void` (E0443);
+//   * an `@Inline` function must not be part of a call cycle, directly or through other functions
+//     or closures (E0444; the hint cannot be honoured and is almost certainly a mistake);
+//   * `@Test` functions are never referenced (E0445, in check/body.or).
+// `@Deprecated` is a tooling concern (warnings W0440, analysis/deprecated.or); the checker ignores it.
+
+import { Diagnostic, diag } from "../diag";
+import { FunctionDecl, Annotation, TNamed } from "../syntax";
+import { Function } from "../hir";
+import { LoadedProgram } from "../loader";
+import { callTargets } from "./purity";
+
+export function hasTest(as: Annotation[]): bool {
+  for (const a of as) {
+    const t = match (a.kind) {
+      ATest => true,
+      _ => false
+    };
+    if (t) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function hasInline(as: Annotation[]): bool {
+  for (const a of as) {
+    const t = match (a.kind) {
+      AInline => true,
+      _ => false
+    };
+    if (t) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isVoidType(f: FunctionDecl): bool {
+  return match (f.ret) {
+    None => true,
+    Some(t) => match (t.kind) {
+      TNamed(id, args) => id.name == "void" && args.length == 0,
+      _ => false
+    }
+  };
+}
+
+// E0443 for the `@Test` functions of all user units.
+export function testSignatureDiags(prog: LoadedProgram): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const u of prog.units) {
+    if (u.name.startsWith("$")) {
+      continue;
+    }
+    for (const it of u.ast.items) {
+      match (it) {
+        IFunction(f) => {
+          if (hasTest(f.annotations)) {
+            if (f.typeParams.length > 0) {
+              out.push(diag("E0443", f.name.span, "`@Test` function `" + f.name.name + "` must not be generic"));
+            } else if (f.params.length > 0) {
+              out.push(diag("E0443", f.name.span, "`@Test` function `" + f.name.name + "` must not take parameters"));
+            } else if (!isVoidType(f)) {
+              out.push(diag("E0443", f.name.span, "`@Test` function `" + f.name.name + "` must return `void`: a test fails by trapping (use `assert` from \"std:test\")"));
+            }
+          }
+        },
+        _ => {}
+      }
+    }
+  }
+  return out;
+}
+
+// E0444: functions marked `inl` (indexed like `funcs`) that can reach themselves through calls and
+// closure creation. Calls through function values and interface methods are not followed.
+export function inlineCycleDiags(funcs: Function[], inl: bool[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  let k: usize = 0;
+  while (k < funcs.length) {
+    if (inl[k] && reaches(funcs, k)) {
+      out.push(diag("E0444", funcs[k].span, "`@Inline` function `" + funcs[k].name + "` is recursive (it is part of a call cycle); remove `@Inline`"));
+    }
+    k += 1;
+  }
+  return out;
+}
+
+// True if `root` is reachable from the callees of `root`.
+function reaches(funcs: Function[], root: usize): bool {
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < funcs.length) {
+    seen.push(false);
+    i += 1;
+  }
+  let stack: usize[] = callTargets(funcs[root]);
+  while (stack.length > 0) {
+    const k = stack.pop().unwrap();
+    if (k == root) {
+      return true;
+    }
+    if (k < funcs.length && !seen[k]) {
+      seen[k] = true;
+      for (const c of callTargets(funcs[k])) {
+        stack.push(c);
+      }
+    }
+  }
+  return false;
+}

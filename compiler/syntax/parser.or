@@ -11,7 +11,7 @@ import {
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
   UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind,
   InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam, ArrowBody,
-  ContractKind, ContractClause
+  ContractKind, ContractClause, AnnotationKind, Annotation
 } from "./ast";
 import { Token, TokKind, lex } from "./lexer";
 
@@ -31,6 +31,8 @@ type TypeArgsRes = { tys: TypeExpr[]; pos: usize; };
 type PatRes = { pat: Pattern; pos: usize; };
 type ClauseRes = { clause: ContractClause; pos: usize; };
 type ClausesRes = { clauses: ContractClause[]; pos: usize; };
+type AnnoRes = { anno: Annotation; pos: usize; };
+type DecosRes = { clauses: ContractClause[]; annos: Annotation[]; first: Span; pos: usize; };
 
 // ---------------------------------------------------------------------------
 // Token helpers
@@ -334,11 +336,13 @@ function parseClause(toks: Token[], pos: usize): Result<ClauseRes, Diagnostic> {
     kind = CDecreases;
   } else if (nt.text == "Rule") {
     kind = CRule;
+  } else if (isBuiltinAnnotation(nt.text)) {
+    return Err(diag("E0440", spanTo(at, nt.span), "annotation `@" + nt.text + "` cannot be applied here (it applies to " + annotationTargets(nt.text) + ")"));
   } else {
     return Err(diag(
       "E0408", spanTo(at, nt.span),
-      "annotations are not supported yet (spec 05): `@" + nt.text
-        + "`; only the contract clauses @Requires, @Ensures, @Invariant, @Decreases and @Rule exist"
+      "unknown annotation `@" + nt.text + "`: only the built-in annotations @Test, @Deprecated and @Inline and the contract clauses "
+        + "@Requires, @Ensures, @Invariant, @Decreases and @Rule exist (user-defined annotations are post-1.0, ADR-0024)"
     ));
   }
   let p = expectP(toks, pos + 2, "(")?;
@@ -367,6 +371,123 @@ function parseClause(toks: Token[], pos: usize): Result<ClauseRes, Diagnostic> {
   p = expectP(toks, p, ")")?;
   const c = ContractClause { kind: kind, expr: ex, rule: rule, span: spanTo(at, lastSpan(toks, p)) };
   return Ok(ClauseRes { clause: c, pos: p });
+}
+
+// ---------------------------------------------------------------------------
+// Built-in annotations (beyond Orin-B, ADR-0024): `@Test`, `@Deprecated("message")`, `@Inline`
+// ---------------------------------------------------------------------------
+
+function isBuiltinAnnotation(name: string): bool {
+  return name == "Test" || name == "Deprecated" || name == "Inline";
+}
+
+function annotationName(k: AnnotationKind): string {
+  return match (k) {
+    ATest => "@Test",
+    ADeprecated => "@Deprecated",
+    AInline => "@Inline"
+  };
+}
+
+function annotationTargets(name: string): string {
+  if (name == "Test" || name == "@Test") {
+    return "top-level functions";
+  }
+  if (name == "Inline" || name == "@Inline") {
+    return "functions and methods";
+  }
+  return "functions, methods, classes, types, interfaces and interface methods";
+}
+
+// Annotation targets: the numbering of `targetName` plus 7 interface, 8 interface method, 9 constant.
+function annotationAllowed(k: AnnotationKind, target: int): bool {
+  return match (k) {
+    ATest => target == 0,
+    ADeprecated => target <= 1 || (target >= 3 && target <= 5) || target == 7 || target == 8,
+    AInline => target <= 1
+  };
+}
+
+function targetNameA(target: int): string {
+  if (target == 7) {
+    return "an interface";
+  }
+  if (target == 8) {
+    return "an interface method";
+  }
+  if (target == 9) {
+    return "a constant";
+  }
+  return targetName(target);
+}
+
+// Placement (E0440) and duplicates (E0442); the contract-clause rules are checked separately.
+function checkAnnoPlacement(as: Annotation[], target: int): Result<bool, Diagnostic> {
+  let i: usize = 0;
+  while (i < as.length) {
+    const a = as[i];
+    if (!annotationAllowed(a.kind, target)) {
+      return Err(diag("E0440", a.span, "annotation `" + annotationName(a.kind) + "` cannot be applied to " + targetNameA(target)
+        + " (it applies to " + annotationTargets(annotationName(a.kind)) + ")"));
+    }
+    let j: usize = 0;
+    while (j < i) {
+      if (annotationName(as[j].kind) == annotationName(a.kind)) {
+        return Err(diag("E0442", a.span, "duplicate annotation `" + annotationName(a.kind) + "`"));
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return Ok(true);
+}
+
+// pos at `@` followed by the name of a built-in annotation.
+function parseAnnotation(toks: Token[], pos: usize): Result<AnnoRes, Diagnostic> {
+  const at = tokAt(toks, pos).span;
+  const nt = tokAt(toks, pos + 1);
+  let p = pos + 2;
+  if (nt.text == "Deprecated") {
+    if (!isP(toks, p, "(")) {
+      return Err(diag("E0441", spanTo(at, nt.span), "`@Deprecated` requires a message: `@Deprecated(\"use other() instead\")`"));
+    }
+    const st = tokAt(toks, p + 1);
+    const isStr = match (st.kind) {
+      KStr => true,
+      _ => false
+    };
+    if (!isStr || !isP(toks, p + 2, ")")) {
+      return Err(diag("E0441", spanTo(at, st.span), "`@Deprecated` takes exactly one string literal argument (the message)"));
+    }
+    p += 3;
+    return Ok(AnnoRes { anno: Annotation { kind: ADeprecated, message: st.text, span: spanTo(at, lastSpan(toks, p)) }, pos: p });
+  }
+  if (isP(toks, p, "(")) {
+    return Err(diag("E0441", spanTo(at, nt.span), "`@" + nt.text + "` takes no arguments"));
+  }
+  const kind: AnnotationKind = nt.text == "Test" ? ATest : AInline;
+  return Ok(AnnoRes { anno: Annotation { kind: kind, message: "", span: spanTo(at, nt.span) }, pos: p });
+}
+
+// Contract clauses and built-in annotations in any order; pos at the first `@`. `first` is the span of
+// the first one (the declaration's span starts there).
+function parseDecos(toks: Token[], pos: usize): Result<DecosRes, Diagnostic> {
+  let p = pos;
+  let cs: ContractClause[] = [];
+  let as: Annotation[] = [];
+  const first = tokAt(toks, pos).span;
+  while (isP(toks, p, "@")) {
+    if (isIdentTok(toks, p + 1) && isBuiltinAnnotation(tokAt(toks, p + 1).text)) {
+      const ar = parseAnnotation(toks, p)?;
+      as.push(ar.anno);
+      p = ar.pos;
+    } else {
+      const c = parseClause(toks, p)?;
+      cs.push(c.clause);
+      p = c.pos;
+    }
+  }
+  return Ok(DecosRes { clauses: cs, annos: as, first: first, pos: p });
 }
 
 // One or more clauses; pos at the first `@`.
@@ -422,17 +543,21 @@ function parseImportDecl(toks: Token[], pos: usize): Result<ImportRes, Diagnosti
 
 function parseItem(toks: Token[], pos: usize): Result<ItemRes, Diagnostic> {
   let cls: ContractClause[] = [];
+  let annos: Annotation[] = [];
   let p0 = pos;
+  let start = tokAt(toks, pos).span;
   if (isP(toks, pos, "@")) {
-    const cr = parseClauses(toks, pos)?;
+    const cr = parseDecos(toks, pos)?;
     cls = cr.clauses;
+    annos = cr.annos;
     p0 = cr.pos;
+    start = cr.first;
   }
-  const start = cls.length > 0 ? cls[0].span : tokAt(toks, p0).span;
   if (isKw(toks, p0, "import")) {
     if (cls.length > 0) {
       return Err(diag("E0200", cls[0].span, "contract clauses cannot precede an import"));
     }
+    checkAnnoPlacement(annos, 10)?;
     const r = parseImportDecl(toks, p0)?;
     return Ok(ItemRes { item: IImport(r.decl), pos: r.pos });
   }
@@ -445,29 +570,37 @@ function parseItem(toks: Token[], pos: usize): Result<ItemRes, Diagnostic> {
       if (cls.length > 0) {
         return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a re-export"));
       }
+      checkAnnoPlacement(annos, 10)?;
       const r = parseImportDecl(toks, p0)?;
       return Ok(ItemRes { item: IReExport(r.decl), pos: r.pos });
     }
   }
   if (isKw(toks, p, "function")) {
     checkPlacement(cls, 0)?;
-    return parseFunction(toks, p, exported, start, cls);
+    checkAnnoPlacement(annos, 0)?;
+    return parseFunction(toks, p, exported, start, cls, annos);
   }
   if (isKw(toks, p, "type")) {
-    return parseTypeDecl(toks, p, exported, start, cls);
+    return parseTypeDecl(toks, p, exported, start, cls, annos);
   }
   if (isKw(toks, p, "const")) {
     if (cls.length > 0) {
       return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a constant"));
     }
+    checkAnnoPlacement(annos, 9)?;
     return parseConstDecl(toks, p, exported, start);
   }
   if (isKw(toks, p, "class")) {
     checkPlacement(cls, 3)?;
-    return parseClass(toks, p, exported, start, cls);
+    checkAnnoPlacement(annos, 3)?;
+    return parseClass(toks, p, exported, start, cls, annos);
   }
   if (isKw(toks, p, "interface")) {
-    return parseInterface(toks, p, exported, start);
+    if (cls.length > 0) {
+      return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to an interface"));
+    }
+    checkAnnoPlacement(annos, 7)?;
+    return parseInterface(toks, p, exported, start, annos);
   }
   return Err(errExpected(toks, p, "declaration"));
 }
@@ -502,7 +635,7 @@ function parseSigBody(toks: Token[], pos: usize): Result<SigRes, Diagnostic> {
 }
 
 // pos at `function`; `start` is the span of the item's first token.
-function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[]): Result<ItemRes, Diagnostic> {
+function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[], annos: Annotation[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParamsB(toks, name.pos)?;
   const sg = parseSigBody(toks, tps.pos)?;
@@ -515,6 +648,7 @@ function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span, c
     ret: sg.ret,
     body: sg.body,
     contracts: cls,
+    annotations: annos,
     span: spanTo(start, sg.body.span)
   };
   return Ok(ItemRes { item: IFunction(decl), pos: sg.pos });
@@ -543,7 +677,7 @@ function isIdentTok(toks: Token[], pos: usize): bool {
 }
 
 // pos at `class`.
-function parseClass(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[]): Result<ItemRes, Diagnostic> {
+function parseClass(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[], annos: Annotation[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParams(toks, name.pos)?;
   let p = tps.pos;
@@ -583,6 +717,7 @@ function parseClass(toks: Token[], pos: usize, exported: bool, start: Span, cls:
     impls: impls,
     members: members,
     contracts: cls,
+    annotations: annos,
     span: spanTo(start, lastSpan(toks, p))
   };
   return Ok(ItemRes { item: IClass(decl), pos: p });
@@ -590,7 +725,7 @@ function parseClass(toks: Token[], pos: usize, exported: bool, start: Span, cls:
 
 // pos at `interface` (ADR-0019): `interface Name { m(a: T): R; .. }`. `extends` and type parameters are
 // parsed so the checker can reject them; fields and method bodies are E0408 here.
-function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span, annos: Annotation[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParams(toks, name.pos)?;
   let p = tps.pos;
@@ -603,7 +738,18 @@ function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span):
   p = expectP(toks, p, "{")?;
   let methods: IfaceMethod[] = [];
   while (!isP(toks, p, "}")) {
-    const mstart = tokAt(toks, p).span;
+    let mstart = tokAt(toks, p).span;
+    let mannos: Annotation[] = [];
+    if (isP(toks, p, "@")) {
+      const dr = parseDecos(toks, p)?;
+      if (dr.clauses.length > 0) {
+        return Err(diag("E0200", dr.clauses[0].span, "contract clauses cannot be applied to an interface method"));
+      }
+      checkAnnoPlacement(dr.annos, 8)?;
+      mannos = dr.annos;
+      mstart = dr.first;
+      p = dr.pos;
+    }
     const mn = parseIdent(toks, p)?;
     p = mn.pos;
     if (isP(toks, p, ":")) {
@@ -637,7 +783,7 @@ function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span):
       return Err(diag("E0408", tokAt(toks, p).span, "interface methods cannot have a body (no default methods in Orin 1.0, ADR-0019)"));
     }
     p = expectP(toks, p, ";")?;
-    methods.push(IfaceMethod { name: mn.id, params: params, ret: ret, span: spanTo(mstart, lastSpan(toks, p)) });
+    methods.push(IfaceMethod { name: mn.id, params: params, ret: ret, annotations: mannos, span: spanTo(mstart, lastSpan(toks, p)) });
   }
   p += 1;
   const decl = InterfaceDecl {
@@ -646,6 +792,7 @@ function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span):
     typeParams: tps.ids,
     ext: ext,
     methods: methods,
+    annotations: annos,
     span: spanTo(start, lastSpan(toks, p))
   };
   return Ok(ItemRes { item: IInterface(decl), pos: p });
@@ -655,13 +802,16 @@ function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span):
 // count when another identifier follows.
 function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
   let cls: ContractClause[] = [];
+  let annos: Annotation[] = [];
   let p = pos;
+  let start = tokAt(toks, pos).span;
   if (isP(toks, pos, "@")) {
-    const cr = parseClauses(toks, pos)?;
+    const cr = parseDecos(toks, pos)?;
     cls = cr.clauses;
+    annos = cr.annos;
     p = cr.pos;
+    start = cr.first;
   }
-  const start = cls.length > 0 ? cls[0].span : tokAt(toks, p).span;
   let priv = false;
   let isStatic = false;
   let mods: usize = 0;
@@ -683,10 +833,12 @@ function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
   p = name.pos;
   if (isP(toks, p, "(") && name.id.name == "constructor" && mods == 0) {
     checkPlacement(cls, 2)?;
+    checkAnnoPlacement(annos, 2)?;
     return parseCtor(toks, p, start, cls);
   }
   if (isP(toks, p, "(") || isP(toks, p, "<")) {
     checkPlacement(cls, 1)?;
+    checkAnnoPlacement(annos, 1)?;
     const tps = parseTypeParams(toks, p)?;
     const sg = parseSigBody(toks, tps.pos)?;
     const md = MethodDecl {
@@ -698,6 +850,7 @@ function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
       ret: sg.ret,
       body: sg.body,
       contracts: cls,
+      annotations: annos,
       span: spanTo(start, sg.body.span)
     };
     return Ok(MemberRes { member: MMethod(md), pos: sg.pos });
@@ -705,6 +858,9 @@ function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
   if (isP(toks, p, ":")) {
     if (cls.length > 0) {
       return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to a field"));
+    }
+    if (annos.length > 0) {
+      return Err(diag("E0440", annos[0].span, "annotation `" + annotationName(annos[0].kind) + "` cannot be applied to a field"));
     }
     if (isStatic) {
       return Err(diag("E0408", spanTo(start, name.id.span), "static fields are not supported (ADR-0009)"));
@@ -757,7 +913,7 @@ function parseCtor(toks: Token[], pos: usize, start: Span, cls: ContractClause[]
 }
 
 // pos at `type`.
-function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[]): Result<ItemRes, Diagnostic> {
+function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[], annos: Annotation[]): Result<ItemRes, Diagnostic> {
   const name = parseIdent(toks, pos + 1)?;
   const tps = parseTypeParams(toks, name.pos)?;
   const eq = expectP(toks, tps.pos, "=")?;
@@ -768,12 +924,14 @@ function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span, c
     _ => false
   };
   checkPlacement(cls, isRecord ? 4 : 5)?;
+  checkAnnoPlacement(annos, isRecord ? 4 : 5)?;
   const decl = TypeDecl {
     exported: exported,
     name: name.id,
     typeParams: tps.ids,
     body: body.body,
     contracts: cls,
+    annotations: annos,
     span: spanTo(start, lastSpan(toks, p))
   };
   return Ok(ItemRes { item: IType(decl), pos: p });

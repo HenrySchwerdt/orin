@@ -31,7 +31,9 @@ PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("te
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
                 os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or"),
                 # interfaces (ADR-0019) are syntax beyond Orin-B
-                os.path.join("tests", "fmt", "interfaces.in.or"), os.path.join("tests", "fmt", "interfaces.out.or")}
+                os.path.join("tests", "fmt", "interfaces.in.or"), os.path.join("tests", "fmt", "interfaces.out.or"),
+                # built-in annotations (ADR-0024) are syntax beyond Orin-B
+                os.path.join("tests", "fmt", "annotations.in.or"), os.path.join("tests", "fmt", "annotations.out.or")}
 # Stage 1 accepts float literals (ADR-0018); these edge cases pin Stage 0's rejection only.
 FLOAT_SKIP = {"err0100_bad_float.or", "err0100_bad_float_in_expr.or", "err0100_bad_float_second_line.or",
               "err0100_bad_int_exp.or"}

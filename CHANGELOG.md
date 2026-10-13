@@ -1,6 +1,14 @@
 # Changelog
 
 ## Unreleased
+- Built-in annotations (ADR-0024, spec 05; compiler built-ins only, any other `@Name` is still E0408):
+  `@Test` on top-level `void` functions with `orin test <file|dir> [--filter S] [--format=json]` (one
+  executable, one process per test, PASS/FAIL per test, stable JSON, MCP `test` with `unit: true`) and
+  the new `std:test` module (`assert`, `assertEq`, ...); `@Test` functions are type-checked but erased from
+  ordinary builds (byte-identical output). `@Deprecated("message")` gives warning W0440 on uses (text, JSON
+  `severity:"warning"`, LSP severity 2 + Deprecated tag, hover, `orin api --check`). `@Inline` becomes
+  `static inline` (C) / `alwaysinline` (LLVM); a recursive `@Inline` function is E0444. New errors
+  E0440-E0445, formatter, VS Code grammar. See docs/testing.md.
 - Packages (ADR-0016, spec 04): `orin.toml` manifest (`[package]`, `[architecture]`,
   `[modules.<path>] allowed_dependencies`), enforced by the loader (E0501 disallowed import, E0502
   unknown module, E0500/E0503 manifest errors); `orin check|compile|build|run <package-dir>`;

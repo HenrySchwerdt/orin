@@ -229,6 +229,13 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0416 | impure contract expression: I/O or other effect, mutating call, call of a function that is not provably pure, closure — beyond Orin-B (ADR-0012) |
 | E0417 | class does not implement an interface method / type does not satisfy a bound (self-hosted compiler only, ADR-0019) |
 | E0418 | method implementing an interface method mutates its receiver (self-hosted compiler only, ADR-0019) |
+| E0440 | built-in annotation on a declaration it does not apply to (`@Test` on a method or class, `@Inline` on a class or type, `@Deprecated` on a constant, field, constructor, import or statement) — beyond Orin-B (ADR-0024) |
+| E0441 | wrong annotation arguments: `@Test(..)` / `@Inline(..)` take none, `@Deprecated` needs exactly one string literal — beyond Orin-B (ADR-0024) |
+| E0442 | duplicate annotation on one declaration — beyond Orin-B (ADR-0024) |
+| E0443 | invalid `@Test` function: generic, has parameters, or does not return `void` — beyond Orin-B (ADR-0024) |
+| E0444 | `@Inline` function that is part of a call cycle (recursive) — beyond Orin-B (ADR-0024) |
+| E0445 | a `@Test` function is called or used as a value (tests are only run by `orin test` and erased from ordinary builds) — beyond Orin-B (ADR-0024) |
+| W0440 | **warning** (never fails a build): use of a `@Deprecated` symbol; printed as `warning[W0440]`, JSON `"severity":"warning"`, LSP severity 2 with the Deprecated tag — beyond Orin-B (ADR-0024) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
 | E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |
@@ -237,8 +244,9 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 Beyond Orin-B (self-hosted compiler only), contract clauses `@Requires`, `@Ensures`, `@Invariant`,
 `@Decreases`, `@Rule` (ADR-0012) reuse existing codes where the failure is not specific to
 contracts: E0200 (a clause in the wrong place, e.g. `@Ensures` on a class), E0300 (`result` outside
-`@Ensures`, or in a `void` function; unknown names), E0408 (any other `@Name`: annotations, spec 05,
-are not implemented; `@Invariant` on a generic record).
+`@Ensures`, or in a `void` function; unknown names), E0408 (any `@Name` that is neither a contract clause
+nor one of the built-in annotations `@Test`, `@Deprecated`, `@Inline` of ADR-0024; `@Invariant` on a
+generic record).
 
 ## 10. Clarifications (v1.1, from conformance-suite review)
 

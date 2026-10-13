@@ -15,10 +15,9 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   - `orin.toml` packages
   - std path/json/time/graph
   - runtime R2 platform layer
-- **done:** interfaces (ADR-0019), contract clauses phase 1 + 2 (ADR-0012)
+- **done:** interfaces (ADR-0019), contract clauses phase 1 + 2 (ADR-0012), `@Test`/`orin test`, `@Deprecated`, `@Inline` (ADR-0024)
 - **next:**
   - fixed-width integers and template-literal interpolation
-  - `@Test`/`orin test`, `@Deprecated`, `@Inline`
   - resources and the streaming `std:fs`
 - **capabilities (language part):** ADR-0021 is to be written. It covers unforgeable handles,
   grants at the program root, boundary declarations in `orin.toml` and enforcement in the platform

@@ -365,7 +365,7 @@ def run(exe):
     for old, new, code in (("@Requires(a > 0)", "@Requires(a + 1)", "E0414"),
                            ("@Requires(a > 0)", "@Requires(old(a) > 0)", "E0415"),
                            ("@Requires(a > 0)", "@Requires(result > 0)", "E0300"),
-                           ("@Requires(a > 0)", "@Deprecated(a)", "E0408")):
+                           ("@Requires(a > 0)", "@Cached(a)", "E0408")):
         change_doc(c, kc, kc_good.replace(old, new), 2)
         d = sync(c, uri_of(kc))
         check(d is not None and len(d) >= 1 and d[0]["code"] == code, "contracts: %s -> %s (got %r)" % (new, code, d))

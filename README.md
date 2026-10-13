@@ -121,6 +121,7 @@ compiler (`cc`, gcc or clang) on your PATH — Orin currently compiles to C, LLV
 tar xzf orin-<version>-<platform>.tar.gz && cd orin-<version>-<platform>
 bin/orin run examples/hello.or
 bin/orin build examples/shapes.or -o shapes && ./shapes
+bin/orin test examples/testing.or                # run the @Test functions (docs/testing.md)
 bin/orin check examples/counter.or           # type-check only
 bin/orin fmt --stdout examples/generics.or   # canonical formatting
 ```

@@ -17,3 +17,6 @@ Implementation: phase 1 (parse, resolve, type-check, erase, `--check-contracts`)
   compiler pass when requested (`orin verify`, `--verify`) or required by module policy.
 - Order of implementation: contract-clause productions + AST nodes in the parser (store, check, ignore) → pure-function
   `@Requires/@Ensures` VC generation (spec 15 Milestone B) → loops → classes/`mut` methods.
+- Update (ADR-0024): the compiler built-ins `@Test`, `@Deprecated`, `@Inline` are a second closed set with
+  their own AST node and grammar; contract clauses stay separate from them, and any other `@Name` is
+  still E0408.

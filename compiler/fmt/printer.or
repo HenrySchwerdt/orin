@@ -17,7 +17,7 @@ import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
   UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ClassDecl, ClassMember,
-  CtorParam, FnTyParam, ArrowParam, ArrowBody, ContractClause, ContractKind
+  CtorParam, FnTyParam, ArrowParam, ArrowBody, ContractClause, ContractKind, Annotation
 } from "../syntax";
 import { Ctx, seq, bracketed, gapsHave, hasCommentIn, findChar } from "./layout";
 import { pad, quote, endCol } from "./text";
@@ -834,6 +834,29 @@ function clauseText(c: Ctx, k: ContractClause, ind: usize): string {
   }
 }
 
+// `@Test`, `@Deprecated("message")`, `@Inline` (ADR-0024).
+function annotationLine(a: Annotation): string {
+  return match (a.kind) {
+    ATest => "@Test",
+    ADeprecated => "@Deprecated(" + quote(a.message) + ")",
+    AInline => "@Inline"
+  };
+}
+
+// The built-in annotations, one per line, in source order.
+function annosPrefix(as: Annotation[], ind: usize): string {
+  let out = "";
+  for (const a of as) {
+    out += annotationLine(a) + "\n" + pad(ind);
+  }
+  return out;
+}
+
+// Annotations first, then contract clauses, one per line above the declaration.
+function decoPrefix(c: Ctx, as: Annotation[], ks: ContractClause[], ind: usize): string {
+  return annosPrefix(as, ind) + clausesPrefix(c, ks, ind);
+}
+
 // The clauses of a declaration, each followed by a line break and the indentation of the declaration.
 function clausesPrefix(c: Ctx, ks: ContractClause[], ind: usize): string {
   let out = "";
@@ -900,7 +923,7 @@ function functionText(c: Ctx, f: FunctionDecl): string {
       lo2 = b.unwrap().span.end;
     }
   }
-  return clausesPrefix(c, f.contracts, 0) + signatureText(c, head, lo2, f.params, f.ret, f.body, 0);
+  return decoPrefix(c, f.annotations, f.contracts, 0) + signatureText(c, head, lo2, f.params, f.ret, f.body, 0);
 }
 
 // `head(params): ret { body }` at indent `ind`; `lo2` is the source position after the name (and
@@ -989,7 +1012,7 @@ function memberText(c: Ctx, m: ClassMember, ind: usize): string {
           lo2 = tp.span.end;
         }
       }
-      return clausesPrefix(c, md.contracts, ind) + signatureText(c, head, lo2, md.params, md.ret, md.body, ind);
+      return decoPrefix(c, md.annotations, md.contracts, ind) + signatureText(c, head, lo2, md.params, md.ret, md.body, ind);
     }
   }
 }
@@ -1024,7 +1047,7 @@ function classText(c: Ctx, k: ClassDecl): string {
     texts.push(memberText(c, m, 2));
   }
   const open = findChar(c, lo2, 123) + 1;
-  return clausesPrefix(c, k.contracts, 0) + bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
+  return decoPrefix(c, k.annotations, k.contracts, 0) + bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
 }
 
 // An interface method signature `name(a: T): R;` (ADR-0019), wrapped like a parameter list when too long.
@@ -1046,10 +1069,11 @@ function ifaceMethodText(c: Ctx, m: IfaceMethod, ind: usize): string {
   const open = findChar(c, m.name.span.end, 40) + 1;
   const forced = gapsHave(c, starts, ends, open, close);
   const flat = m.name.name + "(" + texts.join(", ") + ")" + ret + ";";
+  const pre = annosPrefix(m.annotations, ind);
   if (!forced && ind + flat.length <= WIDTH) {
-    return flat;
+    return pre + flat;
   }
-  return bracketed(c, m.name.name + "(", ")", open, close, starts, ends, texts, ind, ",") + ret + ";";
+  return pre + bracketed(c, m.name.name + "(", ")", open, close, starts, ends, texts, ind, ",") + ret + ";";
 }
 
 function interfaceText(c: Ctx, k: InterfaceDecl): string {
@@ -1073,7 +1097,7 @@ function interfaceText(c: Ctx, k: InterfaceDecl): string {
     texts.push(ifaceMethodText(c, m, 2));
   }
   const open = findChar(c, lo2, 123) + 1;
-  return bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
+  return annosPrefix(k.annotations, 0) + bracketed(c, head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
 }
 
 function variantText(v: VariantDecl): string {
@@ -1084,7 +1108,7 @@ function variantText(v: VariantDecl): string {
 }
 
 function typeDeclText(c: Ctx, t: TypeDecl): string {
-  return clausesPrefix(c, t.contracts, 0) + typeDeclBodyText(c, t);
+  return decoPrefix(c, t.annotations, t.contracts, 0) + typeDeclBodyText(c, t);
 }
 
 function typeDeclBodyText(c: Ctx, t: TypeDecl): string {

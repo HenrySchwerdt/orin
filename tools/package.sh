@@ -21,4 +21,5 @@ echo "$VER" > "$OUT/VERSION"
 tar -C build/dist -czf "build/dist/$NAME.tar.gz" "$NAME"
 # Smoke test the package.
 "$OUT/bin/orin" run "$OUT/examples/hello.or"
+"$OUT/bin/orin" test "$OUT/examples/testing.or"
 echo "packaged build/dist/$NAME.tar.gz"

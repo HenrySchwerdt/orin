@@ -82,8 +82,15 @@ touched file is inside the root.
 
 Every edit replaces the identifier of length `len(symbol)` at the listed position with `newName`.
 
-### `test` {entry? | suite?, filter?} — needs `--allow-exec`
+### `test` {entry? | suite?, filter?, unit?} — needs `--allow-exec`
 
+* `entry` with `unit: true`: runs the `@Test` functions of that program or package, exactly like
+  `orin test` (docs/testing.md; one process per test, 10 s timeout each, `filter` = substring of the test
+  id). The result is the report of `orin test --format=json`: `{"ok":false,"total":2,"passed":1,"failed":1,
+  "filtered":0,"tests":[{"id":"u.ok","status":"pass",...},{"id":"u.bad","status":"fail","reason":"trap",
+  "stderr":"trap: assertEq failed: ..."}],"warnings":[]}`. A program that does not compile returns the
+  diagnostics like `build`; a project that reads files outside the root is refused before anything runs.
+  The build directory is a fresh `/tmp/orin-test-N`, removed afterwards.
 * `entry`: compiles and runs one program (10 s timeout) and compares stdout with `<name>.out`
   (or `expected.out` next to `main.or`); honours a `// exit: N` first line.
   `{"passed":true,"exit":0}`; on failure `why`, `stdout`, `stderr` (truncated).
@@ -92,7 +99,7 @@ Every edit replaces the identifier of length `len(symbol)` at the listed positio
 
 ### `build` {entry, out, binary?} — needs `--allow-exec`
 
-Compiles through the MIR pipeline to C at `out`; with `binary` also links it with `cc` against
+Compiles through the MIR pipeline to C at `out` (`@Test` functions are type-checked and erased); with `binary` also links it with `cc` against
 `<repo>/runtime`. `{"ok":true,"c":"build/main.c","bytes":58213,"binary":"build/main"}`; compile
 errors return `{"ok":false,"errors":N,"diags":[...]}` in the `check` compact format.
 
@@ -104,7 +111,7 @@ errors return `{"ok":false,"errors":N,"diags":[...]}` in the `check` compact for
 * `test`/`build` run `cc` and project code with the server's privileges: they are off unless
   `--allow-exec` is given. Even then the process is not sandboxed; run the server in a container for
   untrusted projects. Temporary artifacts go to `<root>/.orin-mcp/`.
-* `edit` writes only with `apply: true`; no tool can touch FFI/annotation machinery.
+* `edit` writes only with `apply: true`; no tool can touch FFI machinery. `check` reports errors only: `@Deprecated` warnings (W0440) are not listed.
 
 ## Token economy
 
