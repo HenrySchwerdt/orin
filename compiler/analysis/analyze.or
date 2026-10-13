@@ -15,7 +15,7 @@
 import { Module, Item, parse } from "../syntax";
 import { Diagnostic, SourceMap, SourceFile } from "../diag";
 import { LoadedProgram, loadWithOverlay, normalizePath } from "../loader";
-import { check } from "../check";
+import { checkWithIndex } from "../check";
 import { SemanticIndex } from "../hir";
 import { Workspace } from "./workspace";
 
@@ -35,24 +35,27 @@ export type Analysis = {
   sm: SourceMap;               // every file read (index == Span.file); entry is file 0
   diags: PathDiag[];
   program: Option<LoadedProgram>;   // Some when loading succeeded (even if checking failed)
-  // Semantic index (defs/refs/types, hir/index.or). None until the checker produces it; see
-  // `indexAvailable`.
+  // Semantic index (defs/refs/types, hir/index.or). Some whenever loading succeeded; partial when
+  // checking failed (see check/index.or).
   index: Option<SemanticIndex>;
 };
 
-// True once `runCheck` can return a SemanticIndex. The lead flips this when the checker gains
-// a producer; the LSP only advertises definition/hover/references/rename when it is true.
+// True: the checker produces a SemanticIndex (`checkWithIndex`), so the LSP advertises
+// definition/hover/references/rename.
 export function indexAvailable(): bool {
-  return false;
+  return true;
 }
 
-// Isolation point for the checker API: the only place that calls `check`. When the checker
-// returns `{ program, index }`, return `Ok(Some(index))` here.
-function runCheck(prog: LoadedProgram, sm: SourceMap): Result<Option<SemanticIndex>, Diagnostic[]> {
-  const r = check(prog, sm);
-  return match (r) {
-    Ok(_) => Ok(None),
-    Err(ds) => Err(ds)
+type CheckRes = { diags: Diagnostic[]; index: SemanticIndex; };
+
+// Isolation point for the checker API: the only place that calls the checker. The index is
+// produced even when checking fails (partial: type-dependent entries are missing then).
+function runCheck(prog: LoadedProgram, sm: SourceMap): CheckRes {
+  const r = checkWithIndex(prog, sm);
+  const none: Diagnostic[] = [];
+  return match (r.result) {
+    Ok(_) => CheckRes { diags: none, index: r.index },
+    Err(ds) => CheckRes { diags: ds, index: r.index }
   };
 }
 
@@ -147,14 +150,10 @@ export function analyze(ws: Workspace, entryPath: string): Analysis {
     };
   }
   const prog = lo.program.unwrap();
-  return match (runCheck(prog, lo.sm)) {
-    Ok(idx) => Analysis {
-      revision: ws.revision, entry: entry, sm: sm, diags: [], program: Some(prog), index: idx
-    },
-    Err(ds) => Analysis {
-      revision: ws.revision, entry: entry, sm: sm, diags: convert(sm, ds, prep.origLen),
-      program: Some(prog), index: None
-    }
+  const cr = runCheck(prog, lo.sm);
+  return Analysis {
+    revision: ws.revision, entry: entry, sm: sm, diags: convert(sm, cr.diags, prep.origLen),
+    program: Some(prog), index: Some(cr.index)
   };
 }
 
