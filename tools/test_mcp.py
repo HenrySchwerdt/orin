@@ -368,6 +368,21 @@ def main():
     write(os.path.join(proj, "t.out"), "ho\n")
     err, v, raw = c.call("test", {"entry": "t.or"})
     check(not err and v["passed"] is False and "line 1" in v["why"], "test entry mismatch reported (%s)" % raw)
+    # @Test functions (ADR-0024): per-test results, shared with `orin test`
+    write(os.path.join(proj, "u.or"), 'import { assertEq } from "std:test";\n\n@Test\nfunction ok(): void {\n  assertEq(1 + 1, 2, "sum");\n}\n\n'
+          '@Test\nfunction bad(): void {\n  assertEq(1 + 1, 3, "sum");\n}\n\nfunction main(): void {\n}\n')
+    err, v, raw = c.call("test", {"entry": "u.or", "unit": True})
+    check(not err and v["ok"] is False and v["total"] == 2 and v["passed"] == 1 and v["failed"] == 1
+          and [t["status"] for t in v["tests"]] == ["pass", "fail"] and "expected 3, got 2" in v["tests"][1]["stderr"], "test unit=true runs @Test functions (%s)" % raw)
+    err, v, raw = c.call("test", {"entry": "u.or", "unit": True, "filter": "ok"})
+    check(not err and v["ok"] is True and v["total"] == 1 and v["filtered"] == 1, "test unit=true with filter (%s)" % raw)
+    write(os.path.join(proj, "ue.or"), 'import { assertEq } from "std:test";\n\n@Test\nfunction broken(): void {\n  assertEq("a", 1, "x");\n}\n\nfunction main(): void {\n}\n')
+    err, v, raw = c.call("test", {"entry": "ue.or", "unit": True})
+    check(not err and v["ok"] is False and v["errors"] == 1 and "E0400" in v["diags"][0], "test unit=true reports compile errors (%s)" % raw)
+    err, v, raw = c.call("test", {"entry": "esc.or", "unit": True})
+    check(err and "outside the authorized root" in raw, "test unit=true refuses files outside the root (%s)" % raw)
+    err, v, raw = c.call("build", {"entry": "u.or", "out": "build/u.c"})
+    check(not err and v["ok"], "build erases @Test functions and does not run them (%s)" % raw)
     if os.path.exists(os.path.join(ROOT, "build", "bootstrap", "orin2")):
         err, v, raw = c.call("test", {"suite": "default", "filter": "hello"})
         check(not err and v["failed"] == 0 and v["passed"] >= 1, "suite with filter (%s)" % raw)

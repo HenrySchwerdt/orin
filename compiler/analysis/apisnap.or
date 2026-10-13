@@ -17,7 +17,20 @@ type Block = { name: string; head: string; members: string[]; };
 
 export const API_HEADER: string = "orin-api 1";
 
+// `@Test` functions are not API: nothing may call them (E0445).
+function isTestDef(d: SymbolDef): bool {
+  for (const l of d.detail.split("\n")) {
+    if (l == "@Test") {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isTop(d: SymbolDef): bool {
+  if (isTestDef(d)) {
+    return false;
+  }
   return match (d.kind) {
     SkFunction => true,
     SkRecord => true,
@@ -114,6 +127,31 @@ function exportedDefs(prog: LoadedProgram, idx: SemanticIndex, u: usize): usize[
   return out;
 }
 
+// A multi-line detail (annotations and contract clauses of the declaration are lines of its hover text)
+// as snapshot lines: every line indented by `pad`. `@Test` and `@Inline` are not part of the public
+// API (they change no signature and no behaviour a caller can see) and are left out; `@Deprecated`
+// is part of it, so adding or removing it is reported by `orin api --check`.
+function detailLines(detail: string, pad: string): string[] {
+  let out: string[] = [];
+  for (const l of detail.split("\n")) {
+    if (l == "@Test" || l == "@Inline") {
+      continue;
+    }
+    out.push(pad + l);
+  }
+  return out;
+}
+
+// A private member (its detail may start with annotation lines).
+function isPrivateDetail(detail: string): bool {
+  for (const l of detail.split("\n")) {
+    if (l.startsWith("private ")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function blockOf(idx: SemanticIndex, id: usize): Block {
   const d = idx.defs[id];
   let ms: string[] = [];
@@ -130,7 +168,7 @@ function blockOf(idx: SemanticIndex, id: usize): Block {
       Some(c) => c == id,
       None => false
     };
-    if (inside && !m.detail.startsWith("private ")) {
+    if (inside && !isPrivateDetail(m.detail)) {
       ms.push(m.detail);
     }
   }
@@ -191,9 +229,13 @@ export function apiSnapshot(prog: LoadedProgram, idx: SemanticIndex): string {
       bs.push(blockOf(idx, id));
     }
     for (const b of sortBlocks(bs)) {
-      lines.push("  " + b.head);
+      for (const l of detailLines(b.head, "  ")) {
+        lines.push(l);
+      }
       for (const mem of b.members) {
-        lines.push("    " + mem);
+        for (const l of detailLines(mem, "    ")) {
+          lines.push(l);
+        }
       }
     }
   }

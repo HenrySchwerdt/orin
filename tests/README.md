@@ -65,3 +65,11 @@ directory carries an `orin.toml` with `entry = "main.or"` (so the runner's `main
 works); the loader finds the manifest from the entry file. `tools/test_packages.sh` tests the
 default layout (`tests/next/packages/shop`, entry `src/main.or`), package-directory arguments,
 `orin check --deps` and `orin api [--check]`.
+
+## Built-in annotations (ADR-0024)
+
+`tests/next/run/annotations_*.or` and `tests/next/errors/e044*.or` are ordinary conformance cases.
+`tests/next/orin_test/` holds the fixtures of `orin test` (passing, failing, trapping, hanging tests, a
+package directory with tests in several modules); they are driven by `tools/test_annotations.py`, not by
+`run_tests.py` (some of their tests fail on purpose). `tools/test_annotation_erasure.py` compiles
+`annotations_test_*.or` with and without their `@Test` functions and requires identical C and LLVM IR.

@@ -12,6 +12,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
 | `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; clock access **unstable** until capabilities |
 | `std:graph` | Orin, `stdlib/graph.or` | stop-gap functional API; becomes `Graph<T>`/`GraphId<T>` with generic classes |
+| `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
 
@@ -21,7 +22,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `stdlib/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `std/` and `array/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -67,6 +68,18 @@ records `Duration { millis }`: `milliseconds/seconds/minutes/hours/days(n)`, `to
 `addDuration`, `between(start, end)`, `plus(instant, d)`, `formatDuration` ("1h 2m 3s 5ms"). UTC calendar
 (proleptic Gregorian, no zones): `fromMillis(instant): DateTime`, `toInstant(dt): Option<int>` (validates
 the fields), `isLeapYear`, `daysInMonth`, `formatIso(instant)` ("2024-02-29T13:04:05.006Z").
+
+## std:test (assertions, ADR-0024)
+
+Assertions for `@Test` functions; see docs/testing.md. A failed assertion **traps**: it writes
+`trap: <message>` to stderr and exits with status 101 (like every other trap), so it also works in
+ordinary programs. All functions return `void`; `msg` ("" allowed) is part of the trap message.
+
+`assert(cond: bool, msg)` ("assertion failed: msg"), `assertEq(actual: int, expected: int, msg)`,
+`assertEqUsize`, `assertEqString` (values shown in quotes), `assertEqBool`
+("assertEq failed: msg: expected 3, got 2"), `assertNear(actual: float, expected: float, tolerance: float,
+msg)` (|actual - expected| <= tolerance; NaN always fails), `fail(msg)`. One `assertEq*` per type because
+Orin has no generic equality or `toString`.
 
 ## std:graph (spec 06 cyclic graphs)
 

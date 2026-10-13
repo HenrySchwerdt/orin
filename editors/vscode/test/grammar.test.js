@@ -163,10 +163,26 @@ test("comments", async () => {
   assert.ok(scopesOf(t, " line comment with if and 42").includes("comment.line.double-slash.orin"));
 });
 
-test("annotations", async () => {
-  const t = await tokenize("@Inline\nfunction f(): void { }");
-  assertScope(t, "Inline", "entity.name.function.annotation.orin");
+test("annotations: the built-ins @Test, @Deprecated and @Inline (ADR-0024)", async () => {
+  const t = await tokenize('@Test\nfunction a(): void { }\n@Deprecated("use b")\nfunction c(): void { }\n@Inline\nfunction d(): void { }');
+  for (const name of ["Test", "Deprecated", "Inline"]) {
+    assertScope(t, name, "entity.name.function.annotation.builtin.orin");
+    assertScope(t, name, "meta.annotation.builtin.orin");
+  }
   assertScope(t, "@", "punctuation.definition.annotation.orin");
+  // The message is an ordinary string; the declaration after the annotation is highlighted as usual.
+  assertScope(t, "use b", "string.quoted.double.orin");
+  assertScope(t, "c", "entity.name.function.orin");
+  // `@Tests` is not `@Test`: the word boundary keeps the built-in scope off longer names.
+  const longer = await tokenize("@Tests\nfunction f(): void { }");
+  assertScope(longer, "Tests", "entity.name.function.annotation.orin");
+  assert.ok(!scopesOf(longer, "Tests").some((s) => s.includes("builtin")), "no built-in scope on @Tests");
+});
+
+test("annotations: contract clauses keep the generic annotation scope", async () => {
+  const t = await tokenize("@Requires(x > 0)\nfunction f(x: int): int { return x; }");
+  assertScope(t, "Requires", "entity.name.function.annotation.orin");
+  assert.ok(!scopesOf(t, "Requires").some((s) => s.includes("builtin")));
 });
 
 test("operators and calls", async () => {

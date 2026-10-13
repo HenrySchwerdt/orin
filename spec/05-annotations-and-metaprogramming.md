@@ -20,7 +20,10 @@ Potential generated artifacts: static route table, typed decoders/encoders, vali
 
 ## Annotation categories
 
-1. **Compiler built-ins**: `@Inline`, `@Repr`, `@Deprecated`, `@Test` (names illustrative until finalized).
+1. **Compiler built-ins**: `@Test`, `@Deprecated("message")`, `@Inline` — finalized and implemented for 1.0 core
+   (ADR-0024, docs/testing.md); `@Repr` is not part of 1.0 core. These are a closed, compiler-defined set with
+   their own grammar and AST node; they are the *only* annotations in 1.0 core (any other `@Name` is E0408) and
+   are not an extension point. Contract clauses (`@Requires`, ...) are separate constructs (ADR-0012).
 2. **Typed code generators**: `@Json`, `@Controller`, `@Get`, `@Service`, `@Validate`.
 3. **Metadata**: `@Description`, `@Permission`, `@Example`.
 

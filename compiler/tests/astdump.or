@@ -42,6 +42,9 @@
 //            ITEM/MEMBER ... (contracts CLAUSE*) before the closing ")" of fn / type / class / ctor / method,
 //            STMT := (contract@S KIND EXPR_OR_STR) before a loop       KIND := requires | ensures | invariant
 //            | decreases | rule;  EXPR also has (binary@S ==> EXPR EXPR)
+//   Built-in annotations (beyond Orin-B, ADR-0024) appear after the contracts, only when present:
+//            (annotations (test@S) (deprecated@S "msg") (inline@S)) before the closing ")" of fn / type / class
+//            / method / interface / imethod
 //   S       := "@" start "-" end              byte offsets, half-open [start, end)
 //
 // Notes:
@@ -58,7 +61,7 @@ import {
   VariantDecl, ConstDecl,
   TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp, BinaryOp,
   ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, CtorParam, Param,
-  FnTyParam, ArrowParam, ArrowBody, ContractClause
+  FnTyParam, ArrowParam, ArrowBody, ContractClause, Annotation
 } from "../syntax";
 import { Span } from "../diag";
 
@@ -166,7 +169,7 @@ function dumpClass(c: ClassDecl): string {
     None => "-"
   };
   return "(class " + expWord(c.exported) + " " + c.name.name + " (tparams" + namesTail(c.typeParams) + ") " + ext
-    + " (implements" + namesTail(c.impls) + ")" + parts.join("") + contractsTail(c.contracts) + ")";
+    + " (implements" + namesTail(c.impls) + ")" + parts.join("") + contractsTail(c.contracts) + annotationsTail(c.annotations) + ")";
 }
 
 function dumpInterface(k: InterfaceDecl): string {
@@ -176,14 +179,14 @@ function dumpInterface(k: InterfaceDecl): string {
     for (const p of m.params) {
       ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
     }
-    parts.push("\n  (imethod " + m.name.name + " (params" + joinTail(ps) + ") " + optType(m.ret) + ")");
+    parts.push("\n  (imethod " + m.name.name + " (params" + joinTail(ps) + ") " + optType(m.ret) + annotationsTail(m.annotations) + ")");
   }
   const ext = match (k.ext) {
     Some(id) => id.name,
     None => "-"
   };
   return "(interface " + expWord(k.exported) + " " + k.name.name + " (tparams" + namesTail(k.typeParams) + ") " + ext
-    + parts.join("") + ")";
+    + parts.join("") + annotationsTail(k.annotations) + ")";
 }
 
 // Type parameter names, each followed by `:Bound` when it has a bound (ADR-0019).
@@ -215,7 +218,7 @@ function dumpMember(m: ClassMember): string {
   return match (m) {
     MField(f) => "(cfield " + accWord(f.priv) + " " + f.name.name + " " + dumpType(f.ty) + " " + optExpr(f.init, "  ") + ")",
     MCtor(c) => dumpCtor(c.params, c.body, c.contracts),
-    MMethod(md) => dumpMethod(md.priv, md.isStatic, md.name, md.typeParams, md.params, md.ret, md.body, md.contracts)
+    MMethod(md) => dumpMethod(md.priv, md.isStatic, md.name, md.typeParams, md.params, md.ret, md.body, md.contracts, md.annotations)
   };
 }
 
@@ -229,6 +232,23 @@ function contractsTail(cs: ContractClause[]): string {
     parts.push(dumpClause(c));
   }
   return " (contracts " + parts.join(" ") + ")";
+}
+
+// ` (annotations (test@S) (deprecated@S "msg") (inline@S))`, or "" when there are none.
+function annotationsTail(as: Annotation[]): string {
+  if (as.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  for (const a of as) {
+    const t = match (a.kind) {
+      ATest => "(test" + spanStr(a.span) + ")",
+      ADeprecated => "(deprecated" + spanStr(a.span) + " " + quote(a.message) + ")",
+      AInline => "(inline" + spanStr(a.span) + ")"
+    };
+    parts.push(t);
+  }
+  return " (annotations " + parts.join(" ") + ")";
 }
 
 function dumpClause(c: ContractClause): string {
@@ -254,7 +274,7 @@ function dumpCtor(params: CtorParam[], body: Block, cs: ContractClause[]): strin
   return "(ctor (cparams" + joinTail(ps) + ") " + dumpBlock(body, "  ") + contractsTail(cs) + ")";
 }
 
-function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], params: Param[], ret: Option<TypeExpr>, body: Block, cs: ContractClause[]): string {
+function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], params: Param[], ret: Option<TypeExpr>, body: Block, cs: ContractClause[], as: Annotation[]): string {
   let ps: string[] = [];
   for (const p of params) {
     ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
@@ -264,7 +284,7 @@ function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], param
     kind = "static";
   }
   return "(method " + accWord(priv) + " " + kind + " " + name.name + " (tparams" + namesTail(tps) + ") (params"
-    + joinTail(ps) + ") " + optType(ret) + " " + dumpBlock(body, "  ") + contractsTail(cs) + ")";
+    + joinTail(ps) + ") " + optType(ret) + " " + dumpBlock(body, "  ") + contractsTail(cs) + annotationsTail(as) + ")";
 }
 
 function dumpFn(f: FunctionDecl): string {
@@ -273,12 +293,12 @@ function dumpFn(f: FunctionDecl): string {
     ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
   }
   return "(fn " + expWord(f.exported) + " " + f.name.name + " (tparams" + tparamsTail(f.typeParams, f.bounds) + ") (params"
-    + joinTail(ps) + ") " + optType(f.ret) + " " + dumpBlock(f.body, "") + contractsTail(f.contracts) + ")";
+    + joinTail(ps) + ") " + optType(f.ret) + " " + dumpBlock(f.body, "") + contractsTail(f.contracts) + annotationsTail(f.annotations) + ")";
 }
 
 function dumpTypeDecl(t: TypeDecl): string {
   return "(type " + expWord(t.exported) + " " + t.name.name + " (tparams" + namesTail(t.typeParams) + ") "
-    + dumpTypeBody(t.body) + contractsTail(t.contracts) + ")";
+    + dumpTypeBody(t.body) + contractsTail(t.contracts) + annotationsTail(t.annotations) + ")";
 }
 
 function dumpTypeBody(b: TypeDeclBody): string {

@@ -1,0 +1,266 @@
+// `@Test` support on the loaded program (ADR-0024): discovery, erasure and the test harness.
+//
+//   * `eraseTests`: the program as `compile` / `mir` / `verify` see it. Every `@Test` function is
+//     removed from the AST *before* checking, so nothing a test uses (generic instances, closures,
+//     string literals, records) reaches the generated code: the output is byte-identical to the
+//     program with the test functions deleted (tools/test_annotation_erasure.py).
+//   * `buildTestProgram`: the program as `orin test` builds it. Each test is renamed to a unique
+//     exported function `__orin_test_<N>`; the entry module imports them all and its own `main` is
+//     replaced by a dispatcher `main` that runs ONE test, chosen by the index in argv[1]
+//     (`./tests 3`). A failing test traps or exits non-zero without touching the others, which the
+//     runner executes in separate processes. A small harness module (inserted before the entry)
+//     owns the argument handling, so the entry's own imports can never collide with it.
+//
+// Only user units are considered (unit names starting with `$` are the std preludes).
+
+import { Diagnostic, Span } from "../diag";
+import { Ident, Module, Item, FunctionDecl, ImportDecl, parse } from "../syntax";
+import { LoadedProgram, Unit, ImportUnit, ImportStd, StdProcess } from "../loader";
+
+export type TestCase = {
+  id: string;        // "<unit>.<function>", e.g. "math_test.addsTwo": what --filter matches and reports show
+  unit: string;      // unit name (path relative to the entry directory, no ".or")
+  name: string;      // the function's own name
+  index: usize;      // number the harness runs it by
+  file: usize;       // source file (index into the SourceMap)
+  start: usize;      // byte offset of the function name in that file (for reports)
+};
+
+function annotatedTest(f: FunctionDecl): bool {
+  for (const a of f.annotations) {
+    const t = match (a.kind) {
+      ATest => true,
+      _ => false
+    };
+    if (t) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isTestItem(it: Item): bool {
+  return match (it) {
+    IFunction(f) => annotatedTest(f),
+    _ => false
+  };
+}
+
+function isUser(u: Unit): bool {
+  return !u.name.startsWith("$");
+}
+
+// True when a user module has an `@Test` function.
+export function hasTests(prog: LoadedProgram): bool {
+  for (const u of prog.units) {
+    if (!isUser(u)) {
+      continue;
+    }
+    for (const it of u.ast.items) {
+      if (isTestItem(it)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// The `@Test` functions in discovery order: units in loader order (dependencies first), source order
+// inside a unit.
+export function discoverTests(prog: LoadedProgram): TestCase[] {
+  let out: TestCase[] = [];
+  for (const u of prog.units) {
+    if (!isUser(u)) {
+      continue;
+    }
+    for (const it of u.ast.items) {
+      match (it) {
+        IFunction(f) => {
+          if (annotatedTest(f)) {
+            out.push(TestCase {
+              id: u.name + "." + f.name.name, unit: u.name, name: f.name.name, index: out.length,
+              file: u.file, start: f.name.span.start
+            });
+          }
+        },
+        _ => {}
+      }
+    }
+  }
+  return out;
+}
+
+function withItems(u: Unit, items: Item[]): Unit {
+  return Unit { ...u, ast: Module { file: u.ast.file, items: items } };
+}
+
+// The program without its `@Test` functions.
+export function eraseTests(prog: LoadedProgram): LoadedProgram {
+  let units: Unit[] = [];
+  for (const u of prog.units) {
+    if (!isUser(u)) {
+      units.push(u);
+      continue;
+    }
+    let items: Item[] = [];
+    for (const it of u.ast.items) {
+      if (!isTestItem(it)) {
+        items.push(it);
+      }
+    }
+    units.push(withItems(u, items));
+  }
+  return LoadedProgram { units: units, entry: prog.entry, manifest: prog.manifest };
+}
+
+function isMainFn(it: Item): bool {
+  return match (it) {
+    IFunction(f) => f.name.name == "main",
+    _ => false
+  };
+}
+
+// A test file needs no `main`; the checker requires one (E0412), so a program whose entry module has none
+// gets an empty one for the checks of `orin test` (the test build replaces `main` anyway).
+export function ensureMain(prog: LoadedProgram): LoadedProgram {
+  const eu = prog.units[prog.entry];
+  for (const it of eu.ast.items) {
+    if (isMainFn(it)) {
+      return prog;
+    }
+  }
+  const m = parse(eu.file, "function main(): void {\n}\n");
+  if (m.isErr()) {
+    return prog;
+  }
+  let items = eu.ast.items;
+  for (const it of m.unwrap().items) {
+    items.push(it);
+  }
+  let units = prog.units;
+  units[prog.entry] = withItems(eu, items);
+  return LoadedProgram { units: units, entry: prog.entry, manifest: prog.manifest };
+}
+
+export type TestBuild = { prog: LoadedProgram; tests: TestCase[]; };
+
+function testFnName(i: usize): string {
+  return "__orin_test_" + i.toString();
+}
+
+const HARNESS_UNIT: string = "__orin_test_harness";
+
+// The harness module (a unit inserted right before the entry): the argument handling.
+function harnessUnitSource(): string {
+  return "import { args, exit } from \"std:process\";\n"
+    + "export function __orin_test_index(): int {\n"
+    + "  const a = args();\n"
+    + "  if (a.length < 1) {\n"
+    + "    console.error(\"usage: <test executable> <test index>\");\n"
+    + "    exit(2);\n"
+    + "    return 0;\n"
+    + "  }\n"
+    + "  const n = parseInt(a[0]);\n"
+    + "  if (n.isNone()) {\n"
+    + "    console.error(\"usage: <test executable> <test index>\");\n"
+    + "    exit(2);\n"
+    + "    return 0;\n"
+    + "  }\n"
+    + "  return n.unwrap();\n"
+    + "}\n"
+    + "export function __orin_test_missing(i: int): void {\n"
+    + "  console.error(\"no test with index \" + i.toString());\n"
+    + "  exit(2);\n"
+    + "}\n";
+}
+
+// The entry's dispatcher: `main` runs the one test whose index is argv[1].
+function dispatchSource(n: usize): string {
+  let s = "import { __orin_test_index, __orin_test_missing } from \"./" + HARNESS_UNIT + "\";\n"
+    + "function main(): void {\n"
+    + "  const i = __orin_test_index();\n";
+  let k: usize = 0;
+  while (k < n) {
+    s += "  if (i == " + k.toString() + ") {\n    " + testFnName(k) + "();\n    return;\n  }\n";
+    k += 1;
+  }
+  s += "  __orin_test_missing(i);\n}\n";
+  return s;
+}
+
+export function buildTestProgram(prog: LoadedProgram): Result<TestBuild, Diagnostic> {
+  const tests = discoverTests(prog);
+  let units: Unit[] = [];
+  let ui: usize = 0;
+  let entryImports: ImportDecl[] = [];
+  let entryTargets: usize[] = [];
+  const entryFile = prog.units[prog.entry].file;
+  const here = Span { file: entryFile, start: 0, end: 0 };
+  while (ui < prog.units.length) {
+    const u = prog.units[ui];
+    if (!isUser(u)) {
+      units.push(u);
+      ui += 1;
+      continue;
+    }
+    let items: Item[] = [];
+    let names: Ident[] = [];
+    for (const it of u.ast.items) {
+      match (it) {
+        IFunction(f) => {
+          if (annotatedTest(f)) {
+            let k: usize = 0;
+            while (tests[k].unit != u.name || tests[k].name != f.name.name) {
+              k += 1;
+            }
+            const nm = Ident { name: testFnName(k), span: f.name.span };
+            names.push(nm);
+            items.push(IFunction(FunctionDecl { ...f, exported: true, name: nm, annotations: [] }));
+          } else if (ui == prog.entry && f.name.name == "main") {
+            // replaced by the dispatcher
+          } else {
+            items.push(it);
+          }
+        },
+        _ => { items.push(it); }
+      }
+    }
+    if (names.length > 0 && ui != prog.entry) {
+      entryImports.push(ImportDecl { names: names, path: "./" + u.name, pathSpan: here, span: here });
+      entryTargets.push(ui);
+    }
+    units.push(withItems(u, items));
+    ui += 1;
+  }
+  const hm = parse(entryFile, harnessUnitSource())?;
+  const harness = Unit {
+    file: entryFile, path: prog.units[prog.entry].path, name: HARNESS_UNIT, module: "", ast: hm,
+    imports: [ImportStd(StdProcess)]
+  };
+  const dm = parse(entryFile, dispatchSource(tests.length))?;
+  const entryIdx = prog.entry;
+  const eu = units[entryIdx];
+  let items = eu.ast.items;
+  let imports = eu.imports;
+  let ii: usize = 0;
+  while (ii < entryImports.length) {
+    items.push(IImport(entryImports[ii]));
+    imports.push(ImportUnit(entryTargets[ii]));
+    ii += 1;
+  }
+  for (const it of dm.items) {
+    items.push(it);
+  }
+  imports.push(ImportUnit(entryIdx));   // the harness takes the entry's index; the entry moves up by one
+  units[entryIdx] = withItems(Unit { ...eu, imports: imports }, items);
+  let all: Unit[] = [];
+  ui = 0;
+  while (ui < units.length) {
+    if (ui == entryIdx) {
+      all.push(harness);
+    }
+    all.push(units[ui]);
+    ui += 1;
+  }
+  return Ok(TestBuild { prog: LoadedProgram { units: all, entry: entryIdx + 1, manifest: prog.manifest }, tests: tests });
+}
