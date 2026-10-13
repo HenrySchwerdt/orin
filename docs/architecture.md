@@ -14,7 +14,7 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `platform/tests/` (contract tests, CBMC harnesses). |
 | `runtime/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
-| `stdlib/` | **Std modules in Orin** (`std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`): embedded library root, see docs/std.md. |
+| `stdlib/` | **Std modules in Orin** (`std:host`, `std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`; `std:host` and `std:fs` implement the capability grants of ADR-0027): embedded library root, see docs/std.md. |
 | `std/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
