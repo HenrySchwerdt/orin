@@ -26,6 +26,7 @@ verified; memory safety is supported by tests and sanitizers only.
 ## Next milestones
 1. Freeze Stage 0 (bug fixes only); all new language work goes into `compiler/`.
 2. MIR + OIM memory IR and independent verifier (spec 07, ADR-0006), C backend on MIR.
-3. Language growth in the self-hosted compiler: generics, closures, classes (lowering),
+3. Language growth in the self-hosted compiler: generics (done: simple parametric generics,
+   ADR-0007, `tests/next/`), closures, classes (lowering),
    floats, maps, interfaces, annotations — each with an ADR and conformance tests.
 4. LLVM IR backend (ADR-0006); benchmarks (spec 11); formal core calculus (spec 07); `orin mcp`.

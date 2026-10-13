@@ -11,6 +11,10 @@ against any one implementation, so the same suite is run against every compiler 
 The runner is always invoked from anywhere; tests execute with the repository root as the
 working directory (so `std:fs` tests use paths like `build/tests/tmp_<name>.txt`).
 
+`--suite next` runs `tests/next/run` and `tests/next/errors` instead (same formats, language
+beyond Orin-B such as generics; only the self-hosted compiler is expected to pass them);
+`--suite all` runs both. The default is `tests/run` + `tests/errors`.
+
 ## Compiler interface
 
 `<compiler> compile <entry.or> -o <out.c>` must exit 0 on success. On failure it exits

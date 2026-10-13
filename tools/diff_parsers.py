@@ -3,7 +3,8 @@
 
 Usage: python3 tools/diff_parsers.py [--orinb PATH] [--no-build] [-v] [extra files/dirs...]
 
-For every .or file under tests/, compiler/ and bootstrap/tests/parse/ (this includes the
+For every .or file under tests/ (except tests/next/, which uses syntax beyond Orin-B that
+Stage 0 rejects), compiler/ and bootstrap/tests/parse/ (this includes the
 hand-written edge cases in tests/parse_edge/) both parsers run. They agree when both succeed
 with identical stdout, or both fail with the same error code (and the same line:col).
 Exit status is non-zero on any mismatch.
@@ -71,7 +72,9 @@ def collect(extra):
             files.append(r)
             continue
         for dp, dn, fn in os.walk(r):
-            dn[:] = [d for d in dn if d not in ("target", "build", ".git")]
+            # tests/next uses syntax beyond Orin-B (generics) that Stage 0 rejects with E0200.
+            dn[:] = [d for d in dn if d not in ("target", "build", ".git")
+                     and os.path.join(dp, d) != os.path.join(ROOT, "tests", "next")]
             for n in fn:
                 if n.endswith(".or"):
                     files.append(os.path.join(dp, n))

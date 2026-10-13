@@ -41,7 +41,7 @@ export { f, Point } from "./other";      // re-export (used in module.or)
   union type also brings all its variants into scope (ADR-0004).
 - Otherwise a `type` is a transparent alias.
 - Generic type parameters (`type X<T>`, `function f<T>`) are parsed but rejected
-  (E0408) in Orin-B. Built-in generic types: `T[]`, `Option<T>`, `Result<T, E>`.
+  (E0408) in Orin-B (the self-hosted compiler accepts them, see ADR-0007; Stage 0 does not). Built-in generic types: `T[]`, `Option<T>`, `Result<T, E>`.
 - Top-level `const` initializers must be a literal (`int` possibly negated, `string`, `bool`).
 - Entry point: the entry file must contain `function main(): void`.
 - Duplicate names in one module → E0304. Declaration order does not matter at top level
@@ -210,6 +210,7 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0410 | invalid operand types for operator |
 | E0411 | missing/duplicate/unknown record literal field |
 | E0412 | invalid or missing `main` |
+| E0413 | generic instantiation limit exceeded (self-hosted compiler only, ADR-0007) |
 
 ## 10. Clarifications (v1.1, from conformance-suite review)
 

@@ -25,6 +25,17 @@ Each directory is a module (`module.or` = public API). Contracts written by the 
 `diag/diag.or`, `syntax/ast.or`, `hir/hir.or` (mirrors of the Rust `span/diag`, `ast`, `hir`).
 Components are ports of the Stage 0 Rust components with the same behaviour and diagnostics.
 
+## Language growth in the self-hosted compiler
+
+`compiler/` itself must stay within Orin-B (Stage 0 compiles it), but the language it *accepts*
+grows. Features beyond Orin-B get an ADR and tests under `tests/next/` (run with
+`python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite next`; `--suite all` runs both
+suites; Stage 0 is not expected to pass `next`). `tools/diff_parsers.py` skips `tests/next/`.
+
+* Generics (ADR-0007): `check/types.or` (type resolution, instantiation, unification),
+  `check/body.or` (call/record inference), `check/checker.or` (abstract checks, instance loop).
+  Checker functions thread the growing environment through `FnCtx.env`.
+
 ## Writing efficient Orin-B (important for Stage 1 authors)
 
 Orin-B values are immutable-by-default RC'd objects; `let` mutation is copy-on-write and is
