@@ -147,10 +147,13 @@ This is a **design sketch**, not final parsing syntax: mutable `this`, contracts
 
 An invariant MUST be established by construction and preserved by every accessible state transition. A constructor is not allowed to expose an object before invariants hold. Private fields cannot be mutated by uncontrolled outside aliases. OIM value semantics help, but **do not replace** proof of the state invariant.
 
-### 4.2a Canonical surface syntax: contract annotations (decision 2026-10-13, ADR-0012)
+### 4.2a Canonical surface syntax: contract clauses (decision 2026-10-13, ADR-0012)
 
-The keyword clauses in §4.1–§4.3 are superseded as surface syntax by **compiler built-in
-annotations** (spec 05 category 1). Semantics are unchanged. One canonical form:
+The keyword clauses in §4.1–§4.3 are superseded as surface syntax by **contract clauses written
+with an `@` prefix**. They *look like* annotations but are **not annotations**: they are
+dedicated core-language constructs with their own grammar productions, AST nodes, scoping and
+semantics (see "Contract clauses are not annotations" below). Semantics are unchanged. One
+canonical form:
 
 ```typescript
 @Invariant(this.balance >= 0)
@@ -174,13 +177,32 @@ class BankAccount {
 function discount(cents: int, premium: bool): int { ... }
 ```
 
-| Annotation | Target | Meaning |
+| Clause | Target | Meaning |
 |---|---|---|
 | `@Requires(e)` | function, method, constructor | precondition; may mention parameters and (methods) `this` |
 | `@Ensures(e)` | function, method | postcondition; may mention `result`, parameters, `this`, `old(e)` |
 | `@Invariant(e)` | class/record; loop (statement annotation before `while`/`for`) | state / loop invariant |
 | `@Decreases(e)` | loop, recursive function | termination measure |
 | `@Rule("SHOP-001")` | any declaration | traceability to a business rule (spec 14) |
+
+**Contract clauses are not annotations.**
+- They are a **closed, compiler-defined set** of keywords spelled `@Requires`, `@Ensures`,
+  `@Invariant`, `@Decreases`, `@Rule`. These names are reserved: they cannot be declared,
+  imported, re-exported, shadowed, aliased or redefined by annotation libraries (spec 05).
+- The parser has **dedicated productions** for them and produces dedicated AST nodes
+  (`ContractClause`), never generic annotation-use nodes. Their arguments are contract
+  expressions in a special scope (`result`, `old(...)`, `==>`), not ordinary annotation
+  arguments.
+- They are **not processed by the annotation mechanism**: annotation expansion (spec 05) can
+  neither generate, remove, rewrite nor reorder contract clauses, and generated code is subject to
+  the contracts of the declarations it belongs to like handwritten code. Annotation processors MAY
+  read clauses through a read-only API for documentation/tooling.
+- They have **fixed semantics defined by this specification** (preconditions, postconditions,
+  invariants, termination measures, traceability) and are consumed by the checker, the
+  verification pass and optional runtime checking — not by user code or reflection.
+- Placement is part of the grammar: clauses precede the declaration they constrain (function,
+  method, constructor, class/record, loop) and may be freely mixed with real annotations, but
+  their meaning never depends on surrounding annotations.
 
 - Contract expressions are **pure Orin expressions** (no calls to non-pure functions, no
   mutation, no allocation-observable effects); `old(e)` only in `@Ensures`; `==>` implication is
