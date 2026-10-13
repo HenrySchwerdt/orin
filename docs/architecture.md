@@ -120,6 +120,7 @@ docs/formal.md "L0 platform layer".
 | Property | Status |
 |---|---|
 | Bounds-checked indexing, checked arithmetic | Implemented in runtime/codegen; tested only |
+| Struct/variant field access and array slot access check object kind and slot count (backstop for lowering bugs the ownership verifier cannot see, docs/assurance.md F-shape) | Implemented in the runtime and both backends; a mismatch traps (exit 101); tested only. Not a proof: the verifier does not check value shapes yet (P0 proof debt) |
 | Library string/number functions (R1) | Safe Orin in `std/` (checked by the compiler, verified by the MIR verifier, `tools/verify_all.py`); functional behaviour tested only, differentially against the C implementations |
 | RC never under-counts (no UAF/double free) | Generated code: tested + ASan/UBSan on all suites and on the compiler self-compiling. Abstract machine: **proven** in Lean (`formal/`, theorem `run_safe`; rc ≥ owners invariant) — see docs/formal.md |
 | Value semantics / COW | Abstract machine: **proven** for `makeUnique; store` (`makeUnique_store_cow`); generated code: tested |

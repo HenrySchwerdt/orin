@@ -3,6 +3,8 @@
 #include "orin_runtime.h"
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int failures;
 #define CHECK(c)                                                                                \
@@ -138,12 +140,47 @@ static void test_misc(void) {
     orin_release(p);
 }
 
+/* Shape confusion must trap (exit 101), never read or write out of bounds: run each access in a child. */
+static int traps(int which) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        freopen("/dev/null", "w", stderr);
+        OrinObj *s = orin_struct_new(0, 1, 0);        /* a struct with ONE slot */
+        OrinObj *a = orin_array_new(4, 0);
+        OrinObj *str = S("x");
+        switch (which) {
+        case 0: (void)orin_struct_get(s, 1); break;                 /* index == nslots */
+        case 1: orin_struct_set(s, 5, 0); break;
+        case 2: (void)orin_struct_slot_ptr(s, 1); break;
+        case 3: (void)orin_struct_get(a, 0); break;                 /* array read as struct */
+        case 4: (void)orin_struct_get(str, 0); break;               /* string read as struct */
+        case 5: (void)orin_struct_get(orin_nullary(1), 0); break;   /* payload-less variant */
+        case 6: (void)orin_array_at(s, 0); break;                   /* struct read as array */
+        case 7: orin_array_push(s, 1); break;
+        }
+        _exit(0); /* the access did not trap */
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 101;
+}
+
+static void test_shape_traps(void) {
+    for (int i = 0; i < 8; i++) CHECK(traps(i));
+    OrinObj *s = orin_struct_new(0, 2, 0);
+    orin_struct_set(s, 1, 9);
+    CHECK(orin_struct_get(s, 1) == 9); /* in-range access still works */
+    orin_release(s);
+}
+
 int main(int argc, char **argv) {
     orin_init(argc, argv);
     test_strings();
     test_arrays_cow();
     test_deep_chain();
     test_misc();
+    test_shape_traps();
     if (failures) return 1;
     printf("ok\n");
     orin_flush();
