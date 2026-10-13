@@ -210,3 +210,25 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0410 | invalid operand types for operator |
 | E0411 | missing/duplicate/unknown record literal field |
 | E0412 | invalid or missing `main` |
+
+## 10. Clarifications (v1.1, from conformance-suite review)
+
+- `/` truncates toward zero; `%` result has the sign of the dividend (`-17 / 5 == -3`, `-17 % 5 == -2`).
+- `split` follows JS: `"a,,b".split(",")` → `["a", "", "b"]`; `"".split(",")` → `[""]`;
+  leading/trailing separators produce empty strings. `trim` strips ` \t\n\r` (and `\v \f`).
+- `parseInt`: optional `-`, then ≥1 decimal digit, nothing else; `""`, `" 5"`, overflow → `None`.
+- Expected types flow into `?:` branches, match arms, call arguments, array elements, record
+  fields, `return` values and `push` arguments.
+- `Result<void, E>` success pattern is `Ok()` (arity 0).
+- `Name { ...base }` with no overrides is allowed. Trailing commas are allowed in array literals,
+  call arguments, record literals and match arms. Negative int literal patterns are allowed.
+- A new local is not in scope in its own initializer: `const x = x + 1;` in an inner block reads
+  the outer `x`.
+- Top-level `const` type annotation is optional (literal type: `int`, `string`, `bool`).
+- `match` on `bool` requires `_` like other literal matches.
+- Error code choices: mixing `int`/`usize` or an `int` index → E0400; non-bool/non-number
+  operands (`"a" - "b"`, `!1`, `1 && 2`) → E0410; unknown type name → E0300; unknown field in a
+  record literal → E0411; unknown field in `p.z` → E0405; duplicate variant names across unions
+  in one module → E0304; `const r = Ok(1);` → E0407; reserved words used as names → E0200;
+  literal pattern of the wrong type → E0400.
+- `writeFile` to a missing directory returns `Err(message)`.
