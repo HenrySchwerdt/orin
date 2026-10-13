@@ -22,6 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRELUDES = [
     ("std", "$std", "compiler/loader/embedded_std.or", "embeddedStdFiles"),
     ("array", "$array", "compiler/loader/embedded_array.or", "embeddedArrayFiles"),
+    ("stdlib", "$stdlib", "compiler/loader/embedded_stdlib.or", "embeddedStdlibFiles"),
 ]
 
 

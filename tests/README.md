@@ -22,7 +22,7 @@ non-zero and prints diagnostics `path:line:col: error[CODE]: msg` on stderr. The
 is built with
 
 ```
-cc -O1 -w -I runtime <out.c> runtime/orin_runtime.c -o <exe>
+cc -O1 -w -I runtime <out.c> runtime/orin_runtime.c platform/orin_platform.c -lm -o <exe>
 ```
 
 (`--sanitize` adds `-fsanitize=address,undefined -fno-omit-frame-pointer` and runs the
@@ -57,3 +57,11 @@ Beyond `// exit: N`, the leading `//` comment lines of a test may contain `// fl
 (extra compiler flags, ADR-0012) and `// stderr: text` (the run's stderr must contain `text`).
 `tests/contracts/` holds inputs for `tools/test_verify_contracts.py` (`orin verify --contracts`,
 needs z3): expected results are given as `// expect: <function> <kind> <STATUS>` lines.
+
+## Packages
+
+`tests/next/run/package_modules/` and `tests/next/errors/e05*/` are multi-file tests whose
+directory carries an `orin.toml` with `entry = "main.or"` (so the runner's `main.or` convention
+works); the loader finds the manifest from the entry file. `tools/test_packages.sh` tests the
+default layout (`tests/next/packages/shop`, entry `src/main.or`), package-directory arguments,
+`orin check --deps` and `orin api [--check]`.

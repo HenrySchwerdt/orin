@@ -1,0 +1,205 @@
+// `orin.toml` manifest (spec 04, ADR-0016): typed view over the TOML subset in toml.or.
+//
+//   [package]
+//   name = "shop"                  # required
+//   version = "0.1.0"              # default "0.0.0"
+//   entry = "src/main.or"          # default; relative to the package root
+//
+//   [architecture]
+//   acyclic_modules = true         # always enforced; `false` is rejected (E0503)
+//   private_by_default = true      # always enforced; `false` is rejected (E0503)
+//   explicit_public_api = true     # always enforced; `false` is rejected (E0503)
+//
+//   [modules.users]                # module = directory relative to the entry file's directory
+//   allowed_dependencies = ["database", "logging"]
+//
+// `[modules.a.b]` and `[modules."a/b"]` both name module `a/b`; `.` names the root module (the
+// directory of the entry file). Diagnostics: E0500 syntax, E0503 invalid manifest.
+
+import { Span, Diagnostic, diag, span } from "../diag";
+import { TomlValue, TomlEntry, TomlTable, TomlDoc, parseToml } from "./toml";
+
+export type ModuleRule = {
+  module: string;          // "users", "users/internal", "." (root)
+  allowed: string[];
+  span: Span;              // the `[modules.x]` header
+  allowedSpans: Span[];    // one per entry of `allowed`
+};
+
+export type Manifest = {
+  file: usize;             // file id of the manifest in the diagnostics' SourceMap (set by the loader)
+  name: string;
+  version: string;
+  entry: string;           // relative to the package root
+  rules: ModuleRule[];
+};
+
+export const DEFAULT_ENTRY: string = "src/main.or";
+
+function invalid(file: usize, sp: Span, msg: string): Diagnostic {
+  return diag("E0503", span(file, sp.start, sp.end), "orin.toml: " + msg);
+}
+
+function entrySpan(file: usize, e: TomlEntry): Span {
+  return span(file, e.start, e.end);
+}
+
+function strOf(file: usize, e: TomlEntry): Result<string, Diagnostic> {
+  return match (e.value) {
+    TStr(s) => Ok(s),
+    _ => Err(invalid(file, entrySpan(file, e), "`" + e.key + "` must be a string"))
+  };
+}
+
+function boolOf(file: usize, e: TomlEntry): Result<bool, Diagnostic> {
+  return match (e.value) {
+    TBool(b) => Ok(b),
+    _ => Err(invalid(file, entrySpan(file, e), "`" + e.key + "` must be a boolean"))
+  };
+}
+
+function packageTable(file: usize, t: TomlTable, m: Manifest): Result<Manifest, Diagnostic> {
+  let out = m;
+  let haveName = false;
+  for (const e of t.entries) {
+    if (e.key == "name") {
+      const r = strOf(file, e);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      if (r.unwrap().length == 0) {
+        return Err(invalid(file, entrySpan(file, e), "`name` must not be empty"));
+      }
+      out = Manifest { file: out.file, name: r.unwrap(), version: out.version, entry: out.entry, rules: out.rules };
+      haveName = true;
+    } else if (e.key == "version") {
+      const r = strOf(file, e);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      out = Manifest { file: out.file, name: out.name, version: r.unwrap(), entry: out.entry, rules: out.rules };
+    } else if (e.key == "entry") {
+      const r = strOf(file, e);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      if (!r.unwrap().endsWith(".or")) {
+        return Err(invalid(file, entrySpan(file, e), "`entry` must be a path to an `.or` file"));
+      }
+      out = Manifest { file: out.file, name: out.name, version: out.version, entry: r.unwrap(), rules: out.rules };
+    } else {
+      return Err(invalid(file, entrySpan(file, e), "unknown key `" + e.key + "` in [package] (expected name, version, entry)"));
+    }
+  }
+  if (!haveName) {
+    return Err(invalid(file, span(file, t.start, t.end), "[package] requires a `name`"));
+  }
+  return Ok(out);
+}
+
+function architectureTable(file: usize, t: TomlTable): Result<bool, Diagnostic> {
+  for (const e of t.entries) {
+    if (e.key == "acyclic_modules" || e.key == "private_by_default" || e.key == "explicit_public_api") {
+      const r = boolOf(file, e);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      if (!r.unwrap()) {
+        return Err(invalid(file, entrySpan(file, e), "`" + e.key + " = false` is not allowed: Orin always enforces it"));
+      }
+    } else {
+      return Err(invalid(file, entrySpan(file, e),
+        "unknown key `" + e.key + "` in [architecture] (expected acyclic_modules, private_by_default, explicit_public_api)"));
+    }
+  }
+  return Ok(true);
+}
+
+function moduleRule(file: usize, t: TomlTable): Result<ModuleRule, Diagnostic> {
+  const mname = t.path.slice(1, t.path.length).join("/");
+  const hs = span(file, t.start, t.end);
+  let allowed: string[] = [];
+  let spans: Span[] = [];
+  for (const e of t.entries) {
+    if (e.key != "allowed_dependencies") {
+      return Err(invalid(file, entrySpan(file, e), "unknown key `" + e.key + "` in [modules." + mname + "] (expected allowed_dependencies)"));
+    }
+    match (e.value) {
+      TArr(xs) => {
+        allowed = xs;
+        spans = e.elems;
+      },
+      _ => {
+        return Err(invalid(file, entrySpan(file, e), "`allowed_dependencies` must be an array of strings"));
+      }
+    }
+  }
+  return Ok(ModuleRule { module: mname, allowed: allowed, span: hs, allowedSpans: spans });
+}
+
+// `file` is the file id of the manifest text in the SourceMap used to render the diagnostics.
+export function parseManifest(file: usize, text: string): Result<Manifest, Diagnostic> {
+  const pr = parseToml(file, text);
+  if (pr.isErr()) {
+    return Err(pr.unwrapErr());
+  }
+  const doc = pr.unwrap();
+  const noRules: ModuleRule[] = [];
+  let m = Manifest { file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules };
+  let havePackage = false;
+  for (const t of doc.tables) {
+    if (t.path.length == 0) {
+      if (t.entries.length > 0) {
+        const e = t.entries[0];
+        return Err(invalid(file, entrySpan(file, e), "key `" + e.key + "` outside any table (expected [package], [architecture] or [modules.<path>])"));
+      }
+      continue;
+    }
+    const head = t.path[0];
+    if (head == "package" && t.path.length == 1) {
+      const r = packageTable(file, t, m);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      m = r.unwrap();
+      havePackage = true;
+    } else if (head == "architecture" && t.path.length == 1) {
+      const r = architectureTable(file, t);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+    } else if (head == "modules" && t.path.length >= 2) {
+      const r = moduleRule(file, t);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      let rules = m.rules;
+      for (const x of rules) {
+        if (x.module == r.unwrap().module) {
+          return Err(invalid(file, span(file, t.start, t.end), "duplicate rule for module `" + x.module + "`"));
+        }
+      }
+      rules.push(r.unwrap());
+      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: rules };
+    } else {
+      return Err(invalid(file, span(file, t.start, t.end),
+        "unknown table `[" + t.path.join(".") + "]` (expected [package], [architecture] or [modules.<path>])"));
+    }
+  }
+  if (!havePackage) {
+    return Err(invalid(file, span(file, 0, 0), "missing [package] table"));
+  }
+  return Ok(m);
+}
+
+// Index of the rule for `module`, if the manifest has one.
+export function ruleIndex(m: Manifest, module: string): Option<usize> {
+  let i: usize = 0;
+  while (i < m.rules.length) {
+    if (m.rules[i].module == module) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}

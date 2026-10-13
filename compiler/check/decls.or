@@ -3,10 +3,10 @@
 // `check_main` and `resolve_type` from bootstrap/src/checker/mod.rs.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Ident, TypeExpr, EInt, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
+import { Ident, TypeExpr, EInt, EFloat, EStr, EBool, EUnary, UNeg, Expr } from "../syntax";
 import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import {
-  Env, RecordSrc, UnionSrc, FuncInfo, ConstInfo, ConstLit, LitInt, LitStr, LitBool, typeEq, isVoid, showType
+  Env, RecordSrc, UnionSrc, FuncInfo, ConstInfo, ConstLit, LitInt, LitStr, LitBool, LitFloat, typeEq, isVoid, showType
 } from "./env";
 import { CYCLE_MSG, TyOut, aliasType, resolveType, plainScope } from "./types";
 
@@ -25,11 +25,13 @@ type LitInfo = { lit: ConstLit; ty: Type; neg: bool; };
 function constLit(e: Expr): Option<LitInfo> {
   return match (e.kind) {
     EInt(n) => Some(LitInfo { lit: LitInt(n), ty: TyInt, neg: false }),
+    EFloat(t) => Some(LitInfo { lit: LitFloat(t), ty: TyFloat, neg: false }),
     EStr(s) => Some(LitInfo { lit: LitStr(s), ty: TyString, neg: false }),
     EBool(b) => Some(LitInfo { lit: LitBool(b), ty: TyBool, neg: false }),
     EUnary(op, inner) => match (op) {
       UNeg => match (inner.kind) {
         EInt(n) => Some(LitInfo { lit: LitInt(-n), ty: TyInt, neg: true }),
+        EFloat(t) => Some(LitInfo { lit: LitFloat("-" + t), ty: TyFloat, neg: true }),
         _ => None
       },
       _ => None
@@ -54,6 +56,9 @@ function resolveConst(env: Env, c: ConstInfo): Result<ConstInfo, Diagnostic> {
     None => {}
   }
   let ok = typeEq(li.ty, ty);
+  if (isFloatLit(li.ty) && isF32Ty(ty)) {
+    ok = true;
+  }
   if (isIntLike(li.ty) && isUsizeTy(ty)) {
     if (li.neg) {
       return Err(diag("E0400", vspan, "negative integer literal cannot have type `usize`"));
@@ -64,6 +69,14 @@ function resolveConst(env: Env, c: ConstInfo): Result<ConstInfo, Diagnostic> {
     return Err(diag("E0400", vspan, "expected `" + showType(env, ty) + "`, found `" + showType(env, li.ty) + "`"));
   }
   return Ok(ConstInfo { unit: c.unit, decl: c.decl, ty: ty, lit: li.lit });
+}
+
+function isFloatLit(t: Type): bool {
+  return match (t) { TyFloat => true, _ => false };
+}
+
+function isF32Ty(t: Type): bool {
+  return match (t) { TyF32 => true, _ => false };
 }
 
 function isIntLike(t: Type): bool {
@@ -259,7 +272,8 @@ export function resolveDecls(env0: Env, recordSrc: RecordSrc[], unionSrc: UnionS
     insts: cur.insts,
     classes: env0.classes,
     lifted: env0.lifted,
-    prelude: env0.prelude
+    prelude: env0.prelude,
+    mapUnit: env0.mapUnit
   };
   // `main` check.
   const entryUnit = env2.units[env2.entry];

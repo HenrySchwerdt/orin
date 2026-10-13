@@ -93,7 +93,7 @@ def compile_orin(args, entry, c_out, flags=()):
 
 def runtime_sources(backend):
     """C runtime sources to link; the LLVM backend also needs the out-of-line shim."""
-    srcs = [os.path.join("runtime", "orin_runtime.c")]
+    srcs = [os.path.join("runtime", "orin_runtime.c"), os.path.join("platform", "orin_platform.c")]
     if backend == "llvm":
         srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
     return srcs
@@ -158,7 +158,7 @@ def run_test(args, label, test):
         cc = [args.cc, "-O1", "-w", "-I", "runtime"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    cc += [c_out] + runtime_sources(args.backend) + ["-o", exe]
+    cc += [c_out] + runtime_sources(args.backend) + ["-lm", "-o", exe]
     rc, _, err = run_cmd(cc, COMPILE_TIMEOUT)
     if rc != 0:
         return tag, False, "C compilation failed (exit %s); stderr head:\n%s" % (rc, head(err))

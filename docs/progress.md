@@ -24,8 +24,8 @@ _Updated: 2026-10-13_
 | Tooling: fmt, check --format=json, lsp, mcp, VS Code | done |
 | Releases (dispatch workflow, packages, seed C) | done |
 | Seed bootstrap (ADR-0014) | in progress |
-| Floats + Map<K,V> | in progress |
-| Runtime R2: platform layer with contracts | in progress |
+| Floats (`float`, `f32`), `std:math`, `Map<K,V>` (ADR-0018) | done |
+| Runtime R2: platform layer with contracts | done (CBMC-bounded + tests) |
 | Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | in progress |
 | Interfaces, annotations (spec 05), concurrency, packages, incremental analysis | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |

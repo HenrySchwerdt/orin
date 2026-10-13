@@ -26,4 +26,5 @@ OrinObj *orinl_io_read_bytes(uint64_t n) { return orin_io_read_bytes(n); }
 OrinObj *orinl_io_read_line(void) { return orin_io_read_line(); }
 void orinl_io_write_stdout(OrinObj *s) { orin_io_write_stdout(s); }
 int64_t orinl_io_shell(OrinObj *cmd) { return orin_io_shell(cmd); }
+int64_t orinl_time_now_millis(void) { return orin_time_now_millis(); }
 int64_t orinl_str_char_code_at(OrinObj *s, uint64_t i) { return orin_str_char_code_at(s, i); }

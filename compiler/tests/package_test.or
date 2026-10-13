@@ -1,0 +1,85 @@
+// Assertions for compiler/package (TOML subset, manifest, architecture rules). Prints `ok` or one
+// line per failure (exit 1).
+
+import { parseManifest, edgeError, findModuleCycle, Manifest, ModuleRule } from "../package";
+import { SourceMap, SourceFile, Span, span, render } from "../diag";
+import { exit } from "std:process";
+
+function checkS(fails: string[], what: string, got: string, want: string): string[] {
+  let f = fails;
+  if (got != want) {
+    f.push(what + ": got `" + got + "`, want `" + want + "`");
+  }
+  return f;
+}
+
+// First rendered diagnostic of a manifest text ("" when it parses).
+function errOf(text: string): string {
+  const r = parseManifest(0, text);
+  if (r.isOk()) {
+    return "";
+  }
+  const sm = SourceMap { files: [SourceFile { path: "orin.toml", text: text }] };
+  return render(sm, r.unwrapErr());
+}
+
+function main(): void {
+  let f: string[] = [];
+  const good = "# c\n[package]\nname = \"shop\" # trailing\nversion = '0.1.0'\n\n[architecture]\nacyclic_modules = true\n\n[modules.users]\nallowed_dependencies = [\n  \"a\", # x\n  \"b/c\",\n]\n[modules.\"x/y\"]\nallowed_dependencies = []\n[modules.p.q]\n";
+  const g = parseManifest(0, good);
+  f = checkS(f, "good parses", g.isOk() ? "ok" : "err", "ok");
+  if (g.isOk()) {
+    const m = g.unwrap();
+    f = checkS(f, "name", m.name, "shop");
+    f = checkS(f, "version", m.version, "0.1.0");
+    f = checkS(f, "default entry", m.entry, "src/main.or");
+    f = checkS(f, "rules", m.rules.length.toString(), "3");
+    f = checkS(f, "rule users", m.rules[0].module + ":" + m.rules[0].allowed.join(","), "users:a,b/c");
+    f = checkS(f, "rule quoted path", m.rules[1].module, "x/y");
+    f = checkS(f, "rule dotted path", m.rules[2].module, "p/q");
+  }
+  const withEntry = parseManifest(0, "[package]\nname = \"n\"\nentry = \"app/main.or\"\n");
+  f = checkS(f, "entry key", withEntry.isOk() ? withEntry.unwrap().entry : "?", "app/main.or");
+
+  f = checkS(f, "missing value", errOf("[package]\nname =\n"), "orin.toml:2:7: error[E0500]: orin.toml: expected a value after `=`");
+  f = checkS(f, "unterminated string", errOf("[package]\nname = \"abc\n"), "orin.toml:2:8: error[E0500]: orin.toml: unterminated string");
+  f = checkS(f, "duplicate key", errOf("[package]\nname = \"a\"\nname = \"b\"\n"), "orin.toml:3:1: error[E0500]: orin.toml: duplicate key `name`");
+  f = checkS(f, "duplicate table", errOf("[package]\nname = \"a\"\n[package]\n"), "orin.toml:3:1: error[E0500]: orin.toml: duplicate table `[package]`");
+  f = checkS(f, "mixed array", errOf("[package]\nname = \"a\"\n[modules.x]\nallowed_dependencies = [1]\n"), "orin.toml:4:25: error[E0500]: orin.toml: arrays may only contain strings");
+  f = checkS(f, "garbage after value", errOf("[package]\nname = \"a\" x\n"), "orin.toml:2:12: error[E0500]: orin.toml: unexpected `x` (expected end of line)");
+  f = checkS(f, "no equals", errOf("[package]\nname\n"), "orin.toml:2:5: error[E0500]: orin.toml: expected `=` after key `name`");
+  f = checkS(f, "inline table", errOf("[package]\nname = {}\n"), "orin.toml:2:8: error[E0500]: orin.toml: inline tables are not supported");
+
+  f = checkS(f, "no package", errOf("[architecture]\n").substring(0, 38), "orin.toml:1:1: error[E0503]: orin.toml");
+  f = checkS(f, "no name", errOf("[package]\nversion = \"1\"\n").indexOf("requires a `name`").isSome().toString(), "true");
+  f = checkS(f, "unknown key", errOf("[package]\nname = \"a\"\nx = 1\n"), "orin.toml:3:1: error[E0503]: orin.toml: unknown key `x` in [package] (expected name, version, entry)");
+  f = checkS(f, "wrong type", errOf("[package]\nname = 3\n"), "orin.toml:2:1: error[E0503]: orin.toml: `name` must be a string");
+  f = checkS(f, "arch false", errOf("[package]\nname = \"a\"\n[architecture]\nacyclic_modules = false\n").indexOf("always enforces").isSome().toString(), "true");
+
+  // Rules.
+  const noSp: Span[] = [];
+  const mf = Manifest { file: 0, name: "p", version: "1", entry: "src/main.or", rules: [
+    ModuleRule { module: "a", allowed: ["b"], span: span(0, 0, 0), allowedSpans: noSp },
+    ModuleRule { module: ".", allowed: [], span: span(0, 0, 0), allowedSpans: noSp }
+  ] };
+  f = checkS(f, "allowed edge", edgeError(mf, "a", "b").isNone().toString(), "true");
+  f = checkS(f, "no rule = free", edgeError(mf, "c", "a").isNone().toString(), "true");
+  f = checkS(f, "descendant allowed", edgeError(mf, "a", "a/inner").isNone().toString(), "true");
+  f = checkS(f, "disallowed edge", edgeError(mf, "a", "c").unwrapOr(""),
+    "module `a` must not import module `c`: it is not in allowed_dependencies of [modules.a] in orin.toml (allowed: b)");
+  f = checkS(f, "root rule", edgeError(mf, ".", "a/inner").isSome().toString(), "true");
+
+  f = checkS(f, "no cycle", findModuleCycle(["a", "b", "a"], ["b", "c", "c"]).join(">"), "");
+  f = checkS(f, "cycle", findModuleCycle(["a", "b", "c"], ["b", "c", "a"]).join(">"), "a>b>c>a");
+  f = checkS(f, "cycle 2", findModuleCycle(["x", "a", "b"], ["a", "b", "a"]).join(">"), "a>b>a");
+  f = checkS(f, "self edges ignored", findModuleCycle(["a"], ["a"]).join(">"), "");
+
+  if (f.length == 0) {
+    console.log("ok");
+    return;
+  }
+  for (const l of f) {
+    console.log(l);
+  }
+  exit(1);
+}

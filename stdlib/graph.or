@@ -1,0 +1,177 @@
+// std:graph -- Graph<T> with generational, graph-tagged node ids (spec 06 "Cyclic graph", ADR-0016).
+//
+// Cyclic structures are not expressible with owning values (no owning cycles), so a graph owner
+// holds all nodes and edges are checked, non-owning `GraphId<T>` handles:
+//   * Each id carries the graph's tag, the slot index and the slot's generation. Removing a node
+//     bumps its slot's generation, so an id that outlived its node is STALE and every operation
+//     rejects it with `Err(StaleId)`; an id minted by a graph with a different tag is `Err(ForeignId)`.
+//     (An id whose index lies beyond the graph is also `ForeignId`.)
+//   * Value semantics: a Graph is an ordinary value. Operations that change it return a new Graph
+//     (`Added<T>`, or `Result<Graph<T>, GraphError>`); the argument graph is not modified, so a
+//     copy taken earlier keeps seeing its old nodes (an id removed in the newer version is still
+//     valid in the older one: ids identify a node of one *tag*, generations track its history).
+//   * The tag is supplied by the caller: `newGraph(tag)`. Use a different tag per logical graph.
+//     TODO(after global state): an automatic unique tag once the language has a process-wide counter.
+//   * Edges are directed and stored in the source slot as (index, generation) pairs. Removing a node
+//     does not touch edges pointing at it: they become dangling and `neighbors` silently skips them
+//     (an edge only counts while both ends are live with the generations recorded at addEdge time).
+//     Duplicate edges are allowed and reported once per addEdge call.
+//   * Complexity: Orin copies arrays on write (until ADR-0010), so every changing operation is
+//     O(nodes) time/allocation; `get`, `contains`, `neighbors` are O(1) / O(out-degree) reads.
+//
+// TODO(after floats/map): `Map`-based index, edge weights.
+
+// Opaque handle of a node of a graph with value type T. `T` is only a phantom parameter that ties
+// the id to its graph's value type; construct ids only through `add`.
+export type GraphId<T> = { tag: int; index: usize; gen: int; };
+
+// StaleId: the node was removed (the slot has a newer generation or is empty).
+// ForeignId: the id belongs to another graph (different tag) or does not name a slot at all.
+export type GraphError = StaleId | ForeignId;
+
+type Edge = { index: usize; gen: int; };
+
+type Slot<T> = { gen: int; value: Option<T>; edges: Edge[]; };
+
+export type Graph<T> = { tag: int; slots: Slot<T>[]; live: usize; };
+
+export type Added<T> = { graph: Graph<T>; id: GraphId<T>; };
+
+// graphErrorMessage(e: GraphError): string -- "stale graph id" / "foreign graph id". O(1).
+export function graphErrorMessage(e: GraphError): string {
+  return match (e) {
+    StaleId => "stale graph id",
+    ForeignId => "foreign graph id"
+  };
+}
+
+// newGraph<T>(tag: int): Graph<T>
+// An empty graph. Ids minted by it are accepted only by graphs with the same `tag`. O(1).
+export function newGraph<T>(tag: int): Graph<T> {
+  return Graph { tag: tag, slots: [], live: 0 };
+}
+
+// size<T>(g: Graph<T>): usize -- number of live nodes. O(1).
+export function size<T>(g: Graph<T>): usize {
+  return g.live;
+}
+
+// Validates `id` against `g`: Ok(slot index) when the node is live.
+function check<T>(g: Graph<T>, id: GraphId<T>): Result<usize, GraphError> {
+  if (id.tag != g.tag || id.index >= g.slots.length) {
+    return Err(ForeignId);
+  }
+  const s = g.slots[id.index];
+  if (s.gen != id.gen || s.value.isNone()) {
+    return Err(StaleId);
+  }
+  return Ok(id.index);
+}
+
+// contains<T>(g: Graph<T>, id: GraphId<T>): bool -- true when `id` names a live node of `g`. O(1).
+export function contains<T>(g: Graph<T>, id: GraphId<T>): bool {
+  return check(g, id).isOk();
+}
+
+// add<T>(g: Graph<T>, value: T): Added<T>
+// Adds a node (reusing a freed slot with a bumped generation when one exists) and returns the new
+// graph together with the node's id: `const r = add(g, v); g = r.graph; const id = r.id;`. Never
+// fails. O(nodes).
+export function add<T>(g: Graph<T>, value: T): Added<T> {
+  let slots = g.slots;
+  let i: usize = 0;
+  while (i < slots.length) {
+    if (slots[i].value.isNone()) {
+      // Free slot: its generation was already bumped by `remove`.
+      const gen = slots[i].gen;
+      let out: Slot<T>[] = [];
+      let k: usize = 0;
+      while (k < slots.length) {
+        out.push(k == i ? Slot { gen: gen, value: Some(value), edges: [] } : slots[k]);
+        k += 1;
+      }
+      return Added { graph: Graph { tag: g.tag, slots: out, live: g.live + 1 },
+        id: GraphId { tag: g.tag, index: i, gen: gen } };
+    }
+    i += 1;
+  }
+  slots.push(Slot { gen: 0, value: Some(value), edges: [] });
+  return Added { graph: Graph { tag: g.tag, slots: slots, live: g.live + 1 },
+    id: GraphId { tag: g.tag, index: slots.length - 1, gen: 0 } };
+}
+
+// get<T>(g: Graph<T>, id: GraphId<T>): Result<T, GraphError>
+// The value of a live node. Errors: StaleId (removed node), ForeignId (other graph). O(1).
+export function get<T>(g: Graph<T>, id: GraphId<T>): Result<T, GraphError> {
+  const i = check(g, id)?;
+  return Ok(g.slots[i].value.unwrap());
+}
+
+function replaceSlot<T>(g: Graph<T>, i: usize, s: Slot<T>, live: usize): Graph<T> {
+  let out: Slot<T>[] = [];
+  let k: usize = 0;
+  while (k < g.slots.length) {
+    out.push(k == i ? s : g.slots[k]);
+    k += 1;
+  }
+  return Graph { tag: g.tag, slots: out, live: live };
+}
+
+// set<T>(g: Graph<T>, id: GraphId<T>, value: T): Result<Graph<T>, GraphError>
+// Replaces a live node's value (its edges and id stay). Errors as `get`. O(nodes).
+export function set<T>(g: Graph<T>, id: GraphId<T>, value: T): Result<Graph<T>, GraphError> {
+  const i = check(g, id)?;
+  const old = g.slots[i];
+  return Ok(replaceSlot(g, i, Slot { gen: old.gen, value: Some(value), edges: old.edges }, g.live));
+}
+
+// remove<T>(g: Graph<T>, id: GraphId<T>): Result<Graph<T>, GraphError>
+// Removes a live node and its outgoing edges, bumps the slot generation (invalidating `id` and every
+// copy of it) and frees the slot for reuse. Edges of other nodes that pointed at it dangle and are
+// skipped by `neighbors`. Errors as `get`. O(nodes).
+export function remove<T>(g: Graph<T>, id: GraphId<T>): Result<Graph<T>, GraphError> {
+  const i = check(g, id)?;
+  const old = g.slots[i];
+  let gone: Option<T> = None;
+  return Ok(replaceSlot(g, i, Slot { gen: old.gen + 1, value: gone, edges: [] }, g.live - 1));
+}
+
+// addEdge<T>(g: Graph<T>, a: GraphId<T>, b: GraphId<T>): Result<Graph<T>, GraphError>
+// Adds the directed edge a -> b (self loops and duplicates allowed). Both ids must be live in
+// `g`; the first failing id's error is returned (`a` is checked first). O(nodes).
+export function addEdge<T>(g: Graph<T>, a: GraphId<T>, b: GraphId<T>): Result<Graph<T>, GraphError> {
+  const i = check(g, a)?;
+  const j = check(g, b)?;
+  const old = g.slots[i];
+  let edges = old.edges;
+  edges.push(Edge { index: j, gen: b.gen });
+  return Ok(replaceSlot(g, i, Slot { gen: old.gen, value: old.value, edges: edges }, g.live));
+}
+
+// neighbors<T>(g: Graph<T>, id: GraphId<T>): Result<GraphId<T>[], GraphError>
+// The targets of the outgoing edges of a live node, in insertion order, skipping dangling edges
+// (removed targets). Errors as `get`. O(out-degree).
+export function neighbors<T>(g: Graph<T>, id: GraphId<T>): Result<GraphId<T>[], GraphError> {
+  const i = check(g, id)?;
+  let out: GraphId<T>[] = [];
+  for (const e of g.slots[i].edges) {
+    const t = g.slots[e.index];
+    if (t.gen == e.gen && t.value.isSome()) {
+      out.push(GraphId { tag: g.tag, index: e.index, gen: e.gen });
+    }
+  }
+  return Ok(out);
+}
+
+// ids<T>(g: Graph<T>): GraphId<T>[] -- ids of all live nodes in slot order. O(nodes).
+export function ids<T>(g: Graph<T>): GraphId<T>[] {
+  let out: GraphId<T>[] = [];
+  let i: usize = 0;
+  while (i < g.slots.length) {
+    if (g.slots[i].value.isSome()) {
+      out.push(GraphId { tag: g.tag, index: i, gen: g.slots[i].gen });
+    }
+    i += 1;
+  }
+  return out;
+}

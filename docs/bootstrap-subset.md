@@ -227,6 +227,10 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0414 | contract expression is not `bool` (`@Decreases`: not `int`/`usize`) — beyond Orin-B (ADR-0012, `docs/contracts.md`) |
 | E0415 | invalid use of `result`-scope features in a contract: `old(..)` outside `@Ensures` or nested, `==>` outside a contract expression, `?` in a contract, a parameter named `result` hiding it — beyond Orin-B (ADR-0012) |
 | E0416 | impure contract expression: I/O or other effect, mutating call, call of a function that is not provably pure, closure — beyond Orin-B (ADR-0012) |
+| E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
+| E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
+| E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |
+| E0503 | invalid `orin.toml` (unknown key/table, wrong value type, missing `[package] name`, an `[architecture]` flag set to `false`) (beyond Orin-B) |
 
 Beyond Orin-B (self-hosted compiler only), contract clauses `@Requires`, `@Ensures`, `@Invariant`,
 `@Decreases`, `@Rule` (ADR-0012) reuse existing codes where the failure is not specific to

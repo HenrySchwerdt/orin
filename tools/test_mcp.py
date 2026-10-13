@@ -40,7 +40,7 @@ def build(orin2):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         sys.exit("orin2 failed to compile compiler/main.or:\n" + r.stderr.decode())
-    r = subprocess.run(["cc", "-O1", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "-o", exe],
+    r = subprocess.run(["cc", "-O1", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", exe],
                        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         sys.exit("cc failed:\n" + r.stderr.decode())
@@ -241,6 +241,21 @@ def main():
     check(not err and "traps" in v["fails"], "builtin string.split (%s)" % raw)
     err, v, raw = c.call("inspect", {})
     check(err, "inspect without target is an error")
+
+    # ---- packages (orin.toml, spec 04): module inspect shows the rule; violations are diagnostics
+    import shutil
+    shutil.copytree(os.path.join(ROOT, "tests", "next", "packages", "shop"), os.path.join(proj, "shop"))
+    err, v, raw = c.call("inspect", {"module": "shop/src/payments/module.or", "entry": "shop/src/main.or"})
+    check(not err and v.get("allowedDependencies") == ["users", "database"] and v.get("moduleId") == "payments"
+          and v.get("package") == "shop" and v.get("moduleImports") == ["database", "users"],
+          "inspect module shows manifest rule (%s)" % raw)
+    err, v, raw = c.call("check", {"entry": "shop/src/main.or"})
+    check(not err and v.get("errors") == 0, "package checks clean (%s)" % raw)
+    write(os.path.join(proj, "shop", "src", "users", "user.or"),
+          open(os.path.join(proj, "shop", "src", "users", "user.or")).read().replace(
+              'import { hidden }', 'import { charge } from "../payments";\nimport { hidden }'))
+    err, v, raw = c.call("check", {"entry": "shop/src/main.or"})
+    check("E0501" in raw, "disallowed module dependency is reported by check (%s)" % raw)
 
     # ---- edit (rename) ----------------------------------------------------------------------
     before = open(os.path.join(proj, "lib.or")).read()

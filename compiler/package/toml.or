@@ -1,0 +1,371 @@
+// Minimal TOML subset parser for `orin.toml` (spec 04, ADR-0016 packages). Beyond Orin-B tooling
+// code written in Orin-B.
+//
+// Supported: `#` comments, blank lines, `[table.path]` headers (bare or "quoted" segments),
+// `key = value` with bare or quoted keys, and values: basic strings ("..." with \" \\ \n \t \r
+// escapes), literal strings ('...'), booleans, decimal integers, and arrays of strings (may span
+// lines, trailing comma allowed, comments inside). Not supported (reported as E0500): dotted keys,
+// inline tables, arrays of tables ([[x]]), multi-line strings, floats, dates, mixed arrays.
+//
+// Errors are E0500 diagnostics at the offending byte, so they render with line:col.
+
+import { Span, Diagnostic, diag, span } from "../diag";
+
+export type TomlValue = TStr(string) | TBool(bool) | TInt(int) | TArr(string[]);
+
+// `start`/`end`: byte range of the whole `key = value`; `elems`: the span of each array element.
+export type TomlEntry = { key: string; value: TomlValue; start: usize; end: usize; elems: Span[]; };
+
+// `path` is empty for the root table. `start`/`end`: the `[header]` (0..0 for the root).
+export type TomlTable = { path: string[]; start: usize; end: usize; entries: TomlEntry[]; };
+
+export type TomlDoc = { file: usize; tables: TomlTable[]; };
+
+type VRes = { value: TomlValue; pos: usize; elems: Span[]; };
+type SRes = { text: string; pos: usize; };
+type KRes = { keys: string[]; pos: usize; };
+
+function bad(file: usize, s: string, at: usize, msg: string): Diagnostic {
+  let e = at + 1;
+  if (e > s.length) {
+    e = s.length;
+  }
+  let b = at;
+  if (b > e) {
+    b = e;
+  }
+  return diag("E0500", span(file, b, e), "orin.toml: " + msg);
+}
+
+function isBare(c: int): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 45;
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+// Spaces and tabs.
+function skipBlank(s: string, start: usize): usize {
+  let i = start;
+  while (i < s.length && (s.charCodeAt(i) == 32 || s.charCodeAt(i) == 9)) {
+    i += 1;
+  }
+  return i;
+}
+
+// Rest of a comment (from `#`) up to, not including, the newline.
+function skipComment(s: string, start: usize): usize {
+  let i = start;
+  while (i < s.length && s.charCodeAt(i) != 10) {
+    i += 1;
+  }
+  return i;
+}
+
+// Blanks, newlines and comments (between array elements and between lines).
+function skipAll(s: string, start: usize): usize {
+  let i = start;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      i += 1;
+    } else if (c == 35) {
+      i = skipComment(s, i);
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+// After a value or header: only blanks and an optional comment may precede the newline.
+function endOfLine(file: usize, s: string, start: usize): Result<usize, Diagnostic> {
+  let i = skipBlank(s, start);
+  if (i < s.length && s.charCodeAt(i) == 35) {
+    i = skipComment(s, i);
+  }
+  if (i < s.length && s.charCodeAt(i) == 13) {
+    i += 1;
+  }
+  if (i < s.length && s.charCodeAt(i) != 10) {
+    return Err(bad(file, s, i, "unexpected `" + s.charAt(i) + "` (expected end of line)"));
+  }
+  return Ok(i);
+}
+
+// `s[start]` is the opening quote (" or ').
+function parseString(file: usize, s: string, start: usize): Result<SRes, Diagnostic> {
+  const q = s.charCodeAt(start);
+  let parts: string[] = [];
+  let i = start + 1;
+  while (true) {
+    if (i >= s.length || s.charCodeAt(i) == 10) {
+      return Err(bad(file, s, start, "unterminated string"));
+    }
+    const c = s.charCodeAt(i);
+    if (c == q) {
+      return Ok(SRes { text: parts.join(""), pos: i + 1 });
+    }
+    if (q == 34 && c == 92) {
+      if (i + 1 >= s.length) {
+        return Err(bad(file, s, i, "unterminated escape"));
+      }
+      const e = s.charCodeAt(i + 1);
+      if (e == 34) {
+        parts.push("\"");
+      } else if (e == 92) {
+        parts.push("\\");
+      } else if (e == 110) {
+        parts.push("\n");
+      } else if (e == 116) {
+        parts.push("\t");
+      } else if (e == 114) {
+        parts.push("\r");
+      } else {
+        return Err(bad(file, s, i, "unsupported escape `\\" + s.charAt(i + 1) + "`"));
+      }
+      i += 2;
+    } else {
+      parts.push(s.charAt(i));
+      i += 1;
+    }
+  }
+  return Err(bad(file, s, start, "unterminated string"));
+}
+
+function parseArray(file: usize, s: string, start: usize): Result<VRes, Diagnostic> {
+  let items: string[] = [];
+  let elems: Span[] = [];
+  let i = start + 1;
+  while (true) {
+    i = skipAll(s, i);
+    if (i >= s.length) {
+      return Err(bad(file, s, start, "unterminated array"));
+    }
+    const c = s.charCodeAt(i);
+    if (c == 93) {
+      return Ok(VRes { value: TArr(items), pos: i + 1, elems: elems });
+    }
+    if (c != 34 && c != 39) {
+      return Err(bad(file, s, i, "arrays may only contain strings"));
+    }
+    const sr = parseString(file, s, i);
+    if (sr.isErr()) {
+      return Err(sr.unwrapErr());
+    }
+    const r = sr.unwrap();
+    items.push(r.text);
+    elems.push(span(file, i, r.pos));
+    i = skipAll(s, r.pos);
+    if (i >= s.length) {
+      return Err(bad(file, s, start, "unterminated array"));
+    }
+    if (s.charCodeAt(i) == 44) {
+      i += 1;
+    } else if (s.charCodeAt(i) != 93) {
+      return Err(bad(file, s, i, "expected `,` or `]` in array"));
+    }
+  }
+  return Err(bad(file, s, start, "unterminated array"));
+}
+
+function matchWord(s: string, at: usize, w: string): bool {
+  if (at + w.length > s.length || s.substring(at, at + w.length) != w) {
+    return false;
+  }
+  return at + w.length >= s.length || !isBare(s.charCodeAt(at + w.length));
+}
+
+function parseValue(file: usize, s: string, start: usize): Result<VRes, Diagnostic> {
+  const none: Span[] = [];
+  if (start >= s.length || s.charCodeAt(start) == 10 || s.charCodeAt(start) == 13) {
+    return Err(bad(file, s, start, "expected a value after `=`"));
+  }
+  const c = s.charCodeAt(start);
+  if (c == 34 || c == 39) {
+    if (start + 3 <= s.length && (s.substring(start, start + 3) == "\"\"\"" || s.substring(start, start + 3) == "'''")) {
+      return Err(bad(file, s, start, "multi-line strings are not supported"));
+    }
+    const sr = parseString(file, s, start);
+    if (sr.isErr()) {
+      return Err(sr.unwrapErr());
+    }
+    const r = sr.unwrap();
+    return Ok(VRes { value: TStr(r.text), pos: r.pos, elems: none });
+  }
+  if (c == 91) {
+    return parseArray(file, s, start);
+  }
+  if (c == 123) {
+    return Err(bad(file, s, start, "inline tables are not supported"));
+  }
+  if (matchWord(s, start, "true")) {
+    return Ok(VRes { value: TBool(true), pos: start + 4, elems: none });
+  }
+  if (matchWord(s, start, "false")) {
+    return Ok(VRes { value: TBool(false), pos: start + 5, elems: none });
+  }
+  if (isDigit(c) || c == 45 || c == 43) {
+    let i = start;
+    let neg = false;
+    if (c == 45 || c == 43) {
+      neg = c == 45;
+      i += 1;
+    }
+    const ds = i;
+    while (i < s.length && isDigit(s.charCodeAt(i))) {
+      i += 1;
+    }
+    if (i == ds) {
+      return Err(bad(file, s, start, "invalid number"));
+    }
+    if (i < s.length && (isBare(s.charCodeAt(i)) || s.charCodeAt(i) == 46)) {
+      return Err(bad(file, s, i, "only decimal integers are supported as numbers"));
+    }
+    if (i - ds > 18) {
+      return Err(bad(file, s, start, "integer too large"));
+    }
+    let v = 0;
+    let k = ds;
+    while (k < i) {
+      v = v * 10 + (s.charCodeAt(k) - 48);
+      k += 1;
+    }
+    if (neg) {
+      v = 0 - v;
+    }
+    return Ok(VRes { value: TInt(v), pos: i, elems: none });
+  }
+  return Err(bad(file, s, start, "invalid value (expected a string, boolean, integer or array of strings)"));
+}
+
+// One key segment: bare or quoted.
+function parseKeySeg(file: usize, s: string, start: usize): Result<SRes, Diagnostic> {
+  if (start >= s.length) {
+    return Err(bad(file, s, start, "expected a key"));
+  }
+  const c = s.charCodeAt(start);
+  if (c == 34 || c == 39) {
+    return parseString(file, s, start);
+  }
+  let i = start;
+  while (i < s.length && isBare(s.charCodeAt(i))) {
+    i += 1;
+  }
+  if (i == start) {
+    return Err(bad(file, s, start, "expected a key"));
+  }
+  return Ok(SRes { text: s.substring(start, i), pos: i });
+}
+
+// Dotted key path (for table headers): `a.b."c d"`.
+function parseKeyPath(file: usize, s: string, start: usize): Result<KRes, Diagnostic> {
+  let keys: string[] = [];
+  let i = skipBlank(s, start);
+  while (true) {
+    const r = parseKeySeg(file, s, i);
+    if (r.isErr()) {
+      return Err(r.unwrapErr());
+    }
+    const seg = r.unwrap();
+    keys.push(seg.text);
+    i = skipBlank(s, seg.pos);
+    if (i < s.length && s.charCodeAt(i) == 46) {
+      i = skipBlank(s, i + 1);
+    } else {
+      break;
+    }
+  }
+  return Ok(KRes { keys: keys, pos: i });
+}
+
+function samePath(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+export function parseToml(file: usize, s: string): Result<TomlDoc, Diagnostic> {
+  const rootPath: string[] = [];
+  const rootEntries: TomlEntry[] = [];
+  let tables: TomlTable[] = [TomlTable { path: rootPath, start: 0, end: 0, entries: rootEntries }];
+  let i: usize = 0;
+  while (true) {
+    i = skipAll(s, i);
+    if (i >= s.length) {
+      break;
+    }
+    const c = s.charCodeAt(i);
+    if (c == 91) {
+      if (i + 1 < s.length && s.charCodeAt(i + 1) == 91) {
+        return Err(bad(file, s, i, "arrays of tables ([[...]]) are not supported"));
+      }
+      const hs = i;
+      const kp = parseKeyPath(file, s, i + 1);
+      if (kp.isErr()) {
+        return Err(kp.unwrapErr());
+      }
+      const k = kp.unwrap();
+      if (k.pos >= s.length || s.charCodeAt(k.pos) != 93) {
+        return Err(bad(file, s, k.pos, "expected `]` to close the table header"));
+      }
+      const eol = endOfLine(file, s, k.pos + 1);
+      if (eol.isErr()) {
+        return Err(eol.unwrapErr());
+      }
+      for (const t of tables) {
+        if (samePath(t.path, k.keys)) {
+          return Err(bad(file, s, hs, "duplicate table `[" + k.keys.join(".") + "]`"));
+        }
+      }
+      const es: TomlEntry[] = [];
+      tables.push(TomlTable { path: k.keys, start: hs, end: k.pos + 1, entries: es });
+      i = eol.unwrap();
+      continue;
+    }
+    const ks = i;
+    const kr = parseKeySeg(file, s, i);
+    if (kr.isErr()) {
+      return Err(kr.unwrapErr());
+    }
+    const key = kr.unwrap();
+    i = skipBlank(s, key.pos);
+    if (i < s.length && s.charCodeAt(i) == 46) {
+      return Err(bad(file, s, i, "dotted keys are not supported (use a [table] header)"));
+    }
+    if (i >= s.length || s.charCodeAt(i) != 61) {
+      return Err(bad(file, s, i, "expected `=` after key `" + key.text + "`"));
+    }
+    i = skipBlank(s, i + 1);
+    const vr = parseValue(file, s, i);
+    if (vr.isErr()) {
+      return Err(vr.unwrapErr());
+    }
+    const v = vr.unwrap();
+    const eol = endOfLine(file, s, v.pos);
+    if (eol.isErr()) {
+      return Err(eol.unwrapErr());
+    }
+    const last = tables.length - 1;
+    const t = tables[last];
+    for (const e of t.entries) {
+      if (e.key == key.text) {
+        return Err(bad(file, s, ks, "duplicate key `" + key.text + "`"));
+      }
+    }
+    let es = t.entries;
+    es.push(TomlEntry { key: key.text, value: v.value, start: ks, end: v.pos, elems: v.elems });
+    tables[last] = TomlTable { path: t.path, start: t.start, end: t.end, entries: es };
+    i = eol.unwrap();
+  }
+  return Ok(TomlDoc { file: file, tables: tables });
+}

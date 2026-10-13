@@ -4,13 +4,14 @@
 
 import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, asStr, getField, getStr, getInt, getBool } from "../json";
 import { Workspace, newWorkspace, openFile, analyze, Analysis, PathDiag, fileIndexOf, offsetToPos, posToOffset,
-  symbolAt, hoverAt, renameEdits, TextEdit } from "../analysis";
+  symbolAt, hoverAt, renameEdits, TextEdit, moduleDeps } from "../analysis";
 import { SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam,
   SkField } from "../hir";
-import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdIo } from "../loader";
+import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdIo, StdClock } from "../loader";
 import { Span } from "../diag";
 import { normalizePath, joinPath, dirname, loadAll } from "../loader";
 import { check } from "../check";
+import { ruleIndex } from "../package";
 import { lower } from "../lower";
 import { optimize } from "../opt";
 import { verify } from "../verify";
@@ -79,7 +80,7 @@ export function toolList(): Json[] {
       "Signatures and structure without reading source. Give exactly one of: symbol (\"name\", \"Type.member\", or a built-in API such as \"Array.find\" or \"string.split\"), module (file path), or file+position. Symbols, modules and positions are resolved in the project rooted at entry (default: the file itself).",
       schema([
         jField("symbol", prop("string", "symbol name, Type.member, or built-in API name")),
-        jField("module", prop("string", "module file path: returns exports and dependency edges")),
+        jField("module", prop("string", "module file path: returns exports and dependency edges (with an orin.toml: package, moduleId, allowedDependencies, moduleImports)")),
         jField("file", prop("string", "file for a position query")),
         jField("position", prop("object", posDesc)),
         jField("entry", prop("string", "project entry file (default: file/module itself)")),
@@ -359,11 +360,12 @@ function defJson(st: McpState, a: Analysis, idx: SemanticIndex, d: SymbolDef, in
 function importName(a: Analysis, t: ImportTarget): string {
   const prog = a.program.unwrap();
   return match (t) {
-    ImportUnit(i) => prog.units[i].name,
+    ImportUnit(i) => prog.units[i].name == "$array/math" ? "std:math" : prog.units[i].name,
     ImportStd(m) => match (m) {
       StdFs => "std:fs",
       StdProcess => "std:process",
-      StdIo => "std:io"
+      StdIo => "std:io",
+      StdClock => "std:clock"
     }
   };
 }
@@ -500,10 +502,31 @@ function inspectModule(st: McpState, a: Analysis, idx: SemanticIndex, m: string)
       }
     }
   }
-  return ok(st, JObj([
+  let fields: JField[] = [
     jField("module", JStr(prog.units[t].name)), jField("file", JStr(relPath(st, prog.units[t].path))),
     jField("exports", jstrs(exports)), jField("imports", jstrs(imports)), jField("importedBy", jstrs(importedBy))
-  ]));
+  ];
+  // With an orin.toml: the module id (directory relative to the src root) and its rule.
+  match (prog.manifest) {
+    Some(mf) => {
+      fields.push(jField("package", JStr(mf.name)));
+      fields.push(jField("moduleId", JStr(prog.units[t].module)));
+      const ri = ruleIndex(mf, prog.units[t].module);
+      if (ri.isSome()) {
+        fields.push(jField("allowedDependencies", jstrs(mf.rules[ri.unwrap()].allowed)));
+      }
+      // Other modules this unit's module imports (module-level, cf. `orin check --deps`).
+      let modImports: string[] = [];
+      for (const dep of moduleDeps(prog)) {
+        if (dep.module == prog.units[t].module) {
+          modImports = dep.imports;
+        }
+      }
+      fields.push(jField("moduleImports", jstrs(modImports)));
+    },
+    None => {}
+  }
+  return ok(st, JObj(fields));
 }
 
 function inspectPosition(st: McpState, a: Analysis, idx: SemanticIndex, file: string, args: Json, includeSource: bool): ToolOut {
@@ -721,7 +744,7 @@ function ccLink(st: McpState, cfile: string, bin: string): ToolOut {
     return fail(st, "runtime not found at " + rt + "; start the server with --repo <orin checkout>");
   }
   const log = bin + ".cc.log";
-  const code = shellRun("cc -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " -o " + shq(bin)
+  const code = shellRun("cc -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " " + shq(rt + "/../platform/orin_platform.c") + " -lm -o " + shq(bin)
     + " > " + shq(log) + " 2>&1");
   const text = readOr(log);
   return ToolOut { st: st, text: code == 0 ? "" : trunc(text, 2000), err: code != 0 };
