@@ -99,17 +99,42 @@ int64_t orin_live_count(void);
 
 void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 */
 
+/* Opt-in statistics (plain counters, always compiled in; printed as one JSON line on stderr at
+ * exit only when the environment variable ORIN_STATS=1). retains/releases count only
+ * non-immortal objects. Bytes are approximate (object + buffer capacity, excluding malloc
+ * overhead). */
+typedef struct OrinStats {
+    uint64_t alloc_string, alloc_array, alloc_struct; /* object allocations by kind */
+    uint64_t frees;                                   /* objects freed */
+    uint64_t retains, releases;                       /* rc increments / decrements (incl. children released by destroy) */
+    uint64_t cow_copies, cow_inplace;                 /* orin_make_unique: copied vs rc==1 reuse */
+    uint64_t array_grows;                             /* array buffer growth reallocations */
+    uint64_t string_grows;                            /* in-place string append reallocations */
+    uint64_t peak_live_objs, peak_live_bytes;
+    uint64_t live_bytes;
+} OrinStats;
+extern OrinStats orin_stats;
+
 static inline void orin_retain(OrinObj *o) {
-    if (o->rc > 0) o->rc++;
+    if (o->rc > 0) {
+        o->rc++;
+        orin_stats.retains++;
+    }
 }
 /* retain and return (turn a borrowed value into an owned one). */
 static inline OrinObj *orin_dup(OrinObj *o) {
-    if (o->rc > 0) o->rc++;
+    if (o->rc > 0) {
+        o->rc++;
+        orin_stats.retains++;
+    }
     return o;
 }
 /* NULL-safe. */
 static inline void orin_release(OrinObj *o) {
-    if (o && o->rc > 0 && --o->rc == 0) orin_destroy(o);
+    if (o && o->rc > 0) {
+        orin_stats.releases++;
+        if (--o->rc == 0) orin_destroy(o);
+    }
 }
 
 /* Returns o if o->rc == 1, else a shallow copy (ref children retained) and releases one

@@ -1,0 +1,157 @@
+# Benchmarks
+
+Status: first measurement infrastructure (spec 11, "Benchmark groups" 1, 2 and 5 only: CPU, memory,
+compiler UX). No service, concurrency or token-cost benchmarks exist yet. Everything below is
+from one machine and one run of `python3 tools/bench.py`; it is a baseline for tracking, not a
+claim about Orin in general.
+
+## Methodology
+
+- **Programs**: `bench/<name>/main.or` (Orin-B), `main.go` (Go 1.24) and `main.c` (C, `cc -O2`)
+  implement the same algorithm on the same input. Each prints a few checksum lines; `tools/bench.py`
+  fails if stdout differs between the three. Inputs are fixed constants in the sources (no args).
+- **Builds**: Orin = `build/bootstrap/orin2 compile` to C, then `cc -O2 -w -I runtime` with
+  `runtime/orin_runtime.c` (no LTO, runtime is a separate translation unit); Go = `go build`
+  (default flags); C = `cc -O2 -w`. Same `cc` for Orin and C.
+- **Measurement**: one unrecorded warm-up run, then 5 runs; median wall time (min-max shown) from
+  `perf_counter` around the process; peak RSS is `ru_maxrss` of the child, obtained through the small
+  helper `tools/rss_probe.c` (`/usr/bin/time` is not installed; Python's own fork would inflate
+  `ru_maxrss`). RSS has a ~1 MiB process-startup floor. Binary sizes are file sizes (also with `strip`).
+  Build times are a single, uncached-for-C/Orin but Go-build-cache-warm measurement and are only indicative.
+- **Orin counters**: `ORIN_STATS=1 ./prog` prints a one-line JSON summary to stderr at exit (allocations by
+  kind, frees, retains, releases, COW copies vs in-place `make_unique` hits, array/string growth
+  reallocations, peak live objects/bytes). Counters are plain increments compiled in always.
+  `retains`/`releases` count non-immortal objects only; `releases` includes the children released while
+  destroying an object. Bytes are object + buffer capacity (approximate, not RSS).
+- **Algorithm equivalences and deliberate choices** (no cherry-picking: where a choice favours one side it is listed):
+  - `fib`: naive recursion, `fib(40)`. Orin traps on overflow (checked arithmetic); Go and C do not.
+  - `sieve`: 10,000,000 flags as 8-byte ints (not bytes) in all languages, grown by `push`/`append`.
+  - `bintrees`: complete binary trees; Orin uses a tagged union `Leaf | Node(Tree, Tree)`; Go/C use a
+    node struct with nil children; C frees explicitly, Go uses its GC, Orin uses RC.
+  - `strings`: 500,000 appends, `split(",")` into separately allocated parts, `join(";")`, parse.
+    Go uses `strings.Builder` (naive `+=` is quadratic in Go).
+  - `wordfreq`: 1M generated words into a hand-built table (1024 buckets of record arrays, linear scan).
+    No maps in any language.
+  - `qsort_func`: out-of-place 3-way quicksort building fresh arrays (the natural functional style;
+    Orin-B function parameters are immutable). `qsort_inplace`: iterative Lomuto with an explicit stack
+    (Go and C copy the input first because Orin does a COW copy on first write).
+  - `selfcompile`: `orin2 compile compiler/main.or` (~222 KB of Orin source, output 720 KB of C), the
+    only realistic workload; it has no Go/C counterpart. The Rust stage-0 compiler on the same input is
+    listed as a reference only (a different program, not an equivalent implementation). `cc` time is not included.
+- **Limits**: 4 shared vCPUs in a VM, so run-to-run noise is visible in the min-max ranges; Go's GC runs on
+  other cores and its wall time does not include that CPU time. No confidence intervals beyond min-max.
+  Spec 11 asks for latency distributions, CPU time and Rust/Koka comparisons; those are not done.
+  Reproduce with `./tools/bootstrap.sh && python3 tools/bench.py --out build/bench/results.md`.
+
+## Results
+
+Machine: Intel(R) Xeon(R) Processor @ 2.80GHz, 4 cores, 15.7 GiB RAM; Linux-6.18.44-fc-v114-x86_64-with-glibc2.39; cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0; go version go1.24.7 linux/amd64; runs per cell: 5 (median, after 1 warm-up).
+
+### Wall time, seconds (median; min-max in parentheses)
+
+| benchmark | Orin | Go | C | Orin/Go | Orin/C |
+|---|---:|---:|---:|---:|---:|
+| bintrees | 1.228 (1.119-1.378) | 1.537 (1.434-1.753) | 0.659 (0.604-0.715) | 0.80x | 1.86x |
+| fib | 0.604 (0.582-0.748) | 0.648 (0.636-0.685) | 0.228 (0.225-0.256) | 0.93x | 2.65x |
+| qsort_func | 0.668 (0.637-0.746) | 0.952 (0.877-0.984) | 0.309 (0.272-0.341) | 0.70x | 2.16x |
+| qsort_inplace | 0.297 (0.268-0.325) | 0.238 (0.208-0.339) | 0.127 (0.102-0.136) | 1.25x | 2.34x |
+| sieve | 0.402 (0.365-0.426) | 1.501 (1.299-1.761) | 0.278 (0.270-0.320) | 0.27x | 1.44x |
+| strings | 0.188 (0.156-0.231) | 0.164 (0.146-0.181) | 0.081 (0.075-0.104) | 1.15x | 2.32x |
+| wordfreq | 0.234 (0.218-0.253) | 0.142 (0.138-0.152) | 0.115 (0.105-0.129) | 1.65x | 2.04x |
+| selfcompile (orin2 compiles compiler/main.or) | 0.101 (0.085-0.123) | - | - | - | - |
+| selfcompile, reference: Rust stage-0 `orinb` | 0.039 (0.036-0.046) | - | - | - | - |
+
+### Peak RSS, MiB (median of ru_maxrss; ~1 MiB process-startup floor)
+
+| benchmark | Orin | Go | C |
+|---|---:|---:|---:|
+| bintrees | 17.5 | 13.6 | 9.5  |
+| fib | 1.5 | 1.8 | 1.5  |
+| qsort_func | 49.4 | 74.0 | 23.7  |
+| qsort_inplace | 16.8 | 31.0 | 16.8  |
+| sieve | 77.5 | 256.3 | 77.6  |
+| strings | 46.2 | 23.4 | 34.6  |
+| wordfreq | 2.2 | 6.6 | 1.9  |
+| selfcompile (orin2) | 15.4 | - | - |
+| selfcompile (Rust orinb) | 12.8 | - | - |
+
+### Binary size, KiB (unstripped / stripped) and build time, seconds (single run)
+
+| benchmark | Orin | Go | C | Orin build | Go build | C build |
+|---|---:|---:|---:|---:|---:|---:|
+| bintrees | 32 / 26 | 2175 / 1413 | 20 / 18 | 0.41 | 0.10 | 0.18 |
+| fib | 31 / 26 | 2174 / 1413 | 16 / 14 | 0.35 | 0.07 | 0.08 |
+| qsort_func | 32 / 26 | 2175 / 1413 | 16 / 14 | 0.42 | 0.06 | 0.08 |
+| qsort_inplace | 31 / 26 | 2175 / 1413 | 16 / 14 | 0.43 | 0.09 | 0.08 |
+| sieve | 31 / 26 | 2174 / 1413 | 16 / 14 | 0.46 | 0.15 | 0.13 |
+| strings | 32 / 27 | 2208 / 1433 | 16 / 14 | 0.45 | 0.10 | 0.11 |
+| wordfreq | 32 / 26 | 2175 / 1413 | 16 / 14 | 0.45 | 0.06 | 0.08 |
+| orin2 compiler binary | 366 / 324 | - | - | 7.25 | - | - |
+
+### Orin runtime counters (ORIN_STATS=1; one run)
+
+| benchmark | alloc_total | alloc_string | alloc_array | alloc_struct | retains | releases | cow_copies | cow_inplace | array_grows | string_grows | peak_live_objs | peak_live_bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| bintrees | 33,405,923 | 36 | 0 | 33,405,887 | 33,126,270 | 66,532,193 | 0 | 0 | 0 | 0 | 262,142 | 12,582,816 |
+| fib | 2 | 2 | 0 | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 2 | 92 |
+| qsort_func | 2,388,910 | 4 | 2,388,906 | 0 | 955,563 | 3,344,473 | 0 | 25,099,007 | 1,783,059 | 0 | 164 | 55,859,744 |
+| qsort_inplace | 1,355,403 | 4 | 3 | 1,355,396 | 2 | 1,355,405 | 1 | 28,614,441 | 24 | 0 | 4 | 16,389,304 |
+| sieve | 3 | 2 | 1 | 0 | 0 | 3 | 0 | 32,850,054 | 23 | 0 | 2 | 134,217,776 |
+| strings | 3,000,015 | 2,500,014 | 1 | 500,000 | 500,003 | 3,500,018 | 0 | 0 | 17 | 19 | 500,007 | 39,885,282 |
+| wordfreq | 2,006,031 | 2,000,006 | 1,025 | 5,000 | 1,013,073 | 3,019,104 | 0 | 2,996,024 | 1,351 | 0 | 11,027 | 545,699 |
+| selfcompile | 1,023,409 | 224,110 | 89,656 | 709,643 | 1,738,601 | 2,762,010 | 21,146 | 141,546 | 47,207 | 7,842 | 179,900 | 11,300,788 |
+
+selfcompile output C is 720,122 bytes and identical to the committed-bootstrap stage2.c.
+
+Checksums: all outputs identical across Orin/Go/C.
+
+## Discussion (what the data supports)
+
+Orin (compiled through C with `-O2`) is between 1.4x and 2.7x slower than the equivalent C program on all
+seven kernels, and relative to Go it ranges from 0.27x (faster) to 1.65x (slower). The Go comparison
+is not uniform: Orin is faster on `sieve`, `qsort_func`, `bintrees` and `fib`, slower on `qsort_inplace`,
+`wordfreq` and roughly level on `strings`. The "between Go and Rust" aspiration of spec 11 is not
+demonstrated by this data: Orin is behind C everywhere here, and behind Go on 2-3 of 7. (Rust was not measured.)
+The sieve result favours Orin mostly because Go's `append` growth creates garbage and a 256 MiB RSS; it is
+not evidence of a faster inner loop (Orin is 1.4x C there).
+
+Observations tied to counters:
+
+1. **Allocation churn for temporaries (boxed Option, strings).** `qsort_inplace` does 1.36M struct
+   allocations although the program never builds a record: they are the `Option<usize>` objects returned
+   by `stack.pop()`. `strings` allocates 2.5M strings for 500k iterations (the temporaries of
+   `"item" + i.toString() + ","`), `wordfreq` 2.0M strings for 1M words. These benchmarks are 1.15x-1.65x Go
+   and ~2-2.3x C. Everything non-scalar, including Option and Result, is a heap object (ADR-0002).
+2. **RC traffic and per-node allocation.** `bintrees` performs 33.4M allocations, 33.1M retains and
+   66.5M releases (about one retain/release pair per node beyond the allocation/free itself, i.e. the
+   conservative borrowed/owned convention is not eliminating pairs). It is 1.86x C but 0.80x Go, whose
+   allocator+GC is also not cheap. Peak live objects are 262k, so the cost is traffic, not retention.
+3. **Out-of-line runtime calls and checked arithmetic on scalar paths.** `sieve` and `qsort_inplace`
+   do 32.9M and 28.6M `orin_make_unique` calls that all take the in-place path (`cow_copies` is 0 and 1):
+   every `a[i] = v` and `push` pays a call into a separate translation unit (no inlining without LTO) plus
+   bounds and uniqueness checks. `fib` has no allocation at all (2 objects) and is still 2.65x C, so
+   checked arithmetic (`__builtin_*_overflow` plus branch) and codegen shape alone cost 2.7x there; Go is at
+   0.93x of Orin on the same function. I have not isolated how much of the `fib` gap is overflow checks
+   versus other codegen choices.
+
+Further data points: `qsort_func` incurs 1.78M array growth reallocations (`push` into three fresh
+arrays per call, capacity not pre-sized) and uses 2x C's RSS; the COW machinery itself is cheap in these
+programs (`cow_copies` is 0-1 except in the compiler, where 21k copies of 163k make_unique calls occur).
+The self-compile workload allocates 1.02M objects and performs 1.74M retains; the compiler binary built
+by Orin takes 0.10 s versus 0.04 s for the Rust stage-0 compiler on the same source (not a like-for-like
+comparison of implementations). Binary size is a strength of the C-emitting design for small programs
+(31 KiB vs 2.2 MiB for Go) but this mostly reflects Go's bundled runtime. Orin's end-to-end build time
+(0.4 s, dominated by `cc`) is slower than a warm `go build` here; the Go number benefits from its build cache.
+
+## Suggested optimizations (hypotheses, not yet tested)
+
+- Inline fast paths of `orin_make_unique`, `orin_array_at`, `orin_array_slot_ptr`, `orin_array_push` into
+  the header (or build with `-flto`), and hoist uniqueness checks out of loops.
+- Avoid materialising `Option` for `pop().unwrap()` / `get(i).unwrap()` patterns (fuse in codegen, or
+  represent `Option<scalar>` unboxed).
+- Verified retain/release elision for borrowed-then-stored constructor arguments (spec 11 optimization order step 3),
+  starting with `Node(make(..), make(..))`-style owned temporaries; add a freelist/size-class allocator for
+  small structs.
+- Fuse string concatenation chains (`a + b + c`) into one allocation; pre-size array growth for `filter`-like push loops.
+- Use unchecked arithmetic where range analysis proves no overflow (never weakening safety), and measure how
+  much of `fib`'s gap overflow checks account for (e.g. by building with checks stubbed out, for diagnosis only).
