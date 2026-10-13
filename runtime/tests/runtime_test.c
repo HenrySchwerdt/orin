@@ -1,6 +1,9 @@
 /* Runtime-only tests. Build: cc -I runtime runtime/tests/runtime_test.c runtime/orin_runtime.c platform/orin_platform.c
  * Optionally with -fsanitize=address,undefined. Exits 0 and prints "ok" on success. */
+#define _GNU_SOURCE
 #include "orin_runtime.h"
+#include "orin_runtime_io.h"
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -134,8 +137,10 @@ static void test_misc(void) {
     CHECK(orin_tag(r) == 1 && streq(ORIN_REF(orin_res_unwrap_err(r)), "err"));
     orin_release(r);
     OrinObj *p = S("/definitely/not/here");
-    OrinObj *rd = orin_fs_read_file(p);
-    CHECK(orin_tag(rd) == 1 && !orin_fs_exists(p));
+    int64_t host = orin_cap_host_root(), fs = orin_cap_acquire(host, 1);
+    OrinObj *rd = orin_fs_read_file(fs, p);
+    CHECK(orin_tag(rd) == 1 && !orin_fs_exists(fs, p));
+    orin_cap_revoke(fs);
     orin_release(rd);
     orin_release(p);
 }
@@ -174,6 +179,111 @@ static void test_shape_traps(void) {
     orin_release(s);
 }
 
+
+/* ---- capability grants (ADR-0027) ---- */
+/* every temporary of test_grants is collected and released at its end (the suite runs under LeakSanitizer) */
+static OrinObj *keep[512];
+static int nkeep;
+static OrinObj *K(OrinObj *o) {
+    keep[nkeep++] = o;
+    return o;
+}
+#define S(x) K(orin_str_new((x), strlen(x)))
+#define orin_fs_read_file(...) K(orin_fs_read_file(__VA_ARGS__))
+#define orin_fs_write_file(...) K(orin_fs_write_file(__VA_ARGS__))
+static int64_t g_host, g_fs;
+static int trap_code(void (*fn)(void)) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        fn();
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+static void t_forged(void) { (void)orin_fs_exists(0x12345, S("/")); }
+static void t_file_as_grant(void) { /* a file-handle-shaped integer is not a grant */
+    (void)orin_fs_exists(((int64_t)7 << 8) | 0, S("/"));
+}
+static void t_stale(void) {
+    int64_t g = orin_cap_acquire(g_host, 1);
+    orin_cap_revoke(g);
+    (void)orin_fs_exists(g, S("/"));
+}
+static void t_wrong_kind(void) { (void)orin_process_args(g_fs); }
+static void t_double_revoke(void) {
+    int64_t g = orin_cap_acquire(g_host, 4);
+    orin_cap_revoke(g);
+    orin_cap_revoke(g);
+}
+static void t_clock_ok(void) { (void)orin_time_now_millis(orin_cap_acquire(g_host, 4)); }
+static void t_denied_exists(void) { (void)orin_fs_exists(g_fs, S("/")); }
+static void t_denied_args(void) { (void)orin_process_args(orin_cap_acquire(g_host, 2)); }
+static void t_nospawn(void) { (void)orin_io_shell(orin_cap_narrow(orin_cap_acquire(g_host, 2), 2, S("")), S("true")); }
+static void t_scope_exists(void) { (void)orin_fs_exists(orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in")), S("/etc")); }
+
+static void test_grants(void) {
+    unsetenv("ORIN_DENY");
+    g_host = orin_cap_host_root();
+    g_fs = orin_cap_acquire(g_host, 1);
+    CHECK(trap_code(t_forged) == 101 && trap_code(t_file_as_grant) == 101 && trap_code(t_stale) == 101);
+    CHECK(trap_code(t_wrong_kind) == 101 && trap_code(t_double_revoke) == 101);
+    CHECK(trap_code(t_clock_ok) == 0);
+    CHECK(trap_code(t_nospawn) == 101);
+    CHECK(system("rm -rf /tmp/orin_rt_scope && mkdir -p /tmp/orin_rt_scope/in /tmp/orin_rt_scope/out && "
+                 "echo hi > /tmp/orin_rt_scope/in/a.txt && echo secret > /tmp/orin_rt_scope/out/s.txt && "
+                 "ln -s ../out /tmp/orin_rt_scope/in/esc") == 0);
+    int64_t in = orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in"));
+    OrinObj *r = orin_fs_read_file(in, S("/tmp/orin_rt_scope/in/a.txt"));
+    CHECK(orin_tag(r) == 0);
+    CHECK(orin_fs_exists(in, S("/tmp/orin_rt_scope/in/a.txt")));
+    r = orin_fs_read_file(in, S("/tmp/orin_rt_scope/out/s.txt")); /* absolute, outside */
+    CHECK(orin_tag(r) == 1 && streq(ORIN_REF(orin_res_unwrap_err(r)), "cannot read '/tmp/orin_rt_scope/out/s.txt': outside the granted file scope"));
+    r = orin_fs_read_file(in, S("/tmp/orin_rt_scope/in/../out/s.txt")); /* ../ */
+    CHECK(orin_tag(r) == 1);
+    r = orin_fs_read_file(in, S("/tmp/orin_rt_scope/in/esc/s.txt")); /* symlink to outside */
+    CHECK(orin_tag(r) == 1);
+    CHECK(orin_file_open(in, S("/tmp/orin_rt_scope/in/esc/s.txt"), 0) == -100002);
+    CHECK(orin_tag(orin_fs_write_file(in, S("/tmp/orin_rt_scope/in/esc/new.txt"), S("x"))) == 1);
+    CHECK(orin_tag(orin_fs_write_file(in, S("/tmp/orin_rt_scope/in/new.txt"), S("x"))) == 0);
+    /* narrowing never widens */
+    int64_t wide = orin_cap_narrow(in, 0, S("/tmp/orin_rt_scope"));
+    CHECK(orin_tag(orin_fs_read_file(wide, S("/tmp/orin_rt_scope/out/s.txt"))) == 1);
+    CHECK(orin_tag(orin_fs_read_file(wide, S("/tmp/orin_rt_scope/in/a.txt"))) == 0);
+    int64_t disjoint = orin_cap_narrow(in, 0, S("/tmp/orin_rt_scope/out"));
+    CHECK(orin_tag(orin_fs_read_file(disjoint, S("/tmp/orin_rt_scope/out/s.txt"))) == 1);
+    CHECK(orin_tag(orin_fs_read_file(disjoint, S("/tmp/orin_rt_scope/in/a.txt"))) == 1);
+    /* read-only */
+    int64_t ro = orin_cap_narrow(in, 1, S(""));
+    CHECK(orin_tag(orin_fs_read_file(ro, S("/tmp/orin_rt_scope/in/a.txt"))) == 0);
+    CHECK(orin_tag(orin_fs_write_file(ro, S("/tmp/orin_rt_scope/in/b.txt"), S("x"))) == 1);
+    CHECK(orin_file_open(ro, S("/tmp/orin_rt_scope/in/b.txt"), 1) == -100003);
+    int64_t fh = orin_file_open(ro, S("/tmp/orin_rt_scope/in/a.txt"), 0);
+    CHECK(fh > 0);
+    orin_release(orin_file_close(fh));
+    /* relative scopes resolve against the working directory */
+    CHECK(system("mkdir -p /tmp/orin_rt_scope/rel") == 0);
+    CHECK(trap_code(t_scope_exists) == 101);
+    orin_cap_revoke(ro); orin_cap_revoke(disjoint); orin_cap_revoke(wide); orin_cap_revoke(in);
+    CHECK(system("rm -rf /tmp/orin_rt_scope") == 0);
+    /* host policy: families named in ORIN_DENY are refused (re-read by orin_cap_host_root) */
+    setenv("ORIN_DENY", "fs,process", 1);
+    g_host = orin_cap_host_root();
+    g_fs = orin_cap_acquire(g_host, 1);
+    OrinObj *d = orin_fs_read_file(g_fs, S("/etc/passwd"));
+    CHECK(orin_tag(d) == 1 && streq(ORIN_REF(orin_res_unwrap_err(d)), "cannot read '/etc/passwd': denied by the host policy (ORIN_DENY)"));
+    CHECK(orin_file_open(g_fs, S("/etc/passwd"), 0) == -100001);
+    CHECK(trap_code(t_denied_exists) == 101 && trap_code(t_denied_args) == 101);
+    CHECK(trap_code(t_clock_ok) == 0); /* clock is not denied */
+    unsetenv("ORIN_DENY");
+    while (nkeep) orin_release(keep[--nkeep]);
+}
+#undef S
+#undef orin_fs_read_file
+#undef orin_fs_write_file
+
 int main(int argc, char **argv) {
     orin_init(argc, argv);
     test_strings();
@@ -181,6 +291,7 @@ int main(int argc, char **argv) {
     test_deep_chain();
     test_misc();
     test_shape_traps();
+    test_grants();
     if (failures) return 1;
     printf("ok\n");
     orin_flush();

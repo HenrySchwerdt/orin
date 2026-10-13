@@ -25,9 +25,9 @@ _Static_assert(offsetof(OrinStruct, slots) == 32, "OrinStruct.slots");
 _Static_assert(ORIN_K_ARRAY == 2, "ORIN_K_ARRAY (hard-coded in @orinl_array_slot / @orinl_array_push)");
 _Static_assert(ORIN_K_STRUCT == 3, "ORIN_K_STRUCT (hard-coded in @orinl_slot)");
 
-OrinObj *orinl_io_read_bytes(uint64_t n) { return orin_io_read_bytes(n); }
-OrinObj *orinl_io_read_line(void) { return orin_io_read_line(); }
-void orinl_io_write_stdout(OrinObj *s) { orin_io_write_stdout(s); }
-int64_t orinl_io_shell(OrinObj *cmd) { return orin_io_shell(cmd); }
-int64_t orinl_time_now_millis(void) { return orin_time_now_millis(); }
+OrinObj *orinl_io_read_bytes(int64_t g, uint64_t n) { return orin_io_read_bytes(g, n); }
+OrinObj *orinl_io_read_line(int64_t g) { return orin_io_read_line(g); }
+void orinl_io_write_stdout(int64_t g, OrinObj *s) { orin_io_write_stdout(g, s); }
+int64_t orinl_io_shell(int64_t g, OrinObj *cmd) { return orin_io_shell(g, cmd); }
+int64_t orinl_time_now_millis(int64_t g) { return orin_time_now_millis(g); }
 int64_t orinl_str_char_code_at(OrinObj *s, uint64_t i) { return orin_str_char_code_at(s, i); }

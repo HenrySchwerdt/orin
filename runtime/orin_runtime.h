@@ -125,7 +125,7 @@ void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0
  * At most 256 files are open at the same time (open fails with EMFILE beyond that). Streams still open at
  * process end (a trap inside the scope callback, process.exit) are flushed and closed by an exit hook. Errors
  * of read/write/flush are sticky per file and are reported by the close that ends the scope. */
-int64_t orin_file_open(OrinObj *path, int64_t mode);  /* mode 0 read, 1 write (truncate), 2 append */
+int64_t orin_file_open(int64_t fs, OrinObj *path, int64_t mode); /* mode 0 read, 1 write (truncate), 2 append; fs = file grant */
 int64_t orin_file_is_open(int64_t h);                 /* 1 if h came from a successful open, else 0 */
 OrinObj *orin_file_open_error(int64_t h);             /* string: why the open failed (h <= 0) */
 OrinObj *orin_file_close(int64_t h);                  /* Option<string>: Some(message) if any operation failed */
@@ -394,10 +394,20 @@ OrinObj *orin_array_join(OrinObj *a, OrinObj *sep); /* string[] -> string */
 
 void orin_console_log(OrinObj *s);   /* stdout (buffered) + "\n" */
 void orin_console_error(OrinObj *s); /* flushes stdout first, then stderr + "\n" */
-OrinObj *orin_fs_read_file(OrinObj *path);                 /* Result<string,string> */
-OrinObj *orin_fs_write_file(OrinObj *path, OrinObj *data); /* Result<void,string> */
-int64_t orin_fs_exists(OrinObj *path);
-OrinObj *orin_process_args(void); /* new string[] (without program name) */
+OrinObj *orin_fs_read_file(int64_t fs, OrinObj *path);                 /* Result<string,string> */
+OrinObj *orin_fs_write_file(int64_t fs, OrinObj *path, OrinObj *data); /* Result<void,string> */
+int64_t orin_fs_exists(int64_t fs, OrinObj *path);
+OrinObj *orin_process_args(int64_t proc); /* new string[] (without program name) */
+
+/* ---------------------------------------------------------------- capability grants (ADR-0021 Stage A, ADR-0027)
+ * Every privileged operation above and in orin_runtime_io.h takes a grant handle first (int64_t, tagged, generation-
+ * checked; see orin_runtime.c). The root handle of the program is created only here, for `main(host: Host)`. */
+int64_t orin_cap_host_root(void);                              /* the Host handle; reads ORIN_DENY (traps if malformed) */
+int64_t orin_cap_acquire(int64_t host, int64_t family);        /* family 1 fs, 2 process, 3 stdio, 4 clock */
+int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg); /* op 0 fs under(arg), 1 fs readOnly, 2 process argsOnly */
+void orin_cap_revoke(int64_t grant);                           /* end of the scope that acquired / narrowed it */
+void orin_cap_require(int64_t grant, int64_t kind, const char *what); /* traps unless valid, of `kind` and not denied */
+void orin_cap_require_spawn(int64_t proc);                     /* traps unless the process grant may spawn */
 void orin_process_exit(int64_t code) __attribute__((noreturn)); /* flushes stdout */
 
 #ifdef __cplusplus
