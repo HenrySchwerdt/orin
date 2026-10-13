@@ -3,7 +3,7 @@
 //   orin api [--check <snapshot>] <entry.or | package-dir>   public API snapshot / change detection
 //   orin graph <entry.or | package-dir> [-o out.json]   OSIG snapshot (docs/osig.md)
 //   orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html]   OSIG diff report
-//   orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--c-builtins] [--check-contracts]
+//   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--check-contracts]
 //       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
 //   orin lsp                 language server on stdio (spec 18)
@@ -14,7 +14,7 @@
 //   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
 //   (compile/mir/verify run the MIR optimiser, compiler/opt, unless --no-opt is given)
 //   compile/mir/verify load the std prelude (std/, spec 19 R1) implicitly: moved built-ins call
-//   Orin code. --c-builtins (implied by --legacy-codegen) skips it and keeps the C runtime path.
+//   Orin code. --c-builtins skips it and keeps the C runtime path.
 
 import { args, exit } from "std:process";
 import { writeFile } from "std:fs";
@@ -27,7 +27,6 @@ import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
 import { moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff, runGraph, runDiff } from "./analysis";
 import { readFile } from "std:fs";
-import { generate, supportsLegacy } from "./codegen";
 import { lower } from "./lower";
 import { emitC } from "./cemit";
 import { emitLlvm } from "./llvm";
@@ -39,7 +38,7 @@ import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] [--deps] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
+  console.error("usage:\n  orin check [--format=json] [--deps] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
   exit(2);
 }
 
@@ -116,7 +115,6 @@ function main(): void {
     return;
   }
   let json = false;
-  let legacy = false;
   let noVerify = false;
   let noOpt = false;
   let llvm = false;
@@ -157,8 +155,6 @@ function main(): void {
       ai += 1;
     } else if (a == "--format=json") {
       json = true;
-    } else if (a == "--legacy-codegen") {
-      legacy = true;
     } else if (a == "--no-verify") {
       noVerify = true;
     } else if (a == "--no-opt") {
@@ -188,7 +184,7 @@ function main(): void {
     usage();
     return;
   }
-  const usePrelude = !cBuiltins && !legacy && cmd != "check" && cmd != "api";
+  const usePrelude = !cBuiltins && cmd != "check" && cmd != "api";
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(entry, noOverlay, usePrelude ? preludeRoots() : noPreludeRoots());
   if (loaded.diags.length > 0) {
@@ -271,22 +267,13 @@ function main(): void {
     return;
   }
   let c = "";
-  if (legacy) {
-    if (!supportsLegacy(checked.unwrap())) {
-      console.error("error: internal compiler error: the legacy backend (--legacy-codegen) does not support closures, function values or interfaces; use the default MIR backend");
-      exit(70);
-      return;
-    }
-    c = generate(checked.unwrap());
-  } else {
-    const mir = noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()));
-    if (!noVerify && runVerify(mir, false) > 0) {
-      console.error("error: internal compiler error: MIR ownership verification failed");
-      exit(70);
-      return;
-    }
-    c = llvm ? emitLlvm(pruneProgram(mir)) : emitC(pruneProgram(mir));
+  const mir = noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()));
+  if (!noVerify && runVerify(mir, false) > 0) {
+    console.error("error: internal compiler error: MIR ownership verification failed");
+    exit(70);
+    return;
   }
+  c = llvm ? emitLlvm(pruneProgram(mir)) : emitC(pruneProgram(mir));
   const written = writeFile(argv[3], c);
   if (written.isErr()) {
     console.error("error: cannot write " + argv[3] + ": " + written.unwrapErr());

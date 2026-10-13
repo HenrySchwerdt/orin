@@ -4,8 +4,6 @@
   self-hosted compiler additionally accepts simple generics (ADR-0007: no bounds, no generic
   methods, no default type arguments; instantiation depth limit 32, E0413).
 - Memory safety is not formally established; see architecture.md "Safety status".
-- Stage 0 stores string literals as Rust `String`: `\xHH` escapes ≥ 0x80 that are not valid UTF-8
-  become U+FFFD under Stage 0 (the self-hosted compiler keeps raw bytes).
 - Early exits from inside expressions (`?`, diverging match arms) may leak temporaries (safe, not
   freed). Records/variants are limited to 64 slots.
 - No hash maps in Orin-B; compiler symbol tables use linear search.
@@ -13,7 +11,7 @@
   E0401; no recursive arrows, E0300); no `function` expressions, default/rest parameters or generic arrows;
   an arrow as a `?:` branch needs parentheses; parameter types of an arrow need an expected function type
   (or annotations, E0407); builtin functions (`parseInt`, ...) and class methods cannot be used as values;
-  the legacy backend (`--legacy-codegen`) rejects programs with closures. Array methods: `indexOf` /
+  Array methods: `indexOf` /
   `includes` only for `int`, `usize`, `bool`, `string` elements (E0405 otherwise); `sort` is O(n log n) with
   O(n) extra allocation per level; the callbacks' integer results must be `int` (`.toInt()` on lengths).
 - Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic methods (E0460), static fields, getters/setters, `protected`. Private members are
@@ -33,8 +31,7 @@
   implementation is E0418), one bound per type parameter (`T extends A & B` is E0408). A class converts
   implicitly to the interfaces it declares (the only implicit conversion; not lifted over arrays); no
   downcasts, no `instanceof`, `==` on interface values is E0410. Interface values are boxed (one allocation
-  per conversion, one indirect call per method call); the legacy `--legacy-codegen` backend rejects programs
-  that use interfaces. Go-to-definition from a call on a bounded type parameter inside a generic body
+  per conversion, one indirect call per method call). Go-to-definition from a call on a bounded type parameter inside a generic body
   resolves to the interface method; hover shows the implementations of an interface.
 - Built-in annotations (ADR-0024, self-hosted compiler only): only `@Test`, `@Deprecated`, `@Inline` exist;
   any other `@Name` is E0408 and user-defined annotations are post-1.0. `orin test` runs `void` tests that fail by

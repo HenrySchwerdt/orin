@@ -1,22 +1,16 @@
 #!/bin/sh
-# Regenerate bootstrap/seed/ from the current compiler/ (ADR-0014).
-#   tools/update_seed.sh                 bootstrap from the current seed (normal case)
-#   tools/update_seed.sh --from-stage0   bootstrap from the Rust Stage 0 (first seed / independent re-root)
+# Regenerate seed/ from the current compiler/ (ADR-0014).
+#   tools/update_seed.sh                 bootstrap from the current seed
 # The new seed is stage2.c, i.e. the C of the compiler as compiled by a compiler built from the
 # *previous* root. Commit the result in a PR that shows the full bootstrap from the old seed.
 set -eu
 cd "$(dirname "$0")/.."
-SEED=bootstrap/seed
+SEED=seed
 B=build/bootstrap
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
-if [ "${1:-}" = "--from-stage0" ]; then
-  how="Rust Stage 0 (bootstrap/) via tools/bootstrap.sh --from-stage0"
-  ./tools/bootstrap.sh --from-stage0
-else
-  prev=$(sed -n 's/^source-commit: *//p' $SEED/SEED_INFO | head -n1)
-  how="previous seed (source commit ${prev:-unknown}) via tools/bootstrap.sh"
-  ./tools/bootstrap.sh
-fi
+prev=$(sed -n 's/^source-commit: *//p' $SEED/SEED_INFO | head -n1)
+how="previous seed (source commit ${prev:-unknown}) via tools/bootstrap.sh"
+./tools/bootstrap.sh
 mkdir -p $SEED
 gzip -9n -c $B/stage2.c > $SEED/orin-seed.c.gz
 cat > $SEED/SEED_INFO <<INFO

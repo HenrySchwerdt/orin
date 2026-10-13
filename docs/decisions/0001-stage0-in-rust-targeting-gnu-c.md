@@ -13,3 +13,8 @@ The self-hosted compiler (Stage 1+) also emits C against `runtime/`, and Stage 2
 checked on that C. C remains the production backend until benchmarks (spec 11) justify
 LLVM/Cranelift. The C compiler is a platform tool and part of the trusted computing base
 (spec 07); formal safety claims stop at the memory IR, not the native artifact.
+
+## Note (added later)
+
+Stage 0 is retired and archived on the branch `archive/stage0-final` (commit `ec1ba3e`); see
+`docs/bootstrap.md`, "Retired Stage 0", and ADR-0014.
