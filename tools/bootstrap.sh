@@ -7,6 +7,7 @@ CC=${CC:-cc}
 CFLAGS=${CFLAGS:--O2 -w}
 B=build/bootstrap
 mkdir -p "$B"
+python3 tools/gen_prelude.py --check
 (cd bootstrap && cargo build --release -q)
 ORINB=bootstrap/target/release/orinb
 cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c -o "$2"; }
