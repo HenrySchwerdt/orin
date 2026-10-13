@@ -4,7 +4,8 @@
  * C library. Nothing outside platform/ may call libc directly (tools/check_platform_boundary.sh).
  * Adding a function needs an ADR.
  *
- * Rules for this layer: no data structures, no global state beyond argc/argv, no knowledge of Orin
+ * Rules for this layer: no data structures (one opaque OS handle type, `orin_platform_stream`, excepted),
+ * no global state beyond argc/argv, no knowledge of Orin
  * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 lines including
  * comments. Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
  *
@@ -230,6 +231,63 @@ int orin_platform_file_write(const char *path, size_t plen, const char *data, si
     ensures \result == 1 <==> path has no NUL byte and stat(2) on it succeeds; otherwise 0;
     assigns \nothing; */
 int orin_platform_file_exists(const char *path, size_t plen);
+
+/* ---------------------------------------------------------------- file streams (ADR-0025)
+ * An open file for incremental reading and writing (the substrate of the resource handle `File` of
+ * std:fs). `orin_platform_stream` is an opaque OS handle owned by the caller between open and close
+ * (it is the one object type of this layer; the runtime keeps the table of open streams). A stream
+ * records the FIRST error of any operation on it (sticky): later operations still run, the code is
+ * reported by orin_platform_stream_error and, finally, by orin_platform_stream_close. Streams are
+ * block-buffered by the platform; close (and flush) deliver the buffered bytes to the OS. */
+typedef struct orin_platform_stream orin_platform_stream;
+#define ORIN_PLATFORM_STREAM_READ 0   /* existing file, reading only */
+#define ORIN_PLATFORM_STREAM_WRITE 1  /* create or truncate, writing only */
+#define ORIN_PLATFORM_STREAM_APPEND 2 /* create if missing, every write goes to the end */
+
+/*@ requires (plen == 0 || path[0..plen-1] readable) && \valid(out);
+    ensures path contains a NUL byte || mode not in {READ, WRITE, APPEND} ==> \result == ORIN_PLATFORM_EINVAL
+            and nothing is opened;
+    ensures \result == 0 ==> *out is a fresh open stream (opened with the given mode) that the caller must
+            pass to orin_platform_stream_close exactly once;
+    ensures \result != 0 ==> *out == NULL, \result is an errno-style code (ENOMEM, ENOENT, EACCES, EISDIR,
+            EMFILE, ...), nothing needs to be closed;
+    assigns *out, \fs; */
+int orin_platform_stream_open(const char *path, size_t plen, int mode, orin_platform_stream **out);
+
+/*@ requires s is open && (n == 0 || \valid(buf + (0..n-1)));
+    ensures 0 <= \result <= n; buf[0..\result-1] holds the next \result bytes of the stream;
+    ensures \result < n ==> end of file or an error (then orin_platform_stream_error(s) != 0);
+    assigns buf[0..n-1], *s; */
+size_t orin_platform_stream_read(orin_platform_stream *s, char *buf, size_t n);
+
+/*@ requires s is open;
+    ensures \result == -1 (end of file or error) or the next byte of the stream as 0..255;
+    assigns *s; */
+int orin_platform_stream_getc(orin_platform_stream *s);
+
+/*@ requires s is open && (n == 0 || p[0..n-1] readable);
+    ensures 0 <= \result <= n; \result < n ==> an error occurred (orin_platform_stream_error(s) != 0);
+    ensures the \result bytes were handed to the stream's buffer (not necessarily to the OS yet);
+    assigns *s, \fs; */
+size_t orin_platform_stream_write(orin_platform_stream *s, const char *p, size_t n);
+
+/*@ requires s is open;
+    ensures the buffered bytes were handed to the OS; \result == orin_platform_stream_error(s) afterwards
+            (0 = no operation has failed so far; a failing flush sets the sticky error);
+    assigns *s, \fs; */
+int orin_platform_stream_flush(orin_platform_stream *s);
+
+/*@ requires s is open;
+    ensures \result == 0 if no operation on s has failed so far, else the errno-style code of the first failure;
+    assigns \nothing; */
+int orin_platform_stream_error(const orin_platform_stream *s);
+
+/*@ requires s is open;
+    ensures the buffered bytes were delivered to the OS and the file is closed; \result == 0 if neither an
+            earlier operation nor the final flush/close failed, else the code of the first failure;
+    ensures s is dead afterwards (it must not be used or closed again);
+    assigns *s, \fs; */
+int orin_platform_stream_close(orin_platform_stream *s);
 
 #ifdef __cplusplus
 }

@@ -32,7 +32,8 @@ _Updated: 2026-10-13_
 | Interfaces (ADR-0019) | done |
 | Fixed-width integers (`i8`..`u64`, `isize`, `usize`; 128-bit deferred, E0431) and template-literal interpolation (ADR-0022) | done |
 | Built-in annotations `@Test` (`orin test`, `std:test`), `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) | done |
-| Resources, capabilities (ADR-0020/0021) | not started |
+| Resources (`File`, ADR-0025): checker + verifier rules, scope API, streaming `std:fs` (unstable until capabilities) | done |
+| Capabilities (ADR-0020/0021) | not started |
 | Concurrency (ADR-0017), incremental analysis | not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
@@ -42,6 +43,6 @@ _Updated: 2026-10-13_
 See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-software tracks of
 ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 1. Interfaces + contract clauses phase 1 merged; OSIG/`orin graph`/`orin diff` started in parallel.
-2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), resources, generic classes → language freeze; capabilities (ADR-0021) → std I/O freeze.
+2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), ~~resources~~ (done, ADR-0025), generic classes → language freeze; capabilities (ADR-0021) → std I/O freeze.
 3. Compiler rewrite with the full language and MIR source spans (ADR-0015).
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.

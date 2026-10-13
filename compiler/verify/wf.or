@@ -3,7 +3,7 @@
 // of range. Each check returns an error message, or "" when the item is well-formed.
 
 import { MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase } from "../mir";
-import { UnOp, BinOp } from "../hir";
+import { UnOp, BinOp, Builtin } from "../hir";
 
 // Operand/local classes.
 export const CInt: int = 0;
@@ -12,6 +12,7 @@ export const CBool: int = 2;
 export const CRef: int = 3;
 export const CVoid: int = 4;
 export const CFloat: int = 5;
+export const CHandle: int = 6;   // resource handle (v1.8, ADR-0025)
 
 export function tyClass(t: MType): int {
   return match (t) {
@@ -19,6 +20,7 @@ export function tyClass(t: MType): int {
     MUsize => 1,
     MBool => 2,
     MFloat => 5,
+    MHandle => 6,
     MRef => 3,
     MVoid => 4
   };
@@ -59,6 +61,24 @@ function isLocal(o: Operand, l: usize): bool {
   };
 }
 
+// Operand of class handle (a resource handle may only be an argument of a call, see handleMsg).
+function isHandleOp(f: MFunction, o: Operand): bool {
+  return match (o) {
+    OLocal(l) => l < f.locals.length && localClass(f, l) == CHandle,
+    _ => false
+  };
+}
+
+// None of `os` is a resource handle (a handle is never stored, captured or boxed).
+function noHandles(f: MFunction, os: Operand[]): bool {
+  for (const o of os) {
+    if (isHandleOp(f, o)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function opsOk(p: MProgram, f: MFunction, os: Operand[]): bool {
   for (const o of os) {
     if (!opOk(p, f, o)) {
@@ -80,7 +100,7 @@ function opIs(p: MProgram, f: MFunction, o: Operand, c: int): bool {
 
 function constsOk(p: MProgram, f: MFunction, os: Operand[], isRef: bool): bool {
   for (const o of os) {
-    if (!opOk(p, f, o) || (opClass(f, o) == CRef) != isRef) {
+    if (!opOk(p, f, o) || (opClass(f, o) == CRef) != isRef || opClass(f, o) == CHandle) {
       return false;
     }
   }
@@ -105,8 +125,8 @@ function binOk(f: MFunction, op: BinOp, d: usize, a: Operand, b: Operand): bool 
     OpMul => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == ca,
     OpDiv => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == ca,
     OpRem => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
-    OpEq => ca == cb && cd == CBool,
-    OpNe => ca == cb && cd == CBool,
+    OpEq => ca == cb && ca != CHandle && cd == CBool,
+    OpNe => ca == cb && ca != CHandle && cd == CBool,
     OpLt => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
     OpLe => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
     OpGt => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
@@ -175,6 +195,9 @@ function closureMsg(p: MProgram, f: MFunction, d: usize, fi: usize, caps: Operan
       return "IClosure: the lifted function " + g.name + " must have only borrowed parameters";
     }
   }
+  if (!noHandles(f, caps)) {
+    return "IClosure: a resource handle cannot be captured";
+  }
   return opsOk(p, f, caps) ? "" : "IClosure: bad capture operand";
 }
 
@@ -192,14 +215,119 @@ function refPair(f: MFunction, a: usize, b: usize): bool {
 
 // `v` (a consumed/stored operand) must be well-formed and not the object being written.
 function valueOk(p: MProgram, f: MFunction, x: usize, v: Operand): bool {
-  return opOk(p, f, v) && !isLocal(v, x);
+  return opOk(p, f, v) && !isLocal(v, x) && !isHandleOp(f, v);
+}
+
+// ---- resource handles (v1.8, ADR-0025): the structural half of the rules (the dataflow half is in rules.or) ----
+
+// Builtins that take a handle as their first argument (every file builtin but the one that creates handles).
+function takesHandle(b: Builtin): bool {
+  return match (b) {
+    BFileIsOpen => true,
+    BFileOpenError => true,
+    BFileClose => true,
+    BFileReadLine => true,
+    BFileRead => true,
+    BFileReadAll => true,
+    BFileWrite => true,
+    BFileWriteLine => true,
+    BFileFlush => true,
+    _ => false
+  };
+}
+
+function isOpenB(b: Builtin): bool {
+  return match (b) { BFileOpen => true, _ => false };
+}
+
+// The destination local an instruction defines, if any.
+function dstOf(ins: Instr): Option<usize> {
+  return match (ins) {
+    ICopy(d, _) => Some(d),
+    IMove(d, _) => Some(d),
+    IBorrow(d, _) => Some(d),
+    IDup(d, _) => Some(d),
+    IUnary(d, _, _) => Some(d),
+    IBinary(d, _, _, _) => Some(d),
+    ICall(dst, _, _) => dst,
+    IBuiltin(dst, _, _) => dst,
+    IStructNew(d, _, _) => Some(d),
+    INullary(d, _) => Some(d),
+    ITag(d, _) => Some(d),
+    IGetField(d, _, _) => Some(d),
+    ITakeField(d, _, _) => Some(d),
+    IArrayNew(d, _, _) => Some(d),
+    IArrayGet(d, _, _) => Some(d),
+    IArrayTake(d, _, _) => Some(d),
+    IArrayPop(d, _) => Some(d),
+    IClosure(d, _, _) => Some(d),
+    ICallIndirect(dst, _, _) => dst,
+    IIface(d, _, _) => Some(d),
+    ICallVirtual(dst, _, _, _) => dst,
+    _ => None
+  };
+}
+
+// First violated handle rule of `ins` ("" if none). Runs after the other structural checks, so every index is in range.
+//   * a handle local is defined only by IBuiltin(Some(h), BFileOpen, ..): never by a copy, move, borrow, call result,
+//     field/element read, arithmetic ...;
+//   * BFileOpen defines exactly a handle; the other file builtins take a handle as first argument and non-handles
+//     after it; no other builtin sees a handle (no conversion, comparison or printing of one);
+//   * handles are not compared (IBinary), not stored/captured/boxed (the slot/value checks above), not returned.
+function handleMsg(f: MFunction, ins: Instr): string {
+  match (dstOf(ins)) {
+    Some(d) => {
+      if (localClass(f, d) == CHandle) {
+        match (ins) {
+          IBuiltin(_dst, b, _args) => {
+            if (!isOpenB(b)) {
+              return "IBuiltin: only BFileOpen may define a resource handle";
+            }
+          },
+          _ => { return "a resource handle is defined only by BFileOpen (it cannot be copied, moved, borrowed, read from a field or returned by a call)"; }
+        }
+      }
+    },
+    None => {}
+  }
+  match (ins) {
+    IBuiltin(dst, b, args) => {
+      if (isOpenB(b)) {
+        if (!noHandles(f, args)) { return "BFileOpen: arguments cannot be resource handles"; }
+        match (dst) {
+          Some(d) => { return localClass(f, d) == CHandle ? "" : "BFileOpen: the destination must be a handle local"; },
+          None => { return "BFileOpen: the handle must be bound to a local (it would never be closed)"; }
+        }
+      }
+      if (takesHandle(b)) {
+        if (args.length == 0 || !isHandleOp(f, args[0])) { return "file builtin: the first argument must be a resource handle"; }
+        let i: usize = 1;
+        while (i < args.length) {
+          if (isHandleOp(f, args[i])) { return "file builtin: only the first argument can be a resource handle"; }
+          i += 1;
+        }
+        return "";
+      }
+      return noHandles(f, args) ? "" : "a resource handle can only be passed to calls and file builtins";
+    },
+    _ => { return ""; }
+  }
 }
 
 export function wfInstr(p: MProgram, f: MFunction, ins: Instr): string {
+  const base = wfInstrBase(p, f, ins);
+  if (base != "") {
+    return base;
+  }
+  return handleMsg(f, ins);
+}
+
+function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
   return match (ins) {
     ICopy(d, o) => {
       if (d >= f.locals.length || !opOk(p, f, o)) { return "ICopy: bad local or operand"; }
       if (opClass(f, o) != localClass(f, d)) { return "ICopy: operand and destination classes differ"; }
+      if (localClass(f, d) == CHandle) { return "ICopy of a resource handle (handles are never copied)"; }
       if (localClass(f, d) == CRef && !isStr(o)) { return "ICopy of a reference local (use IMove/IDup/IBorrow)"; }
       return "";
     },
@@ -218,7 +346,10 @@ export function wfInstr(p: MProgram, f: MFunction, ins: Instr): string {
       if (!isCls(f, x, CRef) || !opIs(p, f, y, CRef)) { return "IStrAppend: needs reference operands"; }
       return isLocal(y, x) ? "IStrAppend: appending a string to itself" : "";
     },
-    IStructNew(d, _, slots) => (isCls(f, d, CRef) && opsOk(p, f, slots)) ? "" : "IStructNew: bad destination or slot operand",
+    IStructNew(d, _, slots) => {
+      if (isCls(f, d, CRef) && !noHandles(f, slots)) { return "IStructNew: a resource handle cannot be stored"; }
+      return (isCls(f, d, CRef) && opsOk(p, f, slots)) ? "" : "IStructNew: bad destination or slot operand";
+    },
     INullary(d, _) => isCls(f, d, CRef) ? "" : "INullary: destination must be a reference local",
     ITag(d, o) => (isCls(f, d, CInt) && opIs(p, f, o, CRef)) ? "" : "ITag: needs an int destination and a reference operand",
     IGetField(d, o, _) => (d < f.locals.length && refLocalOp(f, o)) ? "" : "IGetField: bad destination or object",
@@ -304,6 +435,7 @@ export function wfFunction(f: MFunction): string {
     if (f.paramOwned[i] && tyClass(f.locals[i].ty) != CRef) { return "owned parameter `" + f.locals[i].name + "` is not a reference"; }
     i += 1;
   }
+  if (tyClass(f.ret) == CHandle) { return "function returns a resource handle (a handle cannot be returned)"; }
   if (f.blocks.length == 0) { return "function has no blocks"; }
   for (const l of f.locals) {
     if (tyClass(l.ty) == CVoid) { return "local `" + l.name + "` has type void"; }

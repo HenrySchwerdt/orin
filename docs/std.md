@@ -7,7 +7,8 @@ API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
 |---|---|---|
-| `std:fs`, `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done, **unstable** until capabilities (ADR-0016 amendment, ADR-0021) |
+| `std:fs` | Orin, `stdlib/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done, **unstable** until capabilities (ADR-0016 amendment, ADR-0021); resources and streaming: ADR-0025 |
+| `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done |
 | `std:path` | Orin, `stdlib/path.or` | done (POSIX, lexical) |
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
 | `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; clock access **unstable** until capabilities |
@@ -31,6 +32,46 @@ unit (`$stdlib/json.Json`).
 The single new built-in is `nowMillis(): int` (`hir.BTimeNowMillis`, C function
 `orin_time_now_millis` in `runtime/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
 It is reachable as the internal module `std:clock`; `std:time` re-exports it. Use `std:time`.
+
+## std:fs (UNSTABLE: signatures may gain a capability parameter, ADR-0021)
+
+Whole-file functions (unchanged): `readFile(path): Result<string, string>`, `writeFile(path, data): Result<void, string>`,
+`exists(path): bool`.
+
+Streaming through **resource handles** (ADR-0025, spec 06). `File` is a handle, not a value: it can only be a
+function parameter. You get one as the parameter of the callback of a scope function, which opens the file, runs
+the callback and closes the file on every path:
+
+```
+type FsError = string                       type FileMode = Read | Write | Append
+withFile<T>(path, mode, body: (file: File) => T): Result<T, FsError>
+useFile(path, mode, body: (file: File) => void): Result<void, FsError>      // body returns nothing
+withFiles<T>(pathA, modeA, pathB, modeB, body: (a: File, b: File) => T): Result<T, FsError>
+useFiles(pathA, modeA, pathB, modeB, body: (a: File, b: File) => void): Result<void, FsError>
+
+File.readLine(): Option<string>      // without "\n" / "\r\n"; None at end of file
+File.read(n: usize): Option<string>  // up to n bytes; None only at end of file (n > 0); read(0) = Some("")
+File.readAll(): string               // the rest of the file
+File.write(s: string): void          File.writeLine(s: string): void       File.flush(): void
+```
+
+`Err` is returned when the file cannot be opened (the body does not run) or when any read, write, flush or the final
+close failed (the file remembers its first error; the body's value is then dropped). Wrong-mode use (writing a
+`Read` file) is such an error, not a compile error. Not allowed on a `File` (compile errors): storing it in a
+record/class/array/`Option`/`Result`/`Map`, returning it, assigning it to a variable (`const g = f`), capturing it
+in a closure (so a nested scope cannot use the outer handle: use `withFiles`), comparing it, converting it to a
+string (E0450, E0451, E0452; `docs/decisions/0025-resources-and-streaming-fs.md`). A trap or `process.exit` inside
+a body ends the process; the runtime flushes and closes open files in its exit hook. At most 256 files are open at
+the same time. Example:
+
+```
+const n = withFile("log.txt", Read, f => {
+  let lines: int = 0;
+  while (f.readLine().isSome()) { lines += 1; }
+  return lines;
+});
+useFiles("in.txt", Read, "out.txt", Write, (a, b) => { while (true) { const l = a.readLine(); if (l.isNone()) { return; } b.writeLine(l.unwrap()); } });
+```
 
 ## std:path (POSIX, lexical)
 
@@ -113,4 +154,5 @@ use a different tag per logical graph.
 * No floats/`Map`: `JNum` is `int`, no `std:math`, `std:map`, edge weights, `sleep`, fractional seconds.
 * Generic classes/methods do not exist yet, hence the functional `std:graph` API.
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
-* `std:clock` is importable but internal.
+* `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close primitives behind `std:fs`; only library code may import it).
+* `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.

@@ -232,3 +232,87 @@ int orin_platform_file_exists(const char *path, size_t plen) {
     orin_platform_free(p);
     return r;
 }
+
+/* ---------------------------------------------------------------- file streams */
+
+struct orin_platform_stream {
+    FILE *f;
+    int err; /* first error code, 0 = none (sticky) */
+};
+
+static void stream_fail(orin_platform_stream *s, int code) {
+    if (s->err == 0) s->err = code ? code : EIO;
+}
+
+int orin_platform_stream_open(const char *path, size_t plen, int mode, orin_platform_stream **out) {
+    *out = NULL;
+    if (mode != ORIN_PLATFORM_STREAM_READ && mode != ORIN_PLATFORM_STREAM_WRITE && mode != ORIN_PLATFORM_STREAM_APPEND)
+        return ORIN_PLATFORM_EINVAL;
+    int err = 0;
+    char *p = path_copy(path, plen, &err);
+    if (!p) return err;
+    orin_platform_stream *s = (orin_platform_stream *)orin_platform_alloc(sizeof *s);
+    if (!s) {
+        orin_platform_free(p);
+        return ORIN_PLATFORM_ENOMEM;
+    }
+    errno = 0;
+    s->f = fopen(p, mode == ORIN_PLATFORM_STREAM_READ ? "rb" : (mode == ORIN_PLATFORM_STREAM_WRITE ? "wb" : "ab"));
+    s->err = 0;
+    orin_platform_free(p);
+    if (!s->f) {
+        int code = errno ? errno : EIO;
+        orin_platform_free(s);
+        return code;
+    }
+    *out = s;
+    return 0;
+}
+
+size_t orin_platform_stream_read(orin_platform_stream *s, char *buf, size_t n) {
+    size_t got = 0;
+    while (got < n) {
+        errno = 0;
+        size_t k = fread(buf + got, 1, n - got, s->f);
+        got += k;
+        if (k == 0) {
+            if (ferror(s->f)) stream_fail(s, errno);
+            break;
+        }
+    }
+    return got;
+}
+
+int orin_platform_stream_getc(orin_platform_stream *s) {
+    errno = 0;
+    int c = getc(s->f);
+    if (c == EOF) {
+        if (ferror(s->f)) stream_fail(s, errno);
+        return -1;
+    }
+    return c;
+}
+
+size_t orin_platform_stream_write(orin_platform_stream *s, const char *p, size_t n) {
+    if (n == 0) return 0;
+    errno = 0;
+    size_t k = fwrite(p, 1, n, s->f);
+    if (k != n) stream_fail(s, errno);
+    return k;
+}
+
+int orin_platform_stream_flush(orin_platform_stream *s) {
+    errno = 0;
+    if (fflush(s->f) != 0) stream_fail(s, errno);
+    return s->err;
+}
+
+int orin_platform_stream_error(const orin_platform_stream *s) { return s->err; }
+
+int orin_platform_stream_close(orin_platform_stream *s) {
+    errno = 0;
+    if (fclose(s->f) != 0) stream_fail(s, errno);
+    int err = s->err;
+    orin_platform_free(s);
+    return err;
+}

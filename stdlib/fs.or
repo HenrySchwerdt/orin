@@ -1,0 +1,146 @@
+// std:fs -- whole-file functions and streaming file access through the scope API (ADR-0025).
+//
+// UNSTABLE (ADR-0016 amendment): the signatures of std I/O modules may change when capabilities (ADR-0021)
+// are added, most likely by one extra capability parameter (`withFile(cap, path, mode, body)`); the scope
+// shape and the `File` methods are meant to survive that change. The language rules for `File` are not
+// unstable: see below.
+//
+// `File` is a RESOURCE HANDLE, not a value (spec 06): it can be passed to functions (borrowed) but not stored in a
+// record / class / array / Option / Result / Map, returned, assigned to another variable, captured by a closure,
+// compared or converted to string; those uses are compile errors E0450 / E0451 / E0452 (compiler/check/resources.or)
+// and, independently, MIR verifier errors (docs/mir.md, "Resource handles"). The only way to obtain one is a
+// scope function below: it opens the file, calls `body` with the handle as the body's PARAMETER, and closes the
+// file when `body` returns -- on every path, including when the result is later turned into an `Err`. A trap
+// inside `body` ends the process; the runtime flushes and closes open files in its exit hook, so bytes already
+// handed to `write` are not lost (a kill by signal still loses buffered bytes).
+//
+// Errors of reads/writes/flushes inside the scope are remembered by the file (the methods themselves stay
+// simple: `readLine(): Option<string>`, `write(s): void`); the scope function reports the first one as
+// `Err(FsError)` when it closes the file. A failed read looks like end of file to `body`.
+//
+// Why two flavours: a generic result `T` cannot be `void`; `withFile` returns the body's value, `useFile`
+// takes a body that returns nothing. Both exist for one file and for two files (`withFiles`, `useFiles`), which is how
+// you stream from one file to another: a handle cannot be captured by a nested scope's closure.
+//
+// Whole-file functions (unchanged): readFile(path): Result<string, string>, writeFile(path, data):
+// Result<void, string>, exists(path): bool.
+
+import { File, fileOpen, fileIsOpen, fileOpenError, fileClose } from "std:fsraw";
+
+export { readFile, writeFile, exists, File } from "std:fsraw";
+
+// Text of an error of this module (currently the human-readable message).
+export type FsError = string;
+
+// How a file is opened: Read (the file must exist), Write (create or truncate), Append (create if missing,
+// every write goes to the end). A file opened with Read cannot be written and vice versa (the failed operation is
+// reported as an `Err` when the scope ends).
+export type FileMode = Read | Write | Append;
+
+function modeCode(m: FileMode): int {
+  return match (m) {
+    Read => 0,
+    Write => 1,
+    Append => 2
+  };
+}
+
+function openMessage(path: string, h: File): string {
+  return "cannot open '" + path + "': " + fileOpenError(h);
+}
+
+// Close message of a handle: Some(error) if any operation failed.
+function firstError(a: Option<string>, b: Option<string>): Option<string> {
+  return match (a) {
+    Some(m) => Some(m),
+    None => b
+  };
+}
+
+// withFile<T>(path, mode, body): Result<T, FsError>
+// Opens `path`, runs `body(file)`, closes the file, and returns `Ok(<body's value>)`; `Err(message)` if the file
+// cannot be opened (body is not called) or if any operation on it or the final flush/close failed (the body's
+// value is discarded). O(1) plus the work of `body`; at most 256 files can be open at once.
+export function withFile<T>(path: string, mode: FileMode, body: (file: File) => T): Result<T, FsError> {
+  const h = fileOpen(path, modeCode(mode));
+  if (!fileIsOpen(h)) {
+    const msg = openMessage(path, h);
+    fileClose(h);
+    return Err(msg);
+  }
+  const r = body(h);
+  const e = fileClose(h);
+  return match (e) {
+    Some(m) => Err(m),
+    None => Ok(r)
+  };
+}
+
+// useFile(path, mode, body): Result<void, FsError> -- `withFile` for a body that returns nothing.
+export function useFile(path: string, mode: FileMode, body: (file: File) => void): Result<void, FsError> {
+  const h = fileOpen(path, modeCode(mode));
+  if (!fileIsOpen(h)) {
+    const msg = openMessage(path, h);
+    fileClose(h);
+    return Err(msg);
+  }
+  body(h);
+  const e = fileClose(h);
+  return match (e) {
+    Some(m) => Err(m),
+    None => Ok()
+  };
+}
+
+// withFiles<T>(pathA, modeA, pathB, modeB, body): Result<T, FsError> -- two files open at the same time (for
+// example copying a file line by line). If the second cannot be opened the first is closed again.
+export function withFiles<T>(
+  pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => T
+): Result<T, FsError> {
+  const a = fileOpen(pathA, modeCode(modeA));
+  if (!fileIsOpen(a)) {
+    const msg = openMessage(pathA, a);
+    fileClose(a);
+    return Err(msg);
+  }
+  const b = fileOpen(pathB, modeCode(modeB));
+  if (!fileIsOpen(b)) {
+    const msg = openMessage(pathB, b);
+    fileClose(b);
+    fileClose(a);
+    return Err(msg);
+  }
+  const r = body(a, b);
+  const eb = fileClose(b);
+  const ea = fileClose(a);
+  return match (firstError(ea, eb)) {
+    Some(m) => Err(m),
+    None => Ok(r)
+  };
+}
+
+// useFiles(pathA, modeA, pathB, modeB, body): Result<void, FsError> -- `withFiles` for a body that returns nothing.
+export function useFiles(
+  pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => void
+): Result<void, FsError> {
+  const a = fileOpen(pathA, modeCode(modeA));
+  if (!fileIsOpen(a)) {
+    const msg = openMessage(pathA, a);
+    fileClose(a);
+    return Err(msg);
+  }
+  const b = fileOpen(pathB, modeCode(modeB));
+  if (!fileIsOpen(b)) {
+    const msg = openMessage(pathB, b);
+    fileClose(b);
+    fileClose(a);
+    return Err(msg);
+  }
+  body(a, b);
+  const eb = fileClose(b);
+  const ea = fileClose(a);
+  return match (firstError(ea, eb)) {
+    Some(m) => Err(m),
+    None => Ok()
+  };
+}
