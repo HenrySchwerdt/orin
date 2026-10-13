@@ -1,0 +1,288 @@
+// Lowering helpers (pure): type mapping, effect analysis, string-literal table.
+// Duplicates a few helpers of compiler/codegen (which is a separate, frozen module).
+
+import { Type, Program, HBlock, HStmt, Place, HExpr, HArm, FieldInitH } from "../hir";
+import { MType } from "../mir";
+
+export function isRefTy(t: Type): bool {
+  return match (t) {
+    TyInt => false,
+    TyUsize => false,
+    TyBool => false,
+    TyVoid => false,
+    _ => true
+  };
+}
+
+export function isVoidTy(t: Type): bool {
+  return match (t) { TyVoid => true, _ => false };
+}
+
+export function isUsizeTy(t: Type): bool {
+  return match (t) { TyUsize => true, _ => false };
+}
+
+export function isStringTy(t: Type): bool {
+  return match (t) { TyString => true, _ => false };
+}
+
+export function mty(t: Type): MType {
+  return match (t) {
+    TyInt => MInt,
+    TyUsize => MUsize,
+    TyBool => MBool,
+    TyVoid => MVoid,
+    _ => MRef
+  };
+}
+
+// ---------------------------------------------------------------- effects
+
+export function isSimple(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XLocal(_) => true,
+    XField(b, _, _) => isSimple(b),
+    _ => false
+  };
+}
+
+export function anyEffects(xs: HExpr[]): bool {
+  for (const x of xs) {
+    if (hasEffects(x)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function armHasEffects(a: HArm): bool {
+  if (a.body.stmts.length != 0) {
+    return true;
+  }
+  return match (a.value) {
+    Some(v) => hasEffects(v),
+    None => false
+  };
+}
+
+export function armsHaveEffects(arms: HArm[]): bool {
+  for (const a of arms) {
+    if (armHasEffects(a)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// May evaluating `e` change the value of a local?
+export function hasEffects(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => false,
+    XBool(_) => false,
+    XStr(_) => false,
+    XLocal(_) => false,
+    XUnary(_, x) => hasEffects(x),
+    XBinary(_, a, b) => hasEffects(a) || hasEffects(b),
+    XCall(_, args) => anyEffects(args),
+    XBuiltin(_, args) => anyEffects(args),
+    XMutMethod(_, _, _) => true,
+    XField(b, _, _) => hasEffects(b),
+    XIndex(b, i) => hasEffects(b) || hasEffects(i),
+    XRecord(_, sp, fields) => recordHasEffects(sp, fields),
+    XVariant(_, payload) => anyEffects(payload),
+    XArray(xs) => anyEffects(xs),
+    XTry(x) => hasEffects(x),
+    XCond(c, a, b) => hasEffects(c) || hasEffects(a) || hasEffects(b),
+    XMatch(s, arms) => hasEffects(s) || armsHaveEffects(arms)
+  };
+}
+
+function recordHasEffects(sp: Option<HExpr>, fields: FieldInitH[]): bool {
+  const spe = match (sp) {
+    Some(x) => hasEffects(x),
+    None => false
+  };
+  if (spe) {
+    return true;
+  }
+  for (const f of fields) {
+    if (hasEffects(f.value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- string literals
+
+export type Lits = { strs: string[]; buckets: usize[][]; };
+
+function litBucket(s: string): usize {
+  let h: usize = 7;
+  let i: usize = 0;
+  while (i < s.length && i < 12) {
+    h = (h * 31 + s.charCodeAt(i).toUsize()) % 1021;
+    i += 1;
+  }
+  return (h + s.length) % 1021;
+}
+
+function newLits(): Lits {
+  let b: usize[][] = [];
+  const empty: usize[] = [];
+  let i: usize = 0;
+  while (i < 1021) {
+    b.push(empty);
+    i += 1;
+  }
+  const strs: string[] = [];
+  return Lits { strs: strs, buckets: b };
+}
+
+function findLit(l: Lits, s: string): Option<usize> {
+  const bucket = l.buckets[litBucket(s)];
+  for (const id of bucket) {
+    if (l.strs[id] == s) {
+      return Some(id);
+    }
+  }
+  return None;
+}
+
+export function litId(l: Lits, s: string): usize {
+  return match (findLit(l, s)) {
+    Some(i) => i,
+    None => 0
+  };
+}
+
+function lexprs(xs: HExpr[]): string[] {
+  let out: string[] = [];
+  for (const x of xs) {
+    for (const s of lexpr(x)) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+function lblock(b: HBlock): string[] {
+  let out: string[] = [];
+  for (const s of b.stmts) {
+    for (const t of lstmt(s)) {
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+function lplace(p: Place): string[] {
+  let out: string[] = [];
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        for (const s of lexpr(ix)) {
+          out.push(s);
+        }
+      },
+      PField(_, _) => {}
+    }
+  }
+  return out;
+}
+
+function lopt(o: Option<HExpr>): string[] {
+  return match (o) {
+    Some(x) => lexpr(x),
+    None => []
+  };
+}
+
+function lstmt(s: HStmt): string[] {
+  return match (s) {
+    HLet(_, e) => lexpr(e),
+    HAssign(p, _, e) => lplace(p).concat(lexpr(e)),
+    HExprStmt(e) => lexpr(e),
+    HIf(c, t, el) => lexpr(c).concat(lblock(t)).concat(lblockOpt(el)),
+    HWhile(c, b) => lexpr(c).concat(lblock(b)),
+    HForOf(_, it, b) => lexpr(it).concat(lblock(b)),
+    HBreak => [],
+    HContinue => [],
+    HReturn(e) => lopt(e),
+    HBlockStmt(b) => lblock(b)
+  };
+}
+
+function lblockOpt(b: Option<HBlock>): string[] {
+  return match (b) {
+    Some(x) => lblock(x),
+    None => []
+  };
+}
+
+function larm(a: HArm): string[] {
+  const pat: string[] = match (a.pattern) {
+    HPStr(s) => [s],
+    _ => []
+  };
+  return pat.concat(lblock(a.body)).concat(lopt(a.value));
+}
+
+function lexpr(e: HExpr): string[] {
+  return match (e.kind) {
+    XInt(_) => [],
+    XBool(_) => [],
+    XStr(s) => [s],
+    XLocal(_) => [],
+    XUnary(_, x) => lexpr(x),
+    XBinary(_, a, b) => lexpr(a).concat(lexpr(b)),
+    XCall(_, args) => lexprs(args),
+    XBuiltin(_, args) => lexprs(args),
+    XMutMethod(_, p, args) => lplace(p).concat(lexprs(args)),
+    XField(b, _, _) => lexpr(b),
+    XIndex(b, i) => lexpr(b).concat(lexpr(i)),
+    XRecord(_, sp, fields) => lopt(sp).concat(lfields(fields)),
+    XVariant(_, payload) => lexprs(payload),
+    XArray(xs) => lexprs(xs),
+    XTry(x) => lexpr(x),
+    XCond(c, a, b) => lexpr(c).concat(lexpr(a)).concat(lexpr(b)),
+    XMatch(s, arms) => lexpr(s).concat(larms(arms))
+  };
+}
+
+function lfields(fs: FieldInitH[]): string[] {
+  let out: string[] = [];
+  for (const f of fs) {
+    for (const s of lexpr(f.value)) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+function larms(arms: HArm[]): string[] {
+  let out: string[] = [];
+  for (const a of arms) {
+    for (const s of larm(a)) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+export function collectLits(prog: Program): Lits {
+  let lits = newLits();
+  for (const f of prog.functions) {
+    for (const s of lblock(f.body)) {
+      if (findLit(lits, s).isNone()) {
+        const id = lits.strs.length;
+        lits.strs.push(s);
+        lits.buckets[litBucket(s)].push(id);
+      }
+    }
+  }
+  return lits;
+}

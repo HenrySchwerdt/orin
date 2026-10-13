@@ -1,7 +1,9 @@
 // orin — the self-hosted Orin compiler driver (Stage 1+).
 // CLI (identical to the Stage 0 `orinb` subset used by tools/):
 //   orin check <entry.or>
-//   orin compile <entry.or> -o <out.c>
+//   orin compile <entry.or> -o <out.c> [--legacy-codegen]   (default: HIR -> MIR -> C)
+//   orin mir <entry.or>      print the MIR
+//   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
 
 import { args, exit } from "std:process";
 import { writeFile } from "std:fs";
@@ -9,9 +11,13 @@ import { SourceMap, Diagnostic, render } from "./diag";
 import { loadAll } from "./loader";
 import { check } from "./check";
 import { generate } from "./codegen";
+import { lower } from "./lower";
+import { emitC } from "./cemit";
+import { printProgram } from "./mir";
+import { verify } from "./verify";
 
 function usage(): void {
-  console.error("usage:\n  orin check <entry.or>\n  orin compile <entry.or> -o <out.c>");
+  console.error("usage:\n  orin check <entry.or>\n  orin compile <entry.or> -o <out.c>\n  orin mir <entry.or>\n  orin verify <entry.or>");
   exit(2);
 }
 
@@ -31,7 +37,7 @@ function main(): void {
   const cmd = argv[0];
   const entry = argv[1];
   const isCompile = cmd == "compile";
-  if (!isCompile && cmd != "check") {
+  if (!isCompile && cmd != "check" && cmd != "mir" && cmd != "verify") {
     usage();
     return;
   }
@@ -50,10 +56,34 @@ function main(): void {
     report(loaded.sm, checked.unwrapErr());
     return;
   }
+  if (cmd == "mir") {
+    console.log(printProgram(lower(checked.unwrap())));
+    return;
+  }
+  if (cmd == "verify") {
+    const rep = verify(lower(checked.unwrap()));
+    for (const d of rep.errors) {
+      console.log("error: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+    }
+    for (const d of rep.warnings) {
+      console.log("warning: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+    }
+    console.log("verify: " + rep.errors.length.toString() + " errors, " + rep.warnings.length.toString() + " warnings");
+    if (rep.errors.length > 0) {
+      exit(1);
+    }
+    return;
+  }
   if (!isCompile) {
     return;
   }
-  const c = generate(checked.unwrap());
+  let legacy = false;
+  for (const a of argv) {
+    if (a == "--legacy-codegen") {
+      legacy = true;
+    }
+  }
+  const c = legacy ? generate(checked.unwrap()) : emitC(lower(checked.unwrap()));
   const written = writeFile(argv[3], c);
   if (written.isErr()) {
     console.error("error: cannot write " + argv[3] + ": " + written.unwrapErr());

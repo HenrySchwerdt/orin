@@ -1,0 +1,204 @@
+// Readable MIR dump (`orin mir <entry>`).
+
+import { BinOp, UnOp, Builtin } from "../hir";
+import { MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram } from "./mir";
+
+function u(n: usize): string {
+  return n.toString();
+}
+
+function tyName(t: MType): string {
+  return match (t) {
+    MInt => "int",
+    MUsize => "usize",
+    MBool => "bool",
+    MRef => "ref",
+    MVoid => "void"
+  };
+}
+
+function loc(i: usize): string {
+  return "l" + u(i);
+}
+
+function opStr(o: Operand): string {
+  return match (o) {
+    OLocal(l) => loc(l),
+    OInt(v) => v.toString(),
+    OUsize(v) => v.toString() + "u",
+    OBool(b) => b ? "true" : "false",
+    OStr(i) => "str#" + u(i)
+  };
+}
+
+function opsStr(os: Operand[]): string {
+  let parts: string[] = [];
+  for (const o of os) {
+    parts.push(opStr(o));
+  }
+  return parts.join(", ");
+}
+
+function binName(op: BinOp): string {
+  return match (op) {
+    OpAdd => "add",
+    OpSub => "sub",
+    OpMul => "mul",
+    OpDiv => "div",
+    OpRem => "rem",
+    OpEq => "eq",
+    OpNe => "ne",
+    OpLt => "lt",
+    OpLe => "le",
+    OpGt => "gt",
+    OpGe => "ge",
+    OpAnd => "and",
+    OpOr => "or"
+  };
+}
+
+function unName(op: UnOp): string {
+  return match (op) {
+    UnNot => "not",
+    UnNeg => "neg"
+  };
+}
+
+export function builtinName(b: Builtin): string {
+  return match (b) {
+    BConsoleLog => "console.log",
+    BConsoleError => "console.error",
+    BStringFromCharCode => "String.fromCharCode",
+    BParseInt => "parseInt",
+    BFsReadFile => "fs.readFile",
+    BFsWriteFile => "fs.writeFile",
+    BFsExists => "fs.exists",
+    BProcessArgs => "process.args",
+    BProcessExit => "process.exit",
+    BStrLength => "str.length",
+    BStrCharCodeAt => "str.charCodeAt",
+    BStrCharAt => "str.charAt",
+    BStrSubstring => "str.substring",
+    BStrIndexOf => "str.indexOf",
+    BStrIncludes => "str.includes",
+    BStrStartsWith => "str.startsWith",
+    BStrEndsWith => "str.endsWith",
+    BStrSplit => "str.split",
+    BStrTrim => "str.trim",
+    BArrLength => "arr.length",
+    BArrGet => "arr.get",
+    BArrSlice => "arr.slice",
+    BArrConcat => "arr.concat",
+    BArrJoin => "arr.join",
+    BIntToString => "int.toString",
+    BIntToUsize => "int.toUsize",
+    BUsizeToString => "usize.toString",
+    BUsizeToInt => "usize.toInt",
+    BBoolToString => "bool.toString",
+    BOptIsSome => "opt.isSome",
+    BOptIsNone => "opt.isNone",
+    BOptUnwrap => "opt.unwrap",
+    BOptUnwrapOr => "opt.unwrapOr",
+    BResIsOk => "res.isOk",
+    BResIsErr => "res.isErr",
+    BResUnwrap => "res.unwrap",
+    BResUnwrapErr => "res.unwrapErr"
+  };
+}
+
+function dstStr(d: Option<usize>): string {
+  return match (d) {
+    Some(x) => loc(x) + " = ",
+    None => ""
+  };
+}
+
+function instrStr(i: Instr): string {
+  return match (i) {
+    ICopy(d, o) => loc(d) + " = copy " + opStr(o),
+    IMove(d, s) => loc(d) + " = move " + loc(s),
+    IBorrow(d, s) => loc(d) + " = borrow " + loc(s),
+    IDup(d, o) => loc(d) + " = dup " + opStr(o),
+    IRelease(x) => "release " + loc(x),
+    IUnary(d, op, o) => loc(d) + " = " + unName(op) + " " + opStr(o),
+    IBinary(d, op, a, b) => loc(d) + " = " + binName(op) + " " + opStr(a) + ", " + opStr(b),
+    ICall(d, f, args) => dstStr(d) + "call fn" + u(f) + "(" + opsStr(args) + ")",
+    IBuiltin(d, b, args) => dstStr(d) + "builtin " + builtinName(b) + "(" + opsStr(args) + ")",
+    IStrAppend(x, y) => "strappend " + loc(x) + ", " + opStr(y),
+    IStructNew(d, tag, slots) => loc(d) + " = struct tag" + u(tag) + " {" + opsStr(slots) + "}",
+    INullary(d, t) => loc(d) + " = nullary tag" + u(t),
+    ITag(d, o) => loc(d) + " = tag " + opStr(o),
+    IGetField(d, o, i) => loc(d) + " = getfield " + opStr(o) + "." + u(i),
+    ISetField(x, i, v) => "setfield " + loc(x) + "." + u(i) + " = " + opStr(v),
+    ITakeField(d, x, i) => loc(d) + " = takefield " + loc(x) + "." + u(i),
+    IPutField(x, i, s) => "putfield " + loc(x) + "." + u(i) + " = " + loc(s),
+    IMakeUnique(x) => "makeunique " + loc(x),
+    IArrayNew(d, r, es) => loc(d) + " = arraynew " + (r ? "ref " : "val ") + "[" + opsStr(es) + "]",
+    IArrayGet(d, a, i) => loc(d) + " = arrayget " + opStr(a) + "[" + opStr(i) + "]",
+    IArraySet(x, i, v) => "arrayset " + loc(x) + "[" + opStr(i) + "] = " + opStr(v),
+    IArrayTake(d, x, i) => loc(d) + " = arraytake " + loc(x) + "[" + opStr(i) + "]",
+    IArrayPut(x, i, s) => "arrayput " + loc(x) + "[" + opStr(i) + "] = " + loc(s),
+    IArrayPush(x, v) => "arraypush " + loc(x) + ", " + opStr(v),
+    IArrayPop(d, x) => loc(d) + " = arraypop " + loc(x)
+  };
+}
+
+function casesStr(cs: SwitchCase[]): string {
+  let parts: string[] = [];
+  for (const c of cs) {
+    parts.push(c.value.toString() + " -> b" + u(c.target));
+  }
+  return parts.join(", ");
+}
+
+function termStr(t: Terminator): string {
+  return match (t) {
+    TGoto(b) => "goto b" + u(b),
+    TBranch(c, a, b) => "branch " + opStr(c) + " ? b" + u(a) + " : b" + u(b),
+    TSwitch(o, cs, d) => "switch " + opStr(o) + " [" + casesStr(cs) + "] default b" + u(d),
+    TReturn(o) => match (o) {
+      Some(x) => "return " + opStr(x),
+      None => "return"
+    },
+    TTrap(m) => "trap \"" + m + "\""
+  };
+}
+
+function funcStr(idx: usize, f: MFunction): string {
+  let out: string[] = [];
+  out.push("fn" + u(idx) + " " + f.name + " (params " + u(f.paramCount) + ") -> " + tyName(f.ret) + "\n");
+  let i: usize = 0;
+  let line = "  locals:";
+  while (i < f.locals.length) {
+    line += " " + loc(i) + ":" + tyName(f.locals[i].ty);
+    i += 1;
+  }
+  out.push(line + "\n");
+  let b: usize = 0;
+  for (const blk of f.blocks) {
+    out.push("  b" + u(b) + ":\n");
+    for (const ins of blk.instrs) {
+      out.push("    " + instrStr(ins) + "\n");
+    }
+    out.push("    " + termStr(blk.term) + "\n");
+    b += 1;
+  }
+  return out.join("");
+}
+
+export function printProgram(p: MProgram): string {
+  let out: string[] = [];
+  let i: usize = 0;
+  for (const s of p.strings) {
+    out.push("str#" + u(i) + " = \"" + s + "\"\n");
+    i += 1;
+  }
+  out.push("main = fn" + u(p.main) + "\n\n");
+  i = 0;
+  for (const f of p.functions) {
+    out.push(funcStr(i, f));
+    out.push("\n");
+    i += 1;
+  }
+  return out.join("");
+}

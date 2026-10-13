@@ -1,0 +1,150 @@
+// Ownership edge cases: borrowed values pinned across later effects, aliasing in appends,
+// early exits (`?`, break, continue, return) with live temporaries, nested place updates.
+
+type Node = { name: string; kids: Node[]; n: int; };
+type Shape = Circle(int) | Rect(int, int) | Named(string, Node) | Empty;
+
+function pair(a: string, b: string): string {
+  return a + "|" + b;
+}
+
+function showNode(n: Node): string {
+  let s = n.name + ":" + n.n.toString() + "[";
+  for (const k of n.kids) {
+    s += showNode(k) + ";";
+  }
+  return s + "]";
+}
+
+function failIf(b: bool, msg: string): Result<string, string> {
+  if (b) {
+    return Err(msg);
+  }
+  return Ok("fine");
+}
+
+// `?` in the middle of an argument list with live owned temporaries
+function chain(a: bool, b: bool): Result<string, string> {
+  const s = "x" + "y";
+  const r = pair(s + "1", failIf(a, "first")?) + pair("p" + "q", failIf(b, "second")?);
+  return Ok(r);
+}
+
+function earlyLoop(limit: int): Result<int, string> {
+  let total = 0;
+  let acc = "a";
+  for (const w of ["one", "two", "three", "four"]) {
+    const t = w + acc;
+    acc += "!";
+    if (t == "twoa!") {
+      continue;
+    }
+    total += failIf(total > limit, t)?.length.toInt();
+    if (w == "four") {
+      break;
+    }
+  }
+  return Ok(total);
+}
+
+function describe(s: Shape): string {
+  return match (s) {
+    Circle(r) => "circle" + r.toString(),
+    Rect(w, h) => "rect" + (w * h).toString(),
+    Named(n, node) => n + "/" + showNode(node),
+    Empty => "empty"
+  };
+}
+
+function mutateInArm(): string {
+  let o: Option<string> = Some("keep");
+  let out = "";
+  match (o) {
+    Some(v) => {
+      o = None;
+      out = v + (o.isNone() ? "-none" : "-some");
+    },
+    None => {
+      out = "nothing";
+    }
+  }
+  return out;
+}
+
+function popArg(): string {
+  let xs = ["a", "b", "c"];
+  const r = pair(xs[0], xs.pop().unwrap()) + pair(xs[1], xs.pop().unwrapOr("z"));
+  return r + xs.length.toString();
+}
+
+function selfAppend(): string {
+  let s = "ab";
+  s += s;
+  s = s + s;
+  let n = Node { name: "n", kids: [], n: 1 };
+  n.name += n.name;
+  n.name += "-";
+  n.name += n.name;
+  return s + n.name;
+}
+
+function nested(): string {
+  let root = Node { name: "root", kids: [Node { name: "k0", kids: [], n: 0 }, Node { name: "k1", kids: [], n: 1 }], n: 7 };
+  const snapshot = root;
+  root.kids[1].kids.push(Node { name: "leaf", kids: [], n: 9 });
+  root.kids[0].n += 5;
+  root.kids[1].kids[0].name += "!";
+  root.n *= 2;
+  const popped = root.kids[1].kids.pop();
+  root.kids.push(popped.unwrap());
+  return showNode(snapshot) + "\n" + showNode(root);
+}
+
+function loops(): string {
+  let out = "";
+  let i = 0;
+  while (true) {
+    const label = "i" + i.toString();
+    i += 1;
+    if (i > 6) {
+      break;
+    }
+    if (i % 2 == 0) {
+      continue;
+    }
+    let tmp = [label];
+    tmp.push(label + "b");
+    out += tmp.join(",") + " ";
+  }
+  let xs = [1, 2, 3];
+  for (const x of xs) {
+    xs.push(x * 10);
+  }
+  return out + xs.length.toString();
+}
+
+function spread(): string {
+  const a = Node { name: "a", kids: [], n: 1 };
+  let b = Node { ...a, n: 2 };
+  b.name += "b";
+  const c = Node { ...b, kids: [a] };
+  return showNode(a) + showNode(b) + showNode(c);
+}
+
+function main(): void {
+  console.log(chain(false, false).unwrap());
+  console.log(chain(true, false).unwrapErr());
+  console.log(chain(false, true).unwrapErr());
+  console.log(earlyLoop(100).unwrap().toString());
+  console.log(earlyLoop(5).unwrapErr());
+  console.log(describe(Circle(3)));
+  console.log(describe(Rect(2, 5)));
+  console.log(describe(Named("nm", Node { name: "in", kids: [], n: 4 })));
+  console.log(describe(Empty));
+  console.log(mutateInArm());
+  console.log(popArg());
+  console.log(selfAppend());
+  console.log(nested());
+  console.log(loops());
+  console.log(spread());
+}
