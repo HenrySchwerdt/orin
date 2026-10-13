@@ -34,3 +34,6 @@ _Updated: 2026-10-13_
 3. Closures/lambdas + std array API (`map`/`filter`/…), floats, `Map<K,V>`.
 4. Seed C file so the compiler source may use features beyond Orin-B (ADR pending).
 5. LLVM IR backend from MIR (ADR-0006).
+6. Self-hosted runtime (spec 19, ADR-0013): R1 std logic in Orin → R2 platform layer (C, closed
+   list, contracts) → R3 core dialect + object model in Orin → R4 L0 verification + L1 refinement
+   proofs against the Lean model.

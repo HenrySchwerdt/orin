@@ -35,6 +35,15 @@ suites; Stage 0 is not expected to pass `next`). `tools/diff_parsers.py` skips `
 * Generics (ADR-0007): `check/types.or` (type resolution, instantiation, unification),
   `check/body.or` (call/record inference), `check/checker.or` (abstract checks, instance loop).
   Checker functions thread the growing environment through `FnCtx.env`.
+* Classes (ADR-0009): `syntax/` (`IClass`, `ENew`, `EThis`; `class`/`new`/`this` stay reserved words,
+  `private`/`public`/`static`/`extends`/`constructor` are contextual), `check/classes.or`
+  (desugaring of each class into a record + constructor function + method functions `C.m(this$, ..)`,
+  class tables, lookups), `check/classfix.or` (inferred-mutability fixpoint by probing method bodies,
+  `$ret` records), `check/body.or` (`new`, method/static calls, `p = C.m(p, ..)` lowering through
+  hoisted statements `FnCtx.pre`, private access E0405, `this` errors E0300, const receiver E0401),
+  `check/index.or` (class/field/method defs and refs; method detail `mut method m(..)` when inferred
+  mutating), `fmt/printer.or`. HIR and backends are unchanged. `tools/diff_parsers.py` skips three
+  parse_edge cases that pin Stage 0's rejection of `class`/`new`/`this`.
 
 ## Writing efficient Orin-B (important for Stage 1 authors)
 

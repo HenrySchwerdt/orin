@@ -20,7 +20,7 @@
 import { Span, SourceMap } from "../diag";
 import {
   Ident, Item, FunctionDecl, TypeDecl, ConstDecl, TypeExpr, Param, Block, Stmt, Expr, FieldInit, MatchArm,
-  ArmBody, Pattern
+  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
@@ -47,6 +47,8 @@ type Ctx = {
   tabs: UnitTab[];
   hir: Option<Program>;
   recDef: Option<usize>[];     // HIR record id -> its SkRecord def
+  tq: string[];                // qualified type name ("unit.Name") -> def, for classes' method references
+  tqDefs: usize[];
 };
 
 // Mutable walker state.
@@ -378,6 +380,126 @@ function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
   return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
 }
 
+// Classes (ADR-0009): the class is an SkRecord def ("class C"), followed by its fields (parameter
+// properties first, then declared fields; SkField) and then the constructor / methods in member
+// order (SkFunction, container = the class).
+function classFieldCount(c: ClassDecl): usize {
+  let n: usize = 0;
+  for (const m of c.members) {
+    match (m) {
+      MField(_) => { n += 1; },
+      MCtor(k) => {
+        for (const p of k.params) {
+          if (p.access > 0) {
+            n += 1;
+          }
+        }
+      },
+      MMethod(_) => {}
+    }
+  }
+  return n;
+}
+
+function paramsText(ps: Param[]): string {
+  let parts: string[] = [];
+  for (const p of ps) {
+    parts.push(p.name.name + ": " + renderTE(p.ty));
+  }
+  return parts.join(", ");
+}
+
+// Inferred mutability of a method (ADR-0009): the lowered HIR function of an instance method
+// returns the updated receiver (declared `void`) or a `$ret` record.
+function methodMutating(hir: Option<Program>, qname: string, declRet: Option<TypeExpr>): bool {
+  match (hir) {
+    Some(h) => {
+      for (const f of h.functions) {
+        if (f.name == qname && f.paramCount > 0 && f.locals[0].name == "this$") {
+          match (f.ret) {
+            TyVoid => { return false; },
+            TyRecord(r) => {
+              if (h.records[r].name.endsWith("$ret")) {
+                return true;
+              }
+              const isVoidDecl = match (declRet) {
+                None => true,
+                Some(t) => match (t.kind) {
+                  TNamed(id, _) => id.name == "void",
+                  _ => false
+                }
+              };
+              return isVoidDecl;
+            },
+            _ => { return false; }
+          }
+        }
+      }
+    },
+    None => {}
+  }
+  return false;
+}
+
+function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>): P1 {
+  let w = p.w;
+  let tab = p.tab;
+  let tq = p.tq;
+  let tqDefs = p.tqDefs;
+  const id = w.defs.length;
+  w = addDef(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, "class " + c.name.name);
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        for (const cp of k.params) {
+          if (cp.access > 0) {
+            w = addDef(w, cp.name.name, SkField, cp.name.span, cp.span, Some(id), c.exported,
+              (cp.access == 2 ? "private " : "") + cp.name.name + ": " + renderTE(cp.ty));
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  for (const m of c.members) {
+    match (m) {
+      MField(f) => {
+        w = addDef(w, f.name.name, SkField, f.name.span, f.span, Some(id), c.exported,
+          (f.priv ? "private " : "") + f.name.name + ": " + renderTE(f.ty));
+      },
+      _ => {}
+    }
+  }
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        const nsp = Span { file: k.span.file, start: k.span.start, end: k.span.start + 11 };
+        let ps: string[] = [];
+        for (const cp of k.params) {
+          ps.push(cp.name.name + ": " + renderTE(cp.ty));
+        }
+        w = addDef(w, "constructor", SkFunction, nsp, k.span, Some(id), c.exported,
+          "constructor(" + ps.join(", ") + ")");
+      },
+      MMethod(md) => {
+        const mutating = !md.isStatic && methodMutating(hir, unitName + "." + c.name.name + "." + md.name.name, md.ret);
+        let d = (md.priv ? "private " : "") + (md.isStatic ? "static " : "") + (mutating ? "mut method " : "method ")
+          + md.name.name + "(" + paramsText(md.params) + ")";
+        match (md.ret) {
+          Some(t) => { d += ": " + renderTE(t); },
+          None => {}
+        }
+        w = addDef(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d);
+      },
+      MField(_) => {}
+    }
+  }
+  tab = addT(tab, c.name.name, id, c.exported);
+  tq.push(unitName + "." + c.name.name);
+  tqDefs.push(id);
+  return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
+}
+
 function variantText(name: string, payload: TypeExpr[]): string {
   if (payload.length == 0) {
     return name;
@@ -590,7 +712,31 @@ function walkExpr(w: W, c: Ctx, e: Expr): W {
       x = walkExpr(x, c, f);
       x = walkExprs(x, c, args);
     },
-    EMember(b, _) => { x = walkExpr(x, c, b); },
+    EMember(b, _) => {
+      // `C.m(..)`: a class name used as a receiver refers to the class.
+      match (b.kind) {
+        EIdent(bid) => {
+          if (lookupLocal(x, bid.name).isNone() && lookupVal(x, c, bid.name).isNone()) {
+            const td = lookupType(x, c, bid.name);
+            if (td.isSome()) {
+              x = addRef(x, bid.span, td.unwrap());
+            }
+          }
+        },
+        _ => {}
+      }
+      x = walkExpr(x, c, b);
+    },
+    ENew(id, targs, args) => {
+      const td = lookupType(x, c, id.name);
+      if (td.isSome()) {
+        x = addRef(x, id.span, td.unwrap());
+      }
+      for (const t of targs) {
+        x = typeRefs(x, c, t);
+      }
+      x = walkExprs(x, c, args);
+    },
     EIndex(a, b) => {
       x = walkExpr(x, c, a);
       x = walkExpr(x, c, b);
@@ -686,6 +832,17 @@ function placeFields(w: W, c: Ctx, e: Expr): TyW {
       const lo = lookupLocal(x, id.name);
       if (lo.isSome()) {
         return TyW { w: x, ty: x.lTys[lo.unwrap()] };
+      }
+      return TyW { w: x, ty: None };
+    },
+    EThis => {
+      // The lowered `this` local of the enclosing method / constructor.
+      let k: usize = 0;
+      while (k < x.hl.length) {
+        if (x.hl[k] == "this") {
+          return TyW { w: x, ty: Some(x.hlTy[k]) };
+        }
+        k += 1;
       }
       return TyW { w: x, ty: None };
     },
@@ -859,6 +1016,73 @@ function walkTypeDecl(w: W, c: Ctx, t: TypeDecl): W {
 
 // ---- HIR walk: field references and expression types ----------------------------------------------
 
+// A call of a lowered method (`unit.C.m`): reference to the method's def at the method name in the
+// source text (after the receiver, or after `C.` for a static method).
+function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      if (fid >= p.functions.length) {
+        return x;
+      }
+      const f = p.functions[fid];
+      let dot: Option<usize> = None;
+      let di: usize = 0;
+      while (di < f.name.length) {
+        if (f.name.charCodeAt(di) == 46) {
+          dot = Some(di);
+        }
+        di += 1;
+      }
+      if (dot.isNone()) {
+        return x;
+      }
+      const mname = f.name.substring(dot.unwrap() + 1, f.name.length);
+      const cname = f.name.substring(0, dot.unwrap());
+      if (mname == "constructor") {
+        return x;
+      }
+      const cd = findName(c.tq, c.tqDefs, cname);
+      if (cd.isNone()) {
+        return x;
+      }
+      let md: Option<usize> = None;
+      for (const k of children(x.defs, cd.unwrap())) {
+        const isFn = match (x.defs[k].kind) { SkFunction => true, _ => false };
+        if (isFn && x.defs[k].name == mname && md.isNone()) {
+          md = Some(k);
+        }
+      }
+      if (md.isNone()) {
+        return x;
+      }
+      const instance = f.paramCount > 0 && f.locals[0].name == "this$";
+      const sp = e.span;
+      const text = c.sm.files[sp.file].text;
+      let pos = sp.start;
+      if (instance) {
+        if (args.length == 0) {
+          return x;
+        }
+        pos = args[0].span.end;
+      }
+      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
+        pos += 1;
+      }
+      pos += 1;
+      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) == 32 || text.charCodeAt(pos) == 10)) {
+        pos += 1;
+      }
+      const end = pos + mname.length;
+      if (end <= sp.end && end <= text.length && text.substring(pos, end) == mname) {
+        x = addRef(x, Span { file: sp.file, start: pos, end: end }, md.unwrap());
+      }
+    },
+    None => {}
+  }
+  return x;
+}
+
 function litKind(e: HExpr): bool {
   return match (e.kind) {
     XInt(_) => true,
@@ -946,7 +1170,10 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       x = hExpr(x, c, a, ty);
       x = hExpr(x, c, b, ty);
     },
-    XCall(_, args) => { x = hExprs(x, c, args, ty); },
+    XCall(fid, args) => {
+      x = hExprs(x, c, args, ty);
+      x = methodRef(x, c, e, fid, args);
+    },
     XBuiltin(_, args) => { x = hExprs(x, c, args, ty); },
     XMutMethod(_, p, args) => {
       x = hPlace(x, c, p, ty);
@@ -1144,6 +1371,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
           did = p.w.defs.length;
           p = declareType(p, u.name, t);
         },
+        IClass(cd) => {
+          did = p.w.defs.length;
+          p = declareClass(p, u.name, cd, hir);
+        },
         _ => {}
       }
       itemDefs.push(did);
@@ -1171,7 +1402,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     },
     None => {}
   }
-  const c = Ctx { prog: prog, sm: sm, tabs: tabs, hir: hir, recDef: recDef };
+  const c = Ctx { prog: prog, sm: sm, tabs: tabs, hir: hir, recDef: recDef, tq: tq, tqDefs: tqDefs };
   // Pass 2: bodies.
   let hn: usize = 0;     // next ordinary (non-generic) HIR function
   ui = 0;
@@ -1205,6 +1436,82 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
           w = walkExpr(w, c, kd.value);
         },
         IType(t) => { w = walkTypeDecl(w, c, t); },
+        IClass(cd) => {
+          // HIR functions of a class: the constructor, then the methods in member order.
+          let ctorHf: Option<Function> = None;
+          let explicitCtor = false;
+          match (hir) {
+            Some(h) => {
+              if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + ".constructor") {
+                ctorHf = Some(h.functions[hn]);
+              }
+            },
+            None => {}
+          }
+          hn += 1;
+          for (const m of cd.members) {
+            match (m) {
+              MCtor(_) => { explicitCtor = true; },
+              _ => {}
+            }
+          }
+          let dk = did + 1 + classFieldCount(cd);
+          const none: string[] = [];
+          w.tps = none;
+          for (const m of cd.members) {
+            match (m) {
+              MField(f) => {
+                w = typeRefs(w, c, f.ty);
+                match (f.init) {
+                  Some(ie) => { w = walkExpr(w, c, ie); },
+                  None => {}
+                }
+              },
+              MCtor(k) => {
+                let ps: Param[] = [];
+                for (const cp of k.params) {
+                  w = typeRefs(w, c, cp.ty);
+                  ps.push(Param { name: cp.name, ty: cp.ty, span: cp.span });
+                }
+                const fd = FunctionDecl {
+                  exported: false, name: cd.name, typeParams: [], params: ps,
+                  ret: None, body: k.body, span: k.span
+                };
+                match (ctorHf) {
+                  Some(hf) => { w = hBlock(w, c, hf.body, true); },
+                  None => {}
+                }
+                w = walkFunction(w, c, fd, dk, ctorHf);
+                dk += 1;
+              },
+              MMethod(md) => {
+                let hf: Option<Function> = None;
+                match (hir) {
+                  Some(h) => {
+                    if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
+                      hf = Some(h.functions[hn]);
+                      w = hBlock(w, c, h.functions[hn].body, true);
+                    }
+                  },
+                  None => {}
+                }
+                hn += 1;
+                const fd = FunctionDecl {
+                  exported: false, name: md.name, typeParams: [], params: md.params, ret: md.ret, body: md.body,
+                  span: md.span
+                };
+                w = walkFunction(w, c, fd, dk, hf);
+                dk += 1;
+              }
+            }
+          }
+          if (!explicitCtor) {
+            match (ctorHf) {
+              Some(hf) => { w = hBlock(w, c, hf.body, false); },
+              None => {}
+            }
+          }
+        },
         _ => {}
       }
     }

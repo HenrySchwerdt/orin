@@ -9,7 +9,8 @@ import { Span, Diagnostic, spanTo, diag } from "../diag";
 import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
-  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind
+  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind,
+  ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl
 } from "./ast";
 import { Token, TokKind, lex } from "./lexer";
 
@@ -241,14 +242,17 @@ function parseItem(toks: Token[], pos: usize): Result<ItemRes, Diagnostic> {
   if (isKw(toks, p, "const")) {
     return parseConstDecl(toks, p, exported, start);
   }
+  if (isKw(toks, p, "class")) {
+    return parseClass(toks, p, exported, start);
+  }
   return Err(errExpected(toks, p, "declaration"));
 }
 
-// pos at `function`; `start` is the span of the item's first token.
-function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
-  const name = parseIdent(toks, pos + 1)?;
-  const tps = parseTypeParams(toks, name.pos)?;
-  let p = expectP(toks, tps.pos, "(")?;
+type SigRes = { params: Param[]; ret: Option<TypeExpr>; body: Block; pos: usize; };
+
+// `(a: T, ..) [: R] { body }` with `pos` at the `(`; shared by functions and methods.
+function parseSigBody(toks: Token[], pos: usize): Result<SigRes, Diagnostic> {
+  let p = expectP(toks, pos, "(")?;
   let params: Param[] = [];
   while (!isP(toks, p, ")")) {
     const pn = parseIdent(toks, p)?;
@@ -270,16 +274,169 @@ function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span): 
     p = rt.pos;
   }
   const body = parseBlock(toks, p)?;
+  return Ok(SigRes { params: params, ret: ret, body: body.block, pos: body.pos });
+}
+
+// pos at `function`; `start` is the span of the item's first token.
+function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+  const name = parseIdent(toks, pos + 1)?;
+  const tps = parseTypeParams(toks, name.pos)?;
+  const sg = parseSigBody(toks, tps.pos)?;
   const decl = FunctionDecl {
     exported: exported,
     name: name.id,
     typeParams: tps.ids,
-    params: params,
-    ret: ret,
-    body: body.block,
-    span: spanTo(start, body.block.span)
+    params: sg.params,
+    ret: sg.ret,
+    body: sg.body,
+    span: spanTo(start, sg.body.span)
   };
-  return Ok(ItemRes { item: IFunction(decl), pos: body.pos });
+  return Ok(ItemRes { item: IFunction(decl), pos: sg.pos });
+}
+
+// ---------------------------------------------------------------------------
+// Classes (beyond Orin-B, ADR-0009)
+// ---------------------------------------------------------------------------
+
+type MemberRes = { member: ClassMember; pos: usize; };
+
+// Contextual keyword: an identifier with exactly this spelling.
+function isIdentText(toks: Token[], pos: usize, s: string): bool {
+  const t = tokAt(toks, pos);
+  return match (t.kind) {
+    KIdent => t.text == s,
+    _ => false
+  };
+}
+
+function isIdentTok(toks: Token[], pos: usize): bool {
+  return match (tokAt(toks, pos).kind) {
+    KIdent => true,
+    _ => false
+  };
+}
+
+// pos at `class`.
+function parseClass(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
+  const name = parseIdent(toks, pos + 1)?;
+  const tps = parseTypeParams(toks, name.pos)?;
+  let p = tps.pos;
+  let ext: Option<Ident> = None;
+  if (isIdentText(toks, p, "extends")) {
+    const b = parseIdent(toks, p + 1)?;
+    ext = Some(b.id);
+    p = b.pos;
+  }
+  p = expectP(toks, p, "{")?;
+  let members: ClassMember[] = [];
+  while (!isP(toks, p, "}")) {
+    const m = parseMember(toks, p)?;
+    members.push(m.member);
+    p = m.pos;
+  }
+  p += 1;
+  const decl = ClassDecl {
+    exported: exported,
+    name: name.id,
+    typeParams: tps.ids,
+    ext: ext,
+    members: members,
+    span: spanTo(start, lastSpan(toks, p))
+  };
+  return Ok(ItemRes { item: IClass(decl), pos: p });
+}
+
+// One class member; modifiers (`public`, `private`, `static`) are contextual keywords that only
+// count when another identifier follows.
+function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
+  const start = tokAt(toks, pos).span;
+  let p = pos;
+  let priv = false;
+  let isStatic = false;
+  let mods: usize = 0;
+  while (isIdentTok(toks, p + 1)) {
+    if (isIdentText(toks, p, "public")) {
+      p += 1;
+    } else if (isIdentText(toks, p, "private")) {
+      priv = true;
+      p += 1;
+    } else if (isIdentText(toks, p, "static")) {
+      isStatic = true;
+      p += 1;
+    } else {
+      break;
+    }
+    mods += 1;
+  }
+  const name = parseIdent(toks, p)?;
+  p = name.pos;
+  if (isP(toks, p, "(") && name.id.name == "constructor" && mods == 0) {
+    return parseCtor(toks, p, start);
+  }
+  if (isP(toks, p, "(") || isP(toks, p, "<")) {
+    const tps = parseTypeParams(toks, p)?;
+    const sg = parseSigBody(toks, tps.pos)?;
+    const md = MethodDecl {
+      priv: priv,
+      isStatic: isStatic,
+      name: name.id,
+      typeParams: tps.ids,
+      params: sg.params,
+      ret: sg.ret,
+      body: sg.body,
+      span: spanTo(start, sg.body.span)
+    };
+    return Ok(MemberRes { member: MMethod(md), pos: sg.pos });
+  }
+  if (isP(toks, p, ":")) {
+    if (isStatic) {
+      return Err(diag("E0408", spanTo(start, name.id.span), "static fields are not supported (ADR-0009)"));
+    }
+    const ft = parseType(toks, p + 1)?;
+    p = ft.pos;
+    let init: Option<Expr> = None;
+    if (isP(toks, p, "=")) {
+      const e = parseExpr(toks, p + 1)?;
+      init = Some(e.expr);
+      p = e.pos;
+    }
+    p = expectP(toks, p, ";")?;
+    const fd = ClassField { priv: priv, name: name.id, ty: ft.ty, init: init, span: spanTo(start, lastSpan(toks, p)) };
+    return Ok(MemberRes { member: MField(fd), pos: p });
+  }
+  return Err(errExpected(toks, p, "`(` or `:` in class member"));
+}
+
+// pos at the `(` after `constructor`.
+function parseCtor(toks: Token[], pos: usize, start: Span): Result<MemberRes, Diagnostic> {
+  let p = pos + 1;
+  let params: CtorParam[] = [];
+  while (!isP(toks, p, ")")) {
+    const pstart = tokAt(toks, p).span;
+    let access = 0;
+    if (isIdentTok(toks, p + 1)) {
+      if (isIdentText(toks, p, "public")) {
+        access = 1;
+        p += 1;
+      } else if (isIdentText(toks, p, "private")) {
+        access = 2;
+        p += 1;
+      }
+    }
+    const pn = parseIdent(toks, p)?;
+    const colon = expectP(toks, pn.pos, ":")?;
+    const pt = parseType(toks, colon)?;
+    params.push(CtorParam { access: access, name: pn.id, ty: pt.ty, span: spanTo(pstart, pt.ty.span) });
+    p = pt.pos;
+    if (isP(toks, p, ",")) {
+      p += 1;
+    } else if (!isP(toks, p, ")")) {
+      return Err(errExpected(toks, p, "`,` or `)`"));
+    }
+  }
+  const body = parseBlock(toks, p + 1)?;
+  const cd = CtorDecl { params: params, body: body.block, span: spanTo(start, body.block.span) };
+  return Ok(MemberRes { member: MCtor(cd), pos: body.pos });
 }
 
 // pos at `type`.
@@ -839,7 +996,36 @@ function parseKeywordExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic
   if (t.text == "match") {
     return parseMatch(toks, pos);
   }
+  if (t.text == "this") {
+    return Ok(ExprRes { expr: mkExpr(EThis, t.span), pos: pos + 1 });
+  }
+  if (t.text == "new") {
+    return parseNew(toks, pos);
+  }
   return Err(errExpected(toks, pos, "expression"));
+}
+
+// `new C(args)` / `new C<T>(args)` (type arguments are rejected by the checker).
+function parseNew(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
+  if (!isIdentTok(toks, pos + 1)) {
+    return Err(errExpected(toks, pos, "expression"));
+  }
+  const nm = parseIdent(toks, pos + 1)?;
+  let p = nm.pos;
+  let targs: TypeExpr[] = [];
+  if (isP(toks, p, "<")) {
+    const ta = tryTypeArgs(toks, p);
+    if (ta.isSome()) {
+      targs = ta.unwrap().tys;
+      p = ta.unwrap().pos;
+    }
+  }
+  if (!isP(toks, p, "(")) {
+    return Err(errExpected(toks, p, "`(` after `new` class name"));
+  }
+  const args = parseExprList(toks, p, ")")?;
+  const sp = spanTo(tokAt(toks, pos).span, lastSpan(toks, args.pos));
+  return Ok(ExprRes { expr: mkExpr(ENew(nm.id, targs, args.exprs), sp), pos: args.pos });
 }
 
 // `<T, U>` list of type arguments at `pos`, or None if the tokens there are not a well-formed

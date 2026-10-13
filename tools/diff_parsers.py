@@ -17,6 +17,9 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+# Stage 1 accepts class syntax (ADR-0009: `class`, `new`, `this`), which Stage 0 rejects with E0200;
+# these edge cases pin Stage 0's behaviour only.
+CLASS_SYNTAX_SKIP = {"err0200_reserved_class.or", "err0200_reserved_new.or", "err0200_reserved_this.or"}
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ERR = re.compile(r"^(?:.*?):(\d+):(\d+): error\[(E\d{4})\]")
 TIMEOUT = 30
@@ -78,6 +81,7 @@ def collect(extra):
             for n in fn:
                 if n.endswith(".or"):
                     files.append(os.path.join(dp, n))
+    files = [f for f in files if os.path.basename(f) not in CLASS_SYNTAX_SKIP]
     return sorted(set(os.path.relpath(f, ROOT) if f.startswith(ROOT) else f for f in files))
 
 

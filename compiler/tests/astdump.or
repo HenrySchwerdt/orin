@@ -7,6 +7,11 @@
 //            | (fn EXP NAME (tparams NAME*) (params (param NAME TYPE)*) RET BLOCK)
 //            | (type EXP NAME (tparams NAME*) TBODY)
 //            | (const EXP NAME TYPE_OR_DASH EXPR)
+//            | (class EXP NAME (tparams NAME*) EXT MEMBER*)        (beyond Orin-B, ADR-0009)
+//   EXT     := - | NAME
+//   MEMBER  := (cfield ACC NAME TYPE EXPR_OR_DASH) | (ctor (cparams (cparam PACC NAME TYPE)*) BLOCK)
+//            | (method ACC KIND NAME (tparams NAME*) (params (param NAME TYPE)*) RET BLOCK)
+//   ACC     := public | private        PACC := - | public | private        KIND := static | inst
 //   EXP     := export | local
 //   RET     := TYPE | -                       (- = no annotation)
 //   TBODY   := (dalias TYPE) | (drecord (field NAME TYPE)*) | (dunion (variant NAME TYPE*)*)
@@ -26,6 +31,7 @@
 //            | (call@S EXPR EXPR*) | (member@S EXPR NAME) | (index@S EXPR EXPR) | (try@S EXPR)
 //            | (cond@S EXPR EXPR EXPR) | (arr@S EXPR*)
 //            | (record@S NAME SPREAD (field NAME EXPR)*)   SPREAD := - | EXPR
+//            | (new@S NAME [TYPE*] EXPR*) | (this@S)
 //            | (match@S EXPR ARMLINE*)  each arm on its own line, indented 2 deeper:
 //                  (arm PAT EXPR_OR_BLOCK)
 //   PAT     := _ | (pident NAME) | (pvariant NAME PAT*) | (pint N) | (pstr "escaped") | (pbool B)
@@ -44,7 +50,7 @@ import {
   Ident, Module, Item, ImportDecl, FunctionDecl, TypeDecl, TypeDeclBody, FieldDecl,
   VariantDecl, ConstDecl,
   TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp, BinaryOp,
-  ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind
+  ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, ClassDecl, ClassMember, CtorParam, Param
 } from "../syntax";
 import { Span } from "../diag";
 
@@ -129,8 +135,68 @@ function dumpItem(it: Item): string {
     IReExport(d) => "(reexport " + quote(d.path) + namesTail(d.names) + ")",
     IFunction(f) => dumpFn(f),
     IType(t) => dumpTypeDecl(t),
-    IConst(c) => dumpConst(c)
+    IConst(c) => dumpConst(c),
+    IClass(c) => dumpClass(c)
   };
+}
+
+function accWord(priv: bool): string {
+  if (priv) {
+    return "private";
+  }
+  return "public";
+}
+
+function dumpClass(c: ClassDecl): string {
+  let parts: string[] = [];
+  for (const m of c.members) {
+    parts.push("\n  " + dumpMember(m));
+  }
+  const ext = match (c.ext) {
+    Some(id) => id.name,
+    None => "-"
+  };
+  return "(class " + expWord(c.exported) + " " + c.name.name + " (tparams" + namesTail(c.typeParams) + ") " + ext
+    + parts.join("") + ")";
+}
+
+function dumpCtorParam(p: CtorParam): string {
+  let acc = "-";
+  if (p.access == 1) {
+    acc = "public";
+  } else if (p.access == 2) {
+    acc = "private";
+  }
+  return "(cparam " + acc + " " + p.name.name + " " + dumpType(p.ty) + ")";
+}
+
+function dumpMember(m: ClassMember): string {
+  return match (m) {
+    MField(f) => "(cfield " + accWord(f.priv) + " " + f.name.name + " " + dumpType(f.ty) + " " + optExpr(f.init, "  ") + ")",
+    MCtor(c) => dumpCtor(c.params, c.body),
+    MMethod(md) => dumpMethod(md.priv, md.isStatic, md.name, md.typeParams, md.params, md.ret, md.body)
+  };
+}
+
+function dumpCtor(params: CtorParam[], body: Block): string {
+  let ps: string[] = [];
+  for (const p of params) {
+    ps.push(dumpCtorParam(p));
+  }
+  return "(ctor (cparams" + joinTail(ps) + ") " + dumpBlock(body, "  ") + ")";
+}
+
+function dumpMethod(priv: bool, isStatic: bool, name: Ident, tps: Ident[], params: Param[], ret: Option<TypeExpr>, body: Block): string {
+  let ps: string[] = [];
+  for (const p of params) {
+    ps.push("(param " + p.name.name + " " + dumpType(p.ty) + ")");
+  }
+  let kind = "inst";
+  if (isStatic) {
+    kind = "static";
+  }
+  return "(method " + accWord(priv) + " " + kind + " " + name.name + " (tparams" + namesTail(tps) + ") (params"
+    + joinTail(ps) + ") " + optType(ret) + " " + dumpBlock(body, "  ") + ")";
 }
 
 function dumpFn(f: FunctionDecl): string {
@@ -338,7 +404,9 @@ function dumpExpr(e: Expr, ind: string): string {
     ERecord(id, spread, fields) => dumpRecord(sp, id, spread, fields, ind),
     ETyApp(id, targs) => "(tyapp" + sp + " " + id.name + " " + typesStr(targs) + ")",
     ERecordT(id, targs, spread, fields) => dumpRecord(sp, id, spread, fields, ind) + " ; " + typesStr(targs),
-    EMatch(scrut, arms) => dumpMatch(sp, scrut, arms, ind)
+    EMatch(scrut, arms) => dumpMatch(sp, scrut, arms, ind),
+    ENew(id, targs, args) => "(new" + sp + " " + id.name + " " + typesStr(targs) + exprsTail(args, ind) + ")",
+    EThis => "(this" + sp + ")"
   };
 }
 

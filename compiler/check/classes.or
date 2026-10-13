@@ -1,0 +1,400 @@
+// Classes (ADR-0009), part 1: desugaring and class tables. Beyond Orin-B.
+//
+// `lowerClasses` runs before collection and replaces every `IClass` item by ordinary items:
+//   * a record type `C` (parameter properties first, then the declared fields);
+//   * a constructor function `C.constructor(params): C`. Its body binds `let this = C { .. }` built
+//     from the leading `this.f = e;` statements, parameter properties and field initializers, then
+//     runs the remaining statements (the checker appends `return this`);
+//   * one function per method: `C.m(this$: C, params)` whose body starts with `let this = this$;`
+//     (static methods: `C.s(params)` unchanged).
+// Names such as `C.m` and `this$` cannot be written in source, so they never clash with user names.
+// Everything that needs types (call lowering, mutation inference, access checks) lives in the
+// checker proper (body.or, classfix.or); this file only holds syntax-level work and the tables.
+
+import { Span, Diagnostic, diag } from "../diag";
+import {
+  Ident, Item, Block, Stmt, SLet, SAssign, Expr, EIdent, EMember, EThis, ERecord, FieldInit, TypeExpr, TNamed,
+  TypeDecl, DRecord, FieldDecl, FunctionDecl, Param, ClassDecl, MField, MCtor, MMethod, ClassField, CtorDecl,
+  MethodDecl, IClass, IType, IFunction, OpAssign, Module
+} from "../syntax";
+import { LoadedProgram, Unit } from "../loader";
+import {
+  Env, ClassInfo, FieldAcc, MethodInfo, EntRecord, VFunc, findType, findVal
+} from "./env";
+
+export type Lowered = { prog: LoadedProgram; classes: ClassInfo[]; diags: Diagnostic[]; };
+
+type ClassOut = { items: Item[]; info: ClassInfo; diags: Diagnostic[]; };
+
+function selfType(name: Ident): TypeExpr {
+  return TypeExpr { kind: TNamed(name, []), span: name.span };
+}
+
+function fieldNamed(names: string[], n: string): bool {
+  for (const x of names) {
+    if (x == n) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Statements of a constructor body up to the first one that is not `this.f = e;` for a distinct
+// field `f` (conservative definite-initialization rule of ADR-0009).
+type Prefix = { inits: FieldInit[]; next: usize; };
+
+function ctorPrefix(stmts: Stmt[], fieldNames: string[]): Prefix {
+  let inits: FieldInit[] = [];
+  let assigned: string[] = [];
+  let k: usize = 0;
+  let go = true;
+  while (go && k < stmts.length) {
+    go = false;
+    match (stmts[k].kind) {
+      SAssign(target, op, value) => {
+        const plain = match (op) { OpAssign => true, _ => false };
+        if (plain) {
+          match (target.kind) {
+            EMember(base, f) => {
+              const onThis = match (base.kind) { EThis => true, _ => false };
+              if (onThis && fieldNamed(fieldNames, f.name) && !fieldNamed(assigned, f.name)) {
+                inits.push(FieldInit { name: f, value: value, span: stmts[k].span });
+                assigned.push(f.name);
+                go = true;
+              }
+            },
+            _ => {}
+          }
+        }
+      },
+      _ => {}
+    }
+    if (go) {
+      k += 1;
+    }
+  }
+  return Prefix { inits: inits, next: k };
+}
+
+function lowerClass(ui: usize, c: ClassDecl): ClassOut {
+  let diags: Diagnostic[] = [];
+  let items: Item[] = [];
+  match (c.ext) {
+    Some(b) => {
+      diags.push(diag("E0408", b.span, "class inheritance (`extends`) is not supported; use composition (ADR-0009)"));
+    },
+    None => {}
+  }
+  if (c.typeParams.length > 0) {
+    diags.push(diag("E0408", c.typeParams[0].span, "generic classes are not supported yet (ADR-0009)"));
+  }
+  let fields: ClassField[] = [];
+  let ctors: CtorDecl[] = [];
+  let methods: MethodDecl[] = [];
+  for (const m of c.members) {
+    match (m) {
+      MField(f) => { fields.push(f); },
+      MCtor(k) => { ctors.push(k); },
+      MMethod(md) => { methods.push(md); }
+    }
+  }
+  if (ctors.length > 1) {
+    diags.push(diag("E0304", ctors[1].span, "class `" + c.name.name + "` has more than one constructor"));
+  }
+  const noParams: Param[] = [];
+  let ctorParams: Param[] = noParams;
+  let ctorSpan = c.name.span;
+  let ctorBody: Block = Block { stmts: [], span: c.span };
+  let propNames: string[] = [];
+  let recFields: FieldDecl[] = [];
+  let accs: FieldAcc[] = [];
+  if (ctors.length > 0) {
+    ctorSpan = ctors[0].span;
+    ctorBody = ctors[0].body;
+    let ps: Param[] = [];
+    for (const p of ctors[0].params) {
+      ps.push(Param { name: p.name, ty: p.ty, span: p.span });
+      if (p.access > 0) {
+        propNames.push(p.name.name);
+        recFields.push(FieldDecl { name: p.name, ty: p.ty, span: p.span });
+        accs.push(FieldAcc { name: p.name.name, priv: p.access == 2 });
+      }
+    }
+    ctorParams = ps;
+  }
+  let fieldNames: string[] = [];
+  for (const n of propNames) {
+    fieldNames.push(n);
+  }
+  for (const f of fields) {
+    fieldNames.push(f.name.name);
+    recFields.push(FieldDecl { name: f.name, ty: f.ty, span: f.span });
+    accs.push(FieldAcc { name: f.name.name, priv: f.priv });
+  }
+
+  // Constructor.
+  const pre = ctorPrefix(ctorBody.stmts, fieldNames);
+  let lit: FieldInit[] = [];
+  let covered: string[] = [];
+  for (const i of pre.inits) {
+    covered.push(i.name.name);
+  }
+  for (const f of fields) {
+    if (f.init.isSome() && !fieldNamed(covered, f.name.name)) {
+      lit.push(FieldInit { name: f.name, value: f.init.unwrap(), span: f.span });
+      covered.push(f.name.name);
+    }
+  }
+  if (ctors.length > 0) {
+    for (const p of ctors[0].params) {
+      if (p.access > 0 && !fieldNamed(covered, p.name.name)) {
+        lit.push(FieldInit { name: p.name, value: Expr { kind: EIdent(p.name), span: p.name.span }, span: p.span });
+        covered.push(p.name.name);
+      }
+    }
+  }
+  for (const i of pre.inits) {
+    lit.push(i);
+  }
+  let missing: string[] = [];
+  for (const n of fieldNames) {
+    if (!fieldNamed(covered, n)) {
+      missing.push(n);
+    }
+  }
+  if (missing.length > 0) {
+    diags.push(diag(
+      "E0411", ctorSpan,
+      "field(s) not definitely initialized by the constructor of `" + c.name.name + "`: " + missing.join(", ")
+        + " (only leading `this.f = e;` statements, parameter properties and field initializers count)"
+    ));
+  }
+  const thisId = Ident { name: "this", span: ctorSpan };
+  let cstmts: Stmt[] = [];
+  cstmts.push(Stmt {
+    kind: SLet(
+      true,
+      thisId,
+      Some(selfType(c.name)),
+      Expr { kind: ERecord(c.name, None, lit), span: ctorSpan }
+    ),
+    span: ctorSpan
+  });
+  let k = pre.next;
+  while (k < ctorBody.stmts.length) {
+    cstmts.push(ctorBody.stmts[k]);
+    k += 1;
+  }
+
+  const recDecl = TypeDecl {
+    exported: c.exported,
+    name: c.name,
+    typeParams: [],
+    body: DRecord(recFields),
+    span: c.span
+  };
+  items.push(IType(recDecl));
+  items.push(IFunction(FunctionDecl {
+    exported: false,
+    name: Ident { name: c.name.name + ".constructor", span: c.name.span },
+    typeParams: [],
+    params: ctorParams,
+    ret: Some(selfType(c.name)),
+    body: Block { stmts: cstmts, span: ctorBody.span },
+    span: ctorSpan
+  }));
+
+  // Methods.
+  let minfos: MethodInfo[] = [];
+  let seen: string[] = [];
+  for (const m of methods) {
+    if (m.typeParams.length > 0) {
+      diags.push(diag("E0408", m.typeParams[0].span, "generic methods are not supported yet (ADR-0009)"));
+    }
+    if (fieldNamed(seen, m.name.name)) {
+      diags.push(diag("E0304", m.name.span, "duplicate method `" + m.name.name + "` in class `" + c.name.name + "`"));
+    }
+    seen.push(m.name.name);
+    let params: Param[] = [];
+    let stmts: Stmt[] = [];
+    if (!m.isStatic) {
+      const recv = Ident { name: "this$", span: m.name.span };
+      params.push(Param { name: recv, ty: selfType(c.name), span: m.name.span });
+      stmts.push(Stmt {
+        kind: SLet(true, thisId, None, Expr { kind: EIdent(recv), span: m.name.span }),
+        span: m.name.span
+      });
+    }
+    for (const p of m.params) {
+      params.push(p);
+    }
+    for (const s of m.body.stmts) {
+      stmts.push(s);
+    }
+    items.push(IFunction(FunctionDecl {
+      exported: false,
+      name: Ident { name: c.name.name + "." + m.name.name, span: m.name.span },
+      typeParams: [],
+      params: params,
+      ret: m.ret,
+      body: Block { stmts: stmts, span: m.body.span },
+      span: m.span
+    }));
+    minfos.push(MethodInfo {
+      name: m.name.name,
+      fid: 0,
+      isStatic: m.isStatic,
+      priv: m.priv,
+      mutating: false,
+      hasRet: false,
+      retRec: 0
+    });
+  }
+  const info = ClassInfo {
+    name: c.name.name,
+    unit: ui,
+    rec: 0,
+    fields: accs,
+    ctor: 0,
+    methods: minfos
+  };
+  return ClassOut { items: items, info: info, diags: diags };
+}
+
+// Replaces every class of the program by its lowering. Units without classes are shared as is.
+export function lowerClasses(prog: LoadedProgram): Lowered {
+  let diags: Diagnostic[] = [];
+  let classes: ClassInfo[] = [];
+  let units: Unit[] = [];
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    let has = false;
+    for (const it of u.ast.items) {
+      match (it) {
+        IClass(_) => { has = true; },
+        _ => {}
+      }
+    }
+    if (!has) {
+      units.push(u);
+    } else {
+      let items: Item[] = [];
+      for (const it of u.ast.items) {
+        match (it) {
+          IClass(c) => {
+            const o = lowerClass(ui, c);
+            for (const d of o.diags) {
+              diags.push(d);
+            }
+            for (const x of o.items) {
+              items.push(x);
+            }
+            classes.push(o.info);
+          },
+          _ => { items.push(it); }
+        }
+      }
+      units.push(Unit {
+        file: u.file,
+        path: u.path,
+        name: u.name,
+        ast: Module { file: u.ast.file, items: items },
+        imports: u.imports
+      });
+    }
+    ui += 1;
+  }
+  return Lowered { prog: LoadedProgram { units: units, entry: prog.entry }, classes: classes, diags: diags };
+}
+
+// After collection: finds the record and function ids of every class and tags the method
+// functions with their class and mode (ADR-0009: mode 1 constructor, 2 method, 5 static).
+export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
+  let env = env0;
+  let out: ClassInfo[] = [];
+  let ci: usize = 0;
+  for (const info of infos) {
+    const scope = env.units[info.unit].scope;
+    let c = info;
+    match (findType(scope, info.name)) {
+      Some(te) => {
+        match (te) {
+          EntRecord(r) => { c.rec = r; },
+          _ => {}
+        }
+      },
+      None => {}
+    }
+    match (findVal(scope, info.name + ".constructor")) {
+      Some(ve) => {
+        match (ve) {
+          VFunc(f) => {
+            c.ctor = f;
+            env.funcs[f].mode = 1;
+            env.funcs[f].cls = ci;
+          },
+          _ => {}
+        }
+      },
+      None => {}
+    }
+    let ms: MethodInfo[] = [];
+    for (const m of info.methods) {
+      let mi = m;
+      match (findVal(scope, info.name + "." + m.name)) {
+        Some(ve) => {
+          match (ve) {
+            VFunc(f) => {
+              mi.fid = f;
+              env.funcs[f].mode = m.isStatic ? 5 : 2;
+              env.funcs[f].cls = ci;
+            },
+            _ => {}
+          }
+        },
+        None => {}
+      }
+      ms.push(mi);
+    }
+    c.methods = ms;
+    out.push(c);
+    ci += 1;
+  }
+  env.classes = out;
+  return env;
+}
+
+// ---------------------------------------------------------------------------
+// Lookups used while checking bodies
+// ---------------------------------------------------------------------------
+
+export function classOfRec(env: Env, r: usize): Option<usize> {
+  let i: usize = 0;
+  while (i < env.classes.length) {
+    if (env.classes[i].rec == r) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+export function findMethod(ci: ClassInfo, name: string): Option<usize> {
+  let i: usize = 0;
+  while (i < ci.methods.length) {
+    if (ci.methods[i].name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+export function fieldIsPrivate(ci: ClassInfo, name: string): bool {
+  for (const f of ci.fields) {
+    if (f.name == name) {
+      return f.priv;
+    }
+  }
+  return false;
+}

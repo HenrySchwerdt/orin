@@ -36,6 +36,7 @@ The files in this folder collectively form the design contract:
 | `16-semantic-change-analysis.md` | Version-to-version business behavior diffs, impact and PO-readable changes |
 | `17-feature-first-review-and-trust.md` | Feature-first review, evidence trust, human sign-off and escalation gates |
 | `18-developer-tooling.md` | Shared semantic engine, `orin check`/`fmt`/`lsp`/`mcp`, editor integration |
+| `19-runtime-and-platform-layer.md` | Self-hosted runtime (Orin core + std) over a minimal, separately verifiable platform layer |
 
 ## Decided principles
 

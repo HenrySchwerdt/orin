@@ -1,5 +1,5 @@
 # Known limitations
-- Orin-B only (see bootstrap-subset.md): no classes, closures, floats, annotations. The
+- Orin-B only (see bootstrap-subset.md): no closures, floats, annotations. The
   self-hosted compiler additionally accepts simple generics (ADR-0007: no bounds, no generic
   methods, no default type arguments; instantiation depth limit 32, E0413).
 - Memory safety is not formally established; see architecture.md "Safety status".
@@ -8,3 +8,13 @@
 - Early exits from inside expressions (`?`, diverging match arms) may leak temporaries (safe, not
   freed). Records/variants are limited to 64 slots.
 - No hash maps in Orin-B; compiler symbol tables use linear search.
+- Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic classes or
+  methods (E0408), static fields, getters/setters, interfaces, `protected`. Private members are
+  checked at compile time (E0405). Constructors initialise fields only through leading `this.f = e;`
+  statements, parameter properties and field initializers (else E0411; `this` is unavailable until
+  then, E0300). Mutating methods are inferred; every mutating call copies the receiver shallowly until
+  ADR-0010 lands (e.g. `this.items.push(x)` in a loop is O(n) per call). A call of a mutating method
+  is hoisted before its statement, so it is rejected inside `&&`/`||` operands, `?:` branches and
+  `while` conditions (E0408), runs before the other operands of the same statement, and its receiver
+  may not contain side-effecting index expressions (E0408). Class values cannot be built with record
+  literals outside their class (E0408). Method hover types on the call expression show the lowered type.
