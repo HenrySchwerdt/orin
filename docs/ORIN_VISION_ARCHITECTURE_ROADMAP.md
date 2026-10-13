@@ -765,6 +765,92 @@ Nicht bei Null anfangen:
 
 ---
 
+## 20a. Lean-verifizierter Compiler und Runtime: verbindliche Proof-Strategie
+
+**Ziel:** Auch der größtenteils von KI-Agents implementierte Orin-Compiler und die Orin-Runtime sollen Fehler in den eigenen Algorithmen erkennen können. Sicherheitskritische Optimierungen und Checker dürfen nicht allein aufgrund erfolgreicher Tests oder eines ähnlichen Lean-Modells als korrekt gelten. Der unabhängig prüfbare Nachweis und seine genaue Reichweite werden Teil des Entwicklungsprozesses.
+
+### Drei getrennte Assurance-Stufen
+
+1. **Model Proof:** Lean beweist eine Eigenschaft des formalisierten Algorithmus/MIR-Modells. Der Orin-Implementierungscode ist dadurch noch nicht verifiziert.
+2. **Implementation Refinement:** Eine geprüfte Abbildung verbindet die *tatsächliche* Orin-Implementierung mit dem Modell. Alternativ validiert ein separater Translation Validator jeden konkreten Transformationsschritt gegen eine präzise Semantik.
+3. **Binary Assurance:** Emittierter C-/LLVM-/Maschinencode und Laufzeit-/Plattform-ABI werden zusätzlich geprüft. Ein reproduzierbarer Bootstrap oder identische C-/LLVM-Testausgaben beweisen keine generelle Korrektheit.
+
+Reports müssen `MODEL_ONLY`, `IMPLEMENTATION_VERIFIED`, `TRANSLATION_VALIDATED`, `TESTED_ONLY`, `ASSUMED`, `UNKNOWN` und `REFUTED` unterscheiden. `VERIFIED` darf nur mit ausgewiesener Eigenschaft, Scope, Modellversion, Beweiskette und Annahmen erscheinen.
+
+### Risk-first-Prioritäten
+
+| Komponente | Zu prüfende Eigenschaft | Priorität |
+|---|---|---|
+| MIR Ownership Verifier | Jede akzeptierte MIR erfüllt die modellierte Ownership-Disziplin; reale Checker-Implementierung entspricht dem formalen Checker | P0 |
+| RC/COW, Last-use Moves, Retain/Release-Elimination | Kein Use-after-free/Double-free, Value-Semantik bleibt erhalten | P0 |
+| HIR→MIR, Optimierungen | Erhalten beobachtbare Semantik einschließlich Effekten und Trap-Verhalten | P0 |
+| Capability-/Effektanalyse | Soundness: benötigte Rechte werden nicht übersehen, unbekannte Effekte sind konservativ | P0 |
+| Information Flow | Nachweisbare Nichtinterferenz unter spezifizierten Policies, einschließlich impliziter Flows | P0 |
+| Contract-Verifier und VC-Erzeugung | Bewiesene Vor-/Nachbedingungen folgen aus den korrekten Proof Obligations; Solver-Grenzen offengelegt | P0 |
+| Core-Runtime in `.or` | Tatsächliche Speicheroperationen verfeinern die Lean-Speichermaschine | P0 |
+| Typechecker, Parser, Formatter | Type Soundness für Sprachkern; Parser- und Formatter-Eigenschaften | P1 |
+| LLVM/C-Backend, Plattform und FFI | Semantik/ABI/Runtime-Contracts und Übersetzungsintegrität | P1 |
+
+**Kein pauschaler Lean-Pflichtbeweis für jeden Hilfsalgorithmus:** Strenge Anforderungen gelten zunächst für sicherheits- und semantikkritische Komponenten. Bei nicht kritischer Infrastruktur reichen risikobasierte Tests.
+
+### PR-Vertrag für kritische Compileränderungen
+
+Jede relevante PR liefert:
+1. **Formale Spezifikation:** Semantik, Preconditions, Postconditions, Invarianten, Fehlerfälle, erlaubte Effekte und externe Annahmen.
+2. **Lean-Theorem(e):** Beweise für die genannten Eigenschaften; pinnen der Tool-Versionen. Keine `sorry`/`admit`-Platzhalter, unkontrollierten Axiome oder unbegründeten `unsafe`-Abkürzungen im vertrauenswürdigen Proof-Pfad.
+3. **Implementierungsbindung:** Eine explizite Relation zwischen realen Orin-/MIR-Operationen und dem Lean-Modell; fehlt sie, ist das Ergebnis lediglich `MODEL_ONLY`.
+4. **Adversarial Regression Suite:** Grammar-Fuzzing, negative MIR-Fälle, Property-/Metamorphic- und Differentialtests. Absichtlich fehlerhafte Optimierungen oder Capability-Analysen müssen die Prüfung scheitern lassen.
+5. **Proof Impact Diff:** Geänderte Annahmen, invalidierte Theoreme, neue Proof Obligations und verletzte Policies werden im Feature-first PR-Report erklärt.
+6. **Governance:** Ein implementierender Agent darf weder Contracts stillschweigend schwächen noch durch neue Axiome oder mehr Rechte ein rotes Ergebnis „reparieren“, ohne gesonderte Freigabe.
+
+Beispiel: Bei der Entfernung eines `retain` muss nicht nur der separate Ownership-Checker die neue MIR akzeptieren; die Transformation muss auch die beobachtbare Semantik und Fehler-/Effektgrenzen erhalten. Speicher-sicher ist nicht automatisch korrekt.
+
+### Unabhängigkeit und Trusted Computing Base
+
+- Lean-Kernel prüft Proof-Terme; Taktiken sind keine unabhängige Autorität. SMT-`unsat` ohne separat überprüftes Zertifikat vertraut mindestens dem Solver und VC-Encoder.
+- Ein möglichst kleiner, unabhängig entwickelter **Translation Validator** kann Eingabe- und Ausgabe-MIR vergleichen. Bei unentscheidbaren Fällen `UNKNOWN` statt behaupteter Äquivalenz.
+- C/LLVM Differentialtests, Sanitizer, zufallsgenerierte Programme, Seed-/Stage0-Vergleiche und Stage2==Stage3 bleiben wichtig, zählen aber jeweils als **Tests oder Reproduzierbarkeit**, nicht als genereller mathematischer Beweis.
+- Runtime-Migration nach spec 19: `core/*.or` implementiert Ownership, Arrays, Strings und Allokation; eine kleine, geschlossene Low-Level-Intrinsic-/Plattform-Grenze wird separat geprüft. Kein Zirkelschluss, bei dem die zu prüfende Runtime ihre eigenen Beweisannahmen garantiert.
+
+### CI und menschenlesbarer Nachweis
+
+Vorgeschlagener Workflow `tools/verify_compiler.sh` mit maschinenlesbarem JSON und GitHub-Check:
+
+```text
+Lean proofs & assumptions audit          PASS
+MIR checker model                       MODEL_ONLY
+Actual checker ↔ formal model           UNKNOWN
+RC/COW formal machine                   PROVEN (MODEL)
+Retain-elimination transformation       TRANSLATION_VALIDATED / UNKNOWN
+HIR→MIR                                  TESTED_ONLY
+C/LLVM + sanitizers                      PASS (TESTS)
+Negative mutation corpus                 PASS
+Bootstrap fixed point                    PASS
+Release assurance                        INCOMPLETE
+```
+
+*Illustrative Statuswerte, keine Aussage über die aktuelle CI.*
+
+- Bereits etablierte, verpflichtende P0-Eigenschaften: **Fail closed** bei gebrochenem Proof, neuen nicht freigegebenen Axiomen oder fehlgeschlagenem Validator.
+- Für noch nicht erfüllte Forschungsziele einen expliziten **Proof-Debt-Ledger** führen; keine fälschlich grünen Sicherheitsclaims, aber auch keine pauschale Blockade jeder Entwicklungs-PR.
+- Nachweisformat mindestens: `property_id`, `assurance_level`, `status`, `assumptions`, `source_hash`, `model_hash`, `compiler_version`, `checker_version`, `proof_dependencies`, `evidence`.
+- Kritische Compiler- und Runtime-Änderungen invalidieren abhängige Nachweise und werden in OSIG/PR-Reports sichtbar.
+
+### Phasenplan
+
+- **L0 – Audit:** Bestehende Lean-Theoreme, Axiome und tatsächlichen Implementierungsbezüge inventarisieren; Claim-vs-Evidence-Tabelle und Proof Debt erstellen.
+- **L1 – CI-Härtung:** Lean pinnen, Axiom-/`sorry`-Checks, Mutationstests und negative MIR-Tests verbindlich machen.
+- **L2 – End-to-End-Beispiel:** Eine kleine reale Optimierung (z. B. Last-use Move) mit Modell, Beweis, Implementierungsbindung und aktiv entdecktem Fehler als vertikalen Proof-Slice liefern.
+- **L3 – Ausrollen:** Checker, HIR→MIR, Capability-/Effektanalyse und Information Flow risikobasiert formalisieren.
+- **L4 – Runtime:** Orin-Core-Dialekt, verifizierte RC-/COW-Verfeinerung und unabhängige Plattform-Intrinsic-Contracts.
+- **L5 – Proof-Carrying Releases:** Nachweise an Quellrevision, Build, Konfiguration und Binärartefakte binden; offenen TCB/Assumptions explizit ausweisen.
+
+**Definition of Done:** Mindestens ein absichtlich injizierter relevanter Fehler wird unabhängig entdeckt; Modellbeweis und Code-Nachweis werden sauber unterschieden; betroffene Nachweise werden bei Änderungen invalidiert; CI liefert reproduzierbare Gründe statt bloßer Ampeln.
+
+**Leitsatz:** *AI implements; independent proof checkers and adversarial tests establish what can actually be trusted.*
+
+---
+
 ## 21. Produktidentität und Schlussfolgerung
 
 Orin soll nicht nur eine Sprache sein, in der Agents bequem programmieren. Orin soll eine **durchgehende Evidenzkette** liefern:
