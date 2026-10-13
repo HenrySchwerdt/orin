@@ -19,6 +19,11 @@ type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
 // Checks one function body. `abs` marks the abstract check of a generic body (type parameters
 // are opaque types; no function instances are created). Returns the (possibly grown) environment.
 function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
+  if (f.mode == 6) {
+    // A lifted closure function: its HIR was produced while its enclosing function was checked.
+    const noErr: Option<Diagnostic> = None;
+    return FuncOut { func: env.lifted[f.cls], err: noErr, env: env };
+  }
   const fx = newFnCtx(f, env, abs);
   const r = checkBlock(env, fx, f.decl.body);
   return match (r) {
@@ -131,16 +136,30 @@ function abstractType(env: Env, g: usize): Option<Diagnostic> {
   }
 }
 
+// Unit index of the array prelude (`array/array.or`, loaded implicitly as unit `$array/array`; see
+// compiler/loader/prelude.or), or -1 when the program was loaded without preludes.
+function arrayPreludeUnit(prog: LoadedProgram): int {
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (prog.units[i].name == "$array/array") {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
   // Classes are lowered to records and functions first (ADR-0009).
   const lw = lowerClasses(prog);
   if (lw.diags.length > 0) {
     return Err(dedupDiags(lw.diags));
   }
-  const c = collect(lw.prog);
+  let c = collect(lw.prog);
   if (c.diags.length > 0) {
     return Err(dedupDiags(c.diags));
   }
+  c.env.prelude = arrayPreludeUnit(lw.prog);
   const r = resolveDecls(buildClassTables(c.env, lw.classes), c.recordSrc, c.unionSrc);
   if (r.diags.length > 0) {
     return Err(dedupDiags(r.diags));

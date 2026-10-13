@@ -153,6 +153,27 @@ function callMsg(p: MProgram, f: MFunction, dst: Option<usize>, fi: usize, args:
   };
 }
 
+// IClosure: the lifted function takes the environment record first (a reference) and has only
+// borrowed parameters (an indirect call cannot honour owned-parameter modes).
+function closureMsg(p: MProgram, f: MFunction, d: usize, fi: usize, caps: Operand[]): string {
+  if (!isCls(f, d, CRef)) {
+    return "IClosure: the destination must be a reference local";
+  }
+  if (fi >= p.functions.length) {
+    return "IClosure: function index out of range";
+  }
+  const g = p.functions[fi];
+  if (g.paramCount == 0 || tyClass(g.locals[0].ty) != CRef) {
+    return "IClosure: the lifted function must take the environment record as its first parameter";
+  }
+  for (const o of g.paramOwned) {
+    if (o) {
+      return "IClosure: the lifted function " + g.name + " must have only borrowed parameters";
+    }
+  }
+  return opsOk(p, f, caps) ? "" : "IClosure: bad capture operand";
+}
+
 function optDstOk(f: MFunction, dst: Option<usize>): bool {
   return match (dst) {
     None => true,
@@ -207,7 +228,12 @@ export function wfInstr(p: MProgram, f: MFunction, ins: Instr): string {
     IArrayTake(d, x, i) => (refPair(f, d, x) && opIs(p, f, i, CUsize)) ? "" : "IArrayTake: bad destination, array or index",
     IArrayPut(x, i, s) => (refPair(f, x, s) && opIs(p, f, i, CUsize)) ? "" : "IArrayPut: bad array, index or source",
     IArrayPush(x, v) => (isCls(f, x, CRef) && valueOk(p, f, x, v)) ? "" : "IArrayPush: bad array or value",
-    IArrayPop(d, x) => refPair(f, d, x) ? "" : "IArrayPop: needs two distinct reference locals"
+    IArrayPop(d, x) => refPair(f, d, x) ? "" : "IArrayPop: needs two distinct reference locals",
+    IClosure(d, fi, caps) => closureMsg(p, f, d, fi, caps),
+    ICallIndirect(dst, c, args) => {
+      if (!optDstOk(f, dst) || !opsOk(p, f, args)) { return "ICallIndirect: bad destination or argument"; }
+      return refLocalOp(f, c) ? "" : "ICallIndirect: the callee must be a reference local";
+    }
   };
 }
 

@@ -30,7 +30,24 @@ export type FnCtx = {
   // ... and the mutation probe: while true, bodies are only analysed for `this` mutation (no HIR is kept).
   probe: bool;
   mutThis: bool;       // a `this` place was mutated (set by the probe)
+  // Closures (ADR-0011). While an arrow function body is checked, `outer` is the context of the
+  // enclosing function at the point of creation (a snapshot; never modified). A name that is not
+  // a local of this function but is visible in `outer` becomes a *capture*: a fresh immutable local
+  // (`capIds`) initialised from the environment record, recorded in capNames / capTys.
+  outer: Option<FnCtx>;
+  capNames: string[];
+  capTys: Type[];
+  capIds: usize[];
+  qname: string;       // name of the function being checked (prefix of its lifted closures)
+  ncl: usize;          // closures created so far in this function
+  retInfer: bool;      // arrow block body without a known result type: `ret` is inferred from `return`s
+  retSeen: Option<Type>;
+  clsAcc: int;         // class whose private members are visible here (-1: none); closures inherit it
+  selfName: string;    // name of the `let` whose initialiser is being checked ("" if none)
+  pendLet: string;     // set by `let` while checking its initialiser, consumed by an arrow
 };
+
+export type VarOut = { fx: FnCtx; id: Option<usize>; };
 
 export type LocalOut = { fx: FnCtx; id: usize; };
 export type LoopOut = { fx: FnCtx; broke: bool; };
@@ -47,6 +64,11 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
   const marks: usize[] = [0];
   const loops: bool[] = [];
   const pre: HStmt[] = [];
+  const noCapN: string[] = [];
+  const noCapT: Type[] = [];
+  const noCapI: usize[] = [];
+  const noOuter: Option<FnCtx> = None;
+  const noSeen: Option<Type> = None;
   return FnCtx {
     unit: f.unit,
     ret: f.mode == 0 ? f.ret : f.srcRet,
@@ -66,8 +88,141 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
     pre: pre,
     tmps: 0,
     probe: false,
-    mutThis: false
+    mutThis: false,
+    outer: noOuter,
+    capNames: noCapN,
+    capTys: noCapT,
+    capIds: noCapI,
+    qname: f.qname,
+    ncl: 0,
+    retInfer: false,
+    retSeen: noSeen,
+    clsAcc: (f.mode >= 1 && f.mode <= 5) ? f.cls.toInt() : -1,
+    selfName: "",
+    pendLet: ""
   };
+}
+
+// The context for checking the body of an arrow function created in `o`: parameters (after the
+// environment local 0) are given by name and type. `ret` is TyVoid when it has to be inferred.
+export function newClosureCtx(o: FnCtx, qname: string, names: string[], tys: Type[], ret: Type, infer: bool): FnCtx {
+  let locals: Local[] = [Local { name: "env$", ty: TyVoid, mutable: false }];
+  let ns: string[] = [];
+  let ids: usize[] = [];
+  let i: usize = 0;
+  while (i < names.length) {
+    locals.push(Local { name: names[i], ty: tys[i], mutable: false });
+    ns.push(names[i]);
+    ids.push(i + 1);
+    i += 1;
+  }
+  const marks: usize[] = [0];
+  const loops: bool[] = [];
+  const pre: HStmt[] = [];
+  const noCapN: string[] = [];
+  const noCapT: Type[] = [];
+  const noCapI: usize[] = [];
+  const noSeen: Option<Type> = None;
+  return FnCtx {
+    unit: o.unit,
+    ret: ret,
+    locals: locals,
+    names: ns,
+    ids: ids,
+    marks: marks,
+    loops: loops,
+    env: o.env,
+    tpNames: o.tpNames,
+    tpTys: o.tpTys,
+    abs: o.abs,
+    depth: o.depth,
+    fmode: 0,
+    fcls: 0,
+    lret: ret,
+    pre: pre,
+    tmps: 0,
+    probe: o.probe,
+    mutThis: false,
+    outer: Some(o),
+    capNames: noCapN,
+    capTys: noCapT,
+    capIds: noCapI,
+    qname: qname,
+    ncl: 0,
+    retInfer: infer,
+    retSeen: noSeen,
+    clsAcc: o.clsAcc,
+    selfName: o.pendLet,
+    pendLet: ""
+  };
+}
+
+// Type of `name` as seen from `fx`: a local, a capture, or (through the chain of enclosing
+// functions) something an arrow function could capture.
+export function varType(fx: FnCtx, name: string): Option<Type> {
+  const l = lookupLocal(fx, name);
+  if (l.isSome()) {
+    return Some(fx.locals[l.unwrap()].ty);
+  }
+  let i: usize = 0;
+  while (i < fx.capNames.length) {
+    if (fx.capNames[i] == name) {
+      return Some(fx.capTys[i]);
+    }
+    i += 1;
+  }
+  return match (fx.outer) {
+    Some(o) => varType(o, name),
+    None => None
+  };
+}
+
+export function isVisibleVar(fx: FnCtx, name: string): bool {
+  return varType(fx, name).isSome();
+}
+
+// Resolves a variable use: a local of this function, else (inside an arrow function) a capture
+// of a variable of an enclosing function, which is registered on first use.
+export function lookupVar(fx: FnCtx, name: string): VarOut {
+  const l = lookupLocal(fx, name);
+  if (l.isSome()) {
+    return VarOut { fx: fx, id: l };
+  }
+  let i: usize = 0;
+  while (i < fx.capNames.length) {
+    if (fx.capNames[i] == name) {
+      return VarOut { fx: fx, id: Some(fx.capIds[i]) };
+    }
+    i += 1;
+  }
+  match (fx.outer) {
+    Some(o) => {
+      const t = varType(o, name);
+      match (t) {
+        Some(ty) => {
+          let f = fx;
+          const id = f.locals.length;
+          f.locals.push(Local { name: name, ty: ty, mutable: false });
+          f.capNames.push(name);
+          f.capTys.push(ty);
+          f.capIds.push(id);
+          return VarOut { fx: f, id: Some(id) };
+        },
+        None => {}
+      }
+    },
+    None => {}
+  }
+  return VarOut { fx: fx, id: None };
+}
+
+export function isCapturedLocal(fx: FnCtx, id: usize): bool {
+  for (const c of fx.capIds) {
+    if (c == id) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function pushScope(fx: FnCtx): FnCtx {

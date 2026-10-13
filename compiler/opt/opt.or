@@ -20,8 +20,32 @@ function ownedAny(f: MFunction): bool {
   return false;
 }
 
+// Functions whose address is taken by an `IClosure`: they are called through function values
+// (`ICallIndirect`), whose arguments are always borrowed, so their parameters stay borrowed
+// (ADR-0011, docs/mir.md v1.3). Calls through function values are not tracked by the inference.
+function closureTargets(p: MProgram): bool[] {
+  let out: bool[] = [];
+  for (const _f of p.functions) {
+    out.push(false);
+  }
+  for (const f of p.functions) {
+    for (const blk of f.blocks) {
+      for (const ins of blk.instrs) {
+        match (ins) {
+          IClosure(_, g, _) => {
+            out[g] = true;
+          },
+          _ => {}
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export function optimize(p: MProgram): MProgram {
   let q = p;
+  const pinned = closureTargets(p);
   let sites: PSites[][] = [];
   for (const f of p.functions) {
     let row: PSites[] = [];
@@ -40,7 +64,7 @@ export function optimize(p: MProgram): MProgram {
       let k: usize = 0;
       while (k < sites[fi].length) {
         const s = sites[fi][k];
-        if (s.ok && !q.functions[fi].paramOwned[k]) {
+        if (s.ok && !pinned[fi] && !q.functions[fi].paramOwned[k]) {
           let want = s.dup;
           for (const c of s.calls) {
             if (c.pos < q.functions[c.callee].paramOwned.length && q.functions[c.callee].paramOwned[c.pos]) {

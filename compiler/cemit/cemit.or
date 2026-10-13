@@ -304,7 +304,9 @@ function instrC(fx: Fx, i: Instr): string {
     IArrayTake(d, x, k) => lname(d) + " = ORIN_REF(orin_mir_array_take(" + lname(x) + ", " + opC(k) + "));",
     IArrayPut(x, k, s) => "orin_mir_array_put(" + lname(x) + ", " + opC(k) + ", ORIN_SLOT(" + lname(s) + "));",
     IArrayPush(x, v) => lname(x) + " = orin_mir_array_push(" + lname(x) + ", " + slotOf(fx, v) + ");",
-    IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); " + lname(d) + " = orin_array_pop(" + lname(x) + ");"
+    IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); " + lname(d) + " = orin_array_pop(" + lname(x) + ");",
+    IClosure(d, f, caps) => closureC(fx, d, f, caps),
+    ICallIndirect(d, f, args) => callIndirectC(fx, d, f, args)
   };
 }
 
@@ -348,6 +350,53 @@ function arrayNewC(fx: Fx, d: usize, isRef: bool, es: Operand[]): string {
     s += " orin_array_push(" + n + ", " + slotOf(fx, o) + ");";
   }
   return s;
+}
+
+// A closure is a struct `{ code pointer (scalar slot 0), environment (reference slot 1) }`; the
+// environment is a struct holding the captured values in order (the immortal nullary object when
+// nothing is captured). docs/mir.md v1.3, ADR-0011.
+function closureC(fx: Fx, d: usize, f: usize, caps: Operand[]): string {
+  const n = lname(d);
+  let s = "";
+  let env = "orin_nullary(0)";
+  if (caps.length > 0) {
+    s += "{ OrinObj *env_ = orin_struct_new(0, " + u(caps.length) + ", " + u(maskOf(fx, caps)) + "ULL);";
+    let k: usize = 0;
+    for (const o of caps) {
+      s += " orin_struct_set(env_, " + u(k) + ", " + slotOf(fx, o) + ");";
+      k += 1;
+    }
+    s += " ";
+    env = "env_";
+  }
+  s += n + " = orin_struct_new(0, 2, 2ULL); orin_struct_set(" + n + ", 0, (uint64_t)(uintptr_t)&" + fx.names[f]
+    + "); orin_struct_set(" + n + ", 1, ORIN_SLOT(" + env + "));";
+  if (caps.length > 0) {
+    s += " }";
+  }
+  return s;
+}
+
+// Call through a closure: the code pointer is cast to the C type implied by the operand and
+// destination types (environment first).
+function callIndirectC(fx: Fx, d: Option<usize>, f: Operand, args: Operand[]): string {
+  const c = opC(f);
+  const rt = match (d) {
+    Some(x) => cty(fx.f.locals[x].ty),
+    None => "void"
+  };
+  let sig = rt + " (*)(OrinObj *";
+  let cargs: string[] = ["ORIN_REF(orin_struct_get(" + c + ", 1))"];
+  for (const a of args) {
+    sig += ", " + cty(opTy(fx, a));
+    cargs.push(opC(a));
+  }
+  sig += ")";
+  const call = "((" + sig + ")(uintptr_t)orin_struct_get(" + c + ", 0))(" + cargs.join(", ") + ")";
+  return match (d) {
+    Some(x) => lname(x) + " = " + call + ";",
+    None => call + ";"
+  };
 }
 
 function termC(fx: Fx, t: Terminator): string {

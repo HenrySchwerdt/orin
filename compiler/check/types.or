@@ -7,7 +7,7 @@
 // resolution returns the possibly grown `Env` together with the type.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Ident, TypeExpr, TNamed, TArray, TypeDeclBody, DAlias, DRecord, DUnion, FunctionDecl, FieldDecl, VariantDecl } from "../syntax";
+import { Ident, TypeExpr, TNamed, TArray, TFn, TypeDeclBody, DAlias, DRecord, DUnion, FunctionDecl, FieldDecl, VariantDecl } from "../syntax";
 import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import {
   Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, findType, findInst, originOf, isVoid,
@@ -89,7 +89,18 @@ export function resolveTy(env: Env, sc: TScope, te: TypeExpr, voidOk: bool, stac
       const r = resolveTy(env, sc, inner, false, stack)?;
       return ok(r.env, TyArray(r.ty));
     },
-    TNamed(name, args) => resolveNamed(env, sc, te, name, args, voidOk, stack)
+    TNamed(name, args) => resolveNamed(env, sc, te, name, args, voidOk, stack),
+    TFn(ps, ret) => {
+      let cur = env;
+      let tys: Type[] = [];
+      for (const p of ps) {
+        const r = resolveTy(cur, sc, p.ty, false, stack)?;
+        cur = r.env;
+        tys.push(r.ty);
+      }
+      const rr = resolveTy(cur, sc, ret, true, stack)?;
+      return ok(rr.env, TyFn(tys, rr.ty));
+    }
   };
 }
 
@@ -378,7 +389,22 @@ export function unify(env: Env, unit: usize, te: TypeExpr, actual: Type, tp: str
       TyArray(a) => unify(env, unit, inner, a, tp, binds),
       _ => binds
     },
-    TNamed(name, args) => unifyNamed(env, unit, name, args, actual, tp, binds)
+    TNamed(name, args) => unifyNamed(env, unit, name, args, actual, tp, binds),
+    TFn(ps, ret) => match (actual) {
+      TyFn(aps, ar) => {
+        let b = binds;
+        if (aps.length == ps.length) {
+          let i: usize = 0;
+          while (i < ps.length) {
+            b = unify(env, unit, ps[i].ty, aps[i], tp, b);
+            i += 1;
+          }
+          b = unify(env, unit, ret, ar, tp, b);
+        }
+        return b;
+      },
+      _ => binds
+    }
   };
 }
 
@@ -466,6 +492,14 @@ function unifyGeneric(
 export function mentionsUnbound(te: TypeExpr, tp: string[], binds: Option<Type>[]): bool {
   return match (te.kind) {
     TArray(inner) => mentionsUnbound(inner, tp, binds),
+    TFn(ps, ret) => {
+      for (const p of ps) {
+        if (mentionsUnbound(p.ty, tp, binds)) {
+          return true;
+        }
+      }
+      return mentionsUnbound(ret, tp, binds);
+    },
     TNamed(name, args) => {
       if (args.length == 0) {
         const k = indexOfName(tp, name.name);

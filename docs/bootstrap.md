@@ -52,6 +52,12 @@ suites; Stage 0 is not expected to pass `next`). `tools/diff_parsers.py` skips `
   mutating), `fmt/printer.or`. HIR and backends are unchanged. `tools/diff_parsers.py` skips three
   parse_edge cases that pin Stage 0's rejection of `class`/`new`/`this`.
 
+* Closures (ADR-0011): `syntax/` (`EArrow`, `TFn`), `check/fnctx.or` (captures), `check/body.or` (closure
+  conversion, function values, array methods), `check/types.or` (`TyFn`), HIR `TyFn` / `XClosure` /
+  `XCallIndirect`, MIR `IClosure` / `ICallIndirect` (docs/mir.md v1.3), `lower`, `opt` (closure targets keep
+  borrowed parameters), `verify`, `cemit`, `llvm`. The array API prelude is `array/array.or`
+  (prelude root `$array`, embedded via `tools/embed_prelude.py`). `compiler/` itself still uses no closures (Orin-B).
+
 ## Writing efficient Orin-B (important for Stage 1 authors)
 
 Orin-B values are immutable-by-default RC'd objects; `let` mutation is copy-on-write and is
