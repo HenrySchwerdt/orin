@@ -1,0 +1,141 @@
+// Pure, lexical path utilities (Orin-B has no realpath). Paths use "/" separators and may be
+// absolute ("/a/b") or relative to the current directory ("a/b", "../a").
+
+// Non-empty path segments of `p` (no "." removal).
+function segments(p: string): string[] {
+  let out: string[] = [];
+  for (const s of p.split("/")) {
+    if (s.length > 0 && s != ".") {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+function isAbs(p: string): bool {
+  return p.length > 0 && p.charCodeAt(0) == 47;
+}
+
+// Resolve "." and ".." lexically and collapse "//". Relative results never start with "./";
+// the empty relative path is ".". ".." above the root of an absolute path is dropped.
+export function normalizePath(p: string): string {
+  const abs = isAbs(p);
+  let out: string[] = [];
+  for (const s of segments(p)) {
+    if (s == ".") {
+      continue;
+    }
+    if (s == "..") {
+      if (out.length > 0 && out[out.length - 1] != "..") {
+        out.pop();
+      } else if (!abs) {
+        out.push("..");
+      }
+      continue;
+    }
+    out.push(s);
+  }
+  const body = out.join("/");
+  if (abs) {
+    return "/" + body;
+  }
+  if (body.length == 0) {
+    return ".";
+  }
+  return body;
+}
+
+// Directory part of `p` (normalized first): "a/b.or" -> "a", "b.or" -> ".", "/b.or" -> "/".
+export function dirname(p: string): string {
+  const n = normalizePath(p);
+  let i: usize = n.length;
+  while (i > 0) {
+    if (n.charCodeAt(i - 1) == 47) {
+      if (i == 1) {
+        return "/";
+      }
+      return n.substring(0, i - 1);
+    }
+    i -= 1;
+  }
+  return ".";
+}
+
+// `b` resolved against directory `a` (an absolute `b` wins), normalized.
+export function joinPath(a: string, b: string): string {
+  if (isAbs(b)) {
+    return normalizePath(b);
+  }
+  return normalizePath(a + "/" + b);
+}
+
+function leadingDotDots(s: string[]): usize {
+  let k: usize = 0;
+  while (k < s.length && s[k] == "..") {
+    k += 1;
+  }
+  return k;
+}
+
+// Path of `path` relative to directory `base`, "/"-separated; "." when equal.
+// Components outside `base` become leading "../".
+export function relativeTo(base: string, path: string): string {
+  const b = segments(normalizePath(base));
+  const c = segments(normalizePath(path));
+  let common: usize = 0;
+  while (common < b.length && common < c.length && b[common] == c[common]) {
+    common += 1;
+  }
+  let parts: string[] = [];
+  let i = common;
+  while (i < b.length) {
+    parts.push("..");
+    i += 1;
+  }
+  let j = common;
+  while (j < c.length) {
+    parts.push(c[j]);
+    j += 1;
+  }
+  if (parts.length == 0) {
+    return ".";
+  }
+  return parts.join("/");
+}
+
+// True when `path` equals `dir` or lies below it. A relative `dir` made only of ".." segments
+// also contains every relative path with fewer leading ".." (those live deeper in its subtree).
+export function isInside(dir: string, path: string): bool {
+  const dn = normalizePath(dir);
+  const pn = normalizePath(path);
+  if (isAbs(dn) != isAbs(pn)) {
+    return false;
+  }
+  const d = segments(dn);
+  const p = segments(pn);
+  if (d.length == 0 && !isAbs(dn)) {
+    return leadingDotDots(p) == 0;
+  }
+  if (d.length > p.length) {
+    return false;
+  }
+  let i: usize = 0;
+  let prefix = true;
+  while (i < d.length) {
+    if (d[i] != p[i]) {
+      prefix = false;
+      break;
+    }
+    i += 1;
+  }
+  if (prefix) {
+    return true;
+  }
+  if (!isAbs(dn)) {
+    const k = leadingDotDots(d);
+    if (k == d.length && leadingDotDots(p) < k) {
+      return true;
+    }
+  }
+  return false;
+}
