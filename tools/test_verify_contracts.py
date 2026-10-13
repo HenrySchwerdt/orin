@@ -5,8 +5,8 @@ Usage: python3 tools/test_verify_contracts.py [--orinc build/bootstrap/orin2] [-
 
 Every tests/contracts/*.or lists its expected results in `// expect: <function> <kind> <STATUS>`
 header lines; the test runs `verify --contracts --format=json` and compares the multiset of
-(function, kind, status). It also checks the JSON shape (counterexample for FAILED, reason for
-UNKNOWN), the exit status (1 iff a clause FAILED; `--strict`: also UNKNOWN) and that the
+(function, kind, status). It also checks the JSON shape (counterexample for REFUTED, reason for
+UNKNOWN), the exit status (1 iff a clause REFUTED; `--strict`: also UNKNOWN) and that the
 human-readable output works. Without z3 the test is skipped unless --require-z3 is given.
 """
 import argparse
@@ -20,7 +20,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXPECT = re.compile(r"^//\s*expect:\s*(\S+)\s+(\S+)\s+(VERIFIED|FAILED|UNKNOWN)\s*$")
+EXPECT = re.compile(r"^//\s*expect:\s*(\S+)\s+(\S+)\s+(VERIFIED|REFUTED|UNKNOWN)\s*$")
 
 checks = 0
 failures = []
@@ -68,14 +68,14 @@ def main():
         got = collections.Counter((x["function"], x["kind"], x["status"]) for x in rep["results"])
         check(got == want, "%s: results differ\n  missing: %s\n  unexpected: %s" % (rel, dict(want - got), dict(got - want)))
         for x in rep["results"]:
-            if x["status"] == "FAILED":
-                check(len(x["counterexample"]) > 0, "%s: FAILED %s has no counterexample" % (rel, x["function"]))
+            if x["status"] == "REFUTED":
+                check(len(x["counterexample"]) > 0, "%s: REFUTED %s has no counterexample" % (rel, x["function"]))
             if x["status"] == "UNKNOWN":
                 check(x["reason"] != "", "%s: UNKNOWN %s has no reason" % (rel, x["function"]))
             check(x["line"] > 0 and x["file"].endswith(".or"), "%s: result without position" % rel)
         s = rep["summary"]
-        check(s["failed"] == sum(1 for x in rep["results"] if x["status"] == "FAILED"), "%s: summary" % rel)
-        any_failed = any(x["status"] == "FAILED" for x in rep["results"])
+        check(s["refuted"] == sum(1 for x in rep["results"] if x["status"] == "REFUTED"), "%s: summary" % rel)
+        any_failed = any(x["status"] == "REFUTED" for x in rep["results"])
         any_unknown = any(x["status"] == "UNKNOWN" for x in rep["results"])
         check((r.returncode == 1) == any_failed, "%s: exit status %d" % (rel, r.returncode))
         strict = run(orinc, "--strict", "--format=json", rel)

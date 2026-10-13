@@ -82,14 +82,14 @@ The test runner understands `// flags: --check-contracts` and `// stderr: text` 
 
 Generates verification conditions and discharges them with z3 (`z3 -in`, SMT-LIB 2; install with
 `pip install z3-solver` or your package manager). Query files are kept in `build/contracts-vc/`.
-Per clause the result is **VERIFIED** (solver `unsat`), **FAILED** (`sat`, with a counterexample for
-the parameters) or **UNKNOWN** (with a reason). Exit status 1 if any clause FAILED (or, with
+Per clause the result is **VERIFIED** (solver `unsat`), **REFUTED** (`sat`, with a counterexample for
+the parameters) or **UNKNOWN** (with a reason; never upgraded to VERIFIED). Exit status 1 if any clause is REFUTED (or, with
 `--strict`, UNKNOWN).
 
 Reported clauses: every `@Ensures`, the `@Requires` of every called function at each call site
 (`call-precondition`), and `@Decreases` (always UNKNOWN: termination is not checked). `@Rule` ids are
 attached to the results as `rules`. JSON: `{"results":[{"function","file","line","kind","clause",
-"rules","status","reason","counterexample"}],"summary":{...}}`.
+"rules","status","reason","counterexample"}],"summary":{"verified","refuted","unknown"}}`.
 
 Supported fragment: functions whose parameters and result are `int` or `bool`; body of `const`/`let`
 of such types, assignments and `+=` etc. to locals, `if`/`else`, `return`, blocks; expressions over
