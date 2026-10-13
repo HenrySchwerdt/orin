@@ -105,7 +105,8 @@ structured, stable diagnostics — optimised for the total effort needed to reac
 | Lean proofs: RC machine safety, copy-on-write, ownership-checker soundness (IR core) | ✅ partial |
 | `orin fmt`, `orin check --format=json`, `orin lsp`, VS Code extension | ✅ |
 | Closures + array API, LLVM backend, `orin mcp`, runtime in Orin | 🚧 in progress |
-| Floats, maps, interfaces, annotations & contracts, concurrency, packages | 📋 planned |
+| Packages (`orin.toml`, enforced module architecture rules, API snapshots) | ✅ |
+| Floats, maps, interfaces, annotations & contracts, concurrency | 📋 planned |
 
 Performance today: roughly 1.1–2.7× the run time of equivalent C on our
 [benchmarks](docs/benchmarks.md) (mixed against Go). Closing that gap without weakening safety
@@ -123,6 +124,33 @@ bin/orin build examples/shapes.or -o shapes && ./shapes
 bin/orin check examples/counter.or           # type-check only
 bin/orin fmt --stdout examples/generics.or   # canonical formatting
 ```
+
+### Packages
+
+A directory with an `orin.toml` is a package; `check`, `compile`, `build` and `run` accept it in
+place of a file and use the manifest's `entry` (default `src/main.or`).
+
+```toml
+[package]
+name = "shop"
+version = "0.1.0"            # entry = "src/main.or" by default
+
+[architecture]
+acyclic_modules = true       # private_by_default / explicit_public_api: always on
+[modules.payments]           # module = directory (with module.or) relative to the entry's directory
+allowed_dependencies = ["users", "database"]
+```
+
+```bash
+bin/orin run myshop/                          # build + run the package
+bin/orin check --deps myshop/                 # module -> imports summary (add --format=json)
+bin/orin api myshop/ > api.txt                # public API snapshot (signatures per module)
+bin/orin api --check api.txt myshop/          # exit 1 if the public API changed
+```
+
+A module with an `allowed_dependencies` rule may only import the listed modules (E0501); unknown
+module names in the manifest are E0502; manifest syntax errors are E0500 and invalid manifests
+E0503. The rules also apply when you check a single file inside the package (editors, MCP).
 
 Editor support: see [`editors/vscode`](editors/vscode) (syntax highlighting + language server).
 

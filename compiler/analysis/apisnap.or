@@ -1,0 +1,220 @@
+// Public API snapshot (spec 04 "Public API changes MUST be detectable"): the exported
+// declarations of every module of the loaded program, rendered as signatures from the semantic
+// index (so inferred method mutability shows as `mut method`). Deterministic text, suitable for
+// committing and diffing; `orin api --check <file>` compares against a saved snapshot.
+//
+// A module's public API is what its entry file exports: `module.or` of a module directory (own
+// exports and re-exports, resolved to the original declaration), or the program's entry file for
+// the root module. Private class members are omitted.
+
+import { LoadedProgram, Unit } from "../loader";
+import { Item, Ident } from "../syntax";
+import { SemanticIndex, SymbolDef } from "../hir";
+import { displayModule } from "../package";
+import { cmpStr, sortStrs } from "./modgraph";
+
+type Block = { name: string; head: string; members: string[]; };
+
+export const API_HEADER: string = "orin-api 1";
+
+function isTop(d: SymbolDef): bool {
+  return match (d.kind) {
+    SkFunction => true,
+    SkRecord => true,
+    SkUnion => true,
+    SkAlias => true,
+    SkConst => true,
+    _ => false
+  };
+}
+
+function hasId(xs: usize[], x: usize): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasName(xs: string[], x: string): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The exported top-level definition called `name` visible from unit `u` (own or re-exported).
+function resolveExport(prog: LoadedProgram, idx: SemanticIndex, u: usize, name: string, depth: usize): Option<usize> {
+  for (const d of idx.defs) {
+    if (d.unit == u && d.name == name && d.exported && d.container.isNone() && isTop(d)) {
+      return Some(d.id);
+    }
+  }
+  if (depth > 32) {
+    return None;
+  }
+  let k: usize = 0;
+  for (const it of prog.units[u].ast.items) {
+    match (it) {
+      IImport(_) => { k += 1; },
+      IReExport(decl) => {
+        if (k < prog.units[u].imports.length) {
+          match (prog.units[u].imports[k]) {
+            ImportUnit(t) => {
+              if (hasName(namesOf(decl.names), name)) {
+                const r = resolveExport(prog, idx, t, name, depth + 1);
+                if (r.isSome()) {
+                  return r;
+                }
+              }
+            },
+            ImportStd(_) => {}
+          }
+        }
+        k += 1;
+      },
+      _ => {}
+    }
+  }
+  return None;
+}
+
+function namesOf(ids: Ident[]): string[] {
+  let out: string[] = [];
+  for (const i of ids) {
+    out.push(i.name);
+  }
+  return out;
+}
+
+// Ids of the definitions exported by unit `u`: its own exports, then its re-exports.
+function exportedDefs(prog: LoadedProgram, idx: SemanticIndex, u: usize): usize[] {
+  let out: usize[] = [];
+  for (const d of idx.defs) {
+    if (d.unit == u && d.exported && d.container.isNone() && isTop(d) && !hasId(out, d.id)) {
+      out.push(d.id);
+    }
+  }
+  for (const it of prog.units[u].ast.items) {
+    match (it) {
+      IReExport(decl) => {
+        for (const n of decl.names) {
+          const r = resolveExport(prog, idx, u, n.name, 0);
+          if (r.isSome() && !hasId(out, r.unwrap())) {
+            out.push(r.unwrap());
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+function blockOf(idx: SemanticIndex, id: usize): Block {
+  const d = idx.defs[id];
+  let ms: string[] = [];
+  const hasMembers = match (d.kind) {
+    SkRecord => true,
+    SkUnion => true,
+    _ => false
+  };
+  for (const m of idx.defs) {
+    if (!hasMembers) {
+      break;
+    }
+    const inside = match (m.container) {
+      Some(c) => c == id,
+      None => false
+    };
+    if (inside && !m.detail.startsWith("private ")) {
+      ms.push(m.detail);
+    }
+  }
+  return Block { name: d.name, head: d.detail, members: ms };
+}
+
+function sortBlocks(bs: Block[]): Block[] {
+  let out: Block[] = [];
+  for (const b of bs) {
+    let at = out.length;
+    while (at > 0 && cmpStr(out[at - 1].name, b.name) > 0) {
+      at -= 1;
+    }
+    out = out.slice(0, at).concat([b]).concat(out.slice(at, out.length));
+  }
+  return out;
+}
+
+function isModuleEntry(u: Unit): bool {
+  return u.path.endsWith("/module.or") || u.path == "module.or";
+}
+
+// The snapshot text (one trailing newline).
+export function apiSnapshot(prog: LoadedProgram, idx: SemanticIndex): string {
+  let mods: string[] = [];
+  let entryOf: usize[] = [];
+  let ui: usize = 0;
+  while (ui < prog.units.length) {
+    const u = prog.units[ui];
+    if (u.module != "" && ui != prog.entry && isModuleEntry(u) && !hasName(mods, u.module)) {
+      mods.push(u.module);
+      entryOf.push(ui);
+    }
+    ui += 1;
+  }
+  const rootModule = prog.units[prog.entry].module;
+  if (rootModule != "" && !hasName(mods, rootModule)) {
+    mods.push(rootModule);
+    entryOf.push(prog.entry);
+  }
+  let lines: string[] = [API_HEADER];
+  match (prog.manifest) {
+    Some(mf) => { lines.push("package " + mf.name); },
+    None => {}
+  }
+  for (const m of sortStrs(mods)) {
+    let u: usize = 0;
+    let i: usize = 0;
+    while (i < mods.length) {
+      if (mods[i] == m) {
+        u = entryOf[i];
+      }
+      i += 1;
+    }
+    lines.push("module " + displayModule(m));
+    let bs: Block[] = [];
+    for (const id of exportedDefs(prog, idx, u)) {
+      bs.push(blockOf(idx, id));
+    }
+    for (const b of sortBlocks(bs)) {
+      lines.push("  " + b.head);
+      for (const mem of b.members) {
+        lines.push("    " + mem);
+      }
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+// Line-based difference between a saved snapshot and the current one: `-` lines only in `old`,
+// `+` lines only in `cur`, in order. Empty when equal.
+export function apiDiff(old: string, cur: string): string[] {
+  const a = old.split("\n");
+  const b = cur.split("\n");
+  let out: string[] = [];
+  for (const x of a) {
+    if (x.length > 0 && !hasName(b, x)) {
+      out.push("- " + x);
+    }
+  }
+  for (const y of b) {
+    if (y.length > 0 && !hasName(a, y)) {
+      out.push("+ " + y);
+    }
+  }
+  return out;
+}
