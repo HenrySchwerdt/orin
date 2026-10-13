@@ -20,7 +20,7 @@
 import { Span, SourceMap } from "../diag";
 import {
   Ident, Item, FunctionDecl, TypeDecl, ConstDecl, TypeExpr, Param, Block, Stmt, Expr, FieldInit, MatchArm,
-  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, CtorDecl, ArrowBody, InterfaceDecl, ContractClause
+  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, CtorDecl, ArrowBody, InterfaceDecl, ContractClause, Annotation
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
@@ -218,7 +218,8 @@ function renderTy(p: Program, t: Type): string {
       }
       return "(" + parts.join(", ") + ") => " + renderTy(p, r);
     },
-    TyIface(i) => i < p.ifaces.length ? shortName(p.ifaces[i].name) : "?"
+    TyIface(i) => i < p.ifaces.length ? shortName(p.ifaces[i].name) : "?",
+    TyFile => "File"
   };
 }
 
@@ -230,8 +231,35 @@ function addDef(w: W, name: string, kind: SymbolKind, nameSpan: Span, declSpan: 
   const id = x.defs.length;
   x.defs.push(SymbolDef {
     id: id, name: name, kind: kind, nameSpan: nameSpan, declSpan: declSpan, unit: x.unit,
-    container: container, exported: exported, detail: detail
+    container: container, exported: exported, detail: detail, deprecated: None
   });
+  return x;
+}
+
+// Annotations (ADR-0024) as written in the source, one per line, for hover texts.
+function annotationText(sm: SourceMap, as: Annotation[]): string {
+  let out = "";
+  for (const a of as) {
+    const f = sm.files[a.span.file];
+    out += f.text.substring(a.span.start, a.span.end).split("\n").join(" ") + "\n";
+  }
+  return out;
+}
+
+// `addDef` for a declaration that may carry annotations: the hover detail starts with them and
+// `@Deprecated` is recorded on the definition.
+function addDefA(w: W, name: string, kind: SymbolKind, nameSpan: Span, declSpan: Span, container: Option<usize>,
+    exported: bool, detail: string, as: Annotation[], sm: SourceMap): W {
+  let x = addDef(w, name, kind, nameSpan, declSpan, container, exported, annotationText(sm, as) + detail);
+  for (const a of as) {
+    const isD = match (a.kind) {
+      ADeprecated => true,
+      _ => false
+    };
+    if (isD) {
+      x.defs[x.defs.length - 1].deprecated = Some(a.message);
+    }
+  }
   return x;
 }
 
@@ -400,15 +428,15 @@ function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
   const cdetail = contractText(sm, t.contracts);
   match (t.body) {
     DAlias(te) => {
-      w = addDef(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te) + cdetail);
+      w = addDefA(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te) + cdetail, t.annotations, sm);
     },
     DRecord(fs) => {
       let parts: string[] = [];
       for (const f of fs) {
         parts.push(f.name.name + ": " + renderTE(f.ty));
       }
-      w = addDef(w, t.name.name, SkRecord, t.name.span, t.span, None, t.exported,
-        head + " = { " + parts.join("; ") + " }" + cdetail);
+      w = addDefA(w, t.name.name, SkRecord, t.name.span, t.span, None, t.exported,
+        head + " = { " + parts.join("; ") + " }" + cdetail, t.annotations, sm);
       for (const f of fs) {
         w = addDef(w, f.name.name, SkField, f.name.span, f.span, Some(id), t.exported,
           f.name.name + ": " + renderTE(f.ty));
@@ -419,8 +447,8 @@ function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
       for (const v of vs) {
         parts.push(variantText(v.name.name, v.payload));
       }
-      w = addDef(w, t.name.name, SkUnion, t.name.span, t.span, None, t.exported,
-        head + " = " + parts.join(" | ") + cdetail);
+      w = addDefA(w, t.name.name, SkUnion, t.name.span, t.span, None, t.exported,
+        head + " = " + parts.join(" | ") + cdetail, t.annotations, sm);
       for (const v of vs) {
         w = addDef(w, v.name.name, SkVariant, v.name.span, v.span, Some(id), t.exported,
           variantText(v.name.name, v.payload) + ": " + t.name.name + tpList(t.typeParams));
@@ -537,7 +565,7 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
     cdetail += " implements " + ins.join(", ");
   }
   cdetail += contractText(sm, c.contracts);
-  w = addDef(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, cdetail);
+  w = addDefA(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, cdetail, c.annotations, sm);
   for (const m of c.members) {
     match (m) {
       MCtor(k) => {
@@ -586,7 +614,7 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
           Some(t) => { d += ": " + renderTE(t); },
           None => {}
         }
-        w = addDef(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d + contractText(sm, md.contracts));
+        w = addDefA(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d + contractText(sm, md.contracts), md.annotations, sm);
       },
       MField(_) => {}
     }
@@ -599,20 +627,20 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
 
 // Interfaces (ADR-0019): the interface is an SkInterface def ("interface I"), followed by its methods
 // (SkFunction, container = the interface) in declaration order.
-function declareInterface(p: P1, unitName: string, k: InterfaceDecl): P1 {
+function declareInterface(p: P1, unitName: string, k: InterfaceDecl, sm: SourceMap): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
   let tqDefs = p.tqDefs;
   const id = w.defs.length;
-  w = addDef(w, k.name.name, SkInterface, k.name.span, k.span, None, k.exported, "interface " + k.name.name);
+  w = addDefA(w, k.name.name, SkInterface, k.name.span, k.span, None, k.exported, "interface " + k.name.name, k.annotations, sm);
   for (const m of k.methods) {
     let d = "method " + m.name.name + "(" + paramsText(m.params) + ")";
     match (m.ret) {
       Some(t) => { d += ": " + renderTE(t); },
       None => {}
     }
-    w = addDef(w, m.name.name, SkFunction, m.name.span, m.span, Some(id), k.exported, d);
+    w = addDefA(w, m.name.name, SkFunction, m.name.span, m.span, Some(id), k.exported, d, m.annotations, sm);
   }
   tab = addT(tab, k.name.name, id, k.exported);
   tq.push(unitName + "." + k.name.name);
@@ -1804,7 +1832,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
       match (item) {
         IFunction(f) => {
           did = p.w.defs.length;
-          p.w = addDef(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm));
+          p.w = addDefA(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm), f.annotations, sm);
           p.tab = addV(p.tab, f.name.name, did, f.exported);
         },
         IConst(k) => {
@@ -1822,7 +1850,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         },
         IInterface(ik) => {
           did = p.w.defs.length;
-          p = declareInterface(p, u.name, ik);
+          p = declareInterface(p, u.name, ik, sm);
         },
         _ => {}
       }
@@ -1989,7 +2017,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 }
                 const fd = FunctionDecl {
                   exported: false, name: cd.name, typeParams: cd.typeParams, bounds: [], params: ps,
-                  ret: None, body: k.body, contracts: allCtorClauses(cd, k), span: k.span
+                  ret: None, body: k.body, contracts: allCtorClauses(cd, k), annotations: [], span: k.span
                 };
                 match (ctorHf) {
                   Some(hf) => {
@@ -2021,7 +2049,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 }
                 const fd = FunctionDecl {
                   exported: false, name: md.name, typeParams: md.isStatic ? [] : cd.typeParams, bounds: [], params: md.params,
-                  ret: md.ret, body: md.body, contracts: md.contracts, span: md.span
+                  ret: md.ret, body: md.body, contracts: md.contracts, annotations: md.annotations, span: md.span
                 };
                 w = walkFunction(w, c, fd, dk, hf);
                 dk += 1;

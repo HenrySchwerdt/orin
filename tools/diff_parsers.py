@@ -36,7 +36,9 @@ PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("te
                 os.path.join("tests", "fmt", "genclasses.in.or"), os.path.join("tests", "fmt", "genclasses.out.or"),
                 # template literals and integer literals above i64 max (ADR-0022) are lexical errors (E0100) in Stage 0
                 os.path.join("tests", "fmt", "templates.in.or"), os.path.join("tests", "fmt", "templates.out.or"),
-                os.path.join("tests", "parse_edge", "ok_template_nested.or")}
+                os.path.join("tests", "parse_edge", "ok_template_nested.or"),
+                # built-in annotations (ADR-0024) are syntax beyond Orin-B
+                os.path.join("tests", "fmt", "annotations.in.or"), os.path.join("tests", "fmt", "annotations.out.or")}
 # Stage 1 accepts float literals (ADR-0018); these edge cases pin Stage 0's rejection only.
 FLOAT_SKIP = {"err0100_bad_float.or", "err0100_bad_float_in_expr.or", "err0100_bad_float_second_line.or",
               "err0100_bad_int_exp.or",

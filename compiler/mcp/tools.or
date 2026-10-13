@@ -12,6 +12,8 @@ import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdIo, StdClock
 import { Span } from "../diag";
 import { normalizePath, joinPath, dirname, loadAll } from "../loader";
 import { check } from "../check";
+import { runTests, TestOpts, reportJson, hasTests, eraseTests } from "../testing";
+import { parseJson } from "../json";
 import { ruleIndex } from "../package";
 import { lower } from "../lower";
 import { optimize } from "../opt";
@@ -98,11 +100,12 @@ export function toolList(): Json[] {
         jField("apply", prop("boolean", "write the edits to disk (default false: dry run)"))
       ], ["kind", "file", "position", "newName"])),
     tool("test",
-      "Run tests (requires --allow-exec). With entry: compile+run that program and compare stdout with its .out file. Otherwise run the conformance runner (suite default|next|all, optional filter).",
+      "Run tests (requires --allow-exec). With entry and unit=true: run the @Test functions of that program or package (orin test; one process per test) and return per-test results. With entry: compile+run that program and compare stdout with its .out file. Otherwise run the conformance runner (suite default|next|all, optional filter).",
       schema([
-        jField("entry", prop("string", "single program to compile and run")),
+        jField("entry", prop("string", "single program to compile and run, or the program/package whose @Test functions to run")),
+        jField("unit", prop("boolean", "run the @Test functions of entry (docs/testing.md) instead of comparing output")),
         jField("suite", enumProp(["default", "next", "all"], "conformance suite")),
-        jField("filter", prop("string", "substring filter for the suite"))
+        jField("filter", prop("string", "substring filter: for unit=true of the test id (<module>.<function>), else of the suite"))
       ], [])),
     tool("build",
       "Compile an entry to C (and optionally to a native binary with cc). Requires --allow-exec. Returns diagnostics on failure.",
@@ -485,7 +488,7 @@ function importName(a: Analysis, t: ImportTarget): string {
   return match (t) {
     ImportUnit(i) => prog.units[i].name == "$array/math" ? "std:math" : prog.units[i].name,
     ImportStd(m) => match (m) {
-      StdFs => "std:fs",
+      StdFs => "std:fsraw",
       StdProcess => "std:process",
       StdIo => "std:io",
       StdClock => "std:clock"
@@ -820,7 +823,16 @@ function compileEntry(st: McpState, entry: string, out: string): Compiled {
   if (loaded.diags.length > 0) {
     return Compiled { ok: false, diags: viewsOf(st, loaded.sm, toPathDiags(loaded.sm, loaded.diags)), err: "", bytes: 0 };
   }
-  const checked = check(loaded.program.unwrap(), loaded.sm);
+  let program = loaded.program.unwrap();
+  if (hasTests(program)) {
+    // @Test functions are checked but erased from ordinary builds (ADR-0024).
+    const full = check(program, loaded.sm);
+    if (full.isErr()) {
+      return Compiled { ok: false, diags: viewsOf(st, loaded.sm, toPathDiags(loaded.sm, full.unwrapErr())), err: "", bytes: 0 };
+    }
+    program = eraseTests(program);
+  }
+  const checked = check(program, loaded.sm);
   if (checked.isErr()) {
     return Compiled { ok: false, diags: viewsOf(st, loaded.sm, toPathDiags(loaded.sm, checked.unwrapErr())), err: "", bytes: 0 };
   }
@@ -960,9 +972,36 @@ function toolTest(st: McpState, args: Json): ToolOut {
   }
   const entry = getStr(args, "entry");
   if (entry.isSome()) {
+    if (getBool(args, "unit").unwrapOr(false)) {
+      return testUnits(st, entry.unwrap(), getStr(args, "filter").unwrapOr(""));
+    }
     return testEntry(st, entry.unwrap());
   }
   return testSuite(st, args);
+}
+
+// `@Test` functions (ADR-0024): the shared runner of `orin test`; the result is its JSON report
+// (docs/testing.md), or the compile diagnostics when the program does not build.
+function testUnits(st: McpState, entryRel: string, filter: string): ToolOut {
+  const e = resolvePath(st, entryRel);
+  if (e.isErr()) {
+    return fail(st, e.unwrapErr());
+  }
+  const rt = runtimeDir(st);
+  const r = runTests(TestOpts {
+    entry: e.unwrap(), filter: filter, runtime: rt, cc: "cc", outDir: "", keep: false, timeout: 10, contracts: true, root: st.root
+  });
+  if (r.diags.length > 0) {
+    return diagFailure(st, Compiled { ok: false, diags: viewsOf(st, r.sm, toPathDiags(r.sm, r.diags)), err: "", bytes: 0 });
+  }
+  if (r.error.length > 0) {
+    return fail(st, r.error);
+  }
+  const j = parseJson(reportJson(r));
+  if (j.isErr()) {
+    return fail(st, "internal error: cannot parse the test report");
+  }
+  return ok(st, j.unwrap());
 }
 
 function testEntry(st: McpState, entryRel: string): ToolOut {

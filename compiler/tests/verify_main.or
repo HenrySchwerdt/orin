@@ -3,7 +3,7 @@
 //   orinb build compiler/tests/verify_main.or -o build/verify_main && ./build/verify_main
 
 import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
-import { BStrLength, UnOp, BinOp } from "../hir";
+import { BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, UnOp, BinOp } from "../hir";
 import { verify, VerifyReport } from "../verify";
 import { exit } from "std:process";
 
@@ -12,6 +12,7 @@ import { exit } from "std:process";
 function lr(n: string): MLocal { return MLocal { name: n, ty: MRef }; }
 function li(n: string): MLocal { return MLocal { name: n, ty: MInt }; }
 function lu(n: string): MLocal { return MLocal { name: n, ty: MUsize }; }
+function lh(n: string): MLocal { return MLocal { name: n, ty: MHandle }; }
 function lb(n: string): MLocal { return MLocal { name: n, ty: MBool }; }
 
 function bk(instrs: Instr[], term: Terminator): MBlock {
@@ -38,7 +39,7 @@ function fnO(name: string, owned: bool[], locals: MLocal[], ret: MType, blocks: 
 }
 
 function prog(fs: MFunction[]): MProgram {
-  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: [] };
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: [], inlineFns: [] };
 }
 
 // Single void function `f` whose only block is `instrs; return`.
@@ -473,7 +474,7 @@ function closureCases(): usize {
 // ---------------------------------------------------------------- interfaces (v1.5, ADR-0019)
 
 function progVt(fs: MFunction[], vts: MVTable[]): MProgram {
-  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: vts };
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: vts, inlineFns: [] };
 }
 
 // Method `m(this: ref, x: int): int` implementing an interface method (all parameters borrowed).
@@ -541,8 +542,104 @@ function ifaceCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- resource handles (v1.8, ADR-0025)
+
+function opn(h: usize): Instr { return IBuiltin(Some(h), BFileOpen, [OStr(0), OInt(0)]); }
+function cls(h: usize, r: usize): Instr { return IBuiltin(Some(r), BFileClose, [OLocal(h)]); }
+function rdl(h: usize, r: usize): Instr { return IBuiltin(Some(r), BFileReadLine, [OLocal(h)]); }
+
+function handleCases(): usize {
+  let bad: usize = 0;
+  const dead = "dead";
+  const p1 = pos("open, read, close", straight(0, [lh("h"), lr("l"), lr("e")], [
+    opn(0), rdl(0, 1), IRelease(1), cls(0, 2), IRelease(2)]));
+  const p2 = pos("handle parameter passed to a call and a builtin (borrowed)", prog([
+    fn("f", 1, [lh("h"), lr("l"), li("i")], MVoid, [bk([ICall(None, 1, [OLocal(0)]), rdl(0, 1), IRelease(1)], ret())]),
+    fn("g", 1, [lh("h")], MVoid, [bk([], ret())])]));
+  const p3 = pos("scope shape: open, indirect call with the handle, close", prog([
+    fn("f", 0, [lh("h"), lr("c"), lr("e")], MVoid, [bk([
+      IClosure(1, 1, []), opn(0), ICallIndirect(None, OLocal(1), [OLocal(0)]), cls(0, 2), IRelease(2), IRelease(1)], ret())]),
+    fn("l", 2, [lr("env"), lh("h")], MVoid, [bk([], ret())])]));
+  const p4 = pos("closed on both branches", prog([
+    fn("f", 1, [lb("c"), lh("h"), lr("e")], MVoid, [
+      bk([opn(1)], TBranch(OLocal(0), 1, 2)),
+      bk([cls(1, 2), IRelease(2)], ret()),
+      bk([cls(1, 2), IRelease(2)], ret())])]));
+  const p5 = pos("two handles open at the same time", straight(0, [lh("a"), lh("b"), lr("e1"), lr("e2")], [
+    opn(0), opn(1), cls(1, 2), IRelease(2), cls(0, 3), IRelease(3)]));
+  const p6 = pos("trap with an open handle (the exit hook closes it)", prog([
+    fn("f", 0, [lh("h")], MVoid, [bk([opn(0)], TTrap("boom"))])]));
+  const p7 = pos("a handle can be reopened after it was closed", straight(0, [lh("h"), lr("e")], [
+    opn(0), cls(0, 1), IRelease(1), opn(0), cls(0, 1), IRelease(1)]));
+  const n1 = neg("handle never closed", straight(0, [lh("h")], [opn(0)]), "not closed");
+  const n2 = neg("handle closed on one branch only", prog([
+    fn("f", 1, [lb("c"), lh("h"), lr("e")], MVoid, [
+      bk([opn(1)], TBranch(OLocal(0), 1, 2)),
+      bk([cls(1, 2), IRelease(2)], TGoto(3)),
+      bk([], TGoto(3)),
+      bk([], ret())])]), "not closed");
+  const n3 = neg("use after close", straight(0, [lh("h"), lr("e"), lr("l")], [
+    opn(0), cls(0, 1), IRelease(1), rdl(0, 2), IRelease(2)]), dead);
+  const n4 = neg("double close", straight(0, [lh("h"), lr("e"), lr("f")], [
+    opn(0), cls(0, 1), IRelease(1), cls(0, 2), IRelease(2)]), "not open");
+  const n5 = neg("close of a handle parameter", prog([
+    fn("f", 1, [lh("h"), lr("e")], MVoid, [bk([cls(0, 1), IRelease(1)], ret())])]), "parameter");
+  const n6 = neg("copy of a handle", straight(0, [lh("a"), lh("b"), lr("e")], [
+    opn(0), ICopy(1, OLocal(0)), cls(0, 2), IRelease(2)]), "ICopy");
+  const n7 = neg("function returning a handle", prog([
+    fn("f", 0, [lh("h")], MHandle, [bk([opn(0)], TReturn(Some(OLocal(0))))])]), "returns a resource handle");
+  const n8 = neg("handle stored in a struct", straight(0, [lh("h"), lr("s"), lr("e")], [
+    opn(0), IStructNew(1, 0, [OLocal(0)]), IRelease(1), cls(0, 2), IRelease(2)]), "cannot be stored");
+  const n9 = neg("handle captured by a closure", prog([
+    fn("f", 0, [lh("h"), lr("c"), lr("e")], MVoid, [bk([opn(0), IClosure(1, 1, [OLocal(0)]), IRelease(1), cls(0, 2), IRelease(2)], ret())]),
+    lifted()]), "cannot be captured");
+  const n10 = neg("handles compared", straight(0, [lh("a"), lh("b"), lb("c"), lr("e")], [
+    opn(0), opn(1), IBinary(2, OpEq, OLocal(0), OLocal(1)), cls(0, 3), IRelease(3), cls(1, 3), IRelease(3)]), "IBinary");
+  const n11 = neg("handle read from a field", straight(1, [lr("p"), lh("h")], [IGetField(1, OLocal(0), 0)]), "only by BFileOpen");
+  const n12 = neg("handle passed to a non-file builtin", straight(0, [lh("h"), lu("n"), lr("e")], [
+    opn(0), IBuiltin(Some(1), BStrLength, [OLocal(0)]), cls(0, 2), IRelease(2)]), "only be passed");
+  const n13 = neg("handle in an array", straight(0, [lh("h"), lr("a"), lr("e")], [
+    opn(0), IArrayNew(1, false, [OLocal(0)]), IRelease(1), cls(0, 2), IRelease(2)]), "IArrayNew");
+  const n14 = neg("handle overwritten while open", straight(0, [lh("h"), lr("e")], [
+    opn(0), opn(0), cls(0, 1), IRelease(1)]), "overwritten");
+  const n15 = neg("handle pushed into an array", straight(0, [lh("h"), lr("a"), lr("e")], [
+    opn(0), IArrayNew(1, false, []), IArrayPush(1, OLocal(0)), IRelease(1), cls(0, 2), IRelease(2)]), "IArrayPush");
+  const n16 = neg("open without a destination", straight(0, [], [IBuiltin(None, BFileOpen, [OStr(0), OInt(0)])]), "bound to a local");
+  const n17 = neg("handle parameter reopened", prog([
+    fn("f", 1, [lh("h"), lr("e")], MVoid, [bk([opn(0)], ret())])]), "parameter");
+  const n18 = neg("handle moved", straight(0, [lh("a"), lh("b"), lr("e")], [
+    opn(0), IMove(1, 0)]), "IMove");
+  const n19 = neg("closed after a join where it is open on one path", prog([
+    fn("f", 1, [lb("c"), lh("h"), lr("e")], MVoid, [
+      bk([opn(1)], TBranch(OLocal(0), 1, 2)),
+      bk([cls(1, 2), IRelease(2)], TGoto(3)),
+      bk([], TGoto(3)),
+      bk([cls(1, 2), IRelease(2)], ret())])]), "some incoming paths");
+  const n20 = neg("handle result of a call", prog([
+    fn("f", 0, [lh("h")], MVoid, [bk([ICall(Some(0), 1, [])], ret())]),
+    fn("g", 0, [li("x")], MInt, [bk([], TReturn(Some(OInt(1))))])]), "ICall");
+  const n21 = neg("handle passed to a call that expects a reference", prog([
+    fn("f", 0, [lh("h"), lr("e")], MVoid, [bk([opn(0), ICall(None, 1, [OLocal(0)]), cls(0, 1), IRelease(1)], ret())]),
+    gVoid()]), "wrong class");
+  const n22 = neg("handle returned from an int function", prog([
+    fn("f", 0, [lh("h"), lr("e")], MInt, [bk([opn(0), cls(0, 1), IRelease(1)], TReturn(Some(OLocal(0))))])]), "TReturn");
+  const n23 = neg("handle used as a branch condition", prog([
+    fn("f", 0, [lh("h"), lr("e")], MVoid, [bk([opn(0)], TBranch(OLocal(0), 1, 1)), bk([cls(0, 1), IRelease(1)], ret())])]), "TBranch");
+  const n24 = neg("file builtin without a handle first argument", straight(0, [lr("l")], [
+    IBuiltin(Some(0), BFileReadLine, [OStr(0)])]), "first argument");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
+  if (!p5) { bad += 1; } if (!p6) { bad += 1; } if (!p7) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; } if (!n11) { bad += 1; } if (!n12) { bad += 1; }
+  if (!n13) { bad += 1; } if (!n14) { bad += 1; } if (!n15) { bad += 1; } if (!n16) { bad += 1; }
+  if (!n17) { bad += 1; } if (!n18) { bad += 1; } if (!n19) { bad += 1; } if (!n20) { bad += 1; }
+  if (!n21) { bad += 1; } if (!n22) { bad += 1; } if (!n23) { bad += 1; } if (!n24) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases();
+  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

@@ -4,7 +4,7 @@
 
 import { BinOp, UnOp, Builtin } from "../hir";
 import {
-  MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram
+  MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn
 } from "../mir";
 
 type Fx = { prog: MProgram; f: MFunction; names: string[]; };
@@ -41,6 +41,7 @@ function cty(t: MType): string {
     MInt => "int64_t",
     MBool => "int64_t",
     MFloat => "double",
+    MHandle => "int64_t",
     MUsize => "uint64_t",
     MVoid => "void",
     MRef => "OrinObj *"
@@ -257,6 +258,16 @@ function builtinC(op: Builtin, a: string[], rt: MType): string {
     BIoWriteStdout => c1("orin_io_write_stdout", a),
     BIoShell => c1("orin_io_shell", a),
     BTimeNowMillis => "orin_time_now_millis()",
+    BFileOpen => c2("orin_file_open", a),
+    BFileIsOpen => c1("orin_file_is_open", a),
+    BFileOpenError => c1("orin_file_open_error", a),
+    BFileClose => c1("orin_file_close", a),
+    BFileReadLine => c1("orin_file_read_line", a),
+    BFileRead => c2("orin_file_read", a),
+    BFileReadAll => c1("orin_file_read_all", a),
+    BFileWrite => c2("orin_file_write", a),
+    BFileWriteLine => c2("orin_file_write_line", a),
+    BFileFlush => c1("orin_file_flush", a),
     BStrLength => c1("orin_str_len", a),
     BStrCharCodeAt => c2("orin_str_char_code_at", a),
     BStrCharAt => c2("orin_str_char_at", a),
@@ -506,8 +517,10 @@ function switchC(o: Operand, cases: SwitchCase[], d: usize): string {
 
 // ---------------------------------------------------------------- functions
 
-function signature(name: string, f: MFunction): string {
-  let s = cty(f.ret) + " " + name + "(";
+// `@Inline` (ADR-0024) becomes `static inline`: a hint the C compiler may ignore, so semantics and
+// link behaviour (one translation unit) are unchanged.
+function signature(name: string, f: MFunction, inl: bool): string {
+  let s = (inl ? "static inline " : "") + cty(f.ret) + " " + name + "(";
   if (f.paramCount == 0) {
     s += "void";
   }
@@ -568,7 +581,7 @@ export function emitC(prog: MProgram): string {
   let sigs: string[] = [];
   i = 0;
   while (i < prog.functions.length) {
-    sigs.push(signature(names[i], prog.functions[i]));
+    sigs.push(signature(names[i], prog.functions[i], isInlineFn(prog, prog.functions[i].name)));
     i += 1;
   }
   let out: string[] = [];

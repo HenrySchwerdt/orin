@@ -9,3 +9,4 @@ for t in json_test analysis_test lsp_test verify_main package_test; do
   cc -O1 -w -I runtime build/$t.c runtime/orin_runtime.c platform/orin_platform.c -o build/$t
   ./build/$t
 done
+sh tools/test_resources.sh

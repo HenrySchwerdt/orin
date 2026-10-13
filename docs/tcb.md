@@ -21,7 +21,7 @@ today. "Trusted" means a bug there can silently break a guarantee.
 | Lean model (`run_safe`, `makeUnique_store_cow`) | trusted (Lean kernel) | machine-checked | models the RC machine, not the C runtime code |
 | C backend (`cemit`), LLVM backend | trusted | backend differential tests (C vs LLVM vs builtins vs opt), LLVM fixed-point self-build | no translation validation |
 | Runtime object model (`runtime/orin_runtime.c`: RC, COW, arrays, strings) | trusted | ASan/UBSan runs of all suites, `ORIN_STATS` counters | not verified; R3 moves it into Orin, R4 refinement proof |
-| L0 platform layer (`platform/`) | trusted, deliberately small (≤1000 lines) | ACSL-style contracts, 651 contract tests, CBMC bounded harnesses, boundary checker | bounded, not full Frama-C proof; float text conversion and clock are thin libc wrappers without harnesses |
+| L0 platform layer (`platform/`) | trusted, deliberately small (≤1000 lines) | ACSL-style contracts, 689 contract tests, CBMC bounded harnesses, boundary checker | bounded, not full Frama-C proof; float text conversion and clock are thin libc wrappers without harnesses |
 | C compiler, linker, libc, libm, OS kernel | trusted (external) | — | outside Orin's control; reproducible builds limit exposure |
 
 ## The compiler binary itself (bootstrap)

@@ -10,6 +10,19 @@
   explaining path from entry points; the HTML report is one self-contained file. MCP tools `graph` and
   `diff`. `SemanticIndex` gains `calls` (call sites from the typed HIR). CI uploads the diff report of a
   pull request as an artifact (report only). `orin api --check` is unchanged.
+- Built-in annotations (ADR-0024, spec 05; compiler built-ins only, any other `@Name` is still E0408):
+  `@Test` on top-level `void` functions with `orin test <file|dir> [--filter S] [--format=json]` (one
+  executable, one process per test, PASS/FAIL per test, stable JSON, MCP `test` with `unit: true`) and
+  the new `std:test` module (`assert`, `assertEq`, ...); `@Test` functions are type-checked but erased from
+  ordinary builds (byte-identical output). `@Deprecated("message")` gives warning W0440 on uses (text, JSON
+  `severity:"warning"`, LSP severity 2 + Deprecated tag, hover, `orin api --check`). `@Inline` becomes
+  `static inline` (C) / `alwaysinline` (LLVM); a recursive `@Inline` function is E0444. New errors
+  E0440-E0445, formatter, VS Code grammar. See docs/testing.md.
+- Resources and streaming `std:fs` (ADR-0025, ADR-0016 "Resources"): `File` is a non-copyable handle that can only be a
+  function parameter; scope API `withFile` / `useFile` / `withFiles` / `useFiles` (`std:fs`, unstable until capabilities)
+  with `readLine`, `read`, `readAll`, `write`, `writeLine`, `flush`; errors E0450 (resource inside another type /
+  variable / result), E0451 (handle used as a value), E0452 (captured by a closure). MIR v1.8: `MHandle` with a linear
+  open/close discipline in the verifier; platform stream primitives with contracts; runtime handle table.
 - Packages (ADR-0016, spec 04): `orin.toml` manifest (`[package]`, `[architecture]`,
   `[modules.<path>] allowed_dependencies`), enforced by the loader (E0501 disallowed import, E0502
   unknown module, E0500/E0503 manifest errors); `orin check|compile|build|run <package-dir>`;

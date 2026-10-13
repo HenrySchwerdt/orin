@@ -1,0 +1,330 @@
+// `orin test` (ADR-0024, docs/testing.md): build one test executable from the `@Test` functions of a
+// program, run every selected test in its own process and report PASS / FAIL per test.
+//
+// Isolation: the executable runs exactly one test, chosen by argv[1] (see transform.or); the runner
+// starts it once per test through the shell. A trap (assertion, contract violation, bounds error...),
+// a non-zero exit, a crash or a timeout therefore fails only that test. Cost: one process start per
+// test (milliseconds), in exchange for no fork support in the language and no shared state.
+//
+// This file is shared by the CLI (`orin test`) and the MCP `test` tool.
+
+import { Diagnostic, SourceMap, render, isWarning } from "../diag";
+import { loadWithRoots, preludeRoots, isInside } from "../loader";
+import { SourceFile } from "../diag";
+import { check, checkRuntime, checkWithIndex, deprecationWarnings, hasDeprecated } from "../check";
+import { lower } from "../lower";
+import { emitC } from "../cemit";
+import { optimize, pruneProgram } from "../opt";
+import { verify } from "../verify";
+import { shellRun } from "../lsp";
+import { quoteJson } from "../json";
+import { formatDiagnosticJson } from "../tools";
+import { readFile, writeFile, exists } from "std:fs";
+import { TestCase, buildTestProgram, discoverTests, ensureMain } from "./transform";
+
+export type TestOpts = {
+  entry: string;        // .or file or package directory
+  filter: string;       // substring of the test id ("" = all)
+  runtime: string;      // directory with orin_runtime.c / orin_runtime.h (the platform layer is ../platform)
+  cc: string;           // C compiler command, may include flags
+  outDir: string;       // "" = a fresh directory under /tmp, removed afterwards
+  keep: bool;           // keep the build directory
+  timeout: int;         // seconds per test, 0 = none
+  contracts: bool;      // build with runtime contract checking (ADR-0012): a violated contract fails the test
+  root: string;         // "" or the directory every loaded file must lie inside (the MCP server's authorized root)
+};
+
+export type TestResult = {
+  test: TestCase;
+  path: string;
+  line: usize;
+  col: usize;
+  pass: bool;
+  exitCode: int;
+  reason: string;       // "" when passed: "trap", "timeout", "crash" or "exit N"
+  stdout: string;
+  stderr: string;
+};
+
+// `error` is non-empty when no test could be run for a reason other than diagnostics (cc failed ...).
+export type TestRun = {
+  sm: SourceMap;
+  diags: Diagnostic[];       // errors of loading / checking
+  warnings: Diagnostic[];
+  error: string;
+  discovered: usize;
+  results: TestResult[];
+};
+
+export function shq(s: string): string {
+  return "'" + s.split("'").join("'\\''") + "'";
+}
+
+function readOr(path: string): string {
+  const r = readFile(path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+function trunc(s: string, n: usize): string {
+  if (s.length <= n) {
+    return s;
+  }
+  return s.substring(0, n) + "\n...[truncated " + (s.length - n).toString() + " bytes]";
+}
+
+function chomp(s: string): string {
+  let e = s.length;
+  while (e > 0 && s.charCodeAt(e - 1) == 10) {
+    e -= 1;
+  }
+  return s.substring(0, e);
+}
+
+function lineCol(text: string, offset: usize, wantCol: bool): usize {
+  let line: usize = 1;
+  let col: usize = 1;
+  let i: usize = 0;
+  while (i < offset && i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      line += 1;
+      col = 1;
+    } else {
+      col += 1;
+    }
+    i += 1;
+  }
+  return wantCol ? col : line;
+}
+
+function newRun(sm: SourceMap): TestRun {
+  return TestRun { sm: sm, diags: [], warnings: [], error: "", discovered: 0, results: [] };
+}
+
+function failRun(sm: SourceMap, msg: string): TestRun {
+  return TestRun { sm: sm, diags: [], warnings: [], error: msg, discovered: 0, results: [] };
+}
+
+function tempDir(): Option<string> {
+  let n: usize = 0;
+  while (n < 500) {
+    const d = "/tmp/orin-test-" + n.toString();
+    if (shellRun("mkdir -m 700 " + shq(d) + " 2>/dev/null") == 0) {
+      return Some(d);
+    }
+    n += 1;
+  }
+  return None;
+}
+
+// The command that runs test `idx` of executable `exe`, output redirected to `base`.out / `base`.err.
+function runCommand(exe: string, idx: usize, base: string, timeout: int): string {
+  let inner = shq(exe) + " " + idx.toString();
+  if (timeout > 0) {
+    inner = "if command -v timeout >/dev/null 2>&1; then timeout " + timeout.toString() + " " + inner + "; else " + inner + "; fi";
+  }
+  return "( " + inner + " ) > " + shq(base + ".out") + " 2> " + shq(base + ".err");
+}
+
+function reasonOf(code: int): string {
+  if (code == 0) {
+    return "";
+  }
+  if (code == 101) {
+    return "trap";
+  }
+  if (code == 124) {
+    return "timeout";
+  }
+  if (code < 0 || code >= 128) {
+    return "crash";
+  }
+  return "exit " + code.toString();
+}
+
+function matches(id: string, filter: string): bool {
+  return filter.length == 0 || id.includes(filter);
+}
+
+export function runTests(o: TestOpts): TestRun {
+  const none: SourceFile[] = [];
+  const loaded = loadWithRoots(o.entry, none, preludeRoots());
+  if (loaded.diags.length > 0) {
+    return TestRun { sm: loaded.sm, diags: loaded.diags, warnings: [], error: "", discovered: 0, results: [] };
+  }
+  const sm = loaded.sm;
+  if (o.root.length > 0) {
+    for (const f of sm.files) {
+      if (!f.path.startsWith("$") && !isInside(o.root, f.path)) {
+        return failRun(sm, "project reads a file outside the authorized root: " + f.path);
+      }
+    }
+  }
+  const program = ensureMain(loaded.program.unwrap());
+  // The real program first: diagnostics keep the names and positions the author wrote.
+  const first = check(program, sm);
+  if (first.isErr()) {
+    return TestRun { sm: sm, diags: first.unwrapErr(), warnings: [], error: "", discovered: 0, results: [] };
+  }
+  let warnings: Diagnostic[] = [];
+  if (hasDeprecated(program)) {
+    warnings = deprecationWarnings(program, checkWithIndex(program, sm).index);
+  }
+  const tests = discoverTests(program);
+  if (tests.length == 0) {
+    return TestRun { sm: sm, diags: [], warnings: warnings, error: "", discovered: 0, results: [] };
+  }
+  const built = buildTestProgram(program);
+  if (built.isErr()) {
+    return failRun(sm, "internal error: cannot build the test harness: " + built.unwrapErr().message);
+  }
+  const tb = built.unwrap();
+  const checked = o.contracts ? checkRuntime(tb.prog, sm) : check(tb.prog, sm);
+  if (checked.isErr()) {
+    let msg = "internal error: the test harness does not type-check";
+    for (const d of checked.unwrapErr()) {
+      msg += "\n  " + render(sm, d);
+    }
+    return failRun(sm, msg);
+  }
+  const mir = optimize(lower(checked.unwrap()));
+  if (verify(mir).errors.length > 0) {
+    return failRun(sm, "internal compiler error: MIR ownership verification failed");
+  }
+  const c = emitC(pruneProgram(mir));
+  let dir = o.outDir;
+  let ownDir = false;
+  if (dir.length == 0) {
+    const t = tempDir();
+    if (t.isNone()) {
+      return failRun(sm, "cannot create a temporary directory under /tmp (use --out-dir DIR)");
+    }
+    dir = t.unwrap();
+    ownDir = true;
+  } else {
+    shellRun("mkdir -p " + shq(dir));
+  }
+  const cfile = dir + "/tests.c";
+  const exe = dir + "/tests";
+  const w = writeFile(cfile, c);
+  if (w.isErr()) {
+    return failRun(sm, "cannot write " + cfile + ": " + w.unwrapErr());
+  }
+  const rt = o.runtime;
+  if (!exists(rt + "/orin_runtime.c")) {
+    return failRun(sm, "runtime not found at " + rt + " (pass --runtime <dir>; the packaged `orin` launcher does this)");
+  }
+  const log = dir + "/cc.log";
+  const cc = shellRun(o.cc + " -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " " + shq(rt + "/../platform/orin_platform.c")
+    + " -lm -o " + shq(exe) + " > " + shq(log) + " 2>&1");
+  if (cc != 0) {
+    const text = trunc(readOr(log), 2000);
+    if (ownDir && !o.keep) {
+      shellRun("rm -rf " + shq(dir));
+    }
+    return failRun(sm, "the C compiler failed (`" + o.cc + "`, exit " + cc.toString() + "): " + text);
+  }
+  let results: TestResult[] = [];
+  for (const t of tests) {
+    if (!matches(t.id, o.filter)) {
+      continue;
+    }
+    const base = dir + "/t" + t.index.toString();
+    const code = shellRun(runCommand(exe, t.index, base, o.timeout));
+    const text = sm.files[t.file].text;
+    results.push(TestResult {
+      test: t, path: sm.files[t.file].path, line: lineCol(text, t.start, false), col: lineCol(text, t.start, true),
+      pass: code == 0, exitCode: code, reason: reasonOf(code),
+      stdout: chomp(readOr(base + ".out")), stderr: chomp(readOr(base + ".err"))
+    });
+  }
+  if (ownDir && !o.keep) {
+    shellRun("rm -rf " + shq(dir));
+  }
+  return TestRun { sm: sm, diags: [], warnings: warnings, error: "", discovered: tests.length, results: results };
+}
+
+export function passedCount(r: TestRun): usize {
+  let n: usize = 0;
+  for (const x of r.results) {
+    if (x.pass) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+export function failedCount(r: TestRun): usize {
+  return r.results.length - passedCount(r);
+}
+
+// True when the run succeeded: no errors and no failed test.
+export function runOk(r: TestRun): bool {
+  return r.diags.length == 0 && r.error.length == 0 && failedCount(r) == 0;
+}
+
+function indent(s: string, pad: string): string {
+  let out: string[] = [];
+  for (const l of s.split("\n")) {
+    out.push(pad + l);
+  }
+  return out.join("\n");
+}
+
+// Human-readable report (stdout of `orin test`). Failing tests show what they printed.
+export function reportText(r: TestRun): string {
+  let lines: string[] = [];
+  for (const x of r.results) {
+    if (x.pass) {
+      lines.push("PASS " + x.test.id);
+    } else {
+      const why = x.reason.startsWith("exit") ? x.reason : x.reason + ", exit " + x.exitCode.toString();
+      lines.push("FAIL " + x.test.id + " (" + why + ") " + x.path + ":" + x.line.toString() + ":" + x.col.toString());
+      if (x.stderr.length > 0) {
+        lines.push(indent(trunc(x.stderr, 2000), "     stderr: "));
+      }
+      if (x.stdout.length > 0) {
+        lines.push(indent(trunc(x.stdout, 2000), "     stdout: "));
+      }
+    }
+  }
+  const filtered = r.discovered - r.results.length;
+  let tail = passedCount(r).toString() + " passed, " + failedCount(r).toString() + " failed";
+  if (filtered > 0) {
+    tail += ", " + filtered.toString() + " filtered out";
+  }
+  if (r.discovered == 0) {
+    tail = "no tests found (annotate functions with @Test)";
+  }
+  lines.push(tail);
+  return lines.join("\n");
+}
+
+function jstr(s: string): string {
+  return quoteJson(s);
+}
+
+// Stable JSON (one line; key order fixed; no timings): see docs/testing.md.
+//   {"ok":bool,"total":N,"passed":N,"failed":N,"filtered":N,"tests":[{"id","unit","name","file","line","col",
+//    "status":"pass"|"fail","exitCode":N,["reason","stdout","stderr"]}],"warnings":[diagnostic objects]}
+export function reportJson(r: TestRun): string {
+  let ts: string[] = [];
+  for (const x of r.results) {
+    let s = "{\"id\":" + jstr(x.test.id) + ",\"unit\":" + jstr(x.test.unit) + ",\"name\":" + jstr(x.test.name)
+      + ",\"file\":" + jstr(x.path) + ",\"line\":" + x.line.toString() + ",\"col\":" + x.col.toString()
+      + ",\"status\":" + (x.pass ? "\"pass\"" : "\"fail\"") + ",\"exitCode\":" + x.exitCode.toString();
+    if (!x.pass) {
+      s += ",\"reason\":" + jstr(x.reason) + ",\"stdout\":" + jstr(trunc(x.stdout, 2000)) + ",\"stderr\":" + jstr(trunc(x.stderr, 2000));
+    }
+    ts.push(s + "}");
+  }
+  let ws: string[] = [];
+  for (const d of r.warnings) {
+    ws.push(formatDiagnosticJson(r.sm, d));
+  }
+  return "{\"ok\":" + (runOk(r) ? "true" : "false") + ",\"total\":" + r.results.length.toString() + ",\"passed\":" + passedCount(r).toString()
+    + ",\"failed\":" + failedCount(r).toString() + ",\"filtered\":" + (r.discovered - r.results.length).toString()
+    + ",\"tests\":[" + ts.join(",") + "],\"warnings\":[" + ws.join(",") + "]}";
+}

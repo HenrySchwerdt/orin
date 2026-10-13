@@ -5,8 +5,10 @@ Beyond Orin-B (self-hosted compiler only; the compiler sources themselves stay O
 
 Contract clauses look like annotations but are **not annotations**: `@Requires(e)`, `@Ensures(e)`,
 `@Invariant(e)`, `@Decreases(e)` and `@Rule("ID")` are a closed set of reserved constructs with their
-own grammar productions and AST node (`ContractClause`, `compiler/syntax/ast.or`). Any other `@Name`
-is reported as E0408 ("annotations are not supported yet", spec 05).
+own grammar productions and AST node (`ContractClause`, `compiler/syntax/ast.or`). The compiler's
+built-in annotations `@Test`, `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) are a separate closed
+set with their own AST node (`Annotation`); they may be mixed with contract clauses and are printed
+before them. Any other `@Name` is reported as E0408 (user-defined annotations are post-1.0).
 
 ## Placement (grammar, E0200 otherwise)
 
