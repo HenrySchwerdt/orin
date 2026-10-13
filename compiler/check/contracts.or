@@ -1,0 +1,182 @@
+// Contract clauses in the checker (ADR-0012, spec 15 §4.2a). Beyond Orin-B.
+//
+// Every build resolves and type-checks the contract expressions of functions, methods, constructors,
+// classes, records and loops, so they cannot rot; the results are discarded (contracts are erased
+// from the generated code). A clause is checked in a *forked* function context at the entry of the
+// function it constrains:
+//   * `@Requires`, `@Decreases`: parameters (and `this` in methods);
+//   * `@Ensures`: additionally `result` (a read-only local of the function's source return type;
+//     absent for `void` functions, so `result` is then an unresolved name, E0300) and `old(e)`;
+//   * `@Invariant` of a class: `this` in the constructor (class invariants are checked with it);
+//   * `@Invariant` of a record type: `this` bound to a value of the record.
+// Checking itself is `checkClause` (body.or). Purity of the called functions is a separate pass over
+// the HIR of all functions (purity.or).
+
+import { Diagnostic, diag } from "../diag";
+import {
+  Ident, Block, TypeExpr, FunctionDecl, Param, Stmt, IType, TypeDecl, ContractKind,
+  CRequires, CEnsures, CInvariant, CDecreases, CRule
+} from "../syntax";
+import { Type, Local, HExpr } from "../hir";
+import { LoadedProgram } from "../loader";
+import { Env, FuncInfo, EntRecord, findType, isVoid } from "./env";
+import { FnCtx, newFnCtx, newLocal, declare, declaredInScope } from "./fnctx";
+import { checkClause } from "./body";
+
+export type CfOut = { fx: FnCtx; exprs: HExpr[]; };
+
+function isEnsures(k: ContractKind): bool {
+  return match (k) {
+    CEnsures => true,
+    _ => false
+  };
+}
+
+function isInvariant(k: ContractKind): bool {
+  return match (k) {
+    CInvariant => true,
+    _ => false
+  };
+}
+
+// Checks the clauses of the function `f` (FuncInfo.decl.contracts) in forks of `fx`, the context at
+// the function's entry (parameters declared).
+export function checkFuncContracts(env: Env, f: FuncInfo, fx0: FnCtx): Result<CfOut, Diagnostic> {
+  let fx = fx0;
+  let exprs: HExpr[] = [];
+  for (const c of f.decl.contracts) {
+    const isRule = match (c.kind) {
+      CRule => true,
+      _ => false
+    };
+    if (isRule) {
+      continue;
+    }
+    let scope = fx;
+    // `this`: methods get a fresh local of the receiver's type (so that a mutating call is reported as E0416, not E0401); constructors only see it in class invariants.
+    if (f.mode == 2 || f.mode == 3 || f.mode == 4) {
+      const nl = newLocal(scope, "this", scope.locals[0].ty, true);
+      scope = declare(nl.fx, Ident { name: "this", span: c.span }, nl.id)?;
+    } else if (f.mode == 1 && isInvariant(c.kind)) {
+      const nl = newLocal(scope, "this", f.ret, true);
+      scope = declare(nl.fx, Ident { name: "this", span: c.span }, nl.id)?;
+    }
+    let cmode: int = 1;
+    if (isEnsures(c.kind)) {
+      cmode = 2;
+      if (!isVoid(scope.ret)) {
+        if (declaredInScope(scope, "result")) {
+          return Err(diag("E0415", c.span, "a parameter named `result` hides the `result` of @Ensures; rename the parameter"));
+        }
+        const rl = newLocal(scope, "result", scope.ret, false);
+        scope = declare(rl.fx, Ident { name: "result", span: c.span }, rl.id)?;
+      }
+    }
+    const o = checkClause(env, scope, c, cmode)?;
+    fx.env = o.env;
+    match (o.expr) {
+      Some(x) => { exprs.push(x); },
+      None => {}
+    }
+  }
+  return Ok(CfOut { fx: fx, exprs: exprs });
+}
+
+export type RecOut = { env: Env; exprs: HExpr[]; diags: Diagnostic[]; };
+
+// `@Invariant` of record types (`type R = { .. }`): `this` is a value of the record.
+export function checkRecordContracts(env0: Env, prog: LoadedProgram): RecOut {
+  let env = env0;
+  let exprs: HExpr[] = [];
+  let diags: Diagnostic[] = [];
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    for (const it of u.ast.items) {
+      match (it) {
+        IType(td) => {
+          if (td.contracts.length > 0) {
+            const hasInv = recHasInvariant(td);
+            if (hasInv && td.typeParams.length > 0) {
+              diags.push(diag("E0408", td.name.span, "@Invariant on a generic record type is not supported yet"));
+            } else if (hasInv) {
+              const te = findType(env.units[ui].scope, td.name.name);
+              match (te) {
+                Some(ent) => {
+                  match (ent) {
+                    EntRecord(r) => {
+                      const o = checkRecInvariants(env, ui, td, r);
+                      match (o) {
+                        Ok(ro) => {
+                          env = ro.env;
+                          for (const x of ro.exprs) {
+                            exprs.push(x);
+                          }
+                        },
+                        Err(d) => { diags.push(d); }
+                      }
+                    },
+                    _ => {}
+                  }
+                },
+                None => {}
+              }
+            }
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
+  }
+  return RecOut { env: env, exprs: exprs, diags: diags };
+}
+
+function recHasInvariant(td: TypeDecl): bool {
+  for (const c of td.contracts) {
+    if (isInvariant(c.kind)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+type RecInv = { env: Env; exprs: HExpr[]; };
+
+function checkRecInvariants(env: Env, ui: usize, td: TypeDecl, r: usize): Result<RecInv, Diagnostic> {
+  const thisTy: Type = TyRecord(r);
+  const noTps: Ident[] = [];
+  const noParams: Param[] = [];
+  const noRet: Option<TypeExpr> = None;
+  const noStmts: Stmt[] = [];
+  const decl = FunctionDecl {
+    exported: false,
+    name: td.name,
+    typeParams: noTps,
+    params: noParams,
+    ret: noRet,
+    body: Block { stmts: noStmts, span: td.span },
+    contracts: td.contracts,
+    span: td.span
+  };
+  const tys: Type[] = [thisTy];
+  const locals: Local[] = [Local { name: "this", ty: thisTy, mutable: false }];
+  const noN: string[] = [];
+  const noT: Type[] = [];
+  const f = FuncInfo {
+    unit: ui,
+    qname: td.name.name,
+    decl: decl,
+    params: tys,
+    paramLocals: locals,
+    ret: TyVoid,
+    tpNames: noN,
+    tpTys: noT,
+    depth: 0,
+    mode: 0,
+    cls: 0,
+    srcRet: TyVoid
+  };
+  const fx = newFnCtx(f, env, false);
+  const o = checkFuncContracts(env, f, fx)?;
+  return Ok(RecInv { env: o.fx.env, exprs: o.exprs });
+}

@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 CLASS_SYNTAX_SKIP = {"err0200_reserved_class.or", "err0200_reserved_new.or", "err0200_reserved_this.or"}
 # The array prelude (ADR-0011) is written with closures, syntax beyond Orin-B that Stage 0 rejects.
 PRELUDE_SKIP = {os.path.join("tests", "fmt", "closures.in.or"), os.path.join("tests", "fmt", "closures.out.or"),
+                # contract clauses (ADR-0012) are beyond Orin-B: Stage 0 rejects `@`
+                os.path.join("tests", "fmt", "contracts.in.or"), os.path.join("tests", "fmt", "contracts.out.or"),
                 # these pin Stage 0's rejection of arrow functions, which Stage 1 now accepts
                 os.path.join("tests", "parse_edge", "err0200_binary_arrow_in_expr.or"),
                 os.path.join("tests", "parse_edge", "err0200_fn_arrow_expr.or")}

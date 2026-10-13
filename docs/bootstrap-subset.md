@@ -224,6 +224,15 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0411 | missing/duplicate/unknown record literal field |
 | E0412 | invalid or missing `main` |
 | E0413 | generic instantiation limit exceeded (self-hosted compiler only, ADR-0007) |
+| E0414 | contract expression is not `bool` (`@Decreases`: not `int`/`usize`) — beyond Orin-B (ADR-0012, `docs/contracts.md`) |
+| E0415 | invalid use of `result`-scope features in a contract: `old(..)` outside `@Ensures` or nested, `==>` outside a contract expression, `?` in a contract, a parameter named `result` hiding it — beyond Orin-B (ADR-0012) |
+| E0416 | impure contract expression: I/O or other effect, mutating call, call of a function that is not provably pure, closure — beyond Orin-B (ADR-0012) |
+
+Beyond Orin-B (self-hosted compiler only), contract clauses `@Requires`, `@Ensures`, `@Invariant`,
+`@Decreases`, `@Rule` (ADR-0012) reuse existing codes where the failure is not specific to
+contracts: E0200 (a clause in the wrong place, e.g. `@Ensures` on a class), E0300 (`result` outside
+`@Ensures`, or in a `void` function; unknown names), E0408 (any other `@Name`: annotations, spec 05,
+are not implemented; `@Invariant` on a generic record).
 
 ## 10. Clarifications (v1.1, from conformance-suite review)
 

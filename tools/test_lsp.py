@@ -352,6 +352,25 @@ def run(exe):
     check("y: int" in hover("y: 2", 0), "rich: hover field (%r)" % hover("y: 2", 0))
     check("Pos" in hover("pos.x)", 0, 1) or "int" in hover("pos.x)", 0, 1), "rich: hover member (%r)" % hover("pos.x)", 0, 1))
 
+    # ---- contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses ----
+    kc = os.path.join(tmp, "contracts.or")
+    kc_good = ("@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int {\n  return a;\n}\n\n"
+               "function main(): void {\n  console.log(add(1).toString());\n}\n")
+    open_doc(c, kc, kc_good)
+    d = sync(c, uri_of(kc))
+    check(d == [], "contracts: valid clauses, no diagnostics (got %r)" % (d,))
+    r = c.request("textDocument/hover", td(kc, pos_of(kc_good, "add(1)", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("@Requires(a > 0)" in hv and "@Ensures(result >= a)" in hv, "contracts: hover shows the clauses (%r)" % (hv,))
+    for old, new, code in (("@Requires(a > 0)", "@Requires(a + 1)", "E0414"),
+                           ("@Requires(a > 0)", "@Requires(old(a) > 0)", "E0415"),
+                           ("@Requires(a > 0)", "@Requires(result > 0)", "E0300"),
+                           ("@Requires(a > 0)", "@Deprecated(a)", "E0408")):
+        change_doc(c, kc, kc_good.replace(old, new), 2)
+        d = sync(c, uri_of(kc))
+        check(d is not None and len(d) >= 1 and d[0]["code"] == code, "contracts: %s -> %s (got %r)" % (new, code, d))
+    change_doc(c, kc, kc_good, 3)
+
     # ---- classes across files (ADR-0009): definition, hover, references, rename ----------------
     clib = os.path.join(tmp, "clib.or")
     cmain = os.path.join(tmp, "cmain.or")

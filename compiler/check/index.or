@@ -20,7 +20,7 @@
 import { Span, SourceMap } from "../diag";
 import {
   Ident, Item, FunctionDecl, TypeDecl, ConstDecl, TypeExpr, Param, Block, Stmt, Expr, FieldInit, MatchArm,
-  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, ArrowBody
+  ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, CtorDecl, ArrowBody, ContractClause
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
 import {
@@ -129,7 +129,17 @@ function tpList(ps: Ident[]): string {
   return "<" + parts.join(", ") + ">";
 }
 
-function funcDetail(f: FunctionDecl): string {
+// Contract clauses (ADR-0012) as written in the source, one per line, for hover texts.
+function contractText(sm: SourceMap, cs: ContractClause[]): string {
+  let out = "";
+  for (const k of cs) {
+    const f = sm.files[k.span.file];
+    out += "\n" + f.text.substring(k.span.start, k.span.end).split("\n").join(" ");
+  }
+  return out;
+}
+
+function funcDetail(f: FunctionDecl, sm: SourceMap): string {
   let ps: string[] = [];
   for (const p of f.params) {
     ps.push(p.name.name + ": " + renderTE(p.ty));
@@ -139,7 +149,7 @@ function funcDetail(f: FunctionDecl): string {
     Some(t) => { s += ": " + renderTE(t); },
     None => {}
   }
-  return s;
+  return s + contractText(sm, f.contracts);
 }
 
 // "users/user.User<int,string>" -> "User<int,string>"
@@ -348,16 +358,17 @@ function constDetail(k: ConstDecl): string {
   return ty.length > 0 ? "const " + k.name.name + ": " + ty : "const " + k.name.name;
 }
 
-function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
+function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
   let tqDefs = p.tqDefs;
   const id = w.defs.length;
   const head = "type " + t.name.name + tpList(t.typeParams);
+  const cdetail = contractText(sm, t.contracts);
   match (t.body) {
     DAlias(te) => {
-      w = addDef(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te));
+      w = addDef(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te) + cdetail);
     },
     DRecord(fs) => {
       let parts: string[] = [];
@@ -365,7 +376,7 @@ function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
         parts.push(f.name.name + ": " + renderTE(f.ty));
       }
       w = addDef(w, t.name.name, SkRecord, t.name.span, t.span, None, t.exported,
-        head + " = { " + parts.join("; ") + " }");
+        head + " = { " + parts.join("; ") + " }" + cdetail);
       for (const f of fs) {
         w = addDef(w, f.name.name, SkField, f.name.span, f.span, Some(id), t.exported,
           f.name.name + ": " + renderTE(f.ty));
@@ -377,7 +388,7 @@ function declareType(p: P1, unitName: string, t: TypeDecl): P1 {
         parts.push(variantText(v.name.name, v.payload));
       }
       w = addDef(w, t.name.name, SkUnion, t.name.span, t.span, None, t.exported,
-        head + " = " + parts.join(" | "));
+        head + " = " + parts.join(" | ") + cdetail);
       for (const v of vs) {
         w = addDef(w, v.name.name, SkVariant, v.name.span, v.span, Some(id), t.exported,
           variantText(v.name.name, v.payload) + ": " + t.name.name + tpList(t.typeParams));
@@ -421,6 +432,18 @@ function classFieldCount(c: ClassDecl): usize {
   return n;
 }
 
+// Class invariants then the constructor's own clauses (the checker attaches both to the constructor).
+function allCtorClauses(c: ClassDecl, k: CtorDecl): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const x of c.contracts) {
+    out.push(x);
+  }
+  for (const x of k.contracts) {
+    out.push(x);
+  }
+  return out;
+}
+
 function paramsText(ps: Param[]): string {
   let parts: string[] = [];
   for (const p of ps) {
@@ -461,13 +484,13 @@ function methodMutating(hir: Option<Program>, qname: string, declRet: Option<Typ
   return false;
 }
 
-function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>): P1 {
+function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>, sm: SourceMap): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
   let tqDefs = p.tqDefs;
   const id = w.defs.length;
-  w = addDef(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, "class " + c.name.name);
+  w = addDef(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, "class " + c.name.name + contractText(sm, c.contracts));
   for (const m of c.members) {
     match (m) {
       MCtor(k) => {
@@ -493,13 +516,20 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
   for (const m of c.members) {
     match (m) {
       MCtor(k) => {
-        const nsp = Span { file: k.span.file, start: k.span.start, end: k.span.start + 11 };
+        // `constructor` follows the contract clauses (the member's span starts at the first one).
+        let kwStart = k.span.start;
+        if (k.contracts.length > 0) {
+          const after = k.contracts[k.contracts.length - 1].span.end;
+          const ftext = sm.files[k.span.file].text;
+          kwStart = after + ftext.substring(after, ftext.length).indexOf("constructor").unwrapOr(0);
+        }
+        const nsp = Span { file: k.span.file, start: kwStart, end: kwStart + 11 };
         let ps: string[] = [];
         for (const cp of k.params) {
           ps.push(cp.name.name + ": " + renderTE(cp.ty));
         }
         w = addDef(w, "constructor", SkFunction, nsp, k.span, Some(id), c.exported,
-          "constructor(" + ps.join(", ") + ")");
+          "constructor(" + ps.join(", ") + ")" + contractText(sm, k.contracts));
       },
       MMethod(md) => {
         const mutating = !md.isStatic && methodMutating(hir, unitName + "." + c.name.name + "." + md.name.name, md.ret);
@@ -509,7 +539,7 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
           Some(t) => { d += ": " + renderTE(t); },
           None => {}
         }
-        w = addDef(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d);
+        w = addDef(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d + contractText(sm, md.contracts));
       },
       MField(_) => {}
     }
@@ -992,6 +1022,12 @@ function walkStmt(w: W, c: Ctx, s: Stmt): W {
       x = popScope(x);
     },
     SBlock(b) => { x = walkBlock(x, c, b); },
+    SContract(k) => {
+      match (k.expr) {
+        Some(e) => { x = walkExpr(x, c, e); },
+        None => {}
+      }
+    },
     _ => {}
   }
   return x;
@@ -1031,6 +1067,12 @@ function walkFunction(w: W, c: Ctx, f: FunctionDecl, fnDef: usize, hf: Option<Fu
     x = declare(x, c, p.name, p.span, SkParam, "(parameter)", Some(p.ty));
   }
   x = optTypeRefs(x, c, f.ret);
+  for (const k of f.contracts) {
+    match (k.expr) {
+      Some(e) => { x = walkExpr(x, c, e); },
+      None => {}
+    }
+  }
   x = walkBlock(x, c, f.body);
   x = popScope(x);
   x.fn = None;
@@ -1416,7 +1458,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
       match (item) {
         IFunction(f) => {
           did = p.w.defs.length;
-          p.w = addDef(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f));
+          p.w = addDef(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm));
           p.tab = addV(p.tab, f.name.name, did, f.exported);
         },
         IConst(k) => {
@@ -1426,11 +1468,11 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         },
         IType(t) => {
           did = p.w.defs.length;
-          p = declareType(p, u.name, t);
+          p = declareType(p, u.name, t, sm);
         },
         IClass(cd) => {
           did = p.w.defs.length;
-          p = declareClass(p, u.name, cd, hir);
+          p = declareClass(p, u.name, cd, hir, sm);
         },
         _ => {}
       }
@@ -1532,7 +1574,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 }
                 const fd = FunctionDecl {
                   exported: false, name: cd.name, typeParams: [], params: ps,
-                  ret: None, body: k.body, span: k.span
+                  ret: None, body: k.body, contracts: allCtorClauses(cd, k), span: k.span
                 };
                 match (ctorHf) {
                   Some(hf) => { w = hBlock(w, c, hf.body, true); },
@@ -1555,7 +1597,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 hn += 1;
                 const fd = FunctionDecl {
                   exported: false, name: md.name, typeParams: [], params: md.params, ret: md.ret, body: md.body,
-                  span: md.span
+                  contracts: md.contracts, span: md.span
                 };
                 w = walkFunction(w, c, fd, dk, hf);
                 dk += 1;

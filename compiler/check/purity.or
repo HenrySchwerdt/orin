@@ -1,0 +1,265 @@
+// Purity of contract expressions (ADR-0012, spec 15 §4.2a). Beyond Orin-B.
+//
+// A contract expression may only observe the program, never change or depend on the world. The
+// rule (v1, deliberately conservative) over the typed HIR of the expression:
+//   * no mutating built-in (`push`, `pop`) and no mutating method call (rejected earlier by the
+//     checker: E0416);
+//   * no I/O built-in: console.log/error, fs.readFile/writeFile/exists, process.args/exit,
+//     io.readBytes/readLine/writeStdout/shell;
+//   * no call through a function value (the callee is unknown);
+//   * every called user function is *pure*: it, and every function reachable from it through calls
+//     and closure creation, performs none of the above I/O and makes no call through a function
+//     value. Mutation of the function's own local variables and arrays is not an effect (value
+//     semantics, and Orin has no mutable globals). Recursion is allowed (cycles are pure unless
+//     something in them is not).
+// Everything else (arithmetic, string / array / Option / Result built-ins, record and variant
+// construction, `match`, conditionals) is pure. Traps (division by zero, index out of bounds,
+// `unwrap` of `None`) and non-termination are not effects of this analysis.
+// Violations are E0416.
+
+import { Span, Diagnostic, diag } from "../diag";
+import {
+  Function, HBlock, HStmt, HExpr, HExprKind, Builtin, Place, PlaceElem, HArm, FieldInitH,
+  HLet, HAssign, HExprStmt, HIf, HWhile, HForOf, HBreak, HContinue, HReturn, HBlockStmt
+} from "../hir";
+
+type Scan = {
+  callees: usize[];
+  cspans: Span[];
+  io: string;         // first I/O built-in found ("" if none)
+  ioSpan: Span;
+  mut: bool;          // a mutating built-in was found
+  mutSpan: Span;
+  indirect: bool;     // a call through a function value was found
+  indSpan: Span;
+};
+
+function ioName(b: Builtin): string {
+  return match (b) {
+    BConsoleLog => "console.log",
+    BConsoleError => "console.error",
+    BFsReadFile => "readFile",
+    BFsWriteFile => "writeFile",
+    BFsExists => "exists",
+    BProcessArgs => "args",
+    BProcessExit => "exit",
+    BIoReadBytes => "readBytes",
+    BIoReadLine => "readLine",
+    BIoWriteStdout => "writeStdout",
+    BIoShell => "shell",
+    _ => ""
+  };
+}
+
+function scanExprs(es: HExpr[], s0: Scan): Scan {
+  let s = s0;
+  for (const e of es) {
+    s = scanExpr(e, s);
+  }
+  return s;
+}
+
+function scanPlace(p: Place, s0: Scan): Scan {
+  let s = s0;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => { s = scanExpr(ix, s); },
+      _ => {}
+    }
+  }
+  return s;
+}
+
+function scanExpr(e: HExpr, s0: Scan): Scan {
+  let s = s0;
+  match (e.kind) {
+    XUnary(_, x) => { s = scanExpr(x, s); },
+    XBinary(_, a, b) => {
+      s = scanExpr(a, s);
+      s = scanExpr(b, s);
+    },
+    XCall(id, args) => {
+      s.callees.push(id);
+      s.cspans.push(e.span);
+      s = scanExprs(args, s);
+    },
+    XBuiltin(b, args) => {
+      const n = ioName(b);
+      if (n != "" && s.io == "") {
+        s.io = n;
+        s.ioSpan = e.span;
+      }
+      s = scanExprs(args, s);
+    },
+    XMutMethod(_, place, args) => {
+      if (!s.mut) {
+        s.mut = true;
+        s.mutSpan = e.span;
+      }
+      s = scanPlace(place, s);
+      s = scanExprs(args, s);
+    },
+    XField(b, _, _) => { s = scanExpr(b, s); },
+    XIndex(a, b) => {
+      s = scanExpr(a, s);
+      s = scanExpr(b, s);
+    },
+    XRecord(_, spread, fields) => {
+      match (spread) {
+        Some(x) => { s = scanExpr(x, s); },
+        None => {}
+      }
+      for (const f of fields) {
+        s = scanExpr(f.value, s);
+      }
+    },
+    XVariant(_, args) => { s = scanExprs(args, s); },
+    XArray(xs) => { s = scanExprs(xs, s); },
+    XTry(x) => { s = scanExpr(x, s); },
+    XCond(a, b, c) => {
+      s = scanExpr(a, s);
+      s = scanExpr(b, s);
+      s = scanExpr(c, s);
+    },
+    XMatch(x, arms) => {
+      s = scanExpr(x, s);
+      for (const a of arms) {
+        s = scanBlock(a.body, s);
+        match (a.value) {
+          Some(v) => { s = scanExpr(v, s); },
+          None => {}
+        }
+      }
+    },
+    XClosure(fid, caps) => {
+      s.callees.push(fid);
+      s.cspans.push(e.span);
+      s = scanExprs(caps, s);
+    },
+    XCallIndirect(c, args) => {
+      if (!s.indirect) {
+        s.indirect = true;
+        s.indSpan = e.span;
+      }
+      s = scanExpr(c, s);
+      s = scanExprs(args, s);
+    },
+    _ => {}
+  }
+  return s;
+}
+
+function scanBlock(b: HBlock, s0: Scan): Scan {
+  let s = s0;
+  for (const st of b.stmts) {
+    s = scanStmt(st, s);
+  }
+  return s;
+}
+
+function scanStmt(st: HStmt, s0: Scan): Scan {
+  let s = s0;
+  match (st) {
+    HLet(_, e) => { s = scanExpr(e, s); },
+    HAssign(p, _, e) => {
+      s = scanPlace(p, s);
+      s = scanExpr(e, s);
+    },
+    HExprStmt(e) => { s = scanExpr(e, s); },
+    HIf(c, t, el) => {
+      s = scanExpr(c, s);
+      s = scanBlock(t, s);
+      match (el) {
+        Some(b) => { s = scanBlock(b, s); },
+        None => {}
+      }
+    },
+    HWhile(c, b) => {
+      s = scanExpr(c, s);
+      s = scanBlock(b, s);
+    },
+    HForOf(_, it, b) => {
+      s = scanExpr(it, s);
+      s = scanBlock(b, s);
+    },
+    HReturn(o) => {
+      match (o) {
+        Some(e) => { s = scanExpr(e, s); },
+        None => {}
+      }
+    },
+    HBlockStmt(b) => { s = scanBlock(b, s); },
+    _ => {}
+  }
+  return s;
+}
+
+function emptyScan(sp: Span): Scan {
+  const cs: usize[] = [];
+  const ss: Span[] = [];
+  return Scan {
+    callees: cs, cspans: ss, io: "", ioSpan: sp, mut: false, mutSpan: sp, indirect: false, indSpan: sp
+  };
+}
+
+// "" if function `root` is pure, else a short reason (searching everything reachable from it).
+function impureReason(funcs: Function[], root: usize): string {
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < funcs.length) {
+    seen.push(false);
+    i += 1;
+  }
+  let stack: usize[] = [root];
+  if (root < seen.length) {
+    seen[root] = true;
+  }
+  while (stack.length > 0) {
+    const k = stack.pop().unwrap();
+    if (k >= funcs.length) {
+      continue;
+    }
+    const f = funcs[k];
+    const s = scanBlock(f.body, emptyScan(f.span));
+    if (s.io != "") {
+      return "`" + f.name + "` performs I/O (" + s.io + ")";
+    }
+    if (s.indirect) {
+      return "`" + f.name + "` calls a function value, whose effects are unknown";
+    }
+    for (const c of s.callees) {
+      if (c < seen.length && !seen[c]) {
+        seen[c] = true;
+        stack.push(c);
+      }
+    }
+  }
+  return "";
+}
+
+// E0416 diagnostics for the contract expressions `exprs` (checked HIR); `funcs` is the final
+// function table (indexed by function id).
+export function purityDiags(funcs: Function[], exprs: HExpr[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const e of exprs) {
+    const s = scanExpr(e, emptyScan(e.span));
+    if (s.mut) {
+      out.push(diag("E0416", s.mutSpan, "mutation is not allowed in a contract expression"));
+    }
+    if (s.io != "") {
+      out.push(diag("E0416", s.ioSpan, "I/O built-in `" + s.io + "` is not allowed in a contract expression (contracts must be pure)"));
+    }
+    if (s.indirect) {
+      out.push(diag("E0416", s.indSpan, "call through a function value is not allowed in a contract expression (not provably pure)"));
+    }
+    let k: usize = 0;
+    while (k < s.callees.length) {
+      const why = impureReason(funcs, s.callees[k]);
+      if (why != "") {
+        out.push(diag("E0416", s.cspans[k], "call is not provably pure: " + why + "; contract expressions may only call pure functions"));
+      }
+      k += 1;
+    }
+  }
+  return out;
+}
