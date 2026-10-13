@@ -1,8 +1,9 @@
 // Loader output types: the loaded program (units in dependency order) and the outcome of a load.
 
 import { Module, Item, ImportDecl } from "../syntax";
-import { SourceFile, SourceMap, Diagnostic } from "../diag";
+import { SourceFile, SourceMap, Diagnostic, allRenderable, allWellFormed } from "../diag";
 import { Manifest } from "../package";
+import { isNormalized } from "./path";
 
 // StdFs = "std:fsraw" (internal: the primitives behind std:fs, stdlib/fs.or), StdProcess = "std:process", StdIo = "std:io", StdClock = "std:clock" (internal; std:time wraps it)
 export type ImportTarget = ImportUnit(usize) | ImportStd(StdModule);
@@ -25,6 +26,11 @@ export type LoadedProgram = { units: Unit[]; entry: usize; manifest: Option<Mani
 // diagnostics can be rendered); `program` is Some exactly when `diags` is empty.
 export type LoadOutcome = { sm: SourceMap; program: Option<LoadedProgram>; diags: Diagnostic[]; };
 
+// A failed load: no program, at least one diagnostic, every diagnostic renderable against the files read.
+@Requires(diags.length > 0 && allWellFormed(diags))
+@Requires(allRenderable(SourceMap { files: files }, diags))
+@Ensures(result.program.isNone() && result.diags.length == diags.length)
+@Ensures(result.sm.files.length == files.length)
 export function failedLoad(files: SourceFile[], diags: Diagnostic[]): LoadOutcome {
   return LoadOutcome { sm: SourceMap { files: files }, program: None, diags: diags };
 }
@@ -39,6 +45,7 @@ export function importOf(item: Item): Option<ImportDecl> {
 }
 
 // A plain loop: closures (`filter`) would make the function impure, and contracts may only call pure ones.
+@Ensures(result <= m.items.length)
 function importCount(m: Module): usize {
   let n: usize = 0;
   for (const it of m.items) {
@@ -49,6 +56,7 @@ function importCount(m: Module): usize {
   return n;
 }
 
+@Ensures(result.isSome() == (match (t) { ImportUnit(_) => true, ImportStd(_) => false }))
 function importedUnit(t: ImportTarget): Option<usize> {
   return match (t) {
     ImportUnit(i) => Some(i),
@@ -56,35 +64,120 @@ function importedUnit(t: ImportTarget): Option<usize> {
   };
 }
 
-// The structural guarantees of a successful load (written with loops so that contracts may call it):
-// the units are in one-to-one correspondence with the files of `sm`, the entry is the last unit,
-// every unit has one import target per import item, and every unit import points at an *earlier*
-// unit. The last property is what makes the unit graph acyclic and the order topological.
-export function isWellFormed(p: LoadedProgram, sm: SourceMap): bool {
-  const n = p.units.length;
-  if (n == 0 || p.entry != n - 1 || sm.files.length != n) {
-    return false;
+// True when `t` is a std import or a unit import below `n` (an index into the units completed so far).
+export function targetBelow(t: ImportTarget, n: usize): bool {
+  return match (t) {
+    ImportUnit(i) => i < n,
+    ImportStd(_) => true,
+  };
+}
+
+// True when `t` is not a unit import of unit `k` or a later one. A unit may only import units that
+// were completed before it, which is what makes the unit graph acyclic and the order topological.
+function importsEarlier(imports: ImportTarget[], k: usize): bool {
+  for (const t of imports) {
+    const dep = importedUnit(t);
+    if (dep.isSome() && dep.unwrap() >= k) {
+      return false;
+    }
   }
+  return true;
+}
+
+// True when every unit imports only earlier units (dependencies first; hence no import cycle).
+export function isTopological(units: Unit[]): bool {
+  let k: usize = 0;
+  while (k < units.length) {
+    if (!importsEarlier(units[k].imports, k)) {
+      return false;
+    }
+    k += 1;
+  }
+  return true;
+}
+
+// True when `file` ids of the units are pairwise distinct and all below `n`.
+function fileIdsDistinct(units: Unit[], n: usize): bool {
   let seen: bool[] = [];
   let k: usize = 0;
   while (k < n) {
     seen.push(false);
     k += 1;
   }
-  k = 0;
-  while (k < n) {
-    const u = p.units[k];
-    if (u.file >= n || seen[u.file] || u.imports.length != importCount(u.ast)) {
+  for (const u of units) {
+    if (u.file >= n || seen[u.file]) {
       return false;
     }
     seen[u.file] = true;
-    for (const t of u.imports) {
-      const dep = importedUnit(t);
-      if (dep.isSome() && dep.unwrap() >= k) {
-        return false;
-      }
-    }
-    k += 1;
   }
   return true;
+}
+
+// True when no two units have the same path or the same name (names become symbol prefixes later).
+export function unitIdsUnique(units: Unit[]): bool {
+  let i: usize = 0;
+  while (i < units.length) {
+    let j: usize = i + 1;
+    while (j < units.length) {
+      if (units[i].path == units[j].path || units[i].name == units[j].name) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// True when every unit has one import target per import item of its syntax tree.
+function importCountsMatch(units: Unit[]): bool {
+  for (const u of units) {
+    if (u.imports.length != importCount(u.ast)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when the unit's own fields agree: its path is normalized, a prelude (virtual `$...`) path has
+// the empty module id, and the AST belongs to the unit's file.
+export function isWellFormedUnit(u: Unit): bool {
+  return isNormalized(u.path)
+      && (!u.path.startsWith("$") || u.module == "")
+      && u.ast.file == u.file;
+}
+
+// True when `isWellFormedUnit` holds for every unit.
+export function allUnitsWellFormed(units: Unit[]): bool {
+  for (const u of units) {
+    if (!isWellFormedUnit(u)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The structural guarantees of a successful load (written with loops so that contracts may call it):
+// the units are in one-to-one correspondence with the files of `sm`, the entry is the last unit and
+// keeps file id 0, every unit has one import target per import item, every unit import points at an
+// *earlier* unit, and paths and names are unique and well-formed.
+export function isWellFormed(p: LoadedProgram, sm: SourceMap): bool {
+  const n = p.units.length;
+  return n > 0
+      && p.entry == n - 1
+      && sm.files.length == n
+      && p.units[p.entry].file == 0
+      && fileIdsDistinct(p.units, n)
+      && importCountsMatch(p.units)
+      && isTopological(p.units)
+      && allUnitsWellFormed(p.units)
+      && unitIdsUnique(p.units);
+}
+
+// What every load result must satisfy (the contract of all `load*` functions): a program exactly when
+// there are no diagnostics, a well-formed program, and diagnostics that can be rendered.
+export function isValidOutcome(o: LoadOutcome): bool {
+  return o.program.isSome() == (o.diags.length == 0)
+      && allRenderable(o.sm, o.diags)
+      && (o.program.isNone() || isWellFormed(o.program.unwrap(), o.sm));
 }

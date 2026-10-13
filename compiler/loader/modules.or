@@ -1,34 +1,99 @@
 // Packages (orin.toml, spec 04): finding and reading the manifest, and module ids.
 
-import { SourceFile, Span, Diagnostic, diag, span } from "../diag";
+import { SourceFile, Span, Diagnostic, Diagnostics, diag, span, allRenderable } from "../diag";
 import { Manifest, parseManifest } from "../package";
 import { LoadOutcome, failedLoad } from "./program";
 import { Sources } from "./sources";
-import { dirname, joinPath, relativeTo, isInside } from "./path";
+import { isNormalized, isAbs, dirname, joinPath, relativeTo, isInside } from "./path";
 
-// Module id of file `p`: the directory (relative to the src root `root`, "." for `root` itself) of
-// the nearest enclosing directory that contains a `module.or`; "" for prelude units and files
-// outside `root`.
-export function moduleOf(src: Sources, root: string, p: string): string {
-  if (p.startsWith("$") || !isInside(root, p)) {
-    return "";
+// The src root of a load (the directory of the entry file, or of the package's entry file) and the
+// files below it: answers which module a file belongs to. Module ids are directories relative to
+// the root ("." is the root module).
+@Invariant(isNormalized(this.root))
+export class SrcRoot {
+  private src: Sources;
+  private root: string;
+
+  @Requires(isNormalized(root))
+  constructor(src: Sources, root: string) {
+    this.src = src;
+    this.root = root;
   }
-  let d = dirname(p);
-  while (d != root && isInside(root, d)) {
-    if (src.exists(joinPath(d, "module.or"))) {
-      return relativeTo(root, d);
+
+  // Module id of file `p`: the directory (relative to the src root, "." for the root itself) of
+  // the nearest enclosing directory that contains a `module.or`; "" for prelude units and files
+  // outside the root.
+  @Requires(isNormalized(p))
+  @Ensures(result == "" || isNormalized(result) && !isAbs(result))
+  @Ensures(p.startsWith("$") || !isInside(this.root, p) ==> result == "")
+  @Ensures(isInside(this.root, p) && !p.startsWith("$") ==> result != "")
+  moduleOf(p: string): string {
+    if (p.startsWith("$") || !isInside(this.root, p)) {
+      return "";
     }
-    const parent = dirname(d);
-    if (parent == d) {
-      break;
+    let d = dirname(p);
+    while (d != this.root && isInside(this.root, d)) {
+      if (this.src.exists(joinPath(d, "module.or"))) {
+        return relativeTo(this.root, d);
+      }
+      const parent = dirname(d);
+      if (parent == d) {
+        break;
+      }
+      d = parent;
     }
-    d = parent;
+    return ".";
   }
-  return ".";
+
+  // True when module id `mod` ("." or a directory with a `module.or`) exists under the root.
+  @Ensures(mod == "." ==> result)
+  hasModule(mod: string): bool {
+    return mod == "." || this.src.exists(joinPath(this.root, mod + "/module.or"));
+  }
+
+  // E0502 for every module name in the manifest that has no `module.or` (the manifest is file 0).
+  // Every diagnostic lies in file 0 and the result is empty exactly when all names exist.
+  @Ensures(allWellFormedIn(result, 0))
+  unknownModules(m: Manifest): Diagnostic[] {
+    let out = new Diagnostics();
+    for (const r of m.rules) {
+      if (!this.hasModule(r.module)) {
+        out.add(unknownModule(r.span, `[modules.${r.module}]`, r.module, this.root));
+      }
+      let i: usize = 0;
+      while (i < r.allowed.length) {
+        if (!this.hasModule(r.allowed[i])) {
+          out.add(
+            unknownModule(
+              r.allowedSpans[i],
+              `allowed_dependencies of [modules.${r.module}]`,
+              r.allowed[i],
+              this.root,
+            ),
+          );
+        }
+        i += 1;
+      }
+    }
+    return out.toArray();
+  }
+}
+
+// True when every diagnostic of `ds` is an E0502 in file `file`.
+function allWellFormedIn(ds: Diagnostic[], file: usize): bool {
+  for (const d of ds) {
+    if (d.code != "E0502" || d.span.file != file || d.span.start > d.span.end) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // The orin.toml governing `entry`: `entry/orin.toml` when `entry` is a package directory,
 // otherwise the nearest one in an ancestor directory of the entry file.
+@Requires(isNormalized(entry))
+@Ensures(result.isSome() ==> isNormalized(result.unwrap()) && result.unwrap().endsWith("orin.toml"))
+@Ensures(result.isSome() ==> isAbs(result.unwrap()) == isAbs(entry))
 export function findManifest(src: Sources, entry: string): Option<string> {
   const inDir = joinPath(entry, "orin.toml");
   if (src.exists(inDir)) {
@@ -48,6 +113,8 @@ export function findManifest(src: Sources, entry: string): Option<string> {
   }
 }
 
+@Requires(sp.start <= sp.end)
+@Ensures(result.code == "E0502" && result.span.file == 0)
 function unknownModule(sp: Span, what: string, mod: string, root: string): Diagnostic {
   const wanted = mod == "." ? "module.or" : `${mod}/module.or`;
   return diag(
@@ -57,42 +124,20 @@ function unknownModule(sp: Span, what: string, mod: string, root: string): Diagn
   );
 }
 
-function moduleExists(src: Sources, root: string, mod: string): bool {
-  return mod == "." || src.exists(joinPath(root, mod + "/module.or"));
-}
-
-// E0502 for every module name in the manifest that has no `module.or` (the manifest is file 0).
-function unknownModules(src: Sources, m: Manifest, root: string): Diagnostic[] {
-  let out: Diagnostic[] = [];
-  for (const r of m.rules) {
-    if (!moduleExists(src, root, r.module)) {
-      out.push(unknownModule(r.span, `[modules.${r.module}]`, r.module, root));
-    }
-    let i: usize = 0;
-    while (i < r.allowed.length) {
-      if (!moduleExists(src, root, r.allowed[i])) {
-        out.push(
-          unknownModule(
-            r.allowedSpans[i],
-            `allowed_dependencies of [modules.${r.module}]`,
-            r.allowed[i],
-            root,
-          ),
-        );
-      }
-      i += 1;
-    }
-  }
-  return out;
-}
-
 // The package entry file named by `m` (relative to the directory of the manifest at `tomlPath`).
+@Requires(isNormalized(tomlPath))
+@Ensures(isNormalized(result))
+@Ensures(!isAbs(m.entry) && !m.entry.includes("..") ==> isInside(dirname(tomlPath), result))
 export function manifestEntry(tomlPath: string, m: Manifest): string {
   return joinPath(dirname(tomlPath), m.entry);
 }
 
 // Reads and validates the manifest; the error is a complete failed outcome (with the manifest as its
 // only file) so that the diagnostics can be rendered.
+@Requires(isNormalized(tomlPath))
+@Ensures(result.isErr() ==> result.unwrapErr().program.isNone() && result.unwrapErr().diags.length > 0)
+@Ensures(result.isErr() ==> result.unwrapErr().sm.files.length == 1 && result.unwrapErr().sm.files[0].path == tomlPath)
+@Ensures(result.isErr() ==> allRenderable(result.unwrapErr().sm, result.unwrapErr().diags))
 export function readManifest(src: Sources, tomlPath: string): Result<Manifest, LoadOutcome> {
   const rt = src.read(tomlPath);
   if (rt.isErr()) {
@@ -109,7 +154,7 @@ export function readManifest(src: Sources, tomlPath: string): Result<Manifest, L
     return Err(failedLoad(files, [mr.unwrapErr()]));
   }
   const m = mr.unwrap();
-  const unknown = unknownModules(src, m, dirname(manifestEntry(tomlPath, m)));
+  const unknown = new SrcRoot(src, dirname(manifestEntry(tomlPath, m))).unknownModules(m);
   if (unknown.length > 0) {
     return Err(failedLoad(files, unknown));
   }
