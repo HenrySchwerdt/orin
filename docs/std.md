@@ -14,6 +14,9 @@ API table (`compiler/mcp/apitable.or`).
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
 | `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; `nowMillis(clock: ClockGrant)` **unstable** (ADR-0027) |
 | `std:graph` | Orin, `stdlib/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
+| `std:bytes` | Orin, `stdlib/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
+| `std:utf8` | Orin, `stdlib/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
+| `std:collections` | Orin, `stdlib/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
@@ -24,7 +27,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `stdlib/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `std/` and `array/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:collections`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -195,6 +198,187 @@ older `h`: ids identify a node of one *tag*). Mutating methods update in place w
 by the caller (`new Graph<T>(tag)`): the language has no process-wide counter for automatic unique tags; use a
 different tag per logical graph. The old functional API (`newGraph`, `add(g, v)` returning `{graph, id}`, ...) was
 removed with ADR-0026; the tests were migrated.
+
+## Provable std, layer 1 (ADR-0030 §3): `std:bytes`, `std:utf8`, `std:collections`
+
+Pure safe Orin: no C, no new built-ins, no language change. They are the first modules under the contract and
+class standard of ADR-0030 §3 (summary):
+
+* every class carries real `@Invariant`s (record invariants are not checked at run time, so all stateful logic is in
+  classes) that `orin test` and `--check-contracts` verify after every public method;
+* every public method states `@Requires` / `@Ensures`; helpers that contracts call are loops (no closures,
+  `map`/`filter`/`every`, no function calling itself from its own contract: those do not terminate or are
+  rejected as impure under `--check-contracts`);
+* no tautologies; every public function has `@Test` coverage including edge cases (`tests/std/*_test.or`);
+* tests run twice: with contract checking (the `orin test` default) and with `--no-contracts` (the logic must not
+  depend on the contracts). `tools/test_std.sh` does both; `tools/test_std.sh --mutate` adds the **mutation check**
+  (`tools/mutate_std.py`): 60 deliberately broken one-line variants of the three modules, each of which must make a
+  test or a contract fail (CI step "Provable std").
+
+Contract counts (clauses in the source): `std:bytes` 3 invariants + 6 `@Requires` + 85 `@Ensures`;
+`std:utf8` 2 + 5 + 49; `std:collections` 19 + 5 + 157 (the collection operations are total, so almost none needs a
+precondition: absent keys and empty containers answer `None`/`false`). The two B-tree maps are generated from one
+template (`tools/sorted_map.tmpl`, `tools/gen_sorted_map.py`; `tools/test_std.sh` checks the generated region is current).
+**Algorithm rule** (project owner, 2026-10-13): the std uses the best known algorithm for the job with its full
+invariants; if the contract tooling cannot state an invariant, find a formulation that works or report the exact
+tooling gap, never ship a weaker algorithm for the sake of a simpler contract. Every choice below was measured against
+the simpler alternative.
+
+### std:bytes
+
+A byte is a `u8`. `Bytes` is an immutable view `data[start .. start+len)` of a `u8[]` (arrays are copy-on-write
+values, so `slice` shares storage and is O(1)); invariant `start + len <= data.length`.
+
+```
+class Bytes                                           // new Bytes(data: u8[], start, len) @Requires(start + len <= data.length)
+  length(): usize            isEmpty(): bool          // O(1)
+  get(i): Option<u8>         at(i): u8                // get never traps; at: @Requires(i < length())
+  slice(lo, hi): Bytes       trySlice(lo, hi): Option<Bytes>   // O(1); slice: @Requires(lo <= hi && hi <= length())
+  concat(o): Bytes           equals(o): bool          startsWith(p): bool     indexOf(b: u8): Option<usize>   // O(n)
+  toArray(): u8[]            toRawString(): string    toHex(): string          // O(n)
+emptyBytes()  bytesFromArray(u8[])  bytesFromInts(int[]) @Requires(allBytes(xs))  bytesFromString(s)  bytesFromHex(s): Option<Bytes>
+allBytes(xs: int[]): bool
+
+class ByteBuilder                                     // invariant: capacity >= length
+  length()  reserved()  byteAt(i)  reserve(extra)  clear()  build(): Bytes
+  appendU8(u8)  appendU16be/le(u16)  appendU32be/le(u32)  appendBytes(Bytes)  appendString(s)   // amortised O(1) per byte
+
+type ReadError = { position: usize; needed: usize; remaining: usize }
+class ByteReader                                      // invariant: pos <= src.length(): the cursor never passes the end
+  position()  remaining()  isAtEnd()  peekAt(offset): Option<u8>
+  readU8(): Result<u8, ReadError>      readU16be/le(): Result<u16, ReadError>     readU32be/le(): Result<u32, ReadError>
+  readExact(n): Result<Bytes, ReadError>   skip(n): Result<void, ReadError>   rest(): Bytes
+readErrorMessage(e)
+```
+
+Contracts that matter: every `read*` is `Ok` **iff** at least that many bytes remain (`result.isOk() ==
+(old(this.remaining()) >= n)`), advances the cursor by exactly the bytes read on `Ok` and leaves it unchanged on
+`Err`, and the value read equals the bytes at the old cursor (`readU16be` = `b0 * 256 + b1`, ...). Builder appends
+grow the length by exactly the bytes appended and put the right bytes at the end. `slice` states its first and last
+byte; `concat` states length and both seams. There are no bitwise operators in Orin, so multi-byte values use `*`,
+`/` and `%` on `int`. `reserve` is bookkeeping (`capacity`): the runtime has no array reserve, arrays still grow
+geometrically on `push`. A `u8` array element costs 8 bytes at run time (ADR-0022); strings are the compact form
+(`toRawString` / `bytesFromString` are O(n) conversions, byte for byte, no validation).
+
+### std:utf8
+
+Orin strings are byte strings that are only *expected* to hold UTF-8; `Utf8String` makes it a type.
+
+```
+type Utf8ErrorKind = InvalidLead | TruncatedSequence | InvalidContinuation | Overlong | Surrogate | TooLarge
+type Utf8Error = { position: usize; length: usize; kind: Utf8ErrorKind }
+validate(b: Bytes): Result<Utf8String, Utf8Error>        validateString(s: string): Result<Utf8String, Utf8Error>   // O(n)
+checkUtf8(s): Result<void, Utf8Error>   isValidUtf8(s): bool   utf8ErrorMessage(e)  encode(s: Utf8String): Bytes
+isScalarValue(cp: int): bool   utf8Len(cp): int  @Requires(isScalarValue(cp))   encodeCodePoint(cp): Option<string>
+fromCodePoints(cps: int[]): Option<Utf8String>
+
+@Invariant(isValidUtf8(this.text))
+class Utf8String                                          // new Utf8String(text) validates and traps on invalid input
+  asString()  byteLength()  isEmpty()  toBytes()  codePointCount()  codePoints(): int[]  codePointAt(i): Option<int>
+  isCharBoundary(i)  concat(o): Utf8String  trySlice(lo, hi): Option<Utf8String>   // slices only at boundaries
+@Invariant(pos <= src.byteLength() && src.isCharBoundary(pos))
+class CodePointCursor    hasNext()  position()  next(): Option<int>               // O(1) per code point
+```
+
+Validation is **table-driven** (Bjoern Hoehrmann's DFA: a 256-entry byte-class table and a 9-state transition table, kept
+as string constants because Orin has no constant arrays; runs of ASCII bytes skip the tables), one pass, no allocation:
+1 MB validates in about 1 ms (ASCII text 0.6 ms, mixed 1 ms, CJK 1.2 ms) against 22 / 16 / 9 ms for the earlier
+per-sequence decoder (`scanSeq`), which is kept for the error path only: when the DFA rejects, `scanSeq` classifies the
+first bad sequence (kind, length), and a contract on the DFA pass requires the two to agree at the reported offset.
+`tests/std/utf8_dfa_test.or` is a differential test against an independent reference written from Table 3-7 as byte
+ranges: exhaustive over all 1- and 2-byte inputs, every first byte with boundary bytes after it for 3 and 4 bytes, and
+random longer inputs; verdict and error position must match. Decoding follows RFC 3629 / Unicode Table 3-7 exactly
+(table in the source header): rejected are lone continuation
+bytes and `F8..FF` (`InvalidLead`), `C0`, `C1`, `E0 80..9F`, `F0 80..8F` (`Overlong`), `ED A0..BF` (`Surrogate`), `F5..F7`
+and `F4 90..BF` (`TooLarge`), cut-off sequences (`TruncatedSequence`) and a wrong continuation byte
+(`InvalidContinuation`). Noncharacters (`U+FFFE`, `U+FDD0`...) are valid scalar values and accepted. `position` is the
+byte offset of the first invalid sequence, i.e. the length of the longest valid prefix; `length` is the maximal invalid
+prefix there (1..3). The constructor of `Utf8String` validates in **every** build (not only with contract checking),
+so the invariant cannot be bypassed; `validate` therefore scans twice (O(2n)). `concat` of valid strings is valid;
+`trySlice` answers `None` unless both ends are code point boundaries, so slicing cannot split a character. Tests
+(`tests/std/utf8_test.or`) are hand-written vectors in the style of Markus Kuhn's UTF-8 decoder stress test: boundary
+values, every continuation byte, every lead byte followed by a space, truncations, overlong forms of `/` and NUL,
+the surrogate range and CESU-8 pairs, above `U+10FFFF`, impossible bytes, error positions, and an encode/decode
+round trip over all code points up to `U+0898` and a stride through the rest.
+
+### std:collections
+
+```
+class IntSet / StringSet          // on Map; invariants: map size == key count, every stored flag true
+  size() isEmpty() has(x) add(x): bool remove(x): bool clear() toArray()   // expected O(1); add/remove say whether the set changed
+  isSubsetOf(o) union(o) intersection(o) difference(o)                       // O(n + m)
+class Deque<T>                    // ring buffer, doubling from 4 slots, wrap by conditional subtraction; invariants:
+                                  // len <= capacity, head in range, a filler value exists exactly when there is storage
+  size() isEmpty() capacity() pushBack(x) pushFront(x) popFront() popBack() front() back() get(i) clear() toArray()   // amortised O(1)
+class SortedMap<V>                // int keys: a B-tree in an arena; new SortedMap<V>(minDegree) with minDegree >= 2, use 16
+class SortedStringMap<V>          // the same with string keys in compareStrings order (byte-wise lexicographic)
+  size() isEmpty() height() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
+  firstKey() lastKey() floorKey(k) ceilKey(k)   popFirst() popLast(): Option<SortedEntry<V>>  keyArray() valueArray() clear()
+class PriorityQueue<T>            // 4-ary min-heap in three parallel arrays; invariants: equal lengths, heap property (strict,
+                                  // on (priority, insertion number)), every insertion number < the counter, which never decreases
+  size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PQEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
+```
+
+Contracts: `add`/`put` return whether the key was new and the size grows by exactly 1 in that case (`result ==>
+size == old(size) + 1`, `!result ==> size == old(size)`), `has(k)` holds afterwards; `remove` makes `has(k)` false and
+shrinks the size by exactly 1 iff the key was present; `get` is `Some` iff `has`; `floorKey`/`ceilKey` return a present
+key on the right side of `k` and, on `None`, the first/last key proves there is none; `popFirst`/`popLast` return
+`old(firstKey())` / `old(lastKey())` and the remaining keys are strictly beyond it; `PriorityQueue.pop` returns the
+priority `old(minPriority())`, shrinks the size by 1 and every remaining priority is `>=` it (`allAtLeast`), `push`
+makes `minPriority` equal `min(priority, old(minPriority()))`; equal priorities leave first-in first-out. Deque pushes
+grow the size by 1 and make the pushed end present, pops shrink it by 1 iff non-empty. Set operations state subset
+relations (`union` contains both operands, `intersection` is contained in both, `difference` is disjoint from the
+other and sizes add up).
+
+**Algorithms, invariants and measurements** (single run, `cc -O2`, one 4-core machine under load; relative numbers matter):
+
+| Structure | Algorithm | Invariants (checked after every public method) | Measured against the simpler version |
+|---|---|---|---|
+| `SortedMap`, `SortedStringMap` | B-tree of minimum degree t (CLRS: top-down insert that splits full nodes, top-down delete that borrows or merges so every node entered has >= t keys), nodes in an arena `nodes[]` addressed by index, a free list for merged nodes, no parent pointers: a plain copy-on-write value. Every operation including `floorKey`/`ceilKey`/`popFirst`/`popLast` is one root-to-leaf pass, O(t log_t n); iterative everywhere (explicit stacks) | keys sorted in each node and bounded by the separators above; every non-root node holds t-1..2t-1 keys (root <= 2t-1, inner root >= 1); all leaves at the same depth; size == number of keys; every node id in range and reached exactly once (no dangling or shared ids, no cycles); free list distinct, unreachable, and reachable + free == arena size; `height()` is logarithmic (`2 t^(h-1) - 1 <= n`) | 20,000 random inserts + lookups + removals: sorted array 1782 ms, B-tree t=4 76 ms, t=8 37 ms, **t=16 31 ms**, t=32 42 ms, t=64 52 ms. t=16 is the recommended degree. 200,000 operations of each kind: 758 ms. The sorted-array version is kept as `tests/std/spec_sorted.or`, the executable specification: `tests/std/sorted_btree_test.or` drives both with the same random operation sequences (degrees 2, 3, 5, 16, tiny and large key ranges, int and string keys) and requires identical answers for every operation |
+| `PriorityQueue` | 4-ary implicit heap, struct of arrays (priorities, insertion numbers, values), hole-based sifting (one write per level), FIFO among equal priorities through the insertion number | equal array lengths; every entry leaves strictly before its up to four children (`isMinHeap4`); insertion numbers below a monotone counter | 200,000 random pushes + pops: boxed binary heap with swaps 300 ms, binary SoA hole 164 ms, **4-ary SoA hole 122 ms**, 8-ary 137 ms |
+| `Deque` | ring buffer with doubling growth, wrap by conditional subtraction, no per-element allocation | `len <= capacity`, head in range, filler exists iff there is storage | 500,000 push/pop rounds: `Option<T>` slots with `%` 128 ms, **plain slots 84 ms** (see the gap below) |
+| `IntSet`, `StringSet` | the prelude's open-addressing hash map (`Map<K, bool>`, expected O(1)); `union` copies the larger set and inserts the smaller, `intersection` walks the smaller and probes the larger | map size == key count, every flag true | reviewed: a hash set is the best known structure and the prelude map is already open addressing with an index table; no change |
+| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `bytesFromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
+| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValidUtf8(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
+
+### Limitations of this layer (language friction, honest list)
+
+* `Map<K, V>` needs a *concrete* key type (`int`, `usize`, `bool`, `string`; E0400 for a type parameter) and a type
+  parameter has no `==`, `<` or hash (E0410). So there is no generic `Set<T>` or `SortedMap<K, V>`: the sets and maps are
+  specialised by key class (`IntSet`/`StringSet`, `SortedMap<V>`/`SortedStringMap<V>`); `Deque<T>`, the values `V` and the
+  queue elements `T` are generic.
+* The same missing `==` on type parameters means the contracts of the generic containers cannot say "the value that
+  comes back is the one that was put in" (`get` after `put`, the popped element is the pushed one); they state sizes,
+  membership, key/priority order and presence. The tests check the values on `int` and `string` instances and against
+  naive reference models on pseudo-random operation sequences.
+* A contract cannot call a function value (E0416), so a comparator closure stored in a class could not appear in the heap
+  invariant: `PriorityQueue<T>` takes an explicit `int` priority until the Eq/Ord ADR lands. A `T extends Ranked`
+  interface would do for ordered classes, but cannot cover `int`/`string` without wrapper classes.
+* **Tooling gaps found while applying the algorithm rule** (feed ADR-0031 A and the Eq/Ord/Hash constraints ADR):
+  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`): no generic `Set<T>`, `SortedMap<K, V>`,
+     comparator queue; the B-tree needed a code generator to exist for two key types; contracts cannot say "the same
+     value comes back";
+  2. no uninitialised or default value for a type parameter (a `MaybeUninit`/`default<T>()` or a `T[]` with capacity):
+     the ring buffer must either box every slot in `Option<T>` (statable invariant "exactly the live slots are Some",
+     but an allocation per element) or hold a filler value in dead slots (fast, the invariant cannot name the dead slots);
+  3. no constant arrays or tables (top-level `const` must be a literal, E0408): the DFA tables are string constants read
+     with `charCodeAt`;
+  4. no bulk byte primitives: no `u8[]` <-> string conversion (one 1-byte string per byte), no array `reserve`/capacity,
+     no `memcmp`/`memchr`-style search, no bitwise operators or shifts (so no power-of-two masks and no bit-parallel
+     validators), no `slice` view type that avoids the array header;
+  5. contracts cannot call a function value, so comparator-based structures cannot state their invariants;
+  6. generic *contract helpers over records of a generic type* work (`btreeIntShapeOk<V>`), but a recursive structure has to
+     be an arena with indices plus explicit-stack loops: there is no termination measure checking for loops
+     (`@Decreases` is only type-checked) and `orin verify --contracts` supports none of this (loops, arrays, classes), so
+     every invariant here is a run-time check (tests, `--check-contracts`), not a proof;
+  7. a mutating method cannot be called inside `&&`/`||`/`?:` or on a temporary (E0408/E0401), and `private constructor` is
+     rejected (E0411).
+* There are no private constructors (`private constructor` is rejected with E0411), so `Bytes` and `Utf8String` have public
+  constructors whose requirements are checked: `Bytes` by `@Requires` (a violation is still memory safe: every access is
+  bounds checked), `Utf8String` by always-on validation, the B-tree maps by `@Requires(minDegree >= 2)`.
+* No bitwise operators or shifts (multi-byte integers use `*`, `/`, `%`); no array `reserve`; a `u8` array element
+  occupies 8 bytes; `@Test` has no "expected trap" form (`tests/std/expect_trap/` and `tools/test_std.sh` fill that gap).
+* Mutating methods cannot be called inside `&&`, `||` or `?:` (E0408), nor on a temporary (E0401): `let r = new ByteReader(b);`.
 
 ## Limitations
 

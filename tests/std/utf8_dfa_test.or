@@ -1,0 +1,164 @@
+// Differential tests of the table-driven UTF-8 validator of std:utf8 against an independent reference written
+// from Unicode Table 3-7 as byte ranges (no code shared with the implementation). Exhaustive over all 1- and
+// 2-byte inputs, boundary-heavy over 3- and 4-byte inputs (every first byte, boundary bytes after it), plus
+// random longer inputs. Both the verdict and the error position must agree.
+import { assertEqBool } from "std:test";
+import { checkUtf8, isValidUtf8 } from "std:utf8";
+
+// Returns the offset of the first invalid or cut-off sequence, or -1 when valid.
+function refFirstBad(xs: int[]): int {
+  const n = xs.length;
+  let i: usize = 0;
+  while (i < n) {
+    const b = xs[i];
+    if (b <= 127) {
+      i += 1;
+      continue;
+    }
+    let need: usize = 0;
+    let lo = 128;
+    let hi = 191;
+    if (b >= 194 && b <= 223) {
+      need = 2;
+    } else if (b == 224) {
+      need = 3;
+      lo = 160;
+    } else if (b >= 225 && b <= 236) {
+      need = 3;
+    } else if (b == 237) {
+      need = 3;
+      hi = 159;
+    } else if (b == 238 || b == 239) {
+      need = 3;
+    } else if (b == 240) {
+      need = 4;
+      lo = 144;
+    } else if (b >= 241 && b <= 243) {
+      need = 4;
+    } else if (b == 244) {
+      need = 4;
+      hi = 143;
+    } else {
+      return i.toInt();
+    }
+    if (i + need > n) {
+      return i.toInt();
+    }
+    if (xs[i + 1] < lo || xs[i + 1] > hi) {
+      return i.toInt();
+    }
+    let k: usize = 2;
+    while (k < need) {
+      if (xs[i + k] < 128 || xs[i + k] > 191) {
+        return i.toInt();
+      }
+      k += 1;
+    }
+    i += need;
+  }
+  return -1;
+}
+
+function stringOf(xs: int[]): string {
+  let parts: string[] = [];
+  for (const x of xs) {
+    parts.push(String.fromCharCode(x));
+  }
+  return parts.join("");
+}
+
+function agrees(xs: int[]): bool {
+  const want = refFirstBad(xs);
+  const s = stringOf(xs);
+  const r = checkUtf8(s);
+  if (want < 0) {
+    return r.isOk() && isValidUtf8(s);
+  }
+  return r.isErr() && !isValidUtf8(s) && r.unwrapErr().position.toInt() == want;
+}
+
+function nextRand(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+@Test
+function dfaMatchesReferenceOnAllOneAndTwoByteInputs(): void {
+  let a: int = 0;
+  while (a < 256) {
+    assertEqBool(agrees([a]), true, "1 byte " + a.toString());
+    let b: int = 0;
+    while (b < 256) {
+      assertEqBool(agrees([a, b]), true, "2 bytes " + a.toString() + " " + b.toString());
+      b += 1;
+    }
+    a += 1;
+  }
+}
+
+@Test
+function dfaMatchesReferenceOnThreeByteBoundaryInputs(): void {
+  const s = [0, 65, 127, 128, 143, 144, 159, 160, 191, 192, 194, 224, 237, 240, 244, 255];
+  let a: int = 0;
+  while (a < 256) {
+    for (const b of s) {
+      for (const c of s) {
+        assertEqBool(agrees([a, b, c]), true, "3 bytes " + a.toString() + " " + b.toString() + " " + c.toString());
+      }
+    }
+    a += 1;
+  }
+}
+
+@Test
+function dfaMatchesReferenceOnFourByteBoundaryInputs(): void {
+  const s = [65, 128, 143, 144, 159, 160, 191, 194];
+  let a: int = 0;
+  while (a < 256) {
+    for (const b of s) {
+      for (const c of s) {
+        for (const d of s) {
+          assertEqBool(agrees([a, b, c, d]), true, "4 bytes " + a.toString() + " " + b.toString() + " " + c.toString() + " " + d.toString());
+        }
+      }
+    }
+    a += 1;
+  }
+}
+
+@Test
+function dfaMatchesReferenceOnRandomMixedInputs(): void {
+  let seed: int = 17;
+  let round: int = 0;
+  while (round < 400) {
+    let xs: int[] = [];
+    let n: int = 0;
+    seed = nextRand(seed);
+    const len = (seed / 16) % 40;
+    while (n < len) {
+      seed = nextRand(seed);
+      const pick = (seed / 16) % 8;
+      seed = nextRand(seed);
+      const r = (seed / 16) % 256;
+      if (pick < 3) {
+        xs.push(r % 128);
+      } else if (pick == 3) {
+        xs.push(194 + r % 30);
+        xs.push(128 + r % 64);
+      } else if (pick == 4) {
+        xs.push(225 + r % 12);
+        xs.push(128 + r % 64);
+        xs.push(128 + (r / 4) % 64);
+      } else if (pick == 5) {
+        xs.push(240 + r % 4);
+        xs.push(128 + r % 64);
+        xs.push(128 + (r / 4) % 64);
+        xs.push(128 + (r / 2) % 64);
+      } else {
+        xs.push(r);
+      }
+      n += 1;
+    }
+    assertEqBool(agrees(xs), true, "random input " + round.toString());
+    round += 1;
+  }
+}

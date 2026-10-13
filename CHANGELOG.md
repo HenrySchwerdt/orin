@@ -17,6 +17,10 @@
   harnesses. MIR v1.9 (`BGrant*` builtins, grants first in every std I/O builtin). OSIG: `PERFORMS_IO` edges to `Effect`
   nodes (primitive call sites only). Seed refreshed through a bridge compiler (ADR-0027, "Bootstrap note"). Not covered:
   TOCTOU, hard links, mounts, `shell`, native code. Open questions for the owner: ADR-0027.
+- Provable std layer 1 (ADR-0030 §3): new pure-Orin modules `std:bytes` (`Bytes`, `ByteBuilder`, `ByteReader`),
+  `std:utf8` (validated decoding, `Utf8String`, `CodePointCursor`) and `std:collections` (`IntSet`, `StringSet`,
+  ring `Deque<T>`, B-tree `SortedMap<V>`/`SortedStringMap<V>`, 4-ary `PriorityQueue<T>`), every class with invariants and every method
+  with contracts; `tools/test_std.sh [--mutate]`, `tests/std/`. Registered in `compiler/loader/resolve.or`; docs/std.md.
 - Contract-quality diagnostics (ADR-0028): warnings W0450-W0452 (invariant without `this`, `@Ensures` that cannot
   fail, trivially true contracts), solver-based W0460-W0462 in `orin verify --contracts`, opt-in strict coverage
   W0470/W0471 (`--strict-contracts`, `[contracts] strict = true`), and `tools/contract_mutation.py` (contract

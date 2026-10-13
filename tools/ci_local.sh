@@ -23,6 +23,7 @@ step "verify all"              python3 tools/verify_all.py compiler/main.or
 step "contract erasure"        python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2
 step "annotation erasure"      python3 tools/test_annotation_erasure.py --orinc build/bootstrap/orin2
 step "annotations, orin test"  python3 tools/test_annotations.py --orinc build/bootstrap/orin2
+step "provable std (tests+mutants)" tools/test_std.sh --mutate
 step "contract verification"   python3 tools/test_verify_contracts.py --require-z3 --orinc build/bootstrap/orin2
 step "contract strength smoke" python3 tools/contract_mutation.py examples/contract_mutation.or --orinc build/bootstrap/orin2 --max-mutants 6 --min-kill-rate 0.3
 step "platform layer"         sh -c 'tools/check_platform_boundary.sh && tools/verify_platform.sh'

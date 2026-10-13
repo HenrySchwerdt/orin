@@ -22,7 +22,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
-   - bytes and UTF-8, collections, I/O
+   - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
    - `std:net`, `std:http`
    - `std:mcp`, JSX/`std:html`
 4. **Complete the Lean proofs:**
@@ -94,6 +94,16 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   2. **std I/O freeze** after capabilities. Stage A has landed, so the signatures are now the
      proposed final ones (`std:host`, `std:fs`, `std:process`, `std:io`, `std:time` take grants);
      they stay *unstable* until the project owner confirms the freeze (ADR-0027 open questions).
+
+### 1c. Provable std foundation (ADR-0030 §3, "bytes and text" + "collections"): done
+- `std:bytes` (`Bytes`, `ByteBuilder`, `ByteReader`), `std:utf8` (validated decoding, `Utf8String`,
+  `CodePointCursor`), `std:collections` (`IntSet`/`StringSet`, `Deque<T>`, B-tree `SortedMap<V>`/
+  `SortedStringMap<V>`, 4-ary `PriorityQueue<T>`): pure safe Orin, every class with `@Invariant`s, every
+  method with `@Requires`/`@Ensures`, tests with and without contract checking, and a mutation check
+  that deliberately broken implementations are rejected (`tools/test_std.sh --mutate`, docs/std.md).
+- Still open in this layer of ADR-0030: `std:fmt`, `Graph<T>` under the contract standard, the
+  mutation kill-rate *gate* for the other std modules, and generic `Set<T>`/`SortedMap<K, V>`/comparator
+  queues, which need language support (equality and ordering on type parameters, docs/std.md "Limitations").
 
 ### 2. Compiler rewrite with the full language (ADR-0015)
 - Refresh the seed, then rewrite module by module:
