@@ -31,7 +31,8 @@ _Updated: 2026-10-13_
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
 
 ## Next milestones
-1. Seed bootstrap merged → compiler source may use generics/closures/classes.
+1. Seed bootstrap merged → compiler source may use generics/closures/classes; then the
+   compiler modernisation with contract dogfooding (ADR-0015), module by module.
 2. v0.1.0-alpha.2 with closures, floats, maps.
 3. Runtime R3 (core dialect, object model in Orin) and refinement proofs.
 4. Contract verification beyond pure functions; interfaces; concurrency design (spec 12 #5).
