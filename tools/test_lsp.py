@@ -352,6 +352,54 @@ def run(exe):
     check("y: int" in hover("y: 2", 0), "rich: hover field (%r)" % hover("y: 2", 0))
     check("Pos" in hover("pos.x)", 0, 1) or "int" in hover("pos.x)", 0, 1), "rich: hover member (%r)" % hover("pos.x)", 0, 1))
 
+    # ---- classes across files (ADR-0009): definition, hover, references, rename ----------------
+    clib = os.path.join(tmp, "clib.or")
+    cmain = os.path.join(tmp, "cmain.or")
+    clib_text = ("export class Counter {\n  constructor(public value: int) {}\n"
+                 "  increment(): void {\n    this.value += 1;\n  }\n"
+                 "  get(): int {\n    return this.value;\n  }\n}\n")
+    cmain_text = ('import { Counter } from "./clib";\n\n'
+                  "function main(): void {\n"
+                  "  let c = new Counter(0);\n"
+                  "  c.increment();\n"
+                  "  console.log(c.get().toString());\n"
+                  "  console.log(c.value.toString());\n"
+                  "}\n")
+    with open(clib, "w") as f:
+        f.write(clib_text)
+    open_doc(c, cmain, cmain_text)
+    d = sync(c, uri_of(cmain))
+    check(d == [], "classes: cmain.or has no diagnostics (got %r)" % (d,))
+    inc = pos_of(cmain_text, "increment", 0, 1)
+    r = c.request("textDocument/definition", td(cmain, inc))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(clib) and loc["range"]["start"] == pos_of(clib_text, "increment", 0),
+          "classes: definition of a method call jumps to the method in clib.or (got %r)" % (loc,))
+    r = c.request("textDocument/definition", td(cmain, pos_of(cmain_text, "Counter(0)", 0, 1)))
+    loc = r.get("result")
+    check(isinstance(loc, dict) and loc["uri"] == uri_of(clib) and loc["range"]["start"] == pos_of(clib_text, "Counter", 0),
+          "classes: definition of `new Counter` jumps to the class (got %r)" % (loc,))
+    r = c.request("textDocument/hover", td(cmain, inc))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("mut method increment()" in hv, "classes: hover shows the inferred mutability (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(cmain, pos_of(cmain_text, "get()", 0, 1)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("method get(): int" in hv and "mut" not in hv, "classes: non-mutating method hover (got %r)" % (hv,))
+    r = c.request("textDocument/references", {**td(cmain, inc), "context": {"includeDeclaration": True}})
+    locs = r.get("result") or []
+    check(len(locs) == 2 and uri_of(clib) in set(l["uri"] for l in locs), "classes: method references (decl + call) (got %d)" % len(locs))
+    r = c.request("textDocument/references", {**td(cmain, pos_of(cmain_text, "value", 0)), "context": {"includeDeclaration": True}})
+    locs = r.get("result") or []
+    check(len(locs) >= 4, "classes: field references (decl, this.value x2, c.value) (got %d)" % len(locs))
+    r = c.request("textDocument/rename", {**td(cmain, inc), "newName": "bump"})
+    changes = (r.get("result") or {}).get("changes", {})
+    check(len(changes.get(uri_of(clib), [])) == 1 and len(changes.get(uri_of(cmain), [])) == 1,
+          "classes: rename method in both files (%r)" % ({k: len(v) for k, v in changes.items()},))
+    r = c.request("textDocument/rename", {**td(cmain, pos_of(cmain_text, "Counter(0)", 0)), "newName": "Tally"})
+    changes = (r.get("result") or {}).get("changes", {})
+    check(len(changes.get(uri_of(clib), [])) == 1 and len(changes.get(uri_of(cmain), [])) == 2,
+          "classes: rename class (decl in clib; import + new in cmain) (%r)" % ({k: len(v) for k, v in changes.items()},))
+
     # ---- shutdown / exit --------------------------------------------------------------------
     r = c.request("shutdown", None)
     check(r.get("result", 0) is None and "error" not in r, "shutdown: null result")

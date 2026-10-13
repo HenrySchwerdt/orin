@@ -409,7 +409,39 @@ function paramsText(ps: Param[]): string {
   return parts.join(", ");
 }
 
-function declareClass(p: P1, unitName: string, c: ClassDecl): P1 {
+// Inferred mutability of a method (ADR-0009): the lowered HIR function of an instance method
+// returns the updated receiver (declared `void`) or a `$ret` record.
+function methodMutating(hir: Option<Program>, qname: string, declRet: Option<TypeExpr>): bool {
+  match (hir) {
+    Some(h) => {
+      for (const f of h.functions) {
+        if (f.name == qname && f.paramCount > 0 && f.locals[0].name == "this$") {
+          match (f.ret) {
+            TyVoid => { return false; },
+            TyRecord(r) => {
+              if (h.records[r].name.endsWith("$ret")) {
+                return true;
+              }
+              const isVoidDecl = match (declRet) {
+                None => true,
+                Some(t) => match (t.kind) {
+                  TNamed(id, _) => id.name == "void",
+                  _ => false
+                }
+              };
+              return isVoidDecl;
+            },
+            _ => { return false; }
+          }
+        }
+      }
+    },
+    None => {}
+  }
+  return false;
+}
+
+function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
@@ -450,8 +482,9 @@ function declareClass(p: P1, unitName: string, c: ClassDecl): P1 {
           "constructor(" + ps.join(", ") + ")");
       },
       MMethod(md) => {
-        let d = (md.priv ? "private " : "") + (md.isStatic ? "static " : "") + md.name.name + "("
-          + paramsText(md.params) + ")";
+        const mutating = !md.isStatic && methodMutating(hir, unitName + "." + c.name.name + "." + md.name.name, md.ret);
+        let d = (md.priv ? "private " : "") + (md.isStatic ? "static " : "") + (mutating ? "mut method " : "method ")
+          + md.name.name + "(" + paramsText(md.params) + ")";
         match (md.ret) {
           Some(t) => { d += ": " + renderTE(t); },
           None => {}
@@ -1340,7 +1373,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         },
         IClass(cd) => {
           did = p.w.defs.length;
-          p = declareClass(p, u.name, cd);
+          p = declareClass(p, u.name, cd, hir);
         },
         _ => {}
       }
