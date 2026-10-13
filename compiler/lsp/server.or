@@ -1,0 +1,69 @@
+// `orin lsp`: the stdio loop around `pump` (handler.or). Reads one framed message at a time
+// (header lines up to the blank line, then exactly Content-Length bytes), feeds it to `pump`
+// and writes the framed output. Returns the process exit code: 0 after `shutdown` + `exit`,
+// 1 for `exit` without `shutdown` or when stdin ends first.
+
+import { LspState, newLspState, pump, lspExitCode } from "./handler";
+import { stdinReadBytes, stdinReadLine, stdoutWrite } from "./stdio";
+
+type Msg = { text: string; ok: bool; };
+
+// Next framed message as raw bytes (headers + body), `ok` false at end of input.
+function readFrame(): Msg {
+  let headers: string[] = [];
+  let len: int = -1;
+  while (true) {
+    const l = stdinReadLine();
+    if (l.isNone()) {
+      return Msg { text: "", ok: false };
+    }
+    const line = l.unwrap();
+    if (line.length == 0) {
+      if (headers.length == 0) {
+        continue;
+      }
+      break;
+    }
+    headers.push(line);
+    const t = line.trim();
+    if (t.startsWith("Content-Length:") || t.startsWith("content-length:")) {
+      const n = parseInt(t.substring(15, t.length).trim());
+      if (n.isSome()) {
+        len = n.unwrap();
+      }
+    }
+  }
+  if (len < 0) {
+    return Msg { text: "", ok: false };
+  }
+  const body = stdinReadBytes(len.toUsize());
+  if (body.isNone()) {
+    return Msg { text: "", ok: false };
+  }
+  return Msg { text: headers.join("\r\n") + "\r\n\r\n" + body.unwrap(), ok: true };
+}
+
+export function runLsp(): int {
+  let st: LspState = newLspState();
+  while (true) {
+    const m = readFrame();
+    if (!m.ok) {
+      return 1;
+    }
+    const r = pump(st, m.text);
+    if (r.isErr()) {
+      console.error("lsp: " + r.unwrapErr());
+      return 1;
+    }
+    const p = r.unwrap();
+    st = p.state;
+    if (p.output.length > 0) {
+      stdoutWrite(p.output);
+    }
+    const code = lspExitCode(st);
+    if (code.isSome()) {
+      return code.unwrap();
+    }
+  }
+  return 1;
+}

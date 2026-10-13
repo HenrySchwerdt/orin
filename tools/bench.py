@@ -231,7 +231,7 @@ def main():
         print("selfcompile median %ss" % fmt_s(selfc["wall"][0]), file=sys.stderr)
         orinb = os.path.join(ROOT, "bootstrap", "target", "release", "orinb")
         if os.path.exists(orinb):
-            cmd = [orinb, "compile", "compiler/main.or", "-o", out + "/out_stage0.c"]
+            cmd = [orinb, "compile", "build/bootstrap/stage0-src/compiler/main.or", "-o", out + "/out_stage0.c"]
             run_once(cmd)
             walls, rss = [], []
             for _ in range(args.runs):

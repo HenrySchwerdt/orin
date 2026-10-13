@@ -11,8 +11,12 @@ mkdir -p "$B"
 ORINB=bootstrap/target/release/orinb
 cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c -o "$2"; }
 
-echo "[stage1] orinb compiles compiler/main.or"
-$ORINB compile compiler/main.or -o $B/stage1.c && cc_link $B/stage1.c $B/orin1
+# Stage 0 does not know `std:io` (compiler/lsp/stdio.or), so stage 1 is built from a copy of the
+# compiler tree in which that one file is replaced by a stub (tools/stage0/lsp_stdio.or).
+echo "[stage1] orinb compiles compiler/main.or (stdio stub)"
+rm -rf $B/stage0-src && mkdir -p $B/stage0-src && cp -r compiler $B/stage0-src/compiler
+cp tools/stage0/lsp_stdio.or $B/stage0-src/compiler/lsp/stdio.or
+$ORINB compile $B/stage0-src/compiler/main.or -o $B/stage1.c && cc_link $B/stage1.c $B/orin1
 echo "[stage2] orin1 compiles compiler/main.or"
 $B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link $B/stage2.c $B/orin2
 echo "[stage3] orin2 compiles compiler/main.or"
