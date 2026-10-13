@@ -29,7 +29,7 @@ _Updated: 2026-10-13_
 | Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | done: phase 1 + phase 2 for int/bool functions (`orin verify --contracts`, z3; see docs/contracts.md) |
 | Packages: `orin.toml`, architecture rules, API snapshots | done |
 | std:path/json/time/graph | done |
-| Provable std layer 1 (ADR-0030 §3): `std:bytes`, `std:utf8`, `std:collections` | done: pure Orin, 19 invariants / 11 `@Requires` / 282 `@Ensures`, 79 `@Test`, 44-mutant check (`tools/test_std.sh --mutate`); generic `Set`/`SortedMap<K,V>`/comparator queue blocked by language limits (docs/std.md) |
+| Provable std layer 1 (ADR-0030 §3): `std:bytes`, `std:utf8`, `std:collections` | done: pure Orin, best-known algorithms (B-tree maps, 4-ary heap, table-driven UTF-8 DFA, ring deque), 24 invariants / 16 `@Requires` / 291 `@Ensures`, 94 `@Test`, 60-mutant check and differential tests against executable specs (`tools/test_std.sh --mutate`); generic `Set`/`SortedMap<K,V>`/comparator queue blocked by language limits (docs/std.md) |
 | Interfaces (ADR-0019) | done |
 | Fixed-width integers (`i8`..`u64`, `isize`, `usize`; 128-bit deferred, E0431) and template-literal interpolation (ADR-0022) | done |
 | Built-in annotations `@Test` (`orin test`, `std:test`), `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) | done |

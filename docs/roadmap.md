@@ -63,8 +63,8 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 
 ### 1c. Provable std foundation (ADR-0030 §3, "bytes and text" + "collections"): done
 - `std:bytes` (`Bytes`, `ByteBuilder`, `ByteReader`), `std:utf8` (validated decoding, `Utf8String`,
-  `CodePointCursor`), `std:collections` (`IntSet`/`StringSet`, `Deque<T>`, `SortedMap<V>`/
-  `SortedStringMap<V>`, `PriorityQueue<T>`): pure safe Orin, every class with `@Invariant`s, every
+  `CodePointCursor`), `std:collections` (`IntSet`/`StringSet`, `Deque<T>`, B-tree `SortedMap<V>`/
+  `SortedStringMap<V>`, 4-ary `PriorityQueue<T>`): pure safe Orin, every class with `@Invariant`s, every
   method with `@Requires`/`@Ensures`, tests with and without contract checking, and a mutation check
   that deliberately broken implementations are rejected (`tools/test_std.sh --mutate`, docs/std.md).
 - Still open in this layer of ADR-0030: `std:fmt`, `Graph<T>` under the contract standard, the

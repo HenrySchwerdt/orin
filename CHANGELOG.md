@@ -3,7 +3,7 @@
 ## Unreleased
 - Provable std layer 1 (ADR-0030 §3): new pure-Orin modules `std:bytes` (`Bytes`, `ByteBuilder`, `ByteReader`),
   `std:utf8` (validated decoding, `Utf8String`, `CodePointCursor`) and `std:collections` (`IntSet`, `StringSet`,
-  `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`), every class with invariants and every method
+  ring `Deque<T>`, B-tree `SortedMap<V>`/`SortedStringMap<V>`, 4-ary `PriorityQueue<T>`), every class with invariants and every method
   with contracts; `tools/test_std.sh [--mutate]`, `tests/std/`. Registered in `compiler/loader/resolve.or`; docs/std.md.
 
 ## 0.1.0-alpha.2 (2026-10-13)

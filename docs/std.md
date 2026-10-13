@@ -181,12 +181,17 @@ class standard of ADR-0030 §3 (summary):
 * no tautologies; every public function has `@Test` coverage including edge cases (`tests/std/*_test.or`);
 * tests run twice: with contract checking (the `orin test` default) and with `--no-contracts` (the logic must not
   depend on the contracts). `tools/test_std.sh` does both; `tools/test_std.sh --mutate` adds the **mutation check**
-  (`tools/mutate_std.py`): 44 deliberately broken one-line variants of the three modules, each of which must make a
+  (`tools/mutate_std.py`): 60 deliberately broken one-line variants of the three modules, each of which must make a
   test or a contract fail (CI step "Provable std").
 
 Contract counts (clauses in the source): `std:bytes` 3 invariants + 6 `@Requires` + 85 `@Ensures`;
-`std:utf8` 2 + 5 + 47; `std:collections` 14 + 0 + 150 (every collection operation is total, so none needs a
-precondition: absent keys and empty containers answer `None`/`false`).
+`std:utf8` 2 + 5 + 49; `std:collections` 19 + 5 + 157 (the collection operations are total, so almost none needs a
+precondition: absent keys and empty containers answer `None`/`false`). The two B-tree maps are generated from one
+template (`tools/sorted_map.tmpl`, `tools/gen_sorted_map.py`; `tools/test_std.sh` checks the generated region is current).
+**Algorithm rule** (project owner, 2026-10-13): the std uses the best known algorithm for the job with its full
+invariants; if the contract tooling cannot state an invariant, find a formulation that works or report the exact
+tooling gap, never ship a weaker algorithm for the sake of a simpler contract. Every choice below was measured against
+the simpler alternative.
 
 ### std:bytes
 
@@ -244,7 +249,15 @@ class Utf8String                                          // new Utf8String(text
 class CodePointCursor    hasNext()  position()  next(): Option<int>               // O(1) per code point
 ```
 
-Decoding follows RFC 3629 / Unicode Table 3-7 exactly (table in the source header): rejected are lone continuation
+Validation is **table-driven** (Bjoern Hoehrmann's DFA: a 256-entry byte-class table and a 9-state transition table, kept
+as string constants because Orin has no constant arrays; runs of ASCII bytes skip the tables), one pass, no allocation:
+1 MB validates in about 1 ms (ASCII text 0.6 ms, mixed 1 ms, CJK 1.2 ms) against 22 / 16 / 9 ms for the earlier
+per-sequence decoder (`scanSeq`), which is kept for the error path only: when the DFA rejects, `scanSeq` classifies the
+first bad sequence (kind, length), and a contract on the DFA pass requires the two to agree at the reported offset.
+`tests/std/utf8_dfa_test.or` is a differential test against an independent reference written from Table 3-7 as byte
+ranges: exhaustive over all 1- and 2-byte inputs, every first byte with boundary bytes after it for 3 and 4 bytes, and
+random longer inputs; verdict and error position must match. Decoding follows RFC 3629 / Unicode Table 3-7 exactly
+(table in the source header): rejected are lone continuation
 bytes and `F8..FF` (`InvalidLead`), `C0`, `C1`, `E0 80..9F`, `F0 80..8F` (`Overlong`), `ED A0..BF` (`Surrogate`), `F5..F7`
 and `F4 90..BF` (`TooLarge`), cut-off sequences (`TruncatedSequence`) and a wrong continuation byte
 (`InvalidContinuation`). Noncharacters (`U+FFFE`, `U+FDD0`...) are valid scalar values and accepted. `position` is the
@@ -263,15 +276,15 @@ round trip over all code points up to `U+0898` and a stride through the rest.
 class IntSet / StringSet          // on Map; invariants: map size == key count, every stored flag true
   size() isEmpty() has(x) add(x): bool remove(x): bool clear() toArray()   // expected O(1); add/remove say whether the set changed
   isSubsetOf(o) union(o) intersection(o) difference(o)                       // O(n + m)
-class Deque<T>                    // ring buffer, doubling from 4 slots; invariants: len <= capacity, head in range,
-                                  // exactly the len slots from head (mod capacity) hold Some, the others None
+class Deque<T>                    // ring buffer, doubling from 4 slots, wrap by conditional subtraction; invariants:
+                                  // len <= capacity, head in range, a filler value exists exactly when there is storage
   size() isEmpty() capacity() pushBack(x) pushFront(x) popFront() popBack() front() back() get(i) clear() toArray()   // amortised O(1)
-class SortedMap<V>                // int keys; sorted array: invariants keys.length == vals.length, keys strictly increasing
+class SortedMap<V>                // int keys: a B-tree in an arena; new SortedMap<V>(minDegree) with minDegree >= 2, use 16
 class SortedStringMap<V>          // the same with string keys in compareStrings order (byte-wise lexicographic)
-  size() isEmpty() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>           // O(log n) search; put/remove shift: O(n)
+  size() isEmpty() height() has(k) get(k): Option<V> put(k, v): bool remove(k): Option<V>   // all O(t log_t n) = O(log n)
   firstKey() lastKey() floorKey(k) ceilKey(k)   popFirst() popLast(): Option<SortedEntry<V>>  keyArray() valueArray() clear()
-class PriorityQueue<T>            // binary min-heap; invariants: heap property (strict, on (priority, insertion number)),
-                                  // every insertion number < the counter, which never decreases
+class PriorityQueue<T>            // 4-ary min-heap in three parallel arrays; invariants: equal lengths, heap property (strict,
+                                  // on (priority, insertion number)), every insertion number < the counter, which never decreases
   size() isEmpty() minPriority() peek() push(priority: int, value: T) pop(): Option<PQEntry<T>> allAtLeast(p) clear()   // push/pop O(log n)
 ```
 
@@ -286,10 +299,16 @@ grow the size by 1 and make the pushed end present, pops shrink it by 1 iff non-
 relations (`union` contains both operands, `intersection` is contained in both, `difference` is disjoint from the
 other and sizes add up).
 
-**Why a sorted array and not a tree.** The invariant "keys strictly increasing, same length as the values" is a two-line
-loop and the representation is fully visible to it; binary search is a dozen lines. A balanced tree would need balance
-and order invariants over a recursive structure that loop-only contract helpers cannot express simply, and the O(n)
-insert is a shift of 8-byte slots. Lookups are O(log n); put/remove are O(n) worst case, O(1) at the largest key.
+**Algorithms, invariants and measurements** (single run, `cc -O2`, one 4-core machine under load; relative numbers matter):
+
+| Structure | Algorithm | Invariants (checked after every public method) | Measured against the simpler version |
+|---|---|---|---|
+| `SortedMap`, `SortedStringMap` | B-tree of minimum degree t (CLRS: top-down insert that splits full nodes, top-down delete that borrows or merges so every node entered has >= t keys), nodes in an arena `nodes[]` addressed by index, a free list for merged nodes, no parent pointers: a plain copy-on-write value. Every operation including `floorKey`/`ceilKey`/`popFirst`/`popLast` is one root-to-leaf pass, O(t log_t n); iterative everywhere (explicit stacks) | keys sorted in each node and bounded by the separators above; every non-root node holds t-1..2t-1 keys (root <= 2t-1, inner root >= 1); all leaves at the same depth; size == number of keys; every node id in range and reached exactly once (no dangling or shared ids, no cycles); free list distinct, unreachable, and reachable + free == arena size; `height()` is logarithmic (`2 t^(h-1) - 1 <= n`) | 20,000 random inserts + lookups + removals: sorted array 1782 ms, B-tree t=4 76 ms, t=8 37 ms, **t=16 31 ms**, t=32 42 ms, t=64 52 ms. t=16 is the recommended degree. 200,000 operations of each kind: 758 ms. The sorted-array version is kept as `tests/std/spec_sorted.or`, the executable specification: `tests/std/sorted_btree_test.or` drives both with the same random operation sequences (degrees 2, 3, 5, 16, tiny and large key ranges, int and string keys) and requires identical answers for every operation |
+| `PriorityQueue` | 4-ary implicit heap, struct of arrays (priorities, insertion numbers, values), hole-based sifting (one write per level), FIFO among equal priorities through the insertion number | equal array lengths; every entry leaves strictly before its up to four children (`isMinHeap4`); insertion numbers below a monotone counter | 200,000 random pushes + pops: boxed binary heap with swaps 300 ms, binary SoA hole 164 ms, **4-ary SoA hole 122 ms**, 8-ary 137 ms |
+| `Deque` | ring buffer with doubling growth, wrap by conditional subtraction, no per-element allocation | `len <= capacity`, head in range, filler exists iff there is storage | 500,000 push/pop rounds: `Option<T>` slots with `%` 128 ms, **plain slots 84 ms** (see the gap below) |
+| `IntSet`, `StringSet` | the prelude's open-addressing hash map (`Map<K, bool>`, expected O(1)); `union` copies the larger set and inserts the smaller, `intersection` walks the smaller and probes the larger | map size == key count, every flag true | reviewed: a hash set is the best known structure and the prelude map is already open addressing with an index table; no change |
+| `Bytes`, `ByteBuilder`, `ByteReader` | views over one shared `u8[]` (O(1) slices, cursor reads without copying), geometric `push` growth | `start + len <= data.length`; `pos <= length`; `capacity >= length` | reviewed: `concat` by `push` loop 108 ms vs built-in `slice` + `concat` 104 ms for 20 x 1 MB (no gain), `equals` 1.9 ms/MB, `bytesFromString` 1.2 ms/MB, `toRawString` 6 ms/MB (one 1-byte string per byte: see the gap below); no change |
+| `std:utf8` | Hoehrmann DFA + ASCII runs (see above) | `Utf8String`: `isValidUtf8(text)`; cursor: position on a code point boundary | 1 MB: DFA 0.6 / 1.0 / 1.2 ms (ASCII / mixed / CJK) vs decoder 22 / 16 / 9 ms |
 
 ### Limitations of this layer (language friction, honest list)
 
@@ -302,11 +321,30 @@ insert is a shift of 8-byte slots. Lookups are O(log n); put/remove are O(n) wor
   membership, key/priority order and presence. The tests check the values on `int` and `string` instances and against
   naive reference models on pseudo-random operation sequences.
 * A contract cannot call a function value (E0416), so a comparator closure stored in a class could not appear in the heap
-  invariant: `PriorityQueue<T>` takes an explicit `int` priority. A `T extends Ranked` interface would do for ordered
-  classes, but cannot cover `int`/`string` without wrapper classes.
+  invariant: `PriorityQueue<T>` takes an explicit `int` priority until the Eq/Ord ADR lands. A `T extends Ranked`
+  interface would do for ordered classes, but cannot cover `int`/`string` without wrapper classes.
+* **Tooling gaps found while applying the algorithm rule** (feed ADR-0031 A and the Eq/Ord/Hash constraints ADR):
+  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`): no generic `Set<T>`, `SortedMap<K, V>`,
+     comparator queue; the B-tree needed a code generator to exist for two key types; contracts cannot say "the same
+     value comes back";
+  2. no uninitialised or default value for a type parameter (a `MaybeUninit`/`default<T>()` or a `T[]` with capacity):
+     the ring buffer must either box every slot in `Option<T>` (statable invariant "exactly the live slots are Some",
+     but an allocation per element) or hold a filler value in dead slots (fast, the invariant cannot name the dead slots);
+  3. no constant arrays or tables (top-level `const` must be a literal, E0408): the DFA tables are string constants read
+     with `charCodeAt`;
+  4. no bulk byte primitives: no `u8[]` <-> string conversion (one 1-byte string per byte), no array `reserve`/capacity,
+     no `memcmp`/`memchr`-style search, no bitwise operators or shifts (so no power-of-two masks and no bit-parallel
+     validators), no `slice` view type that avoids the array header;
+  5. contracts cannot call a function value, so comparator-based structures cannot state their invariants;
+  6. generic *contract helpers over records of a generic type* work (`btreeIntShapeOk<V>`), but a recursive structure has to
+     be an arena with indices plus explicit-stack loops: there is no termination measure checking for loops
+     (`@Decreases` is only type-checked) and `orin verify --contracts` supports none of this (loops, arrays, classes), so
+     every invariant here is a run-time check (tests, `--check-contracts`), not a proof;
+  7. a mutating method cannot be called inside `&&`/`||`/`?:` or on a temporary (E0408/E0401), and `private constructor` is
+     rejected (E0411).
 * There are no private constructors (`private constructor` is rejected with E0411), so `Bytes` and `Utf8String` have public
   constructors whose requirements are checked: `Bytes` by `@Requires` (a violation is still memory safe: every access is
-  bounds checked), `Utf8String` by always-on validation.
+  bounds checked), `Utf8String` by always-on validation, the B-tree maps by `@Requires(minDegree >= 2)`.
 * No bitwise operators or shifts (multi-byte integers use `*`, `/`, `%`); no array `reserve`; a `u8` array element
   occupies 8 bytes; `@Test` has no "expected trap" form (`tests/std/expect_trap/` and `tools/test_std.sh` fill that gap).
 * Mutating methods cannot be called inside `&&`, `||` or `?:` (E0408), nor on a temporary (E0401): `let r = new ByteReader(b);`.
