@@ -222,7 +222,7 @@ wordfreq 0.227 -> 0.242. Benchmarks whose counters did not change generate ident
 pure machine noise (the C reference column slowed down by a similar factor); only `qsort_func` (all 477k retains and
 about 0.48M releases removed, peak live bytes halved) is actually affected. No benchmark got slower in work done.
 
-Quadratic case (tests/run/owned_param_linear.or: `st = add(st, i)` x 200,000, `add` does `let t = s; t.items.push(x)`):
+Quadratic case (tests/next/run/owned_param_linear.or: `st = add(st, i)` x 200,000, `add` does `let t = s; t.items.push(x)`):
 `--no-opt`: cow_copies 400,000, retains 400,000, allocs 400,005, array_grows 200,000 (quadratic: it exceeds the
 10 s test timeout under ASan); optimised: cow_copies 0, retains 0, allocs 5, cow_inplace 600,000 (linear, milliseconds).
 
