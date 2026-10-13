@@ -1,0 +1,194 @@
+// Shared helpers for `orin mcp`: hashing (content-stable diagnostic ids), path authorization,
+// JSON construction and diagnostic rendering.
+
+import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson } from "../json";
+import { Analysis, PathDiag, fileIndexOf, offsetToPos } from "../analysis";
+import { SourceMap, Diagnostic } from "../diag";
+import { normalizePath, joinPath, isInside, relativeTo } from "../loader";
+
+// One check snapshot (a delta base): the diagnostics of `entry` at revision `rev`.
+export type Snap = { rev: int; entry: string; fp: string; keys: string[]; lines: string[]; };
+
+export type McpState = {
+  root: string;            // authorized root (normalized)
+  allowExec: bool;         // test/build may execute code
+  repo: string;            // directory holding runtime/ and tools/ (for build/test)
+  inited: bool;
+  nextRev: int;
+  snaps: Snap[];           // recent check snapshots (delta bases)
+};
+
+export function newState(root: string, allowExec: bool, repo: string): McpState {
+  const none: Snap[] = [];
+  return McpState { root: normalizePath(root), allowExec: allowExec, repo: repo, inited: false, nextRev: 1, snaps: none };
+}
+
+// ---- JSON helpers -----------------------------------------------------------------------
+
+export function jstrs(xs: string[]): Json {
+  let out: Json[] = [];
+  for (const x of xs) {
+    out.push(JStr(x));
+  }
+  return JArr(out);
+}
+
+export function jtext(j: Json): string {
+  return stringifyJson(j);
+}
+
+// ---- hashing -----------------------------------------------------------------------------
+
+export function hashStr(h0: int, s: string): int {
+  let h = h0;
+  let i: usize = 0;
+  while (i < s.length) {
+    h = (h * 131 + s.charCodeAt(i) + 1) % 2147483647;
+    i += 1;
+  }
+  return h;
+}
+
+function hexDigit(n: int): string {
+  if (n < 10) {
+    return String.fromCharCode(48 + n);
+  }
+  return String.fromCharCode(87 + n);
+}
+
+export function hex8(h0: int): string {
+  let h = h0;
+  let out = "";
+  let i = 0;
+  while (i < 8) {
+    out = hexDigit(h % 16) + out;
+    h = h / 16;
+    i += 1;
+  }
+  return out;
+}
+
+// ---- paths / authorization ---------------------------------------------------------------
+
+// Resolve a client-supplied path against the root; Err when it escapes the authorized root.
+// Lexical only (symlinks are not resolved; see docs/mcp.md).
+export function resolvePath(st: McpState, p: string): Result<string, string> {
+  if (p.length == 0) {
+    return Err("empty path");
+  }
+  const r = joinPath(st.root, p);
+  if (!isInside(st.root, r)) {
+    return Err("path is outside the authorized root: " + p);
+  }
+  return Ok(r);
+}
+
+export function relPath(st: McpState, p: string): string {
+  return relativeTo(st.root, p);
+}
+
+// Every file the analysis read must lie inside the root (imports may use `../`).
+export function checkAllInside(st: McpState, a: Analysis): Option<string> {
+  for (const f of a.sm.files) {
+    if (!isInside(st.root, f.path)) {
+      return Some("project reads a file outside the authorized root: " + f.path);
+    }
+  }
+  return None;
+}
+
+// Single-quote a string for /bin/sh.
+export function shq(s: string): string {
+  return "'" + s.split("'").join("'\\''") + "'";
+}
+
+export function trunc(s: string, n: usize): string {
+  if (s.length <= n) {
+    return s;
+  }
+  return s.substring(0, n) + "...[truncated " + (s.length - n).toString() + " bytes]";
+}
+
+// ---- diagnostics -------------------------------------------------------------------------
+
+export type DiagView = {
+  id: string;        // content-stable identity (code + file + message + occurrence)
+  code: string;
+  file: string;      // relative to root
+  line: usize;       // 1-based
+  col: usize;
+  eline: usize;
+  ecol: usize;
+  message: string;
+  notes: string[];
+};
+
+export function compactLine(d: DiagView): string {
+  return d.code + " " + d.file + ":" + d.line.toString() + ":" + d.col.toString() + " " + d.message;
+}
+
+export function detailedJson(d: DiagView): Json {
+  let fs: JField[] = [
+    jField("id", JStr(d.id)), jField("code", JStr(d.code)), jField("file", JStr(d.file)),
+    jField("line", JNum(d.line.toInt())), jField("col", JNum(d.col.toInt())),
+    jField("endLine", JNum(d.eline.toInt())), jField("endCol", JNum(d.ecol.toInt())),
+    jField("message", JStr(d.message))
+  ];
+  if (d.notes.length > 0) {
+    fs.push(jField("notes", jstrs(d.notes)));
+  }
+  return JObj(fs);
+}
+
+// Views of diagnostics (over source map `sm`), with occurrence-disambiguated stable ids.
+export function viewsOf(st: McpState, sm: SourceMap, ds: PathDiag[]): DiagView[] {
+  let out: DiagView[] = [];
+  let seen: string[] = [];
+  for (const d of ds) {
+    let text = "";
+    for (const f of sm.files) {
+      if (f.path == d.path) {
+        text = f.text;
+      }
+    }
+    const s = offsetToPos(text, d.start);
+    const e = offsetToPos(text, d.end);
+    const rel = relPath(st, d.path);
+    const base = d.code + "|" + rel + "|" + d.message;
+    let n = 0;
+    for (const k of seen) {
+      if (k == base) {
+        n += 1;
+      }
+    }
+    seen.push(base);
+    out.push(DiagView {
+      id: hex8(hashStr(hashStr(7, base), n.toString())),
+      code: d.code, file: rel,
+      line: s.line + 1, col: s.character + 1, eline: e.line + 1, ecol: e.character + 1,
+      message: d.message, notes: d.notes
+    });
+  }
+  return out;
+}
+
+// Raw compiler diagnostics (build path) as PathDiags over `sm`.
+export function toPathDiags(sm: SourceMap, ds: Diagnostic[]): PathDiag[] {
+  let out: PathDiag[] = [];
+  for (const d of ds) {
+    out.push(PathDiag {
+      path: sm.files[d.span.file].path, code: d.code, message: d.message,
+      start: d.span.start, end: d.span.end, notes: d.notes
+    });
+  }
+  return out;
+}
+
+// Fingerprint of everything the analysis read (paths + contents).
+export function fingerprint(a: Analysis): string {
+  let h: int = 17;
+  for (const f of a.sm.files) {
+    h = hashStr(hashStr(h, f.path), f.text);
+  }
+  return hex8(h) + a.sm.files.length.toString();
+}

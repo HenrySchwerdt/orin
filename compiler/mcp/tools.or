@@ -1,0 +1,919 @@
+// The MCP tools (spec 10): check, inspect, edit, test, build. All analysis goes through
+// compiler/analysis (the same services as the language server, ADR-0008). Results are compact JSON
+// text; every tool returns a ToolOut (updated state, text, isError).
+
+import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, asStr, getField, getStr, getInt, getBool } from "../json";
+import { Workspace, newWorkspace, openFile, analyze, Analysis, PathDiag, fileIndexOf, offsetToPos, posToOffset,
+  symbolAt, hoverAt, renameEdits, TextEdit } from "../analysis";
+import { SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam,
+  SkField } from "../hir";
+import { ImportTarget, ImportUnit, ImportStd, StdFs, StdProcess, StdIo } from "../loader";
+import { Span } from "../diag";
+import { normalizePath, joinPath, dirname, loadAll } from "../loader";
+import { check } from "../check";
+import { lower } from "../lower";
+import { optimize } from "../opt";
+import { verify } from "../verify";
+import { emitC } from "../cemit";
+import { readFile, writeFile, exists } from "std:fs";
+import { shellRun } from "../lsp";
+import { McpState, Snap, DiagView, newState, jstrs, jtext, hashStr, hex8, resolvePath, relPath, checkAllInside, shq,
+  trunc, compactLine, detailedJson, viewsOf, toPathDiags, fingerprint } from "./util";
+import { apiLookup } from "./apitable";
+
+export type ToolOut = { st: McpState; text: string; err: bool; };
+
+function readOr(p: string): string {
+  const r = readFile(p);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+function ok(st: McpState, j: Json): ToolOut {
+  return ToolOut { st: st, text: jtext(j), err: false };
+}
+
+function fail(st: McpState, msg: string): ToolOut {
+  return ToolOut { st: st, text: msg, err: true };
+}
+
+function num(n: usize): Json {
+  return JNum(n.toInt());
+}
+
+// ---- schemas (tools/list) ------------------------------------------------------------------
+
+function prop(ty: string, desc: string): Json {
+  return JObj([jField("type", JStr(ty)), jField("description", JStr(desc))]);
+}
+
+function enumProp(vals: string[], desc: string): Json {
+  return JObj([jField("type", JStr("string")), jField("enum", jstrs(vals)), jField("description", JStr(desc))]);
+}
+
+function schema(props: JField[], required: string[]): Json {
+  return JObj([
+    jField("type", JStr("object")), jField("properties", JObj(props)), jField("required", jstrs(required)),
+    jField("additionalProperties", JBool(false))
+  ]);
+}
+
+function tool(name: string, desc: string, input: Json): Json {
+  return JObj([jField("name", JStr(name)), jField("description", JStr(desc)), jField("inputSchema", input)]);
+}
+
+export function toolList(): Json[] {
+  const posDesc = "1-based position: {\"line\":L,\"column\":C} or \"L:C\"";
+  return [
+    tool("check",
+      "Type-check a project from an entry file. Returns diagnostics (stable codes, file:line:col, short message) and a revision id. Pass sinceRevision (a revision this server returned for the same entry) to get only {resolved, added, remaining}; an unknown base returns the full snapshot.",
+      schema([
+        jField("entry", prop("string", "entry .or file, relative to the server root")),
+        jField("format", enumProp(["compact", "detailed"], "compact (default): one string per diagnostic; detailed: objects with ids, end positions and notes")),
+        jField("sinceRevision", prop("integer", "revision from an earlier check of the same entry")),
+        jField("limit", prop("integer", "max diagnostics listed (default 50)"))
+      ], ["entry"])),
+    tool("inspect",
+      "Signatures and structure without reading source. Give exactly one of: symbol (\"name\", \"Type.member\", or a built-in API such as \"Array.find\" or \"string.split\"), module (file path), or file+position. Symbols, modules and positions are resolved in the project rooted at entry (default: the file itself).",
+      schema([
+        jField("symbol", prop("string", "symbol name, Type.member, or built-in API name")),
+        jField("module", prop("string", "module file path: returns exports and dependency edges")),
+        jField("file", prop("string", "file for a position query")),
+        jField("position", prop("object", posDesc)),
+        jField("entry", prop("string", "project entry file (default: file/module itself)")),
+        jField("includeSource", prop("boolean", "also return the declaration source text (default false)"))
+      ], [])),
+    tool("edit",
+      "Validated refactor. kind=rename returns the edit list for the symbol at file+position; nothing is written unless apply=true (the files must be inside the root, and the renamed project must not have more errors than before).",
+      schema([
+        jField("kind", enumProp(["rename"], "refactoring kind")),
+        jField("file", prop("string", "file containing the symbol occurrence")),
+        jField("position", prop("object", posDesc)),
+        jField("newName", prop("string", "new identifier")),
+        jField("entry", prop("string", "project entry file whose program contains all uses (default: file)")),
+        jField("apply", prop("boolean", "write the edits to disk (default false: dry run)"))
+      ], ["kind", "file", "position", "newName"])),
+    tool("test",
+      "Run tests (requires --allow-exec). With entry: compile+run that program and compare stdout with its .out file. Otherwise run the conformance runner (suite default|next|all, optional filter).",
+      schema([
+        jField("entry", prop("string", "single program to compile and run")),
+        jField("suite", enumProp(["default", "next", "all"], "conformance suite")),
+        jField("filter", prop("string", "substring filter for the suite"))
+      ], [])),
+    tool("build",
+      "Compile an entry to C (and optionally to a native binary with cc). Requires --allow-exec. Returns diagnostics on failure.",
+      schema([
+        jField("entry", prop("string", "entry .or file")),
+        jField("out", prop("string", "output C file path (inside the root)")),
+        jField("binary", prop("string", "also link a native executable at this path (inside the root)"))
+      ], ["entry", "out"]))
+  ];
+}
+
+// ---- dispatch ------------------------------------------------------------------------------
+
+export function callTool(st: McpState, name: string, args: Json): Option<ToolOut> {
+  if (name == "check") {
+    return Some(toolCheck(st, args));
+  }
+  if (name == "inspect") {
+    return Some(toolInspect(st, args));
+  }
+  if (name == "edit") {
+    return Some(toolEdit(st, args));
+  }
+  if (name == "test") {
+    return Some(toolTest(st, args));
+  }
+  if (name == "build") {
+    return Some(toolBuild(st, args));
+  }
+  return None;
+}
+
+// ---- analysis helper -----------------------------------------------------------------------
+
+// Analyse the project rooted at `entryRel` (disk contents; the entry goes through the overlay so
+// a library entry gets the synthetic `main`, exactly as in the language server).
+function analyzeEntry(st: McpState, entryRel: string): Result<Analysis, string> {
+  const p = resolvePath(st, entryRel)?;
+  const t = readFile(p);
+  if (t.isErr()) {
+    return Err("cannot read " + entryRel);
+  }
+  const ws = openFile(newWorkspace(), p, t.unwrap());
+  const a = analyze(ws, p);
+  const bad = checkAllInside(st, a);
+  if (bad.isSome()) {
+    return Err(bad.unwrap());
+  }
+  return Ok(a);
+}
+
+// ---- check ---------------------------------------------------------------------------------
+
+function indexIn(keys: string[], k: string): bool {
+  for (const x of keys) {
+    if (x == k) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findSnap(snaps: Snap[], entry: string, rev: int): Option<Snap> {
+  for (const s of snaps) {
+    if (s.entry == entry && s.rev == rev) {
+      return Some(s);
+    }
+  }
+  return None;
+}
+
+function view(d: DiagView, detailed: bool): Json {
+  if (detailed) {
+    return detailedJson(d);
+  }
+  return JStr(compactLine(d));
+}
+
+function toolCheck(st: McpState, args: Json): ToolOut {
+  const entry = getStr(args, "entry");
+  if (entry.isNone()) {
+    return fail(st, "missing required argument: entry");
+  }
+  const ar = analyzeEntry(st, entry.unwrap());
+  if (ar.isErr()) {
+    return fail(st, ar.unwrapErr());
+  }
+  const a = ar.unwrap();
+  const detailed = getStr(args, "format").unwrapOr("compact") == "detailed";
+  const limitArg = getInt(args, "limit").unwrapOr(50);
+  let limit: usize = 0;
+  if (limitArg > 0) {
+    limit = limitArg.toUsize();
+  }
+  const views = viewsOf(st, a.sm, a.diags);
+  const fp = fingerprint(a);
+  let keys: string[] = [];
+  let lines: string[] = [];
+  for (const v of views) {
+    keys.push(v.id);
+    lines.push(compactLine(v));
+  }
+  // Revision: unchanged project (same fingerprint as this entry's latest snapshot) keeps its id.
+  let snaps = st.snaps;
+  let latest: Option<Snap> = None;
+  for (const s of snaps) {
+    if (s.entry == a.entry) {
+      latest = Some(s);
+    }
+  }
+  let rev: int = 0;
+  let nextRev = st.nextRev;
+  if (latest.isSome() && latest.unwrap().fp == fp) {
+    rev = latest.unwrap().rev;
+  } else {
+    rev = nextRev;
+    nextRev += 1;
+    snaps.push(Snap { rev: rev, entry: a.entry, fp: fp, keys: keys, lines: lines });
+    if (snaps.length > 32) {
+      snaps = snaps.slice(1, snaps.length);
+    }
+  }
+  const st2 = McpState { ...st, snaps: snaps, nextRev: nextRev };
+  const since = getInt(args, "sinceRevision");
+  if (since.isSome()) {
+    const base = findSnap(snaps, a.entry, since.unwrap());
+    if (base.isSome()) {
+      const b = base.unwrap();
+      let resolved: string[] = [];
+      let i: usize = 0;
+      while (i < b.keys.length) {
+        if (!indexIn(keys, b.keys[i])) {
+          resolved.push(b.lines[i]);
+        }
+        i += 1;
+      }
+      let added: Json[] = [];
+      let remaining: usize = 0;
+      let shown: usize = 0;
+      for (const v of views) {
+        if (indexIn(b.keys, v.id)) {
+          remaining += 1;
+        } else if (shown < limit) {
+          added.push(view(v, detailed));
+          shown += 1;
+        }
+      }
+      let fs: JField[] = [
+        jField("revision", JNum(rev)), jField("base", JNum(since.unwrap())),
+        jField("resolved", jstrs(resolved)), jField("added", JArr(added)), jField("remaining", num(remaining))
+      ];
+      return ok(st2, JObj(fs));
+    }
+  }
+  let list: Json[] = [];
+  for (const v of views) {
+    if (list.length < limit) {
+      list.push(view(v, detailed));
+    }
+  }
+  let fs: JField[] = [jField("revision", JNum(rev)), jField("errors", num(views.length))];
+  if (list.length > 0) {
+    fs.push(jField("diags", JArr(list)));
+  }
+  if (views.length > list.length) {
+    fs.push(jField("more", num(views.length - list.length)));
+  }
+  if (since.isSome()) {
+    fs.push(jField("note", JStr("base revision unknown for this entry; full snapshot")));
+  }
+  return ok(st2, JObj(fs));
+}
+
+// ---- position / symbol helpers -------------------------------------------------------------
+
+type LC = { line: usize; col: usize; };
+
+function parsePos(args: Json): Result<LC, string> {
+  let line = getInt(args, "line");
+  let col = getInt(args, "column");
+  const p = getField(args, "position");
+  if (p.isSome()) {
+    const s = asStr(p.unwrap());
+    if (s.isSome()) {
+      const parts = s.unwrap().split(":");
+      if (parts.length == 2) {
+        line = parseInt(parts[0]);
+        col = parseInt(parts[1]);
+      }
+    } else {
+      line = getInt(p.unwrap(), "line");
+      col = getInt(p.unwrap(), "column");
+    }
+  }
+  if (line.isNone() || col.isNone() || line.unwrap() < 1 || col.unwrap() < 1) {
+    return Err("position must be 1-based: {\"line\":L,\"column\":C} or \"L:C\"");
+  }
+  return Ok(LC { line: line.unwrap().toUsize(), col: col.unwrap().toUsize() });
+}
+
+function kindName(d: SymbolDef): string {
+  return match (d.kind) {
+    SkFunction => d.name == "constructor" ? "constructor" : (d.container.isSome() ? "method" : "function"),
+    SkRecord => d.detail.startsWith("class ") ? "class" : "record",
+    SkUnion => "union",
+    SkVariant => "variant",
+    SkAlias => "alias",
+    SkConst => "const",
+    SkLocal => "local",
+    SkParam => "param",
+    SkField => "field"
+  };
+}
+
+function isNonLocal(d: SymbolDef): bool {
+  return match (d.kind) {
+    SkLocal => false,
+    SkParam => false,
+    _ => true
+  };
+}
+
+function spanLoc(a: Analysis, sp: Span): LC {
+  const p = offsetToPos(a.sm.files[sp.file].text, sp.start);
+  return LC { line: p.line + 1, col: p.character + 1 };
+}
+
+function defJson(st: McpState, a: Analysis, idx: SemanticIndex, d: SymbolDef, includeSource: bool): Json {
+  const loc = spanLoc(a, d.nameSpan);
+  const file = relPath(st, a.sm.files[d.nameSpan.file].path);
+  let fs: JField[] = [
+    jField("name", JStr(d.name)), jField("kind", JStr(kindName(d))), jField("sig", JStr(d.detail)),
+    jField("at", JStr(file + ":" + loc.line.toString() + ":" + loc.col.toString()))
+  ];
+  if (d.exported) {
+    fs.push(jField("exported", JBool(true)));
+  }
+  match (d.container) {
+    Some(c) => {
+      if (c < idx.defs.length) {
+        fs.push(jField("in", JStr(idx.defs[c].name)));
+      }
+    },
+    None => {}
+  }
+  if (kindName(d) == "method") {
+    fs.push(jField("mutates", JBool(d.detail.includes("mut method "))));
+  }
+  if (includeSource) {
+    const sp = d.declSpan;
+    fs.push(jField("source", JStr(a.sm.files[sp.file].text.substring(sp.start, sp.end))));
+  }
+  return JObj(fs);
+}
+
+function importName(a: Analysis, t: ImportTarget): string {
+  const prog = a.program.unwrap();
+  return match (t) {
+    ImportUnit(i) => prog.units[i].name,
+    ImportStd(m) => match (m) {
+      StdFs => "std:fs",
+      StdProcess => "std:process",
+      StdIo => "std:io"
+    }
+  };
+}
+
+function addUnique(xs: string[], x: string): string[] {
+  let out = xs;
+  if (!indexIn(out, x)) {
+    out.push(x);
+  }
+  return out;
+}
+
+// ---- inspect -------------------------------------------------------------------------------
+
+function toolInspect(st: McpState, args: Json): ToolOut {
+  const includeSource = getBool(args, "includeSource").unwrapOr(false);
+  const sym = getStr(args, "symbol");
+  const mod = getStr(args, "module");
+  const file = getStr(args, "file");
+  if (sym.isSome()) {
+    const b = apiLookup(sym.unwrap());
+    if (b.isSome()) {
+      return ok(st, b.unwrap());
+    }
+  }
+  let entry = getStr(args, "entry");
+  if (entry.isNone()) {
+    entry = mod.isSome() ? mod : file;
+  }
+  if (entry.isNone()) {
+    return fail(st, "give one of: symbol (with entry for project symbols), module, or file+position");
+  }
+  const ar = analyzeEntry(st, entry.unwrap());
+  if (ar.isErr()) {
+    return fail(st, ar.unwrapErr());
+  }
+  const a = ar.unwrap();
+  if (a.program.isNone() || a.index.isNone()) {
+    return fail(st, "project does not load; run check (first error: "
+      + (a.diags.length > 0 ? a.diags[0].code + " " + a.diags[0].message : "unknown") + ")");
+  }
+  const idx = a.index.unwrap();
+  if (sym.isSome()) {
+    return inspectSymbol(st, a, idx, sym.unwrap(), includeSource);
+  }
+  if (mod.isSome()) {
+    return inspectModule(st, a, idx, mod.unwrap());
+  }
+  if (file.isSome()) {
+    return inspectPosition(st, a, idx, file.unwrap(), args, includeSource);
+  }
+  return fail(st, "give one of: symbol, module, or file+position");
+}
+
+function inspectSymbol(st: McpState, a: Analysis, idx: SemanticIndex, q: string, includeSource: bool): ToolOut {
+  let cname: Option<string> = None;
+  let name = q;
+  const dot = q.indexOf(".");
+  if (dot.isSome()) {
+    cname = Some(q.substring(0, dot.unwrap()));
+    name = q.substring(dot.unwrap() + 1, q.length);
+  }
+  let top: Json[] = [];
+  let nested: Json[] = [];
+  for (const d of idx.defs) {
+    if (d.name != name || !isNonLocal(d)) {
+      continue;
+    }
+    if (cname.isSome()) {
+      const inC = match (d.container) {
+        Some(c) => c < idx.defs.length && idx.defs[c].name == cname.unwrap(),
+        None => false
+      };
+      if (inC) {
+        top.push(defJson(st, a, idx, d, includeSource));
+      }
+    } else if (d.container.isNone()) {
+      top.push(defJson(st, a, idx, d, includeSource));
+    } else {
+      nested.push(defJson(st, a, idx, d, includeSource));
+    }
+  }
+  let found = top;
+  if (found.length == 0) {
+    found = nested;
+  }
+  if (found.length == 0) {
+    return fail(st, "symbol not found: " + q + " (project symbols are resolved from entry " + relPath(st, a.entry) + ")");
+  }
+  if (found.length == 1) {
+    return ok(st, found[0]);
+  }
+  return ok(st, JObj([jField("matches", JArr(found.slice(0, found.length > 10 ? 10 : found.length)))]));
+}
+
+function inspectModule(st: McpState, a: Analysis, idx: SemanticIndex, m: string): ToolOut {
+  const prog = a.program.unwrap();
+  const rp = resolvePath(st, m);
+  let target: Option<usize> = None;
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    const u = prog.units[i];
+    if (u.name == m || (rp.isOk() && u.path == rp.unwrap())) {
+      target = Some(i);
+    }
+    i += 1;
+  }
+  if (target.isNone()) {
+    return fail(st, "module not in the project rooted at " + relPath(st, a.entry) + ": " + m);
+  }
+  const t = target.unwrap();
+  let exports: string[] = [];
+  for (const d of idx.defs) {
+    if (d.unit == t && d.exported && d.container.isNone()) {
+      exports.push(d.detail);
+    }
+  }
+  let imports: string[] = [];
+  for (const it of prog.units[t].imports) {
+    imports = addUnique(imports, importName(a, it));
+  }
+  let importedBy: string[] = [];
+  for (const u of prog.units) {
+    for (const it of u.imports) {
+      const hit = match (it) {
+        ImportUnit(k) => k == t,
+        ImportStd(_) => false
+      };
+      if (hit) {
+        importedBy = addUnique(importedBy, u.name);
+      }
+    }
+  }
+  return ok(st, JObj([
+    jField("module", JStr(prog.units[t].name)), jField("file", JStr(relPath(st, prog.units[t].path))),
+    jField("exports", jstrs(exports)), jField("imports", jstrs(imports)), jField("importedBy", jstrs(importedBy))
+  ]));
+}
+
+function inspectPosition(st: McpState, a: Analysis, idx: SemanticIndex, file: string, args: Json, includeSource: bool): ToolOut {
+  const p = resolvePath(st, file);
+  if (p.isErr()) {
+    return fail(st, p.unwrapErr());
+  }
+  const lc = parsePos(args);
+  if (lc.isErr()) {
+    return fail(st, lc.unwrapErr());
+  }
+  const fi = fileIndexOf(a, p.unwrap());
+  if (fi.isNone()) {
+    return fail(st, "file is not part of the project rooted at " + relPath(st, a.entry));
+  }
+  const off = posToOffset(a.sm.files[fi.unwrap()].text, lc.unwrap().line - 1, lc.unwrap().col - 1);
+  const s = symbolAt(idx, fi.unwrap(), off);
+  if (s.isSome()) {
+    return ok(st, defJson(st, a, idx, idx.defs[s.unwrap()], includeSource));
+  }
+  const h = hoverAt(idx, fi.unwrap(), off);
+  if (h.isSome()) {
+    return ok(st, JObj([jField("type", JStr(h.unwrap().text))]));
+  }
+  return fail(st, "no symbol or typed expression at this position");
+}
+
+// ---- edit ----------------------------------------------------------------------------------
+
+function sortDesc(es: TextEdit[]): TextEdit[] {
+  let out = es;
+  let i: usize = 1;
+  while (i < out.length) {
+    let j = i;
+    while (j > 0 && out[j - 1].span.start < out[j].span.start) {
+      const t = out[j - 1];
+      out[j - 1] = out[j];
+      out[j] = t;
+      j -= 1;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function applyEdits(text: string, es: TextEdit[]): string {
+  let t = text;
+  for (const e of sortDesc(es)) {
+    t = t.substring(0, e.span.start) + e.newText + t.substring(e.span.end, t.length);
+  }
+  return t;
+}
+
+function toolEdit(st: McpState, args: Json): ToolOut {
+  const kind = getStr(args, "kind").unwrapOr("");
+  if (kind != "rename") {
+    return fail(st, "unsupported edit kind (supported: rename)");
+  }
+  const file = getStr(args, "file");
+  const newName = getStr(args, "newName");
+  if (file.isNone() || newName.isNone()) {
+    return fail(st, "missing required argument: file, newName");
+  }
+  const apply = getBool(args, "apply").unwrapOr(false);
+  const lc = parsePos(args);
+  if (lc.isErr()) {
+    return fail(st, lc.unwrapErr());
+  }
+  const fp = resolvePath(st, file.unwrap());
+  if (fp.isErr()) {
+    return fail(st, fp.unwrapErr());
+  }
+  const entry = getStr(args, "entry").unwrapOr(file.unwrap());
+  const ar = analyzeEntry(st, entry);
+  if (ar.isErr()) {
+    return fail(st, ar.unwrapErr());
+  }
+  const a = ar.unwrap();
+  if (a.index.isNone()) {
+    return fail(st, "project does not load; run check first");
+  }
+  const idx = a.index.unwrap();
+  const fi = fileIndexOf(a, fp.unwrap());
+  if (fi.isNone()) {
+    return fail(st, "file is not part of the project rooted at " + entry);
+  }
+  const off = posToOffset(a.sm.files[fi.unwrap()].text, lc.unwrap().line - 1, lc.unwrap().col - 1);
+  const sym = symbolAt(idx, fi.unwrap(), off);
+  if (sym.isNone()) {
+    return fail(st, "no renameable symbol at this position");
+  }
+  const oldName = idx.defs[sym.unwrap()].name;
+  const r = renameEdits(idx, fi.unwrap(), off, newName.unwrap());
+  if (r.isErr()) {
+    return fail(st, r.unwrapErr());
+  }
+  const edits = r.unwrap();
+  // Group by file, check authorization, compute the new texts.
+  let paths: string[] = [];
+  let texts: string[] = [];
+  let ws = newWorkspace();
+  let k: usize = 0;
+  while (k < a.sm.files.length) {
+    let mine: TextEdit[] = [];
+    for (const e of edits) {
+      if (e.span.file == k) {
+        mine.push(e);
+      }
+    }
+    if (mine.length > 0) {
+      const path = a.sm.files[k].path;
+      if (resolvePath(st, path).isErr()) {
+        return fail(st, "edit touches a file outside the authorized root: " + path);
+      }
+      const nt = applyEdits(a.sm.files[k].text, mine);
+      paths.push(path);
+      texts.push(nt);
+      ws = openFile(ws, path, nt);
+    }
+    k += 1;
+  }
+  if (!indexIn(paths, a.entry)) {
+    ws = openFile(ws, a.entry, a.sm.files[0].text);
+  }
+  const after = analyze(ws, a.entry);
+  const valid = after.diags.length <= a.diags.length;
+  let locs: string[] = [];
+  for (const e of edits) {
+    const lc2 = spanLoc(a, e.span);
+    locs.push(relPath(st, a.sm.files[e.span.file].path) + ":" + lc2.line.toString() + ":" + lc2.col.toString());
+  }
+  let applied = false;
+  if (apply && valid) {
+    let i: usize = 0;
+    while (i < paths.length) {
+      const w = writeFile(paths[i], texts[i]);
+      if (w.isErr()) {
+        return fail(st, "cannot write " + relPath(st, paths[i]) + ": " + w.unwrapErr());
+      }
+      i += 1;
+    }
+    applied = true;
+  }
+  let fs: JField[] = [
+    jField("symbol", JStr(oldName)), jField("newName", JStr(newName.unwrap())),
+    jField("valid", JBool(valid)), jField("applied", JBool(applied)),
+    jField("errorsBefore", num(a.diags.length)), jField("errorsAfter", num(after.diags.length)),
+    jField("edits", jstrs(locs))
+  ];
+  if (apply && !valid) {
+    fs.push(jField("note", JStr("not applied: the rename would introduce errors")));
+  }
+  return ok(st, JObj(fs));
+}
+
+// ---- build / test --------------------------------------------------------------------------
+
+type Compiled = { ok: bool; diags: DiagView[]; err: string; bytes: usize; };
+
+function compileEntry(st: McpState, entry: string, out: string): Compiled {
+  const none: DiagView[] = [];
+  const loaded = loadAll(entry);
+  for (const f of loaded.sm.files) {
+    if (resolvePath(st, f.path).isErr()) {
+      return Compiled { ok: false, diags: none, err: "project reads a file outside the authorized root: " + f.path, bytes: 0 };
+    }
+  }
+  if (loaded.diags.length > 0) {
+    return Compiled { ok: false, diags: viewsOf(st, loaded.sm, toPathDiags(loaded.sm, loaded.diags)), err: "", bytes: 0 };
+  }
+  const checked = check(loaded.program.unwrap(), loaded.sm);
+  if (checked.isErr()) {
+    return Compiled { ok: false, diags: viewsOf(st, loaded.sm, toPathDiags(loaded.sm, checked.unwrapErr())), err: "", bytes: 0 };
+  }
+  const mir = optimize(lower(checked.unwrap()));
+  if (verify(mir).errors.length > 0) {
+    return Compiled { ok: false, diags: none, err: "internal compiler error: MIR ownership verification failed", bytes: 0 };
+  }
+  const c = emitC(mir);
+  const w = writeFile(out, c);
+  if (w.isErr()) {
+    return Compiled { ok: false, diags: none, err: "cannot write " + relPath(st, out) + ": " + w.unwrapErr(), bytes: 0 };
+  }
+  return Compiled { ok: true, diags: none, err: "", bytes: c.length };
+}
+
+function needExec(st: McpState, what: string): Option<ToolOut> {
+  if (!st.allowExec) {
+    return Some(fail(st, what + " executes project code; start the server with --allow-exec to enable it"));
+  }
+  return None;
+}
+
+function diagFailure(st: McpState, c: Compiled): ToolOut {
+  if (c.err.length > 0) {
+    return fail(st, c.err);
+  }
+  let list: Json[] = [];
+  for (const v of c.diags) {
+    if (list.length < 50) {
+      list.push(JStr(compactLine(v)));
+    }
+  }
+  return ok(st, JObj([jField("ok", JBool(false)), jField("errors", num(c.diags.length)), jField("diags", JArr(list))]));
+}
+
+function runtimeDir(st: McpState): string {
+  return joinPath(st.repo, "runtime");
+}
+
+// cc invocation; returns (exit status, trimmed log).
+function ccLink(st: McpState, cfile: string, bin: string): ToolOut {
+  const rt = runtimeDir(st);
+  if (!exists(rt + "/orin_runtime.c")) {
+    return fail(st, "runtime not found at " + rt + "; start the server with --repo <orin checkout>");
+  }
+  const log = bin + ".cc.log";
+  const code = shellRun("cc -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " -o " + shq(bin)
+    + " > " + shq(log) + " 2>&1");
+  const text = readOr(log);
+  return ToolOut { st: st, text: code == 0 ? "" : trunc(text, 2000), err: code != 0 };
+}
+
+function toolBuild(st: McpState, args: Json): ToolOut {
+  const refuse = needExec(st, "build");
+  if (refuse.isSome()) {
+    return refuse.unwrap();
+  }
+  const entry = getStr(args, "entry");
+  const out = getStr(args, "out");
+  if (entry.isNone() || out.isNone()) {
+    return fail(st, "missing required argument: entry, out");
+  }
+  const e = resolvePath(st, entry.unwrap());
+  const o = resolvePath(st, out.unwrap());
+  if (e.isErr()) {
+    return fail(st, e.unwrapErr());
+  }
+  if (o.isErr()) {
+    return fail(st, o.unwrapErr());
+  }
+  const bin = getStr(args, "binary");
+  let b = "";
+  if (bin.isSome()) {
+    const br = resolvePath(st, bin.unwrap());
+    if (br.isErr()) {
+      return fail(st, br.unwrapErr());
+    }
+    b = br.unwrap();
+  }
+  shellRun("mkdir -p " + shq(dirname(o.unwrap())));
+  const c = compileEntry(st, e.unwrap(), o.unwrap());
+  if (!c.ok) {
+    return diagFailure(st, c);
+  }
+  let fs: JField[] = [
+    jField("ok", JBool(true)), jField("c", JStr(relPath(st, o.unwrap()))), jField("bytes", num(c.bytes))
+  ];
+  if (bin.isSome()) {
+    shellRun("mkdir -p " + shq(dirname(b)));
+    const l = ccLink(st, o.unwrap(), b);
+    if (l.err) {
+      return fail(st, "cc failed: " + l.text);
+    }
+    fs.push(jField("binary", JStr(relPath(st, b))));
+  }
+  return ok(st, JObj(fs));
+}
+
+function expectedOutPath(entry: string): string {
+  if (entry.endsWith("/main.or")) {
+    return dirname(entry) + "/expected.out";
+  }
+  if (entry.endsWith(".or")) {
+    return entry.substring(0, entry.length - 3) + ".out";
+  }
+  return entry + ".out";
+}
+
+// `// exit: N` on the first line of the entry (default 0).
+function expectedExit(src: string): int {
+  const first = src.split("\n")[0].trim();
+  if (first.startsWith("// exit:")) {
+    return parseInt(first.substring(8, first.length).trim()).unwrapOr(0);
+  }
+  return 0;
+}
+
+function firstMismatch(got: string, want: string): string {
+  const g = got.split("\n");
+  const w = want.split("\n");
+  let i: usize = 0;
+  while (i < g.length || i < w.length) {
+    const a = i < g.length ? g[i] : "<end>";
+    const b = i < w.length ? w[i] : "<end>";
+    if (a != b) {
+      return "line " + (i + 1).toString() + ": got `" + trunc(a, 120) + "` want `" + trunc(b, 120) + "`";
+    }
+    i += 1;
+  }
+  return "";
+}
+
+function toolTest(st: McpState, args: Json): ToolOut {
+  const refuse = needExec(st, "test");
+  if (refuse.isSome()) {
+    return refuse.unwrap();
+  }
+  const entry = getStr(args, "entry");
+  if (entry.isSome()) {
+    return testEntry(st, entry.unwrap());
+  }
+  return testSuite(st, args);
+}
+
+function testEntry(st: McpState, entryRel: string): ToolOut {
+  const e = resolvePath(st, entryRel);
+  if (e.isErr()) {
+    return fail(st, e.unwrapErr());
+  }
+  const src = readFile(e.unwrap());
+  if (src.isErr()) {
+    return fail(st, "cannot read " + entryRel);
+  }
+  const dir = joinPath(st.root, ".orin-mcp");
+  shellRun("mkdir -p " + shq(dir));
+  const stem = dir + "/t" + hex8(hashStr(3, e.unwrap()));
+  const c = compileEntry(st, e.unwrap(), stem + ".c");
+  if (!c.ok) {
+    return diagFailure(st, c);
+  }
+  const l = ccLink(st, stem + ".c", stem);
+  if (l.err) {
+    return fail(st, "cc failed: " + l.text);
+  }
+  const code = shellRun("timeout 10 " + shq(stem) + " > " + shq(stem + ".stdout") + " 2> " + shq(stem + ".stderr"));
+  const got = readOr(stem + ".stdout");
+  const errText = readOr(stem + ".stderr");
+  const wantExit = expectedExit(src.unwrap());
+  const want = readFile(expectedOutPath(e.unwrap()));
+  let passed = code == wantExit;
+  let why = "";
+  if (!passed) {
+    why = "exit " + code.toString() + ", expected " + wantExit.toString();
+  }
+  if (want.isOk()) {
+    const mm = firstMismatch(got, want.unwrap());
+    if (mm.length > 0) {
+      passed = false;
+      why = why.length > 0 ? why + "; " + mm : mm;
+    }
+  }
+  let fs: JField[] = [jField("passed", JBool(passed)), jField("exit", JNum(code))];
+  if (!passed) {
+    fs.push(jField("why", JStr(why)));
+    fs.push(jField("stdout", JStr(trunc(got, 1000))));
+    if (errText.length > 0) {
+      fs.push(jField("stderr", JStr(trunc(errText, 500))));
+    }
+  }
+  return ok(st, JObj(fs));
+}
+
+function testSuite(st: McpState, args: Json): ToolOut {
+  const suite = getStr(args, "suite").unwrapOr("default");
+  if (suite != "default" && suite != "next" && suite != "all") {
+    return fail(st, "suite must be default, next or all");
+  }
+  const runner = joinPath(st.repo, "tools/run_tests.py");
+  const orinc = joinPath(st.repo, "build/bootstrap/orin2");
+  if (!exists(runner) || !exists(orinc)) {
+    return fail(st, "conformance runner or " + orinc + " not found; start the server with --repo <orin checkout> and run tools/bootstrap.sh");
+  }
+  const dir = joinPath(st.root, ".orin-mcp");
+  shellRun("mkdir -p " + shq(dir));
+  const log = dir + "/suite.log";
+  let cmd = "cd " + shq(st.repo) + " && python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite " + suite;
+  const filter = getStr(args, "filter");
+  if (filter.isSome()) {
+    cmd += " --filter " + shq(filter.unwrap());
+  }
+  const code = shellRun("(" + cmd + ") > " + shq(log) + " 2>&1");
+  const outText = readOr(log);
+  let failures: string[] = [];
+  let passedN: int = -1;
+  let failedN: int = -1;
+  for (const ln of outText.split("\n")) {
+    if (ln.startsWith("FAIL ")) {
+      failures.push(ln.substring(5, ln.length).trim());
+    }
+    if (ln.startsWith("TOTAL")) {
+      const parts = ln.split(" ");
+      let nums: int[] = [];
+      for (const p of parts) {
+        const n = parseInt(p);
+        if (n.isSome()) {
+          nums.push(n.unwrap());
+        }
+      }
+      if (nums.length >= 2) {
+        passedN = nums[0];
+        failedN = nums[1];
+      }
+    }
+  }
+  if (passedN < 0) {
+    return fail(st, "runner produced no summary (exit " + code.toString() + "): " + trunc(outText, 600));
+  }
+  let fs: JField[] = [
+    jField("passed", JNum(passedN)), jField("failed", JNum(failedN)), jField("ok", JBool(code == 0 && failedN == 0))
+  ];
+  if (failures.length > 0) {
+    fs.push(jField("failures", jstrs(failures.slice(0, failures.length > 30 ? 30 : failures.length))));
+  }
+  return ok(st, JObj(fs));
+}
