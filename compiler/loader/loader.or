@@ -82,7 +82,19 @@ function stdKind(p: string): int {
   if (p == "std:io") {
     return 3;
   }
+  if (p == "std:clock") {
+    return 4;
+  }
   return 0;
+}
+
+// Std modules written in Orin (stdlib/, embedded as the `$stdlib` library root, see prelude.or):
+// "std:path" resolves to the unit "$stdlib/path". Empty when `p` is not one of them.
+function stdlibFile(p: string): string {
+  if (p == "std:path" || p == "std:json" || p == "std:time" || p == "std:graph") {
+    return "$stdlib/" + p.substring(4, p.length) + ".or";
+  }
+  return "";
 }
 
 // Resolve import path `p` of file `importer` (in directory `dir`) to a normalized file path,
@@ -93,9 +105,13 @@ function resolveImport(ov: SourceFile[], importer: string, dir: string, p: strin
     return Ok(Resolved { std: 0, path: normalizePath(p) });
   }
   if (p.startsWith("std:")) {
+    const lf = stdlibFile(p);
+    if (lf != "") {
+      return Ok(Resolved { std: 0, path: lf });
+    }
     const k = stdKind(p);
     if (k == 0) {
-      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process, std:io)"));
+      return Err(diag("E0301", sp, "unknown standard module `" + p + "` (available: std:fs, std:process, std:io, std:path, std:json, std:time, std:graph)"));
     }
     return Ok(Resolved { std: k, path: "" });
   }
@@ -221,6 +237,9 @@ export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: P
         // The entry file: add the implicit prelude imports in front of its own items.
         let implicit: Item[] = [];
         for (const r of roots) {
+          if (r.entry == "") {
+            continue;   // library root (std:path, ...): served from memory, imported on demand
+          }
           const sp0 = span(id, 0, 0);
           const none: Ident[] = [];
           implicit.push(IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp0, span: sp0 }));
@@ -285,6 +304,11 @@ export function loadWithRoots(entryPath: string, overlay: SourceFile[], roots: P
     }
     if (res.std == 3) {
       cur.push(ImportStd(StdIo));
+      curItem += 1;
+      continue;
+    }
+    if (res.std == 4) {
+      cur.push(ImportStd(StdClock));
       curItem += 1;
       continue;
     }

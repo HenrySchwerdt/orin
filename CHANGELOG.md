@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Std modules in Orin (ADR-0016): `std:path`, `std:json` (integers only), `std:time` (new built-in `nowMillis`), `std:graph`; see docs/std.md.
+
 ## 0.1.0-alpha.1 (2026-10-13)
 First experimental release of the self-hosted Orin compiler.
 - Self-hosted compiler (Orin), reproducible bootstrap (stage2 == stage3).

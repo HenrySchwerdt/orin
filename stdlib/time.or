@@ -1,0 +1,215 @@
+// std:time -- wall clock, durations with explicit units and UTC calendar conversion (spec 08).
+//
+// The only runtime primitive is `nowMillis` (builtin `std:clock`, runtime function
+// orin_time_now_millis); everything else is pure Orin. All quantities are `int` milliseconds
+// unless the name says otherwise ("explicit units": there is no unit-less number in this API).
+//   * Calendar functions use the proleptic Gregorian calendar in UTC; there are no time zones,
+//     no leap seconds. Instants are milliseconds since 1970-01-01T00:00:00Z (negative before).
+//   * Arithmetic on ints traps on overflow like everywhere in Orin; values here stay far from
+//     the limits for any date in years -292000000 .. 292000000.
+//
+// TODO(after floats/map): fractional seconds (`seconds(1.5)`), `sleep` (needs a second runtime
+// primitive), time zones / locale formatting.
+
+// nowMillis(): int
+// Wall-clock time in milliseconds since the Unix epoch (CLOCK_REALTIME). Not monotonic: the system
+// clock may jump. Cannot fail. O(1), no allocation.
+export { nowMillis } from "std:clock";
+
+// A span of time in whole milliseconds (may be negative: a difference of two instants).
+export type Duration = { millis: int; };
+
+// ---- durations ----------------------------------------------------------------------------
+
+// milliseconds / seconds / minutes / hours / days (n: int): Duration -- n units as a Duration. O(1).
+export function milliseconds(n: int): Duration {
+  return Duration { millis: n };
+}
+
+export function seconds(n: int): Duration {
+  return Duration { millis: n * 1000 };
+}
+
+export function minutes(n: int): Duration {
+  return Duration { millis: n * 60000 };
+}
+
+export function hours(n: int): Duration {
+  return Duration { millis: n * 3600000 };
+}
+
+export function days(n: int): Duration {
+  return Duration { millis: n * 86400000 };
+}
+
+// toMillis(d: Duration): int -- the span in milliseconds. O(1).
+export function toMillis(d: Duration): int {
+  return d.millis;
+}
+
+// toSeconds(d: Duration): int -- whole seconds, truncated toward zero (1999 ms -> 1). O(1).
+export function toSeconds(d: Duration): int {
+  return d.millis / 1000;
+}
+
+// addDuration(a: Duration, b: Duration): Duration -- sum. O(1).
+export function addDuration(a: Duration, b: Duration): Duration {
+  return Duration { millis: a.millis + b.millis };
+}
+
+// between(start: int, end: int): Duration -- end - start for two instants (milliseconds). O(1).
+export function between(start: int, end: int): Duration {
+  return Duration { millis: end - start };
+}
+
+// plus(instant: int, d: Duration): int -- the instant `d` after `instant`. O(1).
+export function plus(instant: int, d: Duration): int {
+  return instant + d.millis;
+}
+
+// formatDuration(d: Duration): string
+// Human-readable "1d 2h 3m 4s 5ms" with zero components omitted, "0ms" for zero and a leading
+// "-" for negative spans: formatDuration(milliseconds(3723005)) == "1h 2m 3s 5ms". O(1).
+export function formatDuration(d: Duration): string {
+  if (d.millis == 0) {
+    return "0ms";
+  }
+  const neg = d.millis < 0;
+  let rest = neg ? 0 - d.millis : d.millis;
+  let parts: string[] = [];
+  const dd = rest / 86400000;
+  rest = rest % 86400000;
+  const hh = rest / 3600000;
+  rest = rest % 3600000;
+  const mm = rest / 60000;
+  rest = rest % 60000;
+  const ss = rest / 1000;
+  const ms = rest % 1000;
+  if (dd > 0) {
+    parts.push(dd.toString() + "d");
+  }
+  if (hh > 0) {
+    parts.push(hh.toString() + "h");
+  }
+  if (mm > 0) {
+    parts.push(mm.toString() + "m");
+  }
+  if (ss > 0) {
+    parts.push(ss.toString() + "s");
+  }
+  if (ms > 0) {
+    parts.push(ms.toString() + "ms");
+  }
+  const body = parts.join(" ");
+  return neg ? "-" + body : body;
+}
+
+// ---- calendar (UTC) -----------------------------------------------------------------------
+
+// Broken-down UTC time. month 1..12, day 1..31, hour 0..23, minute 0..59, second 0..59,
+// millisecond 0..999, weekday 0 = Sunday .. 6 = Saturday.
+export type DateTime = {
+  year: int; month: int; day: int;
+  hour: int; minute: int; second: int; millisecond: int;
+  weekday: int;
+};
+
+function floorDiv(a: int, b: int): int {
+  const q = a / b;
+  if (a % b != 0 && (a < 0) != (b < 0)) {
+    return q - 1;
+  }
+  return q;
+}
+
+// Days since 1970-01-01 of the civil date y-m-d (Howard Hinnant's days_from_civil).
+function daysFromCivil(y0: int, m: int, d: int): int {
+  const y = m <= 2 ? y0 - 1 : y0;
+  const era = floorDiv(y, 400);
+  const yoe = y - era * 400;
+  const mp = m > 2 ? m - 3 : m + 9;
+  const doy = (153 * mp + 2) / 5 + d - 1;
+  const doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// fromMillis(instant: int): DateTime -- UTC calendar fields of an instant. Total, O(1).
+export function fromMillis(instant: int): DateTime {
+  const dayNum = floorDiv(instant, 86400000);
+  const msOfDay = instant - dayNum * 86400000;
+  const z = dayNum + 719468;
+  const era = floorDiv(z, 146097);
+  const doe = z - era * 146097;
+  const yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const mp = (5 * doy + 2) / 153;
+  const d = doy - (153 * mp + 2) / 5 + 1;
+  const m = mp < 10 ? mp + 3 : mp - 9;
+  const y = yoe + era * 400 + (m <= 2 ? 1 : 0);
+  let wd = (dayNum + 4) % 7;
+  if (wd < 0) {
+    wd += 7;
+  }
+  return DateTime {
+    year: y, month: m, day: d,
+    hour: msOfDay / 3600000, minute: (msOfDay / 60000) % 60,
+    second: (msOfDay / 1000) % 60, millisecond: msOfDay % 1000,
+    weekday: wd
+  };
+}
+
+// isLeapYear(year: int): bool -- Gregorian rule. O(1).
+export function isLeapYear(year: int): bool {
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+// daysInMonth(year: int, month: int): Option<int> -- None unless month is 1..12. O(1).
+export function daysInMonth(year: int, month: int): Option<int> {
+  if (month < 1 || month > 12) {
+    return None;
+  }
+  if (month == 2) {
+    return Some(isLeapYear(year) ? 29 : 28);
+  }
+  if (month == 4 || month == 6 || month == 9 || month == 11) {
+    return Some(30);
+  }
+  return Some(31);
+}
+
+// toInstant(dt: DateTime): Option<int>
+// The instant of a UTC date-time, or None when a field is out of range (month 1..12, day within
+// the month, hour 0..23, minute/second 0..59, millisecond 0..999). `weekday` is ignored. O(1).
+export function toInstant(dt: DateTime): Option<int> {
+  const dim = daysInMonth(dt.year, dt.month);
+  if (dim.isNone()) {
+    return None;
+  }
+  if (dt.day < 1 || dt.day > dim.unwrap()) {
+    return None;
+  }
+  if (dt.hour < 0 || dt.hour > 23 || dt.minute < 0 || dt.minute > 59
+      || dt.second < 0 || dt.second > 59 || dt.millisecond < 0 || dt.millisecond > 999) {
+    return None;
+  }
+  const dayNum = daysFromCivil(dt.year, dt.month, dt.day);
+  return Some(dayNum * 86400000 + dt.hour * 3600000 + dt.minute * 60000 + dt.second * 1000 + dt.millisecond);
+}
+
+function pad(n: int, width: usize): string {
+  let s = n.toString();
+  while (s.length < width) {
+    s = "0" + s;
+  }
+  return s;
+}
+
+// formatIso(instant: int): string
+// ISO 8601 / RFC 3339 UTC: "2024-02-29T13:04:05.006Z" (year padded to at least 4 digits; years
+// before 0 or after 9999 are printed with their sign / extra digits). O(1).
+export function formatIso(instant: int): string {
+  const t = fromMillis(instant);
+  const ys = t.year < 0 ? "-" + pad(0 - t.year, 4) : pad(t.year, 4);
+  return ys + "-" + pad(t.month, 2) + "-" + pad(t.day, 2) + "T" + pad(t.hour, 2) + ":"
+    + pad(t.minute, 2) + ":" + pad(t.second, 2) + "." + pad(t.millisecond, 3) + "Z";
+}

@@ -13,6 +13,7 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `bootstrap/` | **Stage 0** compiler `orinb` in Rust (temporary). Orin-B → GNU C. |
 | `runtime/` | C runtime `orin_runtime.{h,c}` shared by all stages' generated code. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
+| `stdlib/` | **Std modules in Orin** (`std:path`, `std:json`, `std:time`, `std:graph`): embedded library root, see docs/std.md. |
 | `std/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
