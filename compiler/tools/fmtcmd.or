@@ -1,0 +1,77 @@
+// `orin fmt [--check] [--stdout] <files...>` (spec 18 §3).
+//   default   rewrite each file in place when its formatting changes
+//   --check   print the files that would change; exit status 1 if there are any
+//   --stdout  print the formatted text instead of writing
+// Files with syntax errors are reported (`path:line:col: error[CODE]: ...`) and left untouched.
+// Exit status: 0 ok, 1 changes found with --check or a file had a syntax error, 2 usage / I/O error.
+
+import { SourceMap, SourceFile, render } from "../diag";
+import { format } from "../fmt";
+import { readFile, writeFile } from "std:fs";
+
+function usage(): int {
+  console.error("usage: orin fmt [--check] [--stdout] <file.or>...");
+  return 2;
+}
+
+export function runFmt(args: string[]): int {
+  let check = false;
+  let toStdout = false;
+  let files: string[] = [];
+  for (const a of args) {
+    if (a == "--check") {
+      check = true;
+    } else if (a == "--stdout") {
+      toStdout = true;
+    } else if (a.startsWith("-")) {
+      console.error("error: unknown option " + a);
+      return usage();
+    } else {
+      files.push(a);
+    }
+  }
+  if (files.length == 0) {
+    return usage();
+  }
+  let code: int = 0;
+  for (const path of files) {
+    const rf = readFile(path);
+    if (rf.isErr()) {
+      console.error("error: cannot read " + path + ": " + rf.unwrapErr());
+      code = 2;
+      continue;
+    }
+    const src = rf.unwrap();
+    const res = format(0, src);
+    if (res.isErr()) {
+      const sm = SourceMap { files: [SourceFile { path: path, text: src }] };
+      console.error(render(sm, res.unwrapErr()));
+      if (code == 0) {
+        code = 1;
+      }
+      continue;
+    }
+    const out = res.unwrap();
+    if (check) {
+      if (out != src) {
+        console.log(path);
+        if (code == 0) {
+          code = 1;
+        }
+      }
+    } else if (toStdout) {
+      if (out.endsWith("\n")) {
+        console.log(out.substring(0, out.length - 1));
+      } else {
+        console.log(out);
+      }
+    } else if (out != src) {
+      const w = writeFile(path, out);
+      if (w.isErr()) {
+        console.error("error: cannot write " + path + ": " + w.unwrapErr());
+        code = 2;
+      }
+    }
+  }
+  return code;
+}

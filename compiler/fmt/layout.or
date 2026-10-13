@@ -1,0 +1,263 @@
+// Comment placement for the formatter.
+//
+// Printing functions return plain strings (multi-line, absolutely indented). Comments are
+// re-inserted by *source position*: `seq` lays out a list of elements (statements, items,
+// arguments, ...) and places the comments found in the gaps between them (leading comments on
+// their own lines, a same-line comment as trailing). Every comment emitted carries an invisible
+// marker (\x01 index \x02) so that enclosing constructs can tell which comments were already
+// placed; unplaced ("stray") comments inside an element are hoisted above it. Markers are
+// stripped at the very end (`stripMarkers`).
+
+import { Comment } from "../syntax";
+import { pad } from "./text";
+
+export type Ctx = { src: string; cs: Comment[]; };
+
+// Index of the first comment whose start is >= pos.
+export function firstAtOrAfter(cs: Comment[], pos: usize): usize {
+  let lo: usize = 0;
+  let hi = cs.length;
+  while (lo < hi) {
+    const mid = lo + (hi - lo) / 2;
+    if (cs[mid].start < pos) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+export function hasCommentIn(c: Ctx, lo: usize, hi: usize): bool {
+  const i = firstAtOrAfter(c.cs, lo);
+  return i < c.cs.length && c.cs[i].start < hi;
+}
+
+// True if src[a, b) holds a blank line (two newlines with only whitespace between them).
+export function blankIn(src: string, a: usize, b: usize): bool {
+  let nl: int = 0;
+  let i = a;
+  while (i < b && i < src.length) {
+    const ch = src.charCodeAt(i);
+    if (ch == 10) {
+      nl += 1;
+      if (nl >= 2) {
+        return true;
+      }
+    } else if (ch != 32 && ch != 9 && ch != 13) {
+      nl = 0;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+export function hasNewline(src: string, a: usize, b: usize): bool {
+  let i = a;
+  while (i < b && i < src.length) {
+    if (src.charCodeAt(i) == 10) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+// Position of the first `ch` at or after `from` that is not inside a comment.
+export function findChar(c: Ctx, begin: usize, ch: int): usize {
+  const n = c.src.length;
+  let i = begin;
+  let ci = firstAtOrAfter(c.cs, begin);
+  while (i < n) {
+    if (ci < c.cs.length && c.cs[ci].start == i) {
+      i = c.cs[ci].end;
+      ci += 1;
+    } else if (c.src.charCodeAt(i) == ch) {
+      return i;
+    } else {
+      i += 1;
+    }
+  }
+  return n;
+}
+
+function commentLine(i: usize, cm: Comment): string {
+  return "\x01" + i.toString() + "\x02" + cm.text;
+}
+
+// Remove the placement markers.
+export function stripMarkers(s: string): string {
+  if (!s.includes("\x01")) {
+    return s;
+  }
+  const parts = s.split("\x01");
+  let out: string[] = [parts[0]];
+  let i: usize = 1;
+  while (i < parts.length) {
+    const pt = parts[i];
+    match (pt.indexOf("\x02")) {
+      Some(k) => {
+        out.push(pt.substring(k + 1, pt.length));
+      },
+      None => {
+        out.push(pt);
+      }
+    }
+    i += 1;
+  }
+  return out.join("");
+}
+
+function markedIndices(text: string): usize[] {
+  let r: usize[] = [];
+  if (!text.includes("\x01")) {
+    return r;
+  }
+  const parts = text.split("\x01");
+  let i: usize = 1;
+  while (i < parts.length) {
+    const pt = parts[i];
+    match (pt.indexOf("\x02")) {
+      Some(k) => {
+        match (parseInt(pt.substring(0, k))) {
+          Some(v) => {
+            r.push(v.toUsize());
+          },
+          None => {}
+        }
+      },
+      None => {}
+    }
+    i += 1;
+  }
+  return r;
+}
+
+function containsIdx(xs: usize[], k: usize): bool {
+  for (const x of xs) {
+    if (x == k) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Comments inside [s, e) that the rendered `text` of that element did not place.
+function strays(c: Ctx, s: usize, e: usize, text: string): usize[] {
+  let r: usize[] = [];
+  let k = firstAtOrAfter(c.cs, s);
+  if (k >= c.cs.length || c.cs[k].start >= e) {
+    return r;
+  }
+  const claimed = markedIndices(text);
+  while (k < c.cs.length && c.cs[k].start < e) {
+    if (!containsIdx(claimed, k)) {
+      r.push(k);
+    }
+    k += 1;
+  }
+  return r;
+}
+
+// True if a comment lies in a gap between elements (or before the first / after the last
+// element) of a list spanning [lo, hi).
+export function gapsHave(c: Ctx, starts: usize[], ends: usize[], lo: usize, hi: usize): bool {
+  let prev = lo;
+  let i: usize = 0;
+  while (i < starts.length) {
+    if (hasCommentIn(c, prev, starts[i])) {
+      return true;
+    }
+    prev = ends[i];
+    i += 1;
+  }
+  return hasCommentIn(c, prev, hi);
+}
+
+// Lay out elements one per line at indent `ind`, each followed by `sep`, with the comments of the
+// gaps (between `lo` and the first element, between elements, and up to `hi`) placed around them.
+// A comment on the same source line after an element becomes its trailing comment. A single blank
+// source line between elements (or comments) is preserved. Returns "" if there is nothing.
+export function seq(c: Ctx, starts: usize[], ends: usize[], texts: string[], lo: usize, hi: usize, ind: usize, sep: string): string {
+  const p = pad(ind);
+  const cs = c.cs;
+  const n = texts.length;
+  let out: string[] = [];
+  let prev = lo;
+  let first = true;
+  let i: usize = 0;
+  while (i < n) {
+    const s = starts[i];
+    const e = ends[i];
+    let limit = hi;
+    if (i + 1 < n) {
+      limit = starts[i + 1];
+    }
+    let ci = firstAtOrAfter(cs, prev);
+    let q = prev;
+    while (ci < cs.length && cs[ci].start < s) {
+      if (!first && blankIn(c.src, q, cs[ci].start)) {
+        out.push("");
+      }
+      out.push(p + commentLine(ci, cs[ci]));
+      q = cs[ci].end;
+      first = false;
+      ci += 1;
+    }
+    const st = strays(c, s, e, texts[i]);
+    for (const k of st) {
+      out.push(p + commentLine(k, cs[k]));
+      first = false;
+    }
+    if (st.length == 0 && !first && blankIn(c.src, q, s)) {
+      out.push("");
+    }
+    let line = p + texts[i] + sep;
+    prev = e;
+    const ti = firstAtOrAfter(cs, e);
+    if (ti < cs.length && cs[ti].start < limit && !hasNewline(c.src, e, cs[ti].start)) {
+      line += " " + commentLine(ti, cs[ti]);
+      prev = cs[ti].end;
+    }
+    out.push(line);
+    first = false;
+    i += 1;
+  }
+  let ci = firstAtOrAfter(cs, prev);
+  let q = prev;
+  while (ci < cs.length && cs[ci].start < hi) {
+    if (!first && blankIn(c.src, q, cs[ci].start)) {
+      out.push("");
+    }
+    out.push(p + commentLine(ci, cs[ci]));
+    q = cs[ci].end;
+    first = false;
+    ci += 1;
+  }
+  return out.join("\n");
+}
+
+// `open` + one element per line (indent ind + 2) + `close`; `lo` is the position just after the
+// opening token, `hi` the position of the closing token. A comment on the opening line stays
+// there. With nothing inside, `open` + `close` directly.
+export function bracketed(c: Ctx, open: string, close: string, lo: usize, hi: usize, starts: usize[], ends: usize[], texts: string[], ind: usize, sep: string): string {
+  let head = open;
+  let begin = lo;
+  const k = firstAtOrAfter(c.cs, lo);
+  let limit = hi;
+  if (starts.length > 0) {
+    limit = starts[0];
+  }
+  if (k < c.cs.length && c.cs[k].start < limit && !hasNewline(c.src, lo, c.cs[k].start)) {
+    head += " " + commentLine(k, c.cs[k]);
+    begin = c.cs[k].end;
+  }
+  const body = seq(c, starts, ends, texts, begin, hi, ind + 2, sep);
+  if (body == "") {
+    if (begin == lo) {
+      return open + close;
+    }
+    return head + "\n" + pad(ind) + close;
+  }
+  return head + "\n" + body + "\n" + pad(ind) + close;
+}
