@@ -15,9 +15,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   - `orin.toml` packages
   - std path/json/time/graph
   - runtime R2 platform layer
-- **integrating:** interfaces (ADR-0019)
-- **in progress:** contract clauses phase 1 (parse/check/erase/runtime checks), then phase 2 (SMT for
-  pure functions) with the ADR-0020 status vocabulary
+- **done:** interfaces (ADR-0019), contract clauses phase 1 + 2 (ADR-0012)
 - **next:**
   - fixed-width integers and template-literal interpolation
   - `@Test`/`orin test`, `@Deprecated`, `@Inline`
@@ -99,7 +97,7 @@ What each phase delivers:
   - the payment/orders reference service
 
 ## Next concrete steps
-1. Merge interfaces and contract clauses phase 1.
+1. (done) Interfaces and contract clauses merged.
 2. Start the Track A worker: OSIG schema ADR, `orin graph` and `orin diff` (vision tickets 1, 3,
    5). Ticket 2 (MIR spans) waits for the rewrite.
 3. Fixed-width integers + interpolation; then `@Test` + resources; then ADR-0021 capabilities.

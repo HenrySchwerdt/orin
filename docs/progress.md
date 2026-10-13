@@ -26,10 +26,10 @@ _Updated: 2026-10-13_
 | Seed bootstrap (ADR-0014) | done |
 | Floats (`float`, `f32`), `std:math`, `Map<K,V>` (ADR-0018) | done |
 | Runtime R2: platform layer with contracts | done (CBMC-bounded + tests) |
-| Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | in progress |
+| Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | done: phase 1 + phase 2 for int/bool functions (`orin verify --contracts`, z3; see docs/contracts.md) |
 | Packages: `orin.toml`, architecture rules, API snapshots | done |
 | std:path/json/time/graph | done |
-| Interfaces (ADR-0019) | integrating |
+| Interfaces (ADR-0019) | done |
 | Integers, interpolation, annotations (spec 05), resources, capabilities (ADR-0020/0021) | not started |
 | Concurrency (ADR-0017), incremental analysis | not started |
 | OSIG / `orin graph` / `orin diff`, effects, lineage, `.orcert` (ADR-0020) | not started |
