@@ -18,8 +18,8 @@
 //     the leading `this.f = e;` field initialisations;
 //   * a violation prints `trap: contract violated: <clause> at <file>:<line>` and exits with 101
 //     (the same convention as every other trap).
-// Not checked at runtime (type-checked only): record-type invariants, loop invariants and
-// `@Decreases`. `return` through `?` in an `@Ensures` function skips the postconditions.
+// Not checked at runtime (type-checked only): record-type invariants, loop invariants and `@Decreases`.
+// Every return of the body, including an early `?` return, is checked: the body is a separate function.
 
 import { Span, SourceMap } from "../diag";
 import {
@@ -140,6 +140,73 @@ function rwCall(e: Expr, callee: Expr, args: Expr[], inOld: bool): Expr {
   return mkE(ECall(rw(callee, inOld), rwAll(args, inOld)), e.span);
 }
 
+function isEnsures(c: ContractClause): bool {
+  return isKind(c, 1);
+}
+
+// `result` of an `@Ensures` is the wrapper's local `result$` (a parameter may be called `result`).
+function renameResult(e: Expr, on: bool): Expr {
+  if (!on) {
+    return e;
+  }
+  return rn(e);
+}
+
+function rnAll(es: Expr[]): Expr[] {
+  let out: Expr[] = [];
+  for (const e of es) {
+    out.push(rn(e));
+  }
+  return out;
+}
+
+function rnFields(fs: FieldInit[]): FieldInit[] {
+  let out: FieldInit[] = [];
+  for (const f of fs) {
+    out.push(FieldInit { name: f.name, value: rn(f.value), span: f.span });
+  }
+  return out;
+}
+
+function rnSpread(o: Option<Expr>): Option<Expr> {
+  return match (o) {
+    Some(x) => Some(rn(x)),
+    None => None
+  };
+}
+
+function rnArms(arms: MatchArm[]): MatchArm[] {
+  let out: MatchArm[] = [];
+  for (const a of arms) {
+    const b = match (a.body) {
+      BExpr(x) => BExpr(rn(x)),
+      BBlock(blk) => BBlock(blk)
+    };
+    out.push(MatchArm { pattern: a.pattern, body: b, span: a.span });
+  }
+  return out;
+}
+
+function rn(e: Expr): Expr {
+  const sp = e.span;
+  return match (e.kind) {
+    EIdent(id) => id.name == "result" ? mkE(EIdent(idOf("result$", id.span)), sp) : e,
+    EUnary(op, x) => mkE(EUnary(op, rn(x)), sp),
+    EBinary(op, l, r) => mkE(EBinary(op, rn(l), rn(r)), sp),
+    ECall(c, args) => mkE(ECall(rn(c), rnAll(args)), sp),
+    EMember(b, n) => mkE(EMember(rn(b), n), sp),
+    EIndex(b, i) => mkE(EIndex(rn(b), rn(i)), sp),
+    ETry(x) => mkE(ETry(rn(x)), sp),
+    ECond(c, a, b) => mkE(ECond(rn(c), rn(a), rn(b)), sp),
+    EArray(xs) => mkE(EArray(rnAll(xs)), sp),
+    ERecord(n, spread, fs) => mkE(ERecord(n, rnSpread(spread), rnFields(fs)), sp),
+    ERecordT(n, tys, spread, fs) => mkE(ERecordT(n, tys, rnSpread(spread), rnFields(fs)), sp),
+    EMatch(s, arms) => mkE(EMatch(rn(s), rnArms(arms)), sp),
+    ENew(n, tys, args) => mkE(ENew(n, tys, rnAll(args)), sp),
+    _ => e
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Check statements
 // ---------------------------------------------------------------------------
@@ -182,7 +249,7 @@ function checkStmts(sm: SourceMap, cs: ContractClause[]): Stmt[] {
         const sp = c.span;
         const msg = mkE(EStr(clauseMessage(sm, c)), sp);
         const fail = mkS(SExpr(mkE(ECall(mkE(EIdent(idOf(FAIL, sp)), sp), [msg]), sp)), sp);
-        const cond = mkE(EUnary(UNot, rw(x, false)), sp);
+        const cond = mkE(EUnary(UNot, renameResult(rw(x, false), isEnsures(c))), sp);
         out.push(mkS(SIf(cond, Block { stmts: [fail], span: sp }, None), sp));
       },
       None => {}
@@ -238,7 +305,7 @@ function wrapperBody(
   if (isVoid) {
     stmts.push(mkS(SExpr(call), sp));
   } else {
-    stmts.push(mkS(SLet(false, idOf("result", sp), None, call), sp));
+    stmts.push(mkS(SLet(false, idOf("result$", sp), None, call), sp));
   }
   for (const s of checkStmts(sm, enss)) {
     stmts.push(s);
@@ -247,7 +314,7 @@ function wrapperBody(
     stmts.push(s);
   }
   if (!isVoid) {
-    stmts.push(mkS(SReturn(Some(mkE(EIdent(idOf("result", sp)), sp))), sp));
+    stmts.push(mkS(SReturn(Some(mkE(EIdent(idOf("result$", sp)), sp))), sp));
   }
   return Block { stmts: stmts, span: sp };
 }
