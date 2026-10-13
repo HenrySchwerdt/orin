@@ -81,8 +81,9 @@ spec 07: *safe Orin* (language guarantees, MIR-verified), *tested only*, *truste
 | `orin_struct_*`, `orin_nullary`, `orin_variant1`, `orin_opt_unwrap`, `orin_res_unwrap(_err)`, `orin_tag` | L1 | stay in C until R3 |
 | `orin_retain/dup/release/destroy`, `orin_make_unique(_slow)`, freelists, `orin_live_count`, `OrinStats` | L1 | stay in C until R3 |
 | checked arithmetic and conversions (`orin_add_i` ... `orin_usize_to_int`) | L1 (codegen intrinsics) | stay in C (inline), R3 |
-| `orin_trap`, `orin_init`, `orin_flush` | L0 | stay in C (R2 carves them into `platform/`) |
-| `orin_console_log/error`, `orin_fs_read_file/write_file/exists`, `orin_process_args/exit`, `orin_runtime_io.h` (`std:io`) | L0 | stay in C (R2) |
+| `orin_trap`, `orin_init`, `orin_flush` | L1 shells over L0 | **R2 done:** the functions stay in `runtime/` as thin object-model-aware wrappers; all OS access is `orin_platform_init/write_line/exit/flush/at_exit/getenv` |
+| `orin_console_log/error`, `orin_fs_read_file/write_file/exists`, `orin_process_args/exit`, `orin_runtime_io.h` (`std:io`) | L1 shells over L0 | **R2 done:** they only convert Orin strings to `(ptr, len)` and Result objects; OS work is `orin_platform_write_line`, `file_read/write/exists`, `error_message`, `arg_count/arg`, `exit`, `stdin_read/getc`, `shell` |
+| allocation, `memcpy`/`memcmp`/`memset`/`memmem` in the object model | L0 | **R2 done:** `orin_platform_alloc/realloc/free`, `mem_copy/set/cmp/find`; `snprintf` replaced by `fmt_i64/fmt_u64` |
 
 Labels: the prelude code is *safe Orin* (type-checked, MIR ownership-verified: `tools/verify_all.py`
 covers all of it) with functional behaviour *tested only* (differential tests against the C versions
@@ -91,6 +92,16 @@ over all run suites, ASan/UBSan, plus `tests/run/std_prelude_edges.or`); everyth
 separator is raised through `process.exit(101)` after printing the same message.
 - **R2 — carve out L0:** split the remaining C into `platform/` (the closed list) and the object
   model; write L0 contracts.
+  **Status: done (2026-10-13).** `platform/orin_platform.{h,c}` (about 440 lines incl. contracts; budget
+  1,000) is the closed list; the final API: memory `alloc, realloc, free, mem_copy, mem_move, mem_set,
+  mem_cmp, mem_find`; formatting `fmt_i64, fmt_u64`; process `init, arg_count, arg, getenv, at_exit, exit,
+  abort, shell`; byte I/O `write, write_line, flush, stdin_read, stdin_getc`; files `file_read, file_write,
+  file_exists, error_message`. No clock: nothing uses one yet (adding one needs an ADR). Every function has
+  an ACSL-style `requires/ensures/assigns` block in the header. `tools/check_platform_boundary.sh` (CI)
+  forbids direct libc calls/includes in `runtime/`. Assurance: memory, find and format primitives are
+  bounded-verified with CBMC (`tools/verify_platform.sh`, docs/formal.md "L0 platform layer"); I/O, process
+  and file primitives are tested only (`platform/tests/platform_test.c`, plain and under ASan/UBSan). The
+  inventory above shows the layer of each runtime function after R2.
 - **R3 — core dialect:** add core intrinsics (raw address type, load/store, size_of, header
   access) restricted to `core` modules; reimplement the object model (retain/release/make_unique,
   allocation, arrays, strings) in Orin; the C object model is deleted. Stage 0 keeps its own C

@@ -40,7 +40,7 @@ size_t orin_platform_fmt_u64(char *buf, uint64_t v) {
 size_t orin_platform_fmt_i64(char *buf, int64_t v) {
     if (v >= 0) return orin_platform_fmt_u64(buf, (uint64_t)v);
     buf[0] = '-';
-    return 1 + orin_platform_fmt_u64(buf + 1, (uint64_t)0 - (uint64_t)v);
+    return 1 + orin_platform_fmt_u64(buf + 1, (uint64_t)(-(v + 1)) + 1); /* |v| without wrapping */
 }
 
 /* ---------------------------------------------------------------- process */

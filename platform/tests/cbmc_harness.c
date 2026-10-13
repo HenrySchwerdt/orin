@@ -41,8 +41,12 @@ static uint64_t parse_u(const char *b, size_t n) {
     return v;
 }
 
+/* 64-bit division/multiplication blow up the SAT encoding (a full-range run did not finish in 20
+ * minutes), so the nondeterministic harnesses cover |v| < 10^6 (6 digits) and the extremes are
+ * checked as concrete values in harness_fmt_extremes. */
 void harness_fmt_u64(void) {
     uint64_t v;
+    __CPROVER_assume(v < 1000000u);
     char buf[20];
     size_t n = orin_platform_fmt_u64(buf, v);
     assert(n >= 1 && n <= 20);
@@ -56,6 +60,7 @@ void harness_fmt_u64(void) {
 
 void harness_fmt_i64(void) {
     int64_t v;
+    __CPROVER_assume(v > -1000000 && v < 1000000);
     char buf[20];
     size_t n = orin_platform_fmt_i64(buf, v);
     assert(n >= 1 && n <= 20);
@@ -70,7 +75,7 @@ void harness_fmt_i64(void) {
     for (size_t i = o; i < n; i++) assert(buf[i] >= '0' && buf[i] <= '9');
     assert(n - o == 1 || buf[o] != '0');
     uint64_t back = parse_u(buf + o, n - o);
-    uint64_t mag = v < 0 ? (uint64_t)0 - (uint64_t)v : (uint64_t)v;
+    uint64_t mag = v < 0 ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
     assert(back == mag);
 }
 
@@ -85,13 +90,14 @@ void harness_mem(void) {
     assert(r == b);
     for (size_t i = 0; i < n; i++) assert(b[i] == saved[i]);
     assert(orin_platform_mem_cmp(a, b, n) == 0);
-    b[0] = (unsigned char)(a[0] + 1);
+    b[0] = a[0] ^ 1;
     if (n > 0) assert(orin_platform_mem_cmp(a, b, n) != 0);
 
     /* overlapping move inside one buffer */
     unsigned char m[2 * MAXN], old[2 * MAXN];
     size_t from, to;
-    __CPROVER_assume(n <= MAXN && from + n <= 2 * MAXN && to + n <= 2 * MAXN);
+    __CPROVER_assume(n <= MAXN && from <= 2 * MAXN && to <= 2 * MAXN);
+    __CPROVER_assume(from + n <= 2 * MAXN && to + n <= 2 * MAXN);
     for (size_t i = 0; i < 2 * MAXN; i++) old[i] = m[i];
     orin_platform_mem_move(m + to, m + from, n);
     for (size_t i = 0; i < n; i++) assert(m[to + i] == old[from + i]);
@@ -100,6 +106,7 @@ void harness_mem(void) {
 
     unsigned char s[MAXN];
     int c;
+    __CPROVER_assume(c >= 0 && c < 256);
     orin_platform_mem_set(s, c, n);
     for (size_t i = 0; i < n; i++) assert(s[i] == (unsigned char)c);
 
@@ -132,4 +139,27 @@ void harness_alloc(void) {
     q[(m ? m : 1) - 1] = 0; /* whole new block is writable */
     orin_platform_free(q);
     orin_platform_free(NULL);
+}
+
+static int is(const char *buf, size_t n, const char *want) {
+    size_t i = 0;
+    while (want[i]) i++;
+    if (i != n) return 0;
+    for (size_t k = 0; k < n; k++)
+        if (buf[k] != want[k]) return 0;
+    return 1;
+}
+
+void harness_fmt_extremes(void) {
+    char b[20];
+    size_t n = orin_platform_fmt_u64(b, UINT64_MAX);
+    assert(is(b, n, "18446744073709551615"));
+    n = orin_platform_fmt_u64(b, 0);
+    assert(is(b, n, "0"));
+    n = orin_platform_fmt_i64(b, INT64_MAX);
+    assert(is(b, n, "9223372036854775807"));
+    n = orin_platform_fmt_i64(b, INT64_MIN);
+    assert(is(b, n, "-9223372036854775808"));
+    n = orin_platform_fmt_i64(b, -1);
+    assert(is(b, n, "-1"));
 }
