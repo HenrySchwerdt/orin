@@ -29,7 +29,10 @@ hole slot when reading that slot.
 - `IDup(d, o)`: o live → d Owned.
 - `IRelease(x)`: x Owned/Unique → Dead. Releasing Param/Borrowed/Dead is an **error**.
 - `ICall`/`IBuiltin`: all ref args live (any of Owned/Unique/Borrowed/Param/OStr); d Owned.
-  A call does not change argument states (borrowed for the call).
+  A call does not change argument states (borrowed for the call), **except** that a `Unique`
+  ref argument is demoted to `Owned` when the call has a ref-typed result: the callee may return
+  a retained alias of its argument, so uniqueness is no longer provable (found by the verifier;
+  v1.1). Lowering must re-`IMakeUnique` before mutating such a local.
 - `IStrAppend(x, y)`: x Owned/Unique (stays Owned); y live.
 - `IStructNew(d, tag, slots)`, `IArrayNew(d, isRef, elems)`: each ref operand Owned/Unique local
   (→ Dead) or OStr; d Unique.
