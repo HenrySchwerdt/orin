@@ -9,6 +9,8 @@ export type SourceFile = { path: string; text: string; };
 export type SourceMap = { files: SourceFile[]; };
 
 // `code` is "E" (error) or "W" (warning) followed by four digits, e.g. "E0400" (see isValidCode).
+// (Record invariants are not checked at run time: `diag` and `Diagnostics.add` enforce this one.)
+@Invariant(isValidCode(this.code) && this.span.start <= this.span.end)
 export type Diagnostic = { code: string; message: string; span: Span; notes: string[]; };
 
 // A diagnostic code: one letter, `E` or `W`, then exactly four decimal digits.
@@ -43,16 +45,35 @@ export function spanTo(a: Span, b: Span): Span {
   return Span { file: a.file, start: s, end: e };
 }
 
-@Requires(isValidCode(code))
+@Requires(isValidCode(code) && sp.start <= sp.end)
 @Ensures(result.code == code && result.message == message && result.notes.length == 0)
+@Ensures(result.span.file == sp.file && result.span.start == sp.start && result.span.end == sp.end)
+@Ensures(isWarning(result) == (code.charCodeAt(0) == 87))
 export function diag(code: string, sp: Span, message: string): Diagnostic {
   const notes: string[] = [];
   return Diagnostic { code: code, message: message, span: sp, notes: notes };
 }
 
+// Number of "\n" bytes in `s`.
+function countNewlines(s: string): usize {
+  let n: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    if (s.charCodeAt(i) == 10) {
+      n += 1;
+    }
+    i += 1;
+  }
+  return n;
+}
+
 type LineCol = { line: usize; col: usize; };
 
 // 1-based line and column (both in bytes) of `offset` in `text`; an offset past the end counts as the end.
+// A column never exceeds the clamped offset + 1, and a line number never exceeds the line count of `text`.
+@Ensures(result.line >= 1 && result.col >= 1)
+@Ensures(result.col <= (offset < text.length ? offset : text.length) + 1)
+@Ensures(result.line <= countNewlines(text) + 1)
 function lineCol(text: string, offset: usize): LineCol {
   const stop = offset < text.length ? offset : text.length;
   let line: usize = 1;
@@ -76,21 +97,115 @@ export function isWarning(d: Diagnostic): bool {
   return d.code.startsWith("W");
 }
 
-// True when `d` can be rendered against `sm`: its span lies in a file of the map, within the text.
+// True when `d` can be rendered against `sm`: its span lies in a file of the map, within the text
+// (the end may lie past the text: spans of EOF diagnostics and of generated code are clamped by their users).
 export function isRenderable(sm: SourceMap, d: Diagnostic): bool {
   return d.span.file < sm.files.length
       && d.span.start <= d.span.end
       && d.span.start <= sm.files[d.span.file].text.length;
 }
 
+// True when every note of a diagnostic appears in its rendering as a `note:` line.
+function containsAllNotes(s: string, notes: string[]): bool {
+  for (const n of notes) {
+    if (!s.includes("\n  note: " + n)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when every diagnostic of `ds` can be rendered against `sm`. A loop, not `every`: contracts
+// may only call pure functions, and calling a function value is impure.
+export function allRenderable(sm: SourceMap, ds: Diagnostic[]): bool {
+  for (const d of ds) {
+    if (!isRenderable(sm, d)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when every diagnostic of `ds` has a valid code and a non-inverted span.
+export function allWellFormed(ds: Diagnostic[]): bool {
+  for (const d of ds) {
+    if (!isValidCode(d.code) || d.span.start > d.span.end) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Number of diagnostics of `ds` that are warnings.
+export function countWarnings(ds: Diagnostic[]): usize {
+  let n: usize = 0;
+  for (const d of ds) {
+    if (isWarning(d)) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
 // `path:line:col: error[CODE]: message` (+ "\n  note: ..." lines); `warning[CODE]` for warnings.
 @Requires(isRenderable(sm, d))
+@Ensures(result.length > 0)
 @Ensures(result.startsWith(sm.files[d.span.file].path + ":"))
+@Ensures(result.includes(
+  isWarning(d) ? ": warning[" + d.code + "]: " : ": error[" + d.code + "]: ",
+))
 @Ensures(result.includes("[" + d.code + "]: " + d.message))
+@Ensures(containsAllNotes(result, d.notes))
+@Ensures(countNewlines(result) >= d.notes.length)
 export function render(sm: SourceMap, d: Diagnostic): string {
   const f = sm.files[d.span.file];
   const pos = lineCol(f.text, d.span.start);
   const kind = isWarning(d) ? "warning" : "error";
   const head = `${f.path}:${pos.line}:${pos.col}: ${kind}[${d.code}]: ${d.message}`;
   return head + d.notes.map(n => `\n  note: ${n}`).join("");
+}
+
+// A list of diagnostics under construction (collecting passes: manifest validation, ...). The counters
+// are redundant on purpose: the invariant ties them to the list, so a code path that bypasses `add`
+// (or an `add` that forgets a counter) is caught after the next method call.
+@Invariant(this.errors + this.warnings == this.items.length)
+@Invariant(countWarnings(this.items) == this.warnings)
+@Invariant(allWellFormed(this.items))
+export class Diagnostics {
+  private items: Diagnostic[] = [];
+  private errors: usize = 0;
+  private warnings: usize = 0;
+
+  @Requires(isValidCode(d.code) && d.span.start <= d.span.end)
+  @Ensures(this.items.length == old(this.items.length) + 1)
+  @Ensures(this.errors + this.warnings == old(this.errors + this.warnings) + 1)
+  add(d: Diagnostic): void {
+    this.items.push(d);
+    if (isWarning(d)) {
+      this.warnings += 1;
+    } else {
+      this.errors += 1;
+    }
+  }
+
+  @Ensures(result == this.items.length)
+  count(): usize {
+    return this.items.length;
+  }
+
+  @Ensures(result == this.errors)
+  errorCount(): usize {
+    return this.errors;
+  }
+
+  @Ensures(result == this.errors > 0)
+  hasErrors(): bool {
+    return this.errors > 0;
+  }
+
+  // The collected diagnostics in insertion order.
+  @Ensures(result.length == this.items.length && allWellFormed(result))
+  toArray(): Diagnostic[] {
+    return this.items;
+  }
 }
