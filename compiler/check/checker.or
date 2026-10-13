@@ -3,13 +3,15 @@
 
 import { Diagnostic, SourceMap, diag } from "../diag";
 import { Ident, DAlias } from "../syntax";
-import { Program, Function, HBlock, Type } from "../hir";
+import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type } from "../hir";
 import { LoadedProgram } from "../loader";
 import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
 import { collect } from "./collect";
 import { resolveDecls, findMain } from "./decls";
 import { newFnCtx } from "./fnctx";
 import { checkBlock } from "./body";
+import { lowerClasses, buildClassTables } from "./classes";
+import { inferClasses } from "./classfix";
 import { scopeOf, mkOpaque, resolveSig, resolveType, instType } from "./types";
 
 type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; };
@@ -34,7 +36,15 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
     },
     Ok(b) => {
       let err: Option<Diagnostic> = None;
-      if (!isVoid(f.ret) && !b.div) {
+      let block = b.block;
+      // Classes: constructors and void mutating methods return the receiver (`this` is the first local
+      // after the parameters).
+      if ((f.mode == 1 || f.mode == 3) && !b.div) {
+        const thisE = HExpr { kind: XLocal(f.paramLocals.length), ty: f.ret, span: f.decl.span };
+        block.stmts.push(HReturn(Some(thisE)));
+      }
+      const srcVoid = f.mode == 0 ? isVoid(f.ret) : isVoid(f.srcRet);
+      if (!srcVoid && !b.div) {
         err = Some(diag(
           "E0403",
           f.decl.name.span,
@@ -47,7 +57,7 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
           paramCount: f.paramLocals.length,
           locals: b.fx.locals,
           ret: f.ret,
-          body: b.block,
+          body: block,
           span: f.decl.span
         },
         err: err,
@@ -93,7 +103,10 @@ function abstractFunc(env: Env, g: usize): Option<Diagnostic> {
     ret: sig.ret,
     tpNames: op.names,
     tpTys: op.tys,
-    depth: 0
+    depth: 0,
+    mode: 0,
+    cls: 0,
+    srcRet: TyVoid
   };
   return checkFunc(sig.env, f, true).err;
 }
@@ -119,15 +132,20 @@ function abstractType(env: Env, g: usize): Option<Diagnostic> {
 }
 
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
-  const c = collect(prog);
+  // Classes are lowered to records and functions first (ADR-0009).
+  const lw = lowerClasses(prog);
+  if (lw.diags.length > 0) {
+    return Err(dedupDiags(lw.diags));
+  }
+  const c = collect(lw.prog);
   if (c.diags.length > 0) {
     return Err(dedupDiags(c.diags));
   }
-  const r = resolveDecls(c.env, c.recordSrc, c.unionSrc);
+  const r = resolveDecls(buildClassTables(c.env, lw.classes), c.recordSrc, c.unionSrc);
   if (r.diags.length > 0) {
     return Err(dedupDiags(r.diags));
   }
-  let env = r.env;
+  let env = inferClasses(r.env);
   let diags: Diagnostic[] = [];
   // Generic declarations are checked once, abstractly, at their definition.
   let gi: usize = 0;

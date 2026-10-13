@@ -1,0 +1,92 @@
+// Classes (ADR-0009), part 2: mutation inference. Beyond Orin-B.
+//
+// A method is *mutating* if its body assigns to a place rooted at `this`, calls `push`/`pop` on such
+// a place, or calls a mutating method on one. This is a fixpoint over all classes: each round
+// type-checks the bodies of the methods not yet known to mutate in "probe" mode (no HIR is kept;
+// calls of mutating methods only record the mutation) and flags the ones that mutate. Errors found
+// while probing are ignored; the real check reports them.
+//
+// Afterwards the mutating methods are lowered (ADR-0009): `m(args): void` returns the updated
+// receiver (mode 3); `m(args): R` returns a generated record `C.m$ret { self: C; value: R; }` (mode 4).
+
+import { Type, FieldDef, RecordDef } from "../hir";
+import { Env, isVoid } from "./env";
+import { newFnCtx } from "./fnctx";
+import { checkBlock } from "./body";
+
+// Does the body of method `fid` mutate its `this`?
+function mutatesThis(env: Env, fid: usize): bool {
+  const f = env.funcs[fid];
+  let fx = newFnCtx(f, env, false);
+  fx.probe = true;
+  const r = checkBlock(env, fx, f.decl.body);
+  return match (r) {
+    Ok(b) => b.fx.mutThis,
+    Err(_) => false
+  };
+}
+
+export function inferClasses(env0: Env): Env {
+  let env = env0;
+  // Source-level signatures (the declared return types), before any lowering.
+  let ci: usize = 0;
+  while (ci < env.classes.length) {
+    env.funcs[env.classes[ci].ctor].srcRet = TyVoid;
+    let k: usize = 0;
+    while (k < env.classes[ci].methods.length) {
+      const fid = env.classes[ci].methods[k].fid;
+      env.funcs[fid].srcRet = env.funcs[fid].ret;
+      env.classes[ci].methods[k].hasRet = !isVoid(env.funcs[fid].ret);
+      k += 1;
+    }
+    ci += 1;
+  }
+  // Fixpoint.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    ci = 0;
+    while (ci < env.classes.length) {
+      let k: usize = 0;
+      while (k < env.classes[ci].methods.length) {
+        const m = env.classes[ci].methods[k];
+        if (!m.isStatic && !m.mutating) {
+          if (mutatesThis(env, m.fid)) {
+            env.classes[ci].methods[k].mutating = true;
+            changed = true;
+          }
+        }
+        k += 1;
+      }
+      ci += 1;
+    }
+  }
+  // Lowered signatures of the mutating methods.
+  ci = 0;
+  while (ci < env.classes.length) {
+    const self: Type = TyRecord(env.classes[ci].rec);
+    let k: usize = 0;
+    while (k < env.classes[ci].methods.length) {
+      const m = env.classes[ci].methods[k];
+      if (m.mutating) {
+        if (m.hasRet) {
+          const rid = env.records.length;
+          const fields: FieldDef[] = [
+            FieldDef { name: "self", ty: self },
+            FieldDef { name: "value", ty: env.funcs[m.fid].srcRet }
+          ];
+          env.records.push(RecordDef { name: env.funcs[m.fid].qname + "$ret", fields: fields });
+          env.classes[ci].methods[k].retRec = rid;
+          env.funcs[m.fid].mode = 4;
+          env.funcs[m.fid].ret = TyRecord(rid);
+        } else {
+          env.funcs[m.fid].mode = 3;
+          env.funcs[m.fid].ret = self;
+        }
+      }
+      k += 1;
+    }
+    ci += 1;
+  }
+  return env;
+}

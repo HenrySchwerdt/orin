@@ -3,7 +3,7 @@
 
 import { Diagnostic, diag } from "../diag";
 import { Ident } from "../syntax";
-import { Type, Local } from "../hir";
+import { Type, Local, HStmt } from "../hir";
 import { FuncInfo, Env } from "./env";
 
 export type FnCtx = {
@@ -19,6 +19,17 @@ export type FnCtx = {
   tpTys: Type[];       // ... and their bindings (opaque types in an abstract check)
   abs: bool;           // abstract check of a generic body: no function instances are created
   depth: usize;        // instantiation depth of the function being checked
+  // Classes (ADR-0009): FuncInfo.mode / cls of the function being checked ...
+  fmode: int;
+  fcls: usize;
+  lret: Type;          // the lowered return type (FuncInfo.ret); `ret` is the source-level one
+  // ... statements hoisted out of the expression being checked (mutating method calls), flushed by
+  // the enclosing block before the statement that contains the expression ...
+  pre: HStmt[];
+  tmps: usize;         // counter for hoisting temporaries
+  // ... and the mutation probe: while true, bodies are only analysed for `this` mutation (no HIR is kept).
+  probe: bool;
+  mutThis: bool;       // a `this` place was mutated (set by the probe)
 };
 
 export type LocalOut = { fx: FnCtx; id: usize; };
@@ -35,9 +46,10 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
   }
   const marks: usize[] = [0];
   const loops: bool[] = [];
+  const pre: HStmt[] = [];
   return FnCtx {
     unit: f.unit,
-    ret: f.ret,
+    ret: f.mode == 0 ? f.ret : f.srcRet,
     locals: f.paramLocals,
     names: names,
     ids: ids,
@@ -47,7 +59,14 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
     tpNames: f.tpNames,
     tpTys: f.tpTys,
     abs: abs,
-    depth: f.depth
+    depth: f.depth,
+    fmode: f.mode,
+    fcls: f.cls,
+    lret: f.ret,
+    pre: pre,
+    tmps: 0,
+    probe: false,
+    mutThis: false
   };
 }
 
