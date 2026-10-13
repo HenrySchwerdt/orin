@@ -59,9 +59,10 @@ TS-familiar syntax for the community, native speed **at least on par with Go**, 
    (post-1.0 option in ADR-0017) must be designed first (ADR).
 3. Expected findings: missing library pieces (arena collection, string interning, fast file walking)
    and language friction — fed back into post-1.0 ADRs.
-Also: `docs/ts-developers.md` — "Orin for TypeScript developers" (the main semantic differences behind
-the familiar syntax: value semantics, no null/any/exceptions/inheritance, integer traps, explicit
-conversions) with matching "did you mean" diagnostics.
+Also: [Orin for TypeScript developers](ts-developers.md) (done): the semantic differences behind the
+familiar syntax; every example is a test (`tests/next/**/ts_dev_*.or`), so update the page with any
+language-surface ADR. Next: "did you mean" diagnostics for common TS habits — candidate list in
+[ts-diagnostics.md](ts-diagnostics.md).
 
 ### 4. Optimisation ‖ provability (in parallel)
 - **Optimisation:** unboxing, RC elision, escape analysis/stack allocation, LLVM tuning. Each step
