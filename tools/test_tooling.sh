@@ -4,9 +4,11 @@ set -eu
 cd "$(dirname "$0")/.."
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 mkdir -p build
-for t in json_test analysis_test lsp_test verify_main package_test; do
+for t in path_test json_test analysis_test lsp_test verify_main package_test; do
   $ORIN2 compile compiler/tests/$t.or -o build/$t.c
   cc -O1 -w -I runtime build/$t.c runtime/orin_runtime.c platform/orin_platform.c -o build/$t
   ./build/$t
 done
+# diag + loader unit tests (@Test; `orin test` runs them with contract checking)
+$ORIN2 test compiler/tests/loader_test.or --runtime runtime
 sh tools/test_resources.sh
