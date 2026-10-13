@@ -6,6 +6,7 @@
 //   orin lsp                 language server on stdio (spec 18)
 //   orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]   MCP server on stdio (spec 10)
 //   orin mir <entry.or>      print the MIR
+//   orin verify --contracts [--format=json] [--z3 PATH] [--strict] <entry.or>   verify contracts with z3 (docs/contracts.md)
 //   orin verify <entry.or>   run the MIR ownership verifier (errors and warning count)
 //   (compile/mir/verify run the MIR optimiser, compiler/opt, unless --no-opt is given)
 //   compile/mir/verify load the std prelude (std/, spec 19 R1) implicitly: moved built-ins call
@@ -25,11 +26,12 @@ import { MProgram, printProgram } from "./mir";
 import { verify } from "./verify";
 import { optimize, pruneProgram } from "./opt";
 import { runFmt, printDiagnosticsJson } from "./tools";
+import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
 import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin mir <entry.or>\n  orin verify <entry.or>");
+  console.error("usage:\n  orin check [--format=json] <entry.or>\n  orin compile [--format=json] <entry.or> -o <out.c> [--legacy-codegen] [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
   exit(2);
 }
 
@@ -84,9 +86,22 @@ function main(): void {
   let llvm = false;
   let cBuiltins = false;
   let checkContracts = false;
+  let verifyContractsFlag = false;
+  let strict = false;
+  let z3 = "z3";
   let argv: string[] = [];
+  let expectZ3 = false;
   for (const a of all) {
-    if (a == "--format=json") {
+    if (expectZ3) {
+      z3 = a;
+      expectZ3 = false;
+    } else if (a == "--z3") {
+      expectZ3 = true;
+    } else if (a == "--contracts") {
+      verifyContractsFlag = true;
+    } else if (a == "--strict") {
+      strict = true;
+    } else if (a == "--format=json") {
       json = true;
     } else if (a == "--legacy-codegen") {
       legacy = true;
@@ -139,6 +154,14 @@ function main(): void {
   }
   if (cmd == "mir") {
     console.log(printProgram(noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()))));
+    return;
+  }
+  if (cmd == "verify" && verifyContractsFlag) {
+    const rep = verifyContracts(program, loaded.sm, z3);
+    console.log(json ? reportJson(rep) : reportText(rep));
+    if (failedCount(rep) > 0 || (strict && unknownCount(rep) > 0)) {
+      exit(1);
+    }
     return;
   }
   if (cmd == "verify") {

@@ -50,3 +50,10 @@ executable with `ASAN_OPTIONS=detect_leaks=0`). Build products live under `build
 
 A per-category and total `passed/failed` summary; for each failure the diff head (stdout
 mismatch), exit status, or compiler/C stderr head. Exit status is non-zero if any test fails.
+
+## Headers for `tests/next`
+
+Beyond `// exit: N`, the leading `//` comment lines of a test may contain `// flags: --check-contracts`
+(extra compiler flags, ADR-0012) and `// stderr: text` (the run's stderr must contain `text`).
+`tests/contracts/` holds inputs for `tools/test_verify_contracts.py` (`orin verify --contracts`,
+needs z3): expected results are given as `// expect: <function> <kind> <STATUS>` lines.

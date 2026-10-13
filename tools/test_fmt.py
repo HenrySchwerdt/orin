@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "build", "fmt")
 SPAN = re.compile(r"@\d+-\d+")
-CORPUS_DIRS = ["tests/run", "tests/next", "tests/parse_edge", "compiler", "bench", "std", "array"]
+CORPUS_DIRS = ["tests/run", "tests/next", "tests/contracts", "tests/parse_edge", "compiler", "bench", "std", "array"]
 
 
 def run(cmd, timeout=120):
