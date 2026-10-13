@@ -10,6 +10,7 @@
   parameter). `std:graph` is rewritten as `class Graph<T>` (generational, tagged ids, stale/foreign ids are `Err`);
   the functional API is removed. Fix: `?` in a mutating method that returns a Result no longer crashes.
   The language-freeze prerequisites are complete.
+- Defence in depth against shape confusion (docs/assurance.md F-shape): every struct/variant slot access (`orin_struct_get/set/slot_ptr`, `orin_mir_struct_take/replace`, `orin_struct_copy_slot`, LLVM `@orinl_slot`) checks that the object is a struct and the index is below its slot count, array slot access and push check the object kind; a mismatch traps with exit 101 (`trap: field access on a value of the wrong shape (compiler bug)`) instead of reading or writing out of bounds. Initialising stores into a fresh `orin_struct_new` use the unchecked `orin_struct_init`. Measured cost in docs/benchmarks.md. New regression test `tests/next/run/shape_confusion_try_in_mutating_method.or`; new P0 proof-debt item: MIR shape/type check in the verifier.
 - OSIG (ADR-0023, docs/osig.md): `orin graph <entry|package-dir> [-o out.json]` exports the deterministic
   Orin Software Intelligence Graph (schema `osig/0.1`: packages, modules, functions, methods, classes,
   interfaces, types, fields, variants, contract clauses; edges `DEFINES`, `IMPORTS`, `CALLS` with

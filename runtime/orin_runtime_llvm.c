@@ -20,7 +20,10 @@ _Static_assert(offsetof(OrinString, data) == 32, "OrinString.data");
 _Static_assert(offsetof(OrinArray, len) == 16, "OrinArray.len");
 _Static_assert(offsetof(OrinArray, cap) == 24, "OrinArray.cap");
 _Static_assert(offsetof(OrinArray, items) == 40, "OrinArray.items");
+_Static_assert(offsetof(OrinStruct, nslots) == 16, "OrinStruct.nslots");
 _Static_assert(offsetof(OrinStruct, slots) == 32, "OrinStruct.slots");
+_Static_assert(ORIN_K_ARRAY == 2, "ORIN_K_ARRAY (hard-coded in @orinl_array_slot / @orinl_array_push)");
+_Static_assert(ORIN_K_STRUCT == 3, "ORIN_K_STRUCT (hard-coded in @orinl_slot)");
 
 OrinObj *orinl_io_read_bytes(uint64_t n) { return orin_io_read_bytes(n); }
 OrinObj *orinl_io_read_line(void) { return orin_io_read_line(); }
