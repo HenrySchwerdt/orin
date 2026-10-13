@@ -9,10 +9,11 @@ import { Span, Diagnostic, diag } from "../diag";
 import { Ident, FunctionDecl } from "../syntax";
 import { Type, VTable } from "../hir";
 import {
-  Env, IfaceSig, EntIface, findType, typeEq, showType, showIfaceSig, boundOf, ifaceMethodIndex
+  Env, FuncInfo, IfaceSig, EntIface, findType, typeEq, showType, showIfaceSig, boundOf, ifaceMethodIndex, originOf
 } from "./env";
-import { plainScope, resolveType } from "./types";
-import { classOfRec, findMethod } from "./classes";
+import { plainScope, resolveType, instFunc } from "./types";
+import { abstractInfo } from "./gclass";
+import { classOfRec, findMethod, satisfies, boundIface } from "./classes";
 
 export type IfaceRes = { env: Env; diags: Diagnostic[]; };
 
@@ -156,7 +157,22 @@ export function checkImpls(env: Env): Diagnostic[] {
           ));
         } else {
           const mi = ci.methods[mo.unwrap()];
-          const f = env.funcs[mi.fid];
+          // A generic class (ADR-0026) is checked on the signatures under opaque type parameters.
+          let fo: Option<FuncInfo> = None;
+          let senv = env;
+          if (ci.gid >= 0 && !mi.isStatic) {
+            const ai = abstractInfo(env, mi.fid);
+            if (ai.isOk()) {
+              fo = Some(ai.unwrap().f);
+              senv = ai.unwrap().env;
+            }
+          } else {
+            fo = Some(env.funcs[mi.fid]);
+          }
+          if (fo.isNone()) {
+            continue;
+          }
+          const f = fo.unwrap();
           const sp = f.decl.name.span;
           if (mi.isStatic) {
             diags.push(diag(
@@ -178,7 +194,7 @@ export function checkImpls(env: Env): Diagnostic[] {
             if (!sameSig(m, ps, f.srcRet)) {
               diags.push(diag(
                 "E0417", sp,
-                "method `" + sigText(env, m.name, paramNamesOf(f.decl), ps, f.srcRet) + "` of class `" + ci.name
+                "method `" + sigText(senv, m.name, paramNamesOf(f.decl), ps, f.srcRet) + "` of class `" + ci.name
                   + "` does not match interface `" + info.name + "`, which requires `" + req + "`"
               ));
             } else if (mi.mutating) {
@@ -200,43 +216,6 @@ export function checkImpls(env: Env): Diagnostic[] {
 // ---------------------------------------------------------------------------
 // Conversions and bounds
 // ---------------------------------------------------------------------------
-
-// Does class record `r` declare `implements iface`? Also true for the opaque type of a parameter
-// bounded by `iface` (abstract check).
-export function recordImplements(env: Env, r: usize, iface: usize): bool {
-  const co = classOfRec(env, r);
-  if (co.isSome()) {
-    for (const i of env.classes[co.unwrap()].impls) {
-      if (i == iface) {
-        return true;
-      }
-    }
-    return false;
-  }
-  const b = boundOf(env, r);
-  return b.isSome() && b.unwrap() == iface;
-}
-
-// Does a value of type `t` satisfy the bound / convert to interface `iface`?
-export function satisfies(env: Env, t: Type, iface: usize): bool {
-  return match (t) {
-    TyRecord(r) => recordImplements(env, r, iface),
-    TyIface(j) => j == iface,
-    _ => false
-  };
-}
-
-// The interface named by the bound of type parameter `k` of `decl` (None: unbounded).
-export function boundIface(env: Env, unit: usize, b: Ident): Result<usize, Diagnostic> {
-  const found = findType(env.units[unit].scope, b.name);
-  if (found.isNone()) {
-    return Err(diag("E0300", b.span, "unknown interface `" + b.name + "` in a type parameter bound"));
-  }
-  return match (found.unwrap()) {
-    EntIface(i) => Ok(i),
-    _ => Err(diag("E0400", b.span, "`" + b.name + "` is not an interface; only interfaces can bound a type parameter"))
-  };
-}
 
 // Checks the arguments of a call of the generic function `decl` against the bounds of its type
 // parameters (E0417 at `span`). Used for abstract checks (opaque arguments) and instantiations alike.
@@ -283,28 +262,39 @@ function unsatisfied(env: Env, decl: FunctionDecl, k: usize, t: Type, iface: usi
 }
 
 // The vtable of class `ci` for interface `iface`: the class methods in interface-method order.
-// Interned (one per pair); conformance has been checked already.
+// Interned (one per pair); conformance has been checked already. `rec` is the record of the value that is
+// converted: the class's record, or for a generic class (ADR-0026) the instance record, whose methods are
+// the instances of the generic methods under its type arguments (created here).
 export type VtOut = { env: Env; id: usize; };
 
-export function internVtable(env0: Env, ci: usize, iface: usize): VtOut {
+export function internVtable(env0: Env, ci: usize, rec: usize, iface: usize, depth: usize, span: Span): Result<VtOut, Diagnostic> {
   let env = env0;
   const cls = env.classes[ci];
   const info = env.ifaces[iface];
-  const name = env.records[cls.rec].name + " as " + info.name;
+  const name = env.records[rec].name + " as " + info.name;
   let i: usize = 0;
   while (i < env.vtables.length) {
     if (env.vtables[i].name == name) {
-      return VtOut { env: env, id: i };
+      return Ok(VtOut { env: env, id: i });
     }
     i += 1;
   }
   let funcs: usize[] = [];
   for (const m of info.methods) {
     const mo = findMethod(cls, m.name);
-    funcs.push(cls.methods[mo.unwrapOr(0)].fid);
+    const fid = cls.methods[mo.unwrapOr(0)].fid;
+    if (cls.gid >= 0) {
+      const o = originOf(env, TyRecord(rec));
+      const args = o.unwrap().args;
+      const fo = instFunc(env, fid, args, depth + 1, span)?;
+      env = fo.env;
+      funcs.push(fo.fid);
+    } else {
+      funcs.push(fid);
+    }
   }
   env.vtables.push(VTable { name: name, funcs: funcs });
-  return VtOut { env: env, id: env.vtables.length - 1 };
+  return Ok(VtOut { env: env, id: env.vtables.length - 1 });
 }
 
 export function ifaceSlot(env: Env, iface: usize, name: string): Option<usize> {

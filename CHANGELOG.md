@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- Generic classes (ADR-0026, ADR-0016 "Generic classes"): `class Box<T>`, `new Box<int>(1)` / inferred `new Box(1)`,
+  several type parameters, nesting, bounds `class C<T extends I>` (ADR-0019), `implements` of non-generic
+  interfaces, contract clauses per instantiation, cross-module use; monomorphised per instantiation by lowering to
+  generic records and functions (no HIR/MIR/backend change, MIR stays v1.8); mutation inferred once, equal for all
+  instances and shown in hover / `orin api` / MCP / OSIG (`Program.mutating`). OSIG: one node per generic
+  declaration. New errors E0460 (generic methods, post-1.0) and E0461 (static method uses a class type
+  parameter). `std:graph` is rewritten as `class Graph<T>` (generational, tagged ids, stale/foreign ids are `Err`);
+  the functional API is removed. Fix: `?` in a mutating method that returns a Result no longer crashes.
+  The language-freeze prerequisites are complete.
 - OSIG (ADR-0023, docs/osig.md): `orin graph <entry|package-dir> [-o out.json]` exports the deterministic
   Orin Software Intelligence Graph (schema `osig/0.1`: packages, modules, functions, methods, classes,
   interfaces, types, fields, variants, contract clauses; edges `DEFINES`, `IMPORTS`, `CALLS` with

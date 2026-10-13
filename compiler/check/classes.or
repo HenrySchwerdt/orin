@@ -13,21 +13,63 @@
 
 import { Span, Diagnostic, diag } from "../diag";
 import {
-  Ident, Item, Block, Stmt, SLet, SAssign, Expr, EIdent, EMember, EThis, ERecord, FieldInit, TypeExpr, TNamed,
+  Ident, Item, Block, Stmt, SLet, SAssign, Expr, EIdent, EMember, EThis, ERecord, ERecordT, FieldInit, TypeExpr, TNamed, TArray, TFn,
   TypeDecl, DRecord, FieldDecl, FunctionDecl, Param, ClassDecl, MField, MCtor, MMethod, ClassField, CtorDecl,
   MethodDecl, IClass, IType, IFunction, OpAssign, Module, ContractClause
 } from "../syntax";
 import { LoadedProgram, Unit } from "../loader";
+import { Type } from "../hir";
 import {
-  Env, ClassInfo, FieldAcc, MethodInfo, EntRecord, VFunc, findType, findVal
+  Env, ClassInfo, FieldAcc, MethodInfo, EntRecord, EntGen, EntIface, VFunc, VGFunc, findType, findVal, originOf, boundOf, showType
 } from "./env";
 
 export type Lowered = { prog: LoadedProgram; classes: ClassInfo[]; diags: Diagnostic[]; };
 
 type ClassOut = { items: Item[]; info: ClassInfo; diags: Diagnostic[]; };
 
-function selfType(name: Ident): TypeExpr {
-  return TypeExpr { kind: TNamed(name, []), span: name.span };
+// `Box<T>` for a generic class (ADR-0026): the class name applied to its own type parameters.
+function paramTypes(tps: Ident[]): TypeExpr[] {
+  let out: TypeExpr[] = [];
+  for (const p of tps) {
+    out.push(TypeExpr { kind: TNamed(p, []), span: p.span });
+  }
+  return out;
+}
+
+// The first class type parameter mentioned in `te`, if any.
+function mentionedParam(te: TypeExpr, tps: Ident[]): Option<Ident> {
+  return match (te.kind) {
+    TNamed(id, args) => {
+      if (args.length == 0) {
+        for (const p of tps) {
+          if (p.name == id.name) {
+            return Some(id);
+          }
+        }
+      }
+      for (const a of args) {
+        const r = mentionedParam(a, tps);
+        if (r.isSome()) {
+          return r;
+        }
+      }
+      return None;
+    },
+    TArray(e) => mentionedParam(e, tps),
+    TFn(ps, ret) => {
+      for (const p of ps) {
+        const r = mentionedParam(p.ty, tps);
+        if (r.isSome()) {
+          return r;
+        }
+      }
+      return mentionedParam(ret, tps);
+    }
+  };
+}
+
+function selfTypeOf(c: ClassDecl): TypeExpr {
+  return TypeExpr { kind: TNamed(c.name, paramTypes(c.typeParams)), span: c.name.span };
 }
 
 function fieldNamed(names: string[], n: string): bool {
@@ -85,9 +127,9 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
     },
     None => {}
   }
-  if (c.typeParams.length > 0) {
-    diags.push(diag("E0408", c.typeParams[0].span, "generic classes are not supported yet (ADR-0009)"));
-  }
+  const generic = c.typeParams.length > 0;
+  const noBounds: Option<Ident>[] = [];
+  const noTps: Ident[] = [];
   let fields: ClassField[] = [];
   let ctors: CtorDecl[] = [];
   let methods: MethodDecl[] = [];
@@ -175,8 +217,11 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
     kind: SLet(
       true,
       thisId,
-      Some(selfType(c.name)),
-      Expr { kind: ERecord(c.name, None, lit), span: ctorSpan }
+      Some(selfTypeOf(c)),
+      Expr {
+        kind: generic ? ERecordT(c.name, paramTypes(c.typeParams), None, lit) : ERecord(c.name, None, lit),
+        span: ctorSpan
+      }
     ),
     span: ctorSpan
   });
@@ -189,7 +234,7 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
   const recDecl = TypeDecl {
     exported: c.exported,
     name: c.name,
-    typeParams: [],
+    typeParams: c.typeParams,
     body: DRecord(recFields),
     contracts: [],
     annotations: c.annotations,
@@ -210,10 +255,10 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
   items.push(IFunction(FunctionDecl {
     exported: false,
     name: Ident { name: c.name.name + ".constructor", span: c.name.span },
-    typeParams: [],
-    bounds: [],
+    typeParams: c.typeParams,
+    bounds: c.bounds,
     params: ctorParams,
-    ret: Some(selfType(c.name)),
+    ret: Some(selfTypeOf(c)),
     body: Block { stmts: cstmts, span: ctorBody.span },
     contracts: ctorClauses,
     annotations: [],
@@ -225,7 +270,32 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
   let seen: string[] = [];
   for (const m of methods) {
     if (m.typeParams.length > 0) {
-      diags.push(diag("E0408", m.typeParams[0].span, "generic methods are not supported yet (ADR-0009)"));
+      diags.push(diag(
+        "E0460", m.typeParams[0].span,
+        "generic methods are not supported in Orin 1.0 (ADR-0026); make the class generic or use a generic function"
+      ));
+    }
+    if (generic && m.isStatic) {
+      // A static method has no instance, hence no type arguments (as in TypeScript): its signature may
+      // not mention the class's type parameters.
+      let sigTypes: TypeExpr[] = [];
+      for (const p of m.params) {
+        sigTypes.push(p.ty);
+      }
+      match (m.ret) {
+        Some(rt) => { sigTypes.push(rt); },
+        None => {}
+      }
+      for (const st of sigTypes) {
+        const mp = mentionedParam(st, c.typeParams);
+        if (mp.isSome()) {
+          diags.push(diag(
+            "E0461", mp.unwrap().span,
+            "static method `" + m.name.name + "` cannot use the type parameter `" + mp.unwrap().name + "` of class `"
+              + c.name.name + "` (a static method has no type arguments); use an instance method or a generic function"
+          ));
+        }
+      }
     }
     if (fieldNamed(seen, m.name.name)) {
       diags.push(diag("E0304", m.name.span, "duplicate method `" + m.name.name + "` in class `" + c.name.name + "`"));
@@ -235,7 +305,7 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
     let stmts: Stmt[] = [];
     if (!m.isStatic) {
       const recv = Ident { name: "this$", span: m.name.span };
-      params.push(Param { name: recv, ty: selfType(c.name), span: m.name.span });
+      params.push(Param { name: recv, ty: selfTypeOf(c), span: m.name.span });
       stmts.push(Stmt {
         kind: SLet(true, thisId, None, Expr { kind: EIdent(recv), span: m.name.span }),
         span: m.name.span
@@ -250,8 +320,8 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
     items.push(IFunction(FunctionDecl {
       exported: false,
       name: Ident { name: c.name.name + "." + m.name.name, span: m.name.span },
-      typeParams: [],
-      bounds: [],
+      typeParams: m.isStatic ? noTps : c.typeParams,
+      bounds: m.isStatic ? noBounds : c.bounds,
       params: params,
       ret: m.ret,
       body: Block { stmts: stmts, span: m.body.span },
@@ -272,6 +342,8 @@ function lowerClass(ui: usize, c: ClassDecl): ClassOut {
   const info = ClassInfo {
     name: c.name.name,
     unit: ui,
+    gid: -1,
+    bounds: c.bounds,
     rec: 0,
     fields: accs,
     ctor: 0,
@@ -331,6 +403,8 @@ export function lowerClasses(prog: LoadedProgram): Lowered {
 
 // After collection: finds the record and function ids of every class and tags the method
 // functions with their class and mode (ADR-0009: mode 1 constructor, 2 method, 5 static).
+// Generic classes (ADR-0026): the record is a generic type (`gid`), the constructor and instance methods
+// are generic functions (their GenFunc entries carry the mode and class, instances inherit them).
 export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
   let env = env0;
   let out: ClassInfo[] = [];
@@ -342,6 +416,7 @@ export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
       Some(te) => {
         match (te) {
           EntRecord(r) => { c.rec = r; },
+          EntGen(g) => { c.gid = g.toInt(); },
           _ => {}
         }
       },
@@ -354,6 +429,11 @@ export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
             c.ctor = f;
             env.funcs[f].mode = 1;
             env.funcs[f].cls = ci;
+          },
+          VGFunc(f) => {
+            c.ctor = f;
+            env.gfuncs[f].mode = 1;
+            env.gfuncs[f].cls = ci;
           },
           _ => {}
         }
@@ -370,6 +450,11 @@ export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
               mi.fid = f;
               env.funcs[f].mode = m.isStatic ? 5 : 2;
               env.funcs[f].cls = ci;
+            },
+            VGFunc(f) => {
+              mi.fid = f;
+              env.gfuncs[f].mode = 2;
+              env.gfuncs[f].cls = ci;
             },
             _ => {}
           }
@@ -390,10 +475,35 @@ export function buildClassTables(env0: Env, infos: ClassInfo[]): Env {
 // Lookups used while checking bodies
 // ---------------------------------------------------------------------------
 
+// The class that record `r` belongs to: an ordinary class's record, or an instance of a generic class's
+// record (ADR-0026).
 export function classOfRec(env: Env, r: usize): Option<usize> {
   let i: usize = 0;
+  let anyGeneric = false;
   while (i < env.classes.length) {
-    if (env.classes[i].rec == r) {
+    if (env.classes[i].gid < 0) {
+      if (env.classes[i].rec == r) {
+        return Some(i);
+      }
+    } else {
+      anyGeneric = true;
+    }
+    i += 1;
+  }
+  if (anyGeneric) {
+    const o = originOf(env, TyRecord(r));
+    if (o.isSome() && o.unwrap().kind == 0) {
+      return classOfGeneric(env, o.unwrap().gid);
+    }
+  }
+  return None;
+}
+
+// The generic class whose record is generic type `g`.
+export function classOfGeneric(env: Env, g: usize): Option<usize> {
+  let i: usize = 0;
+  while (i < env.classes.length) {
+    if (env.classes[i].gid == g.toInt()) {
       return Some(i);
     }
     i += 1;
@@ -419,4 +529,81 @@ export function fieldIsPrivate(ci: ClassInfo, name: string): bool {
     }
   }
   return false;
+}
+
+// Does class record `r` declare `implements iface`? Also true for the opaque type of a parameter
+// bounded by `iface` (abstract check).
+export function recordImplements(env: Env, r: usize, iface: usize): bool {
+  const co = classOfRec(env, r);
+  if (co.isSome()) {
+    for (const i of env.classes[co.unwrap()].impls) {
+      if (i == iface) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const b = boundOf(env, r);
+  return b.isSome() && b.unwrap() == iface;
+}
+
+// Does a value of type `t` satisfy the bound / convert to interface `iface`?
+export function satisfies(env: Env, t: Type, iface: usize): bool {
+  return match (t) {
+    TyRecord(r) => recordImplements(env, r, iface),
+    TyIface(j) => j == iface,
+    _ => false
+  };
+}
+
+// The interface named by the bound of type parameter `k` of `decl` (None: unbounded).
+export function boundIface(env: Env, unit: usize, b: Ident): Result<usize, Diagnostic> {
+  const found = findType(env.units[unit].scope, b.name);
+  if (found.isNone()) {
+    return Err(diag("E0300", b.span, "unknown interface `" + b.name + "` in a type parameter bound"));
+  }
+  return match (found.unwrap()) {
+    EntIface(i) => Ok(i),
+    _ => Err(diag("E0400", b.span, "`" + b.name + "` is not an interface; only interfaces can bound a type parameter"))
+  };
+}
+
+// A type argument of a generic class (`Box<Foo>`) that does not satisfy the bound of its parameter (E0417).
+// Checked wherever the instance is created (ADR-0026).
+export function checkClassBounds(env: Env, ci: usize, args: Type[], span: Span): Option<Diagnostic> {
+  const c = env.classes[ci];
+  let k: usize = 0;
+  while (k < c.bounds.length && k < args.length) {
+    match (c.bounds[k]) {
+      Some(b) => {
+        match (boundIface(env, c.unit, b)) {
+          Ok(i) => {
+            if (!satisfies(env, args[k], i)) {
+              let why = "";
+              match (args[k]) {
+                TyRecord(r) => {
+                  const co = classOfRec(env, r);
+                  if (co.isSome()) {
+                    why = ": class `" + env.classes[co.unwrap()].name + "` does not declare `implements " + b.name + "`";
+                  }
+                },
+                _ => {}
+              }
+              return Some(diag(
+                "E0417", span,
+                "type `" + showType(env, args[k]) + "` does not satisfy the bound `" + env.gtypes[c.gid.toUsize()].decl.typeParams[k].name
+                  + " extends " + env.ifaces[i].name + "` of class `" + c.name + "`" + why
+              ));
+            }
+          },
+          Err(d) => {
+            return Some(d);
+          }
+        }
+      },
+      None => {}
+    }
+    k += 1;
+  }
+  return None;
 }

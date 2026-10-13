@@ -132,7 +132,8 @@ explaining path, added/removed edges, impact on entry points.
   `implements` it, whether or not that class is ever converted to the interface at that point.
 - **Closures:** calls inside a closure are attributed to the enclosing function as `MAY` edges (they run
   only if the closure is called).
-- **Generics:** calls inside a generic function are attributed to the generic declaration, once.
+- **Generics:** calls inside a generic function or a generic-class method are attributed to the generic declaration, once.
+  A generic class is one `Class` node (`sig` shows `class Stack<T>`); its instantiations are not symbols (ADR-0026).
 - **Not modelled yet:** std/built-in calls, FFI, field reads/writes, data flow, effects and capabilities,
   `std:` imports as edges. They arrive with phases 2 and 3 as additive schema versions.
 - **Renames are guesses.** Same-signature matching misses a rename with a signature change and can

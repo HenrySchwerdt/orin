@@ -123,6 +123,21 @@ def main():
         check(e and e["evidence"] == "MAY" and e["via"] == "impl", "MAY edge to the implementation %s.area" % impl)
     e = edge("CALLS", "demo:shapes::totalArea", "demo:shapes::Shape.area")
     check(e and e["evidence"] == "MUST", "call through a bounded type parameter reaches the interface method")
+    # generic classes (ADR-0026): one node per declaration, instantiations are not symbols
+    check(nodes.get("demo:util::Stack", {}).get("sig") == "class Stack<T>", "a generic class is one Class node with its type parameters")
+    check(nodes.get("demo:shapes::Bag", {}).get("sig") == "class Bag<T extends Shape>", "the bound is part of the class signature")
+    check(not any("<" in i and n["kind"] != "Unknown" for i, n in nodes.items() if "::" in i and "(" not in i),
+          "no node for an instantiation (Stack<int>, Stack<string>)")
+    check(nodes["demo:util::Stack.push"]["sig"] == "mut method push(x: T): void" and nodes["demo:util::Stack.size"]["sig"] == "method size(): usize",
+          "inferred mutability of generic-class methods in the signature")
+    e = edge("CALLS", "demo:(root)::main", "demo:util::Stack.push")
+    check(e and e["evidence"] == "MUST" and e["via"] == "method", "calls on both instantiations are one edge to the generic method")
+    check(edge("CALLS", "demo:(root)::main", "demo:util::Stack", "constructor") is not None, "new Stack<..>() is a constructor call of the class")
+    e = edge("CALLS", "demo:shapes::Bag.total", "demo:shapes::Shape.area")
+    check(e and e["evidence"] == "MUST" and e["via"] == "bound", "call on a bounded class type parameter reaches the interface method")
+    e = edge("CALLS", "demo:shapes::Bag.total", "demo:shapes::Circle.area")
+    check(e and e["evidence"] == "MAY" and e["via"] == "impl", "... and MAY edges to the implementations")
+    check(edge("REFERENCES_TYPE", "demo:shapes::Bag", "demo:shapes::Shape") is not None, "the bound is a type reference of the class")
     check(edge("IMPLEMENTS", "demo:shapes::Circle", "demo:shapes::Shape") is not None, "IMPLEMENTS edge")
     check(edge("IMPORTS", "demo:(root)", "demo:shapes") is not None, "IMPORTS edge between modules")
     check(edge("HAS_CONTRACT", "demo:ledger::Ledger.deposit", "demo:ledger::Ledger.deposit@requires#0") is not None,

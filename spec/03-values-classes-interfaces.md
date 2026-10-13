@@ -51,6 +51,11 @@ class Circle implements Shape, Named {            // conformance is declared, ne
 }
 ```
 
+- **Generic classes.** `class Box<T> { .. }`, `new Box<int>(1)` or `new Box(1)` (type arguments are inferred like those of
+  a generic function call), several parameters, nesting (`Box<Box<int>>`), bounds `class C<T extends I>` and
+  `implements` of a non-generic interface. A generic class is monomorphised per instantiation; the inferred
+  mutability of a method is the same for every instantiation. Generic methods and static methods that use the
+  class parameters are not part of 1.0 (E0460, E0461). See ADR-0026.
 - An interface lists **method signatures only**: no fields, no default methods, no inheritance between
   interfaces, no type parameters (E0408 for each).
 - `class C implements I` requires, for every method of `I`, a public instance method of `C` with identical

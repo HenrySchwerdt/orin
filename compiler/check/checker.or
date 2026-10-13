@@ -10,10 +10,11 @@ import { collect } from "./collect";
 import { resolveDecls, findMain } from "./decls";
 import { newFnCtx } from "./fnctx";
 import { checkBlock } from "./body";
-import { lowerClasses, buildClassTables } from "./classes";
+import { lowerClasses, buildClassTables, classOfGeneric } from "./classes";
+import { opaquesBounded, abstractInfo } from "./gclass";
 import { inferClasses } from "./classfix";
-import { scopeOf, mkOpaque, mkOpaqueBound, resolveSig, resolveType, instType } from "./types";
-import { resolveImpls, checkImpls, boundIface } from "./ifaces";
+import { scopeOf, resolveType, instType } from "./types";
+import { resolveImpls, checkImpls } from "./ifaces";
 import { checkFuncContracts, checkRecordContracts } from "./contracts";
 import { purityDiags } from "./purity";
 import { resourceDiags } from "./resources";
@@ -116,80 +117,32 @@ function appendAll(a: HExpr[], b: HExpr[]): HExpr[] {
   return out;
 }
 
-type Opaques = { env: Env; names: string[]; tys: Type[]; };
-
-// One opaque type per type parameter, appended to a scratch copy of the environment.
-function opaquesFor(env: Env, params: Ident[]): Opaques {
-  let e = env;
-  let names: string[] = [];
-  let tys: Type[] = [];
-  for (const p of params) {
-    const o = mkOpaque(e, p.name);
-    e = o.env;
-    names.push(p.name);
-    tys.push(o.ty);
-  }
-  return Opaques { env: e, names: names, tys: tys };
-}
-
-// Like `opaquesFor` for a generic function: a parameter with a bound (`T extends Shape`, ADR-0019)
-// gets an opaque type that carries the interface.
-function opaquesForFn(env: Env, unit: usize, decl: FunctionDecl): Result<Opaques, Diagnostic> {
-  let e = env;
-  let names: string[] = [];
-  let tys: Type[] = [];
-  let k: usize = 0;
-  while (k < decl.typeParams.length) {
-    const p = decl.typeParams[k];
-    let o = mkOpaque(e, p.name);
-    if (k < decl.bounds.length && decl.bounds[k].isSome()) {
-      const i = boundIface(e, unit, decl.bounds[k].unwrap())?;
-      o = mkOpaqueBound(e, p.name, i);
-    }
-    e = o.env;
-    names.push(p.name);
-    tys.push(o.ty);
-    k += 1;
-  }
-  return Ok(Opaques { env: e, names: names, tys: tys });
-}
-
-// Abstract check of a generic function: the body is checked once with opaque type parameters.
+// Abstract check of a generic function: the body is checked once with opaque type parameters. The
+// constructor and instance methods of a generic class (ADR-0026) are checked the same way, with the
+// class mode set (see gclass.or).
 function abstractFunc(env: Env, g: usize): Option<Diagnostic> {
-  const gf = env.gfuncs[g];
-  const opr = opaquesForFn(env, gf.unit, gf.decl);
-  if (opr.isErr()) {
-    return Some(opr.unwrapErr());
-  }
-  const op = opr.unwrap();
-  const sc = scopeOf(gf.unit, op.names, op.tys);
-  const sig = match (resolveSig(op.env, sc, gf.decl)) {
+  const ai = match (abstractInfo(env, g)) {
     Ok(x) => x,
     Err(d) => {
       return Some(d);
     }
   };
-  const f = FuncInfo {
-    unit: gf.unit,
-    qname: gf.qname,
-    decl: gf.decl,
-    params: sig.params,
-    paramLocals: sig.locals,
-    ret: sig.ret,
-    tpNames: op.names,
-    tpTys: op.tys,
-    depth: 0,
-    mode: 0,
-    cls: 0,
-    srcRet: TyVoid
-  };
-  return checkFunc(sig.env, f, true).err;
+  return checkFunc(ai.env, ai.f, true).err;
 }
 
 // Abstract check of a generic type declaration: its field / payload types must resolve.
 function abstractType(env: Env, g: usize): Option<Diagnostic> {
   const gt = env.gtypes[g];
-  const op = opaquesFor(env, gt.decl.typeParams);
+  let bounds: Option<Ident>[] = [];
+  const gc = classOfGeneric(env, g);
+  if (gc.isSome()) {
+    bounds = env.classes[gc.unwrap()].bounds;
+  }
+  const opr = opaquesBounded(env, gt.unit, gt.decl.typeParams, bounds);
+  if (opr.isErr()) {
+    return Some(opr.unwrapErr());
+  }
+  const op = opr.unwrap();
   match (gt.decl.body) {
     DAlias(target) => {
       match (resolveType(op.env, scopeOf(gt.unit, op.names, op.tys), target, false)) {
@@ -236,6 +189,19 @@ function ifaceDefs(env: Env): IfaceDef[] {
   return out;
 }
 
+// Qualified names of the inferred-mutating instance methods of every class (Program.mutating).
+function mutatingMethods(env: Env): string[] {
+  let out: string[] = [];
+  for (const c of env.classes) {
+    for (const m of c.methods) {
+      if (m.mutating) {
+        out.push(env.units[c.unit].name + "." + c.name + "." + m.name);
+      }
+    }
+  }
+  return out;
+}
+
 export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagnostic[]> {
   const sigs = testSignatureDiags(prog);
   if (sigs.length > 0) {
@@ -252,15 +218,17 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   }
   c.env.prelude = arrayPreludeUnit(lw.prog);
   c.env.mapUnit = preludeUnit(lw.prog, "$array/map");
-  const r = resolveDecls(buildClassTables(c.env, lw.classes), c.recordSrc, c.unionSrc);
-  if (r.diags.length > 0) {
-    return Err(dedupDiags(r.diags));
-  }
-  const im = resolveImpls(r.env);
+  // `implements` lists are resolved before the declarations: a bounded generic class (`Box<T extends I>`,
+  // ADR-0026) checks its type arguments against them while declarations are resolved.
+  const im = resolveImpls(buildClassTables(c.env, lw.classes));
   if (im.diags.length > 0) {
     return Err(dedupDiags(im.diags));
   }
-  let env = inferClasses(im.env);
+  const r = resolveDecls(im.env, c.recordSrc, c.unionSrc);
+  if (r.diags.length > 0) {
+    return Err(dedupDiags(r.diags));
+  }
+  let env = inferClasses(r.env);
   const cd = checkImpls(env);
   if (cd.length > 0) {
     return Err(dedupDiags(cd));
@@ -336,7 +304,7 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   const mainId = findMain(env).unwrapOr(0);
   return Ok(Program {
     records: env.records, unions: env.unions, functions: funcs, main: mainId, vtables: env.vtables, ifaces: ifaceDefs(env),
-    inlineFns: inlineFns
+    mutating: mutatingMethods(env), inlineFns: inlineFns
   });
 }
 

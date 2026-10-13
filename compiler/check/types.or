@@ -10,6 +10,7 @@ import { Span, Diagnostic, diag } from "../diag";
 import { Ident, TypeExpr, TNamed, TArray, TFn, TypeDeclBody, DAlias, DRecord, DUnion, FunctionDecl, FieldDecl, VariantDecl } from "../syntax";
 import { Type, FieldDef, RecordDef, UnionDef, VariantDef, Local } from "../hir";
 import { intNamed, is128, classSuffix } from "./ints";
+import { classOfGeneric, checkClassBounds } from "./classes";
 import { hasResource, resourceNested } from "./resources";
 import {
   Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, OpaqueBound, findType, findInst, originOf, isVoid,
@@ -316,6 +317,16 @@ export function instType(env: Env, g: usize, args: Type[], depth: usize, span: S
     const i = old.unwrap();
     return ok(env, isRec ? TyRecord(i.id) : TyUnion(i.id));
   }
+  if (isRec) {
+    // A generic class with bounded type parameters (ADR-0026): the arguments must satisfy them.
+    const gc = classOfGeneric(env, g);
+    if (gc.isSome()) {
+      match (checkClassBounds(env, gc.unwrap(), args, span)) {
+        Some(d) => { return Err(d); },
+        None => {}
+      }
+    }
+  }
   if (depth + 1 > MAX_DEPTH) {
     return Err(depthErr(span, "type `" + gt.decl.name.name + "`"));
   }
@@ -474,19 +485,39 @@ export function instFunc(env: Env, g: usize, args: Type[], depth: usize, span: S
   const sig = resolveSig(env, sc, gf.decl)?;
   let e = sig.env;
   const id = e.funcs.length;
+  const qname = gf.qname + "<" + tysKey(env, args) + ">";
+  // The constructor and instance methods of a generic class (ADR-0026) are lowered like those of an
+  // ordinary class (ADR-0009): mode 1 constructor, 2 non-mutating method, 3 mutating method returning
+  // the updated receiver, 4 mutating method with a result (a `$ret` record per instance).
+  let ret = sig.ret;
+  let srcRet: Type = TyVoid;
+  if (gf.mode != 0 && gf.mode != 1) {
+    srcRet = sig.ret;
+  }
+  if (gf.mode == 3) {
+    ret = sig.params[0];
+  } else if (gf.mode == 4) {
+    const rid = e.records.length;
+    const fields: FieldDef[] = [
+      FieldDef { name: "self", ty: sig.params[0] },
+      FieldDef { name: "value", ty: sig.ret }
+    ];
+    e.records.push(RecordDef { name: qname + "$ret", fields: fields });
+    ret = TyRecord(rid);
+  }
   e.funcs.push(FuncInfo {
     unit: gf.unit,
-    qname: gf.qname + "<" + tysKey(env, args) + ">",
+    qname: qname,
     decl: gf.decl,
     params: sig.params,
     paramLocals: sig.locals,
-    ret: sig.ret,
+    ret: ret,
     tpNames: names,
     tpTys: args,
     depth: depth,
-    mode: 0,
-    cls: 0,
-    srcRet: TyVoid
+    mode: gf.mode,
+    cls: gf.cls,
+    srcRet: srcRet
   });
   e.insts.push(Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
   return Ok(FuncOut { env: e, fid: id });

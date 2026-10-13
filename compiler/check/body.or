@@ -17,12 +17,12 @@ import {
   HPattern, Builtin, MutBuiltin, intKindOf, kindType, kindSigned, kindUnsigned64, i64Min
 } from "../hir";
 import {
-  Env, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isInt, isUsize, isSignedInt, isBool, isString, isVoid,
+  Env, ClassInfo, MethodInfo, ValEnt, Inst, FuncInfo, ConstLit, LitFloat, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isInt, isUsize, isSignedInt, isBool, isString, isVoid,
   isIntish, isFloatTy, isNumeric, isArrayTy, isFn, isIface, expIsUsize, showType, mismatch, globalVal, findType, findVal, originOf, typesEq,
   boundOf, ifaceMethodIndex
 } from "./env";
-import { checkBounds, internVtable, recordImplements } from "./ifaces";
-import { classOfRec, findMethod, fieldIsPrivate } from "./classes";
+import { checkBounds, internVtable } from "./ifaces";
+import { classOfRec, classOfGeneric, findMethod, fieldIsPrivate, recordImplements } from "./classes";
 import {
   FnCtx, newLocal, declare, declaredInScope, pushScope, popScope, lookupLocal, pushLoop, popLoop, markBreak,
   newClosureCtx, lookupVar, isVisibleVar, isCapturedLocal
@@ -35,7 +35,7 @@ import {
   intToStringOp
 } from "./ints";
 import {
-  TScope, resolveType, aliasType, instType, instFunc, unify, noBinds, mentionsUnbound, indexOfName, scopeOf
+  TScope, resolveType, resolveSig, aliasType, instType, instFunc, unify, noBinds, mentionsUnbound, indexOfName, scopeOf
 } from "./types";
 
 export type ExprOut = { fx: FnCtx; expr: HExpr; };
@@ -180,7 +180,11 @@ function toIface(r: ExprOut, span: Span, i: usize): Result<ExprOut, Diagnostic> 
               + "` (conformance is nominal)"
           ));
         }
-        const vo = internVtable(env, co.unwrap(), i);
+        if (env.classes[co.unwrap()].gid >= 0 && (r.fx.abs || r.fx.probe)) {
+          // instance of a generic class in an abstract check / probe: no instances are created (HIR discarded)
+          return done(r.fx, XIface(0, r.expr), TyIface(i), span);
+        }
+        const vo = internVtable(env, co.unwrap(), rec, i, r.fx.depth, span)?;
         return done(withEnv(r.fx, vo.env), XIface(vo.id, r.expr), TyIface(i), span);
       }
       if (recordImplements(env, rec, i)) {
@@ -661,10 +665,39 @@ function checkTry(env: Env, fx: FnCtx, span: Span, inner: Expr): Result<ExprOut,
           ));
         }
       }
+      if (o.fx.fmode == 4) {
+        return tryInMutating(o, span, t, et);
+      }
       return done(o.fx, XTry(o.expr), t, span);
     },
     _ => Err(diag("E0406", span, "`?` requires a `Result`, found `" + showType(o.fx.env, o.expr.ty) + "`"))
   };
+}
+
+// `x?` in a mutating method with a result (ADR-0009: the lowered function returns a `$ret` record
+// { self, value }): an early `Err` return must carry the receiver too, so the check is hoisted like a
+// mutating call, in front of the statement that contains the expression:
+//   const $t = x; if ($t.isErr()) { return $ret { self: this, value: Err($t.unwrapErr()) }; }  ... $t.unwrap()
+function tryInMutating(o: ExprOut, span: Span, t: Type, et: Type): Result<ExprOut, Diagnostic> {
+  let f = o.fx;
+  const nl = newLocal(f, "$t" + f.tmps.toString(), o.expr.ty, false);
+  f = nl.fx;
+  f.tmps += 1;
+  f.pre.push(HLet(nl.id, o.expr));
+  const tmp = mk(XLocal(nl.id), o.expr.ty, span);
+  const rid = match (f.lret) { TyRecord(x) => x, _ => 0 };
+  const errV = mk(XVariant(1, [mk(XBuiltin(BResUnwrapErr, [tmp]), et, span)]), f.ret, span);
+  const wrapped = mk(
+    XRecord(rid, None, [FieldInitH { index: 0, value: thisRead(f, span) }, FieldInitH { index: 1, value: errV }]),
+    f.lret,
+    span
+  );
+  const isErr = mk(XBuiltin(BResIsErr, [tmp]), TyBool, span);
+  f.pre.push(HIf(isErr, HBlock { stmts: [HReturn(Some(wrapped))] }, None));
+  if (isVoid(t)) {
+    return Ok(ExprOut { fx: f, expr: nopExpr(span) });
+  }
+  return done(f, XBuiltin(BResUnwrap, [tmp]), t, span);
 }
 
 function checkCond(
@@ -833,6 +866,14 @@ function checkRecord(
   let t: Type = TyVoid;
   match (found.unwrap()) {
     EntGen(g) => {
+      const gco = classOfGeneric(env, g);
+      if (gco.isSome() && !inClass(fx, gco.unwrap())) {
+        return Err(diag(
+          "E0408",
+          name.span,
+          "class `" + name.name + "` cannot be built with a record literal outside its own body; use `new " + name.name + "(..)`"
+        ));
+      }
       return checkGenericRecord(env, fx, span, g, name, targs, spread, fields, exp);
     },
     EntRecord(r) => { t = TyRecord(r); },
@@ -1490,13 +1531,21 @@ function callGeneric(
   env: Env, fx: FnCtx, span: Span, g: usize, id: Ident, explicit: Option<TypeExpr[]>, args: Expr[],
   exp: Option<Type>
 ): Result<ExprOut, Diagnostic> {
+  return callGenericW(env, fx, span, g, "function `" + id.name + "`", explicit, args, exp);
+}
+
+// `what` names the callee in diagnostics ("function `f`", "constructor of `Box`").
+function callGenericW(
+  env: Env, fx: FnCtx, span: Span, g: usize, what: string, explicit: Option<TypeExpr[]>, args: Expr[],
+  exp: Option<Type>
+): Result<ExprOut, Diagnostic> {
   const gf = env.gfuncs[g];
   let ptes: TypeExpr[] = [];
   for (const p of gf.decl.params) {
     ptes.push(p.ty);
   }
   const io = infer(
-    env, fx, span, "function `" + id.name + "`", gf.unit, gf.decl.typeParams, ptes, gf.decl.ret, args, exp, explicit
+    env, fx, span, what, gf.unit, gf.decl.typeParams, ptes, gf.decl.ret, args, exp, explicit
   )?;
   let cur = io.fx;
   let ret: Type = TyVoid;
@@ -1580,6 +1629,12 @@ function callMember(
           match (te.unwrap()) {
             EntRecord(r) => {
               const co = classOfRec(fx.env, r);
+              if (co.isSome()) {
+                return staticCall(env, fx, span, co.unwrap(), name, args);
+              }
+            },
+            EntGen(g) => {
+              const co = classOfGeneric(fx.env, g);
               if (co.isSome()) {
                 return staticCall(env, fx, span, co.unwrap(), name, args);
               }
@@ -2518,21 +2573,31 @@ function checkNew(
   if (name.name == "Map" && findType(env.units[fx.unit].scope, "Map").isNone() && env.mapUnit >= 0) {
     return newMap(env, fx, span, targs, args, exp);
   }
-  if (targs.length > 0) {
-    return Err(diag("E0408", name.span, "generic classes are not supported yet (ADR-0009)"));
-  }
   const found = findType(env.units[fx.unit].scope, name.name);
   if (found.isNone()) {
     return Err(diag("E0300", name.span, "unknown class `" + name.name + "`"));
   }
   const co = match (found.unwrap()) {
     EntRecord(r) => classOfRec(fx.env, r),
+    EntGen(g) => classOfGeneric(fx.env, g),
     _ => None
   };
   if (co.isNone()) {
     return Err(diag("E0400", name.span, "`" + name.name + "` is not a class"));
   }
   const ci = fx.env.classes[co.unwrap()];
+  if (ci.gid >= 0) {
+    // Generic class (ADR-0026): the constructor is a generic function; the type arguments come from the
+    // explicit list, the expected type or the arguments, exactly as for a generic function call.
+    let explicit: Option<TypeExpr[]> = None;
+    if (targs.length > 0) {
+      explicit = Some(targs);
+    }
+    return callGenericW(env, fx, span, ci.ctor, "constructor of `" + name.name + "`", explicit, args, exp);
+  }
+  if (targs.length > 0) {
+    return Err(diag("E0400", name.span, "class `" + name.name + "` is not generic and takes no type arguments"));
+  }
   const f = fx.env.funcs[ci.ctor];
   const a = argsExpect(env, fx, span, "constructor of `" + name.name + "`", args, f.params)?;
   return done(a.fx, XCall(ci.ctor, a.args), TyRecord(ci.rec), span);
@@ -2630,14 +2695,14 @@ function classMethodCall(
   if (mi.isStatic) {
     return Err(diag("E0405", name.span, "`" + name.name + "` is a static method; call it as `" + ci.name + "." + name.name + "(..)`"));
   }
-  const f = fx0.env.funcs[mi.fid];
-  const a = argsExpect(env, fx0, span, "method `" + name.name + "`", args, tailTypes(f.params))?;
+  const ms = methodSigOf(fx0, ci, mi, b.expr.ty, span)?;
+  const a = argsExpect(env, ms.fx, span, "method `" + name.name + "`", args, tailTypes(ms.params))?;
   let all: HExpr[] = [b.expr];
   for (const x of a.args) {
     all.push(x);
   }
   if (!mi.mutating) {
-    return done(a.fx, XCall(mi.fid, all), f.srcRet, span);
+    return done(a.fx, XCall(ms.fid, all), ms.srcRet, span);
   }
   if (!isPlaceShaped(a.fx, base)) {
     return Err(diag(
@@ -2657,7 +2722,7 @@ function classMethodCall(
   let fx = markMut(pi.fx, pi.place);
   if (fx.probe) {
     if (mi.hasRet) {
-      return done(fx, XCall(mi.fid, noExprs()), f.srcRet, span);
+      return done(fx, XCall(ms.fid, noExprs()), ms.srcRet, span);
     }
     return Ok(ExprOut { fx: fx, expr: nopExpr(span) });
   }
@@ -2668,20 +2733,56 @@ function classMethodCall(
       "the receiver of mutating method `" + name.name + "` must not contain index expressions with side effects"
     ));
   }
-  const call = mk(XCall(mi.fid, all), f.ret, span);
+  const call = mk(XCall(ms.fid, all), ms.ret, span);
   if (!mi.hasRet) {
     fx.pre.push(HAssign(pi.place, None, call));
     return Ok(ExprOut { fx: fx, expr: nopExpr(span) });
   }
   const tmpName = "$r" + fx.tmps.toString();
   fx.tmps += 1;
-  const nl = newLocal(fx, tmpName, f.ret, false);
+  const nl = newLocal(fx, tmpName, ms.ret, false);
   fx = nl.fx;
-  const tmp = mk(XLocal(nl.id), f.ret, span);
+  const tmp = mk(XLocal(nl.id), ms.ret, span);
   fx.pre.push(HLet(nl.id, call));
-  const selfTy = TyRecord(ci.rec);
-  fx.pre.push(HAssign(pi.place, None, mk(XField(tmp, mi.retRec, 0), selfTy, span)));
-  return done(fx, XField(tmp, mi.retRec, 1), f.srcRet, span);
+  const selfTy = b.expr.ty;
+  fx.pre.push(HAssign(pi.place, None, mk(XField(tmp, ms.retRec, 0), selfTy, span)));
+  return done(fx, XField(tmp, ms.retRec, 1), ms.srcRet, span);
+}
+
+type MethSig = { fx: FnCtx; fid: usize; params: Type[]; ret: Type; srcRet: Type; retRec: usize; };
+
+// The signature of method `mi` of class `ci` for a receiver of type `recv`. An ordinary class has one
+// function per method. A generic class (ADR-0026) has a generic function per method: the signature
+// is the one under the receiver's type arguments, and outside abstract checks and mutation probes the
+// instance is created (`instFunc`) and called. Abstract checks / probes never create instances.
+function methodSigOf(fx: FnCtx, ci: ClassInfo, mi: MethodInfo, recv: Type, span: Span): Result<MethSig, Diagnostic> {
+  if (ci.gid < 0 || mi.isStatic) {
+    const f = fx.env.funcs[mi.fid];
+    return Ok(MethSig { fx: fx, fid: mi.fid, params: f.params, ret: f.ret, srcRet: f.srcRet, retRec: mi.retRec });
+  }
+  const o = originOf(fx.env, recv);
+  const args = match (o) {
+    Some(i) => i.args,
+    None => {
+      return Err(diag("E0400", span, "`" + showType(fx.env, recv) + "` is not an instance of class `" + ci.name + "`"));
+    }
+  };
+  const gf = fx.env.gfuncs[mi.fid];
+  if (fx.abs || fx.probe) {
+    const sc = TScope { unit: gf.unit, names: paramNameList(gf.decl.typeParams), tys: args, depth: 0 };
+    const sig = resolveSig(fx.env, sc, gf.decl)?;
+    return Ok(MethSig { fx: withEnv(fx, sig.env), fid: 0, params: sig.params, ret: sig.ret, srcRet: sig.ret, retRec: 0 });
+  }
+  const fo = instFunc(fx.env, mi.fid, args, fx.depth + 1, span)?;
+  const f = fo.env.funcs[fo.fid];
+  let rr: usize = 0;
+  if (f.mode == 4) {
+    rr = match (f.ret) {
+      TyRecord(r) => r,
+      _ => 0
+    };
+  }
+  return Ok(MethSig { fx: withEnv(fx, fo.env), fid: fo.fid, params: f.params, ret: f.ret, srcRet: f.srcRet, retRec: rr });
 }
 
 // ---------------------------------------------------------------------------

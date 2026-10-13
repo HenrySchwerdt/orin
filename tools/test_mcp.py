@@ -117,6 +117,29 @@ export interface Gauge {
 }
 """
 
+GEN = """import { Gauge, Counter } from "./lib";
+
+export class Cell<T extends Gauge> {
+  items: T[] = [];
+  add(x: T): void {
+    this.items.push(x);
+  }
+  total(): int {
+    let t = 0;
+    for (const i of this.items) {
+      t += i.peek();
+    }
+    return t;
+  }
+}
+
+function main(): void {
+  let c = new Cell<Counter>();
+  c.add(new Counter());
+  console.log(c.total().toString());
+}
+"""
+
 BAD = """function f(): void {
   const a: int = "x";
 }
@@ -147,6 +170,7 @@ def main():
     write(os.path.join(proj, "main.or"), MAIN)
     write(os.path.join(proj, "lib.or"), LIB)
     write(os.path.join(proj, "bad.or"), BAD)
+    write(os.path.join(proj, "gen.or"), GEN)
     outside = os.path.join(tmp, "outside.or")
     write(outside, "function main(): void {}\n")
 
@@ -239,6 +263,14 @@ def main():
           "interface method (%s)" % raw)
     err, v, raw = c.call("inspect", {"symbol": "Counter", "entry": "main.or"})
     check(not err and v["kind"] == "class" and v["implements"] == ["Gauge"], "class lists the interfaces it implements (%s)" % raw)
+    # generic classes (ADR-0026): the class is one symbol; its methods carry the inferred mutability
+    err, v, raw = c.call("inspect", {"symbol": "Cell", "entry": "gen.or"})
+    check(not err and v["kind"] == "class" and v["sig"].startswith("class Cell<T extends Gauge>"), "generic class signature (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "Cell.add", "entry": "gen.or"})
+    check(not err and v["kind"] == "method" and v["mutates"] is True and v["sig"] == "mut method add(x: T): void",
+          "generic class: mutating method (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "Cell.total", "entry": "gen.or"})
+    check(not err and v["mutates"] is False, "generic class: non-mutating method (%s)" % raw)
     err, v, raw = c.call("inspect", {"symbol": "Nope", "entry": "main.or"})
     check(err and "not found" in raw, "unknown symbol")
     err, v, raw = c.call("inspect", {"module": "lib.or", "entry": "main.or"})

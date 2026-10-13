@@ -10,10 +10,12 @@
 // receiver (mode 3); `m(args): R` returns a generated record `C.m$ret { self: C; value: R; }` (mode 4).
 // The inferred flag is kept in `Env.classes[c].methods[k].mutating`.
 
+import { TypeExpr, TNamed } from "../syntax";
 import { Type, FieldDef, RecordDef } from "../hir";
 import { Env, isVoid } from "./env";
 import { newFnCtx } from "./fnctx";
 import { checkBlock } from "./body";
+import { abstractInfo } from "./gclass";
 
 // Does the body of method `fid` mutate its `this`?
 function mutatesThis(env: Env, fid: usize): bool {
@@ -27,17 +29,54 @@ function mutatesThis(env: Env, fid: usize): bool {
   };
 }
 
+// Generic classes (ADR-0026): the instance methods are generic functions (`fid` indexes Env.gfuncs). The
+// mutation of `this` cannot depend on the type arguments (a type parameter supports no operation but the
+// non-mutating methods of its bound), so it is inferred once, on the abstract body with opaque type
+// parameters, and every instance inherits the answer: the inferred mutability is the same for every
+// instantiation. Calls of other generic-class methods are analysed without creating instances.
+function mutatesThisGeneric(env: Env, g: usize): bool {
+  const ai = abstractInfo(env, g);
+  if (ai.isErr()) {
+    return false;
+  }
+  const a = ai.unwrap();
+  let fx = newFnCtx(a.f, a.env, true);
+  fx.probe = true;
+  const r = checkBlock(a.env, fx, a.f.decl.body);
+  return match (r) {
+    Ok(b) => b.fx.mutThis,
+    Err(_) => false
+  };
+}
+
+function declIsVoid(ret: Option<TypeExpr>): bool {
+  return match (ret) {
+    None => true,
+    Some(t) => match (t.kind) {
+      TNamed(id, _) => id.name == "void",
+      _ => false
+    }
+  };
+}
+
 export function inferClasses(env0: Env): Env {
   let env = env0;
   // Source-level signatures (the declared return types), before any lowering.
   let ci: usize = 0;
   while (ci < env.classes.length) {
-    env.funcs[env.classes[ci].ctor].srcRet = TyVoid;
+    const generic = env.classes[ci].gid >= 0;
+    if (!generic) {
+      env.funcs[env.classes[ci].ctor].srcRet = TyVoid;
+    }
     let k: usize = 0;
     while (k < env.classes[ci].methods.length) {
       const fid = env.classes[ci].methods[k].fid;
-      env.funcs[fid].srcRet = env.funcs[fid].ret;
-      env.classes[ci].methods[k].hasRet = !isVoid(env.funcs[fid].ret);
+      if (generic && !env.classes[ci].methods[k].isStatic) {
+        env.classes[ci].methods[k].hasRet = !declIsVoid(env.gfuncs[fid].decl.ret);
+      } else {
+        env.funcs[fid].srcRet = env.funcs[fid].ret;
+        env.classes[ci].methods[k].hasRet = !isVoid(env.funcs[fid].ret);
+      }
       k += 1;
     }
     ci += 1;
@@ -52,7 +91,8 @@ export function inferClasses(env0: Env): Env {
       while (k < env.classes[ci].methods.length) {
         const m = env.classes[ci].methods[k];
         if (!m.isStatic && !m.mutating) {
-          if (mutatesThis(env, m.fid)) {
+          const mut = env.classes[ci].gid >= 0 ? mutatesThisGeneric(env, m.fid) : mutatesThis(env, m.fid);
+          if (mut) {
             env.classes[ci].methods[k].mutating = true;
             changed = true;
           }
@@ -69,7 +109,10 @@ export function inferClasses(env0: Env): Env {
     let k: usize = 0;
     while (k < env.classes[ci].methods.length) {
       const m = env.classes[ci].methods[k];
-      if (m.mutating) {
+      if (m.mutating && env.classes[ci].gid >= 0) {
+        // the lowered signature is made per instance (types.or `instFunc`) from the mode
+        env.gfuncs[m.fid].mode = m.hasRet ? 4 : 3;
+      } else if (m.mutating) {
         if (m.hasRet) {
           const rid = env.records.length;
           const fields: FieldDef[] = [
