@@ -1,7 +1,8 @@
 #!/bin/sh
 # L0 platform layer checks (spec 19 R2, docs/formal.md "L0 platform layer"):
-#   1. executable contract tests (platform/tests/platform_test.c), plain and under ASan+UBSan
-#   2. size budget (<= 1,000 code lines in platform/*.c, platform/*.h; contracts and comments excluded) and the runtime boundary check
+#   1. executable contract tests (platform/tests/platform_test.c), plain, under ASan+UBSan and under ThreadSanitizer
+#   2. size budget (<= 1,000 CODE lines in platform/*.c, platform/*.h: comments, contract blocks and blank lines do not
+#      count, ADR-0030 / ADR-0017 stage 0) and the runtime boundary check
 #   3. bounded model checking of the pure/memory primitives with CBMC (platform/tests/cbmc_harness.c);
 #      skipped with a notice when `cbmc` is not installed (apt install cbmc);
 #      REQUIRE_CBMC=1 turns the skip into a failure
@@ -17,6 +18,10 @@ $B/platform_test < /dev/null
 $CC -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
     platform/tests/platform_test.c platform/orin_platform.c -o $B/platform_test_asan
 ASAN_OPTIONS=allocator_may_return_null=1 $B/platform_test_asan < /dev/null 2>/dev/null
+# the thread and monitor primitives (ADR-0017) are tested only: ThreadSanitizer is the evidence that they are race free
+echo "[platform] ThreadSanitizer"
+$CC -Wall -Wextra -g -fsanitize=thread platform/tests/platform_test.c platform/orin_platform.c -o $B/platform_test_tsan
+TSAN_OPTIONS=allocator_may_return_null=1 $B/platform_test_tsan < /dev/null
 
 echo "[platform] size budget"
 # Budget: <= 1,000 CODE lines (non-blank, comments and ACSL contracts excluded) in platform/*.c, platform/*.h.
