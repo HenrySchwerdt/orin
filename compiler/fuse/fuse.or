@@ -1786,16 +1786,8 @@ function findRecord(records: RecordDef[], name: string): Option<usize> {
   return None;
 }
 
-// The closure literals passed to array-API or parallel operations anywhere in the program (the roots of the purity
-// analysis).
-function closureRoots(funcs: Function[]): usize[] {
-  let out: usize[] = [];
-  for (const f of funcs) {
-    out = rootsBlock(funcs, f.body, out);
-  }
-  return out;
-}
-
+// The closure literals passed to array-API or parallel operations in a block (the roots of the purity analysis); a call
+// whose function argument is not a literal adds `funcs.length` (so that the function is still visited).
 function rootsBlock(funcs: Function[], b: HBlock, out0: usize[]): usize[] {
   let out = out0;
   for (const s of b.stmts) {
@@ -1863,7 +1855,9 @@ function rootsExpr(funcs: Function[], e: HExpr, out0: usize[]): usize[] {
             XClosure(c, _) => {
               out.push(c);
             },
-            _ => {},
+            _ => {
+              out.push(funcs.length);
+            },
           }
         }
       }
@@ -1964,7 +1958,16 @@ export function fuseProgram(p: Program): FuseOut {
   if (!hasOps(p.functions)) {
     return FuseOut { program: p, chains: none };
   }
-  const roots = closureRoots(p.functions);
+  // one scan: the closure literals of every operation call (the purity roots; `functions.length` marks a call without
+  // one) and which functions have such a call at all (only those are rewritten)
+  let roots: usize[] = [];
+  let has: bool[] = [];
+  for (const f of p.functions) {
+    const noRoots: usize[] = [];
+    const rs = rootsBlock(p.functions, f.body, noRoots);
+    has.push(rs.length > 0 && !f.name.startsWith("$array/"));
+    roots = roots.concat(rs);
+  }
   if (roots.length == 0) {
     return FuseOut { program: p, chains: none };
   }
@@ -1987,19 +1990,23 @@ export function fuseProgram(p: Program): FuseOut {
     }
   }
   let fz = new Fuser(p.functions, p.records, pur, par);
-  const n = p.functions.length;
+  // the rewritten functions are collected apart: writing them into `fz.funcs` while `fz` is in use copied the table
+  let out: Function[] = [];
   let fi: usize = 0;
-  while (fi < n) {
-    if (!p.functions[fi].name.startsWith("$array/")) {
-      fz.funcs[fi] = fz.rewrite(fi);
+  while (fi < p.functions.length) {
+    if (has[fi]) {
+      out.push(fz.rewrite(fi));
+    } else {
+      out.push(p.functions[fi]);
     }
     fi += 1;
   }
+  out = out.concat(fz.funcs.slice(p.functions.length, fz.funcs.length));
   return FuseOut {
     program: Program {
       records: fz.records,
       unions: p.unions,
-      functions: fz.funcs,
+      functions: out,
       main: p.main,
       vtables: p.vtables,
       ifaces: p.ifaces,
