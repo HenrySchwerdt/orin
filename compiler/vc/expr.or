@@ -51,7 +51,20 @@ function oblChk(kind: string, what: string, line: usize, clause: string, goal: s
 
 // ---------------------------------------------------------------------------------------------- entry
 
+// An expression's term can be copied several times by the term built around it (an ite repeats its operands, a
+// bounds goal repeats the index). Left alone, a deep expression grows exponentially, so a term that has become
+// large is named: a fresh constant equal to it (outside quantifier bodies, where the term may mention the bound
+// variable; there the SMT let of the string operations keeps the sharing).
 export function tr(g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT): Result<TR, string> {
+  const r = trCore(g, vars, cx, e, exp)?;
+  if (r.t.length > 1500 && !cx.inQ && !isUnit(r.vt)) {
+    const f = fresh(r.g, cx, r.vt, r.t)?;
+    return mk(f.g, f.name, r.vt, r.chks);
+  }
+  return Ok(r);
+}
+
+function trCore(g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT): Result<TR, string> {
   return match (e.kind) {
     EInt(n) => mk(g, lit(n), isIntTy(exp) ? exp : VInt("?"), noChks()),
     EBigInt(n) => mk(g, "(+ 18446744073709551616 " + lit(n) + ")", isIntTy(exp) ? exp : VInt("?"), noChks()),
@@ -152,6 +165,9 @@ function trVariant(g0: Gen, vars: Var[], cx: Cx, uni: string, vname: string, arg
     return Err("unknown union `" + uni + "`");
   }
   const t = VUni(uni);
+  if (cx.p.tab.isCyclic("u:" + uni)) {
+    return Err("the variants of the recursive union `" + uni + "` are not modelled");
+  }
   const so = sortS(g, cx, t)?;
   g = so.g;
   for (const v of u.unwrap().variants) {
@@ -345,8 +361,8 @@ function trConcat(g0: Gen, cx: Cx, a: string, b: string, chks: Chk[]): Result<TR
     g.registerFun("cid");
     g.declare("(declare-fun cid (Int Int) Int)");
   }
-  const len = "(+ (slen " + a + ") (slen " + b + "))";
-  return mk(g, "(mkStr " + len + " (ite (= " + len + " 0) 0 (cid (sid " + a + ") (sid " + b + "))))", VStr, chks);
+  const len = "(+ (slen sa) (slen sb))";
+  return mk(g, "(let ((sa " + a + ") (sb " + b + ")) (mkStr " + len + " (ite (= " + len + " 0) 0 (cid (sid sa) (sid sb)))))", VStr, chks);
 }
 
 function trTemplate(g0: Gen, vars: Var[], cx: Cx, parts: string[], xs: Expr[]): Result<TR, string> {
@@ -1460,6 +1476,14 @@ export type MatchPat = { g: Gen; test: string; binds: Var[]; };
 export function matchPattern(g0: Gen, cx: Cx, s: TR, sn: string, p: Pattern): Result<MatchPat, string> {
   let g = g0;
   let binds: Var[] = [];
+  match (s.vt) {
+    VUni(un) => {
+      if (cx.p.tab.isCyclic("u:" + un)) {
+        return Err("`match` on the recursive union `" + un + "` is not modelled");
+      }
+    },
+    _ => {}
+  }
   return match (p.kind) {
     PWildcard => Ok(MatchPat { g: g, test: "true", binds: binds }),
     PBool(b) => Ok(MatchPat { g: g, test: b ? s.t : "(not " + s.t + ")", binds: binds }),
