@@ -18,7 +18,9 @@ import {
   resolveModulePath, referencesOfDef, definitionAt, renameEdits, defIdsDense, isOccurrence,
   spansDistinct, symbolAt,
 } from "../analysis";
-import { LspServer, repliesTo, answers, isRequest } from "../lsp";
+import {
+  LspServer, repliesTo, answers, isRequest, frameMessage, unframe, pathToUri, uriToPath,
+} from "../lsp";
 import { McpSession, Snap, MAX_SNAPS, revsOrdered, handle, handleText } from "../mcp";
 import { format, sameComments, Layout, commentsOrdered, allPlaced, stripMarkers } from "../fmt";
 import { scanComments } from "../syntax";
@@ -60,6 +62,7 @@ function jsonRoundTripsEveryValue(): void {
     "i64::MIN",
   );
   assert(parseJson("9223372036854775808").isErr(), "one past i64::MAX");
+  assert(parseJson("12345678901234567890").isErr() && parseJson("-99999999999999999999").isErr(), "20 places");
 }
 
 @Test
@@ -202,7 +205,7 @@ function workspaceKeepsOneBufferPerPath(): void {
   assertEqString(ws.paths().join(","), "/p/a.or,/p/b.or", "normalized keys, open order");
   assertEqString(ws.text("/p/a.or").unwrapOr(""), "three", "replaced");
   assertEq(ws.revision(), 3, "every change counts");
-  ws.close("/p/b.or");
+  ws.close("/p/x/../b.or"); // another spelling of an open path closes it
   ws.close("/p/never.or");
   assertEq(ws.revision(), 5, "close counts, also of a path that is not open");
   assert(!ws.has("/p/b.or") && ws.has("/p/a.or"), "closed");
@@ -300,6 +303,12 @@ function referencesPointAtExistingDefinitions(): void {
   assertEqUsize(referencesOfDef(idx, 7, true).length, 0, "a dangling id has no references");
   assert(symbolAt(idx, 0, 80).isNone(), "a ref to a missing definition is ignored");
   assertEqUsize(definitionAt(idx, 0, 65).unwrap().start, 9, "the call goes to the declaration");
+  assertEq(
+    symbolAt(idx, 0, 13).unwrap().toInt(),
+    1,
+    "on a declaration: that definition (not the first one)",
+  );
+  assertEqUsize(definitionAt(idx, 0, 13).unwrap().start, 13, "the parameter's own name");
   const edits = renameEdits(idx, 0, 35, "b").unwrap();
   assertEqUsize(edits.length, 2, "rename edits the parameter and its use");
   assert(renameEdits(idx, 0, 35, "1b").isErr(), "not an identifier");
@@ -370,6 +379,29 @@ function replyRulePredicates(): void {
 }
 
 // ---- MCP session ------------------------------------------------------------------------------------------------------
+
+@Test
+function framesAndUrisReadBack(host: Host): void {
+  const body = "{\"k\":\"é\"}";
+  const u = unframe(frameMessage(body) + "Content-Le").unwrap();
+  assertEqUsize(u.messages.length, 1, "one message");
+  assertEqString(u.messages[0], body, "the body, counted in bytes");
+  assertEqString(u.rest, "Content-Le", "the incomplete tail");
+  const p = "/a b/100%41/é.or";
+  assertEqString(
+    uriToPath(pathToUri(p)).unwrapOr("?"),
+    p,
+    "a path with `%`, a space and UTF-8 reads back",
+  );
+  useFs(
+    host,
+    fs => {
+      let s = new LspServer();
+      const r = s.pump(fs, frameMessage(req("1", "initialize", "{}"))).unwrap();
+      assert(r.output.startsWith("Content-Length: ") && r.rest == "", "framed reply");
+    },
+  );
+}
 
 @Test
 function mcpSessionRevisions(): void {
