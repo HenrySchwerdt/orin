@@ -131,6 +131,37 @@ proof.
   (HTTP + JSON) and an allocation-heavy workload.
 - Each step is measured before and after. Expectations stay estimates until measured.
 
+### 8. Backends: C as the base, LLVM for release (project owner, 2026-10-14)
+
+- **The C backend stays the base:**
+  - it is the seed bootstrap and the fixed point `stage2.c == stage3.c`;
+  - it is the trust chain of ADR-0032: CompCert and diverse double compiling need C;
+  - it is what the sanitizers, CBMC and valgrind work with;
+  - it is the fallback on any machine without LLVM.
+- **LLVM becomes the default for `orin build --release`** once all three gates hold:
+  1. **Performance:** the benchmark action (`.github/workflows/bench.yml`) shows the LLVM backend at least on
+     par with the C backend on every benchmark, judged by instruction counts. Known outliers such as `fib`
+     (about 0.89 s LLVM against 0.54 s C, measured under load) are root-caused and fixed first. The
+     suspect is how checked arithmetic is lowered.
+  2. **Fixed point:** the LLVM backend also reproduces itself, `stage2.ll == stage3.ll`, in CI.
+  3. **Toolchain:** a pinned LLVM version is used, as described below.
+- **Toolchain: pinned, not bundled into the compiler.**
+  - Orin keeps emitting textual LLVM IR, but only for **one pinned LLVM version**. The pin is recorded in the
+    repository and checked in CI.
+  - `orin toolchain install` downloads the matching `clang`/`llc` into `~/.orin/toolchains/llvm-<version>`,
+    verified by checksum. The release packages may also include it.
+  - `orin doctor` reports the installed version and whether it matches.
+  - Without a matching LLVM, `--release` falls back to the C backend and says so.
+  - Rust links LLVM in-process through its C++ API. Orin does not, because that would need an FFI from
+    Orin to the LLVM C API, add more than 100 MB to the package, and put all of LLVM into the trusted
+    base of the self-hosted compiler. It is reconsidered only if parsing the textual IR becomes a measured
+    bottleneck of build time.
+- **Why LLVM for release:** the fact-driven code generation of §5 (`noalias`, `nonnull`, `range`,
+  `llvm.assume`, `!invariant.load`, TBAA) is expressed directly in LLVM IR. In C it is only approximated by
+  `restrict` and `__builtin_assume`. Most gains from proved invariants therefore land in the LLVM backend.
+- **Later, after 1.0:** a fast non-optimising backend for debug builds, in the spirit of Cranelift or Go's
+  compiler, if build times call for it.
+
 ## Order
 
 1. **Now:**
@@ -138,7 +169,10 @@ proof.
    - `nounwind`, `nonnull`/`noundef`, TBAA and purity attributes;
    - the defects being fixed now (`s = s + t`, result pairs, bulk byte conversion);
    - closure inlining and fusion of array API chains (§2);
-   - Java and Rust in the benchmarks.
+   - Java and Rust in the benchmarks;
+   - the LLVM backend: root-cause the outliers against the C backend (§8, gate 1), the LLVM
+     fixed point (gate 2), and the pinned toolchain with `orin toolchain install` (gate 3).
+     Then LLVM becomes the release default.
 2. **With the verifier results (ADR-0036):** `nsw`/`nuw`, `range` and `llvm.assume` from
    `VERIFIED` facts; check removal and hoisting; the performance lint.
 3. **With the lowering rewrite and R3:** borrow inference, immortals, stack allocation,
