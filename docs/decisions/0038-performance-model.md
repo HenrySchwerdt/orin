@@ -64,6 +64,41 @@ the lever that unlocks the fastest one.
   sound; the differential tests and translation validation (ADR-0032) cover it. Baseline before this step:
   `filter → map → reduce` over 5 M ints is about 4x slower than the equivalent loop.
 
+  **Implementation status (closure inlining and fusion, 2026-10-14): done** in `compiler/fuse`, a HIR → HIR pass between
+  the checker and the lowering, run by the optimising pipeline of both backends (`--no-opt` and `--no-fuse` skip it).
+  - *Fused:* any number of `map` / `filter` stages ended by `map`, `filter`, `reduce`, `some`, `every`, `find`,
+    `findIndex`, `forEach`, `includes` or `indexOf`, when every function is an arrow function or a named function at the
+    call and pure (`check/purity.or`). One loop, no intermediate arrays, no closure objects: a body of `let`s and one
+    `return` is inlined with its parameters bound to the element, any other body is called directly with its environment
+    record built once. Early exit for `some` / `every` / `find` / `findIndex` / `includes` / `indexOf`; a `map` that ends a
+    chain without a `filter` allocates its result with the exact capacity (task primitive 24, `orin_array_new`).
+  - *Not fused (the prelude call stays, the rest of the chain is fused around it):* a function value that is not a
+    literal, an impure closure, a value argument (`reduce`'s initial value, the needle of `includes` / `indexOf`) that is
+    not a simple expression, a result bound to a variable (used twice or not), `sort` (a barrier).
+  - *Traps (decision):* fusion evaluates exactly the (stage, element) pairs of the unfused chain, element by element
+    instead of stage by stage, so a fused chain traps if and only if the unfused one does, with the same exit status; when
+    two stages would both trap, which one fires first can differ, and so can the message. Accepted, because a trap ends the
+    program either way; no existing test changed. Early exit never hides a trap: when a stage before an early-exit terminal
+    may trap (conservative analysis: checked integer arithmetic, an index, an unwrap, a call), the loop keeps running the
+    stages after the hit without evaluating the terminal (`tests/next/run/fuse_trap_early_exit.or`).
+  - *Evidence:* `tools/diff_backends.py --mode fuse` (fused vs `--no-fuse`, every run test, 0 differences) and `--mode opt`;
+    `tests/next/run/fuse_shapes.or` (every shape, output equal to the unfused compiler's), `fuse_not_fused.or` (every case
+    that must not be fused, with effects whose order would show a wrong fusion), `fuse_trap_early_exit.or`; the MIR ownership
+    verifier runs on every fused program; `compiler/tests/fuse_test.or`. Programs without an array-API call compile to
+    byte-identical code (the pass returns the program unchanged).
+  - *Measured* (`bench/streams`, docs/benchmarks.md "Streams"): `filter → map → reduce` over 5 M ints, 10 times, C backend
+    `-O2`: before 0.95 s wall / 0.46 s CPU against 0.27 s / 0.12 s for the loop; after 0.25 s / 0.11 s against 0.22 s /
+    0.11 s: parity in CPU time.
+  - *Self-compile* (callgrind, `compile compiler/main.or`, all on the same source tree): baseline compiler 41.49 G
+    instructions; the new compiler with `--no-fuse` 41.52 G (+0.07 %); with fusion 41.84 G (+0.84 %). The pass itself costs
+    about 20 M; the rest is the MIR ownership verifier and the optimiser working on the larger fused functions (the
+    verifier's fixpoint +0.26 G). The fused chains in the compiler's own code do not pay that back yet. A follow-up is to make
+    the verifier cheaper on long straight-line loops; the gate "not worse" is missed by 0.84 %.
+  - *Kept for ADR-0042:* the pass returns, for every chain it saw, a `ChainInfo` (function, span, stages, parallel or not,
+    fused or not and why, loops left over the data, early exit, exact capacity); `orin compile --fuse-report` prints it.
+  - *Not done:* borrow inference, reuse in place, freeze after construction (the rest of this section); fusion of a chain
+    through a variable that is used once; translation validation of the pass (ADR-0032).
+
 ### 3. Layout
 
 - **Unboxing:** scalars and records are stored inline, a `u8` takes 1 byte, and a field is

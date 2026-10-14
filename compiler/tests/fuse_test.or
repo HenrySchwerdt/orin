@@ -1,0 +1,137 @@
+// Unit tests of the fusion pass (compiler/fuse, ADR-0038 §2): the recognisers, the expression facts (simple / may trap), and
+// the pass end to end on programs checked from source: which chains are fused (the kept analysis, `ChainInfo`), that the
+// fused program lowers to MIR the ownership verifier accepts, and that a program without a chain comes back unchanged.
+// Run: `orin test compiler/tests/fuse_test.or --runtime runtime` (contracts checked at run time).
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { SourceFile, span } from "../diag";
+import { HExpr, HExprKind, Type, Program, BinOp } from "../hir";
+import { loadWithOverlay } from "../loader";
+import { check } from "../check";
+import { lower } from "../lower";
+import { verify } from "../verify";
+import { fuseProgram, FuseOut, ChainInfo, arrayOp, isEarlyExit, isSimple, mayTrap } from "../fuse";
+
+function e(k: HExprKind, t: Type): HExpr {
+  return HExpr { kind: k, ty: t, span: span(0, 0, 0) };
+}
+
+@Test
+function recognisesThePreludeOperations(): void {
+  assertEqString(arrayOp("$array/array.map<int, string>"), "map", "map");
+  assertEqString(arrayOp("$array/array.findIndex<int>"), "findIndex", "findIndex, not find");
+  assertEqString(arrayOp("$array/array.find<int>"), "find", "find");
+  assertEqString(arrayOp("$array/array.indexOfStr"), "indexOf", "indexOf by element class");
+  assertEqString(arrayOp("$array/array.includesInt"), "includes", "includes");
+  assertEqString(arrayOp("$array/array.sort<int>"), "", "sort is a barrier, not an operation");
+  assertEqString(arrayOp("app.map<int, int>"), "", "a user function called map");
+  assertEqBool(
+    isEarlyExit("some") && isEarlyExit("indexOf") && !isEarlyExit("reduce"),
+    true,
+    "early exits",
+  );
+}
+
+@Test
+function simpleAndTrappingExpressions(): void {
+  const x = e(XLocal(1), TyInt);
+  const two = e(XInt(2), TyInt);
+  const zero = e(XInt(0), TyInt);
+  assertEqBool(isSimple(two) && isSimple(x), true, "literals and locals");
+  assertEqBool(mayTrap(e(XBinary(OpAdd, x, two), TyInt)), true, "integer + may overflow");
+  assertEqBool(
+    mayTrap(e(XBinary(OpRem, x, two), TyInt)),
+    false,
+    "% by a constant other than 0 and -1 cannot trap",
+  );
+  assertEqBool(mayTrap(e(XBinary(OpRem, x, zero), TyInt)), true, "% 0 traps");
+  assertEqBool(mayTrap(e(XBinary(OpLt, x, two), TyBool)), false, "a comparison cannot trap");
+  const f = e(XLocal(2), TyFloat);
+  assertEqBool(mayTrap(e(XBinary(OpMul, f, f), TyFloat)), false, "float arithmetic cannot trap");
+  assertEqBool(
+    mayTrap(e(XIndex(e(XLocal(3), TyArray(TyInt)), x), TyInt)),
+    true,
+    "an index can be out of bounds",
+  );
+  assertEqBool(isSimple(e(XCall(0, []), TyInt)), false, "a call is not simple");
+}
+
+function fused(fs: FsGrant, text: string): Option<FuseOut> {
+  const o = loadWithOverlay(fs, "/virt/a.or", [SourceFile { path: "/virt/a.or", text: text }]);
+  return match (o.program) {
+    Some(p) => {
+      const r = check(p, o.sm);
+      return r.isOk() ? Some(fuseProgram(r.unwrap())) : None;
+    },
+    None => None,
+  };
+}
+
+function src(): string {
+  return "function f(xs: int[], k: int): int {\n  return xs.filter(x => x > k).map(x => x * 2).reduce((a, b) => a + b, 0);\n}\n"
+      + "function g(xs: int[]): bool {\n  const h = (x: int) => x + 1;\n  return xs.map(h).some(x => x == 3);\n}\n"
+      + "function main(): void {\n  console.log(f([1, 2, 3], 1).toString());\n  console.log(g([1, 2]).toString());\n}\n";
+}
+
+@Test
+function keepsTheAnalysisOfEveryChain(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const o = fused(fs, src());
+      assert(o.isSome(), "checks and fuses");
+      const cs = o.unwrap().chains;
+      assertEqUsize(cs.length, 3, "three chains: f's, g's some (fused) and g's map (not)");
+      const c0 = cs[0];
+      assertEqString(
+        c0.stages.join(" "),
+        "filter map reduce",
+        "the stages from the source outwards",
+      );
+      assertEqBool(
+        c0.fused && !c0.parallel && !c0.earlyExit,
+        true,
+        "fused, sequential, no early exit",
+      );
+      assertEqUsize(c0.loops, 1, "one loop");
+      let notFused: usize = 0;
+      for (const c of cs) {
+        if (!c.fused) {
+          notFused += 1;
+          assertEqString(c.reason, "the function argument is not a closure literal", "why");
+        }
+      }
+      assertEqUsize(notFused, 1, "the function value is not fused");
+    },
+  );
+}
+
+@Test
+function fusedProgramVerifies(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const o = fused(fs, src()).unwrap();
+      const m = lower(o.program);
+      assertEqUsize(
+        verify(m).errors.length,
+        0,
+        "the MIR ownership verifier accepts the fused program",
+      );
+    },
+  );
+}
+
+@Test
+function programWithoutChainIsUnchanged(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const text = "function main(): void {\n  let s = 0;\n  for (const x of [1, 2]) {\n    s += x;\n  }\n  console.log(s.toString());\n}\n";
+      const o = fused(fs, text).unwrap();
+      assertEqUsize(o.chains.length, 0, "no chain");
+    },
+  );
+}

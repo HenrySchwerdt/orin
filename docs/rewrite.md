@@ -187,10 +187,15 @@ rewritten module follows these rules (the contracts are checked by the `contract
    collecting the names of the active items, finding the first match, or checking that all entries are in range. Keep a
    `for` loop where it is the clearer form: several results built in one pass, index arithmetic, early exit with
    state, or mutation of the iterated data. There is no `Stream<T>` type. Laziness comes from the compiler: closure
-   inlining and fusion of pure `filter`/`map`/`reduce` chains into one loop (ADR-0038 §2). Until that optimisation
-   has landed, keep hot inner loops of the compiler as loops. Measured before fusion: `filter → map → reduce` over
-   5 M ints is about 4x slower than the loop. The self-compile time in the PR shows whether a change slowed the
-   compiler down.
+   inlining and fusion of pure `filter`/`map`/`reduce` chains into one loop (ADR-0038 §2, `compiler/fuse`). Fusion has
+   landed for every shape the compiler uses (`map`/`filter` stages ending in `map`, `filter`, `reduce`, `some`, `every`,
+   `find`, `findIndex`, `forEach`, `includes`, `indexOf`, with arrow functions or named functions at the call), so a hot
+   loop of the compiler may be written as a chain too: `filter → map → reduce` over 5 M ints now runs at the speed of
+   the loop (docs/benchmarks.md "Streams"). `orin compile --fuse-report` lists every chain and whether it became one
+   loop; what is not fused (a function value that is not a literal, an impure closure, a result bound to a variable and
+   used twice, `sort`) stays a call of the prelude function. The self-compile time in the PR shows whether a change
+   slowed the compiler down.
+
 8. **No global counters in per-function work** (project owner, 2026-10-14; ADR-0039 §6): a phase that works per
    function, such as checking a body, lowering, verifying or emitting code, numbers what it creates (temporaries,
    string literals, fresh names) locally. A program-wide numbering is assigned afterwards, in a fixed order. Then a

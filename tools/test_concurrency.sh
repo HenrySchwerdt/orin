@@ -73,4 +73,6 @@ for t in tests/concurrency/*.or; do
     cmp "tests/concurrency/$n.out" $B/$n.actual || { echo "[concurrency] FAIL $n (asan): output differs"; exit 1; }
   fi
 done
+# parallel pipelines (ADR-0039): thread counts 1..8, fused / unfused, ThreadSanitizer and ASan
+ORIN2=$ORIN2 CC=$CC tools/test_parallel.sh $( [ "$QUICK" = 1 ] && echo --quick )
 echo "[concurrency] ok"

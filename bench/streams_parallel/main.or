@@ -1,0 +1,56 @@
+// Parallel array pipelines (ADR-0039; docs/benchmarks.md "Streams, parallel"). Two workloads, each sequential and with
+// `parallel()`; the first argument picks one, the thread count comes from ORIN_THREADS (default: processors online):
+//   seq / par         `filter -> map -> reduce` over 5,000,000 ints, repeated 10 times (memory-bound, little work per element);
+//   seqheavy / parheavy  the Collatz step count of 1 .. 2,000,000 summed (compute-bound, about 100 steps per element).
+// Every variant prints a checksum; seq and par print the same one, and so do seqheavy and parheavy. Measure wall AND CPU
+// time from outside (`time ORIN_THREADS=4 ./streams_parallel par`): on a shared machine the wall time alone says little.
+import { Host, useProcess } from "std:host";
+import { args } from "std:process";
+
+function input(n: int): int[] {
+  let xs: int[] = [];
+  let i = 0;
+  while (i < n) {
+    xs.push(i);
+    i += 1;
+  }
+  return xs;
+}
+
+function steps(n: int): int {
+  let x = n;
+  let s = 0;
+  while (x != 1) {
+    x = x % 2 == 0 ? x / 2 : 3 * x + 1;
+    s += 1;
+  }
+  return s;
+}
+
+function run(which: string): void {
+  if (which == "seq" || which == "par") {
+    const xs = input(5000000);
+    let total = 0;
+    let r = 0;
+    while (r < 10) {
+      total += which == "seq"
+          ? xs.filter(x => x % 3 == 0).map(x => x * 2).reduce((a, b) => a + b, 0)
+          : xs.parallel().filter(x => x % 3 == 0).map(x => x * 2).reduce((a, b) => a + b, 0);
+      r += 1;
+    }
+    console.log(`${which}: ${total}`);
+  } else {
+    const ns = input(2000000).map(x => x + 1);
+    const total = which == "seqheavy"
+        ? ns.map(n => steps(n)).reduce((a, b) => a + b, 0)
+        : ns.parallel().map(n => steps(n)).reduce((a, b) => a + b, 0);
+    console.log(`${which}: ${total}`);
+  }
+}
+
+function main(host: Host): void {
+  useProcess(host, proc => {
+    const a = args(proc);
+    run(a.length == 0 ? "par" : a[0]);
+  });
+}
