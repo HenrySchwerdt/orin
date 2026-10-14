@@ -14,8 +14,11 @@
 
 import { MFunction, MBlock, MLocal, MType, Instr, Operand } from "../mir";
 import { Span } from "../diag";
+import { Locals } from "../lower";
 import { Counts, ancestors, usesAffecting, instrDef, isRefTy, countsOf } from "./analysis";
 import { sameKey, keyLocal, isMakeUniqueOf } from "./inplace";
+import { BlockSink, withBody } from "./rewrite";
+import { fnShapeOk, passKept, instrCount, dupCount, getterCount } from "./wellformed";
 
 type Hop = { field: bool; idx: usize; key: Operand; };
 
@@ -24,23 +27,27 @@ type Getter = { d: usize; src: usize; hop: Hop; };
 function getterOf(f: MFunction, ins: Instr): Option<Getter> {
   return match (ins) {
     IGetField(d, o, i) => match (o) {
-      OLocal(x) => isRefTy(f.locals[d].ty) ? Some(Getter { d: d, src: x, hop: Hop { field: true, idx: i, key: OInt(0) } }) : None,
-      _ => None
+      OLocal(x) => isRefTy(f.locals[d].ty)
+          ? Some(Getter { d: d, src: x, hop: Hop { field: true, idx: i, key: OInt(0) } })
+          : None,
+      _ => None,
     },
     IArrayGet(d, o, k) => match (o) {
-      OLocal(x) => isRefTy(f.locals[d].ty) ? Some(Getter { d: d, src: x, hop: Hop { field: false, idx: 0, key: k } }) : None,
-      _ => None
+      OLocal(x) => isRefTy(f.locals[d].ty)
+          ? Some(Getter { d: d, src: x, hop: Hop { field: false, idx: 0, key: k } })
+          : None,
+      _ => None,
     },
-    _ => None
+    _ => None,
   };
 }
 
 // `t = take obj.hop`: the local t, if the instruction is that take.
 function takeOf(ins: Instr, obj: usize, h: Hop): Option<usize> {
   return match (ins) {
-    ITakeField(t, o, i) => (h.field && o == obj && i == h.idx) ? Some(t) : None,
-    IArrayTake(t, o, k) => (!h.field && o == obj && sameKey(k, h.key)) ? Some(t) : None,
-    _ => None
+    ITakeField(t, o, i) => h.field && o == obj && i == h.idx ? Some(t) : None,
+    IArrayTake(t, o, k) => !h.field && o == obj && sameKey(k, h.key) ? Some(t) : None,
+    _ => None,
   };
 }
 
@@ -48,15 +55,15 @@ function isPutOf(ins: Instr, obj: usize, h: Hop, t: usize): bool {
   return match (ins) {
     IPutField(o, i, s) => h.field && o == obj && i == h.idx && s == t,
     IArrayPut(o, k, s) => !h.field && o == obj && sameKey(k, h.key) && s == t,
-    _ => false
+    _ => false,
   };
 }
 
 function storeOf(ins: Instr, obj: usize, h: Hop): Option<Operand> {
   return match (ins) {
-    ISetField(x, i, v) => (h.field && x == obj && i == h.idx) ? Some(v) : None,
-    IArraySet(x, k, v) => (!h.field && x == obj && sameKey(k, h.key)) ? Some(v) : None,
-    _ => None
+    ISetField(x, i, v) => h.field && x == obj && i == h.idx ? Some(v) : None,
+    IArraySet(x, k, v) => !h.field && x == obj && sameKey(k, h.key) ? Some(v) : None,
+    _ => None,
   };
 }
 
@@ -68,20 +75,13 @@ function mkPut(obj: usize, h: Hop, s: usize): Instr {
   return h.field ? IPutField(obj, h.idx, s) : IArrayPut(obj, h.key, s);
 }
 
+// Is there a `dup` right after a getter of a reference?
 function hasChainDup(f: MFunction): bool {
   for (const blk of f.blocks) {
     let i: usize = 1;
     while (i < blk.instrs.length) {
-      match (blk.instrs[i]) {
-        IDup(_, _) => {
-          match (getterOf(f, blk.instrs[i - 1])) {
-            Some(_) => {
-              return true;
-            },
-            None => {}
-          }
-        },
-        _ => {}
+      if (isDupOp(blk.instrs[i]) && getterOf(f, blk.instrs[i - 1]).isSome()) {
+        return true;
       }
       i += 1;
     }
@@ -89,10 +89,19 @@ function hasChainDup(f: MFunction): bool {
   return false;
 }
 
+function isDupOp(i: Instr): bool {
+  return match (i) {
+    IDup(_, _) => true,
+    _ => false,
+  };
+}
+
 // The read path ending at the dup at index i: the getters at i-n .. i-1 (each result used once, by the next getter or
 // the dup), outermost container x last. Returns the hops in path order (x -> .. -> slot) and x.
 type ReadPath = { n: usize; x: usize; path: Hop[]; };
 
+@Requires(i < instrs.length)
+@Ensures(result.n == result.path.length && result.n <= i)
 function readPath(f: MFunction, instrs: Instr[], cnt: Counts, i: usize, last: usize): ReadPath {
   let hops: Hop[] = [];
   let srcs: usize[] = [];
@@ -116,12 +125,12 @@ function readPath(f: MFunction, instrs: Instr[], cnt: Counts, i: usize, last: us
                   going = true;
                 }
               },
-              None => {}
+              None => {},
             }
           }
         }
       },
-      None => {}
+      None => {},
     }
   }
   const n = hops.length;
@@ -134,18 +143,25 @@ function readPath(f: MFunction, instrs: Instr[], cnt: Counts, i: usize, last: us
   return ReadPath { n: n, x: n > 0 ? srcs[n - 1] : 0, path: path };
 }
 
+// Every rewrite drops a read path of n >= 2 getters and turns its `dup` into the take of the last slot; the store becomes a
+// put (with a copy of a string literal in front). So the pass never adds instructions: each rewrite removes at least one
+// (the claim of the pass), one `dup` and at least two getters.
+@Requires(fnShapeOk(f))
+@Ensures(passKept(f, result) && result.blocks.length == f.blocks.length)
+@Ensures(instrCount(result) + (dupCount(f) - dupCount(result)) <= instrCount(f))
+@Ensures(dupCount(result) <= dupCount(f)
+    && getterCount(result) + 2 * (dupCount(f) - dupCount(result)) <= getterCount(f))
 export function takePutChains(f: MFunction): MFunction {
   if (!hasChainDup(f)) {
     return f;
   }
   const anc = ancestors(f);
   const cnt = countsOf(f);
-  let locals = f.locals;
+  let locals = new Locals(f.locals);
   let blocks: MBlock[] = [];
   for (const blk of f.blocks) {
     const instrs = blk.instrs;
-    let out: Instr[] = [];
-    let sps: Span[] = [];
+    let out = new BlockSink();
     let changed = false;
     let i: usize = 0;
     while (i < instrs.length) {
@@ -170,7 +186,7 @@ export function takePutChains(f: MFunction): MFunction {
                     Some(_) => {
                       isStart = true;
                     },
-                    None => {}
+                    None => {},
                   }
                   if (isStart) {
                     found = true;
@@ -190,11 +206,11 @@ export function takePutChains(f: MFunction): MFunction {
                                 clean = false;
                               }
                             },
-                            None => {}
+                            None => {},
                           }
                         }
                       },
-                      None => {}
+                      None => {},
                     }
                     if (clean) {
                       start += 1;
@@ -227,7 +243,7 @@ export function takePutChains(f: MFunction): MFunction {
                         },
                         None => {
                           okc = false;
-                        }
+                        },
                       }
                     }
                   }
@@ -242,21 +258,21 @@ export function takePutChains(f: MFunction): MFunction {
                             tail.push(mkPut(obj, path[n - 1], l));
                           },
                           OStr(sn) => {
-                            const t = locals.length;
-                            locals.push(MLocal { name: "_", ty: MRef });
+                            const t = locals.fresh(MRef);
                             tail.push(ICopy(t, OStr(sn)));
                             tail.push(mkPut(obj, path[n - 1], t));
                           },
                           _ => {
                             okv = false;
-                          }
+                          },
                         }
                         // the puts, innermost container first
                         let q = pos + 1;
                         let lv = n - 1;
                         while (okv && lv > 0) {
                           const container = lv == 1 ? x : ts[lv - 2];
-                          if (q < instrs.length && isPutOf(instrs[q], container, path[lv - 1], ts[lv - 1])) {
+                          if (q < instrs.length
+                              && isPutOf(instrs[q], container, path[lv - 1], ts[lv - 1])) {
                             q += 1;
                             lv -= 1;
                           } else {
@@ -268,69 +284,44 @@ export function takePutChains(f: MFunction): MFunction {
                           handled = true;
                           // drop the read path (the getters were emitted before), then: the write prefix (moved up),
                           // the take of the slot, the window, the store as a put, the puts
-                          let r: usize = 0;
-                          while (r < n) {
-                            out.pop();
-                            sps.pop();
-                            r += 1;
-                          }
+                          out.drop(n);
                           let m = start;
                           while (m < prefixEnd) {
-                            out.push(instrs[m]);
-                            sps.push(blk.spans[m]);
+                            out.emit(instrs[m], blk.spans[m]);
                             m += 1;
                           }
-                          out.push(mkTake(d2, obj, path[n - 1]));
-                          sps.push(blk.spans[i]);
+                          out.emit(mkTake(d2, obj, path[n - 1]), blk.spans[i]);
                           m = i + 1;
                           while (m < start) {
-                            out.push(instrs[m]);
-                            sps.push(blk.spans[m]);
+                            out.emit(instrs[m], blk.spans[m]);
                             m += 1;
                           }
-                          for (const tt of tail) {
-                            out.push(tt);
-                            sps.push(blk.spans[pos]);
-                          }
+                          out.emitAll(tail, blk.spans[pos]);
                           m = pos + 1;
                           while (m < q) {
-                            out.push(instrs[m]);
-                            sps.push(blk.spans[m]);
+                            out.emit(instrs[m], blk.spans[m]);
                             m += 1;
                           }
                           i = q;
                         }
                       },
-                      None => {}
+                      None => {},
                     }
                   }
                 }
               }
             },
-            _ => {}
+            _ => {},
           }
         },
-        _ => {}
+        _ => {},
       }
       if (!handled) {
-        out.push(instrs[i]);
-        sps.push(blk.spans[i]);
+        out.emit(instrs[i], blk.spans[i]);
         i += 1;
       }
     }
-    if (!changed) {
-      blocks.push(blk);
-    } else {
-      blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
-    }
+    blocks.push(changed ? out.finish(blk.term, blk.termSpan) : blk);
   }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: locals,
-    ret: f.ret,
-    blocks: blocks
-  };
+  return withBody(f, locals.table(), blocks);
 }

@@ -1,0 +1,246 @@
+// Predicates for the contracts of the optimiser (rewrite step 3d). They build on the shared structural MIR predicates
+// (`mir/wellformed.or`, step 3b) and state what every pass must keep: the function stays well formed, its signature is
+// the same, locals are only appended, the calls and builtins (everything with an effect) are the same calls in the same
+// order, and the instruction counts move only in the direction the pass claims.
+
+import {
+  MType, MLocal, Instr, MBlock, MFunction, MProgram, builtinName, hasSpan, blocksLocalsBelow,
+  blockTargetsInRange, allReachable, spansComplete, spansAligned, paramsWellFormed,
+  isWellFormedFunction, isWellFormedProgram,
+} from "../mir";
+import { mtyEq } from "../lower";
+
+// ---------------------------------------------------------------- well-formedness
+
+// The structure of one function, without its program (the passes that see only the function): an entry block,
+// parameters that are locals with one mode each, one span per instruction, only declared locals, branch targets inside
+// the function.
+export function fnShapeOk(f: MFunction): bool {
+  return f.blocks.length > 0
+      && paramsWellFormed(f)
+      && spansAligned(f.blocks)
+      && blocksLocalsBelow(f.blocks, f.locals.length)
+      && blockTargetsInRange(f.blocks);
+}
+
+// `f` is well formed in `p`: the shared predicate of `mir/` (every local, string, function, vtable and block index
+// exists).
+export function fnWellFormed(p: MProgram, f: MFunction): bool {
+  return isWellFormedFunction(p, f);
+}
+
+export function progWellFormed(p: MProgram): bool {
+  return isWellFormedProgram(p);
+}
+
+// ---------------------------------------------------------------- what a pass keeps
+
+function boolsEq(a: bool[], b: bool[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Name, parameters, parameter modes, in/out flag and result type are the same.
+export function sameSignature(a: MFunction, b: MFunction): bool {
+  return a.name == b.name
+      && a.paramCount == b.paramCount
+      && a.inout == b.inout
+      && mtyEq(a.ret, b.ret)
+      && boolsEq(a.paramOwned, b.paramOwned);
+}
+
+// `now` is `old` with locals appended (the ids of existing locals keep their name and type).
+export function localsExtended(old: MLocal[], now: MLocal[]): bool {
+  if (now.length < old.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < old.length) {
+    if (now[i].name != old[i].name || !mtyEq(now[i].ty, old[i].ty)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The effect of an instruction as a key: the callee of a call, the builtin of a builtin (array concatenation, which the
+// optimiser may turn into an in-place `arrayextend`, excluded), "" for an instruction without an effect of its own.
+function effectKey(i: Instr): string {
+  return match (i) {
+    ICall(_, g, _) => `call ${g.toString()}`,
+    ICallIndirect(_, _, _) => "indirect",
+    ICallVirtual(_, _, s, _) => `virtual ${s.toString()}`,
+    IBuiltin(_, b, _) => match (b) {
+      BArrConcat => "",
+      _ => builtinName(b),
+    },
+    _ => "",
+  };
+}
+
+// The effects of the function in block and instruction order, one key per call and builtin.
+export function effects(f: MFunction): string[] {
+  let out: string[] = [];
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      const k = effectKey(i);
+      if (k.length > 0) {
+        out.push(k);
+      }
+    }
+  }
+  return out;
+}
+
+function stringsEq(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// What every pass keeps: the result is shaped like a function, has the same signature, only appends locals, makes the
+// same calls and builtin calls in the same order (a pass that drops, duplicates or reorders a call changes what the
+// program does), keeps every span and every block reachable when the input had them.
+export function passKept(before: MFunction, after: MFunction): bool {
+  return fnShapeOk(after)
+      && sameSignature(before, after)
+      && localsExtended(before.locals, after.locals)
+      && stringsEq(effects(before), effects(after))
+      && (!spansComplete(before.blocks) || spansComplete(after.blocks))
+      && (!allReachable(before.blocks) || allReachable(after.blocks));
+}
+
+// ---------------------------------------------------------------- counts
+
+export function instrCount(f: MFunction): usize {
+  return f.blocks.reduce((n: usize, b: MBlock) => n + b.instrs.length, 0);
+}
+
+function isDup(i: Instr): bool {
+  return match (i) {
+    IDup(_, _) => true,
+    _ => false,
+  };
+}
+
+function isRelease(i: Instr): bool {
+  return match (i) {
+    IRelease(_) => true,
+    _ => false,
+  };
+}
+
+function isConcat(i: Instr): bool {
+  return match (i) {
+    IBuiltin(_, b, _) => match (b) {
+      BArrConcat => true,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+function isExtend(i: Instr): bool {
+  return match (i) {
+    IArrayExtend(_, _) => true,
+    _ => false,
+  };
+}
+
+function isGetter(i: Instr): bool {
+  return match (i) {
+    IGetField(_, _, _) => true,
+    IArrayGet(_, _, _) => true,
+    _ => false,
+  };
+}
+
+// The instruction kinds the pass contracts count.
+type Counted = CntDup | CntRelease | CntConcat | CntExtend | CntGetter;
+
+function isKind(i: Instr, k: Counted): bool {
+  return match (k) {
+    CntDup => isDup(i),
+    CntRelease => isRelease(i),
+    CntConcat => isConcat(i),
+    CntExtend => isExtend(i),
+    CntGetter => isGetter(i),
+  };
+}
+
+function countWhere(f: MFunction, k: Counted): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      if (isKind(i, k)) {
+        n += 1;
+      }
+    }
+  }
+  return n;
+}
+
+export function dupCount(f: MFunction): usize {
+  return countWhere(f, CntDup);
+}
+
+export function releaseCount(f: MFunction): usize {
+  return countWhere(f, CntRelease);
+}
+
+export function concatCount(f: MFunction): usize {
+  return countWhere(f, CntConcat);
+}
+
+export function extendCount(f: MFunction): usize {
+  return countWhere(f, CntExtend);
+}
+
+// `getfield` and `arrayget` instructions.
+export function getterCount(f: MFunction): usize {
+  return countWhere(f, CntGetter);
+}
+
+// Every block that `after` has beyond `before`'s is an edge block `release p; goto t` (the only blocks the owned-parameter
+// rewrite adds), and the old blocks are still there.
+export function onlyEdgeBlocksAdded(before: MFunction, after: MFunction, p: usize): bool {
+  if (after.blocks.length < before.blocks.length) {
+    return false;
+  }
+  let i = before.blocks.length;
+  while (i < after.blocks.length) {
+    const b = after.blocks[i];
+    const ok = b.instrs.length == 1
+        && match (b.instrs[0]) {
+          IRelease(x) => x == p,
+          _ => false,
+        }
+        && match (b.term) {
+          TGoto(t) => t < before.blocks.length,
+          _ => false,
+        };
+    if (!ok) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}

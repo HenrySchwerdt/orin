@@ -23,8 +23,11 @@
 
 import { MProgram, MFunction, MBlock, MLocal, MType, Instr, Operand, Terminator } from "../mir";
 import { Span } from "../diag";
+import { Locals, mtyEq } from "../lower";
 import { State, Cx, step, blockInStates, KDead } from "../verify";
 import { Counts, countsOf, instrUses, instrDef, termUses, isRefTy } from "./analysis";
+import { BlockSink, RewritePlan, withBody, indices } from "./rewrite";
+import { fnWellFormed, progWellFormed, passKept, sameSignature } from "./wellformed";
 
 // A distinct code per type (MType has no equality of its own).
 function tyCode(t: MType): int {
@@ -35,7 +38,7 @@ function tyCode(t: MType): int {
     MFloat => 3,
     MHandle => 4,
     MRef => 5,
-    MVoid => 6
+    MVoid => 6,
   };
 }
 
@@ -46,24 +49,15 @@ function operandTy(f: MFunction, o: Operand): MType {
     OUsize(_) => MUsize,
     OBool(_) => MBool,
     OFloat(_) => MFloat,
-    OStr(_) => MRef
+    OStr(_) => MRef,
   };
 }
 
 function isLocalOp(o: Operand, l: usize): bool {
   return match (o) {
     OLocal(m) => m == l,
-    _ => false
+    _ => false,
   };
-}
-
-function inList(xs: usize[], x: usize): bool {
-  for (const y of xs) {
-    if (y == x) {
-      return true;
-    }
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------- the callee side
@@ -77,10 +71,47 @@ function noShape(): PairShape {
   return PairShape { ok: false, ty: MVoid, sites: [] };
 }
 
+// Every `return` of f is a site of the shape and every site is a `return` block whose instruction `at` builds the two-slot
+// record with a reference local first. Catches a return the conversion would miss (the caller would read the record
+// as the value) and a site that points at the wrong instruction (the record would be kept and leak, or a different
+// instruction would be removed).
+export function sitesCoverReturns(f: MFunction, sh: PairShape): bool {
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    const isRet = match (blk.term) {
+      TReturn(_) => true,
+      _ => false,
+    };
+    const k = b;
+    const n = sh.sites.filter(st => st.block == k).length;
+    if (isRet ? n != 1 : n != 0) {
+      return false;
+    }
+    b += 1;
+  }
+  return sh.sites.every(
+    st => st.block < f.blocks.length
+        && st.at < f.blocks[st.block].instrs.length
+        && match (f.blocks[st.block].instrs[st.at]) {
+          IStructNew(_, tag, slots) => tag == 0 && slots.length == 2 && isLocalOp(slots[0], st.a),
+          _ => false,
+        },
+  );
+}
+
 // The pair shape of f (or not ok). `pinned`: f is called through a function value.
+@Requires(fi < p.functions.length && pinned.length == p.functions.length)
+@Ensures(!result.ok || sitesCoverReturns(p.functions[fi], result))
 function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
   const f = p.functions[fi];
-  if (pinned[fi] || fi == p.main || f.inout || f.paramCount == 0 || !f.paramOwned[0] || !isRefTy(f.locals[0].ty) || !isRefTy(f.ret)) {
+  if (pinned[fi]
+      || fi == p.main
+      || f.inout
+      || f.paramCount == 0
+      || !f.paramOwned[0]
+      || !isRefTy(f.locals[0].ty)
+      || !isRefTy(f.ret)) {
     return noShape();
   }
   const cnt = countsOf(f);
@@ -108,7 +139,7 @@ function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
                         at = k;
                       }
                     },
-                    None => {}
+                    None => {},
                   }
                   k += 1;
                 }
@@ -145,7 +176,7 @@ function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
                             },
                             _ => {
                               return noShape();
-                            }
+                            },
                           }
                           m += 1;
                         }
@@ -157,7 +188,15 @@ function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
                           }
                           match (states[b]) {
                             Some(st0) => {
-                              let c = Cx { prog: p, f: f, blk: b, ins: 0, st: st0, errs: [], warns: [] };
+                              let c = Cx {
+                                prog: p,
+                                f: f,
+                                blk: b,
+                                ins: 0,
+                                st: st0,
+                                errs: [],
+                                warns: [],
+                              };
                               let j: usize = 0;
                               while (j < at) {
                                 c.ins = j;
@@ -168,32 +207,32 @@ function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
                                 return noShape();
                               }
                             },
-                            None => {}
+                            None => {},
                           }
                         }
                         sites.push(RetSite { block: b, at: at, a: a, v: slots[1] });
                       },
                       _ => {
                         return noShape();
-                      }
+                      },
                     }
                   },
                   _ => {
                     return noShape();
-                  }
+                  },
                 }
               },
               _ => {
                 return noShape();
-              }
+              },
             }
           },
           None => {
             return noShape();
-          }
+          },
         }
       },
-      _ => {}
+      _ => {},
     }
     b += 1;
   }
@@ -204,6 +243,8 @@ function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
 }
 
 // f as an inout function returning the second slot.
+@Requires(sh.ok && sitesCoverReturns(f, sh))
+@Ensures(convertedOk(f, result) && mtyEq(result.ret, sh.ty))
 function convertCallee(f: MFunction, sh: PairShape): MFunction {
   let blocks: MBlock[] = [];
   let b: usize = 0;
@@ -234,8 +275,13 @@ function convertCallee(f: MFunction, sh: PairShape): MFunction {
           out.push(IMove(0, s.a));
           sps.push(blk.spans[s.at]);
         }
-        blocks.push(MBlock { instrs: out, spans: sps, term: TReturn(Some(s.v)), termSpan: blk.termSpan });
-      }
+        blocks.push(MBlock {
+          instrs: out,
+          spans: sps,
+          term: TReturn(Some(s.v)),
+          termSpan: blk.termSpan,
+        });
+      },
     }
     b += 1;
   }
@@ -246,14 +292,76 @@ function convertCallee(f: MFunction, sh: PairShape): MFunction {
     inout: true,
     locals: f.locals,
     ret: sh.ty,
-    blocks: blocks
+    blocks: blocks,
   };
 }
 
 // ---------------------------------------------------------------- the call sites
 
 // Replacement plan for the instructions after a call whose record `d` is destructured in the same block.
+@Invariant(!this.ok || this.hit.length == this.rep.length)
 type Sra = { ok: bool; hit: bool[]; rep: Instr[][]; };
+
+// The locals that hold the record of an in/out call while it is destructured: the call's destination first, then the
+// locals it is moved to, each with the number of its uses seen so far. The plan holds only when every alias is used
+// exactly by the instructions that the plan rewrites (`complete`).
+@Invariant(this.alias.length == this.counted.length && this.alias.length >= 1)
+class RecordAliases {
+  private alias: usize[];
+  private counted: usize[];
+
+  constructor(d: usize) {
+    this.alias = [d];
+    this.counted = [0];
+  }
+
+  has(l: usize): bool {
+    return this.alias.includes(l);
+  }
+
+  // Counts a use of the alias `a`.
+  @Requires(this.has(a))
+  @Ensures(this.alias.length == old(this.alias.length))
+  use(a: usize): void {
+    let k: usize = 0;
+    while (this.alias[k] != a) {
+      k += 1;
+    }
+    this.counted[k] += 1;
+  }
+
+  // `a2 = move a`: a2 is an alias too.
+  @Requires(!this.has(a2))
+  @Ensures(this.has(a2) && this.alias.length == old(this.alias.length) + 1)
+  add(a2: usize): void {
+    this.alias.push(a2);
+    this.counted.push(0);
+  }
+
+  // Every alias is used exactly as often as counted (no use the plan does not rewrite).
+  complete(cnt: Counts): bool {
+    let k: usize = 0;
+    while (k < this.alias.length) {
+      if (cnt.uses[this.alias[k]] != this.counted[k]) {
+        return false;
+      }
+      k += 1;
+    }
+    return true;
+  }
+}
+
+// The plan of a scalar replacement touches only instructions after the call `i`.
+function laterOnly(r: Sra, i: usize): bool {
+  let k: usize = 0;
+  while (k <= i && k < r.hit.length) {
+    if (r.hit[k]) {
+      return false;
+    }
+    k += 1;
+  }
+  return true;
+}
 
 function noSra(): Sra {
   return Sra { ok: false, hit: [], rep: [] };
@@ -261,7 +369,17 @@ function noSra(): Sra {
 
 // Plan the scalar replacement of the record `d` built by the call at index `i` of `blk`; x and v are the
 // locals that hold its two components after the call (v is a reference iff vRef).
-function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usize, vRef: bool): Sra {
+@Requires(i < blk.instrs.length && d < cnt.uses.length)
+@Ensures(!result.ok || result.hit.length == blk.instrs.length && laterOnly(result, i))
+function planSra(
+  blk: MBlock,
+  cnt: Counts,
+  i: usize,
+  d: usize,
+  x: usize,
+  v: usize,
+  vRef: bool,
+): Sra {
   const n = blk.instrs.length;
   let hit: bool[] = [];
   let rep: Instr[][] = [];
@@ -274,8 +392,7 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
   if (cnt.defs[d] != 1) {
     return noSra();
   }
-  let alias: usize[] = [d];
-  let counted: usize[] = [0];
+  let ra = new RecordAliases(d);
   let clobbered = false;
   let gets0: usize[] = [];
   let gets1: usize[] = [];
@@ -288,16 +405,12 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
       IGetField(t, o, slot) => {
         match (o) {
           OLocal(a) => {
-            if (inList(alias, a)) {
+            if (ra.has(a)) {
               handled = true;
-              if (clobbered || slot > 1 || t == x || t == v || inList(alias, t)) {
+              if (clobbered || slot > 1 || t == x || t == v || ra.has(t)) {
                 return noSra();
               }
-              let ai: usize = 0;
-              while (alias[ai] != a) {
-                ai += 1;
-              }
-              counted[ai] += 1;
+              ra.use(a);
               if (slot == 0) {
                 gets0.push(j);
               } else {
@@ -306,73 +419,53 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
               hit[j] = true;
             }
           },
-          _ => {}
+          _ => {},
         }
       },
       IRelease(a) => {
-        if (inList(alias, a)) {
+        if (ra.has(a)) {
           handled = true;
           if (clobbered) {
             return noSra();
           }
-          let ai: usize = 0;
-          while (alias[ai] != a) {
-            ai += 1;
-          }
-          counted[ai] += 1;
+          ra.use(a);
           releases.push(j);
           hit[j] = true;
         }
       },
       IMove(a2, a) => {
-        if (inList(alias, a)) {
+        if (ra.has(a)) {
           handled = true;
-          if (clobbered || cnt.defs[a2] != 1 || a2 == x || a2 == v || inList(alias, a2)) {
+          if (clobbered || cnt.defs[a2] != 1 || a2 == x || a2 == v || ra.has(a2)) {
             return noSra();
           }
-          let ai: usize = 0;
-          while (alias[ai] != a) {
-            ai += 1;
-          }
-          counted[ai] += 1;
-          alias.push(a2);
-          counted.push(0);
+          ra.use(a);
+          ra.add(a2);
           hit[j] = true;
         }
       },
-      _ => {}
+      _ => {},
     }
     if (!handled) {
-      for (const u of instrUses(ins)) {
-        if (inList(alias, u)) {
-          return noSra();
-        }
+      if (instrUses(ins).some(u => ra.has(u))) {
+        return noSra();
       }
       match (instrDef(ins)) {
         Some(df) => {
-          if (inList(alias, df)) {
+          if (ra.has(df)) {
             return noSra();
           }
           if (df == x || df == v) {
             clobbered = true;
           }
         },
-        None => {}
+        None => {},
       }
     }
     j += 1;
   }
-  for (const u of termUses(blk.term)) {
-    if (inList(alias, u)) {
-      return noSra();
-    }
-  }
-  let ai: usize = 0;
-  while (ai < alias.length) {
-    if (cnt.uses[alias[ai]] != counted[ai]) {
-      return noSra();
-    }
-    ai += 1;
+  if (termUses(blk.term).some(u => ra.has(u)) || !ra.complete(cnt)) {
+    return noSra();
   }
   // last use of a component by `t = getfield d.k; u = dup t` is a move of the component
   let movedX = false;
@@ -391,11 +484,11 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
                 movedX = true;
               }
             },
-            _ => {}
+            _ => {},
           }
         }
       },
-      _ => {}
+      _ => {},
     }
   }
   if (vRef && gets1.length == 1) {
@@ -412,11 +505,11 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
                 movedV = true;
               }
             },
-            _ => {}
+            _ => {},
           }
         }
       },
-      _ => {}
+      _ => {},
     }
   }
   for (const g of gets0) {
@@ -425,7 +518,7 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
         IGetField(t, _, _) => {
           rep[g] = [IBorrow(t, x)];
         },
-        _ => {}
+        _ => {},
       }
     }
   }
@@ -435,7 +528,7 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
         IGetField(t, _, _) => {
           rep[g] = vRef ? [IBorrow(t, v)] : [ICopy(t, OLocal(v))];
         },
-        _ => {}
+        _ => {},
       }
     }
   }
@@ -452,45 +545,39 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
   return Sra { ok: true, hit: hit, rep: rep };
 }
 
-// Rewrite the calls of converted functions in f. `conv[g]`: the type of the value function g now returns.
+// Does f call a function that `conv` converts?
+function callsConverted(conv: Option<MType>[], f: MFunction): bool {
+  return f.blocks.some(
+    blk => blk.instrs.some(
+      ins => match (ins) {
+        ICall(_, g, _) => conv[g].isSome(),
+        _ => false,
+      },
+    ),
+  );
+}
+
+// Rewrite the calls of converted functions in f. `conv[g]`: the type of the value function g now returns. The calls are
+// the same calls in the same order (the record they returned is built after the call, or not at all).
+@Requires(conv.length == p.functions.length && fnWellFormed(p, f))
+@Ensures(passKept(f, result) && result.blocks.length == f.blocks.length)
 function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFunction {
-  let any = false;
-  for (const blk of f.blocks) {
-    for (const ins of blk.instrs) {
-      match (ins) {
-        ICall(_, g, _) => {
-          if (conv[g].isSome()) {
-            any = true;
-          }
-        },
-        _ => {}
-      }
-    }
-  }
-  if (!any) {
+  if (!callsConverted(conv, f)) {
     return f;
   }
   const cnt = countsOf(f);
-  let locals = f.locals;
+  let locals = new Locals(f.locals);
   let blocks: MBlock[] = [];
   for (const blk of f.blocks) {
     const n = blk.instrs.length;
-    let hit: bool[] = [];
-    let rep: Instr[][] = [];
-    for (const _x of blk.instrs) {
-      hit.push(false);
-      rep.push([]);
-    }
-    let out: Instr[] = [];
-    let sps: Span[] = [];
+    // replacements of later instructions of the block, planned at the call whose record they destructure
+    let later = new RewritePlan(n);
+    let out = new BlockSink();
     let i: usize = 0;
     while (i < n) {
       const cs = blk.spans[i];
-      if (hit[i]) {
-        for (const r of rep[i]) {
-          out.push(r);
-          sps.push(cs);
-        }
+      if (later.touched(i)) {
+        out.emitAll(later.replacement(i), cs);
         i += 1;
       } else {
         let done = false;
@@ -510,41 +597,33 @@ function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFuncti
                     Some(dd) => {
                       isDst = dd == x0;
                     },
-                    None => {}
+                    None => {},
                   }
                   if (x0 >= f.paramCount && !isDst) {
                     x = x0;
                     direct = true;
                   }
                 },
-                _ => {}
+                _ => {},
               }
               if (!direct) {
-                x = locals.length;
-                locals.push(MLocal { name: "_", ty: MRef });
+                x = locals.fresh(MRef);
                 match (args[0]) {
                   OLocal(x0) => {
-                    out.push(IMove(x, x0));
+                    out.emit(IMove(x, x0), cs);
                   },
                   _ => {
-                    out.push(ICopy(x, args[0]));
-                  }
+                    out.emit(ICopy(x, args[0]), cs);
+                  },
                 }
               }
-              const v = locals.length;
-              locals.push(MLocal { name: "_", ty: vty });
-              let nargs: Operand[] = [OLocal(x)];
-              let k: usize = 1;
-              while (k < args.length) {
-                nargs.push(args[k]);
-                k += 1;
-              }
-              out.push(ICall(Some(v), g, nargs));
+              const v = locals.fresh(vty);
+              out.emit(ICall(Some(v), g, [OLocal(x)].concat(args.slice(1, args.length))), cs);
               match (dst) {
                 None => {
-                  out.push(IRelease(x));
+                  out.emit(IRelease(x), cs);
                   if (vRef) {
-                    out.push(IRelease(v));
+                    out.emit(IRelease(v), cs);
                   }
                 },
                 Some(d) => {
@@ -553,75 +632,83 @@ function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFuncti
                     let j = i + 1;
                     while (j < n) {
                       if (plan.hit[j]) {
-                        hit[j] = true;
-                        rep[j] = plan.rep[j];
+                        later.replace(j, plan.rep[j]);
                       }
                       j += 1;
                     }
                   } else {
-                    out.push(IStructNew(d, 0, [OLocal(x), OLocal(v)]));
+                    out.emit(IStructNew(d, 0, [OLocal(x), OLocal(v)]), cs);
                   }
-                }
+                },
               }
             }
           },
-          _ => {}
+          _ => {},
         }
         if (!done) {
-          out.push(blk.instrs[i]);
-        }
-        while (sps.length < out.length) {
-          sps.push(cs);
+          out.emit(blk.instrs[i], cs);
         }
         i += 1;
       }
     }
-    blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+    blocks.push(out.finish(blk.term, blk.termSpan));
   }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: locals,
-    ret: f.ret,
-    blocks: blocks
-  };
+  return withBody(f, locals.table(), blocks);
 }
 
-export function pairReturns(p: MProgram, pinned: bool[]): MProgram {
-  let shapes: PairShape[] = [];
-  let conv: Option<MType>[] = [];
-  let anyConv = false;
-  let fi: usize = 0;
-  while (fi < p.functions.length) {
-    const sh = pairShape(p, fi, pinned);
-    shapes.push(sh);
-    if (sh.ok) {
-      conv.push(Some(sh.ty));
-      anyConv = true;
-    } else {
-      conv.push(None);
-    }
-    fi += 1;
+// A converted function: in/out now, and its result is the value (the second slot) of the record it returned.
+export function convertedOk(before: MFunction, after: MFunction): bool {
+  return after.inout
+      && !before.inout
+      && after.name == before.name
+      && after.paramCount == before.paramCount
+      && after.blocks.length == before.blocks.length
+      && isRefTy(before.ret);
+}
+
+// The functions are the same functions (names, order, `main`, strings, vtables); only pair functions that are not
+// pinned (closure targets, vtable entries) and not `main` become in/out; every other signature is kept.
+export function pairsKept(p: MProgram, r: MProgram, pinned: bool[]): bool {
+  if (r.functions.length != p.functions.length
+      || r.main != p.main
+      || r.strings.length != p.strings.length) {
+    return false;
   }
-  if (!anyConv) {
+  let i: usize = 0;
+  while (i < p.functions.length) {
+    const a = p.functions[i];
+    const b = r.functions[i];
+    const kept = sameSignature(a, b);
+    if (!kept && (pinned[i] || i == p.main || !convertedOk(a, b))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Stage 5. The shapes of all functions are found first (a program-wide step in function order); then every function is
+// rewritten on its own: the callee side of a pair function, then its calls of converted functions.
+@Requires(pinned.length == p.functions.length && progWellFormed(p))
+@Ensures(pairsKept(p, result, pinned) && progWellFormed(result))
+export function pairReturns(p: MProgram, pinned: bool[]): MProgram {
+  const shapes = indices(p.functions.length).map(fi => pairShape(p, fi, pinned));
+  if (!shapes.some(sh => sh.ok)) {
     return p;
   }
-  let fns: MFunction[] = [];
-  fi = 0;
-  while (fi < p.functions.length) {
-    let f = p.functions[fi];
-    if (shapes[fi].ok) {
-      f = convertCallee(f, shapes[fi]);
-    }
-    fns.push(f);
-    fi += 1;
-  }
-  fi = 0;
-  while (fi < fns.length) {
-    fns[fi] = rewriteCalls(p, conv, fns[fi]);
-    fi += 1;
-  }
-  return MProgram { functions: fns, strings: p.strings, main: p.main, vtables: p.vtables, inlineFns: p.inlineFns };
+  const conv: Option<MType>[] = shapes.map(sh => sh.ok ? Some(sh.ty) : None);
+  const fns = indices(p.functions.length).map(
+    fi => rewriteCalls(
+      p,
+      conv,
+      shapes[fi].ok ? convertCallee(p.functions[fi], shapes[fi]) : p.functions[fi],
+    ),
+  );
+  return MProgram {
+    functions: fns,
+    strings: p.strings,
+    main: p.main,
+    vtables: p.vtables,
+    inlineFns: p.inlineFns,
+  };
 }

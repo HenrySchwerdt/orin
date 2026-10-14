@@ -2,11 +2,12 @@
 // ("ancestor") relation between borrowed locals and the locals they borrow from, successors.
 
 import { MType, MFunction, Operand, Instr, Terminator, SwitchCase } from "../mir";
+import { blocksLocalsBelow, instrLocals, termLocals } from "../mir";
 
 function lo(o: Operand): usize[] {
   return match (o) {
     OLocal(l) => [l],
-    _ => []
+    _ => [],
   };
 }
 
@@ -17,7 +18,7 @@ function los(os: Operand[]): usize[] {
       OLocal(l) => {
         out.push(l);
       },
-      _ => {}
+      _ => {},
     }
   }
   return out;
@@ -55,7 +56,7 @@ export function instrUses(i: Instr): usize[] {
     IClosure(_, _, caps) => los(caps),
     ICallIndirect(_, f, args) => lo(f).concat(los(args)),
     IIface(_, _, v) => lo(v),
-    ICallVirtual(_, r, _, args) => lo(r).concat(los(args))
+    ICallVirtual(_, r, _, args) => lo(r).concat(los(args)),
   };
 }
 
@@ -83,7 +84,7 @@ export function instrDef(i: Instr): Option<usize> {
     ICallIndirect(d, _, _) => d,
     IIface(d, _, _) => Some(d),
     ICallVirtual(d, _, _, _) => d,
-    _ => None
+    _ => None,
   };
 }
 
@@ -94,9 +95,9 @@ export function termUses(t: Terminator): usize[] {
     TSwitch(o, _, _) => lo(o),
     TReturn(r) => match (r) {
       Some(o) => lo(o),
-      None => []
+      None => [],
     },
-    TTrap(_) => []
+    TTrap(_) => [],
   };
 }
 
@@ -105,6 +106,7 @@ export function successors(t: Terminator): usize[] {
     TGoto(b) => [b],
     TBranch(_, a, b) => [a, b],
     TSwitch(_, cs, d) => {
+      // a loop: the liveness fixpoints call this for every block in every round
       let out: usize[] = [];
       for (const c of cs) {
         out.push(c.target);
@@ -113,17 +115,18 @@ export function successors(t: Terminator): usize[] {
       return out;
     },
     TReturn(_) => [],
-    TTrap(_) => []
+    TTrap(_) => [],
   };
 }
 
 export function isRefTy(t: MType): bool {
   return match (t) {
     MRef => true,
-    _ => false
+    _ => false,
   };
 }
 
+// A loop (not `includes`): `affects` calls it for every use of every instruction a pass scans.
 export function contains(xs: usize[], x: usize): bool {
   for (const y of xs) {
     if (y == x) {
@@ -137,18 +140,67 @@ export function contains(xs: usize[], x: usize): bool {
 function edgeSrc(f: MFunction, d: usize, o: Operand): Option<usize> {
   return match (o) {
     OLocal(l) => isRefTy(f.locals[d].ty) ? Some(l) : None,
-    _ => None
+    _ => None,
   };
 }
 
-// anc[d] = every local d may (transitively) be a borrowed projection of: sources of IBorrow /
-// IGetField / IArrayGet into a reference local, closed under the relation. Flow-insensitive, so
-// it over-approximates (a reused local counts as derived everywhere), which is the safe side.
-export function ancestors(f: MFunction): usize[][] {
+// A borrow edge: `d` is a borrowed projection of `src`.
+export type Edge = { d: usize; src: usize; };
+
+// The borrow edges of f, in block and instruction order: IBorrow, and IGetField / IArrayGet into a reference local.
+export function borrowEdges(f: MFunction): Edge[] {
+  let out: Edge[] = [];
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IBorrow(d, s) => {
+          out.push(Edge { d: d, src: s });
+        },
+        IGetField(d, o, _) => {
+          match (edgeSrc(f, d, o)) {
+            Some(l) => {
+              out.push(Edge { d: d, src: l });
+            },
+            None => {},
+          }
+        },
+        IArrayGet(d, o, _) => {
+          match (edgeSrc(f, d, o)) {
+            Some(l) => {
+              out.push(Edge { d: d, src: l });
+            },
+            None => {},
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  return out;
+}
+
+// `anc` is closed under the borrow edges of f: for every edge d <- s, s is an ancestor of d and so is every ancestor of
+// s; one entry per local, every entry a local. (A missing ancestor would let a pass move a release over a use of an
+// alias: a use after free the verifier then rejects, or worse, an alias the optimiser no longer sees.)
+export function ancestorsClosed(f: MFunction, anc: usize[][]): bool {
   const n = f.locals.length;
+  return anc.length == n
+      && anc.every(a => a.every(l => l < n))
+      && borrowEdges(f).every(
+        e => anc[e.d].includes(e.src) && anc[e.src].every(a => anc[e.d].includes(a)),
+      );
+}
+
+// anc[d] = every local d may (transitively) be a borrowed projection of: sources of IBorrow / IGetField / IArrayGet
+// into a reference local, closed under the relation. Flow-insensitive, so it over-approximates (a reused local counts
+// as derived everywhere), which is the safe side.
+@Requires(blocksLocalsBelow(f.blocks, f.locals.length) && tablesAgree(f))
+@Ensures(ancestorsClosed(f, result))
+export function ancestors(f: MFunction): usize[][] {
+  // the edges as two parallel index arrays (not `borrowEdges`' records): this runs once per parameter and pass
   let anc: usize[][] = [];
   let k: usize = 0;
-  while (k < n) {
+  while (k < f.locals.length) {
     anc.push([]);
     k += 1;
   }
@@ -167,7 +219,7 @@ export function ancestors(f: MFunction): usize[][] {
               ed.push(d);
               eo.push(l);
             },
-            None => {}
+            None => {},
           }
         },
         IArrayGet(d, o, _) => {
@@ -176,10 +228,10 @@ export function ancestors(f: MFunction): usize[][] {
               ed.push(d);
               eo.push(l);
             },
-            None => {}
+            None => {},
           }
         },
-        _ => {}
+        _ => {},
       }
     }
   }
@@ -232,9 +284,34 @@ export function termUsesAffecting(anc: usize[][], t: Terminator, x: usize): bool
   return false;
 }
 
+// The optimiser's use / definition tables agree with the shared, independent table of the locals an instruction
+// mentions (`instrLocals`, `termLocals` in mir/wellformed.or) on every instruction of f: what `instrUses` /
+// `instrDef` / `termUses` name is mentioned, and every mentioned local is used or defined. Catches an instruction kind
+// added to one table and not the other: a use the optimiser does not see is a release it may move across that use.
+export function tablesAgree(f: MFunction): bool {
+  return f.blocks.every(
+    b => b.instrs.every(i => sameSet(instrUses(i).concat(optList(instrDef(i))), instrLocals(i)))
+        && sameSet(termUses(b.term), termLocals(b.term)),
+  );
+}
+
+function optList(d: Option<usize>): usize[] {
+  return match (d) {
+    Some(x) => [x],
+    None => [],
+  };
+}
+
+// The same locals, ignoring order and repeats.
+function sameSet(a: usize[], b: usize[]): bool {
+  return a.every(x => b.includes(x)) && b.every(x => a.includes(x));
+}
+
 // Static use / definition counts of every local of f (instruction operands and terminators).
+@Invariant(this.uses.length == this.defs.length)
 export type Counts = { uses: usize[]; defs: usize[]; };
 
+@Ensures(result.uses.length == f.locals.length && result.defs.length == f.locals.length)
 export function countsOf(f: MFunction): Counts {
   let uses: usize[] = [];
   let defs: usize[] = [];
@@ -251,7 +328,7 @@ export function countsOf(f: MFunction): Counts {
         Some(d) => {
           defs[d] += 1;
         },
-        None => {}
+        None => {},
       }
     }
     for (const u of termUses(blk.term)) {
