@@ -2,12 +2,12 @@
 // ("ancestor") relation between borrowed locals and the locals they borrow from, successors.
 
 import { MType, MFunction, Operand, Instr, Terminator, SwitchCase } from "../mir";
-import { blocksLocalsBelow } from "../lower";
+import { blocksLocalsBelow, instrLocals, termLocals } from "../lower";
 
 function lo(o: Operand): usize[] {
   return match (o) {
     OLocal(l) => [l],
-    _ => []
+    _ => [],
   };
 }
 
@@ -18,7 +18,7 @@ function los(os: Operand[]): usize[] {
       OLocal(l) => {
         out.push(l);
       },
-      _ => {}
+      _ => {},
     }
   }
   return out;
@@ -56,7 +56,7 @@ export function instrUses(i: Instr): usize[] {
     IClosure(_, _, caps) => los(caps),
     ICallIndirect(_, f, args) => lo(f).concat(los(args)),
     IIface(_, _, v) => lo(v),
-    ICallVirtual(_, r, _, args) => lo(r).concat(los(args))
+    ICallVirtual(_, r, _, args) => lo(r).concat(los(args)),
   };
 }
 
@@ -84,7 +84,7 @@ export function instrDef(i: Instr): Option<usize> {
     ICallIndirect(d, _, _) => d,
     IIface(d, _, _) => Some(d),
     ICallVirtual(d, _, _, _) => d,
-    _ => None
+    _ => None,
   };
 }
 
@@ -95,9 +95,9 @@ export function termUses(t: Terminator): usize[] {
     TSwitch(o, _, _) => lo(o),
     TReturn(r) => match (r) {
       Some(o) => lo(o),
-      None => []
+      None => [],
     },
-    TTrap(_) => []
+    TTrap(_) => [],
   };
 }
 
@@ -107,14 +107,14 @@ export function successors(t: Terminator): usize[] {
     TBranch(_, a, b) => [a, b],
     TSwitch(_, cs, d) => cs.map(c => c.target).concat([d]),
     TReturn(_) => [],
-    TTrap(_) => []
+    TTrap(_) => [],
   };
 }
 
 export function isRefTy(t: MType): bool {
   return match (t) {
     MRef => true,
-    _ => false
+    _ => false,
   };
 }
 
@@ -172,13 +172,15 @@ export function ancestorsClosed(f: MFunction, anc: usize[][]): bool {
   const n = f.locals.length;
   return anc.length == n
       && anc.every(a => a.every(l => l < n))
-      && borrowEdges(f).every(e => anc[e.d].includes(e.src) && anc[e.src].every(a => anc[e.d].includes(a)));
+      && borrowEdges(f).every(
+        e => anc[e.d].includes(e.src) && anc[e.src].every(a => anc[e.d].includes(a)),
+      );
 }
 
 // anc[d] = every local d may (transitively) be a borrowed projection of: sources of IBorrow / IGetField / IArrayGet
 // into a reference local, closed under the relation. Flow-insensitive, so it over-approximates (a reused local counts
 // as derived everywhere), which is the safe side.
-@Requires(blocksLocalsBelow(f.blocks, f.locals.length))
+@Requires(blocksLocalsBelow(f.blocks, f.locals.length) && tablesAgree(f))
 @Ensures(ancestorsClosed(f, result))
 export function ancestors(f: MFunction): usize[][] {
   let anc: usize[][] = f.locals.map(l => []);
@@ -223,6 +225,29 @@ export function termUsesAffecting(anc: usize[][], t: Terminator, x: usize): bool
   return termUses(t).some(u => affects(anc, u, x));
 }
 
+// The optimiser's use / definition tables agree with the lowering's independent table of the locals an instruction
+// mentions (`instrLocals`, `termLocals` in lower/wellformed.or) on every instruction of f: what `instrUses` /
+// `instrDef` / `termUses` name is mentioned, and every mentioned local is used or defined. Catches an instruction kind
+// added to one table and not the other: a use the optimiser does not see is a release it may move across that use.
+export function tablesAgree(f: MFunction): bool {
+  return f.blocks.every(
+    b => b.instrs.every(i => sameSet(instrUses(i).concat(optList(instrDef(i))), instrLocals(i)))
+        && sameSet(termUses(b.term), termLocals(b.term)),
+  );
+}
+
+function optList(d: Option<usize>): usize[] {
+  return match (d) {
+    Some(x) => [x],
+    None => [],
+  };
+}
+
+// The same locals, ignoring order and repeats.
+function sameSet(a: usize[], b: usize[]): bool {
+  return a.every(x => b.includes(x)) && b.every(x => a.includes(x));
+}
+
 // Static use / definition counts of every local of f (instruction operands and terminators).
 @Invariant(this.uses.length == this.defs.length)
 export type Counts = { uses: usize[]; defs: usize[]; };
@@ -244,7 +269,7 @@ export function countsOf(f: MFunction): Counts {
         Some(d) => {
           defs[d] += 1;
         },
-        None => {}
+        None => {},
       }
     }
     for (const u of termUses(blk.term)) {

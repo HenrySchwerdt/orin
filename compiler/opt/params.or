@@ -9,10 +9,15 @@
 // Liveness is alias-aware (a use of a borrowed projection of p counts as a use of p), which keeps the release after
 // every use of an alias that the verifier would otherwise see dead.
 
-import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr, Terminator, SwitchCase, spanAt } from "../mir";
+import {
+  MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr, Terminator, SwitchCase, spanAt,
+} from "../mir";
 import { Span } from "../diag";
 import { Locals } from "../lower";
-import { successors, ancestors, affects, usesAffecting, termUsesAffecting, entryHasPredecessor, isRefTy } from "./analysis";
+import {
+  instrUses, successors, ancestors, affects, usesAffecting, termUsesAffecting, entryHasPredecessor,
+  isRefTy,
+} from "./analysis";
 import { BlockSink, withBody } from "./rewrite";
 import { fnShapeOk, fnWellFormed, passKept, onlyEdgeBlocksAdded, releaseCount } from "./wellformed";
 
@@ -43,7 +48,8 @@ export function livenessSolved(f: MFunction, lv: PLive, usedIn: bool[]): bool {
 
 // Does block b use p (an alias of p counts)?
 function blockUses(f: MFunction, anc: usize[][], b: usize, p: usize): bool {
-  return termUsesAffecting(anc, f.blocks[b].term, p) || f.blocks[b].instrs.some(ins => usesAffecting(anc, ins, p));
+  return termUsesAffecting(anc, f.blocks[b].term, p)
+      || f.blocks[b].instrs.some(ins => usesAffecting(anc, ins, p));
 }
 
 // Backward liveness of parameter p (no kills: parameters are never redefined).
@@ -130,7 +136,7 @@ export type CallSite = { callee: usize; pos: usize; };
 
 // Where parameter p of f is consumed at its last use. Not `ok`: p can never be owned (it is not a reference, the entry
 // block is a loop head, or a terminator uses it), and then nothing was collected.
-@Invariant(this.ok || (!this.dup && this.calls.length == 0))
+@Invariant(this.ok || !this.dup && this.calls.length == 0)
 export type PSites = { ok: bool; dup: bool; calls: CallSite[]; };
 
 @Requires(fnShapeOk(f) && p < f.paramCount)
@@ -214,7 +220,16 @@ type RU = { pre: Instr[]; main: Instr; consumed: bool; };
 
 // Rewrite one instruction that uses p. `dead`: p is not live after it. `tmp`: index the first temporary local would get
 // (one per element of `pre`).
-function rewriteUse(prog: MProgram, anc: usize[][], ins: Instr, p: usize, dead: bool, tmp: usize): RU {
+@Ensures(!result.consumed || dead)
+@Ensures(result.pre.length <= instrUses(ins).length)
+function rewriteUse(
+  prog: MProgram,
+  anc: usize[][],
+  ins: Instr,
+  p: usize,
+  dead: bool,
+  tmp: usize,
+): RU {
   return match (ins) {
     IDup(d, o) => {
       if (dead && isLocalOp(o, p)) {
@@ -253,7 +268,12 @@ function rewriteUse(prog: MProgram, anc: usize[][], ins: Instr, p: usize, dead: 
 
 // The block that releases `p` on the edge out of `blk` towards `target`; its code has the position of `blk`'s terminator.
 function edgeBlock(blk: MBlock, p: usize, target: usize): MBlock {
-  return MBlock { instrs: [IRelease(p)], spans: [blk.termSpan], term: TGoto(target), termSpan: blk.termSpan };
+  return MBlock {
+    instrs: [IRelease(p)],
+    spans: [blk.termSpan],
+    term: TGoto(target),
+    termSpan: blk.termSpan,
+  };
 }
 
 // The edge blocks a function gains, appended after its `base` blocks (block ids `base`, `base + 1`, ...): each releases
@@ -274,7 +294,9 @@ class EdgeBlocks {
   // continues at t.
   @Requires(p == this.p && t < this.base)
   @Ensures(live ==> result == t)
-  @Ensures(!live ==> result == this.base + this.blocks.length - 1 && this.blocks.length == old(this.blocks.length) + 1)
+  @Ensures(!live
+      ==> result == this.base + this.blocks.length - 1
+          && this.blocks.length == old(this.blocks.length) + 1)
   target(src: MBlock, p: usize, t: usize, live: bool): usize {
     if (live) {
       return t;
@@ -341,7 +363,10 @@ export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction 
         TSwitch(o, cs, d) => {
           let ncs: SwitchCase[] = [];
           for (const k of cs) {
-            ncs.push(SwitchCase { value: k.value, target: extra.target(blk, p, k.target, lv.liveIn[k.target]) });
+            ncs.push(SwitchCase {
+              value: k.value,
+              target: extra.target(blk, p, k.target, lv.liveIn[k.target]),
+            });
           }
           const nd = extra.target(blk, p, d, lv.liveIn[d]);
           term = TSwitch(o, ncs, nd);
