@@ -381,6 +381,267 @@ other and sizes add up).
   occupies 8 bytes; `@Test` has no "expected trap" form (`tests/std/expect_trap/` and `tools/test_std.sh` fill that gap).
 * Mutating methods cannot be called inside `&&`, `||` or `?:` (E0408), nor on a temporary (E0401): `let r = new ByteReader(b);`.
 
+## std:http (ADR-0030 §3, layer "protocols"): the pure message layer of HTTP/1.1
+
+`std:http` is the **pure** part of HTTP/1.1 (RFC 9110, RFC 9112): message types, an incremental **request parser**, an
+incremental **response parser** and a **serializer**, all over `std:bytes`. No sockets, no I/O, no grants, no L0 change:
+the module imports nothing but `std:bytes` and has no grant parameter, so it performs no I/O: the purity inference of ADR-0031 A4 confirms it, because the serializers call the parser inside an `@Ensures` and E0416 would reject an impure function there. The network
+part (`std:net`, a server loop) follows ADR-0033 and only has to move bytes in and out of these functions.
+
+**Request smuggling.** Two parsers on one path that disagree about where a message ends or what a header says are the
+root of request smuggling and response splitting (RFC 9112 §6.3, §11.2, §11.3). This module refuses every such
+ambiguity instead of guessing, with a distinct reason and the byte position (table below), so a front end and a back
+end built on it cannot be driven apart by `Content-Length` + `Transfer-Encoding`, a duplicate or non-numeric length,
+`Transfer-Encoding : chunked`, obs-fold, a bare LF or CR, or a chunk size that overflows. Header injection is
+impossible by construction: `Headers` validates names and values in its constructor and in `add`/`set`, and the
+serializer can only write a `Headers`.
+
+### API
+
+```
+// types
+type HttpVersion = Http10 | Http11
+type Method = Get | Head | Post | Put | Delete | Connect | Options | Trace | Patch | Ext(string)   // Ext: any other token
+type HttpError = { position: usize; reason: HttpReason; message: string }      // 34 reasons: BadMethod ... UnexpectedEof
+type ParseResult<T> = NeedMore | Done(T, usize) | Failed(HttpError)             // Done(message, bytes of THIS chunk used)
+class Headers      // invariants: names are tokens, values contain no CR/LF/NUL/other control, no leading/trailing blank
+  new Headers(names: string[], values: string[])      // validates in EVERY build (traps)
+  count()  nameAt(i)  valueAt(i)  countOf(n)  has(n)  get(n): Option<string>  getAll(n): string[]   // names case-insensitive
+  add(n, v): Result<void, HeaderError>  set(n, v)  remove(n): usize  equals(o)                       // add/set validate first
+class Status       // invariant: 100 <= code <= 599, reason phrase has no CR/LF/NUL
+  new Status(code, reason)  code()  reason()  hasNoBody()  equals(o);   standardStatus(code)  makeStatus(code, reason)
+class Request      // invariant: requestProblem(...) == "" (valid method and target, one Host on HTTP/1.1, unambiguous
+  new Request(method, target, version, headers, body: Bytes, trailers)  // framing that matches the body); traps otherwise
+  method() target() version() headers() body() trailers() isChunked() equals(o);   makeRequest(...): Result<Request, string>
+class Response     // invariant: responseProblem(...) == "" ; forHead = response to a HEAD request
+  new Response(status, version, headers, body, trailers, forHead)  status() version() headers() body() trailers()
+  isBodyless() isForHead() isChunked() equals(o);   makeResponse(...): Result<Response, string>
+// limits
+class Limits       // new Limits(maxStartLine, maxHeaderCount, maxHeaderLine, maxHeaderBytes, maxChunkLine, maxBody); defaultLimits()
+// incremental parsers (state machine, see below)
+class RequestParser   { new RequestParser(limits)  feed(chunk: Bytes): ParseResult<Request>  atEof()  reset()
+                        isIdle() isDone() isFailed() consumed() stateName() }
+class ResponseParser  { new ResponseParser(limits, forHead)   feed(chunk): ParseResult<Response>  atEof()  reset() ... }
+parseRequest(data, limits)  parseResponse(data, limits, forHead)  parseResponseToEof(data, limits, forHead)   // one-shot
+// serializer: parse(serialize(m)) == m
+serializeRequest(r): Bytes   serializeRequestChunked(r, chunkSize)   serializeResponse(r)   serializeResponseChunked(r, chunkSize)
+// helpers
+methodName  methodFromToken  isToken  isFieldValue  isReasonPhrase  isHostValue  isValidTarget  parseContentLength  eqIgnoreCase
+requestProblem  responseProblem  headerErrorMessage  reasonName  reasonText  stateName  edgeAllowed  hexString
+```
+
+```ts
+import { RequestParser, Done, NeedMore, Failed, defaultLimits, methodName } from "std:http";
+let p = new RequestParser(defaultLimits());
+match (p.feed(bytesFromString("GET /a HTT"))) { NeedMore => ..., Done(q, used) => ..., Failed(e) => ... }  // NeedMore
+match (p.feed(bytesFromString("P/1.1\r\nHost: h\r\n\r\nGET /b"))) {
+  Done(q, used) => { /* q is GET /a; the chunk's remaining bytes (from `used`) start the next message */ p.reset(); }
+  ...
+}
+```
+
+### Incremental contract
+
+`feed(chunk)` accepts bytes in **arbitrary chunks** (as `recv` delivers them). `NeedMore`: every byte of the chunk was
+consumed into the parser state. `Done(message, used)`: the message is complete after `used` bytes of *this* chunk; the
+rest of the chunk is the start of the next pipelined message (`reset()` first). `Failed(e)`: refused; the parser is
+sticky-failed until `reset()`. A partial message is never returned as complete, a message split anywhere (every byte
+position, 1-byte chunks, random and empty chunks) gives the identical result (same kind, same total, same error
+reason and position, same message: `tests/std/http_split_test.or`). Error positions are 0-based offsets from the first
+byte of the message: the offending byte; for a limit the first byte over it; for a rule over a whole line (duplicate
+field, `Content-Length` syntax, `Host`) the first byte of that line; for rules over the whole head (both
+`Content-Length` and `Transfer-Encoding`, missing `Host`, body limit of a `Content-Length`) the CR of the empty line;
+for a request-target shape error the first byte of the target. `atEof()` (the peer closed the connection): `Done` for a
+response whose body is delimited by the close (no `Content-Length`, no chunking, RFC 9112 §6.3 rule 8), otherwise
+`Failed(UnexpectedEof)` at the number of bytes received; `isIdle()` tells a clean close between messages from a cut-off
+one. A response to a HEAD request (`forHead`), and every 1xx, 204 and 304 response, has no body whatever its headers say.
+
+### Limits (parameters, `@Requires` and class invariants of `Limits`)
+
+| Parameter | Default | Range | Error at the first byte over it |
+|---|---|---|---|
+| `maxStartLine` (request line / status line) | 8192 | 16 .. 1 MiB | `StartLineTooLong` |
+| `maxHeaderCount` (header fields; trailer fields separately) | 100 | 1 .. 65536 | `TooManyHeaders` |
+| `maxHeaderLine` (one header line, without CRLF) | 8192 | 16 .. 1 MiB | `HeaderLineTooLong` |
+| `maxHeaderBytes` (start line .. empty line; the trailer section separately) | 65536 | 64 .. 64 MiB | `HeadersTooLarge` |
+| `maxChunkLine` (chunk-size line incl. extension) | 1024 | 8 .. 65536 | `ChunkLineTooLong` |
+| `maxBody` (decoded body) | 1 MiB | 0 .. 2^40 | `BodyTooLarge` |
+
+The upper ranges are chosen so that the chunk-size arithmetic `size * 16 + 15` can never overflow: a chunk size is
+checked digit by digit against the remaining body allowance, so `FFFFFFFFFFFFFFFF` is refused at the sixth digit.
+
+### Rules enforced (reason name, RFC section)
+
+| Rule | Reason | RFC |
+|---|---|---|
+| bare LF or bare CR where CRLF is required (start line, header lines, chunk lines, chunk end, trailers) | `BareLf`, `BareCr` | 9112 §2.2 |
+| obs-fold (a header line starting with SP or HTAB), also after the request line | `ObsFold` | 9112 §5.2 |
+| whitespace between a field name and the colon; missing colon; empty or non-token name | `SpaceBeforeColon`, `MissingColon`, `BadHeaderName` | 9112 §5.1 |
+| NUL, DEL or any other control character in a field value, reason phrase, chunk extension | `BadHeaderValue`, `BadStatusLine`, `BadChunkExtension` | 9110 §5.5 |
+| invalid method token; a single SP between the three parts; `HTTP/1.0` and `HTTP/1.1` only | `BadMethod`, `BadTarget`, `BadVersion`, `UnsupportedVersion` | 9112 §3 |
+| request-target shape: origin-form, absolute-form, `*` only for OPTIONS, authority-form only for CONNECT; only 0x21..0x7E, no fragment | `BadTarget` | 9112 §3.2 |
+| status code: exactly three digits, 100..599 | `BadStatusCode`, `BadStatusLine` | 9112 §4 |
+| `Content-Length` and `Transfer-Encoding` together | `ContentLengthWithTransferEncoding` | 9112 §6.3 |
+| duplicate `Content-Length` (even equal values), a list, a sign, hex, more than 18 digits | `DuplicateContentLength`, `BadContentLength` | 9112 §6.3 |
+| `Transfer-Encoding` other than exactly `chunked`, a duplicate, on HTTP/1.0 | `UnsupportedTransferEncoding`, `DuplicateTransferEncoding` | 9112 §6.1 |
+| `Content-Length` / `Transfer-Encoding` in a 1xx or 204 response | `ForbiddenFraming` | 9110 §8.6 |
+| chunk size: empty, not hexadecimal (`-1`, `+5`, `0x5`), overflowing the body limit; chunk not followed by CRLF | `BadChunkSize`, `BodyTooLarge`, `BadChunkTerminator` | 9112 §7.1 |
+| chunk extensions are skipped (control characters refused); trailers parsed with the same field rules, not merged into the headers, framing fields (`Content-Length`, `Transfer-Encoding`, `Trailer`, `Host`) refused | `ForbiddenTrailer` | 9110 §6.5.1 |
+| an HTTP/1.1 request needs exactly one valid `Host` | `MissingHost`, `DuplicateHost`, `BadHost` | 9112 §3.2 |
+
+Deliberately stricter than the RFC where leniency is only a smuggling risk: no leading empty lines before the request
+line (`BadMethod` at byte 0), no repeated `Content-Length` even if the values are equal, no transfer coding but
+`chunked`, no raw non-ASCII bytes in the request-target.
+
+### Serializer and the round-trip contract
+
+`serializeRequest(r)`, `serializeResponse(r)` (and the `...Chunked(r, chunkSize)` forms) write the start line, the
+fields in order, the empty line and the body (`Content-Length`/close-delimited bodies as they are, chunked bodies as
+chunks of at most `chunkSize` bytes with the trailers). They add or change nothing: the framing already is
+consistent with the body, because `Request` and `Response` enforce that in their constructor and invariant
+(`requestProblem`, `responseProblem`). **Round-trip contract** (an `@Ensures` of each serializer, checked by `orin
+test` on every call): the parser accepts the output, with limits that fit it, and returns a message equal to the
+input, `parse(serialize(m)) == m`. A bodyless response (HEAD, 1xx, 204, 304) is written without body bytes.
+`tests/std/http_prop_test.or` also checks the output byte for byte against a naive string-building reference
+serializer and the round trip for random messages (1000), random chunk sizes and 1-byte and random input chunking.
+
+### State machine and contracts
+
+The parser is a table of 23 explicit states (`stateName`): `METHOD TARGET VERSION CODE REASON START_LF HDR_LINE HDR_NAME
+HDR_OWS HDR_VALUE HDR_LF HEAD_END_LF BODY CHUNK_SIZE CHUNK_BWS CHUNK_EXT CHUNK_SIZE_LF CHUNK_DATA CHUNK_CR CHUNK_LF
+BODY_CLOSE DONE ERROR` (the diagram is at the top of `stdlib/http.or`). The transition relation is the function
+`edgeAllowed(src, dst)`; every state change goes through one private method that `@Requires` the edge, so a checked
+build traps on a transition that is not in the diagram. The class invariant ties state to data (the state is one of the
+23; `ERROR` iff an error is stored; header lists parallel and within the count limit; line length within its limit;
+bytes consumed within the header budget while in the head; at most one `Content-Length`, `Transfer-Encoding` and
+`Host` seen; pending body bytes only in a body state; `BODY` has Content-Length framing; a response parser never in
+`METHOD`/`TARGET`). Every step has `@Ensures` progress (the cursor moves or the parser fails), which is the
+termination argument of `feed`.
+
+### Algorithm and measured throughput
+
+One forward pass, no backtracking, no look-ahead, no regular expressions. Bytes are classified by a 256-entry table
+(`HTTP_CLASS`: control, LF, CR, HTAB, SP, obs-text, other VCHAR, `:`, `;`, token symbol, letter, hex letter, digit,
+numbered so that "token character" is `class >= 10` and "may occur in a field value" is `class >= 3`) and a
+256-entry hex-value table; Orin has no constant arrays or bitwise operators, so both are string constants read with
+`charCodeAt`, like the DFA tables of `std:utf8`; `tests/std/http_test.or` recomputes every entry from the RFC
+character sets. Runs of ordinary bytes (a method, a name, a value) are scanned in a tight loop, converted to a string
+once per token and handled once per run; the state changes once per token. Bodies are never copied byte by byte: a body
+that arrives in one chunk is a slice of the input (O(1)). The scanner reads the input through a 4096-byte window
+(`chunk.slice(w, we).toArray()`): indexing a `u8[]` is two orders of magnitude cheaper than calling `Bytes.at` per byte.
+
+Contract counts (`stdlib/http.or`, 2977 lines): 34 `@Invariant`, 49 `@Requires`, 131 `@Ensures`.
+
+Throughput (`tests/std/bench/http_bench.or`, production build without contract checks, 1 MB = 1048576 bytes; corpus: a
+763-byte browser GET with 15 headers and a 160-byte cookie, a curl GET, a 544-byte JSON POST with a bearer token, a
+725-byte chunked PUT with a trailer; 4 cores shared with other workers, so read the numbers as indicative):
+
+| Workload (production build) | Messages | MB/s | Messages/s |
+|---|---|---|---|
+| browser GET (763 B, 15 headers), one chunk | 20,000 | 55.7 | 76,000 |
+| curl GET (83 B), one chunk | 50,000 | 29.7 | 376,000 |
+| JSON POST with bearer token (544 B), one chunk | 20,000 | 68.7 | 132,000 |
+| chunked PUT with trailer (725 B), one chunk | 20,000 | 79.0 | 114,000 |
+| **mixed corpus, one chunk** | 40,000 | **61.8** | 123,000 |
+| mixed corpus, 64-byte chunks | 20,000 | 44.4 | 84,000 |
+| mixed corpus, 1-byte chunks (worst case) | 2,000 | 1.3 | 2,400 |
+| response 200 with 512-byte body | 20,000 | 110.8 | 120,000 |
+| serialize the JSON POST | 20,000 | 126.5 | 247,000 |
+
+With contract checking (`--check-contracts`: every invariant after every public method, the round-trip contract of
+the serializer) the parser reaches 20-33 MB/s (23 MB/s mixed) and the serializer 4 MB/s, which is why the build used
+for deployment is the unchecked one and the tests run both. Before the window and `void`-step rewrite the same corpus
+ran at 26 MB/s.
+
+What the numbers are made of (gprof of the generated C): about a quarter of the time is building the strings of names,
+values and the target (no bulk bytes-to-string primitive: one `String.fromCharCode` + append per byte, 7 ns), a tenth the
+copy of the window, the rest scanning, the validation that makes `Headers`/`Request` valid by construction (the parser
+output goes through the same constructors as user code) and allocation. Two measured facts about the object model shaped
+the code: a *mutating method with a result* allocates a pair `(this, result)` per call (the first version, with
+`advance(): usize` steps, spent half its time there, 26 MB/s; steps that return `void` and leave the cursor in a field
+gave 2x), and `s = s + t` on a field copies while `s += t` appends in place (100,000 one-byte feeds: 275 ms against 1 ms).
+
+### Tests
+
+`tests/std/http_test.or` (24 `@Test`: character classes against the RFC sets, methods, targets, `Headers`, `Status`,
+construction rules, valid messages, chunk extensions, trailers, pipelining, reset), `http_reject_test.or` (32: every
+rejection with its reason and position, the smuggling vectors CL+TE, duplicate and conflicting `Content-Length`,
+`Transfer-Encoding :`, obs-fold, chunk-size overflow, negative and overlong chunk sizes, all limits, responses, EOF,
+the state machine API), `http_split_test.or` (9: 62 request and 24 response messages, valid, invalid and
+partial, fed one-shot, split at every byte position, in 1-byte and random chunks, plus messages larger than the
+scanner window), `http_prop_test.or` (7: serializer round trip and differential test against a naive serializer,
+differential test of the parser against an executable specification, `refRequest`, on random messages and on mutations,
+and the fuzz harness). **Fuzzing**: 20,000 random mutations of valid requests (flip, insert, delete, duplicate, swap,
+truncate, special bytes, CRLF to LF/CR, whitespace around the colon), 10,000 of responses and 10,000 random garbage inputs;
+none may trap, the parser and the specification must agree on accept and refuse, one-shot and random chunking must
+agree, and everything accepted survives parse, serialize, parse unchanged. Five more tests in `tests/std/expect_trap/`
+must trap in every build (constructors of `Headers`, `Status`, `Request`, `Response`, `Limits`).
+`tools/mutate_std.py --module http`: 41 mutants of the parser, rules, limits, serializer and constructors, all killed
+(`41 mutants, 41 killed with contracts on: 18 by a contract violation, 23 by tests; 34 of them are also killed without contracts by the first test file that kills them, 5 by the trap tests of the constructors (which run without contracts by design), and 2 (`reset` keeping its error, `consumed` counting the chunk) only show up in that file as contract violations`).
+
+### Not covered
+
+HTTP/2 and HTTP/3, TLS, sockets and every other I/O (ADR-0033), content codings (`gzip`, `Transfer-Encoding` other than
+`chunked`), `Expect: 100-continue` and interim-response handling (a 1xx response is returned as a response; the caller
+resets the parser), `Upgrade`/CONNECT tunnels (the response to CONNECT is not special-cased), `Connection` and
+keep-alive decisions, URI parsing beyond the shape of the request-target, cookies, caching and every header semantic
+other than framing and `Host`, streaming bodies (a body is collected, up to `maxBody`), and proofs: the contracts are
+checked at run time and by tests; `orin verify --contracts` does not cover strings, arrays, classes or loops (ADR-0031 B).
+
+### Friction found (language and tooling)
+
+* Mutating methods that return a value allocate a result pair; the hot path therefore uses `void` methods and a cursor
+  field. A big class with nested mutating calls and no private constructors forced the shape of `MessageParser`.
+* No constant arrays (tables are string constants), no bitwise operators (class codes are ordered so ranges replace
+  masks), no bulk bytes-to-string or array-to-string primitive, no `u8[]` capacity.
+* Orin values are copied, so a random number generator or any other stateful helper must be one class whose methods
+  mutate `this`; a helper function cannot advance the caller's generator.
+* Top-level `const` must be a literal (no `+` of two strings); `from` is a keyword (a parameter named `from` is an error);
+  a mutating call is not allowed inside `&&`, `||`, `?:` or a `while` condition.
+* The result variant is `Failed`, not `Err`, because `Err` is the constructor of `Result` and a module that uses both
+  could not tell them apart.
+* A constructor of a class with an invariant must check in every build (`enforce`), because `@Requires` is erased
+  without `--check-contracts` and there are no private constructors; the guards that run in every build are loops
+  (`allTokens`, `allFieldValues`: a closure call per element is too slow on the parser's hot path), while the clauses use
+  `every`/`some`/`filter` now that ADR-0031 A has landed (`Headers.has`, `countOf`, `getAll`).
+* The round-trip contract calls the parser inside an `@Ensures`; that is allowed because the parser is pure, but the
+  checked build then parses every serialized message once more.
+
+### What a server needs from ADR-0033
+
+The parser and serializer are transport-agnostic: a server loop is `recv` -> `feed` -> handle -> `serialize` -> `send`.
+What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it *well* and *safely*:
+
+1. **A bulk path from the L0 receive buffer to `Bytes`.** `recv(stream, buf, cap, timeout_ms, out_len)` fills a C
+   buffer; `std:net` must turn it into a `Bytes` without a per-byte loop. Today a `u8[]` can only be built by `push`
+   (about 8 ns per byte, a third of the parser's own cost) and an element takes 8 bytes. Needed: an L1 primitive
+   "new `u8[]` / `Bytes` from the first `len` bytes of a raw buffer" (one `memcpy`), and the reverse for `send`
+   (`Bytes` slice `[off, off+len)` to the L0 buffer, so partial writes resend the tail without copying the rest).
+2. **A tagged receive result**: `Data(n)` | `Eof` (orderly close, 0 bytes) | `Timeout` | `Reset`/error. `atEof()` must
+   be called on `Eof` only; a timeout is not an end of message (the server answers 408 or closes).
+3. **A monotonic clock and a deadline for the whole head.** Per-call timeouts do not stop a slowloris client that
+   sends one byte per `timeout - 1` ms; the limits of `std:http` bound bytes, not time. The server needs a monotonic
+   clock (`std:time.nowMillis` is the wall clock) or a `recv` variant that takes an absolute deadline, to cut off a
+   request whose head or body is not complete within a total budget; also an idle timeout between pipelined
+   messages (`isIdle()` tells a clean close from a cut-off one).
+4. **Half-close.** `net_close` alone makes the OS send RST when unread request bytes remain, which can discard the
+   response (for example the `413`/`400` sent after a refused message). A graceful close needs
+   `shutdown(stream, write)` then a bounded drain then `close`: one more L0 function.
+5. **Per-connection scope with resources.** Streams are resources (ADR-0025: not storable, not capturable), so the
+   server is `acceptEach(listener, timeout, (stream) => ...)` with the `RequestParser`, a normal value, living beside the
+   stream inside the callback. The listener grant should narrow to `addr:port` as in the ADR; the accepted stream
+   should carry the peer address as a value (for logs and `Forwarded` checks).
+6. **One connection at a time until ADR-0017 lands**: a slow client blocks every other, so the first server is only
+   safe behind the timeouts of items 3-4; keep-alive needs an idle timeout shorter than the header deadline.
+7. **Socket options in `tcp_listen`**: `SO_REUSEADDR` on by default, `TCP_NODELAY` per stream, a backlog parameter
+   (already in the ADR). `Expect: 100-continue` only needs `send` before the body is read, but then the parser must
+   hand back the head before the body: a streaming/head-only mode of `std:http` (a follow-up of this module, not an
+   L0 change), which large uploads need as well (today a body is collected up to `maxBody`).
+8. **TLS later** only needs the same two byte interfaces (`Bytes` in, `Bytes` out): the parser does not change.
+
+None of this changes `std:http` itself; items 1, 3 and 4 are L0/L1 additions (about 40 lines of C with contracts), the
+rest is `std:net` design.
+
 ## Limitations
 
 * No floats/`Map`: `JNum` is `int`, no `std:math`, `std:map`, edge weights, `sleep`, fractional seconds.
