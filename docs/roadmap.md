@@ -17,11 +17,15 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - violation reports with values and blame; **done** (ADR-0031 A1-A2);
    - enforced record invariants and pure functions in contracts; **done** (A3-A5: purity is inferred, contract-internal
      calls are unchecked; docs/contracts.md);
-   - static per-method proofs of class invariants;
-   - business-logic patterns: quantifiers, `sum`, conservation laws, executable specs, state
-     machines, `std:decimal` and `@Property`.
+   - static verification of arrays, records, `Option` / `Result` / `Map`, exact integer widths, modular calls, per-method
+     proofs of class invariants, frames inferred from the mutation analysis, loop invariants (the existing `@Invariant`
+     syntax, inferred counter bounds, bounded unrolling); **done** (ADR-0031 B 6-9, ADR-0036);
+   - business-logic patterns: bounded quantifiers (`every` / `some` / `range`), `sum` / `sumBy` (`std:seq`) and conservation
+     laws; **done** (C 11-13, ADR-0036); executable specs, state machines, `std:decimal` and `@Property` remain.
 
-   ADR-0031 part A (items 1-5) is done; parts B-E remain.
+   ADR-0031 parts A (items 1-5), B (6-9) and C 11-13 are done; the rest of C, D and E remain. What the verifier still cannot do
+   is listed in docs/contracts.md ("Semantics (honest limits)") and ADR-0036; the biggest gaps are loop invariants that nobody
+   has written, `?`, and unit-aware type names.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
@@ -57,7 +61,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - *before performance*, because allocation, RC elision and escape analysis depend on the
      threading model, and the comparison with Go needs parallelism;
    - the HTTP server becomes concurrent here.
-6. **Performance push:**
+6. **Performance push** (performance model: ADR-0038, inferred allocation and invariant-driven optimisation, no user-facing arena types):
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
    - **contract-driven optimisation** (ADR-0031 §E). Only `VERIFIED` facts remove checks or change

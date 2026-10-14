@@ -1,0 +1,590 @@
+// Types of the contract verifier (ADR-0031 B6): the value types it can model, the program's type tables and
+// the translation of source type expressions to them. The SMT sort of a type is chosen in gen.or.
+//
+// Supported value types: the integer types (`int`/`i64`, `i8 i16 i32 u8 u16 u32 u64 isize usize`, each with
+// its exact range), `bool`, `string` (by length only), arrays, `Option<T>`, `Result<T, E>`, `Map<K, V>`,
+// records, classes and unions without type parameters. Floats, function values, interface values, resource
+// handles and generic user types are outside the fragment (`VBad` carries the reason).
+
+import { Ident, TypeExpr, TNamed, TArray, TFn, TypeDecl, TypeDeclBody, DAlias, DRecord, DUnion, ClassDecl, ClassMember, MField, MCtor, ContractClause, VariantDecl, FieldDecl } from "../syntax";
+
+export type VT =
+  VInt(string)          // kind: int i8 i16 i32 u8 u16 u32 u64 isize usize; "?" is the type of a bare literal (adopts the other operand)
+  | VBool
+  | VStr
+  | VUnit
+  | VArr(VT)
+  | VOpt(VT)
+  | VRes(VT, VT)
+  | VMap(VT, VT)
+  | VRec(string)        // record type or class, by simple name
+  | VUni(string)        // user union, by simple name
+  | VOpq(string)        // an opaque handle (a capability grant, a file): passed around, never inspected
+  | VBad(string);       // outside the fragment, with the reason
+
+// ---------------------------------------------------------------------------------------------- integers
+
+// Is `k` the name of an integer type (not "?")?
+export function isIntKind(k: string): bool {
+  return k == "int" || k == "i8" || k == "i16" || k == "i32" || k == "u8" || k == "u16" || k == "u32" || k == "u64"
+    || k == "isize" || k == "usize";
+}
+
+// Lower bound of an integer kind as an SMT term. A bare literal ("?") has no bound of its own.
+@Ensures(result.length > 0)
+export function intLo(k: string): string {
+  if (k == "i8") {
+    return "(- 128)";
+  }
+  if (k == "i16") {
+    return "(- 32768)";
+  }
+  if (k == "i32") {
+    return "(- 2147483648)";
+  }
+  if (k == "u8" || k == "u16" || k == "u32" || k == "u64" || k == "usize") {
+    return "0";
+  }
+  return "(- 9223372036854775808)";
+}
+
+@Ensures(result.length > 0)
+export function intHi(k: string): string {
+  if (k == "i8") {
+    return "127";
+  }
+  if (k == "i16") {
+    return "32767";
+  }
+  if (k == "i32") {
+    return "2147483647";
+  }
+  if (k == "u8") {
+    return "255";
+  }
+  if (k == "u16") {
+    return "65535";
+  }
+  if (k == "u32") {
+    return "4294967295";
+  }
+  if (k == "u64" || k == "usize") {
+    return "18446744073709551615";
+  }
+  return "9223372036854775807";
+}
+
+// The joined kind of two operands of an arithmetic operator or comparison: a bare literal adopts the other
+// kind. Empty when the kinds differ (the type checker rejects that, so it signals an unsupported shape).
+@Ensures(result == "" || result == a || result == b)
+export function joinKinds(a: string, b: string): string {
+  if (a == "?") {
+    return b;
+  }
+  if (b == "?" || a == b) {
+    return a;
+  }
+  return "";
+}
+
+// ------------------------------------------------------------------------------------------------ names
+
+// Source-like name of a type, for messages.
+export function vtName(t: VT): string {
+  return match (t) {
+    VInt(k) => k == "?" ? "int" : k,
+    VBool => "bool",
+    VStr => "string",
+    VUnit => "void",
+    VArr(e) => vtName(e) + "[]",
+    VOpt(e) => "Option<" + vtName(e) + ">",
+    VRes(a, b) => "Result<" + vtName(a) + ", " + vtName(b) + ">",
+    VMap(k, v) => "Map<" + vtName(k) + ", " + vtName(v) + ">",
+    VRec(n) => n,
+    VUni(n) => n,
+    VOpq(n) => n,
+    VBad(why) => "an unsupported type (" + why + ")"
+  };
+}
+
+// Unique key of a type (the key of its SMT sort).
+@Ensures(result.length > 0)
+export function vtKey(t: VT): string {
+  return match (t) {
+    VInt(k) => k == "?" ? "int" : k,
+    VBool => "bool",
+    VStr => "string",
+    VUnit => "unit",
+    VArr(e) => "arr(" + vtKey(e) + ")",
+    VOpt(e) => "opt(" + vtKey(e) + ")",
+    VRes(a, b) => "res(" + vtKey(a) + "," + vtKey(b) + ")",
+    VMap(k, v) => "map(" + vtKey(k) + "," + vtKey(v) + ")",
+    VRec(n) => "rec(" + n + ")",
+    VUni(n) => "uni(" + n + ")",
+    VOpq(n) => "opq(" + n + ")",
+    VBad(why) => "bad(" + why + ")"
+  };
+}
+
+@Ensures(result == vtKey(t).startsWith("bad("))
+export function isBad(t: VT): bool {
+  return match (t) {
+    VBad(_) => true,
+    _ => false
+  };
+}
+
+export function badReason(t: VT): string {
+  return match (t) {
+    VBad(why) => why,
+    _ => ""
+  };
+}
+
+// Are two types the same (a bare literal matches any integer type)?
+export function vtEq(a: VT, b: VT): bool {
+  return match (a) {
+    VInt(x) => match (b) {
+      VInt(y) => x == y || x == "?" || y == "?",
+      _ => false
+    },
+    _ => vtKey(a) == vtKey(b)
+  };
+}
+
+export function isIntTy(t: VT): bool {
+  return match (t) {
+    VInt(_) => true,
+    _ => false
+  };
+}
+
+export function intKindOf(t: VT): string {
+  return match (t) {
+    VInt(k) => k,
+    _ => ""
+  };
+}
+
+// The type with a bare literal turned into `int`.
+export function concrete(t: VT): VT {
+  return match (t) {
+    VInt(k) => k == "?" ? VInt("int") : t,
+    _ => t
+  };
+}
+
+// ------------------------------------------------------------------------------------------ type tables
+
+export type RecDef = {
+  name: string; fields: string[]; ftys: TypeExpr[]; isClass: bool; generic: bool; contracts: ContractClause[]; text: string;
+  tparams: string[];
+};
+
+export type UniVariantDef = { name: string; payload: TypeExpr[]; };
+
+export type UniDef = { name: string; variants: UniVariantDef[]; generic: bool; };
+
+export type AliasDef = { name: string; target: TypeExpr; generic: bool; };
+
+// The records, classes, unions and aliases of the program, by simple name. A name declared twice (in two
+// units) is ambiguous and resolves to an unsupported type: the verifier never guesses which one is meant.
+@Invariant(this.recNames.length == this.recs.length && this.uniNames.length == this.unis.length && this.aliasNames.length == this.aliases.length)
+export class Tab {
+  private recNames: string[] = [];
+  private recs: RecDef[] = [];
+  private uniNames: string[] = [];
+  private unis: UniDef[] = [];
+  private aliasNames: string[] = [];
+  private aliases: AliasDef[] = [];
+  private seen: Map<string, usize> = new Map<string, usize>();
+  private cyc: Map<string, bool> = new Map<string, bool>();
+  private vcount: Map<string, usize> = new Map<string, usize>();
+  private vowner: Map<string, string> = new Map<string, string>();
+
+  // Keys ("r:Name" / "u:Name") of all records and unions.
+  recKeys(): string[] {
+    let out: string[] = [];
+    for (const n of this.recNames) {
+      out.push("r:" + n);
+    }
+    for (const n of this.uniNames) {
+      out.push("u:" + n);
+    }
+    return out;
+  }
+
+  setCyclic(keys: string[]): void {
+    for (const k of keys) {
+      this.cyc.set(k, true);
+    }
+  }
+
+  // Is the record `r:Name` / union `u:Name` recursive (sealTab)?
+  isCyclic(key: string): bool {
+    return this.cyc.has(key);
+  }
+
+  // How many declarations of any kind carry this name.
+  @Ensures(result >= 0)
+  declared(name: string): usize {
+    return this.seen.get(name).unwrapOr(0);
+  }
+
+  private bump(name: string): void {
+    this.seen.set(name, this.declared(name) + 1);
+  }
+
+  @Ensures(this.declared(d.name) == old(this.declared(d.name)) + 1)
+  addRec(d: RecDef): void {
+    this.recNames.push(d.name);
+    this.recs.push(d);
+    this.bump(d.name);
+  }
+
+  @Ensures(this.declared(d.name) == old(this.declared(d.name)) + 1)
+  addUni(d: UniDef): void {
+    this.uniNames.push(d.name);
+    this.unis.push(d);
+    this.bump(d.name);
+    for (const v of d.variants) {
+      this.vcount.set(v.name, this.vcount.get(v.name).unwrapOr(0) + 1);
+      this.vowner.set(v.name, d.name);
+    }
+  }
+
+  // The union that declares a variant called `name`, when exactly one union has such a variant.
+  variantOwner(name: string): Option<string> {
+    if (this.vcount.get(name).unwrapOr(0) != 1) {
+      return None;
+    }
+    return this.vowner.get(name);
+  }
+
+  @Ensures(this.declared(d.name) == old(this.declared(d.name)) + 1)
+  addAlias(d: AliasDef): void {
+    this.aliasNames.push(d.name);
+    this.aliases.push(d);
+    this.bump(d.name);
+  }
+
+  // The unique record or class called `name`, if there is exactly one declaration of that name.
+  findRec(name: string): Option<RecDef> {
+    if (this.declared(name) != 1) {
+      return None;
+    }
+    let i: usize = 0;
+    while (i < this.recNames.length) {
+      if (this.recNames[i] == name) {
+        return Some(this.recs[i]);
+      }
+      i += 1;
+    }
+    return None;
+  }
+
+  findUni(name: string): Option<UniDef> {
+    if (this.declared(name) != 1) {
+      return None;
+    }
+    let i: usize = 0;
+    while (i < this.uniNames.length) {
+      if (this.uniNames[i] == name) {
+        return Some(this.unis[i]);
+      }
+      i += 1;
+    }
+    return None;
+  }
+
+  findAlias(name: string): Option<AliasDef> {
+    if (this.declared(name) != 1) {
+      return None;
+    }
+    let i: usize = 0;
+    while (i < this.aliasNames.length) {
+      if (this.aliasNames[i] == name) {
+        return Some(this.aliases[i]);
+      }
+      i += 1;
+    }
+    return None;
+  }
+}
+
+export function identNames(ids: Ident[]): string[] {
+  let out: string[] = [];
+  for (const i of ids) {
+    out.push(i.name);
+  }
+  return out;
+}
+
+export function recOfType(d: TypeDecl, fields: FieldDecl[], text: string): RecDef {
+  let names: string[] = [];
+  let tys: TypeExpr[] = [];
+  for (const f of fields) {
+    names.push(f.name.name);
+    tys.push(f.ty);
+  }
+  return RecDef { name: d.name.name, fields: names, ftys: tys, isClass: false, generic: d.typeParams.length > 0, contracts: d.contracts, text: text, tparams: identNames(d.typeParams) };
+}
+
+export function recOfClass(c: ClassDecl, text: string): RecDef {
+  let names: string[] = [];
+  let tys: TypeExpr[] = [];
+  for (const m of c.members) {
+    match (m) {
+      MField(f) => {
+        names.push(f.name.name);
+        tys.push(f.ty);
+      },
+      _ => {}
+    }
+  }
+  // Parameter properties of the constructor (`constructor(public a: int)`) declare fields too.
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        for (const p of k.params) {
+          if (p.access != 0 && !names.includes(p.name.name)) {
+            names.push(p.name.name);
+            tys.push(p.ty);
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  return RecDef { name: c.name.name, fields: names, ftys: tys, isClass: true, generic: c.typeParams.length > 0, contracts: c.contracts, text: text, tparams: identNames(c.typeParams) };
+}
+
+export function uniOfType(d: TypeDecl, vs: VariantDecl[]): UniDef {
+  let out: UniVariantDef[] = [];
+  for (const v of vs) {
+    out.push(UniVariantDef { name: v.name.name, payload: v.payload });
+  }
+  return UniDef { name: d.name.name, variants: out, generic: d.typeParams.length > 0 };
+}
+
+// ---------------------------------------------------------------------------------- source type -> VT
+
+// The verifier type of a source type expression. `depth` bounds alias chains.
+export function resolveTy(tab: Tab, t: TypeExpr): VT {
+  const none: string[] = [];
+  return resolveAt(tab, t, 0, none);
+}
+
+// With type parameters in scope: inside a generic function or class a type parameter `T` is an opaque value (the
+// function is checked once for every T: nothing can be done with a `T` but pass it around), and the class's own
+// type applied to its own parameters (`Deque<T>` inside `Deque<T>`) is the class.
+export function resolveTyP(tab: Tab, t: TypeExpr, tp: string[]): VT {
+  return resolveAt(tab, t, 0, tp);
+}
+
+// The type of field `i` of a record or class definition, in the scope of its own type parameters.
+export function fieldTyOf(tab: Tab, d: RecDef, i: usize): VT {
+  return resolveAt(tab, d.ftys[i], 0, d.tparams);
+}
+
+function resolveAt(tab: Tab, t: TypeExpr, depth: usize, tp: string[]): VT {
+  return match (t.kind) {
+    TArray(e) => {
+      const el = resolveAt(tab, e, depth, tp);
+      return isBad(el) ? el : VArr(el);
+    },
+    TFn(_, _) => VBad("function value"),
+    TNamed(id, args) => resolveNamed(tab, id.name, args, depth, tp)
+  };
+}
+
+// `args` are the type parameters of the definition itself, in order, and in scope.
+function isIdentity(own: string[], args: TypeExpr[], tp: string[]): bool {
+  if (own.length == 0 || own.length != args.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < args.length) {
+    const ok = match (args[i].kind) {
+      TNamed(id, inner) => inner.length == 0 && id.name == own[i] && tp.includes(id.name),
+      _ => false
+    };
+    if (!ok) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function resolveNamed(tab: Tab, n: string, args: TypeExpr[], depth: usize, tp: string[]): VT {
+  if (args.length == 0 && tp.includes(n)) {
+    return VOpq(n);
+  }
+  if (depth > 8) {
+    return VBad("type alias chain too deep");
+  }
+  if (n == "int" || n == "i64") {
+    return args.length == 0 ? VInt("int") : VBad("type arguments on `" + n + "`");
+  }
+  if (isIntKind(n) && args.length == 0) {
+    return VInt(n);
+  }
+  if (n == "bool" && args.length == 0) {
+    return VBool;
+  }
+  if (n == "string" && args.length == 0) {
+    return VStr;
+  }
+  if (n == "void" && args.length == 0) {
+    return VUnit;
+  }
+  if ((n == "Host" || n == "FsGrant" || n == "ProcessGrant" || n == "StdioGrant" || n == "ClockGrant" || n == "NetGrant" || n == "File") && args.length == 0 && tab.declared(n) == 0) {
+    return VOpq(n);
+  }
+  if (n == "float" || n == "f32") {
+    return VBad("floating-point values are not modelled");
+  }
+  if (n == "Option" && args.length == 1) {
+    const a = resolveAt(tab, args[0], depth + 1, tp);
+    return isBad(a) ? a : VOpt(a);
+  }
+  if (n == "Result" && args.length == 2) {
+    const a = resolveAt(tab, args[0], depth + 1, tp);
+    const b = resolveAt(tab, args[1], depth + 1, tp);
+    return isBad(a) ? a : (isBad(b) ? b : VRes(a, b));
+  }
+  if (n == "Map" && args.length == 2) {
+    const k = resolveAt(tab, args[0], depth + 1, tp);
+    const v = resolveAt(tab, args[1], depth + 1, tp);
+    if (isBad(k)) {
+      return k;
+    }
+    if (isBad(v)) {
+      return v;
+    }
+    return isMapKey(k) ? VMap(k, v) : VBad("Map key type `" + vtName(k) + "`");
+  }
+  if (tab.declared(n) > 1) {
+    return VBad("type name `" + n + "` is declared more than once (ambiguous)");
+  }
+  const r = tab.findRec(n);
+  if (r.isSome()) {
+    if (r.unwrap().generic || args.length > 0) {
+      if (isIdentity(r.unwrap().tparams, args, tp)) {
+        return VRec(n);
+      }
+      return VBad("generic type `" + n + "`");
+    }
+    return VRec(n);
+  }
+  const u = tab.findUni(n);
+  if (u.isSome()) {
+    if (u.unwrap().generic || args.length > 0) {
+      return VBad("generic type `" + n + "`");
+    }
+    return VUni(n);
+  }
+  const a = tab.findAlias(n);
+  if (a.isSome()) {
+    if (a.unwrap().generic || args.length > 0) {
+      return VBad("generic type `" + n + "`");
+    }
+    return resolveAt(tab, a.unwrap().target, depth + 1, tp);
+  }
+  return VBad("type `" + n + "` (a type parameter, interface, resource handle or built-in)");
+}
+
+export function isMapKey(k: VT): bool {
+  return match (k) {
+    VInt(_) => true,
+    VBool => true,
+    VStr => true,
+    _ => false
+  };
+}
+
+// Types that contain themselves (a record with an array of itself, a list-like union) have no finite SMT
+// datatype here: they become an opaque sort whose fields are not modelled. `sealTab` finds them once all
+// declarations are added: a record or union is cyclic when it can reach itself through the types of its fields
+// and payloads.
+function refsOf(tab: Tab, t: VT, out: string[]): string[] {
+  let acc = out;
+  match (t) {
+    VArr(e) => { acc = refsOf(tab, e, acc); },
+    VOpt(e) => { acc = refsOf(tab, e, acc); },
+    VRes(a, b) => { acc = refsOf(tab, b, refsOf(tab, a, acc)); },
+    VMap(k, v) => { acc = refsOf(tab, v, refsOf(tab, k, acc)); },
+    VRec(n) => { acc.push("r:" + n); },
+    VUni(n) => { acc.push("u:" + n); },
+    _ => {}
+  }
+  return acc;
+}
+
+function edgesOf(tab: Tab, key: string): string[] {
+  let out: string[] = [];
+  if (key.startsWith("r:")) {
+    const r = tab.findRec(key.substring(2, key.length));
+    if (r.isSome()) {
+      let fi: usize = 0;
+      while (fi < r.unwrap().ftys.length) {
+        out = refsOf(tab, fieldTyOf(tab, r.unwrap(), fi), out);
+        fi += 1;
+      }
+    }
+  } else {
+    const u = tab.findUni(key.substring(2, key.length));
+    if (u.isSome()) {
+      for (const v of u.unwrap().variants) {
+        for (const pt of v.payload) {
+          out = refsOf(tab, resolveTy(tab, pt), out);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Can `start` reach itself through at least one edge?
+function reachesSelf(tab: Tab, start: string): bool {
+  let seen: string[] = [];
+  let work: string[] = edgesOf(tab, start);
+  while (work.length > 0) {
+    const k = work.pop().unwrap();
+    if (k == start) {
+      return true;
+    }
+    if (!seen.includes(k)) {
+      seen.push(k);
+      for (const e of edgesOf(tab, k)) {
+        work.push(e);
+      }
+    }
+  }
+  return false;
+}
+
+export function sealTab(tab: Tab): Tab {
+  let t = tab;
+  let cyc: string[] = [];
+  for (const k of tab.recKeys()) {
+    if (reachesSelf(tab, k)) {
+      cyc.push(k);
+    }
+  }
+  t.setCyclic(cyc);
+  return t;
+}
+
+// Index of a field in a record definition.
+export function fieldIndex(r: RecDef, name: string): Option<usize> {
+  let i: usize = 0;
+  while (i < r.fields.length) {
+    if (r.fields[i] == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
