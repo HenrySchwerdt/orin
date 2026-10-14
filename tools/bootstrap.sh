@@ -6,6 +6,13 @@
 #                                    (needs only a C compiler, python3, gzip, sha256sum/shasum)
 #   tools/bootstrap.sh --seed-only   only seed -> build/bootstrap/orin0 (a few seconds; enough to compile
 #                                    test drivers such as compiler/tests/verify_text.or)
+#
+# C flags: orin2, the compiler the tests and the tools use, is built with $CFLAGS (default -O2 -w). orin0 and orin1
+# only ever compile compiler/main.or once each, so they are built with $STAGE01_CFLAGS (default -O1 -w): the
+# C compile of the 8 MB stage C at -O2 costs much more than the slower orin0/orin1 run (docs/testing.md has the numbers).
+# The fixed point is unaffected: it compares the generated C (stage2.c == stage3.c), not binaries, and the C a compiler
+# generates does not depend on the C flags it was built with. STAGE01_CFLAGS="-O2 -w" restores the old all--O2 build;
+# a CFLAGS set by the caller also applies to orin0 and orin1 unless STAGE01_CFLAGS is set.
 set -eu
 cd "$(dirname "$0")/.."
 SEED_ONLY=
@@ -15,13 +22,16 @@ case "${1:-}" in
   *) echo "usage: $0 [--seed-only]" >&2; exit 2 ;;
 esac
 CC=${CC:-cc}
+STAGE01_CFLAGS=${STAGE01_CFLAGS:-${CFLAGS:--O1 -w}}
 CFLAGS=${CFLAGS:--O2 -w}
 B=build/bootstrap
 SEED_DIR=${ORIN_SEED_DIR:-seed}
 mkdir -p "$B"
 python3 tools/embed_prelude.py --check
-cc_link() { $CC $CFLAGS -I runtime "$1" runtime/orin_runtime.c platform/orin_platform.c -o "$2"; }
+cc_link() { flags=$1; shift; $CC $flags -I runtime "$1" runtime/orin_runtime.c platform/orin_platform.c -o "$2"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+T0=$(date +%s)
+elapsed() { echo "$(( $(date +%s) - T0 )) s"; }
 
 echo "[seed] decompress and verify $SEED_DIR/orin-seed.c.gz"
 gzip -dc "$SEED_DIR/orin-seed.c.gz" > $B/seed.c
@@ -33,17 +43,17 @@ if [ -z "$want" ] || [ "$want" != "$got" ]; then
   exit 1
 fi
 echo "[seed] sha256 ok ($got)"
-echo "[stage0] cc seed -> orin0"
-cc_link $B/seed.c $B/orin0
+echo "[stage0] cc $STAGE01_CFLAGS seed -> orin0"
+cc_link "$STAGE01_CFLAGS" $B/seed.c $B/orin0
 if [ -n "$SEED_ONLY" ]; then echo "[seed-only] built $B/orin0"; exit 0; fi
-echo "[stage1] orin0 compiles compiler/main.or"
-$B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link $B/stage1.c $B/orin1
-echo "[stage2] orin1 compiles compiler/main.or"
-$B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link $B/stage2.c $B/orin2
-echo "[stage3] orin2 compiles compiler/main.or"
+echo "[stage1] orin0 compiles compiler/main.or; cc $STAGE01_CFLAGS -> orin1 ($(elapsed))"
+$B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" $B/stage1.c $B/orin1
+echo "[stage2] orin1 compiles compiler/main.or; cc $CFLAGS -> orin2 ($(elapsed))"
+$B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link "$CFLAGS" $B/stage2.c $B/orin2
+echo "[stage3] orin2 compiles compiler/main.or ($(elapsed))"
 $B/orin2 compile compiler/main.or -o $B/stage3.c
 if cmp -s $B/stage2.c $B/stage3.c; then
-  echo "[compare] stage2.c == stage3.c ($(wc -c < $B/stage2.c) bytes)"
+  echo "[compare] stage2.c == stage3.c ($(wc -c < $B/stage2.c) bytes; $(elapsed))"
 else
   echo "[compare] FAIL: stage2.c and stage3.c differ"; exit 1
 fi

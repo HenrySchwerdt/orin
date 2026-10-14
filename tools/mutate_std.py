@@ -7,6 +7,10 @@ test file are copied to build/mutate_std/, the std imports are rewritten to rela
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
 
 Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http|net|text|taskcore] [--list]
+                                  [-j N] [--shard I/N]
+The mutants are independent (each has its own directory) and run in parallel: -j N (default: $ORIN_JOBS, else the CPU
+count); the output is printed in the fixed mutant order whatever the -j. --shard I/N runs every N-th selected mutant from
+the I-th on (the CI splits the slow http mutants over several jobs; the shards together run every mutant once).
 Exit status 1 if any mutant survives (is not killed with contracts on).
 """
 import argparse
@@ -15,6 +19,9 @@ import re
 import shutil
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from parallel import add_jobs_arg, ordered_map  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "build", "mutate_std")
@@ -173,47 +180,57 @@ NET_MUTANTS = [
 ]
 
 
-def run_net_mutants(orinc):
-    """Applies each NET_MUTANT in place, rebuilds the compiler, runs net_test; returns the number of survivors."""
+def net_mutant(orinc, mutant):
+    """One NET_MUTANT: the compiler sources and the libraries it embeds are copied to the mutant's directory, the mutant
+    is applied to the copy of stdlib/net.or, the copy's embedded library is regenerated and the copy of the compiler is
+    built with `orinc`; tests/std/net_test.or then runs with the mutated compiler. The working tree is never changed, so
+    the mutants can run in parallel. Returns (output line, survived, error message or None)."""
     import subprocess as sp
-    path = os.path.join(ROOT, "stdlib", "net.or")
-    emb = os.path.join(ROOT, "compiler", "loader", "embedded_stdlib.or")
-    orig = open(path, encoding="utf-8").read()
-    orig_emb = open(emb, encoding="utf-8").read()
+    mod, name, old, new = mutant
+    orig = open(os.path.join(ROOT, "stdlib", "net.or"), encoding="utf-8").read()
+    if orig.count(old) < 1:
+        return None, False, "BAD MUTANT %s/%s: pattern not found" % (mod, name)
+    d = os.path.join(OUT, "net_" + name)
+    src = os.path.join(d, "src")
+    os.makedirs(os.path.join(src, "tools"), exist_ok=True)
+    for sub in ("compiler", "stdlib", "std", "array"):
+        shutil.copytree(os.path.join(ROOT, sub), os.path.join(src, sub))
+    shutil.copy(os.path.join(ROOT, "tools", "embed_prelude.py"), os.path.join(src, "tools"))
+    open(os.path.join(src, "stdlib", "net.or"), "w", encoding="utf-8").write(orig.replace(old, new, 1))
+    sp.run([sys.executable, os.path.join(src, "tools", "embed_prelude.py")], cwd=src, check=True, stdout=sp.DEVNULL)
+    c = os.path.join(d, "orin.c")
+    r = sp.run([orinc, "compile", os.path.relpath(os.path.join(src, "compiler", "main.or"), ROOT), "-o", c], cwd=ROOT,
+               stdout=sp.PIPE, stderr=sp.STDOUT)
+    if r.returncode == 0:
+        r = sp.run(["cc", "-O0", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", os.path.join(d, "orin")],
+                   cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
+    if r.returncode:
+        return None, False, "COMPILE ERROR in mutant net/%s:\n%s" % (name, r.stdout.decode()[:600])
+    shutil.rmtree(src)
+    fails = []
+    for flag in ([], ["--no-contracts"]):
+        try:
+            t = sp.run([os.path.join(d, "orin"), "test", "tests/std/net_test.or", "--runtime", "runtime"] + flag, cwd=ROOT,
+                       stdout=sp.PIPE, stderr=sp.STDOUT, timeout=120)
+        except sp.TimeoutExpired:  # a mutant that waits forever is a failing test
+            fails.append(1)
+            continue
+        out = t.stdout.decode("utf-8", "replace")
+        fails.append(len(re.findall(r"^FAIL ", out, re.M)) + (1 if t.returncode and "error[" not in out and not re.search(r"^FAIL ", out, re.M) else 0))
+    status = "killed" if fails[0] else "SURVIVED"
+    line = "%-12s %-44s %-9s tests failing: %2d; without contracts: %2d" % (mod, name, status, fails[0], fails[1])
+    return line, status == "SURVIVED", None
+
+
+def run_net_mutants(orinc, jobs, mutants):
+    """Runs the given NET_MUTANTS; returns the exit status."""
     survivors = 0
-    try:
-        for mod, name, old, new in NET_MUTANTS:
-            if orig.count(old) < 1:
-                print("BAD MUTANT %s/%s: pattern not found" % (mod, name))
-                return 2
-            d = os.path.join(OUT, "net_" + name)
-            os.makedirs(d, exist_ok=True)
-            open(path, "w", encoding="utf-8").write(orig.replace(old, new, 1))
-            sp.run([sys.executable, os.path.join(ROOT, "tools", "embed_prelude.py")], cwd=ROOT, check=True, stdout=sp.DEVNULL)
-            c = os.path.join(d, "orin.c")
-            r1 = sp.run([orinc, "compile", "compiler/main.or", "-o", c], cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
-            r2 = sp.run(["cc", "-O0", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", os.path.join(d, "orin")],
-                        cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
-            if r1.returncode or r2.returncode:
-                print("COMPILE ERROR in mutant net/%s:\n%s" % (name, (r1.stdout + r2.stdout).decode()[:600]))
-                return 2
-            fails = []
-            for flag in ([], ["--no-contracts"]):
-                try:
-                    t = sp.run([os.path.join(d, "orin"), "test", "tests/std/net_test.or", "--runtime", "runtime"] + flag, cwd=ROOT,
-                               stdout=sp.PIPE, stderr=sp.STDOUT, timeout=120)
-                except sp.TimeoutExpired:  # a mutant that waits forever is a failing test
-                    fails.append(1)
-                    continue
-                out = t.stdout.decode("utf-8", "replace")
-                fails.append(len(re.findall(r"^FAIL ", out, re.M)) + (1 if t.returncode and "error[" not in out and not re.search(r"^FAIL ", out, re.M) else 0))
-            status = "killed" if fails[0] else "SURVIVED"
-            if status == "SURVIVED":
-                survivors += 1
-            print("%-12s %-44s %-9s tests failing: %2d; without contracts: %2d" % (mod, name, status, fails[0], fails[1]), flush=True)
-    finally:
-        open(path, "w", encoding="utf-8").write(orig)
-        open(emb, "w", encoding="utf-8").write(orig_emb)
+    for line, survived, err in ordered_map(lambda m: net_mutant(orinc, m), mutants, jobs):
+        if err:
+            print(err)
+            return 2
+        survivors += survived
+        print(line, flush=True)
     return 1 if survivors else 0
 
 
@@ -236,90 +253,119 @@ def run(orinc, test_file, extra, timeout=900):
     return r.returncode, r.stdout.decode("utf-8", "replace")
 
 
+def std_mutant(orinc, mutant):
+    """One mutant of a pure std module (see the module doc). Returns (row, output line, error message or None)."""
+    mods = ["bytes", "utf8", "collections", "http", "text", "taskcore"]
+    rewrite = {"std:" + m: "./" + m for m in mods}
+    mod, name, old, new = mutant[:4]
+    extra = mutant[4] if len(mutant) > 4 else ""
+    src = open(os.path.join(ROOT, "stdlib", mod + ".or"), encoding="utf-8").read()
+    if src.count(old) < 1:
+        return None, None, "BAD MUTANT %s/%s: pattern not found" % (mod, name)
+    d = os.path.join(OUT, mod + "_" + name)
+    os.makedirs(d)
+    for m in mods:
+        s = open(os.path.join(ROOT, "stdlib", m + ".or"), encoding="utf-8").read()
+        if m == mod:
+            s = s.replace(old, new, 1)
+        for k, v in rewrite.items():
+            s = s.replace('"%s"' % k, '"%s"' % v)
+        open(os.path.join(d, m + ".or"), "w", encoding="utf-8").write(s)
+    tfiles = TEST_ORDER.get(mod) or ([mod + "_test"] + EXTRA_TESTS.get(mod, []))
+    spec = open(os.path.join(ROOT, "tests", "std", "spec_sorted.or"), encoding="utf-8").read()
+    for k, v in rewrite.items():
+        spec = spec.replace('"%s"' % k, '"%s"' % v)
+    open(os.path.join(d, "spec_sorted.or"), "w", encoding="utf-8").write(spec)
+    fails1 = fails2 = viol = 0
+    out1 = ""
+    code1 = 0
+    for tn in tfiles:
+        t = open(os.path.join(ROOT, "tests", "std", tn + ".or"), encoding="utf-8").read()
+        for k, v in rewrite.items():
+            t = t.replace('"%s"' % k, '"%s"' % v)
+        tf = os.path.join(d, tn + ".or")
+        open(tf, "w", encoding="utf-8").write(t)
+        rel = os.path.relpath(tf, ROOT)
+        tmo = 120 if mod in EARLY_EXIT else 900
+        c1, o1 = run(orinc, rel, [], tmo)
+        c2, o2 = run(orinc, rel, ["--no-contracts"], tmo)
+        fails1 += len(re.findall(r"^FAIL ", o1, re.M))
+        fails2 += len(re.findall(r"^FAIL ", o2, re.M))
+        viol += len(re.findall(r"contract violated", o1))
+        out1 += o1
+        if c1 == 1 and "error[" in o1:
+            code1 = 1
+        if mod in EARLY_EXIT and re.search(r"^FAIL ", o1, re.M):
+            break
+    compile_err = code1 == 1 and fails1 == 0
+    if compile_err:
+        return None, None, "COMPILE ERROR in mutant %s/%s:\n%s" % (mod, name, out1[:600])
+    status = "killed by contract" if viol else ("killed by tests" if fails1 else "SURVIVED")
+    if status == "SURVIVED" and extra:
+        xt = open(os.path.join(ROOT, "tests", "std", "expect_trap", extra + ".or"), encoding="utf-8").read()
+        for k, v in rewrite.items():
+            xt = xt.replace('"%s"' % k, '"%s"' % v)
+        xf = os.path.join(d, extra + ".or")
+        open(xf, "w", encoding="utf-8").write(xt)
+        xcode, xout = run(orinc, os.path.relpath(xf, ROOT), ["--no-contracts"])
+        if xcode == 0:
+            status = "killed by tests"
+            fails1 = 1
+    row = (mod, name, status, fails1, viol, fails2)
+    line = "%-12s %-36s %-20s tests failing: %2d (contract traps %2d); without contracts: %2d" % (mod, name, status, fails1, viol, fails2)
+    return row, line, None
+
+
+def select_shard(mutants, shard):
+    """The mutants of shard i/N (1-based): every N-th mutant starting at the i-th, so slow mutants spread over the shards."""
+    i, n = shard
+    return [m for k, m in enumerate(mutants) if k % n == i - 1]
+
+
+def parse_shard(text):
+    try:
+        i, n = (int(x) for x in text.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("--shard expects I/N, for example 2/3")
+    if not 1 <= i <= n:
+        raise argparse.ArgumentTypeError("--shard I/N needs 1 <= I <= N")
+    return i, n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--orinc", default="build/bootstrap/orin2")
     ap.add_argument("--module", default="")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--shard", type=parse_shard, default=(1, 1),
+                    help="I/N: run only the I-th of N interleaved parts of the selected mutants (CI matrix)")
+    add_jobs_arg(ap)
     a = ap.parse_args()
     if a.list:
         for m in MUTANTS + NET_MUTANTS:
             print(m[0], m[1])
         return 0
     orinc = os.path.join(ROOT, a.orinc)
-    shutil.rmtree(OUT, ignore_errors=True)
-    os.makedirs(OUT)
     if a.module == "net":
-        return run_net_mutants(orinc)
-    mods = ["bytes", "utf8", "collections", "http", "text", "taskcore"]
-    rewrite = {"std:" + m: "./" + m for m in mods}
+        selected = select_shard(NET_MUTANTS, a.shard)
+    else:
+        selected = select_shard([m for m in MUTANTS if (not a.module or a.module == m[0]) and m[0] != "net"], a.shard)
+    # remove the old directories of the selected mutants only: other modules or shards may run in the same tree
+    os.makedirs(OUT, exist_ok=True)
+    for m in selected:
+        shutil.rmtree(os.path.join(OUT, m[0] + "_" + m[1]), ignore_errors=True)
+    if a.module == "net":
+        return run_net_mutants(orinc, a.jobs, selected)
     survivors = 0
     rows = []
-    for mutant in MUTANTS:
-        mod, name, old, new = mutant[:4]
-        extra = mutant[4] if len(mutant) > 4 else ""
-        if a.module and a.module != mod:
-            continue
-        if mod == "net":
-            continue
-        src = open(os.path.join(ROOT, "stdlib", mod + ".or"), encoding="utf-8").read()
-        if src.count(old) < 1:
-            print("BAD MUTANT %s/%s: pattern not found" % (mod, name))
+    for row, line, err in ordered_map(lambda m: std_mutant(orinc, m), selected, a.jobs):
+        if err:
+            print(err)
             return 2
-        d = os.path.join(OUT, mod + "_" + name)
-        os.makedirs(d)
-        for m in mods:
-            s = open(os.path.join(ROOT, "stdlib", m + ".or"), encoding="utf-8").read()
-            if m == mod:
-                s = s.replace(old, new, 1)
-            for k, v in rewrite.items():
-                s = s.replace('"%s"' % k, '"%s"' % v)
-            open(os.path.join(d, m + ".or"), "w", encoding="utf-8").write(s)
-        tfiles = TEST_ORDER.get(mod) or ([mod + "_test"] + EXTRA_TESTS.get(mod, []))
-        spec = open(os.path.join(ROOT, "tests", "std", "spec_sorted.or"), encoding="utf-8").read()
-        for k, v in rewrite.items():
-            spec = spec.replace('"%s"' % k, '"%s"' % v)
-        open(os.path.join(d, "spec_sorted.or"), "w", encoding="utf-8").write(spec)
-        fails1 = fails2 = viol = 0
-        out1 = ""
-        code1 = 0
-        for tn in tfiles:
-            t = open(os.path.join(ROOT, "tests", "std", tn + ".or"), encoding="utf-8").read()
-            for k, v in rewrite.items():
-                t = t.replace('"%s"' % k, '"%s"' % v)
-            tf = os.path.join(d, tn + ".or")
-            open(tf, "w", encoding="utf-8").write(t)
-            rel = os.path.relpath(tf, ROOT)
-            tmo = 120 if mod in EARLY_EXIT else 900
-            c1, o1 = run(orinc, rel, [], tmo)
-            c2, o2 = run(orinc, rel, ["--no-contracts"], tmo)
-            fails1 += len(re.findall(r"^FAIL ", o1, re.M))
-            fails2 += len(re.findall(r"^FAIL ", o2, re.M))
-            viol += len(re.findall(r"contract violated", o1))
-            out1 += o1
-            if c1 == 1 and "error[" in o1:
-                code1 = 1
-            if mod in EARLY_EXIT and re.search(r"^FAIL ", o1, re.M):
-                break
-        compile_err = code1 == 1 and fails1 == 0
-        if compile_err:
-            print("COMPILE ERROR in mutant %s/%s:\n%s" % (mod, name, out1[:600]))
-            return 2
-        status = "killed by contract" if viol else ("killed by tests" if fails1 else "SURVIVED")
-        if status == "SURVIVED" and extra:
-            xt = open(os.path.join(ROOT, "tests", "std", "expect_trap", extra + ".or"), encoding="utf-8").read()
-            for k, v in rewrite.items():
-                xt = xt.replace('"%s"' % k, '"%s"' % v)
-            xf = os.path.join(d, extra + ".or")
-            open(xf, "w", encoding="utf-8").write(xt)
-            xcode, xout = run(orinc, os.path.relpath(xf, ROOT), ["--no-contracts"])
-            if xcode == 0:
-                status = "killed by tests"
-                fails1 = 1
-        if status == "SURVIVED":
+        if row[2] == "SURVIVED":
             survivors += 1
-        rows.append((mod, name, status, fails1, viol, fails2))
-        print("%-12s %-36s %-20s tests failing: %2d (contract traps %2d); without contracts: %2d" % (mod, name, status, fails1, viol, fails2), flush=True)
+        rows.append(row)
+        print(line, flush=True)
     by = {}
     for mod, name, status, f1, v, f2 in rows:
         b = by.setdefault(mod, [0, 0, 0, 0])

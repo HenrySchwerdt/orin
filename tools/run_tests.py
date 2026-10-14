@@ -2,7 +2,7 @@
 """Orin conformance test runner (stdlib only).
 
 Usage: python3 tools/run_tests.py --orinc <compiler> [--cc cc] [--filter substr]
-                                  [--jobs N] [--sanitize] [--suite default|next|all]
+                                  [-j/--jobs N] [--sanitize] [--suite default|next|all]
                                   [--backend c|llvm]
 
 Suites: `default` = tests/run + tests/errors (the Orin-B contract, every compiler stage);
@@ -13,11 +13,14 @@ See tests/README.md for the test formats.
 """
 import argparse
 import difflib
+import hashlib
 import os
 import re
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from parallel import add_jobs_arg, ordered_map  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join("build", "tests")
@@ -101,6 +104,48 @@ def runtime_sources(backend):
     return srcs
 
 
+def cc_base(args):
+    """The C compiler command and flags a test executable is built with (without the inputs)."""
+    if args.backend == "llvm":
+        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime"]
+    else:
+        cc = [args.cc, "-O1", "-w", "-I", "runtime"]
+    if args.sanitize:
+        cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
+    return cc
+
+
+def runtime_objects(args):
+    """Compiles the runtime sources once per run, with the flags of the test executables, instead of once per test.
+
+    The objects are keyed by the compiler command and the contents of the runtime and platform sources and headers, so
+    a stale object is never linked. Linking the same object into every test is what compiling the same source with the
+    same flags into every test did, about a second of C compile per test less. Returns the object paths (relative to ROOT), or None if a compile failed (the tests
+    then compile the sources themselves and report the error)."""
+    cc = cc_base(args)
+    h = hashlib.sha256(repr(cc).encode())
+    h.update(run_cmd([cc[0], "--version"], 30)[1].encode())  # a C compiler upgrade rebuilds the objects
+    for d in ("runtime", "platform"):
+        for f in sorted(os.listdir(os.path.join(ROOT, d))):
+            if f.endswith((".c", ".h")):
+                h.update(f.encode())
+                with open(os.path.join(ROOT, d, f), "rb") as fh:
+                    h.update(fh.read())
+    outdir = os.path.join(BUILD, "rt", h.hexdigest()[:16])
+    os.makedirs(os.path.join(ROOT, outdir), exist_ok=True)
+    objs = []
+    for src in runtime_sources(args.backend):
+        o = os.path.join(outdir, os.path.basename(src)[:-2] + ".o")
+        if not os.path.isfile(os.path.join(ROOT, o)):
+            tmp = "%s.%d.tmp.o" % (o, os.getpid())
+            rc, _, _ = run_cmd(cc + ["-c", src, "-o", tmp], COMPILE_TIMEOUT)
+            if rc != 0:
+                return None
+            os.replace(os.path.join(ROOT, tmp), os.path.join(ROOT, o))  # atomic: a concurrent run never sees half an object
+        objs.append(o)
+    return objs
+
+
 def run_test(args, label, test):
     # label is "run", "errors", "next/run" or "next/errors"
     name, entry, exp = test
@@ -165,13 +210,7 @@ def run_test(args, label, test):
         if got_warns != want_warns:
             return tag, False, "warnings differ: expected %s, got %s; stderr head:\n%s" % (want_warns, got_warns, head(err))
 
-    if args.backend == "llvm":
-        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime"]
-    else:
-        cc = [args.cc, "-O1", "-w", "-I", "runtime"]
-    if args.sanitize:
-        cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    cc += [c_out] + runtime_sources(args.backend) + ["-lm", "-o", exe]
+    cc = cc_base(args) + [c_out] + (args.rt_objs or runtime_sources(args.backend)) + ["-lm", "-o", exe]
     rc, _, err = run_cmd(cc, COMPILE_TIMEOUT)
     if rc != 0:
         return tag, False, "C compilation failed (exit %s); stderr head:\n%s" % (rc, head(err))
@@ -210,7 +249,7 @@ def main():
     ap.add_argument("--orinc", default=os.path.join("build", "bootstrap", "orin2"))
     ap.add_argument("--cc", default="cc")
     ap.add_argument("--filter", default="")
-    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    add_jobs_arg(ap)
     ap.add_argument("--sanitize", action="store_true")
     ap.add_argument("--suite", choices=["default", "next", "all"], default="default",
                     help="default: tests/run + tests/errors; next: tests/next/*; all: both")
@@ -242,8 +281,8 @@ def main():
         except Exception as e:  # runner bug or odd environment: report as failure
             return "%s/%s" % (job[0], job[1][0]), False, "runner exception: %r" % (e,)
 
-    with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-        results = list(pool.map(work, jobs))
+    args.rt_objs = runtime_objects(args)
+    results = list(ordered_map(work, jobs, args.jobs))
 
     failed = [r for r in results if not r[1]]
     for tag, ok, detail in failed:

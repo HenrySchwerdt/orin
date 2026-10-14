@@ -20,6 +20,15 @@
   crashed (`trap: index out of bounds`) instead of reporting ill-formed MIR: a call of a callee with more parameters than
   locals, a closure target or vtable entry with parameters but no locals, a block with fewer spans than instructions; they are
   now rejected with a message. Every other verdict and message is unchanged; generated C / LLVM output is byte-identical.
+- **Allocation census (ADR-0038): where the heap allocations and RC operations come from.** Opt-in census build:
+  `orin2 compile --stats-sites` marks every MIR instruction with its site id (`ORIN_SITE(n, caller)`) and appends a site table;
+  with a runtime built with `-DORIN_SITE_STATS`, `ORIN_STATS=sites` reports per site the objects allocated (string, scalar /
+  reference array, record shape), bytes, growths, frees, the retains / releases / COW copies executed there and those its
+  objects received, the joint (executing site, allocating site) RC counts and one level of calling context. Without the flag
+  nothing changes: generated C and LLVM byte-identical on the corpus, runtime object code identical. `tools/alloc_census.py`
+  runs every benchmark, `examples/http_server.or` under a scripted loopback load and the self-compile, attributes each site to the
+  ADR-0038 transformation that would remove it (unboxing, packed arrays, escape / stack, borrow, reuse, region / freeze,
+  library) and writes docs/perf/alloc-census.md: the ranking for the performance wave and the library quick wins.
 - **Rewrite step 3e: the tooling modules `analysis/`, `lsp/`, `mcp/`, `json/`, `fmt/` (ADR-0015) and the capability gate.**
   State that was threaded through records is now five classes: `Workspace` (the document store), `LspServer`, `McpSession`,
   `JsonCursor`, and the formatter's `Layout` (source text and comment queue); 213 contract clauses (35 before), among them the
