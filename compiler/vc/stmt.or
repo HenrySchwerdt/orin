@@ -19,7 +19,7 @@ import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
 import {
   Var, Chk, TR, St, Ret, Ex, Fn, Cls, Prog, Cx, lineOf, clauseText, srcText, lit, inKind, guarded, concat, concatChk, unionUsize, andAll,
   noChks, noExp, lookupVar, prefix, tailFrom, mk, sortS, tyOf, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds, isSomeT,
-  recField, mapHas, mapSize, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf
+  recField, mapHas, mapSize, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf, hasClauses
 } from "./ctx";
 import { tr, trClause, wdOf, callFnX, isUnit, sigOf, Cl, matchPattern } from "./expr";
 
@@ -36,7 +36,7 @@ export function emit(g0: Gen, st0: St, cx: Cx, chks: Chk[]): Emitted {
     if (c.oblig) {
       const o = Obl {
         kind: c.kind, what: c.what, line: c.line, clause: c.clause, goal: c.goal, pc: st.pc, deps: st.deps, approx: st.approx,
-        file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: false
+        file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: false, exact: g.isExact()
       };
       // An obligation that repeats an earlier one on the same path (same place, same goal, and the earlier goal
       // is already assumed here) is redundant: the earlier one is reported.
@@ -345,7 +345,7 @@ function isConsoleCall(e: Expr): bool {
   };
 }
 
-export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[]): Result<Ex, string> {
+export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[], top: bool): Result<Ex, string> {
   let g = g0;
   let st = st0;
   let rets: Ret[] = [];
@@ -497,7 +497,7 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[]): Result<Ex, s
       },
       SBlock(b) => {
         const n0 = st.vars.length;
-        const r = execStmts(g, st, cx, b.stmts)?;
+        const r = execStmts(g, st, cx, b.stmts, false)?;
         g = r.g;
         for (const x of r.rets) {
           rets.push(x);
@@ -520,26 +520,98 @@ export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[]): Result<Ex, s
         st = r.st;
       },
       SWhile(c, b) => {
-        const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span)?;
-        g = r.g;
-        for (const x of r.rets) {
-          rets.push(x);
+        if (g.isExact()) {
+          const u = Unroll { isWhile: true, cond: Some(c), iterVar: None, arrTerm: "", arrSort: "", elemTy: VUnit, body: b };
+          const r = unrollStep(g, st, cx, u, 0)?;
+          g = r.g;
+          for (const x of r.rets) {
+            rets.push(x);
+          }
+          if (!r.fall) {
+            return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+          }
+          st = r.st;
+        } else {
+          const stBefore = st;
+          const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span)?;
+          g = r.g;
+          for (const x of r.rets) {
+            rets.push(x);
+          }
+          // The same loop and the rest of the function, unrolled a few iterations without abstraction: what it
+          // finds is real (bounded refutation).
+          if (top && wantExact(cx)) {
+            const er = exactFlow(g, stBefore, cx, s, tailStmts(stmts, k));
+            match (er) {
+              Ok(x) => {
+                g = x.g;
+                for (const y of x.rets) {
+                  rets.push(y);
+                }
+                if (x.fall) {
+                  rets.push(Ret { st: x.st, val: "", vt: VUnit, isVoid: true });
+                }
+              },
+              Err(_) => {}
+            }
+          }
+          if (!r.fall) {
+            return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+          }
+          st = r.st;
         }
-        if (!r.fall) {
-          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
-        }
-        st = r.st;
       },
       SForOf(id, e, b) => {
-        const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span)?;
-        g = r.g;
-        for (const x of r.rets) {
-          rets.push(x);
+        if (g.isExact()) {
+          const it = trEmit(g, st, cx, e, noExp())?;
+          g = it.g;
+          st = it.st;
+          const el = match (it.vt) {
+            VArr(t) => t,
+            _ => VBad("not an array")
+          };
+          if (isBad(el)) {
+            return Err("`for .. of` over a value of type `" + vtName(it.vt) + "` is not supported");
+          }
+          const so = sortS(g, cx, it.vt)?;
+          g = so.g;
+          const u = Unroll { isWhile: false, cond: None, iterVar: Some(id), arrTerm: it.t, arrSort: so.s, elemTy: el, body: b };
+          const r = unrollStep(g, st, cx, u, 0)?;
+          g = r.g;
+          for (const x of r.rets) {
+            rets.push(x);
+          }
+          if (!r.fall) {
+            return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+          }
+          st = r.st;
+        } else {
+          const stBefore = st;
+          const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span)?;
+          g = r.g;
+          for (const x of r.rets) {
+            rets.push(x);
+          }
+          if (top && wantExact(cx)) {
+            const er = exactFlow(g, stBefore, cx, s, tailStmts(stmts, k));
+            match (er) {
+              Ok(x) => {
+                g = x.g;
+                for (const y of x.rets) {
+                  rets.push(y);
+                }
+                if (x.fall) {
+                  rets.push(Ret { st: x.st, val: "", vt: VUnit, isVoid: true });
+                }
+              },
+              Err(_) => {}
+            }
+          }
+          if (!r.fall) {
+            return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+          }
+          st = r.st;
         }
-        if (!r.fall) {
-          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
-        }
-        st = r.st;
       },
       SBreak => {
         // The path leaves the loop body (the effect of a loop with a jump is havoc'd by execLoop).
@@ -605,7 +677,7 @@ function concatRets(a: Ret[], b: Ret[]): Ret[] {
 function execElse(g: Gen, st: St, cx: Cx, els: Option<Stmt>): Result<Ex, string> {
   return match (els) {
     None => Ok(Ex { g: g, st: st, fall: true, rets: [] }),
-    Some(s) => execStmts(g, st, cx, [s])
+    Some(s) => execStmts(g, st, cx, [s], false)
   };
 }
 
@@ -617,7 +689,7 @@ function execIf(g0: Gen, st: St, cx: Cx, c: Expr, thenB: Block, els: Option<Stmt
   const n0 = st.vars.length;
   const pc0 = ct.st.pc;
   const s1 = St { vars: ct.st.vars, pc: concat(pc0, [ct.t]), deps: ct.st.deps, approx: ct.st.approx };
-  const r1 = execStmts(ct.g, s1, cx, thenB.stmts)?;
+  const r1 = execStmts(ct.g, s1, cx, thenB.stmts, false)?;
   const s2 = St { vars: ct.st.vars, pc: concat(pc0, ["(not " + ct.t + ")"]), deps: ct.st.deps, approx: ct.st.approx };
   const r2 = execElse(r1.g, s2, cx, els)?;
   return mergeBranches(r2.g, cx, pc0, ct.t, n0, r1, r2, s1);
@@ -651,11 +723,87 @@ function execMatchFrom(g0: Gen, st: St, cx: Cx, s: TR, sn: string, arms: MatchAr
     BExpr(x) => [Stmt { kind: SExpr(x), span: arm.span }],
     BBlock(b) => b.stmts
   };
-  const r1 = execStmts(g, s1, cx, body)?;
+  const r1 = execStmts(g, s1, cx, body, false)?;
   const s2 = St { vars: st.vars, pc: concat(st.pc, ["(not " + mp.test + ")"]), deps: st.deps, approx: st.approx };
   const r2 = execMatchFrom(r1.g, s2, cx, s, sn, arms, k + 1)?;
   // vars1 has the bindings; the merge works on the first n0 variables
   return mergeBranches(r2.g, cx, st.pc, mp.test, n0, r1, r2, s1);
+}
+
+// ------------------------------------------------------------------------------- bounded exact unrolling
+
+// How many iterations of a loop are unrolled exactly.
+const UNROLL: usize = 3;
+
+type Unroll = { isWhile: bool; cond: Option<Expr>; iterVar: Option<Ident>; arrTerm: string; arrSort: string; elemTy: VT; body: Block; };
+
+function tailStmts(stmts: Stmt[], start: usize): Stmt[] {
+  let out: Stmt[] = [];
+  let i = start;
+  while (i < stmts.length) {
+    out.push(stmts[i]);
+    i += 1;
+  }
+  return out;
+}
+
+// Only functions with something to prove get the second, exact pass.
+function wantExact(cx: Cx): bool {
+  return hasClauses(cx.f) || cx.f.kind == 1 || cx.f.kind == 3;
+}
+
+// The loop (a statement) and what follows it, executed with every loop unrolled (no abstraction at all): the
+// obligations and the returns found are those of real executions that leave each loop within a few iterations.
+function exactFlow(g0: Gen, st: St, cx: Cx, loopStmt: Stmt, rest: Stmt[]): Result<Ex, string> {
+  let g = g0;
+  g.setExact(true);
+  let all: Stmt[] = [loopStmt];
+  for (const x of rest) {
+    all.push(x);
+  }
+  const r = execStmts(g, st, cx, all, true)?;
+  let g2 = r.g;
+  g2.setExact(false);
+  return Ok(Ex { g: g2, st: r.st, fall: r.fall, rets: r.rets });
+}
+
+// `if (c) { body; <next iteration> } else { exit }`, UNROLL deep; after the last level the loop is assumed to exit
+// (executions with more iterations are not covered, which keeps every path exact).
+function unrollStep(g0: Gen, st: St, cx: Cx, u: Unroll, d: usize): Result<Ex, string> {
+  let g = g0;
+  let st1 = st;
+  let ct = "";
+  if (u.isWhile) {
+    const c = trEmit(g, st, cx, u.cond.unwrap(), VBool)?;
+    if (!vtEq(c.vt, VBool)) {
+      return Err("`while` condition is not bool");
+    }
+    g = c.g;
+    st1 = c.st;
+    ct = c.t;
+  } else {
+    ct = "(< " + d.toString() + " " + arrLen(u.arrSort, u.arrTerm) + ")";
+  }
+  const notC = "(not " + ct + ")";
+  if (d >= UNROLL) {
+    return Ok(Ex { g: g, st: St { vars: st1.vars, pc: concat(st1.pc, [notC]), deps: st1.deps, approx: st1.approx }, fall: true, rets: [] });
+  }
+  const n0 = st1.vars.length;
+  let vars1 = st1.vars;
+  if (!u.isWhile) {
+    vars1.push(Var { name: u.iterVar.unwrap().name, term: arrSel(u.arrSort, u.arrTerm, d.toString()), vt: u.elemTy });
+  }
+  const s1 = St { vars: vars1, pc: concat(st1.pc, [ct]), deps: st1.deps, approx: st1.approx };
+  const r1 = execStmts(g, s1, cx, u.body.stmts, false)?;
+  let thenR = r1;
+  if (r1.fall) {
+    const next = St { vars: prefix(r1.st.vars, n0), pc: r1.st.pc, deps: r1.st.deps, approx: r1.st.approx };
+    const r1b = unrollStep(r1.g, next, cx, u, d + 1)?;
+    thenR = Ex { g: r1b.g, st: r1b.st, fall: r1b.fall, rets: concatRets(r1.rets, r1b.rets) };
+  }
+  const s2 = St { vars: st1.vars, pc: concat(st1.pc, [notC]), deps: st1.deps, approx: st1.approx };
+  const r2 = Ex { g: thenR.g, st: s2, fall: true, rets: [] };
+  return mergeBranches(thenR.g, cx, st1.pc, ct, n0, thenR, r2, s1);
 }
 
 // ------------------------------------------------------------------------------------------------ loops
@@ -997,7 +1145,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
         const hidden = inv.clause.isNone();
         const id = g.addObl(Obl {
           kind: "loop-invariant", what: "entry", line: inv.line, clause: inv.label + " (holds on entry to the loop)", goal: goal, pc: st.pc,
-          deps: st.deps, approx: st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: hidden
+          deps: st.deps, approx: st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: hidden, exact: false
         });
         g.loopAdd(lid, id);
         kept.push(inv);
@@ -1043,7 +1191,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
     s1 = c.st;
     s1.pc.push(c.t);
   }
-  const bodyR = execStmts(g, s1, cx, body.stmts)?;
+  const bodyR = execStmts(g, s1, cx, body.stmts, false)?;
   g = bodyR.g;
   // The invariants are preserved by one iteration.
   if (bodyR.fall && !jump) {
@@ -1055,7 +1203,7 @@ function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, i
           const goal = x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")";
           const id = g.addObl(Obl {
             kind: "loop-invariant", what: "preserved", line: inv.line, clause: inv.label + " (preserved by the loop body)", goal: goal, pc: bodyR.st.pc,
-            deps: bodyR.st.deps, approx: bodyR.st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: inv.clause.isNone()
+            deps: bodyR.st.deps, approx: bodyR.st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: inv.clause.isNone(), exact: false
           });
           g.loopAdd(lid, id);
         },

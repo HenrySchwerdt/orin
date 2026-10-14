@@ -915,7 +915,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
   }
   // Execute the body.
   const st0 = St { vars: en.vars, pc: [], deps: [], approx: "" };
-  const exR = execStmts(en.g, st0, en.cx, f.body.stmts);
+  const exR = execStmts(en.g, st0, en.cx, f.body.stmts, true);
   if (exR.isErr()) {
     return allUnknown(rt, f, cls, exR.unwrapErr());
   }
@@ -926,33 +926,91 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     rets.push(Ret { st: ex.st, val: "", vt: VUnit, isVoid: true });
   }
   const reportSafety = hasClauses(f) || checksInvariants(f, cls);
-  // The obligations found on the way (call preconditions, indexes, `unwrap`, loop invariants).
+  // The obligations found on the way (call preconditions, indexes, `unwrap`, loop invariants). Those found while
+  // unrolling a loop (`exact`) repeat the ones of the abstract pass: they are solved only when the abstract one is
+  // not proved, and a real counterexample among them is the answer for that place.
   const obls = g.oblList();
+  let keys: string[] = [];
   let verdicts: Verdict[] = [];
   let statuses: string[] = [];
+  for (const o of obls) {
+    keys.push(o.kind + "|" + o.line.toString() + "|" + o.clause);
+    verdicts.push(unknownV("not solved"));
+    statuses.push("PENDING");
+  }
   let id: usize = 0;
   while (id < obls.length) {
     const o = obls[id];
     const wanted = o.kind == "call-precondition" || o.kind == "loop-invariant" || reportSafety;
-    if (wanted) {
+    if (!wanted) {
+      statuses[id] = "SKIPPED";
+    } else if (!o.exact) {
       const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
       rt.qn += 1;
-      const v = judge(g, raw, o.approx, en.probes);
-      verdicts.push(v);
-      statuses.push(v.status);
-    } else {
-      verdicts.push(unknownV("not reported"));
-      statuses.push("SKIPPED");
+      verdicts[id] = judge(g, raw, o.approx, en.probes);
+      statuses[id] = verdicts[id].status;
     }
     id += 1;
   }
   id = 0;
   while (id < obls.length) {
     const o = obls[id];
-    const wanted = o.kind == "call-precondition" || o.kind == "loop-invariant" || reportSafety;
-    if (wanted && !o.hidden) {
-      const v = depsVerdict(g, statuses, o.deps, verdicts[id]);
+    if (o.exact && statuses[id] == "PENDING") {
+      let covered = false;
+      let j: usize = 0;
+      while (j < obls.length) {
+        if (!obls[j].exact && keys[j] == keys[id] && statuses[j] == "VERIFIED") {
+          covered = true;
+        }
+        j += 1;
+      }
+      if (covered) {
+        statuses[id] = "COVERED";
+      } else {
+        const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
+        rt.qn += 1;
+        verdicts[id] = judge(g, raw, o.approx, en.probes);
+        statuses[id] = verdicts[id].status;
+      }
+    }
+    id += 1;
+  }
+  let reportedExact: string[] = [];
+  id = 0;
+  while (id < obls.length) {
+    const o = obls[id];
+    if (!o.exact && statuses[id] != "SKIPPED" && !o.hidden) {
+      let v = depsVerdict(g, statuses, o.deps, verdicts[id]);
+      if (v.status != "VERIFIED") {
+        let j: usize = 0;
+        while (j < obls.length) {
+          if (obls[j].exact && keys[j] == keys[id] && statuses[j] == "REFUTED") {
+            v = verdicts[j];
+          }
+          j += 1;
+        }
+      }
       rt = pushRes(rt, f, o.line, o.kind, o.clause, v, g.usedList());
+    }
+    id += 1;
+  }
+  // An obligation that only the unrolled pass has (no abstract twin) and that fails for real.
+  id = 0;
+  while (id < obls.length) {
+    const o = obls[id];
+    if (o.exact && statuses[id] == "REFUTED" && !reportedExact.includes(keys[id])) {
+      let twin = false;
+      let j: usize = 0;
+      while (j < obls.length) {
+        if (!obls[j].exact && keys[j] == keys[id] && statuses[j] != "SKIPPED") {
+          twin = true;
+        }
+        j += 1;
+      }
+      if (!twin) {
+        reportedExact.push(keys[id]);
+        rt = pushRes(rt, f, o.line, o.kind, o.clause, verdicts[id], g.usedList());
+      }
     }
     id += 1;
   }
