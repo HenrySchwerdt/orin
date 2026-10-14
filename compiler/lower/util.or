@@ -40,6 +40,10 @@ export function isStringTy(t: Type): bool {
   return match (t) { TyString => true, _ => false };
 }
 
+// The MIR class of a type: references are exactly the heap types, `void` and the handles map to themselves.
+@Ensures(isRefTy(t) == mtyIsRef(result))
+@Ensures(isVoidTy(t) == mtyIsVoid(result))
+@Ensures(isHandleTy(t) == mtyIsHandle(result))
 export function mty(t: Type): MType {
   return match (t) {
     TyInt => MInt,
@@ -55,8 +59,49 @@ export function mty(t: Type): MType {
   };
 }
 
+// ---------------------------------------------------------------- MIR types
+
+function mtyRank(t: MType): int {
+  return match (t) {
+    MInt => 0,
+    MUsize => 1,
+    MBool => 2,
+    MFloat => 3,
+    MHandle => 4,
+    MRef => 5,
+    MVoid => 6
+  };
+}
+
+export function mtyEq(a: MType, b: MType): bool {
+  return mtyRank(a) == mtyRank(b);
+}
+
+export function mtyIsRef(t: MType): bool {
+  return match (t) {
+    MRef => true,
+    _ => false
+  };
+}
+
+export function mtyIsVoid(t: MType): bool {
+  return match (t) {
+    MVoid => true,
+    _ => false
+  };
+}
+
+export function mtyIsHandle(t: MType): bool {
+  return match (t) {
+    MHandle => true,
+    _ => false
+  };
+}
+
 // ---------------------------------------------------------------- effects
 
+// A simple expression (a constant, a local, a field of one) cannot change a local.
+@Ensures(result ==> !hasEffects(e))
 export function isSimple(e: HExpr): bool {
   return match (e.kind) {
     XInt(_) => true,
@@ -170,6 +215,7 @@ function newLits(): Lits {
   return Lits { strs: strs, buckets: b, pre: pre };
 }
 
+@Ensures(result.isSome() ==> result.unwrap() < l.strs.length && l.strs[result.unwrap()] == s)
 function findLit(l: Lits, s: string): Option<usize> {
   const bucket = l.buckets[litBucket(s)];
   for (const id of bucket) {
@@ -180,6 +226,10 @@ function findLit(l: Lits, s: string): Option<usize> {
   return None;
 }
 
+// The index of a literal in the string table. Every literal of the program was collected (`collectLits`), so a missing one
+// is a lowering bug; the old code answered 0 and silently used another string.
+@Requires(findLit(l, s).isSome())
+@Ensures(result < l.strs.length && l.strs[result] == s)
 export function litId(l: Lits, s: string): usize {
   return match (findLit(l, s)) {
     Some(i) => i,
@@ -306,6 +356,8 @@ function larms(arms: HArm[]): string[] {
   return out;
 }
 
+// The string table of a program: its literals, deduplicated, in first-use order; every bucket entry indexes the table.
+@Ensures(result.buckets.length == 1021 && result.pre.length == 0)
 export function collectLits(prog: Program): Lits {
   let lits = newLits();
   for (const f of prog.functions) {

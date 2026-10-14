@@ -1,0 +1,170 @@
+// The control-flow graph of one function while it is being lowered: class `BlockBuilder`.
+//
+// The lowering emits instructions, block labels and terminators in program order. A label ends the block before it
+// with a fall-through `goto` when that block is still open; a terminator closes the block; code that follows a terminator
+// (up to the next label) is dead and dropped. `finish` removes the blocks that cannot be reached from the entry and
+// renumbers the labels to block indices. Every instruction and terminator carries the source span it was lowered from
+// (docs/mir.md v2.0): `spans[i]` belongs to `instrs[i]`.
+
+import { Instr, Terminator, MBlock, SwitchCase } from "../mir";
+import { Span } from "../diag";
+import { successors, blockTargetsInRange, allReachable } from "./wellformed";
+
+function mapCases(cases: SwitchCase[], f: usize[], idxOf: usize[]): SwitchCase[] {
+  return cases.map(k => SwitchCase { value: k.value, target: f[idxOf[k.target]] });
+}
+
+function remap(t: Terminator, f: usize[], idxOf: usize[]): Terminator {
+  return match (t) {
+    TGoto(a) => TGoto(f[idxOf[a]]),
+    TBranch(c, a, b) => TBranch(c, f[idxOf[a]], f[idxOf[b]]),
+    TSwitch(o, cases, d) => TSwitch(o, mapCases(cases, f, idxOf), f[idxOf[d]]),
+    TReturn(o) => TReturn(o),
+    TTrap(m) => TTrap(m)
+  };
+}
+
+// Finished blocks keep the label numbers of their targets until `finish` renumbers them: `labels[i]` is the label that
+// opened `blocks[i]`. At most one block is open (`live`): its instructions and spans are in `cur` / `curSpans`. Labels
+// are handed out by `reserve`, so every label that was placed (finished or current) is below `next`.
+@Invariant(this.cur.length == this.curSpans.length)
+@Invariant(this.live || this.cur.length == 0)
+@Invariant(this.labels.length == this.blocks.length)
+@Invariant(this.next >= this.labels.length)
+@Invariant(!this.live || this.next > this.labels.length)
+@Invariant(!this.live || this.curLabel < this.next)
+export class BlockBuilder {
+  private labels: usize[] = [];
+  private blocks: MBlock[] = [];
+  private cur: Instr[] = [];
+  private curSpans: Span[] = [];
+  private curLabel: usize = 0;
+  private live: bool = false;
+  private next: usize = 0;
+
+  // True while a block is open (an instruction can still be added); false after a terminator.
+  isOpen(): bool {
+    return this.live;
+  }
+
+  // Number of finished blocks.
+  count(): usize {
+    return this.blocks.length;
+  }
+
+  // Number of labels handed out.
+  labelCount(): usize {
+    return this.next;
+  }
+
+  // The first of `n` fresh labels (consecutive).
+  @Ensures(result == old(this.next) && this.next == result + n)
+  reserve(n: usize): usize {
+    const first = this.next;
+    this.next += n;
+    return first;
+  }
+
+  // Starts the block `l`. A block that is still open falls through into it (`goto l`, at `sp`).
+  @Requires(l < this.next)
+  @Requires(!this.labels.includes(l) && !(this.live && this.curLabel == l))
+  @Ensures(this.live && this.curLabel == l && this.cur.length == 0)
+  @Ensures(old(this.live) ==> this.blocks.length == old(this.blocks.length) + 1)
+  @Ensures(!old(this.live) ==> this.blocks.length == old(this.blocks.length))
+  place(l: usize, sp: Span): void {
+    if (this.live) {
+      this.blocks.push(MBlock { instrs: this.cur, spans: this.curSpans, term: TGoto(l), termSpan: sp });
+      this.labels.push(this.curLabel);
+    }
+    this.cur = [];
+    this.curSpans = [];
+    this.curLabel = l;
+    this.live = true;
+  }
+
+  // Appends an instruction to the open block; after a terminator it is dead code and dropped.
+  @Ensures(this.live == old(this.live))
+  @Ensures(this.live ==> this.cur.length == old(this.cur.length) + 1)
+  @Ensures(!this.live ==> this.cur.length == old(this.cur.length))
+  emit(i: Instr, sp: Span): void {
+    if (this.live) {
+      this.cur.push(i);
+      this.curSpans.push(sp);
+    }
+  }
+
+  // Ends the open block with `t` (a terminator after a terminator is dead code and dropped): every block is terminated
+  // exactly once, by this or by the fall-through of `place`.
+  @Ensures(!this.live && this.cur.length == 0)
+  @Ensures(old(this.live) ==> this.blocks.length == old(this.blocks.length) + 1)
+  @Ensures(!old(this.live) ==> this.blocks.length == old(this.blocks.length))
+  terminate(t: Terminator, sp: Span): void {
+    if (this.live) {
+      this.blocks.push(MBlock { instrs: this.cur, spans: this.curSpans, term: t, termSpan: sp });
+      this.labels.push(this.curLabel);
+      this.cur = [];
+      this.curSpans = [];
+      this.live = false;
+    }
+  }
+
+  // The reachable blocks, entry first, with targets renumbered to block indices. The function must end in a
+  // terminator, and its first block is the entry.
+  @Requires(!this.live && this.blocks.length > 0)
+  @Ensures(result.length >= 1 && result.length <= this.blocks.length)
+  @Ensures(blockTargetsInRange(result))
+  @Ensures(allReachable(result))
+  @Ensures(result.every(b => b.spans.length == b.instrs.length))
+  finish(): MBlock[] {
+    const n = this.blocks.length;
+    let idxOf: usize[] = [];
+    let i: usize = 0;
+    while (i < this.next) {
+      idxOf.push(n);
+      i += 1;
+    }
+    i = 0;
+    while (i < n) {
+      idxOf[this.labels[i]] = i;
+      i += 1;
+    }
+    let reach: bool[] = [];
+    i = 0;
+    while (i < n) {
+      reach.push(false);
+      i += 1;
+    }
+    let stack: usize[] = [0];
+    reach[0] = true;
+    while (stack.length > 0) {
+      const b = stack.pop().unwrap();
+      for (const l of successors(this.blocks[b].term)) {
+        const t = idxOf[l];
+        if (t < n && !reach[t]) {
+          reach[t] = true;
+          stack.push(t);
+        }
+      }
+    }
+    let newIdx: usize[] = [];
+    let k: usize = 0;
+    i = 0;
+    while (i < n) {
+      newIdx.push(k);
+      if (reach[i]) {
+        k += 1;
+      }
+      i += 1;
+    }
+    let out: MBlock[] = [];
+    i = 0;
+    while (i < n) {
+      if (reach[i]) {
+        const blk = this.blocks[i];
+        out.push(MBlock { instrs: blk.instrs, spans: blk.spans, term: remap(blk.term, newIdx, idxOf), termSpan: blk.termSpan });
+      }
+      i += 1;
+    }
+    return out;
+  }
+}
