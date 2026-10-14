@@ -1,0 +1,63 @@
+// Stress (tools/test_concurrency.sh: plain, ThreadSanitizer, ASan + UBSan): thousands of tasks.
+//  1. 3,000 tasks alive at the same time in one scope, results joined in reverse order;
+//  2. tasks that open their own scopes and spawn sub-tasks (a tree of 7 levels: 2^7 leaves);
+//  3. 20,000 short tasks spawned and joined in waves of 100.
+import { scope, spawn, TaskHandle } from "std:task";
+
+function work(i: int): int {
+  return (i * 7919) % 10007;
+}
+
+function tree(depth: int, id: int): int {
+  if (depth == 0) {
+    return work(id);
+  }
+  return scope(s => {
+    const a = spawn(s, () => tree(depth - 1, id * 2));
+    const b = spawn(s, () => tree(depth - 1, id * 2 + 1));
+    return a.join() + b.join();
+  });
+}
+
+function main(): void {
+  const many = scope(s => {
+    let hs: TaskHandle<int>[] = [];
+    let i = 0;
+    while (i < 3000) {
+      const k = i;
+      hs.push(spawn(s, () => work(k)));
+      i += 1;
+    }
+    let total = 0;
+    let j = hs.length;
+    while (j > 0) {
+      j -= 1;
+      total += hs[j].join();
+    }
+    return total;
+  });
+  console.log("3000 tasks: " + many.toString());
+
+  console.log("tree: " + tree(7, 1).toString());
+
+  let waves = 0;
+  let sum = 0;
+  while (waves < 200) {
+    sum += scope(s => {
+      let hs: TaskHandle<int>[] = [];
+      let i = 0;
+      while (i < 100) {
+        const k = waves * 100 + i;
+        hs.push(spawn(s, () => work(k)));
+        i += 1;
+      }
+      let t = 0;
+      for (const h of hs) {
+        t += h.join();
+      }
+      return t;
+    });
+    waves += 1;
+  }
+  console.log("20000 short tasks: " + sum.toString());
+}

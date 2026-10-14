@@ -1,0 +1,54 @@
+// std:task: a producer / transformer / consumer pipeline over two bounded channels (capacity 3): the producer sends the
+// numbers 1..200, the transformer squares them and builds a label, the consumer (the scope body) sums them up.
+import { scope, spawnDo, channel } from "std:task";
+
+type Item = { n: int; label: string; };
+
+function main(): void {
+  const raw = channel<int>(3);
+  const cooked = channel<Item>(3);
+  const total = scope(s => {
+    spawnDo(s, () => {
+      let i = 1;
+      while (i <= 200) {
+        raw.tx.send(i);
+        i += 1;
+      }
+      raw.tx.close();
+    });
+    spawnDo(s, () => {
+      let more = true;
+      while (more) {
+        match (raw.rx.recv()) {
+          Some(v) => {
+            cooked.tx.send(Item { n: v * v, label: "item-" + v.toString() });
+          },
+          None => {
+            more = false;
+          },
+        }
+      }
+      cooked.tx.close();
+    });
+    let sum = 0;
+    let labels = 0;
+    let more = true;
+    while (more) {
+      match (cooked.rx.recv()) {
+        Some(it) => {
+          sum += it.n;
+          if (it.label.startsWith("item-")) {
+            labels += 1;
+          }
+        },
+        None => {
+          more = false;
+        },
+      }
+    }
+    return sum * 1000 + labels;
+  });
+  console.log(total.toString());
+  raw.rx.close();
+  cooked.rx.close();
+}

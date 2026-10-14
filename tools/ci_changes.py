@@ -21,7 +21,7 @@ import json
 import subprocess
 import sys
 
-MODULES = ["bytes", "utf8", "collections", "http", "net", "text"]
+MODULES = ["bytes", "utf8", "collections", "http", "net", "text", "taskcore"]
 ALL_MUTANTS = ["tools/mutate_std.py", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
 MACOS = ("compiler/", "runtime/", "platform/", "seed/", "tools/", ".github/")
 

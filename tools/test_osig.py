@@ -282,6 +282,30 @@ def main():
     rc, dtext, derr = run(orin, ["diff", "--base", os.path.join(iobase, "main.or"), "--head", os.path.join(iohead, "main.or")])
     check(rc == 0 and "+ PERFORMS_IO [MUST] (OUTPUT)" in dtext and "~io:Console.Write" in dtext, "diff shows the new primitive I/O edge (%s)" % derr)
 
+    # ---- 8. task events (ADR-0017 stage 0) ----------------------------------------------------------
+    rc, gt, err = run(orin, ["graph", "tests/osig/tasks/main.or"])
+    check(rc == 0, "graph of the task program exits 0 (%s)" % err)
+    st = json.loads(gt)
+    tperf = {(e["src"].split("::")[-1], e["dst"], e["evidence"], e["via"]) for e in st["edges"] if e["kind"] == "PERFORMS_IO"}
+    want_tasks = [
+        ("fanOut", "~io:Channel.Open", "MUST", "CONTROL"), ("fanOut", "~io:Task.Join", "MUST", "CONTROL"),
+        ("fanOut", "~io:Task.Spawn", "MAY", "CONTROL"),                       # spawn is a CONTROL event (inside the scope body: MAY)
+        ("produce", "~io:Channel.Send", "MUST", "OUTPUT"),                    # a send is an OUTPUT event ...
+        ("consume", "~io:Channel.Receive", "MUST", "INPUT"),                  # ... a receive an INPUT event
+        ("withAuthority", "~io:Task.SpawnFs", "MAY", "CONTROL"),              # delegating a grant names the family
+    ]
+    for w in want_tasks:
+        check(w in tperf, "PERFORMS_IO edge %s" % (w,))
+    teff = {n["id"]: n for n in st["nodes"] if n["kind"] == "Effect"}
+    check(teff["~io:Task.Spawn"]["sig"] == "CONTROL; grant: ambient" and teff["~io:Task.SpawnFs"]["sig"] == "CONTROL; grant: FsGrant",
+          "spawning is a CONTROL effect; delegating a grant names its family")
+    check(teff["~io:Channel.Send"]["sig"] == "OUTPUT; grant: ambient" and teff["~io:Channel.Receive"]["sig"] == "INPUT; grant: ambient",
+          "send is OUTPUT, receive is INPUT")
+    check(not any(src == "pure" for (src, _d, _e, _v) in tperf), "a pure function has no PERFORMS_IO edge")
+    check(all(e["evidence"] in ("MUST", "MAY") for e in st["edges"] if e["kind"] == "PERFORMS_IO"), "task events are never UNKNOWN")
+    rc, gt2, _ = run(orin, ["graph", "tests/osig/tasks/main.or"])
+    check(gt2 == gt, "the task graph is deterministic")
+
     shutil.rmtree(tmp, ignore_errors=True)
     print("%d checks, %d failures" % (checks, len(failures)))
     sys.exit(1 if failures else 0)
