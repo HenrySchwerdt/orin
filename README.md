@@ -40,6 +40,9 @@ experience, not a misleading promise of full ecosystem compatibility.
 - Generate a semantic symbol/call graph and compare two program versions using
   `orin graph` and `orin diff`, including source locations and MUST/MAY/UNKNOWN call evidence.
   See [OSIG](docs/osig.md).
+- Ask what a function, module or program may *do*: `orin effects` infers the transitive primitive effects (file, stdio,
+  process, clock, console) with evidence and an explanation path, and `orin.toml` can restrict them per module
+  (`[effects] allowed = [...]`). See [capabilities](docs/capabilities.md).
 
 ### Where we're going
 
@@ -131,7 +134,8 @@ structured, stable diagnostics — optimised for the total effort needed to reac
 | Copy-on-write value semantics, MIR ownership verification, resource-safe `File` handles | ✅ Implemented; safety evidence has documented limits |
 | Formatter, diagnostics, language server, MCP, VS Code support, `orin test` | ✅ Implemented |
 | Contract clauses + SMT verification | ✅ Supported subset; not universal proof |
-| `orin graph`, `orin diff`, HTML PR report | ✅ OSIG v0.1 structural graph |
+| `orin graph`, `orin diff`, HTML PR report | ✅ OSIG v0.2 structural graph with transitive effect summaries |
+| `orin effects`, `[effects]` policy in `orin.toml` (ADR-0037 D2, Stage B) | ✅ Implemented: sound over-approximation (UNKNOWN is never pure); per-operation-family, not per resource; no native-code guarantees |
 | Compiler modernisation (ADR-0015) | 🚧 Underway |
 | Root capabilities for the std I/O (`main(host: Host)`, narrowing, `ORIN_DENY`, path scopes; ADR-0027) | ✅ Implemented (Stage A; std I/O stays unstable until the freeze); not a sandbox against native code |
 | Derived library capabilities, policy gates, HTTP/Kafka protocol bindings | 📋 Designed; not implemented |

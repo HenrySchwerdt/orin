@@ -22,6 +22,20 @@ export type EdgeFinding = { edge: OEdge; reach: Reach; };
 
 export type Rename = { was: string; now: string; kind: string; basis: string[]; confidence: string; ambiguous: bool; };
 
+// A change of the effect summary of one function (`MAY_PERFORM` edges, ADR-0037 D2): `kind` is "added" (the head graph has
+// an effect the base has not), "removed", or "evidence" (same effect, other evidence class; `was` is the base's). `ev` is the
+// evidence in the graph where the effect exists (the head for added / evidence, the base for removed). `path` explains it
+// there: the function, then the callees it inherits it from (`MAY_PERFORM.next`), the last step the primitive call.
+// `reach`: for an added effect that the function performs itself (no `next`), the entry points of the head that reach
+// the function, i.e. everything that now performs the effect; empty otherwise.
+export type EffectChange = {
+  fn: string; module: string; kind: string; op: string; dir: string; ev: string; was: string; span: OSpan;
+  path: PathStep[]; reach: Reach;
+};
+
+// The effects a module (the union over its functions) gained or lost, as "operation direction" ("Fs.ReadFile INPUT").
+export type ModuleEffectChange = { module: string; added: string[]; removed: string[]; };
+
 export type OsigDiff = {
   base: OsigGraph;
   head: OsigGraph;
@@ -36,6 +50,9 @@ export type OsigDiff = {
   goneCalls: EdgeFinding[];      // removed CALLS edges, with the entry points of the base graph that reached their caller
   impact: Reach[];               // per changed symbol, in the head graph
   truncated: bool;               // findings capped at MAX_FINDINGS
+  effectsComparable: bool;       // both snapshots carry effect summaries (osig/0.2 or later); false: no effect findings
+  effectChanges: EffectChange[]; // per function, ordered by function id, then operation
+  moduleEffects: ModuleEffectChange[];   // per module, ordered by module id
 };
 
 export const MAX_FINDINGS: usize = 100;
@@ -43,6 +60,25 @@ const MAX_ENTRIES: usize = 5;
 
 export function isStructural(kind: string): bool {
   return kind == "DEFINES" || kind == "HAS_FIELD" || kind == "HAS_CONTRACT";
+}
+
+// The transitive effect summary edges: compared by the effect section of the report, not as plain edges.
+export function isEffectEdge(kind: string): bool {
+  return kind == "MAY_PERFORM";
+}
+
+// The minor version of an "osig/0.N" schema, -1 for anything else.
+function minorOf(schema: string): int {
+  if (!schema.startsWith("osig/0.")) {
+    return -1;
+  }
+  let n: int = 0;
+  let i: usize = 7;
+  while (i < schema.length) {
+    n = n * 10 + (schema.charCodeAt(i) - 48);
+    i += 1;
+  }
+  return schema.length > 7 ? n : -1;
 }
 
 // ---- graph index ----------------------------------------------------------------------------------------
@@ -355,6 +391,204 @@ function edgeKeyOf(e: OEdge): string {
   return e.kind + "|" + e.src + "|" + e.dst + "|" + e.ev + "|" + e.via;
 }
 
+// ---- effects ----------------------------------------------------------------------------------------------------
+
+// The MAY_PERFORM edges of `g`, with the identity key of the effect of a function: `src|dst|via` (the evidence is not part
+// of it: a MUST that becomes MAY is the same effect with another evidence).
+type Effs = { edges: OEdge[]; keys: string[]; order: usize[]; };
+
+function effsOf(g: OsigGraph): Effs {
+  let es: OEdge[] = [];
+  let ks: string[] = [];
+  for (const e of g.edges) {
+    if (isEffectEdge(e.kind)) {
+      es.push(e);
+      ks.push(e.src + "|" + e.dst + "|" + e.via);
+    }
+  }
+  return Effs { edges: es, keys: ks, order: sortOrder(ks) };
+}
+
+function opOfDst(dst: string, via: string): string {
+  return dst.startsWith("~io:") ? dst.substring(4, dst.length) : via;
+}
+
+function dirOfVia(dst: string, via: string): string {
+  return dst.startsWith("~io:") ? via : "";
+}
+
+// The explanation of the effect `dst` / `via` of `src` in `ix`: the function, then the callees it inherits it from.
+function effectPath(ix: Ix, src: string, dst: string, via: string): PathStep[] {
+  let steps: PathStep[] = [];
+  let cur = src;
+  let guard: usize = 0;
+  while (guard < 64) {
+    let found: Option<OEdge> = None;
+    for (const ei of edgesOf(ix.outKeys, ix.outOrder, cur)) {
+      const e = ix.g.edges[ei];
+      if (isEffectEdge(e.kind) && e.dst == dst && e.via == via) {
+        found = Some(e);
+      }
+    }
+    if (found.isNone()) {
+      return steps;
+    }
+    const e = found.unwrap();
+    steps.push(PathStep { node: cur, via: "MAY_PERFORM", ev: e.ev, span: e.span });
+    if (e.next == "") {
+      return steps;
+    }
+    cur = e.next;
+    guard += 1;
+  }
+  return steps;
+}
+
+// A function that is not the abstract method of an interface: its module owns the effect (an interface method's effects
+// are those of its implementations, which belong to their own modules).
+function ownsEffects(ix: Ix, n: ONode): bool {
+  if (n.kind != "Method") {
+    return true;
+  }
+  const o = findNode(ix, n.owner);
+  return !(o.isSome() && ix.g.nodes[o.unwrap()].kind == "Interface");
+}
+
+function moduleOfFn(ix: Ix, id: string): string {
+  const n = findNode(ix, id);
+  return n.isSome() ? ix.g.nodes[n.unwrap()].module : "";
+}
+
+// "module\toperation direction" for every effect of every function of the graph, sorted.
+function moduleEffectKeys(ix: Ix, es: Effs): string[] {
+  let out: string[] = [];
+  for (const e of es.edges) {
+    const n = findNode(ix, e.src);
+    if (n.isSome() && ownsEffects(ix, ix.g.nodes[n.unwrap()]) && ix.g.nodes[n.unwrap()].module != "") {
+      const key = ix.g.nodes[n.unwrap()].module + "\t" + opOfDst(e.dst, e.via) + " " + dirOfVia(e.dst, e.via);
+      let seen = false;
+      for (const k of out) {
+        if (k == key) {
+          seen = true;
+        }
+      }
+      if (!seen) {
+        out.push(key);
+      }
+    }
+  }
+  let sorted: string[] = [];
+  for (const o of sortOrder(out)) {
+    sorted.push(out[o]);
+  }
+  return sorted;
+}
+
+function diffEffects(bx: Ix, hx: Ix, truncated0: bool): EffectsDiff {
+  const be = effsOf(bx.g);
+  const he = effsOf(hx.g);
+  let changes: EffectChange[] = [];
+  let truncated = truncated0;
+  let i: usize = 0;
+  let j: usize = 0;
+  while (i < be.order.length || j < he.order.length) {
+    let c = 0;
+    if (i >= be.order.length) {
+      c = 1;
+    } else if (j >= he.order.length) {
+      c = -1;
+    } else {
+      c = cmpStr(be.keys[be.order[i]], he.keys[he.order[j]]);
+    }
+    if (c == 0) {
+      const b = be.edges[be.order[i]];
+      const h = he.edges[he.order[j]];
+      if (b.ev != h.ev) {
+        if (changes.length >= MAX_FINDINGS) {
+          truncated = true;
+        } else {
+          changes.push(EffectChange {
+            fn: h.src, module: moduleOfFn(hx, h.src), kind: "evidence", op: opOfDst(h.dst, h.via), dir: dirOfVia(h.dst, h.via), ev: h.ev,
+            was: b.ev, span: h.span, path: effectPath(hx, h.src, h.dst, h.via), reach: Reach { target: h.src, paths: [], truncated: false }
+          });
+        }
+      }
+      i += 1;
+      j += 1;
+    } else if (c < 0) {
+      const b = be.edges[be.order[i]];
+      if (changes.length >= MAX_FINDINGS) {
+        truncated = true;
+      } else {
+        changes.push(EffectChange {
+          fn: b.src, module: moduleOfFn(bx, b.src), kind: "removed", op: opOfDst(b.dst, b.via), dir: dirOfVia(b.dst, b.via), ev: b.ev,
+          was: "", span: b.span, path: effectPath(bx, b.src, b.dst, b.via), reach: Reach { target: b.src, paths: [], truncated: false }
+        });
+      }
+      i += 1;
+    } else {
+      const h = he.edges[he.order[j]];
+      if (changes.length >= MAX_FINDINGS) {
+        truncated = true;
+      } else {
+        changes.push(EffectChange {
+          fn: h.src, module: moduleOfFn(hx, h.src), kind: "added", op: opOfDst(h.dst, h.via), dir: dirOfVia(h.dst, h.via), ev: h.ev,
+          was: "", span: h.span, path: effectPath(hx, h.src, h.dst, h.via),
+          reach: h.next == "" ? reach(hx, h.src) : Reach { target: h.src, paths: [], truncated: false }
+        });
+      }
+      j += 1;
+    }
+  }
+  // per module
+  const bk = moduleEffectKeys(bx, be);
+  const hk = moduleEffectKeys(hx, he);
+  let mods: ModuleEffectChange[] = [];
+  i = 0;
+  j = 0;
+  while (i < bk.length || j < hk.length) {
+    let c = 0;
+    if (i >= bk.length) {
+      c = 1;
+    } else if (j >= hk.length) {
+      c = -1;
+    } else {
+      c = cmpStr(bk[i], hk[j]);
+    }
+    if (c == 0) {
+      i += 1;
+      j += 1;
+    } else {
+      const k = c < 0 ? bk[i] : hk[j];
+      const tab = k.indexOf("\t").unwrap();
+      const m = k.substring(0, tab);
+      const what = k.substring(tab + 1, k.length);
+      let at: int = -1;
+      let q: usize = 0;
+      while (q < mods.length) {
+        if (mods[q].module == m) {
+          at = q.toInt();
+        }
+        q += 1;
+      }
+      if (at < 0) {
+        mods.push(ModuleEffectChange { module: m, added: [], removed: [] });
+        at = (mods.length - 1).toInt();
+      }
+      if (c < 0) {
+        mods[at.toUsize()].removed.push(what);
+        i += 1;
+      } else {
+        mods[at.toUsize()].added.push(what);
+        j += 1;
+      }
+    }
+  }
+  return EffectsDiff { changes: changes, modules: mods, truncated: truncated };
+}
+
+type EffectsDiff = { changes: EffectChange[]; modules: ModuleEffectChange[]; truncated: bool; };
+
 export function diffOsig(base: OsigGraph, head: OsigGraph): OsigDiff {
   const bx = indexOf(base);
   const hx = indexOf(head);
@@ -399,9 +633,9 @@ export function diffOsig(base: OsigGraph, head: OsigGraph): OsigDiff {
   i = 0;
   j = 0;
   while (i < base.edges.length || j < head.edges.length) {
-    if (i < base.edges.length && isStructural(base.edges[i].kind)) {
+    if (i < base.edges.length && (isStructural(base.edges[i].kind) || isEffectEdge(base.edges[i].kind))) {
       i += 1;
-    } else if (j < head.edges.length && isStructural(head.edges[j].kind)) {
+    } else if (j < head.edges.length && (isStructural(head.edges[j].kind) || isEffectEdge(head.edges[j].kind))) {
       j += 1;
     } else if (i >= base.edges.length) {
       addedE.push(head.edges[j]);
@@ -461,6 +695,14 @@ export function diffOsig(base: OsigGraph, head: OsigGraph): OsigDiff {
       gone.push(EdgeFinding { edge: e, reach: r });
     }
   }
+  const comparable = minorOf(base.schema) >= 2 && minorOf(head.schema) >= 2;
+  let ef = EffectsDiff { changes: [], modules: [], truncated: false };
+  if (comparable) {
+    ef = diffEffects(bx, hx, false);
+    if (ef.truncated) {
+      truncated = true;
+    }
+  }
   let impact: Reach[] = [];
   for (const c of changed) {
     if (impact.length >= MAX_FINDINGS) {
@@ -472,12 +714,13 @@ export function diffOsig(base: OsigGraph, head: OsigGraph): OsigDiff {
   return OsigDiff {
     base: base, head: head, identical: base.hash == head.hash, addedSyms: added, removedSyms: removed, changed: changed,
     renames: findRenames(bx, hx, removed, added), addedEdges: addedE, removedEdges: removedE, newPaths: newPaths,
-    goneCalls: gone, impact: impact, truncated: truncated
+    goneCalls: gone, impact: impact, truncated: truncated, effectsComparable: comparable, effectChanges: ef.changes,
+    moduleEffects: ef.modules
   };
 }
 
 // True when the two snapshots differ in anything the report lists.
 export function hasDifferences(d: OsigDiff): bool {
   return d.addedSyms.length > 0 || d.removedSyms.length > 0 || d.changed.length > 0 || d.addedEdges.length > 0
-    || d.removedEdges.length > 0;
+    || d.removedEdges.length > 0 || d.effectChanges.length > 0;
 }

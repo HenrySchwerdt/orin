@@ -245,6 +245,7 @@ def run(exe):
     r = c.request("textDocument/hover", td(main, call))
     hv = (r.get("result") or {}).get("contents", {}).get("value", "")
     check("function dist(p: Point): int" in hv, "hover: function signature (got %r)" % (hv,))
+    check("**Effects**: none (pure)" in hv, "hover: the effect summary of a pure function, across modules (got %r)" % (hv,))
 
     r = c.request("textDocument/hover", td(main, pos_of(main_text, "d.toString", 0)))
     hv = (r.get("result") or {}).get("contents", {}).get("value", "")
