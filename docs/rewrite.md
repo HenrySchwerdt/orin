@@ -242,6 +242,158 @@ Lessons:
 * `compiler/tests/check_env_test.or` tests `Scope`, the name tables, the type / instance keys and `dedupDiags`; for
   that `check/module.or` exports them (module boundary E0302).
 
+## Step 2b: `check/body.or` (the expression and statement checker)
+
+Rewritten: `check/body.or` (3,548 lines, about 190 functions that threaded `Env` and `FnCtx` through every call and
+returned `{ fx, result }` records) and the record part of `check/fnctx.or`. `check/{checker,classfix,contracts,pattern}.or`
+only got the call-site updates the new interfaces need (`checkBlock(fx, body)`, `checkClause(fx, c, cmode)`, `FnCtx`
+methods instead of `newLocal(fx, ..)`; about 20 lines); `env.or` gained `Env.wrappers` and `emptyEnv()`.
+`compiler/vc/` was not touched.
+
+| Old | New |
+|---|---|
+| `body.or`: 3,548 lines, 190 functions, `(env, fx, args) -> Result<{ fx, x }, Diagnostic>` | `body.or` is a 18-line facade; the code lives in `expr.or`, `stmt.or`, `ops.or`, `match.or`, `call.or`, `lift.or`, `hirok.or` |
+| `type FnCtx = { 30 fields }` plus free functions `newLocal`, `declare`, `pushScope`, `markBreak`, `lookupVar`, ... | class `FnCtx` (fnctx.or) with the same fields and the operations as methods; 13 invariants |
+| every function threads `fx` in and out, `env` is passed beside it | `ExprChecker` owns the context: methods return the HIR (or a diagnostic) and leave what they learnt in `this.fx` |
+| statements, blocks, `match` arms, loop clauses, `checkClause` | class `StmtChecker` (stmt.or), which owns an `ExprChecker`; its invariants say it closed every scope and loop it opened |
+| `match` exhaustiveness: `covered: bool[]` and `wild` threaded through `checkArm` and an inline `missing` loop | class `Coverage` (match.or): flags, `absorb`, `missing`, `verdict`; the E0402 message is produced in one place |
+| `inferPre`: `binds` and `outArgs` as two threaded arrays | class `Inference` (call.or): binding table, argument slots, `typeArgs` |
+| `registerLifted` / `wrapFunc` / the tail of `checkArrow` | lift.or: `registerLifted`, `liftClosure`, `wrapperOf`; wrapper lookup by `Env.wrappers: Map<string, usize>` instead of a scan of `Env.funcs` |
+| ~60 helpers mixed in between (literals, operator rules, diagnostics) | ops.or: pure functions with contracts (`binaryType`, `intLiteral`, `negBigLiteral`, `interpolated`, `fieldIndex`, `missingNames`, `pureH`, ...) |
+
+Files (lines are `orin fmt` output, which spreads every call with more than a few arguments over several lines: the old
+`body.or` is 4,461 lines in the same layout; clauses are the `@Requires` / `@Ensures` / `@Invariant` annotations):
+
+| file | role | lines | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `fnctx.or` (was 457 lines, 36 clauses) | `Scope`, `Captures` (unchanged), `FnCtx`, `newFnCtx`, `newClosureCtx` | 533 | 10 | 44 | 13 |
+| `ops.or` (new) | pure helpers and typing rules | 770 | 2 | 24 | 0 |
+| `match.or` (new) | `Coverage`, `variantsOf` | 148 | 1 | 7 | 2 |
+| `call.or` (new) | `Inference`, diagnostics of built-in calls | 178 | 4 | 8 | 1 |
+| `lift.or` (new) | closure conversion | 168 | 3 | 12 | 0 |
+| `hirok.or` (new) | HIR well-formedness predicates for contracts | 145 | 0 | 0 | 0 |
+| `expr.or` (new) | `ExprChecker` (75 methods) | 3,160 | 5 | 50 | 1 |
+| `stmt.or` (new) | `StmtChecker`, `StmtHost`, `checkBlock`, `checkClause` | 702 | 2 | 39 | 2 |
+| `body.or` (was 3,548 lines, 5 clauses) | facade | 18 | 0 | 0 | 0 |
+| total, before -> after | | 4,005 -> 5,822 | 41 -> 230 clauses | | |
+
+Unit tests: `compiler/tests/check_body_test.or`, 38 `@Test`, 1,279 lines (and `check_env_test.or` of step 2a, which was not
+run by CI, is now run by `tools/test_tooling.sh` together with it).
+
+Classes (6 new, 11 in `check/` with those of 2a): `FnCtx` (the state of one function body: a scope is always open, every capture is a
+local, `cmode` is one of four, a closure has its environment local, type parameters and bindings are parallel, a generic
+instance is no deeper than `MAX_DEPTH`), `ExprChecker` (the environment it works on is well-formed), `StmtChecker`
+(`scope.depth() == base + open` and `loops.length == loopBase + loops`: whatever a statement opens it closes),
+`StmtHost` (stateless; implements the interface `BlockHost` of expr.or), `Coverage` (one flag per variant; flags only
+grow), `Inference` (one binding per type parameter, one slot per argument). The 2a classes `Scope` and `Captures` are
+unchanged.
+
+Contracts (highlights; `grep -n '@Requires\|@Ensures\|@Invariant' compiler/check/{fnctx,expr,stmt,match,call,lift,ops}.or`):
+
+* **a check either reports or returns a well-typed node**: `ExprChecker.check` ensures that the HIR it returns has a type
+  that refers only to ids of the environment (`typeInRange`) and mentions only locals that exist (`localsBound`, hirok.or,
+  a loop-and-recursion predicate over every kind of `HExpr` / `HStmt`), and that scopes, loops and contract mode are as
+  they were; `expect` ensures `typeEq(result.ty, ty)`; the private recursive core carries the cheap version
+  (`typeInRange` only) so that the heavy walk runs once per expression root;
+* **scope depth is balanced across statement checking**: the `StmtChecker` invariants, `block` / `matchOf` / `arm`
+  ensure the depth, the loop depth and the pending-statement list are unchanged on success, `checkBlock` ensures
+  `allStmtsBound(block.stmts, locals.length)`;
+* **match**: `Coverage.verdict(span).isNone() == exhaustive()`, `absorb` requires `coverageKept(old, new)` (a covered
+  variant stays covered), `arm` ensures the same, `matchOf` ensures the HIR has one arm per source arm and a statement
+  match has type `void`;
+* **hoisting** (ADR-0009): `tryInMutating` ensures exactly two hoisted statements, `cond` ensures none, `mapMutCall` at
+  least one outside a probe; `FnCtx.stashPre` / `restorePre` / `hoist` state their effect on `pre`;
+* **inference**: `Inference.learn` ensures `bindsKept` (a binding is never changed), `fill` requires an empty slot,
+  `typeArgs` ensures `length == tp.length` and no `void`; `inferPre` ensures one checked argument per parameter;
+* **closures**: `registerLifted` ensures a new lifted function with `mode == 6` that points at its HIR,
+  `liftClosure` ensures `functionBound` of the lifted function (every local it mentions is its own),
+  `arrow` ensures a `TyFn` and a closure counted in `ncl`; `wrapperOf` ensures the wrapper is indexed under its name;
+* **contexts**: `FnCtx.newLocal` ensures the id is the old length and the local is what was asked for, `declare` fails only
+  with E0304 and only when the name is in the innermost scope, `lookupVar` never shrinks locals / captures and returns a
+  local, `adopt` requires that the environment only grew (`envGrew`);
+* **typing rules** (ops.or): `binaryType` ensures both operand types equal and the result is the operand type for
+  arithmetic and `bool` for a comparison, `intLiteral` ensures `litFits`, `negBigLiteral` ensures the value is `i64::MIN`.
+
+None fired on the compiler's own sources, on the 804 conformance tests or on the unit tests. To see that they can: 15 hand-made mutants
+of the new code (a scope not counted, a verdict that never complains, `popScope` that opens, a predicate that skips
+assignments, a conditional that allows hoisting, an inference that learns nothing, `-` typed as `bool`, ...) were run against
+`check_body_test.or`: 12 are killed (by a contract trap with the values of the clause, or an assertion), the other three are
+the redundant halves of the trial-rollback protocol (below); the pair `loose` + `inferPre` without any rollback is killed
+by `failedTrialChecksLeaveNoTrace`.
+
+Design:
+
+* **One mutable context, two classes, one interface.** The old code returned the updated `fx` from every function; a
+  class that owns `fx` removes that, but expressions and statements are mutually recursive (a `match` arm or an arrow
+  function body is a block), module cycles are an error (E0303) and a class cannot span files. `ExprChecker` therefore
+  holds an interface `BlockHost` (`block`, `stmtExpr`, `matchExpr`) that `StmtHost` implements in stmt.or; a call hands the
+  context to the other side and gets the updated one back (`this.fx = r.fx`). Value semantics make this cheap and safe:
+  the context is copy-on-write, so the checker that handed it out and the one that works on it share until one writes.
+* **Trial checks need an explicit rollback.** In the functional version a failed check dropped its context for free.
+  Now `methodCall` (the receiver is checked as a value, then for `push` / `pop` as a place), `inferPre` (a deferred
+  argument), `loose` (the fallback after a half-resolved arrow function) and `callBuiltin` (the grant argument is only
+  probed) snapshot `this.fx` and restore it. `failedTrialChecksLeaveNoTrace` pins the observable effect: the generic
+  instance a failed attempt created is created again by the retry, so instance order, and with it the generated C,
+  is the old one.
+* **Mutating methods have rules of their own** (ADR-0009): the checker's methods are inferred to mutate `this`, so a call
+  is hoisted in front of its statement and may not stand in a conditionally evaluated position (`&&`, `||`, `?:`,
+  `while` condition, E0408), and the receiver must be a `let` place (`let sub = new ExprChecker(..); sub.check(..)`,
+  not `new ExprChecker(..).check(..)`). The code is written in statements (`const r = this.ex(e, None)?;`).
+* **Private core, public entry points.** Class invariants are checked after every non-private method, so the
+  recursive methods are private and the heavy clauses sit on the few public ones (`check`, `expect`, `place`,
+  `block`, `matchOf`, `clause`).
+* **Method order matters to the compiler.** Class mutability is a fixpoint that probes every method that is not yet known
+  to mutate, once per round; a method that only calls mutating methods becomes mutating in the round after its callees.
+  `orin check compiler/main.or` went from 0.53 s to 0.57 s with the new classes (the whole self-compile is unchanged,
+  below); methods are not reordered for that.
+
+Behaviour preservation (all against the baseline compiler built before the step):
+
+* `tools/diff_compilers.py`: 1,396 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
+* generated code: the C of `compile`, of `compile --check-contracts` and the LLVM IR of `compile --backend=llvm` of
+  every `tests/run`, `tests/next/run`, `tests/contracts` and `examples/` program and of `compiler/main.or`
+  (415 inputs x 3) is **byte-identical** between the two compilers (the diagnostics diff cannot see instance order,
+  hoisted temporaries or closure numbering; this does);
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (6,503,269 bytes), conformance 141/141;
+* all 804 conformance tests, also with the contract-checked compiler (`tools/test_compiler_contracts.sh`), no contract fired;
+* `orin check --strict-contracts compiler/main.or`: 0 warnings (W045x and W047x);
+* the 11 end-to-end tests of `check_body_test.or` (diagnostic codes and messages, hoisted statements, lifted closures,
+  trial rollback) also pass on the old `body.or`, so they are a specification, not a description of the new code.
+
+Selfcompile (`orin2 compile compiler/main.or`, 11 interleaved runs after a warm-up, the machine was shared by three workers):
+
+| | wall median (min-max) | peak RSS median |
+|---|---|---|
+| before (baseline compiler on the old tree) | 4.270 s (4.101-4.610) | 121.2 MiB |
+| after (new compiler on the new tree) | 4.272 s (4.147-5.014), +0.05 % | 124.8 MiB, +3 % (the source is larger) |
+| baseline compiler on the new tree | 4.289 s (4.121-4.655) | 124.4 MiB |
+
+`orin check compiler/main.or` (front end only): 0.527 s -> 0.573 s. The contract-checked compiler self-compiles in
+the same time as the normal one within noise.
+
+Friction (language and toolchain):
+
+* **No shared mutable object.** Classes are values, so two cooperating checkers cannot share one context by reference;
+  the interface `BlockHost` plus handing the context across is the workaround, and `StmtHost` is a class without state
+  that exists only to be converted to the interface. A `&mut` parameter or a reference type for checker state would
+  remove both.
+* **Parameters are immutable.** A helper that "adds a local" cannot take the context: it is a method of `FnCtx`, or it
+  returns the grown environment (`wrapperOf`, `liftClosure` return `{ env, .. }` and the caller `adopt`s it).
+* **Constructors**: only leading `this.f = e;` statements (no local temporaries, `Coverage` calls its helper twice),
+  no `@Ensures` on a constructor, no `readonly`.
+* **Mutating-call rules** (E0408 in conditional positions, `let` receivers) forced the statement style above; `known ?
+  sub.ep(e, ret)? : sub.ex(e, None)?` had to become an `if` / `else`.
+* **Trial checks** are error-prone with a mutable context (four sites found by reading, one pinned by a test); a context
+  that is a value but still copy-on-write cheap is the right model, it just has to be restored by hand.
+* **`Env` as a class** was not mechanical (about 120 sites build or update it through helper functions of
+  types.or / collect.or / decls.or) and was left for the step that rewrites those; `Env.wrappers` is the one new field.
+* **`ExprChecker` is one class of 75 methods in one 3,160-line file** (about 2,560 lines before `orin fmt`): a class cannot
+  span files and a calls layer on top of it would need a second host interface and the context handed across at every
+  call expression. The pure parts are in ops / call / lift / match / hirok.
+* **Contract helpers** over trees are explicit recursion (`localsBound`); `every` / `some` / `filter` are used where the
+  property is about an array (`fieldIndex`, `missingNames`, `noPre`, `typeArgs`).
+* The formatter's canonical layout adds about 25 % lines to code with long diagnostics; line counts above are after it.
+
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
 Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving

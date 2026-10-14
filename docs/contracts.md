@@ -24,7 +24,7 @@ Clauses are stored in `contracts: ContractClause[]` on `FunctionDecl`, `MethodDe
 `ClassDecl`, `TypeDecl`; loop clauses are `SContract` statements directly before the loop. They may be
 mixed with each other in any order; the formatter prints one per line.
 
-## Contract expressions (checker: `compiler/check/{contracts,purity}.or`, `body.or`)
+## Contract expressions (checker: `compiler/check/{contracts,purity,stmt,expr}.or`)
 
 Every build type-checks all clauses (in a forked function context, then discards the result: nothing
 reaches the generated code). Scope: parameters; `this` (methods, class invariants in the constructor,
