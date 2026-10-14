@@ -14,7 +14,7 @@
   Array methods: `indexOf` /
   `includes` only for `int`, `usize`, `bool`, `string` elements (E0405 otherwise); `sort` is O(n log n) with
   O(n) extra allocation per level; the callbacks' integer results must be `int` (`.toInt()` on lengths).
-- Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic methods (E0460; accepted for after 1.0-freeze via ADR-0040), static fields, getters/setters, `protected`. Private members are
+- Classes (ADR-0009, self-hosted compiler only): no inheritance (`extends`, E0408), generic methods (E0460; ADR-0040 adds them), static fields, getters/setters, `protected`. Private members are
   checked at compile time (E0405). Constructors initialise fields only through leading `this.f = e;`
   statements, parameter properties and field initializers (else E0411; `this` is unavailable until
   then, E0300). Mutating methods are inferred; every mutating call copies the receiver shallowly until
