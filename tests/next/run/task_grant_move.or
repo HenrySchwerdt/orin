@@ -1,0 +1,46 @@
+// std:task: a grant is moved into a task (ADR-0017, ADR-0027 Q10). The tasks get their own derived grants with the authority of
+// the spawner's grant (here narrowed to tests/next/run), cannot reach more than that, and the grants are revoked when the tasks
+// end (the table holds 256 live grants, and 300 tasks below each use one).
+import { Host, useFs, useClock } from "std:host";
+import { readFile, useUnder, FsGrant } from "std:fs";
+import { nowMillis } from "std:time";
+import { scopeFsDo, scopeClockDo, spawnFs, spawnClock, TaskHandle } from "std:task";
+
+function readable(fs: FsGrant, path: string): bool {
+  return readFile(fs, path).isOk();
+}
+
+function main(host: Host): void {
+  useFs(host, fs => {
+    useUnder(fs, "tests/next/run", sub => {
+      scopeFsDo(sub, (s, g) => {
+        const inside = spawnFs(s, g, fsg => readable(fsg, "tests/next/run/task_grant_move.or"));
+        const outside = spawnFs(s, g, fsg => readable(fsg, "tests/next/errors/e0481_task_captures_scope.or"));
+        console.log("inside the granted scope: " + (inside.join() ? "readable" : "denied"));
+        console.log("outside the granted scope: " + (outside.join() ? "readable" : "denied"));
+        // the spawner's own grant is untouched and still works
+        console.log("spawner: " + (readable(g, "tests/next/run/task_grant_move.or") ? "readable" : "denied"));
+        // many tasks, each with its own grant: they are revoked as the tasks end
+        let hs: TaskHandle<bool>[] = [];
+        let i = 0;
+        while (i < 300) {
+          hs.push(spawnFs(s, g, fsg => readable(fsg, "tests/next/run/task_grant_move.or")));
+          i += 1;
+        }
+        let ok = 0;
+        for (const h of hs) {
+          if (h.join()) {
+            ok += 1;
+          }
+        }
+        console.log("grants used by tasks: " + ok.toString());
+      });
+    });
+  });
+  useClock(host, clock => {
+    scopeClockDo(clock, (s, c) => {
+      const t = spawnClock(s, c, cg => nowMillis(cg) > 1000000000000);
+      console.log("clock in a task: " + (t.join() ? "plausible" : "wrong"));
+    });
+  });
+}
