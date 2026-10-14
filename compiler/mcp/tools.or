@@ -17,6 +17,7 @@ import { check } from "../check";
 import { runTests, TestOpts, reportJson, hasTests, eraseTests } from "../testing";
 import { parseJson } from "../json";
 import { ruleIndex } from "../package";
+import { effectsContext, defEffectsJson, viewsJson, aggregateViews, moduleDefs } from "../analysis";
 import { lower } from "../lower";
 import { optimize } from "../opt";
 import { verify } from "../verify";
@@ -82,7 +83,7 @@ export function toolList(): Json[] {
         jField("limit", prop("integer", "max diagnostics listed (default 50)"))
       ], ["entry"])),
     tool("inspect",
-      "Signatures and structure without reading source. Give exactly one of: symbol (\"name\", \"Type.member\", or a built-in API such as \"Array.find\" or \"string.split\"), module (file path), or file+position. Symbols, modules and positions are resolved in the project rooted at entry (default: the file itself).",
+      "Signatures and structure without reading source. Give exactly one of: symbol (\"name\", \"Type.member\", or a built-in API such as \"Array.find\" or \"string.split\"), module (file path), or file+position. Symbols, modules and positions are resolved in the project rooted at entry (default: the file itself). Functions, methods and constructors (and modules) also return their inferred transitive effect summary (primitive effects with evidence MUST/MAY/UNKNOWN and the call path to each).",
       schema([
         jField("symbol", prop("string", "symbol name, Type.member, or built-in API name")),
         jField("module", prop("string", "module file path: returns exports and dependency edges (with an orin.toml: package, moduleId, allowedDependencies, moduleImports)")),
@@ -478,6 +479,19 @@ function defJson(st: McpState, a: Analysis, idx: SemanticIndex, d: SymbolDef, in
   if (impls.length > 0) {
     fs.push(jField("implements", jstrs(impls)));
   }
+  // A function, method or constructor: the inferred, transitive effect summary (ADR-0037 D2), the same analysis as
+  // `orin effects` and the LSP hover: `pure`, the effects with evidence and explanation path, the callback parameters.
+  if (kindName(d) == "function" || kindName(d) == "method" || kindName(d) == "constructor") {
+    match (a.program) {
+      Some(prog) => {
+        const ec = effectsContext(prog, idx, a.sm);
+        if (ec.table.isTyped()) {
+          fs.push(jField("effects", defEffectsJson(ec, d.id)));
+        }
+      },
+      None => {}
+    }
+  }
   if (includeSource) {
     const sp = d.declSpan;
     fs.push(jField("source", JStr(a.sm.files[sp.file].text.substring(sp.start, sp.end))));
@@ -634,6 +648,13 @@ function inspectModule(st: McpState, a: Analysis, idx: SemanticIndex, m: string)
     jField("module", JStr(prog.units[t].name)), jField("file", JStr(relPath(st, prog.units[t].path))),
     jField("exports", jstrs(exports)), jField("imports", jstrs(imports)), jField("importedBy", jstrs(importedBy))
   ];
+  // The effects of the module (ADR-0037 D2): what the code written in it may perform, transitively, with explanation paths.
+  if (prog.units[t].module != "") {
+    const ec = effectsContext(prog, idx, a.sm);
+    if (ec.table.isTyped()) {
+      fields.push(jField("effects", viewsJson(aggregateViews(ec, moduleDefs(ec, prog.units[t].module)), true)));
+    }
+  }
   // With an orin.toml: the module id (directory relative to the src root) and its rule.
   match (prog.manifest) {
     Some(mf) => {

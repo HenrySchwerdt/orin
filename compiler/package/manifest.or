@@ -16,8 +16,14 @@
 //   [modules.users]                # module = directory relative to the entry file's directory
 //   allowed_dependencies = ["database", "logging"]
 //
+//   [effects]                      # capability policy (ADR-0037 D4, docs/capabilities.md): the primitive effects the code of a
+//   allowed = ["Fs.Read"]          # module may perform; this table is the package default, absent = no restriction
+//   [effects.loader]               # per module (same naming as [modules.x]); a module without a table gets the default
+//   allowed = ["Fs", "Console.Write"]
+//
 // `[modules.a.b]` and `[modules."a/b"]` both name module `a/b`; `.` names the root module (the
-// directory of the entry file). Diagnostics: E0500 syntax, E0503 invalid manifest.
+// directory of the entry file). Diagnostics: E0500 syntax, E0503 invalid manifest (the effect names of an `allowed` list are
+// checked against the compiler's list by compiler/analysis/effectpolicy.or: E0473, E0474).
 
 import { Span, Diagnostic, diag, span } from "../diag";
 import { TomlValue, TomlEntry, TomlTable, TomlDoc, parseToml } from "./toml";
@@ -29,6 +35,15 @@ export type ModuleRule = {
   allowedSpans: Span[];    // one per entry of `allowed`
 };
 
+// `[effects]` (module "") or `[effects.<module>]`: the effects the module's code may perform. `allowed` entries are operation
+// names ("Fs.ReadFile"), families ("Fs"), family wildcards ("Fs.*"), "Unknown" (calls whose target is not known) or "*".
+export type EffectRule = {
+  module: string;          // "" = the package default, else a module id as in ModuleRule
+  allowed: string[];
+  span: Span;              // the table header
+  allowedSpans: Span[];    // one per entry of `allowed`
+};
+
 export type Manifest = {
   file: usize;             // file id of the manifest in the diagnostics' SourceMap (set by the loader)
   name: string;
@@ -36,6 +51,7 @@ export type Manifest = {
   entry: string;           // relative to the package root
   rules: ModuleRule[];
   strictContracts: bool;   // `[contracts] strict = true` (ADR-0028): strict contract-coverage warnings
+  effects: EffectRule[];   // `[effects]` / `[effects.<module>]` (ADR-0037 D4); empty = no restriction
 };
 
 export const DEFAULT_ENTRY: string = "src/main.or";
@@ -75,14 +91,14 @@ function packageTable(file: usize, t: TomlTable, m: Manifest): Result<Manifest, 
       if (r.unwrap().length == 0) {
         return Err(invalid(file, entrySpan(file, e), "`name` must not be empty"));
       }
-      out = Manifest { file: out.file, name: r.unwrap(), version: out.version, entry: out.entry, rules: out.rules, strictContracts: out.strictContracts };
+      out = Manifest { file: out.file, name: r.unwrap(), version: out.version, entry: out.entry, rules: out.rules, strictContracts: out.strictContracts, effects: out.effects };
       haveName = true;
     } else if (e.key == "version") {
       const r = strOf(file, e);
       if (r.isErr()) {
         return Err(r.unwrapErr());
       }
-      out = Manifest { file: out.file, name: out.name, version: r.unwrap(), entry: out.entry, rules: out.rules, strictContracts: out.strictContracts };
+      out = Manifest { file: out.file, name: out.name, version: r.unwrap(), entry: out.entry, rules: out.rules, strictContracts: out.strictContracts, effects: out.effects };
     } else if (e.key == "entry") {
       const r = strOf(file, e);
       if (r.isErr()) {
@@ -91,7 +107,7 @@ function packageTable(file: usize, t: TomlTable, m: Manifest): Result<Manifest, 
       if (!r.unwrap().endsWith(".or")) {
         return Err(invalid(file, entrySpan(file, e), "`entry` must be a path to an `.or` file"));
       }
-      out = Manifest { file: out.file, name: out.name, version: out.version, entry: r.unwrap(), rules: out.rules, strictContracts: out.strictContracts };
+      out = Manifest { file: out.file, name: out.name, version: out.version, entry: r.unwrap(), rules: out.rules, strictContracts: out.strictContracts, effects: out.effects };
     } else {
       return Err(invalid(file, entrySpan(file, e), "unknown key `" + e.key + "` in [package] (expected name, version, entry)"));
     }
@@ -135,6 +151,29 @@ function contractsTable(file: usize, t: TomlTable): Result<bool, Diagnostic> {
   return Ok(strict);
 }
 
+// `[effects]` or `[effects.<module path>]`: one key, `allowed`, an array of strings.
+function effectRule(file: usize, t: TomlTable): Result<EffectRule, Diagnostic> {
+  const mname = t.path.slice(1, t.path.length).join("/");
+  const hs = span(file, t.start, t.end);
+  let allowed: string[] = [];
+  let spans: Span[] = [];
+  for (const e of t.entries) {
+    if (e.key != "allowed") {
+      return Err(invalid(file, entrySpan(file, e), "unknown key `" + e.key + "` in [" + t.path.join(".") + "] (expected allowed)"));
+    }
+    match (e.value) {
+      TArr(xs) => {
+        allowed = xs;
+        spans = e.elems;
+      },
+      _ => {
+        return Err(invalid(file, entrySpan(file, e), "`allowed` must be an array of strings"));
+      }
+    }
+  }
+  return Ok(EffectRule { module: mname, allowed: allowed, span: hs, allowedSpans: spans });
+}
+
 function moduleRule(file: usize, t: TomlTable): Result<ModuleRule, Diagnostic> {
   const mname = t.path.slice(1, t.path.length).join("/");
   const hs = span(file, t.start, t.end);
@@ -165,7 +204,8 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
   }
   const doc = pr.unwrap();
   const noRules: ModuleRule[] = [];
-  let m = Manifest { file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules, strictContracts: false };
+  const noEffects: EffectRule[] = [];
+  let m = Manifest { file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules, strictContracts: false, effects: noEffects };
   let havePackage = false;
   for (const t of doc.tables) {
     if (t.path.length == 0) {
@@ -193,7 +233,20 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
       if (r.isErr()) {
         return Err(r.unwrapErr());
       }
-      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: m.rules, strictContracts: r.unwrap() };
+      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: m.rules, strictContracts: r.unwrap(), effects: m.effects };
+    } else if (head == "effects") {
+      const r = effectRule(file, t);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      let effs = m.effects;
+      for (const x of effs) {
+        if (x.module == r.unwrap().module) {
+          return Err(invalid(file, span(file, t.start, t.end), "duplicate [effects] table for " + (x.module == "" ? "the package default" : "module `" + x.module + "`")));
+        }
+      }
+      effs.push(r.unwrap());
+      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: m.rules, strictContracts: m.strictContracts, effects: effs };
     } else if (head == "modules" && t.path.length >= 2) {
       const r = moduleRule(file, t);
       if (r.isErr()) {
@@ -206,10 +259,10 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
         }
       }
       rules.push(r.unwrap());
-      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: rules, strictContracts: m.strictContracts };
+      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: rules, strictContracts: m.strictContracts, effects: m.effects };
     } else {
       return Err(invalid(file, span(file, t.start, t.end),
-        "unknown table `[" + t.path.join(".") + "]` (expected [package], [architecture] or [modules.<path>])"));
+        "unknown table `[" + t.path.join(".") + "]` (expected [package], [architecture], [contracts], [effects] or [modules.<path>])"));
     }
   }
   if (!havePackage) {
@@ -223,6 +276,18 @@ export function ruleIndex(m: Manifest, module: string): Option<usize> {
   let i: usize = 0;
   while (i < m.rules.length) {
     if (m.rules[i].module == module) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// Index of the `[effects]` table for `module` ("" = the package default), if the manifest has one.
+export function effectRuleIndex(m: Manifest, module: string): Option<usize> {
+  let i: usize = 0;
+  while (i < m.effects.length) {
+    if (m.effects[i].module == module) {
       return Some(i);
     }
     i += 1;

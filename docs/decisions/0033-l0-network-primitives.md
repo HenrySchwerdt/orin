@@ -1,6 +1,6 @@
 # ADR-0033: L0 network primitives for `std:net`
 
-Status: accepted (2026-10-14; implemented, with the amendment at the end). Amends the closed L0 list of spec 19 §2 (an ADR is required for
+Status: accepted (2026-10-14, project owner; implemented, with the amendment at the end). Amends the closed L0 list of spec 19 §2 (an ADR is required for
 every new platform function). Related: ADR-0021 (primitive operations Bind / Accept / Connect /
 StreamRead / StreamWrite, handle identity), ADR-0027 (Stage A: root grants as resource handles),
 ADR-0030 (the trust boundary is L0 only), ADR-0025 (resources).

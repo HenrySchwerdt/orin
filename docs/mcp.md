@@ -61,11 +61,19 @@ No source text unless `includeSource: true`.
   `{"name","kind","sig","at":"file:line:col","exported","in","mutates"}` — `mutates` (methods only) is
   the checker's inferred receiver mutability. Interfaces (ADR-0019) have kind `interface` with
   `"implementedBy":["Circle at shape.or:7:7", ..]`; a class has `"implements":["Shape", ..]`; an interface
-  method is a `method` whose `in` is the interface.
+  method is a `method` whose `in` is the interface. A function, method or constructor also has
+  `"effects":{"pure":false,"effects":[{"operation":"Fs.ReadFile","direction":"INPUT","grant":"FsGrant","evidence":"MAY",
+  "path":[{"function":"store::reload","span":{...},"route":"direct"},{"function":"store::loadConfig",...}]}],"callbacks":[]}`:
+  its inferred, transitive effect summary ([capabilities.md](capabilities.md), the same analysis as `orin effects`, the OSIG
+  `MAY_PERFORM` edges and the LSP hover). `evidence` is MUST / MAY / UNKNOWN, `path` the call chain to the primitive call,
+  `callbacks` the parameters whose function values it calls (its effects then depend on the arguments). Omitted when the
+  program does not type-check.
 * `module`: a file path (or unit name) in the program rooted at `entry` (default: the module itself):
   ```json
   ← {"module":"a","file":"a.or","exports":["function double(n: int): int"],"imports":[],"importedBy":["m"]}
   ```
+  A module of the program (not std library code) also has `"effects"`: what the code written in the module may perform, transitively
+  (the module row of `orin effects`), each with its witness path.
 * `file` + `position`: the symbol at the position, else the type of the expression there.
 
 ### `edit` {kind:"rename", file, position, newName, entry?, apply?}
@@ -114,7 +122,7 @@ carrying the rendered diagnostics.
 
 ```json
 → {"entry":"shop"}
-← {"schema":"osig/0.1","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
+← {"schema":"osig/0.2","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
 ```
 
 ### `diff` {base, head, format?, out?}
@@ -123,12 +131,12 @@ Compares two OSIG snapshots (`base`, `head`: package directory, entry `.or` file
 written by `graph`): changed / added / removed symbols, added / removed call, import, implements and
 type-reference edges, **heuristic** rename candidates (never identity), and for every changed symbol and
 every new call the entry points that reach it with the explaining path and per-hop evidence. `format`:
-`json` (default, `osig-diff/0.1`), `text` or `html` (one self-contained file); `out` writes the report
+`json` (default, `osig-diff/0.2`), `text` or `html` (one self-contained file); `out` writes the report
 inside the root and returns `{"written","differences"}`. Same engine as `orin diff`.
 
 ```json
 → {"base":"acme-base","head":"acme-head"}
-← {"schema":"osig-diff/0.1","differences":true,"summary":{"added":4,"removed":1,"changed":1,...},"changedSymbols":[...],"possibleRenames":[{"heuristic":true,...}],"newCallPaths":[...],...}
+← {"schema":"osig-diff/0.2","differences":true,"summary":{"added":4,"removed":1,"changed":1,...},"changedSymbols":[...],"possibleRenames":[{"heuristic":true,...}],"newCallPaths":[...],...}
 ```
 
 ## Security model

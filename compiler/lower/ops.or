@@ -1,0 +1,254 @@
+// Pure helpers of the lowering: operator rules, `match` dispatch planning, place paths. None of them touches the block
+// builder, so each has its contract here and is tested on its own (compiler/tests/lower_test.or).
+
+import {
+  Type, Place, PlaceElem, HExpr, HArm, HPattern, FieldInitH, BinOp, Builtin, intKindOf, kindNarrow,
+  kindLo, kindHi,
+} from "../hir";
+import { Operand, Instr, SwitchCase } from "../mir";
+import { Lits, litId, isUsizeTy } from "./util";
+
+// ---------------------------------------------------------------- operators
+
+// Builtins whose result may need rounding when it is an f32 (the others are exact on f32 inputs).
+export function roundsF32(b: Builtin): bool {
+  return match (b) {
+    BFloatSqrt => true,
+    BFloatPow => true,
+    BIntToFloat => true,
+    BUsizeToFloat => true,
+    _ => false,
+  };
+}
+
+export function isArithBin(op: BinOp): bool {
+  return match (op) {
+    OpAdd => true,
+    OpSub => true,
+    OpMul => true,
+    OpDiv => true,
+    _ => false,
+  };
+}
+
+export function isAdd(op: BinOp): bool {
+  return match (op) {
+    OpAdd => true,
+    _ => false,
+  };
+}
+
+// After an operation on a type narrower than 64 bits (computed in an MInt with the 64-bit checked operation): trap
+// unless the result is in the type's range (ADR-0022). `%` cannot leave the range. The `op` of a negation is passed as
+// OpSub.
+@Ensures(result.length <= 1)
+@Ensures(result.length == 1 ==> isArithBin(op) && intKindOf(ty) >= 0 && kindNarrow(intKindOf(ty)))
+@Ensures(isArithBin(op) && intKindOf(ty) >= 0 && kindNarrow(intKindOf(ty)) ==> result.length == 1)
+export function rangeCheck(ty: Type, op: BinOp, id: usize): Instr[] {
+  let out: Instr[] = [];
+  const k = intKindOf(ty);
+  if (k < 0 || !kindNarrow(k)) {
+    return out;
+  }
+  if (isArithBin(op)) {
+    out.push(IBuiltin(Some(id), BIntRange, [OLocal(id), OInt(kindLo(k)), OInt(kindHi(k))]));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- match
+
+export function patIsVariant(p: HPattern): bool {
+  return match (p) {
+    HPVariant(_, _) => true,
+    _ => false,
+  };
+}
+
+export function patIsWild(p: HPattern): bool {
+  return match (p) {
+    HPWildcard => true,
+    _ => false,
+  };
+}
+
+// The constant a literal pattern compares the scrutinee with.
+export function litOperand(lits: Lits, p: HPattern, sty: Type): Operand {
+  return match (p) {
+    HPInt(v) => isUsizeTy(sty) ? OUsize(v) : OInt(v),
+    HPStr(s) => OStr(litId(lits, s)),
+    HPBool(b) => OBool(b),
+    _ => OInt(0),
+  };
+}
+
+// The arms that can be reached: everything after the first wildcard is dead. The result is the number of live arms.
+@Ensures(result <= arms.length)
+@Ensures(result == arms.length || result >= 1 && patIsWild(arms[result - 1].pattern))
+export function matchLimit(arms: HArm[]): usize {
+  let i: usize = 0;
+  while (i < arms.length) {
+    if (patIsWild(arms[i].pattern)) {
+      return i + 1;
+    }
+    i += 1;
+  }
+  return arms.length;
+}
+
+export function distinctValues(cases: SwitchCase[]): bool {
+  let i: usize = 0;
+  while (i < cases.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (cases[i].value == cases[j].value) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The jump table of a `match` over a union: one case per variant, to the label of the first arm that names it
+// (`base + 1 + i` for arm `i`), and a default that is the label of the wildcard arm or the trap label.
+export type Dispatch = { cases: SwitchCase[]; dflt: usize; };
+
+@Requires(limit <= arms.length)
+@Ensures(distinctValues(result.cases))
+@Ensures(result.cases.every(c => c.target > base && c.target <= base + limit))
+@Ensures(result.dflt == ltrap || result.dflt > base && result.dflt <= base + limit)
+export function variantDispatch(arms: HArm[], limit: usize, base: usize, ltrap: usize): Dispatch {
+  let cases: SwitchCase[] = [];
+  let seen: usize[] = [];
+  let dflt = ltrap;
+  let i: usize = 0;
+  while (i < limit) {
+    match (arms[i].pattern) {
+      HPVariant(tag, _) => {
+        if (!seen.includes(tag)) {
+          seen.push(tag);
+          cases.push(SwitchCase { value: tag.toInt(), target: base + 1 + i });
+        }
+      },
+      HPWildcard => {
+        dflt = base + 1 + i;
+      },
+      _ => {},
+    }
+    i += 1;
+  }
+  return Dispatch { cases: cases, dflt: dflt };
+}
+
+// ---------------------------------------------------------------- places and expression lists
+
+export function containsIndex(fields: FieldInitH[], i: usize): bool {
+  return fields.some(f => f.index == i);
+}
+
+// The index expressions of the `PIndex` elements of `place`, in path order.
+@Ensures(result.length <= place.path.length)
+export function placeIdxExprs(place: Place): HExpr[] {
+  let out: HExpr[] = [];
+  for (const el of place.path) {
+    match (el) {
+      PIndex(ix) => {
+        out.push(ix);
+      },
+      PField(_, _) => {},
+    }
+  }
+  return out;
+}
+
+// Number of `PIndex` elements of a path.
+export function indexCount(place: Place): usize {
+  let n: usize = 0;
+  for (const el of place.path) {
+    match (el) {
+      PIndex(_) => {
+        n += 1;
+      },
+      PField(_, _) => {},
+    }
+  }
+  return n;
+}
+
+// The operand of every path element, by position: the evaluated index for a `PIndex` (taken in order from `ops`, the
+// evaluated index expressions), `OInt(0)` for a field.
+@Requires(ops.length >= indexCount(place))
+@Ensures(result.length == place.path.length)
+export function placeIdx(place: Place, ops: Operand[]): Operand[] {
+  let out: Operand[] = [];
+  let j: usize = 0;
+  for (const el of place.path) {
+    match (el) {
+      PIndex(_) => {
+        out.push(ops[j]);
+        j += 1;
+      },
+      PField(_, _) => {
+        out.push(OInt(0));
+      },
+    }
+  }
+  return out;
+}
+
+// What a call instruction calls: a function, a function value (indirect), or an interface method (through the vtable).
+export type Callee = CFn(usize) | CIndirect(Operand) | CVirtual(Operand, usize);
+
+// The call instruction of `callee` with result `d` (None: the result is not used or is `void`) and arguments `ops`
+// (without the function value / receiver).
+export function callInstr(callee: Callee, d: Option<usize>, ops: Operand[]): Instr {
+  return match (callee) {
+    CFn(f) => ICall(d, f, ops),
+    CIndirect(f) => ICallIndirect(d, f, ops),
+    CVirtual(r, slot) => ICallVirtual(d, r, slot, ops),
+  };
+}
+
+export function typesOf(xs: HExpr[]): Type[] {
+  return xs.map(x => x.ty);
+}
+
+// All operands but the first (the callee or receiver of an indirect / virtual call).
+@Requires(ops.length >= 1)
+@Ensures(result.length + 1 == ops.length)
+export function tailOps(ops: Operand[]): Operand[] {
+  return ops.slice(1, ops.length);
+}
+
+export function isLocalExpr(e: HExpr, id: usize): bool {
+  return match (e.kind) {
+    XLocal(l) => l == id,
+    _ => false,
+  };
+}
+
+// `const h = <opener>(..)`: the builtins that define a handle (ADR-0025, ADR-0027).
+export function isFileOpen(e: HExpr): bool {
+  return match (e.kind) {
+    XBuiltin(b, _) => match (b) {
+      BFileOpen => true,
+      BGrantFs => true,
+      BGrantProcess => true,
+      BGrantStdio => true,
+      BGrantClock => true,
+      BGrantUnder => true,
+      BGrantReadOnly => true,
+      BGrantArgsOnly => true,
+      BGrantNet => true,
+      BGrantListen => true,
+      BGrantConnect => true,
+      BNetListen => true,
+      BNetAccept => true,
+      BNetConnect => true,
+      _ => false,
+    },
+    _ => false,
+  };
+}

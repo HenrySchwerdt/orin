@@ -115,7 +115,7 @@ points (at most 5 per target, breadth first, deterministic) and prints the path 
 hop and the weakest evidence of the whole path. The same walk explains **new call paths** (for every added
 `CALLS` edge: the entry points of the head graph that reach its caller, followed by the new edge) and
 removed ones (in the base graph). Findings per section are capped at 100; the report says when it
-truncated. Report formats: text, JSON (`osig-diff/0.1`), one self-contained HTML file.
+truncated. Report formats: text, JSON (`osig-diff/0.1`; `osig-diff/0.2` adds the effect sections, below), one self-contained HTML file.
 
 **9. `orin api` stays.** `orin api [--check]` keeps its text format and behaviour (its tests are
 unchanged). It remains the lean, human-reviewed public-API contract; `orin diff` is the general mechanism.
@@ -145,3 +145,14 @@ this step (a later step may express the API snapshot as the exported-symbol proj
   flow/context sensitivity, one `implements` expansion per interface call (every implementer, even if only
   one is ever converted to the interface), no edges into `std:`/built-ins/FFI, a generic function's calls are
   attributed once to the generic declaration (not per instance).
+
+## Addendum: schema history (osig/0.2, ADR-0037 D2 Stage B)
+
+The versioning rule of decision 1 was applied once so far. `osig/0.2` is additive: the edge kind `MAY_PERFORM` (the transitive
+effect summary of a function: one edge per primitive effect, to the compiler-owned `Effect` node or to `~unknown`, evidence
+MUST / MAY / UNKNOWN, `via` the direction or the UNKNOWN kind) and the edge field `next` (set on `MAY_PERFORM` edges only, the
+callee the effect is inherited from; edge lines of every other kind are byte-identical to 0.1). `orin diff` reports
+`osig-diff/0.2`: the same sections plus `effectsComparable`, `effectChanges` and `moduleEffects`; against a snapshot older than
+0.2 it skips the effect findings and says so. The `MAY_PERFORM` edges are *not* listed again as plain added / removed edges.
+Details: [osig.md](../osig.md), [capabilities.md](../capabilities.md). The hash covers the schema string, so a 0.1 and a 0.2 snapshot of
+the same program differ.

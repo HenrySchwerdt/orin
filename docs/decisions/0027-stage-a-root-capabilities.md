@@ -178,7 +178,8 @@ New node kind `Effect` (compiler-owned, id `~io:<Operation>`, `sig` = `<DIRECTIO
 `PERFORMS_IO` from the *enclosing function* of a call site to the Effect, `via` = direction (`INPUT`, `OUTPUT`,
 `CONTROL`), evidence `MUST` for a direct call (`MAY` inside a closure body, like `CALLS`). Edges exist for the
 primitive builtins, for the std scope functions (`withFile`, `withUnder`, `useFs`, ...: `Fs.Open`, `Fs.Narrow`,
-`Host.Acquire`) and for `console.*` / `exit` (grant `ambient`). Not yet: transitive effect summaries (Stage B), data-flow
+`Host.Acquire`) and for `console.*` / `exit` (grant `ambient`). Transitive effect summaries (Stage B) are implemented: `MAY_PERFORM`
+edges of `osig/0.2` and `orin effects` ([capabilities.md](../capabilities.md)). Not yet: data-flow
 lineage, the grant chain, runtime events. **Absence of a `PERFORMS_IO` edge is not proof that a function performs no
 I/O**: a call through a function value (`~unknown`) or into a callee outside the analysed package can hide one.
 
