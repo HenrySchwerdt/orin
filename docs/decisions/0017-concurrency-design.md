@@ -98,7 +98,7 @@ L0 (`orin_platform_thread_*`, `orin_platform_monitor_*`, `orin_platform_runtime_
 
 **Grants (ADR-0027 Q10).** Resolved in the smallest sound form: no owned-parameter syntax or mode for user code. `spawnFs(s, g,
 fsg => ..)` derives a fresh grant of the same authority, moves it into the task through a one-shot token and the task owns and
-revokes it. MIR v1.10 adds the verifier rules (`grantClone` opener, `grantMove` closer, `grantAdopt*` opener on a token): a handle
+revokes it. MIR v2.1 adds the verifier rules (`grantClone` opener, `grantMove` closer, `grantAdopt*` opener on a token): a handle
 is moved exactly once on every path. The original grant is not moved (it is borrowed from its scope function); moving a `File` is
 not provided.
 

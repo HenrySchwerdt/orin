@@ -14,13 +14,21 @@
   (docs/concurrency.md, ADR-0017 Addendum A). Runtime made thread-safe: per-task free lists, counters, work stack, grant and file
   tables (`ORIN_STATS` adds `transfer_moves`, `transfer_copies`, `tasks_spawned`), immortal singletons published by compare-and-swap,
   the stdout buffer locked, grant handles carry the owning task. Compiler: one builtin `BTask(k)`; checker rules **E0481** (task
-  body captures a `Scope`), **E0482** (`channel(0)`), **E0483** (task body captures a resource handle); MIR v1.10 (`grantClone`
+  body captures a `Scope`), **E0482** (`channel(0)`), **E0483** (task body captures a resource handle); MIR v2.1 (`grantClone`
   opener, `grantMove` closer, `grantAdopt*` opener: a handle moves exactly once on every path; 14 verifier cases); OSIG events
   (`Task.Spawn` / `Task.Join` CONTROL, `Channel.Send` OUTPUT, `Channel.Receive` INPUT). Tests: 10 run + 5 error conformance programs
   (all backend modes), 10 `@Test` + 4 expect-trap, stress tests (3,000 live tasks, 40,000 messages), C tests, everything under
   ThreadSanitizer and ASan + UBSan (`tools/test_concurrency.sh`). Example `examples/parallel_map.or`. Assurance: the C parts are
   `TESTED_ONLY` (ThreadSanitizer, no proof) until R3 / R4 (docs/assurance.md C17). Not in stage 0: `async` / `await`, cancellation,
   timeouts, deadlock detection, an M:N scheduler, a concurrent HTTP server (`std:net` has not landed).
+- **Rewrite step 3a: `compiler/lower/` and MIR source spans (ADR-0015, ADR-0020 D3).** HIR -> MIR lowering is now a `Lowerer`
+  class per function with a `BlockBuilder`, a `Locals` table and an `OwnedScope` (97 contract clauses, 15 unit tests in
+  `compiler/tests/lower_test.or`), split into `lowerer` / `builder` / `state` / `ops` / `place` / `values` / `wellformed`.
+  **MIR v2.0**: every instruction and terminator carries the span of the HIR node it was lowered from
+  (`MBlock { instrs, spans, term, termSpan }`, `noSpan()` for hand-written MIR); the optimiser keeps them; the text format
+  of `orin mir` gains ` @file:start-end` per line (the verifier driver, `tools/mutate_mir.py` and the Lean differential
+  test accept it); `orin verify` / `orin compile` report an ownership error as `verify error: f b0 i2 at path:line:col: ..`.
+  C and LLVM output are byte-identical to before (spans are never emitted). No change to the language.
 - **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0036).** `orin verify --contracts` now encodes arrays
   (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
   `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by

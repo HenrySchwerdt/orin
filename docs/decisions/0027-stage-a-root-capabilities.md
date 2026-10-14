@@ -233,5 +233,5 @@ records this. The full chain old seed -> bridge -> new seed is reproducible from
 10. **Tasks (ADR-0017).** The move-into-task rule for handles needs the owned-parameter extension for handles; schedule
     it with the task design, not with this stage. **Resolved with the task stage (2026-10-14, ADR-0017 Addendum A):** no
     owned-parameter mode for user code; `spawnFs(s, g, fsg => ..)` derives a grant of the same authority, moves it into the task
-    through a one-shot token (MIR v1.10: `grantClone` opener, `grantMove` closer, `grantAdopt*` opener), and the task revokes it.
+    through a one-shot token (MIR v2.1: `grantClone` opener, `grantMove` closer, `grantAdopt*` opener), and the task revokes it.
     The spawner's own grant stays valid; a task cannot capture a grant (E0483).

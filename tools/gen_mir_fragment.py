@@ -88,7 +88,9 @@ def to_lean(p):
 
 # ---------------------------------------------------------------- MIR text (`orin mir` format)
 
-def to_mir(p):
+def to_mir(p, spans=False):
+    """The `orin mir` text of `p`. With `spans`, every instruction and terminator line carries a synthetic source
+    position ` @0:<n>-<n+1>` (docs/mir.md v2.0): the verifier driver must accept it and give the same verdicts."""
     blocks = []  # each: [instr lines, terminator line]
 
     def new():
@@ -136,10 +138,18 @@ def to_mir(p):
     ty = {"r": "ref", "i": "int", "b": "bool"}
     out = ["main = fn0", "", "fn0 f (params %d) -> void" % p.np,
            "  locals: " + " ".join("l%d:%s" % (i, ty[c]) for i, c in enumerate(p.cls))]
+    pos = [0]
+
+    def at(line):
+        if not spans:
+            return line
+        pos[0] += 1
+        return "%s @0:%d-%d" % (line, pos[0], pos[0] + 1)
+
     for bi, (ins, t) in enumerate(blocks):
         out.append("  b%d:" % bi)
-        out += ["    " + x for x in ins]
-        out.append("    " + t)
+        out += ["    " + at(x) for x in ins]
+        out.append("    " + at(t))
     return "\n".join(out) + "\n"
 
 

@@ -10,6 +10,10 @@
 //   <name> ACCEPT <warning count>
 //   <name> REJECT <error count> <error 1> <error 2> ...      (error = fN:bB:iI: message)
 //
+// An instruction or terminator line may end in the source position the lowering recorded, ` @<file>:<start>-<end>`
+// (docs/mir.md v2.0); it is read into the block's spans and shown after the message of a verifier issue. Lines without it
+// have no position (`noSpan()`).
+//
 // The parser is the inverse of the printer except that built-in names are not mapped back (every
 // IBuiltin becomes a call of a fixed non-mutating built-in: the verifier treats all built-ins
 // alike) and the contents of string literals are dropped (only their number matters).
@@ -18,7 +22,8 @@
 import { Host, useHost } from "std:host";
 import { FsGrant } from "std:fs";
 import { ProcessGrant } from "std:process";
-import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, MVTable } from "../mir";
+import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, MVTable, noSpan, spanSuffix } from "../mir";
+import { Span } from "../diag";
 import { Builtin, UnOp, BinOp, taskOpFromName } from "../hir";
 import { verify, VerifyReport } from "../verify";
 import { readFile } from "std:fs";
@@ -331,6 +336,32 @@ function instr(line: string): Instr {
   return IMakeUnique(0);
 }
 
+type Spanned = { text: string; span: Span; };
+
+// "text @file:start-end" -> the text and the position; a line without a well-formed suffix has no position.
+function splitSpan(line: string): Spanned {
+  const parts = line.split(" @");
+  if (parts.length < 2) {
+    return Spanned { text: line, span: noSpan() };
+  }
+  const fc = parts[parts.length - 1].split(":");
+  if (fc.length != 2) {
+    return Spanned { text: line, span: noSpan() };
+  }
+  const se = fc[1].split("-");
+  if (se.length != 2) {
+    return Spanned { text: line, span: noSpan() };
+  }
+  const f = parseInt(fc[0]);
+  const a = parseInt(se[0]);
+  const b = parseInt(se[1]);
+  if (f.isNone() || a.isNone() || b.isNone() || a.unwrap() < 0 || b.unwrap() < a.unwrap() || f.unwrap() < 0) {
+    return Spanned { text: line, span: noSpan() };
+  }
+  const text = parts.slice(0, parts.length - 1).join(" @");
+  return Spanned { text: text, span: Span { file: f.unwrap().toUsize(), start: a.unwrap().toUsize(), end: b.unwrap().toUsize() } };
+}
+
 function isTerm(line: string): bool {
   return line.startsWith("goto ") || line.startsWith("branch ") || line.startsWith("switch ")
     || line == "return" || line.startsWith("return ") || line.startsWith("trap ");
@@ -413,6 +444,7 @@ function parseProgram(lines: string[]): MProgram {
   let mainIdx: usize = 0;
   let seenMain = false;
   let instrs: Instr[] = [];
+  let spans: Span[] = [];
   let inBlock = false;
   let i: usize = 0;
   while (i < lines.length) {
@@ -462,13 +494,18 @@ function parseProgram(lines: string[]): MProgram {
       funcs[funcs.length - 1].locals = ls;
     } else if (line.startsWith("b") && line.endsWith(":") && find(line, " ") < 0) {
       instrs = [];
+      spans = [];
       inBlock = true;
-    } else if (inBlock && isTerm(line)) {
-      funcs[funcs.length - 1].blocks.push(MBlock { instrs: instrs, term: term(line) });
+    } else if (inBlock && isTerm(splitSpan(line).text)) {
+      const sp = splitSpan(line);
+      funcs[funcs.length - 1].blocks.push(MBlock { instrs: instrs, spans: spans, term: term(sp.text), termSpan: sp.span });
       instrs = [];
+      spans = [];
       inBlock = false;
     } else if (inBlock) {
-      instrs.push(instr(line));
+      const sp = splitSpan(line);
+      instrs.push(instr(sp.text));
+      spans.push(sp.span);
     } else {
       die("unexpected line `" + line + "`");
     }
@@ -491,7 +528,7 @@ function runOne(name: string, lines: string[]): void {
   }
   let out = name + "\tREJECT\t" + r.errors.length.toString();
   for (const e of r.errors) {
-    out += "\t" + e.func + ":b" + e.block.toString() + ":i" + e.instr.toString() + ": " + e.message;
+    out += "\t" + e.func + ":b" + e.block.toString() + ":i" + e.instr.toString() + ": " + e.message + spanSuffix(e.span);
   }
   console.log(out);
 }
