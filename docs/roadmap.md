@@ -61,7 +61,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - *before performance*, because allocation, RC elision and escape analysis depend on the
      threading model, and the comparison with Go needs parallelism;
    - the HTTP server becomes concurrent here.
-6. **Performance push:**
+6. **Performance push** (performance model: ADR-0038, inferred allocation and invariant-driven optimisation, no user-facing arena types):
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
    - **contract-driven optimisation** (ADR-0031 §E). Only `VERIFIED` facts remove checks or change
