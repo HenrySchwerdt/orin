@@ -1,6 +1,6 @@
-# ADR-0036: Closed-root capability derivation, generic I/O boundaries and proof roadmap
+# ADR-0037: Closed-root capability derivation, generic I/O boundaries and proof roadmap
 
-**Status:** proposed (2026-10-14). Architecture/design only; no new syntax, builtins or proof claims implemented by this ADR.
+**Status:** accepted (2026-10-14, project owner). Architecture/design only; no new syntax, builtins or proof claims implemented by this ADR. Accepted with the D5 decisions: user-facing `console.*` moves to `StdioGrant` with a trusted panic/diagnostic path, and `shell` is replaced by `spawn(proc, executable, argv)` with enforced allowlists; both are implemented before the std I/O freeze (follow-up implementation ADR for migration and policy format).
 
 **Related:** [ADR-0021](0021-capabilities-and-io-provenance.md), [ADR-0027](0027-stage-a-root-capabilities.md), [ADR-0023](0023-osig-schema-v0.1.md), [ADR-0020](0020-verifiable-software-roadmap.md), [ADR-0025](0025-resources-and-streaming-fs.md), [ADR-0032](0032-end-to-end-assurance.md), [ADR-0033](0033-l0-network-primitives.md), [assurance](../assurance.md). The language freeze of ADR-0016 requires separate approval for new surface syntax.
 
