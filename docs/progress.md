@@ -26,10 +26,11 @@ _Updated: 2026-10-13_
 | Seed bootstrap (ADR-0014) | done |
 | Floats (`float`, `f32`), `std:math`, `Map<K,V>` (ADR-0018) | done |
 | Runtime R2: platform layer with contracts | done (CBMC-bounded + tests) |
-| Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for pure functions | done: phase 1 + phase 2 for int/bool functions (`orin verify --contracts`, z3; see docs/contracts.md) |
+| Contract clauses (ADR-0012): parse/check/erase, runtime checks, SMT for functions, methods and classes | done: phase 1 + phase 2 (`orin verify --contracts`, z3): integers, arrays, records, `Option`/`Result`/`Map`, strings by length, modular calls, class invariants per method, loops, quantifiers and sums (ADR-0031 B/C, ADR-0036; see docs/contracts.md) |
 | Packages: `orin.toml`, architecture rules, API snapshots | done |
 | std:path/json/time/graph | done |
 | Provable std layer 1 (ADR-0030 §3): `std:bytes`, `std:utf8`, `std:collections` | done: pure Orin, best-known algorithms (B-tree maps, 4-ary heap, table-driven UTF-8 DFA, ring deque), 24 invariants / 16 `@Requires` / 291 `@Ensures`, 94 `@Test`, 60-mutant check and differential tests against executable specs (`tools/test_std.sh --mutate`); generic `Set`/`SortedMap<K,V>`/comparator queue blocked by language limits (docs/std.md) |
+| `std:http`, the pure part (ADR-0030 §3 "protocols"): HTTP/1.1 request and response parser, serializer | done: incremental, smuggling-safe (every ambiguity refused with reason and position), limits as parameters, explicit state machine in the invariants, round-trip contract; 34 invariants / 49 `@Requires` / 131 `@Ensures`, 72 `@Test`, split-at-every-byte, differential and fuzz tests (40,000 fuzz iterations), 41-mutant check; no sockets (ADR-0033 pending) |
 | Interfaces (ADR-0019) | done |
 | Fixed-width integers (`i8`..`u64`, `isize`, `usize`; 128-bit deferred, E0431) and template-literal interpolation (ADR-0022) | done |
 | Built-in annotations `@Test` (`orin test`, `std:test`), `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) | done |

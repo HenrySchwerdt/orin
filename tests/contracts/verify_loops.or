@@ -1,0 +1,216 @@
+// Inputs for tools/test_verify_contracts.py: loops (ADR-0031 B, item 10 and the loop rules of docs/contracts.md).
+//   * a counting loop `while (i < N)` with `i += 1` gets its bound `i0 <= i <= max(i0, N)` for free;
+//   * a loop `@Invariant(..)` (ADR-0012 syntax, not checked at run time) is proved on entry and for one iteration and
+//     then used; the result of the loop is only known through it;
+//   * a loop without an invariant havocs what it assigns: UNKNOWN with reason "loop without invariant" and the
+//     action STRENGTHEN_SPEC when the result depends on that;
+//   * a loop is also unrolled a few iterations without abstraction: a bug within a few iterations is REFUTED.
+// expect: count_up ensures VERIFIED
+// expect: double_count loop-invariant VERIFIED
+// expect: double_count loop-invariant VERIFIED
+// expect: double_count ensures VERIFIED
+// expect: double_count_no_inv ensures UNKNOWN
+// expect: double_count_wrong loop-invariant VERIFIED
+// expect: double_count_wrong loop-invariant VERIFIED
+// expect: double_count_wrong ensures REFUTED
+// expect: bad_invariant loop-invariant REFUTED
+// expect: bad_invariant loop-invariant UNKNOWN
+// expect: not_inductive loop-invariant VERIFIED
+// expect: not_inductive loop-invariant UNKNOWN
+// expect: max_of bounds VERIFIED
+// expect: max_of loop-invariant VERIFIED
+// expect: max_of loop-invariant VERIFIED
+// expect: max_of loop-invariant VERIFIED
+// expect: max_of bounds VERIFIED
+// expect: max_of bounds VERIFIED
+// expect: max_of loop-invariant VERIFIED
+// expect: max_of loop-invariant VERIFIED
+// expect: max_of loop-invariant VERIFIED
+// expect: max_of ensures VERIFIED
+// expect: max_of ensures VERIFIED
+// expect: max_of_no_inv bounds VERIFIED
+// expect: max_of_no_inv bounds VERIFIED
+// expect: max_of_no_inv bounds VERIFIED
+// expect: max_of_no_inv ensures UNKNOWN
+// expect: max_wrong bounds VERIFIED
+// expect: max_wrong ensures REFUTED
+// expect: sum_off_by_one bounds REFUTED
+// expect: sum_off_by_one ensures VERIFIED
+// expect: step_two ensures VERIFIED
+// expect: sum_for ensures UNKNOWN
+// expect: first_negative bounds VERIFIED
+// expect: first_negative ensures VERIFIED
+// expect: main call-precondition VERIFIED
+// warn: sum_off_by_one W0460
+
+import { range } from "std:seq";
+
+// The inferred counter bound is enough: i ends at n.
+@Requires(n >= 0)
+@Ensures(result == n)
+function count_up(n: int): int {
+  let i = 0;
+  while (i < n) {
+    i += 1;
+  }
+  return i;
+}
+
+// The same with a user invariant.
+@Requires(n >= 0)
+@Ensures(result == 2 * n)
+function double_count(n: int): int {
+  let i = 0;
+  let s = 0;
+  @Invariant(i <= n && s == 2 * i)
+  while (i < n) {
+    i += 1;
+    s += 2;
+  }
+  return s;
+}
+
+// Without the invariant the loop's result is unknown: UNKNOWN, not a wrong REFUTED.
+@Requires(n >= 0)
+@Ensures(result == 2 * n)
+function double_count_no_inv(n: int): int {
+  let i = 0;
+  let s = 0;
+  while (i < n) {
+    i += 1;
+    s += 2;
+  }
+  return s;
+}
+
+// A wrong claim after a loop with a correct invariant: within a few iterations the loop already shows it.
+@Requires(n >= 1)
+@Ensures(result == 3 * n)
+function double_count_wrong(n: int): int {
+  let i = 0;
+  let s = 0;
+  @Invariant(i <= n && s == 2 * i)
+  while (i < n) {
+    i += 1;
+    s += 2;
+  }
+  return s;
+}
+
+// An invariant that is false on entry is REFUTED.
+function bad_invariant(n: int): int {
+  let i = 0;
+  @Invariant(i == 5)
+  while (i < n) {
+    i += 1;
+  }
+  return i;
+}
+
+// An invariant that is not preserved: UNKNOWN (a counterexample to induction need not be reachable).
+@Requires(n >= 0)
+function not_inductive(n: int): int {
+  let i = 0;
+  @Invariant(i <= 3)
+  while (i < n) {
+    i += 1;
+  }
+  return i;
+}
+
+// The maximum of an array, with quantified invariants over the prefix seen so far.
+@Requires(xs.length > 0)
+@Ensures(xs.every(x => x <= result))
+@Ensures(xs.some(x => x == result))
+function max_of(xs: int[]): int {
+  let m = xs[0];
+  let i: usize = 1;
+  @Invariant(i >= 1 && i <= xs.length)
+  @Invariant(range(0, i).every(j => xs[j] <= m))
+  @Invariant(range(0, i).some(j => xs[j] == m))
+  while (i < xs.length) {
+    if (xs[i] > m) {
+      m = xs[i];
+    }
+    i += 1;
+  }
+  return m;
+}
+
+// Without invariants the maximum cannot be proved.
+@Requires(xs.length > 0)
+@Ensures(xs.every(x => x <= result))
+function max_of_no_inv(xs: int[]): int {
+  let m = xs[0];
+  let i: usize = 1;
+  while (i < xs.length) {
+    if (xs[i] > m) {
+      m = xs[i];
+    }
+    i += 1;
+  }
+  return m;
+}
+
+// Wrong: the loop never updates the maximum, so it is not an upper bound of all elements.
+@Requires(xs.length > 0)
+@Ensures(xs.every(x => x <= result))
+function max_wrong(xs: int[]): int {
+  let m = xs[0];
+  let i: usize = 1;
+  while (i < xs.length) {
+    i += 1;
+  }
+  return m;
+}
+
+// An off-by-one in a loop: the index reaches xs.length. The unrolled loop reaches it within a few iterations.
+@Ensures(result >= 0 || result < 0)
+function sum_off_by_one(xs: int[]): int {
+  let s = 0;
+  let i: usize = 0;
+  while (i <= xs.length) {
+    s += xs[i];
+    i += 1;
+  }
+  return s;
+}
+
+// A loop with a step of two: no counter bound is inferred, the exit condition alone is used.
+@Requires(n >= 0)
+@Ensures(result >= n)
+function step_two(n: int): int {
+  let i = 0;
+  while (i < n) {
+    i += 2;
+  }
+  return i;
+}
+
+// `for .. of`: the element is some element of the array. The claim is true but needs an invariant: UNKNOWN. (A false
+// claim, `result >= 0`, would be REFUTED by the unrolled loop with xs = [-1].)
+@Ensures(xs.length == 0 ==> result == 0)
+function sum_for(xs: int[]): int {
+  let s = 0;
+  for (const x of xs) {
+    s += x;
+  }
+  return s;
+}
+
+// `break`: the loop's effect is not modelled.
+@Ensures(result >= 0)
+function first_negative(xs: int[]): int {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i] < 0) {
+      break;
+    }
+    i += 1;
+  }
+  return i.toInt();
+}
+
+function main(): void {
+  console.log(count_up(3).toString());
+}

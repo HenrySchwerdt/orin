@@ -17,15 +17,20 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - violation reports with values and blame; **done** (ADR-0031 A1-A2);
    - enforced record invariants and pure functions in contracts; **done** (A3-A5: purity is inferred, contract-internal
      calls are unchecked; docs/contracts.md);
-   - static per-method proofs of class invariants;
-   - business-logic patterns: quantifiers, `sum`, conservation laws, executable specs, state
-     machines, `std:decimal` and `@Property`.
+   - static verification of arrays, records, `Option` / `Result` / `Map`, exact integer widths, modular calls, per-method
+     proofs of class invariants, frames inferred from the mutation analysis, loop invariants (the existing `@Invariant`
+     syntax, inferred counter bounds, bounded unrolling); **done** (ADR-0031 B 6-9, ADR-0036);
+   - business-logic patterns: bounded quantifiers (`every` / `some` / `range`), `sum` / `sumBy` (`std:seq`) and conservation
+     laws; **done** (C 11-13, ADR-0036); executable specs, state machines, `std:decimal` and `@Property` remain.
 
-   ADR-0031 part A (items 1-5) is done; parts B-E remain.
+   ADR-0031 parts A (items 1-5), B (6-9) and C 11-13 are done; the rest of C, D and E remain. What the verifier still cannot do
+   is listed in docs/contracts.md ("Semantics (honest limits)") and ADR-0036; the biggest gaps are loop invariants that nobody
+   has written, `?`, and unit-aware type names.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
-   - `std:net`, `std:http`
+   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033) and the server loop on
+     top of it
    - `std:mcp`, JSX/`std:html`
 4. **Complete the Lean proofs:**
    - shape check in the verifier and the model (finding F-shape);
@@ -106,6 +111,17 @@ ships with tests and docs and passes the full CI, including the bootstrap.
 - Still open in this layer of ADR-0030: `std:fmt`, `Graph<T>` under the contract standard, the
   mutation kill-rate *gate* for the other std modules, and generic `Set<T>`/`SortedMap<K, V>`/comparator
   queues, which need language support (equality and ordering on type parameters, docs/std.md "Limitations").
+
+### 1d. `std:http`, the pure part (ADR-0030 §3 "protocols"): done
+- HTTP/1.1 (RFC 9110/9112) request parser, response parser and serializer over `std:bytes`: incremental
+  (`NeedMore | Done(message, used) | Failed(error with position and reason)`), smuggling-safe (CL+TE, duplicate
+  or non-numeric Content-Length, obs-fold, bare LF/CR, whitespace before the colon, chunk-size overflow are all
+  refused with a reason), limits as parameters, explicit state machine in the class invariants, round-trip contract
+  `parse(serialize(m)) == m`, header injection impossible by construction; tests, differential tests against an
+  executable specification, a fuzz harness and a 41-mutant check (docs/std.md "std:http").
+- Next, not started: the network part needs ADR-0033 (`std:net`: recv/send/timeouts, a monotonic clock, half-close,
+  a bulk raw-buffer-to-`Bytes` primitive; docs/std.md lists what the server needs), then a streaming body API for
+  large uploads, `Expect: 100-continue`, and a verified adapter for the parser (ADR-0021 Stage C).
 
 ### 2. Compiler rewrite with the full language (ADR-0015)
 - Refresh the seed, then rewrite module by module:

@@ -1,0 +1,2977 @@
+// std:http -- the pure part of HTTP/1.1 (RFC 9110, RFC 9112): message types, an incremental request and response
+// parser, and a serializer. Pure safe Orin over `std:bytes`: no sockets, no I/O, no grants, no C (ADR-0030 §3,
+// layer "protocols"). The network part (`std:net`, the server loop) comes later with ADR-0033.
+//
+// Why strict. Most HTTP request smuggling and response splitting attacks work because two parsers on one path
+// disagree about where a message ends or which header says what. This module therefore REJECTS every ambiguity
+// instead of guessing (RFC 9112 §6.3, §11.2 and §11.3):
+//
+//   * both `Content-Length` and `Transfer-Encoding`, a duplicate or non-numeric `Content-Length`, a duplicate
+//     `Transfer-Encoding`, any transfer coding other than `chunked`;
+//   * obs-fold (a header line that starts with SP or HTAB), whitespace between a field name and the colon, a bare
+//     LF or a bare CR where CRLF is required, any control character or NUL in a start line, field, chunk header
+//     or chunk extension, invalid token characters in a method or field name;
+//   * chunk sizes that are empty, not hexadecimal (`-1`, `0x10`, `+5`), or larger than the remaining body limit
+//     (so the size can never overflow); a chunk that is not followed by CRLF;
+//   * HTTP/1.1 requests without exactly one valid `Host` field, framing fields (Content-Length, Transfer-Encoding,
+//     Trailer, Host) in trailers.
+//
+// Limits are part of the parser (`Limits`, invariants below): request/status line length, header line length,
+// total header section size, header count, chunk header line length and body size. A message that exceeds a limit
+// is an error at the first byte over the limit, never a truncated parse.
+//
+// Incremental parsing. `RequestParser.feed(chunk)` takes bytes in arbitrary chunks (as `recv` delivers them) and
+// answers `NeedMore` (every byte of the chunk was consumed into the parser state), `Done(message, used)` (the
+// message is complete; `used` bytes of THIS chunk belonged to it, the rest `chunk[used..]` is the start of the next
+// pipelined message) or `Failed(HttpError)` (position = byte offset from the start of the message, reason, text).
+// A partial message is never returned as complete. The result for a message is independent of how the bytes are
+// split into chunks (tests: every split point, 1-byte chunks, random splits).
+//
+// The state machine (explicit: `S_*` constants, `edgeAllowed`, class invariants). A request starts in METHOD, a
+// response in VERSION:
+//
+//   request   METHOD -> TARGET -> VERSION -> START_LF
+//   response  VERSION -> CODE -> REASON -> START_LF
+//   START_LF -> HDR_LINE <-> (HDR_NAME -> HDR_OWS -> HDR_VALUE -> HDR_LF)     one cycle per header field
+//   HDR_LINE -> HEAD_END_LF          the empty line; then, decided by the framing rules (RFC 9112 §6.3):
+//        HEAD_END_LF -> DONE                          no body (or Content-Length 0, HEAD, 1xx, 204, 304)
+//        HEAD_END_LF -> BODY -> DONE                  Content-Length
+//        HEAD_END_LF -> BODY_CLOSE -> (atEof) DONE    responses only: the body ends when the connection closes
+//        HEAD_END_LF -> CHUNK_SIZE -> [CHUNK_BWS] -> [CHUNK_EXT] -> CHUNK_SIZE_LF        Transfer-Encoding: chunked
+//          CHUNK_SIZE_LF -> CHUNK_DATA -> CHUNK_CR -> CHUNK_LF -> CHUNK_SIZE              (size > 0)
+//          CHUNK_SIZE_LF -> HDR_LINE ... HEAD_END_LF -> DONE                               (size 0: the trailer section)
+//   any non-terminal state -> ERROR (sticky); DONE and ERROR are terminal until `reset()`.
+//
+// Algorithm. One forward pass, no backtracking, no regex, no look-ahead. Bytes are classified by a 256-entry table
+// (`HTTP_CLASS`: control, LF, CR, HTAB, SP, obs-text, other VCHAR, `:`, `;`, token symbol, letter, hex letter,
+// digit; ordered so that "is a token character" is `class >= 10` and "may occur in a field value" is `class >= 3`)
+// and `HTTP_HEXV` (hex digit value or 16). Orin has no constant arrays, so both are string constants read with
+// `charCodeAt` like the DFA tables of std:utf8. Runs of ordinary bytes (a method, a header name, a header value) are
+// scanned in a tight loop and handled once per run, not once per byte; the state changes once per token. The loops
+// index a window (a `u8[]` copy of up to 4096 bytes of the chunk) instead of calling `Bytes.at` per byte; a body is a
+// slice of the chunk and is never scanned. Measured throughput and the cost model: docs/std.md.
+//
+// Contract standard (ADR-0030 §3): classes carry `@Invariant`s that `orin test` checks after every public method;
+// `Headers`, `Status`, `Request`, `Response` validate in their constructors in EVERY build (a header with CR/LF
+// cannot be built: header injection is impossible by construction), the guards that run in every build are loops
+// (`allTokens`, `allFieldValues`: no closure call per element on the hot path) while contract clauses may state the
+// same facts with `every` / `some` / `filter` (ADR-0031 A: `Headers.has`, `countOf`, `getAll`), and
+// `serializeRequest` / `serializeResponse` ENSURE that the parser accepts the output and reproduces the message
+// (the round-trip contract).
+//
+// Not covered: HTTP/2 and HTTP/3, TLS, sockets, content codings (gzip), `Expect: 100-continue` handling,
+// connection management, URI parsing beyond the shape checks of `isValidTarget`, cookies and any header semantics
+// other than the framing and `Host` rules above.
+
+import { Bytes, ByteBuilder, bytesFromString, bytesFromArray, emptyBytes } from "std:bytes";
+
+// ------------------------------------------------------------------------------------ character classes
+
+// Class codes of `HTTP_CLASS` (see the algorithm note above). Generated from the RFC 9110 / 9112 character sets
+// by tools/gen_http_tables.py; tests/std/http_test.or recomputes every entry from the RFC definitions.
+const C_CTL: int = 0;
+const C_LF: int = 1;
+const C_CR: int = 2;
+const C_HTAB: int = 3;
+const C_SP: int = 4;
+const C_OBS: int = 5;
+const C_COLON: int = 7;
+const C_SEMI: int = 8;
+const C_TOKEN: int = 10;
+const C_HEXALPHA: int = 12;
+const C_DIGIT: int = 13;
+
+const HTTP_CLASS: string = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\x0a\x06\x0a\x0a\x0a\x0a\x0a\x06\x06\x0a\x0a\x06\x0a\x0a\x06\x0d\x0d\x0d\x0d\x0d\x0d\x0d\x0d\x0d\x0d\x07\x08\x06\x06\x06\x06\x06\x0c\x0c\x0c\x0c\x0c\x0c\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x06\x06\x06\x0a\x0a\x0a\x0c\x0c\x0c\x0c\x0c\x0c\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x0b\x06\x0a\x06\x0a\x00\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05\x05";
+const HTTP_HEXV: string = "\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x10\x10\x10\x10\x10\x10\x10\x0a\x0b\x0c\x0d\x0e\x0f\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x0a\x0b\x0c\x0d\x0e\x0f\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10\x10";
+
+
+// charClass(c): the class code of byte value c (0..255). O(1).
+@Requires(c >= 0 && c <= 255)
+@Ensures(result >= 0 && result <= 13)
+export function charClass(c: int): int {
+  return HTTP_CLASS.charCodeAt(c.toUsize());
+}
+
+// isTokenChar(c): c is a `tchar` (RFC 9110 §5.6.2): ALPHA, DIGIT or one of !#$%&'*+-.^_`|~. O(1).
+@Requires(c >= 0 && c <= 255)
+export function isTokenChar(c: int): bool {
+  return HTTP_CLASS.charCodeAt(c.toUsize()) >= C_TOKEN;
+}
+
+// isFieldByte(c): c may occur inside a field value or a reason phrase: HTAB, SP, VCHAR or obs-text. O(1).
+@Requires(c >= 0 && c <= 255)
+export function isFieldByte(c: int): bool {
+  return HTTP_CLASS.charCodeAt(c.toUsize()) >= C_HTAB;
+}
+
+// isOws(c): SP or HTAB. O(1).
+function isOws(c: int): bool {
+  return c == 32 || c == 9;
+}
+
+// lowerAscii(c): the lower-case form of an ASCII letter code, other codes unchanged. O(1).
+function lowerAscii(c: int): int {
+  if (c >= 65 && c <= 90) {
+    return c + 32;
+  }
+  return c;
+}
+
+// eqIgnoreCase(a, b): equal after ASCII lower-casing (header names, RFC 9110 §5.1). O(n).
+@Ensures(result ==> a.length == b.length)
+export function eqIgnoreCase(a: string, b: string): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (lowerAscii(a.charCodeAt(i)) != lowerAscii(b.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// toLowerAscii(s): s with ASCII letters lower-cased; other bytes (including obs-text) unchanged. O(n).
+@Ensures(result.length == s.length)
+export function toLowerAscii(s: string): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    parts.push(String.fromCharCode(lowerAscii(s.charCodeAt(i))));
+    i += 1;
+  }
+  return parts.join("");
+}
+
+// isToken(s): a non-empty run of token characters (a method or a field name). O(n).
+@Ensures(result ==> s.length > 0)
+export function isToken(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    if (HTTP_CLASS.charCodeAt(s.charCodeAt(i).toUsize()) < C_TOKEN) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// isFieldValue(s): a valid field value: only HTAB, SP, VCHAR and obs-text (so no CR, LF, NUL or other control
+// character), no leading or trailing SP/HTAB (the parser strips optional whitespace, so a stored value is
+// canonical). The empty string is valid. O(n).
+@Ensures(result ==> s.length == 0 || (!isOws(s.charCodeAt(0)) && !isOws(s.charCodeAt(s.length - 1))))
+export function isFieldValue(s: string): bool {
+  if (s.length == 0) {
+    return true;
+  }
+  if (isOws(s.charCodeAt(0)) || isOws(s.charCodeAt(s.length - 1))) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    if (HTTP_CLASS.charCodeAt(s.charCodeAt(i).toUsize()) < C_HTAB) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// isReasonPhrase(s): `*( HTAB / SP / VCHAR / obs-text )`; may be empty and may have leading or trailing blanks
+// (the status line keeps it byte for byte). O(n).
+export function isReasonPhrase(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    if (HTTP_CLASS.charCodeAt(s.charCodeAt(i).toUsize()) < C_HTAB) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Characters of a `Host` value / authority (RFC 3986 reg-name, IP-literal and port, without userinfo):
+// unreserved, `%`, sub-delims, `:`, `[`, `]`.
+function isHostChar(c: int): bool {
+  if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+    return true;
+  }
+  return c == 45 || c == 46 || c == 95 || c == 126 || c == 37 || c == 33 || c == 36 || c == 38 || c == 39
+    || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 58 || c == 91 || c == 93;
+}
+
+// isHostValue(s): a plausible `Host` field value or CONNECT authority: only host characters (no SP, `/`, `@`, `?`,
+// `#`). The empty string is allowed here (an empty authority is legal in `Host`). O(n).
+export function isHostValue(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    if (!isHostChar(s.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// parseContentLength(v): the value of a `Content-Length` field: 1 to 18 decimal digits (so it fits every integer
+// type; larger values are refused instead of overflowing). No sign, no blanks, no list. O(n).
+@Ensures(result.isSome() ==> v.length >= 1 && v.length <= 18)
+export function parseContentLength(v: string): Option<usize> {
+  if (v.length == 0 || v.length > 18) {
+    return None;
+  }
+  let n: usize = 0;
+  let i: usize = 0;
+  while (i < v.length) {
+    const c = v.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return None;
+    }
+    n = n * 10 + (c - 48).toUsize();
+    i += 1;
+  }
+  return Some(n);
+}
+
+// A request-target may contain only 0x21..0x7E (everything else must be percent-encoded) and no fragment `#`.
+function isTargetChars(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (HTTP_CLASS.charCodeAt(c.toUsize()) < 6 || c == 35) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// scheme "://" rest, scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )  (absolute-form, RFC 9112 §3.2.2).
+function isAbsoluteForm(s: string): bool {
+  if (s.length < 4) {
+    return false;
+  }
+  const c0 = lowerAscii(s.charCodeAt(0));
+  if (c0 < 97 || c0 > 122) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    const l = lowerAscii(c);
+    if (!((l >= 97 && l <= 122) || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46)) {
+      break;
+    }
+    i += 1;
+  }
+  return i + 3 < s.length && s.charCodeAt(i) == 58 && s.charCodeAt(i + 1) == 47 && s.charCodeAt(i + 2) == 47;
+}
+
+// ----------------------------------------------------------------------------------------- small types
+
+// The protocol versions this module speaks. Other versions (`HTTP/0.9`, `HTTP/2.0`) are rejected by the parsers.
+export type HttpVersion = Http10 | Http11;
+
+// versionText(v): "HTTP/1.0" or "HTTP/1.1". O(1).
+@Ensures(result.length == 8)
+export function versionText(v: HttpVersion): string {
+  return match (v) {
+    Http10 => "HTTP/1.0",
+    Http11 => "HTTP/1.1"
+  };
+}
+
+// versionMinor(v): 0 or 1. O(1).
+@Ensures(result == 0 || result == 1)
+export function versionMinor(v: HttpVersion): int {
+  return match (v) {
+    Http10 => 0,
+    Http11 => 1
+  };
+}
+
+// The request methods of RFC 9110 §9 plus RFC 5789 `PATCH`, and `Ext(token)` for any other token. The canonical
+// form (what the parser produces and the invariants of `Request` demand): a standard method is never an `Ext`.
+export type Method = Get | Head | Post | Put | Delete | Connect | Options | Trace | Patch | Ext(string);
+
+// methodName(m): the method token, e.g. "GET". O(1).
+@Ensures(result.length > 0 || !isValidMethod(m))
+export function methodName(m: Method): string {
+  return match (m) {
+    Get => "GET",
+    Head => "HEAD",
+    Post => "POST",
+    Put => "PUT",
+    Delete => "DELETE",
+    Connect => "CONNECT",
+    Options => "OPTIONS",
+    Trace => "TRACE",
+    Patch => "PATCH",
+    Ext(t) => t
+  };
+}
+
+// isStandardMethodName(t): t is the exact (case-sensitive) name of one of the nine standard methods. O(1).
+function isStandardMethodName(t: string): bool {
+  return t == "GET" || t == "HEAD" || t == "POST" || t == "PUT" || t == "DELETE" || t == "CONNECT" || t == "OPTIONS"
+    || t == "TRACE" || t == "PATCH";
+}
+
+// isValidMethod(m): canonical and well-formed: a standard method, or `Ext(t)` with a token `t` that is not a
+// standard method name. O(n).
+export function isValidMethod(m: Method): bool {
+  return match (m) {
+    Ext(t) => isToken(t) && !isStandardMethodName(t),
+    _ => true
+  };
+}
+
+// methodFromToken(t): the method with name t; None when t is not a token. Method names are case-sensitive:
+// "get" is `Ext("get")`. O(n).
+@Ensures(result.isSome() == isToken(t))
+@Ensures(result.isSome() ==> isValidMethod(result.unwrap()) && methodName(result.unwrap()) == t)
+export function methodFromToken(t: string): Option<Method> {
+  if (!isToken(t)) {
+    return None;
+  }
+  return match (t) {
+    "GET" => Some(Get),
+    "HEAD" => Some(Head),
+    "POST" => Some(Post),
+    "PUT" => Some(Put),
+    "DELETE" => Some(Delete),
+    "CONNECT" => Some(Connect),
+    "OPTIONS" => Some(Options),
+    "TRACE" => Some(Trace),
+    "PATCH" => Some(Patch),
+    _ => Some(Ext(t))
+  };
+}
+
+// isConnect(m) / isOptions(m): used by the request-target rules.
+function isConnect(m: Method): bool {
+  return match (m) {
+    Connect => true,
+    _ => false
+  };
+}
+
+function isOptions(m: Method): bool {
+  return match (m) {
+    Options => true,
+    _ => false
+  };
+}
+
+// methodEquals(a, b): the same method. O(n).
+export function methodEquals(a: Method, b: Method): bool {
+  return methodName(a) == methodName(b);
+}
+
+// isValidTarget(m, target): the request-target has a legal shape for the method (RFC 9112 §3.2): `CONNECT` takes an
+// authority (`host:port`); `OPTIONS` also takes `*`; every method takes origin-form (`/path?query`) or
+// absolute-form (`scheme://authority/path`). Only the characters 0x21..0x7E occur and there is no fragment. O(n).
+@Ensures(result ==> target.length > 0)
+export function isValidTarget(m: Method, target: string): bool {
+  if (isConnect(m)) {
+    return target.length > 0 && isHostValue(target);
+  }
+  if (!isTargetChars(target)) {
+    return false;
+  }
+  if (target == "*") {
+    return isOptions(m);
+  }
+  return target.charCodeAt(0) == 47 || isAbsoluteForm(target);
+}
+
+// ----------------------------------------------------------------------------------------------- errors
+
+// Why a message was refused. One variant per rule, so that callers (and tests) can tell the cases apart.
+export type HttpReason =
+  BadMethod | BadTarget | BadVersion | UnsupportedVersion | BadStatusCode | BadStatusLine
+  | BadHeaderName | MissingColon | SpaceBeforeColon | BadHeaderValue | ObsFold | BareLf | BareCr
+  | StartLineTooLong | HeaderLineTooLong | HeadersTooLarge | TooManyHeaders | BodyTooLarge | ChunkLineTooLong
+  | BadContentLength | DuplicateContentLength | ContentLengthWithTransferEncoding | DuplicateTransferEncoding
+  | UnsupportedTransferEncoding | ForbiddenFraming | MissingHost | DuplicateHost | BadHost
+  | BadChunkSize | BadChunkExtension | BadChunkTerminator | ForbiddenTrailer
+  | UnexpectedEof | ParserFinished;
+
+// reasonName(r): the variant name, stable (for logs and tests). O(1).
+@Ensures(result.length > 0)
+export function reasonName(r: HttpReason): string {
+  return match (r) {
+    BadMethod => "BadMethod",
+    BadTarget => "BadTarget",
+    BadVersion => "BadVersion",
+    UnsupportedVersion => "UnsupportedVersion",
+    BadStatusCode => "BadStatusCode",
+    BadStatusLine => "BadStatusLine",
+    BadHeaderName => "BadHeaderName",
+    MissingColon => "MissingColon",
+    SpaceBeforeColon => "SpaceBeforeColon",
+    BadHeaderValue => "BadHeaderValue",
+    ObsFold => "ObsFold",
+    BareLf => "BareLf",
+    BareCr => "BareCr",
+    StartLineTooLong => "StartLineTooLong",
+    HeaderLineTooLong => "HeaderLineTooLong",
+    HeadersTooLarge => "HeadersTooLarge",
+    TooManyHeaders => "TooManyHeaders",
+    BodyTooLarge => "BodyTooLarge",
+    ChunkLineTooLong => "ChunkLineTooLong",
+    BadContentLength => "BadContentLength",
+    DuplicateContentLength => "DuplicateContentLength",
+    ContentLengthWithTransferEncoding => "ContentLengthWithTransferEncoding",
+    DuplicateTransferEncoding => "DuplicateTransferEncoding",
+    UnsupportedTransferEncoding => "UnsupportedTransferEncoding",
+    ForbiddenFraming => "ForbiddenFraming",
+    MissingHost => "MissingHost",
+    DuplicateHost => "DuplicateHost",
+    BadHost => "BadHost",
+    BadChunkSize => "BadChunkSize",
+    BadChunkExtension => "BadChunkExtension",
+    BadChunkTerminator => "BadChunkTerminator",
+    ForbiddenTrailer => "ForbiddenTrailer",
+    UnexpectedEof => "UnexpectedEof",
+    ParserFinished => "ParserFinished"
+  };
+}
+
+// reasonText(r): a sentence naming the violated rule. O(1).
+@Ensures(result.length > 0)
+export function reasonText(r: HttpReason): string {
+  return match (r) {
+    BadMethod => "invalid character in the method (not a token)",
+    BadTarget => "invalid request-target",
+    BadVersion => "malformed HTTP version",
+    UnsupportedVersion => "unsupported HTTP version (only HTTP/1.0 and HTTP/1.1)",
+    BadStatusCode => "the status code must be three digits in 100..599",
+    BadStatusLine => "malformed status line",
+    BadHeaderName => "invalid character in a field name (not a token)",
+    MissingColon => "a header line without a colon",
+    SpaceBeforeColon => "whitespace between the field name and the colon",
+    BadHeaderValue => "control character in a field value",
+    ObsFold => "obsolete line folding (a header line that starts with SP or HTAB)",
+    BareLf => "bare LF: a line must end with CRLF",
+    BareCr => "bare CR: a CR must be followed by LF",
+    StartLineTooLong => "the start line exceeds the limit",
+    HeaderLineTooLong => "a header line exceeds the limit",
+    HeadersTooLarge => "the header section exceeds the limit",
+    TooManyHeaders => "too many header fields",
+    BodyTooLarge => "the body exceeds the limit",
+    ChunkLineTooLong => "a chunk header line exceeds the limit",
+    BadContentLength => "invalid Content-Length (1 to 18 digits expected)",
+    DuplicateContentLength => "duplicate Content-Length",
+    ContentLengthWithTransferEncoding => "both Content-Length and Transfer-Encoding (request smuggling)",
+    DuplicateTransferEncoding => "duplicate Transfer-Encoding",
+    UnsupportedTransferEncoding => "unsupported Transfer-Encoding (only `chunked` on HTTP/1.1)",
+    ForbiddenFraming => "Content-Length or Transfer-Encoding is not allowed in this message",
+    MissingHost => "an HTTP/1.1 request needs a Host field",
+    DuplicateHost => "duplicate Host field",
+    BadHost => "invalid Host field value",
+    BadChunkSize => "invalid chunk size (hexadecimal digits expected)",
+    BadChunkExtension => "control character in a chunk extension",
+    BadChunkTerminator => "chunk data is not followed by CRLF",
+    ForbiddenTrailer => "a framing field is not allowed in the trailer section",
+    UnexpectedEof => "the input ended before the message was complete",
+    ParserFinished => "the parser already finished its message (call reset())"
+  };
+}
+
+// The error of a parser: `position` is the 0-based byte offset (from the first byte of the message) of the byte
+// that violates the rule (for limits: the first byte over the limit; for end-of-headers rules such as
+// Content-Length + Transfer-Encoding: the CR of the empty line; for a duplicate field: the first byte of the
+// offending line; for `UnexpectedEof`: the number of bytes received).
+export type HttpError = { position: usize; reason: HttpReason; message: string; };
+
+// httpError(position, reason): the error with its message "<reason text> at byte <position>". O(1).
+@Ensures(result.position == position && result.message.length > 0)
+export function httpError(position: usize, reason: HttpReason): HttpError {
+  return HttpError { position: position, reason: reason, message: `${reasonText(reason)} at byte ${position.toString()}` };
+}
+
+// The answer of a parser: the message is incomplete, complete, or refused. `Done(message, used)`: `used` is the
+// number of bytes of the chunk just fed that belong to the message.
+export type ParseResult<T> = NeedMore | Done(T, usize) | Failed(HttpError);
+
+
+// ---------------------------------------------------------------------------------------------- Headers
+
+// Why `Headers.add` refused a field.
+export type HeaderError = InvalidHeaderName | InvalidHeaderValue;
+
+// headerErrorMessage(e): a sentence. O(1).
+@Ensures(result.length > 0)
+export function headerErrorMessage(e: HeaderError): string {
+  return match (e) {
+    InvalidHeaderName => "invalid field name: a non-empty token is required",
+    InvalidHeaderValue => "invalid field value: no control characters (CR, LF, NUL, ...) and no leading or trailing blanks"
+  };
+}
+
+// Traps in every build (also without contract checking) when `ok` is false. The guard of the constructors that
+// make invalid values impossible: a failed `@Requires` is also a trap in a checked build, this keeps it so in
+// the unchecked one.
+function enforce(ok: bool, what: string): void {
+  if (!ok) {
+    const r: Result<int, string> = Err(what);
+    r.unwrap();
+  }
+}
+
+// allTokens(xs): every element is a token. Loop-based so that contracts can use it.
+export function allTokens(xs: string[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (!isToken(xs[i])) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// allFieldValues(xs): every element is a valid field value.
+export function allFieldValues(xs: string[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (!isFieldValue(xs[i])) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// An ordered list of header fields (also used for trailers). Names are case-insensitive for every lookup and are
+// stored as given (so a message serializes the way it was written); the same name may occur several times and the
+// order of all fields is kept. Invariants: as many values as names, every name is a token, every value is a
+// valid field value (no CR, LF, NUL or other control character, no leading or trailing blanks). They are checked
+// by the constructor in every build and cannot be broken afterwards: `add` and `set` validate before they change
+// anything, so a header value can never smuggle a line break into a serialized message.
+@Invariant(this.names.length == this.values.length)
+@Invariant(allTokens(this.names))
+@Invariant(allFieldValues(this.values))
+export class Headers {
+  private names: string[];
+  private values: string[];
+
+  // new Headers(names, values): the fields (names[i], values[i]) in order. Traps (in every build) when the lists
+  // differ in length or an element is not a token / valid value; `headersFromLists` answers a Result instead.
+  @Requires(names.length == values.length && allTokens(names) && allFieldValues(values))
+  constructor(names: string[], values: string[]) {
+    this.names = names;
+    this.values = values;
+    enforce(names.length == values.length && allTokens(names) && allFieldValues(values), "invalid Headers");
+  }
+
+  // count(): number of fields. O(1).
+  @Ensures(result == this.names.length)
+  count(): usize {
+    return this.names.length;
+  }
+
+  // nameAt(i): the name of the i-th field, as written. O(1).
+  @Requires(i < this.names.length)
+  @Ensures(isToken(result))
+  nameAt(i: usize): string {
+    return this.names[i];
+  }
+
+  // valueAt(i): the value of the i-th field. O(1).
+  @Requires(i < this.names.length)
+  @Ensures(isFieldValue(result))
+  valueAt(i: usize): string {
+    return this.values[i];
+  }
+
+  // countOf(name): number of fields called `name` (case-insensitive). O(count).
+  @Ensures(result <= this.names.length)
+  @Ensures(result == this.names.filter(n => eqIgnoreCase(n, name)).length)
+  countOf(name: string): usize {
+    let n: usize = 0;
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (eqIgnoreCase(this.names[i], name)) {
+        n += 1;
+      }
+      i += 1;
+    }
+    return n;
+  }
+
+  // has(name): some field is called `name` (case-insensitive). O(count).
+  @Ensures(result == (this.countOf(name) > 0))
+  @Ensures(result == this.names.some(n => eqIgnoreCase(n, name)))
+  has(name: string): bool {
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (eqIgnoreCase(this.names[i], name)) {
+        return true;
+      }
+      i += 1;
+    }
+    return false;
+  }
+
+  // get(name): the value of the first field called `name`, or None. O(count).
+  @Ensures(result.isSome() == this.has(name))
+  @Ensures(result.isSome() ==> isFieldValue(result.unwrap()))
+  get(name: string): Option<string> {
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (eqIgnoreCase(this.names[i], name)) {
+        return Some(this.values[i]);
+      }
+      i += 1;
+    }
+    return None;
+  }
+
+  // getAll(name): the values of all fields called `name`, in order. O(count).
+  @Ensures(result.length == this.countOf(name))
+  @Ensures(result.every(v => isFieldValue(v)))
+  getAll(name: string): string[] {
+    let out: string[] = [];
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (eqIgnoreCase(this.names[i], name)) {
+        out.push(this.values[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+
+  // add(name, value): appends a field. Err (and no change) when `name` is not a token or `value` is not a valid
+  // field value. O(name + value).
+  @Ensures(result.isOk() == (isToken(name) && isFieldValue(value)))
+  @Ensures(result.isOk() ==> this.count() == old(this.count()) + 1)
+  @Ensures(result.isOk() ==> this.nameAt(this.count() - 1) == name && this.valueAt(this.count() - 1) == value)
+  @Ensures(result.isErr() ==> this.count() == old(this.count()))
+  add(name: string, value: string): Result<void, HeaderError> {
+    if (!isToken(name)) {
+      return Err(InvalidHeaderName);
+    }
+    if (!isFieldValue(value)) {
+      return Err(InvalidHeaderValue);
+    }
+    this.names.push(name);
+    this.values.push(value);
+    return Ok();
+  }
+
+  // remove(name): deletes every field called `name`; the number removed. O(count).
+  @Ensures(this.countOf(name) == 0)
+  @Ensures(this.count() + result == old(this.count()))
+  @Ensures(result == old(this.countOf(name)))
+  remove(name: string): usize {
+    let ns: string[] = [];
+    let vs: string[] = [];
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (!eqIgnoreCase(this.names[i], name)) {
+        ns.push(this.names[i]);
+        vs.push(this.values[i]);
+      }
+      i += 1;
+    }
+    const removed = this.names.length - ns.length;
+    this.names = ns;
+    this.values = vs;
+    return removed;
+  }
+
+  // set(name, value): replaces every field called `name` by one field (appended at the end). Err (and no change)
+  // when the name or value is invalid. O(count).
+  @Ensures(result.isOk() == (isToken(name) && isFieldValue(value)))
+  @Ensures(result.isOk() ==> this.countOf(name) == 1 && this.get(name).unwrap() == value)
+  @Ensures(result.isErr() ==> this.count() == old(this.count()))
+  set(name: string, value: string): Result<void, HeaderError> {
+    if (!isToken(name)) {
+      return Err(InvalidHeaderName);
+    }
+    if (!isFieldValue(value)) {
+      return Err(InvalidHeaderValue);
+    }
+    this.remove(name);
+    this.names.push(name);
+    this.values.push(value);
+    return Ok();
+  }
+
+  // equals(other): the same fields in the same order, names compared as written (byte for byte). O(size).
+  @Ensures(result ==> this.count() == other.count())
+  equals(other: Headers): bool {
+    if (this.names.length != other.count()) {
+      return false;
+    }
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (this.names[i] != other.nameAt(i) || this.values[i] != other.valueAt(i)) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+}
+
+// emptyHeaders(): no fields. O(1).
+@Ensures(result.count() == 0)
+export function emptyHeaders(): Headers {
+  return new Headers([], []);
+}
+
+// headersFromLists(names, values): the fields as a Result instead of a trap. O(size).
+@Ensures(result.isOk() == (names.length == values.length && allTokens(names) && allFieldValues(values)))
+export function headersFromLists(names: string[], values: string[]): Result<Headers, HeaderError> {
+  if (names.length != values.length) {
+    return Err(InvalidHeaderValue);
+  }
+  if (!allTokens(names)) {
+    return Err(InvalidHeaderName);
+  }
+  if (!allFieldValues(values)) {
+    return Err(InvalidHeaderValue);
+  }
+  return Ok(new Headers(names, values));
+}
+
+// ----------------------------------------------------------------------------------------------- Status
+
+// standardReason(code): the registered reason phrase of a status code (RFC 9110 §15), "" when unregistered. O(1).
+export function standardReason(code: int): string {
+  return match (code) {
+    100 => "Continue",
+    101 => "Switching Protocols",
+    102 => "Processing",
+    103 => "Early Hints",
+    200 => "OK",
+    201 => "Created",
+    202 => "Accepted",
+    203 => "Non-Authoritative Information",
+    204 => "No Content",
+    205 => "Reset Content",
+    206 => "Partial Content",
+    207 => "Multi-Status",
+    300 => "Multiple Choices",
+    301 => "Moved Permanently",
+    302 => "Found",
+    303 => "See Other",
+    304 => "Not Modified",
+    305 => "Use Proxy",
+    307 => "Temporary Redirect",
+    308 => "Permanent Redirect",
+    400 => "Bad Request",
+    401 => "Unauthorized",
+    402 => "Payment Required",
+    403 => "Forbidden",
+    404 => "Not Found",
+    405 => "Method Not Allowed",
+    406 => "Not Acceptable",
+    407 => "Proxy Authentication Required",
+    408 => "Request Timeout",
+    409 => "Conflict",
+    410 => "Gone",
+    411 => "Length Required",
+    412 => "Precondition Failed",
+    413 => "Content Too Large",
+    414 => "URI Too Long",
+    415 => "Unsupported Media Type",
+    416 => "Range Not Satisfiable",
+    417 => "Expectation Failed",
+    418 => "I'm a teapot",
+    421 => "Misdirected Request",
+    422 => "Unprocessable Content",
+    426 => "Upgrade Required",
+    428 => "Precondition Required",
+    429 => "Too Many Requests",
+    431 => "Request Header Fields Too Large",
+    451 => "Unavailable For Legal Reasons",
+    500 => "Internal Server Error",
+    501 => "Not Implemented",
+    502 => "Bad Gateway",
+    503 => "Service Unavailable",
+    504 => "Gateway Timeout",
+    505 => "HTTP Version Not Supported",
+    _ => ""
+  };
+}
+
+// statusHasNoBody(code): a response with this status never has a message body: 1xx, 204 and 304 (RFC 9112 §6.3). O(1).
+@Ensures(result == (code < 200 || code == 204 || code == 304))
+export function statusHasNoBody(code: int): bool {
+  return code < 200 || code == 204 || code == 304;
+}
+
+// A response status: the code (100..599, the invariant) and the reason phrase, which is kept byte for byte.
+@Invariant(this.statusCode >= 100 && this.statusCode <= 599)
+@Invariant(isReasonPhrase(this.phrase))
+export class Status {
+  private statusCode: int;
+  private phrase: string;
+
+  // new Status(code, reason): traps (in every build) unless 100 <= code <= 599 and `reason` has only HTAB, SP,
+  // VCHAR and obs-text. `standardStatus(code)` picks the registered phrase.
+  @Requires(code >= 100 && code <= 599 && isReasonPhrase(reason))
+  constructor(code: int, reason: string) {
+    this.statusCode = code;
+    this.phrase = reason;
+    enforce(code >= 100 && code <= 599 && isReasonPhrase(reason), "invalid Status");
+  }
+
+  // code(): 100..599. O(1).
+  @Ensures(result >= 100 && result <= 599)
+  code(): int {
+    return this.statusCode;
+  }
+
+  // reason(): the reason phrase (may be empty). O(1).
+  @Ensures(isReasonPhrase(result))
+  reason(): string {
+    return this.phrase;
+  }
+
+  // hasNoBody(): see `statusHasNoBody`. O(1).
+  @Ensures(result == statusHasNoBody(this.statusCode))
+  hasNoBody(): bool {
+    return statusHasNoBody(this.statusCode);
+  }
+
+  // equals(other): same code and same phrase. O(n).
+  @Ensures(result ==> this.statusCode == other.code())
+  equals(other: Status): bool {
+    return this.statusCode == other.code() && this.phrase == other.reason();
+  }
+}
+
+// standardStatus(code): the status with the registered phrase of `code` ("Unknown Status" for an unregistered code).
+@Requires(code >= 100 && code <= 599)
+@Ensures(result.code() == code)
+export function standardStatus(code: int): Status {
+  const r = standardReason(code);
+  return new Status(code, r == "" ? "Unknown Status" : r);
+}
+
+// makeStatus(code, reason): the status as a Result instead of a trap. O(n).
+@Ensures(result.isOk() == (code >= 100 && code <= 599 && isReasonPhrase(reason)))
+export function makeStatus(code: int, reason: string): Result<Status, string> {
+  if (code < 100 || code > 599) {
+    return Err("status code out of range 100..599");
+  }
+  if (!isReasonPhrase(reason)) {
+    return Err("invalid reason phrase");
+  }
+  return Ok(new Status(code, reason));
+}
+
+// ------------------------------------------------------------------------------- message validity rules
+
+function isHttp11(v: HttpVersion): bool {
+  return match (v) {
+    Http11 => true,
+    Http10 => false
+  };
+}
+
+// Trailer fields must not be framing or routing fields (RFC 9110 §6.5.1).
+function isForbiddenTrailerName(n: string): bool {
+  return eqIgnoreCase(n, "content-length") || eqIgnoreCase(n, "transfer-encoding") || eqIgnoreCase(n, "trailer")
+    || eqIgnoreCase(n, "host");
+}
+
+function hasForbiddenTrailer(t: Headers): bool {
+  let i: usize = 0;
+  while (i < t.count()) {
+    if (isForbiddenTrailerName(t.nameAt(i))) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+// framingProblem(...): "" when the header fields frame the body unambiguously and consistently with `body` and
+// `trailers`, else the first violated rule. `bodyless`: the message never has a body (response to HEAD, 1xx, 204,
+// 304); `closeOk`: a body without Content-Length / Transfer-Encoding is allowed (a response: it ends at connection
+// close); `noFraming`: neither field may occur (1xx and 204 responses). The rules are exactly those of the parser.
+function framingProblem(h: Headers, trailers: Headers, body: Bytes, version: HttpVersion, bodyless: bool, closeOk: bool,
+    noFraming: bool): string {
+  const cl = h.countOf("content-length");
+  const te = h.countOf("transfer-encoding");
+  if (noFraming && (cl > 0 || te > 0)) {
+    return "Content-Length or Transfer-Encoding is not allowed in this message";
+  }
+  if (cl > 1) {
+    return "duplicate Content-Length";
+  }
+  if (te > 1) {
+    return "duplicate Transfer-Encoding";
+  }
+  if (cl == 1 && te == 1) {
+    return "both Content-Length and Transfer-Encoding";
+  }
+  let chunked = false;
+  if (te == 1) {
+    if (!eqIgnoreCase(h.get("transfer-encoding").unwrap(), "chunked")) {
+      return "unsupported Transfer-Encoding";
+    }
+    if (!isHttp11(version)) {
+      return "Transfer-Encoding needs HTTP/1.1";
+    }
+    chunked = true;
+  }
+  let declared: usize = 0;
+  if (cl == 1) {
+    const p = parseContentLength(h.get("content-length").unwrap());
+    if (p.isNone()) {
+      return "invalid Content-Length";
+    }
+    declared = p.unwrap();
+  }
+  if (bodyless) {
+    if (body.length() != 0) {
+      return "a bodyless message has a body";
+    }
+    if (trailers.count() != 0) {
+      return "a bodyless message has trailers";
+    }
+    return "";
+  }
+  if (trailers.count() > 0 && !chunked) {
+    return "trailers without chunked Transfer-Encoding";
+  }
+  if (hasForbiddenTrailer(trailers)) {
+    return "framing field in the trailers";
+  }
+  if (chunked) {
+    return "";
+  }
+  if (cl == 1) {
+    if (declared != body.length()) {
+      return "Content-Length does not match the body";
+    }
+    return "";
+  }
+  if (!closeOk && body.length() != 0) {
+    return "a body needs Content-Length or Transfer-Encoding";
+  }
+  return "";
+}
+
+// requestProblem(...): "" when the parts form a well-formed request, else the first violated rule. The class
+// invariant of `Request`, the check of its constructor and the rules of the parser. O(size).
+export function requestProblem(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes,
+    trailers: Headers): string {
+  if (!isValidMethod(method)) {
+    return "invalid method";
+  }
+  if (!isValidTarget(method, target)) {
+    return "invalid request-target";
+  }
+  const hosts = headers.countOf("host");
+  if (hosts > 1) {
+    return "duplicate Host";
+  }
+  if (hosts == 0 && isHttp11(version)) {
+    return "an HTTP/1.1 request needs a Host field";
+  }
+  if (hosts == 1 && !isHostValue(headers.get("host").unwrap())) {
+    return "invalid Host";
+  }
+  return framingProblem(headers, trailers, body, version, false, false, false);
+}
+
+// responseProblem(...): "" when the parts form a well-formed response. `forHead`: the response to a HEAD request
+// (its headers describe a body that is not sent). O(size).
+export function responseProblem(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers,
+    forHead: bool): string {
+  const code = status.code();
+  return framingProblem(headers, trailers, body, version, forHead || statusHasNoBody(code), true, code < 200 || code == 204);
+}
+
+// ---------------------------------------------------------------------------------- Request and Response
+
+// A parsed or to-be-serialized HTTP request: method, request-target, version, header fields, body, trailers.
+// Invariant: `requestProblem(...) == ""` (valid method and target, one Host on HTTP/1.1, unambiguous framing that
+// matches the body). The constructor enforces it in every build; there is no mutating method. A chunked request
+// stores the decoded body and its trailer fields (chunk boundaries and extensions are not kept); a request with
+// `Transfer-Encoding: chunked` has `isChunked()`.
+@Invariant(requestProblem(this.reqMethod, this.reqTarget, this.reqVersion, this.reqHeaders, this.reqBody, this.reqTrailers) == "")
+export class Request {
+  private reqMethod: Method;
+  private reqTarget: string;
+  private reqVersion: HttpVersion;
+  private reqHeaders: Headers;
+  private reqBody: Bytes;
+  private reqTrailers: Headers;
+
+  // new Request(method, target, version, headers, body, trailers): traps (in every build) unless
+  // `requestProblem(...) == ""`; `makeRequest` answers a Result instead.
+  @Requires(requestProblem(method, target, version, headers, body, trailers) == "")
+  constructor(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers) {
+    this.reqMethod = method;
+    this.reqTarget = target;
+    this.reqVersion = version;
+    this.reqHeaders = headers;
+    this.reqBody = body;
+    this.reqTrailers = trailers;
+    enforce(requestProblem(method, target, version, headers, body, trailers) == "", "invalid Request");
+  }
+
+  // method(): the request method. O(1).
+  @Ensures(isValidMethod(result))
+  method(): Method {
+    return this.reqMethod;
+  }
+
+  // target(): the request-target as sent. O(1).
+  @Ensures(isValidTarget(this.reqMethod, result))
+  target(): string {
+    return this.reqTarget;
+  }
+
+  // version(): HTTP/1.0 or HTTP/1.1. O(1).
+  version(): HttpVersion {
+    return this.reqVersion;
+  }
+
+  // headers(): the header fields in order. O(1).
+  headers(): Headers {
+    return this.reqHeaders;
+  }
+
+  // body(): the (decoded) message body. O(1).
+  body(): Bytes {
+    return this.reqBody;
+  }
+
+  // trailers(): the trailer fields of a chunked body (empty otherwise). O(1).
+  @Ensures(result.count() > 0 ==> this.isChunked())
+  trailers(): Headers {
+    return this.reqTrailers;
+  }
+
+  // isChunked(): the body is sent with `Transfer-Encoding: chunked`. O(count).
+  @Ensures(result == (this.reqHeaders.countOf("transfer-encoding") == 1))
+  isChunked(): bool {
+    return this.reqHeaders.countOf("transfer-encoding") == 1;
+  }
+
+  // equals(other): the same method, target, version, headers, body and trailers. O(size).
+  equals(other: Request): bool {
+    return methodEquals(this.reqMethod, other.method()) && this.reqTarget == other.target()
+      && versionMinor(this.reqVersion) == versionMinor(other.version()) && this.reqHeaders.equals(other.headers())
+      && this.reqBody.equals(other.body()) && this.reqTrailers.equals(other.trailers());
+  }
+}
+
+// makeRequest(...): the request, or the first violated rule (`requestProblem`), instead of a trap. O(size).
+@Ensures(result.isOk() == (requestProblem(method, target, version, headers, body, trailers) == ""))
+export function makeRequest(method: Method, target: string, version: HttpVersion, headers: Headers, body: Bytes,
+    trailers: Headers): Result<Request, string> {
+  const p = requestProblem(method, target, version, headers, body, trailers);
+  if (p != "") {
+    return Err(p);
+  }
+  return Ok(new Request(method, target, version, headers, body, trailers));
+}
+
+// A parsed or to-be-serialized HTTP response. Invariant: `responseProblem(...) == ""`. `forHead`: the response to
+// a HEAD request, whose headers (Content-Length, Transfer-Encoding) describe a body that is not sent; 1xx, 204
+// and 304 responses are bodyless in any case (`isBodyless()`).
+@Invariant(responseProblem(this.resStatus, this.resVersion, this.resHeaders, this.resBody, this.resTrailers, this.resForHead) == "")
+export class Response {
+  private resStatus: Status;
+  private resVersion: HttpVersion;
+  private resHeaders: Headers;
+  private resBody: Bytes;
+  private resTrailers: Headers;
+  private resForHead: bool;
+
+  // new Response(status, version, headers, body, trailers, forHead): traps (in every build) unless
+  // `responseProblem(...) == ""`; `makeResponse` answers a Result instead.
+  @Requires(responseProblem(status, version, headers, body, trailers, forHead) == "")
+  constructor(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers, forHead: bool) {
+    this.resStatus = status;
+    this.resVersion = version;
+    this.resHeaders = headers;
+    this.resBody = body;
+    this.resTrailers = trailers;
+    this.resForHead = forHead;
+    enforce(responseProblem(status, version, headers, body, trailers, forHead) == "", "invalid Response");
+  }
+
+  // status(): code and reason phrase. O(1).
+  status(): Status {
+    return this.resStatus;
+  }
+
+  // version(): HTTP/1.0 or HTTP/1.1. O(1).
+  version(): HttpVersion {
+    return this.resVersion;
+  }
+
+  // headers(): the header fields in order. O(1).
+  headers(): Headers {
+    return this.resHeaders;
+  }
+
+  // body(): the (decoded) message body. O(1).
+  body(): Bytes {
+    return this.resBody;
+  }
+
+  // trailers(): the trailer fields of a chunked body (empty otherwise). O(1).
+  @Ensures(result.count() > 0 ==> this.isChunked())
+  trailers(): Headers {
+    return this.resTrailers;
+  }
+
+  // isBodyless(): no body is sent: response to HEAD, or status 1xx, 204, 304. O(1).
+  @Ensures(result == (this.resForHead || this.resStatus.hasNoBody()))
+  @Ensures(result ==> this.resBody.length() == 0)
+  isBodyless(): bool {
+    return this.resForHead || this.resStatus.hasNoBody();
+  }
+
+  // isForHead(): the response to a HEAD request. O(1).
+  @Ensures(result == this.resForHead)
+  isForHead(): bool {
+    return this.resForHead;
+  }
+
+  // isChunked(): the body is sent with `Transfer-Encoding: chunked` (never true for a bodyless message when
+  // serialized: no chunks are written). O(count).
+  @Ensures(result == (this.resHeaders.countOf("transfer-encoding") == 1))
+  isChunked(): bool {
+    return this.resHeaders.countOf("transfer-encoding") == 1;
+  }
+
+  // equals(other): the same status, version, headers, body, trailers and HEAD flag. O(size).
+  equals(other: Response): bool {
+    return this.resStatus.equals(other.status()) && versionMinor(this.resVersion) == versionMinor(other.version())
+      && this.resHeaders.equals(other.headers()) && this.resBody.equals(other.body())
+      && this.resTrailers.equals(other.trailers()) && this.resForHead == other.isForHead();
+  }
+}
+
+// makeResponse(...): the response, or the first violated rule (`responseProblem`), instead of a trap. O(size).
+@Ensures(result.isOk() == (responseProblem(status, version, headers, body, trailers, forHead) == ""))
+export function makeResponse(status: Status, version: HttpVersion, headers: Headers, body: Bytes, trailers: Headers,
+    forHead: bool): Result<Response, string> {
+  const p = responseProblem(status, version, headers, body, trailers, forHead);
+  if (p != "") {
+    return Err(p);
+  }
+  return Ok(new Response(status, version, headers, body, trailers, forHead));
+}
+
+
+// -------------------------------------------------------------------------------------------------- Limits
+
+// The resource limits of a parser. Every message that exceeds one is refused at the first byte over the limit
+// (a request line, a header line, the header section, the header count, a chunk header line, the body). They are
+// the `@Requires` of the constructor and the invariants of the class, so a parser can never be built with a
+// limit that is zero, negative or large enough to overflow the chunk-size arithmetic.
+//   maxStartLine    bytes of the request line / status line without CRLF   (default 8192, RFC 9112 §3: at least 8000)
+//   maxHeaderCount  header fields (and, separately, trailer fields)         (default 100)
+//   maxHeaderLine   bytes of one header line without CRLF                   (default 8192)
+//   maxHeaderBytes  the whole header section (start line .. empty line), and separately the trailer section
+//                                                                           (default 65536)
+//   maxChunkLine    bytes of a chunk-size line (size and extension)         (default 1024)
+//   maxBody         bytes of the (decoded) body                             (default 1048576 = 1 MiB)
+@Invariant(this.startLine >= 16 && this.startLine <= 1048576)
+@Invariant(this.headerCount >= 1 && this.headerCount <= 65536)
+@Invariant(this.headerLine >= 16 && this.headerLine <= 1048576)
+@Invariant(this.headerBytes >= 64 && this.headerBytes <= 67108864)
+@Invariant(this.chunkLine >= 8 && this.chunkLine <= 65536)
+@Invariant(this.bodyBytes <= 1099511627776)
+export class Limits {
+  private startLine: usize;
+  private headerCount: usize;
+  private headerLine: usize;
+  private headerBytes: usize;
+  private chunkLine: usize;
+  private bodyBytes: usize;
+
+  @Requires(maxStartLine >= 16 && maxStartLine <= 1048576)
+  @Requires(maxHeaderCount >= 1 && maxHeaderCount <= 65536)
+  @Requires(maxHeaderLine >= 16 && maxHeaderLine <= 1048576)
+  @Requires(maxHeaderBytes >= 64 && maxHeaderBytes <= 67108864)
+  @Requires(maxChunkLine >= 8 && maxChunkLine <= 65536)
+  @Requires(maxBody <= 1099511627776)
+  constructor(maxStartLine: usize, maxHeaderCount: usize, maxHeaderLine: usize, maxHeaderBytes: usize,
+      maxChunkLine: usize, maxBody: usize) {
+    this.startLine = maxStartLine;
+    this.headerCount = maxHeaderCount;
+    this.headerLine = maxHeaderLine;
+    this.headerBytes = maxHeaderBytes;
+    this.chunkLine = maxChunkLine;
+    this.bodyBytes = maxBody;
+    enforce(maxStartLine >= 16 && maxStartLine <= 1048576 && maxHeaderCount >= 1 && maxHeaderCount <= 65536
+      && maxHeaderLine >= 16 && maxHeaderLine <= 1048576 && maxHeaderBytes >= 64 && maxHeaderBytes <= 67108864
+      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, "invalid Limits");
+  }
+
+  // maxStartLine(): the longest request line / status line (without CRLF). O(1).
+  @Ensures(result >= 16)
+  maxStartLine(): usize {
+    return this.startLine;
+  }
+
+  // maxHeaderCount(): the most header fields (also the most trailer fields). O(1).
+  @Ensures(result >= 1)
+  maxHeaderCount(): usize {
+    return this.headerCount;
+  }
+
+  // maxHeaderLine(): the longest header line (without CRLF). O(1).
+  @Ensures(result >= 16)
+  maxHeaderLine(): usize {
+    return this.headerLine;
+  }
+
+  // maxHeaderBytes(): the largest header section, including the empty line (also the largest trailer section). O(1).
+  @Ensures(result >= 64)
+  maxHeaderBytes(): usize {
+    return this.headerBytes;
+  }
+
+  // maxChunkLine(): the longest chunk-size line (hex digits, blanks and extension, without CRLF). O(1).
+  @Ensures(result >= 8)
+  maxChunkLine(): usize {
+    return this.chunkLine;
+  }
+
+  // maxBody(): the largest decoded body. O(1).
+  maxBody(): usize {
+    return this.bodyBytes;
+  }
+}
+
+// defaultLimits(): 8192 start line, 100 headers, 8192 header line, 65536 header section, 1024 chunk line, 1 MiB body. O(1).
+@Ensures(result.maxStartLine() == 8192 && result.maxHeaderCount() == 100 && result.maxBody() == 1048576)
+export function defaultLimits(): Limits {
+  return new Limits(8192, 100, 8192, 65536, 1024, 1048576);
+}
+
+// ------------------------------------------------------------------------------------------ state machine
+
+const S_METHOD: int = 0;
+const S_TARGET: int = 1;
+const S_VERSION: int = 2;
+const S_CODE: int = 3;
+const S_REASON: int = 4;
+const S_START_LF: int = 5;
+const S_HDR_LINE: int = 6;
+const S_HDR_NAME: int = 7;
+const S_HDR_OWS: int = 8;
+const S_HDR_VALUE: int = 9;
+const S_HDR_LF: int = 10;
+const S_HEAD_END_LF: int = 11;
+const S_BODY: int = 12;
+const S_CHUNK_SIZE: int = 13;
+const S_CHUNK_BWS: int = 14;
+const S_CHUNK_EXT: int = 15;
+const S_CHUNK_SIZE_LF: int = 16;
+const S_CHUNK_DATA: int = 17;
+const S_CHUNK_CR: int = 18;
+const S_CHUNK_LF: int = 19;
+const S_BODY_CLOSE: int = 20;
+const S_DONE: int = 21;
+const S_ERROR: int = 22;
+
+// stateName(s): the name of state s, for diagnostics and tests. O(1).
+@Ensures(result.length > 0)
+export function stateName(s: int): string {
+  return match (s) {
+    0 => "METHOD",
+    1 => "TARGET",
+    2 => "VERSION",
+    3 => "CODE",
+    4 => "REASON",
+    5 => "START_LF",
+    6 => "HDR_LINE",
+    7 => "HDR_NAME",
+    8 => "HDR_OWS",
+    9 => "HDR_VALUE",
+    10 => "HDR_LF",
+    11 => "HEAD_END_LF",
+    12 => "BODY",
+    13 => "CHUNK_SIZE",
+    14 => "CHUNK_BWS",
+    15 => "CHUNK_EXT",
+    16 => "CHUNK_SIZE_LF",
+    17 => "CHUNK_DATA",
+    18 => "CHUNK_CR",
+    19 => "CHUNK_LF",
+    20 => "BODY_CLOSE",
+    21 => "DONE",
+    22 => "ERROR",
+    _ => "?"
+  };
+}
+
+// edgeAllowed(src, dst): the transition relation of the parser (the diagram at the top of this file). Every
+// state change goes through `MessageParser.go`, which requires it; `ERROR` is reachable from every non-terminal
+// state (through `fail`) and `DONE` / `ERROR` have no outgoing edge. O(1).
+@Ensures(src >= S_DONE ==> !result)
+@Ensures(result ==> src != dst)
+export function edgeAllowed(src: int, dst: int): bool {
+  return match (src) {
+    0 => dst == S_TARGET,
+    1 => dst == S_VERSION,
+    2 => dst == S_START_LF || dst == S_CODE,
+    3 => dst == S_REASON,
+    4 => dst == S_START_LF,
+    5 => dst == S_HDR_LINE,
+    6 => dst == S_HDR_NAME || dst == S_HEAD_END_LF,
+    7 => dst == S_HDR_OWS,
+    8 => dst == S_HDR_VALUE || dst == S_HDR_LF,
+    9 => dst == S_HDR_LF,
+    10 => dst == S_HDR_LINE,
+    11 => dst == S_BODY || dst == S_CHUNK_SIZE || dst == S_BODY_CLOSE || dst == S_DONE,
+    12 => dst == S_DONE,
+    13 => dst == S_CHUNK_BWS || dst == S_CHUNK_EXT || dst == S_CHUNK_SIZE_LF,
+    14 => dst == S_CHUNK_EXT || dst == S_CHUNK_SIZE_LF,
+    15 => dst == S_CHUNK_SIZE_LF,
+    16 => dst == S_CHUNK_DATA || dst == S_HDR_LINE,
+    17 => dst == S_CHUNK_CR,
+    18 => dst == S_CHUNK_LF,
+    19 => dst == S_CHUNK_SIZE,
+    20 => dst == S_DONE,
+    _ => false
+  };
+}
+
+// The framing of the body, decided at the end of the header section.
+const F_NONE: int = 0;
+const F_LENGTH: int = 1;
+const F_CHUNKED: int = 2;
+const F_CLOSE: int = 3;
+
+function lineLimitReason(st: int): HttpReason {
+  if (st <= S_REASON) {
+    return StartLineTooLong;
+  }
+  if (st <= S_HDR_VALUE) {
+    return HeaderLineTooLong;
+  }
+  return ChunkLineTooLong;
+}
+
+// Is the state one whose bytes count toward `lineLen` (the start line, a header line, a chunk-size line)?
+function isLineState(st: int): bool {
+  return st <= S_REASON || (st >= S_HDR_NAME && st <= S_HDR_VALUE) || (st >= S_CHUNK_SIZE && st <= S_CHUNK_EXT);
+}
+
+
+// The bytes xs[a, b) as a string (one byte per character, no decoding). Appending one character at a time is
+// about twice as fast as collecting 1-character strings and joining them (measured, docs/std.md).
+@Requires(a <= b && b <= xs.length)
+@Ensures(result.length == b - a)
+function sliceString(xs: u8[], a: usize, b: usize): string {
+  let s = "";
+  let k = a;
+  while (k < b) {
+    s += String.fromCharCode(xs[k].toInt());
+    k += 1;
+  }
+  return s;
+}
+
+// s without trailing SP / HTAB. O(trailing blanks).
+@Ensures(result.length <= s.length)
+function trimEndOws(s: string): string {
+  let e = s.length;
+  while (e > 0 && isOws(s.charCodeAt(e - 1))) {
+    e -= 1;
+  }
+  return e == s.length ? s : s.substring(0, e);
+}
+
+function resultKind<T>(r: ParseResult<T>): int {
+  return match (r) {
+    NeedMore => 0,
+    Done(v, used) => 1,
+    Failed(e) => 2
+  };
+}
+
+function resultUsed<T>(r: ParseResult<T>): usize {
+  return match (r) {
+    Done(v, used) => used,
+    _ => 0
+  };
+}
+
+// The scanner reads the input through a window: a copy of at most WINDOW bytes of the chunk as a `u8[]`, so that
+// the byte loops index an array instead of calling `Bytes.at` per byte (a call plus a reference count per byte).
+const WINDOW: usize = 4096;
+
+// The incremental parser shared by `RequestParser` and `ResponseParser`: the state machine described at the top of
+// the file. `feed` consumes input in one forward pass; all state is in the fields, so the input may be split
+// anywhere. Invariants (checked after every public method in a checked build) tie the state to the data: the state
+// is one of the 23 states; a failed parser holds its error and only a failed parser does; the header lists are
+// parallel and within the count limit; the line counter is within the line limit; the header section never exceeds
+// its budget; counters of the framing fields never pass one (a second one is an error at once); pending body bytes
+// exist only in a body state; a response parser never visits the request-line states.
+@Invariant(this.state >= S_METHOD && this.state <= S_ERROR)
+@Invariant((this.state == S_ERROR) == this.err.isSome())
+@Invariant(this.hnames.length == this.hvals.length && this.tnames.length == this.tvals.length)
+@Invariant(this.hnames.length <= this.maxCount && this.tnames.length <= this.maxCount)
+@Invariant(this.lineLen <= this.lineMax)
+@Invariant(this.state > S_HEAD_END_LF || this.total <= this.sectionEnd)
+@Invariant(this.state == S_ERROR || (this.clCount <= 1 && this.teCount <= 1 && this.hostCount <= 1))
+@Invariant(this.bodyLen <= this.maxBody)
+@Invariant(this.remaining == 0 || this.state == S_BODY || this.state == S_CHUNK_DATA || this.state == S_ERROR)
+@Invariant(this.state != S_DONE || this.remaining == 0)
+@Invariant(!this.inTrailers || this.state >= S_HDR_LINE)
+@Invariant(this.isReq || (this.state != S_METHOD && this.state != S_TARGET))
+@Invariant(this.isReq || this.state != S_START_LF || this.vidx == 8)
+@Invariant(this.state != S_BODY_CLOSE || !this.isReq)
+@Invariant(this.state != S_BODY || this.framing == F_LENGTH)
+@Invariant(this.state != S_BODY_CLOSE || this.framing == F_CLOSE)
+@Invariant(this.vidx <= 8 && this.codeDigits <= 3)
+@Invariant(this.acc.length == 0 || this.state == S_METHOD || this.state == S_TARGET || this.state == S_REASON
+  || this.state == S_HDR_NAME || this.state == S_HDR_VALUE || this.state == S_ERROR)
+class MessageParser {
+  private isReq: bool;
+  private forHead: bool;
+  private maxStart: usize;
+  private maxCount: usize;
+  private maxLine: usize;
+  private maxHead: usize;
+  private maxChunk: usize;
+  private maxBody: usize;
+  private state: int;
+  private err: Option<HttpError> = None;
+  private base0: usize = 0;
+  private base: usize = 0;
+  private cur: usize = 0;
+  private total: usize = 0;
+  private sectionEnd: usize;
+  private lineLen: usize = 0;
+  private lineMax: usize;
+  private lineStart: usize = 0;
+  private acc: string = "";
+  private meth: Method = Get;
+  private methodToken: string = "";
+  private target: string = "";
+  private targetPos: usize = 0;
+  private vidx: usize = 0;
+  private minor: int = 1;
+  private code: int = 0;
+  private codeDigits: usize = 0;
+  private reason: string = "";
+  private hnames: string[] = [];
+  private hvals: string[] = [];
+  private tnames: string[] = [];
+  private tvals: string[] = [];
+  private inTrailers: bool = false;
+  private curName: string = "";
+  private curValue: string = "";
+  private clCount: usize = 0;
+  private teCount: usize = 0;
+  private hostCount: usize = 0;
+  private clValue: usize = 0;
+  private framing: int = F_NONE;
+  private remaining: usize = 0;
+  private bodyLen: usize = 0;
+  private parts: Bytes[] = [];
+  private chunkSize: usize = 0;
+  private chunkDigits: usize = 0;
+
+  constructor(isReq: bool, forHead: bool, limits: Limits) {
+    this.isReq = isReq;
+    this.forHead = forHead;
+    this.maxStart = limits.maxStartLine();
+    this.maxCount = limits.maxHeaderCount();
+    this.maxLine = limits.maxHeaderLine();
+    this.maxHead = limits.maxHeaderBytes();
+    this.maxChunk = limits.maxChunkLine();
+    this.maxBody = limits.maxBody();
+    this.state = isReq ? S_METHOD : S_VERSION;
+    this.sectionEnd = limits.maxHeaderBytes();
+    this.lineMax = limits.maxStartLine();
+  }
+
+  // reset(): forget the message and start over (the next pipelined message, or after an error). O(1).
+  @Ensures(this.isIdle())
+  reset(): void {
+    this.state = this.isReq ? S_METHOD : S_VERSION;
+    this.err = None;
+    this.base0 = 0;
+    this.base = 0;
+    this.cur = 0;
+    this.total = 0;
+    this.sectionEnd = this.maxHead;
+    this.lineLen = 0;
+    this.lineMax = this.maxStart;
+    this.lineStart = 0;
+    this.acc = "";
+    this.meth = Get;
+    this.methodToken = "";
+    this.target = "";
+    this.targetPos = 0;
+    this.vidx = 0;
+    this.minor = 1;
+    this.code = 0;
+    this.codeDigits = 0;
+    this.reason = "";
+    this.hnames = [];
+    this.hvals = [];
+    this.tnames = [];
+    this.tvals = [];
+    this.inTrailers = false;
+    this.curName = "";
+    this.curValue = "";
+    this.clCount = 0;
+    this.teCount = 0;
+    this.hostCount = 0;
+    this.clValue = 0;
+    this.framing = F_NONE;
+    this.remaining = 0;
+    this.bodyLen = 0;
+    this.parts = [];
+    this.chunkSize = 0;
+    this.chunkDigits = 0;
+  }
+
+  // isIdle(): no byte of a message was consumed yet. O(1).
+  @Ensures(result == (this.total == 0 && this.state < S_DONE))
+  isIdle(): bool {
+    return this.total == 0 && this.state < S_DONE;
+  }
+
+  // isDone() / isFailed(): the message is complete / refused. O(1).
+  @Ensures(result == (this.state == S_DONE))
+  isDone(): bool {
+    return this.state == S_DONE;
+  }
+
+  @Ensures(result == (this.state == S_ERROR))
+  isFailed(): bool {
+    return this.state == S_ERROR;
+  }
+
+  // stateCode(): the current state (`stateName` gives its name). O(1).
+  @Ensures(result >= S_METHOD && result <= S_ERROR)
+  stateCode(): int {
+    return this.state;
+  }
+
+  // consumed(): bytes consumed since the start of the message (for a failed parser: the offset of the offending
+  // byte). O(1).
+  @Ensures(result == this.total)
+  consumed(): usize {
+    return this.total;
+  }
+
+  // The state change to `dst`; the only way the state changes besides `fail`, and only along `edgeAllowed`.
+  @Requires(edgeAllowed(this.state, dst))
+  @Ensures(this.state == dst)
+  private go(dst: int): void {
+    this.state = dst;
+  }
+
+  // fail(pos, reason): the parser fails at the absolute offset `pos`. Sticky until `reset`.
+  @Requires(this.state < S_DONE)
+  @Ensures(this.state == S_ERROR && this.err.isSome())
+  @Ensures(this.err.unwrap().position == pos)
+  private fail(pos: usize, reason: HttpReason): void {
+    this.err = Some(httpError(pos, reason));
+    this.state = S_ERROR;
+  }
+
+  // feed(chunk): consumes bytes of the message. NeedMore: all of `chunk` was consumed. Done(_, used): the message is
+  // complete after `used` bytes of this chunk. Failed(e): refused. In a terminal state it answers Failed without
+  // consuming anything (the stored error, or `ParserFinished` after Done).
+  //
+  // The loop takes one token per step. A step handles the bytes at the cursor `this.cur` in the current state and
+  // moves the cursor; it consumes at least one byte or ends in ERROR, so the loop terminates in at most
+  // chunk.length() + 1 steps. Scanning states read a window of the chunk (`xs`, cursor relative to the window);
+  // the body states copy nothing: they slice the chunk.
+  @Ensures(resultKind(result) == 0 ==> this.state < S_DONE && this.total == old(this.total) + chunk.length())
+  @Ensures(resultKind(result) == 1 ==> this.state == S_DONE && resultUsed(result) <= chunk.length())
+  @Ensures(resultKind(result) == 1 ==> this.total == old(this.total) + resultUsed(result))
+  @Ensures(resultKind(result) == 2 ==> this.state >= S_DONE)
+  @Ensures(old(this.state) >= S_DONE ==> this.state == old(this.state) && this.total == old(this.total))
+  feed(chunk: Bytes): ParseResult<int> {
+    if (this.state >= S_DONE) {
+      if (this.state == S_ERROR) {
+        return Failed(this.err.unwrap());
+      }
+      return Failed(httpError(this.total, ParserFinished));
+    }
+    this.base0 = this.total;
+    const n = chunk.length();
+    let i: usize = 0;
+    let xs: u8[] = [];
+    let w: usize = 0;
+    let we: usize = 0;
+    while (i < n && this.state < S_DONE) {
+      const st = this.state;
+      if (st == S_BODY) {
+        this.cur = i;
+        this.doBody(chunk, n);
+        i = this.cur;
+      } else if (st == S_CHUNK_DATA) {
+        this.cur = i;
+        this.doChunkData(chunk, n);
+        i = this.cur;
+      } else if (st == S_BODY_CLOSE) {
+        this.cur = i;
+        this.doBodyClose(chunk, n);
+        i = this.cur;
+      } else {
+        let end = n;
+        if (st <= S_HEAD_END_LF) {
+          const budget = this.sectionEnd - this.base0;
+          if (budget < end) {
+            end = budget;
+          }
+          if (i >= end) {
+            this.fail(this.base0 + i, HeadersTooLarge);
+            break;
+          }
+        }
+        if (i < w || i >= we) {
+          w = i;
+          we = n - i > WINDOW ? i + WINDOW : n;
+          xs = chunk.slice(w, we).toArray();
+        }
+        const lim = (end < we ? end : we) - w;
+        this.base = this.base0 + w;
+        this.cur = i - w;
+        if (this.lineLen >= this.lineMax && isLineState(st) && HTTP_CLASS.charCodeAt(xs[this.cur].toUsize()) != C_CR) {
+          this.fail(this.base + this.cur, lineLimitReason(st));
+          break;
+        }
+        if (st == S_HDR_VALUE) {
+          this.doValue(xs, lim);
+        } else if (st == S_HDR_NAME) {
+          this.doName(xs, lim);
+        } else if (st == S_HDR_LINE) {
+          this.doLineStart(xs, lim);
+        } else if (st == S_HDR_OWS) {
+          this.doOws(xs, lim);
+        } else if (st == S_HDR_LF) {
+          this.doHeaderLf(xs);
+        } else if (st == S_METHOD) {
+          this.doMethod(xs, lim);
+        } else if (st == S_TARGET) {
+          this.doTarget(xs, lim);
+        } else if (st == S_VERSION) {
+          this.doVersion(xs, lim);
+        } else if (st == S_CODE) {
+          this.doCode(xs, lim);
+        } else if (st == S_REASON) {
+          this.doReason(xs, lim);
+        } else if (st == S_START_LF) {
+          this.doStartLf(xs);
+        } else if (st == S_HEAD_END_LF) {
+          this.doHeadEnd(xs);
+        } else if (st == S_CHUNK_SIZE) {
+          this.doChunkSize(xs, lim);
+        } else if (st == S_CHUNK_BWS) {
+          this.doChunkBws(xs, lim);
+        } else if (st == S_CHUNK_EXT) {
+          this.doChunkExt(xs, lim);
+        } else if (st == S_CHUNK_SIZE_LF) {
+          this.doChunkSizeLf(xs);
+        } else if (st == S_CHUNK_CR) {
+          this.doChunkCr(xs);
+        } else {
+          this.doChunkLf(xs);
+        }
+        i = w + this.cur;
+      }
+    }
+    this.total = this.base0 + i;
+    if (this.state == S_ERROR) {
+      return Failed(this.err.unwrap());
+    }
+    if (this.state == S_DONE) {
+      return Done(0, i);
+    }
+    return NeedMore;
+  }
+
+  // atEof(): the peer closed the connection. A response body without Content-Length / chunking ends here (Done);
+  // any other incomplete message is `UnexpectedEof` at the number of bytes received. In a terminal state like `feed`.
+  @Ensures(resultKind(result) == 1 ==> this.state == S_DONE && old(this.state) == S_BODY_CLOSE)
+  @Ensures(resultKind(result) != 0)
+  atEof(): ParseResult<int> {
+    if (this.state == S_BODY_CLOSE) {
+      this.go(S_DONE);
+      return Done(0, 0);
+    }
+    if (this.state >= S_DONE) {
+      if (this.state == S_ERROR) {
+        return Failed(this.err.unwrap());
+      }
+      return Failed(httpError(this.total, ParserFinished));
+    }
+    this.fail(this.total, UnexpectedEof);
+    return Failed(this.err.unwrap());
+  }
+
+  // ---------------------------------------------------------------------------------------- start line
+  // Every step below reads the cursor `this.cur`, handles the bytes xs[cur .. n) in its state and leaves the new
+  // cursor in `this.cur`: a position past at least one byte, or the position of the byte it refused (ERROR).
+
+  // METHOD: a run of token characters, then SP.
+  @Requires(this.state == S_METHOD && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doMethod(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_TOKEN) {
+      j += 1;
+    }
+    let tok = "";
+    if (j > i) {
+      tok = sliceString(xs, i, j);
+      this.lineLen += j - i;
+    }
+    this.cur = j;
+    if (j >= n) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c >= C_TOKEN) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    if (c == C_SP && this.lineLen > 0) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.methodToken = tok;
+      this.meth = methodFromToken(tok).unwrap();
+      this.go(S_TARGET);
+      this.targetPos = this.base + j + 1;
+      this.cur = j + 1;
+      return;
+    }
+    this.fail(this.base + j, BadMethod);
+  }
+
+  // TARGET: a run of 0x21..0x7E, then SP.
+  @Requires(this.state == S_TARGET && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doTarget(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= 6) {
+      j += 1;
+    }
+    let tok = "";
+    if (j > i) {
+      tok = sliceString(xs, i, j);
+      this.lineLen += j - i;
+    }
+    this.cur = j;
+    if (j >= n) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c >= 6) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    if (c == C_SP && this.lineLen > this.methodToken.length + 1) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.target = tok;
+      this.go(S_VERSION);
+      this.vidx = 0;
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_CR && this.lineLen > this.methodToken.length + 1) {
+      this.fail(this.base + j, BadVersion);
+      return;
+    }
+    this.fail(this.base + j, BadTarget);
+  }
+
+  // VERSION: "HTTP/1." and a digit (0 or 1), then CR (request) or SP (response).
+  @Requires(this.state == S_VERSION && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doVersion(xs: u8[], n: usize): void {
+    let j = this.cur;
+    while (j < n && this.vidx < 8 && this.lineLen < this.lineMax) {
+      const c = xs[j].toInt();
+      const k = this.vidx;
+      if (k < 7) {
+        if (c != "HTTP/1.".charCodeAt(k)) {
+          this.cur = j;
+          if (k == 5 && c >= 48 && c <= 57) {
+            this.fail(this.base + j, UnsupportedVersion);
+          } else {
+            this.fail(this.base + j, BadVersion);
+          }
+          return;
+        }
+      } else if (c == 48) {
+        this.minor = 0;
+      } else if (c == 49) {
+        this.minor = 1;
+      } else if (c >= 50 && c <= 57) {
+        this.cur = j;
+        this.fail(this.base + j, UnsupportedVersion);
+        return;
+      } else {
+        this.cur = j;
+        this.fail(this.base + j, BadVersion);
+        return;
+      }
+      this.vidx += 1;
+      this.lineLen += 1;
+      j += 1;
+    }
+    this.cur = j;
+    if (this.vidx < 8) {
+      if (j < n) {
+        if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
+          this.fail(this.base + j, StartLineTooLong);
+        } else {
+          this.fail(this.base + j, BadVersion);
+        }
+      }
+      return;
+    }
+    if (j >= n) {
+      return;
+    }
+    const d = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (this.isReq) {
+      if (d == C_CR) {
+        this.go(S_START_LF);
+        this.cur = j + 1;
+        return;
+      }
+      if (d == C_LF) {
+        this.fail(this.base + j, BareLf);
+      } else {
+        this.fail(this.base + j, BadVersion);
+      }
+      return;
+    }
+    if (d == C_SP) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      this.go(S_CODE);
+      this.code = 0;
+      this.codeDigits = 0;
+      this.cur = j + 1;
+      return;
+    }
+    if (d == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadStatusLine);
+    }
+  }
+
+  // CODE: exactly three digits (first 1..5), then SP.
+  @Requires(this.state == S_CODE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doCode(xs: u8[], n: usize): void {
+    let j = this.cur;
+    while (j < n && this.codeDigits < 3 && this.lineLen < this.lineMax) {
+      const c = xs[j].toInt();
+      if (c < 48 || c > 57 || (this.codeDigits == 0 && (c < 49 || c > 53))) {
+        this.cur = j;
+        this.fail(this.base + j, BadStatusCode);
+        return;
+      }
+      this.code = this.code * 10 + (c - 48);
+      this.codeDigits += 1;
+      this.lineLen += 1;
+      j += 1;
+    }
+    this.cur = j;
+    if (this.codeDigits < 3) {
+      if (j < n) {
+        if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
+          this.fail(this.base + j, StartLineTooLong);
+        } else {
+          this.fail(this.base + j, BadStatusCode);
+        }
+      }
+      return;
+    }
+    if (j >= n) {
+      return;
+    }
+    const d = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (d == C_SP) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      this.go(S_REASON);
+      this.cur = j + 1;
+      return;
+    }
+    if (d == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadStatusLine);
+    }
+  }
+
+  // REASON: a run of field bytes, then CR.
+  @Requires(this.state == S_REASON && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doReason(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB) {
+      j += 1;
+    }
+    let tok = "";
+    if (j > i) {
+      tok = sliceString(xs, i, j);
+      this.lineLen += j - i;
+    }
+    this.cur = j;
+    if (j >= n) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c >= C_HTAB) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    if (c == C_CR) {
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.reason = tok;
+      this.go(S_START_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadStatusLine);
+    }
+  }
+
+  // START_LF: the LF of the start line; then the header section begins.
+  @Requires(this.state == S_START_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doStartLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
+      this.fail(this.base + i, BareCr);
+      return;
+    }
+    if (this.isReq && !isValidTarget(this.meth, this.target)) {
+      this.fail(this.targetPos, BadTarget);
+      return;
+    }
+    this.go(S_HDR_LINE);
+    this.lineLen = 0;
+    this.lineMax = this.maxLine;
+    this.lineStart = this.base + i + 1;
+    this.cur = i + 1;
+  }
+
+  // ----------------------------------------------------------------------------- header and trailer fields
+
+  // HDR_LINE: the first byte of a line of the header (or trailer) section.
+  @Requires(this.state == S_HDR_LINE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doLineStart(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const c = HTTP_CLASS.charCodeAt(xs[i].toUsize());
+    if (c >= C_TOKEN) {
+      const count = this.inTrailers ? this.tnames.length : this.hnames.length;
+      if (count >= this.maxCount) {
+        this.fail(this.base + i, TooManyHeaders);
+        return;
+      }
+      this.lineStart = this.base + i;
+      this.lineLen = 0;
+      this.go(S_HDR_NAME);
+      this.doName(xs, n);
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_HEAD_END_LF);
+      this.cur = i + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + i, BareLf);
+    } else if (c == C_SP || c == C_HTAB) {
+      this.fail(this.base + i, ObsFold);
+    } else {
+      this.fail(this.base + i, BadHeaderName);
+    }
+  }
+
+  // HDR_NAME: a run of token characters, then ":".
+  @Requires(this.state == S_HDR_NAME && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doName(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_TOKEN) {
+      j += 1;
+    }
+    let tok = "";
+    if (j > i) {
+      tok = sliceString(xs, i, j);
+      this.lineLen += j - i;
+    }
+    this.cur = j;
+    if (j >= n) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c >= C_TOKEN) {
+      if (j > i) {
+        this.acc += tok;
+      }
+      return;
+    }
+    if (c == C_COLON) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, HeaderLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.curName = tok;
+      this.go(S_HDR_OWS);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_SP || c == C_HTAB) {
+      this.fail(this.base + j, SpaceBeforeColon);
+    } else if (c == C_CR) {
+      this.fail(this.base + j, MissingColon);
+    } else if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadHeaderName);
+    }
+  }
+
+  // HDR_OWS: optional whitespace after the colon, then the value (or CR for an empty value).
+  @Requires(this.state == S_HDR_OWS && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doOws(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && isOws(xs[j].toInt())) {
+      j += 1;
+    }
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c == C_SP || c == C_HTAB) {
+      return;
+    }
+    if (c == C_CR) {
+      this.curValue = "";
+      this.go(S_HDR_LF);
+      this.cur = j + 1;
+      return;
+    }
+    this.go(S_HDR_VALUE);
+    if (j > i) {
+      return;
+    }
+    this.doValue(xs, n);
+  }
+
+  // HDR_VALUE: a run of field bytes, then CR; trailing blanks are not part of the value.
+  @Requires(this.state == S_HDR_VALUE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doValue(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB) {
+      j += 1;
+    }
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n || (j == lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB)) {
+      if (j > i) {
+        const tok = sliceString(xs, i, j);
+        this.acc += tok;
+      }
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c == C_CR) {
+      let e = j;
+      while (e > i && isOws(xs[e - 1].toInt())) {
+        e -= 1;
+      }
+      if (this.acc.length == 0) {
+        this.curValue = sliceString(xs, i, e);
+      } else {
+        this.curValue = trimEndOws(this.acc + sliceString(xs, i, e));
+        this.acc = "";
+      }
+      this.go(S_HDR_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadHeaderValue);
+    }
+  }
+
+  // HDR_LF: the LF that ends a header line; the field is complete and checked.
+  @Requires(this.state == S_HDR_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doHeaderLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
+      this.fail(this.base + i, BareCr);
+      return;
+    }
+    this.commitHeader();
+    if (this.state == S_ERROR) {
+      return;
+    }
+    this.go(S_HDR_LINE);
+    this.lineLen = 0;
+    this.lineStart = this.base + i + 1;
+    this.cur = i + 1;
+  }
+
+  // The field (curName, curValue) is complete: apply the framing and Host rules, then store it.
+  @Requires(this.state == S_HDR_LF)
+  @Ensures(this.state == S_ERROR || this.state == S_HDR_LF)
+  private commitHeader(): void {
+    const name = this.curName;
+    if (this.inTrailers) {
+      if (isForbiddenTrailerName(name)) {
+        this.fail(this.lineStart, ForbiddenTrailer);
+        return;
+      }
+      this.tnames.push(name);
+      this.tvals.push(this.curValue);
+      return;
+    }
+    const nl = name.length;
+    if (nl == 14 && eqIgnoreCase(name, "content-length")) {
+      this.clCount += 1;
+      if (this.clCount > 1) {
+        this.fail(this.lineStart, DuplicateContentLength);
+        return;
+      }
+      const v = parseContentLength(this.curValue);
+      if (v.isNone()) {
+        this.fail(this.lineStart, BadContentLength);
+        return;
+      }
+      this.clValue = v.unwrap();
+    } else if (nl == 17 && eqIgnoreCase(name, "transfer-encoding")) {
+      this.teCount += 1;
+      if (this.teCount > 1) {
+        this.fail(this.lineStart, DuplicateTransferEncoding);
+        return;
+      }
+      if (!eqIgnoreCase(this.curValue, "chunked")) {
+        this.fail(this.lineStart, UnsupportedTransferEncoding);
+        return;
+      }
+    } else if (nl == 4 && this.isReq && eqIgnoreCase(name, "host")) {
+      this.hostCount += 1;
+      if (this.hostCount > 1) {
+        this.fail(this.lineStart, DuplicateHost);
+        return;
+      }
+      if (!isHostValue(this.curValue)) {
+        this.fail(this.lineStart, BadHost);
+        return;
+      }
+    }
+    this.hnames.push(name);
+    this.hvals.push(this.curValue);
+  }
+
+  // HEAD_END_LF: the LF of the empty line. The end of the headers decides the framing; the end of the trailers
+  // ends the message.
+  @Requires(this.state == S_HEAD_END_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doHeadEnd(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
+      this.fail(this.base + i, BareCr);
+      return;
+    }
+    this.cur = i + 1;
+    if (this.inTrailers) {
+      this.go(S_DONE);
+      return;
+    }
+    this.decideFraming(this.base + i - 1);
+  }
+
+  // End of the header section at `at` (the CR of the empty line): apply the rules that need all the fields and pick
+  // how the body is delimited (RFC 9112 §6.3).
+  @Requires(this.state == S_HEAD_END_LF && !this.inTrailers)
+  @Ensures(this.state != S_HEAD_END_LF)
+  private decideFraming(at: usize): void {
+    if (this.isReq && this.minor == 1 && this.hostCount == 0) {
+      this.fail(at, MissingHost);
+      return;
+    }
+    if (this.teCount > 0 && this.minor == 0) {
+      this.fail(at, UnsupportedTransferEncoding);
+      return;
+    }
+    if (this.teCount > 0 && this.clCount > 0) {
+      this.fail(at, ContentLengthWithTransferEncoding);
+      return;
+    }
+    let bodyless = false;
+    if (!this.isReq) {
+      if ((this.code < 200 || this.code == 204) && (this.teCount > 0 || this.clCount > 0)) {
+        this.fail(at, ForbiddenFraming);
+        return;
+      }
+      bodyless = this.forHead || this.code < 200 || this.code == 204 || this.code == 304;
+    }
+    if (bodyless) {
+      this.go(S_DONE);
+      return;
+    }
+    if (this.teCount > 0) {
+      this.framing = F_CHUNKED;
+      this.chunkSize = 0;
+      this.chunkDigits = 0;
+      this.lineLen = 0;
+      this.lineMax = this.maxChunk;
+      this.go(S_CHUNK_SIZE);
+      return;
+    }
+    if (this.clCount > 0) {
+      if (this.clValue > this.maxBody) {
+        this.fail(at, BodyTooLarge);
+        return;
+      }
+      if (this.clValue == 0) {
+        this.go(S_DONE);
+        return;
+      }
+      this.framing = F_LENGTH;
+      this.remaining = this.clValue;
+      this.go(S_BODY);
+      return;
+    }
+    if (this.isReq) {
+      this.go(S_DONE);
+      return;
+    }
+    this.framing = F_CLOSE;
+    this.go(S_BODY_CLOSE);
+  }
+
+  // ------------------------------------------------------------------------------------------------ body
+  // The body states take the cursor as an absolute index into the chunk (no window): they slice the chunk.
+
+  // BODY: the next bytes of a Content-Length body: a slice of the chunk, no copy.
+  @Requires(this.state == S_BODY && this.cur < n && n <= chunk.length())
+  @Ensures(this.cur > old(this.cur))
+  private doBody(chunk: Bytes, n: usize): void {
+    const i = this.cur;
+    const avail = n - i;
+    const take = avail < this.remaining ? avail : this.remaining;
+    this.parts.push(chunk.slice(i, i + take));
+    this.remaining -= take;
+    this.bodyLen += take;
+    if (this.remaining == 0) {
+      this.go(S_DONE);
+    }
+    this.cur = i + take;
+  }
+
+  // BODY_CLOSE: a response body that runs until the peer closes (`atEof`), within the body limit.
+  @Requires(this.state == S_BODY_CLOSE && this.cur < n && n <= chunk.length())
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doBodyClose(chunk: Bytes, n: usize): void {
+    const i = this.cur;
+    const room = this.maxBody - this.bodyLen;
+    if (room == 0) {
+      this.fail(this.base0 + i, BodyTooLarge);
+      return;
+    }
+    const avail = n - i;
+    const take = avail < room ? avail : room;
+    this.parts.push(chunk.slice(i, i + take));
+    this.bodyLen += take;
+    this.cur = i + take;
+  }
+
+  // CHUNK_DATA: the next bytes of the current chunk: a slice of the input.
+  @Requires(this.state == S_CHUNK_DATA && this.cur < n && n <= chunk.length())
+  @Ensures(this.cur > old(this.cur))
+  private doChunkData(chunk: Bytes, n: usize): void {
+    const i = this.cur;
+    const avail = n - i;
+    const take = avail < this.remaining ? avail : this.remaining;
+    this.parts.push(chunk.slice(i, i + take));
+    this.remaining -= take;
+    this.bodyLen += take;
+    if (this.remaining == 0) {
+      this.go(S_CHUNK_CR);
+    }
+    this.cur = i + take;
+  }
+
+  // CHUNK_SIZE: hexadecimal digits of the chunk size, then (BWS) ";" extension or CR.
+  @Requires(this.state == S_CHUNK_SIZE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkSize(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    const allowed = this.maxBody - this.bodyLen;
+    let sz = this.chunkSize;
+    let j = i;
+    while (j < lim) {
+      const hv = HTTP_HEXV.charCodeAt(xs[j].toUsize());
+      if (hv > 15) {
+        break;
+      }
+      sz = sz * 16 + hv.toUsize();
+      if (sz > allowed) {
+        this.chunkSize = sz;
+        this.cur = j;
+        this.fail(this.base + j, BodyTooLarge);
+        return;
+      }
+      j += 1;
+    }
+    this.chunkSize = sz;
+    this.chunkDigits += j - i;
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    if (HTTP_HEXV.charCodeAt(xs[j].toUsize()) <= 15) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (this.chunkDigits == 0) {
+      this.fail(this.base + j, BadChunkSize);
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_CHUNK_SIZE_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_SEMI || c == C_SP || c == C_HTAB) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, ChunkLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      this.go(c == C_SEMI ? S_CHUNK_EXT : S_CHUNK_BWS);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadChunkSize);
+    }
+  }
+
+  // CHUNK_BWS: blanks after the size, then ";" or CR.
+  @Requires(this.state == S_CHUNK_BWS && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkBws(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && isOws(xs[j].toInt())) {
+      j += 1;
+    }
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c == C_SP || c == C_HTAB) {
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_CHUNK_SIZE_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_SEMI) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, ChunkLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      this.go(S_CHUNK_EXT);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadChunkSize);
+    }
+  }
+
+  // CHUNK_EXT: the chunk extension, ignored: a run of field bytes, then CR; control characters are refused.
+  @Requires(this.state == S_CHUNK_EXT && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkExt(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB) {
+      j += 1;
+    }
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c >= C_HTAB) {
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_CHUNK_SIZE_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadChunkExtension);
+    }
+  }
+
+  // CHUNK_SIZE_LF: the LF of the chunk-size line. Size 0: the trailer section follows; else the chunk data.
+  // (The cursor is relative to the window here; the chunk data state that follows uses an absolute cursor, which
+  // `feed` recomputes from the window start.)
+  @Requires(this.state == S_CHUNK_SIZE_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkSizeLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
+      this.fail(this.base + i, BareCr);
+      return;
+    }
+    this.cur = i + 1;
+    if (this.chunkSize == 0) {
+      this.inTrailers = true;
+      this.sectionEnd = this.base + i + 1 + this.maxHead;
+      this.lineLen = 0;
+      this.lineMax = this.maxLine;
+      this.lineStart = this.base + i + 1;
+      this.go(S_HDR_LINE);
+      return;
+    }
+    this.remaining = this.chunkSize;
+    this.go(S_CHUNK_DATA);
+  }
+
+  // CHUNK_CR: the CR after the chunk data.
+  @Requires(this.state == S_CHUNK_CR && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkCr(xs: u8[]): void {
+    const i = this.cur;
+    const c = xs[i].toInt();
+    if (c == 13) {
+      this.go(S_CHUNK_LF);
+      this.cur = i + 1;
+      return;
+    }
+    if (c == 10) {
+      this.fail(this.base + i, BareLf);
+    } else {
+      this.fail(this.base + i, BadChunkTerminator);
+    }
+  }
+
+  // CHUNK_LF: the LF after the chunk data; the next chunk-size line follows.
+  @Requires(this.state == S_CHUNK_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
+      this.fail(this.base + i, BareCr);
+      return;
+    }
+    this.chunkSize = 0;
+    this.chunkDigits = 0;
+    this.lineLen = 0;
+    this.lineMax = this.maxChunk;
+    this.go(S_CHUNK_SIZE);
+    this.cur = i + 1;
+  }
+
+  // ---------------------------------------------------------------------------------- the finished message
+
+  // bodyBytes(): the collected body (all `parts` concatenated; one part is returned as it is, without a copy).
+  @Requires(this.state == S_DONE)
+  @Ensures(result.length() == this.bodyLen)
+  bodyBytes(): Bytes {
+    if (this.parts.length == 0) {
+      return emptyBytes();
+    }
+    if (this.parts.length == 1) {
+      return this.parts[0];
+    }
+    let all: u8[] = [];
+    let k: usize = 0;
+    while (k < this.parts.length) {
+      const a = this.parts[k].toArray();
+      let q: usize = 0;
+      while (q < a.length) {
+        all.push(a[q]);
+        q += 1;
+      }
+      k += 1;
+    }
+    return bytesFromArray(all);
+  }
+
+  // httpVersion(): the version of the start line.
+  @Requires(this.state == S_DONE)
+  httpVersion(): HttpVersion {
+    return this.minor == 0 ? Http10 : Http11;
+  }
+
+  // buildRequest(): the parsed request (the constructor re-checks every rule). Request parsers only.
+  @Requires(this.state == S_DONE && this.isReq)
+  buildRequest(): Request {
+    return new Request(this.meth, this.target, this.httpVersion(), new Headers(this.hnames, this.hvals), this.bodyBytes(),
+      new Headers(this.tnames, this.tvals));
+  }
+
+  // buildResponse(): the parsed response. Response parsers only.
+  @Requires(this.state == S_DONE && !this.isReq)
+  buildResponse(): Response {
+    return new Response(new Status(this.code, this.reason), this.httpVersion(), new Headers(this.hnames, this.hvals),
+      this.bodyBytes(), new Headers(this.tnames, this.tvals), this.forHead);
+  }
+}
+
+
+// --------------------------------------------------------------------------------- public parser classes
+
+// The incremental HTTP/1.1 request parser. `feed` accepts bytes in arbitrary chunks; see the top of the file.
+// After `Done` (or `Failed`) call `reset()` to parse the next message of a connection.
+@Invariant(this.core.stateCode() >= S_METHOD && this.core.stateCode() <= S_ERROR)
+@Invariant(!this.core.isDone() || this.core.consumed() > 0)
+export class RequestParser {
+  private core: MessageParser;
+
+  constructor(limits: Limits) {
+    this.core = new MessageParser(true, false, limits);
+  }
+
+  // feed(chunk): the next bytes of the request. NeedMore | Done(request, used) | Failed(error). O(chunk) per call.
+  @Ensures(resultKind(result) == 0 ==> !this.isDone() && !this.isFailed())
+  @Ensures(resultKind(result) == 1 ==> this.isDone() && resultUsed(result) <= chunk.length())
+  @Ensures(resultKind(result) == 2 ==> this.isFailed() || old(this.isDone()))
+  feed(chunk: Bytes): ParseResult<Request> {
+    const r = this.core.feed(chunk);
+    return match (r) {
+      NeedMore => NeedMore,
+      Failed(e) => Failed(e),
+      Done(z, used) => Done(this.core.buildRequest(), used)
+    };
+  }
+
+  // atEof(): the peer closed the connection: always `Failed(UnexpectedEof)` for a request that is not complete.
+  @Ensures(resultKind(result) == 2)
+  atEof(): ParseResult<Request> {
+    const r = this.core.atEof();
+    return match (r) {
+      NeedMore => NeedMore,
+      Failed(e) => Failed(e),
+      Done(z, used) => Done(this.core.buildRequest(), used)
+    };
+  }
+
+  // reset(): start a new message. O(1).
+  @Ensures(this.isIdle())
+  reset(): void {
+    this.core.reset();
+  }
+
+  // isIdle(): no byte of a message consumed yet (a connection closed now is a clean close). O(1).
+  @Ensures(result == (this.consumed() == 0 && !this.isDone() && !this.isFailed()))
+  isIdle(): bool {
+    return this.core.isIdle();
+  }
+
+  // isDone() / isFailed(): terminal states. O(1).
+  isDone(): bool {
+    return this.core.isDone();
+  }
+
+  isFailed(): bool {
+    return this.core.isFailed();
+  }
+
+  // consumed(): bytes consumed since the start of the message. O(1).
+  consumed(): usize {
+    return this.core.consumed();
+  }
+
+  // stateName(): the current state, e.g. "HDR_VALUE". O(1).
+  @Ensures(result.length > 0)
+  stateName(): string {
+    return stateName(this.core.stateCode());
+  }
+}
+
+// The incremental HTTP/1.1 response parser (for a client). `forHead`: the response is to a HEAD request, so no body
+// follows whatever the headers say. A response without Content-Length and Transfer-Encoding ends at connection
+// close: feed all input, then call `atEof()` for `Done`.
+@Invariant(this.core.stateCode() >= S_VERSION && this.core.stateCode() <= S_ERROR)
+export class ResponseParser {
+  private core: MessageParser;
+
+  constructor(limits: Limits, forHead: bool) {
+    this.core = new MessageParser(false, forHead, limits);
+  }
+
+  // feed(chunk): the next bytes of the response. NeedMore | Done(response, used) | Failed(error). O(chunk) per call.
+  @Ensures(resultKind(result) == 0 ==> !this.isDone() && !this.isFailed())
+  @Ensures(resultKind(result) == 1 ==> this.isDone() && resultUsed(result) <= chunk.length())
+  @Ensures(resultKind(result) == 2 ==> this.isFailed() || old(this.isDone()))
+  feed(chunk: Bytes): ParseResult<Response> {
+    const r = this.core.feed(chunk);
+    return match (r) {
+      NeedMore => NeedMore,
+      Failed(e) => Failed(e),
+      Done(z, used) => Done(this.core.buildResponse(), used)
+    };
+  }
+
+  // atEof(): the peer closed the connection: `Done` for a response whose body runs until close, else
+  // `Failed(UnexpectedEof)`.
+  @Ensures(resultKind(result) != 0)
+  atEof(): ParseResult<Response> {
+    const r = this.core.atEof();
+    return match (r) {
+      NeedMore => NeedMore,
+      Failed(e) => Failed(e),
+      Done(z, used) => Done(this.core.buildResponse(), used)
+    };
+  }
+
+  // reset(): start a new message. O(1).
+  @Ensures(this.isIdle())
+  reset(): void {
+    this.core.reset();
+  }
+
+  // isIdle(): no byte of a message consumed yet. O(1).
+  isIdle(): bool {
+    return this.core.isIdle();
+  }
+
+  // isDone() / isFailed(): terminal states. O(1).
+  isDone(): bool {
+    return this.core.isDone();
+  }
+
+  isFailed(): bool {
+    return this.core.isFailed();
+  }
+
+  // consumed(): bytes consumed since the start of the message. O(1).
+  consumed(): usize {
+    return this.core.consumed();
+  }
+
+  // stateName(): the current state. O(1).
+  @Ensures(result.length > 0)
+  stateName(): string {
+    return stateName(this.core.stateCode());
+  }
+}
+
+// parseRequest(data, limits): a one-shot parse of all of `data` (a fresh parser, one `feed`). NeedMore when `data`
+// is a proper prefix of a message; `Done(request, used)` leaves `data[used..]` for the next message. O(data).
+@Ensures(resultKind(result) == 1 ==> resultUsed(result) <= data.length())
+export function parseRequest(data: Bytes, limits: Limits): ParseResult<Request> {
+  let p = new RequestParser(limits);
+  return p.feed(data);
+}
+
+// parseResponse(data, limits, forHead): the same for a response; `atEof` is NOT applied (use `parseResponseToEof`
+// for a response that ends at connection close). O(data).
+@Ensures(resultKind(result) == 1 ==> resultUsed(result) <= data.length())
+export function parseResponse(data: Bytes, limits: Limits, forHead: bool): ParseResult<Response> {
+  let p = new ResponseParser(limits, forHead);
+  return p.feed(data);
+}
+
+// parseResponseToEof(data, limits, forHead): `data` is everything the peer sent before it closed the connection;
+// a close-delimited body is complete. O(data).
+export function parseResponseToEof(data: Bytes, limits: Limits, forHead: bool): ParseResult<Response> {
+  let p = new ResponseParser(limits, forHead);
+  const r = p.feed(data);
+  if (resultKind(r) == 0) {
+    return p.atEof();
+  }
+  return r;
+}
+
+
+
+// ------------------------------------------------------------------------------------------- serializer
+
+// hexString(n): n in lower-case hexadecimal without leading zeros ("0" for 0). O(digits).
+@Ensures(result.length >= 1)
+export function hexString(n: usize): string {
+  if (n == 0) {
+    return "0";
+  }
+  let digits: string[] = [];
+  let v = n;
+  while (v > 0) {
+    digits.push("0123456789abcdef".charAt(v % 16));
+    v = v / 16;
+  }
+  let out = "";
+  let k = digits.length;
+  while (k > 0) {
+    k -= 1;
+    out += digits[k];
+  }
+  return out;
+}
+
+// The fields of `h`, one line each: `name: value CRLF`. Names and values were validated by `Headers`, so no field
+// can contain a CR or LF: a field can never end its line early or start another one (no header injection).
+@Ensures(result.length == headerBytes(h))
+function fieldsText(h: Headers): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < h.count()) {
+    parts.push(h.nameAt(i));
+    parts.push(": ");
+    parts.push(h.valueAt(i));
+    parts.push("\r\n");
+    i += 1;
+  }
+  return parts.join("");
+}
+
+// The serialized size of the fields of `h`.
+function headerBytes(h: Headers): usize {
+  let n: usize = 0;
+  let i: usize = 0;
+  while (i < h.count()) {
+    n += h.nameAt(i).length + h.valueAt(i).length + 4;
+    i += 1;
+  }
+  return n;
+}
+
+// A chunked body: chunks of at most `chunkSize` bytes, the last chunk, the trailers and the final CRLF.
+@Requires(chunkSize >= 1)
+@Ensures(result.length() >= 5 + body.length() + headerBytes(trailers))
+function chunkedBytes(body: Bytes, trailers: Headers, chunkSize: usize): Bytes {
+  let out = new ByteBuilder();
+  let off: usize = 0;
+  while (off < body.length()) {
+    const left = body.length() - off;
+    const take = left < chunkSize ? left : chunkSize;
+    out.appendString(hexString(take));
+    out.appendString("\r\n");
+    out.appendBytes(body.slice(off, off + take));
+    out.appendString("\r\n");
+    off += take;
+  }
+  out.appendString("0\r\n");
+  out.appendString(fieldsText(trailers));
+  out.appendString("\r\n");
+  return out.build();
+}
+
+// Limits large enough for any message of `n` bytes (the contract of the serializers parses their output with them).
+function limitsFor(n: usize): Limits {
+  const big = n < 16 ? 16 : (n > 1048576 ? 1048576 : n);
+  const head = n < 64 ? 64 : (n > 67108864 ? 67108864 : n);
+  return new Limits(big, 65536, big, head, 1024, n);
+}
+
+// Does the parser accept `wire` as exactly the request `r`? (The round-trip check of the contracts.)
+function roundTripsRequest(wire: Bytes, r: Request): bool {
+  if (wire.length() > 1048576 || r.headers().count() > 65536 || r.trailers().count() > 65536) {
+    return true;
+  }
+  const p = parseRequest(wire, limitsFor(wire.length()));
+  return match (p) {
+    Done(q, used) => used == wire.length() && q.equals(r),
+    _ => false
+  };
+}
+
+// Does the parser accept `wire` as exactly the response `r`?
+function roundTripsResponse(wire: Bytes, r: Response): bool {
+  if (wire.length() > 1048576 || r.headers().count() > 65536 || r.trailers().count() > 65536) {
+    return true;
+  }
+  const p = parseResponseToEof(wire, limitsFor(wire.length()), r.isForHead());
+  return match (p) {
+    Done(q, used) => q.equals(r),
+    _ => false
+  };
+}
+
+// serializeRequestChunked(r, chunkSize): the request as bytes; a chunked body is split into chunks of at most
+// `chunkSize` bytes. ROUND-TRIP CONTRACT: for every request `r` the parser accepts the output (with limits that fit
+// it) and returns a request equal to `r`: parse(serialize(r)) == r. O(size).
+@Requires(chunkSize >= 1)
+@Ensures(roundTripsRequest(result, r))
+export function serializeRequestChunked(r: Request, chunkSize: usize): Bytes {
+  let out = new ByteBuilder();
+  out.appendString(methodName(r.method()));
+  out.appendString(" ");
+  out.appendString(r.target());
+  out.appendString(" ");
+  out.appendString(versionText(r.version()));
+  out.appendString("\r\n");
+  out.appendString(fieldsText(r.headers()));
+  out.appendString("\r\n");
+  if (r.isChunked()) {
+    out.appendBytes(chunkedBytes(r.body(), r.trailers(), chunkSize));
+  } else {
+    out.appendBytes(r.body());
+  }
+  return out.build();
+}
+
+// serializeRequest(r): the request as bytes (a chunked body in one chunk). The output starts with the request line
+// and ends with the last byte of the body; every line ends with CRLF. Round-trip contract as above. O(size).
+@Ensures(roundTripsRequest(result, r))
+export function serializeRequest(r: Request): Bytes {
+  const size = r.body().length();
+  return serializeRequestChunked(r, size == 0 ? 1 : size);
+}
+
+// serializeResponseChunked(r, chunkSize): the response as bytes; a chunked body is split into chunks of at most
+// `chunkSize` bytes; a bodyless response (HEAD, 1xx, 204, 304) has no body bytes. Round-trip contract: the parser
+// (`parseResponseToEof`, with `forHead` as in `r`) accepts the output and returns a response equal to `r`. O(size).
+@Requires(chunkSize >= 1)
+@Ensures(roundTripsResponse(result, r))
+export function serializeResponseChunked(r: Response, chunkSize: usize): Bytes {
+  let out = new ByteBuilder();
+  out.appendString(versionText(r.version()));
+  out.appendString(" ");
+  out.appendString(r.status().code().toString());
+  out.appendString(" ");
+  out.appendString(r.status().reason());
+  out.appendString("\r\n");
+  out.appendString(fieldsText(r.headers()));
+  out.appendString("\r\n");
+  if (!r.isBodyless()) {
+    if (r.isChunked()) {
+      out.appendBytes(chunkedBytes(r.body(), r.trailers(), chunkSize));
+    } else {
+      out.appendBytes(r.body());
+    }
+  }
+  return out.build();
+}
+
+// serializeResponse(r): the response as bytes (a chunked body in one chunk). Round-trip contract as above. O(size).
+@Ensures(roundTripsResponse(result, r))
+export function serializeResponse(r: Response): Bytes {
+  const size = r.body().length();
+  return serializeResponseChunked(r, size == 0 ? 1 : size);
+}
+
