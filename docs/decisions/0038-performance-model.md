@@ -57,6 +57,12 @@ the lever that unlocks the fastest one.
   each object. This is also the basis for `Shared<T>` between tasks.
 - **Uniqueness:** a COW check is hoisted out of loops, or removed where uniqueness is proved.
 - Value semantics cannot create cycles, so there is no cycle collector and no `weak`.
+- **Closure inlining and fusion** (project owner, 2026-10-14): an arrow function passed directly to an array API
+  method is inlined at that call, so there is no closure object and no indirect call per element. A chain of
+  `filter`/`map`/`find`/`some`/`every`/`reduce` with pure closures is fused into one loop with no intermediate
+  arrays. This is what Java streams give, without a `Stream<T>` type. Purity is a guaranteed fact, so fusion is
+  sound; the differential tests and translation validation (ADR-0032) cover it. Baseline before this step:
+  `filter → map → reduce` over 5 M ints is about 4x slower than the equivalent loop.
 
 ### 3. Layout
 
@@ -131,6 +137,7 @@ proof.
    - the fast allocator;
    - `nounwind`, `nonnull`/`noundef`, TBAA and purity attributes;
    - the defects being fixed now (`s = s + t`, result pairs, bulk byte conversion);
+   - closure inlining and fusion of array API chains (§2);
    - Java and Rust in the benchmarks.
 2. **With the verifier results (ADR-0036):** `nsw`/`nuw`, `range` and `llvm.assume` from
    `VERIFIED` facts; check removal and hoisting; the performance lint.
