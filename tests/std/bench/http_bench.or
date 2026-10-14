@@ -1,0 +1,178 @@
+// Throughput of the std:http parser and serializer on a corpus of realistic messages (not a test: run it by hand,
+// see docs/std.md "std:http"). Build in the production configuration (no contract checks, the default of
+// `orin compile`) and run:
+//     orin compile tests/std/bench/http_bench.or -o /tmp/http_bench.c && cc -O2 -w -I runtime /tmp/http_bench.c \
+//       runtime/orin_runtime.c platform/orin_platform.c -o /tmp/http_bench && /tmp/http_bench
+// Every row: bytes of messages parsed, wall time in ms, MB/s (1 MB = 1048576 bytes). "one chunk": each message is
+// fed in one call; "64-byte chunks": as a socket with small reads would deliver it; "1-byte chunks": worst case.
+import { Bytes, bytesFromString } from "std:bytes";
+import { Host, useClock } from "std:host";
+import { ClockGrant, nowMillis } from "std:time";
+import { Request, Response, ParseResult, NeedMore, Done, Failed, RequestParser, ResponseParser, defaultLimits, serializeRequest, serializeResponse }
+  from "std:http";
+
+function browser(): string {
+  return "GET /static/app/main.3f9a1c.js?v=20260101 HTTP/1.1\r\n"
+  + "Host: www.example.com\r\n"
+  + "Connection: keep-alive\r\n"
+  + "sec-ch-ua: \"Chromium\";v=\"126\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"126\"\r\n"
+  + "sec-ch-ua-mobile: ?0\r\n"
+  + "sec-ch-ua-platform: \"Linux\"\r\n"
+  + "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+  + "Accept: */*\r\n"
+  + "Sec-Fetch-Site: same-origin\r\n"
+  + "Sec-Fetch-Mode: no-cors\r\n"
+  + "Sec-Fetch-Dest: script\r\n"
+  + "Referer: https://www.example.com/dashboard/overview\r\n"
+  + "Accept-Encoding: gzip, deflate, br, zstd\r\n"
+  + "Accept-Language: en-US,en;q=0.9,de;q=0.8\r\n"
+  + "Cookie: session=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c; theme=dark; consent=1; _ga=GA1.2.1234567890.1700000000; csrftoken=abcdefghijklmnopqrstuvwxyz0123456789ABCDEF\r\n"
+  + "If-None-Match: \"3f9a1c-5e2b\"\r\n"
+  + "\r\n";
+}
+
+const CURL: string = "GET /health HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n";
+
+function api(): string {
+  const body = "{\"customer\":\"c-10234\",\"items\":[{\"sku\":\"A-1001\",\"qty\":2,\"price\":1999},{\"sku\":\"B-2002\",\"qty\":1,\"price\":4500}],\"currency\":\"EUR\",\"note\":\"leave at the door\"}";
+  return "POST /v1/orders HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-no\r\n"
+    + "Content-Type: application/json\r\nAccept: application/json\r\nUser-Agent: orders-client/2.1\r\nX-Request-Id: 7d2f0c1e-8b7a-4c55-9a3e-1f2d3c4b5a69\r\nContent-Length: "
+    + body.length.toString() + "\r\n\r\n" + body;
+}
+
+function upload(): string {
+  return "PUT /upload/part-0007 HTTP/1.1\r\nHost: files.example.com\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n"
+  + "100\r\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n"
+  + "100\r\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n"
+  + "0\r\nX-Checksum: 9f86d081884c7d659a2feaa0c55ad015\r\n\r\n";
+}
+
+function res_html(): string {
+  return "HTTP/1.1 200 OK\r\nServer: orin\r\nDate: Tue, 13 Oct 2026 12:00:00 GMT\r\nContent-Type: text/html; charset=utf-8\r\n"
+  + "Content-Length: 512\r\nCache-Control: max-age=3600, public\r\nETag: \"3f9a1c-5e2b\"\r\nVary: Accept-Encoding\r\nX-Content-Type-Options: nosniff\r\n"
+  + "Strict-Transport-Security: max-age=63072000; includeSubDomains\r\n\r\n"
+  + "<!doctype html><html><head><meta charset=\"utf-8\"><title>Orin</title></head><body><h1>Hello</h1><p>0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef</p></body></html>";
+}
+
+function repeatString(s: string, n: int): string {
+  let parts: string[] = [];
+  let i = 0;
+  while (i < n) {
+    parts.push(s);
+    i += 1;
+  }
+  return parts.join("");
+}
+
+// Feeds `wire` in pieces of `piece` bytes (0: the whole message); true when a request was completed.
+function parseOnce(wire: Bytes, piece: usize, limitsReuse: RequestParser): RequestParser {
+  let p = limitsReuse;
+  p.reset();
+  if (piece == 0) {
+    p.feed(wire);
+    return p;
+  }
+  let off: usize = 0;
+  while (off < wire.length() && !p.isDone() && !p.isFailed()) {
+    const end = off + piece < wire.length() ? off + piece : wire.length();
+    p.feed(wire.slice(off, end));
+    off = end;
+  }
+  return p;
+}
+
+function benchRequests(clock: ClockGrant, label: string, wires: Bytes[], rounds: int, piece: usize): void {
+  let total: int = 0;
+  let k: usize = 0;
+  while (k < wires.length) {
+    total += wires[k].length().toInt();
+    k += 1;
+  }
+  total = total * rounds;
+  let p = new RequestParser(defaultLimits());
+  const t0 = nowMillis(clock);
+  let r = 0;
+  let ok = 0;
+  while (r < rounds) {
+    let j: usize = 0;
+    while (j < wires.length) {
+      p = parseOnce(wires[j], piece, p);
+      if (p.isDone()) {
+        ok += 1;
+      }
+      j += 1;
+    }
+    r += 1;
+  }
+  const ms = nowMillis(clock) - t0;
+  report(label, total, ms, ok);
+}
+
+function benchResponses(clock: ClockGrant, label: string, wire: Bytes, rounds: int): void {
+  let p = new ResponseParser(defaultLimits(), false);
+  const t0 = nowMillis(clock);
+  let r = 0;
+  let ok = 0;
+  while (r < rounds) {
+    p.reset();
+    p.feed(wire);
+    if (p.isDone()) {
+      ok += 1;
+    }
+    r += 1;
+  }
+  const ms = nowMillis(clock) - t0;
+  report(label, wire.length().toInt() * rounds, ms, ok);
+}
+
+function report(label: string, bytes: int, ms: int, ok: int): void {
+  const t = ms < 1 ? 1 : ms;
+  const mbs10 = bytes * 10000 / t / 1048576;
+  console.log(label + ": " + bytes.toString() + " bytes in " + ms.toString() + " ms = " + (mbs10 / 10).toString() + "." + (mbs10 % 10).toString() + " MB/s (" + ok.toString() + " messages)");
+}
+
+function benchSerialize(clock: ClockGrant, label: string, q: Request, rounds: int): void {
+  const t0 = nowMillis(clock);
+  let r = 0;
+  let total: int = 0;
+  while (r < rounds) {
+    total += serializeRequest(q).length().toInt();
+    r += 1;
+  }
+  report(label, total, nowMillis(clock) - t0, rounds);
+}
+
+function run(clock: ClockGrant): void {
+  const browserMsg = bytesFromString(browser());
+  const curlMsg = bytesFromString(CURL);
+  const apiMsg = bytesFromString(api());
+  const uploadMsg = bytesFromString(upload());
+  const mix = [browserMsg, curlMsg, apiMsg, uploadMsg];
+  console.log("corpus: browser " + browserMsg.length().toString() + " B, curl " + curlMsg.length().toString() + " B, api " + apiMsg.length().toString()
+    + " B, upload " + uploadMsg.length().toString() + " B");
+  benchRequests(clock, "browser GET, one chunk      ", [browserMsg], 20000, 0);
+  benchRequests(clock, "curl GET, one chunk         ", [curlMsg], 50000, 0);
+  benchRequests(clock, "API POST (CL), one chunk    ", [apiMsg], 20000, 0);
+  benchRequests(clock, "chunked PUT, one chunk      ", [uploadMsg], 20000, 0);
+  benchRequests(clock, "mixed corpus, one chunk     ", mix, 10000, 0);
+  benchRequests(clock, "mixed corpus, 64-byte chunks", mix, 5000, 64);
+  benchRequests(clock, "mixed corpus, 1-byte chunks ", mix, 500, 1);
+  benchResponses(clock, "response 200 + 512 B body   ", bytesFromString(res_html()), 20000);
+  let p = new RequestParser(defaultLimits());
+  match (p.feed(apiMsg)) {
+    Done(req, used) => { benchSerialize(clock, "serialize API POST            ", req, 20000); },
+    NeedMore => { console.log("need more"); },
+    Failed(e) => { console.log(e.message); }
+  };
+}
+
+function main(host: Host): void {
+  useClock(host, clock => {
+    run(clock);
+  });
+}

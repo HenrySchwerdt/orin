@@ -1,0 +1,665 @@
+// Tests for std:http: every rejection rule, the request smuggling vectors, limits, responses and the state machine
+// API. Run with `orin test tests/std/http_reject_test.or` (contracts are checked by default) and with
+// `--no-contracts`. See tools/test_std.sh. Positions are 0-based byte offsets from the start of the message.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
+import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
+import { Request, Response, Limits, ParseResult, NeedMore, Done, Failed, Get, Http10, HttpReason, ParserFinished, RequestParser,
+  ResponseParser, defaultLimits, parseRequest, parseResponse, parseResponseToEof, reasonName, reasonText, versionText,
+  emptyHeaders, standardStatus, edgeAllowed, stateName, hexString, httpError } from "std:http";
+
+function bs(s: string): Bytes {
+  return bytesFromString(s);
+}
+
+function lim(startLine: usize, count: usize, line: usize, head: usize, chunkLine: usize, body: usize): Limits {
+  return new Limits(startLine, count, line, head, chunkLine, body);
+}
+
+function rep(s: string, n: usize): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    parts.push(s);
+    i += 1;
+  }
+  return parts.join("");
+}
+
+function failReq(why: string): Request {
+  fail(why);
+  return new Request(Get, "/", Http10, emptyHeaders(), emptyBytes(), emptyHeaders());
+}
+
+function failRes(why: string): Response {
+  fail(why);
+  return new Response(standardStatus(200), Http10, emptyHeaders(), emptyBytes(), emptyHeaders(), false);
+}
+
+function okReqWith(msg: string, l: Limits): Request {
+  const r = parseRequest(bs(msg), l);
+  return match (r) {
+    Done(q, used) => q,
+    NeedMore => failReq("NeedMore for: " + msg),
+    Failed(e) => failReq("refused: " + e.message + " for: " + msg)
+  };
+}
+
+function okReq(msg: string): Request {
+  return okReqWith(msg, defaultLimits());
+}
+
+function okRes(msg: string, forHead: bool): Response {
+  const r = parseResponseToEof(bs(msg), defaultLimits(), forHead);
+  return match (r) {
+    Done(q, used) => q,
+    NeedMore => failRes("NeedMore for: " + msg),
+    Failed(e) => failRes("refused: " + e.message + " for: " + msg)
+  };
+}
+
+// "NeedMore", "Done" or the name of the failure reason.
+function outcome(r: ParseResult<Request>): string {
+  return match (r) {
+    NeedMore => "NeedMore",
+    Done(q, used) => "Done",
+    Failed(e) => reasonName(e.reason)
+  };
+}
+
+function outcome2(r: ParseResult<Response>): string {
+  return match (r) {
+    NeedMore => "NeedMore",
+    Done(q, used) => "Done",
+    Failed(e) => reasonName(e.reason)
+  };
+}
+
+// The request must be refused with `reason` at byte `pos`.
+function expectFail(msg: string, reason: string, pos: usize): void {
+  expectFailWith(msg, defaultLimits(), reason, pos);
+}
+
+function expectFailWith(msg: string, l: Limits, reason: string, pos: usize): void {
+  const r = parseRequest(bs(msg), l);
+  match (r) {
+    Failed(e) => {
+      assertEqString(reasonName(e.reason), reason, "reason for: " + msg);
+      assertEqUsize(e.position, pos, "position for: " + msg);
+      assert(e.message.length > 0, "message");
+    },
+    NeedMore => { fail("NeedMore, expected " + reason + " for: " + msg); },
+    Done(q, used) => { fail("accepted, expected " + reason + " for: " + msg); }
+  };
+}
+
+function expectResFail(msg: string, forHead: bool, reason: string, pos: usize): void {
+  const r = parseResponseToEof(bs(msg), defaultLimits(), forHead);
+  match (r) {
+    Failed(e) => {
+      assertEqString(reasonName(e.reason), reason, "reason for: " + msg);
+      assertEqUsize(e.position, pos, "position for: " + msg);
+    },
+    NeedMore => { fail("NeedMore, expected " + reason + " for: " + msg); },
+    Done(q, used) => { fail("accepted, expected " + reason + " for: " + msg); }
+  };
+}
+
+function expectNeedMore(msg: string): void {
+  const r = parseRequest(bs(msg), defaultLimits());
+  match (r) {
+    NeedMore => { assert(true, ""); },
+    Failed(e) => { fail("refused: " + e.message + " for: " + msg); },
+    Done(q, used) => { fail("complete, expected NeedMore for: " + msg); }
+  };
+}
+
+const PRE: string = "GET / HTTP/1.1\r\nHost: a\r\n";
+const POSTPRE: string = "POST / HTTP/1.1\r\nHost: a\r\n";
+
+// ------------------------------------------------------------------------------- rejections: line syntax
+
+@Test
+function rejectsBareLfWhereCrlfIsRequired(): void {
+  expectFail("GET / HTTP/1.1\nHost: a\n\n", "BareLf", 14);
+  expectFail("GET / HTTP/1.1\r\nHost: a\n\r\n", "BareLf", 23);
+  expectFail("GET / HTTP/1.1\r\nHost: a\r\n\n", "BareLf", 25);
+  expectFail("GET / HTTP/1.1\r\nHo\nst: a\r\n\r\n", "BareLf", 18);
+  expectFail("GET / HTTP/1.1\r\nHost:\n a\r\n\r\n", "BareLf", 21);
+  expectFail("GET /\n HTTP/1.1\r\n", "BadTarget", 5);
+  expectFail("GE\nT / HTTP/1.1\r\n", "BadMethod", 2);
+}
+
+@Test
+function rejectsBareCr(): void {
+  expectFail("GET / HTTP/1.1\rHost: a\r\n\r\n", "BareCr", 15);
+  expectFail("GET / HTTP/1.1\r\nHost: a\rX\r\n\r\n", "BareCr", 24);
+  expectFail(PRE + "\rX", "BareCr", 26);
+  expectFail("GET / HTTP/1.1\r\nHo\rst: a\r\n\r\n", "MissingColon", 18);
+  expectFail("GET / HTTP/1.1\r\nHost: a\r\r\n\r\n", "BareCr", 24);
+  expectFail("GET / HTTP/1.1\r\nHost: a\r\n\r\r\n", "BareCr", 26);
+}
+
+@Test
+function rejectsObsFold(): void {
+  expectFail(PRE + " folded\r\n\r\n", "ObsFold", 25);
+  expectFail(PRE + "\tfolded\r\n\r\n", "ObsFold", 25);
+  expectFail("GET / HTTP/1.1\r\n Host: a\r\n\r\n", "ObsFold", 16);
+  expectFail("GET / HTTP/1.1\r\nHost: a\r\n  \r\n\r\n", "ObsFold", 25);
+  expectFail("GET / HTTP/1.1\r\nX: a\r\n b\r\nHost: a\r\n\r\n", "ObsFold", 22);
+}
+
+@Test
+function rejectsWhitespaceBeforeTheColon(): void {
+  expectFail("GET / HTTP/1.1\r\nHost : a\r\n\r\n", "SpaceBeforeColon", 20);
+  expectFail("GET / HTTP/1.1\r\nHost\t: a\r\n\r\n", "SpaceBeforeColon", 20);
+  expectFail("GET / HTTP/1.1\r\nHost  : a\r\n\r\n", "SpaceBeforeColon", 20);
+}
+
+@Test
+function rejectsInvalidTokenCharacters(): void {
+  expectFail("G@T / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 1);
+  expectFail("GET( / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 3);
+  expectFail(" GET / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 0);
+  expectFail("\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 0);
+  expectFail("GET\r\n", "BadMethod", 3);
+  expectFail("GE\x00T / HTTP/1.1\r\n", "BadMethod", 2);
+  expectFail("GET / HTTP/1.1\r\nHo(st: a\r\n\r\n", "BadHeaderName", 18);
+  expectFail("GET / HTTP/1.1\r\n: a\r\n\r\n", "BadHeaderName", 16);
+  expectFail("GET / HTTP/1.1\r\n\"Host\": a\r\n", "BadHeaderName", 16);
+  expectFail("GET / HTTP/1.1\r\nH\xe9st: a\r\n", "BadHeaderName", 17);
+  expectFail("GET / HTTP/1.1\r\nHost\r\n\r\n", "MissingColon", 20);
+  expectFail("GET / HTTP/1.1\r\nHo@st: a\r\n", "BadHeaderName", 18);
+  expectFail("GET / HTTP/1.1\r\nHost\x00: a\r\n", "BadHeaderName", 20);
+}
+
+@Test
+function rejectsControlCharactersInValuesAndTargets(): void {
+  expectFail(PRE + "X: a\x00b\r\n\r\n", "BadHeaderValue", 29);
+  expectFail(PRE + "X: a\x7fb\r\n\r\n", "BadHeaderValue", 29);
+  expectFail(PRE + "X: a\x01b\r\n\r\n", "BadHeaderValue", 29);
+  expectFail(PRE + "X: a\x0bb\r\n\r\n", "BadHeaderValue", 29);
+  expectFail(PRE + "X: a\x1fb\r\n\r\n", "BadHeaderValue", 29);
+  expectFail(PRE + "X: \x00\r\n\r\n", "BadHeaderValue", 28);
+  expectFail("GET /\x00 HTTP/1.1\r\n", "BadTarget", 5);
+  expectFail("GET /a\tb HTTP/1.1\r\n", "BadTarget", 6);
+  expectFail("GET /\xc3\xa9 HTTP/1.1\r\n", "BadTarget", 5);
+}
+
+@Test
+function rejectsBadVersions(): void {
+  expectFail("GET / HTTP/1.2\r\n\r\n", "UnsupportedVersion", 13);
+  expectFail("GET / HTTP/2.0\r\n\r\n", "UnsupportedVersion", 11);
+  expectFail("GET / HTTP/0.9\r\n\r\n", "UnsupportedVersion", 11);
+  expectFail("GET / http/1.1\r\n\r\n", "BadVersion", 6);
+  expectFail("GET / HTTP/1.1 \r\n\r\n", "BadVersion", 14);
+  expectFail("GET / HTTP/1.\r\n\r\n", "BadVersion", 13);
+  expectFail("GET / HTTP/11.1\r\n\r\n", "BadVersion", 12);
+  expectFail("GET / HTTP/1.x\r\n\r\n", "BadVersion", 13);
+  expectFail("GET / HTTP/1.1x\r\n\r\n", "BadVersion", 14);
+  expectFail("GET /\r\n\r\n", "BadVersion", 5);
+  expectFail("GET / \r\n\r\n", "BadVersion", 6);
+  expectFail("GET / HTTP\r\n\r\n", "BadVersion", 10);
+  expectFail("GET / HTTP/1.1 extra\r\n", "BadVersion", 14);
+}
+
+@Test
+function rejectsBadTargets(): void {
+  expectFail("GET  / HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
+  expectFail("GET foo HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
+  expectFail("GET /a#b HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
+  expectFail("GET * HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
+  expectFail("CONNECT /x HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 8);
+  expectFail("GET example.com:80 HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
+  expectFail("GET /a b HTTP/1.1\r\nHost: a\r\n\r\n", "BadVersion", 7);
+}
+
+@Test
+function enforcesTheHostRules(): void {
+  expectFail("GET / HTTP/1.1\r\n\r\n", "MissingHost", 16);
+  expectFail(PRE + "Host: b\r\n\r\n", "DuplicateHost", 25);
+  expectFail(PRE + "host: a\r\n\r\n", "DuplicateHost", 25);
+  expectFail("GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "BadHost", 16);
+  expectFail("GET / HTTP/1.1\r\nHost: a@b\r\n\r\n", "BadHost", 16);
+  expectFail("GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n", "DuplicateHost", 25);
+  assertEqString(okReq("GET / HTTP/1.1\r\nhost: example.org:8080\r\n\r\n").headers().get("Host").unwrap(), "example.org:8080", "lower-case name");
+  assertEqString(okReq("GET / HTTP/1.1\r\nHost:\r\n\r\n").headers().get("Host").unwrap(), "", "empty Host is legal");
+  assertEqString(okReq("GET / HTTP/1.1\r\nHost: [::1]:80\r\n\r\n").headers().get("Host").unwrap(), "[::1]:80", "IPv6 literal");
+}
+
+// --------------------------------------------------------------------------- smuggling vectors (RFC 9112 §6.3)
+
+@Test
+function smugglingContentLengthAndTransferEncoding(): void {
+  expectFail(POSTPRE + "Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n", "ContentLengthWithTransferEncoding", 73);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n", "ContentLengthWithTransferEncoding", 73);
+  // the classic CL.TE attack: the "smuggled" request must never be parsed as the next message
+  expectFail(POSTPRE + "Content-Length: 13\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /admin HTTP/1.1\r\nHost: a\r\n\r\n",
+    "ContentLengthWithTransferEncoding", 74);
+  expectFail("POST / HTTP/1.1\r\nHost: a\r\ncontent-length: 4\r\nTRANSFER-ENCODING: chunked\r\n\r\n", "ContentLengthWithTransferEncoding", 73);
+}
+
+@Test
+function smugglingDuplicateAndConflictingContentLength(): void {
+  expectFail(POSTPRE + "Content-Length: 4\r\nContent-Length: 4\r\n\r\nabcd", "DuplicateContentLength", 45);
+  expectFail(POSTPRE + "Content-Length: 4\r\nContent-Length: 5\r\n\r\nabcd", "DuplicateContentLength", 45);
+  expectFail(POSTPRE + "Content-Length: 4\r\ncontent-length: 4\r\n\r\nabcd", "DuplicateContentLength", 45);
+  expectFail(POSTPRE + "Content-Length: 4, 4\r\n\r\nabcd", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4,5\r\n\r\nabcd", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: -1\r\n\r\n", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: +4\r\n\r\nabcd", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4x\r\n\r\nabcd", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 0x4\r\n\r\nabcd", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 1e1\r\n\r\n", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length:\r\n\r\n", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4\x0b\r\n\r\nabcd", "BadHeaderValue", 43);
+  expectFail(POSTPRE + "Content-Length: 1000000000000000000\r\n\r\n", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 18446744073709551616\r\n\r\n", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 99999999999\r\n\r\n", "BodyTooLarge", 55);
+  // a Content-Length that is not repeated and has optional whitespace is fine
+  assertEqString(okReq(POSTPRE + "Content-Length: \t4 \t\r\n\r\nabcd").body().toRawString(), "abcd", "OWS around a valid value");
+}
+
+@Test
+function smugglingTransferEncodingVariants(): void {
+  expectFail(POSTPRE + "Transfer-Encoding : chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n", "SpaceBeforeColon", 43);
+  expectFail(POSTPRE + "Transfer-Encoding\t: chunked\r\n\r\n", "SpaceBeforeColon", 43);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked\r\n x\r\n\r\n", "ObsFold", 54);
+  expectFail(POSTPRE + "Transfer-Encoding:\r\n chunked\r\n\r\n", "UnsupportedTransferEncoding", 26);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", "DuplicateTransferEncoding", 54);
+  expectFail(POSTPRE + "Transfer-Encoding: gzip, chunked\r\n\r\n", "UnsupportedTransferEncoding", 26);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked, gzip\r\n\r\n", "UnsupportedTransferEncoding", 26);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked, chunked\r\n\r\n", "UnsupportedTransferEncoding", 26);
+  expectFail(POSTPRE + "Transfer-Encoding: identity\r\n\r\n", "UnsupportedTransferEncoding", 26);
+  expectFail(POSTPRE + "Transfer-Encoding: xchunked\r\n\r\n", "UnsupportedTransferEncoding", 26);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked \x00\r\n\r\n", "BadHeaderValue", 53);
+  expectFail("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "UnsupportedTransferEncoding", 45);
+  // a tab before the value and a different case are fine
+  assertEqString(okReq(POSTPRE + "transfer-ENCODING:\tCHUNKED\r\n\r\n3\r\nabc\r\n0\r\n\r\n").body().toRawString(), "abc", "case and tab");
+}
+
+@Test
+function smugglingChunkSizes(): void {
+  const te = POSTPRE + "Transfer-Encoding: chunked\r\n\r\n";
+  expectFail(te + "FFFFFFFFFFFFFFFFFFFF\r\n", "BodyTooLarge", 61);
+  expectFail(te + "FFFFFFFFFFFFFFFF\r\nx", "BodyTooLarge", 61);
+  expectFail(te + "100001\r\nx", "BodyTooLarge", 61);
+  expectFail(te + "7FFFFFFFFFFFFFFF\r\n", "BodyTooLarge", 61);
+  expectFail(te + "-1\r\n", "BadChunkSize", 56);
+  expectFail(te + "-0\r\n", "BadChunkSize", 56);
+  expectFail(te + "+5\r\nhello\r\n", "BadChunkSize", 56);
+  expectFail(te + "0x5\r\nhello\r\n", "BadChunkSize", 57);
+  expectFail(te + " 5\r\nhello\r\n", "BadChunkSize", 56);
+  expectFail(te + "5 5\r\nhello\r\n", "BadChunkSize", 58);
+  expectFail(te + "\r\n", "BadChunkSize", 56);
+  expectFail(te + "g\r\n", "BadChunkSize", 56);
+  expectFail(te + "5g\r\nhello\r\n", "BadChunkSize", 57);
+  expectFail(te + ";ext\r\n", "BadChunkSize", 56);
+  expectFail(te + "5\r\nhello\r\n-1\r\n", "BadChunkSize", 66);
+  expectFail(te + rep("0", 1030) + "5\r\n", "ChunkLineTooLong", 56 + 1024);
+  expectFail(te + "5;" + rep("x", 1030) + "\r\n", "ChunkLineTooLong", 56 + 1024);
+  expectNeedMore(te + "10\r\nonly part of it");
+  expectNeedMore(te + "5\r\nhello");
+  expectNeedMore(te + "5\r\nhello\r");
+  expectNeedMore(te + "0\r\n");
+  expectNeedMore(te + "0\r\nX: 1\r\n");
+}
+
+@Test
+function smugglingChunkFraming(): void {
+  const te = POSTPRE + "Transfer-Encoding: chunked\r\n\r\n";
+  expectFail(te + "5\r\nhelloXX\r\n", "BadChunkTerminator", 64);
+  expectFail(te + "5\r\nhello\n0\r\n\r\n", "BareLf", 64);
+  expectFail(te + "5\r\nhello\r0\r\n\r\n", "BareCr", 65);
+  expectFail(te + "5\n", "BareLf", 57);
+  expectFail(te + "5\rhello", "BareCr", 58);
+  expectFail(te + "5;a\x01b\r\n", "BadChunkExtension", 59);
+  expectFail(te + "5;a\x00\r\n", "BadChunkExtension", 59);
+  expectFail(te + "5;a\nb\r\n", "BareLf", 59);
+  expectFail(te + "5;a\rb\r\n", "BareCr", 60);
+  expectFail(te + "5 \x01\r\n", "BadChunkSize", 58);
+  expectFail(te + "0\r\n\n", "BareLf", 59);
+  expectFail(te + "0\r\n X: 1\r\n\r\n", "ObsFold", 59);
+  expectFail(te + "0\r\nX : 1\r\n\r\n", "SpaceBeforeColon", 60);
+  expectFail(te + "0\r\nX: a\nb\r\n\r\n", "BareLf", 63);
+  expectFail(te + "0\r\nX: a\x00\r\n\r\n", "BadHeaderValue", 63);
+  expectFail(te + "0\r\nContent-Length: 5\r\n\r\n", "ForbiddenTrailer", 59);
+  expectFail(te + "0\r\nTransfer-Encoding: chunked\r\n\r\n", "ForbiddenTrailer", 59);
+  expectFail(te + "0\r\nhost: b\r\n\r\n", "ForbiddenTrailer", 59);
+  expectFail(te + "0\r\nTrailer: X\r\n\r\n", "ForbiddenTrailer", 59);
+  expectFail(te + "0\r\nX: 1\r\n\rX", "BareCr", 66);
+}
+
+@Test
+function smuggledRequestAfterTheBodyIsTheNextMessageNotPartOfThisOne(): void {
+  const first = POSTPRE + "Content-Length: 5\r\n\r\nhello";
+  const evil = "GET /admin HTTP/1.1\r\nHost: a\r\n\r\n";
+  const wire = bs(first + evil);
+  let p = new RequestParser(defaultLimits());
+  const r = p.feed(wire);
+  match (r) {
+    Done(q, used) => {
+      assertEqUsize(used, first.length, "exactly the declared bytes");
+      assertEqString(q.body().toRawString(), "hello", "body");
+      assertEqString(wire.slice(used, wire.length()).toRawString(), evil, "the rest is untouched");
+    },
+    NeedMore => { fail("need more"); },
+    Failed(e) => { fail(e.message); }
+  };
+  // chunked: the bytes after the last chunk are not consumed either
+  const c = POSTPRE + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+  let p2 = new RequestParser(defaultLimits());
+  match (p2.feed(bs(c + evil))) {
+    Done(q, used) => { assertEqUsize(used, c.length, "chunked: exactly the message"); },
+    NeedMore => { fail("need more"); },
+    Failed(e) => { fail(e.message); }
+  };
+}
+
+// ----------------------------------------------------------------------------------------------- limits
+
+@Test
+function limitsOnTheRequestLine(): void {
+  const l = lim(16, 100, 8192, 65536, 1024, 1048576);
+  expectFailWith("GET /abc HTTP/1.1\r\nHost: a\r\n\r\n", l, "StartLineTooLong", 16);
+  expectFailWith("GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\n", l, "StartLineTooLong", 16);
+  expectFailWith("GETGETGETGETGETGETGETGETGET / HTTP/1.1\r\n", l, "StartLineTooLong", 16);
+  expectFailWith("GETGETGETGETGETG / HTTP/1.1\r\n", l, "StartLineTooLong", 16);
+  expectFailWith("GET /aaaaaaaaaaaaa HTTP/1.1\r\n", l, "StartLineTooLong", 16);
+  expectFailWith("GET /aaaaaaaaaaaa HTTP/1.1\r\n", l, "StartLineTooLong", 16);
+  assertEqString(outcome(parseRequest(bs("GETGETGETGETGETG\r\n"), l)), "BadMethod", "a 16-byte method then CR is a bad method, not a long line");
+  const ok = parseRequest(bs("GET /ab HTTP/1.1\r\nHost: a\r\n\r\n"), l);
+  assertEqString(outcome(ok), "Done", "a line of exactly 16 bytes is accepted");
+  const r2 = parseRequest(bs("GET /a HTTP/1.0\r\n\r\n"), l);
+  assertEqString(outcome(r2), "Done", "shorter line");
+}
+
+@Test
+function limitsOnHeaderLines(): void {
+  const l = lim(8192, 100, 16, 65536, 1024, 1048576);
+  expectFailWith(PRE + "X: 12345678901234\r\n\r\n", l, "HeaderLineTooLong", 25 + 16);
+  expectFailWith(PRE + "X:                    1\r\n\r\n", l, "HeaderLineTooLong", 25 + 16);
+  expectFailWith(PRE + "Long-Header-Name-Over-Limit: 1\r\n\r\n", l, "HeaderLineTooLong", 25 + 16);
+  assertEqString(outcome(parseRequest(bs(PRE + "X: 1234567890123\r\n\r\n"), l)), "Done", "exactly 16 bytes");
+  // trailing blanks count: they are part of the line
+  expectFailWith(PRE + "X: 12            \r\n\r\n", l, "HeaderLineTooLong", 25 + 16);
+}
+
+@Test
+function limitsOnTheHeaderCount(): void {
+  const l = lim(8192, 2, 8192, 65536, 1024, 1048576);
+  assertEqString(outcome(parseRequest(bs(PRE + "A: 1\r\n\r\n"), l)), "Done", "two headers");
+  expectFailWith(PRE + "A: 1\r\nB: 2\r\n\r\n", l, "TooManyHeaders", 25 + 6);
+  const lt = lim(8192, 1, 8192, 65536, 1024, 1048576);
+  expectFailWith("POST / HTTP/1.1\r\nHost: a\r\nA: 1\r\n\r\n", lt, "TooManyHeaders", 26);
+  // trailers have their own count: two headers (Host, Transfer-Encoding) and then two trailers fit, a third does not
+  const head = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+  assertEqString(outcome(parseRequest(bs(head + "0\r\nA: 1\r\nB: 2\r\n\r\n"), l)), "Done", "two trailers");
+  expectFailWith(head + "0\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n", l, "TooManyHeaders", 56 + 3 + 6 + 6);
+}
+
+@Test
+function limitsOnTheHeaderSection(): void {
+  const l = lim(8192, 100, 8192, 64, 1024, 1048576);
+  // a head of exactly 64 bytes (including the empty line) is accepted: 25 + "P: " + 32 + CRLF + CRLF
+  const pad = rep("v", 32);
+  assertEqString(outcome(parseRequest(bs(PRE + "P: " + pad + "\r\n\r\n"), l)), "Done", "exactly 64 bytes");
+  expectFailWith(PRE + "P: " + pad + "v\r\n\r\n", l, "HeadersTooLarge", 64);
+  expectFailWith(PRE + "P: " + rep("v", 1000) + "\r\n\r\n", l, "HeadersTooLarge", 64);
+  expectFailWith("GET / HTTP/1.1\r\n" + rep("X: 1\r\n", 20) + "\r\n", l, "HeadersTooLarge", 64);
+}
+
+@Test
+function limitsOnTheTrailerSection(): void {
+  const l = lim(8192, 100, 8192, 64, 1024, 1048576);
+  const head = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+  // the trailer section has its own budget of 64 bytes, counted from its first byte
+  const t1 = head + "0\r\n" + "T: " + rep("v", 57) + "\r\n\r\n";
+  match (parseRequest(bs(t1), l)) {
+    Done(q, used) => { assertEqUsize(q.trailers().count(), 1, "trailer within budget"); },
+    NeedMore => { fail("need more"); },
+    Failed(e) => { fail("trailers: " + e.message); }
+  };
+  const t2 = head + "0\r\n" + "T: " + rep("v", 58) + "\r\n\r\n";
+  expectFailWith(t2, l, "HeadersTooLarge", head.length + 3 + 64);
+}
+
+@Test
+function limitsOnTheBody(): void {
+  const l = lim(8192, 100, 8192, 65536, 1024, 10);
+  assertEqString(okReqWith("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n0123456789", l).body().toRawString(), "0123456789", "exactly the limit");
+  expectFailWith("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 11\r\n\r\n01234567890", l, "BodyTooLarge", 26 + 20);
+  const te = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+  assertEqUsize(okReqWith(te + "a\r\n0123456789\r\n0\r\n\r\n", l).body().length(), 10, "chunked, exactly the limit");
+  expectFailWith(te + "b\r\n01234567890\r\n0\r\n\r\n", l, "BodyTooLarge", 56);
+  expectFailWith(te + "5\r\n01234\r\n6\r\n", l, "BodyTooLarge", 56 + 3 + 7);
+  expectFailWith(te + "5\r\n01234\r\n5\r\n01234\r\n1\r\nx\r\n", l, "BodyTooLarge", 56 + 10 + 10);
+  const zero = lim(8192, 100, 8192, 65536, 1024, 0);
+  assertEqString(outcome(parseRequest(bs("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\n"), zero)), "Done", "a body limit of 0 allows empty bodies");
+  expectFailWith("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx", zero, "BodyTooLarge", 26 + 19);
+}
+
+@Test
+function limitsOnTheChunkLine(): void {
+  const l = lim(8192, 100, 8192, 65536, 8, 1048576);
+  const te = "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+  assertEqString(okReqWith(te + "00000005\r\nhello\r\n0\r\n\r\n", l).body().toRawString(), "hello", "8 digits");
+  expectFailWith(te + "000000005\r\nhello\r\n0\r\n\r\n", l, "ChunkLineTooLong", 56 + 8);
+  expectFailWith(te + "5;abcdefg\r\nhello\r\n0\r\n\r\n", l, "ChunkLineTooLong", 56 + 8);
+  assertEqString(okReqWith(te + "5;abcdef\r\nhello\r\n0\r\n\r\n", l).body().toRawString(), "hello", "exactly 8 bytes with an extension");
+  expectFailWith(te + "5 \t \t \t \t\r\nhello\r\n0\r\n\r\n", l, "ChunkLineTooLong", 56 + 8);
+}
+
+// ----------------------------------------------------------------------------------------- responses
+
+@Test
+function parsesResponses(): void {
+  const r = okRes("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello", false);
+  assertEq(r.status().code(), 200, "code");
+  assertEqString(r.status().reason(), "OK", "reason");
+  assertEqString(r.body().toRawString(), "hello", "body");
+  assertEqString(r.headers().get("content-type").unwrap(), "text/plain", "header");
+  assertEqBool(r.isBodyless(), false, "has a body");
+  const nf = okRes("HTTP/1.0 404 Not Found At All\r\nServer: x\r\n\r\n", false);
+  assertEq(nf.status().code(), 404, "404");
+  assertEqString(nf.status().reason(), "Not Found At All", "reason with blanks");
+  assertEqString(versionText(nf.version()), "HTTP/1.0", "version");
+  const e = okRes("HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n", false);
+  assertEqString(e.status().reason(), "", "empty reason phrase");
+  const sp = okRes("HTTP/1.1 200  two  \r\nContent-Length: 0\r\n\r\n", false);
+  assertEqString(sp.status().reason(), " two  ", "the reason phrase is kept byte for byte");
+  const obs = okRes("HTTP/1.1 200 caf\xc3\xa9\r\nContent-Length: 0\r\n\r\n", false);
+  assertEqString(obs.status().reason(), "caf\xc3\xa9", "obs-text in the reason");
+  const ch = okRes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;e\r\nabc\r\n2\r\nde\r\n0\r\nX-T: 1\r\n\r\n", false);
+  assertEqString(ch.body().toRawString(), "abcde", "chunked response");
+  assertEqString(ch.trailers().get("x-t").unwrap(), "1", "trailer");
+  assertEqBool(ch.isChunked(), true, "isChunked");
+}
+
+@Test
+function responsesWithoutABody(): void {
+  const h = okRes("HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n", true);
+  assertEqBool(h.isBodyless(), true, "HEAD response");
+  assertEqBool(h.isForHead(), true, "forHead");
+  assertEqString(h.headers().get("content-length").unwrap(), "1234", "the length header is kept");
+  const c = okRes("HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\nETag: x\r\n\r\n", false);
+  assertEqBool(c.isBodyless(), true, "304");
+  const n = okRes("HTTP/1.1 204 No Content\r\n\r\n", false);
+  assertEqBool(n.isBodyless(), true, "204");
+  const i = okRes("HTTP/1.1 100 Continue\r\n\r\n", false);
+  assertEqBool(i.isBodyless(), true, "100");
+  assertEq(i.status().code(), 100, "100 code");
+  const hc = okRes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", true);
+  assertEqUsize(hc.body().length(), 0, "HEAD response with chunked and no chunks");
+  expectResFail("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", false, "ForbiddenFraming", 25 + 19);
+  expectResFail("HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n", false, "ForbiddenFraming", 25 + 28);
+  expectResFail("HTTP/1.1 101 Switching\r\nContent-Length: 5\r\n\r\n", false, "ForbiddenFraming", 24 + 19);
+}
+
+@Test
+function responseBodyUntilClose(): void {
+  const msg = "HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody until the connection closes";
+  assertEqString(outcome2(parseResponse(bs(msg), defaultLimits(), false)), "NeedMore", "without EOF the message is not complete");
+  const r = okRes(msg, false);
+  assertEqString(r.body().toRawString(), "body until the connection closes", "close-delimited body");
+  const e = okRes("HTTP/1.1 200 OK\r\n\r\n", false);
+  assertEqUsize(e.body().length(), 0, "empty close-delimited body");
+  // a body limit applies
+  const l = lim(8192, 100, 8192, 65536, 1024, 4);
+  const r2 = parseResponseToEof(bs("HTTP/1.1 200 OK\r\n\r\n12345"), l, false);
+  assertEqString(outcome2(r2), "BodyTooLarge", "limit on a close-delimited body");
+  const r3 = parseResponseToEof(bs("HTTP/1.1 200 OK\r\n\r\n1234"), l, false);
+  assertEqString(outcome2(r3), "Done", "exactly the limit");
+}
+
+@Test
+function responseEofHandling(): void {
+  let p = new ResponseParser(defaultLimits(), false);
+  assertEqString(outcome2(p.feed(bs("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"))), "NeedMore", "partial body");
+  assertEqString(outcome2(p.atEof()), "UnexpectedEof", "EOF inside a Content-Length body");
+  let q = new ResponseParser(defaultLimits(), false);
+  assertEqString(outcome2(q.feed(bs("HTTP/1.1 200 OK\r\nServer"))), "NeedMore", "partial head");
+  assertEqString(outcome2(q.atEof()), "UnexpectedEof", "EOF inside the head");
+  let c = new ResponseParser(defaultLimits(), false);
+  assertEqString(outcome2(c.feed(bs("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n"))), "NeedMore", "partial chunked");
+  assertEqString(outcome2(c.atEof()), "UnexpectedEof", "EOF inside a chunked body");
+  let d = new ResponseParser(defaultLimits(), false);
+  assertEqString(outcome2(d.feed(bs("HTTP/1.0 200 OK\r\n\r\nxyz"))), "NeedMore", "close-delimited");
+  assertEqBool(d.isDone(), false, "not done before EOF");
+  assertEqString(outcome2(d.atEof()), "Done", "EOF ends a close-delimited body");
+  assertEqBool(d.isDone(), true, "done");
+  assertEqString(outcome2(d.atEof()), "ParserFinished", "second EOF");
+  let i = new ResponseParser(defaultLimits(), false);
+  assertEqBool(i.isIdle(), true, "idle");
+  assertEqString(outcome2(i.atEof()), "UnexpectedEof", "EOF before any byte");
+  let r = new RequestParser(defaultLimits());
+  assertEqString(outcome(r.feed(bs("GET / HT"))), "NeedMore", "partial request");
+  assertEqString(outcome(r.atEof()), "UnexpectedEof", "a request is never complete at EOF");
+}
+
+@Test
+function rejectsBadStatusLines(): void {
+  expectResFail("HTTP/1.1 200\r\n\r\n", false, "BadStatusLine", 12);
+  expectResFail("HTTP/1.1 20 OK\r\n\r\n", false, "BadStatusCode", 11);
+  expectResFail("HTTP/1.1 600 X\r\n\r\n", false, "BadStatusCode", 9);
+  expectResFail("HTTP/1.1 099 X\r\n\r\n", false, "BadStatusCode", 9);
+  expectResFail("HTTP/1.1 000 X\r\n\r\n", false, "BadStatusCode", 9);
+  expectResFail("HTTP/1.1  200 X\r\n\r\n", false, "BadStatusCode", 9);
+  expectResFail("HTTP/1.1 2000 X\r\n\r\n", false, "BadStatusLine", 12);
+  expectResFail("HTTP/1.1 abc X\r\n\r\n", false, "BadStatusCode", 9);
+  expectResFail("HTTP/1.1 +200 X\r\n\r\n", false, "BadStatusCode", 9);
+  expectResFail("HTTP/1.1\r\n\r\n", false, "BadStatusLine", 8);
+  expectResFail("HTTP/1.1 200 O\x00K\r\n\r\n", false, "BadStatusLine", 14);
+  expectResFail("HTTP/1.1 200 OK\n\r\n", false, "BareLf", 15);
+  expectResFail("HTTP/1.1 200 OK\rX", false, "BareCr", 16);
+  expectResFail("HTTP/2 200 OK\r\n\r\n", false, "UnsupportedVersion", 5);
+  expectResFail("HTTP/1.2 200 OK\r\n\r\n", false, "UnsupportedVersion", 7);
+  expectResFail("http/1.1 200 OK\r\n\r\n", false, "BadVersion", 0);
+  expectResFail("HTTP/1.1200 OK\r\n\r\n", false, "BadStatusLine", 8);
+  expectResFail("GET / HTTP/1.1\r\n\r\n", false, "BadVersion", 0);
+}
+
+@Test
+function responsesUseTheSameFramingRules(): void {
+  expectResFail("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n", false, "ContentLengthWithTransferEncoding", 17 + 19 + 28);
+  expectResFail("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx", false, "DuplicateContentLength", 17 + 19);
+  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding : chunked\r\n\r\n", false, "SpaceBeforeColon", 17 + 17);
+  expectResFail("HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n", false, "ObsFold", 17 + 6);
+  expectResFail("HTTP/1.1 200 OK\nX: a\r\n\r\n", false, "BareLf", 15);
+  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", false, "UnsupportedTransferEncoding", 17);
+  expectResFail("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", false, "UnsupportedTransferEncoding", 17 + 28);
+  expectResFail("HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n", false, "BodyTooLarge", 17 + 25);
+  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFF\r\n", false, "BodyTooLarge", 17 + 28 + 2 + 5);
+  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxx", false, "BadChunkTerminator", 17 + 28 + 2 + 3 + 1);
+  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n", false, "ForbiddenTrailer", 17 + 28 + 2 + 3);
+  // a response may carry any Host field: it is not a request
+  const r = okRes("HTTP/1.1 200 OK\r\nHost: a\r\nHost: b\r\nContent-Length: 0\r\n\r\n", false);
+  assertEqUsize(r.headers().countOf("host"), 2, "Host is not special in a response");
+}
+
+// ----------------------------------------------------------------------------------- state machine API
+
+@Test
+function transitionRelation(): void {
+  let s = 0;
+  while (s < 23) {
+    let t = 0;
+    let out = 0;
+    while (t < 23) {
+      if (edgeAllowed(s, t)) {
+        out += 1;
+        assert(s != t, "no self edges");
+        assert(s < 21, "no edge out of DONE or ERROR");
+      }
+      t += 1;
+    }
+    assert(s >= 21 || out >= 1, "every live state has an outgoing edge");
+    assert(stateName(s).length > 0, "name");
+    s += 1;
+  }
+  assertEqBool(edgeAllowed(6, 7), true, "HDR_LINE -> HDR_NAME");
+  assertEqBool(edgeAllowed(7, 6), false, "HDR_NAME does not go back");
+  assertEqBool(edgeAllowed(11, 21), true, "HEAD_END_LF -> DONE");
+  assertEqBool(edgeAllowed(16, 6), true, "CHUNK_SIZE_LF -> HDR_LINE (trailers)");
+  assertEqBool(edgeAllowed(0, 21), false, "METHOD cannot jump to DONE");
+  assertEqString(stateName(0), "METHOD", "name 0");
+  assertEqString(stateName(22), "ERROR", "name 22");
+}
+
+@Test
+function parserReportsItsStateAndPosition(): void {
+  let p = new RequestParser(defaultLimits());
+  assertEqString(p.stateName(), "METHOD", "initial");
+  p.feed(bs("GET"));
+  assertEqString(p.stateName(), "METHOD", "inside the method");
+  p.feed(bs(" /"));
+  assertEqString(p.stateName(), "TARGET", "inside the target");
+  p.feed(bs(" HTTP/1.1\r"));
+  assertEqString(p.stateName(), "START_LF", "after CR");
+  p.feed(bs("\nHo"));
+  assertEqString(p.stateName(), "HDR_NAME", "inside a header name");
+  p.feed(bs("st:"));
+  assertEqString(p.stateName(), "HDR_OWS", "after the colon");
+  p.feed(bs(" a"));
+  assertEqString(p.stateName(), "HDR_VALUE", "inside a value");
+  p.feed(bs("\r"));
+  assertEqString(p.stateName(), "HDR_LF", "after the value's CR");
+  p.feed(bs("\n"));
+  assertEqString(p.stateName(), "HDR_LINE", "at a line start");
+  p.feed(bs("\r"));
+  assertEqString(p.stateName(), "HEAD_END_LF", "empty line CR");
+  assertEqUsize(p.consumed(), 26, "consumed");
+  p.feed(bs("\n"));
+  assertEqString(p.stateName(), "DONE", "done");
+  assertEqUsize(p.consumed(), 27, "consumed all");
+}
+
+@Test
+function hexStringFormatsChunkSizes(): void {
+  assertEqString(hexString(0), "0", "0");
+  assertEqString(hexString(5), "5", "5");
+  assertEqString(hexString(10), "a", "10");
+  assertEqString(hexString(255), "ff", "255");
+  assertEqString(hexString(256), "100", "256");
+  assertEqString(hexString(4095), "fff", "4095");
+  assertEqString(hexString(1048576), "100000", "1 MiB");
+}
+
+function finished(): HttpReason {
+  return ParserFinished;
+}
+
+@Test
+function errorMessagesNameTheRuleAndThePosition(): void {
+  const r = parseRequest(bs("GET / HTTP/1.1\r\nHost : a\r\n\r\n"), defaultLimits());
+  match (r) {
+    Failed(e) => {
+      assertEqString(e.message, "whitespace between the field name and the colon at byte 20", "message");
+      assertEqString(reasonText(e.reason), "whitespace between the field name and the colon", "reasonText");
+    },
+    NeedMore => { fail("need more"); },
+    Done(q, used) => { fail("accepted"); }
+  };
+  const h = httpError(7, finished());
+  assertEqUsize(h.position, 7, "httpError position");
+  assertEqString(reasonName(h.reason), "ParserFinished", "httpError reason");
+}
