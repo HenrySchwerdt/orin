@@ -428,6 +428,7 @@ the conformance suite. Extending `Check.lean` with a linear "open set" is a smal
 
 `platform/orin_platform.{h,c}` is the closed list of primitives through which the runtime touches the OS and
 libc (700 code lines, 1,100 lines including contracts and comments; the budget of 1,000 counts code lines, ADR-0030). Each function has an ACSL-style block (`requires`,
+libc (budget: 1,000 code lines, contracts and comments excluded). Each function has an ACSL-style block (`requires`,
 `ensures`, `assigns`; pseudo-locations `\stdout`, `\stdin`, `\fs`, `\process`). **No tool has checked these
 blocks as ACSL** (Frama-C/WP was not tried); they are the written specification and the intended input for R4.
 

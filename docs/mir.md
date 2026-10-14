@@ -18,7 +18,11 @@ discipline of a file handle. New builtins: the openers `BGrantFs` / `BGrantProce
 (`[host]`), `BGrantUnder` (`[fs, path]`), `BGrantReadOnly` (`[fs]`), `BGrantArgsOnly` (`[proc]`), the closer `BGrantRevoke`.
 `BFileOpen` is now `[fs, path, mode]`, and every std I/O builtin (`BFsReadFile`, `BFsWriteFile`, `BFsExists`,
 `BProcessArgs`, `BIoShell`, `BIoReadBytes`, `BIoReadLine`, `BIoWriteStdout`, `BTimeNowMillis`) takes its grant as the
-first argument. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
+first argument. Network (ADR-0033, same version, additive): `Listener` and `Stream` are `MHandle` too. Openers `BGrantNet`
+(`[host]`), `BGrantListen` / `BGrantConnect` (`[net, ..]`), `BNetListen` (`[net, addr, port, backlog, opt]`), `BNetAccept`
+(`[listener, timeout, opt]`), `BNetConnect` (`[net, host, port, timeout, opt]`); closer `BNetClose` (a Listener or Stream; a
+grant is closed by `BGrantRevoke`); uses `BNetStatus`, `BNetPort`, `BNetNow`, `BNetRecv`, `BNetSend`, `BNetShutdown`,
+`BNetPeer`, `BNetResolve` (handle first) and `BNetErrorText`. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
 
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant

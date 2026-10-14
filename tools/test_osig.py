@@ -65,7 +65,7 @@ def main():
         want = f.read()
     check(g1 == want, "graph of the demo package equals tests/osig/demo.graph.json (run with --update after a deliberate change)")
     snap = json.loads(g1)
-    check(snap["schema"] == "osig/0.1" and snap["package"] == "demo" and snap["hash"].startswith("h62:"), "schema, package, hash")
+    check(snap["schema"] == "osig/0.2" and snap["package"] == "demo" and snap["hash"].startswith("h62:"), "schema, package, hash")
 
     # ---- 2. determinism -------------------------------------------------------------------
     rc, g2, _ = run(orin, ["graph", "tests/osig/demo"])
@@ -174,7 +174,7 @@ def main():
           and "-> CALLS/direct [MUST] acme:audit::record" in txt, "text: call path explained from main through checkout to record")
     rc, js, err = run(orin, ["diff", "--base", "tests/osig/accept/base", "--head", "tests/osig/accept/head", "--format=json"])
     d = json.loads(js)
-    check(d["schema"] == "osig-diff/0.1" and d["differences"] is True, "json: schema")
+    check(d["schema"] == "osig-diff/0.2" and d["differences"] is True, "json: schema")
     check([c["id"] for c in d["changedSymbols"]] == ["acme:orders::checkout"]
           and d["changedSymbols"][0]["aspects"] == ["signature"]
           and d["changedSymbols"][0]["before"] == "function checkout(qty: int): int", "json: signature change")
@@ -253,6 +253,9 @@ def main():
         ("run", "~io:Process.Spawn", "MUST", "CONTROL"), ("run", "~io:Stdio.Read", "MUST", "INPUT"),
         ("run", "~io:Console.Write", "MUST", "OUTPUT"), ("scoped", "~io:Fs.Narrow", "MUST", "CONTROL"),
         ("main", "~io:Host.Acquire", "MUST", "CONTROL"),
+        ("netio", "~io:Net.Bind", "MUST", "CONTROL"), ("netio", "~io:Net.Accept", "MAY", "INPUT"),
+        ("netio", "~io:Net.Connect", "MUST", "CONTROL"), ("netio", "~io:Net.Narrow", "MUST", "CONTROL"),
+        ("netio", "~io:Stream.Read", "MAY", "INPUT"), ("netio", "~io:Stream.Write", "MAY", "OUTPUT"),   # inside closures: MAY
     ]
     for w in want_io:
         check(w in perf, "PERFORMS_IO edge %s" % (w,))

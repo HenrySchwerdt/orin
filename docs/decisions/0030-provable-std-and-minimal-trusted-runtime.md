@@ -32,7 +32,7 @@ translation validation). Everything else is Orin and is proved or checked:
 
 | Layer | Language | Contents | Assurance target |
 |---|---|---|---|
-| L0 | C, closed list, ≤ 1,000 lines | syscalls, raw memory, formatting floats | every function contract-verified (CBMC/Frama-C); I/O functions validate handle identity and scope |
+| L0 | C, closed list, ≤ 1,000 code lines (contracts and comments excluded; the budget limits trusted code, not its specification) | syscalls, raw memory, formatting floats | every function contract-verified (CBMC/Frama-C); I/O functions validate handle identity and scope |
 | L1 core | Orin core dialect | object model, RC/COW, arrays, strings, maps, traps | refinement against the Lean memory machine |
 | L2 std | safe Orin | everything else, including all protocols | MIR-verified; contract and class standard; contract quality warnings clean; mutation kill rate gate |
 

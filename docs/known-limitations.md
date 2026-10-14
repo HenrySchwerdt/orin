@@ -51,3 +51,10 @@
   `exit` need no grant (ambient output). Path scopes are checked lexically and through symbolic links at the time of the
   operation (no protection against races, hard links or mounts); `shell` is outside every grant; a denied
   operation that cannot return an `Err` traps; the network and environment families are reserved only.
+- Effect inference (Stage B, `orin effects`, docs/capabilities.md): the summary is a sound over-approximation *per operation
+  family*, not per resource (it does not say which file), and it is about the program text: native code, FFI, the OS and
+  spawned children are outside it. Function values of unknown origin (a struct field, an array element, a call result), interface
+  methods without an implementation and unresolved calls are `Unknown.*` effects, so a module that stores callbacks in data
+  structures needs `Unknown` in its `[effects]` allowance. A closure counts for the module that writes it. A program that does
+  not type-check has no summary. The `[effects]` policy is enforced by `orin check` / `compile` / `mir` / `verify`, not by the
+  language server.

@@ -29,8 +29,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
-   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033) and the server loop on
-     top of it
+   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033, **done**: blocking TCP, `examples/http_server.or`); concurrency needs ADR-0017
    - `std:mcp`, JSX/`std:html`
 4. **Complete the Lean proofs:**
    - shape check in the verifier and the model (finding F-shape);
@@ -109,7 +108,9 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   `main(host: Host)`, grants as resource handles derived by scope functions and narrowed without amplification, the
   std I/O functions take their grant first, enforcement in the runtime / platform layer (`ORIN_DENY`, path scopes),
   `PERFORMS_IO` edges in the OSIG. Open questions for the owner before the std I/O freeze are listed at the end
-  of ADR-0027. Stages B-D (effect inference, library adapters, lineage, strict policy) stay with their phases.
+  of ADR-0027. **Stage B is done** (transitive effect inference, `orin effects`, OSIG `MAY_PERFORM` / `osig/0.2`, effect
+  sections of `orin diff`, hover / MCP, the minimal `[effects]` policy of `orin.toml`: [capabilities.md](capabilities.md));
+  Stages C-D (library adapters / generic boundaries, lineage, strict policy D4, Lean D6) stay with their phases.
 - **Freeze, in two stages (ADR-0016 amendment):**
   1. **Language freeze** once the "next" items are in. Syntax and semantics then change only
      through an ADR, and the compiler rewrite (step 2) starts.
@@ -175,7 +176,9 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   (`tools/contract_mutation.py --min-kill-rate`) per module, and no regression of `VERIFIED`
   contracts (`orin verify --contracts` results may not turn `UNKNOWN`/`REFUTED`). **Capability gate
   (planned):** only `loader/sources` and the output module may have `PERFORMS_IO` edges (ADR-0021 effect
-  analysis, checked by `orin diff` / `orin effects`).
+  analysis, checked by `orin diff` / `orin effects`). The effect summary of `compiler/` shows the real set of modules
+  (loader, analysis, tools, lsp, mcp, testing, vc, driver; docs/capabilities.md), which is what an `[effects]` policy for the
+  compiler would allow.
 
 ### 2a. Diagnostics and CLI polish (directly after the rewrite)
 Goal (project owner, 2026-10-13): hints and CLI tooling that are a pleasure to use, built on
@@ -263,9 +266,10 @@ What each phase delivers:
   - still open from the phase: stable feature IDs and the feature manifest (ticket 4), MIR source mapping
     (ticket 2, with the compiler rewrite); the gate's "affected features" needs ticket 4
 - **Phase 2:**
-  - ~~capability handles (language part)~~ (done: ADR-0027; primitive `PERFORMS_IO` edges only, no transitive effects yet)
-  - effect inference and transitive fixpoint
-  - policy checker, `orin effects`
+  - ~~capability handles (language part)~~ (done: ADR-0027; primitive `PERFORMS_IO` edges)
+  - ~~effect inference and transitive fixpoint~~ (done: Stage B, ADR-0037 D2, `MAY_PERFORM` edges, [capabilities.md](capabilities.md))
+  - ~~`orin effects`~~ (done); policy checker: the minimal `[effects]` allowance per module is done (E0473, E0474); the strict
+    policies of ADR-0037 D4 (semantic boundaries, lineage) are open
 - **Phase 3:**
   - field lineage
   - control-dependence information flow

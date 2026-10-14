@@ -78,7 +78,7 @@ grants at once with `useHost`, pass grants as arguments to helper functions, or 
 | Process | `ProcessGrant` | `Process.Args` (INPUT), `Process.Spawn` (`shell`, CONTROL); narrowing `argsOnly` removes Spawn | |
 | Stdio | `StdioGrant` | `Stdio.Read` (`readLine`, `readBytes`), `Stdio.Write` (`writeStdout`) | INPUT / OUTPUT |
 | Clock | `ClockGrant` | `Clock.Now` | INPUT |
-| Network | `NetGrant` | **reserved**: `Net.Bind`, `Net.Accept`, `Net.Connect` (CONTROL), `Stream.Read` (INPUT), `Stream.Write` (OUTPUT), exactly the operations of ADR-0021 Feasibility. No `std:net` exists; `TyGrant(5)`, the policy name `net` and the family bit are reserved so that Stage B adds the module and the platform operations without a new mechanism | |
+| Network | `NetGrant` | **implemented by ADR-0033** (was reserved): `Net.Bind`, `Net.Accept`, `Net.Connect` (CONTROL), `Stream.Read` (INPUT), `Stream.Write` (OUTPUT), exactly the operations of ADR-0021 Feasibility. No `std:net` exists; `TyGrant(5)`, the policy name `net` and the family bit are reserved so that Stage B adds the module and the platform operations without a new mechanism | |
 | Environment | -- | no `std:env` exists. Reserved name `Env.Get` (INPUT) under the process family decision of the owner | |
 
 **D4. `main()` without `host` has no authority: a compile error, not a runtime denial.** Every I/O function's first
@@ -179,7 +179,8 @@ New node kind `Effect` (compiler-owned, id `~io:<Operation>`, `sig` = `<DIRECTIO
 `PERFORMS_IO` from the *enclosing function* of a call site to the Effect, `via` = direction (`INPUT`, `OUTPUT`,
 `CONTROL`), evidence `MUST` for a direct call (`MAY` inside a closure body, like `CALLS`). Edges exist for the
 primitive builtins, for the std scope functions (`withFile`, `withUnder`, `useFs`, ...: `Fs.Open`, `Fs.Narrow`,
-`Host.Acquire`) and for `console.*` / `exit` (grant `ambient`). Not yet: transitive effect summaries (Stage B), data-flow
+`Host.Acquire`) and for `console.*` / `exit` (grant `ambient`). Transitive effect summaries (Stage B) are implemented: `MAY_PERFORM`
+edges of `osig/0.2` and `orin effects` ([capabilities.md](../capabilities.md)). Not yet: data-flow
 lineage, the grant chain, runtime events. **Absence of a `PERFORMS_IO` edge is not proof that a function performs no
 I/O**: a call through a function value (`~unknown`) or into a callee outside the analysed package can hide one.
 

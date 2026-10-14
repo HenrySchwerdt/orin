@@ -17,7 +17,8 @@ API table (`compiler/mcp/apitable.or`).
 | `std:bytes` | Orin, `stdlib/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
 | `std:utf8` | Orin, `stdlib/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
 | `std:collections` | Orin, `stdlib/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
-| `std:http` | Orin, `stdlib/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; no sockets (ADR-0033 later); ADR-0030 |
+| `std:http` | Orin, `stdlib/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
+| `std:net` | Orin, `stdlib/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:taskcore` | Orin, `stdlib/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
 | `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`; see docs/concurrency.md |
@@ -58,7 +59,7 @@ useArgsOnly(proc, p => ...)        // `args` but no `shell`
 ```
 
 Families (ADR-0027): `FsGrant` (`std:fs`), `ProcessGrant` (`std:process`: `args`, `shell`), `StdioGrant` (`std:io`),
-`ClockGrant` (`std:time`: `nowMillis`); a network family is reserved (no `std:net` yet). **Ambient, no grant:**
+`ClockGrant` (`std:time`: `nowMillis`), `NetGrant` (`std:net`, ADR-0033; `useNet(host, ...)`). **Ambient, no grant:**
 `console.log`, `console.error` and `exit` (a library without grants can therefore still write to stdout / stderr: see
 ADR-0027 D5). **Host policy:** by default every grant is what the OS process has; `ORIN_DENY=fs,process,...` (families
 `fs process stdio clock net all`) denies families: an operation that returns a `Result` returns `Err("... denied by
@@ -628,7 +629,66 @@ checked at run time and by tests; `orin verify --contracts` does not cover strin
 * The round-trip contract calls the parser inside an `@Ensures`; that is allowed because the parser is pure, but the
   checked build then parses every serialized message once more.
 
-### What a server needs from ADR-0033
+## std:net (ADR-0033): blocking TCP
+
+```ts
+import { Host, useNet } from "std:host";
+import { useListener, useAccepted, useConnection, useListen, useConnect, recv, sendAll, StreamReader, resolve } from "std:net";
+
+function main(host: Host): void {
+  useNet(host, net => {                                    // the root NetGrant (ORIN_DENY=net: every operation refused)
+    useListen(net, "127.0.0.1", 8080, l => {               // narrowed: may listen on exactly 127.0.0.1:8080
+      useListener(l, "127.0.0.1", 8080, 64, ln => {        // Err(NetError) if refused, in use, ...
+        useAccepted(ln, 1000, (s, peer) => {               // Err(timeout) if nobody came within 1 s
+          const r = recv(s, 4096, 1000);                   // RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError
+          sendAll(s, ..., 1000);                           // all bytes, whole-call deadline
+        });
+      });
+    });
+    useConnect(net, "*.example.com", 443, 443, c => {      // narrowed: only names below example.com, port 443
+      useConnection(c, "api.example.com", 443, 2000, s => { ... });
+    });
+  });
+}
+```
+
+| Function | Meaning |
+|---|---|
+| `useNet / withNet(host, body)` (`std:host`) | the root `NetGrant` (may listen and connect anywhere the host policy allows) |
+| `useListen / withListen(net, addr, port, body)` | narrowed grant: listen on exactly `addr:port` (an address literal; port 0 = any) |
+| `useConnect / withConnect(net, hostPattern, portLo, portHi, body)` | narrowed grant: connect to / resolve names matching `"*"`, `"*.sfx"` or an exact text, on those ports |
+| `useListener / withListener(net, addr, port, backlog, body: (Listener) => ..)` | bind (SO_REUSEADDR), run body, close; `Err(NetError)` |
+| `useAccepted / withAccepted(ln, timeoutMs, body: (Stream, Peer) => ..)` | accept (TCP_NODELAY), run body, close the stream; `Err` on timeout (`isTimeout`) |
+| `useConnection / withConnection(net, host, port, timeoutMs, body: (Stream) => ..)` | connect, run body, close |
+| `useListenerNet`, `useConnectionBeside` | variants whose body also receives the `NetGrant` / the `Listener` again (a closure cannot capture a handle): client and server in one process |
+| `recv(s, maxBytes, timeoutMs): RecvResult` | one wait, 1..min(maxBytes, 64 KiB) bytes, one copy into a fresh `u8[]` (never one string per byte) |
+| `send(s, data, timeoutMs)` / `sendAll(s, data, timeoutMs)` | one attempt (partial write reported) / all bytes, deadline for the whole call |
+| `shutdownWrite(s)` | half-close (FIN); a graceful close is this, a bounded drain with `recv`, then the scope ends |
+| `StreamReader(cap)`: `readExact(s, n, ms)`, `readUntil(s, delim, limit, ms)`, `readSome`, `buffered`, `unread`, `take` | read-ahead buffer next to the stream (a stream cannot be stored); results `Filled | FillClosed | FillLimit | FillTimeout | FillError`; at most `cap` bytes are ever buffered, `readUntil` receives at most `limit - buffered` bytes at a time; the ms is a deadline for the whole call |
+| `nowMillis(s)` | monotonic clock via a live stream (deadlines without a clock grant) |
+| `resolve(net, name): Result<string[], NetError>` | numeric addresses; the grant's scope must cover `name` |
+| `Peer { host, port }`, `portOf(ln)`, `isDenied / isTimeout / isReset(e)` | values |
+
+**Security properties.** *Statically* (checker, MIR verifier): every network function needs a `NetGrant` / `Listener` /
+`Stream` first (E0470 missing, E0471 wrong family; this now holds for any function whose first parameter is a grant);
+`Listener` and `Stream` are resources: not storable, copyable, returnable or capturable (E0450-E0452), closed on every path
+(verifier); the raw primitives are in the internal `std:fsraw` (E0301). *At run time* (L0 checks before any system call,
+CBMC-verified: recv / send buffer bounds, narrowing never widens, refusal before any syscall): handle identity (magic, kind,
+live), `ORIN_DENY=net`, the scope of the grant (listen address and port, connect host pattern and port range), mandatory
+timeouts (0..3,600,000 ms), partial writes reported, `recv` never writes past its capacity (and the runtime clamps it to
+64 KiB), no `SIGPIPE`; the runtime traps on a forged, stale, closed or wrong-kind handle. *Not at all:* DNS rebinding (the
+scope is checked against the host text the program supplies), the OS resolver's own timeout, bandwidth, number of
+connections, a process that bypasses the runtime (native code, ADR-0021 "Native threat model"), TOCTOU on the host's
+networking configuration.
+
+**Server demo** (`examples/http_server.or`, `tools/test_net.sh`): `GET /health`, `POST /echo`, request limits (line 2048,
+50 headers, head 16 KiB, body 64 KiB), a deadline for the whole request, idle and send timeouts, 100 requests per
+connection, graceful close after an error answer. It listens on loopback only through a grant narrowed to that address.
+One connection at a time (no tasks, ADR-0017): a slow client holds the server until a deadline passes. Indicative
+throughput on the loopback, one keep-alive connection, sequential requests from a Python client: about 20,000 requests/s
+(single core, verbose logging on).
+
+### What a server needs from ADR-0033 (all of it is now provided; this was the list that shaped the API)
 
 The parser and serializer are transport-agnostic: a server loop is `recv` -> `feed` -> handle -> `serialize` -> `send`.
 What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it *well* and *safely*:

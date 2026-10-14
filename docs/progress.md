@@ -30,7 +30,8 @@ _Updated: 2026-10-13_
 | Packages: `orin.toml`, architecture rules, API snapshots | done |
 | std:path/json/time/graph | done |
 | Provable std layer 1 (ADR-0030 §3): `std:bytes`, `std:utf8`, `std:collections` | done: pure Orin, best-known algorithms (B-tree maps, 4-ary heap, table-driven UTF-8 DFA, ring deque), 24 invariants / 16 `@Requires` / 291 `@Ensures`, 94 `@Test`, 60-mutant check and differential tests against executable specs (`tools/test_std.sh --mutate`); generic `Set`/`SortedMap<K,V>`/comparator queue blocked by language limits (docs/std.md) |
-| `std:http`, the pure part (ADR-0030 §3 "protocols"): HTTP/1.1 request and response parser, serializer | done: incremental, smuggling-safe (every ambiguity refused with reason and position), limits as parameters, explicit state machine in the invariants, round-trip contract; 34 invariants / 49 `@Requires` / 131 `@Ensures`, 72 `@Test`, split-at-every-byte, differential and fuzz tests (40,000 fuzz iterations), 41-mutant check; no sockets (ADR-0033 pending) |
+| `std:http`, the pure part (ADR-0030 §3 "protocols"): HTTP/1.1 request and response parser, serializer | done: incremental, smuggling-safe (every ambiguity refused with reason and position), limits as parameters, explicit state machine in the invariants, round-trip contract; 34 invariants / 49 `@Requires` / 131 `@Ensures`, 72 `@Test`, split-at-every-byte, differential and fuzz tests (40,000 fuzz iterations), 41-mutant check; sockets in `std:net` (ADR-0033) |
+| `std:net` (ADR-0033): blocking TCP on L0 primitives with contracts and CBMC harnesses, `NetGrant` / `Listener` / `Stream` resources, `examples/http_server.or` | done: loopback tests on Linux and macOS (`tools/test_net.sh`), slowloris deadline, scope refusals, `ORIN_DENY=net`; one connection at a time (ADR-0017) |
 | Interfaces (ADR-0019) | done |
 | Fixed-width integers (`i8`..`u64`, `isize`, `usize`; 128-bit deferred, E0431) and template-literal interpolation (ADR-0022) | done |
 | Built-in annotations `@Test` (`orin test`, `std:test`), `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) | done |
@@ -39,6 +40,8 @@ _Updated: 2026-10-13_
 | Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. Stages B-D (effect inference, library adapters, lineage, policy gates) not started |
 | Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): `std:task` (scope / spawn / join, bounded channels, grants moved into tasks, `parallelMap`), L0 threads and monitors, one temporary C interface with a porting table to R3 | done; C parts `TESTED_ONLY` (ThreadSanitizer, ASan + UBSan, stress); no `async` / `await`, cancellation, deadlock detection or M:N scheduler; concurrent HTTP server waits for `std:net` |
 | Incremental analysis | not started |
+| Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. **Stage B done** (transitive effect inference, `orin effects`, OSIG `MAY_PERFORM`, `[effects]` policy; docs/capabilities.md). Stages C-D (library adapters, lineage, strict policy gates) not started |
+| Concurrency (ADR-0017), incremental analysis | not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |

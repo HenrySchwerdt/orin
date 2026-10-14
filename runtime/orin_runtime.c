@@ -859,7 +859,7 @@ static size_t strlen_(const char *s) {
  * Authority is checked at every operation: the family policy (ORIN_DENY, read once by orin_cap_host_root), the
  * read-only flag and, for the file system, the path scope. Denial: an operation that returns a Result reports
  * Err("... denied ..."); every other operation traps ("capability denied ..."). */
-enum { GK_HOST = 0, GK_FS = 1, GK_PROCESS = 2, GK_STDIO = 3, GK_CLOCK = 4 };
+enum { GK_HOST = 0, GK_FS = 1, GK_PROCESS = 2, GK_STDIO = 3, GK_CLOCK = 4, GK_NET = 5, GK_LISTENER = 6, GK_STREAM = 7 };
 enum { GR_SLOTS = 256, CAP_PATH = 4096 };
 enum { DEN_POLICY = 100001, DEN_SCOPE = 100002, DEN_RDONLY = 100003, DEN_RESOLVE = 100004 };
 #define GRANT_TAG ((int64_t)1 << 40)
@@ -874,13 +874,16 @@ typedef struct {
     size_t slen;
     char *rscope;  /* the same with every symbolic link resolved */
     size_t rlen;
+    orin_platform_net net; /* net family (ADR-0033): the L0 record of a NetGrant / Listener / Stream */
+    int port;              /* listener: the bound port; stream: the peer port */
+    char peer[72];         /* stream: numeric peer address */
 } Grant;
 static __thread Grant g_grants[GR_SLOTS]; /* per task: a handle is only meaningful in the task that made it */
 static unsigned g_deny;                    /* written once by orin_cap_host_root before any task exists */
 static uint64_t cap_tid(void) { return orin_platform_thread_id() & 0x3fffff; }
 
 static const char *kind_name(int k) {
-    return k == GK_FS ? "fs" : k == GK_PROCESS ? "process" : k == GK_STDIO ? "stdio" : k == GK_CLOCK ? "clock" : "host";
+    return k == GK_FS ? "fs" : k == GK_PROCESS ? "process" : k == GK_STDIO ? "stdio" : k == GK_CLOCK ? "clock" : k >= GK_NET ? "net" : "host";
 }
 
 static const char *den_text(int code) {
@@ -1023,6 +1026,7 @@ int64_t orin_cap_args_only(int64_t proc) { return orin_cap_narrow(proc, 2, NULL)
 
 void orin_cap_revoke(int64_t h) {
     Grant *g = grant_ref(h, -1);
+    if (g->kind >= GK_NET) orin_platform_net_close(&g->net);
     orin_platform_free(g->scope);
     orin_platform_free(g->rscope);
     g->scope = g->rscope = NULL;
@@ -1280,6 +1284,161 @@ void orin_file_write_line(int64_t h, OrinObj *s) {
 void orin_file_flush(int64_t h) {
     FileSlot *f = file_slot(h);
     if (f->mode != ORIN_PLATFORM_STREAM_READ) orin_platform_stream_flush(f->s);
+}
+
+/* ---------------------------------------------------------------- network (ADR-0033)
+ * NetGrant (kind 5), Listener (6) and Stream (7) are grant-table handles like the other grants: generation-checked, so a
+ * forged, stale, closed or wrong-kind handle traps. The scope, the policy bit (ORIN_DENY=net) and the socket handling live
+ * in the L0 record (`orin_platform_net`) and are checked by L0 before any system call; a refusal is the code EPERM
+ * (reported as Err by std:net). An opener returns the handle or the NEGATED error code (as orin_file_open). */
+enum { NET_BUF = 65536 };
+static char g_netbuf[NET_BUF]; /* the bulk buffer between the u8[] arrays and L0 (single-threaded) */
+
+int64_t orin_cap_net(int64_t host) {
+    (void)grant_ref(host, GK_HOST);
+    Grant *g = grant_new(GK_NET);
+    orin_platform_net *n = &g->net;
+    n->magic = ORIN_PLATFORM_NET_MAGIC, n->kind = ORIN_PLATFORM_NET_GRANT, n->can = ORIN_PLATFORM_NET_LISTEN | ORIN_PLATFORM_NET_CONNECT;
+    n->fd = -1, n->deny = (g_deny & ORIN_PLATFORM_FAM_NET) != 0;
+    for (int i = 0; i < 2; i++) n->sc[i].hl = 1, n->sc[i].h[0] = '*', n->sc[i].lo = 0, n->sc[i].hi = 65535;
+    return grant_handle(g);
+}
+
+/* narrowing: what = LISTEN (host:port) or CONNECT (pattern, lo..hi). A request outside the parent's scope yields a grant
+ * that reaches nothing; a malformed request (bad pattern or range) too. */
+static int64_t net_narrow(int64_t parent, unsigned what, OrinObj *host, int64_t lo, int64_t hi) {
+    Grant *p = grant_ref(parent, GK_NET);
+    Grant *g = grant_new(GK_NET);
+    int rc = lo < 0 || hi > 65535 || lo > hi ? ORIN_PLATFORM_EINVAL
+                                              : orin_platform_net_narrow(&p->net, what, orin_str_data(host), (size_t)orin_str_len(host),
+                                                                         (int)lo, (int)hi, &g->net);
+    if (rc) {
+        g->net = p->net;
+        g->net.can = 0;
+    }
+    return grant_handle(g);
+}
+int64_t orin_cap_listen(int64_t net, OrinObj *addr, int64_t port) { return net_narrow(net, ORIN_PLATFORM_NET_LISTEN, addr, port, port); }
+int64_t orin_cap_connect(int64_t net, OrinObj *pat, int64_t lo, int64_t hi) { return net_narrow(net, ORIN_PLATFORM_NET_CONNECT, pat, lo, hi); }
+
+static int64_t net_done(Grant *g, int rc) { /* an opener's result: the handle, or the negated code with the slot freed */
+    if (rc == 0) return grant_handle(g);
+    g->live = 0;
+    return -(int64_t)rc;
+}
+
+int64_t orin_net_listen(int64_t gh, OrinObj *addr, int64_t port, int64_t backlog, int64_t opt) {
+    Grant *p = grant_ref(gh, GK_NET), *l = grant_new(GK_LISTENER);
+    if (port < 0 || port > 65535 || backlog < 1 || backlog > 4096) return net_done(l, ORIN_PLATFORM_EINVAL);
+    int bound = 0, rc = orin_platform_tcp_listen(&p->net, orin_str_data(addr), (size_t)orin_str_len(addr), (int)port, (int)backlog,
+                                                 (int)opt, &l->net, &bound);
+    l->port = bound;
+    return net_done(l, rc);
+}
+
+int64_t orin_net_accept(int64_t lh, int64_t timeout_ms, int64_t opt) {
+    Grant *l = grant_ref(lh, GK_LISTENER), *s = grant_new(GK_STREAM);
+    if (timeout_ms < 0 || timeout_ms > ORIN_PLATFORM_NET_MAXMS) return net_done(s, ORIN_PLATFORM_EINVAL);
+    int rc = orin_platform_tcp_accept(&l->net, (int)timeout_ms, (int)opt, &s->net, s->peer, sizeof s->peer, &s->port);
+    return net_done(s, rc);
+}
+
+int64_t orin_net_connect(int64_t gh, OrinObj *host, int64_t port, int64_t timeout_ms, int64_t opt) {
+    Grant *p = grant_ref(gh, GK_NET), *s = grant_new(GK_STREAM);
+    if (port < 0 || port > 65535 || timeout_ms < 0 || timeout_ms > ORIN_PLATFORM_NET_MAXMS) return net_done(s, ORIN_PLATFORM_EINVAL);
+    int rc = orin_platform_tcp_connect(&p->net, orin_str_data(host), (size_t)orin_str_len(host), (int)port, (int)timeout_ms, (int)opt, &s->net);
+    s->port = (int)port;
+    size_t n = (size_t)orin_str_len(host);
+    n = n < sizeof s->peer - 1 ? n : sizeof s->peer - 1;
+    orin_platform_mem_copy(s->peer, orin_str_data(host), n), s->peer[n] = 0;
+    return net_done(s, rc);
+}
+
+/* 0 for an open handle, else the code of the failed open (a handle <= 0 is the negated code). */
+int64_t orin_net_status(int64_t h) {
+    if (h > 0) {
+        (void)grant_ref(h, -1);
+        return 0;
+    }
+    return h < 0 && h > -100000 ? -h : ORIN_PLATFORM_EINVAL;
+}
+
+void orin_net_close(int64_t h) {
+    if (h <= 0) return; /* a failed open: nothing to release */
+    Grant *g = grant_ref(h, -1);
+    if (g->kind != GK_LISTENER && g->kind != GK_STREAM) orin_trap("invalid capability grant (forged, revoked, or of the wrong kind)");
+    orin_platform_net_close(&g->net);
+    g->live = 0;
+}
+
+int64_t orin_net_port(int64_t lh) { return grant_ref(lh, GK_LISTENER)->port; }
+
+int64_t orin_net_now(int64_t h) {
+    Grant *g = grant_ref(h, -1);
+    if (g->kind < GK_NET) orin_trap("invalid capability grant (forged, revoked, or of the wrong kind)");
+    return orin_platform_monotonic_millis();
+}
+
+/* Result<u8[], int>: Ok(1..min(cap, 64 KiB) bytes) or Err(code: NET_EOF / TIMEOUT / RESET / errno). One copy from the
+ * L0 buffer into a fresh array (a u8 element is an 8-byte slot, ADR-0022). */
+OrinObj *orin_net_recv(int64_t sh, uint64_t cap, int64_t timeout_ms) {
+    Grant *s = grant_ref(sh, GK_STREAM);
+    size_t n = 0, want = cap < NET_BUF ? (size_t)cap : NET_BUF;
+    int rc = timeout_ms < 0 || timeout_ms > ORIN_PLATFORM_NET_MAXMS ? ORIN_PLATFORM_EINVAL
+                                                                      : orin_platform_stream_recv(&s->net, g_netbuf, want, (int)timeout_ms, &n);
+    if (rc != 0 || n == 0 || n > want) return orin_variant1(1, 0, (uint64_t)(rc ? rc : ORIN_PLATFORM_EINVAL));
+    OrinObj *a = orin_array_new(n, 0);
+    for (size_t i = 0; i < n; i++) orin_array_push(a, (uint64_t)(unsigned char)g_netbuf[i]);
+    return orin_variant1(0, 1, ORIN_SLOT(a));
+}
+
+/* Result<usize, int>: sends from data[off .. off+len) (at most 64 KiB per call); Ok(bytes handed to the OS), Err(code). */
+OrinObj *orin_net_send(int64_t sh, OrinObj *data, uint64_t off, uint64_t len, int64_t timeout_ms) {
+    Grant *s = grant_ref(sh, GK_STREAM);
+    OrinArray *a = (OrinArray *)data;
+    if (data->kind != ORIN_K_ARRAY || off > a->len || len > a->len - off) orin_trap("net send: byte range out of bounds");
+    size_t n = len < NET_BUF ? (size_t)len : NET_BUF, sent = 0;
+    for (size_t i = 0; i < n; i++) g_netbuf[i] = (char)a->items[off + i];
+    int rc = timeout_ms < 0 || timeout_ms > ORIN_PLATFORM_NET_MAXMS ? ORIN_PLATFORM_EINVAL
+                                                                      : orin_platform_stream_send(&s->net, g_netbuf, n, (int)timeout_ms, &sent);
+    return rc ? orin_variant1(1, 0, (uint64_t)rc) : orin_variant1(0, 0, (uint64_t)sent);
+}
+
+int64_t orin_net_shutdown(int64_t sh, int64_t how) {
+    return orin_platform_net_shutdown(&grant_ref(sh, GK_STREAM)->net, (int)how);
+}
+
+/* "addr:port", an IPv6 address in brackets */
+OrinObj *orin_net_peer(int64_t sh) {
+    Grant *s = grant_ref(sh, GK_STREAM);
+    char b[104], num[20];
+    size_t n = 0, pl = strlen_(s->peer), k = orin_platform_fmt_i64(num, s->port);
+    int v6 = 0;
+    for (size_t i = 0; i < pl; i++) v6 |= s->peer[i] == ':';
+    if (v6) b[n++] = '[';
+    orin_platform_mem_copy(b + n, s->peer, pl), n += pl;
+    if (v6) b[n++] = ']';
+    b[n++] = ':';
+    orin_platform_mem_copy(b + n, num, k), n += k;
+    return orin_str_new(b, n);
+}
+
+/* Result<string, int>: the numeric addresses of a name, one per line */
+OrinObj *orin_net_resolve(int64_t gh, OrinObj *name) {
+    Grant *g = grant_ref(gh, GK_NET);
+    size_t n = 0;
+    int rc = orin_platform_dns_resolve(&g->net, orin_str_data(name), (size_t)orin_str_len(name), g_netbuf, 4096, &n);
+    if (rc) return orin_variant1(1, 0, (uint64_t)rc);
+    return orin_variant1(0, 1, ORIN_SLOT(orin_str_new(g_netbuf, n)));
+}
+
+OrinObj *orin_net_error_text(int64_t code) {
+    const char *t = code == ORIN_PLATFORM_EPERM ? "permission denied: outside the granted network scope, or denied by the host policy (ORIN_DENY)"
+                    : code == ORIN_PLATFORM_NET_EOF ? "connection closed by the peer"
+                    : code == ORIN_PLATFORM_NET_TIMEOUT ? "timed out"
+                    : code == ORIN_PLATFORM_NET_RESET ? "connection reset"
+                    : code > 0 && code < 1000 ? orin_platform_error_message((int)code) : "network error";
+    return orin_str_new(t, strlen_(t));
 }
 
 OrinObj *orin_process_args(int64_t gh) {

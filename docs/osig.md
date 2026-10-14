@@ -3,7 +3,7 @@
 The Orin Software Intelligence Graph is the semantic engine's view of one compile: symbols, modules,
 calls, imports, implementations, type references and contract clauses, each with a stable id, a source
 span and (for edges) an evidence class. `orin graph` exports it, `orin diff` compares two of them and
-explains the difference. Design and rules: [ADR-0023](decisions/0023-osig-schema-v0.1.md) (schema),
+explains the difference. Design and rules: [ADR-0023](decisions/0023-osig-schema-v0.1.md) (schema, versioning),
 [ADR-0020](decisions/0020-verifiable-software-roadmap.md) D2 (it is the existing engine grown, not a
 second one). Source: `compiler/analysis/osig*.or`.
 
@@ -29,11 +29,11 @@ orin diff --base <package-dir | entry.or | snapshot.json> --head <package-dir | 
 `orin api --check` is unchanged: it stays the small, reviewed public-API contract (full signature lines
 of exported symbols). `orin diff` covers everything else (call/import/type edges, impact).
 
-## Snapshot shape (`osig/0.1`)
+## Snapshot shape (`osig/0.2`)
 
 ```json
 {
-"schema": "osig/0.1",
+"schema": "osig/0.2",
 "package": "demo",
 "hash": "h62:0123456789abcdef",
 "nodes": [
@@ -54,7 +54,26 @@ closures, contract clauses).
 `entry` marks entry points: `main`, exported functions, exported public methods and constructors.
 
 **Edge kinds:** `DEFINES`, `HAS_FIELD`, `HAS_CONTRACT`, `IMPORTS` (module to module), `IMPLEMENTS`,
-`REFERENCES_TYPE`, `CALLS`.
+`REFERENCES_TYPE`, `CALLS`, `PERFORMS_IO` (a primitive I/O call site, ADR-0027), `MAY_PERFORM` (the transitive effect summary,
+`osig/0.2`, below).
+
+**Schema history** (ADR-0023 versioning: additive changes bump the minor version, readers ignore what they do not know, a
+reader refuses another major): `osig/0.1` the first schema; `osig/0.2` adds the edge kind `MAY_PERFORM` and the edge field
+`next` (present on `MAY_PERFORM` edges only, so every other edge line is unchanged). `orin diff` reads every `osig/0.*`
+snapshot; against a snapshot older than 0.2 the effect sections are skipped ("not compared").
+
+**Effects (`MAY_PERFORM`, ADR-0037 D2, [capabilities.md](capabilities.md)):** for every function, method, constructor and class
+(field initialisers) one edge per primitive effect it may perform *transitively*, to the compiler-owned `Effect` node
+(`~io:Fs.ReadFile`, `sig` = `INPUT; grant: FsGrant`), or to `~unknown` for an effect whose target is not known. `via` is the
+direction (`INPUT` / `OUTPUT` / `CONTROL`), for `~unknown` the kind (`Unknown.FunctionValue`, `Unknown.Callback`,
+`Unknown.Interface`, `Unknown.Unresolved`). `evidence`: `MUST` a primitive call written in the function's body, `MAY`
+inherited / in a closure / through an implementation, `UNKNOWN` for `~unknown`. `span`: the call in the function's body that
+starts the explanation path (the primitive call itself for MUST). `next`: the function the effect is inherited from ("" for
+a MUST effect, or when only library code lies between); following `next` along the edges with the same `dst` and `via`
+reconstructs the explanation path inside the snapshot, which `orin diff` does. A pure function has no `MAY_PERFORM` edge; every
+`PERFORMS_IO` edge has a `MAY_PERFORM` edge from the same function; the summaries are closed under `CALLS` edges
+(`tools/test_effects.py` asserts both on four programs). Effect nodes exist for every effect that occurs, also one that only
+library code performs.
 
 **Evidence:** `MUST` (static call/definition in the body), `MAY` (possible: inside a closure body, a
 function used as a value, an implementation of an interface method that an interface call may reach),
@@ -82,7 +101,7 @@ Sections (text, JSON `osig-diff/0.1` and HTML carry the same content):
    signature once the name is erased and the same owner. Confidence `high` (unique, same callees),
    `medium` (unique), `low` (ambiguous). Never asserted as identity: the symbols stay listed as removed
    and added. A rename combined with a signature change is not detected.
-4. **added / removed edges**: `CALLS`, `IMPORTS`, `IMPLEMENTS`, `REFERENCES_TYPE`.
+4. **added / removed edges**: `CALLS`, `IMPORTS`, `IMPLEMENTS`, `REFERENCES_TYPE` (`MAY_PERFORM` has its own section, 7).
 5. **new / removed call paths**: for every added `CALLS` edge, the entry points of the head graph that
    reach its caller, as a path with the evidence of every hop (breadth first, shortest, at most 5 per
    edge). Removed calls are explained in the base graph.
@@ -107,9 +126,36 @@ new call paths (entry points of head that reach the new call):
         -> CALLS/direct [MUST] acme:audit::sink  (src/audit/audit.or:6)  <- NEW
 ```
 
+7. **effect changes** (`osig/0.2` snapshots on both sides): the effects a *module* gained or lost (the union over its functions,
+   abstract interface methods excluded), and per *function* every effect that is new (`added`), gone (`removed`) or has
+   another evidence class (`evidence`, with the old one), each with the explanation path in the graph where the effect exists
+   (the head for new effects, the base for removed ones). For a new effect that the function performs itself, the entry
+   points of the head that reach the function: everything that now performs the effect. Findings are capped like the others.
+
+```
+effect changes (transitive primitive effects; new or removed per module and function):
+  module (root):
+    - Fs.WriteFile OUTPUT
+  module store:
+    - Fs.WriteFile OUTPUT
+  module util:
+    + Console.Write OUTPUT
+  - app:(root)::main  Fs.WriteFile OUTPUT [MAY]  (in base)
+      app:(root)::main  (src/main.or:13)
+      -> app:store::saveConfig  (src/store/store.or:11)
+  - app:store::saveConfig  Fs.WriteFile OUTPUT [MUST]  (in base)
+      app:store::saveConfig  (src/store/store.or:11)
+  + app:util::fact  Console.Write OUTPUT [MUST]
+      app:util::fact  (src/util/util.or:3)
+      reached from entry point app:util::fact [MUST]
+      reached from entry point app:(root)::main [MAY]
+```
+
 The JSON report has the keys `changedSymbols`, `addedSymbols`, `removedSymbols`, `possibleRenames`
 (each with `"heuristic": true`), `addedEdges`, `removedEdges`, `newCallPaths`, `removedCallPaths`,
-`impact`, plus `summary`, `differences` and the two hashes. A run without differences reports
+`impact`, `effectsComparable`, `effectChanges` (per function: `kind`, `function`, `module`, `operation`, `direction`, `evidence`,
+`was`, `span`, `path`, `reach`), `moduleEffects` (per module: `added`, `removed`), plus `summary` (with `effectsAdded` /
+`effectsRemoved`), `differences` and the two hashes; the report schema is `osig-diff/0.2`. A run without differences reports
 `no differences` (text), `"differences": false` (JSON) or "No differences." (HTML). A comment or blank
 lines that only shift line numbers are not differences.
 
@@ -120,7 +166,8 @@ explaining path, added/removed edges, impact on entry points.
 ## MCP
 
 `orin mcp` exposes `graph {entry, full?, out?}` and `diff {base, head, format?, out?}` over the same engine
-(`docs/mcp.md`). Paths must be inside the server root.
+(`docs/mcp.md`); `inspect` returns the effect summary of a symbol or module (same analysis as the `MAY_PERFORM` edges).
+Paths must be inside the server root.
 
 ## Limits (read before trusting a report)
 
@@ -148,6 +195,16 @@ explaining path, added/removed edges, impact on entry points.
   function (`MAY`, like every closure). Edges between tasks are the send / receive effects themselves: every sender and every receiver of any
   channel meets at the same effect node; matching a send to its receivers per channel is a later analysis. Test: `tests/osig/tasks`.
 - **Not modelled yet:** transitive effects, FFI, field reads/writes, data flow, grant chains and runtime events,
+  summaries: a function that only *calls* one that performs I/O has no `PERFORMS_IO` edge of its own; its transitive summary
+  is the `MAY_PERFORM` edges (Stage B, `osig/0.2`). An absent `PERFORMS_IO` edge never proves the absence of I/O.
+- **Effect summaries over-approximate** (ADR-0037 D2; [capabilities.md](capabilities.md) has the argument): a function value of
+  unknown origin, an interface method without implementation and an unresolved call are `Unknown.*` effects, never pure;
+  closures are accounted for the function that creates them; an interface call is the union over all declared
+  implementations. They say what may be *done*, per operation family, not on which resource, and not FFI / native code.
+- **Network (ADR-0033):** `Net.Bind` (CONTROL), `Net.Accept` (INPUT), `Net.Connect` (CONTROL; also name resolution),
+  `Stream.Read` (INPUT), `Stream.Write` (OUTPUT; also half-close), `Net.Narrow` (CONTROL) for the primitives and the
+  `std:net` functions that wrap them (`useListener`, `useAccepted`, `useConnection`, `recv`, `sendAll`, `useListen`, ...).
+- **Not modelled yet:** FFI, field reads/writes, data flow, grant chains and runtime events, resource identity,
   `std:` imports as edges. They arrive with phases 2 and 3 as additive schema versions.
 - **Renames are guesses.** Same-signature matching misses a rename with a signature change and can
   pair unrelated symbols that look alike; that is why the class is separate and labelled.

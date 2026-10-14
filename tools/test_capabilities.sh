@@ -46,7 +46,7 @@ backends=c
 if command -v clang >/dev/null 2>&1; then backends="c llvm"; CC=clang; fi
 
 for b in $backends; do
-  for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now; do build $b $n; done
+  for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now net_listen; do build $b $n; done
 
   # 1. control run: everything works (stdin is the file itself: readLine finds a line)
   expect $b all_ok "" 0 "fs true" ""
@@ -79,10 +79,43 @@ for b in $backends; do
   expect $b clock_now clock 101 "before" "trap: capability denied: clock nowMillis"
   expect $b clock_now all 101 "before" "trap: capability denied: clock nowMillis"
 
+  # network (ADR-0033): ORIN_DENY=net refuses listen / connect / resolve with an Err (no trap), other families are unaffected
+  expect $b net_listen "" 0 "listen: ok" ""
+  expect $b net_listen "" 0 "inside the listener scope" ""
+  expect $b net_listen net 0 "listen: permission denied: outside the granted network scope, or denied by the host policy (ORIN_DENY)" ""
+  expect $b net_listen net 0 "connect: denied" ""
+  expect $b net_listen all 0 "resolve: permission denied" ""
+  expect $b net_listen net 0 "done" ""
+  if grep -q "inside the listener scope" build/capabilities/net_listen.$b.out; then fail "$b: a denied listener scope ran its body"; fi
+  expect $b net_listen fs,process,stdio,clock 0 "listen: ok" ""
+
   # 3. a malformed policy is rejected as a whole, before any user code runs
   for bad in bogus "fs," ",fs" "fs, process" "FS" "fss" "fs;process"; do
     expect $b fs_open "$bad" 101 "" "trap: invalid ORIN_DENY"
     [ ! -s build/capabilities/fs_open.$b.out ] || fail "$b: user code ran under the malformed policy '$bad'"
   done
 done
+# 5. static and dynamic agree (ADR-0037 D2, Stage B): the effects `orin effects` infers for a program cover the families the
+#    runtime denies above -- the program that traps under ORIN_DENY=<family> has an inferred effect of that family, and the
+#    inferred summary agrees with the purity analysis. (The static summary is an over-approximation: it may list more than
+#    one run performs, never less.)
+effects_of() { $ORIN2 effects tests/next/deny/$1.or --summary --no-paths; }
+has() { # program effect-name
+  effects_of "$1" | grep -qF -- "  $2 " || fail "effects of $1: expected $2 in the inferred summary"
+}
+has fs_open Fs.Open
+has fs_open Fs.Read
+has fs_open Fs.ReadFile
+has fs_open Fs.WriteFile
+has fs_exists Fs.Stat
+has process_args Process.Args
+has process_shell Process.Spawn
+has stdio_read Stdio.Read
+has clock_now Clock.Now
+for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now; do
+  has $n Host.Acquire
+  $ORIN2 effects tests/next/deny/$n.or --check-purity >/dev/null || fail "effects of $n disagree with the purity analysis"
+done
+# a program without grants performs no grant-requiring effect, and says so
+if effects_of ../run/cap_pure_no_grants | grep -E "Fs\.|Process\.|Stdio\.|Clock\." >/dev/null; then fail "cap_pure_no_grants has a grant-requiring effect"; fi
 echo "capabilities ok ($backends)"

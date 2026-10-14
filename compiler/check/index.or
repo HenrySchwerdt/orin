@@ -23,6 +23,7 @@ import {
   ArmBody, Pattern, ClassDecl, ClassMember, CtorParam, CtorDecl, ArrowBody, InterfaceDecl, ContractClause, Annotation
 } from "../syntax";
 import { LoadedProgram, ImportTarget } from "../loader";
+import { isIoBuiltin } from "./purity";
 import {
   Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink, CallSite,
   SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface, kindName, Builtin, grantTypeName
@@ -63,6 +64,8 @@ type W = {
   calls: CallSite[];           // call sites (OSIG CALLS edges)
   cur: Option<usize>;          // caller def of the HIR body being walked
   curMay: bool;                // the body is a lifted closure: its calls are MAY edges of the enclosing function
+  np: int;                     // parameter count of the ordinary function body being walked; -1 in a closure body (a
+                               // parameter of a closure is not one of the enclosing function)
   bnd: usize[];                // interface defs bounding the type parameters of the generic function instance being walked
   lNames: string[];            // flat scope stack of visible locals: name, def id, HIR type
   lIds: usize[];
@@ -757,7 +760,7 @@ function newW(): W {
   const tys: Option<Type>[] = [];
   const tt: Type[] = [];
   return W {
-    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
+    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, np: -1, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
     hl: s, hlTy: tt, hk: 0
   };
 }
@@ -1358,6 +1361,12 @@ function virtRef(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
 // its functions); the direction is INPUT (bytes / information enter the process), OUTPUT (leave it) or CONTROL
 // (open, spawn, acquire, exit). The grant is the family of authority the call needs, or "ambient" for the calls that
 // need none (console output, exit). "" = not a primitive I/O builtin.
+//
+// The names are the registry `primitiveEffects` below; the contract ties every operation to it, and every builtin that has
+// one to the purity analysis (purity.or `isIoBuiltin`): a function that performs an effect is impure, so the two tables
+// of I/O builtins must not drift apart (docs/capabilities.md).
+@Ensures(result == "" || isPrimitiveEffect(result))
+@Ensures(result != "" ==> isIoBuiltin(b))
 function ioOpOf(b: Builtin): string {
   return match (b) {
     BConsoleLog => "Console.Write|OUTPUT|ambient",
@@ -1379,12 +1388,21 @@ function ioOpOf(b: Builtin): string {
     BIoReadLine => "Stdio.Read|INPUT|StdioGrant",
     BIoWriteStdout => "Stdio.Write|OUTPUT|StdioGrant",
     BTimeNowMillis => "Clock.Now|INPUT|ClockGrant",
+    BNetListen => "Net.Bind|CONTROL|NetGrant",
+    BNetAccept => "Net.Accept|INPUT|Listener",
+    BNetConnect => "Net.Connect|CONTROL|NetGrant",
+    BNetRecv => "Stream.Read|INPUT|Stream",
+    BNetSend => "Stream.Write|OUTPUT|Stream",
+    BNetShutdown => "Stream.Write|OUTPUT|Stream",
+    BNetResolve => "Net.Connect|CONTROL|NetGrant",
+    BNetNow => "Clock.Now|INPUT|Stream",
     _ => ""
   };
 }
 
 // The std library functions that perform a primitive I/O operation or derive a grant (they are library code, so the
 // call site in user code is the only place the event is visible).
+@Ensures(result == "" || isPrimitiveEffect(result))
 function ioOpOfLib(name: string): string {
   const lt = name.indexOf("<");
   const n = lt.isSome() ? name.substring(0, lt.unwrap()) : name;
@@ -1396,6 +1414,24 @@ function ioOpOfLib(name: string): string {
   }
   if (n == "$stdlib/process.withArgsOnly" || n == "$stdlib/process.useArgsOnly") {
     return "Process.Narrow|CONTROL|ProcessGrant";
+  }
+  if (n == "$stdlib/net.useListen" || n == "$stdlib/net.useConnect" || n == "$stdlib/net.withListen" || n == "$stdlib/net.withConnect") {
+    return "Net.Narrow|CONTROL|NetGrant";
+  }
+  if (n == "$stdlib/net.useListener" || n == "$stdlib/net.withListener" || n == "$stdlib/net.useListenerNet") {
+    return "Net.Bind|CONTROL|NetGrant";
+  }
+  if (n == "$stdlib/net.useAccepted" || n == "$stdlib/net.withAccepted") {
+    return "Net.Accept|INPUT|Listener";
+  }
+  if (n == "$stdlib/net.useConnection" || n == "$stdlib/net.withConnection" || n == "$stdlib/net.useConnectionBeside" || n == "$stdlib/net.resolve") {
+    return "Net.Connect|CONTROL|NetGrant";
+  }
+  if (n == "$stdlib/net.recv" || n.startsWith("$stdlib/net.StreamReader.read")) {
+    return "Stream.Read|INPUT|Stream";
+  }
+  if (n == "$stdlib/net.send" || n == "$stdlib/net.sendAll" || n == "$stdlib/net.shutdownWrite") {
+    return "Stream.Write|OUTPUT|Stream";
   }
   if (n.startsWith("$stdlib/host.")) {
     return "Host.Acquire|CONTROL|Host";
@@ -1432,17 +1468,81 @@ function ioOpOfLib(name: string): string {
   return "";
 }
 
+// Every primitive effect the compiler knows, "<operation>|<direction>|<grant>": the closed list of ADR-0037 D1 (only the
+// compiler defines operations). `orin.toml` `[effects]` names are checked against it (analysis/effectpolicy.or).
+export function primitiveEffects(): string[] {
+  return [
+    "Clock.Now|INPUT|ClockGrant", "Console.Write|OUTPUT|ambient", "Fs.Narrow|CONTROL|FsGrant", "Fs.Open|CONTROL|FsGrant",
+    "Fs.Read|INPUT|FsGrant", "Fs.ReadFile|INPUT|FsGrant", "Fs.Stat|INPUT|FsGrant", "Fs.Write|OUTPUT|FsGrant",
+    "Fs.WriteFile|OUTPUT|FsGrant", "Host.Acquire|CONTROL|Host", "Process.Args|INPUT|ProcessGrant",
+    "Process.Exit|CONTROL|ambient", "Process.Narrow|CONTROL|ProcessGrant", "Process.Spawn|CONTROL|ProcessGrant",
+    "Stdio.Read|INPUT|StdioGrant", "Stdio.Write|OUTPUT|StdioGrant", "Net.Bind|CONTROL|NetGrant",
+    "Net.Accept|INPUT|Listener", "Net.Connect|CONTROL|NetGrant", "Net.Narrow|CONTROL|NetGrant", "Stream.Read|INPUT|Stream",
+    "Stream.Write|OUTPUT|Stream", "Clock.Now|INPUT|Stream",
+    "Task.Spawn|CONTROL|ambient", "Task.SpawnFs|CONTROL|FsGrant", "Task.SpawnProcess|CONTROL|ProcessGrant",
+    "Task.SpawnStdio|CONTROL|StdioGrant", "Task.SpawnClock|CONTROL|ClockGrant", "Task.Join|CONTROL|ambient",
+    "Channel.Open|CONTROL|ambient", "Channel.Send|OUTPUT|ambient", "Channel.Receive|INPUT|ambient"
+  ];
+}
+
+export function isPrimitiveEffect(s: string): bool {
+  for (const e of primitiveEffects()) {
+    if (e == s) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---- call sites (OSIG) ---------------------------------------------------------------------------------
 
-function addCall(w: W, callee: Option<usize>, ev: string, via: string, sp: Span): W {
+function addCallP(w: W, callee: Option<usize>, ev: string, via: string, sp: Span, param: int, fnArgs: string): W {
   let x = w;
   match (x.cur) {
     Some(cl) => {
-      x.calls.push(CallSite { caller: cl, callee: callee, ev: x.curMay && ev == "MUST" ? "MAY" : ev, via: via, span: sp });
+      x.calls.push(CallSite {
+        caller: cl, callee: callee, ev: x.curMay && ev == "MUST" ? "MAY" : ev, via: via, span: sp, param: param, fnArgs: fnArgs
+      });
     },
     None => {}
   }
   return x;
+}
+
+function addCall(w: W, callee: Option<usize>, ev: string, via: string, sp: Span): W {
+  return addCallP(w, callee, ev, via, sp, -1, "");
+}
+
+// The provenance of the function-typed arguments of a call (CallSite.fnArgs). `lead`: a leading empty entry for the
+// receiver of a virtual call.
+function fnArgKinds(w: W, c: Ctx, args: HExpr[], lead: bool): string {
+  let parts: string[] = lead ? [""] : [];
+  let any = false;
+  for (const a of args) {
+    let k = "";
+    match (a.ty) {
+      TyFn(_, _) => {
+        any = true;
+        k = "u";
+        match (a.kind) {
+          XClosure(fid, _) => {
+            if (fid < c.fnKind.length) {
+              k = c.fnKind[fid] == 2 ? "v" : "c";
+            }
+          },
+          XLocal(q) => {
+            if (w.np >= 0 && q.toInt() < w.np) {
+              k = "p" + q.toString();
+            }
+          },
+          _ => {}
+        }
+      },
+      _ => {}
+    }
+    parts.push(k);
+  }
+  return any ? parts.join(",") : "";
 }
 
 function isContained(w: W, d: usize): bool {
@@ -1454,11 +1554,12 @@ function isContained(w: W, d: usize): bool {
 
 // A direct call (XCall) of a function, method or constructor. Inside an instance of a generic function
 // with bounded type parameters the call of a method of the instance's class is a call of the interface method.
-function callSite(w: W, c: Ctx, e: HExpr, fid: usize): W {
+function callSite(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
   let x = w;
   if (fid >= c.fnDef.length || c.fnKind[fid] != 0) {
     return x;
   }
+  const fa = fnArgKinds(x, c, args, false);
   match (c.fnDef[fid]) {
     Some(d) => {
       let callee = d;
@@ -1476,15 +1577,19 @@ function callSite(w: W, c: Ctx, e: HExpr, fid: usize): W {
           }
         }
       }
-      x = addCall(x, Some(callee), "MUST", via, e.span);
+      x = addCallP(x, Some(callee), "MUST", via, e.span, -1, fa);
     },
-    None => {}
+    None => {
+      // A function the index cannot map to a definition: the call is recorded with an unknown target, so that the
+      // effect analysis never takes it for pure.
+      x = addCallP(x, None, "UNKNOWN", "unresolved", e.span, -1, "");
+    }
   }
   return x;
 }
 
 // A call through an interface value: the interface method.
-function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
+function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize, args: HExpr[]): W {
   let x = w;
   match (c.hir) {
     Some(p) => {
@@ -1495,7 +1600,7 @@ function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
             if (idf.isSome()) {
               for (const k of children(x.defs, idf.unwrap())) {
                 if (x.defs[k].name == p.ifaces[i].methods[slot]) {
-                  x = addCall(x, Some(k), "MUST", "virtual", e.span);
+                  x = addCallP(x, Some(k), "MUST", "virtual", e.span, -1, fnArgKinds(x, c, args, true));
                   return x;
                 }
               }
@@ -1507,7 +1612,7 @@ function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
     },
     None => {}
   }
-  return addCall(x, None, "UNKNOWN", "indirect", e.span);
+  return addCallP(x, None, "UNKNOWN", "indirect", e.span, -1, "");
 }
 
 // A function used as a value (the lifted wrapper `f$closure`, ADR-0011): the wrapped function may be
@@ -1612,7 +1717,7 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
     XCall(fid, args) => {
       x = hExprs(x, c, args, ty);
       x = methodRef(x, c, e, fid, args);
-      x = callSite(x, c, e, fid);
+      x = callSite(x, c, e, fid, args);
       match (c.hir) {
         Some(p) => {
           if (fid < p.functions.length) {
@@ -1701,14 +1806,23 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
     XCallIndirect(f, args) => {
       x = hExpr(x, c, f, ty);
       x = hExprs(x, c, args, ty);
-      x = addCall(x, None, "UNKNOWN", "indirect", e.span);
+      let pk: int = -1;
+      match (f.kind) {
+        XLocal(q) => {
+          if (x.np >= 0 && q.toInt() < x.np) {
+            pk = q.toInt();
+          }
+        },
+        _ => {}
+      }
+      x = addCallP(x, None, "UNKNOWN", "indirect", e.span, pk, "");
     },
     XIface(_, v) => { x = hExpr(x, c, v, ty); },
     XCallVirtual(r, slot, args) => {
       x = hExpr(x, c, r, ty);
       x = hExprs(x, c, args, ty);
       x = virtRef(x, c, e, r, slot);
-      x = virtCall(x, c, e, r, slot);
+      x = virtCall(x, c, e, r, slot, args);
     },
     _ => {}
   }
@@ -2020,8 +2134,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 if (hn < h.functions.length && h.functions[hn].name == u.name + "." + f.name.name) {
                   hf = Some(h.functions[hn]);
                   w.cur = Some(did);
+                  w.np = h.functions[hn].paramCount.toInt();
                   w = hBlock(w, c, h.functions[hn].body, true);
                   w.cur = None;
+                  w.np = -1;
                 }
               },
               None => {}
@@ -2119,8 +2235,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 match (ctorHf) {
                   Some(hf) => {
                     w.cur = Some(dk);
+                    w.np = hf.paramCount.toInt();
                     w = hBlock(w, c, hf.body, true);
                     w.cur = None;
+                    w.np = -1;
                   },
                   None => {}
                 }
@@ -2136,8 +2254,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                       if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
                         hf = Some(h.functions[hn]);
                         w.cur = Some(dk);
+                        w.np = h.functions[hn].paramCount.toInt();
                         w = hBlock(w, c, h.functions[hn].body, true);
                         w.cur = None;
+                        w.np = -1;
                       }
                     },
                     None => {}
@@ -2157,8 +2277,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
             match (ctorHf) {
               Some(hf) => {
                 w.cur = Some(did);
+                w.np = hf.paramCount.toInt();
                 w = hBlock(w, c, hf.body, false);
                 w.cur = None;
+                w.np = -1;
               },
               None => {}
             }
@@ -2177,9 +2299,11 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         w.bnd = boundDefs(c, h.functions[hn].name);
         w.cur = c.fnKind[hn] == 2 ? None : c.fnDef[hn];
         w.curMay = c.fnKind[hn] == 1;
+        w.np = c.fnKind[hn] == 0 ? h.functions[hn].paramCount.toInt() : -1;
         w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
         w.cur = None;
         w.curMay = false;
+        w.np = -1;
         const noB: usize[] = [];
         w.bnd = noB;
         hn += 1;
@@ -2211,6 +2335,9 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     refs: dedupRefs(sortRefs(w.refs)),
     types: dedupTypes(sortTypes(w.types)),
     impls: w.impls,
-    calls: w.calls
+    calls: w.calls,
+    fnDefs: fnDef,
+    fnKinds: fnKind,
+    typed: hir.isSome()
   };
 }
