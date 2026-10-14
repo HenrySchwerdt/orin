@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Borrow inference for read-only parameters (ADR-0038 class (d); `compiler/opt/borrow.or`).** A method or function that only
+  reads a reference parameter (typically `this`: `Bytes.length`, `Reader.cur`, `isDone`, ...) now takes it borrowed: the caller no
+  longer retains the argument and the callee no longer releases it. Interprocedural fixpoint inside the existing parameter-mode
+  inference; default deny (stores, moves, returns, mutation, a second retain keep the parameter owned). The verifier is unchanged
+  (a borrow of a borrowed parameter was already a rule). Unit tests in `compiler/tests/opt_test.or`.
 - **Closure inlining and fusion (ADR-0038 §2; `compiler/fuse`).** A chain of `map` / `filter` stages ended by `map`, `filter`,
   `reduce`, `some`, `every`, `find`, `findIndex`, `forEach`, `includes` or `indexOf`, with pure arrow functions or named
   functions at the call, becomes one loop: no intermediate arrays, no closure objects, closure bodies inlined, early exit, exact

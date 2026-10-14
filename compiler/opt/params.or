@@ -19,6 +19,7 @@ import {
   isRefTy,
 } from "./analysis";
 import { BlockSink, withBody } from "./rewrite";
+import { ReadCall, readInfo, isReadCopy } from "./borrow";
 import { fnShapeOk, fnWellFormed, passKept, onlyEdgeBlocksAdded, releaseCount } from "./wellformed";
 
 // Liveness of one parameter: one flag per block on entry and on exit.
@@ -149,14 +150,16 @@ function cleanCall(anc: usize[][], args: Operand[], p: usize): bool {
 export type CallSite = { callee: usize; pos: usize; };
 
 // Where parameter p of f is consumed at its last use. Not `ok`: p can never be owned (it is not a reference, the entry
-// block is a loop head, or a terminator uses it), and then nothing was collected.
-@Invariant(this.ok || !this.dup && this.calls.length == 0)
-export type PSites = { ok: bool; dup: bool; calls: CallSite[]; };
+// block is a loop head, or a terminator uses it), and then nothing was collected. `via`: p is copied at its last use into
+// a local that is only read (borrow.or); that does not consume p, unless the copy is passed to a parameter that is owned
+// (a position in `via`).
+@Invariant(this.ok || !this.dup && this.calls.length == 0 && this.via.length == 0)
+export type PSites = { ok: bool; dup: bool; calls: CallSite[]; via: ReadCall[]; };
 
 @Requires(fnShapeOk(f) && p < f.paramCount)
 @Ensures(result.calls.every(c => passesAt(f, c, p)))
 export function scanSites(f: MFunction, p: usize): PSites {
-  let r = PSites { ok: false, dup: false, calls: [] };
+  let r = PSites { ok: false, dup: false, calls: [], via: [] };
   if (!isRefTy(f.locals[p].ty) || entryHasPredecessor(f)) {
     return r;
   }
@@ -165,6 +168,7 @@ export function scanSites(f: MFunction, p: usize): PSites {
     return r;
   }
   r.ok = true;
+  const info = readInfo(f);
   const lv = paramLiveness(f, anc, p);
   let b: usize = 0;
   while (b < f.blocks.length) {
@@ -174,9 +178,13 @@ export function scanSites(f: MFunction, p: usize): PSites {
     while (i < blk.instrs.length) {
       if (!la[i]) {
         match (blk.instrs[i]) {
-          IDup(_, o) => {
+          IDup(d, o) => {
             if (isLocalOp(o, p)) {
-              r.dup = true;
+              if (isReadCopy(f, info, blk.instrs[i])) {
+                r.via = r.via.concat(info.calls[d]);
+              } else {
+                r.dup = true;
+              }
             }
           },
           ICall(_, g, args) => {

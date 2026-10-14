@@ -3,8 +3,10 @@
 //   1. parameter-mode inference (class `ParamInference`): interprocedural fixpoint starting from "all borrowed";
 //      parameter k of f becomes owned when f consumes it at a last use (IDup or an owned position of a callee). Modes
 //      only ever flip borrowed -> owned, in function / parameter order, so the result is deterministic and the
-//      iteration terminates.
-//   2. per function (`optimizeFunction`): call-site argument retains (calls.or), callee-side owned-parameter rewrite
+//      iteration terminates. A copy of the parameter that is only read (`d = dup p; ..; release d`, borrow.or) does not
+//      consume it: borrow inference, ADR-0038 class (d).
+//   2. per function (`optimizeFunction`): call-site argument retains (calls.or), read-only copies of borrowed
+//      parameters become borrows (borrow.or), callee-side owned-parameter rewrite
 //      (params.or), take/put of nested and plain slots that are read, retained and stored back (chains.or,
 //      inplace.or), dup/release cancellation (calls.or).
 //   3. pair-return elimination (pairs.or): functions that return a fresh two-slot record become in/out functions, the
@@ -20,6 +22,7 @@ import { insertCallDups, peephole } from "./calls";
 import { inplaceSlots } from "./inplace";
 import { takePutChains } from "./chains";
 import { pairReturns } from "./pairs";
+import { borrowReads } from "./borrow";
 import { indices } from "./rewrite";
 import { progWellFormed, fnWellFormed, passKept } from "./wellformed";
 
@@ -118,6 +121,11 @@ export class ParamInference {
         want = true;
       }
     }
+    for (const c of s.via) {
+      if (c.pos < this.modes[c.callee].length && this.modes[c.callee][c.pos]) {
+        want = true;
+      }
+    }
     return want;
   }
 
@@ -203,6 +211,7 @@ export function optimizeFunction(q: MProgram, p: MProgram, fi: usize): MFunction
   const owned = q.functions[fi].paramOwned;
   let f = insertCallDups(q, p, p.functions[fi], owned);
   f.paramOwned = owned;
+  f = borrowReads(q, f);
   let k: usize = 0;
   while (k < owned.length) {
     if (owned[k]) {

@@ -127,6 +127,14 @@ hole slot when reading that slot.
 - Any operation that makes x Dead or mutates it also invalidates `Borrowed(x)`.
 - `IDup(d, x)` / `IBorrow(d, x)` where x is Unique demote x to Owned (no longer provably unique).
 
+## Borrowed read-only copies of parameters (borrow inference, ADR-0038 class (d))
+The lowering copies a reference parameter into a local (`d = dup p` ... `release d`). `compiler/opt/borrow.or` recognises the
+copies that are only read and rewrites them to `d = borrow p` (no retain, no release), so that the parameter stays borrowed
+(`paramOwned[p] = false`) and no caller retains its argument. **No new rule**: `IBorrow(d, p)` of a `Param` gives `Borrowed(Param)`,
+valid for the whole call, and the uses the pass allows (field and element reads, builtins, borrowed call positions) are the uses
+the verifier already accepts for a `Borrowed` local. A copy that is moved, stored, returned, retained again, mutated, or passed to an
+owned position keeps its `dup` (default deny).
+
 ## In/out receiver (v1.10)
 A mutating method with a result returns a fresh record `{ self, value }` (ADR-0009): one allocation, one retain and one release
 per call for a value that never escapes. The optimiser (`compiler/opt/pairs.or`) removes it with a second kind of function:
