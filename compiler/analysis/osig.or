@@ -12,7 +12,7 @@ import { SourceFile, SourceMap, Span, render } from "../diag";
 import { Item, ContractClause, ClassMember } from "../syntax";
 import { checkWithIndex } from "../check";
 import {
-  SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField,
+  Program, SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField,
   SkInterface
 } from "../hir";
 import { displayModule } from "../package";
@@ -20,8 +20,11 @@ import { Json, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson, par
   getField } from "../json";
 import { readFile } from "std:fs";
 import { cmpStr } from "./modgraph";
+import { inferEffects, isUnknownOp } from "./effects";
 
-export const OSIG_SCHEMA: string = "osig/0.1";
+// osig/0.2 (ADR-0023 versioning, ADR-0037 D2): additive over 0.1 -- the edge kind `MAY_PERFORM` (the transitive effect
+// summary, compiler/analysis/effects.or) and the edge field `next` (set on those edges only).
+export const OSIG_SCHEMA: string = "osig/0.2";
 
 // 1-based line and column (columns count bytes) of the start and end of a source range.
 export type OSpan = { file: string; line: usize; col: usize; endLine: usize; endCol: usize; };
@@ -39,12 +42,13 @@ export type ONode = {
 };
 
 export type OEdge = {
-  kind: string;        // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT PERFORMS_IO
+  kind: string;        // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT PERFORMS_IO MAY_PERFORM
   src: string;
   dst: string;
   ev: string;          // MUST | MAY | UNKNOWN
-  via: string;         // "" or the call route: direct method virtual bound impl value indirect
+  via: string;         // "" or the call route: direct method virtual bound impl value indirect; PERFORMS_IO / MAY_PERFORM: the direction
   span: OSpan;         // first occurrence
+  next: string;        // MAY_PERFORM only: the function the effect is inherited from ("" = performed in `src`, or through library code)
 };
 
 export type OsigGraph = { schema: string; package: string; hash: string; nodes: ONode[]; edges: OEdge[]; };
@@ -134,9 +138,9 @@ function lineOf(starts: usize[], off: usize): usize {
   return lo;
 }
 
-type Mapper = { paths: string[]; starts: usize[][]; };
+export type Mapper = { paths: string[]; starts: usize[][]; };
 
-function mkSpan(m: Mapper, sp: Span): OSpan {
+export function mkSpan(m: Mapper, sp: Span): OSpan {
   if (sp.file >= m.paths.length) {
     return OSpan { file: "", line: 0, col: 0, endLine: 0, endCol: 0 };
   }
@@ -212,11 +216,15 @@ function edgeKey(e: OEdge): string {
 }
 
 function addEdge(r: Raw, kind: string, src: string, dst: string, ev: string, via: string, sp: OSpan): Raw {
+  return addEdgeN(r, kind, src, dst, ev, via, sp, "");
+}
+
+function addEdgeN(r: Raw, kind: string, src: string, dst: string, ev: string, via: string, sp: OSpan, next: string): Raw {
   let x = r;
   if (src == "" || dst == "" || src == dst) {
     return x;
   }
-  const e = OEdge { kind: kind, src: src, dst: dst, ev: ev, via: via, span: sp };
+  const e = OEdge { kind: kind, src: src, dst: dst, ev: ev, via: via, span: sp, next: next };
   x.edges.push(e);
   x.keys.push(edgeKey(e));
   return x;
@@ -254,13 +262,11 @@ function containsSpan(outer: Span, inner: Span): bool {
   return outer.file == inner.file && outer.start <= inner.start && inner.end <= outer.end;
 }
 
-// The OSIG of a successfully checked program.
-export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap): OsigGraph {
-  let pkg = "_";
+// The directory prefix of the source root: the entry's directory ("src/" for `entry = "src/main.or"`), "" without a manifest.
+function sourcePrefix(prog: LoadedProgram): string {
   let prefix = "";
   match (prog.manifest) {
     Some(mf) => {
-      pkg = mf.name;
       let si: usize = 0;
       while (si < mf.entry.length) {
         if (mf.entry.charCodeAt(si) == 47) {
@@ -271,7 +277,12 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
     },
     None => {}
   }
-  // file id -> path relative to the source root, line tables
+  return prefix;
+}
+
+// Span conversion for `sm`: file id -> path relative to the source root (never absolute), and line tables.
+export function spanMapper(prog: LoadedProgram, sm: SourceMap): Mapper {
+  const prefix = sourcePrefix(prog);
   let paths: string[] = [];
   let starts: usize[][] = [];
   let fi: usize = 0;
@@ -285,7 +296,18 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
       paths[u.file] = prefix + u.name + ".or";
     }
   }
-  const mp = Mapper { paths: paths, starts: starts };
+  return Mapper { paths: paths, starts: starts };
+}
+
+// The OSIG of a successfully checked program.
+export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap): OsigGraph {
+  let pkg = "_";
+  match (prog.manifest) {
+    Some(mf) => { pkg = mf.name; },
+    None => {}
+  }
+  const mp = spanMapper(prog, sm);
+  let fi: usize = 0;
   const nd = idx.defs.length;
 
   // ids of the defs ("" = not part of the graph): top-level first (collisions between files of one module
@@ -616,6 +638,38 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
       }
     }
   }
+  // transitive effect summaries (ADR-0037 D2): one MAY_PERFORM edge per function and effect. The same inference as
+  // `orin effects`, the LSP hover and MCP `inspect` (analysis/effects.or); `next` is the closest graph node the effect is
+  // inherited from (library code has no node: an effect that only reaches the function through std code has none).
+  const tbl = inferEffects(idx);
+  for (const d of tbl.defs()) {
+    if (ids[d] == "") {
+      continue;
+    }
+    for (const e of tbl.summary(d)) {
+      const key = tbl.keyAt(e.key);
+      let dst = UNKNOWN_ID;
+      let via = key.op;
+      if (isUnknownOp(key.op)) {
+        usesUnknown = true;
+      } else {
+        dst = "~io:" + key.op;
+        via = key.dir;
+        if (!hasStr(seenIo, dst)) {
+          seenIo.push(dst);
+          raw.nodes.push(ONode {
+            id: dst, kind: "Effect", name: key.op, module: "", owner: "",
+            sig: key.dir + "; grant: " + key.grant, exported: false, entry: false, span: noSpan()
+          });
+        }
+      }
+      let next = e.next;
+      while (next >= 0 && ids[next.toUsize()] == "") {
+        next = tbl.entryFor(next.toUsize(), e.key).unwrap().next;
+      }
+      raw = addEdgeN(raw, "MAY_PERFORM", ids[d], dst, e.ev, via, mkSpan(mp, e.span), next >= 0 ? ids[next.toUsize()] : "");
+    }
+  }
   if (usesUnknown) {
     raw.nodes.push(ONode {
       id: UNKNOWN_ID, kind: "Unknown", name: "function value", module: "", owner: "",
@@ -680,10 +734,14 @@ function nodeLine(n: ONode): string {
 }
 
 function edgeLine(e: OEdge): string {
-  return stringifyJson(JObj([
+  let fs: JField[] = [
     jField("kind", JStr(e.kind)), jField("src", JStr(e.src)), jField("dst", JStr(e.dst)), jField("evidence", JStr(e.ev)),
     jField("via", JStr(e.via)), jField("span", spanJson(e.span))
-  ]));
+  ];
+  if (e.kind == "MAY_PERFORM") {
+    fs.push(jField("next", JStr(e.next)));
+  }
+  return stringifyJson(JObj(fs));
 }
 
 function hexDigit(n: int): string {
@@ -789,7 +847,8 @@ export function parseOsig(text: string): Result<OsigGraph, string> {
   for (const e of getArr(j, "edges").unwrapOr(noJ)) {
     edges.push(OEdge {
       kind: getStr(e, "kind").unwrapOr(""), src: getStr(e, "src").unwrapOr(""), dst: getStr(e, "dst").unwrapOr(""),
-      ev: getStr(e, "evidence").unwrapOr(""), via: getStr(e, "via").unwrapOr(""), span: spanOf(e)
+      ev: getStr(e, "evidence").unwrapOr(""), via: getStr(e, "via").unwrapOr(""), span: spanOf(e),
+      next: getStr(e, "next").unwrapOr("")
     });
   }
   const g = OsigGraph { schema: schema, package: getStr(j, "package").unwrapOr(""), hash: getStr(j, "hash").unwrapOr(""), nodes: nodes, edges: edges };
@@ -807,15 +866,15 @@ export function loadOsig(fs: FsGrant, path: string): Result<OsigGraph, string> {
   return loadOsigIn(fs, path, "");
 }
 
-// Same, but every file the program reads must lie inside `root` ("" = no restriction; MCP passes its root).
-export function loadOsigIn(fs: FsGrant, path: string, root: string): Result<OsigGraph, string> {
-  if (path.endsWith(".json")) {
-    const t = readFile(fs, path);
-    if (t.isErr()) {
-      return Err("cannot read " + path + ": " + t.unwrapErr());
-    }
-    return parseOsig(t.unwrap());
-  }
+// A type-checked program with its HIR and semantic index: what OSIG, effects and the other whole-program reports start from.
+export type CheckedProgram = { program: LoadedProgram; sm: SourceMap; hir: Program; index: SemanticIndex; };
+
+// A loaded (not yet checked) program with the files it was read from.
+export type LoadedForCheck = { program: LoadedProgram; sm: SourceMap; };
+
+// Loads the entry file or package directory `path` (no std prelude, as `orin api`); every file the program reads must lie
+// inside `root` ("" = no restriction; MCP passes its root). Errors are rendered diagnostics.
+export function loadProgram(fs: FsGrant, path: string, root: string): Result<LoadedForCheck, string> {
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(fs, path, noOverlay, noPreludeRoots());
   if (loaded.diags.length > 0) {
@@ -832,14 +891,37 @@ export function loadOsigIn(fs: FsGrant, path: string, root: string): Result<Osig
       }
     }
   }
-  const program = loaded.program.unwrap();
-  const ci = checkWithIndex(program, loaded.sm);
+  return Ok(LoadedForCheck { program: loaded.program.unwrap(), sm: loaded.sm });
+}
+
+// Type-checks a loaded program together with its semantic index. Errors are rendered diagnostics.
+export function checkProgram(program: LoadedProgram, sm: SourceMap): Result<CheckedProgram, string> {
+  const ci = checkWithIndex(program, sm);
   if (ci.result.isErr()) {
     let msgs: string[] = [];
     for (const d of ci.result.unwrapErr()) {
-      msgs.push(render(loaded.sm, d));
+      msgs.push(render(sm, d));
     }
     return Err(msgs.join("\n"));
   }
-  return Ok(buildOsig(program, ci.index, loaded.sm));
+  return Ok(CheckedProgram { program: program, sm: sm, hir: ci.result.unwrap(), index: ci.index });
+}
+
+// Loads and checks `path` (see `loadProgram`).
+export function loadChecked(fs: FsGrant, path: string, root: string): Result<CheckedProgram, string> {
+  const l = loadProgram(fs, path, root)?;
+  return checkProgram(l.program, l.sm);
+}
+
+// Same as `loadOsig`, but every file the program reads must lie inside `root` ("" = no restriction; MCP passes its root).
+export function loadOsigIn(fs: FsGrant, path: string, root: string): Result<OsigGraph, string> {
+  if (path.endsWith(".json")) {
+    const t = readFile(fs, path);
+    if (t.isErr()) {
+      return Err("cannot read " + path + ": " + t.unwrapErr());
+    }
+    return parseOsig(t.unwrap());
+  }
+  const cp = loadChecked(fs, path, root)?;
+  return Ok(buildOsig(cp.program, cp.index, cp.sm));
 }

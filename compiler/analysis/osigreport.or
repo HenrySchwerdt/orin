@@ -1,11 +1,14 @@
-// Renderers of an OSIG diff (ADR-0023): text, JSON ("osig-diff/0.1") and one self-contained HTML file.
+// Renderers of an OSIG diff (ADR-0023): text, JSON ("osig-diff/0.2") and one self-contained HTML file.
 // All of them list exactly what `diffOsig` found; nothing is added or upgraded here.
 
 import { OsigGraph, ONode, OEdge, OSpan } from "./osig";
-import { OsigDiff, SymChange, PathStep, ImpactPath, Reach, EdgeFinding, Rename, hasDifferences, MAX_FINDINGS } from "./osigdiff";
+import {
+  OsigDiff, SymChange, PathStep, ImpactPath, Reach, EdgeFinding, Rename, EffectChange, ModuleEffectChange, hasDifferences, MAX_FINDINGS
+} from "./osigdiff";
 import { Json, JBool, JNum, JStr, JArr, JObj, jField, stringifyJson } from "../json";
 
-export const DIFF_SCHEMA: string = "osig-diff/0.1";
+// 0.2: adds the effect sections (`effectsComparable`, `effectChanges`, `moduleEffects`).
+export const DIFF_SCHEMA: string = "osig-diff/0.2";
 
 function loc(s: OSpan): string {
   return s.file == "" ? "-" : s.file + ":" + s.line.toString();
@@ -19,7 +22,60 @@ function summaryLine(d: OsigDiff): string {
   return plural(d.addedSyms.length, "symbol", "symbols") + " added, " + plural(d.removedSyms.length, "symbol", "symbols")
     + " removed, " + plural(d.changed.length, "symbol", "symbols") + " changed; " + plural(d.addedEdges.length, "edge", "edges")
     + " added, " + plural(d.removedEdges.length, "edge", "edges") + " removed; " + plural(d.renames.length, "possible rename", "possible renames")
-    + " (heuristic)";
+    + " (heuristic); " + plural(countKind(d, "added"), "effect", "effects") + " added, " + plural(countKind(d, "removed"), "effect", "effects")
+    + " removed";
+}
+
+function countKind(d: OsigDiff, kind: string): usize {
+  let n: usize = 0;
+  for (const c of d.effectChanges) {
+    if (c.kind == kind) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+function effLabel(c: EffectChange): string {
+  return c.op + (c.dir == "" ? "" : " " + c.dir);
+}
+
+// The effect section: per module, then per function with the explanation path.
+function effectLines(d: OsigDiff): string[] {
+  let out: string[] = [];
+  if (!d.effectsComparable) {
+    out.push("");
+    out.push("effect changes: not compared (a snapshot has no effect summaries; they exist from osig/0.2 on)");
+    return out;
+  }
+  if (d.effectChanges.length == 0 && d.moduleEffects.length == 0) {
+    return out;
+  }
+  out.push("");
+  out.push("effect changes (transitive primitive effects; new or removed per module and function):");
+  for (const m of d.moduleEffects) {
+    out.push("  module " + m.module + ":");
+    for (const a of m.added) {
+      out.push("    + " + a);
+    }
+    for (const r of m.removed) {
+      out.push("    - " + r);
+    }
+  }
+  for (const c of d.effectChanges) {
+    const mark = c.kind == "added" ? "+" : (c.kind == "removed" ? "-" : "~");
+    out.push("  " + mark + " " + c.fn + "  " + effLabel(c) + " [" + c.ev + "]" + (c.kind == "evidence" ? " (was " + c.was + ")" : "")
+      + (c.kind == "removed" ? "  (in base)" : ""));
+    let k: usize = 0;
+    while (k < c.path.length) {
+      out.push("      " + (k == 0 ? "" : "-> ") + c.path[k].node + "  (" + loc(c.path[k].span) + ")");
+      k += 1;
+    }
+    for (const p of c.reach.paths) {
+      out.push("      reached from entry point " + p.steps[0].node + " [" + p.ev + "]");
+    }
+  }
+  return out;
 }
 
 // ---- text ------------------------------------------------------------------------------------------------
@@ -121,6 +177,9 @@ export function diffText(d: OsigDiff): string {
       out.push("  - " + edgeText(e));
     }
   }
+  for (const l of effectLines(d)) {
+    out.push(l);
+  }
   if (d.newPaths.length > 0) {
     out.push("");
     out.push("new call paths (entry points of head that reach the new call):");
@@ -213,6 +272,18 @@ function findingJ(f: EdgeFinding): Json {
   return JObj([jField("edge", edgeJ(f.edge)), jField("reach", reachJ(f.reach))]);
 }
 
+function effectJ(c: EffectChange): Json {
+  let ps: Json[] = [];
+  for (const p of c.path) {
+    ps.push(JObj([jField("function", JStr(p.node)), jField("evidence", JStr(p.ev)), jField("span", spanJ(p.span))]));
+  }
+  return JObj([
+    jField("kind", JStr(c.kind)), jField("function", JStr(c.fn)), jField("module", JStr(c.module)), jField("operation", JStr(c.op)),
+    jField("direction", JStr(c.dir)), jField("evidence", JStr(c.ev)), jField("was", JStr(c.was)), jField("span", spanJ(c.span)),
+    jField("path", JArr(ps)), jField("reach", reachJ(c.reach))
+  ]);
+}
+
 function listLines(key: string, items: Json[], last: bool): string[] {
   let out: string[] = ["\"" + key + "\": ["];
   let i: usize = 0;
@@ -230,11 +301,13 @@ export function diffJson(d: OsigDiff): string {
   lines.push("\"base\": " + stringifyJson(JObj([jField("package", JStr(d.base.package)), jField("hash", JStr(d.base.hash))])) + ",");
   lines.push("\"head\": " + stringifyJson(JObj([jField("package", JStr(d.head.package)), jField("hash", JStr(d.head.hash))])) + ",");
   lines.push("\"differences\": " + stringifyJson(JBool(hasDifferences(d))) + ",");
+  lines.push("\"effectsComparable\": " + stringifyJson(JBool(d.effectsComparable)) + ",");
   lines.push("\"summary\": " + stringifyJson(JObj([
     jField("added", JNum(d.addedSyms.length.toInt())), jField("removed", JNum(d.removedSyms.length.toInt())),
     jField("changed", JNum(d.changed.length.toInt())), jField("addedEdges", JNum(d.addedEdges.length.toInt())),
     jField("removedEdges", JNum(d.removedEdges.length.toInt())), jField("possibleRenames", JNum(d.renames.length.toInt())),
-    jField("truncated", JBool(d.truncated))
+    jField("truncated", JBool(d.truncated)), jField("effectsAdded", JNum(countKind(d, "added").toInt())),
+    jField("effectsRemoved", JNum(countKind(d, "removed").toInt()))
   ])) + ",");
   let ch: Json[] = [];
   for (const c of d.changed) {
@@ -282,6 +355,20 @@ export function diffJson(d: OsigDiff): string {
     re.push(edgeJ(e));
   }
   for (const l of listLines("removedEdges", re, false)) {
+    lines.push(l);
+  }
+  let ec: Json[] = [];
+  for (const c of d.effectChanges) {
+    ec.push(effectJ(c));
+  }
+  for (const l of listLines("effectChanges", ec, false)) {
+    lines.push(l);
+  }
+  let me: Json[] = [];
+  for (const m of d.moduleEffects) {
+    me.push(JObj([jField("module", JStr(m.module)), jField("added", strsJ(m.added)), jField("removed", strsJ(m.removed))]));
+  }
+  for (const l of listLines("moduleEffects", me, false)) {
     lines.push(l);
   }
   let np: Json[] = [];
@@ -423,6 +510,8 @@ export function diffHtml(d: OsigDiff, linkBase: string): string {
     o.push("<div class=\"card\"><b>" + d.addedEdges.length.toString() + "</b>added edges</div>");
     o.push("<div class=\"card\"><b>" + d.removedEdges.length.toString() + "</b>removed edges</div>");
     o.push("<div class=\"card\"><b>" + d.renames.length.toString() + "</b>possible renames (heuristic)</div>");
+    o.push("<div class=\"card\"><b>" + countKind(d, "added").toString() + "</b>new effects</div>");
+    o.push("<div class=\"card\"><b>" + countKind(d, "removed").toString() + "</b>removed effects</div>");
     o.push("</div>");
     o.push("<p class=\"warn\">The graph is a static over-approximation: calls through function values are MAY / UNKNOWN edges, and the absence of an edge or path is not proof that none exists.</p>");
   }
@@ -449,6 +538,35 @@ export function diffHtml(d: OsigDiff, linkBase: string): string {
         + (r.ambiguous ? " (ambiguous)" : "") + "</td><td>" + esc(r.basis.join("; ")) + "</td></tr>");
     }
     o.push("</table>");
+  }
+  if (!d.effectsComparable) {
+    o.push("<h2>Effect changes</h2>");
+    o.push("<p class=\"muted\">Not compared: a snapshot has no effect summaries (they exist from osig/0.2 on).</p>");
+  } else if (d.effectChanges.length > 0 || d.moduleEffects.length > 0) {
+    o.push("<h2>Effect changes</h2>");
+    o.push("<p class=\"muted\">Transitive primitive effects (ADR-0037 D2): what each function and module may perform, new or removed. MUST: a primitive call in the body; MAY: inherited or in a closure; UNKNOWN: the target is not known.</p>");
+    if (d.moduleEffects.length > 0) {
+      o.push("<table><tr><th>module</th><th>new effects</th><th>removed effects</th></tr>");
+      for (const m of d.moduleEffects) {
+        o.push("<tr><td><code>" + esc(m.module) + "</code></td><td><ins>" + esc(m.added.join(", ")) + "</ins></td><td><del>" + esc(m.removed.join(", ")) + "</del></td></tr>");
+      }
+      o.push("</table>");
+    }
+    for (const c of d.effectChanges) {
+      const tag = c.kind == "added" ? "<span class=\"tag tag-new\">new</span>" : (c.kind == "removed" ? "<span class=\"tag tag-gone\">removed</span>" : "<span class=\"tag\">evidence</span>");
+      o.push("<h3>" + tag + " <code>" + esc(effLabel(c)) + "</code> " + evTag(c.ev) + " in <code>" + esc(c.fn) + "</code> " + link(c.span, c.kind == "removed" ? "" : linkBase) + "</h3>");
+      let items: string[] = ["<ol class=\"path\">"];
+      let k: usize = 0;
+      while (k < c.path.length) {
+        items.push("<li>" + (k == 0 ? "" : "<span class=\"via\">calls</span> ") + "<code>" + esc(c.path[k].node) + "</code> " + link(c.path[k].span, c.kind == "removed" ? "" : linkBase) + "</li>");
+        k += 1;
+      }
+      items.push("</ol>");
+      o.push(items.join("\n"));
+      for (const p of c.reach.paths) {
+        o.push("<p class=\"muted\">reached from entry point <code>" + esc(p.steps[0].node) + "</code> (" + esc(p.ev) + ")</p>");
+      }
+    }
   }
   if (d.newPaths.length > 0 || d.goneCalls.length > 0) {
     o.push("<h2>New and removed call paths</h2>");

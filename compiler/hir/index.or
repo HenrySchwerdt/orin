@@ -45,15 +45,37 @@ export type ImplLink = { cls: usize; iface: usize; span: Span; };
 //           of a function value and for an I/O operation
 //   ev      "MUST" (static call in the body), "MAY" (inside a closure body that runs only if the
 //           closure is called, or a function used as a value), "UNKNOWN" (call of a function value)
-//   via     "direct" | "method" | "constructor" | "virtual" | "bound" | "value" | "indirect" | "io:<op>"
-// In source order per function; not deduplicated. The invariants are what OSIG consumers rely on: a known evidence
-// level, a known edge kind, and no callee for a call whose target is unknown.
+//   via     "direct" | "method" | "constructor" | "virtual" | "bound" | "value" | "indirect" | "unresolved" | "io:<op>"
+// In source order per function; not deduplicated.
+//
+// Two further facts feed the effect analysis (ADR-0037 D2, compiler/analysis/effects.or); they never change the
+// edges of the graph:
+//   param   for a call of a function value: the index of the parameter of the enclosing ordinary function that is
+//           called (`f(x)` where `f` is a parameter), else -1. Parameter indices are HIR parameter indices (a
+//           method's receiver is parameter 0), the same numbering `fnArgs` uses.
+//   fnArgs  for a call of a known callee with function-typed arguments: one comma-separated entry per argument
+//           (a virtual call has a leading empty entry for the receiver, so that positions are HIR parameter
+//           indices): "" (not a function), "c" (closure literal: its calls are MAY edges of the creator), "v" (a
+//           named function used as a value, a MAY edge of the creator), "p<k>" (parameter k of the enclosing
+//           function, passed on), "u" (a function value of any other origin). "" when no argument is a function.
+// The invariants are what OSIG and the effect analysis rely on: a known evidence level and edge kind, no callee when
+// the target is unknown, and a parameter index only for a call of a function value.
 @Invariant(isEvidence(this.ev))
 @Invariant(isCallVia(this.via))
 @Invariant(this.ev == "UNKNOWN" ==> this.callee.isNone())
-export type CallSite = { caller: usize; callee: Option<usize>; ev: string; via: string; span: Span; };
+@Invariant(this.param >= -1 && (this.param >= 0 ==> this.callee.isNone()))
+export type CallSite = {
+  caller: usize; callee: Option<usize>; ev: string; via: string; span: Span; param: int; fnArgs: string;
+};
 
-export type SemanticIndex = { defs: SymbolDef[]; refs: SymbolRef[]; types: TypeAt[]; impls: ImplLink[]; calls: CallSite[]; };
+// `fnDefs` / `fnKinds` map a HIR function id to the def it was lowered from (None: no def) and its kind (0 ordinary or
+// generic instance, 1 lifted closure body, 2 function-value wrapper); both are empty when `typed` is false.
+// `typed` is true when the program type-checked: only then are `calls` complete (a partial index has no call sites,
+// so a summary computed from it would claim purity that nobody checked).
+export type SemanticIndex = {
+  defs: SymbolDef[]; refs: SymbolRef[]; types: TypeAt[]; impls: ImplLink[]; calls: CallSite[];
+  fnDefs: Option<usize>[]; fnKinds: usize[]; typed: bool;
+};
 
 // An evidence level of a call site.
 export function isEvidence(ev: string): bool {
@@ -63,5 +85,5 @@ export function isEvidence(ev: string): bool {
 // An edge kind of a call site.
 export function isCallVia(via: string): bool {
   return via == "direct" || via == "method" || via == "constructor" || via == "virtual" || via == "bound"
-      || via == "value" || via == "indirect" || via.startsWith("io:");
+      || via == "value" || via == "indirect" || via == "unresolved" || via.startsWith("io:");
 }
