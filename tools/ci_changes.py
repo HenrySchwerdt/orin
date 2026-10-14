@@ -14,7 +14,7 @@ std is embedded in the compiler:
 
 A push to main, a scheduled run and a manual run select everything (the safety net for this filter).
 
-Prints `key=value` lines for $GITHUB_OUTPUT. `--selftest` checks the rules on examples.
+Prints `key=value` lines for $GITHUB_OUTPUT (`mutant_jobs`: the std-mutants matrix, the slow modules split into shards). `--selftest` checks the rules on examples.
 Usage: python3 tools/ci_changes.py [--base SHA] [--all] [--selftest]
 """
 import json
@@ -22,6 +22,9 @@ import subprocess
 import sys
 
 MODULES = ["bytes", "utf8", "collections", "http", "net", "text", "taskcore"]
+# modules whose mutants are split over several CI jobs (tools/mutate_std.py --shard I/N): the http mutants run the slow
+# property tests, about 15 minutes on one runner
+SHARDS = {"http": 3}
 ALL_MUTANTS = ["tools/mutate_std.py", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
 MACOS = ("compiler/", "runtime/", "platform/", "seed/", "tools/", ".github/")
 
@@ -46,6 +49,11 @@ def decide(files, everything=False):
     return {"code": code, "macos": macos, "vscode": vscode, "mutants": mutants}
 
 
+def mutant_jobs(mutants):
+    """The std-mutants matrix: one {module, shard} entry per job; the shards of a module together run all its mutants."""
+    return [{"module": m, "shard": "%d/%d" % (i, SHARDS.get(m, 1))} for m in mutants for i in range(1, SHARDS.get(m, 1) + 1)]
+
+
 def selftest():
     cases = [
         (["docs/roadmap.md"], {"code": False, "macos": False, "vscode": False, "mutants": []}),
@@ -64,11 +72,16 @@ def selftest():
         if got != want:
             print("FAIL %s: got %s, want %s" % (files, got, want))
             bad += 1
+    jobs = mutant_jobs(["bytes", "http"])
+    if jobs != [{"module": "bytes", "shard": "1/1"}, {"module": "http", "shard": "1/3"}, {"module": "http", "shard": "2/3"},
+                {"module": "http", "shard": "3/3"}] or mutant_jobs([]) != []:
+        print("FAIL mutant_jobs: %s" % jobs)
+        bad += 1
     full = decide([], everything=True)
     if not (full["code"] and full["macos"] and full["vscode"] and full["mutants"] == MODULES):
         print("FAIL everything")
         bad += 1
-    print("ci_changes selftest: %d cases, %d failed" % (len(cases) + 1, bad))
+    print("ci_changes selftest: %d cases, %d failed" % (len(cases) + 2, bad))
     return 1 if bad else 0
 
 
@@ -92,6 +105,7 @@ def main():
     print("macos=%s" % str(d["macos"]).lower())
     print("vscode=%s" % str(d["vscode"]).lower())
     print("mutants=%s" % json.dumps(d["mutants"]))
+    print("mutant_jobs=%s" % json.dumps(mutant_jobs(d["mutants"])))
     return 0
 
 

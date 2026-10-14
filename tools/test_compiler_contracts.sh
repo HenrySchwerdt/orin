@@ -17,15 +17,22 @@ mkdir -p "$B"
 echo "[contracts] orin2 --check-contracts compiles compiler/main.or"
 $ORIN2 compile compiler/main.or --check-contracts -o $B/orin_cc.c
 cc -O2 -w -I runtime $B/orin_cc.c runtime/orin_runtime.c platform/orin_platform.c -lm -o $B/orin_cc
+# Steps 1 and 2 are independent and run at the same time (the suite runs in parallel itself); the suite's output is
+# held back and printed after step 1, so the output is in the same order as when they ran one after the other.
+echo "[contracts] suite '$SUITE' with the contract-checked compiler" > $B/suite.out
+python3 tools/run_tests.py --orinc $B/orin_cc --suite $SUITE >> $B/suite.out 2>&1 &
+SUITE_PID=$!
 echo "[contracts] contract-checked compiler self-compiles compiler/main.or"
-$B/orin_cc compile compiler/main.or -o $B/self.c
+if ! $B/orin_cc compile compiler/main.or -o $B/self.c; then kill $SUITE_PID 2>/dev/null || true; exit 1; fi
 if cmp -s $B/self.c build/bootstrap/stage2.c; then
   echo "[contracts] output identical to stage2.c ($(wc -c < $B/self.c) bytes)"
 else
-  echo "[contracts] FAIL: output differs from stage2.c"; exit 1
+  echo "[contracts] FAIL: output differs from stage2.c"; kill $SUITE_PID 2>/dev/null || true; exit 1
 fi
-echo "[contracts] suite '$SUITE' with the contract-checked compiler"
-python3 tools/run_tests.py --orinc $B/orin_cc --suite $SUITE
+suite_rc=0
+wait $SUITE_PID || suite_rc=$?
+cat $B/suite.out
+[ $suite_rc = 0 ] || exit $suite_rc
 # The verifier (compiler/vc) is part of the compiler: run its own tests with the contract-checked build, so that its
 # contracts (and its class invariants) are checked on every verification condition it generates (ADR-0036).
 if command -v z3 >/dev/null 2>&1; then

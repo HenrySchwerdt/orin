@@ -131,3 +131,49 @@ assert on the values (the tasks of `tests/std/task_test.or` do). A trap in a tas
 reported at its `join` or at the end of the scope as `task panicked: <message>`. Do not assert on the order of output of two tasks.
 `movedCount()` / `copiedCount()` of `std:task` count what this task sent by move or by deep copy; whether a fresh value is moved depends
 on the build (optimiser, contract checking), so pin it only in the default build (`tests/concurrency/move_counts.or`).
+
+## Fast local loop and parallel tests
+
+This section is about the repository's own test tools (`tools/`), not `orin test`.
+
+**Iterate with `tools/dev.sh`.** It builds `build/dev/orin` from the current tree with *one* self-compile of
+`compiler/main.or` by the existing `build/bootstrap/orin2` (by the seed compiler `orin0` if there is no `orin2`), with
+the C at `-O1`, and then runs a subset with that compiler. The build is skipped when no input changed (the compiler
+sources, everything they embed, the runtime and the building compiler; `build/dev/stamp`). A stale embedded std is
+regenerated (`tools/embed_prelude.py`).
+
+```bash
+tools/dev.sh                          # build build/dev/orin only
+tools/dev.sh test                     # conformance, all suites (or: default | next | all)
+tools/dev.sh test tests/run/arith_basic.or  # one conformance test (or any substring of `run/name`, `next/errors/name`, ...)
+tools/dev.sh std http                 # the std tests of one module (or a file; no argument: all)
+tools/dev.sh tooling                  # tooling unit tests, LSP, MCP, OSIG, effects
+```
+
+**Required before a PR.** `build/dev/orin` is a stage-1 compiler: it does not show that the compiler reproduces itself.
+Before a pull request run `tools/bootstrap.sh` (seed -> orin0 -> orin1 -> orin2 -> stage3, the fixed point
+`stage2.c == stage3.c`, conformance) and the suites your change touches with `build/bootstrap/orin2` (`tools/ci_local.sh`
+runs the whole Linux CI). `bootstrap.sh` builds orin0 and orin1 at `-O1` (`STAGE01_CFLAGS`) and orin2 at `-O2`
+(`CFLAGS`): orin0 and orin1 compile the compiler only once, so the C compile at `-O2` costs more than it saves. The fixed
+point compares generated C, not binaries, so it is unchanged; `STAGE01_CFLAGS="-O2 -w"` gives the old all-`-O2` build.
+
+**Parallel cases.** Every test tool runs its independent cases in parallel, as many as there are CPUs; `-j N` or
+`ORIN_JOBS=N` overrides it (`-j 1` = sequential). The output does not depend on `-j`: results are printed in the fixed
+order of the sequential run, and failures are reported as before (the shell scripts stop at the first failing case in
+that order). Parallel: `run_tests.py` (tests), `test_std.sh` (test files with and without contracts, expect-trap
+tests), `test_tooling.sh` (unit test files and the resources / capabilities / net scripts; the guard for unwired unit
+tests still runs), `mutate_std.py` (mutants, each in its own directory; also `--shard I/N`), `test_verify_contracts.py`
+(the files; each runs in its own working directory because the verifier writes its solver queries to
+`build/contracts-vc/`), `test_compiler_contracts.sh` (the self-compile check and the suite run at the same time).
+`run_tests.py` compiles the runtime once per run instead of once per test (same flags; keyed by the sources). `tools/parallel.py`
+is the shared helper. `test_lsp.py` and `test_mcp.py` are one protocol session each and `test_osig.py` / `test_effects.py`
+take seconds, so they stay sequential; `--orin PATH` skips their compiler build.
+
+**CI.** The `build` job caches `build/bootstrap/orin2` and `stage2.c` (`actions/cache`), keyed by the hash of
+`compiler/`, `std/`, `array/`, `stdlib/`, `runtime/`, `platform/`, `seed/`, `tools/bootstrap.sh` and
+`tools/embed_prelude.py`. A pull request with a hit skips the bootstrap (the conformance run it would do is covered by the
+`sanitize` job: the same tests with the same compiler, under ASan + UBSan). An entry is only written after a full
+bootstrap passed. A push to `main`, the nightly run and a manual run never read the cache: they always bootstrap from the
+seed, so a cache cannot hide a broken fixed point on `main`. The http mutants run as three matrix jobs (`--shard`,
+`tools/ci_changes.py`). The tooling job runs the LSP and MCP tests against `orin2` instead of building the same compiler
+twice more.
