@@ -217,7 +217,92 @@ A diagnostic must separate `UNKNOWN` (solver limitation, abstraction or
 unresolved target) from `REFUTED` (real counterexample); UNKNOWN is never
 reported as a discovered crashing input.
 
-## 6. Recovery semantics and safety constraints
+## 6. Proof-directed check insertion and optimisation (proposed)
+
+The compiler, not the programmer, owns the lowering of safety obligations into
+runtime checks. Developers specify semantic contracts (`@Requires`, `@Ensures`,
+`@Invariant`, and `@NoTrap`) and ordinary validation logic. The compiler
+combines path-sensitive verification with call summaries and optimisation to
+place **only the checks that remain necessary** in the configured safety policy.
+
+For every potential trap or runtime-enforced contract:
+
+1. **Prove first.** If an obligation is VERIFIED under the path condition at
+   the actual operation/call site, emit **no redundant safety check**, subject
+   to the build's explicit `--check-contracts` testing/debug policy.
+   A preceding `if` guard counts if it dominates the operation and its
+   established predicate still holds after all intervening mutations.
+2. **REFUTED means diagnose.** A genuine counterexample is an error in the
+   relevant strict verification policy, not an invitation to silently insert a
+   `recover` and conceal a known invalid call.
+3. **UNKNOWN is not failure.** If proof is unavailable (solver timeout,
+   unsupported construct, unknown dynamic target), preserve a sound runtime
+   check where possible; classify the *potential* fault separately from a
+   demonstrated one. A proved-no-trap assertion may not depend on an UNKNOWN
+   operation being silently ignored.
+4. **Place checks at an efficient, semantics-preserving point.** The preferred
+   site is the earliest safe point that avoids repeated work **without**
+   checking too early for observable correctness. Examples: hoist a
+   loop-invariant bounds check outside a loop if the relevant value and array
+   shape do not change; reuse a dominating checked predicate within a branch;
+   eliminate a duplicate callee-entry check when the caller already proved it.
+   For checks depending on mutable state, check at the latest necessary point
+   or after the last invalidating write. Use SSA/MIR dominance, data-flow,
+   alias/mutation analysis and an explicit notion of side-effect ordering.
+5. **Preserve semantics and blame.** Moving a check must not change which
+   inputs are accepted, when side effects happen, whether an operation traps,
+   the required error category or caller/callee blame. Do not hoist a check
+   above an operation that may mutate its operands, above a conditional
+   branch where it need not run, or across externally visible I/O without a
+   sound equivalence proof. In particular, a later `@Ensures` cannot in
+   general be turned into an earlier input check; that would change the
+   postcondition's meaning.
+6. **Performance is a constrained optimisation.** Aim to minimise runtime
+   overhead and redundant checks, but guarantee semantic equivalence first.
+   Claim "optimally placed" only against an explicitly stated cost model,
+   not as a universal global optimum. Compare with contract-check-enabled
+   builds and measure generated C/LLVM on representative benchmarks.
+7. **Strict policy only needs recovery for escaping, unproved trap risks.**
+   When a non-provable condition is handled by a guard with `Result.Err`,
+   a checked API, a propagated `@Requires`, or a valid proof elsewhere,
+   **no recovery boundary is required**. When a runtime-check failure can
+   escape a long-lived entrypoint as an uncontained trap, strict mode demands
+   a *verified-safe* fault-containment boundary or rejects the program.
+   It never mandates `recover` solely because a grant is used or input
+   came from an HTTP request. Some faults cannot be safely recovered and
+   must instead be rejected or isolated at process level.
+8. **Policy modes remain explicit.** Normal builds currently erase
+   contracts; this ADR proposes a future safety-checked release mode, not
+   an unannounced change to existing semantics. The exact CLI surface is
+   intentionally open. Any optimised check elimination requires an actual
+   proof; UNKNOWN checks cannot be omitted while claiming safety.
+
+Illustrative proof-directed lowering:
+
+```orin
+@Requires(x > 0)
+@NoTrap
+function positive(x: int): int { return x; }
+
+@NoTrap
+function request(x: int): Result<int, string> {
+    if (x <= 0) { return Err("invalid"); }
+    return Ok(positive(x)); // path condition proves x > 0
+}
+```
+
+The proposed strict release compilation emits **no second runtime check**
+for `positive`'s precondition at this call. If the guard is deleted,
+`@NoTrap request` is not VERIFIED. The compiler should suggest restoring
+validation or explicitly forwarding the precondition, not immediately
+inserting a `recover`.
+
+Report for each check: its source obligation, VERIFIED/REFUTED/UNKNOWN status,
+the proof or assumptions, whether a runtime check remains, its emitted
+location, and why a check was hoisted, shared or eliminated. Expose this via
+CLI, LSP, MCP and OSIG so developers and agents can audit optimisation.
+
+## 7. Recovery semantics and safety constraints
 
 `recover` is a **fault-containment boundary**, not a general exception facility.
 The final syntax remains open. Prefer an isolated task/request/job supervisor
@@ -262,7 +347,7 @@ a justified safe containment boundary for every escaping modelled trap. It
 must NOT demand a recovery boundary just because code receives external input,
 holds a grant, or returns `Result`.
 
-## 7. Strict build policy and reporting
+## 8. Strict build policy and reporting
 
 Proposed independent controls (flags/names to be finalized):
 - **Verify annotations:** an `@NoTrap` that is REFUTED or UNKNOWN is a build
@@ -280,7 +365,7 @@ Proposed independent controls (flags/names to be finalized):
 
 No existing default compilation behavior changes just by accepting this ADR.
 
-## 8. Implementation order and acceptance tests
+## 9. Implementation order and acceptance tests
 
 ### Stage A: trap taxonomy and static VCs (no new runtime behavior)
 - Inventory all compiler-emitted/runtime traps from the C and LLVM backends,
@@ -299,11 +384,11 @@ No existing default compilation behavior changes just by accepting this ADR.
   platform primitives. Summaries are shared by CLI, LSP, MCP and OSIG.
 - Add positive/negative conformance cases and `UNKNOWN` regression tests.
 
-### Stage C: compiler advice and strict safety gates
+### Stage C: compiler advice, proof-directed check placement and strict safety gates
 - Suggest `@Requires` propagation vs guard/`Result` on unsatisfied call sites,
   `@Ensures` for useful return postconditions, `@Invariant` for state,
   `@NoTrap` for safety claims, and recovery **only at eligible boundaries**.
-- Machine-readable diagnostics with explanation/witness/source/quick-fix.
+- Implement verified-safe MIR check elimination/sharing/hoisting using dominance, mutation/alias analysis and preservation of external effect ordering; report emitted check sites and benchmark runtime overhead.\n- Machine-readable diagnostics with explanation/witness/source/quick-fix.
 - Per-package policy for entrypoint safety; no hidden inference changing the
   caller-visible API. Benchmark usefulness on the agent ergonomics task set.
 
@@ -327,7 +412,7 @@ No existing default compilation behavior changes just by accepting this ADR.
 6. Unknown callback/interface calls remain UNKNOWN.
 7. A correctly validated JSON-to-typed-data boundary feeding a proved core
    needs no recovery solely because data originated outside.
-8. Recovery cannot continue with invalidated state or claim to undo a write.
+8. Recovery cannot continue with invalidated state or claim to undo a write.\n9. A dominating guard eliminates a redundant runtime precondition check in strict release mode, but removing the guard restores the outstanding proof obligation.\n10. Check hoisting respects mutations, conditional reachability, I/O ordering and original violation blame.\n11. An UNKNOWN obligation retains a runtime check if supported, with a safe failure boundary at an exposed strict entrypoint; an already guarded `Result.Err` path needs no recover.
 
 ## Non-goals
 
