@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **Performance defects of the std fixed** (docs/benchmarks.md "Performance defects found while building the std"): `x = x + e` /
+  `x = x.concat(e)` on fields, elements and nested places are in-place (take/put of the slot, new MIR instruction `IArrayExtend`;
+  74 s -> 13 ms on bench/appends); mutating methods with a result no longer allocate a pair or copy a field receiver (MIR v1.10 in/out
+  receivers, `compiler/opt/pairs.or`; call loops 8-13x, std:http parse 2x); built-ins `bytesToString(u8[], start, len)` and
+  `stringToBytes(s)` (std:bytes / std:http use them: 8x); verifier definitions no longer scan all locals; LLVM `noundef` / `nonnull`.
+  New benchmarks (appends, mutres, bytesstr, http_parse, sortedmap, pqueue), Rust and Java counterparts in tools/bench.py.
 - **Capabilities, Stage A (ADR-0021 addendum, ADR-0027).** Standard I/O now needs a *grant*. Programs that do I/O are
   `function main(host: Host): void`; `Host` and every grant (`FsGrant`, `ProcessGrant`, `StdioGrant`, `ClockGrant`) are
   resource handles with the rules of `File` (only a parameter; E0450-E0452; the MIR verifier re-checks). Grants are derived

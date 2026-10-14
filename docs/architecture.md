@@ -89,6 +89,8 @@ so `stage2.c == stage3.c` still holds):
   `preludeSlot` + `preludeNames`) to the prelude function of that name; `exprBuiltin` (lower/body.or)
   then lowers them like an `XCall`. If the program has no such function (`--c-builtins`) the built-in is
   emitted as before, as a runtime C call.
+- **Optimiser passes** (`compiler/opt`): owned parameters and last-use moves (ADR-0010), take/put of slots read-retained-stored back and
+  in-place array concatenation (`inplace.or`, `chains.or`), pair-return elimination into in/out receivers (`pairs.or`, docs/mir.md v1.10).
 - **No bloat.** `compiler/opt/prune.or` (run after the optimiser and the verifier, just before C emission)
   drops prelude functions (names starting with `$`) that are not reachable from `main` or from the
   program's own functions, renumbering calls. `orin mir` / `orin verify` do not prune, so
