@@ -11,6 +11,7 @@ for t in path_test json_test analysis_test lsp_test verify_main package_test; do
 done
 # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
 $ORIN2 test compiler/tests/loader_test.or --runtime runtime
+$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime
 # checker unit tests: the env / fnctx foundation (2a) and the body checker's classes (2b)
 $ORIN2 test compiler/tests/check_env_test.or --runtime runtime
 $ORIN2 test compiler/tests/check_body_test.or --runtime runtime
