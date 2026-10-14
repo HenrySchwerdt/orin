@@ -1,0 +1,145 @@
+// Match exhaustiveness (spec 02): which variants of the scrutinee the arms seen so far cover, and the
+// verdict once all arms are in. The arms themselves are checked by the statement checker (stmt.or,
+// they contain blocks); patterns by pattern.or, which reports what each pattern covers.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Type, VariantDef } from "../hir";
+import { Env, isVoid, isIntish, isString, isBool } from "./env";
+
+export function noTypes(): Type[] {
+  const xs: Type[] = [];
+  return xs;
+}
+
+// The variants a value of type `t` is matched against: those of a union, or the built-in `Option` /
+// `Result` (`Some`, `None` / `Ok`, `Err`; an `Ok` of `void` has no payload). None for a scalar.
+export function variantsOf(env: Env, t: Type): Option<VariantDef[]> {
+  return match (t) {
+    TyUnion(u) => Some(env.unions[u].variants),
+    TyOption(x) => Some([VariantDef { name: "Some", payload: [x] }, VariantDef { name: "None", payload: noTypes() }]),
+    TyResult(a, b) => Some([
+      VariantDef { name: "Ok", payload: isVoid(a) ? noTypes() : [a] },
+      VariantDef { name: "Err", payload: [b] }
+    ]),
+    _ => None
+  };
+}
+
+// A scalar that is matched by literal patterns.
+export function isLiteralScrut(t: Type): bool {
+  return isIntish(t) || isString(t) || isBool(t);
+}
+
+// Number of `false` flags.
+export function uncoveredCount(covered: bool[]): usize {
+  let n: usize = 0;
+  for (const c of covered) {
+    if (!c) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+// Coverage only grows: a variant that was covered stays covered.
+export function coverageKept(before: bool[], after: bool[]): bool {
+  if (before.length != after.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < before.length) {
+    if (before[i] && !after[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function namesOf(variants: Option<VariantDef[]>): string[] {
+  let out: string[] = [];
+  match (variants) {
+    Some(vs) => {
+      for (const v of vs) {
+        out.push(v.name);
+      }
+    },
+    None => {}
+  }
+  return out;
+}
+
+function noneCovered(n: usize): bool[] {
+  let out: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(false);
+    i += 1;
+  }
+  return out;
+}
+
+// What the arms of one `match` cover. A variant scrutinee has one flag per variant; a scalar one has
+// none and is only exhaustive through a `_` arm (`wild`). The flags never shrink.
+@Invariant(this.covered.length == this.names.length)
+@Invariant(this.isVariant || this.names.length == 0)
+export class Coverage {
+  isVariant: bool;
+  names: string[];
+  covered: bool[];
+  wild: bool = false;
+
+  constructor(variants: Option<VariantDef[]>) {
+    this.isVariant = variants.isSome();
+    this.names = namesOf(variants);
+    this.covered = noneCovered(namesOf(variants).length);
+  }
+
+  // Takes over what a pattern covered (pattern.or returns the updated flags): at least what was
+  // covered before, and `_` once seen stays seen.
+  @Requires(coverageKept(this.covered, covered) && (wild || !this.wild))
+  @Ensures(this.wild == wild && this.covered.length == covered.length)
+  @Ensures(uncoveredCount(this.covered) <= uncoveredCount(old(this.covered)))
+  absorb(covered: bool[], wild: bool): void {
+    this.covered = covered;
+    this.wild = wild;
+  }
+
+  // Names of the variants no arm covers yet, in declaration order.
+  @Ensures(result.length == uncoveredCount(this.covered))
+  missing(): string[] {
+    let out: string[] = [];
+    let i: usize = 0;
+    while (i < this.names.length) {
+      if (!this.covered[i]) {
+        out.push(this.names[i]);
+      }
+      i += 1;
+    }
+    return out;
+  }
+
+  // A `_` arm, or every variant covered.
+  @Ensures(this.wild ==> result)
+  @Ensures(!this.isVariant && !this.wild ==> !result)
+  exhaustive(): bool {
+    return this.wild || (this.isVariant && uncoveredCount(this.covered) == 0);
+  }
+
+  // The E0402 error of a match that does not cover its scrutinee, at `span`; None when it does.
+  @Ensures(result.isNone() == this.exhaustive())
+  @Ensures(result.isSome() ==> result.unwrap().code == "E0402")
+  verdict(span: Span): Option<Diagnostic> {
+    if (this.wild) {
+      return None;
+    }
+    if (!this.isVariant) {
+      return Some(diag("E0402", span, "match on a scalar value requires a `_` arm"));
+    }
+    const missing = this.missing();
+    if (missing.length > 0) {
+      return Some(diag("E0402", span, "non-exhaustive match: missing " + missing.join(", ")));
+    }
+    return None;
+  }
+}

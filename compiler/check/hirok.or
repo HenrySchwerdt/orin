@@ -1,0 +1,145 @@
+// Well-formedness predicates over the HIR the body checker produces, for contracts. A check that
+// returns a node promises that every local the node mentions already exists (`localsBound`) and that
+// its type refers only to ids of the environment (`typeInRange`, env.or). They are written with loops
+// and direct recursion over the tree (no function values), so a clause may call them.
+
+import { HExpr, HStmt, HBlock, HArm, HPattern, Place, Function } from "../hir";
+
+// Every local of `e` (a read, a write target or a binding) has an id below `n`.
+export function localsBound(e: HExpr, n: usize): bool {
+  return match (e.kind) {
+    XLocal(l) => l < n,
+    XUnary(_, a) => localsBound(a, n),
+    XBinary(_, a, b) => localsBound(a, n) && localsBound(b, n),
+    XCall(_, xs) => allBound(xs, n),
+    XBuiltin(_, xs) => allBound(xs, n),
+    XMutMethod(_, p, xs) => placeBound(p, n) && allBound(xs, n),
+    XField(b, _, _) => localsBound(b, n),
+    XIndex(a, i) => localsBound(a, n) && localsBound(i, n),
+    XRecord(_, sp, fs) => {
+      let ok = match (sp) {
+        Some(s) => localsBound(s, n),
+        None => true
+      };
+      for (const f of fs) {
+        ok = ok && localsBound(f.value, n);
+      }
+      return ok;
+    },
+    XVariant(_, xs) => allBound(xs, n),
+    XArray(xs) => allBound(xs, n),
+    XTry(a) => localsBound(a, n),
+    XCond(c, t, f) => localsBound(c, n) && localsBound(t, n) && localsBound(f, n),
+    XMatch(s, arms) => {
+      let ok = localsBound(s, n);
+      for (const a of arms) {
+        ok = ok && armBound(a, n);
+      }
+      return ok;
+    },
+    XClosure(_, caps) => allBound(caps, n),
+    XCallIndirect(c, xs) => localsBound(c, n) && allBound(xs, n),
+    XIface(_, v) => localsBound(v, n),
+    XCallVirtual(r, _, xs) => localsBound(r, n) && allBound(xs, n),
+    _ => true
+  };
+}
+
+export function allBound(xs: HExpr[], n: usize): bool {
+  for (const x of xs) {
+    if (!localsBound(x, n)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function placeBound(p: Place, n: usize): bool {
+  if (p.root >= n) {
+    return false;
+  }
+  for (const el of p.path) {
+    const ok = match (el) {
+      PIndex(ix) => localsBound(ix, n),
+      PField(_, _) => true
+    };
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function patternBound(p: HPattern, n: usize): bool {
+  return match (p) {
+    HPVariant(_, bs) => {
+      for (const b of bs) {
+        match (b) {
+          Some(l) => {
+            if (l >= n) {
+              return false;
+            }
+          },
+          None => {}
+        }
+      }
+      return true;
+    },
+    _ => true
+  };
+}
+
+function armBound(a: HArm, n: usize): bool {
+  const vok = match (a.value) {
+    Some(v) => localsBound(v, n),
+    None => true
+  };
+  return patternBound(a.pattern, n) && vok && blockBound(a.body, n);
+}
+
+export function blockBound(b: HBlock, n: usize): bool {
+  for (const s of b.stmts) {
+    if (!stmtBound(s, n)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function stmtBound(s: HStmt, n: usize): bool {
+  return match (s) {
+    HLet(l, e) => l < n && localsBound(e, n),
+    HAssign(p, _, e) => placeBound(p, n) && localsBound(e, n),
+    HExprStmt(e) => localsBound(e, n),
+    HIf(c, t, e) => {
+      const eok = match (e) {
+        Some(b) => blockBound(b, n),
+        None => true
+      };
+      return localsBound(c, n) && blockBound(t, n) && eok;
+    },
+    HWhile(c, b) => localsBound(c, n) && blockBound(b, n),
+    HForOf(l, e, b) => l < n && localsBound(e, n) && blockBound(b, n),
+    HBreak => true,
+    HContinue => true,
+    HReturn(v) => match (v) {
+      Some(e) => localsBound(e, n),
+      None => true
+    },
+    HBlockStmt(b) => blockBound(b, n)
+  };
+}
+
+export function allStmtsBound(ss: HStmt[], n: usize): bool {
+  for (const s of ss) {
+    if (!stmtBound(s, n)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A lifted function mentions only its own locals, and its parameters are among them.
+export function functionBound(f: Function): bool {
+  return f.paramCount <= f.locals.length && blockBound(f.body, f.locals.length);
+}

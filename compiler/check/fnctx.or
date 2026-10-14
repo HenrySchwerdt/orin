@@ -1,10 +1,11 @@
-// Per-function checking context: locals, scope stack and loop stack. Functions take a context
-// and return the updated one (values are copy-on-write).
+// Per-function checking context (class `FnCtx`): locals, scope stack, loop stack, hoisted statements,
+// captures. It is the state of one `ExprChecker` (expr.or); values are copy-on-write, so a snapshot
+// (`const saved = fx`) is cheap and restoring it undoes a failed trial check.
 
 import { Diagnostic, diag } from "../diag";
 import { Ident } from "../syntax";
-import { Type, Local, HStmt, HExpr } from "../hir";
-import { FuncInfo, Env } from "./env";
+import { Type, Local, HStmt, HExpr, Place } from "../hir";
+import { FuncInfo, Env, typeEq } from "./env";
 
 // What a visible name is bound to: the local's id and the scope level it was declared at.
 type Bind = { id: usize; level: usize; };
@@ -152,94 +153,307 @@ export class Captures {
   }
 }
 
-export type FnCtx = {
+
+// The environment tables only ever grow while a body is checked (generic instances, lifted closures).
+function envGrew(old: Env, e: Env): bool {
+  return e.insts.size() >= old.insts.size()
+      && e.funcs.length >= old.funcs.length
+      && e.records.length >= old.records.length
+      && e.vtables.length >= old.vtables.length;
+}
+
+// True when the instance, function, record and vtable tables of `e` are exactly as large as those of
+// `old` (no instance was created): `adopt` then keeps the current environment.
+function sameTables(old: Env, e: Env): bool {
+  return e.insts.size() == old.insts.size()
+      && e.funcs.length == old.funcs.length
+      && e.records.length == old.records.length
+      && e.vtables.length == old.vtables.length;
+}
+
+// The state of the function body being checked: its locals and their visible names, the loop stack,
+// the environment (which grows as generic instances are created), the statements hoisted out of the
+// expression being checked, the mutation probe and, for an arrow function, the snapshot of the
+// enclosing function and the captures. One `FnCtx` is owned by one `ExprChecker`; an arrow function
+// body gets a context of its own (`newClosureCtx`).
+//
+// Invariants: a scope is always open (the parameters' scope at least); every capture is a local;
+// `cmode` is one of the four contract modes; a result type is only inferred (`retSeen`) for a closure
+// that asked for it; a closure has its environment local 0; the type parameters and their bindings are
+// parallel; an ordinary function's lowered result type is its source result type.
+@Invariant(this.scope.depth() >= 1)
+@Invariant(this.caps.size() <= this.locals.length)
+@Invariant(this.cmode >= 0 && this.cmode <= 3)
+@Invariant(this.retSeen.isSome() ==> this.retInfer)
+@Invariant(this.outer.isSome() ==> this.locals.length >= 1)
+@Invariant(this.tpNames.length == this.tpTys.length)
+@Invariant(this.fmode >= 0 && this.fmode <= 6 && this.clsAcc >= -1)
+@Invariant(this.fmode == 0 ==> typeEq(this.ret, this.lret))
+export class FnCtx {
   unit: usize;
-  ret: Type;
+  ret: Type; // the source-level result type
   locals: Local[];
   scope: Scope; // the visible local names
-  loops: bool[]; // one flag per enclosing loop: has a `break` targeting it been seen?
+  loops: bool[] = []; // one flag per enclosing loop: has a `break` targeting it been seen?
   env: Env; // current environment: grows as generic instances are created
-  tpNames: string[]; // type parameters of the function being checked ...
-  tpTys: Type[]; // ... and their bindings (opaque types in an abstract check)
-  abs: bool; // abstract check of a generic body: no function instances are created
-  depth: usize; // instantiation depth of the function being checked
+  tpNames: string[] = []; // type parameters of the function being checked ...
+  tpTys: Type[] = []; // ... and their bindings (opaque types in an abstract check)
+  abs: bool = false; // abstract check of a generic body: no function instances are created
+  depth: usize = 0; // instantiation depth of the function being checked
   // Classes (ADR-0009): FuncInfo.mode / cls of the function being checked ...
-  fmode: int;
-  fcls: usize;
+  fmode: int = 0;
+  fcls: usize = 0;
   lret: Type; // the lowered return type (FuncInfo.ret); `ret` is the source-level one
   // ... statements hoisted out of the expression being checked (mutating method calls), flushed by
   // the enclosing block before the statement that contains the expression ...
-  pre: HStmt[];
-  tmps: usize; // counter for hoisting temporaries
+  pre: HStmt[] = [];
+  tmps: usize = 0; // counter for hoisting temporaries
   // ... and the mutation probe: while true, bodies are only analysed for `this` mutation (no HIR is kept).
-  probe: bool;
-  mutThis: bool; // a `this` place was mutated (set by the probe)
+  probe: bool = false;
+  mutThis: bool = false; // a `this` place was mutated (set by the probe)
   // Closures (ADR-0011). While an arrow function body is checked, `outer` is the context of the
   // enclosing function at the point of creation (a snapshot; never modified). A name that is not
   // a local of this function but is visible in `outer` becomes a *capture*: a fresh immutable local
-  // (`capIds`) initialised from the environment record, recorded in capNames / capTys.
-  outer: Option<FnCtx>;
-  caps: Captures;
+  // initialised from the environment record, recorded in `caps`.
+  outer: Option<FnCtx> = None;
+  caps: Captures = new Captures();
   qname: string; // name of the function being checked (prefix of its lifted closures)
-  ncl: usize; // closures created so far in this function
-  retInfer: bool; // arrow block body without a known result type: `ret` is inferred from `return`s
-  retSeen: Option<Type>;
-  clsAcc: int; // class whose private members are visible here (-1: none); closures inherit it
-  selfName: string; // name of the `let` whose initialiser is being checked ("" if none)
-  pendLet: string; // set by `let` while checking its initialiser, consumed by an arrow
+  ncl: usize = 0; // closures created so far in this function
+  retInfer: bool = false; // arrow block body without a known result type: `ret` is inferred from `return`s
+  retSeen: Option<Type> = None;
+  clsAcc: int = -1; // class whose private members are visible here (-1: none); closures inherit it
+  selfName: string = ""; // name of the `let` whose initialiser is being checked ("" if none)
+  pendLet: string = ""; // set by `let` while checking its initialiser, consumed by an arrow
   // Contract clauses (ADR-0012): 0 ordinary code, 1 contract expression (`@Requires`, `@Invariant`,
   // `@Decreases`), 2 `@Ensures` expression (`result`, `old(..)`), 3 inside `old(..)`; and the checked
   // expressions of the loop clauses seen so far (for the purity pass).
-  cmode: int;
-  cexprs: HExpr[];
-};
+  cmode: int = 0;
+  cexprs: HExpr[] = [];
 
-export type VarOut = { fx: FnCtx; id: Option<usize>; };
+  @Requires(scope.depth() >= 1)
+  constructor(unit: usize, qname: string, env: Env, locals: Local[], scope: Scope, ret: Type) {
+    this.unit = unit;
+    this.qname = qname;
+    this.env = env;
+    this.locals = locals;
+    this.scope = scope;
+    this.ret = ret;
+    this.lret = ret;
+  }
 
-export type LocalOut = { fx: FnCtx; id: usize; };
-export type LoopOut = { fx: FnCtx; broke: bool; };
+  // ---- names and locals ------------------------------------------------------------------------
 
-// A context with the defaults every function starts with; the two constructors below set the rest.
-function blankCtx(
-  unit: usize,
-  qname: string,
-  env: Env,
-  locals: Local[],
-  scope: Scope,
-  ret: Type,
-): FnCtx {
-  return FnCtx {
-    unit: unit,
-    ret: ret,
-    locals: locals,
-    scope: scope,
-    loops: [],
-    env: env,
-    tpNames: [],
-    tpTys: [],
-    abs: false,
-    depth: 0,
-    fmode: 0,
-    fcls: 0,
-    lret: ret,
-    pre: [],
-    tmps: 0,
-    probe: false,
-    mutThis: false,
-    outer: None,
-    caps: new Captures(),
-    qname: qname,
-    ncl: 0,
-    retInfer: false,
-    retSeen: None,
-    clsAcc: -1,
-    selfName: "",
-    pendLet: "",
-    cmode: 0,
-    cexprs: [],
-  };
+  // A new local; it is not visible by name until `declare`d. Its id is its index.
+  @Ensures(result == old(this.locals.length) && this.locals.length == result + 1)
+  @Ensures(this.locals[result].name == name && this.locals[result].mutable == mutable)
+  @Ensures(typeEq(this.locals[result].ty, ty))
+  newLocal(name: string, ty: Type, mutable: bool): usize {
+    const id = this.locals.length;
+    this.locals.push(Local { name: name, ty: ty, mutable: mutable });
+    return id;
+  }
+
+  // A fresh immutable temporary `prefix` + counter, for statements hoisted out of an expression.
+  @Ensures(this.tmps == old(this.tmps) + 1 && this.locals.length == old(this.locals.length) + 1)
+  @Ensures(result == old(this.locals.length) && this.locals[result].name == prefix + old(this.tmps.toString()))
+  newTemp(prefix: string, ty: Type): usize {
+    const name = prefix + this.tmps.toString();
+    this.tmps += 1;
+    return this.newLocal(name, ty, false);
+  }
+
+  // Makes the local `id` visible as `name` in the innermost scope. Refused (E0304) only when the name
+  // is already declared in the innermost scope.
+  @Requires(id < this.locals.length)
+  @Ensures(this.scope.depth() == old(this.scope.depth()) && this.locals.length == old(this.locals.length))
+  @Ensures(result.isOk() ==> this.scope.lookup(name.name).isSome() && this.scope.lookup(name.name).unwrap() == id)
+  @Ensures(result.isErr() ==> result.unwrapErr().code == "E0304" && this.scope.inInnermost(name.name))
+  declare(name: Ident, id: usize): Result<void, Diagnostic> {
+    if (this.scope.inInnermost(name.name)) {
+      return Err(diag("E0304", name.span, `\`${name.name}\` is already declared in this block`));
+    }
+    this.scope.bind(name.name, id);
+    return Ok();
+  }
+
+  // True if `name` is already declared in the innermost scope.
+  @Ensures(result ==> this.scope.lookup(name).isSome())
+  declaredInScope(name: string): bool {
+    return this.scope.inInnermost(name);
+  }
+
+  @Ensures(result.isSome() ==> result.unwrap() < this.locals.length)
+  lookupLocal(name: string): Option<usize> {
+    return this.scope.lookup(name);
+  }
+
+  // Type of `name` as seen from here: a local, a capture, or (through the chain of enclosing
+  // functions) something an arrow function could capture.
+  varType(name: string): Option<Type> {
+    const l = this.scope.lookup(name);
+    if (l.isSome()) {
+      return Some(this.locals[l.unwrap()].ty);
+    }
+    const c = this.caps.indexOf(name);
+    if (c.isSome()) {
+      return Some(this.caps.tys[c.unwrap()]);
+    }
+    return match (this.outer) {
+      Some(o) => o.varType(name),
+      None => None,
+    };
+  }
+
+  isVisibleVar(name: string): bool {
+    return this.varType(name).isSome();
+  }
+
+  // Resolves a variable use: a local of this function, else (inside an arrow function) a capture
+  // of a variable of an enclosing function, which is registered on first use. The result is a local.
+  @Ensures(result.isSome() ==> result.unwrap() < this.locals.length)
+  @Ensures(this.locals.length >= old(this.locals.length) && this.caps.size() >= old(this.caps.size()))
+  @Ensures(result.isNone() ==> this.locals.length == old(this.locals.length))
+  lookupVar(name: string): Option<usize> {
+    const l = this.scope.lookup(name);
+    if (l.isSome()) {
+      return l;
+    }
+    const c = this.caps.indexOf(name);
+    if (c.isSome()) {
+      return Some(this.caps.ids[c.unwrap()]);
+    }
+    match (this.outer) {
+      Some(o) => {
+        const t = o.varType(name);
+        match (t) {
+          Some(ty) => {
+            const id = this.locals.length;
+            this.locals.push(Local { name: name, ty: ty, mutable: false });
+            this.caps.add(name, ty, id);
+            return Some(id);
+          },
+          None => {},
+        }
+      },
+      None => {},
+    }
+    return None;
+  }
+
+  @Ensures(result ==> id < this.locals.length)
+  isCapturedLocal(id: usize): bool {
+    return this.caps.hasId(id);
+  }
+
+  // ---- scopes and loops ------------------------------------------------------------------------
+
+  @Ensures(this.scope.depth() == old(this.scope.depth()) + 1 && this.locals.length == old(this.locals.length))
+  pushScope(): void {
+    this.scope.open();
+  }
+
+  @Requires(this.scope.depth() > 1)
+  @Ensures(this.scope.depth() + 1 == old(this.scope.depth()) && this.locals.length == old(this.locals.length))
+  popScope(): void {
+    this.scope.close();
+  }
+
+  @Ensures(this.loops.length == old(this.loops.length) + 1 && !this.loops[this.loops.length - 1])
+  pushLoop(): void {
+    this.loops.push(false);
+  }
+
+  // Leaves the innermost loop; true if a `break` targeted it.
+  @Requires(this.loops.length > 0)
+  @Ensures(this.loops.length + 1 == old(this.loops.length))
+  popLoop(): bool {
+    return this.loops.pop().unwrapOr(false);
+  }
+
+  // Records a `break` for the innermost loop; the caller has checked that a loop exists.
+  @Requires(this.loops.length > 0)
+  @Ensures(this.loops.length == old(this.loops.length) && this.loops[this.loops.length - 1])
+  markBreak(): void {
+    this.loops[this.loops.length - 1] = true;
+  }
+
+  // ---- hoisted statements ----------------------------------------------------------------------
+
+  // A statement that has to run before the one being checked (ADR-0009 hoisting).
+  @Ensures(this.pre.length == old(this.pre.length) + 1)
+  hoist(s: HStmt): void {
+    this.pre.push(s);
+  }
+
+  // Sets the pending list aside (the statement about to be checked starts with an empty one) and
+  // returns it; `restorePre` puts it back.
+  @Ensures(this.pre.length == 0 && result.length == old(this.pre.length))
+  stashPre(): HStmt[] {
+    const outer = this.pre;
+    const none: HStmt[] = [];
+    this.pre = none;
+    return outer;
+  }
+
+  @Ensures(this.pre.length == outer.length)
+  restorePre(outer: HStmt[]): void {
+    this.pre = outer;
+  }
+
+  // ---- environment -----------------------------------------------------------------------------
+
+  // Takes over `e`, the environment after a resolution or instantiation that may have created
+  // instances (they only ever grow the tables). An unchanged environment is not copied in.
+  @Requires(envGrew(this.env, e))
+  @Ensures(envGrew(old(this.env), this.env))
+  @Ensures(this.env.insts.size() >= e.insts.size() && this.env.funcs.length >= e.funcs.length)
+  adopt(e: Env): void {
+    if (sameTables(this.env, e)) {
+      return;
+    }
+    this.env = e;
+  }
+
+  // Replaces the environment by `e` (closure conversion adds records and lifted functions).
+  @Requires(envGrew(this.env, e))
+  @Ensures(this.env.records.length == e.records.length && this.env.funcs.length == e.funcs.length)
+  replaceEnv(e: Env): void {
+    this.env = e;
+  }
+
+  // ---- contract modes and mutation tracking ----------------------------------------------------
+
+  @Requires(m >= 0 && m <= 3)
+  @Ensures(this.cmode == m)
+  setCmode(m: int): void {
+    this.cmode = m;
+  }
+
+  // Records that the `this` of the method being analysed is mutated through `place`.
+  @Ensures(this.mutThis == (old(this.mutThis) || result))
+  @Ensures(result ==> this.lookupLocal("this").isSome() && this.lookupLocal("this").unwrap() == place.root)
+  markMut(place: Place): bool {
+    const t = this.scope.lookup("this");
+    if (t.isSome() && t.unwrap() == place.root) {
+      this.mutThis = true;
+      return true;
+    }
+    return false;
+  }
+
+  // True inside the constructor / methods of class `c` (private members are visible there).
+  @Ensures(result == (this.clsAcc == c.toInt()))
+  inClass(c: usize): bool {
+    return this.clsAcc == c.toInt();
+  }
+
+  // The local `this` as an expression (only called where `this` is in scope).
+  thisLocal(): usize {
+    return this.scope.lookup("this").unwrapOr(0);
+  }
 }
 
+// A context with the defaults every function starts with; the two constructors below set the rest.
 @Ensures(result.locals.length == f.paramLocals.length && result.scope.depth() == 1)
 @Ensures(result.loops.length == 0 && result.caps.size() == 0 && result.outer.isNone())
 @Ensures(paramsVisible(result, f))
@@ -250,7 +464,7 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
     scope.bind(l.name, i);
     i += 1;
   }
-  let fx = blankCtx(f.unit, f.qname, env, f.paramLocals, scope, f.mode == 0 ? f.ret : f.srcRet);
+  let fx = new FnCtx(f.unit, f.qname, env, f.paramLocals, scope, f.mode == 0 ? f.ret : f.srcRet);
   fx.tpNames = f.tpNames;
   fx.tpTys = f.tpTys;
   fx.abs = abs;
@@ -268,6 +482,7 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
 @Ensures(result.locals.length == names.length + 1
     && result.scope.depth() == 1
     && result.outer.isSome())
+@Ensures(result.abs == o.abs && result.probe == o.probe && result.clsAcc == o.clsAcc)
 export function newClosureCtx(
   o: FnCtx,
   qname: string,
@@ -284,7 +499,7 @@ export function newClosureCtx(
     scope.bind(names[i], i + 1);
     i += 1;
   }
-  let fx = blankCtx(o.unit, qname, o.env, locals, scope, ret);
+  let fx = new FnCtx(o.unit, qname, o.env, locals, scope, ret);
   fx.tpNames = o.tpNames;
   fx.tpTys = o.tpTys;
   fx.abs = o.abs;
@@ -297,135 +512,6 @@ export function newClosureCtx(
   return fx;
 }
 
-// Type of `name` as seen from `fx`: a local, a capture, or (through the chain of enclosing
-// functions) something an arrow function could capture.
-export function varType(fx: FnCtx, name: string): Option<Type> {
-  const l = lookupLocal(fx, name);
-  if (l.isSome()) {
-    return Some(fx.locals[l.unwrap()].ty);
-  }
-  const c = fx.caps.indexOf(name);
-  if (c.isSome()) {
-    return Some(fx.caps.tys[c.unwrap()]);
-  }
-  return match (fx.outer) {
-    Some(o) => varType(o, name),
-    None => None,
-  };
-}
-
-export function isVisibleVar(fx: FnCtx, name: string): bool {
-  return varType(fx, name).isSome();
-}
-
-// Resolves a variable use: a local of this function, else (inside an arrow function) a capture
-// of a variable of an enclosing function, which is registered on first use.
-@Ensures(varOutOk(fx, result))
-export function lookupVar(fx: FnCtx, name: string): VarOut {
-  const l = lookupLocal(fx, name);
-  if (l.isSome()) {
-    return VarOut { fx: fx, id: l };
-  }
-  const c = fx.caps.indexOf(name);
-  if (c.isSome()) {
-    return VarOut { fx: fx, id: Some(fx.caps.ids[c.unwrap()]) };
-  }
-  match (fx.outer) {
-    Some(o) => {
-      const t = varType(o, name);
-      match (t) {
-        Some(ty) => {
-          let f = fx;
-          const id = f.locals.length;
-          f.locals.push(Local { name: name, ty: ty, mutable: false });
-          f.caps.add(name, ty, id);
-          return VarOut { fx: f, id: Some(id) };
-        },
-        None => {},
-      }
-    },
-    None => {},
-  }
-  return VarOut { fx: fx, id: None };
-}
-
-@Ensures(result ==> id < fx.locals.length)
-export function isCapturedLocal(fx: FnCtx, id: usize): bool {
-  return fx.caps.hasId(id);
-}
-
-@Ensures(result.scope.depth() == fx.scope.depth() + 1 && result.locals.length == fx.locals.length)
-export function pushScope(fx: FnCtx): FnCtx {
-  let f = fx;
-  f.scope.open();
-  return f;
-}
-
-@Requires(fx.scope.depth() > 0)
-@Ensures(result.scope.depth() + 1 == fx.scope.depth() && result.locals.length == fx.locals.length)
-export function popScope(fx: FnCtx): FnCtx {
-  let f = fx;
-  f.scope.close();
-  return f;
-}
-
-@Ensures(result.isSome() ==> result.unwrap() < fx.locals.length)
-export function lookupLocal(fx: FnCtx, name: string): Option<usize> {
-  return fx.scope.lookup(name);
-}
-
-@Ensures(result.id == fx.locals.length && result.fx.locals.length == fx.locals.length + 1)
-@Ensures(result.fx.locals[result.id].name == name && result.fx.locals[result.id].mutable == mutable)
-export function newLocal(fx: FnCtx, name: string, ty: Type, mutable: bool): LocalOut {
-  let f = fx;
-  const id = f.locals.length;
-  f.locals.push(Local { name: name, ty: ty, mutable: mutable });
-  return LocalOut { fx: f, id: id };
-}
-
-// True if `name` is already declared in the innermost scope.
-@Ensures(result ==> fx.scope.lookup(name).isSome())
-export function declaredInScope(fx: FnCtx, name: string): bool {
-  return fx.scope.inInnermost(name);
-}
-
-@Requires(id < fx.locals.length)
-@Ensures(declareOk(fx, name, id, result))
-export function declare(fx: FnCtx, name: Ident, id: usize): Result<FnCtx, Diagnostic> {
-  if (declaredInScope(fx, name.name)) {
-    return Err(diag("E0304", name.span, `\`${name.name}\` is already declared in this block`));
-  }
-  let f = fx;
-  f.scope.bind(name.name, id);
-  return Ok(f);
-}
-
-@Ensures(result.loops.length == fx.loops.length + 1)
-export function pushLoop(fx: FnCtx): FnCtx {
-  let f = fx;
-  f.loops.push(false);
-  return f;
-}
-
-@Requires(fx.loops.length > 0)
-@Ensures(result.fx.loops.length + 1 == fx.loops.length)
-export function popLoop(fx: FnCtx): LoopOut {
-  let f = fx;
-  const b = f.loops.pop();
-  return LoopOut { fx: f, broke: b.unwrapOr(false) };
-}
-
-// Records a `break` for the innermost loop; the caller has checked that a loop exists.
-@Requires(fx.loops.length > 0)
-@Ensures(result.loops.length == fx.loops.length && result.loops[result.loops.length - 1])
-export function markBreak(fx: FnCtx): FnCtx {
-  let f = fx;
-  if (f.loops.length > 0) {
-    f.loops[f.loops.length - 1] = true;
-  }
-  return f;
-}
-
 // Every parameter of `f` is a visible name of `fx`.
 function paramsVisible(fx: FnCtx, f: FuncInfo): bool {
   for (const l of f.paramLocals) {
@@ -434,24 +520,4 @@ function paramsVisible(fx: FnCtx, f: FuncInfo): bool {
     }
   }
   return true;
-}
-
-// A variable lookup is sound: a found id is a local of the returned context, which has the locals of
-// the one it started from (a capture only appends one).
-function varOutOk(fx: FnCtx, r: VarOut): bool {
-  return r.fx.locals.length >= fx.locals.length
-      && r.fx.caps.size() >= fx.caps.size()
-      && (r.id.isNone() || r.id.unwrap() < r.fx.locals.length);
-}
-
-// A declaration leaves the context as it was, plus the name; a refusal is the duplicate error and happens
-// only when the name is already in the innermost scope.
-function declareOk(fx: FnCtx, name: Ident, id: usize, r: Result<FnCtx, Diagnostic>): bool {
-  return match (r) {
-    Ok(f) => f.scope.lookup(name.name).isSome()
-        && f.scope.lookup(name.name).unwrap() == id
-        && f.scope.depth() == fx.scope.depth()
-        && f.locals.length == fx.locals.length,
-    Err(d) => d.code == "E0304" && fx.scope.inInnermost(name.name),
-  };
 }

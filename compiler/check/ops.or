@@ -1,0 +1,636 @@
+// Pure helpers of the body checker (expr.or, stmt.or): HIR node constructors, the syntactic shape of
+// expressions, the typing rules of literals and operators, the diagnostics that more than one place
+// reports, and the receiver purity rule of hoisted mutating calls. Nothing here reads or changes a
+// checking context; what needs one lives in fnctx.or or in the checkers.
+
+import { Span, Diagnostic, diag } from "../diag";
+import {
+  Ident, Expr, TypeDecl, TypeExpr, TNamed, AssignOp, BinaryOp, FieldDecl, Stmt, Block, FunctionDecl, Param,
+} from "../syntax";
+import {
+  Type, FieldDef, HExpr, HExprKind, Place, PlaceElem, BinOp, Builtin, intKindOf, kindSigned, i64Min,
+} from "../hir";
+import {
+  Env, FuncInfo, showType, typeEq, isBool, isString, isIntish, isFloatTy, isNumeric, isFn, isVoid, isSignedInt,
+} from "./env";
+import { litTypeOf, litFits, rangeText, intToStringOp, classSuffix } from "./ints";
+
+// ---------------------------------------------------------------------------
+// HIR nodes
+// ---------------------------------------------------------------------------
+
+export function mk(kind: HExprKind, ty: Type, span: Span): HExpr {
+  return HExpr { kind: kind, ty: ty, span: span };
+}
+
+export function noExprs(): HExpr[] {
+  const xs: HExpr[] = [];
+  return xs;
+}
+
+// The void marker returned for a hoisted mutating call: the statement `p = C.m(p, ..)` is already in
+// `fx.pre`; a statement whose expression is this marker emits nothing more.
+export function isNop(e: HExpr): bool {
+  return match (e.kind) {
+    XBool(_) => isVoid(e.ty),
+    _ => false
+  };
+}
+
+@Ensures(isNop(result) && isVoid(result.ty))
+export function nopExpr(span: Span): HExpr {
+  return mk(XBool(false), TyVoid, span);
+}
+
+export function isTrueLit(e: HExpr): bool {
+  return match (e.kind) {
+    XBool(b) => b,
+    _ => false
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Syntactic shape of expressions
+// ---------------------------------------------------------------------------
+
+export function isArithOp(op: BinaryOp): bool {
+  return match (op) {
+    BAdd => true,
+    BSub => true,
+    BMul => true,
+    BDiv => true,
+    BRem => true,
+    _ => false
+  };
+}
+
+// Syntactic "untyped numeric literal expression": adopts the type demanded by context (an integer
+// literal an int type, a float literal a float type; there is no conversion between the two, ADR-0018).
+export function untypedInt(e: Expr): bool {
+  return match (e.kind) {
+    EInt(_) => true,
+    EBigInt(_) => true,
+    EFloat(_) => true,
+    EUnary(op, x) => match (op) { UNeg => untypedInt(x), _ => false },
+    EBinary(op, l, r) => isArithOp(op) && untypedInt(l) && untypedInt(r),
+    _ => false
+  };
+}
+
+export function toBinOp(op: BinaryOp): BinOp {
+  return match (op) {
+    BAdd => OpAdd,
+    BSub => OpSub,
+    BMul => OpMul,
+    BDiv => OpDiv,
+    BRem => OpRem,
+    BEq => OpEq,
+    BNe => OpNe,
+    BLt => OpLt,
+    BLe => OpLe,
+    BGt => OpGt,
+    BGe => OpGe,
+    BAnd => OpAnd,
+    BOr => OpOr,
+    BImplies => OpOr
+  };
+}
+
+export function intishHint(exp: Option<Type>): Option<Type> {
+  return match (exp) {
+    Some(t) => isNumeric(t) ? Some(t) : None,
+    None => None
+  };
+}
+
+@Ensures(result.isSome() ==> isNumeric(t) && typeEq(result.unwrap(), t))
+export function hintOf(t: Type): Option<Type> {
+  return isNumeric(t) ? Some(t) : None;
+}
+
+// Expected type of a float literal: `f32` when the context says so, else `float`.
+export function expIsF32(exp: Option<Type>): bool {
+  return match (exp) {
+    Some(t) => match (t) { TyF32 => true, _ => false },
+    None => false
+  };
+}
+
+export function isFloatHint(exp: Option<Type>): bool {
+  return match (exp) {
+    Some(t) => isFloatTy(t),
+    None => false
+  };
+}
+
+export function intLitValue(e: Expr): Option<int> {
+  return match (e.kind) {
+    EInt(n) => Some(n),
+    _ => None
+  };
+}
+
+export function isArrowExpr(e: Expr): bool {
+  return match (e.kind) {
+    EArrow(_, _, _) => true,
+    _ => false
+  };
+}
+
+// The expected function type, if `exp` is one.
+export function expFn(exp: Option<Type>): Option<Type> {
+  return match (exp) {
+    Some(t) => isFn(t) ? Some(t) : None,
+    None => None
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fields and declarations
+// ---------------------------------------------------------------------------
+
+@Ensures(result.isSome() ==> result.unwrap() < fields.length && fields[result.unwrap()].name == name)
+@Ensures(result.isNone() ==> fields.every(f => f.name != name))
+export function fieldIndex(fields: FieldDef[], name: string): Option<usize> {
+  let i: usize = 0;
+  for (const f of fields) {
+    if (f.name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+@Ensures(result.isSome() ==> result.unwrap() < fields.length && fields[result.unwrap()].name.name == name)
+@Ensures(result.isNone() ==> fields.every(f => f.name.name != name))
+export function fieldDeclIndex(fields: FieldDecl[], name: string): Option<usize> {
+  let i: usize = 0;
+  for (const f of fields) {
+    if (f.name.name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The names whose `seen` flag is false.
+@Requires(names.length == seen.length)
+@Ensures(result.length <= names.length)
+@Ensures(result.length == seen.filter(s => !s).length)
+export function missingNames(names: string[], seen: bool[]): string[] {
+  let missing: string[] = [];
+  let k: usize = 0;
+  for (const n of names) {
+    if (!seen[k]) {
+      missing.push(n);
+    }
+    k += 1;
+  }
+  return missing;
+}
+
+export function recordHasFnField(fields: FieldDef[], name: string): bool {
+  const io = fieldIndex(fields, name);
+  if (io.isNone()) {
+    return false;
+  }
+  return isFn(fields[io.unwrap()].ty);
+}
+
+@Ensures(result.length == ps.length)
+export function paramNameList(ps: Ident[]): string[] {
+  let out: string[] = [];
+  for (const p of ps) {
+    out.push(p.name);
+  }
+  return out;
+}
+
+// `Name<P1, ..., Pn>` for a generic declaration: the "return type" of its constructors.
+export function selfTypeExpr(d: TypeDecl): TypeExpr {
+  let args: TypeExpr[] = [];
+  for (const p of d.typeParams) {
+    args.push(TypeExpr { kind: TNamed(p, []), span: p.span });
+  }
+  return TypeExpr { kind: TNamed(d.name, args), span: d.name.span };
+}
+
+// A placeholder declaration for a lifted function (an arrow body or a function-value wrapper).
+export function dummyDecl(name: string, span: Span): FunctionDecl {
+  const noTps: Ident[] = [];
+  const noParams: Param[] = [];
+  const noRet: Option<TypeExpr> = None;
+  const noStmts: Stmt[] = [];
+  return FunctionDecl {
+    exported: false,
+    name: Ident { name: name, span: span },
+    typeParams: noTps,
+    bounds: [],
+    params: noParams,
+    ret: noRet,
+    body: Block { stmts: noStmts, span: span },
+    contracts: [],
+    annotations: [],
+    span: span
+  };
+}
+
+// All types of `ts` but the first (the receiver of a method).
+@Ensures(result.length == (ts.length == 0 ? 0 : ts.length - 1))
+export function tailTypes(ts: Type[]): Type[] {
+  let out: Type[] = [];
+  let i: usize = 1;
+  while (i < ts.length) {
+    out.push(ts[i]);
+    i += 1;
+  }
+  return out;
+}
+
+@Ensures(result.length == binds.length)
+export function bindsOrVoid(binds: Option<Type>[]): Type[] {
+  let out: Type[] = [];
+  for (const b of binds) {
+    out.push(b.unwrapOr(TyVoid));
+  }
+  return out;
+}
+
+// A list of `n` absent pre-checked arguments.
+@Ensures(result.length == n && result.every(o => o.isNone()))
+export function noPre(n: usize): Option<HExpr>[] {
+  let out: Option<HExpr>[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(None);
+    i += 1;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Typing rules of literals and operators
+// ---------------------------------------------------------------------------
+
+export function litRange(env: Env, span: Span, text: string, t: Type): Diagnostic {
+  return diag(
+    "E0430",
+    span,
+    "integer literal `" + text + "` does not fit in `" + showType(env, t) + "` (" + rangeText(intKindOf(t)) + ")"
+  );
+}
+
+// An integer literal adopts the expected integer type (ADR-0022); it must fit.
+@Ensures(result.isOk() ==> isIntish(result.unwrap().ty) && litFits(n, false, result.unwrap().ty))
+export function intLiteral(env: Env, n: int, exp: Option<Type>, span: Span): Result<HExpr, Diagnostic> {
+  const t = litTypeOf(exp);
+  if (!litFits(n, false, t)) {
+    return Err(litRange(env, span, n.toString(), t));
+  }
+  return Ok(mk(XInt(n), t, span));
+}
+
+// A literal in 2^63 .. 2^64-1 (the lexer holds its 64-bit pattern): only `u64` and `usize` have room for it.
+@Ensures(result.isOk() ==> intKindOf(result.unwrap().ty) == 8 || intKindOf(result.unwrap().ty) == 9)
+export function bigIntLiteral(env: Env, n: int, exp: Option<Type>, span: Span): Result<HExpr, Diagnostic> {
+  const t = litTypeOf(exp);
+  const k = intKindOf(t);
+  if (k != 8 && k != 9) {
+    return Err(diag(
+      "E0430",
+      span,
+      "integer literal does not fit in `" + showType(env, t) + "`; values above 9223372036854775807 need type `u64` or `usize`"
+    ));
+  }
+  return Ok(mk(XInt(n), t, span));
+}
+
+// `-lit`: a negative integer literal has a signed type and must fit it.
+@Ensures(result.isOk() ==> kindSigned(intKindOf(result.unwrap().ty)) && litFits(lit, true, result.unwrap().ty))
+export function negIntLiteral(env: Env, lit: int, exp: Option<Type>, span: Span): Result<HExpr, Diagnostic> {
+  const t = litTypeOf(exp);
+  if (!kindSigned(intKindOf(t))) {
+    return Err(diag("E0400", span, "negative integer literal cannot have type `" + showType(env, t) + "`"));
+  }
+  if (!litFits(lit, true, t)) {
+    return Err(litRange(env, span, "-" + lit.toString(), t));
+  }
+  return Ok(mk(XInt(-lit), t, span));
+}
+
+// `-lit` for a literal above i64::MAX: only -9223372036854775808 is representable, as `int` / `isize`.
+@Ensures(result.isOk() ==> n == i64Min() && (intKindOf(result.unwrap().ty) == 3 || intKindOf(result.unwrap().ty) == 4))
+export function negBigLiteral(env: Env, n: int, exp: Option<Type>, span: Span): Result<HExpr, Diagnostic> {
+  const t = litTypeOf(exp);
+  const k = intKindOf(t);
+  if (n == i64Min() && (k == 3 || k == 4)) {
+    return Ok(mk(XInt(n), t, span));
+  }
+  return Err(diag("E0430", span, "negative integer literal does not fit in `" + showType(env, t) + "`"));
+}
+
+// `${e}` of a template literal: `string`, integers, `float`, `f32` and `bool` convert implicitly (ADR-0022).
+@Ensures(result.isOk() ==> isString(result.unwrap().ty))
+export function interpolated(env: Env, e: HExpr, span: Span): Result<HExpr, Diagnostic> {
+  const t = e.ty;
+  if (isString(t)) {
+    return Ok(e);
+  }
+  if (isIntish(t)) {
+    return Ok(mk(XBuiltin(intToStringOp(t), [e]), TyString, span));
+  }
+  const op: Option<Builtin> = match (t) {
+    TyFloat => Some(BFloatToString),
+    TyF32 => Some(BF32ToString),
+    TyBool => Some(BBoolToString),
+    _ => None
+  };
+  if (op.isSome()) {
+    return Ok(mk(XBuiltin(op.unwrap(), [e]), TyString, span));
+  }
+  return Err(diag(
+    "E0432",
+    span,
+    "cannot interpolate a value of type `" + showType(env, t)
+      + "` in a template literal; only `string`, integers, `float`, `f32` and `bool` convert implicitly, convert it explicitly (call `.toString()`)"
+  ));
+}
+
+// The error of `-x` for an operand that is neither a signed integer nor a float.
+@Ensures(isSignedInt(t) || isFloatTy(t) ? result.isNone() : result.isSome())
+export function negOperandErr(env: Env, t: Type, span: Span): Option<Diagnostic> {
+  if (!isSignedInt(t) && !isFloatTy(t)) {
+    return Some(diag("E0410", span, "cannot negate a value of type `" + showType(env, t) + "`"));
+  }
+  return None;
+}
+
+// `a && b` / `a || b` need `bool` operands.
+@Ensures(isBool(lt) && isBool(rt) ? result.isNone() : result.isSome())
+export function logicOperandErr(env: Env, lt: Type, rt: Type, span: Span): Option<Diagnostic> {
+  if (!isBool(lt) || !isBool(rt)) {
+    return Some(diag(
+      "E0410",
+      span,
+      "`&&`/`||` require `bool` operands, found `" + showType(env, lt) + "` and `"
+        + showType(env, rt) + "`"
+    ));
+  }
+  return None;
+}
+
+// `a ==> b` (contract expressions only) needs `bool` operands.
+@Ensures(isBool(lt) && isBool(rt) ? result.isNone() : result.isSome())
+export function impliesOperandErr(env: Env, lt: Type, rt: Type, span: Span): Option<Diagnostic> {
+  if (!isBool(lt) || !isBool(rt)) {
+    return Some(diag(
+      "E0410",
+      span,
+      "`==>` requires `bool` operands, found `" + showType(env, lt) + "` and `"
+        + showType(env, rt) + "`"
+    ));
+  }
+  return None;
+}
+
+// Is the arithmetic / comparison operator `op` defined for operands of type `lt`?
+export function opDefined(op: BinaryOp, lt: Type): bool {
+  return match (op) {
+    BAdd => isIntish(lt) || isFloatTy(lt) || isString(lt),
+    BSub => isIntish(lt) || isFloatTy(lt),
+    BMul => isIntish(lt) || isFloatTy(lt),
+    BDiv => isIntish(lt) || isFloatTy(lt),
+    BRem => isIntish(lt),
+    BEq => isIntish(lt) || isFloatTy(lt) || isBool(lt) || isString(lt),
+    BNe => isIntish(lt) || isFloatTy(lt) || isBool(lt) || isString(lt),
+    _ => isIntish(lt) || isFloatTy(lt)
+  };
+}
+
+// The result type of the arithmetic or comparison `l op r` on operands of types `lt` and `rt`: both
+// operands have the same type, the operator is defined for it, arithmetic keeps it and a comparison
+// yields `bool`.
+@Requires(!isLogicOp(op))
+@Ensures(result.isOk() ==> typeEq(lt, rt) && opDefined(op, lt))
+@Ensures(result.isOk() ==> (isArithOp(op) ? typeEq(result.unwrap(), lt) : isBool(result.unwrap())))
+export function binaryType(env: Env, op: BinaryOp, lt: Type, rt: Type, span: Span): Result<Type, Diagnostic> {
+  if (!typeEq(lt, rt) && isNumeric(lt) && isNumeric(rt)) {
+    return Err(diag(
+      "E0400",
+      span,
+      "cannot mix `" + showType(env, lt) + "` and `" + showType(env, rt) + "`; convert explicitly"
+    ));
+  }
+  if (!typeEq(lt, rt)) {
+    return Err(diag(
+      "E0410",
+      span,
+      "operands have different types `" + showType(env, lt) + "` and `" + showType(env, rt) + "`"
+    ));
+  }
+  if (!opDefined(op, lt)) {
+    if (isFn(lt)) {
+      return Err(diag("E0410", span, "function values cannot be compared (type `" + showType(env, lt) + "`)"));
+    }
+    return Err(diag("E0410", span, "operator is not defined for type `" + showType(env, lt) + "`"));
+  }
+  return Ok(isArithOp(op) ? lt : TyBool);
+}
+
+export function isLogicOp(op: BinaryOp): bool {
+  return match (op) { BAnd => true, BOr => true, BImplies => true, _ => false };
+}
+
+export function assignOpOf(op: AssignOp): Option<BinOp> {
+  return match (op) {
+    OpAssign => None,
+    OpAddAssign => Some(OpAdd),
+    OpSubAssign => Some(OpSub),
+    OpMulAssign => Some(OpMul),
+    OpDivAssign => Some(OpDiv),
+    OpRemAssign => Some(OpRem)
+  };
+}
+
+function isRemOp(o: BinOp): bool {
+  return match (o) { OpRem => true, _ => false };
+}
+
+function isAddOp(o: BinOp): bool {
+  return match (o) { OpAdd => true, _ => false };
+}
+
+// Is the compound assignment `place op= value` defined for a place of type `pty`?
+export function compoundAllowed(pty: Type, o: BinOp): bool {
+  return isIntish(pty) || (isFloatTy(pty) && !isRemOp(o)) || (isAddOp(o) && isString(pty));
+}
+
+// ---------------------------------------------------------------------------
+// Places
+// ---------------------------------------------------------------------------
+
+// The place `p` extended by one element of type `ty`.
+@Ensures(result.path.length == p.path.length + 1 && result.root == p.root && typeEq(result.ty, ty))
+export function extendPath(p: Place, elem: PlaceElem, ty: Type): Place {
+  let path = p.path;
+  path.push(elem);
+  return Place { root: p.root, path: path, ty: ty };
+}
+
+// Receiver index expressions are evaluated twice by the lowering `p = C.m(p, ..)`; only
+// side-effect-free ones are accepted.
+export function pureH(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XLocal(_) => true,
+    XField(b, _, _) => pureH(b),
+    XIndex(a, i) => pureH(a) && pureH(i),
+    XUnary(_, a) => pureH(a),
+    XBinary(_, a, b) => pureH(a) && pureH(b),
+    XBuiltin(b, xs) => {
+      let ok = match (b) {
+        BArrLength => true,
+        BStrLength => true,
+        BIntToUsize => true,
+        BUsizeToInt => true,
+        BIntConv => true,
+        BUIntConv => true,
+        BIntId => true,
+        _ => false
+      };
+      for (const x of xs) {
+        ok = ok && pureH(x);
+      }
+      return ok;
+    },
+    _ => false
+  };
+}
+
+export function purePlace(p: Place): bool {
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        if (!pureH(ix)) {
+          return false;
+        }
+      },
+      PField(_, _) => {}
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics reported from more than one place
+// ---------------------------------------------------------------------------
+
+export function noField(env: Env, name: Ident, t: Type): Diagnostic {
+  return diag("E0405", name.span, "no field `" + name.name + "` on type `" + showType(env, t) + "`");
+}
+
+// E0300 for an unknown name; inside `const f = (..) => ..` the name `f` itself gets a hint.
+export function unresolvedName(selfName: string, id: Ident): Diagnostic {
+  if (selfName != "" && id.name == selfName) {
+    return diag(
+      "E0300",
+      id.span,
+      "a closure cannot refer to itself (`" + id.name + "` is not defined inside its own initialiser); use a top-level function for recursion"
+    );
+  }
+  return diag("E0300", id.span, "unresolved name `" + id.name + "`");
+}
+
+export function condHoistErr(span: Span): Diagnostic {
+  return diag(
+    "E0408",
+    span,
+    "a call to a mutating method is not allowed in a conditionally evaluated expression (`&&`/`||` operand, `?:` branch, `while` condition); move it into its own statement"
+  );
+}
+
+// `this` where it is not available, by the mode of the function being checked.
+export function thisErr(fmode: int, span: Span): Diagnostic {
+  if (fmode == 1) {
+    return diag("E0300", span, "`this` cannot be used before every field is initialized by the leading `this.f = e;` statements of the constructor");
+  }
+  if (fmode == 5) {
+    return diag("E0300", span, "`this` is not available in a static method");
+  }
+  return diag("E0300", span, "`this` can only be used inside a class constructor or method");
+}
+
+export function capturedErr(span: Span, name: string): Diagnostic {
+  return diag(
+    "E0401",
+    span,
+    "cannot modify `" + name + "`: it is captured by a closure, and closures capture variables by value (a snapshot taken when the closure is created)"
+  );
+}
+
+export function mapKeyErr(env: Env, span: Span, kt: Type): Diagnostic {
+  return diag("E0400", span, "`Map` keys must be `int`, `usize`, `bool` or `string`, found `" + showType(env, kt) + "`");
+}
+
+// `@Test` functions are entry points of `orin test` and are erased from ordinary builds (ADR-0024), so
+// no code may refer to them.
+export function testGuard(f: FuncInfo, span: Span): Option<Diagnostic> {
+  for (const a of f.decl.annotations) {
+    const isTest = match (a.kind) {
+      ATest => true,
+      _ => false
+    };
+    if (isTest) {
+      return Some(diag("E0445", span, "`@Test` function `" + f.decl.name.name + "` cannot be called or used as a value: it is only run by `orin test` and erased from ordinary builds"));
+    }
+  }
+  return None;
+}
+
+// ---------------------------------------------------------------------------
+// Array API and Map methods (spec 08): which prelude function implements a method
+// ---------------------------------------------------------------------------
+
+export function isArrayApi(n: string): bool {
+  return n == "map" || n == "filter" || n == "find" || n == "findIndex" || n == "some" || n == "every"
+    || n == "reduce" || n == "forEach" || n == "sort" || n == "indexOf" || n == "includes";
+}
+
+// The type class suffix of the `indexOf` / `includes` helpers ("" if the element type has none).
+export function elemSuffix(elem: Type): string {
+  const cs = classSuffix(elem);
+  if (cs != "") {
+    return cs;
+  }
+  return match (elem) {
+    TyBool => "Bool",
+    TyString => "Str",
+    _ => ""
+  };
+}
+
+// The prelude function behind a read-only Map method, "" when `n` is not one (`set` / `delete` mutate
+// and are handled separately).
+@Ensures(result != "" ==> n == "get" || n == "has" || n == "keys" || n == "values" || n == "entries")
+export function mapReadFn(n: string): string {
+  if (n == "get") {
+    return "mapGet";
+  }
+  if (n == "has") {
+    return "mapHas";
+  }
+  if (n == "keys") {
+    return "mapKeys";
+  }
+  if (n == "values") {
+    return "mapValues";
+  }
+  if (n == "entries") {
+    return "mapEntries";
+  }
+  return "";
+}
