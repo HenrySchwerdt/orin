@@ -721,6 +721,69 @@ OrinObj *orin_array_concat(OrinObj *x, OrinObj *y) {
     return r;
 }
 
+OrinObj *orin_array_extend(OrinObj *x, OrinObj *y) {
+    OrinArray *a = (OrinArray *)x, *b = (OrinArray *)y;
+    if (ORIN_UNLIKELY(x->kind != ORIN_K_ARRAY || y->kind != ORIN_K_ARRAY)) orin_trap_shape();
+    if (b->len == 0) return x;
+    if (x->rc == 1 && x != y && (a->is_ref == b->is_ref || a->len == 0)) {
+        uint64_t n = a->len + b->len;
+        if (n > a->cap) {
+            uint64_t cap = a->cap * 2;
+            if (cap < n) cap = n;
+            if (cap < 4) cap = 4;
+            if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
+            a->items = (uint64_t *)xrealloc(a->items, cap * 8);
+            orin_stats.live_bytes += (cap - a->cap) * 8;
+            if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+            orin_stats.array_grows++;
+            a->cap = cap;
+        }
+        a->is_ref = b->is_ref;
+        if (b->is_ref) {
+            for (uint64_t i = 0; i < b->len; i++) {
+                orin_retain(ORIN_REF(b->items[i]));
+                a->items[a->len + i] = b->items[i];
+            }
+        } else {
+            orin_platform_mem_copy(a->items + a->len, b->items, b->len * 8);
+        }
+        a->len = n;
+        return x;
+    }
+    OrinObj *r = orin_array_concat(x, y);
+    orin_release(x);
+    return r;
+}
+
+OrinObj *orin_bytes_to_string(OrinObj *o, uint64_t start, uint64_t len) {
+    OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY || a->is_ref)) orin_trap_shape();
+    if (ORIN_UNLIKELY(start > a->len || len > a->len - start)) orin_trap("slice out of range");
+    OrinString *s = str_alloc(len, len);
+    const uint64_t *src = a->items + start;
+    uint64_t bad = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        uint64_t v = src[i];
+        bad |= v;
+        s->data[i] = (char)(unsigned char)v;
+    }
+    if (ORIN_UNLIKELY(bad > 255)) {
+        orin_release(&s->h);
+        orin_trap("byte out of range");
+    }
+    return &s->h;
+}
+
+OrinObj *orin_string_to_bytes(OrinObj *o) {
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_STRING)) orin_trap_shape();
+    const OrinString *s = (const OrinString *)o;
+    OrinObj *r = orin_array_new(s->len, 0);
+    OrinArray *a = (OrinArray *)r;
+    for (uint64_t i = 0; i < s->len; i++) a->items[i] = (unsigned char)s->data[i];
+    a->len = s->len;
+    return r;
+}
+
 OrinObj *orin_array_join(OrinObj *o, OrinObj *sep) {
     OrinArray *a = (OrinArray *)o;
     OrinString *sp = (OrinString *)sep;

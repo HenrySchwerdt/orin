@@ -388,6 +388,27 @@ static inline uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
 OrinObj *orin_array_get(OrinObj *a, uint64_t i); /* Option<T> (element retained) */
 OrinObj *orin_array_slice(OrinObj *a, uint64_t from, uint64_t to);
 OrinObj *orin_array_concat(OrinObj *a, OrinObj *b);
+/*@ orin_array_extend(a, b): a = a ++ b.  CONSUMES a (the result replaces it), b is only read.
+    requires a and b are arrays (anything else traps "wrong shape"); each is kept alive by its caller;
+    ensures  \result is an array whose elements are a's elements followed by b's: len(result) == len(a) + len(b);
+             every reference element copied from b is retained once more (b keeps its own references);
+    ensures  a->rc == 1 && a != b && (a, b have the same element kind, or a is empty)
+               ==> \result == a, extended in place (amortised O(len(b)), capacity at least doubles on growth);
+    ensures  otherwise \result is a fresh array and a has been released (as orin_array_concat followed by a release);
+    assigns  the heap (a, or a new array); b is unchanged. */
+OrinObj *orin_array_extend(OrinObj *a, OrinObj *b);
+/*@ orin_bytes_to_string(a, start, len): the bytes a[start .. start+len) of a u8 array as a string.
+    requires a is an array of u8 (elements 0..255 in 64-bit slots; anything else traps "wrong shape");
+    ensures  start <= len(a) && len <= len(a) - start, else it traps "slice out of range" (never reads out of bounds);
+    ensures  \result is a fresh string of exactly len bytes with \result[i] == a[start + i] for i < len;
+    ensures  an element above 255 (impossible for a well-typed u8 array) traps "byte out of range" instead of being truncated;
+    assigns  one allocation; a is unchanged. O(len), a plain copy loop, no per-byte allocation. */
+OrinObj *orin_bytes_to_string(OrinObj *a, uint64_t start, uint64_t len);
+/*@ orin_string_to_bytes(s): the bytes of a string as a u8 array.
+    requires s is a string (anything else traps "wrong shape");
+    ensures  \result is a fresh u8 array (not reference elements) with len == len(s) and \result[i] == (unsigned char)s[i];
+    assigns  one array allocation and its buffer; s is unchanged. O(len). */
+OrinObj *orin_string_to_bytes(OrinObj *s);
 OrinObj *orin_array_join(OrinObj *a, OrinObj *sep); /* string[] -> string */
 
 /* ---------------------------------------------------------------- I/O and process */

@@ -26,7 +26,7 @@
 // use, no call that receives x). The pass is block-local; the verifier checks the result like any other MIR.
 
 import { MFunction, MBlock, MLocal, MType, Instr, Operand } from "../mir";
-import { ancestors, usesAffecting, instrDef, isRefTy } from "./analysis";
+import { ancestors, affects, usesAffecting, instrDef, isRefTy, countsOf } from "./analysis";
 
 function sameKey(a: Operand, b: Operand): bool {
   return match (a) {
@@ -86,9 +86,11 @@ function isMakeUniqueOf(ins: Instr, x: usize): bool {
   };
 }
 
-// Index (in the block) of the closing store of the slot read at `i`, with the window clean, or None.
-function findStore(f: MFunction, anc: usize[][], instrs: Instr[], i: usize, s: Slot, kl: Option<usize>): Option<usize> {
-  let j = i + 2;
+// Index (in the block) of the closing store of the slot, searching from `start`, with the window clean (no use of
+// the object or of anything borrowed from it, no redefinition of the object or of the index local; the instruction
+// `exempt` and `makeunique` of the object are allowed), or None.
+function findStore(f: MFunction, anc: usize[][], instrs: Instr[], start: usize, exempt: usize, s: Slot, kl: Option<usize>): Option<usize> {
+  let j = start;
   while (j < instrs.length) {
     const ins = instrs[j];
     match (storeTo(s, ins)) {
@@ -97,7 +99,7 @@ function findStore(f: MFunction, anc: usize[][], instrs: Instr[], i: usize, s: S
       },
       None => {}
     }
-    if (!isMakeUniqueOf(ins, s.obj)) {
+    if (j != exempt && !isMakeUniqueOf(ins, s.obj)) {
       if (usesAffecting(anc, ins, s.obj)) {
         return None;
       }
@@ -140,7 +142,7 @@ function hasSlotGet(instrs: Instr[]): bool {
   return false;
 }
 
-export function inplaceSlots(f: MFunction): MFunction {
+function takePutSlots(f: MFunction): MFunction {
   let any = false;
   for (const blk of f.blocks) {
     if (hasSlotGet(blk.instrs)) {
@@ -179,7 +181,7 @@ export function inplaceSlots(f: MFunction): MFunction {
                 };
                 if (isD1 && d2 != s.obj && d2 != d1) {
                   const kl = keyLocal(s.key);
-                  match (findStore(f, anc, instrs, i, s, kl)) {
+                  match (findStore(f, anc, instrs, i + 2, instrs.length, s, kl)) {
                     Some(j) => {
                       let ok = !touched[j];
                       let tail: Instr[] = [];
@@ -260,4 +262,236 @@ export function inplaceSlots(f: MFunction): MFunction {
     ret: f.ret,
     blocks: blocks
   };
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Array concatenation in place: `a = a.concat(b)` allocates a new array and copies all of a each time (quadratic
+// in a loop). With the old value released right after, or stored back into the slot it was read from, the new array
+// can be the old one extended (`arrayextend`, docs/mir.md v1.10), amortised O(length of b):
+//
+//     d = builtin arr.concat(x, y)           arrayextend x, y
+//     release x                       =>
+//     x = move d
+//
+//     d1 = getfield x.i                      makeunique x
+//     ..                                     d1 = takefield x.i
+//     d3 = builtin arr.concat(d1, y)  =>     ..
+//     ..                                     arrayextend d1, y
+//     makeunique x                           ..
+//     setfield x.i = d3                      putfield x.i = d1
+//
+// (and the same for an array element `arrayget` / `arrayset`). y must not be, or be borrowed from, the array that is
+// extended (the runtime would copy anyway, but a borrow of x does not survive the mutation).
+
+function isConcat(ins: Instr): bool {
+  return match (ins) {
+    IBuiltin(_, b, _) => match (b) {
+      BArrConcat => true,
+      _ => false
+    },
+    _ => false
+  };
+}
+
+function hasConcat(f: MFunction): bool {
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      if (isConcat(ins)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// d = concat(x, y) with locals x, y: (d, x, y).
+type Concat = { d: usize; x: usize; y: usize; };
+
+function concatOf(ins: Instr): Option<Concat> {
+  return match (ins) {
+    IBuiltin(dst, b, args) => match (b) {
+      BArrConcat => match (dst) {
+        Some(d) => match (args[0]) {
+          OLocal(x) => match (args[1]) {
+            OLocal(y) => Some(Concat { d: d, x: x, y: y }),
+            _ => None
+          },
+          _ => None
+        },
+        None => None
+      },
+      _ => None
+    },
+    _ => None
+  };
+}
+
+function extendArrays(f: MFunction): MFunction {
+  if (!hasConcat(f)) {
+    return f;
+  }
+  const anc = ancestors(f);
+  const cnt = countsOf(f);
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    const instrs = blk.instrs;
+    let rep: Instr[][] = [];
+    let touched: bool[] = [];
+    for (const _x of instrs) {
+      rep.push([]);
+      touched.push(false);
+    }
+    let changed = false;
+    let i: usize = 0;
+    while (i < instrs.length) {
+      match (concatOf(instrs[i])) {
+        Some(c) => {
+          // (1) x = x.concat(y), the old x released right after (releases of other temporaries, typically y, may
+          // come first)
+          if (!touched[i] && c.x >= f.paramCount && c.y != c.x && !affects(anc, c.y, c.x) && cnt.uses[c.d] == 1 && cnt.defs[c.d] == 1) {
+            let jr = i + 1;
+            let fnd = false;
+            while (jr < instrs.length && !fnd && !touched[jr]) {
+              match (instrs[jr]) {
+                IRelease(z) => {
+                  if (z == c.x) {
+                    fnd = true;
+                  } else if (z == c.d) {
+                    jr = instrs.length;
+                  } else {
+                    jr += 1;
+                  }
+                },
+                _ => {
+                  jr = instrs.length;
+                }
+              }
+            }
+            if (fnd && jr + 1 < instrs.length && !touched[jr + 1]) {
+              match (instrs[jr + 1]) {
+                IMove(dd, ss) => {
+                  if (dd == c.x && ss == c.d) {
+                    rep[i] = [IArrayExtend(c.x, OLocal(c.y))];
+                    touched[i] = true;
+                    touched[jr] = true;
+                    touched[jr + 1] = true;
+                    changed = true;
+                  }
+                },
+                _ => {}
+              }
+            }
+          }
+        },
+        None => {}
+      }
+      // (2) slot = slot.concat(y): the read at `i`, the concat later in the window
+      if (i + 1 < instrs.length && !touched[i]) {
+        match (slotOfGet(f, instrs[i])) {
+          Some(sl) => {
+            const d1 = match (instrDef(instrs[i])) {
+              Some(d) => d,
+              None => 0
+            };
+            if (cnt.uses[d1] == 1 && cnt.defs[d1] == 1) {
+              // the concat that consumes d1
+              let b: usize = i + 1;
+              let found = false;
+              while (b < instrs.length && !found) {
+                match (concatOf(instrs[b])) {
+                  Some(c) => {
+                    if (c.x == d1) {
+                      found = true;
+                    }
+                  },
+                  None => {}
+                }
+                if (!found) {
+                  b += 1;
+                }
+              }
+              if (found && !touched[b]) {
+                const c = concatOf(instrs[b]).unwrap();
+                const kl = keyLocal(sl.key);
+                if (cnt.uses[c.d] == 1 && cnt.defs[c.d] == 1 && c.y != sl.obj && !affects(anc, c.y, sl.obj) && c.d != d1) {
+                  match (findStore(f, anc, instrs, i + 1, b, sl, kl)) {
+                    Some(j) => {
+                      let ok = !touched[j] && j > b;
+                      match (storeTo(sl, instrs[j])) {
+                        Some(v) => {
+                          match (v) {
+                            OLocal(l) => {
+                              if (l != c.d) {
+                                ok = false;
+                              }
+                            },
+                            _ => {
+                              ok = false;
+                            }
+                          }
+                        },
+                        None => {
+                          ok = false;
+                        }
+                      }
+                      if (ok) {
+                        changed = true;
+                        rep[i] = [IMakeUnique(sl.obj), sl.field ? ITakeField(d1, sl.obj, sl.idx) : IArrayTake(d1, sl.obj, sl.key)];
+                        touched[i] = true;
+                        rep[b] = [IArrayExtend(d1, OLocal(c.y))];
+                        touched[b] = true;
+                        rep[j] = [sl.field ? IPutField(sl.obj, sl.idx, d1) : IArrayPut(sl.obj, sl.key, d1)];
+                        touched[j] = true;
+                        let m = i + 1;
+                        while (m < j) {
+                          if (isMakeUniqueOf(instrs[m], sl.obj)) {
+                            touched[m] = true;
+                          }
+                          m += 1;
+                        }
+                      }
+                    },
+                    None => {}
+                  }
+                }
+              }
+            }
+          },
+          None => {}
+        }
+      }
+      i += 1;
+    }
+    if (!changed) {
+      blocks.push(blk);
+    } else {
+      let out: Instr[] = [];
+      let k: usize = 0;
+      while (k < instrs.length) {
+        if (touched[k]) {
+          for (const r of rep[k]) {
+            out.push(r);
+          }
+        } else {
+          out.push(instrs[k]);
+        }
+        k += 1;
+      }
+      blocks.push(MBlock { instrs: out, term: blk.term });
+    }
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: f.inout,
+    locals: f.locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
+
+// The slot and concatenation rewrites of the optimiser (stage 4).
+export function inplaceSlots(f: MFunction): MFunction {
+  return extendArrays(takePutSlots(f));
 }
