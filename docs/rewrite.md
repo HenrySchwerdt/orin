@@ -509,7 +509,7 @@ Files (`orin fmt` output for the rewritten files; clauses counted with `grep -c 
 | `hir/index.or` | `CallSite` (after merging main's `param` / `fnArgs`) | 72 -> 89 | 0 | 0 | 4 |
 | `lower/wellformed.or` | (predicates moved to `mir/`) | 241 -> 57 | 0 | 0 | 0 |
 | `lower/lower.or` | `lower` | 36 -> 37 | 0 | 5 (+1) | 0 |
-| total verify | | 1,489 -> 2,118 | 27 | 61 | 10 = **98 clauses (0 before)** |
+| total verify | | 1,489 -> 2,118 | 27 | 61 | 10 = **98 clauses (0 before)**; 101 after the merges below (28 / 63 / 10) |
 | total hir + mir + lower | | | 3 | 13 (+2) | 5 = 21 new clauses |
 
 Unit tests: `compiler/tests/verify_test.or` (23 `@Test`, 622 lines), run by `tools/test_tooling.sh`; `compiler/tests/verify_main.or`
@@ -666,6 +666,62 @@ root to its aliases would remove most of the first, a change of algorithm left f
   taken from the `addCall` sites, not from the comment.
 * **Monitoring a background job**: `pgrep -f <script>` inside a monitor loop matches the monitor itself (the pitfall of step
   1 again); wait on the PID.
+
+### Merges after the step: std:net, concurrency stage 0, the performance branch (MIR v1.10)
+
+Two merges were done on top of the step, both into the new structure, with the same verdicts as the merged old verifier:
+
+* **`origin/main` (d73f88a: std:net, concurrency stage 0).** Main had changed the record-threading verifier: net openers
+  `BGrantNet` / `BGrantListen` / `BGrantConnect` / `BNetListen` / `BNetAccept` / `BNetConnect` and the closer `BNetClose` in
+  `builtinStep`, `BTask(k)` dispatched by `taskOpOpensFrom` / `taskOpAdopts` (openers) and `taskOpMoves` (closer); in wf.or the net
+  arms of `takesHandle` / `isOpenB`, `isAdoptB` and the adoption branch of `handleMsg`. Ported as arms of `Transfer.builtin`
+  and the same arms in wf.or; `handleDefOk` (the contract "only an opener defines a handle") now also accepts an adoption,
+  otherwise the contract-checked compiler would trap on std:task. Also: `grantTypeName` grew to eight names, which silently
+  broke its `@Ensures((k < 6) == ..)` from this step (fixed to 8; it merged without a conflict). `verify_main` keeps every case
+  set and sums them (`robustnessCases`, `spanCases`, ..., `netCases`, `taskGrantCases`).
+* **The performance branch (MIR v1.10).** In/out receivers: `def` lets an inout function write parameter 0, an `ICall` of an
+  inout callee re-defines its argument 0 as Owned, `TReturn` of an inout function requires an owned receiver in local 0 and
+  consumes it, wf.or checks the call shape and that parameter 0 is owned; `IArrayExtend` has the rules of `IStrAppend`. All
+  ported into `Transfer` / wf.or / `mir/wellformed.or` (`instrLocals`, `instrOperands`). One contract had to learn the new rule:
+  an inout call defines a local that is not its destination, so `noRevival` now takes `defsOf(prog, ins)` (destination + in/out
+  argument); with `dstOf` alone it would trap on an erroneous inout call. Its two verifier speed-ups:
+  * *`def` skips `killBorrows` when the redefined local was Dead or a scalar* (the alias scan over all locals, the verifier's
+    hottest loop): **still applies, ported.** The reason it is sound is now a stated precondition, `rootsLive` (no alias is
+    rooted at a Dead or scalar local), required and ensured by `Transfer.run`.
+  * *the join allocates nothing when nothing changes* (`joinChanged`): **still applies, ported** as `State.joinIfChanged`
+    (`@Ensures(result.isNone() == this.join(o).equals(this))`); `Fixpoint.run` and `isStable` use it instead of `join` +
+    `equals`.
+  Neither is made unnecessary by the 3b restructuring: the copies that `Fixpoint` / `Transfer` remove (a mutating method called
+  on a class-typed field) exist only in the class version and are a different cost; the perf branch's two speed-ups are about the
+  algorithm and apply to both.
+
+Gates on the doubly merged tree, against a baseline built from `origin/main` + the performance branch *without* step 3b
+(`git merge-tree`, clean in `verify/`):
+
+* verifier output byte for byte against the baseline's `verify_text` driver: **identical** on 49,521 programs of the
+  `mutate_mir` corpus (now with the perf branch's two in/out mutation classes; 32,388 rejections) and the 4,000 Lean-fragment
+  programs (3,114 rejections);
+* `tools/mutate_mir.py`: 46,570 mutants, 32,388 rejected, 13,593 warned, 589 benign, **0 survivors**, 0 wrong-reason;
+  `tools/diff_verifier_lean.py`: 4,592 both ACCEPT, 7,396 both REJECT, 12 divergences, all in the allow-listed class F6;
+  `verify_main.or`: all cases pass (241: every set of main, the perf branch and this step, summed);
+  `verify_test.or`: 26 `@Test` (3 new: an inout call's `defsOf`, `rootsLive` / `joinIfChanged`, `IArrayExtend`);
+* generated code (C, C with `--check-contracts`, LLVM IR): 408 inputs x 3, **0 differences**; diagnostics
+  (`tools/diff_compilers.py`): 1,432 inputs x 3, 0 differences;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,890,058 bytes), conformance 141/141; all suites 832/832;
+* `tools/test_compiler_contracts.sh`: contract-checked self-compile identical to `stage2.c`; suites 832/832 (one test,
+  `std_http_basic`, hit the harness timeout at load 22 and passed on rerun: 1.7 s with contracts, 0.5 s without);
+  `test_verify_contracts` 809 checks; **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: **0 warnings** (the 13 `W0471` of `compiler/vc/` that main had are fixed:
+  `@Ensures` on `Gen.next` / `declare` / `assert` / `lemma` / `setExact` / `taint` / `noteApprox` / `noteStr` /
+  `useAssumption` / `newLoop` / `loopAdd` / `addObl` and `Tab.setCyclic`, each stating its effect; checked by
+  `test_verify_contracts`);
+* `tools/test_tooling.sh` and `tools/test_concurrency.sh` (`task_test` 98 checks, the stress and panic tests under the
+  sanitizers): pass;
+* self-compile instruction count (callgrind, `compile compiler/main.or`, both compilers on the final tree): baseline
+  36,423,718,059, new **34,819,751,109 (-4.4 %)**; `killBorrows` 8.25 G -> 6.43 G (the `Transfer` method writes `this.ls` in
+  place, the record version copied), the joins unchanged (`joinLs` 4.38 G in both, `join` 4.22 G, `joinIfChanged` 3.66 G).
+  The verifier is still about 60 % of the self-compile: `killBorrows` with an index from a root to its aliases, and a join that
+  stops at the first poisoned local, are the next algorithmic steps.
 
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
