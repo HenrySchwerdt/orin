@@ -186,6 +186,15 @@ Paths must be inside the server root.
   edge from the enclosing function to a compiler-owned `Effect` node (`~io:Fs.ReadFile`, `sig` = `INPUT; grant:
   FsGrant`); the edge's `via` is the direction `INPUT` / `OUTPUT` / `CONTROL`, evidence `MUST` for a direct call
   (`MAY` inside a closure). `console.*` and `exit` are `ambient` (they need no grant). These are call sites, not effect
+  summaries: a function that only *calls* one that performs I/O has no edge of its own (transitive inference is Stage B),
+  and a call through a function value is `~unknown`, so an absent edge never proves the absence of I/O.
+- **Tasks (ADR-0017 stage 0):** the `std:task` functions are events like the scope functions: `spawn` / `spawnDo` / `parallelMap` are `~io:Task.Spawn`
+  (`CONTROL`, grant `ambient`), `spawnFs` / `spawnProcess` / `spawnStdio` / `spawnClock` are `~io:Task.SpawnFs` ... (`CONTROL`, naming the delegated
+  grant family), `scope*` and `TaskHandle.join` are `~io:Task.Join` (`CONTROL`), `channel` is `~io:Channel.Open` (`CONTROL`), `Sender.send` is
+  `~io:Channel.Send` (`OUTPUT`) and `Receiver.recv` is `~io:Channel.Receive` (`INPUT`). What a task body does is attributed to the enclosing
+  function (`MAY`, like every closure). Edges between tasks are the send / receive effects themselves: every sender and every receiver of any
+  channel meets at the same effect node; matching a send to its receivers per channel is a later analysis. Test: `tests/osig/tasks`.
+- **Not modelled yet:** transitive effects, FFI, field reads/writes, data flow, grant chains and runtime events,
   summaries: a function that only *calls* one that performs I/O has no `PERFORMS_IO` edge of its own; its transitive summary
   is the `MAY_PERFORM` edges (Stage B, `osig/0.2`). An absent `PERFORMS_IO` edge never proves the absence of I/O.
 - **Effect summaries over-approximate** (ADR-0037 D2; [capabilities.md](capabilities.md) has the argument): a function value of

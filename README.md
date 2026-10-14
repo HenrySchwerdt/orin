@@ -140,7 +140,8 @@ structured, stable diagnostics — optimised for the total effort needed to reac
 | Root capabilities for the std I/O (`main(host: Host)`, narrowing, `ORIN_DENY`, path scopes; ADR-0027) | ✅ Implemented (Stage A; std I/O stays unstable until the freeze); not a sandbox against native code |
 | Derived library capabilities, policy gates, HTTP/Kafka protocol bindings | 📋 Designed; not implemented |
 | Inferred effects, field lineage, automatic cross-service process discovery | 📋 Planned |
-| Signed attestations (`.orcert`), concurrency, further optimisation | 📋 Planned |
+| Concurrency, stage 0: `std:task` (structured `scope` / `spawn` / `join`, bounded channels, isolated tasks with move-or-copy transfer, grants moved into tasks; ADR-0017) | ✅ Implemented in Orin over a small C core (L0 threads + a temporary runtime interface that R3 ports); the C parts are tested only (ThreadSanitizer), see [concurrency](docs/concurrency.md); no `async` / `await`, no deadlock detection |
+| Signed attestations (`.orcert`), M:N scheduler, further optimisation | 📋 Planned |
 
 **Performance:** Native output does not automatically imply C-equivalent speed. Check
 [benchmarks](docs/benchmarks.md) for workload-specific measurements, and

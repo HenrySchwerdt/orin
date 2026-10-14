@@ -26,6 +26,12 @@
 - Generic classes (ADR-0026): no generic methods yet (E0460; ADR-0040 adds them, plus `void` as a type argument); static methods cannot use the class type parameters
   (E0461); one interface bound per parameter; instances are created on demand, so an instance method that is never
   called is only checked abstractly; a `?` in a mutating method with a result is hoisted like a mutating call.
+- Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): a task is an OS thread (thousands fine, hundreds of thousands not; no
+  M:N scheduler); no `async` / `await`, no timeouts or `select`, no cancellation beyond `rx.close()`, **no deadlock detection** (tasks that
+  all wait hang); a panic does not unwind, so a trapped task leaks its heap and a panic in a scope *body* leaves running tasks running
+  until the process ends; `exit` in a task ends the process and flushes only its own open files; sending a *named local* copies it (no
+  last-use move yet); channel ends are copyable and closed explicitly (no "all senders gone"); the C parts (threads, monitors, transfer)
+  are tested, not verified; Windows has no thread backend yet.
 - Interfaces (ADR-0019, self-hosted compiler only): nominal conformance (`implements`), method signatures only
   (no fields, default methods, `extends`, type parameters: E0408), non-mutating methods only (a mutating
   implementation is E0418), one bound per type parameter (`T extends A & B` is E0408). A class converts

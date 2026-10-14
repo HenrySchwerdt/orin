@@ -61,6 +61,11 @@ outside the scope of this page's "platform" list):
 - Path separators in the compiler's module resolution (`/` is accepted by the Win32 API, but printed paths
   and OSIG ids should stay `/`).
 
+Threads (ADR-0017 stage 0) add `orin_platform_thread_create / join / exit / id`, `orin_platform_monitor_*` and the runtime lock, all on
+`pthread` today. The Win32 backend needs `CreateThread` (or `_beginthreadex`), a `SRWLOCK` + `CONDITION_VARIABLE` pair (two queues) per monitor, a
+`CRITICAL_SECTION` for the stdout buffer, `__declspec(thread)` / `_Thread_local` for the thread id, and `ExitThread` for `thread_exit`; the
+runtime itself uses `__thread` and GCC `__atomic` builtins, which clang accepts. Until then std:task does not work on Windows.
+
 Later capabilities (ADR-0021: file system, processes, network handles) will add more functions; each needs a
 Win32 backend from day one, so the port should be structured as `platform/orin_platform_win32.c` beside the
 POSIX file rather than `#ifdef`s inside one file, and `tools/check_platform_boundary.sh` must cover both.

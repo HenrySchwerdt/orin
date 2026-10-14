@@ -1,0 +1,241 @@
+// Task rules (ADR-0017 stage 0, docs/concurrency.md "Checker rules"). A pass over the checked HIR of every function, generic
+// instances and lifted closures included, run before the resource pass (so a task-specific message wins over the general
+// E0452). The std:task library is Orin; these are the rules about how it is USED:
+//
+//   E0481  the body of a task (a closure literal passed to `spawn`, `spawnFs`, ...) captures a `Scope`. A scope belongs to the
+//          task that opened it: a task that needs sub-tasks opens its own `scope`. (If a `Scope` reaches a task some other
+//          way, `spawn` traps at run time when the scope has ended: no task outlives its scope either way.)
+//   E0482  `channel(capacity)` with the constant capacity 0: stage 0 has bounded channels of at least one slot (no rendezvous).
+//   E0483  the body of a task captures a resource handle (a grant or a file). A handle is not a value and cannot be copied to
+//          another task; delegate a grant with `spawnFs` / `spawnProcess` / `spawnStdio` / `spawnClock`, which derive a
+//          fresh grant for the task and MOVE it in (the task owns and revokes it) and hand it to the body as a parameter.
+//
+// What is NOT a rule here, because the language already makes it impossible: sending or capturing a resource handle as a
+// VALUE (E0450 / E0451 / E0452: handles are only parameters), and sharing mutable memory (values are immutable, closures
+// capture snapshots, ADR-0011). Everything else that can be captured or sent is deep-copyable, so it is sendable.
+//
+// The rules look at closure LITERALS at the call: a function value of unknown origin passed to `spawn` is not inspected (its
+// captures were already checked where it was created: it cannot capture a handle at all, E0452).
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Type, RecordDef, Function, HBlock, HStmt, HExpr, Place } from "../hir";
+
+type Tc = { funcs: Function[]; records: RecordDef[]; diags: Diagnostic[]; };
+
+function isHandle(t: Type): bool {
+  return match (t) {
+    TyFile => true,
+    TyGrant(_) => true,
+    _ => false
+  };
+}
+
+function isScope(c: Tc, t: Type): bool {
+  return match (t) {
+    TyRecord(r) => r < c.records.length && c.records[r].name == "$stdlib/task.Scope",
+    _ => false
+  };
+}
+
+function calleeName(c: Tc, fid: usize): string {
+  return fid < c.funcs.length ? c.funcs[fid].name : "";
+}
+
+// `$stdlib/task.spawn`, `$stdlib/task.spawnFs<int>`, ...
+function isSpawn(name: string): bool {
+  return name.startsWith("$stdlib/task.spawn");
+}
+
+function isChannel(name: string): bool {
+  return name.startsWith("$stdlib/task.channel");
+}
+
+function report(c: Tc, code: string, span: Span, msg: string): Tc {
+  let x = c;
+  x.diags.push(diag(code, span, msg));
+  return x;
+}
+
+function body(c: Tc, args: HExpr[]): Tc {
+  let x = c;
+  for (const a of args) {
+    match (a.kind) {
+      XClosure(_, caps) => {
+        for (const cap of caps) {
+          if (isHandle(cap.ty)) {
+            x = report(x, "E0483", cap.span, "a task body cannot capture a resource handle (a grant or a file is not a value and cannot be copied to another task); delegate a grant with `spawnFs` / `spawnProcess` / `spawnStdio` / `spawnClock`, which move a fresh grant into the task and pass it to the body as a parameter");
+          } else if (isScope(x, cap.ty)) {
+            x = report(x, "E0481", cap.span, "a task body cannot capture the `Scope` it is spawned in: the scope belongs to the task that opened it; open a `scope` inside the task to start sub-tasks");
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  return x;
+}
+
+function exprs(c: Tc, es: HExpr[]): Tc {
+  let x = c;
+  for (const e of es) {
+    x = expr(x, e);
+  }
+  return x;
+}
+
+function expr(c: Tc, e: HExpr): Tc {
+  let x = c;
+  match (e.kind) {
+    XInt(_) => {},
+    XFloat(_) => {},
+    XBool(_) => {},
+    XStr(_) => {},
+    XLocal(_) => {},
+    XUnary(_, a) => { x = expr(x, a); },
+    XBinary(_, a, b) => {
+      x = expr(x, a);
+      x = expr(x, b);
+    },
+    XCall(fid, args) => {
+      const n = calleeName(x, fid);
+      if (isSpawn(n)) {
+        x = body(x, args);
+      }
+      if (isChannel(n) && args.length > 0) {
+        match (args[0].kind) {
+          XInt(v) => {
+            if (v == 0) {
+              x = report(x, "E0482", args[0].span, "a channel needs a capacity of at least 1 (stage 0 has bounded channels only; there is no rendezvous channel)");
+            }
+          },
+          _ => {}
+        }
+      }
+      x = exprs(x, args);
+    },
+    XBuiltin(_, args) => { x = exprs(x, args); },
+    XMutMethod(_, p, args) => {
+      x = place(x, p);
+      x = exprs(x, args);
+    },
+    XField(b, _, _) => { x = expr(x, b); },
+    XIndex(b, i) => {
+      x = expr(x, b);
+      x = expr(x, i);
+    },
+    XRecord(_, sp, fs) => {
+      match (sp) {
+        Some(s) => { x = expr(x, s); },
+        None => {}
+      }
+      for (const f of fs) {
+        x = expr(x, f.value);
+      }
+    },
+    XVariant(_, payload) => { x = exprs(x, payload); },
+    XArray(xs) => { x = exprs(x, xs); },
+    XTry(a) => { x = expr(x, a); },
+    XCond(a, b, d) => {
+      x = expr(x, a);
+      x = expr(x, b);
+      x = expr(x, d);
+    },
+    XMatch(s, arms) => {
+      x = expr(x, s);
+      for (const a of arms) {
+        x = block(x, a.body);
+        match (a.value) {
+          Some(v) => { x = expr(x, v); },
+          None => {}
+        }
+      }
+    },
+    XClosure(_, caps) => { x = exprs(x, caps); },
+    XCallIndirect(f, args) => {
+      x = expr(x, f);
+      x = exprs(x, args);
+    },
+    XIface(_, v) => { x = expr(x, v); },
+    XCallVirtual(r, _, args) => {
+      x = expr(x, r);
+      x = exprs(x, args);
+    }
+  }
+  return x;
+}
+
+function place(c: Tc, p: Place): Tc {
+  let x = c;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => { x = expr(x, ix); },
+      _ => {}
+    }
+  }
+  return x;
+}
+
+function block(c: Tc, b: HBlock): Tc {
+  let x = c;
+  for (const s of b.stmts) {
+    x = stmt(x, s);
+  }
+  return x;
+}
+
+function stmt(c: Tc, s: HStmt): Tc {
+  let x = c;
+  match (s) {
+    HLet(_, init) => { x = expr(x, init); },
+    HAssign(p, _, v) => {
+      x = place(x, p);
+      x = expr(x, v);
+    },
+    HExprStmt(e) => { x = expr(x, e); },
+    HIf(cond, th, el) => {
+      x = expr(x, cond);
+      x = block(x, th);
+      match (el) {
+        Some(b) => { x = block(x, b); },
+        None => {}
+      }
+    },
+    HWhile(cond, b) => {
+      x = expr(x, cond);
+      x = block(x, b);
+    },
+    HForOf(_, it, b) => {
+      x = expr(x, it);
+      x = block(x, b);
+    },
+    HBreak => {},
+    HContinue => {},
+    HReturn(r) => {
+      match (r) {
+        Some(e) => { x = expr(x, e); },
+        None => {}
+      }
+    },
+    HBlockStmt(b) => { x = block(x, b); }
+  }
+  return x;
+}
+
+// The task rules for the whole checked program.
+export function taskDiags(funcs: Function[], records: RecordDef[]): Diagnostic[] {
+  let used = false;
+  for (const f of funcs) {
+    if (f.name.startsWith("$stdlib/task.")) {
+      used = true;
+      break;
+    }
+  }
+  if (!used) {
+    return [];
+  }
+  let c = Tc { funcs: funcs, records: records, diags: [] };
+  for (const f of funcs) {
+    c = block(c, f.body);
+  }
+  return c.diags;
+}

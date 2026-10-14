@@ -31,6 +31,15 @@ optimiser invents from nothing). **No new instruction and no semantic change**: 
 output is byte-identical (the emitters ignore spans), the optimiser keeps the span of the instruction it rewrites (an inserted
 `dup` / `release` has the span of the call or edge it belongs to). Text format: see "Source spans" below.
 
+v2.1 (ADR-0017 stage 0, ADR-0027 Q10) tasks: **no new type or instruction**. One builtin `BTask(k)` (`compiler/hir/taskops.or`) carries the task
+primitives (monitors, transfer tokens, thread start / join). Three of them touch handles: `grantClone` (k = 17, `[grant]` -> a handle of the same
+family) is an opener like `BGrantUnder`; `grantMove` (k = 18, `[handle]` -> a `usize` token) is a CLOSER like `BGrantRevoke` (the handle must be `Open`,
+is `Dead` afterwards: moved exactly once on every path, never a parameter); `grantAdoptFs / Process / Stdio / Clock` (k = 19..22, `[token]` -> a
+handle) are openers whose argument is a scalar token: no argument may be a handle, the destination must be a bound handle local, and the function
+must revoke it. A value sent to a task is consumed by the one-field record that carries it (`IStructNew`), which already kills every borrow of
+the consumed local, so "no value used after it was moved into a task" is an existing rule; the runtime decides move or copy from the reference
+counts. Cases: `compiler/tests/verify_main.or` (`taskGrantCases`).
+
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
 in order; each block ends in exactly one terminator. Scalars (`MInt`, `MUsize`, `MBool`, `MFloat`) are plain

@@ -1,0 +1,142 @@
+// Stress (tools/test_concurrency.sh: plain, ThreadSanitizer, ASan + UBSan): many messages.
+//  1. 8 producers x 5,000 messages into ONE bounded channel (capacity 32), 4 consumers on the same channel;
+//  2. 20,000 round trips of ping-pong between two tasks over capacity-1 channels;
+//  3. messages that carry strings and arrays (every message is checked for integrity on arrival).
+import { scope, spawn, spawnDo, channel, TaskHandle } from "std:task";
+
+type Msg = { id: int; text: string; parts: int[]; };
+
+function main(): void {
+  // 1. many producers, many consumers, one channel
+  const ch = channel<int>(32);
+  const sums = scope(s => {
+    let producers: TaskHandle<bool>[] = [];
+    let p = 0;
+    while (p < 8) {
+      const base = p * 5000;
+      producers.push(spawnDo(s, () => {
+        let i = 0;
+        while (i < 5000) {
+          ch.tx.send(base + i);
+          i += 1;
+        }
+      }));
+      p += 1;
+    }
+    let consumers: TaskHandle<int>[] = [];
+    let c = 0;
+    while (c < 4) {
+      consumers.push(spawn(s, () => {
+        let sum = 0;
+        let more = true;
+        while (more) {
+          match (ch.rx.recv()) {
+            Some(v) => {
+              sum += v;
+            },
+            None => {
+              more = false;
+            },
+          }
+        }
+        return sum;
+      }));
+      c += 1;
+    }
+    for (const h of producers) {
+      h.join();
+    }
+    ch.tx.close();
+    let total = 0;
+    for (const h of consumers) {
+      total += h.join();
+    }
+    return total;
+  });
+  console.log("40000 messages, sum " + sums.toString());
+  ch.rx.close();
+
+  // 2. ping-pong
+  const ping = channel<int>(1);
+  const pong = channel<int>(1);
+  const last = scope(s => {
+    spawnDo(s, () => {
+      let more = true;
+      while (more) {
+        match (ping.rx.recv()) {
+          Some(v) => {
+            pong.tx.send(v + 1);
+          },
+          None => {
+            more = false;
+          },
+        }
+      }
+      pong.tx.close();
+    });
+    let v = 0;
+    let round = 0;
+    while (round < 20000) {
+      ping.tx.send(v);
+      match (pong.rx.recv()) {
+        Some(r) => {
+          v = r + 1;
+        },
+        None => {
+          v = -1;
+        },
+      }
+      round += 1;
+    }
+    ping.tx.close();
+    return v;
+  });
+  console.log("20000 round trips: " + last.toString());
+  ping.rx.close();
+  pong.rx.close();
+
+  // 3. structured messages
+  const docs = channel<Msg>(8);
+  const checked = scope(s => {
+    const w = spawnDo(s, () => {
+      let i = 0;
+      while (i < 3000) {
+        let parts: int[] = [];
+        let k = 0;
+        while (k < i % 20) {
+          parts.push(i + k);
+          k += 1;
+        }
+        docs.tx.send(Msg { id: i, text: "message number " + i.toString(), parts: parts });
+        i += 1;
+      }
+      docs.tx.close();
+    });
+    let good = 0;
+    let more = true;
+    while (more) {
+      match (docs.rx.recv()) {
+        Some(m) => {
+          let ok = m.text == "message number " + m.id.toString() && m.parts.length == (m.id % 20).toUsize();
+          let k: usize = 0;
+          while (k < m.parts.length) {
+            if (m.parts[k] != m.id + k.toInt()) {
+              ok = false;
+            }
+            k += 1;
+          }
+          if (ok) {
+            good += 1;
+          }
+        },
+        None => {
+          more = false;
+        },
+      }
+    }
+    w.join();
+    return good;
+  });
+  console.log("3000 structured messages intact: " + checked.toString());
+  docs.rx.close();
+}

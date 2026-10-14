@@ -4,7 +4,7 @@
 // where that is meaningful, so one mistake does not cascade.
 
 import { MProgram, MFunction, Operand, Instr, Terminator } from "../mir";
-import { Builtin } from "../hir";
+import { Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 import {
   VerifyIssue, issueSpan, State, LState, HoleEntry, mk, ownedLike, leaky, kindName, holeEq,
   KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen
@@ -498,6 +498,18 @@ function builtinStep(cx: Cx, dst: Option<usize>, b: Builtin, args: Operand[]): C
     BNetClose => closeHandle(readAll(cx, args), dst, args),
     BFileClose => closeHandle(readAll(cx, args), dst, args),
     BGrantRevoke => closeHandle(readAll(cx, args), dst, args),
+    BTask(k) => {
+      // ADR-0017: grantClone derives a handle from a parent (an opener); grantAdopt* makes one from a token (an opener
+      // with no authorising handle); grantMove ends one and returns its token (a closer: the handle is moved into a task
+      // exactly once on every path, and is dead afterwards).
+      if (taskOpOpensFrom(k) || taskOpAdopts(k)) {
+        return openers(cx, dst, args);
+      }
+      if (taskOpMoves(k)) {
+        return closeHandle(readAll(cx, args), dst, args);
+      }
+      return call(cx, dst, args);
+    },
     _ => call(cx, dst, args)
   };
 }

@@ -1,0 +1,116 @@
+// Task micro-benchmarks (ADR-0017 stage 0; docs/concurrency.md "Measurements"). Prints one checksum line per part; the time of each
+// part is measured from outside (`tools/bench.py --only tasks` runs all three; by hand: the first argument 1, 2 or 3 runs one part).
+//   1. spawn + join: 20,000 tasks in waves of 100 (one OS thread per task);
+//   2. ping-pong: 100,000 round trips between two tasks over two capacity-1 channels (every send waits for the receiver);
+//   3. throughput: 1,000,000 messages from one producer to one consumer through a channel of capacity 64.
+import { Host, useProcess } from "std:host";
+import { args } from "std:process";
+import { scope, spawn, spawnDo, channel, TaskHandle } from "std:task";
+
+function spawnJoin(): int {
+  let sum = 0;
+  let wave = 0;
+  while (wave < 200) {
+    sum += scope(s => {
+      let hs: TaskHandle<int>[] = [];
+      let i = 0;
+      while (i < 100) {
+        const k = i;
+        hs.push(spawn(s, () => k + 1));
+        i += 1;
+      }
+      let t = 0;
+      for (const h of hs) {
+        t += h.join();
+      }
+      return t;
+    });
+    wave += 1;
+  }
+  return sum;
+}
+
+function pingPong(): int {
+  const ping = channel<int>(1);
+  const pong = channel<int>(1);
+  const last = scope(s => {
+    spawnDo(s, () => {
+      let more = true;
+      while (more) {
+        match (ping.rx.recv()) {
+          Some(v) => {
+            pong.tx.send(v + 1);
+          },
+          None => {
+            more = false;
+          },
+        }
+      }
+      pong.tx.close();
+    });
+    let v = 0;
+    let round = 0;
+    while (round < 100000) {
+      ping.tx.send(v);
+      match (pong.rx.recv()) {
+        Some(r) => {
+          v = r + 1;
+        },
+        None => {
+          v = -1;
+        },
+      }
+      round += 1;
+    }
+    ping.tx.close();
+    return v;
+  });
+  ping.rx.close();
+  pong.rx.close();
+  return last;
+}
+
+function throughput(): int {
+  const ch = channel<int>(64);
+  const total = scope(s => {
+    spawnDo(s, () => {
+      let i = 0;
+      while (i < 1000000) {
+        ch.tx.send(i);
+        i += 1;
+      }
+      ch.tx.close();
+    });
+    let sum = 0;
+    let more = true;
+    while (more) {
+      match (ch.rx.recv()) {
+        Some(v) => {
+          sum += v;
+        },
+        None => {
+          more = false;
+        },
+      }
+    }
+    return sum;
+  });
+  ch.rx.close();
+  return total;
+}
+
+function main(host: Host): void {
+  useProcess(host, proc => {
+    const a = args(proc);
+    const part = a.length > 0 ? parseInt(a[0]).unwrapOr(0) : 0;
+    if (part == 0 || part == 1) {
+      console.log("spawn+join " + spawnJoin().toString());
+    }
+    if (part == 0 || part == 2) {
+      console.log("ping-pong " + pingPong().toString());
+    }
+    if (part == 0 || part == 3) {
+      console.log("throughput " + throughput().toString());
+    }
+  });
+}

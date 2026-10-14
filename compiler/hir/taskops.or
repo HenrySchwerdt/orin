@@ -1,0 +1,105 @@
+// The task primitives of std:task (ADR-0017 stage 0, docs/concurrency.md): ONE builtin `BTask(k)` whose number k selects
+// the operation. They are reachable only through the internal module `std:fsraw`, which only library code can import
+// (E0301 for user code), so user programs use them only through `std:task`.
+//
+// | k  | name              | C function                | arguments -> result                                              |
+// |----|-------------------|---------------------------|------------------------------------------------------------------|
+// | 0  | monNew            | orin_mon_new              | (words: usize) -> usize                                          |
+// | 1  | monFree           | orin_mon_free             | (m) -> void                                                      |
+// | 2  | monLock           | orin_mon_lock             | (m) -> void                                                      |
+// | 3  | monUnlock         | orin_mon_unlock           | (m) -> void                                                      |
+// | 4  | monWait           | orin_mon_wait             | (m, queue 0 or 1) -> void                                        |
+// | 5  | monNotifyAll      | orin_mon_notify_all       | (m, queue) -> void                                               |
+// | 6  | monGet            | orin_mon_get              | (m, i) -> usize                                                  |
+// | 7  | monSet            | orin_mon_set              | (m, i, v) -> void                                                |
+// | 8  | monGrow           | orin_mon_grow             | (m, words) -> void                                               |
+// | 9  | transitPut        | orin_rt_transfer_put      | (box: any record) -> usize (the box is built by the caller)      |
+// | 10 | transitTake       | orin_rt_transfer_take     | (token) -> the record type expected at the call (annotated local) |
+// | 11 | transitDrop       | orin_rt_transfer_drop     | (token) -> void                                                  |
+// | 12 | taskSpawn         | orin_rt_task_spawn        | (token of a `() => void` closure) -> usize (thread handle)       |
+// | 13 | taskJoin          | orin_rt_task_join         | (thread) -> usize (0 returned, 1 trapped)                        |
+// | 14 | taskMessage       | orin_rt_task_message      | () -> string (the trap message of the last joined task)          |
+// | 15 | taskTrap          | orin_rt_trap_str          | (message: string) -> void, ends the task (or the process)        |
+// | 16 | transferCount     | orin_rt_transfer_count    | (0 moved | 1 copied) -> usize                                    |
+// | 17 | grantClone        | orin_cap_clone            | (grant) -> a grant of the same family: OPENER (handle)           |
+// | 18 | grantMove         | orin_cap_move             | (grant) -> usize token: CLOSER (the handle is dead afterwards)   |
+// | 19 | grantAdoptFs      | orin_cap_adopt_fs         | (token) -> FsGrant: OPENER whose authority is the token          |
+// | 20 | grantAdoptProcess | orin_cap_adopt_process    | (token) -> ProcessGrant: OPENER                                  |
+// | 21 | grantAdoptStdio   | orin_cap_adopt_stdio      | (token) -> StdioGrant: OPENER                                    |
+// | 22 | grantAdoptClock   | orin_cap_adopt_clock      | (token) -> ClockGrant: OPENER                                    |
+// | 23 | monNotifyOne      | orin_mon_notify_one       | (m, queue) -> void                                               |
+//
+// The monitor and transfer functions are the L0 / runtime interface of docs/concurrency.md ("Porting table").
+
+export function taskOpCount(): usize {
+  return 24;
+}
+
+function names(): string[] {
+  return [
+    "monNew", "monFree", "monLock", "monUnlock", "monWait", "monNotifyAll", "monGet", "monSet", "monGrow", "transitPut",
+    "transitTake", "transitDrop", "taskSpawn", "taskJoin", "taskMessage", "taskTrap", "transferCount", "grantClone",
+    "grantMove", "grantAdoptFs", "grantAdoptProcess", "grantAdoptStdio", "grantAdoptClock", "monNotifyOne"
+  ];
+}
+
+function cnames(): string[] {
+  return [
+    "orin_mon_new", "orin_mon_free", "orin_mon_lock", "orin_mon_unlock", "orin_mon_wait", "orin_mon_notify_all",
+    "orin_mon_get", "orin_mon_set", "orin_mon_grow", "orin_rt_transfer_put", "orin_rt_transfer_take",
+    "orin_rt_transfer_drop", "orin_rt_task_spawn", "orin_rt_task_join", "orin_rt_task_message", "orin_rt_trap_str",
+    "orin_rt_transfer_count", "orin_cap_clone", "orin_cap_move", "orin_cap_adopt_fs", "orin_cap_adopt_process",
+    "orin_cap_adopt_stdio", "orin_cap_adopt_clock", "orin_mon_notify_one"
+  ];
+}
+
+// The name std:fsraw exports operation k under; "" for an unknown k.
+export function taskOpName(k: usize): string {
+  const ns = names();
+  return k < ns.length ? ns[k] : "";
+}
+
+// The operation called `name` in std:fsraw.
+export function taskOpFromName(name: string): Option<usize> {
+  const ns = names();
+  let i: usize = 0;
+  while (i < ns.length) {
+    if (ns[i] == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The C function of the runtime (both backends call it; the LLVM backend by the same symbol).
+export function taskOpC(k: usize): string {
+  const cs = cnames();
+  return k < cs.length ? cs[k] : "";
+}
+
+// Result kind: 0 void, 1 a 64-bit scalar (also a handle), 2 a reference (an owned object).
+export function taskOpRet(k: usize): int {
+  if (k == 1 || k == 2 || k == 3 || k == 4 || k == 5 || k == 7 || k == 8 || k == 11 || k == 15 || k == 23) {
+    return 0;
+  }
+  if (k == 10 || k == 14) {
+    return 2;
+  }
+  return 1;
+}
+
+// A primitive that defines a resource handle from another handle (the authorising first argument): grantClone.
+export function taskOpOpensFrom(k: usize): bool {
+  return k == 17;
+}
+
+// A primitive that defines a resource handle from a one-shot token: grantAdopt*.
+export function taskOpAdopts(k: usize): bool {
+  return k >= 19 && k <= 22;
+}
+
+// A primitive that ends a resource handle and hands its authority over as a token: grantMove.
+export function taskOpMoves(k: usize): bool {
+  return k == 18;
+}

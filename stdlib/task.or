@@ -1,0 +1,575 @@
+// std:task -- structured concurrency with isolated tasks (ADR-0017 stage 0; docs/concurrency.md).
+//
+// UNSTABLE until the concurrency freeze. The whole library is Orin. Only the primitives under it are C: the L0 thread and
+// monitor operations (platform/orin_platform.h) and the transfer / task-start functions of the temporary runtime interface
+// `orin_rt_*` (runtime/orin_runtime.c, to move to Orin in R3). Nothing in this file is trusted beyond what the compiler
+// checks: the scheduler bookkeeping (the scope's task table), the channel buffers, the join results and the panic
+// propagation are ordinary Orin with invariants and contracts.
+//
+// MODEL. A task is an operating-system thread with its own heap. A value that crosses from one task to another (a
+// captured variable of a task body, a result, a message) is MOVED when it is uniquely owned (every reference in it has
+// count 1: no copy is made) and deep-copied otherwise; to the program both are a value copy. Reference counts stay
+// non-atomic: no object is ever reachable from two tasks, so there is no shared mutable memory and no data race. The only
+// state tasks share is a MONITOR: a lock-protected array of integers owned by the L0 layer. std:task keeps the task table of a
+// scope in one and the buffer of a channel in one; a buffer holds transfer tokens, never values.
+//
+//   scope(s => {
+//     const a = spawn(s, () => work(1));
+//     const b = spawn(s, () => work(2));
+//     return a.join() + b.join();
+//   })
+//
+// * `scope(body)` runs `body(s)` and, before it returns, joins every task spawned in it whether or not the body joined it:
+//   no task outlives its scope. If a task that nobody joined panicked, the scope panics (traps) after all tasks have ended.
+// * `spawn(s, f)` starts `f` as a task; `h.join()` waits for it and returns its result. A panic (trap) in a task ends only
+//   that task; `join` (or the end of the scope) turns it into a trap of the joining task with the message
+//   `task panicked: <message>`. A panic is never lost silently. Generic methods do not exist (E0460), so `spawn` is a
+//   function taking the scope, not a method of it.
+// * `channel<T>(capacity)` makes a bounded channel; `ch.tx.send(v)` blocks while it is full, `ch.rx.recv()` blocks while it
+//   is empty and returns `None` once the channel is closed and drained. `tx.close()` ends the stream, `rx.close()`
+//   cancels it (a blocked or later `send` returns false). Each end can be copied and used by any number of tasks. Close both
+//   ends to release the channel: after that any use of it traps.
+// * Resource handles are not values: a task body cannot capture one (E0483). A grant is delegated with `spawnFs`,
+//   `spawnProcess`, `spawnStdio` or `spawnClock`: the spawner derives a fresh grant with the same authority and MOVES it
+//   into the task (the task owns it and revokes it when it ends, also when it panics) and the body receives it as a
+//   parameter, like the body of a scope function of std:host.
+// * `parallelMap(xs, f, parts)` maps `f` over `xs` in `parts` tasks and returns the results in order.
+//
+// Stage 0 has no `async` / `await`, no cancellation other than `rx.close()`, no timeouts, no deadlock detection (all tasks
+// blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
+// A panic in the BODY of a scope (not in a task) is not unwound: tasks still running keep running until the process ends.
+
+import { Ring, Ledger } from "std:taskcore";
+import {
+  FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
+  grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
+  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne
+} from "std:fsraw";
+
+// ------------------------------------------------------------------------------------------------------ transfer
+
+// The unit of transfer: a one-field record. Building it consumes the value (the runtime then moves a uniquely owned graph
+// and copies a shared one); a task body, a result and a message all travel in one.
+type Box<T> = { v: T; };
+
+type Thunk = () => void;
+
+// putBox<T>(v): the transfer token of `v`. A token is taken exactly once, by takeBox or dropped by transitDrop.
+function putBox<T>(v: T): usize {
+  return transitPut(Box<T> { v: v });
+}
+
+function takeBox<T>(tok: usize): T {
+  const b: Box<T> = transitTake(tok);
+  return b.v;
+}
+
+export { Ring, Ledger } from "std:taskcore";
+
+// movedCount(): how many values this task has sent by MOVE (no copy) since it started, and copiedCount(): by deep copy.
+// Only values that contain a reference (strings, arrays, records, ...) are counted; scalars cost nothing either way.
+export function movedCount(): usize {
+  return transferCount(0);
+}
+
+export function copiedCount(): usize {
+  return transferCount(1);
+}
+
+// ------------------------------------------------------------------------------------------------------ channels
+
+// Monitor words of a channel: [0] capacity, [1] head, [2] len, [3] flags (1 = tx closed, 2 = rx closed), [4 + i] the
+// token in ring slot i.
+const CH_HDR: usize = 4;
+
+function loadRing(m: usize): Ring {
+  const flags = monGet(m, 3);
+  return new Ring(monGet(m, 0), monGet(m, 1), monGet(m, 2), flags % 2 == 1, flags >= 2);
+}
+
+// A monitor has two condition queues: 0 = "there is room" (blocked senders), 1 = "there is a value" (blocked receivers). A
+// send wakes one receiver, a receive wakes one sender, a close wakes everybody.
+function wakeAll(m: usize): void {
+  monNotifyAll(m, 0);
+  monNotifyAll(m, 1);
+}
+
+function storeRing(m: usize, r: Ring): void {
+  monSet(m, 1, r.head);
+  monSet(m, 2, r.len);
+  let flags: usize = 0;
+  if (r.txClosed) {
+    flags += 1;
+  }
+  if (r.rxClosed) {
+    flags += 2;
+  }
+  monSet(m, 3, flags);
+}
+
+// The sending end of a channel. A copy refers to the same channel. A monitor handle is never 0: a forged `new Sender<T>(0)` is a
+// contract violation (and any other forged handle is refused by the platform layer at its first use).
+@Invariant(this.ch != 0)
+export class Sender<T> {
+  ch: usize;
+
+  @Requires(ch != 0)
+  constructor(ch: usize) {
+    this.ch = ch;
+  }
+
+  // send(v): blocks while the channel is full; true when `v` was handed to the channel (moved if it is uniquely owned,
+  // copied otherwise); false when the channel is closed by either end, in which case `v` is dropped.
+  send(v: T): bool {
+    const tok = putBox(v);
+    monLock(this.ch);
+    let r = loadRing(this.ch);
+    while (!r.canPush() && !r.txClosed && !r.rxClosed) {
+      monWait(this.ch, 0);
+      r = loadRing(this.ch);
+    }
+    if (!r.canPush()) {
+      monUnlock(this.ch);
+      transitDrop(tok);
+      return false;
+    }
+    const slot = r.push();
+    monSet(this.ch, CH_HDR + slot, tok);
+    storeRing(this.ch, r);
+    monNotifyOne(this.ch, 1);
+    monUnlock(this.ch);
+    return true;
+  }
+
+  // close(): no more values will be sent; receivers drain what is buffered and then get None.
+  close(): void {
+    monLock(this.ch);
+    let r = loadRing(this.ch);
+    r.closeTx();
+    storeRing(this.ch, r);
+    wakeAll(this.ch);
+    const done = r.released();
+    monUnlock(this.ch);
+    if (done) {
+      monFree(this.ch);
+    }
+  }
+}
+
+// The receiving end of a channel. A copy refers to the same channel (several receivers share the stream).
+@Invariant(this.ch != 0)
+export class Receiver<T> {
+  ch: usize;
+
+  @Requires(ch != 0)
+  constructor(ch: usize) {
+    this.ch = ch;
+  }
+
+  // recv(): blocks while the channel is empty; Some(v) with the oldest value, or None once the channel is closed and
+  // drained (or cancelled by rx.close()).
+  recv(): Option<T> {
+    monLock(this.ch);
+    let r = loadRing(this.ch);
+    while (!r.canPop() && !r.isDone()) {
+      monWait(this.ch, 1);
+      r = loadRing(this.ch);
+    }
+    if (!r.canPop()) {
+      monUnlock(this.ch);
+      return None;
+    }
+    const slot = r.pop();
+    const tok = monGet(this.ch, CH_HDR + slot);
+    storeRing(this.ch, r);
+    monNotifyOne(this.ch, 0);
+    monUnlock(this.ch);
+    const v: T = takeBox(tok);
+    return Some(v);
+  }
+
+  // close(): this end is done: buffered values are dropped, a blocked or later send returns false.
+  close(): void {
+    monLock(this.ch);
+    let r = loadRing(this.ch);
+    let toks: usize[] = [];
+    while (r.canPop()) {
+      const slot = r.pop();
+      toks.push(monGet(this.ch, CH_HDR + slot));
+    }
+    r.closeRx();
+    storeRing(this.ch, r);
+    wakeAll(this.ch);
+    const done = r.released();
+    monUnlock(this.ch);
+    for (const t of toks) {
+      transitDrop(t);
+    }
+    if (done) {
+      monFree(this.ch);
+    }
+  }
+}
+
+// The two ends of a channel.
+export type Channel<T> = { tx: Sender<T>; rx: Receiver<T>; };
+
+// channel<T>(capacity): a bounded channel of at least one slot. A capacity of 0 (rendezvous) is not supported in stage 0:
+// E0482 for a constant, a trap otherwise (also without contract checking). Both ends refer to the same channel.
+@Requires(capacity >= 1)
+@Ensures(result.tx.ch == result.rx.ch)
+export function channel<T>(capacity: usize): Channel<T> {
+  if (capacity == 0) {
+    taskTrap("channel capacity must be at least 1");
+  }
+  const m = monNew(CH_HDR + capacity);
+  monLock(m);
+  monSet(m, 0, capacity);
+  monUnlock(m);
+  return Channel<T> { tx: new Sender<T>(m), rx: new Receiver<T>(m) };
+}
+
+// ------------------------------------------------------------------------------------------------------ scopes
+
+const LG_HDR: usize = 4;
+const LG_STRIDE: usize = 3;
+const LG_FIRST: usize = 8;
+
+function loadLedger(m: usize): Ledger {
+  return new Ledger(monGet(m, 0), monGet(m, 1), monGet(m, 2) == 1);
+}
+
+// First word of the entry of task i.
+function entry(i: usize): usize {
+  return LG_HDR + LG_STRIDE * i;
+}
+
+// A scope: the handle of a task table. `scope` makes one and passes it to its body; it is valid only until `scope` returns.
+@Invariant(this.tab != 0)
+export class Scope {
+  tab: usize;
+
+  @Requires(tab != 0)
+  constructor(tab: usize) {
+    this.tab = tab;
+  }
+}
+
+// A started task. `join` may be called once; a second call, or a call after the scope has ended, traps.
+@Invariant(this.tab != 0 && this.res != 0)
+export class TaskHandle<T> {
+  tab: usize;
+  idx: usize;
+  res: usize;
+
+  @Requires(tab != 0 && res != 0)
+  constructor(tab: usize, idx: usize, res: usize) {
+    this.tab = tab;
+    this.idx = idx;
+    this.res = res;
+  }
+
+  // join(): waits for the task and returns its result. If the task panicked, traps with `task panicked: <message>`.
+  join(): T {
+    monLock(this.tab);
+    const st = monGet(this.tab, entry(this.idx) + 2);
+    if (st != 0) {
+      monUnlock(this.tab);
+      taskTrap("task joined twice (or after the end of its scope)");
+    }
+    monSet(this.tab, entry(this.idx) + 2, 1);
+    const th = monGet(this.tab, entry(this.idx));
+    monUnlock(this.tab);
+    const status = taskJoin(th);
+    if (status != 0) {
+      monFree(this.res);
+      taskTrap("task panicked: " + taskMessage());
+    }
+    monLock(this.res);
+    const tok = monGet(this.res, 0);
+    monUnlock(this.res);
+    monFree(this.res);
+    return takeBox(tok);
+  }
+}
+
+// What a task does, as the runtime runs it: compute, publish the result in the result monitor.
+function runTask<T>(f: () => T, res: usize): void {
+  const r = f();
+  const tok = putBox(r);
+  monLock(res);
+  monSet(res, 0, tok);
+  monUnlock(res);
+}
+
+// spawn<T>(s, f): starts `f` as a task of the scope and returns its handle. `f` and everything it captures move to the task
+// (unique values) or are copied to it; the task cannot affect the spawner's values. A body that captures a resource handle
+// is E0483, one that captures a `Scope` is E0481. Traps when the scope has ended or no thread can be started.
+@Ensures(result.tab == s.tab)
+export function spawn<T>(s: Scope, f: () => T): TaskHandle<T> {
+  const res = monNew(1);
+  const body: Thunk = () => runTask(f, res);
+  const tok = putBox(body);
+  monLock(s.tab);
+  let lg = loadLedger(s.tab);
+  if (lg.closed) {
+    monUnlock(s.tab);
+    transitDrop(tok);
+    monFree(res);
+    taskTrap("spawn in a scope that has ended");
+  }
+  const idx = lg.add();
+  const need = entry(idx) + LG_STRIDE;
+  const have = monGet(s.tab, 3);
+  if (need > have) {
+    monGrow(s.tab, have * 2);
+    monSet(s.tab, 3, have * 2);
+  }
+  monSet(s.tab, 0, lg.count);
+  monSet(s.tab, entry(idx), 0);
+  monSet(s.tab, entry(idx) + 1, res);
+  monSet(s.tab, entry(idx) + 2, 0);
+  monUnlock(s.tab);
+  const th = taskSpawn(tok);
+  monLock(s.tab);
+  monSet(s.tab, entry(idx), th);
+  monNotifyAll(s.tab, 0);
+  monUnlock(s.tab);
+  return new TaskHandle<T>(s.tab, idx, res);
+}
+
+// spawnDo(s, f): spawn for a body that returns nothing; join() then returns true.
+export function spawnDo(s: Scope, f: () => void): TaskHandle<bool> {
+  return spawn(s, () => {
+    f();
+    return true;
+  });
+}
+
+// Joins every task of the table that nobody joined, closes the table and returns "" or the message of the first panic.
+function drain(tab: usize): string {
+  let failure = "";
+  let more = true;
+  while (more) {
+    monLock(tab);
+    let lg = loadLedger(tab);
+    if (lg.isScanned()) {
+      lg.close();
+      monSet(tab, 2, 1);
+      monUnlock(tab);
+      more = false;
+    } else {
+      const e = entry(lg.cursor);
+      const claimed = monGet(tab, e + 2) != 0;
+      const th = monGet(tab, e);
+      if (claimed) {
+        lg.advance();
+        monSet(tab, 1, lg.cursor);
+        monUnlock(tab);
+      } else if (th == 0) {
+        monWait(tab, 0);
+        monUnlock(tab);
+      } else {
+        const res = monGet(tab, e + 1);
+        monSet(tab, e + 2, 1);
+        lg.advance();
+        monSet(tab, 1, lg.cursor);
+        monUnlock(tab);
+        const status = taskJoin(th);
+        if (status != 0) {
+          if (failure == "") {
+            failure = taskMessage();
+          }
+        } else {
+          monLock(res);
+          const tok = monGet(res, 0);
+          monUnlock(res);
+          transitDrop(tok);
+        }
+        monFree(res);
+      }
+    }
+  }
+  return failure;
+}
+
+// begin(): a new, empty task table.
+@Ensures(result != 0)
+function begin(): usize {
+  const tab = monNew(LG_FIRST * LG_STRIDE);
+  monLock(tab);
+  monSet(tab, 3, LG_FIRST * LG_STRIDE);
+  monUnlock(tab);
+  return tab;
+}
+
+// finish(tab): joins every task of the table, frees it, and panics if a task nobody joined panicked.
+function finish(tab: usize): void {
+  const failure = drain(tab);
+  monFree(tab);
+  if (failure != "") {
+    taskTrap("task panicked: " + failure);
+  }
+}
+
+// scope(body): runs `body` with a new scope and returns its result after every task spawned in the scope has ended. See the
+// header comment for panics.
+export function scope<R>(body: (s: Scope) => R): R {
+  const tab = begin();
+  const r = body(new Scope(tab));
+  finish(tab);
+  return r;
+}
+
+// scopeFs(fs, body), scopeProcess, scopeStdio, scopeClock: `scope` for a body that also uses a grant. A closure cannot
+// capture a grant (E0452), so the grant is passed through: the body gets it back as a second parameter (the same shape as
+// `withFileFs` of std:fs). Use it with the matching spawnFs / spawnProcess / spawnStdio / spawnClock.
+export function scopeFs<R>(fs: FsGrant, body: (s: Scope, g: FsGrant) => R): R {
+  const tab = begin();
+  const r = body(new Scope(tab), fs);
+  finish(tab);
+  return r;
+}
+
+export function scopeProcess<R>(proc: ProcessGrant, body: (s: Scope, g: ProcessGrant) => R): R {
+  const tab = begin();
+  const r = body(new Scope(tab), proc);
+  finish(tab);
+  return r;
+}
+
+export function scopeStdio<R>(stdio: StdioGrant, body: (s: Scope, g: StdioGrant) => R): R {
+  const tab = begin();
+  const r = body(new Scope(tab), stdio);
+  finish(tab);
+  return r;
+}
+
+export function scopeClock<R>(clock: ClockGrant, body: (s: Scope, g: ClockGrant) => R): R {
+  const tab = begin();
+  const r = body(new Scope(tab), clock);
+  finish(tab);
+  return r;
+}
+
+// scopeDo(body), scopeFsDo, ...: the flavours for a body that returns nothing (a generic result cannot be void; std:fs and
+// std:host have the same pairs of `with*` / `use*`).
+export function scopeDo(body: (s: Scope) => void): void {
+  const tab = begin();
+  body(new Scope(tab));
+  finish(tab);
+}
+
+export function scopeFsDo(fs: FsGrant, body: (s: Scope, g: FsGrant) => void): void {
+  const tab = begin();
+  body(new Scope(tab), fs);
+  finish(tab);
+}
+
+export function scopeProcessDo(proc: ProcessGrant, body: (s: Scope, g: ProcessGrant) => void): void {
+  const tab = begin();
+  body(new Scope(tab), proc);
+  finish(tab);
+}
+
+export function scopeStdioDo(stdio: StdioGrant, body: (s: Scope, g: StdioGrant) => void): void {
+  const tab = begin();
+  body(new Scope(tab), stdio);
+  finish(tab);
+}
+
+export function scopeClockDo(clock: ClockGrant, body: (s: Scope, g: ClockGrant) => void): void {
+  const tab = begin();
+  body(new Scope(tab), clock);
+  finish(tab);
+}
+
+// ------------------------------------------------------------------------------------------------------ delegating grants
+//
+// A grant is a resource handle (ADR-0025, ADR-0027): it is only ever a parameter, never a captured or sent value. To give
+// authority to a task, the spawner DERIVES a grant of the same family (never more authority than its own: same scope, same
+// flags), MOVES it into the task, and the task's wrapper adopts it, passes it to the body as a parameter and revokes it
+// when the body returns (the runtime also revokes it if the task panics). The compiler checks both halves: the derived handle
+// is moved exactly once on every path of the spawner (the MIR verifier's closer rule), and the adopted one is revoked
+// exactly once on every path of the task wrapper. The spawner's own grant is untouched.
+
+function runFs<T>(tok: usize, body: (g: FsGrant) => T): T {
+  const g = grantAdoptFs(tok);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+function runProcess<T>(tok: usize, body: (g: ProcessGrant) => T): T {
+  const g = grantAdoptProcess(tok);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+function runStdio<T>(tok: usize, body: (g: StdioGrant) => T): T {
+  const g = grantAdoptStdio(tok);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+function runClock<T>(tok: usize, body: (g: ClockGrant) => T): T {
+  const g = grantAdoptClock(tok);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+// spawnFs(s, fs, body): a task whose body gets a file-system grant of the authority of `fs`, owned by the task.
+export function spawnFs<T>(s: Scope, fs: FsGrant, body: (g: FsGrant) => T): TaskHandle<T> {
+  const c = grantClone(fs);
+  const tok = grantMove(c);
+  return spawn(s, () => runFs(tok, body));
+}
+
+export function spawnProcess<T>(s: Scope, proc: ProcessGrant, body: (g: ProcessGrant) => T): TaskHandle<T> {
+  const c = grantClone(proc);
+  const tok = grantMove(c);
+  return spawn(s, () => runProcess(tok, body));
+}
+
+export function spawnStdio<T>(s: Scope, stdio: StdioGrant, body: (g: StdioGrant) => T): TaskHandle<T> {
+  const c = grantClone(stdio);
+  const tok = grantMove(c);
+  return spawn(s, () => runStdio(tok, body));
+}
+
+export function spawnClock<T>(s: Scope, clock: ClockGrant, body: (g: ClockGrant) => T): TaskHandle<T> {
+  const c = grantClone(clock);
+  const tok = grantMove(c);
+  return spawn(s, () => runClock(tok, body));
+}
+
+// ------------------------------------------------------------------------------------------------------ parallelMap
+
+// parallelMap(xs, f, parts): `xs.map(f)` computed by `parts` tasks, each mapping one contiguous chunk; the result is in
+// order. `f` is copied to every task, each chunk moves or is copied to its task. parts = 0 or 1 maps in the calling task.
+@Ensures(result.length == xs.length)
+export function parallelMap<A, B>(xs: A[], f: (x: A) => B, parts: usize): B[] {
+  if (parts <= 1 || xs.length <= 1) {
+    return xs.map(f);
+  }
+  const n = parts < xs.length ? parts : xs.length;
+  const size = (xs.length + n - 1) / n;
+  return scope(s => {
+    let hs: TaskHandle<B[]>[] = [];
+    let lo: usize = 0;
+    while (lo < xs.length) {
+      const hi = lo + size < xs.length ? lo + size : xs.length;
+      const chunk = xs.slice(lo, hi);
+      hs.push(spawn(s, () => chunk.map(f)));
+      lo = hi;
+    }
+    let out: B[] = [];
+    for (const h of hs) {
+      out = out.concat(h.join());
+    }
+    return out;
+  });
+}
