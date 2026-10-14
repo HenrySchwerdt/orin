@@ -916,6 +916,253 @@ Friction:
   at every nesting level, exponential in the depth; it was dropped. `format`'s idempotence clause runs the formatter twice per
   call, acceptable because only the contract-checked build pays it.
 
+## Step 3b: `verify/` (the ownership verifier), `mir/` well-formedness, `hir/`
+
+Rewritten: `compiler/verify/` (the independent MIR ownership verifier, the trust anchor of memory safety: every compile is
+gated by it, it has a Lean twin in `formal/` and the differential test `tools/diff_verifier_lean.py`). The transfer functions
+threaded a `Cx` record through ~60 functions that each returned the updated copy; the fixpoint kept parallel `ins` / `queued`
+/ `work` arrays in one function. New: `compiler/mir/wellformed.or` (the structural MIR predicates, shared by the lowering, the
+verifier and the tests). `compiler/hir/` got contracts where it has real invariants. `compiler/lower/` only lost the predicates
+that moved to `mir/` (and `lower` gained `@Ensures(isWellFormedProgram(result))`). `compiler/opt/` was not touched: it keeps
+using `Cx`, `step`, `State.ls` and `blockInStates` exactly as before.
+
+| Old | New |
+|---|---|
+| `type State = { ls; holes }` + free functions `joinState`, `stateEq`, `holeIn`, `holesEq` | class `State` (state.or): the lattice value stored per block: queries (`kind`, `srcOf`, `holeAny`, `holeHas`, `holeMay`), `join`, `equals`, `leq` (the lattice order), `borrowsFlat`; the hole queries are also free functions over a hole array (`holeAnyIn`, ...) |
+| `type Cx = {..}` threaded through every rule: `c = readLocal(c, l); c = err(c, msg); return def(c, d, k, 0)`; `setLs`, `killBorrows`, `addHole`, ... over a `Cx` | class `Transfer` (rules.or): one run through a block; it owns the state arrays `ls` / `holes` and the issues; the rules and the state mutators (`set`, `killBorrows`, `addHole`, `removeHole`, `dropHolesOf`) are private methods that mutate `this`; public `run`, `step(ins)`, `term(t)`, `state()` carry the contracts. `Cx` / `step(cx, ins)` remain as the optimiser's interface (a wrapper) |
+| `fixpoint(p, f)`: `ins`, `queued`, `work` as three local arrays | class `Fixpoint` (verify.or): the in-states and the worklist (`queued` flags, LIFO `work`), private `add` / `take`, public `run`, `isStable`, `pending` |
+| `successors`, `dstOf`, `instrLocals`, ... duplicated in verify.or, wf.or and lower/wellformed.or | one copy in `mir/wellformed.or`: `dstOf`, `instrLocals`, `instrOperands`, `termLocals`, `successors`, `instrInRange`, `termInRange`, `spansAligned`, `paramsWellFormed`, `isWellFormedFunction`, `isWellFormedProgram`, plus the block predicates of 3a |
+| index loops that ask a question about an array (`noHandles`, `opsOk`, `constsOk`, `casesOk`, `holeIn`, `holesEq`, owned-parameter scans, the void-local scan) | `some` / `every` / `find` / `filter` (rule 7); the per-instruction loops of the transfer functions (`killBorrows`, `callOwned`, the leak scan at `return`, `join`, `equals`) stay loops: they are the hot path, mutate, or exit early |
+| vtable check inline in `verify` | `vtableMsg` |
+
+Files (`orin fmt` output for the rewritten files; clauses counted with `grep -c '^ *@Requires'` etc.):
+
+| file | role | lines before -> after | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `verify/state.or` | domain: `LState` (record invariants), `lsLeq`, `joinLs`, hole queries, `borrowsFlatIn`, class `State` | 145 -> 331 | 6 | 12 | 3 |
+| `verify/rules.or` | class `Transfer`, `Cx` / `step`, `noRevival`, `issuesAt` | 656 -> 830 | 11 | 20 | 3 |
+| `verify/verify.or` | class `Fixpoint`; `verify`, `blockInStates`, report placement | 211 -> 380 | 7 | 20 | 4 |
+| `verify/wf.or` | structural checks, tied to the `mir/` predicates | 473 -> 564 | 3 | 9 | 0 |
+| `verify/module.or` | exports | 4 -> 13 | 0 | 0 | 0 |
+| `mir/wellformed.or` (new) | shared structural predicates | 0 -> 292 | 0 | 1 | 0 |
+| `hir/hir.or` | integer kinds, `Function` | 264 -> 298 | 3 | 11 | 1 |
+| `hir/index.or` | `CallSite` (after merging main's `param` / `fnArgs`) | 72 -> 89 | 0 | 0 | 4 |
+| `lower/wellformed.or` | (predicates moved to `mir/`) | 241 -> 57 | 0 | 0 | 0 |
+| `lower/lower.or` | `lower` | 36 -> 37 | 0 | 5 (+1) | 0 |
+| total verify | | 1,489 -> 2,118 | 27 | 61 | 10 = **98 clauses (0 before)**; 101 after the merges below (28 / 63 / 10) |
+| total hir + mir + lower | | | 3 | 13 (+2) | 5 = 21 new clauses |
+
+Unit tests: `compiler/tests/verify_test.or` (23 `@Test`, 622 lines), run by `tools/test_tooling.sh`; `compiler/tests/verify_main.or`
+gained 4 robustness cases (below).
+
+Classes (3 new): `State` (every hole names a local of the function, so does every symbolic index), `Transfer` (one state
+entry per local of the function; every hole names a local; the position is a block of the function and at most its
+terminator), `Fixpoint` (one in-state slot and one queue flag per block; the entry block is always reached; the worklist is
+never longer than the block list, and only block ids get in, by the `@Requires` of `add`). `LState` (a kind in range; a source
+only for `Borrowed`) and `CallSite` (a known evidence level and edge kind, no callee when the target is unknown, a parameter index only for a call of
+a function value) are records
+with invariants; `Function` (HIR) has `paramCount <= locals.length`.
+
+Contracts (highlights; the bug each would catch):
+
+* **the join is a semilattice join**: `joinLs` ensures commutativity (`joinLs(a, b) == joinLs(b, a)`, a self-call in the
+  contract), idempotence, that the result is an upper bound of both inputs in `lsLeq` (the order is stated independently of
+  the join: equal; Unique/Imm below Owned; no-reference states below MaybeDead; everything but handles below MaybeLeak;
+  MaybeOpen on top), and that a borrow survives a join only when both sides agree on its root. `State.join` ensures
+  `this.leq(result) && o.leq(result)` (catches a join that loses a hole or a poisoning: the next block would be checked from a
+  state that is too optimistic, i.e. unsound) and `equals` ensures `result ==> this.leq(o)`. The unit tests check
+  associativity and that the join is the *least* upper bound over all 12x12x12 states (the worklist order then cannot matter).
+* **only a defining instruction revives a local**: `Transfer.step` ensures `noRevival(old(this.st), this.st, dstOf(ins))`:
+  a local that was dead or poisoned before an instruction is in exactly the same state after it, unless the instruction
+  defines it. Catches a rule that "repairs" a released array by a push (a use-after-free that would then pass every later
+  check), a demotion that fires on a dead local, a close that reopens.
+* **borrows are flat**: `Transfer.run` requires and ensures `State.borrowsFlat()` (an alias's root is never itself an alias).
+  `rootOf` and the single `killBorrows(x)` per release rely on it; a redefinition that forgot to kill the aliases of the
+  redefined local makes a chain, and the alias would survive the release of its real owner.
+* **every report names an existing position**: `Transfer.step` / `term` ensure that every new issue is at the current block
+  and instruction and carries that instruction's span (`issuesAt`); `verifyFunction` ensures `issuePlaced` for every error and
+  warning (an existing block and instruction, the terminator being `instrs.length`, or the function itself at 0/0 without a
+  span); `verify` ensures `reportPlaced` (a function, a vtable or `<program>`).
+* **the fixpoint is one**: `Fixpoint.run` ensures an empty worklist, one entry per local in every in-state, that the reached
+  blocks are closed under successors, and `isStable()`: re-running every reached block and joining its out-state into each
+  successor's in-state changes nothing. Catches a worklist that drops a block or does not re-queue a loop head whose in-state
+  grew (the blocks after the loop would be checked from a stale state). `Fixpoint.add` / `take` state their effect on the
+  queue (a block is queued at most once; `take` returns a valid id and unqueues it).
+* **the verifier's well-formedness implies the shared predicate**: `wfInstr` ensures `instrInRange` (only locals, strings,
+  functions, vtables that exist) and `handleDefOk` (only an opener defines a handle); `wfTerm` ensures `termInRange`;
+  `wfFunction` ensures `paramsWellFormed`, an entry block, `spansAligned`; `wellFormed` / `verifyFunction` ensure
+  `errors.length == 0 ==> isWellFormedFunction(p, f)` and `verify` ensures `errors.length == 0 ==> isWellFormedProgram(p)`.
+  The verifier's check and the structural predicate of `mir/` are written independently; the contract keeps them from drifting
+  apart (a wf rule deleted from the verifier shows as a trap). `lower` ensures `isWellFormedProgram(result)` with the same
+  predicate.
+* **preconditions of the rules**: `Transfer.step` requires `wfInstr(..) == ""` (the rules index without checks),
+  `State.set` requires a kind in range and a borrow rooted at another existing local, `addHole` a hole naming existing locals,
+  `blockInStates` (the optimiser's entry) a well-formed function.
+* **hir**: `kindType` requires a kind number and ensures `intKindOf(kindType(k)) == k`; `kindHi` ensures that a narrow kind has
+  exactly 2^bits values (`kindHi(k) - kindLo(k) + 1 == pow2(kindBits(k))`) and that the u64 maximum is the all-ones pattern;
+  `kindLo` is negative exactly for signed kinds; `kindNarrow == (kindBits < 64)`; `kindName` requires a kind number (it
+  indexes a table).
+
+None fired on the compiler's own sources, the conformance suites or the unit tests. To see that they can: 12 hand-made
+mutants of the new code (join keeps Unique, worklist forgets its flag, no re-queue of a grown in-state, redefinition or release
+keeps aliases, a push revives a dead array, a symbolic hole key never aliases, errors one instruction late, an unchecked
+`goto` target, `dup` does not demote, the join drops the second state's holes, `kindHi(i8) == 128`) were run against
+`verify_test.or`: **12 / 12 killed**, 9 of them by a contract trap (the other three by assertions). The first run left one
+survivor (the revived array), which is why `aPushOntoAReleasedArrayDoesNotReviveIt` exists.
+
+### Defects found and fixed
+
+**The verifier crashed (array index out of range) instead of reporting ill-formed MIR in four places.** All four are
+fail-safe (a trap aborts the compile, nothing unsafe is accepted) and no MIR the compiler produces triggers them, but the trust
+anchor must report, not crash, and the batch driver (`verify_text`) and `orin verify` died on such input. Found by the new
+`@Requires(l < f.locals.length)` of `localClass` and the `spansAligned` part of the shared predicate:
+
+1. `ICall` of a callee whose `paramCount` exceeds its locals: the argument-class loop read `g.locals[i]` of the callee
+   before the callee itself was checked. Now `ICall: callee g has more parameters than locals` (and the callee's own
+   `paramCount exceeds the number of locals`).
+2. `IClosure` whose target has parameters but no locals: `g.locals[0]`. Now the existing message `IClosure: the lifted
+   function must take the environment record as its first parameter`.
+3. A vtable entry with parameters but no locals: same; now the existing `vtable entry g must take the boxed value ...`.
+4. A block with fewer spans than instructions (possible only without contract checking: `MBlock`'s record invariant forbids
+   it): reporting an error in it read `spans[i]`. `wfFunction` now rejects it with `a block has a different number of source
+   spans and instructions`.
+
+Each is a case of `verify_main.or` (`robustnessCases`, run without contracts, so case 4 can be built) and, for 1-3, of
+`verify_test.or`; on the old verifier all four end in `trap: index out of bounds`. **Verdicts**: these inputs went from "crash"
+to "reject"; no input that was accepted or rejected before changes (measured below). The Lean model needs no change: its
+fragment has well-formed parameter tables and no spans (the differential test generates only well-formed programs).
+
+### Behaviour preservation
+
+All against the compiler built from `origin/main` (c37cf52, merged into the step at the end; the same gates were also run
+before the merge against the 3a baseline, with the same results):
+
+* **verifier verdicts and messages, byte for byte**: the `verify_text` driver built from the old and the new tree, fed the
+  same 43,935 programs (every distinct function of the conformance programs' MIR and all its `mutate_mir` mutants) and
+  the 4,000 `gen_mir_fragment` programs of the Lean differential test (with a synthetic span on every line): **output
+  identical** (28,412 and 3,114 rejections, 4,445,071 and 808,781 bytes), so every accept / reject decision and every
+  message is unchanged; the four robustness inputs above are the only ones that behave differently (a crash before);
+* `tools/mutate_mir.py`: 41,315 mutants, 28,412 rejected, 12,354 warned, 549 benign, 0 survivors, 0 wrong-reason (the
+  same as before); `tools/diff_verifier_lean.py` (12,000 programs): 4,592 both ACCEPT, 7,396 both REJECT, 12 divergences,
+  all in the allow-listed class F6, the same numbers with the old driver; `verify_main.or`: all cases pass (4 new);
+* generated code (`tools/diff_compilers.py`-style comparison of C, C with `--check-contracts` and LLVM IR of every `tests/run`,
+  `tests/next/run`, `tests/contracts`, `examples/` program and `compiler/main.or`): **390 inputs x 3, 0 differences**;
+  diagnostics (`tools/diff_compilers.py`): 1,406 inputs x 3 modes, 0 differences;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,373,446 bytes), conformance 141/141; all suites with `orin2`: 806/806;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806/806
+  conformance tests, `test_verify_contracts` 809 checks: **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: no warning in the files of this step; the 13 `W0471` of
+  `compiler/vc/` (`Gen`, `Tab`) are on `origin/main` too and are not part of this step;
+* `tools/test_tooling.sh` (including `verify_test.or` and `verify_main.or`): passes; `ci_local.sh` was not run (the
+  coordinator replaced it by the gates above; GitHub CI covers the rest).
+
+Selfcompile (`orin2 compile compiler/main.or -o /dev/null`, both compilers on the same merged tree, interleaved, the
+machine shared with other workers at load 4-10 on 4 cores):
+
+| | main compiler | new compiler |
+|---|---|---|
+| batch 1 (main first, 10 runs) | median 9.241 s, min 8.104 | median 9.508 s (+2.9 %), min 8.219 (+1.4 %) |
+| batch 2 (new first, 10 runs) | median 8.673 s, min 7.413 | median 8.408 s (-3.1 %), min 7.242 (-2.3 %) |
+| before the merge, 3a baseline vs final layout (5 runs) | median 7.938 s, min 7.185 | median 7.160 s, min 6.910 |
+
+No regression beyond the noise; the copy count of the verifier is below the old code's (2.62 M vs 2.89 M
+`orin_make_unique_slow` calls per self-compile, gprof). The verifier is about half of the self-compile; its hot spots are the
+same as before (`killBorrows`, O(locals) per definition, about 23 %, and `State.join`, about 17 %): a reverse index from a
+root to its aliases would remove most of the first, a change of algorithm left for later.
+
+### Design notes and friction
+
+* **A mutating method called on a class-typed field copies the object (performance finding).** The first version kept a
+  `State` field in `Transfer` (`this.st.set(l, k, src)`, `this.st.killBorrows(x)`) and a `Worklist` field in `Fixpoint`
+  (`this.work.add(s)`). The self-compile became **20 % slower** (median 11.20 s vs 9.34 s, minimum 10.21 vs 8.57, both
+  compilers on the same tree): the verifier is about half of the self-compile, and gprof showed `orin_make_unique_slow`
+  going from 2.9 M to 5.9 M calls, 2.7 M of them from `State.set` and 1.4 M from `Worklist.add` / `take`. A 30-line
+  micro-benchmark confirms it: `this.inner.set(i, v)` copies the inner object *and its array* on every call (400,000 copies
+  for 200,000 calls of a 1,000-element array), `this.a[i] = v` copies nothing. The generated code keeps the field's old
+  value alive across the call, so the callee never sees a unique object. The fix keeps the hot state in the class that
+  mutates it: `Transfer` owns `ls` / `holes` (`state()` packages them as a `State` at the boundaries) and `Fixpoint` owns
+  its queue. Afterwards: 2.6 M copies, fewer than before the rewrite. The same pattern costs the lowering of step 3a
+  copies too (`this.b.emit(..)`: 321,000 copies of the `BlockBuilder` per self-compile); a lowering of a mutating call on
+  a field place via take / put (as `IArrayPush` on a field already does) would remove the trap for every class. That is a
+  change to `lower/` and to the generated C, outside this step.
+* **`Cx` stays for the optimiser.** `opt/calls.or` builds `Cx { prog, f, blk, ins, st, errs, warns }` and replays one
+  instruction at a time; `step(cx, ins)` builds a `Transfer` from it, runs `Transfer.step` and returns its `state()`.
+  `State` is a class with *public* `ls` / `holes` because the optimiser reads `s.ls[x].k`; the invariant is checked after
+  `State`'s own methods only (public fields can be written around it, nothing does).
+* **`old(this.ls)` of an array works** (`noRevival(old(this.ls), this.ls, ..)`): it is a snapshot, the copy-on-write copy is
+  paid only by the contract-checked build.
+* **Contracts on recursive data stay O(1) in invariants**: the class invariants are O(1) or O(holes); the O(locals) properties
+  (`noRevival`, `borrowsFlat`, `killBorrows` leaving no alias) are `@Ensures` of the methods that change the state, and the
+  O(function) ones (`isStable`, `reachClosed`, `isWellFormedFunction`) are on `Fixpoint.run` and `verify`, once per function.
+* **`from` is still a keyword**: the parameter of `issuesAt` is `start`.
+* **A predicate that is too strong for a quirk.** `holesEq` compares lengths and membership, so a hole set with a repeated
+  entry (only a `take` of an already taken slot creates one, and that is an error already) can compare equal to a different
+  set. The contracts say exactly what holds (`equals` ensures `this.leq(o)`, not set equality); behaviour is unchanged.
+* **Shared predicates vs. an independent verifier.** The verifier must not trust the lowering; it does not: its own check
+  (`wf.or`) stays, and the shared `mir/` predicate is only used in its *contracts* to state that the two agree.
+* **A record invariant must cover what the producer emits, not what the comment says.** The comment on `CallSite.via` listed
+  six kinds; the checker also emits `constructor` and `io:<op>`, and main (merged during the step) added `unresolved`. The
+  first `isCallVia` would have trapped the contract-checked compiler on the first unresolved call (rule 6); the kinds were
+  taken from the `addCall` sites, not from the comment.
+* **Monitoring a background job**: `pgrep -f <script>` inside a monitor loop matches the monitor itself (the pitfall of step
+  1 again); wait on the PID.
+
+### Merges after the step: std:net, concurrency stage 0, the performance branch (MIR v1.10)
+
+Two merges were done on top of the step, both into the new structure, with the same verdicts as the merged old verifier:
+
+* **`origin/main` (d73f88a: std:net, concurrency stage 0).** Main had changed the record-threading verifier: net openers
+  `BGrantNet` / `BGrantListen` / `BGrantConnect` / `BNetListen` / `BNetAccept` / `BNetConnect` and the closer `BNetClose` in
+  `builtinStep`, `BTask(k)` dispatched by `taskOpOpensFrom` / `taskOpAdopts` (openers) and `taskOpMoves` (closer); in wf.or the net
+  arms of `takesHandle` / `isOpenB`, `isAdoptB` and the adoption branch of `handleMsg`. Ported as arms of `Transfer.builtin`
+  and the same arms in wf.or; `handleDefOk` (the contract "only an opener defines a handle") now also accepts an adoption,
+  otherwise the contract-checked compiler would trap on std:task. Also: `grantTypeName` grew to eight names, which silently
+  broke its `@Ensures((k < 6) == ..)` from this step (fixed to 8; it merged without a conflict). `verify_main` keeps every case
+  set and sums them (`robustnessCases`, `spanCases`, ..., `netCases`, `taskGrantCases`).
+* **The performance branch (MIR v1.10).** In/out receivers: `def` lets an inout function write parameter 0, an `ICall` of an
+  inout callee re-defines its argument 0 as Owned, `TReturn` of an inout function requires an owned receiver in local 0 and
+  consumes it, wf.or checks the call shape and that parameter 0 is owned; `IArrayExtend` has the rules of `IStrAppend`. All
+  ported into `Transfer` / wf.or / `mir/wellformed.or` (`instrLocals`, `instrOperands`). One contract had to learn the new rule:
+  an inout call defines a local that is not its destination, so `noRevival` now takes `defsOf(prog, ins)` (destination + in/out
+  argument); with `dstOf` alone it would trap on an erroneous inout call. Its two verifier speed-ups:
+  * *`def` skips `killBorrows` when the redefined local was Dead or a scalar* (the alias scan over all locals, the verifier's
+    hottest loop): **still applies, ported.** The reason it is sound is now a stated precondition, `rootsLive` (no alias is
+    rooted at a Dead or scalar local), required and ensured by `Transfer.run`.
+  * *the join allocates nothing when nothing changes* (`joinChanged`): **still applies, ported** as `State.joinIfChanged`
+    (`@Ensures(result.isNone() == this.join(o).equals(this))`); `Fixpoint.run` and `isStable` use it instead of `join` +
+    `equals`.
+  Neither is made unnecessary by the 3b restructuring: the copies that `Fixpoint` / `Transfer` remove (a mutating method called
+  on a class-typed field) exist only in the class version and are a different cost; the perf branch's two speed-ups are about the
+  algorithm and apply to both.
+
+Gates on the doubly merged tree, against a baseline built from `origin/main` + the performance branch *without* step 3b
+(`git merge-tree`, clean in `verify/`):
+
+* verifier output byte for byte against the baseline's `verify_text` driver: **identical** on 49,521 programs of the
+  `mutate_mir` corpus (now with the perf branch's two in/out mutation classes; 32,388 rejections) and the 4,000 Lean-fragment
+  programs (3,114 rejections);
+* `tools/mutate_mir.py`: 46,570 mutants, 32,388 rejected, 13,593 warned, 589 benign, **0 survivors**, 0 wrong-reason;
+  `tools/diff_verifier_lean.py`: 4,592 both ACCEPT, 7,396 both REJECT, 12 divergences, all in the allow-listed class F6;
+  `verify_main.or`: all cases pass (241: every set of main, the perf branch and this step, summed);
+  `verify_test.or`: 26 `@Test` (3 new: an inout call's `defsOf`, `rootsLive` / `joinIfChanged`, `IArrayExtend`);
+* generated code (C, C with `--check-contracts`, LLVM IR): 408 inputs x 3, **0 differences**; diagnostics
+  (`tools/diff_compilers.py`): 1,432 inputs x 3, 0 differences;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,890,058 bytes), conformance 141/141; all suites 832/832;
+* `tools/test_compiler_contracts.sh`: contract-checked self-compile identical to `stage2.c`; suites 832/832 (one test,
+  `std_http_basic`, hit the harness timeout at load 22 and passed on rerun: 1.7 s with contracts, 0.5 s without);
+  `test_verify_contracts` 809 checks; **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: **0 warnings** (the 13 `W0471` of `compiler/vc/` that main had are fixed:
+  `@Ensures` on `Gen.next` / `declare` / `assert` / `lemma` / `setExact` / `taint` / `noteApprox` / `noteStr` /
+  `useAssumption` / `newLoop` / `loopAdd` / `addObl` and `Tab.setCyclic`, each stating its effect; checked by
+  `test_verify_contracts`);
+* `tools/test_tooling.sh` and `tools/test_concurrency.sh` (`task_test` 98 checks, the stress and panic tests under the
+  sanitizers): pass;
+* self-compile instruction count (callgrind, `compile compiler/main.or`, both compilers on the final tree): baseline
+  36,423,718,059, new **34,819,751,109 (-4.4 %)**; `killBorrows` 8.25 G -> 6.43 G (the `Transfer` method writes `this.ls` in
+  place, the record version copied), the joins unchanged (`joinLs` 4.38 G in both, `join` 4.22 G, `joinIfChanged` 3.66 G).
+  The verifier is still about 60 % of the self-compile: `killBorrows` with an index from a root to its aliases, and a join that
+  stops at the first poisoned local, are the next algorithmic steps.
+
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
 Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving

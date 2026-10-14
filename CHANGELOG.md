@@ -1,6 +1,18 @@
 # Changelog
 
 ## Unreleased
+- **Rewrite step 3b: the ownership verifier `compiler/verify/`, shared MIR well-formedness, `compiler/hir/` contracts
+  (ADR-0015).** The verifier's abstract state is a class `State`, the transfer functions are the methods of a class
+  `Transfer` (one run through a block), the fixpoint and its worklist are the class `Fixpoint`; 98 contract clauses (0 before), among
+  them: the join is commutative, idempotent and an upper bound in an independently stated lattice order; no instruction
+  revives a dead or poisoned local unless it defines it; borrows stay flat; every report names an existing block and
+  instruction with its span; the fixpoint is stable; the verifier's well-formedness check implies the shared predicate
+  `isWellFormedProgram` (new `compiler/mir/wellformed.or`, also used by the lowering). `hir/`: integer-kind round trip and
+  exact ranges, `Function.paramCount <= locals.length`, `CallSite` evidence and edge kinds. 23 unit tests
+  (`compiler/tests/verify_test.or`), 12/12 hand-made mutants killed. **Fixed**: four inputs on which the verifier itself
+  crashed (`trap: index out of bounds`) instead of reporting ill-formed MIR: a call of a callee with more parameters than
+  locals, a closure target or vtable entry with parameters but no locals, a block with fewer spans than instructions; they are
+  now rejected with a message. Every other verdict and message is unchanged; generated C / LLVM output is byte-identical.
 - **Rewrite step 3e: the tooling modules `analysis/`, `lsp/`, `mcp/`, `json/`, `fmt/` (ADR-0015) and the capability gate.**
   State that was threaded through records is now five classes: `Workspace` (the document store), `LspServer`, `McpSession`,
   `JsonCursor`, and the formatter's `Layout` (source text and comment queue); 213 contract clauses (35 before), among them the
@@ -56,6 +68,12 @@
   ThreadSanitizer and ASan + UBSan (`tools/test_concurrency.sh`). Example `examples/parallel_map.or`. Assurance: the C parts are
   `TESTED_ONLY` (ThreadSanitizer, no proof) until R3 / R4 (docs/assurance.md C17). Not in stage 0: `async` / `await`, cancellation,
   timeouts, deadlock detection, an M:N scheduler, a concurrent HTTP server (`std:net` has not landed).
+- **Performance defects of the std fixed** (docs/benchmarks.md "Performance defects found while building the std"): `x = x + e` /
+  `x = x.concat(e)` on fields, elements and nested places are in-place (take/put of the slot, new MIR instruction `IArrayExtend`;
+  74 s -> 13 ms on bench/appends); mutating methods with a result no longer allocate a pair or copy a field receiver (MIR v1.10 in/out
+  receivers, `compiler/opt/pairs.or`; call loops 8-13x, std:http parse 2x); built-ins `bytesToString(u8[], start, len)` and
+  `stringToBytes(s)` (std:bytes / std:http use them: 8x); verifier definitions no longer scan all locals; LLVM `noundef` / `nonnull`.
+  New benchmarks (appends, mutres, bytesstr, http_parse, sortedmap, pqueue), Rust and Java counterparts in tools/bench.py.
 - **Capabilities, Stage B: transitive effect inference (ADR-0037 D2, graph 2; no new syntax).** The compiler now infers, for
   every function, method and constructor, the set of primitive effects it may perform *transitively* (`Fs.ReadFile`,
   `Console.Write`, `Process.Spawn`, `Clock.Now`, ...; direction INPUT / OUTPUT / CONTROL; grant family), with evidence (MUST: a

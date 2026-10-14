@@ -1,0 +1,294 @@
+// Structural well-formedness of MIR (docs/mir.md "Execution model"): the predicates every producer and consumer of MIR
+// can state its contracts with. They are shared by the lowering (compiler/lower, which must produce well-formed MIR), the
+// verifier (compiler/verify, whose own well-formedness check `wf.or` must imply them) and the tests. Purely structural:
+// index ranges and shapes, no operand classes and no ownership.
+
+import { Operand, Instr, Terminator, MBlock, MFunction, MProgram, hasSpan } from "./mir";
+
+// ---------------------------------------------------------------- what an instruction mentions
+
+function operandLocals(o: Operand): usize[] {
+  return match (o) {
+    OLocal(l) => [l],
+    _ => [],
+  };
+}
+
+function opsLocals(os: Operand[]): usize[] {
+  let out: usize[] = [];
+  for (const o of os) {
+    match (o) {
+      OLocal(l) => {
+        out.push(l);
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+function optLocals(d: Option<usize>): usize[] {
+  return match (d) {
+    Some(x) => [x],
+    None => [],
+  };
+}
+
+// The local an instruction defines (its destination), if any.
+export function dstOf(ins: Instr): Option<usize> {
+  return match (ins) {
+    ICopy(d, _) => Some(d),
+    IMove(d, _) => Some(d),
+    IBorrow(d, _) => Some(d),
+    IDup(d, _) => Some(d),
+    IUnary(d, _, _) => Some(d),
+    IBinary(d, _, _, _) => Some(d),
+    ICall(dst, _, _) => dst,
+    IBuiltin(dst, _, _) => dst,
+    IStructNew(d, _, _) => Some(d),
+    INullary(d, _) => Some(d),
+    ITag(d, _) => Some(d),
+    IGetField(d, _, _) => Some(d),
+    ITakeField(d, _, _) => Some(d),
+    IArrayNew(d, _, _) => Some(d),
+    IArrayGet(d, _, _) => Some(d),
+    IArrayTake(d, _, _) => Some(d),
+    IArrayPop(d, _) => Some(d),
+    IClosure(d, _, _) => Some(d),
+    ICallIndirect(dst, _, _) => dst,
+    IIface(d, _, _) => Some(d),
+    ICallVirtual(dst, _, _, _) => dst,
+    _ => None,
+  };
+}
+
+// Every local an instruction defines or uses (destinations, source locals, local operands).
+@Ensures(dstOf(i).isNone() || result.includes(dstOf(i).unwrap()))
+export function instrLocals(i: Instr): usize[] {
+  return match (i) {
+    ICopy(d, o) => [d].concat(operandLocals(o)),
+    IMove(d, s) => [d, s],
+    IBorrow(d, s) => [d, s],
+    IDup(d, o) => [d].concat(operandLocals(o)),
+    IRelease(x) => [x],
+    IUnary(d, _, o) => [d].concat(operandLocals(o)),
+    IBinary(d, _, a, b) => [d].concat(operandLocals(a)).concat(operandLocals(b)),
+    ICall(d, _, args) => optLocals(d).concat(opsLocals(args)),
+    IBuiltin(d, _, args) => optLocals(d).concat(opsLocals(args)),
+    IStrAppend(x, y) => [x].concat(operandLocals(y)),
+    IArrayExtend(x, y) => [x].concat(operandLocals(y)),
+    IStructNew(d, _, slots) => [d].concat(opsLocals(slots)),
+    INullary(d, _) => [d],
+    ITag(d, o) => [d].concat(operandLocals(o)),
+    IGetField(d, o, _) => [d].concat(operandLocals(o)),
+    ISetField(x, _, v) => [x].concat(operandLocals(v)),
+    ITakeField(d, x, _) => [d, x],
+    IPutField(x, _, s) => [x, s],
+    IMakeUnique(x) => [x],
+    IArrayNew(d, _, es) => [d].concat(opsLocals(es)),
+    IArrayGet(d, a, i2) => [d].concat(operandLocals(a)).concat(operandLocals(i2)),
+    IArraySet(x, i2, v) => [x].concat(operandLocals(i2)).concat(operandLocals(v)),
+    IArrayTake(d, x, i2) => [d, x].concat(operandLocals(i2)),
+    IArrayPut(x, i2, s) => [x, s].concat(operandLocals(i2)),
+    IArrayPush(x, v) => [x].concat(operandLocals(v)),
+    IArrayPop(d, x) => [d, x],
+    IClosure(d, _, caps) => [d].concat(opsLocals(caps)),
+    ICallIndirect(d, f, args) => optLocals(d).concat(operandLocals(f)).concat(opsLocals(args)),
+    IIface(d, _, v) => [d].concat(operandLocals(v)),
+    ICallVirtual(d, r, _, args) => optLocals(d).concat(operandLocals(r)).concat(opsLocals(args)),
+  };
+}
+
+// Every operand of an instruction.
+export function instrOperands(i: Instr): Operand[] {
+  return match (i) {
+    ICopy(_, o) => [o],
+    IMove(_, _) => [],
+    IBorrow(_, _) => [],
+    IDup(_, o) => [o],
+    IRelease(_) => [],
+    IUnary(_, _, o) => [o],
+    IBinary(_, _, a, b) => [a, b],
+    ICall(_, _, args) => args,
+    IBuiltin(_, _, args) => args,
+    IStrAppend(_, y) => [y],
+    IArrayExtend(_, y) => [y],
+    IStructNew(_, _, slots) => slots,
+    INullary(_, _) => [],
+    ITag(_, o) => [o],
+    IGetField(_, o, _) => [o],
+    ISetField(_, _, v) => [v],
+    ITakeField(_, _, _) => [],
+    IPutField(_, _, _) => [],
+    IMakeUnique(_) => [],
+    IArrayNew(_, _, es) => es,
+    IArrayGet(_, a, i2) => [a, i2],
+    IArraySet(_, i2, v) => [i2, v],
+    IArrayTake(_, _, i2) => [i2],
+    IArrayPut(_, i2, _) => [i2],
+    IArrayPush(_, v) => [v],
+    IArrayPop(_, _) => [],
+    IClosure(_, _, caps) => caps,
+    ICallIndirect(_, f, args) => [f].concat(args),
+    IIface(_, _, v) => [v],
+    ICallVirtual(_, r, _, args) => [r].concat(args),
+  };
+}
+
+// The locals a terminator reads.
+export function termLocals(t: Terminator): usize[] {
+  return match (t) {
+    TGoto(_) => [],
+    TBranch(c, _, _) => operandLocals(c),
+    TSwitch(o, _, _) => operandLocals(o),
+    TReturn(o) => match (o) {
+      Some(x) => operandLocals(x),
+      None => [],
+    },
+    TTrap(_) => [],
+  };
+}
+
+// The operands a terminator reads.
+function termOperands(t: Terminator): Operand[] {
+  return match (t) {
+    TBranch(c, _, _) => [c],
+    TSwitch(o, _, _) => [o],
+    TReturn(o) => match (o) {
+      Some(x) => [x],
+      None => [],
+    },
+    _ => [],
+  };
+}
+
+// The blocks a terminator can continue in, in order (switch cases, then the default).
+export function successors(t: Terminator): usize[] {
+  return match (t) {
+    TGoto(a) => [a],
+    TBranch(_, a, b) => [a, b],
+    TSwitch(_, cases, d) => cases.map(k => k.target).concat([d]),
+    TReturn(_) => [],
+    TTrap(_) => [],
+  };
+}
+
+function strBelow(o: Operand, n: usize): bool {
+  return match (o) {
+    OStr(k) => k < n,
+    _ => true,
+  };
+}
+
+// The function (`ICall`, `IClosure`) or vtable (`IIface`) an instruction names is in range.
+function calleeBelow(i: Instr, nFns: usize, nVts: usize): bool {
+  return match (i) {
+    ICall(_, g, _) => g < nFns,
+    IClosure(_, g, _) => g < nFns,
+    IIface(_, vt, _) => vt < nVts,
+    _ => true,
+  };
+}
+
+// Instruction `i` of a function with `n` locals in program `p` mentions only locals, string literals, functions and
+// vtables that exist.
+export function instrInRange(p: MProgram, n: usize, i: Instr): bool {
+  return instrLocals(i).every(l => l < n)
+      && instrOperands(i).every(o => strBelow(o, p.strings.length))
+      && calleeBelow(i, p.functions.length, p.vtables.length);
+}
+
+// Terminator `t` of `f` in program `p` continues only in blocks of `f` and reads only locals and strings that exist.
+export function termInRange(p: MProgram, f: MFunction, t: Terminator): bool {
+  return successors(t).every(s => s < f.blocks.length)
+      && termLocals(t).every(l => l < f.locals.length)
+      && termOperands(t).every(o => strBelow(o, p.strings.length));
+}
+
+// ---------------------------------------------------------------- blocks
+
+// Every block has one span per instruction (the record invariant of `MBlock`, as a predicate over a block list).
+export function spansAligned(blocks: MBlock[]): bool {
+  return blocks.every(b => b.spans.length == b.instrs.length);
+}
+
+// Every local that an instruction or terminator of `blocks` mentions is declared (index below `n`).
+export function blocksLocalsBelow(blocks: MBlock[], n: usize): bool {
+  return blocks.every(
+    b => b.instrs.every(i => instrLocals(i).every(l => l < n))
+        && termLocals(b.term).every(l => l < n),
+  );
+}
+
+// Every string literal operand of `blocks` indexes the string table (`n` entries).
+export function blocksStrsBelow(blocks: MBlock[], n: usize): bool {
+  return blocks.every(
+    b => b.instrs.every(i => instrOperands(i).every(o => strBelow(o, n)))
+        && termOperands(b.term).every(o => strBelow(o, n)),
+  );
+}
+
+// Every branch target is a block of the function (`blocks.length` blocks).
+export function blockTargetsInRange(blocks: MBlock[]): bool {
+  return blocks.every(b => successors(b.term).every(t => t < blocks.length));
+}
+
+// Every block can be reached from block 0 (an independent depth-first search). Empty block lists are vacuously
+// reachable.
+export function allReachable(blocks: MBlock[]): bool {
+  const n = blocks.length;
+  if (n == 0) {
+    return true;
+  }
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    seen.push(false);
+    i += 1;
+  }
+  let stack: usize[] = [0];
+  seen[0] = true;
+  while (stack.length > 0) {
+    const b = stack.pop().unwrap();
+    for (const t of successors(blocks[b].term)) {
+      if (t < n && !seen[t]) {
+        seen[t] = true;
+        stack.push(t);
+      }
+    }
+  }
+  return seen.every(s => s);
+}
+
+// Every instruction and terminator has a source position, one span per instruction.
+export function spansComplete(blocks: MBlock[]): bool {
+  return blocks.every(
+    b => b.spans.length == b.instrs.length && b.spans.every(s => hasSpan(s)) && hasSpan(b.termSpan),
+  );
+}
+
+// ---------------------------------------------------------------- functions and programs
+
+// The parameter table is consistent: the parameters are locals and there is one mode per parameter.
+export function paramsWellFormed(f: MFunction): bool {
+  return f.paramCount <= f.locals.length && f.paramOwned.length == f.paramCount;
+}
+
+// `f` is structurally well-formed in `p`: consistent parameters, an entry block, one span per instruction, every block id,
+// local, string, function and vtable index it mentions in range. The verifier's well-formedness check implies this
+// (`compiler/verify`), the lowering produces it (`compiler/lower`).
+export function isWellFormedFunction(p: MProgram, f: MFunction): bool {
+  return paramsWellFormed(f)
+      && f.blocks.length > 0
+      && spansAligned(f.blocks)
+      && f.blocks.every(
+        b => b.instrs.every(i => instrInRange(p, f.locals.length, i)) && termInRange(p, f, b.term),
+      );
+}
+
+// Every function of `p` is well-formed, `main` is one of them and every vtable entry is a function.
+export function isWellFormedProgram(p: MProgram): bool {
+  return p.main < p.functions.length
+      && p.vtables.every(v => v.funcs.every(g => g < p.functions.length))
+      && p.functions.every(f => isWellFormedFunction(p, f));
+}

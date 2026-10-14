@@ -22,6 +22,8 @@ $ORIN2 test compiler/tests/syntax_test.or --runtime runtime
 # parser error recovery: several syntax errors per file, first error unchanged, no cascades, cap, termination on garbage
 $ORIN2 test compiler/tests/recovery_test.or --runtime runtime
 python3 tools/test_recovery.py --orinc "$ORIN2"
+# verifier unit tests (3b): ownership lattice, State / Worklist / Transfer / Fixpoint, reports, MIR + HIR predicates
+$ORIN2 test compiler/tests/verify_test.or --runtime runtime
 $ORIN2 test compiler/tests/quality_test.or --runtime runtime
 $ORIN2 test compiler/tests/doccomments_test.or --runtime runtime
 # tooling unit tests (3e): JSON cursor / round trip, workspace, positions, index queries, LSP and MCP reply rule,

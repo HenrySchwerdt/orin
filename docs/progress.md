@@ -41,8 +41,6 @@ _Updated: 2026-10-14_
 | Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. Stages B-D (effect inference, library adapters, lineage, policy gates) not started |
 | Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): `std:task` (scope / spawn / join, bounded channels, grants moved into tasks, `parallelMap`), L0 threads and monitors, one temporary C interface with a porting table to R3 | done; C parts `TESTED_ONLY` (ThreadSanitizer, ASan + UBSan, stress); no `async` / `await`, cancellation, deadlock detection or M:N scheduler; concurrent HTTP server waits for `std:net` |
 | Incremental analysis | not started |
-| Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. **Stage B done** (transitive effect inference, `orin effects`, OSIG `MAY_PERFORM`, `[effects]` policy; docs/capabilities.md). Stages C-D (library adapters, lineage, strict policy gates) not started |
-| Concurrency (ADR-0017), incremental analysis | not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
@@ -52,5 +50,5 @@ See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-softwa
 ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 1. Interfaces + contract clauses phase 1 merged; OSIG/`orin graph`/`orin diff` started in parallel.
 2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), ~~resources~~ (done, ADR-0025), ~~generic classes~~ (done, ADR-0026: all language-freeze prerequisites are in; the language freeze and the compiler rewrite of ADR-0015 can start); capabilities (ADR-0021 Stage A, ADR-0027: done) → std I/O freeze (owner decision, open questions in ADR-0027).
-3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a, 3c and 3e (tooling) done (3a added MIR source spans, ADR-0020 D3; 3c the lexer and parser); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...), then opt / verify, backends, tooling.
+3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a, 3b (verifier), 3c and 3e (tooling) done (3a added MIR source spans, ADR-0020 D3; 3c the lexer and parser); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...), then opt / verify, backends, tooling.
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.
