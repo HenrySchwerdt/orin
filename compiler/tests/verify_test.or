@@ -1,0 +1,610 @@
+// Unit tests of the ownership verifier's classes and predicates (rewrite step 3b): the lattice of per-local states
+// (`joinLs`, `lsLeq`), the class `State` (holes, borrow invalidation, join), `Worklist`, `Transfer` (one block run),
+// `Fixpoint`, the reports, the shared MIR well-formedness predicates (compiler/mir) and the HIR integer kinds. Run:
+// `orin test compiler/tests/verify_test.or --runtime runtime`. `orin test` checks contracts at run time, so the class
+// invariants and the `@Requires` / `@Ensures` of every method called below run too; a broken invariant is a trap.
+
+import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { span } from "../diag";
+import {
+  Type, intKindOf, kindType, kindName, kindLo, kindHi, kindBits, kindNarrow, kindSigned,
+  kindUnsigned64, pow2, isKindNumber, CallSite, isEvidence, isCallVia,
+} from "../hir";
+import {
+  MProgram, MFunction, MLocal, MType, MBlock, MVTable, Instr, Terminator, Operand, plainBlock,
+  noSpan, hasSpan, dstOf, instrLocals, successors, instrInRange, termInRange, isWellFormedFunction,
+  isWellFormedProgram, paramsWellFormed, spansAligned,
+} from "../mir";
+import {
+  verify, VerifyReport, VerifyIssue, blockInStates, State, LState, HoleEntry, HoleKey, mk, joinLs,
+  lsLeq, lsEq, isKind, isLive, Worklist, Fixpoint, Transfer, Cx, step, noRevival, issuesAt,
+  issuePlaced, reportPlaced, reachClosed, statesSized, wfFunction, wfInstr, KDead, KOwned, KUnique,
+  KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
+} from "../verify";
+
+// ---------------------------------------------------------------- builders
+
+function lr(n: string): MLocal {
+  return MLocal { name: n, ty: MRef };
+}
+
+function li(n: string): MLocal {
+  return MLocal { name: n, ty: MInt };
+}
+
+function lb(n: string): MLocal {
+  return MLocal { name: n, ty: MBool };
+}
+
+function fnOf(name: string, params: usize, locals: MLocal[], blocks: MBlock[]): MFunction {
+  let owned: bool[] = [];
+  let i: usize = 0;
+  while (i < params) {
+    owned.push(false);
+    i += 1;
+  }
+  return MFunction {
+    name: name,
+    paramCount: params,
+    paramOwned: owned,
+    locals: locals,
+    ret: MVoid,
+    blocks: blocks,
+  };
+}
+
+function progOf(fs: MFunction[]): MProgram {
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: [], inlineFns: [] };
+}
+
+function straight(params: usize, locals: MLocal[], instrs: Instr[]): MProgram {
+  return progOf([fnOf("f", params, locals, [plainBlock(instrs, TReturn(None))])]);
+}
+
+// Every state of the lattice over two locals: the eleven kinds, Borrowed with two different sources.
+function allStates(): LState[] {
+  let out: LState[] = [];
+  let k = KDead;
+  while (k <= KMaybeOpen) {
+    if (k == KBorrowed) {
+      out.push(mk(k, 0));
+      out.push(mk(k, 1));
+    } else {
+      out.push(mk(k, 0));
+    }
+    k += 1;
+  }
+  return out;
+}
+
+function hasMsg(r: VerifyReport, needle: string): bool {
+  return r.errors.some(e => e.message.includes(needle));
+}
+
+// ---------------------------------------------------------------- the per-local lattice
+
+@Test
+function joinIsCommutativeIdempotentAndAnUpperBound(): void {
+  const all = allStates();
+  assertEqUsize(all.length, 12, "eleven kinds, Borrowed twice");
+  for (const a of all) {
+    assert(lsEq(joinLs(a, a), a), "idempotent");
+    for (const b of all) {
+      const j = joinLs(a, b);
+      assert(lsEq(j, joinLs(b, a)), "commutative");
+      assert(lsLeq(a, j) && lsLeq(b, j), "an upper bound");
+      assert(isKind(j.k), "a kind");
+    }
+  }
+}
+
+@Test
+function joinIsAssociative(): void {
+  // Associativity is what makes the fixpoint's result independent of the worklist order.
+  const all = allStates();
+  for (const a of all) {
+    for (const b of all) {
+      for (const c of all) {
+        assert(lsEq(joinLs(joinLs(a, b), c), joinLs(a, joinLs(b, c))), "associative");
+      }
+    }
+  }
+}
+
+@Test
+function orderIsAPartialOrderAndTheJoinIsLeast(): void {
+  const all = allStates();
+  for (const a of all) {
+    assert(lsLeq(a, a), "reflexive");
+    for (const b of all) {
+      if (lsLeq(a, b) && lsLeq(b, a)) {
+        assert(lsEq(a, b), "antisymmetric");
+      }
+      for (const c of all) {
+        if (lsLeq(a, b) && lsLeq(b, c)) {
+          assert(lsLeq(a, c), "transitive");
+        }
+        // the join is the least upper bound: below every common upper bound
+        if (lsLeq(a, c) && lsLeq(b, c)) {
+          assert(lsLeq(joinLs(a, b), c), "least");
+        }
+      }
+    }
+  }
+}
+
+@Test
+function joinRules(): void {
+  assertEqBool(
+    joinLs(mk(KUnique, 0), mk(KImm, 0)).k == KOwned,
+    true,
+    "owned-like states join to Owned",
+  );
+  assertEqBool(
+    joinLs(mk(KOwned, 0), mk(KDead, 0)).k == KMaybeLeak,
+    true,
+    "owned on one path only: MaybeLeak",
+  );
+  assertEqBool(
+    joinLs(mk(KInit, 0), mk(KDead, 0)).k == KMaybeDead,
+    true,
+    "dead on one path: MaybeDead",
+  );
+  assertEqBool(
+    joinLs(mk(KOpen, 0), mk(KDead, 0)).k == KMaybeOpen,
+    true,
+    "open on one path: MaybeOpen",
+  );
+  assertEqBool(
+    joinLs(mk(KBorrowed, 0), mk(KBorrowed, 1)).k == KMaybeDead,
+    true,
+    "different borrow sources: poisoned",
+  );
+  assertEqBool(
+    joinLs(mk(KBorrowed, 1), mk(KBorrowed, 1)).k == KBorrowed,
+    true,
+    "the same borrow survives",
+  );
+  assert(
+    !isLive(KMaybeLeak) && !isLive(KMaybeDead) && !isLive(KMaybeOpen) && !isLive(KDead),
+    "poisoned and dead are not live",
+  );
+  assert(isLive(KParam) && isLive(KOpen) && isLive(KImm), "readable states are live");
+}
+
+// ---------------------------------------------------------------- State
+
+function st3(): State {
+  return new State([mk(KUnique, 0), mk(KBorrowed, 0), mk(KBorrowed, 3), mk(KOwned, 0)], []);
+}
+
+@Test
+function killBorrowsKillsExactlyTheAliasesOfOneLocal(): void {
+  let s = st3();
+  s.killBorrows(0);
+  assertEqBool(s.kind(1) == KDead, true, "the alias of l0 dies");
+  assertEqBool(s.kind(2) == KBorrowed && s.srcOf(2) == 3, true, "the alias of l3 lives");
+  assertEqBool(s.kind(0) == KUnique, true, "the source itself is unchanged");
+  assert(s.borrowsFlat(), "still flat");
+}
+
+@Test
+function holesAreTrackedPerObjectAndKey(): void {
+  let s = new State([mk(KUnique, 0), mk(KInit, 0), mk(KUnique, 0)], []);
+  s.addHole(0, HoleKey { sym: false, idx: 3 });
+  assert(s.holeAny(0) && !s.holeAny(2), "a hole of l0 only");
+  assert(s.holeHas(0, HoleKey { sym: false, idx: 3 }), "exact key");
+  assert(!s.holeHas(0, HoleKey { sym: false, idx: 4 }), "other slot is not taken");
+  assert(!s.holeMay(0, HoleKey { sym: false, idx: 4 }), "a different constant slot cannot alias");
+  assert(s.holeMay(0, HoleKey { sym: true, idx: 1 }), "a symbolic index may alias any slot");
+  s.addHole(2, HoleKey { sym: true, idx: 1 });
+  assert(s.holeMay(2, HoleKey { sym: false, idx: 9 }), "a symbolic hole may be any slot");
+  s.removeHole(0, HoleKey { sym: false, idx: 3 });
+  assert(!s.holeAny(0) && s.holeAny(2), "put back");
+  s.dropHolesOf(2);
+  assertEqUsize(s.holes.length, 0, "dropped");
+}
+
+@Test
+function stateJoinUnitesHolesAndBoundsBothSides(): void {
+  let a = new State([mk(KUnique, 0), mk(KInit, 0)], []);
+  a.addHole(0, HoleKey { sym: false, idx: 1 });
+  let b = new State([mk(KImm, 0), mk(KDead, 0)], []);
+  b.addHole(0, HoleKey { sym: false, idx: 2 });
+  b.addHole(0, HoleKey { sym: false, idx: 1 });
+  const j = a.join(b);
+  assertEqUsize(j.holes.length, 2, "union without repeats");
+  assert(a.leq(j) && b.leq(j), "an upper bound of both");
+  assertEqBool(j.kind(0) == KOwned && j.kind(1) == KMaybeDead, true, "per local");
+  assert(j.join(j).equals(j), "idempotent");
+  assert(a.join(b).equals(b.join(a)), "the same state either way (holes compared as sets)");
+  assert(!a.equals(j), "the join added information");
+}
+
+// ---------------------------------------------------------------- Worklist
+
+@Test
+function worklistQueuesEachBlockOnceLastInFirstOut(): void {
+  let w = new Worklist(4);
+  w.add(1);
+  w.add(3);
+  w.add(1);
+  assertEqUsize(w.size(), 2, "a queued block is not queued twice");
+  assertEqUsize(w.take(), 3, "last in, first out");
+  w.add(3);
+  assertEqUsize(w.size(), 2, "a taken block can be queued again");
+  assertEqUsize(w.take(), 3, "again");
+  assertEqUsize(w.take(), 1, "then the first");
+  assert(w.isEmpty(), "empty");
+}
+
+// ---------------------------------------------------------------- Transfer
+
+@Test
+function transferReportsAtTheInstructionAndRevivesNothing(): void {
+  // l0 = struct; l1 = borrow l0; release l0; t = tag l1  -> use of a dead alias at i3
+  const p = straight(
+    0,
+    [lr("a"), lr("b"), li("t")],
+    [IStructNew(0, 0, []), IBorrow(1, 0), IRelease(0), ITag(2, OLocal(1))],
+  );
+  const f = p.functions[0];
+  let t = new Transfer(
+    p,
+    f,
+    0,
+    0,
+    new State([mk(KDead, 0), mk(KDead, 0), mk(KDead, 0)], []),
+    [],
+    [],
+  );
+  t.run();
+  assertEqUsize(t.errs.length, 1, "one error");
+  assertEqUsize(t.errs[0].instr, 3, "at the tag");
+  assert(t.errs[0].message.includes("dead"), "use of a dead local");
+  assert(issuesAt(t.errs, 0, f, 0, 3), "names the instruction");
+  assertEqBool(t.st.kind(0) == KDead && t.st.kind(1) == KDead, true, "released, alias invalidated");
+  assertEqBool(t.st.kind(2) == KInit, true, "the tag is defined even after the error");
+}
+
+@Test
+function borrowsOfBorrowsAreRootedAtTheOwner(): void {
+  // l1 = borrow l0; l2 = borrow l1 -> l2 is Borrowed(l0), so releasing l0 kills both
+  const p = straight(1, [lr("p"), lr("b"), lr("c")], [IBorrow(1, 0), IBorrow(2, 1)]);
+  const f = p.functions[0];
+  let t = new Transfer(
+    p,
+    f,
+    0,
+    0,
+    new State([mk(KParam, 0), mk(KDead, 0), mk(KDead, 0)], []),
+    [],
+    [],
+  );
+  t.run();
+  assertEqUsize(t.errs.length, 0, "fine");
+  assertEqBool(
+    t.st.kind(2) == KBorrowed && t.st.srcOf(2) == 0,
+    true,
+    "rooted at the parameter, not at l1",
+  );
+  assert(t.st.borrowsFlat(), "flat");
+}
+
+@Test
+function stepReplaysOneInstructionForTheOptimiser(): void {
+  const p = straight(
+    0,
+    [lr("a"), lr("b")],
+    [IStructNew(0, 0, []), IDup(1, OLocal(0)), IRelease(1), IRelease(0)],
+  );
+  const f = p.functions[0];
+  let cx = Cx {
+    prog: p,
+    f: f,
+    blk: 0,
+    ins: 0,
+    st: new State([mk(KDead, 0), mk(KDead, 0)], []),
+    errs: [],
+    warns: [],
+  };
+  cx = step(cx, f.blocks[0].instrs[0]);
+  assertEqBool(cx.st.kind(0) == KUnique, true, "a new struct is Unique");
+  cx.ins = 1;
+  const before = cx.st;
+  cx = step(cx, f.blocks[0].instrs[1]);
+  assertEqBool(cx.st.kind(0) == KOwned && cx.st.kind(1) == KOwned, true, "dup demotes the source");
+  assert(
+    noRevival(before, cx.st, dstOf(f.blocks[0].instrs[1])),
+    "only the destination came to life",
+  );
+  assert(!noRevival(before, cx.st, None), "the destination did come to life");
+}
+
+@Test
+function aPushOntoAReleasedArrayDoesNotReviveIt(): void {
+  // a = []; release a; push a, 1; push a, 2 -> both pushes are uses of a dead array; `a` must stay dead after the first
+  // (`noRevival`), so the second is reported too
+  const p = straight(
+    0,
+    [lr("a")],
+    [IArrayNew(0, false, []), IRelease(0), IArrayPush(0, OInt(1)), IArrayPush(0, OInt(2))],
+  );
+  const r = verify(p);
+  assertEqUsize(r.errors.length, 2, "both pushes are rejected");
+  assertEqUsize(r.errors[1].instr, 3, "the second at its own instruction");
+}
+
+@Test
+function noRevivalSeesAResurrectedLocal(): void {
+  const before = new State([mk(KDead, 0), mk(KMaybeDead, 0)], []);
+  const same = new State([mk(KDead, 0), mk(KMaybeDead, 0)], []);
+  const revived = new State([mk(KDead, 0), mk(KOwned, 0)], []);
+  assert(noRevival(before, same, None), "unchanged");
+  assert(!noRevival(before, revived, None), "a poisoned local became Owned without a definition");
+  assert(noRevival(before, revived, Some(1)), "fine when it is the destination");
+}
+
+// ---------------------------------------------------------------- Fixpoint and reports
+
+// b0: branch c ? b1 : b2; b1: l1 = struct; goto b3; b2: goto b3; b3: return; b4 (unreachable): return
+function diamond(): MProgram {
+  const blocks = [
+    plainBlock([], TBranch(OLocal(0), 1, 2)),
+    plainBlock([IStructNew(1, 0, [])], TGoto(3)),
+    plainBlock([], TGoto(3)),
+    plainBlock([], TReturn(None)),
+    plainBlock([], TReturn(None)),
+  ];
+  return progOf([fnOf("f", 1, [lb("c"), lr("x")], blocks)]);
+}
+
+@Test
+function fixpointJoinsAtTheMergeAndLeavesDeadCodeUnreached(): void {
+  const p = diamond();
+  const f = p.functions[0];
+  let fx = new Fixpoint(p, f);
+  fx.run();
+  assert(fx.isStable(), "stable");
+  assert(reachClosed(f, fx.ins) && statesSized(fx.ins, 2), "closed, sized");
+  assert(fx.ins[4].isNone(), "block 4 is unreachable");
+  assertEqBool(fx.ins[3].unwrap().kind(1) == KMaybeLeak, true, "owned on one path only");
+  const r = verify(p);
+  assertEqUsize(r.errors.length, 0, "a leak is not an error");
+  assertEqUsize(r.warnings.length, 1, "but a warning at the return");
+  assert(reportPlaced(p, r.warnings), "placed");
+  assertEqUsize(blockInStates(p, f).length, 5, "one in-state slot per block");
+}
+
+@Test
+function fixpointRevisitsALoopHeadWhoseInStateGrew(): void {
+  // b0: x = struct; goto b1.  b1: branch c ? b2 : b3.  b2: release x; goto b1.  b3: release x; return.
+  // The back edge makes x MaybeLeak at b1, which must reach b3: a worklist that did not re-queue b1 would leave b3 at
+  // Unique (and `isStable` would fail).
+  const blocks = [
+    plainBlock([IStructNew(1, 0, [])], TGoto(1)),
+    plainBlock([], TBranch(OLocal(0), 2, 3)),
+    plainBlock([IRelease(1)], TGoto(1)),
+    plainBlock([IRelease(1)], TReturn(None)),
+  ];
+  const p = progOf([fnOf("f", 1, [lb("c"), lr("x")], blocks)]);
+  let fx = new Fixpoint(p, p.functions[0]);
+  fx.run();
+  assertEqBool(fx.ins[1].unwrap().kind(1) == KMaybeLeak, true, "poisoned at the loop head");
+  assertEqBool(fx.ins[3].unwrap().kind(1) == KMaybeLeak, true, "and after the loop");
+  assert(
+    hasMsg(verify(p), "dead or inconsistent on some incoming path"),
+    "the release after the loop is rejected",
+  );
+}
+
+@Test
+function redefiningARootKillsItsAliases(): void {
+  // l1 = struct; l2 = borrow l1; l1 = borrow p: l2 must die, or it would be an alias of an alias (and dangle).
+  const p = straight(
+    1,
+    [lr("p"), lr("a"), lr("b"), li("t")],
+    [IStructNew(1, 0, []), IBorrow(2, 1), IBorrow(1, 0), ITag(3, OLocal(2))],
+  );
+  const r = verify(p);
+  assert(hasMsg(r, "use of `b` which is dead"), "the old alias is dead");
+  let t = new Transfer(
+    p,
+    p.functions[0],
+    0,
+    0,
+    new State([mk(KParam, 0), mk(KDead, 0), mk(KDead, 0), mk(KDead, 0)], []),
+    [],
+    [],
+  );
+  t.run();
+  assert(t.st.borrowsFlat(), "flat");
+}
+
+@Test
+function reportsNameExistingPositions(): void {
+  // a function-level error, an instruction error, a terminator error, the program and a vtable
+  const bad = MFunction {
+    name: "g",
+    paramCount: 2,
+    paramOwned: [false],
+    locals: [lr("p"), lr("q")],
+    ret: MVoid,
+    blocks: [plainBlock([], TReturn(None))],
+  };
+  const h = fnOf("h", 0, [lr("a")], [plainBlock([IRelease(7)], TGoto(9))]);
+  const p = MProgram {
+    functions: [h, bad],
+    strings: [],
+    main: 5,
+    vtables: [MVTable { name: "vt", funcs: [8] }],
+    inlineFns: [],
+  };
+  const r = verify(p);
+  assert(reportPlaced(p, r.errors), "every error is placed");
+  assert(
+    hasMsg(r, "main function index out of range")
+        && hasMsg(r, "vtable entry: function index out of range"),
+    "program level",
+  );
+  assert(hasMsg(r, "paramOwned length differs from paramCount"), "function level");
+  assert(hasMsg(r, "IRelease") && hasMsg(r, "TGoto"), "instruction and terminator");
+  for (const e of r.errors) {
+    if (e.func == "g") {
+      assertEqUsize(e.block + e.instr, 0, "a function-level error is at 0/0");
+      assert(!hasSpan(e.span), "without a span");
+    }
+    if (e.func == "h" && e.message.includes("TGoto")) {
+      assertEqUsize(e.instr, 1, "the terminator is instruction instrs.length");
+    }
+  }
+  assert(!isWellFormedProgram(p), "and the shared predicate agrees");
+  const fake = VerifyIssue { func: "h", block: 3, instr: 0, message: "x", span: noSpan() };
+  assert(!issuePlaced(h, fake), "block 3 does not exist");
+}
+
+@Test
+function verifierWellFormednessImpliesTheSharedPredicate(): void {
+  const good = diamond();
+  assertEqUsize(verify(good).errors.length, 0, "verifies");
+  assert(isWellFormedProgram(good), "well-formed");
+  // an out-of-range string, local and block: each one is a verifier error and breaks the shared predicate
+  const cases: MProgram[] = [
+    straight(0, [lr("a")], [ICopy(0, OStr(4))]),
+    straight(0, [lr("a")], [IRelease(3)]),
+    progOf([fnOf("f", 0, [lr("a")], [plainBlock([], TGoto(1))])]),
+  ];
+  for (const p of cases) {
+    assert(verify(p).errors.length > 0, "rejected");
+    assert(!isWellFormedFunction(p, p.functions[0]), "ill-formed");
+  }
+}
+
+// ---------------------------------------------------------------- defects fixed in step 3b
+
+@Test
+function aCallOfAnIllFormedCalleeIsReportedNotACrash(): void {
+  // g claims two parameters but has one local: checking the call used to read g.locals[1] (out of range)
+  const g = MFunction {
+    name: "g",
+    paramCount: 2,
+    paramOwned: [false, false],
+    locals: [lr("p")],
+    ret: MVoid,
+    blocks: [plainBlock([], TReturn(None))],
+  };
+  const f = fnOf(
+    "f",
+    0,
+    [lr("a"), lr("b")],
+    [plainBlock([ICall(None, 1, [OStr(0), OStr(0)])], TReturn(None))],
+  );
+  const r = verify(progOf([f, g]));
+  assert(hasMsg(r, "ICall: callee g has more parameters than locals"), "the call is rejected");
+  assert(hasMsg(r, "paramCount exceeds the number of locals"), "and g itself");
+}
+
+@Test
+function aClosureOrVtableTargetWithoutLocalsIsReportedNotACrash(): void {
+  const g = MFunction {
+    name: "g",
+    paramCount: 1,
+    paramOwned: [false],
+    locals: [],
+    ret: MVoid,
+    blocks: [plainBlock([], TReturn(None))],
+  };
+  const f = fnOf("f", 0, [lr("c")], [plainBlock([IClosure(0, 1, []), IRelease(0)], TReturn(None))]);
+  const p = MProgram {
+    functions: [f, g],
+    strings: [],
+    main: 0,
+    vtables: [MVTable { name: "vt", funcs: [1] }],
+    inlineFns: [],
+  };
+  const r = verify(p);
+  assert(
+    hasMsg(r, "IClosure: the lifted function must take the environment record"),
+    "closure target",
+  );
+  assert(hasMsg(r, "vtable entry g must take the boxed value"), "vtable entry");
+}
+
+// ---------------------------------------------------------------- shared MIR predicates
+
+@Test
+function sharedPredicatesOfInstructionsAndTerminators(): void {
+  const p = progOf([]);
+  assert(instrInRange(p, 2, IMove(0, 1)) && !instrInRange(p, 1, IMove(0, 1)), "locals");
+  assert(
+    instrInRange(p, 1, ICopy(0, OStr(0))) && !instrInRange(p, 1, ICopy(0, OStr(1))),
+    "strings",
+  );
+  assert(!instrInRange(p, 1, ICall(None, 0, [])), "functions");
+  assert(
+    instrLocals(IArrayPop(3, 1)).includes(3) && dstOf(IArrayPop(3, 1)).unwrap() == 3,
+    "destination",
+  );
+  assert(dstOf(IRelease(0)).isNone(), "release defines nothing");
+  assertEqUsize(successors(TSwitch(OInt(0), [], 2)).length, 1, "the default");
+  const f = fnOf("f", 0, [lr("a")], [plainBlock([], TReturn(None))]);
+  assert(termInRange(p, f, TGoto(0)) && !termInRange(p, f, TGoto(1)), "targets");
+  assert(
+    termInRange(p, f, TReturn(Some(OStr(0)))) && !termInRange(p, f, TReturn(Some(OStr(3)))),
+    "returned strings",
+  );
+  assert(paramsWellFormed(f) && spansAligned(f.blocks), "params, spans");
+  assertEqString(wfFunction(f), "", "the verifier agrees");
+  assertEqString(wfInstr(p, f, IRelease(0)), "", "a release of a ref local");
+  assert(wfInstr(p, f, ICopy(0, OInt(1))) != "", "an int into a ref local");
+}
+
+// ---------------------------------------------------------------- HIR integer kinds
+
+@Test
+function integerKindsRoundTripAndHaveExactRanges(): void {
+  let k = 0;
+  while (k <= 9) {
+    assert(isKindNumber(k), "a kind");
+    assertEqBool(intKindOf(kindType(k)) == k, true, "round trip " + kindName(k));
+    if (kindNarrow(k)) {
+      assertEqBool(
+        kindHi(k) - kindLo(k) + 1 == pow2(kindBits(k)),
+        true,
+        "2^bits values: " + kindName(k),
+      );
+    }
+    assertEqBool(kindLo(k) < 0, kindSigned(k), "signed kinds go below zero: " + kindName(k));
+    assertEqBool(
+      kindHi(k) == -1,
+      kindUnsigned64(k),
+      "the all-ones pattern is the u64 maximum: " + kindName(k),
+    );
+    k += 1;
+  }
+  assertEqString(kindName(3), "int", "kind 3 is int");
+  assertEqBool(intKindOf(TyBool) == -1, true, "not an integer");
+}
+
+@Test
+function callSitesHaveKnownEvidenceAndEdgeKinds(): void {
+  assert(
+    isEvidence("MUST") && isEvidence("MAY") && isEvidence("UNKNOWN") && !isEvidence("maybe"),
+    "evidence",
+  );
+  assert(
+    isCallVia("direct")
+        && isCallVia("io:fs.read")
+        && isCallVia("constructor")
+        && !isCallVia("dynamic"),
+    "via",
+  );
+  const c = CallSite {
+    caller: 0,
+    callee: None,
+    ev: "UNKNOWN",
+    via: "indirect",
+    span: span(0, 0, 1),
+  };
+  assertEqString(c.via, "indirect", "a call of a function value has no callee");
+}
