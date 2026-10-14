@@ -1,0 +1,318 @@
+// Assertions for the transitive effect inference (compiler/analysis/effects.or, effectsum.or, effectpolicy.or; ADR-0037 D2):
+// direct and transitive effects, evidence, explanation paths, closures and function values (UNKNOWN), callbacks, interface
+// calls, recursion, the std scope functions `useHost` / `useFs`, the agreement with the purity analysis, and the policy
+// matching. Prints `ok` or one line per failure.
+// Build: build/bootstrap/orin2 compile compiler/tests/effects_test.or -o x.c && cc -O1 -w -I runtime x.c runtime/orin_runtime.c platform/orin_platform.c
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { newWorkspace, openFile, analyze, effectsContext, effectViews, EffContext, EffView, purityViolations } from "../analysis";
+import { allowsEffect, knownEffectName, allowedBy, qualName, hoverEffectText, buildReport, reportText, reportJson } from "../analysis";
+import { checkWithIndex, inferPurity, allFunctions } from "../check";
+import { SkFunction } from "../hir";
+import { exit } from "std:process";
+
+function eq(fails: string[], what: string, got: string, want: string): string[] {
+  let f = fails;
+  if (got != want) {
+    f.push(what + ": got `" + got + "`, want `" + want + "`");
+  }
+  return f;
+}
+
+// The context of a one-file program (`/e/main.or`); None when it does not check.
+function ctxFor(fs: FsGrant, src: string): Option<EffContext> {
+  const ws = openFile(newWorkspace(), "/e/main.or", src);
+  const a = analyze(fs, ws, "/e/main.or");
+  if (a.diags.length > 0 || a.program.isNone() || a.index.isNone()) {
+    return None;
+  }
+  return Some(effectsContext(a.program.unwrap(), a.index.unwrap(), a.sm));
+}
+
+// The def of the function `name`, or of the method `name` of class / interface `owner` ("" = a top-level function).
+function defOf(c: EffContext, owner: string, name: string): int {
+  for (const d of c.idx.defs) {
+    const isFn = match (d.kind) {
+      SkFunction => true,
+      _ => false
+    };
+    if (!isFn || d.name != name) {
+      continue;
+    }
+    match (d.container) {
+      Some(o) => {
+        if (owner != "" && c.idx.defs[o].name == owner) {
+          return d.id.toInt();
+        }
+      },
+      None => {
+        if (owner == "") {
+          return d.id.toInt();
+        }
+      }
+    }
+  }
+  return -1;
+}
+
+// "Fs.ReadFile:MAY,Console.Write:MUST" in the table's order; "<no def>" if there is none.
+function sum(c: EffContext, owner: string, name: string): string {
+  const d = defOf(c, owner, name);
+  if (d < 0) {
+    return "<no def " + name + ">";
+  }
+  let parts: string[] = [];
+  for (const v of effectViews(c, d.toUsize())) {
+    parts.push(v.op + ":" + v.ev);
+  }
+  return parts.join(",");
+}
+
+function hops(c: EffContext, owner: string, name: string, op: string): string {
+  const d = defOf(c, owner, name);
+  if (d < 0) {
+    return "<no def>";
+  }
+  for (const v of effectViews(c, d.toUsize())) {
+    if (v.op == op) {
+      let ns: string[] = [];
+      for (const h of v.hops) {
+        ns.push(h.name);
+      }
+      return ns.join(" > ");
+    }
+  }
+  return "<no effect>";
+}
+
+function callbacks(c: EffContext, name: string): string {
+  const d = defOf(c, "", name);
+  if (d < 0) {
+    return "<no def>";
+  }
+  let ns: string[] = [];
+  for (const j of c.table.callbacksOf(d.toUsize())) {
+    ns.push(j.toString());
+  }
+  return ns.join(",");
+}
+
+// Defs that have an effect although every function lowered from them is pure (must be empty), as names.
+function disagreements(c: EffContext, fs: FsGrant, src: string): string {
+  const ws = openFile(newWorkspace(), "/e/main.or", src);
+  const a = analyze(fs, ws, "/e/main.or");
+  const ci = checkWithIndex(a.program.unwrap(), a.sm);
+  if (ci.result.isErr()) {
+    return "does not check";
+  }
+  const hir = ci.result.unwrap();
+  const pu = inferPurity(hir.functions, allFunctions(hir.functions));
+  let names: string[] = [];
+  for (const d of purityViolations(ci.index, c.table, pu.impure, pu.reached)) {
+    names.push(qualName(c, d));
+  }
+  return names.join(",");
+}
+
+const IO: string = "import { Host, useHost, useFs } from \"std:host\";\nimport { FsGrant, readFile, writeFile, withFile, Read } from \"std:fs\";\n";
+
+function testDirectAndTransitive(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const src = IO + "function load(fs: FsGrant, p: string): string { const r = readFile(fs, p); return r.isOk() ? r.unwrap() : \"\"; }\n"
+    + "function twice(fs: FsGrant, p: string): string { return load(fs, p) + load(fs, p); }\n"
+    + "function save(fs: FsGrant, p: string): void { writeFile(fs, p, \"x\"); console.log(\"saved\"); }\n"
+    + "function both(fs: FsGrant, p: string): void { save(fs, twice(fs, p)); }\n"
+    + "function pure(n: int): int { return n * 2; }\n"
+    + "function usesPure(n: int): int { return pure(n) + 1; }\n"
+    + "function ping(fs: FsGrant, n: int): string { return n == 0 ? load(fs, \"x\") : pong(fs, n - 1); }\n"
+    + "function pong(fs: FsGrant, n: int): string { return ping(fs, n); }\n"
+    + "function selfLoop(fs: FsGrant, n: int): string { return n == 0 ? \"\" : selfLoop(fs, n - 1); }\n"
+    + "function main(): void { }\n";
+  const o = ctxFor(fs, src);
+  if (o.isNone()) {
+    fails.push("direct: program does not check");
+    return fails;
+  }
+  const c = o.unwrap();
+  fails = eq(fails, "direct is MUST", sum(c, "", "load"), "Fs.ReadFile:MUST");
+  fails = eq(fails, "transitive is MAY", sum(c, "", "twice"), "Fs.ReadFile:MAY");
+  fails = eq(fails, "two primitives, sorted", sum(c, "", "save"), "Console.Write:MUST,Fs.WriteFile:MUST");
+  fails = eq(fails, "transitive over two levels", sum(c, "", "both"), "Console.Write:MAY,Fs.ReadFile:MAY,Fs.WriteFile:MAY");
+  fails = eq(fails, "pure", sum(c, "", "pure"), "");
+  fails = eq(fails, "calls only pure", sum(c, "", "usesPure"), "");
+  fails = eq(fails, "path of a direct effect", hops(c, "", "load", "Fs.ReadFile"), "(root)::load");
+  fails = eq(fails, "path of a transitive effect", hops(c, "", "both", "Fs.ReadFile"), "(root)::both > (root)::twice > (root)::load");
+  fails = eq(fails, "shortest path", hops(c, "", "both", "Fs.WriteFile"), "(root)::both > (root)::save");
+  // recursion: a fixed point, every member has the effect, the path is finite and ends at the primitive
+  fails = eq(fails, "mutual recursion ping", sum(c, "", "ping"), "Fs.ReadFile:MAY");
+  fails = eq(fails, "mutual recursion pong", sum(c, "", "pong"), "Fs.ReadFile:MAY");
+  fails = eq(fails, "recursion path", hops(c, "", "pong", "Fs.ReadFile"), "(root)::pong > (root)::ping > (root)::load");
+  fails = eq(fails, "self recursion without effect", sum(c, "", "selfLoop"), "");
+  fails = eq(fails, "table is consistent", c.table.consistent().toString(), "true");
+  fails = eq(fails, "agrees with purity", disagreements(c, fs, src), "");
+  return fails;
+}
+
+function testClosuresAndUnknown(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const src = "function make(k: int): (x: int) => int { return x => x + k; }\n"
+    + "function viaLocal(): int { const f = make(2); return f(1); }\n"
+    + "function viaLocalCaller(): int { return viaLocal() + 1; }\n"
+    + "function apply(f: (x: int) => int, x: int): int { return f(x); }\n"
+    + "function relay(g: (x: int) => int): int { return apply(g, 1); }\n"
+    + "function okCaller(): int { return apply(x => x + 1, 2); }\n"
+    + "function badCaller(): int { const f = make(1); return apply(f, 2); }\n"
+    + "function viaRelay(): int { return relay(x => x); }\n"
+    + "function badRelay(): int { const f = make(1); return relay(f); }\n"
+    + "function inner(x: int): int { return x; }\n"
+    + "function named(): int { return apply(inner, 1); }\n"
+    + "function effectful(): int { return apply(x => { console.log(\"hi\"); return x; }, 3); }\n"
+    + "function main(): void { }\n";
+  const o = ctxFor(fs, src);
+  if (o.isNone()) {
+    fails.push("closures: program does not check");
+    return fails;
+  }
+  const c = o.unwrap();
+  fails = eq(fails, "making a closure is pure", sum(c, "", "make"), "");
+  fails = eq(fails, "calling a local function value is UNKNOWN", sum(c, "", "viaLocal"), "Unknown.FunctionValue:UNKNOWN");
+  fails = eq(fails, "UNKNOWN is inherited", sum(c, "", "viaLocalCaller"), "Unknown.FunctionValue:UNKNOWN");
+  fails = eq(fails, "calling a parameter: no effect of its own", sum(c, "", "apply"), "");
+  fails = eq(fails, "calling a parameter: it is a callback", callbacks(c, "apply"), "0");
+  fails = eq(fails, "passing a parameter on: parametric in turn", callbacks(c, "relay"), "0");
+  fails = eq(fails, "closure literal without effect", sum(c, "", "okCaller"), "");
+  fails = eq(fails, "closure literal passed through a relay", sum(c, "", "viaRelay"), "");
+  fails = eq(fails, "value of unknown origin to a callback parameter", sum(c, "", "badCaller"), "Unknown.Callback:UNKNOWN");
+  fails = eq(fails, "value of unknown origin through a relay", sum(c, "", "badRelay"), "Unknown.Callback:UNKNOWN");
+  fails = eq(fails, "named function as a value", sum(c, "", "named"), "");
+  fails = eq(fails, "effect of a closure literal is MAY of its creator", sum(c, "", "effectful"), "Console.Write:MAY");
+  fails = eq(fails, "path of an UNKNOWN effect", hops(c, "", "viaLocalCaller", "Unknown.FunctionValue"), "(root)::viaLocalCaller > (root)::viaLocal");
+  fails = eq(fails, "table is consistent", c.table.consistent().toString(), "true");
+  fails = eq(fails, "agrees with purity", disagreements(c, fs, src), "");
+  return fails;
+}
+
+function testInterfaces(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const src = "interface Sink { put(s: string): void; }\n"
+    + "class LogSink implements Sink { put(s: string): void { console.log(s); } }\n"
+    + "class NullSink implements Sink { put(s: string): void { } }\n"
+    + "function emit(k: Sink): void { k.put(\"x\"); }\n"
+    + "interface Lonely { go(): void; }\n"
+    + "function useLonely(l: Lonely): void { l.go(); }\n"
+    + "function main(): void { emit(new LogSink()); }\n";
+  const o = ctxFor(fs, src);
+  if (o.isNone()) {
+    fails.push("interfaces: program does not check");
+    return fails;
+  }
+  const c = o.unwrap();
+  fails = eq(fails, "union over the implementations", sum(c, "", "emit"), "Console.Write:MAY");
+  fails = eq(fails, "path through the interface method", hops(c, "", "emit", "Console.Write"),
+    "(root)::emit > (root)::Sink.put > (root)::LogSink.put");
+  fails = eq(fails, "the implementation's own effect", sum(c, "LogSink", "put"), "Console.Write:MUST");
+  fails = eq(fails, "a pure implementation", sum(c, "NullSink", "put"), "");
+  fails = eq(fails, "an interface method has the union of its implementations", sum(c, "Sink", "put"), "Console.Write:MAY");
+  fails = eq(fails, "no implementation: unknown", sum(c, "", "useLonely"), "Unknown.Interface:UNKNOWN");
+  fails = eq(fails, "main inherits", sum(c, "", "main"), "Console.Write:MAY");
+  fails = eq(fails, "table is consistent", c.table.consistent().toString(), "true");
+  // the effect analysis is more precise than the purity analysis here (purity: an interface call is unknown): effect-free
+  // is allowed to be impure, never the other way round
+  fails = eq(fails, "agrees with purity", disagreements(c, fs, src), "");
+  const pureOnly = "interface Sink { put(s: string): void; }\nclass NullSink implements Sink { put(s: string): void { } }\n"
+    + "function emit(k: Sink): void { k.put(\"x\"); }\nfunction main(): void { }\n";
+  const p = ctxFor(fs, pureOnly);
+  if (p.isSome()) {
+    fails = eq(fails, "only pure implementations: no effect", sum(p.unwrap(), "", "emit"), "");
+    fails = eq(fails, "only pure implementations: agrees with purity", disagreements(p.unwrap(), fs, pureOnly), "");
+  } else {
+    fails.push("pure interface: program does not check");
+  }
+  return fails;
+}
+
+function testHostCallbacks(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const src = IO + "function load(fs: FsGrant): void { readFile(fs, \"a\"); }\n"
+    + "function stream(fs: FsGrant): int { const r = withFile(fs, \"a\", Read, file => file.readLine().isSome() ? 1 : 0); return r.isOk() ? r.unwrap() : 0; }\n"
+    + "function main(host: Host): void {\n  useFs(host, fs => { load(fs); });\n  useHost(host, (fs, proc, stdio, clock) => { console.log(\"x\"); stream(fs); });\n}\n";
+  const o = ctxFor(fs, src);
+  if (o.isNone()) {
+    fails.push("host: program does not check");
+    return fails;
+  }
+  const c = o.unwrap();
+  fails = eq(fails, "std scope function with a callback", sum(c, "", "main"),
+    "Console.Write:MAY,Fs.Open:MAY,Fs.Read:MAY,Fs.ReadFile:MAY,Host.Acquire:MUST");
+  fails = eq(fails, "withFile: the open is MUST, the read in the closure MAY", sum(c, "", "stream"), "Fs.Open:MUST,Fs.Read:MAY");
+  fails = eq(fails, "no UNKNOWN through useHost / useFs", sum(c, "", "main").includes("Unknown").toString(), "false");
+  // the std functions themselves: no effect of their own besides the grants, parametric in the body
+  const useFsDef = defOf(c, "", "useFs");
+  if (useFsDef >= 0) {
+    fails = eq(fails, "useFs has the callback body", c.table.callbacksOf(useFsDef.toUsize()).length.toString(), "1");
+  } else {
+    fails.push("std:host useFs is not part of the index");
+  }
+  fails = eq(fails, "table is consistent", c.table.consistent().toString(), "true");
+  fails = eq(fails, "agrees with purity", disagreements(c, fs, src), "");
+  const h = hoverEffectText(c, defOf(c, "", "main").toUsize());
+  fails = eq(fails, "hover lists the effects", h.startsWith("**Effects** (inferred, transitive):").toString(), "true");
+  fails = eq(fails, "hover names the route", h.includes("- `Fs.ReadFile INPUT [MAY] FsGrant` via (root)::load").toString(), "true");
+  fails = eq(fails, "hover of a pure function", hoverEffectText(c, defOf(c, "", "load").toUsize()).startsWith("**Effects** (inferred").toString(), "true");
+  return fails;
+}
+
+function testNotTyped(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const ws = openFile(newWorkspace(), "/e/main.or", "function f(): int { return true; }\nfunction main(): void { f(); }");
+  const a = analyze(fs, ws, "/e/main.or");
+  if (a.index.isSome() && a.program.isSome()) {
+    const c = effectsContext(a.program.unwrap(), a.index.unwrap(), a.sm);
+    fails = eq(fails, "an unchecked program has no summary", c.table.isTyped().toString(), "false");
+    fails = eq(fails, "...and no defs", c.table.defs().length.toString(), "0");
+    fails = eq(fails, "hover says so", hoverEffectText(c, 0), "**Effects**: not available (the program has errors)");
+  } else {
+    fails.push("not typed: no index");
+  }
+  return fails;
+}
+
+function testPolicyNames(f: string[]): string[] {
+  let fails = f;
+  fails = eq(fails, "exact", allowsEffect("Fs.ReadFile", "Fs.ReadFile").toString(), "true");
+  fails = eq(fails, "an operation does not allow its sibling", allowsEffect("Fs.Read", "Fs.ReadFile").toString(), "false");
+  fails = eq(fails, "family", allowsEffect("Fs", "Fs.WriteFile").toString(), "true");
+  fails = eq(fails, "family does not leak", allowsEffect("Fs", "Process.Spawn").toString(), "false");
+  fails = eq(fails, "wildcard", allowsEffect("Fs.*", "Fs.Open").toString(), "true");
+  fails = eq(fails, "star", allowsEffect("*", "Unknown.Callback").toString(), "true");
+  fails = eq(fails, "unknown needs its own entry", allowsEffect("Fs", "Unknown.FunctionValue").toString(), "false");
+  fails = eq(fails, "Unknown family", allowsEffect("Unknown", "Unknown.Interface").toString(), "true");
+  fails = eq(fails, "list", allowedBy(["Console.Write", "Fs.Read"], "Fs.Read").toString(), "true");
+  fails = eq(fails, "empty list allows nothing", allowedBy([], "Console.Write").toString(), "false");
+  fails = eq(fails, "known op", knownEffectName("Process.Spawn").toString(), "true");
+  fails = eq(fails, "known family", knownEffectName("Stdio").toString(), "true");
+  fails = eq(fails, "unknown name", knownEffectName("Fs.Delete").toString(), "false");
+  fails = eq(fails, "typo", knownEffectName("fs").toString(), "false");
+  return fails;
+}
+
+function main(host: Host): void {
+  useFs(host, fs => {
+    let fails: string[] = [];
+    fails = testDirectAndTransitive(fs, fails);
+    fails = testClosuresAndUnknown(fs, fails);
+    fails = testInterfaces(fs, fails);
+    fails = testHostCallbacks(fs, fails);
+    fails = testNotTyped(fs, fails);
+    fails = testPolicyNames(fails);
+    if (fails.length == 0) {
+      console.log("ok");
+      return;
+    }
+    for (const l of fails) {
+      console.log(l);
+    }
+    exit(1);
+  });
+}

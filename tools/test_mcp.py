@@ -296,6 +296,30 @@ def main():
           "inspect module shows manifest rule (%s)" % raw)
     err, v, raw = c.call("check", {"entry": "shop/src/main.or"})
     check(not err and v.get("errors") == 0, "package checks clean (%s)" % raw)
+
+    # ---- inspect: the inferred effect summary (ADR-0037 D2; the same analysis as `orin effects`) ------------
+    shutil.copytree(os.path.join(ROOT, "tests", "osig", "effects", "app"), os.path.join(proj, "effapp"))
+    err, v, raw = c.call("inspect", {"symbol": "loadConfig", "entry": "effapp"})
+    ef = v.get("effects", {}) if not err else {}
+    check(not err and ef.get("pure") is False and [(e["operation"], e["direction"], e["evidence"]) for e in ef.get("effects", [])]
+          == [("Fs.ReadFile", "INPUT", "MUST")], "inspect symbol: a direct effect (%s)" % raw)
+    check(not err and ef["effects"][0]["path"][-1]["function"] == "store::loadConfig"
+          and ef["effects"][0]["path"][-1]["span"]["file"] == "src/store/store.or", "inspect symbol: the path ends at the primitive call")
+    err, v, raw = c.call("inspect", {"symbol": "reload", "entry": "effapp"})
+    ef = v.get("effects", {}) if not err else {}
+    check(not err and [(e["operation"], e["evidence"], [h["function"] for h in e["path"]]) for e in ef.get("effects", [])]
+          == [("Fs.ReadFile", "MAY", ["store::reload", "store::loadConfig"])], "inspect symbol: a transitive effect with its path (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "fact", "entry": "effapp"})
+    check(not err and v.get("effects", {}).get("pure") is True and v["effects"]["effects"] == [], "inspect symbol: a pure function (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "runDynamic", "entry": "effapp"})
+    check(not err and [e["operation"] for e in v.get("effects", {}).get("effects", [])] == ["Unknown.FunctionValue"]
+          and v["effects"]["effects"][0]["evidence"] == "UNKNOWN", "inspect symbol: UNKNOWN is not pure (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "apply", "entry": "effapp"})
+    check(not err and v.get("effects", {}).get("callbacks") == ["f"] and v["effects"]["pure"] is False,
+          "inspect symbol: a function that calls its parameter names the callback (%s)" % raw)
+    err, v, raw = c.call("inspect", {"module": "effapp/src/store/module.or", "entry": "effapp"})
+    check(not err and sorted((e["operation"], e["evidence"]) for e in v.get("effects", [])) == [("Fs.ReadFile", "MUST"), ("Fs.WriteFile", "MUST")],
+          "inspect module: the module's effects (%s)" % raw)
     write(os.path.join(proj, "shop", "src", "users", "user.or"),
           open(os.path.join(proj, "shop", "src", "users", "user.or")).read().replace(
               'import { hidden }', 'import { charge } from "../payments";\nimport { hidden }'))
@@ -330,13 +354,13 @@ def main():
     for side in ("base", "head"):
         shutil.copytree(os.path.join(ROOT, "tests", "osig", "accept", side), os.path.join(proj, "osig", side))
     err, v, raw = c.call("graph", {"entry": "osig/head"})
-    check(not err and v["schema"] == "osig/0.1" and v["package"] == "acme" and v["hash"].startswith("h62:")
+    check(not err and v["schema"] == "osig/0.2" and v["package"] == "acme" and v["hash"].startswith("h62:")
           and v["nodes"] > 5 and v["edges"] > 5 and "snapshot" not in v, "graph summary (%s)" % raw)
     err, v2, raw = c.call("graph", {"entry": "osig/head", "full": True, "out": "osig/head.json"})
     check(not err and v2["hash"] == v["hash"] and json.loads(v2["snapshot"])["hash"] == v["hash"], "graph full is deterministic")
     check(os.path.exists(os.path.join(proj, "osig", "head.json")), "graph out written inside the root")
     err, d, raw = c.call("diff", {"base": "osig/base", "head": "osig/head"})
-    check(not err and d["schema"] == "osig-diff/0.1" and d["differences"] is True, "diff json (%s)" % raw[:200])
+    check(not err and d["schema"] == "osig-diff/0.2" and d["differences"] is True, "diff json (%s)" % raw[:200])
     check([c_["id"] for c_ in d["changedSymbols"]] == ["acme:orders::checkout"] and d["changedSymbols"][0]["aspects"] == ["signature"],
           "diff: API signature change")
     check(len(d["possibleRenames"]) == 1 and d["possibleRenames"][0]["heuristic"] is True

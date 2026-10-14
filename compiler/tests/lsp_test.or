@@ -320,7 +320,7 @@ function testIndexRequests(fs: FsGrant, f: string[]): string[] {
 
   s = req(fs, st, 22, "textDocument/hover", "{" + doc + "," + onCall + "}");
   fails = eq(fails, "hover", show(s),
-    "{\"jsonrpc\":\"2.0\",\"id\":22,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"```orin\\nfunction add(a: int): int\\n```\"},"
+    "{\"jsonrpc\":\"2.0\",\"id\":22,\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":\"```orin\\nfunction add(a: int): int\\n```\\n\\n**Effects**: none (pure)\"},"
     + "\"range\":{\"start\":{\"line\":1,\"character\":24},\"end\":{\"line\":1,\"character\":27}}}}");
   s = req(fs, st, 23, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":1,\"character\":28}}");
   fails = eq(fails, "hover type", has(show(s), "\"value\":\"```orin\\nint\\n```\""), "true");
@@ -360,10 +360,35 @@ function testDeprecated(fs: FsGrant, f: string[]): string[] {
     "{\"range\":{\"start\":{\"line\":5,\"character\":14},\"end\":{\"line\":5,\"character\":15}},\"severity\":2,\"code\":\"W0440\",\"source\":\"orin\","
     + "\"message\":\"`f` is deprecated: use g\",\"tags\":[2]}"));
   const h = req(fs, st, 50, "textDocument/hover", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":5,\"character\":14}}");
-  fails = eq(fails, "deprecated hover", has(show(h), "\"value\":\"```orin\\n@Deprecated(\\\"use g\\\")\\nfunction f(): int\\n```\""), "true");
+  fails = eq(fails, "deprecated hover", has(show(h), "\"value\":\"```orin\\n@Deprecated(\\\"use g\\\")\\nfunction f(): int\\n```\\n\\n**Effects**: none (pure)\""), "true");
   // Errors and warnings are separate: a document without uses has no diagnostics at all.
   const noUse = change(fs, st, uri, "@Deprecated(\"use g\")\nfunction f(): int {\n  return 1;\n}\nfunction main(): void {\n}\n");
   fails = eq(fails, "deprecated unused", show(noUse), diagNote(uri, ""));
+  return fails;
+}
+
+// Hover shows the inferred, transitive effect summary of a function (ADR-0037 D2): a direct effect, one reached through a
+// callee (with the route), a pure function, and a call through a function value (UNKNOWN, never pure).
+function testHoverEffects(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const uri = "file:///h/a.or";
+  const text = "function say(): void {\n  console.log(\"x\");\n}\nfunction twice(): void {\n  say();\n  say();\n}\nfunction pick(): (x: int) => int {\n  return x => x;\n}\n"
+    + "function dyn(): int {\n  const g = pick();\n  return g(1);\n}\nfunction pure(n: int): int {\n  return n;\n}\nfunction main(): void {\n  twice();\n  console.log(dyn().toString());\n  console.log(pure(1).toString());\n}\n";
+  let st = initialized(fs);
+  st = open(fs, st, uri, text).state;
+  const doc = "\"textDocument\":{\"uri\":\"" + uri + "\"}";
+  // on the declaration of `say` (line 0), `twice` (line 3), `dyn` (line 10), `pure` (line 14)
+  const say = req(fs, st, 60, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":0,\"character\":10}}");
+  fails = eq(fails, "hover direct effect", has(show(say), "**Effects** (inferred, transitive):\\n- `Console.Write OUTPUT [MUST] ambient` direct"), "true");
+  const twice = req(fs, st, 61, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":3,\"character\":10}}");
+  fails = eq(fails, "hover transitive effect", has(show(twice), "- `Console.Write OUTPUT [MAY] ambient` via (root)::say"), "true");
+  const dyn = req(fs, st, 62, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":10,\"character\":10}}");
+  fails = eq(fails, "hover unknown", has(show(dyn), "- `Unknown.FunctionValue [UNKNOWN]` call of a function value of unknown origin"), "true");
+  const pure = req(fs, st, 63, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":14,\"character\":10}}");
+  fails = eq(fails, "hover pure", has(show(pure), "**Effects**: none (pure)"), "true");
+  // on a call: the effects of the callee
+  const call = req(fs, st, 64, "textDocument/hover", "{" + doc + ",\"position\":{\"line\":18,\"character\":3}}");
+  fails = eq(fails, "hover on a call", has(show(call), "via (root)::say"), "true");
   return fails;
 }
 
@@ -419,6 +444,7 @@ function run(fs: FsGrant): void {
   f = testIndexRequests(fs, f);
   f = testInterfaces(fs, f);
   f = testDeprecated(fs, f);
+  f = testHoverEffects(fs, f);
   f = testFraming(fs, f);
   if (f.length == 0) {
     console.log("ok");
