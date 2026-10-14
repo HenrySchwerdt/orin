@@ -1,0 +1,1258 @@
+// Property, differential and fuzz tests for std:http.
+//   * serializer round trip: random well-formed requests and responses (all methods and framings, random chunk
+//     sizes) satisfy parse(serialize(m)) == m, also when the bytes arrive in random chunks;
+//   * differential test of the serializer against a naive string-building reference serializer;
+//   * differential test of the parser against an executable specification (`refRequest`: a whole-message,
+//     line-splitting parser written from the RFC rules without the state machine) on random messages and on random
+//     mutations of them;
+//   * fuzzing: random mutations of valid messages (flip, insert, delete, duplicate, swap, truncate, special
+//     bytes) and random garbage must never trap: the result is NeedMore, Done or Failed, and whatever the
+//     parser accepts survives parse -> serialize -> parse unchanged.
+// Run with `orin test tests/std/http_prop_test.or`, with and without `--no-contracts` (the checked build also
+// runs the round-trip contract of the serializers on every call). Iteration counts are in the test names.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
+import { Bytes, bytesFromString, bytesFromInts, emptyBytes } from "std:bytes";
+import { Request, Response, Headers, Status, Limits, ParseResult, NeedMore, Done, Failed, Method, Get, Head, Post, Put, Delete, Connect,
+  Options, Trace, Patch, Ext, HttpVersion, Http10, Http11, RequestParser, ResponseParser, defaultLimits, parseRequest, parseResponse,
+  parseResponseToEof, methodName, versionText, reasonName, emptyHeaders, standardStatus, serializeRequest,
+  serializeRequestChunked, serializeResponse, serializeResponseChunked, makeRequest, makeResponse, toLowerAscii } from "std:http";
+
+// ---------------------------------------------------------------------------------------------- random
+
+const TCHARS: string = "!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const HOSTCHARS: string = "-._~%!$&'()*+,;=:[]0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+function bs(s: string): Bytes {
+  return bytesFromString(s);
+}
+
+// A pseudo-random generator of messages and mutations. Orin values are copied, so all generators are methods of
+// one object whose state advances in place.
+class Gen {
+  private s: int;
+
+  constructor(seed: int) {
+    this.s = seed;
+  }
+
+  // next(n): a pseudo-random integer in 0..n-1 (n <= 32768).
+  next(n: int): int {
+    this.s = (this.s * 1103515245 + 12345) % 2147483648;
+    return (this.s / 65536) % n;
+  }
+
+  // flip(): a fair coin.
+  flip(): bool {
+    return this.next(2) == 0;
+  }
+
+  token(maxLen: int): string {
+    const n = 1 + this.next(maxLen);
+    let parts: string[] = [];
+    let i = 0;
+    while (i < n) {
+      const k = this.next(TCHARS.length.toInt());
+      parts.push(TCHARS.charAt(k.toUsize()));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  // A letters-and-digits name (a host name).
+  alnum(maxLen: int): string {
+    const n = 1 + this.next(maxLen);
+    let parts: string[] = [];
+    let i = 0;
+    while (i < n) {
+      const k = this.next(62);
+      parts.push("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".charAt(k.toUsize()));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  // A valid field value: visible characters, obs-text, inner blanks; no leading or trailing blank; maybe empty.
+  value(maxLen: int): string {
+    const n = this.next(maxLen + 1);
+    let parts: string[] = [];
+    let i = 0;
+    while (i < n) {
+      const k = this.next(20);
+      const visible = 33 + this.next(94);
+      const high = 128 + this.next(128);
+      let c = visible;
+      if (k == 0) {
+        c = high;
+      } else if (k < 4 && i > 0 && i < n - 1) {
+        c = k == 1 ? 32 : 9;
+      }
+      parts.push(String.fromCharCode(c));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  host(): string {
+    const n = this.next(12);
+    let parts: string[] = [];
+    let i = 0;
+    while (i < n) {
+      const k = this.next(HOSTCHARS.length.toInt());
+      parts.push(HOSTCHARS.charAt(k.toUsize()));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  body(maxLen: int): Bytes {
+    const n = this.next(maxLen + 1);
+    let xs: int[] = [];
+    let i = 0;
+    while (i < n) {
+      const k = this.next(8);
+      const any = this.next(256);
+      xs.push(k == 0 ? 13 : (k == 1 ? 10 : any));
+      i += 1;
+    }
+    return bytesFromInts(xs);
+  }
+
+  target(m: Method): string {
+    const name = methodName(m);
+    if (name == "CONNECT") {
+      const t = this.alnum(6);
+      const port = 1 + this.next(32767);
+      return t + ":" + port.toString();
+    }
+    const k = this.next(10);
+    if (k == 0 && name == "OPTIONS") {
+      return "*";
+    }
+    let seg = "";
+    const n = this.next(6);
+    let i = 0;
+    while (i < n) {
+      let c = 33 + this.next(94);
+      if (c == 35) {
+        c = 47;
+      }
+      seg += String.fromCharCode(c);
+      i += 1;
+    }
+    if (k == 1) {
+      const t = this.alnum(6);
+      return "http://" + t + "/" + seg;
+    }
+    return "/" + seg;
+  }
+
+  method(): Method {
+    const k = this.next(11);
+    if (k == 0) {
+      return Get;
+    }
+    if (k == 1) {
+      return Head;
+    }
+    if (k == 2) {
+      return Post;
+    }
+    if (k == 3) {
+      return Put;
+    }
+    if (k == 4) {
+      return Delete;
+    }
+    if (k == 5) {
+      return Options;
+    }
+    if (k == 6) {
+      return Trace;
+    }
+    if (k == 7) {
+      return Patch;
+    }
+    if (k == 8) {
+      return Connect;
+    }
+    let t = this.token(8);
+    if (t == "GET" || t == "HEAD" || t == "POST" || t == "PUT" || t == "DELETE" || t == "CONNECT" || t == "OPTIONS" || t == "TRACE" || t == "PATCH") {
+      t = t + "x";
+    }
+    return Ext(t);
+  }
+
+  // `h` plus up to `maxCount` random "X-..." fields (never a framing field or Host).
+  fields(h: Headers, maxCount: int): Headers {
+    let out = h;
+    const n = this.next(maxCount + 1);
+    let i = 0;
+    while (i < n) {
+      const lower = this.flip();
+      const t = this.token(8);
+      const v = this.value(20);
+      out.add(lower ? "x-" + toLowerAscii(t) : "X-" + t, v).unwrap();
+      i += 1;
+    }
+    return out;
+  }
+
+  mixCase(s: string): string {
+    let parts: string[] = [];
+    let i: usize = 0;
+    while (i < s.length) {
+      const c = s.charCodeAt(i);
+      const up = this.flip();
+      parts.push(String.fromCharCode(up && c >= 97 && c <= 122 ? c - 32 : c));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  // A random well-formed request: any method, any framing (none, Content-Length, chunked with trailers).
+  request(): Request {
+    const m = this.method();
+    const target = this.target(m);
+    const old = this.next(4) == 0;
+    const v = old ? Http10 : Http11;
+    let h = emptyHeaders();
+    h = this.fields(h, 3);
+    const hostName = this.mixCase("Host");
+    const hostValue = this.host();
+    const coin = this.flip();
+    const withHost = old ? coin : true;
+    if (withHost) {
+      h.add(hostName, hostValue).unwrap();
+    }
+    h = this.fields(h, 3);
+    let body = emptyBytes();
+    let trailers = emptyHeaders();
+    const framing = this.next(3);
+    if (framing == 1) {
+      body = this.body(40);
+      h.add(this.mixCase("Content-Length"), body.length().toString()).unwrap();
+    } else if (framing == 2 && !old) {
+      body = this.body(60);
+      h.add(this.mixCase("Transfer-Encoding"), this.mixCase("chunked")).unwrap();
+      trailers = this.fields(trailers, 3);
+    }
+    h = this.fields(h, 2);
+    return makeRequest(m, target, v, h, body, trailers).unwrap();
+  }
+
+  phrase(): string {
+    const k = this.next(4);
+    if (k == 0) {
+      return "";
+    }
+    if (k == 1) {
+      return "OK";
+    }
+    const n = this.next(15);
+    let parts: string[] = [];
+    let i = 0;
+    while (i < n) {
+      const a = this.next(10);
+      const b = this.next(6);
+      const high = 128 + this.next(128);
+      const visible = 33 + this.next(94);
+      const c = a == 0 ? high : (b == 0 ? 32 : visible);
+      parts.push(String.fromCharCode(c));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  response(): Response {
+    const kind = this.next(8);
+    let code = 200 + this.next(400);
+    if (kind == 0) {
+      code = 100 + this.next(100);
+    } else if (kind == 1) {
+      code = 204;
+    } else if (kind == 2) {
+      code = 304;
+    }
+    const std = this.flip();
+    const phrase = this.phrase();
+    const status = std ? standardStatus(code) : new Status(code, phrase);
+    const old = this.next(4) == 0;
+    const v = old ? Http10 : Http11;
+    const forHead = this.next(5) == 0;
+    let h = emptyHeaders();
+    h = this.fields(h, 3);
+    let body = emptyBytes();
+    let trailers = emptyHeaders();
+    const noFraming = code < 200 || code == 204;
+    const bodyless = forHead || code < 200 || code == 204 || code == 304;
+    const framing = this.next(3);
+    if (!noFraming) {
+      if (framing == 1) {
+        if (bodyless) {
+          h.add("Content-Length", this.next(1000).toString()).unwrap();
+        } else {
+          body = this.body(40);
+          h.add("Content-Length", body.length().toString()).unwrap();
+        }
+      } else if (framing == 2 && !old) {
+        h.add("Transfer-Encoding", "chunked").unwrap();
+        if (!bodyless) {
+          body = this.body(60);
+          trailers = this.fields(trailers, 3);
+        }
+      } else if (!bodyless) {
+        body = this.body(40);
+      }
+    }
+    h = this.fields(h, 2);
+    return makeResponse(status, v, h, body, trailers, forHead).unwrap();
+  }
+
+  // One random mutation of the bytes `xs`.
+  mutate(xs: int[]): int[] {
+    let out = xs;
+    const specials = [13, 10, 32, 58, 0, 9, 128, 255, 59, 44, 48, 49, 53, 57, 70, 45, 43, 127, 11];
+    const n = out.length.toInt();
+    const kind = this.next(9);
+    if (n == 0) {
+      return [this.next(256)];
+    }
+    const at = this.next(n);
+    const sp = specials[this.next(specials.length.toInt()).toUsize()];
+    const rnd = this.next(256);
+    const other = this.next(n);
+    const coin = this.flip();
+    if (kind == 0) {
+      out[at.toUsize()] = rnd;
+    } else if (kind == 1) {
+      out[at.toUsize()] = sp;
+    } else if (kind == 2) {
+      let ys: int[] = [];
+      let i = 0;
+      while (i < n) {
+        if (i == at) {
+          ys.push(sp);
+        }
+        ys.push(out[i.toUsize()]);
+        i += 1;
+      }
+      out = ys;
+    } else if (kind == 3) {
+      let ys: int[] = [];
+      let i = 0;
+      while (i < n) {
+        if (i != at) {
+          ys.push(out[i.toUsize()]);
+        }
+        i += 1;
+      }
+      out = ys;
+    } else if (kind == 4) {
+      const len = 1 + this.next(8);
+      let ys: int[] = [];
+      let i = 0;
+      while (i < n) {
+        ys.push(out[i.toUsize()]);
+        if (i == at) {
+          let k = 0;
+          while (k < len && at + k < n) {
+            ys.push(out[(at + k).toUsize()]);
+            k += 1;
+          }
+        }
+        i += 1;
+      }
+      out = ys;
+    } else if (kind == 5) {
+      const t = out[at.toUsize()];
+      out[at.toUsize()] = out[other.toUsize()];
+      out[other.toUsize()] = t;
+    } else if (kind == 6) {
+      let ys: int[] = [];
+      let i = 0;
+      while (i < at) {
+        ys.push(out[i.toUsize()]);
+        i += 1;
+      }
+      out = ys;
+    } else if (kind == 7) {
+      let ys: int[] = [];
+      let i = 0;
+      let done = false;
+      while (i < n) {
+        if (!done && i >= at && out[i.toUsize()] == 13 && i + 1 < n && out[(i + 1).toUsize()] == 10) {
+          ys.push(coin ? 10 : 13);
+          i += 2;
+          done = true;
+        } else {
+          ys.push(out[i.toUsize()]);
+          i += 1;
+        }
+      }
+      out = ys;
+    } else {
+      let ys: int[] = [];
+      let i = 0;
+      let done = false;
+      while (i < n) {
+        if (!done && i >= at && out[i.toUsize()] == 58) {
+          ys.push(coin ? 32 : 9);
+          done = true;
+        }
+        ys.push(out[i.toUsize()]);
+        i += 1;
+      }
+      out = ys;
+    }
+    return out;
+  }
+
+  // The request parsed from chunks cut at random positions (also empty chunks); the answer must be the one-shot answer.
+  feedRandomly(wire: Bytes, limits: Limits): ParseResult<Request> {
+    let p = new RequestParser(limits);
+    let start: usize = 0;
+    let last: ParseResult<Request> = NeedMore;
+    while (start < wire.length()) {
+      const room = (wire.length() - start).toInt();
+      const empty = this.next(7) == 0;
+      const pick = 1 + this.next(room < 13 ? room : 13);
+      let take = empty ? 0 : pick;
+      if (take > room) {
+        take = room;
+      }
+      const piece = wire.slice(start, start + take.toUsize());
+      const res = p.feed(piece);
+      const finished = match (res) {
+        NeedMore => false,
+        Done(q, used) => true,
+        Failed(e) => true
+      };
+      if (finished) {
+        return match (res) {
+          Done(q, used) => Done(q, start + used),
+          _ => res
+        };
+      }
+      start += take.toUsize();
+      last = res;
+    }
+    return last;
+  }
+
+  // The differential check of one input: the parser against the specification, one-shot against random chunking.
+  // 1 = accepted, 0 = needs more, 2 = refused.
+  differential(input: string): int {
+    const wire = bs(input);
+    const impl = parseRequest(wire, bigLimits());
+    const ref = refRequest(input);
+    const whole = sig(impl);
+    assertEqString(sig(this.feedRandomly(wire, bigLimits())), whole, "random chunking of: " + toHexLabel(input));
+    match (impl) {
+      Done(q, used) => {
+        assertEq(ref.status, 1, "parser accepts, specification refuses or needs more: " + toHexLabel(input));
+        assertEqUsize(used, ref.used, "used bytes: " + toHexLabel(input));
+        assertEqString(dumpRequest(q), ref.text, "parsed message: " + toHexLabel(input));
+        checkStable(q);
+        return 1;
+      },
+      NeedMore => {
+        assertEq(ref.status, 0, "parser needs more, specification says " + ref.status.toString() + ": " + toHexLabel(input));
+        return 0;
+      },
+      Failed(e) => {
+        assert(ref.status != 1, "parser refuses (" + reasonName(e.reason) + " at " + e.position.toString() + "), specification accepts: " + toHexLabel(input));
+        assert(e.position <= wire.length(), "position within the input");
+        return 2;
+      }
+    };
+  }
+}
+
+// ----------------------------------------------------------------------------- the reference serializer
+
+function fieldLines(h: Headers): string {
+  let s = "";
+  let i: usize = 0;
+  while (i < h.count()) {
+    s += h.nameAt(i) + ": " + h.valueAt(i) + "\r\n";
+    i += 1;
+  }
+  return s;
+}
+
+function hexOf(n: usize): string {
+  const digits = "0123456789abcdef";
+  if (n == 0) {
+    return "0";
+  }
+  let s = "";
+  let v = n;
+  while (v > 0) {
+    s = digits.charAt(v % 16) + s;
+    v = v / 16;
+  }
+  return s;
+}
+
+function chunkedText(body: Bytes, trailers: Headers, size: usize): string {
+  const raw = body.toRawString();
+  let s = "";
+  let off: usize = 0;
+  while (off < raw.length) {
+    const take = raw.length - off < size ? raw.length - off : size;
+    s += hexOf(take) + "\r\n" + raw.substring(off, off + take) + "\r\n";
+    off += take;
+  }
+  return s + "0\r\n" + fieldLines(trailers) + "\r\n";
+}
+
+function refSerializeRequest(q: Request, size: usize): string {
+  const head = methodName(q.method()) + " " + q.target() + " " + versionText(q.version()) + "\r\n" + fieldLines(q.headers()) + "\r\n";
+  if (q.isChunked()) {
+    return head + chunkedText(q.body(), q.trailers(), size);
+  }
+  return head + q.body().toRawString();
+}
+
+function refSerializeResponse(q: Response, size: usize): string {
+  const head = versionText(q.version()) + " " + q.status().code().toString() + " " + q.status().reason() + "\r\n" + fieldLines(q.headers()) + "\r\n";
+  if (q.isBodyless()) {
+    return head;
+  }
+  if (q.isChunked()) {
+    return head + chunkedText(q.body(), q.trailers(), size);
+  }
+  return head + q.body().toRawString();
+}
+
+// ------------------------------------------------------------------------------ the reference parser (spec)
+
+// An executable specification of the request rules: the whole input is split into lines first, the head is
+// checked as a whole, then the body is decoded; no state machine, no incremental processing, no limits (the
+// tests run the parser with limits that cannot trigger). `status`: 0 = the input is a prefix of a message (more
+// bytes needed), 1 = a complete message of `used` bytes (dump in `text`), 2 = refused.
+type Ref = { status: int; used: usize; text: string; };
+
+function refInc(): Ref {
+  return Ref { status: 0, used: 0, text: "" };
+}
+
+function refBad(): Ref {
+  return Ref { status: 2, used: 0, text: "" };
+}
+
+function refIsTchar(c: int): bool {
+  let i: usize = 0;
+  while (i < TCHARS.length) {
+    if (TCHARS.charCodeAt(i) == c) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+function refIsToken(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    if (!refIsTchar(s.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function refFieldByte(c: int): bool {
+  return c == 9 || (c >= 32 && c <= 126) || c >= 128;
+}
+
+function refHasCr(s: string): bool {
+  return s.indexOf("\r").isSome();
+}
+
+function refLower(s: string): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    parts.push(String.fromCharCode(c >= 65 && c <= 90 ? c + 32 : c));
+    i += 1;
+  }
+  return parts.join("");
+}
+
+function refTrim(s: string): string {
+  let a: usize = 0;
+  let b = s.length;
+  while (a < b && (s.charCodeAt(a) == 32 || s.charCodeAt(a) == 9)) {
+    a += 1;
+  }
+  while (b > a && (s.charCodeAt(b - 1) == 32 || s.charCodeAt(b - 1) == 9)) {
+    b -= 1;
+  }
+  return s.substring(a, b);
+}
+
+function refIsHostText(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    if (HOSTCHARS.indexOf(s.charAt(i)).isNone()) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function refAbsolute(t: string): bool {
+  const k = t.indexOf("://");
+  if (k.isNone() || k.unwrap() == 0) {
+    return false;
+  }
+  const scheme = refLower(t.substring(0, k.unwrap()));
+  const c0 = scheme.charCodeAt(0);
+  if (c0 < 97 || c0 > 122) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < scheme.length) {
+    const c = scheme.charCodeAt(i);
+    if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 43 || c == 45 || c == 46)) {
+      return false;
+    }
+    i += 1;
+  }
+  return k.unwrap() + 3 < t.length;
+}
+
+function refTargetOk(method: string, t: string): bool {
+  if (t.length == 0) {
+    return false;
+  }
+  if (method == "CONNECT") {
+    return refIsHostText(t);
+  }
+  let i: usize = 0;
+  while (i < t.length) {
+    const c = t.charCodeAt(i);
+    if (c < 33 || c > 126 || c == 35) {
+      return false;
+    }
+    i += 1;
+  }
+  if (t == "*") {
+    return method == "OPTIONS";
+  }
+  return t.charCodeAt(0) == 47 || refAbsolute(t);
+}
+
+function refHex(s: string): string {
+  const digits = "0123456789abcdef";
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    parts.push(digits.charAt((c / 16).toUsize()));
+    parts.push(digits.charAt((c % 16).toUsize()));
+    i += 1;
+  }
+  return parts.join("");
+}
+
+function refDigits(v: string): int {
+  if (v.length == 0 || v.length > 18) {
+    return -1;
+  }
+  let n = 0;
+  let i: usize = 0;
+  while (i < v.length) {
+    const c = v.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return -1;
+    }
+    n = n * 10 + (c - 48);
+    i += 1;
+  }
+  return n;
+}
+
+function hexValue(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+type RefFields = { ok: bool; names: string[]; values: string[]; };
+
+function refFieldsBad(): RefFields {
+  return RefFields { ok: false, names: [], values: [] };
+}
+
+// Parses the lines `lines[first..]` as header fields.
+function refFields(lines: string[], first: usize): RefFields {
+  let names: string[] = [];
+  let values: string[] = [];
+  let i = first;
+  while (i < lines.length) {
+    const line = lines[i];
+    const c0 = line.charCodeAt(0);
+    if (c0 == 32 || c0 == 9) {
+      return refFieldsBad();
+    }
+    const k = line.indexOf(":");
+    if (k.isNone() || k.unwrap() == 0) {
+      return refFieldsBad();
+    }
+    const name = line.substring(0, k.unwrap());
+    const value = refTrim(line.substring(k.unwrap() + 1, line.length));
+    if (!refIsToken(name)) {
+      return refFieldsBad();
+    }
+    let j: usize = 0;
+    while (j < value.length) {
+      if (!refFieldByte(value.charCodeAt(j))) {
+        return refFieldsBad();
+      }
+      j += 1;
+    }
+    names.push(name);
+    values.push(value);
+    i += 1;
+  }
+  return RefFields { ok: true, names: names, values: values };
+}
+
+function refCount(names: string[], name: string): int {
+  let n = 0;
+  let i: usize = 0;
+  while (i < names.length) {
+    if (refLower(names[i]) == name) {
+      n += 1;
+    }
+    i += 1;
+  }
+  return n;
+}
+
+function refValueOf(names: string[], values: string[], name: string): string {
+  let i: usize = 0;
+  while (i < names.length) {
+    if (refLower(names[i]) == name) {
+      return values[i];
+    }
+    i += 1;
+  }
+  return "";
+}
+
+function refJoin(names: string[], values: string[]): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < names.length) {
+    parts.push(names[i] + "=" + values[i]);
+    i += 1;
+  }
+  return parts.join(",");
+}
+
+// The LF position at or after `pos`, or -1.
+function refLf(s: string, pos: usize): int {
+  const rest = s.substring(pos, s.length);
+  const k = rest.indexOf("\n");
+  if (k.isNone()) {
+    return -1;
+  }
+  return (pos + k.unwrap()).toInt();
+}
+
+function refRequest(s: string): Ref {
+  // ---- the head: lines up to the first empty line
+  let lines: string[] = [];
+  let pos: usize = 0;
+  let found = false;
+  while (!found) {
+    const e = refLf(s, pos);
+    if (e < 0) {
+      return refInc();
+    }
+    const lf = e.toUsize();
+    if (lf == pos || s.charCodeAt(lf - 1) != 13) {
+      return refBad();
+    }
+    const content = s.substring(pos, lf - 1);
+    if (refHasCr(content)) {
+      return refBad();
+    }
+    pos = lf + 1;
+    if (content.length == 0) {
+      found = true;
+    } else {
+      lines.push(content);
+    }
+  }
+  if (lines.length == 0) {
+    return refBad();
+  }
+  const parts = lines[0].split(" ");
+  if (parts.length != 3 || !refIsToken(parts[0]) || !refTargetOk(parts[0], parts[1])) {
+    return refBad();
+  }
+  if (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0") {
+    return refBad();
+  }
+  const minor = parts[2] == "HTTP/1.1" ? 1 : 0;
+  const f = refFields(lines, 1);
+  if (!f.ok) {
+    return refBad();
+  }
+  const cl = refCount(f.names, "content-length");
+  const te = refCount(f.names, "transfer-encoding");
+  const host = refCount(f.names, "host");
+  if (cl > 1 || te > 1 || (cl == 1 && te == 1) || host > 1 || (host == 0 && minor == 1)) {
+    return refBad();
+  }
+  if (host == 1 && !refIsHostText(refValueOf(f.names, f.values, "host"))) {
+    return refBad();
+  }
+  if (te == 1 && (refLower(refValueOf(f.names, f.values, "transfer-encoding")) != "chunked" || minor == 0)) {
+    return refBad();
+  }
+  let length = 0;
+  if (cl == 1) {
+    length = refDigits(refValueOf(f.names, f.values, "content-length"));
+    if (length < 0) {
+      return refBad();
+    }
+  }
+  let body = "";
+  let trailerNames: string[] = [];
+  let trailerValues: string[] = [];
+  let end = pos;
+  if (te == 1) {
+    let p = pos;
+    let more = true;
+    while (more) {
+      const e = refLf(s, p);
+      if (e < 0) {
+        return refInc();
+      }
+      const lf = e.toUsize();
+      if (lf == p || s.charCodeAt(lf - 1) != 13) {
+        return refBad();
+      }
+      const line = s.substring(p, lf - 1);
+      if (refHasCr(line)) {
+        return refBad();
+      }
+      let i: usize = 0;
+      let size = 0;
+      while (i < line.length && hexValue(line.charCodeAt(i)) >= 0) {
+        size = size * 16 + hexValue(line.charCodeAt(i));
+        if (size > 1099511627776) {
+          return refBad();
+        }
+        i += 1;
+      }
+      if (i == 0) {
+        return refBad();
+      }
+      const rest = line.substring(i, line.length);
+      let r: usize = 0;
+      while (r < rest.length && (rest.charCodeAt(r) == 32 || rest.charCodeAt(r) == 9)) {
+        r += 1;
+      }
+      if (r < rest.length) {
+        if (rest.charCodeAt(r) != 59) {
+          return refBad();
+        }
+        let q = r + 1;
+        while (q < rest.length) {
+          if (!refFieldByte(rest.charCodeAt(q))) {
+            return refBad();
+          }
+          q += 1;
+        }
+      }
+      p = lf + 1;
+      if (size == 0) {
+        // the trailer section
+        let tl: string[] = [];
+        let done = false;
+        while (!done) {
+          const e2 = refLf(s, p);
+          if (e2 < 0) {
+            return refInc();
+          }
+          const lf2 = e2.toUsize();
+          if (lf2 == p || s.charCodeAt(lf2 - 1) != 13) {
+            return refBad();
+          }
+          const content = s.substring(p, lf2 - 1);
+          if (refHasCr(content)) {
+            return refBad();
+          }
+          p = lf2 + 1;
+          if (content.length == 0) {
+            done = true;
+          } else {
+            tl.push(content);
+          }
+        }
+        const tf = refFields(tl, 0);
+        if (!tf.ok) {
+          return refBad();
+        }
+        if (refCount(tf.names, "content-length") > 0 || refCount(tf.names, "transfer-encoding") > 0 || refCount(tf.names, "trailer") > 0
+            || refCount(tf.names, "host") > 0) {
+          return refBad();
+        }
+        trailerNames = tf.names;
+        trailerValues = tf.values;
+        more = false;
+        end = p;
+      } else {
+        const at = p + size.toUsize();
+        if (at >= s.length) {
+          return refInc();
+        }
+        body += s.substring(p, at);
+        if (s.charCodeAt(at) != 13) {
+          return refBad();
+        }
+        if (at + 1 >= s.length) {
+          return refInc();
+        }
+        if (s.charCodeAt(at + 1) != 10) {
+          return refBad();
+        }
+        p = at + 2;
+      }
+    }
+  } else if (cl == 1) {
+    if (pos + length.toUsize() > s.length) {
+      return refInc();
+    }
+    body = s.substring(pos, pos + length.toUsize());
+    end = pos + length.toUsize();
+  }
+  const text = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + refJoin(f.names, f.values) + "|" + refHex(body) + "|" + refJoin(trailerNames, trailerValues);
+  return Ref { status: 1, used: end, text: text };
+}
+
+// ---------------------------------------------------------------------------------------- dump and helpers
+
+function dumpFields(h: Headers): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < h.count()) {
+    parts.push(h.nameAt(i) + "=" + h.valueAt(i));
+    i += 1;
+  }
+  return parts.join(",");
+}
+
+function dumpRequest(q: Request): string {
+  return methodName(q.method()) + "|" + q.target() + "|" + versionText(q.version()) + "|" + dumpFields(q.headers()) + "|"
+    + q.body().toHex() + "|" + dumpFields(q.trailers());
+}
+
+// Limits that cannot trigger on the test inputs (the reference parser has no limits).
+function bigLimits(): Limits {
+  return new Limits(1048576, 65536, 1048576, 67108864, 65536, 1099511627776);
+}
+
+function toInts(s: string): int[] {
+  let xs: int[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    xs.push(s.charCodeAt(i));
+    i += 1;
+  }
+  return xs;
+}
+
+function fromInts(xs: int[]): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    parts.push(String.fromCharCode(xs[i]));
+    i += 1;
+  }
+  return parts.join("");
+}
+
+function toHexLabel(s: string): string {
+  return bs(s).toHex() + " (" + s.length.toString() + " bytes)";
+}
+
+// "NeedMore", "Done <used> <dump>" or "Failed <reason> <position>".
+function sig(r: ParseResult<Request>): string {
+  return match (r) {
+    NeedMore => "NeedMore",
+    Done(q, used) => "Done " + used.toString() + " " + dumpRequest(q),
+    Failed(e) => "Failed " + reasonName(e.reason) + " " + e.position.toString()
+  };
+}
+
+function sigResponse(r: ParseResult<Response>): string {
+  return match (r) {
+    NeedMore => "NeedMore",
+    Done(q, used) => "Done " + q.status().code().toString() + " " + q.status().reason() + " " + dumpFields(q.headers()) + " " + q.body().toHex() + " " + dumpFields(q.trailers()),
+    Failed(e) => "Failed " + reasonName(e.reason) + " " + e.position.toString()
+  };
+}
+
+// parse -> serialize -> parse of an accepted request is the identity.
+function checkStable(q: Request): void {
+  const wire = serializeRequest(q);
+  match (parseRequest(wire, bigLimits())) {
+    Done(p, used) => {
+      assertEqUsize(used, wire.length(), "stable: all bytes used");
+      assert(p.equals(q), "parse(serialize(parse(x))) == parse(x)");
+    },
+    NeedMore => { fail("stable: NeedMore"); },
+    Failed(e) => { fail("stable: refused " + e.message); }
+  };
+}
+
+// ------------------------------------------------------------------------------------------ round trips
+
+@Test
+function requestRoundTrip500(): void {
+  let g = new Gen(20260101);
+  let n = 0;
+  while (n < 500) {
+    const q = g.request();
+    const wire = serializeRequest(q);
+    // differential: the same bytes as the naive serializer
+    assertEqString(wire.toRawString(), refSerializeRequest(q, q.body().length() == 0 ? 1 : q.body().length()), "serializer vs reference, message " + n.toString());
+    const r = parseRequest(wire, defaultLimits());
+    match (r) {
+      Done(p, used) => {
+        assertEqUsize(used, wire.length(), "all bytes used, message " + n.toString());
+        assert(p.equals(q), "parse(serialize(m)) == m, message " + n.toString());
+      },
+      NeedMore => { fail("NeedMore for message " + n.toString()); },
+      Failed(e) => { fail("refused " + e.message + " for message " + n.toString()); }
+    };
+    // random chunk sizes and random input chunking
+    const pick = g.next(32768);
+    const size = q.body().length() == 0 ? 1 : 1 + pick % q.body().length().toInt();
+    const wire2 = serializeRequestChunked(q, size.toUsize());
+    assertEqString(wire2.toRawString(), refSerializeRequest(q, size.toUsize()), "chunk size " + size.toString() + ", message " + n.toString());
+    match (g.feedRandomly(wire2, defaultLimits())) {
+      Done(p, used) => {
+        assertEqUsize(used, wire2.length(), "all bytes used in random chunks");
+        assert(p.equals(q), "round trip in random chunks, message " + n.toString());
+      },
+      NeedMore => { fail("NeedMore (random chunks) for message " + n.toString()); },
+      Failed(e) => { fail("refused (random chunks) " + e.message); }
+    };
+    n += 1;
+  }
+}
+
+@Test
+function responseRoundTrip500(): void {
+  let g = new Gen(20260202);
+  let n = 0;
+  while (n < 500) {
+    const q = g.response();
+    const wire = serializeResponse(q);
+    assertEqString(wire.toRawString(), refSerializeResponse(q, q.body().length() == 0 ? 1 : q.body().length()), "serializer vs reference, response " + n.toString());
+    const r = parseResponseToEof(wire, defaultLimits(), q.isForHead());
+    match (r) {
+      Done(p, used) => { assert(p.equals(q), "parse(serialize(m)) == m, response " + n.toString()); },
+      NeedMore => { fail("NeedMore for response " + n.toString()); },
+      Failed(e) => { fail("refused " + e.message + " for response " + n.toString()); }
+    };
+    const pick = g.next(32768);
+    const size = q.body().length() == 0 ? 1 : 1 + pick % q.body().length().toInt();
+    const wire2 = serializeResponseChunked(q, size.toUsize());
+    assertEqString(wire2.toRawString(), refSerializeResponse(q, size.toUsize()), "chunk size, response " + n.toString());
+    // byte by byte
+    let p2 = new ResponseParser(defaultLimits(), q.isForHead());
+    let k: usize = 0;
+    let got = "";
+    while (k < wire2.length() && got == "") {
+      match (p2.feed(wire2.slice(k, k + 1))) {
+        Done(p, used) => { got = p.equals(q) ? "equal" : "different"; },
+        NeedMore => { assert(true, ""); },
+        Failed(e) => { got = "refused " + e.message; }
+      };
+      k += 1;
+    }
+    if (got == "") {
+      match (p2.atEof()) {
+        Done(p, used) => { got = p.equals(q) ? "equal" : "different"; },
+        NeedMore => { got = "need more"; },
+        Failed(e) => { got = "refused " + e.message; }
+      };
+    }
+    assertEqString(got, "equal", "round trip of response " + n.toString() + " byte by byte");
+    n += 1;
+  }
+}
+
+@Test
+function everyStandardStatusRoundTrips(): void {
+  let code = 100;
+  while (code <= 599) {
+    const noBody = code < 200 || code == 204 || code == 304;
+    let h = emptyHeaders();
+    if (code >= 200 && code != 204) {
+      h.add("Content-Length", noBody ? "7" : "2").unwrap();
+    }
+    const q = makeResponse(standardStatus(code), Http11, h, noBody ? emptyBytes() : bs("hi"), emptyHeaders(), false).unwrap();
+    const wire = serializeResponse(q);
+    match (parseResponseToEof(wire, defaultLimits(), false)) {
+      Done(p, used) => { assert(p.equals(q), "status " + code.toString()); },
+      NeedMore => { fail("NeedMore " + code.toString()); },
+      Failed(e) => { fail(e.message); }
+    };
+    code += 1;
+  }
+}
+
+// ------------------------------------------------------------------------------------------------- fuzz
+
+@Test
+function requestParserAgreesWithTheSpecificationOnRandomMessages300(): void {
+  let g = new Gen(777);
+  let accepted = 0;
+  let n = 0;
+  while (n < 300) {
+    const q = g.request();
+    const input = serializeRequest(q).toRawString();
+    accepted += g.differential(input) == 1 ? 1 : 0;
+    n += 1;
+  }
+  assertEq(accepted, 300, "every well-formed message is accepted");
+}
+
+@Test
+function fuzzRequestMutations20000(): void {
+  let g = new Gen(424242);
+  let done = 0;
+  let failed = 0;
+  let needMore = 0;
+  let n = 0;
+  while (n < 20000) {
+    const q = g.request();
+    let xs = toInts(serializeRequest(q).toRawString());
+    const rounds = 1 + g.next(4);
+    let i = 0;
+    while (i < rounds) {
+      xs = g.mutate(xs);
+      i += 1;
+    }
+    const r = g.differential(fromInts(xs));
+    if (r == 1) {
+      done += 1;
+    } else if (r == 2) {
+      failed += 1;
+    } else {
+      needMore += 1;
+    }
+    n += 1;
+  }
+  // the three outcomes all occur, so the mutations are neither all harmless nor all fatal
+  assert(done > 500, "some mutants are still valid: " + done.toString());
+  assert(failed > 5000, "many mutants are refused: " + failed.toString());
+  assert(needMore > 50, "some mutants are incomplete: " + needMore.toString());
+}
+
+@Test
+function fuzzRandomGarbageNeverTraps10000(): void {
+  let g = new Gen(99);
+  let n = 0;
+  while (n < 10000) {
+    const len = g.next(120);
+    let xs: int[] = [];
+    let i = 0;
+    while (i < len) {
+      const k = g.next(6);
+      const any = g.next(256);
+      xs.push(k == 0 ? 13 : (k == 1 ? 10 : (k == 2 ? 32 : (k == 3 ? 58 : any))));
+      i += 1;
+    }
+    const wire = bytesFromInts(xs);
+    const a = sig(parseRequest(wire, defaultLimits()));
+    assert(a.length > 0, "an answer");
+    let p = new ResponseParser(defaultLimits(), n % 2 == 0);
+    p.feed(wire);
+    p.atEof();
+    n += 1;
+  }
+}
+
+function kindOf(s: string): string {
+  const parts = s.split(" ");
+  if (parts[0] == "Failed") {
+    return parts[0] + " " + parts[1] + " " + parts[2];
+  }
+  return parts[0];
+}
+
+@Test
+function fuzzResponseMutations10000(): void {
+  let g = new Gen(31337);
+  let done = 0;
+  let n = 0;
+  while (n < 10000) {
+    const q = g.response();
+    let xs = toInts(serializeResponse(q).toRawString());
+    const rounds = 1 + g.next(3);
+    let i = 0;
+    while (i < rounds) {
+      xs = g.mutate(xs);
+      i += 1;
+    }
+    const wire = bytesFromInts(xs);
+    const forHead = q.isForHead();
+    // one-shot and byte-by-byte give the same answer (with EOF at the end)
+    const whole = parseResponseToEof(wire, bigLimits(), forHead);
+    let p = new ResponseParser(bigLimits(), forHead);
+    let k: usize = 0;
+    let res: ParseResult<Response> = NeedMore;
+    let stop = false;
+    while (k < wire.length() && !stop) {
+      res = p.feed(wire.slice(k, k + 1));
+      stop = match (res) {
+        NeedMore => false,
+        _ => true
+      };
+      k += 1;
+    }
+    if (!stop) {
+      res = p.atEof();
+    }
+    assertEqString(kindOf(sigResponse(whole)), kindOf(sigResponse(res)), "one-shot and byte-by-byte agree");
+    match (whole) {
+      Done(m, used) => {
+        done += 1;
+        const wire2 = serializeResponse(m);
+        match (parseResponseToEof(wire2, bigLimits(), forHead)) {
+          Done(m2, u2) => { assert(m2.equals(m), "response parse -> serialize -> parse is stable"); },
+          NeedMore => { fail("stable: need more"); },
+          Failed(e) => { fail("stable: " + e.message); }
+        };
+      },
+      NeedMore => { assert(true, ""); },
+      Failed(e) => { assert(e.position <= wire.length(), "position within the input"); }
+    };
+    n += 1;
+  }
+  assert(done > 300, "some response mutants are still valid: " + done.toString());
+}

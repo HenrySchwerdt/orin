@@ -1,0 +1,37 @@
+// flags: --check-contracts
+import { bytesFromString } from "std:bytes";
+import { Done, NeedMore, Failed, Http11, RequestParser, defaultLimits, emptyHeaders, standardStatus, makeResponse, methodName,
+  reasonName, serializeResponse, versionText } from "std:http";
+
+function main(): void {
+  // an incremental parse: the request arrives in three pieces
+  let p = new RequestParser(defaultLimits());
+  const pieces = ["POST /orders?x=1 HTT", "P/1.1\r\nHost: shop.example\r\nContent-Length: 5\r\n\r\nhel", "lo, next request"];
+  let k: usize = 0;
+  while (k < pieces.length) {
+    match (p.feed(bytesFromString(pieces[k]))) {
+      NeedMore => { console.log("need more after piece " + k.toString() + " (state " + p.stateName() + ")"); },
+      Done(q, used) => {
+        console.log(methodName(q.method()) + " " + q.target() + " " + versionText(q.version()) + " host=" + q.headers().get("host").unwrap());
+        console.log("body=" + q.body().toRawString() + " used " + used.toString() + " of " + pieces[k].length.toString());
+      },
+      Failed(e) => { console.log(e.message); }
+    };
+    k += 1;
+  }
+  // a smuggling attempt is refused with the rule and the byte position
+  let bad = new RequestParser(defaultLimits());
+  match (bad.feed(bytesFromString("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n"))) {
+    Failed(e) => { console.log(reasonName(e.reason) + " at " + e.position.toString()); },
+    NeedMore => { console.log("need more"); },
+    Done(q, used) => { console.log("accepted"); }
+  };
+  // a response and its wire form; the serializer's output is accepted by the parser (the round-trip contract)
+  let h = emptyHeaders();
+  h.add("Content-Type", "text/plain").unwrap();
+  h.add("Content-Length", "2").unwrap();
+  const r = makeResponse(standardStatus(200), Http11, h, bytesFromString("ok"), emptyHeaders(), false).unwrap();
+  console.log(serializeResponse(r).toRawString().split("\r\n").join("|"));
+  // header injection is refused by construction
+  console.log(h.add("X-Evil", "a\r\nSet-Cookie: x=1").isErr().toString());
+}

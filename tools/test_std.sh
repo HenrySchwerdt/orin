@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tests of the provable std modules (ADR-0030 §3): every tests/std/*_test.or is run with `orin test` twice,
 #   1. with runtime contract checking (the default of `orin test`: every @Requires / @Ensures / @Invariant of
-#      std:bytes, std:utf8 and std:collections is a run-time trap),
+#      std:bytes, std:utf8, std:collections and std:http is a run-time trap),
 #   2. with --no-contracts (the logic must be right without the contracts as well).
 # Needs build/bootstrap/orin2 (tools/bootstrap.sh). Usage: tools/test_std.sh [--mutate]
 #   --mutate  also run the mutation check (tools/mutate_std.py): every deliberately broken implementation must fail
@@ -9,6 +9,7 @@ set -eu
 cd "$(dirname "$0")/.."
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 python3 tools/gen_sorted_map.py --check   # SortedMap / SortedStringMap are generated from tools/sorted_map.tmpl
+python3 tools/gen_http_tables.py --check  # the byte class tables of std:http are generated from the RFC character sets
 for t in tests/std/*_test.or; do
   for flag in "" "--no-contracts"; do
     out=$($ORIN2 test "$t" $flag 2>&1) || { echo "$out" | grep -v '^PASS'; echo "[std] FAIL $t $flag"; exit 1; }

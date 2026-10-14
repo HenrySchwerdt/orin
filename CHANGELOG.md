@@ -21,6 +21,13 @@
   `std:utf8` (validated decoding, `Utf8String`, `CodePointCursor`) and `std:collections` (`IntSet`, `StringSet`,
   ring `Deque<T>`, B-tree `SortedMap<V>`/`SortedStringMap<V>`, 4-ary `PriorityQueue<T>`), every class with invariants and every method
   with contracts; `tools/test_std.sh [--mutate]`, `tests/std/`. Registered in `compiler/loader/resolve.or`; docs/std.md.
+- `std:http` (ADR-0030 §3, the pure part; no sockets): HTTP/1.1 `Request`/`Response`/`Headers`/`Status`, an incremental
+  request parser and response parser (`feed(chunk)` answers `NeedMore | Done(message, used) | Failed(HttpError)`; refuses
+  request-smuggling ambiguities: Content-Length with Transfer-Encoding, duplicate Content-Length, obs-fold, bare LF/CR,
+  whitespace before the colon, chunk-size overflow; limits as parameters; explicit state machine) and a serializer with
+  the round-trip contract `parse(serialize(m)) == m`; header injection is impossible by construction. Registered like
+  the layer-1 modules (`compiler/loader/resolve.or`), `tests/std/http_*_test.or`, 41 mutants in `tools/mutate_std.py`,
+  `tests/std/bench/http_bench.or`; docs/std.md.
 - Stronger invariants, part A (ADR-0031 A1-A5), under `--check-contracts` and in the checker:
   - a violated contract prints a power-assert style report: the clause, the function and its argument values, the
     value of every maximal non-literal operand of the clause (ints, bools, floats, quoted and truncated strings,
