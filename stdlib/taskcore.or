@@ -131,3 +131,96 @@ export class Ledger {
     this.closed = true;
   }
 }
+
+// The chunk ranges of a fork/join pool (std:task `forkJoin`, ADR-0039): worker w owns the chunks lo[w] .. hi[w] - 1 and takes
+// them from the front; a worker whose range is empty steals the back half of the largest range of another worker. Chunks at
+// or after `cut` are cancelled (`forkJoinUntil`: everything to the right of the leftmost hit found so far). Pure: the pool
+// keeps the words in its monitor and loads, changes and stores them inside one critical section.
+@Invariant(this.lo.length == this.hi.length && this.lo.length >= 1)
+@Invariant(this.cut <= this.chunks)
+@Invariant(rangesOk(this.lo, this.hi, this.chunks))
+export class Ranges {
+  lo: usize[];
+  hi: usize[];
+  cut: usize;
+  chunks: usize;
+
+  @Requires(lo.length == hi.length && lo.length >= 1 && cut <= chunks && rangesOk(lo, hi, chunks))
+  constructor(lo: usize[], hi: usize[], cut: usize, chunks: usize) {
+    this.lo = lo;
+    this.hi = hi;
+    this.cut = cut;
+    this.chunks = chunks;
+  }
+
+  // claim(w): the next chunk for worker w: its own next one, else one stolen from the back of the largest other range
+  // (counting only chunks before the cut). None when no chunk before the cut is left to anybody.
+  @Requires(w < this.lo.length)
+  @Ensures(result.isSome() ==> result.unwrap() < this.cut && result.unwrap() < this.chunks)
+  @Ensures(result.isSome() ==> this.lo[w] == result.unwrap() + 1)
+  @Ensures(this.cut == old(this.cut))
+  claim(w: usize): Option<usize> {
+    if (this.lo[w] >= this.hi[w] || this.lo[w] >= this.cut) {
+      const n = this.lo.length;
+      let best = n;
+      let most: usize = 0;
+      let v: usize = 0;
+      while (v < n) {
+        const top = this.hi[v] < this.cut ? this.hi[v] : this.cut;
+        if (v != w && top > this.lo[v] && top - this.lo[v] > most) {
+          best = v;
+          most = top - this.lo[v];
+        }
+        v += 1;
+      }
+      if (best == n) {
+        return None;
+      }
+      // the victim keeps the front half, the thief takes the back half (all of it when one chunk is left)
+      const mid = this.lo[best] + most / 2;
+      this.lo[w] = mid;
+      this.hi[w] = this.hi[best];
+      this.hi[best] = mid;
+    }
+    const k = this.lo[w];
+    this.lo[w] = k + 1;
+    return Some(k);
+  }
+
+  // cancelAfter(k): chunk k produced a hit, so no chunk after it needs to run.
+  @Ensures(this.cut <= old(this.cut) && this.cut <= k + 1)
+  cancelAfter(k: usize): void {
+    if (k + 1 < this.cut) {
+      this.cut = k + 1;
+    }
+  }
+
+  // cancelAll(): a worker failed; nothing more needs to run.
+  @Ensures(this.cut == 0)
+  cancelAll(): void {
+    this.cut = 0;
+  }
+}
+
+// Every range is inside 0 .. chunks and no chunk belongs to two ranges (so no chunk can run twice).
+export function rangesOk(lo: usize[], hi: usize[], chunks: usize): bool {
+  if (lo.length != hi.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < lo.length) {
+    if (lo[i] > hi[i] || hi[i] > chunks) {
+      return false;
+    }
+    let j: usize = i + 1;
+    while (j < lo.length) {
+      const overlap = lo[i] < hi[i] && lo[j] < hi[j] && lo[i] < hi[j] && lo[j] < hi[i];
+      if (overlap) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}

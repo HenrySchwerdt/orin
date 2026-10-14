@@ -1,0 +1,316 @@
+// Parallel array pipelines (ADR-0039): `parallel()` on an array `xs` and the operations of the view it returns.
+//
+// This file is part of the `$array` prelude root but is only LOADED for a unit whose source mentions `.parallel`
+// (compiler/loader/loader.or adds the import), so other programs neither check nor compile it. The checker rewrites
+// `parallel()` on an array `xs` to `parallel(xs)` and `p.map(f)` on a `Parallel<T>` to `parMap(p, f)` and so on (check/expr.or); the
+// restrictions of ADR-0039 §3-4 are checked on the calls (check/parallel.or): every closure is a pure closure literal (or
+// a named function), a reducer is a built-in associative operator, and the input element type is a scalar or a flat record
+// of scalars. The optimiser fuses a chain into one loop per chunk (compiler/fuse) and calls the `run*` functions below with
+// the fused body; without it every operation below runs on its own, with the same result.
+//
+// SEMANTICS (the same result as the sequential chain on the same array):
+// * `parallel()` on an array `xs` splits `xs` into chunks of CHUNK consecutive elements (the last one may be shorter). Every operation
+//   keeps this grouping: `map` maps each chunk, `filter` filters each chunk (a chunk may become empty), the elements stay
+//   in order.
+// * `reduce(f, init)` folds every chunk from left to right, then folds `init` with the chunk results from left to right
+//   (empty chunks are skipped). For an associative `f` this is the sequential result; the grouping is fixed, so even a
+//   float `reduce` gives the same bits on every machine and with every number of threads (but possibly not the bits of
+//   the sequential `reduce`: warning W0480).
+// * `some`, `every`, `find`, `findIndex` give what the sequential chain gives: chunks after the first hit are cancelled,
+//   chunks before it always run.
+// * `toArray()` is the array of the elements.
+// * Inputs below SEQUENTIAL_BELOW elements, and every input when only one thread is available (ORIN_THREADS=1), run on the
+//   calling task, chunk by chunk, so the result is the same either way.
+// * A trap in a closure traps the program with the closure's message, as in the sequential chain; which element traps
+//   first is not defined when several would.
+//
+// MEMORY (ADR-0039 §4). The input array is LENT to the worker tasks: it is pinned (its counts frozen) while they run and
+// shared, not copied (runtime/orin_runtime.c "lending"). Results are built by the workers and moved back. Captured
+// values of the closures are copied to every worker like any task body.
+
+import { forkJoin, forkJoinUntil, parallelism } from "std:task";
+import { transitPut, transitDrop } from "std:fsraw";
+
+const CHUNK: usize = 4096;
+const SEQUENTIAL_BELOW: usize = 8192;
+
+// A parallel view: the elements and, for each chunk, the index in `xs` where it ends. Built by `parallel(xs)` and by the
+// operations; not meant to be built by hand.
+export type Parallel<T> = { xs: T[]; ends: usize[]; };
+
+// What a chunk contributes to `findIndex`: how many elements it has and where in it the first match is.
+export type ChunkIndex = { count: usize; at: Option<usize>; };
+
+// The record a lend is made from (two slots: see runtime/orin_runtime.c "lending").
+type Lent<A> = { v: A; spare: usize; };
+
+// ------------------------------------------------------------------------------------------------ chunks
+
+// The number of chunks of an array of n elements.
+@Ensures(result * CHUNK >= n && (result == 0 || (result - 1) * CHUNK < n))
+export function chunkCount(n: usize): usize {
+  return (n + CHUNK - 1) / CHUNK;
+}
+
+// First index of chunk k of an array of n elements, and one past its last.
+export function chunkStart(k: usize): usize {
+  return k * CHUNK;
+}
+
+@Ensures(result <= n)
+export function chunkEnd(k: usize, n: usize): usize {
+  const e = (k + 1) * CHUNK;
+  return e < n ? e : n;
+}
+
+// How many worker tasks a pipeline over n elements in `chunks` chunks uses: 1 (the calling task) below the threshold.
+@Ensures(result >= 1)
+export function workersFor(n: usize, chunks: usize): usize {
+  if (n < SEQUENTIAL_BELOW || chunks <= 1) {
+    return 1;
+  }
+  const t = parallelism();
+  return t < chunks ? t : chunks;
+}
+
+// Lends `v` to the worker tasks when there are any (0: nothing lent).
+function lendIf<A>(workers: usize, v: A): usize {
+  if (workers <= 1) {
+    return 0;
+  }
+  return transitPut(Lent<A> { v: v, spare: 0 });
+}
+
+function endLend(tok: usize): void {
+  if (tok != 0) {
+    transitDrop(tok);
+  }
+}
+
+function startOf(ends: usize[], k: usize): usize {
+  return k == 0 ? 0 : ends[k - 1];
+}
+
+// ------------------------------------------------------------------------------------------------ the operations
+
+// parallel() on an array xs
+@Ensures(result.xs.length == xs.length)
+export function parallel<T>(xs: T[]): Parallel<T> {
+  const n = xs.length;
+  let ends: usize[] = [];
+  let k: usize = 0;
+  while (k < chunkCount(n)) {
+    ends.push(chunkEnd(k, n));
+    k += 1;
+  }
+  return Parallel<T> { xs: xs, ends: ends };
+}
+
+// The chunk results of map / filter, concatenated in order, with the chunk boundaries kept.
+export function runCollect<U>(chunks: usize, workers: usize, body: (k: usize) => U[]): Parallel<U> {
+  const parts = forkJoin(chunks, workers, body);
+  let xs: U[] = [];
+  let ends: usize[] = [];
+  for (const p of parts) {
+    for (const x of p) {
+      xs.push(x);
+    }
+    ends.push(xs.length);
+  }
+  return Parallel<U> { xs: xs, ends: ends };
+}
+
+// `init` folded with the chunk results in order.
+export function runReduce<U>(
+  chunks: usize,
+  workers: usize,
+  body: (k: usize) => Option<U>,
+  f: (acc: U, x: U) => U,
+  init: U,
+): U {
+  const parts = forkJoin(chunks, workers, body);
+  let acc = init;
+  for (const o of parts) {
+    match (o) {
+      Some(v) => {
+        acc = f(acc, v);
+      },
+      None => {},
+    }
+  }
+  return acc;
+}
+
+// Is any chunk a hit? (`some`; `every` asks whether any chunk has a counterexample.)
+export function runAny(chunks: usize, workers: usize, body: (k: usize) => bool): bool {
+  const rs = forkJoinUntil(chunks, workers, body, (h: bool) => h);
+  return rs.length > 0 && rs[rs.length - 1];
+}
+
+// The first hit of the first chunk that has one.
+export function runFind<U>(chunks: usize, workers: usize, body: (k: usize) => Option<U>): Option<U> {
+  const rs = forkJoinUntil(chunks, workers, body, (o: Option<U>) => o.isSome());
+  if (rs.length == 0) {
+    return None;
+  }
+  return rs[rs.length - 1];
+}
+
+// The index of the first match: the sizes of the chunks before the first chunk with a match, plus its place in that chunk.
+export function runFindIndex(chunks: usize, workers: usize, body: (k: usize) => ChunkIndex): Option<usize> {
+  const rs = forkJoinUntil(chunks, workers, body, (c: ChunkIndex) => c.at.isSome());
+  let base: usize = 0;
+  for (const c of rs) {
+    match (c.at) {
+      Some(j) => {
+        return Some(base + j);
+      },
+      None => {
+        base += c.count;
+      },
+    }
+  }
+  return None;
+}
+
+function mapRange<T, U>(xs: T[], lo: usize, hi: usize, f: (x: T) => U): U[] {
+  let out: U[] = [];
+  let i = lo;
+  while (i < hi) {
+    out.push(f(xs[i]));
+    i += 1;
+  }
+  return out;
+}
+
+function filterRange<T>(xs: T[], lo: usize, hi: usize, pred: (x: T) => bool): T[] {
+  let out: T[] = [];
+  let i = lo;
+  while (i < hi) {
+    if (pred(xs[i])) {
+      out.push(xs[i]);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function foldRange<T>(xs: T[], lo: usize, hi: usize, f: (acc: T, x: T) => T): Option<T> {
+  if (lo >= hi) {
+    return None;
+  }
+  let acc = xs[lo];
+  let i = lo + 1;
+  while (i < hi) {
+    acc = f(acc, xs[i]);
+    i += 1;
+  }
+  return Some(acc);
+}
+
+function findRange<T>(xs: T[], lo: usize, hi: usize, pred: (x: T) => bool): Option<T> {
+  let i = lo;
+  while (i < hi) {
+    if (pred(xs[i])) {
+      return Some(xs[i]);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function indexRange<T>(xs: T[], lo: usize, hi: usize, pred: (x: T) => bool): ChunkIndex {
+  let i = lo;
+  while (i < hi) {
+    if (pred(xs[i])) {
+      return ChunkIndex { count: hi - lo, at: Some(i - lo) };
+    }
+    i += 1;
+  }
+  return ChunkIndex { count: hi - lo, at: None };
+}
+
+// p.map(f)
+@Ensures(result.xs.length == p.xs.length)
+export function parMap<T, U>(p: Parallel<T>, f: (x: T) => U): Parallel<U> {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runCollect(ends.length, w, k => mapRange(xs, startOf(ends, k), ends[k], f));
+  endLend(tok);
+  return r;
+}
+
+// p.filter(pred)
+@Ensures(result.xs.length <= p.xs.length)
+export function parFilter<T>(p: Parallel<T>, pred: (x: T) => bool): Parallel<T> {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runCollect(ends.length, w, k => filterRange(xs, startOf(ends, k), ends[k], pred));
+  endLend(tok);
+  return r;
+}
+
+// p.reduce(f, init): `f` must be associative (E0485 otherwise).
+export function parReduce<T>(p: Parallel<T>, f: (acc: T, x: T) => T, init: T): T {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runReduce(ends.length, w, k => foldRange(xs, startOf(ends, k), ends[k], f), f, init);
+  endLend(tok);
+  return r;
+}
+
+// p.some(pred)
+export function parSome<T>(p: Parallel<T>, pred: (x: T) => bool): bool {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runAny(ends.length, w, k => findRange(xs, startOf(ends, k), ends[k], pred).isSome());
+  endLend(tok);
+  return r;
+}
+
+// p.every(pred)
+export function parEvery<T>(p: Parallel<T>, pred: (x: T) => bool): bool {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runAny(ends.length, w, k => findRange(xs, startOf(ends, k), ends[k], x => !pred(x)).isSome());
+  endLend(tok);
+  return !r;
+}
+
+// p.find(pred)
+export function parFind<T>(p: Parallel<T>, pred: (x: T) => bool): Option<T> {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runFind(ends.length, w, k => findRange(xs, startOf(ends, k), ends[k], pred));
+  endLend(tok);
+  return r;
+}
+
+// p.findIndex(pred): the index in `p.toArray()`.
+export function parFindIndex<T>(p: Parallel<T>, pred: (x: T) => bool): Option<usize> {
+  const xs = p.xs;
+  const ends = p.ends;
+  const w = workersFor(xs.length, ends.length);
+  const tok = lendIf(w, xs);
+  const r = runFindIndex(ends.length, w, k => indexRange(xs, startOf(ends, k), ends[k], pred));
+  endLend(tok);
+  return r;
+}
+
+// p.toArray()
+@Ensures(result.length == p.xs.length)
+export function parToArray<T>(p: Parallel<T>): T[] {
+  return p.xs;
+}

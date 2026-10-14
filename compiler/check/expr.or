@@ -22,7 +22,7 @@ import {
   BinOp, grantTypeName, kindType,
 } from "../hir";
 import {
-  ClassInfo, MethodInfo, ValEnt, Inst, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
+  ClassInfo, MethodInfo, ValEnt, Inst, mapOrigin, parOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
   EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isBool, isString, isVoid, isIntish, isFloatTy,
   isArrayTy, isIface, isSignedInt, isFn, showType, mismatch, globalVal, findType, findVal, originOf,
   boundOf, ifaceMethodIndex, typeInRange, isWellFormedEnv,
@@ -46,7 +46,7 @@ import {
   paramNameList, selfTypeExpr, tailTypes, noPre, intLiteral, bigIntLiteral, negIntLiteral,
   negBigLiteral, interpolated, negOperandErr, logicOperandErr, impliesOperandErr, binaryType,
   extendPath, purePlace, noField, unresolvedName, condHoistErr, thisErr, capturedErr, mapKeyErr,
-  testGuard, isArrayApi, elemSuffix, mapReadFn, isOptionTy, isResultTy, isRecordTy, isUnionTy,
+  testGuard, isArrayApi, isParScalar, parFnName, elemSuffix, mapReadFn, isOptionTy, isResultTy, isRecordTy, isUnionTy,
 } from "./ops";
 import { liftClosure, wrapperOf } from "./lift";
 import { Inference, grantMissingErr, grantMismatchErr } from "./call";
@@ -2128,6 +2128,10 @@ export class ExprChecker {
       const b0 = bo.unwrap();
       match (b0.ty) {
         TyRecord(r) => {
+          const po = parOrigin(this.fx.env, b0.ty);
+          if (po.isSome()) {
+            return this.parMethodCall(b0, span, name, args, exp);
+          }
           const mo = mapOrigin(this.fx.env, b0.ty);
           if (mo.isSome()) {
             return this.mapMethodCall(b0, span, base, name, args, exp, mo.unwrap());
@@ -2148,6 +2152,9 @@ export class ExprChecker {
           }
         },
         TyArray(t) => {
+          if (n == "parallel") {
+            return this.parallelCall(b0, span, t, name, args, exp);
+          }
           if (isArrayApi(n)) {
             return this.arrayApiCall(b0, span, t, name, args, exp);
           }
@@ -3022,6 +3029,90 @@ export class ExprChecker {
       noPre(args.length),
       exp,
       argTy,
+    );
+  }
+
+  // The array method `parallel()` (ADR-0039): a call of `parallel` of the parallel prelude (array/parallel.or, loaded for every
+  // file that calls it). The input is lent to worker tasks without a copy, which needs element types without counted
+  // references inside the elements: scalars and records of scalars (E0486) until borrow inference exists (ADR-0039 §4).
+  private parallelCall(
+    b: HExpr,
+    span: Span,
+    elem: Type,
+    name: Ident,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
+    const noMethod = diag(
+      "E0405",
+      name.span,
+      "no method `parallel` on type `" + showType(this.fx.env, TyArray(elem)) + "`",
+    );
+    if (this.fx.env.parUnit < 0) {
+      return Err(noMethod);
+    }
+    if (!this.parallelElem(elem)) {
+      return Err(
+        diag(
+          "E0486",
+          name.span,
+          "`parallel()` needs an array of scalars or of records whose fields are scalars, not `"
+              + showType(this.fx.env, TyArray(elem))
+              + "`: the worker tasks read the input without copying it, and until borrow inference exists (ADR-0039 §4) that is only sound for elements that hold no counted references (map to scalars first, or drop `parallel()`)",
+        ),
+      );
+    }
+    return this.preludeCall(
+      b, span, this.fx.env.parUnit.toUsize(), "parallel", "parallel", noMethod, args, noPre(args.length), exp, None,
+    );
+  }
+
+  // A scalar (integer, float, bool) or a record whose fields are all scalars.
+  private parallelElem(t: Type): bool {
+    if (isParScalar(t)) {
+      return true;
+    }
+    match (t) {
+      TyRecord(r) => {
+        if (classOfRec(this.fx.env, r).isSome() || mapOrigin(this.fx.env, t).isSome()) {
+          return false;
+        }
+        for (const f of this.fx.env.records[r].fields) {
+          if (!isParScalar(f.ty)) {
+            return false;
+          }
+        }
+        return true;
+      },
+      _ => {
+        return false;
+      },
+    }
+  }
+
+  // A method of the view `Parallel<T>` (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex` and
+  // `toArray`, calls of `parMap`, `parFilter`, ... of the parallel prelude with the view as first argument. The rules
+  // on the closures (pure literals, associative reducers) are checked on the whole program (parallel.or).
+  private parMethodCall(
+    b: HExpr,
+    span: Span,
+    name: Ident,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
+    const n = name.name;
+    const noMethod = diag(
+      "E0405",
+      name.span,
+      "no method `" + n + "` on type `" + showType(this.fx.env, b.ty)
+          + "` (a parallel view has map, filter, reduce, some, every, find, findIndex and toArray)",
+    );
+    const fname = parFnName(n);
+    if (fname == "") {
+      return Err(noMethod);
+    }
+    return this.preludeCall(
+      b, span, this.fx.env.parUnit.toUsize(), fname, n, noMethod, args, noPre(args.length), exp, None,
     );
   }
 

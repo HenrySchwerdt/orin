@@ -496,6 +496,7 @@ static void test_threads_and_monitors(void) {
     /* thread ids: stable per thread, distinct between threads */
     uint64_t me = orin_platform_thread_id();
     CHECK(me >= 1 && orin_platform_thread_id() == me);
+    CHECK(orin_platform_cpu_count() >= 1 && orin_platform_cpu_count() == orin_platform_cpu_count());
     void *arg = NULL;
     int64_t a = orin_platform_thread_create(th_ids, (void *)0), b = orin_platform_thread_create(th_ids, (void *)1);
     CHECK(a > 0 && b > 0 && a != b);

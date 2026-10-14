@@ -26,7 +26,7 @@ import { writeFile } from "std:fs";
 import { SourceMap, Diagnostic, render, describeSpan } from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
-import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts } from "./check";
+import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts, parallelWarnings } from "./check";
 import { runTestCommand, hasTests, eraseTests } from "./testing";
 import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
@@ -38,12 +38,14 @@ import { emitLlvm } from "./llvm";
 import { MProgram, printProgram, hasSpan } from "./mir";
 import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
+import { fuseProgram, FuseOut, ChainInfo } from "./fuse";
+import { Program } from "./hir";
 import { runFmt, printDiagnosticsJson } from "./tools";
 import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
+  console.error("usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
   exit(2);
 }
 
@@ -116,6 +118,21 @@ function runVerify(prog: MProgram, sm: SourceMap, verbose: bool): usize {
 // (`orin test`, `orin mcp` and `orin verify --contracts` run the C compiler and the solver; every command reads its
 // arguments) and stdio (`orin lsp`, `orin mcp`); it does not use the clock. The grants come from the host policy
 // (ORIN_DENY, ADR-0027).
+// The fusion pass (compiler/fuse); with `--fuse-report` every array pipeline it found is listed on stderr: where, its stages,
+// and whether it became one loop (or why not).
+function fused(p: Program, sm: SourceMap, report: bool): Program {
+  const out = fuseProgram(p);
+  if (report) {
+    for (const c of out.chains) {
+      const how = c.fused
+          ? `fused into one loop${c.parallel ? " per chunk" : ""}${c.earlyExit ? ", early exit" : ""}${c.exactCap ? ", exact capacity" : ""}`
+          : `not fused: ${c.reason}`;
+      console.error(`${describeSpan(sm, c.span)}: ${c.parallel ? "parallel " : ""}${c.stages.join(" -> ")}: ${how}`);
+    }
+  }
+  return out.program;
+}
+
 function main(host: Host): void {
   useHost(host, (fs, proc, stdio, clock) => { driver(fs, proc, stdio); });
 }
@@ -156,6 +173,8 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
   let json = false;
   let noVerify = false;
   let noOpt = false;
+  let noFuse = false;
+  let fuseReport = false;
   let llvm = false;
   let cBuiltins = false;
   let checkContracts = false;
@@ -201,6 +220,10 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
       noVerify = true;
     } else if (a == "--no-opt") {
       noOpt = true;
+    } else if (a == "--no-fuse") {
+      noFuse = true;
+    } else if (a == "--fuse-report") {
+      fuseReport = true;
     } else if (a == "--backend=llvm") {
       llvm = true;
     } else if (a == "--backend=c") {
@@ -280,6 +303,15 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   policyCheck(program, loaded.sm, json);
+  // Warnings that need the typed program: the parallel reductions of ADR-0039 (W0480, W0481).
+  const pw = parallelWarnings(checked.unwrap().functions);
+  if (pw.length > 0 && json && !verifyContractsFlag) {
+    printDiagnosticsJson(loaded.sm, pw);
+  } else if (pw.length > 0 && !json) {
+    for (const d of pw) {
+      console.error(render(loaded.sm, d));
+    }
+  }
   if (!withTests) {
     printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
   }
@@ -292,7 +324,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   if (cmd == "mir") {
-    console.log(printProgram(noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()))));
+    console.log(printProgram(noOpt ? lower(checked.unwrap()) : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)))));
     return;
   }
   if (cmd == "verify" && verifyContractsFlag) {
@@ -304,13 +336,13 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   if (cmd == "verify") {
-    if (runVerify(noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap())), loaded.sm, true) > 0) {
+    if (runVerify(noOpt ? lower(checked.unwrap()) : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport))), loaded.sm, true) > 0) {
       exit(1);
     }
     return;
   }
   let c = "";
-  const mir = noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()));
+  const mir = noOpt ? lower(checked.unwrap()) : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)));
   if (!noVerify && runVerify(mir, loaded.sm, false) > 0) {
     console.error("error: internal compiler error: MIR ownership verification failed");
     exit(70);
