@@ -56,4 +56,17 @@ for h in harness_mem_find:24 harness_fmt_u64:8 harness_fmt_i64:8 harness_fmt_ext
     echo "FAILED"; tail -30 "$B/$fn.log"; exit 1
   fi
 done
+# network primitives (ADR-0033): recv / send buffer bounds, narrowing never widens, refusal before any system call.
+# The harness file includes platform/orin_platform.c itself (static scope functions) and stubs the system calls.
+for h in harness_net_recv:4 harness_net_send:4 harness_net_narrow:6 harness_net_refuse:6; do
+  fn=${h%%:*}; un=${h##*:}
+  printf '%s ... ' "$fn"
+  if cbmc platform/tests/cbmc_net_harness.c --function "$fn" \
+       --bounds-check --pointer-check --signed-overflow-check --unsigned-overflow-check \
+       --conversion-check --unwind "$un" --unwinding-assertions >"$B/$fn.log" 2>&1; then
+    echo "VERIFIED (bounded)"
+  else
+    echo "FAILED"; tail -30 "$B/$fn.log"; exit 1
+  fi
+done
 echo "[platform] ok"

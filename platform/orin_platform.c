@@ -547,7 +547,7 @@ static int net_wait(int fd, short ev, int ms) {
 
 static int net_err(int e) {
     return e == EAGAIN || e == EINTR ? ORIN_PLATFORM_NET_TIMEOUT
-           : e == ECONNRESET || e == EPIPE || e == ECONNABORTED || e == ETIMEDOUT ? ORIN_PLATFORM_NET_RESET : e;
+           : e == ECONNRESET || e == EPIPE || e == ECONNABORTED || e == ETIMEDOUT ? ORIN_PLATFORM_NET_RESET : e ? e : EIO; /* never 0: a failure stays a failure */
 }
 
 /* getaddrinfo for (host, port); 0, ENOENT (no such name) or EINVAL. */
