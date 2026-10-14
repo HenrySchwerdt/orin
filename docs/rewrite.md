@@ -483,7 +483,7 @@ unchanged; the exported surface (`lex`, `parse`, `scanComments`, the AST and tok
 
 | Old | New |
 |---|---|
-| `lex(file, src)`: one loop with a template brace-depth stack, `lexIdent` / `lexNumber` / `lexFloat` / `lexString` / `lexPunct` return `LexRes { tok, end }` | class `Lexer` (lexer.or): `src`, cursor `pos`, `toks`, `depth`, `done`; `step()` lexes one token, `run()` the stream; the per-kind lexers are private methods that `emit` |
+| `lex(file, src)`: one loop with a template brace-depth stack, `lexIdent` / `lexNumber` / `lexFloat` / `lexString` / `lexPunct` return `LexRes { tok, end }` | class `Lexer` (lexer.or): `src`, cursor `pos`, `toks`, `depth`, `done`, first error `err`; `step()` lexes one token, `run()` the stream; the per-kind lexers are private methods that `emit` or `fail` |
 | every parse function takes `(toks, pos)` and returns `{ node, pos }` (`IdentRes`, `TypeRes`, `ExprRes`, ... 18 types) | class `Parser` (parser.or): `toks`, cursor `pos`, `ops`; methods return the node and move the cursor |
 | `parseBin(toks, pos, level)`: one recursion level per precedence level (7 nested calls per operand), `binLevel` / `levelOfText` / `binOpOf` string chains | precedence climbing `parseBin(min)` over class `OpTable` (precedence.or): rows `{ text, level, op, rightAssoc }`, a `Map` index |
 | `arrowStart` / `tryTypeArgs` re-parse from a position and drop the result | `arrowStart` probes on a copy of the parser (classes are values), `tryTypeArgs` restores the cursor on `None` |
@@ -495,19 +495,19 @@ clauses are `@Requires` / `@Ensures` / `@Invariant` annotation lines, `grep -c '
 
 | file | role | lines | requires | ensures | invariant |
 |---|---|---|---|---|---|
-| `lexer.or` (was 528 lines, 1 clause) | class `Lexer`, `lex`, `tokensWellFormed` | 721 | 6 | 16 | 4 |
+| `lexer.or` (was 528 lines, 1 clause) | class `Lexer`, `lex`, `skipTrivia`, `tokensWellFormed` | 775 | 8 | 17 | 6 |
 | `parser.or` (was 1,906, 0) | class `Parser` (76 methods), `parse`, `isSyntaxCode` | 2,033 | 15 | 68 | 2 |
 | `precedence.or` (new) | operator table, class `OpTable` | 111 | 1 | 5 | 2 |
 | `rules.or` (new) | placement of clauses and annotations | 181 | 0 | 4 | 0 |
 | `wellformed.or` (new) | span predicates over every node kind | 470 | 0 | 0 | 0 |
 | `trivia.or` (was 148, 0) | `scanComments`, `commentsWellFormed` | 176 | 0 | 1 | 0 |
 | `ast.or`, `module.or` | unchanged / exports | 214, 24 | 0 | 0 | 0 |
-| total, before -> after | | 2,807 -> 3,930 | 1 -> 124 clauses (22 requires, 94 ensures, 8 invariants) | | |
+| total, before -> after | | 2,807 -> 3,984 | 1 -> 129 clauses (24 requires, 95 ensures, 10 invariants) | | |
 
-Unit tests: `compiler/tests/syntax_test.or` (14 `@Test`, 567 lines), run by `tools/test_tooling.sh`.
+Unit tests: `compiler/tests/syntax_test.or` (14 `@Test`, 575 lines), run by `tools/test_tooling.sh`.
 
 Classes (3 new): `Lexer` (the cursor stays in the source, the last token ends at or before the cursor, template depths are
-non-negative, a finished lexer is at the end), `Parser` (the token stream ends with KEof, the cursor is always on a token, so
+non-negative, a finished lexer is at the end or holds its first error, which is E0100 with a span inside the source), `Parser` (the token stream ends with KEof, the cursor is always on a token, so
 it never passes the final KEof), `OpTable` (the rows form a precedence table: levels 0..`MAX_LEVEL`, loosest first, no gap,
 one associativity per level; the spelling index is as large as the table, so no operator shadows another).
 
@@ -540,7 +540,7 @@ Contracts, with the bug each would catch:
 * **comments**: `scanComments` ensures `commentsWellFormed` (ordered, non-empty, each holds exactly its source text): the
   formatter re-emits these texts, so an overlap would print a comment twice.
 
-None fired on the compiler's own sources, on the conformance suites, on the unit tests, or on 3,191 parse inputs including
+None fired on the compiler's own sources, on the conformance suites, on the unit tests, or on 3,207 parse inputs including
 1,500 garbage files (below). To see that they can: 13 hand-made mutants (binary span = right operand, left-associative
 operators grouped to the right, block span = `{`, `lastSpan` off by one, parentheses not widened, `?` skipping a token,
 type-argument backtracking not undone, token span one byte short, newline not skipped, a duplicate operator row, `<` moved to
@@ -549,7 +549,7 @@ the level of `+`, the order check removed from `nestedIn`, a line comment keepin
 
 Error recovery: there is none. The parser stops at the first error (the language reports one syntax error per file;
 `errors` and `next/errors` pin those diagnostics), so "recovery always advances" reduces to the progress property above, and
-"diagnostics as a field" would only duplicate the `Err` that `?` propagates; the diagnostic stays the `Err` of the method.
+in the parser "diagnostics as a field" would only duplicate the `Err` that `?` propagates, so it stays the `Err` of the method (the lexer keeps its first error in a field for speed, below).
 `parseTerminatesOnGarbage` runs 400 random token soups and every prefix of a 400-byte program through `parse` and checks that
 each returns with a well-formed module or a parse error inside the source. A recovering parser (several syntax errors per
 file) is a language-visible change: **NEEDS_DECISION**, not done here.
@@ -562,31 +562,50 @@ are consumed in the same order.
 Behaviour preservation (against the baseline compiler built before the step):
 
 * **AST differential**: `compiler/tests/parse_main.or` (the canonical AST dump with spans, or the rendered first error)
-  built from the old and the new tree, run over every `.or` file of the repository (1,691) and 1,500 garbage files (random
-  token soups, truncations, deletions and duplications of real files): 3,191 inputs, **0 differences** (1,906 of them are
+  built from the old and the new tree, run over every `.or` file of the repository (1,707, after merging origin/main) and 1,500 garbage files (random
+  token soups, truncations, deletions and duplications of real files): 3,207 inputs, **0 differences** (1,908 of them are
   parse errors: code, message and span identical). The same inputs through a contract-checked `parse_main`: no contract fired.
-* `tools/diff_compilers.py`: RESULT_DIFF;
-* generated code: RESULT_GEN;
-* `tools/bootstrap.sh`: RESULT_BOOT;
-* `tools/test_compiler_contracts.sh`: RESULT_CONTRACTS;
-* `python3 tools/test_fmt.py`: RESULT_FMT; `tools/test_tooling.sh`: RESULT_TOOLING;
-* `orin check --strict-contracts compiler/main.or`: RESULT_STRICT
+* `tools/diff_compilers.py`: 1,406 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
+* generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`, `examples/` program and of `compiler/main.or` (390 inputs x 3) **byte-identical**;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,666,960 bytes, after merging origin/main with Capabilities Stage B), conformance 141/141; all suites with `orin2`: 806 / 806;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806 / 806 conformance tests, `test_verify_contracts` 809 checks, **no contract fired**;
+* `python3 tools/test_fmt.py`: 1,651 passed; `tools/test_tooling.sh`: all unit test files pass (`syntax_test` 14 / 14); `tools/test_effects.py` 85 checks and `tools/test_osig.py` 95 checks pass;
+* `orin check --strict-contracts compiler/main.or`: **0 warnings**. The base had 13 W0471 (public mutating methods without `@Ensures`) in `compiler/vc/gen.or` (`Gen.next`, `declare`, `assert`, `lemma`, `setExact`, `taint`, `noteApprox`, `noteStr`, `useAssumption`, `newLoop`, `loopAdd`, `addObl`) and `vc/vt.or` (`Tab.setCyclic`); they now state their effect (the counter grows by one so no SMT symbol is handed out twice, a push grows its list by one, a set-like add contains the element and grows by at most one, `noteApprox` keeps the first reason, `newLoop` / `addObl` return the new index). `test_verify_contracts.py` with the contract-checked compiler: 809 checks, 0 failed.
 
 Performance. Wall time on the shared machine (load average 11-13 on 4 cores during the step) was too noisy to resolve a few
 percent, so the comparison is also made in instructions (`valgrind --tool=callgrind`, deterministic), both compilers built
 by the same baseline compiler:
 
-RESULT_TIMING
+| | base compiler | new compiler | change |
+|---|---|---|---|
+| instructions, `orin compile compiler/main.or` | 38,753 M | 38,558 M | -0.5 % |
+| instructions, `orin check compiler/main.or` (front end) | 2,718 M | 2,521 M | -7.3 % |
+| instructions, lex + parse of every `compiler/**/*.or` file once (benchmark driver) | 1,623 M | 1,365 M | -15.9 % |
+| instructions, lex only, same files | 721 M | 668 M | -7.3 % (it was +14 % with Result-returning lexer methods, below) |
+| peak RSS, self-compile | 157.8 MiB | 157.8 MiB | 0 |
+| wall, self-compile, 9 interleaved runs at load ~1 (median / min) | 7.38 s / 7.06 s | 7.33 s / 6.74 s | -0.7 % / -4.6 % |
+
+Final numbers: both compilers on the merged tree, the new one built by the bootstrap. Earlier, under load 11-13, wall
+times moved by 10-15 % between runs of the same binary (`check`: 1.22 s vs 1.32 s in one session,
+0.65 s vs 0.75 s median but 0.618 vs 0.626 min in another), so the instruction counts are the measurement. The parser is
+cheaper (precedence climbing makes one call per operand instead of seven, and the `{ node, pos }` records are gone), and so is the
+lexer since its methods return nothing (below). No slowdown.
 
 Design notes and friction:
 
 * **A mutating method that returns a value returns a pair.** Every `Parser` method that moves the cursor and returns a node
   allocates the `(self, result)` pair; the old code allocated the `{ node, pos }` record instead, so the count is the same.
-  But `Ok(true)` of a `Result<bool, _>` boxes the bool while `Ok()` of `Result<void, _>` is a shared nullary: the first
-  `Lexer.step(): Result<bool, _>` cost one allocation per token more than the old loop (+14 % instructions in lexing), so
-  `step` returns `Result<void, _>` and the end is a `done` field (`finished()`).
+  In the lexer that pair is per token and on top of the old costs: with `step(): Result<bool, _>` and Result-returning
+  per-kind methods lexing took +14 % instructions against the base (`Ok(true)` also boxes the bool; `Ok()` of
+  `Result<void, _>` is a shared nullary). A mutating method that returns `void` returns only `self`, so the lexer's methods
+  return nothing: the end is the `done` field, the first error the `err` field (`fail(d)`; `finished()`, `error()`), and
+  `run` turns it into the `Err`. Lexing is now -7 % against the base. This is "diagnostics as a field" where it pays; the
+  parser keeps `Result` (its methods return nodes anyway, so the pair is there either way, and `?` is the clearer form).
 * **Speculation on a copy.** `arrowStart` needs to try a return type without moving the cursor: `let probe = new
   Parser(this.toks); probe.pos = q + 2;` (the copy shares the token array). A class that is a value makes this cheap and safe.
+* **Rule 8 (no program-wide counters)**: the lexer and the parser are per file; nothing is numbered across files (spans
+  carry the file index the caller passes, `OpTable` is built per `Parser`). The only class-typed field, `Parser.ops`, is
+  only read (`level`, `rowOf`), so the copy-on-call of a mutating method on a class field (seen in 3b) does not arise.
 * **`from` is a keyword** (again): the contract helper's parameter is `first`.
 * **Contract helpers as private methods.** `spansFrom` and the token tests are private methods used in the `@Ensures` of
   the same class; it works, and keeps the clauses short (`this.spansFrom(result.unwrap().span, old(this.pos))`).

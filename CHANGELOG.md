@@ -6,7 +6,7 @@
   operators are parsed by precedence climbing over a data table (`precedence.or`, class `OpTable`: level, operator,
   associativity per spelling, with an invariant); placement rules of clauses and annotations moved to `rules.or`; new
   well-formedness predicates of tokens (`tokensWellFormed`), trees (`wellformed.or`: spans nested and ordered) and comments.
-  124 contract clauses (was 1): every successful `parseX` consumes at least one token and spans exactly what it consumed
+  129 contract clauses (was 1): every successful `parseX` consumes at least one token and spans exactly what it consumed
   (the progress property), the cursor never passes the final KEof, `parse` ensures a well-formed module or a parse error
   inside the source. 14 unit tests in `compiler/tests/syntax_test.or` (incl. termination on garbage input). Parse errors,
   ASTs and generated code are byte-identical to before; no change to the language. Also: `@Ensures` for the 13 public
