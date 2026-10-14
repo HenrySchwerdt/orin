@@ -1,0 +1,575 @@
+// Unit tests of the front end's syntax module (rewrite step 3c): `Lexer`, `Parser`, the operator table, the placement
+// rules, the comment scanner and the well-formedness predicates of tokens and trees. Run:
+// `orin test compiler/tests/syntax_test.or --runtime runtime`. `orin test` checks contracts at run time, so the class
+// invariants of `Lexer`, `Parser` and `OpTable`, the progress `@Ensures` of every `parseX` (`spansFrom`: at least one
+// token consumed, the node spans exactly the consumed tokens) and the `@Ensures` of `lex` / `parse` (tokens and trees
+// well formed, error spans inside the source) run on every call below.
+
+import { assert, assertEq, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { Span, Diagnostic, span } from "../diag";
+import {
+  Ident, Module, Item, Expr, ExprKind, BinaryOp, UnaryOp, ContractKind, AnnotationKind, Stmt,
+  Pattern, TypeExpr, Block, ContractClause, Annotation, Token, TokKind, Lexer, lex, isEofTok,
+  tokensWellFormed, Parser, parse, isSyntaxCode, OpRow, OpTable, binaryOps, opRowsOk, MAX_LEVEL,
+  T_FUNCTION, T_METHOD, T_CLASS, T_LOOP, T_CONST, clauseAllowed, annotationAllowed, checkPlacement,
+  checkAnnoPlacement, inside, nestedIn, exprOk, exprShallowOk, stmtOk, typeOk, itemSpan,
+  moduleWellFormed, Comment, scanComments, commentsWellFormed,
+} from "../syntax";
+
+function sp(a: usize, b: usize): Span {
+  return span(0, a, b);
+}
+
+function toks(src: string): Token[] {
+  return lex(0, src).unwrap();
+}
+
+function opName(op: BinaryOp): string {
+  return match (op) {
+    BAdd => "+",
+    BSub => "-",
+    BMul => "*",
+    BDiv => "/",
+    BRem => "%",
+    BEq => "==",
+    BNe => "!=",
+    BLt => "<",
+    BLe => "<=",
+    BGt => ">",
+    BGe => ">=",
+    BAnd => "&&",
+    BOr => "||",
+    BImplies => "==>",
+  };
+}
+
+function unName(op: UnaryOp): string {
+  return match (op) {
+    UNot => "!",
+    UNeg => "neg",
+  };
+}
+
+// The shape of an expression as an S-expression (the parts the precedence tests look at).
+function shape(e: Expr): string {
+  return match (e.kind) {
+    EIdent(id) => id.name,
+    EInt(v) => `${v}`,
+    EBinary(op, a, b) => `(${opName(op)} ${shape(a)} ${shape(b)})`,
+    EUnary(op, x) => `(${unName(op)} ${shape(x)})`,
+    ECond(c, a, b) => `(? ${shape(c)} ${shape(a)} ${shape(b)})`,
+    ECall(f, args) => `(call ${shape(f)} ${args.map(a => shape(a)).join(" ")})`,
+    ETyApp(id, tys) => `(tyapp ${id.name} ${tys.length})`,
+    EMember(x, id) => `(. ${shape(x)} ${id.name})`,
+    ETry(x) => `(try ${shape(x)})`,
+    EArrow(ps, _, _) => `(arrow ${ps.length})`,
+    _ => "?",
+  };
+}
+
+function exprOf(src: string): Expr {
+  let p = new Parser(toks(src));
+  const r = p.parseExpr();
+  assert(r.isOk(), `parses: ${src}`);
+  assert(p.atEnd(), `consumes everything: ${src}`);
+  return r.unwrap();
+}
+
+function errOf(src: string): Diagnostic {
+  const r = parse(0, src);
+  assert(r.isErr(), `is an error: ${src}`);
+  return r.unwrapErr();
+}
+
+// A deterministic pseudo-random sequence (LCG), for the garbage inputs.
+function nextSeed(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+// ---------------------------------------------------------------------------
+// Lexer
+// ---------------------------------------------------------------------------
+
+@Test
+function lexerTokensAreOrderedAndEndWithEof(): void {
+  const src = "const x: int = 0x1F + 2.5e3; // c\nlet s = \"a\\n\" + `t${x}u`; /* b */ f(a) ==> b ... 18446744073709551615";
+  const ts = toks(src);
+  assert(tokensWellFormed(ts, 0, src.length), "well formed");
+  assert(isEofTok(ts[ts.length - 1]), "ends with KEof");
+  assertEqString(ts[0].text, "const", "keyword");
+  assertEq(ts[5].value, 31, "hex value");
+  assertEqString(ts[7].text, "2.5e3", "float spelling (already canonical)");
+  const big = ts[ts.length - 2];
+  assertEq(big.value, -1, "2^64-1 is the 64-bit pattern -1");
+  let texts: string[] = [];
+  for (const t of ts) {
+    texts.push(t.text);
+  }
+  assert(texts.includes("==>") && texts.includes("..."), "longest-match punctuation");
+}
+
+@Test
+function lexerStepAdvancesUntilFinished(): void {
+  const src = "  a = b(1, `x${ { y: 2 }.y }z`) ;\n// end";
+  let lx = new Lexer(0, src);
+  let steps: usize = 0;
+  while (!lx.finished()) {
+    const before = lx.position();
+    const n = lx.tokens().length;
+    lx.step();
+    assert(lx.error().isNone(), "lexes");
+    if (!lx.finished()) {
+      assert(lx.position() > before, "a step advances the cursor");
+      assertEqUsize(lx.tokens().length, n + 1, "a step adds one token");
+      assertEqUsize(lx.tokens()[n].span.end, lx.position(), "the token ends at the cursor");
+    }
+    steps += 1;
+    assert(steps <= src.length + 1, "terminates: at most one step per byte");
+  }
+  assertEqUsize(lx.position(), src.length, "finished at the end");
+  // an error finishes the lexer and is kept
+  let bad = new Lexer(0, "a \"open");
+  while (!bad.finished()) {
+    bad.step();
+  }
+  assert(bad.error().isSome(), "the error is kept");
+  assertEqString(bad.error().unwrap().message, "unterminated string literal", "first error");
+  assertEqUsize(bad.tokens().length, 1, "tokens before the error stay");
+}
+
+@Test
+function lexerErrorsHaveSpansInsideTheSource(): void {
+  const bad = [
+    "\"abc",
+    "\"a\nb\"",
+    "/* open",
+    "`a${b",
+    "`x",
+    "0x",
+    "0xG",
+    "1..2",
+    "#",
+    "\"\\q\"",
+    "\"\\x4\"",
+    "99999999999999999999999",
+    "1.5e99999",
+    ".5",
+    "x @ y",
+    "\xe9",
+    "`a\\",
+    "0x1.5",
+    "12ab",
+  ];
+  for (const s of bad) {
+    const r = lex(0, s);
+    assert(r.isErr(), `lexical error: ${s}`);
+    const d = r.unwrapErr();
+    assertEqString(d.code, "E0100", `code: ${s}`);
+    assert(d.span.start <= d.span.end && d.span.end <= s.length, `span inside the source: ${s}`);
+  }
+  assertEqString(lex(0, "/* x").unwrapErr().message, "unterminated block comment", "message kept");
+  assertEqString(
+    lex(0, "`a${b").unwrapErr().message,
+    "unterminated template literal interpolation (missing `}`)",
+    "message kept",
+  );
+}
+
+@Test
+function tokensWellFormedRejectsBrokenStreams(): void {
+  const good = toks("a b");
+  assert(tokensWellFormed(good, 0, 3), "good");
+  assert(!tokensWellFormed(good, 0, 4), "KEof not at the end of the source");
+  assert(!tokensWellFormed(good, 1, 3), "wrong file");
+  const a = good[0];
+  const b = good[1];
+  const eof = good[2];
+  const overlap = Token { kind: KIdent, text: "x", span: sp(0, 2), value: 0 };
+  assert(!tokensWellFormed([a, overlap, eof], 0, 3), "overlapping tokens");
+  assert(!tokensWellFormed([b, a, eof], 0, 3), "out of order");
+  assert(!tokensWellFormed([a, b], 0, 3), "no KEof");
+  assert(!tokensWellFormed([a, eof, b, eof], 0, 3), "two KEof");
+  const empty = Token { kind: KIdent, text: "", span: sp(1, 1), value: 0 };
+  assert(!tokensWellFormed([a, empty, eof], 0, 3), "empty token");
+  assert(!tokensWellFormed([], 0, 0), "nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Operator table and precedence climbing
+// ---------------------------------------------------------------------------
+
+@Test
+function operatorTableIsAPrecedenceTable(): void {
+  const rows = binaryOps();
+  assert(opRowsOk(rows), "the table is well formed");
+  assertEqUsize(rows.length, 13, "13 binary operators");
+  const t = new OpTable();
+  assertEq(t.level("||"), 0, "|| loosest");
+  assertEq(t.level("&&"), 1, "&&");
+  assertEq(t.level("!="), 2, "!=");
+  assertEq(t.level(">="), 3, ">=");
+  assertEq(t.level("-"), 4, "-");
+  assertEq(t.level("%"), MAX_LEVEL, "% tightest");
+  assertEq(t.level("?"), -1, "? is not a binary operator");
+  assertEq(t.level("==>"), -1, "==> is not in the table");
+  assertEq(t.level("="), -1, "= is not an operator");
+  // the invariant rejects tables that would mis-group
+  let gap = binaryOps();
+  gap[12] = OpRow { text: "%", level: 7, op: BRem, rightAssoc: false };
+  assert(!opRowsOk(gap), "a level gap / out of range");
+  let down = binaryOps();
+  down[1] = OpRow { text: "&&", level: 0, op: BAnd, rightAssoc: false };
+  down[0] = OpRow { text: "||", level: 1, op: BOr, rightAssoc: false };
+  assert(!opRowsOk(down), "levels decrease");
+  let mixed = binaryOps();
+  mixed[9] = OpRow { text: "-", level: 4, op: BSub, rightAssoc: true };
+  assert(!opRowsOk(mixed), "mixed associativity on one level");
+}
+
+@Test
+function precedenceAndAssociativity(): void {
+  assertEqString(shape(exprOf("a - b - c")), "(- (- a b) c)", "left-associative");
+  assertEqString(shape(exprOf("a + b * c - d")), "(- (+ a (* b c)) d)", "* binds tighter");
+  assertEqString(shape(exprOf("a || b && c || d")), "(|| (|| a (&& b c)) d)", "&& tighter than ||");
+  assertEqString(
+    shape(exprOf("a < b == c > d")),
+    "(== (< a b) (> c d))",
+    "comparison tighter than equality",
+  );
+  assertEqString(shape(exprOf("!a && -b * c")), "(&& (! a) (* (neg b) c))", "unary tightest");
+  assertEqString(shape(exprOf("a ? b : c ? d : e")), "(? a b (? c d e))", "?: right-associative");
+  assertEqString(shape(exprOf("a ==> b ==> c")), "(==> a (==> b c))", "==> right-associative");
+  assertEqString(shape(exprOf("a || b ? c : d")), "(? (|| a b) c d)", "?: below ||");
+  assertEqString(shape(exprOf("a % b / c * d")), "(* (/ (% a b) c) d)", "one level, left to right");
+}
+
+@Test
+function speculativeParsesBacktrack(): void {
+  assertEqString(shape(exprOf("f<T>(x)")), "(call (tyapp f 1) x)", "type application");
+  assertEqString(
+    shape(exprOf("a < b > c")),
+    "(> (< a b) c)",
+    "a type-argument list not followed by ( or { is a comparison",
+  );
+  assertEqString(shape(exprOf("a < b")), "(< a b)", "comparison");
+  assertEqString(shape(exprOf("(x: int): int => x")), "(arrow 1)", "arrow with result type");
+  assertEqString(shape(exprOf("(a)")), "a", "parenthesised");
+  assertEqString(shape(exprOf("(a, b) => a")), "(arrow 2)", "arrow");
+  assertEqString(shape(exprOf("f(a)?.b")), "(. (try (call f a)) b)", "postfix chain");
+}
+
+// ---------------------------------------------------------------------------
+// Parser: progress and spans
+// ---------------------------------------------------------------------------
+
+@Test
+function everyParseMethodConsumesAndSpansItsTokens(): void {
+  const exprs = [
+    "x",
+    "1 + 2",
+    "f(a, b)[i].m",
+    "Point { x: 1, y: 2 }",
+    "match (v) { A => 1, _ => { return; } }",
+    "`a${b}c`",
+    "new C<T>(1)",
+    "[1, 2]",
+    "x => x + 1",
+  ];
+  for (const s of exprs) {
+    let p = new Parser(toks(s));
+    const r = p.parseExpr();
+    assert(r.isOk(), `expr: ${s}`);
+    assert(p.position() > 0 && p.atEnd(), `consumed: ${s}`);
+    assertEqUsize(r.unwrap().span.start, 0, `starts at the first token: ${s}`);
+    assertEqUsize(r.unwrap().span.end, s.length, `ends at the last token: ${s}`);
+    assert(exprOk(r.unwrap()), `well formed: ${s}`);
+  }
+  const types = ["int", "Map<string, int[]>[]", "(a: int, b: T) => void", "(int)[]"];
+  for (const s of types) {
+    let p = new Parser(toks(s));
+    const r = p.parseType();
+    assert(
+      r.isOk() && p.atEnd() && r.unwrap().span.end == s.length && typeOk(r.unwrap()),
+      `type: ${s}`,
+    );
+  }
+  const stmts = [
+    "let x: int = 1;",
+    "if (a) { b(); } else if (c) { } else { d = 1; }",
+    "while (x) { break; }",
+    "for (const a of xs) { continue; }",
+    "return;",
+    "{ x += 2; }",
+  ];
+  for (const s of stmts) {
+    let p = new Parser(toks(s));
+    const r = p.parseStmt();
+    assert(
+      r.isOk() && p.atEnd() && r.unwrap().span.end == s.length && stmtOk(r.unwrap()),
+      `stmt: ${s}`,
+    );
+  }
+  const pats = ["_", "None", "Some(x)", "-5", "\"s\"", "true", "Pair(A(_), b)"];
+  for (const s of pats) {
+    let p = new Parser(toks(s));
+    const r = p.parsePattern();
+    assert(r.isOk() && p.atEnd() && r.unwrap().span.end == s.length, `pattern: ${s}`);
+  }
+  const items = [
+    "@Requires(x > 0) @Test function f(x: int): int { return x; }",
+    "export type P = { a: int; };",
+    "type U = A | B(int);",
+    "const K: int = 1;",
+    "@Invariant(this.n >= 0) class C<T> implements I { private n: int = 0; constructor(public a: int) { } @Ensures(result >= 0) m(): int { return this.n; } }",
+    "interface I { @Deprecated(\"x\") m(a: int): bool; }",
+    "import { a, b } from \"./m\";",
+    "export { a } from \"./m\";",
+  ];
+  for (const s of items) {
+    let p = new Parser(toks(s));
+    const r = p.parseItem();
+    assert(r.isOk() && p.atEnd(), `item: ${s}`);
+    assertEqUsize(
+      itemSpan(r.unwrap()).start,
+      0,
+      `item starts at its first decoration or keyword: ${s}`,
+    );
+    assertEqUsize(itemSpan(r.unwrap()).end, s.length, `item ends at its last token: ${s}`);
+  }
+}
+
+@Test
+function nothingConsumedOnlyWhereDocumented(): void {
+  // a failing parse leaves the cursor on a token (the class invariant) and the final KEof is never consumed
+  const bad = ["", ")", "}", "@Foo", "function", "class C {", "let = 1;", "x +", "match (x) {"];
+  for (const s of bad) {
+    const ts = toks(s);
+    let p = new Parser(ts);
+    const r = p.parseExpr();
+    assert(p.position() < ts.length, `cursor on a token: ${s}`);
+    if (r.isOk()) {
+      assert(p.position() > 0, `a successful parse consumed: ${s}`);
+    }
+  }
+}
+
+@Test
+function parseTerminatesOnGarbage(): void {
+  // Token soups: random sequences of spellings that start most constructs, so the parser goes deep into every
+  // production before it fails. Every parse returns (no loop without progress), with a parse-error code and a span
+  // inside the source, or with a well-formed module.
+  const words = [
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    "<",
+    ">",
+    ",",
+    ";",
+    ":",
+    "=>",
+    "=",
+    "==",
+    "?",
+    ".",
+    "...",
+    "@Requires",
+    "@Test",
+    "@",
+    "function",
+    "class",
+    "interface",
+    "type",
+    "const",
+    "let",
+    "if",
+    "else",
+    "while",
+    "for",
+    "of",
+    "return",
+    "match",
+    "new",
+    "this",
+    "export",
+    "import",
+    "from",
+    "x",
+    "T",
+    "1",
+    "2.5",
+    "\"s\"",
+    "`a${",
+    "}b`",
+    "`t`",
+    "|",
+    "-",
+    "!",
+    "+",
+    "&&",
+    "==>",
+    "constructor",
+    "private",
+    "static",
+    "extends",
+    "implements",
+    "var",
+    "_",
+    "\n",
+  ];
+  let seed: int = 7;
+  let oks: usize = 0;
+  let errs: usize = 0;
+  let i: usize = 0;
+  while (i < 400) {
+    seed = nextSeed(seed);
+    const n = seed % 40 + 1;
+    let parts: string[] = [];
+    let k: int = 0;
+    while (k < n) {
+      seed = nextSeed(seed);
+      parts.push(words[(seed % words.length.toInt()).toUsize()]);
+      k += 1;
+    }
+    const src = parts.join(" ");
+    const r = parse(0, src);
+    if (r.isOk()) {
+      assert(moduleWellFormed(r.unwrap(), src.length), `well formed: ${src}`);
+      oks += 1;
+    } else {
+      const d = r.unwrapErr();
+      assert(isSyntaxCode(d.code), `code ${d.code}: ${src}`);
+      assert(d.span.end <= src.length, `span inside the source: ${src}`);
+      errs += 1;
+    }
+    i += 1;
+  }
+  assert(errs > 300, "garbage is mostly rejected");
+  // Every prefix of a real program: the parser stops at the first error, wherever the text is cut.
+  const prog = "@Requires(n >= 0)\nexport function f<T extends S>(n: int, g: (x: T) => bool): Result<int[], string> {\n  let xs: int[] = [];\n  for (const a of [1, 2]) { xs.push(a * n - 1); }\n  match (g) { A(y) => { return Ok(xs); }, _ => {} }\n  const s = `n=${n + 1}`;\n  return n > 0 ? Ok(xs) : Err(\"neg\");\n}\nclass C { private a: int = 1; m(): int { return this.a; } }\n";
+  let cut: usize = 0;
+  while (cut <= prog.length) {
+    const src = prog.substring(0, cut);
+    const r = parse(0, src);
+    if (r.isErr()) {
+      assert(r.unwrapErr().span.end <= src.length, `prefix ${cut}: span inside the source`);
+    } else {
+      assert(moduleWellFormed(r.unwrap(), src.length), `prefix ${cut}: well formed`);
+    }
+    cut += 1;
+  }
+  assert(parse(0, prog).isOk(), "the whole program parses");
+}
+
+@Test
+function firstErrorIsReportedUnchanged(): void {
+  const e1 = errOf("function f(): void { let x = 1 }");
+  assertEqString(e1.code, "E0200", "code");
+  assertEqString(e1.message, "expected `;`, found `}`", "message");
+  assertEqUsize(e1.span.start, 31, "at the `}`");
+  const e2 = errOf("function f(): void { var x = 1; }");
+  assertEqString(e2.code, "E0201", "var");
+  const e3 = errOf("function f(");
+  assertEqString(e3.message, "expected identifier, found end of file", "end of file");
+  const e4 = errOf("@Ensures(true) const K: int = 1;");
+  assertEqString(e4.message, "contract clauses cannot precede a constant", "placement");
+  const e5 = errOf("@Test @Test function f(): void {}");
+  assertEqString(e5.code, "E0442", "duplicate annotation");
+  const e6 = errOf("@Foo function f(): void {}");
+  assertEqString(e6.code, "E0408", "unknown annotation");
+  const e7 = errOf("interface I { x: int; }");
+  assertEqString(e7.code, "E0408", "interface field");
+  const e8 = errOf("type T<A extends B> = A;");
+  assertEqString(e8.code, "E0408", "bound on a type alias");
+}
+
+// ---------------------------------------------------------------------------
+// Well-formedness predicates
+// ---------------------------------------------------------------------------
+
+@Test
+function spanPredicatesRejectMisplacedChildren(): void {
+  assert(inside(sp(2, 3), sp(0, 5)), "inside");
+  assert(!inside(sp(2, 6), sp(0, 5)), "overshoots");
+  assert(!inside(span(1, 2, 3), sp(0, 5)), "other file");
+  assert(nestedIn([sp(0, 1), sp(1, 2), sp(3, 5)], sp(0, 5)), "ordered children");
+  assert(!nestedIn([sp(0, 2), sp(1, 3)], sp(0, 5)), "overlapping children");
+  assert(!nestedIn([sp(3, 4), sp(0, 1)], sp(0, 5)), "children out of order");
+  const a = Expr { kind: EIdent(Ident { name: "a", span: sp(0, 1) }), span: sp(0, 1) };
+  const b = Expr { kind: EIdent(Ident { name: "b", span: sp(4, 5) }), span: sp(4, 5) };
+  const good = Expr { kind: EBinary(BAdd, a, b), span: sp(0, 5) };
+  assert(exprOk(good), "a + b");
+  const short = Expr { kind: EBinary(BAdd, a, b), span: sp(0, 3) };
+  assert(!exprShallowOk(short), "a span that misses a child");
+  const swapped = Expr { kind: EBinary(BAdd, b, a), span: sp(0, 5) };
+  assert(!exprOk(swapped), "children out of order");
+  const deep = Expr {
+    kind: EUnary(UNeg, Expr { kind: EIdent(Ident { name: "a", span: sp(2, 3) }), span: sp(0, 1) }),
+    span: sp(0, 9),
+  };
+  assert(exprShallowOk(deep), "the root alone is fine");
+  assert(!exprOk(deep), "a broken grandchild is found by the deep check");
+  const m = parse(0, "function f(): void { g(1, 2); }").unwrap();
+  assert(moduleWellFormed(m, 31), "a parsed module");
+  assert(!moduleWellFormed(m, 10), "items past the end of the source");
+  assert(!moduleWellFormed(Module { file: 1, items: m.items }, 31), "items in another file");
+}
+
+// ---------------------------------------------------------------------------
+// Placement rules and comments
+// ---------------------------------------------------------------------------
+
+@Test
+function placementRules(): void {
+  const req = parse(0, "@Requires(true) function f(): void {}").unwrap();
+  let cs: ContractClause[] = [];
+  match (req.items[0]) {
+    IFunction(d) => {
+      cs = d.contracts;
+    },
+    _ => {},
+  }
+  assertEqUsize(cs.length, 1, "one clause");
+  assert(checkPlacement(cs, T_FUNCTION).isOk(), "@Requires on a function");
+  assert(checkPlacement(cs, T_METHOD).isOk(), "@Requires on a method");
+  assert(checkPlacement(cs, T_CLASS).isErr(), "@Requires not on a class");
+  assert(checkPlacement(cs, T_LOOP).isErr(), "@Requires not on a loop");
+  assert(
+    clauseAllowed(CInvariant, T_LOOP)
+        && clauseAllowed(CInvariant, T_CLASS)
+        && !clauseAllowed(CInvariant, T_FUNCTION),
+    "@Invariant",
+  );
+  assert(
+    annotationAllowed(ATest, T_FUNCTION) && !annotationAllowed(ATest, T_METHOD),
+    "@Test only on functions",
+  );
+  assert(!annotationAllowed(ADeprecated, T_CONST), "@Deprecated not on a constant");
+  const twice = [
+    Annotation { kind: AInline, message: "", span: sp(0, 7) },
+    Annotation { kind: AInline, message: "", span: sp(8, 15) },
+  ];
+  assertEqString(checkAnnoPlacement(twice, T_FUNCTION).unwrapErr().code, "E0442", "duplicate");
+}
+
+@Test
+function commentsAreFoundInOrder(): void {
+  const src = "// a\nconst s = \"// not\"; /* b */\n\n  // c   \nconst t = `x${ /* in */ 1 }`;";
+  const cs = scanComments(src);
+  assertEqUsize(cs.length, 3, "three comments, none inside a string or template");
+  assertEqString(cs[0].text, "// a", "line comment");
+  assertEqString(cs[1].text, "/* b */", "block comment");
+  assertEqString(cs[2].text, "// c", "trailing spaces trimmed");
+  assertEqBool(cs[2].ownLine, true, "own line");
+  assertEqBool(cs[2].blankBefore, true, "blank line before");
+  assert(commentsWellFormed(cs, src), "well formed");
+  const swapped = [cs[1], cs[0]];
+  assert(!commentsWellFormed(swapped, src), "out of order");
+  const wrongText = [
+    Comment { start: 0, end: 4, text: "// b", isLine: true, ownLine: true, blankBefore: false },
+  ];
+  assert(!commentsWellFormed(wrongText, src), "text differs from the source");
+}

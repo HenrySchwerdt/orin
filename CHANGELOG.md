@@ -1,6 +1,16 @@
 # Changelog
 
 ## Unreleased
+- **Rewrite step 3c: `compiler/syntax/` (ADR-0015).** The lexer is a `Lexer` class (cursor, tokens, template depth) and the
+  parser a `Parser` class (tokens and cursor as fields instead of `{ node, pos }` records returned by ~90 functions); binary
+  operators are parsed by precedence climbing over a data table (`precedence.or`, class `OpTable`: level, operator,
+  associativity per spelling, with an invariant); placement rules of clauses and annotations moved to `rules.or`; new
+  well-formedness predicates of tokens (`tokensWellFormed`), trees (`wellformed.or`: spans nested and ordered) and comments.
+  129 contract clauses (was 1): every successful `parseX` consumes at least one token and spans exactly what it consumed
+  (the progress property), the cursor never passes the final KEof, `parse` ensures a well-formed module or a parse error
+  inside the source. 14 unit tests in `compiler/tests/syntax_test.or` (incl. termination on garbage input). Parse errors,
+  ASTs and generated code are byte-identical to before; no change to the language. Also: `@Ensures` for the 13 public
+  mutating methods of `vc/gen.or` `Gen` and `vc/vt.or` `Tab` that `orin check --strict-contracts compiler/main.or` reported.
 - **Capabilities, Stage B: transitive effect inference (ADR-0037 D2, graph 2; no new syntax).** The compiler now infers, for
   every function, method and constructor, the set of primitive effects it may perform *transitively* (`Fs.ReadFile`,
   `Console.Write`, `Process.Spawn`, `Clock.Now`, ...; direction INPUT / OUTPUT / CONTROL; grant family), with evidence (MUST: a

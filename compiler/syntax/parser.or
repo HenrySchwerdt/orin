@@ -1,80 +1,44 @@
-// Recursive-descent parser: source text -> ast.Module (docs/bootstrap-subset.md §2, §4, §5).
-// Errors: E0200 (syntax, first error only), E0201 (`var`). Lexical errors (E0100) come from lex.
+// Recursive-descent parser: source text -> ast.Module (docs/bootstrap-subset.md §2, §4, §5): class `Parser`.
+// Errors: E0200 (syntax), E0201 (`var`), E0408 (constructs the language rejects at parse time), E0440 / E0441 / E0442
+// (annotations). Lexical errors (E0100) come from `lex`. The first error ends the parse: there is no error recovery,
+// so every diagnostic is the first one in source order (a recovering parser would report more errors, a
+// language-visible change).
 //
-// Style (docs/bootstrap.md, "Writing efficient Orin-B"): every parse function takes the
-// immutable token array plus a position and returns a small `{ node, pos }` record, where
-// `pos` is the index of the first token after the parsed construct.
+// The parser holds the tokens and a cursor `pos`. Every `parseX` method starts at the cursor and leaves it at the
+// first token after the construct. Progress: every successful `parseX` consumes at least one token (stated as an
+// `@Ensures`, mostly `spansFrom`: the node's span is exactly the extent of the tokens it consumed). The only methods
+// that may consume nothing are `parseTypeParamsB` / `parseTypeParams` (no `<`) and the speculative `tryTypeArgs`
+// (None), which leave the cursor where it was. Every loop of the parser calls a consuming method or stops at a token
+// it does not consume, so the parser terminates on any input; the final KEof token is never consumed.
 
 import { Span, Diagnostic, spanTo, diag } from "../diag";
 import {
   Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
-  VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr,
-  UnaryOp, BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind,
-  InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam, ArrowBody,
-  ContractKind, ContractClause, AnnotationKind, Annotation
+  VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp,
+  BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl,
+  IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam,
+  ArrowParam, ArrowBody, ContractKind, ContractClause, AnnotationKind, Annotation,
 } from "./ast";
-import { Token, TokKind, lex } from "./lexer";
+import { Token, lex, isEofTok } from "./lexer";
+import { OpTable } from "./precedence";
+import {
+  T_FUNCTION, T_METHOD, T_CTOR, T_CLASS, T_RECORD, T_TYPE, T_LOOP, T_INTERFACE, T_IFACE_METHOD,
+  T_CONST, T_IMPORT, checkPlacement, checkAnnoPlacement, isBuiltinAnnotation, annotationName,
+  annotationTargets,
+} from "./rules";
+import {
+  exprShallowOk, stmtShallowOk, typeShallowOk, patShallowOk, blockShallowOk, itemShallowOk,
+  memberShallowOk, itemSpan, memberSpan, moduleWellFormed,
+} from "./wellformed";
 
-type IdentRes = { id: Ident; pos: usize; };
-type IdentsRes = { ids: Ident[]; pos: usize; };
-type BoundsRes = { ids: Ident[]; bounds: Option<Ident>[]; any: bool; pos: usize; };
-type TypeRes = { ty: TypeExpr; pos: usize; };
-type BodyRes = { body: TypeDeclBody; pos: usize; };
-type VariantRes = { variant: VariantDecl; pos: usize; };
-type ImportRes = { decl: ImportDecl; pos: usize; };
-type ItemRes = { item: Item; pos: usize; };
-type BlockRes = { block: Block; pos: usize; };
-type StmtRes = { stmt: Stmt; pos: usize; };
-type ExprRes = { expr: Expr; pos: usize; };
-type ExprsRes = { exprs: Expr[]; pos: usize; };
-type TypeArgsRes = { tys: TypeExpr[]; pos: usize; };
-type PatRes = { pat: Pattern; pos: usize; };
-type ClauseRes = { clause: ContractClause; pos: usize; };
-type ClausesRes = { clauses: ContractClause[]; pos: usize; };
-type AnnoRes = { anno: Annotation; pos: usize; };
-type DecosRes = { clauses: ContractClause[]; annos: Annotation[]; first: Span; pos: usize; };
+// Type parameters with their optional bounds (parallel); `any`: some parameter has a bound.
+type Bounds = { ids: Ident[]; bounds: Option<Ident>[]; any: bool; };
 
-// ---------------------------------------------------------------------------
-// Token helpers
-// ---------------------------------------------------------------------------
+// Contract clauses and annotations before a declaration; `first` is the span of the first one.
+type Decos = { clauses: ContractClause[]; annos: Annotation[]; first: Span; };
 
-// Token at `pos`; positions past the end read as the final KEof token.
-function tokAt(toks: Token[], pos: usize): Token {
-  if (pos < toks.length) {
-    return toks[pos];
-  }
-  return toks[toks.length - 1];
-}
-
-function isP(toks: Token[], pos: usize, s: string): bool {
-  const t = tokAt(toks, pos);
-  return match (t.kind) {
-    KPunct => t.text == s,
-    _ => false
-  };
-}
-
-function isKw(toks: Token[], pos: usize, s: string): bool {
-  const t = tokAt(toks, pos);
-  return match (t.kind) {
-    KKeyword => t.text == s,
-    _ => false
-  };
-}
-
-function isEof(toks: Token[], pos: usize): bool {
-  return match (tokAt(toks, pos).kind) {
-    KEof => true,
-    _ => false
-  };
-}
-
-function isKindInt(t: Token): bool {
-  return match (t.kind) {
-    KInt => true,
-    _ => false
-  };
-}
+// Parameters, result type and body of a function or method.
+type Sig = { params: Param[]; ret: Option<TypeExpr>; body: Block; };
 
 function describe(t: Token): string {
   return match (t.kind) {
@@ -84,15 +48,17 @@ function describe(t: Token): string {
     KTplHead => "template literal",
     KTplMid => "`}` in a template literal",
     KTplTail => "`}` in a template literal",
-    _ => "`" + t.text + "`"
+    _ => "`" + t.text + "`",
   };
 }
 
 // Syntax error at token `t`; a stray `var` keyword always reports E0201.
+@Ensures(result.code == "E0200" || result.code == "E0201")
+@Ensures(result.span.start == t.span.start && result.span.end == t.span.end)
 function errAt(t: Token, msg: string): Diagnostic {
   const isVar = match (t.kind) {
     KKeyword => t.text == "var",
-    _ => false
+    _ => false,
   };
   if (isVar) {
     return diag("E0201", t.span, "`var` is not allowed; use `const` or `let`");
@@ -100,1122 +66,24 @@ function errAt(t: Token, msg: string): Diagnostic {
   return diag("E0200", t.span, msg);
 }
 
-function errExpected(toks: Token[], pos: usize, what: string): Diagnostic {
-  const t = tokAt(toks, pos);
-  return errAt(t, "expected " + what + ", found " + describe(t));
-}
-
-function expectP(toks: Token[], pos: usize, s: string): Result<usize, Diagnostic> {
-  if (isP(toks, pos, s)) {
-    return Ok(pos + 1);
-  }
-  return Err(errExpected(toks, pos, "`" + s + "`"));
-}
-
-function expectKw(toks: Token[], pos: usize, s: string): Result<usize, Diagnostic> {
-  if (isKw(toks, pos, s)) {
-    return Ok(pos + 1);
-  }
-  return Err(errExpected(toks, pos, "`" + s + "`"));
-}
-
-// Span of the last consumed token (pos must be >= 1).
-function lastSpan(toks: Token[], pos: usize): Span {
-  return toks[pos - 1].span;
-}
-
-function parseIdent(toks: Token[], pos: usize): Result<IdentRes, Diagnostic> {
-  const t = tokAt(toks, pos);
-  const ok = match (t.kind) {
-    KIdent => true,
-    _ => false
-  };
-  if (ok) {
-    return Ok(IdentRes { id: Ident { name: t.text, span: t.span }, pos: pos + 1 });
-  }
-  return Err(errExpected(toks, pos, "identifier"));
-}
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-// True if the tokens at `pos` start a function type: `(` followed by `)` or `name :`.
-function isFnTypeStart(toks: Token[], pos: usize): bool {
-  if (!isP(toks, pos, "(")) {
-    return false;
-  }
-  if (isP(toks, pos + 1, ")")) {
-    return true;
-  }
-  return isIdentTok(toks, pos + 1) && isP(toks, pos + 2, ":");
-}
-
-// `(a: T, b: U) => R` (beyond Orin-B, ADR-0011) or a parenthesised type `(T)` followed by any
-// number of `[]`; `pos` is at the `(`.
-function parseParenType(toks: Token[], pos: usize): Result<TypeRes, Diagnostic> {
-  if (isFnTypeStart(toks, pos)) {
-    let p = pos + 1;
-    let ps: FnTyParam[] = [];
-    while (!isP(toks, p, ")")) {
-      const pn = parseIdent(toks, p)?;
-      const colon = expectP(toks, pn.pos, ":")?;
-      const pt = parseType(toks, colon)?;
-      ps.push(FnTyParam { name: pn.id, ty: pt.ty });
-      p = pt.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-      } else if (!isP(toks, p, ")")) {
-        return Err(errExpected(toks, p, "`,` or `)`"));
-      }
-    }
-    p = expectP(toks, p + 1, "=>")?;
-    const rt = parseType(toks, p)?;
-    const ty = TypeExpr { kind: TFn(ps, rt.ty), span: spanTo(tokAt(toks, pos).span, rt.ty.span) };
-    return Ok(TypeRes { ty: ty, pos: rt.pos });
-  }
-  const inner = parseType(toks, pos + 1)?;
-  let p = expectP(toks, inner.pos, ")")?;
-  let ty = TypeExpr { kind: inner.ty.kind, span: spanTo(tokAt(toks, pos).span, lastSpan(toks, p)) };
-  while (isP(toks, p, "[") && isP(toks, p + 1, "]")) {
-    p += 2;
-    ty = TypeExpr { kind: TArray(ty), span: spanTo(ty.span, lastSpan(toks, p)) };
-  }
-  return Ok(TypeRes { ty: ty, pos: p });
-}
-
-// `Name`, `Name<A, B>`, followed by any number of `[]`; or a function type (see above).
-function parseType(toks: Token[], pos: usize): Result<TypeRes, Diagnostic> {
-  if (isP(toks, pos, "(")) {
-    return parseParenType(toks, pos);
-  }
-  const nm = parseIdent(toks, pos)?;
-  let p = nm.pos;
-  let args: TypeExpr[] = [];
-  if (isP(toks, p, "<")) {
-    p += 1;
-    while (true) {
-      const a = parseType(toks, p)?;
-      args.push(a.ty);
-      p = a.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-      } else {
-        break;
-      }
-    }
-    p = expectP(toks, p, ">")?;
-  }
-  let ty = TypeExpr { kind: TNamed(nm.id, args), span: spanTo(nm.id.span, lastSpan(toks, p)) };
-  while (isP(toks, p, "[") && isP(toks, p + 1, "]")) {
-    p += 2;
-    ty = TypeExpr { kind: TArray(ty), span: spanTo(ty.span, lastSpan(toks, p)) };
-  }
-  return Ok(TypeRes { ty: ty, pos: p });
-}
-
-// Optional `<T, U>` list of generic parameter names, each with an optional bound `T extends Shape`
-// (interfaces, ADR-0019). More than one bound (`A & B`) is E0408.
-function parseTypeParamsB(toks: Token[], pos: usize): Result<BoundsRes, Diagnostic> {
-  let ids: Ident[] = [];
-  let bounds: Option<Ident>[] = [];
-  let any = false;
-  if (!isP(toks, pos, "<")) {
-    return Ok(BoundsRes { ids: ids, bounds: bounds, any: any, pos: pos });
-  }
-  let p = pos + 1;
-  while (true) {
-    const id = parseIdent(toks, p)?;
-    ids.push(id.id);
-    p = id.pos;
-    let b: Option<Ident> = None;
-    if (isIdentText(toks, p, "extends")) {
-      const bi = parseIdent(toks, p + 1)?;
-      b = Some(bi.id);
-      any = true;
-      p = bi.pos;
-      if (isP(toks, p, "&")) {
-        return Err(diag("E0408", tokAt(toks, p).span, "a type parameter can have only one bound in Orin 1.0 (`T extends A & B` is not supported, ADR-0019)"));
-      }
-    }
-    bounds.push(b);
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else {
-      break;
-    }
-  }
-  p = expectP(toks, p, ">")?;
-  return Ok(BoundsRes { ids: ids, bounds: bounds, any: any, pos: p });
-}
-
-// Type parameters of declarations that cannot have bounds (types, classes, methods).
-function parseTypeParams(toks: Token[], pos: usize): Result<IdentsRes, Diagnostic> {
-  const r = parseTypeParamsB(toks, pos)?;
-  if (r.any) {
-    return Err(diag("E0408", tokAt(toks, pos).span, "type parameter bounds (`extends`) are only supported on generic functions and classes (ADR-0019, ADR-0026)"));
-  }
-  return Ok(IdentsRes { ids: r.ids, pos: r.pos });
-}
-
-// ---------------------------------------------------------------------------
-// Contract clauses (beyond Orin-B, ADR-0012, spec 15 §4.2a)
-// ---------------------------------------------------------------------------
-// `@Requires(e)`, `@Ensures(e)`, `@Invariant(e)`, `@Decreases(e)`, `@Rule("ID")` look like annotations
-// but are dedicated, reserved constructs with their own productions and AST node (ContractClause).
-// Any other `@Name` is an annotation (spec 05), which is not implemented: E0408.
-
-function clauseName(k: ContractKind): string {
-  return match (k) {
-    CRequires => "@Requires",
-    CEnsures => "@Ensures",
-    CInvariant => "@Invariant",
-    CDecreases => "@Decreases",
-    CRule => "@Rule"
+function isPunctTok(t: Token, s: string): bool {
+  return match (t.kind) {
+    KPunct => t.text == s,
+    _ => false,
   };
 }
 
-// Declaration targets of a clause: 0 function, 1 method, 2 constructor, 3 class, 4 record type,
-// 5 other type, 6 loop.
-function clauseAllowed(k: ContractKind, target: int): bool {
-  return match (k) {
-    CRequires => target <= 2,
-    CEnsures => target <= 1,
-    CInvariant => target == 3 || target == 4 || target == 6,
-    CDecreases => target <= 1 || target == 6,
-    CRule => target <= 5
+function isKindInt(t: Token): bool {
+  return match (t.kind) {
+    KInt => true,
+    _ => false,
   };
 }
 
-function targetName(target: int): string {
-  if (target == 0) {
-    return "a function";
-  }
-  if (target == 1) {
-    return "a method";
-  }
-  if (target == 2) {
-    return "a constructor";
-  }
-  if (target == 3) {
-    return "a class";
-  }
-  if (target == 4) {
-    return "a record type";
-  }
-  if (target == 5) {
-    return "a type declaration";
-  }
-  if (target == 6) {
-    return "a loop";
-  }
-  return "this declaration";
-}
-
-// Placement is part of the grammar: E0200 when a clause precedes the wrong kind of declaration.
-function checkPlacement(cs: ContractClause[], target: int): Result<bool, Diagnostic> {
-  for (const c of cs) {
-    if (!clauseAllowed(c.kind, target)) {
-      return Err(diag("E0200", c.span, "contract clause `" + clauseName(c.kind) + "` cannot be applied to " + targetName(target)));
-    }
-  }
-  return Ok(true);
-}
-
-// pos at `@`.
-function parseClause(toks: Token[], pos: usize): Result<ClauseRes, Diagnostic> {
-  const at = tokAt(toks, pos).span;
-  if (!isIdentTok(toks, pos + 1)) {
-    return Err(errExpected(toks, pos + 1, "a contract clause name after `@`"));
-  }
-  const nt = tokAt(toks, pos + 1);
-  let kind: ContractKind = CRequires;
-  if (nt.text == "Requires") {
-    kind = CRequires;
-  } else if (nt.text == "Ensures") {
-    kind = CEnsures;
-  } else if (nt.text == "Invariant") {
-    kind = CInvariant;
-  } else if (nt.text == "Decreases") {
-    kind = CDecreases;
-  } else if (nt.text == "Rule") {
-    kind = CRule;
-  } else if (isBuiltinAnnotation(nt.text)) {
-    return Err(diag("E0440", spanTo(at, nt.span), "annotation `@" + nt.text + "` cannot be applied here (it applies to " + annotationTargets(nt.text) + ")"));
-  } else {
-    return Err(diag(
-      "E0408", spanTo(at, nt.span),
-      "unknown annotation `@" + nt.text + "`: only the built-in annotations @Test, @Deprecated and @Inline and the contract clauses "
-        + "@Requires, @Ensures, @Invariant, @Decreases and @Rule exist (user-defined annotations are post-1.0, ADR-0024)"
-    ));
-  }
-  let p = expectP(toks, pos + 2, "(")?;
-  let ex: Option<Expr> = None;
-  let rule = "";
-  const isRule = match (kind) {
-    CRule => true,
-    _ => false
-  };
-  if (isRule) {
-    const st = tokAt(toks, p);
-    const isStr = match (st.kind) {
-      KStr => true,
-      _ => false
-    };
-    if (!isStr) {
-      return Err(errExpected(toks, p, "a string literal (rule id)"));
-    }
-    rule = st.text;
-    p += 1;
-  } else {
-    const e = parseExpr(toks, p)?;
-    ex = Some(e.expr);
-    p = e.pos;
-  }
-  p = expectP(toks, p, ")")?;
-  const c = ContractClause { kind: kind, expr: ex, rule: rule, span: spanTo(at, lastSpan(toks, p)) };
-  return Ok(ClauseRes { clause: c, pos: p });
-}
-
-// ---------------------------------------------------------------------------
-// Built-in annotations (beyond Orin-B, ADR-0024): `@Test`, `@Deprecated("message")`, `@Inline`
-// ---------------------------------------------------------------------------
-
-function isBuiltinAnnotation(name: string): bool {
-  return name == "Test" || name == "Deprecated" || name == "Inline";
-}
-
-function annotationName(k: AnnotationKind): string {
-  return match (k) {
-    ATest => "@Test",
-    ADeprecated => "@Deprecated",
-    AInline => "@Inline"
-  };
-}
-
-function annotationTargets(name: string): string {
-  if (name == "Test" || name == "@Test") {
-    return "top-level functions";
-  }
-  if (name == "Inline" || name == "@Inline") {
-    return "functions and methods";
-  }
-  return "functions, methods, classes, types, interfaces and interface methods";
-}
-
-// Annotation targets: the numbering of `targetName` plus 7 interface, 8 interface method, 9 constant.
-function annotationAllowed(k: AnnotationKind, target: int): bool {
-  return match (k) {
-    ATest => target == 0,
-    ADeprecated => target <= 1 || (target >= 3 && target <= 5) || target == 7 || target == 8,
-    AInline => target <= 1
-  };
-}
-
-function targetNameA(target: int): string {
-  if (target == 7) {
-    return "an interface";
-  }
-  if (target == 8) {
-    return "an interface method";
-  }
-  if (target == 9) {
-    return "a constant";
-  }
-  return targetName(target);
-}
-
-// Placement (E0440) and duplicates (E0442); the contract-clause rules are checked separately.
-function checkAnnoPlacement(as: Annotation[], target: int): Result<bool, Diagnostic> {
-  let i: usize = 0;
-  while (i < as.length) {
-    const a = as[i];
-    if (!annotationAllowed(a.kind, target)) {
-      return Err(diag("E0440", a.span, "annotation `" + annotationName(a.kind) + "` cannot be applied to " + targetNameA(target)
-        + " (it applies to " + annotationTargets(annotationName(a.kind)) + ")"));
-    }
-    let j: usize = 0;
-    while (j < i) {
-      if (annotationName(as[j].kind) == annotationName(a.kind)) {
-        return Err(diag("E0442", a.span, "duplicate annotation `" + annotationName(a.kind) + "`"));
-      }
-      j += 1;
-    }
-    i += 1;
-  }
-  return Ok(true);
-}
-
-// pos at `@` followed by the name of a built-in annotation.
-function parseAnnotation(toks: Token[], pos: usize): Result<AnnoRes, Diagnostic> {
-  const at = tokAt(toks, pos).span;
-  const nt = tokAt(toks, pos + 1);
-  let p = pos + 2;
-  if (nt.text == "Deprecated") {
-    if (!isP(toks, p, "(")) {
-      return Err(diag("E0441", spanTo(at, nt.span), "`@Deprecated` requires a message: `@Deprecated(\"use other() instead\")`"));
-    }
-    const st = tokAt(toks, p + 1);
-    const isStr = match (st.kind) {
-      KStr => true,
-      _ => false
-    };
-    if (!isStr || !isP(toks, p + 2, ")")) {
-      return Err(diag("E0441", spanTo(at, st.span), "`@Deprecated` takes exactly one string literal argument (the message)"));
-    }
-    p += 3;
-    return Ok(AnnoRes { anno: Annotation { kind: ADeprecated, message: st.text, span: spanTo(at, lastSpan(toks, p)) }, pos: p });
-  }
-  if (isP(toks, p, "(")) {
-    return Err(diag("E0441", spanTo(at, nt.span), "`@" + nt.text + "` takes no arguments"));
-  }
-  const kind: AnnotationKind = nt.text == "Test" ? ATest : AInline;
-  return Ok(AnnoRes { anno: Annotation { kind: kind, message: "", span: spanTo(at, nt.span) }, pos: p });
-}
-
-// Contract clauses and built-in annotations in any order; pos at the first `@`. `first` is the span of
-// the first one (the declaration's span starts there).
-function parseDecos(toks: Token[], pos: usize): Result<DecosRes, Diagnostic> {
-  let p = pos;
-  let cs: ContractClause[] = [];
-  let as: Annotation[] = [];
-  const first = tokAt(toks, pos).span;
-  while (isP(toks, p, "@")) {
-    if (isIdentTok(toks, p + 1) && isBuiltinAnnotation(tokAt(toks, p + 1).text)) {
-      const ar = parseAnnotation(toks, p)?;
-      as.push(ar.anno);
-      p = ar.pos;
-    } else {
-      const c = parseClause(toks, p)?;
-      cs.push(c.clause);
-      p = c.pos;
-    }
-  }
-  return Ok(DecosRes { clauses: cs, annos: as, first: first, pos: p });
-}
-
-// One or more clauses; pos at the first `@`.
-function parseClauses(toks: Token[], pos: usize): Result<ClausesRes, Diagnostic> {
-  let p = pos;
-  let cs: ContractClause[] = [];
-  while (isP(toks, p, "@")) {
-    const c = parseClause(toks, p)?;
-    cs.push(c.clause);
-    p = c.pos;
-  }
-  return Ok(ClausesRes { clauses: cs, pos: p });
-}
-
-// ---------------------------------------------------------------------------
-// Items
-// ---------------------------------------------------------------------------
-
-// `{ a, b, }` list of names (trailing comma allowed).
-function parseNameList(toks: Token[], pos: usize): Result<IdentsRes, Diagnostic> {
-  let p = expectP(toks, pos, "{")?;
-  let ids: Ident[] = [];
-  while (!isP(toks, p, "}")) {
-    const id = parseIdent(toks, p)?;
-    ids.push(id.id);
-    p = id.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, "}")) {
-      return Err(errExpected(toks, p, "`,` or `}`"));
-    }
-  }
-  return Ok(IdentsRes { ids: ids, pos: p + 1 });
-}
-
-// `import { .. } from "path";` or `export { .. } from "path";` (pos at the first keyword).
-function parseImportDecl(toks: Token[], pos: usize): Result<ImportRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  const names = parseNameList(toks, pos + 1)?;
-  let p = expectKw(toks, names.pos, "from")?;
-  const pt = tokAt(toks, p);
-  const isStr = match (pt.kind) {
+function isStrTok(t: Token): bool {
+  return match (t.kind) {
     KStr => true,
-    _ => false
-  };
-  if (!isStr) {
-    return Err(errExpected(toks, p, "module path string"));
-  }
-  p = expectP(toks, p + 1, ";")?;
-  const decl = ImportDecl { names: names.ids, path: pt.text, pathSpan: pt.span, span: spanTo(start, lastSpan(toks, p)) };
-  return Ok(ImportRes { decl: decl, pos: p });
-}
-
-function parseItem(toks: Token[], pos: usize): Result<ItemRes, Diagnostic> {
-  let cls: ContractClause[] = [];
-  let annos: Annotation[] = [];
-  let p0 = pos;
-  let start = tokAt(toks, pos).span;
-  if (isP(toks, pos, "@")) {
-    const cr = parseDecos(toks, pos)?;
-    cls = cr.clauses;
-    annos = cr.annos;
-    p0 = cr.pos;
-    start = cr.first;
-  }
-  if (isKw(toks, p0, "import")) {
-    if (cls.length > 0) {
-      return Err(diag("E0200", cls[0].span, "contract clauses cannot precede an import"));
-    }
-    checkAnnoPlacement(annos, 10)?;
-    const r = parseImportDecl(toks, p0)?;
-    return Ok(ItemRes { item: IImport(r.decl), pos: r.pos });
-  }
-  let p = p0;
-  let exported = false;
-  if (isKw(toks, p, "export")) {
-    exported = true;
-    p += 1;
-    if (isP(toks, p, "{")) {
-      if (cls.length > 0) {
-        return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a re-export"));
-      }
-      checkAnnoPlacement(annos, 10)?;
-      const r = parseImportDecl(toks, p0)?;
-      return Ok(ItemRes { item: IReExport(r.decl), pos: r.pos });
-    }
-  }
-  if (isKw(toks, p, "function")) {
-    checkPlacement(cls, 0)?;
-    checkAnnoPlacement(annos, 0)?;
-    return parseFunction(toks, p, exported, start, cls, annos);
-  }
-  if (isKw(toks, p, "type")) {
-    return parseTypeDecl(toks, p, exported, start, cls, annos);
-  }
-  if (isKw(toks, p, "const")) {
-    if (cls.length > 0) {
-      return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a constant"));
-    }
-    checkAnnoPlacement(annos, 9)?;
-    return parseConstDecl(toks, p, exported, start);
-  }
-  if (isKw(toks, p, "class")) {
-    checkPlacement(cls, 3)?;
-    checkAnnoPlacement(annos, 3)?;
-    return parseClass(toks, p, exported, start, cls, annos);
-  }
-  if (isKw(toks, p, "interface")) {
-    if (cls.length > 0) {
-      return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to an interface"));
-    }
-    checkAnnoPlacement(annos, 7)?;
-    return parseInterface(toks, p, exported, start, annos);
-  }
-  return Err(errExpected(toks, p, "declaration"));
-}
-
-type SigRes = { params: Param[]; ret: Option<TypeExpr>; body: Block; pos: usize; };
-
-// `(a: T, ..) [: R] { body }` with `pos` at the `(`; shared by functions and methods.
-function parseSigBody(toks: Token[], pos: usize): Result<SigRes, Diagnostic> {
-  let p = expectP(toks, pos, "(")?;
-  let params: Param[] = [];
-  while (!isP(toks, p, ")")) {
-    const pn = parseIdent(toks, p)?;
-    const colon = expectP(toks, pn.pos, ":")?;
-    const pt = parseType(toks, colon)?;
-    params.push(Param { name: pn.id, ty: pt.ty, span: spanTo(pn.id.span, pt.ty.span) });
-    p = pt.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, ")")) {
-      return Err(errExpected(toks, p, "`,` or `)`"));
-    }
-  }
-  p += 1;
-  let ret: Option<TypeExpr> = None;
-  if (isP(toks, p, ":")) {
-    const rt = parseType(toks, p + 1)?;
-    ret = Some(rt.ty);
-    p = rt.pos;
-  }
-  const body = parseBlock(toks, p)?;
-  return Ok(SigRes { params: params, ret: ret, body: body.block, pos: body.pos });
-}
-
-// pos at `function`; `start` is the span of the item's first token.
-function parseFunction(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[], annos: Annotation[]): Result<ItemRes, Diagnostic> {
-  const name = parseIdent(toks, pos + 1)?;
-  const tps = parseTypeParamsB(toks, name.pos)?;
-  const sg = parseSigBody(toks, tps.pos)?;
-  const decl = FunctionDecl {
-    exported: exported,
-    name: name.id,
-    typeParams: tps.ids,
-    bounds: tps.bounds,
-    params: sg.params,
-    ret: sg.ret,
-    body: sg.body,
-    contracts: cls,
-    annotations: annos,
-    span: spanTo(start, sg.body.span)
-  };
-  return Ok(ItemRes { item: IFunction(decl), pos: sg.pos });
-}
-
-// ---------------------------------------------------------------------------
-// Classes (beyond Orin-B, ADR-0009)
-// ---------------------------------------------------------------------------
-
-type MemberRes = { member: ClassMember; pos: usize; };
-
-// Contextual keyword: an identifier with exactly this spelling.
-function isIdentText(toks: Token[], pos: usize, s: string): bool {
-  const t = tokAt(toks, pos);
-  return match (t.kind) {
-    KIdent => t.text == s,
-    _ => false
-  };
-}
-
-function isIdentTok(toks: Token[], pos: usize): bool {
-  return match (tokAt(toks, pos).kind) {
-    KIdent => true,
-    _ => false
-  };
-}
-
-// pos at `class`.
-function parseClass(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[], annos: Annotation[]): Result<ItemRes, Diagnostic> {
-  const name = parseIdent(toks, pos + 1)?;
-  const tps = parseTypeParamsB(toks, name.pos)?;
-  let p = tps.pos;
-  let ext: Option<Ident> = None;
-  if (isIdentText(toks, p, "extends")) {
-    const b = parseIdent(toks, p + 1)?;
-    ext = Some(b.id);
-    p = b.pos;
-  }
-  let impls: Ident[] = [];
-  if (isIdentText(toks, p, "implements")) {
-    p += 1;
-    while (true) {
-      const ii = parseIdent(toks, p)?;
-      impls.push(ii.id);
-      p = ii.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-      } else {
-        break;
-      }
-    }
-  }
-  p = expectP(toks, p, "{")?;
-  let members: ClassMember[] = [];
-  while (!isP(toks, p, "}")) {
-    const m = parseMember(toks, p)?;
-    members.push(m.member);
-    p = m.pos;
-  }
-  p += 1;
-  const decl = ClassDecl {
-    exported: exported,
-    name: name.id,
-    typeParams: tps.ids,
-    bounds: tps.bounds,
-    ext: ext,
-    impls: impls,
-    members: members,
-    contracts: cls,
-    annotations: annos,
-    span: spanTo(start, lastSpan(toks, p))
-  };
-  return Ok(ItemRes { item: IClass(decl), pos: p });
-}
-
-// pos at `interface` (ADR-0019): `interface Name { m(a: T): R; .. }`. `extends` and type parameters are
-// parsed so the checker can reject them; fields and method bodies are E0408 here.
-function parseInterface(toks: Token[], pos: usize, exported: bool, start: Span, annos: Annotation[]): Result<ItemRes, Diagnostic> {
-  const name = parseIdent(toks, pos + 1)?;
-  const tps = parseTypeParamsB(toks, name.pos)?;
-  let p = tps.pos;
-  let ext: Option<Ident> = None;
-  if (isIdentText(toks, p, "extends")) {
-    const b = parseIdent(toks, p + 1)?;
-    ext = Some(b.id);
-    p = b.pos;
-  }
-  p = expectP(toks, p, "{")?;
-  let methods: IfaceMethod[] = [];
-  while (!isP(toks, p, "}")) {
-    let mstart = tokAt(toks, p).span;
-    let mannos: Annotation[] = [];
-    if (isP(toks, p, "@")) {
-      const dr = parseDecos(toks, p)?;
-      if (dr.clauses.length > 0) {
-        return Err(diag("E0200", dr.clauses[0].span, "contract clauses cannot be applied to an interface method"));
-      }
-      checkAnnoPlacement(dr.annos, 8)?;
-      mannos = dr.annos;
-      mstart = dr.first;
-      p = dr.pos;
-    }
-    const mn = parseIdent(toks, p)?;
-    p = mn.pos;
-    if (isP(toks, p, ":")) {
-      return Err(diag("E0408", spanTo(mstart, mn.id.span), "interfaces cannot declare fields; declare a method (ADR-0019)"));
-    }
-    if (isP(toks, p, "<")) {
-      return Err(diag("E0408", tokAt(toks, p).span, "generic interface methods are not supported (ADR-0019)"));
-    }
-    p = expectP(toks, p, "(")?;
-    let params: Param[] = [];
-    while (!isP(toks, p, ")")) {
-      const pn = parseIdent(toks, p)?;
-      const colon = expectP(toks, pn.pos, ":")?;
-      const pt = parseType(toks, colon)?;
-      params.push(Param { name: pn.id, ty: pt.ty, span: spanTo(pn.id.span, pt.ty.span) });
-      p = pt.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-      } else if (!isP(toks, p, ")")) {
-        return Err(errExpected(toks, p, "`,` or `)`"));
-      }
-    }
-    p += 1;
-    let ret: Option<TypeExpr> = None;
-    if (isP(toks, p, ":")) {
-      const rt = parseType(toks, p + 1)?;
-      ret = Some(rt.ty);
-      p = rt.pos;
-    }
-    if (isP(toks, p, "{")) {
-      return Err(diag("E0408", tokAt(toks, p).span, "interface methods cannot have a body (no default methods in Orin 1.0, ADR-0019)"));
-    }
-    p = expectP(toks, p, ";")?;
-    methods.push(IfaceMethod { name: mn.id, params: params, ret: ret, annotations: mannos, span: spanTo(mstart, lastSpan(toks, p)) });
-  }
-  p += 1;
-  const decl = InterfaceDecl {
-    exported: exported,
-    name: name.id,
-    typeParams: tps.ids,
-    ext: ext,
-    methods: methods,
-    annotations: annos,
-    span: spanTo(start, lastSpan(toks, p))
-  };
-  return Ok(ItemRes { item: IInterface(decl), pos: p });
-}
-
-// One class member; modifiers (`public`, `private`, `static`) are contextual keywords that only
-// count when another identifier follows.
-function parseMember(toks: Token[], pos: usize): Result<MemberRes, Diagnostic> {
-  let cls: ContractClause[] = [];
-  let annos: Annotation[] = [];
-  let p = pos;
-  let start = tokAt(toks, pos).span;
-  if (isP(toks, pos, "@")) {
-    const cr = parseDecos(toks, pos)?;
-    cls = cr.clauses;
-    annos = cr.annos;
-    p = cr.pos;
-    start = cr.first;
-  }
-  let priv = false;
-  let isStatic = false;
-  let mods: usize = 0;
-  while (isIdentTok(toks, p + 1)) {
-    if (isIdentText(toks, p, "public")) {
-      p += 1;
-    } else if (isIdentText(toks, p, "private")) {
-      priv = true;
-      p += 1;
-    } else if (isIdentText(toks, p, "static")) {
-      isStatic = true;
-      p += 1;
-    } else {
-      break;
-    }
-    mods += 1;
-  }
-  const name = parseIdent(toks, p)?;
-  p = name.pos;
-  if (isP(toks, p, "(") && name.id.name == "constructor" && mods == 0) {
-    checkPlacement(cls, 2)?;
-    checkAnnoPlacement(annos, 2)?;
-    return parseCtor(toks, p, start, cls);
-  }
-  if (isP(toks, p, "(") || isP(toks, p, "<")) {
-    checkPlacement(cls, 1)?;
-    checkAnnoPlacement(annos, 1)?;
-    const tps = parseTypeParams(toks, p)?;
-    const sg = parseSigBody(toks, tps.pos)?;
-    const md = MethodDecl {
-      priv: priv,
-      isStatic: isStatic,
-      name: name.id,
-      typeParams: tps.ids,
-      params: sg.params,
-      ret: sg.ret,
-      body: sg.body,
-      contracts: cls,
-      annotations: annos,
-      span: spanTo(start, sg.body.span)
-    };
-    return Ok(MemberRes { member: MMethod(md), pos: sg.pos });
-  }
-  if (isP(toks, p, ":")) {
-    if (cls.length > 0) {
-      return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to a field"));
-    }
-    if (annos.length > 0) {
-      return Err(diag("E0440", annos[0].span, "annotation `" + annotationName(annos[0].kind) + "` cannot be applied to a field"));
-    }
-    if (isStatic) {
-      return Err(diag("E0408", spanTo(start, name.id.span), "static fields are not supported (ADR-0009)"));
-    }
-    const ft = parseType(toks, p + 1)?;
-    p = ft.pos;
-    let init: Option<Expr> = None;
-    if (isP(toks, p, "=")) {
-      const e = parseExpr(toks, p + 1)?;
-      init = Some(e.expr);
-      p = e.pos;
-    }
-    p = expectP(toks, p, ";")?;
-    const fd = ClassField { priv: priv, name: name.id, ty: ft.ty, init: init, span: spanTo(start, lastSpan(toks, p)) };
-    return Ok(MemberRes { member: MField(fd), pos: p });
-  }
-  return Err(errExpected(toks, p, "`(` or `:` in class member"));
-}
-
-// pos at the `(` after `constructor`.
-function parseCtor(toks: Token[], pos: usize, start: Span, cls: ContractClause[]): Result<MemberRes, Diagnostic> {
-  let p = pos + 1;
-  let params: CtorParam[] = [];
-  while (!isP(toks, p, ")")) {
-    const pstart = tokAt(toks, p).span;
-    let access = 0;
-    if (isIdentTok(toks, p + 1)) {
-      if (isIdentText(toks, p, "public")) {
-        access = 1;
-        p += 1;
-      } else if (isIdentText(toks, p, "private")) {
-        access = 2;
-        p += 1;
-      }
-    }
-    const pn = parseIdent(toks, p)?;
-    const colon = expectP(toks, pn.pos, ":")?;
-    const pt = parseType(toks, colon)?;
-    params.push(CtorParam { access: access, name: pn.id, ty: pt.ty, span: spanTo(pstart, pt.ty.span) });
-    p = pt.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, ")")) {
-      return Err(errExpected(toks, p, "`,` or `)`"));
-    }
-  }
-  const body = parseBlock(toks, p + 1)?;
-  const cd = CtorDecl { params: params, body: body.block, contracts: cls, span: spanTo(start, body.block.span) };
-  return Ok(MemberRes { member: MCtor(cd), pos: body.pos });
-}
-
-// pos at `type`.
-function parseTypeDecl(toks: Token[], pos: usize, exported: bool, start: Span, cls: ContractClause[], annos: Annotation[]): Result<ItemRes, Diagnostic> {
-  const name = parseIdent(toks, pos + 1)?;
-  const tps = parseTypeParams(toks, name.pos)?;
-  const eq = expectP(toks, tps.pos, "=")?;
-  const body = parseTypeBody(toks, eq)?;
-  const p = expectP(toks, body.pos, ";")?;
-  const isRecord = match (body.body) {
-    DRecord(_) => true,
-    _ => false
-  };
-  checkPlacement(cls, isRecord ? 4 : 5)?;
-  checkAnnoPlacement(annos, isRecord ? 4 : 5)?;
-  const decl = TypeDecl {
-    exported: exported,
-    name: name.id,
-    typeParams: tps.ids,
-    body: body.body,
-    contracts: cls,
-    annotations: annos,
-    span: spanTo(start, lastSpan(toks, p))
-  };
-  return Ok(ItemRes { item: IType(decl), pos: p });
-}
-
-// Right side of `type N = ...`: `{..}` record; `Name(..)` or any `|` -> union; else alias.
-// Mirrors Stage 0: the first member is parsed as a type; a following `|` makes it a union,
-// in which case it must be a bare `Name`. A leading `|` is not accepted.
-function parseTypeBody(toks: Token[], pos: usize): Result<BodyRes, Diagnostic> {
-  if (isP(toks, pos, "{")) {
-    return parseRecordBody(toks, pos);
-  }
-  let p = pos;
-  let variants: VariantDecl[] = [];
-  const first = tokAt(toks, p);
-  const isName = match (first.kind) {
-    KIdent => true,
-    _ => false
-  };
-  if (isName && isP(toks, p + 1, "(")) {
-    const v = parseVariant(toks, p)?;
-    variants.push(v.variant);
-    p = v.pos;
-  } else {
-    const t = parseType(toks, p)?;
-    if (!isP(toks, t.pos, "|")) {
-      return Ok(BodyRes { body: DAlias(t.ty), pos: t.pos });
-    }
-    const bare = match (t.ty.kind) {
-      TNamed(id, args) => args.length == 0,
-      TArray(_) => false,
-      TFn(_, _) => false
-    };
-    if (!bare) {
-      return Err(diag("E0200", t.ty.span, "union members must be `Name` or `Name(T, ...)`"));
-    }
-    const nm = match (t.ty.kind) {
-      TNamed(id, args) => id,
-      TArray(_) => Ident { name: "", span: t.ty.span },
-      TFn(_, _) => Ident { name: "", span: t.ty.span }
-    };
-    variants.push(VariantDecl { name: nm, payload: [], span: t.ty.span });
-    p = t.pos;
-  }
-  while (isP(toks, p, "|")) {
-    const v = parseVariant(toks, p + 1)?;
-    variants.push(v.variant);
-    p = v.pos;
-  }
-  return Ok(BodyRes { body: DUnion(variants), pos: p });
-}
-
-// `{ a: T; b: U; }`
-function parseRecordBody(toks: Token[], pos: usize): Result<BodyRes, Diagnostic> {
-  let p = pos + 1;
-  let fields: FieldDecl[] = [];
-  while (!isP(toks, p, "}")) {
-    const fname = parseIdent(toks, p)?;
-    const colon = expectP(toks, fname.pos, ":")?;
-    const ft = parseType(toks, colon)?;
-    p = expectP(toks, ft.pos, ";")?;
-    fields.push(FieldDecl { name: fname.id, ty: ft.ty, span: spanTo(fname.id.span, lastSpan(toks, p)) });
-  }
-  return Ok(BodyRes { body: DRecord(fields), pos: p + 1 });
-}
-
-// `Name` or `Name(T1, T2)`
-function parseVariant(toks: Token[], pos: usize): Result<VariantRes, Diagnostic> {
-  const name = parseIdent(toks, pos)?;
-  let p = name.pos;
-  let payload: TypeExpr[] = [];
-  if (isP(toks, p, "(")) {
-    p += 1;
-    while (true) {
-      const t = parseType(toks, p)?;
-      payload.push(t.ty);
-      p = t.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-        if (isP(toks, p, ")")) {
-          break;
-        }
-      } else {
-        break;
-      }
-    }
-    p = expectP(toks, p, ")")?;
-  }
-  const v = VariantDecl { name: name.id, payload: payload, span: spanTo(name.id.span, lastSpan(toks, p)) };
-  return Ok(VariantRes { variant: v, pos: p });
-}
-
-// pos at `const`: `const NAME: T = expr;`
-function parseConstDecl(toks: Token[], pos: usize, exported: bool, start: Span): Result<ItemRes, Diagnostic> {
-  const name = parseIdent(toks, pos + 1)?;
-  let p = name.pos;
-  let ty: Option<TypeExpr> = None;
-  if (isP(toks, p, ":")) {
-    const t = parseType(toks, p + 1)?;
-    ty = Some(t.ty);
-    p = t.pos;
-  }
-  p = expectP(toks, p, "=")?;
-  const value = parseExpr(toks, p)?;
-  p = expectP(toks, value.pos, ";")?;
-  const decl = ConstDecl {
-    exported: exported,
-    name: name.id,
-    ty: ty,
-    value: value.expr,
-    span: spanTo(start, lastSpan(toks, p))
-  };
-  return Ok(ItemRes { item: IConst(decl), pos: p });
-}
-
-// ---------------------------------------------------------------------------
-// Statements
-// ---------------------------------------------------------------------------
-
-function mkStmt(kind: StmtKind, start: Span, toks: Token[], p: usize): Stmt {
-  return Stmt { kind: kind, span: spanTo(start, lastSpan(toks, p)) };
-}
-
-// `{ stmt* }`
-function parseBlock(toks: Token[], pos: usize): Result<BlockRes, Diagnostic> {
-  const open = tokAt(toks, pos).span;
-  let p = expectP(toks, pos, "{")?;
-  let stmts: Stmt[] = [];
-  while (!isP(toks, p, "}")) {
-    if (isEof(toks, p)) {
-      return Err(errExpected(toks, p, "`}`"));
-    }
-    if (isP(toks, p, "@")) {
-      // Loop contract clauses: one SContract statement per clause, directly before the loop.
-      const cr = parseClauses(toks, p)?;
-      checkPlacement(cr.clauses, 6)?;
-      for (const c of cr.clauses) {
-        stmts.push(Stmt { kind: SContract(c), span: c.span });
-      }
-      p = cr.pos;
-      if (!isKw(toks, p, "while") && !isKw(toks, p, "for")) {
-        return Err(errExpected(toks, p, "`while` or `for` after a loop contract clause"));
-      }
-    }
-    const s = parseStmt(toks, p)?;
-    stmts.push(s.stmt);
-    p = s.pos;
-  }
-  const blk = Block { stmts: stmts, span: spanTo(open, tokAt(toks, p).span) };
-  return Ok(BlockRes { block: blk, pos: p + 1 });
-}
-
-function blockStmt(b: BlockRes): StmtRes {
-  return StmtRes { stmt: Stmt { kind: SBlock(b.block), span: b.block.span }, pos: b.pos };
-}
-
-function parseStmt(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const t = tokAt(toks, pos);
-  const start = t.span;
-  const isKwTok = match (t.kind) {
-    KKeyword => true,
-    _ => false
-  };
-  if (isKwTok) {
-    if (t.text == "const" || t.text == "let") {
-      return parseLet(toks, pos);
-    }
-    if (t.text == "if") {
-      return parseIf(toks, pos);
-    }
-    if (t.text == "while") {
-      return parseWhile(toks, pos);
-    }
-    if (t.text == "for") {
-      return parseFor(toks, pos);
-    }
-    if (t.text == "return") {
-      return parseReturn(toks, pos);
-    }
-    if (t.text == "break" || t.text == "continue") {
-      const p = expectP(toks, pos + 1, ";")?;
-      let k: StmtKind = SBreak;
-      if (t.text == "continue") {
-        k = SContinue;
-      }
-      return Ok(StmtRes { stmt: mkStmt(k, start, toks, p), pos: p });
-    }
-  }
-  if (isP(toks, pos, "{")) {
-    const b = parseBlock(toks, pos)?;
-    return Ok(blockStmt(b));
-  }
-  return parseExprStmt(toks, pos);
-}
-
-// `const x[: T] = e;` / `let x[: T] = e;` (initializer required)
-function parseLet(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  const mutable = isKw(toks, pos, "let");
-  const name = parseIdent(toks, pos + 1)?;
-  let p = name.pos;
-  let ty: Option<TypeExpr> = None;
-  if (isP(toks, p, ":")) {
-    const t = parseType(toks, p + 1)?;
-    ty = Some(t.ty);
-    p = t.pos;
-  }
-  p = expectP(toks, p, "=")?;
-  const init = parseExpr(toks, p)?;
-  p = expectP(toks, init.pos, ";")?;
-  return Ok(StmtRes { stmt: mkStmt(SLet(mutable, name.id, ty, init.expr), start, toks, p), pos: p });
-}
-
-// `( expr )`
-function parseParenExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const open = expectP(toks, pos, "(")?;
-  const e = parseExpr(toks, open)?;
-  const close = expectP(toks, e.pos, ")")?;
-  return Ok(ExprRes { expr: e.expr, pos: close });
-}
-
-function parseIf(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  const cond = parseParenExpr(toks, pos + 1)?;
-  const thenB = parseBlock(toks, cond.pos)?;
-  let p = thenB.pos;
-  let els: Option<Stmt> = None;
-  if (isKw(toks, p, "else")) {
-    if (isKw(toks, p + 1, "if")) {
-      const e = parseIf(toks, p + 1)?;
-      els = Some(e.stmt);
-      p = e.pos;
-    } else {
-      const b = parseBlock(toks, p + 1)?;
-      els = Some(blockStmt(b).stmt);
-      p = b.pos;
-    }
-  }
-  return Ok(StmtRes { stmt: mkStmt(SIf(cond.expr, thenB.block, els), start, toks, p), pos: p });
-}
-
-function parseWhile(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  const cond = parseParenExpr(toks, pos + 1)?;
-  const body = parseBlock(toks, cond.pos)?;
-  return Ok(StmtRes { stmt: mkStmt(SWhile(cond.expr, body.block), start, toks, body.pos), pos: body.pos });
-}
-
-// `for (const x of expr) { .. }`
-function parseFor(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  let p = expectP(toks, pos + 1, "(")?;
-  p = expectKw(toks, p, "const")?;
-  const name = parseIdent(toks, p)?;
-  p = expectKw(toks, name.pos, "of")?;
-  const iter = parseExpr(toks, p)?;
-  p = expectP(toks, iter.pos, ")")?;
-  const body = parseBlock(toks, p)?;
-  return Ok(StmtRes { stmt: mkStmt(SForOf(name.id, iter.expr, body.block), start, toks, body.pos), pos: body.pos });
-}
-
-function parseReturn(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  let p = pos + 1;
-  let val: Option<Expr> = None;
-  if (!isP(toks, p, ";")) {
-    const e = parseExpr(toks, p)?;
-    val = Some(e.expr);
-    p = e.pos;
-  }
-  p = expectP(toks, p, ";")?;
-  return Ok(StmtRes { stmt: mkStmt(SReturn(val), start, toks, p), pos: p });
-}
-
-function isAssignTok(toks: Token[], pos: usize): bool {
-  const t = tokAt(toks, pos);
-  return match (t.kind) {
-    KPunct => t.text == "=" || t.text == "+=" || t.text == "-=" || t.text == "*=" || t.text == "/=" || t.text == "%=",
-    _ => false
+    _ => false,
   };
 }
 
@@ -1241,666 +109,1925 @@ function assignOpOf(s: string): AssignOp {
 function isMatchExpr(e: Expr): bool {
   return match (e.kind) {
     EMatch(_, _) => true,
-    _ => false
+    _ => false,
   };
 }
-
-// Expression statement or assignment. A statement-level `match` needs no `;`.
-function parseExprStmt(toks: Token[], pos: usize): Result<StmtRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  const e = parseExpr(toks, pos)?;
-  let p = e.pos;
-  if (isAssignTok(toks, p)) {
-    const op = assignOpOf(tokAt(toks, p).text);
-    const rhs = parseExpr(toks, p + 1)?;
-    p = expectP(toks, rhs.pos, ";")?;
-    return Ok(StmtRes { stmt: mkStmt(SAssign(e.expr, op, rhs.expr), start, toks, p), pos: p });
-  }
-  if (isMatchExpr(e.expr) && !isP(toks, p, ";")) {
-    return Ok(StmtRes { stmt: mkStmt(SExpr(e.expr), start, toks, p), pos: p });
-  }
-  p = expectP(toks, p, ";")?;
-  return Ok(StmtRes { stmt: mkStmt(SExpr(e.expr), start, toks, p), pos: p });
-}
-
-// ---------------------------------------------------------------------------
-// Expressions
-// ---------------------------------------------------------------------------
 
 function mkExpr(kind: ExprKind, sp: Span): Expr {
   return Expr { kind: kind, span: sp };
 }
 
-function parseExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const k = arrowStart(toks, pos);
-  if (k == 1) {
-    return parseArrow(toks, pos, false);
-  }
-  if (k == 2) {
-    return parseArrow(toks, pos, true);
-  }
-  const c = parseCond(toks, pos)?;
-  if (isP(toks, c.pos, "==>")) {
-    // `a ==> b`: implication, right-associative, lower than `?:`. Only valid inside contract
-    // expressions; the checker rejects it elsewhere (E0415).
-    const r = parseExpr(toks, c.pos + 1)?;
-    const sp = spanTo(c.expr.span, r.expr.span);
-    return Ok(ExprRes { expr: mkExpr(EBinary(BImplies, c.expr, r.expr), sp), pos: r.pos });
-  }
-  return Ok(c);
+// The codes a parse error can have.
+export function isSyntaxCode(code: string): bool {
+  return code == "E0100"
+      || code == "E0200"
+      || code == "E0201"
+      || code == "E0408"
+      || code == "E0440"
+      || code == "E0441"
+      || code == "E0442";
 }
 
-// Index of the `)` matching the `(` at `pos` (counting only parentheses), or the end of input.
-function matchingParen(toks: Token[], pos: usize): usize {
-  let depth: usize = 0;
-  let p = pos;
-  while (p < toks.length) {
-    if (isP(toks, p, "(")) {
-      depth += 1;
-    } else if (isP(toks, p, ")")) {
-      depth -= 1;
-      if (depth == 0) {
+// The parser over a token stream that ends with KEof (`lex` output). The cursor stays on a token: it never moves past
+// the final KEof.
+@Invariant(this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
+@Invariant(this.pos < this.toks.length)
+export class Parser {
+  private toks: Token[];
+  private pos: usize = 0;
+  private ops: OpTable = new OpTable();
+
+  constructor(toks: Token[]) {
+    this.toks = toks;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cursor and token tests
+  // ---------------------------------------------------------------------------
+
+  // The index of the current token.
+  position(): usize {
+    return this.pos;
+  }
+
+  // True at the final KEof token.
+  atEnd(): bool {
+    return isEofTok(this.toks[this.pos]);
+  }
+
+  // The token `k` after the cursor; positions past the end read as the final KEof token.
+  private at(k: usize): Token {
+    const i = this.pos + k;
+    if (i < this.toks.length) {
+      return this.toks[i];
+    }
+    return this.toks[this.toks.length - 1];
+  }
+
+  // The token at index `i`, clamped like `at`.
+  private tokAbs(i: usize): Token {
+    if (i < this.toks.length) {
+      return this.toks[i];
+    }
+    return this.toks[this.toks.length - 1];
+  }
+
+  private isP(s: string): bool {
+    return isPunctTok(this.toks[this.pos], s);
+  }
+
+  private isPAt(k: usize, s: string): bool {
+    return isPunctTok(this.at(k), s);
+  }
+
+  private isKw(s: string): bool {
+    const t = this.toks[this.pos];
+    return match (t.kind) {
+      KKeyword => t.text == s,
+      _ => false,
+    };
+  }
+
+  private isKwAt(k: usize, s: string): bool {
+    const t = this.at(k);
+    return match (t.kind) {
+      KKeyword => t.text == s,
+      _ => false,
+    };
+  }
+
+  private isEof(): bool {
+    return isEofTok(this.toks[this.pos]);
+  }
+
+  private isIdentAt(k: usize): bool {
+    return match (this.at(k).kind) {
+      KIdent => true,
+      _ => false,
+    };
+  }
+
+  // Contextual keyword: an identifier with exactly this spelling, `k` tokens after the cursor.
+  private isIdentText(k: usize, s: string): bool {
+    const t = this.at(k);
+    return match (t.kind) {
+      KIdent => t.text == s,
+      _ => false,
+    };
+  }
+
+  // Span of the last consumed token (the cursor has moved at least once).
+  @Requires(this.pos >= 1)
+  private lastSpan(): Span {
+    return this.toks[this.pos - 1].span;
+  }
+
+  // `sp` is exactly the extent of the tokens consumed since index `first`: at least one token was consumed, the span
+  // starts with the first of them and ends with the last. (Progress plus a span that neither misses nor overshoots.)
+  private spansFrom(sp: Span, first: usize): bool {
+    return first < this.pos
+        && sp.file == this.toks[first].span.file
+        && sp.start == this.toks[first].span.start
+        && sp.end == this.toks[this.pos - 1].span.end;
+  }
+
+  private errExpectedAt(k: usize, what: string): Diagnostic {
+    const t = this.at(k);
+    return errAt(t, "expected " + what + ", found " + describe(t));
+  }
+
+  private errExpected(what: string): Diagnostic {
+    return this.errExpectedAt(0, what);
+  }
+
+  // Consumes the punctuation `s` or reports what was found instead.
+  @Ensures(result.isOk() ==> this.pos == old(this.pos) + 1)
+  @Ensures(result.isErr() ==> this.pos == old(this.pos))
+  private expectP(s: string): Result<void, Diagnostic> {
+    if (this.isP(s)) {
+      this.pos += 1;
+      return Ok();
+    }
+    return Err(this.errExpected("`" + s + "`"));
+  }
+
+  @Ensures(result.isOk() ==> this.pos == old(this.pos) + 1)
+  @Ensures(result.isErr() ==> this.pos == old(this.pos))
+  private expectKw(s: string): Result<void, Diagnostic> {
+    if (this.isKw(s)) {
+      this.pos += 1;
+      return Ok();
+    }
+    return Err(this.errExpected("`" + s + "`"));
+  }
+
+  @Ensures(result.isOk()
+      ==> this.pos == old(this.pos) + 1 && this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseIdent(): Result<Ident, Diagnostic> {
+    const t = this.toks[this.pos];
+    const ok = match (t.kind) {
+      KIdent => true,
+      _ => false,
+    };
+    if (ok) {
+      this.pos += 1;
+      return Ok(Ident { name: t.text, span: t.span });
+    }
+    return Err(this.errExpected("identifier"));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Types
+  // ---------------------------------------------------------------------------
+
+  // True if the tokens at the cursor start a function type: `(` followed by `)` or `name :`.
+  private isFnTypeStart(): bool {
+    if (!this.isP("(")) {
+      return false;
+    }
+    if (this.isPAt(1, ")")) {
+      return true;
+    }
+    return this.isIdentAt(1) && this.isPAt(2, ":");
+  }
+
+  // `(a: T, b: U) => R` (beyond Orin-B, ADR-0011) or a parenthesised type `(T)` followed by any
+  // number of `[]`; the cursor is at the `(`.
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && typeShallowOk(result.unwrap()))
+  private parseParenType(): Result<TypeExpr, Diagnostic> {
+    const open = this.toks[this.pos].span;
+    if (this.isFnTypeStart()) {
+      this.pos += 1;
+      let ps: FnTyParam[] = [];
+      while (!this.isP(")")) {
+        const pn = this.parseIdent()?;
+        this.expectP(":")?;
+        const pt = this.parseType()?;
+        ps.push(FnTyParam { name: pn, ty: pt });
+        if (this.isP(",")) {
+          this.pos += 1;
+        } else if (!this.isP(")")) {
+          return Err(this.errExpected("`,` or `)`"));
+        }
+      }
+      this.pos += 1;
+      this.expectP("=>")?;
+      const rt = this.parseType()?;
+      return Ok(TypeExpr { kind: TFn(ps, rt), span: spanTo(open, rt.span) });
+    }
+    this.pos += 1;
+    const inner = this.parseType()?;
+    this.expectP(")")?;
+    let ty = TypeExpr { kind: inner.kind, span: spanTo(open, this.lastSpan()) };
+    while (this.isP("[") && this.isPAt(1, "]")) {
+      this.pos += 2;
+      ty = TypeExpr { kind: TArray(ty), span: spanTo(ty.span, this.lastSpan()) };
+    }
+    return Ok(ty);
+  }
+
+  // `Name`, `Name<A, B>`, followed by any number of `[]`; or a function type (see above).
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && typeShallowOk(result.unwrap()))
+  parseType(): Result<TypeExpr, Diagnostic> {
+    if (this.isP("(")) {
+      return this.parseParenType();
+    }
+    const nm = this.parseIdent()?;
+    let args: TypeExpr[] = [];
+    if (this.isP("<")) {
+      this.pos += 1;
+      while (true) {
+        const a = this.parseType()?;
+        args.push(a);
+        if (this.isP(",")) {
+          this.pos += 1;
+        } else {
+          break;
+        }
+      }
+      this.expectP(">")?;
+    }
+    let ty = TypeExpr { kind: TNamed(nm, args), span: spanTo(nm.span, this.lastSpan()) };
+    while (this.isP("[") && this.isPAt(1, "]")) {
+      this.pos += 2;
+      ty = TypeExpr { kind: TArray(ty), span: spanTo(ty.span, this.lastSpan()) };
+    }
+    return Ok(ty);
+  }
+
+  // Optional `<T, U>` list of generic parameter names, each with an optional bound `T extends Shape`
+  // (interfaces, ADR-0019). More than one bound (`A & B`) is E0408. Consumes nothing when there is no `<`.
+  @Ensures(result.isOk() ==> result.unwrap().ids.length == result.unwrap().bounds.length)
+  @Ensures(result.isOk() ==> result.unwrap().ids.length == 0 == (this.pos == old(this.pos)))
+  @Ensures(result.isOk() ==> result.unwrap().any == result.unwrap().bounds.some(b => b.isSome()))
+  private parseTypeParamsB(): Result<Bounds, Diagnostic> {
+    let ids: Ident[] = [];
+    let bounds: Option<Ident>[] = [];
+    let any = false;
+    if (!this.isP("<")) {
+      return Ok(Bounds { ids: ids, bounds: bounds, any: any });
+    }
+    this.pos += 1;
+    while (true) {
+      const id = this.parseIdent()?;
+      ids.push(id);
+      let b: Option<Ident> = None;
+      if (this.isIdentText(0, "extends")) {
+        this.pos += 1;
+        const bi = this.parseIdent()?;
+        b = Some(bi);
+        any = true;
+        if (this.isP("&")) {
+          return Err(
+            diag(
+              "E0408",
+              this.toks[this.pos].span,
+              "a type parameter can have only one bound in Orin 1.0 (`T extends A & B` is not supported, ADR-0019)",
+            ),
+          );
+        }
+      }
+      bounds.push(b);
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else {
+        break;
+      }
+    }
+    this.expectP(">")?;
+    return Ok(Bounds { ids: ids, bounds: bounds, any: any });
+  }
+
+  // Type parameters of declarations that cannot have bounds (types, classes, methods).
+  @Ensures(result.isOk() ==> result.unwrap().length == 0 == (this.pos == old(this.pos)))
+  private parseTypeParams(): Result<Ident[], Diagnostic> {
+    const here = this.toks[this.pos].span;
+    const r = this.parseTypeParamsB()?;
+    if (r.any) {
+      return Err(
+        diag(
+          "E0408",
+          here,
+          "type parameter bounds (`extends`) are only supported on generic functions and classes (ADR-0019, ADR-0026)",
+        ),
+      );
+    }
+    return Ok(r.ids);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Contract clauses (beyond Orin-B, ADR-0012, spec 15 §4.2a)
+  // ---------------------------------------------------------------------------
+  // `@Requires(e)`, `@Ensures(e)`, `@Invariant(e)`, `@Decreases(e)`, `@Rule("ID")` look like annotations
+  // but are dedicated, reserved constructs with their own productions and AST node (ContractClause).
+  // `@Test`, `@Deprecated`, `@Inline` are the built-in annotations (ADR-0024); any other `@Name` is E0408.
+
+  // The cursor is at `@`.
+  @Requires(this.isP("@"))
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  @Ensures(result.isOk()
+      ==> result.unwrap().expr.isNone() == (this.toks[old(this.pos) + 1].text == "Rule"))
+  private parseClause(): Result<ContractClause, Diagnostic> {
+    const at = this.toks[this.pos].span;
+    if (!this.isIdentAt(1)) {
+      return Err(this.errExpectedAt(1, "a contract clause name after `@`"));
+    }
+    const nt = this.at(1);
+    let kind: ContractKind = CRequires;
+    if (nt.text == "Requires") {
+      kind = CRequires;
+    } else if (nt.text == "Ensures") {
+      kind = CEnsures;
+    } else if (nt.text == "Invariant") {
+      kind = CInvariant;
+    } else if (nt.text == "Decreases") {
+      kind = CDecreases;
+    } else if (nt.text == "Rule") {
+      kind = CRule;
+    } else if (isBuiltinAnnotation(nt.text)) {
+      return Err(
+        diag(
+          "E0440",
+          spanTo(at, nt.span),
+          "annotation `@" + nt.text + "` cannot be applied here (it applies to "
+              + annotationTargets(nt.text) + ")",
+        ),
+      );
+    } else {
+      return Err(
+        diag(
+          "E0408",
+          spanTo(at, nt.span),
+          "unknown annotation `@" + nt.text
+              + "`: only the built-in annotations @Test, @Deprecated and @Inline and the contract clauses "
+              + "@Requires, @Ensures, @Invariant, @Decreases and @Rule exist (user-defined annotations are post-1.0, ADR-0024)",
+        ),
+      );
+    }
+    this.pos += 2;
+    this.expectP("(")?;
+    let ex: Option<Expr> = None;
+    let rule = "";
+    const isRule = match (kind) {
+      CRule => true,
+      _ => false,
+    };
+    if (isRule) {
+      const st = this.toks[this.pos];
+      if (!isStrTok(st)) {
+        return Err(this.errExpected("a string literal (rule id)"));
+      }
+      rule = st.text;
+      this.pos += 1;
+    } else {
+      const e = this.parseExpr()?;
+      ex = Some(e);
+    }
+    this.expectP(")")?;
+    return Ok(ContractClause {
+      kind: kind,
+      expr: ex,
+      rule: rule,
+      span: spanTo(at, this.lastSpan()),
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Built-in annotations (beyond Orin-B, ADR-0024): `@Test`, `@Deprecated("message")`, `@Inline`
+  // ---------------------------------------------------------------------------
+
+  // The cursor is at `@` followed by the name of a built-in annotation.
+  @Requires(this.isP("@") && this.isIdentAt(1))
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  @Ensures(result.isErr() ==> result.unwrapErr().code == "E0441")
+  private parseAnnotation(): Result<Annotation, Diagnostic> {
+    const at = this.toks[this.pos].span;
+    const nt = this.at(1);
+    if (nt.text == "Deprecated") {
+      if (!this.isPAt(2, "(")) {
+        return Err(
+          diag(
+            "E0441",
+            spanTo(at, nt.span),
+            "`@Deprecated` requires a message: `@Deprecated(\"use other() instead\")`",
+          ),
+        );
+      }
+      const st = this.at(3);
+      if (!isStrTok(st) || !this.isPAt(4, ")")) {
+        return Err(
+          diag(
+            "E0441",
+            spanTo(at, st.span),
+            "`@Deprecated` takes exactly one string literal argument (the message)",
+          ),
+        );
+      }
+      this.pos += 5;
+      return Ok(Annotation {
+        kind: ADeprecated,
+        message: st.text,
+        span: spanTo(at, this.lastSpan()),
+      });
+    }
+    if (this.isPAt(2, "(")) {
+      return Err(diag("E0441", spanTo(at, nt.span), "`@" + nt.text + "` takes no arguments"));
+    }
+    this.pos += 2;
+    const kind: AnnotationKind = nt.text == "Test" ? ATest : AInline;
+    return Ok(Annotation { kind: kind, message: "", span: spanTo(at, nt.span) });
+  }
+
+  // Contract clauses and built-in annotations in any order; the cursor is at the first `@`. `first` is the span of
+  // the first one (the declaration's span starts there).
+  @Requires(this.isP("@"))
+  @Ensures(result.isOk()
+      ==> this.pos > old(this.pos)
+          && result.unwrap().first.start == this.toks[old(this.pos)].span.start)
+  @Ensures(result.isOk()
+      ==> result.unwrap().clauses.length + result.unwrap().annos.length >= 1 && !this.isP("@"))
+  private parseDecos(): Result<Decos, Diagnostic> {
+    let cs: ContractClause[] = [];
+    let as: Annotation[] = [];
+    const first = this.toks[this.pos].span;
+    while (this.isP("@")) {
+      if (this.isIdentAt(1) && isBuiltinAnnotation(this.at(1).text)) {
+        const a = this.parseAnnotation()?;
+        as.push(a);
+      } else {
+        const c = this.parseClause()?;
+        cs.push(c);
+      }
+    }
+    return Ok(Decos { clauses: cs, annos: as, first: first });
+  }
+
+  // One or more clauses; the cursor is at the first `@`.
+  @Requires(this.isP("@"))
+  @Ensures(result.isOk()
+      ==> this.pos > old(this.pos) && result.unwrap().length >= 1 && !this.isP("@"))
+  private parseClauses(): Result<ContractClause[], Diagnostic> {
+    let cs: ContractClause[] = [];
+    while (this.isP("@")) {
+      const c = this.parseClause()?;
+      cs.push(c);
+    }
+    return Ok(cs);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Items
+  // ---------------------------------------------------------------------------
+
+  // `{ a, b, }` list of names (trailing comma allowed).
+  @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 2)
+  private parseNameList(): Result<Ident[], Diagnostic> {
+    this.expectP("{")?;
+    let ids: Ident[] = [];
+    while (!this.isP("}")) {
+      const id = this.parseIdent()?;
+      ids.push(id);
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP("}")) {
+        return Err(this.errExpected("`,` or `}`"));
+      }
+    }
+    this.pos += 1;
+    return Ok(ids);
+  }
+
+  // `import { .. } from "path";` or `export { .. } from "path";` (the cursor is at the first keyword).
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseImportDecl(): Result<ImportDecl, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    const names = this.parseNameList()?;
+    this.expectKw("from")?;
+    const pt = this.toks[this.pos];
+    if (!isStrTok(pt)) {
+      return Err(this.errExpected("module path string"));
+    }
+    this.pos += 1;
+    this.expectP(";")?;
+    return Ok(ImportDecl {
+      names: names,
+      path: pt.text,
+      pathSpan: pt.span,
+      span: spanTo(start, this.lastSpan()),
+    });
+  }
+
+  // One top-level declaration with the clauses and annotations before it.
+  @Ensures(result.isOk()
+      ==> this.spansFrom(itemSpan(result.unwrap()), old(this.pos))
+          && itemShallowOk(result.unwrap()))
+  parseItem(): Result<Item, Diagnostic> {
+    let cls: ContractClause[] = [];
+    let annos: Annotation[] = [];
+    let start = this.toks[this.pos].span;
+    if (this.isP("@")) {
+      const cr = this.parseDecos()?;
+      cls = cr.clauses;
+      annos = cr.annos;
+      start = cr.first;
+    }
+    if (this.isKw("import")) {
+      if (cls.length > 0) {
+        return Err(diag("E0200", cls[0].span, "contract clauses cannot precede an import"));
+      }
+      checkAnnoPlacement(annos, T_IMPORT)?;
+      const d = this.parseImportDecl()?;
+      return Ok(IImport(d));
+    }
+    let exported = false;
+    if (this.isKw("export")) {
+      if (this.isPAt(1, "{")) {
+        if (cls.length > 0) {
+          return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a re-export"));
+        }
+        checkAnnoPlacement(annos, T_IMPORT)?;
+        const d = this.parseImportDecl()?;
+        return Ok(IReExport(d));
+      }
+      exported = true;
+      this.pos += 1;
+    }
+    if (this.isKw("function")) {
+      checkPlacement(cls, T_FUNCTION)?;
+      checkAnnoPlacement(annos, T_FUNCTION)?;
+      return this.parseFunction(exported, start, cls, annos);
+    }
+    if (this.isKw("type")) {
+      return this.parseTypeDecl(exported, start, cls, annos);
+    }
+    if (this.isKw("const")) {
+      if (cls.length > 0) {
+        return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a constant"));
+      }
+      checkAnnoPlacement(annos, T_CONST)?;
+      return this.parseConstDecl(exported, start);
+    }
+    if (this.isKw("class")) {
+      checkPlacement(cls, T_CLASS)?;
+      checkAnnoPlacement(annos, T_CLASS)?;
+      return this.parseClass(exported, start, cls, annos);
+    }
+    if (this.isKw("interface")) {
+      if (cls.length > 0) {
+        return Err(
+          diag("E0200", cls[0].span, "contract clauses cannot be applied to an interface"),
+        );
+      }
+      checkAnnoPlacement(annos, T_INTERFACE)?;
+      return this.parseInterface(exported, start, annos);
+    }
+    return Err(this.errExpected("declaration"));
+  }
+
+  // `(a: T, ..) [: R] { body }` with the cursor at the `(`; shared by functions and methods.
+  @Ensures(result.isOk()
+      ==> this.pos > old(this.pos) && this.lastSpan().end == result.unwrap().body.span.end)
+  private parseSigBody(): Result<Sig, Diagnostic> {
+    this.expectP("(")?;
+    let params: Param[] = [];
+    while (!this.isP(")")) {
+      const pn = this.parseIdent()?;
+      this.expectP(":")?;
+      const pt = this.parseType()?;
+      params.push(Param { name: pn, ty: pt, span: spanTo(pn.span, pt.span) });
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP(")")) {
+        return Err(this.errExpected("`,` or `)`"));
+      }
+    }
+    this.pos += 1;
+    let ret: Option<TypeExpr> = None;
+    if (this.isP(":")) {
+      this.pos += 1;
+      const rt = this.parseType()?;
+      ret = Some(rt);
+    }
+    const body = this.parseBlock()?;
+    return Ok(Sig { params: params, ret: ret, body: body });
+  }
+
+  // The cursor is at `function`; `start` is the span of the item's first token.
+  @Requires(this.isKw("function"))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseFunction(
+    exported: bool,
+    start: Span,
+    cls: ContractClause[],
+    annos: Annotation[],
+  ): Result<Item, Diagnostic> {
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    const tps = this.parseTypeParamsB()?;
+    const sg = this.parseSigBody()?;
+    return Ok(
+      IFunction(FunctionDecl {
+        exported: exported,
+        name: name,
+        typeParams: tps.ids,
+        bounds: tps.bounds,
+        params: sg.params,
+        ret: sg.ret,
+        body: sg.body,
+        contracts: cls,
+        annotations: annos,
+        span: spanTo(start, sg.body.span),
+      }),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Classes (beyond Orin-B, ADR-0009) and interfaces (ADR-0019)
+  // ---------------------------------------------------------------------------
+
+  // The cursor is at `class`.
+  @Requires(this.isKw("class"))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseClass(
+    exported: bool,
+    start: Span,
+    cls: ContractClause[],
+    annos: Annotation[],
+  ): Result<Item, Diagnostic> {
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    const tps = this.parseTypeParamsB()?;
+    let ext: Option<Ident> = None;
+    if (this.isIdentText(0, "extends")) {
+      this.pos += 1;
+      const b = this.parseIdent()?;
+      ext = Some(b);
+    }
+    let impls: Ident[] = [];
+    if (this.isIdentText(0, "implements")) {
+      this.pos += 1;
+      while (true) {
+        const ii = this.parseIdent()?;
+        impls.push(ii);
+        if (this.isP(",")) {
+          this.pos += 1;
+        } else {
+          break;
+        }
+      }
+    }
+    this.expectP("{")?;
+    let members: ClassMember[] = [];
+    while (!this.isP("}")) {
+      const m = this.parseMember()?;
+      members.push(m);
+    }
+    this.pos += 1;
+    return Ok(
+      IClass(ClassDecl {
+        exported: exported,
+        name: name,
+        typeParams: tps.ids,
+        bounds: tps.bounds,
+        ext: ext,
+        impls: impls,
+        members: members,
+        contracts: cls,
+        annotations: annos,
+        span: spanTo(start, this.lastSpan()),
+      }),
+    );
+  }
+
+  // The cursor is at `interface` (ADR-0019): `interface Name { m(a: T): R; .. }`. `extends` and type parameters are
+  // parsed so the checker can reject them; fields and method bodies are E0408 here.
+  @Requires(this.isKw("interface"))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseInterface(
+    exported: bool,
+    start: Span,
+    annos: Annotation[],
+  ): Result<Item, Diagnostic> {
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    const tps = this.parseTypeParamsB()?;
+    let ext: Option<Ident> = None;
+    if (this.isIdentText(0, "extends")) {
+      this.pos += 1;
+      const b = this.parseIdent()?;
+      ext = Some(b);
+    }
+    this.expectP("{")?;
+    let methods: IfaceMethod[] = [];
+    while (!this.isP("}")) {
+      const m = this.parseIfaceMethod()?;
+      methods.push(m);
+    }
+    this.pos += 1;
+    return Ok(
+      IInterface(InterfaceDecl {
+        exported: exported,
+        name: name,
+        typeParams: tps.ids,
+        ext: ext,
+        methods: methods,
+        annotations: annos,
+        span: spanTo(start, this.lastSpan()),
+      }),
+    );
+  }
+
+  // `[@Deprecated(..)] name(a: T, ..) [: R];` inside an interface.
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseIfaceMethod(): Result<IfaceMethod, Diagnostic> {
+    let mstart = this.toks[this.pos].span;
+    let mannos: Annotation[] = [];
+    if (this.isP("@")) {
+      const dr = this.parseDecos()?;
+      if (dr.clauses.length > 0) {
+        return Err(
+          diag(
+            "E0200",
+            dr.clauses[0].span,
+            "contract clauses cannot be applied to an interface method",
+          ),
+        );
+      }
+      checkAnnoPlacement(dr.annos, T_IFACE_METHOD)?;
+      mannos = dr.annos;
+      mstart = dr.first;
+    }
+    const mn = this.parseIdent()?;
+    if (this.isP(":")) {
+      return Err(
+        diag(
+          "E0408",
+          spanTo(mstart, mn.span),
+          "interfaces cannot declare fields; declare a method (ADR-0019)",
+        ),
+      );
+    }
+    if (this.isP("<")) {
+      return Err(
+        diag(
+          "E0408",
+          this.toks[this.pos].span,
+          "generic interface methods are not supported (ADR-0019)",
+        ),
+      );
+    }
+    this.expectP("(")?;
+    let params: Param[] = [];
+    while (!this.isP(")")) {
+      const pn = this.parseIdent()?;
+      this.expectP(":")?;
+      const pt = this.parseType()?;
+      params.push(Param { name: pn, ty: pt, span: spanTo(pn.span, pt.span) });
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP(")")) {
+        return Err(this.errExpected("`,` or `)`"));
+      }
+    }
+    this.pos += 1;
+    let ret: Option<TypeExpr> = None;
+    if (this.isP(":")) {
+      this.pos += 1;
+      const rt = this.parseType()?;
+      ret = Some(rt);
+    }
+    if (this.isP("{")) {
+      return Err(
+        diag(
+          "E0408",
+          this.toks[this.pos].span,
+          "interface methods cannot have a body (no default methods in Orin 1.0, ADR-0019)",
+        ),
+      );
+    }
+    this.expectP(";")?;
+    return Ok(IfaceMethod {
+      name: mn,
+      params: params,
+      ret: ret,
+      annotations: mannos,
+      span: spanTo(mstart, this.lastSpan()),
+    });
+  }
+
+  // One class member; modifiers (`public`, `private`, `static`) are contextual keywords that only
+  // count when another identifier follows.
+  @Ensures(result.isOk()
+      ==> this.spansFrom(memberSpan(result.unwrap()), old(this.pos))
+          && memberShallowOk(result.unwrap()))
+  private parseMember(): Result<ClassMember, Diagnostic> {
+    let cls: ContractClause[] = [];
+    let annos: Annotation[] = [];
+    let start = this.toks[this.pos].span;
+    if (this.isP("@")) {
+      const cr = this.parseDecos()?;
+      cls = cr.clauses;
+      annos = cr.annos;
+      start = cr.first;
+    }
+    let priv = false;
+    let isStatic = false;
+    let mods: usize = 0;
+    while (this.isIdentAt(1)) {
+      if (this.isIdentText(0, "public")) {
+        this.pos += 1;
+      } else if (this.isIdentText(0, "private")) {
+        priv = true;
+        this.pos += 1;
+      } else if (this.isIdentText(0, "static")) {
+        isStatic = true;
+        this.pos += 1;
+      } else {
+        break;
+      }
+      mods += 1;
+    }
+    const name = this.parseIdent()?;
+    if (this.isP("(") && name.name == "constructor" && mods == 0) {
+      checkPlacement(cls, T_CTOR)?;
+      checkAnnoPlacement(annos, T_CTOR)?;
+      return this.parseCtor(start, cls);
+    }
+    if (this.isP("(") || this.isP("<")) {
+      checkPlacement(cls, T_METHOD)?;
+      checkAnnoPlacement(annos, T_METHOD)?;
+      const tps = this.parseTypeParams()?;
+      const sg = this.parseSigBody()?;
+      return Ok(
+        MMethod(MethodDecl {
+          priv: priv,
+          isStatic: isStatic,
+          name: name,
+          typeParams: tps,
+          params: sg.params,
+          ret: sg.ret,
+          body: sg.body,
+          contracts: cls,
+          annotations: annos,
+          span: spanTo(start, sg.body.span),
+        }),
+      );
+    }
+    if (this.isP(":")) {
+      if (cls.length > 0) {
+        return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to a field"));
+      }
+      if (annos.length > 0) {
+        return Err(
+          diag(
+            "E0440",
+            annos[0].span,
+            "annotation `" + annotationName(annos[0].kind) + "` cannot be applied to a field",
+          ),
+        );
+      }
+      if (isStatic) {
+        return Err(
+          diag("E0408", spanTo(start, name.span), "static fields are not supported (ADR-0009)"),
+        );
+      }
+      this.pos += 1;
+      const ft = this.parseType()?;
+      let init: Option<Expr> = None;
+      if (this.isP("=")) {
+        this.pos += 1;
+        const e = this.parseExpr()?;
+        init = Some(e);
+      }
+      this.expectP(";")?;
+      return Ok(
+        MField(ClassField {
+          priv: priv,
+          name: name,
+          ty: ft,
+          init: init,
+          span: spanTo(start, this.lastSpan()),
+        }),
+      );
+    }
+    return Err(this.errExpected("`(` or `:` in class member"));
+  }
+
+  // The cursor is at the `(` after `constructor`.
+  @Requires(this.isP("("))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseCtor(start: Span, cls: ContractClause[]): Result<ClassMember, Diagnostic> {
+    this.pos += 1;
+    let params: CtorParam[] = [];
+    while (!this.isP(")")) {
+      const pstart = this.toks[this.pos].span;
+      let access = 0;
+      if (this.isIdentAt(1)) {
+        if (this.isIdentText(0, "public")) {
+          access = 1;
+          this.pos += 1;
+        } else if (this.isIdentText(0, "private")) {
+          access = 2;
+          this.pos += 1;
+        }
+      }
+      const pn = this.parseIdent()?;
+      this.expectP(":")?;
+      const pt = this.parseType()?;
+      params.push(CtorParam { access: access, name: pn, ty: pt, span: spanTo(pstart, pt.span) });
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP(")")) {
+        return Err(this.errExpected("`,` or `)`"));
+      }
+    }
+    this.pos += 1;
+    const body = this.parseBlock()?;
+    return Ok(
+      MCtor(CtorDecl {
+        params: params,
+        body: body,
+        contracts: cls,
+        span: spanTo(start, body.span),
+      }),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Type and constant declarations
+  // ---------------------------------------------------------------------------
+
+  // The cursor is at `type`.
+  @Requires(this.isKw("type"))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseTypeDecl(
+    exported: bool,
+    start: Span,
+    cls: ContractClause[],
+    annos: Annotation[],
+  ): Result<Item, Diagnostic> {
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    const tps = this.parseTypeParams()?;
+    this.expectP("=")?;
+    const body = this.parseTypeBody()?;
+    this.expectP(";")?;
+    const isRecord = match (body) {
+      DRecord(_) => true,
+      _ => false,
+    };
+    checkPlacement(cls, isRecord ? T_RECORD : T_TYPE)?;
+    checkAnnoPlacement(annos, isRecord ? T_RECORD : T_TYPE)?;
+    return Ok(
+      IType(TypeDecl {
+        exported: exported,
+        name: name,
+        typeParams: tps,
+        body: body,
+        contracts: cls,
+        annotations: annos,
+        span: spanTo(start, this.lastSpan()),
+      }),
+    );
+  }
+
+  // Right side of `type N = ...`: `{..}` record; `Name(..)` or any `|` -> union; else alias.
+  // Mirrors Stage 0: the first member is parsed as a type; a following `|` makes it a union,
+  // in which case it must be a bare `Name`. A leading `|` is not accepted.
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseTypeBody(): Result<TypeDeclBody, Diagnostic> {
+    if (this.isP("{")) {
+      return this.parseRecordBody();
+    }
+    let variants: VariantDecl[] = [];
+    if (this.isIdentAt(0) && this.isPAt(1, "(")) {
+      const v = this.parseVariant()?;
+      variants.push(v);
+    } else {
+      const t = this.parseType()?;
+      if (!this.isP("|")) {
+        return Ok(DAlias(t));
+      }
+      const bare = match (t.kind) {
+        TNamed(id, args) => args.length == 0,
+        TArray(_) => false,
+        TFn(_, _) => false,
+      };
+      if (!bare) {
+        return Err(diag("E0200", t.span, "union members must be `Name` or `Name(T, ...)`"));
+      }
+      const nm = match (t.kind) {
+        TNamed(id, args) => id,
+        TArray(_) => Ident { name: "", span: t.span },
+        TFn(_, _) => Ident { name: "", span: t.span },
+      };
+      variants.push(VariantDecl { name: nm, payload: [], span: t.span });
+    }
+    while (this.isP("|")) {
+      this.pos += 1;
+      const v = this.parseVariant()?;
+      variants.push(v);
+    }
+    return Ok(DUnion(variants));
+  }
+
+  // `{ a: T; b: U; }`
+  @Requires(this.isP("{"))
+  @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 2)
+  private parseRecordBody(): Result<TypeDeclBody, Diagnostic> {
+    this.pos += 1;
+    let fields: FieldDecl[] = [];
+    while (!this.isP("}")) {
+      const fname = this.parseIdent()?;
+      this.expectP(":")?;
+      const ft = this.parseType()?;
+      this.expectP(";")?;
+      fields.push(FieldDecl { name: fname, ty: ft, span: spanTo(fname.span, this.lastSpan()) });
+    }
+    this.pos += 1;
+    return Ok(DRecord(fields));
+  }
+
+  // `Name` or `Name(T1, T2)`
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseVariant(): Result<VariantDecl, Diagnostic> {
+    const name = this.parseIdent()?;
+    let payload: TypeExpr[] = [];
+    if (this.isP("(")) {
+      this.pos += 1;
+      while (true) {
+        const t = this.parseType()?;
+        payload.push(t);
+        if (this.isP(",")) {
+          this.pos += 1;
+          if (this.isP(")")) {
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      this.expectP(")")?;
+    }
+    return Ok(VariantDecl {
+      name: name,
+      payload: payload,
+      span: spanTo(name.span, this.lastSpan()),
+    });
+  }
+
+  // The cursor is at `const`: `const NAME: T = expr;`
+  @Requires(this.isKw("const"))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private parseConstDecl(exported: bool, start: Span): Result<Item, Diagnostic> {
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    let ty: Option<TypeExpr> = None;
+    if (this.isP(":")) {
+      this.pos += 1;
+      const t = this.parseType()?;
+      ty = Some(t);
+    }
+    this.expectP("=")?;
+    const value = this.parseExpr()?;
+    this.expectP(";")?;
+    return Ok(
+      IConst(ConstDecl {
+        exported: exported,
+        name: name,
+        ty: ty,
+        value: value,
+        span: spanTo(start, this.lastSpan()),
+      }),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Statements
+  // ---------------------------------------------------------------------------
+
+  // A statement of kind `kind` from `start` to the last consumed token.
+  private mkStmt(kind: StmtKind, start: Span): Stmt {
+    return Stmt { kind: kind, span: spanTo(start, this.lastSpan()) };
+  }
+
+  // `{ stmt* }`
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && blockShallowOk(result.unwrap()))
+  parseBlock(): Result<Block, Diagnostic> {
+    const open = this.toks[this.pos].span;
+    this.expectP("{")?;
+    let stmts: Stmt[] = [];
+    while (!this.isP("}")) {
+      if (this.isEof()) {
+        return Err(this.errExpected("`}`"));
+      }
+      if (this.isP("@")) {
+        // Loop contract clauses: one SContract statement per clause, directly before the loop.
+        const cs = this.parseClauses()?;
+        checkPlacement(cs, T_LOOP)?;
+        for (const c of cs) {
+          stmts.push(Stmt { kind: SContract(c), span: c.span });
+        }
+        if (!this.isKw("while") && !this.isKw("for")) {
+          return Err(this.errExpected("`while` or `for` after a loop contract clause"));
+        }
+      }
+      const s = this.parseStmt()?;
+      stmts.push(s);
+    }
+    const blk = Block { stmts: stmts, span: spanTo(open, this.toks[this.pos].span) };
+    this.pos += 1;
+    return Ok(blk);
+  }
+
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && stmtShallowOk(result.unwrap()))
+  parseStmt(): Result<Stmt, Diagnostic> {
+    const t = this.toks[this.pos];
+    const isKwTok = match (t.kind) {
+      KKeyword => true,
+      _ => false,
+    };
+    if (isKwTok) {
+      if (t.text == "const" || t.text == "let") {
+        return this.parseLet();
+      }
+      if (t.text == "if") {
+        return this.parseIf();
+      }
+      if (t.text == "while") {
+        return this.parseWhile();
+      }
+      if (t.text == "for") {
+        return this.parseFor();
+      }
+      if (t.text == "return") {
+        return this.parseReturn();
+      }
+      if (t.text == "break" || t.text == "continue") {
+        this.pos += 1;
+        this.expectP(";")?;
+        let k: StmtKind = SBreak;
+        if (t.text == "continue") {
+          k = SContinue;
+        }
+        return Ok(this.mkStmt(k, t.span));
+      }
+    }
+    if (this.isP("{")) {
+      const b = this.parseBlock()?;
+      return Ok(Stmt { kind: SBlock(b), span: b.span });
+    }
+    return this.parseExprStmt();
+  }
+
+  // `const x[: T] = e;` / `let x[: T] = e;` (initializer required)
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseLet(): Result<Stmt, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    const mutable = this.isKw("let");
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    let ty: Option<TypeExpr> = None;
+    if (this.isP(":")) {
+      this.pos += 1;
+      const t = this.parseType()?;
+      ty = Some(t);
+    }
+    this.expectP("=")?;
+    const init = this.parseExpr()?;
+    this.expectP(";")?;
+    return Ok(this.mkStmt(SLet(mutable, name, ty, init), start));
+  }
+
+  // `( expr )`: the inner expression (its span does not include the parentheses).
+  @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 3)
+  private parseParenExpr(): Result<Expr, Diagnostic> {
+    this.expectP("(")?;
+    const e = this.parseExpr()?;
+    this.expectP(")")?;
+    return Ok(e);
+  }
+
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseIf(): Result<Stmt, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    const cond = this.parseParenExpr()?;
+    const thenB = this.parseBlock()?;
+    let els: Option<Stmt> = None;
+    if (this.isKw("else")) {
+      this.pos += 1;
+      if (this.isKw("if")) {
+        const e = this.parseIf()?;
+        els = Some(e);
+      } else {
+        const b = this.parseBlock()?;
+        els = Some(Stmt { kind: SBlock(b), span: b.span });
+      }
+    }
+    return Ok(this.mkStmt(SIf(cond, thenB, els), start));
+  }
+
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseWhile(): Result<Stmt, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    const cond = this.parseParenExpr()?;
+    const body = this.parseBlock()?;
+    return Ok(this.mkStmt(SWhile(cond, body), start));
+  }
+
+  // `for (const x of expr) { .. }`
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseFor(): Result<Stmt, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    this.expectP("(")?;
+    this.expectKw("const")?;
+    const name = this.parseIdent()?;
+    this.expectKw("of")?;
+    const iter = this.parseExpr()?;
+    this.expectP(")")?;
+    const body = this.parseBlock()?;
+    return Ok(this.mkStmt(SForOf(name, iter, body), start));
+  }
+
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseReturn(): Result<Stmt, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    let val: Option<Expr> = None;
+    if (!this.isP(";")) {
+      const e = this.parseExpr()?;
+      val = Some(e);
+    }
+    this.expectP(";")?;
+    return Ok(this.mkStmt(SReturn(val), start));
+  }
+
+  private isAssignTok(): bool {
+    const t = this.toks[this.pos];
+    return match (t.kind) {
+      KPunct => t.text == "="
+          || t.text == "+="
+          || t.text == "-="
+          || t.text == "*="
+          || t.text == "/="
+          || t.text == "%=",
+      _ => false,
+    };
+  }
+
+  // Expression statement or assignment. A statement-level `match` needs no `;`.
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseExprStmt(): Result<Stmt, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    const e = this.parseExpr()?;
+    if (this.isAssignTok()) {
+      const op = assignOpOf(this.toks[this.pos].text);
+      this.pos += 1;
+      const rhs = this.parseExpr()?;
+      this.expectP(";")?;
+      return Ok(this.mkStmt(SAssign(e, op, rhs), start));
+    }
+    if (isMatchExpr(e) && !this.isP(";")) {
+      return Ok(this.mkStmt(SExpr(e), start));
+    }
+    this.expectP(";")?;
+    return Ok(this.mkStmt(SExpr(e), start));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Expressions
+  // ---------------------------------------------------------------------------
+
+  // A whole expression: an arrow function, or a conditional optionally followed by `==> expr`.
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && exprShallowOk(result.unwrap()))
+  parseExpr(): Result<Expr, Diagnostic> {
+    const k = this.arrowStart();
+    if (k == 1) {
+      return this.parseArrow(false);
+    }
+    if (k == 2) {
+      return this.parseArrow(true);
+    }
+    const c = this.parseCond()?;
+    if (this.isP("==>")) {
+      // `a ==> b`: implication, right-associative, lower than `?:`. Only valid inside contract
+      // expressions; the checker rejects it elsewhere (E0415).
+      this.pos += 1;
+      const r = this.parseExpr()?;
+      return Ok(mkExpr(EBinary(BImplies, c, r), spanTo(c.span, r.span)));
+    }
+    return Ok(c);
+  }
+
+  // Index of the `)` matching the `(` at the cursor (counting only parentheses), or of the final KEof.
+  @Requires(this.isP("("))
+  @Ensures(result > this.pos && result < this.toks.length)
+  private matchingParen(): usize {
+    let depth: usize = 0;
+    let p = this.pos;
+    while (p < this.toks.length) {
+      const t = this.toks[p];
+      if (isPunctTok(t, "(")) {
+        depth += 1;
+      } else if (isPunctTok(t, ")")) {
+        depth -= 1;
+        if (depth == 0) {
+          return p;
+        }
+      } else if (isEofTok(t)) {
         return p;
       }
-    } else if (isEof(toks, p)) {
-      return p;
+      p += 1;
     }
-    p += 1;
+    return p;
   }
-  return p;
-}
 
-// Does an arrow function start at `pos`? 1: `name =>`; 2: `( .. ) [: R] =>`; 0: no (beyond Orin-B,
-// ADR-0011).
-function arrowStart(toks: Token[], pos: usize): int {
-  if (isIdentTok(toks, pos)) {
-    return isP(toks, pos + 1, "=>") ? 1 : 0;
-  }
-  if (!isP(toks, pos, "(")) {
-    return 0;
-  }
-  const q = matchingParen(toks, pos);
-  if (!isP(toks, q, ")")) {
-    return 0;
-  }
-  if (isP(toks, q + 1, "=>")) {
-    return 2;
-  }
-  if (isP(toks, q + 1, ":")) {
-    const rt = parseType(toks, q + 2);
-    if (rt.isOk() && isP(toks, rt.unwrap().pos, "=>")) {
+  // Does an arrow function start at the cursor? 1: `name =>`; 2: `( .. ) [: R] =>`; 0: no (beyond Orin-B,
+  // ADR-0011). Looks ahead without moving the cursor (a return type is tried on a copy of the parser).
+  @Ensures(result >= 0 && result <= 2)
+  private arrowStart(): int {
+    if (this.isIdentAt(0)) {
+      return this.isPAt(1, "=>") ? 1 : 0;
+    }
+    if (!this.isP("(")) {
+      return 0;
+    }
+    const q = this.matchingParen();
+    if (!isPunctTok(this.tokAbs(q), ")")) {
+      return 0;
+    }
+    if (isPunctTok(this.tokAbs(q + 1), "=>")) {
       return 2;
     }
-  }
-  return 0;
-}
-
-// `x => body`, `(x: T, y) [: R] => body`; the body is a block when it starts with `{`.
-function parseArrow(toks: Token[], pos: usize, parens: bool): Result<ExprRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  let p = pos;
-  let ps: ArrowParam[] = [];
-  let ret: Option<TypeExpr> = None;
-  if (!parens) {
-    const nm = parseIdent(toks, p)?;
-    ps.push(ArrowParam { name: nm.id, ty: None, span: nm.id.span });
-    p = nm.pos;
-  } else {
-    p += 1;
-    while (!isP(toks, p, ")")) {
-      const pn = parseIdent(toks, p)?;
-      p = pn.pos;
-      let pty: Option<TypeExpr> = None;
-      let psp = pn.id.span;
-      if (isP(toks, p, ":")) {
-        const pt = parseType(toks, p + 1)?;
-        pty = Some(pt.ty);
-        psp = spanTo(pn.id.span, pt.ty.span);
-        p = pt.pos;
-      }
-      ps.push(ArrowParam { name: pn.id, ty: pty, span: psp });
-      if (isP(toks, p, ",")) {
-        p += 1;
-      } else if (!isP(toks, p, ")")) {
-        return Err(errExpected(toks, p, "`,` or `)`"));
+    if (isPunctTok(this.tokAbs(q + 1), ":")) {
+      let probe = new Parser(this.toks);
+      probe.pos = q + 2;
+      const rt = probe.parseType();
+      if (rt.isOk() && probe.isP("=>")) {
+        return 2;
       }
     }
-    p += 1;
-    if (isP(toks, p, ":")) {
-      const rt = parseType(toks, p + 1)?;
-      ret = Some(rt.ty);
-      p = rt.pos;
-    }
-  }
-  p = expectP(toks, p, "=>")?;
-  if (isP(toks, p, "{")) {
-    const b = parseBlock(toks, p)?;
-    return Ok(ExprRes { expr: mkExpr(EArrow(ps, ret, ABlock(b.block)), spanTo(start, b.block.span)), pos: b.pos });
-  }
-  const e = parseExpr(toks, p)?;
-  return Ok(ExprRes { expr: mkExpr(EArrow(ps, ret, AExpr(e.expr)), spanTo(start, e.expr.span)), pos: e.pos });
-}
-
-// `c ? a : b` (right-associative, lowest precedence). A `?` that reaches here was not
-// taken as postfix propagation (ADR-0003).
-function parseCond(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const c = parseBin(toks, pos, 0)?;
-  if (isP(toks, c.pos, "?")) {
-    const a = parseCond(toks, c.pos + 1)?;
-    const colon = expectP(toks, a.pos, ":")?;
-    const b = parseCond(toks, colon)?;
-    const sp = spanTo(c.expr.span, b.expr.span);
-    return Ok(ExprRes { expr: mkExpr(ECond(c.expr, a.expr, b.expr), sp), pos: b.pos });
-  }
-  return Ok(c);
-}
-
-// Precedence level of a binary operator token, or -1.
-// 0 `||`, 1 `&&`, 2 `== !=`, 3 `< <= > >=`, 4 `+ -`, 5 `* / %`.
-function binLevel(t: Token): int {
-  return match (t.kind) {
-    KPunct => levelOfText(t.text),
-    _ => -1
-  };
-}
-
-function levelOfText(s: string): int {
-  if (s == "||") {
     return 0;
   }
-  if (s == "&&") {
-    return 1;
-  }
-  if (s == "==" || s == "!=") {
-    return 2;
-  }
-  if (s == "<" || s == "<=" || s == ">" || s == ">=") {
-    return 3;
-  }
-  if (s == "+" || s == "-") {
-    return 4;
-  }
-  if (s == "*" || s == "/" || s == "%") {
-    return 5;
-  }
-  return -1;
-}
 
-function binOpOf(s: string): BinaryOp {
-  if (s == "||") {
-    return BOr;
-  }
-  if (s == "&&") {
-    return BAnd;
-  }
-  if (s == "==") {
-    return BEq;
-  }
-  if (s == "!=") {
-    return BNe;
-  }
-  if (s == "<") {
-    return BLt;
-  }
-  if (s == "<=") {
-    return BLe;
-  }
-  if (s == ">") {
-    return BGt;
-  }
-  if (s == ">=") {
-    return BGe;
-  }
-  if (s == "+") {
-    return BAdd;
-  }
-  if (s == "-") {
-    return BSub;
-  }
-  if (s == "*") {
-    return BMul;
-  }
-  if (s == "/") {
-    return BDiv;
-  }
-  return BRem;
-}
-
-// Left-associative binary operators at `level` and tighter.
-function parseBin(toks: Token[], pos: usize, level: int): Result<ExprRes, Diagnostic> {
-  if (level > 5) {
-    return parseUnary(toks, pos);
-  }
-  const first = parseBin(toks, pos, level + 1)?;
-  let lhs = first.expr;
-  let p = first.pos;
-  while (binLevel(tokAt(toks, p)) == level) {
-    const op = binOpOf(tokAt(toks, p).text);
-    const r = parseBin(toks, p + 1, level + 1)?;
-    lhs = mkExpr(EBinary(op, lhs, r.expr), spanTo(lhs.span, r.expr.span));
-    p = r.pos;
-  }
-  return Ok(ExprRes { expr: lhs, pos: p });
-}
-
-function parseUnary(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const t = tokAt(toks, pos);
-  if (isP(toks, pos, "!") || isP(toks, pos, "-")) {
-    const operand = parseUnary(toks, pos + 1)?;
-    let op: UnaryOp = UNot;
-    if (t.text == "-") {
-      op = UNeg;
-    }
-    return Ok(ExprRes { expr: mkExpr(EUnary(op, operand.expr), spanTo(t.span, operand.expr.span)), pos: operand.pos });
-  }
-  return parsePostfix(toks, pos);
-}
-
-// True if the token at `pos` cannot start an expression, so a preceding `?` is
-// propagation: one of `) ] } , ; . ? :` or end of file (ADR-0003).
-function isPropagateFollow(toks: Token[], pos: usize): bool {
-  const t = tokAt(toks, pos);
-  return match (t.kind) {
-    KEof => true,
-    KPunct => t.text == ")" || t.text == "]" || t.text == "}" || t.text == "," || t.text == ";"
-      || t.text == "." || t.text == "?" || t.text == ":",
-    _ => false
-  };
-}
-
-// `open` ... `close` comma-separated expressions; pos at the opening token.
-function parseExprList(toks: Token[], pos: usize, close: string): Result<ExprsRes, Diagnostic> {
-  let p = pos + 1;
-  let xs: Expr[] = [];
-  while (!isP(toks, p, close)) {
-    const a = parseExpr(toks, p)?;
-    xs.push(a.expr);
-    p = a.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, close)) {
-      return Err(errExpected(toks, p, "`,` or `" + close + "`"));
-    }
-  }
-  return Ok(ExprsRes { exprs: xs, pos: p + 1 });
-}
-
-// primary followed by calls, member accesses, indexing and `?`.
-function parsePostfix(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const prim = parsePrimary(toks, pos)?;
-  let e = prim.expr;
-  let p = prim.pos;
-  while (true) {
-    if (isP(toks, p, "(")) {
-      const args = parseExprList(toks, p, ")")?;
-      e = mkExpr(ECall(e, args.exprs), spanTo(e.span, lastSpan(toks, args.pos)));
-      p = args.pos;
-    } else if (isP(toks, p, ".")) {
-      const m = parseIdent(toks, p + 1)?;
-      e = mkExpr(EMember(e, m.id), spanTo(e.span, m.id.span));
-      p = m.pos;
-    } else if (isP(toks, p, "[")) {
-      const ix = parseExpr(toks, p + 1)?;
-      const q = expectP(toks, ix.pos, "]")?;
-      e = mkExpr(EIndex(e, ix.expr), spanTo(e.span, lastSpan(toks, q)));
-      p = q;
-    } else if (isP(toks, p, "?") && isPropagateFollow(toks, p + 1)) {
-      e = mkExpr(ETry(e), spanTo(e.span, tokAt(toks, p).span));
-      p += 1;
+  // `x => body`, `(x: T, y) [: R] => body`; the body is a block when it starts with `{`.
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseArrow(parens: bool): Result<Expr, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    let ps: ArrowParam[] = [];
+    let ret: Option<TypeExpr> = None;
+    if (!parens) {
+      const nm = this.parseIdent()?;
+      ps.push(ArrowParam { name: nm, ty: None, span: nm.span });
     } else {
-      break;
+      this.pos += 1;
+      while (!this.isP(")")) {
+        const pn = this.parseIdent()?;
+        let pty: Option<TypeExpr> = None;
+        let psp = pn.span;
+        if (this.isP(":")) {
+          this.pos += 1;
+          const pt = this.parseType()?;
+          pty = Some(pt);
+          psp = spanTo(pn.span, pt.span);
+        }
+        ps.push(ArrowParam { name: pn, ty: pty, span: psp });
+        if (this.isP(",")) {
+          this.pos += 1;
+        } else if (!this.isP(")")) {
+          return Err(this.errExpected("`,` or `)`"));
+        }
+      }
+      this.pos += 1;
+      if (this.isP(":")) {
+        this.pos += 1;
+        const rt = this.parseType()?;
+        ret = Some(rt);
+      }
     }
+    this.expectP("=>")?;
+    if (this.isP("{")) {
+      const b = this.parseBlock()?;
+      return Ok(mkExpr(EArrow(ps, ret, ABlock(b)), spanTo(start, b.span)));
+    }
+    const e = this.parseExpr()?;
+    return Ok(mkExpr(EArrow(ps, ret, AExpr(e)), spanTo(start, e.span)));
   }
-  return Ok(ExprRes { expr: e, pos: p });
-}
 
-// A template literal with interpolations (ADR-0022), at its KTplHead token: `head expr (mid expr)* tail`.
-function parseTemplate(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const head = tokAt(toks, pos);
-  let parts: string[] = [head.text];
-  let exprs: Expr[] = [];
-  let p = pos + 1;
-  while (true) {
-    const e = parseExpr(toks, p)?;
-    exprs.push(e.expr);
-    p = e.pos;
-    const t = tokAt(toks, p);
-    const isMid = match (t.kind) {
-      KTplMid => true,
-      _ => false
+  // `c ? a : b` (right-associative, below every binary operator). A `?` that reaches here was not
+  // taken as postfix propagation (ADR-0003).
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseCond(): Result<Expr, Diagnostic> {
+    const c = this.parseBin(0)?;
+    if (this.isP("?")) {
+      this.pos += 1;
+      const a = this.parseCond()?;
+      this.expectP(":")?;
+      const b = this.parseCond()?;
+      return Ok(mkExpr(ECond(c, a, b), spanTo(c.span, b.span)));
+    }
+    return Ok(c);
+  }
+
+  // Level of the binary operator at the cursor (precedence.or), or -1.
+  private levelHere(): int {
+    const t = this.toks[this.pos];
+    return match (t.kind) {
+      KPunct => this.ops.level(t.text),
+      _ => -1,
     };
-    const isTail = match (t.kind) {
-      KTplTail => true,
-      _ => false
+  }
+
+  // Precedence climbing over the operator table: an operand followed by operators of level `min` or tighter. A
+  // left-associative operator parses its right side one level tighter (so `a - b - c` is `(a - b) - c`), a
+  // right-associative one at its own level. On return the operator at the cursor, if any, is looser than `min`.
+  @Requires(min >= 0)
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && this.levelHere() < min)
+  private parseBin(min: int): Result<Expr, Diagnostic> {
+    let lhs = this.parseUnary()?;
+    while (this.levelHere() >= min) {
+      const row = this.ops.rowOf(this.toks[this.pos].text);
+      this.pos += 1;
+      const rhs = this.parseBin(row.rightAssoc ? row.level : row.level + 1)?;
+      lhs = mkExpr(EBinary(row.op, lhs, rhs), spanTo(lhs.span, rhs.span));
+    }
+    return Ok(lhs);
+  }
+
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseUnary(): Result<Expr, Diagnostic> {
+    const t = this.toks[this.pos];
+    if (this.isP("!") || this.isP("-")) {
+      this.pos += 1;
+      const operand = this.parseUnary()?;
+      let op: UnaryOp = UNot;
+      if (t.text == "-") {
+        op = UNeg;
+      }
+      return Ok(mkExpr(EUnary(op, operand), spanTo(t.span, operand.span)));
+    }
+    return this.parsePostfix();
+  }
+
+  // True if the token after the cursor cannot start an expression, so a `?` at the cursor is
+  // propagation: one of `) ] } , ; . ? :` or end of file (ADR-0003).
+  private isPropagateFollow(): bool {
+    const t = this.at(1);
+    return match (t.kind) {
+      KEof => true,
+      KPunct => t.text == ")"
+          || t.text == "]"
+          || t.text == "}"
+          || t.text == ","
+          || t.text == ";"
+          || t.text == "."
+          || t.text == "?"
+          || t.text == ":",
+      _ => false,
     };
-    if (!isMid && !isTail) {
-      return Err(errExpected(toks, p, "`}` to close the interpolation"));
+  }
+
+  // `open` ... `close` comma-separated expressions; the cursor is at the opening token.
+  @Ensures(result.isOk()
+      ==> this.pos >= old(this.pos) + 2 && isPunctTok(this.toks[this.pos - 1], close))
+  private parseExprList(close: string): Result<Expr[], Diagnostic> {
+    this.pos += 1;
+    let xs: Expr[] = [];
+    while (!this.isP(close)) {
+      const a = this.parseExpr()?;
+      xs.push(a);
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP(close)) {
+        return Err(this.errExpected("`,` or `" + close + "`"));
+      }
     }
-    parts.push(t.text);
-    p += 1;
-    if (isTail) {
-      return Ok(ExprRes { expr: mkExpr(ETemplate(parts, exprs), spanTo(head.span, t.span)), pos: p });
+    this.pos += 1;
+    return Ok(xs);
+  }
+
+  // primary followed by calls, member accesses, indexing and `?`.
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parsePostfix(): Result<Expr, Diagnostic> {
+    let e = this.parsePrimary()?;
+    while (true) {
+      if (this.isP("(")) {
+        const args = this.parseExprList(")")?;
+        e = mkExpr(ECall(e, args), spanTo(e.span, this.lastSpan()));
+      } else if (this.isP(".")) {
+        this.pos += 1;
+        const m = this.parseIdent()?;
+        e = mkExpr(EMember(e, m), spanTo(e.span, m.span));
+      } else if (this.isP("[")) {
+        this.pos += 1;
+        const ix = this.parseExpr()?;
+        this.expectP("]")?;
+        e = mkExpr(EIndex(e, ix), spanTo(e.span, this.lastSpan()));
+      } else if (this.isP("?") && this.isPropagateFollow()) {
+        e = mkExpr(ETry(e), spanTo(e.span, this.toks[this.pos].span));
+        this.pos += 1;
+      } else {
+        break;
+      }
+    }
+    return Ok(e);
+  }
+
+  // A template literal with interpolations (ADR-0022), at its KTplHead token: `head expr (mid expr)* tail`.
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseTemplate(): Result<Expr, Diagnostic> {
+    const head = this.toks[this.pos];
+    let parts: string[] = [head.text];
+    let exprs: Expr[] = [];
+    this.pos += 1;
+    while (true) {
+      const e = this.parseExpr()?;
+      exprs.push(e);
+      const t = this.toks[this.pos];
+      const isMid = match (t.kind) {
+        KTplMid => true,
+        _ => false,
+      };
+      const isTail = match (t.kind) {
+        KTplTail => true,
+        _ => false,
+      };
+      if (!isMid && !isTail) {
+        return Err(this.errExpected("`}` to close the interpolation"));
+      }
+      parts.push(t.text);
+      this.pos += 1;
+      if (isTail) {
+        return Ok(mkExpr(ETemplate(parts, exprs), spanTo(head.span, t.span)));
+      }
+    }
+    return Err(this.errExpected("template literal"));
+  }
+
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parsePrimary(): Result<Expr, Diagnostic> {
+    const t = this.toks[this.pos];
+    match (t.kind) {
+      KInt => {
+        this.pos += 1;
+        return Ok(mkExpr(EInt(t.value), t.span));
+      },
+      KBigInt => {
+        this.pos += 1;
+        return Ok(mkExpr(EBigInt(t.value), t.span));
+      },
+      KFloat => {
+        this.pos += 1;
+        return Ok(mkExpr(EFloat(t.text), t.span));
+      },
+      KStr => {
+        this.pos += 1;
+        return Ok(mkExpr(EStr(t.text), t.span));
+      },
+      KTplFull => {
+        this.pos += 1;
+        const none: Expr[] = [];
+        return Ok(mkExpr(ETemplate([t.text], none), t.span));
+      },
+      KTplHead => {
+        return this.parseTemplate();
+      },
+      KTplMid => {
+        return Err(this.errExpected("expression"));
+      },
+      KTplTail => {
+        return Err(this.errExpected("expression"));
+      },
+      KIdent => {
+        return this.parseIdentExpr();
+      },
+      KPunct => {
+        return this.parsePunctExpr();
+      },
+      KKeyword => {
+        return this.parseKeywordExpr();
+      },
+      KEof => {
+        return Err(this.errExpected("expression"));
+      },
     }
   }
-  return Err(errExpected(toks, p, "template literal"));
-}
 
-function parsePrimary(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const t = tokAt(toks, pos);
-  match (t.kind) {
-    KInt => {
-      return Ok(ExprRes { expr: mkExpr(EInt(t.value), t.span), pos: pos + 1 });
-    },
-    KBigInt => {
-      return Ok(ExprRes { expr: mkExpr(EBigInt(t.value), t.span), pos: pos + 1 });
-    },
-    KFloat => {
-      return Ok(ExprRes { expr: mkExpr(EFloat(t.text), t.span), pos: pos + 1 });
-    },
-    KStr => {
-      return Ok(ExprRes { expr: mkExpr(EStr(t.text), t.span), pos: pos + 1 });
-    },
-    KTplFull => {
-      const none: Expr[] = [];
-      return Ok(ExprRes { expr: mkExpr(ETemplate([t.text], none), t.span), pos: pos + 1 });
-    },
-    KTplHead => {
-      return parseTemplate(toks, pos);
-    },
-    KTplMid => {
-      return Err(errExpected(toks, pos, "expression"));
-    },
-    KTplTail => {
-      return Err(errExpected(toks, pos, "expression"));
-    },
-    KIdent => {
-      return parseIdentExpr(toks, pos);
-    },
-    KPunct => {
-      return parsePunctExpr(toks, pos);
-    },
-    KKeyword => {
-      return parseKeywordExpr(toks, pos);
-    },
-    KEof => {
-      return Err(errExpected(toks, pos, "expression"));
+  // `( e )` or `[a, b]`. Parentheses produce no node: the result is the inner expression with
+  // its span widened to include the parentheses (as Stage 0 does).
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parsePunctExpr(): Result<Expr, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    if (this.isP("(")) {
+      const inner = this.parseParenExpr()?;
+      return Ok(mkExpr(inner.kind, spanTo(start, this.lastSpan())));
     }
-  }
-}
-
-// `( e )` or `[a, b]`. Parentheses produce no node: the result is the inner expression with
-// its span widened to include the parentheses (as Stage 0 does).
-function parsePunctExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  if (isP(toks, pos, "(")) {
-    const inner = parseParenExpr(toks, pos)?;
-    const wide = spanTo(tokAt(toks, pos).span, lastSpan(toks, inner.pos));
-    return Ok(ExprRes { expr: mkExpr(inner.expr.kind, wide), pos: inner.pos });
-  }
-  if (isP(toks, pos, "[")) {
-    const xs = parseExprList(toks, pos, "]")?;
-    const sp = spanTo(tokAt(toks, pos).span, lastSpan(toks, xs.pos));
-    return Ok(ExprRes { expr: mkExpr(EArray(xs.exprs), sp), pos: xs.pos });
-  }
-  return Err(errExpected(toks, pos, "expression"));
-}
-
-function parseKeywordExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const t = tokAt(toks, pos);
-  if (t.text == "true" || t.text == "false") {
-    return Ok(ExprRes { expr: mkExpr(EBool(t.text == "true"), t.span), pos: pos + 1 });
-  }
-  if (t.text == "match") {
-    return parseMatch(toks, pos);
-  }
-  if (t.text == "this") {
-    return Ok(ExprRes { expr: mkExpr(EThis, t.span), pos: pos + 1 });
-  }
-  if (t.text == "new") {
-    return parseNew(toks, pos);
-  }
-  return Err(errExpected(toks, pos, "expression"));
-}
-
-// `new C(args)` / `new C<T>(args)` (type arguments: generic classes, ADR-0026).
-function parseNew(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  if (!isIdentTok(toks, pos + 1)) {
-    return Err(errExpected(toks, pos, "expression"));
-  }
-  const nm = parseIdent(toks, pos + 1)?;
-  let p = nm.pos;
-  let targs: TypeExpr[] = [];
-  if (isP(toks, p, "<")) {
-    const ta = tryTypeArgs(toks, p);
-    if (ta.isSome()) {
-      targs = ta.unwrap().tys;
-      p = ta.unwrap().pos;
+    if (this.isP("[")) {
+      const xs = this.parseExprList("]")?;
+      return Ok(mkExpr(EArray(xs), spanTo(start, this.lastSpan())));
     }
+    return Err(this.errExpected("expression"));
   }
-  if (!isP(toks, p, "(")) {
-    return Err(errExpected(toks, p, "`(` after `new` class name"));
-  }
-  const args = parseExprList(toks, p, ")")?;
-  const sp = spanTo(tokAt(toks, pos).span, lastSpan(toks, args.pos));
-  return Ok(ExprRes { expr: mkExpr(ENew(nm.id, targs, args.exprs), sp), pos: args.pos });
-}
 
-// `<T, U>` list of type arguments at `pos`, or None if the tokens there are not a well-formed
-// list (the caller then treats `<` as a comparison). Never reports errors.
-function tryTypeArgs(toks: Token[], pos: usize): Option<TypeArgsRes> {
-  if (!isP(toks, pos, "<")) {
-    return None;
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseKeywordExpr(): Result<Expr, Diagnostic> {
+    const t = this.toks[this.pos];
+    if (t.text == "true" || t.text == "false") {
+      this.pos += 1;
+      return Ok(mkExpr(EBool(t.text == "true"), t.span));
+    }
+    if (t.text == "match") {
+      return this.parseMatch();
+    }
+    if (t.text == "this") {
+      this.pos += 1;
+      return Ok(mkExpr(EThis, t.span));
+    }
+    if (t.text == "new") {
+      return this.parseNew();
+    }
+    return Err(this.errExpected("expression"));
   }
-  let p = pos + 1;
-  let tys: TypeExpr[] = [];
-  while (true) {
-    const r = parseType(toks, p);
-    if (r.isErr()) {
+
+  // `new C(args)` / `new C<T>(args)` (type arguments: generic classes, ADR-0026).
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseNew(): Result<Expr, Diagnostic> {
+    if (!this.isIdentAt(1)) {
+      return Err(this.errExpected("expression"));
+    }
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    const nm = this.parseIdent()?;
+    let targs: TypeExpr[] = [];
+    if (this.isP("<")) {
+      const ta = this.tryTypeArgs();
+      if (ta.isSome()) {
+        targs = ta.unwrap();
+      }
+    }
+    if (!this.isP("(")) {
+      return Err(this.errExpected("`(` after `new` class name"));
+    }
+    const args = this.parseExprList(")")?;
+    return Ok(mkExpr(ENew(nm, targs, args), spanTo(start, this.lastSpan())));
+  }
+
+  // `<T, U>` list of type arguments at the cursor, or None if the tokens there are not a well-formed
+  // list (the caller then treats `<` as a comparison). Never reports errors; on None the cursor is unchanged.
+  @Ensures(result.isNone() ==> this.pos == old(this.pos))
+  @Ensures(result.isSome()
+      ==> this.pos >= old(this.pos) + 3
+          && result.unwrap().length >= 1
+          && isPunctTok(this.toks[this.pos - 1], ">"))
+  private tryTypeArgs(): Option<TypeExpr[]> {
+    if (!this.isP("<")) {
       return None;
     }
-    const a = r.unwrap();
-    tys.push(a.ty);
-    p = a.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else {
-      break;
-    }
-  }
-  if (!isP(toks, p, ">")) {
-    return None;
-  }
-  return Some(TypeArgsRes { tys: tys, pos: p + 1 });
-}
-
-// Identifier, record literal when directly followed by `{`, or (beyond Orin-B) a generic
-// form `name<types>(` / `Name<types> {` -- decided by backtracking (ADR-0007).
-function parseIdentExpr(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const nm = parseIdent(toks, pos)?;
-  if (isP(toks, nm.pos, "{")) {
-    return parseRecordLit(toks, nm, []);
-  }
-  if (isP(toks, nm.pos, "<")) {
-    const ta = tryTypeArgs(toks, nm.pos);
-    if (ta.isSome()) {
-      const targs = ta.unwrap();
-      if (isP(toks, targs.pos, "(")) {
-        const sp = spanTo(nm.id.span, lastSpan(toks, targs.pos));
-        return Ok(ExprRes { expr: mkExpr(ETyApp(nm.id, targs.tys), sp), pos: targs.pos });
+    const save = this.pos;
+    this.pos += 1;
+    let tys: TypeExpr[] = [];
+    while (true) {
+      const r = this.parseType();
+      if (r.isErr()) {
+        this.pos = save;
+        return None;
       }
-      if (isP(toks, targs.pos, "{")) {
-        return parseRecordLit(toks, IdentRes { id: nm.id, pos: targs.pos }, targs.tys);
+      tys.push(r.unwrap());
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else {
+        break;
       }
     }
-  }
-  return Ok(ExprRes { expr: mkExpr(EIdent(nm.id), nm.id.span), pos: nm.pos });
-}
-
-// `Name { ...spread, a: e, b: e }`; `nm.pos` is at the `{`.
-function parseRecordLit(toks: Token[], nm: IdentRes, targs: TypeExpr[]): Result<ExprRes, Diagnostic> {
-  let p = nm.pos + 1;
-  let spread: Option<Expr> = None;
-  if (isP(toks, p, "...")) {
-    const s = parseExpr(toks, p + 1)?;
-    spread = Some(s.expr);
-    p = s.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, "}")) {
-      return Err(errExpected(toks, p, "`,` or `}`"));
+    if (!this.isP(">")) {
+      this.pos = save;
+      return None;
     }
+    this.pos += 1;
+    return Some(tys);
   }
-  let fields: FieldInit[] = [];
-  while (!isP(toks, p, "}")) {
-    const fname = parseIdent(toks, p)?;
-    const colon = expectP(toks, fname.pos, ":")?;
-    const v = parseExpr(toks, colon)?;
-    fields.push(FieldInit { name: fname.id, value: v.expr, span: spanTo(fname.id.span, v.expr.span) });
-    p = v.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, "}")) {
-      return Err(errExpected(toks, p, "`,` or `}`"));
+
+  // Identifier, record literal when directly followed by `{`, or (beyond Orin-B) a generic
+  // form `name<types>(` / `Name<types> {` -- decided by backtracking (ADR-0007).
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseIdentExpr(): Result<Expr, Diagnostic> {
+    const nm = this.parseIdent()?;
+    if (this.isP("{")) {
+      return this.parseRecordLit(nm, []);
     }
-  }
-  p += 1;
-  const sp = spanTo(nm.id.span, lastSpan(toks, p));
-  if (targs.length > 0) {
-    return Ok(ExprRes { expr: mkExpr(ERecordT(nm.id, targs, spread, fields), sp), pos: p });
-  }
-  return Ok(ExprRes { expr: mkExpr(ERecord(nm.id, spread, fields), sp), pos: p });
-}
-
-// `match (e) { pattern => body, ... }`
-function parseMatch(toks: Token[], pos: usize): Result<ExprRes, Diagnostic> {
-  const start = tokAt(toks, pos).span;
-  const scrut = parseParenExpr(toks, pos + 1)?;
-  let p = expectP(toks, scrut.pos, "{")?;
-  let arms: MatchArm[] = [];
-  while (!isP(toks, p, "}")) {
-    const pat = parsePattern(toks, p)?;
-    const arrow = expectP(toks, pat.pos, "=>")?;
-    if (isP(toks, arrow, "{")) {
-      // Block arm: the comma after it is optional.
-      const b = parseBlock(toks, arrow)?;
-      arms.push(MatchArm { pattern: pat.pat, body: BBlock(b.block), span: spanTo(pat.pat.span, b.block.span) });
-      p = b.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-      }
-    } else {
-      const e = parseExpr(toks, arrow)?;
-      arms.push(MatchArm { pattern: pat.pat, body: BExpr(e.expr), span: spanTo(pat.pat.span, e.expr.span) });
-      p = e.pos;
-      if (isP(toks, p, ",")) {
-        p += 1;
-      } else if (!isP(toks, p, "}")) {
-        return Err(errExpected(toks, p, "`,` or `}`"));
-      }
-    }
-  }
-  p += 1;
-  return Ok(ExprRes { expr: mkExpr(EMatch(scrut.expr, arms), spanTo(start, lastSpan(toks, p))), pos: p });
-}
-
-// ---------------------------------------------------------------------------
-// Patterns
-// ---------------------------------------------------------------------------
-
-function mkPat(kind: PatternKind, sp: Span, pos: usize): Result<PatRes, Diagnostic> {
-  return Ok(PatRes { pat: Pattern { kind: kind, span: sp }, pos: pos });
-}
-
-function parsePattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
-  const t = tokAt(toks, pos);
-  match (t.kind) {
-    KIdent => {
-      return parseIdentPattern(toks, pos);
-    },
-    KInt => {
-      return mkPat(PInt(t.value), t.span, pos + 1);
-    },
-    KFloat => {
-      return Err(errExpected(toks, pos, "pattern (float literals cannot be matched)"));
-    },
-    KBigInt => {
-      return Err(errExpected(toks, pos, "pattern (integer literal too large for a pattern)"));
-    },
-    KTplFull => {
-      return Err(errExpected(toks, pos, "pattern (template literals cannot be matched)"));
-    },
-    KTplHead => {
-      return Err(errExpected(toks, pos, "pattern (template literals cannot be matched)"));
-    },
-    KTplMid => {
-      return Err(errExpected(toks, pos, "pattern"));
-    },
-    KTplTail => {
-      return Err(errExpected(toks, pos, "pattern"));
-    },
-    KStr => {
-      return mkPat(PStr(t.text), t.span, pos + 1);
-    },
-    KKeyword => {
-      if (t.text == "true" || t.text == "false") {
-        return mkPat(PBool(t.text == "true"), t.span, pos + 1);
-      }
-      return Err(errExpected(toks, pos, "pattern"));
-    },
-    KPunct => {
-      // Negative integer literal pattern.
-      const nt = tokAt(toks, pos + 1);
-      if (isP(toks, pos, "-")) {
-        if (isKindInt(nt)) {
-          return mkPat(PInt(0 - nt.value), spanTo(t.span, nt.span), pos + 2);
+    if (this.isP("<")) {
+      const afterName = this.pos;
+      const ta = this.tryTypeArgs();
+      if (ta.isSome()) {
+        const targs = ta.unwrap();
+        if (this.isP("(")) {
+          return Ok(mkExpr(ETyApp(nm, targs), spanTo(nm.span, this.lastSpan())));
         }
-        return Err(errExpected(toks, pos + 1, "integer after `-` in pattern"));
+        if (this.isP("{")) {
+          return this.parseRecordLit(nm, targs);
+        }
+        this.pos = afterName;
       }
-      return Err(errExpected(toks, pos, "pattern"));
-    },
-    KEof => {
-      return Err(errExpected(toks, pos, "pattern"));
     }
+    return Ok(mkExpr(EIdent(nm), nm.span));
+  }
+
+  // `Name { ...spread, a: e, b: e }`; the name (and type arguments) are consumed, the cursor is at the `{`.
+  @Requires(this.isP("{"))
+  @Ensures(result.isOk()
+      ==> this.pos >= old(this.pos) + 2
+          && result.unwrap().span.start == nm.span.start
+          && result.unwrap().span.end == this.lastSpan().end)
+  private parseRecordLit(nm: Ident, targs: TypeExpr[]): Result<Expr, Diagnostic> {
+    this.pos += 1;
+    let spread: Option<Expr> = None;
+    if (this.isP("...")) {
+      this.pos += 1;
+      const s = this.parseExpr()?;
+      spread = Some(s);
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP("}")) {
+        return Err(this.errExpected("`,` or `}`"));
+      }
+    }
+    let fields: FieldInit[] = [];
+    while (!this.isP("}")) {
+      const fname = this.parseIdent()?;
+      this.expectP(":")?;
+      const v = this.parseExpr()?;
+      fields.push(FieldInit { name: fname, value: v, span: spanTo(fname.span, v.span) });
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP("}")) {
+        return Err(this.errExpected("`,` or `}`"));
+      }
+    }
+    this.pos += 1;
+    const sp = spanTo(nm.span, this.lastSpan());
+    if (targs.length > 0) {
+      return Ok(mkExpr(ERecordT(nm, targs, spread, fields), sp));
+    }
+    return Ok(mkExpr(ERecord(nm, spread, fields), sp));
+  }
+
+  // `match (e) { pattern => body, ... }`
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseMatch(): Result<Expr, Diagnostic> {
+    const start = this.toks[this.pos].span;
+    this.pos += 1;
+    const scrut = this.parseParenExpr()?;
+    this.expectP("{")?;
+    let arms: MatchArm[] = [];
+    while (!this.isP("}")) {
+      const pat = this.parsePattern()?;
+      this.expectP("=>")?;
+      if (this.isP("{")) {
+        // Block arm: the comma after it is optional.
+        const b = this.parseBlock()?;
+        arms.push(MatchArm { pattern: pat, body: BBlock(b), span: spanTo(pat.span, b.span) });
+        if (this.isP(",")) {
+          this.pos += 1;
+        }
+      } else {
+        const e = this.parseExpr()?;
+        arms.push(MatchArm { pattern: pat, body: BExpr(e), span: spanTo(pat.span, e.span) });
+        if (this.isP(",")) {
+          this.pos += 1;
+        } else if (!this.isP("}")) {
+          return Err(this.errExpected("`,` or `}`"));
+        }
+      }
+    }
+    this.pos += 1;
+    return Ok(mkExpr(EMatch(scrut, arms), spanTo(start, this.lastSpan())));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Patterns
+  // ---------------------------------------------------------------------------
+
+  @Ensures(result.isOk()
+      ==> this.spansFrom(result.unwrap().span, old(this.pos)) && patShallowOk(result.unwrap()))
+  parsePattern(): Result<Pattern, Diagnostic> {
+    const t = this.toks[this.pos];
+    match (t.kind) {
+      KIdent => {
+        return this.parseIdentPattern();
+      },
+      KInt => {
+        this.pos += 1;
+        return Ok(Pattern { kind: PInt(t.value), span: t.span });
+      },
+      KFloat => {
+        return Err(this.errExpected("pattern (float literals cannot be matched)"));
+      },
+      KBigInt => {
+        return Err(this.errExpected("pattern (integer literal too large for a pattern)"));
+      },
+      KTplFull => {
+        return Err(this.errExpected("pattern (template literals cannot be matched)"));
+      },
+      KTplHead => {
+        return Err(this.errExpected("pattern (template literals cannot be matched)"));
+      },
+      KTplMid => {
+        return Err(this.errExpected("pattern"));
+      },
+      KTplTail => {
+        return Err(this.errExpected("pattern"));
+      },
+      KStr => {
+        this.pos += 1;
+        return Ok(Pattern { kind: PStr(t.text), span: t.span });
+      },
+      KKeyword => {
+        if (t.text == "true" || t.text == "false") {
+          this.pos += 1;
+          return Ok(Pattern { kind: PBool(t.text == "true"), span: t.span });
+        }
+        return Err(this.errExpected("pattern"));
+      },
+      KPunct => {
+        // Negative integer literal pattern.
+        const nt = this.at(1);
+        if (this.isP("-")) {
+          if (isKindInt(nt)) {
+            this.pos += 2;
+            return Ok(Pattern { kind: PInt(0 - nt.value), span: spanTo(t.span, nt.span) });
+          }
+          return Err(this.errExpectedAt(1, "integer after `-` in pattern"));
+        }
+        return Err(this.errExpected("pattern"));
+      },
+      KEof => {
+        return Err(this.errExpected("pattern"));
+      },
+    }
+  }
+
+  // `_`, `Name`, or `Name(p, ..)`. Nested patterns are accepted here (as in Stage 0); Orin-B's
+  // restriction to bindings and `_` is enforced later, by the checker.
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseIdentPattern(): Result<Pattern, Diagnostic> {
+    const nm = this.parseIdent()?;
+    if (nm.name == "_") {
+      return Ok(Pattern { kind: PWildcard, span: nm.span });
+    }
+    if (!this.isP("(")) {
+      return Ok(Pattern { kind: PIdent(nm), span: nm.span });
+    }
+    this.pos += 1;
+    let subs: Pattern[] = [];
+    while (!this.isP(")")) {
+      const sub = this.parsePattern()?;
+      subs.push(sub);
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP(")")) {
+        return Err(this.errExpected("`,` or `)`"));
+      }
+    }
+    this.pos += 1;
+    return Ok(Pattern { kind: PVariant(nm, subs), span: spanTo(nm.span, this.lastSpan()) });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Module
+  // ---------------------------------------------------------------------------
+
+  // All items up to the final KEof, in file `file`.
+  @Ensures(result.isOk() ==> this.atEnd() && result.unwrap().file == file)
+  parseModule(file: usize): Result<Module, Diagnostic> {
+    let items: Item[] = [];
+    while (!this.isEof()) {
+      const it = this.parseItem()?;
+      items.push(it);
+    }
+    return Ok(Module { file: file, items: items });
   }
 }
 
-// `_`, `Name`, or `Name(p, ..)`. Nested patterns are accepted here (as in Stage 0); Orin-B's
-// restriction to bindings and `_` is enforced later, by the checker.
-function parseIdentPattern(toks: Token[], pos: usize): Result<PatRes, Diagnostic> {
-  const nm = parseIdent(toks, pos)?;
-  if (nm.id.name == "_") {
-    return mkPat(PWildcard, nm.id.span, nm.pos);
-  }
-  if (!isP(toks, nm.pos, "(")) {
-    return mkPat(PIdent(nm.id), nm.id.span, nm.pos);
-  }
-  let p = nm.pos + 1;
-  let subs: Pattern[] = [];
-  while (!isP(toks, p, ")")) {
-    const sub = parsePattern(toks, p)?;
-    subs.push(sub.pat);
-    p = sub.pos;
-    if (isP(toks, p, ",")) {
-      p += 1;
-    } else if (!isP(toks, p, ")")) {
-      return Err(errExpected(toks, p, "`,` or `)`"));
-    }
-  }
-  p += 1;
-  return mkPat(PVariant(nm.id, subs), spanTo(nm.id.span, lastSpan(toks, p)), p);
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
+// The syntax tree of `src` (file `file`), or the first lexical or syntax error. A module is well formed (spans nested
+// and ordered, inside the source); an error has a parse-error code and a span inside the source.
+@Ensures(result.isOk()
+    ==> result.unwrap().file == file && moduleWellFormed(result.unwrap(), src.length))
+@Ensures(result.isErr()
+    ==> isSyntaxCode(result.unwrapErr().code)
+        && result.unwrapErr().span.file == file
+        && result.unwrapErr().span.end <= src.length)
 export function parse(file: usize, src: string): Result<Module, Diagnostic> {
   const toks = lex(file, src)?;
-  let items: Item[] = [];
-  let p: usize = 0;
-  while (!isEof(toks, p)) {
-    const r = parseItem(toks, p)?;
-    items.push(r.item);
-    p = r.pos;
-  }
-  return Ok(Module { file: file, items: items });
+  let p = new Parser(toks);
+  return p.parseModule(file);
 }

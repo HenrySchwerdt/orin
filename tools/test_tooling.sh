@@ -17,6 +17,8 @@ $ORIN2 test compiler/tests/check_env_test.or --runtime runtime
 $ORIN2 test compiler/tests/check_body_test.or --runtime runtime
 # lowering unit tests (3a): block builder, locals, owned scope, place walk, MIR spans, Lowerer end to end
 $ORIN2 test compiler/tests/lower_test.or --runtime runtime
+# syntax unit tests (3c): Lexer, Parser progress and spans, operator table, well-formedness predicates, garbage input
+$ORIN2 test compiler/tests/syntax_test.or --runtime runtime
 $ORIN2 test compiler/tests/quality_test.or --runtime runtime
 $ORIN2 test compiler/tests/doccomments_test.or --runtime runtime
 sh tools/test_resources.sh

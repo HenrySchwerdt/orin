@@ -1,0 +1,111 @@
+// The binary-operator table of the expression grammar as data (class `OpTable`), used by the parser's precedence
+// climbing (`Parser.parseBin`).
+//
+// Levels, loosest first (a higher level binds tighter):
+//
+//   0 `||`   1 `&&`   2 `== !=`   3 `< <= > >=`   4 `+ -`   5 `* / %`      all left-associative
+//
+// Below the table, and not part of it because they are not plain binary operators: `c ? a : b` (right-associative,
+// `Parser.parseCond`) and `a ==> b` (right-associative, lowest, its right side is a whole expression; contract clauses
+// only, `Parser.parseExpr`). Unary `!` / `-` bind tighter than every level (`Parser.parseUnary`).
+
+import { BinaryOp } from "./ast";
+
+export const MAX_LEVEL: int = 5;
+
+// One operator: its spelling, its level, the AST operator, and whether it groups to the right.
+export type OpRow = { text: string; level: int; op: BinaryOp; rightAssoc: bool; };
+
+function row(text: string, level: int, op: BinaryOp): OpRow {
+  return OpRow { text: text, level: level, op: op, rightAssoc: false };
+}
+
+// The table, loosest level first.
+export function binaryOps(): OpRow[] {
+  return [
+    row("||", 0, BOr),
+    row("&&", 1, BAnd),
+    row("==", 2, BEq),
+    row("!=", 2, BNe),
+    row("<", 3, BLt),
+    row("<=", 3, BLe),
+    row(">", 3, BGt),
+    row(">=", 3, BGe),
+    row("+", 4, BAdd),
+    row("-", 4, BSub),
+    row("*", 5, BMul),
+    row("/", 5, BDiv),
+    row("%", 5, BRem),
+  ];
+}
+
+// The rows are a precedence table: every level is in 0..MAX_LEVEL and occurs, levels never decrease along the rows (so
+// the table reads loosest first), and the operators of one level agree on their associativity (the climbing loop
+// decides by level, so a mixed level would group one operator the wrong way).
+export function opRowsOk(rows: OpRow[]): bool {
+  if (rows.length == 0 || rows[0].level != 0 || rows[rows.length - 1].level != MAX_LEVEL) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < rows.length) {
+    const a = rows[i - 1];
+    const b = rows[i];
+    if (b.level != a.level && b.level != a.level + 1) {
+      return false;
+    }
+    if (b.level == a.level && b.rightAssoc != a.rightAssoc) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The table with an index by spelling. Spellings are distinct (the index is as large as the table: a duplicate would
+// shadow a row).
+@Invariant(opRowsOk(this.rows))
+@Invariant(this.index.size == this.rows.length)
+export class OpTable {
+  private rows: OpRow[];
+  private index: Map<string, usize>;
+
+  constructor() {
+    this.rows = binaryOps();
+    this.index = indexRows(binaryOps());
+  }
+
+  // Level of the operator spelled `text`, or -1 when `text` is not a binary operator.
+  @Ensures(result >= -1 && result <= MAX_LEVEL)
+  @Ensures(result >= 0 ==> this.rows.some(r => r.text == text && r.level == result))
+  @Ensures(result == -1 ==> this.rows.every(r => r.text != text))
+  level(text: string): int {
+    const i = this.index.get(text);
+    if (i.isNone()) {
+      return -1;
+    }
+    return this.rows[i.unwrap()].level;
+  }
+
+  // The row of the operator spelled `text`, which is in the table.
+  @Requires(this.level(text) >= 0)
+  @Ensures(result.text == text)
+  rowOf(text: string): OpRow {
+    return this.rows[this.index.get(text).unwrap()];
+  }
+
+  // All rows, loosest first.
+  all(): OpRow[] {
+    return this.rows;
+  }
+}
+
+@Ensures(result.size <= rows.length)
+function indexRows(rows: OpRow[]): Map<string, usize> {
+  let m = new Map<string, usize>();
+  let i: usize = 0;
+  while (i < rows.length) {
+    m.set(rows[i].text, i);
+    i += 1;
+  }
+  return m;
+}
