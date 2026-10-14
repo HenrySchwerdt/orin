@@ -345,9 +345,10 @@ A string is a pair (length, id): the id stands for the contents, and two strings
 string is the only string of length 0. `length`, `+` (length adds), literals (distinct literals have distinct ids), `==` between
 variables and literals are exact. The operations on contents (`charCodeAt`, `substring`, `charAt`, `trim`, `startsWith`,
 `toString`, a template literal, `==` with a computed string) are uninterpreted functions of the ids: they give no facts about the
-contents, so a proof that needs them is UNKNOWN, and a counterexample that depends on them is not reported. A REFUTED claim about
-strings is only given when the claim and its path use lengths, `charCodeAt`, or `+`, but not `+` together with `charCodeAt` and not
-derived contents. The Z3 string theory is not used: it is undecidable together with the length arithmetic and quantifiers.
+contents, so a proof that needs them is UNKNOWN, and a counterexample that depends on them is not reported (a `charCodeAt` value
+in a path condition or goal counts: the contents are not known, think of a table literal). `charCodeAt` is a byte, 0..255. A REFUTED
+claim about strings is only given when it and its path use lengths, `+` and the bounds of `charCodeAt` / `substring`, not
+contents. The Z3 string theory is not used: it is undecidable together with the length arithmetic and quantifiers.
 
 ### Counterexamples
 
@@ -370,7 +371,7 @@ Every VERIFIED result carries its assumptions (`assumptions` in JSON, listed onc
 | A-INV | class invariants hold on entry to a public method and for class-typed parameters and results; record invariants (ADR-0031 A3: such a value cannot exist) hold for record-typed parameters and results | an invariant was assumed |
 | A-FRAME | a method writes only the fields its body writes; others keep their value | a frame fact was used |
 | A-LOOP | the loop invariants used hold (each is proved) | the function has a loop |
-| A-STR | strings are modelled by length; content operations are uninterpreted | a string operation was used |
+| A-STR | strings are modelled by length (and an id for the contents); content operations are uninterpreted; `charCodeAt` is a byte in 0..255 (the runtime reads an unsigned char) | a string operation was used |
 | A-MAP | the size of a `Map` is axiomatised, not computed from its keys | `size`, `keys` or `values` was used |
 
 The soundness reasoning for each encoding choice (datatypes are free so well-formedness is stated about values, not as axioms;

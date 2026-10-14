@@ -712,6 +712,27 @@ function trMethodCall(g0: Gen, vars: Var[], cx: Cx, recvE: Expr, name: string, a
   if ((name == "every" || name == "some") && args.length == 1 && isRangeCall(cx, recvE)) {
     return trRangeQuant(g, vars, cx, recvE, name == "every", args[0], e);
   }
+  // `String.fromCharCode(c)`: the one-byte string of c (traps unless 0 <= c <= 255).
+  match (recvE.kind) {
+    EIdent(sid) => {
+      if (sid.name == "String" && name == "fromCharCode" && args.length == 1 && lookupVar(vars, "String").isNone()) {
+        const c = tr(g, vars, cx, args[0], VInt("int"))?;
+        let g2 = c.g;
+        const so = sortS(g2, cx, VStr)?;
+        g2 = so.g;
+        g2.noteStr("derive");
+        g2.useAssumption("A-STR");
+        if (!g2.hasFun("cfc")) {
+          g2.registerFun("cfc");
+          g2.declare("(declare-fun cfc (Int) Int)");
+        }
+        const clause = "character code in 0..255: `" + srcText(cx.text, e) + "`";
+        const goal = "(and (<= 0 " + c.t + ") (<= " + c.t + " 255))";
+        return mk(g2, "(mkStr 1 (cfc " + c.t + "))", VStr, concatChk(c.chks, [oblChk("bounds", "fromCharCode", lineOf(cx.text, e.span.start), clause, goal)]));
+      }
+    },
+    _ => {}
+  }
   // `Class.method(..)`: a static method (the receiver is a class name, not a value).
   match (recvE.kind) {
     EIdent(id) => {
@@ -909,10 +930,14 @@ function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args:
     if (!g.hasFun("chr")) {
       g.registerFun("chr");
       g.declare("(declare-fun chr (Int Int) Int)");
+      // the byte at a position depends on contents the model does not know (a table literal, say): not trusted
+      g.taint("chr");
     }
     const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
     const goal = "(and (<= 0 " + i.t + ") (< " + i.t + " " + len + "))";
-    return mk(g, "(chr (sid " + r.t + ") " + i.t + ")", VInt("int"), concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charCodeAt", line, clause, goal)]));
+    // the runtime reads an unsigned char: a byte in 0..255
+    const ch = "(chr (sid " + r.t + ") " + i.t + ")";
+    return mk(g, ch, VInt("int"), concatChk(concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charCodeAt", line, clause, goal)]), [tfChk("(and (<= 0 " + ch + ") (<= " + ch + " 255))")]));
   }
   if (name == "charAt" && args.length == 1) {
     const i = tr(g, vars, cx, args[0], VInt("usize"))?;
