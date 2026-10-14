@@ -96,12 +96,10 @@ function trStr(g0: Gen, cx: Cx, s: string): Result<TR, string> {
   if (known.isSome()) {
     return mk(g, known.unwrap(), VStr, noChks());
   }
-  const name = g.next("s");
-  g.declare("(declare-const " + name + " Str)");
-  g.assert("(= (slen " + name + ") " + s.length.toString() + ")");
-  if (s.length == 0) {
-    g.assert("(forall ((x Str)) (=> (= (slen x) 0) (= x " + name + ")))");
-  }
+  // A literal is a string of its length whose id is its position among the literals (the empty string has id 0):
+  // distinct literals are distinct strings.
+  const id = s.length == 0 ? 0 : g.litConsts().length + 1;
+  const name = "(mkStr " + s.length.toString() + " " + id.toString() + ")";
   g.registerLit(s, name);
   return mk(g, name, VStr, noChks());
 }
@@ -323,7 +321,12 @@ function trBinary(g: Gen, vars: Var[], cx: Cx, op: BinaryOp, l: Expr, r: Expr): 
       return Err("`==` / `!=` on values of type `" + vtName(lt.vt) + "` is not supported (only integers, bool and string)");
     }
     const eq = "(= " + lt.t + " " + rt.t + ")";
-    return mk(rt.g, isEq ? eq : "(not " + eq + ")", VBool, chks);
+    let g2 = rt.g;
+    if (vtEq(lt.vt, VStr) && (lt.t.startsWith("(") || rt.t.startsWith("("))) {
+      g2.noteStr("derive");
+      g2.useAssumption("A-STR");
+    }
+    return mk(g2, isEq ? eq : "(not " + eq + ")", VBool, chks);
   }
   if (!isIntTy(lt.vt) || !isIntTy(rt.vt)) {
     return Err("comparison of non-integer values");
@@ -334,14 +337,16 @@ function trBinary(g: Gen, vars: Var[], cx: Cx, op: BinaryOp, l: Expr, r: Expr): 
 // String concatenation: uninterpreted, with the length axiom (strings are modelled by their length).
 function trConcat(g0: Gen, cx: Cx, a: string, b: string, chks: Chk[]): Result<TR, string> {
   let g = g0;
-  g.noteApprox("string contents are only modelled by length (`+` on strings is uninterpreted)");
+  // Only lengths are known of the result; a model is realisable by strings of those lengths unless the claim
+  // compares the concatenation with another string (`==` on a derived string notes the abstraction).
   g.useAssumption("A-STR");
-  if (!g.hasFun("sconcat")) {
-    g.registerFun("sconcat");
-    g.declare("(declare-fun sconcat (Str Str) Str)");
-    g.assert("(forall ((x Str) (y Str)) (= (slen (sconcat x y)) (+ (slen x) (slen y))))");
+  g.noteStr("concat");
+  if (!g.hasFun("cid")) {
+    g.registerFun("cid");
+    g.declare("(declare-fun cid (Int Int) Int)");
   }
-  return mk(g, "(sconcat " + a + " " + b + ")", VStr, chks);
+  const len = "(+ (slen " + a + ") (slen " + b + "))";
+  return mk(g, "(mkStr " + len + " (ite (= " + len + " 0) 0 (cid (sid " + a + ") (sid " + b + "))))", VStr, chks);
 }
 
 function trTemplate(g0: Gen, vars: Var[], cx: Cx, parts: string[], xs: Expr[]): Result<TR, string> {
@@ -361,7 +366,7 @@ function trTemplate(g0: Gen, vars: Var[], cx: Cx, parts: string[], xs: Expr[]): 
   if (cx.inQ) {
     return Err("template literal inside a quantifier body");
   }
-  g.noteApprox("string contents are only modelled by length (a template literal is an unknown string of at least its literal length)");
+  g.noteStr("derive");
   g.useAssumption("A-STR");
   const f = freshFree(g, cx, VStr)?;
   g = f.g;
@@ -769,57 +774,58 @@ function trStrOf(g0: Gen, cx: Cx, arg: string, chks: Chk[]): Result<TR, string> 
   let g = g0;
   const so = sortS(g, cx, VStr)?;
   g = so.g;
-  g.noteApprox("string contents are only modelled by length (`toString` is uninterpreted)");
+  g.noteStr("derive");
   g.useAssumption("A-STR");
-  if (!g.hasFun("tostr")) {
-    g.registerFun("tostr");
-    g.declare("(declare-fun tostr (Int) Str)");
-    g.assert("(forall ((x Int)) (>= (slen (tostr x)) 1))");
+  if (!g.hasFun("tl")) {
+    g.registerFun("tl");
+    g.declare("(declare-fun tl (Int) Int)");
+    g.declare("(declare-fun ti (Int) Int)");
   }
-  return mk(g, "(tostr " + arg + ")", VStr, chks);
+  // the decimal text of a number: at least one character
+  return mk(g, "(mkStr (+ 1 (ite (>= (tl " + arg + ") 0) (tl " + arg + ") (- (tl " + arg + ")))) (ti " + arg + "))", VStr, chks);
 }
 
 function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args: Expr[], e: Expr): Result<TR, string> {
   let g = g0;
-  g.noteApprox("string contents are only modelled by length (`" + name + "` is uninterpreted)");
   g.useAssumption("A-STR");
   const line = lineOf(cx.text, e.span.start);
   const len = "(slen " + r.t + ")";
   if (name == "charCodeAt" && args.length == 1) {
     const i = tr(g, vars, cx, args[0], VInt("usize"))?;
     g = i.g;
+    g.noteStr("chr");
     if (!g.hasFun("chr")) {
       g.registerFun("chr");
-      g.declare("(declare-fun chr (Str Int) Int)");
+      g.declare("(declare-fun chr (Int Int) Int)");
     }
     const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
     const goal = "(and (<= 0 " + i.t + ") (< " + i.t + " " + len + "))";
-    return mk(g, "(chr " + r.t + " " + i.t + ")", VInt("int"), concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charCodeAt", line, clause, goal)]));
+    return mk(g, "(chr (sid " + r.t + ") " + i.t + ")", VInt("int"), concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charCodeAt", line, clause, goal)]));
   }
   if (name == "charAt" && args.length == 1) {
     const i = tr(g, vars, cx, args[0], VInt("usize"))?;
     g = i.g;
-    if (!g.hasFun("chat")) {
-      g.registerFun("chat");
-      g.declare("(declare-fun chat (Str Int) Str)");
-      g.assert("(forall ((s Str) (i Int)) (= (slen (chat s i)) 1))");
+    g.noteStr("derive");
+    if (!g.hasFun("cht")) {
+      g.registerFun("cht");
+      g.declare("(declare-fun cht (Int Int) Int)");
     }
     const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
     const goal = "(and (<= 0 " + i.t + ") (< " + i.t + " " + len + "))";
-    return mk(g, "(chat " + r.t + " " + i.t + ")", VStr, concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charAt", line, clause, goal)]));
+    return mk(g, "(mkStr 1 (cht (sid " + r.t + ") " + i.t + "))", VStr, concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charAt", line, clause, goal)]));
   }
   if (name == "substring" && args.length == 2) {
     const a = tr(g, vars, cx, args[0], VInt("usize"))?;
     const b = tr(a.g, vars, cx, args[1], VInt("usize"))?;
     g = b.g;
-    if (!g.hasFun("ssub")) {
-      g.registerFun("ssub");
-      g.declare("(declare-fun ssub (Str Int Int) Str)");
-      g.assert("(forall ((s Str) (a Int) (b Int)) (=> (and (<= 0 a) (<= a b) (<= b (slen s))) (= (slen (ssub s a b)) (- b a))))");
+    g.noteStr("derive");
+    if (!g.hasFun("sbt")) {
+      g.registerFun("sbt");
+      g.declare("(declare-fun sbt (Int Int Int) Int)");
     }
     const clause = "substring range in bounds: `" + srcText(cx.text, e) + "`";
     const goal = "(and (<= 0 " + a.t + ") (<= " + a.t + " " + b.t + ") (<= " + b.t + " " + len + "))";
-    return mk(g, "(ssub " + r.t + " " + a.t + " " + b.t + ")", VStr, concatChk(concatChk(r.chks, concatChk(a.chks, b.chks)), [oblChk("bounds", "substring", line, clause, goal)]));
+    return mk(g, "(mkStr (- " + b.t + " " + a.t + ") (ite (= " + b.t + " " + a.t + ") 0 (sbt (sid " + r.t + ") " + a.t + " " + b.t + ")))", VStr, concatChk(concatChk(r.chks, concatChk(a.chks, b.chks)), [oblChk("bounds", "substring", line, clause, goal)]));
   }
   if ((name == "startsWith" || name == "endsWith" || name == "includes") && args.length == 1) {
     const x = tr(g, vars, cx, args[0], VStr)?;
@@ -827,6 +833,7 @@ function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args:
     if (cx.inQ) {
       return Err("`" + name + "` inside a quantifier body");
     }
+    g.noteStr("derive");
     const f = freshFree(g, cx, VBool)?;
     g = f.g;
     g.assert("(=> " + f.name + " (>= " + len + " (slen " + x.t + ")))");
@@ -836,6 +843,7 @@ function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args:
     if (cx.inQ) {
       return Err("`trim` inside a quantifier body");
     }
+    g.noteStr("derive");
     const f = freshFree(g, cx, VStr)?;
     g = f.g;
     g.assert("(<= (slen " + f.name + ") " + len + ")");
@@ -922,8 +930,6 @@ function trMapMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, k: VT, v: VT, name: st
   let g = g0;
   const so = sortS(g, cx, r.vt)?;
   g = so.g;
-  g.noteApprox("the size of a Map is axiomatised, not computed from its keys");
-  g.useAssumption("A-MAP");
   if (name == "has" && args.length == 1) {
     const a = tr(g, vars, cx, args[0], k)?;
     return mk(a.g, mapHas(so.s, r.t, a.t), VBool, concatChk(r.chks, a.chks));
@@ -938,6 +944,8 @@ function trMapMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, k: VT, v: VT, name: st
     if (cx.inQ) {
       return Err("`" + name + "` inside a quantifier body");
     }
+    g.noteApprox("the size of a Map is axiomatised, not computed from its keys");
+    g.useAssumption("A-MAP");
     const isKeys = name == "keys";
     const at = VArr(isKeys ? k : v);
     const as = sortS(g, cx, at)?;
@@ -1324,6 +1332,35 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
       i += 1;
     }
   }
+  // Fields with an initialiser that the constructor does not write and does not take from a parameter.
+  const icx = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
+  let fi: usize = 0;
+  while (fi < cls.fields.length) {
+    const fname = cls.fields[fi];
+    if (cls.finit[fi].isSome()) {
+      let skip = false;
+      if (ctor.isSome()) {
+        const cf = ctor.unwrap();
+        if (cf.frameAll || cf.frame.includes(fname) || cf.pnames.includes(fname)) {
+          skip = true;
+        }
+      }
+      const ft = tyOf(cx, cls.ftys[fi]);
+      if (!skip && !isBad(ft)) {
+        const none: Var[] = [];
+        const r = tr(g, none, icx, cls.finit[fi].unwrap(), ft);
+        match (r) {
+          Ok(x) => {
+            g = x.g;
+            g.assert("(= " + recField(so.s, fname, fr.name) + " " + x.t + ")");
+            g.useAssumption("A-FRAME");
+          },
+          Err(_) => {}
+        }
+      }
+    }
+    fi += 1;
+  }
   const iv = invTerms(g, cx, cls, fr.name);
   g = iv.g;
   if (iv.terms.length > 0) {
@@ -1356,8 +1393,6 @@ function trNewMap(g0: Gen, cx: Cx, targs: TypeExpr[]): Result<TR, string> {
   g = vs.g;
   const dflt = g.next("c");
   g.declare("(declare-const " + dflt + " (Array " + ks.s + " " + vs.s + "))");
-  g.useAssumption("A-MAP");
-  g.noteApprox("the size of a Map is axiomatised, not computed from its keys");
   return mk(g, "(mk" + so.s + " ((as const (Array " + ks.s + " Bool)) false) " + dflt + " 0)", t, noChks());
 }
 

@@ -1,0 +1,205 @@
+// Inputs for tools/test_verify_contracts.py: records, `Option`, `Result`, `Map` and strings (ADR-0031 B6), with the
+// obligations they carry (`unwrap` of `Some`, index in range) and what is REFUTED / UNKNOWN.
+// expect: swap ensures VERIFIED
+// expect: swap_wrong ensures REFUTED
+// expect: shift ensures VERIFIED
+// expect: shift_spread ensures VERIFIED
+// expect: shift_spread ensures VERIFIED
+// expect: positive ensures VERIFIED
+// expect: positive ensures VERIFIED
+// expect: use_positive unwrap VERIFIED
+// expect: use_positive ensures VERIFIED
+// expect: unsafe_unwrap unwrap REFUTED
+// expect: unsafe_unwrap ensures VERIFIED
+// expect: default_zero unwrap VERIFIED
+// expect: default_zero ensures VERIFIED
+// expect: divide ensures VERIFIED
+// expect: divide ensures VERIFIED
+// expect: with_match ensures VERIFIED
+// expect: area ensures REFUTED
+// expect: area_ok ensures VERIFIED
+// expect: put ensures VERIFIED
+// expect: put ensures VERIFIED
+// expect: put ensures VERIFIED
+// expect: drop ensures VERIFIED
+// expect: drop ensures VERIFIED
+// expect: drop_wrong ensures REFUTED
+// expect: drop_present ensures VERIFIED
+// expect: lookup ensures VERIFIED
+// expect: join2 ensures VERIFIED
+// expect: join2_wrong ensures REFUTED
+// expect: first_char bounds VERIFIED
+// expect: first_char ensures VERIFIED
+// expect: last_char_wrong bounds REFUTED
+// expect: last_char_wrong ensures VERIFIED
+// expect: slice_len bounds VERIFIED
+// expect: slice_len ensures VERIFIED
+// warn: unsafe_unwrap W0460
+// warn: first_char W0460
+// warn: last_char_wrong W0460
+
+type Point = { x: int; y: int; };
+
+type Shape = Circle(int) | Rect(int, int) | Empty;
+
+@Ensures(result.x == p.y && result.y == p.x)
+function swap(p: Point): Point {
+  return Point { x: p.y, y: p.x };
+}
+
+// Wrong: swap moves x.
+@Ensures(result.x == p.x)
+function swap_wrong(p: Point): Point {
+  return Point { x: p.y, y: p.x };
+}
+
+@Ensures(result.x == p.x + 1 && result.y == p.y)
+function shift(p: Point): Point {
+  let q = p;
+  q.x += 1;
+  return q;
+}
+
+@Ensures(result.y == p.y)
+@Ensures(result.x == p.x + 1)
+function shift_spread(p: Point): Point {
+  return Point { ...p, x: p.x + 1 };
+}
+
+@Ensures(result.isSome() == (x > 0))
+@Ensures(result.isSome() ==> result.unwrap() == x)
+function positive(x: int): Option<int> {
+  if (x > 0) {
+    return Some(x);
+  }
+  return None;
+}
+
+@Requires(o.isSome() && o.unwrap() > 0)
+@Ensures(result > 0)
+function use_positive(o: Option<int>): int {
+  return o.unwrap();
+}
+
+// Wrong: `unwrap` of an Option that may be None traps.
+@Ensures(result == 1 || result != 1)
+function unsafe_unwrap(o: Option<int>): int {
+  return o.unwrap();
+}
+
+@Ensures(result == o.unwrapOr(0))
+function default_zero(o: Option<int>): int {
+  if (o.isSome()) {
+    return o.unwrap();
+  }
+  return 0;
+}
+
+@Ensures(result.isOk() == (b != 0))
+@Ensures(result.isOk() ==> result.unwrap() * b + a % b == a)
+function divide(a: int, b: int): Result<int, string> {
+  if (b == 0) {
+    return Err("division by zero");
+  }
+  return Ok(a / b);
+}
+
+@Ensures(match (o) { Some(v) => result == v, None => result == -1 })
+function with_match(o: Option<int>): int {
+  return match (o) {
+    Some(v) => v,
+    None => -1
+  };
+}
+
+// Wrong: Rect(-1, 5) has a negative area; the counterexample names the variant and its payload.
+@Ensures(result >= 0)
+function area(s: Shape): int {
+  return match (s) {
+    Circle(r) => 3 * r * r,
+    Rect(w, h) => w * h,
+    Empty => 0
+  };
+}
+
+@Requires(match (s) { Rect(w, h) => w >= 0 && h >= 0, _ => true })
+@Ensures(result >= 0)
+function area_ok(s: Shape): int {
+  return match (s) {
+    Circle(r) => 3 * r * r,
+    Rect(w, h) => w * h,
+    Empty => 0
+  };
+}
+
+// An insertion keeps the key, and the size grows by at most one.
+@Ensures(result.has(k))
+@Ensures(result.size >= m.size)
+@Ensures(result.size <= m.size + 1)
+function put(m: Map<int, int>, k: int, v: int): Map<int, int> {
+  let r = m;
+  r.set(k, v);
+  return r;
+}
+
+@Ensures(!result.has(k))
+@Ensures(result.size <= m.size)
+function drop(m: Map<int, int>, k: int): Map<int, int> {
+  let r = m;
+  r.delete(k);
+  return r;
+}
+
+// Wrong: the key is gone after a delete.
+@Ensures(result.has(k))
+function drop_wrong(m: Map<int, int>, k: int): Map<int, int> {
+  let r = m;
+  r.delete(k);
+  return r;
+}
+
+@Requires(m.has(k))
+@Ensures(result.size == m.size - 1)
+function drop_present(m: Map<int, int>, k: int): Map<int, int> {
+  let r = m;
+  r.delete(k);
+  return r;
+}
+
+@Ensures(m.has(k) ==> result.isSome())
+function lookup(m: Map<int, int>, k: int): Option<int> {
+  return m.get(k);
+}
+
+@Ensures(result.length == a.length + b.length)
+function join2(a: string, b: string): string {
+  return a + b;
+}
+
+// Wrong in general (b may be non-empty); strings are modelled by length only, so a counterexample is not trusted.
+@Ensures(result.length == a.length)
+function join2_wrong(a: string, b: string): string {
+  return a + b;
+}
+
+@Requires(s.length > 0)
+@Ensures(result >= 0 || result < 0)
+function first_char(s: string): int {
+  return s.charCodeAt(0);
+}
+
+// Wrong: the index is one past the end.
+@Ensures(result >= 0 || result < 0)
+function last_char_wrong(s: string): int {
+  return s.charCodeAt(s.length);
+}
+
+@Requires(a <= b && b <= s.length)
+@Ensures(result.length == b - a)
+function slice_len(s: string, a: usize, b: usize): string {
+  return s.substring(a, b);
+}
+
+function main(): void {
+  console.log(swap(Point { x: 1, y: 2 }).x.toString());
+}
