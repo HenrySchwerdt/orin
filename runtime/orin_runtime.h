@@ -127,13 +127,18 @@ void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0
  *     in it was consumed by the sender); put detaches the value (moved if its whole graph is uniquely owned, deep-copied
  *     otherwise; a copy is a fresh graph nobody else can reach) and returns a token; take returns the box (owned by the
  *     caller, now in ITS heap); drop frees it. A token is valid for exactly one take or drop; anything else traps.
+ *     A box only the sender references is published itself (retained; no second box): the sender must release its
+ *     reference before the token reaches another task (std:task's putBox does; a monitor or a thread start orders it).
  *   task: spawn starts a thread that takes the closure `() => void` out of the token, runs it and ends; join waits
  *     (0: it returned, 1: it trapped, the message is then available from orin_rt_task_message). A trap on a task thread
- *     ends only that task. */
+ *     ends only that task.
+ *   lend (ADR-0039, `.parallel()`): put of a TWO-slot record { value, _ } pins the value's graph for reading by the tasks
+ *     the owner spawns next (their closures share it instead of copying it); drop of that token ends the lend and
+ *     restores the counts; take of it traps. A transfer by another task copies pinned objects. See "lending" in the .c. */
 uint64_t orin_rt_transfer_put(OrinObj *box);
 OrinObj *orin_rt_transfer_take(uint64_t token);
 void orin_rt_transfer_drop(uint64_t token);
-uint64_t orin_rt_transfer_count(uint64_t which); /* 0: values moved by this task so far, 1: copied */
+uint64_t orin_rt_transfer_count(uint64_t which); /* 0: values moved by this task so far, 1: copied, 2: parallel threads */
 uint64_t orin_rt_task_spawn(uint64_t token);
 uint64_t orin_rt_task_join(uint64_t thread);
 OrinObj *orin_rt_task_message(void);

@@ -7,6 +7,7 @@
 #include "orin_runtime.h"
 #include "../../platform/orin_platform.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int checks, failures;
@@ -331,8 +332,120 @@ static void test_invalid_handles(void) {
     CHECK(orin_platform_thread_join((int64_t)th, &arg) == ORIN_PLATFORM_EINVAL); /* joined twice */
 }
 
+/* ---------------------------------------------------------------- lending (ADR-0039 §4, `.parallel()`) */
+
+static OrinObj *lend_box(OrinObj *v) { /* the two-slot record of a lend; consumes v */
+    OrinObj *b = orin_struct_new(0, 2, 1);
+    orin_struct_init(b, 0, ORIN_SLOT(v));
+    orin_struct_init(b, 1, 0);
+    return b;
+}
+
+static void body_sum(OrinObj *env) { /* env: { lent int array, monitor, word }: reads the array like generated code */
+    OrinObj *arr = ORIN_REF(orin_struct_get(env, 0));
+    uint64_t m = orin_struct_get(env, 1), k = orin_struct_get(env, 2);
+    for (int r = 0; r < 100; r++) {
+        orin_retain(arr); /* no-op on a pinned object: the shared count is never written */
+        orin_release(arr);
+    }
+    int64_t s = 0;
+    for (uint64_t i = 0; i < orin_array_len(arr); i++) s += (int64_t)orin_array_at(arr, i);
+    orin_mon_lock(m);
+    orin_mon_set(m, k, (uint64_t)s);
+    orin_mon_unlock(m);
+}
+
+static OrinObj *env3(OrinObj *ref, uint64_t m, uint64_t k) { /* consumes ref */
+    OrinObj *e = orin_struct_new(0, 3, 1);
+    orin_struct_init(e, 0, ORIN_SLOT(ref));
+    orin_struct_init(e, 1, m);
+    orin_struct_init(e, 2, k);
+    return e;
+}
+
+static void body_send_back(OrinObj *env) { /* env: { lent record array, monitor, _ }: sends element 0 back to the owner */
+    OrinObj *recs = ORIN_REF(orin_struct_get(env, 0));
+    uint64_t m = orin_struct_get(env, 1);
+    OrinObj *r0 = ORIN_REF(orin_array_at(recs, 0));
+    orin_retain(r0);
+    OrinObj *b = box_ref(r0);
+    uint64_t tok = orin_rt_transfer_put(b); /* by a task that does not own the pin: must copy r0 */
+    orin_release(b);
+    orin_mon_lock(m);
+    orin_mon_set(m, 0, tok);
+    orin_mon_unlock(m);
+}
+
+static void test_lend(void) {
+    int64_t base = orin_live_count();
+    /* an int array lent to 8 tasks: no copy, counts untouched, restored at the end */
+    OrinObj *arr = orin_array_new(1000, 0);
+    int64_t want = 0;
+    for (int64_t i = 0; i < 1000; i++) {
+        orin_array_push(arr, (uint64_t)i);
+        want += i;
+    }
+    orin_retain(arr);
+    OrinObj *lb = lend_box(arr);
+    uint64_t lt = orin_rt_transfer_put(lb);
+    orin_release(lb);
+    CHECK(arr->rc < 0);
+    uint64_t c0 = orin_rt_transfer_count(1);
+    enum { T = 8 };
+    uint64_t m = orin_mon_new(T), th[T];
+    for (int i = 0; i < T; i++) {
+        orin_retain(arr);
+        th[i] = start(body_sum, env3(arr, m, (uint64_t)i));
+    }
+    for (int i = 0; i < T; i++) CHECK(orin_rt_task_join(th[i]) == 0);
+    CHECK(orin_rt_transfer_count(1) == c0); /* the closures were moved and shared the pinned array: nothing copied */
+    orin_mon_lock(m);
+    for (int i = 0; i < T; i++) CHECK((int64_t)orin_mon_get(m, (uint64_t)i) == want);
+    orin_mon_unlock(m);
+    orin_rt_transfer_drop(lt);
+    CHECK(arr->rc == 1);
+    orin_release(arr);
+    /* records: a result sent back by a reader is a COPY, so no reference into the lent graph survives the lend */
+    OrinObj *recs = orin_array_new(4, 1);
+    for (int64_t i = 0; i < 4; i++) {
+        OrinObj *r = orin_struct_new(0, 1, 0);
+        orin_struct_init(r, 0, (uint64_t)(i * 7));
+        orin_array_push(recs, ORIN_SLOT(r));
+    }
+    OrinObj *r0 = ORIN_REF(orin_array_at(recs, 0));
+    orin_retain(recs);
+    lb = lend_box(recs);
+    lt = orin_rt_transfer_put(lb);
+    orin_release(lb);
+    CHECK(recs->rc < 0 && r0->rc < 0);
+    orin_retain(recs);
+    uint64_t t1 = start(body_send_back, env3(recs, m, 0));
+    CHECK(orin_rt_task_join(t1) == 0);
+    orin_mon_lock(m);
+    uint64_t tok = orin_mon_get(m, 0);
+    orin_mon_unlock(m);
+    OrinObj *got = orin_rt_transfer_take(tok);
+    CHECK(unbox(got) != r0 && orin_struct_get(unbox(got), 0) == 0);
+    orin_rt_transfer_drop(lt);
+    CHECK(recs->rc == 1 && r0->rc == 1);
+    orin_release(got);
+    orin_release(recs);
+    orin_mon_free(m);
+    CHECK(orin_live_count() == base);
+    /* the thread count of parallel pipelines */
+    CHECK(orin_rt_transfer_count(2) >= 1);
+    setenv("ORIN_THREADS", "3", 1);
+    CHECK(orin_rt_transfer_count(2) == 3);
+    setenv("ORIN_THREADS", "0", 1);
+    CHECK(orin_rt_transfer_count(2) == orin_platform_cpu_count());
+    setenv("ORIN_THREADS", "x2", 1);
+    CHECK(orin_rt_transfer_count(2) == orin_platform_cpu_count());
+    unsetenv("ORIN_THREADS");
+}
+
 int main(void) {
     orin_init(0, NULL);
+    test_lend();
     test_transfer();
     test_tasks();
     test_trap();

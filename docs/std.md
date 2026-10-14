@@ -22,7 +22,8 @@ API table (`compiler/mcp/apitable.or`).
 | `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:text` | Orin, `stdlib/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
 | `std:taskcore` | Orin, `stdlib/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
-| `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`; see docs/concurrency.md |
+| `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
+| `parallel()` on arrays | Orin prelude (`array/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
@@ -724,6 +725,47 @@ What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it 
 
 None of this changes `std:http` itself; items 1, 3 and 4 are L0/L1 additions (about 40 lines of C with contracts), the
 rest is `std:net` design.
+
+## Parallel pipelines: `parallel()` (ADR-0039)
+
+```ts
+const total = xs.parallel().filter(x => x % 3 == 0).map(x => x * 2).reduce((a, b) => a + b, 0);
+const big = orders.parallel().filter(o => o.qty > 10).toArray();     // Order = { id: int; qty: int; price: float }
+const hit = xs.parallel().findIndex(x => x > limit);                 // Option<usize>: the same index as xs.findIndex(..)
+```
+
+`xs.parallel()` returns a view `Parallel<T>`. Its methods: `map(f)` and `filter(p)` return a view, `reduce(f, init)`, `some(p)`,
+`every(p)`, `find(p)`, `findIndex(p)` return what the sequential method returns, `toArray()` returns the elements. No import is
+needed (the prelude `array/parallel.or` is loaded for every file that calls `parallel()`); parallelism is explicit, the compiler
+never parallelises on its own.
+
+**Semantics: the result of the sequential chain.** The input is split into chunks of 4,096 consecutive elements (fixed: it does
+not depend on the number of processors). `map` and `filter` keep the order. `reduce` folds every chunk from left to right and
+then folds `init` with the chunk results from left to right, so for an associative reducer it equals the sequential fold, and
+because the grouping is fixed even a float `reduce` gives the same bits on every machine and with every thread count. `some`,
+`every`, `find`, `findIndex` give the sequential answer: chunks after the first hit are cancelled, chunks before it always run.
+Inputs below 8,192 elements, and every input with `ORIN_THREADS=1`, run on the calling task, chunk by chunk, with the same result.
+
+**Rules (compile errors and warnings).**
+
+| Code | Rule |
+|---|---|
+| E0484 | every function given to a parallel operation is an arrow function or a named function and **pure** (no I/O, no impure call, no call of a function value); the message names the effect and where it happens |
+| E0485 | the reducer of a parallel `reduce` is a built-in associative operator: `+` (integers, floats, strings), `*`, `&&`, `||`, min / max (`a < b ? a : b` and the other orders and comparisons, `Math.min` / `Math.max`), parameters in either order. A user-defined reducer needs a proved associativity law (ADR-0039 §3.2), a later step |
+| E0486 | the input element type is a scalar (integers, floats, `bool`) or a record whose fields are all scalars. The workers read the input without copying it, which needs elements without counted references until borrow inference exists (ADR-0039 §4). Stages may produce any type (`map(x => x.toString())` is fine) |
+| W0480 | a parallel float `reduce` (`+`, `*`, min, max): float arithmetic is not associative, so the result may differ from the sequential `reduce` in the last bits (it is the same everywhere else) |
+| W0481 | a parallel integer `reduce` with signed `+`, or with `*`: a chunk's partial result can overflow (and trap) where the sequential fold does not, or the reverse. Unsigned `+` cannot differ (every partial sum is at most the total), so it gives no warning |
+
+**Runtime.** The work-stealing fork/join pool of `std:task` (`forkJoin`, `forkJoinUntil`, docs/concurrency.md "Fork/join
+pool"). Threads: `ORIN_THREADS` (1 to 1,024) or the processors online. The input array is *lent* to the worker tasks: it is
+pinned (its reference counts frozen) while they run and shared instead of copied; results are built by the workers and moved
+back; values the closures capture are copied to each worker. A trap in a closure traps the program with the closure's own
+message; which element traps first is not defined when several would. With the optimiser, a chain becomes one fused loop per
+chunk (`orin compile --fuse-report` lists them).
+
+**Limits.** No parallel `sort`, `forEach`, `indexOf` / `includes` yet (ADR-0039 order 4); no user reducers; element types as
+above; a pool lives for one call (worker threads are started per operation, about 80 us each); a parallel `some` / `every` /
+`find` / `findIndex` whose predicate can trap may trap on an element after the first match, where the sequential method stops.
 
 ## Limitations
 

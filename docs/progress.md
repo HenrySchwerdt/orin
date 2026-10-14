@@ -41,6 +41,8 @@ _Updated: 2026-10-14_
 | Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. **Stage B done** (transitive effect inference, `orin effects`, OSIG `MAY_PERFORM`, `[effects]` policy; docs/capabilities.md). Stages C-D (library adapters, lineage, strict policy gates) not started |
 | Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): `std:task` (scope / spawn / join, bounded channels, grants moved into tasks, `parallelMap`), L0 threads and monitors, one temporary C interface with a porting table to R3 | done; C parts `TESTED_ONLY` (ThreadSanitizer, ASan + UBSan, stress); no `async` / `await`, cancellation, deadlock detection or M:N scheduler; concurrent HTTP server waits for `std:net` |
 | Incremental analysis | not started |
+| Closure inlining and fusion (ADR-0038 §2, `compiler/fuse`) | done for `map` / `filter` chains ended by every array-API terminal; chain = loop in CPU time (`bench/streams`); borrow inference, reuse in place not started |
+| Parallel pipelines (ADR-0039 steps 1-3): `parallel()`, work-stealing fork/join pool in `std:task`, lending without copies, E0484-E0486, W0480-W0481 | done; speedup not yet measured on an idle machine; parallel `sort`, user reducers, all element types not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |

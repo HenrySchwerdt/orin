@@ -2,7 +2,7 @@
 // `Ledger` of one scope's task table. Their invariants and contracts are checked by `orin test`; tools/mutate_std.py breaks them
 // on purpose and requires these tests to notice. No threads are needed.
 import { assert, assertEq, assertEqUsize, assertEqBool } from "std:test";
-import { Ring, Ledger } from "std:taskcore";
+import { Ring, Ledger, Ranges, rangesOk } from "std:taskcore";
 
 // ------------------------------------------------------------------------------------------------ Ring
 
@@ -88,4 +88,64 @@ function ledgerCountsAndScans(): void {
   l.close();
   assertEqBool(l.closed, true, "closed");
   assertEqUsize(l.count, 2, "closing keeps the count");
+}
+
+// ------------------------------------------------------------------------------------------------ Ranges (the fork/join pool)
+
+@Test
+function rangesOwnChunksFirstInOrder(): void {
+  let r = new Ranges([0, 3], [3, 6], 6, 6);
+  assertEqUsize(r.claim(0).unwrap(), 0, "worker 0 starts at its front");
+  assertEqUsize(r.claim(0).unwrap(), 1, "then the next one");
+  assertEqUsize(r.claim(1).unwrap(), 3, "worker 1 starts at its own front");
+  assertEqUsize(r.lo[0], 2, "worker 0 has chunk 2 left");
+}
+
+@Test
+function rangesStealTheBackHalfOfTheLargest(): void {
+  let r = new Ranges([0, 4, 8], [4, 8, 8], 8, 8);
+  // worker 2 has nothing: it steals from the largest range (workers 0 and 1 tie: the first wins), the back half
+  assertEqUsize(r.claim(2).unwrap(), 2, "stole chunks 2 and 3 of worker 0 and took chunk 2");
+  assertEqUsize(r.hi[0], 2, "the victim keeps the front half");
+  assertEqUsize(r.lo[2], 3, "the thief owns chunk 3 next");
+  assertEqUsize(r.claim(2).unwrap(), 3, "and takes it");
+  assertEqBool(rangesOk(r.lo, r.hi, r.chunks), true, "no chunk in two ranges");
+}
+
+@Test
+function rangesEveryChunkExactlyOnce(): void {
+  let r = new Ranges([0, 2, 9], [2, 9, 13], 13, 13);
+  let seen: bool[] = [];
+  while (seen.length < 13) {
+    seen.push(false);
+  }
+  let n: usize = 0;
+  let w: usize = 0;
+  let idle: usize = 0;
+  while (idle < 3) {
+    const c = r.claim(w % 3);
+    if (c.isSome()) {
+      assertEqBool(seen[c.unwrap()], false, "a chunk is claimed once");
+      seen[c.unwrap()] = true;
+      n += 1;
+      idle = 0;
+    } else {
+      idle += 1;
+    }
+    w += 1;
+  }
+  assertEqUsize(n, 13, "every chunk was claimed");
+}
+
+@Test
+function rangesCutCancelsTheRight(): void {
+  let r = new Ranges([0, 4], [4, 8], 8, 8);
+  assertEqUsize(r.claim(1).unwrap(), 4, "worker 1 takes chunk 4");
+  r.cancelAfter(4);
+  assertEqUsize(r.cut, 5, "chunks after 4 are cancelled");
+  assertEqUsize(r.claim(1).unwrap(), 2, "worker 1 steals from the chunks before the cut");
+  r.cancelAfter(6);
+  assertEqUsize(r.cut, 5, "a later hit does not move the cut right");
+  r.cancelAll();
+  assertEqBool(r.claim(0).isNone(), true, "nothing left after a failure");
 }

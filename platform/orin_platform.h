@@ -184,6 +184,11 @@ int64_t orin_platform_now_millis(void);
     assigns \nothing (a thread-local cache); */
 uint64_t orin_platform_thread_id(void);
 
+/*@ ensures \result >= 1: the number of processors online (1 when the OS cannot tell); a hint for how many worker threads
+            a parallel computation should start (ADR-0039), never a limit;
+    assigns \nothing; */
+uint64_t orin_platform_cpu_count(void);
+
 /*@ requires entry is a function that may run on another thread; arg is whatever entry expects (the layer never reads it);
     ensures \result == 0 ==> no thread was started (limit of 65,536 live threads or the OS refused) and nothing needs cleaning;
     ensures \result > 0 ==> a new thread runs entry(arg); the handle must be passed to orin_platform_thread_join exactly once;
