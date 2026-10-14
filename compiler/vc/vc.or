@@ -67,7 +67,7 @@ function unitFns(u: string, file: string, text: string, d: FunctionDecl): Fn {
   return Fn {
     key: d.name.name, name: d.name.name, unit: u, file: file, text: text, cls: "", kind: 0, priv: false, generic: d.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: d.ret, body: d.body, contracts: d.contracts, span: d.span, pure: false, mutating: false,
-    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params
+    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params, verify: !u.startsWith("$")
   };
 }
 
@@ -83,7 +83,7 @@ function methodFn(u: string, file: string, text: string, c: ClassDecl, m: Method
   return Fn {
     key: c.name.name + "." + m.name.name, name: m.name.name, unit: u, file: file, text: text, cls: c.name.name, kind: m.isStatic ? 2 : 1, priv: m.priv,
     generic: m.typeParams.length > 0 || c.typeParams.length > 0, pnames: names, ptys: tys, pacc: acc, ret: m.ret, body: m.body, contracts: m.contracts,
-    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params
+    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params, verify: !u.startsWith("$")
   };
 }
 
@@ -101,7 +101,7 @@ function ctorFn(u: string, file: string, text: string, c: ClassDecl, k: CtorDecl
   return Fn {
     key: c.name.name + ".constructor", name: "constructor", unit: u, file: file, text: text, cls: c.name.name, kind: 3, priv: false, generic: c.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: None, body: k.body, contracts: k.contracts, span: k.span, pure: false, mutating: false,
-    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps
+    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps, verify: !u.startsWith("$")
   };
 }
 
@@ -344,8 +344,7 @@ function assertAll(xs: string[]): string {
 
 // The query text for "does `goal` follow from the facts, the assumptions `base` and the path condition `pc`":
 // everything asserted and `(not goal)`; `unsat` means it follows.
-function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): string {
-  const lits = "";
+function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: Probe[], withLemmas: bool, extra: string[]): string {
   let get = "";
   if (probes.length > 0) {
     let ts: string[] = [];
@@ -354,12 +353,12 @@ function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: P
     }
     get = "(get-value (" + ts.join(" ") + "))\n";
   }
-  return g.declsText() + "\n" + assertAll(g.factsList()) + assertAll(g.lemmasList()) + lits + assertAll(base) + assertAll(pc)
-    + "(assert (not " + goal + "))\n(check-sat)\n" + get;
+  return g.declsText() + "\n" + assertAll(g.factsList()) + (withLemmas ? assertAll(g.lemmasList()) : "") + assertAll(base) + assertAll(pc)
+    + assertAll(extra) + "(assert (not " + goal + "))\n(check-sat)\n" + get;
 }
 
-function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, query: string): Result<Solved, string> {
-  const base = "build/contracts-vc/q" + qn.toString();
+function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, tag: string, query: string): Result<Solved, string> {
+  const base = "build/contracts-vc/q" + qn.toString() + tag;
   const w = writeFile(fs, base + ".smt2", prelude() + query);
   if (w.isErr()) {
     return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
@@ -657,13 +656,33 @@ function postVars(entry: Var[], fin: Var[]): Var[] {
 // What the solver said, before it is judged.
 type Raw = { status: string; reason: string; values: string[]; };
 
+// Is `unknown` worth a second try? The quantified facts that make a proof possible (the lemmas about sums, the
+// elementwise definitions) often keep the solver from building a model when the claim is false. A bounded search
+// drops the lemmas (they follow from the definitions, so a model of the definitions satisfies them) and limits the
+// length of every array and string that is shown in the counterexample: a model found that way is a model of the
+// original query, hence a real counterexample.
 function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): Raw {
-  const q = queryText(g, base, pc, goal, probes);
-  const s = solve(fs, proc, z3, qn, q);
+  const q = queryText(g, base, pc, goal, probes, true, []);
+  const s = solve(fs, proc, z3, qn, "", q);
   if (s.isErr()) {
     return Raw { status: "error", reason: s.unwrapErr(), values: [] };
   }
   const r = s.unwrap();
+  if (r.status == "unknown" && probes.length > 0) {
+    let bounds: string[] = [];
+    for (const pr of probes) {
+      if (pr.label.endsWith(".length") && pr.kind == 0) {
+        bounds.push("(<= " + pr.term + " 3)");
+      }
+    }
+    if (bounds.length > 0) {
+      const q2 = queryText(g, base, pc, goal, probes, false, bounds);
+      const s2 = solve(fs, proc, z3, qn, "b", q2);
+      if (s2.isOk() && s2.unwrap().status == "sat") {
+        return Raw { status: "sat", reason: "", values: s2.unwrap().values };
+      }
+    }
+  }
   return Raw { status: r.status, reason: "", values: r.values };
 }
 
@@ -1099,6 +1118,9 @@ export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedPro
   shellRun(proc, "mkdir -p build/contracts-vc");
   let rt = Rt { p: p, z3: z3, qn: 0, out: [], warns: [] };
   for (const f of p.fns) {
+    if (!f.verify) {
+      continue;
+    }
     // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
     // if they are outside the fragment nothing is reported for them.
     rt = verifyFn(fs, proc, rt, f);
