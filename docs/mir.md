@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v1.9)
+# MIR and the OIM ownership verifier (v2.0)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -19,6 +19,13 @@ discipline of a file handle. New builtins: the openers `BGrantFs` / `BGrantProce
 `BFileOpen` is now `[fs, path, mode]`, and every std I/O builtin (`BFsReadFile`, `BFsWriteFile`, `BFsExists`,
 `BProcessArgs`, `BIoShell`, `BIoReadBytes`, `BIoReadLine`, `BIoWriteStdout`, `BTimeNowMillis`) takes its grant as the
 first argument. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
+
+v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
+lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
+`spans.length == instrs.length`); `noSpan()` (file index 4294967295) marks code without a source position (hand-written MIR, code the
+optimiser invents from nothing). **No new instruction and no semantic change**: the verifier's verdicts are the same, the C and LLVM
+output is byte-identical (the emitters ignore spans), the optimiser keeps the span of the instruction it rewrites (an inserted
+`dup` / `release` has the span of the call or edge it belongs to). Text format: see "Source spans" below.
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -98,6 +105,23 @@ hole slot when reading that slot.
   invalidate `Borrowed(x)`; v consumed; d Owned.
 - Any operation that makes x Dead or mutates it also invalidates `Borrowed(x)`.
 - `IDup(d, x)` / `IBorrow(d, x)` where x is Unique demote x to Owned (no longer provably unique).
+
+## Source spans (v2.0)
+`MBlock.spans[i]` is a `Span { file; start; end }` (byte offsets, `file` indexes the `SourceMap`) of the HIR expression or statement the
+instruction was lowered from; `termSpan` is the span of the terminator. Rules of the lowering (`compiler/lower/lowerer.or`):
+
+- an expression sets the span to its own while it is lowered and restores its parent's afterwards: the instructions of a call carry the
+  span of the call, those of its arguments the spans of the arguments, the error path of `x?` the span of the `?` expression;
+- a statement takes the span of its head expression (initializer of a `let`, value of an assignment, condition of `if` / `while`, the
+  iterated array of `for`, the value of `return`); the fall-through `goto`s and releases at the end of a block keep the span of the last statement;
+- `break`, `continue` and a bare `return` have no span in the HIR and keep the span of the statement before them; the epilogue of a function
+  (end-of-body releases, the implicit `return`, `trap: missing return`) has the span of the function.
+
+Verifier: `VerifyIssue` has a `span` (the span of the offending instruction; `noSpan()` for function-level well-formedness errors and for MIR without
+spans). `orin compile` / `orin verify` print `verify error: <func> b<B> i<I> at <path>:<line>:<col>: <message>` when it has one.
+
+Text format (`orin mir`, read back by `compiler/tests/verify_text.or`): an instruction or terminator line ends in ` @<file>:<start>-<end>`, e.g.
+`release l1 @0:78-89`; a line without the suffix has no span. The parser also accepts MIR without any suffix.
 
 ## Resource handles (v1.8, ADR-0025)
 `MHandle` is the type of a resource handle (an open file): an `int64_t` at run time (a generation-tagged table

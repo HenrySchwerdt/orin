@@ -404,6 +404,74 @@ Friction (language and toolchain):
   property is about an array (`fieldIndex`, `missingNames`, `noPre`, `typeArgs`).
 * The formatter's canonical layout adds about 25 % lines to code with long diagnostics; line counts above are after it.
 
+## Step 3a: `lower/` (HIR -> MIR) and MIR source spans
+
+Rewritten: `compiler/lower/` (`body.or` 1,732 lines of functions threading the counters `Ctr`, the scope `Sc` and a growing `Item[]` through every call, `items.or`, `util.or`) into a `Lowerer` class per function plus small classes and pure helpers. **ADR-0020 D3 is done**: MIR carries source spans (below). `compiler/vc/` was not touched; `compiler/check/` was not touched.
+
+| Old | New |
+|---|---|
+| `Ctr { loc, lab }` threaded in and out of every function (`tm(c, ty)` returns the new counter) | class `Locals` (state.or): the MIR locals table, `fresh(ty)` returns the next id; labels come from `BlockBuilder.reserve(n)` |
+| `V { items, op, k, root, stable, c }` returned by every expression, `items.concat(..)` everywhere | `Lowerer` emits into a `BlockBuilder` as it goes; `V` (values.or) is only the operand and its ownership kind |
+| flat `Item[]` (`IxI` / `IxL` / `IxT` / `IxD`) converted by `buildBlocks` at the end | class `BlockBuilder` (builder.or): open block, labels, `emit` / `place` / `terminate` / `finish` (unreachable blocks dropped, labels renumbered) |
+| `Sc { vars, loopMark, brk, cont }` copied into every call, `inVars`, `releaseFrom` | class `OwnedScope` (state.or): owned locals as a stack, the loop stack, `owned(lo)` in release order |
+| `walkPlace(c, ..)` building items | pure `walkPlace(base, ..) -> { instrs, temps }` (place.or), tested without a lowerer |
+| ~40 small helpers inside `body.or` | ops.or (operator rules, `match` dispatch planning, place paths, `Callee` / `callInstr`), values.or, wellformed.or (predicates over MIR, used by the contracts) |
+
+Files (`orin fmt` output; clauses are `@Requires` / `@Ensures` / `@Invariant` annotations):
+
+| file | role | lines | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `lowerer.or` (was `body.or`, 1,732 lines, 0 clauses) | class `Lowerer` (expressions, statements, `match`, closures, places) and `lowerFunction` | 1,302 | 2 | 21 | 3 |
+| `builder.or` (was `items.or`, 128) | class `BlockBuilder` | 180 | 3 | 14 | 6 |
+| `state.or` (new) | classes `Locals`, `OwnedScope` | 180 | 5 | 9 | 2 |
+| `ops.or` (new) | pure helpers | 248 | 3 | 11 | 0 |
+| `place.or` (new) | pure place walk | 191 | 1 | 3 | 0 |
+| `values.or` (new) | `V`, `Args` (record invariants) | 87 | 0 | 0 | 2 |
+| `wellformed.or` (new) | MIR predicates (`allReachable`, `blocksLocalsBelow`, `operandMatches`, `fnWellLowered`, ...) | 241 | 0 | 0 | 0 |
+| `util.or` (was 321) | type mapping, effects, string table | 388 | 1 | 7 | 0 |
+| `lower.or` (was 23) | `lower` | 36 | 0 | 4 | 0 |
+| total, before -> after | | 2,204 -> 2,853 | | 0 -> 69 ensures + 15 requires + 13 invariants (97 clauses) | |
+
+Unit tests: `compiler/tests/lower_test.or` (15 `@Test`, 437 lines), run by `tools/test_tooling.sh` together with the checker tests; `compiler/tests/verify_main.or` gained 3 span cases.
+
+Classes (4 new): `BlockBuilder` (cur instructions and spans in step, a closed builder has no pending code, labels placed are below the label counter, every finished block was opened by a distinct label), `Locals` (HIR locals first, a temporary's id is its index), `OwnedScope` (loop marks ordered and never above the owned depth; a local is registered once), `Lowerer` (owned depth <= locals, HIR locals preserved, the current span is a real span). `V` and `Args` are records with invariants (a tracked value is in a local; the four argument arrays are parallel).
+
+Contracts (highlights): `Lowerer.finish` ensures the function declares every local it mentions, branches only to blocks of the function, has no unreachable block, every string literal is in the table, a span on every instruction and terminator, HIR locals first with the MIR type of their HIR type, all parameters borrowed; `Lowerer.run` ensures the builder is closed (every block terminated exactly once), no loop open, nothing owned; `expr` ensures the owned depth, loop depth and span are as they were and that the operand of the value is typed like the HIR expression (`operandMatches`); `args` ensures one operand per argument and the owned stack restored; `BlockBuilder.place` / `terminate` ensure the block count and the open flag, `finish` ensures targets in range and all blocks reachable; `walkPlace` ensures take / put balance (every slot it empties is filled again); `rangeCheck` ensures a check exactly for `+ - * /` on narrow types; `variantDispatch` ensures one case per tag, the first arm wins; `litId` requires that the literal was collected (the old code answered 0 and would have used another string silently); `mty` ensures `isRefTy` / `isVoidTy` / `isHandleTy` agree with the MIR class; `isSimple` ensures `!hasEffects`; `lower` ensures the function / vtable / `main` correspondence and `progWellLowered`. None fired on the compiler's own sources, the conformance suites or the unit tests.
+
+### MIR source spans
+
+`MBlock = { instrs; spans; term; termSpan }`, record invariant `spans.length == instrs.length`; `noSpan()` for code without a source. The lowering sets the span of the HIR node it lowers (docs/mir.md "Source spans"); `break` / `continue` / bare `return` have no span in the HIR (`HStmt` has none) and take the previous statement's. The optimiser (`opt/calls.or`, `params.or`, `prune.or`) carries them along; `MBlock` literals elsewhere are the hand-written MIR of the tests (`plainBlock`). `VerifyIssue.span`; the printer writes ` @file:start-end` after an instruction; `verify_text.or` parses it; `tools/gen_mir_fragment.py` / `diff_verifier_lean.py` feed the verifier driver with synthetic spans on every line (so the Lean differential test also exercises the parser), `tools/mutate_mir.py` drops them. The C and LLVM emitters ignore spans (generated code byte-identical, below); there is no comment-in-output flag.
+
+Verifier messages, before and after (`orin verify` / `orin compile`; the same MIR: `l1 = dup str#0; release l1; release l1`):
+
+```
+before:  verify error: f b0 i2: use of `l1` which is dead (uninitialised, moved, released or invalidated)
+after:   verify error: f b0 i2 at src/main.or:12:5: use of `l1` which is dead (uninitialised, moved, released or invalidated)
+```
+
+and through the batch driver (`verify_text`): `f:b0:i2: use of .. @0:78-89`. A function-level well-formedness error and MIR without spans keep the old text. Only a compiler bug triggers a verifier error, so no conformance input changes (`diff_compilers.py`: 0 differences).
+
+Design notes and friction:
+
+* **Classes are values.** `PlaceWalker` as a class over the builder was impossible (no shared mutable object), so the walk is a pure planner (temporaries as `base + k`) and the lowerer declares and emits its result. The same holds for `ownAll` / `args`, which are `Lowerer` methods because they emit.
+* **One class, 1,300 lines.** A class cannot span files and `match` arms contain statements (mutual recursion), so expressions, statements and `match` stay in one class; everything that does not emit is outside (ops / place / values / wellformed).
+* **Mutating methods that return a value.** Every `Lowerer` method that emits and returns (`expr`, `args`, `temp`, `dupOf`, `ownOp`, ...) is inferred mutating and returns `(self, result)` in the generated C: that pair is where the allocation is built (see the report of step 3a; lowering is about 5 % of the self-compile).
+* **Statement style.** Mutating calls cannot stand in `&&` / `||` / `?:`; the lowerer is written in statements (`const v = this.expr(e);`); the call helpers use a `Callee` union instead of a lambda that builds the instruction.
+* **Label numbers do not matter.** Labels are renumbered to block indices by `finish`, so labels are handed out on demand (`reserve(n)`); only the order of temporaries (local ids) shows in the generated code, and is unchanged.
+
+Behaviour preservation (against the baseline compiler built before the step):
+
+* `tools/diff_compilers.py`: 1,396 inputs x 3 modes, **0 differences** (diagnostics unchanged; the verifier message gains a location only for compiler bugs, so no input shows it);
+* generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`, `examples/` program and of `compiler/main.or` (381 inputs x 3) **byte-identical** (spans never reach the emitters);
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (6,617,344 bytes), conformance 141/141; `tools/test_compiler_contracts.sh`: contract-checked self-compile byte-identical to `stage2.c`, 804 / 804 conformance tests, **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: 0 warnings;
+* `tools/mutate_mir.py` (37,951 mutants: all rejected, warned or classified benign) and `tools/diff_verifier_lean.py` (6,000 programs with a synthetic span on every line, only the 4 allow-listed F6 divergences) pass;
+* `tools/ci_local.sh` after merging origin/main: every step passed (sanitizer and LLVM suites, the four diff modes, formatter, tooling incl. `lower_test`, LSP, MCP, packages, OSIG, verify contracts, verify-all, erasure); the last step "provable std (tests+mutants)" hit the 4,000 s limit on the shared machine and was run as `tools/test_std.sh` (ok).
+
+Selfcompile (`orin2 compile compiler/main.or -o /dev/null`, interleaved runs, both compilers on the same tree, the machine shared with two other workers): baseline compiler median 8.76 s (min 7.59), new compiler 9.49 s (min 7.83), +3 % on the minimum, +8 % on the median, inside the load noise (the same pair measured earlier: 7.70 s vs 7.69 s; front end `check` 0.87 vs 0.89 s; `mir --no-opt` 1.22 vs 1.27 s). Spans cost one `Span[]` per block and a pointer per instruction.
+
+Rule 7 (array API): the loops of the lowering are the hot inner loops (`args`, `walk`, release loops, `BlockBuilder.finish`) or build several results in one pass, so they stay loops; the well-formedness predicates and contract helpers use `every` / `some` / `map` with pure arrow functions.
+
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
 Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving
