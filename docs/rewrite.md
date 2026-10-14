@@ -476,6 +476,264 @@ Selfcompile (`orin2 compile compiler/main.or -o /dev/null`, interleaved runs, bo
 
 Rule 7 (array API): the loops of the lowering are the hot inner loops (`args`, `walk`, release loops, `BlockBuilder.finish`) or build several results in one pass, so they stay loops; the well-formedness predicates and contract helpers use `every` / `some` / `map` with pure arrow functions.
 
+## Step 3c: `syntax/` (lexer, parser, AST predicates)
+
+Rewritten: `compiler/syntax/lexer.or` (free functions threading `(file, src, start)` and returning `LexRes { tok, end }`) and
+`parser.or` (about 90 functions `(toks, pos, ..) -> Result<{ node, pos }, Diagnostic>`, 18 result record types) into the classes
+`Lexer` and `Parser`; the binary-operator precedence is a data table (`precedence.or`), the clause / annotation placement rules
+are pure functions of their own (`rules.or`), and the tree has well-formedness predicates (`wellformed.or`). `ast.or` is
+unchanged; the exported surface (`lex`, `parse`, `scanComments`, the AST and token types) is unchanged, additions only.
+`compiler/fmt/` was not touched (it uses `parse` and `scanComments`).
+
+| Old | New |
+|---|---|
+| `lex(file, src)`: one loop with a template brace-depth stack, `lexIdent` / `lexNumber` / `lexFloat` / `lexString` / `lexPunct` return `LexRes { tok, end }` | class `Lexer` (lexer.or): `src`, cursor `pos`, `toks`, `depth`, `done`, first error `err`; `step()` lexes one token, `run()` the stream; the per-kind lexers are private methods that `emit` or `fail` |
+| every parse function takes `(toks, pos)` and returns `{ node, pos }` (`IdentRes`, `TypeRes`, `ExprRes`, ... 18 types) | class `Parser` (parser.or): `toks`, cursor `pos`, `ops`; methods return the node and move the cursor |
+| `parseBin(toks, pos, level)`: one recursion level per precedence level (7 nested calls per operand), `binLevel` / `levelOfText` / `binOpOf` string chains | precedence climbing `parseBin(min)` over class `OpTable` (precedence.or): rows `{ text, level, op, rightAssoc }`, a `Map` index |
+| `arrowStart` / `tryTypeArgs` re-parse from a position and drop the result | `arrowStart` probes on a copy of the parser (classes are values), `tryTypeArgs` restores the cursor on `None` |
+| `clauseAllowed`, `checkPlacement`, annotation rules, target numbers 0..10 in the parser | rules.or, named targets `T_FUNCTION` .. `T_IMPORT`, `Result<void, Diagnostic>` |
+| no statement about spans | wellformed.or: children of every node kind, `nestedIn`, shallow and deep predicates, `moduleWellFormed` |
+
+Files (`orin fmt` layout; the old files reformatted the same way for comparison: lexer 600, parser 2,119, trivia 155 lines;
+clauses are `@Requires` / `@Ensures` / `@Invariant` annotation lines, `grep -c '^ *@Requires('` etc.):
+
+| file | role | lines | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `lexer.or` (was 528 lines, 1 clause) | class `Lexer`, `lex`, `skipTrivia`, `tokensWellFormed` | 775 | 8 | 17 | 6 |
+| `parser.or` (was 1,906, 0) | class `Parser` (76 methods), `parse`, `isSyntaxCode` | 2,033 | 15 | 68 | 2 |
+| `precedence.or` (new) | operator table, class `OpTable` | 111 | 1 | 5 | 2 |
+| `rules.or` (new) | placement of clauses and annotations | 181 | 0 | 4 | 0 |
+| `wellformed.or` (new) | span predicates over every node kind | 470 | 0 | 0 | 0 |
+| `trivia.or` (was 148, 0) | `scanComments`, `commentsWellFormed` | 176 | 0 | 1 | 0 |
+| `ast.or`, `module.or` | unchanged / exports | 214, 24 | 0 | 0 | 0 |
+| total, before -> after | | 2,807 -> 3,984 | 1 -> 129 clauses (24 requires, 95 ensures, 10 invariants) | | |
+
+Unit tests: `compiler/tests/syntax_test.or` (14 `@Test`, 575 lines), run by `tools/test_tooling.sh`.
+
+Classes (3 new): `Lexer` (the cursor stays in the source, the last token ends at or before the cursor, template depths are
+non-negative, a finished lexer is at the end or holds its first error, which is E0100 with a span inside the source), `Parser` (the token stream ends with KEof, the cursor is always on a token, so
+it never passes the final KEof), `OpTable` (the rows form a precedence table: levels 0..`MAX_LEVEL`, loosest first, no gap,
+one associativity per level; the spelling index is as large as the table, so no operator shadows another).
+
+Contracts, with the bug each would catch:
+
+* **progress** (the property that rules out an endless loop): every `parseX` that succeeds ensures `spansFrom(span,
+  old(pos))`: it consumed at least one token, and the node's span starts at the first consumed token and ends at the last.
+  This catches a production that returns without consuming (a `while (!isP(")"))` loop around it would spin), a node span
+  taken from the wrong token (`lastSpan` off by one), and a span that misses its first or last token (a parenthesised
+  expression not widened). The documented non-consuming methods state it exactly: `parseTypeParamsB` consumes nothing iff
+  there is no `<`, `tryTypeArgs` leaves the cursor unchanged on `None`, `expectP` / `expectKw` move by exactly one or not
+  at all. `Lexer.step` ensures that a step adds one token that ends at the new cursor, which is past the old one.
+* **cursor in range**: the `Parser` invariant `pos < toks.length` with a KEof last (a production that skips past the end
+  would read garbage through the old clamping `tokAt`); `matchingParen` ensures its result lies after the cursor and in the
+  stream; `lastSpan` requires that something was consumed.
+* **spans nest and are ordered**: every node the parser builds is shallow-well-formed (`exprShallowOk`, `stmtShallowOk`,
+  `typeShallowOk`, `patShallowOk`, `blockShallowOk`, `itemShallowOk`, `memberShallowOk`: the children lie inside the node,
+  in source order, without overlap; each node is checked once, so the cost is linear); `parse` ensures the deep property
+  `moduleWellFormed` (items ordered, inside the source and the file). Catches: a binary node with the span of one operand,
+  a block span that is only its `{`, children stored out of order, a span in another file or past the end of the source
+  (every LSP range and diagnostic of the node would be wrong).
+* **tokens**: `lex` / `Lexer.run` ensure `tokensWellFormed` (in the source and the file, ordered, non-overlapping, non-empty,
+  exactly one KEof, at the end); a token one byte short, or a newline that is not skipped, is caught.
+* **errors**: `lex` ensures E0100 with a span inside the source; `parse` ensures one of the parse-error codes (`isSyntaxCode`:
+  E0100, E0200, E0201, E0408, E0440, E0441, E0442) and a span inside the source and the file (a diagnostic past the end
+  cannot be rendered); `errAt` ensures E0200 / E0201 at the token; `checkPlacement` is `Ok` exactly when every clause is allowed,
+  `checkAnnoPlacement` exactly when every annotation is allowed and no kind repeats.
+* **operators**: `OpTable.level` ensures the level is that of a row with that spelling (or -1 exactly when no row has it);
+  `parseBin(min)` ensures that the operator left at the cursor is looser than `min` (the climbing loop did not stop early).
+* **comments**: `scanComments` ensures `commentsWellFormed` (ordered, non-empty, each holds exactly its source text): the
+  formatter re-emits these texts, so an overlap would print a comment twice.
+
+None fired on the compiler's own sources, on the conformance suites, on the unit tests, or on 3,207 parse inputs including
+1,500 garbage files (below). To see that they can: 13 hand-made mutants (binary span = right operand, left-associative
+operators grouped to the right, block span = `{`, `lastSpan` off by one, parentheses not widened, `?` skipping a token,
+type-argument backtracking not undone, token span one byte short, newline not skipped, a duplicate operator row, `<` moved to
+the level of `+`, the order check removed from `nestedIn`, a line comment keeping its trailing spaces) were run against
+`syntax_test.or`: **13 / 13 killed**.
+
+Error recovery: there is none. The parser stops at the first error (the language reports one syntax error per file;
+`errors` and `next/errors` pin those diagnostics), so "recovery always advances" reduces to the progress property above, and
+in the parser "diagnostics as a field" would only duplicate the `Err` that `?` propagates, so it stays the `Err` of the method (the lexer keeps its first error in a field for speed, below).
+`parseTerminatesOnGarbage` runs 400 random token soups and every prefix of a 400-byte program through `parse` and checks that
+each returns with a well-formed module or a parse error inside the source. A recovering parser (several syntax errors per
+file) is a language-visible change: **NEEDS_DECISION**, not done here. (Decided and done afterwards: "Parser error recovery"
+below.)
+
+Precedence climbing replaces the level-per-function recursion: one call per operand instead of seven, the table is data
+(`binaryOps()`), and associativity is a column. The tree is the same for left-associative operators (all of them; `?:` and
+`==>` are right-associative and stay their own productions, documented in precedence.or). Errors are the same because tokens
+are consumed in the same order.
+
+Behaviour preservation (against the baseline compiler built before the step):
+
+* **AST differential**: `compiler/tests/parse_main.or` (the canonical AST dump with spans, or the rendered first error)
+  built from the old and the new tree, run over every `.or` file of the repository (1,707, after merging origin/main) and 1,500 garbage files (random
+  token soups, truncations, deletions and duplications of real files): 3,207 inputs, **0 differences** (1,908 of them are
+  parse errors: code, message and span identical). The same inputs through a contract-checked `parse_main`: no contract fired.
+* `tools/diff_compilers.py`: 1,406 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
+* generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`, `examples/` program and of `compiler/main.or` (390 inputs x 3) **byte-identical**;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,666,960 bytes, after merging origin/main with Capabilities Stage B), conformance 141/141; all suites with `orin2`: 806 / 806;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806 / 806 conformance tests, `test_verify_contracts` 809 checks, **no contract fired**;
+* `python3 tools/test_fmt.py`: 1,651 passed; `tools/test_tooling.sh`: all unit test files pass (`syntax_test` 14 / 14); `tools/test_effects.py` 85 checks and `tools/test_osig.py` 95 checks pass;
+* `orin check --strict-contracts compiler/main.or`: **0 warnings**. The base had 13 W0471 (public mutating methods without `@Ensures`) in `compiler/vc/gen.or` (`Gen.next`, `declare`, `assert`, `lemma`, `setExact`, `taint`, `noteApprox`, `noteStr`, `useAssumption`, `newLoop`, `loopAdd`, `addObl`) and `vc/vt.or` (`Tab.setCyclic`); they now state their effect (the counter grows by one so no SMT symbol is handed out twice, a push grows its list by one, a set-like add contains the element and grows by at most one, `noteApprox` keeps the first reason, `newLoop` / `addObl` return the new index). `test_verify_contracts.py` with the contract-checked compiler: 809 checks, 0 failed.
+
+Performance. Wall time on the shared machine (load average 11-13 on 4 cores during the step) was too noisy to resolve a few
+percent, so the comparison is also made in instructions (`valgrind --tool=callgrind`, deterministic), both compilers built
+by the same baseline compiler:
+
+| | base compiler | new compiler | change |
+|---|---|---|---|
+| instructions, `orin compile compiler/main.or` | 38,753 M | 38,558 M | -0.5 % |
+| instructions, `orin check compiler/main.or` (front end) | 2,718 M | 2,521 M | -7.3 % |
+| instructions, lex + parse of every `compiler/**/*.or` file once (benchmark driver) | 1,623 M | 1,365 M | -15.9 % |
+| instructions, lex only, same files | 721 M | 668 M | -7.3 % (it was +14 % with Result-returning lexer methods, below) |
+| peak RSS, self-compile | 157.8 MiB | 157.8 MiB | 0 |
+| wall, self-compile, 9 interleaved runs at load ~1 (median / min) | 7.38 s / 7.06 s | 7.33 s / 6.74 s | -0.7 % / -4.6 % |
+
+Final numbers: both compilers on the merged tree, the new one built by the bootstrap. Earlier, under load 11-13, wall
+times moved by 10-15 % between runs of the same binary (`check`: 1.22 s vs 1.32 s in one session,
+0.65 s vs 0.75 s median but 0.618 vs 0.626 min in another), so the instruction counts are the measurement. The parser is
+cheaper (precedence climbing makes one call per operand instead of seven, and the `{ node, pos }` records are gone), and so is the
+lexer since its methods return nothing (below). No slowdown.
+
+Design notes and friction:
+
+* **A mutating method that returns a value returns a pair.** Every `Parser` method that moves the cursor and returns a node
+  allocates the `(self, result)` pair; the old code allocated the `{ node, pos }` record instead, so the count is the same.
+  In the lexer that pair is per token and on top of the old costs: with `step(): Result<bool, _>` and Result-returning
+  per-kind methods lexing took +14 % instructions against the base (`Ok(true)` also boxes the bool; `Ok()` of
+  `Result<void, _>` is a shared nullary). A mutating method that returns `void` returns only `self`, so the lexer's methods
+  return nothing: the end is the `done` field, the first error the `err` field (`fail(d)`; `finished()`, `error()`), and
+  `run` turns it into the `Err`. Lexing is now -7 % against the base. This is "diagnostics as a field" where it pays; the
+  parser keeps `Result` (its methods return nodes anyway, so the pair is there either way, and `?` is the clearer form).
+* **Speculation on a copy.** `arrowStart` needs to try a return type without moving the cursor: `let probe = new
+  Parser(this.toks); probe.pos = q + 2;` (the copy shares the token array). A class that is a value makes this cheap and safe.
+* **Rule 8 (no program-wide counters)**: the lexer and the parser are per file; nothing is numbered across files (spans
+  carry the file index the caller passes, `OpTable` is built per `Parser`). The only class-typed field, `Parser.ops`, is
+  only read (`level`, `rowOf`), so the copy-on-call of a mutating method on a class field (seen in 3b) does not arise.
+* **`from` is a keyword** (again): the contract helper's parameter is `first`.
+* **Contract helpers as private methods.** `spansFrom` and the token tests are private methods used in the `@Ensures` of
+  the same class; it works, and keeps the clauses short (`this.spansFrom(result.unwrap().span, old(this.pos))`).
+* **Public parse methods for tests.** `parseExpr`, `parseType`, `parseStmt`, `parseBlock`, `parsePattern`, `parseItem` and
+  `parseModule` are public so that the tests can drive single productions (and so that the class invariant is checked after
+  each of them); the rest is private.
+* Rule 7 (array API): the lexer's character loops, the parser's list loops and `nestedIn` / `tokensWellFormed` (index
+  arithmetic, early exit) stay loops; the child lists of the predicates are built with `map` / `concat`, the rule checks use
+  `find` / `every` / `some`.
+
+### Parser error recovery
+
+Approved by the project owner on 2026-10-14 (the NEEDS_DECISION of step 3c). `orin check`, `orin compile`, `--format=json`,
+the LSP diagnostics and MCP `check` report every syntax error of a file, up to 20, instead of the first one only. Nothing
+else changed: the first error is byte-identical to the one before (code, message, span), every valid program gives the
+same tree and the same generated code, and `orin fmt` still refuses a file with a syntax error (it calls `parse`, which
+stops at the first error as before).
+
+```
+tests/recovery/three_errors.or:3:15: error[E0200]: expected expression, found `;`
+tests/recovery/three_errors.or:7:28: error[E0200]: expected identifier, found `:`
+tests/recovery/three_errors.or:12:12: error[E0200]: expected expression, found `;`
+```
+
+**API.** `parse(file, src)` is unchanged. `parseRecovering(file, src): Result<Module, Diagnostic[]>` (parser.or) is the
+recovering parse; the loader calls it and puts the further errors after the first in the `LoadOutcome` (`Loader.moreSyntaxErrors`),
+so every consumer of the loader (CLI text and JSON, LSP, MCP, `orin test`) reports them without a change of its own. A lexical
+error (E0100) ends the scan, so it stays the only error of its file. `Parser.enableRecovery()` switches a parser built by hand
+to recovery; without it the `Parser` behaves as before.
+
+**Recovery points.** The innermost of three loops catches the error, reports it and skips tokens:
+
+* *block statement* (`recoverStmt`, in `parseBlock`): to after the next `;` at the statement's brace level; to the `}` that
+  closes the block (not consumed); past the `}` that ends the body of an `if` / `while` / `for` / block statement, unless
+  `else` follows; or to a token after the error that starts a statement (`let`, `const`, `if`, `while`, `for`, `return`,
+  `break`, `continue`, `@`). Brace depth is counted from the first token of the failed statement, so a record literal or
+  an arrow function body inside it does not end the block early.
+* *class or interface member* (`recoverMember`): to after the next `;`, or past the `}` that closes a method body, at the
+  member's brace level; to a `@` after the error; or to the `}` that closes the class body.
+* *top-level declaration* (`recoverItem`, in `parseModule`): to the next `function`, `class`, `interface`, `type`, `import`,
+  `export` or `@` at the declaration's brace level after the error.
+
+A declaration keyword at the statement's or member's level means that a `}` is missing: the error is reported once, and the
+parse unwinds (`Parser.unwinding`, every catcher propagates) to `parseModule`, which continues at that keyword. Running into the
+end of the file inside a recovery stops the parse (no "expected `}`" after the real error).
+
+**No cascades.** (1) *The checker never sees a recovered tree.* When the parse has errors, `parseRecovering` returns only the
+diagnostics, the loader stops at that file (as it did at the first error before), and no checker runs on the program: only
+the parse errors are reported. This is the safe rule of the decision; marking recovered nodes so that the checker could skip
+errors that stem from them would have meant a flag on `Expr` / `Stmt` / `Item` (built by literal in ~150 places) and a rule in
+every checker method, for the benefit of type errors in a file that does not parse. (2) *Inside the parser* an error is dropped
+when it starts at or before the previous error or at the token a statement or member recovery resumed at or the token after it
+(`Parser.floor`): a construct that fails at once after a resume point means the tokens are still out of step (a `}` missing
+or doubled), and every following line would otherwise report "expected `(` or `:` in class member, found `.`" and the like.
+Top-level resume points (a declaration keyword or `@`) are reliable and an annotation error starts at its `@`, so there the
+window is not applied. Prefer one error fewer: `a b; c d;` reports one error (`d` is the second token after the resume
+point), `let a = ; let b = ;` reports two. (3) *Cap*: at most `MAX_SYNTAX_ERRORS` = 20 per file; when a 21st error is found
+the 20th gets the note "further syntax errors suppressed" and the parse stops.
+
+**Termination.** In the style of 3c's progress property: `recoverStmt` and `recoverMember` ensure `result ==> this.pos > st ||
+this.isP("}")` (the loop continues only when the cursor moved past the start of the failed construct, or it ends at the `}`),
+`recoverItem` ensures `this.pos > st || this.atEnd()`. Every resume point is a token after the error, a `}` that ends the loop,
+or the end of the file.
+
+**Contracts** (28 new clauses in parser.or, 3 in loader.or): the `Parser` invariants (`errs.length <= MAX_SYNTAX_ERRORS`, no errors
+and no unwinding without recovery, the last error is at or before `floor`), the progress clauses above, `report` adds at most one
+error and adds exactly `d`, `stop` leaves the cursor at the end, `parseModule` with recovery always returns a module and has
+stopped unwinding, `parseRecovering` ensures `syntaxErrorsOk` (1..20 errors, parse-error codes, spans in the source, strictly
+ordered by start, the note only on the 20th) and `agreesWithParse` (errors exactly when `parse` fails, and the first one is
+`sameDiag` to it: the "first error unchanged" rule is a contract that runs on every file the contract-checked compiler loads);
+`Loader.run` ensures the further errors are renderable and empty on success.
+
+Tests: `compiler/tests/recovery_test.or` (9 `@Test`, run by `tools/test_tooling.sh`: each recovery point, no cascades, the
+cap and its note, the lexer, `Parser` without recovery unchanged, 400 garbage token soups and every prefix and every 3-byte
+deletion of a program checked against `parse`), `tests/recovery/` with `tools/test_recovery.py` (8 programs with the exact
+expected `check` output in `<name>.err`; also checks `compile`, `--format=json` and that `fmt --check` refuses the file), new
+cases in `test_lsp.py`, `test_mcp.py` and `analysis_test.or`. Mutation check: 12 hand-made mutants of the recovery code
+against `recovery_test.or` (no skipping in `recoverStmt`, no cascade floor, cap off by one, top-level resume at the error
+token, `if` body not a statement end, no unwinding at a declaration keyword, one-token cascade window, first error dropped,
+note on another error, a method body's `}` not consumed, recovery always on, `recoverStmt` ignoring `unwinding`): 11 killed;
+the last is equivalent (the check right after `report` returns on `unwinding` as well, and the re-report is dropped by the
+floor).
+
+Results (against the baseline compiler built before the change):
+
+* **first error**: `check` and `check --format=json` of 3,257 inputs (every `.or` file of the repository and 1,500 garbage
+  files: random token soups, truncations, deletions and duplications of real files, generated as in 3c): 3,047 outputs
+  identical, 210 report more errors; in all 210 the base reported one diagnostic and the new first diagnostic is
+  byte-identical to it (JSON line and rendered text), every further one has a syntax code, starts after the previous one,
+  and there are never more than 20 (histogram: 2 errors 144 files, 3: 27, 4: 12, 5: 7, 6: 4, 7: 3, 8: 5, 9: 2, 10: 3,
+  11: 1, 12: 1, 20: 1, `tests/recovery/cap.or`). No crash, no trap. The same inputs through the contract-checked compiler:
+  identical output, no contract fired (3,090 inputs: all but the 167 valid `compiler/` files, which take minutes each to
+  type check under contracts on a loaded machine; the contract-checked self-compile below parses every one of them).
+* **generated code**: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
+  `examples/` program and of `compiler/main.or` (392 programs x 3) byte-identical;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,833,375 bytes), conformance 141/141; all suites 812/812;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`,
+  812/812 conformance tests, `test_verify_contracts` 809 checks, no contract fired;
+* `orin check --strict-contracts compiler/main.or`: 0 warnings;
+* `test_fmt.py` 1,661 passed; `orin fmt --stdout` of 3,243 files byte-identical between the two compilers (1,271 formatted,
+  1,972 refused); `test_tooling.sh` passed (`recovery_test` 9/9, `test_recovery.py` 8/8); `test_lsp.py` 104 checks,
+  `test_mcp.py` 191 checks, 0 failed.
+
+Performance (callgrind instruction counts, both compilers built by the baseline compiler, both on the new tree):
+`orin compile compiler/main.or` 38,780 M -> 38,792 M (+0.03 %), `orin check compiler/main.or` (front end) 2,575.0 M ->
+2,587.2 M (+0.47 %). The parser's own copy-on-write traffic did not grow (the `Parser` copies in `orin_make_unique_slow`
+went from 1.60 M to 1.46 M instructions); the rest is spread thinly. Wall time was not measurable (load average 17-19 on 4
+cores: medians moved by more than 5 % between runs of the same binary).
+
+Friction:
+
+* **No exceptions, no catch.** Every error is a `Result` that `?` propagates; a recovery point is a loop that takes the
+  `Err` apart (`isOk` / `unwrap` / `unwrapErr` instead of `?`), and "give up and resume at the top level" needs a flag in
+  the parser (`unwinding`) that every catcher tests, because there is no way to unwind past several frames.
+* **Parameters are immutable and classes are values**: the loop-clause part of a block statement had to become a method
+  that returns its statements (`parseLoopClauses`) instead of pushing into the caller's array.
+* **Cascade rules are heuristics.** The cap, "stop at the end of the file" and "the checker never sees a recovered tree" are
+  rules; the two-token window after a resume point is a judgement (it drops `c d` in `a b; c d;`). It was tuned on the
+  garbage corpus, where the out-of-step cases (a `}` deleted in the middle of a class) produced one error per following line
+  before it.
+* **Session tooling**: shell loops over compiler runs are refused in a worktree-isolated session (like compound `git`
+  commands, see "Pitfalls found"); the corpus and comparison drivers were small Python scripts.
+
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
 Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving

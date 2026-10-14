@@ -1,0 +1,470 @@
+// Well-formedness of the syntax tree, for contracts: spans nest and are ordered.
+//
+// A node's *children* are the sub-nodes that have a span, in source order (`exprKids`, `stmtKids`, ...). A node is
+// shallow-well-formed when its children lie inside its span, in the same file, and do not overlap, each ending before
+// the next starts (`nestedIn`). A tree is well formed when every node is (`exprOk`, `stmtOk`, ..., `moduleWellFormed`).
+// The parser ensures the shallow property of every node it builds (each node once, so the cost is linear) and `parse`
+// ensures the deep one of the module. Bugs this catches: a node whose span is taken from the wrong token (it then misses
+// a child, and every diagnostic or LSP range of that node is wrong), children stored out of order, a span from another
+// file, a span past the end of the source.
+
+import { Span } from "../diag";
+import {
+  Ident, Module, Item, ImportDecl, FunctionDecl, Param, TypeDecl, TypeDeclBody, FieldDecl,
+  VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit,
+  MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ContractClause, Annotation,
+  ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam,
+  ArrowBody,
+} from "./ast";
+
+// `c` lies inside `p` (same file).
+export function inside(c: Span, p: Span): bool {
+  return c.file == p.file && c.start >= p.start && c.end <= p.end;
+}
+
+// Every span of `kids` lies inside `p`, and each ends at or before the start of the next.
+export function nestedIn(kids: Span[], p: Span): bool {
+  let i: usize = 0;
+  while (i < kids.length) {
+    if (!inside(kids[i], p)) {
+      return false;
+    }
+    if (i > 0 && kids[i - 1].end > kids[i].start) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function exprSpans(xs: Expr[]): Span[] {
+  return xs.map(x => x.span);
+}
+
+function typeSpans(ts: TypeExpr[]): Span[] {
+  return ts.map(t => t.span);
+}
+
+function optExpr(o: Option<Expr>): Span[] {
+  if (o.isSome()) {
+    return [o.unwrap().span];
+  }
+  return [];
+}
+
+function optType(o: Option<TypeExpr>): Span[] {
+  if (o.isSome()) {
+    return [o.unwrap().span];
+  }
+  return [];
+}
+
+function optStmt(o: Option<Stmt>): Span[] {
+  if (o.isSome()) {
+    return [o.unwrap().span];
+  }
+  return [];
+}
+
+function optIdent(o: Option<Ident>): Span[] {
+  if (o.isSome()) {
+    return [o.unwrap().span];
+  }
+  return [];
+}
+
+function armBodySpan(b: ArmBody): Span {
+  return match (b) {
+    BExpr(e) => e.span,
+    BBlock(bl) => bl.span,
+  };
+}
+
+function arrowBodySpan(b: ArrowBody): Span {
+  return match (b) {
+    AExpr(e) => e.span,
+    ABlock(bl) => bl.span,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Children in source order
+// ---------------------------------------------------------------------------
+
+export function exprKids(e: Expr): Span[] {
+  return match (e.kind) {
+    EIdent(id) => [id.span],
+    EUnary(_, x) => [x.span],
+    EBinary(_, a, b) => [a.span, b.span],
+    ECall(f, args) => [f.span].concat(exprSpans(args)),
+    EMember(x, id) => [x.span, id.span],
+    EIndex(x, ix) => [x.span, ix.span],
+    ETry(x) => [x.span],
+    ECond(c, a, b) => [c.span, a.span, b.span],
+    EArray(xs) => exprSpans(xs),
+    ERecord(id, spread, fields) => [id.span]
+        .concat(optExpr(spread))
+        .concat(fields.map(f => f.span)),
+    ETyApp(id, tys) => [id.span].concat(typeSpans(tys)),
+    ERecordT(id, tys, spread, fields) => [id.span]
+        .concat(typeSpans(tys))
+        .concat(optExpr(spread))
+        .concat(fields.map(f => f.span)),
+    EMatch(x, arms) => [x.span].concat(arms.map(a => a.span)),
+    ETemplate(_, xs) => exprSpans(xs),
+    ENew(id, tys, args) => [id.span].concat(typeSpans(tys)).concat(exprSpans(args)),
+    EArrow(ps, ret, body) => ps.map(p => p.span).concat(optType(ret)).concat([arrowBodySpan(body)]),
+    _ => [],
+  };
+}
+
+export function stmtKids(s: Stmt): Span[] {
+  return match (s.kind) {
+    SLet(_, id, ty, init) => [id.span].concat(optType(ty)).concat([init.span]),
+    SAssign(t, _, v) => [t.span, v.span],
+    SExpr(e) => [e.span],
+    SReturn(v) => optExpr(v),
+    SIf(c, b, els) => [c.span, b.span].concat(optStmt(els)),
+    SWhile(c, b) => [c.span, b.span],
+    SForOf(id, x, b) => [id.span, x.span, b.span],
+    SBlock(b) => [b.span],
+    SContract(c) => optExpr(c.expr),
+    _ => [],
+  };
+}
+
+function fnTypeKids(ps: FnTyParam[], r: TypeExpr): Span[] {
+  let k: Span[] = [];
+  for (const p of ps) {
+    k.push(p.name.span);
+    k.push(p.ty.span);
+  }
+  k.push(r.span);
+  return k;
+}
+
+export function typeKids(t: TypeExpr): Span[] {
+  return match (t.kind) {
+    TNamed(id, args) => [id.span].concat(typeSpans(args)),
+    TArray(el) => [el.span],
+    TFn(ps, r) => fnTypeKids(ps, r),
+  };
+}
+
+export function patKids(p: Pattern): Span[] {
+  return match (p.kind) {
+    PIdent(id) => [id.span],
+    PVariant(id, subs) => [id.span].concat(subs.map(s => s.span)),
+    _ => [],
+  };
+}
+
+export function itemSpan(it: Item): Span {
+  return match (it) {
+    IImport(d) => d.span,
+    IReExport(d) => d.span,
+    IFunction(d) => d.span,
+    IType(d) => d.span,
+    IConst(d) => d.span,
+    IClass(d) => d.span,
+    IInterface(d) => d.span,
+  };
+}
+
+export function memberSpan(m: ClassMember): Span {
+  return match (m) {
+    MField(f) => f.span,
+    MCtor(c) => c.span,
+    MMethod(md) => md.span,
+  };
+}
+
+function paramSpans(ps: Param[]): Span[] {
+  return ps.map(p => p.span);
+}
+
+function identSpans(ids: Ident[]): Span[] {
+  return ids.map(i => i.span);
+}
+
+function signatureKids(name: Ident, params: Param[], ret: Option<TypeExpr>): Span[] {
+  return [name.span].concat(paramSpans(params)).concat(optType(ret));
+}
+
+function memberKids(m: ClassMember): Span[] {
+  return match (m) {
+    MField(f) => [f.name.span, f.ty.span].concat(optExpr(f.init)),
+    MCtor(c) => c.params.map(p => p.span).concat([c.body.span]),
+    MMethod(md) => signatureKids(md.name, md.params, md.ret).concat([md.body.span]),
+  };
+}
+
+function bodyKids(b: TypeDeclBody): Span[] {
+  return match (b) {
+    DAlias(t) => [t.span],
+    DRecord(fs) => fs.map(f => f.span),
+    DUnion(vs) => vs.map(v => v.span),
+  };
+}
+
+// The children of an item in source order. Contract clauses, annotations and type parameters are checked as separate
+// ordered lists (`declListsOk`): clauses and annotations may be interleaved, and bounds sit between type parameters.
+export function itemKids(it: Item): Span[] {
+  return match (it) {
+    IImport(d) => identSpans(d.names).concat([d.pathSpan]),
+    IReExport(d) => identSpans(d.names).concat([d.pathSpan]),
+    IFunction(d) => signatureKids(d.name, d.params, d.ret).concat([d.body.span]),
+    IType(d) => [d.name.span].concat(identSpans(d.typeParams)).concat(bodyKids(d.body)),
+    IConst(d) => [d.name.span].concat(optType(d.ty)).concat([d.value.span]),
+    IClass(d) => [d.name.span]
+        .concat(optIdent(d.ext))
+        .concat(identSpans(d.impls))
+        .concat(d.members.map(m => memberSpan(m))),
+    IInterface(d) => [d.name.span].concat(optIdent(d.ext)).concat(d.methods.map(m => m.span)),
+  };
+}
+
+function clausesNested(cs: ContractClause[], p: Span): bool {
+  return nestedIn(cs.map(c => c.span), p);
+}
+
+function annosNested(as: Annotation[], p: Span): bool {
+  return nestedIn(as.map(a => a.span), p);
+}
+
+function boundsInside(bs: Option<Ident>[], p: Span): bool {
+  return bs.every(b => b.isNone() || inside(b.unwrap().span, p));
+}
+
+// The lists of a declaration that `itemKids` leaves out: clauses, annotations, type parameters (and their bounds).
+function declListsOk(it: Item): bool {
+  return match (it) {
+    IFunction(d) => clausesNested(d.contracts, d.span)
+        && annosNested(d.annotations, d.span)
+        && nestedIn(identSpans(d.typeParams), d.span)
+        && boundsInside(d.bounds, d.span),
+    IType(d) => clausesNested(d.contracts, d.span) && annosNested(d.annotations, d.span),
+    IClass(d) => clausesNested(d.contracts, d.span)
+        && annosNested(d.annotations, d.span)
+        && nestedIn(identSpans(d.typeParams), d.span)
+        && boundsInside(d.bounds, d.span),
+    IInterface(d) => annosNested(d.annotations, d.span)
+        && nestedIn(identSpans(d.typeParams), d.span),
+    _ => true,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Shallow: one node
+// ---------------------------------------------------------------------------
+
+export function exprShallowOk(e: Expr): bool {
+  return nestedIn(exprKids(e), e.span);
+}
+
+export function stmtShallowOk(s: Stmt): bool {
+  return nestedIn(stmtKids(s), s.span);
+}
+
+export function typeShallowOk(t: TypeExpr): bool {
+  return nestedIn(typeKids(t), t.span);
+}
+
+export function patShallowOk(p: Pattern): bool {
+  return nestedIn(patKids(p), p.span);
+}
+
+export function blockShallowOk(b: Block): bool {
+  return nestedIn(b.stmts.map(s => s.span), b.span);
+}
+
+export function itemShallowOk(it: Item): bool {
+  return nestedIn(itemKids(it), itemSpan(it)) && declListsOk(it);
+}
+
+export function memberShallowOk(m: ClassMember): bool {
+  return nestedIn(memberKids(m), memberSpan(m));
+}
+
+// ---------------------------------------------------------------------------
+// Deep: a whole tree
+// ---------------------------------------------------------------------------
+
+export function typeOk(t: TypeExpr): bool {
+  if (!typeShallowOk(t)) {
+    return false;
+  }
+  return match (t.kind) {
+    TNamed(_, args) => args.every(a => typeOk(a)),
+    TArray(el) => typeOk(el),
+    TFn(ps, r) => ps.every(p => typeOk(p.ty)) && typeOk(r),
+  };
+}
+
+function optTypeOk(o: Option<TypeExpr>): bool {
+  return o.isNone() || typeOk(o.unwrap());
+}
+
+function optExprOk(o: Option<Expr>): bool {
+  return o.isNone() || exprOk(o.unwrap());
+}
+
+export function patOk(p: Pattern): bool {
+  if (!patShallowOk(p)) {
+    return false;
+  }
+  return match (p.kind) {
+    PVariant(_, subs) => subs.every(s => patOk(s)),
+    _ => true,
+  };
+}
+
+function fieldInitOk(f: FieldInit): bool {
+  return nestedIn([f.name.span, f.value.span], f.span) && exprOk(f.value);
+}
+
+function armOk(a: MatchArm): bool {
+  return match (a.body) {
+    BExpr(e) => nestedIn([a.pattern.span, e.span], a.span) && patOk(a.pattern) && exprOk(e),
+    BBlock(b) => nestedIn([a.pattern.span, b.span], a.span) && patOk(a.pattern) && blockOk(b),
+  };
+}
+
+function arrowParamOk(p: ArrowParam): bool {
+  return nestedIn([p.name.span].concat(optType(p.ty)), p.span) && optTypeOk(p.ty);
+}
+
+export function exprOk(e: Expr): bool {
+  if (!exprShallowOk(e)) {
+    return false;
+  }
+  return match (e.kind) {
+    EUnary(_, x) => exprOk(x),
+    EBinary(_, a, b) => exprOk(a) && exprOk(b),
+    ECall(f, args) => exprOk(f) && args.every(a => exprOk(a)),
+    EMember(x, _) => exprOk(x),
+    EIndex(x, ix) => exprOk(x) && exprOk(ix),
+    ETry(x) => exprOk(x),
+    ECond(c, a, b) => exprOk(c) && exprOk(a) && exprOk(b),
+    EArray(xs) => xs.every(x => exprOk(x)),
+    ERecord(_, spread, fields) => optExprOk(spread) && fields.every(f => fieldInitOk(f)),
+    ETyApp(_, tys) => tys.every(t => typeOk(t)),
+    ERecordT(_, tys, spread, fields) => tys.every(t => typeOk(t))
+        && optExprOk(spread)
+        && fields.every(f => fieldInitOk(f)),
+    EMatch(x, arms) => exprOk(x) && arms.every(a => armOk(a)),
+    ETemplate(_, xs) => xs.every(x => exprOk(x)),
+    ENew(_, tys, args) => tys.every(t => typeOk(t)) && args.every(a => exprOk(a)),
+    EArrow(ps, ret, body) => ps.every(p => arrowParamOk(p)) && optTypeOk(ret) && arrowBodyOk(body),
+    _ => true,
+  };
+}
+
+function arrowBodyOk(b: ArrowBody): bool {
+  return match (b) {
+    AExpr(x) => exprOk(x),
+    ABlock(bl) => blockOk(bl),
+  };
+}
+
+function clauseOk(c: ContractClause): bool {
+  return nestedIn(optExpr(c.expr), c.span) && optExprOk(c.expr);
+}
+
+export function stmtOk(s: Stmt): bool {
+  if (!stmtShallowOk(s)) {
+    return false;
+  }
+  return match (s.kind) {
+    SLet(_, _, ty, init) => optTypeOk(ty) && exprOk(init),
+    SAssign(t, _, v) => exprOk(t) && exprOk(v),
+    SExpr(e) => exprOk(e),
+    SReturn(v) => optExprOk(v),
+    SIf(c, b, els) => exprOk(c) && blockOk(b) && (els.isNone() || stmtOk(els.unwrap())),
+    SWhile(c, b) => exprOk(c) && blockOk(b),
+    SForOf(_, x, b) => exprOk(x) && blockOk(b),
+    SBlock(b) => blockOk(b),
+    SContract(c) => clauseOk(c),
+    _ => true,
+  };
+}
+
+export function blockOk(b: Block): bool {
+  return blockShallowOk(b) && b.stmts.every(s => stmtOk(s));
+}
+
+function paramOk(p: Param): bool {
+  return nestedIn([p.name.span, p.ty.span], p.span) && typeOk(p.ty);
+}
+
+function ctorParamOk(p: CtorParam): bool {
+  return nestedIn([p.name.span, p.ty.span], p.span) && typeOk(p.ty);
+}
+
+function memberOk(m: ClassMember): bool {
+  if (!memberShallowOk(m)) {
+    return false;
+  }
+  return match (m) {
+    MField(f) => typeOk(f.ty) && optExprOk(f.init),
+    MCtor(c) => c.params.every(p => ctorParamOk(p))
+        && blockOk(c.body)
+        && clausesNested(c.contracts, c.span)
+        && c.contracts.every(k => clauseOk(k)),
+    MMethod(md) => md.params.every(p => paramOk(p))
+        && optTypeOk(md.ret)
+        && blockOk(md.body)
+        && clausesNested(md.contracts, md.span)
+        && annosNested(md.annotations, md.span)
+        && md.contracts.every(k => clauseOk(k))
+        && nestedIn(identSpans(md.typeParams), md.span),
+  };
+}
+
+function ifaceMethodOk(m: IfaceMethod): bool {
+  return nestedIn(signatureKids(m.name, m.params, m.ret), m.span)
+      && annosNested(m.annotations, m.span)
+      && m.params.every(p => paramOk(p))
+      && optTypeOk(m.ret);
+}
+
+function fieldDeclOk(f: FieldDecl): bool {
+  return nestedIn([f.name.span, f.ty.span], f.span) && typeOk(f.ty);
+}
+
+function variantOk(v: VariantDecl): bool {
+  return nestedIn([v.name.span].concat(typeSpans(v.payload)), v.span)
+      && v.payload.every(t => typeOk(t));
+}
+
+function typeBodyOk(b: TypeDeclBody): bool {
+  return match (b) {
+    DAlias(t) => typeOk(t),
+    DRecord(fs) => fs.every(f => fieldDeclOk(f)),
+    DUnion(vs) => vs.every(v => variantOk(v)),
+  };
+}
+
+export function itemOk(it: Item): bool {
+  if (!itemShallowOk(it)) {
+    return false;
+  }
+  return match (it) {
+    IFunction(d) => d.params.every(p => paramOk(p))
+        && optTypeOk(d.ret)
+        && blockOk(d.body)
+        && d.contracts.every(c => clauseOk(c)),
+    IType(d) => typeBodyOk(d.body) && d.contracts.every(c => clauseOk(c)),
+    IConst(d) => optTypeOk(d.ty) && exprOk(d.value),
+    IClass(d) => d.members.every(m => memberOk(m)) && d.contracts.every(c => clauseOk(c)),
+    IInterface(d) => d.methods.every(m => ifaceMethodOk(m)),
+    _ => true,
+  };
+}
+
+// The module of a source of `n` bytes is well formed: its items are in source order, do not overlap, lie in the source
+// and in the module's file, and every item is well formed (`itemOk`).
+export function moduleWellFormed(m: Module, n: usize): bool {
+  const whole = Span { file: m.file, start: 0, end: n };
+  return nestedIn(m.items.map(it => itemSpan(it)), whole) && m.items.every(it => itemOk(it));
+}
