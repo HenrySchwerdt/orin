@@ -24,7 +24,7 @@ function bk(instrs: Instr[], term: Terminator): MBlock {
 }
 
 function fn(name: string, params: usize, locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
-  return MFunction { name: name, paramCount: params, paramOwned: noOwned(params), locals: locals, ret: ret, blocks: blocks };
+  return MFunction { name: name, paramCount: params, paramOwned: noOwned(params), inout: false, locals: locals, ret: ret, blocks: blocks };
 }
 
 function noOwned(n: usize): bool[] {
@@ -39,7 +39,7 @@ function noOwned(n: usize): bool[] {
 
 // Like `fn` but with explicit per-parameter ownership modes.
 function fnO(name: string, owned: bool[], locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
-  return MFunction { name: name, paramCount: owned.length, paramOwned: owned, locals: locals, ret: ret, blocks: blocks };
+  return MFunction { name: name, paramCount: owned.length, paramOwned: owned, inout: false, locals: locals, ret: ret, blocks: blocks };
 }
 
 function prog(fs: MFunction[]): MProgram {
@@ -380,7 +380,7 @@ function ownedCases(): usize {
     fn("f", 0, [lr("a")], MVoid, [bk([IStructNew(0, 0, []), ICall(None, 1, [OLocal(0), OLocal(0)])], ret())]),
     fnO("h", [true, true], [lr("p"), lr("q")], MVoid, [bk([IRelease(0), IRelease(1)], ret())])]), dead);
   const n10 = neg("paramOwned length differs", prog([
-    MFunction { name: "f", paramCount: 1, paramOwned: [], locals: [lr("p")], ret: MVoid, blocks: [bk([], ret())] }]), "paramOwned");
+    MFunction { name: "f", paramCount: 1, paramOwned: [], inout: false, locals: [lr("p")], ret: MVoid, blocks: [bk([], ret())] }]), "paramOwned");
   const n11 = neg("owned scalar parameter", prog([
     fnO("f", [true], [li("n")], MVoid, [bk([], ret())])]), "not a reference");
   const n12 = neg("borrow of owned param used after it is consumed", prog([
@@ -582,6 +582,7 @@ function sInstr(i: Instr): Instr {
       _ => IBuiltin(sd(d), b, sos(args))
     },
     IStrAppend(x, o) => IStrAppend(x + 1, so(o)),
+    IArrayExtend(x, o) => IArrayExtend(x + 1, so(o)),
     IStructNew(d, tag, slots) => IStructNew(d + 1, tag, sos(slots)),
     INullary(d, tag) => INullary(d + 1, tag),
     ITag(d, o) => ITag(d + 1, so(o)),
@@ -642,7 +643,7 @@ function withAuth(p0: MProgram): MProgram {
       blocks.push(plainBlock(is, sTerm(b.term)));
     }
     fs.push(MFunction {
-      name: f.name, paramCount: f.paramCount + 1, paramOwned: [false].concat(f.paramOwned),
+      name: f.name, paramCount: f.paramCount + 1, paramOwned: [false].concat(f.paramOwned), inout: false,
       locals: [lh("auth")].concat(f.locals), ret: f.ret, blocks: blocks
     });
   }
@@ -933,6 +934,90 @@ function netCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- in/out receiver (v1.10)
+
+// An inout function: parameter 0 (owned) is handed back at return. `fnIO(name, locals, ret, blocks)`.
+function fnIO(name: string, locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
+  return MFunction { name: name, paramCount: 1, paramOwned: [true], inout: true, locals: locals, ret: ret, blocks: blocks };
+}
+
+// next(owned this): int, in/out: moves this into a temp, bumps the field, hands the receiver back, returns an int.
+function ioNext(): MFunction {
+  return fnIO("next", [lr("this"), lr("t"), li("v")], MInt, [bk([
+    IMove(1, 0), IMakeUnique(1), ISetField(1, 0, OInt(1)), IMove(0, 1), ICopy(2, OInt(7))], TReturn(Some(OLocal(2))))]);
+}
+
+function inoutCases(): usize {
+  let bad: usize = 0;
+  const dead = "dead";
+  const p1 = pos("inout callee hands its receiver back", prog([
+    fn("f", 0, [lr("x"), li("r")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), IRelease(0)], ret())]),
+    ioNext()]));
+  const p2 = pos("inout callee that never touches its receiver", prog([
+    fn("f", 0, [lr("x"), li("r")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), IRelease(0)], ret())]),
+    fnIO("keep", [lr("this")], MInt, [bk([], TReturn(Some(OInt(3))))])]));
+  const p3 = pos("inout call result may be discarded", prog([
+    fn("f", 0, [lr("x")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(None, 1, [OLocal(0)]), IRelease(0)], ret())]),
+    ioNext()]));
+  const p4 = pos("inout caller passes its own receiver on", prog([
+    fn("f", 0, [lr("x"), li("r")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), IRelease(0)], ret())]),
+    fnIO("outer", [lr("this"), lr("t"), li("v")], MInt, [bk([
+      IMove(1, 0), ICall(Some(2), 2, [OLocal(1)]), IMove(0, 1)], TReturn(Some(OLocal(2))))]),
+    ioNext()]));
+  const n1 = neg("inout callee returns without a receiver", prog([
+    fn("f", 0, [lr("x"), li("r")], MVoid, [bk([
+      IStructNew(0, 0, [OInt(1)]), ICall(Some(1), 1, [OLocal(0)]), IRelease(0)], ret())]),
+    fnIO("lose", [lr("this")], MInt, [bk([IRelease(0)], TReturn(Some(OInt(3))))])]), "updated receiver");
+  const n2 = neg("inout callee returns its receiver twice (released then returned)", prog([
+    fnIO("twice", [lr("this"), lr("t")], MInt, [bk([IMove(1, 0), IRelease(1)], TReturn(Some(OInt(3))))])]), "updated receiver");
+  const n3 = neg("inout callee holds a hole in its receiver at return", prog([
+    fnIO("hole", [lr("this"), lr("t"), lr("u")], MInt, [bk([
+      IMove(1, 0), IMakeUnique(1), ITakeField(2, 1, 0), IMove(0, 1), IRelease(2)], TReturn(Some(OInt(3))))])]), "hole");
+  const n4 = neg("a non-inout function writes parameter 0", prog([
+    fnO("f", [true], [lr("p"), lr("q")], MVoid, [bk([IMove(1, 0), IMove(0, 1), IRelease(0)], ret())])]), "write to parameter");
+  const n5 = neg("inout call with a literal receiver", prog([
+    fn("f", 0, [li("r")], MVoid, [bk([ICall(Some(0), 1, [OStr(0)])], ret())]),
+    ioNext()]), "must be a local");
+  const n6 = neg("inout call result stored in the receiver local", prog([
+    fn("f", 0, [lr("x")], MVoid, [bk([IStructNew(0, 0, [OInt(1)]), ICall(Some(0), 1, [OLocal(0)])], ret())]),
+    fnIO("rr", [lr("this")], MRef, [bk([IStructNew(0, 0, [])], TReturn(Some(OLocal(0))))])]), "destination must not be");
+  const n7 = neg("inout call with a borrowed parameter as receiver", prog([
+    fnO("f", [false], [lr("p"), li("r")], MVoid, [bk([ICall(Some(1), 1, [OLocal(0)])], ret())]),
+    ioNext()]), "parameter");
+  const n8 = neg("receiver read after being consumed by the inout call is fine, but a borrow of it dies", prog([
+    fn("f", 0, [lr("x"), lr("b"), li("r"), li("i")], MVoid, [bk([
+      IStructNew(0, 0, [OStr(0)]), IGetField(1, OLocal(0), 0), ICall(Some(2), 1, [OLocal(0)]), ITag(3, OLocal(1)), IRelease(0)], ret())]),
+    ioNext()]), dead);
+  const n9 = neg("inout function without parameters", prog([
+    MFunction { name: "f", paramCount: 0, paramOwned: [], inout: true, locals: [], ret: MVoid, blocks: [bk([], ret())] }]), "parameter 0");
+  const n10 = neg("inout function with a borrowed parameter 0", prog([
+    MFunction { name: "f", paramCount: 1, paramOwned: [false], inout: true, locals: [lr("p")], ret: MVoid, blocks: [bk([], ret())] }]), "parameter 0");
+  // IArrayExtend (v1.10): x = x ++ y in place; rules of IStrAppend
+  const e1 = pos("arrayextend of an owned array by another", straight(0, [lr("a"), lr("b")], [
+    IArrayNew(0, false, []), IArrayNew(1, false, [OInt(1)]), IArrayExtend(0, OLocal(1)), IRelease(1), IRelease(0)]));
+  const e2 = pos("arrayextend leaves the array Owned: it can be released or extended again", straight(0, [lr("a"), lr("b")], [
+    IArrayNew(0, false, []), IArrayNew(1, false, []), IArrayExtend(0, OLocal(1)), IArrayExtend(0, OLocal(1)), IRelease(1), IRelease(0)]));
+  const e3 = neg("arrayextend of a borrowed parameter", straight(2, [lr("p"), lr("q")], [IArrayExtend(0, OLocal(1))]), "parameter");
+  const e4 = neg("arrayextend by itself", straight(0, [lr("a")], [IArrayNew(0, false, []), IArrayExtend(0, OLocal(0)), IRelease(0)]), "by itself");
+  const e5 = neg("arrayextend by an alias of the array", straight(0, [lr("a"), lr("g")], [
+    IArrayNew(0, true, [OStr(0)]), IGetField(1, OLocal(0), 0), IArrayExtend(0, OLocal(1)), IRelease(0)]), "borrowed from the array");
+  const e6 = neg("arrayextend invalidates borrows of the array", straight(0, [lr("a"), lr("b"), lr("g"), li("i")], [
+    IArrayNew(0, true, [OStr(0)]), IArrayNew(1, true, []), IArrayGet(2, OLocal(0), OUsize(0)), IArrayExtend(0, OLocal(1)), ITag(3, OLocal(2)),
+    IRelease(1), IRelease(0)]), dead);
+  const e7 = neg("arrayextend with a literal", straight(0, [lr("a")], [IArrayNew(0, false, []), IArrayExtend(0, OStr(0))]), "needs reference locals");
+  if (!e1) { bad += 1; } if (!e2) { bad += 1; } if (!e3) { bad += 1; } if (!e4) { bad += 1; } if (!e5) { bad += 1; }
+  if (!e6) { bad += 1; } if (!e7) { bad += 1; }
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; } if (!p4) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; }
+  return bad;
+}
+
 // Source positions (docs/mir.md v2.0): an ownership error is reported at the span of the offending instruction, a
 // well-formedness error and an error in MIR without spans carry none.
 function spanCases(): usize {
@@ -975,7 +1060,7 @@ function spanCases(): usize {
 }
 
 function main(): void {
-  const bad = spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases();
+  const bad = spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

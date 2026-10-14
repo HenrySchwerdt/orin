@@ -1,0 +1,137 @@
+// `x = x + e` (string) and `x = x.concat(e)` (array) must mean exactly `x += e` / "a new array", whatever the place
+// is: a local, a record field, a class field, an element, a field of an element. The optimiser turns them into
+// in-place appends when the value is not shared (docs/mir.md v1.10: take/put of the slot, `arrayextend`); every
+// case below also checks that a copy taken before the update does not change (value semantics) and that operands
+// which alias the destination still work.
+
+type Rec = { s: string; t: string; a: int[]; names: string[]; n: int; };
+
+class Buf {
+  s: string;
+  items: string[];
+  nums: int[];
+  constructor() {
+    this.s = "";
+    this.items = [];
+    this.nums = [];
+  }
+  addStr(t: string): void {
+    this.s = this.s + t;
+  }
+  addTwice(t: string): void {
+    this.s = this.s + t + t;
+  }
+  addSelf(): void {
+    this.s = this.s + this.s;
+  }
+  addItems(more: string[]): void {
+    this.items = this.items.concat(more);
+  }
+  addNums(more: int[]): void {
+    this.nums = this.nums.concat(more);
+  }
+  addNumsSelf(): void {
+    this.nums = this.nums.concat(this.nums);
+  }
+  show(): string {
+    return this.s + "|" + this.items.join(",") + "|" + this.nums.length.toString();
+  }
+}
+
+function fresh(): Rec {
+  return Rec { s: "", t: "T", a: [], names: [], n: 0 };
+}
+
+function main(): void {
+  // local string, record field
+  let r = fresh();
+  let i = 0;
+  while (i < 5) {
+    r.s = r.s + "ab";
+    i += 1;
+  }
+  console.log(r.s);
+  // a copy taken before the update keeps the old value
+  const before = r;
+  r.s = r.s + "!";
+  console.log(before.s + " / " + r.s);
+  // operands that alias the destination
+  r.s = r.s + r.s;
+  console.log(r.s.length.toString());
+  r.t = r.t + r.s.substring(0, 2);
+  console.log(r.t);
+  r.s = r.s + r.t;
+  console.log(r.s);
+  // chains
+  r.t = r.t + "x" + "y" + r.t;
+  console.log(r.t);
+
+  // arrays: local, field, aliasing
+  let xs: int[] = [1, 2];
+  const keep = xs;
+  xs = xs.concat([3, 4]);
+  xs = xs.concat(keep);
+  xs = xs.concat(xs);
+  console.log(xs.length.toString() + " " + keep.length.toString());
+  r.a = r.a.concat([7]);
+  r.a = r.a.concat(r.a);
+  r.a = r.a.concat([8, 9]);
+  const snap = r.a;
+  r.a = r.a.concat(snap);
+  console.log(r.a.length.toString() + " " + snap.length.toString());
+  // arrays of references
+  let ws: string[] = [];
+  const empty = ws;
+  ws = ws.concat(["a", "b"]);
+  ws = ws.concat(ws);
+  ws = ws.concat(["c"]);
+  console.log(ws.join("") + " " + empty.length.toString());
+  r.names = r.names.concat(ws);
+  r.names = r.names.concat(r.names);
+  console.log(r.names.join("") + " " + ws.length.toString());
+
+  // class fields, including through a copy
+  let b = new Buf();
+  b.addStr("x");
+  b.addTwice("yz");
+  const snapshot = b;
+  b.addSelf();
+  b.addItems(["p", "q"]);
+  b.addItems(["r"]);
+  b.addNums([1, 2, 3]);
+  b.addNumsSelf();
+  console.log(b.show());
+  console.log(snapshot.show());
+
+  // elements and fields of elements
+  let recs: Rec[] = [fresh(), fresh()];
+  let k = 0;
+  while (k < 3) {
+    recs[1].s = recs[1].s + "e";
+    recs[0].a = recs[0].a.concat([k]);
+    k += 1;
+  }
+  const rcopy = recs;
+  recs[1].s = recs[1].s + "!";
+  recs[0].a = recs[0].a.concat(recs[0].a);
+  console.log(recs[0].s + "|" + recs[1].s + "|" + recs[0].a.length.toString() + "|" + rcopy[1].s + "|" + rcopy[0].a.length.toString());
+  let grid: string[][] = [[], []];
+  grid[0] = grid[0].concat(["a"]);
+  grid[0] = grid[0].concat(grid[0]);
+  grid[1] = grid[1].concat(grid[0]);
+  console.log(grid[0].join("") + " " + grid[1].join(""));
+  let lines: string[] = ["a", "b"];
+  lines[1] = lines[1] + lines[0];
+  lines[0] = lines[0] + lines[1];
+  console.log(lines.join(","));
+
+  // many appends (linear time: 50000 appends would take seconds if each one copied)
+  let big = fresh();
+  let m = 0;
+  while (m < 50000) {
+    big.s = big.s + "x";
+    big.a = big.a.concat([m]);
+    m += 1;
+  }
+  console.log(big.s.length.toString() + " " + big.a.length.toString());
+}

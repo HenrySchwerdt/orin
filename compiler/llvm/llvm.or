@@ -51,6 +51,23 @@ function isFloatT(t: MType): bool {
   };
 }
 
+// Type with the attributes the language guarantees for parameters and results of generated functions.
+function attrTy(t: MType): string {
+  return match (t) {
+    MVoid => "void",
+    MRef => "noundef nonnull ptr",
+    _ => "noundef " + lty(t)
+  };
+}
+
+// Parameter type then attributes (the result attributes go before the type, parameter attributes after it).
+function paramTy(t: MType): string {
+  return match (t) {
+    MRef => "ptr noundef nonnull",
+    _ => lty(t) + " noundef"
+  };
+}
+
 function lty(t: MType): string {
   return match (t) {
     MVoid => "void",
@@ -363,6 +380,9 @@ function declares(): string {
     "declare ptr @orin_array_slice(ptr, i64, i64)",
     "declare ptr @orin_array_concat(ptr, ptr)",
     "declare ptr @orin_array_join(ptr, ptr)",
+    "declare ptr @orin_bytes_to_string(ptr, i64, i64)",
+    "declare ptr @orin_string_to_bytes(ptr)",
+    "declare ptr @orin_array_extend(ptr, ptr)",
     "declare ptr @orin_int_to_string(i64)",
     "declare ptr @orin_usize_to_string(i64)",
     "declare ptr @orin_bool_to_string(i64)",
@@ -424,6 +444,14 @@ function ld(fx: Fx, p: string, n: usize, o: Operand): string {
 
 function targ(fx: Fx, p: string, n: usize, o: Operand): string {
   return lty(opTy(fx, o)) + " " + ov(p, n, o);
+}
+
+// The address of the local an operand names (the in/out argument of a call, docs/mir.md v1.10).
+function operandPtr(o: Operand): string {
+  return match (o) {
+    OLocal(l) => "%l" + u(l),
+    _ => "null"
+  };
 }
 
 function loadsOf(fx: Fx, p: string, os: Operand[]): string {
@@ -671,6 +699,8 @@ function bname(op: Builtin): string {
     BArrSlice => "orin_array_slice",
     BArrConcat => "orin_array_concat",
     BArrJoin => "orin_array_join",
+    BBytesToString => "orin_bytes_to_string",
+    BStringToBytes => "orin_string_to_bytes",
     BIntToString => "orin_int_to_string",
     BUsizeToString => "orin_usize_to_string",
     BBoolToString => "orin_bool_to_string",
@@ -842,7 +872,9 @@ function builtinStore(fx: Fx, p: string, x: usize, pre: string, r: R): string {
 function callI(fx: Fx, p: string, d: Option<usize>, f: usize, args: Operand[]): string {
   const pre = loadsOf(fx, p, args);
   const callee = fx.prog.functions[f];
-  const call = "call " + lty(callee.ret) + " @" + fx.names[f] + "(" + argList(fx, p, args) + ")\n";
+  // in/out receiver (docs/mir.md v1.10): pass the address of the argument's local, the callee stores its final receiver there
+  const outArg = callee.inout ? ", ptr " + operandPtr(args[0]) : "";
+  const call = "call " + lty(callee.ret) + " @" + fx.names[f] + "(" + argList(fx, p, args) + outArg + ")\n";
   return pre + match (d) {
     Some(x) => "  " + p + "r = " + call + st(fx, x, p + "r"),
     None => "  " + call
@@ -989,6 +1021,8 @@ function instrI(fx: Fx, p: string, i: Instr): string {
     IBuiltin(d, b, args) => builtinInstr(fx, p, d, b, args),
     IStrAppend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + ld(fx, p, 1, y)
       + "  " + p + "r = call ptr @orin_str_append(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n" + st(fx, x, p + "r"),
+    IArrayExtend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + ld(fx, p, 1, y)
+      + "  " + p + "r = call ptr @orin_array_extend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n" + st(fx, x, p + "r"),
     IStructNew(d, tag, slots) => structNewI(fx, p, d, tag, slots),
     INullary(d, t) => "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + st(fx, d, p + "r"),
     ITag(d, o) => ld(fx, p, 0, o) + "  " + p + "g = getelementptr inbounds i8, ptr " + ov(p, 0, o) + ", i64 12\n  "
@@ -1034,9 +1068,12 @@ function termI(fx: Fx, p: string, t: Terminator): string {
     TGoto(b) => "  br label %B" + u(b) + "\n",
     TBranch(c, a, b) => ld(fx, p, 0, c) + "  " + p + "c = icmp ne i64 " + ov(p, 0, c) + ", 0\n  br i1 " + p + "c, label %B" + u(a) + ", label %B" + u(b) + "\n",
     TSwitch(o, cases, d) => switchI(fx, p, o, cases, d),
-    TReturn(o) => match (o) {
-      Some(x) => ld(fx, p, 0, x) + "  ret " + targ(fx, p, 0, x) + "\n",
-      None => "  ret void\n"
+    TReturn(o) => {
+      const outStore = fx.f.inout ? "  " + p + "o = load ptr, ptr %l0\n  store ptr " + p + "o, ptr %pout\n" : "";
+      return match (o) {
+        Some(x) => ld(fx, p, 0, x) + outStore + "  ret " + targ(fx, p, 0, x) + "\n",
+        None => outStore + "  ret void\n"
+      };
     },
     TTrap(m) => "  call void @orin_trap(ptr @.m" + u(msgIndex(fx.msgs, m)) + ")\n  unreachable\n"
   };
@@ -1055,14 +1092,18 @@ function switchI(fx: Fx, p: string, o: Operand, cases: SwitchCase[], d: usize): 
 function genFunction(fx: Fx, name: string): string {
   const f = fx.f;
   let out: string[] = [];
-  let sig = "define internal " + lty(f.ret) + " @" + name + "(";
+  // ADR-0038 step 1: every value is initialised (`noundef`) and a reference is never null (`nonnull`); no function unwinds.
+  let sig = "define internal " + attrTy(f.ret) + " @" + name + "(";
   let i: usize = 0;
   while (i < f.paramCount) {
     if (i > 0) {
       sig += ", ";
     }
-    sig += lty(f.locals[i].ty) + " %p" + u(i);
+    sig += paramTy(f.locals[i].ty) + " %p" + u(i);
     i += 1;
+  }
+  if (f.inout) {
+    sig += ", ptr noundef nonnull %pout";
   }
   sig += (isInlineFn(fx.prog, f.name) ? ") alwaysinline nounwind {\nentry:\n" : ") nounwind {\nentry:\n");
   out.push(sig);
