@@ -1,0 +1,828 @@
+// Unit tests of the body checker's building blocks (rewrite step 2b): the function context `FnCtx`
+// (fnctx.or), match coverage (match.or), generic-call inference state (call.or), the pure typing rules
+// (ops.or), the HIR well-formedness predicates (hirok.or), and the expression and statement checkers
+// end to end (programs are loaded from the overlay and checked). Run:
+// `orin test compiler/tests/check_body_test.or --runtime runtime`. `orin test` checks contracts at
+// run time, so the invariants of `FnCtx`, `Coverage`, `Inference`, `ExprChecker` and `StmtChecker` run on
+// every call below: a checker that left a scope open, a loop entered, a local unbound or a variant
+// uncounted traps here, or fails an assertion.
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { Span, SourceFile, Diagnostic, span } from "../diag";
+import { Ident, TypeExpr, TNamed, BinaryOp } from "../syntax";
+import {
+  Type, Local, Function, Program, HBlock, HStmt, HExpr, HExprKind, HArm, HPattern, VariantDef, RecordDef,
+  FieldDef, Place, PlaceElem, BinOp,
+} from "../hir";
+import { loadWithOverlay } from "../loader";
+import {
+  FnCtx, Scope, newFnCtx, newClosureCtx, Coverage, variantsOf, coverageKept, uncoveredCount, Inference,
+  allFilled, filledCount, localsBound, blockBound, stmtBound, placeBound, functionBound, allStmtsBound, mk,
+  nopExpr, isNop, untypedInt, fieldIndex, missingNames, tailTypes, noPre, intLiteral, bigIntLiteral,
+  negIntLiteral, negBigLiteral, interpolated, binaryType, extendPath, pureH, purePlace, mapReadFn, elemSuffix,
+  isArrayApi, emptyEnv, Env, typeEq, check,
+} from "../check";
+
+function sp(): Span {
+  return span(0, 0, 0);
+}
+
+function ident(n: string): Ident {
+  return Ident { name: n, span: sp() };
+}
+
+function ctx(): FnCtx {
+  let locals: Local[] = [Local { name: "p", ty: TyInt, mutable: false }];
+  let scope = new Scope();
+  scope.bind("p", 0);
+  return new FnCtx(0, "f", emptyEnv(), locals, scope, TyVoid);
+}
+
+function idOf(o: Option<usize>): int {
+  return match (o) {
+    Some(i) => i.toInt(),
+    None => -1,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// FnCtx
+// ---------------------------------------------------------------------------
+
+@Test
+function fnctxLocalsAndScopes(): void {
+  let fx = ctx();
+  assertEqUsize(fx.scope.depth(), 1, "parameter scope");
+  const a = fx.newLocal("a", TyBool, true);
+  assertEqUsize(a, 1, "ids are indexes");
+  assert(fx.lookupLocal("a").isNone(), "a local is not visible until declared");
+  assert(fx.declare(ident("a"), a).isOk(), "declare a");
+  assert(idOf(fx.lookupLocal("a")) == 1, "a visible");
+  assert(fx.declare(ident("a"), a).isErr(), "a second declaration in the same scope is E0304");
+  assertEqString(fx.declare(ident("a"), a).unwrapErr().code, "E0304", "code");
+  fx.pushScope();
+  assertEqUsize(fx.scope.depth(), 2, "pushed");
+  const b = fx.newLocal("a", TyInt, false);
+  assert(fx.declare(ident("a"), b).isOk(), "shadowing in an inner scope is fine");
+  assert(idOf(fx.lookupLocal("a")) == 2, "inner a");
+  assertEqBool(fx.declaredInScope("a"), true, "a is in the innermost scope");
+  assertEqBool(fx.declaredInScope("p"), false, "p is in the outer scope");
+  fx.popScope();
+  assert(idOf(fx.lookupLocal("a")) == 1, "outer a restored");
+  assertEqUsize(fx.locals.length, 3, "locals are never removed");
+  assertEqUsize(fx.scope.depth(), 1, "popped");
+}
+
+@Test
+function fnctxSnapshotIsAValue(): void {
+  let fx = ctx();
+  const saved = fx;
+  fx.newLocal("x", TyInt, false);
+  fx.pushScope();
+  fx.hoist(HBreak);
+  assertEqUsize(saved.locals.length, 1, "the snapshot keeps its locals");
+  assertEqUsize(saved.scope.depth(), 1, "the snapshot keeps its scopes");
+  assertEqUsize(saved.pre.length, 0, "the snapshot keeps its pending statements");
+  fx = saved;
+  assertEqUsize(fx.locals.length, 1, "restoring undoes the trial");
+}
+
+@Test
+function fnctxLoops(): void {
+  let fx = ctx();
+  fx.pushLoop();
+  fx.pushLoop();
+  fx.markBreak();
+  assertEqBool(fx.popLoop(), true, "the inner loop saw a break");
+  assertEqBool(fx.popLoop(), false, "the outer loop did not");
+  assertEqUsize(fx.loops.length, 0, "no loop left");
+}
+
+@Test
+function fnctxHoistedStatements(): void {
+  let fx = ctx();
+  fx.hoist(HBreak);
+  fx.hoist(HContinue);
+  assertEqUsize(fx.pre.length, 2, "two pending");
+  const outer = fx.stashPre();
+  assertEqUsize(outer.length, 2, "the stash holds them");
+  assertEqUsize(fx.pre.length, 0, "the statement starts empty");
+  fx.hoist(HBreak);
+  fx.restorePre(outer);
+  assertEqUsize(fx.pre.length, 2, "restored");
+}
+
+@Test
+function fnctxTemporaries(): void {
+  let fx = ctx();
+  const t0 = fx.newTemp("$t", TyInt);
+  const t1 = fx.newTemp("$r", TyBool);
+  assertEqString(fx.locals[t0].name, "$t0", "first temp");
+  assertEqString(fx.locals[t1].name, "$r1", "the counter is shared by every prefix");
+  assertEqUsize(fx.tmps, 2, "counter");
+  assert(fx.lookupLocal("$t0").isNone(), "temporaries are not named in any scope");
+}
+
+@Test
+function fnctxMarkMutOnlyForThis(): void {
+  let fx = ctx();
+  const t = fx.newLocal("this", TyInt, true);
+  assert(fx.declare(ident("this"), t).isOk(), "declare this");
+  assertEqBool(fx.markMut(Place { root: 0, path: [], ty: TyInt }), false, "a parameter is not `this`");
+  assertEqBool(fx.mutThis, false, "not marked");
+  assertEqBool(fx.markMut(Place { root: t, path: [], ty: TyInt }), true, "`this`");
+  assertEqBool(fx.mutThis, true, "marked");
+  assertEqBool(fx.markMut(Place { root: 0, path: [], ty: TyInt }), false, "the mark is sticky, the answer is per call");
+  assertEqBool(fx.mutThis, true, "still marked");
+}
+
+@Test
+function fnctxCapturesOfAnArrowFunction(): void {
+  let outer = ctx();
+  const x = outer.newLocal("x", TyString, false);
+  assert(outer.declare(ident("x"), x).isOk(), "declare x");
+  const pn: string[] = ["a"];
+  const pt: Type[] = [TyInt];
+  let inner = newClosureCtx(outer, "f$closure0", pn, pt, TyVoid, false);
+  assertEqUsize(inner.locals.length, 2, "env local and the parameter");
+  assertEqBool(inner.isVisibleVar("x"), true, "x is visible through the enclosing function");
+  assertEqUsize(inner.caps.size(), 0, "seeing is not capturing");
+  assertEqBool(inner.varType("x").isSome() && typeEq(inner.varType("x").unwrap(), TyString), true, "type of x");
+  assert(inner.lookupLocal("x").isNone(), "x is not a local of the closure");
+  const c1 = inner.lookupVar("x");
+  assert(c1.isSome(), "a use captures");
+  assertEqUsize(inner.caps.size(), 1, "one capture");
+  assertEqBool(inner.isCapturedLocal(c1.unwrap()), true, "it is a capture local");
+  assertEqUsize(c1.unwrap(), 2, "after env$ and a");
+  const c2 = inner.lookupVar("x");
+  assertEqUsize(c2.unwrap(), c1.unwrap(), "a variable is captured once");
+  assertEqUsize(inner.caps.size(), 1, "still one");
+  assert(inner.lookupVar("nothing").isNone(), "an unknown name captures nothing");
+  assertEqUsize(inner.locals.length, 3, "an unknown name adds no local");
+  assertEqUsize(outer.caps.size(), 0, "the enclosing function is not changed");
+  assertEqUsize(outer.locals.length, 2, "its locals neither");
+}
+
+@Test
+function fnctxAdoptKeepsTheTablesGrowing(): void {
+  let fx = ctx();
+  let e = fx.env;
+  fx.adopt(e);
+  assertEqUsize(fx.env.records.length, 0, "an unchanged environment is kept");
+  e.records.push(RecordDef { name: "R", fields: [] });
+  fx.adopt(e);
+  assertEqUsize(fx.env.records.length, 1, "a grown one is taken over");
+  let e2 = fx.env;
+  e2.records.push(RecordDef { name: "S", fields: [] });
+  fx.replaceEnv(e2);
+  assertEqUsize(fx.env.records.length, 2, "replaced");
+}
+
+@Test
+function fnctxContractModes(): void {
+  let fx = ctx();
+  fx.setCmode(2);
+  assertEqUsize(fx.cmode.toUsize(), 2, "@Ensures");
+  fx.setCmode(3);
+  assertEqUsize(fx.cmode.toUsize(), 3, "inside old(..)");
+  fx.setCmode(0);
+  assertEqUsize(fx.cmode.toUsize(), 0, "ordinary code");
+}
+
+// ---------------------------------------------------------------------------
+// Coverage (match exhaustiveness)
+// ---------------------------------------------------------------------------
+
+function threeVariants(): Option<VariantDef[]> {
+  const none: Type[] = [];
+  return Some([
+    VariantDef { name: "A", payload: none },
+    VariantDef { name: "B", payload: none },
+    VariantDef { name: "C", payload: none },
+  ]);
+}
+
+@Test
+function coverageOfAUnion(): void {
+  let c = new Coverage(threeVariants());
+  assertEqUsize(c.missing().length, 3, "nothing covered");
+  assertEqBool(c.exhaustive(), false, "not exhaustive");
+  assertEqString(c.verdict(sp()).unwrap().message, "non-exhaustive match: missing A, B, C", "message");
+  c.absorb([true, false, false], false);
+  assertEqString(c.missing().join(","), "B,C", "A is covered");
+  c.absorb([true, false, true], false);
+  assertEqString(c.verdict(sp()).unwrap().message, "non-exhaustive match: missing B", "one left");
+  assertEqString(c.verdict(sp()).unwrap().code, "E0402", "code");
+  c.absorb([true, true, true], false);
+  assertEqBool(c.exhaustive(), true, "all covered");
+  assert(c.verdict(sp()).isNone(), "no verdict against a covered match");
+}
+
+@Test
+function coverageWildcardCoversEverything(): void {
+  let c = new Coverage(threeVariants());
+  c.absorb([false, true, false], true);
+  assertEqBool(c.exhaustive(), true, "a `_` arm");
+  assert(c.verdict(sp()).isNone(), "no verdict");
+  assertEqUsize(c.missing().length, 2, "the flags are still honest");
+}
+
+@Test
+function coverageOfAScalar(): void {
+  const none: Option<VariantDef[]> = None;
+  let c = new Coverage(none);
+  assertEqUsize(c.covered.length, 0, "no flags");
+  assertEqBool(c.exhaustive(), false, "literals never exhaust a scalar");
+  assertEqString(c.verdict(sp()).unwrap().message, "match on a scalar value requires a `_` arm", "message");
+  c.absorb([], true);
+  assertEqBool(c.exhaustive(), true, "with `_`");
+}
+
+@Test
+function coverageOnlyGrows(): void {
+  assertEqBool(coverageKept([true, false], [true, true]), true, "growing");
+  assertEqBool(coverageKept([true, false], [false, true]), false, "a covered variant cannot be uncovered");
+  assertEqBool(coverageKept([true], [true, false]), false, "the variant count is fixed");
+  assertEqUsize(uncoveredCount([false, true, false]), 2, "count");
+}
+
+@Test
+function variantsOfBuiltins(): void {
+  const env = emptyEnv();
+  const o = variantsOf(env, TyOption(TyInt));
+  assertEqString(o.unwrap()[0].name + o.unwrap()[1].name, "SomeNone", "Option");
+  const r = variantsOf(env, TyResult(TyVoid, TyString)).unwrap();
+  assertEqString(r[0].name + r[1].name, "OkErr", "Result");
+  assertEqUsize(r[0].payload.length, 0, "an Ok of void has no payload");
+  assertEqUsize(r[1].payload.length, 1, "Err has one");
+  assert(variantsOf(env, TyInt).isNone(), "a scalar has no variants");
+}
+
+// ---------------------------------------------------------------------------
+// Inference (type arguments of a generic call)
+// ---------------------------------------------------------------------------
+
+function named(n: string): TypeExpr {
+  return TypeExpr { kind: TNamed(ident(n), []), span: sp() };
+}
+
+@Test
+function inferenceFirstBindingWins(): void {
+  const env = emptyEnv();
+  const tp: string[] = ["T", "U"];
+  let inf = new Inference(tp, 2);
+  assertEqBool(inf.unbound(named("T")), true, "T unbound");
+  inf.learn(env, 0, named("T"), TyInt);
+  assertEqBool(inf.unbound(named("T")), false, "T bound");
+  assertEqBool(inf.unbound(named("U")), true, "U unbound");
+  inf.learn(env, 0, named("T"), TyString);
+  assertEqBool(typeEq(inf.binds[0].unwrap(), TyInt), true, "a binding is never changed");
+  assertEqUsize(inf.current().length, 2, "current has one entry per parameter");
+  assertEqBool(typeEq(inf.current()[1], TyVoid), true, "an unbound parameter reads as void");
+}
+
+@Test
+function inferenceTypeArgs(): void {
+  const tp: string[] = ["T", "U"];
+  let inf = new Inference(tp, 0);
+  assertEqString(inf.typeArgs(sp(), "function `f`").unwrapErr().code, "E0407", "unresolved parameter");
+  assertEqString(
+    inf.typeArgs(sp(), "function `f`").unwrapErr().message,
+    "cannot infer type argument `T` of function `f`; add explicit type arguments or a type annotation",
+    "message",
+  );
+  inf.explicit(0, TyInt);
+  inf.explicit(1, TyVoid);
+  assertEqString(inf.typeArgs(sp(), "function `f`").unwrapErr().code, "E0400", "void argument");
+  let ok = new Inference(tp, 0);
+  ok.explicit(0, TyInt);
+  ok.explicit(1, TyString);
+  const tys = ok.typeArgs(sp(), "function `f`").unwrap();
+  assertEqUsize(tys.length, 2, "both");
+  assertEqBool(typeEq(tys[1], TyString), true, "in order");
+}
+
+@Test
+function inferenceSlotsAreFilledOnce(): void {
+  const tp: string[] = [];
+  let inf = new Inference(tp, 3);
+  assertEqBool(allFilled(inf.slots), false, "nothing yet");
+  inf.fill(1, mk(XInt(1), TyInt, sp()));
+  assertEqBool(inf.isFilled(1), true, "slot 1");
+  assertEqBool(inf.isFilled(0), false, "slot 0");
+  assertEqUsize(filledCount(inf.slots), 1, "one filled");
+  inf.fill(0, mk(XBool(true), TyBool, sp()));
+  inf.fill(2, mk(XStr("s"), TyString, sp()));
+  assertEqBool(allFilled(inf.slots), true, "all");
+  const args = inf.args();
+  assertEqUsize(args.length, 3, "in source order");
+  assertEqBool(typeEq(args[0].ty, TyBool) && typeEq(args[1].ty, TyInt) && typeEq(args[2].ty, TyString), true, "positions");
+}
+
+// ---------------------------------------------------------------------------
+// Pure typing rules (ops.or)
+// ---------------------------------------------------------------------------
+
+@Test
+function binaryTypeRules(): void {
+  const env = emptyEnv();
+  assertEqBool(typeEq(binaryType(env, BAdd, TyInt, TyInt, sp()).unwrap(), TyInt), true, "int + int");
+  assertEqBool(typeEq(binaryType(env, BLt, TyInt, TyInt, sp()).unwrap(), TyBool), true, "int < int is bool");
+  assertEqBool(typeEq(binaryType(env, BEq, TyString, TyString, sp()).unwrap(), TyBool), true, "string == string");
+  assertEqBool(typeEq(binaryType(env, BAdd, TyString, TyString, sp()).unwrap(), TyString), true, "string + string");
+  assertEqString(binaryType(env, BAdd, TyInt, TyFloat, sp()).unwrapErr().code, "E0400", "mixing numeric types");
+  assertEqString(
+    binaryType(env, BAdd, TyInt, TyFloat, sp()).unwrapErr().message,
+    "cannot mix `int` and `float`; convert explicitly",
+    "message",
+  );
+  assertEqString(binaryType(env, BEq, TyInt, TyBool, sp()).unwrapErr().code, "E0410", "different types");
+  assertEqString(binaryType(env, BSub, TyString, TyString, sp()).unwrapErr().message, "operator is not defined for type `string`", "undefined");
+  assertEqString(binaryType(env, BRem, TyFloat, TyFloat, sp()).unwrapErr().code, "E0410", "% on floats");
+  assertEqBool(typeEq(binaryType(env, BLe, TyUsize, TyUsize, sp()).unwrap(), TyBool), true, "usize <=");
+  assertEqString(
+    binaryType(env, BEq, TyFn([], TyInt), TyFn([], TyInt), sp()).unwrapErr().message,
+    "function values cannot be compared (type `() => int`)",
+    "function values",
+  );
+}
+
+@Test
+function literalTyping(): void {
+  const env = emptyEnv();
+  const u8 = TyIntK(5);
+  assertEqBool(typeEq(intLiteral(env, 200, Some(u8), sp()).unwrap().ty, u8), true, "a literal adopts the expected type");
+  assertEqString(intLiteral(env, 256, Some(u8), sp()).unwrapErr().code, "E0430", "it must fit");
+  assertEqBool(typeEq(intLiteral(env, 7, Some(TyBool), sp()).unwrap().ty, TyInt), true, "else int");
+  assert(bigIntLiteral(env, -1, None, sp()).isErr(), "above i64::MAX needs u64 / usize");
+  assert(bigIntLiteral(env, -1, Some(TyUsize), sp()).isOk(), "usize has room");
+  assertEqString(negIntLiteral(env, 1, Some(TyUsize), sp()).unwrapErr().code, "E0400", "no negative usize");
+  assertEqString(negIntLiteral(env, 129, Some(TyIntK(0)), sp()).unwrapErr().code, "E0430", "-129 does not fit i8");
+  assert(negIntLiteral(env, 128, Some(TyIntK(0)), sp()).isOk(), "-128 fits i8");
+  assert(negBigLiteral(env, -9223372036854775807 - 1, None, sp()).isOk(), "i64::MIN");
+  assert(negBigLiteral(env, 5, None, sp()).isErr(), "no other big negative");
+}
+
+@Test
+function interpolationRules(): void {
+  const env = emptyEnv();
+  assertEqBool(typeEq(interpolated(env, mk(XInt(1), TyInt, sp()), sp()).unwrap().ty, TyString), true, "int");
+  assertEqBool(typeEq(interpolated(env, mk(XFloat("1.5"), TyFloat, sp()), sp()).unwrap().ty, TyString), true, "float");
+  assertEqBool(typeEq(interpolated(env, mk(XBool(true), TyBool, sp()), sp()).unwrap().ty, TyString), true, "bool");
+  const s = mk(XStr("s"), TyString, sp());
+  assertEqBool(isStrLit(interpolated(env, s, sp()).unwrap()), true, "a string is used as it is");
+  assertEqString(
+    interpolated(env, mk(XArray([]), TyArray(TyInt), sp()), sp()).unwrapErr().code,
+    "E0432",
+    "an array does not convert",
+  );
+}
+
+function isStrLit(e: HExpr): bool {
+  return match (e.kind) {
+    XStr(_) => true,
+    _ => false,
+  };
+}
+
+@Test
+function smallHelpers(): void {
+  const fields = [FieldDef { name: "a", ty: TyInt }, FieldDef { name: "b", ty: TyBool }];
+  assertEqUsize(fieldIndex(fields, "b").unwrap(), 1, "field b");
+  assert(fieldIndex(fields, "c").isNone(), "no field c");
+  const names: string[] = ["x", "y", "z"];
+  assertEqString(missingNames(names, [true, false, false]).join(","), "y,z", "missing");
+  assertEqUsize(missingNames(names, [true, true, true]).length, 0, "none missing");
+  const ts: Type[] = [TyInt, TyBool, TyString];
+  assertEqUsize(tailTypes(ts).length, 2, "tail");
+  assertEqUsize(tailTypes([]).length, 0, "tail of nothing");
+  assertEqUsize(noPre(4).length, 4, "four absent arguments");
+  assertEqBool(noPre(4)[3].isNone(), true, "all absent");
+  assertEqBool(isNop(nopExpr(sp())), true, "the nop marker");
+  assertEqBool(isNop(mk(XBool(false), TyBool, sp())), false, "a bool literal is not a nop");
+  assertEqString(mapReadFn("get"), "mapGet", "Map get");
+  assertEqString(mapReadFn("set"), "", "set mutates");
+  assertEqString(elemSuffix(TyString), "Str", "string elements");
+  assertEqString(elemSuffix(TyFloat), "", "no helper for floats");
+  assertEqBool(isArrayApi("filter") && !isArrayApi("push"), true, "array API names");
+}
+
+@Test
+function placesAndPurity(): void {
+  const local = mk(XLocal(0), TyInt, sp());
+  const call = mk(XCall(0, []), TyInt, sp());
+  assertEqBool(pureH(local), true, "a local");
+  assertEqBool(pureH(mk(XBinary(OpAdd, local, mk(XInt(1), TyInt, sp())), TyInt, sp())), true, "arithmetic on locals");
+  assertEqBool(pureH(call), false, "a call may have effects");
+  const root = Place { root: 0, path: [], ty: TyArray(TyInt) };
+  const p1 = extendPath(root, PIndex(local), TyInt);
+  assertEqUsize(p1.path.length, 1, "extended");
+  assertEqUsize(root.path.length, 0, "the original is a value");
+  assertEqBool(purePlace(p1), true, "index by a local");
+  assertEqBool(purePlace(extendPath(root, PIndex(call), TyInt)), false, "index by a call");
+}
+
+// ---------------------------------------------------------------------------
+// HIR well-formedness predicates (what the checkers' contracts rely on)
+// ---------------------------------------------------------------------------
+
+@Test
+function localsBoundDetectsDanglingLocals(): void {
+  const l2 = mk(XLocal(2), TyInt, sp());
+  assertEqBool(localsBound(l2, 3), true, "local 2 of 3");
+  assertEqBool(localsBound(l2, 2), false, "local 2 of 2 does not exist");
+  const nested = mk(XCond(mk(XBool(true), TyBool, sp()), l2, mk(XInt(0), TyInt, sp())), TyInt, sp());
+  assertEqBool(localsBound(nested, 2), false, "found inside a conditional");
+  const closure = mk(XClosure(0, [l2]), TyFn([], TyInt), sp());
+  assertEqBool(localsBound(closure, 2), false, "a capture is evaluated in the enclosing function");
+  const m = mk(
+    XMatch(mk(XLocal(0), TyOption(TyInt), sp()), [
+      HArm {
+        pattern: HPVariant(0, [Some(5)]),
+        body: HBlock { stmts: [] },
+        value: Some(mk(XInt(1), TyInt, sp())),
+      },
+    ]),
+    TyInt,
+    sp(),
+  );
+  assertEqBool(localsBound(m, 5), false, "a pattern binding must exist");
+  assertEqBool(localsBound(m, 6), true, "and does once it does");
+}
+
+@Test
+function blockBoundCoversStatements(): void {
+  const l = mk(XLocal(1), TyInt, sp());
+  const ok: HStmt[] = [HLet(1, mk(XInt(0), TyInt, sp())), HExprStmt(l), HReturn(Some(l))];
+  assertEqBool(allStmtsBound(ok, 2), true, "all bound");
+  assertEqBool(allStmtsBound(ok, 1), false, "the let binds local 1, which does not exist");
+  assertEqBool(stmtBound(HForOf(0, l, HBlock { stmts: [HBreak] }), 1), false, "iterated array");
+  assertEqBool(stmtBound(HIf(mk(XBool(true), TyBool, sp()), HBlock { stmts: [HExprStmt(l)] }, None), 1), false, "then branch");
+  assertEqBool(blockBound(HBlock { stmts: [HWhile(mk(XBool(true), TyBool, sp()), HBlock { stmts: [HContinue] })] }, 0), true, "no locals at all");
+  const place = Place { root: 3, path: [], ty: TyInt };
+  assertEqBool(placeBound(place, 3), false, "root out of range");
+  assertEqBool(placeBound(place, 4), true, "root in range");
+  const f = Function {
+    name: "f",
+    paramCount: 1,
+    locals: [Local { name: "p", ty: TyInt, mutable: false }],
+    ret: TyInt,
+    body: HBlock { stmts: [HReturn(Some(mk(XLocal(0), TyInt, sp())))] },
+    span: sp(),
+  };
+  assertEqBool(functionBound(f), true, "a function over its own locals");
+}
+
+// ---------------------------------------------------------------------------
+// The checkers end to end
+// ---------------------------------------------------------------------------
+
+function checked(fs: FsGrant, text: string): Result<Program, Diagnostic[]> {
+  const o = loadWithOverlay(fs, "/virt/a.or", [SourceFile { path: "/virt/a.or", text: text }]);
+  const none: Diagnostic[] = [];
+  return match (o.program) {
+    Some(p) => check(p, o.sm),
+    None => Err(none),
+  };
+}
+
+// The first error code of a program, or "ok".
+function codeOf(fs: FsGrant, text: string): string {
+  const r = checked(fs, text);
+  if (r.isOk()) {
+    return "ok";
+  }
+  const ds = r.unwrapErr();
+  return ds.length == 0 ? "load failed" : ds[0].code;
+}
+
+function messageOf(fs: FsGrant, text: string): string {
+  const r = checked(fs, text);
+  if (r.isOk()) {
+    return "ok";
+  }
+  const ds = r.unwrapErr();
+  return ds.length == 0 ? "load failed" : ds[0].message;
+}
+
+// Every function of the program mentions only locals it has.
+function programBound(p: Program): bool {
+  for (const f of p.functions) {
+    if (!functionBound(f)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function fnNamed(p: Program, name: string): Option<Function> {
+  for (const f of p.functions) {
+    if (f.name == name) {
+      return Some(f);
+    }
+  }
+  return None;
+}
+
+// One letter per statement: Let, Assign, Expr, If, While, For, Break, Continue, Return, Block.
+function kinds(b: HBlock): string {
+  let out = "";
+  for (const s of b.stmts) {
+    out += match (s) {
+      HLet(_, _) => "L",
+      HAssign(_, _, _) => "A",
+      HExprStmt(_) => "E",
+      HIf(_, _, _) => "I",
+      HWhile(_, _) => "W",
+      HForOf(_, _, _) => "F",
+      HBreak => "B",
+      HContinue => "C",
+      HReturn(_) => "R",
+      HBlockStmt(_) => "K",
+    };
+  }
+  return out;
+}
+
+@Test
+function mutatingCallsAreHoistedInFrontOfTheirStatement(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const text =
+        "class Counter {\n  n: int = 0;\n  inc(): int { this.n += 1; return this.n; }\n  bump(): void { this.n += 1; }\n}\n"
+        + "function main(): void {\n  let c = new Counter();\n  const x = c.inc() + 1;\n  c.bump();\n  console.log(x.toString());\n}\n";
+      const r = checked(fs, text);
+      assert(r.isOk(), "checks");
+      const p = r.unwrap();
+      assert(programBound(p), "every local is bound");
+      const m = fnNamed(p, "a.main").unwrap();
+      // let c; $r0 = c.inc(); c = $r0.self; let x = $r0.value + 1; c = c.bump(); (an empty block for the call statement); console.log(..)
+      assertEqString(kinds(m.body), "LLALAKE", "hoisted statements precede the statement that contained the call");
+    },
+  );
+}
+
+@Test
+function arrowFunctionsAreLiftedWithTheirCaptures(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const text =
+        "function main(): void {\n  const k = 3;\n  const xs = [1, 2, 3].map(x => x + k);\n  console.log(xs.length.toString());\n}\n";
+      const r = checked(fs, text);
+      assert(r.isOk(), "checks");
+      const p = r.unwrap();
+      assert(programBound(p), "every local of every function, lifted ones included, is bound");
+      const lifted = fnNamed(p, "a.main$closure0");
+      assert(lifted.isSome(), "the arrow function is lifted");
+      assertEqUsize(lifted.unwrap().paramCount, 2, "the environment record and x");
+      // prologue `let k = env.k`, then `return x + k`
+      assertEqString(kinds(lifted.unwrap().body), "LR", "capture prologue and body");
+    },
+  );
+}
+
+@Test
+function matchExhaustiveness(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const shape = "type Shape = Circle(int) | Square(int) | Dot;\n";
+      const ok = shape + "function f(s: Shape): int {\n  return match (s) { Circle(r) => r * r, Square(w) => w * w, Dot => 0 };\n}\nfunction main(): void {}\n";
+      assertEqString(codeOf(fs, ok), "ok", "all variants");
+      const missing = shape + "function f(s: Shape): int {\n  return match (s) { Circle(r) => r };\n}\nfunction main(): void {}\n";
+      assertEqString(messageOf(fs, missing), "non-exhaustive match: missing Square, Dot", "the missing variants, in order");
+      const wild = shape + "function f(s: Shape): int {\n  return match (s) { Circle(r) => r, _ => 0 };\n}\nfunction main(): void {}\n";
+      assertEqString(codeOf(fs, wild), "ok", "a wildcard covers the rest");
+      const scalar = "function f(n: int): int {\n  return match (n) { 1 => 10, 2 => 20 };\n}\nfunction main(): void {}\n";
+      assertEqString(messageOf(fs, scalar), "match on a scalar value requires a `_` arm", "scalar");
+      const opt = "function f(o: Option<int>): int {\n  return match (o) { Some(x) => x };\n}\nfunction main(): void {}\n";
+      assertEqString(messageOf(fs, opt), "non-exhaustive match: missing None", "Option");
+      const stmt = shape + "function f(s: Shape): void {\n  match (s) { Circle(r) => { return; }, Square(w) => { return; }, Dot => { return; } }\n}\nfunction main(): void {}\n";
+      assertEqString(codeOf(fs, stmt), "ok", "a statement match whose arms all diverge needs no value");
+    },
+  );
+}
+
+@Test
+function blocksScopesAndDivergence(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      assertEqString(codeOf(fs, "function main(): void {\n  let a = 1;\n  let a = 2;\n}\n"), "E0304", "duplicate in one block");
+      assertEqString(codeOf(fs, "function main(): void {\n  let a = 1;\n  { let a = 2; }\n}\n"), "ok", "shadowing in an inner block");
+      assertEqString(codeOf(fs, "function main(): void {\n  { let b = 1; }\n  b = 2;\n}\n"), "E0300", "a block's names end with it");
+      assertEqString(codeOf(fs, "function main(): void {\n  break;\n}\n"), "E0409", "break outside a loop");
+      assertEqString(codeOf(fs, "function main(): void {\n  continue;\n}\n"), "E0409", "continue outside a loop");
+      assertEqString(codeOf(fs, "function f(): int {\n  while (true) { }\n}\nfunction main(): void {}\n"), "ok", "a loop without exit never completes");
+      assertEqString(codeOf(fs, "function f(): int {\n  while (true) { break; }\n}\nfunction main(): void {}\n"), "E0403", "a loop with a break does");
+      assertEqString(
+        codeOf(fs, "function f(x: int): int {\n  if (x > 0) { return 1; } else { return 2; }\n}\nfunction main(): void {}\n"),
+        "ok",
+        "both branches return",
+      );
+      assertEqString(
+        codeOf(fs, "function f(x: int): int {\n  if (x > 0) { return 1; }\n}\nfunction main(): void {}\n"),
+        "E0403",
+        "one branch does not",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  for (const x of [1, 2]) { for (const y of [x]) { if (y > 1) { break; } } }\n}\n"),
+        "ok",
+        "nested loops and for-of scopes",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  for (const x of [1, 2]) { let x = 3; }\n}\n"),
+        "ok",
+        "the loop variable is in a scope around the body",
+      );
+    },
+  );
+}
+
+@Test
+function mutatingCallsInConditionalPositionsAreRejected(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const cls = "class Counter {\n  n: int = 0;\n  inc(): int { this.n += 1; return this.n; }\n}\n";
+      assertEqString(
+        codeOf(fs, cls + "function main(): void {\n  let c = new Counter();\n  if (true && c.inc() > 0) { }\n}\n"),
+        "E0408",
+        "right operand of &&",
+      );
+      assertEqString(
+        codeOf(fs, cls + "function main(): void {\n  let c = new Counter();\n  const x = true ? c.inc() : 0;\n}\n"),
+        "E0408",
+        "branch of ?:",
+      );
+      assertEqString(
+        codeOf(fs, cls + "function main(): void {\n  let c = new Counter();\n  while (c.inc() < 3) { }\n}\n"),
+        "E0408",
+        "while condition",
+      );
+      assertEqString(
+        codeOf(fs, cls + "function main(): void {\n  const c = new Counter();\n  const x = c.inc();\n}\n"),
+        "E0401",
+        "receiver must be declared with let",
+      );
+    },
+  );
+}
+
+@Test
+function closuresCaptureByValue(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  let a = 1;\n  const f = () => { a = 2; };\n}\n"),
+        "E0401",
+        "a captured variable cannot be assigned",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  const f = (x: int) => x + 1;\n  const g = (x: int) => f(x) + 1;\n  console.log(g(1).toString());\n}\n"),
+        "ok",
+        "a closure calls a captured closure",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  const f = (x: int, x: int) => x;\n}\n"),
+        "E0304",
+        "duplicate parameter",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  const f = x => x;\n}\n"),
+        "E0407",
+        "a parameter type that cannot be inferred",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  const f = (n: int) => { if (n > 0) { return 1; } };\n}\n"),
+        "E0403",
+        "a closure that does not return on every path",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  const f = (n: int) => { if (n > 0) { return 1; } return 2; };\n  console.log(f(1).toString());\n}\n"),
+        "ok",
+        "result type inferred from the returns",
+      );
+    },
+  );
+}
+
+@Test
+function genericCallInference(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const first = "function first<T>(xs: T[], d: T): T {\n  return d;\n}\n";
+      assertEqString(
+        codeOf(fs, first + "function main(): void {\n  const a = first([], 1);\n  const b = first([\"x\"], \"y\");\n}\n"),
+        "ok",
+        "an argument that cannot be typed alone waits for the others",
+      );
+      assertEqString(
+        codeOf(fs, first + "function main(): void {\n  const a = first([1], \"y\");\n}\n"),
+        "E0400",
+        "conflicting arguments",
+      );
+      assertEqString(
+        messageOf(fs, "function none<T>(): T[] {\n  return [];\n}\nfunction main(): void {\n  const x = none();\n}\n"),
+        "cannot infer type argument `T` of function `none`; add explicit type arguments or a type annotation",
+        "nothing to infer from",
+      );
+      assertEqString(
+        codeOf(fs, "function none<T>(): T[] {\n  return [];\n}\nfunction main(): void {\n  const x: int[] = none();\n  const y = none<string>();\n}\n"),
+        "ok",
+        "the expected type and explicit arguments",
+      );
+      assertEqString(
+        codeOf(fs, "function apply<T, U>(x: T, f: (v: T) => U): U {\n  return f(x);\n}\nfunction main(): void {\n  const s = apply(2, v => v * 2);\n  const t = apply(\"a\", v => v + \"b\");\n}\n"),
+        "ok",
+        "an arrow function is checked against the parameter types known so far",
+      );
+    },
+  );
+}
+
+@Test
+function contractClausesAreCheckedAndErased(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      assertEqString(
+        codeOf(fs, "@Requires(x > 0)\n@Ensures(result >= old(x))\nfunction f(x: int): int {\n  return x + 1;\n}\nfunction main(): void {}\n"),
+        "ok",
+        "old in an @Ensures",
+      );
+      assertEqString(
+        codeOf(fs, "@Requires(old(x) > 0)\nfunction f(x: int): int {\n  return x;\n}\nfunction main(): void {}\n"),
+        "E0415",
+        "old outside @Ensures",
+      );
+      assertEqString(
+        codeOf(fs, "@Requires(x)\nfunction f(x: int): int {\n  return x;\n}\nfunction main(): void {}\n"),
+        "E0414",
+        "a clause must be bool",
+      );
+      assertEqString(
+        codeOf(fs, "@Requires(x > 0 ==> x > 1)\nfunction f(x: int): int {\n  return x;\n}\nfunction main(): void {}\n"),
+        "ok",
+        "implication in a clause",
+      );
+      assertEqString(
+        codeOf(fs, "function f(x: int): bool {\n  return x > 1 ==> true;\n}\nfunction main(): void {}\n"),
+        "E0415",
+        "implication outside a clause",
+      );
+      assertEqString(
+        codeOf(fs, "function main(): void {\n  let i = 0;\n  @Invariant(i >= 0)\n  @Decreases(5 - i)\n  while (i < 5) { i += 1; }\n}\n"),
+        "ok",
+        "loop clauses",
+      );
+      assertEqString(
+        codeOf(fs, "class C {\n  n: int = 0;\n  inc(): int { this.n += 1; return this.n; }\n  @Requires(this.inc() > 0)\n  other(): void { }\n}\nfunction main(): void {}\n"),
+        "E0416",
+        "a mutating call in a clause",
+      );
+    },
+  );
+}
+
+@Test
+function placesAndAssignment(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      assertEqString(codeOf(fs, "function main(): void {\n  const a = 1;\n  a = 2;\n}\n"), "E0401", "assign to a const");
+      assertEqString(codeOf(fs, "function main(): void {\n  let a = \"s\";\n  a -= \"t\";\n}\n"), "E0410", "compound assignment on a string");
+      assertEqString(codeOf(fs, "function main(): void {\n  let a = \"s\";\n  a += \"t\";\n}\n"), "ok", "string +=");
+      assertEqString(codeOf(fs, "function main(): void {\n  let xs = [1, 2];\n  xs[0] = 3;\n  xs.push(4);\n  const n = xs.pop();\n}\n"), "ok", "element and push / pop");
+      assertEqString(codeOf(fs, "function main(): void {\n  const xs = [1, 2];\n  xs.push(3);\n}\n"), "E0401", "push on a const");
+      assertEqString(codeOf(fs, "function main(): void {\n  let xs = [1, 2];\n  xs.length = 3;\n}\n"), "E0401", "length is read-only");
+      assertEqString(codeOf(fs, "type P = { x: int; };\nfunction main(): void {\n  let p = P { x: 1 };\n  p.x = 2;\n  p.y = 3;\n}\n"), "E0405", "no such field");
+    },
+  );
+}
+
+@Test
+function everyCheckedProgramHasBoundLocals(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const text =
+        "type Shape = Circle(int) | Square(int) | Dot;\n"
+        + "class Acc {\n  total: int = 0;\n  add(x: int): int { this.total += x; return this.total; }\n}\n"
+        + "function area(s: Shape): int {\n  return match (s) { Circle(r) => r * r, Square(w) => w * w, Dot => 0 };\n}\n"
+        + "function main(): void {\n  let a = new Acc();\n  let m = new Map<string, int>();\n  m.set(\"k\", 1);\n"
+        + "  for (const s of [Circle(2), Square(3), Dot]) {\n    const n = a.add(area(s));\n    if (n > 3) { continue; }\n  }\n"
+        + "  const sq = [1, 2, 3].map(x => x * x).filter(x => x > 1);\n  const h = m.has(\"k\") ? m.get(\"k\").unwrapOr(0) : 0;\n"
+        + "  console.log(`${sq.length} ${h} ${a.total}`);\n}\n";
+      const r = checked(fs, text);
+      assert(r.isOk(), "checks");
+      assert(programBound(r.unwrap()), "every local referenced anywhere is bound");
+    },
+  );
+}
