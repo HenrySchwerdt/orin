@@ -135,7 +135,7 @@ MUTANTS = [
     ("http", "header-count-off-by-one", "      if (count >= this.maxCount) {", "      if (count > this.maxCount) {"),
     ("http", "header-line-limit-off-by-one", "  private doValue(xs: u8[], n: usize): void {\n    const i = this.cur;\n    const room = this.lineMax - this.lineLen;", "  private doValue(xs: u8[], n: usize): void {\n    const i = this.cur;\n    const room = this.lineMax - this.lineLen + 1;"),
     ("http", "head-budget-off-by-one", "          const budget = this.sectionEnd - this.base0;", "          const budget = this.sectionEnd - this.base0 + 1;"),
-    ("http", "trailer-budget-not-relative", "      this.sectionEnd = this.posOf(i) + 1 + this.maxHead;", "      this.sectionEnd = this.maxHead;"),
+    ("http", "trailer-budget-not-relative", "      this.sectionEnd = posAt(this.base, this.off, i) + 1 + this.maxHead;", "      this.sectionEnd = this.maxHead;"),
     ("http", "version-1-2-reason", "      } else if (c >= 50 && c <= 57) {", "      } else if (c >= 51 && c <= 57) {"),
     ("http", "status-600-accepted", "(this.codeDigits == 0 && (c < 49 || c > 53))", "(this.codeDigits == 0 && (c < 49 || c > 54))"),
     ("http", "204-framing-accepted", "      if ((this.code < 200 || this.code == 204) && (this.teCount > 0 || this.clCount > 0)) {", "      if (this.code < 200 && (this.teCount > 0 || this.clCount > 0)) {"),
@@ -156,7 +156,7 @@ MUTANTS = [
     # the scanners read the chunk's storage array (no window copy any more): the chunk index -> array index mapping
     ("http", "storage-cursor-ignores-offset", "        this.cur = off + i;", "        this.cur = i;"),
     ("http", "empty-chunk-size-accepted", "    if (this.chunkDigits == 0) {\n      this.fail(this.posOf(j), BadChunkSize);\n      return;\n    }", "    if (this.chunkDigits == 0 && false) {\n      this.fail(this.posOf(j), BadChunkSize);\n      return;\n    }"),
-    ("http", "posOf-ignores-storage-offset", "    return this.base + (j - this.off);", "    return this.base + j;"),
+    ("http", "posOf-ignores-storage-offset", "  return base + (j - off);", "  return base + j;"),
     ("http", "headers-ctor-skips-validation", "    enforce(names.length == values.length && allTokens(names) && allFieldValues(values), \"invalid Headers\");", "", "http_headers_ctor_rejects_crlf"),
     ("http", "status-ctor-skips-validation", "    enforce(code >= 100 && code <= 599 && isReasonPhrase(reason), \"invalid Status\");", "", "http_status_ctor_rejects_range"),
     ("http", "request-ctor-skips-validation", "    enforce(requestProblem(method, target, version, headers, body, trailers) == \"\", \"invalid Request\");", "", "http_request_ctor_rejects_invalid"),

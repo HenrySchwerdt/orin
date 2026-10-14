@@ -1416,6 +1416,13 @@ function resultUsed<T>(r: ParseResult<T>): usize {
 // array instead of calling `Bytes.at` per byte (a call plus a reference count per byte). Their cursor `this.cur` is an
 // index into that array; the chunk starts at index `this.off` of it, which is stream offset `this.base`.
 
+// posAt(base, off, j): the stream offset of index j of a storage array whose index `off` is at stream offset `base`.
+@Requires(j >= off)
+@Ensures(result == base + (j - off))
+function posAt(base: usize, off: usize, j: usize): usize {
+  return base + (j - off);
+}
+
 // The incremental parser shared by `RequestParser` and `ResponseParser`: the state machine described at the top of
 // the file. `feed` consumes input in one forward pass; all state is in the fields, so the input may be split
 // anywhere. Invariants (checked after every public method in a checked build) tie the state to the data: the state
@@ -1596,11 +1603,12 @@ class MessageParser {
   }
 
   // posOf(j): the stream offset of index j of the storage array the scanners read (index `this.off` is the first
-  // byte of the chunk, at stream offset `this.base`).
+  // byte of the chunk, at stream offset `this.base`). Assignments to fields use `posAt` directly: a method call on
+  // `this` inside the right-hand side of a field store makes the lowering emit an extra `makeunique` of `this`.
   @Requires(j >= this.off)
   @Ensures(result == this.base + (j - this.off))
   private posOf(j: usize): usize {
-    return this.base + (j - this.off);
+    return posAt(this.base, this.off, j);
   }
 
   // feed(chunk): consumes bytes of the message. NeedMore: all of `chunk` was consumed. Done(_, used): the message is
@@ -1779,7 +1787,7 @@ class MessageParser {
       this.methodToken = tok;
       this.meth = methodFromToken(tok).unwrap();
       this.go(S_TARGET);
-      this.targetPos = this.posOf(j) + 1;
+      this.targetPos = posAt(this.base, this.off, j) + 1;
       this.cur = j + 1;
       return;
     }
@@ -2035,7 +2043,7 @@ class MessageParser {
     this.go(S_HDR_LINE);
     this.lineLen = 0;
     this.lineMax = this.maxLine;
-    this.lineStart = this.posOf(i) + 1;
+    this.lineStart = posAt(this.base, this.off, i) + 1;
     this.cur = i + 1;
   }
 
@@ -2053,7 +2061,7 @@ class MessageParser {
         this.fail(this.posOf(i), TooManyHeaders);
         return;
       }
-      this.lineStart = this.posOf(i);
+      this.lineStart = posAt(this.base, this.off, i);
       this.lineLen = 0;
       this.go(S_HDR_NAME);
       this.doName(xs, n);
@@ -2222,7 +2230,7 @@ class MessageParser {
     }
     this.go(S_HDR_LINE);
     this.lineLen = 0;
-    this.lineStart = this.posOf(i) + 1;
+    this.lineStart = posAt(this.base, this.off, i) + 1;
     this.cur = i + 1;
   }
 
@@ -2557,10 +2565,10 @@ class MessageParser {
     this.cur = i + 1;
     if (this.chunkSize == 0) {
       this.inTrailers = true;
-      this.sectionEnd = this.posOf(i) + 1 + this.maxHead;
+      this.sectionEnd = posAt(this.base, this.off, i) + 1 + this.maxHead;
       this.lineLen = 0;
       this.lineMax = this.maxLine;
-      this.lineStart = this.posOf(i) + 1;
+      this.lineStart = posAt(this.base, this.off, i) + 1;
       this.go(S_HDR_LINE);
       return;
     }
