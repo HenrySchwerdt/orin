@@ -363,7 +363,7 @@ function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, tag: stri
   if (w.isErr()) {
     return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
   }
-  const rc = shellRun(proc, z3 + " -in -t:6000 -T:30 < " + base + ".smt2 > " + base + ".out 2>&1");
+  const rc = shellRun(proc, z3 + " -in -t:4000 -T:15 < " + base + ".smt2 > " + base + ".out 2>&1");
   if (rc != 0 && rc != 1) {
     return Err("solver `" + z3 + "` could not be run (exit status " + rc.toString() + ")");
   }
@@ -439,13 +439,13 @@ function probesOf(g: Gen, tab: Tab, label: string, term: string, vt: VT, depth: 
       if (u.isSome() && sn.isSome() && depth < 3 && !tab.isCyclic("u:" + un)) {
         for (const v of u.unwrap().variants) {
           const tl = label + " is " + v.name;
-          out.push(Probe { label: tl, term: "((_ is " + sn.unwrap() + "_" + v.name + ") " + term + ")", kind: 0, guard: "", idx: 0 });
+          out.push(Probe { label: tl, term: "((_ is " + sn.unwrap() + "." + v.name + ") " + term + ")", kind: 0, guard: "", idx: 0 });
           let i: usize = 0;
           while (i < v.payload.length) {
             const pt = resolveTy(tab, v.payload[i]);
             if (!isBad(pt)) {
               const before = out.length;
-              out = probesOf(g, tab, label + "." + v.name + "." + i.toString(), "(" + sn.unwrap() + "_" + v.name + "_" + i.toString() + " " + term + ")", pt, depth + 1, out);
+              out = probesOf(g, tab, label + "." + v.name + "." + i.toString(), "(" + sn.unwrap() + "." + v.name + "." + i.toString() + " " + term + ")", pt, depth + 1, out);
               let j = before;
               while (j < out.length) {
                 out[j] = Probe { label: out[j].label, term: out[j].term, kind: 2, guard: tl, idx: 0 };
@@ -466,7 +466,7 @@ function probesOf(g: Gen, tab: Tab, label: string, term: string, vt: VT, depth: 
         while (i < d.fields.length) {
           const ft = resolveTy(tab, d.ftys[i]);
           if (!isBad(ft)) {
-            out = probesOf(g, tab, label + "." + d.fields[i], "(" + sn.unwrap() + "_" + d.fields[i] + " " + term + ")", ft, depth + 1, out);
+            out = probesOf(g, tab, label + "." + d.fields[i], "(" + sn.unwrap() + "." + d.fields[i] + " " + term + ")", ft, depth + 1, out);
           }
           i += 1;
         }
@@ -486,6 +486,7 @@ function probesOfVars(g: Gen, tab: Tab, vars: Var[]): Probe[] {
 }
 
 // `x = 5` lines for the probes of a sat answer.
+@Ensures(result.length <= probes.length)
 function counterexample(probes: Probe[], values: string[]): string[] {
   let out: string[] = [];
   if (values.length != probes.length) {
@@ -531,6 +532,7 @@ function describeSolverUnknown(): string {
   return "solver returned unknown (timeout or incomplete theory)";
 }
 
+@Ensures(result.out.length == rt0.out.length + 1)
 function pushRes(rt0: Rt, f: Fn, line: usize, kind: string, clause: string, v: Verdict, used: string[]): Rt {
   let rt = rt0;
   rt.out.push(Res {
@@ -540,6 +542,7 @@ function pushRes(rt0: Rt, f: Fn, line: usize, kind: string, clause: string, v: V
   return rt;
 }
 
+@Ensures(result.status == "UNKNOWN" && result.reason == reason)
 function unknownV(reason: string): Verdict {
   return Verdict { status: "UNKNOWN", reason: reason, cex: [] };
 }
@@ -687,6 +690,10 @@ function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen
 }
 
 // A sat answer is a counterexample only if nothing on the way was an abstraction.
+// VERIFIED only from unsat; REFUTED only from sat on a path without abstraction (the soundness rule of ADR-0035).
+@Ensures(result.status == "VERIFIED" ==> r.status == "unsat")
+@Ensures(r.status == "unsat" ==> result.status == "VERIFIED")
+@Ensures(result.status == "REFUTED" ==> r.status == "sat" && approx == "")
 function judge(g: Gen, r: Raw, approx: string, probes: Probe[]): Verdict {
   if (r.status == "unsat") {
     return Verdict { status: "VERIFIED", reason: "", cex: [] };
@@ -711,6 +718,9 @@ function judge(g: Gen, r: Raw, approx: string, probes: Probe[]): Verdict {
 type RetGoal = { pc: string[]; goal: string; approx: string; deps: usize[]; };
 
 // The loops a result relies on: all their invariant obligations must be VERIFIED, else the result is UNKNOWN.
+// A result that relied on an unproved loop invariant is never upgraded: only VERIFIED can change, to UNKNOWN.
+@Ensures(v.status != "VERIFIED" ==> result.status == v.status)
+@Ensures(result.status == "VERIFIED" ==> v.status == "VERIFIED")
 function depsVerdict(g: Gen, statuses: string[], deps: usize[], v: Verdict): Verdict {
   if (v.status != "VERIFIED") {
     return v;
