@@ -7,7 +7,7 @@
 // Values are grouped into *webs*: the locals, parameters and function results that one value can flow between (moves,
 // dups, borrows, call arguments, call results, returns) must share one representation, so they are unified (a union-find
 // over all locals of the program plus one node per function result). The payload of a web is unified too, slot by slot
-// (`slotScalar` / `slotField`, Steensgaard-style): a slot is a plain scalar word or another web (a nested Option /
+// (`slotScalar` / `ensureField`, Steensgaard-style): a slot is a plain scalar word or another web (a nested Option /
 // record). A web is unboxed only when every member satisfies the eligibility rule (ADR-0038 addendum, "Unboxing"):
 //
 //   * it is built only by `IStructNew` of scalar or unboxed slots, `INullary`, or `IArrayPop` (an Option of a scalar),
@@ -130,6 +130,17 @@ function identity(n: usize): usize[] {
 }
 
 @Ensures(result.length == n)
+function ones(n: usize): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(1);
+    i += 1;
+  }
+  return out;
+}
+
+@Ensures(result.length == n)
 function falses(n: usize): bool[] {
   let out: bool[] = [];
   let i: usize = 0;
@@ -155,8 +166,12 @@ function nils(n: usize): usize[] {
 // the slot nodes created for nested values), each root with a list of its slots (`k` -> a slot node, or NIL for a
 // scalar word), a `bad` flag (some member breaks the eligibility rule) and a `pops` flag (some member is the result of
 // `IArrayPop`: an Option of one scalar word). The slot lists are linked lists in flat arrays (`head` per node, entries
-// `ek` / `en` / `enext`), so every update is in place.
+// `ek` / `en` / `enext`), so every update is in place. The union is by weight (the smaller web joins the larger), so a
+// root is found in O(log n) steps without path compression: no method both mutates and returns a value (a mutating
+// method with a result returns `{this, result}` and costs a copy of these arrays in code compiled by an older compiler,
+// such as stage 1 of the bootstrap).
 @Invariant(this.parent.length == this.bad.length && this.parent.length == this.pops.length)
+@Invariant(this.parent.length == this.weight.length)
 @Invariant(this.parent.length == this.head.length)
 @Invariant(this.ek.length == this.en.length && this.ek.length == this.enext.length)
 @Invariant(this.base.length == this.prog.functions.length && this.pinned.length == this.base.length)
@@ -165,6 +180,7 @@ export class Unboxing {
   private pinned: bool[];
   private base: usize[];
   private parent: usize[];
+  private weight: usize[];
   private bad: bool[];
   private pops: bool[];
   private head: usize[];
@@ -179,6 +195,7 @@ export class Unboxing {
     this.pinned = pinned;
     this.base = nodeBases(p);
     this.parent = identity(nodeCount(p));
+    this.weight = ones(nodeCount(p));
     this.bad = falses(nodeCount(p));
     this.pops = falses(nodeCount(p));
     this.head = nils(nodeCount(p));
@@ -205,21 +222,9 @@ export class Unboxing {
     return this.base[fi] + this.prog.functions[fi].locals.length;
   }
 
-  // The root of node a (path halving: every node on the way points to its grandparent afterwards).
+  // The root of node a (its web).
   @Requires(a < this.parent.length)
   @Ensures(result < this.parent.length && this.parent[result] == result)
-  find(a: usize): usize {
-    let x = a;
-    while (this.parent[x] != x) {
-      const g = this.parent[this.parent[x]];
-      this.parent[x] = g;
-      x = g;
-    }
-    return x;
-  }
-
-  // The root of node a, without changing anything (for contracts).
-  @Requires(a < this.parent.length)
   rootOf(a: usize): usize {
     let x = a;
     while (this.parent[x] != x) {
@@ -228,20 +233,21 @@ export class Unboxing {
     return x;
   }
 
-  // A new node, its own web.
-  @Ensures(result == old(this.parent.length) && this.parent.length == result + 1)
-  private fresh(): usize {
+  // A new node (number `parent.length` before the call), its own web.
+  @Ensures(this.parent.length == old(this.parent.length) + 1)
+  private addNode(): void {
     const n = this.parent.length;
     this.parent.push(n);
+    this.weight.push(1);
     this.bad.push(false);
     this.pops.push(false);
     this.head.push(NIL);
-    return n;
   }
 
   @Requires(a < this.parent.length)
+  @Ensures(this.bad[this.rootOf(a)] && this.parent.length == old(this.parent.length))
   markBad(a: usize): void {
-    const r = this.find(a);
+    const r = this.rootOf(a);
     this.bad[r] = true;
   }
 
@@ -269,8 +275,9 @@ export class Unboxing {
 
   // Slot k of the web of a holds a plain scalar word.
   @Requires(a < this.parent.length)
+  @Ensures(this.parent.length == old(this.parent.length))
   slotScalar(a: usize, k: usize): void {
-    const r = this.find(a);
+    const r = this.rootOf(a);
     if (k >= MAX_SLOTS) {
       this.bad[r] = true;
       return;
@@ -285,26 +292,33 @@ export class Unboxing {
     }
   }
 
-  // The node of the nested value in slot k of the web of a (created on first use).
+  // Slot k of the web of a holds a nested value: its node exists afterwards (`fieldOf`).
   @Requires(a < this.parent.length)
-  @Ensures(result < this.parent.length)
-  slotField(a: usize, k: usize): usize {
-    const r = this.find(a);
+  @Ensures(this.parent.length >= old(this.parent.length))
+  ensureField(a: usize, k: usize): void {
+    const r = this.rootOf(a);
     if (k >= MAX_SLOTS) {
       this.bad[r] = true;
-      return r;
+      return;
     }
     const e = this.entry(r, k);
-    if (e != NIL && this.en[e] != NIL) {
-      return this.en[e];
-    }
-    if (e != NIL) {
+    if (e == NIL) {
+      const n = this.parent.length;
+      this.addNode();
+      this.addEntry(r, k, n);
+    } else if (this.en[e] == NIL) {
       this.bad[r] = true; // a nested value in one variant, a scalar in another
-      return r;
     }
-    const n = this.fresh();
-    this.addEntry(r, k, n);
-    return n;
+  }
+
+  // The node of the nested value in slot k of the web of a, after `ensureField`: the web itself when that slot cannot
+  // hold one (which is then bad, so whatever is unified with it stays boxed too).
+  @Requires(a < this.parent.length)
+  @Ensures(result < this.parent.length)
+  fieldOf(a: usize, k: usize): usize {
+    const r = this.rootOf(a);
+    const e = k < MAX_SLOTS ? this.entry(r, k) : NIL;
+    return e != NIL && this.en[e] != NIL ? this.en[e] : r;
   }
 
   // a and b hold the same value: one web (their slots are unified too).
@@ -316,10 +330,14 @@ export class Unboxing {
     while (this.work.length > 0) {
       const y = this.work.pop().unwrap();
       const x = this.work.pop().unwrap();
-      const rx = this.find(x);
-      const ry = this.find(y);
+      const rx = this.rootOf(x);
+      const ry = this.rootOf(y);
       if (rx != ry) {
-        this.merge(rx, ry);
+        if (this.weight[rx] >= this.weight[ry]) {
+          this.merge(rx, ry);
+        } else {
+          this.merge(ry, rx);
+        }
       }
     }
   }
@@ -329,6 +347,7 @@ export class Unboxing {
   @Requires(this.parent[rx] == rx && this.parent[ry] == ry)
   private merge(rx: usize, ry: usize): void {
     this.parent[ry] = rx;
+    this.weight[rx] += this.weight[ry];
     if (this.bad[ry]) {
       this.bad[rx] = true;
     }
@@ -362,7 +381,8 @@ export class Unboxing {
 
   // ---------------------------------------------------------------- scanning
 
-  // All functions, in order.
+  // All functions, in order. Nodes are only added (slot nodes), never removed.
+  @Ensures(this.parent.length >= old(this.parent.length))
   scanAll(): void {
     let fi: usize = 0;
     while (fi < this.prog.functions.length) {
@@ -519,8 +539,8 @@ export class Unboxing {
           match (slots[k]) {
             OLocal(s) => {
               if (this.isRef(fi, s)) {
-                const fld = this.slotField(this.node(fi, d), k);
-                this.union(this.node(fi, s), fld);
+                this.ensureField(this.node(fi, d), k);
+                this.union(this.node(fi, s), this.fieldOf(this.node(fi, d), k));
                 okUses.push(s);
               } else if (this.isWord(fi, s)) {
                 this.slotScalar(this.node(fi, d), k);
@@ -558,8 +578,8 @@ export class Unboxing {
                 this.slotScalar(this.node(fi, a), k);
                 okUses = [a];
               } else if (this.isRef(fi, d)) {
-                const fld = this.slotField(this.node(fi, a), k);
-                this.union(this.node(fi, d), fld);
+                this.ensureField(this.node(fi, a), k);
+                this.union(this.node(fi, d), this.fieldOf(this.node(fi, a), k));
                 okUses = [a];
                 okDef = true;
               }
@@ -571,7 +591,7 @@ export class Unboxing {
       IArrayPop(d, _) => {
         const n = this.node(fi, d);
         this.slotScalar(n, 0);
-        const r = this.find(n);
+        const r = this.rootOf(n);
         this.pops[r] = true;
         okDef = true;
       },
@@ -601,7 +621,7 @@ export class Unboxing {
     let root: usize[] = [];
     let i: usize = 0;
     while (i < n) {
-      root.push(this.find(i));
+      root.push(this.rootOf(i));
       i += 1;
     }
     let sizer = new WebSizer(root, this.bad, this.pops, this.head, this.ek, this.en, this.enext);
@@ -677,19 +697,11 @@ export class WebSizer {
     return NIL;
   }
 
-  // The words slot k of root r takes (computing the nested web first).
+  // The words slot k of root r takes (after its nested web is sized).
   @Requires(r < this.head.length)
   private slotWords(r: usize, k: usize): usize {
     const s = this.slotNode(r, k);
-    if (s == NIL) {
-      return 1;
-    }
-    const q = this.root[s];
-    this.size(q);
-    if (!this.good[q]) {
-      this.good[r] = false;
-    }
-    return this.width[q] + 1;
+    return s == NIL ? 1 : this.width[this.root[s]] + 1;
   }
 
   // The width of root r (memoised; a cycle makes the web bad).
@@ -703,6 +715,17 @@ export class WebSizer {
       return;
     }
     this.state[r] = 1;
+    let e = this.head[r];
+    while (e != NIL) {
+      if (this.en[e] != NIL) {
+        const q = this.root[this.en[e]];
+        this.size(q);
+        if (!this.good[q]) {
+          this.good[r] = false;
+        }
+      }
+      e = this.enext[e];
+    }
     const m = this.slotCount(r);
     let w: usize = 0;
     let k: usize = 0;
@@ -724,6 +747,7 @@ export class WebSizer {
   }
 
   // Sizes every web, then excludes everything nested in a bad web and every web holding a bad one, to the fixpoint.
+  @Ensures(this.root.length == old(this.root.length) && this.sound())
   run(): void {
     let i: usize = 0;
     while (i < this.root.length) {
@@ -755,6 +779,28 @@ export class WebSizer {
         i += 1;
       }
     }
+  }
+
+  // Every good web fits into AGG_MAX payload words, and a good web holds only good webs (and is held only by good ones).
+  sound(): bool {
+    let i: usize = 0;
+    while (i < this.root.length) {
+      if (this.root[i] == i) {
+        if (this.good[i] && this.width[i] > AGG_MAX) {
+          return false;
+        }
+        let e = this.head[i];
+        while (e != NIL) {
+          const s = this.en[e];
+          if (s != NIL && this.good[i] != this.good[this.root[s]]) {
+            return false;
+          }
+          e = this.enext[e];
+        }
+      }
+      i += 1;
+    }
+    return true;
   }
 
   // The plan: per node its web, per web good / width / the start word of every slot.
@@ -881,7 +927,9 @@ export function unboxFunction(plan: UnboxPlan, fi: usize, f: MFunction): MFuncti
             _ => false,
           };
           out.emit(
-            a ? IGetField(d, o, wordOffset(plan, plan.base[fi] + operandLocal(o), slot)) : blk.instrs[i],
+            a
+                ? IGetField(d, o, wordOffset(plan, plan.base[fi] + operandLocal(o), slot))
+                : blk.instrs[i],
             sp,
           );
         },
