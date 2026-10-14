@@ -83,7 +83,7 @@ ADR-0038's inferred stack, region, inline, frozen and RC/COW representations mus
 
 Extend the independent MIR verifier, Lean memory model and translation validator to cover stack/region lifetime, verified move/copy-out, frozen publication, RC elimination and SROA/LLVM lowering. Only established facts justify `noalias`, `inbounds`, overflow flags, invariant loads or erased checks. If proof is absent, use the original checked RC/COW path; a model-only theorem or sanitizer test is not implementation verification.
 
-Expose per-allocation-site proof IDs, chosen representation, fallback, assumptions and `VERIFIED` vs `TESTED_ONLY` evidence in proposed `orin perf explain`/assurance reports. Benchmark measurements choose among **proven equivalent** strategies; performance heuristics never establish correctness.
+Expose per-allocation-site proof IDs, chosen representation, fallback, assumptions and `VERIFIED` vs `TESTED_ONLY` evidence in `orin perf --explain` (ADR-0042) and the assurance reports. Benchmark measurements choose among **proven equivalent** strategies; performance heuristics never establish correctness.
 
 ## Honest limits
 
