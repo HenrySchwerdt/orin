@@ -11,6 +11,8 @@ For every directory bench/<name>/ containing main.or / main.go / main.c it
   * runs each binary N times (plus one unrecorded warm-up) and records wall time and peak RSS
     (ru_maxrss of the child, via wait4),
   * runs the Orin binary once more with ORIN_STATS=1 to collect the runtime counters.
+A benchmark may have no Go and / or C counterpart (std:http, std:collections: bench/http_parse, bench/sortedmap); it is
+then an Orin-only row (n/a in the other columns, no output cross-check).
 It also times "orin2 compiles compiler/main.or" (the self-hosting workload) and prints Markdown.
 """
 import argparse
@@ -178,12 +180,17 @@ def main():
                               ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c", "platform/orin_platform.c",
                                                     "runtime/orin_runtime_llvm.c", "-lm", "-o", out + "/llvm"]]
         res = {}
+        have = {"orin": True, "llvm": HAVE_CLANG,
+                "go": os.path.isfile(os.path.join(ROOT, src, "main.go")), "c": os.path.isfile(os.path.join(ROOT, src, "main.c"))}
+        present = [l for l in LANGS if have[l]]
         for lang, cmds in builds.items():
+            if not have[lang]:
+                continue
             bt = timed_build(cmds)
             res[lang] = {"exe": os.path.join(ROOT, out, lang), "build_s": bt}
         # verify outputs
         ref = None
-        for lang in ("c", "go", "orin") + (("llvm",) if HAVE_CLANG else ()):
+        for lang in [l for l in ("c", "go", "orin", "llvm") if l in res]:
             _, _, rc, so, se = run_once([res[lang]["exe"]])
             if rc != 0:
                 sys.exit("%s/%s exited %d: %s" % (name, lang, rc, se.decode("utf-8", "replace")))
@@ -193,7 +200,7 @@ def main():
                 mismatches.append((name, lang))
                 print("CHECKSUM MISMATCH in %s (%s)" % (name, lang), file=sys.stderr)
             res[lang]["output"] = so.decode()
-        for lang in LANGS:
+        for lang in present:
             r = res[lang]
             r["raw"], r["stripped"] = sizes(r["exe"])
             run_once([r["exe"]])  # warm-up
@@ -248,13 +255,12 @@ def main():
     L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for n in names:
         r = results[n]
-        cells = ["%s (%s-%s)" % (fmt_s(r[l]["wall"][0]), fmt_s(r[l]["wall"][1]), fmt_s(r[l]["wall"][2])) for l in LANGS]
-        cm = dict(zip(LANGS, cells))
-        lw = r["llvm"]["wall"][0] if "llvm" in r else None
-        L.append("| %s | %s | %s | %s | %s | %.2fx | %.2fx | %s | %s |" % (
-            n, cm["orin"], cm.get("llvm", "n/a"), cm["go"], cm["c"], r["orin"]["wall"][0] / r["go"]["wall"][0],
-            r["orin"]["wall"][0] / r["c"]["wall"][0],
-            "%.2fx" % (lw / r["go"]["wall"][0]) if lw else "n/a", "%.2fx" % (lw / r["c"]["wall"][0]) if lw else "n/a"))
+        cm = {l: ("%s (%s-%s)" % (fmt_s(r[l]["wall"][0]), fmt_s(r[l]["wall"][1]), fmt_s(r[l]["wall"][2])) if l in r else "n/a") for l in ("orin", "llvm", "go", "c")}
+
+        def ratio(a, b):
+            return "%.2fx" % (r[a]["wall"][0] / r[b]["wall"][0]) if a in r and b in r else "n/a"
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            n, cm["orin"], cm["llvm"], cm["go"], cm["c"], ratio("orin", "go"), ratio("orin", "c"), ratio("llvm", "go"), ratio("llvm", "c")))
     if selfc:
         w = selfc["wall"]
         L.append("| selfcompile (orin2 compiles compiler/main.or) | %s (%s-%s) | - | - | - | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
@@ -265,7 +271,7 @@ def main():
     L.append("|---|" + "---:|" * len(LANGS))
     for n in names:
         r = results[n]
-        L.append("| %s | %s |" % (n, " | ".join("%.1f" % (r[l]["rss_kb"] / 1024) for l in LANGS) + " "))
+        L.append("| %s | %s |" % (n, " | ".join(("%.1f" % (r[l]["rss_kb"] / 1024)) if l in r else "n/a" for l in LANGS) + " "))
     if selfc:
         extra = " |" + " - |" * (len(LANGS) - 1)
         L.append("| selfcompile (orin2) | %.1f%s" % (selfc["rss_kb"] / 1024, extra))
@@ -278,7 +284,7 @@ def main():
         return "%.0f / %s" % (r["raw"] / 1024, "%.0f" % (r["stripped"] / 1024) if r["stripped"] else "n/a")
     for n in names:
         r = results[n]
-        L.append("| %s | %s | %s |" % (n, " | ".join(sz(r[l]) for l in LANGS), " | ".join("%.2f" % r[l]["build_s"] for l in LANGS)))
+        L.append("| %s | %s | %s |" % (n, " | ".join(sz(r[l]) if l in r else "n/a" for l in LANGS), " | ".join(("%.2f" % r[l]["build_s"]) if l in r else "n/a" for l in LANGS)))
     if selfc:
         raw, stripped = selfc["size"]
         L.append("| orin2 compiler binary | %.0f / %s |%s %.2f |%s" % (
@@ -300,7 +306,7 @@ def main():
         L.append("selfcompile output C is %s bytes and %s the committed-bootstrap stage2.c." %
                  ("{:,}".format(selfc["csize"]), "identical to" if selfc["same"] else "NOT identical to"))
         L.append("")
-    L.append("Checksums: %s." % ("all outputs identical across " + "/".join(LANGS) if not mismatches else
+    L.append("Checksums: %s." % ("all outputs identical across the languages of every benchmark (Orin-only rows have no counterpart)" if not mismatches else
                                   "MISMATCH in " + ", ".join("%s/%s" % m for m in mismatches)))
     text = "\n".join(L) + "\n"
     print(text)
