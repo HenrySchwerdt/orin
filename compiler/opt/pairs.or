@@ -23,8 +23,11 @@
 
 import { MProgram, MFunction, MBlock, MLocal, MType, Instr, Operand, Terminator } from "../mir";
 import { Span } from "../diag";
+import { Locals, mtyEq } from "../lower";
 import { State, Cx, step, blockInStates, KDead } from "../verify";
 import { Counts, countsOf, instrUses, instrDef, termUses, isRefTy } from "./analysis";
+import { BlockSink, RewritePlan, withBody, indices } from "./rewrite";
+import { fnWellFormed, progWellFormed, passKept, sameSignature } from "./wellformed";
 
 // A distinct code per type (MType has no equality of its own).
 function tyCode(t: MType): int {
@@ -204,6 +207,8 @@ function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
 }
 
 // f as an inout function returning the second slot.
+@Requires(sh.ok && sh.sites.every(st => st.block < f.blocks.length && st.at < f.blocks[st.block].instrs.length))
+@Ensures(convertedOk(f, result) && mtyEq(result.ret, sh.ty))
 function convertCallee(f: MFunction, sh: PairShape): MFunction {
   let blocks: MBlock[] = [];
   let b: usize = 0;
@@ -253,6 +258,7 @@ function convertCallee(f: MFunction, sh: PairShape): MFunction {
 // ---------------------------------------------------------------- the call sites
 
 // Replacement plan for the instructions after a call whose record `d` is destructured in the same block.
+@Invariant(!this.ok || this.hit.length == this.rep.length)
 type Sra = { ok: bool; hit: bool[]; rep: Instr[][]; };
 
 function noSra(): Sra {
@@ -452,45 +458,39 @@ function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usiz
   return Sra { ok: true, hit: hit, rep: rep };
 }
 
-// Rewrite the calls of converted functions in f. `conv[g]`: the type of the value function g now returns.
+// Does f call a function that `conv` converts?
+function callsConverted(conv: Option<MType>[], f: MFunction): bool {
+  return f.blocks.some(
+    blk => blk.instrs.some(
+      ins => match (ins) {
+        ICall(_, g, _) => conv[g].isSome(),
+        _ => false,
+      },
+    ),
+  );
+}
+
+// Rewrite the calls of converted functions in f. `conv[g]`: the type of the value function g now returns. The calls are
+// the same calls in the same order (the record they returned is built after the call, or not at all).
+@Requires(conv.length == p.functions.length && fnWellFormed(p, f))
+@Ensures(passKept(f, result) && result.blocks.length == f.blocks.length)
 function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFunction {
-  let any = false;
-  for (const blk of f.blocks) {
-    for (const ins of blk.instrs) {
-      match (ins) {
-        ICall(_, g, _) => {
-          if (conv[g].isSome()) {
-            any = true;
-          }
-        },
-        _ => {}
-      }
-    }
-  }
-  if (!any) {
+  if (!callsConverted(conv, f)) {
     return f;
   }
   const cnt = countsOf(f);
-  let locals = f.locals;
+  let locals = new Locals(f.locals);
   let blocks: MBlock[] = [];
   for (const blk of f.blocks) {
     const n = blk.instrs.length;
-    let hit: bool[] = [];
-    let rep: Instr[][] = [];
-    for (const _x of blk.instrs) {
-      hit.push(false);
-      rep.push([]);
-    }
-    let out: Instr[] = [];
-    let sps: Span[] = [];
+    // replacements of later instructions of the block, planned at the call whose record they destructure
+    let later = new RewritePlan(n);
+    let out = new BlockSink();
     let i: usize = 0;
     while (i < n) {
       const cs = blk.spans[i];
-      if (hit[i]) {
-        for (const r of rep[i]) {
-          out.push(r);
-          sps.push(cs);
-        }
+      if (later.touched(i)) {
+        out.emitAll(later.replacement(i), cs);
         i += 1;
       } else {
         let done = false;
@@ -510,41 +510,33 @@ function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFuncti
                     Some(dd) => {
                       isDst = dd == x0;
                     },
-                    None => {}
+                    None => {},
                   }
                   if (x0 >= f.paramCount && !isDst) {
                     x = x0;
                     direct = true;
                   }
                 },
-                _ => {}
+                _ => {},
               }
               if (!direct) {
-                x = locals.length;
-                locals.push(MLocal { name: "_", ty: MRef });
+                x = locals.fresh(MRef);
                 match (args[0]) {
                   OLocal(x0) => {
-                    out.push(IMove(x, x0));
+                    out.emit(IMove(x, x0), cs);
                   },
                   _ => {
-                    out.push(ICopy(x, args[0]));
-                  }
+                    out.emit(ICopy(x, args[0]), cs);
+                  },
                 }
               }
-              const v = locals.length;
-              locals.push(MLocal { name: "_", ty: vty });
-              let nargs: Operand[] = [OLocal(x)];
-              let k: usize = 1;
-              while (k < args.length) {
-                nargs.push(args[k]);
-                k += 1;
-              }
-              out.push(ICall(Some(v), g, nargs));
+              const v = locals.fresh(vty);
+              out.emit(ICall(Some(v), g, [OLocal(x)].concat(args.slice(1, args.length))), cs);
               match (dst) {
                 None => {
-                  out.push(IRelease(x));
+                  out.emit(IRelease(x), cs);
                   if (vRef) {
-                    out.push(IRelease(v));
+                    out.emit(IRelease(v), cs);
                   }
                 },
                 Some(d) => {
@@ -553,75 +545,65 @@ function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFuncti
                     let j = i + 1;
                     while (j < n) {
                       if (plan.hit[j]) {
-                        hit[j] = true;
-                        rep[j] = plan.rep[j];
+                        later.replace(j, plan.rep[j]);
                       }
                       j += 1;
                     }
                   } else {
-                    out.push(IStructNew(d, 0, [OLocal(x), OLocal(v)]));
+                    out.emit(IStructNew(d, 0, [OLocal(x), OLocal(v)]), cs);
                   }
-                }
+                },
               }
             }
           },
-          _ => {}
+          _ => {},
         }
         if (!done) {
-          out.push(blk.instrs[i]);
-        }
-        while (sps.length < out.length) {
-          sps.push(cs);
+          out.emit(blk.instrs[i], cs);
         }
         i += 1;
       }
     }
-    blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+    blocks.push(out.finish(blk.term, blk.termSpan));
   }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: locals,
-    ret: f.ret,
-    blocks: blocks
-  };
+  return withBody(f, locals.table(), blocks);
 }
 
-export function pairReturns(p: MProgram, pinned: bool[]): MProgram {
-  let shapes: PairShape[] = [];
-  let conv: Option<MType>[] = [];
-  let anyConv = false;
-  let fi: usize = 0;
-  while (fi < p.functions.length) {
-    const sh = pairShape(p, fi, pinned);
-    shapes.push(sh);
-    if (sh.ok) {
-      conv.push(Some(sh.ty));
-      anyConv = true;
-    } else {
-      conv.push(None);
-    }
-    fi += 1;
+// A converted function: in/out now, and its result is the value (the second slot) of the record it returned.
+export function convertedOk(before: MFunction, after: MFunction): bool {
+  return after.inout && !before.inout && after.name == before.name && after.paramCount == before.paramCount
+      && after.blocks.length == before.blocks.length && isRefTy(before.ret);
+}
+
+// The functions are the same functions (names, order, `main`, strings, vtables); only pair functions that are not
+// pinned (closure targets, vtable entries) and not `main` become in/out; every other signature is kept.
+export function pairsKept(p: MProgram, r: MProgram, pinned: bool[]): bool {
+  if (r.functions.length != p.functions.length || r.main != p.main || r.strings.length != p.strings.length) {
+    return false;
   }
-  if (!anyConv) {
+  let i: usize = 0;
+  while (i < p.functions.length) {
+    const a = p.functions[i];
+    const b = r.functions[i];
+    const kept = sameSignature(a, b);
+    if (!kept && (pinned[i] || i == p.main || !convertedOk(a, b))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Stage 5. The shapes of all functions are found first (a program-wide step in function order); then every function is
+// rewritten on its own: the callee side of a pair function, then its calls of converted functions.
+@Requires(pinned.length == p.functions.length && progWellFormed(p))
+@Ensures(pairsKept(p, result, pinned) && progWellFormed(result))
+export function pairReturns(p: MProgram, pinned: bool[]): MProgram {
+  const shapes = indices(p.functions.length).map(fi => pairShape(p, fi, pinned));
+  if (!shapes.some(sh => sh.ok)) {
     return p;
   }
-  let fns: MFunction[] = [];
-  fi = 0;
-  while (fi < p.functions.length) {
-    let f = p.functions[fi];
-    if (shapes[fi].ok) {
-      f = convertCallee(f, shapes[fi]);
-    }
-    fns.push(f);
-    fi += 1;
-  }
-  fi = 0;
-  while (fi < fns.length) {
-    fns[fi] = rewriteCalls(p, conv, fns[fi]);
-    fi += 1;
-  }
+  const conv: Option<MType>[] = shapes.map(sh => sh.ok ? Some(sh.ty) : None);
+  const fns = indices(p.functions.length).map(fi => rewriteCalls(p, conv, shapes[fi].ok ? convertCallee(p.functions[fi], shapes[fi]) : p.functions[fi]));
   return MProgram { functions: fns, strings: p.strings, main: p.main, vtables: p.vtables, inlineFns: p.inlineFns };
 }

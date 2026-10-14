@@ -1,0 +1,237 @@
+// Unit tests of the code generators (rewrite step 3d): the C backend (`compiler/cemit`) and the LLVM backend
+// (`compiler/llvm`). Literals and names, the symbol tables, the "refers only to declared symbols" predicates, the reference
+// mask of large structs, and rule 8: a function's text depends only on the read-only symbol table, so emitting the
+// functions in another order and joining them in index order gives the same unit. Run:
+// `orin test compiler/tests/emit_test.or --runtime runtime` (contracts are checked at run time).
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { assert, assertEqUsize, assertEqString } from "std:test";
+import { SourceFile } from "../diag";
+import { MType, Operand, MLocal, MBlock, Instr, Terminator, MFunction, MProgram, MVTable, plainBlock } from "../mir";
+import { loadWithOverlay } from "../loader";
+import { check } from "../check";
+import { lower } from "../lower";
+import { optimize, pruneProgram } from "../opt";
+import {
+  emitC, joinC, emittable, indices, CSymbols, cSymbols, refsDeclared, symbolsWellFormed, emitCFunction, sanitize,
+  fnSymbol, commentSafe, cString, cStringValue, refMask, maskAll, identChars,
+} from "../cemit";
+import {
+  emitLlvm, joinLlvm, LlvmSymbols, llvmSymbols, trapsIndexed, introducedNames, llvmRefsDeclared, emitLlvmFunction,
+  llStr, llStrValue, prelude, declares, fixedMsgs,
+} from "../llvm";
+
+// ---------------------------------------------------------------- builders
+
+function lr(n: string): MLocal {
+  return MLocal { name: n, ty: MRef };
+}
+
+function bk(instrs: Instr[], term: Terminator): MBlock {
+  return plainBlock(instrs, term);
+}
+
+function fn(name: string, locals: MLocal[], blocks: MBlock[]): MFunction {
+  return MFunction { name: name, paramCount: 0, paramOwned: [], inout: false, locals: locals, ret: MVoid, blocks: blocks };
+}
+
+// main calls `a.b`, which builds a closure of `c/d`, traps with a message used twice and returns a string literal.
+function sample(): MProgram {
+  const mainF = fn("main", [], [bk([ICall(None, 1, [])], TReturn(None))]);
+  const ab = fn("a.b", [lr("k"), lr("s")], [
+    bk([IClosure(0, 2, []), IRelease(0), ICopy(1, OStr(1))], TBranch(OBool(true), 1, 2)),
+    bk([], TTrap("custom failure")),
+    bk([], TTrap("custom failure")),
+  ]);
+  const env = MFunction { name: "c/d", paramCount: 1, paramOwned: [false], inout: false, locals: [lr("env")], ret: MVoid, blocks: [bk([], TReturn(None))] };
+  return MProgram {
+    functions: [mainF, ab, env],
+    strings: ["hi", "a \"quoted\" */ string?\n"],
+    main: 0,
+    vtables: [MVTable { name: "I for c/d */", funcs: [2] }],
+    inlineFns: [],
+  };
+}
+
+function reversed(xs: string[]): string[] {
+  let out: string[] = [];
+  let i = xs.length;
+  while (i > 0) {
+    i -= 1;
+    out.push(xs[i]);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- text
+
+@Test
+function cStringRoundTripsEveryByte(): void {
+  let all = "";
+  let c: int = 1;
+  while (c < 256) {
+    all += String.fromCharCode(c);
+    c += 1;
+  }
+  const samples = ["", "plain", "say \"hi\"", "back\\slash", "??=trigraph", "tab\there", String.fromCharCode(127) + "1", all];
+  for (const s of samples) {
+    const lit = cString(s);
+    assert(cStringValue(lit).isSome() && cStringValue(lit).unwrap() == s, "cString round-trips");
+  }
+  assert(cStringValue("\"\\1\"").isNone(), "a short octal escape is not cString's form");
+  assert(cStringValue("\"a\"b\"").isNone(), "an unescaped quote is not");
+}
+
+@Test
+function llStrRoundTripsEveryByte(): void {
+  let all = "";
+  let c: int = 1;
+  while (c < 256) {
+    all += String.fromCharCode(c);
+    c += 1;
+  }
+  assert(llStrValue(llStr(all)).unwrap() == all, "llStr round-trips");
+  assert(llStrValue("\\4").isNone(), "a truncated escape is rejected");
+  assert(llStrValue("\\4g").isNone(), "a non-hex escape is rejected");
+}
+
+@Test
+function commentsCannotBeClosedByANameAndSymbolsAreIdentifiers(): void {
+  assert(!commentSafe("a*/b").includes("*/"), "*/ is broken up");
+  assert(!commentSafe("**/").includes("*/"), "**/ too");
+  assertEqString(sanitize("a.b/c$d"), "a_b_c_d", "one underscore per character");
+  assert(identChars(fnSymbol(3, "x.y-z")), "a symbol is an identifier");
+  assert(fnSymbol(0, "a.b") != fnSymbol(1, "a_b"), "names that sanitize alike get different symbols");
+}
+
+// The defect fixed in step 3d: a struct with more than 64 slots made the mask loop add bit 63 once per extra reference
+// slot and overflow (`trap: usize overflow` in the compiler). Slots from 64 on contribute nothing now; the runtime traps
+// on such a struct with "struct has more than 64 slots" when it is built.
+@Test
+function referenceMasksOfLargeStructsDoNotOverflow(): void {
+  let refs: bool[] = [];
+  let i: usize = 0;
+  while (i < 70) {
+    refs.push(true);
+    i += 1;
+  }
+  assertEqUsize(refMask(refs), maskAll(64), "all 64 mask bits, nothing beyond");
+  assertEqUsize(refMask([false, true, true]), 6, "bits 1 and 2");
+  assertEqUsize(refMask([]), 0, "no slots");
+}
+
+// ---------------------------------------------------------------- symbol tables and references
+
+@Test
+function theCSymbolTableNamesEveryFunctionOnce(): void {
+  const p = sample();
+  const syms = cSymbols(p);
+  assertEqUsize(syms.count(), 3, "one symbol per function");
+  assert(symbolsWellFormed(syms), "orin_fn_<i>_<name>");
+  assert(syms.isFunction(syms.name(2)) && !syms.isFunction("orin_fn_9_x"), "lookup");
+  assert(refsDeclared("x = orin_fn_1_a_b(orin_s1); orin_str_eq(a, b); orin_s2f(z);", syms), "known symbols pass");
+  assert(!refsDeclared("orin_fn_7_nope();", syms), "an undefined function is caught");
+  assert(!refsDeclared("x = orin_s2;", syms), "a string literal past the table is caught");
+  assert(!refsDeclared("x = orin_vt1;", syms), "a vtable past the table is caught");
+  assert(refsDeclared("orin_trap(\"orin_s99\"); /* orin_fn_9_x */", syms), "string literals and comments are not code");
+}
+
+@Test
+function theLlvmSymbolTableNumbersTrapMessagesOnce(): void {
+  const p = sample();
+  const syms = llvmSymbols(p);
+  const fixed = fixedMsgs();
+  assertEqUsize(syms.messages().length, fixed.length + 1, "the repeated message has one global");
+  assertEqUsize(syms.message("custom failure"), fixed.length, "after the fixed messages");
+  assertEqUsize(syms.message("integer overflow"), 0, "a fixed message keeps its index");
+  assert(trapsIndexed(p, syms), "every trap has a global");
+  assert(introducedNames(declares()).includes("orin_str_eq"), "declarations are runtime symbols");
+  assert(introducedNames(prelude()).includes("orinl_dup"), "prelude helpers too");
+  assert(llvmRefsDeclared("call void @orin_trap(ptr @.m9) call ptr @orinl_dup(ptr %x)", syms), "known globals pass");
+  assert(!llvmRefsDeclared("call void @orin_bogus()", syms), "an undeclared runtime function is caught");
+  assert(!llvmRefsDeclared("call void @orin_trap(ptr @.m10)", syms), "a message past the table is caught");
+  assert(llvmRefsDeclared("@x = constant [3 x i8] c\"@no\\00\"", syms) == false, "@x itself is undeclared");
+}
+
+// ---------------------------------------------------------------- whole units, rule 8
+
+@Test
+function aCUnitIsTheJoinOfIndependentlyEmittedFunctions(): void {
+  const p = sample();
+  assert(emittable(p), "the sample is emittable");
+  const whole = emitC(p);
+  const syms = cSymbols(p);
+  // emit the functions last to first, then put them in index order: the same unit
+  let rev: string[] = [];
+  let i = p.functions.length;
+  while (i > 0) {
+    i -= 1;
+    rev.push(emitCFunction(syms, p, i));
+  }
+  assertEqString(joinC(p, syms, reversed(rev)), whole, "order of emission does not matter");
+  assert(refsDeclared(whole, syms), "the unit refers only to what it declares");
+  assert(whole.includes("ORIN_STRING_LIT(orin_s1, 22, "), "string literals are defined");
+  assert(!whole.includes("I for c/d */ */"), "the vtable comment cannot close early");
+  // changing one function does not change the text of another
+  let q = p;
+  q.functions[1].blocks[0] = bk([ICopy(1, OStr(0))], TBranch(OBool(true), 1, 2));
+  const sq = cSymbols(q);
+  assertEqString(emitCFunction(sq, q, 0), emitCFunction(syms, p, 0), "main is unaffected by a change in a.b");
+  assertEqString(emitCFunction(sq, q, 2), emitCFunction(syms, p, 2), "c/d is unaffected");
+}
+
+@Test
+function anLlvmModuleIsTheJoinOfIndependentlyEmittedFunctions(): void {
+  const p = sample();
+  const whole = emitLlvm(p);
+  const syms = llvmSymbols(p);
+  let rev: string[] = [];
+  let i = p.functions.length;
+  while (i > 0) {
+    i -= 1;
+    rev.push(emitLlvmFunction(syms, p, i));
+  }
+  assertEqString(joinLlvm(p, syms, reversed(rev)), whole, "order of emission does not matter");
+  assert(llvmRefsDeclared(whole, syms), "the module refers only to globals it defines or declares");
+  assert(whole.includes("@.m9 = private unnamed_addr constant [15 x i8] c\"custom failure\\00\""), "the trap message global");
+}
+
+function compiled(fs: FsGrant, text: string): Option<MProgram> {
+  const o = loadWithOverlay(fs, "/virt/a.or", [SourceFile { path: "/virt/a.or", text: text }]);
+  return match (o.program) {
+    Some(p) => {
+      const r = check(p, o.sm);
+      return r.isOk() ? Some(pruneProgram(optimize(lower(r.unwrap())))) : None;
+    },
+    None => None,
+  };
+}
+
+function source(): string {
+  return "interface Shape {\n  area(): float;\n}\nclass Sq implements Shape {\n  s: float = 2.0;\n  area(): float {\n    return this.s * this.s;\n  }\n}\n"
+      + "class Counter {\n  n: int = 0;\n  next(): int {\n    this.n += 1;\n    return this.n;\n  }\n}\n"
+      + "function main(): void {\n  const sh: Shape = new Sq();\n  let c = new Counter();\n  const xs = [1, 2, 3].map(x => x * c.n);\n"
+      + "  console.log(sh.area().toString() + c.next().toString() + xs.length.toString());\n  const o: Option<int> = None;\n"
+      + "  console.log(o.unwrapOr(4).toString());\n}\n";
+}
+
+@Test
+function realProgramsReferOnlyToDeclaredSymbolsInBothBackends(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const m = compiled(fs, source());
+      assert(m.isSome(), "checks, lowers, optimises");
+      const p = m.unwrap();
+      assert(emittable(p), "emittable");
+      const c = emitC(p);
+      const ll = emitLlvm(p);
+      assert(refsDeclared(c, cSymbols(p)), "C");
+      assert(llvmRefsDeclared(ll, llvmSymbols(p)), "LLVM");
+      assert(c.includes("#pragma STDC FP_CONTRACT OFF"), "a program with floats");
+      assert(p.functions.some(f => f.inout) && c.includes("OrinObj **orin_out"), "an in/out function in C");
+      assert(ll.includes("ptr noundef nonnull %pout"), "and in LLVM");
+    },
+  );
+}

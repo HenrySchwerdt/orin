@@ -1,54 +1,64 @@
 // Owned-parameter inference and the callee-side rewrite (ADR-0010).
 //
-// A reference parameter p of f is *owned* when some use of p is its last use and consumes a
-// counted reference: `IDup(d, p)` (the callee would retain the parameter to store, return or
-// mutate it) or an argument of a call whose parameter is itself owned. For an owned p:
+// A reference parameter p of f is *owned* when some use of p is its last use and consumes a counted reference:
+// `IDup(d, p)` (the callee would retain the parameter to store, return or mutate it) or an argument of a call whose
+// parameter is itself owned. For an owned p:
 //   - the consuming last use takes the reference (IDup -> IMove, call operand consumed);
-//   - on every other path the reference is released right after the last use of p (or of anything
-//     borrowed from p), on the edge into a block where p is no longer live, or at entry if p is
-//     never used.
-// Liveness is alias-aware (a use of a borrowed projection of p counts as a use of p), which keeps
-// the release after every use of an alias that the verifier would otherwise see dead.
+//   - on every other path the reference is released right after the last use of p (or of anything borrowed from p), on
+//     the edge into a block where p is no longer live, or at entry if p is never used.
+// Liveness is alias-aware (a use of a borrowed projection of p counts as a use of p), which keeps the release after
+// every use of an alias that the verifier would otherwise see dead.
 
 import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr, Terminator, SwitchCase, spanAt } from "../mir";
 import { Span } from "../diag";
-import {
-  instrUses, successors, contains, ancestors, affects, usesAffecting, termUsesAffecting,
-  entryHasPredecessor, isRefTy
-} from "./analysis";
+import { Locals } from "../lower";
+import { successors, ancestors, affects, usesAffecting, termUsesAffecting, entryHasPredecessor, isRefTy } from "./analysis";
+import { BlockSink, withBody } from "./rewrite";
+import { fnShapeOk, fnWellFormed, passKept, onlyEdgeBlocksAdded, releaseCount } from "./wellformed";
 
+// Liveness of one parameter: one flag per block on entry and on exit.
+@Invariant(this.liveIn.length == this.liveOut.length)
 export type PLive = { liveIn: bool[]; liveOut: bool[]; };
 
 function isLocalOp(o: Operand, l: usize): bool {
   return match (o) {
     OLocal(m) => m == l,
-    _ => false
+    _ => false,
   };
 }
 
-// Backward liveness of parameter p (no kills: parameters are never redefined).
-export function paramLiveness(f: MFunction, anc: usize[][], p: usize): PLive {
-  const nb = f.blocks.length;
-  let usedIn: bool[] = [];
-  let liveIn: bool[] = [];
-  let liveOut: bool[] = [];
+// The liveness equations hold: a block is live-out iff a successor is live-in, and live-in iff it is live-out or uses
+// p (`usedIn`).
+export function livenessSolved(f: MFunction, lv: PLive, usedIn: bool[]): bool {
   let b: usize = 0;
-  while (b < nb) {
-    let u = termUsesAffecting(anc, f.blocks[b].term, p);
-    for (const ins of f.blocks[b].instrs) {
-      if (!u && usesAffecting(anc, ins, p)) {
-        u = true;
-      }
+  while (b < f.blocks.length) {
+    const out = successors(f.blocks[b].term).some(s => lv.liveIn[s]);
+    if (lv.liveOut[b] != out || lv.liveIn[b] != (out || usedIn[b])) {
+      return false;
     }
-    usedIn.push(u);
-    liveIn.push(u);
-    liveOut.push(false);
     b += 1;
   }
+  return true;
+}
+
+// Does block b use p (an alias of p counts)?
+function blockUses(f: MFunction, anc: usize[][], b: usize, p: usize): bool {
+  return termUsesAffecting(anc, f.blocks[b].term, p) || f.blocks[b].instrs.some(ins => usesAffecting(anc, ins, p));
+}
+
+// Backward liveness of parameter p (no kills: parameters are never redefined).
+@Requires(fnShapeOk(f) && anc.length == f.locals.length && p < f.paramCount)
+@Ensures(result.liveIn.length == f.blocks.length)
+@Ensures(livenessSolved(f, result, usedFlags(f, anc, p)))
+export function paramLiveness(f: MFunction, anc: usize[][], p: usize): PLive {
+  const nb = f.blocks.length;
+  const usedIn = usedFlags(f, anc, p);
+  let liveIn: bool[] = usedIn;
+  let liveOut: bool[] = usedIn.map(u => false);
   let changed = true;
   while (changed) {
     changed = false;
-    b = nb;
+    let b = nb;
     while (b > 0) {
       b -= 1;
       let out = false;
@@ -70,16 +80,23 @@ export function paramLiveness(f: MFunction, anc: usize[][], p: usize): PLive {
   return PLive { liveIn: liveIn, liveOut: liveOut };
 }
 
+// One flag per block: the block uses p.
+export function usedFlags(f: MFunction, anc: usize[][], p: usize): bool[] {
+  let out: bool[] = [];
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    out.push(blockUses(f, anc, b, p));
+    b += 1;
+  }
+  return out;
+}
+
 // la[i] = p is live after instruction i of the block.
+@Ensures(result.length == blk.instrs.length)
 function liveAfter(blk: MBlock, anc: usize[][], p: usize, out: bool): bool[] {
   let live = out || termUsesAffecting(anc, blk.term, p);
-  let la: bool[] = [];
-  let i: usize = 0;
-  while (i < blk.instrs.length) {
-    la.push(false);
-    i += 1;
-  }
-  i = blk.instrs.length;
+  let la: bool[] = blk.instrs.map(i => false);
+  let i = blk.instrs.length;
   while (i > 0) {
     i -= 1;
     la[i] = live;
@@ -90,8 +107,8 @@ function liveAfter(blk: MBlock, anc: usize[][], p: usize, out: bool): bool[] {
   return la;
 }
 
-// p occurs exactly once among the call arguments and nothing else passed to the call may be
-// borrowed from p (the callee could release its owned argument while reading the alias).
+// p occurs exactly once among the call arguments and nothing else passed to the call may be borrowed from p (the callee
+// could release its owned argument while reading the alias).
 function cleanCall(anc: usize[][], args: Operand[], p: usize): bool {
   let n: usize = 0;
   for (const a of args) {
@@ -103,7 +120,7 @@ function cleanCall(anc: usize[][], args: Operand[], p: usize): bool {
           return false;
         }
       },
-      _ => {}
+      _ => {},
     }
   }
   return n == 1;
@@ -111,19 +128,21 @@ function cleanCall(anc: usize[][], args: Operand[], p: usize): bool {
 
 export type CallSite = { callee: usize; pos: usize; };
 
-// Where parameter p of f is consumed at its last use.
+// Where parameter p of f is consumed at its last use. Not `ok`: p can never be owned (it is not a reference, the entry
+// block is a loop head, or a terminator uses it), and then nothing was collected.
+@Invariant(this.ok || (!this.dup && this.calls.length == 0))
 export type PSites = { ok: bool; dup: bool; calls: CallSite[]; };
 
+@Requires(fnShapeOk(f) && p < f.paramCount)
+@Ensures(result.calls.every(c => passesAt(f, c, p)))
 export function scanSites(f: MFunction, p: usize): PSites {
   let r = PSites { ok: false, dup: false, calls: [] };
   if (!isRefTy(f.locals[p].ty) || entryHasPredecessor(f)) {
     return r;
   }
   const anc = ancestors(f);
-  for (const blk of f.blocks) {
-    if (termUsesAffecting(anc, blk.term, p)) {
-      return r;
-    }
+  if (f.blocks.some(blk => termUsesAffecting(anc, blk.term, p))) {
+    return r;
   }
   r.ok = true;
   const lv = paramLiveness(f, anc, p);
@@ -151,7 +170,7 @@ export function scanSites(f: MFunction, p: usize): PSites {
               }
             }
           },
-          _ => {}
+          _ => {},
         }
       }
       i += 1;
@@ -161,10 +180,40 @@ export function scanSites(f: MFunction, p: usize): PSites {
   return r;
 }
 
+// f has a call of `c.callee` with p as argument `c.pos` (a recorded site is a real one: a wrong position would make the
+// inference own the wrong parameter of the callee).
+export function passesAt(f: MFunction, c: CallSite, p: usize): bool {
+  return f.blocks.some(
+    blk => blk.instrs.some(
+      ins => match (ins) {
+        ICall(_, g, args) => g == c.callee && c.pos < args.length && isLocalOp(args[c.pos], p),
+        _ => false,
+      },
+    ),
+  );
+}
+
+// Is `b` the edge block `release p; goto t` with t below `n`?
+function isEdgeBlock(b: MBlock, p: usize, n: usize): bool {
+  return b.instrs.length == 1
+      && match (b.instrs[0]) {
+        IRelease(x) => x == p,
+        _ => false,
+      }
+      && match (b.term) {
+        TGoto(t) => t < n,
+        _ => false,
+      };
+}
+
+function edgeBlocksOk(bs: MBlock[], p: usize, n: usize): bool {
+  return bs.every(b => isEdgeBlock(b, p, n));
+}
+
 type RU = { pre: Instr[]; main: Instr; consumed: bool; };
 
-// Rewrite one instruction that uses p. `dead`: p is not live after it. `tmp`: index the first
-// temporary local would get (one per element of `pre`).
+// Rewrite one instruction that uses p. `dead`: p is not live after it. `tmp`: index the first temporary local would get
+// (one per element of `pre`).
 function rewriteUse(prog: MProgram, anc: usize[][], ins: Instr, p: usize, dead: bool, tmp: usize): RU {
   return match (ins) {
     IDup(d, o) => {
@@ -198,7 +247,7 @@ function rewriteUse(prog: MProgram, anc: usize[][], ins: Instr, p: usize, dead: 
       }
       return RU { pre: pre, main: ICall(dst, g, nargs), consumed: consumed };
     },
-    _ => RU { pre: [], main: ins, consumed: false }
+    _ => RU { pre: [], main: ins, consumed: false },
   };
 }
 
@@ -207,44 +256,75 @@ function edgeBlock(blk: MBlock, p: usize, target: usize): MBlock {
   return MBlock { instrs: [IRelease(p)], spans: [blk.termSpan], term: TGoto(target), termSpan: blk.termSpan };
 }
 
-// Make parameter p (already flagged owned in prog) own its reference in f's body.
+// The edge blocks a function gains, appended after its `base` blocks (block ids `base`, `base + 1`, ...): each releases
+// the parameter `p` and continues at one of the old blocks.
+@Invariant(edgeBlocksOk(this.blocks, this.p, this.base))
+class EdgeBlocks {
+  private base: usize;
+  private p: usize;
+  private blocks: MBlock[];
+
+  constructor(base: usize, p: usize) {
+    this.base = base;
+    this.p = p;
+    this.blocks = [];
+  }
+
+  // The target to use for the edge `src -> t`: t itself when p is live there, else a new edge block that releases p and
+  // continues at t.
+  @Requires(p == this.p && t < this.base)
+  @Ensures(live ==> result == t)
+  @Ensures(!live ==> result == this.base + this.blocks.length - 1 && this.blocks.length == old(this.blocks.length) + 1)
+  target(src: MBlock, p: usize, t: usize, live: bool): usize {
+    if (live) {
+      return t;
+    }
+    this.blocks.push(edgeBlock(src, p, t));
+    return this.base + this.blocks.length - 1;
+  }
+
+  all(): MBlock[] {
+    return this.blocks;
+  }
+}
+
+// Make parameter p (already flagged owned in prog) own its reference in f's body: the consuming last use takes it, every
+// other path releases it. The old blocks keep their ids; the only blocks added are edge releases of p.
+@Requires(fnWellFormed(prog, f) && p < f.paramCount && isRefTy(f.locals[p].ty))
+@Ensures(passKept(f, result) && fnWellFormed(prog, result))
+@Ensures(onlyEdgeBlocksAdded(f, result, p))
+@Ensures(releaseCount(result) >= releaseCount(f))
 export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction {
   const anc = ancestors(f);
   const lv = paramLiveness(f, anc, p);
   const nb = f.blocks.length;
-  let locals = f.locals;
+  let locals = new Locals(f.locals);
   let blocks: MBlock[] = [];
-  let extra: MBlock[] = [];
+  let extra = new EdgeBlocks(nb, p);
   let b: usize = 0;
   while (b < nb) {
     const blk = f.blocks[b];
     const la = liveAfter(blk, anc, p, lv.liveOut[b]);
-    let out: Instr[] = [];
-    let sps: Span[] = [];
+    let out = new BlockSink();
     if (b == 0 && !lv.liveIn[0]) {
-      out.push(IRelease(p));
-      sps.push(spanAt(blk, 0));
+      out.emit(IRelease(p), spanAt(blk, 0));
     }
     let i: usize = 0;
     while (i < blk.instrs.length) {
       const ins = blk.instrs[i];
       const here = blk.spans[i];
       if (!usesAffecting(anc, ins, p)) {
-        out.push(ins);
-        sps.push(here);
+        out.emit(ins, here);
       } else {
         const dead = !la[i];
-        const ru = rewriteUse(prog, anc, ins, p, dead, locals.length);
+        const ru = rewriteUse(prog, anc, ins, p, dead, locals.count());
         for (const pi of ru.pre) {
-          locals.push(MLocal { name: "_", ty: MRef });
-          out.push(pi);
-          sps.push(here);
+          locals.fresh(MRef);
+          out.emit(pi, here);
         }
-        out.push(ru.main);
-        sps.push(here);
+        out.emit(ru.main, here);
         if (dead && !ru.consumed) {
-          out.push(IRelease(p));
-          sps.push(here);
+          out.emit(IRelease(p), here);
         }
       }
       i += 1;
@@ -254,51 +334,23 @@ export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction 
     if (lv.liveOut[b]) {
       match (blk.term) {
         TBranch(c, x, y) => {
-          let nx = x;
-          let ny = y;
-          if (!lv.liveIn[x]) {
-            extra.push(edgeBlock(blk, p, x));
-            nx = nb + extra.length - 1;
-          }
-          if (!lv.liveIn[y]) {
-            extra.push(edgeBlock(blk, p, y));
-            ny = nb + extra.length - 1;
-          }
+          const nx = extra.target(blk, p, x, lv.liveIn[x]);
+          const ny = extra.target(blk, p, y, lv.liveIn[y]);
           term = TBranch(c, nx, ny);
         },
         TSwitch(o, cs, d) => {
           let ncs: SwitchCase[] = [];
           for (const k of cs) {
-            let t = k.target;
-            if (!lv.liveIn[t]) {
-              extra.push(edgeBlock(blk, p, t));
-              t = nb + extra.length - 1;
-            }
-            ncs.push(SwitchCase { value: k.value, target: t });
+            ncs.push(SwitchCase { value: k.value, target: extra.target(blk, p, k.target, lv.liveIn[k.target]) });
           }
-          let nd = d;
-          if (!lv.liveIn[d]) {
-            extra.push(edgeBlock(blk, p, d));
-            nd = nb + extra.length - 1;
-          }
+          const nd = extra.target(blk, p, d, lv.liveIn[d]);
           term = TSwitch(o, ncs, nd);
         },
-        _ => {}
+        _ => {},
       }
     }
-    blocks.push(MBlock { instrs: out, spans: sps, term: term, termSpan: blk.termSpan });
+    blocks.push(out.finish(term, blk.termSpan));
     b += 1;
   }
-  for (const e of extra) {
-    blocks.push(e);
-  }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: locals,
-    ret: f.ret,
-    blocks: blocks
-  };
+  return withBody(f, locals.table(), blocks.concat(extra.all()));
 }

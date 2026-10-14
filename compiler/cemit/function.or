@@ -1,0 +1,477 @@
+// One function of the C output: class `CFunctionEmitter`.
+//
+// A direct translation: one C local per MIR local (`l<i>`), blocks as labels (`B<i>:`) and gotos. The emitter reads the
+// program-wide `CSymbols` and the program (callee signatures), and writes nothing but its own text, so the text of a
+// function depends only on the function, the symbol table and the callees' `inout` flags (rule 8; `emitCFunction`).
+
+import { BinOp, UnOp, Builtin } from "../hir";
+import { MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram } from "../mir";
+import { u, isRefT, isUsizeT, isFloatT, cty, fromSlot, toSlot, commentSafe, cString, intCode, refMask } from "./text";
+import { CSymbols, refsDeclared } from "./symbols";
+
+// ---------------------------------------------------------------- operands, operators, builtins (pure)
+
+export function lname(i: usize): string {
+  return "l" + u(i);
+}
+
+export function opC(o: Operand): string {
+  return match (o) {
+    OLocal(l) => lname(l),
+    OInt(v) => intCode(v),
+    OUsize(v) => "((uint64_t)" + v.toString() + "ULL)",
+    OBool(b) => b ? "1" : "0",
+    OFloat(t) => "(" + t + ")",
+    OStr(i) => "orin_s" + u(i),
+  };
+}
+
+function arith(op: BinOp, usz: bool, a: string, b: string): string {
+  const suffix = usz ? "u" : "i";
+  const name = match (op) {
+    OpAdd => "add",
+    OpSub => "sub",
+    OpMul => "mul",
+    OpDiv => "div",
+    OpRem => "rem",
+    _ => "?",
+  };
+  return "orin_" + name + "_" + suffix + "(" + a + ", " + b + ")";
+}
+
+// IEEE arithmetic on doubles: plain C operators, no traps.
+function floatArith(op: BinOp, a: string, b: string): string {
+  const s = match (op) {
+    OpAdd => "+",
+    OpSub => "-",
+    OpMul => "*",
+    _ => "/",
+  };
+  return "(" + a + " " + s + " " + b + ")";
+}
+
+function binaryC(op: BinOp, ref: bool, usz: bool, flt: bool, a: string, b: string): string {
+  return match (op) {
+    OpAdd => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpSub => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpMul => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpDiv => flt ? floatArith(op, a, b) : arith(op, usz, a, b),
+    OpRem => arith(op, usz, a, b),
+    OpEq => ref ? "orin_str_eq(" + a + ", " + b + ")" : "(" + a + " == " + b + ")",
+    OpNe => ref ? "(!orin_str_eq(" + a + ", " + b + "))" : "(" + a + " != " + b + ")",
+    OpLt => "(" + a + " < " + b + ")",
+    OpLe => "(" + a + " <= " + b + ")",
+    OpGt => "(" + a + " > " + b + ")",
+    OpGe => "(" + a + " >= " + b + ")",
+    OpAnd => "(" + a + " && " + b + ")",
+    OpOr => "(" + a + " || " + b + ")",
+  };
+}
+
+function unaryC(op: UnOp, usz: bool, flt: bool, a: string): string {
+  return match (op) {
+    UnNot => "(!" + a + ")",
+    UnNeg => flt ? "(-" + a + ")" : (usz ? "orin_neg_u(" + a + ")" : "orin_neg_i(" + a + ")"),
+  };
+}
+
+// `f(a0, .., a<n-1>)` with the first `n` argument texts.
+@Requires(n <= a.length)
+function callN(f: string, a: string[], n: usize): string {
+  return f + "(" + a.slice(0, n).join(", ") + ")";
+}
+
+// The runtime function and arity of a builtin that is a plain call, or None for the ones written inline.
+type RtCall = { name: string; n: usize; };
+
+function c(name: string, n: usize): Option<RtCall> {
+  return Some(RtCall { name: name, n: n });
+}
+
+function runtimeCall(op: Builtin): Option<RtCall> {
+  return match (op) {
+    BConsoleLog => c("orin_console_log", 1),
+    BConsoleError => c("orin_console_error", 1),
+    BStringFromCharCode => c("orin_string_from_char_code", 1),
+    BParseInt => c("orin_parse_int", 1),
+    BFsReadFile => c("orin_fs_read_file", 2),
+    BFsWriteFile => c("orin_fs_write_file", 3),
+    BFsExists => c("orin_fs_exists", 2),
+    BProcessArgs => c("orin_process_args", 1),
+    BProcessExit => c("orin_process_exit", 1),
+    BIoReadBytes => c("orin_io_read_bytes", 2),
+    BIoReadLine => c("orin_io_read_line", 1),
+    BIoWriteStdout => c("orin_io_write_stdout", 2),
+    BIoShell => c("orin_io_shell", 2),
+    BTimeNowMillis => c("orin_time_now_millis", 1),
+    BGrantFs => c("orin_cap_fs", 1),
+    BGrantProcess => c("orin_cap_process", 1),
+    BGrantStdio => c("orin_cap_stdio", 1),
+    BGrantClock => c("orin_cap_clock", 1),
+    BGrantUnder => c("orin_cap_under", 2),
+    BGrantReadOnly => c("orin_cap_read_only", 1),
+    BGrantArgsOnly => c("orin_cap_args_only", 1),
+    BGrantRevoke => c("orin_cap_revoke", 1),
+    BGrantNet => c("orin_cap_net", 1),
+    BGrantListen => c("orin_cap_listen", 3),
+    BGrantConnect => c("orin_cap_connect", 4),
+    BNetListen => c("orin_net_listen", 5),
+    BNetAccept => c("orin_net_accept", 3),
+    BNetConnect => c("orin_net_connect", 5),
+    BNetStatus => c("orin_net_status", 1),
+    BNetClose => c("orin_net_close", 1),
+    BNetPort => c("orin_net_port", 1),
+    BNetNow => c("orin_net_now", 1),
+    BNetRecv => c("orin_net_recv", 3),
+    BNetSend => c("orin_net_send", 5),
+    BNetShutdown => c("orin_net_shutdown", 2),
+    BNetPeer => c("orin_net_peer", 1),
+    BNetResolve => c("orin_net_resolve", 2),
+    BNetErrorText => c("orin_net_error_text", 1),
+    BFileOpen => c("orin_file_open", 3),
+    BFileIsOpen => c("orin_file_is_open", 1),
+    BFileOpenError => c("orin_file_open_error", 1),
+    BFileClose => c("orin_file_close", 1),
+    BFileReadLine => c("orin_file_read_line", 1),
+    BFileRead => c("orin_file_read", 2),
+    BFileReadAll => c("orin_file_read_all", 1),
+    BFileWrite => c("orin_file_write", 2),
+    BFileWriteLine => c("orin_file_write_line", 2),
+    BFileFlush => c("orin_file_flush", 1),
+    BStrLength => c("orin_str_len", 1),
+    BStrCharCodeAt => c("orin_str_char_code_at", 2),
+    BStrCharAt => c("orin_str_char_at", 2),
+    BStrSubstring => c("orin_str_substring", 3),
+    BStrIndexOf => c("orin_str_index_of", 2),
+    BStrIncludes => c("orin_str_includes", 2),
+    BStrStartsWith => c("orin_str_starts_with", 2),
+    BStrEndsWith => c("orin_str_ends_with", 2),
+    BStrSplit => c("orin_str_split", 2),
+    BStrTrim => c("orin_str_trim", 1),
+    BArrLength => c("orin_array_len", 1),
+    BArrGet => c("orin_array_get", 2),
+    BArrSlice => c("orin_array_slice", 3),
+    BArrConcat => c("orin_array_concat", 2),
+    BArrJoin => c("orin_array_join", 2),
+    BBytesToString => c("orin_bytes_to_string", 3),
+    BStringToBytes => c("orin_string_to_bytes", 1),
+    BIntToString => c("orin_int_to_string", 1),
+    BIntToUsize => c("orin_int_to_usize", 1),
+    BUsizeToString => c("orin_usize_to_string", 1),
+    BUsizeToInt => c("orin_usize_to_int", 1),
+    BBoolToString => c("orin_bool_to_string", 1),
+    BParseFloat => c("orin_parse_float", 1),
+    BFloatToString => c("orin_float_to_string", 1),
+    BF32ToString => c("orin_f32_to_string", 1),
+    BFloatToInt => c("orin_float_to_int", 1),
+    BFloatFloor => c("__builtin_floor", 1),
+    BFloatCeil => c("__builtin_ceil", 1),
+    BFloatRound => c("__builtin_round", 1),
+    BFloatSqrt => c("__builtin_sqrt", 1),
+    BFloatAbs => c("__builtin_fabs", 1),
+    BFloatPow => c("__builtin_pow", 2),
+    BIntRange => c("orin_range_i", 3),
+    BIntConv => c("orin_conv_i", 3),
+    BUIntConv => c("orin_conv_u", 2),
+    BIntOp => c("orin_int_op", 4),
+    BIntChk => c("orin_int_chk", 4),
+    BParseIntK => c("orin_parse_int_k", 2),
+    _ => None,
+  };
+}
+
+// Builtins that return a borrowed slot are retained: the MIR result is Owned.
+function dupIf(rt: MType, code: string): string {
+  if (isRefT(rt)) {
+    return "orin_dup(" + code + ")";
+  }
+  return code;
+}
+
+// C expression for a builtin whose result is a fresh Owned ref or a scalar. `rt` is the type of the destination (MVoid
+// when there is none).
+export function builtinC(op: Builtin, a: string[], rt: MType): string {
+  match (runtimeCall(op)) {
+    Some(rc) => {
+      return callN(rc.name, a, rc.n);
+    },
+    None => {},
+  }
+  return match (op) {
+    BOptIsSome => "(orin_tag(" + a[0] + ") == 0)",
+    BOptIsNone => "(orin_tag(" + a[0] + ") == 1)",
+    BResIsOk => "(orin_tag(" + a[0] + ") == 0)",
+    BResIsErr => "(orin_tag(" + a[0] + ") == 1)",
+    BOptUnwrap => dupIf(rt, fromSlot(rt, callN("orin_opt_unwrap", a, 1))),
+    BOptUnwrapOr => dupIf(
+      rt,
+      "(orin_tag(" + a[0] + ") == 0 ? " + fromSlot(rt, "orin_struct_get(" + a[0] + ", 0)") + " : " + a[1] + ")",
+    ),
+    BResUnwrap => dupIf(rt, fromSlot(rt, callN("orin_res_unwrap", a, 1))),
+    BResUnwrapErr => dupIf(rt, fromSlot(rt, callN("orin_res_unwrap_err", a, 1))),
+    BIntToFloat => "((double)(" + a[0] + "))",
+    BUsizeToFloat => "((double)(" + a[0] + "))",
+    BF32Round => "((double)(float)(" + a[0] + "))",
+    BF32ToFloat => "(" + a[0] + ")",
+    BFloatIsNaN => "((int64_t)(!!__builtin_isnan(" + a[0] + ")))",
+    BFloatIsFinite => "((int64_t)(!!__builtin_isfinite(" + a[0] + ")))",
+    BIntId => "(" + a[0] + ")",
+    _ => "?",
+  };
+}
+
+function switchC(o: Operand, cases: SwitchCase[], d: usize): string {
+  let s = "switch (" + opC(o) + ") {";
+  for (const k of cases) {
+    s += " case " + k.value.toString() + ": goto B" + u(k.target) + ";";
+  }
+  s += " default: goto B" + u(d) + "; }";
+  return s;
+}
+
+// The `x = ..;` or `..;` statement of a call-like expression with an optional destination.
+function assignOpt(d: Option<usize>, code: string): string {
+  return match (d) {
+    Some(x) => lname(x) + " = " + code + ";",
+    None => code + ";",
+  };
+}
+
+// ---------------------------------------------------------------- the emitter
+
+// The function being emitted is one of the program and one of the symbol table; its parameters are declared locals.
+@Invariant(this.fi < this.prog.functions.length && this.syms.count() == this.prog.functions.length)
+@Invariant(this.f.paramCount <= this.f.locals.length)
+export class CFunctionEmitter {
+  private syms: CSymbols;
+  private prog: MProgram;
+  private fi: usize;
+  private f: MFunction;
+  private lines: string[];
+
+  constructor(syms: CSymbols, prog: MProgram, fi: usize) {
+    this.syms = syms;
+    this.prog = prog;
+    this.fi = fi;
+    this.f = prog.functions[fi];
+    this.lines = [];
+  }
+
+  private ty(l: usize): MType {
+    return this.f.locals[l].ty;
+  }
+
+  private opTy(o: Operand): MType {
+    return match (o) {
+      OLocal(l) => this.f.locals[l].ty,
+      OInt(_) => MInt,
+      OUsize(_) => MUsize,
+      OBool(_) => MBool,
+      OFloat(_) => MFloat,
+      OStr(_) => MRef,
+    };
+  }
+
+  private slotOf(o: Operand): string {
+    return toSlot(this.opTy(o), opC(o));
+  }
+
+  private maskOf(os: Operand[]): usize {
+    let refs: bool[] = [];
+    for (const o of os) {
+      refs.push(isRefT(this.opTy(o)));
+    }
+    return refMask(refs);
+  }
+
+  private instr(i: Instr): string {
+    return match (i) {
+      ICopy(d, o) => lname(d) + " = " + opC(o) + ";",
+      IMove(d, s) => lname(d) + " = " + lname(s) + ";",
+      IBorrow(d, s) => lname(d) + " = " + lname(s) + ";",
+      IDup(d, o) => lname(d) + " = orin_dup(" + opC(o) + ");",
+      IRelease(x) => "orin_release(" + lname(x) + ");",
+      IUnary(d, op, o) => lname(d) + " = " + unaryC(op, isUsizeT(this.ty(d)), isFloatT(this.ty(d)), opC(o)) + ";",
+      IBinary(d, op, a, b) => lname(d) + " = "
+          + binaryC(op, isRefT(this.opTy(a)), isUsizeT(this.opTy(a)), isFloatT(this.opTy(a)), opC(a), opC(b)) + ";",
+      ICall(d, g, args) => this.call(d, g, args),
+      IBuiltin(d, b, args) => match (d) {
+        Some(x) => lname(x) + " = " + builtinC(b, args.map(opC), this.ty(x)) + ";",
+        None => builtinC(b, args.map(opC), MVoid) + ";",
+      },
+      IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
+      IArrayExtend(x, y) => lname(x) + " = orin_array_extend(" + lname(x) + ", " + opC(y) + ");",
+      IStructNew(d, tag, slots) => this.structNew(d, tag, slots),
+      INullary(d, t) => lname(d) + " = orin_nullary(" + u(t) + ");",
+      ITag(d, o) => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
+      IGetField(d, o, k) => lname(d) + " = " + fromSlot(this.ty(d), "orin_struct_get(" + opC(o) + ", " + u(k) + ")") + ";",
+      ISetField(x, k, v) => "orin_mir_struct_replace(" + lname(x) + ", " + u(k) + ", " + this.slotOf(v) + ");",
+      ITakeField(d, x, k) => lname(d) + " = ORIN_REF(orin_mir_struct_take(" + lname(x) + ", " + u(k) + "));",
+      IPutField(x, k, s) => "orin_struct_set(" + lname(x) + ", " + u(k) + ", ORIN_SLOT(" + lname(s) + "));",
+      IMakeUnique(x) => lname(x) + " = orin_make_unique(" + lname(x) + ");",
+      IArrayNew(d, r, es) => this.arrayNew(d, r, es),
+      IArrayGet(d, a, k) => lname(d) + " = " + fromSlot(this.ty(d), "orin_array_at(" + opC(a) + ", " + opC(k) + ")") + ";",
+      IArraySet(x, k, v) => "orin_mir_array_replace(" + lname(x) + ", " + opC(k) + ", " + this.slotOf(v) + ");",
+      IArrayTake(d, x, k) => lname(d) + " = ORIN_REF(orin_mir_array_take(" + lname(x) + ", " + opC(k) + "));",
+      IArrayPut(x, k, s) => "orin_mir_array_put(" + lname(x) + ", " + opC(k) + ", ORIN_SLOT(" + lname(s) + "));",
+      IArrayPush(x, v) => lname(x) + " = orin_mir_array_push(" + lname(x) + ", " + this.slotOf(v) + ");",
+      IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); " + lname(d) + " = orin_array_pop(" + lname(x) + ");",
+      IClosure(d, g, caps) => this.closure(d, g, caps),
+      ICallIndirect(d, c, args) => this.callThrough(d, c, args, "(uintptr_t)orin_struct_get(" + opC(c) + ", 0)"),
+      IIface(d, vt, v) => this.iface(d, vt, v),
+      ICallVirtual(d, r, slot, args) => this.callThrough(
+        d,
+        r,
+        args,
+        "(((void *const *)(uintptr_t)orin_struct_get(" + opC(r) + ", 0))[" + u(slot) + "])",
+      ),
+    };
+  }
+
+  // A direct call; an in/out callee (docs/mir.md v1.10) stores its final receiver through the extra pointer argument.
+  @Requires(g < this.prog.functions.length)
+  private call(d: Option<usize>, g: usize, args: Operand[]): string {
+    let cargs = args.map(opC);
+    if (this.prog.functions[g].inout) {
+      cargs.push("&" + opC(args[0]));
+    }
+    return assignOpt(d, this.syms.name(g) + "(" + cargs.join(", ") + ")");
+  }
+
+  private structNew(d: usize, tag: usize, slots: Operand[]): string {
+    const n = lname(d);
+    let s = n + " = orin_struct_new(" + u(tag) + ", " + u(slots.length) + ", " + u(this.maskOf(slots)) + "ULL);";
+    let k: usize = 0;
+    for (const o of slots) {
+      s += " orin_struct_init(" + n + ", " + u(k) + ", " + this.slotOf(o) + ");";
+      k += 1;
+    }
+    return s;
+  }
+
+  private arrayNew(d: usize, isRef: bool, es: Operand[]): string {
+    const n = lname(d);
+    let s = n + " = orin_array_new(" + u(es.length) + ", " + (isRef ? "1" : "0") + ");";
+    for (const o of es) {
+      s += " orin_array_push(" + n + ", " + this.slotOf(o) + ");";
+    }
+    return s;
+  }
+
+  // A closure is a struct `{ code pointer (scalar slot 0), environment (reference slot 1) }`; the environment is a struct
+  // holding the captured values in order (the immortal nullary object when nothing is captured). docs/mir.md v1.3,
+  // ADR-0011.
+  @Requires(g < this.prog.functions.length)
+  private closure(d: usize, g: usize, caps: Operand[]): string {
+    const n = lname(d);
+    let s = "";
+    let env = "orin_nullary(0)";
+    if (caps.length > 0) {
+      s += "{ OrinObj *env_ = orin_struct_new(0, " + u(caps.length) + ", " + u(this.maskOf(caps)) + "ULL);";
+      let k: usize = 0;
+      for (const o of caps) {
+        s += " orin_struct_init(env_, " + u(k) + ", " + this.slotOf(o) + ");";
+        k += 1;
+      }
+      s += " ";
+      env = "env_";
+    }
+    s += n + " = orin_struct_new(0, 2, 2ULL); orin_struct_init(" + n + ", 0, (uint64_t)(uintptr_t)&" + this.syms.name(g)
+        + "); orin_struct_init(" + n + ", 1, ORIN_SLOT(" + env + "));";
+    if (caps.length > 0) {
+      s += " }";
+    }
+    return s;
+  }
+
+  // Call through a closure or a vtable entry (`code` is the function pointer as an integer or `void *`): cast to the C
+  // type implied by the operand and destination types, the environment / boxed value (slot 1 of `r`) first.
+  private callThrough(d: Option<usize>, r: Operand, args: Operand[], code: string): string {
+    const c = opC(r);
+    const rt = match (d) {
+      Some(x) => cty(this.ty(x)),
+      None => "void",
+    };
+    let sig = rt + " (*)(OrinObj *";
+    let cargs: string[] = ["ORIN_REF(orin_struct_get(" + c + ", 1))"];
+    for (const a of args) {
+      sig += ", " + cty(this.opTy(a));
+      cargs.push(opC(a));
+    }
+    sig += ")";
+    return assignOpt(d, "((" + sig + ")" + code + ")(" + cargs.join(", ") + ")");
+  }
+
+  // An interface value (docs/mir.md v1.5, ADR-0019): a struct `{ vtable pointer (scalar slot 0), boxed value (reference
+  // slot 1) }`; the vtable is the static table `orin_vtN`.
+  @Requires(vt < this.syms.vtables())
+  private iface(d: usize, vt: usize, v: Operand): string {
+    const n = lname(d);
+    return n + " = orin_struct_new(0, 2, 2ULL); orin_struct_init(" + n + ", 0, (uint64_t)(uintptr_t)orin_vt" + u(vt)
+        + "); orin_struct_init(" + n + ", 1, " + this.slotOf(v) + ");";
+  }
+
+  private term(t: Terminator): string {
+    return match (t) {
+      TGoto(b) => "goto B" + u(b) + ";",
+      TBranch(c, a, b) => "if (" + opC(c) + ") goto B" + u(a) + "; else goto B" + u(b) + ";",
+      TSwitch(o, cases, d) => switchC(o, cases, d),
+      TReturn(o) => {
+        const out = this.f.inout ? "{ *orin_out = l0; " : "";
+        const end = this.f.inout ? " }" : "";
+        return match (o) {
+          Some(x) => out + "return " + opC(x) + ";" + end,
+          None => out + "return;" + end,
+        };
+      },
+      TTrap(m) => "orin_trap(" + cString(m) + ");",
+    };
+  }
+
+  // Emits the whole function: signature, the non-parameter locals (zero-initialised), the blocks.
+  @Requires(this.lines.length == 0)
+  @Ensures(this.lines.length == 2 + (this.f.locals.length - this.f.paramCount) + linesOfBlocks(this.f.blocks))
+  run(): void {
+    const f = this.f;
+    this.lines.push(this.syms.sig(this.fi) + " {\n");
+    let i = f.paramCount;
+    while (i < f.locals.length) {
+      const l = f.locals[i];
+      const init = isRefT(l.ty) ? "NULL" : "0";
+      this.lines.push("  " + cty(l.ty) + " " + lname(i) + " = " + init + "; /* " + commentSafe(l.name) + " */\n");
+      i += 1;
+    }
+    let b: usize = 0;
+    for (const blk of f.blocks) {
+      this.lines.push("B" + u(b) + ":;\n");
+      for (const ins of blk.instrs) {
+        this.lines.push("  " + this.instr(ins) + "\n");
+      }
+      this.lines.push("  " + this.term(blk.term) + "\n");
+      b += 1;
+    }
+    this.lines.push("}\n");
+  }
+
+  // The text emitted so far.
+  text(): string {
+    return this.lines.join("");
+  }
+}
+
+// Number of lines the blocks take: a label, the instructions, the terminator.
+export function linesOfBlocks(blocks: MBlock[]): usize {
+  return blocks.reduce((n: usize, b: MBlock) => n + b.instrs.length + 2, 0);
+}
+
+// The C definition of function `fi`: a function of the symbol table and the program only (no state is shared between
+// two calls), so the functions of a program can be emitted independently and joined in index order. The text starts
+// with the function's own signature and refers only to symbols the table declares.
+@Requires(fi < prog.functions.length && syms.count() == prog.functions.length)
+@Ensures(result.startsWith(syms.sig(fi) + " {\n") && result.endsWith("}\n"))
+@Ensures(refsDeclared(result, syms))
+export function emitCFunction(syms: CSymbols, prog: MProgram, fi: usize): string {
+  let e = new CFunctionEmitter(syms, prog, fi);
+  e.run();
+  return e.text();
+}

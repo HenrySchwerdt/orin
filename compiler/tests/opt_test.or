@@ -1,0 +1,413 @@
+// Unit tests of the MIR optimiser (rewrite step 3d): the block-rewrite classes, every pass on hand-built MIR (the result is
+// checked by the ownership verifier and by the pass contracts), the parameter-mode inference, pruning, the well-formedness
+// predicates, and `optimize` end to end on a program checked from source. Run:
+// `orin test compiler/tests/opt_test.or --runtime runtime`. `orin test` checks contracts at run time, so the `@Requires` /
+// `@Ensures` of every pass (`passKept`, the instruction-count claims, `pairsKept`, `prunedOk`) run on every call below.
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
+import { Span, SourceFile, span } from "../diag";
+import { BArrConcat, BStrLength } from "../hir";
+import { MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, plainBlock } from "../mir";
+import { loadWithOverlay } from "../loader";
+import { check } from "../check";
+import { lower } from "../lower";
+import { verify } from "../verify";
+import {
+  optimize, inferModes, ParamInference, closureTargets, allBorrowed, sameFunctions, pruneProgram, prunedOk,
+  insertCallDups, peephole, rewriteParam, scanSites, paramLiveness, livenessSolved, usedFlags, inplaceSlots,
+  takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink, RewritePlan, fnShapeOk, fnWellFormed,
+  progWellFormed, passKept, effects, instrCount, dupCount, releaseCount, concatCount, extendCount, getterCount,
+  onlyEdgeBlocksAdded, indices,
+} from "../opt";
+
+// ---------------------------------------------------------------- builders
+
+function lr(n: string): MLocal {
+  return MLocal { name: n, ty: MRef };
+}
+
+function li(n: string): MLocal {
+  return MLocal { name: n, ty: MInt };
+}
+
+function lb(n: string): MLocal {
+  return MLocal { name: n, ty: MBool };
+}
+
+function bk(instrs: Instr[], term: Terminator): MBlock {
+  return plainBlock(instrs, term);
+}
+
+function borrowed(n: usize): bool[] {
+  let out: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(false);
+    i += 1;
+  }
+  return out;
+}
+
+function fn(name: string, params: usize, locals: MLocal[], blocks: MBlock[]): MFunction {
+  return MFunction {
+    name: name,
+    paramCount: params,
+    paramOwned: borrowed(params),
+    inout: false,
+    locals: locals,
+    ret: MVoid,
+    blocks: blocks,
+  };
+}
+
+function prog(fs: MFunction[]): MProgram {
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: [], inlineFns: [] };
+}
+
+function straight(locals: MLocal[], instrs: Instr[]): MFunction {
+  return fn("f", 0, locals, [bk(instrs, TReturn(None))]);
+}
+
+function verifies(p: MProgram): bool {
+  return verify(p).errors.length == 0;
+}
+
+function sp(a: usize): Span {
+  return span(0, a, a + 1);
+}
+
+function isMove(i: Instr, d: usize, s: usize): bool {
+  return match (i) {
+    IMove(a, b) => a == d && b == s,
+    _ => false,
+  };
+}
+
+// ---------------------------------------------------------------- the block-rewrite classes
+
+@Test
+function blockSinkKeepsSpansInStep(): void {
+  let s = new BlockSink();
+  s.emit(IRelease(0), sp(1));
+  s.emitAll([IRelease(1), IRelease(2)], sp(5));
+  assertEqUsize(s.size(), 3, "three instructions");
+  s.drop(1);
+  const b = s.finish(TReturn(None), sp(9));
+  assertEqUsize(b.instrs.length, 2, "one dropped");
+  assertEqUsize(b.spans.length, 2, "spans dropped with it");
+  assertEqUsize(b.spans[1].start, 5, "emitAll gives every instruction the span");
+  assertEqUsize(b.termSpan.start, 9, "the terminator span");
+}
+
+@Test
+function rewritePlanReplacesRemovesAndKeeps(): void {
+  const blk = MBlock {
+    instrs: [IRelease(0), IRelease(1), IRelease(2)],
+    spans: [sp(0), sp(1), sp(2)],
+    term: TReturn(None),
+    termSpan: sp(3),
+  };
+  let plan = new RewritePlan(3);
+  assertEqUsize(plan.changes(), 0, "nothing planned");
+  assertEqUsize(plan.outLength(), 3, "an empty plan keeps the block");
+  plan.replace(0, [IMove(5, 6), IRelease(5)]);
+  plan.remove(2);
+  assert(plan.touched(0) && !plan.touched(1) && plan.touched(2), "touched flags");
+  assertEqUsize(plan.changes(), 2, "two changes");
+  const out = plan.apply(blk);
+  assertEqUsize(out.instrs.length, 3, "two replace one, one removed, one kept");
+  assert(isMove(out.instrs[0], 5, 6), "the replacement comes first");
+  assertEqUsize(out.spans[1].start, 0, "a replacement takes the span of what it replaces");
+  assertEqUsize(out.spans[2].start, 1, "a kept instruction keeps its span");
+}
+
+// ---------------------------------------------------------------- stage 3: dup / release cancellation
+
+@Test
+function peepholeTurnsDupAndReleaseIntoAMove(): void {
+  const f = straight([lr("a"), lr("d")], [IDup(0, OStr(0)), IDup(1, OLocal(0)), IRelease(0), IRelease(1)]);
+  const g = peephole(f);
+  assertEqUsize(g.blocks[0].instrs.length, 3, "one instruction less");
+  assert(isMove(g.blocks[0].instrs[1], 1, 0), "d = move a");
+  assertEqUsize(dupCount(g), 1, "one dup left");
+  assertEqUsize(releaseCount(g), 1, "one release left");
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+@Test
+function peepholeCancelsADupReleasedRightAway(): void {
+  const f = straight(
+    [lr("a"), lr("d"), li("n")],
+    [IDup(0, OStr(0)), IDup(1, OLocal(0)), IRelease(1), IBuiltin(Some(2), BStrLength, [OLocal(0)]), IRelease(0)],
+  );
+  const g = peephole(f);
+  assertEqUsize(g.blocks[0].instrs.length, 3, "the dup and its release are gone");
+  assertEqUsize(dupCount(f) - dupCount(g), releaseCount(f) - releaseCount(g), "removed in pairs");
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+@Test
+function peepholeKeepsADupWhoseSourceIsUsedBeforeTheRelease(): void {
+  const f = straight(
+    [lr("a"), lr("d"), li("n")],
+    [IDup(0, OStr(0)), IDup(1, OLocal(0)), IBuiltin(Some(2), BStrLength, [OLocal(0)]), IRelease(0), IRelease(1)],
+  );
+  const g = peephole(f);
+  // `release a` is preceded by a use of a, so `d = dup a` cannot become a move; `release d` is found though
+  assertEqUsize(dupCount(g), dupCount(f) - 1, "only the d pair is cancelled");
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+// ---------------------------------------------------------------- stage 4: slots, chains, concatenation
+
+@Test
+function aFieldUpdatedThroughADupBecomesTakeAndPut(): void {
+  const f = straight([lr("x"), lr("d1"), lr("d2")], [
+    IStructNew(0, 0, [OStr(0)]),
+    IGetField(1, OLocal(0), 0),
+    IDup(2, OLocal(1)),
+    IStrAppend(2, OStr(0)),
+    IMakeUnique(0),
+    ISetField(0, 0, OLocal(2)),
+    IRelease(0),
+  ]);
+  assert(verifies(prog([f])), "the input verifies");
+  const g = inplaceSlots(f);
+  const is = g.blocks[0].instrs;
+  assertEqUsize(is.length, 6, "the makeunique in the window is gone");
+  assertEqUsize(dupCount(g), 0, "no retain of the slot");
+  assertEqUsize(getterCount(g), 0, "the getter became makeunique");
+  assert(
+    match (is[2]) {
+      ITakeField(d, x, k) => d == 2 && x == 0 && k == 0,
+      _ => false,
+    },
+    "d2 = takefield x.0",
+  );
+  assert(
+    match (is[4]) {
+      IPutField(x, k, s) => x == 0 && k == 0 && s == 2,
+      _ => false,
+    },
+    "putfield x.0 = d2",
+  );
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+@Test
+function aConcatenationReleasedRightAwayBecomesArrayExtend(): void {
+  const f = straight([lr("a"), lr("b"), lr("d")], [
+    IArrayNew(0, false, [OInt(1)]),
+    IArrayNew(1, false, [OInt(2)]),
+    IBuiltin(Some(2), BArrConcat, [OLocal(0), OLocal(1)]),
+    IRelease(0),
+    IMove(0, 2),
+    IRelease(1),
+    IRelease(0),
+  ]);
+  assert(verifies(prog([f])), "the input verifies");
+  const g = inplaceSlots(f);
+  assertEqUsize(concatCount(g), 0, "no concatenation");
+  assertEqUsize(extendCount(g), 1, "one arrayextend");
+  assertEqUsize(instrCount(g), instrCount(f) - 2, "the release and the move are gone");
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+@Test
+function aNestedSlotIsTakenThroughTheWholePath(): void {
+  const f = straight([lr("x"), lr("inner"), lr("r1"), lr("r2"), lr("d"), lr("t1")], [
+    IStructNew(1, 0, [OStr(0)]),
+    IStructNew(0, 0, [OLocal(1)]),
+    IGetField(2, OLocal(0), 0),
+    IGetField(3, OLocal(2), 0),
+    IDup(4, OLocal(3)),
+    IStrAppend(4, OStr(0)),
+    IMakeUnique(0),
+    ITakeField(5, 0, 0),
+    IMakeUnique(5),
+    ISetField(5, 0, OLocal(4)),
+    IPutField(0, 0, 5),
+    IRelease(0),
+  ]);
+  assert(verifies(prog([f])), "the input verifies");
+  const g = takePutChains(f);
+  assertEqUsize(instrCount(g), instrCount(f) - 2, "the two getters are gone");
+  assertEqUsize(dupCount(g), 0, "the dup became a take");
+  assertEqUsize(getterCount(g), 0, "no borrow of the path is left");
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+// ---------------------------------------------------------------- stage 1: parameter modes
+
+// keep(p): retains p at its last use; pass(q): hands q to keep; boxed(r): like keep, but a closure target.
+function modesProgram(): MProgram {
+  const mainF = fn("main", 0, [], [bk([], TReturn(None))]);
+  const pass = fn("pass", 1, [lr("q")], [bk([ICall(None, 2, [OLocal(0)])], TReturn(None))]);
+  const keep = fn("keep", 1, [lr("p"), lr("d")], [bk([IDup(1, OLocal(0)), IRelease(1)], TReturn(None))]);
+  const boxed = fn("boxed", 1, [lr("env"), lr("d")], [bk([IDup(1, OLocal(0)), IRelease(1)], TReturn(None))]);
+  const user = fn("user", 0, [lr("c")], [bk([IClosure(0, 3, []), IRelease(0)], TReturn(None))]);
+  return prog([mainF, pass, keep, boxed, user]);
+}
+
+@Test
+function ownershipFlowsBackwardsThroughCallsToAFixpoint(): void {
+  const p = modesProgram();
+  assert(progWellFormed(p) && allBorrowed(p), "lowering-shaped input");
+  const pinned = closureTargets(p);
+  assert(pinned[3] && !pinned[2], "only the closure target is pinned");
+  const modes = inferModes(p, pinned);
+  assert(modes[2][0], "keep consumes its parameter: owned");
+  assert(modes[1][0], "pass hands its parameter to an owned position: owned (second round)");
+  assert(!modes[3][0], "a closure target keeps borrowed parameters");
+}
+
+@Test
+function theInferenceIsStableAfterRun(): void {
+  const p = modesProgram();
+  const sites = p.functions.map(f => indices(f.paramCount).map(k => scanSites(f, k)));
+  let inf = new ParamInference(sites, closureTargets(p));
+  assert(!inf.stable(), "keep wants to be owned before the run");
+  inf.run();
+  assert(inf.stable(), "no parameter wants to flip after the run");
+}
+
+@Test
+function anOwnedParameterIsReleasedOnTheEdgeWhereItDies(): void {
+  // f(p, c): if c { len(p) } ; return   -- p is live only into block 1
+  const f = MFunction {
+    name: "f",
+    paramCount: 2,
+    paramOwned: [true, false],
+    inout: false,
+    locals: [lr("p"), lb("c"), li("n")],
+    ret: MVoid,
+    blocks: [
+      bk([], TBranch(OLocal(1), 1, 2)),
+      bk([IBuiltin(Some(2), BStrLength, [OLocal(0)])], TGoto(2)),
+      bk([], TReturn(None)),
+    ],
+  };
+  const p = prog([f]);
+  const anc = ancestors(f);
+  assert(ancestorsClosed(f, anc), "ancestors are closed");
+  const lv = paramLiveness(f, anc, 0);
+  assert(livenessSolved(f, lv, usedFlags(f, anc, 0)), "the liveness equations hold");
+  assert(lv.liveIn[1] && !lv.liveIn[2], "live into the use only");
+  const g = rewriteParam(p, f, 0);
+  assertEqUsize(g.blocks.length, 4, "one edge block (0 -> 2)");
+  assert(onlyEdgeBlocksAdded(f, g, 0), "the new block releases p and continues");
+  assertEqUsize(releaseCount(g), 2, "released after the use and on the edge");
+  assert(verifies(prog([g])), "the result verifies");
+}
+
+// ---------------------------------------------------------------- what the contracts check
+
+@Test
+function passKeptRejectsADroppedOrReorderedCall(): void {
+  const a = fn("f", 0, [], [bk([ICall(None, 1, []), ICall(None, 2, [])], TReturn(None))]);
+  const dropped = fn("f", 0, [], [bk([ICall(None, 1, [])], TReturn(None))]);
+  const swapped = fn("f", 0, [], [bk([ICall(None, 2, []), ICall(None, 1, [])], TReturn(None))]);
+  assert(passKept(a, a), "the identity keeps everything");
+  assert(!passKept(a, dropped), "a dropped call is caught");
+  assert(!passKept(a, swapped), "a reordered call is caught");
+  assertEqUsize(effects(a).length, 2, "two effects");
+  let renamed = a;
+  renamed.paramOwned = [true];
+  assert(!passKept(a, renamed), "a changed signature is caught");
+}
+
+@Test
+function wellFormednessCatchesDanglingIndices(): void {
+  const ok = prog([straight([lr("a")], [ICopy(0, OStr(0))])]);
+  assert(progWellFormed(ok), "well formed");
+  assert(!progWellFormed(prog([straight([lr("a")], [ICopy(0, OStr(1))])])), "a string past the table");
+  assert(!progWellFormed(prog([straight([lr("a")], [ICopy(1, OStr(0))])])), "an undeclared local");
+  assert(!progWellFormed(prog([straight([], [ICall(None, 7, [])])])), "a call of a function that does not exist");
+  assert(!fnShapeOk(fn("f", 0, [], [bk([], TGoto(3))])), "a branch out of the function");
+}
+
+@Test
+function pruningDropsOnlyUnreachablePreludeCode(): void {
+  const mainF = fn("main", 0, [], [bk([ICall(None, 2, [])], TReturn(None))]);
+  const dead = fn("$std/x.unused", 0, [], [bk([], TReturn(None))]);
+  const used = fn("$std/x.used", 0, [], [bk([], TReturn(None))]);
+  const userDead = fn("helper", 0, [], [bk([], TReturn(None))]);
+  const p = prog([mainF, dead, used, userDead]);
+  const r = pruneProgram(p);
+  assertEqUsize(r.functions.length, 3, "the unreachable prelude function is dropped");
+  assertEqString(r.functions[1].name, "$std/x.used", "order kept");
+  assertEqString(r.functions[2].name, "helper", "user functions are never dropped");
+  assert(
+    match (r.functions[0].blocks[0].instrs[0]) {
+      ICall(_, g, _) => g == 1,
+      _ => false,
+    },
+    "the call is renumbered",
+  );
+  assert(prunedOk(p, r), "prunedOk");
+  assert(!prunedOk(p, prog([mainF])), "dropping a user function is caught");
+}
+
+// ---------------------------------------------------------------- end to end
+
+function optimized(fs: FsGrant, text: string): Option<MProgram> {
+  const o = loadWithOverlay(fs, "/virt/a.or", [SourceFile { path: "/virt/a.or", text: text }]);
+  return match (o.program) {
+    Some(p) => {
+      const r = check(p, o.sm);
+      return r.isOk() ? Some(lower(r.unwrap())) : None;
+    },
+    None => None,
+  };
+}
+
+export function sampleSource(): string {
+  return "class Counter {\n  n: int = 0;\n  label: string = \"\";\n  next(): int {\n    this.n += 1;\n    return this.n;\n  }\n}\n"
+      + "function keep(s: string): string {\n  return s;\n}\n"
+      + "function grow(xs: int[], k: int): int[] {\n  let a = xs;\n  a = a.concat([k]);\n  return a;\n}\n"
+      + "function main(): void {\n  let c = new Counter();\n  let i = 0;\n  while (i < 3) {\n    const v = c.next();\n"
+      + "    c.label = c.label + \"x\" + v.toString();\n    i += 1;\n  }\n  console.log(keep(c.label));\n"
+      + "  console.log(grow([1, 2], 3).length.toString());\n}\n";
+}
+
+@Test
+function optimizeKeepsTheProgramAndTheVerifierAcceptsIt(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const m = optimized(fs, sampleSource());
+      assert(m.isSome(), "checks and lowers");
+      const p = m.unwrap();
+      assert(allBorrowed(p) && progWellFormed(p), "lowering output");
+      const q = optimize(p);
+      assert(sameFunctions(p, q) && progWellFormed(q), "the same functions, well formed");
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      assert(q.functions.some(f => f.inout), "the mutating method with a result became in/out");
+      assert(q.functions.some(f => f.paramOwned.some(o => o)), "some parameter became owned");
+      const r = pruneProgram(q);
+      assert(prunedOk(q, r), "pruning keeps the user functions");
+      assertEqUsize(verify(r).errors.length, 0, "the pruned program verifies");
+    },
+  );
+}
+
+@Test
+function optimizingTwiceFromTheSameInputGivesTheSameProgram(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = optimized(fs, sampleSource()).unwrap();
+      const a = optimize(p);
+      const b = optimize(p);
+      assertEqUsize(instrCount(a.functions[0]), instrCount(b.functions[0]), "deterministic");
+      let i: usize = 0;
+      while (i < a.functions.length) {
+        assertEqUsize(instrCount(a.functions[i]), instrCount(b.functions[i]), "same instruction count per function");
+        assertEqBool(a.functions[i].inout, b.functions[i].inout, "same in/out flags");
+        i += 1;
+      }
+    },
+  );
+}

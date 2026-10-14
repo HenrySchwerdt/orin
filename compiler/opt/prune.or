@@ -12,6 +12,8 @@
 // `renumber` below.
 
 import { MProgram, MFunction, MBlock, Instr, MVTable } from "../mir";
+import { withBody } from "./rewrite";
+import { progWellFormed } from "./wellformed";
 
 function isPrelude(f: MFunction): bool {
   return f.name.startsWith("$") || f.name.includes("$closure");
@@ -32,30 +34,46 @@ function callees(f: MFunction): usize[] {
   return out;
 }
 
-function renumber(f: MFunction, idx: usize[]): MFunction {
-  let blocks: MBlock[] = [];
-  for (const b of f.blocks) {
-    let instrs: Instr[] = [];
-    for (const ins of b.instrs) {
-      match (ins) {
-        ICall(d, g, a) => { instrs.push(ICall(d, idx[g], a)); },
-        IClosure(d, g, caps) => { instrs.push(IClosure(d, idx[g], caps)); },
-        _ => { instrs.push(ins); }
-      }
-    }
-    blocks.push(MBlock { instrs: instrs, spans: b.spans, term: b.term, termSpan: b.termSpan });
-  }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: f.locals,
-    ret: f.ret,
-    blocks: blocks
+function renumberInstr(ins: Instr, idx: usize[]): Instr {
+  return match (ins) {
+    ICall(d, g, a) => ICall(d, idx[g], a),
+    IClosure(d, g, caps) => IClosure(d, idx[g], caps),
+    _ => ins,
   };
 }
 
+// `f` with every function index `g` replaced by `idx[g]`.
+@Ensures(result.blocks.length == f.blocks.length && result.name == f.name)
+function renumber(f: MFunction, idx: usize[]): MFunction {
+  const blocks = f.blocks.map(
+    b => MBlock { instrs: b.instrs.map(ins => renumberInstr(ins, idx)), spans: b.spans, term: b.term, termSpan: b.termSpan },
+  );
+  return withBody(f, f.locals, blocks);
+}
+
+// `r` keeps every function of `p` that is not prelude code (and `main`), in the same order, and has no other functions:
+// its names are a subsequence of `p`'s. Catches a pruning that drops a user function (the verifier and the output would
+// silently stop covering it) or reorders the functions (the symbols `orin_fn_<i>_..` would change).
+export function prunedOk(p: MProgram, r: MProgram): bool {
+  if (r.functions.length > p.functions.length || r.main >= r.functions.length) {
+    return false;
+  }
+  if (r.functions[r.main].name != p.functions[p.main].name || r.vtables.length != p.vtables.length) {
+    return false;
+  }
+  let j: usize = 0;
+  for (const f of p.functions) {
+    if (j < r.functions.length && r.functions[j].name == f.name) {
+      j += 1;
+    } else if (!isPrelude(f)) {
+      return false;
+    }
+  }
+  return j == r.functions.length;
+}
+
+@Requires(progWellFormed(p))
+@Ensures(progWellFormed(result) && prunedOk(p, result))
 export function pruneProgram(p: MProgram): MProgram {
   let live: bool[] = [];
   let work: usize[] = [];
@@ -110,13 +128,6 @@ export function pruneProgram(p: MProgram): MProgram {
     }
     i += 1;
   }
-  let vts: MVTable[] = [];
-  for (const v of p.vtables) {
-    let fs: usize[] = [];
-    for (const g of v.funcs) {
-      fs.push(idx[g]);
-    }
-    vts.push(MVTable { name: v.name, funcs: fs });
-  }
+  const vts = p.vtables.map(v => MVTable { name: v.name, funcs: v.funcs.map(g => idx[g]) });
   return MProgram { functions: fns, strings: p.strings, main: idx[p.main], vtables: vts, inlineFns: p.inlineFns };
 }
