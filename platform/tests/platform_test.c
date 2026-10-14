@@ -41,7 +41,11 @@ static void test_memory(void) {
     p = orin_platform_realloc(p, 1000);
     CHECK(p && ((unsigned char *)p)[0] == 0xAB && ((unsigned char *)p)[99] == 0xAB);
     volatile size_t huge = (size_t)-1;
-    CHECK(orin_platform_alloc(huge) == NULL); /* failure is NULL, not a crash */
+    /* The result goes through a volatile so the allocation escapes: clang may otherwise elide a malloc whose
+       result is only compared with NULL and fold the comparison to false (seen on macOS). */
+    void *volatile hp = orin_platform_alloc(huge);
+    CHECK(hp == NULL); /* failure is NULL, not a crash */
+    orin_platform_free(hp);
     void *volatile vp = p;
     void *q = orin_platform_realloc(vp, huge);
     CHECK(q == NULL && ((unsigned char *)vp)[50] == 0xAB); /* old block still valid */
