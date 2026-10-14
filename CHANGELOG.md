@@ -33,6 +33,12 @@
   ThreadSanitizer and ASan + UBSan (`tools/test_concurrency.sh`). Example `examples/parallel_map.or`. Assurance: the C parts are
   `TESTED_ONLY` (ThreadSanitizer, no proof) until R3 / R4 (docs/assurance.md C17). Not in stage 0: `async` / `await`, cancellation,
   timeouts, deadlock detection, an M:N scheduler, a concurrent HTTP server (`std:net` has not landed).
+- **Performance defects of the std fixed** (docs/benchmarks.md "Performance defects found while building the std"): `x = x + e` /
+  `x = x.concat(e)` on fields, elements and nested places are in-place (take/put of the slot, new MIR instruction `IArrayExtend`;
+  74 s -> 13 ms on bench/appends); mutating methods with a result no longer allocate a pair or copy a field receiver (MIR v1.10 in/out
+  receivers, `compiler/opt/pairs.or`; call loops 8-13x, std:http parse 2x); built-ins `bytesToString(u8[], start, len)` and
+  `stringToBytes(s)` (std:bytes / std:http use them: 8x); verifier definitions no longer scan all locals; LLVM `noundef` / `nonnull`.
+  New benchmarks (appends, mutres, bytesstr, http_parse, sortedmap, pqueue), Rust and Java counterparts in tools/bench.py.
 - **Capabilities, Stage B: transitive effect inference (ADR-0037 D2, graph 2; no new syntax).** The compiler now infers, for
   every function, method and constructor, the set of primitive effects it may perform *transitively* (`Fs.ReadFile`,
   `Console.Write`, `Process.Spawn`, `Clock.Now`, ...; direction INPUT / OUTPUT / CONTROL; grant family), with evidence (MUST: a

@@ -177,6 +177,24 @@ function callMsg(
     }
     i += 1;
   }
+  if (g.inout) {
+    // v1.10: the call consumes argument 0 and redefines that local with the callee's final receiver
+    match (args[0]) {
+      OLocal(x) => {
+        match (dst) {
+          Some(d) => {
+            if (d == x) {
+              return "ICall of an inout function: the destination must not be the in/out argument";
+            }
+          },
+          None => {},
+        }
+      },
+      _ => {
+        return "ICall of an inout function: argument 0 must be a local (it receives the updated value)";
+      },
+    }
+  }
   const rc = tyClass(g.ret);
   return match (dst) {
     None => "",
@@ -336,7 +354,9 @@ function handleMsg(f: MFunction, ins: Instr): string {
         }
         match (dst) {
           Some(d) => {
-            return localClass(f, d) == CHandle ? "" : "grant adoption: the destination must be a handle local";
+            return localClass(f, d) == CHandle
+                ? ""
+                : "grant adoption: the destination must be a handle local";
           },
           None => {
             return "grant adoption: the handle must be bound to a local (it would never be revoked)";
@@ -449,6 +469,12 @@ function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
         return "IStrAppend: needs reference operands";
       }
       return isLocal(y, x) ? "IStrAppend: appending a string to itself" : "";
+    },
+    IArrayExtend(x, y) => {
+      if (!isCls(f, x, CRef) || !refLocalOp(f, y)) {
+        return "IArrayExtend: needs reference locals";
+      }
+      return isLocal(y, x) ? "IArrayExtend: extending an array by itself" : "";
     },
     IStructNew(d, _, slots) => {
       if (isCls(f, d, CRef) && !noHandles(f, slots)) {
@@ -584,6 +610,9 @@ export function wfFunction(f: MFunction): string {
       return "owned parameter `" + f.locals[i].name + "` is not a reference";
     }
     i += 1;
+  }
+  if (f.inout && (f.paramCount == 0 || !f.paramOwned[0])) {
+    return "inout function: parameter 0 must be an owned reference parameter (v1.10)";
   }
   if (tyClass(f.ret) == CHandle) {
     return "function returns a resource handle (a handle cannot be returned)";

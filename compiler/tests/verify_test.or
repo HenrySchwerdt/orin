@@ -18,9 +18,9 @@ import {
 import {
   verify, VerifyReport, VerifyIssue, blockInStates, State, LState, HoleEntry, HoleKey, mk, joinLs,
   lsLeq, lsEq, isKind, isLive, holeAnyIn, holeHasIn, holeMayIn, holesInRange, borrowsFlatIn,
-  Fixpoint, Transfer, Cx, step, noRevival, issuesAt, issuePlaced, reportPlaced, reachClosed,
-  statesSized, wfFunction, wfInstr, KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit,
-  KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
+  Fixpoint, Transfer, Cx, step, noRevival, defsOf, rootsLive, issuesAt, issuePlaced, reportPlaced,
+  reachClosed, statesSized, wfFunction, wfInstr, KDead, KOwned, KUnique, KImm, KBorrowed, KParam,
+  KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
 } from "../verify";
 
 // ---------------------------------------------------------------- builders
@@ -48,6 +48,7 @@ function fnOf(name: string, params: usize, locals: MLocal[], blocks: MBlock[]): 
     name: name,
     paramCount: params,
     paramOwned: owned,
+    inout: false,
     locals: locals,
     ret: MVoid,
     blocks: blocks,
@@ -322,10 +323,10 @@ function stepReplaysOneInstructionForTheOptimiser(): void {
   cx = step(cx, f.blocks[0].instrs[1]);
   assertEqBool(cx.st.kind(0) == KOwned && cx.st.kind(1) == KOwned, true, "dup demotes the source");
   assert(
-    noRevival(before.ls, cx.st.ls, dstOf(f.blocks[0].instrs[1])),
+    noRevival(before.ls, cx.st.ls, defsOf(p, f.blocks[0].instrs[1])),
     "only the destination came to life",
   );
-  assert(!noRevival(before.ls, cx.st.ls, None), "the destination did come to life");
+  assert(!noRevival(before.ls, cx.st.ls, []), "the destination did come to life");
 }
 
 @Test
@@ -343,13 +344,88 @@ function aPushOntoAReleasedArrayDoesNotReviveIt(): void {
 }
 
 @Test
+function anInoutCallDefinesItsReceiverArgument(): void {
+  // g(inout l0) returns its receiver; f: a = struct; g(a): `a` is consumed and re-defined Owned by the call (v1.10)
+  const g = MFunction {
+    name: "g",
+    paramCount: 1,
+    paramOwned: [true],
+    inout: true,
+    locals: [lr("r")],
+    ret: MVoid,
+    blocks: [plainBlock([], TReturn(None))],
+  };
+  const call = ICall(None, 1, [OLocal(0)]);
+  const f = fnOf(
+    "f",
+    0,
+    [lr("a")],
+    [plainBlock([IStructNew(0, 0, []), call, IRelease(0)], TReturn(None))],
+  );
+  const p = progOf([f, g]);
+  assertEqUsize(verify(p).errors.length, 0, "verifies");
+  assertEqUsize(
+    defsOf(p, call).length,
+    1,
+    "the call has no destination but defines its in/out argument",
+  );
+  assertEqUsize(defsOf(p, call)[0], 0, "local 0");
+  // a call on a released receiver is an error; the call still re-defines the receiver (Owned), which `noRevival` allows
+  // because `defsOf` lists it (with `dstOf` alone the contract of `Transfer.step` would trap here)
+  const bad = fnOf(
+    "f",
+    0,
+    [lr("a")],
+    [plainBlock([IStructNew(0, 0, []), IRelease(0), call], TReturn(None))],
+  );
+  assert(verify(progOf([bad, g])).errors.length > 0, "use of a released receiver is rejected");
+}
+
+@Test
+function aliasesHaveLiveRootsAndTheJoinAllocatesOnlyOnChange(): void {
+  assert(rootsLive([mk(KOwned, 0), mk(KBorrowed, 0)]), "an alias of an owned local");
+  assert(!rootsLive([mk(KDead, 0), mk(KBorrowed, 0)]), "an alias of a dead local");
+  const a = new State([mk(KOwned, 0), mk(KInit, 0)], []);
+  assert(a.joinIfChanged(a).isNone(), "joining a state with itself changes nothing");
+  const b = new State([mk(KDead, 0), mk(KInit, 0)], []);
+  assert(a.joinIfChanged(b).unwrap().equals(a.join(b)), "otherwise the join");
+  const h = new State([mk(KOwned, 0), mk(KInit, 0)], [hole(0, false, 1)]);
+  assert(a.joinIfChanged(h).isSome(), "a new hole is a change");
+  assert(h.joinIfChanged(a).isNone(), "a hole the state already has is not");
+}
+
+@Test
+function arrayExtendKeepsTheArrayOwnedAndReadsItsArgument(): void {
+  // a = []; b = []; arrayextend a, b; release b; release a
+  const ok = straight(
+    0,
+    [lr("a"), lr("b")],
+    [
+      IArrayNew(0, false, []),
+      IArrayNew(1, false, []),
+      IArrayExtend(0, OLocal(1)),
+      IRelease(1),
+      IRelease(0),
+    ],
+  );
+  assertEqUsize(verify(ok).errors.length + verify(ok).warnings.length, 0, "fine, nothing leaks");
+  // extending by a borrow of the array itself is rejected
+  const alias = straight(
+    0,
+    [lr("a"), lr("b")],
+    [IArrayNew(0, false, []), IBorrow(1, 0), IArrayExtend(0, OLocal(1)), IRelease(0)],
+  );
+  assert(hasMsg(verify(alias), "is borrowed from the array being extended"), "self alias");
+}
+
+@Test
 function noRevivalSeesAResurrectedLocal(): void {
   const before = [mk(KDead, 0), mk(KMaybeDead, 0)];
   const same = [mk(KDead, 0), mk(KMaybeDead, 0)];
   const revived = [mk(KDead, 0), mk(KOwned, 0)];
-  assert(noRevival(before, same, None), "unchanged");
-  assert(!noRevival(before, revived, None), "a poisoned local became Owned without a definition");
-  assert(noRevival(before, revived, Some(1)), "fine when it is the destination");
+  assert(noRevival(before, same, []), "unchanged");
+  assert(!noRevival(before, revived, []), "a poisoned local became Owned without a definition");
+  assert(noRevival(before, revived, [1]), "fine when it is the destination");
 }
 
 // ---------------------------------------------------------------- Fixpoint and reports
@@ -436,6 +512,7 @@ function reportsNameExistingPositions(): void {
     name: "g",
     paramCount: 2,
     paramOwned: [false],
+    inout: false,
     locals: [lr("p"), lr("q")],
     ret: MVoid,
     blocks: [plainBlock([], TReturn(None))],
@@ -497,6 +574,7 @@ function aCallOfAnIllFormedCalleeIsReportedNotACrash(): void {
     name: "g",
     paramCount: 2,
     paramOwned: [false, false],
+    inout: false,
     locals: [lr("p")],
     ret: MVoid,
     blocks: [plainBlock([], TReturn(None))],
@@ -518,6 +596,7 @@ function aClosureOrVtableTargetWithoutLocalsIsReportedNotACrash(): void {
     name: "g",
     paramCount: 1,
     paramOwned: [false],
+    inout: false,
     locals: [],
     ret: MVoid,
     blocks: [plainBlock([], TReturn(None))],

@@ -23,6 +23,8 @@ Mutation classes (id: injected bug -> required reaction)
   move-param          `t = move p` for a borrowed parameter p     -> ERROR
   drop-dup            delete `d = dup x`                          -> ERROR (d dead at its later use)
   extra-dup           `t = dup x` before `release x`, t unused    -> a leak WARNING (or an error)
+  inout-drop-receiver delete `l0 = move ..` in an inout function  -> ERROR (l0 must hold the receiver at return)
+  inout-release-receiver `release l0` before a return of an inout function -> ERROR (same)
 
 A mutant that is accepted without a new warning is a SURVIVOR, a finding, unless it is one of the
 explicitly classified BENIGN cases below (each has a precise, local reason). A mutant that is
@@ -55,10 +57,11 @@ class Func:
         self.header = header          # "fn3 name (params 1, owned l0) -> ref"
         self.locals = locals_         # list of (name, type)
         self.blocks = blocks          # list of [label, [instr lines], terminator line]
-        m = re.match(r"fn\d+ (.*) \(params (\d+)(?:, owned ([l0-9 ]+))?\) -> (\w+)$", header)
+        m = re.match(r"fn\d+ (.*) \(params (\d+)(?:, owned ([l0-9 ]+))?(, inout)?\) -> (\w+)$", header)
         self.name = m.group(1)
         self.nparams = int(m.group(2))
         self.owned = set(int(x[1:]) for x in (m.group(3) or "").split())
+        self.inout = bool(m.group(4))     # v1.10: parameter 0 is handed back to the caller at every return
 
     def key(self):
         return self.name + "\n" + self.render(normalise=True)
@@ -399,6 +402,16 @@ def sites(f):
                 elif nxt == "def":
                     benign = "l%d is overwritten before any use in the block" % d
                 out.append(Mut("drop-dup", f, (bi, ii), "delete `%s` (b%d i%d)" % (line, bi, ii), benign, "dead", "error"))
+    if f.inout:
+        # v1.10: parameter 0 is handed back to the caller at every return
+        for bi, (label, ins, term) in enumerate(f.blocks):
+            for ii, line in enumerate(ins):
+                if dest(line) == 0 and op(line) == "move":
+                    out.append(Mut("inout-drop-receiver", f, (bi, ii), "delete `%s` (b%d i%d)" % (line, bi, ii), None,
+                                   "must hold the updated receiver", "error"))
+            if term.startswith("return"):
+                out.append(Mut("inout-release-receiver", f, (bi, len(ins)), "release l0 before `%s` (b%d)" % (term, bi), None,
+                               "must hold the updated receiver", "error"))
     for p in range(f.nparams):
         if f.is_ref(p) and p not in f.owned:
             out.append(Mut("release-param", f, (0, 0), "release borrowed parameter l%d at entry" % p, None, "of parameter", "error"))
@@ -420,9 +433,14 @@ def apply(m):
             n = f.new_local()
             ins.insert(0, "l%d = move l%d" % (n, p))
         return f
+    if m.cls == "inout-release-receiver":
+        ins.append("release l0")
+        return f
     line = ins[ii]
     t = toks(line)
-    if m.cls == "drop-release":
+    if m.cls == "inout-drop-receiver":
+        del ins[ii]
+    elif m.cls == "drop-release":
         del ins[ii]
     elif m.cls == "extra-release":
         ins.insert(ii + 1, line)

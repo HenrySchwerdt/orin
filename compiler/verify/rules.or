@@ -40,20 +40,51 @@ export function issuesAt(
       .every(e => e.func == f.name && e.block == b && e.instr == ins && sameSpan(e.span, sp));
 }
 
-// Only a defining instruction revives a local: every local that was not live before (dead or poisoned) and is not the
-// destination `d` is in exactly the same state after.
-export function noRevival(before: LState[], after: LState[], d: Option<usize>): bool {
+// Only a defining instruction revives a local: every local that was not live before (dead or poisoned) and is not one
+// of the locals the instruction defines (`defs`) is in exactly the same state after.
+export function noRevival(before: LState[], after: LState[], defs: usize[]): bool {
   if (before.length != after.length) {
     return false;
   }
   let i: usize = 0;
   while (i < before.length) {
-    if (!isLive(before[i].k) && !lsEq(before[i], after[i]) && !(d.isSome() && d.unwrap() == i)) {
+    if (!isLive(before[i].k) && !lsEq(before[i], after[i]) && !defs.includes(i)) {
       return false;
     }
     i += 1;
   }
   return true;
+}
+
+// The locals instruction `ins` defines: its destination, and for a call of an in/out function (v1.10) the in/out
+// argument, which receives the callee's final receiver.
+export function defsOf(p: MProgram, ins: Instr): usize[] {
+  let out: usize[] = match (dstOf(ins)) {
+    Some(d) => [d],
+    None => [],
+  };
+  match (ins) {
+    ICall(_, g, args) => {
+      if (g < p.functions.length && p.functions[g].inout && args.length > 0) {
+        match (args[0]) {
+          OLocal(x) => {
+            out.push(x);
+          },
+          _ => {},
+        }
+      }
+    },
+    _ => {},
+  }
+  return out;
+}
+
+// No alias is rooted at a Dead or scalar local: every way a local dies invalidates its aliases first, and a scalar is
+// never a root. `def` relies on it to skip the alias scan.
+export function rootsLive(ls: LState[]): bool {
+  return ls.every(
+    s => s.k != KBorrowed || s.src >= ls.length || ls[s.src].k != KDead && ls[s.src].k != KInit,
+  );
 }
 
 function slotKey(i: usize): HoleKey {
@@ -114,8 +145,8 @@ export class Transfer {
   }
 
   // Runs the whole block from the state it holds: every instruction, then the terminator. Borrows stay flat.
-  @Requires(borrowsFlatIn(this.ls))
-  @Ensures(borrowsFlatIn(this.ls))
+  @Requires(borrowsFlatIn(this.ls) && rootsLive(this.ls))
+  @Ensures(borrowsFlatIn(this.ls) && rootsLive(this.ls))
   @Ensures(this.ins == this.f.blocks[this.blk].instrs.length)
   @Ensures(this.errs.length >= old(this.errs.length) && this.warns.length >= old(this.warns.length))
   run(): void {
@@ -135,7 +166,7 @@ export class Transfer {
   @Requires(this.ins < this.f.blocks[this.blk].instrs.length)
   @Requires(wfInstr(this.prog, this.f, ins) == "")
   @Ensures(this.ins == old(this.ins))
-  @Ensures(noRevival(old(this.ls), this.ls, dstOf(ins)))
+  @Ensures(noRevival(old(this.ls), this.ls, defsOf(this.prog, ins)))
   @Ensures(this.errs.length >= old(this.errs.length) && this.warns.length >= old(this.warns.length))
   @Ensures(issuesAt(this.errs, old(this.errs.length), this.f, this.blk, this.ins))
   @Ensures(issuesAt(this.warns, old(this.warns.length), this.f, this.blk, this.ins))
@@ -148,7 +179,7 @@ export class Transfer {
   @Requires(this.ins == this.f.blocks[this.blk].instrs.length)
   @Requires(wfTerm(this.prog, this.f, t) == "")
   @Ensures(this.ins == old(this.ins))
-  @Ensures(noRevival(old(this.ls), this.ls, None))
+  @Ensures(noRevival(old(this.ls), this.ls, []))
   @Ensures(issuesAt(this.errs, old(this.errs.length), this.f, this.blk, this.ins))
   @Ensures(issuesAt(this.warns, old(this.warns.length), this.f, this.blk, this.ins))
   term(t: Terminator): void {
@@ -166,6 +197,18 @@ export class Transfer {
             this.consume(o);
           },
           None => {},
+        }
+        if (this.f.inout) {
+          // v1.10: local 0 is handed back to the caller, so it must hold an owned receiver here
+          if (ownedLike(this.kindOf(0))) {
+            this.consume(OLocal(0));
+          } else {
+            this.err(
+              "inout parameter " + this.nm(0)
+                  + " must hold the updated receiver at return, but it is "
+                  + kindName(this.kindOf(0)),
+            );
+          }
         }
         let i: usize = 0;
         while (i < this.ls.length) {
@@ -367,7 +410,7 @@ export class Transfer {
 
   // Define local d (every destination goes through here).
   private def(d: usize, k: int, src: usize): void {
-    if (d < this.f.paramCount) {
+    if (d < this.f.paramCount && !(this.f.inout && d == 0)) {
       this.err("write to parameter " + this.nm(d));
       return;
     }
@@ -383,7 +426,13 @@ export class Transfer {
         this.err("index local " + this.nm(d) + " is overwritten while it names an open hole");
       }
     }
-    this.killBorrows(d);
+    // No alias is rooted at a Dead or scalar local (`rootsLive`, a precondition of `run`): every way a local dies runs
+    // `killBorrows` first, and a scalar is never a root. Defining one has nothing to invalidate, so the scan over all
+    // locals (the verifier's hottest loop) is skipped.
+    const kd = this.kindOf(d);
+    if (kd != KDead && kd != KInit) {
+      this.killBorrows(d);
+    }
     this.set(d, k, src);
   }
 
@@ -745,6 +794,17 @@ export class Transfer {
       },
       ICall(dst, fi, args) => {
         this.callOwned(dst, args, this.prog.functions[fi].paramOwned);
+        if (this.prog.functions[fi].inout) {
+          // v1.10: argument 0 was consumed; it now holds the callee's final receiver (Owned: the callee may have kept
+          // an alias, so uniqueness is not known). Writing a parameter is an error except the in/out parameter of an
+          // inout caller (`def`).
+          match (args[0]) {
+            OLocal(x) => {
+              this.def(x, KOwned, 0);
+            },
+            _ => {},
+          }
+        }
       },
       IBuiltin(dst, b, args) => {
         this.builtin(dst, b, args);
@@ -762,6 +822,20 @@ export class Transfer {
           _ => {},
         }
         this.mutateOwned(x, "IStrAppend");
+      },
+      IArrayExtend(x, y) => {
+        this.readOp(y);
+        match (y) {
+          OLocal(l) => {
+            if (this.kindOf(l) == KBorrowed && this.ls[l].src == x) {
+              this.err(
+                "IArrayExtend: " + this.nm(l) + " is borrowed from the array being extended",
+              );
+            }
+          },
+          _ => {},
+        }
+        this.mutateOwned(x, "IArrayExtend");
       },
       IStructNew(d, _, slots) => {
         this.consumeAll(slots);
