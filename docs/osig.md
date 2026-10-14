@@ -192,6 +192,9 @@ Paths must be inside the server root.
   unknown origin, an interface method without implementation and an unresolved call are `Unknown.*` effects, never pure;
   closures are accounted for the function that creates them; an interface call is the union over all declared
   implementations. They say what may be *done*, per operation family, not on which resource, and not FFI / native code.
+- **Network (ADR-0033):** `Net.Bind` (CONTROL), `Net.Accept` (INPUT), `Net.Connect` (CONTROL; also name resolution),
+  `Stream.Read` (INPUT), `Stream.Write` (OUTPUT; also half-close), `Net.Narrow` (CONTROL) for the primitives and the
+  `std:net` functions that wrap them (`useListener`, `useAccepted`, `useConnection`, `recv`, `sendAll`, `useListen`, ...).
 - **Not modelled yet:** FFI, field reads/writes, data flow, grant chains and runtime events, resource identity,
   `std:` imports as edges. They arrive with phases 2 and 3 as additive schema versions.
 - **Renames are guesses.** Same-signature matching misses a rename with a signature change and can

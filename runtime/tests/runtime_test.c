@@ -280,6 +280,104 @@ static void test_grants(void) {
     unsetenv("ORIN_DENY");
     while (nkeep) orin_release(keep[--nkeep]);
 }
+
+/* ---- network handles (ADR-0033): forged / stale / wrong-kind handles trap; scope and policy refuse; recv stays in its capacity ---- */
+static int64_t n_host, n_net, n_lis, n_cl, n_srv;
+static void t_net_forged(void) { orin_release(orin_net_recv(0x12345, 4, 10)); }
+static void t_net_file_shaped(void) { orin_release(orin_net_recv(((int64_t)7 << 8) | 0, 4, 10)); }
+static void t_net_listener_as_stream(void) { orin_release(orin_net_recv(n_lis, 4, 10)); }
+static void t_net_stream_as_listener(void) { (void)orin_net_accept(n_srv, 10, 0); }
+static void t_net_grant_as_stream(void) { orin_release(orin_net_recv(n_net, 4, 10)); }
+static void t_net_stale(void) {
+    int64_t c = orin_net_connect(n_net, orin_str_new("127.0.0.1", 9), orin_net_port(n_lis), 1000, 0);
+    orin_net_close(c);
+    orin_release(orin_net_recv(c, 4, 10)); /* the closed slot: stale */
+}
+static void t_net_double_close(void) {
+    int64_t c = orin_net_connect(n_net, orin_str_new("127.0.0.1", 9), orin_net_port(n_lis), 1000, 0);
+    orin_net_close(c);
+    orin_net_close(c);
+}
+static void t_net_close_grant(void) { orin_net_close(n_net); }
+static void t_net_send_range(void) {
+    OrinObj *a = orin_array_new(4, 0);
+    for (int i = 0; i < 4; i++) orin_array_push(a, (uint64_t)i);
+    orin_release(orin_net_send(n_cl, a, 3, 2, 10)); /* [3, 5) of a 4 element array */
+}
+static void t_net_send_range_overflow(void) {
+    OrinObj *a = orin_array_new(4, 0);
+    orin_release(orin_net_send(n_cl, a, 1, UINT64_MAX, 10)); /* off + len wraps */
+}
+static void t_net_use_after_grant_revoked(void) {
+    int64_t g = orin_cap_net(n_host);
+    orin_cap_revoke(g);
+    (void)orin_net_listen(g, orin_str_new("127.0.0.1", 9), 0, 4, 0);
+}
+
+static void test_net_handles(void) {
+    unsetenv("ORIN_DENY");
+    n_host = orin_cap_host_root();
+    n_net = orin_cap_net(n_host);
+    int64_t ll = orin_cap_listen(n_net, S("127.0.0.1"), 0);
+    n_lis = orin_net_listen(ll, S("127.0.0.1"), 0, 8, 1);
+    CHECK(n_lis > 0 && orin_net_status(n_lis) == 0 && orin_net_port(n_lis) > 0);
+    int64_t cc = orin_cap_connect(n_net, S("127.0.0.1"), orin_net_port(n_lis), orin_net_port(n_lis));
+    n_cl = orin_net_connect(cc, S("127.0.0.1"), orin_net_port(n_lis), 1000, 1);
+    n_srv = orin_net_accept(n_lis, 1000, 1);
+    CHECK(n_cl > 0 && n_srv > 0 && orin_net_now(n_cl) > 0 && orin_net_now(n_net) > 0);
+    /* forged, wrong-kind, stale handles trap (exit 101), never reach a socket */
+    CHECK(trap_code(t_net_forged) == 101 && trap_code(t_net_file_shaped) == 101);
+    CHECK(trap_code(t_net_listener_as_stream) == 101 && trap_code(t_net_stream_as_listener) == 101 && trap_code(t_net_grant_as_stream) == 101);
+    CHECK(trap_code(t_net_stale) == 101 && trap_code(t_net_double_close) == 101 && trap_code(t_net_close_grant) == 101);
+    CHECK(trap_code(t_net_use_after_grant_revoked) == 101);
+    CHECK(trap_code(t_net_send_range) == 101 && trap_code(t_net_send_range_overflow) == 101);
+    /* a recv never returns more than the capacity it was given, and the bytes are right */
+    OrinObj *a = K(orin_array_new(10, 0));
+    for (int i = 0; i < 10; i++) orin_array_push(a, (uint64_t)(200 + i));
+    OrinObj *r = K(orin_net_send(n_cl, a, 2, 8, 1000)); /* bytes 202 .. 209 */
+    CHECK(orin_tag(r) == 0 && orin_res_unwrap(r) == 8);
+    r = K(orin_net_recv(n_srv, 3, 1000));
+    CHECK(orin_tag(r) == 0 && orin_array_len(ORIN_REF(orin_res_unwrap(r))) == 3);
+    CHECK(orin_array_at(ORIN_REF(orin_res_unwrap(r)), 0) == 202 && orin_array_at(ORIN_REF(orin_res_unwrap(r)), 2) == 204);
+    r = K(orin_net_recv(n_srv, 1 << 20, 1000)); /* huge capacity: clamped, here only 5 bytes are there */
+    CHECK(orin_tag(r) == 0 && orin_array_len(ORIN_REF(orin_res_unwrap(r))) == 5);
+    r = K(orin_net_recv(n_srv, 4, 20)); /* nothing more: a timeout is a value, not a trap */
+    CHECK(orin_tag(r) == 1 && orin_res_unwrap_err(r) == ORIN_PLATFORM_NET_TIMEOUT);
+    r = K(orin_net_recv(n_srv, 0, 20));
+    CHECK(orin_tag(r) == 1);
+    r = K(orin_net_recv(n_srv, 4, -1));
+    CHECK(orin_tag(r) == 1); /* no negative or infinite timeout */
+    CHECK(orin_net_shutdown(n_cl, 1) == 0);
+    r = K(orin_net_recv(n_srv, 4, 1000));
+    CHECK(orin_tag(r) == 1 && orin_res_unwrap_err(r) == ORIN_PLATFORM_NET_EOF);
+    OrinObj *p = K(orin_net_peer(n_srv));
+    CHECK(orin_str_len(p) > 10 && orin_str_starts_with(p, S("127.0.0.1:")));
+    /* scope: a widened narrowing reaches nothing; a listen grant cannot connect; refusals are EPERM values */
+    int64_t wide = orin_cap_listen(ll, S("0.0.0.0"), 0);
+    CHECK(orin_net_listen(wide, S("0.0.0.0"), 0, 4, 0) == -ORIN_PLATFORM_EPERM);
+    CHECK(orin_net_listen(ll, S("127.0.0.1"), 80, 4, 0) == -ORIN_PLATFORM_EPERM);
+    CHECK(orin_net_connect(ll, S("127.0.0.1"), orin_net_port(n_lis), 1000, 0) == -ORIN_PLATFORM_EPERM);
+    CHECK(orin_net_connect(cc, S("127.0.0.1"), orin_net_port(n_lis) + 1, 1000, 0) == -ORIN_PLATFORM_EPERM);
+    CHECK(orin_net_connect(cc, S("localhost"), orin_net_port(n_lis), 1000, 0) == -ORIN_PLATFORM_EPERM);
+    OrinObj *rs = K(orin_net_resolve(cc, S("localhost")));
+    CHECK(orin_tag(rs) == 1 && orin_res_unwrap_err(rs) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_net_status(-ORIN_PLATFORM_EPERM) == ORIN_PLATFORM_EPERM);
+    orin_net_close(-ORIN_PLATFORM_EPERM); /* closing a failed open is a no-op */
+    orin_net_close(n_srv), orin_net_close(n_cl), orin_net_close(n_lis);
+    orin_cap_revoke(wide), orin_cap_revoke(cc), orin_cap_revoke(ll), orin_cap_revoke(n_net);
+    /* host policy: ORIN_DENY=net refuses every operation (an EPERM value), even on a grant that is otherwise in scope */
+    setenv("ORIN_DENY", "net", 1);
+    n_host = orin_cap_host_root();
+    n_net = orin_cap_net(n_host);
+    CHECK(orin_net_listen(n_net, S("127.0.0.1"), 0, 4, 0) == -ORIN_PLATFORM_EPERM);
+    CHECK(orin_net_connect(n_net, S("127.0.0.1"), 80, 100, 0) == -ORIN_PLATFORM_EPERM);
+    int64_t nl = orin_cap_listen(n_net, S("127.0.0.1"), 0); /* narrowing a denied grant stays denied */
+    CHECK(orin_net_listen(nl, S("127.0.0.1"), 0, 4, 0) == -ORIN_PLATFORM_EPERM);
+    orin_cap_revoke(nl), orin_cap_revoke(n_net);
+    unsetenv("ORIN_DENY");
+    while (nkeep) orin_release(keep[--nkeep]);
+}
+
 #undef S
 #undef orin_fs_read_file
 #undef orin_fs_write_file
@@ -292,6 +390,7 @@ int main(int argc, char **argv) {
     test_misc();
     test_shape_traps();
     test_grants();
+    test_net_handles();
     if (failures) return 1;
     printf("ok\n");
     orin_flush();
