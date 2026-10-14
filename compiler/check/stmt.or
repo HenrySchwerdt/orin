@@ -18,7 +18,7 @@ import { checkPattern } from "./pattern";
 import {
   mk, isNop, isArrowExpr, isTrueLit, assignOpOf, compoundAllowed, condHoistErr,
 } from "./ops";
-import { Coverage, variantsOf, isLiteralScrut } from "./match";
+import { Coverage, variantsOf, isLiteralScrut, coverageKept } from "./match";
 import { allStmtsBound } from "./hirok";
 import { ExprChecker, BlockHost, BlockOut, StmtOut, MatchOut } from "./expr";
 
@@ -35,7 +35,7 @@ type ArmRes = { arm: HArm; div: bool; target: Option<Type>; covered: bool[]; wil
 function armCount(e: HExpr): usize {
   return match (e.kind) {
     XMatch(_, arms) => arms.length,
-    _ => 0
+    _ => 0,
   };
 }
 
@@ -80,7 +80,7 @@ export class StmtChecker {
       // Loop contract clauses (ADR-0012) are checked in the current scope and erased.
       const isClause = match (s.kind) {
         SContract(_) => true,
-        _ => false
+        _ => false,
       };
       if (isClause) {
         match (s.kind) {
@@ -90,10 +90,10 @@ export class StmtChecker {
               Some(h) => {
                 this.ex.fx.cexprs.push(h);
               },
-              None => {}
+              None => {},
             }
           },
-          _ => {}
+          _ => {},
         }
         continue;
       }
@@ -155,7 +155,7 @@ export class StmtChecker {
       },
       SContract(_) => {
         return Err(diag("E0200", s.span, "contract clause outside a loop context"));
-      }
+      },
     }
   }
 
@@ -183,31 +183,55 @@ export class StmtChecker {
         this.ex.fx.setCmode(cmode);
         const isDec = match (c.kind) {
           CDecreases => true,
-          _ => false
+          _ => false,
         };
         const hint: Option<Type> = isDec ? None : Some(TyBool);
         const npre = this.ex.fx.pre.length;
         const r = this.ex.check(e, hint)?;
         if (isDec) {
           if (!isIntish(r.ty)) {
-            return Err(diag("E0414", e.span, "@Decreases expects an `int` or `usize` measure, found `" + showType(this.ex.fx.env, r.ty) + "`"));
+            return Err(
+              diag(
+                "E0414",
+                e.span,
+                "@Decreases expects an `int` or `usize` measure, found `"
+                    + showType(this.ex.fx.env, r.ty) + "`",
+              ),
+            );
           }
         } else if (!isBool(r.ty)) {
-          return Err(diag("E0414", e.span, "contract expression must be `bool`, found `" + showType(this.ex.fx.env, r.ty) + "`"));
+          return Err(
+            diag(
+              "E0414",
+              e.span,
+              "contract expression must be `bool`, found `" + showType(this.ex.fx.env, r.ty) + "`",
+            ),
+          );
         }
         if (this.ex.fx.pre.length > npre) {
-          return Err(diag("E0416", e.span, "a call that mutates its receiver is not allowed in a contract expression"));
+          return Err(
+            diag(
+              "E0416",
+              e.span,
+              "a call that mutates its receiver is not allowed in a contract expression",
+            ),
+          );
         }
         const env = this.ex.fx.env;
         this.ex.fx = saved;
         this.ex.fx.adopt(env);
         return Ok(Some(r));
-      }
+      },
     }
   }
 
+  @Ensures(result.isOk() ==> this.ex.fx.declaredInScope(name.name) && !result.unwrap().div)
+  @Ensures(result.isOk() ==> this.ex.fx.locals.length > old(this.ex.fx.locals.length))
   private stmtLet(
-    mutable: bool, name: Ident, ty: Option<TypeExpr>, init: Expr
+    mutable: bool,
+    name: Ident,
+    ty: Option<TypeExpr>,
+    init: Expr,
   ): Result<StmtRes, Diagnostic> {
     if (isArrowExpr(init)) {
       this.ex.fx.pendLet = name.name;
@@ -222,7 +246,7 @@ export class StmtChecker {
       None => {
         e = this.ex.check(init, None)?;
         t = e.ty;
-      }
+      },
     }
     this.ex.fx.pendLet = "";
     if (isVoid(t)) {
@@ -236,24 +260,29 @@ export class StmtChecker {
     return Ok(StmtRes { stmt: HLet(id, e), div: false });
   }
 
+  @Ensures(result.isOk() ==> !result.unwrap().div)
   private stmtAssign(target: Expr, op: AssignOp, value: Expr): Result<StmtRes, Diagnostic> {
     const pi = this.ex.place(target)?;
     if (!pi.mutable) {
-      return Err(diag(
-        "E0401",
-        target.span,
-        "cannot assign to `" + pi.rootName + "`: it is not declared with `let`"
-      ));
+      return Err(
+        diag(
+          "E0401",
+          target.span,
+          "cannot assign to `" + pi.rootName + "`: it is not declared with `let`",
+        ),
+      );
     }
     const pty = pi.place.ty;
     const hop = assignOpOf(op);
     if (hop.isSome()) {
       if (!compoundAllowed(pty, hop.unwrap())) {
-        return Err(diag(
-          "E0410",
-          target.span,
-          "compound assignment is not defined for type `" + showType(this.ex.fx.env, pty) + "`"
-        ));
+        return Err(
+          diag(
+            "E0410",
+            target.span,
+            "compound assignment is not defined for type `" + showType(this.ex.fx.env, pty) + "`",
+          ),
+        );
       }
     }
     this.ex.fx.markMut(pi.place);
@@ -276,22 +305,29 @@ export class StmtChecker {
           return Ok(StmtRes { stmt: HBlockStmt(HBlock { stmts: [] }), div: false });
         }
         return Ok(StmtRes { stmt: HExprStmt(r), div: false });
-      }
+      },
     }
   }
 
   // `return` in an arrow function block body whose result type is still to be inferred (the first
   // `return` fixes it; later ones must agree).
+  @Ensures(result.isOk() ==> result.unwrap().div && this.ex.fx.retSeen.isSome())
   private returnInfer(span: Span, v: Option<Expr>): Result<StmtRes, Diagnostic> {
     match (v) {
       None => {
         match (this.ex.fx.retSeen) {
           Some(t) => {
             if (!isVoid(t)) {
-              return Err(diag("E0400", span, "`return;` in a closure returning `" + showType(this.ex.fx.env, t) + "`"));
+              return Err(
+                diag(
+                  "E0400",
+                  span,
+                  "`return;` in a closure returning `" + showType(this.ex.fx.env, t) + "`",
+                ),
+              );
             }
           },
-          None => {}
+          None => {},
         }
         this.ex.fx.retSeen = Some(TyVoid);
         return Ok(StmtRes { stmt: HReturn(None), div: true });
@@ -304,17 +340,18 @@ export class StmtChecker {
           },
           None => {
             r = this.ex.check(e, None)?;
-          }
+          },
         }
         if (isVoid(r.ty)) {
           return Err(diag("E0400", e.span, "cannot return a value of type `void`"));
         }
         this.ex.fx.retSeen = Some(r.ty);
         return Ok(StmtRes { stmt: HReturn(Some(r)), div: true });
-      }
+      },
     }
   }
 
+  @Ensures(result.isOk() ==> result.unwrap().div)
   private stmtReturn(span: Span, v: Option<Expr>): Result<StmtRes, Diagnostic> {
     if (this.ex.fx.retInfer) {
       return this.returnInfer(span, v);
@@ -322,7 +359,14 @@ export class StmtChecker {
     match (v) {
       None => {
         if (!isVoid(this.ex.fx.ret)) {
-          return Err(diag("E0400", span, "`return;` in a function returning `" + showType(this.ex.fx.env, this.ex.fx.ret) + "`"));
+          return Err(
+            diag(
+              "E0400",
+              span,
+              "`return;` in a function returning `" + showType(this.ex.fx.env, this.ex.fx.ret)
+                  + "`",
+            ),
+          );
         }
         if (this.ex.fx.fmode == 1 || this.ex.fx.fmode == 3) {
           return Ok(StmtRes { stmt: HReturn(Some(this.ex.thisRead(span))), div: true });
@@ -331,27 +375,40 @@ export class StmtChecker {
       },
       Some(e) => {
         if (isVoid(this.ex.fx.ret)) {
-          return Err(diag("E0400", e.span, "cannot return a value from a function returning `void`"));
+          return Err(
+            diag("E0400", e.span, "cannot return a value from a function returning `void`"),
+          );
         }
         const r = this.ex.expect(e, this.ex.fx.ret)?;
         if (this.ex.fx.fmode == 4) {
-          const rid = match (this.ex.fx.lret) { TyRecord(x) => x, _ => 0 };
+          const rid = match (this.ex.fx.lret) {
+            TyRecord(x) => x,
+            _ => 0,
+          };
           // The result is computed first (it may mutate `this`), then `this` is read.
           const vid = this.ex.fx.newTemp("$v", r.ty);
           this.ex.fx.hoist(HLet(vid, r));
           const val = mk(XLocal(vid), r.ty, span);
           const wrapped = mk(
-            XRecord(rid, None, [FieldInitH { index: 0, value: this.ex.thisRead(span) }, FieldInitH { index: 1, value: val }]),
+            XRecord(
+              rid,
+              None,
+              [
+                FieldInitH { index: 0, value: this.ex.thisRead(span) },
+                FieldInitH { index: 1, value: val },
+              ],
+            ),
             this.ex.fx.lret,
-            span
+            span,
           );
           return Ok(StmtRes { stmt: HReturn(Some(wrapped)), div: true });
         }
         return Ok(StmtRes { stmt: HReturn(Some(r)), div: true });
-      }
+      },
     }
   }
 
+  @Ensures(result.isOk() && result.unwrap().div ==> result.unwrap().block.isSome())
   private elseBranch(els: Option<Stmt>): Result<ElseRes, Diagnostic> {
     match (els) {
       None => {
@@ -373,12 +430,13 @@ export class StmtChecker {
             stmts.push(r.stmt);
             this.ex.fx.restorePre(outer);
             return Ok(ElseRes { block: Some(HBlock { stmts: stmts }), div: r.div });
-          }
+          },
         }
-      }
+      },
     }
   }
 
+  @Ensures(result.isOk() && result.unwrap().div ==> els.isSome())
   private stmtIf(cond: Expr, thenB: Block, els: Option<Stmt>): Result<StmtRes, Diagnostic> {
     const c = this.ex.expect(cond, TyBool)?;
     const t = this.block(thenB)?;
@@ -401,6 +459,7 @@ export class StmtChecker {
     return Ok(StmtRes { stmt: HWhile(c, b.block), div: isTrueLit(c) && !broke });
   }
 
+  @Ensures(result.isOk() ==> !result.unwrap().div)
   private stmtForOf(name: Ident, iter: Expr, body: Block): Result<StmtRes, Diagnostic> {
     const it = this.ex.check(iter, None)?;
     match (it.ty) {
@@ -419,12 +478,14 @@ export class StmtChecker {
         return Ok(StmtRes { stmt: HForOf(id, it, b.block), div: false });
       },
       _ => {
-        return Err(diag(
-          "E0400",
-          iter.span,
-          "`for ... of` requires an array, found `" + showType(this.ex.fx.env, it.ty) + "`"
-        ));
-      }
+        return Err(
+          diag(
+            "E0400",
+            iter.span,
+            "`for ... of` requires an array, found `" + showType(this.ex.fx.env, it.ty) + "`",
+          ),
+        );
+      },
     }
   }
 
@@ -438,12 +499,25 @@ export class StmtChecker {
   @Ensures(result.isOk() ==> armCount(result.unwrap().expr) == arms.length)
   @Ensures(result.isOk() ==> this.ex.fx.scope.depth() == old(this.ex.fx.scope.depth()))
   @Ensures(result.isOk() && result.unwrap().div ==> stmtPos && arms.length > 0)
-  matchOf(span: Span, scrut: Expr, arms: MatchArm[], exp: Option<Type>, stmtPos: bool): Result<MatchRes, Diagnostic> {
+  @Ensures(result.isOk() && stmtPos ==> isVoid(result.unwrap().expr.ty))
+  matchOf(
+    span: Span,
+    scrut: Expr,
+    arms: MatchArm[],
+    exp: Option<Type>,
+    stmtPos: bool,
+  ): Result<MatchRes, Diagnostic> {
     const s = this.ex.check(scrut, None)?;
     const sty = s.ty;
     const variants = variantsOf(this.ex.fx.env, sty);
     if (variants.isNone() && !isLiteralScrut(sty)) {
-      return Err(diag("E0402", scrut.span, "cannot match on a value of type `" + showType(this.ex.fx.env, sty) + "`"));
+      return Err(
+        diag(
+          "E0402",
+          scrut.span,
+          "cannot match on a value of type `" + showType(this.ex.fx.env, sty) + "`",
+        ),
+      );
     }
     let cov = new Coverage(variants);
     let target: Option<Type> = stmtPos ? Some(TyVoid) : exp;
@@ -470,9 +544,21 @@ export class StmtChecker {
 
   // One match arm in a scope of its own (the pattern's bindings): returns the arm plus whether it
   // diverges, the (possibly inferred) target type and what the pattern covers.
+  @Ensures(result.isOk()
+      ==> this.ex.fx.scope.depth() == old(this.ex.fx.scope.depth())
+          && this.ex.fx.pre.length == old(this.ex.fx.pre.length))
+  @Ensures(result.isOk() && stmtPos ==> result.unwrap().arm.value.isNone())
+  @Ensures(result.isOk() && !stmtPos ==> result.unwrap().arm.value.isSome() || result.unwrap().div)
+  @Ensures(result.isOk()
+      ==> coverageKept(covered, result.unwrap().covered) && (result.unwrap().wild || !wild))
   private arm(
-    arm: MatchArm, sty: Type, variants: Option<VariantDef[]>, covered: bool[], wild: bool,
-    target: Option<Type>, stmtPos: bool
+    arm: MatchArm,
+    sty: Type,
+    variants: Option<VariantDef[]>,
+    covered: bool[],
+    wild: bool,
+    target: Option<Type>,
+    stmtPos: bool,
   ): Result<ArmRes, Diagnostic> {
     this.ex.fx.pushScope();
     this.open += 1;
@@ -495,7 +581,7 @@ export class StmtChecker {
             },
             _ => {
               he = this.ex.check(e, None)?;
-            }
+            },
           }
           body = isNop(he) ? HBlock { stmts: [] } : HBlock { stmts: [HExprStmt(he)] };
         } else {
@@ -508,7 +594,7 @@ export class StmtChecker {
               const r = this.ex.check(e, None)?;
               tgt = Some(r.ty);
               value = Some(r);
-            }
+            },
           }
         }
       },
@@ -518,14 +604,14 @@ export class StmtChecker {
           let d = diag(
             "E0400",
             b.span,
-            "block arm of a match used as an expression must end in `return`, `break` or `continue`"
+            "block arm of a match used as an expression must end in `return`, `break` or `continue`",
           );
           d.notes.push("a block arm has no value; use an expression arm to produce a value");
           return Err(d);
         }
         body = bo.block;
         div = bo.div;
-      }
+      },
     }
     if (this.ex.fx.pre.length > 0) {
       let all: HStmt[] = [];
@@ -545,7 +631,7 @@ export class StmtChecker {
       div: div,
       target: tgt,
       covered: po.covered,
-      wild: po.wild
+      wild: po.wild,
     });
   }
 }
@@ -566,7 +652,12 @@ class StmtHost implements BlockHost {
   }
 
   matchExpr(
-    fx: FnCtx, span: Span, scrut: Expr, arms: MatchArm[], exp: Option<Type>, stmtPos: bool
+    fx: FnCtx,
+    span: Span,
+    scrut: Expr,
+    arms: MatchArm[],
+    exp: Option<Type>,
+    stmtPos: bool,
   ): Result<MatchOut, Diagnostic> {
     let sc = new StmtChecker(new ExprChecker(fx, new StmtHost()));
     const r = sc.matchOf(span, scrut, arms, exp, stmtPos)?;
@@ -585,7 +676,11 @@ export function checkBlock(fx: FnCtx, b: Block): Result<BlockOut, Diagnostic> {
 // Checks one contract clause of a function in (a fork of) the context `fx`; see `StmtChecker.clause`.
 // The context of the caller is not changed; the environment after the clause is returned.
 @Requires(cmode >= 1 && cmode <= 2)
-export function checkClause(fx: FnCtx, c: ContractClause, cmode: int): Result<ClauseOut, Diagnostic> {
+export function checkClause(
+  fx: FnCtx,
+  c: ContractClause,
+  cmode: int,
+): Result<ClauseOut, Diagnostic> {
   let sc = new StmtChecker(new ExprChecker(fx, new StmtHost()));
   const x = sc.clause(c, cmode)?;
   return Ok(ClauseOut { env: sc.ex.fx.env, expr: x });

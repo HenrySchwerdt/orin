@@ -4,7 +4,9 @@
 // prologue, the `Function` and its registration in the environment.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Type, Function, Local, FieldDef, RecordDef, HBlock, HStmt, HExpr, HExprKind } from "../hir";
+import {
+  Type, Function, Local, FieldDef, RecordDef, HBlock, HStmt, HExpr, HExprKind,
+} from "../hir";
 import { Env, FuncInfo, isVoid } from "./env";
 import { FnCtx } from "./fnctx";
 import { mk, dummyDecl } from "./ops";
@@ -18,9 +20,16 @@ export type LiftOut = { env: Env; fid: usize; };
 @Requires(ptys.length == fn.paramCount && fn.paramCount <= fn.locals.length)
 @Ensures(result.fid == env0.funcs.length && result.env.funcs.length == env0.funcs.length + 1)
 @Ensures(result.env.lifted.length == env0.lifted.length + 1)
-@Ensures(result.env.funcs[result.fid].mode == 6 && result.env.funcs[result.fid].cls == env0.lifted.length)
+@Ensures(result.env.funcs[result.fid].mode == 6
+    && result.env.funcs[result.fid].cls == env0.lifted.length)
 @Ensures(result.env.funcs[result.fid].paramLocals.length == fn.paramCount)
-export function registerLifted(fx: FnCtx, env0: Env, fn: Function, ptys: Type[], span: Span): LiftOut {
+export function registerLifted(
+  fx: FnCtx,
+  env0: Env,
+  fn: Function,
+  ptys: Type[],
+  span: Span,
+): LiftOut {
   let e = env0;
   const lid = e.lifted.length;
   e.lifted.push(fn);
@@ -43,7 +52,7 @@ export function registerLifted(fx: FnCtx, env0: Env, fn: Function, ptys: Type[],
     depth: fx.depth,
     mode: 6,
     cls: lid,
-    srcRet: TyVoid
+    srcRet: TyVoid,
   });
   return LiftOut { env: e, fid: fid };
 }
@@ -58,7 +67,12 @@ export function registerLifted(fx: FnCtx, env0: Env, fn: Function, ptys: Type[],
 @Ensures(functionBound(result.env.lifted[result.env.lifted.length - 1]))
 @Ensures(result.env.lifted[result.env.lifted.length - 1].paramCount == ptys.length + 1)
 export function liftClosure(
-  inner: FnCtx, lname: string, ptys: Type[], stmts: HStmt[], finalRet: Type, span: Span
+  inner: FnCtx,
+  lname: string,
+  ptys: Type[],
+  stmts: HStmt[],
+  finalRet: Type,
+  span: Span,
 ): LiftOut {
   let e = inner.env;
   const rid = e.records.length;
@@ -88,7 +102,7 @@ export function liftClosure(
     locals: locals,
     ret: finalRet,
     body: HBlock { stmts: all },
-    span: span
+    span: span,
   };
   let pfull: Type[] = [envTy];
   for (const t of ptys) {
@@ -99,33 +113,26 @@ export function liftClosure(
 
 export type WrapOut = { env: Env; wid: usize; created: bool; };
 
-// The index of the lifted wrapper named `wname` in `env.funcs`, if one exists.
-function findWrapper(env: Env, wname: string): Option<usize> {
-  let k: usize = 0;
-  while (k < env.funcs.length) {
-    if (env.funcs[k].mode == 6 && env.funcs[k].qname == wname) {
-      return Some(k);
-    }
-    k += 1;
-  }
-  return None;
-}
-
 // The lifted wrapper `f$closure(env, a, ..) { return f(a, ..); }` of function `fid`, so that the
-// function can be used as a value. Created once per function (`created` tells whether this call did).
+// function can be used as a value. Created once per function (`created` tells whether this call did),
+// found through the `Env.wrappers` index by its name.
 @Requires(fid < fx.env.funcs.length)
 @Ensures(result.isOk() ==> result.unwrap().wid < result.unwrap().env.funcs.length)
 @Ensures(result.isOk() ==> result.unwrap().env.funcs[result.unwrap().wid].mode == 6)
-@Ensures(result.isOk() ==> result.unwrap().created
-    ? result.unwrap().env.funcs.length == fx.env.funcs.length + 1
-    : result.unwrap().env.funcs.length == fx.env.funcs.length)
+@Ensures(result.isOk()
+    ==> result.unwrap().created
+        ? result.unwrap().env.funcs.length == fx.env.funcs.length + 1
+        : result.unwrap().env.funcs.length == fx.env.funcs.length)
+@Ensures(result.isOk() ==> result.unwrap().env.wrappers.has(fx.env.funcs[fid].qname + "$closure"))
 export function wrapperOf(fx: FnCtx, span: Span, fid: usize): Result<WrapOut, Diagnostic> {
   const f = fx.env.funcs[fid];
   if (f.mode != 0) {
-    return Err(diag("E0400", span, "function `" + f.decl.name.name + "` cannot be used as a value"));
+    return Err(
+      diag("E0400", span, "function `" + f.decl.name.name + "` cannot be used as a value"),
+    );
   }
   const wname = f.qname + "$closure";
-  const found = findWrapper(fx.env, wname);
+  const found = fx.env.wrappers.get(wname);
   if (found.isSome()) {
     return Ok(WrapOut { env: fx.env, wid: found.unwrap(), created: false });
   }
@@ -152,8 +159,10 @@ export function wrapperOf(fx: FnCtx, span: Span, fid: usize): Result<WrapOut, Di
     locals: locals,
     ret: f.ret,
     body: HBlock { stmts: [st] },
-    span: span
+    span: span,
   };
   const lo = registerLifted(fx, e, fn, pfull, span);
-  return Ok(WrapOut { env: lo.env, wid: lo.fid, created: true });
+  let e2 = lo.env;
+  e2.wrappers.set(wname, lo.fid);
+  return Ok(WrapOut { env: e2, wid: lo.fid, created: true });
 }

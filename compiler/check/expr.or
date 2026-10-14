@@ -14,34 +14,39 @@
 
 import { Span, Diagnostic, diag, isValidCode } from "../diag";
 import {
-  Ident, Block, Expr, ExprKind, FieldInit, MatchArm, TypeExpr, TFn, ArrowParam, ArrowBody, UnaryOp, BinaryOp,
-  DRecord, DUnion,
+  Ident, Block, Expr, ExprKind, FieldInit, MatchArm, TypeExpr, TFn, ArrowParam, ArrowBody, UnaryOp,
+  BinaryOp, DRecord, DUnion,
 } from "../syntax";
 import {
-  Type, Function, FieldDef, RecordDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, FieldInitH,
-  Builtin, MutBuiltin, UnOp, BinOp, grantTypeName, intKindOf, kindType,
+  Type, Function, FieldDef, RecordDef, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind,
+  FieldInitH, Builtin, MutBuiltin, UnOp, BinOp, grantTypeName, intKindOf, kindType,
 } from "../hir";
 import {
-  Env, ClassInfo, MethodInfo, ValEnt, Inst, ConstLit, mapOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
-  EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isUsize, isBool, isString, isVoid, isIntish, isFloatTy, isNumeric,
-  isArrayTy, isIface, showType, mismatch, globalVal, findType, findVal, originOf, boundOf, ifaceMethodIndex,
-  typeInRange, isWellFormedEnv,
+  Env, ClassInfo, MethodInfo, ValEnt, Inst, ConstLit, mapOrigin, mapGenType, isMapKeyType,
+  EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isUsize, isBool, isString,
+  isVoid, isIntish, isFloatTy, isNumeric, isArrayTy, isIface, isSignedInt, isFn, showType, mismatch,
+  globalVal, findType, findVal, originOf, boundOf, ifaceMethodIndex, typeInRange, isWellFormedEnv,
 } from "./env";
 import { checkBounds, internVtable } from "./ifaces";
-import { classOfRec, classOfGeneric, findMethod, fieldIsPrivate, recordImplements } from "./classes";
+import {
+  classOfRec, classOfGeneric, findMethod, fieldIsPrivate, recordImplements,
+} from "./classes";
 import { FnCtx, newClosureCtx } from "./fnctx";
 import { builtinSig, methodSig, grantNeeded } from "./builtins";
 import { hasResource } from "./resources";
 import {
   litTypeOf, convMethodKind, convExpr, arithMethodMode, arithExpr, parseFnKind, parseExpr,
 } from "./ints";
-import { TScope, resolveType, resolveSig, aliasType, instType, instFunc, indexOfName } from "./types";
 import {
-  mk, noExprs, nopExpr, isNop, isArithOp, untypedInt, toBinOp, intishHint, hintOf, expIsF32, isFloatHint, intLitValue,
-  expFn, fieldIndex, fieldDeclIndex, missingNames, recordHasFnField, paramNameList, selfTypeExpr, tailTypes,
-  noPre, intLiteral, bigIntLiteral, negIntLiteral, negBigLiteral, interpolated, negOperandErr, logicOperandErr,
-  impliesOperandErr, binaryType, extendPath, purePlace, noField, unresolvedName, condHoistErr, thisErr, capturedErr,
-  mapKeyErr, testGuard, isArrayApi, elemSuffix, mapReadFn,
+  TScope, resolveType, resolveSig, aliasType, instType, instFunc, indexOfName,
+} from "./types";
+import {
+  mk, noExprs, nopExpr, isNop, isArithOp, untypedInt, toBinOp, intishHint, hintOf, expIsF32,
+  isFloatHint, intLitValue, expFn, fieldIndex, fieldDeclIndex, missingNames, recordHasFnField,
+  paramNameList, selfTypeExpr, tailTypes, noPre, intLiteral, bigIntLiteral, negIntLiteral,
+  negBigLiteral, interpolated, negOperandErr, logicOperandErr, impliesOperandErr, binaryType,
+  extendPath, purePlace, noField, unresolvedName, condHoistErr, thisErr, capturedErr, mapKeyErr,
+  testGuard, isArrayApi, elemSuffix, mapReadFn,
 } from "./ops";
 import { liftClosure, wrapperOf } from "./lift";
 import { Inference, grantMissingErr, grantMismatchErr } from "./call";
@@ -57,7 +62,12 @@ export interface BlockHost {
   block(fx: FnCtx, b: Block): Result<BlockOut, Diagnostic>;
   stmtExpr(fx: FnCtx, e: Expr): Result<StmtOut, Diagnostic>;
   matchExpr(
-    fx: FnCtx, span: Span, scrut: Expr, arms: MatchArm[], exp: Option<Type>, stmtPos: bool
+    fx: FnCtx,
+    span: Span,
+    scrut: Expr,
+    arms: MatchArm[],
+    exp: Option<Type>,
+    stmtPos: bool,
   ): Result<MatchOut, Diagnostic>;
 }
 
@@ -90,7 +100,8 @@ export class ExprChecker {
   @Ensures(result.isOk() ==> typeInRange(this.fx.env, result.unwrap().ty))
   @Ensures(result.isOk() ==> localsBound(result.unwrap(), this.fx.locals.length))
   @Ensures(result.isOk() ==> this.fx.scope.depth() == old(this.fx.scope.depth()))
-  @Ensures(result.isOk() ==> this.fx.loops.length == old(this.fx.loops.length) && this.fx.cmode == old(this.fx.cmode))
+  @Ensures(result.isOk()
+      ==> this.fx.loops.length == old(this.fx.loops.length) && this.fx.cmode == old(this.fx.cmode))
   @Ensures(result.isOk() ==> this.fx.pre.length >= old(this.fx.pre.length))
   @Ensures(this.fx.locals.length >= old(this.fx.locals.length))
   check(e: Expr, exp: Option<Type>): Result<HExpr, Diagnostic> {
@@ -100,7 +111,8 @@ export class ExprChecker {
   // Checks `e` against the type `ty`: the result has exactly that type (a class value converts to an
   // interface type it implements, the one implicit conversion, ADR-0019).
   @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, ty))
-  @Ensures(result.isOk() ==> typeInRange(this.fx.env, ty) ==> localsBound(result.unwrap(), this.fx.locals.length))
+  @Ensures(result.isOk()
+      ==> typeInRange(this.fx.env, ty) ==> localsBound(result.unwrap(), this.fx.locals.length))
   @Ensures(result.isOk() ==> this.fx.scope.depth() == old(this.fx.scope.depth()))
   expect(e: Expr, ty: Type): Result<HExpr, Diagnostic> {
     return this.ep(e, ty);
@@ -133,6 +145,7 @@ export class ExprChecker {
   // Expressions
   // ===========================================================================
 
+  @Ensures(result.isOk() ==> typeInRange(this.fx.env, result.unwrap().ty))
   private ex(e: Expr, exp: Option<Type>): Result<HExpr, Diagnostic> {
     const span = e.span;
     match (e.kind) {
@@ -191,7 +204,9 @@ export class ExprChecker {
         return this.record(span, name, Some(targs), spread, fields, exp);
       },
       ETyApp(_, _) => {
-        return Err(diag("E0400", span, "type arguments are only allowed on a call or a record literal"));
+        return Err(
+          diag("E0400", span, "type arguments are only allowed on a call or a record literal"),
+        );
       },
       EMatch(s, arms) => {
         const r = this.host.matchExpr(this.fx, span, s, arms, exp, false)?;
@@ -206,11 +221,12 @@ export class ExprChecker {
       },
       EArrow(ps, rte, body) => {
         return this.arrowExp(span, ps, rte, body, exp);
-      }
+      },
     }
   }
 
   // Checks `e` against `ty`; a value of a class type converts to an interface type it implements.
+  @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, ty))
   private ep(e: Expr, ty: Type): Result<HExpr, Diagnostic> {
     const r = this.ex(e, Some(ty))?;
     if (!typeEq(r.ty, ty)) {
@@ -228,7 +244,7 @@ export class ExprChecker {
       },
       _ => {
         return Err(mismatch(this.fx.env, span, ty, r.ty));
-      }
+      },
     }
   }
 
@@ -239,13 +255,15 @@ export class ExprChecker {
         const co = classOfRec(env, rec);
         if (co.isSome()) {
           if (!recordImplements(env, rec, i)) {
-            return Err(diag(
-              "E0417",
-              span,
-              "class `" + env.classes[co.unwrap()].name + "` does not implement interface `" + env.ifaces[i].name
-                + "`; declare `class " + env.classes[co.unwrap()].name + " implements " + env.ifaces[i].decl.name.name
-                + "` (conformance is nominal)"
-            ));
+            return Err(
+              diag(
+                "E0417",
+                span,
+                "class `" + env.classes[co.unwrap()].name + "` does not implement interface `"
+                    + env.ifaces[i].name + "`; declare `class " + env.classes[co.unwrap()].name
+                    + " implements " + env.ifaces[i].decl.name.name + "` (conformance is nominal)",
+              ),
+            );
           }
           if (env.classes[co.unwrap()].gid >= 0 && (this.fx.abs || this.fx.probe)) {
             // instance of a generic class in an abstract check / probe: no instances are created (HIR discarded)
@@ -260,18 +278,26 @@ export class ExprChecker {
           return Ok(mk(XIface(0, r), TyIface(i), span));
         }
       },
-      _ => {}
+      _ => {},
     }
     return Err(mismatch(env, span, TyIface(i), r.ty));
   }
 
   // `s.m(args)` on an interface value, or on a value of a type parameter bounded by the interface
   // (abstract check): a call through the vtable (ADR-0019).
-  private ifaceCall(b: HExpr, span: Span, i: usize, name: Ident, args: Expr[]): Result<HExpr, Diagnostic> {
+  private ifaceCall(
+    b: HExpr,
+    span: Span,
+    i: usize,
+    name: Ident,
+    args: Expr[],
+  ): Result<HExpr, Diagnostic> {
     const info = this.fx.env.ifaces[i];
     const so = ifaceMethodIndex(info, name.name);
     if (so.isNone()) {
-      return Err(diag("E0405", name.span, "no method `" + name.name + "` on interface `" + info.name + "`"));
+      return Err(
+        diag("E0405", name.span, "no method `" + name.name + "` on interface `" + info.name + "`"),
+      );
     }
     const slot = so.unwrap();
     const m = info.methods[slot];
@@ -281,6 +307,7 @@ export class ExprChecker {
 
   // A template literal: the parts and the interpolated values are concatenated left to right with `+` on strings,
   // which the lowering turns into appends onto one fresh buffer (linear, no repeated copying).
+  @Ensures(result.isOk() ==> isString(result.unwrap().ty))
   private template(span: Span, parts: string[], xs: Expr[]): Result<HExpr, Diagnostic> {
     let acc: Option<HExpr> = None;
     let i: usize = 0;
@@ -289,7 +316,7 @@ export class ExprChecker {
         const piece = mk(XStr(parts[i]), TyString, span);
         acc = match (acc) {
           Some(a) => Some(mk(XBinary(OpAdd, a, piece), TyString, span)),
-          None => Some(piece)
+          None => Some(piece),
         };
       }
       if (i < xs.length) {
@@ -297,19 +324,23 @@ export class ExprChecker {
         const h = interpolated(this.fx.env, r, xs[i].span)?;
         acc = match (acc) {
           Some(a) => Some(mk(XBinary(OpAdd, a, h), TyString, span)),
-          None => Some(h)
+          None => Some(h),
         };
       }
       i += 1;
     }
     return match (acc) {
       Some(a) => Ok(a),
-      None => Ok(mk(XStr(""), TyString, span))
+      None => Ok(mk(XStr(""), TyString, span)),
     };
   }
 
   private arrowExp(
-    span: Span, ps: ArrowParam[], rte: Option<TypeExpr>, body: ArrowBody, exp: Option<Type>
+    span: Span,
+    ps: ArrowParam[],
+    rte: Option<TypeExpr>,
+    body: ArrowBody,
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const noP: Option<Type[]> = None;
     const noR: Option<Type> = None;
@@ -319,10 +350,10 @@ export class ExprChecker {
           TyFn(eps, er) => {
             return this.arrow(span, ps, rte, body, Some(eps), Some(er));
           },
-          _ => {}
+          _ => {},
         }
       },
-      None => {}
+      None => {},
     }
     return this.arrow(span, ps, rte, body, noP, noR);
   }
@@ -350,7 +381,12 @@ export class ExprChecker {
     return Err(unresolvedName(this.fx.selfName, id));
   }
 
-  private funcValueOf(ent: ValEnt, id: Ident, span: Span, exp: Option<Type>): Result<HExpr, Diagnostic> {
+  private funcValueOf(
+    ent: ValEnt,
+    id: Ident,
+    span: Span,
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     const noP: Option<Type[]> = None;
     const noR: Option<Type> = None;
     match (expFn(exp)) {
@@ -359,15 +395,20 @@ export class ExprChecker {
           TyFn(eps, er) => {
             return this.funcValue(span, ent, id, Some(eps), Some(er));
           },
-          _ => {}
+          _ => {},
         }
       },
-      None => {}
+      None => {},
     }
     return this.funcValue(span, ent, id, noP, noR);
   }
 
-  private identVal(ent: ValEnt, id: Ident, span: Span, exp: Option<Type>): Result<HExpr, Diagnostic> {
+  private identVal(
+    ent: ValEnt,
+    id: Ident,
+    span: Span,
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     match (ent) {
       VConst(i) => {
         const c = this.fx.env.consts[i];
@@ -375,18 +416,21 @@ export class ExprChecker {
           LitInt(n) => XInt(n),
           LitStr(s) => XStr(s),
           LitBool(b) => XBool(b),
-          LitFloat(t) => XFloat(t)
+          LitFloat(t) => XFloat(t),
         };
         return Ok(mk(kind, c.ty, span));
       },
       VVariant(u, tag) => {
         const def = this.fx.env.unions[u].variants[tag];
         if (def.payload.length > 0) {
-          return Err(diag(
-            "E0404",
-            span,
-            "variant `" + def.name + "` expects " + def.payload.length.toString() + " argument(s)"
-          ));
+          return Err(
+            diag(
+              "E0404",
+              span,
+              "variant `" + def.name + "` expects " + def.payload.length.toString()
+                  + " argument(s)",
+            ),
+          );
         }
         return Ok(mk(XVariant(tag, noExprs()), TyUnion(u), span));
       },
@@ -401,7 +445,7 @@ export class ExprChecker {
       },
       VStd(_) => {
         return Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value"));
-      }
+      },
     }
   }
 
@@ -413,13 +457,15 @@ export class ExprChecker {
             return Ok(mk(XVariant(1, noExprs()), TyOption(inner), span));
           },
           _ => {
-            return Err(diag("E0400", span, "expected `" + showType(this.fx.env, t) + "`, found an `Option`"));
-          }
+            return Err(
+              diag("E0400", span, "expected `" + showType(this.fx.env, t) + "`, found an `Option`"),
+            );
+          },
         }
       },
       None => {
         return Err(diag("E0407", span, "cannot infer the type of `None`; add a type annotation"));
-      }
+      },
     }
   }
 
@@ -436,7 +482,12 @@ export class ExprChecker {
   // Operators
   // ---------------------------------------------------------------------------
 
-  private unary(span: Span, op: UnaryOp, inner: Expr, exp: Option<Type>): Result<HExpr, Diagnostic> {
+  private unary(
+    span: Span,
+    op: UnaryOp,
+    inner: Expr,
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     match (op) {
       UNeg => {
         return this.neg(span, inner, exp);
@@ -444,13 +495,16 @@ export class ExprChecker {
       UNot => {
         const o = this.ex(inner, None)?;
         if (!isBool(o.ty)) {
-          return Err(diag("E0410", span, "`!` requires `bool`, found `" + showType(this.fx.env, o.ty) + "`"));
+          return Err(
+            diag("E0410", span, "`!` requires `bool`, found `" + showType(this.fx.env, o.ty) + "`"),
+          );
         }
         return Ok(mk(XUnary(UnNot, o), TyBool, span));
-      }
+      },
     }
   }
 
+  @Ensures(result.isOk() ==> isSignedInt(result.unwrap().ty) || isFloatTy(result.unwrap().ty))
   private neg(span: Span, inner: Expr, exp: Option<Type>): Result<HExpr, Diagnostic> {
     const lit = intLitValue(inner);
     if (lit.isSome()) {
@@ -460,15 +514,15 @@ export class ExprChecker {
       EBigInt(n) => {
         return negBigLiteral(this.fx.env, n, exp, span);
       },
-      _ => {}
+      _ => {},
     }
     match (inner.kind) {
       EFloat(t) => {
         return Ok(mk(XFloat("-" + t), expIsF32(exp) ? TyF32 : TyFloat, span));
       },
-      _ => {}
+      _ => {},
     }
-    const o = this.ex(inner, (untypedInt(inner) && isFloatHint(exp)) ? exp : None)?;
+    const o = this.ex(inner, untypedInt(inner) && isFloatHint(exp) ? exp : None)?;
     const ne = negOperandErr(this.fx.env, o.ty, span);
     if (ne.isSome()) {
       return Err(ne.unwrap());
@@ -489,15 +543,29 @@ export class ExprChecker {
     return Ok(Pair { l: l, r: r });
   }
 
+  @Ensures(result.isOk() && !isArithOp(op) ==> isBool(result.unwrap().ty))
   private binary(
-    span: Span, op: BinaryOp, lhs: Expr, rhs: Expr, exp: Option<Type>
+    span: Span,
+    op: BinaryOp,
+    lhs: Expr,
+    rhs: Expr,
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const hop = toBinOp(op);
-    const isImpl = match (op) { BImplies => true, _ => false };
+    const isImpl = match (op) {
+      BImplies => true,
+      _ => false,
+    };
     if (isImpl) {
       // `a ==> b` (ADR-0012) is `!a || b` (short-circuit); only valid inside contract expressions.
       if (this.fx.cmode == 0) {
-        return Err(diag("E0415", span, "`==>` is only allowed inside contract expressions (@Requires, @Ensures, @Invariant, @Decreases)"));
+        return Err(
+          diag(
+            "E0415",
+            span,
+            "`==>` is only allowed inside contract expressions (@Requires, @Ensures, @Invariant, @Decreases)",
+          ),
+        );
       }
       const l = this.ex(lhs, None)?;
       const r = this.ex(rhs, None)?;
@@ -507,7 +575,11 @@ export class ExprChecker {
       }
       return Ok(mk(XBinary(OpOr, mk(XUnary(UnNot, l), TyBool, lhs.span), r), TyBool, span));
     }
-    const isLogic = match (op) { BAnd => true, BOr => true, _ => false };
+    const isLogic = match (op) {
+      BAnd => true,
+      BOr => true,
+      _ => false,
+    };
     if (isLogic) {
       const l = this.ex(lhs, None)?;
       const npre = this.fx.pre.length;
@@ -547,8 +619,14 @@ export class ExprChecker {
       TyRecord(r) => {
         const def = this.fx.env.records[r];
         const io = fieldIndex(def.fields, name.name);
-        if (io.isNone() || (name.name != "size" && this.outsideMapPrelude(t))) {
-          return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + showType(this.fx.env, t) + "`"));
+        if (io.isNone() || name.name != "size" && this.outsideMapPrelude(t)) {
+          return Err(
+            diag(
+              "E0405",
+              name.span,
+              "no field `" + name.name + "` on type `" + showType(this.fx.env, t) + "`",
+            ),
+          );
         }
         const i = io.unwrap();
         this.fieldAccess(r, name)?;
@@ -556,7 +634,7 @@ export class ExprChecker {
       },
       _ => {
         return Err(noField(this.fx.env, name, t));
-      }
+      },
     }
   }
 
@@ -568,8 +646,10 @@ export class ExprChecker {
         return Ok(mk(XIndex(b, i), t, span));
       },
       _ => {
-        return Err(diag("E0400", span, "cannot index into type `" + showType(this.fx.env, b.ty) + "`"));
-      }
+        return Err(
+          diag("E0400", span, "cannot index into type `" + showType(this.fx.env, b.ty) + "`"),
+        );
+      },
     }
   }
 
@@ -580,21 +660,27 @@ export class ExprChecker {
         match (this.fx.ret) {
           TyResult(_, e2) => {
             if (!typeEq(e2, et)) {
-              return Err(diag(
-                "E0406",
-                span,
-                "error type `" + showType(this.fx.env, et) + "` does not match the function's error type `"
-                  + showType(this.fx.env, e2) + "`"
-              ));
+              return Err(
+                diag(
+                  "E0406",
+                  span,
+                  "error type `" + showType(this.fx.env, et)
+                      + "` does not match the function's error type `" + showType(this.fx.env, e2)
+                      + "`",
+                ),
+              );
             }
           },
           _ => {
-            return Err(diag(
-              "E0406",
-              span,
-              "`?` used in a function returning `" + showType(this.fx.env, this.fx.ret) + "`, not a `Result`"
-            ));
-          }
+            return Err(
+              diag(
+                "E0406",
+                span,
+                "`?` used in a function returning `" + showType(this.fx.env, this.fx.ret)
+                    + "`, not a `Result`",
+              ),
+            );
+          },
         }
         if (this.fx.fmode == 4) {
           return this.tryInMutating(o, span, t, et);
@@ -602,8 +688,14 @@ export class ExprChecker {
         return Ok(mk(XTry(o), t, span));
       },
       _ => {
-        return Err(diag("E0406", span, "`?` requires a `Result`, found `" + showType(this.fx.env, o.ty) + "`"));
-      }
+        return Err(
+          diag(
+            "E0406",
+            span,
+            "`?` requires a `Result`, found `" + showType(this.fx.env, o.ty) + "`",
+          ),
+        );
+      },
     }
   }
 
@@ -611,16 +703,24 @@ export class ExprChecker {
   // { self, value }): an early `Err` return must carry the receiver too, so the check is hoisted like a
   // mutating call, in front of the statement that contains the expression:
   //   const $t = x; if ($t.isErr()) { return $ret { self: this, value: Err($t.unwrapErr()) }; }  ... $t.unwrap()
+  @Ensures(result.isOk() ==> this.fx.pre.length == old(this.fx.pre.length) + 2)
   private tryInMutating(o: HExpr, span: Span, t: Type, et: Type): Result<HExpr, Diagnostic> {
     const id = this.fx.newTemp("$t", o.ty);
     this.fx.hoist(HLet(id, o));
     const tmp = mk(XLocal(id), o.ty, span);
-    const rid = match (this.fx.lret) { TyRecord(x) => x, _ => 0 };
+    const rid = match (this.fx.lret) {
+      TyRecord(x) => x,
+      _ => 0,
+    };
     const errV = mk(XVariant(1, [mk(XBuiltin(BResUnwrapErr, [tmp]), et, span)]), this.fx.ret, span);
     const wrapped = mk(
-      XRecord(rid, None, [FieldInitH { index: 0, value: this.thisRead(span) }, FieldInitH { index: 1, value: errV }]),
+      XRecord(
+        rid,
+        None,
+        [FieldInitH { index: 0, value: this.thisRead(span) }, FieldInitH { index: 1, value: errV }],
+      ),
       this.fx.lret,
-      span
+      span,
     );
     const isErr = mk(XBuiltin(BResIsErr, [tmp]), TyBool, span);
     this.fx.hoist(HIf(isErr, HBlock { stmts: [HReturn(Some(wrapped))] }, None));
@@ -631,7 +731,11 @@ export class ExprChecker {
   }
 
   private cond(
-    span: Span, cond: Expr, thenE: Expr, elsE: Expr, exp: Option<Type>
+    span: Span,
+    cond: Expr,
+    thenE: Expr,
+    elsE: Expr,
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const c = this.ep(cond, TyBool)?;
     const npre = this.fx.pre.length;
@@ -647,7 +751,7 @@ export class ExprChecker {
           return Ok(mk(XCond(c, tr, fr), et, span));
         }
       },
-      None => {}
+      None => {},
     }
     let t: HExpr = mk(XBool(false), TyBool, span);
     let f: HExpr = mk(XBool(false), TyBool, span);
@@ -667,16 +771,19 @@ export class ExprChecker {
       return Err(condHoistErr(span));
     }
     if (!typeEq(t.ty, f.ty)) {
-      return Err(diag(
-        "E0400",
-        elsE.span,
-        "branches of conditional have different types `" + showType(this.fx.env, t.ty) + "` and `"
-          + showType(this.fx.env, f.ty) + "`"
-      ));
+      return Err(
+        diag(
+          "E0400",
+          elsE.span,
+          "branches of conditional have different types `" + showType(this.fx.env, t.ty) + "` and `"
+              + showType(this.fx.env, f.ty) + "`",
+        ),
+      );
     }
     return Ok(mk(XCond(c, t, f), t.ty, span));
   }
 
+  @Ensures(result.isOk() ==> isArrayTy(result.unwrap().ty))
   private array(span: Span, elems: Expr[], exp: Option<Type>): Result<HExpr, Diagnostic> {
     let pre: Option<HExpr>[] = noPre(elems.length);
     let elemTy: Type = TyInt;
@@ -688,14 +795,16 @@ export class ExprChecker {
             elemTy = et;
             fromExp = true;
           },
-          _ => {}
+          _ => {},
         }
       },
-      None => {}
+      None => {},
     }
     if (!fromExp) {
       if (elems.length == 0) {
-        return Err(diag("E0407", span, "cannot infer the element type of `[]`; add a type annotation"));
+        return Err(
+          diag("E0407", span, "cannot infer the element type of `[]`; add a type annotation"),
+        );
       }
       let k: usize = 0;
       let found = false;
@@ -730,7 +839,7 @@ export class ExprChecker {
         None => {
           const r = this.ep(e, elemTy)?;
           out.push(r);
-        }
+        },
       }
       i += 1;
     }
@@ -742,11 +851,17 @@ export class ExprChecker {
   // ---------------------------------------------------------------------------
 
   private record(
-    span: Span, name: Ident, targs: Option<TypeExpr[]>, spread: Option<Expr>, fields: FieldInit[],
-    exp: Option<Type>
+    span: Span,
+    name: Ident,
+    targs: Option<TypeExpr[]>,
+    spread: Option<Expr>,
+    fields: FieldInit[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     if (indexOfName(this.fx.tpNames, name.name).isSome()) {
-      return Err(diag("E0400", name.span, "`" + name.name + "` is a type parameter, not a record type"));
+      return Err(
+        diag("E0400", name.span, "`" + name.name + "` is a type parameter, not a record type"),
+      );
     }
     const found = findType(this.fx.env.units[this.fx.unit].scope, name.name);
     if (found.isNone()) {
@@ -757,11 +872,15 @@ export class ExprChecker {
       EntGen(g) => {
         const gco = classOfGeneric(this.fx.env, g);
         if (gco.isSome() && !this.fx.inClass(gco.unwrap())) {
-          return Err(diag(
-            "E0408",
-            name.span,
-            "class `" + name.name + "` cannot be built with a record literal outside its own body; use `new " + name.name + "(..)`"
-          ));
+          return Err(
+            diag(
+              "E0408",
+              name.span,
+              "class `" + name.name
+                  + "` cannot be built with a record literal outside its own body; use `new "
+                  + name.name + "(..)`",
+            ),
+          );
         }
         return this.genericRecord(span, g, name, targs, spread, fields, exp);
       },
@@ -778,11 +897,19 @@ export class ExprChecker {
         t = r.ty;
       },
       EntIface(_) => {
-        return Err(diag("E0400", name.span, "`" + name.name + "` is an interface, not a record type"));
+        return Err(
+          diag("E0400", name.span, "`" + name.name + "` is an interface, not a record type"),
+        );
       },
       EntBuiltin(_) => {
-        return Err(diag("E0400", name.span, "`" + name.name + "` is a built-in resource type, not a record type"));
-      }
+        return Err(
+          diag(
+            "E0400",
+            name.span,
+            "`" + name.name + "` is a built-in resource type, not a record type",
+          ),
+        );
+      },
     }
     if (targs.isSome()) {
       return Err(diag("E0400", name.span, "type `" + name.name + "` is not generic"));
@@ -790,20 +917,26 @@ export class ExprChecker {
     const rid = match (t) {
       TyRecord(r) => r,
       _ => {
-        return Err(diag(
-          "E0400",
-          name.span,
-          "`" + name.name + "` is not a record type (it is `" + showType(this.fx.env, t) + "`)"
-        ));
-      }
+        return Err(
+          diag(
+            "E0400",
+            name.span,
+            "`" + name.name + "` is not a record type (it is `" + showType(this.fx.env, t) + "`)",
+          ),
+        );
+      },
     };
     const co = classOfRec(this.fx.env, rid);
     if (co.isSome() && !this.fx.inClass(co.unwrap())) {
-      return Err(diag(
-        "E0408",
-        name.span,
-        "class `" + name.name + "` cannot be built with a record literal outside its own body; use `new " + name.name + "(..)`"
-      ));
+      return Err(
+        diag(
+          "E0408",
+          name.span,
+          "class `" + name.name
+              + "` cannot be built with a record literal outside its own body; use `new "
+              + name.name + "(..)`",
+        ),
+      );
     }
     return this.recordOf(span, rid, spread, fields);
   }
@@ -811,15 +944,20 @@ export class ExprChecker {
   // Record literal of a generic record type: the instance comes from the spread, the explicit type
   // arguments, the expected type or the field values (in that order of authority).
   private genericRecord(
-    span: Span, g: usize, name: Ident, targs: Option<TypeExpr[]>, spread: Option<Expr>,
-    fields: FieldInit[], exp: Option<Type>
+    span: Span,
+    g: usize,
+    name: Ident,
+    targs: Option<TypeExpr[]>,
+    spread: Option<Expr>,
+    fields: FieldInit[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const gt = this.fx.env.gtypes[g];
     const fdecls = match (gt.decl.body) {
       DRecord(fs) => fs,
       _ => {
         return Err(diag("E0400", name.span, "`" + name.name + "` is not a record type"));
-      }
+      },
     };
     match (spread) {
       Some(se) => {
@@ -834,18 +972,21 @@ export class ExprChecker {
               rid = inst.id;
             }
           },
-          None => {}
+          None => {},
         }
         if (!ok) {
-          return Err(diag(
-            "E0400", se.span,
-            "spread of `" + name.name + "` literal must be an instance of `" + name.name + "`, found `"
-              + showType(this.fx.env, s.ty) + "`"
-          ));
+          return Err(
+            diag(
+              "E0400",
+              se.span,
+              "spread of `" + name.name + "` literal must be an instance of `" + name.name
+                  + "`, found `" + showType(this.fx.env, s.ty) + "`",
+            ),
+          );
         }
         return this.recordOf(span, rid, spread, fields);
       },
-      None => {}
+      None => {},
     }
     let idxs: usize[] = [];
     let seen: bool[] = [];
@@ -859,7 +1000,13 @@ export class ExprChecker {
     for (const f of fields) {
       const io = fieldDeclIndex(fdecls, f.name.name);
       if (io.isNone()) {
-        return Err(diag("E0411", f.name.span, "record `" + name.name + "` has no field `" + f.name.name + "`"));
+        return Err(
+          diag(
+            "E0411",
+            f.name.span,
+            "record `" + name.name + "` has no field `" + f.name.name + "`",
+          ),
+        );
       }
       const idx = io.unwrap();
       if (seen[idx]) {
@@ -875,14 +1022,21 @@ export class ExprChecker {
       return Err(diag("E0411", span, "missing field(s) in record literal: " + missing.join(", ")));
     }
     const io = this.infer(
-      span, "record `" + name.name + "`", gt.unit, gt.decl.typeParams, ptes,
-      Some(selfTypeExpr(gt.decl)), vals, exp, targs
+      span,
+      "record `" + name.name + "`",
+      gt.unit,
+      gt.decl.typeParams,
+      ptes,
+      Some(selfTypeExpr(gt.decl)),
+      vals,
+      exp,
+      targs,
     )?;
     const inst = instType(this.fx.env, g, io.tys, 0, span)?;
     this.fx.adopt(inst.env);
     const rid = match (inst.ty) {
       TyRecord(r) => r,
-      _ => 0
+      _ => 0,
     };
     let out: FieldInitH[] = [];
     let i: usize = 0;
@@ -893,7 +1047,12 @@ export class ExprChecker {
     return Ok(mk(XRecord(rid, None, out), TyRecord(rid), span));
   }
 
-  private recordOf(span: Span, rid: usize, spread: Option<Expr>, fields: FieldInit[]): Result<HExpr, Diagnostic> {
+  private recordOf(
+    span: Span,
+    rid: usize,
+    spread: Option<Expr>,
+    fields: FieldInit[],
+  ): Result<HExpr, Diagnostic> {
     const def = this.fx.env.records[rid];
     let sp: Option<HExpr> = None;
     match (spread) {
@@ -901,7 +1060,7 @@ export class ExprChecker {
         const r = this.ep(s, TyRecord(rid))?;
         sp = Some(r);
       },
-      None => {}
+      None => {},
     }
     let seen: bool[] = [];
     let names: string[] = [];
@@ -913,7 +1072,13 @@ export class ExprChecker {
     for (const f of fields) {
       const io = fieldIndex(def.fields, f.name.name);
       if (io.isNone()) {
-        return Err(diag("E0411", f.name.span, "record `" + def.name + "` has no field `" + f.name.name + "`"));
+        return Err(
+          diag(
+            "E0411",
+            f.name.span,
+            "record `" + def.name + "` has no field `" + f.name.name + "`",
+          ),
+        );
       }
       const idx = io.unwrap();
       if (seen[idx]) {
@@ -926,7 +1091,9 @@ export class ExprChecker {
     if (sp.isNone()) {
       const missing = missingNames(names, seen);
       if (missing.length > 0) {
-        return Err(diag("E0411", span, "missing field(s) in record literal: " + missing.join(", ")));
+        return Err(
+          diag("E0411", span, "missing field(s) in record literal: " + missing.join(", ")),
+        );
       }
     }
     return Ok(mk(XRecord(rid, sp, out), TyRecord(rid), span));
@@ -939,13 +1106,21 @@ export class ExprChecker {
   // The arguments checked against the parameter types, in source order.
   @Ensures(result.isOk() ==> result.unwrap().length == params.length)
   @Ensures(args.length != params.length ==> result.isErr())
-  private argsExpect(span: Span, what: string, args: Expr[], params: Type[]): Result<HExpr[], Diagnostic> {
+  private argsExpect(
+    span: Span,
+    what: string,
+    args: Expr[],
+    params: Type[],
+  ): Result<HExpr[], Diagnostic> {
     if (args.length != params.length) {
-      return Err(diag(
-        "E0404",
-        span,
-        what + " expects " + params.length.toString() + " argument(s), found " + args.length.toString()
-      ));
+      return Err(
+        diag(
+          "E0404",
+          span,
+          what + " expects " + params.length.toString() + " argument(s), found "
+              + args.length.toString(),
+        ),
+      );
     }
     let out: HExpr[] = [];
     let i: usize = 0;
@@ -957,7 +1132,12 @@ export class ExprChecker {
     return Ok(out);
   }
 
-  private call(span: Span, callee: Expr, args: Expr[], exp: Option<Type>): Result<HExpr, Diagnostic> {
+  private call(
+    span: Span,
+    callee: Expr,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     if (this.fx.cmode > 0) {
       match (callee.kind) {
         EIdent(id) => {
@@ -965,7 +1145,7 @@ export class ExprChecker {
             return this.oldExpr(span, args);
           }
         },
-        _ => {}
+        _ => {},
       }
     }
     match (callee.kind) {
@@ -980,7 +1160,7 @@ export class ExprChecker {
       },
       _ => {
         return this.callValue(span, callee, args);
-      }
+      },
     }
   }
 
@@ -989,11 +1169,15 @@ export class ExprChecker {
   @Ensures(result.isOk() ==> this.fx.cmode == 2)
   private oldExpr(span: Span, args: Expr[]): Result<HExpr, Diagnostic> {
     if (this.fx.cmode != 2) {
-      return Err(diag(
-        "E0415",
-        span,
-        this.fx.cmode == 3 ? "`old(..)` cannot be nested" : "`old(..)` is only allowed in an @Ensures expression"
-      ));
+      return Err(
+        diag(
+          "E0415",
+          span,
+          this.fx.cmode == 3
+              ? "`old(..)` cannot be nested"
+              : "`old(..)` is only allowed in an @Ensures expression",
+        ),
+      );
     }
     if (args.length != 1) {
       return Err(diag("E0404", span, "`old` expects 1 argument, found " + args.length.toString()));
@@ -1019,14 +1203,18 @@ export class ExprChecker {
           },
           _ => {
             return Err(diag("E0400", callee.span, "expression is not callable"));
-          }
+          },
         }
-      }
+      },
     }
   }
 
   private callIdent(
-    span: Span, callee: Expr, id: Ident, args: Expr[], exp: Option<Type>
+    span: Span,
+    callee: Expr,
+    id: Ident,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const lv = this.fx.lookupVar(id.name);
     if (lv.isSome()) {
@@ -1038,7 +1226,13 @@ export class ExprChecker {
         return this.callBuiltin(span, "function `parseInt`", BParseInt, args);
       }
       if (id.name == "parseI128" || id.name == "parseU128") {
-        return Err(diag("E0431", id.span, "the 128-bit integer types are not supported yet (ADR-0022); use `parseI64` / `parseU64`"));
+        return Err(
+          diag(
+            "E0431",
+            id.span,
+            "the 128-bit integer types are not supported yet (ADR-0022); use `parseI64` / `parseU64`",
+          ),
+        );
       }
       const pk = parseFnKind(id.name);
       if (pk >= 0) {
@@ -1079,7 +1273,7 @@ export class ExprChecker {
       },
       VConst(_) => {
         return Err(diag("E0400", callee.span, "`" + id.name + "` is not a function"));
-      }
+      },
     }
   }
 
@@ -1088,10 +1282,17 @@ export class ExprChecker {
   // ---------------------------------------------------------------------------
 
   private callTyApp(
-    span: Span, callee: Expr, id: Ident, targs: TypeExpr[], args: Expr[], exp: Option<Type>
+    span: Span,
+    callee: Expr,
+    id: Ident,
+    targs: TypeExpr[],
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     if (this.fx.isVisibleVar(id.name)) {
-      return Err(diag("E0400", callee.span, "`" + id.name + "` is not generic and takes no type arguments"));
+      return Err(
+        diag("E0400", callee.span, "`" + id.name + "` is not generic and takes no type arguments"),
+      );
     }
     const g = globalVal(this.fx.env, this.fx.unit, id.name);
     if (g.isNone()) {
@@ -1105,8 +1306,14 @@ export class ExprChecker {
         return this.genericVariant(span, gi, tag, Some(targs), args, exp);
       },
       _ => {
-        return Err(diag("E0400", callee.span, "`" + id.name + "` is not generic and takes no type arguments"));
-      }
+        return Err(
+          diag(
+            "E0400",
+            callee.span,
+            "`" + id.name + "` is not generic and takes no type arguments",
+          ),
+        );
+      },
     }
   }
 
@@ -1114,7 +1321,13 @@ export class ExprChecker {
   // bound to `tys` (only mentioned parameters need to be real).
   @Requires(tp.length == tys.length)
   @Ensures(result.isOk() ==> typeInRange(this.fx.env, result.unwrap()))
-  private resolveBound(unit: usize, tp: string[], tys: Type[], te: TypeExpr, voidOk: bool): Result<Type, Diagnostic> {
+  private resolveBound(
+    unit: usize,
+    tp: string[],
+    tys: Type[],
+    te: TypeExpr,
+    voidOk: bool,
+  ): Result<Type, Diagnostic> {
     const sc = new TScope(unit, tp, tys, 0);
     const r = resolveType(this.fx.env, sc, te, voidOk)?;
     this.fx.adopt(r.env);
@@ -1126,18 +1339,44 @@ export class ExprChecker {
   // the expected type; then the arguments left to right (arguments that cannot be typed alone,
   // such as `[]` or `None`, and bare integer literals are deferred until the others are known).
   // Returns the type arguments and the checked arguments in source order.
+  @Ensures(result.isOk()
+      ==> result.unwrap().args.length == args.length && result.unwrap().tys.length == tps.length)
   private infer(
-    span: Span, what: string, unit: usize, tps: Ident[], paramTEs: TypeExpr[],
-    retTE: Option<TypeExpr>, args: Expr[], exp: Option<Type>, explicit: Option<TypeExpr[]>
+    span: Span,
+    what: string,
+    unit: usize,
+    tps: Ident[],
+    paramTEs: TypeExpr[],
+    retTE: Option<TypeExpr>,
+    args: Expr[],
+    exp: Option<Type>,
+    explicit: Option<TypeExpr[]>,
   ): Result<InferOut, Diagnostic> {
-    return this.inferPre(span, what, unit, tps, paramTEs, retTE, args, exp, explicit, noPre(args.length));
+    return this.inferPre(
+      span,
+      what,
+      unit,
+      tps,
+      paramTEs,
+      retTE,
+      args,
+      exp,
+      explicit,
+      noPre(args.length),
+    );
   }
 
   // An argument that is typed on its own because its parameter type still mentions unbound type
   // parameters. An arrow function whose expected parameter types are all known (but not its result,
   // e.g. `xs.map(x => x + 1)`) is checked against them; its type then binds the result parameter.
   // When no such special case applies, the argument is checked on its own from the unchanged context.
-  private loose(a: Expr, te: TypeExpr, unit: usize, tp: string[], inf: Inference): Result<HExpr, Diagnostic> {
+  private loose(
+    a: Expr,
+    te: TypeExpr,
+    unit: usize,
+    tp: string[],
+    inf: Inference,
+  ): Result<HExpr, Diagnostic> {
     const saved = this.fx;
     match (te.kind) {
       TFn(pts, _) => {
@@ -1161,7 +1400,7 @@ export class ExprChecker {
                     },
                     None => {
                       ok = false;
-                    }
+                    },
                   }
                 }
                 i += 1;
@@ -1195,42 +1434,58 @@ export class ExprChecker {
                   VGFunc(_) => {
                     return this.funcValue(a.span, g.unwrap(), id, Some(tys), noR);
                   },
-                  _ => {}
+                  _ => {},
                 }
               }
             }
           },
-          _ => {}
+          _ => {},
         }
       },
-      _ => {}
+      _ => {},
     }
     this.fx = saved;
     return this.ex(a, None);
   }
 
   // `infer` where some arguments are already checked (`pre[i]`, e.g. the receiver of a method call).
+  @Ensures(result.isOk()
+      ==> result.unwrap().args.length == args.length && result.unwrap().tys.length == tps.length)
   private inferPre(
-    span: Span, what: string, unit: usize, tps: Ident[], paramTEs: TypeExpr[],
-    retTE: Option<TypeExpr>, args: Expr[], exp: Option<Type>, explicit: Option<TypeExpr[]>, pre: Option<HExpr>[]
+    span: Span,
+    what: string,
+    unit: usize,
+    tps: Ident[],
+    paramTEs: TypeExpr[],
+    retTE: Option<TypeExpr>,
+    args: Expr[],
+    exp: Option<Type>,
+    explicit: Option<TypeExpr[]>,
+    pre: Option<HExpr>[],
   ): Result<InferOut, Diagnostic> {
     if (args.length != paramTEs.length) {
-      return Err(diag(
-        "E0404",
-        span,
-        what + " expects " + paramTEs.length.toString() + " argument(s), found " + args.length.toString()
-      ));
+      return Err(
+        diag(
+          "E0404",
+          span,
+          what + " expects " + paramTEs.length.toString() + " argument(s), found "
+              + args.length.toString(),
+        ),
+      );
     }
     const tp = paramNameList(tps);
     let inf = new Inference(tp, args.length);
     match (explicit) {
       Some(ts) => {
         if (ts.length != tp.length) {
-          return Err(diag(
-            "E0400",
-            span,
-            what + " expects " + tp.length.toString() + " type argument(s), found " + ts.length.toString()
-          ));
+          return Err(
+            diag(
+              "E0400",
+              span,
+              what + " expects " + tp.length.toString() + " type argument(s), found "
+                  + ts.length.toString(),
+            ),
+          );
         }
         let k: usize = 0;
         for (const t of ts) {
@@ -1246,12 +1501,12 @@ export class ExprChecker {
               Some(rt) => {
                 inf.learn(this.fx.env, unit, rt, et);
               },
-              None => {}
+              None => {},
             }
           },
-          None => {}
+          None => {},
         }
-      }
+      },
     }
     let pi: usize = 0;
     while (pi < args.length) {
@@ -1260,7 +1515,7 @@ export class ExprChecker {
           inf.fill(pi, h);
           inf.learn(this.fx.env, unit, paramTEs[pi], h.ty);
         },
-        None => {}
+        None => {},
       }
       pi += 1;
     }
@@ -1291,7 +1546,7 @@ export class ExprChecker {
             } else {
               return Err(d);
             }
-          }
+          },
         }
       }
       i += 1;
@@ -1330,7 +1585,7 @@ export class ExprChecker {
                 firstErr = Some(d);
               }
               rest.push(di);
-            }
+            },
           }
         }
       }
@@ -1374,33 +1629,53 @@ export class ExprChecker {
   }
 
   private callGeneric(
-    span: Span, g: usize, id: Ident, explicit: Option<TypeExpr[]>, args: Expr[], exp: Option<Type>
+    span: Span,
+    g: usize,
+    id: Ident,
+    explicit: Option<TypeExpr[]>,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     return this.callGenericW(span, g, "function `" + id.name + "`", explicit, args, exp);
   }
 
   // `what` names the callee in diagnostics ("function `f`", "constructor of `Box`").
   private callGenericW(
-    span: Span, g: usize, what: string, explicit: Option<TypeExpr[]>, args: Expr[], exp: Option<Type>
+    span: Span,
+    g: usize,
+    what: string,
+    explicit: Option<TypeExpr[]>,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const gf = this.fx.env.gfuncs[g];
     let ptes: TypeExpr[] = [];
     for (const p of gf.decl.params) {
       ptes.push(p.ty);
     }
-    const io = this.infer(span, what, gf.unit, gf.decl.typeParams, ptes, gf.decl.ret, args, exp, explicit)?;
+    const io = this.infer(
+      span,
+      what,
+      gf.unit,
+      gf.decl.typeParams,
+      ptes,
+      gf.decl.ret,
+      args,
+      exp,
+      explicit,
+    )?;
     let ret: Type = TyVoid;
     match (gf.decl.ret) {
       Some(rte) => {
         ret = this.resolveBound(gf.unit, paramNameList(gf.decl.typeParams), io.tys, rte, true)?;
       },
-      None => {}
+      None => {},
     }
     match (checkBounds(this.fx.env, gf.unit, gf.decl, io.tys, span)) {
       Some(d) => {
         return Err(d);
       },
-      None => {}
+      None => {},
     }
     let fid: usize = 0;
     if (!this.fx.abs) {
@@ -1412,19 +1687,31 @@ export class ExprChecker {
   }
 
   private genericVariant(
-    span: Span, g: usize, tag: usize, explicit: Option<TypeExpr[]>, args: Expr[], exp: Option<Type>
+    span: Span,
+    g: usize,
+    tag: usize,
+    explicit: Option<TypeExpr[]>,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const gt = this.fx.env.gtypes[g];
     const vs = match (gt.decl.body) {
       DUnion(x) => x,
       _ => {
         return Err(diag("E0400", span, "not a variant constructor"));
-      }
+      },
     };
     const v = vs[tag];
     const io = this.infer(
-      span, "variant `" + v.name.name + "`", gt.unit, gt.decl.typeParams, v.payload,
-      Some(selfTypeExpr(gt.decl)), args, exp, explicit
+      span,
+      "variant `" + v.name.name + "`",
+      gt.unit,
+      gt.decl.typeParams,
+      v.payload,
+      Some(selfTypeExpr(gt.decl)),
+      args,
+      exp,
+      explicit,
     )?;
     const inst = instType(this.fx.env, g, io.tys, 0, span)?;
     match (inst.ty) {
@@ -1434,16 +1721,23 @@ export class ExprChecker {
       },
       _ => {
         return Err(diag("E0400", span, "not a variant constructor"));
-      }
+      },
     }
   }
 
-  private callBuiltin(span: Span, what: string, b: Builtin, args: Expr[]): Result<HExpr, Diagnostic> {
+  private callBuiltin(
+    span: Span,
+    what: string,
+    b: Builtin,
+    args: Expr[],
+  ): Result<HExpr, Diagnostic> {
     match (b) {
       BGrantRevoke => {
         // `grantRevoke(g)` (std:fsraw, library code only): any grant
         if (args.length != 1) {
-          return Err(diag("E0404", span, what + " expects 1 argument(s), found " + args.length.toString()));
+          return Err(
+            diag("E0404", span, what + " expects 1 argument(s), found " + args.length.toString()),
+          );
         }
         const r0 = this.ex(args[0], None)?;
         match (r0.ty) {
@@ -1451,11 +1745,17 @@ export class ExprChecker {
             return Ok(mk(XBuiltin(b, [r0]), TyVoid, span));
           },
           _ => {
-            return Err(diag("E0471", args[0].span, what + " needs a grant, found `" + showType(this.fx.env, r0.ty) + "`"));
-          }
+            return Err(
+              diag(
+                "E0471",
+                args[0].span,
+                what + " needs a grant, found `" + showType(this.fx.env, r0.ty) + "`",
+              ),
+            );
+          },
         }
       },
-      _ => {}
+      _ => {},
     }
     const sig = builtinSig(b);
     const gk = grantNeeded(b);
@@ -1470,7 +1770,10 @@ export class ExprChecker {
         const g0 = this.ex(args[0], Some(sig.params[0]))?;
         if (!typeEq(g0.ty, sig.params[0])) {
           const found = showType(this.fx.env, g0.ty);
-          const isGrant = match (g0.ty) { TyGrant(_) => true, _ => false };
+          const isGrant = match (g0.ty) {
+            TyGrant(_) => true,
+            _ => false,
+          };
           return Err(grantMismatchErr(args[0].span, what, gname, found, isGrant));
         }
         this.fx = saved;
@@ -1481,13 +1784,17 @@ export class ExprChecker {
   }
 
   private callMember(
-    span: Span, base: Expr, name: Ident, args: Expr[], exp: Option<Type>
+    span: Span,
+    base: Expr,
+    name: Ident,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     match (base.kind) {
       EIdent(bid) => {
         const special = (bid.name == "console" || bid.name == "String")
-          && !this.fx.isVisibleVar(bid.name)
-          && globalVal(this.fx.env, this.fx.unit, bid.name).isNone();
+            && !this.fx.isVisibleVar(bid.name)
+            && globalVal(this.fx.env, this.fx.unit, bid.name).isNone();
         if (special) {
           let b: Option<Builtin> = None;
           if (bid.name == "console" && name.name == "log") {
@@ -1498,11 +1805,14 @@ export class ExprChecker {
             b = Some(BStringFromCharCode);
           }
           if (b.isNone()) {
-            return Err(diag("E0405", name.span, "`" + bid.name + "` has no member `" + name.name + "`"));
+            return Err(
+              diag("E0405", name.span, "`" + bid.name + "` has no member `" + name.name + "`"),
+            );
           }
           return this.callBuiltin(span, "`" + bid.name + "." + name.name + "`", b.unwrap(), args);
         }
-        if (!this.fx.isVisibleVar(bid.name) && globalVal(this.fx.env, this.fx.unit, bid.name).isNone()) {
+        if (!this.fx.isVisibleVar(bid.name)
+            && globalVal(this.fx.env, this.fx.unit, bid.name).isNone()) {
           const te = findType(this.fx.env.units[this.fx.unit].scope, bid.name);
           if (te.isSome()) {
             match (te.unwrap()) {
@@ -1518,17 +1828,22 @@ export class ExprChecker {
                   return this.staticCall(span, co.unwrap(), name, args);
                 }
               },
-              _ => {}
+              _ => {},
             }
           }
         }
       },
-      _ => {}
+      _ => {},
     }
     return this.methodCall(span, base, name, args, exp);
   }
 
-  private builtinCtor(span: Span, name: string, args: Expr[], exp: Option<Type>): Result<HExpr, Diagnostic> {
+  private builtinCtor(
+    span: Span,
+    name: string,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     if (name == "Some") {
       return this.someCtor(span, args, exp);
     }
@@ -1538,9 +1853,13 @@ export class ExprChecker {
         this.ex(a, None)?;
       }
       if (name == "Ok") {
-        return Err(diag("E0407", span, "cannot infer the error type of `Ok(..)`; add a type annotation"));
+        return Err(
+          diag("E0407", span, "cannot infer the error type of `Ok(..)`; add a type annotation"),
+        );
       }
-      return Err(diag("E0407", span, "cannot infer the success type of `Err(..)`; add a type annotation"));
+      return Err(
+        diag("E0407", span, "cannot infer the success type of `Err(..)`; add a type annotation"),
+      );
     }
     const et = exp.unwrap();
     match (et) {
@@ -1551,8 +1870,10 @@ export class ExprChecker {
         return this.errCtor(span, args, t, e);
       },
       _ => {
-        return Err(diag("E0400", span, "expected `" + showType(this.fx.env, et) + "`, found a `Result`"));
-      }
+        return Err(
+          diag("E0400", span, "expected `" + showType(this.fx.env, et) + "`, found a `Result`"),
+        );
+      },
     }
   }
 
@@ -1567,10 +1888,10 @@ export class ExprChecker {
           TyOption(x) => {
             inner = Some(x);
           },
-          _ => {}
+          _ => {},
         }
       },
-      None => {}
+      None => {},
     }
     let p: HExpr = mk(XBool(false), TyBool, span);
     match (inner) {
@@ -1579,7 +1900,7 @@ export class ExprChecker {
       },
       None => {
         p = this.ex(args[0], None)?;
-      }
+      },
     }
     if (isVoid(p.ty)) {
       return Err(diag("E0400", args[0].span, "`Option<void>` is not allowed"));
@@ -1590,7 +1911,13 @@ export class ExprChecker {
   private okCtor(span: Span, args: Expr[], t: Type, e: Type): Result<HExpr, Diagnostic> {
     const want: usize = isVoid(t) ? 0 : 1;
     if (args.length != want) {
-      return Err(diag("E0404", span, "`Ok` expects " + want.toString() + " argument(s), found " + args.length.toString()));
+      return Err(
+        diag(
+          "E0404",
+          span,
+          "`Ok` expects " + want.toString() + " argument(s), found " + args.length.toString(),
+        ),
+      );
     }
     if (want == 0) {
       return Ok(mk(XVariant(0, noExprs()), TyResult(t, e), span));
@@ -1618,12 +1945,16 @@ export class ExprChecker {
       EThis => true,
       EMember(_, _) => true,
       EIndex(_, _) => true,
-      _ => false
+      _ => false,
     };
   }
 
   private methodCall(
-    span: Span, base: Expr, name: Ident, args: Expr[], exp: Option<Type>
+    span: Span,
+    base: Expr,
+    name: Ident,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const n = name.name;
     // The receiver is checked as a value first; for `push` / `pop` on a place it is checked again as a
@@ -1661,7 +1992,7 @@ export class ExprChecker {
         TyIface(i) => {
           return this.ifaceCall(b0, span, i, name, args);
         },
-        _ => {}
+        _ => {},
       }
     }
     if (n == "push" || n == "pop") {
@@ -1677,7 +2008,13 @@ export class ExprChecker {
     }
     const so = methodSig(b.ty, n);
     if (so.isNone()) {
-      return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`"));
+      return Err(
+        diag(
+          "E0405",
+          name.span,
+          "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`",
+        ),
+      );
     }
     const s = so.unwrap();
     const a = this.argsExpect(span, "method `" + n + "`", args, s.params)?;
@@ -1691,10 +2028,21 @@ export class ExprChecker {
   // Methods of the integer types (ADR-0022) that need constants or the receiver type: explicit conversions
   // (`toI32()`, `toUsize()`, `toInt()`, ...) and `wrapping*` / `saturating*` / `checked*` `Add` / `Sub` / `Mul`.
   // None when `name` is not one of them (the plain built-in methods are in builtins.or).
-  private intMethodCall(b: HExpr, span: Span, name: Ident, args: Expr[]): Result<Option<HExpr>, Diagnostic> {
+  private intMethodCall(
+    b: HExpr,
+    span: Span,
+    name: Ident,
+    args: Expr[],
+  ): Result<Option<HExpr>, Diagnostic> {
     const n = name.name;
     if (n == "toI128" || n == "toU128") {
-      return Err(diag("E0431", name.span, "the 128-bit integer types are not supported yet (ADR-0022); use `toI64()` / `toU64()`"));
+      return Err(
+        diag(
+          "E0431",
+          name.span,
+          "the 128-bit integer types are not supported yet (ADR-0022); use `toI64()` / `toU64()`",
+        ),
+      );
     }
     const dk = convMethodKind(n);
     if (dk >= 0) {
@@ -1711,18 +2059,25 @@ export class ExprChecker {
     return Ok(none2);
   }
 
-  private mutMethodCall(span: Span, base: Expr, name: Ident, args: Expr[]): Result<HExpr, Diagnostic> {
+  private mutMethodCall(
+    span: Span,
+    base: Expr,
+    name: Ident,
+    args: Expr[],
+  ): Result<HExpr, Diagnostic> {
     const n = name.name;
     if (this.isPlaceShaped(base)) {
       const pi = this.placeOf(base)?;
       match (pi.place.ty) {
         TyArray(t) => {
           if (!pi.mutable) {
-            return Err(diag(
-              "E0401",
-              base.span,
-              "cannot call `" + n + "` on `" + pi.rootName + "`: it is not declared with `let`"
-            ));
+            return Err(
+              diag(
+                "E0401",
+                base.span,
+                "cannot call `" + n + "` on `" + pi.rootName + "`: it is not declared with `let`",
+              ),
+            );
           }
           const isPush = n == "push";
           const params: Type[] = isPush ? [t] : [];
@@ -1733,15 +2088,27 @@ export class ExprChecker {
           return Ok(mk(XMutMethod(op, pi.place, a), ret, span));
         },
         _ => {
-          return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(this.fx.env, pi.place.ty) + "`"));
-        }
+          return Err(
+            diag(
+              "E0405",
+              name.span,
+              "no method `" + n + "` on type `" + showType(this.fx.env, pi.place.ty) + "`",
+            ),
+          );
+        },
       }
     }
     const b = this.ex(base, None)?;
     if (isArrayTy(b.ty)) {
       return Err(diag("E0401", base.span, "receiver of `" + n + "` must be a mutable place"));
     }
-    return Err(diag("E0405", name.span, "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`"));
+    return Err(
+      diag(
+        "E0405",
+        name.span,
+        "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`",
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------
@@ -1762,7 +2129,7 @@ export class ExprChecker {
           return Ok(PlaceInfo {
             place: Place { root: l, path: path, ty: loc.ty },
             mutable: loc.mutable,
-            rootName: id.name
+            rootName: id.name,
           });
         }
         if (globalVal(this.fx.env, this.fx.unit, id.name).isSome()) {
@@ -1783,7 +2150,7 @@ export class ExprChecker {
         return Ok(PlaceInfo {
           place: Place { root: l, path: path, ty: this.fx.locals[l].ty },
           mutable: this.fx.locals[l].mutable,
-          rootName: "this"
+          rootName: "this",
         });
       },
       EMember(base, name) => {
@@ -1791,19 +2158,28 @@ export class ExprChecker {
         match (p.place.ty) {
           TyRecord(r) => {
             if (this.outsideMapPrelude(p.place.ty)) {
-              return Err(diag("E0401", e.span, "`" + name.name + "` is read-only: a `Map` changes only through `set` and `delete`"));
+              return Err(
+                diag(
+                  "E0401",
+                  e.span,
+                  "`" + name.name
+                      + "` is read-only: a `Map` changes only through `set` and `delete`",
+                ),
+              );
             }
             const def = this.fx.env.records[r];
             const io = fieldIndex(def.fields, name.name);
             if (io.isNone()) {
-              return Err(diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"));
+              return Err(
+                diag("E0405", name.span, "no field `" + name.name + "` on type `" + def.name + "`"),
+              );
             }
             this.fieldAccess(r, name)?;
             const i = io.unwrap();
             return Ok(PlaceInfo {
               place: extendPath(p.place, PField(r, i), def.fields[i].ty),
               mutable: p.mutable,
-              rootName: p.rootName
+              rootName: p.rootName,
             });
           },
           TyString => {
@@ -1820,7 +2196,7 @@ export class ExprChecker {
           },
           _ => {
             return Err(noField(this.fx.env, name, p.place.ty));
-          }
+          },
         }
       },
       EIndex(base, index) => {
@@ -1831,17 +2207,23 @@ export class ExprChecker {
             return Ok(PlaceInfo {
               place: extendPath(p.place, PIndex(idx), t),
               mutable: p.mutable,
-              rootName: p.rootName
+              rootName: p.rootName,
             });
           },
           _ => {
-            return Err(diag("E0400", e.span, "cannot index into type `" + showType(this.fx.env, p.place.ty) + "`"));
-          }
+            return Err(
+              diag(
+                "E0400",
+                e.span,
+                "cannot index into type `" + showType(this.fx.env, p.place.ty) + "`",
+              ),
+            );
+          },
         }
       },
       _ => {
         return Err(diag("E0401", e.span, "expression is not an assignable place"));
-      }
+      },
     }
   }
 
@@ -1850,23 +2232,36 @@ export class ExprChecker {
   // ---------------------------------------------------------------------------
 
   // A private field is only accessible inside its class (E0405).
+  @Ensures(result.isErr() ==> result.unwrapErr().code == "E0405")
   private fieldAccess(r: usize, name: Ident): Result<void, Diagnostic> {
     const co = classOfRec(this.fx.env, r);
     if (co.isSome()) {
       const c = co.unwrap();
       const ci = this.fx.env.classes[c];
       if (fieldIsPrivate(ci, name.name) && !this.fx.inClass(c)) {
-        return Err(diag("E0405", name.span, "field `" + name.name + "` of class `" + ci.name + "` is private"));
+        return Err(
+          diag(
+            "E0405",
+            name.span,
+            "field `" + name.name + "` of class `" + ci.name + "` is private",
+          ),
+        );
       }
     }
     return Ok();
   }
 
   private newExpr(
-    span: Span, name: Ident, targs: TypeExpr[], args: Expr[], exp: Option<Type>
+    span: Span,
+    name: Ident,
+    targs: TypeExpr[],
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const env = this.fx.env;
-    if (name.name == "Map" && findType(env.units[this.fx.unit].scope, "Map").isNone() && env.mapUnit >= 0) {
+    if (name.name == "Map"
+        && findType(env.units[this.fx.unit].scope, "Map").isNone()
+        && env.mapUnit >= 0) {
       return this.newMap(span, targs, args, exp);
     }
     const found = findType(env.units[this.fx.unit].scope, name.name);
@@ -1876,7 +2271,7 @@ export class ExprChecker {
     const co = match (found.unwrap()) {
       EntRecord(r) => classOfRec(env, r),
       EntGen(g) => classOfGeneric(env, g),
-      _ => None
+      _ => None,
     };
     if (co.isNone()) {
       return Err(diag("E0400", name.span, "`" + name.name + "` is not a class"));
@@ -1889,10 +2284,23 @@ export class ExprChecker {
       if (targs.length > 0) {
         explicit = Some(targs);
       }
-      return this.callGenericW(span, ci.ctor, "constructor of `" + name.name + "`", explicit, args, exp);
+      return this.callGenericW(
+        span,
+        ci.ctor,
+        "constructor of `" + name.name + "`",
+        explicit,
+        args,
+        exp,
+      );
     }
     if (targs.length > 0) {
-      return Err(diag("E0400", name.span, "class `" + name.name + "` is not generic and takes no type arguments"));
+      return Err(
+        diag(
+          "E0400",
+          name.span,
+          "class `" + name.name + "` is not generic and takes no type arguments",
+        ),
+      );
     }
     const f = env.funcs[ci.ctor];
     const a = this.argsExpect(span, "constructor of `" + name.name + "`", args, f.params)?;
@@ -1903,14 +2311,32 @@ export class ExprChecker {
     const ci = this.fx.env.classes[c];
     const mo = findMethod(ci, name.name);
     if (mo.isNone()) {
-      return Err(diag("E0405", name.span, "class `" + ci.name + "` has no static method `" + name.name + "`"));
+      return Err(
+        diag(
+          "E0405",
+          name.span,
+          "class `" + ci.name + "` has no static method `" + name.name + "`",
+        ),
+      );
     }
     const mi = ci.methods[mo.unwrap()];
     if (mi.priv && !this.fx.inClass(c)) {
-      return Err(diag("E0405", name.span, "method `" + name.name + "` of class `" + ci.name + "` is private"));
+      return Err(
+        diag(
+          "E0405",
+          name.span,
+          "method `" + name.name + "` of class `" + ci.name + "` is private",
+        ),
+      );
     }
     if (!mi.isStatic) {
-      return Err(diag("E0405", name.span, "`" + name.name + "` is an instance method of `" + ci.name + "`; call it on a value"));
+      return Err(
+        diag(
+          "E0405",
+          name.span,
+          "`" + name.name + "` is an instance method of `" + ci.name + "`; call it on a value",
+        ),
+      );
     }
     const f = this.fx.env.funcs[mi.fid];
     const a = this.argsExpect(span, "method `" + name.name + "`", args, f.params)?;
@@ -1919,19 +2345,39 @@ export class ExprChecker {
 
   // `recv.m(args)` where the receiver has class type `c` (already checked as `b`).
   private classMethodCall(
-    span: Span, base: Expr, b: HExpr, c: usize, name: Ident, args: Expr[]
+    span: Span,
+    base: Expr,
+    b: HExpr,
+    c: usize,
+    name: Ident,
+    args: Expr[],
   ): Result<HExpr, Diagnostic> {
     const ci = this.fx.env.classes[c];
     const mo = findMethod(ci, name.name);
     if (mo.isNone()) {
-      return Err(diag("E0405", name.span, "no method `" + name.name + "` on class `" + ci.name + "`"));
+      return Err(
+        diag("E0405", name.span, "no method `" + name.name + "` on class `" + ci.name + "`"),
+      );
     }
     const mi = ci.methods[mo.unwrap()];
     if (mi.priv && !this.fx.inClass(c)) {
-      return Err(diag("E0405", name.span, "method `" + name.name + "` of class `" + ci.name + "` is private"));
+      return Err(
+        diag(
+          "E0405",
+          name.span,
+          "method `" + name.name + "` of class `" + ci.name + "` is private",
+        ),
+      );
     }
     if (mi.isStatic) {
-      return Err(diag("E0405", name.span, "`" + name.name + "` is a static method; call it as `" + ci.name + "." + name.name + "(..)`"));
+      return Err(
+        diag(
+          "E0405",
+          name.span,
+          "`" + name.name + "` is a static method; call it as `" + ci.name + "." + name.name
+              + "(..)`",
+        ),
+      );
     }
     const ms = this.methodSigOf(ci, mi, b.ty, span)?;
     const a = this.argsExpect(span, "method `" + name.name + "`", args, tailTypes(ms.params))?;
@@ -1943,19 +2389,25 @@ export class ExprChecker {
       return Ok(mk(XCall(ms.fid, all), ms.srcRet, span));
     }
     if (!this.isPlaceShaped(base)) {
-      return Err(diag(
-        "E0401",
-        base.span,
-        "receiver of mutating method `" + name.name + "` must be a mutable place (a `let` variable, field or element)"
-      ));
+      return Err(
+        diag(
+          "E0401",
+          base.span,
+          "receiver of mutating method `" + name.name
+              + "` must be a mutable place (a `let` variable, field or element)",
+        ),
+      );
     }
     const pi = this.placeOf(base)?;
     if (!pi.mutable) {
-      return Err(diag(
-        "E0401",
-        base.span,
-        "cannot call mutating method `" + name.name + "` on `" + pi.rootName + "`: it is not declared with `let`"
-      ));
+      return Err(
+        diag(
+          "E0401",
+          base.span,
+          "cannot call mutating method `" + name.name + "` on `" + pi.rootName
+              + "`: it is not declared with `let`",
+        ),
+      );
     }
     this.fx.markMut(pi.place);
     if (this.fx.probe) {
@@ -1965,11 +2417,14 @@ export class ExprChecker {
       return Ok(nopExpr(span));
     }
     if (!purePlace(pi.place)) {
-      return Err(diag(
-        "E0408",
-        base.span,
-        "the receiver of mutating method `" + name.name + "` must not contain index expressions with side effects"
-      ));
+      return Err(
+        diag(
+          "E0408",
+          base.span,
+          "the receiver of mutating method `" + name.name
+              + "` must not contain index expressions with side effects",
+        ),
+      );
     }
     const call = mk(XCall(ms.fid, all), ms.ret, span);
     if (!mi.hasRet) {
@@ -1988,17 +2443,34 @@ export class ExprChecker {
   // function per method. A generic class (ADR-0026) has a generic function per method: the signature
   // is the one under the receiver's type arguments, and outside abstract checks and mutation probes the
   // instance is created (`instFunc`) and called. Abstract checks / probes never create instances.
-  private methodSigOf(ci: ClassInfo, mi: MethodInfo, recv: Type, span: Span): Result<MethSig, Diagnostic> {
+  private methodSigOf(
+    ci: ClassInfo,
+    mi: MethodInfo,
+    recv: Type,
+    span: Span,
+  ): Result<MethSig, Diagnostic> {
     if (ci.gid < 0 || mi.isStatic) {
       const f = this.fx.env.funcs[mi.fid];
-      return Ok(MethSig { fid: mi.fid, params: f.params, ret: f.ret, srcRet: f.srcRet, retRec: mi.retRec });
+      return Ok(MethSig {
+        fid: mi.fid,
+        params: f.params,
+        ret: f.ret,
+        srcRet: f.srcRet,
+        retRec: mi.retRec,
+      });
     }
     const o = originOf(this.fx.env, recv);
     const args = match (o) {
       Some(i) => i.args,
       None => {
-        return Err(diag("E0400", span, "`" + showType(this.fx.env, recv) + "` is not an instance of class `" + ci.name + "`"));
-      }
+        return Err(
+          diag(
+            "E0400",
+            span,
+            "`" + showType(this.fx.env, recv) + "` is not an instance of class `" + ci.name + "`",
+          ),
+        );
+      },
     };
     const gf = this.fx.env.gfuncs[mi.fid];
     if (this.fx.abs || this.fx.probe) {
@@ -2013,7 +2485,7 @@ export class ExprChecker {
     if (f.mode == 4) {
       rr = match (f.ret) {
         TyRecord(r) => r,
-        _ => 0
+        _ => 0,
       };
     }
     this.fx.adopt(fo.env);
@@ -2021,7 +2493,13 @@ export class ExprChecker {
   }
 
   // `r.f(args)` where field `f` of record `r` has a function type.
-  private callFieldValue(b: HExpr, span: Span, r: usize, name: Ident, args: Expr[]): Result<HExpr, Diagnostic> {
+  private callFieldValue(
+    b: HExpr,
+    span: Span,
+    r: usize,
+    name: Ident,
+    args: Expr[],
+  ): Result<HExpr, Diagnostic> {
     const def = this.fx.env.records[r];
     const i = fieldIndex(def.fields, name.name).unwrap();
     this.fieldAccess(r, name)?;
@@ -2033,7 +2511,7 @@ export class ExprChecker {
       },
       _ => {
         return Err(diag("E0400", span, "`" + name.name + "` is not a function"));
-      }
+      },
     }
   }
 
@@ -2045,22 +2523,31 @@ export class ExprChecker {
   // type, when known. The body is checked as a new function (closure conversion): its first parameter
   // is the environment record holding the captured variables, which are bound to immutable locals
   // at entry. The result is `XClosure(lifted, captures)`.
+  @Ensures(result.isOk() ==> isFn(result.unwrap().ty) && this.fx.ncl == old(this.fx.ncl) + 1)
+  @Ensures(result.isOk() ==> this.fx.env.lifted.length > old(this.fx.env.lifted.length))
   private arrow(
-    span: Span, ps: ArrowParam[], retTE: Option<TypeExpr>, body: ArrowBody,
-    expP: Option<Type[]>, expR: Option<Type>
+    span: Span,
+    ps: ArrowParam[],
+    retTE: Option<TypeExpr>,
+    body: ArrowBody,
+    expP: Option<Type[]>,
+    expR: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     match (expP) {
       Some(eps) => {
         if (eps.length != ps.length) {
-          return Err(diag(
-            "E0404",
-            span,
-            "this function value is expected to take " + eps.length.toString() + " argument(s), the arrow function has "
-              + ps.length.toString() + " parameter(s)"
-          ));
+          return Err(
+            diag(
+              "E0404",
+              span,
+              "this function value is expected to take " + eps.length.toString()
+                  + " argument(s), the arrow function has " + ps.length.toString()
+                  + " parameter(s)",
+            ),
+          );
         }
       },
-      None => {}
+      None => {},
     }
     let ptys: Type[] = [];
     let names: string[] = [];
@@ -2081,7 +2568,7 @@ export class ExprChecker {
                 return Err(mismatch(this.fx.env, p.span, eps[i], t));
               }
             },
-            None => {}
+            None => {},
           }
         },
         None => {
@@ -2090,14 +2577,16 @@ export class ExprChecker {
               t = eps[i];
             },
             None => {
-              return Err(diag(
-                "E0407",
-                p.name.span,
-                "cannot infer the type of parameter `" + p.name.name + "`; add a type annotation"
-              ));
-            }
+              return Err(
+                diag(
+                  "E0407",
+                  p.name.span,
+                  "cannot infer the type of parameter `" + p.name.name + "`; add a type annotation",
+                ),
+              );
+            },
           }
-        }
+        },
       }
       ptys.push(t);
       names.push(p.name.name);
@@ -2116,17 +2605,20 @@ export class ExprChecker {
             ret = t;
             known = true;
           },
-          None => {}
+          None => {},
         }
-      }
+      },
     }
     const isBlock = match (body) {
       ABlock(_) => true,
-      AExpr(_) => false
+      AExpr(_) => false,
     };
     const lname = this.fx.qname + "$closure" + this.fx.ncl.toString();
     // The body is checked as a function of its own, in a context that sees this one as `outer`.
-    let sub = new ExprChecker(newClosureCtx(this.fx, lname, names, ptys, ret, !known && isBlock), this.host);
+    let sub = new ExprChecker(
+      newClosureCtx(this.fx, lname, names, ptys, ret, !known && isBlock),
+      this.host,
+    );
     let stmts: HStmt[] = [];
     let finalRet = ret;
     match (body) {
@@ -2172,10 +2664,16 @@ export class ExprChecker {
         if (!isVoid(finalRet) && !bo.div) {
           return Err(diag("E0403", span, "the closure does not return a value on every path"));
         }
-      }
+      },
     }
     if (hasResource(finalRet)) {
-      return Err(diag("E0450", span, "a closure cannot return a resource handle (it can only be passed to functions, borrowed)"));
+      return Err(
+        diag(
+          "E0450",
+          span,
+          "a closure cannot return a resource handle (it can only be passed to functions, borrowed)",
+        ),
+      );
     }
     // Environment record, entry prologue, lifted function; then, back in the enclosing function,
     // evaluate the captured variables there.
@@ -2192,6 +2690,7 @@ export class ExprChecker {
   }
 
   // The lifted wrapper of function `fid` as a function value (created once per function).
+  @Ensures(result.isOk() ==> isFn(result.unwrap().ty))
   private wrapFunc(span: Span, fid: usize): Result<HExpr, Diagnostic> {
     const w = wrapperOf(this.fx, span, fid)?;
     if (w.created) {
@@ -2204,8 +2703,13 @@ export class ExprChecker {
 
   // A top-level function used as a value. A generic function needs its type arguments from the
   // expected function type: `expP` / `expR` (parameter types, and the result type when known).
+  @Ensures(result.isOk() ==> isFn(result.unwrap().ty))
   private funcValue(
-    span: Span, ent: ValEnt, id: Ident, expP: Option<Type[]>, expR: Option<Type>
+    span: Span,
+    ent: ValEnt,
+    id: Ident,
+    expP: Option<Type[]>,
+    expR: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     match (ent) {
       VFunc(fid) => {
@@ -2222,12 +2726,14 @@ export class ExprChecker {
         match (expP) {
           Some(eps) => {
             if (eps.length != gf.decl.params.length) {
-              return Err(diag(
-                "E0404",
-                span,
-                "function `" + id.name + "` takes " + gf.decl.params.length.toString() + " argument(s), the expected function type has "
-                  + eps.length.toString()
-              ));
+              return Err(
+                diag(
+                  "E0404",
+                  span,
+                  "function `" + id.name + "` takes " + gf.decl.params.length.toString()
+                      + " argument(s), the expected function type has " + eps.length.toString(),
+                ),
+              );
             }
             let i: usize = 0;
             while (i < eps.length) {
@@ -2235,7 +2741,7 @@ export class ExprChecker {
               i += 1;
             }
           },
-          None => {}
+          None => {},
         }
         match (expR) {
           Some(er) => {
@@ -2243,10 +2749,10 @@ export class ExprChecker {
               Some(rt) => {
                 inf.learn(this.fx.env, gf.unit, rt, er);
               },
-              None => {}
+              None => {},
             }
           },
-          None => {}
+          None => {},
         }
         let tys: Type[] = [];
         let bi: usize = 0;
@@ -2256,13 +2762,15 @@ export class ExprChecker {
               tys.push(t);
             },
             None => {
-              return Err(diag(
-                "E0407",
-                span,
-                "cannot infer type argument `" + tp[bi] + "` of function `" + id.name
-                  + "` used as a value; its type arguments come from the expected function type, add a type annotation"
-              ));
-            }
+              return Err(
+                diag(
+                  "E0407",
+                  span,
+                  "cannot infer type argument `" + tp[bi] + "` of function `" + id.name
+                      + "` used as a value; its type arguments come from the expected function type, add a type annotation",
+                ),
+              );
+            },
           }
           bi += 1;
         }
@@ -2276,13 +2784,13 @@ export class ExprChecker {
           Some(rte) => {
             ret = this.resolveBound(gf.unit, tp, tys, rte, true)?;
           },
-          None => {}
+          None => {},
         }
         match (checkBounds(this.fx.env, gf.unit, gf.decl, tys, span)) {
           Some(d) => {
             return Err(d);
           },
-          None => {}
+          None => {},
         }
         if (this.fx.abs) {
           const noCaps: HExpr[] = [];
@@ -2294,7 +2802,7 @@ export class ExprChecker {
       },
       _ => {
         return Err(diag("E0400", span, "function `" + id.name + "` cannot be used as a value"));
-      }
+      },
     }
   }
 
@@ -2304,36 +2812,68 @@ export class ExprChecker {
   // ---------------------------------------------------------------------------
 
   private arrayApiCall(
-    b: HExpr, span: Span, elem: Type, name: Ident, args: Expr[], exp: Option<Type>
+    b: HExpr,
+    span: Span,
+    elem: Type,
+    name: Ident,
+    args: Expr[],
+    exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const n = name.name;
     let fname = n;
     if (n == "indexOf" || n == "includes") {
       const suffix = elemSuffix(elem);
       if (suffix == "") {
-        return Err(diag(
-          "E0405",
-          name.span,
-          "method `" + n + "` is only available on arrays of integers, `bool` or `string`, not `"
-            + showType(this.fx.env, TyArray(elem)) + "`"
-        ));
+        return Err(
+          diag(
+            "E0405",
+            name.span,
+            "method `" + n + "` is only available on arrays of integers, `bool` or `string`, not `"
+                + showType(this.fx.env, TyArray(elem)) + "`",
+          ),
+        );
       }
       fname = n + suffix;
     }
-    const noMethod = diag("E0405", name.span, "no method `" + n + "` on type `" + showType(this.fx.env, TyArray(elem)) + "`");
+    const noMethod = diag(
+      "E0405",
+      name.span,
+      "no method `" + n + "` on type `" + showType(this.fx.env, TyArray(elem)) + "`",
+    );
     if (this.fx.env.prelude < 0) {
       return Err(noMethod);
     }
-    const argTy: Option<Type> = (n == "indexOf" || n == "includes") && isIntish(elem) ? Some(elem) : None;
-    return this.preludeCall(b, span, this.fx.env.prelude.toUsize(), fname, n, noMethod, args, noPre(args.length), exp, argTy);
+    const argTy: Option<Type> = (n == "indexOf" || n == "includes") && isIntish(elem)
+        ? Some(elem)
+        : None;
+    return this.preludeCall(
+      b,
+      span,
+      this.fx.env.prelude.toUsize(),
+      fname,
+      n,
+      noMethod,
+      args,
+      noPre(args.length),
+      exp,
+      argTy,
+    );
   }
 
   // Call of the prelude function `fname` of unit `unit` with the checked receiver `b` as first argument and
   // `args` as the others (`argPre[i]` may hold an already checked argument). Generic functions get their type
   // arguments inferred; non-generic ones are called directly.
   private preludeCall(
-    b: HExpr, span: Span, unit: usize, fname: string, n: string, noMethod: Diagnostic,
-    args: Expr[], argPre: Option<HExpr>[], exp: Option<Type>, argTy: Option<Type>
+    b: HExpr,
+    span: Span,
+    unit: usize,
+    fname: string,
+    n: string,
+    noMethod: Diagnostic,
+    args: Expr[],
+    argPre: Option<HExpr>[],
+    exp: Option<Type>,
+    argTy: Option<Type>,
   ): Result<HExpr, Diagnostic> {
     const ent = findVal(this.fx.env.units[unit].scope, fname);
     if (ent.isNone()) {
@@ -2343,11 +2883,14 @@ export class ExprChecker {
       VGFunc(g) => {
         const gf = this.fx.env.gfuncs[g];
         if (args.length + 1 != gf.decl.params.length) {
-          return Err(diag(
-            "E0404",
-            span,
-            "method `" + n + "` expects " + (gf.decl.params.length - 1).toString() + " argument(s), found " + args.length.toString()
-          ));
+          return Err(
+            diag(
+              "E0404",
+              span,
+              "method `" + n + "` expects " + (gf.decl.params.length - 1).toString()
+                  + " argument(s), found " + args.length.toString(),
+            ),
+          );
         }
         let ptes: TypeExpr[] = [];
         for (const p of gf.decl.params) {
@@ -2364,15 +2907,23 @@ export class ExprChecker {
         }
         const noExplicit: Option<TypeExpr[]> = None;
         const io = this.inferPre(
-          span, "method `" + n + "`", gf.unit, gf.decl.typeParams, ptes, gf.decl.ret, all, exp,
-          noExplicit, pre
+          span,
+          "method `" + n + "`",
+          gf.unit,
+          gf.decl.typeParams,
+          ptes,
+          gf.decl.ret,
+          all,
+          exp,
+          noExplicit,
+          pre,
         )?;
         let ret: Type = TyVoid;
         match (gf.decl.ret) {
           Some(rte) => {
             ret = this.resolveBound(gf.unit, paramNameList(gf.decl.typeParams), io.tys, rte, true)?;
           },
-          None => {}
+          None => {},
         }
         let fid: usize = 0;
         if (!this.fx.abs) {
@@ -2395,7 +2946,7 @@ export class ExprChecker {
       },
       _ => {
         return Err(noMethod);
-      }
+      },
     }
   }
 
@@ -2416,16 +2967,25 @@ export class ExprChecker {
           this.fx.adopt(fo.env);
           return Ok(fo.fid);
         },
-        _ => {}
+        _ => {},
       }
     }
-    return Err(diag("E0405", span, "internal error: the Map prelude has no function `" + fname + "`"));
+    return Err(
+      diag("E0405", span, "internal error: the Map prelude has no function `" + fname + "`"),
+    );
   }
 
   // `new Map<K, V>()`; the type arguments may be omitted when the expected type is a Map.
-  private newMap(span: Span, targs: TypeExpr[], args: Expr[], exp: Option<Type>): Result<HExpr, Diagnostic> {
+  private newMap(
+    span: Span,
+    targs: TypeExpr[],
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
     if (args.length != 0) {
-      return Err(diag("E0404", span, "`new Map` takes no arguments, found " + args.length.toString()));
+      return Err(
+        diag("E0404", span, "`new Map` takes no arguments, found " + args.length.toString()),
+      );
     }
     let kt: Type = TyVoid;
     let vt: Type = TyVoid;
@@ -2443,13 +3003,16 @@ export class ExprChecker {
             found = true;
           }
         },
-        None => {}
+        None => {},
       }
       if (!found) {
-        return Err(diag(
-          "E0407", span,
-          "cannot infer the type arguments of `new Map()`; write `new Map<K, V>()` or add a type annotation"
-        ));
+        return Err(
+          diag(
+            "E0407",
+            span,
+            "cannot infer the type arguments of `new Map()`; write `new Map<K, V>()` or add a type annotation",
+          ),
+        );
       }
     } else {
       return Err(diag("E0400", span, "`Map` takes exactly two type arguments"));
@@ -2465,15 +3028,36 @@ export class ExprChecker {
   }
 
   private mapMethodCall(
-    b: HExpr, span: Span, base: Expr, name: Ident, args: Expr[], exp: Option<Type>, inst: Inst
+    b: HExpr,
+    span: Span,
+    base: Expr,
+    name: Ident,
+    args: Expr[],
+    exp: Option<Type>,
+    inst: Inst,
   ): Result<HExpr, Diagnostic> {
     const n = name.name;
     const unit = this.fx.env.mapUnit.toUsize();
-    const noMethod = diag("E0405", name.span, "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`");
+    const noMethod = diag(
+      "E0405",
+      name.span,
+      "no method `" + n + "` on type `" + showType(this.fx.env, b.ty) + "`",
+    );
     const fname = mapReadFn(n);
     if (fname != "") {
       const noTy: Option<Type> = None;
-      return this.preludeCall(b, span, unit, fname, n, noMethod, args, noPre(args.length), exp, noTy);
+      return this.preludeCall(
+        b,
+        span,
+        unit,
+        fname,
+        n,
+        noMethod,
+        args,
+        noPre(args.length),
+        exp,
+        noTy,
+      );
     }
     if (n == "set" || n == "delete") {
       return this.mapMutCall(b, span, base, name, args, inst);
@@ -2483,8 +3067,14 @@ export class ExprChecker {
 
   // `m.set(k, v)` / `m.delete(k)`: the receiver is a mutable place; the call becomes `m = mapSet(m, k, v)`
   // (a statement hoisted before the current one, like mutating class methods, ADR-0009).
+  @Ensures(result.isOk() && !this.fx.probe ==> this.fx.pre.length > old(this.fx.pre.length))
   private mapMutCall(
-    b: HExpr, span: Span, base: Expr, name: Ident, args: Expr[], inst: Inst
+    b: HExpr,
+    span: Span,
+    base: Expr,
+    name: Ident,
+    args: Expr[],
+    inst: Inst,
   ): Result<HExpr, Diagnostic> {
     const n = name.name;
     const isSet = n == "set";
@@ -2492,19 +3082,23 @@ export class ExprChecker {
     const vt = inst.args[1];
     const params: Type[] = isSet ? [kt, vt] : [kt];
     if (!this.isPlaceShaped(base)) {
-      return Err(diag(
-        "E0401",
-        base.span,
-        "receiver of `" + n + "` must be a mutable place (a `let` variable, field or element)"
-      ));
+      return Err(
+        diag(
+          "E0401",
+          base.span,
+          "receiver of `" + n + "` must be a mutable place (a `let` variable, field or element)",
+        ),
+      );
     }
     const pi = this.placeOf(base)?;
     if (!pi.mutable) {
-      return Err(diag(
-        "E0401",
-        base.span,
-        "cannot call `" + n + "` on `" + pi.rootName + "`: it is not declared with `let`"
-      ));
+      return Err(
+        diag(
+          "E0401",
+          base.span,
+          "cannot call `" + n + "` on `" + pi.rootName + "`: it is not declared with `let`",
+        ),
+      );
     }
     this.fx.markMut(pi.place);
     const a = this.argsExpect(span, "method `" + n + "`", args, params)?;
@@ -2515,11 +3109,13 @@ export class ExprChecker {
       return Ok(mk(XBool(false), TyBool, span));
     }
     if (!purePlace(pi.place)) {
-      return Err(diag(
-        "E0408",
-        base.span,
-        "the receiver of `" + n + "` must not contain index expressions with side effects"
-      ));
+      return Err(
+        diag(
+          "E0408",
+          base.span,
+          "the receiver of `" + n + "` must not contain index expressions with side effects",
+        ),
+      );
     }
     const mapTy = b.ty;
     const kv: Type[] = [kt, vt];
