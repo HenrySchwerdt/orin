@@ -26,6 +26,7 @@ jobs:
       macos: ${{ steps.f.outputs.macos }}
       vscode: ${{ steps.f.outputs.vscode }}
       mutants: ${{ steps.f.outputs.mutants }}
+      mutant_jobs: ${{ steps.f.outputs.mutant_jobs }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,14 +45,48 @@ jobs:
           fi
 
   # Seed bootstrap once; the later jobs reuse the compiler (build/bootstrap) as an artifact.
+  # Compiler cache (docs/testing.md): a pull request whose compiler inputs (the key below: the compiler, every source it
+  # embeds, the runtime, the platform layer, the seed and the bootstrap scripts) equal those of an earlier passed
+  # bootstrap reuses that bootstrap's orin2 and stage2.c and skips the bootstrap. An entry is only written after the full
+  # bootstrap (fixed point stage2.c == stage3.c, conformance) passed. A push to main, the nightly run and a manual run
+  # never read the cache: they always bootstrap from the seed (and refresh the entry), so a cache can never hide a broken
+  # fixed point on main.
   build:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Cache key (hash of the compiler inputs)
+        run: echo "ORIN_CACHE_KEY=orin2-${{ runner.os }}-${{ hashFiles('compiler/**', 'std/**', 'array/**', 'stdlib/**', 'runtime/**', 'platform/**', 'seed/**', 'tools/bootstrap.sh', 'tools/embed_prelude.py') }}" >> "$GITHUB_ENV"
+      - name: Restore the compiler from the cache (pull requests only)
+        id: cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ env.ORIN_CACHE_KEY }}
+          path: |
+            build/bootstrap/orin2
+            build/bootstrap/stage2.c
       - name: Seed bootstrap (seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance)
+        if: steps.cache.outputs.cache-hit != 'true'
         run: ./tools/bootstrap.sh
+      # On a hit the bootstrap's conformance run (tests/run + tests/errors with orin2) is covered by the sanitize job
+      # (the same tests with the same compiler, all suites, the executables under ASan + UBSan), llvm and contracts.
+      - name: Cached compiler (inputs equal those of a passed bootstrap)
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          python3 tools/embed_prelude.py --check
+          echo "orin2 and stage2.c restored from the cache entry $ORIN_CACHE_KEY: bootstrap skipped"
+      - name: Save the compiler to the cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true  # an entry with this key may exist already (written by a concurrent run)
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ env.ORIN_CACHE_KEY }}
+          path: |
+            build/bootstrap/orin2
+            build/bootstrap/stage2.c
       - name: Pack compiler
         run: tar -czf bootstrap.tgz build/bootstrap/orin2 build/bootstrap/stage2.c
       - uses: actions/upload-artifact@v4
@@ -94,6 +129,8 @@ jobs:
       - run: tar -xzf bootstrap.tgz
       - name: Optimised MIR vs --no-opt (differential)
         run: python3 tools/diff_backends.py --mode opt
+      - name: Fused array pipelines vs --no-fuse (differential, ADR-0038 §2)
+        run: python3 tools/diff_backends.py --mode fuse
       - name: Std prelude (Orin) vs C runtime built-ins (spec 19 R1)
         run: python3 tools/diff_backends.py --mode builtins
       - name: Release packaging smoke test
@@ -130,10 +167,12 @@ jobs:
         run: python3 tools/test_fmt.py
       - name: Tooling unit tests (JSON, analysis, LSP)
         run: ./tools/test_tooling.sh
+      # --orin orin2: orin2 is the current compiler/ built by orin1, and its self-compile is byte-identical (the fixed
+      # point), so the tests no longer build the same compiler again (once each, about a minute)
       - name: Language server end to end (orin lsp over stdio)
-        run: python3 tools/test_lsp.py
+        run: python3 tools/test_lsp.py --orin build/bootstrap/orin2
       - name: MCP server end to end (orin mcp over stdio)
-        run: python3 tools/test_mcp.py
+        run: python3 tools/test_mcp.py --orin build/bootstrap/orin2
       - name: OSIG (orin graph / orin diff - golden, determinism, evidence classes, rename + signature change + new call path)
         run: python3 tools/test_osig.py --orin build/bootstrap/orin2
       - name: Effects (orin effects, MAY_PERFORM edges, diff effect sections, [effects] policy; ADR-0037 D2)
@@ -222,15 +261,17 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # one entry per {module, shard}: the slow http mutants are split over several jobs (tools/ci_changes.py SHARDS);
+      # the shards of a module together run every one of its mutants
       matrix:
-        module: ${{ fromJSON(needs.changes.outputs.mutants) }}
+        include: ${{ fromJSON(needs.changes.outputs.mutant_jobs) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: bootstrap }
       - run: tar -xzf bootstrap.tgz
-      - name: "Provable std mutation check (every deliberately broken implementation must fail): ${{ matrix.module }}"
-        run: python3 tools/mutate_std.py --orinc build/bootstrap/orin2 --module ${{ matrix.module }}
+      - name: "Provable std mutation check (every deliberately broken implementation must fail): ${{ matrix.module }} ${{ matrix.shard }}"
+        run: python3 tools/mutate_std.py --orinc build/bootstrap/orin2 --module ${{ matrix.module }} --shard ${{ matrix.shard }}
 
   vscode:
     needs: changes

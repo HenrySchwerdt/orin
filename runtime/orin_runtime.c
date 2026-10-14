@@ -24,6 +24,223 @@ static inline void stat_alloc(uint64_t *kind_counter, uint64_t bytes) {
     if (g_live > (int64_t)orin_stats.peak_live_objs) orin_stats.peak_live_objs = (uint64_t)g_live;
 }
 
+/* ---------------------------------------------------------------- allocation-site census (opt-in, orin_runtime.h)
+ * Only with -DORIN_SITE_STATS; otherwise the hooks below are empty macros and nothing here is compiled. */
+#ifdef ORIN_SITE_STATS
+__thread uint32_t orin_site_cur ORIN_TLS_MODEL;
+__thread uint32_t orin_site_par ORIN_TLS_MODEL;
+/* Defined by the generated C (orin2 compile --stats-sites): entry 0 is "<runtime>", entry i the description of site i. */
+extern const char *const orin_site_names[];
+extern const uint32_t orin_site_count;
+typedef struct {
+    uint64_t n_str, n_arr_val, n_arr_ref, n_struct; /* objects allocated here, by runtime kind */
+    uint64_t bytes;                                 /* bytes allocated here (object + initial buffer) */
+    uint64_t grows, grow_bytes;                     /* buffer growths of objects allocated here */
+    uint64_t frees;                                 /* objects allocated here that were freed */
+    uint64_t of_retains, of_releases, of_cow;       /* operations on objects allocated here (anywhere) */
+    uint64_t at_retains, at_releases, at_cow, at_cow_inplace; /* operations executed here (on any object) */
+    uint64_t arr_val_freed, arr_val_small, arr_val_elems; /* scalar arrays of this site freed; of those, every element < 256; elements */
+    uint64_t last_tag, last_nslots, last_refmask;   /* shape of the last struct allocated here (refmask: which slots are references) */
+} SiteCtr;
+enum { SITE_NFIELDS = 21, SITE_NSHAPE = 3 }; /* the last SITE_NSHAPE fields describe a shape (not summed) */
+_Static_assert(sizeof(SiteCtr) == SITE_NFIELDS * sizeof(uint64_t), "SiteCtr is a flat array of counters");
+static __thread SiteCtr *t_sites; /* per task, folded into g_sites when the task's heap ends */
+static SiteCtr *g_sites;
+
+static SiteCtr *site_tab(void) {
+    if (ORIN_UNLIKELY(!t_sites)) {
+        size_t n = (size_t)orin_site_count + 1;
+        t_sites = (SiteCtr *)orin_platform_alloc(n * sizeof(SiteCtr));
+        if (!t_sites) orin_platform_abort();
+        orin_platform_mem_set(t_sites, 0, n * sizeof(SiteCtr));
+    }
+    return t_sites;
+}
+static inline uint32_t site_id(uint32_t s) { return s <= orin_site_count ? s : 0; }
+/* The joint counts: (site executing the operation, site that allocated the object) -> retains, releases, COW copies. An
+ * open-addressing table per thread (key = (at << 32 | of) + 1, 0 = empty), folded into g_pairs like the site counters. */
+typedef struct { uint64_t key, n[3]; } PairEnt;
+typedef struct { PairEnt *e; size_t cap, n; } PairTab;
+static __thread PairTab t_pairs;
+static PairTab g_pairs;
+/* The calling context of allocations: (allocating site, the call site that entered its function) -> objects, bytes. */
+static __thread PairTab t_calls;
+static PairTab g_calls;
+static void pair_add(PairTab *t, uint64_t key, const uint64_t v[3]) {
+    if (2 * (t->n + 1) > t->cap) {
+        PairTab g = {NULL, t->cap ? t->cap * 2 : 1024, 0};
+        g.e = (PairEnt *)orin_platform_alloc(g.cap * sizeof(PairEnt));
+        if (!g.e) orin_platform_abort();
+        orin_platform_mem_set(g.e, 0, g.cap * sizeof(PairEnt));
+        for (size_t i = 0; i < t->cap; i++)
+            if (t->e[i].key) pair_add(&g, t->e[i].key, t->e[i].n);
+        orin_platform_free(t->e);
+        *t = g;
+    }
+    size_t i = (size_t)((key * 0x9E3779B97F4A7C15ull) >> 20) & (t->cap - 1);
+    while (t->e[i].key && t->e[i].key != key) i = (i + 1) & (t->cap - 1);
+    if (!t->e[i].key) t->e[i].key = key, t->n++;
+    for (int k = 0; k < 3; k++) t->e[i].n[k] += v[k];
+}
+static void site_alloc(OrinObj *o, int rkind, uint64_t bytes) {
+    uint32_t s = site_id(orin_site_cur);
+    o->site = s;
+    o->site_pad = 0;
+    SiteCtr *c = &site_tab()[s];
+    switch (rkind) {
+    case 0: c->n_str++; break;
+    case 1: c->n_arr_val++; break;
+    case 2: c->n_arr_ref++; break;
+    default:
+        c->n_struct++;
+        c->last_tag = o->tag;
+        c->last_nslots = ((OrinStruct *)o)->nslots;
+        c->last_refmask = ((OrinStruct *)o)->refmask;
+        break;
+    }
+    bytes -= sizeof(OrinObj) - 16; /* as a normal build lays it out (without the census fields of the header) */
+    c->bytes += bytes;
+    uint64_t v[3] = {1, bytes, 0};
+    pair_add(&t_calls, (((uint64_t)s << 32) | site_id(orin_site_par)) + 1, v);
+}
+static void site_grow(OrinObj *o, uint64_t bytes) {
+    SiteCtr *c = &site_tab()[site_id(o->site)];
+    c->grows++;
+    c->grow_bytes += bytes;
+}
+static void site_free(OrinObj *o) {
+    SiteCtr *c = &site_tab()[site_id(o->site)];
+    c->frees++;
+    if (o->kind == ORIN_K_ARRAY && !((OrinArray *)o)->is_ref) {
+        OrinArray *a = (OrinArray *)o;
+        int small = 1;
+        for (uint64_t i = 0; i < a->len && small; i++)
+            if (a->items[i] > 255) small = 0;
+        c->arr_val_freed++;
+        c->arr_val_small += (uint64_t)small;
+        c->arr_val_elems += a->len;
+    }
+}
+void orin_site_rc(OrinObj *o, int what) {
+    SiteCtr *t = site_tab();
+    uint32_t sa = site_id(orin_site_cur), so = site_id(o->site);
+    SiteCtr *at = &t[sa], *of = &t[so];
+    uint64_t v[3] = {0, 0, 0};
+    switch (what) {
+    case ORIN_SITE_RETAIN: at->at_retains++, of->of_retains++, v[0] = 1; break;
+    case ORIN_SITE_RELEASE: at->at_releases++, of->of_releases++, v[1] = 1; break;
+    case ORIN_SITE_COW_COPY: at->at_cow++, of->of_cow++, v[2] = 1; break;
+    default: at->at_cow_inplace++; return;
+    }
+    pair_add(&t_pairs, (((uint64_t)sa << 32) | so) + 1, v);
+}
+static void site_fold(void) { /* the calling thread's counters into g_sites (under the runtime lock) */
+    if (!t_sites) return;
+    size_t n = (size_t)orin_site_count + 1;
+    if (!g_sites) {
+        g_sites = (SiteCtr *)orin_platform_alloc(n * sizeof(SiteCtr));
+        if (!g_sites) orin_platform_abort();
+        orin_platform_mem_set(g_sites, 0, n * sizeof(SiteCtr));
+    }
+    for (size_t i = 0; i < n; i++) {
+        uint64_t *d = (uint64_t *)&g_sites[i], *s = (uint64_t *)&t_sites[i];
+        for (int k = 0; k < SITE_NFIELDS - SITE_NSHAPE; k++) d[k] += s[k];
+        if (s[SITE_NFIELDS - 2]) /* a struct was allocated here: take its shape */
+            for (int k = SITE_NFIELDS - SITE_NSHAPE; k < SITE_NFIELDS; k++) d[k] = s[k];
+    }
+    orin_platform_free(t_sites);
+    t_sites = NULL;
+    for (size_t i = 0; i < t_pairs.cap; i++)
+        if (t_pairs.e[i].key) pair_add(&g_pairs, t_pairs.e[i].key, t_pairs.e[i].n);
+    orin_platform_free(t_pairs.e);
+    t_pairs.e = NULL, t_pairs.cap = t_pairs.n = 0;
+    for (size_t i = 0; i < t_calls.cap; i++)
+        if (t_calls.e[i].key) pair_add(&g_calls, t_calls.e[i].key, t_calls.e[i].n);
+    orin_platform_free(t_calls.e);
+    t_calls.e = NULL, t_calls.cap = t_calls.n = 0;
+}
+typedef struct { char *b; size_t n, cap; } SiteBuf;
+static void sb_put(SiteBuf *w, const char *s, size_t k) {
+    if (w->n + k + 32 > w->cap) {
+        w->cap = (w->n + k + 32) * 2;
+        w->b = (char *)orin_platform_realloc(w->b, w->cap);
+        if (!w->b) orin_platform_abort();
+    }
+    orin_platform_mem_copy(w->b + w->n, s, k);
+    w->n += k;
+}
+static void sb_str(SiteBuf *w, const char *s) {
+    size_t k = 0;
+    while (s[k]) k++;
+    sb_put(w, s, k);
+}
+static void sb_u(SiteBuf *w, uint64_t v) {
+    char t[24];
+    size_t k = orin_platform_fmt_u64(t, v);
+    sb_put(w, "\t", 1);
+    sb_put(w, t, k);
+}
+/* One line per site that did anything: "site", the id, the SITE_NFIELDS counters in SiteCtr order, the description. */
+static void site_report(void) {
+    orin_platform_runtime_lock();
+    site_fold();
+    orin_platform_runtime_unlock();
+    if (!g_sites) return;
+    SiteBuf w = {NULL, 0, 0};
+    sb_str(&w, "#orin_sites\tv1\tid\tn_str\tn_arr_val\tn_arr_ref\tn_struct\tbytes\tgrows\tgrow_bytes\tfrees\tof_retains\tof_releases\tof_cow"
+               "\tat_retains\tat_releases\tat_cow\tat_cow_inplace\tarr_val_freed\tarr_val_small\tarr_val_elems\tlast_tag\tlast_nslots\tlast_refmask\tname\n");
+    for (uint32_t i = 0; i <= orin_site_count; i++) {
+        const uint64_t *f = (const uint64_t *)&g_sites[i];
+        int any = 0;
+        for (int k = 0; k < SITE_NFIELDS; k++) any |= f[k] != 0;
+        if (!any) continue;
+        sb_str(&w, "site");
+        sb_u(&w, i);
+        for (int k = 0; k < SITE_NFIELDS; k++) sb_u(&w, f[k]);
+        sb_put(&w, "\t", 1);
+        sb_str(&w, orin_site_names[i]);
+        sb_put(&w, "\n", 1);
+    }
+    /* "pair", executing site, allocating site, retains, releases, COW copies (unordered) */
+    for (size_t i = 0; i < g_pairs.cap; i++) {
+        const PairEnt *p = &g_pairs.e[i];
+        if (!p->key) continue;
+        sb_str(&w, "pair");
+        sb_u(&w, (p->key - 1) >> 32);
+        sb_u(&w, (p->key - 1) & 0xffffffffu);
+        for (int k = 0; k < 3; k++) sb_u(&w, p->n[k]);
+        sb_put(&w, "\n", 1);
+    }
+    /* "call", allocating site, calling site, objects, bytes */
+    for (size_t i = 0; i < g_calls.cap; i++) {
+        const PairEnt *p = &g_calls.e[i];
+        if (!p->key) continue;
+        sb_str(&w, "call");
+        sb_u(&w, (p->key - 1) >> 32);
+        sb_u(&w, (p->key - 1) & 0xffffffffu);
+        sb_u(&w, p->n[0]);
+        sb_u(&w, p->n[1]);
+        sb_put(&w, "\n", 1);
+    }
+    const char *out = orin_platform_getenv("ORIN_SITES_OUT");
+    if (out && out[0]) {
+        size_t pl = 0;
+        while (out[pl]) pl++;
+        if (orin_platform_file_write(out, pl, w.b, w.n) != 0) orin_platform_write_line(ORIN_PLATFORM_STDERR, "orin: cannot write ORIN_SITES_OUT", 33);
+    } else {
+        orin_platform_write(ORIN_PLATFORM_STDERR, w.b, w.n);
+    }
+    orin_platform_free(w.b);
+}
+#define SITE_ALLOC(o, rkind, bytes) site_alloc((o), (rkind), (bytes))
+#define SITE_GROW(o, bytes) site_grow((o), (bytes))
+#define SITE_FREE(o) site_free(o)
+#else
+#define SITE_ALLOC(o, rkind, bytes) ((void)0)
+#define SITE_GROW(o, bytes) ((void)0)
+#define SITE_FREE(o) ((void)0)
+#endif
+
 /* Report buffer: fixed size, assembled by hand (no printf). Longest report is < 700 bytes. */
 typedef struct { char b[1024]; size_t n; } Rep;
 static void rep_s(Rep *r, const char *s) {
@@ -52,7 +269,14 @@ static void stats_add(OrinStats *d, const OrinStats *s) {
 
 static void stats_report(void) {
     const char *e = orin_platform_getenv("ORIN_STATS");
+#ifdef ORIN_SITE_STATS
+    /* ORIN_STATS=sites: the per-site table and the summary line */
+    int sites = e && e[0] == 's' && e[1] == 'i' && e[2] == 't' && e[3] == 'e' && e[4] == 's' && e[5] == 0;
+    if (sites) site_report();
+    if (!sites && (!e || e[0] != '1' || e[1] != 0)) return;
+#else
     if (!e || e[0] != '1' || e[1] != 0) return;
+#endif
     OrinStats tot = orin_stats;
     orin_platform_runtime_lock();
     stats_add(&tot, &g_fold);
@@ -173,12 +397,14 @@ void orin_destroy(OrinObj *o) {
         OrinObj *c_ = (c);                                                                      \
         if (c_ && c_->rc > 0) {                                                                 \
             orin_stats.releases++;                                                              \
+            ORIN_SITE_RC(c_, ORIN_SITE_RELEASE);                                                \
             if (--c_->rc == 0) PUSH(c_);                                                        \
         }                                                                                       \
     } while (0)
     PUSH(o);
     while (sp) {
         OrinObj *x = stack[--sp];
+        SITE_FREE(x);
         switch (x->kind) {
         case ORIN_K_ARRAY: {
             OrinArray *a = (OrinArray *)x;
@@ -250,6 +476,7 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     orin_platform_mem_set(s->slots, 0, (size_t)nslots * 8);
     g_live++;
     stat_alloc(&orin_stats.alloc_struct, sizeof(OrinStruct) + (uint64_t)nslots * 8);
+    SITE_ALLOC(&s->h, 3, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     return &s->h;
 }
 
@@ -313,6 +540,7 @@ uint64_t orin_res_unwrap_err(OrinObj *o) {
 
 OrinObj *orin_make_unique_slow(OrinObj *o) {
     orin_stats.cow_copies++;
+    ORIN_SITE_RC(o, ORIN_SITE_COW_COPY);
     OrinObj *r;
     switch (o->kind) {
     case ORIN_K_STRUCT: {
@@ -356,6 +584,7 @@ static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     s->data[len] = 0;
     g_live++;
     stat_alloc(&orin_stats.alloc_string, sizeof(OrinString) + cap + 1);
+    SITE_ALLOC(&s->h, 0, sizeof(OrinString) + cap + 1);
     return s;
 }
 
@@ -387,6 +616,7 @@ OrinObj *orin_str_append(OrinObj *a, OrinObj *b) {
             x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
             orin_stats.live_bytes += cap - x->cap;
             orin_stats.string_grows++;
+            SITE_GROW(&x->h, cap - x->cap);
             x->cap = cap;
         }
         orin_platform_mem_copy(x->data + x->len, y->data, y->len);
@@ -739,6 +969,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     a->items = cap ? (uint64_t *)xmalloc(cap * 8) : NULL;
     g_live++;
     stat_alloc(&orin_stats.alloc_array, sizeof(OrinArray) + cap * 8);
+    SITE_ALLOC(&a->h, is_ref ? 2 : 1, sizeof(OrinArray) + cap * 8);
     return &a->h;
 }
 
@@ -749,6 +980,7 @@ void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     orin_stats.live_bytes += (cap - a->cap) * 8;
     if ((int64_t)orin_stats.live_bytes > (int64_t)orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
     orin_stats.array_grows++;
+    SITE_GROW(o, (cap - a->cap) * 8);
     a->cap = cap;
     a->items[a->len++] = slot;
 }
@@ -789,6 +1021,70 @@ OrinObj *orin_array_concat(OrinObj *x, OrinObj *y) {
         if (b->is_ref) orin_retain(ORIN_REF(b->items[i]));
         orin_array_push(r, b->items[i]);
     }
+    return r;
+}
+
+OrinObj *orin_array_extend(OrinObj *x, OrinObj *y) {
+    OrinArray *a = (OrinArray *)x, *b = (OrinArray *)y;
+    if (ORIN_UNLIKELY(x->kind != ORIN_K_ARRAY || y->kind != ORIN_K_ARRAY)) orin_trap_shape();
+    if (b->len == 0) return x;
+    if (x->rc == 1 && x != y && (a->is_ref == b->is_ref || a->len == 0)) {
+        uint64_t n = a->len + b->len;
+        if (n > a->cap) {
+            uint64_t cap = a->cap * 2;
+            if (cap < n) cap = n;
+            if (cap < 4) cap = 4;
+            if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
+            a->items = (uint64_t *)xrealloc(a->items, cap * 8);
+            orin_stats.live_bytes += (cap - a->cap) * 8;
+            if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+            orin_stats.array_grows++;
+            SITE_GROW(x, (cap - a->cap) * 8);
+            a->cap = cap;
+        }
+        a->is_ref = b->is_ref;
+        if (b->is_ref) {
+            for (uint64_t i = 0; i < b->len; i++) {
+                orin_retain(ORIN_REF(b->items[i]));
+                a->items[a->len + i] = b->items[i];
+            }
+        } else {
+            orin_platform_mem_copy(a->items + a->len, b->items, b->len * 8);
+        }
+        a->len = n;
+        return x;
+    }
+    OrinObj *r = orin_array_concat(x, y);
+    orin_release(x);
+    return r;
+}
+
+OrinObj *orin_bytes_to_string(OrinObj *o, uint64_t start, uint64_t len) {
+    OrinArray *a = (OrinArray *)o;
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY || a->is_ref)) orin_trap_shape();
+    if (ORIN_UNLIKELY(start > a->len || len > a->len - start)) orin_trap("slice out of range");
+    OrinString *s = str_alloc(len, len);
+    const uint64_t *src = a->items + start;
+    uint64_t bad = 0;
+    for (uint64_t i = 0; i < len; i++) {
+        uint64_t v = src[i];
+        bad |= v;
+        s->data[i] = (char)(unsigned char)v;
+    }
+    if (ORIN_UNLIKELY(bad > 255)) {
+        orin_release(&s->h);
+        orin_trap("byte out of range");
+    }
+    return &s->h;
+}
+
+OrinObj *orin_string_to_bytes(OrinObj *o) {
+    if (ORIN_UNLIKELY(o->kind != ORIN_K_STRING)) orin_trap_shape();
+    const OrinString *s = (const OrinString *)o;
+    OrinObj *r = orin_array_new(s->len, 0);
+    OrinArray *a = (OrinArray *)r;
+    for (uint64_t i = 0; i < s->len; i++) a->items[i] = (unsigned char)s->data[i];
+    a->len = s->len;
     return r;
 }
 
@@ -1816,6 +2112,9 @@ void orin_rt_heap_exit(void) {
     orin_platform_runtime_lock();
     g_fold_live += g_live;
     stats_add(&g_fold, &orin_stats);
+#ifdef ORIN_SITE_STATS
+    site_fold();
+#endif
     orin_platform_runtime_unlock();
 }
 

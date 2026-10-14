@@ -1,0 +1,181 @@
+// Placement rules of contract clauses (ADR-0012, spec 15 §4.2a) and built-in annotations (ADR-0024, spec 05): which
+// declaration a `@Name` may precede. Placement is part of the grammar, so the parser reports it (E0200 for a clause,
+// E0440 for an annotation, E0442 for a duplicate annotation). Pure functions.
+
+import { Diagnostic, diag } from "../diag";
+import { ContractKind, ContractClause, AnnotationKind, Annotation } from "./ast";
+
+// Declaration targets.
+export const T_FUNCTION: int = 0;
+export const T_METHOD: int = 1;
+export const T_CTOR: int = 2;
+export const T_CLASS: int = 3;
+export const T_RECORD: int = 4;
+export const T_TYPE: int = 5;
+export const T_LOOP: int = 6;
+export const T_INTERFACE: int = 7;
+export const T_IFACE_METHOD: int = 8;
+export const T_CONST: int = 9;
+export const T_IMPORT: int = 10;
+
+export function clauseName(k: ContractKind): string {
+  return match (k) {
+    CRequires => "@Requires",
+    CEnsures => "@Ensures",
+    CInvariant => "@Invariant",
+    CDecreases => "@Decreases",
+    CRule => "@Rule",
+  };
+}
+
+// Declaration targets of a clause: functions, methods and constructors take preconditions; functions and methods
+// postconditions; classes, record types and loops invariants; functions, methods and loops variants; every declaration
+// up to a type declaration a rule id.
+export function clauseAllowed(k: ContractKind, target: int): bool {
+  return match (k) {
+    CRequires => target <= T_CTOR,
+    CEnsures => target <= T_METHOD,
+    CInvariant => target == T_CLASS || target == T_RECORD || target == T_LOOP,
+    CDecreases => target <= T_METHOD || target == T_LOOP,
+    CRule => target <= T_TYPE,
+  };
+}
+
+function targetName(target: int): string {
+  if (target == T_FUNCTION) {
+    return "a function";
+  }
+  if (target == T_METHOD) {
+    return "a method";
+  }
+  if (target == T_CTOR) {
+    return "a constructor";
+  }
+  if (target == T_CLASS) {
+    return "a class";
+  }
+  if (target == T_RECORD) {
+    return "a record type";
+  }
+  if (target == T_TYPE) {
+    return "a type declaration";
+  }
+  if (target == T_LOOP) {
+    return "a loop";
+  }
+  return "this declaration";
+}
+
+// E0200 at the first clause that cannot precede `target`.
+@Ensures(result.isOk() == cs.every(c => clauseAllowed(c.kind, target)))
+@Ensures(result.isErr() ==> result.unwrapErr().code == "E0200")
+export function checkPlacement(cs: ContractClause[], target: int): Result<void, Diagnostic> {
+  const bad = cs.find(c => !clauseAllowed(c.kind, target));
+  if (bad.isSome()) {
+    const c = bad.unwrap();
+    return Err(
+      diag(
+        "E0200",
+        c.span,
+        "contract clause `" + clauseName(c.kind) + "` cannot be applied to " + targetName(target),
+      ),
+    );
+  }
+  return Ok();
+}
+
+export function isBuiltinAnnotation(name: string): bool {
+  return name == "Test" || name == "Deprecated" || name == "Inline";
+}
+
+export function annotationName(k: AnnotationKind): string {
+  return match (k) {
+    ATest => "@Test",
+    ADeprecated => "@Deprecated",
+    AInline => "@Inline",
+  };
+}
+
+export function annotationTargets(name: string): string {
+  if (name == "Test" || name == "@Test") {
+    return "top-level functions";
+  }
+  if (name == "Inline" || name == "@Inline") {
+    return "functions and methods";
+  }
+  return "functions, methods, classes, types, interfaces and interface methods";
+}
+
+// Annotation targets: `@Test` on functions, `@Inline` on functions and methods, `@Deprecated` on functions, methods,
+// classes, types, interfaces and interface methods.
+export function annotationAllowed(k: AnnotationKind, target: int): bool {
+  return match (k) {
+    ATest => target == T_FUNCTION,
+    ADeprecated => target <= T_METHOD
+        || target >= T_CLASS && target <= T_TYPE
+        || target == T_INTERFACE
+        || target == T_IFACE_METHOD,
+    AInline => target <= T_METHOD,
+  };
+}
+
+function targetNameA(target: int): string {
+  if (target == T_INTERFACE) {
+    return "an interface";
+  }
+  if (target == T_IFACE_METHOD) {
+    return "an interface method";
+  }
+  if (target == T_CONST) {
+    return "a constant";
+  }
+  return targetName(target);
+}
+
+// No two annotations of the same kind.
+export function annotationsDistinct(as: Annotation[]): bool {
+  let i: usize = 0;
+  while (i < as.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (annotationName(as[j].kind) == annotationName(as[i].kind)) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Placement (E0440) and duplicates (E0442), at the first annotation that breaks a rule; the contract-clause rules are
+// checked separately.
+@Ensures(result.isOk()
+    == (as.every(a => annotationAllowed(a.kind, target)) && annotationsDistinct(as)))
+@Ensures(result.isErr()
+    ==> result.unwrapErr().code == "E0440" || result.unwrapErr().code == "E0442")
+export function checkAnnoPlacement(as: Annotation[], target: int): Result<void, Diagnostic> {
+  let i: usize = 0;
+  while (i < as.length) {
+    const a = as[i];
+    if (!annotationAllowed(a.kind, target)) {
+      return Err(
+        diag(
+          "E0440",
+          a.span,
+          "annotation `" + annotationName(a.kind) + "` cannot be applied to " + targetNameA(target)
+              + " (it applies to " + annotationTargets(annotationName(a.kind)) + ")",
+        ),
+      );
+    }
+    let j: usize = 0;
+    while (j < i) {
+      if (annotationName(as[j].kind) == annotationName(a.kind)) {
+        return Err(diag("E0442", a.span, "duplicate annotation `" + annotationName(a.kind) + "`"));
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return Ok();
+}

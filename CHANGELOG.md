@@ -19,6 +19,69 @@
   `tools/test_parallel.sh` (threads 1..8, fused / unfused, ThreadSanitizer, ASan), now part of `tools/test_concurrency.sh`. No
   speedup could be measured on the loaded shared machine (CPU time unchanged); see docs/benchmarks.md.
 - **Fix:** `ORIN_STATS` peak live objects / bytes wrapped to 2^64 - 1 in programs whose tasks free objects other tasks allocated.
+- **Benchmark workflow** (`.github/workflows/bench.yml`, docs/benchmarks.md "Benchmark workflow"): nightly, manual, or on a PR
+  labelled `bench`. `tools/bench.py` gains `--json` (machine, tool versions, commit; per benchmark and language wall median / min,
+  user / sys CPU, peak RSS, output check), `--instructions` (executed instructions under valgrind cachegrind for the Orin
+  binaries, C and the self-compile: the regression metric) and a parallel section (`bench/parallel_*`, `bench/streams_parallel`
+  with 1, 2, 4 worker threads given as the first program argument: speedup, efficiency, CPU time); new `bench/parallel_collatz`.
+  `tools/bench_report.py` (stdlib only) writes the job summary, the PR comparison comment (instructions > +2 % or wall > +15 % is
+  flagged, never fails) and the SVG charts + README of the `bench-results` history branch.
+- **Rewrite step 3b: the ownership verifier `compiler/verify/`, shared MIR well-formedness, `compiler/hir/` contracts
+  (ADR-0015).** The verifier's abstract state is a class `State`, the transfer functions are the methods of a class
+  `Transfer` (one run through a block), the fixpoint and its worklist are the class `Fixpoint`; 98 contract clauses (0 before), among
+  them: the join is commutative, idempotent and an upper bound in an independently stated lattice order; no instruction
+  revives a dead or poisoned local unless it defines it; borrows stay flat; every report names an existing block and
+  instruction with its span; the fixpoint is stable; the verifier's well-formedness check implies the shared predicate
+  `isWellFormedProgram` (new `compiler/mir/wellformed.or`, also used by the lowering). `hir/`: integer-kind round trip and
+  exact ranges, `Function.paramCount <= locals.length`, `CallSite` evidence and edge kinds. 23 unit tests
+  (`compiler/tests/verify_test.or`), 12/12 hand-made mutants killed. **Fixed**: four inputs on which the verifier itself
+  crashed (`trap: index out of bounds`) instead of reporting ill-formed MIR: a call of a callee with more parameters than
+  locals, a closure target or vtable entry with parameters but no locals, a block with fewer spans than instructions; they are
+  now rejected with a message. Every other verdict and message is unchanged; generated C / LLVM output is byte-identical.
+- **Allocation census (ADR-0038): where the heap allocations and RC operations come from.** Opt-in census build:
+  `orin2 compile --stats-sites` marks every MIR instruction with its site id (`ORIN_SITE(n, caller)`) and appends a site table;
+  with a runtime built with `-DORIN_SITE_STATS`, `ORIN_STATS=sites` reports per site the objects allocated (string, scalar /
+  reference array, record shape), bytes, growths, frees, the retains / releases / COW copies executed there and those its
+  objects received, the joint (executing site, allocating site) RC counts and one level of calling context. Without the flag
+  nothing changes: generated C and LLVM byte-identical on the corpus, runtime object code identical. `tools/alloc_census.py`
+  runs every benchmark, `examples/http_server.or` under a scripted loopback load and the self-compile, attributes each site to the
+  ADR-0038 transformation that would remove it (unboxing, packed arrays, escape / stack, borrow, reuse, region / freeze,
+  library) and writes docs/perf/alloc-census.md: the ranking for the performance wave and the library quick wins.
+- **Rewrite step 3e: the tooling modules `analysis/`, `lsp/`, `mcp/`, `json/`, `fmt/` (ADR-0015) and the capability gate.**
+  State that was threaded through records is now five classes: `Workspace` (the document store), `LspServer`, `McpSession`,
+  `JsonCursor`, and the formatter's `Layout` (source text and comment queue); 213 contract clauses (35 before), among them the
+  JSON round trip (`parseJson(stringifyJson(v))` equals `v`), offset <-> position round trip, the reply rule of the LSP and MCP
+  servers (every request answered once with its id), references that point at existing definitions, formatter idempotence and
+  comment preservation as `@Ensures` of `format`, OSIG snapshots that read back with their hash. **Capability gate:** `analysis`
+  performs no I/O of its own: its three file reads go through the loader's `Sources`, and the drivers of `orin graph` / `diff` /
+  `effects` (with their output file) moved to `tools`; `orin effects compiler/main.or` shows only inherited `Fs.ReadFile` /
+  `Fs.Stat` for `analysis`, every path ending in `loader::Sources` (pinned by `tools/test_effects.py`). Fixes: `parseJson` reads
+  every `int` (it rejected 19-digit integers that `stringifyJson` writes); the effect-policy errors E0474 / E0502 are located in
+  `orin.toml` (they were printed as a position in the program's first source file, and the contract-checked compiler trapped).
+  Generated C / LLVM unchanged. `lsp::shellRun` stays until `spawn` exists (ADR-0037 D5). Tests: `compiler/tests/tooling_test.or`
+  (16 `@Test`). Docs: docs/rewrite.md "Step 3e", docs/capabilities.md.
+- **Parser error recovery: several syntax errors per file.** `orin check`, `orin compile`, `--format=json`, the LSP
+  diagnostics and MCP `check` now report every syntax error of a file (up to 20; past that the 20th carries the note
+  "further syntax errors suppressed") instead of only the first. Recovery points: the next statement of a block (after `;`,
+  at the block's `}`, past an `if` / `while` / `for` body, at a statement keyword), the next member of a class or interface,
+  the next top-level `function` / `class` / `interface` / `type` / `import` / `export` / `@`; a declaration keyword inside a
+  body (a missing `}`) is reported once and the parse resumes there. No cascades: a file with syntax errors is not type
+  checked (only its syntax errors are reported, so no node built by recovery reaches the checker), an error at or right
+  after a resume point is dropped, running into the end of the file stops. The first error is byte-identical to before for
+  every input (code, message, span: a contract of `parseRecovering`, and 3,247 inputs incl. 1,500 garbage files compared);
+  valid programs give the same trees and the same C / LLVM output; `orin fmt` still refuses a file with a syntax error. A
+  lexical error (E0100) is still the only error of its file. New: `parseRecovering` (syntax module), progress contracts of
+  the recovery loops, `compiler/tests/recovery_test.or`, `tests/recovery/` with `tools/test_recovery.py`.
+- **Rewrite step 3c: `compiler/syntax/` (ADR-0015).** The lexer is a `Lexer` class (cursor, tokens, template depth) and the
+  parser a `Parser` class (tokens and cursor as fields instead of `{ node, pos }` records returned by ~90 functions); binary
+  operators are parsed by precedence climbing over a data table (`precedence.or`, class `OpTable`: level, operator,
+  associativity per spelling, with an invariant); placement rules of clauses and annotations moved to `rules.or`; new
+  well-formedness predicates of tokens (`tokensWellFormed`), trees (`wellformed.or`: spans nested and ordered) and comments.
+  129 contract clauses (was 1): every successful `parseX` consumes at least one token and spans exactly what it consumed
+  (the progress property), the cursor never passes the final KEof, `parse` ensures a well-formed module or a parse error
+  inside the source. 14 unit tests in `compiler/tests/syntax_test.or` (incl. termination on garbage input). Parse errors,
+  ASTs and generated code are byte-identical to before; no change to the language. Also: `@Ensures` for the 13 public
+  mutating methods of `vc/gen.or` `Gen` and `vc/vt.or` `Tab` that `orin check --strict-contracts compiler/main.or` reported.
 - **Concurrency, stage 0 (ADR-0017 Addendum A; docs/concurrency.md).** New module `std:task`, written in Orin: structured
   `scope` / `spawn` / `TaskHandle.join`, bounded `channel<T>(capacity)` with `Sender` / `Receiver` (`send`, `recv`, `close`),
   `parallelMap`, and `scopeFs` / `spawnFs` (also process, stdio, clock) that MOVE a derived grant into a task (ADR-0027 Q10, smallest
@@ -39,6 +102,12 @@
   ThreadSanitizer and ASan + UBSan (`tools/test_concurrency.sh`). Example `examples/parallel_map.or`. Assurance: the C parts are
   `TESTED_ONLY` (ThreadSanitizer, no proof) until R3 / R4 (docs/assurance.md C17). Not in stage 0: `async` / `await`, cancellation,
   timeouts, deadlock detection, an M:N scheduler, a concurrent HTTP server (`std:net` has not landed).
+- **Performance defects of the std fixed** (docs/benchmarks.md "Performance defects found while building the std"): `x = x + e` /
+  `x = x.concat(e)` on fields, elements and nested places are in-place (take/put of the slot, new MIR instruction `IArrayExtend`;
+  74 s -> 13 ms on bench/appends); mutating methods with a result no longer allocate a pair or copy a field receiver (MIR v1.10 in/out
+  receivers, `compiler/opt/pairs.or`; call loops 8-13x, std:http parse 2x); built-ins `bytesToString(u8[], start, len)` and
+  `stringToBytes(s)` (std:bytes / std:http use them: 8x); verifier definitions no longer scan all locals; LLVM `noundef` / `nonnull`.
+  New benchmarks (appends, mutres, bytesstr, http_parse, sortedmap, pqueue), Rust and Java counterparts in tools/bench.py.
 - **Capabilities, Stage B: transitive effect inference (ADR-0037 D2, graph 2; no new syntax).** The compiler now infers, for
   every function, method and constructor, the set of primitive effects it may perform *transitively* (`Fs.ReadFile`,
   `Console.Write`, `Process.Spawn`, `Clock.Now`, ...; direction INPUT / OUTPUT / CONTROL; grant family), with evidence (MUST: a

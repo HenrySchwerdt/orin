@@ -18,7 +18,7 @@
 // E0502  an `[effects.<module>]` table names a module that does not exist (as for `[modules.x]`)
 
 import { LoadedProgram } from "../loader";
-import { Diagnostic, SourceMap, Span, diag } from "../diag";
+import { Diagnostic, SourceMap, Span, diag, span, allRenderable } from "../diag";
 import { checkWithIndex, primitiveEffects } from "../check";
 import { EffectRule, displayModule } from "../package";
 import { isUnknownOp, familyOf } from "./effects";
@@ -90,8 +90,25 @@ function listText(xs: string[]): string {
   return xs.length == 0 ? "no effects" : "[" + xs.join(", ") + "]";
 }
 
-// E0474 / E0502 for the tables themselves.
-function ruleDiags(prog: LoadedProgram, rules: EffectRule[]): Diagnostic[] {
+// The source map the policy diagnostics are rendered against: the program's files and, after them (file
+// `sm.files.length`), the manifest, which the spans of E0474 / E0502 point into. (Before, those spans kept the file id 0 of
+// the manifest parse and were rendered as a position in the program's first file.)
+@Ensures(result.files.length >= sm.files.length)
+export function policySourceMap(prog: LoadedProgram, sm: SourceMap): SourceMap {
+  return match (prog.manifest) {
+    Some(mf) => SourceMap { files: sm.files.concat([mf.source]) },
+    None => sm,
+  };
+}
+
+// The span `sp` of the manifest as a span of file `mfile` (the manifest's place in `policySourceMap`).
+function inManifest(sp: Span, mfile: usize): Span {
+  return span(mfile, sp.start, sp.end);
+}
+
+// E0474 / E0502 for the tables themselves, located in the manifest (file `mfile`).
+@Ensures(result.every(d => d.span.file == mfile))
+function ruleDiags(prog: LoadedProgram, rules: EffectRule[], mfile: usize): Diagnostic[] {
   let out: Diagnostic[] = [];
   for (const r of rules) {
     if (r.module != "") {
@@ -105,7 +122,7 @@ function ruleDiags(prog: LoadedProgram, rules: EffectRule[]): Diagnostic[] {
         out.push(
           diag(
             "E0502",
-            r.span,
+            inManifest(r.span, mfile),
             "orin.toml: [effects." + (r.module == "." ? "\".\"" : r.module.split("/").join("."))
                 + "] names module `" + displayModule(r.module) + "`, which does not exist",
           ),
@@ -118,7 +135,7 @@ function ruleDiags(prog: LoadedProgram, rules: EffectRule[]): Diagnostic[] {
         out.push(
           diag(
             "E0474",
-            i < r.allowedSpans.length ? r.allowedSpans[i] : r.span,
+            inManifest(i < r.allowedSpans.length ? r.allowedSpans[i] : r.span, mfile),
             "orin.toml: unknown effect `" + r.allowed[i]
                 + "` in [effects] allowed (an operation such as `Fs.ReadFile`, a family such as `Fs`, `Fs.*`, `Unknown` or `*`)",
           ),
@@ -154,7 +171,7 @@ export function policyDiags(c: EffContext): Diagnostic[] {
       if (mf.effects.length == 0 || !c.table.isTyped()) {
         return out;
       }
-      const bad = ruleDiags(c.prog, mf.effects);
+      const bad = ruleDiags(c.prog, mf.effects, c.map.paths.length);
       if (bad.length > 0) {
         return bad;
       }
@@ -206,6 +223,7 @@ export function policyDiags(c: EffContext): Diagnostic[] {
 
 // The policy of `prog` (a program that type-checks, tests already erased): the diagnostics, empty without an `[effects]`
 // table. Runs the checker once more, only when there is a policy.
+@Ensures(policyCodes(result) && allRenderable(policySourceMap(prog, sm), result))
 export function effectPolicyDiags(prog: LoadedProgram, sm: SourceMap): Diagnostic[] {
   let none: Diagnostic[] = [];
   match (prog.manifest) {

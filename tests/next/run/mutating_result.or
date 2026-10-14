@@ -1,0 +1,244 @@
+// Mutating methods that return a value (ADR-0009: the lowered function returns a `{ self, value }` record). The
+// optimiser turns such functions into in/out functions (docs/mir.md v1.10) and removes the record at the call sites.
+// Every shape that matters is exercised here and must behave as before: scalar and reference results, results that
+// are discarded or used in conditions, receivers that are locals, fields of fields, elements, results that alias the
+// old receiver (value semantics), recursion, `?`, generic classes, and receivers copied before the call.
+
+type Pair = { a: int; b: string; };
+
+class Reader {
+  data: int[];
+  pos: usize;
+  log: string;
+  constructor(d: int[]) {
+    this.data = d;
+    this.pos = 0;
+    this.log = "";
+  }
+  next(): int {
+    const v = this.data[this.pos];
+    this.pos += 1;
+    this.log = this.log + v.toString();
+    return v;
+  }
+  peekAndSkip(): Option<int> {
+    if (this.pos >= this.data.length) {
+      return None;
+    }
+    this.pos += 1;
+    return Some(this.data[this.pos - 1]);
+  }
+  take(n: usize): int[] {
+    let out: int[] = [];
+    let k: usize = 0;
+    while (k < n && this.pos < this.data.length) {
+      out.push(this.data[this.pos]);
+      this.pos += 1;
+      k += 1;
+    }
+    return out;
+  }
+  name(): string {
+    this.pos += 1;
+    return "item" + this.pos.toString();
+  }
+  pair(): Pair {
+    this.pos += 1;
+    return Pair { a: this.pos.toInt(), b: this.log };
+  }
+  // the old receiver is returned: the update must not be visible through it
+  snapshot(): Reader {
+    const old = this;
+    this.pos += 1;
+    return old;
+  }
+  // recursion
+  sumFrom(limit: usize): int {
+    if (this.pos >= limit) {
+      return 0;
+    }
+    const v = this.next();
+    return v + this.sumFrom(limit);
+  }
+  // `?` inside a mutating method with a result
+  need(): Result<int, string> {
+    if (this.pos >= this.data.length) {
+      return Err("end");
+    }
+    const v = this.next();
+    return Ok(v);
+  }
+  needTwo(): Result<int, string> {
+    const a = this.need()?;
+    const b = this.need()?;
+    return Ok(a * 10 + b);
+  }
+  done(): bool {
+    return this.pos >= this.data.length;
+  }
+}
+
+class Parser {
+  r: Reader;
+  total: int;
+  words: string[];
+  constructor(d: int[]) {
+    this.r = new Reader(d);
+    this.total = 0;
+    this.words = [];
+  }
+  step(): int {
+    const v = this.r.next();
+    this.total += v;
+    return v;
+  }
+  stepTwo(): int {
+    const a = this.r.next();
+    const b = this.r.next();
+    this.total += a * b;
+    return a + b;
+  }
+  word(): string {
+    const w = this.r.name();
+    this.words.push(w);
+    return w;
+  }
+  skipAll(): int {
+    let n = 0;
+    while (!this.r.done()) {
+      this.r.next();
+      n += 1;
+    }
+    return n;
+  }
+}
+
+class Outer {
+  p: Parser;
+  count: int;
+  constructor(d: int[]) {
+    this.p = new Parser(d);
+    this.count = 0;
+  }
+  go(): int {
+    this.count += 1;
+    return this.p.step() + this.p.stepTwo();
+  }
+}
+
+class Stack<T> {
+  items: T[];
+  constructor() {
+    this.items = [];
+  }
+  push2(a: T, b: T): usize {
+    this.items.push(a);
+    this.items.push(b);
+    return this.items.length;
+  }
+  pop1(): Option<T> {
+    return this.items.pop();
+  }
+}
+
+function main(): void {
+  // scalar result in a loop, receiver is a local
+  let r = new Reader([5, 6, 7, 8, 9, 10, 11, 12]);
+  let sum = 0;
+  let i = 0;
+  while (i < 3) {
+    sum += r.next();
+    i += 1;
+  }
+  console.log(sum.toString() + " " + r.log + " " + r.pos.toString());
+  // result discarded, result in a condition
+  r.next();
+  if (r.next() > 8) {
+    console.log("big");
+  }
+  console.log(r.log);
+  // reference results
+  const o1 = r.peekAndSkip();
+  console.log(o1.unwrapOr(-1).toString());
+  const xs = r.take(2);
+  console.log(xs.length.toString() + " " + r.pos.toString());
+  console.log(r.name() + " " + r.name());
+  const pr = r.pair();
+  console.log(pr.a.toString() + pr.b);
+  const none = r.peekAndSkip();
+  console.log(none.isNone().toString());
+
+  // the copy taken before the call keeps its state
+  let q = new Reader([1, 2, 3, 4, 5, 6]);
+  const copy = q;
+  q.next();
+  q.next();
+  console.log(copy.pos.toString() + " " + q.pos.toString());
+  // a result that is the old receiver
+  const old = q.snapshot();
+  console.log(old.pos.toString() + " " + q.pos.toString());
+  const old2 = q.snapshot();
+  console.log(old2.pos.toString() + " " + old.pos.toString() + " " + q.pos.toString());
+
+  // recursion
+  let rec = new Reader([1, 2, 3, 4, 5]);
+  console.log(rec.sumFrom(4).toString() + " " + rec.pos.toString());
+
+  // ? inside mutating methods
+  let t = new Reader([1, 2, 3]);
+  console.log(t.needTwo().unwrap().toString());
+  console.log(t.needTwo().isErr().toString() + " " + t.pos.toString());
+  console.log(t.needTwo().unwrapErr());
+
+  // fields of fields
+  let p = new Parser([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  let acc = 0;
+  let k = 0;
+  while (k < 3) {
+    acc += p.step();
+    acc += p.stepTwo();
+    k += 1;
+  }
+  console.log(acc.toString() + " " + p.total.toString() + " " + p.r.log);
+  let pw = new Parser([1]);
+  pw.word();
+  pw.word();
+  console.log(pw.word() + " " + pw.words.join(","));
+  console.log(pw.skipAll().toString());
+  let ps = new Parser([4, 5, 6]);
+  console.log(ps.skipAll().toString() + " " + ps.r.log);
+  // three levels
+  let o = new Outer([1, 2, 3, 4, 5, 6, 7]);
+  let tot = 0;
+  tot += o.go();
+  tot += o.go();
+  console.log(tot.toString() + " " + o.count.toString() + " " + o.p.total.toString() + " " + o.p.r.log);
+  // elements of arrays and copies of the array
+  let rs: Reader[] = [new Reader([1, 2, 3]), new Reader([10, 20, 30])];
+  const rsCopy = rs;
+  let e = 0;
+  e += rs[0].next();
+  e += rs[1].next();
+  e += rs[1].next();
+  console.log(e.toString() + " " + rs[0].pos.toString() + rs[1].pos.toString() + " " + rsCopy[0].pos.toString() + rsCopy[1].pos.toString());
+  // generic class
+  let st = new Stack<string>();
+  console.log(st.push2("a", "b").toString());
+  console.log(st.push2("c", "d").toString());
+  console.log(st.pop1().unwrapOr("?") + st.pop1().unwrapOr("?"));
+  let si = new Stack<int>();
+  si.push2(1, 2);
+  console.log(si.pop1().unwrapOr(0).toString() + si.items.length.toString());
+
+  // many calls (an allocation per call before the optimisation)
+  let big = new Reader([1, 2, 3, 4, 5, 6, 7, 8]);
+  let acc2 = 0;
+  let c = 0;
+  while (c < 3000) {
+    big.pos = 0;
+    acc2 += big.next();
+    acc2 += big.next();
+    c += 1;
+  }
+  console.log(acc2.toString() + " " + big.log.length.toString());
+}

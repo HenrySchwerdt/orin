@@ -3,26 +3,35 @@
 
 export type Unframed = { messages: string[]; rest: string; };
 
+// `frames` is exactly the one message `body` (what `unframe` reads back from a single frame).
+export function isFrameOf(frames: string, body: string): bool {
+  return match (unframe(frames)) {
+    Ok(u) => u.messages.length == 1 && u.messages[0] == body && u.rest == "",
+    Err(_) => false,
+  };
+}
+
+// The header counts bytes (`body.length` of a byte string), so a frame reads back as the same body.
+@Ensures(isFrameOf(result, body))
 export function frameMessage(body: string): string {
   return "Content-Length: " + body.length.toString() + "\r\n\r\n" + body;
 }
 
+// ASCII lower case (header names are case-insensitive).
+@Ensures(result.length == s.length)
 function lower(s: string): string {
   let out = "";
   let i: usize = 0;
   while (i < s.length) {
     const c = s.charCodeAt(i);
-    if (c >= 65 && c <= 90) {
-      out += String.fromCharCode(c + 32);
-    } else {
-      out += s.charAt(i);
-    }
+    out += c >= 65 && c <= 90 ? String.fromCharCode(c + 32) : s.charAt(i);
     i += 1;
   }
   return out;
 }
 
 // Content-Length value from a header block (`Name: value` lines separated by CRLF), if present.
+@Ensures(result.isOk() ==> result.unwrap() >= 0)
 function contentLength(header: string): Result<int, string> {
   for (const line of header.split("\r\n")) {
     const k = line.indexOf(":");
@@ -40,8 +49,21 @@ function contentLength(header: string): Result<int, string> {
   return Err("missing Content-Length header");
 }
 
+function totalLength(ms: string[]): usize {
+  let n: usize = 0;
+  for (const m of ms) {
+    n += m.length;
+  }
+  return n;
+}
+
 // Extract every complete message from `buf`. `rest` holds the trailing incomplete bytes (to be
-// prepended to the next read). Err on a malformed header block.
+// prepended to the next read). Err on a malformed header block. Nothing is lost or invented: the messages and the rest
+// are pieces of `buf`, in order, and the rest is its tail.
+@Ensures(result.isOk() ==> buf.endsWith(result.unwrap().rest))
+@Ensures(result.isOk() ==> result.unwrap().messages.every(m => buf.includes(m)))
+@Ensures(result.isOk()
+    ==> result.unwrap().rest.length + totalLength(result.unwrap().messages) <= buf.length)
 export function unframe(buf: string): Result<Unframed, string> {
   let messages: string[] = [];
   let pos: usize = 0;

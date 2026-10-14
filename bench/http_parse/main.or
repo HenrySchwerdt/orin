@@ -1,0 +1,143 @@
+// std:http parser throughput on a corpus of realistic messages (the benchmark of tests/std/bench/http_bench.or without the
+// timing: deterministic output so that tools/bench.py can time the whole process). Orin only: there is no Go / C
+// counterpart of std:http (Go's net/http parses a different grammar with different limits).
+// Every message is parsed `rounds` times from one chunk, from 64-byte chunks and from 1-byte chunks; the checksum lines
+// count the messages parsed and the bytes fed, and one request is inspected and serialized again.
+import { Bytes, bytesFromString } from "std:bytes";
+import { Request, Response, ParseResult, NeedMore, Done, Failed, RequestParser, ResponseParser, defaultLimits, serializeRequest }
+  from "std:http";
+
+function browser(): string {
+  return "GET /static/app/main.3f9a1c.js?v=20260101 HTTP/1.1\r\n"
+  + "Host: www.example.com\r\n"
+  + "Connection: keep-alive\r\n"
+  + "sec-ch-ua: \"Chromium\";v=\"126\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"126\"\r\n"
+  + "sec-ch-ua-mobile: ?0\r\n"
+  + "sec-ch-ua-platform: \"Linux\"\r\n"
+  + "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+  + "Accept: */*\r\n"
+  + "Sec-Fetch-Site: same-origin\r\n"
+  + "Sec-Fetch-Mode: no-cors\r\n"
+  + "Sec-Fetch-Dest: script\r\n"
+  + "Referer: https://www.example.com/dashboard/overview\r\n"
+  + "Accept-Encoding: gzip, deflate, br, zstd\r\n"
+  + "Accept-Language: en-US,en;q=0.9,de;q=0.8\r\n"
+  + "Cookie: session=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c; theme=dark; consent=1; _ga=GA1.2.1234567890.1700000000; csrftoken=abcdefghijklmnopqrstuvwxyz0123456789ABCDEF\r\n"
+  + "If-None-Match: \"3f9a1c-5e2b\"\r\n"
+  + "\r\n";
+}
+
+const CURL: string = "GET /health HTTP/1.1\r\nHost: localhost:8080\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n";
+
+function api(): string {
+  const body = "{\"customer\":\"c-10234\",\"items\":[{\"sku\":\"A-1001\",\"qty\":2,\"price\":1999},{\"sku\":\"B-2002\",\"qty\":1,\"price\":4500}],\"currency\":\"EUR\",\"note\":\"leave at the door\"}";
+  return "POST /v1/orders HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-not-a-real-token-no\r\n"
+    + "Content-Type: application/json\r\nAccept: application/json\r\nUser-Agent: orders-client/2.1\r\nX-Request-Id: 7d2f0c1e-8b7a-4c55-9a3e-1f2d3c4b5a69\r\nContent-Length: "
+    + body.length.toString() + "\r\n\r\n" + body;
+}
+
+function upload(): string {
+  return "PUT /upload/part-0007 HTTP/1.1\r\nHost: files.example.com\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n"
+  + "100\r\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n"
+  + "100\r\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\r\n"
+  + "0\r\nX-Checksum: 9f86d081884c7d659a2feaa0c55ad015\r\n\r\n";
+}
+
+function res_html(): string {
+  return "HTTP/1.1 200 OK\r\nServer: orin\r\nDate: Tue, 13 Oct 2026 12:00:00 GMT\r\nContent-Type: text/html; charset=utf-8\r\n"
+  + "Content-Length: 512\r\nCache-Control: max-age=3600, public\r\nETag: \"3f9a1c-5e2b\"\r\nVary: Accept-Encoding\r\nX-Content-Type-Options: nosniff\r\n"
+  + "Strict-Transport-Security: max-age=63072000; includeSubDomains\r\n\r\n"
+  + "<!doctype html><html><head><meta charset=\"utf-8\"><title>Orin</title></head><body><h1>Hello</h1><p>0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  + "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef</p></body></html>";
+}
+
+
+// Feeds `wire` in pieces of `piece` bytes (0: the whole message); returns the parser.
+function parseOnce(wire: Bytes, piece: usize, reuse: RequestParser): RequestParser {
+  let p = reuse;
+  p.reset();
+  if (piece == 0) {
+    p.feed(wire);
+    return p;
+  }
+  let off: usize = 0;
+  while (off < wire.length() && !p.isDone() && !p.isFailed()) {
+    const end = off + piece < wire.length() ? off + piece : wire.length();
+    p.feed(wire.slice(off, end));
+    off = end;
+  }
+  return p;
+}
+
+function countRequests(wires: Bytes[], rounds: int, piece: usize): int {
+  let ok = 0;
+  let p = new RequestParser(defaultLimits());
+  let r = 0;
+  while (r < rounds) {
+    let j: usize = 0;
+    while (j < wires.length) {
+      p = parseOnce(wires[j], piece, p);
+      if (p.isDone()) {
+        ok += 1;
+      }
+      j += 1;
+    }
+    r += 1;
+  }
+  return ok;
+}
+
+function main(): void {
+  const browserMsg = bytesFromString(browser());
+  const curlMsg = bytesFromString(CURL);
+  const apiMsg = bytesFromString(api());
+  const uploadMsg = bytesFromString(upload());
+  const mix = [browserMsg, curlMsg, apiMsg, uploadMsg];
+  console.log("corpus " + browserMsg.length().toString() + " " + curlMsg.length().toString() + " " + apiMsg.length().toString() + " " + uploadMsg.length().toString());
+  let total: int = 0;
+  let k: usize = 0;
+  while (k < mix.length) {
+    total += mix[k].length().toInt();
+    k += 1;
+  }
+  console.log("one-chunk requests " + countRequests(mix, 6000, 0).toString() + " bytes " + (total * 6000).toString());
+  console.log("64-byte requests " + countRequests(mix, 2500, 64).toString() + " bytes " + (total * 2500).toString());
+  console.log("1-byte requests " + countRequests(mix, 150, 1).toString() + " bytes " + (total * 150).toString());
+  const resMsg = bytesFromString(res_html());
+  let rp = new ResponseParser(defaultLimits(), false);
+  let resOk = 0;
+  let resBody: int = 0;
+  let r = 0;
+  while (r < 6000) {
+    rp.reset();
+    match (rp.feed(resMsg)) {
+      Done(resp, used) => {
+        resOk += 1;
+        resBody += resp.body().length().toInt() + resp.headers().count().toInt();
+      },
+      NeedMore => {},
+      Failed(e) => { console.log(e.message); }
+    };
+    r += 1;
+  }
+  console.log("responses " + resOk.toString() + " body+headers " + resBody.toString());
+  let p = new RequestParser(defaultLimits());
+  match (p.feed(apiMsg)) {
+    Done(req, used) => {
+      let n = 0;
+      let bytes: int = 0;
+      while (n < 6000) {
+        bytes += serializeRequest(req).length().toInt();
+        n += 1;
+      }
+      console.log("request " + req.target() + " headers " + req.headers().count().toString() + " body " + req.body().length().toString() + " used " + used.toString());
+      console.log("serialized " + bytes.toString());
+    },
+    NeedMore => { console.log("need more"); },
+    Failed(e) => { console.log(e.message); }
+  };
+}

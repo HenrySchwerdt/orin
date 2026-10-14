@@ -5,7 +5,7 @@
 // completed (and numbered) after all its imports, the entry last. File paths are normalized
 // lexically (see path.or), not canonicalized.
 
-import { Module, Item, ImportDecl, Ident, parse } from "../syntax";
+import { Module, Item, ImportDecl, Ident, parseRecovering, MAX_SYNTAX_ERRORS } from "../syntax";
 import {
   Span, SourceMap, SourceFile, Diagnostic, diag, span, allRenderable, allWellFormed,
 } from "../diag";
@@ -124,8 +124,12 @@ function overlayRespected(overlay: SourceFile[], o: LoadOutcome): bool {
 @Invariant(isTopological(this.units) && allUnitsWellFormed(this.units))
 @Invariant(allNormalized(this.stack) && allDistinct(this.stack) && noneDone(this.stack, this.done))
 @Invariant(this.manifest.isNone() ==> this.graph.edgeCount() == 0)
+@Invariant(this.moreSyntaxErrors.length < MAX_SYNTAX_ERRORS)
 class Loader {
   files: SourceFile[] = [];
+  // After a failed `run` whose error is a syntax error: the further syntax errors of that file (error recovery; the
+  // first one is the `Err` of `run`). No other file is parsed after it, so no checker ever sees that file.
+  moreSyntaxErrors: Diagnostic[] = [];
   private units: Unit[] = [];
   private done: Map<string, usize> = new Map<string, usize>(); // file path -> index in `units`
   private stack: string[] = []; // files being loaded (their imports are not complete yet)
@@ -161,6 +165,8 @@ class Loader {
   @Ensures(result.isOk() ==> this.graph.acyclic())
   @Ensures(result.isErr()
       ==> this.files.length > 0 && isRenderableErr(this.files, result.unwrapErr()))
+  @Ensures(result.isErr() ==> allRenderable(SourceMap { files: this.files }, this.moreSyntaxErrors))
+  @Ensures(result.isOk() ==> this.moreSyntaxErrors.length == 0)
   run(fs: FsGrant, entry: string, entryDisplay: string): Result<LoadedProgram, Diagnostic> {
     this.visit(fs, entry, entryDisplay)?;
     this.checkModuleCycles()?;
@@ -192,7 +198,13 @@ class Loader {
     }
     const file = this.files.length;
     this.files.push(SourceFile { path: display, text: text.unwrap() });
-    const parsed = parse(file, text.unwrap())?;
+    const pr = parseRecovering(file, text.unwrap());
+    if (pr.isErr()) {
+      const ds = pr.unwrapErr();
+      this.moreSyntaxErrors = ds.slice(1, ds.length);
+      return Err(ds[0]);
+    }
+    const parsed = pr.unwrap();
     // The entry file also gets the implicit imports of the prelude roots, in front of its own items. A file that calls
     // the array method `parallel()` also imports the parallel-pipeline prelude (ADR-0039), which is loaded only for such programs.
     const noItems: Item[] = [];
@@ -339,7 +351,7 @@ export function loadWithRoots(
   let loader = new Loader(src, roots, dirname(entry), srcRoot, manifest);
   const r = loader.run(fs, entry, entryDisplay);
   if (r.isErr()) {
-    return failedLoad(loader.files, [r.unwrapErr()]);
+    return failedLoad(loader.files, [r.unwrapErr()].concat(loader.moreSyntaxErrors));
   }
   return LoadOutcome {
     sm: SourceMap { files: loader.files },

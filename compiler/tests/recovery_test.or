@@ -1,0 +1,303 @@
+// Unit tests of parser error recovery (`parseRecovering`, docs/rewrite.md "Parser error recovery"): several syntax errors
+// per file, the first one exactly the error of `parse`, no cascades, at most MAX_SYNTAX_ERRORS, termination on any input.
+// Run: `orin test compiler/tests/recovery_test.or --runtime runtime`. `orin test` checks contracts at run time, so the
+// progress `@Ensures` of `recoverStmt` / `recoverMember` / `recoverItem` (the cursor moves past the start of the failed
+// construct, or the loop ends), the `Parser` invariants and the `@Ensures` of `parseRecovering` (`syntaxErrorsOk`, the
+// first error agrees with `parse`) run on every call below.
+
+import { assert, assertEqString, assertEqUsize } from "std:test";
+import { Diagnostic } from "../diag";
+import {
+  Module, Parser, lex, parse, parseRecovering, isSyntaxCode, sameDiag, syntaxErrorsOk,
+  moduleWellFormed, MAX_SYNTAX_ERRORS, SUPPRESSED_NOTE,
+} from "../syntax";
+
+// The errors of `src` (which must have some).
+function errsOf(src: string): Diagnostic[] {
+  const r = parseRecovering(0, src);
+  assert(r.isErr(), `has errors: ${src}`);
+  return r.unwrapErr();
+}
+
+// "CODE message @ text" of each error, the text being the source the span covers.
+function show(src: string, ds: Diagnostic[]): string {
+  return ds
+      .map(d => `${d.code} ${d.message} @ ${src.substring(d.span.start, d.span.end)}`)
+      .join("\n");
+}
+
+// The properties every recovering parse has, checked against the plain parse.
+function checkAgainstParse(src: string): usize {
+  const r = parseRecovering(0, src);
+  const p = parse(0, src);
+  assert(r.isOk() == p.isOk(), `errors exactly when parse fails: ${src}`);
+  if (r.isOk()) {
+    assert(moduleWellFormed(r.unwrap(), src.length), `well formed: ${src}`);
+    assertEqUsize(r.unwrap().items.length, p.unwrap().items.length, `same items: ${src}`);
+    return 0;
+  }
+  const ds = r.unwrapErr();
+  assert(sameDiag(ds[0], p.unwrapErr()), `first error is the error of parse: ${src}`);
+  assert(syntaxErrorsOk(ds, 0, src.length), `errors ordered, capped, in the source: ${src}`);
+  return ds.length;
+}
+
+function nextSeed(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+@Test
+function threeErrorsInOneFile(): void {
+  const src = "function f(): void {\n  let x = 1 +;\n  g(;\n}\n\nfunction h(: int): void {}\n\nclass C {\n  a: int = ;\n  m(): void {}\n}\n";
+  const ds = errsOf(src);
+  assertEqString(
+    show(src, ds),
+    "E0200 expected expression, found `;` @ ;\n" + "E0200 expected expression, found `;` @ ;\n"
+        + "E0200 expected identifier, found `:` @ :\n" + "E0200 expected expression, found `;` @ ;",
+    "a statement, a parameter list and a field each report their own error",
+  );
+  assertEqUsize(ds[0].span.start, 34, "first error at the `;` of line 2");
+  assert(sameDiag(ds[0], parse(0, src).unwrapErr()), "first error unchanged");
+}
+
+@Test
+function validProgramsHaveNoErrors(): void {
+  const src = "import { a } from \"./a\";\n@Requires(n >= 0)\nexport function f(n: int): int {\n  @Invariant(n >= 0)\n  while (n > 0) { n -= 1; }\n  return match (n) { 0 => 1, _ => 2 };\n}\ninterface I { m(): int; }\nclass C implements I { private a: int = 1; m(): int { return this.a; } }\ntype U = A | B(int);\nconst K: int = 3;\n";
+  const r = parseRecovering(0, src);
+  assert(r.isOk(), "parses");
+  assertEqUsize(r.unwrap().items.length, 6, "six items");
+}
+
+@Test
+function eachRecoveryPointReportsOnce(): void {
+  // Block: after a `;`, at a statement keyword, past the body of an `if`.
+  assertEqUsize(errsOf("function f(): void { let a = ; let b = ; }").length, 2, "two statements");
+  // An error at the resume point or the token after it counts as a cascade (`c d` fails on its second token).
+  assertEqUsize(
+    errsOf("function f(): void { a b; c d; }").length,
+    1,
+    "second error inside the cascade window",
+  );
+  assertEqUsize(
+    errsOf("function f(): void { if (a b) { x(); } y(;) }").length,
+    2,
+    "past the if body",
+  );
+  assertEqUsize(
+    errsOf("function f(): void { let x = 1 2 return; let y = ; }").length,
+    2,
+    "at `return`",
+  );
+  // A record literal or arrow body inside the failed statement does not end the block early.
+  assertEqUsize(
+    errsOf("function f(): void { x = Foo { a: 1 b: 2 }; y(); z(; }").length,
+    2,
+    "nested braces skipped",
+  );
+  // Class and interface members.
+  assertEqUsize(
+    errsOf("class C { a: int = ; m(: int): void { } n(): void { let = 1; } b: = 2; }").length,
+    4,
+    "field, method signature, method body, field type",
+  );
+  assertEqUsize(
+    errsOf("interface I { m(): int { } n(: int): int; k(): void; }").length,
+    2,
+    "a body (E0408), then a parameter",
+  );
+  // Top level: the next declaration keyword or `@`.
+  const ds = errsOf(
+    "@Foo function f(): void {}\nconst = 1;\n@Test function g(): void { let = 1; }\n",
+  );
+  assertEqString(ds[0].code, "E0408", "unknown annotation");
+  assertEqUsize(ds.length, 3, "annotation, constant, statement");
+}
+
+@Test
+function noCascades(): void {
+  // A missing `}`: the next `function` is reported once, then the parse resumes at the top level (no "expected `}`").
+  const miss = "function f(): void {\n  if (x) {\n    g();\nfunction k(): void { let = 1; }\n";
+  assertEqString(
+    show(miss, errsOf(miss)),
+    "E0200 expected expression, found `function` @ function\nE0200 expected identifier, found `=` @ =",
+    "missing brace",
+  );
+  // Running into the end of the file inside a recovery stops the parse: one error, not a second "expected `}`".
+  assertEqUsize(errsOf("function f(): void { g(a b c").length, 1, "end of file");
+  assertEqUsize(errsOf("function f( {\n").length, 1, "signature then end of file");
+  // Out of step: a stray `}` ends the class early, the rest of the class body is skipped at the top level.
+  const stray = "class C {\n  m(): void { if (a) { } }\n  }\n  n(): void {}\n}\nfunction g(): void {}\n";
+  assertEqString(
+    show(stray, errsOf(stray)),
+    "E0200 expected declaration, found `n` @ n",
+    "one error",
+  );
+  // Out of step inside a class (statements of a function parsed as members): every line would fail on its second
+  // token; only the first is reported.
+  const members = "class C {\n  m(): void { if (a) { }\n}\nfunctx a = 1;\n  a.b(1);\n  a.c(2);\n  a.d(3);\n}\n";
+  assertEqString(
+    show(members, errsOf(members)),
+    "E0200 expected `(` or `:` in class member, found `a` @ a",
+    "the first bad member only",
+  );
+  // An error at the token a recovery resumed at is dropped.
+  assertEqUsize(
+    errsOf("function f(): void { let x = ; ) y(); }").length,
+    1,
+    "stray `)` after the resume point",
+  );
+}
+
+@Test
+function capAtTwentyWithANote(): void {
+  let src = "function f(): void {\n";
+  let i: usize = 0;
+  while (i < 30) {
+    src = src + `  let x${i} = ;\n`;
+    i += 1;
+  }
+  src = src + "}\n";
+  const ds = errsOf(src);
+  assertEqUsize(ds.length, MAX_SYNTAX_ERRORS, "capped");
+  assertEqUsize(ds[MAX_SYNTAX_ERRORS - 1].notes.length, 1, "one note");
+  assertEqString(ds[MAX_SYNTAX_ERRORS - 1].notes[0], SUPPRESSED_NOTE, "the note");
+  assertEqString(SUPPRESSED_NOTE, "further syntax errors suppressed", "its text");
+  assertEqUsize(ds[0].notes.length, 0, "no note on the others");
+  // Exactly twenty errors: no note.
+  let exact = "function f(): void {\n";
+  i = 0;
+  while (i < 20) {
+    exact = exact + `  let x${i} = ;\n`;
+    i += 1;
+  }
+  const de = errsOf(exact + "}\n");
+  assertEqUsize(de.length, 20, "twenty");
+  assertEqUsize(de[19].notes.length, 0, "no note when nothing was suppressed");
+}
+
+@Test
+function lexicalErrorIsTheOnlyError(): void {
+  const ds = errsOf("function f(): void { let = 1; }\nconst s = \"open\n");
+  assertEqUsize(ds.length, 1, "the lexer stops at its first error");
+  assertEqString(ds[0].code, "E0100", "E0100");
+}
+
+@Test
+function plainParseIsUnchanged(): void {
+  // `parse` stops at the first error, also on a parser built by hand: recovery is off unless asked for.
+  let p = new Parser(lex(0, "function f(): void { let a = ; let b = ; }").unwrap());
+  const r = p.parseModule(0);
+  assert(r.isErr(), "error");
+  assertEqUsize(p.errors().length, 0, "nothing recorded");
+  let q = new Parser(lex(0, "function f(): void { let a = ; let b = ; }").unwrap());
+  q.enableRecovery();
+  const s = q.parseModule(0);
+  assert(s.isOk(), "a module (the errors are in errors())");
+  assertEqUsize(q.errors().length, 2, "both recorded");
+  assert(sameDiag(q.errors()[0], r.unwrapErr()), "the same first error");
+}
+
+@Test
+function recoveryTerminatesOnGarbage(): void {
+  const words = [
+    "function",
+    "class",
+    "interface",
+    "type",
+    "import",
+    "export",
+    "const",
+    "let",
+    "if",
+    "else",
+    "while",
+    "for",
+    "of",
+    "return",
+    "break",
+    "continue",
+    "match",
+    "new",
+    "this",
+    "true",
+    "@",
+    "@Requires",
+    "@Test",
+    "(",
+    ")",
+    "{",
+    "}",
+    "{",
+    "}",
+    "[",
+    "]",
+    "<",
+    ">",
+    ",",
+    ";",
+    ";",
+    ":",
+    ".",
+    "=",
+    "=>",
+    "==>",
+    "+",
+    "-",
+    "!",
+    "?",
+    "|",
+    "x",
+    "y",
+    "T",
+    "int",
+    "f",
+    "1",
+    "\"s\"",
+    "`a${",
+    "}b`",
+    "constructor",
+    "private",
+    "static",
+    "extends",
+    "\n",
+  ];
+  let seed: int = 11;
+  let multi: usize = 0;
+  let i: usize = 0;
+  while (i < 400) {
+    seed = nextSeed(seed);
+    const n = seed % 80 + 1;
+    let parts: string[] = [];
+    let k: int = 0;
+    while (k < n) {
+      seed = nextSeed(seed);
+      parts.push(words[(seed % words.length.toInt()).toUsize()]);
+      k += 1;
+    }
+    if (checkAgainstParse(parts.join(" ")) > 1) {
+      multi += 1;
+    }
+    i += 1;
+  }
+  assert(multi > 20, "garbage often has several errors");
+  // Every prefix of a real program, and the program with every single token's worth of bytes deleted.
+  const prog = "@Requires(n >= 0)\nexport function f<T extends S>(n: int, g: (x: T) => bool): Result<int[], string> {\n  let xs: int[] = [];\n  for (const a of [1, 2]) { xs.push(a * n - 1); }\n  match (g) { A(y) => { return Ok(xs); }, _ => {} }\n  const s = `n=${n + 1}`;\n  return n > 0 ? Ok(xs) : Err(\"neg\");\n}\nclass C { private a: int = 1; m(): int { return this.a; } }\ninterface I { m(): int; }\n";
+  let cut: usize = 0;
+  while (cut <= prog.length) {
+    checkAgainstParse(prog.substring(0, cut));
+    if (cut + 3 <= prog.length) {
+      checkAgainstParse(prog.substring(0, cut) + prog.substring(cut + 3, prog.length));
+    }
+    cut += 1;
+  }
+  assertEqUsize(checkAgainstParse(prog), 0, "the whole program parses");
+}
+
+@Test
+function errorCodesStaySyntaxCodes(): void {
+  const src = "@Ensures(true) const K: int = 1;\n@Test @Test function f(): void {}\nfunction g(): void { var x = 1; }\ntype T<A extends B> = A;\n@Deprecated function h(): void {}\n";
+  const ds = errsOf(src);
+  assertEqUsize(ds.length, 5, "five errors");
+  assert(ds.every(d => isSyntaxCode(d.code)), "all syntax codes");
+  assertEqString(ds.map(d => d.code).join(" "), "E0200 E0442 E0201 E0408 E0441", "codes");
+}
