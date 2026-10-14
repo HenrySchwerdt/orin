@@ -67,6 +67,8 @@ export function isReset(e: NetError): bool {
   return e.code == CODE_RESET;
 }
 
+@Ensures(result >= 0 && result <= MAX_MS)
+@Ensures(ms >= 0 && ms <= MAX_MS ==> result == ms)
 function clampMs(ms: int): int {
   if (ms < 0) {
     return 0;
@@ -80,6 +82,7 @@ function clampMs(ms: int): int {
 export type Peer = { host: string; port: int; };
 
 // parsePeer(text): "1.2.3.4:5" or "[::1]:5" to a Peer; Peer { host: text, port: 0 } if the text has no port. O(n).
+@Ensures(result.port >= 0 && result.port <= 100001)
 export function parsePeer(text: string): Peer {
   let i = text.length;
   while (i > 0) {
@@ -315,9 +318,28 @@ function splitLines(text: string): string[] {
 // The result of one `recv`.
 export type RecvResult = RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError(NetError);
 
+// recvWithin(r, max): a RecvData holds between 1 and `max` bytes (a recv never returns more than it was asked for, and
+// never an empty chunk: that is RecvEof). Other results hold no bytes. Used in contracts.
+export function recvWithin(r: RecvResult, max: usize): bool {
+  return match (r) {
+    RecvData(b) => b.length() >= 1 && b.length() <= max,
+    _ => true
+  };
+}
+
+// recvIsError(r): the result is RecvError. Used in contracts.
+export function recvIsError(r: RecvResult): bool {
+  return match (r) {
+    RecvError(e) => true,
+    _ => false
+  };
+}
+
 // recv(s, maxBytes, timeoutMs): waits up to timeoutMs for bytes and returns 1..min(maxBytes, 65536) of them
 // (RecvData), or RecvEof (the peer closed: no more data ever), RecvTimeout (nothing arrived), RecvReset, or RecvError.
 // maxBytes 0 is an error. One system call; the bytes are copied once from the L0 buffer into the result.
+@Ensures(recvWithin(result, maxBytes))
+@Ensures(maxBytes == 0 ==> recvIsError(result))
 export function recv(s: Stream, maxBytes: usize, timeoutMs: int): RecvResult {
   if (maxBytes == 0) {
     return RecvError(makeError(22));
@@ -359,7 +381,6 @@ function sendFrom(s: Stream, arr: u8[], off: usize, timeoutMs: int): Result<usiz
 
 // sendAll(s, data, timeoutMs): sends all of `data`, resending the tail after partial writes; timeoutMs is a deadline for
 // the whole call. Err(timeout) if the peer does not read fast enough, Err(reset) if it is gone. O(length) copying.
-@Ensures(result.isOk() ==> true)
 export function sendAll(s: Stream, data: Bytes, timeoutMs: int): Result<void, NetError> {
   const arr = data.toArray();
   const deadline = netNow(s) + clampMs(timeoutMs);
@@ -549,6 +570,7 @@ export class StreamReader {
 
 // findFrom(hay, delim, begin, limit): the end index (exclusive) of the first occurrence of `delim` in hay that starts at an
 // index >= begin and ends at <= limit, or None. O(length * delim) worst case, O(length) typical.
+@Ensures(result.isSome() ==> result.unwrap() >= delim.length() && result.unwrap() <= limit && result.unwrap() <= hay.length())
 export function findFrom(hay: Bytes, delim: Bytes, begin: usize, limit: usize): Option<usize> {
   const n = hay.length() < limit ? hay.length() : limit;
   const m = delim.length();
