@@ -1,0 +1,1072 @@
+// Symbolic execution of statements for the contract verifier (ADR-0031 B6-B9, loops): assignments to locals,
+// fields and elements, mutating calls (`push`, `pop`, `set`, `delete`, mutating methods with their frames),
+// branches, `match`, and loops (user `@Invariant`, inferred counter bounds, or havoc).
+
+import { Span } from "../diag";
+import {
+  TypeExpr, Block, Stmt, Expr, ContractClause, MatchArm, ArmBody, Ident,
+  SLet, SAssign, SExpr, SReturn, SIf, SBlock, SContract, SWhile, SForOf, SBreak, SContinue,
+  EInt, EBool, EIdent, EThis, EBinary, ECall, EMember, EIndex, EMatch, EUnary, ECond, EArrow, EArray, ERecord, ENew, ETemplate,
+  BAdd, BLt, BLe, BGt, BGe, BAnd, BOr, BImplies, BSub, BMul, BDiv, BRem, BEq, BNe,
+  OpAssign, OpAddAssign, OpSubAssign, OpMulAssign, OpDivAssign, OpRemAssign, AssignOp, BinaryOp,
+  BExpr, BBlock, CInvariant, CDecreases, CRequires, CEnsures
+} from "../syntax";
+import {
+  VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
+  vtName, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, joinKinds, fieldIndex, resolveTy
+} from "./vt";
+import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
+import {
+  Var, Chk, TR, St, Ret, Ex, Fn, Cls, Prog, Cx, lineOf, clauseText, srcText, lit, inKind, guarded, concat, concatChk, unionUsize, andAll,
+  noChks, noExp, lookupVar, prefix, tailFrom, mk, sortS, tyOf, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds, isSomeT,
+  recField, mapHas, mapSize, assignedIn, hasJump, rootOf, isThisExpr, clausesOfList, exprOf
+} from "./ctx";
+import { tr, trClause, wdOf, callFnX, isUnit, sigOf, Cl, matchPattern } from "./expr";
+
+// ------------------------------------------------------------------------------------------ emitting
+
+export type Emitted = { g: Gen; st: St; };
+
+// Turn the checks of an expression into obligations (reported) and assumptions (the path continues only when
+// they hold: a failed check traps, so it never returns). Each is assumed after the point where it occurs.
+export function emit(g0: Gen, st0: St, cx: Cx, chks: Chk[]): Emitted {
+  let g = g0;
+  let st = st0;
+  for (const c of chks) {
+    if (c.oblig) {
+      const o = Obl {
+        kind: c.kind, what: c.what, line: c.line, clause: c.clause, goal: c.goal, pc: st.pc, deps: st.deps, approx: st.approx,
+        file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: false
+      };
+      let dup = false;
+      const existing = g.oblList();
+      let k = existing.length;
+      let looked: usize = 0;
+      while (k > 0 && looked < 4) {
+        k -= 1;
+        looked += 1;
+        const x = existing[k];
+        if (x.kind == o.kind && x.line == o.line && x.clause == o.clause && x.goal == o.goal && x.pc.length == o.pc.length) {
+          dup = true;
+        }
+      }
+      if (!dup) {
+        g.addObl(o);
+      }
+    }
+    st.pc.push(c.goal);
+  }
+  return Emitted { g: g, st: st };
+}
+
+export type TS = { g: Gen; st: St; t: string; vt: VT; };
+
+// Translate an expression in a state and emit its checks.
+export function trEmit(g: Gen, st: St, cx: Cx, e: Expr, exp: VT): Result<TS, string> {
+  const r = tr(g, st.vars, cx, e, exp)?;
+  const em = emit(r.g, st, cx, r.chks);
+  return Ok(TS { g: em.g, st: em.st, t: r.t, vt: r.vt });
+}
+
+function assignIndex(vars: Var[], name: string): Option<usize> {
+  let i = vars.length;
+  while (i > 0) {
+    i -= 1;
+    if (vars[i].name == name) {
+      return Some(i);
+    }
+  }
+  return None;
+}
+
+function cxPlain(cx: Cx): Cx {
+  return Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: cx.ret, inQ: false, text: cx.text };
+}
+
+// ----------------------------------------------------------------------------------------- places
+
+// Write `val` (of type `vt`) to the place `place`: a local, a field `a.f`, an element `a[i]`, nested to any
+// depth. The enclosing values are rebuilt (value semantics: no aliasing).
+export function setPlace(g0: Gen, st0: St, cx: Cx, place: Expr, val: string, vt: VT): Result<Emitted, string> {
+  let g = g0;
+  let st = st0;
+  return match (place.kind) {
+    EIdent(id) => {
+      const idx = assignIndex(st.vars, id.name);
+      if (idx.isNone()) {
+        return Err("assignment to the unknown variable `" + id.name + "`");
+      }
+      const old = st.vars[idx.unwrap()];
+      if (!vtEq(old.vt, vt)) {
+        return Err("assignment changes the type of `" + id.name + "` (" + vtName(old.vt) + " to " + vtName(vt) + ")");
+      }
+      const f = fresh(g, cx, old.vt, val)?;
+      g = f.g;
+      st.vars[idx.unwrap()] = Var { name: id.name, term: f.name, vt: old.vt };
+      return Ok(Emitted { g: g, st: st });
+    },
+    EMember(b, fld) => {
+      const bt = trEmit(g, st, cx, b, noExp())?;
+      g = bt.g;
+      st = bt.st;
+      return match (bt.vt) {
+        VRec(rn) => {
+          const rd = cx.p.tab.findRec(rn);
+          if (rd.isNone()) {
+            return Err("unknown record `" + rn + "`");
+          }
+          const d = rd.unwrap();
+          if (cx.p.tab.isCyclic("r:" + rn)) {
+            return Err("the fields of the recursive type `" + rn + "` are not modelled");
+          }
+          const fi = fieldIndex(d, fld.name);
+          if (fi.isNone()) {
+            return Err("no field `" + fld.name + "` on `" + rn + "`");
+          }
+          const ft = tyOf(cx, d.ftys[fi.unwrap()]);
+          if (isBad(ft)) {
+            return Err("field `" + rn + "." + fld.name + "` has an unsupported type (" + badReason(ft) + ")");
+          }
+          if (!vtEq(ft, vt)) {
+            return Err("field `" + rn + "." + fld.name + "` has type `" + vtName(ft) + "`, assigned `" + vtName(vt) + "`");
+          }
+          const so = sortS(g, cx, bt.vt)?;
+          g = so.g;
+          let args: string[] = [];
+          let i: usize = 0;
+          while (i < d.fields.length) {
+            args.push(i == fi.unwrap() ? val : recField(so.s, d.fields[i], bt.t));
+            i += 1;
+          }
+          const nv = "(mk" + so.s + " " + args.join(" ") + ")";
+          return setPlace(g, st, cx, b, nv, bt.vt);
+        },
+        _ => Err("field assignment on a value of type `" + vtName(bt.vt) + "`")
+      };
+    },
+    EIndex(b, ie) => {
+      const bt = trEmit(g, st, cx, b, noExp())?;
+      g = bt.g;
+      st = bt.st;
+      const it = tr(g, st.vars, cx, ie, VInt("usize"))?;
+      return match (bt.vt) {
+        VArr(el) => {
+          if (!vtEq(el, vt)) {
+            return Err("element assignment of type `" + vtName(vt) + "` to an array of `" + vtName(el) + "`");
+          }
+          const so = sortS(it.g, cx, bt.vt)?;
+          const goal = inBounds(so.s, bt.t, it.t);
+          const clause = "index in bounds: `" + srcText(cx.text, place) + "`";
+          const em = emit(so.g, st, cx, concatChk(it.chks, [Chk { oblig: true, kind: "bounds", what: "index", line: lineOf(cx.text, place.span.start), clause: clause, goal: goal }]));
+          g = em.g;
+          st = em.st;
+          const nv = arrMk(so.s, "(store " + arrData(so.s, bt.t) + " " + it.t + " " + val + ")", arrLen(so.s, bt.t));
+          return setPlace(g, st, cx, b, nv, bt.vt);
+        },
+        _ => Err("element assignment on a value of type `" + vtName(bt.vt) + "`")
+      };
+    },
+    _ => Err("unsupported assignment target")
+  };
+}
+
+// ------------------------------------------------------------------------------------ mutating calls
+
+export type MutR = { g: Gen; st: St; t: string; vt: VT; };
+
+// A statement-level call that changes its receiver: `xs.push(e)`, `xs.pop()`, `m.set(k, v)`, `m.delete(k)` and a
+// mutating method of a class. None when the call is not of that kind (it is then an ordinary expression).
+function execCallStmt(g0: Gen, st0: St, cx: Cx, e: Expr): Result<Option<MutR>, string> {
+  let g = g0;
+  let st = st0;
+  const none: Option<MutR> = None;
+  return match (e.kind) {
+    ECall(callee, args) => match (callee.kind) {
+      EMember(base, m) => {
+        // Not a value: a class name (static call), `console`.
+        match (base.kind) {
+          EIdent(id) => {
+            if (lookupVar(st.vars, id.name).isNone()) {
+              return Ok(none);
+            }
+          },
+          _ => {}
+        }
+        const r = tr(g, st.vars, cx, base, noExp())?;
+        const name = m.name;
+        return match (r.vt) {
+          VArr(el) => {
+            if (name != "push" && name != "pop") {
+              return Ok(none);
+            }
+            const em = emit(r.g, st, cx, r.chks);
+            g = em.g;
+            st = em.st;
+            const so = sortS(g, cx, r.vt)?;
+            g = so.g;
+            const len = arrLen(so.s, r.t);
+            if (name == "push" && args.length == 1) {
+              const x = trEmit(g, st, cx, args[0], el)?;
+              g = x.g;
+              st = x.st;
+              if (!vtEq(x.vt, el)) {
+                return Err("`push` of `" + vtName(x.vt) + "` to an array of `" + vtName(el) + "`");
+              }
+              const nv = arrMk(so.s, "(store " + arrData(so.s, r.t) + " " + len + " " + x.t + ")", "(+ " + len + " 1)");
+              const sp = setPlace(g, st, cx, base, nv, r.vt)?;
+              return Ok(Some(MutR { g: sp.g, st: sp.st, t: "0", vt: VUnit }));
+            }
+            if (name == "pop" && args.length == 0) {
+              const os = sortS(g, cx, VOpt(el))?;
+              g = os.g;
+              const res = "(ite (> " + len + " 0) (some" + os.s + " " + arrSel(so.s, r.t, "(- " + len + " 1)") + ") none" + os.s + ")";
+              const nv = arrMk(so.s, arrData(so.s, r.t), "(ite (> " + len + " 0) (- " + len + " 1) 0)");
+              const fr = fresh(g, cx, VOpt(el), res)?;
+              g = fr.g;
+              const sp = setPlace(g, st, cx, base, nv, r.vt)?;
+              return Ok(Some(MutR { g: sp.g, st: sp.st, t: fr.name, vt: VOpt(el) }));
+            }
+            return Err("array method `" + name + "` with this many arguments");
+          },
+          VMap(k, v) => {
+            if (name != "set" && name != "delete") {
+              return Ok(none);
+            }
+            const em = emit(r.g, st, cx, r.chks);
+            g = em.g;
+            st = em.st;
+            const so = sortS(g, cx, r.vt)?;
+            g = so.g;
+            g.noteApprox("the size of a Map is axiomatised, not computed from its keys");
+            g.useAssumption("A-MAP");
+            const kt = trEmit(g, st, cx, args[0], k)?;
+            g = kt.g;
+            st = kt.st;
+            const has = mapHas(so.s, r.t, kt.t);
+            const sz = mapSize(so.s, r.t);
+            if (name == "set" && args.length == 2) {
+              const vt2 = trEmit(g, st, cx, args[1], v)?;
+              g = vt2.g;
+              st = vt2.st;
+              const nv = "(mk" + so.s + " (store (" + so.s + "h " + r.t + ") " + kt.t + " true) (store (" + so.s + "v " + r.t + ") " + kt.t + " " + vt2.t + ") (ite " + has + " " + sz + " (+ " + sz + " 1)))";
+              const sp = setPlace(g, st, cx, base, nv, r.vt)?;
+              return Ok(Some(MutR { g: sp.g, st: sp.st, t: "0", vt: VUnit }));
+            }
+            if (name == "delete" && args.length == 1) {
+              const nv = "(mk" + so.s + " (store (" + so.s + "h " + r.t + ") " + kt.t + " false) (" + so.s + "v " + r.t + ") (ite " + has + " (- " + sz + " 1) " + sz + "))";
+              const sp = setPlace(g, st, cx, base, nv, r.vt)?;
+              return Ok(Some(MutR { g: sp.g, st: sp.st, t: has, vt: VBool }));
+            }
+            return Err("Map method `" + name + "` with this many arguments");
+          },
+          VRec(cn) => {
+            const mi = cx.p.fnIx.get(cn + "." + name);
+            if (mi.isNone() || !cx.p.fns[mi.unwrap()].mutating || cx.p.fns[mi.unwrap()].kind != 1) {
+              return Ok(none);
+            }
+            const f = cx.p.fns[mi.unwrap()];
+            const c = callFnX(r.g, st.vars, cx, f, Some(r), args, e, noExp())?;
+            const em = emit(c.g, st, cx, c.chks);
+            g = em.g;
+            st = em.st;
+            if (c.newThis == "") {
+              return Err("internal: a mutating call without a new receiver");
+            }
+            const sp = setPlace(g, st, cx, base, c.newThis, r.vt)?;
+            return Ok(Some(MutR { g: sp.g, st: sp.st, t: c.t, vt: c.vt }));
+          },
+          _ => Ok(none)
+        };
+      },
+      _ => Ok(none)
+    },
+    _ => Ok(none)
+  };
+}
+
+// ---------------------------------------------------------------------------------------- statements
+
+function binOfAssign(op: AssignOp): Option<BinaryOp> {
+  return match (op) {
+    OpAssign => None,
+    OpAddAssign => Some(BAdd),
+    OpSubAssign => Some(BSub),
+    OpMulAssign => Some(BMul),
+    OpDivAssign => Some(BDiv),
+    OpRemAssign => Some(BRem)
+  };
+}
+
+function isCallNamed(e: Expr, name: string): bool {
+  return match (e.kind) {
+    ECall(c, _) => match (c.kind) {
+      EIdent(id) => id.name == name,
+      _ => false
+    },
+    _ => false
+  };
+}
+
+function isConsoleCall(e: Expr): bool {
+  return match (e.kind) {
+    ECall(c, _) => match (c.kind) {
+      EMember(b, _) => match (b.kind) {
+        EIdent(id) => id.name == "console",
+        _ => false
+      },
+      _ => false
+    },
+    _ => false
+  };
+}
+
+export function execStmts(g0: Gen, st0: St, cx: Cx, stmts: Stmt[]): Result<Ex, string> {
+  let g = g0;
+  let st = st0;
+  let rets: Ret[] = [];
+  let pending: ContractClause[] = [];
+  let k: usize = 0;
+  while (k < stmts.length) {
+    const s = stmts[k];
+    k += 1;
+    let keepPending = false;
+    match (s.kind) {
+      SContract(c) => {
+        pending.push(c);
+        keepPending = true;
+      },
+      SLet(_, name, ann, init) => {
+        let exp = noExp();
+        match (ann) {
+          Some(t) => {
+            exp = tyOf(cx, t);
+            if (isBad(exp)) {
+              return Err("local `" + name.name + "` has an unsupported type (" + badReason(exp) + ")");
+            }
+          },
+          None => {}
+        }
+        const mr = execCallStmt(g, st, cx, init)?;
+        let val = "";
+        let vty = noExp();
+        if (mr.isSome()) {
+          g = mr.unwrap().g;
+          st = mr.unwrap().st;
+          val = mr.unwrap().t;
+          vty = mr.unwrap().vt;
+        } else {
+          const t = trEmit(g, st, cx, init, exp)?;
+          g = t.g;
+          st = t.st;
+          val = t.t;
+          vty = t.vt;
+        }
+        if (isUnit(vty)) {
+          return Err("`let " + name.name + "` of a void value");
+        }
+        if (!isBad(exp) && !vtEq(vty, exp)) {
+          return Err("local `" + name.name + "` has type `" + vtName(exp) + "`, initialiser `" + vtName(vty) + "`");
+        }
+        const ty = isBad(exp) ? concrete(vty) : exp;
+        const f = fresh(g, cx, ty, val)?;
+        g = f.g;
+        st.vars.push(Var { name: name.name, term: f.name, vt: ty });
+      },
+      SAssign(target, op, value) => {
+        const bo = binOfAssign(op);
+        // the type of the place, then the value
+        const cur = trEmit(g, st, cx, target, noExp())?;
+        g = cur.g;
+        st = cur.st;
+        let rhs = value;
+        if (bo.isSome()) {
+          rhs = Expr { kind: EBinary(bo.unwrap(), target, value), span: s.span };
+        }
+        let mr: Option<MutR> = None;
+        if (bo.isNone()) {
+          mr = execCallStmt(g, st, cx, rhs)?;
+        }
+        let val = "";
+        let vty = noExp();
+        if (mr.isSome()) {
+          g = mr.unwrap().g;
+          st = mr.unwrap().st;
+          val = mr.unwrap().t;
+          vty = mr.unwrap().vt;
+        } else {
+          const t = trEmit(g, st, cx, rhs, cur.vt)?;
+          g = t.g;
+          st = t.st;
+          val = t.t;
+          vty = t.vt;
+        }
+        const sp = setPlace(g, st, cx, target, val, isIntTy(vty) && isIntTy(cur.vt) ? cur.vt : vty)?;
+        g = sp.g;
+        st = sp.st;
+      },
+      SExpr(e) => {
+        if (isCallNamed(e, "exit") && cx.p.fnCount.get("exit").unwrapOr(0) == 0) {
+          // The process ends: no path continues.
+          match (e.kind) {
+            ECall(_, args) => {
+              for (const a of args) {
+                const t = trEmit(g, st, cx, a, noExp())?;
+                g = t.g;
+                st = t.st;
+              }
+            },
+            _ => {}
+          }
+          return Ok(Ex { g: g, st: st, fall: false, rets: rets });
+        }
+        const mr = execCallStmt(g, st, cx, e)?;
+        if (mr.isSome()) {
+          g = mr.unwrap().g;
+          st = mr.unwrap().st;
+        } else if (isConsoleCall(e)) {
+          // Output has no effect on the values the contracts speak about; its arguments are still evaluated.
+          match (e.kind) {
+            ECall(_, args) => {
+              for (const a of args) {
+                const t = trEmit(g, st, cx, a, noExp())?;
+                g = t.g;
+                st = t.st;
+              }
+            },
+            _ => {}
+          }
+        } else {
+          match (e.kind) {
+            EMatch(scrut, arms) => {
+              const r = execMatch(g, st, cx, scrut, arms, 0)?;
+              g = r.g;
+              for (const x of r.rets) {
+                rets.push(x);
+              }
+              if (!r.fall) {
+                return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+              }
+              st = r.st;
+            },
+            _ => {
+              const t = trEmit(g, st, cx, e, noExp())?;
+              g = t.g;
+              st = t.st;
+            }
+          }
+        }
+      },
+      SReturn(v) => {
+        match (v) {
+          Some(e) => {
+            const t = trEmit(g, st, cx, e, cx.ret)?;
+            g = t.g;
+            rets.push(Ret { st: t.st, val: t.t, vt: t.vt, isVoid: false });
+            return Ok(Ex { g: g, st: t.st, fall: false, rets: rets });
+          },
+          None => {
+            rets.push(Ret { st: st, val: "", vt: VUnit, isVoid: true });
+            return Ok(Ex { g: g, st: st, fall: false, rets: rets });
+          }
+        }
+      },
+      SBlock(b) => {
+        const n0 = st.vars.length;
+        const r = execStmts(g, st, cx, b.stmts)?;
+        g = r.g;
+        for (const x of r.rets) {
+          rets.push(x);
+        }
+        if (!r.fall) {
+          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+        }
+        st = r.st;
+        st.vars = prefix(st.vars, n0);
+      },
+      SIf(c, thenB, els) => {
+        const r = execIf(g, st, cx, c, thenB, els)?;
+        g = r.g;
+        for (const x of r.rets) {
+          rets.push(x);
+        }
+        if (!r.fall) {
+          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+        }
+        st = r.st;
+      },
+      SWhile(c, b) => {
+        const r = execLoop(g, st, cx, true, Some(c), None, None, b, pending, s.span)?;
+        g = r.g;
+        for (const x of r.rets) {
+          rets.push(x);
+        }
+        if (!r.fall) {
+          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+        }
+        st = r.st;
+      },
+      SForOf(id, e, b) => {
+        const r = execLoop(g, st, cx, false, None, Some(id), Some(e), b, pending, s.span)?;
+        g = r.g;
+        for (const x of r.rets) {
+          rets.push(x);
+        }
+        if (!r.fall) {
+          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
+        }
+        st = r.st;
+      },
+      SBreak => {
+        // The path leaves the loop body (the effect of a loop with a jump is havoc'd by execLoop).
+        return Ok(Ex { g: g, st: st, fall: false, rets: rets });
+      },
+      SContinue => {
+        return Ok(Ex { g: g, st: st, fall: false, rets: rets });
+      }
+    }
+    if (!keepPending) {
+      pending = [];
+    }
+  }
+  return Ok(Ex { g: g, st: st, fall: true, rets: rets });
+}
+
+// The state after two branches of a conditional, merged: variables that differ get a conditional value, the
+// path conditions of the branches are guarded by the branch condition.
+function mergeBranches(g0: Gen, cx: Cx, pc0: string[], ct: string, n0: usize, r1: Ex, r2: Ex, st1: St): Result<Ex, string> {
+  let g = g0;
+  const notC = "(not " + ct + ")";
+  const rets = concatRets(r1.rets, r2.rets);
+  if (!r1.fall && !r2.fall) {
+    return Ok(Ex { g: g, st: st1, fall: false, rets: rets });
+  }
+  if (r1.fall && !r2.fall) {
+    return Ok(Ex { g: g, st: St { vars: prefix(r1.st.vars, n0), pc: r1.st.pc, deps: r1.st.deps, approx: r1.st.approx }, fall: true, rets: rets });
+  }
+  if (!r1.fall && r2.fall) {
+    return Ok(Ex { g: g, st: St { vars: prefix(r2.st.vars, n0), pc: r2.st.pc, deps: r2.st.deps, approx: r2.st.approx }, fall: true, rets: rets });
+  }
+  let merged: Var[] = [];
+  let i: usize = 0;
+  while (i < n0) {
+    const a = r1.st.vars[i];
+    const b = r2.st.vars[i];
+    if (a.term == b.term) {
+      merged.push(a);
+    } else {
+      const f = fresh(g, cx, a.vt, "(ite " + ct + " " + a.term + " " + b.term + ")")?;
+      g = f.g;
+      merged.push(Var { name: a.name, term: f.name, vt: a.vt });
+    }
+    i += 1;
+  }
+  const base = pc0.length + 1;
+  const pc = concat(concat(pc0, guarded(ct, tailFrom(r1.st.pc, base))), guarded(notC, tailFrom(r2.st.pc, base)));
+  const approx = r1.st.approx != "" ? r1.st.approx : r2.st.approx;
+  return Ok(Ex { g: g, st: St { vars: merged, pc: pc, deps: unionUsize(r1.st.deps, r2.st.deps), approx: approx }, fall: true, rets: rets });
+}
+
+function concatRets(a: Ret[], b: Ret[]): Ret[] {
+  let out: Ret[] = [];
+  for (const x of a) {
+    out.push(x);
+  }
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
+}
+
+function execElse(g: Gen, st: St, cx: Cx, els: Option<Stmt>): Result<Ex, string> {
+  return match (els) {
+    None => Ok(Ex { g: g, st: st, fall: true, rets: [] }),
+    Some(s) => execStmts(g, st, cx, [s])
+  };
+}
+
+function execIf(g0: Gen, st: St, cx: Cx, c: Expr, thenB: Block, els: Option<Stmt>): Result<Ex, string> {
+  const ct = trEmit(g0, st, cx, c, VBool)?;
+  if (!vtEq(ct.vt, VBool)) {
+    return Err("`if` condition is not bool");
+  }
+  const n0 = st.vars.length;
+  const pc0 = ct.st.pc;
+  const s1 = St { vars: ct.st.vars, pc: concat(pc0, [ct.t]), deps: ct.st.deps, approx: ct.st.approx };
+  const r1 = execStmts(ct.g, s1, cx, thenB.stmts)?;
+  const s2 = St { vars: ct.st.vars, pc: concat(pc0, ["(not " + ct.t + ")"]), deps: ct.st.deps, approx: ct.st.approx };
+  const r2 = execElse(r1.g, s2, cx, els)?;
+  return mergeBranches(r2.g, cx, pc0, ct.t, n0, r1, r2, s1);
+}
+
+// `match (e) { .. }` as a statement: arm k is taken when its pattern matches and no earlier one did.
+function execMatch(g0: Gen, st: St, cx: Cx, scrut: Expr, arms: MatchArm[], k0: usize): Result<Ex, string> {
+  let g = g0;
+  const s0 = trEmit(g, st, cx, scrut, noExp())?;
+  const sr = TR { g: s0.g, t: s0.t, vt: s0.vt, chks: noChks() };
+  const so = sortS(s0.g, cx, s0.vt)?;
+  return execMatchFrom(so.g, s0.st, cx, sr, so.s, arms, 0);
+}
+
+function execMatchFrom(g0: Gen, st: St, cx: Cx, s: TR, sn: string, arms: MatchArm[], k: usize): Result<Ex, string> {
+  let g = g0;
+  if (k >= arms.length) {
+    // no arm matched: the match is exhaustive, so this path cannot happen
+    return Ok(Ex { g: g, st: St { vars: st.vars, pc: concat(st.pc, ["false"]), deps: st.deps, approx: st.approx }, fall: true, rets: [] });
+  }
+  const arm = arms[k];
+  const mp = matchPattern(g, cx, s, sn, arm.pattern)?;
+  g = mp.g;
+  const n0 = st.vars.length;
+  let vars1 = st.vars;
+  for (const b of mp.binds) {
+    vars1.push(b);
+  }
+  const s1 = St { vars: vars1, pc: concat(st.pc, [mp.test]), deps: st.deps, approx: st.approx };
+  const body: Stmt[] = match (arm.body) {
+    BExpr(x) => [Stmt { kind: SExpr(x), span: arm.span }],
+    BBlock(b) => b.stmts
+  };
+  const r1 = execStmts(g, s1, cx, body)?;
+  const s2 = St { vars: st.vars, pc: concat(st.pc, ["(not " + mp.test + ")"]), deps: st.deps, approx: st.approx };
+  const r2 = execMatchFrom(r1.g, s2, cx, s, sn, arms, k + 1)?;
+  // vars1 has the bindings; the merge works on the first n0 variables
+  return mergeBranches(r2.g, cx, st.pc, mp.test, n0, r1, r2, s1);
+}
+
+// ------------------------------------------------------------------------------------------------ loops
+
+// A loop invariant: a user clause (`@Invariant(e)` before the loop) or an inferred counter bound.
+type LInv = { label: string; clause: Option<ContractClause>; ctr: Option<Ctr>; line: usize; };
+
+// `while (i < N)` with a counter `i` that the body only increases by one, once per iteration, and a bound `N` the
+// body does not change: `i0 <= i` and `i <= max(i0, N)` (for `<=`: `max(i0, N + 1)`) hold at every iteration.
+type Ctr = { name: string; bound: Expr; incl: bool; i0: string; };
+
+function mentions(e: Expr, names: string[]): bool {
+  return match (e.kind) {
+    EIdent(id) => names.includes(id.name),
+    EThis => names.includes("this") || names.includes("this."),
+    EUnary(_, x) => mentions(x, names),
+    EBinary(_, l, r) => mentions(l, names) || mentions(r, names),
+    ECond(c, a, b) => mentions(c, names) || mentions(a, names) || mentions(b, names),
+    EMember(b, f) => {
+      if (isThisExpr(b)) {
+        return names.includes("this") || names.includes("this." + f.name);
+      }
+      return mentions(b, names);
+    },
+    EIndex(b, i) => mentions(b, names) || mentions(i, names),
+    ECall(c, args) => {
+      if (mentions(c, names)) {
+        return true;
+      }
+      for (const a of args) {
+        if (mentions(a, names)) {
+          return true;
+        }
+      }
+      return false;
+    },
+    EInt(_) => false,
+    EBool(_) => false,
+    _ => true
+  };
+}
+
+// Number of `name += 1` / `name = name + 1` statements in the list (not inside nested loops); None when the
+// variable is assigned any other way, shadowed, or touched inside a nested loop.
+function incrementsOf(stmts: Stmt[], name: string): Option<usize> {
+  let n: usize = 0;
+  for (const s of stmts) {
+    const r = incrementsStmt(s, name);
+    if (r.isNone()) {
+      return None;
+    }
+    n += r.unwrap();
+  }
+  return Some(n);
+}
+
+function isIdentNamed(e: Expr, name: string): bool {
+  return match (e.kind) {
+    EIdent(id) => id.name == name,
+    _ => false
+  };
+}
+
+function isOne(e: Expr): bool {
+  return match (e.kind) {
+    EInt(n) => n == 1,
+    _ => false
+  };
+}
+
+function incrementsStmt(s: Stmt, name: string): Option<usize> {
+  return match (s.kind) {
+    SAssign(target, op, value) => {
+      if (!isIdentNamed(target, name)) {
+        return Some(0);
+      }
+      const isInc = match (op) {
+        OpAddAssign => isOne(value),
+        OpAssign => match (value.kind) {
+          EBinary(bop, l, r) => match (bop) {
+            BAdd => isIdentNamed(l, name) && isOne(r),
+            _ => false
+          },
+          _ => false
+        },
+        _ => false
+      };
+      return isInc ? Some(1) : None;
+    },
+    SLet(_, id, _, _) => id.name == name ? None : Some(0),
+    SIf(_, t, e) => {
+      const a = incrementsOf(t.stmts, name);
+      if (a.isNone()) {
+        return None;
+      }
+      if (e.isSome()) {
+        const b = incrementsStmt(e.unwrap(), name);
+        if (b.isNone()) {
+          return None;
+        }
+        // at most one of the two branches runs
+        return Some(a.unwrap() > b.unwrap() ? a.unwrap() : b.unwrap());
+      }
+      return a;
+    },
+    SBlock(b) => incrementsOf(b.stmts, name),
+    SWhile(_, b) => {
+      const r = incrementsOf(b.stmts, name);
+      return r.isSome() && r.unwrap() == 0 ? Some(0) : None;
+    },
+    SForOf(id, _, b) => {
+      if (id.name == name) {
+        return None;
+      }
+      const r = incrementsOf(b.stmts, name);
+      return r.isSome() && r.unwrap() == 0 ? Some(0) : None;
+    },
+    _ => Some(0)
+  };
+}
+
+function inferCounter(st: St, cond: Expr, body: Block, mods: string[]): Option<Ctr> {
+  let name = "";
+  let bound: Option<Expr> = None;
+  let incl = false;
+  match (cond.kind) {
+    EBinary(op, l, r) => {
+      match (op) {
+        BLt => {
+          match (l.kind) {
+            EIdent(id) => { name = id.name; bound = Some(r); },
+            _ => {}
+          }
+        },
+        BLe => {
+          match (l.kind) {
+            EIdent(id) => { name = id.name; bound = Some(r); incl = true; },
+            _ => {}
+          }
+        },
+        BGt => {
+          match (r.kind) {
+            EIdent(id) => { name = id.name; bound = Some(l); },
+            _ => {}
+          }
+        },
+        BGe => {
+          match (r.kind) {
+            EIdent(id) => { name = id.name; bound = Some(l); incl = true; },
+            _ => {}
+          }
+        },
+        _ => {}
+      }
+    },
+    _ => {}
+  }
+  const none: Option<Ctr> = None;
+  if (name == "" || bound.isNone() || !mods.includes(name)) {
+    return none;
+  }
+  const v = lookupVar(st.vars, name);
+  if (v.isNone() || !isIntTy(v.unwrap().vt)) {
+    return none;
+  }
+  if (mentions(bound.unwrap(), mods)) {
+    return none;
+  }
+  const inc = incrementsOf(body.stmts, name);
+  if (inc.isNone() || inc.unwrap() != 1) {
+    return none;
+  }
+  return Some(Ctr { name: name, bound: bound.unwrap(), incl: incl, i0: v.unwrap().term });
+}
+
+// An invariant at the variables `vars`: the term and the well-definedness of its clause.
+function invAt(g: Gen, cx: Cx, vars: Var[], inv: LInv): Result<Cl, string> {
+  const pc = cxPlain(cx);
+  if (inv.clause.isSome()) {
+    const ex = exprOf(inv.clause.unwrap());
+    if (ex.isNone()) {
+      return Err("empty clause");
+    }
+    return trClause(g, vars, pc, ex.unwrap());
+  }
+  const ctr = inv.ctr.unwrap();
+  const v = lookupVar(vars, ctr.name);
+  if (v.isNone()) {
+    return Err("counter not in scope");
+  }
+  const n = tr(g, vars, pc, ctr.bound, v.unwrap().vt)?;
+  const nb = ctr.incl ? "(+ " + n.t + " 1)" : n.t;
+  const t = "(and (<= " + ctr.i0 + " " + v.unwrap().term + ") (<= " + v.unwrap().term + " (ite (<= " + ctr.i0 + " " + nb + ") " + nb + " " + ctr.i0 + ")))";
+  return Ok(Cl { g: n.g, t: t, wd: wdOf(n.chks) });
+}
+
+type HV = { g: Gen; vars: Var[]; touched: string[]; };
+
+// Fresh values for what a loop changes. `names` are variables, `this` or `this.f`.
+function havocVars(g0: Gen, cx: Cx, vars: Var[], names: string[]): Result<HV, string> {
+  let g = g0;
+  let out = vars;
+  let touched: string[] = [];
+  for (const n of names) {
+    if (n.startsWith("this.")) {
+      continue;
+    }
+    const idx = assignIndex(out, n);
+    if (idx.isSome()) {
+      const v = out[idx.unwrap()];
+      const f = freshFree(g, cx, v.vt)?;
+      g = f.g;
+      out[idx.unwrap()] = Var { name: v.name, term: f.name, vt: v.vt };
+      touched.push(n);
+    }
+  }
+  // fields of `this`: a new object that keeps the other fields
+  if (!names.includes("this")) {
+    let flds: string[] = [];
+    for (const n of names) {
+      if (n.startsWith("this.")) {
+        flds.push(n.substring(5, n.length));
+      }
+    }
+    const ti = assignIndex(out, "this");
+    if (flds.length > 0 && ti.isSome()) {
+      const tv = out[ti.unwrap()];
+      match (tv.vt) {
+        VRec(rn) => {
+          const rd = cx.p.tab.findRec(rn);
+          if (rd.isSome() && !cx.p.tab.isCyclic("r:" + rn)) {
+            const so = sortS(g, cx, tv.vt)?;
+            g = so.g;
+            const d = rd.unwrap();
+            let args: string[] = [];
+            let i: usize = 0;
+            while (i < d.fields.length) {
+              if (flds.includes(d.fields[i])) {
+                const ft = tyOf(cx, d.ftys[i]);
+                if (isBad(ft)) {
+                  const os = opaqueSort(g);
+                  g = os.g;
+                  const nm = g.next("o");
+                  g.declare("(declare-const " + nm + " " + os.s + ")");
+                  args.push(nm);
+                } else {
+                  const f = freshFree(g, cx, ft)?;
+                  g = f.g;
+                  args.push(f.name);
+                }
+              } else {
+                args.push(recField(so.s, d.fields[i], tv.term));
+              }
+              i += 1;
+            }
+            const f2 = fresh(g, cx, tv.vt, "(mk" + so.s + " " + args.join(" ") + ")")?;
+            g = f2.g;
+            out[ti.unwrap()] = Var { name: "this", term: f2.name, vt: tv.vt };
+            touched.push("this." + flds.join(", this."));
+          }
+        },
+        _ => {}
+      }
+    }
+  }
+  return Ok(HV { g: g, vars: out, touched: touched });
+}
+
+function modifiedNames(cx: Cx, st: St, body: Block): string[] {
+  const all = assignedIn(cx.p, body.stmts, []);
+  let out: string[] = [];
+  for (const n of all) {
+    if (n.startsWith("this.")) {
+      if (lookupVar(st.vars, "this").isSome()) {
+        out.push(n);
+      }
+    } else if (lookupVar(st.vars, n).isSome()) {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
+function execLoop(g0: Gen, st0: St, cx: Cx, isWhile: bool, cond: Option<Expr>, iterVar: Option<Ident>, iterExpr: Option<Expr>, body: Block, pending: ContractClause[], span: Span): Result<Ex, string> {
+  let g = g0;
+  let st = st0;
+  const line = lineOf(cx.text, span.start);
+  // `for (const x of xs)`: the iterated array is evaluated once.
+  let elemTy = noExp();
+  let arrTerm = "";
+  let arrSortName = "";
+  if (!isWhile) {
+    const it = trEmit(g, st, cx, iterExpr.unwrap(), noExp())?;
+    g = it.g;
+    st = it.st;
+    match (it.vt) {
+      VArr(el) => {
+        elemTy = el;
+        arrTerm = it.t;
+        const so = sortS(g, cx, it.vt)?;
+        g = so.g;
+        arrSortName = so.s;
+      },
+      _ => {
+        return Err("`for .. of` over a value of type `" + vtName(it.vt) + "` is not supported");
+      }
+    }
+  }
+  const mods = modifiedNames(cx, st, body);
+  const jump = hasJump(body.stmts);
+  // Invariants: the user's, then an inferred counter bound.
+  let invs: LInv[] = [];
+  if (!jump) {
+    for (const c of pending) {
+      match (c.kind) {
+        CInvariant => {
+          invs.push(LInv { label: clauseText(cx.text, c), clause: Some(c), ctr: None, line: lineOf(cx.text, c.span.start) });
+        },
+        _ => {}
+      }
+    }
+    if (isWhile) {
+      const ctr = inferCounter(st, cond.unwrap(), body, mods);
+      if (ctr.isSome()) {
+        invs.push(LInv { label: "inferred counter bound of `" + ctr.unwrap().name + "`", clause: None, ctr: ctr, line: line });
+      }
+    }
+  }
+  // Entry: every invariant holds before the first iteration.
+  let kept: LInv[] = [];
+  const lid = g.newLoop();
+  let userCount: usize = 0;
+  for (const inv of invs) {
+    const t = invAt(g, cx, st.vars, inv);
+    match (t) {
+      Ok(x) => {
+        g = x.g;
+        const goal = x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")";
+        const hidden = inv.clause.isNone();
+        const id = g.addObl(Obl {
+          kind: "loop-invariant", what: "entry", line: inv.line, clause: inv.label + " (holds on entry to the loop)", goal: goal, pc: st.pc,
+          deps: st.deps, approx: st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: hidden
+        });
+        g.loopAdd(lid, id);
+        kept.push(inv);
+        if (!hidden) {
+          userCount += 1;
+        }
+      },
+      Err(_) => {}
+    }
+  }
+  g.useAssumption("A-LOOP");
+  const reasonIn = userCount > 0
+    ? "inside a loop: the loop invariant may be too weak to exclude this state (a counterexample is not trusted)"
+    : "loop without invariant: the state inside the loop is unconstrained (a counterexample is not trusted)";
+  // The state at the start of an arbitrary iteration: what the loop changes is arbitrary, the invariants hold.
+  const hv1 = havocVars(g, cx, st.vars, mods)?;
+  g = hv1.g;
+  let pc1 = st.pc;
+  for (const inv of kept) {
+    const t = invAt(g, cx, hv1.vars, inv);
+    match (t) {
+      Ok(x) => {
+        g = x.g;
+        pc1.push(x.t);
+      },
+      Err(_) => {}
+    }
+  }
+  let s1 = St { vars: hv1.vars, pc: pc1, deps: unionUsize(st.deps, [lid]), approx: reasonIn };
+  if (!isWhile) {
+    // the element of this iteration is some element of the array
+    const xv = freshFree(g, cx, elemTy)?;
+    g = xv.g;
+    const q = g.next("q");
+    s1.pc.push("(exists ((" + q + " Int)) (and " + inBounds(arrSortName, arrTerm, q) + " (= " + xv.name + " " + arrSel(arrSortName, arrTerm, q) + ")))");
+    s1.vars.push(Var { name: iterVar.unwrap().name, term: xv.name, vt: elemTy });
+  } else {
+    const c = trEmit(g, s1, cx, cond.unwrap(), VBool)?;
+    if (!vtEq(c.vt, VBool)) {
+      return Err("`while` condition is not bool");
+    }
+    g = c.g;
+    s1 = c.st;
+    s1.pc.push(c.t);
+  }
+  const bodyR = execStmts(g, s1, cx, body.stmts)?;
+  g = bodyR.g;
+  // The invariants are preserved by one iteration.
+  if (bodyR.fall && !jump) {
+    for (const inv of kept) {
+      const t = invAt(g, cx, bodyR.st.vars, inv);
+      match (t) {
+        Ok(x) => {
+          g = x.g;
+          const goal = x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")";
+          const id = g.addObl(Obl {
+            kind: "loop-invariant", what: "preserved", line: inv.line, clause: inv.label + " (preserved by the loop body)", goal: goal, pc: bodyR.st.pc,
+            deps: bodyR.st.deps, approx: bodyR.st.approx, file: cx.f.file, fn: cx.f.key, text: cx.f.text, hidden: inv.clause.isNone()
+          });
+          g.loopAdd(lid, id);
+        },
+        Err(_) => {}
+      }
+    }
+  }
+  // After the loop: what it changes is arbitrary, the invariants hold, and (for `while`, without `break`) the
+  // condition is false.
+  const hv3 = havocVars(g, cx, st.vars, mods)?;
+  g = hv3.g;
+  let pc3 = st.pc;
+  for (const inv of kept) {
+    const t = invAt(g, cx, hv3.vars, inv);
+    match (t) {
+      Ok(x) => {
+        g = x.g;
+        pc3.push(x.t);
+      },
+      Err(_) => {}
+    }
+  }
+  if (isWhile && !jump) {
+    const c = tr(g, hv3.vars, cx, cond.unwrap(), VBool)?;
+    g = c.g;
+    pc3.push("(not " + c.t + ")");
+  }
+  let approx3 = st.approx;
+  if (hv3.touched.length > 0) {
+    approx3 = userCount > 0
+      ? "after a loop: the loop invariant may not determine " + hv3.touched.join(", ") + " (a counterexample is not trusted)"
+      : "loop without invariant: " + hv3.touched.join(", ") + " is unconstrained after the loop (a counterexample is not trusted)";
+  }
+  if (jump) {
+    approx3 = "loop with `break` or `continue`: its effect is not modelled (a counterexample is not trusted)";
+  }
+  const st3 = St { vars: hv3.vars, pc: pc3, deps: unionUsize(st.deps, [lid]), approx: approx3 };
+  return Ok(Ex { g: g, st: st3, fall: true, rets: bodyR.rets });
+}

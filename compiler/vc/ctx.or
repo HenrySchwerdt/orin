@@ -1,0 +1,616 @@
+// Shared definitions of the contract verifier (ADR-0031 B): symbolic values and states, the table of functions,
+// methods and classes, small SMT term builders, and the syntactic analyses (what a loop assigns, which fields a
+// method writes) that the frame and loop reasoning use.
+
+import { Span } from "../diag";
+import {
+  TypeExpr, Block, Stmt, Expr, ContractClause, ConstDecl, Param,
+  SLet, SAssign, SExpr, SReturn, SIf, SBlock, SWhile, SForOf, SBreak, SContinue,
+  ECall, EUnary, EBinary, ECond, EMember, EIndex, EIdent, EThis, EMatch, BExpr, BBlock,
+  CRequires, CEnsures, CInvariant, CDecreases, CRule
+} from "../syntax";
+import { VT, VInt, VBad, VRec, intLo, intHi, resolveTy, RecDef, Tab, fieldIndex } from "./vt";
+import { Gen, SortR, sortOf } from "./gen";
+
+export const I64_MIN: string = "(- 9223372036854775808)";
+export const I64_MAX: string = "9223372036854775807";
+
+export type Var = { name: string; term: string; vt: VT; };
+
+// A check found while translating an expression, in evaluation order. An assumption (overflow, division by zero:
+// the paths that trap never return) or an obligation (an index in bounds, `unwrap` of `Some`, a callee's
+// `@Requires`): obligations are reported, and both are assumed after the point where they occur.
+export type Chk = { oblig: bool; kind: string; what: string; line: usize; clause: string; goal: string; };
+
+export type TR = { g: Gen; t: string; vt: VT; chks: Chk[]; };
+
+// A symbolic state: variables, path condition, the loop-invariant obligations this path relies on, and the
+// reason the path went through an abstraction ("" for none).
+export type St = { vars: Var[]; pc: string[]; deps: usize[]; approx: string; };
+
+export type Ret = { st: St; val: string; vt: VT; isVoid: bool; };
+
+export type Ex = { g: Gen; st: St; fall: bool; rets: Ret[]; };
+
+// Functions, methods (instance and static) and constructors in one shape. kind: 0 function, 1 instance method,
+// 2 static method, 3 constructor. `frame` is the set of fields a method writes (`frameAll`: not known, every
+// field), `mutating` is the mutation analysis' verdict, `pure` the purity analysis' verdict.
+export type Fn = {
+  key: string; name: string; unit: string; file: string; text: string; cls: string; kind: int; priv: bool; generic: bool;
+  pnames: string[]; ptys: TypeExpr[]; pacc: int[]; ret: Option<TypeExpr>; body: Block; contracts: ContractClause[];
+  span: Span; pure: bool; mutating: bool; frame: string[]; frameAll: bool; line: usize; params: Param[];
+};
+
+export type Cls = {
+  name: string; unit: string; file: string; text: string; fields: string[]; ftys: TypeExpr[]; finit: Option<Expr>[];
+  invs: ContractClause[]; generic: bool; ctor: Option<usize>;
+};
+
+export type ConstInfo = { name: string; decl: ConstDecl; text: string; };
+
+export type Prog = {
+  tab: Tab; fns: Fn[]; fnIx: Map<string, usize>; fnCount: Map<string, usize>; classes: Cls[]; clsIx: Map<string, usize>;
+  consts: ConstInfo[]; mutNames: Map<string, bool>;
+};
+
+// Translation context. `ens`: `old(..)` and `result` are available; `body`: code (true) or a contract (false);
+// `olds`: the entry state `old(..)` reads; `ret`: declared result type of the function (types `None` / `Ok` /
+// `Err`); `inQ`: inside the body of a quantifier (no fresh constants: it may mention the bound variable);
+// `text`: source text of the file of the expression, for line numbers.
+export type Cx = {
+  p: Prog; f: Fn; res: Option<Var>; ens: bool; body: bool; olds: Var[]; ret: VT; inQ: bool; text: string;
+};
+
+// ---------------------------------------------------------------------------------------------- helpers
+
+export function lineOf(text: string, off: usize): usize {
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < off && i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      line += 1;
+    }
+    i += 1;
+  }
+  return line;
+}
+
+export function clauseText(text: string, c: ContractClause): string {
+  return text.substring(c.span.start, c.span.end).split("\n").join(" ");
+}
+
+export function srcText(text: string, e: Expr): string {
+  const s = text.substring(e.span.start, e.span.end).split("\n").join(" ");
+  return s.length > 60 ? s.substring(0, 57) + "..." : s;
+}
+
+export function lit(n: int): string {
+  if (n < 0) {
+    return "(- " + (0 - n).toString() + ")";
+  }
+  return n.toString();
+}
+
+export function inRange(t: string): string {
+  return "(and (<= " + I64_MIN + " " + t + ") (<= " + t + " " + I64_MAX + "))";
+}
+
+// The value `t` is in the range of the integer kind.
+export function inKind(k: string, t: string): string {
+  return "(and (<= " + intLo(k) + " " + t + ") (<= " + t + " " + intHi(k) + "))";
+}
+
+export function guarded(guard: string, asm: string[]): string[] {
+  let out: string[] = [];
+  for (const a of asm) {
+    out.push("(=> " + guard + " " + a + ")");
+  }
+  return out;
+}
+
+export function guardChks(guard: string, cs: Chk[]): Chk[] {
+  let out: Chk[] = [];
+  for (const c of cs) {
+    out.push(Chk { oblig: c.oblig, kind: c.kind, what: c.what, line: c.line, clause: c.clause, goal: "(=> " + guard + " " + c.goal + ")" });
+  }
+  return out;
+}
+
+export function concat(a: string[], b: string[]): string[] {
+  let out: string[] = [];
+  for (const x of a) {
+    out.push(x);
+  }
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
+}
+
+export function concatChk(a: Chk[], b: Chk[]): Chk[] {
+  let out: Chk[] = [];
+  for (const x of a) {
+    out.push(x);
+  }
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
+}
+
+export function unionUsize(a: usize[], b: usize[]): usize[] {
+  let out: usize[] = [];
+  for (const x of a) {
+    out.push(x);
+  }
+  for (const x of b) {
+    if (!out.includes(x)) {
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+export function andAll(xs: string[]): string {
+  if (xs.length == 0) {
+    return "true";
+  }
+  if (xs.length == 1) {
+    return xs[0];
+  }
+  return "(and " + xs.join(" ") + ")";
+}
+
+export function noChks(): Chk[] {
+  return [];
+}
+
+export function noExp(): VT {
+  return VBad("");
+}
+
+export function lookupVar(vars: Var[], name: string): Option<Var> {
+  let i = vars.length;
+  while (i > 0) {
+    i -= 1;
+    if (vars[i].name == name) {
+      return Some(vars[i]);
+    }
+  }
+  return None;
+}
+
+export function prefix(vs: Var[], n: usize): Var[] {
+  let out: Var[] = [];
+  let i: usize = 0;
+  while (i < n && i < vs.length) {
+    out.push(vs[i]);
+    i += 1;
+  }
+  return out;
+}
+
+export function tailFrom(xs: string[], n: usize): string[] {
+  let out: string[] = [];
+  let i = n;
+  while (i < xs.length) {
+    out.push(xs[i]);
+    i += 1;
+  }
+  return out;
+}
+
+export function mk(g: Gen, t: string, vt: VT, chks: Chk[]): Result<TR, string> {
+  return Ok(TR { g: g, t: t, vt: vt, chks: chks });
+}
+
+export function sortS(g: Gen, cx: Cx, vt: VT): Result<SortR, string> {
+  return sortOf(g, cx.p.tab, vt);
+}
+
+export function tyOf(cx: Cx, t: TypeExpr): VT {
+  return resolveTy(cx.p.tab, t);
+}
+
+// Name an SMT symbol after a source name: letters, digits and `_` only.
+export function symName(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    const ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+    out += ok ? s.charAt(i) : "_";
+    i += 1;
+  }
+  return out;
+}
+
+export type Fresh = { g: Gen; name: string; };
+
+// A fresh SMT constant of the sort of `vt`, equal to `term`.
+export function fresh(g0: Gen, cx: Cx, vt: VT, term: string): Result<Fresh, string> {
+  let g = g0;
+  const so = sortS(g, cx, vt)?;
+  g = so.g;
+  const name = g.next("v");
+  g.declare("(declare-const " + name + " " + so.s + ")");
+  g.assert("(= " + name + " " + term + ")");
+  return Ok(Fresh { g: g, name: name });
+}
+
+// Facts every value of the type satisfies (its range).
+export function typeFact(vt: VT, term: string): Option<string> {
+  return match (vt) {
+    VInt(k) => k == "?" ? None : Some(inKind(k, term)),
+    _ => None
+  };
+}
+
+// A fresh unconstrained constant of the type (constrained only by what every value of the type satisfies).
+export function freshFree(g0: Gen, cx: Cx, vt: VT): Result<Fresh, string> {
+  let g = g0;
+  const so = sortS(g, cx, vt)?;
+  g = so.g;
+  const name = g.next("c");
+  g.declare("(declare-const " + name + " " + so.s + ")");
+  const f = typeFact(vt, name);
+  if (f.isSome()) {
+    g.assert(f.unwrap());
+  }
+  return Ok(Fresh { g: g, name: name });
+}
+
+// ----------------------------------------------------------------------------------------- term builders
+
+export function arrLen(sn: string, t: string): string {
+  return "(" + sn + "n " + t + ")";
+}
+
+export function arrData(sn: string, t: string): string {
+  return "(" + sn + "d " + t + ")";
+}
+
+export function arrMk(sn: string, data: string, len: string): string {
+  return "(mk" + sn + " " + data + " " + len + ")";
+}
+
+export function arrSel(sn: string, t: string, i: string): string {
+  return "(select " + arrData(sn, t) + " " + i + ")";
+}
+
+export function inBounds(sn: string, arr: string, i: string): string {
+  return "(and (<= 0 " + i + ") (< " + i + " " + arrLen(sn, arr) + "))";
+}
+
+export function isSomeT(sn: string, t: string): string {
+  return "((_ is some" + sn + ") " + t + ")";
+}
+
+export function isOkT(sn: string, t: string): string {
+  return "((_ is ok" + sn + ") " + t + ")";
+}
+
+export function recField(sn: string, f: string, t: string): string {
+  return "(" + sn + "_" + f + " " + t + ")";
+}
+
+export function mapHas(sn: string, m: string, k: string): string {
+  return "(select (" + sn + "h " + m + ") " + k + ")";
+}
+
+export function mapSize(sn: string, m: string): string {
+  return "(" + sn + "s " + m + ")";
+}
+
+// ------------------------------------------------------------------------------------- program tables
+
+export function clausesOfList(cs: ContractClause[], want: int): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const c of cs) {
+    const k = match (c.kind) {
+      CRequires => 0,
+      CEnsures => 1,
+      CDecreases => 2,
+      CInvariant => 4,
+      _ => 3
+    };
+    if (k == want) {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+export function exprOf(c: ContractClause): Option<Expr> {
+  return c.expr;
+}
+
+export function rulesOfList(cs: ContractClause[]): string[] {
+  let out: string[] = [];
+  for (const c of cs) {
+    match (c.kind) {
+      CRule => { out.push(c.rule); },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+export function hasClauses(f: Fn): bool {
+  return clausesOfList(f.contracts, 0).length + clausesOfList(f.contracts, 1).length + clausesOfList(f.contracts, 2).length > 0;
+}
+
+export function isThisExpr(e: Expr): bool {
+  return match (e.kind) {
+    EThis => true,
+    _ => false
+  };
+}
+
+// The root identifier of a place and, when the root is `this`, the field it goes through.
+export type Root = { name: string; field: string; };
+
+export function rootOf(e: Expr): Root {
+  return match (e.kind) {
+    EIdent(id) => Root { name: id.name, field: "" },
+    EThis => Root { name: "this", field: "" },
+    EMember(b, f) => {
+      if (isThisExpr(b)) {
+        return Root { name: "this", field: f.name };
+      }
+      return rootOf(b);
+    },
+    EIndex(b, _) => rootOf(b),
+    ECall(c, _) => match (c.kind) {
+      EMember(b, _) => rootOf(b),
+      _ => Root { name: "", field: "" }
+    },
+    _ => Root { name: "", field: "" }
+  };
+}
+
+// What a statement list can change, as the names of variables: `x` (a local assigned to, or a receiver of a
+// mutating method), `this` (the whole object) or `this.f` (one field). A method call counts as a write to its
+// receiver only when a mutating builtin (`push`, `pop`, `set`, `delete`) or a mutating method of that name exists.
+export function assignedIn(p: Prog, stmts: Stmt[], out0: string[]): string[] {
+  let out = out0;
+  for (const s of stmts) {
+    out = assignedStmt(p, s, out);
+  }
+  return out;
+}
+
+function placeName(e: Expr): string {
+  const r = rootOf(e);
+  if (r.name == "this" && r.field != "") {
+    return "this." + r.field;
+  }
+  return r.name;
+}
+
+function addName(out: string[], n: string): string[] {
+  let o = out;
+  if (n != "" && !o.includes(n)) {
+    o.push(n);
+  }
+  return o;
+}
+
+function isMutName(p: Prog, n: string): bool {
+  return n == "push" || n == "pop" || n == "set" || n == "delete" || p.mutNames.has(n);
+}
+
+function callsIn(p: Prog, e: Expr, out0: string[]): string[] {
+  let out = out0;
+  match (e.kind) {
+    ECall(c, args) => {
+      match (c.kind) {
+        EMember(b, m) => {
+          if (isMutName(p, m.name)) {
+            out = addName(out, placeName(b));
+          }
+          out = callsIn(p, b, out);
+        },
+        _ => {
+          out = callsIn(p, c, out);
+        }
+      }
+      for (const a of args) {
+        out = callsIn(p, a, out);
+      }
+    },
+    EUnary(_, x) => { out = callsIn(p, x, out); },
+    EBinary(_, l, r) => { out = callsIn(p, r, callsIn(p, l, out)); },
+    ECond(c, a, b) => { out = callsIn(p, b, callsIn(p, a, callsIn(p, c, out))); },
+    EMember(b, _) => { out = callsIn(p, b, out); },
+    EIndex(b, i) => { out = callsIn(p, i, callsIn(p, b, out)); },
+    EMatch(sc, arms) => {
+      out = callsIn(p, sc, out);
+      for (const a of arms) {
+        match (a.body) {
+          BExpr(x) => { out = callsIn(p, x, out); },
+          BBlock(b) => { out = assignedIn(p, b.stmts, out); }
+        }
+      }
+    },
+    _ => {}
+  }
+  return out;
+}
+
+function assignedStmt(p: Prog, s: Stmt, out0: string[]): string[] {
+  let out = out0;
+  match (s.kind) {
+    SLet(_, _, _, init) => { out = callsIn(p, init, out); },
+    SAssign(target, _, value) => {
+      out = addName(out, placeName(target));
+      out = callsIn(p, value, out);
+    },
+    SExpr(e) => { out = callsIn(p, e, out); },
+    SReturn(v) => {
+      match (v) {
+        Some(e) => { out = callsIn(p, e, out); },
+        None => {}
+      }
+    },
+    SIf(c, thenB, els) => {
+      out = callsIn(p, c, out);
+      out = assignedIn(p, thenB.stmts, out);
+      match (els) {
+        Some(x) => { out = assignedStmt(p, x, out); },
+        None => {}
+      }
+    },
+    SWhile(c, b) => {
+      out = callsIn(p, c, out);
+      out = assignedIn(p, b.stmts, out);
+    },
+    SForOf(_, e, b) => {
+      out = callsIn(p, e, out);
+      out = assignedIn(p, b.stmts, out);
+    },
+    SBlock(b) => { out = assignedIn(p, b.stmts, out); },
+    _ => {}
+  }
+  return out;
+}
+
+// Does the statement list contain `break` or `continue` (not inside a nested loop: those belong to it)?
+export function hasJump(stmts: Stmt[]): bool {
+  for (const s of stmts) {
+    const j = match (s.kind) {
+      SBreak => true,
+      SContinue => true,
+      SIf(_, t, e) => hasJump(t.stmts) || (e.isSome() && hasJump([e.unwrap()])),
+      SBlock(b) => hasJump(b.stmts),
+      _ => false
+    };
+    if (j) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Fields of `this` a method body writes: an assignment to `this.f...`, a method call on `this.f...` (a mutating
+// builtin, or a mutating method of the field's class), and the methods of the class it calls on `this` (their own
+// frames are added by the caller of `writesStmts`: `thisCalls`).
+export type Writes = { fields: string[]; thisCalls: string[]; unknown: bool; };
+
+export function writesStmts(p: Prog, cls: Cls, stmts: Stmt[], w0: Writes): Writes {
+  let w = w0;
+  for (const s of stmts) {
+    w = writesStmt(p, cls, s, w);
+  }
+  return w;
+}
+
+function addField(w0: Writes, f: string): Writes {
+  let w = w0;
+  if (f != "" && !w.fields.includes(f)) {
+    w.fields.push(f);
+  }
+  return w;
+}
+
+function writesExpr(p: Prog, cls: Cls, e: Expr, w0: Writes): Writes {
+  let w = w0;
+  match (e.kind) {
+    ECall(c, args) => {
+      match (c.kind) {
+        EMember(b, m) => {
+          const r = rootOf(b);
+          if (isThisExpr(b)) {
+            if (!w.thisCalls.includes(m.name)) {
+              w.thisCalls.push(m.name);
+            }
+          } else if (r.name == "this" && r.field != "") {
+            if (m.name == "push" || m.name == "pop" || m.name == "set" || m.name == "delete") {
+              w = addField(w, r.field);
+            } else {
+              const rd = RecDef { name: cls.name, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [] };
+              const fi = fieldIndex(rd, r.field);
+              if (fi.isSome()) {
+                const ft = resolveTy(p.tab, cls.ftys[fi.unwrap()]);
+                match (ft) {
+                  VRec(cn) => {
+                    const mi = p.fnIx.get(cn + "." + m.name);
+                    if (mi.isSome()) {
+                      if (p.fns[mi.unwrap()].mutating) {
+                        w = addField(w, r.field);
+                      }
+                    } else {
+                      w.unknown = true;
+                    }
+                  },
+                  _ => {}
+                }
+              }
+            }
+          }
+          w = writesExpr(p, cls, b, w);
+        },
+        _ => { w = writesExpr(p, cls, c, w); }
+      }
+      for (const a of args) {
+        w = writesExpr(p, cls, a, w);
+      }
+    },
+    EUnary(_, x) => { w = writesExpr(p, cls, x, w); },
+    EBinary(_, l, r) => { w = writesExpr(p, cls, r, writesExpr(p, cls, l, w)); },
+    ECond(c, a, b) => { w = writesExpr(p, cls, b, writesExpr(p, cls, a, writesExpr(p, cls, c, w))); },
+    EMember(b, _) => { w = writesExpr(p, cls, b, w); },
+    EIndex(b, i) => { w = writesExpr(p, cls, i, writesExpr(p, cls, b, w)); },
+    EMatch(sc, arms) => {
+      w = writesExpr(p, cls, sc, w);
+      for (const a of arms) {
+        match (a.body) {
+          BExpr(x) => { w = writesExpr(p, cls, x, w); },
+          BBlock(b) => { w = writesStmts(p, cls, b.stmts, w); }
+        }
+      }
+    },
+    _ => {}
+  }
+  return w;
+}
+
+function writesStmt(p: Prog, cls: Cls, s: Stmt, w0: Writes): Writes {
+  let w = w0;
+  match (s.kind) {
+    SLet(_, _, _, init) => { w = writesExpr(p, cls, init, w); },
+    SAssign(target, _, value) => {
+      const r = rootOf(target);
+      if (r.name == "this") {
+        w = addField(w, r.field);
+      }
+      w = writesExpr(p, cls, value, w);
+    },
+    SExpr(e) => { w = writesExpr(p, cls, e, w); },
+    SReturn(v) => {
+      match (v) {
+        Some(e) => { w = writesExpr(p, cls, e, w); },
+        None => {}
+      }
+    },
+    SIf(c, thenB, els) => {
+      w = writesExpr(p, cls, c, w);
+      w = writesStmts(p, cls, thenB.stmts, w);
+      match (els) {
+        Some(x) => { w = writesStmt(p, cls, x, w); },
+        None => {}
+      }
+    },
+    SWhile(c, b) => {
+      w = writesExpr(p, cls, c, w);
+      w = writesStmts(p, cls, b.stmts, w);
+    },
+    SForOf(_, e, b) => {
+      w = writesExpr(p, cls, e, w);
+      w = writesStmts(p, cls, b.stmts, w);
+    },
+    SBlock(b) => { w = writesStmts(p, cls, b.stmts, w); },
+    _ => {}
+  }
+  return w;
+}

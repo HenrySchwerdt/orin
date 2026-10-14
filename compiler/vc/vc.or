@@ -1,696 +1,324 @@
-// Contract verification, phase 2 (ADR-0012, spec 15): `orin verify --contracts`. Beyond Orin-B.
+// Contract verification, phase 2 (ADR-0012, spec 15) and ADR-0031 part B: `orin verify --contracts`. Beyond Orin-B.
 //
-// Verification conditions for pure int / bool functions, discharged by an SMT solver (z3, SMT-LIB 2
-// text on stdin). Documented in docs/contracts.md. Summary of the supported fragment:
-//   * parameters and result of type `int` or `bool`;
-//   * body: `const` / `let` of int or bool, assignment and `+=` etc. to such locals, `if` / `else`,
-//     `return`, nested blocks; expressions over int / bool literals, locals, `+ - * / %`, comparisons,
-//     `&& || !`, `?:`, and calls to other functions of the same fragment (modular: the callee's
-//     `@Requires` become proof obligations at the call site, its `@Ensures` are assumed);
-//   * everything else (loops, strings, arrays, records, classes, I/O, closures, `usize`) makes the
-//     function's clauses UNKNOWN with the reason.
-// Semantics: PARTIAL correctness over unbounded mathematical integers in contracts; the program's
-// arithmetic traps on i64 overflow, division by zero, so executions that trap never return and the
-// proof assumes they do not happen (each arithmetic result is assumed to be in the i64 range and
-// each divisor non-zero, on the path where it is computed). Termination is not proved.
-// Results per clause: VERIFIED (solver: unsat), REFUTED (sat, with a counterexample for the
-// parameters) or UNKNOWN (solver unknown / timeout / unavailable, or outside the fragment).
+// Verification conditions for functions, methods and constructors, discharged by an SMT solver (z3, SMT-LIB 2
+// text on stdin). Documented in docs/contracts.md (the supported fragment and the honest limits). Files:
+//   vt.or     verifier types, the program's type tables
+//   gen.or    SMT generation state, sorts (datatypes for arrays, records, Option, Result, Map; strings)
+//   ctx.or    symbolic values, states, the function table, small term builders, syntactic analyses
+//   expr.or   expressions: arithmetic, arrays, fields, calls (modular), quantifiers, sums
+//   stmt.or   statements: assignment to places, mutating calls, branches, match, loops
+//   vc.or     this file: program tables, solver, functions / methods / constructors, class invariants
+//   report.or statuses, refusal protocol fields, assumptions, JSON and text
+// Semantics: PARTIAL correctness over unbounded mathematical integers in contracts; the program's arithmetic
+// traps on overflow, division by zero, an index out of range and `unwrap` of `None`, so executions that trap
+// never return: a proof about the returning paths assumes they do not happen, and an index or `unwrap` failure
+// is reported as an obligation of its own. Termination is not proved.
+// Statuses: VERIFIED (solver: unsat), REFUTED (sat, with a counterexample, only when the path used no
+// abstraction), UNKNOWN (solver unknown / timeout / unavailable, outside the fragment, or a counterexample that
+// may be spurious because of an abstraction), always with the reason. A result never claims more than its list
+// of assumptions (report.or) allows.
 
 import { FsGrant } from "std:fs";
 import { ProcessGrant } from "std:process";
 import { SourceMap } from "../diag";
 import {
-  Ident, FunctionDecl, TypeExpr, TNamed, UnaryOp, BinaryOp, AssignOp, Block, Stmt, Expr, StmtKind, ExprKind, ContractClause,
-  IFunction, SLet, SAssign, SExpr, SReturn, SIf, SBlock, SContract, SWhile, SForOf,
-  EInt, EBool, EIdent, EUnary, EBinary, ECall, ECond, UNot, UNeg,
-  BAdd, BSub, BMul, BDiv, BRem, BEq, BNe, BLt, BLe, BGt, BGe, BAnd, BOr, BImplies,
-  OpAssign, OpAddAssign, OpSubAssign, OpMulAssign, OpDivAssign, OpRemAssign,
-  CRequires, CEnsures, CDecreases, CRule
+  Ident, FunctionDecl, Param, TypeExpr, Block, Stmt, Expr, ContractClause,
+  IFunction, IClass, IType, IConst, ClassDecl, MField, MCtor, MMethod, MethodDecl, CtorDecl,
+  TypeDecl, DAlias, DRecord, DUnion,
+  CRequires, CEnsures, CInvariant, CDecreases, CRule
 } from "../syntax";
+import { Program } from "../hir";
 import { LoadedProgram } from "../loader";
-import { isSyntacticallyTrivial } from "../check";
+import { isSyntacticallyTrivial, inferPurity, allFunctions } from "../check";
 import { writeFile, readFile } from "std:fs";
 import { shellRun } from "../lsp";
-import { jsonString } from "../tools";
+import { Res, QWarn, Report, assumptionsFor } from "./report";
+import { replyValues } from "./sx";
+import {
+  VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
+  vtKey, vtName, isBad, badReason, vtEq, isIntTy, RecDef, UniDef, AliasDef, Tab, recOfType, recOfClass, uniOfType, resolveTy, sealTab, fieldIndex
+} from "./vt";
+import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
+import {
+  Var, Chk, TR, St, Ret, Ex, Fn, Cls, ConstInfo, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, lit, inRange, inKind, concat, unionUsize, andAll,
+  noChks, noExp, lookupVar, sortS, tyOf, fresh, freshFree, typeFact, recField, arrLen, arrSel, clausesOfList, exprOf, rulesOfList, hasClauses,
+  Writes, writesStmts
+} from "./ctx";
+import { tr, trClause, wdOf, sigOf, invTerms, Cl, Sig, isUnit } from "./expr";
+import { execStmts, emit } from "./stmt";
 
-const I64_MIN: string = "(- 9223372036854775808)";
-const I64_MAX: string = "9223372036854775807";
-
-type FnInfo = { decl: FunctionDecl; file: string; text: string; };
-type Var = { name: string; term: string; ty: int; };       // ty: 0 int, 1 bool
-type Obl = { callee: string; line: usize; clause: string; goal: string; pc: string[]; };
-type Gen = { decls: string[]; facts: string[]; n: usize; obls: Obl[]; };
-type St = { vars: Var[]; pc: string[]; };
-type Ret = { pc: string[]; val: string; ty: int; isVoid: bool; };
-type Cx = { fns: FnInfo[]; res: Option<Var>; ens: bool; body: bool; text: string; };
-type TR = { g: Gen; t: string; ty: int; asm: string[]; };
-type Ex = { g: Gen; st: St; fall: bool; rets: Ret[]; };
-
-export type Res = {
-  fn: string; file: string; line: usize; kind: string; clause: string; rules: string[];
-  status: string; reason: string; cex: string[];
-};
-
-// A contract-quality finding proved by the solver (ADR-0028). `status` is the status of the *finding*:
-// `VERIFIED` means the solver proved the clause is vacuous (tautology / unsatisfiable / implied by the
-// preconditions). Unproved candidates are not reported at all.
-export type QWarn = { code: string; fn: string; file: string; line: usize; kind: string; clause: string; message: string; status: string; };
-
-export type Report = { results: Res[]; warnings: QWarn[]; };
+export { Report, Res, QWarn } from "./report";
 
 const W_TAUTOLOGY: string = "W0460";
 const W_UNSAT_REQUIRES: string = "W0461";
 const W_IMPLIED_ENSURES: string = "W0462";
 
-function lineOf(text: string, off: usize): usize {
-  let line: usize = 1;
-  let i: usize = 0;
-  while (i < off && i < text.length) {
-    if (text.charCodeAt(i) == 10) {
-      line += 1;
-    }
-    i += 1;
+// ------------------------------------------------------------------------------------- program tables
+
+function unitFns(u: string, file: string, text: string, d: FunctionDecl): Fn {
+  let names: string[] = [];
+  let tys: TypeExpr[] = [];
+  let acc: int[] = [];
+  for (const p of d.params) {
+    names.push(p.name.name);
+    tys.push(p.ty);
+    acc.push(0);
   }
-  return line;
-}
-
-function clauseText(text: string, c: ContractClause): string {
-  return text.substring(c.span.start, c.span.end).split("\n").join(" ");
-}
-
-function lit(n: int): string {
-  if (n < 0) {
-    return "(- " + (0 - n).toString() + ")";
-  }
-  return n.toString();
-}
-
-function tyName(ty: int): string {
-  return ty == 1 ? "Bool" : "Int";
-}
-
-function inRange(t: string): string {
-  return "(and (<= " + I64_MIN + " " + t + ") (<= " + t + " " + I64_MAX + "))";
-}
-
-function guarded(guard: string, asm: string[]): string[] {
-  let out: string[] = [];
-  for (const a of asm) {
-    out.push("(=> " + guard + " " + a + ")");
-  }
-  return out;
-}
-
-function concat(a: string[], b: string[]): string[] {
-  let out: string[] = [];
-  for (const x of a) {
-    out.push(x);
-  }
-  for (const x of b) {
-    out.push(x);
-  }
-  return out;
-}
-
-function andAll(xs: string[]): string {
-  if (xs.length == 0) {
-    return "true";
-  }
-  if (xs.length == 1) {
-    return xs[0];
-  }
-  return "(and " + xs.join(" ") + ")";
-}
-
-// Type of a parameter / result annotation: 0 int, 1 bool, -1 unsupported.
-function tyOf(t: TypeExpr): int {
-  return match (t.kind) {
-    TNamed(id, args) => args.length > 0 ? -1 : ((id.name == "int" || id.name == "i64") ? 0 : (id.name == "bool" ? 1 : -1)),
-    _ => -1
+  return Fn {
+    key: d.name.name, name: d.name.name, unit: u, file: file, text: text, cls: "", kind: 0, priv: false, generic: d.typeParams.length > 0,
+    pnames: names, ptys: tys, pacc: acc, ret: d.ret, body: d.body, contracts: d.contracts, span: d.span, pure: false, mutating: false,
+    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params
   };
 }
 
-function tyText(t: TypeExpr): string {
-  return match (t.kind) {
-    TNamed(id, _) => id.name,
-    _ => "a compound type"
+function methodFn(u: string, file: string, text: string, c: ClassDecl, m: MethodDecl): Fn {
+  let names: string[] = [];
+  let tys: TypeExpr[] = [];
+  let acc: int[] = [];
+  for (const p of m.params) {
+    names.push(p.name.name);
+    tys.push(p.ty);
+    acc.push(0);
+  }
+  return Fn {
+    key: c.name.name + "." + m.name.name, name: m.name.name, unit: u, file: file, text: text, cls: c.name.name, kind: m.isStatic ? 2 : 1, priv: m.priv,
+    generic: m.typeParams.length > 0 || c.typeParams.length > 0, pnames: names, ptys: tys, pacc: acc, ret: m.ret, body: m.body, contracts: m.contracts,
+    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params
   };
 }
 
-function lookupVar(vars: Var[], name: string): Option<Var> {
-  let i = vars.length;
-  while (i > 0) {
-    i -= 1;
-    if (vars[i].name == name) {
-      return Some(vars[i]);
-    }
+function ctorFn(u: string, file: string, text: string, c: ClassDecl, k: CtorDecl): Fn {
+  let names: string[] = [];
+  let tys: TypeExpr[] = [];
+  let acc: int[] = [];
+  let ps: Param[] = [];
+  for (const p of k.params) {
+    names.push(p.name.name);
+    tys.push(p.ty);
+    acc.push(p.access);
+    ps.push(Param { name: p.name, ty: p.ty, span: p.span });
   }
-  return None;
-}
-
-type Fresh = { g: Gen; name: string; };
-
-// A fresh SMT constant `vN` of type `ty` defined to equal `term`.
-function fresh(g0: Gen, ty: int, term: string): Fresh {
-  let g = g0;
-  const name = "v" + g.n.toString();
-  g.n += 1;
-  g.decls.push("(declare-const " + name + " " + tyName(ty) + ")");
-  g.facts.push("(= " + name + " " + term + ")");
-  return Fresh { g: g, name: name };
-}
-
-function freshFree(g0: Gen, ty: int): Fresh {
-  let g = g0;
-  const name = "c" + g.n.toString();
-  g.n += 1;
-  g.decls.push("(declare-const " + name + " " + tyName(ty) + ")");
-  return Fresh { g: g, name: name };
-}
-
-// ---------------------------------------------------------------------------
-// Expressions
-// ---------------------------------------------------------------------------
-
-function mk(g: Gen, t: string, ty: int, asm: string[]): Result<TR, string> {
-  return Ok(TR { g: g, t: t, ty: ty, asm: asm });
-}
-
-function findFn(fns: FnInfo[], name: string): Option<FnInfo> {
-  let found: Option<FnInfo> = None;
-  let count: usize = 0;
-  for (const f of fns) {
-    if (f.decl.name.name == name) {
-      found = Some(f);
-      count += 1;
-    }
-  }
-  if (count == 1) {
-    return found;
-  }
-  return None;
-}
-
-function tr(g: Gen, vars: Var[], pc: string[], cx: Cx, e: Expr): Result<TR, string> {
-  return match (e.kind) {
-    EInt(n) => mk(g, lit(n), 0, []),
-    EBool(b) => mk(g, b ? "true" : "false", 1, []),
-    EIdent(id) => trIdent(g, vars, cx, id.name),
-    EUnary(op, x) => trUnary(g, vars, pc, cx, op, x),
-    EBinary(op, l, r) => trBinary(g, vars, pc, cx, op, l, r),
-    ECond(c, a, b) => trCond(g, vars, pc, cx, c, a, b),
-    ECall(callee, args) => trCall(g, vars, pc, cx, callee, args, e),
-    _ => Err("unsupported expression (outside the verified fragment: int / bool arithmetic, comparisons, calls)")
+  return Fn {
+    key: c.name.name + ".constructor", name: "constructor", unit: u, file: file, text: text, cls: c.name.name, kind: 3, priv: false, generic: c.typeParams.length > 0,
+    pnames: names, ptys: tys, pacc: acc, ret: None, body: k.body, contracts: k.contracts, span: k.span, pure: false, mutating: false,
+    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps
   };
 }
 
-function trIdent(g: Gen, vars: Var[], cx: Cx, name: string): Result<TR, string> {
-  const v = lookupVar(vars, name);
-  if (v.isSome()) {
-    return mk(g, v.unwrap().term, v.unwrap().ty, []);
-  }
-  if (name == "result" && cx.res.isSome()) {
-    return mk(g, cx.res.unwrap().term, cx.res.unwrap().ty, []);
-  }
-  return Err("unsupported name `" + name + "` (constants and globals are not supported)");
-}
-
-function trUnary(g: Gen, vars: Var[], pc: string[], cx: Cx, op: UnaryOp, x: Expr): Result<TR, string> {
-  const a = tr(g, vars, pc, cx, x)?;
-  return match (op) {
-    UNot => a.ty == 1 ? mk(a.g, "(not " + a.t + ")", 1, a.asm) : Err("`!` on a non-bool value"),
-    UNeg => {
-      if (a.ty != 0) {
-        return Err("`-` on a non-int value");
-      }
-      const t = "(- " + a.t + ")";
-      return mk(a.g, t, 0, concat(a.asm, [inRange(t)]));
-    }
-  };
-}
-
-function trCond(g: Gen, vars: Var[], pc: string[], cx: Cx, c: Expr, a: Expr, b: Expr): Result<TR, string> {
-  const ct = tr(g, vars, pc, cx, c)?;
-  if (ct.ty != 1) {
-    return Err("condition of `?:` is not bool");
-  }
-  const at = tr(ct.g, vars, concat(pc, [ct.t]), cx, a)?;
-  const bt = tr(at.g, vars, concat(pc, ["(not " + ct.t + ")"]), cx, b)?;
-  if (at.ty != bt.ty) {
-    return Err("branches of `?:` have different types");
-  }
-  const asm = concat(concat(ct.asm, guarded(ct.t, at.asm)), guarded("(not " + ct.t + ")", bt.asm));
-  return mk(bt.g, "(ite " + ct.t + " " + at.t + " " + bt.t + ")", at.ty, asm);
-}
-
-function smtCmp(op: BinaryOp): string {
-  return match (op) {
-    BLt => "<",
-    BLe => "<=",
-    BGt => ">",
-    BGe => ">=",
-    _ => "="
-  };
-}
-
-function trBinary(g: Gen, vars: Var[], pc: string[], cx: Cx, op: BinaryOp, l: Expr, r: Expr): Result<TR, string> {
-  const lt = tr(g, vars, pc, cx, l)?;
-  const isAnd = match (op) { BAnd => true, _ => false };
-  const isOr = match (op) { BOr => true, _ => false };
-  const isImp = match (op) { BImplies => true, _ => false };
-  if (isAnd || isOr || isImp) {
-    // The right operand is only evaluated when the left one does not decide: guard its facts.
-    const guard = isAnd || isImp ? lt.t : "(not " + lt.t + ")";
-    const rt = tr(lt.g, vars, concat(pc, [guard]), cx, r)?;
-    if (lt.ty != 1 || rt.ty != 1) {
-      return Err("`&&`, `||`, `==>` need bool operands");
-    }
-    const asm = concat(lt.asm, guarded(guard, rt.asm));
-    const term = isAnd ? "(and " + lt.t + " " + rt.t + ")" : (isOr ? "(or " + lt.t + " " + rt.t + ")" : "(=> " + lt.t + " " + rt.t + ")");
-    return mk(rt.g, term, 1, asm);
-  }
-  const rt = tr(lt.g, vars, pc, cx, r)?;
-  const asm = concat(lt.asm, rt.asm);
-  const arith = match (op) {
-    BAdd => true,
-    BSub => true,
-    BMul => true,
-    BDiv => true,
-    BRem => true,
-    _ => false
-  };
-  if (arith) {
-    if (lt.ty != 0 || rt.ty != 0) {
-      return Err("arithmetic on a non-int value");
-    }
-    const a = lt.t;
-    const b = rt.t;
-    let t = "";
-    let extra: string[] = [];
-    match (op) {
-      BAdd => { t = "(+ " + a + " " + b + ")"; },
-      BSub => { t = "(- " + a + " " + b + ")"; },
-      BMul => { t = "(* " + a + " " + b + ")"; },
-      BDiv => {
-        t = "(tdiv " + a + " " + b + ")";
-        extra.push("(not (= " + b + " 0))");
+function classInfo(u: string, file: string, text: string, c: ClassDecl, ctor: Option<usize>): Cls {
+  let fields: string[] = [];
+  let ftys: TypeExpr[] = [];
+  let finit: Option<Expr>[] = [];
+  for (const m of c.members) {
+    match (m) {
+      MField(f) => {
+        fields.push(f.name.name);
+        ftys.push(f.ty);
+        finit.push(f.init);
       },
-      _ => {
-        t = "(trem " + a + " " + b + ")";
-        extra.push("(not (= " + b + " 0))");
-        extra.push(inRange("(tdiv " + a + " " + b + ")"));
-      }
-    }
-    extra.push(inRange(t));
-    return mk(rt.g, t, 0, concat(asm, extra));
-  }
-  const isEq = match (op) { BEq => true, _ => false };
-  const isNe = match (op) { BNe => true, _ => false };
-  if (isEq || isNe) {
-    if (lt.ty != rt.ty) {
-      return Err("`==` / `!=` on operands of different types");
-    }
-    const eq = "(= " + lt.t + " " + rt.t + ")";
-    return mk(rt.g, isEq ? eq : "(not " + eq + ")", 1, asm);
-  }
-  if (lt.ty != 0 || rt.ty != 0) {
-    return Err("comparison of non-int values");
-  }
-  return mk(rt.g, "(" + smtCmp(op) + " " + lt.t + " " + rt.t + ")", 1, asm);
-}
-
-function paramVars(f: FunctionDecl, terms: string[], tys: int[]): Var[] {
-  let out: Var[] = [];
-  let i: usize = 0;
-  while (i < f.params.length) {
-    out.push(Var { name: f.params[i].name.name, term: terms[i], ty: tys[i] });
-    i += 1;
-  }
-  return out;
-}
-
-// Parameter types of a function in the fragment, or the reason it is outside it.
-function paramTypes(f: FunctionDecl): Result<int[], string> {
-  let tys: int[] = [];
-  for (const p of f.params) {
-    const t = tyOf(p.ty);
-    if (t < 0) {
-      return Err("parameter `" + p.name.name + "` has type `" + tyText(p.ty) + "` (only int/i64 and bool are supported; other integer widths are not modelled yet)");
-    }
-    tys.push(t);
-  }
-  return Ok(tys);
-}
-
-function retType(f: FunctionDecl): Result<int, string> {
-  return match (f.ret) {
-    None => Ok(0 - 1),
-    Some(t) => {
-      const k = tyOf(t);
-      if (k < 0) {
-        if (tyText(t) == "void") {
-          return Ok(0 - 1);
-        }
-        return Err("result type `" + tyText(t) + "` is not supported (only int/i64 and bool; other integer widths are not modelled yet)");
-      }
-      return Ok(k);
-    }
-  };
-}
-
-function exprOf(c: ContractClause): Option<Expr> {
-  return c.expr;
-}
-
-function clausesOf(f: FunctionDecl, want: int): ContractClause[] {
-  let out: ContractClause[] = [];
-  for (const c of f.contracts) {
-    const k = match (c.kind) {
-      CRequires => 0,
-      CEnsures => 1,
-      CDecreases => 2,
-      _ => 3
-    };
-    if (k == want) {
-      out.push(c);
+      _ => {}
     }
   }
-  return out;
-}
-
-// Contract expressions of `cs` translated over `vars` (and `res`); facts about overflow are ignored
-// (contracts are over mathematical integers).
-function trClauses(g: Gen, vars: Var[], cx: Cx, cs: ContractClause[]): Result<string[], string> {
-  let out: string[] = [];
-  for (const c of cs) {
-    const e = exprOf(c);
-    if (e.isSome()) {
-      const t = tr(g, vars, [], cx, e.unwrap())?;
-      if (t.ty != 1) {
-        return Err("contract expression is not bool");
-      }
-      out.push(t.t);
-    }
-  }
-  return Ok(out);
-}
-
-// Call of a function of the fragment: modular reasoning with its contract.
-function trCall(g: Gen, vars: Var[], pc: string[], cx: Cx, callee: Expr, args: Expr[], e: Expr): Result<TR, string> {
-  const name = match (callee.kind) {
-    EIdent(id) => id.name,
-    _ => ""
-  };
-  if (name == "") {
-    return Err("unsupported call (only calls of named functions)");
-  }
-  if (name == "old" && cx.ens && args.length == 1) {
-    return tr(g, vars, pc, cx, args[0]);
-  }
-  if (!cx.body) {
-    return Err("call of `" + name + "` inside a contract expression is not supported");
-  }
-  const fo = findFn(cx.fns, name);
-  if (fo.isNone()) {
-    return Err("call of `" + name + "`: not a unique function of the program, or a built-in");
-  }
-  const f = fo.unwrap();
-  if (f.decl.typeParams.length > 0 || f.decl.params.length != args.length) {
-    return Err("call of `" + name + "`: generic or wrong arity");
-  }
-  const ptys = paramTypes(f.decl)?;
-  const rty = retType(f.decl)?;
-  if (rty < 0) {
-    return Err("call of `" + name + "`: void functions are not supported");
-  }
-  let cur = g;
-  let terms: string[] = [];
-  let asm: string[] = [];
-  let i: usize = 0;
-  while (i < args.length) {
-    const a = tr(cur, vars, pc, cx, args[i])?;
-    if (a.ty != ptys[i]) {
-      return Err("call of `" + name + "`: argument type mismatch");
-    }
-    cur = a.g;
-    terms.push(a.t);
-    asm = concat(asm, a.asm);
-    i += 1;
-  }
-  const calleeVars = paramVars(f.decl, terms, ptys);
-  const ccx = Cx { fns: cx.fns, res: None, ens: false, body: false, text: f.text };
-  const reqs = clausesOf(f.decl, 0);
-  const reqTerms = trClauses(cur, calleeVars, ccx, reqs)?;
-  // Proof obligation: the callee's preconditions hold here.
-  let k: usize = 0;
-  while (k < reqs.length) {
-    const rc = exprOf(reqs[k]);
-    if (rc.isSome()) {
-      const one = tr(cur, calleeVars, [], ccx, rc.unwrap())?;
-      cur.obls.push(Obl {
-        callee: name, line: lineOf(cx.text, e.span.start), clause: clauseText(f.text, reqs[k]), goal: one.t,
-        pc: concat(pc, asm)
-      });
-    }
-    k += 1;
-  }
-  // The result: unconstrained apart from the callee's postconditions (assumed under its preconditions).
-  const fr = freshFree(cur, rty);
-  cur = fr.g;
-  const rcx = Cx { fns: cx.fns, res: Some(Var { name: "result", term: fr.name, ty: rty }), ens: true, body: false, text: f.text };
-  const enss = trClauses(cur, calleeVars, rcx, clausesOf(f.decl, 1))?;
-  if (enss.length > 0) {
-    cur.facts.push("(=> " + andAll(reqTerms) + " " + andAll(enss) + ")");
-  }
-  return mk(cur, fr.name, rty, asm);
-}
-
-// ---------------------------------------------------------------------------
-// Statements (symbolic execution)
-// ---------------------------------------------------------------------------
-
-function tyOfLet(ann: Option<TypeExpr>, actual: int): Result<int, string> {
-  return match (ann) {
-    None => Ok(actual),
-    Some(t) => {
-      const k = tyOf(t);
-      if (k < 0) {
-        return Err("local variable of type `" + tyText(t) + "` (only int/i64 and bool are supported; other integer widths are not modelled yet)");
-      }
-      if (k != actual) {
-        return Err("local variable type does not match its initialiser");
-      }
-      return Ok(k);
-    }
-  };
-}
-
-function assignIndex(vars: Var[], name: string): Option<usize> {
-  let i = vars.length;
-  while (i > 0) {
-    i -= 1;
-    if (vars[i].name == name) {
-      return Some(i);
-    }
-  }
-  return None;
-}
-
-function binOfAssign(op: AssignOp): Option<BinaryOp> {
-  return match (op) {
-    OpAssign => None,
-    OpAddAssign => Some(BAdd),
-    OpSubAssign => Some(BSub),
-    OpMulAssign => Some(BMul),
-    OpDivAssign => Some(BDiv),
-    OpRemAssign => Some(BRem)
-  };
-}
-
-function execStmts(g0: Gen, st0: St, stmts: Stmt[], cx: Cx): Result<Ex, string> {
-  let g = g0;
-  let st = st0;
-  let rets: Ret[] = [];
-  let k: usize = 0;
-  while (k < stmts.length) {
-    const s = stmts[k];
-    k += 1;
-    match (s.kind) {
-      SContract(_) => {},
-      SLet(_, name, ann, init) => {
-        const t = tr(g, st.vars, st.pc, cx, init)?;
-        const ty = tyOfLet(ann, t.ty)?;
-        const f = fresh(t.g, ty, t.t);
-        g = f.g;
-        st.pc = concat(st.pc, t.asm);
-        st.vars.push(Var { name: name.name, term: f.name, ty: ty });
-      },
-      SAssign(target, op, value) => {
-        const tn = match (target.kind) {
-          EIdent(id) => id.name,
-          _ => ""
-        };
-        if (tn == "") {
-          return Err("assignment to a field or element is not supported");
-        }
-        const idx = assignIndex(st.vars, tn);
-        if (idx.isNone()) {
-          return Err("assignment to unknown variable `" + tn + "`");
-        }
-        const bo = binOfAssign(op);
-        let rhs = value;
-        if (bo.isSome()) {
-          rhs = Expr { kind: EBinary(bo.unwrap(), target, value), span: s.span };
-        }
-        const t = tr(g, st.vars, st.pc, cx, rhs)?;
-        if (t.ty != st.vars[idx.unwrap()].ty) {
-          return Err("assignment changes the type of `" + tn + "`");
-        }
-        const f = fresh(t.g, t.ty, t.t);
-        g = f.g;
-        st.pc = concat(st.pc, t.asm);
-        st.vars[idx.unwrap()] = Var { name: tn, term: f.name, ty: t.ty };
-      },
-      SExpr(e) => {
-        const t = tr(g, st.vars, st.pc, cx, e)?;
-        g = t.g;
-        st.pc = concat(st.pc, t.asm);
-      },
-      SReturn(v) => {
-        match (v) {
-          Some(e) => {
-            const t = tr(g, st.vars, st.pc, cx, e)?;
-            g = t.g;
-            rets.push(Ret { pc: concat(st.pc, t.asm), val: t.t, ty: t.ty, isVoid: false });
-          },
-          None => {
-            rets.push(Ret { pc: st.pc, val: "", ty: 0, isVoid: true });
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        for (const p of k.params) {
+          if (p.access != 0 && !fields.includes(p.name.name)) {
+            fields.push(p.name.name);
+            ftys.push(p.ty);
+            finit.push(None);
           }
         }
-        return Ok(Ex { g: g, st: st, fall: false, rets: rets });
       },
-      SBlock(b) => {
-        const n0 = st.vars.length;
-        const r = execStmts(g, st, b.stmts, cx)?;
-        g = r.g;
-        for (const x of r.rets) {
-          rets.push(x);
+      _ => {}
+    }
+  }
+  return Cls { name: c.name.name, unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor };
+}
+
+// Count of a name in a map (0 when absent).
+function bumped(m: Map<string, usize>, k: string): Map<string, usize> {
+  let out = m;
+  out.set(k, m.get(k).unwrapOr(0) + 1);
+  return out;
+}
+
+// The fixpoint of the frames: the fields a mutating method writes, including what the methods of its own class
+// that it calls on `this` write.
+function computeFrames(p0: Prog): Prog {
+  let p = p0;
+  const n = p.fns.length;
+  let writes: Writes[] = [];
+  let k: usize = 0;
+  while (k < n) {
+    const f = p.fns[k];
+    const co = p.clsIx.get(f.cls);
+    if ((f.kind == 1 && f.mutating || f.kind == 3) && co.isSome()) {
+      writes.push(writesStmts(p, p.classes[co.unwrap()], f.body.stmts, Writes { fields: [], thisCalls: [], unknown: false }));
+    } else {
+      writes.push(Writes { fields: [], thisCalls: [], unknown: false });
+    }
+    k += 1;
+  }
+  let frames: string[][] = [];
+  let all: bool[] = [];
+  k = 0;
+  while (k < n) {
+    frames.push(writes[k].fields);
+    all.push(writes[k].unknown);
+    k += 1;
+  }
+  let changed = true;
+  let rounds: usize = 0;
+  while (changed && rounds < 20) {
+    changed = false;
+    rounds += 1;
+    k = 0;
+    while (k < n) {
+      const f = p.fns[k];
+      if (f.kind == 1 && f.mutating) {
+        for (const c of writes[k].thisCalls) {
+          const mi = p.fnIx.get(f.cls + "." + c);
+          if (mi.isNone()) {
+            if (!all[k]) {
+              all[k] = true;
+              changed = true;
+            }
+          } else if (p.fns[mi.unwrap()].mutating) {
+            const j = mi.unwrap();
+            if (all[j] && !all[k]) {
+              all[k] = true;
+              changed = true;
+            }
+            for (const fld of frames[j]) {
+              if (!frames[k].includes(fld)) {
+                frames[k].push(fld);
+                changed = true;
+              }
+            }
+          }
         }
-        if (!r.fall) {
-          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
-        }
-        st = r.st;
-        st.vars = prefix(st.vars, n0);
-      },
-      SIf(c, thenB, els) => {
-        const r = execIf(g, st, cx, c, thenB, els)?;
-        g = r.g;
-        for (const x of r.rets) {
-          rets.push(x);
-        }
-        if (!r.fall) {
-          return Ok(Ex { g: g, st: r.st, fall: false, rets: rets });
-        }
-        st = r.st;
-      },
-      SWhile(_, _) => {
-        return Err("loops are not supported (no loop-invariant reasoning in v1)");
-      },
-      SForOf(_, _, _) => {
-        return Err("loops are not supported (no loop-invariant reasoning in v1)");
-      },
-      _ => {
-        return Err("unsupported statement");
+      }
+      k += 1;
+    }
+  }
+  let fns = p.fns;
+  k = 0;
+  while (k < n) {
+    let f = fns[k];
+    f.frame = frames[k];
+    // A mutating method whose writes the analysis could not see: every field may change.
+    f.frameAll = all[k] || (f.kind == 1 && f.mutating && frames[k].length == 0);
+    fns[k] = f;
+    k += 1;
+  }
+  p.fns = fns;
+  return p;
+}
+
+function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
+  let tab = new Tab();
+  let fns: Fn[] = [];
+  let classes: Cls[] = [];
+  let consts: ConstInfo[] = [];
+  let fnIx = new Map<string, usize>();
+  let fnCount = new Map<string, usize>();
+  let clsIx = new Map<string, usize>();
+  let mutNames = new Map<string, bool>();
+  // purity and mutation, from the analyses of the checker (ADR-0031 A4, ADR-0009)
+  const pur = inferPurity(hir.functions, allFunctions(hir.functions));
+  let pureOf = new Map<string, bool>();
+  let hi: usize = 0;
+  while (hi < hir.functions.length) {
+    if (pur.reached[hi] && !pur.impure[hi]) {
+      pureOf.set(hir.functions[hi].name, true);
+    }
+    hi += 1;
+  }
+  let mutOf = new Map<string, bool>();
+  for (const m of hir.mutating) {
+    mutOf.set(m, true);
+  }
+  for (const u of prog.units) {
+    if (u.name.startsWith("$") && !u.name.startsWith("$stdlib/")) {
+      continue;
+    }
+    const f = sm.files[u.file];
+    for (const it of u.ast.items) {
+      match (it) {
+        IType(d) => {
+          match (d.body) {
+            DRecord(fs) => { tab.addRec(recOfType(d, fs)); },
+            DUnion(vs) => { tab.addUni(uniOfType(d, vs)); },
+            DAlias(t) => { tab.addAlias(AliasDef { name: d.name.name, target: t, generic: d.typeParams.length > 0 }); }
+          }
+        },
+        IClass(c) => {
+          tab.addRec(recOfClass(c));
+        },
+        IConst(c) => {
+          consts.push(ConstInfo { name: c.name.name, decl: c, text: f.text });
+        },
+        _ => {}
       }
     }
   }
-  return Ok(Ex { g: g, st: st, fall: true, rets: rets });
-}
-
-function prefix(vs: Var[], n: usize): Var[] {
-  let out: Var[] = [];
-  let i: usize = 0;
-  while (i < n && i < vs.length) {
-    out.push(vs[i]);
-    i += 1;
-  }
-  return out;
-}
-
-function tailFrom(xs: string[], n: usize): string[] {
-  let out: string[] = [];
-  let i = n;
-  while (i < xs.length) {
-    out.push(xs[i]);
-    i += 1;
-  }
-  return out;
-}
-
-function execElse(g: Gen, st: St, cx: Cx, els: Option<Stmt>): Result<Ex, string> {
-  return match (els) {
-    None => Ok(Ex { g: g, st: st, fall: true, rets: [] }),
-    Some(s) => execStmts(g, st, [s], cx)
-  };
-}
-
-function execIf(g0: Gen, st: St, cx: Cx, c: Expr, thenB: Block, els: Option<Stmt>): Result<Ex, string> {
-  const ct = tr(g0, st.vars, st.pc, cx, c)?;
-  if (ct.ty != 1) {
-    return Err("`if` condition is not bool");
-  }
-  const n0 = st.vars.length;
-  const pc0 = concat(st.pc, ct.asm);
-  const notC = "(not " + ct.t + ")";
-  const s1 = St { vars: st.vars, pc: concat(pc0, [ct.t]) };
-  const r1 = execStmts(ct.g, s1, thenB.stmts, cx)?;
-  const s2 = St { vars: st.vars, pc: concat(pc0, [notC]) };
-  const r2 = execElse(r1.g, s2, cx, els)?;
-  const rets = concat2(r1.rets, r2.rets);
-  if (!r1.fall && !r2.fall) {
-    return Ok(Ex { g: r2.g, st: s1, fall: false, rets: rets });
-  }
-  if (r1.fall && !r2.fall) {
-    return Ok(Ex { g: r2.g, st: St { vars: prefix(r1.st.vars, n0), pc: r1.st.pc }, fall: true, rets: rets });
-  }
-  if (!r1.fall && r2.fall) {
-    return Ok(Ex { g: r2.g, st: St { vars: prefix(r2.st.vars, n0), pc: r2.st.pc }, fall: true, rets: rets });
-  }
-  // Both branches fall through: merge the variables with `ite` and keep the branch facts guarded.
-  let g = r2.g;
-  let merged: Var[] = [];
-  let i: usize = 0;
-  while (i < n0) {
-    const a = r1.st.vars[i];
-    const b = r2.st.vars[i];
-    if (a.term == b.term) {
-      merged.push(a);
-    } else {
-      const f = fresh(g, a.ty, "(ite " + ct.t + " " + a.term + " " + b.term + ")");
-      g = f.g;
-      merged.push(Var { name: a.name, term: f.name, ty: a.ty });
+  for (const u of prog.units) {
+    if (u.name.startsWith("$") && !u.name.startsWith("$stdlib/")) {
+      continue;
     }
-    i += 1;
+    const f = sm.files[u.file];
+    for (const it of u.ast.items) {
+      match (it) {
+        IFunction(d) => {
+          let fn = unitFns(u.name, f.path, f.text, d);
+          fn.pure = pureOf.has(u.name + "." + d.name.name);
+          fnIx.set(fn.key, fns.length);
+          fnCount = bumped(fnCount, fn.key);
+          fns.push(fn);
+        },
+        IClass(c) => {
+          let ctorIx: Option<usize> = None;
+          for (const m of c.members) {
+            match (m) {
+              MCtor(k) => {
+                const fn = ctorFn(u.name, f.path, f.text, c, k);
+                ctorIx = Some(fns.length);
+                fns.push(fn);
+              },
+              _ => {}
+            }
+          }
+          clsIx.set(c.name.name, classes.length);
+          classes.push(classInfo(u.name, f.path, f.text, c, ctorIx));
+          for (const m of c.members) {
+            match (m) {
+              MMethod(md) => {
+                let fn = methodFn(u.name, f.path, f.text, c, md);
+                const q = u.name + "." + c.name.name + "." + md.name.name;
+                fn.mutating = fn.kind == 1 && mutOf.has(q);
+                fn.pure = pureOf.has(q);
+                if (fn.mutating) {
+                  mutNames.set(md.name.name, true);
+                }
+                fnIx.set(fn.key, fns.length);
+                fnCount = bumped(fnCount, fn.key);
+                fns.push(fn);
+              },
+              _ => {}
+            }
+          }
+        },
+        _ => {}
+      }
+    }
   }
-  const base = pc0.length + 1;
-  const pc = concat(concat(pc0, guarded(ct.t, tailFrom(r1.st.pc, base))), guarded(notC, tailFrom(r2.st.pc, base)));
-  return Ok(Ex { g: g, st: St { vars: merged, pc: pc }, fall: true, rets: rets });
+  const sealed = sealTab(tab);
+  let p = Prog { tab: sealed, fns: fns, fnIx: fnIx, fnCount: fnCount, classes: classes, clsIx: clsIx, consts: consts, mutNames: mutNames };
+  return computeFrames(p);
 }
 
-function concat2(a: Ret[], b: Ret[]): Ret[] {
-  let out: Ret[] = [];
-  for (const x of a) {
-    out.push(x);
-  }
-  for (const x of b) {
-    out.push(x);
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Solver
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------- solver
 
 function prelude(): string {
   return "(set-option :produce-models true)\n(set-logic ALL)\n"
@@ -698,20 +326,51 @@ function prelude(): string {
     + "(define-fun trem ((a Int) (b Int)) Int (- a (* b (tdiv a b))))\n";
 }
 
-type Rt = { fns: FnInfo[]; z3: string; qn: usize; out: Res[]; warns: QWarn[]; };
-type Solved = { status: string; model: string; };
+type Rt = { p: Prog; z3: string; qn: usize; out: Res[]; warns: QWarn[]; };
 
-// Runs the solver on `query` (SMT-LIB text without check-sat); status is `unsat`, `sat`, `unknown` or
-// `error` (solver missing or crashed).
-function solve(fs: FsGrant, proc: ProcessGrant, rt0: Rt, query: string): Result<Solved, string> {
-  const base = "build/contracts-vc/q" + rt0.qn.toString();
-  const w = writeFile(fs, base + ".smt2", prelude() + query + "(check-sat)\n(get-model)\n");
+// A value the counterexample shows: `label = value`, shown when its guard holds (an element only below the
+// length, a payload only when present).
+type Probe = { label: string; term: string; kind: int; guard: string; idx: int; };
+
+type Solved = { status: string; values: string[]; };
+
+function assertAll(xs: string[]): string {
+  let s = "";
+  for (const x of xs) {
+    s += "(assert " + x + ")\n";
+  }
+  return s;
+}
+
+// The query text for "does `goal` follow from the facts, the assumptions `base` and the path condition `pc`":
+// everything asserted and `(not goal)`; `unsat` means it follows.
+function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): string {
+  let lits = "";
+  const lc = g.litConsts();
+  if (lc.length > 1) {
+    lits = "(assert (distinct " + lc.join(" ") + "))\n";
+  }
+  let get = "";
+  if (probes.length > 0) {
+    let ts: string[] = [];
+    for (const pr of probes) {
+      ts.push(pr.term);
+    }
+    get = "(get-value (" + ts.join(" ") + "))\n";
+  }
+  return g.declsText() + "\n" + assertAll(g.factsList()) + assertAll(g.lemmasList()) + lits + assertAll(base) + assertAll(pc)
+    + "(assert (not " + goal + "))\n(check-sat)\n" + get;
+}
+
+function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, query: string): Result<Solved, string> {
+  const base = "build/contracts-vc/q" + qn.toString();
+  const w = writeFile(fs, base + ".smt2", prelude() + query);
   if (w.isErr()) {
     return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
   }
-  const rc = shellRun(proc, rt0.z3 + " -in -T:20 < " + base + ".smt2 > " + base + ".out 2>&1");
+  const rc = shellRun(proc, z3 + " -in -t:6000 -T:30 < " + base + ".smt2 > " + base + ".out 2>&1");
   if (rc != 0 && rc != 1) {
-    return Err("solver `" + rt0.z3 + "` could not be run (exit status " + rc.toString() + ")");
+    return Err("solver `" + z3 + "` could not be run (exit status " + rc.toString() + ")");
   }
   const o = readFile(fs, base + ".out");
   if (o.isErr()) {
@@ -722,210 +381,684 @@ function solve(fs: FsGrant, proc: ProcessGrant, rt0: Rt, query: string): Result<
   const first = (nl.isSome() ? text.substring(0, nl.unwrap()) : text).trim();
   const rest = nl.isSome() ? text.substring(nl.unwrap() + 1, text.length) : "";
   if (first == "unsat" || first == "sat" || first == "unknown") {
-    return Ok(Solved { status: first, model: rest });
+    return Ok(Solved { status: first, values: first == "sat" ? replyValues(rest) : [] });
   }
   return Err("solver answered: " + first);
 }
 
-// Value of constant `name` in a z3 model: `(define-fun name () Int\n  5)` -> "5".
-function modelValue(model: string, name: string): string {
-  const key = "(define-fun " + name + " () ";
-  const at = model.indexOf(key);
-  if (at.isNone()) {
-    return "?";
+// ---------------------------------------------------------------------------------------- counterexamples
+
+function probesOf(g: Gen, tab: Tab, label: string, term: string, vt: VT, depth: usize, out0: Probe[]): Probe[] {
+  let out = out0;
+  if (out.length > 48) {
+    return out;
   }
-  let i = at.unwrap() + key.length;
-  // skip the sort
-  while (i < model.length && model.charCodeAt(i) != 32 && model.charCodeAt(i) != 10) {
-    i += 1;
-  }
-  let depth: int = 0;
-  let start = i;
-  while (i < model.length) {
-    const ch = model.charCodeAt(i);
-    if (ch == 40) {
-      depth += 1;
-    } else if (ch == 41) {
-      if (depth == 0) {
-        break;
+  match (vt) {
+    VInt(_) => { out.push(Probe { label: label, term: term, kind: 0, guard: "", idx: 0 }); },
+    VBool => { out.push(Probe { label: label, term: term, kind: 0, guard: "", idx: 0 }); },
+    VStr => { out.push(Probe { label: label + ".length", term: "(slen " + term + ")", kind: 0, guard: "", idx: 0 }); },
+    VArr(el) => {
+      const sn = g.sortFor(vtKey(vt));
+      if (sn.isSome()) {
+        out.push(Probe { label: label + ".length", term: arrLen(sn.unwrap(), term), kind: 0, guard: "", idx: 0 });
+        let i: usize = 0;
+        while (i < 3) {
+          const elTerm = arrSel(sn.unwrap(), term, i.toString());
+          const lbl = label + "[" + i.toString() + "]";
+          const before = out.length;
+          out = probesOf(g, tab, lbl, elTerm, el, depth + 1, out);
+          // mark the probes of this element as guarded by the length
+          let j = before;
+          while (j < out.length) {
+            if (out[j].kind == 0) {
+              out[j] = Probe { label: out[j].label, term: out[j].term, kind: 1, guard: label + ".length", idx: i.toInt() };
+            }
+            j += 1;
+          }
+          i += 1;
+        }
       }
-      depth -= 1;
+    },
+    VOpt(el) => {
+      const sn = g.sortFor(vtKey(vt));
+      if (sn.isSome()) {
+        out.push(Probe { label: label + ".isSome()", term: "((_ is some" + sn.unwrap() + ") " + term + ")", kind: 0, guard: "", idx: 0 });
+        const before = out.length;
+        out = probesOf(g, tab, label + ".unwrap()", "(val" + sn.unwrap() + " " + term + ")", el, depth + 1, out);
+        let j = before;
+        while (j < out.length) {
+          out[j] = Probe { label: out[j].label, term: out[j].term, kind: 2, guard: label + ".isSome()", idx: 0 };
+          j += 1;
+        }
+      }
+    },
+    VMap(_, _) => {
+      const sn = g.sortFor(vtKey(vt));
+      if (sn.isSome()) {
+        out.push(Probe { label: label + ".size", term: "(" + sn.unwrap() + "s " + term + ")", kind: 0, guard: "", idx: 0 });
+      }
+    },
+    VRec(rn) => {
+      const rd = tab.findRec(rn);
+      const sn = g.sortFor(vtKey(vt));
+      if (rd.isSome() && sn.isSome() && depth < 3 && !tab.isCyclic("r:" + rn)) {
+        let i: usize = 0;
+        const d = rd.unwrap();
+        while (i < d.fields.length) {
+          const ft = resolveTy(tab, d.ftys[i]);
+          if (!isBad(ft)) {
+            out = probesOf(g, tab, label + "." + d.fields[i], "(" + sn.unwrap() + "_" + d.fields[i] + " " + term + ")", ft, depth + 1, out);
+          }
+          i += 1;
+        }
+      }
+    },
+    _ => {}
+  }
+  return out;
+}
+
+function probesOfVars(g: Gen, tab: Tab, vars: Var[]): Probe[] {
+  let out: Probe[] = [];
+  for (const v of vars) {
+    out = probesOf(g, tab, v.name, v.term, v.vt, 0, out);
+  }
+  return out;
+}
+
+// `x = 5` lines for the probes of a sat answer.
+function counterexample(probes: Probe[], values: string[]): string[] {
+  let out: string[] = [];
+  if (values.length != probes.length) {
+    return out;
+  }
+  let i: usize = 0;
+  while (i < probes.length) {
+    const pr = probes[i];
+    let show = true;
+    if (pr.kind == 1 || pr.kind == 2) {
+      let j: usize = 0;
+      while (j < probes.length) {
+        if (probes[j].label == pr.guard) {
+          if (pr.kind == 1) {
+            // element index below the length
+            const n = values[j];
+            show = !n.startsWith("-") && n.length < 10 && pr.idx.toString().length <= n.length && lessThan(pr.idx, n);
+          } else {
+            show = values[j] == "true";
+          }
+        }
+        j += 1;
+      }
+    }
+    if (show) {
+      out.push(pr.label + " = " + values[i]);
     }
     i += 1;
   }
-  const v = model.substring(start, i).trim().split("\n").join(" ").split("  ").join(" ");
-  if (v.startsWith("(- ") && v.endsWith(")")) {
-    return "-" + v.substring(3, v.length - 1);
-  }
-  return v;
-}
-
-function counterexample(model: string, f: FunctionDecl): string[] {
-  let out: string[] = [];
-  for (const p of f.params) {
-    out.push(p.name.name + " = " + modelValue(model, "p_" + p.name.name));
-  }
   return out;
 }
 
-function assertAll(xs: string[]): string {
-  let s = "";
-  for (const x of xs) {
-    s += "(assert " + x + ")\n";
-  }
-  return s;
+function lessThan(i: int, n: string): bool {
+  const p = parseInt(n);
+  return p.isSome() && i < p.unwrap();
 }
 
-function queryText(g: Gen, base: string[], pc: string[], goal: string): string {
-  return concat(g.decls, []).join("\n") + "\n" + assertAll(g.facts) + assertAll(base) + assertAll(pc)
-    + "(assert (not " + goal + "))\n";
+// -------------------------------------------------------------------------------- one proof query, a status
+
+type Verdict = { status: string; reason: string; cex: string[]; };
+
+function describeSolverUnknown(): string {
+  return "solver returned unknown (timeout or incomplete theory)";
 }
 
-function rulesOf(f: FunctionDecl): string[] {
-  let out: string[] = [];
-  for (const c of f.contracts) {
-    match (c.kind) {
-      CRule => { out.push(c.rule); },
-      _ => {}
-    }
-  }
-  return out;
-}
-
-function pushRes(rt0: Rt, f: FnInfo, kind: string, clause: ContractClause, status: string, reason: string, cex: string[]): Rt {
+function pushRes(rt0: Rt, f: Fn, line: usize, kind: string, clause: string, v: Verdict, used: string[]): Rt {
   let rt = rt0;
   rt.out.push(Res {
-    fn: f.decl.name.name, file: f.file, line: lineOf(f.text, clause.span.start), kind: kind,
-    clause: clauseText(f.text, clause), rules: rulesOf(f.decl), status: status, reason: reason, cex: cex
+    fn: f.key, file: f.file, line: line, kind: kind, clause: clause, rules: rulesOfList(f.contracts), status: v.status, reason: v.reason, cex: v.cex,
+    assumes: v.status == "VERIFIED" ? assumptionsFor(used) : []
   });
   return rt;
 }
 
-function allUnknown(rt0: Rt, f: FnInfo, reason: string): Rt {
+function unknownV(reason: string): Verdict {
+  return Verdict { status: "UNKNOWN", reason: reason, cex: [] };
+}
+
+// ---------------------------------------------------------------------------------------- the function
+
+// Everything a function's proofs share.
+type Entry = { g: Gen; vars: Var[]; base: string[]; rangeBase: string[]; probes: Probe[]; sig: Sig; cx: Cx; cls: Option<Cls>; };
+
+function clauseKinds(f: Fn, c: Option<Cls>): usize {
+  return clausesOfList(f.contracts, 1).length;
+}
+
+// Does a method of this class have to preserve its invariants (public, changes `this`)?
+function checksInvariants(f: Fn, c: Option<Cls>): bool {
+  if (c.isNone() || c.unwrap().invs.length == 0) {
+    return false;
+  }
+  return (f.kind == 1 && !f.priv && (f.mutating)) || f.kind == 3;
+}
+
+function allUnknown(rt0: Rt, f: Fn, c: Option<Cls>, reason: string): Rt {
   let rt = rt0;
-  for (const c of clausesOf(f.decl, 1)) {
-    rt = pushRes(rt, f, "ensures", c, "UNKNOWN", reason, []);
+  for (const cl of clausesOfList(f.contracts, 1)) {
+    rt = pushRes(rt, f, lineOf(f.text, cl.span.start), "ensures", clauseText(f.text, cl), unknownV(reason), []);
+  }
+  if (checksInvariants(f, c)) {
+    for (const iv of c.unwrap().invs) {
+      rt = pushRes(rt, f, f.line, "invariant", clauseText(c.unwrap().text, iv), unknownV(reason), []);
+    }
   }
   return rt;
 }
 
-// Result of one solver query for a clause.
-function report(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, kind: string, c: ContractClause, query: string): Rt {
-  let rt = rt0;
-  const s = solve(fs, proc, rt, query);
-  rt.qn += 1;
-  match (s) {
-    Err(m) => { return pushRes(rt, f, kind, c, "UNKNOWN", m, []); },
-    Ok(r) => {
-      if (r.status == "unsat") {
-        return pushRes(rt, f, kind, c, "VERIFIED", "", []);
-      }
-      if (r.status == "sat") {
-        return pushRes(rt, f, kind, c, "REFUTED", "", counterexample(r.model, f.decl));
-      }
-      return pushRes(rt, f, kind, c, "UNKNOWN", "solver returned unknown (timeout or incomplete theory)", []);
+// The entry state of a function: parameters (and `this`) as free constants of their sorts in their ranges; class
+// invariants of the objects passed in are assumed (A-INV).
+function entryOf(rt: Rt, f: Fn, c: Option<Cls>): Result<Entry, string> {
+  let g = new Gen();
+  const cx0 = Cx { p: rt.p, f: f, res: None, ens: false, body: true, olds: [], ret: VUnit, inQ: false, text: f.text };
+  const sig = sigOf(cx0, f)?;
+  let vars: Var[] = [];
+  let base: string[] = [];
+  let i: usize = 0;
+  while (i < f.pnames.length) {
+    const so = sortS(g, cx0, sig.ptys[i])?;
+    g = so.g;
+    const nm = "p_" + f.pnames[i];
+    g.declare("(declare-const " + nm + " " + so.s + ")");
+    const tf = typeFact(sig.ptys[i], nm);
+    if (tf.isSome()) {
+      base.push(tf.unwrap());
     }
+    vars.push(Var { name: f.pnames[i], term: nm, vt: sig.ptys[i] });
+    i += 1;
   }
+  if (f.kind == 1) {
+    const ct = VRec(f.cls);
+    const so = sortS(g, cx0, ct)?;
+    g = so.g;
+    g.declare("(declare-const p_this " + so.s + ")");
+    vars.push(Var { name: "this", term: "p_this", vt: ct });
+  }
+  const cx = Cx { p: rt.p, f: f, res: None, ens: false, body: true, olds: [], ret: sig.rty, inQ: false, text: f.text };
+  return Ok(Entry { g: g, vars: vars, base: base, rangeBase: base, probes: [], sig: sig, cx: cx, cls: c });
 }
 
-// ---------------------------------------------------------------------------
-// Contract quality (ADR-0028): vacuous clauses, proved by the solver
-// ---------------------------------------------------------------------------
+// Assume the class invariants of every class-typed parameter and of `this` (public methods).
+function assumeInvariants(rt: Rt, f: Fn, en0: Entry): Entry {
+  let en = en0;
+  for (const v of en.vars) {
+    match (v.vt) {
+      VRec(cn) => {
+        const co = rt.p.clsIx.get(cn);
+        if (co.isSome() && rt.p.classes[co.unwrap()].invs.length > 0) {
+          if (v.name == "this" && (f.priv || f.kind == 3)) {
+            continue;
+          }
+          const iv = invTerms(en.g, en.cx, rt.p.classes[co.unwrap()], v.term);
+          en.g = iv.g;
+          for (const t of iv.terms) {
+            en.base.push(t);
+          }
+          if (iv.terms.length > 0) {
+            en.g.useAssumption("A-INV");
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  return en;
+}
+
+// The variables `old(..)` reads (the entry state) with `this` replaced by the final one for the post-state.
+function postVars(entry: Var[], fin: Var[]): Var[] {
+  let out: Var[] = [];
+  for (const v of entry) {
+    if (v.name == "this") {
+      const t = lookupVar(fin, "this");
+      out.push(t.isSome() ? t.unwrap() : v);
+    } else {
+      out.push(v);
+    }
+  }
+  return out;
+}
+
+// What the solver said, before it is judged.
+type Raw = { status: string; reason: string; values: string[]; };
+
+function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): Raw {
+  const q = queryText(g, base, pc, goal, probes);
+  const s = solve(fs, proc, z3, qn, q);
+  if (s.isErr()) {
+    return Raw { status: "error", reason: s.unwrapErr(), values: [] };
+  }
+  const r = s.unwrap();
+  return Raw { status: r.status, reason: "", values: r.values };
+}
+
+// A sat answer is a counterexample only if nothing on the way was an abstraction.
+function judge(g: Gen, r: Raw, approx: string, probes: Probe[]): Verdict {
+  if (r.status == "unsat") {
+    return Verdict { status: "VERIFIED", reason: "", cex: [] };
+  }
+  if (r.status == "error") {
+    return unknownV(r.reason);
+  }
+  if (r.status == "sat") {
+    if (approx != "") {
+      return unknownV(approx);
+    }
+    if (g.approxReason() != "") {
+      return unknownV(g.approxReason() + " (a counterexample is not trusted)");
+    }
+    const cex = counterexample(probes, r.values);
+    return Verdict { status: "REFUTED", reason: "", cex: cex.length > 0 ? cex : ["(no model values)"] };
+  }
+  return unknownV(describeSolverUnknown());
+}
+
+// One goal at the end of one path: what holds on the path, what is to be proved, what the path used.
+type RetGoal = { pc: string[]; goal: string; approx: string; deps: usize[]; };
+
+// The loops a result relies on: all their invariant obligations must be VERIFIED, else the result is UNKNOWN.
+function depsVerdict(g: Gen, statuses: string[], deps: usize[], v: Verdict): Verdict {
+  if (v.status != "VERIFIED") {
+    return v;
+  }
+  for (const d of deps) {
+    for (const id of g.loopMembers(d)) {
+      if (id < statuses.length && statuses[id] != "VERIFIED") {
+        const o = g.oblList()[id];
+        return unknownV("relies on a loop invariant that is not proved: " + o.clause + " (line " + o.line.toString() + ")");
+      }
+    }
+  }
+  return v;
+}
+
+// A clause at the end of every path: proved together; when that fails and some paths went through an
+// abstraction, the exact paths are tried alone (a counterexample on one of them is a real one).
+type Proved = { v: Verdict; used: usize; };
+
+function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: Gen, base: string[], goals: RetGoal[], statuses: string[], probes: Probe[]): Proved {
+  let parts: string[] = [];
+  let deps: usize[] = [];
+  let anyApprox = "";
+  let allExact = true;
+  for (const r of goals) {
+    parts.push("(=> " + andAll(r.pc) + " " + r.goal + ")");
+    deps = unionUsize(deps, r.deps);
+    if (r.approx != "") {
+      allExact = false;
+      if (anyApprox == "") {
+        anyApprox = r.approx;
+      }
+    }
+  }
+  let used: usize = 1;
+  const raw = rawProve(fs, proc, z3, qn0, g, base, [], andAll(parts), probes);
+  if (raw.status == "unsat") {
+    return Proved { v: depsVerdict(g, statuses, deps, Verdict { status: "VERIFIED", reason: "", cex: [] }), used: used };
+  }
+  if (raw.status == "sat" && !allExact) {
+    // paths without abstraction are judged alone
+    for (const r of goals) {
+      if (r.approx == "") {
+        const one = rawProve(fs, proc, z3, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
+        used += 1;
+        if (one.status == "sat") {
+          return Proved { v: judge(g, one, "", probes), used: used };
+        }
+      }
+    }
+    return Proved { v: unknownV(anyApprox), used: used };
+  }
+  return Proved { v: judge(g, raw, anyApprox, probes), used: used };
+}
+
+// ---------------------------------------------------------------------------------------- the function
+
+function isEnsuresTask(k: string): bool {
+  return k == "ensures";
+}
+
+type Task = { kind: string; text: string; line: usize; e: Expr; ctext: string; inv: bool; };
+
+// The clauses a function must prove at its returns: its @Ensures and, for a public method that changes `this`
+// and for a constructor, the class invariants.
+function tasksOf(f: Fn, c: Option<Cls>): Task[] {
+  let out: Task[] = [];
+  for (const cl of clausesOfList(f.contracts, 1)) {
+    const ex = exprOf(cl);
+    if (ex.isSome()) {
+      out.push(Task { kind: "ensures", text: clauseText(f.text, cl), line: lineOf(f.text, cl.span.start), e: ex.unwrap(), ctext: f.text, inv: false });
+    }
+  }
+  if (checksInvariants(f, c)) {
+    for (const iv of c.unwrap().invs) {
+      const ex = exprOf(iv);
+      if (ex.isSome()) {
+        out.push(Task { kind: "invariant", text: clauseText(c.unwrap().text, iv), line: f.line, e: ex.unwrap(), ctext: c.unwrap().text, inv: true });
+      }
+    }
+  }
+  return out;
+}
+
+// The state of a constructor before its body: the fields take the parameters (parameter properties), their
+// initialiser (when it translates) or an arbitrary value (a leading `this.f = e;` sets it next).
+function ctorEntry(en0: Entry, f: Fn, cls: Cls): Result<Entry, string> {
+  let en = en0;
+  let g = en.g;
+  const ct = VRec(cls.name);
+  const so = sortS(g, en.cx, ct)?;
+  g = so.g;
+  const icx = Cx { p: en.cx.p, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
+  let args: string[] = [];
+  let i: usize = 0;
+  while (i < cls.fields.length) {
+    const name = cls.fields[i];
+    const ft = resolveTy(en.cx.p.tab, cls.ftys[i]);
+    let term = "";
+    let k: usize = 0;
+    while (k < f.pnames.length) {
+      if (f.pnames[k] == name && f.pacc[k] != 0) {
+        const pv = lookupVar(en.vars, name);
+        if (pv.isSome()) {
+          term = pv.unwrap().term;
+        }
+      }
+      k += 1;
+    }
+    if (term == "" && cls.finit[i].isSome() && !isBad(ft)) {
+      const none: Var[] = [];
+      const r = trClause2(g, none, icx, cls.finit[i].unwrap(), ft);
+      match (r) {
+        Ok(x) => {
+          g = x.g;
+          term = x.t;
+        },
+        Err(_) => {}
+      }
+    }
+    if (term == "") {
+      if (isBad(ft)) {
+        const os = opaqueSort(g);
+        g = os.g;
+        const nm = g.next("o");
+        g.declare("(declare-const " + nm + " " + os.s + ")");
+        term = nm;
+      } else {
+        const fr = freshFree(g, en.cx, ft)?;
+        g = fr.g;
+        term = fr.name;
+      }
+    }
+    args.push(term);
+    i += 1;
+  }
+  const th = fresh(g, en.cx, ct, "(mk" + so.s + (args.length > 0 ? " " + args.join(" ") : "") + ")")?;
+  g = th.g;
+  en.g = g;
+  en.vars.push(Var { name: "this", term: th.name, vt: ct });
+  return Ok(en);
+}
+
+function trClause2(g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT): Result<TR, string> {
+  return tr(g, vars, cx, e, exp);
+}
+
+function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
+  let rt = rt0;
+  let cls: Option<Cls> = None;
+  if (f.cls != "") {
+    const co = rt.p.clsIx.get(f.cls);
+    if (co.isSome()) {
+      cls = Some(rt.p.classes[co.unwrap()]);
+    }
+  }
+  for (const c of clausesOfList(f.contracts, 2)) {
+    rt = pushRes(rt, f, lineOf(f.text, c.span.start), "decreases", clauseText(f.text, c), unknownV("termination measures are not checked (v1)"), []);
+  }
+  if (f.generic) {
+    return allUnknown(rt, f, cls, "generic function");
+  }
+  if (f.kind != 0 && cls.isNone()) {
+    return allUnknown(rt, f, cls, "class `" + f.cls + "` is outside the fragment");
+  }
+  const enR = entryOf(rt, f, cls);
+  if (enR.isErr()) {
+    return allUnknown(rt, f, cls, enR.unwrapErr());
+  }
+  let en = enR.unwrap();
+  if (f.kind == 3) {
+    const cr = ctorEntry(en, f, cls.unwrap());
+    if (cr.isErr()) {
+      return allUnknown(rt, f, cls, cr.unwrapErr());
+    }
+    en = cr.unwrap();
+  }
+  en = assumeInvariants(rt, f, en);
+  // @Requires: hypotheses.
+  const rcx = Cx { p: rt.p, f: f, res: None, ens: false, body: false, olds: [], ret: en.sig.rty, inQ: false, text: f.text };
+  let reqTerms: string[] = [];
+  for (const c of clausesOfList(f.contracts, 0)) {
+    const ex = exprOf(c);
+    if (ex.isSome()) {
+      const r = trClause(en.g, en.vars, rcx, ex.unwrap());
+      match (r) {
+        Ok(x) => {
+          en.g = x.g;
+          reqTerms.push(x.t);
+        },
+        Err(m) => {
+          return allUnknown(rt, f, cls, "@Requires: " + m);
+        }
+      }
+    }
+  }
+  const rangeBase = en.base;
+  let base = concat(en.base, reqTerms);
+  en.probes = probesOfVars(en.g, rt.p.tab, en.vars);
+  if (f.kind == 0) {
+    rt = qualityChecks(fs, proc, rt, f, en, reqTerms);
+  }
+  // Execute the body.
+  const st0 = St { vars: en.vars, pc: [], deps: [], approx: "" };
+  const exR = execStmts(en.g, st0, en.cx, f.body.stmts);
+  if (exR.isErr()) {
+    return allUnknown(rt, f, cls, exR.unwrapErr());
+  }
+  const ex = exR.unwrap();
+  let g = ex.g;
+  let rets = ex.rets;
+  if (ex.fall) {
+    rets.push(Ret { st: ex.st, val: "", vt: VUnit, isVoid: true });
+  }
+  const reportSafety = hasClauses(f) || checksInvariants(f, cls);
+  // The obligations found on the way (call preconditions, indexes, `unwrap`, loop invariants).
+  const obls = g.oblList();
+  let verdicts: Verdict[] = [];
+  let statuses: string[] = [];
+  let id: usize = 0;
+  while (id < obls.length) {
+    const o = obls[id];
+    const wanted = o.kind == "call-precondition" || o.kind == "loop-invariant" || reportSafety;
+    if (wanted) {
+      const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
+      rt.qn += 1;
+      const v = judge(g, raw, o.approx, en.probes);
+      verdicts.push(v);
+      statuses.push(v.status);
+    } else {
+      verdicts.push(unknownV("not reported"));
+      statuses.push("SKIPPED");
+    }
+    id += 1;
+  }
+  id = 0;
+  while (id < obls.length) {
+    const o = obls[id];
+    const wanted = o.kind == "call-precondition" || o.kind == "loop-invariant" || reportSafety;
+    if (wanted && !o.hidden) {
+      const v = depsVerdict(g, statuses, o.deps, verdicts[id]);
+      rt = pushRes(rt, f, o.line, o.kind, o.clause, v, g.usedList());
+    }
+    id += 1;
+  }
+  // Postconditions and class invariants at every return.
+  const rty = en.sig.rty;
+  for (const t of tasksOf(f, cls)) {
+    let goals: RetGoal[] = [];
+    let failure = "";
+    for (const r of rets) {
+      if (r.isVoid != isUnit(rty)) {
+        failure = "return statements do not match the declared result type";
+        continue;
+      }
+      let res: Option<Var> = None;
+      if (!r.isVoid) {
+        res = Some(Var { name: "result", term: r.val, vt: r.vt });
+      }
+      let env = postVars(en.vars, r.st.vars);
+      let ecx = Cx { p: rt.p, f: f, res: res, ens: true, body: false, olds: en.vars, ret: rty, inQ: false, text: t.ctext };
+      if (t.inv) {
+        const tv = lookupVar(env, "this");
+        if (tv.isNone()) {
+          failure = "no `this` at a return";
+          continue;
+        }
+        env = [Var { name: "this", term: tv.unwrap().term, vt: tv.unwrap().vt }];
+        ecx = Cx { p: rt.p, f: f, res: None, ens: false, body: false, olds: [], ret: rty, inQ: false, text: t.ctext };
+      }
+      const c = trClause(g, env, ecx, t.e);
+      match (c) {
+        Err(m) => { failure = m; },
+        Ok(x) => {
+          g = x.g;
+          goals.push(RetGoal { pc: r.st.pc, goal: x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")", approx: r.st.approx, deps: r.st.deps });
+        }
+      }
+    }
+    if (failure != "") {
+      rt = pushRes(rt, f, t.line, t.kind, t.text, unknownV(failure), []);
+    } else {
+      const pr = proveRets(fs, proc, rt.z3, rt.qn, g, base, goals, statuses, en.probes);
+      rt.qn += pr.used;
+      rt = pushRes(rt, f, t.line, t.kind, t.text, pr.v, g.usedList());
+    }
+  }
+  return rt;
+}
+
+// ---------------------------------------------------------------------------------------------- quality
 
 type Entail = { rt: Rt; holds: bool; };
 
-// True (`holds`) exactly when the solver proves `goal` from the facts of `g` and the assumptions `base`
-// (`unsat` of the negation). `sat`, `unknown` and solver errors are all "not proved": a finding needs a proof.
+// True exactly when the solver proves `goal` from the facts of `g` and the assumptions `base` (`unsat` of the
+// negation). `sat`, `unknown` and solver errors all mean "not proved": a finding needs a proof.
 function entails(fs: FsGrant, proc: ProcessGrant, rt0: Rt, g: Gen, base: string[], goal: string): Entail {
   let rt = rt0;
-  const s = solve(fs, proc, rt, queryText(g, base, [], goal));
+  const none: Probe[] = [];
+  const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, [], goal, none);
   rt.qn += 1;
-  return match (s) {
-    Ok(r) => Entail { rt: rt, holds: r.status == "unsat" },
-    Err(_) => Entail { rt: rt, holds: false }
-  };
+  return Entail { rt: rt, holds: raw.status == "unsat" };
 }
 
-function pushWarn(rt0: Rt, f: FnInfo, code: string, kind: string, c: ContractClause, message: string): Rt {
+function pushWarn(rt0: Rt, f: Fn, code: string, kind: string, c: ContractClause, message: string): Rt {
   let rt = rt0;
   rt.warns.push(QWarn {
-    code: code, fn: f.decl.name.name, file: f.file, line: lineOf(f.text, c.span.start), kind: kind,
+    code: code, fn: f.key, file: f.file, line: lineOf(f.text, c.span.start), kind: kind,
     clause: clauseText(f.text, c), message: message, status: "VERIFIED"
   });
   return rt;
 }
 
-// The contract-quality checks of one function in the supported fragment. They concern the clauses only
-// (not the body), so they run before the body is examined. A clause the fragment cannot translate is skipped
-// silently: a warning is only issued with a solver proof.
-//   W0460  clause valid with no premises (parameters in the i64 range only): it cannot fail
+function decl0(f: Fn): FunctionDecl {
+  return FunctionDecl {
+    exported: false, name: Ident { name: f.name, span: f.span }, typeParams: [], bounds: [], params: f.params, ret: f.ret, body: f.body,
+    contracts: f.contracts, annotations: [], span: f.span
+  };
+}
+
+// The contract-quality checks of one function in the supported fragment (ADR-0028). They concern the clauses
+// only (not the body), so they run before the body is examined. A clause the fragment cannot translate is
+// skipped silently: a warning is only issued with a solver proof.
+//   W0460  clause valid with no premises (parameters in their type's range only): it cannot fail
 //   W0461  the @Requires clauses together are unsatisfiable: the function can never be called
 //   W0462  an @Ensures that follows from the @Requires alone, whatever the result is: the body cannot violate it
-function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, g: Gen, vars: Var[], rangeBase: string[], rty: int): Rt {
+function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entry, reqTerms: string[]): Rt {
   let rt = rt0;
-  const d = f.decl;
-  const reqs = clausesOf(d, 0);
-  const enss = clausesOf(d, 1);
-  const cx = Cx { fns: rt.fns, res: None, ens: false, body: true, text: f.text };
-  let reqTerms: string[] = [];
+  const d = decl0(f);
+  let g = en.g;
+  const reqs = clausesOfList(f.contracts, 0);
+  const enss = clausesOfList(f.contracts, 1);
+  const rcx = Cx { p: rt.p, f: f, res: None, ens: false, body: false, olds: [], ret: en.sig.rty, inQ: false, text: f.text };
   for (const c of reqs) {
     const e = exprOf(c);
     if (e.isNone()) {
       continue;
     }
-    const t = tr(g, vars, [], cx, e.unwrap());
-    if (t.isErr() || t.unwrap().ty != 1) {
+    const t = trClause(g, en.vars, rcx, e.unwrap());
+    if (t.isErr()) {
       return rt;
     }
-    reqTerms.push(t.unwrap().t);
+    g = t.unwrap().g;
     if (!isSyntacticallyTrivial(d, c)) {
-      const r = entails(fs, proc, rt, g, rangeBase, t.unwrap().t);
+      const r = entails(fs, proc, rt, g, en.rangeBase, t.unwrap().t);
       rt = r.rt;
-      if (r.holds) {
+      if (r.holds && g.approxReason() == "") {
         rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Requires` is valid without any premises: it excludes no input and catches no bug");
       }
     }
   }
-  const withReqs = concat(rangeBase, reqTerms);
+  const withReqs = concat(en.rangeBase, reqTerms);
   if (reqTerms.length > 0) {
     const u = entails(fs, proc, rt, g, withReqs, "false");
     rt = u.rt;
     if (u.holds) {
-      return pushWarn(rt, f, W_UNSAT_REQUIRES, "unsatisfiable-requires", reqs[0], "the `@Requires` clauses of `" + d.name.name + "` are unsatisfiable: the function can never be called, and every `@Ensures` holds vacuously");
+      return pushWarn(rt, f, W_UNSAT_REQUIRES, "unsatisfiable-requires", reqs[0], "the `@Requires` clauses of `" + f.key + "` are unsatisfiable: the function can never be called, and every `@Ensures` holds vacuously");
     }
   }
   // `result` is a fresh unconstrained value: what holds for all of them cannot be violated by the body.
   let g2 = g;
   let res: Option<Var> = None;
-  let resBase = rangeBase;
-  if (rty >= 0) {
-    const fr = freshFree(g2, rty);
-    g2 = fr.g;
-    res = Some(Var { name: "result", term: fr.name, ty: rty });
-    if (rty == 0) {
-      resBase = concat(rangeBase, [inRange(fr.name)]);
+  let resBase = en.rangeBase;
+  if (!isUnit(en.sig.rty)) {
+    const fr = freshFree(g2, en.cx, en.sig.rty);
+    if (fr.isErr()) {
+      return rt;
     }
+    g2 = fr.unwrap().g;
+    res = Some(Var { name: "result", term: fr.unwrap().name, vt: en.sig.rty });
   }
-  const ecx = Cx { fns: rt.fns, res: res, ens: true, body: false, text: f.text };
+  const ecx = Cx { p: rt.p, f: f, res: res, ens: true, body: false, olds: en.vars, ret: en.sig.rty, inQ: false, text: f.text };
   for (const c of enss) {
     const e = exprOf(c);
     if (e.isNone()) {
       continue;
     }
-    const t = tr(g2, vars, [], ecx, e.unwrap());
-    if (t.isErr() || t.unwrap().ty != 1) {
+    const t = trClause(g2, en.vars, ecx, e.unwrap());
+    if (t.isErr()) {
       continue;
     }
-    const taut = entails(fs, proc, rt, g2, resBase, t.unwrap().t);
+    g2 = t.unwrap().g;
+    const goal = t.unwrap().wd == "true" ? t.unwrap().t : "(and " + t.unwrap().t + " " + t.unwrap().wd + ")";
+    const taut = entails(fs, proc, rt, g2, resBase, goal);
     rt = taut.rt;
     if (taut.holds) {
-      if (!isSyntacticallyTrivial(d, c)) {
+      if (!isSyntacticallyTrivial(d, c) && g2.approxReason() == "") {
         rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Ensures` is valid without any premises: it holds for every result and catches no bug");
       }
     } else if (reqTerms.length > 0) {
-      const imp = entails(fs, proc, rt, g2, concat(resBase, reqTerms), t.unwrap().t);
+      const imp = entails(fs, proc, rt, g2, concat(resBase, reqTerms), goal);
       rt = imp.rt;
-      if (imp.holds) {
+      if (imp.holds && g2.approxReason() == "") {
         rt = pushWarn(rt, f, W_IMPLIED_ENSURES, "implied-ensures", c, "`@Ensures` follows from the `@Requires` alone for every possible result: the body cannot violate it");
       }
     }
@@ -933,385 +1066,16 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo, g: G
   return rt;
 }
 
-function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: FnInfo): Rt {
-  let rt = rt0;
-  const d = f.decl;
-  const enss = clausesOf(d, 1);
-  for (const c of clausesOf(d, 2)) {
-    rt = pushRes(rt, f, "decreases", c, "UNKNOWN", "termination measures are not checked (v1)", []);
-  }
-  if (d.typeParams.length > 0) {
-    return allUnknown(rt, f, "generic function");
-  }
-  const ptysR = paramTypes(d);
-  if (ptysR.isErr()) {
-    return allUnknown(rt, f, ptysR.unwrapErr());
-  }
-  const rtyR = retType(d);
-  if (rtyR.isErr()) {
-    return allUnknown(rt, f, rtyR.unwrapErr());
-  }
-  const ptys = ptysR.unwrap();
-  const rty = rtyR.unwrap();
-  // Entry state: parameters are free constants `p_x` in the i64 range.
-  let g = Gen { decls: [], facts: [], n: 0, obls: [] };
-  let terms: string[] = [];
-  let base: string[] = [];
-  let i: usize = 0;
-  while (i < d.params.length) {
-    const nm = "p_" + d.params[i].name.name;
-    g.decls.push("(declare-const " + nm + " " + tyName(ptys[i]) + ")");
-    if (ptys[i] == 0) {
-      base.push(inRange(nm));
-    }
-    terms.push(nm);
-    i += 1;
-  }
-  const vars = paramVars(d, terms, ptys);
-  const cx = Cx { fns: rt.fns, res: None, ens: false, body: true, text: f.text };
-  const reqR = trClauses(g, vars, cx, clausesOf(d, 0));
-  if (reqR.isErr()) {
-    return allUnknown(rt, f, "@Requires: " + reqR.unwrapErr());
-  }
-  const rangeBase = base;
-  base = concat(base, reqR.unwrap());
-  rt = qualityChecks(fs, proc, rt, f, g, vars, rangeBase, rty);
-  const exR = execStmts(g, St { vars: vars, pc: [] }, d.body.stmts, cx);
-  if (exR.isErr()) {
-    return allUnknown(rt, f, exR.unwrapErr());
-  }
-  const ex = exR.unwrap();
-  let rets = ex.rets;
-  if (ex.fall) {
-    rets.push(Ret { pc: ex.st.pc, val: "", ty: 0, isVoid: true });
-  }
-  g = ex.g;
-  // Call-site preconditions.
-  for (const o of g.obls) {
-    const q = queryText(g, base, o.pc, o.goal);
-    const s = solve(fs, proc, rt, q);
-    rt.qn += 1;
-    let status = "UNKNOWN";
-    let reason = "";
-    let cex: string[] = [];
-    match (s) {
-      Err(m) => { reason = m; },
-      Ok(r) => {
-        if (r.status == "unsat") {
-          status = "VERIFIED";
-        } else if (r.status == "sat") {
-          status = "REFUTED";
-          cex = counterexample(r.model, d);
-        } else {
-          reason = "solver returned unknown (timeout or incomplete theory)";
-        }
-      }
-    }
-    rt.out.push(Res {
-      fn: d.name.name, file: f.file, line: o.line, kind: "call-precondition",
-      clause: o.clause + " (call of " + o.callee + ")", rules: rulesOf(d), status: status, reason: reason, cex: cex
-    });
-  }
-  // Postconditions: for every return, the clause holds under the facts of that path.
-  for (const c of enss) {
-    const e = exprOf(c);
-    if (e.isNone()) {
-      continue;
-    }
-    let parts: string[] = [];
-    let failure = "";
-    for (const r of rets) {
-      let res: Option<Var> = None;
-      if (!r.isVoid) {
-        res = Some(Var { name: "result", term: r.val, ty: r.ty });
-      }
-      if (r.isVoid != (rty < 0)) {
-        failure = "return statements do not match the declared result type";
-      }
-      const ecx = Cx { fns: rt.fns, res: res, ens: true, body: false, text: f.text };
-      const t = tr(g, vars, [], ecx, e.unwrap());
-      if (t.isErr()) {
-        failure = t.unwrapErr();
-      } else if (t.unwrap().ty != 1) {
-        failure = "contract expression is not bool";
-      } else {
-        parts.push("(=> " + andAll(r.pc) + " " + t.unwrap().t + ")");
-      }
-    }
-    if (failure != "") {
-      rt = pushRes(rt, f, "ensures", c, "UNKNOWN", failure, []);
-    } else {
-      rt = report(fs, proc, rt, f, "ensures", c, queryText(g, base, [], andAll(parts)));
-    }
-  }
-  return rt;
-}
+// ----------------------------------------------------------------------------------------------- driver
 
-// ---------------------------------------------------------------------------
-// Driver
-// ---------------------------------------------------------------------------
-
-export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, z3: string): Report {
-  let fns: FnInfo[] = [];
-  for (const u of prog.units) {
-    if (u.name.startsWith("$") && !u.name.startsWith("$stdlib/")) {
-      continue;
-    }
-    const f = sm.files[u.file];
-    for (const it of u.ast.items) {
-      match (it) {
-        IFunction(d) => { fns.push(FnInfo { decl: d, file: f.path, text: f.text }); },
-        _ => {}
-      }
-    }
-  }
+export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string): Report {
+  const p = buildProg(prog, sm, hir);
   shellRun(proc, "mkdir -p build/contracts-vc");
-  let rt = Rt { fns: fns, z3: z3, qn: 0, out: [], warns: [] };
-  for (const f of fns) {
-    // Functions without clauses are still analysed (their calls of contracted functions are proof
-    // obligations); if they are outside the fragment nothing is reported for them.
+  let rt = Rt { p: p, z3: z3, qn: 0, out: [], warns: [] };
+  for (const f of p.fns) {
+    // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
+    // if they are outside the fragment nothing is reported for them.
     rt = verifyFn(fs, proc, rt, f);
   }
   return Report { results: rt.out, warnings: rt.warns };
-}
-
-// ---------------------------------------------------------------------------
-// Refusal protocol (ADR-0029 §1-3): who has to act on a result
-// ---------------------------------------------------------------------------
-
-type Opt = { edit: string; changesSpec: bool; widensAuthority: bool; };
-
-// `FIX_CODE` | `STRENGTHEN_SPEC` | `NEEDS_DECISION`, or "" for a VERIFIED result (nothing to do).
-//   REFUTED call-precondition        FIX_CODE        (the caller passes an argument the callee forbids)
-//   REFUTED contract of the function NEEDS_DECISION  (the body or the contract is wrong; only a human knows which)
-//   UNKNOWN                          STRENGTHEN_SPEC (loop, missing callee contract, unsupported fragment, solver limit)
-// NEEDS_AUTHORITY does not arise here: no verification result needs a grant or a dependency rule.
-function actionOf(r: Res): string {
-  if (r.status == "REFUTED") {
-    return r.kind == "call-precondition" ? "FIX_CODE" : "NEEDS_DECISION";
-  }
-  return r.status == "UNKNOWN" ? "STRENGTHEN_SPEC" : "";
-}
-
-// The inputs of a counterexample as a condition: `x == 1 && y == 2`.
-function cexCondition(r: Res): string {
-  let parts: string[] = [];
-  for (const c of r.cex) {
-    parts.push(c.split(" = ").join(" == "));
-  }
-  return parts.join(" && ");
-}
-
-function callOf(r: Res): string {
-  let parts: string[] = [];
-  for (const c of r.cex) {
-    parts.push(c);
-  }
-  return r.fn + "(" + parts.join(", ") + ")";
-}
-
-// A precondition that excludes exactly the counterexample, or "" when there is none.
-function candidatePrecondition(r: Res): string {
-  if (r.status != "REFUTED" || r.kind == "call-precondition" || r.cex.length == 0) {
-    return "";
-  }
-  return "@Requires(!(" + cexCondition(r) + "))";
-}
-
-// The question of a NEEDS_DECISION result, one sentence a human can answer without reading the code.
-function questionOf(r: Res): string {
-  if (actionOf(r) != "NEEDS_DECISION") {
-    return "";
-  }
-  const at = r.cex.length > 0 ? callOf(r) + " violates " : r.fn + " violates ";
-  return at + r.clause + ". Is the body wrong (fix it), is this input meant to be excluded (add a precondition), or is the contract itself wrong (change it)?";
-}
-
-function optionsOf(r: Res): Opt[] {
-  let out: Opt[] = [];
-  if (actionOf(r) != "NEEDS_DECISION") {
-    return out;
-  }
-  out.push(Opt { edit: "change the body of `" + r.fn + "` so that " + r.clause + " holds for this input", changesSpec: false, widensAuthority: false });
-  const cand = candidatePrecondition(r);
-  if (cand != "") {
-    out.push(Opt { edit: "add `" + cand + "` to `" + r.fn + "` (callers must then establish it)", changesSpec: true, widensAuthority: false });
-  }
-  out.push(Opt { edit: "weaken or remove " + r.clause + " (a weaker guarantee)", changesSpec: true, widensAuthority: true });
-  return out;
-}
-
-// Contract suggestions for a STRENGTHEN_SPEC / NEEDS_DECISION result. They are suggestions, never
-// verified. UNKNOWN results carry none: the solver gives no counterexample to derive one from.
-function candidatesOf(r: Res): string[] {
-  let out: string[] = [];
-  const c = candidatePrecondition(r);
-  if (c != "") {
-    out.push(c);
-  }
-  return out;
-}
-
-function jsonBool(b: bool): string {
-  return b ? "true" : "false";
-}
-
-function jsonOptions(os: Opt[]): string {
-  let out: string[] = [];
-  for (const o of os) {
-    out.push("{\"edit\":" + jsonString(o.edit) + ",\"changes_spec\":" + jsonBool(o.changesSpec) + ",\"widens_authority\":" + jsonBool(o.widensAuthority) + "}");
-  }
-  return out.join(",");
-}
-
-function jsonAction(a: string): string {
-  return a == "" ? "null" : jsonString(a);
-}
-
-// The ADR-0029 fields of a result: `action`, `question`, `options`, `candidates`, `evidence`.
-function protocolJson(r: Res): string {
-  const loc = r.file + ":" + r.line.toString();
-  return "\"action\":" + jsonAction(actionOf(r)) + ",\"question\":" + (questionOf(r) == "" ? "null" : jsonString(questionOf(r)))
-    + ",\"options\":[" + jsonOptions(optionsOf(r)) + "],\"candidates\":[" + jsonStrings(candidatesOf(r))
-    + "],\"evidence\":{\"clause\":" + jsonString(r.clause) + ",\"location\":" + jsonString(loc) + ",\"counterexample\":["
-    + jsonStrings(r.cex) + "]}";
-}
-
-function jsonRes(r: Res): string {
-  let rules: string[] = [];
-  for (const x of r.rules) {
-    rules.push(jsonString(x));
-  }
-  let cex: string[] = [];
-  for (const x of r.cex) {
-    cex.push(jsonString(x));
-  }
-  return "{\"function\":" + jsonString(r.fn) + ",\"file\":" + jsonString(r.file) + ",\"line\":" + r.line.toString()
-    + ",\"kind\":" + jsonString(r.kind) + ",\"clause\":" + jsonString(r.clause) + ",\"rules\":[" + rules.join(",")
-    + "],\"status\":" + jsonString(r.status) + ",\"reason\":" + jsonString(r.reason) + ",\"counterexample\":["
-    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]," + protocolJson(r) + "}";
-}
-
-function jsonStrings(xs: string[]): string {
-  let out: string[] = [];
-  for (const x of xs) {
-    out.push(jsonString(x));
-  }
-  return out.join(",");
-}
-
-function assumptionsJson(): string {
-  const ids = assumptionIds();
-  const texts = assumptionTexts();
-  let out: string[] = [];
-  let i: usize = 0;
-  while (i < ids.length) {
-    out.push("{\"id\":" + jsonString(ids[i]) + ",\"text\":" + jsonString(texts[i]) + "}");
-    i += 1;
-  }
-  return out.join(",");
-}
-
-// Model assumptions every VERIFIED result depends on (ADR-0020 D1: a VERIFIED result names its
-// assumptions). Ids are referenced from each result; texts are listed once per report.
-function assumptionIds(): string[] {
-  return ["A-INT", "A-DIV", "A-PARTIAL"];
-}
-
-function assumptionTexts(): string[] {
-  return [
-    "integers are unbounded: no i64 overflow occurs on the paths that return",
-    "no division or remainder by zero occurs on the paths that return",
-    "partial correctness: the function is assumed to return (termination is not proved)"
-  ];
-}
-
-function assumptionsOf(r: Res): string[] {
-  if (r.status == "VERIFIED") {
-    return assumptionIds();
-  }
-  const none: string[] = [];
-  return none;
-}
-
-function jsonWarn(w: QWarn): string {
-  return "{\"code\":" + jsonString(w.code) + ",\"function\":" + jsonString(w.fn) + ",\"file\":" + jsonString(w.file)
-    + ",\"line\":" + w.line.toString() + ",\"kind\":" + jsonString(w.kind) + ",\"clause\":" + jsonString(w.clause)
-    + ",\"message\":" + jsonString(w.message) + ",\"status\":" + jsonString(w.status) + ",\"assumptions\":[],\"action\":\"STRENGTHEN_SPEC\"}";
-}
-
-function count(rs: Res[], status: string): usize {
-  let n: usize = 0;
-  for (const r of rs) {
-    if (r.status == status) {
-      n += 1;
-    }
-  }
-  return n;
-}
-
-export function reportJson(rep: Report): string {
-  let items: string[] = [];
-  for (const r of rep.results) {
-    items.push(jsonRes(r));
-  }
-  let warns: string[] = [];
-  for (const w of rep.warnings) {
-    warns.push(jsonWarn(w));
-  }
-  return "{\"results\":[" + items.join(",") + "],\"assumptions\":[" + assumptionsJson() + "],\"warnings\":[" + warns.join(",")
-    + "],\"summary\":{\"verified\":" + count(rep.results, "VERIFIED").toString()
-    + ",\"refuted\":" + count(rep.results, "REFUTED").toString() + ",\"unknown\":" + count(rep.results, "UNKNOWN").toString() + "}}";
-}
-
-export function reportText(rep: Report): string {
-  let lines: string[] = [];
-  for (const r of rep.results) {
-    let s = r.status + "  " + r.fn + ": " + r.clause + "  (" + r.file + ":" + r.line.toString() + ")";
-    if (r.reason != "") {
-      s += "\n    reason: " + r.reason;
-    }
-    if (r.cex.length > 0) {
-      s += "\n    counterexample: " + r.cex.join(", ");
-    }
-    if (actionOf(r) != "") {
-      s += "\n    action: " + actionOf(r);
-    }
-    if (questionOf(r) != "") {
-      s += "\n    question: " + questionOf(r);
-      let k: usize = 1;
-      for (const o of optionsOf(r)) {
-        s += "\n    option " + k.toString() + ": " + o.edit + " (changes_spec: " + jsonBool(o.changesSpec) + ", widens_authority: " + jsonBool(o.widensAuthority) + ")";
-        k += 1;
-      }
-    }
-    for (const c of candidatesOf(r)) {
-      s += "\n    candidate: " + c;
-    }
-    lines.push(s);
-  }
-  if (count(rep.results, "VERIFIED") > 0) {
-    lines.push("VERIFIED holds under these assumptions:");
-    const ids = assumptionIds();
-    const texts = assumptionTexts();
-    let i: usize = 0;
-    while (i < ids.length) {
-      lines.push("  " + ids[i] + ": " + texts[i]);
-      i += 1;
-    }
-  }
-  for (const w of rep.warnings) {
-    lines.push("warning[" + w.code + "]  " + w.fn + ": " + w.clause + "  (" + w.file + ":" + w.line.toString() + ")\n    " + w.message + "\n    action: STRENGTHEN_SPEC");
-  }
-  lines.push("verified " + count(rep.results, "VERIFIED").toString() + ", refuted " + count(rep.results, "REFUTED").toString()
-    + ", unknown " + count(rep.results, "UNKNOWN").toString());
-  return lines.join("\n");
-}
-
-export function failedCount(rep: Report): usize {
-  return count(rep.results, "REFUTED");
-}
-
-export function unknownCount(rep: Report): usize {
-  return count(rep.results, "UNKNOWN");
 }

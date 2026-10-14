@@ -1,0 +1,110 @@
+// S-expressions of the solver's replies (the `(get-value ..)` answer of a counterexample).
+
+export type Sx = SAtom(string) | SList(Sx[]);
+
+function isSpace(c: usize): bool {
+  return c == 32 || c == 10 || c == 13 || c == 9;
+}
+
+// Parses one S-expression. None when the text is not a single well-formed one (unbalanced parentheses, empty).
+export function parseSx(text: string): Option<Sx> {
+  let stack: Sx[][] = [];
+  let done: Option<Sx> = None;
+  let i: usize = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text.charCodeAt(i).toUsize();
+    if (isSpace(c)) {
+      i += 1;
+    } else if (c == 40) {
+      const fresh: Sx[] = [];
+      stack.push(fresh);
+      i += 1;
+    } else if (c == 41) {
+      if (stack.length == 0) {
+        return None;
+      }
+      const items = stack.pop().unwrap();
+      const node = SList(items);
+      if (stack.length == 0) {
+        if (done.isSome()) {
+          return None;
+        }
+        done = Some(node);
+      } else {
+        let top = stack.pop().unwrap();
+        top.push(node);
+        stack.push(top);
+      }
+      i += 1;
+    } else {
+      let j = i;
+      while (j < n && !isSpace(text.charCodeAt(j).toUsize()) && text.charCodeAt(j) != 40 && text.charCodeAt(j) != 41) {
+        j += 1;
+      }
+      const atom = SAtom(text.substring(i, j));
+      if (stack.length == 0) {
+        if (done.isSome()) {
+          return None;
+        }
+        done = Some(atom);
+      } else {
+        let top = stack.pop().unwrap();
+        top.push(atom);
+        stack.push(top);
+      }
+      i = j;
+    }
+  }
+  if (stack.length != 0) {
+    return None;
+  }
+  return done;
+}
+
+// A solver value as source-like text: `5`, `(- 5)` -> `-5`, `true`; anything else flattened.
+export function valueText(x: Sx): string {
+  return match (x) {
+    SAtom(a) => a,
+    SList(items) => {
+      if (items.length == 2) {
+        const head = valueText(items[0]);
+        if (head == "-") {
+          return "-" + valueText(items[1]);
+        }
+      }
+      return "(" + items.map(it => valueText(it)).join(" ") + ")";
+    }
+  };
+}
+
+// The values of a `(get-value (t1 .. tn))` reply `((t1 v1) .. (tn vn))`, in order; empty when the reply is
+// not of that shape (for example an error because no model exists).
+export function replyValues(reply: string): string[] {
+  let out: string[] = [];
+  const p = parseSx(reply);
+  if (p.isNone()) {
+    return out;
+  }
+  return match (p.unwrap()) {
+    SList(pairs) => {
+      for (const pr of pairs) {
+        match (pr) {
+          SList(kv) => {
+            if (kv.length != 2) {
+              const none: string[] = [];
+              return none;
+            }
+            out.push(valueText(kv[1]));
+          },
+          _ => {
+            const none2: string[] = [];
+            return none2;
+          }
+        }
+      }
+      return out;
+    },
+    _ => out
+  };
+}
