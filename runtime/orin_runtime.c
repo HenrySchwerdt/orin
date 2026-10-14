@@ -5,8 +5,13 @@
 #include "orin_runtime.h"
 #include "../platform/orin_platform.h"
 
-static int64_t g_live;
-OrinStats orin_stats;
+/* Per-thread heap state (ADR-0017): every task allocates from, and counts in, its own thread-local state, so reference counts
+ * and free lists need no atomics. Moving an object to another task's heap is safe because a block is just malloc memory
+ * (freed on any thread). The process-wide totals of finished tasks are g_fold / g_fold_live. */
+static __thread int64_t g_live;
+__thread OrinStats orin_stats;
+static OrinStats g_fold;
+static int64_t g_fold_live;
 
 /* Accounting helpers: called wherever g_live changes / buffers are (re)allocated. */
 static inline void stat_alloc(uint64_t *kind_counter, uint64_t bytes) {
@@ -29,10 +34,27 @@ static void rep_u(Rep *r, const char *key, uint64_t v) {
     r->n += orin_platform_fmt_u64(r->b + r->n, v);
 }
 
+/* d += s (peaks: the larger one). */
+static void stats_add(OrinStats *d, const OrinStats *s) {
+    d->alloc_string += s->alloc_string, d->alloc_array += s->alloc_array, d->alloc_struct += s->alloc_struct;
+    d->frees += s->frees, d->retains += s->retains, d->releases += s->releases;
+    d->cow_copies += s->cow_copies, d->cow_inplace += s->cow_inplace;
+    d->array_grows += s->array_grows, d->string_grows += s->string_grows;
+    if (s->peak_live_objs > d->peak_live_objs) d->peak_live_objs = s->peak_live_objs;
+    if (s->peak_live_bytes > d->peak_live_bytes) d->peak_live_bytes = s->peak_live_bytes;
+    d->live_bytes += s->live_bytes;
+    d->file_opens += s->file_opens, d->file_closes += s->file_closes;
+    d->transfer_moves += s->transfer_moves, d->transfer_copies += s->transfer_copies, d->tasks_spawned += s->tasks_spawned;
+}
+
 static void stats_report(void) {
     const char *e = orin_platform_getenv("ORIN_STATS");
     if (!e || e[0] != '1' || e[1] != 0) return;
-    const OrinStats *s = &orin_stats;
+    OrinStats tot = orin_stats;
+    orin_platform_runtime_lock();
+    stats_add(&tot, &g_fold);
+    orin_platform_runtime_unlock();
+    const OrinStats *s = &tot;
     Rep r = {{0}, 0};
     rep_s(&r, "{\"orin_stats\":");
     rep_u(&r, "{\"alloc_string\":", s->alloc_string);
@@ -50,12 +72,20 @@ static void stats_report(void) {
     rep_u(&r, ",\"peak_live_bytes\":", s->peak_live_bytes);
     rep_u(&r, ",\"file_opens\":", s->file_opens);
     rep_u(&r, ",\"file_closes\":", s->file_closes);
+    rep_u(&r, ",\"transfer_moves\":", s->transfer_moves);
+    rep_u(&r, ",\"transfer_copies\":", s->transfer_copies);
+    rep_u(&r, ",\"tasks_spawned\":", s->tasks_spawned);
     rep_s(&r, ",\"live_objs_at_exit\":");
-    r.n += orin_platform_fmt_i64(r.b + r.n, g_live);
+    r.n += orin_platform_fmt_i64(r.b + r.n, orin_live_count());
     rep_s(&r, "}}");
     orin_platform_write_line(ORIN_PLATFORM_STDERR, r.b, r.n);
 }
-int64_t orin_live_count(void) { return g_live; }
+int64_t orin_live_count(void) {
+    orin_platform_runtime_lock();
+    int64_t folded = g_fold_live;
+    orin_platform_runtime_unlock();
+    return g_live + folded;
+}
 
 static void files_at_exit(void);
 
@@ -67,7 +97,11 @@ void orin_init(int argc, char **argv) {
 
 void orin_flush(void) { orin_platform_flush(); }
 
+static int task_active(void);
+static void task_trap(const char *msg) __attribute__((noreturn));
+
 void orin_trap(const char *msg) {
+    if (task_active()) task_trap(msg); /* a trap on a task thread ends that task only; the joiner traps (ADR-0017) */
     size_t n = 0;
     while (msg[n]) n++;
     enum { MAX = 480 };
@@ -94,8 +128,8 @@ void orin_trap(const char *msg) {
 #ifndef ORIN_NO_FREELIST
 enum { FL_STRUCT_CLASSES = 9 }; /* nslots 0..8 */
 typedef struct FreeNode { struct FreeNode *next; } FreeNode;
-static FreeNode *fl_struct[FL_STRUCT_CLASSES];
-static FreeNode *fl_array;
+static __thread FreeNode *fl_struct[FL_STRUCT_CLASSES];
+static __thread FreeNode *fl_array;
 #endif
 
 static void *xmalloc(size_t n) {
@@ -111,11 +145,13 @@ static void *xrealloc(void *q, size_t n) {
 
 /* ---------------------------------------------------------------- destroy */
 
+static __thread OrinObj **t_dstack; /* the work stack of orin_destroy: per task, freed when the task ends */
+static __thread size_t t_dcap;
+
 void orin_destroy(OrinObj *o) {
     /* Iterative so that long chains (lists, deep trees) cannot overflow the C stack. */
-    static OrinObj **stack;
-    static size_t sp, scap;
-    sp = 0;
+    OrinObj **stack = t_dstack;
+    size_t scap = t_dcap, sp = 0;
 #define PUSH(x)                                                                                 \
     do {                                                                                        \
         if (sp == scap) {                                                                       \
@@ -173,6 +209,8 @@ void orin_destroy(OrinObj *o) {
         g_live--;
         orin_stats.frees++;
     }
+    t_dstack = stack;
+    t_dcap = scap;
 #undef PUSH
 #undef DEC
 }
@@ -202,19 +240,30 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     return &s->h;
 }
 
+/* The immortal singletons are shared by all tasks (never counted, never freed, never written after creation): created on
+ * first use and published with a compare-and-swap, the loser frees its copy. */
 OrinObj *orin_nullary(uint32_t tag) {
     enum { N = 1024 };
     static OrinObj *tbl[N];
     if (tag >= N) orin_trap("variant tag too large");
-    if (!tbl[tag]) {
-        OrinObj *o = orin_struct_new(tag, 0, 0);
-        o->rc = -1;
-        g_live--; /* immortal: not counted */
-        orin_stats.alloc_struct--;
-        orin_stats.live_bytes -= sizeof(OrinStruct);
-        tbl[tag] = o;
+    OrinObj *o = __atomic_load_n(&tbl[tag], __ATOMIC_ACQUIRE);
+    if (!o) {
+        OrinStruct *s = (OrinStruct *)xmalloc(sizeof(OrinStruct));
+        s->h.rc = -1;
+        s->h.kind = ORIN_K_STRUCT;
+        s->h.tag = tag;
+        s->nslots = 0;
+        s->pad = 0;
+        s->refmask = 0;
+        OrinObj *none = NULL;
+        if (__atomic_compare_exchange_n(&tbl[tag], &none, &s->h, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            o = &s->h;
+        } else {
+            orin_platform_free(s);
+            o = none;
+        }
     }
-    return tbl[tag];
+    return o;
 }
 
 void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
@@ -345,18 +394,26 @@ int64_t orin_str_eq(OrinObj *a, OrinObj *b) {
     return x->len == y->len && orin_platform_mem_cmp(x->data, y->data, x->len) == 0;
 }
 
-static OrinObj *char_string(unsigned c) {
+static OrinObj *char_string(unsigned c) { /* shared immortals, published like orin_nullary's */
     static OrinObj *tbl[256];
-    if (!tbl[c]) {
-        char ch = (char)c;
-        OrinObj *o = orin_str_new(&ch, 1);
-        o->rc = -1;
-        g_live--;
-        orin_stats.alloc_string--;
-        orin_stats.live_bytes -= sizeof(OrinString) + 2;
-        tbl[c] = o;
+    OrinObj *o = __atomic_load_n(&tbl[c], __ATOMIC_ACQUIRE);
+    if (!o) {
+        OrinString *s = (OrinString *)xmalloc(sizeof(OrinString) + 2);
+        s->h.rc = -1;
+        s->h.kind = ORIN_K_STRING;
+        s->h.tag = 0;
+        s->len = s->cap = 1;
+        s->data[0] = (char)c;
+        s->data[1] = 0;
+        OrinObj *none = NULL;
+        if (__atomic_compare_exchange_n(&tbl[c], &none, &s->h, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            o = &s->h;
+        } else {
+            orin_platform_free(s);
+            o = none;
+        }
     }
-    return tbl[c];
+    return o;
 }
 
 OrinObj *orin_str_char_at(OrinObj *s, uint64_t i) {
@@ -807,8 +864,9 @@ typedef struct {
     char *rscope;  /* the same with every symbolic link resolved */
     size_t rlen;
 } Grant;
-static Grant g_grants[GR_SLOTS];
-static unsigned g_deny;
+static __thread Grant g_grants[GR_SLOTS]; /* per task: a handle is only meaningful in the task that made it */
+static unsigned g_deny;                    /* written once by orin_cap_host_root before any task exists */
+static uint64_t cap_tid(void) { return orin_platform_thread_id() & 0x3fffff; }
 
 static const char *kind_name(int k) {
     return k == GK_FS ? "fs" : k == GK_PROCESS ? "process" : k == GK_STDIO ? "stdio" : k == GK_CLOCK ? "clock" : "host";
@@ -846,17 +904,18 @@ static Grant *grant_new(int kind) {
     orin_trap("too many active capability grants");
 }
 
+/* GRANT_TAG | task id << 41 | generation (32 bits) << 8 | slot */
 static int64_t grant_handle(const Grant *g) {
-    return GRANT_TAG | (int64_t)(g->gen << 8) | (int64_t)(g - g_grants);
+    return GRANT_TAG | (int64_t)(cap_tid() << 41) | (int64_t)((g->gen & 0xffffffffu) << 8) | (int64_t)(g - g_grants);
 }
 
 /* The live grant named by h, of kind `kind` (kind < 0: any kind); traps on anything else (forged, revoked, stale,
  * wrong kind). */
 static Grant *grant_ref(int64_t h, int kind) {
-    if ((h & ~(GRANT_TAG - 1)) == GRANT_TAG) {
-        uint64_t idx = (uint64_t)h & 255, gen = ((uint64_t)h & ((uint64_t)GRANT_TAG - 1)) >> 8;
+    if (h > 0 && ((uint64_t)h & (uint64_t)GRANT_TAG) && ((uint64_t)h >> 41) == cap_tid()) {
+        uint64_t idx = (uint64_t)h & 255, gen = ((uint64_t)h >> 8) & 0xffffffffu;
         Grant *g = &g_grants[idx];
-        if (g->live && g->gen == gen && (kind < 0 || g->kind == kind)) return g;
+        if (g->live && (g->gen & 0xffffffffu) == gen && (kind < 0 || g->kind == kind)) return g;
     }
     orin_trap("invalid capability grant (forged, revoked, or of the wrong kind)");
 }
@@ -902,13 +961,8 @@ static char *dup_cstr(const char *s, size_t n) {
     return d;
 }
 
-/* op 0: fs under(path); op 1: fs readOnly; op 2: process argsOnly. A narrowed grant never has more authority than
- * its parent: the new scope is used only when it lies inside the parent's (else the parent's, if that is
- * narrower, else nothing). */
-int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg) {
-    if (op < 0 || op > 2) orin_trap("invalid capability narrowing");
-    Grant *p = grant_ref(parent, op == 2 ? GK_PROCESS : GK_FS);
-    Grant *g = grant_new(p->kind);
+/* g gets the authority of p (same flags, same scope). */
+static void grant_copy_into(Grant *g, const Grant *p) {
     g->denied = p->denied;
     g->readonly = p->readonly;
     g->nospawn = p->nospawn;
@@ -919,6 +973,16 @@ int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg) {
         g->rscope = dup_cstr(p->rscope, p->rlen);
         g->rlen = p->rlen;
     }
+}
+
+/* op 0: fs under(path); op 1: fs readOnly; op 2: process argsOnly. A narrowed grant never has more authority than
+ * its parent: the new scope is used only when it lies inside the parent's (else the parent's, if that is
+ * narrower, else nothing). */
+int64_t orin_cap_narrow(int64_t parent, int64_t op, OrinObj *arg) {
+    if (op < 0 || op > 2) orin_trap("invalid capability narrowing");
+    Grant *p = grant_ref(parent, op == 2 ? GK_PROCESS : GK_FS);
+    Grant *g = grant_new(p->kind);
+    grant_copy_into(g, p);
     if (op == 1) g->readonly = 1;
     if (op == 2) g->nospawn = 1;
     if (op == 0 && !g->empty) {
@@ -1021,7 +1085,7 @@ typedef struct {
     int mode;                /* ORIN_PLATFORM_STREAM_* */
     int err;                 /* first runtime-detected error (wrong mode); 0 = none */
 } FileSlot;
-static FileSlot g_files[FILE_SLOTS];
+static __thread FileSlot g_files[FILE_SLOTS]; /* per task, like the grants; a task's open files are closed when it ends */
 
 static void files_at_exit(void) {
     for (int i = 0; i < FILE_SLOTS; i++) {
@@ -1221,3 +1285,393 @@ OrinObj *orin_process_args(int64_t gh) {
 }
 
 void orin_process_exit(int64_t code) { orin_platform_exit((int)code); }
+
+/* ================================================================ tasks and transfer (ADR-0017 stage 0)
+ * TEMPORARY C (spec 19 R3, docs/concurrency.md "Porting table"): everything between this banner and the end of the
+ * file needs the object model (reference counts, struct / array / string layout, thread-local free lists) and
+ * therefore cannot be written in Orin before R3. It is ONE small interface: orin_rt_transfer_* (move or deep copy
+ * of a value between task heaps), orin_rt_task_* (start / join / trap of a task), orin_rt_heap_* (the per-thread
+ * allocator state), plus forwarders that trap on a failed L0 call (orin_mon_*). Each function maps 1:1 onto a planned
+ * Orin core-dialect function; no logic of the task library (scheduler bookkeeping, channels, scopes) lives here:
+ * that is std:task (stdlib/task.or). Every task owns its heap: reference counts stay NON-atomic because an object
+ * graph is only ever reachable from one thread at a time (a transfer moves a uniquely owned graph, or copies). */
+
+/* Transfer slots: a value in flight between two tasks, owned by nobody. A token is `generation << 32 | (index + 1)`. */
+typedef struct {
+    OrinObj *box; /* NULL = free */
+    uint32_t gen, next;
+} TrSlot;
+static TrSlot *g_tr;
+static uint32_t g_tr_n, g_tr_cap, g_tr_free; /* g_tr_free: 1-based head of the free list, 0 = empty */
+
+static uint64_t tr_publish(OrinObj *box) {
+    orin_platform_runtime_lock();
+    if (!g_tr_free && g_tr_n == g_tr_cap) {
+        uint32_t cap = g_tr_cap ? g_tr_cap * 2 : 256;
+        TrSlot *t = (TrSlot *)orin_platform_realloc(g_tr, (size_t)cap * sizeof(TrSlot));
+        if (!t) {
+            orin_platform_runtime_unlock();
+            orin_trap("out of memory");
+        }
+        g_tr = t;
+        g_tr_cap = cap;
+    }
+    uint32_t i;
+    if (g_tr_free) {
+        i = g_tr_free - 1;
+        g_tr_free = g_tr[i].next;
+    } else {
+        i = g_tr_n++;
+        g_tr[i].gen = 0;
+    }
+    g_tr[i].box = box;
+    g_tr[i].gen++;
+    uint64_t tok = ((uint64_t)g_tr[i].gen << 32) | (i + 1);
+    orin_platform_runtime_unlock();
+    return tok;
+}
+
+static OrinObj *tr_claim(uint64_t tok) {
+    uint32_t i = (uint32_t)(tok & 0xffffffffu) - 1u;
+    orin_platform_runtime_lock();
+    if (tok == 0 || i >= g_tr_n || !g_tr[i].box || g_tr[i].gen != (uint32_t)(tok >> 32)) {
+        orin_platform_runtime_unlock();
+        orin_trap("invalid transfer token (taken twice, dropped, or forged)");
+    }
+    OrinObj *b = g_tr[i].box;
+    g_tr[i].box = NULL;
+    g_tr[i].next = g_tr_free;
+    g_tr_free = i + 1;
+    orin_platform_runtime_unlock();
+    return b;
+}
+
+/* Is every object reachable from `root` referenced exactly once (immortals excepted)? Then the graph has no other
+ * owner in this task and can change hands without copying. Iterative: a long list cannot overflow the C stack. */
+static int graph_unique(OrinObj *root) {
+    if (root->rc != 1) return 0;
+    size_t cap = 64, sp = 0;
+    OrinObj **st = (OrinObj **)xmalloc(cap * sizeof *st);
+    st[sp++] = root;
+    int ok = 1;
+    while (sp && ok) {
+        OrinObj *x = st[--sp];
+        uint64_t *items = NULL;
+        uint64_t n = 0;
+        if (x->kind == ORIN_K_STRUCT) {
+            OrinStruct *s = (OrinStruct *)x;
+            for (uint32_t i = 0; i < s->nslots && ok; i++) {
+                if (!((s->refmask >> i) & 1)) continue;
+                OrinObj *c = ORIN_REF(s->slots[i]);
+                if (!c || c->rc < 0) continue;
+                if (c->rc != 1) {
+                    ok = 0;
+                    break;
+                }
+                if (sp == cap) st = (OrinObj **)xrealloc(st, (cap *= 2) * sizeof *st);
+                st[sp++] = c;
+            }
+        } else if (x->kind == ORIN_K_ARRAY && ((OrinArray *)x)->is_ref) {
+            items = ((OrinArray *)x)->items;
+            n = ((OrinArray *)x)->len;
+            for (uint64_t i = 0; i < n; i++) {
+                OrinObj *c = ORIN_REF(items[i]);
+                if (!c || c->rc < 0) continue;
+                if (c->rc != 1) {
+                    ok = 0;
+                    break;
+                }
+                if (sp == cap) st = (OrinObj **)xrealloc(st, (cap *= 2) * sizeof *st);
+                st[sp++] = c;
+            }
+        }
+    }
+    orin_platform_free(st);
+    return ok;
+}
+
+typedef struct {
+    uint64_t *dst; /* where the copy of `src` has to be stored */
+    OrinObj *src;
+} CopyJob;
+
+/* Deep copy of one object (not of its children): scalars are copied, reference slots get a job. */
+static OrinObj *copy_node(OrinObj *x, CopyJob **jobs, size_t *n, size_t *cap) {
+#define JOB(slotp, child)                                                                       \
+    do {                                                                                        \
+        OrinObj *c_ = (child);                                                                  \
+        if (!c_ || c_->rc < 0) {                                                                \
+            *(slotp) = ORIN_SLOT(c_);                                                           \
+        } else {                                                                                \
+            if (*n == *cap) *jobs = (CopyJob *)xrealloc(*jobs, (*cap *= 2) * sizeof(CopyJob)); \
+            (*jobs)[(*n)++] = (CopyJob){(slotp), c_};                                           \
+        }                                                                                       \
+    } while (0)
+    if (x->kind == ORIN_K_STRING) return orin_str_new(((OrinString *)x)->data, ((OrinString *)x)->len);
+    if (x->kind == ORIN_K_ARRAY) {
+        OrinArray *a = (OrinArray *)x;
+        OrinObj *r = orin_array_new(a->len, (int64_t)a->is_ref);
+        OrinArray *d = (OrinArray *)r;
+        d->len = a->len;
+        for (uint64_t i = 0; i < a->len; i++) {
+            if (a->is_ref) JOB(&d->items[i], ORIN_REF(a->items[i]));
+            else d->items[i] = a->items[i];
+        }
+        return r;
+    }
+    OrinStruct *s = (OrinStruct *)x;
+    OrinObj *r = orin_struct_new(x->tag, s->nslots, s->refmask);
+    OrinStruct *d = (OrinStruct *)r;
+    for (uint32_t i = 0; i < s->nslots; i++) {
+        if ((s->refmask >> i) & 1) JOB(&d->slots[i], ORIN_REF(s->slots[i]));
+        else d->slots[i] = s->slots[i];
+    }
+    return r;
+#undef JOB
+}
+
+static OrinObj *deep_copy(OrinObj *root) {
+    size_t n = 0, cap = 64;
+    CopyJob *jobs = (CopyJob *)xmalloc(cap * sizeof *jobs);
+    OrinObj *r = copy_node(root, &jobs, &n, &cap);
+    while (n) {
+        CopyJob j = jobs[--n];
+        *j.dst = ORIN_SLOT(copy_node(j.src, &jobs, &n, &cap));
+    }
+    orin_platform_free(jobs);
+    return r;
+}
+
+/* Detach the value in `box` (a one-slot record the sender has just built and still owns) and publish it. Moved when
+ * every reference in it is the only one (the sender's own copy is then empty and its release frees only the husk);
+ * deep-copied otherwise. Either way the receiver gets a graph no other task can reach. */
+uint64_t orin_rt_transfer_put(OrinObj *box) {
+    if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 1) orin_trap_shape();
+    OrinStruct *s = (OrinStruct *)box;
+    OrinObj *out;
+    if (!(s->refmask & 1) || !s->slots[0]) {
+        out = orin_struct_new(box->tag, 1, s->refmask);
+        ((OrinStruct *)out)->slots[0] = s->slots[0];
+    } else if (graph_unique(box)) {
+        out = orin_struct_new(box->tag, 1, s->refmask);
+        ((OrinStruct *)out)->slots[0] = s->slots[0];
+        s->slots[0] = 0;
+        orin_stats.transfer_moves++;
+    } else {
+        out = deep_copy(box);
+        orin_stats.transfer_copies++;
+    }
+    return tr_publish(out);
+}
+
+OrinObj *orin_rt_transfer_take(uint64_t tok) { return tr_claim(tok); }
+void orin_rt_transfer_drop(uint64_t tok) { orin_release(tr_claim(tok)); }
+uint64_t orin_rt_transfer_count(uint64_t which) {
+    return which == 0 ? orin_stats.transfer_moves : which == 1 ? orin_stats.transfer_copies : 0;
+}
+
+/* ---------------------------------------------------------------- tasks */
+
+enum { TASK_MSG = 480 };
+typedef struct {
+    uint64_t tok;       /* the transfer token of the task body (a closure) */
+    int trapped;        /* written by the task thread, read after the join */
+    char msg[TASK_MSG]; /* the trap message */
+} RtTask;
+static __thread RtTask *t_task;                        /* the task this thread runs, NULL on the main thread */
+static __thread char t_joined_msg[TASK_MSG + 1];       /* message of the task joined last by this thread */
+
+/* A task's heap ends: close what it left open, return its free lists to the allocator, fold its counters. */
+void orin_rt_heap_exit(void) {
+    for (int i = 0; i < GR_SLOTS; i++)
+        if (g_grants[i].live) orin_cap_revoke(grant_handle(&g_grants[i]));
+    files_at_exit();
+    orin_platform_free(t_dstack);
+    t_dstack = NULL;
+    t_dcap = 0;
+#ifndef ORIN_NO_FREELIST
+    for (int c = 0; c < FL_STRUCT_CLASSES; c++)
+        while (fl_struct[c]) {
+            FreeNode *n = fl_struct[c];
+            fl_struct[c] = n->next;
+            orin_platform_free(n);
+        }
+    while (fl_array) {
+        FreeNode *n = fl_array;
+        fl_array = n->next;
+        orin_platform_free(n);
+    }
+#endif
+    orin_platform_runtime_lock();
+    g_fold_live += g_live;
+    stats_add(&g_fold, &orin_stats);
+    orin_platform_runtime_unlock();
+}
+
+static int task_active(void) { return t_task != NULL; }
+
+/* Called by orin_trap on a task thread: record the message, end the task, never return. */
+static void task_trap(const char *msg) {
+    size_t n = 0;
+    while (msg[n] && n < TASK_MSG - 1) n++;
+    orin_platform_mem_copy(t_task->msg, msg, n);
+    t_task->msg[n] = 0;
+    t_task->trapped = 1;
+    orin_rt_heap_exit();
+    orin_platform_thread_exit();
+}
+
+static void task_main(void *p) {
+    RtTask *t = (RtTask *)p;
+    t_task = t;
+    OrinObj *box = tr_claim(t->tok);
+    OrinStruct *clo = (OrinStruct *)ORIN_REF(((OrinStruct *)box)->slots[0]);
+    ((void (*)(OrinObj *))(uintptr_t)clo->slots[0])(ORIN_REF(clo->slots[1])); /* closure layout: docs/mir.md v1.3 */
+    orin_release(box);
+    orin_rt_heap_exit();
+}
+
+uint64_t orin_rt_task_spawn(uint64_t tok) {
+    RtTask *t = (RtTask *)xmalloc(sizeof *t);
+    t->tok = tok;
+    t->trapped = 0;
+    t->msg[0] = 0;
+    int64_t h = orin_platform_thread_create(task_main, t);
+    if (!h) {
+        orin_platform_free(t);
+        orin_rt_transfer_drop(tok);
+        orin_trap("cannot start a task (thread limit reached)");
+    }
+    orin_stats.tasks_spawned++;
+    return (uint64_t)h;
+}
+
+/* Waits for the task to end. 0: it returned; 1: it trapped (the message is kept for orin_rt_task_message). */
+uint64_t orin_rt_task_join(uint64_t h) {
+    void *arg = NULL;
+    if (orin_platform_thread_join((int64_t)h, &arg) != 0) orin_trap("invalid task handle (joined twice, or forged)");
+    RtTask *t = (RtTask *)arg;
+    uint64_t st = (uint64_t)t->trapped;
+    orin_platform_mem_copy(t_joined_msg, t->msg, TASK_MSG);
+    t_joined_msg[TASK_MSG] = 0;
+    orin_platform_free(t);
+    return st;
+}
+
+OrinObj *orin_rt_task_message(void) {
+    size_t n = 0;
+    while (t_joined_msg[n]) n++;
+    return orin_str_new(t_joined_msg, n);
+}
+
+/* ---------------------------------------------------------------- monitors (forwarders to L0 that trap on failure) */
+
+static void mon_check(int rc) {
+    if (rc == 0) return;
+    if (rc == ORIN_PLATFORM_EDEADLK) orin_trap("monitor locked twice by the same task");
+    if (rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    orin_trap("invalid monitor operation (stale handle, lock not held, or index out of range)");
+}
+uint64_t orin_mon_new(uint64_t n) {
+    int64_t h = orin_platform_monitor_new((size_t)n);
+    if (!h) orin_trap("cannot create a monitor (limit reached)");
+    return (uint64_t)h;
+}
+void orin_mon_free(uint64_t m) { mon_check(orin_platform_monitor_free((int64_t)m)); }
+void orin_mon_lock(uint64_t m) { mon_check(orin_platform_monitor_lock((int64_t)m)); }
+void orin_mon_unlock(uint64_t m) { mon_check(orin_platform_monitor_unlock((int64_t)m)); }
+void orin_mon_wait(uint64_t m) { mon_check(orin_platform_monitor_wait((int64_t)m)); }
+void orin_mon_notify_all(uint64_t m) { mon_check(orin_platform_monitor_notify_all((int64_t)m)); }
+uint64_t orin_mon_get(uint64_t m, uint64_t i) {
+    uint64_t v = 0;
+    mon_check(orin_platform_monitor_get((int64_t)m, (size_t)i, &v));
+    return v;
+}
+void orin_mon_set(uint64_t m, uint64_t i, uint64_t v) { mon_check(orin_platform_monitor_set((int64_t)m, (size_t)i, v)); }
+void orin_mon_grow(uint64_t m, uint64_t n) { mon_check(orin_platform_monitor_grow((int64_t)m, (size_t)n)); }
+
+void orin_rt_trap_str(OrinObj *msg) {
+    char buf[TASK_MSG];
+    size_t n = (size_t)orin_str_len(msg);
+    if (n > TASK_MSG - 1) n = TASK_MSG - 1;
+    orin_platform_mem_copy(buf, orin_str_data(msg), n);
+    buf[n] = 0;
+    orin_trap(buf);
+}
+
+/* ---------------------------------------------------------------- grants moving into a task (ADR-0017, ADR-0027 Q10) */
+
+typedef struct {
+    Grant g; /* the detached grant: its scope strings belong to the slot until adopted */
+    uint32_t gen, next;
+    int used;
+} GrantFlight;
+static GrantFlight *g_gf;
+static uint32_t g_gf_n, g_gf_cap, g_gf_free;
+
+int64_t orin_cap_clone(int64_t h) {
+    Grant *p = grant_ref(h, -1);
+    if (p->kind < GK_FS || p->kind > GK_CLOCK) orin_trap("only a grant of a family (fs, process, stdio, clock) can be delegated to a task");
+    Grant *g = grant_new(p->kind);
+    grant_copy_into(g, p);
+    return grant_handle(g);
+}
+
+uint64_t orin_cap_move(int64_t h) {
+    Grant *g = grant_ref(h, -1);
+    orin_platform_runtime_lock();
+    if (!g_gf_free && g_gf_n == g_gf_cap) {
+        uint32_t cap = g_gf_cap ? g_gf_cap * 2 : 16;
+        GrantFlight *t = (GrantFlight *)orin_platform_realloc(g_gf, (size_t)cap * sizeof(GrantFlight));
+        if (!t) {
+            orin_platform_runtime_unlock();
+            orin_trap("out of memory");
+        }
+        g_gf = t;
+        g_gf_cap = cap;
+    }
+    uint32_t i;
+    if (g_gf_free) {
+        i = g_gf_free - 1;
+        g_gf_free = g_gf[i].next;
+    } else {
+        i = g_gf_n++;
+        g_gf[i].gen = 0;
+    }
+    g_gf[i].g = *g;
+    g_gf[i].used = 1;
+    g_gf[i].gen++;
+    uint64_t tok = ((uint64_t)g_gf[i].gen << 32) | (i + 1);
+    orin_platform_runtime_unlock();
+    g->scope = g->rscope = NULL; /* the strings travel with the token */
+    g->live = 0;
+    return tok;
+}
+
+static int64_t cap_adopt(uint64_t tok, int kind) {
+    uint32_t i = (uint32_t)(tok & 0xffffffffu) - 1u;
+    orin_platform_runtime_lock();
+    if (tok == 0 || i >= g_gf_n || !g_gf[i].used || g_gf[i].gen != (uint32_t)(tok >> 32)) {
+        orin_platform_runtime_unlock();
+        orin_trap("invalid grant token (adopted twice, or forged)");
+    }
+    Grant d = g_gf[i].g;
+    g_gf[i].used = 0;
+    g_gf[i].next = g_gf_free;
+    g_gf_free = i + 1;
+    orin_platform_runtime_unlock();
+    if (d.kind != kind) {
+        orin_platform_free(d.scope);
+        orin_platform_free(d.rscope);
+        orin_trap("grant token adopted as the wrong family");
+    }
+    Grant *g = grant_new(kind);
+    d.gen = g->gen;
+    *g = d;
+    g->live = 1;
+    return grant_handle(g);
+}
+int64_t orin_cap_adopt_fs(uint64_t t) { return cap_adopt(t, GK_FS); }
+int64_t orin_cap_adopt_process(uint64_t t) { return cap_adopt(t, GK_PROCESS); }
+int64_t orin_cap_adopt_stdio(uint64_t t) { return cap_adopt(t, GK_STDIO); }
+int64_t orin_cap_adopt_clock(uint64_t t) { return cap_adopt(t, GK_CLOCK); }

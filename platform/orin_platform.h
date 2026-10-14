@@ -5,9 +5,10 @@
  * Adding a function needs an ADR.
  *
  * Rules for this layer: no data structures (one opaque OS handle type, `orin_platform_stream`, excepted),
- * no global state beyond argc/argv, no knowledge of Orin
- * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 lines including
- * comments. Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
+ * no global state beyond argc/argv, the stdout lock and the thread / monitor tables, no knowledge of Orin
+ * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 CODE lines (blank lines,
+ * comments and contract blocks do not count: tools/verify_platform.sh). Thread-safe except where said otherwise
+ * (ADR-0017 stage 0: threads and monitors below).
  *
  * CONTRACT FORMAT. Every function carries one ACSL-style block, machine readable (a leading
  * slash-star-at marker; clauses `requires`, `ensures`, `assigns`, each ending in `;`):
@@ -30,6 +31,7 @@
 #ifndef ORIN_PLATFORM_H
 #define ORIN_PLATFORM_H
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -43,6 +45,8 @@ extern "C" {
 #define ORIN_PLATFORM_STDERR 2  /* writing flushes stdout first, then flushes stderr */
 #define ORIN_PLATFORM_EINVAL 22 /* path contains a NUL byte (same value on Linux and macOS) */
 #define ORIN_PLATFORM_ENOMEM 12
+#define ORIN_PLATFORM_EBUSY 16
+#define ORIN_PLATFORM_EDEADLK EDEADLK /* a monitor locked twice by the same thread (35 on Linux, 11 on macOS) */
 
 /* ================================================================ memory
  * Defined inline in this header so the hot paths of the runtime keep inlining them; the
@@ -162,6 +166,94 @@ int64_t orin_platform_shell(const char *cmd, size_t n);
 /*@ ensures \result is the wall-clock time in milliseconds since the Unix epoch (CLOCK_REALTIME);
     assigns \nothing; */
 int64_t orin_platform_now_millis(void);
+
+
+/* ================================================================ threads and monitors (ADR-0017 stage 0)
+ * The only primitives of concurrency, and they stay in C: create / join / end an operating-system thread, and a
+ * MONITOR = a mutex, a condition variable and an array of 64-bit words that can be read and written only while
+ * the calling thread holds the mutex. Everything above them (tasks, scopes, channels, results) is Orin (std:task).
+ * Handles are 64-bit values `generation << 32 | (index + 1)` and are VALIDATED on every call: a stale (already freed or
+ * joined), forged or foreign handle is refused with ORIN_PLATFORM_EINVAL, never dereferenced; records are recycled, not
+ * freed, so a lookup never touches freed memory. Contract status: tested only (platform/tests/platform_test.c, plain,
+ * ASan+UBSan and ThreadSanitizer; tools/verify_platform.sh); CBMC cannot model threads. All other functions of this
+ * layer may now be called from several threads at the same time unless said otherwise; the stdout buffer is serialised
+ * inside orin_platform_write / write_line / flush. */
+
+/*@ ensures \result >= 1, unique among all threads of the process, constant for the calling thread (the first
+            caller, normally the main thread, gets 1);
+    assigns \nothing (a thread-local cache); */
+uint64_t orin_platform_thread_id(void);
+
+/*@ requires entry is a function that may run on another thread; arg is whatever entry expects (the layer never reads it);
+    ensures \result == 0 ==> no thread was started (limit of 65,536 live threads or the OS refused) and nothing needs cleaning;
+    ensures \result > 0 ==> a new thread runs entry(arg); the handle must be passed to orin_platform_thread_join exactly once;
+    assigns \process; */
+int64_t orin_platform_thread_create(void (*entry)(void *), void *arg);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is not a live, not yet joined handle (stale, forged, joined twice,
+            being joined by another thread); nothing happens;
+    ensures \result == 0 ==> the thread has ended (returned from entry or called orin_platform_thread_exit), *arg is the
+            `arg` given to create, all of the thread's writes are visible to the caller, h is dead afterwards;
+    assigns *arg, \process; */
+int orin_platform_thread_join(int64_t h, void **arg);
+
+/*@ requires the calling thread was started by orin_platform_thread_create;
+    ensures every monitor the calling thread holds is unlocked (a thread that ends abnormally never leaves a lock held);
+    ensures the thread ends and is joinable; never returns;
+    assigns \process; */
+void orin_platform_thread_exit(void) __attribute__((noreturn));
+
+/*@ ensures \result == 0 ==> no monitor could be made (limit of 262,144 live monitors, or no memory);
+    ensures \result > 0 ==> a monitor with nwords words, all 0, unlocked; free it with orin_platform_monitor_free;
+    assigns \process; */
+int64_t orin_platform_monitor_new(size_t nwords);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is stale or forged;
+    ensures \result == ORIN_PLATFORM_EBUSY ==> the monitor is locked or a thread waits on it; nothing happens;
+    ensures \result == 0 ==> h is dead (its words are gone), a later use of h returns ORIN_PLATFORM_EINVAL;
+    assigns the monitor; */
+int orin_platform_monitor_free(int64_t h);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is stale or forged;
+    ensures \result == ORIN_PLATFORM_EDEADLK ==> the calling thread already holds the monitor (no relock);
+    ensures \result == 0 ==> the calling thread holds the monitor (blocking until it was free);
+    assigns the monitor; */
+int orin_platform_monitor_lock(int64_t h);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is stale or forged, or the calling thread does not hold it;
+    ensures \result == 0 ==> the monitor is free; the caller's writes are visible to the next thread that locks it;
+    assigns the monitor; */
+int orin_platform_monitor_unlock(int64_t h);
+
+/*@ requires as unlock; ensures \result == 0 ==> the caller released the monitor, slept until another thread called
+            notify_all (or spuriously), and holds the monitor again: re-check the condition in a loop;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> as unlock; assigns the monitor; */
+int orin_platform_monitor_wait(int64_t h);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> every thread waiting on it wakes up (after the caller
+            unlocks); \result == ORIN_PLATFORM_EINVAL ==> as unlock; assigns \nothing; */
+int orin_platform_monitor_notify_all(int64_t h);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> *out is word i; \result == ORIN_PLATFORM_EINVAL ==>
+            stale handle, lock not held, or i >= the number of words; assigns *out; */
+int orin_platform_monitor_get(int64_t h, size_t i, uint64_t *out);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> word i is v; \result == ORIN_PLATFORM_EINVAL ==> as get;
+    assigns the monitor's word i; */
+int orin_platform_monitor_set(int64_t h, size_t i, uint64_t v);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> the monitor has nwords >= its old size words, the old
+            ones unchanged, the new ones 0; \result == ORIN_PLATFORM_EINVAL ==> as get or nwords is smaller than now;
+            \result == ORIN_PLATFORM_ENOMEM ==> nothing changed; assigns the monitor; */
+int orin_platform_monitor_grow(int64_t h, size_t nwords);
+
+/*@ ensures the calling thread holds the one lock of the runtime's own shared tables (transfer slots, the statistics of
+            finished tasks); hold it only for a few instructions and never call a trapping function while holding it;
+    assigns \process; */
+void orin_platform_runtime_lock(void);
+
+/*@ requires the caller holds the runtime lock; ensures it is released; assigns \process; */
+void orin_platform_runtime_unlock(void);
 
 /* ================================================================ floating point text */
 

@@ -3,7 +3,7 @@
 // of range. Each check returns an error message, or "" when the item is well-formed.
 
 import { MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase } from "../mir";
-import { UnOp, BinOp, Builtin } from "../hir";
+import { UnOp, BinOp, Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 
 // Operand/local classes.
 export const CInt: int = 0;
@@ -235,6 +235,7 @@ function takesHandle(b: Builtin): bool {
     BIoShell => true,
     BTimeNowMillis => true,
     BGrantRevoke => true,
+    BTask(k) => taskOpMoves(k),
     BFileIsOpen => true,
     BFileOpenError => true,
     BFileClose => true,
@@ -260,6 +261,16 @@ function isOpenB(b: Builtin): bool {
     BGrantUnder => true,
     BGrantReadOnly => true,
     BGrantArgsOnly => true,
+    BTask(k) => taskOpOpensFrom(k),
+    _ => false
+  };
+}
+
+// The builtins that define a handle from a one-shot token instead of from another handle (ADR-0017: a grant moved into a
+// task is adopted there): no argument is a handle, the destination is.
+function isAdoptB(b: Builtin): bool {
+  return match (b) {
+    BTask(k) => taskOpAdopts(k),
     _ => false
   };
 }
@@ -304,8 +315,8 @@ function handleMsg(f: MFunction, ins: Instr): string {
       if (localClass(f, d) == CHandle) {
         match (ins) {
           IBuiltin(_dst, b, _args) => {
-            if (!isOpenB(b)) {
-              return "IBuiltin: only BFileOpen and the BGrant* builtins may define a resource handle";
+            if (!isOpenB(b) && !isAdoptB(b)) {
+              return "IBuiltin: only BFileOpen, the BGrant* builtins and the task grant primitives (clone, adopt) may define a resource handle";
             }
           },
           _ => { return "a resource handle is defined only by BFileOpen / BGrant* (it cannot be copied, moved, borrowed, read from a field or returned by a call)"; }
@@ -316,6 +327,13 @@ function handleMsg(f: MFunction, ins: Instr): string {
   }
   match (ins) {
     IBuiltin(dst, b, args) => {
+      if (isAdoptB(b)) {
+        if (!noHandles(f, args)) { return "grant adoption: its argument is a token, not a handle"; }
+        match (dst) {
+          Some(d) => { return localClass(f, d) == CHandle ? "" : "grant adoption: the destination must be a handle local"; },
+          None => { return "grant adoption: the handle must be bound to a local (it would never be revoked)"; }
+        }
+      }
       if (isOpenB(b)) {
         if (args.length == 0 || !isHandleOp(f, args[0])) { return "handle-opening builtin: the first argument must be the authorising resource handle (a grant)"; }
         let k: usize = 1;

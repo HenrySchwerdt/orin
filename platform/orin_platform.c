@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -11,6 +12,7 @@
 
 _Static_assert(ORIN_PLATFORM_EINVAL == EINVAL, "EINVAL value");
 _Static_assert(ORIN_PLATFORM_ENOMEM == ENOMEM, "ENOMEM value");
+_Static_assert(ORIN_PLATFORM_EBUSY == EBUSY, "EBUSY value");
 
 /* ---------------------------------------------------------------- memory */
 
@@ -62,13 +64,13 @@ const char *orin_platform_getenv(const char *name) { return getenv(name); }
 int orin_platform_at_exit(void (*fn)(void)) { return atexit(fn); }
 
 void orin_platform_exit(int code) {
-    fflush(stdout);
+    orin_platform_flush();
     exit(code);
 }
 void orin_platform_abort(void) { abort(); }
 
 int64_t orin_platform_shell(const char *cmd, size_t n) {
-    fflush(stdout);
+    orin_platform_flush();
     char *buf = (char *)orin_platform_alloc(n + 1);
     if (!buf) return -1;
     orin_platform_mem_copy(buf, cmd, n);
@@ -231,7 +233,12 @@ double orin_platform_parse_double(const char *s, int is_f32) {
 #define ORIN_PUTC putc
 #endif
 
+/* One lock for the process-wide stdout buffer (and the stderr that must flush it first): tasks may print at the same time
+ * (ADR-0017). Stdin needs none: getc / fread of stdio lock internally. */
+static pthread_mutex_t g_io = PTHREAD_MUTEX_INITIALIZER;
+
 void orin_platform_write(int stream, const char *p, size_t n) {
+    pthread_mutex_lock(&g_io);
     if (stream == ORIN_PLATFORM_STDOUT) {
         if (n) ORIN_FWRITE(p, 1, n, stdout);
     } else {
@@ -239,9 +246,11 @@ void orin_platform_write(int stream, const char *p, size_t n) {
         if (n) fwrite(p, 1, n, stderr);
         fflush(stderr);
     }
+    pthread_mutex_unlock(&g_io);
 }
 
 void orin_platform_write_line(int stream, const char *p, size_t n) {
+    pthread_mutex_lock(&g_io);
     if (stream == ORIN_PLATFORM_STDOUT) {
         if (n) ORIN_FWRITE(p, 1, n, stdout);
         ORIN_PUTC('\n', stdout);
@@ -251,9 +260,14 @@ void orin_platform_write_line(int stream, const char *p, size_t n) {
         fputc('\n', stderr);
         fflush(stderr);
     }
+    pthread_mutex_unlock(&g_io);
 }
 
-void orin_platform_flush(void) { fflush(stdout); }
+void orin_platform_flush(void) {
+    pthread_mutex_lock(&g_io);
+    fflush(stdout);
+    pthread_mutex_unlock(&g_io);
+}
 
 size_t orin_platform_stdin_read(char *buf, size_t n) {
     size_t got = 0;
@@ -442,3 +456,244 @@ int orin_platform_stream_close(orin_platform_stream *s) {
     orin_platform_free(s);
     return err;
 }
+
+/* ---------------------------------------------------------------- threads and monitors (ADR-0017 stage 0) */
+
+/* Handles are `generation << 32 | (index + 1)`; 0 is never valid. Records are recycled, never freed, so a stale
+ * handle is detected by its generation (and a lookup never touches freed memory). g_reg guards the tables'
+ * free lists and high-water marks only; operations on a monitor use the monitor's own mutex. */
+enum { THR_MAX = 1 << 16, MON_MAX = 1 << 18 };
+
+typedef struct Thr {
+    pthread_t th;
+    void (*entry)(void *);
+    void *arg;
+    uint32_t gen;
+    int state; /* 0 free, 1 running or finished and not yet joined, 2 being joined */
+} Thr;
+
+typedef struct Mon {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    uint64_t *w;
+    size_t n;
+    uint64_t owner; /* id of the thread holding mu, 0 = nobody (atomic) */
+    uint32_t gen;
+    uint32_t waiters;
+    int live; /* atomic */
+} Mon;
+
+static pthread_mutex_t g_reg = PTHREAD_MUTEX_INITIALIZER;
+static Thr *g_thr[THR_MAX];
+static uint32_t g_thr_hi, g_thr_free[THR_MAX], g_thr_nfree;
+static Mon *g_mon[MON_MAX];
+static uint32_t g_mon_hi, g_mon_free[MON_MAX], g_mon_nfree;
+static uint64_t g_next_tid;
+static __thread uint64_t t_tid;
+
+uint64_t orin_platform_thread_id(void) {
+    if (!t_tid) t_tid = __atomic_add_fetch(&g_next_tid, 1, __ATOMIC_RELAXED);
+    return t_tid;
+}
+
+static void *thread_main(void *p) {
+    Thr *t = (Thr *)p;
+    (void)orin_platform_thread_id();
+    t->entry(t->arg);
+    return NULL;
+}
+
+int64_t orin_platform_thread_create(void (*entry)(void *), void *arg) {
+    pthread_mutex_lock(&g_reg);
+    uint32_t i;
+    if (g_thr_nfree) {
+        i = g_thr_free[--g_thr_nfree];
+    } else if (g_thr_hi < THR_MAX) {
+        i = g_thr_hi++;
+        g_thr[i] = (Thr *)calloc(1, sizeof(Thr));
+        if (!g_thr[i]) {
+            g_thr_hi--;
+            pthread_mutex_unlock(&g_reg);
+            return 0;
+        }
+    } else {
+        pthread_mutex_unlock(&g_reg);
+        return 0;
+    }
+    Thr *t = g_thr[i];
+    t->entry = entry;
+    t->arg = arg;
+    t->state = 1;
+    uint32_t gen = t->gen;
+    pthread_mutex_unlock(&g_reg);
+    if (pthread_create(&t->th, NULL, thread_main, t) != 0) {
+        pthread_mutex_lock(&g_reg);
+        t->state = 0;
+        g_thr_free[g_thr_nfree++] = i;
+        pthread_mutex_unlock(&g_reg);
+        return 0;
+    }
+    return (int64_t)(((uint64_t)gen << 32) | (i + 1));
+}
+
+int orin_platform_thread_join(int64_t h, void **arg) {
+    uint32_t i = (uint32_t)((uint64_t)h & 0xffffffffu) - 1u, gen = (uint32_t)((uint64_t)h >> 32);
+    pthread_mutex_lock(&g_reg);
+    Thr *t = (h > 0 && i < g_thr_hi) ? g_thr[i] : NULL;
+    if (!t || t->gen != gen || t->state != 1) {
+        pthread_mutex_unlock(&g_reg);
+        return ORIN_PLATFORM_EINVAL;
+    }
+    t->state = 2;
+    pthread_mutex_unlock(&g_reg);
+    pthread_join(t->th, NULL);
+    *arg = t->arg;
+    pthread_mutex_lock(&g_reg);
+    t->state = 0;
+    t->gen++;
+    g_thr_free[g_thr_nfree++] = i;
+    pthread_mutex_unlock(&g_reg);
+    return 0;
+}
+
+static Mon *mon_ref(int64_t h) {
+    uint32_t i = (uint32_t)((uint64_t)h & 0xffffffffu) - 1u;
+    if (h <= 0 || i >= __atomic_load_n(&g_mon_hi, __ATOMIC_ACQUIRE)) return NULL;
+    Mon *m = __atomic_load_n(&g_mon[i], __ATOMIC_ACQUIRE);
+    if (!m || !__atomic_load_n(&m->live, __ATOMIC_ACQUIRE) || __atomic_load_n(&m->gen, __ATOMIC_RELAXED) != (uint32_t)((uint64_t)h >> 32))
+        return NULL;
+    return m;
+}
+
+static int mon_held(const Mon *m) { return __atomic_load_n(&m->owner, __ATOMIC_RELAXED) == orin_platform_thread_id(); }
+
+void orin_platform_thread_exit(void) {
+    uint64_t me = orin_platform_thread_id();
+    uint32_t hi = __atomic_load_n(&g_mon_hi, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < hi; i++) {
+        Mon *m = __atomic_load_n(&g_mon[i], __ATOMIC_ACQUIRE);
+        if (m && __atomic_load_n(&m->owner, __ATOMIC_RELAXED) == me) { /* a panic must not leave a lock held */
+            __atomic_store_n(&m->owner, 0, __ATOMIC_RELAXED);
+            pthread_mutex_unlock(&m->mu);
+        }
+    }
+    pthread_exit(NULL);
+}
+
+int64_t orin_platform_monitor_new(size_t nwords) {
+    uint64_t *w = (uint64_t *)calloc(nwords ? nwords : 1, sizeof(uint64_t));
+    if (!w) return 0;
+    pthread_mutex_lock(&g_reg);
+    uint32_t i;
+    if (g_mon_nfree) {
+        i = g_mon_free[--g_mon_nfree];
+    } else if (g_mon_hi < MON_MAX) {
+        Mon *m = (Mon *)calloc(1, sizeof(Mon));
+        if (!m) {
+            pthread_mutex_unlock(&g_reg);
+            free(w);
+            return 0;
+        }
+        pthread_mutex_init(&m->mu, NULL);
+        pthread_cond_init(&m->cv, NULL);
+        i = g_mon_hi;
+        __atomic_store_n(&g_mon[i], m, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_mon_hi, i + 1, __ATOMIC_RELEASE);
+    } else {
+        pthread_mutex_unlock(&g_reg);
+        free(w);
+        return 0;
+    }
+    Mon *m = g_mon[i];
+    m->w = w;
+    m->n = nwords;
+    uint32_t gen = __atomic_load_n(&m->gen, __ATOMIC_RELAXED);
+    __atomic_store_n(&m->live, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_reg);
+    return (int64_t)(((uint64_t)gen << 32) | (i + 1));
+}
+
+int orin_platform_monitor_lock(int64_t h) {
+    Mon *m = mon_ref(h);
+    if (!m) return ORIN_PLATFORM_EINVAL;
+    if (mon_held(m)) return ORIN_PLATFORM_EDEADLK;
+    pthread_mutex_lock(&m->mu);
+    __atomic_store_n(&m->owner, orin_platform_thread_id(), __ATOMIC_RELAXED);
+    return 0;
+}
+
+int orin_platform_monitor_unlock(int64_t h) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m)) return ORIN_PLATFORM_EINVAL;
+    __atomic_store_n(&m->owner, 0, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&m->mu);
+    return 0;
+}
+
+int orin_platform_monitor_wait(int64_t h) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m)) return ORIN_PLATFORM_EINVAL;
+    m->waiters++;
+    __atomic_store_n(&m->owner, 0, __ATOMIC_RELAXED);
+    pthread_cond_wait(&m->cv, &m->mu);
+    __atomic_store_n(&m->owner, orin_platform_thread_id(), __ATOMIC_RELAXED);
+    m->waiters--;
+    return 0;
+}
+
+int orin_platform_monitor_notify_all(int64_t h) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m)) return ORIN_PLATFORM_EINVAL;
+    pthread_cond_broadcast(&m->cv);
+    return 0;
+}
+
+int orin_platform_monitor_get(int64_t h, size_t i, uint64_t *out) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m) || i >= m->n) return ORIN_PLATFORM_EINVAL;
+    *out = m->w[i];
+    return 0;
+}
+
+int orin_platform_monitor_set(int64_t h, size_t i, uint64_t v) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m) || i >= m->n) return ORIN_PLATFORM_EINVAL;
+    m->w[i] = v;
+    return 0;
+}
+
+int orin_platform_monitor_grow(int64_t h, size_t nwords) {
+    Mon *m = mon_ref(h);
+    if (!m || !mon_held(m) || nwords < m->n) return ORIN_PLATFORM_EINVAL;
+    uint64_t *w = (uint64_t *)realloc(m->w, (nwords ? nwords : 1) * sizeof(uint64_t));
+    if (!w) return ORIN_PLATFORM_ENOMEM;
+    for (size_t i = m->n; i < nwords; i++) w[i] = 0;
+    m->w = w;
+    m->n = nwords;
+    return 0;
+}
+
+int orin_platform_monitor_free(int64_t h) {
+    Mon *m = mon_ref(h);
+    if (!m) return ORIN_PLATFORM_EINVAL;
+    if (pthread_mutex_trylock(&m->mu) != 0) return ORIN_PLATFORM_EBUSY;
+    if (m->waiters) {
+        pthread_mutex_unlock(&m->mu);
+        return ORIN_PLATFORM_EBUSY;
+    }
+    __atomic_store_n(&m->live, 0, __ATOMIC_RELEASE);
+    free(m->w);
+    m->w = NULL;
+    m->n = 0;
+    __atomic_add_fetch(&m->gen, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&m->mu);
+    pthread_mutex_lock(&g_reg);
+    g_mon_free[g_mon_nfree++] = (uint32_t)((uint64_t)h & 0xffffffffu) - 1u;
+    pthread_mutex_unlock(&g_reg);
+    return 0;
+}
+
+/* The one lock of the runtime's own shared tables (transfer slots, statistics of finished tasks). */
+static pthread_mutex_t g_rt = PTHREAD_MUTEX_INITIALIZER;
+void orin_platform_runtime_lock(void) { pthread_mutex_lock(&g_rt); }
+void orin_platform_runtime_unlock(void) { pthread_mutex_unlock(&g_rt); }
