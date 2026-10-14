@@ -80,6 +80,37 @@ its own, because the cost model of an implicit choice is not predictable for the
 - Differential tests compare `.parallel()` with the sequential result for every operation. The thread count varies
   between 1 and the core count, and the input size varies around the threshold and the chunk boundaries.
 
+### 6. The parallel compiler (project owner, 2026-10-14)
+
+The compiler uses `.parallel()` in every phase where the work splits per file, per function or per proof
+obligation. It does not get a separate thread framework.
+
+| Phase | Parallel unit |
+|---|---|
+| parsing | file |
+| loading, resolving, collecting signatures | sequential (short) |
+| checking bodies | function, against the frozen `Env` |
+| lowering, MIR ownership verifier | function |
+| optimiser | interprocedural summaries sequential, then per function |
+| code generation | function (the text pieces are joined in a fixed order) |
+| `orin verify --contracts` | proof obligation (independent Z3 runs) |
+| `orin test` | `@Test` function, results reported in declaration order |
+
+**Hard gates:**
+- **Bit-identical output:** the bootstrap fixed point must keep holding, and the output must be identical to
+  the sequential run for every thread count.
+- **No global counters in a per-function phase:** string literal ids, fresh names and similar numbering are
+  local to the function and renumbered in a fixed order after the parallel step. The compiler rewrite already
+  follows this rule (docs/rewrite.md), so switching a phase to `.parallel()` stays a one-line change.
+- **Shared input without copies:** `Env` and the program are frozen and borrowed by the tasks (§4). That
+  needs borrow inference or `Shared<T>` (ADR-0038 §2), and it is the real prerequisite, not the threads.
+
+**Expected gain:** about 2.5–3x on 4 cores for the self-compile. This is an estimate to be measured; Amdahl's
+law applies because of the sequential load and collect phases and the final join.
+
+**Test harness:** independently of this, the test tools (the std mutants, std and tooling test files, Z3 cases)
+run their independent cases in a process pool now. That needs no Orin threads.
+
 ## Order
 
 1. Concurrency stage 0 (ADR-0017): pool, tasks, per-thread heaps.
