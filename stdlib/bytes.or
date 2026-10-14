@@ -1,0 +1,573 @@
+// std:bytes -- immutable byte sequences, a byte builder and a bounds-checked byte reader (ADR-0030 §3,
+// layer "bytes and text"). Pure safe Orin: no C, no new built-ins.
+//
+// Representation. A byte is a `u8`. `Bytes` is a view `data[start .. start + len)` of a `u8[]`; arrays are
+// copy-on-write values, so a `Bytes` never changes and `slice` is O(1) (the storage is shared, nothing is
+// copied until somebody mutates it, and nobody can: the fields are private and `Bytes` has no mutating
+// method). The runtime stores a `u8` array element in 8 bytes (ADR-0022); strings are the compact form and
+// `toRawString` / `bytesFromString` convert byte for byte in O(n).
+//
+// Contract standard (ADR-0030 §3). Every class carries an `@Invariant` that the checked build
+// (`orin test`, `--check-contracts`) verifies after every public method; every public method states
+// `@Requires` / `@Ensures`; helpers used in contracts are loops, not closures, and never call themselves.
+// Reads never trap: `ByteReader` returns `Err(ReadError)` when fewer bytes remain than requested, and the
+// cursor is left where it was.
+//
+// Complexity: n = number of bytes involved. `length`, `get`, `at`, `slice`, `trySlice` O(1); `concat`, `equals`,
+// `startsWith`, `indexOf`, `toArray`, `toRawString`, `toHex` O(n); `ByteBuilder.append*` amortised O(1) per byte;
+// `ByteReader.read*` O(1) per byte read (`readExact` O(n): it copies nothing, it slices).
+
+// ---------------------------------------------------------------------------------------------- Bytes
+
+// Is every element of `xs` a valid byte (0..255)? Loop-based so that contracts can use it.
+export function allBytes(xs: int[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i] < 0 || xs[i] > 255) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// An immutable sequence of bytes: the view data[start .. start + len).
+@Invariant(this.start + this.len <= this.data.length)
+export class Bytes {
+  private data: u8[];
+  private start: usize;
+  private len: usize;
+
+  // new Bytes(data, start, len): the view of `len` bytes of `data` from `start`. Most code uses
+  // `bytesFromArray` / `bytesFromString` / `emptyBytes` instead.
+  @Requires(start + len <= data.length)
+  constructor(data: u8[], start: usize, len: usize) {
+    this.data = data;
+    this.start = start;
+    this.len = len;
+  }
+
+  // length(): number of bytes. O(1).
+  @Ensures(result == this.len)
+  length(): usize {
+    return this.len;
+  }
+
+  // isEmpty(): true when there are no bytes. O(1).
+  @Ensures(result == (this.length() == 0))
+  isEmpty(): bool {
+    return this.len == 0;
+  }
+
+  // get(i): the byte at index i, or None when i >= length(). Never traps. O(1).
+  @Ensures(result.isSome() == (i < this.len))
+  get(i: usize): Option<u8> {
+    if (i >= this.len) {
+      return None;
+    }
+    return Some(this.data[this.start + i]);
+  }
+
+  // at(i): the byte at index i. Precondition i < length(). O(1).
+  @Requires(i < this.len)
+  at(i: usize): u8 {
+    return this.data[this.start + i];
+  }
+
+  // slice(lo, hi): the bytes [lo, hi). Shares storage with the receiver. O(1).
+  @Requires(lo <= hi && hi <= this.len)
+  @Ensures(result.length() == hi - lo)
+  @Ensures(hi > lo ==> result.at(0) == this.at(lo) && result.at(hi - lo - 1) == this.at(hi - 1))
+  slice(lo: usize, hi: usize): Bytes {
+    return new Bytes(this.data, this.start + lo, hi - lo);
+  }
+
+  // trySlice(lo, hi): `slice` that answers None instead of requiring lo <= hi <= length(). O(1).
+  @Ensures(result.isSome() == (lo <= hi && hi <= this.len))
+  @Ensures(result.isSome() ==> result.unwrap().length() == hi - lo)
+  trySlice(lo: usize, hi: usize): Option<Bytes> {
+    if (lo > hi || hi > this.len) {
+      return None;
+    }
+    return Some(this.slice(lo, hi));
+  }
+
+  // concat(other): this followed by other. O(length() + other.length()).
+  @Ensures(result.length() == this.len + other.length())
+  @Ensures(this.len > 0 ==> result.at(0) == this.at(0))
+  @Ensures(other.length() > 0 ==> result.at(this.len) == other.at(0))
+  @Ensures(other.length() > 0 ==> result.at(this.len + other.length() - 1) == other.at(other.length() - 1))
+  concat(other: Bytes): Bytes {
+    let out: u8[] = [];
+    let i: usize = 0;
+    while (i < this.len) {
+      out.push(this.data[this.start + i]);
+      i += 1;
+    }
+    let j: usize = 0;
+    while (j < other.length()) {
+      out.push(other.at(j));
+      j += 1;
+    }
+    return new Bytes(out, 0, out.length);
+  }
+
+  // equals(other): same length and same bytes. O(n).
+  @Ensures(result ==> this.len == other.length())
+  @Ensures(this.len != other.length() ==> !result)
+  equals(other: Bytes): bool {
+    if (this.len != other.length()) {
+      return false;
+    }
+    let i: usize = 0;
+    while (i < this.len) {
+      if (this.data[this.start + i] != other.at(i)) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // startsWith(prefix): the first prefix.length() bytes equal `prefix`. O(prefix.length()).
+  @Ensures(result ==> prefix.length() <= this.len)
+  @Ensures(prefix.length() == 0 ==> result)
+  startsWith(prefix: Bytes): bool {
+    if (prefix.length() > this.len) {
+      return false;
+    }
+    let i: usize = 0;
+    while (i < prefix.length()) {
+      if (this.data[this.start + i] != prefix.at(i)) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // indexOf(b): the first index holding byte b, or None. O(n).
+  @Ensures(result.isSome() ==> result.unwrap() < this.len && this.at(result.unwrap()) == b)
+  indexOf(b: u8): Option<usize> {
+    let i: usize = 0;
+    while (i < this.len) {
+      if (this.data[this.start + i] == b) {
+        return Some(i);
+      }
+      i += 1;
+    }
+    return None;
+  }
+
+  // toArray(): a copy of the bytes. O(n).
+  @Ensures(result.length == this.len)
+  toArray(): u8[] {
+    return this.data.slice(this.start, this.start + this.len);
+  }
+
+  // toRawString(): the same bytes as a string. No validation: the string holds arbitrary bytes (use
+  // `std:utf8` to get text). Inverse of `bytesFromString`. O(n).
+  @Ensures(result.length == this.len)
+  toRawString(): string {
+    let parts: string[] = [];
+    let i: usize = 0;
+    while (i < this.len) {
+      parts.push(String.fromCharCode(this.data[this.start + i].toInt()));
+      i += 1;
+    }
+    return parts.join("");
+  }
+
+  // toHex(): lower-case hexadecimal, two digits per byte. O(n).
+  @Ensures(result.length == 2 * this.len)
+  toHex(): string {
+    let parts: string[] = [];
+    let i: usize = 0;
+    while (i < this.len) {
+      const b = this.data[this.start + i].toInt();
+      parts.push(hexDigit(b / 16));
+      parts.push(hexDigit(b % 16));
+      i += 1;
+    }
+    return parts.join("");
+  }
+}
+
+@Requires(d >= 0 && d < 16)
+@Ensures(result.length == 1)
+function hexDigit(d: int): string {
+  return "0123456789abcdef".charAt(d.toUsize());
+}
+
+// The value of a hexadecimal digit character code, or -1.
+@Ensures(result >= -1 && result < 16)
+function hexValue(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  return -1;
+}
+
+// emptyBytes(): no bytes. O(1).
+@Ensures(result.length() == 0)
+export function emptyBytes(): Bytes {
+  return new Bytes([], 0, 0);
+}
+
+// bytesFromArray(xs): the bytes of `xs` (the array is shared, not copied). O(1).
+@Ensures(result.length() == xs.length)
+export function bytesFromArray(xs: u8[]): Bytes {
+  return new Bytes(xs, 0, xs.length);
+}
+
+// bytesFromInts(xs): bytes from integers; every element must lie in 0..255. O(n).
+@Requires(allBytes(xs))
+@Ensures(result.length() == xs.length)
+export function bytesFromInts(xs: int[]): Bytes {
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i < xs.length) {
+    out.push(xs[i].toU8());
+    i += 1;
+  }
+  return new Bytes(out, 0, out.length);
+}
+
+// bytesFromString(s): the bytes of a string, one per string byte (no encoding step). O(n).
+@Ensures(result.length() == s.length)
+export function bytesFromString(s: string): Bytes {
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    out.push(s.charCodeAt(i).toU8());
+    i += 1;
+  }
+  return new Bytes(out, 0, out.length);
+}
+
+// bytesFromHex(s): decodes pairs of hex digits (either case); None for an odd length or a non-hex character. O(n).
+@Ensures(result.isSome() ==> result.unwrap().length() * 2 == s.length)
+@Ensures(s.length % 2 == 1 ==> result.isNone())
+export function bytesFromHex(s: string): Option<Bytes> {
+  if (s.length % 2 == 1) {
+    return None;
+  }
+  let out: u8[] = [];
+  let i: usize = 0;
+  while (i < s.length) {
+    const hi = hexValue(s.charCodeAt(i));
+    const lo = hexValue(s.charCodeAt(i + 1));
+    if (hi < 0 || lo < 0) {
+      return None;
+    }
+    out.push((hi * 16 + lo).toU8());
+    i += 2;
+  }
+  return Some(new Bytes(out, 0, out.length));
+}
+
+// ----------------------------------------------------------------------------------------- ByteBuilder
+
+// A growable byte buffer. `capacity` is bookkeeping for `reserve` (the runtime has no array reserve: the array
+// still grows geometrically on `push`); the invariant ties it to the length.
+@Invariant(this.capacity >= this.data.length)
+export class ByteBuilder {
+  private data: u8[] = [];
+  private capacity: usize = 0;
+
+  // length(): number of bytes appended so far. O(1).
+  @Ensures(result == this.data.length)
+  length(): usize {
+    return this.data.length;
+  }
+
+  // capacity(): the number of bytes that fit without a reservation being exceeded; never below length(). O(1).
+  @Ensures(result == this.capacity)
+  reserved(): usize {
+    return this.capacity;
+  }
+
+  // byteAt(i): the byte at index i. Precondition i < length(). O(1).
+  @Requires(i < this.data.length)
+  byteAt(i: usize): u8 {
+    return this.data[i];
+  }
+
+  // reserve(extra): room for `extra` more bytes. The contents do not change. O(1).
+  @Ensures(this.length() == old(this.length()))
+  @Ensures(this.reserved() >= this.length() + extra)
+  reserve(extra: usize): void {
+    if (this.capacity < this.data.length + extra) {
+      this.capacity = this.data.length + extra;
+    }
+  }
+
+  private grew(): void {
+    if (this.capacity < this.data.length) {
+      this.capacity = this.data.length;
+    }
+  }
+
+  // appendU8(v): one byte. Amortised O(1).
+  @Ensures(this.length() == old(this.length()) + 1)
+  @Ensures(this.byteAt(this.length() - 1) == v)
+  appendU8(v: u8): void {
+    this.data.push(v);
+    this.grew();
+  }
+
+  // appendU16be(v): two bytes, most significant first. O(1).
+  @Ensures(this.length() == old(this.length()) + 2)
+  @Ensures(this.byteAt(this.length() - 2).toInt() == v.toInt() / 256)
+  @Ensures(this.byteAt(this.length() - 1).toInt() == v.toInt() % 256)
+  appendU16be(v: u16): void {
+    const n = v.toInt();
+    this.data.push((n / 256).toU8());
+    this.data.push((n % 256).toU8());
+    this.grew();
+  }
+
+  // appendU16le(v): two bytes, least significant first. O(1).
+  @Ensures(this.length() == old(this.length()) + 2)
+  @Ensures(this.byteAt(this.length() - 2).toInt() == v.toInt() % 256)
+  @Ensures(this.byteAt(this.length() - 1).toInt() == v.toInt() / 256)
+  appendU16le(v: u16): void {
+    const n = v.toInt();
+    this.data.push((n % 256).toU8());
+    this.data.push((n / 256).toU8());
+    this.grew();
+  }
+
+  // appendU32be(v): four bytes, most significant first. O(1).
+  @Ensures(this.length() == old(this.length()) + 4)
+  @Ensures(this.byteAt(this.length() - 4).toInt() == v.toInt() / 16777216)
+  @Ensures(this.byteAt(this.length() - 1).toInt() == v.toInt() % 256)
+  appendU32be(v: u32): void {
+    const n = v.toInt();
+    this.data.push((n / 16777216).toU8());
+    this.data.push(((n / 65536) % 256).toU8());
+    this.data.push(((n / 256) % 256).toU8());
+    this.data.push((n % 256).toU8());
+    this.grew();
+  }
+
+  // appendU32le(v): four bytes, least significant first. O(1).
+  @Ensures(this.length() == old(this.length()) + 4)
+  @Ensures(this.byteAt(this.length() - 4).toInt() == v.toInt() % 256)
+  @Ensures(this.byteAt(this.length() - 1).toInt() == v.toInt() / 16777216)
+  appendU32le(v: u32): void {
+    const n = v.toInt();
+    this.data.push((n % 256).toU8());
+    this.data.push(((n / 256) % 256).toU8());
+    this.data.push(((n / 65536) % 256).toU8());
+    this.data.push((n / 16777216).toU8());
+    this.grew();
+  }
+
+  // appendBytes(b): all bytes of `b`. O(b.length()).
+  @Ensures(this.length() == old(this.length()) + b.length())
+  appendBytes(b: Bytes): void {
+    let i: usize = 0;
+    while (i < b.length()) {
+      this.data.push(b.at(i));
+      i += 1;
+    }
+    this.grew();
+  }
+
+  // appendString(s): the bytes of `s` (no encoding step). O(s.length).
+  @Ensures(this.length() == old(this.length()) + s.length)
+  appendString(s: string): void {
+    let i: usize = 0;
+    while (i < s.length) {
+      this.data.push(s.charCodeAt(i).toU8());
+      i += 1;
+    }
+    this.grew();
+  }
+
+  // clear(): remove all bytes; the reservation stays. O(1).
+  @Ensures(this.length() == 0)
+  @Ensures(this.reserved() == old(this.reserved()))
+  clear(): void {
+    this.data = [];
+  }
+
+  // build(): the bytes appended so far as an immutable `Bytes`; the builder stays usable. O(1) (shares storage).
+  @Ensures(result.length() == this.data.length)
+  build(): Bytes {
+    return new Bytes(this.data, 0, this.data.length);
+  }
+}
+
+// ----------------------------------------------------------------------------------------- ByteReader
+
+// Why a read failed: at `position` the reader needed `needed` bytes but only `remaining` were left.
+export type ReadError = { position: usize; needed: usize; remaining: usize; };
+
+// readErrorMessage(e): "unexpected end of input at byte 3: needed 4 bytes, 1 remaining". O(1).
+@Ensures(result.length > 0)
+export function readErrorMessage(e: ReadError): string {
+  return `unexpected end of input at byte ${e.position.toString()}: needed ${e.needed.toString()} bytes, ${e.remaining.toString()} remaining`;
+}
+
+// A cursor over a `Bytes`. Invariant: the cursor never passes the end, so `remaining()` cannot underflow and
+// every successful read is in bounds. A failed read changes nothing.
+@Invariant(this.pos <= this.src.length())
+export class ByteReader {
+  private src: Bytes;
+  private pos: usize = 0;
+
+  constructor(src: Bytes) {
+    this.src = src;
+  }
+
+  // position(): index of the next byte to read. O(1).
+  @Ensures(result <= this.src.length())
+  position(): usize {
+    return this.pos;
+  }
+
+  // remaining(): number of unread bytes. O(1).
+  @Ensures(result + this.pos == this.src.length())
+  remaining(): usize {
+    return this.src.length() - this.pos;
+  }
+
+  // isAtEnd(): no unread bytes. O(1).
+  @Ensures(result == (this.remaining() == 0))
+  isAtEnd(): bool {
+    return this.pos == this.src.length();
+  }
+
+  // peekAt(offset): the unread byte `offset` positions ahead (0 = next), without moving. None past the end. O(1).
+  @Ensures(result.isSome() == (offset < this.remaining()))
+  peekAt(offset: usize): Option<u8> {
+    return this.src.get(this.pos + offset);
+  }
+
+  private shortRead(n: usize): ReadError {
+    return ReadError { position: this.pos, needed: n, remaining: this.src.length() - this.pos };
+  }
+
+  // readU8(): the next byte. Err when no byte is left (cursor unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= 1))
+  @Ensures(result.isOk() ==> this.position() == old(this.position()) + 1)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  @Ensures(result.isOk() ==> result.unwrap() == old(this.peekAt(0).unwrapOr(0)))
+  @Ensures(result.isErr() ==> result.unwrapErr().needed == 1 && result.unwrapErr().remaining == old(this.remaining()))
+  readU8(): Result<u8, ReadError> {
+    if (this.src.length() - this.pos < 1) {
+      return Err(this.shortRead(1));
+    }
+    const v = this.src.at(this.pos);
+    this.pos += 1;
+    return Ok(v);
+  }
+
+  // readU16be(): the next two bytes as a big-endian u16. Err when fewer than 2 remain (cursor unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= 2))
+  @Ensures(result.isOk() ==> this.position() == old(this.position()) + 2)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  @Ensures(result.isOk() ==> result.unwrap().toInt() == old(this.peekAt(0).unwrapOr(0)).toInt() * 256 + old(this.peekAt(1).unwrapOr(0)).toInt())
+  readU16be(): Result<u16, ReadError> {
+    if (this.src.length() - this.pos < 2) {
+      return Err(this.shortRead(2));
+    }
+    const a = this.src.at(this.pos).toInt();
+    const b = this.src.at(this.pos + 1).toInt();
+    this.pos += 2;
+    return Ok((a * 256 + b).toU16());
+  }
+
+  // readU16le(): the next two bytes as a little-endian u16. Err when fewer than 2 remain (cursor unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= 2))
+  @Ensures(result.isOk() ==> this.position() == old(this.position()) + 2)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  @Ensures(result.isOk() ==> result.unwrap().toInt() == old(this.peekAt(1).unwrapOr(0)).toInt() * 256 + old(this.peekAt(0).unwrapOr(0)).toInt())
+  readU16le(): Result<u16, ReadError> {
+    if (this.src.length() - this.pos < 2) {
+      return Err(this.shortRead(2));
+    }
+    const a = this.src.at(this.pos).toInt();
+    const b = this.src.at(this.pos + 1).toInt();
+    this.pos += 2;
+    return Ok((b * 256 + a).toU16());
+  }
+
+  // readU32be(): the next four bytes as a big-endian u32. Err when fewer than 4 remain (cursor unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= 4))
+  @Ensures(result.isOk() ==> this.position() == old(this.position()) + 4)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  @Ensures(result.isOk() ==> result.unwrap().toInt() / 16777216 == old(this.peekAt(0).unwrapOr(0)).toInt())
+  @Ensures(result.isOk() ==> result.unwrap().toInt() % 256 == old(this.peekAt(3).unwrapOr(0)).toInt())
+  readU32be(): Result<u32, ReadError> {
+    if (this.src.length() - this.pos < 4) {
+      return Err(this.shortRead(4));
+    }
+    const a = this.src.at(this.pos).toInt();
+    const b = this.src.at(this.pos + 1).toInt();
+    const c = this.src.at(this.pos + 2).toInt();
+    const d = this.src.at(this.pos + 3).toInt();
+    this.pos += 4;
+    return Ok((((a * 256 + b) * 256 + c) * 256 + d).toU32());
+  }
+
+  // readU32le(): the next four bytes as a little-endian u32. Err when fewer than 4 remain (cursor unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= 4))
+  @Ensures(result.isOk() ==> this.position() == old(this.position()) + 4)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  @Ensures(result.isOk() ==> result.unwrap().toInt() / 16777216 == old(this.peekAt(3).unwrapOr(0)).toInt())
+  @Ensures(result.isOk() ==> result.unwrap().toInt() % 256 == old(this.peekAt(0).unwrapOr(0)).toInt())
+  readU32le(): Result<u32, ReadError> {
+    if (this.src.length() - this.pos < 4) {
+      return Err(this.shortRead(4));
+    }
+    const a = this.src.at(this.pos).toInt();
+    const b = this.src.at(this.pos + 1).toInt();
+    const c = this.src.at(this.pos + 2).toInt();
+    const d = this.src.at(this.pos + 3).toInt();
+    this.pos += 4;
+    return Ok((((d * 256 + c) * 256 + b) * 256 + a).toU32());
+  }
+
+  // readExact(n): the next n bytes (a slice sharing storage, no copy). Err when fewer than n remain (cursor
+  // unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= n))
+  @Ensures(result.isOk() ==> result.unwrap().length() == n && this.position() == old(this.position()) + n)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  readExact(n: usize): Result<Bytes, ReadError> {
+    if (this.src.length() - this.pos < n) {
+      return Err(this.shortRead(n));
+    }
+    const out = this.src.slice(this.pos, this.pos + n);
+    this.pos += n;
+    return Ok(out);
+  }
+
+  // skip(n): advance n bytes. Err when fewer than n remain (cursor unchanged). O(1).
+  @Ensures(result.isOk() == (old(this.remaining()) >= n))
+  @Ensures(result.isOk() ==> this.position() == old(this.position()) + n)
+  @Ensures(result.isErr() ==> this.position() == old(this.position()))
+  skip(n: usize): Result<void, ReadError> {
+    if (this.src.length() - this.pos < n) {
+      return Err(this.shortRead(n));
+    }
+    this.pos += n;
+    return Ok();
+  }
+
+  // rest(): all unread bytes as a slice; the cursor moves to the end. O(1).
+  @Ensures(this.isAtEnd() && result.length() == old(this.remaining()))
+  rest(): Bytes {
+    const out = this.src.slice(this.pos, this.src.length());
+    this.pos = this.src.length();
+    return out;
+  }
+}

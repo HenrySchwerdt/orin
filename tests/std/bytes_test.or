@@ -1,0 +1,290 @@
+// Tests for std:bytes. Run with `orin test tests/std/bytes_test.or` (contracts are checked by default) and
+// with `--no-contracts` (the logic must not depend on the contracts). See tools/test_std.sh.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool } from "std:test";
+import { Bytes, ByteBuilder, ByteReader, ReadError, allBytes, emptyBytes, bytesFromArray, bytesFromInts,
+  bytesFromString, bytesFromHex, readErrorMessage } from "std:bytes";
+
+function b(xs: int[]): Bytes {
+  return bytesFromInts(xs);
+}
+
+// ---------------------------------------------------------------- Bytes
+
+@Test
+function allBytesChecksRange(): void {
+  assertEqBool(allBytes([]), true, "empty");
+  assertEqBool(allBytes([0, 255]), true, "bounds");
+  assertEqBool(allBytes([0, 256]), false, "256");
+  assertEqBool(allBytes([-1]), false, "negative");
+}
+
+@Test
+function emptyAndLength(): void {
+  const e = emptyBytes();
+  assertEqUsize(e.length(), 0, "empty length");
+  assertEqBool(e.isEmpty(), true, "isEmpty");
+  assertEqBool(b([1]).isEmpty(), false, "not empty");
+  assertEqUsize(b([1, 2, 3]).length(), 3, "length");
+}
+
+@Test
+function getAndAt(): void {
+  const x = b([10, 20, 255]);
+  assertEq(x.get(0).unwrap().toInt(), 10, "get 0");
+  assertEq(x.get(2).unwrap().toInt(), 255, "get 2");
+  assertEqBool(x.get(3).isNone(), true, "get past end");
+  assertEqBool(emptyBytes().get(0).isNone(), true, "get on empty");
+  assertEq(x.at(1).toInt(), 20, "at");
+}
+
+@Test
+function sliceSharesAndBounds(): void {
+  const x = b([1, 2, 3, 4, 5]);
+  const s = x.slice(1, 4);
+  assertEqUsize(s.length(), 3, "slice length");
+  assertEq(s.at(0).toInt(), 2, "slice first");
+  assertEq(s.at(2).toInt(), 4, "slice last");
+  const t = s.slice(1, 2);
+  assertEq(t.at(0).toInt(), 3, "slice of slice");
+  assertEqUsize(x.slice(5, 5).length(), 0, "empty slice at end");
+  assertEqUsize(x.slice(0, 5).length(), 5, "full slice");
+  assertEqBool(x.equals(x.slice(0, 5)), true, "full slice equals");
+}
+
+@Test
+function trySliceNeverTraps(): void {
+  const x = b([1, 2, 3]);
+  assertEqBool(x.trySlice(0, 3).isSome(), true, "full");
+  assertEqBool(x.trySlice(2, 1).isNone(), true, "reversed");
+  assertEqBool(x.trySlice(0, 4).isNone(), true, "past end");
+  assertEqBool(x.trySlice(4, 5).isNone(), true, "start past end");
+  assertEqUsize(x.trySlice(1, 1).unwrap().length(), 0, "empty");
+}
+
+@Test
+function concatKeepsOrder(): void {
+  const c = b([1, 2]).concat(b([3]));
+  assertEqString(c.toHex(), "010203", "concat");
+  assertEqString(emptyBytes().concat(b([9])).toHex(), "09", "empty left");
+  assertEqString(b([9]).concat(emptyBytes()).toHex(), "09", "empty right");
+  assertEqUsize(emptyBytes().concat(emptyBytes()).length(), 0, "both empty");
+  assertEqString(b([1, 2, 3, 4]).slice(1, 3).concat(b([1, 2, 3, 4]).slice(0, 1)).toHex(), "0203" + "01", "slices");
+}
+
+@Test
+function equalsAndStartsWith(): void {
+  assertEqBool(b([1, 2]).equals(b([1, 2])), true, "equal");
+  assertEqBool(b([1, 2]).equals(b([1, 3])), false, "differ");
+  assertEqBool(b([1, 2]).equals(b([1, 2, 3])), false, "length differs");
+  assertEqBool(emptyBytes().equals(emptyBytes()), true, "empty equal");
+  assertEqBool(b([1, 2, 3]).startsWith(b([1, 2])), true, "prefix");
+  assertEqBool(b([1, 2, 3]).startsWith(emptyBytes()), true, "empty prefix");
+  assertEqBool(b([1, 2]).startsWith(b([1, 2, 3])), false, "longer prefix");
+  assertEqBool(b([1, 2, 3]).startsWith(b([2])), false, "not a prefix");
+}
+
+@Test
+function indexOfFindsFirst(): void {
+  const x = b([5, 7, 7, 9]);
+  assertEqUsize(x.indexOf(7).unwrap(), 1, "first 7");
+  assertEqBool(x.indexOf(8).isNone(), true, "absent");
+  assertEqBool(emptyBytes().indexOf(0).isNone(), true, "empty");
+}
+
+@Test
+function conversions(): void {
+  const raw = bytesFromString("A\xff\x00z");
+  assertEqUsize(raw.length(), 4, "string length");
+  assertEq(raw.at(1).toInt(), 255, "0xff survives");
+  assertEq(raw.at(2).toInt(), 0, "NUL survives");
+  assertEqString(raw.toHex(), "41ff007a", "hex");
+  assertEqUsize(raw.toRawString().length, 4, "raw length");
+  assertEq(raw.toRawString().charCodeAt(1), 255, "round trip byte");
+  assertEqBool(bytesFromString(raw.toRawString()).equals(raw), true, "string round trip");
+  assertEqUsize(bytesFromString("").length(), 0, "empty string");
+  const arr: u8[] = [1, 2, 3];
+  assertEqBool(bytesFromArray(arr).equals(b([1, 2, 3])), true, "from array");
+  assertEqUsize(b([4, 5]).toArray().length, 2, "toArray");
+  assertEq(b([4, 5]).slice(1, 2).toArray()[0].toInt(), 5, "toArray of a slice");
+}
+
+@Test
+function hexRoundTrip(): void {
+  assertEqString(emptyBytes().toHex(), "", "empty hex");
+  assertEqString(b([0, 15, 16, 255]).toHex(), "000f10ff", "hex digits");
+  assertEqBool(bytesFromHex("000F10fF").unwrap().equals(b([0, 15, 16, 255])), true, "mixed case");
+  assertEqBool(bytesFromHex("").unwrap().isEmpty(), true, "empty");
+  assertEqBool(bytesFromHex("abc").isNone(), true, "odd length");
+  assertEqBool(bytesFromHex("zz").isNone(), true, "not hex");
+  assertEqBool(bytesFromHex("0g").isNone(), true, "bad low digit");
+  assertEqBool(bytesFromHex("g0").isNone(), true, "bad high digit");
+}
+
+// ---------------------------------------------------------------- ByteBuilder
+
+@Test
+function builderAppendsScalars(): void {
+  let w = new ByteBuilder();
+  w.appendU8(1);
+  w.appendU16be(0x0203);
+  w.appendU16le(0x0504);
+  w.appendU32be(0x06070809);
+  w.appendU32le(0x0d0c0b0a);
+  assertEqUsize(w.length(), 13, "length");
+  assertEqString(w.build().toHex(), "01" + "0203" + "0405" + "06070809" + "0a0b0c0d", "layout");
+}
+
+@Test
+function builderExtremes(): void {
+  let w = new ByteBuilder();
+  w.appendU16be(65535);
+  w.appendU32be(4294967295);
+  w.appendU32le(0);
+  w.appendU16le(0);
+  assertEqString(w.build().toHex(), "ffff" + "ffffffff" + "00000000" + "0000", "extremes");
+}
+
+@Test
+function builderAppendsBytesAndStrings(): void {
+  let w = new ByteBuilder();
+  w.appendString("hi");
+  w.appendBytes(b([0, 255]));
+  w.appendBytes(emptyBytes());
+  w.appendString("");
+  assertEqString(w.build().toHex(), "6869" + "00ff", "contents");
+  assertEqUsize(w.length(), 4, "length");
+  assertEq(w.byteAt(3).toInt(), 255, "byteAt");
+}
+
+@Test
+function builderReserveAndClear(): void {
+  let w = new ByteBuilder();
+  assertEqUsize(w.reserved(), 0, "fresh");
+  w.reserve(100);
+  assertEqUsize(w.length(), 0, "reserve keeps length");
+  assert(w.reserved() >= 100, "reserved");
+  w.appendU8(7);
+  assert(w.reserved() >= 100, "append inside the reservation");
+  w.clear();
+  assertEqUsize(w.length(), 0, "clear");
+  assert(w.reserved() >= 100, "reservation survives clear");
+  w.appendU8(8);
+  assertEqString(w.build().toHex(), "08", "usable after clear");
+  let g = new ByteBuilder();
+  let i: int = 0;
+  while (i < 50) {
+    g.appendU8((i % 256).toU8());
+    i += 1;
+  }
+  assert(g.reserved() >= g.length(), "capacity follows growth");
+}
+
+@Test
+function buildSnapshotIsStable(): void {
+  let w = new ByteBuilder();
+  w.appendU8(1);
+  const snap = w.build();
+  w.appendU8(2);
+  assertEqUsize(snap.length(), 1, "snapshot unaffected");
+  assertEqUsize(w.build().length(), 2, "builder continues");
+}
+
+// ---------------------------------------------------------------- ByteReader
+
+@Test
+function readerReadsScalars(): void {
+  let r = new ByteReader(b([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]));
+  assertEq(r.readU8().unwrap().toInt(), 1, "u8");
+  assertEq(r.readU16be().unwrap().toInt(), 0x0203, "u16be");
+  assertEq(r.readU16le().unwrap().toInt(), 0x0504, "u16le");
+  assertEq(r.readU32be().unwrap().toInt(), 0x06070809, "u32be");
+  assertEq(r.readU32le().unwrap().toInt(), 0x0d0c0b0a, "u32le");
+  assertEqBool(r.isAtEnd(), true, "end");
+  assertEqUsize(r.position(), 13, "position");
+  assertEqUsize(r.remaining(), 0, "remaining");
+}
+
+@Test
+function readerHighBitValues(): void {
+  let r = new ByteReader(b([255, 255, 255, 255, 255, 255, 128, 0, 0, 255, 255, 255, 255, 1, 0]));
+  assertEq(r.readU8().unwrap().toInt(), 255, "u8 high");
+  assertEq(r.readU16be().unwrap().toInt(), 65535, "u16 max");
+  assertEq(r.readU32be().unwrap().toInt(), 4294967168, "u32be with high bit");
+  assertEq(r.readU16le().unwrap().toInt(), 0, "u16le zero");
+  assertEq(r.readU32le().unwrap().toInt(), 4294967295, "u32le max");
+  assertEq(r.readU16le().unwrap().toInt(), 1, "u16le one");
+}
+
+@Test
+function readerEofNeverTraps(): void {
+  let r = new ByteReader(b([1, 2, 3]));
+  assertEqBool(r.readU32be().isErr(), true, "u32be short");
+  assertEqBool(r.readU32le().isErr(), true, "u32le short");
+  assertEqUsize(r.position(), 0, "cursor unchanged after failures");
+  const e: ReadError = r.readU32be().unwrapErr();
+  assertEqUsize(e.needed, 4, "needed");
+  assertEqUsize(e.remaining, 3, "remaining in error");
+  assertEqUsize(e.position, 0, "position in error");
+  assertEqString(readErrorMessage(e), "unexpected end of input at byte 0: needed 4 bytes, 3 remaining", "message");
+  assertEq(r.readU16be().unwrap().toInt(), 0x0102, "still readable");
+  assertEqBool(r.readU16be().isErr(), true, "one byte left");
+  assertEqBool(r.readU16le().isErr(), true, "one byte left le");
+  assertEq(r.readU8().unwrap().toInt(), 3, "last byte");
+  assertEqBool(r.readU8().isErr(), true, "u8 at end");
+  assertEqUsize(r.position(), 3, "position at end");
+  let e0 = new ByteReader(emptyBytes());
+  assertEqBool(e0.readU8().isErr(), true, "empty input");
+}
+
+@Test
+function readExactSlicesAndFails(): void {
+  let r = new ByteReader(b([1, 2, 3, 4, 5]));
+  const head = r.readExact(2).unwrap();
+  assertEqString(head.toHex(), "0102", "head");
+  assertEqUsize(r.position(), 2, "advanced");
+  assertEqBool(r.readExact(4).isErr(), true, "too long");
+  assertEqUsize(r.position(), 2, "unchanged after failure");
+  assertEqUsize(r.readExact(0).unwrap().length(), 0, "zero bytes");
+  assertEqString(r.readExact(3).unwrap().toHex(), "030405", "tail");
+  assertEqBool(r.readExact(1).isErr(), true, "at end");
+  assertEqUsize(r.readExact(0).unwrap().length(), 0, "zero bytes at end");
+}
+
+@Test
+function readerPeekSkipRest(): void {
+  let r = new ByteReader(b([10, 20, 30, 40]));
+  assertEq(r.peekAt(0).unwrap().toInt(), 10, "peek 0");
+  assertEq(r.peekAt(3).unwrap().toInt(), 40, "peek 3");
+  assertEqBool(r.peekAt(4).isNone(), true, "peek past end");
+  assertEqUsize(r.position(), 0, "peek does not move");
+  assertEqBool(r.skip(5).isErr(), true, "skip too far");
+  assertEqUsize(r.position(), 0, "skip failure leaves cursor");
+  assertEqBool(r.skip(1).isOk(), true, "skip");
+  assertEq(r.peekAt(0).unwrap().toInt(), 20, "after skip");
+  const rest = r.rest();
+  assertEqString(rest.toHex(), "141e28", "rest");
+  assertEqBool(r.isAtEnd(), true, "rest consumes");
+  assertEqUsize(r.rest().length(), 0, "rest at end");
+}
+
+@Test
+function readerOnSliceUsesSliceBounds(): void {
+  const whole = b([1, 2, 3, 4, 5, 6]);
+  let r = new ByteReader(whole.slice(2, 4));
+  assertEqUsize(r.remaining(), 2, "slice remaining");
+  assertEq(r.readU16be().unwrap().toInt(), 0x0304, "reads inside the slice");
+  assertEqBool(r.readU8().isErr(), true, "does not leak past the slice");
+}
+
+@Test
+function builderReaderRoundTrip(): void {
+  let w = new ByteBuilder();
+  w.appendU32le(123456789);
+  w.appendU16be(4242);
+  w.appendString("ok");
+  let r = new ByteReader(w.build());
+  assertEq(r.readU32le().unwrap().toInt(), 123456789, "u32le");
+  assertEq(r.readU16be().unwrap().toInt(), 4242, "u16be");
+  assertEqString(r.readExact(2).unwrap().toRawString(), "ok", "string");
+  assertEqBool(r.isAtEnd(), true, "consumed");
+}

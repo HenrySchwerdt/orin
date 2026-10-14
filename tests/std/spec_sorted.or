@@ -1,0 +1,406 @@
+// Executable specification of the sorted maps: the earlier sorted-array implementation (linear-time insert and
+// remove, binary search lookups), kept because it is trivially correct. tests/std/collections_test.or drives the
+// B-tree maps of std:collections and these with the same random operation sequences and requires identical
+// results. Not part of the std.
+import { isStrictlyIncreasing, isStrictlyIncreasingStrings, compareStrings } from "std:collections";
+
+// ------------------------------------------------------------------------------------------ SpecSortedMap
+
+// A map from int keys to values of type V, ordered by key: parallel arrays `keys` / `vals` with the keys strictly
+// increasing (so sorted and without duplicates). Lookups are binary searches.
+@Invariant(this.keys.length == this.vals.length)
+@Invariant(isStrictlyIncreasing(this.keys))
+export class SpecSortedMap<V> {
+  private keys: int[] = [];
+  private vals: V[] = [];
+
+  // size(): number of entries. O(1).
+  @Ensures(result == this.keys.length && result == this.vals.length)
+  size(): usize {
+    return this.keys.length;
+  }
+
+  // isEmpty(): no entries. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.keys.length == 0;
+  }
+
+  // The first index whose key is >= k (keys.length when there is none). O(log n).
+  @Ensures(result <= this.keys.length)
+  @Ensures(result < this.keys.length ==> this.keys[result] >= k)
+  @Ensures(result > 0 ==> this.keys[result - 1] < k)
+  private lowerBound(k: int): usize {
+    let lo: usize = 0;
+    let hi: usize = this.keys.length;
+    while (lo < hi) {
+      const mid = lo + (hi - lo) / 2;
+      if (this.keys[mid] < k) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  // has(k): is there an entry for k? O(log n).
+  @Ensures(result ==> this.size() > 0)
+  has(k: int): bool {
+    const i = this.lowerBound(k);
+    return i < this.keys.length && this.keys[i] == k;
+  }
+
+  // get(k): the value for k, None when absent. O(log n).
+  @Ensures(result.isSome() == this.has(k))
+  get(k: int): Option<V> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && this.keys[i] == k) {
+      return Some(this.vals[i]);
+    }
+    return None;
+  }
+
+  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
+  // replaced (size unchanged). O(log n) to find, O(n) to shift on insert.
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  put(k: int, v: V): bool {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && this.keys[i] == k) {
+      this.vals[i] = v;
+      return false;
+    }
+    this.keys.push(k);
+    this.vals.push(v);
+    let j = this.keys.length - 1;
+    while (j > i) {
+      this.keys[j] = this.keys[j - 1];
+      this.vals[j] = this.vals[j - 1];
+      j -= 1;
+    }
+    this.keys[i] = k;
+    this.vals[i] = v;
+    return true;
+  }
+
+  // remove(k): delete the entry for k and return its value, None when absent. O(log n) to find, O(n) to shift.
+  @Ensures(!this.has(k))
+  @Ensures(result.isSome() == old(this.has(k)))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == old(this.size()))
+  remove(k: int): Option<V> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length || this.keys[i] != k) {
+      return None;
+    }
+    const v = this.vals[i];
+    let j = i;
+    while (j + 1 < this.keys.length) {
+      this.keys[j] = this.keys[j + 1];
+      this.vals[j] = this.vals[j + 1];
+      j += 1;
+    }
+    this.keys.pop();
+    this.vals.pop();
+    return Some(v);
+  }
+
+  // firstKey(): the smallest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  firstKey(): Option<int> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[0]);
+  }
+
+  // lastKey(): the largest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  lastKey(): Option<int> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[this.keys.length - 1]);
+  }
+
+  // floorKey(k): the greatest key <= k, None when there is none. O(log n).
+  @Ensures(result.isSome() ==> result.unwrap() <= k && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || this.firstKey().unwrap() > k)
+  floorKey(k: int): Option<int> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && this.keys[i] == k) {
+      return Some(k);
+    }
+    if (i == 0) {
+      return None;
+    }
+    return Some(this.keys[i - 1]);
+  }
+
+  // ceilKey(k): the smallest key >= k, None when there is none. O(log n).
+  @Ensures(result.isSome() ==> result.unwrap() >= k && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || this.lastKey().unwrap() < k)
+  ceilKey(k: int): Option<int> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length) {
+      return None;
+    }
+    return Some(this.keys[i]);
+  }
+
+  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> result.unwrap().key == old(this.firstKey().unwrapOr(0)))
+  @Ensures(result.isSome() && this.size() > 0 ==> this.firstKey().unwrap() > result.unwrap().key)
+  popFirst(): Option<SpecSortedEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[0];
+    const v = this.remove(k).unwrap();
+    return Some(SpecSortedEntry<V> { key: k, value: v });
+  }
+
+  // popLast(): remove the entry with the largest key and return it, None when empty. O(1).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> result.unwrap().key == old(this.lastKey().unwrapOr(0)))
+  @Ensures(result.isSome() && this.size() > 0 ==> this.lastKey().unwrap() < result.unwrap().key)
+  popLast(): Option<SpecSortedEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[this.keys.length - 1];
+    const v = this.vals[this.vals.length - 1];
+    this.keys.pop();
+    this.vals.pop();
+    return Some(SpecSortedEntry<V> { key: k, value: v });
+  }
+
+  // keyArray(): all keys in increasing order. O(n).
+  @Ensures(result.length == this.size() && isStrictlyIncreasing(result))
+  keyArray(): int[] {
+    return this.keys;
+  }
+
+  // valueArray(): all values in key order. O(n).
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return this.vals;
+  }
+
+  // clear(): remove all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.keys = [];
+    this.vals = [];
+  }
+}
+
+// An entry returned by `popFirst` / `popLast`.
+export type SpecSortedEntry<V> = { key: int; value: V; };
+
+// ----------------------------------------------------------------------------------- SpecSortedStringMap
+
+// Like `SpecSortedMap` with string keys ordered by `compareStrings`.
+@Invariant(this.keys.length == this.vals.length)
+@Invariant(isStrictlyIncreasingStrings(this.keys))
+export class SpecSortedStringMap<V> {
+  private keys: string[] = [];
+  private vals: V[] = [];
+
+  // size(): number of entries. O(1).
+  @Ensures(result == this.keys.length && result == this.vals.length)
+  size(): usize {
+    return this.keys.length;
+  }
+
+  // isEmpty(): no entries. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.keys.length == 0;
+  }
+
+  // The first index whose key is >= k (keys.length when there is none). O(log n * key length).
+  @Ensures(result <= this.keys.length)
+  @Ensures(result < this.keys.length ==> compareStrings(this.keys[result], k) >= 0)
+  @Ensures(result > 0 ==> compareStrings(this.keys[result - 1], k) < 0)
+  private lowerBound(k: string): usize {
+    let lo: usize = 0;
+    let hi: usize = this.keys.length;
+    while (lo < hi) {
+      const mid = lo + (hi - lo) / 2;
+      if (compareStrings(this.keys[mid], k) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  // has(k): is there an entry for k? O(log n * key length).
+  @Ensures(result ==> this.size() > 0)
+  has(k: string): bool {
+    const i = this.lowerBound(k);
+    return i < this.keys.length && compareStrings(this.keys[i], k) == 0;
+  }
+
+  // get(k): the value for k, None when absent. O(log n * key length).
+  @Ensures(result.isSome() == this.has(k))
+  get(k: string): Option<V> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && compareStrings(this.keys[i], k) == 0) {
+      return Some(this.vals[i]);
+    }
+    return None;
+  }
+
+  // put(k, v): set the value for k; true when k was new (the size grows by 1). O(log n) to find, O(n) to shift.
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  put(k: string, v: V): bool {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && compareStrings(this.keys[i], k) == 0) {
+      this.vals[i] = v;
+      return false;
+    }
+    this.keys.push(k);
+    this.vals.push(v);
+    let j = this.keys.length - 1;
+    while (j > i) {
+      this.keys[j] = this.keys[j - 1];
+      this.vals[j] = this.vals[j - 1];
+      j -= 1;
+    }
+    this.keys[i] = k;
+    this.vals[i] = v;
+    return true;
+  }
+
+  // remove(k): delete the entry for k and return its value, None when absent. O(log n) to find, O(n) to shift.
+  @Ensures(!this.has(k))
+  @Ensures(result.isSome() == old(this.has(k)))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == old(this.size()))
+  remove(k: string): Option<V> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length || compareStrings(this.keys[i], k) != 0) {
+      return None;
+    }
+    const v = this.vals[i];
+    let j = i;
+    while (j + 1 < this.keys.length) {
+      this.keys[j] = this.keys[j + 1];
+      this.vals[j] = this.vals[j + 1];
+      j += 1;
+    }
+    this.keys.pop();
+    this.vals.pop();
+    return Some(v);
+  }
+
+  // firstKey(): the smallest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  firstKey(): Option<string> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[0]);
+  }
+
+  // lastKey(): the largest key, None when empty. O(1).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  lastKey(): Option<string> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    return Some(this.keys[this.keys.length - 1]);
+  }
+
+  // floorKey(k): the greatest key <= k, None when there is none. O(log n * key length).
+  @Ensures(result.isSome() ==> compareStrings(result.unwrap(), k) <= 0 && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || compareStrings(this.firstKey().unwrap(), k) > 0)
+  floorKey(k: string): Option<string> {
+    const i = this.lowerBound(k);
+    if (i < this.keys.length && compareStrings(this.keys[i], k) == 0) {
+      return Some(this.keys[i]);
+    }
+    if (i == 0) {
+      return None;
+    }
+    return Some(this.keys[i - 1]);
+  }
+
+  // ceilKey(k): the smallest key >= k, None when there is none. O(log n * key length).
+  @Ensures(result.isSome() ==> compareStrings(result.unwrap(), k) >= 0 && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || compareStrings(this.lastKey().unwrap(), k) < 0)
+  ceilKey(k: string): Option<string> {
+    const i = this.lowerBound(k);
+    if (i >= this.keys.length) {
+      return None;
+    }
+    return Some(this.keys[i]);
+  }
+
+  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() && this.size() > 0 ==> compareStrings(this.firstKey().unwrap(), result.unwrap().key) > 0)
+  popFirst(): Option<SpecSortedStringEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[0];
+    const v = this.remove(k).unwrap();
+    return Some(SpecSortedStringEntry<V> { key: k, value: v });
+  }
+
+  // popLast(): remove the entry with the largest key and return it, None when empty. O(1).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() && this.size() > 0 ==> compareStrings(this.lastKey().unwrap(), result.unwrap().key) < 0)
+  popLast(): Option<SpecSortedStringEntry<V>> {
+    if (this.keys.length == 0) {
+      return None;
+    }
+    const k = this.keys[this.keys.length - 1];
+    const v = this.vals[this.vals.length - 1];
+    this.keys.pop();
+    this.vals.pop();
+    return Some(SpecSortedStringEntry<V> { key: k, value: v });
+  }
+
+  // keyArray(): all keys in increasing order. O(n).
+  @Ensures(result.length == this.size() && isStrictlyIncreasingStrings(result))
+  keyArray(): string[] {
+    return this.keys;
+  }
+
+  // valueArray(): all values in key order. O(n).
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return this.vals;
+  }
+
+  // clear(): remove all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.keys = [];
+    this.vals = [];
+  }
+}
+
+// An entry returned by `SpecSortedStringMap.popFirst` / `popLast`.
+export type SpecSortedStringEntry<V> = { key: string; value: V; };
+

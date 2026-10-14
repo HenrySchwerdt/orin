@@ -1,0 +1,755 @@
+// ------------------------------------------------------------------------------------------ @CLASS@
+
+// One node of the B-tree: `keys` sorted, `vals` parallel to them, `kids` empty for a leaf, else keys.length + 1
+// child ids (indices into the arena `nodes` of the map).
+export type @P@Node<V> = { keys: @K@[]; vals: V[]; kids: usize[]; };
+
+// An entry returned by `@CLASS@.popFirst` / `popLast`.
+export type @ENTRY@<V> = { key: @K@; value: V; };
+
+// The first index whose key is >= k (keys.length when there is none). Binary search, O(log keys.length).
+@Ensures(result <= keys.length)
+@Ensures(result < keys.length ==> GE(keys[result], k))
+@Ensures(result > 0 ==> LT(keys[result - 1], k))
+export function lowerBound@P@(keys: @K@[], k: @K@): usize {
+  let lo: usize = 0;
+  let hi: usize = keys.length;
+  while (lo < hi) {
+    const mid = lo + (hi - lo) / 2;
+    if (LT(keys[mid], k)) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+// Is `nodes` a well-formed B-tree arena of minimum degree t rooted at `root`, with free list `free`? Checked
+// iteratively with an explicit stack: every node id is in range and reached exactly once (no dangling or shared
+// ids, no cycles), keys and values have the same length, a leaf has no children and an inner node has one more
+// child than keys (and at least one key), every non-root node holds t-1 .. 2t-1 keys and the root at most 2t-1,
+// all leaves have the same depth, the free list holds distinct ids of unreachable nodes, and every arena slot is
+// either reachable or free.
+export function btree@P@ShapeOk<V>(nodes: @P@Node<V>[], root: usize, t: usize, free: usize[]): bool {
+  const n = nodes.length;
+  if (t < 2 || root >= n) {
+    return false;
+  }
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    seen.push(false);
+    i += 1;
+  }
+  i = 0;
+  while (i < free.length) {
+    if (free[i] >= n || seen[free[i]]) {
+      return false;
+    }
+    seen[free[i]] = true;
+    i += 1;
+  }
+  let ids: usize[] = [root];
+  let depths: usize[] = [0];
+  let leafDepth: int = -1;
+  let reachable: usize = 0;
+  while (ids.length > 0) {
+    const id = ids.pop().unwrap();
+    const d = depths.pop().unwrap();
+    if (seen[id]) {
+      return false;
+    }
+    seen[id] = true;
+    reachable += 1;
+    const kc = nodes[id].keys.length;
+    if (nodes[id].vals.length != kc || kc > 2 * t - 1) {
+      return false;
+    }
+    if (id != root && kc < t - 1) {
+      return false;
+    }
+    const kk = nodes[id].kids.length;
+    if (kk == 0) {
+      if (leafDepth < 0) {
+        leafDepth = d.toInt();
+      } else if (leafDepth != d.toInt()) {
+        return false;
+      }
+    } else {
+      if (kk != kc + 1 || kc == 0) {
+        return false;
+      }
+      let c: usize = 0;
+      while (c < kk) {
+        if (nodes[id].kids[c] >= n) {
+          return false;
+        }
+        ids.push(nodes[id].kids[c]);
+        depths.push(d + 1);
+        c += 1;
+      }
+    }
+  }
+  return reachable + free.length == n;
+}
+
+// Are the keys ordered? Inside every node strictly increasing, and every key of a child lies strictly between the
+// separator keys around it in the parent (inherited bounds), which together say the in-order sequence is strictly
+// increasing. Iterative; tolerates a broken shape (out-of-range ids, revisits) by answering false.
+export function btree@P@OrderOk<V>(nodes: @P@Node<V>[], root: usize): bool {
+  if (root >= nodes.length) {
+    return false;
+  }
+  let ids: usize[] = [root];
+  let loFlags: bool[] = [false];
+  let los: @K@[] = [@ZERO@];
+  let hiFlags: bool[] = [false];
+  let his: @K@[] = [@ZERO@];
+  let visited: usize = 0;
+  while (ids.length > 0) {
+    visited += 1;
+    if (visited > nodes.length) {
+      return false;
+    }
+    const id = ids.pop().unwrap();
+    const hasLo = loFlags.pop().unwrap();
+    const lo = los.pop().unwrap();
+    const hasHi = hiFlags.pop().unwrap();
+    const hi = his.pop().unwrap();
+    const kc = nodes[id].keys.length;
+    let j: usize = 0;
+    while (j < kc) {
+      if (j > 0 && GE(nodes[id].keys[j - 1], nodes[id].keys[j])) {
+        return false;
+      }
+      j += 1;
+    }
+    if (kc > 0) {
+      if (hasLo && LE(nodes[id].keys[0], lo)) {
+        return false;
+      }
+      if (hasHi && GE(nodes[id].keys[kc - 1], hi)) {
+        return false;
+      }
+    }
+    const kk = nodes[id].kids.length;
+    if (kk > 0 && kk != kc + 1) {
+      return false;
+    }
+    let c: usize = 0;
+    while (c < kk) {
+      if (nodes[id].kids[c] >= nodes.length) {
+        return false;
+      }
+      ids.push(nodes[id].kids[c]);
+      if (c == 0) {
+        loFlags.push(hasLo);
+        los.push(lo);
+      } else {
+        loFlags.push(true);
+        los.push(nodes[id].keys[c - 1]);
+      }
+      if (c == kc) {
+        hiFlags.push(hasHi);
+        his.push(hi);
+      } else {
+        hiFlags.push(true);
+        his.push(nodes[id].keys[c]);
+      }
+      c += 1;
+    }
+  }
+  return true;
+}
+
+// The number of keys stored in the tree below `root` (iterative; a revisit or bad id stops the walk early).
+export function btree@P@KeyCount<V>(nodes: @P@Node<V>[], root: usize): usize {
+  if (root >= nodes.length) {
+    return 0;
+  }
+  let ids: usize[] = [root];
+  let total: usize = 0;
+  let visited: usize = 0;
+  while (ids.length > 0) {
+    visited += 1;
+    if (visited > nodes.length) {
+      return total;
+    }
+    const id = ids.pop().unwrap();
+    total += nodes[id].keys.length;
+    let c: usize = 0;
+    while (c < nodes[id].kids.length) {
+      if (nodes[id].kids[c] < nodes.length) {
+        ids.push(nodes[id].kids[c]);
+      }
+      c += 1;
+    }
+  }
+  return total;
+}
+
+// Height of the tree: the number of levels (1 for a single leaf root). Follows the first child down. O(height).
+export function btree@P@Height<V>(nodes: @P@Node<V>[], root: usize): usize {
+  let h: usize = 1;
+  let id = root;
+  while (id < nodes.length && nodes[id].kids.length > 0 && h <= nodes.length) {
+    id = nodes[id].kids[0];
+    h += 1;
+  }
+  return h;
+}
+
+// The fewest keys a tree of minimum degree t and the given height can hold: the root has 1 key, every other node
+// at least t-1, so level d >= 1 has >= 2 t^(d-1) nodes and the total is 2 t^(h-1) - 1 (height 1: 1 key, but the
+// root leaf may also be empty, so 0 is returned for an empty tree by the caller). This is why height is O(log_t n).
+@Requires(t >= 2 && h >= 1)
+export function btreeMinKeys@P@(h: usize, t: usize): usize {
+  let p: usize = 1;
+  let d: usize = 1;
+  while (d < h) {
+    p *= t;
+    d += 1;
+  }
+  return 2 * p - 1;
+}
+
+// All keys in order, by an explicit-stack in-order walk (the stack holds a node id and how many of its children
+// were visited). O(n).
+export function btree@P@Keys<V>(nodes: @P@Node<V>[], root: usize): @K@[] {
+  let out: @K@[] = [];
+  let ids: usize[] = [root];
+  let js: usize[] = [0];
+  while (ids.length > 0) {
+    const top = ids.length - 1;
+    const id = ids[top];
+    const j = js[top];
+    const kc = nodes[id].keys.length;
+    if (nodes[id].kids.length == 0) {
+      let a: usize = 0;
+      while (a < kc) {
+        out.push(nodes[id].keys[a]);
+        a += 1;
+      }
+      ids.pop();
+      js.pop();
+    } else {
+      if (j > 0 && j - 1 < kc) {
+        out.push(nodes[id].keys[j - 1]);
+      }
+      if (j <= kc) {
+        js[top] = j + 1;
+        ids.push(nodes[id].kids[j]);
+        js.push(0);
+      } else {
+        ids.pop();
+        js.pop();
+      }
+    }
+  }
+  return out;
+}
+
+// All values in key order (same walk as `btree@P@Keys`). O(n).
+export function btree@P@Vals<V>(nodes: @P@Node<V>[], root: usize): V[] {
+  let out: V[] = [];
+  let ids: usize[] = [root];
+  let js: usize[] = [0];
+  while (ids.length > 0) {
+    const top = ids.length - 1;
+    const id = ids[top];
+    const j = js[top];
+    const kc = nodes[id].keys.length;
+    if (nodes[id].kids.length == 0) {
+      let a: usize = 0;
+      while (a < kc) {
+        out.push(nodes[id].vals[a]);
+        a += 1;
+      }
+      ids.pop();
+      js.pop();
+    } else {
+      if (j > 0 && j - 1 < kc) {
+        out.push(nodes[id].vals[j - 1]);
+      }
+      if (j <= kc) {
+        js[top] = j + 1;
+        ids.push(nodes[id].kids[j]);
+        js.push(0);
+      } else {
+        ids.pop();
+        js.pop();
+      }
+    }
+  }
+  return out;
+}
+
+// An ordered map from @K@ keys to values of type V: a B-tree of minimum degree t (every node but the root holds
+// t-1 .. 2t-1 keys, all leaves at the same depth) whose nodes live in an arena (`nodes`) and refer to each other
+// by index, so the structure is a plain value (copy-on-write arrays, no pointers, no parent links). `free` lists
+// the arena slots of merged-away nodes for reuse. Insertion splits full nodes on the way down and deletion makes
+// every node it enters hold at least t keys (borrow from a sibling or merge), so both run in one root-to-leaf pass.
+//
+// Invariants (`@Invariant`, checked after every public method by `orin test` / `--check-contracts`): the arena is a
+// valid B-tree of degree t (shape, occupancy, equal leaf depth, no dangling or shared ids, consistent free list),
+// keys are ordered (sorted within nodes and bounded by the separators above them) and the stored count equals the
+// number of keys. Complexity: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/popLast O(t log_t n)
+// (a binary search of O(log t) in each of O(log_t n) nodes, plus O(t) to shift keys inside one node per level on
+// updates); size/isEmpty O(1); keyArray/valueArray O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
+// have measured otherwise; `minDegree` 2 gives the smallest nodes and deepest trees (useful for tests).
+@Invariant(this.t >= 2)
+@Invariant(btree@P@ShapeOk(this.nodes, this.root, this.t, this.free))
+@Invariant(btree@P@OrderOk(this.nodes, this.root))
+@Invariant(btree@P@KeyCount(this.nodes, this.root) == this.count)
+export class @CLASS@<V> {
+  private t: usize;
+  private nodes: @P@Node<V>[] = [@P@Node<V> { keys: [], vals: [], kids: [] }];
+  private root: usize = 0;
+  private free: usize[] = [];
+  private count: usize = 0;
+
+  // new @CLASS@<V>(minDegree): an empty map; every node but the root keeps minDegree-1 .. 2*minDegree-1 keys.
+  @Requires(minDegree >= 2)
+  constructor(minDegree: usize) {
+    this.t = minDegree;
+  }
+
+  // size(): number of entries. O(1).
+  @Ensures(result == this.count)
+  size(): usize {
+    return this.count;
+  }
+
+  // isEmpty(): no entries. O(1).
+  @Ensures(result == (this.size() == 0))
+  isEmpty(): bool {
+    return this.count == 0;
+  }
+
+  // height(): number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
+  // holds at least 2 t^(h-1) - 1 keys, so n keys need at most about log_t(n/2) + 1 levels. O(height).
+  @Ensures(result >= 1)
+  @Ensures(this.count > 0 ==> btreeMinKeys@P@(result, this.t) <= this.count)
+  height(): usize {
+    return btree@P@Height(this.nodes, this.root);
+  }
+
+  // has(k): is there an entry for k? O(t log_t n).
+  @Ensures(result ==> this.size() > 0)
+  has(k: @K@): bool {
+    let x = this.root;
+    while (true) {
+      const i = lowerBound@P@(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && EQ(this.nodes[x].keys[i], k)) {
+        return true;
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return false;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return false;
+  }
+
+  // get(k): the value for k, None when absent. O(t log_t n).
+  @Ensures(result.isSome() == this.has(k))
+  get(k: @K@): Option<V> {
+    let x = this.root;
+    while (true) {
+      const i = lowerBound@P@(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && EQ(this.nodes[x].keys[i], k)) {
+        return Some(this.nodes[x].vals[i]);
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return None;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return None;
+  }
+
+  // A fresh arena slot (reusing a freed one) holding the given node contents.
+  private alloc(keys: @K@[], vals: V[], kids: usize[]): usize {
+    if (this.free.length > 0) {
+      const id = this.free.pop().unwrap();
+      this.nodes[id] = @P@Node<V> { keys: keys, vals: vals, kids: kids };
+      return id;
+    }
+    this.nodes.push(@P@Node<V> { keys: keys, vals: vals, kids: kids });
+    return this.nodes.length - 1;
+  }
+
+  // Empties an arena slot and puts it on the free list.
+  private release(id: usize): void {
+    this.nodes[id] = @P@Node<V> { keys: [], vals: [], kids: [] };
+    this.free.push(id);
+  }
+
+  private insertKey(id: usize, pos: usize, k: @K@, v: V): void {
+    this.nodes[id].keys.push(k);
+    this.nodes[id].vals.push(v);
+    let j = this.nodes[id].keys.length - 1;
+    while (j > pos) {
+      this.nodes[id].keys[j] = this.nodes[id].keys[j - 1];
+      this.nodes[id].vals[j] = this.nodes[id].vals[j - 1];
+      j -= 1;
+    }
+    this.nodes[id].keys[pos] = k;
+    this.nodes[id].vals[pos] = v;
+  }
+
+  private removeKey(id: usize, pos: usize): void {
+    let j = pos;
+    while (j + 1 < this.nodes[id].keys.length) {
+      this.nodes[id].keys[j] = this.nodes[id].keys[j + 1];
+      this.nodes[id].vals[j] = this.nodes[id].vals[j + 1];
+      j += 1;
+    }
+    this.nodes[id].keys.pop();
+    this.nodes[id].vals.pop();
+  }
+
+  private insertKid(id: usize, pos: usize, kid: usize): void {
+    this.nodes[id].kids.push(kid);
+    let j = this.nodes[id].kids.length - 1;
+    while (j > pos) {
+      this.nodes[id].kids[j] = this.nodes[id].kids[j - 1];
+      j -= 1;
+    }
+    this.nodes[id].kids[pos] = kid;
+  }
+
+  private removeKid(id: usize, pos: usize): void {
+    let j = pos;
+    while (j + 1 < this.nodes[id].kids.length) {
+      this.nodes[id].kids[j] = this.nodes[id].kids[j + 1];
+      j += 1;
+    }
+    this.nodes[id].kids.pop();
+  }
+
+  // Splits the full child number i of node x around its median key, which moves up into x.
+  private splitChild(x: usize, i: usize): void {
+    const t = this.t;
+    const y = this.nodes[x].kids[i];
+    const yk = this.nodes[y].keys;
+    const yv = this.nodes[y].vals;
+    const yc = this.nodes[y].kids;
+    const med = yk[t - 1];
+    const medv = yv[t - 1];
+    let zc: usize[] = [];
+    if (yc.length > 0) {
+      zc = yc.slice(t, yc.length);
+      this.nodes[y].kids = yc.slice(0, t);
+    }
+    const z = this.alloc(yk.slice(t, yk.length), yv.slice(t, yv.length), zc);
+    this.nodes[y].keys = yk.slice(0, t - 1);
+    this.nodes[y].vals = yv.slice(0, t - 1);
+    this.insertKey(x, i, med, medv);
+    this.insertKid(x, i + 1, z);
+  }
+
+  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
+  // replaced. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  @Ensures(result ==> this.size() == old(this.size()) + 1)
+  @Ensures(!result ==> this.size() == old(this.size()))
+  put(k: @K@, v: V): bool {
+    const maxKeys = 2 * this.t - 1;
+    if (this.nodes[this.root].keys.length == maxKeys) {
+      const nr = this.alloc([], [], [this.root]);
+      this.root = nr;
+      this.splitChild(nr, 0);
+    }
+    let x = this.root;
+    while (true) {
+      const i = lowerBound@P@(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && EQ(this.nodes[x].keys[i], k)) {
+        this.nodes[x].vals[i] = v;
+        return false;
+      }
+      if (this.nodes[x].kids.length == 0) {
+        this.insertKey(x, i, k, v);
+        this.count += 1;
+        return true;
+      }
+      let ci = i;
+      if (this.nodes[this.nodes[x].kids[i]].keys.length == maxKeys) {
+        this.splitChild(x, i);
+        const m = this.nodes[x].keys[i];
+        if (EQ(k, m)) {
+          this.nodes[x].vals[i] = v;
+          return false;
+        }
+        if (GT(k, m)) {
+          ci = i + 1;
+        }
+      }
+      x = this.nodes[x].kids[ci];
+    }
+    return false;
+  }
+
+  // Child number ci of x has t-1 keys: give it one more from a sibling (rotation through x) or merge it with a
+  // sibling. Returns the id of the child to descend into afterwards. May shrink the root.
+  private fill(x: usize, ci: usize): usize {
+    const t = this.t;
+    const len = this.nodes[x].keys.length;
+    const c = this.nodes[x].kids[ci];
+    if (ci > 0 && this.nodes[this.nodes[x].kids[ci - 1]].keys.length >= t) {
+      const l = this.nodes[x].kids[ci - 1];
+      const ll = this.nodes[l].keys.length;
+      this.insertKey(c, 0, this.nodes[x].keys[ci - 1], this.nodes[x].vals[ci - 1]);
+      this.nodes[x].keys[ci - 1] = this.nodes[l].keys[ll - 1];
+      this.nodes[x].vals[ci - 1] = this.nodes[l].vals[ll - 1];
+      if (this.nodes[l].kids.length > 0) {
+        this.insertKid(c, 0, this.nodes[l].kids[this.nodes[l].kids.length - 1]);
+        this.nodes[l].kids.pop();
+      }
+      this.nodes[l].keys.pop();
+      this.nodes[l].vals.pop();
+      return c;
+    }
+    if (ci < len && this.nodes[this.nodes[x].kids[ci + 1]].keys.length >= t) {
+      const r = this.nodes[x].kids[ci + 1];
+      this.insertKey(c, this.nodes[c].keys.length, this.nodes[x].keys[ci], this.nodes[x].vals[ci]);
+      this.nodes[x].keys[ci] = this.nodes[r].keys[0];
+      this.nodes[x].vals[ci] = this.nodes[r].vals[0];
+      this.removeKey(r, 0);
+      if (this.nodes[r].kids.length > 0) {
+        this.nodes[c].kids.push(this.nodes[r].kids[0]);
+        this.removeKid(r, 0);
+      }
+      return c;
+    }
+    if (ci < len) {
+      this.mergeChildren(x, ci);
+      return c;
+    }
+    const left = this.nodes[x].kids[ci - 1];
+    this.mergeChildren(x, ci - 1);
+    return left;
+  }
+
+  // Merges child i+1 of x and the separator key i into child i; releases child i+1. If x was the root and ends up
+  // without keys, its only child becomes the root.
+  private mergeChildren(x: usize, i: usize): void {
+    const y = this.nodes[x].kids[i];
+    const z = this.nodes[x].kids[i + 1];
+    this.nodes[y].keys.push(this.nodes[x].keys[i]);
+    this.nodes[y].vals.push(this.nodes[x].vals[i]);
+    let a: usize = 0;
+    while (a < this.nodes[z].keys.length) {
+      this.nodes[y].keys.push(this.nodes[z].keys[a]);
+      this.nodes[y].vals.push(this.nodes[z].vals[a]);
+      a += 1;
+    }
+    let b: usize = 0;
+    while (b < this.nodes[z].kids.length) {
+      this.nodes[y].kids.push(this.nodes[z].kids[b]);
+      b += 1;
+    }
+    this.removeKey(x, i);
+    this.removeKid(x, i + 1);
+    this.release(z);
+    if (x == this.root && this.nodes[x].keys.length == 0) {
+      this.root = y;
+      this.release(x);
+    }
+  }
+
+  // remove(k): delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
+  // top-down deletion): a node is only entered when it has at least t keys, so removing from a leaf never
+  // underflows. A key in an inner node is replaced by its predecessor or successor (or the children are merged) and
+  // that key is deleted further down. O(t log_t n).
+  @Ensures(!this.has(k))
+  @Ensures(result.isSome() == old(this.has(k)))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1)
+  @Ensures(result.isNone() ==> this.size() == old(this.size()))
+  remove(k: @K@): Option<V> {
+    const t = this.t;
+    let x = this.root;
+    let target = k;
+    let removed: Option<V> = None;
+    let saved = false;
+    while (true) {
+      const len = this.nodes[x].keys.length;
+      const i = lowerBound@P@(this.nodes[x].keys, target);
+      const isLeaf = this.nodes[x].kids.length == 0;
+      if (i < len && EQ(this.nodes[x].keys[i], target)) {
+        if (isLeaf) {
+          if (!saved) {
+            removed = Some(this.nodes[x].vals[i]);
+          }
+          this.removeKey(x, i);
+          this.count -= 1;
+          return removed;
+        }
+        if (!saved) {
+          removed = Some(this.nodes[x].vals[i]);
+          saved = true;
+        }
+        const y = this.nodes[x].kids[i];
+        const z = this.nodes[x].kids[i + 1];
+        if (this.nodes[y].keys.length >= t) {
+          let w = y;
+          while (this.nodes[w].kids.length > 0) {
+            w = this.nodes[w].kids[this.nodes[w].kids.length - 1];
+          }
+          const last = this.nodes[w].keys.length - 1;
+          this.nodes[x].keys[i] = this.nodes[w].keys[last];
+          this.nodes[x].vals[i] = this.nodes[w].vals[last];
+          target = this.nodes[w].keys[last];
+          x = y;
+        } else if (this.nodes[z].keys.length >= t) {
+          let w = z;
+          while (this.nodes[w].kids.length > 0) {
+            w = this.nodes[w].kids[0];
+          }
+          this.nodes[x].keys[i] = this.nodes[w].keys[0];
+          this.nodes[x].vals[i] = this.nodes[w].vals[0];
+          target = this.nodes[w].keys[0];
+          x = z;
+        } else {
+          this.mergeChildren(x, i);
+          x = y;
+        }
+      } else {
+        if (isLeaf) {
+          return removed;
+        }
+        const c = this.nodes[x].kids[i];
+        if (this.nodes[c].keys.length < t) {
+          x = this.fill(x, i);
+        } else {
+          x = c;
+        }
+      }
+    }
+    return removed;
+  }
+
+  // firstKey(): the smallest key, None when empty. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  firstKey(): Option<@K@> {
+    if (this.count == 0) {
+      return None;
+    }
+    let x = this.root;
+    while (this.nodes[x].kids.length > 0) {
+      x = this.nodes[x].kids[0];
+    }
+    return Some(this.nodes[x].keys[0]);
+  }
+
+  // lastKey(): the largest key, None when empty. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> this.has(result.unwrap()))
+  lastKey(): Option<@K@> {
+    if (this.count == 0) {
+      return None;
+    }
+    let x = this.root;
+    while (this.nodes[x].kids.length > 0) {
+      x = this.nodes[x].kids[this.nodes[x].kids.length - 1];
+    }
+    return Some(this.nodes[x].keys[this.nodes[x].keys.length - 1]);
+  }
+
+  // floorKey(k): the greatest key <= k, None when there is none. One descent. O(t log_t n).
+  @Ensures(result.isSome() ==> LE(result.unwrap(), k) && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.firstKey().isNone() || GT(this.firstKey().unwrap(), k))
+  floorKey(k: @K@): Option<@K@> {
+    let best: Option<@K@> = None;
+    let x = this.root;
+    while (true) {
+      const i = lowerBound@P@(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length && EQ(this.nodes[x].keys[i], k)) {
+        return Some(k);
+      }
+      if (i > 0) {
+        best = Some(this.nodes[x].keys[i - 1]);
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return best;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return best;
+  }
+
+  // ceilKey(k): the smallest key >= k, None when there is none. One descent. O(t log_t n).
+  @Ensures(result.isSome() ==> GE(result.unwrap(), k) && this.has(result.unwrap()))
+  @Ensures(result.isNone() ==> this.lastKey().isNone() || LT(this.lastKey().unwrap(), k))
+  ceilKey(k: @K@): Option<@K@> {
+    let best: Option<@K@> = None;
+    let x = this.root;
+    while (true) {
+      const i = lowerBound@P@(this.nodes[x].keys, k);
+      if (i < this.nodes[x].keys.length) {
+        if (EQ(this.nodes[x].keys[i], k)) {
+          return Some(k);
+        }
+        best = Some(this.nodes[x].keys[i]);
+      }
+      if (this.nodes[x].kids.length == 0) {
+        return best;
+      }
+      x = this.nodes[x].kids[i];
+    }
+    return best;
+  }
+
+  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> EQ(result.unwrap().key, old(this.firstKey().unwrapOr(@ZERO@))))
+  @Ensures(result.isSome() && this.size() > 0 ==> GT(this.firstKey().unwrap(), result.unwrap().key))
+  popFirst(): Option<@ENTRY@<V>> {
+    const f = this.firstKey();
+    if (f.isNone()) {
+      return None;
+    }
+    const v = this.remove(f.unwrap()).unwrap();
+    return Some(@ENTRY@<V> { key: f.unwrap(), value: v });
+  }
+
+  // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
+  @Ensures(result.isSome() == (old(this.size()) > 0))
+  @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
+  @Ensures(result.isSome() ==> EQ(result.unwrap().key, old(this.lastKey().unwrapOr(@ZERO@))))
+  @Ensures(result.isSome() && this.size() > 0 ==> LT(this.lastKey().unwrap(), result.unwrap().key))
+  popLast(): Option<@ENTRY@<V>> {
+    const l = this.lastKey();
+    if (l.isNone()) {
+      return None;
+    }
+    const v = this.remove(l.unwrap()).unwrap();
+    return Some(@ENTRY@<V> { key: l.unwrap(), value: v });
+  }
+
+  // keyArray(): all keys in increasing order. O(n).
+  @Ensures(result.length == this.size() && @INC@(result))
+  keyArray(): @K@[] {
+    return btree@P@Keys(this.nodes, this.root);
+  }
+
+  // valueArray(): all values in key order. O(n).
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return btree@P@Vals(this.nodes, this.root);
+  }
+
+  // clear(): remove all entries. O(1).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.nodes = [@P@Node<V> { keys: [], vals: [], kids: [] }];
+    this.root = 0;
+    this.free = [];
+    this.count = 0;
+  }
+}
+
