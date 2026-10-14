@@ -167,10 +167,10 @@ rewritten module follows these rules (the contracts are checked by the `contract
    points at what was asked for, an index map is as large as its array, a resolved type refers only to ids that exist,
    a parallel-array argument has equal lengths, `declare` does not shrink the tables. Trivial one-liners (`isInt`)
    need none.
-3. **Well-formedness helpers**: a small exported predicate written with loops (no closures, no `map` / `filter`, no
-   self-call) that is reused in `@Requires`, `@Ensures` and `@Invariant` (`marksOrdered`, `noRepeats`, `typeInRange`,
-   `isWellFormedEnv`, `sigOk`, `bindsKept`), like `isWellFormed` of the loader. Remember: a clause cannot call a function
-   value, so `instKey` / `typesId` are loops although the code around them could use `map`.
+3. **Well-formedness helpers**: a small exported predicate (no self-call) that is reused in `@Requires`, `@Ensures`
+   and `@Invariant` (`marksOrdered`, `noRepeats`, `typeInRange`, `isWellFormedEnv`, `sigOk`, `bindsKept`), like
+   `isWellFormed` of the loader. Since ADR-0031 A, purity inference accepts `every` / `some` / `map` / `filter` with a
+   pure arrow function in a clause, so a helper may use them; a clause still cannot call a function *value*.
 4. **Ask of each contract which bug it would catch.** Good: `typeEq(a, b) == (typeId(a) == typeId(b))` (the two
    notions of type identity cannot drift apart, which would corrupt the instance cache), `Insts.add` requires a fresh key
    *and* a fresh id, `bindsKept` (unification never unbinds), `declare` fails only when the name is already in the
@@ -182,6 +182,15 @@ rewritten module follows these rules (the contracts are checked by the `contract
    still reaches the resolver, so `TScope` must not require distinct names; the first draft did, and an error test would
    have trapped the contract-checked compiler. Run the error suites with the contract-checked compiler before you
    believe an invariant.
+7. **Say what a loop computes** (project owner, 2026-10-14): a loop that is a transformation or a question about an
+   array is written with the array API: `map`, `filter`, `find`, `findIndex`, `some`, `every`, `reduce`. Examples are
+   collecting the names of the active items, finding the first match, or checking that all entries are in range. Keep a
+   `for` loop where it is the clearer form: several results built in one pass, index arithmetic, early exit with
+   state, or mutation of the iterated data. There is no `Stream<T>` type. Laziness comes from the compiler: closure
+   inlining and fusion of pure `filter`/`map`/`reduce` chains into one loop (ADR-0038 §2). Until that optimisation
+   has landed, keep hot inner loops of the compiler as loops. Measured before fusion: `filter → map → reduce` over
+   5 M ints is about 4x slower than the loop. The self-compile time in the PR shows whether a change slowed the
+   compiler down.
 
 ## Step 2a: `check/{env,fnctx,types}.or` (the checker's foundation)
 
