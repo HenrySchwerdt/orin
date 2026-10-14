@@ -1,6 +1,18 @@
 # Changelog
 
 ## Unreleased
+- **Rewrite step 3b: the ownership verifier `compiler/verify/`, shared MIR well-formedness, `compiler/hir/` contracts
+  (ADR-0015).** The verifier's abstract state is a class `State`, the transfer functions are the methods of a class
+  `Transfer` (one run through a block), the fixpoint is `Fixpoint` over a `Worklist`; 98 contract clauses (0 before), among
+  them: the join is commutative, idempotent and an upper bound in an independently stated lattice order; no instruction
+  revives a dead or poisoned local unless it defines it; borrows stay flat; every report names an existing block and
+  instruction with its span; the fixpoint is stable; the verifier's well-formedness check implies the shared predicate
+  `isWellFormedProgram` (new `compiler/mir/wellformed.or`, also used by the lowering). `hir/`: integer-kind round trip and
+  exact ranges, `Function.paramCount <= locals.length`, `CallSite` evidence and edge kinds. 23 unit tests
+  (`compiler/tests/verify_test.or`), 12/12 hand-made mutants killed. **Fixed**: four inputs on which the verifier itself
+  crashed (`trap: index out of bounds`) instead of reporting ill-formed MIR: a call of a callee with more parameters than
+  locals, a closure target or vtable entry with parameters but no locals, a block with fewer spans than instructions; they are
+  now rejected with a message. Every other verdict and message is unchanged; generated C / LLVM output is byte-identical.
 - **Rewrite step 3a: `compiler/lower/` and MIR source spans (ADR-0015, ADR-0020 D3).** HIR -> MIR lowering is now a `Lowerer`
   class per function with a `BlockBuilder`, a `Locals` table and an `OwnedScope` (97 contract clauses, 15 unit tests in
   `compiler/tests/lower_test.or`), split into `lowerer` / `builder` / `state` / `ops` / `place` / `values` / `wellformed`.

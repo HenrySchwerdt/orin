@@ -1,21 +1,34 @@
-// Abstract domain of the OIM ownership verifier (docs/mir.md, "Abstract ownership state").
-// One LState per local plus a set of open holes. The join is a semilattice join, so the fixpoint
-// iteration in verify.or terminates: in-states only ever grow, and the lattice is finite.
+// Abstract domain of the OIM ownership verifier (docs/mir.md, "Abstract ownership state"): one `LState` per local plus a
+// set of open holes, held by the class `State`. The join is a semilattice join (commutative, idempotent, an upper bound
+// in the order `lsLeq`), so the fixpoint iteration in verify.or terminates: in-states only ever grow, and the lattice is
+// finite.
 
-import { MFunction, noSpan, spanAt } from "../mir";
+import { MFunction, noSpan, hasSpan, spanAt } from "../mir";
 import { Span } from "../diag";
 
 // `span` is the source position of the offending instruction (block `block`, instruction `instr`; `instr` equal to the
 // block's instruction count is the terminator) as recorded by the lowering (docs/mir.md v2.0); `noSpan()` when the MIR
 // has no source positions (hand-written MIR) or the issue is not about one instruction.
-export type VerifyIssue = { func: string; block: usize; instr: usize; message: string; span: Span; };
+export type VerifyIssue = {
+  func: string;
+  block: usize;
+  instr: usize;
+  message: string;
+  span: Span;
+};
 
 // The span of instruction `i` of block `b` of `f`, or `noSpan()` when that position does not exist.
+@Ensures(!(b < f.blocks.length && i <= f.blocks[b].instrs.length) ==> !hasSpan(result))
 export function issueSpan(f: MFunction, b: usize, i: usize): Span {
   if (b < f.blocks.length && i <= f.blocks[b].instrs.length) {
     return spanAt(f.blocks[b], i);
   }
   return noSpan();
+}
+
+// Two spans are the same position.
+export function sameSpan(a: Span, b: Span): bool {
+  return a.file == b.file && a.start == b.start && a.end == b.end;
 }
 
 // Kinds of LState. Imm = immortal reference (OStr copy, INullary): readable, consumable,
@@ -37,15 +50,29 @@ export const KMaybeDead: int = 8;
 export const KOpen: int = 9;
 export const KMaybeOpen: int = 10;
 
-// src is meaningful only for KBorrowed (the root local the alias depends on); otherwise 0.
+// One of the eleven kinds above.
+export function isKind(k: int): bool {
+  return k >= KDead && k <= KMaybeOpen;
+}
+
+// A local in this state may be read: neither dead nor poisoned by a join.
+export function isLive(k: int): bool {
+  return k == KOwned
+      || k == KUnique
+      || k == KImm
+      || k == KBorrowed
+      || k == KParam
+      || k == KInit
+      || k == KOpen;
+}
+
+// `src` is meaningful only for KBorrowed (the root local the alias depends on); otherwise 0.
+@Invariant(isKind(this.k))
+@Invariant(this.k == KBorrowed || this.src == 0)
 export type LState = { k: int; src: usize; };
 
-// A taken slot of local `obj`. Field slots and constant array indices are (sym=false, idx=slot);
-// an array index held in a usize local l is the symbolic key (sym=true, idx=l).
-export type HoleEntry = { obj: usize; sym: bool; idx: usize; };
-
-export type State = { ls: LState[]; holes: HoleEntry[]; };
-
+@Requires(isKind(k) && (k == KBorrowed || src == 0))
+@Ensures(result.k == k && result.src == src)
 export function mk(k: int, src: usize): LState {
   return LState { k: k, src: src };
 }
@@ -59,22 +86,70 @@ export function leaky(k: int): bool {
   return k == KOwned || k == KUnique || k == KMaybeLeak;
 }
 
+@Requires(isKind(k))
 export function kindName(k: int): string {
-  if (k == KDead) { return "Dead"; }
-  if (k == KOwned) { return "Owned"; }
-  if (k == KUnique) { return "Unique"; }
-  if (k == KImm) { return "Imm"; }
-  if (k == KBorrowed) { return "Borrowed"; }
-  if (k == KParam) { return "Param"; }
-  if (k == KInit) { return "Init"; }
-  if (k == KMaybeLeak) { return "MaybeDead(owned on some path)"; }
-  if (k == KOpen) { return "Open"; }
-  if (k == KMaybeOpen) { return "MaybeOpen"; }
+  if (k == KDead) {
+    return "Dead";
+  }
+  if (k == KOwned) {
+    return "Owned";
+  }
+  if (k == KUnique) {
+    return "Unique";
+  }
+  if (k == KImm) {
+    return "Imm";
+  }
+  if (k == KBorrowed) {
+    return "Borrowed";
+  }
+  if (k == KParam) {
+    return "Param";
+  }
+  if (k == KInit) {
+    return "Init";
+  }
+  if (k == KMaybeLeak) {
+    return "MaybeDead(owned on some path)";
+  }
+  if (k == KOpen) {
+    return "Open";
+  }
+  if (k == KMaybeOpen) {
+    return "MaybeOpen";
+  }
   return "MaybeDead";
+}
+
+export function lsEq(a: LState, b: LState): bool {
+  return a.k == b.k && a.src == b.src;
+}
+
+// The order of the per-local lattice, stated independently of `joinLs`: equal states; Unique and Imm below Owned; the
+// states that hold no counted reference below MaybeDead; everything that is not a handle below MaybeLeak; everything
+// below MaybeOpen (the top).
+export function lsLeq(a: LState, b: LState): bool {
+  if (lsEq(a, b) || b.k == KMaybeOpen) {
+    return true;
+  }
+  if (b.k == KMaybeLeak) {
+    return a.k != KOpen && a.k != KMaybeOpen;
+  }
+  if (b.k == KOwned) {
+    return a.k == KUnique || a.k == KImm;
+  }
+  if (b.k == KMaybeDead) {
+    return a.k == KDead || a.k == KImm || a.k == KBorrowed || a.k == KParam || a.k == KInit;
+  }
+  return false;
 }
 
 // Join of two per-local states. Owned-like states join to Owned (Unique/Imm information is
 // lost); identical states are kept; anything else is poisoned.
+@Ensures(lsEq(result, joinLs(b, a)))
+@Ensures(lsEq(a, b) ==> lsEq(result, a))
+@Ensures(lsLeq(a, result) && lsLeq(b, result))
+@Ensures(result.k == KBorrowed ==> lsEq(a, b))
 export function joinLs(a: LState, b: LState): LState {
   if (a.k == b.k && a.src == b.src) {
     return a;
@@ -91,55 +166,183 @@ export function joinLs(a: LState, b: LState): LState {
   return mk(KMaybeDead, 0);
 }
 
+// ---------------------------------------------------------------- holes
+
+// A taken slot of local `obj`. Field slots and constant array indices are (sym=false, idx=slot);
+// an array index held in a usize local l is the symbolic key (sym=true, idx=l).
+export type HoleEntry = { obj: usize; sym: bool; idx: usize; };
+
+// The slot part of a hole: a field slot / constant index, or a symbolic index local.
+export type HoleKey = { sym: bool; idx: usize; };
+
 export function holeEq(a: HoleEntry, b: HoleEntry): bool {
   return a.obj == b.obj && a.sym == b.sym && a.idx == b.idx;
 }
 
 export function holeIn(h: HoleEntry, hs: HoleEntry[]): bool {
-  for (const x of hs) {
-    if (holeEq(x, h)) {
-      return true;
-    }
-  }
-  return false;
+  return hs.some(x => holeEq(x, h));
 }
 
+// Equal as sets when neither has repeated entries (a repeated hole is only created by a `take` that is reported as an
+// error).
+@Ensures(result ==> a.length == b.length)
 export function holesEq(a: HoleEntry[], b: HoleEntry[]): bool {
-  if (a.length != b.length) {
-    return false;
-  }
-  for (const h of a) {
-    if (!holeIn(h, b)) {
-      return false;
-    }
-  }
-  return true;
+  return a.length == b.length && a.every(h => holeIn(h, b));
 }
 
-// Join of hole sets is the union (the mismatch itself is reported per edge by verify.or).
-export function joinState(a: State, b: State): State {
-  let ls: LState[] = [];
-  let i: usize = 0;
-  while (i < a.ls.length) {
-    ls.push(joinLs(a.ls[i], b.ls[i]));
-    i += 1;
-  }
-  let holes = a.holes;
-  for (const h of b.holes) {
-    if (!holeIn(h, holes)) {
-      holes.push(h);
-    }
-  }
-  return State { ls: ls, holes: holes };
+// Every hole names a local below `n`, and so does every symbolic index.
+export function holesInRange(hs: HoleEntry[], n: usize): bool {
+  return hs.every(h => h.obj < n && (!h.sym || h.idx < n));
 }
 
-export function stateEq(a: State, b: State): bool {
-  let i: usize = 0;
-  while (i < a.ls.length) {
-    if (a.ls[i].k != b.ls[i].k || a.ls[i].src != b.ls[i].src) {
+// ---------------------------------------------------------------- the state at one program point
+
+// The abstract state at one program point: `ls[l]` is the state of local `l` (one entry per local of the function) and
+// `holes` the slots that are taken. Every hole names a local of the function. Borrows are flat (`borrowsFlat`): an
+// alias depends on a local that is not itself an alias, which is what lets one `killBorrows(x)` invalidate every alias
+// of the object `x` owns; the transfer functions keep this (rules.or).
+@Invariant(holesInRange(this.holes, this.ls.length))
+export class State {
+  ls: LState[];
+  holes: HoleEntry[];
+
+  constructor(ls: LState[], holes: HoleEntry[]) {
+    this.ls = ls;
+    this.holes = holes;
+  }
+
+  // Number of locals.
+  size(): usize {
+    return this.ls.length;
+  }
+
+  @Requires(l < this.ls.length)
+  kind(l: usize): int {
+    return this.ls[l].k;
+  }
+
+  // The root of a borrowed local (0 for any other state).
+  @Requires(l < this.ls.length)
+  srcOf(l: usize): usize {
+    return this.ls[l].src;
+  }
+
+  // Local `l` is now in state (k, src). A borrow is rooted at another local.
+  @Requires(l < this.ls.length && isKind(k))
+  @Requires(k == KBorrowed ? src < this.ls.length && src != l : src == 0)
+  @Ensures(this.ls.length == old(this.ls.length) && this.ls[l].k == k && this.ls[l].src == src)
+  set(l: usize, k: int, src: usize): void {
+    this.ls[l] = mk(k, src);
+  }
+
+  // Every `Borrowed(x)` alias dies (x is released, moved, consumed, mutated or redefined). Nothing else changes.
+  @Requires(x < this.ls.length)
+  @Ensures(this.ls.length == old(this.ls.length))
+  @Ensures(this.ls.every(s => !(s.k == KBorrowed && s.src == x)))
+  killBorrows(x: usize): void {
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      if (this.ls[i].k == KBorrowed && this.ls[i].src == x) {
+        this.ls[i] = mk(KDead, 0);
+      }
+      i += 1;
+    }
+  }
+
+  // Some slot of `x` is taken.
+  holeAny(x: usize): bool {
+    return this.holes.some(h => h.obj == x);
+  }
+
+  // Exactly the slot `k` of `x` is taken.
+  holeHas(x: usize, k: HoleKey): bool {
+    return this.holes.some(h => h.obj == x && h.sym == k.sym && h.idx == k.idx);
+  }
+
+  // Slot `k` of `x` may be taken: an equal key, or either key is symbolic (conservative).
+  @Ensures(this.holeHas(x, k) ==> result)
+  holeMay(x: usize, k: HoleKey): bool {
+    return this.holes.some(h => h.obj == x && (h.sym || k.sym || h.idx == k.idx));
+  }
+
+  @Requires(x < this.ls.length && (!k.sym || k.idx < this.ls.length))
+  @Ensures(this.holes.length == old(this.holes.length) + 1 && this.holeHas(x, k))
+  addHole(x: usize, k: HoleKey): void {
+    this.holes.push(HoleEntry { obj: x, sym: k.sym, idx: k.idx });
+  }
+
+  @Ensures(!this.holeHas(x, k) && this.holes.length <= old(this.holes.length))
+  removeHole(x: usize, k: HoleKey): void {
+    this.holes = this.holes.filter(h => !(h.obj == x && h.sym == k.sym && h.idx == k.idx));
+  }
+
+  @Ensures(!this.holeAny(x) && this.holes.length <= old(this.holes.length))
+  dropHolesOf(x: usize): void {
+    this.holes = this.holes.filter(h => h.obj != x);
+  }
+
+  // Below `o` in the lattice: every local's state is below its state in `o`, and every hole of this is a hole of `o`.
+  leq(o: State): bool {
+    if (o.ls.length != this.ls.length) {
       return false;
     }
-    i += 1;
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      if (!lsLeq(this.ls[i], o.ls[i])) {
+        return false;
+      }
+      i += 1;
+    }
+    return this.holes.every(h => holeIn(h, o.holes));
   }
-  return holesEq(a.holes, b.holes);
+
+  // A borrowed local depends on another local that is not itself borrowed.
+  borrowsFlat(): bool {
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      const s = this.ls[i];
+      if (s.k == KBorrowed
+          && (s.src >= this.ls.length || s.src == i || this.ls[s.src].k == KBorrowed)) {
+        return false;
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // The join of two states of the same function: per local `joinLs`, the hole sets united (the mismatch itself is
+  // reported per edge by verify.or). An upper bound of both.
+  @Requires(o.ls.length == this.ls.length)
+  @Ensures(result.ls.length == this.ls.length)
+  @Ensures(this.leq(result) && o.leq(result))
+  @Ensures(result.holes.length <= this.holes.length + o.holes.length)
+  join(o: State): State {
+    let ls: LState[] = [];
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      ls.push(joinLs(this.ls[i], o.ls[i]));
+      i += 1;
+    }
+    let holes = this.holes;
+    for (const h of o.holes) {
+      if (!holeIn(h, holes)) {
+        holes.push(h);
+      }
+    }
+    return new State(ls, holes);
+  }
+
+  // The same state (the fixpoint's termination test).
+  @Requires(o.ls.length == this.ls.length)
+  @Ensures(result ==> this.leq(o))
+  equals(o: State): bool {
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      if (this.ls[i].k != o.ls[i].k || this.ls[i].src != o.ls[i].src) {
+        return false;
+      }
+      i += 1;
+    }
+    return holesEq(this.holes, o.holes);
+  }
 }

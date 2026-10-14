@@ -192,12 +192,16 @@ decrements a count owned by the releasing local exactly once — hence no double
 the C compiler and allocator are correct; the MIR → C emitter is a direct translation.
 
 ## Verifier implementation notes
-Implementation: `compiler/verify/` (`wf.or` well-formedness, `state.or` abstract domain and joins,
-`rules.or` one transfer function per instruction/terminator, `verify.or` worklist fixpoint and
-reporting). Tests: `compiler/tests/verify_main.or` (hand-written cases), `compiler/tests/verify_text.or` (batch driver over textual MIR: differential test against the Lean checker, `tools/diff_verifier_lean.py`, and mutation corpus, `tools/mutate_mir.py`). Choices where the rules above were ambiguous:
+Implementation: `compiler/verify/` (`wf.or` well-formedness, `state.or` abstract domain and joins (class `State`),
+`rules.or` one transfer function per instruction/terminator (methods of class `Transfer`), `verify.or` worklist fixpoint
+(classes `Worklist`, `Fixpoint`) and reporting). The structural predicates shared with the lowering are in
+`compiler/mir/wellformed.or` (`isWellFormedFunction`, `isWellFormedProgram`, `instrInRange`, `termInRange`, ...); the
+verifier's own check is independent of them, and its contracts state that it implies them (docs/rewrite.md, step 3b). Tests: `compiler/tests/verify_main.or` (hand-written cases), `compiler/tests/verify_text.or` (batch driver over textual MIR: differential test against the Lean checker, `tools/diff_verifier_lean.py`, and mutation corpus, `tools/mutate_mir.py`). Choices where the rules above were ambiguous:
 
 - **Well-formedness first.** Index ranges, operand classes (int/usize/bool/ref), `ICall` arity and
-  argument/return classes, `paramCount <= locals.length`, no `void` locals (`OUsize` is a 64-bit pattern since v1.6: any int is well-formed). If a
+  argument/return classes, `paramCount <= locals.length`, no `void` locals, one span per instruction (`spans.length ==
+  instrs.length`), and a callee / closure target / vtable entry whose parameters are locals (checked at the use, since the
+  callee itself may be checked later) (`OUsize` is a 64-bit pattern since v1.6: any int is well-formed). If a
   function is not well-formed only these errors are reported (no dataflow). `IBuiltin` has no
   signature table in MIR, so only its operand/destination indices are checked.
   `IMove`/`IBorrow`/`ITakeField`/`IArrayTake`/`IArrayPop` need distinct source and destination;

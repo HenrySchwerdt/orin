@@ -31,6 +31,7 @@ export type Type =
                                   // kind: 0 Host, 1 FsGrant, 2 ProcessGrant, 3 StdioGrant, 4 ClockGrant (5 NetGrant reserved).
 
 // Names of the grant types (kind -> source name).
+@Ensures((k < 6) == (result != "?"))
 export function grantTypeName(k: usize): string {
   const names = ["Host", "FsGrant", "ProcessGrant", "StdioGrant", "ClockGrant", "NetGrant"];
   return k < names.length ? names[k] : "?";
@@ -64,6 +65,8 @@ export type UnionDef = { name: string; variants: VariantDef[]; };
 
 export type VariantDef = { name: string; payload: Type[]; };
 
+// The parameters are the first `paramCount` locals, so there are at least that many locals.
+@Invariant(this.paramCount <= this.locals.length)
 export type Function = {
   name: string;
   paramCount: usize;      // the first paramCount locals are the parameters
@@ -190,6 +193,7 @@ export type MutBuiltin = MArrPush | MArrPop;
 // ---------------------------------------------------------------------------
 
 // The kind of an integer type, or -1.
+@Ensures(result >= -1 && result <= 9)
 export function intKindOf(t: Type): int {
   return match (t) {
     TyInt => 3,
@@ -199,6 +203,9 @@ export function intKindOf(t: Type): int {
   };
 }
 
+// The integer type of kind `k`: the inverse of `intKindOf`.
+@Requires(isKindNumber(k))
+@Ensures(intKindOf(result) == k)
 export function kindType(k: int): Type {
   if (k == 3) {
     return TyInt;
@@ -209,6 +216,12 @@ export function kindType(k: int): Type {
   return TyIntK(k.toUsize());
 }
 
+// One of the ten integer kinds.
+export function isKindNumber(k: int): bool {
+  return k >= 0 && k <= 9;
+}
+
+@Requires(isKindNumber(k))
 export function kindName(k: int): string {
   const names = ["i8", "i16", "i32", "int", "isize", "u8", "u16", "u32", "u64", "usize"];
   return names[k.toUsize()];
@@ -219,15 +232,18 @@ export function kindSigned(k: int): bool {
 }
 
 // Types narrower than 64 bits: kept in an MInt and range-checked after every operation.
+@Ensures(result == (kindBits(k) < 64))
 export function kindNarrow(k: int): bool {
   return k == 0 || k == 1 || k == 2 || k == 5 || k == 6 || k == 7;
 }
 
 // Machine class: true for u64 / usize (an MUsize), false for the others (an MInt).
+@Ensures(result ==> !kindSigned(k) && kindBits(k) == 64)
 export function kindUnsigned64(k: int): bool {
   return k == 8 || k == 9;
 }
 
+@Ensures(result == 8 || result == 16 || result == 32 || result == 64)
 export function kindBits(k: int): int {
   if (k == 0 || k == 5) {
     return 8;
@@ -245,7 +261,22 @@ export function i64Min(): int {
   return -9223372036854775807 - 1;
 }
 
+// 2^e for 0 <= e <= 62.
+@Requires(e >= 0 && e <= 62)
+@Ensures(result > 0)
+export function pow2(e: int): int {
+  let r = 1;
+  let i = 0;
+  while (i < e) {
+    r = r * 2;
+    i += 1;
+  }
+  return r;
+}
+
 // Smallest value of the kind as an int (0 for the unsigned kinds).
+@Ensures(kindSigned(k) == (result < 0))
+@Ensures(kindSigned(k) && kindNarrow(k) ==> result == 0 - pow2(kindBits(k) - 1))
 export function kindLo(k: int): int {
   if (!kindSigned(k)) {
     return 0;
@@ -254,7 +285,10 @@ export function kindLo(k: int): int {
   return b == 8 ? -128 : (b == 16 ? -32768 : (b == 32 ? -2147483648 : i64Min()));
 }
 
-// Largest value of the kind as an int; for u64 / usize it is the pattern of 2^64-1, i.e. -1 (compare unsigned).
+// Largest value of the kind as an int; for u64 / usize it is the pattern of 2^64-1, i.e. -1 (compare unsigned). A narrow
+// kind has exactly 2^bits values from `kindLo` to `kindHi`.
+@Ensures(kindUnsigned64(k) == (result == -1))
+@Ensures(kindNarrow(k) ==> result - kindLo(k) + 1 == pow2(kindBits(k)))
 export function kindHi(k: int): int {
   const b = kindBits(k);
   if (kindSigned(k)) {
