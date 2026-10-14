@@ -21,6 +21,9 @@ claim about Orin in general.
 - **Orin counters**: `ORIN_STATS=1 ./prog` prints a one-line JSON summary to stderr at exit (allocations by
   kind, frees, retains, releases, COW copies vs in-place `make_unique` hits, array/string growth
   reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). Counters are plain increments compiled in always.
+  **Per allocation site** (opt-in, not compiled into normal builds): `orin2 compile --stats-sites` plus a runtime built with
+  `-DORIN_SITE_STATS`, then `ORIN_STATS=sites` reports allocations, bytes, retains, releases and COW copies per MIR instruction;
+  `tools/alloc_census.py` runs it on every benchmark, the HTTP server and the self-compile (docs/perf/alloc-census.md).
   `retains`/`releases` count non-immortal objects only; `releases` includes the children released while
   destroying an object. Bytes are object + buffer capacity (approximate, not RSS).
 - **Algorithm equivalences and deliberate choices** (no cherry-picking: where a choice favours one side it is listed):
