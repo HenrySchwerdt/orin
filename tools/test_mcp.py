@@ -238,6 +238,16 @@ def main():
     err, v, raw = c.call("check", {"entry": "bad.or", "sinceRevision": rev_ok})
     check("diags" in v, "a revision of another entry is not a base")
 
+    # parser error recovery: every syntax error of the file (three), no type error (the checker does not run)
+    write(os.path.join(proj, "syn.or"),
+          "function f(): int {\n  return true;\n}\n\nfunction g(): void {\n  let a = ;\n  h(1;\n}\n\nfunction k(: int): void {}\n\nfunction main(): void {}\n")
+    err, v, raw = c.call("check", {"entry": "syn.or"})
+    check(not err and v["errors"] == 3, "syntax errors: all 3 reported (%s)" % raw)
+    check([d.split(" ")[:2] for d in v.get("diags", [])]
+          == [["E0200", "syn.or:6:11"], ["E0200", "syn.or:7:6"], ["E0200", "syn.or:10:12"]],
+          "syntax errors: codes and positions in order (%s)" % raw)
+    os.remove(os.path.join(proj, "syn.or"))
+
     err, v, raw = c.call("check", {"entry": "missing.or"})
     check(err and "cannot read" in raw, "missing entry is a tool error")
     err, v, raw = c.call("check", {})

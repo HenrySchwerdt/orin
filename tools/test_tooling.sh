@@ -19,6 +19,9 @@ $ORIN2 test compiler/tests/check_body_test.or --runtime runtime
 $ORIN2 test compiler/tests/lower_test.or --runtime runtime
 # syntax unit tests (3c): Lexer, Parser progress and spans, operator table, well-formedness predicates, garbage input
 $ORIN2 test compiler/tests/syntax_test.or --runtime runtime
+# parser error recovery: several syntax errors per file, first error unchanged, no cascades, cap, termination on garbage
+$ORIN2 test compiler/tests/recovery_test.or --runtime runtime
+python3 tools/test_recovery.py --orinc "$ORIN2"
 $ORIN2 test compiler/tests/quality_test.or --runtime runtime
 $ORIN2 test compiler/tests/doccomments_test.or --runtime runtime
 sh tools/test_resources.sh

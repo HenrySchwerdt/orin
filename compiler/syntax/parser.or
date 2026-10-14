@@ -1,15 +1,20 @@
 // Recursive-descent parser: source text -> ast.Module (docs/bootstrap-subset.md §2, §4, §5): class `Parser`.
 // Errors: E0200 (syntax), E0201 (`var`), E0408 (constructs the language rejects at parse time), E0440 / E0441 / E0442
-// (annotations). Lexical errors (E0100) come from `lex`. The first error ends the parse: there is no error recovery,
-// so every diagnostic is the first one in source order (a recovering parser would report more errors, a
-// language-visible change).
+// (annotations). Lexical errors (E0100) come from `lex`. `parse` stops at the first error. `parseRecovering` reports
+// up to MAX_SYNTAX_ERRORS errors per file (error recovery, docs/rewrite.md "Parser error recovery"): after an error
+// the parser skips to the next statement of the block, the next member of the class or interface, or the next
+// top-level declaration. Its first error is always the one `parse` reports. When the file has errors the partial tree
+// is dropped, so no node built by recovery reaches the checker.
 //
 // The parser holds the tokens and a cursor `pos`. Every `parseX` method starts at the cursor and leaves it at the
 // first token after the construct. Progress: every successful `parseX` consumes at least one token (stated as an
 // `@Ensures`, mostly `spansFrom`: the node's span is exactly the extent of the tokens it consumed). The only methods
 // that may consume nothing are `parseTypeParamsB` / `parseTypeParams` (no `<`) and the speculative `tryTypeArgs`
 // (None), which leave the cursor where it was. Every loop of the parser calls a consuming method or stops at a token
-// it does not consume, so the parser terminates on any input; the final KEof token is never consumed.
+// it does not consume, so the parser terminates on any input; the final KEof token is never consumed. The four loops
+// that recover (block statements, class members, interface methods, module items) continue after a failed iteration
+// only when the recovery moved the cursor past the start of the failed construct or onto the `}` that ends the loop
+// (the `@Ensures` of `recoverStmt` / `recoverMember` / `recoverItem`), so recovery cannot spin either.
 
 import { Span, Diagnostic, spanTo, diag } from "../diag";
 import {
@@ -117,6 +122,83 @@ function mkExpr(kind: ExprKind, sp: Span): Expr {
   return Expr { kind: kind, span: sp };
 }
 
+// Error recovery: at most this many syntax errors per file; when there are more, the last reported one carries
+// SUPPRESSED_NOTE and the parse stops.
+export const MAX_SYNTAX_ERRORS: usize = 20;
+export const SUPPRESSED_NOTE: string = "further syntax errors suppressed";
+
+function isKwTok(t: Token, s: string): bool {
+  return match (t.kind) {
+    KKeyword => t.text == s,
+    _ => false,
+  };
+}
+
+// A keyword that starts a top-level declaration (inside a block or a class body it means a `}` is missing).
+function isDeclKwTok(t: Token): bool {
+  return match (t.kind) {
+    KKeyword => t.text == "function"
+        || t.text == "class"
+        || t.text == "interface"
+        || t.text == "type"
+        || t.text == "import"
+        || t.text == "export",
+    _ => false,
+  };
+}
+
+// A token where a statement starts for sure: a statement keyword or `@` (loop contract clauses).
+function isStmtStartTok(t: Token): bool {
+  return match (t.kind) {
+    KKeyword => t.text == "let"
+        || t.text == "const"
+        || t.text == "if"
+        || t.text == "while"
+        || t.text == "for"
+        || t.text == "return"
+        || t.text == "break"
+        || t.text == "continue",
+    KPunct => t.text == "@",
+    _ => false,
+  };
+}
+
+// The same diagnostic: code, message, span and notes.
+export function sameDiag(a: Diagnostic, b: Diagnostic): bool {
+  return a.code == b.code
+      && a.message == b.message
+      && a.span.file == b.span.file
+      && a.span.start == b.span.start
+      && a.span.end == b.span.end
+      && a.notes.join("\n") == b.notes.join("\n")
+      && a.notes.length == b.notes.length;
+}
+
+// The errors of a recovering parse of a source of `len` bytes in file `file`: one to MAX_SYNTAX_ERRORS parse errors with
+// spans inside the source, strictly ordered by their start (no error reported twice, none out of order); only the last
+// may carry a note, SUPPRESSED_NOTE, and only when the cap is reached.
+export function syntaxErrorsOk(ds: Diagnostic[], file: usize, len: usize): bool {
+  if (ds.length == 0 || ds.length > MAX_SYNTAX_ERRORS) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < ds.length) {
+    const d = ds[i];
+    if (!isSyntaxCode(d.code) || d.span.file != file || d.span.end > len) {
+      return false;
+    }
+    if (i > 0 && ds[i - 1].span.start >= d.span.start) {
+      return false;
+    }
+    if (d.notes.length > 0
+        && (i + 1 != MAX_SYNTAX_ERRORS || d.notes.length != 1 || d.notes[0] != SUPPRESSED_NOTE)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
 // The codes a parse error can have.
 export function isSyntaxCode(code: string): bool {
   return code == "E0100"
@@ -129,16 +211,268 @@ export function isSyntaxCode(code: string): bool {
 }
 
 // The parser over a token stream that ends with KEof (`lex` output). The cursor stays on a token: it never moves past
-// the final KEof.
+// the final KEof. Error recovery (only after `enableRecovery`): `errs` holds the errors reported so far (at most
+// MAX_SYNTAX_ERRORS); an error that starts at or before `floor` (the last error, or the token a recovery resumed at) is
+// dropped as a cascade; `unwinding` makes every catcher propagate the error to `parseModule`, which resumes at the cursor
+// (a declaration keyword, or the final KEof when the parse has stopped).
 @Invariant(this.toks.length > 0 && isEofTok(this.toks[this.toks.length - 1]))
 @Invariant(this.pos < this.toks.length)
+@Invariant(this.errs.length <= MAX_SYNTAX_ERRORS)
+@Invariant(!this.recovering ==> this.errs.length == 0 && !this.unwinding)
+@Invariant(this.errs.length > 0 ==> this.errs[this.errs.length - 1].span.start <= this.floor)
 export class Parser {
   private toks: Token[];
   private pos: usize = 0;
   private ops: OpTable = new OpTable();
+  private recovering: bool = false;
+  private errs: Diagnostic[] = [];
+  private floor: usize = 0;
+  private unwinding: bool = false;
 
   constructor(toks: Token[]) {
     this.toks = toks;
+  }
+
+  // Report several errors (see `parseRecovering`) instead of stopping at the first.
+  @Ensures(this.recovering && this.errs.length == old(this.errs.length))
+  enableRecovery(): void {
+    this.recovering = true;
+  }
+
+  // The errors reported by a recovering parse, in source order.
+  errors(): Diagnostic[] {
+    return this.errs;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Error recovery
+  // ---------------------------------------------------------------------------
+  // Recovery points: a statement of a block (`recoverStmt`), a member of a class or interface body (`recoverMember`),
+  // a top-level declaration (`recoverItem`). The innermost catcher reports the error and skips tokens; when it finds a
+  // declaration keyword (a `}` is missing) or the end of the file it sets `unwinding`, and the error travels to
+  // `parseModule` unreported. Progress: every recovery that lets a loop continue leaves the cursor past the start of
+  // the construct that failed, or on the `}` that ends the loop (stated as `@Ensures`), so recovery never spins.
+
+  // Reports `d` unless it is a cascade (it starts at or before the last error or resume point). The error past the cap
+  // is not reported: the last reported one gets SUPPRESSED_NOTE and the parse stops.
+  @Requires(this.recovering)
+  @Ensures(this.errs.length >= old(this.errs.length)
+      && this.errs.length <= old(this.errs.length) + 1)
+  @Ensures(this.errs.length == old(this.errs.length) + 1
+      ==> sameDiag(this.errs[this.errs.length - 1], d))
+  private report(d: Diagnostic): void {
+    if (this.errs.length > 0 && d.span.start <= this.floor) {
+      return;
+    }
+    if (this.errs.length == MAX_SYNTAX_ERRORS) {
+      const last = this.errs[MAX_SYNTAX_ERRORS - 1];
+      this.errs[MAX_SYNTAX_ERRORS - 1] = Diagnostic {
+        code: last.code,
+        message: last.message,
+        span: last.span,
+        notes: last.notes.concat([SUPPRESSED_NOTE]),
+      };
+      this.stop();
+      return;
+    }
+    this.errs.push(d);
+    if (d.span.start > this.floor) {
+      this.floor = d.span.start;
+    }
+  }
+
+  // Ends the parse: the cursor goes to the final KEof and the catchers unwind.
+  @Ensures(this.unwinding && this.atEnd())
+  private stop(): void {
+    this.pos = this.toks.length - 1;
+    this.unwinding = true;
+  }
+
+  // Continue at token `i`. An error at that token or the next one is taken as a cascade of the recovery and dropped:
+  // a construct that fails at once after a resume point means the tokens are still out of step (a `}` missing or
+  // doubled), and every following line would report "expected `(` or `:` in class member, found `.`" and the like.
+  @Requires(i < this.toks.length)
+  @Ensures(this.pos == i && result && this.floor >= this.toks[i].span.start)
+  private resumeAt(i: usize): bool {
+    this.pos = i;
+    const s = this.tokAbs(i + 1).span.start;
+    if (s > this.floor) {
+      this.floor = s;
+    }
+    return true;
+  }
+
+  // Unwind to the top level, which continues at token `i` (a declaration keyword).
+  @Requires(i < this.toks.length)
+  @Ensures(this.pos == i && this.unwinding && !result)
+  private unwindAt(i: usize): bool {
+    this.resumeAt(i);
+    this.unwinding = true;
+    return false;
+  }
+
+  // `{` minus `}` in the tokens `first` .. `last` - 1, never below zero: the brace nesting of the cursor relative to the
+  // start of the construct that failed.
+  private braceDepth(first: usize, last: usize): usize {
+    let depth: usize = 0;
+    let i = first;
+    while (i < last) {
+      const t = this.toks[i];
+      if (isPunctTok(t, "{")) {
+        depth += 1;
+      } else if (isPunctTok(t, "}") && depth > 0) {
+        depth -= 1;
+      }
+      i += 1;
+    }
+    return depth;
+  }
+
+  // A statement of a block failed with `d`; it started at token `st`. Reports `d` and skips to the next statement:
+  // after a `;` at the statement's brace level; to a `}` that closes the block (not consumed); past the `}` that ends
+  // the body of an `if` / `while` / `for` / block statement (unless `else` follows); or to a token after the error that
+  // starts a statement. False (propagate `d`): no recovery, the parse is unwinding, a declaration keyword at the
+  // statement's level (resume there, at the top level) or the end of the file (stop).
+  @Requires(st <= this.pos)
+  @Ensures(result ==> this.recovering && !this.unwinding && (this.pos > st || this.isP("}")))
+  @Ensures(!result && this.recovering ==> this.unwinding)
+  private recoverStmt(d: Diagnostic, st: usize): bool {
+    if (!this.recovering || this.unwinding) {
+      return false;
+    }
+    this.report(d);
+    if (this.unwinding) {
+      return false;
+    }
+    const fail = this.pos;
+    let depth = this.braceDepth(st, fail);
+    const first = this.toks[st];
+    const bodied = isKwTok(first, "if")
+        || isKwTok(first, "while")
+        || isKwTok(first, "for")
+        || isPunctTok(first, "{");
+    let i = fail;
+    while (true) {
+      const t = this.toks[i];
+      if (isEofTok(t)) {
+        this.stop();
+        return false;
+      }
+      if (isPunctTok(t, "{")) {
+        depth += 1;
+      } else if (isPunctTok(t, "}")) {
+        if (depth == 0) {
+          return this.resumeAt(i);
+        }
+        depth -= 1;
+        if (depth == 0 && bodied && !isKwTok(this.tokAbs(i + 1), "else")) {
+          return this.resumeAt(i + 1);
+        }
+      } else if (depth == 0) {
+        if (isPunctTok(t, ";")) {
+          return this.resumeAt(i + 1);
+        }
+        if (isDeclKwTok(t)) {
+          return this.unwindAt(i);
+        }
+        if (i > fail && isStmtStartTok(t)) {
+          return this.resumeAt(i);
+        }
+      }
+      i += 1;
+    }
+    return false;
+  }
+
+  // A member of a class or interface body failed with `d`; it started at token `st`. Reports `d` and skips to the next
+  // member: after a `;` or after the `}` that closes a method body, at the member's brace level; to a `@` after the
+  // error; to the `}` that closes the body (not consumed). False: as `recoverStmt`.
+  @Requires(st <= this.pos)
+  @Ensures(result ==> this.recovering && !this.unwinding && (this.pos > st || this.isP("}")))
+  @Ensures(!result && this.recovering ==> this.unwinding)
+  private recoverMember(d: Diagnostic, st: usize): bool {
+    if (!this.recovering || this.unwinding) {
+      return false;
+    }
+    this.report(d);
+    if (this.unwinding) {
+      return false;
+    }
+    const fail = this.pos;
+    let depth = this.braceDepth(st, fail);
+    let i = fail;
+    while (true) {
+      const t = this.toks[i];
+      if (isEofTok(t)) {
+        this.stop();
+        return false;
+      }
+      if (isPunctTok(t, "{")) {
+        depth += 1;
+      } else if (isPunctTok(t, "}")) {
+        if (depth == 0) {
+          return this.resumeAt(i);
+        }
+        depth -= 1;
+        if (depth == 0) {
+          return this.resumeAt(i + 1);
+        }
+      } else if (depth == 0) {
+        if (isPunctTok(t, ";")) {
+          return this.resumeAt(i + 1);
+        }
+        if (isDeclKwTok(t)) {
+          return this.unwindAt(i);
+        }
+        if (i > fail && isPunctTok(t, "@")) {
+          return this.resumeAt(i);
+        }
+      }
+      i += 1;
+    }
+    return false;
+  }
+
+  // A top-level declaration failed with `d`; it started at token `st`. Reports `d` (unless it was reported where it was
+  // caught, `unwinding`) and skips to the next `function`, `class`, `interface`, `type`, `import`, `export` or `@` at the
+  // declaration's brace level after the error, or to the end of the file. False only without recovery.
+  @Requires(st <= this.pos)
+  @Ensures(result == this.recovering)
+  @Ensures(result ==> !this.unwinding && (this.pos > st || this.atEnd()))
+  private recoverItem(d: Diagnostic, st: usize): bool {
+    if (!this.recovering) {
+      return false;
+    }
+    if (this.unwinding) {
+      this.unwinding = false;
+      return true;
+    }
+    this.report(d);
+    if (this.unwinding) {
+      this.unwinding = false;
+      return true;
+    }
+    const fail = this.pos;
+    let depth = this.braceDepth(st, fail);
+    let i = fail;
+    while (!isEofTok(this.toks[i])) {
+      const t = this.toks[i];
+      if (isPunctTok(t, "{")) {
+        depth += 1;
+      } else if (isPunctTok(t, "}")) {
+        if (depth > 0) {
+          depth -= 1;
+        }
+      } else if (depth == 0 && i > fail && (isDeclKwTok(t) || isPunctTok(t, "@"))) {
+        // A declaration keyword or `@` at the top level is a reliable resume point, and an annotation error starts
+        // at its `@`: no cascade window here (unlike `resumeAt`).
+        this.pos = i;
+        return true;
+      }
+      i += 1;
+    }
+    this.pos = i;
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -782,8 +1116,13 @@ export class Parser {
     this.expectP("{")?;
     let members: ClassMember[] = [];
     while (!this.isP("}")) {
-      const m = this.parseMember()?;
-      members.push(m);
+      const st = this.pos;
+      const m = this.parseMember();
+      if (m.isOk()) {
+        members.push(m.unwrap());
+      } else if (!this.recoverMember(m.unwrapErr(), st)) {
+        return Err(m.unwrapErr());
+      }
     }
     this.pos += 1;
     return Ok(
@@ -823,8 +1162,13 @@ export class Parser {
     this.expectP("{")?;
     let methods: IfaceMethod[] = [];
     while (!this.isP("}")) {
-      const m = this.parseIfaceMethod()?;
-      methods.push(m);
+      const st = this.pos;
+      const m = this.parseIfaceMethod();
+      if (m.isOk()) {
+        methods.push(m.unwrap());
+      } else if (!this.recoverMember(m.unwrapErr(), st)) {
+        return Err(m.unwrapErr());
+      }
     }
     this.pos += 1;
     return Ok(
@@ -1225,23 +1569,43 @@ export class Parser {
       if (this.isEof()) {
         return Err(this.errExpected("`}`"));
       }
+      const st = this.pos;
       if (this.isP("@")) {
         // Loop contract clauses: one SContract statement per clause, directly before the loop.
-        const cs = this.parseClauses()?;
-        checkPlacement(cs, T_LOOP)?;
-        for (const c of cs) {
-          stmts.push(Stmt { kind: SContract(c), span: c.span });
+        const cs = this.parseLoopClauses();
+        if (cs.isErr()) {
+          if (!this.recoverStmt(cs.unwrapErr(), st)) {
+            return Err(cs.unwrapErr());
+          }
+          continue;
         }
-        if (!this.isKw("while") && !this.isKw("for")) {
-          return Err(this.errExpected("`while` or `for` after a loop contract clause"));
+        for (const c of cs.unwrap()) {
+          stmts.push(c);
         }
       }
-      const s = this.parseStmt()?;
-      stmts.push(s);
+      const s = this.parseStmt();
+      if (s.isOk()) {
+        stmts.push(s.unwrap());
+      } else if (!this.recoverStmt(s.unwrapErr(), st)) {
+        return Err(s.unwrapErr());
+      }
     }
     const blk = Block { stmts: stmts, span: spanTo(open, this.toks[this.pos].span) };
     this.pos += 1;
     return Ok(blk);
+  }
+
+  // Loop contract clauses (the cursor is at the first `@`) as SContract statements; a loop must follow.
+  @Requires(this.isP("@"))
+  @Ensures(result.isOk() ==> this.pos > old(this.pos) && result.unwrap().length >= 1)
+  @Ensures(result.isOk() ==> this.isKw("while") || this.isKw("for"))
+  private parseLoopClauses(): Result<Stmt[], Diagnostic> {
+    const cs = this.parseClauses()?;
+    checkPlacement(cs, T_LOOP)?;
+    if (!this.isKw("while") && !this.isKw("for")) {
+      return Err(this.errExpected("`while` or `for` after a loop contract clause"));
+    }
+    return Ok(cs.map(c => Stmt { kind: SContract(c), span: c.span }));
   }
 
   @Ensures(result.isOk()
@@ -2006,16 +2370,57 @@ export class Parser {
   // Module
   // ---------------------------------------------------------------------------
 
-  // All items up to the final KEof, in file `file`.
+  // All items up to the final KEof, in file `file`. With recovery the result is always a module (the errors are in
+  // `errors()`; items that failed are left out).
   @Ensures(result.isOk() ==> this.atEnd() && result.unwrap().file == file)
+  @Ensures(this.recovering ==> result.isOk() && !this.unwinding)
   parseModule(file: usize): Result<Module, Diagnostic> {
     let items: Item[] = [];
     while (!this.isEof()) {
-      const it = this.parseItem()?;
-      items.push(it);
+      const st = this.pos;
+      const it = this.parseItem();
+      if (it.isOk()) {
+        items.push(it.unwrap());
+      } else if (!this.recoverItem(it.unwrapErr(), st)) {
+        return Err(it.unwrapErr());
+      }
     }
     return Ok(Module { file: file, items: items });
   }
+}
+
+// True when the errors of a recovering parse begin with the error `parse` reports (and only then there are any).
+function agreesWithParse(r: Result<Module, Diagnostic[]>, file: usize, src: string): bool {
+  const first = parse(file, src);
+  if (r.isOk() || first.isOk()) {
+    return r.isOk() == first.isOk();
+  }
+  return sameDiag(r.unwrapErr()[0], first.unwrapErr());
+}
+
+// The syntax tree of `src` (file `file`), or its syntax errors with error recovery: at most MAX_SYNTAX_ERRORS, in source
+// order, the first one exactly the error `parse` reports. A lexical error ends the scan, so it is the only error. When
+// there are errors the partial tree is dropped: nothing built by recovery reaches a later phase.
+@Ensures(result.isOk()
+    ==> result.unwrap().file == file && moduleWellFormed(result.unwrap(), src.length))
+@Ensures(result.isErr() ==> syntaxErrorsOk(result.unwrapErr(), file, src.length))
+@Ensures(agreesWithParse(result, file, src))
+export function parseRecovering(file: usize, src: string): Result<Module, Diagnostic[]> {
+  const lr = lex(file, src);
+  if (lr.isErr()) {
+    return Err([lr.unwrapErr()]);
+  }
+  let p = new Parser(lr.unwrap());
+  p.enableRecovery();
+  const m = p.parseModule(file);
+  if (m.isErr()) {
+    return Err([m.unwrapErr()]);
+  }
+  const es = p.errors();
+  if (es.length > 0) {
+    return Err(es);
+  }
+  return Ok(m.unwrap());
 }
 
 // The syntax tree of `src` (file `file`), or the first lexical or syntax error. A module is well formed (spans nested

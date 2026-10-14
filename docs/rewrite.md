@@ -552,7 +552,8 @@ Error recovery: there is none. The parser stops at the first error (the language
 in the parser "diagnostics as a field" would only duplicate the `Err` that `?` propagates, so it stays the `Err` of the method (the lexer keeps its first error in a field for speed, below).
 `parseTerminatesOnGarbage` runs 400 random token soups and every prefix of a 400-byte program through `parse` and checks that
 each returns with a well-formed module or a parse error inside the source. A recovering parser (several syntax errors per
-file) is a language-visible change: **NEEDS_DECISION**, not done here.
+file) is a language-visible change: **NEEDS_DECISION**, not done here. (Decided and done afterwards: "Parser error recovery"
+below.)
 
 Precedence climbing replaces the level-per-function recursion: one call per operand instead of seven, the table is data
 (`binaryOps()`), and associativity is a column. The tree is the same for left-associative operators (all of them; `?:` and
