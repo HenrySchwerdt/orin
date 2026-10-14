@@ -1,6 +1,6 @@
 # Progress
 
-_Updated: 2026-10-13_
+_Updated: 2026-10-14_
 
 ## Current stage: self-hosting alpha, first public pre-release
 - Release **v0.1.0-alpha.1** (Linux x86-64, macOS arm64):
@@ -22,6 +22,7 @@ _Updated: 2026-10-13_
 | Runtime R1: string/number std in Orin (spec 19) | done |
 | Lean: RC machine safety, COW, checker soundness for the MIR core | done (partial) |
 | Tooling: fmt, check --format=json, lsp, mcp, VS Code | done |
+| Parser error recovery: up to 20 syntax errors per file (CLI, JSON, LSP, MCP), first error unchanged, no type checking of a file that does not parse (docs/rewrite.md "Parser error recovery") | done |
 | Releases (dispatch workflow, packages, seed C) | done |
 | Seed bootstrap (ADR-0014) | done |
 | Floats (`float`, `f32`), `std:math`, `Map<K,V>` (ADR-0018) | done |
@@ -36,9 +37,10 @@ _Updated: 2026-10-13_
 | Fixed-width integers (`i8`..`u64`, `isize`, `usize`; 128-bit deferred, E0431) and template-literal interpolation (ADR-0022) | done |
 | Built-in annotations `@Test` (`orin test`, `std:test`), `@Deprecated`, `@Inline` (ADR-0024, docs/testing.md) | done |
 | Resources (`File`, ADR-0025): checker + verifier rules, scope API, streaming `std:fs` (unstable until capabilities) | done |
-| Compiler rewrite with the full language (ADR-0015, docs/rewrite.md): `diag` + `loader` (step 1), checker foundation `check/{env,fnctx,types}` (step 2a: Map-based symbol tables / instance indexes, `Scope` class), expression and statement checker `check/body.or` split into `fnctx` / `ops` / `match` / `call` / `lift` / `hirok` / `expr` / `stmt` (step 2b: classes `FnCtx`, `ExprChecker`, `StmtChecker`, `Coverage`, `Inference`; 230 contract clauses; byte-identical output), `lower/` (step 3a: class `Lowerer`, `BlockBuilder`, `Locals`, `OwnedScope`; 97 contract clauses; **MIR source spans**, ADR-0020 D3, MIR v2.0; byte-identical C / LLVM output), `opt/` + `cemit/` + `llvm/` (step 3d: classes `ParamInference`, `BlockSink`, `RewritePlan`, `CSymbols`, `CFunctionEmitter`, `LlvmSymbols`, `LlvmFunctionEmitter`, ...; per-function code generation from a read-only symbol table, rule 8; byte-identical C / LLVM output) | in progress (remaining `check` files, verify, tooling) |
+| Compiler rewrite with the full language (ADR-0015, docs/rewrite.md): `diag` + `loader` (step 1), checker foundation `check/{env,fnctx,types}` (step 2a: Map-based symbol tables / instance indexes, `Scope` class), expression and statement checker `check/body.or` split into `fnctx` / `ops` / `match` / `call` / `lift` / `hirok` / `expr` / `stmt` (step 2b: classes `FnCtx`, `ExprChecker`, `StmtChecker`, `Coverage`, `Inference`; 230 contract clauses; byte-identical output), `lower/` (step 3a: class `Lowerer`, `BlockBuilder`, `Locals`, `OwnedScope`; 97 contract clauses; **MIR source spans**, ADR-0020 D3, MIR v2.0; byte-identical C / LLVM output), `syntax/` (step 3c: classes `Lexer`, `Parser`, `OpTable`; precedence climbing over an operator table; AST well-formedness predicates; 129 contract clauses; parse errors and generated code byte-identical; then parser error recovery, several syntax errors per file), `opt/` + `cemit/` + `llvm/` (step 3d: classes `ParamInference`, `BlockSink`, `RewritePlan`, `CSymbols`, `CFunctionEmitter`, `LlvmSymbols`, `LlvmFunctionEmitter`, ...; per-function code generation from a read-only symbol table, rule 8; byte-identical C / LLVM output) | in progress (remaining `check` files) |
 | Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. **Stage B done** (transitive effect inference, `orin effects`, OSIG `MAY_PERFORM`, `[effects]` policy; docs/capabilities.md). Stages C-D (library adapters, lineage, strict policy gates) not started |
-| Concurrency (ADR-0017), incremental analysis | not started |
+| Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): `std:task` (scope / spawn / join, bounded channels, grants moved into tasks, `parallelMap`), L0 threads and monitors, one temporary C interface with a porting table to R3 | done; C parts `TESTED_ONLY` (ThreadSanitizer, ASan + UBSan, stress); no `async` / `await`, cancellation, deadlock detection or M:N scheduler; concurrent HTTP server waits for `std:net` |
+| Incremental analysis | not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
@@ -48,5 +50,5 @@ See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-softwa
 ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 1. Interfaces + contract clauses phase 1 merged; OSIG/`orin graph`/`orin diff` started in parallel.
 2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), ~~resources~~ (done, ADR-0025), ~~generic classes~~ (done, ADR-0026: all language-freeze prerequisites are in; the language freeze and the compiler rewrite of ADR-0015 can start); capabilities (ADR-0021 Stage A, ADR-0027: done) → std I/O freeze (owner decision, open questions in ADR-0027).
-3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a and 3d done (3a added MIR source spans, ADR-0020 D3; 3d the optimiser and both backends, with per-function code generation ready for ADR-0039 `.parallel()`); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...), then verify, tooling.
+3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a, 3b (verifier), 3c, 3d (optimiser and both backends, per-function code generation ready for ADR-0039 `.parallel()`) and 3e (tooling) done (3a added MIR source spans, ADR-0020 D3; 3c the lexer and parser); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...).
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.

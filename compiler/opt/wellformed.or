@@ -1,57 +1,36 @@
-// Predicates for the contracts of the optimiser (rewrite step 3d). They build on the MIR predicates of the lowering
-// (`lower/wellformed.or`) and state what every pass must keep: the function stays well formed, its signature is the
-// same, locals are only appended, the calls and builtins (everything with an effect) are the same calls in the same
+// Predicates for the contracts of the optimiser (rewrite step 3d). They build on the shared structural MIR predicates
+// (`mir/wellformed.or`, step 3b) and state what every pass must keep: the function stays well formed, its signature is
+// the same, locals are only appended, the calls and builtins (everything with an effect) are the same calls in the same
 // order, and the instruction counts move only in the direction the pass claims.
 
-import { MType, MLocal, Instr, MBlock, MFunction, MProgram, builtinName, hasSpan } from "../mir";
 import {
-  blocksLocalsBelow, blocksStrsBelow, blockTargetsInRange, allReachable, spansComplete, mtyEq,
-} from "../lower";
+  MType, MLocal, Instr, MBlock, MFunction, MProgram, builtinName, hasSpan, blocksLocalsBelow,
+  blockTargetsInRange, allReachable, spansComplete, spansAligned, paramsWellFormed,
+  isWellFormedFunction, isWellFormedProgram,
+} from "../mir";
+import { mtyEq } from "../lower";
 
 // ---------------------------------------------------------------- well-formedness
 
-// Every block has one span per instruction.
-export function spansAligned(blocks: MBlock[]): bool {
-  return blocks.every(b => b.spans.length == b.instrs.length);
-}
-
-function refsIn(i: Instr, nf: usize, nv: usize): bool {
-  return match (i) {
-    ICall(_, g, _) => g < nf,
-    IClosure(_, g, _) => g < nf,
-    IIface(_, vt, _) => vt < nv,
-    _ => true,
-  };
-}
-
-// Every function and vtable an instruction names exists (`nf` functions, `nv` vtables).
-export function calleesInRange(blocks: MBlock[], nf: usize, nv: usize): bool {
-  return blocks.every(b => b.instrs.every(i => refsIn(i, nf, nv)));
-}
-
-// The structure of one function, without its program: an entry block, parameters that are locals with one mode each, one
-// span per instruction, only declared locals, branch targets inside the function.
+// The structure of one function, without its program (the passes that see only the function): an entry block,
+// parameters that are locals with one mode each, one span per instruction, only declared locals, branch targets inside
+// the function.
 export function fnShapeOk(f: MFunction): bool {
   return f.blocks.length > 0
-      && f.paramCount <= f.locals.length
-      && f.paramOwned.length == f.paramCount
+      && paramsWellFormed(f)
       && spansAligned(f.blocks)
       && blocksLocalsBelow(f.blocks, f.locals.length)
       && blockTargetsInRange(f.blocks);
 }
 
-// `fnShapeOk` and every string, function and vtable index of `f` exists in `p`.
+// `f` is well formed in `p`: the shared predicate of `mir/` (every local, string, function, vtable and block index
+// exists).
 export function fnWellFormed(p: MProgram, f: MFunction): bool {
-  return fnShapeOk(f)
-      && blocksStrsBelow(f.blocks, p.strings.length)
-      && calleesInRange(f.blocks, p.functions.length, p.vtables.length);
+  return isWellFormedFunction(p, f);
 }
 
-// Every function well formed, `main` and every vtable entry exist.
 export function progWellFormed(p: MProgram): bool {
-  return p.main < p.functions.length
-      && p.vtables.every(v => v.funcs.every(g => g < p.functions.length))
-      && p.functions.every(f => fnWellFormed(p, f));
+  return isWellFormedProgram(p);
 }
 
 // ---------------------------------------------------------------- what a pass keeps

@@ -436,6 +436,175 @@ static void test_policy_and_scopes(void) {
     CHECK(orin_platform_path_real(root, strlen(root), r, 3) == -1); /* buffer too small */
 }
 
+/* ---------------------------------------------------------------- threads and monitors (ADR-0017 stage 0) */
+
+static int64_t g_m;
+static uint64_t g_ids[2];
+
+static void th_ids(void *arg) { g_ids[(size_t)arg] = orin_platform_thread_id(); }
+
+static void th_incr(void *arg) {
+    for (int i = 0; i < (int)(size_t)arg; i++) {
+        orin_platform_monitor_lock(g_m);
+        uint64_t v;
+        orin_platform_monitor_get(g_m, 0, &v);
+        orin_platform_monitor_set(g_m, 0, v + 1);
+        orin_platform_monitor_unlock(g_m);
+    }
+}
+
+static void th_wait_for_flag(void *arg) { /* waits until word 1 is set, then publishes word 2 = word 1 + 1 */
+    (void)arg;
+    uint64_t v = 0;
+    orin_platform_monitor_lock(g_m);
+    while (orin_platform_monitor_get(g_m, 1, &v) == 0 && v == 0) orin_platform_monitor_wait(g_m, 0);
+    orin_platform_monitor_set(g_m, 2, v + 1);
+    orin_platform_monitor_unlock(g_m);
+}
+
+/* sleeps on queue 1 until word 1 is non-zero, consumes that (sets it back to 0) and counts itself out of word 3 */
+static void th_wait_queue1(void *arg) {
+    (void)arg;
+    uint64_t v = 0;
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 3, &v);
+    orin_platform_monitor_set(g_m, 3, v + 1);
+    for (;;) {
+        orin_platform_monitor_get(g_m, 1, &v);
+        if (v != 0) break;
+        orin_platform_monitor_wait(g_m, 1);
+    }
+    orin_platform_monitor_set(g_m, 1, 0);
+    orin_platform_monitor_get(g_m, 3, &v);
+    orin_platform_monitor_set(g_m, 3, v - 1);
+    orin_platform_monitor_unlock(g_m);
+}
+
+static void th_die_holding(void *arg) {
+    (void)arg;
+    orin_platform_monitor_lock(g_m);
+    orin_platform_thread_exit();
+}
+
+static void th_print(void *arg) {
+    char line[32];
+    int n = snprintf(line, sizeof line, "concurrent line %d", (int)(size_t)arg);
+    for (int i = 0; i < 200; i++) orin_platform_write_line(ORIN_PLATFORM_STDOUT, line, (size_t)n);
+}
+
+static void test_threads_and_monitors(void) {
+    /* thread ids: stable per thread, distinct between threads */
+    uint64_t me = orin_platform_thread_id();
+    CHECK(me >= 1 && orin_platform_thread_id() == me);
+    void *arg = NULL;
+    int64_t a = orin_platform_thread_create(th_ids, (void *)0), b = orin_platform_thread_create(th_ids, (void *)1);
+    CHECK(a > 0 && b > 0 && a != b);
+    CHECK(orin_platform_thread_join(a, &arg) == 0 && arg == (void *)0);
+    CHECK(orin_platform_thread_join(b, &arg) == 0 && arg == (void *)1);
+    CHECK(g_ids[0] != g_ids[1] && g_ids[0] != me && g_ids[1] != me);
+    /* a joined (stale), zero or forged handle is refused, never dereferenced */
+    CHECK(orin_platform_thread_join(a, &arg) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_thread_join(0, &arg) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_thread_join((int64_t)1 << 40, &arg) == ORIN_PLATFORM_EINVAL);
+
+    /* monitor access discipline */
+    g_m = orin_platform_monitor_new(3);
+    CHECK(g_m > 0);
+    uint64_t v = 99;
+    CHECK(orin_platform_monitor_get(g_m, 0, &v) == ORIN_PLATFORM_EINVAL && v == 99); /* not locked */
+    CHECK(orin_platform_monitor_unlock(g_m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_lock(g_m) == 0);
+    CHECK(orin_platform_monitor_lock(g_m) == ORIN_PLATFORM_EDEADLK);
+    CHECK(orin_platform_monitor_get(g_m, 0, &v) == 0 && v == 0); /* new words are 0 */
+    CHECK(orin_platform_monitor_set(g_m, 2, 7) == 0 && orin_platform_monitor_get(g_m, 2, &v) == 0 && v == 7);
+    CHECK(orin_platform_monitor_get(g_m, 3, &v) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_set(g_m, 3, 1) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_grow(g_m, 2) == ORIN_PLATFORM_EINVAL); /* never shrinks */
+    CHECK(orin_platform_monitor_grow(g_m, 100) == 0 && orin_platform_monitor_get(g_m, 99, &v) == 0 && v == 0);
+    CHECK(orin_platform_monitor_get(g_m, 2, &v) == 0 && v == 7);
+    CHECK(orin_platform_monitor_free(g_m) == ORIN_PLATFORM_EBUSY); /* locked */
+    CHECK(orin_platform_monitor_unlock(g_m) == 0);
+
+    /* mutual exclusion: 8 threads x 5,000 increments of a plain word */
+    int64_t th[8];
+    for (int i = 0; i < 8; i++) th[i] = orin_platform_thread_create(th_incr, (void *)5000);
+    for (int i = 0; i < 8; i++) CHECK(th[i] > 0 && orin_platform_thread_join(th[i], &arg) == 0);
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 0, &v);
+    CHECK(v == 8 * 5000);
+    orin_platform_monitor_unlock(g_m);
+
+    /* condition variable: the waiter sleeps until the flag is set */
+    int64_t w = orin_platform_thread_create(th_wait_for_flag, NULL);
+    CHECK(w > 0);
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_set(g_m, 1, 41);
+    CHECK(orin_platform_monitor_notify(g_m, 0, 1) == 0);
+    orin_platform_monitor_unlock(g_m);
+    CHECK(orin_platform_thread_join(w, &arg) == 0);
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 2, &v);
+    CHECK(v == 42);
+    CHECK(orin_platform_monitor_wait(g_m + 12345, 0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_notify(0, 0, 1) == ORIN_PLATFORM_EINVAL);
+    orin_platform_monitor_unlock(g_m);
+    CHECK(orin_platform_monitor_notify(g_m, 0, 1) == ORIN_PLATFORM_EINVAL); /* not held */
+
+    /* two condition queues: a notify of queue 0 does not wake a waiter of queue 1; notify_one wakes one waiter */
+    CHECK(orin_platform_monitor_lock(g_m) == 0);
+    CHECK(orin_platform_monitor_wait(g_m, 2) == ORIN_PLATFORM_EINVAL && orin_platform_monitor_notify(g_m, -1, 0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_notify(g_m, 1, 0) == 0); /* nobody waits: harmless */
+    orin_platform_monitor_set(g_m, 1, 0);
+    orin_platform_monitor_unlock(g_m);
+    int64_t q[3];
+    for (int i = 0; i < 3; i++) q[i] = orin_platform_thread_create(th_wait_queue1, NULL);
+    for (int woken = 0; woken < 3; woken++) {
+        for (;;) { /* wait until the number of sleepers is what we expect (word 3 counts them) */
+            orin_platform_monitor_lock(g_m);
+            orin_platform_monitor_get(g_m, 3, &v);
+            orin_platform_monitor_unlock(g_m);
+            if (v == (uint64_t)(3 - woken)) break;
+        }
+        orin_platform_monitor_lock(g_m);
+        orin_platform_monitor_notify(g_m, 0, 1); /* the wrong queue: nobody wakes */
+        orin_platform_monitor_set(g_m, 1, 1);
+        orin_platform_monitor_notify(g_m, 1, 0); /* one waiter of queue 1 */
+        orin_platform_monitor_unlock(g_m);
+        for (;;) {
+            orin_platform_monitor_lock(g_m);
+            orin_platform_monitor_get(g_m, 3, &v);
+            orin_platform_monitor_unlock(g_m);
+            if (v == (uint64_t)(3 - woken - 1)) break;
+        }
+    }
+    for (int i = 0; i < 3; i++) CHECK(orin_platform_thread_join(q[i], &arg) == 0);
+
+    /* a thread that ends while holding a monitor does not leave it locked */
+    int64_t d = orin_platform_thread_create(th_die_holding, NULL);
+    CHECK(d > 0 && orin_platform_thread_join(d, &arg) == 0);
+    CHECK(orin_platform_monitor_lock(g_m) == 0 && orin_platform_monitor_unlock(g_m) == 0);
+
+    /* free: the handle is dead afterwards, a recycled record has a new generation */
+    CHECK(orin_platform_monitor_free(g_m) == 0);
+    CHECK(orin_platform_monitor_lock(g_m) == ORIN_PLATFORM_EINVAL && orin_platform_monitor_free(g_m) == ORIN_PLATFORM_EINVAL);
+    int64_t g2 = orin_platform_monitor_new(1);
+    CHECK(g2 > 0 && g2 != g_m && orin_platform_monitor_lock(g_m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_free(g2) == 0);
+
+    /* the process-wide stdout buffer is serialised: four threads print 200 lines each */
+    int64_t pr[4];
+    fflush(stdout);
+    int saved = dup(1), devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, 1);
+    for (int i = 0; i < 4; i++) pr[i] = orin_platform_thread_create(th_print, (void *)(size_t)i);
+    for (int i = 0; i < 4; i++) CHECK(pr[i] > 0 && orin_platform_thread_join(pr[i], &arg) == 0);
+    orin_platform_flush();
+    dup2(saved, 1);
+    close(saved);
+    close(devnull);
+    orin_platform_runtime_lock();
+    orin_platform_runtime_unlock();
+}
 
 /* ---- network (ADR-0033): loopback sockets; handle identity and scope are refused before any system call ---- */
 static orin_platform_net root_grant(void) {
@@ -584,6 +753,7 @@ int main(void) {
     test_process_and_output();
     test_stdin();
     test_policy_and_scopes();
+    test_threads_and_monitors();
     test_net();
     char cmd[300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);

@@ -4,7 +4,7 @@
 // program-wide `CSymbols` and the program (callee signatures), and writes nothing but its own text, so the text of a
 // function depends only on the function, the symbol table and the callees' `inout` flags (rule 8; `emitCFunction`).
 
-import { BinOp, UnOp, Builtin } from "../hir";
+import { BinOp, UnOp, Builtin, taskOpC } from "../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram,
 } from "../mir";
@@ -221,6 +221,7 @@ export function builtinC(op: Builtin, a: string[], rt: MType): string {
     BFloatIsNaN => "((int64_t)(!!__builtin_isnan(" + a[0] + ")))",
     BFloatIsFinite => "((int64_t)(!!__builtin_isfinite(" + a[0] + ")))",
     BIntId => "(" + a[0] + ")",
+    BTask(k) => taskOpC(k) + "(" + a.join(", ") + ")",
     _ => "?",
   };
 }
@@ -484,9 +485,16 @@ export class CFunctionEmitter {
   }
 
   // Emits the whole function: signature, the non-parameter locals (zero-initialised), the blocks.
+  // In a census build (`--stats-sites`) every instruction and terminator is preceded by `ORIN_SITE(n, orin_site_caller);`
+  // with consecutive ids from the function's first site (`CSymbols.firstSite`), and the function remembers its caller's
+  // site; a normal build has neither.
   @Requires(this.lines.length == 0)
-  @Ensures(this.lines.length
-      == 2 + (this.f.locals.length - this.f.paramCount) + linesOfBlocks(this.f.blocks))
+  @Ensures(this.syms.firstSite(this.fi) == 0
+      ==> this.lines.length
+          == 2 + (this.f.locals.length - this.f.paramCount) + linesOfBlocks(this.f.blocks))
+  @Ensures(this.syms.firstSite(this.fi) > 0
+      ==> this.lines.length
+          == 3 + (this.f.locals.length - this.f.paramCount) + linesOfBlocks(this.f.blocks))
   run(): void {
     const f = this.f;
     this.lines.push(this.syms.sig(this.fi) + " {\n");
@@ -500,12 +508,19 @@ export class CFunctionEmitter {
       i += 1;
     }
     let b: usize = 0;
+    let site = this.syms.firstSite(this.fi);
+    if (site > 0) {
+      // census: the site that called this function (one level of calling context for the allocations made here)
+      this.lines.push("  const uint32_t orin_site_caller = orin_site_cur;\n");
+    }
     for (const blk of f.blocks) {
       this.lines.push("B" + u(b) + ":;\n");
       for (const ins of blk.instrs) {
-        this.lines.push("  " + this.instr(ins) + "\n");
+        this.lines.push("  " + siteMark(site) + this.instr(ins) + "\n");
+        site = nextSite(site);
       }
-      this.lines.push("  " + this.term(blk.term) + "\n");
+      this.lines.push("  " + siteMark(site) + this.term(blk.term) + "\n");
+      site = nextSite(site);
       b += 1;
     }
     this.lines.push("}\n");
@@ -515,6 +530,15 @@ export class CFunctionEmitter {
   text(): string {
     return this.lines.join("");
   }
+}
+
+// Census mode: `ORIN_SITE(n, orin_site_caller); ` in front of every instruction and terminator; nothing when off (site 0).
+function siteMark(site: usize): string {
+  return site == 0 ? "" : "ORIN_SITE(" + u(site) + ", orin_site_caller); ";
+}
+
+function nextSite(site: usize): usize {
+  return site == 0 ? 0 : site + 1;
 }
 
 // Number of lines the blocks take: a label, the instructions, the terminator.

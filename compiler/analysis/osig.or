@@ -7,18 +7,21 @@
 // The `hash` is a 62-bit content fingerprint of the body, for equality checks -- not a cryptographic digest.
 
 import { FsGrant } from "std:fs";
-import { LoadedProgram, loadWithRoots, noPreludeRoots, isInside } from "../loader";
+import {
+  LoadedProgram, loadWithRoots, noPreludeRoots, isInside, normalizePath, Sources,
+} from "../loader";
 import { SourceFile, SourceMap, Span, render } from "../diag";
 import { Item, ContractClause, ClassMember } from "../syntax";
 import { checkWithIndex } from "../check";
 import {
-  Program, SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField,
-  SkInterface
+  Program, SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst,
+  SkLocal, SkParam, SkField, SkInterface,
 } from "../hir";
 import { displayModule } from "../package";
-import { Json, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson, parseJson, getStr, getInt, getBool, getArr,
-  getField } from "../json";
-import { readFile } from "std:fs";
+import {
+  Json, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson, parseJson, getStr, getInt,
+  getBool, getArr, getField,
+} from "../json";
 import { cmpStr } from "./modgraph";
 import { inferEffects, isUnknownOp } from "./effects";
 
@@ -31,42 +34,77 @@ export type OSpan = { file: string; line: usize; col: usize; endLine: usize; end
 
 export type ONode = {
   id: string;
-  kind: string;        // Package Module Function Method Class Interface Record Union Alias Const Field Variant Contract Unknown Effect
+  kind: string; // Package Module Function Method Class Interface Record Union Alias Const Field Variant Contract Unknown Effect
   name: string;
-  module: string;      // module id ("(root)" for the root module); "" for Package and Unknown
-  owner: string;       // id of the containing node ("" for none)
-  sig: string;         // rendered signature (Contract: the clause text)
+  module: string; // module id ("(root)" for the root module); "" for Package and Unknown
+  owner: string; // id of the containing node ("" for none)
+  sig: string; // rendered signature (Contract: the clause text)
   exported: bool;
-  entry: bool;         // an entry point: `main`, exported functions, exported public methods and constructors
+  entry: bool; // an entry point: `main`, exported functions, exported public methods and constructors
   span: OSpan;
 };
 
 export type OEdge = {
-  kind: string;        // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT PERFORMS_IO MAY_PERFORM
+  kind: string; // DEFINES IMPORTS CALLS IMPLEMENTS HAS_FIELD REFERENCES_TYPE HAS_CONTRACT PERFORMS_IO MAY_PERFORM
   src: string;
   dst: string;
-  ev: string;          // MUST | MAY | UNKNOWN
-  via: string;         // "" or the call route: direct method virtual bound impl value indirect; PERFORMS_IO / MAY_PERFORM: the direction
-  span: OSpan;         // first occurrence
-  next: string;        // MAY_PERFORM only: the function the effect is inherited from ("" = performed in `src`, or through library code)
+  ev: string; // MUST | MAY | UNKNOWN
+  via: string; // "" or the call route: direct method virtual bound impl value indirect; PERFORMS_IO / MAY_PERFORM: the direction
+  span: OSpan; // first occurrence
+  next: string; // MAY_PERFORM only: the function the effect is inherited from ("" = performed in `src`, or through library code)
 };
 
-export type OsigGraph = { schema: string; package: string; hash: string; nodes: ONode[]; edges: OEdge[]; };
+export type OsigGraph = {
+  schema: string;
+  package: string;
+  hash: string;
+  nodes: ONode[];
+  edges: OEdge[];
+};
 
 export const UNKNOWN_ID: string = "~unknown";
 
 function hasStr(xs: string[], s: string): bool {
-  for (const x of xs) {
-    if (x == s) {
-      return true;
-    }
-  }
-  return false;
+  return xs.includes(s);
 }
 
 // ---- sorting ------------------------------------------------------------------------------------------
 
+// `order` is a permutation of 0..n (every index once).
+export function isPermutation(order: usize[], n: usize): bool {
+  if (order.length != n) {
+    return false;
+  }
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    seen.push(false);
+    i += 1;
+  }
+  for (const o of order) {
+    if (o >= n || seen[o]) {
+      return false;
+    }
+    seen[o] = true;
+  }
+  return true;
+}
+
+// `keys` visited in `order` are in ascending order (`cmpStr`), equal keys in their original order (stability).
+export function sortedBy(keys: string[], order: usize[]): bool {
+  let i: usize = 1;
+  while (i < order.length) {
+    const c = cmpStr(keys[order[i - 1]], keys[order[i]]);
+    if (c > 0 || c == 0 && order[i - 1] > order[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
 // Stable merge sort: the indices of `keys` in ascending byte order.
+@Ensures(isPermutation(result, keys.length) && sortedBy(keys, result))
 export function sortOrder(keys: string[]): usize[] {
   const n = keys.length;
   let a: usize[] = [];
@@ -148,7 +186,11 @@ export function mkSpan(m: Mapper, sp: Span): OSpan {
   const l1 = lineOf(st, sp.start);
   const l2 = lineOf(st, sp.end);
   return OSpan {
-    file: m.paths[sp.file], line: l1 + 1, col: sp.start - st[l1] + 1, endLine: l2 + 1, endCol: sp.end - st[l2] + 1
+    file: m.paths[sp.file],
+    line: l1 + 1,
+    col: sp.start - st[l1] + 1,
+    endLine: l2 + 1,
+    endCol: sp.end - st[l2] + 1,
   };
 }
 
@@ -162,7 +204,7 @@ function isLocalDef(d: SymbolDef): bool {
   return match (d.kind) {
     SkLocal => true,
     SkParam => true,
-    _ => false
+    _ => false,
   };
 }
 
@@ -172,7 +214,7 @@ function isTypeDef(d: SymbolDef): bool {
     SkUnion => true,
     SkAlias => true,
     SkInterface => true,
-    _ => false
+    _ => false,
   };
 }
 
@@ -191,7 +233,7 @@ function kindOfDef(d: SymbolDef): string {
     SkField => "Field",
     SkVariant => "Variant",
     SkInterface => "Interface",
-    _ => ""
+    _ => "",
   };
 }
 
@@ -205,7 +247,7 @@ function contractKind(k: ContractClause): string {
     CEnsures => "ensures",
     CInvariant => "invariant",
     CDecreases => "decreases",
-    CRule => "rule"
+    CRule => "rule",
   };
 }
 
@@ -215,11 +257,28 @@ function edgeKey(e: OEdge): string {
   return e.kind + "|" + e.src + "|" + e.dst + "|" + e.ev + "|" + e.via;
 }
 
-function addEdge(r: Raw, kind: string, src: string, dst: string, ev: string, via: string, sp: OSpan): Raw {
+function addEdge(
+  r: Raw,
+  kind: string,
+  src: string,
+  dst: string,
+  ev: string,
+  via: string,
+  sp: OSpan,
+): Raw {
   return addEdgeN(r, kind, src, dst, ev, via, sp, "");
 }
 
-function addEdgeN(r: Raw, kind: string, src: string, dst: string, ev: string, via: string, sp: OSpan, next: string): Raw {
+function addEdgeN(
+  r: Raw,
+  kind: string,
+  src: string,
+  dst: string,
+  ev: string,
+  via: string,
+  sp: OSpan,
+  next: string,
+): Raw {
   let x = r;
   if (src == "" || dst == "" || src == dst) {
     return x;
@@ -234,7 +293,7 @@ function spanBefore(a: OSpan, b: OSpan): bool {
   if (a.file != b.file) {
     return cmpStr(a.file, b.file) < 0;
   }
-  return a.line < b.line || (a.line == b.line && a.col < b.col);
+  return a.line < b.line || a.line == b.line && a.col < b.col;
 }
 
 // Sort the raw edges and keep one per key: the occurrence with the smallest span.
@@ -275,7 +334,7 @@ function sourcePrefix(prog: LoadedProgram): string {
         si += 1;
       }
     },
-    None => {}
+    None => {},
   }
   return prefix;
 }
@@ -299,12 +358,28 @@ export function spanMapper(prog: LoadedProgram, sm: SourceMap): Mapper {
   return Mapper { paths: paths, starts: starts };
 }
 
+// Node ids in ascending order (`cmpStr`), none twice: the snapshot is deterministic and an id names one node.
+export function nodesSorted(ns: ONode[]): bool {
+  let i: usize = 1;
+  while (i < ns.length) {
+    if (cmpStr(ns[i - 1].id, ns[i].id) >= 0) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
 // The OSIG of a successfully checked program.
+@Ensures(result.hash == hashGraph(result) && result.schema == OSIG_SCHEMA)
+@Ensures(nodesSorted(result.nodes))
 export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap): OsigGraph {
   let pkg = "_";
   match (prog.manifest) {
-    Some(mf) => { pkg = mf.name; },
-    None => {}
+    Some(mf) => {
+      pkg = mf.name;
+    },
+    None => {},
   }
   const mp = spanMapper(prog, sm);
   let fi: usize = 0;
@@ -343,7 +418,9 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
     let q = t;
     while (q < e) {
       const did = topDefs[topOrder[q]];
-      ids[did] = e - t > 1 ? topKeys[topOrder[q]] + "~" + prog.units[idx.defs[did].unit].name : topKeys[topOrder[q]];
+      ids[did] = e - t > 1
+          ? topKeys[topOrder[q]] + "~" + prog.units[idx.defs[did].unit].name
+          : topKeys[topOrder[q]];
       q += 1;
     }
     t = e;
@@ -358,7 +435,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
           ids[d.id] = ids[c] + "." + d.name;
         }
       },
-      None => {}
+      None => {},
     }
   }
   // members of each def
@@ -375,14 +452,22 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
           kids[c].push(d.id);
         }
       },
-      None => {}
+      None => {},
     }
   }
 
   const pkgId = pkg;
   let raw = Raw { edges: [], keys: [], nodes: [] };
   raw.nodes.push(ONode {
-    id: pkgId, kind: "Package", name: pkg, module: "", owner: "", sig: "", exported: false, entry: false, span: noSpan()
+    id: pkgId,
+    kind: "Package",
+    name: pkg,
+    module: "",
+    owner: "",
+    sig: "",
+    exported: false,
+    entry: false,
+    span: noSpan(),
   });
   // modules
   let modNames: string[] = [];
@@ -402,7 +487,17 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
   }
   for (const m of modNames) {
     const mid = pkg + ":" + m;
-    raw.nodes.push(ONode { id: mid, kind: "Module", name: m, module: m, owner: pkgId, sig: "", exported: false, entry: false, span: noSpan() });
+    raw.nodes.push(ONode {
+      id: mid,
+      kind: "Module",
+      name: m,
+      module: m,
+      owner: pkgId,
+      sig: "",
+      exported: false,
+      entry: false,
+      span: noSpan(),
+    });
     raw = addEdge(raw, "DEFINES", pkgId, mid, "MUST", "", noSpan());
   }
   // definitions
@@ -414,25 +509,37 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
     const kind = kindOfDef(d);
     let owner = pkg + ":" + mods[d.id];
     match (d.container) {
-      Some(c) => { owner = ids[c]; },
-      None => {}
+      Some(c) => {
+        owner = ids[c];
+      },
+      None => {},
     }
     const priv = d.detail.startsWith("private ");
     const member = d.container.isSome();
     const isIfaceMember = match (d.container) {
-      Some(c) => match (idx.defs[c].kind) { SkInterface => true, _ => false },
-      None => false
+      Some(c) => match (idx.defs[c].kind) {
+        SkInterface => true,
+        _ => false,
+      },
+      None => false,
     };
     const exported = member ? d.exported && !priv : d.exported;
     let entry = false;
     if (kind == "Function") {
-      entry = d.exported || (d.name == "main" && d.unit == prog.entry);
+      entry = d.exported || d.name == "main" && d.unit == prog.entry;
     } else if (kind == "Method") {
       entry = exported && !isIfaceMember;
     }
     raw.nodes.push(ONode {
-      id: id, kind: kind, name: d.name, module: mods[d.id], owner: owner, sig: firstLine(d.detail), exported: exported,
-      entry: entry, span: mkSpan(mp, d.declSpan)
+      id: id,
+      kind: kind,
+      name: d.name,
+      module: mods[d.id],
+      owner: owner,
+      sig: firstLine(d.detail),
+      exported: exported,
+      entry: entry,
+      span: mkSpan(mp, d.declSpan),
     });
     if (kind == "Field") {
       raw = addEdge(raw, "HAS_FIELD", owner, id, "MUST", "", mkSpan(mp, d.declSpan));
@@ -457,12 +564,24 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
         let members: ClassMember[] = [];
         let isClass = false;
         match (item) {
-          IImport(_) => { hasDef = false; },
-          IReExport(_) => { hasDef = false; },
-          IFunction(f) => { cs = f.contracts; },
-          IType(td) => { cs = td.contracts; },
-          IClass(cd) => { cs = cd.contracts; members = cd.members; isClass = true; },
-          _ => {}
+          IImport(_) => {
+            hasDef = false;
+          },
+          IReExport(_) => {
+            hasDef = false;
+          },
+          IFunction(f) => {
+            cs = f.contracts;
+          },
+          IType(td) => {
+            cs = td.contracts;
+          },
+          IClass(cd) => {
+            cs = cd.contracts;
+            members = cd.members;
+            isClass = true;
+          },
+          _ => {},
         }
         if (hasDef && ti < tops.length) {
           const owner = tops[ti];
@@ -470,7 +589,10 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
           if (isClass) {
             let fns: usize[] = [];
             for (const m of kids[owner]) {
-              const isFn = match (idx.defs[m].kind) { SkFunction => true, _ => false };
+              const isFn = match (idx.defs[m].kind) {
+                SkFunction => true,
+                _ => false,
+              };
               if (isFn) {
                 fns.push(m);
               }
@@ -480,9 +602,15 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
               let mc: ContractClause[] = [];
               let isFn = true;
               match (m) {
-                MCtor(ct) => { mc = ct.contracts; },
-                MMethod(md) => { mc = md.contracts; },
-                MField(_) => { isFn = false; }
+                MCtor(ct) => {
+                  mc = ct.contracts;
+                },
+                MMethod(md) => {
+                  mc = md.contracts;
+                },
+                MField(_) => {
+                  isFn = false;
+                },
               }
               if (isFn) {
                 if (fk < fns.length) {
@@ -508,20 +636,33 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
         let isImp = false;
         let sp = Span { file: 0, start: 0, end: 0 };
         match (item) {
-          IImport(decl) => { isImp = true; sp = decl.span; },
-          IReExport(decl) => { isImp = true; sp = decl.span; },
-          _ => {}
+          IImport(decl) => {
+            isImp = true;
+            sp = decl.span;
+          },
+          IReExport(decl) => {
+            isImp = true;
+            sp = decl.span;
+          },
+          _ => {},
         }
         if (isImp) {
           if (ik < u.imports.length) {
             match (u.imports[ik]) {
               ImportUnit(t) => {
                 if (prog.units[t].module != u.module && prog.units[t].module != "") {
-                  raw = addEdge(raw, "IMPORTS", pkg + ":" + displayModule(u.module), pkg + ":" + displayModule(prog.units[t].module),
-                    "MUST", "", mkSpan(mp, sp));
+                  raw = addEdge(
+                    raw,
+                    "IMPORTS",
+                    pkg + ":" + displayModule(u.module),
+                    pkg + ":" + displayModule(prog.units[t].module),
+                    "MUST",
+                    "",
+                    mkSpan(mp, sp),
+                  );
                 }
               },
-              ImportStd(_) => {}
+              ImportStd(_) => {},
             }
           }
           ik += 1;
@@ -547,14 +688,19 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
   }
   for (const r of idx.refs) {
     const td = idx.defs[r.def];
-    const isVariant = match (td.kind) { SkVariant => true, _ => false };
+    const isVariant = match (td.kind) {
+      SkVariant => true,
+      _ => false,
+    };
     if (!isTypeDef(td) && !isVariant) {
       continue;
     }
     let target = r.def;
     match (td.container) {
-      Some(c) => { target = c; },
-      None => {}
+      Some(c) => {
+        target = c;
+      },
+      None => {},
     }
     if (ids[target] == "" || r.span.file >= tops.length) {
       continue;
@@ -580,10 +726,18 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
           }
         }
         if (!viaImpl) {
-          raw = addEdge(raw, "REFERENCES_TYPE", ids[inner], ids[target], "MUST", "", mkSpan(mp, r.span));
+          raw = addEdge(
+            raw,
+            "REFERENCES_TYPE",
+            ids[inner],
+            ids[target],
+            "MUST",
+            "",
+            mkSpan(mp, r.span),
+          );
         }
       },
-      None => {}
+      None => {},
     }
   }
   // calls (plus the implementations of an interface method that a call may reach)
@@ -602,7 +756,10 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
         raw = addEdge(raw, "CALLS", ids[c.caller], ids[d], c.ev, c.via, sp);
         match (idx.defs[d].container) {
           Some(ct) => {
-            const isIface = match (idx.defs[ct].kind) { SkInterface => true, _ => false };
+            const isIface = match (idx.defs[ct].kind) {
+              SkInterface => true,
+              _ => false,
+            };
             if (isIface) {
               for (const l of idx.impls) {
                 if (l.iface == ct) {
@@ -615,7 +772,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
               }
             }
           },
-          None => {}
+          None => {},
         }
       },
       None => {
@@ -627,15 +784,22 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
           if (!hasStr(seenIo, eid)) {
             seenIo.push(eid);
             raw.nodes.push(ONode {
-              id: eid, kind: "Effect", name: parts[0], module: "", owner: "",
-              sig: parts[1] + "; grant: " + parts[2], exported: false, entry: false, span: noSpan()
+              id: eid,
+              kind: "Effect",
+              name: parts[0],
+              module: "",
+              owner: "",
+              sig: parts[1] + "; grant: " + parts[2],
+              exported: false,
+              entry: false,
+              span: noSpan(),
             });
           }
         } else {
           usesUnknown = true;
           raw = addEdge(raw, "CALLS", ids[c.caller], UNKNOWN_ID, "UNKNOWN", c.via, sp);
         }
-      }
+      },
     }
   }
   // transitive effect summaries (ADR-0037 D2): one MAY_PERFORM edge per function and effect. The same inference as
@@ -658,8 +822,15 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
         if (!hasStr(seenIo, dst)) {
           seenIo.push(dst);
           raw.nodes.push(ONode {
-            id: dst, kind: "Effect", name: key.op, module: "", owner: "",
-            sig: key.dir + "; grant: " + key.grant, exported: false, entry: false, span: noSpan()
+            id: dst,
+            kind: "Effect",
+            name: key.op,
+            module: "",
+            owner: "",
+            sig: key.dir + "; grant: " + key.grant,
+            exported: false,
+            entry: false,
+            span: noSpan(),
           });
         }
       }
@@ -667,13 +838,29 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
       while (next >= 0 && ids[next.toUsize()] == "") {
         next = tbl.entryFor(next.toUsize(), e.key).unwrap().next;
       }
-      raw = addEdgeN(raw, "MAY_PERFORM", ids[d], dst, e.ev, via, mkSpan(mp, e.span), next >= 0 ? ids[next.toUsize()] : "");
+      raw = addEdgeN(
+        raw,
+        "MAY_PERFORM",
+        ids[d],
+        dst,
+        e.ev,
+        via,
+        mkSpan(mp, e.span),
+        next >= 0 ? ids[next.toUsize()] : "",
+      );
     }
   }
   if (usesUnknown) {
     raw.nodes.push(ONode {
-      id: UNKNOWN_ID, kind: "Unknown", name: "function value", module: "", owner: "",
-      sig: "target of a call through a function value is not known statically", exported: false, entry: false, span: noSpan()
+      id: UNKNOWN_ID,
+      kind: "Unknown",
+      name: "function value",
+      module: "",
+      owner: "",
+      sig: "target of a call through a function value is not known statically",
+      exported: false,
+      entry: false,
+      span: noSpan(),
     });
   }
   // sort
@@ -685,12 +872,25 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
   for (const o of sortOrder(nkeys)) {
     nodes.push(raw.nodes[o]);
   }
-  let g = OsigGraph { schema: OSIG_SCHEMA, package: pkg, hash: "", nodes: nodes, edges: finishEdges(raw) };
+  let g = OsigGraph {
+    schema: OSIG_SCHEMA,
+    package: pkg,
+    hash: "",
+    nodes: nodes,
+    edges: finishEdges(raw),
+  };
   g.hash = hashGraph(g);
   return g;
 }
 
-function addContracts(r: Raw, mp: Mapper, sm: SourceMap, owner: string, module: string, cs: ContractClause[]): Raw {
+function addContracts(
+  r: Raw,
+  mp: Mapper,
+  sm: SourceMap,
+  owner: string,
+  module: string,
+  cs: ContractClause[],
+): Raw {
   let x = r;
   if (owner == "") {
     return x;
@@ -708,8 +908,15 @@ function addContracts(r: Raw, mp: Mapper, sm: SourceMap, owner: string, module: 
     const id = owner + "@" + kind + "#" + n.toString();
     const sp = mkSpan(mp, c.span);
     x.nodes.push(ONode {
-      id: id, kind: "Contract", name: kind, module: module, owner: owner,
-      sig: oneLine(sm.files[c.span.file].text.substring(c.span.start, c.span.end)), exported: false, entry: false, span: sp
+      id: id,
+      kind: "Contract",
+      name: kind,
+      module: module,
+      owner: owner,
+      sig: oneLine(sm.files[c.span.file].text.substring(c.span.start, c.span.end)),
+      exported: false,
+      entry: false,
+      span: sp,
     });
     x = addEdge(x, "HAS_CONTRACT", owner, id, "MUST", "", sp);
   }
@@ -720,23 +927,38 @@ function addContracts(r: Raw, mp: Mapper, sm: SourceMap, owner: string, module: 
 
 function spanJson(s: OSpan): Json {
   return JObj([
-    jField("file", JStr(s.file)), jField("line", JNum(s.line.toInt())), jField("col", JNum(s.col.toInt())),
-    jField("endLine", JNum(s.endLine.toInt())), jField("endCol", JNum(s.endCol.toInt()))
+    jField("file", JStr(s.file)),
+    jField("line", JNum(s.line.toInt())),
+    jField("col", JNum(s.col.toInt())),
+    jField("endLine", JNum(s.endLine.toInt())),
+    jField("endCol", JNum(s.endCol.toInt())),
   ]);
 }
 
 function nodeLine(n: ONode): string {
-  return stringifyJson(JObj([
-    jField("id", JStr(n.id)), jField("kind", JStr(n.kind)), jField("name", JStr(n.name)), jField("module", JStr(n.module)),
-    jField("owner", JStr(n.owner)), jField("sig", JStr(n.sig)), jField("exported", JBool(n.exported)),
-    jField("entry", JBool(n.entry)), jField("span", spanJson(n.span))
-  ]));
+  return stringifyJson(
+    JObj([
+      jField("id", JStr(n.id)),
+      jField("kind", JStr(n.kind)),
+      jField("name", JStr(n.name)),
+      jField("module", JStr(n.module)),
+      jField("owner", JStr(n.owner)),
+      jField("sig", JStr(n.sig)),
+      jField("exported", JBool(n.exported)),
+      jField("entry", JBool(n.entry)),
+      jField("span", spanJson(n.span)),
+    ]),
+  );
 }
 
 function edgeLine(e: OEdge): string {
   let fs: JField[] = [
-    jField("kind", JStr(e.kind)), jField("src", JStr(e.src)), jField("dst", JStr(e.dst)), jField("evidence", JStr(e.ev)),
-    jField("via", JStr(e.via)), jField("span", spanJson(e.span))
+    jField("kind", JStr(e.kind)),
+    jField("src", JStr(e.src)),
+    jField("dst", JStr(e.dst)),
+    jField("evidence", JStr(e.ev)),
+    jField("via", JStr(e.via)),
+    jField("span", spanJson(e.span)),
   ];
   if (e.kind == "MAY_PERFORM") {
     fs.push(jField("next", JStr(e.next)));
@@ -789,7 +1011,11 @@ export function hashGraph(g: OsigGraph): string {
   return hashOf(parts);
 }
 
-// The snapshot text: one node / edge per line, one trailing newline.
+// The snapshot text: one node / edge per line, one trailing newline. What it writes `parseOsig` reads back with the
+// same hash (a field that is written but not read, or read differently, breaks the hash check of every later `orin diff`).
+@Requires(g.hash == hashGraph(g))
+@Ensures(result.endsWith("}\n"))
+@Ensures(parseOsig(result).isOk() && parseOsig(result).unwrap().hash == g.hash)
 export function osigJson(g: OsigGraph): string {
   let lines: string[] = ["{"];
   lines.push("\"schema\": " + stringifyJson(JStr(g.schema)) + ",");
@@ -819,15 +1045,23 @@ function spanOf(j: Json): OSpan {
   match (getField(j, "span")) {
     Some(s) => {
       return OSpan {
-        file: getStr(s, "file").unwrapOr(""), line: getInt(s, "line").unwrapOr(0).toUsize(), col: getInt(s, "col").unwrapOr(0).toUsize(),
-        endLine: getInt(s, "endLine").unwrapOr(0).toUsize(), endCol: getInt(s, "endCol").unwrapOr(0).toUsize()
+        file: getStr(s, "file").unwrapOr(""),
+        line: getInt(s, "line").unwrapOr(0).toUsize(),
+        col: getInt(s, "col").unwrapOr(0).toUsize(),
+        endLine: getInt(s, "endLine").unwrapOr(0).toUsize(),
+        endCol: getInt(s, "endCol").unwrapOr(0).toUsize(),
       };
     },
-    None => { return noSpan(); }
+    None => {
+      return noSpan();
+    },
   }
 }
 
 // Parse a snapshot produced by `orin graph`; verifies the schema major version and the hash.
+@Ensures(result.isOk()
+    ==> result.unwrap().hash == hashGraph(result.unwrap())
+        && result.unwrap().schema.startsWith("osig/0."))
 export function parseOsig(text: string): Result<OsigGraph, string> {
   const j = parseJson(text)?;
   const schema = getStr(j, "schema").unwrapOr("");
@@ -838,20 +1072,36 @@ export function parseOsig(text: string): Result<OsigGraph, string> {
   const noJ: Json[] = [];
   for (const n of getArr(j, "nodes").unwrapOr(noJ)) {
     nodes.push(ONode {
-      id: getStr(n, "id").unwrapOr(""), kind: getStr(n, "kind").unwrapOr(""), name: getStr(n, "name").unwrapOr(""),
-      module: getStr(n, "module").unwrapOr(""), owner: getStr(n, "owner").unwrapOr(""), sig: getStr(n, "sig").unwrapOr(""),
-      exported: getBool(n, "exported").unwrapOr(false), entry: getBool(n, "entry").unwrapOr(false), span: spanOf(n)
+      id: getStr(n, "id").unwrapOr(""),
+      kind: getStr(n, "kind").unwrapOr(""),
+      name: getStr(n, "name").unwrapOr(""),
+      module: getStr(n, "module").unwrapOr(""),
+      owner: getStr(n, "owner").unwrapOr(""),
+      sig: getStr(n, "sig").unwrapOr(""),
+      exported: getBool(n, "exported").unwrapOr(false),
+      entry: getBool(n, "entry").unwrapOr(false),
+      span: spanOf(n),
     });
   }
   let edges: OEdge[] = [];
   for (const e of getArr(j, "edges").unwrapOr(noJ)) {
     edges.push(OEdge {
-      kind: getStr(e, "kind").unwrapOr(""), src: getStr(e, "src").unwrapOr(""), dst: getStr(e, "dst").unwrapOr(""),
-      ev: getStr(e, "evidence").unwrapOr(""), via: getStr(e, "via").unwrapOr(""), span: spanOf(e),
-      next: getStr(e, "next").unwrapOr("")
+      kind: getStr(e, "kind").unwrapOr(""),
+      src: getStr(e, "src").unwrapOr(""),
+      dst: getStr(e, "dst").unwrapOr(""),
+      ev: getStr(e, "evidence").unwrapOr(""),
+      via: getStr(e, "via").unwrapOr(""),
+      span: spanOf(e),
+      next: getStr(e, "next").unwrapOr(""),
     });
   }
-  const g = OsigGraph { schema: schema, package: getStr(j, "package").unwrapOr(""), hash: getStr(j, "hash").unwrapOr(""), nodes: nodes, edges: edges };
+  const g = OsigGraph {
+    schema: schema,
+    package: getStr(j, "package").unwrapOr(""),
+    hash: getStr(j, "hash").unwrapOr(""),
+    nodes: nodes,
+    edges: edges,
+  };
   if (hashGraph(g) != g.hash) {
     return Err("snapshot hash mismatch: the file was edited or truncated");
   }
@@ -867,14 +1117,23 @@ export function loadOsig(fs: FsGrant, path: string): Result<OsigGraph, string> {
 }
 
 // A type-checked program with its HIR and semantic index: what OSIG, effects and the other whole-program reports start from.
-export type CheckedProgram = { program: LoadedProgram; sm: SourceMap; hir: Program; index: SemanticIndex; };
+export type CheckedProgram = {
+  program: LoadedProgram;
+  sm: SourceMap;
+  hir: Program;
+  index: SemanticIndex;
+};
 
 // A loaded (not yet checked) program with the files it was read from.
 export type LoadedForCheck = { program: LoadedProgram; sm: SourceMap; };
 
 // Loads the entry file or package directory `path` (no std prelude, as `orin api`); every file the program reads must lie
 // inside `root` ("" = no restriction; MCP passes its root). Errors are rendered diagnostics.
-export function loadProgram(fs: FsGrant, path: string, root: string): Result<LoadedForCheck, string> {
+export function loadProgram(
+  fs: FsGrant,
+  path: string,
+  root: string,
+): Result<LoadedForCheck, string> {
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(fs, path, noOverlay, noPreludeRoots());
   if (loaded.diags.length > 0) {
@@ -895,7 +1154,10 @@ export function loadProgram(fs: FsGrant, path: string, root: string): Result<Loa
 }
 
 // Type-checks a loaded program together with its semantic index. Errors are rendered diagnostics.
-export function checkProgram(program: LoadedProgram, sm: SourceMap): Result<CheckedProgram, string> {
+export function checkProgram(
+  program: LoadedProgram,
+  sm: SourceMap,
+): Result<CheckedProgram, string> {
   const ci = checkWithIndex(program, sm);
   if (ci.result.isErr()) {
     let msgs: string[] = [];
@@ -908,7 +1170,11 @@ export function checkProgram(program: LoadedProgram, sm: SourceMap): Result<Chec
 }
 
 // Loads and checks `path` (see `loadProgram`).
-export function loadChecked(fs: FsGrant, path: string, root: string): Result<CheckedProgram, string> {
+export function loadChecked(
+  fs: FsGrant,
+  path: string,
+  root: string,
+): Result<CheckedProgram, string> {
   const l = loadProgram(fs, path, root)?;
   return checkProgram(l.program, l.sm);
 }
@@ -916,7 +1182,9 @@ export function loadChecked(fs: FsGrant, path: string, root: string): Result<Che
 // Same as `loadOsig`, but every file the program reads must lie inside `root` ("" = no restriction; MCP passes its root).
 export function loadOsigIn(fs: FsGrant, path: string, root: string): Result<OsigGraph, string> {
   if (path.endsWith(".json")) {
-    const t = readFile(fs, path);
+    // A snapshot is read through the loader's `Sources` (no overlay), the one place that touches the disk.
+    const disk = new Sources([]);
+    const t = disk.read(fs, normalizePath(path));
     if (t.isErr()) {
       return Err("cannot read " + path + ": " + t.unwrapErr());
     }

@@ -2,7 +2,7 @@
 
 How a module of `compiler/` is rewritten with the full language and contract clauses, as it was
 actually done for the first two modules (`compiler/diag/`, `compiler/loader/`, the trial run). The
-next modules (check, lower / opt / verify, backends, tooling) follow the same checklist.
+next modules (check, lower / opt / verify, backends, tooling: step 3e below) follow the same checklist.
 
 The rules are in [ADR-0015](decisions/0015-compiler-modernisation-and-contract-dogfooding.md): one
 module per PR, **behaviour-preserving**, no new language features, contracts for real invariants,
@@ -191,12 +191,11 @@ rewritten module follows these rules (the contracts are checked by the `contract
    has landed, keep hot inner loops of the compiler as loops. Measured before fusion: `filter → map → reduce` over
    5 M ints is about 4x slower than the loop. The self-compile time in the PR shows whether a change slowed the
    compiler down.
-8. **No program-wide counters in per-function phases** (project owner, 2026-10-14): a phase that works function by
-   function (optimisation, code generation) must be a function of its input function and of tables that were fixed
-   *before* the phase, so that ADR-0039 can later run it with `.parallel()`. Everything numbered across the program
-   (string literal ids, symbols, trap message globals, fresh names) is assigned in a separate step that walks the
-   program in a fixed order; the per-function step only reads it, and the results are joined in index order. The
-   output must stay byte-identical. Step 3d is the first application (below).
+8. **No global counters in per-function work** (project owner, 2026-10-14; ADR-0039 §6): a phase that works per
+   function, such as checking a body, lowering, verifying or emitting code, numbers what it creates (temporaries,
+   string literals, fresh names) locally. A program-wide numbering is assigned afterwards, in a fixed order. Then a
+   phase can switch to `.parallel()` without changing its output, so the bootstrap fixed point keeps holding.
+   Step 3d (below) applies it to the optimiser and both code generators.
 
 ## Step 2a: `check/{env,fnctx,types}.or` (the checker's foundation)
 
@@ -478,16 +477,712 @@ Selfcompile (`orin2 compile compiler/main.or -o /dev/null`, interleaved runs, bo
 
 Rule 7 (array API): the loops of the lowering are the hot inner loops (`args`, `walk`, release loops, `BlockBuilder.finish`) or build several results in one pass, so they stay loops; the well-formedness predicates and contract helpers use `every` / `some` / `map` with pure arrow functions.
 
+## Step 3c: `syntax/` (lexer, parser, AST predicates)
+
+Rewritten: `compiler/syntax/lexer.or` (free functions threading `(file, src, start)` and returning `LexRes { tok, end }`) and
+`parser.or` (about 90 functions `(toks, pos, ..) -> Result<{ node, pos }, Diagnostic>`, 18 result record types) into the classes
+`Lexer` and `Parser`; the binary-operator precedence is a data table (`precedence.or`), the clause / annotation placement rules
+are pure functions of their own (`rules.or`), and the tree has well-formedness predicates (`wellformed.or`). `ast.or` is
+unchanged; the exported surface (`lex`, `parse`, `scanComments`, the AST and token types) is unchanged, additions only.
+`compiler/fmt/` was not touched (it uses `parse` and `scanComments`).
+
+| Old | New |
+|---|---|
+| `lex(file, src)`: one loop with a template brace-depth stack, `lexIdent` / `lexNumber` / `lexFloat` / `lexString` / `lexPunct` return `LexRes { tok, end }` | class `Lexer` (lexer.or): `src`, cursor `pos`, `toks`, `depth`, `done`, first error `err`; `step()` lexes one token, `run()` the stream; the per-kind lexers are private methods that `emit` or `fail` |
+| every parse function takes `(toks, pos)` and returns `{ node, pos }` (`IdentRes`, `TypeRes`, `ExprRes`, ... 18 types) | class `Parser` (parser.or): `toks`, cursor `pos`, `ops`; methods return the node and move the cursor |
+| `parseBin(toks, pos, level)`: one recursion level per precedence level (7 nested calls per operand), `binLevel` / `levelOfText` / `binOpOf` string chains | precedence climbing `parseBin(min)` over class `OpTable` (precedence.or): rows `{ text, level, op, rightAssoc }`, a `Map` index |
+| `arrowStart` / `tryTypeArgs` re-parse from a position and drop the result | `arrowStart` probes on a copy of the parser (classes are values), `tryTypeArgs` restores the cursor on `None` |
+| `clauseAllowed`, `checkPlacement`, annotation rules, target numbers 0..10 in the parser | rules.or, named targets `T_FUNCTION` .. `T_IMPORT`, `Result<void, Diagnostic>` |
+| no statement about spans | wellformed.or: children of every node kind, `nestedIn`, shallow and deep predicates, `moduleWellFormed` |
+
+Files (`orin fmt` layout; the old files reformatted the same way for comparison: lexer 600, parser 2,119, trivia 155 lines;
+clauses are `@Requires` / `@Ensures` / `@Invariant` annotation lines, `grep -c '^ *@Requires('` etc.):
+
+| file | role | lines | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `lexer.or` (was 528 lines, 1 clause) | class `Lexer`, `lex`, `skipTrivia`, `tokensWellFormed` | 775 | 8 | 17 | 6 |
+| `parser.or` (was 1,906, 0) | class `Parser` (76 methods), `parse`, `isSyntaxCode` | 2,033 | 15 | 68 | 2 |
+| `precedence.or` (new) | operator table, class `OpTable` | 111 | 1 | 5 | 2 |
+| `rules.or` (new) | placement of clauses and annotations | 181 | 0 | 4 | 0 |
+| `wellformed.or` (new) | span predicates over every node kind | 470 | 0 | 0 | 0 |
+| `trivia.or` (was 148, 0) | `scanComments`, `commentsWellFormed` | 176 | 0 | 1 | 0 |
+| `ast.or`, `module.or` | unchanged / exports | 214, 24 | 0 | 0 | 0 |
+| total, before -> after | | 2,807 -> 3,984 | 1 -> 129 clauses (24 requires, 95 ensures, 10 invariants) | | |
+
+Unit tests: `compiler/tests/syntax_test.or` (14 `@Test`, 575 lines), run by `tools/test_tooling.sh`.
+
+Classes (3 new): `Lexer` (the cursor stays in the source, the last token ends at or before the cursor, template depths are
+non-negative, a finished lexer is at the end or holds its first error, which is E0100 with a span inside the source), `Parser` (the token stream ends with KEof, the cursor is always on a token, so
+it never passes the final KEof), `OpTable` (the rows form a precedence table: levels 0..`MAX_LEVEL`, loosest first, no gap,
+one associativity per level; the spelling index is as large as the table, so no operator shadows another).
+
+Contracts, with the bug each would catch:
+
+* **progress** (the property that rules out an endless loop): every `parseX` that succeeds ensures `spansFrom(span,
+  old(pos))`: it consumed at least one token, and the node's span starts at the first consumed token and ends at the last.
+  This catches a production that returns without consuming (a `while (!isP(")"))` loop around it would spin), a node span
+  taken from the wrong token (`lastSpan` off by one), and a span that misses its first or last token (a parenthesised
+  expression not widened). The documented non-consuming methods state it exactly: `parseTypeParamsB` consumes nothing iff
+  there is no `<`, `tryTypeArgs` leaves the cursor unchanged on `None`, `expectP` / `expectKw` move by exactly one or not
+  at all. `Lexer.step` ensures that a step adds one token that ends at the new cursor, which is past the old one.
+* **cursor in range**: the `Parser` invariant `pos < toks.length` with a KEof last (a production that skips past the end
+  would read garbage through the old clamping `tokAt`); `matchingParen` ensures its result lies after the cursor and in the
+  stream; `lastSpan` requires that something was consumed.
+* **spans nest and are ordered**: every node the parser builds is shallow-well-formed (`exprShallowOk`, `stmtShallowOk`,
+  `typeShallowOk`, `patShallowOk`, `blockShallowOk`, `itemShallowOk`, `memberShallowOk`: the children lie inside the node,
+  in source order, without overlap; each node is checked once, so the cost is linear); `parse` ensures the deep property
+  `moduleWellFormed` (items ordered, inside the source and the file). Catches: a binary node with the span of one operand,
+  a block span that is only its `{`, children stored out of order, a span in another file or past the end of the source
+  (every LSP range and diagnostic of the node would be wrong).
+* **tokens**: `lex` / `Lexer.run` ensure `tokensWellFormed` (in the source and the file, ordered, non-overlapping, non-empty,
+  exactly one KEof, at the end); a token one byte short, or a newline that is not skipped, is caught.
+* **errors**: `lex` ensures E0100 with a span inside the source; `parse` ensures one of the parse-error codes (`isSyntaxCode`:
+  E0100, E0200, E0201, E0408, E0440, E0441, E0442) and a span inside the source and the file (a diagnostic past the end
+  cannot be rendered); `errAt` ensures E0200 / E0201 at the token; `checkPlacement` is `Ok` exactly when every clause is allowed,
+  `checkAnnoPlacement` exactly when every annotation is allowed and no kind repeats.
+* **operators**: `OpTable.level` ensures the level is that of a row with that spelling (or -1 exactly when no row has it);
+  `parseBin(min)` ensures that the operator left at the cursor is looser than `min` (the climbing loop did not stop early).
+* **comments**: `scanComments` ensures `commentsWellFormed` (ordered, non-empty, each holds exactly its source text): the
+  formatter re-emits these texts, so an overlap would print a comment twice.
+
+None fired on the compiler's own sources, on the conformance suites, on the unit tests, or on 3,207 parse inputs including
+1,500 garbage files (below). To see that they can: 13 hand-made mutants (binary span = right operand, left-associative
+operators grouped to the right, block span = `{`, `lastSpan` off by one, parentheses not widened, `?` skipping a token,
+type-argument backtracking not undone, token span one byte short, newline not skipped, a duplicate operator row, `<` moved to
+the level of `+`, the order check removed from `nestedIn`, a line comment keeping its trailing spaces) were run against
+`syntax_test.or`: **13 / 13 killed**.
+
+Error recovery: there is none. The parser stops at the first error (the language reports one syntax error per file;
+`errors` and `next/errors` pin those diagnostics), so "recovery always advances" reduces to the progress property above, and
+in the parser "diagnostics as a field" would only duplicate the `Err` that `?` propagates, so it stays the `Err` of the method (the lexer keeps its first error in a field for speed, below).
+`parseTerminatesOnGarbage` runs 400 random token soups and every prefix of a 400-byte program through `parse` and checks that
+each returns with a well-formed module or a parse error inside the source. A recovering parser (several syntax errors per
+file) is a language-visible change: **NEEDS_DECISION**, not done here. (Decided and done afterwards: "Parser error recovery"
+below.)
+
+Precedence climbing replaces the level-per-function recursion: one call per operand instead of seven, the table is data
+(`binaryOps()`), and associativity is a column. The tree is the same for left-associative operators (all of them; `?:` and
+`==>` are right-associative and stay their own productions, documented in precedence.or). Errors are the same because tokens
+are consumed in the same order.
+
+Behaviour preservation (against the baseline compiler built before the step):
+
+* **AST differential**: `compiler/tests/parse_main.or` (the canonical AST dump with spans, or the rendered first error)
+  built from the old and the new tree, run over every `.or` file of the repository (1,707, after merging origin/main) and 1,500 garbage files (random
+  token soups, truncations, deletions and duplications of real files): 3,207 inputs, **0 differences** (1,908 of them are
+  parse errors: code, message and span identical). The same inputs through a contract-checked `parse_main`: no contract fired.
+* `tools/diff_compilers.py`: 1,406 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
+* generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`, `examples/` program and of `compiler/main.or` (390 inputs x 3) **byte-identical**;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,666,960 bytes, after merging origin/main with Capabilities Stage B), conformance 141/141; all suites with `orin2`: 806 / 806;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806 / 806 conformance tests, `test_verify_contracts` 809 checks, **no contract fired**;
+* `python3 tools/test_fmt.py`: 1,651 passed; `tools/test_tooling.sh`: all unit test files pass (`syntax_test` 14 / 14); `tools/test_effects.py` 85 checks and `tools/test_osig.py` 95 checks pass;
+* `orin check --strict-contracts compiler/main.or`: **0 warnings**. The base had 13 W0471 (public mutating methods without `@Ensures`) in `compiler/vc/gen.or` (`Gen.next`, `declare`, `assert`, `lemma`, `setExact`, `taint`, `noteApprox`, `noteStr`, `useAssumption`, `newLoop`, `loopAdd`, `addObl`) and `vc/vt.or` (`Tab.setCyclic`); they now state their effect (the counter grows by one so no SMT symbol is handed out twice, a push grows its list by one, a set-like add contains the element and grows by at most one, `noteApprox` keeps the first reason, `newLoop` / `addObl` return the new index). `test_verify_contracts.py` with the contract-checked compiler: 809 checks, 0 failed.
+
+Performance. Wall time on the shared machine (load average 11-13 on 4 cores during the step) was too noisy to resolve a few
+percent, so the comparison is also made in instructions (`valgrind --tool=callgrind`, deterministic), both compilers built
+by the same baseline compiler:
+
+| | base compiler | new compiler | change |
+|---|---|---|---|
+| instructions, `orin compile compiler/main.or` | 38,753 M | 38,558 M | -0.5 % |
+| instructions, `orin check compiler/main.or` (front end) | 2,718 M | 2,521 M | -7.3 % |
+| instructions, lex + parse of every `compiler/**/*.or` file once (benchmark driver) | 1,623 M | 1,365 M | -15.9 % |
+| instructions, lex only, same files | 721 M | 668 M | -7.3 % (it was +14 % with Result-returning lexer methods, below) |
+| peak RSS, self-compile | 157.8 MiB | 157.8 MiB | 0 |
+| wall, self-compile, 9 interleaved runs at load ~1 (median / min) | 7.38 s / 7.06 s | 7.33 s / 6.74 s | -0.7 % / -4.6 % |
+
+Final numbers: both compilers on the merged tree, the new one built by the bootstrap. Earlier, under load 11-13, wall
+times moved by 10-15 % between runs of the same binary (`check`: 1.22 s vs 1.32 s in one session,
+0.65 s vs 0.75 s median but 0.618 vs 0.626 min in another), so the instruction counts are the measurement. The parser is
+cheaper (precedence climbing makes one call per operand instead of seven, and the `{ node, pos }` records are gone), and so is the
+lexer since its methods return nothing (below). No slowdown.
+
+Design notes and friction:
+
+* **A mutating method that returns a value returns a pair.** Every `Parser` method that moves the cursor and returns a node
+  allocates the `(self, result)` pair; the old code allocated the `{ node, pos }` record instead, so the count is the same.
+  In the lexer that pair is per token and on top of the old costs: with `step(): Result<bool, _>` and Result-returning
+  per-kind methods lexing took +14 % instructions against the base (`Ok(true)` also boxes the bool; `Ok()` of
+  `Result<void, _>` is a shared nullary). A mutating method that returns `void` returns only `self`, so the lexer's methods
+  return nothing: the end is the `done` field, the first error the `err` field (`fail(d)`; `finished()`, `error()`), and
+  `run` turns it into the `Err`. Lexing is now -7 % against the base. This is "diagnostics as a field" where it pays; the
+  parser keeps `Result` (its methods return nodes anyway, so the pair is there either way, and `?` is the clearer form).
+* **Speculation on a copy.** `arrowStart` needs to try a return type without moving the cursor: `let probe = new
+  Parser(this.toks); probe.pos = q + 2;` (the copy shares the token array). A class that is a value makes this cheap and safe.
+* **Rule 8 (no program-wide counters)**: the lexer and the parser are per file; nothing is numbered across files (spans
+  carry the file index the caller passes, `OpTable` is built per `Parser`). The only class-typed field, `Parser.ops`, is
+  only read (`level`, `rowOf`), so the copy-on-call of a mutating method on a class field (seen in 3b) does not arise.
+* **`from` is a keyword** (again): the contract helper's parameter is `first`.
+* **Contract helpers as private methods.** `spansFrom` and the token tests are private methods used in the `@Ensures` of
+  the same class; it works, and keeps the clauses short (`this.spansFrom(result.unwrap().span, old(this.pos))`).
+* **Public parse methods for tests.** `parseExpr`, `parseType`, `parseStmt`, `parseBlock`, `parsePattern`, `parseItem` and
+  `parseModule` are public so that the tests can drive single productions (and so that the class invariant is checked after
+  each of them); the rest is private.
+* Rule 7 (array API): the lexer's character loops, the parser's list loops and `nestedIn` / `tokensWellFormed` (index
+  arithmetic, early exit) stay loops; the child lists of the predicates are built with `map` / `concat`, the rule checks use
+  `find` / `every` / `some`.
+
+### Parser error recovery
+
+Approved by the project owner on 2026-10-14 (the NEEDS_DECISION of step 3c). `orin check`, `orin compile`, `--format=json`,
+the LSP diagnostics and MCP `check` report every syntax error of a file, up to 20, instead of the first one only. Nothing
+else changed: the first error is byte-identical to the one before (code, message, span), every valid program gives the
+same tree and the same generated code, and `orin fmt` still refuses a file with a syntax error (it calls `parse`, which
+stops at the first error as before).
+
+```
+tests/recovery/three_errors.or:3:15: error[E0200]: expected expression, found `;`
+tests/recovery/three_errors.or:7:28: error[E0200]: expected identifier, found `:`
+tests/recovery/three_errors.or:12:12: error[E0200]: expected expression, found `;`
+```
+
+**API.** `parse(file, src)` is unchanged. `parseRecovering(file, src): Result<Module, Diagnostic[]>` (parser.or) is the
+recovering parse; the loader calls it and puts the further errors after the first in the `LoadOutcome` (`Loader.moreSyntaxErrors`),
+so every consumer of the loader (CLI text and JSON, LSP, MCP, `orin test`) reports them without a change of its own. A lexical
+error (E0100) ends the scan, so it stays the only error of its file. `Parser.enableRecovery()` switches a parser built by hand
+to recovery; without it the `Parser` behaves as before.
+
+**Recovery points.** The innermost of three loops catches the error, reports it and skips tokens:
+
+* *block statement* (`recoverStmt`, in `parseBlock`): to after the next `;` at the statement's brace level; to the `}` that
+  closes the block (not consumed); past the `}` that ends the body of an `if` / `while` / `for` / block statement, unless
+  `else` follows; or to a token after the error that starts a statement (`let`, `const`, `if`, `while`, `for`, `return`,
+  `break`, `continue`, `@`). Brace depth is counted from the first token of the failed statement, so a record literal or
+  an arrow function body inside it does not end the block early.
+* *class or interface member* (`recoverMember`): to after the next `;`, or past the `}` that closes a method body, at the
+  member's brace level; to a `@` after the error; or to the `}` that closes the class body.
+* *top-level declaration* (`recoverItem`, in `parseModule`): to the next `function`, `class`, `interface`, `type`, `import`,
+  `export` or `@` at the declaration's brace level after the error.
+
+A declaration keyword at the statement's or member's level means that a `}` is missing: the error is reported once, and the
+parse unwinds (`Parser.unwinding`, every catcher propagates) to `parseModule`, which continues at that keyword. Running into the
+end of the file inside a recovery stops the parse (no "expected `}`" after the real error).
+
+**No cascades.** (1) *The checker never sees a recovered tree.* When the parse has errors, `parseRecovering` returns only the
+diagnostics, the loader stops at that file (as it did at the first error before), and no checker runs on the program: only
+the parse errors are reported. This is the safe rule of the decision; marking recovered nodes so that the checker could skip
+errors that stem from them would have meant a flag on `Expr` / `Stmt` / `Item` (built by literal in ~150 places) and a rule in
+every checker method, for the benefit of type errors in a file that does not parse. (2) *Inside the parser* an error is dropped
+when it starts at or before the previous error or at the token a statement or member recovery resumed at or the token after it
+(`Parser.floor`): a construct that fails at once after a resume point means the tokens are still out of step (a `}` missing
+or doubled), and every following line would otherwise report "expected `(` or `:` in class member, found `.`" and the like.
+Top-level resume points (a declaration keyword or `@`) are reliable and an annotation error starts at its `@`, so there the
+window is not applied. Prefer one error fewer: `a b; c d;` reports one error (`d` is the second token after the resume
+point), `let a = ; let b = ;` reports two. (3) *Cap*: at most `MAX_SYNTAX_ERRORS` = 20 per file; when a 21st error is found
+the 20th gets the note "further syntax errors suppressed" and the parse stops.
+
+**Termination.** In the style of 3c's progress property: `recoverStmt` and `recoverMember` ensure `result ==> this.pos > st ||
+this.isP("}")` (the loop continues only when the cursor moved past the start of the failed construct, or it ends at the `}`),
+`recoverItem` ensures `this.pos > st || this.atEnd()`. Every resume point is a token after the error, a `}` that ends the loop,
+or the end of the file.
+
+**Contracts** (28 new clauses in parser.or, 3 in loader.or): the `Parser` invariants (`errs.length <= MAX_SYNTAX_ERRORS`, no errors
+and no unwinding without recovery, the last error is at or before `floor`), the progress clauses above, `report` adds at most one
+error and adds exactly `d`, `stop` leaves the cursor at the end, `parseModule` with recovery always returns a module and has
+stopped unwinding, `parseRecovering` ensures `syntaxErrorsOk` (1..20 errors, parse-error codes, spans in the source, strictly
+ordered by start, the note only on the 20th) and `agreesWithParse` (errors exactly when `parse` fails, and the first one is
+`sameDiag` to it: the "first error unchanged" rule is a contract that runs on every file the contract-checked compiler loads);
+`Loader.run` ensures the further errors are renderable and empty on success.
+
+Tests: `compiler/tests/recovery_test.or` (9 `@Test`, run by `tools/test_tooling.sh`: each recovery point, no cascades, the
+cap and its note, the lexer, `Parser` without recovery unchanged, 400 garbage token soups and every prefix and every 3-byte
+deletion of a program checked against `parse`), `tests/recovery/` with `tools/test_recovery.py` (8 programs with the exact
+expected `check` output in `<name>.err`; also checks `compile`, `--format=json` and that `fmt --check` refuses the file), new
+cases in `test_lsp.py`, `test_mcp.py` and `analysis_test.or`. Mutation check: 12 hand-made mutants of the recovery code
+against `recovery_test.or` (no skipping in `recoverStmt`, no cascade floor, cap off by one, top-level resume at the error
+token, `if` body not a statement end, no unwinding at a declaration keyword, one-token cascade window, first error dropped,
+note on another error, a method body's `}` not consumed, recovery always on, `recoverStmt` ignoring `unwinding`): 11 killed;
+the last is equivalent (the check right after `report` returns on `unwinding` as well, and the re-report is dropped by the
+floor).
+
+Results (against the baseline compiler built before the change):
+
+* **first error**: `check` and `check --format=json` of 3,257 inputs (every `.or` file of the repository and 1,500 garbage
+  files: random token soups, truncations, deletions and duplications of real files, generated as in 3c): 3,047 outputs
+  identical, 210 report more errors; in all 210 the base reported one diagnostic and the new first diagnostic is
+  byte-identical to it (JSON line and rendered text), every further one has a syntax code, starts after the previous one,
+  and there are never more than 20 (histogram: 2 errors 144 files, 3: 27, 4: 12, 5: 7, 6: 4, 7: 3, 8: 5, 9: 2, 10: 3,
+  11: 1, 12: 1, 20: 1, `tests/recovery/cap.or`). No crash, no trap. The same inputs through the contract-checked compiler:
+  identical output, no contract fired (3,090 inputs: all but the 167 valid `compiler/` files, which take minutes each to
+  type check under contracts on a loaded machine; the contract-checked self-compile below parses every one of them).
+* **generated code**: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
+  `examples/` program and of `compiler/main.or` (392 programs x 3) byte-identical;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,833,375 bytes), conformance 141/141; all suites 812/812;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`,
+  812/812 conformance tests, `test_verify_contracts` 809 checks, no contract fired;
+* `orin check --strict-contracts compiler/main.or`: 0 warnings;
+* `test_fmt.py` 1,661 passed; `orin fmt --stdout` of 3,243 files byte-identical between the two compilers (1,271 formatted,
+  1,972 refused); `test_tooling.sh` passed (`recovery_test` 9/9, `test_recovery.py` 8/8); `test_lsp.py` 104 checks,
+  `test_mcp.py` 191 checks, 0 failed.
+
+Performance (callgrind instruction counts, both compilers built by the baseline compiler, both on the new tree):
+`orin compile compiler/main.or` 38,780 M -> 38,792 M (+0.03 %), `orin check compiler/main.or` (front end) 2,575.0 M ->
+2,587.2 M (+0.47 %). The parser's own copy-on-write traffic did not grow (the `Parser` copies in `orin_make_unique_slow`
+went from 1.60 M to 1.46 M instructions); the rest is spread thinly. Wall time was not measurable (load average 17-19 on 4
+cores: medians moved by more than 5 % between runs of the same binary).
+
+Friction:
+
+* **No exceptions, no catch.** Every error is a `Result` that `?` propagates; a recovery point is a loop that takes the
+  `Err` apart (`isOk` / `unwrap` / `unwrapErr` instead of `?`), and "give up and resume at the top level" needs a flag in
+  the parser (`unwinding`) that every catcher tests, because there is no way to unwind past several frames.
+* **Parameters are immutable and classes are values**: the loop-clause part of a block statement had to become a method
+  that returns its statements (`parseLoopClauses`) instead of pushing into the caller's array.
+* **Cascade rules are heuristics.** The cap, "stop at the end of the file" and "the checker never sees a recovered tree" are
+  rules; the two-token window after a resume point is a judgement (it drops `c d` in `a b; c d;`). It was tuned on the
+  garbage corpus, where the out-of-step cases (a `}` deleted in the middle of a class) produced one error per following line
+  before it.
+* **Session tooling**: shell loops over compiler runs are refused in a worktree-isolated session (like compound `git`
+  commands, see "Pitfalls found"); the corpus and comparison drivers were small Python scripts.
+
+## Step 3e: the tooling modules (`analysis/`, `lsp/`, `mcp/`, `json/`, `fmt/`) and the capability gate
+
+Rewritten to the contract and class standard: the state that the tooling threaded through records and free functions is now
+five classes, the exported functions state what they guarantee, and `analysis` performs no I/O of its own (the capability
+gate of Stage B). The exported surface is kept: the functional interfaces (`handle(fs, st, msg) -> { state, out }`,
+`openFile(ws, ..) -> Workspace`, `newState`, `format`, `parseJson`, `stringifyJson`, ...) are thin wrappers over the classes,
+so `mcp`, `testing`, `vc`, `main.or` and the tests needed only the renames below.
+
+| Old | New |
+|---|---|
+| `type Workspace = { files: SourceFile[]; revision }` + free functions that copy it | class `Workspace` (workspace.or): the document store; `open` / `close` / `text` / `paths` / `sources()` |
+| `type LspState` record, `handleRequest` / `reqX(fs, st, id, msg) -> LspStep` | class `LspServer` (lsp/handler.or): `handle` / `handleText` / `pump`; a request is answered by one private method that returns *the* reply |
+| `type McpState` record, `toolCheck` rebuilds it with a spread literal | class `McpSession` (mcp/util.or): root, rights, `record` / `find` / `latest` of the `check` snapshots |
+| `parseValue(s, i, depth) -> { v, pos }`, `parseString`, `parseNumber` threading the offset | class `JsonCursor` (json/parse.or): the read position over one text; `document()` |
+| `emit(j, out: string[]) -> string[]` (json.or) | `write.or`: `stringifyJson` / `quoteJson` with `map` / `join`; `jsonEq`, `nesting` in json.or |
+| `type Ctx = { src; cs }` + `seq(c, ..)`, `bracketed(c, ..)`, `findChar(c, ..)`, `gapsHave(c, ..)` | class `Layout` (fmt/layout.or): the source with its comment queue and the comment-placing operations; the printer calls `c.seq(..)` |
+| `readFile` / `exists` in `analysis` (`readText`, `resolveModulePath`, `loadOsigIn`) | `Workspace.sources()` / `new Sources([])`: reads go through the loader's `Sources` |
+| `analysis/osigcli.or`, `analysis/effectscli.or` (CLI, `writeFile`, `console.*`) | moved to `tools/` (the CLI layer, next to `orin fmt`); `analysis` exports no driver |
+| linear `for` searches (`hasStr`, `hasName`, `indexIn`, `hasLabel`, `containsIdx`, `sameSet`, ...) | `includes` / `some` / `every` / `findIndex` / `filter` / `map` (rule 7) |
+
+No `Printer` with an output buffer: the printer renders an element, measures it against the line width and renders it again
+broken over lines when it does not fit (`ex` with `lim`), so its results are values; a write-only buffer would need a rollback
+for every trial. The comment queue is the `Layout` class; its placement markers (`\x01 k \x02`) are what lets an enclosing
+construct see which comments an element already placed.
+
+Files (`orin fmt` output; most of these files had never been formatted, which accounts for most of the growth, e.g.
+`mcp/apitable.or` 192 -> 848 lines with no change of content; clauses are `@Requires` / `@Ensures` / `@Invariant` lines):
+
+| file | lines before -> after | requires | ensures | invariant |
+|---|---|---|---|---|
+| `analysis/analyze.or` | 188 -> 199 | 0 | 7 | 0 |
+| `analysis/apisnap.or` | 262 -> 264 | 0 | 2 | 0 |
+| `analysis/effectpolicy.or` | 226 -> 244 | 0 | 4 -> 7 | 0 |
+| `analysis/modgraph.or` | 162 -> 186 | 0 | 4 | 0 |
+| `analysis/osig.or` | 927 -> 1,195 | 1 | 6 | 0 |
+| `analysis/osigdiff.or` | 726 -> 808 | 0 | 5 | 0 |
+| `analysis/osigreport.or` | 602 -> 837 | 0 | 4 | 0 |
+| `analysis/pos.or` | 65 -> 78 | 0 | 3 | 0 |
+| `analysis/query.or` | 289 -> 407 | 8 | 19 | 0 |
+| `analysis/symbols.or` | 364 -> 479 | 0 | 3 | 0 |
+| `analysis/workspace.or` | 75 -> 137 | 0 | 10 | 3 |
+| `analysis/{effects,effectsum,doccomments}.or` (Stage B, unchanged) | 1,536 -> 1,538 | 11 | 16 | 4 |
+| `lsp/handler.or` | 670 -> 744 | 0 | 15 | 2 |
+| `lsp/frame.or`, `uri.or`, `convert.or` | 243 -> 284 | 0 | 11 | 0 |
+| `lsp/{server,stdio,format,module}.or` | 123 -> 123 | 0 | 0 | 0 |
+| `mcp/util.or` | 195 -> 286 | 4 | 14 | 5 |
+| `mcp/handler.or` | 101 -> 119 | 0 | 4 | 0 |
+| `mcp/tools.or` | 1,130 -> 1,418 | 1 | 3 | 0 |
+| `mcp/apitable.or` | 192 -> 848 | 0 | 2 | 0 |
+| `json/parse.or` | 310 -> 412 | 2 | 13 | 1 |
+| `json/json.or` + `write.or` (new) | 228 -> 308 | 0 | 4 | 0 |
+| `fmt/printer.or` | 1,248 -> 1,502 | 0 | 6 | 0 |
+| `fmt/layout.or` | 263 -> 330 | 2 | 4 | 1 |
+| `fmt/format.or`, `text.or` | 119 -> 155 | 0 | 6 | 0 |
+| `tools/osigcli.or`, `effectscli.or` (moved from `analysis`) | 242 -> 248 | 0 | 0 | 0 |
+| **total** (with the module files) | **10,589 -> 13,264** | **35 -> 213 clauses** (29 requires, 168 ensures, 16 invariants) | | |
+
+Classes: 1 -> 6 (`EffectTable` of Stage B, plus): `Workspace` (keys normalized and distinct, the revision only grows; `open`
+ensures the text is there and the revision moved by one, `close` that the path is gone), `LspServer` (`shutdown` only after
+`initialize`; every published path once), `McpSession` (root normalized, at most `MAX_SNAPS` snapshots, revisions increasing and
+below the next one; `record` ensures that the revision it returns names a stored snapshot and that an unchanged project keeps its
+revision), `JsonCursor` (the position never leaves the text; `value` consumes at least one byte on success), `Layout`
+(comments sorted, not overlapping, inside the text: what the binary search `firstAtOrAfter` relies on). `Snap` is a record with
+an invariant (`keys` and `lines` in step).
+
+Contracts, each with the bug it catches:
+
+* **JSON round trip**: `stringifyJson` ensures `nesting(j) <= MAX_DEPTH ==> parsesBackTo(result, j)` (structural `jsonEq`),
+  `quoteJson` ensures its literal reads back. Catches a missing escape, a number the parser cannot read (it did: below), a
+  field order change. `parseJson` / `JsonCursor.document` ensure a successful parse consumed the whole text and stays within
+  `MAX_DEPTH`, and an error names an offset inside the text (`errorInRange`); `value` ensures progress (a parse that does not
+  advance would loop) and `depth + nesting(result) <= MAX_DEPTH`; `utf8` requires a scalar value (a surrogate would make the
+  output invalid UTF-8).
+* **Positions**: `offsetToPos` ensures `isCharBoundary(text, off) ==> posToOffset(text, offsetToPos(text, off)) == off`;
+  `posToOffset` ensures its result is a character boundary inside the text. Catches a unit-counting rule that drifts between
+  the two directions (a hover or rename one character off after a non-ASCII character).
+* **The reply rule** (LSP and MCP): `LspServer.handle` ensures `repliesTo(msg, result)`: a request gets exactly one response,
+  carrying the id it was given (`jsonEq`, so string, number and object ids), everything else is a notification and a
+  notification gets no response; nothing after `exit`. `handleText` ensures a text that is not JSON is answered once with id
+  null. The private `request` ensures `answers(result, id)`, `notify` that it returns only notifications. MCP `handle` /
+  `handleText` ensure the same rule. Catches a handler that answers twice, forgets to answer, or answers with another id
+  (a client hangs or mismatches replies).
+* **References point at existing definitions** (query.or): every query requires `defIdsDense(idx)` (`defs[i].id == i`, which
+  the checker's `addDef` guarantees and the hit search relies on); `hitAt` ensures the hit is an occurrence of a definition
+  that exists; `referencesOfDef` ensures every span is an occurrence of `def` (`isOccurrence`: its name or one of its refs),
+  no span twice, the declaration first when asked for and absent otherwise; `definitionAt` ensures a definition's name;
+  `implementationsOfDef` that every span is a definition's name; `renameEdits` that every edit has the new name and lies on an
+  occurrence of the symbol at the cursor. Catches a reference list that mixes symbols (a rename that edits another symbol).
+* **Formatter**: `format` ensures `sameComments(src, result)` (same multiset of comment texts) and idempotence
+  (`format(result) == result`, a self-call, ADR-0031 A5); `printModule` ensures every comment of the file is placed
+  (`allPlaced` of its marker), `Layout.seq` / `bracketed` / `block` ensure every comment of their range; `quote` ensures a
+  one-line, valid UTF-8 literal. Catches a comment lost or doubled by a new layout rule, a non-canonical output.
+* **Capability-relevant analysis**: `analyze` ensures every diagnostic names a file of the source map and a range inside its
+  text (`diagsInRange`: the synthetic `main` of a library entry never leaks a position), `program` and `index` together;
+  `readText` returns the buffer when there is one; `resolveModulePath` a normalized `.or` path, never for `std:`.
+* **OSIG**: `buildOsig` ensures the hash and sorted, distinct node ids; `osigJson` ensures `parseOsig` reads it back with the same
+  hash (a field written but not read would break every later `orin diff`); `sortOrder` (merge sort) a stable permutation;
+  `cmpStr` a total order; `diffOsig` no differences for two snapshots of equal content; `diffJson` one JSON document whose
+  `differences` is `hasDifferences`; `diffHtml` no `<script`.
+* **MCP**: `McpSession` (above), `resolvePath` a normalized path inside the root, `applyEdits` requires disjoint edits inside
+  the text and ensures the resulting length, `hashStr` stays in range, `shq` one quoted word, the API table has unique names.
+* **Framing**: `frameMessage` ensures `unframe` reads back exactly the body (a `Content-Length` in characters instead of bytes),
+  `unframe` that the rest is the tail of the buffer; `pathToUri` ensures `uriToPath` gives the path back (an unescaped `%`).
+
+Mutation check: 16 hand-made mutants of the new code (a number that does not advance the cursor, `\` not escaped, 20-digit
+numbers accepted, a reused revision, an unbounded snapshot list, an unnormalized buffer key, `close` by raw spelling,
+continuation bytes counted as characters, `initialize` answered with id null, `shutdown` answered with a notification, `ping`
+answered twice, references of other definitions included, a hit on the wrong definition, a trailing comment dropped, `%` not
+escaped in URIs, `Content-Length` off by one) against `compiler/tests/tooling_test.or`: all 16 killed, 14 by a contract trap (with the values of the clause), 2 by an
+assertion (continuation bytes, 20-digit numbers). Five survived the first run because the test never exercised the path
+(closing a buffer by another spelling, a hit on a declaration that is not the first definition, a framed message, a path with a
+valid `%XX`, a 20-digit number); the test now does, and the contracts of those paths kill them.
+
+Defects found and fixed:
+
+* **JSON: the serializer wrote numbers the parser rejected.** `parseJson` refused integers with more than 18 digits, but
+  `stringifyJson` writes any `int` (`i64::MIN`, any value from 10^18 on): the round-trip contract failed on them. The
+  parser now reads every `int` (19 digits checked against the bounds, accumulated on the side of the sign so that `i64::MIN`
+  does not overflow) and rejects only values outside the i64 range; `json_test.or` was updated (`1234567890123456789` is now
+  read, `9223372036854775808` and 20 digits are errors).
+* **Effect policy diagnostics pointed into the wrong file.** E0474 (unknown effect name) and E0502 (a table of a missing
+  module) are found after loading, but kept the file id 0 of the manifest parse, so they were rendered as a position in the
+  program's first source file (`src/main.or:19:1` for a line of `orin.toml`), and the contract-checked compiler trapped on
+  `render`'s `isRenderable` precondition. `Manifest` now carries its `source` (the loader sets it), the policy relocates the
+  spans to the manifest's place in `policySourceMap(prog, sm)`, and `main.or` / `orin effects` render against that map; the
+  location is now `orin.toml:24:12`. `effectPolicyDiags` ensures `allRenderable(policySourceMap(..), result)`;
+  `tools/test_effects.py` checks the file name. (Found by running the effect suite with the contract-checked compiler.)
+
+Not done: `lsp::shellRun` (the only `shell` call) stays: there is no `spawn(proc, executable, argv)` in the standard library
+yet (ADR-0037 D5). The 13 strict-contract warnings W0471 of `compiler/vc/` (public mutating methods of `Gen` / `Tab` without
+`@Ensures`) are older than this step and outside its modules.
+
+Unit tests: `compiler/tests/tooling_test.or` (16 `@Test`: JSON round trip, equality, cursor, error offsets, nesting limit;
+position round trip; workspace store and reads through `Sources`; index queries; the LSP and MCP reply rule on scripted
+sessions and its predicate on hand-built replies; MCP revisions; formatter idempotence and comments; `Layout`), run by
+`tools/test_tooling.sh`. `json_test.or`, `analysis_test.or`, `lsp_test.or` were adapted (`LspServer`, `revision()`, the number
+rule); they also pass when built with `--check-contracts`.
+
+Behaviour preservation (against the baseline compiler built from `origin/main` before the step):
+
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,513,150 bytes), conformance 141/141;
+* generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
+  `examples/` program and of `compiler/main.or` (426 inputs x 3), baseline compiler vs new compiler: **0 differences**;
+* `tools/diff_compilers.py`: 1,412 inputs x 3 modes, **0 differences** (no conformance input has an `[effects]` table, so the
+  relocated E0474 / E0502 do not show there; `tools/test_effects.py` checks them);
+* conformance `--suite all` 812/812 (C), default suite with `--backend=llvm` 141/141;
+* `tools/test_compiler_contracts.sh`: contract-checked self-compile byte-identical to `stage2.c`, 812/812 conformance tests,
+  verifier contracts 809/809, **no contract fired**; `tools/test_lsp.py` (100 checks), `test_mcp.py` (188), `test_osig.py` (101),
+  `test_effects.py` (89) also pass with the contract-checked compiler as the binary under test (that run found the E0474 defect);
+* `tools/test_tooling.sh`, `tools/test_fmt.py` (13 goldens, 1,584 corpus files: idempotence, AST and comment preservation,
+  61 JSON diagnostics; 1,658 passed), `test_lsp.py`, `test_mcp.py`, `test_osig.py`, `test_effects.py`: pass;
+* `orin fmt --stdout` of the 1,609-file formatter corpus with the contract-checked compiler: output byte-identical to the
+  baseline's, no contract fired (idempotence and comment contracts on every file);
+* `orin check --strict-contracts compiler/main.or`: 13 warnings, the same 13 W0471 of `compiler/vc/` as on `origin/main`;
+  none in the modules of this step (`LspServer.pump` got its `@Ensures`).
+
+Selfcompile (callgrind instruction counts of `orin2 compile compiler/main.or -o /dev/null`; the machine was shared, so
+instructions rather than wall time): baseline compiler on the old tree 38,236,442,981; new compiler on the new tree
+38,419,783,870 (+0.48 %); baseline compiler on the new tree 38,419,717,402. The two compilers on the same tree differ by
+66,468 instructions (+0.0002 %): the growth is the larger input (the formatted and annotated tooling sources), not a slower
+compiler. Contracts are erased in the normal build; the tooling code does not run during a compile.
+
+Friction:
+
+* **A class cannot hand itself out.** `LspServer.pump` returns `Pumped { state: this, .. }` for the functional interface; the
+  free functions copy the class into a `let`, call the mutating method and return the copy (`handle(fs, st, msg)`). The MCP
+  tools still thread the session through `ToolOut.st` because only `check` changes it and the tool functions are free
+  functions; a `&mut` parameter would remove both.
+* **Grants in tests.** A closure cannot capture a grant (E0452), so a test that needs both the file-system and the process grant
+  uses `useHost(host, (fs, proc, stdio, clock) => ..)` and a helper function instead of nesting `useFs` / `useProcess`.
+* **No `lastIndexOf`, no `Option.map`, `every` without an index.** `errorOffset` splits the message, `findField` uses
+  `findIndex`, `sortDesc`'s ordering predicate is a loop.
+* **`reduce` takes the function first** (`xs.reduce(f, init)`), and an `int` literal does not meet a `usize` accumulator; the
+  length sum of `unframe`'s contract is a loop.
+* **The word "digits" in a shell command** made the worktree sandbox refuse it (it contains `git`); scripts were written to
+  files instead.
+* **`orin fmt` had never run on these modules**: the first formatting is most of the line growth (`apitable.or` alone 192 ->
+  848); the clause counts are unaffected.
+* **Contract cost of self-calls.** A clause that re-renders (`ex` ensuring the broken form equals `exBreak(..)`) doubles the work
+  at every nesting level, exponential in the depth; it was dropped. `format`'s idempotence clause runs the formatter twice per
+  call, acceptable because only the contract-checked build pays it.
+
+## Step 3b: `verify/` (the ownership verifier), `mir/` well-formedness, `hir/`
+
+Rewritten: `compiler/verify/` (the independent MIR ownership verifier, the trust anchor of memory safety: every compile is
+gated by it, it has a Lean twin in `formal/` and the differential test `tools/diff_verifier_lean.py`). The transfer functions
+threaded a `Cx` record through ~60 functions that each returned the updated copy; the fixpoint kept parallel `ins` / `queued`
+/ `work` arrays in one function. New: `compiler/mir/wellformed.or` (the structural MIR predicates, shared by the lowering, the
+verifier and the tests). `compiler/hir/` got contracts where it has real invariants. `compiler/lower/` only lost the predicates
+that moved to `mir/` (and `lower` gained `@Ensures(isWellFormedProgram(result))`). `compiler/opt/` was not touched: it keeps
+using `Cx`, `step`, `State.ls` and `blockInStates` exactly as before.
+
+| Old | New |
+|---|---|
+| `type State = { ls; holes }` + free functions `joinState`, `stateEq`, `holeIn`, `holesEq` | class `State` (state.or): the lattice value stored per block: queries (`kind`, `srcOf`, `holeAny`, `holeHas`, `holeMay`), `join`, `equals`, `leq` (the lattice order), `borrowsFlat`; the hole queries are also free functions over a hole array (`holeAnyIn`, ...) |
+| `type Cx = {..}` threaded through every rule: `c = readLocal(c, l); c = err(c, msg); return def(c, d, k, 0)`; `setLs`, `killBorrows`, `addHole`, ... over a `Cx` | class `Transfer` (rules.or): one run through a block; it owns the state arrays `ls` / `holes` and the issues; the rules and the state mutators (`set`, `killBorrows`, `addHole`, `removeHole`, `dropHolesOf`) are private methods that mutate `this`; public `run`, `step(ins)`, `term(t)`, `state()` carry the contracts. `Cx` / `step(cx, ins)` remain as the optimiser's interface (a wrapper) |
+| `fixpoint(p, f)`: `ins`, `queued`, `work` as three local arrays | class `Fixpoint` (verify.or): the in-states and the worklist (`queued` flags, LIFO `work`), private `add` / `take`, public `run`, `isStable`, `pending` |
+| `successors`, `dstOf`, `instrLocals`, ... duplicated in verify.or, wf.or and lower/wellformed.or | one copy in `mir/wellformed.or`: `dstOf`, `instrLocals`, `instrOperands`, `termLocals`, `successors`, `instrInRange`, `termInRange`, `spansAligned`, `paramsWellFormed`, `isWellFormedFunction`, `isWellFormedProgram`, plus the block predicates of 3a |
+| index loops that ask a question about an array (`noHandles`, `opsOk`, `constsOk`, `casesOk`, `holeIn`, `holesEq`, owned-parameter scans, the void-local scan) | `some` / `every` / `find` / `filter` (rule 7); the per-instruction loops of the transfer functions (`killBorrows`, `callOwned`, the leak scan at `return`, `join`, `equals`) stay loops: they are the hot path, mutate, or exit early |
+| vtable check inline in `verify` | `vtableMsg` |
+
+Files (`orin fmt` output for the rewritten files; clauses counted with `grep -c '^ *@Requires'` etc.):
+
+| file | role | lines before -> after | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `verify/state.or` | domain: `LState` (record invariants), `lsLeq`, `joinLs`, hole queries, `borrowsFlatIn`, class `State` | 145 -> 331 | 6 | 12 | 3 |
+| `verify/rules.or` | class `Transfer`, `Cx` / `step`, `noRevival`, `issuesAt` | 656 -> 830 | 11 | 20 | 3 |
+| `verify/verify.or` | class `Fixpoint`; `verify`, `blockInStates`, report placement | 211 -> 380 | 7 | 20 | 4 |
+| `verify/wf.or` | structural checks, tied to the `mir/` predicates | 473 -> 564 | 3 | 9 | 0 |
+| `verify/module.or` | exports | 4 -> 13 | 0 | 0 | 0 |
+| `mir/wellformed.or` (new) | shared structural predicates | 0 -> 292 | 0 | 1 | 0 |
+| `hir/hir.or` | integer kinds, `Function` | 264 -> 298 | 3 | 11 | 1 |
+| `hir/index.or` | `CallSite` (after merging main's `param` / `fnArgs`) | 72 -> 89 | 0 | 0 | 4 |
+| `lower/wellformed.or` | (predicates moved to `mir/`) | 241 -> 57 | 0 | 0 | 0 |
+| `lower/lower.or` | `lower` | 36 -> 37 | 0 | 5 (+1) | 0 |
+| total verify | | 1,489 -> 2,118 | 27 | 61 | 10 = **98 clauses (0 before)**; 101 after the merges below (28 / 63 / 10) |
+| total hir + mir + lower | | | 3 | 13 (+2) | 5 = 21 new clauses |
+
+Unit tests: `compiler/tests/verify_test.or` (23 `@Test`, 622 lines), run by `tools/test_tooling.sh`; `compiler/tests/verify_main.or`
+gained 4 robustness cases (below).
+
+Classes (3 new): `State` (every hole names a local of the function, so does every symbolic index), `Transfer` (one state
+entry per local of the function; every hole names a local; the position is a block of the function and at most its
+terminator), `Fixpoint` (one in-state slot and one queue flag per block; the entry block is always reached; the worklist is
+never longer than the block list, and only block ids get in, by the `@Requires` of `add`). `LState` (a kind in range; a source
+only for `Borrowed`) and `CallSite` (a known evidence level and edge kind, no callee when the target is unknown, a parameter index only for a call of
+a function value) are records
+with invariants; `Function` (HIR) has `paramCount <= locals.length`.
+
+Contracts (highlights; the bug each would catch):
+
+* **the join is a semilattice join**: `joinLs` ensures commutativity (`joinLs(a, b) == joinLs(b, a)`, a self-call in the
+  contract), idempotence, that the result is an upper bound of both inputs in `lsLeq` (the order is stated independently of
+  the join: equal; Unique/Imm below Owned; no-reference states below MaybeDead; everything but handles below MaybeLeak;
+  MaybeOpen on top), and that a borrow survives a join only when both sides agree on its root. `State.join` ensures
+  `this.leq(result) && o.leq(result)` (catches a join that loses a hole or a poisoning: the next block would be checked from a
+  state that is too optimistic, i.e. unsound) and `equals` ensures `result ==> this.leq(o)`. The unit tests check
+  associativity and that the join is the *least* upper bound over all 12x12x12 states (the worklist order then cannot matter).
+* **only a defining instruction revives a local**: `Transfer.step` ensures `noRevival(old(this.st), this.st, dstOf(ins))`:
+  a local that was dead or poisoned before an instruction is in exactly the same state after it, unless the instruction
+  defines it. Catches a rule that "repairs" a released array by a push (a use-after-free that would then pass every later
+  check), a demotion that fires on a dead local, a close that reopens.
+* **borrows are flat**: `Transfer.run` requires and ensures `State.borrowsFlat()` (an alias's root is never itself an alias).
+  `rootOf` and the single `killBorrows(x)` per release rely on it; a redefinition that forgot to kill the aliases of the
+  redefined local makes a chain, and the alias would survive the release of its real owner.
+* **every report names an existing position**: `Transfer.step` / `term` ensure that every new issue is at the current block
+  and instruction and carries that instruction's span (`issuesAt`); `verifyFunction` ensures `issuePlaced` for every error and
+  warning (an existing block and instruction, the terminator being `instrs.length`, or the function itself at 0/0 without a
+  span); `verify` ensures `reportPlaced` (a function, a vtable or `<program>`).
+* **the fixpoint is one**: `Fixpoint.run` ensures an empty worklist, one entry per local in every in-state, that the reached
+  blocks are closed under successors, and `isStable()`: re-running every reached block and joining its out-state into each
+  successor's in-state changes nothing. Catches a worklist that drops a block or does not re-queue a loop head whose in-state
+  grew (the blocks after the loop would be checked from a stale state). `Fixpoint.add` / `take` state their effect on the
+  queue (a block is queued at most once; `take` returns a valid id and unqueues it).
+* **the verifier's well-formedness implies the shared predicate**: `wfInstr` ensures `instrInRange` (only locals, strings,
+  functions, vtables that exist) and `handleDefOk` (only an opener defines a handle); `wfTerm` ensures `termInRange`;
+  `wfFunction` ensures `paramsWellFormed`, an entry block, `spansAligned`; `wellFormed` / `verifyFunction` ensure
+  `errors.length == 0 ==> isWellFormedFunction(p, f)` and `verify` ensures `errors.length == 0 ==> isWellFormedProgram(p)`.
+  The verifier's check and the structural predicate of `mir/` are written independently; the contract keeps them from drifting
+  apart (a wf rule deleted from the verifier shows as a trap). `lower` ensures `isWellFormedProgram(result)` with the same
+  predicate.
+* **preconditions of the rules**: `Transfer.step` requires `wfInstr(..) == ""` (the rules index without checks),
+  `State.set` requires a kind in range and a borrow rooted at another existing local, `addHole` a hole naming existing locals,
+  `blockInStates` (the optimiser's entry) a well-formed function.
+* **hir**: `kindType` requires a kind number and ensures `intKindOf(kindType(k)) == k`; `kindHi` ensures that a narrow kind has
+  exactly 2^bits values (`kindHi(k) - kindLo(k) + 1 == pow2(kindBits(k))`) and that the u64 maximum is the all-ones pattern;
+  `kindLo` is negative exactly for signed kinds; `kindNarrow == (kindBits < 64)`; `kindName` requires a kind number (it
+  indexes a table).
+
+None fired on the compiler's own sources, the conformance suites or the unit tests. To see that they can: 12 hand-made
+mutants of the new code (join keeps Unique, worklist forgets its flag, no re-queue of a grown in-state, redefinition or release
+keeps aliases, a push revives a dead array, a symbolic hole key never aliases, errors one instruction late, an unchecked
+`goto` target, `dup` does not demote, the join drops the second state's holes, `kindHi(i8) == 128`) were run against
+`verify_test.or`: **12 / 12 killed**, 9 of them by a contract trap (the other three by assertions). The first run left one
+survivor (the revived array), which is why `aPushOntoAReleasedArrayDoesNotReviveIt` exists.
+
+### Defects found and fixed
+
+**The verifier crashed (array index out of range) instead of reporting ill-formed MIR in four places.** All four are
+fail-safe (a trap aborts the compile, nothing unsafe is accepted) and no MIR the compiler produces triggers them, but the trust
+anchor must report, not crash, and the batch driver (`verify_text`) and `orin verify` died on such input. Found by the new
+`@Requires(l < f.locals.length)` of `localClass` and the `spansAligned` part of the shared predicate:
+
+1. `ICall` of a callee whose `paramCount` exceeds its locals: the argument-class loop read `g.locals[i]` of the callee
+   before the callee itself was checked. Now `ICall: callee g has more parameters than locals` (and the callee's own
+   `paramCount exceeds the number of locals`).
+2. `IClosure` whose target has parameters but no locals: `g.locals[0]`. Now the existing message `IClosure: the lifted
+   function must take the environment record as its first parameter`.
+3. A vtable entry with parameters but no locals: same; now the existing `vtable entry g must take the boxed value ...`.
+4. A block with fewer spans than instructions (possible only without contract checking: `MBlock`'s record invariant forbids
+   it): reporting an error in it read `spans[i]`. `wfFunction` now rejects it with `a block has a different number of source
+   spans and instructions`.
+
+Each is a case of `verify_main.or` (`robustnessCases`, run without contracts, so case 4 can be built) and, for 1-3, of
+`verify_test.or`; on the old verifier all four end in `trap: index out of bounds`. **Verdicts**: these inputs went from "crash"
+to "reject"; no input that was accepted or rejected before changes (measured below). The Lean model needs no change: its
+fragment has well-formed parameter tables and no spans (the differential test generates only well-formed programs).
+
+### Behaviour preservation
+
+All against the compiler built from `origin/main` (c37cf52, merged into the step at the end; the same gates were also run
+before the merge against the 3a baseline, with the same results):
+
+* **verifier verdicts and messages, byte for byte**: the `verify_text` driver built from the old and the new tree, fed the
+  same 43,935 programs (every distinct function of the conformance programs' MIR and all its `mutate_mir` mutants) and
+  the 4,000 `gen_mir_fragment` programs of the Lean differential test (with a synthetic span on every line): **output
+  identical** (28,412 and 3,114 rejections, 4,445,071 and 808,781 bytes), so every accept / reject decision and every
+  message is unchanged; the four robustness inputs above are the only ones that behave differently (a crash before);
+* `tools/mutate_mir.py`: 41,315 mutants, 28,412 rejected, 12,354 warned, 549 benign, 0 survivors, 0 wrong-reason (the
+  same as before); `tools/diff_verifier_lean.py` (12,000 programs): 4,592 both ACCEPT, 7,396 both REJECT, 12 divergences,
+  all in the allow-listed class F6, the same numbers with the old driver; `verify_main.or`: all cases pass (4 new);
+* generated code (`tools/diff_compilers.py`-style comparison of C, C with `--check-contracts` and LLVM IR of every `tests/run`,
+  `tests/next/run`, `tests/contracts`, `examples/` program and `compiler/main.or`): **390 inputs x 3, 0 differences**;
+  diagnostics (`tools/diff_compilers.py`): 1,406 inputs x 3 modes, 0 differences;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,373,446 bytes), conformance 141/141; all suites with `orin2`: 806/806;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806/806
+  conformance tests, `test_verify_contracts` 809 checks: **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: no warning in the files of this step; the 13 `W0471` of
+  `compiler/vc/` (`Gen`, `Tab`) are on `origin/main` too and are not part of this step;
+* `tools/test_tooling.sh` (including `verify_test.or` and `verify_main.or`): passes; `ci_local.sh` was not run (the
+  coordinator replaced it by the gates above; GitHub CI covers the rest).
+
+Selfcompile (`orin2 compile compiler/main.or -o /dev/null`, both compilers on the same merged tree, interleaved, the
+machine shared with other workers at load 4-10 on 4 cores):
+
+| | main compiler | new compiler |
+|---|---|---|
+| batch 1 (main first, 10 runs) | median 9.241 s, min 8.104 | median 9.508 s (+2.9 %), min 8.219 (+1.4 %) |
+| batch 2 (new first, 10 runs) | median 8.673 s, min 7.413 | median 8.408 s (-3.1 %), min 7.242 (-2.3 %) |
+| before the merge, 3a baseline vs final layout (5 runs) | median 7.938 s, min 7.185 | median 7.160 s, min 6.910 |
+
+No regression beyond the noise; the copy count of the verifier is below the old code's (2.62 M vs 2.89 M
+`orin_make_unique_slow` calls per self-compile, gprof). The verifier is about half of the self-compile; its hot spots are the
+same as before (`killBorrows`, O(locals) per definition, about 23 %, and `State.join`, about 17 %): a reverse index from a
+root to its aliases would remove most of the first, a change of algorithm left for later.
+
+### Design notes and friction
+
+* **A mutating method called on a class-typed field copies the object (performance finding).** The first version kept a
+  `State` field in `Transfer` (`this.st.set(l, k, src)`, `this.st.killBorrows(x)`) and a `Worklist` field in `Fixpoint`
+  (`this.work.add(s)`). The self-compile became **20 % slower** (median 11.20 s vs 9.34 s, minimum 10.21 vs 8.57, both
+  compilers on the same tree): the verifier is about half of the self-compile, and gprof showed `orin_make_unique_slow`
+  going from 2.9 M to 5.9 M calls, 2.7 M of them from `State.set` and 1.4 M from `Worklist.add` / `take`. A 30-line
+  micro-benchmark confirms it: `this.inner.set(i, v)` copies the inner object *and its array* on every call (400,000 copies
+  for 200,000 calls of a 1,000-element array), `this.a[i] = v` copies nothing. The generated code keeps the field's old
+  value alive across the call, so the callee never sees a unique object. The fix keeps the hot state in the class that
+  mutates it: `Transfer` owns `ls` / `holes` (`state()` packages them as a `State` at the boundaries) and `Fixpoint` owns
+  its queue. Afterwards: 2.6 M copies, fewer than before the rewrite. The same pattern costs the lowering of step 3a
+  copies too (`this.b.emit(..)`: 321,000 copies of the `BlockBuilder` per self-compile); a lowering of a mutating call on
+  a field place via take / put (as `IArrayPush` on a field already does) would remove the trap for every class. That is a
+  change to `lower/` and to the generated C, outside this step.
+* **`Cx` stays for the optimiser.** `opt/calls.or` builds `Cx { prog, f, blk, ins, st, errs, warns }` and replays one
+  instruction at a time; `step(cx, ins)` builds a `Transfer` from it, runs `Transfer.step` and returns its `state()`.
+  `State` is a class with *public* `ls` / `holes` because the optimiser reads `s.ls[x].k`; the invariant is checked after
+  `State`'s own methods only (public fields can be written around it, nothing does).
+* **`old(this.ls)` of an array works** (`noRevival(old(this.ls), this.ls, ..)`): it is a snapshot, the copy-on-write copy is
+  paid only by the contract-checked build.
+* **Contracts on recursive data stay O(1) in invariants**: the class invariants are O(1) or O(holes); the O(locals) properties
+  (`noRevival`, `borrowsFlat`, `killBorrows` leaving no alias) are `@Ensures` of the methods that change the state, and the
+  O(function) ones (`isStable`, `reachClosed`, `isWellFormedFunction`) are on `Fixpoint.run` and `verify`, once per function.
+* **`from` is still a keyword**: the parameter of `issuesAt` is `start`.
+* **A predicate that is too strong for a quirk.** `holesEq` compares lengths and membership, so a hole set with a repeated
+  entry (only a `take` of an already taken slot creates one, and that is an error already) can compare equal to a different
+  set. The contracts say exactly what holds (`equals` ensures `this.leq(o)`, not set equality); behaviour is unchanged.
+* **Shared predicates vs. an independent verifier.** The verifier must not trust the lowering; it does not: its own check
+  (`wf.or`) stays, and the shared `mir/` predicate is only used in its *contracts* to state that the two agree.
+* **A record invariant must cover what the producer emits, not what the comment says.** The comment on `CallSite.via` listed
+  six kinds; the checker also emits `constructor` and `io:<op>`, and main (merged during the step) added `unresolved`. The
+  first `isCallVia` would have trapped the contract-checked compiler on the first unresolved call (rule 6); the kinds were
+  taken from the `addCall` sites, not from the comment.
+* **Monitoring a background job**: `pgrep -f <script>` inside a monitor loop matches the monitor itself (the pitfall of step
+  1 again); wait on the PID.
+
+### Merges after the step: std:net, concurrency stage 0, the performance branch (MIR v1.10)
+
+Two merges were done on top of the step, both into the new structure, with the same verdicts as the merged old verifier:
+
+* **`origin/main` (d73f88a: std:net, concurrency stage 0).** Main had changed the record-threading verifier: net openers
+  `BGrantNet` / `BGrantListen` / `BGrantConnect` / `BNetListen` / `BNetAccept` / `BNetConnect` and the closer `BNetClose` in
+  `builtinStep`, `BTask(k)` dispatched by `taskOpOpensFrom` / `taskOpAdopts` (openers) and `taskOpMoves` (closer); in wf.or the net
+  arms of `takesHandle` / `isOpenB`, `isAdoptB` and the adoption branch of `handleMsg`. Ported as arms of `Transfer.builtin`
+  and the same arms in wf.or; `handleDefOk` (the contract "only an opener defines a handle") now also accepts an adoption,
+  otherwise the contract-checked compiler would trap on std:task. Also: `grantTypeName` grew to eight names, which silently
+  broke its `@Ensures((k < 6) == ..)` from this step (fixed to 8; it merged without a conflict). `verify_main` keeps every case
+  set and sums them (`robustnessCases`, `spanCases`, ..., `netCases`, `taskGrantCases`).
+* **The performance branch (MIR v1.10).** In/out receivers: `def` lets an inout function write parameter 0, an `ICall` of an
+  inout callee re-defines its argument 0 as Owned, `TReturn` of an inout function requires an owned receiver in local 0 and
+  consumes it, wf.or checks the call shape and that parameter 0 is owned; `IArrayExtend` has the rules of `IStrAppend`. All
+  ported into `Transfer` / wf.or / `mir/wellformed.or` (`instrLocals`, `instrOperands`). One contract had to learn the new rule:
+  an inout call defines a local that is not its destination, so `noRevival` now takes `defsOf(prog, ins)` (destination + in/out
+  argument); with `dstOf` alone it would trap on an erroneous inout call. Its two verifier speed-ups:
+  * *`def` skips `killBorrows` when the redefined local was Dead or a scalar* (the alias scan over all locals, the verifier's
+    hottest loop): **still applies, ported.** The reason it is sound is now a stated precondition, `rootsLive` (no alias is
+    rooted at a Dead or scalar local), required and ensured by `Transfer.run`.
+  * *the join allocates nothing when nothing changes* (`joinChanged`): **still applies, ported** as `State.joinIfChanged`
+    (`@Ensures(result.isNone() == this.join(o).equals(this))`); `Fixpoint.run` and `isStable` use it instead of `join` +
+    `equals`.
+  Neither is made unnecessary by the 3b restructuring: the copies that `Fixpoint` / `Transfer` remove (a mutating method called
+  on a class-typed field) exist only in the class version and are a different cost; the perf branch's two speed-ups are about the
+  algorithm and apply to both.
+
+Gates on the doubly merged tree, against a baseline built from `origin/main` + the performance branch *without* step 3b
+(`git merge-tree`, clean in `verify/`):
+
+* verifier output byte for byte against the baseline's `verify_text` driver: **identical** on 49,521 programs of the
+  `mutate_mir` corpus (now with the perf branch's two in/out mutation classes; 32,388 rejections) and the 4,000 Lean-fragment
+  programs (3,114 rejections);
+* `tools/mutate_mir.py`: 46,570 mutants, 32,388 rejected, 13,593 warned, 589 benign, **0 survivors**, 0 wrong-reason;
+  `tools/diff_verifier_lean.py`: 4,592 both ACCEPT, 7,396 both REJECT, 12 divergences, all in the allow-listed class F6;
+  `verify_main.or`: all cases pass (241: every set of main, the perf branch and this step, summed);
+  `verify_test.or`: 26 `@Test` (3 new: an inout call's `defsOf`, `rootsLive` / `joinIfChanged`, `IArrayExtend`);
+* generated code (C, C with `--check-contracts`, LLVM IR): 408 inputs x 3, **0 differences**; diagnostics
+  (`tools/diff_compilers.py`): 1,432 inputs x 3, 0 differences;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,890,058 bytes), conformance 141/141; all suites 832/832;
+* `tools/test_compiler_contracts.sh`: contract-checked self-compile identical to `stage2.c`; suites 832/832 (one test,
+  `std_http_basic`, hit the harness timeout at load 22 and passed on rerun: 1.7 s with contracts, 0.5 s without);
+  `test_verify_contracts` 809 checks; **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: **0 warnings** (the 13 `W0471` of `compiler/vc/` that main had are fixed:
+  `@Ensures` on `Gen.next` / `declare` / `assert` / `lemma` / `setExact` / `taint` / `noteApprox` / `noteStr` /
+  `useAssumption` / `newLoop` / `loopAdd` / `addObl` and `Tab.setCyclic`, each stating its effect; checked by
+  `test_verify_contracts`);
+* `tools/test_tooling.sh` and `tools/test_concurrency.sh` (`task_test` 98 checks, the stress and panic tests under the
+  sanitizers): pass;
+* self-compile instruction count (callgrind, `compile compiler/main.or`, both compilers on the final tree): baseline
+  36,423,718,059, new **34,819,751,109 (-4.4 %)**; `killBorrows` 8.25 G -> 6.43 G (the `Transfer` method writes `this.ls` in
+  place, the record version copied), the joins unchanged (`joinLs` 4.38 G in both, `join` 4.22 G, `joinIfChanged` 3.66 G).
+  The verifier is still about 60 % of the self-compile: `killBorrows` with an index from a root to its aliases, and a join that
+  stops at the first poisoned local, are the next algorithmic steps.
+
 ## Step 3d: `opt/` (the MIR optimiser), `cemit/` and `llvm/` (the code generators)
 
 Rewritten: the optimiser `compiler/opt/` (nine files; every pass threaded parallel arrays through its block loop:
 `out` / `sps`, `touched` / `rep`, `gone`, `hit`, the growing `locals`, and the inference kept its modes in the program it
 was rewriting) and both code generators, `compiler/cemit/cemit.or` (676 lines) and `compiler/llvm/llvm.or` (1,163 lines),
 which were one file each with a `Fx { prog, f, names }` record passed to every function. The exported surface is unchanged
-(`optimize`, `pruneProgram`, `emitC`, `emitLlvm`; additions only). `compiler/mir/` was not touched: step 3b (not merged on
-this base) moves the structural MIR predicates to `mir/wellformed.or`, so the contracts here use those of
-`lower/wellformed.or` (`blocksLocalsBelow`, `blockTargetsInRange`, `blocksStrsBelow`, `allReachable`, `spansComplete`,
-`instrLocals`), which 3b re-exports from the new place.
+(`optimize`, `pruneProgram`, `emitC`, `emitCSites`, `emitLlvm`; additions only). `compiler/mir/` was not touched; the
+contracts use the shared structural predicates of step 3b in `mir/wellformed.or` (`isWellFormedFunction`,
+`isWellFormedProgram`, `paramsWellFormed`, `spansAligned`, `blocksLocalsBelow`, `blockTargetsInRange`, `allReachable`,
+`spansComplete`, `instrLocals`, `termLocals`): `fnWellFormed` / `progWellFormed` of the optimiser and `emittable` of the
+emitters are those predicates. (The step was written on a base without 3b, against the same predicates in
+`lower/wellformed.or`, and switched when origin/main was merged.)
+
+The allocation-site census (`--stats-sites`, `cemit/sites.or`, merged from origin/main during the step) numbers the
+`ORIN_SITE(n, ..)` marks across the whole program, the one program-wide counter of the C backend. Under rule 8 it moved
+into the symbol step: `cSymbolsWith(prog, true)` fixes the first site id of every function (`CSymbols.firstSite`,
+ensured by `sitesNumbered`: function i starts after all sites of functions 0 .. i-1, the numbering `siteTable` uses),
+and `CFunctionEmitter.run` only reads it. The census output and the normal output are byte-identical to origin/main's
+compiler (spot check below).
 
 | Old | New |
 |---|---|

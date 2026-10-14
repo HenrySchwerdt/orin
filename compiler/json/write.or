@@ -1,0 +1,80 @@
+// Deterministic JSON serializer (spec 18 §3). Compact (no whitespace); objects keep their field order.
+//
+// Round trip: whatever `stringifyJson` writes, `parseJson` reads back as the same value (`jsonEq`), for every
+// value the parser can hold (nesting up to MAX_DEPTH; every `int`, see parse.or). Stated as the `@Ensures` of
+// `stringifyJson`, so the contract-checked build tests it on every message the LSP, the MCP server and the OSIG
+// writer produce.
+
+import { Json, JField, JStr, jsonEq, nesting } from "./json";
+import { parseJson, MAX_DEPTH } from "./parse";
+
+function hexDigit(n: int): string {
+  return String.fromCharCode(n < 10 ? 48 + n : 87 + n);
+}
+
+// True when `s` is a JSON text whose value is `j`.
+export function parsesBackTo(s: string, j: Json): bool {
+  return match (parseJson(s)) {
+    Ok(v) => jsonEq(v, j),
+    Err(_) => false,
+  };
+}
+
+// The JSON string literal of `s`: `"` and `\` escaped, control characters (< 0x20) as `\n` `\r` `\t` or
+// `\u00XX`; every other byte (UTF-8 sequences included) passes through unchanged.
+@Ensures(result.length >= s.length + 2 && result.startsWith("\"") && result.endsWith("\""))
+@Ensures(parsesBackTo(result, JStr(s)))
+export function quoteJson(s: string): string {
+  let parts: string[] = ["\""];
+  let runStart: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 34 || c == 92 || c < 32) {
+      if (i > runStart) {
+        parts.push(s.substring(runStart, i));
+      }
+      if (c == 34) {
+        parts.push("\\\"");
+      } else if (c == 92) {
+        parts.push("\\\\");
+      } else if (c == 10) {
+        parts.push("\\n");
+      } else if (c == 13) {
+        parts.push("\\r");
+      } else if (c == 9) {
+        parts.push("\\t");
+      } else {
+        parts.push("\\u00" + hexDigit(c / 16) + hexDigit(c % 16));
+      }
+      runStart = i + 1;
+    }
+    i += 1;
+  }
+  if (s.length > runStart) {
+    parts.push(s.substring(runStart, s.length));
+  }
+  parts.push("\"");
+  return parts.join("");
+}
+
+function fieldText(f: JField): string {
+  return quoteJson(f.key) + ":" + write(f.value);
+}
+
+function write(j: Json): string {
+  return match (j) {
+    JNull => "null",
+    JBool(b) => b ? "true" : "false",
+    JNum(n) => n.toString(),
+    JStr(s) => quoteJson(s),
+    JArr(a) => "[" + a.map(x => write(x)).join(",") + "]",
+    JObj(fs) => "{" + fs.map(f => fieldText(f)).join(",") + "}",
+  };
+}
+
+// Compact, deterministic serialization.
+@Ensures(nesting(j) <= MAX_DEPTH ==> parsesBackTo(result, j))
+export function stringifyJson(j: Json): string {
+  return write(j);
+}

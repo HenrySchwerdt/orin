@@ -112,6 +112,10 @@ separator is raised through `process.exit(101)` after printing the same message.
 ## 5. Non-goals / OPEN
 
 - No garbage collector is introduced by this split (spec 06).
-- Threads/atomics/async runtime design is OPEN (spec 12 #5); when added, the scheduler's
-  low-level primitives belong to L0 and its logic to L1.
+- Async runtime design is OPEN (spec 12 #5). **Threads (ADR-0017 stage 0, 2026-10-14):** the scheduler's low-level primitives are L0
+  (`orin_platform_thread_*`, `orin_platform_monitor_*`: thread create / join / exit and a mutex + condition queues + integer words, all
+  handle-checked) and stay C; its logic (task table, channels, join results) is Orin (`std:task`); the part that needs the object model
+  (value transfer between task heaps, per-task allocator state) is ONE temporary C interface, `orin_rt_*`, that R3 replaces
+  function by function (porting table: ADR-0017 Addendum A, docs/concurrency.md). The L0 size budget counts CODE lines (comments and
+  contract blocks excluded), per ADR-0030.
 - Exact choice of C verification tool is OPEN.

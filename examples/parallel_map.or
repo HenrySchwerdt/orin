@@ -1,0 +1,56 @@
+// CPU-parallel map with std:task (ADR-0017 stage 0): the number of Collatz steps of every integer in 1..N, computed
+// sequentially and by `parallelMap` in P tasks (one operating-system thread each, no shared memory: every chunk of the input is
+// moved or copied to its task and the results are moved back). Prints both times and the speedup.
+//
+//   orin run examples/parallel_map.or            N = 3,000,000, P = 4
+//   orin run examples/parallel_map.or 2000000 8   N and P
+//
+// Timing is wall-clock milliseconds from the clock grant. On a machine with fewer free cores than P the speedup is
+// correspondingly smaller (measured numbers: docs/concurrency.md).
+import { Host, useHost } from "std:host";
+import { args } from "std:process";
+import { nowMillis } from "std:time";
+import { parallelMap } from "std:task";
+
+function collatzSteps(n: int): int {
+  let x = n;
+  let steps = 0;
+  while (x != 1) {
+    x = x % 2 == 0 ? x / 2 : 3 * x + 1;
+    steps += 1;
+  }
+  return steps;
+}
+
+function total(xs: int[]): int {
+  let sum = 0;
+  for (const x of xs) {
+    sum += x;
+  }
+  return sum;
+}
+
+function main(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    const a = args(proc);
+    const n = a.length > 0 ? parseInt(a[0]).unwrapOr(3000000) : 3000000;
+    const p = a.length > 1 ? parseInt(a[1]).unwrapOr(4) : 4;
+    let xs: int[] = [];
+    let i = 1;
+    while (i <= n) {
+      xs.push(i);
+      i += 1;
+    }
+    const t0 = nowMillis(clock);
+    const seq = xs.map(collatzSteps);
+    const t1 = nowMillis(clock);
+    const par = parallelMap(xs, collatzSteps, p.toUsize());
+    const t2 = nowMillis(clock);
+    console.log("n = " + n.toString() + ", tasks = " + p.toString());
+    console.log("sequential: " + (t1 - t0).toString() + " ms, total steps " + total(seq).toString());
+    console.log("parallel:   " + (t2 - t1).toString() + " ms, total steps " + total(par).toString());
+    console.log(total(seq) == total(par) ? "results equal" : "RESULTS DIFFER");
+    const speedup = (t1 - t0).toFloat() / (t2 - t1).toFloat();
+    console.log("speedup: " + speedup.toString());
+  });
+}

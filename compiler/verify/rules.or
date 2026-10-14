@@ -1,16 +1,19 @@
-// Transfer functions of the ownership verifier: one rule per MIR instruction / terminator, a
-// direct transcription of docs/mir.md. Input is well-formed (wf.or). Errors and warnings are
-// appended to the context; after an error the state is updated as if the rule had succeeded
-// where that is meaningful, so one mistake does not cascade.
+// Transfer functions of the ownership verifier: one rule per MIR instruction / terminator, a direct transcription of
+// docs/mir.md, as the methods of class `Transfer` (the state of one run through a block: position, abstract state,
+// issues found). Input is well-formed (wf.or). Errors and warnings are appended; after an error the state is updated as
+// if the rule had succeeded where that is meaningful, so one mistake does not cascade.
 
-import { MProgram, MFunction, Operand, Instr, Terminator } from "../mir";
-import { Builtin } from "../hir";
+import { MProgram, MFunction, Operand, Instr, Terminator, dstOf } from "../mir";
+import { Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 import {
-  VerifyIssue, issueSpan, State, LState, HoleEntry, mk, ownedLike, leaky, kindName, holeEq,
-  KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen
+  VerifyIssue, issueSpan, sameSpan, State, LState, HoleEntry, HoleKey, mk, isKind, ownedLike, leaky,
+  isLive, lsEq, holeAnyIn, holeHasIn, holeMayIn, holesInRange, borrowsFlatIn, kindName, KDead,
+  KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
 } from "./state";
-import { CRef, CHandle, localClass, opClass } from "./wf";
+import { CRef, CHandle, localClass, wfInstr, wfTerm } from "./wf";
 
+// One step of the replay used by the optimiser (compiler/opt/calls.or): the position, the state before the
+// instruction and the issues so far. `step` runs one instruction on it.
 export type Cx = {
   prog: MProgram;
   f: MFunction;
@@ -21,679 +24,916 @@ export type Cx = {
   warns: VerifyIssue[];
 };
 
-// ------------------------------------------------------------------ reporting and basics
+// ------------------------------------------------------------------ contract helpers
 
-function err(cx: Cx, msg: string): Cx {
-  let c = cx;
-  c.errs.push(VerifyIssue { func: c.f.name, block: c.blk, instr: c.ins, message: msg, span: issueSpan(c.f, c.blk, c.ins) });
-  return c;
+// The issues `is[start..]` all name instruction `ins` of block `b` of `f` (function, position and its span).
+export function issuesAt(
+  is: VerifyIssue[],
+  start: usize,
+  f: MFunction,
+  b: usize,
+  ins: usize,
+): bool {
+  const sp = issueSpan(f, b, ins);
+  return is
+      .slice(start, is.length)
+      .every(e => e.func == f.name && e.block == b && e.instr == ins && sameSpan(e.span, sp));
 }
 
-function warn(cx: Cx, msg: string): Cx {
-  let c = cx;
-  c.warns.push(VerifyIssue { func: c.f.name, block: c.blk, instr: c.ins, message: msg, span: issueSpan(c.f, c.blk, c.ins) });
-  return c;
-}
-
-function nm(c: Cx, l: usize): string {
-  return "`" + c.f.locals[l].name + "`";
-}
-
-function kindOf(c: Cx, l: usize): int {
-  return c.st.ls[l].k;
-}
-
-function setLs(cx: Cx, l: usize, k: int, src: usize): Cx {
-  let c = cx;
-  c.st.ls[l] = mk(k, src);
-  return c;
-}
-
-function isRefLocal(c: Cx, l: usize): bool {
-  return localClass(c.f, l) == CRef;
-}
-
-// ------------------------------------------------------------------ holes
-
-function holeKey(o: Operand): HoleEntryKey {
-  return match (o) {
-    OLocal(l) => HoleEntryKey { sym: true, idx: l },
-    OUsize(n) => HoleEntryKey { sym: false, idx: n >= 0 ? n.toUsize() : 0 },
-    _ => HoleEntryKey { sym: false, idx: 0 }
-  };
-}
-
-type HoleEntryKey = { sym: bool; idx: usize; };
-
-function slotKey(i: usize): HoleEntryKey {
-  return HoleEntryKey { sym: false, idx: i };
-}
-
-function holeAny(c: Cx, x: usize): bool {
-  for (const h of c.st.holes) {
-    if (h.obj == x) {
-      return true;
-    }
+// Only a defining instruction revives a local: every local that was not live before (dead or poisoned) and is not one
+// of the locals the instruction defines (`defs`) is in exactly the same state after.
+export function noRevival(before: LState[], after: LState[], defs: usize[]): bool {
+  if (before.length != after.length) {
+    return false;
   }
-  return false;
-}
-
-// Exact hole (x, k).
-function holeHas(c: Cx, x: usize, k: HoleEntryKey): bool {
-  for (const h of c.st.holes) {
-    if (h.obj == x && h.sym == k.sym && h.idx == k.idx) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Slot k of x may be a hole: equal key, or either side is symbolic (conservative).
-function holeMay(c: Cx, x: usize, k: HoleEntryKey): bool {
-  for (const h of c.st.holes) {
-    if (h.obj == x && (h.sym || k.sym || h.idx == k.idx)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function addHole(cx: Cx, x: usize, k: HoleEntryKey): Cx {
-  let c = cx;
-  c.st.holes.push(HoleEntry { obj: x, sym: k.sym, idx: k.idx });
-  return c;
-}
-
-function removeHole(cx: Cx, x: usize, k: HoleEntryKey): Cx {
-  let c = cx;
-  let hs: HoleEntry[] = [];
-  for (const h of c.st.holes) {
-    if (!(h.obj == x && h.sym == k.sym && h.idx == k.idx)) {
-      hs.push(h);
-    }
-  }
-  c.st.holes = hs;
-  return c;
-}
-
-function dropHolesOf(cx: Cx, x: usize): Cx {
-  let c = cx;
-  let hs: HoleEntry[] = [];
-  for (const h of c.st.holes) {
-    if (h.obj != x) {
-      hs.push(h);
-    }
-  }
-  c.st.holes = hs;
-  return c;
-}
-
-// ------------------------------------------------------------------ reads, kills, definitions
-
-// Every `Borrowed(x)` alias dies when x is released, moved, consumed, mutated or redefined.
-function killBorrows(cx: Cx, x: usize): Cx {
-  let c = cx;
   let i: usize = 0;
-  while (i < c.st.ls.length) {
-    if (c.st.ls[i].k == KBorrowed && c.st.ls[i].src == x) {
-      c.st.ls[i] = mk(KDead, 0);
+  while (i < before.length) {
+    if (!isLive(before[i].k) && !lsEq(before[i], after[i]) && !defs.includes(i)) {
+      return false;
     }
     i += 1;
   }
-  return c;
+  return true;
 }
 
-// "read x requires x not Dead" (also rejects poisoned join results).
-function readLocal(cx: Cx, l: usize): Cx {
-  const k = kindOf(cx, l);
-  if (k == KDead) {
-    return err(cx, "use of " + nm(cx, l) + " which is dead (uninitialised, moved, released or invalidated)");
-  }
-  if (k == KMaybeDead || k == KMaybeLeak) {
-    return err(cx, "use of " + nm(cx, l) + " which is dead or inconsistent on some incoming path");
-  }
-  if (k == KMaybeOpen) {
-    return err(cx, "use of resource handle " + nm(cx, l) + " which is open on some incoming paths and closed (or never opened) on others");
-  }
-  return cx;
-}
-
-// Whole-object use of a local: live, and no slot may be missing.
-function readWhole(cx: Cx, l: usize): Cx {
-  let c = readLocal(cx, l);
-  if (isRefLocal(c, l) && holeAny(c, l)) {
-    c = err(c, "whole-object use of " + nm(c, l) + " while a slot is taken (open hole)");
-  }
-  return c;
-}
-
-function readOp(cx: Cx, o: Operand): Cx {
-  return match (o) {
-    OLocal(l) => readWhole(cx, l),
-    _ => cx
+// The locals instruction `ins` defines: its destination, and for a call of an in/out function (v1.10) the in/out
+// argument, which receives the callee's final receiver.
+export function defsOf(p: MProgram, ins: Instr): usize[] {
+  let out: usize[] = match (dstOf(ins)) {
+    Some(d) => [d],
+    None => [],
   };
-}
-
-// Owned/Unique/Imm local -> ok (returns true), else the matching error.
-function needOwned(cx: Cx, l: usize, what: string): Cx {
-  const k = kindOf(cx, l);
-  if (ownedLike(k)) {
-    return readWhole(cx, l);
-  }
-  if (k == KParam) {
-    return err(cx, what + " of parameter " + nm(cx, l) + " (borrowed parameters are borrowed for the whole call)");
-  }
-  if (k == KBorrowed) {
-    return err(cx, what + " of borrowed " + nm(cx, l));
-  }
-  return readLocal(cx, l);
-}
-
-function needUnique(cx: Cx, l: usize, what: string): Cx {
-  const k = kindOf(cx, l);
-  if (k == KUnique) {
-    return cx;
-  }
-  if (k == KDead || k == KMaybeDead || k == KMaybeLeak) {
-    return readLocal(cx, l);
-  }
-  return err(cx, what + " requires " + nm(cx, l) + " to be Unique, but it is " + kindName(k));
-}
-
-// Owned-like local ceases to exist (released or consumed): Dead, borrows invalidated.
-function kill(cx: Cx, l: usize): Cx {
-  return setLs(killBorrows(cx, l), l, KDead, 0);
-}
-
-// Consume an operand (ref slots of IStructNew, stored values, pushed values, returned values).
-// Scalars are merely read; OStr is immortal.
-function consume(cx: Cx, o: Operand): Cx {
-  return match (o) {
-    OLocal(l) => {
-      if (!isRefLocal(cx, l)) {
-        return readLocal(cx, l);
+  match (ins) {
+    ICall(_, g, args) => {
+      if (g < p.functions.length && p.functions[g].inout && args.length > 0) {
+        match (args[0]) {
+          OLocal(x) => {
+            out.push(x);
+          },
+          _ => {},
+        }
       }
-      const k = kindOf(cx, l);
-      const c = needOwned(cx, l, "consuming");
-      if (ownedLike(k) && c.errs.length == cx.errs.length) {
-        return kill(c, l);
-      }
-      return c;
     },
-    _ => cx
+    _ => {},
+  }
+  return out;
+}
+
+// No alias is rooted at a Dead or scalar local: every way a local dies invalidates its aliases first, and a scalar is
+// never a root. `def` relies on it to skip the alias scan.
+export function rootsLive(ls: LState[]): bool {
+  return ls.every(
+    s => s.k != KBorrowed || s.src >= ls.length || ls[s.src].k != KDead && ls[s.src].k != KInit,
+  );
+}
+
+function slotKey(i: usize): HoleKey {
+  return HoleKey { sym: false, idx: i };
+}
+
+function holeKey(o: Operand): HoleKey {
+  return match (o) {
+    OLocal(l) => HoleKey { sym: true, idx: l },
+    OUsize(n) => HoleKey { sym: false, idx: n >= 0 ? n.toUsize() : 0 },
+    _ => HoleKey { sym: false, idx: 0 },
   };
 }
 
-// Define local d (every destination goes through here).
-function def(cx: Cx, d: usize, k: int, src: usize): Cx {
-  if (d < cx.f.paramCount && !(cx.f.inout && d == 0)) {
-    return err(cx, "write to parameter " + nm(cx, d));
+// ------------------------------------------------------------------ the transfer state
+
+// The state of one run through block `blk` of `f`: the instruction `ins` it is at (the block's instruction count is the
+// terminator), the abstract state (`ls`, one entry per local of `f`, and the open `holes`; `state()` is it as a `State`)
+// and the issues found so far. The state arrays are fields of the class itself, not a `State` field: a mutating method
+// called on a class-typed field copies that object and its arrays on every call (measured: twice as many copies as the
+// old record code and +20 % self-compile time), while a write to `this.ls[l]` is done in place.
+@Invariant(this.ls.length == this.f.locals.length)
+@Invariant(holesInRange(this.holes, this.ls.length))
+@Invariant(this.blk < this.f.blocks.length && this.ins <= this.f.blocks[this.blk].instrs.length)
+export class Transfer {
+  prog: MProgram;
+  f: MFunction;
+  blk: usize;
+  ins: usize;
+  ls: LState[];
+  holes: HoleEntry[];
+  errs: VerifyIssue[];
+  warns: VerifyIssue[];
+
+  constructor(
+    prog: MProgram,
+    f: MFunction,
+    blk: usize,
+    ins: usize,
+    st: State,
+    errs: VerifyIssue[],
+    warns: VerifyIssue[],
+  ) {
+    this.prog = prog;
+    this.f = f;
+    this.blk = blk;
+    this.ins = ins;
+    this.ls = st.ls;
+    this.holes = st.holes;
+    this.errs = errs;
+    this.warns = warns;
   }
-  let c = cx;
-  if (leaky(kindOf(c, d))) {
-    c = warn(c, "leak: " + nm(c, d) + " is overwritten while it may still own a reference");
+
+  // The abstract state after the instructions run so far.
+  @Ensures(result.ls.length == this.ls.length)
+  state(): State {
+    return new State(this.ls, this.holes);
   }
-  if (holeAny(c, d)) {
-    c = err(c, nm(c, d) + " is overwritten while a slot is taken (open hole)");
-    c = dropHolesOf(c, d);
-  }
-  for (const h of c.st.holes) {
-    if (h.sym && h.idx == d) {
-      c = err(c, "index local " + nm(c, d) + " is overwritten while it names an open hole");
+
+  // Runs the whole block from the state it holds: every instruction, then the terminator. Borrows stay flat.
+  @Requires(borrowsFlatIn(this.ls) && rootsLive(this.ls))
+  @Ensures(borrowsFlatIn(this.ls) && rootsLive(this.ls))
+  @Ensures(this.ins == this.f.blocks[this.blk].instrs.length)
+  @Ensures(this.errs.length >= old(this.errs.length) && this.warns.length >= old(this.warns.length))
+  run(): void {
+    const blk = this.f.blocks[this.blk];
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      this.ins = i;
+      this.step(blk.instrs[i]);
+      i += 1;
     }
+    this.ins = blk.instrs.length;
+    this.term(blk.term);
   }
-  // killBorrows runs whenever a local dies, so no live alias borrows from a Dead or scalar local: defining one has
-  // nothing to invalidate and the scan over all locals is skipped (it dominated the verifier's time).
-  const kd = kindOf(c, d);
-  if (kd == KDead || kd == KInit) {
-    return setLs(c, d, k, src);
+
+  // The rule of instruction `ins` (the one at position `this.ins`). Issues are reported at this position; no local that
+  // is dead or poisoned comes back to life unless the instruction defines it.
+  @Requires(this.ins < this.f.blocks[this.blk].instrs.length)
+  @Requires(wfInstr(this.prog, this.f, ins) == "")
+  @Ensures(this.ins == old(this.ins))
+  @Ensures(noRevival(old(this.ls), this.ls, defsOf(this.prog, ins)))
+  @Ensures(this.errs.length >= old(this.errs.length) && this.warns.length >= old(this.warns.length))
+  @Ensures(issuesAt(this.errs, old(this.errs.length), this.f, this.blk, this.ins))
+  @Ensures(issuesAt(this.warns, old(this.warns.length), this.f, this.blk, this.ins))
+  step(ins: Instr): void {
+    this.instr(ins);
   }
-  return setLs(killBorrows(c, d), d, k, src);
-}
 
-// Destination of a result: Owned for references, initialised for scalars.
-function defResult(cx: Cx, d: usize): Cx {
-  return def(cx, d, isRefLocal(cx, d) ? KOwned : KInit, 0);
-}
-
-// Root a new borrow of local l depends on: l itself, or l's own root.
-function rootOf(c: Cx, l: usize): usize {
-  const s = c.st.ls[l];
-  return s.k == KBorrowed ? s.src : l;
-}
-
-// A Unique object that is aliased (borrowed whole, duplicated, passed to a call that may
-// return it) is no longer provably unique.
-function demote(cx: Cx, l: usize): Cx {
-  if (kindOf(cx, l) == KUnique) {
-    return setLs(cx, l, KOwned, 0);
-  }
-  return cx;
-}
-
-function demoteOp(cx: Cx, o: Operand): Cx {
-  return match (o) {
-    OLocal(l) => demote(cx, l),
-    _ => cx
-  };
-}
-
-// Result of a field/element read: borrowed from the root of `o` (references) or a scalar.
-function defProjection(cx: Cx, d: usize, o: Operand): Cx {
-  if (!isRefLocal(cx, d)) {
-    return def(cx, d, KInit, 0);
-  }
-  return match (o) {
-    OLocal(l) => defBorrow(cx, d, rootOf(cx, l)),
-    _ => def(cx, d, KOwned, 0)
-  };
-}
-
-// d becomes Borrowed(root). A borrow rooted at its own destination would leave d aliasing an
-// object whose only owner was d's old value (found by the Lean soundness proof; docs/formal.md).
-function defBorrow(cx: Cx, d: usize, root: usize): Cx {
-  if (root == d) {
-    return err(cx, "borrow into " + nm(cx, d) + " rooted at " + nm(cx, d) + " itself");
-  }
-  return def(cx, d, KBorrowed, root);
-}
-
-// ------------------------------------------------------------------ instruction rules
-
-function consumeAll(cx: Cx, os: Operand[]): Cx {
-  let c = cx;
-  for (const o of os) {
-    c = consume(c, o);
-  }
-  return c;
-}
-
-function readAll(cx: Cx, os: Operand[]): Cx {
-  let c = cx;
-  for (const o of os) {
-    c = readOp(c, o);
-  }
-  return c;
-}
-
-// ICall / IBuiltin: arguments are borrowed for the call; the result is Owned. A reference
-// result may alias an argument, so a Unique argument is demoted (docs/mir.md notes).
-function call(cx: Cx, dst: Option<usize>, args: Operand[]): Cx {
-  return callOwned(cx, dst, args, []);
-}
-
-// v1.2: `owned[i]` (when i < owned.length) marks an operand in an owned-parameter position: it is
-// consumed (Owned/Unique/Imm -> Dead, OStr allowed; Borrowed/Param is an error). Borrowed
-// positions may not alias a consumed operand (the callee could release it while reading the
-// alias). Unique-demotion applies to borrowed positions only.
-function callOwned(cx: Cx, dst: Option<usize>, args: Operand[], owned: bool[]): Cx {
-  let c = readAll(cx, args);
-  let i: usize = 0;
-  while (i < args.length) {
-    if (i < owned.length && owned[i]) {
-      match (args[i]) {
-        OLocal(x) => {
-          let j: usize = 0;
-          while (j < args.length) {
-            if (j != i && !(j < owned.length && owned[j])) {
-              match (args[j]) {
-                OLocal(y) => {
-                  if (y == x || (kindOf(c, y) == KBorrowed && c.st.ls[y].src == x)) {
-                    c = err(c, "borrowed argument " + nm(c, y) + " aliases consumed argument " + nm(c, x));
-                  }
-                },
-                _ => {}
-              }
-            }
-            j += 1;
+  // The rule of the block's terminator `t`. A return leaves no handle open and no hole (errors) and warns about every
+  // local that may still own a reference.
+  @Requires(this.ins == this.f.blocks[this.blk].instrs.length)
+  @Requires(wfTerm(this.prog, this.f, t) == "")
+  @Ensures(this.ins == old(this.ins))
+  @Ensures(noRevival(old(this.ls), this.ls, []))
+  @Ensures(issuesAt(this.errs, old(this.errs.length), this.f, this.blk, this.ins))
+  @Ensures(issuesAt(this.warns, old(this.warns.length), this.f, this.blk, this.ins))
+  term(t: Terminator): void {
+    match (t) {
+      TGoto(_) => {},
+      TBranch(o, _, _) => {
+        this.readOp(o);
+      },
+      TSwitch(o, _, _) => {
+        this.readOp(o);
+      },
+      TReturn(r) => {
+        match (r) {
+          Some(o) => {
+            this.consume(o);
+          },
+          None => {},
+        }
+        if (this.f.inout) {
+          // v1.10: local 0 is handed back to the caller, so it must hold an owned receiver here
+          if (ownedLike(this.kindOf(0))) {
+            this.consume(OLocal(0));
+          } else {
+            this.err(
+              "inout parameter " + this.nm(0)
+                  + " must hold the updated receiver at return, but it is "
+                  + kindName(this.kindOf(0)),
+            );
           }
-        },
-        _ => {}
-      }
-    }
-    i += 1;
-  }
-  i = 0;
-  while (i < args.length) {
-    if (i < owned.length && owned[i]) {
-      c = consume(c, args[i]);
-    }
-    i += 1;
-  }
-  return match (dst) {
-    None => c,
-    Some(d) => {
-      if (isRefLocal(c, d)) {
-        i = 0;
-        while (i < args.length) {
-          if (!(i < owned.length && owned[i])) {
-            c = demoteOp(c, args[i]);
+        }
+        let i: usize = 0;
+        while (i < this.ls.length) {
+          const k = this.ls[i].k;
+          if (leaky(k)) {
+            this.warn("leak: " + this.nm(i) + " may still own a reference at return");
+          }
+          if (k == KOpen || k == KMaybeOpen) {
+            this.err(
+              "resource handle " + this.nm(i)
+                  + " is not closed on this path: every opened file must be closed before the function returns",
+            );
           }
           i += 1;
         }
-      }
-      return defResult(c, d);
-    }
-  };
-}
-
-// Reading slot k of object operand o (IGetField / IArrayGet).
-function project(cx: Cx, d: usize, o: Operand, k: HoleEntryKey): Cx {
-  let c = cx;
-  match (o) {
-    OLocal(l) => {
-      c = readLocal(c, l);
-      if (holeMay(c, l, k)) {
-        c = err(c, "read of a slot of " + nm(c, l) + " that is (or may be) taken");
-      }
-    },
-    _ => {}
-  }
-  return defProjection(c, d, o);
-}
-
-// ISetField / IArraySet.
-function store(cx: Cx, x: usize, k: HoleEntryKey, v: Operand, what: string): Cx {
-  let c = needUnique(cx, x, what);
-  if (holeMay(c, x, k)) {
-    c = err(c, what + " into a slot of " + nm(c, x) + " that is (or may be) taken; use the put instruction");
-  }
-  c = consume(c, v);
-  return killBorrows(c, x);
-}
-
-// ITakeField / IArrayTake.
-function take(cx: Cx, d: usize, x: usize, k: HoleEntryKey, what: string): Cx {
-  let c = needUnique(cx, x, what);
-  if (holeMay(c, x, k)) {
-    c = err(c, what + " of a slot of " + nm(c, x) + " that is (or may be) already taken");
-  }
-  c = killBorrows(c, x);
-  c = addHole(c, x, k);
-  return def(c, d, KOwned, 0);
-}
-
-// IPutField / IArrayPut.
-function put(cx: Cx, x: usize, k: HoleEntryKey, s: usize, what: string): Cx {
-  let c = needUnique(cx, x, what);
-  if (!holeHas(c, x, k)) {
-    c = err(c, what + " into a slot of " + nm(c, x) + " that is not a taken slot");
-  }
-  c = consume(c, OLocal(s));
-  c = removeHole(c, x, k);
-  return killBorrows(c, x);
-}
-
-// IArrayPush / IArrayPop / IStrAppend: x must be owned (not Param/Borrowed); the runtime may
-// reallocate or mutate it, so borrows die and Unique is not kept.
-function mutateOwned(cx: Cx, x: usize, what: string): Cx {
-  let c = needOwned(cx, x, what);
-  c = killBorrows(c, x);
-  if (ownedLike(kindOf(c, x))) {
-    c = setLs(c, x, KOwned, 0);
-  }
-  return c;
-}
-
-// ------------------------------------------------------------------ resource handles (v1.8, ADR-0025)
-// Lifecycle of a handle local: Dead --BFileOpen--> Open --BFileClose--> Dead. A parameter handle is Param
-// (borrowed): it can be used but not closed. Uses (call arguments, file builtins) need Open or Param.
-// A function must not return while a handle is Open (error, not a warning) and must not overwrite one.
-
-function isHandleLocal(c: Cx, l: usize): bool {
-  return localClass(c.f, l) == CHandle;
-}
-
-function openHandle(cx: Cx, d: usize, args: Operand[]): Cx {
-  let c = readAll(cx, args);
-  const k = kindOf(c, d);
-  if (k == KOpen || k == KMaybeOpen) {
-    c = err(c, "resource handle " + nm(c, d) + " is overwritten while it is (or may be) still open: it would never be closed");
-  }
-  return def(c, d, KOpen, 0);
-}
-
-function closeHandle(cx: Cx, dst: Option<usize>, args: Operand[]): Cx {
-  let c = cx;
-  match (args[0]) {
-    OLocal(h) => {
-      const k = kindOf(c, h);
-      if (k == KOpen) {
-        c = setLs(c, h, KDead, 0);
-      } else if (k == KParam) {
-        c = err(c, "close of parameter " + nm(c, h) + ": a handle is closed only by the scope that opened it");
-      } else if (k == KMaybeOpen) {
-        c = err(c, "close of " + nm(c, h) + " which is not open on some incoming paths (it could be closed twice)");
-      } else {
-        c = err(c, "close of " + nm(c, h) + " which is not open (already closed, or never opened)");
-      }
-    },
-    _ => {}
-  }
-  return match (dst) {
-    None => c,
-    Some(d) => defResult(c, d)
-  };
-}
-
-// BFileOpen / BGrant*: the destination becomes an Open handle (the authorising first argument is only read: it must
-// be Open or Param).
-function openers(cx: Cx, dst: Option<usize>, args: Operand[]): Cx {
-  return match (dst) {
-    Some(d) => openHandle(cx, d, args),
-    None => cx
-  };
-}
-
-function builtinStep(cx: Cx, dst: Option<usize>, b: Builtin, args: Operand[]): Cx {
-  return match (b) {
-    BFileOpen => openers(cx, dst, args),
-    BGrantFs => openers(cx, dst, args),
-    BGrantProcess => openers(cx, dst, args),
-    BGrantStdio => openers(cx, dst, args),
-    BGrantClock => openers(cx, dst, args),
-    BGrantUnder => openers(cx, dst, args),
-    BGrantReadOnly => openers(cx, dst, args),
-    BGrantArgsOnly => openers(cx, dst, args),
-    BGrantNet => openers(cx, dst, args),
-    BGrantListen => openers(cx, dst, args),
-    BGrantConnect => openers(cx, dst, args),
-    BNetListen => openers(cx, dst, args),
-    BNetAccept => openers(cx, dst, args),
-    BNetConnect => openers(cx, dst, args),
-    BNetClose => closeHandle(readAll(cx, args), dst, args),
-    BFileClose => closeHandle(readAll(cx, args), dst, args),
-    BGrantRevoke => closeHandle(readAll(cx, args), dst, args),
-    _ => call(cx, dst, args)
-  };
-}
-
-export function step(cx: Cx, ins: Instr): Cx {
-  match (ins) {
-    ICopy(d, o) => {
-      return def(readOp(cx, o), d, isRefLocal(cx, d) ? KImm : KInit, 0);
-    },
-    IMove(d, s) => {
-      const k = kindOf(cx, s);
-      const c = consume(cx, OLocal(s));
-      return def(c, d, ownedLike(k) ? k : KOwned, 0);
-    },
-    IBorrow(d, s) => {
-      let c = readWhole(cx, s);
-      const r = rootOf(c, s);
-      c = demote(c, s);
-      return defBorrow(c, d, r);
-    },
-    IDup(d, o) => {
-      let c = readOp(cx, o);
-      c = demoteOp(c, o);
-      return def(c, d, KOwned, 0);
-    },
-    IRelease(x) => {
-      const c = needOwned(cx, x, "release");
-      return ownedLike(kindOf(cx, x)) ? kill(c, x) : c;
-    },
-    IUnary(d, _, o) => {
-      return def(readOp(cx, o), d, KInit, 0);
-    },
-    IBinary(d, _, a, b) => {
-      return def(readOp(readOp(cx, a), b), d, KInit, 0);
-    },
-    ICall(dst, fi, args) => {
-      const c = callOwned(cx, dst, args, cx.prog.functions[fi].paramOwned);
-      if (!cx.prog.functions[fi].inout) {
-        return c;
-      }
-      // v1.10: argument 0 was consumed; it now holds the callee's final receiver (Owned: the callee may
-      // have kept an alias, so uniqueness is not known). Writing a parameter is an error except the
-      // in/out parameter of an inout caller (`def`).
-      return match (args[0]) {
-        OLocal(x) => def(c, x, KOwned, 0),
-        _ => c
-      };
-    },
-    IBuiltin(dst, b, args) => {
-      return builtinStep(cx, dst, b, args);
-    },
-    IStrAppend(x, y) => {
-      let c = readOp(cx, y);
-      match (y) {
-        OLocal(l) => {
-          if (kindOf(c, l) == KBorrowed && c.st.ls[l].src == x) {
-            c = err(c, "IStrAppend: " + nm(c, l) + " is borrowed from the string being appended to");
-          }
-        },
-        _ => {}
-      }
-      return mutateOwned(c, x, "IStrAppend");
-    },
-    IArrayExtend(x, y) => {
-      let c = readOp(cx, y);
-      match (y) {
-        OLocal(l) => {
-          if (kindOf(c, l) == KBorrowed && c.st.ls[l].src == x) {
-            c = err(c, "IArrayExtend: " + nm(c, l) + " is borrowed from the array being extended");
-          }
-        },
-        _ => {}
-      }
-      return mutateOwned(c, x, "IArrayExtend");
-    },
-    IStructNew(d, _, slots) => {
-      return def(consumeAll(cx, slots), d, KUnique, 0);
-    },
-    INullary(d, _) => {
-      return def(cx, d, KImm, 0);
-    },
-    ITag(d, o) => {
-      let c = cx;
-      match (o) {
-        OLocal(l) => {
-          c = readLocal(c, l);
-        },
-        _ => {}
-      }
-      return def(c, d, KInit, 0);
-    },
-    IGetField(d, o, i) => {
-      return project(cx, d, o, slotKey(i));
-    },
-    ISetField(x, i, v) => {
-      return store(cx, x, slotKey(i), v, "ISetField");
-    },
-    ITakeField(d, x, i) => {
-      return take(cx, d, x, slotKey(i), "ITakeField");
-    },
-    IPutField(x, i, s) => {
-      return put(cx, x, slotKey(i), s, "IPutField");
-    },
-    IMakeUnique(x) => {
-      let c = needOwned(cx, x, "IMakeUnique");
-      c = killBorrows(c, x);
-      return ownedLike(kindOf(cx, x)) ? setLs(c, x, KUnique, 0) : c;
-    },
-    IArrayNew(d, _, elems) => {
-      return def(consumeAll(cx, elems), d, KUnique, 0);
-    },
-    IArrayGet(d, a, i) => {
-      return project(readOp(cx, i), d, a, holeKey(i));
-    },
-    IArraySet(x, i, v) => {
-      return store(readOp(cx, i), x, holeKey(i), v, "IArraySet");
-    },
-    IArrayTake(d, x, i) => {
-      return take(readOp(cx, i), d, x, holeKey(i), "IArrayTake");
-    },
-    IArrayPut(x, i, s) => {
-      return put(readOp(cx, i), x, holeKey(i), s, "IArrayPut");
-    },
-    IArrayPush(x, v) => {
-      return mutateOwned(consume(cx, v), x, "IArrayPush");
-    },
-    IArrayPop(d, x) => {
-      return def(mutateOwned(cx, x, "IArrayPop"), d, KOwned, 0);
-    },
-    IClosure(d, _, caps) => {
-      return def(consumeAll(cx, caps), d, KUnique, 0);
-    },
-    ICallIndirect(dst, c, args) => {
-      return call(cx, dst, [c].concat(args));
-    },
-    IIface(d, _, v) => {
-      return def(consume(cx, v), d, KUnique, 0);
-    },
-    ICallVirtual(dst, c, _, args) => {
-      return call(cx, dst, [c].concat(args));
+        for (const h of this.holes) {
+          this.err("return with an open hole in " + this.nm(h.obj));
+        }
+      },
+      TTrap(_) => {},
     }
   }
-}
 
-// ------------------------------------------------------------------ terminators
+  // ---------------------------------------------------------------- the state arrays
 
-export function stepTerm(cx: Cx, t: Terminator): Cx {
-  match (t) {
-    TGoto(_) => {
-      return cx;
-    },
-    TBranch(o, _, _) => {
-      return readOp(cx, o);
-    },
-    TSwitch(o, _, _) => {
-      return readOp(cx, o);
-    },
-    TReturn(r) => {
-      let c = cx;
-      match (r) {
-        Some(o) => {
-          c = consume(c, o);
-        },
-        None => {}
+  // Local `l` is now in state (k, src). A borrow is rooted at another local.
+  @Requires(l < this.ls.length && isKind(k))
+  @Requires(k == KBorrowed ? src < this.ls.length && src != l : src == 0)
+  private set(l: usize, k: int, src: usize): void {
+    this.ls[l] = mk(k, src);
+  }
+
+  // Every `Borrowed(x)` alias dies (x is released, moved, consumed, mutated or redefined). Nothing else changes.
+  @Requires(x < this.ls.length)
+  @Ensures(this.ls.length == old(this.ls.length))
+  @Ensures(this.ls.every(s => !(s.k == KBorrowed && s.src == x)))
+  private killBorrows(x: usize): void {
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      if (this.ls[i].k == KBorrowed && this.ls[i].src == x) {
+        this.ls[i] = mk(KDead, 0);
       }
-      if (c.f.inout) {
-        // v1.10: local 0 is handed back to the caller, so it must hold an owned receiver here
-        if (ownedLike(kindOf(c, 0))) {
-          c = consume(c, OLocal(0));
+      i += 1;
+    }
+  }
+
+  @Requires(x < this.ls.length && (!k.sym || k.idx < this.ls.length))
+  @Ensures(this.holes.length == old(this.holes.length) + 1 && holeHasIn(this.holes, x, k))
+  private addHole(x: usize, k: HoleKey): void {
+    this.holes.push(HoleEntry { obj: x, sym: k.sym, idx: k.idx });
+  }
+
+  @Ensures(!holeHasIn(this.holes, x, k) && this.holes.length <= old(this.holes.length))
+  private removeHole(x: usize, k: HoleKey): void {
+    this.holes = this.holes.filter(h => !(h.obj == x && h.sym == k.sym && h.idx == k.idx));
+  }
+
+  @Ensures(!holeAnyIn(this.holes, x) && this.holes.length <= old(this.holes.length))
+  private dropHolesOf(x: usize): void {
+    this.holes = this.holes.filter(h => h.obj != x);
+  }
+
+  // ---------------------------------------------------------------- reporting and basics
+
+  private err(msg: string): void {
+    this.errs.push(VerifyIssue {
+      func: this.f.name,
+      block: this.blk,
+      instr: this.ins,
+      message: msg,
+      span: issueSpan(this.f, this.blk, this.ins),
+    });
+  }
+
+  private warn(msg: string): void {
+    this.warns.push(VerifyIssue {
+      func: this.f.name,
+      block: this.blk,
+      instr: this.ins,
+      message: msg,
+      span: issueSpan(this.f, this.blk, this.ins),
+    });
+  }
+
+  private nm(l: usize): string {
+    return "`" + this.f.locals[l].name + "`";
+  }
+
+  private kindOf(l: usize): int {
+    return this.ls[l].k;
+  }
+
+  private isRefLocal(l: usize): bool {
+    return localClass(this.f, l) == CRef;
+  }
+
+  // ---------------------------------------------------------------- reads, kills, definitions
+
+  // "read x requires x not Dead" (also rejects poisoned join results).
+  private readLocal(l: usize): void {
+    const k = this.kindOf(l);
+    if (k == KDead) {
+      this.err(
+        "use of " + this.nm(l) + " which is dead (uninitialised, moved, released or invalidated)",
+      );
+    } else if (k == KMaybeDead || k == KMaybeLeak) {
+      this.err("use of " + this.nm(l) + " which is dead or inconsistent on some incoming path");
+    } else if (k == KMaybeOpen) {
+      this.err(
+        "use of resource handle " + this.nm(l)
+            + " which is open on some incoming paths and closed (or never opened) on others",
+      );
+    }
+  }
+
+  // Whole-object use of a local: live, and no slot may be missing.
+  private readWhole(l: usize): void {
+    this.readLocal(l);
+    if (this.isRefLocal(l) && holeAnyIn(this.holes, l)) {
+      this.err("whole-object use of " + this.nm(l) + " while a slot is taken (open hole)");
+    }
+  }
+
+  private readOp(o: Operand): void {
+    match (o) {
+      OLocal(l) => {
+        this.readWhole(l);
+      },
+      _ => {},
+    }
+  }
+
+  private readAll(os: Operand[]): void {
+    for (const o of os) {
+      this.readOp(o);
+    }
+  }
+
+  // An Owned/Unique/Imm local is fine (whole-object use); anything else is the matching error.
+  private needOwned(l: usize, what: string): void {
+    const k = this.kindOf(l);
+    if (ownedLike(k)) {
+      this.readWhole(l);
+    } else if (k == KParam) {
+      this.err(
+        what + " of parameter " + this.nm(l)
+            + " (borrowed parameters are borrowed for the whole call)",
+      );
+    } else if (k == KBorrowed) {
+      this.err(what + " of borrowed " + this.nm(l));
+    } else {
+      this.readLocal(l);
+    }
+  }
+
+  private needUnique(l: usize, what: string): void {
+    const k = this.kindOf(l);
+    if (k == KUnique) {
+      return;
+    }
+    if (k == KDead || k == KMaybeDead || k == KMaybeLeak) {
+      this.readLocal(l);
+    } else {
+      this.err(what + " requires " + this.nm(l) + " to be Unique, but it is " + kindName(k));
+    }
+  }
+
+  // Owned-like local ceases to exist (released or consumed): Dead, borrows invalidated.
+  private kill(l: usize): void {
+    this.killBorrows(l);
+    this.set(l, KDead, 0);
+  }
+
+  // Consume an operand (ref slots of IStructNew, stored values, pushed values, returned values).
+  // Scalars are merely read; OStr is immortal.
+  private consume(o: Operand): void {
+    match (o) {
+      OLocal(l) => {
+        if (!this.isRefLocal(l)) {
+          this.readLocal(l);
+          return;
+        }
+        const k = this.kindOf(l);
+        const before = this.errs.length;
+        this.needOwned(l, "consuming");
+        if (ownedLike(k) && this.errs.length == before) {
+          this.kill(l);
+        }
+      },
+      _ => {},
+    }
+  }
+
+  private consumeAll(os: Operand[]): void {
+    for (const o of os) {
+      this.consume(o);
+    }
+  }
+
+  // Define local d (every destination goes through here).
+  private def(d: usize, k: int, src: usize): void {
+    if (d < this.f.paramCount && !(this.f.inout && d == 0)) {
+      this.err("write to parameter " + this.nm(d));
+      return;
+    }
+    if (leaky(this.kindOf(d))) {
+      this.warn("leak: " + this.nm(d) + " is overwritten while it may still own a reference");
+    }
+    if (holeAnyIn(this.holes, d)) {
+      this.err(this.nm(d) + " is overwritten while a slot is taken (open hole)");
+      this.dropHolesOf(d);
+    }
+    for (const h of this.holes) {
+      if (h.sym && h.idx == d) {
+        this.err("index local " + this.nm(d) + " is overwritten while it names an open hole");
+      }
+    }
+    // No alias is rooted at a Dead or scalar local (`rootsLive`, a precondition of `run`): every way a local dies runs
+    // `killBorrows` first, and a scalar is never a root. Defining one has nothing to invalidate, so the scan over all
+    // locals (the verifier's hottest loop) is skipped.
+    const kd = this.kindOf(d);
+    if (kd != KDead && kd != KInit) {
+      this.killBorrows(d);
+    }
+    this.set(d, k, src);
+  }
+
+  // Destination of a result: Owned for references, initialised for scalars.
+  private defResult(d: usize): void {
+    this.def(d, this.isRefLocal(d) ? KOwned : KInit, 0);
+  }
+
+  // Root a new borrow of local l depends on: l itself, or l's own root (borrows are flat).
+  private rootOf(l: usize): usize {
+    const s = this.ls[l];
+    return s.k == KBorrowed ? s.src : l;
+  }
+
+  // d becomes Borrowed(root). A borrow rooted at its own destination would leave d aliasing an
+  // object whose only owner was d's old value (found by the Lean soundness proof; docs/formal.md).
+  private defBorrow(d: usize, root: usize): void {
+    if (root == d) {
+      this.err("borrow into " + this.nm(d) + " rooted at " + this.nm(d) + " itself");
+      return;
+    }
+    this.def(d, KBorrowed, root);
+  }
+
+  // A Unique object that is aliased (borrowed whole, duplicated, passed to a call that may
+  // return it) is no longer provably unique.
+  private demote(l: usize): void {
+    if (this.kindOf(l) == KUnique) {
+      this.set(l, KOwned, 0);
+    }
+  }
+
+  private demoteOp(o: Operand): void {
+    match (o) {
+      OLocal(l) => {
+        this.demote(l);
+      },
+      _ => {},
+    }
+  }
+
+  // Result of a field/element read: borrowed from the root of `o` (references) or a scalar.
+  private defProjection(d: usize, o: Operand): void {
+    if (!this.isRefLocal(d)) {
+      this.def(d, KInit, 0);
+      return;
+    }
+    match (o) {
+      OLocal(l) => {
+        this.defBorrow(d, this.rootOf(l));
+      },
+      _ => {
+        this.def(d, KOwned, 0);
+      },
+    }
+  }
+
+  // ---------------------------------------------------------------- calls
+
+  // ICall / IBuiltin: arguments are borrowed for the call; the result is Owned. A reference
+  // result may alias an argument, so a Unique argument is demoted (docs/mir.md notes).
+  private call(dst: Option<usize>, args: Operand[]): void {
+    this.callOwned(dst, args, []);
+  }
+
+  // v1.2: `owned[i]` (when i < owned.length) marks an operand in an owned-parameter position: it is
+  // consumed (Owned/Unique/Imm -> Dead, OStr allowed; Borrowed/Param is an error). Borrowed
+  // positions may not alias a consumed operand (the callee could release it while reading the
+  // alias). Unique-demotion applies to borrowed positions only.
+  private callOwned(dst: Option<usize>, args: Operand[], owned: bool[]): void {
+    this.readAll(args);
+    let i: usize = 0;
+    while (i < args.length) {
+      if (i < owned.length && owned[i]) {
+        match (args[i]) {
+          OLocal(x) => {
+            let j: usize = 0;
+            while (j < args.length) {
+              if (j != i && !(j < owned.length && owned[j])) {
+                match (args[j]) {
+                  OLocal(y) => {
+                    if (y == x || this.kindOf(y) == KBorrowed && this.ls[y].src == x) {
+                      this.err(
+                        "borrowed argument " + this.nm(y) + " aliases consumed argument "
+                            + this.nm(x),
+                      );
+                    }
+                  },
+                  _ => {},
+                }
+              }
+              j += 1;
+            }
+          },
+          _ => {},
+        }
+      }
+      i += 1;
+    }
+    i = 0;
+    while (i < args.length) {
+      if (i < owned.length && owned[i]) {
+        this.consume(args[i]);
+      }
+      i += 1;
+    }
+    match (dst) {
+      None => {},
+      Some(d) => {
+        if (this.isRefLocal(d)) {
+          i = 0;
+          while (i < args.length) {
+            if (!(i < owned.length && owned[i])) {
+              this.demoteOp(args[i]);
+            }
+            i += 1;
+          }
+        }
+        this.defResult(d);
+      },
+    }
+  }
+
+  // ---------------------------------------------------------------- slots and holes
+
+  // Reading slot k of object operand o (IGetField / IArrayGet).
+  private project(d: usize, o: Operand, k: HoleKey): void {
+    match (o) {
+      OLocal(l) => {
+        this.readLocal(l);
+        if (holeMayIn(this.holes, l, k)) {
+          this.err("read of a slot of " + this.nm(l) + " that is (or may be) taken");
+        }
+      },
+      _ => {},
+    }
+    this.defProjection(d, o);
+  }
+
+  // ISetField / IArraySet.
+  private store(x: usize, k: HoleKey, v: Operand, what: string): void {
+    this.needUnique(x, what);
+    if (holeMayIn(this.holes, x, k)) {
+      this.err(
+        what + " into a slot of " + this.nm(x)
+            + " that is (or may be) taken; use the put instruction",
+      );
+    }
+    this.consume(v);
+    this.killBorrows(x);
+  }
+
+  // ITakeField / IArrayTake.
+  private take(d: usize, x: usize, k: HoleKey, what: string): void {
+    this.needUnique(x, what);
+    if (holeMayIn(this.holes, x, k)) {
+      this.err(what + " of a slot of " + this.nm(x) + " that is (or may be) already taken");
+    }
+    this.killBorrows(x);
+    this.addHole(x, k);
+    this.def(d, KOwned, 0);
+  }
+
+  // IPutField / IArrayPut.
+  private put(x: usize, k: HoleKey, s: usize, what: string): void {
+    this.needUnique(x, what);
+    if (!holeHasIn(this.holes, x, k)) {
+      this.err(what + " into a slot of " + this.nm(x) + " that is not a taken slot");
+    }
+    this.consume(OLocal(s));
+    this.removeHole(x, k);
+    this.killBorrows(x);
+  }
+
+  // IArrayPush / IArrayPop / IStrAppend: x must be owned (not Param/Borrowed); the runtime may
+  // reallocate or mutate it, so borrows die and Unique is not kept.
+  private mutateOwned(x: usize, what: string): void {
+    this.needOwned(x, what);
+    this.killBorrows(x);
+    if (ownedLike(this.kindOf(x))) {
+      this.set(x, KOwned, 0);
+    }
+  }
+
+  // ---------------------------------------------------------------- resource handles (v1.8, ADR-0025)
+  // Lifecycle of a handle local: Dead --BFileOpen--> Open --BFileClose--> Dead. A parameter handle is Param
+  // (borrowed): it can be used but not closed. Uses (call arguments, file builtins) need Open or Param.
+  // A function must not return while a handle is Open (error, not a warning) and must not overwrite one.
+
+  private openHandle(d: usize, args: Operand[]): void {
+    this.readAll(args);
+    const k = this.kindOf(d);
+    if (k == KOpen || k == KMaybeOpen) {
+      this.err(
+        "resource handle " + this.nm(d)
+            + " is overwritten while it is (or may be) still open: it would never be closed",
+      );
+    }
+    this.def(d, KOpen, 0);
+  }
+
+  private closeHandle(dst: Option<usize>, args: Operand[]): void {
+    match (args[0]) {
+      OLocal(h) => {
+        const k = this.kindOf(h);
+        if (k == KOpen) {
+          this.set(h, KDead, 0);
+        } else if (k == KParam) {
+          this.err(
+            "close of parameter " + this.nm(h)
+                + ": a handle is closed only by the scope that opened it",
+          );
+        } else if (k == KMaybeOpen) {
+          this.err(
+            "close of " + this.nm(h)
+                + " which is not open on some incoming paths (it could be closed twice)",
+          );
         } else {
-          c = err(c, "inout parameter " + nm(c, 0) + " must hold the updated receiver at return, but it is " + kindName(kindOf(c, 0)));
+          this.err(
+            "close of " + this.nm(h) + " which is not open (already closed, or never opened)",
+          );
         }
-      }
-      let i: usize = 0;
-      while (i < c.st.ls.length) {
-        if (leaky(c.st.ls[i].k)) {
-          c = warn(c, "leak: " + nm(c, i) + " may still own a reference at return");
-        }
-        if (c.st.ls[i].k == KOpen || c.st.ls[i].k == KMaybeOpen) {
-          c = err(c, "resource handle " + nm(c, i) + " is not closed on this path: every opened file must be closed before the function returns");
-        }
-        i += 1;
-      }
-      for (const h of c.st.holes) {
-        c = err(c, "return with an open hole in " + nm(c, h.obj));
-      }
-      return c;
-    },
-    TTrap(_) => {
-      return cx;
+      },
+      _ => {},
+    }
+    match (dst) {
+      None => {},
+      Some(d) => {
+        this.defResult(d);
+      },
     }
   }
+
+  // BFileOpen / BGrant*: the destination becomes an Open handle (the authorising first argument is only read: it must
+  // be Open or Param).
+  private opener(dst: Option<usize>, args: Operand[]): void {
+    match (dst) {
+      Some(d) => {
+        this.openHandle(d, args);
+      },
+      None => {},
+    }
+  }
+
+  private builtin(dst: Option<usize>, b: Builtin, args: Operand[]): void {
+    match (b) {
+      BFileOpen => {
+        this.opener(dst, args);
+      },
+      BGrantFs => {
+        this.opener(dst, args);
+      },
+      BGrantProcess => {
+        this.opener(dst, args);
+      },
+      BGrantStdio => {
+        this.opener(dst, args);
+      },
+      BGrantClock => {
+        this.opener(dst, args);
+      },
+      BGrantUnder => {
+        this.opener(dst, args);
+      },
+      BGrantReadOnly => {
+        this.opener(dst, args);
+      },
+      BGrantArgsOnly => {
+        this.opener(dst, args);
+      },
+      BGrantNet => {
+        this.opener(dst, args);
+      },
+      BGrantListen => {
+        this.opener(dst, args);
+      },
+      BGrantConnect => {
+        this.opener(dst, args);
+      },
+      BNetListen => {
+        this.opener(dst, args);
+      },
+      BNetAccept => {
+        this.opener(dst, args);
+      },
+      BNetConnect => {
+        this.opener(dst, args);
+      },
+      BNetClose => {
+        this.readAll(args);
+        this.closeHandle(dst, args);
+      },
+      BTask(k) => {
+        // ADR-0017: grantClone derives a handle from a parent (an opener); grantAdopt* makes one from a token (an opener
+        // with no authorising handle); grantMove ends one and returns its token (a closer: the handle is moved into a
+        // task exactly once on every path, and is dead afterwards).
+        if (taskOpOpensFrom(k) || taskOpAdopts(k)) {
+          this.opener(dst, args);
+        } else if (taskOpMoves(k)) {
+          this.readAll(args);
+          this.closeHandle(dst, args);
+        } else {
+          this.call(dst, args);
+        }
+      },
+      BFileClose => {
+        this.readAll(args);
+        this.closeHandle(dst, args);
+      },
+      BGrantRevoke => {
+        this.readAll(args);
+        this.closeHandle(dst, args);
+      },
+      _ => {
+        this.call(dst, args);
+      },
+    }
+  }
+
+  // ---------------------------------------------------------------- instruction rules
+
+  private instr(ins: Instr): void {
+    match (ins) {
+      ICopy(d, o) => {
+        this.readOp(o);
+        this.def(d, this.isRefLocal(d) ? KImm : KInit, 0);
+      },
+      IMove(d, s) => {
+        const k = this.kindOf(s);
+        this.consume(OLocal(s));
+        this.def(d, ownedLike(k) ? k : KOwned, 0);
+      },
+      IBorrow(d, s) => {
+        this.readWhole(s);
+        const r = this.rootOf(s);
+        this.demote(s);
+        this.defBorrow(d, r);
+      },
+      IDup(d, o) => {
+        this.readOp(o);
+        this.demoteOp(o);
+        this.def(d, KOwned, 0);
+      },
+      IRelease(x) => {
+        const k = this.kindOf(x);
+        this.needOwned(x, "release");
+        if (ownedLike(k)) {
+          this.kill(x);
+        }
+      },
+      IUnary(d, _, o) => {
+        this.readOp(o);
+        this.def(d, KInit, 0);
+      },
+      IBinary(d, _, a, b) => {
+        this.readOp(a);
+        this.readOp(b);
+        this.def(d, KInit, 0);
+      },
+      ICall(dst, fi, args) => {
+        this.callOwned(dst, args, this.prog.functions[fi].paramOwned);
+        if (this.prog.functions[fi].inout) {
+          // v1.10: argument 0 was consumed; it now holds the callee's final receiver (Owned: the callee may have kept
+          // an alias, so uniqueness is not known). Writing a parameter is an error except the in/out parameter of an
+          // inout caller (`def`).
+          match (args[0]) {
+            OLocal(x) => {
+              this.def(x, KOwned, 0);
+            },
+            _ => {},
+          }
+        }
+      },
+      IBuiltin(dst, b, args) => {
+        this.builtin(dst, b, args);
+      },
+      IStrAppend(x, y) => {
+        this.readOp(y);
+        match (y) {
+          OLocal(l) => {
+            if (this.kindOf(l) == KBorrowed && this.ls[l].src == x) {
+              this.err(
+                "IStrAppend: " + this.nm(l) + " is borrowed from the string being appended to",
+              );
+            }
+          },
+          _ => {},
+        }
+        this.mutateOwned(x, "IStrAppend");
+      },
+      IArrayExtend(x, y) => {
+        this.readOp(y);
+        match (y) {
+          OLocal(l) => {
+            if (this.kindOf(l) == KBorrowed && this.ls[l].src == x) {
+              this.err(
+                "IArrayExtend: " + this.nm(l) + " is borrowed from the array being extended",
+              );
+            }
+          },
+          _ => {},
+        }
+        this.mutateOwned(x, "IArrayExtend");
+      },
+      IStructNew(d, _, slots) => {
+        this.consumeAll(slots);
+        this.def(d, KUnique, 0);
+      },
+      INullary(d, _) => {
+        this.def(d, KImm, 0);
+      },
+      ITag(d, o) => {
+        match (o) {
+          OLocal(l) => {
+            this.readLocal(l);
+          },
+          _ => {},
+        }
+        this.def(d, KInit, 0);
+      },
+      IGetField(d, o, i) => {
+        this.project(d, o, slotKey(i));
+      },
+      ISetField(x, i, v) => {
+        this.store(x, slotKey(i), v, "ISetField");
+      },
+      ITakeField(d, x, i) => {
+        this.take(d, x, slotKey(i), "ITakeField");
+      },
+      IPutField(x, i, s) => {
+        this.put(x, slotKey(i), s, "IPutField");
+      },
+      IMakeUnique(x) => {
+        const k = this.kindOf(x);
+        this.needOwned(x, "IMakeUnique");
+        this.killBorrows(x);
+        if (ownedLike(k)) {
+          this.set(x, KUnique, 0);
+        }
+      },
+      IArrayNew(d, _, elems) => {
+        this.consumeAll(elems);
+        this.def(d, KUnique, 0);
+      },
+      IArrayGet(d, a, i) => {
+        this.readOp(i);
+        this.project(d, a, holeKey(i));
+      },
+      IArraySet(x, i, v) => {
+        this.readOp(i);
+        this.store(x, holeKey(i), v, "IArraySet");
+      },
+      IArrayTake(d, x, i) => {
+        this.readOp(i);
+        this.take(d, x, holeKey(i), "IArrayTake");
+      },
+      IArrayPut(x, i, s) => {
+        this.readOp(i);
+        this.put(x, holeKey(i), s, "IArrayPut");
+      },
+      IArrayPush(x, v) => {
+        this.consume(v);
+        this.mutateOwned(x, "IArrayPush");
+      },
+      IArrayPop(d, x) => {
+        this.mutateOwned(x, "IArrayPop");
+        this.def(d, KOwned, 0);
+      },
+      IClosure(d, _, caps) => {
+        this.consumeAll(caps);
+        this.def(d, KUnique, 0);
+      },
+      ICallIndirect(dst, c, args) => {
+        this.call(dst, [c].concat(args));
+      },
+      IIface(d, _, v) => {
+        this.consume(v);
+        this.def(d, KUnique, 0);
+      },
+      ICallVirtual(dst, c, _, args) => {
+        this.call(dst, [c].concat(args));
+      },
+    }
+  }
+}
+
+// One instruction on a replay context (the optimiser's interface, compiler/opt/calls.or): the context after `ins`.
+@Requires(cx.blk < cx.f.blocks.length && cx.ins < cx.f.blocks[cx.blk].instrs.length)
+@Requires(cx.st.ls.length == cx.f.locals.length)
+@Ensures(result.blk == cx.blk && result.ins == cx.ins && result.st.ls.length == cx.st.ls.length)
+@Ensures(result.errs.length >= cx.errs.length && result.warns.length >= cx.warns.length)
+export function step(cx: Cx, ins: Instr): Cx {
+  let t = new Transfer(cx.prog, cx.f, cx.blk, cx.ins, cx.st, cx.errs, cx.warns);
+  t.step(ins);
+  return Cx {
+    prog: t.prog,
+    f: t.f,
+    blk: t.blk,
+    ins: t.ins,
+    st: t.state(),
+    errs: t.errs,
+    warns: t.warns,
+  };
 }

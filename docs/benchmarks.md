@@ -21,6 +21,9 @@ claim about Orin in general.
 - **Orin counters**: `ORIN_STATS=1 ./prog` prints a one-line JSON summary to stderr at exit (allocations by
   kind, frees, retains, releases, COW copies vs in-place `make_unique` hits, array/string growth
   reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). Counters are plain increments compiled in always.
+  **Per allocation site** (opt-in, not compiled into normal builds): `orin2 compile --stats-sites` plus a runtime built with
+  `-DORIN_SITE_STATS`, then `ORIN_STATS=sites` reports allocations, bytes, retains, releases and COW copies per MIR instruction;
+  `tools/alloc_census.py` runs it on every benchmark, the HTTP server and the self-compile (docs/perf/alloc-census.md).
   `retains`/`releases` count non-immortal objects only; `releases` includes the children released while
   destroying an object. Bytes are object + buffer capacity (approximate, not RSS).
 - **Algorithm equivalences and deliberate choices** (no cherry-picking: where a choice favours one side it is listed):
@@ -386,6 +389,12 @@ variant payloads in the legacy codegen), where the index is a loop counter below
 allocation; the LLVM closure/interface constructors use the same reasoning (`slotGep`). Everything else is checked,
 including `IPutField` (a put after a take) and struct-literal/update stores in the legacy codegen.
 
+## Concurrency stage 0 (ADR-0017): cost of the thread-local runtime state
+
+Per-task heap state (`__thread` counters, free lists, work stack) replaced globals. Same generated C, old runtime (commit d55461c) vs
+current, executed instructions (callgrind): fib 1.0000, sieve 1.0000, nbody 1.0000, strings 1.0138, wordfreq 1.0132, mapfreq 1.0159,
+qsort_func 1.0143, bintrees 1.0197. The counters use the `local-exec` TLS model (one instruction per update); with the default model
+the cost was up to 1.05. Task micro-benchmarks (`bench/tasks`) and the rest: docs/concurrency.md "Measurements".
 
 ## Performance defects found while building the std: fixes and re-measurement
 
@@ -581,3 +590,89 @@ What remains for the big levers: unboxing (Option/Result of scalars, small recor
 returned and destructured), reference-count elision (borrowed-to-owned retains that the callee only reads, release-after-last-use
 pairs across loop iterations, `bintrees`-style constructor chains) and escape analysis (stack allocation of records that never leave a
 function; with it `Some(x)` for `pop().unwrap()` disappears). Each is a MIR pass with its verifier rules, in the style of `opt/pairs.or`.
+
+
+## Benchmark workflow (CI), metrics and history
+
+`.github/workflows/bench.yml` runs `tools/bench.py` on a GitHub-hosted `ubuntu-latest` runner (4 vCPUs, shared) with Go 1.24
+(`actions/setup-go`), Temurin Java 21 (`actions/setup-java`), stable Rust (the preinstalled rustup), the preinstalled clang
+and valgrind from apt, after the seed bootstrap of `tools/bootstrap.sh`. It does not run on every push.
+
+### Triggering it
+
+| how | what runs | where the result goes |
+|---|---|---|
+| nightly, 03:57 UTC on `main` (`schedule`) | everything, 5 runs per cell | job summary, artifact `bench-results`, appended to the `bench-results` branch |
+| Actions tab -> bench -> "Run workflow" (`workflow_dispatch`) | inputs: `runs` (default 5) and `only` (comma-separated names, empty = all; `selfcompile` in the list adds the self-compile) | as above; a manual run on `main` is also appended to the history, a run on another branch is not |
+| add the label `bench` to a pull request (`pull_request: labeled`) | everything for the PR's merge commit | job summary, artifact, and one PR comment comparing with `main` (edited in place when the label is added again or the run is re-run) |
+
+Locally the same numbers come from
+`python3 tools/bench.py --runs 1 --only fib,sieve --json build/bench/x.json --instructions` and
+`python3 tools/bench_report.py summary build/bench/x.json`.
+
+Permissions are least privilege: the workflow token is `contents: read`; only the `history` job has `contents: write` (to
+push to `bench-results`) and only the `compare` job has `pull-requests: write` (to comment). A pull request from a fork gets
+a read-only token, so its comparison is only in the job summary. Nothing has to be configured in the repository settings;
+the `bench` label is created the first time someone types it in a pull request's label menu.
+
+### Metrics (per benchmark and language, in the JSON written by `--json`)
+
+| field | meaning |
+|---|---|
+| `wall_median`, `wall_min`, `wall_max` | wall time of the whole process (seconds), `runs` runs after one unrecorded warm-up |
+| `user_median`, `sys_median`, `cpu_median` | user, system and user + system CPU time of the process and all its threads (`wait4` rusage, seconds). CPU above wall means parallel work (Go's GC, the JVM's JIT and GC threads, std:task workers) |
+| `rss_kb` | peak resident set (`ru_maxrss`, KiB, median); ~1 MiB process-startup floor |
+| `output_matched` | stdout identical to the reference (C, else the first language built); a mismatch fails the workflow after the upload |
+| `instructions.<lang>.count` | executed instructions (valgrind `cachegrind --cache-sim=no`, "I refs"), one run, for `orin` (C backend), `llvm` and `c`; `args` is set when a reduced input was used, `skipped` holds the reason when the program was not counted |
+| `orin_stats` | the runtime counters of `ORIN_STATS=1` |
+| `selfcompile` | the same fields for `orin2 compile compiler/main.or`, plus `identical_to_stage2` and its instruction count |
+| `parallel.<name>.threads.<n>` | the same timing fields with `n` worker threads, plus `speedup` = wall(1) / wall(n), `efficiency` = speedup / n, `cpu_ratio` = CPU(n) / CPU(1) |
+
+The top level records `commit`, `ref`, `date` (UTC), `runs`, `only`, `machine` (CPU model, core count, memory, OS, runner),
+`tools` (cc, clang, go, java, rustc, valgrind, python versions) and `mismatches`; `schema` is 1.
+
+**Why instruction counts are the regression metric.** On a shared runner the wall time of a byte-identical binary moves by
+10-25 % between runs (the A/B runs above show +-25 % on `sieve` from identical C), so a 5 % regression is invisible in it.
+The number of executed instructions of a single-threaded, deterministic program is the same on every run and every runner
+(it changes with the compiler, the runtime and the C compiler version, which the JSON records), so a change of more than 2 %
+is a real change in the code that runs. It does not see cache misses, branch mispredictions or memory-bandwidth effects, which
+is why the wall time is still reported and compared with a wide (15 %) threshold. valgrind costs 20-50x the native time; the
+whole instruction pass is a few minutes. Conventions for a benchmark that is too slow under valgrind: a file
+`bench/<name>/instructions.args` holds arguments for a smaller input (the JSON records them and the PR comparison does not
+compare such counts with full-size ones), `bench/<name>/instructions.skip` holds the reason to skip it; a run over
+`--instr-timeout` (900 s) is skipped with that reason. Multi-threaded programs (`bench/tasks`, the parallel benchmarks) are
+skipped, because valgrind serialises threads.
+
+**Parallel speedup.** `bench/parallel_*/` and `bench/streams_parallel/` (picked up automatically when present) take the
+number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. There is no
+runtime knob: std:task has no thread pool, every task is one OS thread, so the worker count is the `parts` argument of
+`parallelMap` (or the number of tasks the program spawns). Each program runs with 1, 2 and 4 threads (`--threads`); the output
+must not depend on the count. `bench/parallel_collatz` is the Collatz-steps map of `examples/parallel_map.or` over
+1..2,000,000 with deterministic output. With more threads than free cores the speedup flattens; `cpu_ratio` above 1 shows the
+cost of copying chunks, joining and oversubscription.
+
+### The job summary and the PR comment
+
+The job summary has: wall time of Orin (C and LLVM backend), C, Go, Java and Rust; ratios to C; CPU time and RSS; executed
+instructions with the Orin/C ratios; the parallel table (wall, CPU, speedup, efficiency); the self-compile (time, CPU, RSS,
+instructions). The PR comment (`tools/bench_report.py compare`) is one table per Orin binary and benchmark plus the
+self-compile: instructions on `main` and on the PR, wall time on `main` and on the PR, the changes, and a verdict:
+**regression (instructions)** above +2 %, **regression (wall time)** above +15 %, *improvement* below -2 % instructions. The
+baseline of each row is the newest `main` entry of the history that has that row. The comment only reports; the job does not
+fail on a regression.
+
+### History: the `bench-results` branch
+
+An orphan branch of this repository, created by the first run on `main` and only fast-forwarded afterwards (commits by
+`github-actions[bot]`, with the workflow's `GITHUB_TOKEN`):
+
+    history/<YYYY-MM-DD>-<sha12>.json   one bench.py --json result per run on main
+    charts/ratio_wall.svg               Orin (C / LLVM backend) / C wall-time ratio per benchmark over time (small multiples)
+    charts/ratio_instructions.svg       the same ratio by executed instructions (stable)
+    charts/selfcompile.svg              self-compile instructions and wall time over time
+    charts/parallel.svg                 speedup by worker threads (latest run, with the ideal line) and at 4 threads over time
+    README.md                           the charts, the latest run's tables, the list of runs
+
+`tools/bench_report.py render --history history --out .` regenerates the charts and the README (stdlib only). Opening the
+branch on GitHub shows the README with the charts; no GitHub Pages. The SVGs have their own light background, axis titles, a
+legend and a `<title>` / `<desc>`; under a dark system color scheme they switch to the dark steps of the same palette.

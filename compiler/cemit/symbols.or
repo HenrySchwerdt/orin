@@ -8,6 +8,7 @@
 
 import { MProgram, MFunction, isInlineFn } from "../mir";
 import { u, cty, fnSymbol, identChars } from "./text";
+import { siteCount } from "./sites";
 
 // `@Inline` (ADR-0024) becomes `static inline`: a hint the C compiler may ignore, so semantics and link behaviour (one
 // translation unit) are unchanged.
@@ -37,12 +38,14 @@ export function signature(name: string, f: MFunction, inl: bool): string {
 // as the list, so no symbol shadows another); the string literal and vtable counts are those of the program.
 @Invariant(this.names.length == this.sigs.length)
 @Invariant(this.byName.size == this.names.length)
+@Invariant(this.firstSites.length == this.names.length)
 export class CSymbols {
   private names: string[];
   private sigs: string[];
   private byName: Map<string, usize>;
   private nStrings: usize;
   private nVtables: usize;
+  private firstSites: usize[];
 
   constructor(
     names: string[],
@@ -50,12 +53,20 @@ export class CSymbols {
     byName: Map<string, usize>,
     nStrings: usize,
     nVtables: usize,
+    firstSites: usize[],
   ) {
     this.names = names;
     this.sigs = sigs;
     this.byName = byName;
     this.nStrings = nStrings;
     this.nVtables = nVtables;
+    this.firstSites = firstSites;
+  }
+
+  // The allocation-site census id of the first site of function `i` (`--stats-sites`); 0 in a normal build.
+  @Requires(i < this.firstSites.length)
+  firstSite(i: usize): usize {
+    return this.firstSites[i];
   }
 
   // Number of functions.
@@ -90,22 +101,52 @@ export class CSymbols {
   }
 }
 
-// The symbol table of `prog`: built in function order, before any function is emitted.
+// The symbol table of `prog` for a normal build.
+@Ensures(result.count() == prog.functions.length)
+export function cSymbols(prog: MProgram): CSymbols {
+  return cSymbolsWith(prog, false);
+}
+
+// The site ids of a census build start at 1 and are numbered in MIR order (function, block, instruction, the terminator
+// last): function i's first site follows all sites of functions 0 .. i-1. Catches a numbering that drifts from
+// `siteTable`, whose entry n describes site n.
+export function sitesNumbered(prog: MProgram, syms: CSymbols): bool {
+  let next: usize = 1;
+  let i: usize = 0;
+  while (i < prog.functions.length) {
+    if (syms.firstSite(i) != next) {
+      return false;
+    }
+    next += siteCount(prog.functions[i]);
+    i += 1;
+  }
+  return true;
+}
+
+// The symbol table of `prog`: built in function order, before any function is emitted. With `sites` (the census build)
+// it also fixes the first allocation-site id of every function, the one program-wide counter of the C backend (rule 8).
 @Ensures(result.count() == prog.functions.length)
 @Ensures(result.strings() == prog.strings.length && result.vtables() == prog.vtables.length)
-export function cSymbols(prog: MProgram): CSymbols {
+@Ensures(sites ==> sitesNumbered(prog, result))
+export function cSymbolsWith(prog: MProgram, sites: bool): CSymbols {
   let names: string[] = [];
   let sigs: string[] = [];
   let byName = new Map<string, usize>();
+  let firstSites: usize[] = [];
+  let site: usize = sites ? 1 : 0;
   let i: usize = 0;
   for (const f of prog.functions) {
     const n = fnSymbol(i, f.name);
     names.push(n);
     sigs.push(signature(n, f, isInlineFn(prog, f.name)));
     byName.set(n, i);
+    firstSites.push(site);
+    if (sites) {
+      site += siteCount(f);
+    }
     i += 1;
   }
-  return new CSymbols(names, sigs, byName, prog.strings.length, prog.vtables.length);
+  return new CSymbols(names, sigs, byName, prog.strings.length, prog.vtables.length, firstSites);
 }
 
 // ---------------------------------------------------------------- what a piece of output refers to

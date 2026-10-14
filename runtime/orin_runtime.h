@@ -49,6 +49,10 @@ typedef struct OrinObj {
     int64_t rc;    /* >0 live count, <0 immortal */
     uint32_t kind; /* ORIN_K_* */
     uint32_t tag;  /* variant tag (struct kind only; records use 0) */
+#ifdef ORIN_SITE_STATS
+    uint32_t site; /* allocation-site census only (see "Allocation-site census" below): the site that allocated it */
+    uint32_t site_pad;
+#endif
 } OrinObj;
 
 typedef struct OrinString {
@@ -110,10 +114,42 @@ void orin_init(int argc, char **argv);
 /* Flush buffered stdout (called by orin_process_exit, orin_trap; call before returning from main). */
 void orin_flush(void);
 void orin_trap(const char *msg) __attribute__((noreturn, cold));
-/* Number of live (non-immortal) heap objects; for leak/UAF tests. */
+/* Number of live (non-immortal) heap objects; for leak/UAF tests. Counts the calling thread's allocations minus its
+ * frees plus the net of all finished tasks (an object moved between tasks is allocated by one and freed by another). */
 int64_t orin_live_count(void);
 
 void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0 */
+
+/* ---------------------------------------------------------------- tasks (ADR-0017 stage 0, docs/concurrency.md)
+ * TEMPORARY interface (spec 19 R3): the part of task support that needs the object model. Each function maps 1:1 onto
+ * a planned Orin core-dialect function (docs/concurrency.md "Porting table"). Everything else of std:task is Orin.
+ *   transfer: a value changes task heaps. `box` is a record with ONE slot that the sender has just built (so the value
+ *     in it was consumed by the sender); put detaches the value (moved if its whole graph is uniquely owned, deep-copied
+ *     otherwise; a copy is a fresh graph nobody else can reach) and returns a token; take returns the box (owned by the
+ *     caller, now in ITS heap); drop frees it. A token is valid for exactly one take or drop; anything else traps.
+ *   task: spawn starts a thread that takes the closure `() => void` out of the token, runs it and ends; join waits
+ *     (0: it returned, 1: it trapped, the message is then available from orin_rt_task_message). A trap on a task thread
+ *     ends only that task. */
+uint64_t orin_rt_transfer_put(OrinObj *box);
+OrinObj *orin_rt_transfer_take(uint64_t token);
+void orin_rt_transfer_drop(uint64_t token);
+uint64_t orin_rt_transfer_count(uint64_t which); /* 0: values moved by this task so far, 1: copied */
+uint64_t orin_rt_task_spawn(uint64_t token);
+uint64_t orin_rt_task_join(uint64_t thread);
+OrinObj *orin_rt_task_message(void);
+void orin_rt_trap_str(OrinObj *msg) __attribute__((noreturn)); /* trap with the text of an Orin string */
+void orin_rt_heap_exit(void);                                   /* end of a task's heap (called by the runtime itself) */
+/* monitors (L0, platform layer): forwarders that trap on an invalid handle / unlocked access */
+uint64_t orin_mon_new(uint64_t nwords);
+void orin_mon_free(uint64_t m);
+void orin_mon_lock(uint64_t m);
+void orin_mon_unlock(uint64_t m);
+void orin_mon_wait(uint64_t m, uint64_t cond);       /* cond: 0 or 1, the two condition queues of a monitor */
+void orin_mon_notify_all(uint64_t m, uint64_t cond);
+void orin_mon_notify_one(uint64_t m, uint64_t cond);
+uint64_t orin_mon_get(uint64_t m, uint64_t i);
+void orin_mon_set(uint64_t m, uint64_t i, uint64_t v);
+void orin_mon_grow(uint64_t m, uint64_t nwords);
 
 /* ---------------------------------------------------------------- file resources (ADR-0025)
  * A file handle is an int64_t: a positive generation-tagged index into a fixed table of open streams
@@ -150,13 +186,47 @@ typedef struct OrinStats {
     uint64_t peak_live_objs, peak_live_bytes;
     uint64_t live_bytes;
     uint64_t file_opens, file_closes;                 /* resource handles (ADR-0025): successful opens / closes */
+    uint64_t transfer_moves, transfer_copies;         /* values sent between tasks (ADR-0017): moved without a copy / deep-copied */
+    uint64_t tasks_spawned;
 } OrinStats;
-extern OrinStats orin_stats;
+/* Per THREAD (every task has its own heap and its own counters; a finished task's counters are folded into the
+ * process totals, which the ORIN_STATS report prints together with the main thread's). */
+/* The counters live in one executable (never a shared library), so on ELF targets the access can use the local-exec TLS model: one
+ * instruction per counter update, like the plain global it replaced (measured: instruction counts of the benchmarks are unchanged). */
+#if defined(__ELF__)
+#define ORIN_TLS_MODEL __attribute__((tls_model("local-exec")))
+#else
+#define ORIN_TLS_MODEL
+#endif
+extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
+
+/* Allocation-site census (opt-in, docs/perf/alloc-census.md, tools/alloc_census.py). Compiled in only when BOTH the generated C
+ * and the runtime are built with ORIN_SITE_STATS: the compiler (`orin2 compile --stats-sites`) then defines it at the top of
+ * its output, emits `ORIN_SITE(n, orin_site_caller);` before every MIR instruction and terminator (n: the site id, 1-based, in
+ * MIR order: function, block, instruction; the terminator counts as the last instruction; `orin_site_caller` is a local that
+ * every function sets on entry to the call site that entered it, one level of calling context for its allocations) and a
+ * table `orin_site_names` describing every site; the
+ * runtime must be compiled with -DORIN_SITE_STATS (a mismatch is a link error: each side references a symbol only the other
+ * defines). Every object records the site that allocated it (OrinObj.site), so the counters are both "at the site" (operations
+ * the site executed, on any object) and "of the site" (operations on the objects the site allocated). Report: ORIN_STATS=sites
+ * writes one line per site that did anything to $ORIN_SITES_OUT (stderr when unset), besides the usual summary line.
+ * Without ORIN_SITE_STATS every hook below is an empty macro: normal builds are unchanged. */
+#ifdef ORIN_SITE_STATS
+extern __thread uint32_t orin_site_cur ORIN_TLS_MODEL; /* the site executing now (0: none / runtime start-up) */
+extern __thread uint32_t orin_site_par ORIN_TLS_MODEL; /* the call site that entered the function of orin_site_cur */
+#define ORIN_SITE(n, caller) (orin_site_cur = (uint32_t)(n), orin_site_par = (caller))
+enum { ORIN_SITE_RETAIN = 0, ORIN_SITE_RELEASE = 1, ORIN_SITE_COW_COPY = 2, ORIN_SITE_COW_INPLACE = 3 };
+void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur and at o->site */
+#define ORIN_SITE_RC(o, what) orin_site_rc((o), (what))
+#else
+#define ORIN_SITE_RC(o, what) ((void)0)
+#endif
 
 static inline void orin_retain(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
         orin_stats.retains++;
+        ORIN_SITE_RC(o, ORIN_SITE_RETAIN);
     }
 }
 /* retain and return (turn a borrowed value into an owned one). */
@@ -164,6 +234,7 @@ static inline OrinObj *orin_dup(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
         orin_stats.retains++;
+        ORIN_SITE_RC(o, ORIN_SITE_RETAIN);
     }
     return o;
 }
@@ -171,6 +242,7 @@ static inline OrinObj *orin_dup(OrinObj *o) {
 static inline void orin_release(OrinObj *o) {
     if (o && o->rc > 0) {
         orin_stats.releases++;
+        ORIN_SITE_RC(o, ORIN_SITE_RELEASE);
         if (ORIN_UNLIKELY(--o->rc == 0)) orin_destroy(o);
     }
 }
@@ -181,6 +253,7 @@ OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path */
 static inline OrinObj *orin_make_unique(OrinObj *o) {
     if (ORIN_LIKELY(o->rc == 1)) {
         orin_stats.cow_inplace++;
+        ORIN_SITE_RC(o, ORIN_SITE_COW_INPLACE);
         return o;
     }
     return orin_make_unique_slow(o);
@@ -452,6 +525,16 @@ OrinObj *orin_net_peer(int64_t stream);
 OrinObj *orin_net_resolve(int64_t net, OrinObj *name); /* Result<string, int> */
 OrinObj *orin_net_error_text(int64_t code);
 void orin_cap_revoke(int64_t grant);                           /* end of the scope that acquired / narrowed it */
+/* Moving a grant into a task (ADR-0017, ADR-0027 Q10): clone derives a grant with the same authority (never more);
+ * move detaches it into a one-shot token (the handle is dead afterwards, like after revoke); adopt_* makes the token a
+ * live grant of the calling task, of the family the function names. A token adopted twice, or as the wrong family, traps.
+ * Handles are per task: a grant handle used on another thread than the one that made it traps. */
+int64_t orin_cap_clone(int64_t grant);
+uint64_t orin_cap_move(int64_t grant);
+int64_t orin_cap_adopt_fs(uint64_t token);
+int64_t orin_cap_adopt_process(uint64_t token);
+int64_t orin_cap_adopt_stdio(uint64_t token);
+int64_t orin_cap_adopt_clock(uint64_t token);
 void orin_cap_require(int64_t grant, int64_t kind, const char *what); /* traps unless valid, of `kind` and not denied */
 void orin_cap_require_spawn(int64_t proc);                     /* traps unless the process grant may spawn */
 void orin_process_exit(int64_t code) __attribute__((noreturn)); /* flushes stdout */

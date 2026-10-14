@@ -119,6 +119,14 @@ in the header (no cost on hot paths); everything else is out of line. The platfo
 stdout buffer and the argv copy; the runtime keeps no libc state. Contracts, status labels and verification:
 docs/formal.md "L0 platform layer".
 
+## Tasks (ADR-0017 stage 0)
+
+A task is a thread with its own heap: allocation, free lists, counters, the grant table and the file table are thread-local
+(`__thread`), reference counts stay non-atomic, and a value crosses between tasks only through `orin_rt_transfer_put` / `take` (move
+if its graph is uniquely owned, else deep copy). `std:task` (Orin) keeps its shared state in L0 **monitors** (a mutex, two condition
+queues, integer words). The platform layer is now thread-safe (the stdout buffer is locked). Details, porting table and assurance:
+[concurrency.md](concurrency.md).
+
 ## Safety status (honest labelling, spec 07)
 
 | Property | Status |
@@ -132,4 +140,5 @@ docs/formal.md "L0 platform layer".
 | Link verifier ⇄ Lean model | **Proven for the structured MIR core** (`check_sound`: Lean checker transcribing docs/mir.md accepts ⇒ no use-after-free/double free/shared store), given a caller contract. Not covered: calls/builtins, loops, switch, arrays/strings; the Orin verifier source is not itself verified against the Lean checker (manual transcription). See docs/formal.md |
 | Source type safety (progress/preservation) | Not started |
 | L0 platform layer (`platform/`) | Contracts written (ACSL-style); memory/string/format primitives bounded-verified with CBMC; I/O, process and file primitives tested only (docs/formal.md) |
+| Task isolation (ADR-0017 stage 0) | Static: handles cannot be captured / stored / sent, E0481-E0483, MIR verifier handle rules for grants moved into tasks. Run time: handle validation, one-shot tokens. **Tested only** (ThreadSanitizer, ASan + UBSan, stress): the C transfer and the L0 thread / monitor primitives; not verified, see docs/concurrency.md "Safety argument" |
 | Native artifact | TCB: runtime, C compiler, allocator, emitter — unverified |

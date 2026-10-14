@@ -1,9 +1,15 @@
 // Well-formedness of MIR (docs/mir.md "Execution model"): index ranges and operand classes. The
 // ownership rules in rules.or assume every function passed this check, so they never index out
-// of range. Each check returns an error message, or "" when the item is well-formed.
+// of range. Each check returns an error message, or "" when the item is well-formed. The check is the
+// verifier's own (it does not trust the producer of the MIR); its `@Ensures` tie it to the shared structural
+// predicates of compiler/mir (`instrInRange`, `termInRange`, `paramsWellFormed`, `spansAligned`), so the two
+// formulations cannot drift apart.
 
-import { MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase } from "../mir";
-import { UnOp, BinOp, Builtin } from "../hir";
+import {
+  MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase, dstOf, instrInRange,
+  termInRange, paramsWellFormed, spansAligned,
+} from "../mir";
+import { UnOp, BinOp, Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 
 // Operand/local classes.
 export const CInt: int = 0;
@@ -12,8 +18,9 @@ export const CBool: int = 2;
 export const CRef: int = 3;
 export const CVoid: int = 4;
 export const CFloat: int = 5;
-export const CHandle: int = 6;   // resource handle (v1.8, ADR-0025)
+export const CHandle: int = 6; // resource handle (v1.8, ADR-0025)
 
+@Ensures(result >= CInt && result <= CHandle)
 export function tyClass(t: MType): int {
   return match (t) {
     MInt => 0,
@@ -22,16 +29,18 @@ export function tyClass(t: MType): int {
     MFloat => 5,
     MHandle => 6,
     MRef => 3,
-    MVoid => 4
+    MVoid => 4,
   };
 }
 
 // Class of a local; callers have checked the index.
+@Requires(l < f.locals.length)
 export function localClass(f: MFunction, l: usize): int {
   return tyClass(f.locals[l].ty);
 }
 
 // Class of a well-formed operand.
+@Requires(opLocalOk(f, o))
 export function opClass(f: MFunction, o: Operand): int {
   return match (o) {
     OLocal(l) => localClass(f, l),
@@ -39,25 +48,34 @@ export function opClass(f: MFunction, o: Operand): int {
     OUsize(_) => 1,
     OBool(_) => 2,
     OFloat(_) => 5,
-    OStr(_) => 3
+    OStr(_) => 3,
   };
 }
 
+// A local operand names a local of `f`.
+export function opLocalOk(f: MFunction, o: Operand): bool {
+  return match (o) {
+    OLocal(l) => l < f.locals.length,
+    _ => true,
+  };
+}
+
+@Ensures(result ==> opLocalOk(f, o))
 function opOk(p: MProgram, f: MFunction, o: Operand): bool {
   return match (o) {
     OLocal(l) => l < f.locals.length,
     OInt(_) => true,
-    OUsize(_) => true,   // the 64-bit pattern: a negative int is a value above 2^63-1 (u64 literals, ADR-0022)
+    OUsize(_) => true, // the 64-bit pattern: a negative int is a value above 2^63-1 (u64 literals, ADR-0022)
     OBool(_) => true,
     OFloat(t) => t.length > 0,
-    OStr(i) => i < p.strings.length
+    OStr(i) => i < p.strings.length,
   };
 }
 
 function isLocal(o: Operand, l: usize): bool {
   return match (o) {
     OLocal(m) => m == l,
-    _ => false
+    _ => false,
   };
 }
 
@@ -65,27 +83,17 @@ function isLocal(o: Operand, l: usize): bool {
 function isHandleOp(f: MFunction, o: Operand): bool {
   return match (o) {
     OLocal(l) => l < f.locals.length && localClass(f, l) == CHandle,
-    _ => false
+    _ => false,
   };
 }
 
 // None of `os` is a resource handle (a handle is never stored, captured or boxed).
 function noHandles(f: MFunction, os: Operand[]): bool {
-  for (const o of os) {
-    if (isHandleOp(f, o)) {
-      return false;
-    }
-  }
-  return true;
+  return !os.some(o => isHandleOp(f, o));
 }
 
 function opsOk(p: MProgram, f: MFunction, os: Operand[]): bool {
-  for (const o of os) {
-    if (!opOk(p, f, o)) {
-      return false;
-    }
-  }
-  return true;
+  return os.every(o => opOk(p, f, o));
 }
 
 // local `l` is in range and has class `c`
@@ -99,19 +107,14 @@ function opIs(p: MProgram, f: MFunction, o: Operand, c: int): bool {
 }
 
 function constsOk(p: MProgram, f: MFunction, os: Operand[], isRef: bool): bool {
-  for (const o of os) {
-    if (!opOk(p, f, o) || (opClass(f, o) == CRef) != isRef || opClass(f, o) == CHandle) {
-      return false;
-    }
-  }
-  return true;
+  return os.every(o => opOk(p, f, o) && opClass(f, o) == CRef == isRef && opClass(f, o) != CHandle);
 }
 
 // Operand that is a *local* of class ref (OStr is not an object that can be indexed/mutated).
 function refLocalOp(f: MFunction, o: Operand): bool {
   return match (o) {
     OLocal(l) => isCls(f, l, CRef),
-    _ => false
+    _ => false,
   };
 }
 
@@ -132,19 +135,26 @@ function binOk(f: MFunction, op: BinOp, d: usize, a: Operand, b: Operand): bool 
     OpGt => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
     OpGe => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
     OpAnd => ca == CBool && cb == CBool && cd == CBool,
-    OpOr => ca == CBool && cb == CBool && cd == CBool
+    OpOr => ca == CBool && cb == CBool && cd == CBool,
   };
 }
 
 function unOk(f: MFunction, op: UnOp, d: usize, a: Operand): bool {
   const c = match (op) {
     UnNot => CBool,
-    UnNeg => opClass(f, a) == CFloat ? CFloat : CInt
+    UnNeg => opClass(f, a) == CFloat ? CFloat : CInt,
   };
   return opClass(f, a) == c && localClass(f, d) == c;
 }
 
-function callMsg(p: MProgram, f: MFunction, dst: Option<usize>, fi: usize, args: Operand[]): string {
+@Ensures(result == "" ==> fi < p.functions.length && args.length == p.functions[fi].paramCount)
+function callMsg(
+  p: MProgram,
+  f: MFunction,
+  dst: Option<usize>,
+  fi: usize,
+  args: Operand[],
+): string {
   if (fi >= p.functions.length) {
     return "ICall: function index out of range";
   }
@@ -154,6 +164,11 @@ function callMsg(p: MProgram, f: MFunction, dst: Option<usize>, fi: usize, args:
   }
   if (!opsOk(p, f, args)) {
     return "ICall: bad operand";
+  }
+  // The callee's own well-formedness is checked when it is verified, which may be later: its parameters must be
+  // locals before their classes can be compared (an ill-formed callee used to make the verifier index out of range).
+  if (g.paramCount > g.locals.length) {
+    return "ICall: callee " + g.name + " has more parameters than locals";
   }
   let i: usize = 0;
   while (i < args.length) {
@@ -172,12 +187,12 @@ function callMsg(p: MProgram, f: MFunction, dst: Option<usize>, fi: usize, args:
               return "ICall of an inout function: the destination must not be the in/out argument";
             }
           },
-          None => {}
+          None => {},
         }
       },
       _ => {
         return "ICall of an inout function: argument 0 must be a local (it receives the updated value)";
-      }
+      },
     }
   }
   const rc = tyClass(g.ret);
@@ -191,12 +206,13 @@ function callMsg(p: MProgram, f: MFunction, dst: Option<usize>, fi: usize, args:
         return "ICall: destination class does not match the callee's return type";
       }
       return "";
-    }
+    },
   };
 }
 
 // IClosure: the lifted function takes the environment record first (a reference) and has only
 // borrowed parameters (an indirect call cannot honour owned-parameter modes).
+@Ensures(result == "" ==> fi < p.functions.length && p.functions[fi].paramOwned.every(o => !o))
 function closureMsg(p: MProgram, f: MFunction, d: usize, fi: usize, caps: Operand[]): string {
   if (!isCls(f, d, CRef)) {
     return "IClosure: the destination must be a reference local";
@@ -205,13 +221,11 @@ function closureMsg(p: MProgram, f: MFunction, d: usize, fi: usize, caps: Operan
     return "IClosure: function index out of range";
   }
   const g = p.functions[fi];
-  if (g.paramCount == 0 || tyClass(g.locals[0].ty) != CRef) {
+  if (g.paramCount == 0 || g.locals.length == 0 || tyClass(g.locals[0].ty) != CRef) {
     return "IClosure: the lifted function must take the environment record as its first parameter";
   }
-  for (const o of g.paramOwned) {
-    if (o) {
-      return "IClosure: the lifted function " + g.name + " must have only borrowed parameters";
-    }
+  if (g.paramOwned.some(o => o)) {
+    return "IClosure: the lifted function " + g.name + " must have only borrowed parameters";
   }
   if (!noHandles(f, caps)) {
     return "IClosure: a resource handle cannot be captured";
@@ -222,7 +236,7 @@ function closureMsg(p: MProgram, f: MFunction, d: usize, fi: usize, caps: Operan
 function optDstOk(f: MFunction, dst: Option<usize>): bool {
   return match (dst) {
     None => true,
-    Some(d) => d < f.locals.length
+    Some(d) => d < f.locals.length,
   };
 }
 
@@ -253,6 +267,7 @@ function takesHandle(b: Builtin): bool {
     BIoShell => true,
     BTimeNowMillis => true,
     BGrantRevoke => true,
+    BTask(k) => taskOpMoves(k),
     BNetStatus => true,
     BNetClose => true,
     BNetPort => true,
@@ -271,7 +286,7 @@ function takesHandle(b: Builtin): bool {
     BFileWrite => true,
     BFileWriteLine => true,
     BFileFlush => true,
-    _ => false
+    _ => false,
   };
 }
 
@@ -293,35 +308,17 @@ function isOpenB(b: Builtin): bool {
     BNetListen => true,
     BNetAccept => true,
     BNetConnect => true,
-    _ => false
+    BTask(k) => taskOpOpensFrom(k),
+    _ => false,
   };
 }
 
-// The destination local an instruction defines, if any.
-function dstOf(ins: Instr): Option<usize> {
-  return match (ins) {
-    ICopy(d, _) => Some(d),
-    IMove(d, _) => Some(d),
-    IBorrow(d, _) => Some(d),
-    IDup(d, _) => Some(d),
-    IUnary(d, _, _) => Some(d),
-    IBinary(d, _, _, _) => Some(d),
-    ICall(dst, _, _) => dst,
-    IBuiltin(dst, _, _) => dst,
-    IStructNew(d, _, _) => Some(d),
-    INullary(d, _) => Some(d),
-    ITag(d, _) => Some(d),
-    IGetField(d, _, _) => Some(d),
-    ITakeField(d, _, _) => Some(d),
-    IArrayNew(d, _, _) => Some(d),
-    IArrayGet(d, _, _) => Some(d),
-    IArrayTake(d, _, _) => Some(d),
-    IArrayPop(d, _) => Some(d),
-    IClosure(d, _, _) => Some(d),
-    ICallIndirect(dst, _, _) => dst,
-    IIface(d, _, _) => Some(d),
-    ICallVirtual(dst, _, _, _) => dst,
-    _ => None
+// The builtins that define a handle from a one-shot token instead of from another handle (ADR-0017: a grant moved into a
+// task is adopted there): no argument is a handle, the destination is.
+function isAdoptB(b: Builtin): bool {
+  return match (b) {
+    BTask(k) => taskOpAdopts(k),
+    _ => false,
   };
 }
 
@@ -337,45 +334,92 @@ function handleMsg(f: MFunction, ins: Instr): string {
       if (localClass(f, d) == CHandle) {
         match (ins) {
           IBuiltin(_dst, b, _args) => {
-            if (!isOpenB(b)) {
-              return "IBuiltin: only BFileOpen and the BGrant* builtins may define a resource handle";
+            if (!isOpenB(b) && !isAdoptB(b)) {
+              return "IBuiltin: only BFileOpen, the BGrant* builtins and the task grant primitives (clone, adopt) may define a resource handle";
             }
           },
-          _ => { return "a resource handle is defined only by BFileOpen / BGrant* (it cannot be copied, moved, borrowed, read from a field or returned by a call)"; }
+          _ => {
+            return "a resource handle is defined only by BFileOpen / BGrant* (it cannot be copied, moved, borrowed, read from a field or returned by a call)";
+          },
         }
       }
     },
-    None => {}
+    None => {},
   }
   match (ins) {
     IBuiltin(dst, b, args) => {
-      if (isOpenB(b)) {
-        if (args.length == 0 || !isHandleOp(f, args[0])) { return "handle-opening builtin: the first argument must be the authorising resource handle (a grant)"; }
-        let k: usize = 1;
-        while (k < args.length) {
-          if (isHandleOp(f, args[k])) { return "handle-opening builtin: only the first argument can be a resource handle"; }
-          k += 1;
+      if (isAdoptB(b)) {
+        if (!noHandles(f, args)) {
+          return "grant adoption: its argument is a token, not a handle";
         }
         match (dst) {
-          Some(d) => { return localClass(f, d) == CHandle ? "" : "handle-opening builtin: the destination must be a handle local"; },
-          None => { return "handle-opening builtin: the handle must be bound to a local (it would never be closed)"; }
+          Some(d) => {
+            return localClass(f, d) == CHandle
+                ? ""
+                : "grant adoption: the destination must be a handle local";
+          },
+          None => {
+            return "grant adoption: the handle must be bound to a local (it would never be revoked)";
+          },
+        }
+      }
+      if (isOpenB(b)) {
+        if (args.length == 0 || !isHandleOp(f, args[0])) {
+          return "handle-opening builtin: the first argument must be the authorising resource handle (a grant)";
+        }
+        if (!noHandles(f, args.slice(1, args.length))) {
+          return "handle-opening builtin: only the first argument can be a resource handle";
+        }
+        match (dst) {
+          Some(d) => {
+            return localClass(f, d) == CHandle
+                ? ""
+                : "handle-opening builtin: the destination must be a handle local";
+          },
+          None => {
+            return "handle-opening builtin: the handle must be bound to a local (it would never be closed)";
+          },
         }
       }
       if (takesHandle(b)) {
-        if (args.length == 0 || !isHandleOp(f, args[0])) { return "file builtin: the first argument must be a resource handle"; }
-        let i: usize = 1;
-        while (i < args.length) {
-          if (isHandleOp(f, args[i])) { return "file builtin: only the first argument can be a resource handle"; }
-          i += 1;
+        if (args.length == 0 || !isHandleOp(f, args[0])) {
+          return "file builtin: the first argument must be a resource handle";
         }
-        return "";
+        return noHandles(f, args.slice(1, args.length))
+            ? ""
+            : "file builtin: only the first argument can be a resource handle";
       }
-      return noHandles(f, args) ? "" : "a resource handle can only be passed to calls and file builtins";
+      return noHandles(f, args)
+          ? ""
+          : "a resource handle can only be passed to calls and file builtins";
     },
-    _ => { return ""; }
+    _ => {
+      return "";
+    },
   }
 }
 
+// A resource handle is defined only by an opener builtin (BFileOpen, BGrant*, the net openers, grantClone) or by a
+// grant adoption (ADR-0017).
+export function handleDefOk(f: MFunction, ins: Instr): bool {
+  return match (dstOf(ins)) {
+    Some(d) => d >= f.locals.length || localClass(f, d) != CHandle || isOpener(ins),
+    None => true,
+  };
+}
+
+function isOpener(ins: Instr): bool {
+  return match (ins) {
+    IBuiltin(_dst, b, _args) => isOpenB(b) || isAdoptB(b),
+    _ => false,
+  };
+}
+
+// The first structural error of instruction `ins` of `f` ("" if none). A well-formed instruction mentions only locals,
+// strings, functions and vtables that exist (`instrInRange`), and only an opener defines a handle.
+@Requires(paramsWellFormed(f))
+@Ensures(result == "" ==> instrInRange(p, f.locals.length, ins))
+@Ensures(result == "" ==> handleDefOk(f, ins))
 export function wfInstr(p: MProgram, f: MFunction, ins: Instr): string {
   const base = wfInstrBase(p, f, ins);
   if (base != "") {
@@ -387,70 +431,122 @@ export function wfInstr(p: MProgram, f: MFunction, ins: Instr): string {
 function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
   return match (ins) {
     ICopy(d, o) => {
-      if (d >= f.locals.length || !opOk(p, f, o)) { return "ICopy: bad local or operand"; }
-      if (opClass(f, o) != localClass(f, d)) { return "ICopy: operand and destination classes differ"; }
-      if (localClass(f, d) == CHandle) { return "ICopy of a resource handle (handles are never copied)"; }
-      if (localClass(f, d) == CRef && !isStr(o)) { return "ICopy of a reference local (use IMove/IDup/IBorrow)"; }
+      if (d >= f.locals.length || !opOk(p, f, o)) {
+        return "ICopy: bad local or operand";
+      }
+      if (opClass(f, o) != localClass(f, d)) {
+        return "ICopy: operand and destination classes differ";
+      }
+      if (localClass(f, d) == CHandle) {
+        return "ICopy of a resource handle (handles are never copied)";
+      }
+      if (localClass(f, d) == CRef && !isStr(o)) {
+        return "ICopy of a reference local (use IMove/IDup/IBorrow)";
+      }
       return "";
     },
     IMove(d, s) => refPair(f, d, s) ? "" : "IMove: needs two distinct reference locals",
     IBorrow(d, s) => refPair(f, d, s) ? "" : "IBorrow: needs two distinct reference locals",
-    IDup(d, o) => (isCls(f, d, CRef) && opIs(p, f, o, CRef)) ? "" : "IDup: needs a reference destination and operand",
+    IDup(d, o) => isCls(f, d, CRef) && opIs(p, f, o, CRef)
+        ? ""
+        : "IDup: needs a reference destination and operand",
     IRelease(x) => isCls(f, x, CRef) ? "" : "IRelease: needs a reference local",
-    IUnary(d, op, o) => (d < f.locals.length && opOk(p, f, o) && unOk(f, op, d, o)) ? "" : "IUnary: operand class mismatch",
+    IUnary(d, op, o) => d < f.locals.length && opOk(p, f, o) && unOk(f, op, d, o)
+        ? ""
+        : "IUnary: operand class mismatch",
     IBinary(d, op, a, b) => {
-      if (d < f.locals.length && opOk(p, f, a) && opOk(p, f, b) && binOk(f, op, d, a, b)) { return ""; }
+      if (d < f.locals.length && opOk(p, f, a) && opOk(p, f, b) && binOk(f, op, d, a, b)) {
+        return "";
+      }
       return "IBinary: operand class mismatch";
     },
     ICall(dst, fi, args) => callMsg(p, f, dst, fi, args),
-    IBuiltin(dst, _, args) => (optDstOk(f, dst) && opsOk(p, f, args)) ? "" : "IBuiltin: bad local or operand",
+    IBuiltin(dst, _, args) => optDstOk(f, dst) && opsOk(p, f, args)
+        ? ""
+        : "IBuiltin: bad local or operand",
     IStrAppend(x, y) => {
-      if (!isCls(f, x, CRef) || !opIs(p, f, y, CRef)) { return "IStrAppend: needs reference operands"; }
+      if (!isCls(f, x, CRef) || !opIs(p, f, y, CRef)) {
+        return "IStrAppend: needs reference operands";
+      }
       return isLocal(y, x) ? "IStrAppend: appending a string to itself" : "";
     },
     IArrayExtend(x, y) => {
-      if (!isCls(f, x, CRef) || !refLocalOp(f, y)) { return "IArrayExtend: needs reference locals"; }
+      if (!isCls(f, x, CRef) || !refLocalOp(f, y)) {
+        return "IArrayExtend: needs reference locals";
+      }
       return isLocal(y, x) ? "IArrayExtend: extending an array by itself" : "";
     },
     IStructNew(d, _, slots) => {
-      if (isCls(f, d, CRef) && !noHandles(f, slots)) { return "IStructNew: a resource handle cannot be stored"; }
-      return (isCls(f, d, CRef) && opsOk(p, f, slots)) ? "" : "IStructNew: bad destination or slot operand";
+      if (isCls(f, d, CRef) && !noHandles(f, slots)) {
+        return "IStructNew: a resource handle cannot be stored";
+      }
+      return isCls(f, d, CRef) && opsOk(p, f, slots)
+          ? ""
+          : "IStructNew: bad destination or slot operand";
     },
     INullary(d, _) => isCls(f, d, CRef) ? "" : "INullary: destination must be a reference local",
-    ITag(d, o) => (isCls(f, d, CInt) && opIs(p, f, o, CRef)) ? "" : "ITag: needs an int destination and a reference operand",
-    IGetField(d, o, _) => (d < f.locals.length && refLocalOp(f, o)) ? "" : "IGetField: bad destination or object",
-    ISetField(x, _, v) => (isCls(f, x, CRef) && valueOk(p, f, x, v)) ? "" : "ISetField: bad object or value",
-    ITakeField(d, x, _) => refPair(f, d, x) ? "" : "ITakeField: needs two distinct reference locals",
+    ITag(d, o) => isCls(f, d, CInt) && opIs(p, f, o, CRef)
+        ? ""
+        : "ITag: needs an int destination and a reference operand",
+    IGetField(d, o, _) => d < f.locals.length && refLocalOp(f, o)
+        ? ""
+        : "IGetField: bad destination or object",
+    ISetField(x, _, v) => isCls(f, x, CRef) && valueOk(p, f, x, v)
+        ? ""
+        : "ISetField: bad object or value",
+    ITakeField(d, x, _) => refPair(f, d, x)
+        ? ""
+        : "ITakeField: needs two distinct reference locals",
     IPutField(x, _, s) => refPair(f, x, s) ? "" : "IPutField: needs two distinct reference locals",
     IMakeUnique(x) => isCls(f, x, CRef) ? "" : "IMakeUnique: needs a reference local",
-    IArrayNew(d, isRef, elems) => (isCls(f, d, CRef) && constsOk(p, f, elems, isRef)) ? "" : "IArrayNew: bad destination or element class",
-    IArrayGet(d, a, i) => (d < f.locals.length && refLocalOp(f, a) && opIs(p, f, i, CUsize)) ? "" : "IArrayGet: bad destination, array or index",
-    IArraySet(x, i, v) => (isCls(f, x, CRef) && opIs(p, f, i, CUsize) && valueOk(p, f, x, v)) ? "" : "IArraySet: bad array, index or value",
-    IArrayTake(d, x, i) => (refPair(f, d, x) && opIs(p, f, i, CUsize)) ? "" : "IArrayTake: bad destination, array or index",
-    IArrayPut(x, i, s) => (refPair(f, x, s) && opIs(p, f, i, CUsize)) ? "" : "IArrayPut: bad array, index or source",
-    IArrayPush(x, v) => (isCls(f, x, CRef) && valueOk(p, f, x, v)) ? "" : "IArrayPush: bad array or value",
+    IArrayNew(d, isRef, elems) => isCls(f, d, CRef) && constsOk(p, f, elems, isRef)
+        ? ""
+        : "IArrayNew: bad destination or element class",
+    IArrayGet(d, a, i) => d < f.locals.length && refLocalOp(f, a) && opIs(p, f, i, CUsize)
+        ? ""
+        : "IArrayGet: bad destination, array or index",
+    IArraySet(x, i, v) => isCls(f, x, CRef) && opIs(p, f, i, CUsize) && valueOk(p, f, x, v)
+        ? ""
+        : "IArraySet: bad array, index or value",
+    IArrayTake(d, x, i) => refPair(f, d, x) && opIs(p, f, i, CUsize)
+        ? ""
+        : "IArrayTake: bad destination, array or index",
+    IArrayPut(x, i, s) => refPair(f, x, s) && opIs(p, f, i, CUsize)
+        ? ""
+        : "IArrayPut: bad array, index or source",
+    IArrayPush(x, v) => isCls(f, x, CRef) && valueOk(p, f, x, v)
+        ? ""
+        : "IArrayPush: bad array or value",
     IArrayPop(d, x) => refPair(f, d, x) ? "" : "IArrayPop: needs two distinct reference locals",
     IClosure(d, fi, caps) => closureMsg(p, f, d, fi, caps),
     ICallIndirect(dst, c, args) => {
-      if (!optDstOk(f, dst) || !opsOk(p, f, args)) { return "ICallIndirect: bad destination or argument"; }
+      if (!optDstOk(f, dst) || !opsOk(p, f, args)) {
+        return "ICallIndirect: bad destination or argument";
+      }
       return refLocalOp(f, c) ? "" : "ICallIndirect: the callee must be a reference local";
     },
     IIface(d, vt, v) => {
-      if (!isCls(f, d, CRef)) { return "IIface: the destination must be a reference local"; }
-      if (vt >= p.vtables.length) { return "IIface: vtable index out of range"; }
+      if (!isCls(f, d, CRef)) {
+        return "IIface: the destination must be a reference local";
+      }
+      if (vt >= p.vtables.length) {
+        return "IIface: vtable index out of range";
+      }
       return opIs(p, f, v, CRef) ? "" : "IIface: the boxed value must be a reference operand";
     },
     ICallVirtual(dst, c, _, args) => {
-      if (!optDstOk(f, dst) || !opsOk(p, f, args)) { return "ICallVirtual: bad destination or argument"; }
+      if (!optDstOk(f, dst) || !opsOk(p, f, args)) {
+        return "ICallVirtual: bad destination or argument";
+      }
       return refLocalOp(f, c) ? "" : "ICallVirtual: the interface value must be a reference local";
-    }
+    },
   };
 }
 
 function isStr(o: Operand): bool {
   return match (o) {
     OStr(_) => true,
-    _ => false
+    _ => false,
   };
 }
 
@@ -459,23 +555,25 @@ function targetOk(f: MFunction, t: usize): bool {
 }
 
 function casesOk(f: MFunction, cs: SwitchCase[]): bool {
-  for (const c of cs) {
-    if (!targetOk(f, c.target)) {
-      return false;
-    }
-  }
-  return true;
+  return cs.every(c => targetOk(f, c.target));
 }
 
+// The first structural error of terminator `t` of `f` ("" if none): a well-formed terminator branches only to blocks
+// of `f` and reads only locals and strings that exist (`termInRange`).
+@Ensures(result == "" ==> termInRange(p, f, t))
 export function wfTerm(p: MProgram, f: MFunction, t: Terminator): string {
   return match (t) {
     TGoto(b) => targetOk(f, b) ? "" : "TGoto: block index out of range",
     TBranch(o, a, b) => {
-      if (!targetOk(f, a) || !targetOk(f, b)) { return "TBranch: block index out of range"; }
+      if (!targetOk(f, a) || !targetOk(f, b)) {
+        return "TBranch: block index out of range";
+      }
       return opIs(p, f, o, CBool) ? "" : "TBranch: condition must be a bool operand";
     },
     TSwitch(o, cs, d) => {
-      if (!targetOk(f, d) || !casesOk(f, cs)) { return "TSwitch: block index out of range"; }
+      if (!targetOk(f, d) || !casesOk(f, cs)) {
+        return "TSwitch: block index out of range";
+      }
       return opIs(p, f, o, CInt) ? "" : "TSwitch: scrutinee must be an int operand";
     },
     TReturn(r) => {
@@ -483,29 +581,53 @@ export function wfTerm(p: MProgram, f: MFunction, t: Terminator): string {
       return match (r) {
         None => rc == CVoid ? "" : "TReturn without a value in a non-void function",
         Some(o) => {
-          if (rc == CVoid) { return "TReturn with a value in a void function"; }
+          if (rc == CVoid) {
+            return "TReturn with a value in a void function";
+          }
           return opIs(p, f, o, rc) ? "" : "TReturn: value class does not match the return type";
-        }
+        },
       };
     },
-    TTrap(_) => ""
+    TTrap(_) => "",
   };
 }
 
-// Function-level checks (first error, "" if fine).
+// Function-level checks (first error, "" if fine). A function that passes has a consistent parameter table, an entry
+// block and one span per instruction (the spans are where the issues are reported: a block with fewer spans than
+// instructions is rejected here instead of failing the report).
+@Ensures(result == "" ==> paramsWellFormed(f) && f.blocks.length > 0 && spansAligned(f.blocks))
+@Ensures(result == "" ==> f.locals.every(l => tyClass(l.ty) != CVoid))
 export function wfFunction(f: MFunction): string {
-  if (f.paramCount > f.locals.length) { return "paramCount exceeds the number of locals"; }
-  if (f.paramOwned.length != f.paramCount) { return "paramOwned length differs from paramCount"; }
+  if (f.paramCount > f.locals.length) {
+    return "paramCount exceeds the number of locals";
+  }
+  if (f.paramOwned.length != f.paramCount) {
+    return "paramOwned length differs from paramCount";
+  }
   let i: usize = 0;
   while (i < f.paramCount) {
-    if (f.paramOwned[i] && tyClass(f.locals[i].ty) != CRef) { return "owned parameter `" + f.locals[i].name + "` is not a reference"; }
+    if (f.paramOwned[i] && tyClass(f.locals[i].ty) != CRef) {
+      return "owned parameter `" + f.locals[i].name + "` is not a reference";
+    }
     i += 1;
   }
-  if (f.inout && (f.paramCount == 0 || !f.paramOwned[0])) { return "inout function: parameter 0 must be an owned reference parameter (v1.10)"; }
-  if (tyClass(f.ret) == CHandle) { return "function returns a resource handle (a handle cannot be returned)"; }
-  if (f.blocks.length == 0) { return "function has no blocks"; }
-  for (const l of f.locals) {
-    if (tyClass(l.ty) == CVoid) { return "local `" + l.name + "` has type void"; }
+  if (f.inout && (f.paramCount == 0 || !f.paramOwned[0])) {
+    return "inout function: parameter 0 must be an owned reference parameter (v1.10)";
+  }
+  if (tyClass(f.ret) == CHandle) {
+    return "function returns a resource handle (a handle cannot be returned)";
+  }
+  if (f.blocks.length == 0) {
+    return "function has no blocks";
+  }
+  match (f.locals.find(l => tyClass(l.ty) == CVoid)) {
+    Some(l) => {
+      return "local `" + l.name + "` has type void";
+    },
+    None => {},
+  }
+  if (!spansAligned(f.blocks)) {
+    return "a block has a different number of source spans and instructions";
   }
   return "";
 }

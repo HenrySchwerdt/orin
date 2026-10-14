@@ -184,28 +184,39 @@ def run(exe):
         want = pos_of(bad_syntax, ";", 0)
         check(d[0]["range"]["start"]["line"] == want["line"] == 1, "syntax error: reported on line 2 (%r)" % (d[0]["range"],))
         check(d[0]["range"]["start"]["character"] == want["character"], "syntax error: column of the `;` (%r vs %r)" % (d[0]["range"], want))
+    check(d is not None and len(d) == 1, "one syntax error: one diagnostic (got %r)" % (d,))
+
+    # Parser error recovery: every syntax error of the file, in order, and no type error (the checker does not run).
+    multi = bad_syntax.replace("console.log(add(1, 2).toString());", "let x = ;\n  console.log(add(1, 2).toString())\n  return true;")
+    change_doc(c, solo, multi, 3)
+    d = sync(c, uri_of(solo))
+    check(d is not None and [x["code"] for x in d] == ["E0200", "E0200", "E0200"],
+          "three syntax errors: three E0200 diagnostics (got %r)" % (d,))
+    if d and len(d) == 3:
+        check([x["range"]["start"]["line"] for x in d] == [1, 5, 7], "syntax errors on lines 2, 6, 8 (%r)" % (d,))
+        check(d[2]["message"] == "expected `;`, found `return`", "third message (%r)" % (d[2],))
 
     bad_type = good.replace("return a + b;", "return true;")
-    change_doc(c, solo, bad_type, 3)
+    change_doc(c, solo, bad_type, 4)
     d = sync(c, uri_of(solo))
     check(d is not None and len(d) >= 1 and d[0]["code"] == "E0400", "type error: E0400 (got %r)" % (d,))
     if d:
         check(d[0]["range"]["start"]["line"] == 1, "type error: on line 2 (%r)" % (d[0]["range"],))
 
-    change_doc(c, solo, good, 4)
+    change_doc(c, solo, good, 5)
     d = sync(c, uri_of(solo))
     check(d == [], "fixed file: diagnostics cleared (got %r)" % (d,))
 
     # ---- formatting ---------------------------------------------------------------------------
     ugly = "function   add(a:int,b:int):int{return a+b;}\nfunction main():void{console.log(add(1,2).toString());}\n"
-    change_doc(c, solo, ugly, 5)
+    change_doc(c, solo, ugly, 6)
     r = c.request("textDocument/formatting", {"textDocument": {"uri": uri_of(solo)},
                                               "options": {"tabSize": 2, "insertSpaces": True}})
     edits = r.get("result")
     check(isinstance(edits, list) and len(edits) == 1, "formatting: one edit (got %r)" % (r,))
     if edits:
         check(edits[0]["newText"].startswith("function add(a: int, b: int): int {"), "formatting: canonical text (%r)" % edits[0]["newText"][:60])
-    change_doc(c, solo, good, 6)
+    change_doc(c, solo, good, 7)
 
     # ---- completion --------------------------------------------------------------------------
     comp_text = "function helper(): int {\n  return 1;\n}\n\nfunction main(): void {\n  const total = helper();\n  const other = 2;\n  console.log(total.toString());\n}\n"
