@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Mutation check for the provable std modules (ADR-0030 §3, ADR-0028).
 
-Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http}.or. The module and its
+Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http,text}.or. The module and its
 test file are copied to build/mutate_std/, the std imports are rewritten to relative ones, the mutation is applied and
 `orin test` is run twice: with runtime contract checking (the default) and with `--no-contracts`. A mutant is
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
 
-Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http] [--list]
+Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http|text] [--list]
 Exit status 1 if any mutant survives (is not killed with contracts on).
 """
 import argparse
@@ -130,6 +130,15 @@ MUTANTS = [
     ("http", "request-ctor-skips-validation", "    enforce(requestProblem(method, target, version, headers, body, trailers) == \"\", \"invalid Request\");", "", "http_request_ctor_rejects_invalid"),
     ("http", "response-ctor-skips-validation", "    enforce(responseProblem(status, version, headers, body, trailers, forHead) == \"\", \"invalid Response\");", "", "http_response_ctor_rejects_204_body"),
     ("http", "limits-ctor-skips-validation", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, \"invalid Limits\");", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776 || true, \"invalid Limits\");", "http_limits_ctor_rejects_zero"),
+    # ---- std:text
+    ("text", "dedent-last-indent-wins", "      common = found ? commonPrefix(common, ind) : ind;", "      common = ind;"),
+    ("text", "dedent-width-not-prefix", "  while (i < a.length && i < b.length && a.charCodeAt(i) == b.charCodeAt(i)) {", "  while (i < a.length && i < b.length) {"),
+    ("text", "cr-not-blank", "    if (c != 32 && c != 9 && c != 13) {\n      return false;", "    if (c != 32 && c != 9) {\n      return false;"),
+    ("text", "crlf-gives-two-newlines", "      if (i + 1 < text.length && text.charCodeAt(i + 1) == 10) {\n        i += 1;\n      }", "      if (i + 1 < text.length && text.charCodeAt(i + 1) == 10) {\n      }"),
+    ("text", "indent-empty-lines", "line.length == 0 ? \"\" : prefix + line", "prefix + line"),
+    ("text", "trim-keeps-trailing-blank", "  while (last > first && isBlankLine(lines[last - 1])) {", "  while (last > lines.length && isBlankLine(lines[last - 1])) {"),
+    ("text", "trim-keeps-leading-blank", "  while (first < lines.length && isBlankLine(lines[first])) {", "  while (first > lines.length && isBlankLine(lines[first])) {"),
+
 ]
 
 # further test files of a module that also run against every mutant
@@ -164,7 +173,7 @@ def main():
     orinc = os.path.join(ROOT, a.orinc)
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
-    mods = ["bytes", "utf8", "collections", "http"]
+    mods = ["bytes", "utf8", "collections", "http", "text"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     survivors = 0
     rows = []

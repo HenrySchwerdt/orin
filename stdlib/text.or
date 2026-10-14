@@ -4,8 +4,10 @@
 // Unicode code points. Whitespace in this module means ASCII SP, TAB or CR.
 // UTF-8 data is preserved byte-for-byte; Unicode segmentation belongs in std:utf8.
 // No platform calls, no additional trusted code, no runtime reflection.
+// Every function is total (never traps) and O(n) in the size of its input and output.
 
-function blankLine(line: string): bool {
+// True when `line` consists only of ASCII SP, TAB and CR (the empty line included).
+export function isBlankLine(line: string): bool {
   let i: usize = 0;
   while (i < line.length) {
     const c = line.charCodeAt(i);
@@ -17,7 +19,9 @@ function blankLine(line: string): bool {
   return true;
 }
 
-function indentation(line: string): usize {
+// The leading run of ASCII SP / TAB of `line`, as a string (the indentation itself, not its width).
+@Ensures(result.length <= line.length && line.startsWith(result))
+export function leadingIndent(line: string): string {
   let i: usize = 0;
   while (i < line.length) {
     const c = line.charCodeAt(i);
@@ -26,78 +30,77 @@ function indentation(line: string): usize {
     }
     i += 1;
   }
-  return i;
+  return line.substring(0, i);
+}
+
+// The longest common prefix of `a` and `b`, byte by byte.
+@Ensures(a.startsWith(result) && b.startsWith(result))
+function commonPrefix(a: string, b: string): string {
+  let i: usize = 0;
+  while (i < a.length && i < b.length && a.charCodeAt(i) == b.charCodeAt(i)) {
+    i += 1;
+  }
+  return a.substring(0, i);
 }
 
 // trimBlankLines: removes outer whitespace-only lines, retaining internal blank lines.
-// An empty or whitespace-only input produces "". O(n) time and space.
+// An empty or whitespace-only input produces "". The line break after the last kept line is removed.
 @Ensures(result.length <= text.length)
+@Ensures(result.length == 0 || !isBlankLine(result.split("\n")[0]))
+@Ensures(result.length == 0 || !isBlankLine(result.split("\n")[result.split("\n").length - 1]))
 export function trimBlankLines(text: string): string {
   const lines = text.split("\n");
   let first: usize = 0;
-  while (first < lines.length && blankLine(lines[first])) {
+  while (first < lines.length && isBlankLine(lines[first])) {
     first += 1;
   }
   let last = lines.length;
-  while (last > first && blankLine(lines[last - 1])) {
+  while (last > first && isBlankLine(lines[last - 1])) {
     last -= 1;
   }
-  let kept: string[] = [];
-  let i = first;
-  while (i < last) {
-    kept.push(lines[i]);
-    i += 1;
-  }
-  return kept.join("\n");
+  return lines.slice(first, last).join("\n");
 }
 
-// dedent: removes the longest common ASCII-space/tab indentation from nonblank lines.
-// Blank lines become empty; a trailing newline is preserved. O(n) time and space.
+// dedent: removes the longest common indentation *prefix* (the same sequence of SP / TAB bytes, as in
+// Python's textwrap.dedent) from every nonblank line. A tab and a space never match, so "\tfoo\n  bar"
+// has no common indentation and is returned unchanged. Blank lines become empty; the number of lines,
+// and therefore a trailing newline, is preserved.
 @Ensures(result.length <= text.length)
+@Ensures(result.split("\n").length == text.split("\n").length)
 export function dedent(text: string): string {
   const lines = text.split("\n");
-  let common = text.length;
+  let common = "";
   let found = false;
   for (const line of lines) {
-    if (!blankLine(line)) {
-      const width = indentation(line);
-      if (!found || width < common) {
-        common = width;
-      }
+    if (!isBlankLine(line)) {
+      const ind = leadingIndent(line);
+      common = found ? commonPrefix(common, ind) : ind;
       found = true;
     }
   }
   if (!found) {
     return text;
   }
-  let out: string[] = [];
-  for (const line of lines) {
-    if (blankLine(line)) {
-      out.push("");
-    } else {
-      out.push(line.substring(common, line.length));
-    }
-  }
-  return out.join("\n");
+  return lines.map(line => isBlankLine(line) ? "" : line.substring(common.length, line.length)).join("\n");
 }
 
-// indentLines: prefix each non-empty line; empty lines and a trailing newline stay empty.
-// The prefix may be any byte string. O(n + number_of_lines * prefix.length).
+// indentLines: prefixes each non-empty line with `prefix`; empty lines (and so a trailing newline) stay
+// empty. The prefix may be any byte string. O(n + number_of_lines * prefix.length).
 @Ensures(result.length >= text.length)
+@Ensures(prefix.length == 0 ==> result == text)
+@Ensures(result.split("\n").length == text.split("\n").length)
 export function indentLines(text: string, prefix: string): string {
   if (text.length == 0 || prefix.length == 0) {
     return text;
   }
-  let out: string[] = [];
-  for (const line of text.split("\n")) {
-    out.push(line.length == 0 ? "" : prefix + line);
-  }
-  return out.join("\n");
+  return text.split("\n").map(line => line.length == 0 ? "" : prefix + line).join("\n");
 }
 
-// normalizeNewlines: convert CRLF and lone CR to LF without touching other bytes.
-// This is deliberately not a Unicode normalization operation. O(n) time and space.
+// normalizeNewlines: converts CRLF and a lone CR to LF without touching other bytes.
+// This is deliberately not a Unicode normalization operation.
 @Ensures(result.length <= text.length)
+@Ensures(result.indexOf("\r").isNone())
+@Ensures(text.indexOf("\r").isNone() ==> result == text)
 export function normalizeNewlines(text: string): string {
   let parts: string[] = [];
   let start: usize = 0;
