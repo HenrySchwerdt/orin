@@ -17,7 +17,7 @@ import {
 import { Gen, SortR, sortOf, opaqueSort } from "./gen";
 import {
   Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
-  andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, symName, fresh, freshFree, typeFact, arrLen, arrData, arrMk, arrSel, inBounds,
+  andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
   isSomeT, isOkT, recField, mapHas, mapSize, clausesOfList, exprOf, isThisExpr, Fresh
 } from "./ctx";
 
@@ -546,6 +546,16 @@ function isUserFn(cx: Cx, name: string): bool {
   return cx.p.fnCount.get(name).unwrapOr(0) > 0;
 }
 
+// Is the unique function called `name` the one of `std:seq` (stdlib/seq.or)? Its calls are axiomatised, not
+// executed: `sum`, `sumBy` as recursive sums, `range(a, b).every` as a bounded quantifier.
+function isSeqFn(cx: Cx, name: string): bool {
+  if (cx.p.fnCount.get(name).unwrapOr(0) != 1) {
+    return false;
+  }
+  const i = cx.p.fnIx.get(name);
+  return i.isSome() && cx.p.fns[i.unwrap()].unit == "$stdlib/seq";
+}
+
 function calleeCx(cx: Cx, f: Fn): Cx {
   return Cx { p: cx.p, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: f.text };
 }
@@ -586,7 +596,7 @@ function trNamedCall(g0: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e
       _ => Err("cannot infer the type of `" + name + "(..)` here")
     };
   }
-  if (!isUserFn(cx, name)) {
+  if (isSeqFn(cx, name)) {
     const pre = trPrelude(g, vars, cx, name, args, e, exp);
     if (pre.isSome()) {
       return pre.unwrap();
@@ -610,23 +620,14 @@ function trNamedCall(g0: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e
   return callFn(g, vars, cx, f, None, args, e, exp);
 }
 
-// A call of a function that is neither user-defined nor a constructor: the prelude's array combinators in their
-// function form (`every(xs, p)`, `sum(xs)`, `range(a, b)`).
+// A call of a `std:seq` function (isSeqFn): `sum(xs)`, `sumBy(xs, f)`. (`range` is read where it is the receiver of
+// `every` / `some`.) None for any other name: the call is then an ordinary one.
 function trPrelude(g: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e: Expr, exp: VT): Option<Result<TR, string>> {
-  if ((name == "every" || name == "some") && args.length == 2) {
-    return Some(trQuant(g, vars, cx, args[0], name == "every", args[1], e));
-  }
   if (name == "sum" && args.length == 1) {
     return Some(trSum(g, vars, cx, args[0], None, e));
   }
   if (name == "sumBy" && args.length == 2) {
     return Some(trSum(g, vars, cx, args[0], Some(args[1]), e));
-  }
-  if (name == "map" && args.length == 2) {
-    return Some(trMapArr(g, vars, cx, args[0], args[1], e));
-  }
-  if (name == "filter" && args.length == 2) {
-    return Some(trFilterArr(g, vars, cx, args[0], args[1], e));
   }
   const none: Option<Result<TR, string>> = None;
   return none;
@@ -687,7 +688,7 @@ function trMethodCall(g0: Gen, vars: Var[], cx: Cx, recvE: Expr, name: string, a
 function isRangeCall(cx: Cx, e: Expr): bool {
   return match (e.kind) {
     ECall(c, args) => match (c.kind) {
-      EIdent(id) => id.name == "range" && args.length == 2 && !isUserFn(cx, "range"),
+      EIdent(id) => id.name == "range" && args.length == 2 && isSeqFn(cx, "range"),
       _ => false
     },
     _ => false
@@ -1159,9 +1160,10 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
         }
       }
       resTerm = allTerms.length == 0 ? fname : "(" + fname + " " + allTerms.join(" ") + ")";
-      const tf = typeFact(rty, resTerm);
-      if (tf.isSome()) {
-        g.assert(tf.unwrap());
+      const wf = wfOf(g, cx, resTerm, rty, 0)?;
+      g = wf.g;
+      if (wf.f != "") {
+        g.assert(wf.f);
       }
     } else {
       if (cx.inQ) {

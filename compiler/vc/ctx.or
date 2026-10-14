@@ -9,7 +9,7 @@ import {
   ECall, EUnary, EBinary, ECond, EMember, EIndex, EIdent, EThis, EMatch, BExpr, BBlock,
   CRequires, CEnsures, CInvariant, CDecreases, CRule
 } from "../syntax";
-import { VT, VInt, VBad, VRec, intLo, intHi, resolveTy, RecDef, Tab, fieldIndex } from "./vt";
+import { VT, VInt, VBad, VArr, VOpt, VRes, VMap, VRec, intLo, intHi, resolveTy, RecDef, Tab, fieldIndex } from "./vt";
 import { Gen, SortR, sortOf } from "./gen";
 
 export const I64_MIN: string = "(- 9223372036854775808)";
@@ -246,16 +246,108 @@ export function typeFact(vt: VT, term: string): Option<string> {
   };
 }
 
-// A fresh unconstrained constant of the type (constrained only by what every value of the type satisfies).
+// Well-formedness of a value of a type: what every real value satisfies but a datatype value does not (a length is
+// not negative, a fixed-width integer is in its range, a map's size agrees with its members). The sorts are free
+// datatypes, so these are facts about the *values that arise* (parameters, fresh values, results of calls), never
+// axioms over all values: an axiom `forall a. len(a) >= 0` would contradict the freeness of the datatype.
+// Bounded in depth: a missing fact only makes a proof harder.
+export type WF = { g: Gen; f: string; };
+
+export function wfOf(g0: Gen, cx: Cx, term: string, vt: VT, depth: usize): Result<WF, string> {
+  let g = g0;
+  if (depth > 4) {
+    return Ok(WF { g: g, f: "" });
+  }
+  return match (vt) {
+    VInt(k) => Ok(WF { g: g, f: k == "?" ? "" : inKind(k, term) }),
+    VArr(e) => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      let parts: string[] = ["(>= " + arrLen(so.s, term) + " 0)"];
+      const q = g.next("w");
+      const inner = wfOf(g, cx, arrSel(so.s, term, q), e, depth + 1)?;
+      g = inner.g;
+      if (inner.f != "") {
+        parts.push("(forall ((" + q + " Int)) (=> " + inBounds(so.s, term, q) + " " + inner.f + "))");
+      }
+      return Ok(WF { g: g, f: andAll(parts) });
+    },
+    VOpt(e) => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      const inner = wfOf(g, cx, "(val" + so.s + " " + term + ")", e, depth + 1)?;
+      g = inner.g;
+      return Ok(WF { g: g, f: inner.f == "" ? "" : "(=> " + isSomeT(so.s, term) + " " + inner.f + ")" });
+    },
+    VRes(a, b) => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      const ia = wfOf(g, cx, "(okv" + so.s + " " + term + ")", a, depth + 1)?;
+      g = ia.g;
+      const ib = wfOf(g, cx, "(errv" + so.s + " " + term + ")", b, depth + 1)?;
+      g = ib.g;
+      let parts: string[] = [];
+      if (ia.f != "") {
+        parts.push("(=> " + isOkT(so.s, term) + " " + ia.f + ")");
+      }
+      if (ib.f != "") {
+        parts.push("(=> (not " + isOkT(so.s, term) + ") " + ib.f + ")");
+      }
+      return Ok(WF { g: g, f: parts.length == 0 ? "" : andAll(parts) });
+    },
+    VMap(k, v) => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      const ks = sortS(g, cx, k)?;
+      g = ks.g;
+      const q = g.next("w");
+      return Ok(WF { g: g, f: "(and (>= " + mapSize(so.s, term) + " 0) (forall ((" + q + " " + ks.s + ")) (=> " + mapHas(so.s, term, q) + " (>= " + mapSize(so.s, term) + " 1))))" });
+    },
+    VRec(rn) => {
+      const rd = cx.p.tab.findRec(rn);
+      if (rd.isNone() || cx.p.tab.isCyclic("r:" + rn)) {
+        return Ok(WF { g: g, f: "" });
+      }
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      let parts: string[] = [];
+      const d = rd.unwrap();
+      let i: usize = 0;
+      while (i < d.fields.length) {
+        const ft = resolveTy(cx.p.tab, d.ftys[i]);
+        if (!isBadT(ft)) {
+          const inner = wfOf(g, cx, recField(so.s, d.fields[i], term), ft, depth + 1)?;
+          g = inner.g;
+          if (inner.f != "") {
+            parts.push(inner.f);
+          }
+        }
+        i += 1;
+      }
+      return Ok(WF { g: g, f: parts.length == 0 ? "" : andAll(parts) });
+    },
+    _ => Ok(WF { g: g, f: "" })
+  };
+}
+
+function isBadT(t: VT): bool {
+  return match (t) {
+    VBad(_) => true,
+    _ => false
+  };
+}
+
+// A fresh unconstrained constant of the type, constrained only by its well-formedness.
 export function freshFree(g0: Gen, cx: Cx, vt: VT): Result<Fresh, string> {
   let g = g0;
   const so = sortS(g, cx, vt)?;
   g = so.g;
   const name = g.next("c");
   g.declare("(declare-const " + name + " " + so.s + ")");
-  const f = typeFact(vt, name);
-  if (f.isSome()) {
-    g.assert(f.unwrap());
+  const w = wfOf(g, cx, name, vt, 0)?;
+  g = w.g;
+  if (w.f != "") {
+    g.assert(w.f);
   }
   return Ok(Fresh { g: g, name: name });
 }

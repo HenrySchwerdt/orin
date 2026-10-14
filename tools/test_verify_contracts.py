@@ -95,8 +95,10 @@ def main():
                 check(x["action"] == "NEEDS_DECISION" and x["question"] and len(x["options"]) >= 2, "%s: REFUTED needs a question" % rel)
                 for o in x["options"]:
                     check(set(o) == {"edit", "changes_spec", "widens_authority"}, "%s: option keys %r" % (rel, o))
-                check(any(o["widens_authority"] for o in x["options"]) and any(not o["changes_spec"] for o in x["options"]),
-                      "%s: options must include a code fix and a weakening" % rel)
+                # a violated contract can be weakened (the spec side); an index or unwrap that can fail has no clause to weaken
+                weak = x["kind"] in ("ensures", "invariant")
+                check(any(not o["changes_spec"] for o in x["options"]) and (not weak or any(o["widens_authority"] for o in x["options"])),
+                      "%s: options must include a code fix%s" % (rel, " and a weakening" if weak else ""))
                 check(x["evidence"]["counterexample"] == x["counterexample"], "%s: evidence" % rel)
         s = rep["summary"]
         check(s["refuted"] == sum(1 for x in rep["results"] if x["status"] == "REFUTED"), "%s: summary" % rel)
