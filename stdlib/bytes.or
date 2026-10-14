@@ -165,6 +165,21 @@ export class Bytes {
     return this.data.slice(this.start, this.start + this.len);
   }
 
+  // storage(): the array the view reads, without a copy: byte i of the view is `storage()[storageStart() + i]`. For
+  // byte loops that would otherwise call `at` per byte (a call and a reference count each) or copy with `toArray`.
+  // Arrays are values, so the caller cannot change the view through it. O(1).
+  @Ensures(result.length >= this.start + this.len)
+  @Ensures(this.len > 0 ==> result[this.start] == this.at(0) && result[this.start + this.len - 1] == this.at(this.len - 1))
+  storage(): u8[] {
+    return this.data;
+  }
+
+  // storageStart(): the index in `storage()` of the first byte of the view. O(1).
+  @Ensures(result == this.start && result + this.len <= this.storage().length)
+  storageStart(): usize {
+    return this.start;
+  }
+
   // toRawString(): the same bytes as a string. No validation: the string holds arbitrary bytes (use
   // `std:utf8` to get text). Inverse of `bytesFromString`. O(n).
   @Ensures(result.length == this.len)
@@ -175,15 +190,15 @@ export class Bytes {
   // toHex(): lower-case hexadecimal, two digits per byte. O(n).
   @Ensures(result.length == 2 * this.len)
   toHex(): string {
-    let parts: string[] = [];
+    let out = "";
     let i: usize = 0;
     while (i < this.len) {
       const b = this.data[this.start + i].toInt();
-      parts.push(hexDigit(b / 16));
-      parts.push(hexDigit(b % 16));
+      out += hexDigit(b / 16);
+      out += hexDigit(b % 16);
       i += 1;
     }
-    return parts.join("");
+    return out;
   }
 }
 
@@ -262,6 +277,9 @@ export function bytesFromHex(s: string): Option<Bytes> {
 }
 
 // ----------------------------------------------------------------------------------------- ByteBuilder
+
+// Strings up to this length are appended by `ByteBuilder.appendString` byte by byte; longer ones in one block.
+const SHORT_STRING: usize = 64;
 
 // A growable byte buffer. `capacity` is bookkeeping for `reserve` (the runtime has no array reserve: the array
 // still grows geometrically on `push`); the invariant ties it to the length.
@@ -359,21 +377,43 @@ export class ByteBuilder {
     this.grew();
   }
 
-  // appendBytes(b): all bytes of `b`. O(b.length()).
+  // appendBytes(b): all bytes of `b`. O(b.length()). A view of a whole array is appended in one step (the buffer is
+  // extended in place); a partial view is copied from its storage in a plain loop: no call and no reference count per
+  // byte, no temporary array.
   @Ensures(this.length() == old(this.length()) + b.length())
+  @Ensures(b.length() > 0 ==> this.byteAt(this.length() - b.length()) == b.at(0))
+  @Ensures(b.length() > 0 ==> this.byteAt(this.length() - 1) == b.at(b.length() - 1))
   appendBytes(b: Bytes): void {
-    let i: usize = 0;
-    while (i < b.length()) {
-      this.data.push(b.at(i));
-      i += 1;
+    const src = b.storage();
+    const s0 = b.storageStart();
+    const n = b.length();
+    if (s0 == 0 && n == src.length) {
+      this.data = this.data.concat(src);
+    } else {
+      let i: usize = 0;
+      while (i < n) {
+        this.data.push(src[s0 + i]);
+        i += 1;
+      }
     }
     this.grew();
   }
 
-  // appendString(s): the bytes of `s` (no encoding step). O(s.length).
+  // appendString(s): the bytes of `s` (no encoding step). O(s.length). A short string is appended byte by byte (no
+  // temporary array); a long one through one temporary array and an in-place extension.
   @Ensures(this.length() == old(this.length()) + s.length)
+  @Ensures(s.length > 0 ==> this.byteAt(this.length() - s.length).toInt() == s.charCodeAt(0))
+  @Ensures(s.length > 0 ==> this.byteAt(this.length() - 1).toInt() == s.charCodeAt(s.length - 1))
   appendString(s: string): void {
-    this.data = this.data.concat(stringToBytes(s));
+    if (s.length <= SHORT_STRING) {
+      let i: usize = 0;
+      while (i < s.length) {
+        this.data.push(s.charCodeAt(i).toU8());
+        i += 1;
+      }
+    } else {
+      this.data = this.data.concat(stringToBytes(s));
+    }
     this.grew();
   }
 

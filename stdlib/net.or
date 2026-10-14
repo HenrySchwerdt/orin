@@ -368,11 +368,14 @@ function recvFailure(code: int): RecvResult {
 // 65536 bytes of `data`; Ok(n) with 0 <= n <= min(length, 65536) (a partial write is normal), Err otherwise (isTimeout,
 // isReset: the peer is gone). `sendAll` loops.
 export function send(s: Stream, data: Bytes, timeoutMs: int): Result<usize, NetError> {
-  return sendFrom(s, data.toArray(), 0, timeoutMs);
+  const start = data.storageStart();
+  return sendFrom(s, data.storage(), start, start + data.length(), timeoutMs);
 }
 
-function sendFrom(s: Stream, arr: u8[], off: usize, timeoutMs: int): Result<usize, NetError> {
-  const r = netSend(s, arr, off, arr.length - off, clampMs(timeoutMs));
+// One attempt to send arr[off, end) (the bytes of a `Bytes` read from its storage, without a copy).
+@Requires(off <= end && end <= arr.length)
+function sendFrom(s: Stream, arr: u8[], off: usize, end: usize, timeoutMs: int): Result<usize, NetError> {
+  const r = netSend(s, arr, off, end - off, clampMs(timeoutMs));
   return match (r) {
     Ok(n) => Ok(n),
     Err(code) => Err(makeError(code))
@@ -380,17 +383,19 @@ function sendFrom(s: Stream, arr: u8[], off: usize, timeoutMs: int): Result<usiz
 }
 
 // sendAll(s, data, timeoutMs): sends all of `data`, resending the tail after partial writes; timeoutMs is a deadline for
-// the whole call. Err(timeout) if the peer does not read fast enough, Err(reset) if it is gone. O(length) copying.
+// the whole call. Err(timeout) if the peer does not read fast enough, Err(reset) if it is gone. O(length); `data` itself
+// is not copied.
 export function sendAll(s: Stream, data: Bytes, timeoutMs: int): Result<void, NetError> {
-  const arr = data.toArray();
+  const arr = data.storage();
+  const end = data.storageStart() + data.length();
   const deadline = netNow(s) + clampMs(timeoutMs);
-  let off: usize = 0;
-  while (off < arr.length) {
+  let off = data.storageStart();
+  while (off < end) {
     const left = deadline - netNow(s);
     if (left <= 0) {
       return Err(makeError(CODE_TIMEOUT));
     }
-    const r = sendFrom(s, arr, off, left > MAX_MS ? MAX_MS : left);
+    const r = sendFrom(s, arr, off, end, left > MAX_MS ? MAX_MS : left);
     match (r) {
       Ok(n) => {
         if (n == 0) {
