@@ -1,27 +1,47 @@
 #!/bin/sh
 # Tooling unit tests (JSON, analysis, LSP handler) built with the self-hosted compiler.
+# Usage: tools/test_tooling.sh [-j N]
+#   The cases below are independent and run in parallel (-j N, default: $ORIN_JOBS, else the CPU count); their output is
+#   printed in the listed order and the run stops at the first failing case in that order, as the sequential script did.
 set -eu
 cd "$(dirname "$0")/.."
 ORIN2=${ORIN2:-build/bootstrap/orin2}
-mkdir -p build
-for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test; do
+export ORIN2
+
+# one compiled unit test (run by tools/parallel.py): --unit NAME
+if [ "${1:-}" = "--unit" ]; then
+  t=$2
   $ORIN2 compile compiler/tests/$t.or -o build/$t.c
   cc -O1 -w -I runtime build/$t.c runtime/orin_runtime.c platform/orin_platform.c -o build/$t
-  ./build/$t
-done
-# diag + loader unit tests (@Test; `orin test` runs them with contract checking)
-$ORIN2 test compiler/tests/loader_test.or --runtime runtime
-$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime
-# checker unit tests: the env / fnctx foundation (2a) and the body checker's classes (2b)
-$ORIN2 test compiler/tests/check_env_test.or --runtime runtime
-$ORIN2 test compiler/tests/check_body_test.or --runtime runtime
-# lowering unit tests (3a): block builder, locals, owned scope, place walk, MIR spans, Lowerer end to end
-$ORIN2 test compiler/tests/lower_test.or --runtime runtime
-$ORIN2 test compiler/tests/quality_test.or --runtime runtime
-$ORIN2 test compiler/tests/doccomments_test.or --runtime runtime
-sh tools/test_resources.sh
-sh tools/test_capabilities.sh
-sh tools/test_net.sh
+  exec ./build/$t
+fi
+JOBS=
+case "${1:-}" in
+  "") ;;
+  -j) JOBS="-j $2" ;;
+  -j*) JOBS="-j ${1#-j}" ;;
+  *) echo "usage: $0 [-j N]" >&2; exit 2 ;;
+esac
+mkdir -p build
+# one line per case, in the order of the output; `first:` starts a slow case before the others (tools/parallel.py)
+{
+  for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test; do
+    echo "sh tools/test_tooling.sh --unit $t"
+  done
+  # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
+  echo '$ORIN2 test compiler/tests/loader_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime'
+  # checker unit tests: the env / fnctx foundation (2a) and the body checker's classes (2b)
+  echo '$ORIN2 test compiler/tests/check_env_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/check_body_test.or --runtime runtime'
+  # lowering unit tests (3a): block builder, locals, owned scope, place walk, MIR spans, Lowerer end to end
+  echo '$ORIN2 test compiler/tests/lower_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/quality_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/doccomments_test.or --runtime runtime'
+  echo "first: sh tools/test_resources.sh"
+  echo "first: sh tools/test_capabilities.sh"
+  echo "first: sh tools/test_net.sh"
+} | python3 tools/parallel.py $JOBS
 # Guard: every compiler unit test file must be run by some test script or CI step (an unwired test
 # once failed unnoticed). Fails with the names of the unwired files.
 unwired=""
