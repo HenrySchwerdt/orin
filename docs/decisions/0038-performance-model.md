@@ -89,6 +89,11 @@ the lever that unlocks the fastest one.
   - *Measured* (`bench/streams`, docs/benchmarks.md "Streams"): `filter → map → reduce` over 5 M ints, 10 times, C backend
     `-O2`: before 0.95 s wall / 0.46 s CPU against 0.27 s / 0.12 s for the loop; after 0.25 s / 0.11 s against 0.22 s /
     0.11 s: parity in CPU time.
+  - *Self-compile* (callgrind, `compile compiler/main.or`, all on the same source tree): baseline compiler 41.49 G
+    instructions; the new compiler with `--no-fuse` 41.52 G (+0.07 %); with fusion 41.84 G (+0.84 %). The pass itself costs
+    about 20 M; the rest is the MIR ownership verifier and the optimiser working on the larger fused functions (the
+    verifier's fixpoint +0.26 G). The fused chains in the compiler's own code do not pay that back yet. A follow-up is to make
+    the verifier cheaper on long straight-line loops; the gate "not worse" is missed by 0.84 %.
   - *Kept for ADR-0042:* the pass returns, for every chain it saw, a `ChainInfo` (function, span, stages, parallel or not,
     fused or not and why, loops left over the data, early exit, exact capacity); `orin compile --fuse-report` prints it.
   - *Not done:* borrow inference, reuse in place, freeze after construction (the rest of this section); fusion of a chain

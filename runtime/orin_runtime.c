@@ -18,10 +18,10 @@ static inline void stat_alloc(uint64_t *kind_counter, uint64_t bytes) {
     (*kind_counter)++;
     orin_stats.live_bytes += bytes;
     /* A task that frees objects another task allocated (a value moved to it) can have a negative balance of its own:
-     * the counters are per task, so they are compared as signed numbers (they used to wrap to 2^64 - 1). */
-    if ((int64_t)orin_stats.live_bytes > 0 && orin_stats.live_bytes > orin_stats.peak_live_bytes)
-        orin_stats.peak_live_bytes = orin_stats.live_bytes;
-    if (g_live > 0 && (uint64_t)g_live > orin_stats.peak_live_objs) orin_stats.peak_live_objs = (uint64_t)g_live;
+     * the counters are per task, so they are compared as signed numbers (they used to wrap to 2^64 - 1).
+     * One signed compare each (a peak is never negative), as cheap as the unsigned one it replaces. */
+    if ((int64_t)orin_stats.live_bytes > (int64_t)orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+    if (g_live > (int64_t)orin_stats.peak_live_objs) orin_stats.peak_live_objs = (uint64_t)g_live;
 }
 
 /* Report buffer: fixed size, assembled by hand (no printf). Longest report is < 700 bytes. */
@@ -747,7 +747,7 @@ void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     uint64_t cap = a->cap ? a->cap * 2 : 4;
     a->items = (uint64_t *)xrealloc(a->items, cap * 8);
     orin_stats.live_bytes += (cap - a->cap) * 8;
-    if ((int64_t)orin_stats.live_bytes > 0 && orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
+    if ((int64_t)orin_stats.live_bytes > (int64_t)orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes;
     orin_stats.array_grows++;
     a->cap = cap;
     a->items[a->len++] = slot;
