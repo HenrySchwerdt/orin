@@ -392,3 +392,284 @@ Per-task heap state (`__thread` counters, free lists, work stack) replaced globa
 current, executed instructions (callgrind): fib 1.0000, sieve 1.0000, nbody 1.0000, strings 1.0138, wordfreq 1.0132, mapfreq 1.0159,
 qsort_func 1.0143, bintrees 1.0197. The counters use the `local-exec` TLS model (one instruction per update); with the default model
 the cost was up to 1.05. Task micro-benchmarks (`bench/tasks`) and the rest: docs/concurrency.md "Measurements".
+
+## Performance defects found while building the std: fixes and re-measurement
+
+Context: the std (`std:bytes`, `std:http`, `std:collections`) exposed four defects of the compiler and runtime, each of which cost a
+factor of 2 to 1000 in a realistic program. All four are fixed without changing semantics or weakening a check; the optimiser
+changes are verified by the MIR ownership verifier like every other pass (docs/mir.md v1.10). Machine: the shared 4-vCPU VM, **load
+average 5-16 from other workers during these runs**, so every number is a median of 5-9 runs with the min-max range, and where the
+generated C is byte-identical before and after (bintrees, fib, mapfreq, nbody, qsort_*, sieve, strings, wordfreq) the A/B
+differences below are pure noise and show its size: up to +-25% (sieve 0.436 s vs 0.555 s from identical C).
+
+### Fix 1: `x = x + e` on a field, an element or a nested place, and `x = x.concat(e)`
+
+Cause: for a local string the lowering already turned `s = s + t` into an append. For `r.s = r.s + t`, `this.s = this.s + t`,
+`rs[i].s = ..` the value was computed first (`getfield; dup; strappend`), so the string had two owners (the field and the
+temporary) and `strappend` copied it: quadratic. `a = a.concat(b)` always allocated a new array. Fix (compiler/opt only, no
+lowering change): `opt/inplace.or` and `opt/chains.or` rewrite "read a slot, retain it, store it back" into take / put of the slot
+(the existing hole discipline of `x.a.push(v)`), at any depth, and `a = a.concat(b)` (local, field, element) into the new
+instruction `arrayextend` (runtime `orin_array_extend`: in place when unique, otherwise a copy, amortised O(len b)).
+
+| measurement (same machine, A/B) | before | after |
+|---|---:|---:|
+| 100,000 one-byte appends, `s = s + t` local / `s += t` | 0 ms / 4 ms | 1 ms / 1 ms |
+| 100,000 appends, `r.s = r.s + t` (record field) | 277 ms | 1 ms |
+| 100,000 appends, `this.s = this.s + t` (class field) | 137 ms | 1 ms |
+| 20,000 `a = a.concat([i])` | 310-590 ms | 1 ms |
+| bench/appends (200k string appends to a local, a field, a class field, an element; 100k array concats to a local and a field) | 74.4 s (one run) | 0.013 s (0.012-0.014) |
+
+Tests: `tests/next/run/append_in_place.or` (value semantics with copies, aliasing operands, nesting, 50,000 appends),
+`runtime/tests/runtime_test.c` (`orin_array_extend`), `compiler/tests/verify_main.or` (`IArrayExtend` rules).
+
+### Fix 2: a mutating method that returns a value
+
+Cause, two parts. (a) `this.r.next()` on a field copied the receiver on every call: the field and the call argument both
+owned it, the callee's `makeunique` copied (`cow_copies` 6,000,000 for 12,000,000 calls). The take / put rewrite above removes that.
+(b) The lowered function returns a fresh record `{ self, value }` that the caller destructures and releases: an allocation, a
+retain and a release per call. `opt/pairs.or` turns a function whose every `return` builds such a record into an **in/out function**
+(MIR v1.10: parameter 0 is also an output, `T f(OrinObj *l0, .., OrinObj **out)` in C) and scalar-replaces the record at the call
+sites; if the record escapes it is rebuilt there, so the change is local and safe. Verified by the verifier (new rules, hand-written
+cases, two new mutation classes: 41,368 mutants, 0 survivors).
+
+| measurement | before | after |
+|---|---:|---:|
+| 3M calls `r.next()` (mutating, scalar result), top level | 126 ms | 15 ms |
+| 3M calls `q.stepRet()` (calls `this.r.next()`), nested | 360 ms | 28 ms |
+| same work with void methods (the old workaround), top level / nested | 25 / 137 ms | 26 / 25 ms |
+| allocations, 12M calls | 15,000,016 | 16 |
+| bench/mutres (4 x 10M calls) | 2.06 s (1.76-2.25) | 0.33 s (0.24-0.54) |
+| bench/http_parse (std:http, see below) | 0.968 s (0.796-1.243) | 0.470 s (0.414-0.584) |
+| http_parse counters: cow_copies / retains / allocations | 798,954 / 36.0M / 5.26M | 0 / 9.0M / 3.88M |
+| bench/sortedmap (SortedMap<int>, 200k inserts, lookups, floors, removals, drain) | 1.128 s (0.910-1.400) | 0.719 s (0.638-1.008) |
+| bench/pqueue (PriorityQueue, 1.2M operations) | 0.599 s (0.484-0.763) | 0.507 s (0.475-0.639) |
+
+Earlier interleaved run of http_parse on a quieter machine: 0.716 -> 0.378 s (1.9x). Tests: `tests/next/run/mutating_result.or` (scalar and
+reference results, discarded results, conditions, fields of fields, elements, a result that is the old receiver, recursion, `?`,
+generic classes, copies taken before the call), all 805 existing conformance programs.
+
+### Fix 3: bulk bytes <-> string
+
+`bytesToString(a: u8[], start, len): string` and `stringToBytes(s): u8[]` are built-ins over the runtime object model
+(`orin_bytes_to_string`, `orin_string_to_bytes`, contracts in `runtime/orin_runtime.h`; bounds are checked ("slice out of range"), an
+element above 255 or a non-u8 array traps instead of being truncated; no platform call, so the boundary check is unchanged).
+std:bytes (`toRawString`, `bytesFromString`, `ByteBuilder.appendString`) and std:http (`sliceString`) use them. bench/bytesstr
+(1 MiB, 40 round trips through `bytesFromString` / `toRawString`): **1.322 s (1.115-1.520) -> 0.157 s (0.077-0.187)**, 8.4x. Tests:
+`tests/next/run/bytes_string_bulk.or`, `bytes_string_bulk_trap_range.or`, runtime unit tests, the std suites.
+
+### Fix 4 (found on the way): the verifier scanned all locals on every definition
+
+gprof of `orin verify compiler/main.or`: `killBorrows` (a scan over all locals, 1.07M calls) and `joinState` (an allocation per join) were
+48% of the verifier's time. Defining a Dead or scalar local cannot invalidate a borrow (borrows die whenever their source dies), so the
+scan is skipped there, and the fixpoint joins without allocating when the join changes nothing. Result: the verify phase is about 10-15%
+faster, but **`orin2 compile compiler/main.or` CPU time is unchanged** (5.37 s before, 5.35 s after, medians of 7 interleaved runs,
+user+sys, under the load above): the new optimiser passes cost about what the verifier saved. The compiler's own sources are
+already written with `+=`, `push` and `void` methods, so it gains nothing from fixes 1-3 (121 of its methods become in/out functions;
+`cow_copies` 1.61M -> 1.58M).
+
+### Re-measurement of every benchmark (tools/bench.py, 5 runs, median; min-max in parentheses)
+
+Orin = the compiler of this change; Go 1.24.7, gcc 13.3 `-O2`, clang 18 (LLVM backend), OpenJDK 21 `-XX:+UseParallelGC`, rustc 1.97
+`-O`. Rows without a Go / C column (http_parse, sortedmap) have no counterpart (Go's net/http parses a different grammar, Go has no
+ordered map). Java rows come with the warm-up repetitions of one JVM (all eight, in ms): the first repetition is the cold one.
+The `selfcompile` row of this run (7.47 s) was taken at load average 5-16; the unloaded figure is the 4.95 s of the baseline run
+(5.37 s CPU for both compilers under load, above). Check sums are identical in all languages.
+
+Before (baseline run of this change, same machine, quieter: load 1-4; this is `main` + the std:http branch, `tools/bench.py` before any fix):
+
+#### Wall time, seconds (median; min-max in parentheses)
+
+| benchmark | Orin (C backend) | Orin (LLVM backend) | Go | C | Orin-C/Go | Orin-C/C | Orin-LLVM/Go | Orin-LLVM/C |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| bintrees | 1.381 (1.217-1.555) | 0.846 (0.781-0.974) | 2.656 (2.383-3.002) | 0.920 (0.606-0.959) | 0.52x | 1.50x | 0.32x | 0.92x |
+| fib | 0.445 (0.367-0.469) | 0.787 (0.628-0.848) | 0.714 (0.625-0.748) | 0.266 (0.203-0.392) | 0.62x | 1.67x | 1.10x | 2.96x |
+| mapfreq | 0.596 (0.371-0.657) | 0.326 (0.305-0.451) | 0.289 (0.220-0.451) | 0.182 (0.109-0.200) | 2.06x | 3.27x | 1.13x | 1.79x |
+| nbody | 0.210 (0.196-0.315) | 0.281 (0.197-0.348) | 0.130 (0.106-0.175) | 0.107 (0.075-0.121) | 1.62x | 1.97x | 2.17x | 2.64x |
+| qsort_func | 0.407 (0.392-0.447) | 0.531 (0.447-0.552) | 0.924 (0.811-1.038) | 0.294 (0.269-0.364) | 0.44x | 1.39x | 0.57x | 1.81x |
+| qsort_inplace | 0.206 (0.186-0.247) | 0.183 (0.171-0.228) | 0.238 (0.180-0.278) | 0.133 (0.116-0.150) | 0.87x | 1.56x | 0.77x | 1.38x |
+| sieve | 0.392 (0.330-0.423) | 0.340 (0.308-0.372) | 1.011 (0.891-1.271) | 0.306 (0.287-0.321) | 0.39x | 1.28x | 0.34x | 1.11x |
+| strings | 0.162 (0.157-0.180) | 0.208 (0.160-0.228) | 0.150 (0.106-0.219) | 0.120 (0.095-0.130) | 1.08x | 1.36x | 1.39x | 1.74x |
+| wordfreq | 0.198 (0.193-0.278) | 0.213 (0.199-0.242) | 0.168 (0.148-0.197) | 0.143 (0.116-0.154) | 1.18x | 1.39x | 1.26x | 1.49x |
+| selfcompile (orin2 compiles compiler/main.or) | 4.953 (4.778-5.419) | - | - | - | - | - | - | - |
+
+
+After:
+
+#### Wall time, seconds (median; min-max in parentheses)
+
+| benchmark | Orin (C backend) | Orin (LLVM backend) | Go | C | Orin-C/Go | Orin-C/C | Orin-LLVM/Go | Orin-LLVM/C |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| appends | 0.042 (0.036-0.064) | 0.029 (0.014-0.041) | 0.036 (0.017-0.076) | 0.034 (0.029-0.040) | 1.19x | 1.24x | 0.80x | 0.84x |
+| bintrees | 1.905 (1.739-2.275) | 1.312 (1.228-1.691) | 3.947 (3.431-4.337) | 1.520 (1.439-1.763) | 0.48x | 1.25x | 0.33x | 0.86x |
+| bytesstr | 0.174 (0.114-0.220) | 0.246 (0.190-0.313) | 0.082 (0.060-0.198) | 0.229 (0.152-0.252) | 2.12x | 0.76x | 2.99x | 1.07x |
+| fib | 0.535 (0.516-0.652) | 0.894 (0.731-0.999) | 0.793 (0.742-0.873) | 0.462 (0.453-0.516) | 0.68x | 1.16x | 1.13x | 1.94x |
+| http_parse | 0.537 (0.460-0.693) | 0.355 (0.348-0.501) | n/a | n/a | n/a | n/a | n/a | n/a |
+| mapfreq | 0.641 (0.601-0.687) | 0.425 (0.366-0.696) | 0.301 (0.239-0.350) | 0.139 (0.106-0.296) | 2.13x | 4.62x | 1.41x | 3.06x |
+| mutres | 0.259 (0.238-0.331) | 0.216 (0.182-0.240) | 0.080 (0.068-0.088) | 0.048 (0.037-0.075) | 3.25x | 5.42x | 2.71x | 4.52x |
+| nbody | 0.361 (0.194-0.486) | 0.357 (0.282-0.378) | 0.151 (0.104-0.164) | 0.126 (0.098-0.181) | 2.39x | 2.86x | 2.36x | 2.83x |
+| pqueue | 0.656 (0.566-0.667) | 0.389 (0.334-0.426) | 0.428 (0.340-0.470) | 0.120 (0.109-0.209) | 1.53x | 5.48x | 0.91x | 3.25x |
+| qsort_func | 0.492 (0.416-0.578) | 0.564 (0.461-0.605) | 1.111 (0.979-1.148) | 0.349 (0.341-0.621) | 0.44x | 1.41x | 0.51x | 1.62x |
+| qsort_inplace | 0.319 (0.246-0.456) | 0.234 (0.208-0.377) | 0.368 (0.212-0.468) | 0.184 (0.152-0.211) | 0.87x | 1.73x | 0.64x | 1.27x |
+| sieve | 0.528 (0.460-0.580) | 0.469 (0.450-0.523) | 1.124 (1.095-1.316) | 0.468 (0.415-0.519) | 0.47x | 1.13x | 0.42x | 1.00x |
+| sortedmap | 1.039 (0.961-1.592) | 1.184 (1.097-1.327) | n/a | n/a | n/a | n/a | n/a | n/a |
+| strings | 0.279 (0.182-0.376) | 0.344 (0.155-0.384) | 0.199 (0.118-0.373) | 0.240 (0.228-0.260) | 1.40x | 1.16x | 1.72x | 1.43x |
+| wordfreq | 0.312 (0.242-0.387) | 0.352 (0.255-0.539) | 0.419 (0.360-0.534) | 0.171 (0.161-0.359) | 0.74x | 1.83x | 0.84x | 2.06x |
+| selfcompile (orin2 compiles compiler/main.or) | 7.473 (6.833-7.576) | - | - | - | - | - | - | - |
+
+#### Peak RSS, MiB (median of ru_maxrss; ~1 MiB process-startup floor)
+
+| benchmark | orin | llvm | go | c |
+|---|---:|---:|---:|---:|
+| appends | 4.4 | 4.7 | 11.2 | 4.8  |
+| bintrees | 17.4 | 17.7 | 19.7 | 9.6  |
+| bytesstr | 11.4 | 11.6 | 9.3 | 11.7  |
+| fib | 1.4 | 1.7 | 1.8 | 1.6  |
+| http_parse | 1.6 | 1.9 | n/a | n/a  |
+| mapfreq | 10.4 | 10.6 | 8.7 | 5.1  |
+| mutres | 1.4 | 1.7 | 1.8 | 1.6  |
+| nbody | 1.8 | 1.7 | 1.8 | 1.8  |
+| pqueue | 6.0 | 6.2 | 16.0 | 4.8  |
+| qsort_func | 35.3 | 35.6 | 76.6 | 23.8  |
+| qsort_inplace | 16.6 | 16.8 | 32.3 | 16.8  |
+| sieve | 77.6 | 77.8 | 294.1 | 77.6  |
+| sortedmap | 9.1 | 9.4 | n/a | n/a  |
+| strings | 46.0 | 46.2 | 32.7 | 34.7  |
+| wordfreq | 2.3 | 2.5 | 7.1 | 2.0  |
+| selfcompile (orin2) | 130.4 | - | - | - |
+
+#### Java (OpenJDK, -XX:+UseParallelGC) and Rust (rustc -O): same programs, wall time of the whole process in seconds (median; min-max)
+
+| benchmark | Orin (C backend) | Java cold | Java warm (last of 8 reps in one JVM, ms) | Rust | Java RSS MiB | Rust RSS MiB | Orin RSS MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| appends | 0.042 | 0.177 (0.136-0.308) | 7 (reps: 180 12 12 12 14 27 9 7) | 0.020 (0.012-0.023) | 50.3 | 5.0 | 4.4 |
+| bintrees | 1.905 | 0.672 (0.508-0.876) | 357 (reps: 631 579 562 567 321 635 470 357) | 1.952 (1.659-2.407) | 269.4 | 10.1 | 17.4 |
+| bytesstr | 0.174 | 0.408 (0.258-0.493) | 18 (reps: 99 23 42 21 20 46 55 18) | 0.131 (0.107-0.203) | 96.1 | 5.0 | 11.4 |
+| fib | 0.535 | 0.816 (0.728-0.972) | 792 (reps: 728 837 708 687 697 720 757 792) | 0.432 (0.380-0.493) | 39.2 | 2.1 | 1.4 |
+| mutres | 0.259 | 0.235 (0.178-0.272) | 20 (reps: 75 72 38 33 31 19 22 20) | 0.051 (0.042-0.055) | 39.2 | 2.1 | 1.4 |
+| pqueue | 0.656 | 0.740 (0.664-0.915) | 361 (reps: 819 864 564 366 323 445 312 361) | 0.198 (0.183-0.311) | 62.9 | 5.2 | 6.0 |
+| sieve | 0.528 | 0.632 (0.454-0.862) | 389 (reps: 773 609 458 496 488 400 395 389) | 0.439 (0.367-0.633) | 116.6 | 78.4 | 77.6 |
+| strings | 0.279 | 1.068 (0.767-1.207) | 74 (reps: 880 464 388 308 151 352 193 74) | 0.127 (0.120-0.172) | 130.9 | 19.9 | 46.0 |
+
+Startup: `java Hello` (JVM start, class load, print, exit) 0.074 s median, 38.1 MiB peak RSS. The native columns carry a ~1 MiB process-startup floor of RSS (see Methodology).
+
+Reading the Java rows: Java wins where its JIT and GC pay off over a long run (bintrees warm 357 ms against Orin 1.9 s, which
+frees every node by reference counting; pqueue warm 361 ms) and loses the whole-process comparison on short programs (cold start
+0.07 s for `Hello`, 38 MiB RSS; fib 0.82 s cold against 0.54 s; strings 1.07 s against 0.28 s). RSS is where it differs most: Java
+40-270 MiB against Orin 1.4-78 MiB on the same programs (sieve 117 vs 78 MiB because both use 8-byte flags; bintrees 269 vs 17 MiB).
+Rust and C are within noise of each other and ahead of Orin by 1.1x-5.5x on the allocation-heavy rows (mutres 5.4x, pqueue 5.5x
+against C, mapfreq 4.6x), i.e. the gap that remains is the object model, not the std.
+
+### Backends: ADR-0038 step 1 (attributes)
+
+The LLVM backend marks every generated function's parameters `noundef`, references `nonnull`, results `noundef` / `nonnull` (all values
+are initialised and no reference is null; `nounwind` was already on every function). `memory(none)` / `readonly` / `willreturn` were not
+added: the MIR has no purity or termination information, and a function with checked arithmetic or a bounds check can trap (call
+`orin_trap`, which writes and exits), so `memory(none)` would let LLVM delete a trap whose result is unused. Measured effect on the LLVM
+column: none distinguishable from noise (fib 0.894 s vs 0.787 s in the baseline run, bintrees 1.31 vs 0.85 s, at a load average of 5-16
+against 1-4); `diff_backends.py --mode llvm` and the LLVM suites pass. The C backend has no equivalent attributes that the language
+guarantees (the C compilers already see `static` functions).
+
+### Further defects, not fixed (listed, in the order of expected gain)
+
+* **Option / Result / pair results still allocate** (`pop()`, `get()`, `indexOf`, `Some(x)`): 1.69M of http_parse's 3.88M allocations, 2 per
+  `PriorityQueue.pop`. Needs unboxed `Option<scalar>` (the "unboxing" lever); the in/out receiver of fix 2 is the first instance of the mechanism.
+* **RC traffic**: http_parse still does 9.0M retains and 12.9M releases for 3.9M allocations, bintrees 33M releases; elision of borrowed-then-stored
+  pairs and escape analysis for non-escaping records are the levers (ADR-0010 only handles owned parameters and last uses).
+* `std:http` `toLowerAscii` and `std:bytes` `toHex` build one 1-character string per byte and join them (no fast path when there is no
+  upper-case letter); a `u8[]` map + `bytesToString` would do. `Bytes.concat` copies through a `push` loop.
+* The verifier allocates one `LState` record per `setLs` (11M structs per self-compile) and `joinState` is O(locals) per edge: a flat int
+  encoding would halve the verify phase; `orin_destroy` is 14-17% of the compiler's profile (freelist covers structs of 0-8 slots only).
+* `x = t + x` (prepend) and `x = f(x)` for a non-mutating `f` with a borrowed parameter are inherently copying; `s.split` /
+  `join` / `int.toString` are prelude Orin with a call per byte.
+* Checked-arithmetic overhead on `fib` and the field bounds checks (+22% on self-compile, see above) need range analysis / a shape-checking verifier.
+
+What remains for the big levers: unboxing (Option/Result of scalars, small records, the pair of fix 2 generalised to any fresh record
+returned and destructured), reference-count elision (borrowed-to-owned retains that the callee only reads, release-after-last-use
+pairs across loop iterations, `bintrees`-style constructor chains) and escape analysis (stack allocation of records that never leave a
+function; with it `Some(x)` for `pop().unwrap()` disappears). Each is a MIR pass with its verifier rules, in the style of `opt/pairs.or`.
+
+
+## Benchmark workflow (CI), metrics and history
+
+`.github/workflows/bench.yml` runs `tools/bench.py` on a GitHub-hosted `ubuntu-latest` runner (4 vCPUs, shared) with Go 1.24
+(`actions/setup-go`), Temurin Java 21 (`actions/setup-java`), stable Rust (the preinstalled rustup), the preinstalled clang
+and valgrind from apt, after the seed bootstrap of `tools/bootstrap.sh`. It does not run on every push.
+
+### Triggering it
+
+| how | what runs | where the result goes |
+|---|---|---|
+| nightly, 03:57 UTC on `main` (`schedule`) | everything, 5 runs per cell | job summary, artifact `bench-results`, appended to the `bench-results` branch |
+| Actions tab -> bench -> "Run workflow" (`workflow_dispatch`) | inputs: `runs` (default 5) and `only` (comma-separated names, empty = all; `selfcompile` in the list adds the self-compile) | as above; a manual run on `main` is also appended to the history, a run on another branch is not |
+| add the label `bench` to a pull request (`pull_request: labeled`) | everything for the PR's merge commit | job summary, artifact, and one PR comment comparing with `main` (edited in place when the label is added again or the run is re-run) |
+
+Locally the same numbers come from
+`python3 tools/bench.py --runs 1 --only fib,sieve --json build/bench/x.json --instructions` and
+`python3 tools/bench_report.py summary build/bench/x.json`.
+
+Permissions are least privilege: the workflow token is `contents: read`; only the `history` job has `contents: write` (to
+push to `bench-results`) and only the `compare` job has `pull-requests: write` (to comment). A pull request from a fork gets
+a read-only token, so its comparison is only in the job summary. Nothing has to be configured in the repository settings;
+the `bench` label is created the first time someone types it in a pull request's label menu.
+
+### Metrics (per benchmark and language, in the JSON written by `--json`)
+
+| field | meaning |
+|---|---|
+| `wall_median`, `wall_min`, `wall_max` | wall time of the whole process (seconds), `runs` runs after one unrecorded warm-up |
+| `user_median`, `sys_median`, `cpu_median` | user, system and user + system CPU time of the process and all its threads (`wait4` rusage, seconds). CPU above wall means parallel work (Go's GC, the JVM's JIT and GC threads, std:task workers) |
+| `rss_kb` | peak resident set (`ru_maxrss`, KiB, median); ~1 MiB process-startup floor |
+| `output_matched` | stdout identical to the reference (C, else the first language built); a mismatch fails the workflow after the upload |
+| `instructions.<lang>.count` | executed instructions (valgrind `cachegrind --cache-sim=no`, "I refs"), one run, for `orin` (C backend), `llvm` and `c`; `args` is set when a reduced input was used, `skipped` holds the reason when the program was not counted |
+| `orin_stats` | the runtime counters of `ORIN_STATS=1` |
+| `selfcompile` | the same fields for `orin2 compile compiler/main.or`, plus `identical_to_stage2` and its instruction count |
+| `parallel.<name>.threads.<n>` | the same timing fields with `n` worker threads, plus `speedup` = wall(1) / wall(n), `efficiency` = speedup / n, `cpu_ratio` = CPU(n) / CPU(1) |
+
+The top level records `commit`, `ref`, `date` (UTC), `runs`, `only`, `machine` (CPU model, core count, memory, OS, runner),
+`tools` (cc, clang, go, java, rustc, valgrind, python versions) and `mismatches`; `schema` is 1.
+
+**Why instruction counts are the regression metric.** On a shared runner the wall time of a byte-identical binary moves by
+10-25 % between runs (the A/B runs above show +-25 % on `sieve` from identical C), so a 5 % regression is invisible in it.
+The number of executed instructions of a single-threaded, deterministic program is the same on every run and every runner
+(it changes with the compiler, the runtime and the C compiler version, which the JSON records), so a change of more than 2 %
+is a real change in the code that runs. It does not see cache misses, branch mispredictions or memory-bandwidth effects, which
+is why the wall time is still reported and compared with a wide (15 %) threshold. valgrind costs 20-50x the native time; the
+whole instruction pass is a few minutes. Conventions for a benchmark that is too slow under valgrind: a file
+`bench/<name>/instructions.args` holds arguments for a smaller input (the JSON records them and the PR comparison does not
+compare such counts with full-size ones), `bench/<name>/instructions.skip` holds the reason to skip it; a run over
+`--instr-timeout` (900 s) is skipped with that reason. Multi-threaded programs (`bench/tasks`, the parallel benchmarks) are
+skipped, because valgrind serialises threads.
+
+**Parallel speedup.** `bench/parallel_*/` and `bench/streams_parallel/` (picked up automatically when present) take the
+number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. There is no
+runtime knob: std:task has no thread pool, every task is one OS thread, so the worker count is the `parts` argument of
+`parallelMap` (or the number of tasks the program spawns). Each program runs with 1, 2 and 4 threads (`--threads`); the output
+must not depend on the count. `bench/parallel_collatz` is the Collatz-steps map of `examples/parallel_map.or` over
+1..2,000,000 with deterministic output. With more threads than free cores the speedup flattens; `cpu_ratio` above 1 shows the
+cost of copying chunks, joining and oversubscription.
+
+### The job summary and the PR comment
+
+The job summary has: wall time of Orin (C and LLVM backend), C, Go, Java and Rust; ratios to C; CPU time and RSS; executed
+instructions with the Orin/C ratios; the parallel table (wall, CPU, speedup, efficiency); the self-compile (time, CPU, RSS,
+instructions). The PR comment (`tools/bench_report.py compare`) is one table per Orin binary and benchmark plus the
+self-compile: instructions on `main` and on the PR, wall time on `main` and on the PR, the changes, and a verdict:
+**regression (instructions)** above +2 %, **regression (wall time)** above +15 %, *improvement* below -2 % instructions. The
+baseline of each row is the newest `main` entry of the history that has that row. The comment only reports; the job does not
+fail on a regression.
+
+### History: the `bench-results` branch
+
+An orphan branch of this repository, created by the first run on `main` and only fast-forwarded afterwards (commits by
+`github-actions[bot]`, with the workflow's `GITHUB_TOKEN`):
+
+    history/<YYYY-MM-DD>-<sha12>.json   one bench.py --json result per run on main
+    charts/ratio_wall.svg               Orin (C / LLVM backend) / C wall-time ratio per benchmark over time (small multiples)
+    charts/ratio_instructions.svg       the same ratio by executed instructions (stable)
+    charts/selfcompile.svg              self-compile instructions and wall time over time
+    charts/parallel.svg                 speedup by worker threads (latest run, with the ideal line) and at 4 threads over time
+    README.md                           the charts, the latest run's tables, the list of runs
+
+`tools/bench_report.py render --history history --out .` regenerates the charts and the README (stdlib only). Opening the
+branch on GitHub shows the README with the charts; no GitHub Pages. The SVGs have their own light background, axis titles, a
+legend and a `<title>` / `<desc>`; under a dark system color scheme they switch to the dark steps of the same palette.

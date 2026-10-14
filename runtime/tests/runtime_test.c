@@ -382,6 +382,95 @@ static void test_net_handles(void) {
 #undef orin_fs_read_file
 #undef orin_fs_write_file
 
+/* ---- bulk byte conversions and in-place array extension (docs/mir.md v1.10) ---- */
+static OrinObj *u8array(const unsigned char *p, uint64_t n) {
+    OrinObj *a = orin_array_new(n, 0);
+    for (uint64_t i = 0; i < n; i++) orin_array_push(a, p[i]);
+    return a;
+}
+
+static int bulk_traps(int which) {
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        freopen("/dev/null", "w", stderr);
+        unsigned char b[3] = {1, 2, 3};
+        OrinObj *a = u8array(b, 3);
+        OrinObj *refs = orin_array_new(1, 1);
+        OrinObj *str = S("x");
+        switch (which) {
+        case 0: (void)orin_bytes_to_string(a, 2, 2); break;                 /* start + len > length */
+        case 1: (void)orin_bytes_to_string(a, 4, 0); break;                 /* start > length */
+        case 2: (void)orin_bytes_to_string(a, 1, (uint64_t)-1); break;      /* start + len overflows */
+        case 3: (void)orin_bytes_to_string(str, 0, 1); break;               /* a string is not an array */
+        case 4: (void)orin_bytes_to_string(refs, 0, 0); break;              /* a reference array is not a u8[] */
+        case 5: orin_array_push(a, 256); (void)orin_bytes_to_string(a, 3, 1); break; /* element above 255 */
+        case 6: (void)orin_string_to_bytes(a); break;                       /* an array is not a string */
+        case 7: (void)orin_array_extend(str, a); break;                     /* a string cannot be extended */
+        case 8: (void)orin_array_extend(a, str); break;
+        }
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 101;
+}
+
+static void test_bulk(void) {
+    int64_t base = orin_live_count();
+    /* stringToBytes / bytesToString: every byte value, NUL included, round trips; empty ranges */
+    unsigned char all[256];
+    for (int i = 0; i < 256; i++) all[i] = (unsigned char)i;
+    OrinObj *s = orin_str_new((const char *)all, 256);
+    OrinObj *bytes = orin_string_to_bytes(s);
+    CHECK(orin_array_len(bytes) == 256 && !((OrinArray *)bytes)->is_ref);
+    for (uint64_t i = 0; i < 256; i++) CHECK(orin_array_at(bytes, i) == i);
+    OrinObj *back = orin_bytes_to_string(bytes, 0, 256);
+    CHECK(orin_str_eq(s, back));
+    OrinObj *mid = orin_bytes_to_string(bytes, 65, 3);
+    CHECK(streq(mid, "ABC"));
+    OrinObj *e1 = orin_bytes_to_string(bytes, 256, 0), *e2 = orin_bytes_to_string(bytes, 0, 0);
+    CHECK(orin_str_len(e1) == 0 && orin_str_len(e2) == 0);
+    OrinObj *emp = S("");
+    OrinObj *eb = orin_string_to_bytes(emp);
+    CHECK(orin_array_len(eb) == 0);
+    for (int i = 0; i < 9; i++) CHECK(bulk_traps(i));
+    /* extend: in place when unique (same object), a copy when shared; b is never changed */
+    OrinObj *x = orin_array_new(0, 0);
+    for (uint64_t i = 0; i < 3; i++) orin_array_push(x, i);
+    OrinObj *y = orin_array_new(0, 0);
+    for (uint64_t i = 10; i < 13; i++) orin_array_push(y, i);
+    OrinObj *x0 = x;
+    x = orin_array_extend(x, y);
+    CHECK(x == x0 && orin_array_len(x) == 6 && orin_array_at(x, 3) == 10 && orin_array_len(y) == 3);
+    OrinObj *shared = orin_dup(x);
+    x = orin_array_extend(x, y); /* x is shared: the result is a new array, `shared` keeps its length */
+    CHECK(x != shared && orin_array_len(x) == 9 && orin_array_len(shared) == 6 && shared->rc == 1);
+    x = orin_array_extend(x, x); /* y == x: never extended into itself in place, still a ++ a (and a is consumed) */
+    CHECK(orin_array_len(x) == 18 && orin_array_at(x, 17) == 12 && orin_array_at(x, 8) == 12 && x->rc == 1);
+    x0 = x;
+    OrinObj *none_ = orin_array_new(0, 0);
+    x = orin_array_extend(x, none_); /* appending nothing returns the same array */
+    CHECK(x == x0);
+    orin_release(none_);
+    for (int i = 0; i < 1000; i++) x = orin_array_extend(x, y); /* amortised growth */
+    CHECK(orin_array_len(x) == 18 + 3000);
+    /* reference elements: every copied reference is retained once more */
+    OrinObj *rs = orin_array_new(0, 1), *rt = orin_array_new(0, 1);
+    OrinObj *p = S("p"), *q = S("q");
+    orin_array_push(rs, ORIN_SLOT(orin_dup(p)));
+    orin_array_push(rt, ORIN_SLOT(orin_dup(q)));
+    rs = orin_array_extend(rs, rt);
+    rs = orin_array_extend(rs, rs);
+    CHECK(orin_array_len(rs) == 4 && p->rc == 3 && q->rc == 4 && rt->rc == 1);
+    OrinObj *emptyref = orin_array_new(0, 0); /* an empty array adopts the element kind of b */
+    emptyref = orin_array_extend(emptyref, rt);
+    CHECK(((OrinArray *)emptyref)->is_ref == 1 && orin_array_len(emptyref) == 1 && q->rc == 5);
+    OrinObj *all2[] = {s, bytes, back, mid, e1, e2, emp, eb, x, y, shared, rs, rt, p, q, emptyref};
+    for (size_t i = 0; i < sizeof all2 / sizeof *all2; i++) orin_release(all2[i]);
+    CHECK(orin_live_count() == base);
+}
+
 int main(int argc, char **argv) {
     orin_init(argc, argv);
     test_strings();
@@ -389,6 +478,7 @@ int main(int argc, char **argv) {
     test_deep_chain();
     test_misc();
     test_shape_traps();
+    test_bulk();
     test_grants();
     test_net_handles();
     if (failures) return 1;

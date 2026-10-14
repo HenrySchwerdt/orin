@@ -1,5 +1,5 @@
 // OIM ownership verifier driver (docs/mir.md). Per function: well-formedness (wf.or), then a
-// forward worklist dataflow over the CFG to a fixpoint (transfer functions in rules.or, joins in
+// forward worklist dataflow over the CFG to a fixpoint (class `Fixpoint`; transfer functions in rules.or, joins in
 // state.or), then one reporting pass over the stable block in-states.
 //
 // Termination: in[b] is only ever replaced by join(in[b], out) and re-queued when that differs
@@ -7,38 +7,71 @@
 // drawn from the finite set of locals, hole sets over a finite universe) has finite height, so
 // every in[b] changes finitely often. This holds even if a transfer function is not monotone.
 
-import { MProgram, MFunction, MBlock, Terminator, noSpan } from "../mir";
-import { VerifyIssue, issueSpan, State, LState, mk, holesEq, joinState, stateEq, KDead, KOwned, KParam, KInit } from "./state";
+import {
+  MProgram, MFunction, MBlock, noSpan, hasSpan, successors, isWellFormedFunction,
+  isWellFormedProgram,
+} from "../mir";
+import {
+  VerifyIssue, issueSpan, sameSpan, State, LState, mk, holesEq, KDead, KOwned, KParam, KInit,
+} from "./state";
 import { CRef, CHandle, localClass, wfInstr, wfTerm, wfFunction } from "./wf";
-import { Cx, step, stepTerm } from "./rules";
+import { Transfer } from "./rules";
 
 export type VerifyReport = { errors: VerifyIssue[]; warnings: VerifyIssue[]; };
 
-function successors(t: Terminator): usize[] {
-  return match (t) {
-    TGoto(b) => [b],
-    TBranch(_, a, b) => [a, b],
-    TSwitch(_, cs, d) => {
-      let out: usize[] = [];
-      for (const c of cs) {
-        out.push(c.target);
-      }
-      out.push(d);
-      return out;
-    },
-    TReturn(_) => [],
-    TTrap(_) => []
-  };
+// ------------------------------------------------------------------ issues
+
+function issue(f: MFunction, b: usize, i: usize, msg: string): VerifyIssue {
+  return VerifyIssue { func: f.name, block: b, instr: i, message: msg, span: issueSpan(f, b, i) };
 }
 
+// Issue `e` of function `f` names an existing block and instruction (the terminator counts as instruction
+// `instrs.length`) and carries that position's span, or it is about the whole function (position 0/0, no span).
+export function issuePlaced(f: MFunction, e: VerifyIssue): bool {
+  if (e.func != f.name) {
+    return false;
+  }
+  if (e.block < f.blocks.length && e.instr <= f.blocks[e.block].instrs.length) {
+    return sameSpan(e.span, issueSpan(f, e.block, e.instr));
+  }
+  return e.block == 0 && e.instr == 0 && !hasSpan(e.span);
+}
+
+// Every issue of a report on `p` names something that exists: a function of `p` (placed as `issuePlaced` says), a
+// vtable of `p`, or the program itself (`main`).
+export function reportPlaced(p: MProgram, es: VerifyIssue[]): bool {
+  return es.every(
+    e => e.func == "<program>"
+        || p.vtables.some(v => v.name == e.func)
+        || p.functions.some(f => issuePlaced(f, e)),
+  );
+}
+
+// The queue flags of a fresh fixpoint over `n` blocks: only the entry block is queued.
+@Requires(n > 0)
+@Ensures(result.length == n && result[0] && result.filter(q => q).length == 1)
+function entryQueued(n: usize): bool[] {
+  let out: bool[] = [true];
+  let i: usize = 1;
+  while (i < n) {
+    out.push(false);
+    i += 1;
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------ the fixpoint
+
 // Parameters are Param (references) or initialised scalars; everything else starts Dead.
-function entryState(f: MFunction): State {
+@Requires(isWellFormedFunction(p, f))
+@Ensures(result.ls.length == f.locals.length && result.holes.length == 0 && result.borrowsFlat())
+function entryState(p: MProgram, f: MFunction): State {
   let ls: LState[] = [];
   let i: usize = 0;
   while (i < f.locals.length) {
     if (i < f.paramCount) {
       if (localClass(f, i) == CHandle) {
-        ls.push(mk(KParam, 0));            // a handle parameter is borrowed for the whole call
+        ls.push(mk(KParam, 0)); // a handle parameter is borrowed for the whole call
       } else if (localClass(f, i) != CRef) {
         ls.push(mk(KInit, 0));
       } else {
@@ -49,28 +82,163 @@ function entryState(f: MFunction): State {
     }
     i += 1;
   }
-  return State { ls: ls, holes: [] };
+  return new State(ls, []);
 }
 
-// Run block b from `st`; the result's st is the state after the terminator.
-function runBlock(p: MProgram, f: MFunction, b: usize, st: State): Cx {
-  let c = Cx { prog: p, f: f, blk: b, ins: 0, st: st, errs: [], warns: [] };
-  const blk = f.blocks[b];
-  let i: usize = 0;
-  while (i < blk.instrs.length) {
-    c.ins = i;
-    c = step(c, blk.instrs[i]);
+// The in-states: the entry state for block 0, nothing for the others yet.
+@Requires(isWellFormedFunction(p, f))
+@Ensures(result.length == f.blocks.length && result[0].isSome())
+function initialIns(p: MProgram, f: MFunction): Option<State>[] {
+  let ins: Option<State>[] = [Some(entryState(p, f))];
+  let i: usize = 1;
+  while (i < f.blocks.length) {
+    ins.push(None);
     i += 1;
   }
-  c.ins = blk.instrs.length;
-  return stepTerm(c, blk.term);
+  return ins;
 }
 
-function issue(f: MFunction, b: usize, i: usize, msg: string): VerifyIssue {
-  return VerifyIssue { func: f.name, block: b, instr: i, message: msg, span: issueSpan(f, b, i) };
+// Run block b from `st`; the result's state is the state after the terminator.
+function runBlock(p: MProgram, f: MFunction, b: usize, st: State): Transfer {
+  let t = new Transfer(p, f, b, 0, st, [], []);
+  t.run();
+  return t;
 }
 
-// Structural errors of function f (empty if well-formed).
+// Every in-state has one entry per local (`n`).
+export function statesSized(ins: Option<State>[], n: usize): bool {
+  return ins.every(s => s.isNone() || s.unwrap().ls.length == n);
+}
+
+// The reached blocks are closed under the successor relation: a successor of a block that has an in-state has one.
+export function reachClosed(f: MFunction, ins: Option<State>[]): bool {
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    if (ins[b].isSome() && !successors(f.blocks[b].term).every(s => ins[s].isSome())) {
+      return false;
+    }
+    b += 1;
+  }
+  return true;
+}
+
+// The forward dataflow of one well-formed function: `ins[b]` is the in-state of block `b` (None while `b` has not been
+// reached); the worklist `work` holds the blocks whose in-state changed since they were last run, each at most once
+// (`queued[b]` iff `b` is in `work`), last in first out. Only block ids get in (`add` requires one), so the worklist is
+// never longer than the block list. The worklist is part of this class rather than a class of its own because a
+// mutating method called on a class-typed field copies the object and its arrays on every call (step 3b, measured).
+@Invariant(this.ins.length == this.f.blocks.length)
+@Invariant(this.ins.length > 0 && this.ins[0].isSome())
+@Invariant(this.queued.length == this.ins.length)
+@Invariant(this.work.length <= this.queued.length)
+export class Fixpoint {
+  private prog: MProgram;
+  private f: MFunction;
+  ins: Option<State>[];
+  private work: usize[];
+  private queued: bool[];
+
+  constructor(prog: MProgram, f: MFunction) {
+    this.prog = prog;
+    this.f = f;
+    this.ins = initialIns(prog, f);
+    this.work = [0];
+    this.queued = entryQueued(f.blocks.length);
+  }
+
+  // Number of blocks waiting to be run.
+  pending(): usize {
+    return this.work.length;
+  }
+
+  // Queues block `b` unless it is queued already.
+  @Requires(b < this.queued.length)
+  @Ensures(this.queued[b] && this.queued.length == old(this.queued.length))
+  @Ensures(old(this.queued[b]) ==> this.work.length == old(this.work.length))
+  @Ensures(!old(this.queued[b]) ==> this.work.length == old(this.work.length) + 1)
+  private add(b: usize): void {
+    if (!this.queued[b]) {
+      this.queued[b] = true;
+      this.work.push(b);
+    }
+  }
+
+  // The most recently queued block; it is no longer queued.
+  @Requires(this.work.length > 0)
+  @Ensures(result < this.queued.length && !this.queued[result])
+  @Ensures(this.work.length + 1 == old(this.work.length))
+  private take(): usize {
+    const b = this.work.pop().unwrap();
+    this.queued[b] = false;
+    return b;
+  }
+
+  // Iterates to the fixpoint. Afterwards the worklist is empty, every reached block's successors are reached, and the
+  // in-states are stable: running any reached block and joining its out-state into a successor's in-state changes
+  // nothing (a block that was forgotten in the worklist would show here).
+  @Requires(isWellFormedFunction(this.prog, this.f) && wfFunction(this.f) == "")
+  @Ensures(this.work.length == 0 && this.queued.every(q => !q))
+  @Ensures(statesSized(this.ins, this.f.locals.length))
+  @Ensures(reachClosed(this.f, this.ins))
+  @Ensures(this.isStable())
+  run(): void {
+    while (this.work.length > 0) {
+      const b = this.take();
+      const out = runBlock(this.prog, this.f, b, this.ins[b].unwrap()).state();
+      for (const s of successors(this.f.blocks[b].term)) {
+        match (this.ins[s]) {
+          None => {
+            this.ins[s] = Some(out);
+            this.add(s);
+          },
+          Some(prev) => {
+            match (prev.joinIfChanged(out)) {
+              Some(nw) => {
+                this.ins[s] = Some(nw);
+                this.add(s);
+              },
+              None => {},
+            }
+          },
+        }
+      }
+    }
+  }
+
+  // No reached block's out-state adds anything to the in-state of a successor.
+  isStable(): bool {
+    let b: usize = 0;
+    while (b < this.ins.length) {
+      match (this.ins[b]) {
+        None => {},
+        Some(st) => {
+          const out = runBlock(this.prog, this.f, b, st).state();
+          for (const s of successors(this.f.blocks[b].term)) {
+            match (this.ins[s]) {
+              None => {
+                return false;
+              },
+              Some(prev) => {
+                if (prev.joinIfChanged(out).isSome()) {
+                  return false;
+                }
+              },
+            }
+          }
+        },
+      }
+      b += 1;
+    }
+    return true;
+  }
+}
+
+// ------------------------------------------------------------------ verification
+
+// Structural errors of function f (empty if well-formed). No errors means `f` is well-formed in the sense of the
+// shared MIR predicate (`isWellFormedFunction`, compiler/mir): the verifier's own check is at least as strict.
+@Ensures(result.length == 0 ==> isWellFormedFunction(p, f))
+@Ensures(result.every(e => issuePlaced(f, e)))
 function wellFormed(p: MProgram, f: MFunction): VerifyIssue[] {
   let out: VerifyIssue[] = [];
   const m = wfFunction(f);
@@ -98,97 +266,95 @@ function wellFormed(p: MProgram, f: MFunction): VerifyIssue[] {
   return out;
 }
 
-// Fixpoint: the in-state of every reachable block (None = unreachable).
-function fixpoint(p: MProgram, f: MFunction): Option<State>[] {
-  let ins: Option<State>[] = [];
-  let queued: bool[] = [];
-  for (const _b of f.blocks) {
-    ins.push(None);
-    queued.push(false);
-  }
-  ins[0] = Some(entryState(f));
-  let work: usize[] = [0];
-  queued[0] = true;
-  while (work.length > 0) {
-    const b = work.pop().unwrap();
-    queued[b] = false;
-    const out = runBlock(p, f, b, ins[b].unwrap()).st;
-    for (const s of successors(f.blocks[b].term)) {
-      match (ins[s]) {
-        None => {
-          ins[s] = Some(out);
-          queued[s] = true;
-          work.push(s);
-        },
-        Some(old) => {
-          const nw = joinState(old, out);
-          if (!stateEq(nw, old)) {
-            ins[s] = Some(nw);
-            if (!queued[s]) {
-              queued[s] = true;
-              work.push(s);
-            }
-          }
-        }
-      }
-    }
-  }
-  return ins;
-}
-
+// The report of one function: its structural errors, or else the ownership errors and leak warnings of every reached
+// block (an unreachable block is only checked for well-formedness). Every issue names a position of `f`.
+@Ensures(result.errors.length == 0 ==> isWellFormedFunction(p, f))
+@Ensures(result.errors.every(e => issuePlaced(f, e))
+    && result.warnings.every(w => issuePlaced(f, w)))
 function verifyFunction(p: MProgram, f: MFunction): VerifyReport {
   let rep = VerifyReport { errors: wellFormed(p, f), warnings: [] };
   if (rep.errors.length > 0) {
     return rep;
   }
-  const ins = fixpoint(p, f);
+  let fx = new Fixpoint(p, f);
+  fx.run();
+  const ins = fx.ins;
   let b: usize = 0;
   while (b < f.blocks.length) {
     match (ins[b]) {
       None => {},
       Some(st) => {
-        const c = runBlock(p, f, b, st);
-        for (const e of c.errs) {
+        const t = runBlock(p, f, b, st);
+        // appended in a loop: `concat` would copy the report once per block
+        for (const e of t.errs) {
           rep.errors.push(e);
         }
-        for (const w of c.warns) {
+        for (const w of t.warns) {
           rep.warnings.push(w);
         }
         // Join rule: hole sets must agree on every edge into a block.
         for (const s of successors(f.blocks[b].term)) {
-          if (!holesEq(c.st.holes, ins[s].unwrap().holes)) {
-            rep.errors.push(issue(f, b, f.blocks[b].instrs.length, "hole sets differ at the join into block " + s.toString()));
+          if (!holesEq(t.holes, ins[s].unwrap().holes)) {
+            rep.errors.push(
+              issue(
+                f,
+                b,
+                f.blocks[b].instrs.length,
+                "hole sets differ at the join into block " + s.toString(),
+              ),
+            );
           }
         }
-      }
+      },
     }
     b += 1;
   }
   return rep;
 }
 
+// A vtable entry (v1.5) takes the boxed value as its first parameter (a reference) and has only borrowed parameters;
+// "" when it does.
+function vtableMsg(prog: MProgram, g: usize): string {
+  if (g >= prog.functions.length) {
+    return "vtable entry: function index out of range";
+  }
+  const h = prog.functions[g];
+  if (h.paramCount == 0 || h.locals.length == 0 || localClass(h, 0) != CRef) {
+    return "vtable entry " + h.name
+        + " must take the boxed value (a reference) as its first parameter";
+  }
+  if (h.paramOwned.some(o => o)) {
+    return "vtable entry " + h.name + " must have only borrowed parameters";
+  }
+  return "";
+}
+
+// Verifies every function of `prog`. No error means the program is well-formed (`isWellFormedProgram`, compiler/mir)
+// and every function follows the ownership discipline of docs/mir.md. Every issue names something that exists.
+@Ensures(result.errors.length == 0 ==> isWellFormedProgram(prog))
+@Ensures(reportPlaced(prog, result.errors) && reportPlaced(prog, result.warnings))
 export function verify(prog: MProgram): VerifyReport {
   let rep = VerifyReport { errors: [], warnings: [] };
   if (prog.main >= prog.functions.length) {
-    rep.errors.push(VerifyIssue { func: "<program>", block: 0, instr: 0, message: "main function index out of range", span: noSpan() });
+    rep.errors.push(VerifyIssue {
+      func: "<program>",
+      block: 0,
+      instr: 0,
+      message: "main function index out of range",
+      span: noSpan(),
+    });
   }
-  // Vtable entries (v1.5): the boxed value is the first parameter (a reference) and all parameters are borrowed.
   for (const v of prog.vtables) {
     for (const g of v.funcs) {
-      let msg = "";
-      if (g >= prog.functions.length) {
-        msg = "vtable entry: function index out of range";
-      } else if (prog.functions[g].paramCount == 0 || localClass(prog.functions[g], 0) != CRef) {
-        msg = "vtable entry " + prog.functions[g].name + " must take the boxed value (a reference) as its first parameter";
-      } else {
-        for (const o of prog.functions[g].paramOwned) {
-          if (o) {
-            msg = "vtable entry " + prog.functions[g].name + " must have only borrowed parameters";
-          }
-        }
-      }
+      const msg = vtableMsg(prog, g);
       if (msg != "") {
-        rep.errors.push(VerifyIssue { func: v.name, block: 0, instr: 0, message: msg, span: noSpan() });
+        rep.errors.push(VerifyIssue {
+          func: v.name,
+          block: 0,
+          instr: 0,
+          message: msg,
+          span: noSpan(),
+        });
       }
     }
   }
@@ -206,6 +372,11 @@ export function verify(prog: MProgram): VerifyReport {
 
 // Abstract in-state of every block of a well-formed function (None = unreachable). Used by the
 // optimiser (compiler/opt) to query ownership kinds; replay a block with `step` from rules.or.
+@Requires(isWellFormedFunction(p, f) && wfFunction(f) == "")
+@Ensures(result.length == f.blocks.length && result[0].isSome())
+@Ensures(statesSized(result, f.locals.length))
 export function blockInStates(p: MProgram, f: MFunction): Option<State>[] {
-  return fixpoint(p, f);
+  let fx = new Fixpoint(p, f);
+  fx.run();
+  return fx.ins;
 }

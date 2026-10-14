@@ -1,0 +1,336 @@
+// Nested slots through take / put (stage 4 of the MIR optimiser, see inplace.or for the one-level case).
+//
+// `rs[1].s = rs[1].s + t` or `this.a.b = f(this.a.b)`: the read walks the path with borrows and retains the last
+// value, the write takes the containers one by one, sets the last slot and puts the containers back:
+//
+//     r1 = arrayget a[k]; r2 = getfield r1.i; d = dup r2           makeunique a; t1 = arraytake a[k]; makeunique t1
+//     ..window..                                             =>    d = takefield t1.i
+//     makeunique a; t1 = arraytake a[k]; makeunique t1             ..window..
+//     setfield t1.i = v; arrayput a[k] = t1                        putfield t1.i = v; arrayput a[k] = t1
+//
+// The takes move in front of the window (nothing in the window may mention a, so no hole can be observed), and the
+// last level takes the slot instead of retaining it, so the value has a single owner and `strappend` / a mutating
+// callee works in place. The old container borrows are gone. Block-local; the verifier checks the result.
+
+import { MFunction, MBlock, MLocal, MType, Instr, Operand } from "../mir";
+import { Span } from "../diag";
+import { Counts, ancestors, usesAffecting, instrDef, isRefTy, countsOf } from "./analysis";
+import { sameKey, keyLocal, isMakeUniqueOf } from "./inplace";
+
+type Hop = { field: bool; idx: usize; key: Operand; };
+
+type Getter = { d: usize; src: usize; hop: Hop; };
+
+function getterOf(f: MFunction, ins: Instr): Option<Getter> {
+  return match (ins) {
+    IGetField(d, o, i) => match (o) {
+      OLocal(x) => isRefTy(f.locals[d].ty) ? Some(Getter { d: d, src: x, hop: Hop { field: true, idx: i, key: OInt(0) } }) : None,
+      _ => None
+    },
+    IArrayGet(d, o, k) => match (o) {
+      OLocal(x) => isRefTy(f.locals[d].ty) ? Some(Getter { d: d, src: x, hop: Hop { field: false, idx: 0, key: k } }) : None,
+      _ => None
+    },
+    _ => None
+  };
+}
+
+// `t = take obj.hop`: the local t, if the instruction is that take.
+function takeOf(ins: Instr, obj: usize, h: Hop): Option<usize> {
+  return match (ins) {
+    ITakeField(t, o, i) => (h.field && o == obj && i == h.idx) ? Some(t) : None,
+    IArrayTake(t, o, k) => (!h.field && o == obj && sameKey(k, h.key)) ? Some(t) : None,
+    _ => None
+  };
+}
+
+function isPutOf(ins: Instr, obj: usize, h: Hop, t: usize): bool {
+  return match (ins) {
+    IPutField(o, i, s) => h.field && o == obj && i == h.idx && s == t,
+    IArrayPut(o, k, s) => !h.field && o == obj && sameKey(k, h.key) && s == t,
+    _ => false
+  };
+}
+
+function storeOf(ins: Instr, obj: usize, h: Hop): Option<Operand> {
+  return match (ins) {
+    ISetField(x, i, v) => (h.field && x == obj && i == h.idx) ? Some(v) : None,
+    IArraySet(x, k, v) => (!h.field && x == obj && sameKey(k, h.key)) ? Some(v) : None,
+    _ => None
+  };
+}
+
+function mkTake(d: usize, obj: usize, h: Hop): Instr {
+  return h.field ? ITakeField(d, obj, h.idx) : IArrayTake(d, obj, h.key);
+}
+
+function mkPut(obj: usize, h: Hop, s: usize): Instr {
+  return h.field ? IPutField(obj, h.idx, s) : IArrayPut(obj, h.key, s);
+}
+
+function hasChainDup(f: MFunction): bool {
+  for (const blk of f.blocks) {
+    let i: usize = 1;
+    while (i < blk.instrs.length) {
+      match (blk.instrs[i]) {
+        IDup(_, _) => {
+          match (getterOf(f, blk.instrs[i - 1])) {
+            Some(_) => {
+              return true;
+            },
+            None => {}
+          }
+        },
+        _ => {}
+      }
+      i += 1;
+    }
+  }
+  return false;
+}
+
+// The read path ending at the dup at index i: the getters at i-n .. i-1 (each result used once, by the next getter or
+// the dup), outermost container x last. Returns the hops in path order (x -> .. -> slot) and x.
+type ReadPath = { n: usize; x: usize; path: Hop[]; };
+
+function readPath(f: MFunction, instrs: Instr[], cnt: Counts, i: usize, last: usize): ReadPath {
+  let hops: Hop[] = [];
+  let srcs: usize[] = [];
+  let cur = last;
+  let first = i;
+  let going = true;
+  while (going && first > 0) {
+    going = false;
+    match (getterOf(f, instrs[first - 1])) {
+      Some(g) => {
+        if (g.d == cur && cnt.uses[cur] == 1 && cnt.defs[cur] == 1 && g.src >= f.paramCount) {
+          hops.push(g.hop);
+          srcs.push(g.src);
+          cur = g.src;
+          first -= 1;
+          // continue while the source is itself a single-use getter result
+          if (first > 0 && cnt.uses[cur] == 1 && cnt.defs[cur] == 1) {
+            match (getterOf(f, instrs[first - 1])) {
+              Some(g2) => {
+                if (g2.d == cur) {
+                  going = true;
+                }
+              },
+              None => {}
+            }
+          }
+        }
+      },
+      None => {}
+    }
+  }
+  const n = hops.length;
+  let path: Hop[] = [];
+  let k: usize = n;
+  while (k > 0) {
+    k -= 1;
+    path.push(hops[k]);
+  }
+  return ReadPath { n: n, x: n > 0 ? srcs[n - 1] : 0, path: path };
+}
+
+export function takePutChains(f: MFunction): MFunction {
+  if (!hasChainDup(f)) {
+    return f;
+  }
+  const anc = ancestors(f);
+  const cnt = countsOf(f);
+  let locals = f.locals;
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    const instrs = blk.instrs;
+    let out: Instr[] = [];
+    let sps: Span[] = [];
+    let changed = false;
+    let i: usize = 0;
+    while (i < instrs.length) {
+      let handled = false;
+      match (instrs[i]) {
+        IDup(d2, o) => {
+          match (o) {
+            OLocal(last) => {
+              const rp = readPath(f, instrs, cnt, i, last);
+              const n = rp.n;
+              if (n >= 2 && n <= 4) {
+                const x = rp.x;
+                const path = rp.path;
+                // the window runs until the write chain starts: `makeunique x` or the first take
+                let start = i + 1;
+                let found = false;
+                let clean = true;
+                while (start < instrs.length && !found && clean) {
+                  const ins = instrs[start];
+                  let isStart = isMakeUniqueOf(ins, x);
+                  match (takeOf(ins, x, path[0])) {
+                    Some(_) => {
+                      isStart = true;
+                    },
+                    None => {}
+                  }
+                  if (isStart) {
+                    found = true;
+                  } else {
+                    if (usesAffecting(anc, ins, x)) {
+                      clean = false;
+                    }
+                    match (instrDef(ins)) {
+                      Some(dd) => {
+                        if (dd == x) {
+                          clean = false;
+                        }
+                        for (const h of path) {
+                          match (keyLocal(h.key)) {
+                            Some(kl) => {
+                              if (kl == dd) {
+                                clean = false;
+                              }
+                            },
+                            None => {}
+                          }
+                        }
+                      },
+                      None => {}
+                    }
+                    if (clean) {
+                      start += 1;
+                    }
+                  }
+                }
+                if (found && clean) {
+                  // the write chain: [makeunique x] (take [makeunique t])* store puts
+                  let pos = start;
+                  let okc = true;
+                  let obj = x;
+                  let ts: usize[] = [];
+                  if (isMakeUniqueOf(instrs[pos], x)) {
+                    pos += 1;
+                  }
+                  let lvl: usize = 0;
+                  while (okc && lvl + 1 < n) {
+                    if (pos >= instrs.length) {
+                      okc = false;
+                    } else {
+                      match (takeOf(instrs[pos], obj, path[lvl])) {
+                        Some(t) => {
+                          ts.push(t);
+                          obj = t;
+                          pos += 1;
+                          if (pos < instrs.length && isMakeUniqueOf(instrs[pos], t)) {
+                            pos += 1;
+                          }
+                          lvl += 1;
+                        },
+                        None => {
+                          okc = false;
+                        }
+                      }
+                    }
+                  }
+                  if (okc && pos < instrs.length) {
+                    const prefixEnd = pos;
+                    match (storeOf(instrs[pos], obj, path[n - 1])) {
+                      Some(v) => {
+                        let tail: Instr[] = [];
+                        let okv = true;
+                        match (v) {
+                          OLocal(l) => {
+                            tail.push(mkPut(obj, path[n - 1], l));
+                          },
+                          OStr(sn) => {
+                            const t = locals.length;
+                            locals.push(MLocal { name: "_", ty: MRef });
+                            tail.push(ICopy(t, OStr(sn)));
+                            tail.push(mkPut(obj, path[n - 1], t));
+                          },
+                          _ => {
+                            okv = false;
+                          }
+                        }
+                        // the puts, innermost container first
+                        let q = pos + 1;
+                        let lv = n - 1;
+                        while (okv && lv > 0) {
+                          const container = lv == 1 ? x : ts[lv - 2];
+                          if (q < instrs.length && isPutOf(instrs[q], container, path[lv - 1], ts[lv - 1])) {
+                            q += 1;
+                            lv -= 1;
+                          } else {
+                            okv = false;
+                          }
+                        }
+                        if (okv) {
+                          changed = true;
+                          handled = true;
+                          // drop the read path (the getters were emitted before), then: the write prefix (moved up),
+                          // the take of the slot, the window, the store as a put, the puts
+                          let r: usize = 0;
+                          while (r < n) {
+                            out.pop();
+                            sps.pop();
+                            r += 1;
+                          }
+                          let m = start;
+                          while (m < prefixEnd) {
+                            out.push(instrs[m]);
+                            sps.push(blk.spans[m]);
+                            m += 1;
+                          }
+                          out.push(mkTake(d2, obj, path[n - 1]));
+                          sps.push(blk.spans[i]);
+                          m = i + 1;
+                          while (m < start) {
+                            out.push(instrs[m]);
+                            sps.push(blk.spans[m]);
+                            m += 1;
+                          }
+                          for (const tt of tail) {
+                            out.push(tt);
+                            sps.push(blk.spans[pos]);
+                          }
+                          m = pos + 1;
+                          while (m < q) {
+                            out.push(instrs[m]);
+                            sps.push(blk.spans[m]);
+                            m += 1;
+                          }
+                          i = q;
+                        }
+                      },
+                      None => {}
+                    }
+                  }
+                }
+              }
+            },
+            _ => {}
+          }
+        },
+        _ => {}
+      }
+      if (!handled) {
+        out.push(instrs[i]);
+        sps.push(blk.spans[i]);
+        i += 1;
+      }
+    }
+    if (!changed) {
+      blocks.push(blk);
+    } else {
+      blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+    }
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: f.inout,
+    locals: locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
