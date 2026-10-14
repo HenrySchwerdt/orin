@@ -1,0 +1,87 @@
+// Values of the lowering (docs/mir.md, ownership rules). The lowering of an expression leaves its instructions in the
+// block builder and returns a `V`: the operand that holds the value and how the consumer has to treat it.
+//
+// Values (`V`) carry an ownership kind:
+//   KS  scalar, or an immortal string literal operand: nothing to release
+//   KO  `op` is a fresh Owned temp: the consumer must release or consume it
+//   KB  `op` is a local that is only borrowed (a param, an HIR local or a Borrowed temp);
+//       `root`/`stable` say which local it lives in and whether that local can change
+//       (stable = the root is immutable: a param, a `const`, a pattern binding, a loop variable)
+
+import { Operand } from "../mir";
+
+export type Kind = KS | KO | KB;
+
+export function kindIsO(k: Kind): bool {
+  return match (k) {
+    KO => true,
+    _ => false,
+  };
+}
+
+export function kindIsB(k: Kind): bool {
+  return match (k) {
+    KB => true,
+    _ => false,
+  };
+}
+
+export function localOf(op: Operand): usize {
+  return match (op) {
+    OLocal(l) => l,
+    _ => 0,
+  };
+}
+
+export function isLocalOp(op: Operand): bool {
+  return match (op) {
+    OLocal(_) => true,
+    _ => false,
+  };
+}
+
+export function isOStr(op: Operand): bool {
+  return match (op) {
+    OStr(_) => true,
+    _ => false,
+  };
+}
+
+// A value that has to be tracked (owned or borrowed) is held in a local; only a scalar or a literal is an immediate.
+@Invariant(kindIsK(this.k) || isLocalOp(this.op))
+export type V = { op: Operand; k: Kind; root: usize; stable: bool; };
+
+function kindIsK(k: Kind): bool {
+  return match (k) {
+    KS => true,
+    _ => false,
+  };
+}
+
+// The arguments of a call (or of any operation that evaluates a sequence of expressions): per argument its operand,
+// whether it is a fresh Owned temp that the caller must release or consume, and the root local and stability of a
+// borrowed one. The four arrays are parallel.
+@Invariant(this.ops.length == this.own.length
+    && this.ops.length == this.roots.length
+    && this.ops.length == this.stab.length)
+export type Args = { ops: Operand[]; own: bool[]; roots: usize[]; stab: bool[]; };
+
+// A constant or a literal: nothing to release.
+export function vConst(op: Operand): V {
+  return V { op: op, k: KS, root: 0, stable: true };
+}
+
+// The value of a `void` expression.
+export function vVoid(): V {
+  return V { op: OInt(0), k: KS, root: 0, stable: true };
+}
+
+// A fresh Owned reference in local `t`.
+export function vOwned(t: usize): V {
+  return V { op: OLocal(t), k: KO, root: t, stable: true };
+}
+
+// A scalar in local `t`.
+export function vScalar(t: usize): V {
+  return V { op: OLocal(t), k: KS, root: t, stable: true };
+}

@@ -60,7 +60,10 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      extend by "disjoint heaps, send transfers ownership" instead of a new memory model;
    - *before performance*, because allocation, RC elision and escape analysis depend on the
      threading model, and the comparison with Go needs parallelism;
-   - the HTTP server becomes concurrent here.
+   - the HTTP server becomes concurrent here;
+   - parallel array pipelines (`xs.parallel()`, ADR-0039) build on the task pool, fusion and borrow inference.
+     Every closure must be pure, a `reduce` must be associative (built-in operator or proved), and chunks have a
+     fixed size, so the result is reproducible.
 6. **Performance push** (performance model: ADR-0038, inferred allocation and invariant-driven optimisation, no user-facing arena types):
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
@@ -76,6 +79,18 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - every optimisation is translation-validated or proved; the goal is at least on par with Go,
      measured.
 7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
+8. **WebAssembly target** (project owner, 2026-10-14, at the very end):
+   - **Toolchain:** the LLVM backend's `.ll` goes through `clang --target=wasm64-wasip1` (or `wasm32`) with
+     wasi-libc.
+   - **Prerequisite:** R3/R4 are done, so L0 is the only C and only L0 needs a second implementation.
+   - **Capabilities:** WASI is capability-based itself. `host.fs()` maps to the host's preopened directories, and
+     `useUnder` / `useReadOnly` map to subtrees of them.
+   - **Pointer width:** `usize` is i64 in the IR today, so wasm64 (Memory64) is the first target. wasm32 needs a
+     target-dependent `usize`.
+   - **Limits:** sockets need WASI preview 2, and threads need wasi-threads. Until then `std:net` and `.parallel()`
+     are limited or sequential there, and this is documented.
+   - **Browser:** a browser target uses an L0 over imported JS host functions, which pairs with JSX.
+   - **CI:** all suites run under `wasmtime`.
 
 ### 1. Language 1.0 core (ADR-0016), then a two-stage freeze
 - **done:**
@@ -103,6 +118,22 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   2. **std I/O freeze** after capabilities. Stage A has landed, so the signatures are now the
      proposed final ones (`std:host`, `std:fs`, `std:process`, `std:io`, `std:time` take grants);
      they stay *unstable* until the project owner confirms the freeze (ADR-0027 open questions).
+- **Agent ergonomics, measured before the 1.0 release** (project owner, 2026-10-14):
+  - **Benchmark:** a fixed set of about 20 tasks (HTTP service, parser, ledger with invariants, CLI tool, data
+    processing) is solved by fresh agents with no prior Orin knowledge.
+  - **Measured:**
+    - fix rounds until green;
+    - the most frequent diagnostic codes;
+    - where agents give up or loop.
+  - **Response per frequent trap:**
+    - **Pure syntax** with no effect on the guarantees: move it towards TypeScript, through an ADR because the
+      language is frozen.
+    - **A recognisable TS idiom** with a different meaning, such as `try/catch`, `null` or ambient `fs`: a targeted
+      diagnostic with a machine-readable quick-fix.
+    - **A safety core**, such as `const` meaning immutable under value semantics, or I/O only with a grant: stays,
+      with a better explanation and `orin explain`.
+  - **Repeated** after every major step. "Rounds until green" becomes a tracked language metric, next to the
+    benchmarks.
 
 ### 1c. Provable std foundation (ADR-0030 §3, "bytes and text" + "collections"): done
 - `std:bytes` (`Bytes`, `ByteBuilder`, `ByteReader`), `std:utf8` (validated decoding, `Utf8String`,

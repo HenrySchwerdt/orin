@@ -23,7 +23,7 @@ import { FsGrant } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { StdioGrant } from "std:io";
 import { writeFile } from "std:fs";
-import { SourceMap, Diagnostic, render } from "./diag";
+import { SourceMap, Diagnostic, render, describeSpan } from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
 import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts } from "./check";
@@ -35,8 +35,8 @@ import { readFile } from "std:fs";
 import { lower } from "./lower";
 import { emitC } from "./cemit";
 import { emitLlvm } from "./llvm";
-import { MProgram, printProgram } from "./mir";
-import { verify } from "./verify";
+import { MProgram, printProgram, hasSpan } from "./mir";
+import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
 import { runFmt, printDiagnosticsJson } from "./tools";
 import { runLsp } from "./lsp";
@@ -91,14 +91,21 @@ function policyCheck(program: LoadedProgram, sm: SourceMap, json: bool): void {
 }
 
 // Runs the verifier; prints errors (and warnings when `verbose`). Returns the error count.
-function runVerify(prog: MProgram, verbose: bool): usize {
+// An issue is located by function, block and instruction index and, when the MIR carries source positions
+// (docs/mir.md v2.0), by `path:line:col` of the HIR node it was lowered from: `f b3 i2 at src/a.or:12:5: message`.
+function issueWhere(sm: SourceMap, d: VerifyIssue): string {
+  const where = d.func + " b" + d.block.toString() + " i" + d.instr.toString();
+  return hasSpan(d.span) ? where + " at " + describeSpan(sm, d.span) : where;
+}
+
+function runVerify(prog: MProgram, sm: SourceMap, verbose: bool): usize {
   const rep = verify(prog);
   for (const d of rep.errors) {
-    console.error("verify error: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+    console.error("verify error: " + issueWhere(sm, d) + ": " + d.message);
   }
   if (verbose) {
     for (const d of rep.warnings) {
-      console.log("warning: " + d.func + " b" + d.block.toString() + " i" + d.instr.toString() + ": " + d.message);
+      console.log("warning: " + issueWhere(sm, d) + ": " + d.message);
     }
     console.log("verify: " + rep.errors.length.toString() + " errors, " + rep.warnings.length.toString() + " warnings");
   }
@@ -297,14 +304,14 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   if (cmd == "verify") {
-    if (runVerify(noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap())), true) > 0) {
+    if (runVerify(noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap())), loaded.sm, true) > 0) {
       exit(1);
     }
     return;
   }
   let c = "";
   const mir = noOpt ? lower(checked.unwrap()) : optimize(lower(checked.unwrap()));
-  if (!noVerify && runVerify(mir, false) > 0) {
+  if (!noVerify && runVerify(mir, loaded.sm, false) > 0) {
     console.error("error: internal compiler error: MIR ownership verification failed");
     exit(70);
     return;

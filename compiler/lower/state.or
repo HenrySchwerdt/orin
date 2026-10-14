@@ -1,0 +1,180 @@
+// The bookkeeping state of one function's lowering: the MIR locals (`Locals`) and the owned locals that are live at
+// the current program point together with the loops that are open (`OwnedScope`).
+
+import { MType, MLocal } from "../mir";
+import { mtyEq } from "./util";
+
+// ---------------------------------------------------------------- locals
+
+// The MIR locals of a function: the HIR locals (parameters first) as given, then the temporaries the lowering creates. A
+// temporary's id is its index, so a fresh id is never an id that was handed out before.
+@Invariant(this.nHir <= this.ls.length)
+export class Locals {
+  private ls: MLocal[];
+  private nHir: usize;
+
+  constructor(ls: MLocal[]) {
+    this.ls = ls;
+    this.nHir = ls.length;
+  }
+
+  // Number of locals (HIR locals and temporaries).
+  count(): usize {
+    return this.ls.length;
+  }
+
+  // Number of locals that come from the HIR function.
+  hirCount(): usize {
+    return this.nHir;
+  }
+
+  // Number of temporaries created so far.
+  temps(): usize {
+    return this.ls.length - this.nHir;
+  }
+
+  @Requires(l < this.ls.length)
+  tyOf(l: usize): MType {
+    return this.ls[l].ty;
+  }
+
+  // The declaration table, in id order.
+  table(): MLocal[] {
+    return this.ls;
+  }
+
+  // A new temporary of type `ty`; its id is the old length of the table, so ids are unique and dense.
+  @Ensures(result == old(this.ls.length) && this.ls.length == result + 1 && result >= this.nHir)
+  @Ensures(mtyEq(this.ls[result].ty, ty) && this.ls[result].name == "_")
+  fresh(ty: MType): usize {
+    const id = this.ls.length;
+    this.ls.push(MLocal { name: "_", ty: ty });
+    return id;
+  }
+}
+
+// ---------------------------------------------------------------- owned locals and loops
+
+// An open loop: the number of owned locals when it was entered (a `break` / `continue` releases the ones above the mark)
+// and its two targets, the exit label and the continue label.
+export type Loop = { mark: usize; brk: usize; cont: usize; };
+
+// The marks of the open loops never decrease and never exceed the number of owned locals.
+export function loopsOrdered(loops: Loop[], depth: usize): bool {
+  let prev: usize = 0;
+  for (const l of loops) {
+    if (l.mark < prev || l.mark > depth) {
+      return false;
+    }
+    prev = l.mark;
+  }
+  return true;
+}
+
+// All distinct (no value occurs twice).
+export function distinctLocals(xs: usize[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (xs[i] == xs[j]) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Every owned local (a parameter copy, a temporary, a `let`) that is live at the current program point, innermost last:
+// an early exit (`return`, `break`, `continue`, `?`) releases exactly those. `loops` is the stack of open loops. A local is
+// registered once: registering it twice would release it twice.
+@Invariant(loopsOrdered(this.loops, this.vars.length))
+export class OwnedScope {
+  private vars: usize[] = [];
+  private loops: Loop[] = [];
+
+  // Number of owned locals.
+  depth(): usize {
+    return this.vars.length;
+  }
+
+  // Number of open loops.
+  loopDepth(): usize {
+    return this.loops.length;
+  }
+
+  contains(l: usize): bool {
+    return this.vars.includes(l);
+  }
+
+  @Requires(!this.contains(l))
+  @Ensures(this.vars.length == old(this.vars.length) + 1 && this.contains(l))
+  push(l: usize): void {
+    this.vars.push(l);
+  }
+
+  // Forgets the owned locals above `n` (a scope ended and released them). A loop's own locals stay.
+  @Requires(n <= this.vars.length)
+  @Requires(this.loops.length == 0 || n >= this.loops[this.loops.length - 1].mark)
+  @Ensures(this.vars.length == n)
+  truncate(n: usize): void {
+    while (this.vars.length > n) {
+      this.vars.pop();
+    }
+  }
+
+  // Enters a loop whose exit label is `brk` and whose continue label is `cont`.
+  @Ensures(this.loops.length == old(this.loops.length) + 1)
+  @Ensures(this.loopMark() == this.vars.length && this.brk() == brk && this.cont() == cont)
+  enterLoop(brk: usize, cont: usize): void {
+    this.loops.push(Loop { mark: this.vars.length, brk: brk, cont: cont });
+  }
+
+  @Requires(this.loops.length > 0)
+  @Ensures(this.loops.length + 1 == old(this.loops.length))
+  leaveLoop(): void {
+    this.loops.pop();
+  }
+
+  // The owned locals above `lo`, innermost first (the order in which they are released).
+  @Ensures(result.length == (lo < this.vars.length ? this.vars.length - lo : 0))
+  owned(lo: usize): usize[] {
+    let out: usize[] = [];
+    let i = this.vars.length;
+    while (i > lo) {
+      i -= 1;
+      out.push(this.vars[i]);
+    }
+    return out;
+  }
+
+  // Every owned local but `keep`, innermost first.
+  @Ensures(result.every(x => x != keep))
+  ownedExcept(keep: usize): usize[] {
+    let out: usize[] = [];
+    let i = this.vars.length;
+    while (i > 0) {
+      i -= 1;
+      if (this.vars[i] != keep) {
+        out.push(this.vars[i]);
+      }
+    }
+    return out;
+  }
+
+  // The owned locals a `break` / `continue` out of the innermost loop releases start here (0 outside any loop, as the
+  // code before the rewrite).
+  loopMark(): usize {
+    return this.loops.length == 0 ? 0 : this.loops[this.loops.length - 1].mark;
+  }
+
+  brk(): usize {
+    return this.loops.length == 0 ? 0 : this.loops[this.loops.length - 1].brk;
+  }
+
+  cont(): usize {
+    return this.loops.length == 0 ? 0 : this.loops[this.loops.length - 1].cont;
+  }
+}
