@@ -160,3 +160,39 @@ function refusals(host: Host): void {
     assert(c.isErr(), "port out of range");
   });
 }
+
+@Test
+function readUntilNeverBuffersPastTheLimit(host: Host): void {
+  useNet(host, net => {
+    const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
+      pair(ln, n, (c: Stream) => {
+        sendAll(c, bytesFromString("0123456789"), 1000);
+      }, (s: Stream) => {
+        let rd = new StreamReader(64);
+        rd.unread(bytesFromString("xx"));
+        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\n"), 4, 500)), "limit", "no delimiter within 4 bytes");
+        assertEqUsize(rd.buffered().length(), 4, "two bytes were already buffered, so only two more were received");
+      });
+    });
+    assert(l.isOk(), "listener");
+  });
+}
+
+@Test
+function readUntilDeadline(host: Host): void {
+  useNet(host, net => {
+    const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
+      pair(ln, n, (c: Stream) => {
+        sendAll(c, bytesFromString("abc"), 1000);
+      }, (s: Stream) => {
+        let rd = new StreamReader(64);
+        const t0 = nowMillis(s);
+        assertEqString(fillKind(rd.readUntil(s, bytesFromString("\n"), 64, 150)), "timeout", "the delimiter never comes");
+        const dt = nowMillis(s) - t0;
+        assert(dt >= 120 && dt < 3000, "readUntil honours its deadline: " + dt.toString());
+        assertEqUsize(rd.buffered().length(), 3, "the bytes that did arrive stay buffered");
+      });
+    });
+    assert(l.isOk(), "listener");
+  });
+}

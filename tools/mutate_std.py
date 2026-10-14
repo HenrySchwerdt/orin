@@ -6,7 +6,7 @@ test file are copied to build/mutate_std/, the std imports are rewritten to rela
 `orin test` is run twice: with runtime contract checking (the default) and with `--no-contracts`. A mutant is
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
 
-Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http] [--list]
+Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http|net] [--list]
 Exit status 1 if any mutant survives (is not killed with contracts on).
 """
 import argparse
@@ -132,6 +132,65 @@ MUTANTS = [
     ("http", "limits-ctor-skips-validation", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, \"invalid Limits\");", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776 || true, \"invalid Limits\");", "http_limits_ctor_rejects_zero"),
 ]
 
+# std:net mutants (module "net"): stdlib/net.or imports the internal std:fsraw, so a copy outside the library root cannot be
+# compiled. These mutants are applied to stdlib/net.or in place, the compiler (which embeds the library) is rebuilt with the
+# given compiler, and tests/std/net_test.or runs with the mutated compiler; stdlib/net.or is restored afterwards.
+NET_MUTANTS = [
+    ("net", "findFrom-misses-delimiter-at-end", "  while (i + m <= n) {", "  while (i + m < n) {"),
+    ("net", "readUntil-receives-past-the-limit", "const r = recv(s, limit - this.pending.length(), left);", "const r = recv(s, limit, left);"),
+    ("net", "readExact-reports-short-read-as-timeout", "        RecvEof => {\n          return FillClosed(this.take(this.pending.length()));\n        },\n        RecvTimeout => {\n          return FillTimeout;\n        },\n        RecvReset => {\n          return FillError(makeError(CODE_RESET));\n        },\n        RecvError(e) => {\n          return FillError(e);\n        }\n      }\n    }\n    return Filled(this.take(n));", "        RecvEof => {\n          return FillTimeout;\n        },\n        RecvTimeout => {\n          return FillTimeout;\n        },\n        RecvReset => {\n          return FillError(makeError(CODE_RESET));\n        },\n        RecvError(e) => {\n          return FillError(e);\n        }\n      }\n    }\n    return Filled(this.take(n));"),
+    ("net", "readExact-loop-bound", "    while (this.pending.length() < n) {\n      const left", "    while (this.pending.length() <= n) {\n      const left"),
+    ("net", "parsePeer-keeps-brackets", "h = h.substring(1, h.length - 1);", "h = h;"),
+    ("net", "isDenied-wrong-code", "return e.code == CODE_DENIED;", "return e.code == CODE_TIMEOUT;"),
+    ("net", "recv-ignores-maxBytes", "const r = netRecv(s, maxBytes, clampMs(timeoutMs));", "const r = netRecv(s, 65536, clampMs(timeoutMs));"),
+    ("net", "readUntil-deadline-ignored", "    const deadline = netNow(s) + clampMs(timeoutMs);\n    let begin: usize = 0;", "    const deadline = netNow(s) + 1000000;\n    let begin: usize = 0;"),
+]
+
+
+def run_net_mutants(orinc):
+    """Applies each NET_MUTANT in place, rebuilds the compiler, runs net_test; returns the number of survivors."""
+    import subprocess as sp
+    path = os.path.join(ROOT, "stdlib", "net.or")
+    emb = os.path.join(ROOT, "compiler", "loader", "embedded_stdlib.or")
+    orig = open(path, encoding="utf-8").read()
+    orig_emb = open(emb, encoding="utf-8").read()
+    survivors = 0
+    try:
+        for mod, name, old, new in NET_MUTANTS:
+            if orig.count(old) < 1:
+                print("BAD MUTANT %s/%s: pattern not found" % (mod, name))
+                return 2
+            d = os.path.join(OUT, "net_" + name)
+            os.makedirs(d, exist_ok=True)
+            open(path, "w", encoding="utf-8").write(orig.replace(old, new, 1))
+            sp.run([sys.executable, os.path.join(ROOT, "tools", "embed_prelude.py")], cwd=ROOT, check=True, stdout=sp.DEVNULL)
+            c = os.path.join(d, "orin.c")
+            r1 = sp.run([orinc, "compile", "compiler/main.or", "-o", c], cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
+            r2 = sp.run(["cc", "-O0", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", os.path.join(d, "orin")],
+                        cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
+            if r1.returncode or r2.returncode:
+                print("COMPILE ERROR in mutant net/%s:\n%s" % (name, (r1.stdout + r2.stdout).decode()[:600]))
+                return 2
+            fails = []
+            for flag in ([], ["--no-contracts"]):
+                try:
+                    t = sp.run([os.path.join(d, "orin"), "test", "tests/std/net_test.or", "--runtime", "runtime"] + flag, cwd=ROOT,
+                               stdout=sp.PIPE, stderr=sp.STDOUT, timeout=120)
+                except sp.TimeoutExpired:  # a mutant that waits forever is a failing test
+                    fails.append(1)
+                    continue
+                out = t.stdout.decode("utf-8", "replace")
+                fails.append(len(re.findall(r"^FAIL ", out, re.M)) + (1 if t.returncode and "error[" not in out and not re.search(r"^FAIL ", out, re.M) else 0))
+            status = "killed" if fails[0] else "SURVIVED"
+            if status == "SURVIVED":
+                survivors += 1
+            print("%-12s %-44s %-9s tests failing: %2d; without contracts: %2d" % (mod, name, status, fails[0], fails[1]), flush=True)
+    finally:
+        open(path, "w", encoding="utf-8").write(orig)
+        open(emb, "w", encoding="utf-8").write(orig_emb)
+    return 1 if survivors else 0
+
+
 # further test files of a module that also run against every mutant
 EXTRA_TESTS = {"utf8": ["utf8_dfa_test"], "collections": ["sorted_btree_test"],
                "http": ["http_reject_test", "http_split_test", "http_prop_test"]}
@@ -158,12 +217,14 @@ def main():
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
-        for m in MUTANTS:
+        for m in MUTANTS + NET_MUTANTS:
             print(m[0], m[1])
         return 0
     orinc = os.path.join(ROOT, a.orinc)
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
+    if a.module == "net":
+        return run_net_mutants(orinc)
     mods = ["bytes", "utf8", "collections", "http"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     survivors = 0
@@ -172,6 +233,8 @@ def main():
         mod, name, old, new = mutant[:4]
         extra = mutant[4] if len(mutant) > 4 else ""
         if a.module and a.module != mod:
+            continue
+        if mod == "net":
             continue
         src = open(os.path.join(ROOT, "stdlib", mod + ".or"), encoding="utf-8").read()
         if src.count(old) < 1:
