@@ -91,3 +91,14 @@ Honest limits found:
 - Listening takes a numeric address only (no DNS); IPv4 and IPv6; UDP is still a later amendment.
 - Not enforced: bandwidth, connection count, the OS's own backlog and port rules, TOCTOU between scope check and use on a
   handle table that a hostile native library could write.
+
+**Orin side (as built).** `NetGrant` is `TyGrant(5)`, `Listener` `TyGrant(6)`, `Stream` `TyGrant(7)`: handles of the grant table
+(generation-checked), not new mechanisms. `std:host.useNet(host, net => ...)` gives the root grant. `std:net.useListen(net,
+addr, port, l => ...)` and `useConnect(net, hostPattern, portLo, portHi, c => ...)` narrow it (`listenGrant`, `connectGrant`
+of §2); `useListener` / `useAccepted` / `useConnection` open and close the resources. Ten built-ins of the internal
+`std:fsraw` carry the primitives (`grantNet`, `grantListen`, `grantConnect`, `netListen`, `netAccept`, `netConnect`, `netClose`,
+`netRecv`, `netSend`, `netShutdown`, plus `netStatus`, `netPort`, `netNow`, `netPeer`, `netResolve`, `netErrorText`); the
+verifier treats `netListen` / `netAccept` / `netConnect` as openers and `netClose` as the closer. `E0470` / `E0471` now apply to
+any function whose first parameter is a grant (not only the built-ins). OSIG: `Net.Bind`, `Net.Accept`, `Net.Connect`,
+`Stream.Read`, `Stream.Write`, `Net.Narrow` with the directions of §2 (accept and recv INPUT, send OUTPUT, listen and connect
+CONTROL). No seed bridge was needed: only new runtime functions were added.

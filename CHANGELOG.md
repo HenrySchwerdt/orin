@@ -1,6 +1,17 @@
 # Changelog
 
 ## Unreleased
+- **`std:net`: blocking TCP, and an HTTP server on `std:http` (ADR-0033).** New L0 functions (`tcp_listen`, `tcp_accept`,
+  `tcp_connect`, `stream_recv`, `stream_send`, `net_shutdown`, `net_close`, `net_narrow`, `dns_resolve`,
+  `monotonic_millis`; 685 code lines for the whole layer, budget now counted in code lines without contracts and comments, ADR-0030 §1),
+  each with a contract; handle identity, scope and `ORIN_DENY=net` are checked before any system call (EPERM); CBMC harnesses for
+  the recv / send buffer bounds, "narrowing never widens" and "refused before any syscall" (found and fixed: an errno of 0 could make
+  a failed recv look like success). New `NetGrant` / `Listener` / `Stream` resources, `useNet`, `useListen`, `useConnect`, `std:net`
+  (`useListener`, `useAccepted`, `useConnection`, `recv`, `sendAll`, `StreamReader.readExact/readUntil`, `resolve`, deadlines,
+  half-close), 16 internal built-ins re-checked by the MIR verifier, OSIG `Net.*` / `Stream.*` effects, E0470 / E0471 for every
+  function whose first parameter is a grant. `examples/http_server.or`; `tools/test_net.sh` (Linux and macOS CI): curl and raw-socket
+  checks, a slowloris client cut off by the deadline, narrowed-scope refusals from an Orin client, `ORIN_DENY=net`. One connection
+  at a time until tasks exist (ADR-0017).
 - **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0036).** `orin verify --contracts` now encodes arrays
   (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
   `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by

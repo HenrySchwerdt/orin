@@ -141,6 +141,9 @@ explaining path, added/removed edges, impact on entry points.
   (`MAY` inside a closure). `console.*` and `exit` are `ambient` (they need no grant). These are call sites, not effect
   summaries: a function that only *calls* one that performs I/O has no edge of its own (transitive inference is Stage B),
   and a call through a function value is `~unknown`, so an absent edge never proves the absence of I/O.
+- **Network (ADR-0033):** `Net.Bind` (CONTROL), `Net.Accept` (INPUT), `Net.Connect` (CONTROL; also name resolution),
+  `Stream.Read` (INPUT), `Stream.Write` (OUTPUT; also half-close), `Net.Narrow` (CONTROL) for the primitives and the
+  `std:net` functions that wrap them (`useListener`, `useAccepted`, `useConnection`, `recv`, `sendAll`, `useListen`, ...).
 - **Not modelled yet:** transitive effects, FFI, field reads/writes, data flow, grant chains and runtime events,
   `std:` imports as edges. They arrive with phases 2 and 3 as additive schema versions.
 - **Renames are guesses.** Same-signature matching misses a rename with a signature change and can

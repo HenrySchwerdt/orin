@@ -78,7 +78,7 @@ grants at once with `useHost`, pass grants as arguments to helper functions, or 
 | Process | `ProcessGrant` | `Process.Args` (INPUT), `Process.Spawn` (`shell`, CONTROL); narrowing `argsOnly` removes Spawn | |
 | Stdio | `StdioGrant` | `Stdio.Read` (`readLine`, `readBytes`), `Stdio.Write` (`writeStdout`) | INPUT / OUTPUT |
 | Clock | `ClockGrant` | `Clock.Now` | INPUT |
-| Network | `NetGrant` | **reserved**: `Net.Bind`, `Net.Accept`, `Net.Connect` (CONTROL), `Stream.Read` (INPUT), `Stream.Write` (OUTPUT), exactly the operations of ADR-0021 Feasibility. No `std:net` exists; `TyGrant(5)`, the policy name `net` and the family bit are reserved so that Stage B adds the module and the platform operations without a new mechanism | |
+| Network | `NetGrant` | **implemented by ADR-0033** (was reserved): `Net.Bind`, `Net.Accept`, `Net.Connect` (CONTROL), `Stream.Read` (INPUT), `Stream.Write` (OUTPUT), exactly the operations of ADR-0021 Feasibility. No `std:net` exists; `TyGrant(5)`, the policy name `net` and the family bit are reserved so that Stage B adds the module and the platform operations without a new mechanism | |
 | Environment | -- | no `std:env` exists. Reserved name `Env.Get` (INPUT) under the process family decision of the owner | |
 
 **D4. `main()` without `host` has no authority: a compile error, not a runtime denial.** Every I/O function's first
