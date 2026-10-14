@@ -14,6 +14,8 @@ $ORIN2 test compiler/tests/loader_test.or --runtime runtime
 # checker unit tests: the env / fnctx foundation (2a) and the body checker's classes (2b)
 $ORIN2 test compiler/tests/check_env_test.or --runtime runtime
 $ORIN2 test compiler/tests/check_body_test.or --runtime runtime
+# lowering unit tests (3a): block builder, locals, owned scope, place walk, MIR spans, Lowerer end to end
+$ORIN2 test compiler/tests/lower_test.or --runtime runtime
 $ORIN2 test compiler/tests/quality_test.or --runtime runtime
 sh tools/test_resources.sh
 sh tools/test_capabilities.sh
