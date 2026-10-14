@@ -14,7 +14,7 @@ import { Span, SourceFile, Diagnostic, span } from "../diag";
 import { Ident, TypeExpr, TNamed, BinaryOp } from "../syntax";
 import {
   Type, Local, Function, Program, HBlock, HStmt, HExpr, HExprKind, HArm, HPattern, VariantDef,
-  RecordDef, FieldDef, Place, PlaceElem, BinOp,
+  RecordDef, FieldDef, FieldInitH, Place, PlaceElem, BinOp, UnOp, Builtin, MutBuiltin,
 } from "../hir";
 import { loadWithOverlay } from "../loader";
 import {
@@ -590,6 +590,95 @@ function blockBoundCoversStatements(): void {
   assertEqBool(functionBound(f), true, "a function over its own locals");
 }
 
+// Every kind of expression and statement is searched for dangling locals: a mutant of `localsBound` that
+// skips one kind is caught here.
+@Test
+function localsBoundLooksInsideEveryNodeKind(): void {
+  const bad = mk(XLocal(9), TyInt, sp());
+  const ok = mk(XInt(1), TyInt, sp());
+  const kindsOfExpr: HExpr[] = [
+    mk(XUnary(UnNeg, bad), TyInt, sp()),
+    mk(XBinary(OpAdd, ok, bad), TyInt, sp()),
+    mk(XBinary(OpAdd, bad, ok), TyInt, sp()),
+    mk(XCall(0, [ok, bad]), TyInt, sp()),
+    mk(XBuiltin(BStrLength, [bad]), TyUsize, sp()),
+    mk(XMutMethod(MArrPush, Place { root: 0, path: [], ty: TyArray(TyInt) }, [bad]), TyVoid, sp()),
+    mk(XMutMethod(MArrPop, Place { root: 9, path: [], ty: TyArray(TyInt) }, []), TyVoid, sp()),
+    mk(XField(bad, 0, 0), TyInt, sp()),
+    mk(XIndex(ok, bad), TyInt, sp()),
+    mk(XIndex(bad, ok), TyInt, sp()),
+    mk(XRecord(0, None, [FieldInitH { index: 0, value: bad }]), TyRecord(0), sp()),
+    mk(XRecord(0, Some(bad), []), TyRecord(0), sp()),
+    mk(XVariant(0, [bad]), TyOption(TyInt), sp()),
+    mk(XArray([ok, bad]), TyArray(TyInt), sp()),
+    mk(XTry(bad), TyInt, sp()),
+    mk(XCond(bad, ok, ok), TyInt, sp()),
+    mk(XCond(ok, bad, ok), TyInt, sp()),
+    mk(XCond(ok, ok, bad), TyInt, sp()),
+    mk(XMatch(bad, []), TyInt, sp()),
+    mk(XClosure(0, [bad]), TyFn([], TyInt), sp()),
+    mk(XCallIndirect(bad, []), TyInt, sp()),
+    mk(XCallIndirect(ok, [bad]), TyInt, sp()),
+    mk(XIface(0, bad), TyIface(0), sp()),
+    mk(XCallVirtual(bad, 0, []), TyInt, sp()),
+    mk(XCallVirtual(ok, 0, [bad]), TyInt, sp()),
+  ];
+  let i: usize = 0;
+  for (const e of kindsOfExpr) {
+    assertEqBool(
+      localsBound(e, 1),
+      false,
+      "dangling local found in expression kind " + i.toString(),
+    );
+    assertEqBool(localsBound(e, 10), true, "and accepted once it exists: " + i.toString());
+    i += 1;
+  }
+  const noneStmts: HStmt[] = [];
+  const blk = HBlock { stmts: [HExprStmt(bad)] };
+  const kindsOfStmt: HStmt[] = [
+    HLet(9, ok),
+    HLet(0, bad),
+    HAssign(Place { root: 9, path: [], ty: TyInt }, None, ok),
+    HAssign(Place { root: 0, path: [PIndex(bad)], ty: TyInt }, None, ok),
+    HAssign(Place { root: 0, path: [], ty: TyInt }, None, bad),
+    HExprStmt(bad),
+    HIf(bad, HBlock { stmts: noneStmts }, None),
+    HIf(ok, blk, None),
+    HIf(ok, HBlock { stmts: noneStmts }, Some(blk)),
+    HWhile(bad, HBlock { stmts: noneStmts }),
+    HWhile(ok, blk),
+    HForOf(9, ok, HBlock { stmts: noneStmts }),
+    HForOf(0, bad, HBlock { stmts: noneStmts }),
+    HForOf(0, ok, blk),
+    HReturn(Some(bad)),
+    HBlockStmt(blk),
+  ];
+  let j: usize = 0;
+  for (const s of kindsOfStmt) {
+    assertEqBool(stmtBound(s, 1), false, "dangling local found in statement kind " + j.toString());
+    j += 1;
+  }
+  const arm = HArm {
+    pattern: HPVariant(0, [None, Some(9)]),
+    body: HBlock { stmts: noneStmts },
+    value: None,
+  };
+  assertEqBool(localsBound(mk(XMatch(ok, [arm]), TyInt, sp()), 9), false, "binding 9 of 9");
+  const armBody = HArm { pattern: HPWildcard, body: blk, value: None };
+  assertEqBool(localsBound(mk(XMatch(ok, [armBody]), TyInt, sp()), 1), false, "arm body");
+  const armValue = HArm {
+    pattern: HPWildcard,
+    body: HBlock { stmts: noneStmts },
+    value: Some(bad),
+  };
+  assertEqBool(localsBound(mk(XMatch(ok, [armValue]), TyInt, sp()), 1), false, "arm value");
+  assertEqBool(
+    stmtBound(HReturn(None), 0) && stmtBound(HBreak, 0) && stmtBound(HContinue, 0),
+    true,
+    "no locals",
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Closure conversion (lift.or)
 // ---------------------------------------------------------------------------
@@ -1020,6 +1109,37 @@ function genericCallInference(host: Host): void {
         "ok",
         "an arrow function is checked against the parameter types known so far",
       );
+    },
+  );
+}
+
+// A trial check that fails leaves no trace: the generic instance the failed attempt created for the
+// parameter type `Box<int>` is created again by the retry, after `Pair<string>`.
+@Test
+function failedTrialChecksLeaveNoTrace(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const text = "type Box<T> = { v: T; };\ntype Pair<T> = { p: T; };\n"
+          + "function g<T>(f: (x: Box<int>, y: T) => int, v: Pair<string>, t: T): int {\n  return 0;\n}\n"
+          + "function main(): void {\n  const r = g((x, y) => 1, Pair { p: \"s\" }, 5);\n}\n";
+      const r = checked(fs, text);
+      assert(r.isOk(), "checks");
+      const rs = r.unwrap().records;
+      let pair: int = -1;
+      let box: int = -1;
+      let i: usize = 0;
+      for (const rec of rs) {
+        if (rec.name.includes("Pair<string>")) {
+          pair = i.toInt();
+        }
+        if (rec.name.includes("Box<int>")) {
+          box = i.toInt();
+        }
+        i += 1;
+      }
+      assert(pair >= 0 && box >= 0, "both instances exist");
+      assert(pair < box, "Box<int> was created by the retry, not by the failed attempt");
     },
   );
 }
