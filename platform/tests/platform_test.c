@@ -604,6 +604,7 @@ static void test_threads_and_monitors(void) {
     close(devnull);
     orin_platform_runtime_lock();
     orin_platform_runtime_unlock();
+}
 
 /* ---- network (ADR-0033): loopback sockets; handle identity and scope are refused before any system call ---- */
 static orin_platform_net root_grant(void) {
