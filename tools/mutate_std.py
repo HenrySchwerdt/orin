@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Mutation check for the provable std modules (ADR-0030 §3, ADR-0028).
 
-Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections}.or. The module and its
+Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http}.or. The module and its
 test file are copied to build/mutate_std/, the std imports are rewritten to relative ones, the mutation is applied and
 `orin test` is run twice: with runtime contract checking (the default) and with `--no-contracts`. A mutant is
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
 
-Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections] [--list]
+Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http] [--list]
 Exit status 1 if any mutant survives (is not killed with contracts on).
 """
 import argparse
@@ -88,10 +88,57 @@ MUTANTS = [
     ("collections", "pq-pop-returns-last", "const top = PQEntry<T> { priority: this.prios[0], value: this.vals[0] };", "const top = PQEntry<T> { priority: this.prios[this.prios.length - 1], value: this.vals[this.vals.length - 1] };"),
     ("collections", "pq-push-wrong-parent", "      const par = (i - 1) / 4;\n      if (!leavesBefore(priority", "      const par = (i - 1) / 2;\n      if (!leavesBefore(priority"),
     ("collections", "pq-sift-drops-value", "      this.seqs[i] = this.seqs[par];\n      this.vals[i] = this.vals[par];\n      i = par;", "      this.seqs[i] = this.seqs[par];\n      i = par;"),
+    # ---- std:http, parser (state machine, framing rules, limits), serializer, constructors
+    ("http", "hdr-lf-bare-cr-accepted", "    if (xs[i].toInt() != 10) {\n      this.fail(this.base + i, BareCr);\n      return;\n    }\n    this.commitHeader();", "    this.commitHeader();"),
+    ("http", "obs-fold-not-detected", "    } else if (c == C_SP || c == C_HTAB) {\n      this.fail(this.base + i, ObsFold);", "    } else if (c == 777) {\n      this.fail(this.base + i, ObsFold);"),
+    ("http", "space-before-colon-not-detected", "    if (c == C_SP || c == C_HTAB) {\n      this.fail(this.base + j, SpaceBeforeColon);", "    if (c == 777) {\n      this.fail(this.base + j, SpaceBeforeColon);"),
+    ("http", "cl-and-te-accepted", "    if (this.teCount > 0 && this.clCount > 0) {", "    if (this.teCount > 99 && this.clCount > 0) {"),
+    ("http", "duplicate-cl-accepted", "      if (this.clCount > 1) {", "      if (this.clCount > 99) {"),
+    ("http", "cl-19-digits-accepted", "if (v.length == 0 || v.length > 18) {", "if (v.length == 0 || v.length > 19) {"),
+    ("http", "chunk-size-overflow-unchecked", "      if (sz > allowed) {", "      if (sz > allowed + 4096) {"),
+    ("http", "chunk-ext-control-char-reason", "      this.fail(this.base + j, BadChunkExtension);", "      this.fail(this.base + j, BadChunkSize);"),
+    ("http", "chunk-terminator-lf-reason", "    if (c == 10) {\n      this.fail(this.base + i, BareLf);\n    } else {\n      this.fail(this.base + i, BadChunkTerminator);", "    if (c == 999) {\n      this.fail(this.base + i, BareLf);\n    } else {\n      this.fail(this.base + i, BadChunkTerminator);"),
+    ("http", "forbidden-trailer-accepted", "      if (isForbiddenTrailerName(name)) {", "      if (false) {"),
+    ("http", "missing-host-accepted", "    if (this.isReq && this.minor == 1 && this.hostCount == 0) {", "    if (this.isReq && this.minor == 7 && this.hostCount == 0) {"),
+    ("http", "duplicate-host-accepted", "      if (this.hostCount > 1) {", "      if (this.hostCount > 99) {"),
+    ("http", "cl-body-limit-ignored", "      if (this.clValue > this.maxBody) {", "      if (this.clValue > this.maxBody + 1000000000) {"),
+    ("http", "header-count-off-by-one", "      if (count >= this.maxCount) {", "      if (count > this.maxCount) {"),
+    ("http", "header-line-limit-off-by-one", "  private doValue(xs: u8[], n: usize): void {\n    const i = this.cur;\n    const room = this.lineMax - this.lineLen;", "  private doValue(xs: u8[], n: usize): void {\n    const i = this.cur;\n    const room = this.lineMax - this.lineLen + 1;"),
+    ("http", "head-budget-off-by-one", "          const budget = this.sectionEnd - this.base0;", "          const budget = this.sectionEnd - this.base0 + 1;"),
+    ("http", "trailer-budget-not-relative", "      this.sectionEnd = this.base + i + 1 + this.maxHead;", "      this.sectionEnd = this.maxHead;"),
+    ("http", "version-1-2-reason", "      } else if (c >= 50 && c <= 57) {", "      } else if (c >= 51 && c <= 57) {"),
+    ("http", "status-600-accepted", "(this.codeDigits == 0 && (c < 49 || c > 53))", "(this.codeDigits == 0 && (c < 49 || c > 54))"),
+    ("http", "204-framing-accepted", "      if ((this.code < 200 || this.code == 204) && (this.teCount > 0 || this.clCount > 0)) {", "      if (this.code < 200 && (this.teCount > 0 || this.clCount > 0)) {"),
+    ("http", "head-response-reads-a-body", "      bodyless = this.forHead || this.code < 200 || this.code == 204 || this.code == 304;", "      bodyless = this.code < 200 || this.code == 204 || this.code == 304;"),
+    ("http", "304-reads-a-body", "      bodyless = this.forHead || this.code < 200 || this.code == 204 || this.code == 304;", "      bodyless = this.forHead || this.code < 200 || this.code == 204;"),
+    ("http", "host-name-case-sensitive", "    } else if (nl == 4 && this.isReq && eqIgnoreCase(name, \"host\")) {", "    } else if (nl == 4 && this.isReq && name == \"Host\") {"),
+    ("http", "lowercase-wraps-at", "  if (c >= 65 && c <= 90) {\n    return c + 32;", "  if (c >= 64 && c <= 90) {\n    return c + 32;"),
+    ("http", "target-shape-check-skipped", "    if (this.isReq && !isValidTarget(this.meth, this.target)) {", "    if (false) {"),
+    ("http", "body-parts-reversed", "      const a = this.parts[k].toArray();", "      const a = this.parts[this.parts.length - 1 - k].toArray();"),
+    ("http", "trailing-blanks-kept", "      while (e > i && isOws(xs[e - 1].toInt())) {", "      while (e > i && false) {"),
+    ("http", "consumed-counts-the-chunk", "    this.total = this.base0 + i;", "    this.total = this.base0 + n;"),
+    ("http", "method-line-limit-off-by-one", "      if (this.lineLen >= this.lineMax) {\n        this.fail(this.base + j, StartLineTooLong);\n        return;\n      }\n      this.lineLen += 1;\n      if (this.acc.length > 0) {\n        tok = this.acc + tok;\n        this.acc = \"\";\n      }\n      this.methodToken = tok;", "      if (this.lineLen > this.lineMax) {\n        this.fail(this.base + j, StartLineTooLong);\n        return;\n      }\n      this.lineLen += 1;\n      if (this.acc.length > 0) {\n        tok = this.acc + tok;\n        this.acc = \"\";\n      }\n      this.methodToken = tok;"),
+    ("http", "head-method-not-canonical", "    \"HEAD\" => Some(Head),", "    \"HEAD\" => Some(Ext(t)),"),
+    ("http", "serializer-no-final-crlf", "  out.appendString(fieldsText(trailers));\n  out.appendString(\"\\r\\n\");\n  return out.build();", "  out.appendString(fieldsText(trailers));\n  return out.build();"),
+    ("http", "hex-digit-modulus", "    digits.push(\"0123456789abcdef\".charAt(v % 16));", "    digits.push(\"0123456789abcdef\".charAt(v % 15));"),
+    ("http", "headers-set-keeps-old-fields", "    this.remove(name);\n    this.names.push(name);", "    this.names.push(name);"),
+    ("http", "reset-keeps-the-error", "    this.err = None;\n    this.base0 = 0;", "    this.base0 = 0;"),
+    ("http", "window-boundary-off-by-one", "        if (i < w || i >= we) {", "        if (i < w || i > we) {"),
+    ("http", "empty-chunk-size-accepted", "    if (this.chunkDigits == 0) {\n      this.fail(this.base + j, BadChunkSize);\n      return;\n    }", "    if (this.chunkDigits == 0 && false) {\n      this.fail(this.base + j, BadChunkSize);\n      return;\n    }"),
+    ("http", "headers-ctor-skips-validation", "    enforce(names.length == values.length && allTokens(names) && allFieldValues(values), \"invalid Headers\");", "", "http_headers_ctor_rejects_crlf"),
+    ("http", "status-ctor-skips-validation", "    enforce(code >= 100 && code <= 599 && isReasonPhrase(reason), \"invalid Status\");", "", "http_status_ctor_rejects_range"),
+    ("http", "request-ctor-skips-validation", "    enforce(requestProblem(method, target, version, headers, body, trailers) == \"\", \"invalid Request\");", "", "http_request_ctor_rejects_invalid"),
+    ("http", "response-ctor-skips-validation", "    enforce(responseProblem(status, version, headers, body, trailers, forHead) == \"\", \"invalid Response\");", "", "http_response_ctor_rejects_204_body"),
+    ("http", "limits-ctor-skips-validation", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, \"invalid Limits\");", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776 || true, \"invalid Limits\");", "http_limits_ctor_rejects_zero"),
 ]
 
 # further test files of a module that also run against every mutant
-EXTRA_TESTS = {"utf8": ["utf8_dfa_test"], "collections": ["sorted_btree_test"]}
+EXTRA_TESTS = {"utf8": ["utf8_dfa_test"], "collections": ["sorted_btree_test"],
+               "http": ["http_reject_test", "http_split_test", "http_prop_test"]}
+# modules whose mutants stop at the first test file that kills them (the http property tests are slow)
+EARLY_EXIT = {"http"}
+# the order of the test files (fast and most selective first); default: <module>_test then EXTRA_TESTS
+TEST_ORDER = {"http": ["http_reject_test", "http_test", "http_split_test", "http_prop_test"]}
 
 
 def run(orinc, test_file, extra):
@@ -113,7 +160,7 @@ def main():
     orinc = os.path.join(ROOT, a.orinc)
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
-    mods = ["bytes", "utf8", "collections"]
+    mods = ["bytes", "utf8", "collections", "http"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     survivors = 0
     rows = []
@@ -135,7 +182,7 @@ def main():
             for k, v in rewrite.items():
                 s = s.replace('"%s"' % k, '"%s"' % v)
             open(os.path.join(d, m + ".or"), "w", encoding="utf-8").write(s)
-        tfiles = [mod + "_test"] + EXTRA_TESTS.get(mod, [])
+        tfiles = TEST_ORDER.get(mod) or ([mod + "_test"] + EXTRA_TESTS.get(mod, []))
         spec = open(os.path.join(ROOT, "tests", "std", "spec_sorted.or"), encoding="utf-8").read()
         for k, v in rewrite.items():
             spec = spec.replace('"%s"' % k, '"%s"' % v)
@@ -158,6 +205,8 @@ def main():
             out1 += o1
             if c1 == 1 and "error[" in o1:
                 code1 = 1
+            if mod in EARLY_EXIT and re.search(r"^FAIL ", o1, re.M):
+                break
         compile_err = code1 == 1 and fails1 == 0
         if compile_err:
             print("COMPILE ERROR in mutant %s/%s:\n%s" % (mod, name, out1[:600]))

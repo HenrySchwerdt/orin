@@ -106,7 +106,11 @@ function sigResponse(r: ParseResult<Response>, start: usize): string {
 // Feeds `wire` cut at the (non-decreasing) positions `cuts`; the answer of the first chunk that is not NeedMore, or
 // "NeedMore <consumed>" when the input ended without a result.
 function runRequest(wire: Bytes, cuts: usize[]): string {
-  let p = new RequestParser(smallLimits());
+  return runRequestWith(wire, cuts, smallLimits());
+}
+
+function runRequestWith(wire: Bytes, cuts: usize[], limits: Limits): string {
+  let p = new RequestParser(limits);
   let start: usize = 0;
   let k: usize = 0;
   while (k <= cuts.length) {
@@ -461,6 +465,60 @@ function responsesInRandomChunks(): void {
       assertEqString(runResponse(wire, cuts, false, true), whole, "random cuts of response " + m.toString());
       t += 1;
     }
+    m += 1;
+  }
+}
+
+function clip(s: string): string {
+  return s.length > 60 ? s.substring(0, 60) : s;
+}
+
+// Messages larger than the scanner window (4096 bytes): a long request line, header values and a chunk extension that
+// cross window boundaries, 300 header fields, bodies of tens of thousands of bytes; fed in one piece, cut at every
+// multiple of 997 and at the window boundaries, and in pieces of 100 bytes.
+@Test
+function messagesLargerThanTheScannerWindow(): void {
+  const l = new Limits(65536, 1000, 65536, 1048576, 8192, 1048576);
+  let hs = "";
+  let i = 0;
+  while (i < 300) {
+    hs += "X-Field-" + i.toString() + ": value number " + i.toString() + " " + rep("v", 17) + "\r\n";
+    i += 1;
+  }
+  const big = "GET /" + rep("a", 5000) + " HTTP/1.1\r\nHost: a\r\nX-Big: " + rep("b", 9000) + "\r\n" + hs + "X-Last:   end  \r\n\r\n";
+  const cl = "POST /up HTTP/1.1\r\nHost: a\r\nContent-Length: 20000\r\n\r\n" + rep("0123456789", 2000);
+  const te = "POST /up HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n" + "1388;ext=" + rep("e", 4500) + "\r\n" + rep("c", 5000)
+    + "\r\n3e8\r\n" + rep("d", 1000) + "\r\n0\r\nX-T: " + rep("t", 5000) + "\r\n\r\n";
+  const bad = "GET / HTTP/1.1\r\nHost: a\r\nX-Big: " + rep("b", 9000) + "\x00\r\n\r\n";
+  const msgs = [big, cl, te, bad, big + cl];
+  let m: usize = 0;
+  while (m < msgs.length) {
+    const wire = bs(msgs[m]);
+    const whole = runRequestWith(wire, [], l);
+    assert(whole.startsWith(m == 3 ? "Failed BadHeaderValue" : "Done "), "message " + m.toString() + " is valid or fails as expected: " + clip(whole));
+    let cuts: usize[] = [];
+    let at: usize = 997;
+    while (at < wire.length()) {
+      cuts.push(at);
+      at += 997;
+    }
+    assertEqString(runRequestWith(wire, cuts, l), whole, "every 997 bytes, message " + m.toString());
+    let c2: usize[] = [];
+    let b: usize = 4095;
+    while (b < wire.length()) {
+      c2.push(b);
+      c2.push(b + 1);
+      c2.push(b + 2);
+      b += 4096;
+    }
+    assertEqString(runRequestWith(wire, c2, l), whole, "around the window boundaries, message " + m.toString());
+    let c3: usize[] = [];
+    let q: usize = 100;
+    while (q < wire.length()) {
+      c3.push(q);
+      q += 100;
+    }
+    assertEqString(runRequestWith(wire, c3, l), whole, "pieces of 100 bytes, message " + m.toString());
     m += 1;
   }
 }
