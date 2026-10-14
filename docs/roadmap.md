@@ -44,7 +44,11 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - per-compile translation validation of lowering, optimisation and emission, built with the
      lowering rewrite and R3;
    - SMT proof certificates checked by the Lean kernel, and a proof that VC generation is sound;
-   - `@Decreases` (termination) and a "no runtime errors" mode;
+   - `@Decreases` (termination) and a "no runtime errors" mode, whose per-function form is `@NoTrap`
+     ([ADR-0041](decisions/0041-proof-guided-error-handling.md)): explicit obligations for overflow,
+     division, bounds and unwrap, a trap inventory generated from the backends, proof-guided advice
+     (guard, `@Requires`, `Result`, never `recover` where a guard suffices), and later isolated recovery
+     boundaries once the trap hook and cancellation for tasks exist. Stage A ships with ADR-0035 phase 1;
    - for people:
      - a traceable normative language reference;
      - a per-program assurance report;
