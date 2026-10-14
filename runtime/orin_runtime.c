@@ -9,7 +9,7 @@
  * and free lists need no atomics. Moving an object to another task's heap is safe because a block is just malloc memory
  * (freed on any thread). The process-wide totals of finished tasks are g_fold / g_fold_live. */
 static __thread int64_t g_live;
-__thread OrinStats orin_stats __attribute__((tls_model("local-exec")));
+__thread OrinStats orin_stats ORIN_TLS_MODEL;
 static OrinStats g_fold;
 static int64_t g_fold_live;
 

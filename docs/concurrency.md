@@ -50,6 +50,12 @@ that is still alive counts as an owner, so sending it copies; sending a fresh te
 temporary is passed by move rests on the optimiser's owned-parameter inference (ADR-0010): without it the value is copied.
 Last-use moves of named locals are the performance model's job (ADR-0038).
 
+**What is sendable.** Everything that is a value: scalars, strings, arrays, records, unions, `Option`, `Result`, `Map`, class
+instances, interface values and closures (their captures are values, ADR-0011), `Sender` / `Receiver` / `TaskHandle` (plain handles of
+monitors, copyable by design). Not sendable, and not even representable as a captured or sent value: resource handles (`File`, grants,
+`Host`). So the checker needs no "sendable" predicate of its own: E0450 / E0451 / E0452 already forbid a handle as a type argument, a
+variable, a field, a result or a capture, and E0483 gives the task-specific message at `spawn`.
+
 **Resources.** A resource handle (`File`, grant, `Host`) is not a value: it cannot be captured by a task body (E0483), stored,
 returned or sent (E0450-E0452). Grants are delegated, see below.
 
@@ -89,7 +95,7 @@ delegated grant).
 | Layer | Contents | Language | Lines (code, no comments or blank lines) |
 |---|---|---|---|
 | `std:task` (L2) | scope table and task bookkeeping (`Ledger`, `drain`), join results, panic propagation, channel buffers (`Ring`), `Sender` / `Receiver`, grant delegation, `parallelMap` | **Orin**, `stdlib/task.or`, and the pure state machines `Ring` and `Ledger` in `stdlib/taskcore.or` | 508 (`task.or` 416 + `taskcore.or` 92), with 8 `@Invariant` and 26 `@Requires` / `@Ensures` |
-| L0 platform | thread create / join / exit / id; monitors (mutex + 2 condition queues + integer words); the runtime lock; the lock of the stdout buffer | **C, forever** (`platform/orin_platform.{c,h}`) | +243 (platform total 700 of the 1,000 budget) |
+| L0 platform | thread create / join / exit / id; monitors (mutex + 2 condition queues + integer words); the runtime lock; the lock of the stdout buffer | **C, forever** (`platform/orin_platform.{c,h}`) | +243 (platform total 700 of the 1,000 budget). Why a monitor has words: Orin values cannot be shared between tasks, so the state that tasks DO share (the task table of a scope, the buffer of a channel) needs minimal shared memory with the OS's mutual exclusion; integers behind a lock are the smallest such cell (an "atomic counter" with a lock, handle-checked), and they let every line of channel and scope logic stay Orin |
 | runtime, temporary | transfer (`orin_rt_transfer_*`), task start / join / trap (`orin_rt_task_*`, `orin_rt_heap_exit`), forwarders that trap on a failed L0 call (`orin_mon_*`), grant clone / move / adopt (`orin_cap_*`) | **C, until R3** (`runtime/orin_runtime.c`, section "tasks and transfer") | 342 (transfer 130, tasks 80, `orin_mon_*` 35, trap forwarder 8, grants 70, rest 19), plus about 30 changed lines for per-task state |
 
 Everything in the third row needs the object model (reference counts, struct / array / string layout, thread-local free
@@ -167,14 +173,14 @@ allocated.
 
 | Test | What it checks |
 |---|---|
-| `tests/next/run/task_*.or` (10) | spawn / join, 500 tasks, channel ping-pong, a producer / transformer / consumer pipeline, scope-exit join, a panic propagating at `join`, a panic found at scope exit, send of large values (copy and move, content intact), a grant moved into tasks (scope respected, 300 tasks each with their own grant), `parallelMap`. Run by every conformance mode: C, LLVM, `--no-opt`, `--c-builtins`, sanitizers |
+| `tests/next/run/task_*.or` (11) | spawn / join, 500 tasks, channel ping-pong, a producer / transformer / consumer pipeline, scope-exit join, a panic propagating at `join`, a panic found at scope exit, send of large values (copy and move, content intact), every kind of value (`Map`, interface value, closure), a grant moved into tasks (scope respected, 300 tasks each with their own grant), `parallelMap`. Run by every conformance mode: C, LLVM, `--no-opt`, `--c-builtins`, sanitizers |
 | `tests/next/errors/e0481 e0482 e0483 e0450_channel_of_grant e0301_task_primitives_are_internal` | one negative test per checker rule |
-| `tests/std/task_test.or` (10 `@Test`) and `tests/std/expect_trap/task_*.or` (4) | the invariants and contracts of `Ring` and `Ledger` (checked by `orin test`), channel semantics in one task, move-versus-copy counters, joins in any order, `parallelMap` against `map`; traps that hold without contracts (join twice, a panic reaching the joiner, use of a released channel, capacity 0) |
+| `tests/std/taskcore_test.or` (5 `@Test`), `tests/std/task_test.or` (7) and `tests/std/expect_trap/task_*.or` (4) | the invariants and contracts of `Ring` and `Ledger` (checked by `orin test`; all 35 contract obligations of `std:taskcore` are `VERIFIED` by `orin verify --contracts`), channel semantics in one task, the move / copy counters, joins in any order, `parallelMap` against `map`; traps that hold without contracts (join twice, a panic reaching the joiner, use of a released channel, capacity 0). `tools/mutate_std.py --module taskcore`: 16 mutants, 16 killed (14 by a contract) |
 | `compiler/tests/verify_main.or` (14 cases) | the grant move rules of the MIR verifier |
 | `tools/test_osig.py` section 8 | the task events of the OSIG |
 | `runtime/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
 | `platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
-| `tests/concurrency/stress_tasks.or`, `stress_messages.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks, 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival |
+| `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
 | `tools/test_concurrency.sh` | all C tests and the stress tests plain, under **ThreadSanitizer** and under **ASan + UBSan**; `tools/verify_platform.sh` also runs the platform tests under ThreadSanitizer. CI: `ci_local.sh` steps "concurrency (tsan, asan)" and "platform layer" |
 
 ## Measurements

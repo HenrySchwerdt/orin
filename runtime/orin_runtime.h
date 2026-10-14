@@ -187,7 +187,14 @@ typedef struct OrinStats {
 } OrinStats;
 /* Per THREAD (every task has its own heap and its own counters; a finished task's counters are folded into the
  * process totals, which the ORIN_STATS report prints together with the main thread's). */
-extern __thread OrinStats orin_stats __attribute__((tls_model("local-exec"))); /* one instruction per counter update: the program is one executable */
+/* The counters live in one executable (never a shared library), so on ELF targets the access can use the local-exec TLS model: one
+ * instruction per counter update, like the plain global it replaced (measured: instruction counts of the benchmarks are unchanged). */
+#if defined(__ELF__)
+#define ORIN_TLS_MODEL __attribute__((tls_model("local-exec")))
+#else
+#define ORIN_TLS_MODEL
+#endif
+extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 
 static inline void orin_retain(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
