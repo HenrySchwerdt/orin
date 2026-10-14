@@ -40,45 +40,149 @@ functions) and `old(e)` (only in `@Ensures`, not nested); `a ==> b` (right assoc
 | E0416 | impure contract expression (below) |
 | E0300 | `result` outside `@Ensures` (or in a `void` function), or any unknown name |
 
-### Purity rule (v1, conservative)
+### Purity rule (ADR-0031 A4)
 
-A contract expression may contain only: arithmetic, comparisons, logic, conditionals, `match`,
-construction of records / variants / arrays, built-in string / array / int / Option / Result methods,
-field access and indexing, and calls of **pure** functions. It must not contain closures, `?`,
-mutating built-ins (`push`, `pop`), calls that mutate their receiver (mutating class methods), calls
-through function values, or I/O built-ins (`console.log/error`, `readFile`, `writeFile`, `exists`,
-`args`, `exit`, `readBytes`, `readLine`, `writeStdout`, `shell`).
+A contract expression may contain only: arithmetic, comparisons, logic, conditionals, `match`, construction of
+records / variants / arrays, built-in string / array / int / Option / Result methods, field access and indexing,
+closures, and calls of **pure** functions and **pure closures**. It must not contain `?`, mutating built-ins
+(`push`, `pop`), calls that mutate their receiver (mutating class methods), or any call whose effects are not
+known to be pure (below).
 
-A user function is *pure* if neither it nor any function reachable from it through calls or closure
-creation performs I/O or calls a function value. Changing the function's own locals or arrays is not
-an effect (value semantics; Orin has no mutable globals). Recursion is allowed. The analysis is over
-the typed HIR after all functions are checked. Traps (division by zero, `unwrap` of `None`, index out
-of range) and non-termination are not effects here.
+A function is **pure** when
+- it performs no I/O built-in (`console.log/error`, `readFile`, `writeFile`, `exists`, `args`, `exit`,
+  `readBytes`, `readLine`, `writeStdout`, `shell`, the file primitives),
+- it mutates no non-local state (changing its own locals and arrays is not an effect: value semantics, and Orin
+  has no mutable globals),
+- it calls only pure functions, and
+- it calls a function value only if that value is a pure closure.
+
+How function values are judged: a function that calls one of its function-typed *parameters* is pure *relative to
+its argument*. `every(xs, pred)` is pure exactly when the closure passed for `pred` is; the call site decides.
+So the prelude's `every`, `some`, `map`, `filter` (and any user combinator written the same way) can be used in
+contracts with a pure lambda, `xs.every(x => isPositive(x))`, and a helper may use them internally. A function
+value of any other origin (a local variable, a field, a call result, a captured variable, a function-typed
+parameter of the constrained function itself) and a call through an interface value have unknown effects: the
+caller is impure. A closure is judged by its own body (a closure that calls an impure helper is impure) and
+captured variables are snapshots, so reading them is not an effect.
+
+The analysis is a fixed point over the call graph of the typed HIR, after all functions (instances of generic
+functions, lifted closures) are checked. It is monotone, so recursion and mutual recursion are allowed:
+termination is not part of purity, and neither are traps (division by zero, `unwrap` of `None`, index out of
+range). A closure that is created counts as called, so an impure closure is rejected even if it is never called.
+(`count` is not in the prelude yet; `xs.filter(p).length` does the same.)
+
+E0416 names the impure operation and where it is: `call is not provably pure: `f` -> `g` performs I/O
+(console.log) at file.or:12:3; contract expressions may only call pure functions` (the chain of calls from the
+contract to the operation), or `I/O built-in `console.log` is not allowed in a contract expression`, or `function
+value passed to `every` in a contract expression is not a closure literal, so its effects are unknown`.
+
+Not supported in a clause: `result`, `this` and `old(..)` inside a closure with a *block* body (an expression
+body works); the run-time rewriting does not descend into blocks.
 
 ## Erasure
 
 Without flags the clauses produce no code. `tools/test_contract_erasure.py` (CI) compiles programs
 with and without their clause lines and requires byte-identical C and LLVM IR. (Known corner: a
-contract that is the only user of a generic instantiation leaves that instance in the output.)
+contract that is the only user of a generic instantiation leaves that instance in the output. The lifted
+closure functions of closures written in a clause are dropped by the prune pass, `compiler/opt/prune.or`.)
 
 ## Runtime checking: `orin compile --check-contracts`
 
-`compiler/check/rtcheck.or` expands the type-checked program and checks it again:
+`compiler/check/rtcheck.or` expands the type-checked program on the AST and checks it again;
+`compiler/check/rthir.or` then rewrites the typed HIR of the result (reports, caller locations, record
+invariants):
 
-- a function / method with `@Requires` or `@Ensures` becomes a wrapper with the original name around
-  the original body (renamed `$contract$body$<name>`): entry checks, call, exit checks, return. Every
-  return of the body, including early `?` returns, is therefore checked; recursive calls go through
-  the wrapper;
+- a function / method with `@Requires` or `@Ensures` becomes a wrapper with the original name around the
+  original body (renamed `$contract$body$<name>`): entry checks, call, exit checks, return. Every return of the
+  body, including early `?` returns, is therefore checked; recursive calls go through the wrapper. A function
+  with a `@Requires` has a third function, `$contract$site$<name>`, that takes the caller's location as an extra
+  first parameter; the wrapper forwards to it with `""`, and a call the compiler can see is redirected to it with
+  `file:line` of the call;
 - `old(e)` is `e` for functions (parameters are immutable); in methods it is evaluated over a snapshot
   `old$this` of the receiver taken at entry;
 - class `@Invariant`s are checked at the end of constructors and after every non-private, non-static
   method; constructor `@Requires` run after the leading `this.f = e;` initialisations;
-- a violation prints `trap: contract violated: @Requires(x > 0) at file.or:LINE` on stderr and exits
-  with status 101 (same convention as other traps).
+- **contract-internal calls are unchecked** (ADR-0031 A5): inside a clause a call of a function (or method)
+  that has contracts goes to its `$contract$body$` function, so `@Ensures(isNormalized(result))` inside
+  `isNormalized`, a self-call, or an invariant that calls a public method of its class terminate. The functions
+  called that way run their own bodies as ordinary code (their inner calls are checked as usual);
+- a violation prints the report below on stderr and exits with status 101 (same convention as other traps).
 
-Not checked at run time (still type-checked): record-type invariants, loop invariants, `@Decreases`.
+### Violation reports (ADR-0031 A1, A2; ADR-0029)
+
+One stable text format on stderr. The first line is unchanged:
+
+```
+trap: contract violated: @Ensures(result.length == xs.length + 1 && result[0] == old(xs[0]) + 1) at f.or:13
+  function: f.grow(xs = int[] of length 2, label = "abc")
+  values:
+    result.length = 3
+    xs.length + 1 = 3
+    result[0] = 5
+    old(xs[0]) + 1 = 6
+    old(xs[0]) = 5
+  blame: the callee f.grow
+  action: NEEDS_DECISION
+  question: f.grow breaks its @Ensures. Is the code wrong, or is the contract?
+  option 1: fix the code (the specification stays)
+  option 2: add a precondition that excludes this call (changes the specification)
+  option 3: change the clause (changes the specification)
+```
+
+- `function:` the function (qualified `unit.name`, `unit.Class.method`, generic instances `unit.f<T>`) and its
+  argument values. Values: `int`/`usize`/fixed-width ints, `bool` and `float` by value; a string quoted, cut at 40
+  characters with its length (`"abc..." (length 60)`); an array as `int[] of length N`; anything else as `<Type>`
+  (not evaluated). A method shows `this = <Class>`.
+- `values:` each *maximal non-literal operand* of the clause: both operands of a comparison, the operands of the
+  failed boolean atom (the arguments of a call), the atom itself otherwise; literals are not repeated, equal terms
+  are shown once. `xs.length + 1` is one term (the maximal operand), not `xs.length` and `1`. Terms are the source
+  text of the sub-expression, so they read like the clause.
+- `old(..)` values are shown as `old(e) = v`, in the term that contains them and again on their own line.
+- The report evaluates sub-terms again, which is safe because contracts are pure. Parts that short-circuiting
+  skipped (`b` in `a && b` when `a` was false, `b` in `a || b` when `a` was true) are not evaluated: `i <
+  xs.length && xs[i] > 0` with an out-of-range `i` reports `i` and `xs.length`, never `xs[i]`. An `old(..)`
+  inside a branch that may be skipped is shown as `<not shown>` unless it cannot trap.
+- Blame and action (ADR-0029): a failed `@Requires` is the **caller's** fault: `blame: the caller, at file.or:LINE`
+  with `action: FIX_CODE (caller)`. The location is the call of the function; it is not available when the call
+  goes through a function value, an interface or a constructor, and the report then says
+  `blame: the caller of f (call site not available ...)` (the function and its clause are in the first lines). A
+  failed `@Ensures` or class `@Invariant` is the **callee's**: `blame: the callee f`, `action: NEEDS_DECISION`,
+  with a `question:` and the `option` lines (an agent must ask a human, not weaken the contract). A record
+  invariant reports `record R`, the location of the literal / assignment / return (`blame: the code that built
+  this value, at ...`) and `action: NEEDS_DECISION`.
+- There is no JSON form of a trap (the runtime prints plain text for every trap); a JSON report would need a
+  runtime change.
+
+### Record invariants (ADR-0031 A3)
+
+A record type `@Invariant(e)` (`type R = { .. }`, `this` is the record) is checked under `--check-contracts` at
+exactly these points; nowhere else:
+
+1. **every record literal** of type `R`, including `R { ..spread, f: v }` (the invariant is evaluated on the
+   finished value, so a literal that spreads a valid record and changes a field is checked);
+2. **every write through a place that passes through an `R`**: an assignment `x.f = v`, a compound assignment
+   `x.f += v`, a write through nested records `a.b.f = v` (the invariant of every record on the path that has
+   one is checked, innermost first), through array elements `xs[i].f = v`, and `push` / `pop` on an array field
+   (`x.items.push(v)`) used as a statement or as the initialiser of a `let`. The check runs right after the
+   write, on the value as it is after it;
+3. **every `return` in a function whose result type is `R`**, unless the returned expression is itself a record
+   literal of `R` (already checked at 1). So a value that comes out of a function cannot violate the invariant
+   even if it was assembled in a way points 1 and 2 do not see.
+
+A value that violates the invariant therefore cannot be created by a literal, by a field write or by a function
+result in checked code. Not checked: a record that is only *read* from an array or a variant payload (it was
+checked when it was created); a field assignment whose place contains an index expression with a call in it
+(`xs[next()].f = v`: the index would be evaluated twice, so the assignment is not checked); a write via an
+`Option` / `Result` / variant payload or through a class field (class invariants are the class's); loop
+invariants and `@Decreases`; generic records (`@Invariant` on them is E0408). Inside a clause no record literal
+is checked (a clause may build the record it constrains). Records with an invariant in the compiler itself:
+`Span`, `Diagnostic`, `Resolved`, `PreludeRoot`.
+
+Without `--check-contracts` a record invariant is only type-checked and erased like every clause.
+
 The test runner understands `// flags: --check-contracts` and `// stderr: text` headers
-(`tools/run_tests.py`).
+(`tools/run_tests.py`; for an error test `// stderr:` is matched against the compiler's output, which pins the
+text of an E0416 message).
 
 ## `orin verify --contracts [--format=json] [--z3 PATH] [--strict] entry.or` (phase 2)
 
@@ -171,7 +275,10 @@ not weaken contracts, add assumptions or widen grants to make a result pass.
 
 ## Known limitations
 
-- Loop invariants / `@Decreases` and record invariants are only type-checked.
+- Loop invariants / `@Decreases` are only type-checked.
+- Contract-internal calls are unchecked only one level deep: the body of a function called from a clause is
+  ordinary checked code (a recursive function with a contract that calls itself in its clause costs time
+  quadratic in the depth, not an endless recursion).
 - Loop clauses inside closure bodies are not part of the purity pass.
 - `@Invariant` on a generic record is rejected (E0408).
 - `--check-contracts` needs `exit` from `std:process`; a module that declares its own `exit` clashes.

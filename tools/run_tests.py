@@ -115,7 +115,7 @@ def run_test(args, label, test):
     hdrs = header_lines(entry)
     flags = []          # `// flags: --check-contracts` (any header line): extra compiler flags
     want_warns = None   # `// warns: W0450 W0452` (or `none`): the warning codes of the compile, as a sorted list
-    want_stderr = []    # `// stderr: text` (any header line): stderr of the run must contain text
+    want_stderr = []    # `// stderr: text` (any header line): stderr of the run (of the compile, for an error test) must contain text
     for h in hdrs:
         m = HEADER_FLAGS.match(h)
         if m:
@@ -139,6 +139,9 @@ def run_test(args, label, test):
             return tag, False, "expected compile failure with %s but compilation succeeded" % code
         if code not in err:
             return tag, False, "expected %s in stderr (exit %s); stderr head:\n%s" % (code, rc, head(err))
+        for w in want_stderr:
+            if w not in err:
+                return tag, False, "compiler stderr does not contain %r; stderr head:\n%s" % (w, head(err))
         return tag, True, ""
 
     # run tests
