@@ -1,0 +1,186 @@
+name: bench
+
+# Benchmarks (docs/benchmarks.md "Benchmark workflow"): Orin (C and LLVM backend) against C, Go, Java and Rust, executed
+# instruction counts under valgrind (the regression metric), the parallel speedup of std:task with 1, 2 and 4 worker threads,
+# and the self-compile. Not on every push: nightly, by hand, or on a pull request when the label `bench` is added.
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Timed runs per cell (median after one warm-up)"
+        type: number
+        default: 5
+      only:
+        description: "Comma-separated benchmark names (empty = all; add `selfcompile` to include the self-compile)"
+        type: string
+        default: ""
+  # nightly on main, 40 minutes after ci.yml's 03:17 run
+  schedule:
+    - cron: "57 3 * * *"
+  pull_request:
+    types: [labeled]
+
+# Least privilege: everything reads by default; only the history job may push and only the compare job may comment.
+permissions:
+  contents: read
+
+# The label is part of the group: adding some other label to the PR must not cancel a running `bench` run.
+concurrency:
+  group: bench-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  bench:
+    # a pull_request event is any label; only `bench` runs the benchmarks
+    if: github.event_name != 'pull_request' || github.event.label.name == 'bench'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    outputs:
+      status: ${{ steps.run.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Toolchains (Rust via the preinstalled rustup, clang preinstalled, valgrind from apt)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update -q
+          sudo apt-get install -y -q valgrind
+          cc --version | head -n1; clang --version | head -n1; go version; java -version 2>&1 | head -n1
+          rustc --version; valgrind --version
+      - name: Seed bootstrap (seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance)
+        run: ./tools/bootstrap.sh
+      - name: Run benchmarks (wall time, CPU time, RSS, instructions, parallel speedup, self-compile)
+        id: run
+        env:
+          RUNS: ${{ inputs.runs || 5 }}
+          ONLY: ${{ inputs.only }}
+          BENCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          BENCH_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          set +e
+          python3 tools/bench.py --runs "$RUNS" ${ONLY:+--only "$ONLY"} --instructions \
+            --json build/bench/results.json --out build/bench/results.md
+          status=$?
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          test -s build/bench/results.json
+      - name: Job summary
+        run: |
+          python3 tools/bench_report.py summary build/bench/results.json > build/bench/summary.md
+          cat build/bench/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            build/bench/results.json
+            build/bench/results.md
+            build/bench/summary.md
+          retention-days: 30
+      - name: Output check (a checksum mismatch between languages or thread counts fails the run after the upload)
+        if: steps.run.outputs.status != '0'
+        run: |
+          echo "tools/bench.py exited ${{ steps.run.outputs.status }} (see 'Output mismatches' in the summary)"
+          exit 1
+
+  # Every run on main appends history/<date>-<sha>.json to the orphan branch `bench-results` and re-renders its README and
+  # SVG charts (tools/bench_report.py). The branch is created on the first run; pushes are plain fast-forwards.
+  history:
+    needs: bench
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: bench-results-branch
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-results
+          path: run
+      - name: Append to the bench-results branch and re-render the charts
+        working-directory: src
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          name="$(date -u +%Y-%m-%d)-$(git rev-parse --short=12 HEAD).json"
+          for attempt in 1 2 3; do
+            rm -rf ../results
+            git worktree prune
+            if git fetch --no-tags --depth=1 origin bench-results; then
+              git worktree add --detach ../results FETCH_HEAD
+              (cd ../results && git checkout -B bench-results)
+            else
+              # first run: create the orphan branch (the only time anything but a fast-forward is pushed)
+              git worktree add --detach ../results HEAD
+              (cd ../results && git checkout --orphan bench-results && git rm -rq --cached . && git clean -fdxq)
+            fi
+            mkdir -p ../results/history
+            cp ../run/results.json "../results/history/$name"
+            python3 tools/bench_report.py render --history ../results/history --out ../results --repo "$REPO"
+            cd ../results
+            git add -A history charts README.md
+            git commit -q -m "bench: $name"
+            if git push origin HEAD:refs/heads/bench-results; then
+              echo "### History: appended \`history/$name\` to [bench-results](https://github.com/$REPO/tree/bench-results)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            cd ../src
+            echo "push rejected (a concurrent update); retrying from the new branch head"
+          done
+          exit 1
+
+  # On a pull request labelled `bench`: compare with the newest `main` entries of bench-results and post one comment,
+  # updated in place on reruns. Reports only; never fails the job on a regression.
+  compare:
+    needs: bench
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-results
+          path: run
+      - name: Compare with main
+        run: |
+          mkdir -p base
+          if git fetch --no-tags --depth=1 origin bench-results; then
+            git worktree add --detach base FETCH_HEAD
+          fi
+          mkdir -p base/history
+          python3 tools/bench_report.py compare --history base/history run/results.json > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Post or update the PR comment
+        # a pull request from a fork gets a read-only token; the comparison is still in the job summary
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                 --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- orin-bench-comment -->"))) | .id' | head -n1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@comment.md > /dev/null
+            echo "updated comment $id"
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -F body=@comment.md > /dev/null
+            echo "posted a new comment"
+          fi
