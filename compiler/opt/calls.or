@@ -1,10 +1,9 @@
 // Call-site rewrite (stage 2) and dup/release cancellation (stage 3) of the MIR optimiser.
 //
-// Stage 2: an argument in an owned-parameter position must be consumed, so a *local* (not a
-// parameter: parameters are handled in params.or) is retained into a fresh temporary that the call
-// consumes: `tmp = dup x; call g(.. tmp ..)`. When x was Unique and the call has no reference
-// result (so the verifier would have kept x Unique across a borrowed call) and x is still needed,
-// `makeunique x` re-establishes uniqueness after the call.
+// Stage 2: an argument in an owned-parameter position must be consumed, so a *local* (not a parameter: parameters are
+// handled in params.or) is retained into a fresh temporary that the call consumes: `tmp = dup x; call g(.. tmp ..)`.
+// When x was Unique and the call has no reference result (so the verifier would have kept x Unique across a borrowed
+// call) and x is still needed, `makeunique x` re-establishes uniqueness after the call.
 //
 // Stage 3 (peephole, block-local, verifiably safe by construction):
 //   d = dup x; ...; release x      (nothing in between touches x or anything borrowed from x)
@@ -14,15 +13,19 @@
 
 import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr } from "../mir";
 import { Span } from "../diag";
+import { Locals } from "../lower";
 import { State, Cx, step, blockInStates, KUnique } from "../verify";
-import { instrDef, contains, ancestors, usesAffecting, isRefTy } from "./analysis";
+import { instrDef, ancestors, usesAffecting, isRefTy } from "./analysis";
+import { BlockSink, RewritePlan, withBody } from "./rewrite";
+import {
+  passKept, fnShapeOk, fnWellFormed, instrCount, dupCount, releaseCount,
+} from "./wellformed";
 
 function isOwnedPos(owned: bool[], j: usize): bool {
   return j < owned.length && owned[j];
 }
 
-// Is there a call in f with an owned-position argument that is a reference local other than an
-// owned parameter of f itself (`self`; those are handled in params.or)?
+// Is x a reference local that is not an owned parameter of f itself (`self`; those are handled in params.or)?
 function stage2Local(f: MFunction, self: bool[], x: usize): bool {
   if (!isRefTy(f.locals[x].ty)) {
     return false;
@@ -30,41 +33,55 @@ function stage2Local(f: MFunction, self: bool[], x: usize): bool {
   return x >= f.paramCount || !self[x];
 }
 
+// Is there a call in f with an owned-position argument that is a stage-2 local?
 function needsCallDups(prog: MProgram, f: MFunction, self: bool[]): bool {
-  for (const blk of f.blocks) {
-    for (const ins of blk.instrs) {
-      match (ins) {
-        ICall(_, g, args) => {
-          const owned = prog.functions[g].paramOwned;
-          let j: usize = 0;
-          while (j < args.length) {
-            if (isOwnedPos(owned, j)) {
-              match (args[j]) {
-                OLocal(x) => {
-                  if (stage2Local(f, self, x)) {
-                    return true;
-                  }
-                },
-                _ => {}
-              }
-            }
-            j += 1;
+  return f.blocks.some(
+    blk => blk.instrs.some(
+      ins => match (ins) {
+        ICall(_, g, args) => argsNeedDup(prog.functions[g].paramOwned, f, self, args),
+        _ => false,
+      },
+    ),
+  );
+}
+
+function argsNeedDup(owned: bool[], f: MFunction, self: bool[], args: Operand[]): bool {
+  let j: usize = 0;
+  while (j < args.length) {
+    if (isOwnedPos(owned, j)) {
+      match (args[j]) {
+        OLocal(x) => {
+          if (stage2Local(f, self, x)) {
+            return true;
           }
         },
-        _ => {}
+        _ => {},
       }
     }
+    j += 1;
   }
   return false;
 }
 
-// Index of `release x` after position `start` in the block with no intervening use or redefinition
-// of x (or of anything borrowed from x) within a bounded window.
-function findRelease(instrs: Instr[], gone: bool[], start: usize, x: usize, anc: usize[][]): Option<usize> {
+// Index of `release x` after position `start` in the block with no intervening use or redefinition of x (or of anything
+// borrowed from x) within a bounded window; instructions the plan already removed or replaced are skipped.
+@Requires(plan.size() == instrs.length)
+@Ensures(result.isSome()
+    ==> result.unwrap() >= start
+        && result.unwrap() < instrs.length
+        && !plan.touched(result.unwrap()))
+@Ensures(result.isSome() ==> isReleaseOf(instrs[result.unwrap()], x))
+export function findRelease(
+  instrs: Instr[],
+  plan: RewritePlan,
+  start: usize,
+  x: usize,
+  anc: usize[][],
+): Option<usize> {
   let j = start;
   const end = start + 256 < instrs.length ? start + 256 : instrs.length;
   while (j < end) {
-    if (!gone[j]) {
+    if (!plan.touched(j)) {
       const ins = instrs[j];
       match (ins) {
         IRelease(y) => {
@@ -72,7 +89,7 @@ function findRelease(instrs: Instr[], gone: bool[], start: usize, x: usize, anc:
             return Some(j);
           }
         },
-        _ => {}
+        _ => {},
       }
       if (usesAffecting(anc, ins, x)) {
         return None;
@@ -83,7 +100,7 @@ function findRelease(instrs: Instr[], gone: bool[], start: usize, x: usize, anc:
             return None;
           }
         },
-        None => {}
+        None => {},
       }
     }
     j += 1;
@@ -91,33 +108,44 @@ function findRelease(instrs: Instr[], gone: bool[], start: usize, x: usize, anc:
   return None;
 }
 
-function isRefDst(f: MFunction, dst: Option<usize>): bool {
-  return match (dst) {
-    Some(d) => isRefTy(f.locals[d].ty),
-    None => false
+function isReleaseOf(i: Instr, x: usize): bool {
+  return match (i) {
+    IRelease(y) => y == x,
+    _ => false,
   };
 }
 
-// Stage 2. `orig` is the unmodified program (all parameters borrowed) used for ownership states;
-// `prog` carries the inferred parameter modes of the callees.
-export function insertCallDups(prog: MProgram, orig: MProgram, f: MFunction, self: bool[]): MFunction {
+function isRefDst(f: MFunction, dst: Option<usize>): bool {
+  return match (dst) {
+    Some(d) => isRefTy(f.locals[d].ty),
+    None => false,
+  };
+}
+
+// Stage 2. `orig` is the unmodified program (all parameters borrowed) used for ownership states; `prog` carries the
+// inferred parameter modes of the callees. Only `dup` and `makeunique` are added: blocks, releases and calls stay.
+@Requires(fnWellFormed(prog, f) && self.length == f.paramCount)
+@Ensures(passKept(f, result) && fnWellFormed(prog, result))
+@Ensures(result.blocks.length == f.blocks.length && releaseCount(result) == releaseCount(f))
+@Ensures(dupCount(result) >= dupCount(f) && instrCount(result) >= instrCount(f))
+export function insertCallDups(
+  prog: MProgram,
+  orig: MProgram,
+  f: MFunction,
+  self: bool[],
+): MFunction {
   if (!needsCallDups(prog, f, self)) {
     return f;
   }
   const anc = ancestors(f);
   const states = blockInStates(orig, f);
-  let locals = f.locals;
+  let locals = new Locals(f.locals);
   let blocks: MBlock[] = [];
   let b: usize = 0;
   while (b < f.blocks.length) {
     const blk = f.blocks[b];
-    let out: Instr[] = [];
-    let sps: Span[] = [];
+    let out = new BlockSink();
     let st: Option<State> = states[b];
-    let gone: bool[] = [];
-    for (const _x of blk.instrs) {
-      gone.push(false);
-    }
     let i: usize = 0;
     while (i < blk.instrs.length) {
       const ins = blk.instrs[i];
@@ -136,28 +164,26 @@ export function insertCallDups(prog: MProgram, orig: MProgram, f: MFunction, sel
               match (a) {
                 OLocal(x) => {
                   if (stage2Local(f, self, x)) {
-                    const t = locals.length;
-                    locals.push(MLocal { name: "_", ty: MRef });
+                    const t = locals.fresh(MRef);
                     pre.push(IDup(t, a));
                     a = OLocal(t);
                     if (!isRefDst(f, dst)) {
                       match (st) {
                         Some(s) => {
                           if (s.ls[x].k == KUnique) {
-                            match (findRelease(blk.instrs, gone, i + 1, x, anc)) {
-                              Some(_) => {},
-                              None => {
-                                post.push(IMakeUnique(x));
-                              }
+                            // nothing is planned in this pass: an empty plan (only built here, the rare case)
+                            const none = new RewritePlan(blk.instrs.length);
+                            if (findRelease(blk.instrs, none, i + 1, x, anc).isNone()) {
+                              post.push(IMakeUnique(x));
                             }
                           }
                         },
-                        None => {}
+                        None => {},
                       }
                     }
                   }
                 },
-                _ => {}
+                _ => {},
               }
             }
             nargs.push(a);
@@ -165,23 +191,15 @@ export function insertCallDups(prog: MProgram, orig: MProgram, f: MFunction, sel
           }
           if (pre.length > 0) {
             handled = true;
-            for (const x of pre) {
-              out.push(x);
-              sps.push(here);
-            }
-            out.push(ICall(dst, g, nargs));
-            sps.push(here);
-            for (const x of post) {
-              out.push(x);
-              sps.push(here);
-            }
+            out.emitAll(pre, here);
+            out.emit(ICall(dst, g, nargs), here);
+            out.emitAll(post, here);
           }
         },
-        _ => {}
+        _ => {},
       }
       if (!handled) {
-        out.push(ins);
-        sps.push(here);
+        out.emit(ins, here);
       }
       // advance the replayed verifier state over the *original* instruction
       match (st) {
@@ -189,106 +207,79 @@ export function insertCallDups(prog: MProgram, orig: MProgram, f: MFunction, sel
           const c = step(Cx { prog: orig, f: f, blk: b, ins: i, st: s, errs: [], warns: [] }, ins);
           st = Some(c.st);
         },
-        None => {}
+        None => {},
       }
       i += 1;
     }
-    blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+    blocks.push(out.finish(blk.term, blk.termSpan));
     b += 1;
   }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: locals,
-    ret: f.ret,
-    blocks: blocks
-  };
+  return withBody(f, locals.table(), blocks);
 }
 
-function hasDup(f: MFunction): bool {
-  for (const blk of f.blocks) {
-    for (const ins of blk.instrs) {
-      match (ins) {
-        IDup(_, _) => {
-          return true;
-        },
-        _ => {}
-      }
-    }
-  }
-  return false;
-}
-
-// Stage 3.
+// Stage 3. Every rewrite removes one `release` and turns its `dup` into a `move` or removes it, so the two counts drop by
+// the same amount and nothing else changes.
+@Requires(fnShapeOk(f))
+@Ensures(passKept(f, result)
+    && result.locals.length == f.locals.length
+    && result.blocks.length == f.blocks.length)
+@Ensures(instrCount(result) <= instrCount(f))
+@Ensures(dupCount(result) <= dupCount(f)
+    && dupCount(f) + releaseCount(result) == dupCount(result) + releaseCount(f))
 export function peephole(f: MFunction): MFunction {
-  if (!hasDup(f)) {
+  if (!f.blocks.some(blk => blk.instrs.some(isDupInstr))) {
     return f;
   }
   const anc = ancestors(f);
-  let blocks: MBlock[] = [];
-  for (const blk of f.blocks) {
-    let instrs = blk.instrs;
-    let gone: bool[] = [];
-    for (const _x of instrs) {
-      gone.push(false);
-    }
-    let i: usize = 0;
-    while (i < instrs.length) {
-      if (!gone[i]) {
-        match (instrs[i]) {
-          IDup(d, o) => {
-            let done = false;
-            match (o) {
-              OLocal(x) => {
-                if (x != d && x >= f.paramCount) {
-                  match (findRelease(instrs, gone, i + 1, x, anc)) {
-                    Some(r) => {
-                      instrs[i] = IMove(d, x);
-                      gone[r] = true;
-                      done = true;
-                    },
-                    None => {}
-                  }
-                }
-              },
-              _ => {}
-            }
-            if (!done) {
-              match (findRelease(instrs, gone, i + 1, d, anc)) {
-                Some(r) => {
-                  gone[i] = true;
-                  gone[r] = true;
-                },
-                None => {}
-              }
-            }
-          },
-          _ => {}
-        }
-      }
-      i += 1;
-    }
-    let out: Instr[] = [];
-    let sps: Span[] = [];
-    i = 0;
-    while (i < instrs.length) {
-      if (!gone[i]) {
-        out.push(instrs[i]);
-        sps.push(blk.spans[i]);
-      }
-      i += 1;
-    }
-    blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
-  }
-  return MFunction {
-    name: f.name,
-    paramCount: f.paramCount,
-    paramOwned: f.paramOwned,
-    inout: f.inout,
-    locals: f.locals,
-    ret: f.ret,
-    blocks: blocks
+  const blocks = f.blocks.map(blk => peepholeBlock(f, anc, blk));
+  return withBody(f, f.locals, blocks);
+}
+
+function isDupInstr(i: Instr): bool {
+  return match (i) {
+    IDup(_, _) => true,
+    _ => false,
   };
+}
+
+function peepholeBlock(f: MFunction, anc: usize[][], blk: MBlock): MBlock {
+  const instrs = blk.instrs;
+  let plan = new RewritePlan(instrs.length);
+  let i: usize = 0;
+  while (i < instrs.length) {
+    if (!plan.touched(i)) {
+      match (instrs[i]) {
+        IDup(d, o) => {
+          let done = false;
+          match (o) {
+            OLocal(x) => {
+              if (x != d && x >= f.paramCount) {
+                match (findRelease(instrs, plan, i + 1, x, anc)) {
+                  Some(r) => {
+                    plan.replace(i, [IMove(d, x)]);
+                    plan.remove(r);
+                    done = true;
+                  },
+                  None => {},
+                }
+              }
+            },
+            _ => {},
+          }
+          if (!done) {
+            match (findRelease(instrs, plan, i + 1, d, anc)) {
+              Some(r) => {
+                plan.remove(i);
+                plan.remove(r);
+              },
+              None => {},
+            }
+          }
+        },
+        _ => {},
+      }
+    }
+    i += 1;
+  }
+  return plan.apply(blk);
 }

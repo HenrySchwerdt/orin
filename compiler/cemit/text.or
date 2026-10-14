@@ -1,0 +1,244 @@
+// Pure text helpers of the C backend: C types and slot conversions of MIR types, literals, identifiers, comments,
+// the reference mask of a struct, and the symbol names that both backends give to functions. Nothing here knows about
+// a function being emitted; everything is a function of its arguments.
+
+import { MType } from "../mir";
+
+export function u(n: usize): string {
+  return n.toString();
+}
+
+export function isRefT(t: MType): bool {
+  return match (t) {
+    MRef => true,
+    _ => false,
+  };
+}
+
+export function isUsizeT(t: MType): bool {
+  return match (t) {
+    MUsize => true,
+    _ => false,
+  };
+}
+
+export function isFloatT(t: MType): bool {
+  return match (t) {
+    MFloat => true,
+    _ => false,
+  };
+}
+
+// The C type of a MIR type.
+export function cty(t: MType): string {
+  return match (t) {
+    MInt => "int64_t",
+    MBool => "int64_t",
+    MFloat => "double",
+    MHandle => "int64_t",
+    MUsize => "uint64_t",
+    MVoid => "void",
+    MRef => "OrinObj *",
+  };
+}
+
+// A value of type `t` read from a 64-bit slot expression.
+export function fromSlot(t: MType, code: string): string {
+  if (isRefT(t)) {
+    return `ORIN_REF(${code})`;
+  }
+  if (isFloatT(t)) {
+    return `orin_s2f(${code})`;
+  }
+  return `((${cty(t)})(${code}))`;
+}
+
+// A value of type `t` stored into a 64-bit slot.
+export function toSlot(t: MType, code: string): string {
+  if (isRefT(t)) {
+    return `ORIN_SLOT(${code})`;
+  }
+  if (isFloatT(t)) {
+    return `orin_f2s(${code})`;
+  }
+  return `((uint64_t)(${code}))`;
+}
+
+function isIdentChar(c: int): bool {
+  return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95;
+}
+
+// Only letters, digits and `_` (a C identifier, given that it does not start with a digit).
+export function identChars(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    if (!isIdentChar(s.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// `name` with every character that cannot appear in a C or LLVM identifier replaced by `_` (one for one).
+@Ensures(result.length == name.length && identChars(result))
+export function sanitize(name: string): string {
+  let out = "";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < name.length) {
+    const c = name.charCodeAt(i);
+    const ok = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122;
+    if (!ok) {
+      out += name.substring(start, i);
+      out += "_";
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += name.substring(start, name.length);
+  return out;
+}
+
+// The symbol of function `i` called `name`, in both backends: `orin_fn_<i>_<sanitized name>`. The index makes it unique
+// whatever the names are (two qualified names can sanitize to the same text).
+@Ensures(result.startsWith(`orin_fn_${i.toString()}_`) && identChars(result))
+export function fnSymbol(i: usize, name: string): string {
+  return `orin_fn_${u(i)}_${sanitize(name)}`;
+}
+
+// `name` made safe inside a C block comment: no `*/` survives.
+@Ensures(!result.includes("*/"))
+export function commentSafe(name: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < name.length) {
+    if (name.charCodeAt(i) == 42 && i + 1 < name.length && name.charCodeAt(i + 1) == 47) {
+      out += "* /";
+      i += 2;
+    } else {
+      out += name.charAt(i);
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function isOct(c: int): bool {
+  return c >= 48 && c <= 55;
+}
+
+// The bytes a C string literal stands for, or None for a text that is not of the form `cString` writes: printable
+// characters except `"`, `\` and `?` (trigraphs) as they are, `\"`, `\\`, `\?` and three-digit octal escapes.
+// Independent of `cString`; used by its contract.
+export function cStringValue(lit: string): Option<string> {
+  if (lit.length < 2 || lit.charCodeAt(0) != 34 || lit.charCodeAt(lit.length - 1) != 34) {
+    return None;
+  }
+  let out = "";
+  let i: usize = 1;
+  const end = lit.length - 1;
+  while (i < end) {
+    const c = lit.charCodeAt(i);
+    if (c == 34 || c == 63 || c < 32 || c > 126) {
+      return None;
+    }
+    if (c != 92) {
+      out += lit.charAt(i);
+      i += 1;
+    } else {
+      if (i + 1 >= end) {
+        return None;
+      }
+      const e = lit.charCodeAt(i + 1);
+      if (e == 34 || e == 92 || e == 63) {
+        out += lit.charAt(i + 1);
+        i += 2;
+      } else if (i + 3 < end && isOct(e) && isOct(lit.charCodeAt(i + 2)) && isOct(lit.charCodeAt(i + 3))) {
+        const v = (e - 48) * 64 + (lit.charCodeAt(i + 2) - 48) * 8 + (lit.charCodeAt(i + 3) - 48);
+        out += String.fromCharCode(v);
+        i += 4;
+      } else {
+        return None;
+      }
+    }
+  }
+  return Some(out);
+}
+
+// `s` as a C string literal: printable ASCII except `"`, `\` and `?` (trigraphs) as is, everything else as a three-digit
+// octal escape (three digits, so a following digit cannot extend it).
+@Ensures(cStringValue(result).isSome() && cStringValue(result).unwrap() == s)
+export function cString(s: string): string {
+  let out = "\"";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    let esc = "";
+    if (c == 34) {
+      esc = "\\\"";
+    } else if (c == 92) {
+      esc = "\\\\";
+    } else if (c == 63) {
+      esc = "\\?";
+    } else if (c < 32 || c > 126) {
+      esc = "\\" + (c / 64).toString() + (c / 8 % 8).toString() + (c % 8).toString();
+    }
+    if (esc.length > 0) {
+      out += s.substring(start, i);
+      out += esc;
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += s.substring(start, s.length);
+  out += "\"";
+  return out;
+}
+
+// An `int` constant as C: `INT64_MIN` has no literal of its own.
+export function intCode(v: int): string {
+  if (v == -9223372036854775807 - 1) {
+    return "INT64_MIN";
+  }
+  return `((int64_t)${v.toString()}LL)`;
+}
+
+// The reference mask of a struct with these slot types: bit i is set when slot i holds a reference. The runtime has 64
+// mask bits and traps on a struct of more than 64 slots (`orin_struct_new`), so slots from 64 on contribute nothing:
+// the old loop kept adding bit 63 for every reference slot past 63 and overflowed (a trap in the compiler).
+@Ensures(refs.length == 0 ==> result == 0)
+@Ensures(refs.length > 0 && refs.length <= 64 && refs.every(r => r)
+    ==> result == maskAll(refs.length))
+export function refMask(refs: bool[]): usize {
+  let m: usize = 0;
+  let p: usize = 1;
+  let i: usize = 0;
+  while (i < refs.length && i < 64) {
+    if (refs[i]) {
+      m += p;
+    }
+    if (i < 63) {
+      p *= 2;
+    }
+    i += 1;
+  }
+  return m;
+}
+
+// 2^n - 1 for 1 <= n <= 64 (the mask with the low n bits set), computed without overflow.
+@Requires(n >= 1 && n <= 64)
+export function maskAll(n: usize): usize {
+  let m: usize = 0;
+  let p: usize = 1;
+  let i: usize = 0;
+  while (i < n) {
+    m += p;
+    if (i < 63) {
+      p *= 2;
+    }
+    i += 1;
+  }
+  return m;
+}
