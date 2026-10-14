@@ -5,9 +5,10 @@
 // and integers with more than 18 digits are rejected with an error message.
 //
 // Objects keep their fields in insertion order (a JField array); lookups are linear. A
-// duplicate key resolves to the FIRST occurrence in `getField`.
+// duplicate key resolves to the FIRST occurrence in `getField`. `jsonEq` is structural equality
+// (field order matters: it is part of the deterministic output).
 //
-// Strings are Orin byte strings holding UTF-8. `stringifyJson` escapes `"` `\` and control
+// Strings are Orin byte strings holding UTF-8. `stringifyJson` (write.or) escapes `"` `\` and control
 // characters (< 0x20) and passes all other bytes (including UTF-8 sequences) through unchanged,
 // so output is deterministic and compact (no whitespace).
 
@@ -34,15 +35,11 @@ export function getField(j: Json, key: string): Option<Json> {
   };
 }
 
+// The value of the first field named `key` (a duplicate key resolves to the first occurrence).
+@Ensures(result.isSome() == fs.some(f => f.key == key))
 function findField(fs: JField[], key: string): Option<Json> {
-  let i: usize = 0;
-  while (i < fs.length) {
-    if (fs[i].key == key) {
-      return Some(fs[i].value);
-    }
-    i += 1;
-  }
-  return None;
+  const k = fs.findIndex(f => f.key == key);
+  return k.isSome() ? Some(fs[k.unwrap()].value) : None;
 }
 
 export function asStr(j: Json): Option<string> {
@@ -141,88 +138,91 @@ export function getPathInt(j: Json, path: string[]): Option<int> {
   return asInt(f.unwrap());
 }
 
-// ---- serializer ---------------------------------------------------------------------------
+// ---- equality and shape (used by the contracts of the parser and the serializer) ---------------
 
-function hexDigit(n: int): string {
-  if (n < 10) {
-    return String.fromCharCode(48 + n);
-  }
-  return String.fromCharCode(87 + n);
+// Structural equality: same variant, same scalar, same elements / fields (keys and values) in the same order.
+export function jsonEq(a: Json, b: Json): bool {
+  return match (a) {
+    JNull => isNull(b),
+    JBool(x) => match (b) {
+      JBool(y) => x == y,
+      _ => false
+    },
+    JNum(x) => match (b) {
+      JNum(y) => x == y,
+      _ => false
+    },
+    JStr(x) => match (b) {
+      JStr(y) => x == y,
+      _ => false
+    },
+    JArr(xs) => match (b) {
+      JArr(ys) => jsonsEq(xs, ys),
+      _ => false
+    },
+    JObj(xs) => match (b) {
+      JObj(ys) => fieldsEq(xs, ys),
+      _ => false
+    }
+  };
 }
 
-export function quoteJson(s: string): string {
-  let parts: string[] = ["\""];
-  let runStart: usize = 0;
+function jsonsEq(xs: Json[], ys: Json[]): bool {
+  if (xs.length != ys.length) {
+    return false;
+  }
   let i: usize = 0;
-  while (i < s.length) {
-    const c = s.charCodeAt(i);
-    if (c == 34 || c == 92 || c < 32) {
-      if (i > runStart) {
-        parts.push(s.substring(runStart, i));
-      }
-      if (c == 34) {
-        parts.push("\\\"");
-      } else if (c == 92) {
-        parts.push("\\\\");
-      } else if (c == 10) {
-        parts.push("\\n");
-      } else if (c == 13) {
-        parts.push("\\r");
-      } else if (c == 9) {
-        parts.push("\\t");
-      } else {
-        parts.push("\\u00" + hexDigit(c / 16) + hexDigit(c % 16));
-      }
-      runStart = i + 1;
+  while (i < xs.length) {
+    if (!jsonEq(xs[i], ys[i])) {
+      return false;
     }
     i += 1;
   }
-  if (s.length > runStart) {
-    parts.push(s.substring(runStart, s.length));
-  }
-  parts.push("\"");
-  return parts.join("");
+  return true;
 }
 
-function emit(j: Json, out: string[]): string[] {
-  let o = out;
-  match (j) {
-    JNull => { o.push("null"); },
-    JBool(b) => { o.push(b ? "true" : "false"); },
-    JNum(n) => { o.push(n.toString()); },
-    JStr(s) => { o.push(quoteJson(s)); },
-    JArr(a) => {
-      o.push("[");
-      let i: usize = 0;
-      while (i < a.length) {
-        if (i > 0) {
-          o.push(",");
-        }
-        o = emit(a[i], o);
-        i += 1;
-      }
-      o.push("]");
-    },
-    JObj(fs) => {
-      o.push("{");
-      let i: usize = 0;
-      while (i < fs.length) {
-        if (i > 0) {
-          o.push(",");
-        }
-        o.push(quoteJson(fs[i].key));
-        o.push(":");
-        o = emit(fs[i].value, o);
-        i += 1;
-      }
-      o.push("}");
+function fieldsEq(xs: JField[], ys: JField[]): bool {
+  if (xs.length != ys.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i].key != ys[i].key || !jsonEq(xs[i].value, ys[i].value)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Nesting of `j`: the largest number of arrays / objects that enclose a value inside it (a scalar or an empty
+// container is 0, `[1]` is 1). The parser rejects a document whose nesting exceeds MAX_DEPTH (parse.or).
+export function nesting(j: Json): usize {
+  return match (j) {
+    JArr(xs) => xs.length == 0 ? 0 : 1 + maxNesting(xs),
+    JObj(fs) => fs.length == 0 ? 0 : 1 + maxFieldNesting(fs),
+    _ => 0
+  };
+}
+
+function maxNesting(xs: Json[]): usize {
+  let m: usize = 0;
+  for (const x of xs) {
+    const n = nesting(x);
+    if (n > m) {
+      m = n;
     }
   }
-  return o;
+  return m;
 }
 
-// Compact, deterministic serialization.
-export function stringifyJson(j: Json): string {
-  const out: string[] = [];
-  return emit(j, out).join("");
+function maxFieldNesting(fs: JField[]): usize {
+  let m: usize = 0;
+  for (const f of fs) {
+    const n = nesting(f.value);
+    if (n > m) {
+      m = n;
+    }
+  }
+  return m;
 }

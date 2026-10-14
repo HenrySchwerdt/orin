@@ -1,0 +1,342 @@
+// Unit tests of the tooling modules (rewrite step 3e): the JSON cursor and serializer, the analysis workspace, the position
+// conversion and the index queries, the language server, the MCP session and the formatter's layout.
+// Run: `orin test compiler/tests/tooling_test.or --runtime runtime` (contracts are checked, so every class invariant and
+// every `@Requires` / `@Ensures` of these modules runs on the calls below; the negative cases call the predicates the
+// contracts are made of on hand-built ill-formed values).
+
+import { assert, assertEqString, assertEqUsize, assertEqBool, assertEq } from "std:test";
+import { Host, useFs, useHost } from "std:host";
+import { FsGrant } from "std:fs";
+import { ProcessGrant } from "std:process";
+import {
+  Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, parseJson, stringifyJson, jsonEq, nesting, JsonCursor,
+  MAX_DEPTH, errorOffset, errorInRange, parsesBackTo, quoteJson, getStr, getField
+} from "../json";
+import {
+  Workspace, newWorkspace, distinctPaths, offsetToPos, posToOffset, isCharBoundary, readText, resolveModulePath,
+  referencesOfDef, definitionAt, renameEdits, defIdsDense, isOccurrence, spansDistinct, symbolAt
+} from "../analysis";
+import { LspServer, repliesTo, answers, isRequest } from "../lsp";
+import { McpSession, Snap, MAX_SNAPS, revsOrdered, handle, handleText } from "../mcp";
+import { format, sameComments, Layout, commentsOrdered, allPlaced, stripMarkers } from "../fmt";
+import { scanComments } from "../syntax";
+import { SourceFile, Span, span } from "../diag";
+import { SemanticIndex, SymbolDef, SymbolRef, SkFunction, SkParam } from "../hir";
+
+// ---- JSON --------------------------------------------------------------------------------------------------------
+
+function obj(fs: JField[]): Json {
+  return JObj(fs);
+}
+
+@Test
+function jsonRoundTripsEveryValue(): void {
+  const values: Json[] = [
+    JNull, JBool(true), JBool(false), JNum(0), JNum(-7), JNum(9223372036854775807), JNum(-9223372036854775807 - 1),
+    JStr(""), JStr("tab\tnl\nquote\"back\\ctl\x01\x1f"), JStr("\xc3\xa9 \xf0\x9f\x98\x80"),
+    JArr([]), obj([]), JArr([JNum(1), JArr([JStr("x"), JNull]), obj([jField("k", JBool(false))])]),
+    obj([jField("b", JNum(2)), jField("a", JNum(1)), jField("a", JNum(3))]),
+  ];
+  for (const v of values) {
+    const text = stringifyJson(v);
+    assert(parsesBackTo(text, v), `round trip of ${text}`);
+  }
+  // 19-digit integers are read back (the old parser stopped at 18 and rejected what the serializer wrote)
+  assertEqString(stringifyJson(parseJson("-9223372036854775808").unwrap()), "-9223372036854775808", "i64::MIN");
+  assert(parseJson("9223372036854775808").isErr(), "one past i64::MAX");
+}
+
+@Test
+function jsonEqualityIsStructural(): void {
+  const a = obj([jField("x", JNum(1)), jField("y", JArr([JNull]))]);
+  assert(jsonEq(a, parseJson("{\"x\":1,\"y\":[null]}").unwrap()), "same value");
+  assert(!jsonEq(a, parseJson("{\"y\":[null],\"x\":1}").unwrap()), "field order matters");
+  assert(!jsonEq(JNum(1), JStr("1")), "variant matters");
+  assert(!jsonEq(JArr([JNum(1)]), JArr([JNum(1), JNum(1)])), "length matters");
+  assert(!parsesBackTo("[1,2]", JArr([JNum(1)])), "parsesBackTo compares");
+  assert(!parsesBackTo("[1,", JArr([JNum(1)])), "parsesBackTo of a bad text");
+}
+
+@Test
+function jsonCursorConsumesTheWholeText(): void {
+  const text = "  {\"a\": [1, 2.5, -3], \"b\": \"\\u00e9\"}  ";
+  let c = new JsonCursor(text);
+  const v = c.document();
+  assert(v.isOk(), "parses");
+  assertEqUsize(c.position(), text.length, "at the end");
+  assertEqString(getStr(v.unwrap(), "b").unwrapOr(""), "\xc3\xa9", "unicode escape decoded");
+  let t = new JsonCursor("[1] x");
+  assert(t.document().isErr(), "trailing characters");
+  assert(t.position() <= 5, "the cursor stays inside the text after an error");
+}
+
+@Test
+function jsonErrorsNameAnOffsetInsideTheText(): void {
+  const bad = ["", "[", "{\"a\"", "{\"a\":1,}", "\"abc", "\"\\x\"", "tru", "-", "1e5", "[1 2]", "{1:2}", "\"\\ud800", "\"a\x01\""];
+  for (const s of bad) {
+    const r = parseJson(s);
+    assert(r.isErr(), `rejects ${s}`);
+    assert(errorInRange(r.unwrapErr(), s), `offset in range: ${r.unwrapErr()}`);
+  }
+  assertEq(errorOffset("expected `:` at offset 12").unwrapOr(999).toInt(), 12, "errorOffset");
+  assert(errorOffset("no offset here").isNone(), "no offset");
+  assert(!errorInRange("unexpected end of input at offset 9", "abc"), "an offset past the text is out of range");
+  assertEqString(stringifyJson(parseJson("\"\\ud83d\\ude00\"").unwrap()), "\"\xf0\x9f\x98\x80\"", "surrogate pair");
+  assertEqString(stringifyJson(parseJson("\"\\udc00\"").unwrap()), "\"\xef\xbf\xbd\"", "lone surrogate -> U+FFFD");
+}
+
+function nested(n: usize): string {
+  let s = "";
+  let i: usize = 0;
+  while (i < n) {
+    s = s + "[";
+    i += 1;
+  }
+  s = s + "1";
+  i = 0;
+  while (i < n) {
+    s = s + "]";
+    i += 1;
+  }
+  return s;
+}
+
+@Test
+function jsonNestingLimit(): void {
+  const ok = parseJson(nested(MAX_DEPTH));
+  assert(ok.isOk(), "MAX_DEPTH levels");
+  assertEqUsize(nesting(ok.unwrap()), MAX_DEPTH, "nesting counts the containers");
+  const deep = parseJson(nested(MAX_DEPTH + 1));
+  assert(deep.isErr() && deep.unwrapErr().startsWith("nesting too deep"), "one more is rejected");
+  assertEqUsize(nesting(JArr([])), 0, "an empty array encloses nothing");
+  assertEqUsize(nesting(obj([jField("a", JArr([JNum(1)]))])), 2, "object of array");
+  assertEqString(quoteJson("a\"b"), "\"a\\\"b\"", "quote");
+}
+
+// ---- positions -------------------------------------------------------------------------------------------------------
+
+@Test
+function positionsAndOffsetsConvertBothWays(): void {
+  const text = "ab\r\n\xc3\xa9x\n\xf0\x9f\x98\x80y\n\nz";
+  let boundaries: usize = 0;
+  let o: usize = 0;
+  while (o <= text.length) {
+    if (isCharBoundary(text, o)) {
+      const p = offsetToPos(text, o);
+      assertEqUsize(posToOffset(text, p.line, p.character), o, `round trip at ${o}`);
+      boundaries += 1;
+    }
+    o += 1;
+  }
+  assertEqUsize(boundaries, text.length + 1 - 4, "every byte but the 4 continuation bytes is a boundary");
+  assert(!isCharBoundary(text, 5), "inside the 2-byte sequence");
+  assert(!isCharBoundary(text, text.length + 1), "past the end");
+  const astral = offsetToPos(text, 12);
+  assertEqUsize(astral.character, 2, "an astral code point counts two UTF-16 units");
+  assertEqUsize(posToOffset(text, 0, 99), 3, "a character past the line end clamps to the line end (`\\r` belongs to it)");
+  assertEqUsize(posToOffset(text, 99, 0), text.length, "a line past the end clamps to the end");
+}
+
+// ---- workspace (the document store) ------------------------------------------------------------------------------------
+
+@Test
+function workspaceKeepsOneBufferPerPath(): void {
+  let ws = newWorkspace();
+  ws.open("/p/a.or", "one");
+  ws.open("/p/./b.or", "two");
+  ws.open("/p/x/../a.or", "three");
+  assertEqUsize(ws.paths().length, 2, "two documents: another spelling of a path replaces its buffer");
+  assertEqString(ws.paths().join(","), "/p/a.or,/p/b.or", "normalized keys, open order");
+  assertEqString(ws.text("/p/a.or").unwrapOr(""), "three", "replaced");
+  assertEq(ws.revision(), 3, "every change counts");
+  ws.close("/p/b.or");
+  ws.close("/p/never.or");
+  assertEq(ws.revision(), 5, "close counts, also of a path that is not open");
+  assert(!ws.has("/p/b.or") && ws.has("/p/a.or"), "closed");
+  assertEqUsize(ws.sources().size(), 1, "the overlay handed to the loader");
+  assert(!distinctPaths([SourceFile { path: "/a", text: "" }, SourceFile { path: "/a", text: "x" }]), "duplicate path");
+}
+
+@Test
+function workspaceReadsGoThroughSources(host: Host): void {
+  useFs(host, fs => {
+    let ws = newWorkspace();
+    ws.open("/virtual/dir/main.or", "import { f } from \"./lib\";\n");
+    ws.open("/virtual/dir/lib.or", "export function f(): void {}\n");
+    assertEqString(readText(fs, ws, "/virtual/dir/./main.or").unwrapOr("?"), "import { f } from \"./lib\";\n", "buffer");
+    assert(readText(fs, ws, "/virtual/dir/missing.or").isNone(), "neither buffer nor file");
+    assertEqString(resolveModulePath(fs, ws, "/virtual/dir/main.or", "./lib").unwrapOr("?"), "/virtual/dir/lib.or", "import");
+    assert(resolveModulePath(fs, ws, "/virtual/dir/main.or", "std:fs").isNone(), "std module");
+    assert(readText(fs, ws, "compiler/json/module.or").unwrapOr("").includes("Module `json`"), "disk, through Sources");
+  });
+}
+
+// ---- index queries -------------------------------------------------------------------------------------------------
+
+function index(): SemanticIndex {
+  // function add(a: int): int { return a; }  /  add(1)
+  const defs = [
+    SymbolDef { id: 0, name: "add", kind: SkFunction, nameSpan: span(0, 9, 12), declSpan: span(0, 0, 39), unit: 0, container: None,
+      exported: false, detail: "function add(a: int): int", deprecated: None },
+    SymbolDef { id: 1, name: "a", kind: SkParam, nameSpan: span(0, 13, 14), declSpan: span(0, 13, 19), unit: 0, container: Some(0),
+      exported: false, detail: "a: int", deprecated: None },
+  ];
+  const refs = [
+    SymbolRef { span: span(0, 35, 36), def: 1 },
+    SymbolRef { span: span(0, 64, 67), def: 0 },
+    SymbolRef { span: span(0, 64, 67), def: 0 },
+    SymbolRef { span: span(0, 80, 81), def: 7 },
+  ];
+  return SemanticIndex { defs: defs, refs: refs, types: [], impls: [], calls: [], fnDefs: [], fnKinds: [], typed: true };
+}
+
+@Test
+function referencesPointAtExistingDefinitions(): void {
+  const idx = index();
+  assert(defIdsDense(idx), "ids are indexes");
+  const refs = referencesOfDef(idx, 0, true);
+  assertEqUsize(refs.length, 2, "declaration + one call (the duplicate ref is dropped)");
+  assert(spansDistinct(refs) && refs.every(sp => isOccurrence(idx, 0, sp)), "occurrences of add");
+  assertEqUsize(referencesOfDef(idx, 0, false).length, 1, "without the declaration");
+  assertEqUsize(referencesOfDef(idx, 7, true).length, 0, "a dangling id has no references");
+  assert(symbolAt(idx, 0, 80).isNone(), "a ref to a missing definition is ignored");
+  assertEqUsize(definitionAt(idx, 0, 65).unwrap().start, 9, "the call goes to the declaration");
+  const edits = renameEdits(idx, 0, 35, "b").unwrap();
+  assertEqUsize(edits.length, 2, "rename edits the parameter and its use");
+  assert(renameEdits(idx, 0, 35, "1b").isErr(), "not an identifier");
+  // ill-formed values for the predicates
+  let shuffled = index();
+  shuffled.defs[0].id = 1;
+  assert(!defIdsDense(shuffled), "an id that is not its index");
+  assert(!isOccurrence(idx, 1, span(0, 64, 67)), "a call of add is no occurrence of a");
+  assert(!spansDistinct([span(0, 1, 2), span(0, 1, 2)]), "duplicate span");
+}
+
+// ---- language server ------------------------------------------------------------------------------------------------
+
+function req(id: string, method: string, params: string): string {
+  return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"method\":\"" + method + "\",\"params\":" + params + "}";
+}
+
+@Test
+function lspAnswersEveryRequestWithItsId(host: Host): void {
+  useFs(host, fs => {
+    let s = new LspServer();
+    let out = s.handleText(fs, req("\"abc\"", "textDocument/hover", "{}"));
+    assertEqUsize(out.length, 1, "one reply before initialize");
+    assert(answers(out[0], JStr("abc")), "with the string id");
+    out = s.handleText(fs, req("1", "initialize", "{\"capabilities\":{}}"));
+    assert(answers(out[0], JNum(1)) && s.inited, "initialized");
+    out = s.handleText(fs, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}");
+    assertEqUsize(out.length, 0, "a notification is not answered");
+    out = s.handleText(fs, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":"
+        + "{\"uri\":\"file:///virtual/t.or\",\"text\":\"function main(): void { x; }\\n\"}}}");
+    assert(out.length >= 1 && out.every(j => getField(j, "id").isNone()), "diagnostics are notifications");
+    out = s.handleText(fs, req("{\"k\":[1]}", "no/such", "{}"));
+    assert(answers(out[0], parseJson("{\"k\":[1]}").unwrap()), "an object id is echoed");
+    out = s.handleText(fs, "{oops");
+    assert(answers(out[0], JNull), "a parse error answers id null");
+    out = s.handleText(fs, req("2", "shutdown", "null"));
+    assert(answers(out[0], JNum(2)) && s.shutdownRequested, "shutdown");
+    out = s.handleText(fs, req("3", "textDocument/hover", "{}"));
+    assert(answers(out[0], JNum(3)), "still answered while shutting down");
+    out = s.handleText(fs, "{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}");
+    assertEq(s.exitCode().unwrapOr(-1), 0, "clean exit");
+    out = s.handleText(fs, req("4", "shutdown", "null"));
+    assertEqUsize(out.length, 0, "nothing after exit");
+  });
+}
+
+@Test
+function replyRulePredicates(): void {
+  const r = parseJson("{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":null}").unwrap();
+  const n = parseJson("{\"jsonrpc\":\"2.0\",\"method\":\"x\",\"params\":{}}").unwrap();
+  const reqMsg = parseJson(req("5", "m", "{}")).unwrap();
+  assert(isRequest(reqMsg) && !isRequest(n), "requests have an id and a method");
+  assert(repliesTo(reqMsg, [n, r]), "one response with the id, notifications around it");
+  assert(!repliesTo(reqMsg, [n]), "no response");
+  assert(!repliesTo(reqMsg, [r, r]), "two responses");
+  assert(!repliesTo(parseJson(req("6", "m", "{}")).unwrap(), [r]), "the wrong id");
+  assert(!repliesTo(n, [r]), "a response to a notification");
+}
+
+// ---- MCP session ------------------------------------------------------------------------------------------------------
+
+@Test
+function mcpSessionRevisions(): void {
+  let s = new McpSession("/root/./p", false, ".");
+  assertEqString(s.root, "/root/p", "the root is normalized");
+  const r1 = s.record("main.or", "fp1", ["k"], ["line"]);
+  const r2 = s.record("main.or", "fp1", ["k"], ["line"]);
+  assertEq(r1, 1, "first revision");
+  assertEq(r2, 1, "an unchanged project keeps its revision");
+  const r3 = s.record("lib.or", "fp1", [], []);
+  const r4 = s.record("main.or", "fp2", [], []);
+  assertEq(r3, 2, "another entry gets the next one");
+  assertEq(r4, 3, "a changed project gets the next one");
+  assert(s.find("main.or", 1).isSome() && s.find("lib.or", 1).isNone(), "find by entry and revision");
+  let i: usize = 0;
+  while (i < MAX_SNAPS) {
+    const r = s.record("main.or", `x${i}`, [], []);
+    assert(r > r4, "revisions grow");
+    i += 1;
+  }
+  assert(s.find("main.or", 1).isNone(), "the oldest snapshots were dropped");
+  assert(s.latest("main.or").isSome(), "the newest is kept");
+  const ok = [Snap { rev: 1, entry: "a", fp: "", keys: [], lines: [] }, Snap { rev: 3, entry: "a", fp: "", keys: [], lines: [] }];
+  assert(revsOrdered(ok, 4), "ordered");
+  assert(!revsOrdered(ok, 3), "a revision that was not handed out yet");
+  assert(!revsOrdered([ok[1], ok[0]], 4), "out of order");
+}
+
+function mcpScript(fs: FsGrant, proc: ProcessGrant): void {
+  let st = new McpSession(".", false, ".");
+  let s = handleText(fs, proc, st, req("\"p\"", "ping", "{}"));
+  assert(answers(s.out[0], JStr("p")), "ping works before initialize");
+  s = handleText(fs, proc, s.st, req("1", "tools/list", "{}"));
+  assert(answers(s.out[0], JNum(1)) && getField(s.out[0], "error").isSome(), "not initialized");
+  s = handleText(fs, proc, s.st, req("2", "initialize", "{}"));
+  assert(s.st.inited, "initialized");
+  s = handleText(fs, proc, s.st, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+  assertEqUsize(s.out.length, 0, "notification");
+  s = handleText(fs, proc, s.st, req("3", "tools/call", "{\"name\":\"nope\"}"));
+  assert(answers(s.out[0], JNum(3)), "unknown tool is an error reply");
+  s = handleText(fs, proc, s.st, "not json");
+  assert(answers(s.out[0], JNull), "parse error");
+}
+
+@Test
+function mcpAnswersEveryRequestWithItsId(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => {
+    mcpScript(fs, proc);
+  });
+}
+
+// ---- formatter ------------------------------------------------------------------------------------------------------
+
+const SRC: string = "// head\nfunction f(a: int,   /* mid */ b: int): int {\n  // inside\n  return a+b; // tail\n}\n/* end */\n";
+
+@Test
+function formatterKeepsCommentsAndIsIdempotent(): void {
+  const once = format(0, SRC).unwrap();
+  const twice = format(0, once).unwrap();
+  assertEqString(twice, once, "idempotent");
+  assert(sameComments(SRC, once), "every comment is kept");
+  assertEqUsize(scanComments(once).length, 5, "five comments, each once");
+  assert(!sameComments(SRC, "// head\n"), "a lost comment");
+  assert(!sameComments("// a\n// a\n", "// a\n"), "a comment kept once instead of twice");
+  assert(format(0, "function (").isErr(), "a syntax error formats nothing");
+}
+
+@Test
+function layoutPlacesEveryCommentOfItsRange(): void {
+  const src = "x; // one\n// two\ny;\n";
+  const c = new Layout(src, scanComments(src));
+  const out = c.seq([0, 17], [2, 19], ["x;", "y;"], 0, src.length, 0, "");
+  assert(allPlaced(c.cs, 0, src.length, out), "both comments placed");
+  assertEqString(stripMarkers(out), "x; // one\n// two\ny;", "trailing and own-line comment");
+  assert(!allPlaced(c.cs, 0, src.length, "x;\ny;"), "a text without the markers");
+  assertEqUsize(c.findChar(0, 121), 17, "findChar skips comments");
+  assert(!commentsOrdered([scanComments(src)[1], scanComments(src)[0]], src.length), "out of order");
+  assert(!commentsOrdered(scanComments(src), 3), "outside the text");
+}

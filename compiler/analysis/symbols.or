@@ -6,8 +6,7 @@
 import { FsGrant } from "std:fs";
 import { Item, FunctionDecl, TypeDecl, ConstDecl, ImportDecl, TypeExpr, Param, FieldDecl, VariantDecl, Ident, InterfaceDecl, parse } from "../syntax";
 import { Span } from "../diag";
-import { readFile, exists } from "std:fs";
-import { dirname, joinPath, normalizePath } from "../loader";
+import { dirname, joinPath, normalizePath, isNormalized } from "../loader";
 import { Workspace, fileText } from "./workspace";
 
 export type DeclKind =
@@ -193,21 +192,17 @@ function symbolsOrEmpty(text: string): DocSymbol[] {
   return r.unwrap();
 }
 
-// Buffer text from the workspace overlay, else the file on disk.
+// Buffer text from the workspace overlay, else the file on disk (read through the loader's `Sources`, the one
+// place that touches the disk).
+@Ensures(fileText(ws, path).isSome() ==> result.isSome() && result.unwrap() == fileText(ws, path).unwrap())
 export function readText(fs: FsGrant, ws: Workspace, path: string): Option<string> {
-  const t = fileText(ws, path);
-  if (t.isSome()) {
-    return t;
-  }
+  const src = ws.sources();
   const p = normalizePath(path);
-  if (!exists(fs, p)) {
+  if (!src.exists(fs, p)) {
     return None;
   }
-  const r = readFile(fs, p);
-  if (r.isErr()) {
-    return None;
-  }
-  return Some(r.unwrap());
+  const r = src.read(fs, p);
+  return r.isOk() ? Some(r.unwrap()) : None;
 }
 
 // Top-level declarations of `path` in source order (functions, types with field/variant
@@ -257,18 +252,21 @@ export function builtinCompletions(): CompletionItem[] {
 }
 
 // Resolve import path `p` (as written in `import ... from "p"`) from file `fromPath` to a normalized
-// file path that exists in the workspace overlay or on disk. None for std modules/missing files.
+// file path that exists in the workspace overlay or on disk (`Sources.exists`). None for std modules/missing files.
+@Ensures(result.isSome() ==> isNormalized(result.unwrap()) && result.unwrap().endsWith(".or"))
+@Ensures(p.startsWith("std:") ==> result.isNone())
 export function resolveModulePath(fs: FsGrant, ws: Workspace, fromPath: string, p: string): Option<string> {
   if (p.startsWith("std:")) {
     return None;
   }
+  const src = ws.sources();
   const dir = dirname(normalizePath(fromPath));
   const c1 = joinPath(dir, p + ".or");
-  if (fileText(ws, c1).isSome() || exists(fs, c1)) {
+  if (src.exists(fs, c1)) {
     return Some(c1);
   }
   const c2 = joinPath(dir, p + "/module.or");
-  if (fileText(ws, c2).isSome() || exists(fs, c2)) {
+  if (src.exists(fs, c2)) {
     return Some(c2);
   }
   return None;

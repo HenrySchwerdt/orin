@@ -203,6 +203,16 @@ def main():
         direct = {(e["src"], e["dst"], e["via"]) for e in sd["edges"] if e["kind"] == "PERFORMS_IO"}
         check(all((d_, v_) in sm.get(s_, set()) for (s_, d_, v_) in direct), "%s: every PERFORMS_IO edge is in the summary" % what)
 
+    # The capability gate of the compiler's tooling (rewrite step 3e, docs/capabilities.md): `analysis` performs no effect
+    # of its own; it reads files only through the loader's `Sources` (MAY, every chain ends in Sources.read / exists)
+    # and writes nothing (the `orin graph` / `diff` / `effects` drivers and their output file live in `tools`).
+    rc, out, err = run(orin, ["effects", "compiler/main.or", "--format=json", "--module", "analysis"])
+    an = {m["module"]: m for m in json.loads(out)["modules"]}["analysis"]["effects"] if rc == 0 else []
+    check(rc == 0 and an and all(e["operation"] in ("Fs.ReadFile", "Fs.Stat") and e["evidence"] == "MAY" for e in an),
+          "compiler: analysis has no direct effect, only file reads it inherits (%s)" % [(e["operation"], e["evidence"]) for e in an])
+    check(all(e["path"][-1]["function"] in ("loader::Sources.read", "loader::Sources.exists") for e in an),
+          "compiler: every file access of analysis goes through loader::Sources (%s)" % [e["path"][-1]["function"] for e in an])
+
     # @Test functions are not part of what a build ships: erased unless --tests
     tp = copy_package(app, os.path.join(tmp, "withtests"))
     with open(os.path.join(tp, "src", "util", "util.or"), "a") as f:

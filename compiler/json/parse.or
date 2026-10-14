@@ -1,31 +1,45 @@
 // JSON parser (RFC 8259 subset, see json.or for the number rule).
 //
-// Errors are `Err("<message> at offset N")`. Nesting deeper than MAX_DEPTH is rejected.
-// `\uXXXX` escapes are decoded to UTF-8 bytes; a surrogate pair becomes one 4-byte sequence,
-// a lone surrogate becomes U+FFFD. Raw control characters inside strings are rejected.
+// Errors are `Err("<message> at offset N")` with `N <= text.length`. Nesting deeper than MAX_DEPTH is rejected.
+// `\uXXXX` escapes are decoded to UTF-8 bytes; a surrogate pair becomes one 4-byte sequence, a lone surrogate
+// becomes U+FFFD. Raw control characters inside strings are rejected.
+//
+// Numbers: every `int` (i64) is accepted, so whatever `stringifyJson` writes reads back (write.or); a
+// fraction is truncated toward zero, an exponent or an integer outside the i64 range is an error.
 
-import { Json, JField } from "./json";
+import { Json, JField, nesting } from "./json";
 
-const MAX_DEPTH: int = 200;
+export const MAX_DEPTH: usize = 200;
 
-type PRes = { v: Json; pos: usize; };
-type SRes = { text: string; pos: usize; };
-type NRes = { n: int; pos: usize; };
+const I64_MAX_DIGITS: string = "9223372036854775807";
+const I64_MIN_DIGITS: string = "9223372036854775808";
 
 function fail(msg: string, at: usize): string {
   return msg + " at offset " + at.toString();
+}
+
+// The offset N of an error message "... at offset N" (None for another text).
+export function errorOffset(msg: string): Option<usize> {
+  const parts = msg.split(" at offset ");
+  if (parts.length < 2) {
+    return None;
+  }
+  const n = parseInt(parts[parts.length - 1]);
+  return n.isSome() && n.unwrap() >= 0 ? Some(n.unwrap().toUsize()) : None;
+}
+
+// An error of the parser of `s`: it names a position inside the text (or just after it).
+export function errorInRange(msg: string, s: string): bool {
+  const at = errorOffset(msg);
+  return at.isSome() && at.unwrap() <= s.length;
 }
 
 function isWs(c: int): bool {
   return c == 32 || c == 9 || c == 10 || c == 13;
 }
 
-function skipWs(s: string, start: usize): usize {
-  let i = start;
-  while (i < s.length && isWs(s.charCodeAt(i))) {
-    i += 1;
-  }
-  return i;
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
 }
 
 function hexVal(c: int): int {
@@ -42,6 +56,8 @@ function hexVal(c: int): int {
 }
 
 // Four hex digits at `at`, or -1.
+@Ensures(result >= -1 && result <= 65535)
+@Ensures(result >= 0 ==> at + 4 <= s.length)
 function hex4(s: string, at: usize): int {
   if (at + 4 > s.length) {
     return -1;
@@ -59,6 +75,14 @@ function hex4(s: string, at: usize): int {
   return v;
 }
 
+// A Unicode scalar value: in range and not a surrogate (a surrogate would make the output invalid UTF-8).
+function isScalar(cp: int): bool {
+  return cp >= 0 && cp <= 1114111 && !(cp >= 55296 && cp <= 57343);
+}
+
+// The UTF-8 encoding of the scalar value `cp`.
+@Requires(isScalar(cp))
+@Ensures(result.length >= 1 && result.length <= 4)
 function utf8(cp: int): string {
   if (cp < 128) {
     return String.fromCharCode(cp);
@@ -74,237 +98,315 @@ function utf8(cp: int): string {
     + String.fromCharCode(128 + (cp / 64) % 64) + String.fromCharCode(128 + cp % 64);
 }
 
-// `s[start]` is the opening quote.
-function parseString(s: string, start: usize): Result<SRes, string> {
-  let parts: string[] = [];
-  let i = start + 1;
-  let runStart = i;
-  while (true) {
-    if (i >= s.length) {
-      return Err(fail("unterminated string", start));
+// True when the decimal digits `ds` (no sign, no leading `-`) denote a magnitude an `int` can hold.
+function fitsI64(ds: string, neg: bool): bool {
+  if (ds.length != 19) {
+    return ds.length < 19;
+  }
+  const lim = neg ? I64_MIN_DIGITS : I64_MAX_DIGITS;
+  let i: usize = 0;
+  while (i < 19) {
+    const a = ds.charCodeAt(i);
+    const b = lim.charCodeAt(i);
+    if (a != b) {
+      return a < b;
     }
-    const c = s.charCodeAt(i);
+    i += 1;
+  }
+  return true;
+}
+
+// The read position of a parse over one text. Every method leaves the position inside the text (the
+// invariant) and either consumes what it parsed or fails; the error message names an offset inside the text.
+@Invariant(this.pos <= this.s.length)
+export class JsonCursor {
+  private s: string;
+  private pos: usize;
+
+  constructor(s: string) {
+    this.s = s;
+    this.pos = 0;
+  }
+
+  // The current offset.
+  position(): usize {
+    return this.pos;
+  }
+
+  // The whole text as one value: whitespace around it is allowed, anything else after it is an error.
+  @Ensures(result.isOk() ==> this.pos == this.s.length && nesting(result.unwrap()) <= MAX_DEPTH)
+  @Ensures(result.isErr() ==> errorInRange(result.unwrapErr(), this.s))
+  document(): Result<Json, string> {
+    const v = this.value(0)?;
+    this.skipWs();
+    if (this.pos < this.s.length) {
+      return Err(fail("trailing characters", this.pos));
+    }
+    return Ok(v);
+  }
+
+  private skipWs(): void {
+    while (this.pos < this.s.length && isWs(this.s.charCodeAt(this.pos))) {
+      this.pos += 1;
+    }
+  }
+
+  private at(i: usize): int {
+    return i < this.s.length ? this.s.charCodeAt(i) : -1;
+  }
+
+  private lit(word: string): bool {
+    return this.pos + word.length <= this.s.length
+      && this.s.substring(this.pos, this.pos + word.length) == word;
+  }
+
+  // One value at nesting `depth` (after leading whitespace). A value is never empty: on success the position moved.
+  @Ensures(result.isOk() ==> this.pos > old(this.pos) && this.pos <= this.s.length)
+  @Ensures(result.isOk() ==> depth + nesting(result.unwrap()) <= MAX_DEPTH)
+  private value(depth: usize): Result<Json, string> {
+    this.skipWs();
+    const i = this.pos;
+    if (i >= this.s.length) {
+      return Err(fail("unexpected end of input", i));
+    }
+    if (depth > MAX_DEPTH) {
+      return Err(fail("nesting too deep", i));
+    }
+    const c = this.s.charCodeAt(i);
     if (c == 34) {
-      if (i > runStart) {
-        parts.push(s.substring(runStart, i));
+      const t = this.str()?;
+      return Ok(JStr(t));
+    }
+    if (c == 123) {
+      return this.object(depth);
+    }
+    if (c == 91) {
+      return this.array(depth);
+    }
+    if (c == 45 || isDigit(c)) {
+      const n = this.number()?;
+      return Ok(JNum(n));
+    }
+    if (this.lit("true")) {
+      this.pos += 4;
+      return Ok(JBool(true));
+    }
+    if (this.lit("false")) {
+      this.pos += 5;
+      return Ok(JBool(false));
+    }
+    if (this.lit("null")) {
+      this.pos += 4;
+      return Ok(JNull);
+    }
+    return Err(fail("unexpected character", i));
+  }
+
+  // A string literal; the position is at its opening quote.
+  @Requires(this.at(this.pos) == 34)
+  @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 2)
+  private str(): Result<string, string> {
+    const start = this.pos;
+    let parts: string[] = [];
+    let i = start + 1;
+    let runStart = i;
+    while (true) {
+      if (i >= this.s.length) {
+        return Err(fail("unterminated string", start));
       }
-      return Ok(SRes { text: parts.join(""), pos: i + 1 });
-    }
-    if (c < 32) {
-      return Err(fail("control character in string", i));
-    }
-    if (c != 92) {
-      i += 1;
-      continue;
-    }
-    if (i > runStart) {
-      parts.push(s.substring(runStart, i));
-    }
-    if (i + 1 >= s.length) {
-      return Err(fail("unterminated escape", i));
-    }
-    const e = s.charCodeAt(i + 1);
-    i += 2;
-    if (e == 34) {
-      parts.push("\"");
-    } else if (e == 92) {
-      parts.push("\\");
-    } else if (e == 47) {
-      parts.push("/");
-    } else if (e == 98) {
-      parts.push(String.fromCharCode(8));
-    } else if (e == 102) {
-      parts.push(String.fromCharCode(12));
-    } else if (e == 110) {
-      parts.push("\n");
-    } else if (e == 114) {
-      parts.push("\r");
-    } else if (e == 116) {
-      parts.push("\t");
-    } else if (e == 117) {
-      const u = hex4(s, i);
-      if (u < 0) {
-        return Err(fail("invalid \\u escape", i - 2));
-      }
-      i += 4;
-      let cp = u;
-      if (u >= 55296 && u <= 56319) {
-        // High surrogate: needs a following \uDC00..\uDFFF.
-        let lo = -1;
-        if (i + 1 < s.length && s.charCodeAt(i) == 92 && s.charCodeAt(i + 1) == 117) {
-          lo = hex4(s, i + 2);
+      const c = this.s.charCodeAt(i);
+      if (c == 34) {
+        if (i > runStart) {
+          parts.push(this.s.substring(runStart, i));
         }
-        if (lo >= 56320 && lo <= 57343) {
-          cp = 65536 + (u - 55296) * 1024 + (lo - 56320);
-          i += 6;
-        } else {
+        this.pos = i + 1;
+        return Ok(parts.join(""));
+      }
+      if (c < 32) {
+        return Err(fail("control character in string", i));
+      }
+      if (c != 92) {
+        i += 1;
+        continue;
+      }
+      if (i > runStart) {
+        parts.push(this.s.substring(runStart, i));
+      }
+      if (i + 1 >= this.s.length) {
+        return Err(fail("unterminated escape", i));
+      }
+      const e = this.s.charCodeAt(i + 1);
+      i += 2;
+      if (e == 34) {
+        parts.push("\"");
+      } else if (e == 92) {
+        parts.push("\\");
+      } else if (e == 47) {
+        parts.push("/");
+      } else if (e == 98) {
+        parts.push(String.fromCharCode(8));
+      } else if (e == 102) {
+        parts.push(String.fromCharCode(12));
+      } else if (e == 110) {
+        parts.push("\n");
+      } else if (e == 114) {
+        parts.push("\r");
+      } else if (e == 116) {
+        parts.push("\t");
+      } else if (e == 117) {
+        const u = hex4(this.s, i);
+        if (u < 0) {
+          return Err(fail("invalid \\u escape", i - 2));
+        }
+        i += 4;
+        let cp = u;
+        if (u >= 55296 && u <= 56319) {
+          // High surrogate: needs a following \uDC00..\uDFFF.
+          let lo = -1;
+          if (this.at(i) == 92 && this.at(i + 1) == 117) {
+            lo = hex4(this.s, i + 2);
+          }
+          if (lo >= 56320 && lo <= 57343) {
+            cp = 65536 + (u - 55296) * 1024 + (lo - 56320);
+            i += 6;
+          } else {
+            cp = 65533;
+          }
+        } else if (u >= 56320 && u <= 57343) {
           cp = 65533;
         }
-      } else if (u >= 56320 && u <= 57343) {
-        cp = 65533;
+        parts.push(utf8(cp));
+      } else {
+        return Err(fail("invalid escape", i - 2));
       }
-      parts.push(utf8(cp));
-    } else {
-      return Err(fail("invalid escape", i - 2));
+      runStart = i;
     }
-    runStart = i;
+    return Err("unreachable");
   }
-  return Err("unreachable");
-}
 
-function isDigit(c: int): bool {
-  return c >= 48 && c <= 57;
-}
-
-function parseNumber(s: string, start: usize): Result<NRes, string> {
-  let i = start;
-  let neg = false;
-  if (s.charCodeAt(i) == 45) {
-    neg = true;
-    i += 1;
-  }
-  const ds = i;
-  while (i < s.length && isDigit(s.charCodeAt(i))) {
-    i += 1;
-  }
-  if (i == ds) {
-    return Err(fail("invalid number", start));
-  }
-  if (i - ds > 18) {
-    return Err(fail("integer too large", start));
-  }
-  let v = 0;
-  let k = ds;
-  while (k < i) {
-    v = v * 10 + (s.charCodeAt(k) - 48);
-    k += 1;
-  }
-  if (i < s.length && s.charCodeAt(i) == 46) {
-    // Fraction: validated, then truncated toward zero.
-    i += 1;
-    const fs = i;
-    while (i < s.length && isDigit(s.charCodeAt(i))) {
+  // A number; the position is at its `-` or first digit.
+  @Ensures(result.isOk() ==> this.pos > old(this.pos))
+  private number(): Result<int, string> {
+    const start = this.pos;
+    let i = start;
+    const neg = this.at(i) == 45;
+    if (neg) {
       i += 1;
     }
-    if (i == fs) {
+    const ds = i;
+    while (isDigit(this.at(i))) {
+      i += 1;
+    }
+    if (i == ds) {
       return Err(fail("invalid number", start));
     }
+    const digits = this.s.substring(ds, i);
+    if (!fitsI64(digits, neg)) {
+      return Err(fail("integer too large", start));
+    }
+    // Accumulated on the side of the sign, so that i64::MIN does not overflow.
+    let v = 0;
+    let k = ds;
+    while (k < i) {
+      const d = this.s.charCodeAt(k) - 48;
+      v = neg ? v * 10 - d : v * 10 + d;
+      k += 1;
+    }
+    if (this.at(i) == 46) {
+      // Fraction: validated, then truncated toward zero.
+      i += 1;
+      const fs = i;
+      while (isDigit(this.at(i))) {
+        i += 1;
+      }
+      if (i == fs) {
+        return Err(fail("invalid number", start));
+      }
+    }
+    if (this.at(i) == 101 || this.at(i) == 69) {
+      return Err(fail("exponent notation is not supported", i));
+    }
+    this.pos = i;
+    return Ok(v);
   }
-  if (i < s.length && (s.charCodeAt(i) == 101 || s.charCodeAt(i) == 69)) {
-    return Err(fail("exponent notation is not supported", i));
+
+  // `[ value, ... ]`; the position is at the `[`.
+  @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 2)
+  private array(depth: usize): Result<Json, string> {
+    const start = this.pos;
+    let items: Json[] = [];
+    this.pos += 1;
+    this.skipWs();
+    if (this.at(this.pos) == 93) {
+      this.pos += 1;
+      return Ok(JArr(items));
+    }
+    while (true) {
+      const v = this.value(depth + 1)?;
+      items.push(v);
+      this.skipWs();
+      if (this.pos >= this.s.length) {
+        return Err(fail("unterminated array", start));
+      }
+      const c = this.s.charCodeAt(this.pos);
+      if (c == 93) {
+        this.pos += 1;
+        return Ok(JArr(items));
+      }
+      if (c != 44) {
+        return Err(fail("expected `,` or `]`", this.pos));
+      }
+      this.pos += 1;
+    }
+    return Err("unreachable");
   }
-  if (neg) {
-    v = 0 - v;
+
+  // `{ "key": value, ... }`; the position is at the `{`.
+  @Ensures(result.isOk() ==> this.pos >= old(this.pos) + 2)
+  private object(depth: usize): Result<Json, string> {
+    const start = this.pos;
+    let fields: JField[] = [];
+    this.pos += 1;
+    this.skipWs();
+    if (this.at(this.pos) == 125) {
+      this.pos += 1;
+      return Ok(JObj(fields));
+    }
+    while (true) {
+      this.skipWs();
+      if (this.at(this.pos) != 34) {
+        return Err(fail("expected string key", this.pos));
+      }
+      const k = this.str()?;
+      this.skipWs();
+      if (this.at(this.pos) != 58) {
+        return Err(fail("expected `:`", this.pos));
+      }
+      this.pos += 1;
+      const v = this.value(depth + 1)?;
+      fields.push(JField { key: k, value: v });
+      this.skipWs();
+      if (this.pos >= this.s.length) {
+        return Err(fail("unterminated object", start));
+      }
+      const c = this.s.charCodeAt(this.pos);
+      if (c == 125) {
+        this.pos += 1;
+        return Ok(JObj(fields));
+      }
+      if (c != 44) {
+        return Err(fail("expected `,` or `}`", this.pos));
+      }
+      this.pos += 1;
+    }
+    return Err("unreachable");
   }
-  return Ok(NRes { n: v, pos: i });
 }
 
-function expectLit(s: string, at: usize, lit: string): bool {
-  if (at + lit.length > s.length) {
-    return false;
-  }
-  return s.substring(at, at + lit.length) == lit;
-}
-
-function parseValue(s: string, start: usize, depth: int): Result<PRes, string> {
-  const i = skipWs(s, start);
-  if (i >= s.length) {
-    return Err(fail("unexpected end of input", i));
-  }
-  if (depth > MAX_DEPTH) {
-    return Err(fail("nesting too deep", i));
-  }
-  const c = s.charCodeAt(i);
-  if (c == 34) {
-    const r = parseString(s, i)?;
-    return Ok(PRes { v: JStr(r.text), pos: r.pos });
-  }
-  if (c == 123) {
-    return parseObject(s, i, depth);
-  }
-  if (c == 91) {
-    return parseArray(s, i, depth);
-  }
-  if (c == 45 || isDigit(c)) {
-    const r = parseNumber(s, i)?;
-    return Ok(PRes { v: JNum(r.n), pos: r.pos });
-  }
-  if (expectLit(s, i, "true")) {
-    return Ok(PRes { v: JBool(true), pos: i + 4 });
-  }
-  if (expectLit(s, i, "false")) {
-    return Ok(PRes { v: JBool(false), pos: i + 5 });
-  }
-  if (expectLit(s, i, "null")) {
-    return Ok(PRes { v: JNull, pos: i + 4 });
-  }
-  return Err(fail("unexpected character", i));
-}
-
-function parseArray(s: string, start: usize, depth: int): Result<PRes, string> {
-  let items: Json[] = [];
-  let i = skipWs(s, start + 1);
-  if (i < s.length && s.charCodeAt(i) == 93) {
-    return Ok(PRes { v: JArr(items), pos: i + 1 });
-  }
-  while (true) {
-    const r = parseValue(s, i, depth + 1)?;
-    items.push(r.v);
-    i = skipWs(s, r.pos);
-    if (i >= s.length) {
-      return Err(fail("unterminated array", start));
-    }
-    const c = s.charCodeAt(i);
-    if (c == 93) {
-      return Ok(PRes { v: JArr(items), pos: i + 1 });
-    }
-    if (c != 44) {
-      return Err(fail("expected `,` or `]`", i));
-    }
-    i += 1;
-  }
-  return Err("unreachable");
-}
-
-function parseObject(s: string, start: usize, depth: int): Result<PRes, string> {
-  let fields: JField[] = [];
-  let i = skipWs(s, start + 1);
-  if (i < s.length && s.charCodeAt(i) == 125) {
-    return Ok(PRes { v: JObj(fields), pos: i + 1 });
-  }
-  while (true) {
-    i = skipWs(s, i);
-    if (i >= s.length || s.charCodeAt(i) != 34) {
-      return Err(fail("expected string key", i));
-    }
-    const k = parseString(s, i)?;
-    i = skipWs(s, k.pos);
-    if (i >= s.length || s.charCodeAt(i) != 58) {
-      return Err(fail("expected `:`", i));
-    }
-    const r = parseValue(s, i + 1, depth + 1)?;
-    fields.push(JField { key: k.text, value: r.v });
-    i = skipWs(s, r.pos);
-    if (i >= s.length) {
-      return Err(fail("unterminated object", start));
-    }
-    const c = s.charCodeAt(i);
-    if (c == 125) {
-      return Ok(PRes { v: JObj(fields), pos: i + 1 });
-    }
-    if (c != 44) {
-      return Err(fail("expected `,` or `}`", i));
-    }
-    i += 1;
-  }
-  return Err("unreachable");
-}
-
+// Parses one JSON text.
+@Ensures(result.isOk() ==> nesting(result.unwrap()) <= MAX_DEPTH)
+@Ensures(result.isErr() ==> errorInRange(result.unwrapErr(), s))
 export function parseJson(s: string): Result<Json, string> {
-  const r = parseValue(s, 0, 0)?;
-  const end = skipWs(s, r.pos);
-  if (end < s.length) {
-    return Err(fail("trailing characters", end));
-  }
-  return Ok(r.v);
+  let c = new JsonCursor(s);
+  return c.document();
 }

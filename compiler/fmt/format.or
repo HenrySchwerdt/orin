@@ -1,17 +1,39 @@
 // `orin fmt` entry point: parse, pretty-print canonically, re-insert comments.
 
 import { Diagnostic, span, diag } from "../diag";
-import { parse, scanComments } from "../syntax";
-import { Ctx, stripMarkers } from "./layout";
+import { parse, scanComments, Comment } from "../syntax";
+import { Layout, stripMarkers } from "./layout";
 import { printModule } from "./printer";
 
+// The number of comments of `cs` whose text is `t`.
+function countText(cs: Comment[], t: string): usize {
+  let n: usize = 0;
+  for (const c of cs) {
+    if (c.text == t) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+// `a` and `b` hold the same comments: the same multiset of comment texts (the order may change: a comment inside an
+// element that the element does not place is hoisted above it).
+export function sameComments(a: string, b: string): bool {
+  const ca = scanComments(a);
+  const cb = scanComments(b);
+  return ca.length == cb.length && ca.every(c => countText(ca, c.text) == countText(cb, c.text));
+}
+
 // Canonical formatting of `src` (file index `file`). Syntax errors are returned as diagnostics
-// and nothing is formatted. The result is idempotent: format(format(x)) == format(x).
+// and nothing is formatted. The result is idempotent: format(format(x)) == format(x); it keeps every comment
+// (`sameComments`).
+@Ensures(result.isOk() ==> sameComments(src, result.unwrap()))
+@Ensures(result.isOk() ==> format(file, result.unwrap()).isOk() && format(file, result.unwrap()).unwrap() == result.unwrap())
 export function format(file: usize, src: string): Result<string, Diagnostic> {
   const m = parse(file, src)?;
   if (src.includes("\x01") || src.includes("\x02")) {
     return Err(diag("E0100", span(file, 0, 0), "the formatter does not support control bytes 0x01/0x02 in source"));
   }
-  const c = Ctx { src: src, cs: scanComments(src) };
+  const c = new Layout(src, scanComments(src));
   return Ok(stripMarkers(printModule(c, m)));
 }
