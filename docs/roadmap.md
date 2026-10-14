@@ -116,6 +116,22 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   2. **std I/O freeze** after capabilities. Stage A has landed, so the signatures are now the
      proposed final ones (`std:host`, `std:fs`, `std:process`, `std:io`, `std:time` take grants);
      they stay *unstable* until the project owner confirms the freeze (ADR-0027 open questions).
+- **Agent ergonomics, measured before the 1.0 release** (project owner, 2026-10-14):
+  - **Benchmark:** a fixed set of about 20 tasks (HTTP service, parser, ledger with invariants, CLI tool, data
+    processing) is solved by fresh agents with no prior Orin knowledge.
+  - **Measured:**
+    - fix rounds until green;
+    - the most frequent diagnostic codes;
+    - where agents give up or loop.
+  - **Response per frequent trap:**
+    - **Pure syntax** with no effect on the guarantees: move it towards TypeScript, through an ADR because the
+      language is frozen.
+    - **A recognisable TS idiom** with a different meaning, such as `try/catch`, `null` or ambient `fs`: a targeted
+      diagnostic with a machine-readable quick-fix.
+    - **A safety core**, such as `const` meaning immutable under value semantics, or I/O only with a grant: stays,
+      with a better explanation and `orin explain`.
+  - **Repeated** after every major step. "Rounds until green" becomes a tracked language metric, next to the
+    benchmarks.
 
 ### 1c. Provable std foundation (ADR-0030 §3, "bytes and text" + "collections"): done
 - `std:bytes` (`Bytes`, `ByteBuilder`, `ByteReader`), `std:utf8` (validated decoding, `Utf8String`,
