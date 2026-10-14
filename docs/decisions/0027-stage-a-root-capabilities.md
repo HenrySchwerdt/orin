@@ -78,7 +78,7 @@ grants at once with `useHost`, pass grants as arguments to helper functions, or 
 | Process | `ProcessGrant` | `Process.Args` (INPUT), `Process.Spawn` (`shell`, CONTROL); narrowing `argsOnly` removes Spawn | |
 | Stdio | `StdioGrant` | `Stdio.Read` (`readLine`, `readBytes`), `Stdio.Write` (`writeStdout`) | INPUT / OUTPUT |
 | Clock | `ClockGrant` | `Clock.Now` | INPUT |
-| Network | `NetGrant` | **reserved**: `Net.Bind`, `Net.Accept`, `Net.Connect` (CONTROL), `Stream.Read` (INPUT), `Stream.Write` (OUTPUT), exactly the operations of ADR-0021 Feasibility. No `std:net` exists; `TyGrant(5)`, the policy name `net` and the family bit are reserved so that Stage B adds the module and the platform operations without a new mechanism | |
+| Network | `NetGrant` | **implemented by ADR-0033** (was reserved): `Net.Bind`, `Net.Accept`, `Net.Connect` (CONTROL), `Stream.Read` (INPUT), `Stream.Write` (OUTPUT), exactly the operations of ADR-0021 Feasibility. No `std:net` exists; `TyGrant(5)`, the policy name `net` and the family bit are reserved so that Stage B adds the module and the platform operations without a new mechanism | |
 | Environment | -- | no `std:env` exists. Reserved name `Env.Get` (INPUT) under the process family decision of the owner | |
 
 **D4. `main()` without `host` has no authority: a compile error, not a runtime denial.** Every I/O function's first
@@ -144,7 +144,8 @@ one) is a limit; exceeding it traps.
 
 **D9. Moving into a task, never sharing (ADR-0017).** A grant (like a file) may be *moved* into a task once ADR-0017's
 task spawn exists (an owned-parameter mode for handles plus a spawn rule); it can never be shared or copied. Nothing in
-Stage A creates tasks, so the rule is only recorded here and in ADR-0021 Addendum A.
+Stage A creates tasks, so the rule is only recorded here and in ADR-0021 Addendum A. *Implemented by the task stage:* see Q10
+below and ADR-0017 Addendum A.
 
 **D10. Forgery.** There is no constructor: `FsGrant {}` is E0400 ("a built-in resource type, not a record type"),
 `const g = fs;` and `let g: FsGrant = ...` are E0450, an integer cannot become a grant (no conversion exists), the raw
@@ -231,4 +232,7 @@ records this. The full chain old seed -> bridge -> new seed is reproducible from
    (`withListener(net, port, l => ...)`, ADR-0021 D4a).
 9. **Grant limit** (256 live grants) and the handle layout are runtime details; is a documented fixed limit acceptable?
 10. **Tasks (ADR-0017).** The move-into-task rule for handles needs the owned-parameter extension for handles; schedule
-    it with the task design, not with this stage.
+    it with the task design, not with this stage. **Resolved with the task stage (2026-10-14, ADR-0017 Addendum A):** no
+    owned-parameter mode for user code; `spawnFs(s, g, fsg => ..)` derives a grant of the same authority, moves it into the task
+    through a one-shot token (MIR v2.1: `grantClone` opener, `grantMove` closer, `grantAdopt*` opener), and the task revokes it.
+    The spawner's own grant stays valid; a task cannot capture a grant (E0483).

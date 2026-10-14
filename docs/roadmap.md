@@ -29,8 +29,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
-   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033) and the server loop on
-     top of it
+   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033, **done**: blocking TCP, `examples/http_server.or`); concurrency needs ADR-0017
    - `std:mcp`, JSX/`std:html`
 4. **Complete the Lean proofs:**
    - shape check in the verifier and the model (finding F-shape);
@@ -53,7 +52,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      - a TCB size budget enforced in CI;
    - closing the chain to the binary: a CompCert-compatible C path, diverse double compiling
      against the archived Stage 0, and signed `.orcert` attestations.
-5. **Concurrency** (ADR-0017), placed after R3/R4 and before the performance push:
+5. **Concurrency** (ADR-0017). **Stage 0 is built (2026-10-14)**: `std:task` in Orin over L0 thread / monitor primitives and one small temporary C interface for transfer and task start (docs/concurrency.md); the owner's condition "only if it can then simply be moved to Orin" is met by the porting table (ADR-0017 Addendum A), so R3 ports the C interface 1:1 instead of redesigning. Still open from the original placement: the M:N scheduler, `async` / `await` only if blocking tasks prove insufficient, `Shared<T>`, per-task regions (ADR-0038), the proofs (R4) and the concurrent HTTP server (waits for `std:net`). Original placement, after R3/R4 and before the performance push:
    - *after R3*, because task heaps and the L0 thread primitives belong to the Orin core runtime.
      Built before R3, threads would be built twice, once in C and again in Orin;
    - isolated tasks with send = move-or-copy keep reference counting non-atomic. The proofs then
@@ -209,7 +208,9 @@ the rewritten, contract-checked front end.
 
 ### 3. Concurrency (ADR-0017)
 Isolated tasks, `scope`/`spawn`/`join`, channels and send = move-or-copy. Runs on the L0 thread
-primitives.
+primitives. **Stage 0 done (2026-10-14):** [docs/concurrency.md](concurrency.md), ADR-0017 Addendum A; `std:task`, 1:1 threads,
+bounded channels, panics propagate at `join`, grants move into tasks (ADR-0027 Q10); the C parts are `TESTED_ONLY`
+(ThreadSanitizer) until R3 / R4. Next: the concurrent HTTP server once `std:net` is on `main`, then the scheduler.
 
 ### 3a. Flagship: TypeScript tooling in Orin (deferred until a GitHub organisation exists)
 Goal (project owner, 2026-10-13): show that Orin is the natural language for TypeScript tooling —

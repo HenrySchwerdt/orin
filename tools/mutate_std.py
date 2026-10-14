@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Mutation check for the provable std modules (ADR-0030 §3, ADR-0028).
 
-Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http}.or. The module and its
+Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http,text}.or. The module and its
 test file are copied to build/mutate_std/, the std imports are rewritten to relative ones, the mutation is applied and
 `orin test` is run twice: with runtime contract checking (the default) and with `--no-contracts`. A mutant is
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
 
-Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http] [--list]
+Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http|net|text|taskcore] [--list]
 Exit status 1 if any mutant survives (is not killed with contracts on).
 """
 import argparse
@@ -22,6 +22,23 @@ OUT = os.path.join(ROOT, "build", "mutate_std")
 # (module, name, old text (must occur exactly once), new text[, expect-trap test in tests/std/expect_trap/])
 # An expect-trap test must FAIL (trap) on the real code; a mutant that makes it pass is killed.
 MUTANTS = [
+    # ---- std:taskcore (the pure bookkeeping of std:task: Ring = one channel buffer, Ledger = one scope's task table)
+    ("taskcore", "ring-push-slot-ignores-head", "const slot = (this.head + this.len) % this.cap;", "const slot = this.len % this.cap;"),
+    ("taskcore", "ring-push-forgets-len", "    const slot = (this.head + this.len) % this.cap;\n    this.len += 1;\n    return slot;", "    const slot = (this.head + this.len) % this.cap;\n    return slot;"),
+    ("taskcore", "ring-pop-head-stays", "    this.head = (this.head + 1) % this.cap;\n    this.len -= 1;", "    this.len -= 1;"),
+    ("taskcore", "ring-pop-wrap-off-by-one", "this.head = (this.head + 1) % this.cap;", "this.head = (this.head + 1) % (this.cap + 1);"),
+    ("taskcore", "ring-canPush-ignores-tx-closed", "return !this.txClosed && !this.rxClosed && this.len < this.cap;", "return !this.rxClosed && this.len < this.cap;"),
+    ("taskcore", "ring-canPush-ignores-rx-closed", "return !this.txClosed && !this.rxClosed && this.len < this.cap;", "return !this.txClosed && this.len < this.cap;"),
+    ("taskcore", "ring-canPush-allows-full", "return !this.txClosed && !this.rxClosed && this.len < this.cap;", "return !this.txClosed && !this.rxClosed && this.len <= this.cap;"),
+    ("taskcore", "ring-isDone-forgets-drain", "return this.rxClosed || (this.txClosed && this.len == 0);", "return this.rxClosed || this.txClosed;"),
+    ("taskcore", "ring-isDone-forgets-cancel", "return this.rxClosed || (this.txClosed && this.len == 0);", "return this.txClosed && this.len == 0;"),
+    ("taskcore", "ring-closeTx-closes-rx", "    this.txClosed = true;", "    this.rxClosed = true;"),
+    ("taskcore", "ring-released-either", "return this.txClosed && this.rxClosed;", "return this.txClosed || this.rxClosed;"),
+    ("taskcore", "ring-canPop-needs-two", "return this.len > 0;\n  }\n\n  // isDone()", "return this.len > 1;\n  }\n\n  // isDone()"),
+    ("taskcore", "ledger-add-returns-next", "    const i = this.count;\n    this.count += 1;\n    return i;", "    this.count += 1;\n    return this.count;"),
+    ("taskcore", "ledger-advance-skips", "    this.cursor += 1;", "    this.cursor += 2;"),
+    ("taskcore", "ledger-scanned-early", "return this.cursor == this.count;\n  }\n\n  // close()", "return this.cursor + 1 >= this.count;\n  }\n\n  // close()"),
+    ("taskcore", "ledger-close-forgets", "    this.closed = true;\n  }\n}", "    this.closed = false;\n  }\n}"),
     # ---- std:bytes
     ("bytes", "slice-offset-ignored", "return new Bytes(this.data, this.start + lo, hi - lo);", "return new Bytes(this.data, this.start, hi - lo);"),
     ("bytes", "slice-length-off-by-one", "return new Bytes(this.data, this.start + lo, hi - lo);", "return new Bytes(this.data, this.start + lo, hi - lo + 1);"),
@@ -130,7 +147,75 @@ MUTANTS = [
     ("http", "request-ctor-skips-validation", "    enforce(requestProblem(method, target, version, headers, body, trailers) == \"\", \"invalid Request\");", "", "http_request_ctor_rejects_invalid"),
     ("http", "response-ctor-skips-validation", "    enforce(responseProblem(status, version, headers, body, trailers, forHead) == \"\", \"invalid Response\");", "", "http_response_ctor_rejects_204_body"),
     ("http", "limits-ctor-skips-validation", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, \"invalid Limits\");", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776 || true, \"invalid Limits\");", "http_limits_ctor_rejects_zero"),
+    # ---- std:text
+    ("text", "dedent-last-indent-wins", "      common = found ? commonPrefix(common, ind) : ind;", "      common = ind;"),
+    ("text", "dedent-width-not-prefix", "  while (i < a.length && i < b.length && a.charCodeAt(i) == b.charCodeAt(i)) {", "  while (i < a.length && i < b.length) {"),
+    ("text", "cr-not-blank", "    if (c != 32 && c != 9 && c != 13) {\n      return false;", "    if (c != 32 && c != 9) {\n      return false;"),
+    ("text", "crlf-gives-two-newlines", "      if (i + 1 < text.length && text.charCodeAt(i + 1) == 10) {\n        i += 1;\n      }", "      if (i + 1 < text.length && text.charCodeAt(i + 1) == 10) {\n      }"),
+    ("text", "indent-empty-lines", "line.length == 0 ? \"\" : prefix + line", "prefix + line"),
+    ("text", "trim-keeps-trailing-blank", "  while (last > first && isBlankLine(lines[last - 1])) {", "  while (last > lines.length && isBlankLine(lines[last - 1])) {"),
+    ("text", "trim-keeps-leading-blank", "  while (first < lines.length && isBlankLine(lines[first])) {", "  while (first > lines.length && isBlankLine(lines[first])) {"),
+
 ]
+
+# std:net mutants (module "net"): stdlib/net.or imports the internal std:fsraw, so a copy outside the library root cannot be
+# compiled. These mutants are applied to stdlib/net.or in place, the compiler (which embeds the library) is rebuilt with the
+# given compiler, and tests/std/net_test.or runs with the mutated compiler; stdlib/net.or is restored afterwards.
+NET_MUTANTS = [
+    ("net", "findFrom-misses-delimiter-at-end", "  while (i + m <= n) {", "  while (i + m < n) {"),
+    ("net", "readUntil-receives-past-the-limit", "const r = recv(s, limit - this.pending.length(), left);", "const r = recv(s, limit, left);"),
+    ("net", "readExact-reports-short-read-as-timeout", "        RecvEof => {\n          return FillClosed(this.take(this.pending.length()));\n        },\n        RecvTimeout => {\n          return FillTimeout;\n        },\n        RecvReset => {\n          return FillError(makeError(CODE_RESET));\n        },\n        RecvError(e) => {\n          return FillError(e);\n        }\n      }\n    }\n    return Filled(this.take(n));", "        RecvEof => {\n          return FillTimeout;\n        },\n        RecvTimeout => {\n          return FillTimeout;\n        },\n        RecvReset => {\n          return FillError(makeError(CODE_RESET));\n        },\n        RecvError(e) => {\n          return FillError(e);\n        }\n      }\n    }\n    return Filled(this.take(n));"),
+    ("net", "readExact-loop-bound", "    while (this.pending.length() < n) {\n      const left", "    while (this.pending.length() <= n) {\n      const left"),
+    ("net", "parsePeer-keeps-brackets", "h = h.substring(1, h.length - 1);", "h = h;"),
+    ("net", "isDenied-wrong-code", "return e.code == CODE_DENIED;", "return e.code == CODE_TIMEOUT;"),
+    ("net", "recv-ignores-maxBytes", "const r = netRecv(s, maxBytes, clampMs(timeoutMs));", "const r = netRecv(s, 65536, clampMs(timeoutMs));"),
+    ("net", "readUntil-deadline-ignored", "    const deadline = netNow(s) + clampMs(timeoutMs);\n    let begin: usize = 0;", "    const deadline = netNow(s) + 1000000;\n    let begin: usize = 0;"),
+]
+
+
+def run_net_mutants(orinc):
+    """Applies each NET_MUTANT in place, rebuilds the compiler, runs net_test; returns the number of survivors."""
+    import subprocess as sp
+    path = os.path.join(ROOT, "stdlib", "net.or")
+    emb = os.path.join(ROOT, "compiler", "loader", "embedded_stdlib.or")
+    orig = open(path, encoding="utf-8").read()
+    orig_emb = open(emb, encoding="utf-8").read()
+    survivors = 0
+    try:
+        for mod, name, old, new in NET_MUTANTS:
+            if orig.count(old) < 1:
+                print("BAD MUTANT %s/%s: pattern not found" % (mod, name))
+                return 2
+            d = os.path.join(OUT, "net_" + name)
+            os.makedirs(d, exist_ok=True)
+            open(path, "w", encoding="utf-8").write(orig.replace(old, new, 1))
+            sp.run([sys.executable, os.path.join(ROOT, "tools", "embed_prelude.py")], cwd=ROOT, check=True, stdout=sp.DEVNULL)
+            c = os.path.join(d, "orin.c")
+            r1 = sp.run([orinc, "compile", "compiler/main.or", "-o", c], cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
+            r2 = sp.run(["cc", "-O0", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", os.path.join(d, "orin")],
+                        cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
+            if r1.returncode or r2.returncode:
+                print("COMPILE ERROR in mutant net/%s:\n%s" % (name, (r1.stdout + r2.stdout).decode()[:600]))
+                return 2
+            fails = []
+            for flag in ([], ["--no-contracts"]):
+                try:
+                    t = sp.run([os.path.join(d, "orin"), "test", "tests/std/net_test.or", "--runtime", "runtime"] + flag, cwd=ROOT,
+                               stdout=sp.PIPE, stderr=sp.STDOUT, timeout=120)
+                except sp.TimeoutExpired:  # a mutant that waits forever is a failing test
+                    fails.append(1)
+                    continue
+                out = t.stdout.decode("utf-8", "replace")
+                fails.append(len(re.findall(r"^FAIL ", out, re.M)) + (1 if t.returncode and "error[" not in out and not re.search(r"^FAIL ", out, re.M) else 0))
+            status = "killed" if fails[0] else "SURVIVED"
+            if status == "SURVIVED":
+                survivors += 1
+            print("%-12s %-44s %-9s tests failing: %2d; without contracts: %2d" % (mod, name, status, fails[0], fails[1]), flush=True)
+    finally:
+        open(path, "w", encoding="utf-8").write(orig)
+        open(emb, "w", encoding="utf-8").write(orig_emb)
+    return 1 if survivors else 0
+
 
 # further test files of a module that also run against every mutant
 EXTRA_TESTS = {"utf8": ["utf8_dfa_test"], "collections": ["sorted_btree_test"],
@@ -158,13 +243,15 @@ def main():
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
-        for m in MUTANTS:
+        for m in MUTANTS + NET_MUTANTS:
             print(m[0], m[1])
         return 0
     orinc = os.path.join(ROOT, a.orinc)
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
-    mods = ["bytes", "utf8", "collections", "http"]
+    if a.module == "net":
+        return run_net_mutants(orinc)
+    mods = ["bytes", "utf8", "collections", "http", "text", "taskcore"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     survivors = 0
     rows = []
@@ -172,6 +259,8 @@ def main():
         mod, name, old, new = mutant[:4]
         extra = mutant[4] if len(mutant) > 4 else ""
         if a.module and a.module != mod:
+            continue
+        if mod == "net":
             continue
         src = open(os.path.join(ROOT, "stdlib", mod + ".or"), encoding="utf-8").read()
         if src.count(old) < 1:

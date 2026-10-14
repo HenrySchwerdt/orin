@@ -192,6 +192,10 @@ rewritten module follows these rules (the contracts are checked by the `contract
    5 M ints is about 4x slower than the loop. The self-compile time in the PR shows whether a change slowed the
    compiler down.
 
+8. **No global counters in per-function work** (project owner, 2026-10-14; ADR-0039 §6): a phase that works per
+   function, such as checking a body, lowering, verifying or emitting code, numbers what it creates (temporaries,
+   string literals, fresh names) locally. A program-wide numbering is assigned afterwards, in a fixed order. Then a
+   phase can switch to `.parallel()` without changing its output, so the bootstrap fixed point keeps holding.
 ## Step 2a: `check/{env,fnctx,types}.or` (the checker's foundation)
 
 Rewritten: symbol tables, scope stack, type-instance caches. `body.or`, `decls.or`, `collect.or` only got the

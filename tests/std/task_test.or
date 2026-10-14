@@ -1,0 +1,154 @@
+// Tests for std:task (ADR-0017 stage 0): channel semantics in one task, transfer by move or copy (the counters), and the structure
+// of a scope. The pure bookkeeping classes `Ring` and `Ledger` are tested in taskcore_test.or. Run with `orin test` (contracts
+// checked) and with `--no-contracts`; see tools/test_std.sh.
+import { assert, assertEq, assertEqUsize, assertEqBool, assertEqString } from "std:test";
+import { scope, scopeDo, spawn, spawnDo, channel, movedCount, copiedCount, TaskHandle, parallelMap } from "std:task";
+
+// ------------------------------------------------------------------------------------------------ channels (one task)
+
+@Test
+function channelFifoAndClose(): void {
+  const ch = channel<string>(3);
+  assertEqBool(ch.tx.send("one"), true, "send 1");
+  assertEqBool(ch.tx.send("two"), true, "send 2");
+  assertEqBool(ch.tx.send("three"), true, "send 3 (the channel is now full)");
+  assertEqString(ch.rx.recv().unwrap(), "one", "fifo 1");
+  assertEqBool(ch.tx.send("four"), true, "a slot is free again");
+  ch.tx.close();
+  assertEqBool(ch.tx.send("five"), false, "send after close is refused, not lost silently");
+  assertEqString(ch.rx.recv().unwrap(), "two", "drain 2");
+  assertEqString(ch.rx.recv().unwrap(), "three", "drain 3");
+  assertEqString(ch.rx.recv().unwrap(), "four", "drain 4");
+  assertEqBool(ch.rx.recv().isNone(), true, "None once closed and drained");
+  assertEqBool(ch.rx.recv().isNone(), true, "and stays None");
+  ch.rx.close();
+}
+
+@Test
+function receiverCancelDropsAndRefuses(): void {
+  const ch = channel<int[]>(4);
+  ch.tx.send([1, 2, 3]);
+  ch.tx.send([4]);
+  ch.rx.close();
+  assertEqBool(ch.tx.send([5]), false, "a cancelled channel refuses senders");
+  ch.tx.close();
+}
+
+// ------------------------------------------------------------------------------------------------ move or copy
+
+function makeBig(n: int): string[] {
+  let xs: string[] = [];
+  let i = 0;
+  while (i < n) {
+    xs.push("item " + i.toString());
+    i += 1;
+  }
+  return xs;
+}
+
+// Every value that crosses is counted exactly once, as a move or as a copy; a value that the sender still holds can only be copied, and
+// the receiver's copy is independent of it. WHETHER a fresh temporary is moved depends on the build (the optimiser's owned-parameter
+// inference, ADR-0010, passes it by move; contract checking keeps an extra reference and copies), so this test does not pin it:
+// tests/concurrency/move_counts.or does, in the default build.
+@Test
+function everyCrossingIsCountedOnce(): void {
+  const ch = channel<string[]>(4);
+  const m0 = movedCount();
+  const c0 = copiedCount();
+  ch.tx.send(makeBig(500));
+  assertEqUsize((movedCount() - m0) + (copiedCount() - c0), 1, "one crossing, counted once");
+  const keep = makeBig(500);
+  ch.tx.send(keep);
+  assertEqUsize((movedCount() - m0) + (copiedCount() - c0), 2, "two crossings, counted twice");
+  assertEqBool(copiedCount() - c0 >= 1, true, "a value the sender still holds is copied");
+  assertEqUsize(keep.length, 500, "the sender's value is intact");
+  ch.tx.close();
+  assertEqUsize(ch.rx.recv().unwrap().length, 500, "the first value arrives");
+  const got = ch.rx.recv().unwrap();
+  assertEqUsize(got.length, 500, "the second arrives");
+  assertEqString(got[499], "item 499", "with its content");
+  ch.rx.close();
+}
+
+@Test
+function scalarsCostNothing(): void {
+  const ch = channel<int>(2);
+  const m0 = movedCount();
+  const c0 = copiedCount();
+  ch.tx.send(41);
+  assertEqUsize(movedCount() - m0, 0, "a scalar is neither moved");
+  assertEqUsize(copiedCount() - c0, 0, "nor copied");
+  assertEq(ch.rx.recv().unwrap(), 41, "but arrives");
+  ch.tx.close();
+  ch.rx.close();
+}
+
+// ------------------------------------------------------------------------------------------------ scopes
+
+@Test
+function scopeJoinsWhatTheBodyDidNot(): void {
+  const done = channel<int>(8);
+  scopeDo(s => {
+    let i = 0;
+    while (i < 6) {
+      const k = i;
+      spawnDo(s, () => {
+        done.tx.send(k);
+      });
+      i += 1;
+    }
+  });
+  done.tx.close();
+  let n = 0;
+  let sum = 0;
+  let more = true;
+  while (more) {
+    match (done.rx.recv()) {
+      Some(v) => {
+        n += 1;
+        sum += v;
+      },
+      None => {
+        more = false;
+      },
+    }
+  }
+  assertEq(n, 6, "every task ran before the scope returned");
+  assertEq(sum, 15, "with its own argument");
+  done.rx.close();
+}
+
+@Test
+function resultsComeBackInAnyJoinOrder(): void {
+  const r = scope(s => {
+    let hs: TaskHandle<int>[] = [];
+    let i = 0;
+    while (i < 10) {
+      const k = i;
+      hs.push(spawn(s, () => k * k));
+      i += 1;
+    }
+    let out: int[] = [];
+    let j = hs.length;
+    while (j > 0) {
+      j -= 1;
+      out.push(hs[j].join());
+    }
+    return out;
+  });
+  assertEq(r[0], 81, "last task first");
+  assertEq(r[9], 0, "first task last");
+}
+
+@Test
+function parallelMapMatchesMap(): void {
+  const xs = makeBig(37);
+  const want = xs.map(x => x.length);
+  const got = parallelMap(xs, x => x.length, 4);
+  assertEqUsize(got.length, want.length, "same length");
+  let i: usize = 0;
+  while (i < want.length) {
+    assertEqUsize(got[i], want[i], "same element");
+    i += 1;
+  }
+}

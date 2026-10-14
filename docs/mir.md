@@ -18,7 +18,11 @@ discipline of a file handle. New builtins: the openers `BGrantFs` / `BGrantProce
 (`[host]`), `BGrantUnder` (`[fs, path]`), `BGrantReadOnly` (`[fs]`), `BGrantArgsOnly` (`[proc]`), the closer `BGrantRevoke`.
 `BFileOpen` is now `[fs, path, mode]`, and every std I/O builtin (`BFsReadFile`, `BFsWriteFile`, `BFsExists`,
 `BProcessArgs`, `BIoShell`, `BIoReadBytes`, `BIoReadLine`, `BIoWriteStdout`, `BTimeNowMillis`) takes its grant as the
-first argument. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
+first argument. Network (ADR-0033, same version, additive): `Listener` and `Stream` are `MHandle` too. Openers `BGrantNet`
+(`[host]`), `BGrantListen` / `BGrantConnect` (`[net, ..]`), `BNetListen` (`[net, addr, port, backlog, opt]`), `BNetAccept`
+(`[listener, timeout, opt]`), `BNetConnect` (`[net, host, port, timeout, opt]`); closer `BNetClose` (a Listener or Stream; a
+grant is closed by `BGrantRevoke`); uses `BNetStatus`, `BNetPort`, `BNetNow`, `BNetRecv`, `BNetSend`, `BNetShutdown`,
+`BNetPeer`, `BNetResolve` (handle first) and `BNetErrorText`. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
 
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
@@ -26,6 +30,15 @@ lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` be
 optimiser invents from nothing). **No new instruction and no semantic change**: the verifier's verdicts are the same, the C and LLVM
 output is byte-identical (the emitters ignore spans), the optimiser keeps the span of the instruction it rewrites (an inserted
 `dup` / `release` has the span of the call or edge it belongs to). Text format: see "Source spans" below.
+
+v2.1 (ADR-0017 stage 0, ADR-0027 Q10) tasks: **no new type or instruction**. One builtin `BTask(k)` (`compiler/hir/taskops.or`) carries the task
+primitives (monitors, transfer tokens, thread start / join). Three of them touch handles: `grantClone` (k = 17, `[grant]` -> a handle of the same
+family) is an opener like `BGrantUnder`; `grantMove` (k = 18, `[handle]` -> a `usize` token) is a CLOSER like `BGrantRevoke` (the handle must be `Open`,
+is `Dead` afterwards: moved exactly once on every path, never a parameter); `grantAdoptFs / Process / Stdio / Clock` (k = 19..22, `[token]` -> a
+handle) are openers whose argument is a scalar token: no argument may be a handle, the destination must be a bound handle local, and the function
+must revoke it. A value sent to a task is consumed by the one-field record that carries it (`IStructNew`), which already kills every borrow of
+the consumed local, so "no value used after it was moved into a task" is an existing rule; the runtime decides move or copy from the reference
+counts. Cases: `compiler/tests/verify_main.or` (`taskGrantCases`).
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute

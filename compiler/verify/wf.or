@@ -9,7 +9,7 @@ import {
   MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase, dstOf, instrInRange,
   termInRange, paramsWellFormed, spansAligned,
 } from "../mir";
-import { UnOp, BinOp, Builtin } from "../hir";
+import { UnOp, BinOp, Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 
 // Operand/local classes.
 export const CInt: int = 0;
@@ -249,6 +249,16 @@ function takesHandle(b: Builtin): bool {
     BIoShell => true,
     BTimeNowMillis => true,
     BGrantRevoke => true,
+    BTask(k) => taskOpMoves(k),
+    BNetStatus => true,
+    BNetClose => true,
+    BNetPort => true,
+    BNetNow => true,
+    BNetRecv => true,
+    BNetSend => true,
+    BNetShutdown => true,
+    BNetPeer => true,
+    BNetResolve => true,
     BFileIsOpen => true,
     BFileOpenError => true,
     BFileClose => true,
@@ -274,6 +284,22 @@ function isOpenB(b: Builtin): bool {
     BGrantUnder => true,
     BGrantReadOnly => true,
     BGrantArgsOnly => true,
+    BGrantNet => true,
+    BGrantListen => true,
+    BGrantConnect => true,
+    BNetListen => true,
+    BNetAccept => true,
+    BNetConnect => true,
+    BTask(k) => taskOpOpensFrom(k),
+    _ => false,
+  };
+}
+
+// The builtins that define a handle from a one-shot token instead of from another handle (ADR-0017: a grant moved into a
+// task is adopted there): no argument is a handle, the destination is.
+function isAdoptB(b: Builtin): bool {
+  return match (b) {
+    BTask(k) => taskOpAdopts(k),
     _ => false,
   };
 }
@@ -290,8 +316,8 @@ function handleMsg(f: MFunction, ins: Instr): string {
       if (localClass(f, d) == CHandle) {
         match (ins) {
           IBuiltin(_dst, b, _args) => {
-            if (!isOpenB(b)) {
-              return "IBuiltin: only BFileOpen and the BGrant* builtins may define a resource handle";
+            if (!isOpenB(b) && !isAdoptB(b)) {
+              return "IBuiltin: only BFileOpen, the BGrant* builtins and the task grant primitives (clone, adopt) may define a resource handle";
             }
           },
           _ => {
@@ -304,6 +330,19 @@ function handleMsg(f: MFunction, ins: Instr): string {
   }
   match (ins) {
     IBuiltin(dst, b, args) => {
+      if (isAdoptB(b)) {
+        if (!noHandles(f, args)) {
+          return "grant adoption: its argument is a token, not a handle";
+        }
+        match (dst) {
+          Some(d) => {
+            return localClass(f, d) == CHandle ? "" : "grant adoption: the destination must be a handle local";
+          },
+          None => {
+            return "grant adoption: the handle must be bound to a local (it would never be revoked)";
+          },
+        }
+      }
       if (isOpenB(b)) {
         if (args.length == 0 || !isHandleOp(f, args[0])) {
           return "handle-opening builtin: the first argument must be the authorising resource handle (a grant)";
@@ -340,7 +379,8 @@ function handleMsg(f: MFunction, ins: Instr): string {
   }
 }
 
-// A resource handle is defined only by an opener builtin (BFileOpen, BGrant*).
+// A resource handle is defined only by an opener builtin (BFileOpen, BGrant*, the net openers, grantClone) or by a
+// grant adoption (ADR-0017).
 export function handleDefOk(f: MFunction, ins: Instr): bool {
   return match (dstOf(ins)) {
     Some(d) => d >= f.locals.length || localClass(f, d) != CHandle || isOpener(ins),
@@ -350,7 +390,7 @@ export function handleDefOk(f: MFunction, ins: Instr): bool {
 
 function isOpener(ins: Instr): bool {
   return match (ins) {
-    IBuiltin(_dst, b, _args) => isOpenB(b),
+    IBuiltin(_dst, b, _args) => isOpenB(b) || isAdoptB(b),
     _ => false,
   };
 }

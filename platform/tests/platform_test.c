@@ -41,7 +41,11 @@ static void test_memory(void) {
     p = orin_platform_realloc(p, 1000);
     CHECK(p && ((unsigned char *)p)[0] == 0xAB && ((unsigned char *)p)[99] == 0xAB);
     volatile size_t huge = (size_t)-1;
-    CHECK(orin_platform_alloc(huge) == NULL); /* failure is NULL, not a crash */
+    /* The result goes through a volatile so the allocation escapes: clang may otherwise elide a malloc whose
+       result is only compared with NULL and fold the comparison to false (seen on macOS). */
+    void *volatile hp = orin_platform_alloc(huge);
+    CHECK(hp == NULL); /* failure is NULL, not a crash */
+    orin_platform_free(hp);
     void *volatile vp = p;
     void *q = orin_platform_realloc(vp, huge);
     CHECK(q == NULL && ((unsigned char *)vp)[50] == 0xAB); /* old block still valid */
@@ -432,6 +436,312 @@ static void test_policy_and_scopes(void) {
     CHECK(orin_platform_path_real(root, strlen(root), r, 3) == -1); /* buffer too small */
 }
 
+/* ---------------------------------------------------------------- threads and monitors (ADR-0017 stage 0) */
+
+static int64_t g_m;
+static uint64_t g_ids[2];
+
+static void th_ids(void *arg) { g_ids[(size_t)arg] = orin_platform_thread_id(); }
+
+static void th_incr(void *arg) {
+    for (int i = 0; i < (int)(size_t)arg; i++) {
+        orin_platform_monitor_lock(g_m);
+        uint64_t v;
+        orin_platform_monitor_get(g_m, 0, &v);
+        orin_platform_monitor_set(g_m, 0, v + 1);
+        orin_platform_monitor_unlock(g_m);
+    }
+}
+
+static void th_wait_for_flag(void *arg) { /* waits until word 1 is set, then publishes word 2 = word 1 + 1 */
+    (void)arg;
+    uint64_t v = 0;
+    orin_platform_monitor_lock(g_m);
+    while (orin_platform_monitor_get(g_m, 1, &v) == 0 && v == 0) orin_platform_monitor_wait(g_m, 0);
+    orin_platform_monitor_set(g_m, 2, v + 1);
+    orin_platform_monitor_unlock(g_m);
+}
+
+/* sleeps on queue 1 until word 1 is non-zero, consumes that (sets it back to 0) and counts itself out of word 3 */
+static void th_wait_queue1(void *arg) {
+    (void)arg;
+    uint64_t v = 0;
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 3, &v);
+    orin_platform_monitor_set(g_m, 3, v + 1);
+    for (;;) {
+        orin_platform_monitor_get(g_m, 1, &v);
+        if (v != 0) break;
+        orin_platform_monitor_wait(g_m, 1);
+    }
+    orin_platform_monitor_set(g_m, 1, 0);
+    orin_platform_monitor_get(g_m, 3, &v);
+    orin_platform_monitor_set(g_m, 3, v - 1);
+    orin_platform_monitor_unlock(g_m);
+}
+
+static void th_die_holding(void *arg) {
+    (void)arg;
+    orin_platform_monitor_lock(g_m);
+    orin_platform_thread_exit();
+}
+
+static void th_print(void *arg) {
+    char line[32];
+    int n = snprintf(line, sizeof line, "concurrent line %d", (int)(size_t)arg);
+    for (int i = 0; i < 200; i++) orin_platform_write_line(ORIN_PLATFORM_STDOUT, line, (size_t)n);
+}
+
+static void test_threads_and_monitors(void) {
+    /* thread ids: stable per thread, distinct between threads */
+    uint64_t me = orin_platform_thread_id();
+    CHECK(me >= 1 && orin_platform_thread_id() == me);
+    void *arg = NULL;
+    int64_t a = orin_platform_thread_create(th_ids, (void *)0), b = orin_platform_thread_create(th_ids, (void *)1);
+    CHECK(a > 0 && b > 0 && a != b);
+    CHECK(orin_platform_thread_join(a, &arg) == 0 && arg == (void *)0);
+    CHECK(orin_platform_thread_join(b, &arg) == 0 && arg == (void *)1);
+    CHECK(g_ids[0] != g_ids[1] && g_ids[0] != me && g_ids[1] != me);
+    /* a joined (stale), zero or forged handle is refused, never dereferenced */
+    CHECK(orin_platform_thread_join(a, &arg) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_thread_join(0, &arg) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_thread_join((int64_t)1 << 40, &arg) == ORIN_PLATFORM_EINVAL);
+
+    /* monitor access discipline */
+    g_m = orin_platform_monitor_new(3);
+    CHECK(g_m > 0);
+    uint64_t v = 99;
+    CHECK(orin_platform_monitor_get(g_m, 0, &v) == ORIN_PLATFORM_EINVAL && v == 99); /* not locked */
+    CHECK(orin_platform_monitor_unlock(g_m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_lock(g_m) == 0);
+    CHECK(orin_platform_monitor_lock(g_m) == ORIN_PLATFORM_EDEADLK);
+    CHECK(orin_platform_monitor_get(g_m, 0, &v) == 0 && v == 0); /* new words are 0 */
+    CHECK(orin_platform_monitor_set(g_m, 2, 7) == 0 && orin_platform_monitor_get(g_m, 2, &v) == 0 && v == 7);
+    CHECK(orin_platform_monitor_get(g_m, 3, &v) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_set(g_m, 3, 1) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_grow(g_m, 2) == ORIN_PLATFORM_EINVAL); /* never shrinks */
+    CHECK(orin_platform_monitor_grow(g_m, 100) == 0 && orin_platform_monitor_get(g_m, 99, &v) == 0 && v == 0);
+    CHECK(orin_platform_monitor_get(g_m, 2, &v) == 0 && v == 7);
+    CHECK(orin_platform_monitor_free(g_m) == ORIN_PLATFORM_EBUSY); /* locked */
+    CHECK(orin_platform_monitor_unlock(g_m) == 0);
+
+    /* mutual exclusion: 8 threads x 5,000 increments of a plain word */
+    int64_t th[8];
+    for (int i = 0; i < 8; i++) th[i] = orin_platform_thread_create(th_incr, (void *)5000);
+    for (int i = 0; i < 8; i++) CHECK(th[i] > 0 && orin_platform_thread_join(th[i], &arg) == 0);
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 0, &v);
+    CHECK(v == 8 * 5000);
+    orin_platform_monitor_unlock(g_m);
+
+    /* condition variable: the waiter sleeps until the flag is set */
+    int64_t w = orin_platform_thread_create(th_wait_for_flag, NULL);
+    CHECK(w > 0);
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_set(g_m, 1, 41);
+    CHECK(orin_platform_monitor_notify(g_m, 0, 1) == 0);
+    orin_platform_monitor_unlock(g_m);
+    CHECK(orin_platform_thread_join(w, &arg) == 0);
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 2, &v);
+    CHECK(v == 42);
+    CHECK(orin_platform_monitor_wait(g_m + 12345, 0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_notify(0, 0, 1) == ORIN_PLATFORM_EINVAL);
+    orin_platform_monitor_unlock(g_m);
+    CHECK(orin_platform_monitor_notify(g_m, 0, 1) == ORIN_PLATFORM_EINVAL); /* not held */
+
+    /* two condition queues: a notify of queue 0 does not wake a waiter of queue 1; notify_one wakes one waiter */
+    CHECK(orin_platform_monitor_lock(g_m) == 0);
+    CHECK(orin_platform_monitor_wait(g_m, 2) == ORIN_PLATFORM_EINVAL && orin_platform_monitor_notify(g_m, -1, 0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_notify(g_m, 1, 0) == 0); /* nobody waits: harmless */
+    orin_platform_monitor_set(g_m, 1, 0);
+    orin_platform_monitor_unlock(g_m);
+    int64_t q[3];
+    for (int i = 0; i < 3; i++) q[i] = orin_platform_thread_create(th_wait_queue1, NULL);
+    for (int woken = 0; woken < 3; woken++) {
+        for (;;) { /* wait until the number of sleepers is what we expect (word 3 counts them) */
+            orin_platform_monitor_lock(g_m);
+            orin_platform_monitor_get(g_m, 3, &v);
+            orin_platform_monitor_unlock(g_m);
+            if (v == (uint64_t)(3 - woken)) break;
+        }
+        orin_platform_monitor_lock(g_m);
+        orin_platform_monitor_notify(g_m, 0, 1); /* the wrong queue: nobody wakes */
+        orin_platform_monitor_set(g_m, 1, 1);
+        orin_platform_monitor_notify(g_m, 1, 0); /* one waiter of queue 1 */
+        orin_platform_monitor_unlock(g_m);
+        for (;;) {
+            orin_platform_monitor_lock(g_m);
+            orin_platform_monitor_get(g_m, 3, &v);
+            orin_platform_monitor_unlock(g_m);
+            if (v == (uint64_t)(3 - woken - 1)) break;
+        }
+    }
+    for (int i = 0; i < 3; i++) CHECK(orin_platform_thread_join(q[i], &arg) == 0);
+
+    /* a thread that ends while holding a monitor does not leave it locked */
+    int64_t d = orin_platform_thread_create(th_die_holding, NULL);
+    CHECK(d > 0 && orin_platform_thread_join(d, &arg) == 0);
+    CHECK(orin_platform_monitor_lock(g_m) == 0 && orin_platform_monitor_unlock(g_m) == 0);
+
+    /* free: the handle is dead afterwards, a recycled record has a new generation */
+    CHECK(orin_platform_monitor_free(g_m) == 0);
+    CHECK(orin_platform_monitor_lock(g_m) == ORIN_PLATFORM_EINVAL && orin_platform_monitor_free(g_m) == ORIN_PLATFORM_EINVAL);
+    int64_t g2 = orin_platform_monitor_new(1);
+    CHECK(g2 > 0 && g2 != g_m && orin_platform_monitor_lock(g_m) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_free(g2) == 0);
+
+    /* the process-wide stdout buffer is serialised: four threads print 200 lines each */
+    int64_t pr[4];
+    fflush(stdout);
+    int saved = dup(1), devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, 1);
+    for (int i = 0; i < 4; i++) pr[i] = orin_platform_thread_create(th_print, (void *)(size_t)i);
+    for (int i = 0; i < 4; i++) CHECK(pr[i] > 0 && orin_platform_thread_join(pr[i], &arg) == 0);
+    orin_platform_flush();
+    dup2(saved, 1);
+    close(saved);
+    close(devnull);
+    orin_platform_runtime_lock();
+    orin_platform_runtime_unlock();
+}
+
+/* ---- network (ADR-0033): loopback sockets; handle identity and scope are refused before any system call ---- */
+static orin_platform_net root_grant(void) {
+    orin_platform_net g;
+    memset(&g, 0, sizeof g);
+    g.magic = ORIN_PLATFORM_NET_MAGIC, g.kind = ORIN_PLATFORM_NET_GRANT, g.can = 3, g.fd = -1;
+    for (int i = 0; i < 2; i++) g.sc[i].hl = 1, g.sc[i].h[0] = '*', g.sc[i].hi = 65535;
+    return g;
+}
+
+static int open_fds(void) { /* descriptors open in this process: a refused call must not open one */
+    int n = 0;
+    for (int fd = 0; fd < 256; fd++)
+        if (fcntl(fd, F_GETFD) != -1) n++;
+    return n;
+}
+
+static void test_net(void) {
+    signal(SIGPIPE, SIG_DFL); /* the layer must not need the process to ignore it */
+    orin_platform_net root = root_grant(), lg, cg, ln, cs, as, junk;
+    memset(&ln, 0, sizeof ln);
+    int port = -1, outp = -1;
+    char peer[64], buf[8];
+    size_t n;
+    /* narrowing */
+    CHECK(orin_platform_net_narrow(&root, ORIN_PLATFORM_NET_LISTEN, "127.0.0.1", 9, 0, 0, &lg) == 0 && lg.can == ORIN_PLATFORM_NET_LISTEN);
+    CHECK(orin_platform_net_narrow(&root, ORIN_PLATFORM_NET_CONNECT, "*.example.com", 13, 80, 443, &cg) == 0 && cg.can == ORIN_PLATFORM_NET_CONNECT);
+    CHECK(orin_platform_net_narrow(&root, 3, "x", 1, 0, 1, &junk) == ORIN_PLATFORM_EINVAL); /* one capability at a time */
+    CHECK(orin_platform_net_narrow(&root, ORIN_PLATFORM_NET_CONNECT, "a*", 2, 0, 1, &junk) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_net_narrow(&root, ORIN_PLATFORM_NET_CONNECT, "x", 1, 5, 4, &junk) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_net_narrow(&root, ORIN_PLATFORM_NET_CONNECT, "x", 1, 0, 70000, &junk) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_net_narrow(NULL, ORIN_PLATFORM_NET_CONNECT, "x", 1, 0, 1, &junk) == ORIN_PLATFORM_EPERM);
+    orin_platform_net w;
+    CHECK(orin_platform_net_narrow(&cg, ORIN_PLATFORM_NET_CONNECT, "*", 1, 80, 443, &w) == 0 && w.can == 0); /* wider pattern */
+    CHECK(orin_platform_net_narrow(&cg, ORIN_PLATFORM_NET_CONNECT, "*.example.com", 13, 0, 443, &w) == 0 && w.can == 0); /* wider ports */
+    CHECK(orin_platform_net_narrow(&cg, ORIN_PLATFORM_NET_CONNECT, "*.evil.example.com", 18, 443, 443, &w) == 0 && w.can != 0); /* narrower */
+    CHECK(orin_platform_net_narrow(&cg, ORIN_PLATFORM_NET_CONNECT, "example.com", 11, 443, 443, &w) == 0 && w.can == 0); /* the apex is not below it */
+    CHECK(orin_platform_net_narrow(&cg, ORIN_PLATFORM_NET_LISTEN, "127.0.0.1", 9, 0, 0, &w) == 0 && w.can == 0); /* cannot gain listen */
+    CHECK(orin_platform_net_narrow(&lg, ORIN_PLATFORM_NET_CONNECT, "*", 1, 0, 65535, &w) == 0 && w.can == 0); /* cannot gain connect */
+
+    /* a refused call opens nothing and is EPERM, before any system call */
+    int fds = open_fds();
+    CHECK(orin_platform_tcp_listen(&cg, "127.0.0.1", 9, 0, 8, 1, &junk, &outp) == ORIN_PLATFORM_EPERM); /* connect grant */
+    CHECK(orin_platform_tcp_listen(&lg, "127.0.0.1", 9, 80, 8, 1, &junk, &outp) == ORIN_PLATFORM_EPERM); /* port outside */
+    CHECK(orin_platform_tcp_listen(&lg, "0.0.0.0", 7, 0, 8, 1, &junk, &outp) == ORIN_PLATFORM_EPERM); /* address outside */
+    CHECK(orin_platform_tcp_connect(&lg, "127.0.0.1", 9, 80, 100, 0, &junk) == ORIN_PLATFORM_EPERM); /* listen grant */
+    CHECK(orin_platform_tcp_connect(&cg, "127.0.0.1", 9, 80, 100, 0, &junk) == ORIN_PLATFORM_EPERM); /* host outside */
+    CHECK(orin_platform_tcp_connect(&cg, "a.EXAMPLE.com", 13, 8080, 100, 0, &junk) == ORIN_PLATFORM_EPERM); /* port outside */
+    CHECK(orin_platform_dns_resolve(&lg, "localhost", 9, buf, sizeof buf, &n) == ORIN_PLATFORM_EPERM && n == 0);
+    CHECK(orin_platform_dns_resolve(&cg, "localhost", 9, buf, sizeof buf, &n) == ORIN_PLATFORM_EPERM);
+    orin_platform_net denied = root;
+    denied.deny = 1;
+    CHECK(orin_platform_tcp_listen(&denied, "127.0.0.1", 9, 0, 8, 1, &junk, &outp) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_tcp_connect(&denied, "127.0.0.1", 9, 80, 100, 0, &junk) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_dns_resolve(&denied, "localhost", 9, buf, sizeof buf, &n) == ORIN_PLATFORM_EPERM);
+    orin_platform_net forged;
+    memset(&forged, 0x41, sizeof forged);
+    CHECK(orin_platform_tcp_listen(&forged, "127.0.0.1", 9, 0, 8, 1, &junk, &outp) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_tcp_listen(NULL, "127.0.0.1", 9, 0, 8, 1, &junk, &outp) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_tcp_connect(&ln, "127.0.0.1", 9, 80, 100, 0, &junk) == ORIN_PLATFORM_EPERM); /* not a grant (zeroed) */
+    CHECK(open_fds() == fds);
+
+    /* listen / connect / accept on the loopback */
+    CHECK(orin_platform_tcp_listen(&root, "127.0.0.1", 9, 0, 0, 1, &ln, &port) == ORIN_PLATFORM_EINVAL); /* backlog */
+    CHECK(orin_platform_tcp_listen(&root, "not an address", 14, 0, 8, 1, &ln, &port) != 0); /* numeric only */
+    CHECK(orin_platform_tcp_listen(&lg, "127.0.0.1", 9, 0, 8, 1, &ln, &port) == 0 && port > 0 && ln.kind == ORIN_PLATFORM_NET_LISTENER);
+    CHECK(orin_platform_tcp_connect(&root, "127.0.0.1", 9, port, 1000, 1, &cs) == 0 && cs.kind == ORIN_PLATFORM_NET_STREAM);
+    int pp = 0;
+    CHECK(orin_platform_tcp_accept(&ln, 1000, 1, &as, peer, sizeof peer, &pp) == 0 && strcmp(peer, "127.0.0.1") == 0 && pp > 0);
+    CHECK(orin_platform_tcp_accept(&ln, 20, 1, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_NET_TIMEOUT); /* nobody there */
+    CHECK(orin_platform_tcp_accept(&ln, -1, 1, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_EINVAL); /* no negative timeout */
+    CHECK(orin_platform_tcp_accept(&ln, ORIN_PLATFORM_NET_MAXMS + 1, 1, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_tcp_accept(&cs, 10, 1, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_EPERM); /* a stream is not a listener */
+    CHECK(orin_platform_tcp_connect(&root, "127.0.0.1", 9, 1, 1000, 0, &junk) != 0); /* nothing listens on port 1 */
+    CHECK(orin_platform_tcp_connect(&root, "orin-no-such-host.invalid", 25, 80, 1000, 0, &junk) == ENOENT);
+
+    /* bytes: partial reads, a recv never exceeds its capacity (guard bytes around the buffer), timeouts */
+    CHECK(orin_platform_stream_send(&cs, "hello world", 11, 1000, &n) == 0 && n == 11);
+    char area[16];
+    memset(area, 0x55, sizeof area);
+    CHECK(orin_platform_stream_recv(&as, area + 4, 5, 1000, &n) == 0 && n == 5 && memcmp(area + 4, "hello", 5) == 0);
+    int guards = 1;
+    for (int i = 0; i < 4; i++) guards &= area[i] == 0x55 && area[9 + i] == 0x55;
+    CHECK(guards);
+    CHECK(orin_platform_stream_recv(&as, area, 16, 1000, &n) == 0 && n == 6 && memcmp(area, " world", 6) == 0);
+    CHECK(orin_platform_stream_recv(&as, area, 16, 30, &n) == ORIN_PLATFORM_NET_TIMEOUT && n == 0);
+    CHECK(orin_platform_stream_recv(&as, area, 0, 30, &n) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_stream_recv(&as, area, 16, -5, &n) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_stream_send(&cs, "x", 1, -1, &n) == ORIN_PLATFORM_EINVAL && n == 0);
+    CHECK(orin_platform_stream_send(&cs, "", 0, 100, &n) == 0 && n == 0);
+
+    /* half-close: the peer sees EOF after the data, and can still answer */
+    CHECK(orin_platform_stream_send(&cs, "tail", 4, 1000, &n) == 0 && n == 4);
+    CHECK(orin_platform_net_shutdown(&cs, 1) == 0);
+    CHECK(orin_platform_net_shutdown(&cs, 7) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_stream_recv(&as, area, 16, 1000, &n) == 0 && n == 4);
+    CHECK(orin_platform_stream_recv(&as, area, 16, 1000, &n) == ORIN_PLATFORM_NET_EOF && n == 0);
+    CHECK(orin_platform_stream_send(&as, "bye", 3, 1000, &n) == 0 && n == 3);
+    CHECK(orin_platform_stream_recv(&cs, area, 16, 1000, &n) == 0 && n == 3);
+
+    /* a backed-up peer: send reports a partial write or times out, it never blocks past its timeout */
+    static char big[1 << 16];
+    memset(big, 'x', sizeof big);
+    int stuck = 0;
+    for (int i = 0; i < 400 && !stuck; i++) {
+        int rr = orin_platform_stream_send(&as, big, sizeof big, 50, &n);
+        CHECK(rr == 0 || rr == ORIN_PLATFORM_NET_TIMEOUT);
+        if (rr == ORIN_PLATFORM_NET_TIMEOUT) stuck = 1;
+        CHECK(n <= sizeof big);
+    }
+    CHECK(stuck);
+
+    /* close is idempotent; a closed record is refused; a reset is reported, not raised as SIGPIPE */
+    CHECK(orin_platform_net_close(&cs) == 0 && cs.fd == -1 && orin_platform_net_close(&cs) == 0);
+    CHECK(orin_platform_stream_recv(&cs, area, 16, 10, &n) == ORIN_PLATFORM_EPERM && n == 0);
+    CHECK(orin_platform_stream_send(&cs, "x", 1, 10, &n) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_net_shutdown(&cs, 1) == ORIN_PLATFORM_EPERM);
+    int r = 0;
+    for (int i = 0; i < 100 && r == 0; i++) r = orin_platform_stream_send(&as, big, sizeof big, 200, &n); /* the peer is gone */
+    CHECK(r == ORIN_PLATFORM_NET_RESET);
+    CHECK(orin_platform_net_close(&as) == 0 && orin_platform_net_close(&ln) == 0);
+    CHECK(orin_platform_net_close(NULL) == ORIN_PLATFORM_EPERM && orin_platform_net_close(&forged) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_tcp_accept(&ln, 10, 0, &junk, peer, sizeof peer, &pp) == ORIN_PLATFORM_EPERM); /* the closed listener */
+
+    /* resolve: numeric addresses, one per line */
+    char out[256];
+    CHECK(orin_platform_dns_resolve(&root, "localhost", 9, out, sizeof out, &n) == 0 && n > 0 && out[n - 1] == '\n');
+    CHECK(orin_platform_dns_resolve(&root, "127.0.0.1", 9, out, sizeof out, &n) == 0 && n == 10 && memcmp(out, "127.0.0.1\n", 10) == 0);
+    CHECK(orin_platform_dns_resolve(&root, "127.0.0.1", 9, out, 4, &n) == 0 && n == 0); /* too small: nothing written past cap */
+    CHECK(orin_platform_dns_resolve(&root, "orin-no-such-host.invalid", 25, out, sizeof out, &n) == ENOENT);
+
+    CHECK(orin_platform_monotonic_millis() > 0);
+    int64_t t0 = orin_platform_monotonic_millis();
+    CHECK(orin_platform_stream_recv(&forged, area, 16, 10, &n) == ORIN_PLATFORM_EPERM);
+    CHECK(orin_platform_monotonic_millis() >= t0);
+}
+
 int main(void) {
     snprintf(tmpdir, sizeof tmpdir, "/tmp/orin_platform_test_%d", (int)getpid());
     mkdir(tmpdir, 0700);
@@ -443,6 +753,8 @@ int main(void) {
     test_process_and_output();
     test_stdin();
     test_policy_and_scopes();
+    test_threads_and_monitors();
+    test_net();
     char cmd[300];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", tmpdir);
     if (system(cmd)) {}

@@ -1125,6 +1125,34 @@ export class ExprChecker {
     args: Expr[],
     params: Type[],
   ): Result<HExpr[], Diagnostic> {
+    // A function whose first parameter is a grant (a std network / file scope function, or a builtin): a call without that
+    // grant is E0470, with a grant of another family E0471 (ADR-0027, ADR-0033), not a plain arity / type error.
+    if (params.length > 0) {
+      match (params[0]) {
+        TyGrant(k) => {
+          const gname = grantTypeName(k);
+          if (args.length == 0 && params.length >= 1) {
+            return Err(grantMissingErr(span, what, gname));
+          }
+          if (args.length + 1 == params.length || args.length == params.length) {
+            const saved = this.fx;
+            const g0 = this.ex(args[0], None)?;
+            const isGrant = match (g0.ty) {
+              TyGrant(_) => true,
+              _ => false,
+            };
+            this.fx = saved;
+            if (!isGrant && args.length + 1 == params.length) {
+              return Err(grantMissingErr(span, what, gname));
+            }
+            if (args.length == params.length && !typeEq(g0.ty, params[0])) {
+              return Err(grantMismatchErr(args[0].span, what, gname, showType(this.fx.env, g0.ty), isGrant));
+            }
+          }
+        },
+        _ => {},
+      }
+    }
     if (args.length != params.length) {
       return Err(
         diag(
@@ -1282,6 +1310,14 @@ export class ExprChecker {
         return Ok(mk(XVariant(tag, a), TyUnion(u), span));
       },
       VStd(b) => {
+        match (b) {
+          BTask(k) => {
+            if (k == 10) {
+              return this.callTake(span, "function `" + id.name + "`", b, args, exp);
+            }
+          },
+          _ => {},
+        }
         return this.callBuiltin(span, "function `" + id.name + "`", b, args);
       },
       VConst(_) => {
@@ -1739,6 +1775,107 @@ export class ExprChecker {
     }
   }
 
+  // The task primitives whose types depend on the call (hir/taskops.or): transitPut (9) takes any value but a resource handle,
+  // grantClone (17) and grantMove (18) take any family grant (clone returns a grant of the same family).
+  private taskTyped(
+    span: Span,
+    what: string,
+    b: Builtin,
+    k: usize,
+    args: Expr[],
+  ): Result<HExpr, Diagnostic> {
+    if (args.length != 1) {
+      return Err(
+        diag("E0404", span, what + " expects 1 argument(s), found " + args.length.toString()),
+      );
+    }
+    const r0 = this.ex(args[0], None)?;
+    match (r0.ty) {
+      TyGrant(g) => {
+        if (k == 9) {
+          return Err(
+            diag("E0480", args[0].span, what + " cannot send a resource handle (a handle is not a value)"),
+          );
+        }
+        if (g < 1 || g > 4) {
+          return Err(
+            diag("E0471", args[0].span, what + " needs a grant of a family (fs, process, stdio, clock), not the host"),
+          );
+        }
+        return Ok(mk(XBuiltin(b, [r0]), k == 17 ? r0.ty : TyUsize, span));
+      },
+      TyFile => {
+        return Err(
+          diag("E0480", args[0].span, what + " cannot take a file handle (a handle is not a value)"),
+        );
+      },
+      _ => {
+        if (k == 9) {
+          return Ok(mk(XBuiltin(b, [r0]), TyUsize, span));
+        }
+        return Err(
+          diag("E0471", args[0].span, what + " needs a grant, found `" + showType(this.fx.env, r0.ty) + "`"),
+        );
+      },
+    }
+  }
+
+  // `transitTake(token)`: its result is the record type expected at the call (an annotated local or a typed position).
+  private callTake(
+    span: Span,
+    what: string,
+    b: Builtin,
+    args: Expr[],
+    exp: Option<Type>,
+  ): Result<HExpr, Diagnostic> {
+    const a = this.argsExpect(span, what, args, [TyUsize])?;
+    match (exp) {
+      Some(t) => {
+        return Ok(mk(XBuiltin(b, a), t, span));
+      },
+      None => {
+        return Err(
+          diag("E0407", span, what + " has no expected type: bind its result to a variable with a declared record type"),
+        );
+      },
+    }
+  }
+
+  // The network builtins that accept more than one kind of handle (ADR-0033): one argument, a grant of kind lo..hi
+  // (5 NetGrant, 6 Listener, 7 Stream).
+  private netHandleCall(
+    span: Span,
+    what: string,
+    b: Builtin,
+    args: Expr[],
+    lo: usize,
+    hi: usize,
+  ): Result<HExpr, Diagnostic> {
+    if (args.length != 1) {
+      return Err(diag("E0404", span, what + " expects 1 argument(s), found " + args.length.toString()));
+    }
+    const r0 = this.ex(args[0], None)?;
+    const ok = match (r0.ty) {
+      TyGrant(k) => k >= lo && k <= hi,
+      _ => false,
+    };
+    if (!ok) {
+      return Err(
+        diag(
+          "E0471",
+          args[0].span,
+          what + " needs a " + grantTypeName(lo) + (lo == hi ? "" : " or " + grantTypeName(hi)) + ", found `"
+            + showType(this.fx.env, r0.ty) + "`",
+        ),
+      );
+    }
+    const ret = match (b) {
+      BNetClose => TyVoid,
+      _ => TyInt,
+    };
+    return Ok(mk(XBuiltin(b, [r0]), ret, span));
+  }
+
   private callBuiltin(
     span: Span,
     what: string,
@@ -1746,6 +1883,11 @@ export class ExprChecker {
     args: Expr[],
   ): Result<HExpr, Diagnostic> {
     match (b) {
+      BTask(k) => {
+        if (k == 9 || k == 17 || k == 18) {
+          return this.taskTyped(span, what, b, k, args);
+        }
+      },
       BGrantRevoke => {
         // `grantRevoke(g)` (std:fsraw, library code only): any grant
         if (args.length != 1) {
@@ -1769,6 +1911,10 @@ export class ExprChecker {
           },
         }
       },
+      BNetStatus => { return this.netHandleCall(span, what, b, args, 6, 7); },
+      BNetClose => { return this.netHandleCall(span, what, b, args, 6, 7); },
+      BNetPort => { return this.netHandleCall(span, what, b, args, 6, 6); },
+      BNetNow => { return this.netHandleCall(span, what, b, args, 5, 7); },
       _ => {},
     }
     const sig = builtinSig(b);

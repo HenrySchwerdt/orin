@@ -1,0 +1,73 @@
+// std:task: values cross task boundaries as VALUE COPIES, whether the runtime moves them (uniquely owned) or deep-copies them
+// (still referenced by the sender). Large values: 200,000 integers and 20,000 strings travel through a task body, a channel
+// and a result; the sender keeps using its own value afterwards and the tasks cannot affect it.
+import { scope, spawn, channel } from "std:task";
+
+type Doc = { title: string; numbers: int[]; words: string[]; };
+
+function makeDoc(n: int): Doc {
+  let numbers: int[] = [];
+  let words: string[] = [];
+  let i = 0;
+  while (i < n) {
+    numbers.push(i);
+    if (i % 10 == 0) {
+      words.push("word-" + i.toString());
+    }
+    i += 1;
+  }
+  return Doc { title: "document", numbers: numbers, words: words };
+}
+
+function checksum(d: Doc): int {
+  let sum = 0;
+  for (const x of d.numbers) {
+    sum += x;
+  }
+  return sum + d.words.length.toInt() * 1000000007;
+}
+
+function main(): void {
+  // captured by a task body (copied: the spawner keeps `keep`)
+  const keep = makeDoc(200000);
+  const sum = scope(s => {
+    const h = spawn(s, () => {
+      let local = keep;
+      local.numbers.push(-1);
+      return checksum(local);
+    });
+    return h.join();
+  });
+  console.log("task saw " + sum.toString() + ", spawner still has " + checksum(keep).toString());
+
+  // a fresh result of a task (moved back to the spawner)
+  const made = scope(s => spawn(s, () => makeDoc(50000)).join());
+  console.log("made in a task: " + made.numbers.length.toString() + " numbers, " + made.words.length.toString() + " words");
+
+  // through a channel, copied and moved
+  const ch = channel<Doc>(2);
+  const got = scope(s => {
+    const reader = spawn(s, () => {
+      let total = 0;
+      let more = true;
+      while (more) {
+        match (ch.rx.recv()) {
+          Some(d) => {
+            total += checksum(d);
+          },
+          None => {
+            more = false;
+          },
+        }
+      }
+      return total;
+    });
+    ch.tx.send(keep);
+    ch.tx.send(makeDoc(1000));
+    ch.tx.close();
+    return reader.join();
+  });
+  console.log("received " + got.toString());
+  console.log("sender's copy unchanged: " + (keep.numbers.length == 200000 ? "yes" : "no"));
+  ch.rx.close();
+}

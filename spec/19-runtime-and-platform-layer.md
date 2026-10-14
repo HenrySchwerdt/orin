@@ -16,7 +16,7 @@ model) cover the runtime as well.
 
 | Layer | Language | Contents | Assurance target |
 |---|---|---|---|
-| **L0 platform** (`platform/`) | C (or asm), freestanding style, no libc dependency beyond a declared list | raw memory: `page_alloc`/`page_free` (or `malloc`/`free` wrappers), byte load/store at an address, `memcpy`/`memmove`/`memcmp`; process: args, exit, abort; I/O: `read`/`write` on fds, open/close; clock; host policy and path-scope primitives for the capability grants (ADR-0027: `policy_parse/load`, `path_normalize/within/absolute/real`); later atomics and threads | each function has a written contract (pre/post/frame) and is verified separately (e.g. Frama-C/WP, VST, CBMC) or, until then, exhaustively tested and fuzzed; kept under a hard size budget (target ≤ 1,000 lines, no data structures) |
+| **L0 platform** (`platform/`) | C (or asm), freestanding style, no libc dependency beyond a declared list | raw memory: `page_alloc`/`page_free` (or `malloc`/`free` wrappers), byte load/store at an address, `memcpy`/`memmove`/`memcmp`; process: args, exit, abort; I/O: `read`/`write` on fds, open/close; clock; host policy and path-scope primitives for the capability grants (ADR-0027: `policy_parse/load`, `path_normalize/within/absolute/real`); later atomics and threads | each function has a written contract (pre/post/frame) and is verified separately (e.g. Frama-C/WP, VST, CBMC) or, until then, exhaustively tested and fuzzed; kept under a hard size budget (≤ 1,000 code lines, contracts and comments excluded: the budget limits trusted code, not its specification; no data structures) |
 | **L1 core runtime** (`core/`, Orin "core dialect") | Orin with a small set of *core intrinsics* (raw address type, load/store, size_of) usable **only** in modules the package manifest marks `core = true` | object header layout, `retain`/`release`/`make_unique`, allocation, arrays (push/pop/grow), strings (concat/append/compare/slice), struct slots, traps, the `ORIN_STATS` counters | proven to implement the operations of the formal memory model (refinement: each core function satisfies the corresponding Lean machine operation's specification); all core code also passes the MIR ownership verifier where it uses ordinary values |
 | **L2 std** (`std/`) | safe Orin only | string utilities (`split`, `trim`, `indexOf`, `parseInt`, number formatting), array utilities, `fs`/`process`/`io` wrappers over L0, later maps, JSON, … | ordinary safe Orin: memory safety follows from the language guarantees; functional correctness by tests and optional contracts (spec 15) |
 
@@ -112,6 +112,10 @@ separator is raised through `process.exit(101)` after printing the same message.
 ## 5. Non-goals / OPEN
 
 - No garbage collector is introduced by this split (spec 06).
-- Threads/atomics/async runtime design is OPEN (spec 12 #5); when added, the scheduler's
-  low-level primitives belong to L0 and its logic to L1.
+- Async runtime design is OPEN (spec 12 #5). **Threads (ADR-0017 stage 0, 2026-10-14):** the scheduler's low-level primitives are L0
+  (`orin_platform_thread_*`, `orin_platform_monitor_*`: thread create / join / exit and a mutex + condition queues + integer words, all
+  handle-checked) and stay C; its logic (task table, channels, join results) is Orin (`std:task`); the part that needs the object model
+  (value transfer between task heaps, per-task allocator state) is ONE temporary C interface, `orin_rt_*`, that R3 replaces
+  function by function (porting table: ADR-0017 Addendum A, docs/concurrency.md). The L0 size budget counts CODE lines (comments and
+  contract blocks excluded), per ADR-0030.
 - Exact choice of C verification tool is OPEN.

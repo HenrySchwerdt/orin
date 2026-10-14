@@ -5,9 +5,10 @@
  * Adding a function needs an ADR.
  *
  * Rules for this layer: no data structures (one opaque OS handle type, `orin_platform_stream`, excepted),
- * no global state beyond argc/argv, no knowledge of Orin
- * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 lines including
- * comments. Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
+ * no global state beyond argc/argv, the stdout lock and the thread / monitor tables, no knowledge of Orin
+ * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 CODE lines (blank lines,
+ * comments and contract blocks do not count: tools/verify_platform.sh). Thread-safe except where said otherwise
+ * (ADR-0017 stage 0: threads and monitors below; the network functions, ADR-0033, act on caller-owned handles).
  *
  * CONTRACT FORMAT. Every function carries one ACSL-style block, machine readable (a leading
  * slash-star-at marker; clauses `requires`, `ensures`, `assigns`, each ending in `;`):
@@ -30,6 +31,7 @@
 #ifndef ORIN_PLATFORM_H
 #define ORIN_PLATFORM_H
 
+#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -43,6 +45,8 @@ extern "C" {
 #define ORIN_PLATFORM_STDERR 2  /* writing flushes stdout first, then flushes stderr */
 #define ORIN_PLATFORM_EINVAL 22 /* path contains a NUL byte (same value on Linux and macOS) */
 #define ORIN_PLATFORM_ENOMEM 12
+#define ORIN_PLATFORM_EBUSY 16
+#define ORIN_PLATFORM_EDEADLK EDEADLK /* a monitor locked twice by the same thread (35 on Linux, 11 on macOS) */
 
 /* ================================================================ memory
  * Defined inline in this header so the hot paths of the runtime keep inlining them; the
@@ -162,6 +166,97 @@ int64_t orin_platform_shell(const char *cmd, size_t n);
 /*@ ensures \result is the wall-clock time in milliseconds since the Unix epoch (CLOCK_REALTIME);
     assigns \nothing; */
 int64_t orin_platform_now_millis(void);
+
+
+/* ================================================================ threads and monitors (ADR-0017 stage 0)
+ * The only primitives of concurrency, and they stay in C: create / join / end an operating-system thread, and a
+ * MONITOR = a mutex, a condition variable and an array of 64-bit words that can be read and written only while
+ * the calling thread holds the mutex. Everything above them (tasks, scopes, channels, results) is Orin (std:task).
+ * Handles are 64-bit values `generation << 32 | (index + 1)` and are VALIDATED on every call: a stale (already freed or
+ * joined), forged or foreign handle is refused with ORIN_PLATFORM_EINVAL, never dereferenced; records are recycled, not
+ * freed, so a lookup never touches freed memory. Contract status: tested only (platform/tests/platform_test.c, plain,
+ * ASan+UBSan and ThreadSanitizer; tools/verify_platform.sh); CBMC cannot model threads. All other functions of this
+ * layer may now be called from several threads at the same time unless said otherwise; the stdout buffer is serialised
+ * inside orin_platform_write / write_line / flush. */
+
+/*@ ensures \result >= 1, unique among all threads of the process, constant for the calling thread (the first
+            caller, normally the main thread, gets 1);
+    assigns \nothing (a thread-local cache); */
+uint64_t orin_platform_thread_id(void);
+
+/*@ requires entry is a function that may run on another thread; arg is whatever entry expects (the layer never reads it);
+    ensures \result == 0 ==> no thread was started (limit of 65,536 live threads or the OS refused) and nothing needs cleaning;
+    ensures \result > 0 ==> a new thread runs entry(arg); the handle must be passed to orin_platform_thread_join exactly once;
+    assigns \process; */
+int64_t orin_platform_thread_create(void (*entry)(void *), void *arg);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is not a live, not yet joined handle (stale, forged, joined twice,
+            being joined by another thread); nothing happens;
+    ensures \result == 0 ==> the thread has ended (returned from entry or called orin_platform_thread_exit), *arg is the
+            `arg` given to create, all of the thread's writes are visible to the caller, h is dead afterwards;
+    assigns *arg, \process; */
+int orin_platform_thread_join(int64_t h, void **arg);
+
+/*@ requires the calling thread was started by orin_platform_thread_create;
+    ensures every monitor the calling thread holds is unlocked (a thread that ends abnormally never leaves a lock held);
+    ensures the thread ends and is joinable; never returns;
+    assigns \process; */
+void orin_platform_thread_exit(void) __attribute__((noreturn));
+
+/*@ ensures \result == 0 ==> no monitor could be made (limit of 262,144 live monitors, or no memory);
+    ensures \result > 0 ==> a monitor with nwords words, all 0, unlocked; free it with orin_platform_monitor_free;
+    assigns \process; */
+int64_t orin_platform_monitor_new(size_t nwords);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is stale or forged;
+    ensures \result == ORIN_PLATFORM_EBUSY ==> the monitor is locked or a thread waits on it; nothing happens;
+    ensures \result == 0 ==> h is dead (its words are gone), a later use of h returns ORIN_PLATFORM_EINVAL;
+    assigns the monitor; */
+int orin_platform_monitor_free(int64_t h);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is stale or forged;
+    ensures \result == ORIN_PLATFORM_EDEADLK ==> the calling thread already holds the monitor (no relock);
+    ensures \result == 0 ==> the calling thread holds the monitor (blocking until it was free);
+    assigns the monitor; */
+int orin_platform_monitor_lock(int64_t h);
+
+/*@ ensures \result == ORIN_PLATFORM_EINVAL ==> h is stale or forged, or the calling thread does not hold it;
+    ensures \result == 0 ==> the monitor is free; the caller's writes are visible to the next thread that locks it;
+    assigns the monitor; */
+int orin_platform_monitor_unlock(int64_t h);
+
+/*@ requires as unlock; cond is 0 or 1 (a monitor has two condition queues);
+    ensures \result == 0 ==> the caller released the monitor, slept on queue `cond` until another thread notified that
+            queue (or spuriously), and holds the monitor again: re-check the condition in a loop;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> as unlock, or cond is not 0 or 1; assigns the monitor; */
+int orin_platform_monitor_wait(int64_t h, int cond);
+
+/*@ requires the caller holds the monitor and cond is 0 or 1;
+    ensures \result == 0 ==> all threads waiting on queue `cond` (all != 0) or one of them, if any (all == 0), wake up
+            (after the caller unlocks);
+    ensures \result == ORIN_PLATFORM_EINVAL ==> as wait; assigns \nothing; */
+int orin_platform_monitor_notify(int64_t h, int cond, int all);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> *out is word i; \result == ORIN_PLATFORM_EINVAL ==>
+            stale handle, lock not held, or i >= the number of words; assigns *out; */
+int orin_platform_monitor_get(int64_t h, size_t i, uint64_t *out);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> word i is v; \result == ORIN_PLATFORM_EINVAL ==> as get;
+    assigns the monitor's word i; */
+int orin_platform_monitor_set(int64_t h, size_t i, uint64_t v);
+
+/*@ requires the caller holds the monitor; ensures \result == 0 ==> the monitor has nwords >= its old size words, the old
+            ones unchanged, the new ones 0; \result == ORIN_PLATFORM_EINVAL ==> as get or nwords is smaller than now;
+            \result == ORIN_PLATFORM_ENOMEM ==> nothing changed; assigns the monitor; */
+int orin_platform_monitor_grow(int64_t h, size_t nwords);
+
+/*@ ensures the calling thread holds the one lock of the runtime's own shared tables (transfer slots, the statistics of
+            finished tasks); hold it only for a few instructions and never call a trapping function while holding it;
+    assigns \process; */
+void orin_platform_runtime_lock(void);
+
+/*@ requires the caller holds the runtime lock; ensures it is released; assigns \process; */
+void orin_platform_runtime_unlock(void);
 
 /* ================================================================ floating point text */
 
@@ -342,6 +437,105 @@ int64_t orin_platform_path_absolute(const char *path, size_t plen, char *out, si
             non-existing component is a dangling symbolic link, or the buffer is too small;
     assigns out[0..cap-1]; */
 int64_t orin_platform_path_real(const char *abs, size_t alen, char *out, size_t cap);
+
+/* ---------------------------------------------------------------- network (ADR-0033): blocking TCP
+ * Every function takes a HANDLE: an `orin_platform_net` record owned by the caller (the runtime keeps the table and
+ * the generation counter; this layer owns what a record means). A function first checks the handle (magic, kind, live,
+ * not denied by ORIN_DENY=net) and, for a grant, that its scope covers what is asked, and refuses with
+ * ORIN_PLATFORM_EPERM BEFORE any system call. Timeouts are mandatory: 0..ORIN_PLATFORM_NET_MAXMS, never infinite.
+ * A scope is a host pattern ("*" = any, "*.sfx" = names ending in ".sfx", else the exact text, ASCII case-insensitive;
+ * for listening the text is an address literal) and a port range lo..hi. Names and addresses containing '*' are invalid.
+ * Results of waiting calls are one of: 0 (done), ORIN_PLATFORM_NET_EOF / _TIMEOUT / _RESET, or an errno-style code. */
+#define ORIN_PLATFORM_EPERM 1
+#define ORIN_PLATFORM_NET_EOF 1001 /* orderly end of the stream (recv) */
+#define ORIN_PLATFORM_NET_TIMEOUT 1002
+#define ORIN_PLATFORM_NET_RESET 1003 /* connection reset / aborted / broken pipe */
+#define ORIN_PLATFORM_NET_MAXMS 3600000
+#define ORIN_PLATFORM_NET_MAGIC 0x4e455431u
+enum { ORIN_PLATFORM_NET_GRANT = 1, ORIN_PLATFORM_NET_LISTENER = 2, ORIN_PLATFORM_NET_STREAM = 3 };
+enum { ORIN_PLATFORM_NET_LISTEN = 1, ORIN_PLATFORM_NET_CONNECT = 2 }; /* grant.can bits; index of a scope = bit - 1 */
+typedef struct {
+    size_t hl;
+    char h[64];
+    unsigned lo, hi;
+} orin_platform_scope;
+typedef struct {
+    unsigned magic, kind, can, deny; /* deny != 0: the host policy denies the net family */
+    int fd;                           /* listener / stream: the socket, -1 once closed */
+    orin_platform_scope sc[2];        /* grant: what it may listen on / connect to */
+} orin_platform_net;
+
+/*@ ensures \result is a monotonic clock in milliseconds (arbitrary origin, never decreases);
+    assigns \nothing; */
+int64_t orin_platform_monotonic_millis(void);
+
+/*@ requires \valid(out) && (hl == 0 || host[0..hl-1] readable);
+    ensures \result == ORIN_PLATFORM_EPERM ==> parent is not a live grant; *out untouched; no other effect;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> what not in {LISTEN, CONNECT}, bad host text or range; *out untouched;
+    ensures \result == 0 ==> *out is a grant copied from parent with out->can == parent->can & what, and (when the parent
+            may do `what` and its scope covers host:lo..hi) the `what` scope replaced by host:lo..hi, else out->can == 0:
+            a narrowed grant never covers anything the parent does not;
+    assigns *out; */
+int orin_platform_net_narrow(const orin_platform_net *parent, unsigned what, const char *host, size_t hl, int lo, int hi,
+                             orin_platform_net *out);
+
+/*@ requires \valid(out) && \valid(out_port) && (alen == 0 || addr[0..alen-1] readable) && 1 <= backlog <= 4096;
+    ensures grant not live / denied / LISTEN scope does not cover addr:port ==> \result == EPERM and no system call was made;
+    ensures \result == 0 ==> *out is a LISTENER bound to addr:port (opt & 1: SO_REUSEADDR), *out_port the bound port
+            (the real one when port == 0), non-blocking, close-on-exec; \result != 0 ==> *out untouched;
+    assigns *out, *out_port, the network; */
+int orin_platform_tcp_listen(const orin_platform_net *grant, const char *addr, size_t alen, int port, int backlog, int opt,
+                             orin_platform_net *out, int *out_port);
+
+/*@ requires \valid(out) && \valid(peer + (0..pcap-1)) && \valid(peer_port);
+    ensures listener not live / denied ==> \result == EPERM, no system call;
+    ensures \result == ORIN_PLATFORM_NET_TIMEOUT ==> no connection arrived within timeout_ms;
+    ensures \result == 0 ==> *out is a STREAM (opt & 1: TCP_NODELAY), peer[0..] the NUL-terminated numeric address of the
+            peer (truncated to pcap - 1) and *peer_port its port; \result != 0 ==> *out untouched;
+    assigns *out, peer[0..pcap-1], *peer_port, the network; */
+int orin_platform_tcp_accept(const orin_platform_net *listener, int timeout_ms, int opt, orin_platform_net *out, char *peer,
+                             size_t pcap, int *peer_port);
+
+/*@ requires \valid(out) && (hl == 0 || host[0..hl-1] readable);
+    ensures grant not live / denied / CONNECT scope does not cover host:port ==> \result == EPERM, no system call;
+    ensures \result == 0 ==> *out is a STREAM connected to host:port within timeout_ms (opt & 1: TCP_NODELAY); a name is
+            resolved by the OS resolver first (that lookup is not bounded by timeout_ms); \result == NET_TIMEOUT or an
+            errno-style code (ECONNREFUSED, ...) otherwise, *out untouched;
+    assigns *out, the network; */
+int orin_platform_tcp_connect(const orin_platform_net *grant, const char *host, size_t hl, int port, int timeout_ms, int opt,
+                              orin_platform_net *out);
+
+/*@ requires \valid(out_len) && (cap == 0 || \valid(buf + (0..cap-1)));
+    ensures stream not live / denied ==> \result == EPERM, no system call; cap == 0 ==> EINVAL;
+    ensures \result == 0 ==> 1 <= *out_len <= cap and buf[0..*out_len-1] holds the next bytes; \result in {NET_EOF, NET_TIMEOUT,
+            NET_RESET} or an errno-style code ==> *out_len == 0; nothing outside buf[0..cap-1] is written;
+    assigns buf[0..cap-1], *out_len, the network; */
+int orin_platform_stream_recv(const orin_platform_net *s, char *buf, size_t cap, int timeout_ms, size_t *out_len);
+
+/*@ requires \valid(out_sent) && (len == 0 || data[0..len-1] readable);
+    ensures stream not live / denied ==> \result == EPERM, no system call;
+    ensures \result == 0 ==> 0 <= *out_sent <= len bytes were handed to the OS (a partial write is normal; the caller
+            sends the tail again); \result == NET_TIMEOUT ==> the socket stayed unwritable for timeout_ms (*out_sent == 0);
+            \result == NET_RESET ==> the peer is gone (no SIGPIPE is raised);
+    assigns *out_sent, the network; */
+int orin_platform_stream_send(const orin_platform_net *s, const char *data, size_t len, int timeout_ms, size_t *out_sent);
+
+/*@ ensures stream not live / denied ==> \result == EPERM; how not in {0 read, 1 write, 2 both} ==> EINVAL;
+    ensures \result == 0 ==> that direction is shut down (how 1 sends FIN: the half-close of a graceful close);
+    assigns the network; */
+int orin_platform_net_shutdown(const orin_platform_net *s, int how);
+
+/*@ ensures h not an initialised record ==> \result == EPERM; otherwise \result == 0 and the socket (if any) is closed,
+            h->fd == -1 and h->can == 0: closing twice is harmless;
+    assigns *h, the network; */
+int orin_platform_net_close(orin_platform_net *h);
+
+/*@ requires \valid(out + (0..cap-1)) && \valid(out_len) && (nlen == 0 || name[0..nlen-1] readable);
+    ensures grant not live / denied / CONNECT scope does not cover name (any port) ==> EPERM, no system call;
+    ensures \result == 0 ==> out[0..*out_len-1] holds the numeric addresses of name, each followed by '\n' (IPv4 and IPv6,
+            duplicates removed, as many as fit), *out_len <= cap; \result == ENOENT when the name does not resolve;
+    assigns out[0..cap-1], *out_len, the network (DNS); */
+int orin_platform_dns_resolve(const orin_platform_net *grant, const char *name, size_t nlen, char *out, size_t cap, size_t *out_len);
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,80 @@
+// Move versus copy (ADR-0017): what the DEFAULT build (optimiser on, no contract checking) does with each way of sending a value.
+// This is pinned here and not in the conformance suites because it depends on the build: `--no-opt` copies a temporary too (no
+// owned-parameter inference), and contract checking keeps an extra reference. The values themselves are identical in every mode.
+import { scope, spawn, channel, movedCount, copiedCount } from "std:task";
+
+type Doc = { name: string; lines: string[]; };
+
+function makeLines(n: int): string[] {
+  let xs: string[] = [];
+  let i = 0;
+  while (i < n) {
+    xs.push("line " + i.toString());
+    i += 1;
+  }
+  return xs;
+}
+
+function makeDoc(n: int): Doc {
+  return Doc { name: "doc", lines: makeLines(n) };
+}
+
+function report(what: string, m0: usize, c0: usize): void {
+  console.log(what + ": moved " + (movedCount() - m0).toString() + ", copied " + (copiedCount() - c0).toString());
+}
+
+function main(): void {
+  const ch = channel<Doc>(8);
+
+  let m0 = movedCount();
+  let c0 = copiedCount();
+  ch.tx.send(makeDoc(1000));
+  report("a function result", m0, c0);
+
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch.tx.send(Doc { name: "literal", lines: makeLines(1000) });
+  report("a record literal of fresh parts", m0, c0);
+
+  const kept = makeDoc(1000);
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch.tx.send(kept);
+  report("a value the sender still uses", m0, c0);
+  console.log("the sender's value is intact: " + (kept.lines.length == 1000 ? "yes" : "no"));
+
+  const shared = makeLines(100);
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch.tx.send(Doc { name: "shares a child", lines: shared });
+  report("a record that shares a child with a live local", m0, c0);
+  console.log("the shared child is intact: " + (shared.length == 100 ? "yes" : "no"));
+
+  m0 = movedCount();
+  c0 = copiedCount();
+  ch.tx.send(Doc { name: "scalar parts only", lines: [] });
+  report("a record with an empty array", m0, c0);
+  ch.tx.close();
+
+  let n = 0;
+  let more = true;
+  while (more) {
+    match (ch.rx.recv()) {
+      Some(d) => {
+        n += d.lines.length.toInt();
+      },
+      None => {
+        more = false;
+      },
+    }
+  }
+  console.log("received lines: " + n.toString());
+  ch.rx.close();
+
+  // a task result is moved back to the joiner; a captured value that the spawner still holds is copied to the task
+  const made = scope(s => spawn(s, () => makeDoc(500)).join());
+  console.log("result of a task: " + made.lines.length.toString() + " lines");
+  const captured = makeDoc(500);
+  const sum = scope(s => spawn(s, () => captured.lines.length).join());
+  console.log("captured by a task body: " + sum.toString() + " lines, spawner still has " + captured.lines.length.toString());
+}
