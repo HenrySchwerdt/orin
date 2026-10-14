@@ -1,0 +1,1302 @@
+// HIR -> MIR lowering of one function body: class `Lowerer` (docs/mir.md ownership rules, ADR-0006).
+//
+// The lowerer owns everything that the code before the rewrite threaded through every call: the block builder (the
+// instructions, labels and terminators emitted so far), the locals table (temporaries), the owned locals that are live
+// (`OwnedScope`: early exits release exactly those) and the loops that are open. Lowering an expression emits its
+// instructions in order and returns a `V` (values.or) that says where the value is and who has to release it.
+//
+// Source spans (ADR-0020 D3): `sp` is the span of the HIR node being lowered; every instruction and terminator is emitted
+// with it. An expression sets it to its own span while it is lowered and restores the span of its parent afterwards, so the
+// instructions of a call carry the span of the call, those of its arguments the spans of the arguments. A statement sets
+// it to the span of its head expression (the initializer of a `let`, the value of an assignment, the condition of an `if`,
+// `while` and `for`). `break`, `continue` and a bare `return` have no span in the HIR: they keep the span of the statement
+// before them, and the epilogue of a function (the releases at its end, the implicit `return`, `trap: missing return`)
+// has the span of the function.
+
+import {
+  Type, Program, Function, HBlock, HStmt, Place, HExpr, UnOp, BinOp, HArm, FieldInitH, Builtin,
+  MutBuiltin,
+} from "../hir";
+import { Span } from "../diag";
+import { MType, MLocal, Operand, Instr, Terminator, MFunction, hasSpan } from "../mir";
+import { BlockBuilder } from "./builder";
+import { Locals, OwnedScope } from "./state";
+import { preludeSlot } from "./prelude";
+import {
+  Lits, litId, isRefTy, isHandleTy, isVoidTy, isUsizeTy, isStringTy, isF32Ty, mty, isSimple,
+  hasEffects, armsHaveEffects,
+} from "./util";
+import {
+  Kind, V, Args, kindIsO, kindIsB, localOf, isLocalOp, isOStr, vConst, vVoid, vOwned, vScalar,
+} from "./values";
+import {
+  roundsF32, isArithBin, isAdd, rangeCheck, patIsVariant, patIsWild, litOperand, matchLimit,
+  variantDispatch, containsIndex, placeIdxExprs, placeIdx, typesOf, tailOps, isLocalExpr,
+  isFileOpen, Callee, callInstr,
+} from "./ops";
+import { Fin, walkPlace } from "./place";
+import { operandMatches, localsMatchHir, fnWellLowered } from "./wellformed";
+
+@Invariant(this.sc.depth() <= this.t.count())
+@Invariant(this.t.count() >= this.fn.locals.length && this.t.hirCount() == this.fn.locals.length)
+@Invariant(hasSpan(this.sp))
+export class Lowerer {
+  private prog: Program;
+  private fn: Function;
+  private lits: Lits;
+  private b: BlockBuilder = new BlockBuilder();
+  private t: Locals;
+  private sc: OwnedScope = new OwnedScope();
+  private sp: Span;
+
+  constructor(prog: Program, fn: Function, lits: Lits) {
+    this.prog = prog;
+    this.fn = fn;
+    this.lits = lits;
+    this.t = new Locals(fn.locals.map(l => MLocal { name: l.name, ty: mty(l.ty) }));
+    this.sp = fn.span;
+  }
+
+  // ------------------------------------------------------------ the function
+
+  // Lowers the whole body: the statements, the releases of what is still owned at the end, and the implicit return (or the
+  // `missing return` trap of a function with a result). Afterwards the builder is closed, no loop is open and nothing is
+  // owned.
+  @Ensures(!this.b.isOpen())
+  @Ensures(this.sc.depth() == 0 && this.sc.loopDepth() == 0)
+  run(): void {
+    const entry = this.b.reserve(1);
+    this.sp = this.fn.span;
+    this.at(entry);
+    this.stmtSeq(this.fn.body.stmts);
+    this.sp = this.fn.span;
+    this.releaseTo(0);
+    if (isVoidTy(this.fn.ret)) {
+      this.jump(TReturn(None));
+    } else {
+      this.jump(TTrap("missing return"));
+    }
+    this.sc.truncate(0);
+  }
+
+  // The lowered function. It declares every local its code mentions, branches only to blocks of the function, has no
+  // unreachable block and a source span on every instruction and terminator; its locals start with the HIR locals
+  // (same types), all its parameters are borrowed.
+  @Requires(!this.b.isOpen())
+  @Ensures(result.name == this.fn.name && result.paramCount == this.fn.paramCount)
+  @Ensures(result.paramOwned.length == result.paramCount && result.paramOwned.every(o => !o))
+  @Ensures(localsMatchHir(this.fn.locals, result.locals) && result.locals.length == this.t.count())
+  @Ensures(fnWellLowered(result, this.lits.strs.length))
+  finish(): MFunction {
+    let owned: bool[] = [];
+    let i: usize = 0;
+    while (i < this.fn.paramCount) {
+      owned.push(false);
+      i += 1;
+    }
+    return MFunction {
+      name: this.fn.name,
+      paramCount: this.fn.paramCount,
+      paramOwned: owned,
+      locals: this.t.table(),
+      ret: mty(this.fn.ret),
+      blocks: this.b.finish(),
+    };
+  }
+
+  // ------------------------------------------------------------ emission
+
+  private emit(i: Instr): void {
+    this.b.emit(i, this.sp);
+  }
+
+  private emitAll(is: Instr[]): void {
+    for (const i of is) {
+      this.b.emit(i, this.sp);
+    }
+  }
+
+  private jump(t: Terminator): void {
+    this.b.terminate(t, this.sp);
+  }
+
+  private at(l: usize): void {
+    this.b.place(l, this.sp);
+  }
+
+  @Ensures(result == old(this.t.count()) && this.t.count() == result + 1)
+  private temp(ty: MType): usize {
+    return this.t.fresh(ty);
+  }
+
+  @Ensures(result == old(this.b.labelCount()) && this.b.labelCount() == result + n)
+  private labels(n: usize): usize {
+    return this.b.reserve(n);
+  }
+
+  // A fresh Owned copy (`dup`) of `op`.
+  private dupOf(op: Operand): Operand {
+    const t = this.temp(MRef);
+    this.emit(IDup(t, op));
+    return OLocal(t);
+  }
+
+  // An operand that can be consumed (moved into a struct / array / slot): an Owned local or a literal; a borrowed
+  // reference is duplicated.
+  private ownOp(ty: Type, op: Operand, owned: bool): Operand {
+    if (!isRefTy(ty) || owned || isOStr(op)) {
+      return op;
+    }
+    return this.dupOf(op);
+  }
+
+  @Ensures(result.length == tys.length)
+  private ownAll(a: Args, tys: Type[]): Operand[] {
+    let ops: Operand[] = [];
+    let i: usize = 0;
+    while (i < tys.length) {
+      const o = this.ownOp(tys[i], a.ops[i], a.own[i]);
+      ops.push(o);
+      i += 1;
+    }
+    return ops;
+  }
+
+  // Release statements for the owned locals above `lo`, innermost first.
+  private releaseTo(lo: usize): void {
+    for (const x of this.sc.owned(lo)) {
+      this.emit(IRelease(x));
+    }
+  }
+
+  private releaseExcept(keep: usize): void {
+    for (const x of this.sc.ownedExcept(keep)) {
+      this.emit(IRelease(x));
+    }
+  }
+
+  // Release an owned value that was only borrowed.
+  private discard(v: V): void {
+    match (v.k) {
+      KO => {
+        this.emit(IRelease(localOf(v.op)));
+      },
+      _ => {},
+    }
+  }
+
+  private releaseOps(a: Args): void {
+    let i: usize = 0;
+    while (i < a.ops.length) {
+      if (a.own[i]) {
+        this.emit(IRelease(localOf(a.ops[i])));
+      }
+      i += 1;
+    }
+  }
+
+  // res = value (consumed as an owned ref / copied scalar)
+  private assignRes(res: usize, v: V, ty: Type): void {
+    if (isVoidTy(ty)) {
+      this.discard(v);
+      return;
+    }
+    if (!isRefTy(ty)) {
+      this.emit(ICopy(res, v.op));
+      return;
+    }
+    match (v.k) {
+      KO => {
+        this.emit(IMove(res, localOf(v.op)));
+      },
+      KS => {
+        this.emit(ICopy(res, v.op));
+      },
+      KB => {
+        this.emit(IDup(res, v.op));
+      },
+    }
+  }
+
+  // ------------------------------------------------------------ argument sequences
+
+  // Evaluate `es` left to right. Owned temps stay Owned (listed in `own`) until the caller releases or consumes them. A
+  // borrowed ref that a later argument could invalidate (or a mutable scalar local that it could change) is pinned:
+  // duplicated / copied right away. The owned temps are registered while the later arguments are evaluated (an early
+  // exit inside them releases them) and forgotten again when the sequence is done.
+  @Ensures(result.ops.length == es.length)
+  @Ensures(this.sc.depth() == old(this.sc.depth())
+      && this.sc.loopDepth() == old(this.sc.loopDepth()))
+  private args(es: HExpr[]): Args {
+    const n = es.length;
+    const nHir = this.fn.locals.length;
+    let later: bool[] = [];
+    let k: usize = 0;
+    while (k < n) {
+      later.push(false);
+      k += 1;
+    }
+    let acc = false;
+    k = n;
+    while (k > 0) {
+      k -= 1;
+      later[k] = acc;
+      if (hasEffects(es[k])) {
+        acc = true;
+      }
+    }
+    const mark = this.sc.depth();
+    let ops: Operand[] = [];
+    let own: bool[] = [];
+    let roots: usize[] = [];
+    let stab: bool[] = [];
+    let i: usize = 0;
+    while (i < n) {
+      const e = es[i];
+      const v = this.expr(e);
+      let op = v.op;
+      let owned = kindIsO(v.k);
+      let root = v.root;
+      let st = v.stable;
+      if (later[i]) {
+        if (isRefTy(e.ty)) {
+          if (kindIsB(v.k) && !v.stable) {
+            op = this.dupOf(op);
+            owned = true;
+            root = localOf(op);
+            st = true;
+          }
+        } else {
+          if (isLocalOp(op) && localOf(op) < nHir && this.fn.locals[localOf(op)].mutable) {
+            const tt = this.temp(mty(e.ty));
+            this.emit(ICopy(tt, op));
+            op = OLocal(tt);
+          }
+        }
+      }
+      if (owned) {
+        this.sc.push(localOf(op));
+      }
+      ops.push(op);
+      own.push(owned);
+      roots.push(root);
+      stab.push(st);
+      i += 1;
+    }
+    this.sc.truncate(mark);
+    return Args { ops: ops, own: own, roots: roots, stab: stab };
+  }
+
+  // ------------------------------------------------------------ expressions
+
+  // Lowers `e`: emits its instructions and returns where the value is. The value is typed like `e` (a local of the MIR
+  // type of `e.ty`, a constant of the right class), and the owned locals, the loops and the current span are as they were.
+  @Ensures(this.sc.depth() == old(this.sc.depth())
+      && this.sc.loopDepth() == old(this.sc.loopDepth()))
+  @Ensures(this.sp.file == old(this.sp.file)
+      && this.sp.start == old(this.sp.start)
+      && this.sp.end == old(this.sp.end))
+  @Ensures(operandMatches(this.t.table(), result.op, e.ty))
+  private expr(e: HExpr): V {
+    const saved = this.sp;
+    this.sp = e.span;
+    const v = this.exprKind(e);
+    this.sp = saved;
+    return v;
+  }
+
+  private exprKind(e: HExpr): V {
+    match (e.kind) {
+      XInt(v) => {
+        return vConst(isUsizeTy(e.ty) ? OUsize(v) : OInt(v));
+      },
+      XFloat(t) => {
+        return this.floatLit(e, t);
+      },
+      XBool(b) => {
+        return vConst(OBool(b));
+      },
+      XStr(s) => {
+        return vConst(OStr(litId(this.lits, s)));
+      },
+      XLocal(l) => {
+        return this.localRef(l, e.ty);
+      },
+      XUnary(op, x) => {
+        return this.unary(e, op, x);
+      },
+      XBinary(op, a, b) => {
+        return this.binary(e, op, a, b);
+      },
+      XCall(f, args) => {
+        return this.call(e, f, args);
+      },
+      XBuiltin(b, args) => {
+        return this.builtin(e, b, args);
+      },
+      XMutMethod(m, p, args) => {
+        return this.mutCall(m, p, args);
+      },
+      XField(b, _, idx) => {
+        return this.field(e, b, idx);
+      },
+      XIndex(b, i) => {
+        return this.index(e, b, i);
+      },
+      XRecord(r, sp, fs) => {
+        return this.record(r, sp, fs);
+      },
+      XVariant(tag, payload) => {
+        return this.variant(tag, payload);
+      },
+      XArray(xs) => {
+        return this.array(e, xs);
+      },
+      XTry(x) => {
+        return this.tryExpr(e, x);
+      },
+      XCond(a, b, d) => {
+        return this.cond(e, a, b, d);
+      },
+      XMatch(s, arms) => {
+        return this.matchExpr(e, s, arms);
+      },
+      XClosure(f, caps) => {
+        return this.closure(f, caps);
+      },
+      XCallIndirect(f, args) => {
+        return this.callIndirect(e, f, args);
+      },
+      XIface(vt, v) => {
+        return this.iface(vt, v);
+      },
+      XCallVirtual(r, slot, args) => {
+        return this.callVirtual(e, r, slot, args);
+      },
+    }
+  }
+
+  private localRef(l: usize, ty: Type): V {
+    const stable = !this.fn.locals[l].mutable;
+    const k: Kind = isRefTy(ty) ? KB : KS;
+    return V { op: OLocal(l), k: k, root: l, stable: stable };
+  }
+
+  // A float literal; an f32 literal is rounded to binary32 (decimal -> double -> float, ADR-0018).
+  private floatLit(e: HExpr, text: string): V {
+    if (!isF32Ty(e.ty)) {
+      return vConst(OFloat(text));
+    }
+    const t = this.temp(MFloat);
+    this.emit(IBuiltin(Some(t), BF32Round, [OFloat(text)]));
+    return vScalar(t);
+  }
+
+  // After an operation whose f32 result was computed in binary64: round to binary32 (ADR-0018).
+  private roundF32(id: usize): V {
+    const r = this.temp(MFloat);
+    this.emit(IBuiltin(Some(r), BF32Round, [OLocal(id)]));
+    return vScalar(r);
+  }
+
+  private unary(e: HExpr, op: UnOp, x: HExpr): V {
+    const v = this.expr(x);
+    const t = this.temp(mty(e.ty));
+    this.emit(IUnary(t, op, v.op));
+    this.emitAll(rangeCheck(e.ty, OpSub, t));
+    return vScalar(t);
+  }
+
+  private binary(e: HExpr, op: BinOp, lhs: HExpr, rhs: HExpr): V {
+    match (op) {
+      OpAnd => {
+        return this.logic(lhs, rhs, true);
+      },
+      OpOr => {
+        return this.logic(lhs, rhs, false);
+      },
+      _ => {},
+    }
+    const es: HExpr[] = [lhs, rhs];
+    const a = this.args(es);
+    if (isStringTy(lhs.ty) && isAdd(op)) {
+      // a + b: append onto an owned copy of a (in place when a is a fresh temp)
+      let acc = a.ops[0];
+      if (!a.own[0]) {
+        acc = this.dupOf(a.ops[0]);
+      }
+      this.emit(IStrAppend(localOf(acc), a.ops[1]));
+      if (a.own[1]) {
+        this.emit(IRelease(localOf(a.ops[1])));
+      }
+      return vOwned(localOf(acc));
+    }
+    const t = this.temp(mty(e.ty));
+    this.emit(IBinary(t, op, a.ops[0], a.ops[1]));
+    this.emitAll(rangeCheck(e.ty, op, t));
+    this.releaseOps(a);
+    if (isF32Ty(e.ty) && isArithBin(op)) {
+      return this.roundF32(t);
+    }
+    return vScalar(t);
+  }
+
+  // a && b / a || b with short-circuit evaluation.
+  private logic(lhs: HExpr, rhs: HExpr, isAnd: bool): V {
+    if (isSimple(rhs)) {
+      const es: HExpr[] = [lhs, rhs];
+      const a = this.args(es);
+      const t = this.temp(MBool);
+      this.emit(IBinary(t, isAnd ? OpAnd : OpOr, a.ops[0], a.ops[1]));
+      return vScalar(t);
+    }
+    const a = this.expr(lhs);
+    const d = this.temp(MBool);
+    this.emit(ICopy(d, a.op));
+    const lr = this.labels(2);
+    const lend = lr + 1;
+    if (isAnd) {
+      this.jump(TBranch(OLocal(d), lr, lend));
+    } else {
+      this.jump(TBranch(OLocal(d), lend, lr));
+    }
+    this.at(lr);
+    const b = this.expr(rhs);
+    this.emit(ICopy(d, b.op));
+    this.jump(TGoto(lend));
+    this.at(lend);
+    return vScalar(d);
+  }
+
+  // The result of a call: a fresh temp (Owned for a reference, a scalar otherwise), or nothing for `void`; the owned
+  // arguments are released after the call.
+  private callResult(e: HExpr, a: Args, callee: Callee, ops: Operand[]): V {
+    if (isVoidTy(e.ty)) {
+      this.emit(callInstr(callee, None, ops));
+      this.releaseOps(a);
+      return vVoid();
+    }
+    const t = this.temp(mty(e.ty));
+    this.emit(callInstr(callee, Some(t), ops));
+    this.releaseOps(a);
+    if (isRefTy(e.ty)) {
+      return vOwned(t);
+    }
+    return vScalar(t);
+  }
+
+  private call(e: HExpr, f: usize, args: HExpr[]): V {
+    const a = this.args(args);
+    return this.callResult(e, a, CFn(f), a.ops);
+  }
+
+  // A closure: the captured values are consumed like the slots of a variant (IClosure, docs/mir.md v1.3).
+  private closure(f: usize, caps: HExpr[]): V {
+    const a = this.args(caps);
+    const ops = this.ownAll(a, typesOf(caps));
+    const t = this.temp(MRef);
+    this.emit(IClosure(t, f, ops));
+    return vOwned(t);
+  }
+
+  // A call of a function value: the callee is evaluated first, then the arguments; all are borrowed.
+  private callIndirect(e: HExpr, callee: HExpr, args: HExpr[]): V {
+    const es: HExpr[] = [callee].concat(args);
+    const a = this.args(es);
+    const f = a.ops[0];
+    const rest = tailOps(a.ops);
+    return this.callResult(e, a, CIndirect(f), rest);
+  }
+
+  // An interface value (ADR-0019): the class value is consumed like the slot of a variant (IIface, docs/mir.md v1.5); the
+  // vtable is `MProgram.vtables[vt]`.
+  private iface(vt: usize, v: HExpr): V {
+    const es: HExpr[] = [v];
+    const a = this.args(es);
+    const ops = this.ownAll(a, [v.ty]);
+    const t = this.temp(MRef);
+    this.emit(IIface(t, vt, ops[0]));
+    return vOwned(t);
+  }
+
+  // A call through the vtable of an interface value: receiver first, then the arguments; all borrowed.
+  private callVirtual(e: HExpr, recv: HExpr, slot: usize, args: HExpr[]): V {
+    const es: HExpr[] = [recv].concat(args);
+    const a = this.args(es);
+    const r = a.ops[0];
+    const rest = tailOps(a.ops);
+    return this.callResult(e, a, CVirtual(r, slot), rest);
+  }
+
+  // Tag test: Option/Result predicates.
+  private tagTest(a: Args, tag: int, eq: bool): V {
+    const tg = this.temp(MInt);
+    this.emit(ITag(tg, a.ops[0]));
+    const r = this.temp(MBool);
+    this.emit(IBinary(r, eq ? OpEq : OpNe, OLocal(tg), OInt(tag)));
+    this.releaseOps(a);
+    return vScalar(r);
+  }
+
+  // unwrap / unwrapErr: trap unless the tag is `tag`, then borrow slot 0.
+  private unwrapForm(a: Args, ty: Type, tag: int, msg: string): V {
+    const tg = this.temp(MInt);
+    this.emit(ITag(tg, a.ops[0]));
+    const cmp = this.temp(MBool);
+    this.emit(IBinary(cmp, OpEq, OLocal(tg), OInt(tag)));
+    const lok = this.labels(2);
+    const ltrap = lok + 1;
+    this.jump(TBranch(OLocal(cmp), lok, ltrap));
+    this.at(ltrap);
+    this.jump(TTrap(msg));
+    this.at(lok);
+    if (isVoidTy(ty)) {
+      this.releaseOps(a);
+      return vVoid();
+    }
+    const d = this.temp(mty(ty));
+    this.emit(IGetField(d, a.ops[0], 0));
+    if (a.own[0]) {
+      if (isRefTy(ty)) {
+        const d2 = this.dupOf(OLocal(d));
+        this.emit(IRelease(localOf(a.ops[0])));
+        return vOwned(localOf(d2));
+      }
+      this.emit(IRelease(localOf(a.ops[0])));
+      return vScalar(d);
+    }
+    if (isRefTy(ty)) {
+      return V { op: OLocal(d), k: KB, root: a.roots[0], stable: a.stab[0] };
+    }
+    return vScalar(d);
+  }
+
+  private builtin(e: HExpr, b: Builtin, args: HExpr[]): V {
+    // Built-ins that migrated to the Orin prelude (spec 19 R1) become ordinary calls.
+    const slot = preludeSlot(b);
+    if (slot >= 0 && slot.toUsize() < this.lits.pre.length && this.lits.pre[slot.toUsize()] >= 0) {
+      return this.call(e, this.lits.pre[slot.toUsize()].toUsize(), args);
+    }
+    const a = this.args(args);
+    match (b) {
+      BOptIsSome => {
+        return this.tagTest(a, 0, true);
+      },
+      BOptIsNone => {
+        return this.tagTest(a, 1, true);
+      },
+      BResIsOk => {
+        return this.tagTest(a, 0, true);
+      },
+      BResIsErr => {
+        return this.tagTest(a, 1, true);
+      },
+      BOptUnwrap => {
+        return this.unwrapForm(a, e.ty, 0, "unwrap on None");
+      },
+      BResUnwrap => {
+        return this.unwrapForm(a, e.ty, 0, "unwrap on Err");
+      },
+      BResUnwrapErr => {
+        return this.unwrapForm(a, e.ty, 1, "unwrapErr on Ok");
+      },
+      _ => {},
+    }
+    if (isVoidTy(e.ty)) {
+      this.emit(IBuiltin(None, b, a.ops));
+      this.releaseOps(a);
+      return vVoid();
+    }
+    const t = this.temp(mty(e.ty));
+    this.emit(IBuiltin(Some(t), b, a.ops));
+    this.releaseOps(a);
+    if (isRefTy(e.ty)) {
+      return vOwned(t);
+    }
+    if (isF32Ty(e.ty) && roundsF32(b)) {
+      return this.roundF32(t);
+    }
+    return vScalar(t);
+  }
+
+  // Read a field/element of `base` (already emitted into local `d`), fixing up ownership of the result.
+  private projected(
+    d: usize,
+    ty: Type,
+    baseOp: Operand,
+    baseOwned: bool,
+    root: usize,
+    stable: bool,
+  ): V {
+    if (baseOwned) {
+      if (isRefTy(ty)) {
+        const d2 = this.dupOf(OLocal(d));
+        this.emit(IRelease(localOf(baseOp)));
+        return vOwned(localOf(d2));
+      }
+      this.emit(IRelease(localOf(baseOp)));
+      return vScalar(d);
+    }
+    if (isRefTy(ty)) {
+      return V { op: OLocal(d), k: KB, root: root, stable: stable };
+    }
+    return vScalar(d);
+  }
+
+  private field(e: HExpr, base: HExpr, idx: usize): V {
+    const v = this.expr(base);
+    const d = this.temp(mty(e.ty));
+    this.emit(IGetField(d, v.op, idx));
+    return this.projected(d, e.ty, v.op, kindIsO(v.k), v.root, v.stable);
+  }
+
+  private index(e: HExpr, base: HExpr, ix: HExpr): V {
+    const es: HExpr[] = [base, ix];
+    const a = this.args(es);
+    const d = this.temp(mty(e.ty));
+    this.emit(IArrayGet(d, a.ops[0], a.ops[1]));
+    return this.projected(d, e.ty, a.ops[0], a.own[0], a.roots[0], a.stab[0]);
+  }
+
+  private record(rid: usize, spread: Option<HExpr>, fields: FieldInitH[]): V {
+    const def = this.prog.records[rid];
+    const nf = def.fields.length;
+    let es: HExpr[] = [];
+    let hasSpread = false;
+    match (spread) {
+      Some(s) => {
+        es.push(s);
+        hasSpread = true;
+      },
+      None => {},
+    }
+    for (const f of fields) {
+      es.push(f.value);
+    }
+    const a = this.args(es);
+    let slots: Operand[] = [];
+    let i: usize = 0;
+    while (i < nf) {
+      slots.push(OInt(0));
+      i += 1;
+    }
+    const base: usize = hasSpread ? 1 : 0;
+    i = 0;
+    for (const f of fields) {
+      const o = this.ownOp(f.value.ty, a.ops[base + i], a.own[base + i]);
+      slots[f.index] = o;
+      i += 1;
+    }
+    if (hasSpread) {
+      i = 0;
+      while (i < nf) {
+        if (!containsIndex(fields, i)) {
+          const fty = def.fields[i].ty;
+          const g = this.temp(mty(fty));
+          this.emit(IGetField(g, a.ops[0], i));
+          if (isRefTy(fty)) {
+            const d = this.dupOf(OLocal(g));
+            slots[i] = d;
+          } else {
+            slots[i] = OLocal(g);
+          }
+        }
+        i += 1;
+      }
+    }
+    const t = this.temp(MRef);
+    this.emit(IStructNew(t, 0, slots));
+    if (hasSpread && a.own[0]) {
+      this.emit(IRelease(localOf(a.ops[0])));
+    }
+    return vOwned(t);
+  }
+
+  private variant(tag: usize, payload: HExpr[]): V {
+    if (payload.length == 0) {
+      const t = this.temp(MRef);
+      this.emit(INullary(t, tag));
+      return vOwned(t);
+    }
+    const a = this.args(payload);
+    const ops = this.ownAll(a, typesOf(payload));
+    const t = this.temp(MRef);
+    this.emit(IStructNew(t, tag, ops));
+    return vOwned(t);
+  }
+
+  private array(e: HExpr, xs: HExpr[]): V {
+    const elemRef = match (e.ty) {
+      TyArray(t) => isRefTy(t),
+      _ => false,
+    };
+    const a = this.args(xs);
+    const ops = this.ownAll(a, typesOf(xs));
+    const t = this.temp(MRef);
+    this.emit(IArrayNew(t, elemRef, ops));
+    return vOwned(t);
+  }
+
+  // `x?`: on an error rebuild `Err(e)` for our own return type, release everything live and return.
+  private tryExpr(e: HExpr, inner: HExpr): V {
+    const errTy = match (inner.ty) {
+      TyResult(_, er) => er,
+      _ => TyVoid,
+    };
+    const v = this.expr(inner);
+    const tg = this.temp(MInt);
+    this.emit(ITag(tg, v.op));
+    const cmp = this.temp(MBool);
+    this.emit(IBinary(cmp, OpEq, OLocal(tg), OInt(1)));
+    const lerr = this.labels(2);
+    const lok = lerr + 1;
+    this.jump(TBranch(OLocal(cmp), lerr, lok));
+    // error path
+    this.at(lerr);
+    const g = this.temp(mty(errTy));
+    this.emit(IGetField(g, v.op, 0));
+    let slot: Operand = OLocal(g);
+    if (isRefTy(errTy)) {
+      slot = this.dupOf(OLocal(g));
+    }
+    const r = this.temp(MRef);
+    this.emit(IStructNew(r, 1, [slot]));
+    this.discard(v);
+    this.releaseTo(0);
+    this.jump(TReturn(Some(OLocal(r))));
+    // ok path
+    this.at(lok);
+    if (isVoidTy(e.ty)) {
+      this.discard(v);
+      return vVoid();
+    }
+    const d = this.temp(mty(e.ty));
+    this.emit(IGetField(d, v.op, 0));
+    return this.projected(d, e.ty, v.op, kindIsO(v.k), v.root, v.stable);
+  }
+
+  private cond(e: HExpr, cond: HExpr, th: HExpr, el: HExpr): V {
+    const cv = this.expr(cond);
+    const isV = isVoidTy(e.ty);
+    let res: usize = 0;
+    if (!isV) {
+      res = this.temp(mty(e.ty));
+    }
+    const lt = this.labels(3);
+    const lf = lt + 1;
+    const le = lt + 2;
+    this.jump(TBranch(cv.op, lt, lf));
+    this.at(lt);
+    const a = this.expr(th);
+    this.assignRes(res, a, e.ty);
+    this.jump(TGoto(le));
+    this.at(lf);
+    const b = this.expr(el);
+    this.assignRes(res, b, e.ty);
+    this.jump(TGoto(le));
+    this.at(le);
+    if (isV) {
+      return vVoid();
+    }
+    if (isRefTy(e.ty)) {
+      return vOwned(res);
+    }
+    return vScalar(res);
+  }
+
+  // `match`: dispatch on the tag of a union (a `switch`) or on the constants of literal patterns (a chain of compares);
+  // every arm gets a label, the arms after the first wildcard are dead, and a failed dispatch traps. A scrutinee that is
+  // borrowed and could be invalidated by an arm is pinned; an owned one stays registered during the arms.
+  private matchExpr(e: HExpr, scrut: HExpr, arms: HArm[]): V {
+    const sv = this.expr(scrut);
+    let sop = sv.op;
+    let owned = kindIsO(sv.k);
+    const mark0 = this.sc.depth();
+    if (isRefTy(scrut.ty) && kindIsB(sv.k) && !sv.stable && armsHaveEffects(arms)) {
+      sop = this.dupOf(sop);
+      owned = true;
+    }
+    if (owned) {
+      this.sc.push(localOf(sop));
+    }
+    const na = arms.length;
+    const limit = matchLimit(arms);
+    const base = this.labels(2 * na + 2);
+    const lend = base;
+    const ltrap = base + 1 + 2 * na;
+    const hasVal = !isVoidTy(e.ty);
+    let res: usize = 0;
+    if (hasVal) {
+      res = this.temp(mty(e.ty));
+    }
+    let isVar = false;
+    for (const a of arms) {
+      if (patIsVariant(a.pattern)) {
+        isVar = true;
+      }
+    }
+    // dispatch
+    if (isVar) {
+      const tg = this.temp(MInt);
+      this.emit(ITag(tg, sop));
+      const d = variantDispatch(arms, limit, base, ltrap);
+      this.jump(TSwitch(OLocal(tg), d.cases, d.dflt));
+    } else {
+      let i: usize = 0;
+      let done = false;
+      while (i < limit && !done) {
+        if (i > 0) {
+          this.at(base + 1 + na + i);
+        }
+        if (patIsWild(arms[i].pattern)) {
+          this.jump(TGoto(base + 1 + i));
+          done = true;
+        } else {
+          const cmp = this.temp(MBool);
+          this.emit(IBinary(cmp, OpEq, sop, litOperand(this.lits, arms[i].pattern, scrut.ty)));
+          const next = i + 1 < limit ? base + 1 + na + i + 1 : ltrap;
+          this.jump(TBranch(OLocal(cmp), base + 1 + i, next));
+        }
+        i += 1;
+      }
+      if (!done && limit == 0) {
+        this.jump(TGoto(ltrap));
+      }
+    }
+    this.at(ltrap);
+    this.jump(TTrap("non-exhaustive match"));
+    // arms
+    let i: usize = 0;
+    while (i < limit) {
+      const arm = arms[i];
+      this.at(base + 1 + i);
+      match (arm.pattern) {
+        HPVariant(_, binds) => {
+          let k: usize = 0;
+          for (const bd of binds) {
+            match (bd) {
+              Some(l) => {
+                this.emit(IGetField(l, sop, k));
+              },
+              None => {},
+            }
+            k += 1;
+          }
+        },
+        _ => {},
+      }
+      const mark = this.sc.depth();
+      this.stmtSeq(arm.body.stmts);
+      match (arm.value) {
+        Some(vx) => {
+          const vv = this.expr(vx);
+          this.assignRes(res, vv, e.ty);
+        },
+        None => {},
+      }
+      this.releaseTo(mark);
+      this.jump(TGoto(lend));
+      this.sc.truncate(mark);
+      i += 1;
+    }
+    this.at(lend);
+    if (owned) {
+      this.emit(IRelease(localOf(sop)));
+    }
+    this.sc.truncate(mark0);
+    if (!hasVal) {
+      return vVoid();
+    }
+    if (isRefTy(e.ty)) {
+      return vOwned(res);
+    }
+    return vScalar(res);
+  }
+
+  // ------------------------------------------------------------ places
+
+  // Emits the walk of `place` (place.or): declares its temporaries in order, then its instructions.
+  @Ensures(this.t.count() >= old(this.t.count()))
+  private walk(place: Place, idx: Operand[], fin: Fin, ty: Type): void {
+    const w = walkPlace(this.t.count(), place, idx, fin, ty);
+    for (const k of w.temps) {
+      this.temp(k);
+    }
+    this.emitAll(w.instrs);
+  }
+
+  private mutCall(m: MutBuiltin, place: Place, args: HExpr[]): V {
+    let es = placeIdxExprs(place);
+    match (m) {
+      MArrPush => {
+        es.push(args[0]);
+      },
+      MArrPop => {},
+    }
+    const a = this.args(es);
+    const idx = placeIdx(place, a.ops);
+    match (m) {
+      MArrPush => {
+        const vi = es.length - 1;
+        const o = this.ownOp(args[0].ty, a.ops[vi], a.own[vi]);
+        this.walk(place, idx, FPush(o), place.ty);
+        return vVoid();
+      },
+      MArrPop => {
+        const d = this.temp(MRef);
+        this.walk(place, idx, FPop(d), place.ty);
+        return vOwned(d);
+      },
+    }
+  }
+
+  // ------------------------------------------------------------ statements
+
+  // The statements of a block in order. A `let` of a reference that owns its value registers the local, so it is released
+  // when the enclosing scope ends or exits early; the caller closes the scope (`block`, an arm, a loop body).
+  private stmtSeq(stmts: HStmt[]): void {
+    for (const st of stmts) {
+      const added = this.stmt(st);
+      match (added) {
+        Some(l) => {
+          this.sc.push(l);
+        },
+        None => {},
+      }
+    }
+  }
+
+  // A `{ .. }` scope: its statements, then the release of what it registered.
+  @Ensures(this.sc.depth() == old(this.sc.depth())
+      && this.sc.loopDepth() == old(this.sc.loopDepth()))
+  private block(b: HBlock): void {
+    const mark = this.sc.depth();
+    this.stmtSeq(b.stmts);
+    this.releaseTo(mark);
+    this.sc.truncate(mark);
+  }
+
+  // One statement. Returns the local it makes owned (a `let` of a reference), which the caller registers.
+  @Ensures(this.sc.depth() == old(this.sc.depth())
+      && this.sc.loopDepth() == old(this.sc.loopDepth()))
+  private stmt(st: HStmt): Option<usize> {
+    match (st) {
+      HLet(l, init) => {
+        this.sp = init.span;
+        return this.stLet(l, init);
+      },
+      HAssign(p, op, v) => {
+        this.sp = v.span;
+        this.stAssign(p, op, v);
+        return None;
+      },
+      HExprStmt(e) => {
+        this.sp = e.span;
+        const v = this.expr(e);
+        this.discard(v);
+        return None;
+      },
+      HIf(cd, th, el) => {
+        this.sp = cd.span;
+        this.stIf(cd, th, el);
+        return None;
+      },
+      HWhile(cd, b) => {
+        this.sp = cd.span;
+        this.stWhile(cd, b);
+        return None;
+      },
+      HForOf(l, it, b) => {
+        this.sp = it.span;
+        this.stForOf(l, it, b);
+        return None;
+      },
+      HBreak => {
+        this.releaseTo(this.sc.loopMark());
+        this.jump(TGoto(this.sc.brk()));
+        return None;
+      },
+      HContinue => {
+        this.releaseTo(this.sc.loopMark());
+        this.jump(TGoto(this.sc.cont()));
+        return None;
+      },
+      HReturn(e) => {
+        this.stReturn(e);
+        return None;
+      },
+      HBlockStmt(b) => {
+        this.block(b);
+        return None;
+      },
+    }
+  }
+
+  // `const h = fileOpen(path, mode)` (the std:fs scope API, ADR-0025): the handle local is the destination of the
+  // IBuiltin itself; a handle is never copied or moved (the verifier rejects ICopy of a handle).
+  private letOpen(l: usize, b: Builtin, args: HExpr[]): void {
+    const a = this.args(args);
+    this.emit(IBuiltin(Some(l), b, a.ops));
+    this.releaseOps(a);
+  }
+
+  private stLet(l: usize, init: HExpr): Option<usize> {
+    const lty = this.fn.locals[l].ty;
+    if (isHandleTy(lty) && isFileOpen(init)) {
+      match (init.kind) {
+        XBuiltin(b, args) => {
+          this.letOpen(l, b, args);
+        },
+        _ => {
+          this.letOpen(l, BFileOpen, []);
+        },
+      }
+      return None;
+    }
+    const v = this.expr(init);
+    if (!isRefTy(lty)) {
+      this.emit(ICopy(l, v.op));
+      return None;
+    }
+    match (v.k) {
+      KO => {
+        this.emit(IMove(l, localOf(v.op)));
+      },
+      KS => {
+        this.emit(ICopy(l, v.op));
+      },
+      KB => {
+        if (!this.fn.locals[l].mutable && v.stable) {
+          this.emit(IBorrow(l, localOf(v.op)));
+          return None;
+        }
+        this.emit(IDup(l, v.op));
+      },
+    }
+    return Some(l);
+  }
+
+  private stIf(cond: HExpr, th: HBlock, el: Option<HBlock>): void {
+    const cv = this.expr(cond);
+    const sp = this.sp;
+    const lt = this.labels(3);
+    const lf = lt + 1;
+    const le = lt + 2;
+    const hasElse = el.isSome();
+    this.jump(TBranch(cv.op, lt, hasElse ? lf : le));
+    this.at(lt);
+    this.block(th);
+    this.sp = sp;
+    this.jump(TGoto(le));
+    match (el) {
+      Some(b) => {
+        this.at(lf);
+        this.block(b);
+        this.sp = sp;
+        this.jump(TGoto(le));
+      },
+      None => {},
+    }
+    this.at(le);
+  }
+
+  // The loop is entered after its condition is evaluated, as before the rewrite: a `break` inside the condition
+  // belongs to the enclosing loop.
+  @Ensures(this.sc.loopDepth() == old(this.sc.loopDepth()))
+  private stWhile(cond: HExpr, b: HBlock): void {
+    const sp = this.sp;
+    const lhead = this.labels(3);
+    const lbody = lhead + 1;
+    const lexit = lhead + 2;
+    this.at(lhead);
+    const cv = this.expr(cond);
+    const alwaysTrue = match (cond.kind) {
+      XBool(t) => t,
+      _ => false,
+    };
+    if (alwaysTrue) {
+      this.jump(TGoto(lbody));
+    } else {
+      this.jump(TBranch(cv.op, lbody, lexit));
+    }
+    this.at(lbody);
+    this.sc.enterLoop(lexit, lhead);
+    this.block(b);
+    this.sc.leaveLoop();
+    this.sp = sp;
+    this.jump(TGoto(lhead));
+    this.at(lexit);
+  }
+
+  @Ensures(this.sc.loopDepth() == old(this.sc.loopDepth()))
+  private stForOf(local: usize, iter: HExpr, b: HBlock): void {
+    const sp = this.sp;
+    const iv = this.expr(iter);
+    const mark = this.sc.depth();
+    let itL = localOf(iv.op);
+    let ownedIt = kindIsO(iv.k);
+    if (kindIsB(iv.k) && !iv.stable) {
+      const d = this.dupOf(iv.op);
+      itL = localOf(d);
+      ownedIt = true;
+    }
+    if (ownedIt) {
+      this.sc.push(itL);
+    }
+    const len = this.temp(MUsize);
+    this.emit(IBuiltin(Some(len), BArrLength, [OLocal(itL)]));
+    const ix = this.temp(MUsize);
+    this.emit(ICopy(ix, OUsize(0)));
+    const cmp = this.temp(MBool);
+    const lhead = this.labels(4);
+    const lbody = lhead + 1;
+    const lcont = lhead + 2;
+    const lexit = lhead + 3;
+    this.at(lhead);
+    this.emit(IBinary(cmp, OpLt, OLocal(ix), OLocal(len)));
+    this.jump(TBranch(OLocal(cmp), lbody, lexit));
+    this.at(lbody);
+    this.emit(IArrayGet(local, OLocal(itL), OLocal(ix)));
+    this.sc.enterLoop(lexit, lcont);
+    const inner = this.sc.depth();
+    this.stmtSeq(b.stmts);
+    this.releaseTo(inner);
+    this.sc.truncate(inner);
+    this.sc.leaveLoop();
+    this.sp = sp;
+    this.jump(TGoto(lcont));
+    this.at(lcont);
+    this.emit(IBinary(ix, OpAdd, OLocal(ix), OUsize(1)));
+    this.jump(TGoto(lhead));
+    this.at(lexit);
+    if (ownedIt) {
+      this.emit(IRelease(itL));
+    }
+    this.sc.truncate(mark);
+  }
+
+  private stReturn(e: Option<HExpr>): void {
+    match (e) {
+      None => {
+        this.releaseTo(0);
+        this.jump(TReturn(None));
+      },
+      Some(x) => {
+        this.sp = x.span;
+        if (isVoidTy(this.fn.ret)) {
+          const v = this.expr(x);
+          this.discard(v);
+          this.releaseTo(0);
+          this.jump(TReturn(None));
+          return;
+        }
+        // `return local` moves an owned local out instead of dup + release
+        match (x.kind) {
+          XLocal(l) => {
+            if (isRefTy(x.ty) && this.sc.contains(l)) {
+              this.releaseExcept(l);
+              this.jump(TReturn(Some(OLocal(l))));
+              return;
+            }
+          },
+          _ => {},
+        }
+        const v = this.expr(x);
+        const o = this.ownOp(x.ty, v.op, kindIsO(v.k));
+        this.releaseTo(0);
+        this.jump(TReturn(Some(o)));
+      },
+    }
+  }
+
+  private stAssign(place: Place, op0: Option<BinOp>, value0: HExpr): void {
+    const ty = place.ty;
+    const root = place.root;
+    let op = op0;
+    let value = value0;
+    // `s = s + x` on a string local is an append
+    if (op0.isNone() && isStringTy(ty) && place.path.length == 0) {
+      match (value0.kind) {
+        XBinary(bo, lhs, rhs) => {
+          if (isAdd(bo) && isLocalExpr(lhs, root)) {
+            op = Some(OpAdd);
+            value = rhs;
+          }
+        },
+        _ => {},
+      }
+    }
+    let es = placeIdxExprs(place);
+    es.push(value);
+    const nv = es.length - 1;
+    const a = this.args(es);
+    const idx = placeIdx(place, a.ops);
+    let vop = a.ops[nv];
+    let vown = a.own[nv];
+    const isApp = match (op) {
+      Some(o) => isAdd(o) && isStringTy(ty),
+      None => false,
+    };
+    if (isApp) {
+      // the appended string must not alias the destination
+      if (!vown && !isOStr(vop) && a.roots[nv] == root) {
+        vop = this.dupOf(vop);
+        vown = true;
+      }
+      if (place.path.length == 0) {
+        this.emit(IStrAppend(root, vop));
+      } else {
+        this.walk(place, idx, FAppend(vop), TyString);
+      }
+      if (vown) {
+        this.emit(IRelease(localOf(vop)));
+      }
+      return;
+    }
+    if (!isRefTy(ty)) {
+      if (place.path.length == 0) {
+        match (op) {
+          None => {
+            this.emit(ICopy(root, vop));
+          },
+          Some(o) => {
+            this.emit(IBinary(root, o, OLocal(root), vop));
+            this.emitAll(rangeCheck(ty, o, root));
+            if (isF32Ty(ty)) {
+              this.emit(IBuiltin(Some(root), BF32Round, [OLocal(root)]));
+            }
+          },
+        }
+      } else {
+        const fin: Fin = match (op) {
+          None => FSet(vop),
+          Some(o) => FArith(o, vop),
+        };
+        this.walk(place, idx, fin, ty);
+      }
+      return;
+    }
+    // reference-typed plain assignment
+    const o = this.ownOp(ty, vop, vown);
+    if (place.path.length == 0) {
+      this.emit(IRelease(root));
+      if (isOStr(o)) {
+        this.emit(ICopy(root, o));
+      } else {
+        this.emit(IMove(root, localOf(o)));
+      }
+    } else {
+      this.walk(place, idx, FSet(o), ty);
+    }
+  }
+}
+
+// Lowers function `fi` of `prog`.
+@Requires(fi < prog.functions.length)
+@Ensures(result.name == prog.functions[fi].name)
+@Ensures(fnWellLowered(result, lits.strs.length))
+export function lowerFunction(prog: Program, fi: usize, lits: Lits): MFunction {
+  let lw = new Lowerer(prog, prog.functions[fi], lits);
+  lw.run();
+  return lw.finish();
+}

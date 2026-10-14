@@ -1,6 +1,14 @@
 # Changelog
 
 ## Unreleased
+- **Rewrite step 3a: `compiler/lower/` and MIR source spans (ADR-0015, ADR-0020 D3).** HIR -> MIR lowering is now a `Lowerer`
+  class per function with a `BlockBuilder`, a `Locals` table and an `OwnedScope` (97 contract clauses, 15 unit tests in
+  `compiler/tests/lower_test.or`), split into `lowerer` / `builder` / `state` / `ops` / `place` / `values` / `wellformed`.
+  **MIR v2.0**: every instruction and terminator carries the span of the HIR node it was lowered from
+  (`MBlock { instrs, spans, term, termSpan }`, `noSpan()` for hand-written MIR); the optimiser keeps them; the text format
+  of `orin mir` gains ` @file:start-end` per line (the verifier driver, `tools/mutate_mir.py` and the Lean differential
+  test accept it); `orin verify` / `orin compile` report an ownership error as `verify error: f b0 i2 at path:line:col: ..`.
+  C and LLVM output are byte-identical to before (spans are never emitted). No change to the language.
 - **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0036).** `orin verify --contracts` now encodes arrays
   (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
   `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by

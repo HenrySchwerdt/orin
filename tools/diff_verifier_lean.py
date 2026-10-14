@@ -65,7 +65,8 @@ def run_verifier(exe, progs, tmp):
     path = os.path.join(tmp, "mir.txt")
     with open(path, "w") as f:
         for p in progs:
-            f.write("=== %s\n%s" % (p.name, gen.to_mir(p)))
+            # with source positions on every line (docs/mir.md v2.0): the driver must read and ignore them
+            f.write("=== %s\n%s" % (p.name, gen.to_mir(p, spans=True)))
     r = subprocess.run([exe, path], capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         sys.exit("verify_text failed: " + r.stderr[:500])

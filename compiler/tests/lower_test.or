@@ -1,0 +1,437 @@
+// Unit tests of the lowering (rewrite step 3a): the block builder, the locals table, the owned-locals scope, the place
+// walk, the pure helpers, MIR source spans (builder and end to end), and `Lowerer` on programs checked from source. Run:
+// `orin test compiler/tests/lower_test.or --runtime runtime`. `orin test` checks contracts at run time, so the invariants of
+// `BlockBuilder`, `Locals`, `OwnedScope`, `Lowerer` and the `@Ensures` of `finish` / `lower` run on every call below.
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { assert, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { Span, SourceFile, SourceMap, span, describeSpan } from "../diag";
+import {
+  Type, Local, Function, Program, HBlock, HStmt, HExpr, HExprKind, HArm, HPattern, Place, PlaceElem,
+  BinOp,
+} from "../hir";
+import {
+  MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, MProgram, hasSpan, noSpan,
+  printProgram,
+} from "../mir";
+import { loadWithOverlay } from "../loader";
+import { check } from "../check";
+import { verify } from "../verify";
+import {
+  lower, lowerFunction, Lowerer, BlockBuilder, Locals, OwnedScope, rangeCheck, matchLimit,
+  variantDispatch, distinctValues, placeIdx, indexCount, walkPlace, Fin, takeCount, putCount,
+  instrLocals, successors, blocksLocalsBelow, blockTargetsInRange, allReachable, spansComplete,
+  collectLits, progWellLowered,
+} from "../lower";
+
+function sp(a: usize, b: usize): Span {
+  return span(0, a, b);
+}
+
+// ---------------------------------------------------------------------------
+// BlockBuilder
+// ---------------------------------------------------------------------------
+
+@Test
+function builderFallsThroughAndDropsDeadCode(): void {
+  let b = new BlockBuilder();
+  const l0 = b.reserve(3);
+  assertEqUsize(l0, 0, "labels start at 0");
+  b.place(0, sp(0, 1));
+  b.emit(ICopy(0, OInt(1)), sp(2, 3));
+  b.place(1, sp(4, 5));
+  assert(b.isOpen(), "a label opens a block");
+  assertEqUsize(b.count(), 1, "the first block was closed by the fall-through");
+  b.emit(IRelease(0), sp(6, 7));
+  b.terminate(TReturn(None), sp(8, 9));
+  assert(!b.isOpen(), "a terminator closes the block");
+  b.emit(IRelease(0), sp(1, 1));
+  b.terminate(TTrap("dead"), sp(1, 1));
+  assertEqUsize(b.count(), 2, "dead code after a terminator is dropped");
+  const blocks = b.finish();
+  assertEqUsize(blocks.length, 2, "two blocks");
+  assertEqUsize(blocks[0].instrs.length, 1, "first block has one instruction");
+  assertEqUsize(blocks[0].spans[0].start, 2, "the span of the instruction");
+  assertEqUsize(blocks[0].termSpan.start, 4, "the fall-through goto has the span of the label");
+  assertEqUsize(blocks[1].termSpan.start, 8, "the return keeps its span");
+  assert(
+    spansComplete(blocks) && allReachable(blocks) && blockTargetsInRange(blocks),
+    "well formed",
+  );
+}
+
+@Test
+function builderDropsUnreachableBlocksAndRenumbers(): void {
+  let b = new BlockBuilder();
+  b.reserve(4);
+  b.place(0, sp(0, 1));
+  b.terminate(TGoto(2), sp(0, 1));
+  b.place(1, sp(2, 3));
+  b.emit(ICopy(0, OInt(7)), sp(2, 3));
+  b.terminate(TReturn(None), sp(2, 3));
+  b.place(2, sp(4, 5));
+  b.terminate(TReturn(None), sp(4, 5));
+  const blocks = b.finish();
+  assertEqUsize(blocks.length, 2, "block 1 is unreachable and removed");
+  match (blocks[0].term) {
+    TGoto(t) => {
+      assertEqUsize(t, 1, "the goto to label 2 now targets block 1");
+    },
+    _ => {
+      assert(false, "goto");
+    },
+  }
+  assertEqUsize(blocks[1].termSpan.start, 4, "the surviving block keeps its span");
+}
+
+@Test
+function builderSwitchTargetsAreRenumbered(): void {
+  let b = new BlockBuilder();
+  b.reserve(4);
+  b.place(0, sp(0, 1));
+  b.terminate(
+    TSwitch(OInt(0), [SwitchCase { value: 0, target: 3 }, SwitchCase { value: 1, target: 2 }], 3),
+    sp(0, 1),
+  );
+  b.place(1, sp(1, 2));
+  b.terminate(TTrap("dead"), sp(1, 2));
+  b.place(2, sp(2, 3));
+  b.terminate(TReturn(None), sp(2, 3));
+  b.place(3, sp(3, 4));
+  b.terminate(TReturn(None), sp(3, 4));
+  const blocks = b.finish();
+  assertEqUsize(blocks.length, 3, "label 1 is dead");
+  assertEqUsize(successors(blocks[0].term).length, 3, "two cases and a default");
+  assert(blockTargetsInRange(blocks), "all targets are blocks");
+}
+
+// ---------------------------------------------------------------------------
+// Locals and OwnedScope
+// ---------------------------------------------------------------------------
+
+@Test
+function temporariesAreFreshAndDense(): void {
+  let ls = new Locals([MLocal { name: "a", ty: MInt }, MLocal { name: "b", ty: MRef }]);
+  assertEqUsize(ls.count(), 2, "two HIR locals");
+  let ids: usize[] = [];
+  let i: usize = 0;
+  while (i < 50) {
+    ids.push(ls.fresh(i % 2 == 0 ? MBool : MRef));
+    i += 1;
+  }
+  i = 0;
+  while (i < 50) {
+    assertEqUsize(ids[i], 2 + i, "an id is the index");
+    i += 1;
+  }
+  assertEqUsize(ls.temps(), 50, "temporaries counted");
+  assertEqUsize(ls.hirCount(), 2, "HIR locals unchanged");
+  assertEqString(ls.table()[1].name, "b", "HIR locals keep their names");
+  assertEqString(ls.table()[10].name, "_", "temporaries are anonymous");
+}
+
+@Test
+function ownedScopeReleasesInnermostFirst(): void {
+  let sc = new OwnedScope();
+  sc.push(5);
+  sc.push(7);
+  sc.push(9);
+  assertEqUsize(sc.depth(), 3, "three owned");
+  const all = sc.owned(0);
+  assertEqUsize(all[0], 9, "innermost first");
+  assertEqUsize(all[2], 5, "outermost last");
+  assertEqUsize(sc.owned(2).length, 1, "above the mark");
+  assertEqUsize(sc.owned(3).length, 0, "nothing above the top");
+  assertEqUsize(sc.ownedExcept(7).length, 2, "all but the kept one");
+  sc.truncate(1);
+  assertEqUsize(sc.depth(), 1, "truncated");
+  assert(sc.contains(5) && !sc.contains(9), "contains");
+}
+
+@Test
+function loopsAreBalancedAndMarkTheOwnedDepth(): void {
+  let sc = new OwnedScope();
+  assertEqUsize(sc.loopMark(), 0, "no loop: mark 0");
+  assertEqUsize(sc.brk(), 0, "no loop: target 0");
+  sc.push(1);
+  sc.enterLoop(10, 11);
+  sc.push(2);
+  sc.enterLoop(20, 21);
+  assertEqUsize(sc.loopDepth(), 2, "two loops");
+  assertEqUsize(sc.loopMark(), 2, "inner mark");
+  assertEqUsize(sc.brk(), 20, "inner exit");
+  assertEqUsize(sc.cont(), 21, "inner continue");
+  sc.leaveLoop();
+  assertEqUsize(sc.brk(), 10, "outer exit");
+  assertEqUsize(sc.loopMark(), 1, "outer mark");
+  sc.leaveLoop();
+  assertEqUsize(sc.loopDepth(), 0, "balanced");
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+@Test
+function rangeChecksOnlyNarrowArithmetic(): void {
+  assertEqUsize(rangeCheck(TyInt, OpAdd, 3).length, 0, "i64 needs none");
+  assertEqUsize(rangeCheck(TyIntK(5), OpAdd, 3).length, 1, "u8 add is checked");
+  assertEqUsize(rangeCheck(TyIntK(5), OpRem, 3).length, 0, "% cannot leave the range");
+  assertEqUsize(rangeCheck(TyIntK(2), OpSub, 3).length, 1, "i32 sub is checked");
+  assertEqUsize(rangeCheck(TyBool, OpAdd, 3).length, 0, "not an integer");
+}
+
+function arm(p: HPattern): HArm {
+  return HArm { pattern: p, body: HBlock { stmts: [] }, value: None };
+}
+
+@Test
+function matchDispatchFirstArmWinsAndWildcardEnds(): void {
+  const arms = [
+    arm(HPVariant(1, [])),
+    arm(HPVariant(0, [])),
+    arm(HPVariant(1, [])),
+    arm(HPWildcard),
+    arm(HPVariant(2, [])),
+  ];
+  assertEqUsize(matchLimit(arms), 4, "arms after the wildcard are dead");
+  const d = variantDispatch(arms, 4, 10, 99);
+  assertEqUsize(d.cases.length, 2, "one case per tag");
+  assertEqUsize(d.cases[0].target, 11, "tag 1 goes to the first arm that names it");
+  assertEqUsize(d.dflt, 14, "the wildcard arm is the default");
+  assert(distinctValues(d.cases), "distinct values");
+  const none = variantDispatch([arm(HPVariant(0, []))], 1, 0, 7);
+  assertEqUsize(none.dflt, 7, "no wildcard: the trap label");
+  assertEqUsize(matchLimit([]), 0, "no arms");
+}
+
+function field(i: usize): PlaceElem {
+  return PField(0, i);
+}
+
+@Test
+function placeWalkPutsBackEverythingItTakes(): void {
+  const place = Place { root: 0, path: [field(1), field(2), field(0)], ty: TyInt };
+  const idx = placeIdx(place, []);
+  assertEqUsize(idx.length, 3, "one operand per element");
+  const w = walkPlace(10, place, idx, FSet(OInt(5)), TyInt);
+  assertEqUsize(takeCount(w.instrs), 2, "two enclosing objects are taken");
+  assertEqUsize(putCount(w.instrs), 2, "and put back");
+  assertEqUsize(w.temps.length, 2, "one temporary per taken object");
+  assert(instrLocals(w.instrs[1]).length >= 1, "temporaries start at the base");
+  const shallow = walkPlace(
+    10,
+    Place { root: 0, path: [field(1)], ty: TyInt },
+    [OInt(0)],
+    FSet(OInt(5)),
+    TyInt,
+  );
+  assertEqUsize(takeCount(shallow.instrs), 0, "a one-element path stores in place");
+  const push = walkPlace(
+    10,
+    Place { root: 0, path: [], ty: TyString },
+    [],
+    FPush(OInt(1)),
+    TyString,
+  );
+  assertEqUsize(push.instrs.length, 1, "whole-array push on a local");
+  assertEqUsize(indexCount(place), 0, "no index elements");
+}
+
+@Test
+function compoundAssignmentOnAFieldReadsModifiesWrites(): void {
+  const place = Place { root: 0, path: [field(0)], ty: TyIntK(5) };
+  const w = walkPlace(4, place, [OInt(0)], FArith(OpAdd, OInt(1)), TyIntK(5));
+  assertEqUsize(w.temps.length, 2, "old and new value");
+  // getfield, add, range check, setfield (after the make-unique)
+  assertEqUsize(w.instrs.length, 5, "makeunique, get, add, range, set");
+}
+
+// ---------------------------------------------------------------------------
+// Lowerer end to end: programs are checked from source and lowered
+// ---------------------------------------------------------------------------
+
+function lowered(fs: FsGrant, text: string): Option<MProgram> {
+  const o = loadWithOverlay(fs, "/virt/a.or", [SourceFile { path: "/virt/a.or", text: text }]);
+  return match (o.program) {
+    Some(p) => {
+      const r = check(p, o.sm);
+      return r.isOk() ? Some(lower(r.unwrap())) : None;
+    },
+    None => None,
+  };
+}
+
+function fnNamed(p: MProgram, suffix: string): usize {
+  let i: usize = 0;
+  while (i < p.functions.length) {
+    if (p.functions[i].name.endsWith(suffix)) {
+      return i;
+    }
+    i += 1;
+  }
+  return p.functions.length;
+}
+
+function src(): string {
+  return "function twice(xs: int[], n: int): int {\n  let total = 0;\n  for (const x of xs) {\n    total += x * n;\n  }\n"
+      + "  while (total > 100) {\n    total -= 100;\n    if (total == 7) { break; }\n  }\n  return total;\n}\n"
+      + "function main(): void {\n  const a = [1, 2, 3];\n  console.log(twice(a, 2).toString());\n}\n";
+}
+
+@Test
+function loweringIsWellFormedAndVerifies(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const m = lowered(fs, src());
+      assert(m.isSome(), "checks and lowers");
+      const p = m.unwrap();
+      assert(progWellLowered(p), "every function is well lowered");
+      const f = fnNamed(p, "twice");
+      assert(f < p.functions.length, "twice is lowered");
+      assertEqUsize(p.functions[f].paramCount, 2, "parameters");
+      assertEqUsize(verify(p).errors.length, 0, "the verifier accepts it");
+      assert(p.functions[f].blocks.length >= 6, "loops make blocks");
+    },
+  );
+}
+
+@Test
+function everyInstructionPointsAtItsSource(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = lowered(fs, src()).unwrap();
+      const f = p.functions[fnNamed(p, "main")];
+      // `console.log(twice(a, 2).toString())`: the call of `twice` is lowered from exactly that call expression
+      let found = false;
+      for (const blk of f.blocks) {
+        let i: usize = 0;
+        while (i < blk.instrs.length) {
+          const s = blk.spans[i];
+          assert(hasSpan(s) && s.file == 0 && s.end <= src().length, "span inside the source");
+          match (blk.instrs[i]) {
+            ICall(_, _, _) => {
+              if (src().substring(s.start, s.end) == "twice(a, 2)") {
+                found = true;
+              }
+            },
+            _ => {},
+          }
+          i += 1;
+        }
+        assert(hasSpan(blk.termSpan), "terminators have spans");
+      }
+      assert(found, "the call instruction carries the span of `twice(a, 2)`");
+      // the printed MIR shows them
+      assert(printProgram(p).includes(" @0:"), "the printer shows spans");
+    },
+  );
+}
+
+@Test
+function statementSpansFollowTheirHeadExpression(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = lowered(fs, src()).unwrap();
+      const f = p.functions[fnNamed(p, "twice")];
+      // the loop condition `total > 100` is compared by an instruction with exactly that span, and the `break` and the
+      // implicit end of the function have spans of the function or of earlier statements, never none
+      let cmp = false;
+      for (const blk of f.blocks) {
+        let i: usize = 0;
+        while (i < blk.instrs.length) {
+          match (blk.instrs[i]) {
+            IBinary(_, OpGt, _, _) => {
+              if (src().substring(blk.spans[i].start, blk.spans[i].end) == "total > 100") {
+                cmp = true;
+              }
+            },
+            _ => {},
+          }
+          i += 1;
+        }
+      }
+      assert(cmp, "the loop condition has its own span");
+    },
+  );
+}
+
+@Test
+function lowererOnAHandBuiltFunction(): void {
+  const body = HBlock {
+    stmts: [
+      HLet(1, HExpr { kind: XInt(4), ty: TyInt, span: sp(10, 11) }),
+      HReturn(Some(HExpr { kind: XLocal(1), ty: TyInt, span: sp(20, 21) })),
+    ],
+  };
+  const f = Function {
+    name: "f",
+    paramCount: 1,
+    locals: [
+      Local { name: "p", ty: TyInt, mutable: false },
+      Local { name: "x", ty: TyInt, mutable: false },
+    ],
+    ret: TyInt,
+    body: body,
+    span: sp(0, 30),
+  };
+  const prog = Program {
+    records: [],
+    unions: [],
+    functions: [f],
+    main: 0,
+    vtables: [],
+    ifaces: [],
+    mutating: [],
+    inlineFns: [],
+  };
+  const lits = collectLits(prog);
+  let lw = new Lowerer(prog, f, lits);
+  lw.run();
+  const m = lw.finish();
+  assertEqUsize(m.blocks.length, 1, "straight line code is one block");
+  assertEqUsize(m.blocks[0].instrs.length, 1, "copy of the constant");
+  assertEqUsize(m.blocks[0].spans[0].start, 10, "the copy has the span of the initializer");
+  assertEqUsize(m.blocks[0].termSpan.start, 20, "the return has the span of its value");
+  assertEqUsize(m.locals.length, 2, "no temporaries needed");
+  assert(blocksLocalsBelow(m.blocks, m.locals.length), "locals declared");
+  const g = lowerFunction(prog, 0, lits);
+  assertEqString(g.name, "f", "lowerFunction");
+}
+
+@Test
+function missingReturnTrapsWithTheFunctionSpan(): void {
+  const f = Function {
+    name: "g",
+    paramCount: 0,
+    locals: [],
+    ret: TyInt,
+    body: HBlock { stmts: [] },
+    span: sp(5, 9),
+  };
+  const prog = Program {
+    records: [],
+    unions: [],
+    functions: [f],
+    main: 0,
+    vtables: [],
+    ifaces: [],
+    mutating: [],
+    inlineFns: [],
+  };
+  const m = lowerFunction(prog, 0, collectLits(prog));
+  assertEqUsize(m.blocks.length, 1, "one block");
+  match (m.blocks[0].term) {
+    TTrap(msg) => {
+      assertEqString(msg, "missing return", "the trap");
+    },
+    _ => {
+      assert(false, "expected a trap");
+    },
+  }
+  assertEqUsize(m.blocks[0].termSpan.start, 5, "the function span");
+}
