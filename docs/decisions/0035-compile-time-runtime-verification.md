@@ -1,12 +1,12 @@
 # ADR-0035: Compile-time proof and runtime contract enforcement
 
-**Status:** proposed (2026-10-14)  
+**Status:** accepted (2026-10-14, project owner)  
 **Scope:** contract verification and release policy; design only, no compiler implementation in this ADR.  
 **Related:** [ADR-0012](0012-contracts-as-annotations.md), [ADR-0020](0020-verifiable-software-roadmap.md), [ADR-0028](0028-contract-quality.md), [ADR-0029](0029-agent-refusal-protocol.md), [ADR-0030](0030-provable-std-and-minimal-trusted-runtime.md), [ADR-0031](0031-invariants-for-verified-business-logic.md), [assurance ledger](../assurance.md), [contracts](../contracts.md).
 
 ## Context
 
-Orin has compiler-recognized `@Requires`, `@Ensures`, `@Invariant`, `@Decreases` and `@Rule` clauses, a `--check-contracts` runtime-checking build, and `orin verify --contracts [--strict]` for a **limited** SMT fragment (pure `int`/`bool` functions without loops, arrays, strings, records, classes or I/O). The latter produces `VERIFIED`, `REFUTED` or `UNKNOWN`, with assumptions including A-INT, A-DIV and A-PARTIAL.
+Orin has compiler-recognized `@Requires`, `@Ensures`, `@Invariant`, `@Decreases` and `@Rule` clauses, a `--check-contracts` runtime-checking build, and `orin verify --contracts [--strict]` for an SMT fragment that, since ADR-0031 part B / ADR-0036 (PR #40), covers arrays (length, bounds-obligated indexing, updates), records and classes, `Option`/`Result`/unions, `Map` size and membership, exact integer ranges, strings by length, modular calls, class invariants proved per method with inferred frames, user loop `@Invariant`s, bounded `every`/`some` and recursive `sum`. It still excludes floats, interfaces, closures as values, `?`, recursive types and I/O. Results are `VERIFIED`, `REFUTED` or `UNKNOWN` with listed assumptions (A-INT, A-DIV, A-PARTIAL, A-CALL, A-PURE, A-INV, A-FRAME, A-LOOP, A-STR, A-MAP); a counterexample that passes through a havoced, uninterpreted or untranslatable part is untrusted and reported as `UNKNOWN`. Measured after PR #40: compiler/ 163 VERIFIED / 1 REFUTED / 280 UNKNOWN; std (bytes, utf8, collections) 355 / 2 / 394. Loop invariants are not yet checked at run time, and `@Decreases` is parsed but not yet discharged as a termination obligation.
 
 Many invariants in the standard library are **runtime-checked and tested**, not formally proved. Counting contracts, testing mutations, successfully self-hosting, and having a Lean model of the ownership core do not prove the real standard library correct.
 
