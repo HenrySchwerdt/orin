@@ -2031,7 +2031,6 @@ static OrinObj *deep_copy(OrinObj *root) {
  * token travels only through a monitor or a thread start, both of which order the sender's release before the
  * receiver's take). Otherwise (a shared box, which std:task never passes) a fresh box is built as before. */
 uint64_t orin_rt_transfer_put(OrinObj *box) {
-    if (box->kind == ORIN_K_STRUCT && ((OrinStruct *)box)->nslots == 2) return lend_put(box);
     if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 1) orin_trap_shape();
     OrinStruct *s = (OrinStruct *)box;
     OrinObj *out;
@@ -2082,12 +2081,20 @@ static uint64_t par_threads(void) {
     return orin_platform_cpu_count();
 }
 
-/* 0: values moved by this task so far, 1: copied; 2: the thread count of parallel pipelines (par_threads). Query 2 shares
- * this function because both backends already declare it (the LLVM backend's list of runtime declarations was not
- * extended for parallel pipelines); it becomes `core.task.threads` with the rest of this section in R3. */
+/* 0: values moved by this task so far, 1: copied. */
 uint64_t orin_rt_transfer_count(uint64_t which) {
-    return which == 0 ? orin_stats.transfer_moves : which == 1 ? orin_stats.transfer_copies : which == 2 ? par_threads() : 0;
+    return which == 0 ? orin_stats.transfer_moves : which == 1 ? orin_stats.transfer_copies : 0;
 }
+
+/* Lend (ADR-0039 §4, see "lending" above): `box` is a TWO-slot record { value, _ } the caller has just built; returns the lend
+ * token (end it with orin_rt_transfer_drop). It becomes `core.lend.put` in R3. */
+uint64_t orin_rt_lend(OrinObj *box) {
+    if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 2) orin_trap_shape();
+    return lend_put(box);
+}
+
+/* The thread count of parallel pipelines: ORIN_THREADS (1..1,024) or the processors online. It becomes `core.task.threads` in R3. */
+uint64_t orin_rt_par_threads(void) { return par_threads(); }
 
 /* ---------------------------------------------------------------- tasks */
 

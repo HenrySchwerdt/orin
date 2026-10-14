@@ -387,7 +387,7 @@ static void test_lend(void) {
     }
     orin_retain(arr);
     OrinObj *lb = lend_box(arr);
-    uint64_t lt = orin_rt_transfer_put(lb);
+    uint64_t lt = orin_rt_lend(lb);
     orin_release(lb);
     CHECK(arr->rc < 0);
     uint64_t c0 = orin_rt_transfer_count(1);
@@ -415,7 +415,7 @@ static void test_lend(void) {
     OrinObj *r0 = ORIN_REF(orin_array_at(recs, 0));
     orin_retain(recs);
     lb = lend_box(recs);
-    lt = orin_rt_transfer_put(lb);
+    lt = orin_rt_lend(lb);
     orin_release(lb);
     CHECK(recs->rc < 0 && r0->rc < 0);
     orin_retain(recs);
@@ -433,13 +433,13 @@ static void test_lend(void) {
     orin_mon_free(m);
     CHECK(orin_live_count() == base);
     /* the thread count of parallel pipelines */
-    CHECK(orin_rt_transfer_count(2) >= 1);
+    CHECK(orin_rt_par_threads() >= 1);
     setenv("ORIN_THREADS", "3", 1);
-    CHECK(orin_rt_transfer_count(2) == 3);
+    CHECK(orin_rt_par_threads() == 3);
     setenv("ORIN_THREADS", "0", 1);
-    CHECK(orin_rt_transfer_count(2) == orin_platform_cpu_count());
+    CHECK(orin_rt_par_threads() == orin_platform_cpu_count());
     setenv("ORIN_THREADS", "x2", 1);
-    CHECK(orin_rt_transfer_count(2) == orin_platform_cpu_count());
+    CHECK(orin_rt_par_threads() == orin_platform_cpu_count());
     unsetenv("ORIN_THREADS");
 }
 
