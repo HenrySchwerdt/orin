@@ -1,10 +1,24 @@
-// Inputs for tools/test_verify_contracts.py: only `int` (= i64) and `bool` are modelled by the verifier;
-// every other integer width gives UNKNOWN with a reason (ADR-0022), while i64 is verified like int.
+// Inputs for tools/test_verify_contracts.py: every integer width is modelled with its exact range (ADR-0022,
+// ADR-0031 B6): `i8 i16 i32 u8 u16 u32 u64 isize usize` are bounded integers; arithmetic that leaves the range traps
+// (so it does not return, A-INT), unsigned subtraction included; conversions are range-checked.
 // expect: with_i64 ensures VERIFIED
-// expect: with_i32 ensures UNKNOWN
-// expect: with_u8_result ensures UNKNOWN
-// expect: with_usize ensures UNKNOWN
-// expect: caller ensures UNKNOWN
+// expect: with_i32 ensures VERIFIED
+// expect: with_u8_result ensures VERIFIED
+// expect: with_usize ensures VERIFIED
+// expect: caller call-precondition VERIFIED
+// expect: caller call-precondition VERIFIED
+// expect: caller ensures VERIFIED
+// expect: u8_range ensures VERIFIED
+// expect: u8_plus ensures REFUTED
+// expect: i8_neg ensures VERIFIED
+// expect: usize_minus ensures VERIFIED
+// expect: usize_minus_wrong ensures REFUTED
+// expect: widen ensures VERIFIED
+// expect: narrow_wrong ensures REFUTED
+// expect: i32_square ensures VERIFIED
+// warn: with_u8_result W0460
+// warn: with_usize W0460
+// warn: u8_range W0460
 
 @Requires(x >= 0 && x < 1000)
 @Ensures(result == x + 1)
@@ -32,6 +46,57 @@ function with_usize(n: usize): int {
 @Ensures(result >= 0)
 function caller(): int {
   return with_i32(5).toInt() + with_usize(2).toInt();
+}
+
+// An unsigned value is never negative and never above its maximum: a property of the type, not of the code.
+@Ensures(result <= 255 && result >= 0)
+function u8_range(x: u8): u8 {
+  return x;
+}
+
+// Wrong: x + y can exceed 255; the proof is about the returning paths, so the claim `result >= x` holds on them,
+// but `result >= 200` does not.
+@Ensures(result >= 200)
+function u8_plus(x: u8, y: u8): u8 {
+  return x + y;
+}
+
+// -x traps for -128 (no i8 can hold 128), so on a returning path x > -128 and the result is positive when x is
+// negative.
+@Ensures(x < 0 ==> result > 0)
+function i8_neg(x: i8): i8 {
+  return -x;
+}
+
+// Subtraction on usize traps when it would be negative: on a returning path a >= b.
+@Ensures(result <= a)
+function usize_minus(a: usize, b: usize): usize {
+  return a - b;
+}
+
+// Wrong: the result of a - b is not b (only when a == 2 * b).
+@Ensures(result == b)
+function usize_minus_wrong(a: usize, b: usize): usize {
+  return a - b;
+}
+
+// Widening never traps and keeps the value.
+@Ensures(result == x.toInt())
+function widen(x: u8): int {
+  return x.toInt();
+}
+
+// Wrong: narrowing int -> u8 keeps the value when it fits (else it traps), so `result == x` holds on the returning
+// paths, but `result < 100` does not.
+@Ensures(result < 100)
+function narrow_wrong(x: int): u8 {
+  return x.toU8();
+}
+
+@Requires(x > -46341 && x < 46341)
+@Ensures(result >= 0)
+function i32_square(x: i32): i32 {
+  return x * x;
 }
 
 function main(): void {

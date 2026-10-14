@@ -1,0 +1,301 @@
+// Results of `orin verify --contracts` and their reports: the statuses, the refusal protocol fields of
+// ADR-0029 (action, question, options, candidates, evidence), the assumptions of ADR-0020 D1, JSON and text.
+
+import { jsonString } from "../tools";
+
+export type Res = {
+  fn: string; file: string; line: usize; kind: string; clause: string; rules: string[];
+  status: string; reason: string; cex: string[]; assumes: string[];
+};
+
+// A contract-quality finding proved by the solver (ADR-0028). `status` is the status of the *finding*:
+// `VERIFIED` means the solver proved the clause is vacuous (tautology / unsatisfiable / implied by the
+// preconditions). Unproved candidates are not reported at all.
+export type QWarn = { code: string; fn: string; file: string; line: usize; kind: string; clause: string; message: string; status: string; };
+
+export type Report = { results: Res[]; warnings: QWarn[]; };
+
+// ---------------------------------------------------------------------------
+// Refusal protocol (ADR-0029 §1-3): who has to act on a result
+// ---------------------------------------------------------------------------
+
+type Opt = { edit: string; changesSpec: bool; widensAuthority: bool; };
+
+// `FIX_CODE` | `STRENGTHEN_SPEC` | `NEEDS_DECISION`, or "" for a VERIFIED result (nothing to do).
+//   REFUTED call-precondition        FIX_CODE        (the caller passes an argument the callee forbids)
+//   REFUTED anything else            NEEDS_DECISION  (the body or the contract is wrong; only a human knows which): an
+//                                    @Ensures, a class invariant a method can break, an index or `unwrap` that can fail
+//   UNKNOWN                          STRENGTHEN_SPEC (loop, missing callee contract, unsupported fragment, solver limit)
+// NEEDS_AUTHORITY does not arise here: no verification result needs a grant or a dependency rule.
+function actionOf(r: Res): string {
+  if (r.status == "REFUTED") {
+    return r.kind == "call-precondition" ? "FIX_CODE" : "NEEDS_DECISION";
+  }
+  return r.status == "UNKNOWN" ? "STRENGTHEN_SPEC" : "";
+}
+
+// The inputs of a counterexample as a condition: `x == 1 && y == 2`.
+function cexCondition(r: Res): string {
+  let parts: string[] = [];
+  for (const c of r.cex) {
+    parts.push(c.split(" = ").join(" == "));
+  }
+  return parts.join(" && ");
+}
+
+function callOf(r: Res): string {
+  let parts: string[] = [];
+  for (const c of r.cex) {
+    parts.push(c);
+  }
+  return r.fn + "(" + parts.join(", ") + ")";
+}
+
+// A precondition that excludes exactly the counterexample, or "" when there is none.
+function candidatePrecondition(r: Res): string {
+  if (r.status != "REFUTED" || r.kind == "call-precondition" || r.cex.length == 0) {
+    return "";
+  }
+  return "@Requires(!(" + cexCondition(r) + "))";
+}
+
+// The question of a NEEDS_DECISION result, one sentence a human can answer without reading the code.
+function questionOf(r: Res): string {
+  if (actionOf(r) != "NEEDS_DECISION") {
+    return "";
+  }
+  const call = r.cex.length > 0 ? callOf(r) : r.fn;
+  if (r.kind == "invariant") {
+    return call + " can break " + r.clause + ". Is the method wrong (fix it), should it require more (add a precondition), or is the invariant itself wrong (change it)?";
+  }
+  if (r.kind == "bounds" || r.kind == "unwrap") {
+    return call + " can fail here: " + r.clause + ". Is the code wrong (fix it), or must callers avoid this input (add a precondition)?";
+  }
+  return call + " violates " + r.clause + ". Is the body wrong (fix it), is this input meant to be excluded (add a precondition), or is the contract itself wrong (change it)?";
+}
+
+function optionsOf(r: Res): Opt[] {
+  let out: Opt[] = [];
+  if (actionOf(r) != "NEEDS_DECISION") {
+    return out;
+  }
+  const safety = r.kind == "bounds" || r.kind == "unwrap";
+  if (safety) {
+    out.push(Opt { edit: "change the body of `" + r.fn + "` so that " + r.clause + " cannot fail", changesSpec: false, widensAuthority: false });
+  } else {
+    out.push(Opt { edit: "change the body of `" + r.fn + "` so that " + r.clause + " holds for this input", changesSpec: false, widensAuthority: false });
+  }
+  const cand = candidatePrecondition(r);
+  if (cand != "") {
+    out.push(Opt { edit: "add `" + cand + "` to `" + r.fn + "` (callers must then establish it)", changesSpec: true, widensAuthority: false });
+  }
+  if (safety) {
+    out.push(Opt { edit: "guard the access in `" + r.fn + "` with an explicit check (handles the case in code)", changesSpec: false, widensAuthority: false });
+  } else {
+    out.push(Opt { edit: "weaken or remove " + r.clause + " (a weaker guarantee)", changesSpec: true, widensAuthority: true });
+  }
+  return out;
+}
+
+// Contract suggestions for a STRENGTHEN_SPEC / NEEDS_DECISION result. They are suggestions, never
+// verified. UNKNOWN results carry none: the solver gives no counterexample to derive one from.
+function candidatesOf(r: Res): string[] {
+  let out: string[] = [];
+  const c = candidatePrecondition(r);
+  if (c != "") {
+    out.push(c);
+  }
+  return out;
+}
+
+function jsonBool(b: bool): string {
+  return b ? "true" : "false";
+}
+
+function jsonOptions(os: Opt[]): string {
+  let out: string[] = [];
+  for (const o of os) {
+    out.push("{\"edit\":" + jsonString(o.edit) + ",\"changes_spec\":" + jsonBool(o.changesSpec) + ",\"widens_authority\":" + jsonBool(o.widensAuthority) + "}");
+  }
+  return out.join(",");
+}
+
+function jsonAction(a: string): string {
+  return a == "" ? "null" : jsonString(a);
+}
+
+// The ADR-0029 fields of a result: `action`, `question`, `options`, `candidates`, `evidence`.
+function protocolJson(r: Res): string {
+  const loc = r.file + ":" + r.line.toString();
+  return "\"action\":" + jsonAction(actionOf(r)) + ",\"question\":" + (questionOf(r) == "" ? "null" : jsonString(questionOf(r)))
+    + ",\"options\":[" + jsonOptions(optionsOf(r)) + "],\"candidates\":[" + jsonStrings(candidatesOf(r))
+    + "],\"evidence\":{\"clause\":" + jsonString(r.clause) + ",\"location\":" + jsonString(loc) + ",\"counterexample\":["
+    + jsonStrings(r.cex) + "]}";
+}
+
+function jsonRes(r: Res): string {
+  let rules: string[] = [];
+  for (const x of r.rules) {
+    rules.push(jsonString(x));
+  }
+  let cex: string[] = [];
+  for (const x of r.cex) {
+    cex.push(jsonString(x));
+  }
+  return "{\"function\":" + jsonString(r.fn) + ",\"file\":" + jsonString(r.file) + ",\"line\":" + r.line.toString()
+    + ",\"kind\":" + jsonString(r.kind) + ",\"clause\":" + jsonString(r.clause) + ",\"rules\":[" + rules.join(",")
+    + "],\"status\":" + jsonString(r.status) + ",\"reason\":" + jsonString(r.reason) + ",\"counterexample\":["
+    + cex.join(",") + "],\"assumptions\":[" + jsonStrings(assumptionsOf(r)) + "]," + protocolJson(r) + "}";
+}
+
+function jsonStrings(xs: string[]): string {
+  let out: string[] = [];
+  for (const x of xs) {
+    out.push(jsonString(x));
+  }
+  return out.join(",");
+}
+
+function assumptionsJson(): string {
+  const ids = assumptionIds();
+  const texts = assumptionTexts();
+  let out: string[] = [];
+  let i: usize = 0;
+  while (i < ids.length) {
+    out.push("{\"id\":" + jsonString(ids[i]) + ",\"text\":" + jsonString(texts[i]) + "}");
+    i += 1;
+  }
+  return out.join(",");
+}
+
+// Model assumptions (ADR-0020 D1: a VERIFIED result names the assumptions it depends on). Ids are referenced
+// from each result; the texts are listed once per report. A-INT, A-DIV and A-PARTIAL hold for every proof;
+// the others are listed on the results whose proof used the construct.
+function assumptionIds(): string[] {
+  return ["A-INT", "A-DIV", "A-PARTIAL", "A-CALL", "A-PURE", "A-INV", "A-FRAME", "A-LOOP", "A-STR", "A-MAP"];
+}
+
+function assumptionTexts(): string[] {
+  return [
+    "integers: every arithmetic result and conversion is assumed to be in the range of its type on the paths that return (an overflow traps, so it never returns); inside a contract integers are unbounded",
+    "no division or remainder by zero occurs on the paths that return",
+    "partial correctness: the function is assumed to return (termination is not proved)",
+    "the contracts of the functions called hold: their @Ensures are assumed (each is proved for the callee separately), and a recursive call assumes the function's own contract",
+    "a function the purity analysis finds pure is a deterministic function of its arguments",
+    "class invariants hold on entry to a public method and for every object of the class that is passed in (constructors establish them, public methods maintain them; a write to a public field from outside the class is not covered)",
+    "a method writes only the fields the mutation analysis finds in its body; every other field keeps its value across a call",
+    "loop invariants hold where they are used (each is proved on entry and for one iteration); a loop without one changes everything it assigns to",
+    "strings are modelled by their length (and an id for the contents); concatenation, substring and the other operations on contents are uninterpreted; charCodeAt is a byte in 0..255 (the runtime reads an unsigned char)",
+    "the size of a Map is axiomatised (never negative, positive when a key is present, exact under set and delete), not computed from the key set"
+  ];
+}
+
+// The assumptions a VERIFIED result depends on: the three always-on ones and those the proof used.
+@Ensures(result.length >= 3 && result[0] == "A-INT" && result[1] == "A-DIV" && result[2] == "A-PARTIAL")
+export function assumptionsFor(used: string[]): string[] {
+  let out: string[] = ["A-INT", "A-DIV", "A-PARTIAL"];
+  for (const id of assumptionIds()) {
+    if (used.includes(id) && !out.includes(id)) {
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+function assumptionsOf(r: Res): string[] {
+  if (r.status == "VERIFIED") {
+    return r.assumes;
+  }
+  const none: string[] = [];
+  return none;
+}
+
+function jsonWarn(w: QWarn): string {
+  return "{\"code\":" + jsonString(w.code) + ",\"function\":" + jsonString(w.fn) + ",\"file\":" + jsonString(w.file)
+    + ",\"line\":" + w.line.toString() + ",\"kind\":" + jsonString(w.kind) + ",\"clause\":" + jsonString(w.clause)
+    + ",\"message\":" + jsonString(w.message) + ",\"status\":" + jsonString(w.status) + ",\"assumptions\":[],\"action\":\"STRENGTHEN_SPEC\"}";
+}
+
+function count(rs: Res[], status: string): usize {
+  let n: usize = 0;
+  for (const r of rs) {
+    if (r.status == status) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+export function reportJson(rep: Report): string {
+  let items: string[] = [];
+  for (const r of rep.results) {
+    items.push(jsonRes(r));
+  }
+  let warns: string[] = [];
+  for (const w of rep.warnings) {
+    warns.push(jsonWarn(w));
+  }
+  return "{\"results\":[" + items.join(",") + "],\"assumptions\":[" + assumptionsJson() + "],\"warnings\":[" + warns.join(",")
+    + "],\"summary\":{\"verified\":" + count(rep.results, "VERIFIED").toString()
+    + ",\"refuted\":" + count(rep.results, "REFUTED").toString() + ",\"unknown\":" + count(rep.results, "UNKNOWN").toString() + "}}";
+}
+
+export function reportText(rep: Report): string {
+  let lines: string[] = [];
+  for (const r of rep.results) {
+    let s = r.status + "  " + r.fn + ": " + r.clause + "  (" + r.file + ":" + r.line.toString() + ")";
+    if (r.reason != "") {
+      s += "\n    reason: " + r.reason;
+    }
+    if (r.cex.length > 0) {
+      s += "\n    counterexample: " + r.cex.join(", ");
+    }
+    if (actionOf(r) != "") {
+      s += "\n    action: " + actionOf(r);
+    }
+    if (questionOf(r) != "") {
+      s += "\n    question: " + questionOf(r);
+      let k: usize = 1;
+      for (const o of optionsOf(r)) {
+        s += "\n    option " + k.toString() + ": " + o.edit + " (changes_spec: " + jsonBool(o.changesSpec) + ", widens_authority: " + jsonBool(o.widensAuthority) + ")";
+        k += 1;
+      }
+    }
+    for (const c of candidatesOf(r)) {
+      s += "\n    candidate: " + c;
+    }
+    lines.push(s);
+  }
+  if (count(rep.results, "VERIFIED") > 0) {
+    lines.push("VERIFIED holds under these assumptions:");
+    const ids = assumptionIds();
+    const texts = assumptionTexts();
+    let i: usize = 0;
+    while (i < ids.length) {
+      let used = ids[i] == "A-INT" || ids[i] == "A-DIV" || ids[i] == "A-PARTIAL";
+      for (const r of rep.results) {
+        if (r.status == "VERIFIED" && r.assumes.includes(ids[i])) {
+          used = true;
+        }
+      }
+      if (used) {
+        lines.push("  " + ids[i] + ": " + texts[i]);
+      }
+      i += 1;
+    }
+  }
+  for (const w of rep.warnings) {
+    lines.push("warning[" + w.code + "]  " + w.fn + ": " + w.clause + "  (" + w.file + ":" + w.line.toString() + ")\n    " + w.message + "\n    action: STRENGTHEN_SPEC");
+  }
+  lines.push("verified " + count(rep.results, "VERIFIED").toString() + ", refuted " + count(rep.results, "REFUTED").toString()
+    + ", unknown " + count(rep.results, "UNKNOWN").toString());
+  return lines.join("\n");
+}
+
+export function failedCount(rep: Report): usize {
+  return count(rep.results, "REFUTED");
+}
+
+export function unknownCount(rep: Report): usize {
+  return count(rep.results, "UNKNOWN");
+}
