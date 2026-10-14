@@ -1,6 +1,18 @@
 # Changelog
 
 ## Unreleased
+- **Parser error recovery: several syntax errors per file.** `orin check`, `orin compile`, `--format=json`, the LSP
+  diagnostics and MCP `check` now report every syntax error of a file (up to 20; past that the 20th carries the note
+  "further syntax errors suppressed") instead of only the first. Recovery points: the next statement of a block (after `;`,
+  at the block's `}`, past an `if` / `while` / `for` body, at a statement keyword), the next member of a class or interface,
+  the next top-level `function` / `class` / `interface` / `type` / `import` / `export` / `@`; a declaration keyword inside a
+  body (a missing `}`) is reported once and the parse resumes there. No cascades: a file with syntax errors is not type
+  checked (only its syntax errors are reported, so no node built by recovery reaches the checker), an error at or right
+  after a resume point is dropped, running into the end of the file stops. The first error is byte-identical to before for
+  every input (code, message, span: a contract of `parseRecovering`, and 3,247 inputs incl. 1,500 garbage files compared);
+  valid programs give the same trees and the same C / LLVM output; `orin fmt` still refuses a file with a syntax error. A
+  lexical error (E0100) is still the only error of its file. New: `parseRecovering` (syntax module), progress contracts of
+  the recovery loops, `compiler/tests/recovery_test.or`, `tests/recovery/` with `tools/test_recovery.py`.
 - **Rewrite step 3c: `compiler/syntax/` (ADR-0015).** The lexer is a `Lexer` class (cursor, tokens, template depth) and the
   parser a `Parser` class (tokens and cursor as fields instead of `{ node, pos }` records returned by ~90 functions); binary
   operators are parsed by precedence climbing over a data table (`precedence.or`, class `OpTable`: level, operator,

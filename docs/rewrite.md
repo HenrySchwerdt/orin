@@ -617,6 +617,119 @@ Design notes and friction:
   arithmetic, early exit) stay loops; the child lists of the predicates are built with `map` / `concat`, the rule checks use
   `find` / `every` / `some`.
 
+### Parser error recovery
+
+Approved by the project owner on 2026-10-14 (the NEEDS_DECISION of step 3c). `orin check`, `orin compile`, `--format=json`,
+the LSP diagnostics and MCP `check` report every syntax error of a file, up to 20, instead of the first one only. Nothing
+else changed: the first error is byte-identical to the one before (code, message, span), every valid program gives the
+same tree and the same generated code, and `orin fmt` still refuses a file with a syntax error (it calls `parse`, which
+stops at the first error as before).
+
+```
+tests/recovery/three_errors.or:3:15: error[E0200]: expected expression, found `;`
+tests/recovery/three_errors.or:7:28: error[E0200]: expected identifier, found `:`
+tests/recovery/three_errors.or:12:12: error[E0200]: expected expression, found `;`
+```
+
+**API.** `parse(file, src)` is unchanged. `parseRecovering(file, src): Result<Module, Diagnostic[]>` (parser.or) is the
+recovering parse; the loader calls it and puts the further errors after the first in the `LoadOutcome` (`Loader.moreSyntaxErrors`),
+so every consumer of the loader (CLI text and JSON, LSP, MCP, `orin test`) reports them without a change of its own. A lexical
+error (E0100) ends the scan, so it stays the only error of its file. `Parser.enableRecovery()` switches a parser built by hand
+to recovery; without it the `Parser` behaves as before.
+
+**Recovery points.** The innermost of three loops catches the error, reports it and skips tokens:
+
+* *block statement* (`recoverStmt`, in `parseBlock`): to after the next `;` at the statement's brace level; to the `}` that
+  closes the block (not consumed); past the `}` that ends the body of an `if` / `while` / `for` / block statement, unless
+  `else` follows; or to a token after the error that starts a statement (`let`, `const`, `if`, `while`, `for`, `return`,
+  `break`, `continue`, `@`). Brace depth is counted from the first token of the failed statement, so a record literal or
+  an arrow function body inside it does not end the block early.
+* *class or interface member* (`recoverMember`): to after the next `;`, or past the `}` that closes a method body, at the
+  member's brace level; to a `@` after the error; or to the `}` that closes the class body.
+* *top-level declaration* (`recoverItem`, in `parseModule`): to the next `function`, `class`, `interface`, `type`, `import`,
+  `export` or `@` at the declaration's brace level after the error.
+
+A declaration keyword at the statement's or member's level means that a `}` is missing: the error is reported once, and the
+parse unwinds (`Parser.unwinding`, every catcher propagates) to `parseModule`, which continues at that keyword. Running into the
+end of the file inside a recovery stops the parse (no "expected `}`" after the real error).
+
+**No cascades.** (1) *The checker never sees a recovered tree.* When the parse has errors, `parseRecovering` returns only the
+diagnostics, the loader stops at that file (as it did at the first error before), and no checker runs on the program: only
+the parse errors are reported. This is the safe rule of the decision; marking recovered nodes so that the checker could skip
+errors that stem from them would have meant a flag on `Expr` / `Stmt` / `Item` (built by literal in ~150 places) and a rule in
+every checker method, for the benefit of type errors in a file that does not parse. (2) *Inside the parser* an error is dropped
+when it starts at or before the previous error or at the token a statement or member recovery resumed at or the token after it
+(`Parser.floor`): a construct that fails at once after a resume point means the tokens are still out of step (a `}` missing
+or doubled), and every following line would otherwise report "expected `(` or `:` in class member, found `.`" and the like.
+Top-level resume points (a declaration keyword or `@`) are reliable and an annotation error starts at its `@`, so there the
+window is not applied. Prefer one error fewer: `a b; c d;` reports one error (`d` is the second token after the resume
+point), `let a = ; let b = ;` reports two. (3) *Cap*: at most `MAX_SYNTAX_ERRORS` = 20 per file; when a 21st error is found
+the 20th gets the note "further syntax errors suppressed" and the parse stops.
+
+**Termination.** In the style of 3c's progress property: `recoverStmt` and `recoverMember` ensure `result ==> this.pos > st ||
+this.isP("}")` (the loop continues only when the cursor moved past the start of the failed construct, or it ends at the `}`),
+`recoverItem` ensures `this.pos > st || this.atEnd()`. Every resume point is a token after the error, a `}` that ends the loop,
+or the end of the file.
+
+**Contracts** (28 new clauses in parser.or, 3 in loader.or): the `Parser` invariants (`errs.length <= MAX_SYNTAX_ERRORS`, no errors
+and no unwinding without recovery, the last error is at or before `floor`), the progress clauses above, `report` adds at most one
+error and adds exactly `d`, `stop` leaves the cursor at the end, `parseModule` with recovery always returns a module and has
+stopped unwinding, `parseRecovering` ensures `syntaxErrorsOk` (1..20 errors, parse-error codes, spans in the source, strictly
+ordered by start, the note only on the 20th) and `agreesWithParse` (errors exactly when `parse` fails, and the first one is
+`sameDiag` to it: the "first error unchanged" rule is a contract that runs on every file the contract-checked compiler loads);
+`Loader.run` ensures the further errors are renderable and empty on success.
+
+Tests: `compiler/tests/recovery_test.or` (9 `@Test`, run by `tools/test_tooling.sh`: each recovery point, no cascades, the
+cap and its note, the lexer, `Parser` without recovery unchanged, 400 garbage token soups and every prefix and every 3-byte
+deletion of a program checked against `parse`), `tests/recovery/` with `tools/test_recovery.py` (8 programs with the exact
+expected `check` output in `<name>.err`; also checks `compile`, `--format=json` and that `fmt --check` refuses the file), new
+cases in `test_lsp.py`, `test_mcp.py` and `analysis_test.or`. Mutation check: 12 hand-made mutants of the recovery code
+against `recovery_test.or` (no skipping in `recoverStmt`, no cascade floor, cap off by one, top-level resume at the error
+token, `if` body not a statement end, no unwinding at a declaration keyword, one-token cascade window, first error dropped,
+note on another error, a method body's `}` not consumed, recovery always on, `recoverStmt` ignoring `unwinding`): 11 killed;
+the last is equivalent (the check right after `report` returns on `unwinding` as well, and the re-report is dropped by the
+floor).
+
+Results (against the baseline compiler built before the change):
+
+* **first error**: `check` and `check --format=json` of 3,257 inputs (every `.or` file of the repository and 1,500 garbage
+  files: random token soups, truncations, deletions and duplications of real files, generated as in 3c): 3,047 outputs
+  identical, 210 report more errors; in all 210 the base reported one diagnostic and the new first diagnostic is
+  byte-identical to it (JSON line and rendered text), every further one has a syntax code, starts after the previous one,
+  and there are never more than 20 (histogram: 2 errors 144 files, 3: 27, 4: 12, 5: 7, 6: 4, 7: 3, 8: 5, 9: 2, 10: 3,
+  11: 1, 12: 1, 20: 1, `tests/recovery/cap.or`). No crash, no trap. The same inputs through the contract-checked compiler:
+  identical output, no contract fired (3,090 inputs: all but the 167 valid `compiler/` files, which take minutes each to
+  type check under contracts on a loaded machine; the contract-checked self-compile below parses every one of them).
+* **generated code**: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
+  `examples/` program and of `compiler/main.or` (392 programs x 3) byte-identical;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,833,375 bytes), conformance 141/141; all suites 812/812;
+* `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`,
+  812/812 conformance tests, `test_verify_contracts` 809 checks, no contract fired;
+* `orin check --strict-contracts compiler/main.or`: 0 warnings;
+* `test_fmt.py` 1,661 passed; `orin fmt --stdout` of 3,243 files byte-identical between the two compilers (1,271 formatted,
+  1,972 refused); `test_tooling.sh` passed (`recovery_test` 9/9, `test_recovery.py` 8/8); `test_lsp.py` 104 checks,
+  `test_mcp.py` 191 checks, 0 failed.
+
+Performance (callgrind instruction counts, both compilers built by the baseline compiler, both on the new tree):
+`orin compile compiler/main.or` 38,780 M -> 38,792 M (+0.03 %), `orin check compiler/main.or` (front end) 2,575.0 M ->
+2,587.2 M (+0.47 %). The parser's own copy-on-write traffic did not grow (the `Parser` copies in `orin_make_unique_slow`
+went from 1.60 M to 1.46 M instructions); the rest is spread thinly. Wall time was not measurable (load average 17-19 on 4
+cores: medians moved by more than 5 % between runs of the same binary).
+
+Friction:
+
+* **No exceptions, no catch.** Every error is a `Result` that `?` propagates; a recovery point is a loop that takes the
+  `Err` apart (`isOk` / `unwrap` / `unwrapErr` instead of `?`), and "give up and resume at the top level" needs a flag in
+  the parser (`unwinding`) that every catcher tests, because there is no way to unwind past several frames.
+* **Parameters are immutable and classes are values**: the loop-clause part of a block statement had to become a method
+  that returns its statements (`parseLoopClauses`) instead of pushing into the caller's array.
+* **Cascade rules are heuristics.** The cap, "stop at the end of the file" and "the checker never sees a recovered tree" are
+  rules; the two-token window after a resume point is a judgement (it drops `c d` in `a b; c d;`). It was tuned on the
+  garbage corpus, where the out-of-step cases (a `}` deleted in the middle of a class) produced one error per following line
+  before it.
+* **Session tooling**: shell loops over compiler runs are refused in a worktree-isolated session (like compound `git`
+  commands, see "Pitfalls found"); the corpus and comparison drivers were small Python scripts.
+
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
 Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving
