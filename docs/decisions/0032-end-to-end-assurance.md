@@ -77,6 +77,14 @@ People also need to see *what* is proved, under *which* assumptions, without rea
 10. **TCB budget.** `docs/tcb.md` lists every trusted component with its size. CI fails if L0 grows
     beyond its budget or a new trusted component appears without an ADR.
 
+## Addendum (2026-10-14): verification of representation optimizations
+
+ADR-0038's inferred stack, region, inline, frozen and RC/COW representations must preserve source-level value semantics. Each transformation needs evidence for **lifetime, layout/shape, aliasing, trap and side-effect order, resource cleanup and inter-task safety**; particularly guard against the documented F-shape class of compiler bugs. A proof of non-escape does not prove valid indices, and a `@NoTrap` proof does not prove unique ownership. Physical LLVM registers are not a semantic guarantee.
+
+Extend the independent MIR verifier, Lean memory model and translation validator to cover stack/region lifetime, verified move/copy-out, frozen publication, RC elimination and SROA/LLVM lowering. Only established facts justify `noalias`, `inbounds`, overflow flags, invariant loads or erased checks. If proof is absent, use the original checked RC/COW path; a model-only theorem or sanitizer test is not implementation verification.
+
+Expose per-allocation-site proof IDs, chosen representation, fallback, assumptions and `VERIFIED` vs `TESTED_ONLY` evidence in `orin perf --explain` (ADR-0042) and the assurance reports. Benchmark measurements choose among **proven equivalent** strategies; performance heuristics never establish correctness.
+
 ## Honest limits
 
 - The OS kernel and the hardware stay trusted.

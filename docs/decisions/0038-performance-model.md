@@ -199,3 +199,20 @@ verifier and added to the Lean model (ADR-0032):
   - array and numeric code 1.0–1.2x of C;
   - strings and maps 1.1–1.3x;
   - object-heavy code 1.2–1.5x.
+
+## Addendum (2026-10-14): proof-guided memory strategy
+
+RC/COW is Orin's **fallback representation**, not a mandate that every non-scalar remain boxed. Today most objects have a reference-counted heap header; sharing a pointer is not an immediate deep copy. Track allocations, retains/releases, uniqueness checks and actual COW copies separately.
+
+The MIR optimizer should combine **interprocedural escape analysis, points-to/alias analysis, capture and last-use inference, mutability/effects, shape/range proofs and task reachability**. Unknown dispatch or unproved lifetimes use the safe RC/COW fallback. Facts determine which transformations are legal; a calibrated cost model selects among legal choices. Escape analysis alone is not a universal heap-versus-stack algorithm: inlining and scalar replacement may eliminate an escaping object; unbounded locals may still require heap storage.
+
+Candidate order (not a universal cost ranking): eliminate/scalar-replace values; unbox small aggregates; stack-allocate proven non-escaping bounded objects; place scope-bound graphs into verified regions; reuse unique mutable objects in place; freeze transitively immutable long-lived graphs; otherwise use RC/COW. LLVM SROA and mem2reg may produce SSA values and registers but can spill; neither a source annotation nor a proof guarantees physical register residency.
+
+A `u8[]` should eventually occupy one payload byte per element, rather than today's eight-byte slots; verify alignment, bounds, integer overflow, layouts and cross-task transfer. Build a direct JSON-to-packed-byte writer and bulk socket I/O, eliminating temporary number strings and byte-wise conversion, while preserving partial-write and error behavior. This is a library algorithm change, not something escape analysis invents.
+
+Read-only globals may become frozen shared graphs **only after** safe publication, lifetime and reclamation proofs. Mutable globals require explicit synchronization, owner tasks or semantics-preserving sharding. An observable exact counter must not silently become eventually-consistent worker-local counts. Stage-0 task heaps still move or copy objects.
+
+A future separate language/CLI decision may allow ignorable optimization hints versus **provable performance requirements** (hypothetical `@Prefer("stack")`, `@NoHeap`, `@NoCopy`); none of this syntax is implemented or approved by this addendum. Strict requirements must define transitive accounting and reject unknown proofs. No unsafe escape hatch.
+
+Measure every pass on matched HTTP+JSON, allocation-heavy and compiler workloads: `ORIN_STATS` allocations/retains/releases/COW, RSS, instruction counts, throughput, p50/p99 latency, compilation and verification time, with Go/C/Rust comparators. Roll out packed bytes, the direct writer **and unboxing of small aggregates** (`Result`, `Option`, pairs and small records, which are 1.7M of the 3.9M allocations measured in `http_parse`); then escape/alias and stack/SROA; then R3 regions/frozen sharing; finally proof-backed LLVM metadata and check removal, which lands mainly in the LLVM backend (§8, the release default once its gates hold). C/LLVM differential, sanitizer, alias/closure/recursion, panic and self-hosting tests are required. Speedup ratios remain hypotheses until measured.
+
