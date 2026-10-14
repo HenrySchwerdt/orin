@@ -1580,8 +1580,9 @@ uint64_t orin_mon_new(uint64_t n) {
 void orin_mon_free(uint64_t m) { mon_check(orin_platform_monitor_free((int64_t)m)); }
 void orin_mon_lock(uint64_t m) { mon_check(orin_platform_monitor_lock((int64_t)m)); }
 void orin_mon_unlock(uint64_t m) { mon_check(orin_platform_monitor_unlock((int64_t)m)); }
-void orin_mon_wait(uint64_t m) { mon_check(orin_platform_monitor_wait((int64_t)m)); }
-void orin_mon_notify_all(uint64_t m) { mon_check(orin_platform_monitor_notify_all((int64_t)m)); }
+void orin_mon_wait(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_wait((int64_t)m, (int)c)); }
+void orin_mon_notify_all(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_notify((int64_t)m, (int)c, 1)); }
+void orin_mon_notify_one(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_notify((int64_t)m, (int)c, 0)); }
 uint64_t orin_mon_get(uint64_t m, uint64_t i) {
     uint64_t v = 0;
     mon_check(orin_platform_monitor_get((int64_t)m, (size_t)i, &v));

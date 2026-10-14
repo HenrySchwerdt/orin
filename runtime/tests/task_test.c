@@ -198,13 +198,13 @@ static void body_echo(OrinObj *env) { /* words: 0 = state (0 empty, 1 ping, 2 po
     uint64_t m = orin_struct_get(env, 0), rounds = orin_struct_get(env, 1);
     for (uint64_t i = 0; i < rounds; i++) {
         orin_mon_lock(m);
-        while (orin_mon_get(m, 0) != 1) orin_mon_wait(m);
+        while (orin_mon_get(m, 0) != 1) orin_mon_wait(m, 0);
         OrinObj *b = orin_rt_transfer_take(orin_mon_get(m, 1));
         int64_t v = (int64_t)orin_struct_get(b, 0);
         orin_release(b);
         orin_mon_set(m, 1, orin_rt_transfer_put(box_int(v + 1)) );
         orin_mon_set(m, 0, 2);
-        orin_mon_notify_all(m);
+        orin_mon_notify_all(m, 0);
         orin_mon_unlock(m);
     }
 }
@@ -220,8 +220,8 @@ static void test_pingpong(void) {
         orin_mon_lock(m);
         orin_mon_set(m, 1, tok);
         orin_mon_set(m, 0, 1);
-        orin_mon_notify_all(m);
-        while (orin_mon_get(m, 0) != 2) orin_mon_wait(m);
+        orin_mon_notify_all(m, 0);
+        while (orin_mon_get(m, 0) != 2) orin_mon_wait(m, 0);
         OrinObj *r = orin_rt_transfer_take(orin_mon_get(m, 1));
         v = (int64_t)orin_struct_get(r, 0);
         orin_release(r);

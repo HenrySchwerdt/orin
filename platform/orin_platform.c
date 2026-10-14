@@ -474,7 +474,7 @@ typedef struct Thr {
 
 typedef struct Mon {
     pthread_mutex_t mu;
-    pthread_cond_t cv;
+    pthread_cond_t cv[2]; /* two condition queues, so that e.g. senders and receivers of a channel do not wake each other */
     uint64_t *w;
     size_t n;
     uint64_t owner; /* id of the thread holding mu, 0 = nobody (atomic) */
@@ -595,7 +595,8 @@ int64_t orin_platform_monitor_new(size_t nwords) {
             return 0;
         }
         pthread_mutex_init(&m->mu, NULL);
-        pthread_cond_init(&m->cv, NULL);
+        pthread_cond_init(&m->cv[0], NULL);
+        pthread_cond_init(&m->cv[1], NULL);
         i = g_mon_hi;
         __atomic_store_n(&g_mon[i], m, __ATOMIC_RELEASE);
         __atomic_store_n(&g_mon_hi, i + 1, __ATOMIC_RELEASE);
@@ -630,21 +631,22 @@ int orin_platform_monitor_unlock(int64_t h) {
     return 0;
 }
 
-int orin_platform_monitor_wait(int64_t h) {
+int orin_platform_monitor_wait(int64_t h, int cond) {
     Mon *m = mon_ref(h);
-    if (!m || !mon_held(m)) return ORIN_PLATFORM_EINVAL;
+    if (!m || !mon_held(m) || (cond != 0 && cond != 1)) return ORIN_PLATFORM_EINVAL;
     m->waiters++;
     __atomic_store_n(&m->owner, 0, __ATOMIC_RELAXED);
-    pthread_cond_wait(&m->cv, &m->mu);
+    pthread_cond_wait(&m->cv[cond], &m->mu);
     __atomic_store_n(&m->owner, orin_platform_thread_id(), __ATOMIC_RELAXED);
     m->waiters--;
     return 0;
 }
 
-int orin_platform_monitor_notify_all(int64_t h) {
+int orin_platform_monitor_notify(int64_t h, int cond, int all) {
     Mon *m = mon_ref(h);
-    if (!m || !mon_held(m)) return ORIN_PLATFORM_EINVAL;
-    pthread_cond_broadcast(&m->cv);
+    if (!m || !mon_held(m) || (cond != 0 && cond != 1)) return ORIN_PLATFORM_EINVAL;
+    if (all) pthread_cond_broadcast(&m->cv[cond]);
+    else pthread_cond_signal(&m->cv[cond]);
     return 0;
 }
 

@@ -225,14 +225,17 @@ int orin_platform_monitor_lock(int64_t h);
     assigns the monitor; */
 int orin_platform_monitor_unlock(int64_t h);
 
-/*@ requires as unlock; ensures \result == 0 ==> the caller released the monitor, slept until another thread called
-            notify_all (or spuriously), and holds the monitor again: re-check the condition in a loop;
-    ensures \result == ORIN_PLATFORM_EINVAL ==> as unlock; assigns the monitor; */
-int orin_platform_monitor_wait(int64_t h);
+/*@ requires as unlock; cond is 0 or 1 (a monitor has two condition queues);
+    ensures \result == 0 ==> the caller released the monitor, slept on queue `cond` until another thread notified that
+            queue (or spuriously), and holds the monitor again: re-check the condition in a loop;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> as unlock, or cond is not 0 or 1; assigns the monitor; */
+int orin_platform_monitor_wait(int64_t h, int cond);
 
-/*@ requires the caller holds the monitor; ensures \result == 0 ==> every thread waiting on it wakes up (after the caller
-            unlocks); \result == ORIN_PLATFORM_EINVAL ==> as unlock; assigns \nothing; */
-int orin_platform_monitor_notify_all(int64_t h);
+/*@ requires the caller holds the monitor and cond is 0 or 1;
+    ensures \result == 0 ==> all threads waiting on queue `cond` (all != 0) or one of them, if any (all == 0), wake up
+            (after the caller unlocks);
+    ensures \result == ORIN_PLATFORM_EINVAL ==> as wait; assigns \nothing; */
+int orin_platform_monitor_notify(int64_t h, int cond, int all);
 
 /*@ requires the caller holds the monitor; ensures \result == 0 ==> *out is word i; \result == ORIN_PLATFORM_EINVAL ==>
             stale handle, lock not held, or i >= the number of words; assigns *out; */

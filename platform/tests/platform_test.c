@@ -453,8 +453,26 @@ static void th_wait_for_flag(void *arg) { /* waits until word 1 is set, then pub
     (void)arg;
     uint64_t v = 0;
     orin_platform_monitor_lock(g_m);
-    while (orin_platform_monitor_get(g_m, 1, &v) == 0 && v == 0) orin_platform_monitor_wait(g_m);
+    while (orin_platform_monitor_get(g_m, 1, &v) == 0 && v == 0) orin_platform_monitor_wait(g_m, 0);
     orin_platform_monitor_set(g_m, 2, v + 1);
+    orin_platform_monitor_unlock(g_m);
+}
+
+/* sleeps on queue 1 until word 1 is non-zero, consumes that (sets it back to 0) and counts itself out of word 3 */
+static void th_wait_queue1(void *arg) {
+    (void)arg;
+    uint64_t v = 0;
+    orin_platform_monitor_lock(g_m);
+    orin_platform_monitor_get(g_m, 3, &v);
+    orin_platform_monitor_set(g_m, 3, v + 1);
+    for (;;) {
+        orin_platform_monitor_get(g_m, 1, &v);
+        if (v != 0) break;
+        orin_platform_monitor_wait(g_m, 1);
+    }
+    orin_platform_monitor_set(g_m, 1, 0);
+    orin_platform_monitor_get(g_m, 3, &v);
+    orin_platform_monitor_set(g_m, 3, v - 1);
     orin_platform_monitor_unlock(g_m);
 }
 
@@ -517,16 +535,45 @@ static void test_threads_and_monitors(void) {
     CHECK(w > 0);
     orin_platform_monitor_lock(g_m);
     orin_platform_monitor_set(g_m, 1, 41);
-    CHECK(orin_platform_monitor_notify_all(g_m) == 0);
+    CHECK(orin_platform_monitor_notify(g_m, 0, 1) == 0);
     orin_platform_monitor_unlock(g_m);
     CHECK(orin_platform_thread_join(w, &arg) == 0);
     orin_platform_monitor_lock(g_m);
     orin_platform_monitor_get(g_m, 2, &v);
     CHECK(v == 42);
-    CHECK(orin_platform_monitor_wait(g_m + 12345) == ORIN_PLATFORM_EINVAL);
-    CHECK(orin_platform_monitor_notify_all(0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_wait(g_m + 12345, 0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_notify(0, 0, 1) == ORIN_PLATFORM_EINVAL);
     orin_platform_monitor_unlock(g_m);
-    CHECK(orin_platform_monitor_notify_all(g_m) == ORIN_PLATFORM_EINVAL); /* not held */
+    CHECK(orin_platform_monitor_notify(g_m, 0, 1) == ORIN_PLATFORM_EINVAL); /* not held */
+
+    /* two condition queues: a notify of queue 0 does not wake a waiter of queue 1; notify_one wakes one waiter */
+    CHECK(orin_platform_monitor_lock(g_m) == 0);
+    CHECK(orin_platform_monitor_wait(g_m, 2) == ORIN_PLATFORM_EINVAL && orin_platform_monitor_notify(g_m, -1, 0) == ORIN_PLATFORM_EINVAL);
+    CHECK(orin_platform_monitor_notify(g_m, 1, 0) == 0); /* nobody waits: harmless */
+    orin_platform_monitor_set(g_m, 1, 0);
+    orin_platform_monitor_unlock(g_m);
+    int64_t q[3];
+    for (int i = 0; i < 3; i++) q[i] = orin_platform_thread_create(th_wait_queue1, NULL);
+    for (int woken = 0; woken < 3; woken++) {
+        for (;;) { /* wait until the number of sleepers is what we expect (word 3 counts them) */
+            orin_platform_monitor_lock(g_m);
+            orin_platform_monitor_get(g_m, 3, &v);
+            orin_platform_monitor_unlock(g_m);
+            if (v == (uint64_t)(3 - woken)) break;
+        }
+        orin_platform_monitor_lock(g_m);
+        orin_platform_monitor_notify(g_m, 0, 1); /* the wrong queue: nobody wakes */
+        orin_platform_monitor_set(g_m, 1, 1);
+        orin_platform_monitor_notify(g_m, 1, 0); /* one waiter of queue 1 */
+        orin_platform_monitor_unlock(g_m);
+        for (;;) {
+            orin_platform_monitor_lock(g_m);
+            orin_platform_monitor_get(g_m, 3, &v);
+            orin_platform_monitor_unlock(g_m);
+            if (v == (uint64_t)(3 - woken - 1)) break;
+        }
+    }
+    for (int i = 0; i < 3; i++) CHECK(orin_platform_thread_join(q[i], &arg) == 0);
 
     /* a thread that ends while holding a monitor does not leave it locked */
     int64_t d = orin_platform_thread_create(th_die_holding, NULL);

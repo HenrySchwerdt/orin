@@ -42,7 +42,7 @@
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
-  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount
+  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne
 } from "std:fsraw";
 
 // ------------------------------------------------------------------------------------------------------ transfer
@@ -165,6 +165,13 @@ function loadRing(m: usize): Ring {
   return new Ring(monGet(m, 0), monGet(m, 1), monGet(m, 2), flags % 2 == 1, flags >= 2);
 }
 
+// A monitor has two condition queues: 0 = "there is room" (blocked senders), 1 = "there is a value" (blocked receivers). A
+// send wakes one receiver, a receive wakes one sender, a close wakes everybody.
+function wakeAll(m: usize): void {
+  monNotifyAll(m, 0);
+  monNotifyAll(m, 1);
+}
+
 function storeRing(m: usize, r: Ring): void {
   monSet(m, 1, r.head);
   monSet(m, 2, r.len);
@@ -193,7 +200,7 @@ export class Sender<T> {
     monLock(this.ch);
     let r = loadRing(this.ch);
     while (!r.canPush() && !r.txClosed && !r.rxClosed) {
-      monWait(this.ch);
+      monWait(this.ch, 0);
       r = loadRing(this.ch);
     }
     if (!r.canPush()) {
@@ -204,7 +211,7 @@ export class Sender<T> {
     const slot = r.push();
     monSet(this.ch, CH_HDR + slot, tok);
     storeRing(this.ch, r);
-    monNotifyAll(this.ch);
+    monNotifyOne(this.ch, 1);
     monUnlock(this.ch);
     return true;
   }
@@ -215,7 +222,7 @@ export class Sender<T> {
     let r = loadRing(this.ch);
     r.closeTx();
     storeRing(this.ch, r);
-    monNotifyAll(this.ch);
+    wakeAll(this.ch);
     const done = r.released();
     monUnlock(this.ch);
     if (done) {
@@ -238,7 +245,7 @@ export class Receiver<T> {
     monLock(this.ch);
     let r = loadRing(this.ch);
     while (!r.canPop() && !r.isDone()) {
-      monWait(this.ch);
+      monWait(this.ch, 1);
       r = loadRing(this.ch);
     }
     if (!r.canPop()) {
@@ -248,7 +255,7 @@ export class Receiver<T> {
     const slot = r.pop();
     const tok = monGet(this.ch, CH_HDR + slot);
     storeRing(this.ch, r);
-    monNotifyAll(this.ch);
+    monNotifyOne(this.ch, 0);
     monUnlock(this.ch);
     const v: T = takeBox(tok);
     return Some(v);
@@ -265,7 +272,7 @@ export class Receiver<T> {
     }
     r.closeRx();
     storeRing(this.ch, r);
-    monNotifyAll(this.ch);
+    wakeAll(this.ch);
     const done = r.released();
     monUnlock(this.ch);
     for (const t of toks) {
@@ -436,7 +443,7 @@ export function spawn<T>(s: Scope, f: () => T): TaskHandle<T> {
   const th = taskSpawn(tok);
   monLock(s.tab);
   monSet(s.tab, entry(idx), th);
-  monNotifyAll(s.tab);
+  monNotifyAll(s.tab, 0);
   monUnlock(s.tab);
   return new TaskHandle<T>(s.tab, idx, res);
 }
@@ -470,7 +477,7 @@ function drain(tab: usize): string {
         monSet(tab, 1, lg.cursor);
         monUnlock(tab);
       } else if (th == 0) {
-        monWait(tab);
+        monWait(tab, 0);
         monUnlock(tab);
       } else {
         const res = monGet(tab, e + 1);

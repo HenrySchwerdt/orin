@@ -140,8 +140,9 @@ uint64_t orin_mon_new(uint64_t nwords);
 void orin_mon_free(uint64_t m);
 void orin_mon_lock(uint64_t m);
 void orin_mon_unlock(uint64_t m);
-void orin_mon_wait(uint64_t m);
-void orin_mon_notify_all(uint64_t m);
+void orin_mon_wait(uint64_t m, uint64_t cond);       /* cond: 0 or 1, the two condition queues of a monitor */
+void orin_mon_notify_all(uint64_t m, uint64_t cond);
+void orin_mon_notify_one(uint64_t m, uint64_t cond);
 uint64_t orin_mon_get(uint64_t m, uint64_t i);
 void orin_mon_set(uint64_t m, uint64_t i, uint64_t v);
 void orin_mon_grow(uint64_t m, uint64_t nwords);
