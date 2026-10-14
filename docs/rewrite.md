@@ -357,6 +357,7 @@ Behaviour preservation (all against the baseline compiler built before the step)
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (6,503,269 bytes), conformance 141/141;
 * all 804 conformance tests, also with the contract-checked compiler (`tools/test_compiler_contracts.sh`), no contract fired;
 * `orin check --strict-contracts compiler/main.or`: 0 warnings (W045x and W047x);
+* `tools/ci_local.sh` (after merging origin/main, `timeout 4000`): all steps passed;
 * the 11 end-to-end tests of `check_body_test.or` (diagnostic codes and messages, hoisted statements, lifted closures,
   trial rollback) also pass on the old `body.or`, so they are a specification, not a description of the new code.
 
