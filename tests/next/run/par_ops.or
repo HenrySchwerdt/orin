@@ -1,0 +1,89 @@
+// warns: W0481 W0481
+// Parallel pipelines (ADR-0039, array/parallel.or): every operation of the view against the sequential chain, for sizes
+// around the sequential threshold (8192) and the chunk boundaries (multiples of 4096). The result must not depend on the
+// number of threads: tools/test_parallel.sh runs this program with ORIN_THREADS=1..8 and under the sanitizers.
+// (W0481: the signed `+` reduce below; the values are small, so no partial sum overflows.)
+type Pt = { x: int; y: int; w: bool; };
+
+function input(n: usize): int[] {
+  let xs: int[] = [];
+  let s = 12345;
+  while (xs.length < n) {
+    s = (s * 1103515245 + 12345) % 2147483648;
+    xs.push(s % 1000 - 500);
+  }
+  return xs;
+}
+
+function check(what: string, n: usize, ok: bool): usize {
+  if (!ok) {
+    console.log(`MISMATCH ${what} at n = ${n}`);
+    return 1;
+  }
+  return 0;
+}
+
+function same(a: int[], b: int[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function sizes(): usize[] {
+  return [0, 1, 2, 4095, 4096, 4097, 8191, 8192, 8193, 12287, 12288, 12289, 40000];
+}
+
+function main(): void {
+  let bad: usize = 0;
+  for (const n of sizes()) {
+    const xs = input(n);
+    const lim = 400;
+    const zero: usize = 0;
+    // map, filter (order kept), toArray
+    bad += check("map", n, same(xs.parallel().map(x => x * 3 - 1).toArray(), xs.map(x => x * 3 - 1)));
+    bad += check("filter", n, same(xs.parallel().filter(x => x > lim).toArray(), xs.filter(x => x > lim)));
+    bad += check("chain", n, same(
+      xs.parallel().filter(x => x % 3 != 0).map(x => x * x).filter(x => x < 90000).toArray(),
+      xs.filter(x => x % 3 != 0).map(x => x * x).filter(x => x < 90000)));
+    // reduce with the built-in associative operators
+    bad += check("sum", n, xs.parallel().map(x => x + 1).reduce((a, b) => a + b, 7) == xs.map(x => x + 1).reduce((a, b) => a + b, 7));
+    bad += check("min", n, xs.parallel().reduce((a, b) => a < b ? a : b, 1000) == xs.reduce((a, b) => a < b ? a : b, 1000));
+    bad += check("max", n, xs.parallel().reduce((a, b) => a > b ? a : b, -1000) == xs.reduce((a, b) => a > b ? a : b, -1000));
+    bad += check("usum", n, xs.parallel().map(x => (x + 500).toUsize()).reduce((a, b) => a + b, zero)
+        == xs.map(x => (x + 500).toUsize()).reduce((a: usize, b: usize) => a + b, zero));
+    bad += check("and", n, xs.parallel().map(x => x > -490).reduce((a, b) => a && b, true) == xs.map(x => x > -490).reduce((a, b) => a && b, true));
+    bad += check("or", n, xs.parallel().map(x => x == 499).reduce((a, b) => b || a, false) == xs.map(x => x == 499).reduce((a, b) => b || a, false));
+    // early exits: the first hit, chunks before it always run
+    bad += check("some", n, xs.parallel().some(x => x == 498) == xs.some(x => x == 498));
+    bad += check("some-none", n, xs.parallel().some(x => x > 500) == xs.some(x => x > 500));
+    bad += check("every", n, xs.parallel().every(x => x > -500) == xs.every(x => x > -500));
+    bad += check("every-not", n, xs.parallel().filter(x => x > 0).every(x => x < 497) == xs.filter(x => x > 0).every(x => x < 497));
+    bad += check("find", n, xs.parallel().map(x => x * 2).find(x => x > 990).unwrapOr(-9999) == xs.map(x => x * 2).find(x => x > 990).unwrapOr(-9999));
+    bad += check("findIndex", n, xs.parallel().filter(x => x % 2 == 0).findIndex(x => x > 495).unwrapOr(999999)
+        == xs.filter(x => x % 2 == 0).findIndex(x => x > 495).unwrapOr(999999));
+    bad += check("findIndex-none", n, xs.parallel().findIndex(x => x > 1000).isNone());
+    // a view kept in a variable, then used twice (not fused: the prelude's own functions run)
+    const v = xs.parallel().map(x => x + 2);
+    bad += check("view", n, same(v.filter(x => x > 0).toArray(), xs.map(x => x + 2).filter(x => x > 0)) && v.toArray().length == n);
+    // records of scalars as input, strings as a stage result
+    let pts: Pt[] = [];
+    for (const x of xs) {
+      pts.push(Pt { x: x, y: x % 7, w: x > 0 });
+    }
+    bad += check("records", n, same(pts.parallel().filter(p => p.w).map(p => p.x + p.y).toArray(), pts.filter(p => p.w).map(p => p.x + p.y)));
+    const kept = pts.parallel().filter(p => p.y == 3).toArray();
+    bad += check("records-kept", n, kept.length == pts.filter(p => p.y == 3).length && kept.every(p => p.y == 3));
+    bad += check("strings", n, xs.parallel().filter(x => x > 495).map(x => x.toString() + ",").reduce((a, b) => a + b, "")
+        == xs.filter(x => x > 495).map(x => x.toString() + ",").reduce((a, b) => a + b, ""));
+    console.log(`n = ${n}: ${xs.parallel().filter(x => x > 0).map(x => x % 10).toArray().length} positive, sum ${xs.parallel().map(x => x * 2).reduce((a, b) => a + b, 0)}`);
+  }
+  console.log(`mismatches: ${bad}`);
+}

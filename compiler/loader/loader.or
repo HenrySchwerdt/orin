@@ -24,6 +24,17 @@ import { SrcRoot, findManifest, readManifest, manifestEntry } from "./modules";
 
 export type LoadResult = { program: LoadedProgram; sm: SourceMap; };
 
+// The prelude of parallel array pipelines (the array method `parallel()`, ADR-0039): part of the `$array` root, loaded
+// only for a file whose text contains a dot followed by `parallel(` (a comment or a string that does too only costs the
+// loading of that unit). The sources compiled into the compiler avoid that spelling, so the compiler does not load it.
+const PARALLEL_PRELUDE: string = "$array/parallel.or";
+
+// Does the file `path` with source `text` need the parallel prelude?
+@Ensures(result ==> path != PARALLEL_PRELUDE)
+export function usesParallel(path: string, text: string): bool {
+  return path != PARALLEL_PRELUDE && text.includes("." + "parallel(");
+}
+
 // True when unit `i` of `units` is the one `done` records for its path, for every unit: the index
 // map and the unit list describe the same set of files.
 function unitsIndexed(units: Unit[], done: Map<string, usize>): bool {
@@ -194,10 +205,13 @@ class Loader {
       return Err(ds[0]);
     }
     const parsed = pr.unwrap();
-    // The entry file also gets the implicit imports of the prelude roots, in front of its own items.
+    // The entry file also gets the implicit imports of the prelude roots, in front of its own items. A file that calls
+    // the array method `parallel()` also imports the parallel-pipeline prelude (ADR-0039), which is loaded only for such programs.
+    const noItems: Item[] = [];
+    const par = usesParallel(path, text.unwrap()) ? [this.parallelImport(file)] : noItems;
     const ast = file == 0
-        ? Module { file: parsed.file, items: this.preludeImports(file).concat(parsed.items) }
-        : parsed;
+        ? Module { file: parsed.file, items: this.preludeImports(file).concat(par).concat(parsed.items) }
+        : Module { file: parsed.file, items: par.concat(parsed.items) };
     this.stack.push(path);
     let imports: ImportTarget[] = [];
     for (const item of ast.items) {
@@ -230,6 +244,13 @@ class Loader {
     return this.roots
         .filter(r => r.entry != "")
         .map(r => IImport(ImportDecl { names: none, path: r.entry, pathSpan: sp, span: sp }));
+  }
+
+  // `import {} from "$array/parallel.or"`: the prelude of the array method `parallel()` (ADR-0039).
+  private parallelImport(file: usize): Item {
+    const sp = span(file, 0, 0);
+    const none: Ident[] = [];
+    return IImport(ImportDecl { names: none, path: PARALLEL_PRELUDE, pathSpan: sp, span: sp });
   }
 
   @Requires(isNormalized(importer))

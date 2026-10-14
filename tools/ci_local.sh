@@ -12,6 +12,7 @@ step "all suites (llvm)"       python3 tools/run_tests.py --orinc build/bootstra
 step "diff llvm"               python3 tools/diff_backends.py --mode llvm
 step "diff builtins"           python3 tools/diff_backends.py --mode builtins
 step "diff opt"                python3 tools/diff_backends.py --mode opt
+step "diff fuse"               python3 tools/diff_backends.py --mode fuse
 step "formatter"               python3 tools/test_fmt.py
 step "tooling"                 ./tools/test_tooling.sh
 step "lsp"                     python3 tools/test_lsp.py

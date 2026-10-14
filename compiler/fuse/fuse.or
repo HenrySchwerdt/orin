@@ -1,0 +1,2018 @@
+// Closure inlining and fusion of array pipelines (ADR-0038 §2, ADR-0039; docs/decisions/0038-performance-model.md
+// "Implementation status"). A HIR -> HIR pass between the checker and the lowering, run by the optimising pipeline of both
+// backends (`orin compile` without `--no-opt` / `--no-fuse`).
+//
+// WHAT IS FUSED. A chain of array-API calls whose functions are arrow functions or named functions at the call (an
+// `XClosure` literal) and pure (check/purity.or), for example `xs.filter(p).map(f).reduce(g, 0)`, becomes ONE loop over
+// `xs`: the closure bodies are inlined with their parameters bound to the element (a body that is not a `let`s-and-`return`
+// sequence is called directly instead, with its environment record built once), so there is no closure object, no
+// indirect call and no intermediate array. Stages: `map` and `filter` (any number, in any order), ended by `map`,
+// `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `forEach`, `includes` or `indexOf`. `some` / `every` / `find` /
+// `findIndex` / `includes` / `indexOf` leave the loop at the first hit. A `map` that ends a chain without a `filter` builds
+// its result with the exact capacity (the length of the input). A parallel chain (`parallel()` then the view's methods,
+// array/parallel.or) becomes one fused loop per chunk, passed to the `run*` function of the parallel prelude.
+//
+// WHAT IS NOT FUSED (the call stays a call of the prelude function; the rest of the chain is still fused around it):
+// * a function argument that is not a closure literal (a variable, a field, a call result): its effects are unknown;
+// * a closure that is not pure (I/O, or a call of something impure or unknown): its effects must stay in order;
+// * an extra argument (`reduce`'s initial value, the value of `includes` / `indexOf`) that is not a simple expression
+//   (literals, locals, fields, operators): fusing moves its evaluation before the stages run;
+// * an intermediate result used twice: only direct nesting is a chain (a result bound to a variable is a source);
+// * `sort`: a barrier, the chain is split there (the part before it and the part after it are fused separately);
+// * a parallel chain whose stages may trap before an early-exit terminal, or whose `reduce` element type is not a scalar
+//   or a string (the parallel prelude's own functions run it, with the same result).
+//
+// TRAPS (the decision, ADR-0038 §2 "Implementation status"). Pure closures can still trap (overflow, index out of bounds,
+// division by zero, unwrap of None). Fusion evaluates exactly the same (stage, element) pairs as the unfused chain, only in
+// a different order (element by element instead of stage by stage). So a fused chain traps if and only if the unfused
+// one does, with the same exit status; when two different stages would both trap, the one that comes first can differ, and
+// so can the message. That is accepted: a trap ends the program either way, and no existing test changed. Early exit
+// must not hide a trap: when a stage before an early-exit terminal may trap, the fused loop keeps running the stages to
+// the end after the hit (the terminal is no longer evaluated, as in the unfused chain); when they cannot trap it stops.
+//
+// The analysis of every chain is kept (`ChainInfo`, ADR-0042): its stages, whether and how it was fused, how many loops
+// over the data remain. A later complexity pass reads it from `FuseOut.chains`.
+
+import { Span } from "../diag";
+import {
+  Type, Program, Function, Local, RecordDef, FieldDef, HBlock, HStmt, HExpr, HExprKind, Place,
+  PlaceElem, HArm, HPattern, FieldInitH, BinOp, UnOp, Builtin, MutBuiltin, HLet, HAssign, HExprStmt,
+  HIf, HWhile, HForOf, HBreak, HContinue, HReturn, HBlockStmt,
+} from "../hir";
+import {
+  inferPurity, Purity, closureBody, prologueLength, returnedExpr, reducerKindIn, parallelOp,
+} from "../check";
+
+// ------------------------------------------------------------------------------------------------ the kept analysis
+
+// One chain found in the program, fused or not (ADR-0042 reads these).
+//   host      the function the chain is in
+//   span      the call that ends the chain
+//   stages    the operations from the source outwards, e.g. ["filter", "map", "reduce"] (for a parallel chain without
+//             "parallel" itself)
+//   parallel  a chain on the parallel view
+//   fused     the stages run in one loop (per chunk for a parallel chain)
+//   loops     passes over the data after the pass: 1 when fused, else one per stage
+//   earlyExit the loop stops at the first hit
+//   exactCap  the result array is allocated with its final size
+//   reason    why it was not fused ("" when it was)
+export type ChainInfo = {
+  host: string;
+  span: Span;
+  stages: string[];
+  parallel: bool;
+  fused: bool;
+  loops: usize;
+  earlyExit: bool;
+  exactCap: bool;
+  reason: string;
+};
+
+export type FuseOut = { program: Program; chains: ChainInfo[]; };
+
+// ------------------------------------------------------------------------------------------------ recognising calls
+
+// The array-API operation implemented by the prelude function `name`, "" for any other function.
+export function arrayOp(name: string): string {
+  const pre = "$array/array.";
+  if (!name.startsWith(pre)) {
+    return "";
+  }
+  const rest = name.substring(pre.length, name.length);
+  const ops = ["map", "filter", "reduce", "some", "every", "findIndex", "find", "forEach"];
+  for (const o of ops) {
+    if (rest.startsWith(o + "<")) {
+      return o;
+    }
+  }
+  if (rest.startsWith("indexOf")) {
+    return "indexOf";
+  }
+  if (rest.startsWith("includes")) {
+    return "includes";
+  }
+  return "";
+}
+
+// Operations that end a chain with a single value and may stop at the first hit.
+export function isEarlyExit(op: string): bool {
+  return op == "some"
+      || op == "every"
+      || op == "find"
+      || op == "findIndex"
+      || op == "includes"
+      || op == "indexOf";
+}
+
+// The arity of an operation's function argument (0 when it has none).
+function closureArity(op: string): usize {
+  if (op == "reduce") {
+    return 2;
+  }
+  if (op == "includes" || op == "indexOf" || op == "toArray") {
+    return 0;
+  }
+  return 1;
+}
+
+function isRefType(t: Type): bool {
+  return match (t) {
+    TyInt => false,
+    TyUsize => false,
+    TyIntK(_) => false,
+    TyBool => false,
+    TyFloat => false,
+    TyF32 => false,
+    TyFile => false,
+    TyGrant(_) => false,
+    TyVoid => false,
+    _ => true,
+  };
+}
+
+function elemOf(t: Type): Type {
+  return match (t) {
+    TyArray(e) => e,
+    _ => TyVoid,
+  };
+}
+
+// A value of type t that the fused per-chunk fold can start from before its first element (never read before it is
+// overwritten): scalars and strings only.
+function placeholder(t: Type, sp: Span): Option<HExpr> {
+  return match (t) {
+    TyInt => Some(mk(XInt(0), t, sp)),
+    TyUsize => Some(mk(XInt(0), t, sp)),
+    TyIntK(_) => Some(mk(XInt(0), t, sp)),
+    TyBool => Some(mk(XBool(false), t, sp)),
+    TyFloat => Some(mk(XFloat("0.0"), t, sp)),
+    TyF32 => Some(mk(XFloat("0.0"), t, sp)),
+    TyString => Some(mk(XStr(""), t, sp)),
+    _ => None,
+  };
+}
+
+function mk(k: HExprKind, t: Type, sp: Span): HExpr {
+  return HExpr { kind: k, ty: t, span: sp };
+}
+
+// ------------------------------------------------------------------------------------------------ expression facts
+
+// An expression that is evaluated without effects and without a trap (literals, locals, fields, non-trapping operators):
+// it may move before or after the stages of a chain.
+export function isSimple(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XFloat(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XLocal(_) => true,
+    XField(b, _, _) => isSimple(b),
+    XUnary(op, x) => match (op) {
+      UnNot => isSimple(x),
+      UnNeg => isFloatT(x.ty) && isSimple(x),
+    },
+    XBinary(op, a, b) => !binaryMayTrap(op, a, b) && isSimple(a) && isSimple(b),
+    XCond(c, a, b) => isSimple(c) && isSimple(a) && isSimple(b),
+    _ => false,
+  };
+}
+
+function isFloatT(t: Type): bool {
+  return match (t) {
+    TyFloat => true,
+    TyF32 => true,
+    _ => false,
+  };
+}
+
+function isIntT(t: Type): bool {
+  return match (t) {
+    TyInt => true,
+    TyUsize => true,
+    TyIntK(_) => true,
+    _ => false,
+  };
+}
+
+// Integer + - * can overflow, / and % can divide by zero (or overflow for MIN / -1); a division by a constant other than
+// 0 and -1 cannot trap.
+function binaryMayTrap(op: BinOp, a: HExpr, b: HExpr): bool {
+  if (!isIntT(a.ty)) {
+    return false;
+  }
+  return match (op) {
+    OpAdd => true,
+    OpSub => true,
+    OpMul => true,
+    OpDiv => !safeDivisor(b),
+    OpRem => !safeDivisor(b),
+    _ => false,
+  };
+}
+
+function safeDivisor(b: HExpr): bool {
+  return match (b.kind) {
+    XInt(v) => v != 0 && v != -1,
+    _ => false,
+  };
+}
+
+// Built-ins that never trap (and have no effect).
+function safeBuiltin(b: Builtin): bool {
+  return match (b) {
+    BStrLength => true,
+    BArrLength => true,
+    BStrIncludes => true,
+    BStrStartsWith => true,
+    BStrEndsWith => true,
+    BStrIndexOf => true,
+    BStrTrim => true,
+    BIntToString => true,
+    BUsizeToString => true,
+    BBoolToString => true,
+    BFloatToString => true,
+    BF32ToString => true,
+    BIntToFloat => true,
+    BUsizeToFloat => true,
+    BF32ToFloat => true,
+    BF32Round => true,
+    BFloatFloor => true,
+    BFloatCeil => true,
+    BFloatRound => true,
+    BFloatSqrt => true,
+    BFloatAbs => true,
+    BFloatPow => true,
+    BFloatIsNaN => true,
+    BFloatIsFinite => true,
+    BOptIsSome => true,
+    BOptIsNone => true,
+    BOptUnwrapOr => true,
+    BResIsOk => true,
+    BResIsErr => true,
+    BIntId => true,
+    BParseInt => true,
+    BParseFloat => true,
+    BParseIntK => true,
+    BIntChk => true,
+    _ => false,
+  };
+}
+
+// May evaluating `e` trap? Conservative: a call of a function, an index, an unwrap, a checked integer operation.
+export function mayTrap(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => false,
+    XFloat(_) => false,
+    XBool(_) => false,
+    XStr(_) => false,
+    XLocal(_) => false,
+    XUnary(op, x) => match (op) {
+      UnNot => mayTrap(x),
+      UnNeg => isIntT(x.ty) || mayTrap(x),
+    },
+    XBinary(op, a, b) => binaryMayTrap(op, a, b) || mayTrap(a) || mayTrap(b),
+    XBuiltin(b, args) => !safeBuiltin(b) || anyMayTrap(args),
+    XField(b, _, _) => mayTrap(b),
+    XRecord(_, spread, fields) => {
+      let t = false;
+      match (spread) {
+        Some(x) => {
+          t = mayTrap(x);
+        },
+        None => {},
+      }
+      for (const f of fields) {
+        if (mayTrap(f.value)) {
+          t = true;
+        }
+      }
+      return t;
+    },
+    XVariant(_, args) => anyMayTrap(args),
+    XArray(xs) => anyMayTrap(xs),
+    XCond(c, a, b) => mayTrap(c) || mayTrap(a) || mayTrap(b),
+    XClosure(_, caps) => anyMayTrap(caps),
+    _ => true,
+  };
+}
+
+function anyMayTrap(es: HExpr[]): bool {
+  for (const e of es) {
+    if (mayTrap(e)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stmtsMayTrap(ss: HStmt[]): bool {
+  for (const s of ss) {
+    const t = match (s) {
+      HLet(_, e) => mayTrap(e),
+      HReturn(o) => match (o) {
+        Some(e) => mayTrap(e),
+        None => false,
+      },
+      HExprStmt(e) => mayTrap(e),
+      _ => true,
+    };
+    if (t) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Does `e` mention local `l` (or leave its function: `?`)? Used to refuse bodies that cannot be inlined.
+function exprMentions(e: HExpr, l: usize): bool {
+  return match (e.kind) {
+    XLocal(k) => k == l,
+    XTry(_) => true,
+    XUnary(_, x) => exprMentions(x, l),
+    XBinary(_, a, b) => exprMentions(a, l) || exprMentions(b, l),
+    XCall(_, args) => anyMentions(args, l),
+    XBuiltin(_, args) => anyMentions(args, l),
+    XMutMethod(_, p, args) => p.root == l || placeMentions(p, l) || anyMentions(args, l),
+    XField(b, _, _) => exprMentions(b, l),
+    XIndex(a, b) => exprMentions(a, l) || exprMentions(b, l),
+    XRecord(_, spread, fields) => {
+      let m = false;
+      match (spread) {
+        Some(x) => {
+          m = exprMentions(x, l);
+        },
+        None => {},
+      }
+      for (const f of fields) {
+        if (exprMentions(f.value, l)) {
+          m = true;
+        }
+      }
+      return m;
+    },
+    XVariant(_, args) => anyMentions(args, l),
+    XArray(xs) => anyMentions(xs, l),
+    XCond(c, a, b) => exprMentions(c, l) || exprMentions(a, l) || exprMentions(b, l),
+    XMatch(x, arms) => {
+      if (exprMentions(x, l)) {
+        return true;
+      }
+      for (const a of arms) {
+        if (blockMentions(a.body, l)) {
+          return true;
+        }
+        match (a.value) {
+          Some(v) => {
+            if (exprMentions(v, l)) {
+              return true;
+            }
+          },
+          None => {},
+        }
+      }
+      return false;
+    },
+    XClosure(_, caps) => anyMentions(caps, l),
+    XCallIndirect(c, args) => exprMentions(c, l) || anyMentions(args, l),
+    XIface(_, v) => exprMentions(v, l),
+    XCallVirtual(r, _, args) => exprMentions(r, l) || anyMentions(args, l),
+    _ => false,
+  };
+}
+
+function anyMentions(es: HExpr[], l: usize): bool {
+  for (const e of es) {
+    if (exprMentions(e, l)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function placeMentions(p: Place, l: usize): bool {
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        if (exprMentions(ix, l)) {
+          return true;
+        }
+      },
+      _ => {},
+    }
+  }
+  return false;
+}
+
+// A nested block of a match arm: any `return` leaves the closure, so it counts as a mention (not inlinable).
+function blockMentions(b: HBlock, l: usize): bool {
+  for (const s of b.stmts) {
+    const m = match (s) {
+      HLet(_, e) => exprMentions(e, l),
+      HAssign(p, _, e) => p.root == l || placeMentions(p, l) || exprMentions(e, l),
+      HExprStmt(e) => exprMentions(e, l),
+      HIf(c, t, el) => exprMentions(c, l)
+          || blockMentions(t, l)
+          || match (el) {
+            Some(x) => blockMentions(x, l),
+            None => false,
+          },
+      HWhile(c, body) => exprMentions(c, l) || blockMentions(body, l),
+      HForOf(_, it, body) => exprMentions(it, l) || blockMentions(body, l),
+      HReturn(_) => true,
+      HBlockStmt(x) => blockMentions(x, l),
+      _ => false,
+    };
+    if (m) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The body of lifted closure `f` can be inlined: `let`s and one final `return e` (or, for a void closure, `let`s and
+// expression statements), none of which leaves the closure early or reads the environment parameter directly.
+function inlinable(f: Function, isVoidFn: bool): bool {
+  const body = closureBody(f);
+  if (!isVoidFn && body.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < body.length) {
+    const last = i + 1 == body.length;
+    const ok = match (body[i]) {
+      HLet(_, e) => !exprMentions(e, 0),
+      HExprStmt(e) => isVoidFn && !exprMentions(e, 0),
+      HReturn(o) => match (o) {
+        Some(e) => last && !isVoidFn && !exprMentions(e, 0),
+        None => false,
+      },
+      _ => false,
+    };
+    if (!ok) {
+      return false;
+    }
+    i += 1;
+  }
+  if (!isVoidFn) {
+    return returnedExpr(f).isSome() || endsWithReturn(body);
+  }
+  return true;
+}
+
+function endsWithReturn(body: HStmt[]): bool {
+  if (body.length == 0) {
+    return false;
+  }
+  return match (body[body.length - 1]) {
+    HReturn(o) => o.isSome(),
+    _ => false,
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ renaming locals
+
+// Local j >= 1 of an inlined closure becomes local base + j - 1 of the host.
+function rl(l: usize, base: usize): usize {
+  return base + l - 1;
+}
+
+function rnExprs(es: HExpr[], base: usize): HExpr[] {
+  let out: HExpr[] = [];
+  for (const e of es) {
+    out.push(rnExpr(e, base));
+  }
+  return out;
+}
+
+function rnPlace(p: Place, base: usize): Place {
+  let path: PlaceElem[] = [];
+  for (const el of p.path) {
+    path.push(
+      match (el) {
+        PIndex(ix) => PIndex(rnExpr(ix, base)),
+        _ => el,
+      },
+    );
+  }
+  return Place { root: rl(p.root, base), path: path, ty: p.ty };
+}
+
+function rnExpr(e: HExpr, base: usize): HExpr {
+  const k: HExprKind = match (e.kind) {
+    XLocal(l) => XLocal(rl(l, base)),
+    XUnary(op, x) => XUnary(op, rnExpr(x, base)),
+    XBinary(op, a, b) => XBinary(op, rnExpr(a, base), rnExpr(b, base)),
+    XCall(f, args) => XCall(f, rnExprs(args, base)),
+    XBuiltin(b, args) => XBuiltin(b, rnExprs(args, base)),
+    XMutMethod(m, p, args) => XMutMethod(m, rnPlace(p, base), rnExprs(args, base)),
+    XField(b, r, i) => XField(rnExpr(b, base), r, i),
+    XIndex(a, b) => XIndex(rnExpr(a, base), rnExpr(b, base)),
+    XRecord(r, spread, fields) => XRecord(r, rnOpt(spread, base), rnFields(fields, base)),
+    XVariant(t, args) => XVariant(t, rnExprs(args, base)),
+    XArray(xs) => XArray(rnExprs(xs, base)),
+    XTry(x) => XTry(rnExpr(x, base)),
+    XCond(c, a, b) => XCond(rnExpr(c, base), rnExpr(a, base), rnExpr(b, base)),
+    XMatch(x, arms) => XMatch(rnExpr(x, base), rnArms(arms, base)),
+    XClosure(f, caps) => XClosure(f, rnExprs(caps, base)),
+    XCallIndirect(c, args) => XCallIndirect(rnExpr(c, base), rnExprs(args, base)),
+    XIface(v, x) => XIface(v, rnExpr(x, base)),
+    XCallVirtual(r, s, args) => XCallVirtual(rnExpr(r, base), s, rnExprs(args, base)),
+    _ => e.kind,
+  };
+  return HExpr { kind: k, ty: e.ty, span: e.span };
+}
+
+function rnOpt(o: Option<HExpr>, base: usize): Option<HExpr> {
+  return match (o) {
+    Some(x) => Some(rnExpr(x, base)),
+    None => None,
+  };
+}
+
+function rnFields(fs: FieldInitH[], base: usize): FieldInitH[] {
+  let out: FieldInitH[] = [];
+  for (const f of fs) {
+    out.push(FieldInitH { index: f.index, value: rnExpr(f.value, base) });
+  }
+  return out;
+}
+
+function rnArms(arms: HArm[], base: usize): HArm[] {
+  let out: HArm[] = [];
+  for (const a of arms) {
+    out.push(HArm {
+      pattern: rnPattern(a.pattern, base),
+      body: rnBlock(a.body, base),
+      value: rnOpt(a.value, base),
+    });
+  }
+  return out;
+}
+
+function rnPattern(p: HPattern, base: usize): HPattern {
+  return match (p) {
+    HPVariant(tag, binds) => {
+      let bs: Option<usize>[] = [];
+      for (const b of binds) {
+        bs.push(
+          match (b) {
+            Some(l) => Some(rl(l, base)),
+            None => None,
+          },
+        );
+      }
+      return HPVariant(tag, bs);
+    },
+    _ => p,
+  };
+}
+
+function rnBlock(b: HBlock, base: usize): HBlock {
+  let out: HStmt[] = [];
+  for (const s of b.stmts) {
+    out.push(rnStmt(s, base));
+  }
+  return HBlock { stmts: out };
+}
+
+function rnStmt(s: HStmt, base: usize): HStmt {
+  return match (s) {
+    HLet(l, e) => HLet(rl(l, base), rnExpr(e, base)),
+    HAssign(p, op, e) => HAssign(rnPlace(p, base), op, rnExpr(e, base)),
+    HExprStmt(e) => HExprStmt(rnExpr(e, base)),
+    HIf(c, t, el) => HIf(
+      rnExpr(c, base),
+      rnBlock(t, base),
+      match (el) {
+        Some(x) => Some(rnBlock(x, base)),
+        None => None,
+      },
+    ),
+    HWhile(c, b) => HWhile(rnExpr(c, base), rnBlock(b, base)),
+    HForOf(l, it, b) => HForOf(rl(l, base), rnExpr(it, base), rnBlock(b, base)),
+    HReturn(o) => HReturn(rnOpt(o, base)),
+    HBlockStmt(b) => HBlockStmt(rnBlock(b, base)),
+    _ => s,
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ the pass
+
+// One stage of a chain: the operation, its function argument (a closure literal, or None for includes / indexOf), the
+// value argument (reduce's initial value, the needle of includes / indexOf), the type of the call.
+type Stage = { op: string; fid: usize; caps: HExpr[]; extra: Option<HExpr>; ty: Type; span: Span; };
+
+// A closure inlined into the host: where its locals start, and what each element needs.
+type Inl = { fid: usize; base: usize; inline: bool; env: usize; };
+
+// The fused loop being built: the statements before the loop and of the loop body.
+type Built = { pre: HStmt[]; body: HStmt[]; cur: HExpr; };
+
+// A stage bound before the loop, and the statements before the loop so far.
+type Bound = { inl: Inl; pre: HStmt[]; };
+
+// The functions of the parallel prelude a fused parallel chain calls.
+type ParFns = {
+  chunkCount: usize;
+  chunkStart: usize;
+  chunkEnd: usize;
+  workersFor: usize;
+  chunkIndex: usize;
+};
+
+@Invariant(this.hostLocals.length >= this.hostParams)
+class Fuser {
+  funcs: Function[];
+  records: RecordDef[];
+  pur: Purity;
+  chains: ChainInfo[];
+  host: string;
+  hostLocals: Local[];
+  hostParams: usize;
+  changed: bool;
+  nPar: usize;
+  par: Option<ParFns>;
+
+  constructor(funcs: Function[], records: RecordDef[], pur: Purity, par: Option<ParFns>) {
+    this.funcs = funcs;
+    this.records = records;
+    this.pur = pur;
+    this.chains = [];
+    this.host = "";
+    this.hostLocals = [];
+    this.hostParams = 0;
+    this.changed = false;
+    this.nPar = 0;
+    this.par = par;
+  }
+
+  // A new local of the function being built.
+  @Ensures(result == old(this.hostLocals.length)
+      && this.hostLocals.length == old(this.hostLocals.length) + 1)
+  newLocal(name: string, ty: Type, mutable: bool): usize {
+    const l = this.hostLocals.length;
+    this.hostLocals.push(Local { name: name, ty: ty, mutable: mutable });
+    return l;
+  }
+
+  // Rewrites function `fi`; the function is unchanged (the same value) when it has no fusable chain.
+  @Requires(fi < this.funcs.length)
+  @Ensures(result.paramCount == this.funcs[fi].paramCount && result.locals.length >= this.funcs[fi].locals.length)
+  rewrite(fi: usize): Function {
+    const f = this.funcs[fi];
+    this.host = f.name;
+    this.hostLocals = f.locals;
+    this.hostParams = f.paramCount;
+    this.changed = false;
+    const body = this.block(f.body);
+    if (!this.changed) {
+      return f;
+    }
+    return Function {
+      name: f.name,
+      paramCount: f.paramCount,
+      locals: this.hostLocals,
+      ret: f.ret,
+      body: body,
+      span: f.span,
+    };
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  block(b: HBlock): HBlock {
+    let out: HStmt[] = [];
+    for (const s of b.stmts) {
+      out.push(this.stmt(s));
+    }
+    return HBlock { stmts: out };
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  optBlock(o: Option<HBlock>): Option<HBlock> {
+    return match (o) {
+      Some(b) => Some(this.block(b)),
+      None => None,
+    };
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  stmt(s: HStmt): HStmt {
+    return match (s) {
+      HLet(l, e) => HLet(l, this.ex(e)),
+      HAssign(p, op, e) => HAssign(this.place(p), op, this.ex(e)),
+      HExprStmt(e) => HExprStmt(this.ex(e)),
+      HIf(c, t, el) => HIf(this.ex(c), this.block(t), this.optBlock(el)),
+      HWhile(c, b) => HWhile(this.ex(c), this.block(b)),
+      HForOf(l, it, b) => HForOf(l, this.ex(it), this.block(b)),
+      HReturn(o) => HReturn(this.opt(o)),
+      HBlockStmt(b) => HBlockStmt(this.block(b)),
+      _ => s,
+    };
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  opt(o: Option<HExpr>): Option<HExpr> {
+    return match (o) {
+      Some(x) => Some(this.ex(x)),
+      None => None,
+    };
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  exs(es: HExpr[]): HExpr[] {
+    let out: HExpr[] = [];
+    for (const e of es) {
+      out.push(this.ex(e));
+    }
+    return out;
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  place(p: Place): Place {
+    let path: PlaceElem[] = [];
+    for (const el of p.path) {
+      path.push(
+        match (el) {
+          PIndex(ix) => PIndex(this.ex(ix)),
+          _ => el,
+        },
+      );
+    }
+    return Place { root: p.root, path: path, ty: p.ty };
+  }
+
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  ex(e: HExpr): HExpr {
+    match (e.kind) {
+      XCall(fid, args) => {
+        if (fid < this.funcs.length) {
+          const name = this.funcs[fid].name;
+          if (arrayOp(name) != "") {
+            const r = this.seqChain(e);
+            if (r.isSome()) {
+              this.changed = true;
+              return r.unwrap();
+            }
+          } else if (parallelOp(name) != "" && parallelOp(name) != "toArray") {
+            const r = this.parChain(e);
+            if (r.isSome()) {
+              this.changed = true;
+              return r.unwrap();
+            }
+          }
+        }
+        return mk(XCall(fid, this.exs(args)), e.ty, e.span);
+      },
+      _ => {},
+    }
+    const k: HExprKind = match (e.kind) {
+      XUnary(op, x) => XUnary(op, this.ex(x)),
+      XBinary(op, a, b) => XBinary(op, this.ex(a), this.ex(b)),
+      XBuiltin(b, args) => XBuiltin(b, this.exs(args)),
+      XMutMethod(m, p, args) => XMutMethod(m, this.place(p), this.exs(args)),
+      XField(b, r, i) => XField(this.ex(b), r, i),
+      XIndex(a, b) => XIndex(this.ex(a), this.ex(b)),
+      XRecord(r, spread, fields) => XRecord(r, this.opt(spread), this.fields(fields)),
+      XVariant(t, args) => XVariant(t, this.exs(args)),
+      XArray(xs) => XArray(this.exs(xs)),
+      XTry(x) => XTry(this.ex(x)),
+      XCond(c, a, b) => XCond(this.ex(c), this.ex(a), this.ex(b)),
+      XMatch(x, arms) => XMatch(this.ex(x), this.arms(arms)),
+      XClosure(f, caps) => XClosure(f, this.exs(caps)),
+      XCallIndirect(c, args) => XCallIndirect(this.ex(c), this.exs(args)),
+      XIface(v, x) => XIface(v, this.ex(x)),
+      XCallVirtual(r, s, args) => XCallVirtual(this.ex(r), s, this.exs(args)),
+      _ => e.kind,
+    };
+    return mk(k, e.ty, e.span);
+  }
+
+  fields(fs: FieldInitH[]): FieldInitH[] {
+    let out: FieldInitH[] = [];
+    for (const f of fs) {
+      out.push(FieldInitH { index: f.index, value: this.ex(f.value) });
+    }
+    return out;
+  }
+
+  arms(arms: HArm[]): HArm[] {
+    let out: HArm[] = [];
+    for (const a of arms) {
+      out.push(HArm { pattern: a.pattern, body: this.block(a.body), value: this.opt(a.value) });
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------------------------- stages
+
+  // The stage of call `e` (an operation `op` of the array API or of the parallel view), or why it cannot be a fused stage.
+  stageOf(e: HExpr, op: string): Result<Stage, string> {
+    const args = argsOf(e);
+    const ar = closureArity(op);
+    if (ar == 0) {
+      if (op == "toArray" || args.length < 2) {
+        const none: HExpr[] = [];
+        return Ok(Stage { op: op, fid: 0, caps: none, extra: None, ty: e.ty, span: e.span });
+      }
+      if (!isSimple(args[1])) {
+        return Err("the value argument is not a simple expression");
+      }
+      const none2: HExpr[] = [];
+      return Ok(Stage {
+        op: op,
+        fid: 0,
+        caps: none2,
+        extra: Some(args[1]),
+        ty: e.ty,
+        span: e.span,
+      });
+    }
+    if (args.length < 2) {
+      return Err("malformed call");
+    }
+    match (args[1].kind) {
+      XClosure(fid, caps) => {
+        if (fid >= this.funcs.length || fid >= this.pur.impure.length) {
+          return Err("unknown function");
+        }
+        const f = this.funcs[fid];
+        if (f.paramCount != ar + 1 || prologueLength(f) != caps.length) {
+          return Err("the closure has an unexpected shape");
+        }
+        if (!this.pur.reached[fid] || this.pur.impure[fid] || this.pur.applied[fid].length > 0) {
+          return Err("the function is not pure");
+        }
+        let extra: Option<HExpr> = None;
+        if (op == "reduce") {
+          if (args.length < 3 || !isSimple(args[2])) {
+            return Err("the initial value is not a simple expression");
+          }
+          extra = Some(args[2]);
+        }
+        return Ok(Stage { op: op, fid: fid, caps: caps, extra: extra, ty: e.ty, span: e.span });
+      },
+      _ => {
+        return Err("the function argument is not a closure literal");
+      },
+    }
+  }
+
+  // May the closure of stage s trap on an element?
+  stageMayTrap(s: Stage): bool {
+    if (closureArity(s.op) == 0) {
+      return false;
+    }
+    return stmtsMayTrap(closureBody(this.funcs[s.fid]));
+  }
+
+  // Binds the captures of stage s (before the loop): its closure's locals become host locals.
+  @Requires(s.fid < this.funcs.length)
+  @Ensures(result.inl.base == old(this.hostLocals.length) && result.pre.length >= pre0.length)
+  bindStage(s: Stage, pre0: HStmt[]): Bound {
+    let pre = pre0;
+    const f = this.funcs[s.fid];
+    const base = this.hostLocals.length;
+    let j: usize = 1;
+    while (j < f.locals.length) {
+      const lc = f.locals[j];
+      this.newLocal(lc.name, lc.ty, lc.mutable);
+      j += 1;
+    }
+    const isVoidFn = match (f.ret) {
+      TyVoid => true,
+      _ => false,
+    };
+    const inl = inlinable(f, isVoidFn);
+    let env: usize = 0;
+    if (inl) {
+      let k: usize = 0;
+      while (k < prologueLength(f)) {
+        match (f.body.stmts[k]) {
+          HLet(l, init) => {
+            const fi = match (init.kind) {
+              XField(_, _, i) => i,
+              _ => k,
+            };
+            pre.push(HLet(rl(l, base), s.caps[fi]));
+          },
+          _ => {},
+        }
+        k += 1;
+      }
+    } else {
+      // called directly: its environment record is built once
+      const envTy = f.locals[0].ty;
+      const rid = match (envTy) {
+        TyRecord(r) => r,
+        _ => 0,
+      };
+      let fields: FieldInitH[] = [];
+      let k2: usize = 0;
+      while (k2 < s.caps.length) {
+        fields.push(FieldInitH { index: k2, value: s.caps[k2] });
+        k2 += 1;
+      }
+      env = this.newLocal("env$fuse", envTy, false);
+      pre.push(HLet(env, mk(XRecord(rid, None, fields), envTy, s.span)));
+    }
+    return Bound { inl: Inl { fid: s.fid, base: base, inline: inl, env: env }, pre: pre };
+  }
+
+  // Applies the closure of `inl` to the arguments (values of the element, of the accumulator): statements that bind its
+  // parameters and run its body, and the value it returns (a void closure: XBool(false), unused).
+  apply(inl: Inl, args: HExpr[], sp: Span, body0: HStmt[]): Built {
+    let body = body0;
+    const f = this.funcs[inl.fid];
+    if (!inl.inline) {
+      let all: HExpr[] = [mk(XLocal(inl.env), f.locals[0].ty, sp)];
+      for (const a of args) {
+        all.push(a);
+      }
+      const none: HStmt[] = [];
+      return Built { pre: none, body: body, cur: mk(XCall(inl.fid, all), f.ret, sp) };
+    }
+    let p: usize = 0;
+    while (p < args.length) {
+      body.push(HLet(rl(p + 1, inl.base), args[p]));
+      p += 1;
+    }
+    let value = mk(XBool(false), TyBool, sp);
+    for (const st of closureBody(f)) {
+      match (st) {
+        HReturn(o) => {
+          match (o) {
+            Some(e) => {
+              value = rnExpr(e, inl.base);
+            },
+            None => {},
+          }
+        },
+        _ => {
+          body.push(rnStmt(st, inl.base));
+        },
+      }
+    }
+    const none2: HStmt[] = [];
+    return Built { pre: none2, body: body, cur: value };
+  }
+
+  // The value `v` held in a fresh immutable local (so that it is evaluated once per element).
+  @Ensures(this.hostLocals.length <= old(this.hostLocals.length) + 1 && result.body.length >= body0.length)
+  hold(name: string, v: HExpr, body0: HStmt[]): Built {
+    let body = body0;
+    const none: HStmt[] = [];
+    match (v.kind) {
+      XLocal(_) => {
+        return Built { pre: none, body: body, cur: v };
+      },
+      _ => {},
+    }
+    const l = this.newLocal(name, v.ty, false);
+    body.push(HLet(l, v));
+    return Built { pre: none, body: body, cur: mk(XLocal(l), v.ty, v.span) };
+  }
+
+  // ---------------------------------------------------------------------------------------------- sequential chains
+
+  // The stages of the chain ended by `e`, from the source outwards, and the source; None when `e` itself cannot be fused.
+  collect(e: HExpr, parallel: bool): Result<Stage[], string> {
+    const op0 = this.opOf(e, parallel);
+    const s0 = this.stageOf(e, op0)?;
+    let top: Stage[] = [s0];
+    let cur = argZero(e);
+    let more = true;
+    while (more) {
+      const op = this.opOf(cur, parallel);
+      if (op == "map" || op == "filter") {
+        match (this.stageOf(cur, op)) {
+          Ok(s) => {
+            top.push(s);
+            cur = argZero(cur);
+          },
+          Err(_) => {
+            more = false;
+          },
+        }
+      } else {
+        more = false;
+      }
+    }
+    let out: Stage[] = [];
+    let i = top.length;
+    while (i > 0) {
+      i -= 1;
+      out.push(top[i]);
+    }
+    return Ok(out);
+  }
+
+  opOf(e: HExpr, parallel: bool): string {
+    return match (e.kind) {
+      XCall(fid, _) => fid < this.funcs.length
+          ? parallel ? parallelOp(this.funcs[fid].name) : arrayOp(this.funcs[fid].name)
+          : "",
+      _ => "",
+    };
+  }
+
+  // The innermost call's receiver (the source of the chain whose outermost call is `e`).
+  sourceOf(e: HExpr, depth: usize): HExpr {
+    let cur = e;
+    let d: usize = 0;
+    while (d < depth) {
+      cur = argZero(cur);
+      d += 1;
+    }
+    return cur;
+  }
+
+  @Ensures(this.chains.length == old(this.chains.length) + 1)
+  record(
+    span: Span,
+    stages: Stage[],
+    parallel: bool,
+    fused: bool,
+    exactCap: bool,
+    reason: string,
+  ): void {
+    let names: string[] = [];
+    for (const s of stages) {
+      names.push(s.op);
+    }
+    const term = stages.length > 0 ? stages[stages.length - 1].op : "";
+    this.chains.push(ChainInfo {
+      host: this.host,
+      span: span,
+      stages: names,
+      parallel: parallel,
+      fused: fused,
+      loops: fused ? 1 : stages.length,
+      earlyExit: fused && isEarlyExit(term),
+      exactCap: exactCap,
+      reason: reason,
+    });
+  }
+
+  // `e` (an array-API call) as a fused loop, or None.
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  seqChain(e: HExpr): Option<HExpr> {
+    const sc = this.collect(e, false);
+    if (sc.isErr()) {
+      const noCaps: HExpr[] = [];
+      let one: Stage[] = [
+        Stage {
+          op: arrayOp(this.nameOf(e)),
+          fid: 0,
+          caps: noCaps,
+          extra: None,
+          ty: e.ty,
+          span: e.span,
+        },
+      ];
+      this.record(e.span, one, false, false, false, sc.unwrapErr());
+      return None;
+    }
+    const stages = sc.unwrap();
+    const src = this.ex(this.sourceOf(e, stages.length));
+    const sp = e.span;
+    const term = stages[stages.length - 1];
+    let pre: HStmt[] = [];
+    const elemTy = elemOf(src.ty);
+    const srcL = this.newLocal("src$fuse", src.ty, false);
+    pre.push(HLet(srcL, src));
+    // captures and value arguments, in source order (the closures are created in that order)
+    let inls: Inl[] = [];
+    for (const s of stages) {
+      if (closureArity(s.op) > 0) {
+        const bd = this.bindStage(s, pre);
+        pre = bd.pre;
+        inls.push(bd.inl);
+      } else {
+        inls.push(Inl { fid: 0, base: 0, inline: true, env: 0 });
+      }
+    }
+    let extraL: usize = 0;
+    match (term.extra) {
+      Some(x) => {
+        extraL = this.newLocal(
+          term.op == "reduce" ? "acc$fuse" : "needle$fuse",
+          x.ty,
+          term.op == "reduce",
+        );
+        pre.push(HLet(extraL, x));
+      },
+      None => {},
+    }
+    // a stage before an early-exit terminal that may trap: keep running the stages after the hit
+    let upstreamTraps = false;
+    let i: usize = 0;
+    while (i + 1 < stages.length) {
+      if (this.stageMayTrap(stages[i])) {
+        upstreamTraps = true;
+      }
+      i += 1;
+    }
+    const early = isEarlyExit(term.op);
+    const keepGoing = early && upstreamTraps;
+    let hasFilter = false;
+    for (const s of stages) {
+      if (s.op == "filter") {
+        hasFilter = true;
+      }
+    }
+    // the result
+    const resTy = term.ty;
+    let resL: usize = 0;
+    let exactCap = false;
+    if (term.op == "map" || term.op == "filter") {
+      resL = this.newLocal("out$fuse", resTy, true);
+      if (term.op == "map" && !hasFilter) {
+        exactCap = true;
+        const n = mk(XBuiltin(BArrLength, [mk(XLocal(srcL), src.ty, sp)]), TyUsize, sp);
+        const isRef = mk(XInt(isRefType(elemOf(resTy)) ? 1 : 0), TyUsize, sp);
+        pre.push(HLet(resL, mk(XBuiltin(BTask(24), [n, isRef]), resTy, sp)));
+      } else {
+        pre.push(HLet(resL, mk(XArray([]), resTy, sp)));
+      }
+    } else if (term.op == "reduce") {
+      resL = extraL;
+    } else if (term.op == "some" || term.op == "includes") {
+      resL = this.newLocal("found$fuse", TyBool, true);
+      pre.push(HLet(resL, mk(XBool(false), TyBool, sp)));
+    } else if (term.op == "every") {
+      resL = this.newLocal("all$fuse", TyBool, true);
+      pre.push(HLet(resL, mk(XBool(true), TyBool, sp)));
+    } else if (term.op == "find" || term.op == "findIndex" || term.op == "indexOf") {
+      resL = this.newLocal("hit$fuse", resTy, true);
+      pre.push(HLet(resL, mk(XVariant(1, []), resTy, sp)));
+    }
+    let countL: usize = 0;
+    if (term.op == "findIndex" || term.op == "indexOf") {
+      countL = this.newLocal("i$fuse", TyUsize, true);
+      pre.push(HLet(countL, mk(XInt(0), TyUsize, sp)));
+    }
+    let doneL: usize = 0;
+    if (keepGoing) {
+      doneL = this.newLocal("done$fuse", TyBool, true);
+      pre.push(HLet(doneL, mk(XBool(false), TyBool, sp)));
+    }
+    // the loop body: the stages before the terminal
+    const xL = this.newLocal("x$fuse", elemTy, false);
+    let body: HStmt[] = [];
+    let cur = mk(XLocal(xL), elemTy, sp);
+    i = 0;
+    while (i + 1 < stages.length) {
+      const s = stages[i];
+      const b = this.apply(inls[i], [cur], sp, body);
+      body = b.body;
+      if (s.op == "filter") {
+        const notP = mk(XUnary(UnNot, b.cur), TyBool, sp);
+        body.push(HIf(notP, HBlock { stmts: [HContinue] }, None));
+      } else {
+        const h = this.hold("m$fuse", b.cur, body);
+        body = h.body;
+        cur = h.cur;
+      }
+      i += 1;
+    }
+    // the terminal
+    let tstmts: HStmt[] = [];
+    const tinl = inls[stages.length - 1];
+    const stopStmts: HStmt[] = keepGoing ? [setBool(doneL, true, sp)] : [HBreak];
+    if (term.op == "map") {
+      const b = this.apply(tinl, [cur], sp, tstmts);
+      tstmts = b.body;
+      tstmts.push(push(resL, resTy, b.cur, sp));
+    } else if (term.op == "filter") {
+      const b = this.apply(tinl, [cur], sp, tstmts);
+      tstmts = b.body;
+      tstmts.push(HIf(b.cur, HBlock { stmts: [push(resL, resTy, cur, sp)] }, None));
+    } else if (term.op == "forEach") {
+      const b = this.apply(tinl, [cur], sp, tstmts);
+      tstmts = b.body;
+      match (b.cur.kind) {
+        XBool(_) => {},
+        _ => {
+          tstmts.push(HExprStmt(b.cur));
+        },
+      }
+    } else if (term.op == "reduce") {
+      const accTy = this.hostLocals[resL].ty;
+      const b = this.apply(tinl, [mk(XLocal(resL), accTy, sp), cur], sp, tstmts);
+      tstmts = b.body;
+      tstmts.push(HAssign(Place { root: resL, path: [], ty: accTy }, None, b.cur));
+    } else if (term.op == "some" || term.op == "every" || term.op == "find" || term.op == "findIndex") {
+      const b = this.apply(tinl, [cur], sp, tstmts);
+      tstmts = b.body;
+      const test = term.op == "every" ? mk(XUnary(UnNot, b.cur), TyBool, sp) : b.cur;
+      let hit: HStmt[] = [];
+      if (term.op == "some") {
+        hit.push(setBool(resL, true, sp));
+      } else if (term.op == "every") {
+        hit.push(setBool(resL, false, sp));
+      } else if (term.op == "find") {
+        hit.push(
+          HAssign(
+            Place { root: resL, path: [], ty: resTy },
+            None,
+            mk(XVariant(0, [cur]), resTy, sp),
+          ),
+        );
+      } else {
+        hit.push(
+          HAssign(
+            Place { root: resL, path: [], ty: resTy },
+            None,
+            mk(XVariant(0, [mk(XLocal(countL), TyUsize, sp)]), resTy, sp),
+          ),
+        );
+      }
+      for (const st of stopStmts) {
+        hit.push(st);
+      }
+      tstmts.push(HIf(test, HBlock { stmts: hit }, None));
+      if (term.op == "findIndex") {
+        tstmts.push(incr(countL, sp));
+      }
+    } else if (term.op == "includes" || term.op == "indexOf") {
+      const needle = mk(XLocal(extraL), this.hostLocals[extraL].ty, sp);
+      const test = mk(XBinary(OpEq, cur, needle), TyBool, sp);
+      let hit: HStmt[] = [];
+      if (term.op == "includes") {
+        hit.push(setBool(resL, true, sp));
+      } else {
+        hit.push(
+          HAssign(
+            Place { root: resL, path: [], ty: resTy },
+            None,
+            mk(XVariant(0, [mk(XLocal(countL), TyUsize, sp)]), resTy, sp),
+          ),
+        );
+      }
+      for (const st of stopStmts) {
+        hit.push(st);
+      }
+      tstmts.push(HIf(test, HBlock { stmts: hit }, None));
+      if (term.op == "indexOf") {
+        tstmts.push(incr(countL, sp));
+      }
+    }
+    if (keepGoing) {
+      const notDone = mk(XUnary(UnNot, mk(XLocal(doneL), TyBool, sp)), TyBool, sp);
+      body.push(HIf(notDone, HBlock { stmts: tstmts }, None));
+    } else {
+      for (const st of tstmts) {
+        body.push(st);
+      }
+    }
+    pre.push(HForOf(xL, mk(XLocal(srcL), src.ty, sp), HBlock { stmts: body }));
+    this.record(sp, stages, false, true, exactCap, "");
+    const isVoidT = match (resTy) {
+      TyVoid => true,
+      _ => false,
+    };
+    const value: Option<HExpr> = isVoidT ? None : Some(mk(XLocal(resL), resTy, sp));
+    return Some(blockExpr(pre, value, resTy, sp));
+  }
+
+  nameOf(e: HExpr): string {
+    return match (e.kind) {
+      XCall(fid, _) => fid < this.funcs.length ? this.funcs[fid].name : "",
+      _ => "",
+    };
+  }
+
+  // ---------------------------------------------------------------------------------------------- parallel chains
+
+  // The callee of the first call in function `fi`'s body whose name starts with `prefix`.
+  calleeIn(fi: usize, prefix: string): Option<usize> {
+    return findCall(this.funcs, this.funcs[fi].body, prefix);
+  }
+
+  // `e` (an operation of the parallel view, not toArray) as one fused loop per chunk, or None.
+  @Ensures(this.hostLocals.length >= old(this.hostLocals.length) && this.chains.length >= old(this.chains.length))
+  parChain(e: HExpr): Option<HExpr> {
+    if (this.par.isNone()) {
+      return None;
+    }
+    const pf = this.par.unwrap();
+    const sc = this.collect(e, true);
+    if (sc.isErr()) {
+      return None;
+    }
+    const stages = sc.unwrap();
+    const bottom = this.sourceOf(e, stages.length);
+    // the source must be `parallel(xs)` itself
+    let xs: Option<HExpr> = None;
+    match (bottom.kind) {
+      XCall(fid, args) => {
+        if (fid < this.funcs.length
+            && this.funcs[fid].name.startsWith("$array/parallel.parallel<")
+            && args.length == 1) {
+          xs = Some(args[0]);
+        }
+      },
+      _ => {},
+    }
+    if (xs.isNone()) {
+      this.record(
+        e.span,
+        stages,
+        true,
+        false,
+        false,
+        "the source is not a direct call of parallel()",
+      );
+      return None;
+    }
+    const term = stages[stages.length - 1];
+    let upstreamTraps = false;
+    let i: usize = 0;
+    while (i + 1 < stages.length) {
+      if (this.stageMayTrap(stages[i])) {
+        upstreamTraps = true;
+      }
+      i += 1;
+    }
+    if (isEarlyExit(term.op) && upstreamTraps) {
+      this.record(e.span, stages, true, false, false, "a stage before an early exit may trap");
+      return None;
+    }
+    // the run function of the terminal, found in the prelude function the call goes to
+    const tfid = match (e.kind) {
+      XCall(fid, _) => fid,
+      _ => 0,
+    };
+    const runName = term.op == "map" || term.op == "filter"
+        ? "runCollect<"
+        : term.op == "reduce"
+            ? "runReduce<"
+            : term.op == "some" || term.op == "every"
+                ? "runAny"
+                : term.op == "find" ? "runFind<" : "runFindIndex";
+    const run = this.calleeIn(tfid, "$array/parallel." + runName);
+    if (run.isNone()) {
+      this.record(e.span, stages, true, false, false, "internal: no run function");
+      return None;
+    }
+    const resTy = term.ty;
+    let foldTy: Type = TyVoid;
+    if (term.op == "reduce") {
+      foldTy = resTy;
+      if (placeholder(foldTy, e.span).isNone()) {
+        this.record(
+          e.span,
+          stages,
+          true,
+          false,
+          false,
+          "the reduce element type is not a scalar or a string",
+        );
+        return None;
+      }
+    }
+    const sp = e.span;
+    const src = this.ex(xs.unwrap());
+    const elemTy = elemOf(src.ty);
+    // in the host: the source, the captures (snapshot), the extra argument, the chunk count, the workers, the lend
+    let pre: HStmt[] = [];
+    const srcL = this.newLocal("src$par", src.ty, false);
+    pre.push(HLet(srcL, src));
+    let capVals: HExpr[] = [mk(XLocal(srcL), src.ty, sp)];
+    let capTys: Type[] = [src.ty];
+    for (const s of stages) {
+      for (const c of s.caps) {
+        const l = this.newLocal("cap$par", c.ty, false);
+        pre.push(HLet(l, c));
+        capVals.push(mk(XLocal(l), c.ty, sp));
+        capTys.push(c.ty);
+      }
+    }
+    let extra: Option<HExpr> = None;
+    match (term.extra) {
+      Some(x) => {
+        const l = this.newLocal("init$par", x.ty, false);
+        pre.push(HLet(l, x));
+        extra = Some(mk(XLocal(l), x.ty, sp));
+      },
+      None => {},
+    }
+    const n = mk(XBuiltin(BArrLength, [mk(XLocal(srcL), src.ty, sp)]), TyUsize, sp);
+    const nkL = this.newLocal("chunks$par", TyUsize, false);
+    pre.push(HLet(nkL, mk(XCall(pf.chunkCount, [n]), TyUsize, sp)));
+    const nk = mk(XLocal(nkL), TyUsize, sp);
+    const wL = this.newLocal("workers$par", TyUsize, false);
+    pre.push(HLet(wL, mk(XCall(pf.workersFor, [n, nk]), TyUsize, sp)));
+    const w = mk(XLocal(wL), TyUsize, sp);
+    const lentRid = this.records.length;
+    this.records.push(RecordDef {
+      name: this.host + "$lent" + this.nPar.toString(),
+      fields: [FieldDef { name: "v", ty: src.ty }, FieldDef { name: "spare", ty: TyUsize }],
+    });
+    const lent = mk(
+      XRecord(
+        lentRid,
+        None,
+        [
+          FieldInitH { index: 0, value: mk(XLocal(srcL), src.ty, sp) },
+          FieldInitH { index: 1, value: mk(XInt(0), TyUsize, sp) },
+        ],
+      ),
+      TyRecord(lentRid),
+      sp,
+    );
+    const tokL = this.newLocal("lend$par", TyUsize, false);
+    const many = mk(XBinary(OpGt, w, mk(XInt(1), TyUsize, sp)), TyBool, sp);
+    pre.push(
+      HLet(
+        tokL,
+        mk(
+          XCond(many, mk(XBuiltin(BTask(9), [lent]), TyUsize, sp), mk(XInt(0), TyUsize, sp)),
+          TyUsize,
+          sp,
+        ),
+      ),
+    );
+    // the chunk function and its closure
+    const chunkTy = this.funcs[run.unwrap()].locals.length > 2
+        ? this.bodyTypeOf(run.unwrap())
+        : TyVoid;
+    const cf = this.chunkFunction(stages, src.ty, elemTy, capTys, chunkTy, foldTy, pf, sp);
+    const clo = mk(XClosure(cf.fid, capVals), TyFn([TyUsize], chunkTy), sp);
+    let runArgs: HExpr[] = [nk, w, clo];
+    if (term.op == "reduce") {
+      runArgs.push(this.reducerClosure(e));
+      runArgs.push(extra.unwrap());
+    }
+    const resL = this.newLocal("res$par", this.funcs[run.unwrap()].ret, false);
+    pre.push(HLet(resL, mk(XCall(run.unwrap(), runArgs), this.funcs[run.unwrap()].ret, sp)));
+    const tok = mk(XLocal(tokL), TyUsize, sp);
+    pre.push(
+      HIf(
+        mk(XBinary(OpNe, tok, mk(XInt(0), TyUsize, sp)), TyBool, sp),
+        HBlock { stmts: [HExprStmt(mk(XBuiltin(BTask(11), [tok]), TyVoid, sp))] },
+        None,
+      ),
+    );
+    let value = mk(XLocal(resL), resTy, sp);
+    if (term.op == "every") {
+      value = mk(XUnary(UnNot, value), TyBool, sp);
+    }
+    this.nPar += 1;
+    this.record(sp, stages, true, true, false, "");
+    return Some(blockExpr(pre, Some(value), resTy, sp));
+  }
+
+  // The reducer closure of a parallel reduce call `e` (argument 1, a closure literal whose captures are locals).
+  reducerClosure(e: HExpr): HExpr {
+    return match (e.kind) {
+      XCall(_, args) => args[1],
+      _ => e,
+    };
+  }
+
+  // The result type of the `body` parameter of run function `fi` (its third parameter, a function type).
+  bodyTypeOf(fi: usize): Type {
+    return match (this.funcs[fi].locals[2].ty) {
+      TyFn(_, r) => r,
+      _ => TyVoid,
+    };
+  }
+
+  // A new lifted function `(env, k) => <the fused loop over chunk k>` for the stages, and its environment record (the
+  // source array, then the captures of every stage in order).
+  @Ensures(result.fid == old(this.funcs.length) && this.funcs.length == old(this.funcs.length) + 1)
+  @Ensures(this.hostLocals.length == old(this.hostLocals.length))
+  chunkFunction(
+    stages: Stage[],
+    srcTy: Type,
+    elemTy: Type,
+    capTys: Type[],
+    chunkTy: Type,
+    foldTy: Type,
+    pf: ParFns,
+    sp: Span,
+  ): Inl {
+    const saveLocals = this.hostLocals;
+    const saveParams = this.hostParams;
+    const name = this.host + "$par" + this.nPar.toString();
+    const envRid = this.records.length;
+    let fields: FieldDef[] = [];
+    let ci: usize = 0;
+    while (ci < capTys.length) {
+      fields.push(FieldDef { name: "c" + ci.toString(), ty: capTys[ci] });
+      ci += 1;
+    }
+    this.records.push(RecordDef { name: name + "$env", fields: fields });
+    const envTy = TyRecord(envRid);
+    this.hostLocals = [
+      Local { name: "env$", ty: envTy, mutable: false },
+      Local { name: "k", ty: TyUsize, mutable: false },
+    ];
+    this.hostParams = 2;
+    let pre: HStmt[] = [];
+    const envE = mk(XLocal(0), envTy, sp);
+    const srcL = this.newLocal("src", srcTy, false);
+    pre.push(HLet(srcL, mk(XField(envE, envRid, 0), srcTy, sp)));
+    // the stages' locals; their captures come from the environment record
+    let inls: Inl[] = [];
+    let field: usize = 1;
+    for (const s of stages) {
+      if (closureArity(s.op) == 0) {
+        inls.push(Inl { fid: 0, base: 0, inline: true, env: 0 });
+        continue;
+      }
+      let caps: HExpr[] = [];
+      for (const c of s.caps) {
+        caps.push(mk(XField(envE, envRid, field), c.ty, sp));
+        field += 1;
+      }
+      const s2 = Stage { op: s.op, fid: s.fid, caps: caps, extra: s.extra, ty: s.ty, span: s.span };
+      const bd = this.bindStage(s2, pre);
+      pre = bd.pre;
+      inls.push(bd.inl);
+    }
+    const kE = mk(XLocal(1), TyUsize, sp);
+    const iL = this.newLocal("i", TyUsize, true);
+    pre.push(HLet(iL, mk(XCall(pf.chunkStart, [kE]), TyUsize, sp)));
+    const hiL = this.newLocal("hi", TyUsize, false);
+    const n = mk(XBuiltin(BArrLength, [mk(XLocal(srcL), srcTy, sp)]), TyUsize, sp);
+    pre.push(HLet(hiL, mk(XCall(pf.chunkEnd, [kE, n]), TyUsize, sp)));
+    const term = stages[stages.length - 1];
+    // the chunk's result
+    let resL: usize = 0;
+    let hasL: usize = 0;
+    let cntL: usize = 0;
+    if (term.op == "map" || term.op == "filter") {
+      resL = this.newLocal("out", chunkTy, true);
+      pre.push(HLet(resL, mk(XArray([]), chunkTy, sp)));
+    } else if (term.op == "reduce") {
+      resL = this.newLocal("acc", foldTy, true);
+      pre.push(HLet(resL, placeholder(foldTy, sp).unwrap()));
+      hasL = this.newLocal("has", TyBool, true);
+      pre.push(HLet(hasL, mk(XBool(false), TyBool, sp)));
+    } else if (term.op == "some" || term.op == "every") {
+      resL = this.newLocal("found", TyBool, true);
+      pre.push(HLet(resL, mk(XBool(false), TyBool, sp)));
+    } else if (term.op == "find") {
+      resL = this.newLocal("hit", chunkTy, true);
+      pre.push(HLet(resL, mk(XVariant(1, []), chunkTy, sp)));
+    } else {
+      resL = this.newLocal("at", TyOption(TyUsize), true);
+      pre.push(HLet(resL, mk(XVariant(1, []), TyOption(TyUsize), sp)));
+      cntL = this.newLocal("count", TyUsize, true);
+      pre.push(HLet(cntL, mk(XInt(0), TyUsize, sp)));
+    }
+    // the loop: while (i < hi) { const x = src[i]; i += 1; stages; terminal }
+    const xL = this.newLocal("x", elemTy, false);
+    let body: HStmt[] = [];
+    body.push(
+      HLet(xL, mk(XIndex(mk(XLocal(srcL), srcTy, sp), mk(XLocal(iL), TyUsize, sp)), elemTy, sp)),
+    );
+    body.push(incr(iL, sp));
+    let cur = mk(XLocal(xL), elemTy, sp);
+    let i: usize = 0;
+    while (i + 1 < stages.length) {
+      const b = this.apply(inls[i], [cur], sp, body);
+      body = b.body;
+      if (stages[i].op == "filter") {
+        body.push(HIf(mk(XUnary(UnNot, b.cur), TyBool, sp), HBlock { stmts: [HContinue] }, None));
+      } else {
+        const h = this.hold("m", b.cur, body);
+        body = h.body;
+        cur = h.cur;
+      }
+      i += 1;
+    }
+    const tinl = inls[stages.length - 1];
+    if (term.op == "map") {
+      const b = this.apply(tinl, [cur], sp, body);
+      body = b.body;
+      body.push(push(resL, chunkTy, b.cur, sp));
+    } else if (term.op == "filter") {
+      const b = this.apply(tinl, [cur], sp, body);
+      body = b.body;
+      body.push(HIf(b.cur, HBlock { stmts: [push(resL, chunkTy, cur, sp)] }, None));
+    } else if (term.op == "reduce") {
+      const accE = mk(XLocal(resL), foldTy, sp);
+      const b = this.apply(tinl, [accE, cur], sp, []);
+      let folded: HStmt[] = b.body;
+      folded.push(HAssign(Place { root: resL, path: [], ty: foldTy }, None, b.cur));
+      const first: HStmt[] = [
+        HAssign(Place { root: resL, path: [], ty: foldTy }, None, cur),
+        setBool(hasL, true, sp),
+      ];
+      body.push(
+        HIf(mk(XLocal(hasL), TyBool, sp), HBlock { stmts: folded }, Some(HBlock { stmts: first })),
+      );
+    } else {
+      const b = this.apply(tinl, [cur], sp, body);
+      body = b.body;
+      const test = term.op == "every" ? mk(XUnary(UnNot, b.cur), TyBool, sp) : b.cur;
+      let hit: HStmt[] = [];
+      if (term.op == "some" || term.op == "every") {
+        hit.push(setBool(resL, true, sp));
+      } else if (term.op == "find") {
+        hit.push(
+          HAssign(
+            Place { root: resL, path: [], ty: chunkTy },
+            None,
+            mk(XVariant(0, [cur]), chunkTy, sp),
+          ),
+        );
+      } else {
+        hit.push(
+          HAssign(
+            Place { root: resL, path: [], ty: TyOption(TyUsize) },
+            None,
+            mk(XVariant(0, [mk(XLocal(cntL), TyUsize, sp)]), TyOption(TyUsize), sp),
+          ),
+        );
+      }
+      hit.push(HBreak);
+      body.push(HIf(test, HBlock { stmts: hit }, None));
+      if (term.op == "findIndex") {
+        body.push(incr(cntL, sp));
+      }
+    }
+    const cond = mk(
+      XBinary(OpLt, mk(XLocal(iL), TyUsize, sp), mk(XLocal(hiL), TyUsize, sp)),
+      TyBool,
+      sp,
+    );
+    pre.push(HWhile(cond, HBlock { stmts: body }));
+    // return the chunk's result
+    let ret = mk(XLocal(resL), chunkTy, sp);
+    if (term.op == "reduce") {
+      ret = mk(
+        XCond(
+          mk(XLocal(hasL), TyBool, sp),
+          mk(XVariant(0, [mk(XLocal(resL), foldTy, sp)]), chunkTy, sp),
+          mk(XVariant(1, []), chunkTy, sp),
+        ),
+        chunkTy,
+        sp,
+      );
+    } else if (term.op == "findIndex") {
+      ret = mk(
+        XRecord(
+          pf.chunkIndex,
+          None,
+          [
+            FieldInitH { index: 0, value: mk(XLocal(cntL), TyUsize, sp) },
+            FieldInitH { index: 1, value: mk(XLocal(resL), TyOption(TyUsize), sp) },
+          ],
+        ),
+        chunkTy,
+        sp,
+      );
+    }
+    pre.push(HReturn(Some(ret)));
+    const fid = this.funcs.length;
+    this.funcs.push(Function {
+      name: name,
+      paramCount: 2,
+      locals: this.hostLocals,
+      ret: chunkTy,
+      body: HBlock { stmts: pre },
+      span: sp,
+    });
+    this.hostLocals = saveLocals;
+    this.hostParams = saveParams;
+    return Inl { fid: fid, base: 0, inline: false, env: 0 };
+  }
+}
+
+function argsOf(e: HExpr): HExpr[] {
+  const none: HExpr[] = [];
+  return match (e.kind) {
+    XCall(_, a) => a,
+    _ => none,
+  };
+}
+
+function argZero(e: HExpr): HExpr {
+  return match (e.kind) {
+    XCall(_, args) => args.length > 0 ? args[0] : e,
+    _ => e,
+  };
+}
+
+function setBool(l: usize, v: bool, sp: Span): HStmt {
+  return HAssign(Place { root: l, path: [], ty: TyBool }, None, mk(XBool(v), TyBool, sp));
+}
+
+function incr(l: usize, sp: Span): HStmt {
+  return HAssign(Place { root: l, path: [], ty: TyUsize }, Some(OpAdd), mk(XInt(1), TyUsize, sp));
+}
+
+function push(l: usize, arrTy: Type, v: HExpr, sp: Span): HStmt {
+  return HExprStmt(
+    mk(XMutMethod(MArrPush, Place { root: l, path: [], ty: arrTy }, [v]), TyVoid, sp),
+  );
+}
+
+// `{ stmts; value }` as an expression: a `match` on `true` with one wildcard arm (lowered to straight-line code).
+function blockExpr(stmts: HStmt[], value: Option<HExpr>, ty: Type, sp: Span): HExpr {
+  return mk(
+    XMatch(
+      mk(XBool(true), TyBool, sp),
+      [HArm { pattern: HPWildcard, body: HBlock { stmts: stmts }, value: value }],
+    ),
+    ty,
+    sp,
+  );
+}
+
+// The callee of the first call in `b` whose function name starts with `prefix`.
+function findCall(funcs: Function[], b: HBlock, prefix: string): Option<usize> {
+  for (const s of b.stmts) {
+    const r = match (s) {
+      HLet(_, e) => findCallE(funcs, e, prefix),
+      HExprStmt(e) => findCallE(funcs, e, prefix),
+      HReturn(o) => match (o) {
+        Some(e) => findCallE(funcs, e, prefix),
+        None => None,
+      },
+      _ => None,
+    };
+    if (r.isSome()) {
+      return r;
+    }
+  }
+  return None;
+}
+
+function findCallE(funcs: Function[], e: HExpr, prefix: string): Option<usize> {
+  match (e.kind) {
+    XCall(f, args) => {
+      if (f < funcs.length && funcs[f].name.startsWith(prefix)) {
+        return Some(f);
+      }
+      for (const a of args) {
+        const r = findCallE(funcs, a, prefix);
+        if (r.isSome()) {
+          return r;
+        }
+      }
+      return None;
+    },
+    _ => {
+      return None;
+    },
+  }
+}
+
+function findFn(funcs: Function[], name: string): Option<usize> {
+  let i: usize = 0;
+  while (i < funcs.length) {
+    if (funcs[i].name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function findRecord(records: RecordDef[], name: string): Option<usize> {
+  let i: usize = 0;
+  while (i < records.length) {
+    if (records[i].name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The closure literals passed to array-API or parallel operations in a block (the roots of the purity analysis); a call
+// whose function argument is not a literal adds `funcs.length` (so that the function is still visited).
+function rootsBlock(funcs: Function[], b: HBlock, out0: usize[]): usize[] {
+  let out = out0;
+  for (const s of b.stmts) {
+    match (s) {
+      HLet(_, e) => {
+        out = rootsExpr(funcs, e, out);
+      },
+      HAssign(_, _, e) => {
+        out = rootsExpr(funcs, e, out);
+      },
+      HExprStmt(e) => {
+        out = rootsExpr(funcs, e, out);
+      },
+      HIf(c, t, el) => {
+        out = rootsExpr(funcs, c, out);
+        out = rootsBlock(funcs, t, out);
+        match (el) {
+          Some(x) => {
+            out = rootsBlock(funcs, x, out);
+          },
+          None => {},
+        }
+      },
+      HWhile(c, body) => {
+        out = rootsExpr(funcs, c, out);
+        out = rootsBlock(funcs, body, out);
+      },
+      HForOf(_, it, body) => {
+        out = rootsExpr(funcs, it, out);
+        out = rootsBlock(funcs, body, out);
+      },
+      HReturn(o) => {
+        match (o) {
+          Some(e) => {
+            out = rootsExpr(funcs, e, out);
+          },
+          None => {},
+        }
+      },
+      HBlockStmt(x) => {
+        out = rootsBlock(funcs, x, out);
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+function rootsExprs(funcs: Function[], es: HExpr[], out0: usize[]): usize[] {
+  let out = out0;
+  for (const e of es) {
+    out = rootsExpr(funcs, e, out);
+  }
+  return out;
+}
+
+function rootsExpr(funcs: Function[], e: HExpr, out0: usize[]): usize[] {
+  let out = out0;
+  match (e.kind) {
+    XCall(f, args) => {
+      if (f < funcs.length && args.length >= 2) {
+        const n = funcs[f].name;
+        if (arrayOp(n) != "" || parallelOp(n) != "") {
+          match (args[1].kind) {
+            XClosure(c, _) => {
+              out.push(c);
+            },
+            _ => {
+              out.push(funcs.length);
+            },
+          }
+        }
+      }
+      out = rootsExprs(funcs, args, out);
+    },
+    XUnary(_, x) => {
+      out = rootsExpr(funcs, x, out);
+    },
+    XBinary(_, a, b) => {
+      out = rootsExpr(funcs, a, out);
+      out = rootsExpr(funcs, b, out);
+    },
+    XBuiltin(_, args) => {
+      out = rootsExprs(funcs, args, out);
+    },
+    XMutMethod(_, _, args) => {
+      out = rootsExprs(funcs, args, out);
+    },
+    XField(b, _, _) => {
+      out = rootsExpr(funcs, b, out);
+    },
+    XIndex(a, b) => {
+      out = rootsExpr(funcs, a, out);
+      out = rootsExpr(funcs, b, out);
+    },
+    XRecord(_, spread, fields) => {
+      match (spread) {
+        Some(x) => {
+          out = rootsExpr(funcs, x, out);
+        },
+        None => {},
+      }
+      for (const f of fields) {
+        out = rootsExpr(funcs, f.value, out);
+      }
+    },
+    XVariant(_, args) => {
+      out = rootsExprs(funcs, args, out);
+    },
+    XArray(xs) => {
+      out = rootsExprs(funcs, xs, out);
+    },
+    XTry(x) => {
+      out = rootsExpr(funcs, x, out);
+    },
+    XCond(c, a, b) => {
+      out = rootsExpr(funcs, c, out);
+      out = rootsExpr(funcs, a, out);
+      out = rootsExpr(funcs, b, out);
+    },
+    XMatch(x, arms) => {
+      out = rootsExpr(funcs, x, out);
+      for (const a of arms) {
+        out = rootsBlock(funcs, a.body, out);
+        match (a.value) {
+          Some(v) => {
+            out = rootsExpr(funcs, v, out);
+          },
+          None => {},
+        }
+      }
+    },
+    XClosure(_, caps) => {
+      out = rootsExprs(funcs, caps, out);
+    },
+    XCallIndirect(c, args) => {
+      out = rootsExpr(funcs, c, out);
+      out = rootsExprs(funcs, args, out);
+    },
+    XIface(_, v) => {
+      out = rootsExpr(funcs, v, out);
+    },
+    XCallVirtual(r, _, args) => {
+      out = rootsExpr(funcs, r, out);
+      out = rootsExprs(funcs, args, out);
+    },
+    _ => {},
+  }
+  return out;
+}
+
+// Does the program call any array-API or parallel operation? (Without one the pass returns the program unchanged.)
+function hasOps(funcs: Function[]): bool {
+  for (const f of funcs) {
+    if (arrayOp(f.name) != "" || parallelOp(f.name) != "") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The pass: every function outside the `$array` prelude is rewritten; a program without array-API calls is returned as it
+// is (the same value), so its generated code does not change.
+@Ensures(result.program.functions.length >= p.functions.length)
+@Ensures(result.program.records.length >= p.records.length)
+export function fuseProgram(p: Program): FuseOut {
+  const none: ChainInfo[] = [];
+  if (!hasOps(p.functions)) {
+    return FuseOut { program: p, chains: none };
+  }
+  // one scan: the closure literals of every operation call (the purity roots; `functions.length` marks a call without
+  // one) and which functions have such a call at all (only those are rewritten)
+  let roots: usize[] = [];
+  let has: bool[] = [];
+  for (const f of p.functions) {
+    const noRoots: usize[] = [];
+    const rs = rootsBlock(p.functions, f.body, noRoots);
+    has.push(rs.length > 0 && !f.name.startsWith("$array/"));
+    roots = roots.concat(rs);
+  }
+  if (roots.length == 0) {
+    return FuseOut { program: p, chains: none };
+  }
+  const pur = inferPurity(p.functions, roots);
+  let par: Option<ParFns> = None;
+  const cc = findFn(p.functions, "$array/parallel.chunkCount");
+  if (cc.isSome()) {
+    const cs = findFn(p.functions, "$array/parallel.chunkStart");
+    const ce = findFn(p.functions, "$array/parallel.chunkEnd");
+    const wf = findFn(p.functions, "$array/parallel.workersFor");
+    const ci = findRecord(p.records, "$array/parallel.ChunkIndex");
+    if (cs.isSome() && ce.isSome() && wf.isSome() && ci.isSome()) {
+      par = Some(ParFns {
+        chunkCount: cc.unwrap(),
+        chunkStart: cs.unwrap(),
+        chunkEnd: ce.unwrap(),
+        workersFor: wf.unwrap(),
+        chunkIndex: ci.unwrap(),
+      });
+    }
+  }
+  let fz = new Fuser(p.functions, p.records, pur, par);
+  // the rewritten functions are collected apart: writing them into `fz.funcs` while `fz` is in use copied the table
+  let out: Function[] = [];
+  let fi: usize = 0;
+  while (fi < p.functions.length) {
+    if (has[fi]) {
+      out.push(fz.rewrite(fi));
+    } else {
+      out.push(p.functions[fi]);
+    }
+    fi += 1;
+  }
+  out = out.concat(fz.funcs.slice(p.functions.length, fz.funcs.length));
+  return FuseOut {
+    program: Program {
+      records: fz.records,
+      unions: p.unions,
+      functions: out,
+      main: p.main,
+      vtables: p.vtables,
+      ifaces: p.ifaces,
+      mutating: p.mutating,
+      inlineFns: p.inlineFns,
+    },
+    chains: fz.chains,
+  };
+}

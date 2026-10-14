@@ -503,6 +503,11 @@ uint64_t orin_platform_thread_id(void) {
     return t_tid;
 }
 
+uint64_t orin_platform_cpu_count(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n >= 1 ? (uint64_t)n : 1;
+}
+
 static void *thread_main(void *p) {
     Thr *t = (Thr *)p;
     (void)orin_platform_thread_id();

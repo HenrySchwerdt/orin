@@ -10,11 +10,14 @@ tests/next/run (ADR-0006).
 std prelude, spec 19 R1) against `--c-builtins` (the C runtime implementations) over tests/run and
 tests/next/run (works with --sanitize too).
 
+`--mode fuse` compares the default pipeline against `--no-fuse` (the same optimiser without the fusion of array
+pipelines, compiler/fuse, ADR-0038 §2): fused against unfused on every program.
+
 `--mode opt` compares the optimised MIR pipeline (default) against `--no-opt`
 (ADR-0010) over tests/run and tests/next/run.
 
 Usage: python3 tools/diff_backends.py [--orinc build/bootstrap/orin2] [--cc cc] [--filter s]
-                                      [--sanitize] --mode opt|llvm|builtins
+                                      [--sanitize] --mode opt|llvm|builtins|fuse
 """
 import argparse
 import os
@@ -77,14 +80,15 @@ def main():
     ap.add_argument("--cc", default="cc")
     ap.add_argument("--filter", default="")
     ap.add_argument("--sanitize", action="store_true")
-    ap.add_argument("--mode", choices=["opt", "llvm", "builtins"], required=True)
+    ap.add_argument("--mode", choices=["opt", "llvm", "builtins", "fuse"], required=True)
     args = ap.parse_args()
     if not os.path.isabs(args.orinc):
         args.orinc = os.path.join(ROOT, args.orinc)
     os.makedirs(os.path.join(ROOT, OUT), exist_ok=True)
     suites = ("run", os.path.join("next", "run"))
     tests = [t for t in entries(suites) if args.filter in t[0]]
-    old_flags = {"opt": ["--no-opt"], "llvm": ["--backend=llvm"], "builtins": ["--c-builtins"]}[args.mode]
+    old_flags = {"opt": ["--no-opt"], "llvm": ["--backend=llvm"], "builtins": ["--c-builtins"],
+                 "fuse": ["--no-fuse"]}[args.mode]
     old_is_llvm = args.mode == "llvm"
 
     def work(t):

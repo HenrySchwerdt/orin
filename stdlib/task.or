@@ -39,7 +39,7 @@
 // blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
 // A panic in the BODY of a scope (not in a task) is not unwound: tasks still running keep running until the process ends.
 
-import { Ring, Ledger } from "std:taskcore";
+import { Ring, Ledger, Ranges } from "std:taskcore";
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
@@ -64,7 +64,7 @@ function takeBox<T>(tok: usize): T {
   return b.v;
 }
 
-export { Ring, Ledger } from "std:taskcore";
+export { Ring, Ledger, Ranges } from "std:taskcore";
 
 // movedCount(): how many values this task has sent by MOVE (no copy) since it started, and copiedCount(): by deep copy.
 // Only values that contain a reference (strings, arrays, records, ...) are counted; scalars cost nothing either way.
@@ -291,6 +291,32 @@ export class TaskHandle<T> {
     monFree(this.res);
     return takeBox(tok);
   }
+}
+
+// tryJoin(h): `h.join()` that returns None instead of trapping when the task panicked (its message is then `taskMessage()`).
+// A second join still traps. (`join` keeps its own copy of these lines so that programs that do not use the fork/join pool
+// compile to the same code as before the pool was added.)
+function tryJoin<T>(h: TaskHandle<T>): Option<T> {
+  monLock(h.tab);
+  const st = monGet(h.tab, entry(h.idx) + 2);
+  if (st != 0) {
+    monUnlock(h.tab);
+    taskTrap("task joined twice (or after the end of its scope)");
+  }
+  monSet(h.tab, entry(h.idx) + 2, 1);
+  const th = monGet(h.tab, entry(h.idx));
+  monUnlock(h.tab);
+  const status = taskJoin(th);
+  if (status != 0) {
+    monFree(h.res);
+    return None;
+  }
+  monLock(h.res);
+  const tok = monGet(h.res, 0);
+  monUnlock(h.res);
+  monFree(h.res);
+  const v: T = takeBox(tok);
+  return Some(v);
 }
 
 // What a task does, as the runtime runs it: compute, publish the result in the result monitor.
@@ -572,4 +598,197 @@ export function parallelMap<A, B>(xs: A[], f: (x: A) => B, parts: usize): B[] {
     }
     return out;
   });
+}
+
+// ------------------------------------------------------------------------------------------------------ fork/join pool
+//
+// The pool behind `parallel()` on an array `xs` (ADR-0039, docs/std.md "Parallel pipelines"); usable directly too. A computation is split
+// into `chunks` numbered pieces; `body(k)` computes piece k. With `workers` >= 2 the pool starts that many worker tasks for
+// the call (a pool lives for one call: structured, like `scope`). Worker w starts with the contiguous range of pieces
+// w * chunks / workers .. (w + 1) * chunks / workers - 1 and takes them from the front; when its range is empty it STEALS the
+// back half of the largest range left (std:taskcore `Ranges`, kept in one monitor). Results are put back in piece order,
+// so the result never depends on the number of workers or on who computed what. With `workers` <= 1 the pieces run in
+// order on the calling task. A panic in a piece cancels the pieces nobody has started, waits for the workers that are
+// still running and then traps the caller with the piece's own message (so a parallel pipeline traps like the sequential
+// one). `body` is copied to every worker like any task body: what it captures moves or is copied (`parallel()` lends
+// its input array instead, see "lending" in runtime/orin_runtime.c).
+
+// A finished piece: its number and its result.
+type Done<R> = { k: usize; r: R; };
+
+// Monitor words of a pool: [0] chunks, [1] cut, [2] workers, then lo / hi of every worker.
+const POOL_HDR: usize = 3;
+
+function loadRanges(m: usize): Ranges {
+  const n = monGet(m, 2);
+  let lo: usize[] = [];
+  let hi: usize[] = [];
+  let w: usize = 0;
+  while (w < n) {
+    lo.push(monGet(m, POOL_HDR + 2 * w));
+    hi.push(monGet(m, POOL_HDR + 2 * w + 1));
+    w += 1;
+  }
+  return new Ranges(lo, hi, monGet(m, 1), monGet(m, 0));
+}
+
+function storeRanges(m: usize, r: Ranges): void {
+  monSet(m, 0, r.chunks);
+  monSet(m, 1, r.cut);
+  monSet(m, 2, r.lo.length);
+  let w: usize = 0;
+  while (w < r.lo.length) {
+    monSet(m, POOL_HDR + 2 * w, r.lo[w]);
+    monSet(m, POOL_HDR + 2 * w + 1, r.hi[w]);
+    w += 1;
+  }
+}
+
+// The loop of worker w: claim a piece, compute it, repeat; with `until`, a piece whose result is a hit cancels every piece
+// after it.
+function poolWork<R>(m: usize, w: usize, body: (k: usize) => R, until: bool, hit: (r: R) => bool): Done<R>[] {
+  let out: Done<R>[] = [];
+  let more = true;
+  while (more) {
+    monLock(m);
+    let rs = loadRanges(m);
+    const c = rs.claim(w);
+    storeRanges(m, rs);
+    monUnlock(m);
+    match (c) {
+      Some(k) => {
+        const r = body(k);
+        if (until && hit(r)) {
+          monLock(m);
+          let rs2 = loadRanges(m);
+          rs2.cancelAfter(k);
+          storeRanges(m, rs2);
+          monUnlock(m);
+        }
+        out.push(Done<R> { k: k, r: r });
+      },
+      None => {
+        more = false;
+      }
+    }
+  }
+  return out;
+}
+
+// Runs the pieces on `nw` >= 2 worker tasks; the finished pieces in no particular order.
+function runPool<R>(chunks: usize, nw: usize, body: (k: usize) => R, until: bool, hit: (r: R) => bool): Done<R>[] {
+  const m = monNew(POOL_HDR + 2 * nw);
+  let lo: usize[] = [];
+  let hi: usize[] = [];
+  let w: usize = 0;
+  while (w < nw) {
+    lo.push(chunks * w / nw);
+    hi.push(chunks * (w + 1) / nw);
+    w += 1;
+  }
+  monLock(m);
+  storeRanges(m, new Ranges(lo, hi, chunks, chunks));
+  monUnlock(m);
+  const tab = begin();
+  const s = new Scope(tab);
+  let hs: TaskHandle<Done<R>[]>[] = [];
+  w = 0;
+  while (w < nw) {
+    const me = w;
+    hs.push(spawn(s, () => poolWork(m, me, body, until, hit)));
+    w += 1;
+  }
+  let all: Done<R>[] = [];
+  let failure = "";
+  let failed = false;
+  for (const h of hs) {
+    match (tryJoin(h)) {
+      Some(ds) => {
+        for (const d of ds) {
+          all.push(d);
+        }
+      },
+      None => {
+        if (!failed) {
+          failed = true;
+          failure = taskMessage();
+          monLock(m);
+          let rs = loadRanges(m);
+          rs.cancelAll();
+          storeRanges(m, rs);
+          monUnlock(m);
+        }
+      }
+    }
+  }
+  finish(tab);
+  monFree(m);
+  if (failed) {
+    taskTrap(failure);
+  }
+  return all;
+}
+
+// The results of `chunks` pieces in piece order (every piece ran exactly once: the unwrap checks it).
+function inOrder<R>(chunks: usize, ds: Done<R>[]): Option<R>[] {
+  let slots: Option<R>[] = [];
+  while (slots.length < chunks) {
+    slots.push(None);
+  }
+  for (const d of ds) {
+    slots[d.k] = Some(d.r);
+  }
+  return slots;
+}
+
+// parallelism(): how many worker threads a parallel computation uses: the environment variable ORIN_THREADS when it is a
+// number from 1 to 1024, else the number of processors online. Results of `forkJoin` and `parallel()` never depend on it.
+@Ensures(result >= 1)
+export function parallelism(): usize {
+  const t = transferCount(2);
+  return t >= 1 ? t : 1;
+}
+
+// forkJoin(chunks, workers, body): [body(0), body(1), ..., body(chunks - 1)], computed by `workers` worker tasks (work
+// stealing) when workers >= 2, else in order by the calling task.
+@Ensures(result.length == chunks)
+export function forkJoin<R>(chunks: usize, workers: usize, body: (k: usize) => R): R[] {
+  if (workers <= 1 || chunks <= 1) {
+    let out: R[] = [];
+    while (out.length < chunks) {
+      out.push(body(out.length));
+    }
+    return out;
+  }
+  const nw = workers < chunks ? workers : chunks;
+  const slots = inOrder(chunks, runPool(chunks, nw, body, false, (r: R) => false));
+  return slots.map(o => o.unwrap());
+}
+
+// forkJoinUntil(chunks, workers, body, hit): [body(0), ..., body(j)] where j is the first piece whose result is a hit (all
+// pieces when none is). Pieces after a hit are cancelled; the pieces before the first hit always run, so the result is the
+// same as computing the pieces one by one and stopping at the first hit.
+@Ensures(result.length <= chunks)
+export function forkJoinUntil<R>(chunks: usize, workers: usize, body: (k: usize) => R, hit: (r: R) => bool): R[] {
+  let out: R[] = [];
+  if (workers <= 1 || chunks <= 1) {
+    let k: usize = 0;
+    while (k < chunks) {
+      const r = body(k);
+      const h = hit(r);
+      out.push(r);
+      k = h ? chunks : k + 1;
+    }
+    return out;
+  }
+  const nw = workers < chunks ? workers : chunks;
+  const slots = inOrder(chunks, runPool(chunks, nw, body, true, hit));
+  let k: usize = 0;
+  while (k < chunks) {
+    const r = slots[k].unwrap();
+    const h = hit(r);
+    out.push(r);
+    k = h ? chunks : k + 1;
+  }
+  return out;
 }

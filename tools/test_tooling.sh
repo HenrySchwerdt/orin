@@ -36,6 +36,8 @@ mkdir -p build
   echo '$ORIN2 test compiler/tests/check_body_test.or --runtime runtime'
   # lowering unit tests (3a): block builder, locals, owned scope, place walk, MIR spans, Lowerer end to end
   echo '$ORIN2 test compiler/tests/lower_test.or --runtime runtime'
+  # fusion of array pipelines (ADR-0038 §2): recognisers, chain analysis, verifier on fused MIR
+  echo '$ORIN2 test compiler/tests/fuse_test.or --runtime runtime'
   # optimiser and code generator unit tests (3d): passes, inference, pruning, emitters, symbol tables, rule 8
   echo '$ORIN2 test compiler/tests/opt_test.or --runtime runtime'
   echo '$ORIN2 test compiler/tests/emit_test.or --runtime runtime'

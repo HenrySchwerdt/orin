@@ -1,0 +1,506 @@
+// The rules of parallel pipelines (ADR-0039 §3, docs/std.md "Parallel pipelines"). A pass over the checked HIR of every function,
+// generic instances and lifted closures included, that looks at the calls of the operations of the view `Parallel<T>` (the
+// functions `parMap`, `parFilter`, ... of the parallel prelude array/parallel.or that the checker turns the methods into):
+//
+//   E0484  a closure of a parallel operation is not a pure closure literal: it performs I/O or calls something that does (the
+//          message names the effect and where it happens, like E0416), it calls a function value of unknown origin, or the
+//          argument is not an arrow function or a named function at all (then its effects are unknown). The chunks run in
+//          any order on several tasks, so an effect would happen in an order the program cannot predict.
+//   E0485  the reducer of a parallel `reduce` is not a built-in associative operator. Chunks are folded separately and then
+//          combined, which gives the sequential result only for an associative function. Accepted: `(a, b) => a + b` on
+//          integers, floats and strings, `a * b` on integers and floats, `a && b`, `a || b`, min and max (`a < b ? a : b`
+//          and the other orders and comparisons, `Math.min` / `Math.max` of std:math), with the parameters in either order.
+//          A user function needs a proof obligation (ADR-0039 §3.2), which comes later.
+//   E0486  (checked where the method is called, check/expr.or) the input element type is not a scalar or a flat record of
+//          scalars.
+//
+// Warnings (`parallelWarnings`, printed by `orin compile` / `orin check`):
+//   W0480  a parallel float `reduce`: float `+` and `*` are not associative, so the result can differ from the sequential
+//          `reduce` in the last bits (it is the same on every machine and with every thread count: the grouping is fixed).
+//   W0481  a parallel integer `reduce` with `+` on a signed type, or with `*`: a partial result of a chunk can overflow (and
+//          trap) where the sequential fold does not, or the reverse. Unsigned `+` cannot differ: every partial sum is at most
+//          the total, so a partial sum overflows only when the total does (ADR-0039 §3.3, the simplest sound rule; a proved
+//          range or a wider accumulator comes with the verifier obligation).
+
+import { Span, Diagnostic, SourceMap, diag } from "../diag";
+import { Type, Function, HBlock, HStmt, HExpr, Place, BinOp, intKindOf, kindSigned } from "../hir";
+import { inferPurity, explain, Purity } from "./purity";
+
+// The parallel operation called by function `name` ("map", "filter", ...), "" for any other function.
+export function parallelOp(name: string): string {
+  const pre = "$array/parallel.par";
+  if (!name.startsWith(pre)) {
+    return "";
+  }
+  const rest = name.substring(pre.length, name.length);
+  const ops = ["Map", "Filter", "Reduce", "Some", "Every", "FindIndex", "Find", "ToArray"];
+  const lower = ["map", "filter", "reduce", "some", "every", "findIndex", "find", "toArray"];
+  let i: usize = 0;
+  while (i < ops.length) {
+    if (rest.startsWith(ops[i] + "<")) {
+      return lower[i];
+    }
+    i += 1;
+  }
+  return "";
+}
+
+// The statements of lifted closure `f` after its prologue (the `let <capture> = env.<field>` lines, liftClosure).
+export function closureBody(f: Function): HStmt[] {
+  let k: usize = 0;
+  while (k < f.body.stmts.length && isCapLet(f.body.stmts[k])) {
+    k += 1;
+  }
+  return f.body.stmts.slice(k, f.body.stmts.length);
+}
+
+// The number of prologue statements of a lifted closure.
+export function prologueLength(f: Function): usize {
+  let k: usize = 0;
+  while (k < f.body.stmts.length && isCapLet(f.body.stmts[k])) {
+    k += 1;
+  }
+  return k;
+}
+
+function isCapLet(st: HStmt): bool {
+  return match (st) {
+    HLet(_, e) => match (e.kind) {
+      XField(b, _, _) => match (b.kind) {
+        XLocal(l) => l == 0,
+        _ => false,
+      },
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// The expression a closure body returns when it is a single `return e`.
+export function returnedExpr(f: Function): Option<HExpr> {
+  const b = closureBody(f);
+  if (b.length != 1) {
+    return None;
+  }
+  return match (b[0]) {
+    HReturn(o) => o,
+    _ => None,
+  };
+}
+
+function isParam(e: HExpr, k: usize): bool {
+  return match (e.kind) {
+    XLocal(l) => l == k,
+    _ => false,
+  };
+}
+
+// The two parameters (locals 1 and 2 of the lifted closure), in either order.
+function bothParams(a: HExpr, b: HExpr): bool {
+  return isParam(a, 1) && isParam(b, 2) || isParam(a, 2) && isParam(b, 1);
+}
+
+// What a two-parameter reducer closure computes, when it is a built-in associative operator: "add", "mul", "and", "or",
+// "min", "max" (also a `?:` of a comparison of the two parameters that picks one of them) or "concat" (string `+`); ""
+// otherwise.
+export function reducerKind(f: Function): string {
+  if (f.paramCount != 3) {
+    return "";
+  }
+  const eo = returnedExpr(f);
+  if (eo.isNone()) {
+    return "";
+  }
+  const e = eo.unwrap();
+  match (e.kind) {
+    XBinary(op, a, b) => {
+      if (!bothParams(a, b)) {
+        return "";
+      }
+      return match (op) {
+        OpAdd => match (e.ty) {
+          TyString => "concat",
+          _ => "add",
+        },
+        OpMul => "mul",
+        OpAnd => "and",
+        OpOr => "or",
+        _ => "",
+      };
+    },
+    XCond(c, t, el) => {
+      if (!bothParams(t, el)) {
+        return "";
+      }
+      match (c.kind) {
+        XBinary(op, a, b) => {
+          if (!bothParams(a, b)) {
+            return "";
+          }
+          // `a < b ? a : b` is min; picking the right operand of a "less" test, or testing "greater", flips it
+          const less = match (op) {
+            OpLt => 1,
+            OpLe => 1,
+            OpGt => 0,
+            OpGe => 0,
+            _ => 2,
+          };
+          if (less == 2) {
+            return "";
+          }
+          const pickLeft = isParam(t, localOf(a));
+          return less == 1 == pickLeft ? "min" : "max";
+        },
+        _ => {
+          return "";
+        },
+      }
+    },
+    _ => {
+      return "";
+    },
+  }
+}
+
+// Like reducerKind, and also `Math.min(a, b)` / `Math.max(a, b)` of std:math (needs the function table for the callee).
+export function reducerKindIn(funcs: Function[], f: Function): string {
+  const k = reducerKind(f);
+  if (k != "") {
+    return k;
+  }
+  const eo = returnedExpr(f);
+  if (eo.isNone() || f.paramCount != 3) {
+    return "";
+  }
+  return match (eo.unwrap().kind) {
+    XCall(g, args) => {
+      if (g >= funcs.length || args.length != 2 || !bothParams(args[0], args[1])) {
+        return "";
+      }
+      const n = funcs[g].name;
+      return n == "$array/math.min" ? "min" : n == "$array/math.max" ? "max" : "";
+    },
+    _ => "",
+  };
+}
+
+function localOf(e: HExpr): usize {
+  return match (e.kind) {
+    XLocal(l) => l,
+    _ => 0,
+  };
+}
+
+function isFloatType(t: Type): bool {
+  return match (t) {
+    TyFloat => true,
+    TyF32 => true,
+    _ => false,
+  };
+}
+
+// One call of a parallel operation found in a body.
+type ParCall = { op: string; span: Span; args: HExpr[]; ty: Type; };
+
+function scanExprs(es: HExpr[], funcs: Function[], out0: ParCall[]): ParCall[] {
+  let out = out0;
+  for (const e of es) {
+    out = scanExpr(e, funcs, out);
+  }
+  return out;
+}
+
+function scanExpr(e: HExpr, funcs: Function[], out0: ParCall[]): ParCall[] {
+  let out = out0;
+  match (e.kind) {
+    XUnary(_, x) => {
+      out = scanExpr(x, funcs, out);
+    },
+    XBinary(_, a, b) => {
+      out = scanExpr(a, funcs, out);
+      out = scanExpr(b, funcs, out);
+    },
+    XCall(id, args) => {
+      if (id < funcs.length) {
+        const op = parallelOp(funcs[id].name);
+        if (op != "") {
+          out.push(ParCall { op: op, span: e.span, args: args, ty: e.ty });
+        }
+      }
+      out = scanExprs(args, funcs, out);
+    },
+    XBuiltin(_, args) => {
+      out = scanExprs(args, funcs, out);
+    },
+    XMutMethod(_, p, args) => {
+      out = scanPlace(p, funcs, out);
+      out = scanExprs(args, funcs, out);
+    },
+    XField(b, _, _) => {
+      out = scanExpr(b, funcs, out);
+    },
+    XIndex(a, b) => {
+      out = scanExpr(a, funcs, out);
+      out = scanExpr(b, funcs, out);
+    },
+    XRecord(_, spread, fields) => {
+      match (spread) {
+        Some(x) => {
+          out = scanExpr(x, funcs, out);
+        },
+        None => {},
+      }
+      for (const f of fields) {
+        out = scanExpr(f.value, funcs, out);
+      }
+    },
+    XVariant(_, args) => {
+      out = scanExprs(args, funcs, out);
+    },
+    XArray(xs) => {
+      out = scanExprs(xs, funcs, out);
+    },
+    XTry(x) => {
+      out = scanExpr(x, funcs, out);
+    },
+    XCond(a, b, c) => {
+      out = scanExpr(a, funcs, out);
+      out = scanExpr(b, funcs, out);
+      out = scanExpr(c, funcs, out);
+    },
+    XMatch(x, arms) => {
+      out = scanExpr(x, funcs, out);
+      for (const a of arms) {
+        out = scanBlock(a.body, funcs, out);
+        match (a.value) {
+          Some(v) => {
+            out = scanExpr(v, funcs, out);
+          },
+          None => {},
+        }
+      }
+    },
+    XClosure(_, caps) => {
+      out = scanExprs(caps, funcs, out);
+    },
+    XIface(_, v) => {
+      out = scanExpr(v, funcs, out);
+    },
+    XCallVirtual(r, _, args) => {
+      out = scanExpr(r, funcs, out);
+      out = scanExprs(args, funcs, out);
+    },
+    XCallIndirect(c, args) => {
+      out = scanExpr(c, funcs, out);
+      out = scanExprs(args, funcs, out);
+    },
+    _ => {},
+  }
+  return out;
+}
+
+function scanPlace(p: Place, funcs: Function[], out0: ParCall[]): ParCall[] {
+  let out = out0;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        out = scanExpr(ix, funcs, out);
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+function scanBlock(b: HBlock, funcs: Function[], out0: ParCall[]): ParCall[] {
+  let out = out0;
+  for (const st of b.stmts) {
+    out = scanStmt(st, funcs, out);
+  }
+  return out;
+}
+
+function scanStmt(st: HStmt, funcs: Function[], out0: ParCall[]): ParCall[] {
+  let out = out0;
+  match (st) {
+    HLet(_, e) => {
+      out = scanExpr(e, funcs, out);
+    },
+    HAssign(p, _, e) => {
+      out = scanPlace(p, funcs, out);
+      out = scanExpr(e, funcs, out);
+    },
+    HExprStmt(e) => {
+      out = scanExpr(e, funcs, out);
+    },
+    HIf(c, t, el) => {
+      out = scanExpr(c, funcs, out);
+      out = scanBlock(t, funcs, out);
+      match (el) {
+        Some(b) => {
+          out = scanBlock(b, funcs, out);
+        },
+        None => {},
+      }
+    },
+    HWhile(c, b) => {
+      out = scanExpr(c, funcs, out);
+      out = scanBlock(b, funcs, out);
+    },
+    HForOf(_, it, b) => {
+      out = scanExpr(it, funcs, out);
+      out = scanBlock(b, funcs, out);
+    },
+    HReturn(o) => {
+      match (o) {
+        Some(e) => {
+          out = scanExpr(e, funcs, out);
+        },
+        None => {},
+      }
+    },
+    HBlockStmt(b) => {
+      out = scanBlock(b, funcs, out);
+    },
+    _ => {},
+  }
+  return out;
+}
+
+// Every call of a parallel operation in the program, in function order. Functions of the parallel prelude itself are
+// skipped (they pass closures to std:task, not to a parallel operation).
+function parCalls(funcs: Function[]): ParCall[] {
+  let out: ParCall[] = [];
+  // without an instance of a parallel operation there is no call of one (the common case: no scan at all)
+  if (!funcs.some(f => parallelOp(f.name) != "")) {
+    return out;
+  }
+  for (const f of funcs) {
+    if (!f.name.startsWith("$array/parallel.")) {
+      out = scanBlock(f.body, funcs, out);
+    }
+  }
+  return out;
+}
+
+// The closure argument of a call (argument 1 for every operation but toArray).
+function closureArg(c: ParCall): Option<HExpr> {
+  return c.op != "toArray" && c.args.length >= 2 ? Some(c.args[1]) : None;
+}
+
+// E0484 and E0485 for the whole program (`sm` names the place of an effect).
+export function parallelDiags(sm: SourceMap, funcs: Function[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  const calls = parCalls(funcs);
+  if (calls.length == 0) {
+    return out;
+  }
+  let roots: usize[] = [];
+  for (const c of calls) {
+    match (closureArg(c)) {
+      Some(a) => {
+        match (a.kind) {
+          XClosure(fid, _) => {
+            roots.push(fid);
+          },
+          _ => {},
+        }
+      },
+      None => {},
+    }
+  }
+  const p = inferPurity(funcs, roots);
+  for (const c of calls) {
+    match (closureArg(c)) {
+      Some(a) => {
+        match (a.kind) {
+          XClosure(fid, _) => {
+            if (fid < funcs.length && p.impure[fid]) {
+              out.push(
+                diag(
+                  "E0484",
+                  a.span,
+                  "the function passed to the parallel `" + c.op + "` must be pure: "
+                      + explain(sm, funcs, p, fid)
+                      + "; the chunks run on several tasks in no fixed order, so drop `parallel()` to keep the effects in order",
+                ),
+              );
+            } else if (fid < funcs.length && p.applied[fid].length > 0) {
+              out.push(
+                diag(
+                  "E0484",
+                  a.span,
+                  "the function passed to the parallel `" + c.op
+                      + "` calls a function value, whose effects are unknown; the closures of a parallel pipeline must be pure",
+                ),
+              );
+            } else if (c.op == "reduce" && fid < funcs.length && reducerKindIn(funcs, funcs[fid]) == "") {
+              out.push(
+                diag(
+                  "E0485",
+                  a.span,
+                  "the reducer of a parallel `reduce` must be a built-in associative operator: `(a, b) => a + b`, `a * b`, `a && b`, `a || b`, a min or max (`a < b ? a : b`, `Math.min(a, b)`, ...); the chunks are folded separately and then combined, which equals the sequential fold only for an associative function (a user-defined reducer needs a proof of associativity, ADR-0039 §3.2, not supported yet)",
+                ),
+              );
+            }
+          },
+          _ => {
+            out.push(
+              diag(
+                "E0484",
+                a.span,
+                "the function passed to the parallel `" + c.op
+                    + "` must be an arrow function or a named function: the effects of a function value are unknown, and a parallel pipeline needs pure functions",
+              ),
+            );
+          },
+        }
+      },
+      None => {},
+    }
+  }
+  return out;
+}
+
+// W0480 and W0481 (see the header).
+export function parallelWarnings(funcs: Function[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const c of parCalls(funcs)) {
+    if (c.op != "reduce") {
+      continue;
+    }
+    match (closureArg(c)) {
+      Some(a) => {
+        match (a.kind) {
+          XClosure(fid, _) => {
+            if (fid >= funcs.length) {
+              continue;
+            }
+            const k = reducerKindIn(funcs, funcs[fid]);
+            if (isFloatType(c.ty) && (k == "add" || k == "mul" || k == "min" || k == "max")) {
+              out.push(
+                diag(
+                  "W0480",
+                  c.span,
+                  "a parallel float `reduce` groups the elements by chunks, and float arithmetic is not associative: the result is the same on every machine and with every thread count, but it can differ from the sequential `reduce` in the last bits",
+                ),
+              );
+            } else if (intKindOf(c.ty) >= 0 && (k == "mul" || k == "add" && kindSigned(intKindOf(c.ty)))) {
+              out.push(
+                diag(
+                  "W0481",
+                  c.span,
+                  "a parallel integer `reduce` with `" + (k == "mul" ? "*" : "+")
+                      + "` adds up chunks first: a partial result can overflow (and trap) where the sequential fold does not, or the reverse (unsigned `+` cannot differ; ADR-0039 §3.3)",
+                ),
+              );
+            }
+          },
+          _ => {},
+        }
+      },
+      None => {},
+    }
+  }
+  return out;
+}

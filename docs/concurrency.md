@@ -35,6 +35,7 @@ ch.tx.close();  ch.rx.close();                // end of stream / cancellation; c
 | `Receiver<T>.recv(): Option<T>`, `.close()` | `recv` blocks while empty. `None` once closed by the sender **and** drained, or cancelled by `rx.close()`. `rx.close()` drops what is buffered and makes senders get `false` |
 | `scopeFs(fs, (s, g) => ..)`, `scopeProcess`, `scopeStdio`, `scopeClock` (+ `...Do`), `spawnFs(s, g, fsg => ..)`, `spawnProcess`, `spawnStdio`, `spawnClock` | delegating a grant to a task, see "Grants" |
 | `parallelMap(xs, f, parts): B[]` | `xs.map(f)` computed by `parts` tasks over contiguous chunks, results in order |
+| `forkJoin(chunks, workers, body): R[]`, `forkJoinUntil(chunks, workers, body, hit): R[]`, `parallelism(): usize` | the work-stealing fork/join pool behind `parallel()` on arrays (ADR-0039), see "Fork/join pool and lending" |
 | `movedCount()`, `copiedCount()` | how many values this task sent by move / by deep copy so far (`ORIN_STATS=1` prints the process totals too) |
 
 ## Semantics
@@ -213,6 +214,28 @@ machine.** Four cores were shared with other workers (load average 8-14), so the
 the CPU time of the parallel version is the same as the sequential one (user 1.21 s against 1.10 s: no copying or locking
 overhead that would eat a speedup; the chunks are moved or copied once). The experiment has to be repeated on an idle machine
 (`orin run examples/parallel_map.or 3000000 4`); no speedup number is claimed here.
+
+## Fork/join pool and lending (ADR-0039, `parallel()` on arrays)
+
+Added after stage 0, for parallel array pipelines (docs/std.md "Parallel pipelines"). Everything but one runtime mechanism
+(lending) is Orin.
+
+| Piece | Where | What |
+|---|---|---|
+| `forkJoin(chunks, workers, body)`, `forkJoinUntil(chunks, workers, body, hit)`, `parallelism()` | `std:task` (Orin) | a pool for ONE call: `workers` tasks (or the caller alone when `workers` <= 1) compute `body(k)` for the pieces `k`; results in piece order; `forkJoinUntil` cancels the pieces after the first hit and still runs every piece before it. A panic in a piece cancels what nobody started, joins every worker, then traps the caller with the piece's own message (no `task panicked:` prefix, so a parallel pipeline traps like the sequential chain) |
+| work stealing | `Ranges` in `std:taskcore` (pure class, 3 invariants: equal lengths, cut <= chunks, every range inside 0..chunks and no piece in two ranges) | worker w owns pieces lo[w] .. hi[w]-1 and takes them from the front; an idle worker steals the back half of the largest range below the cut; one monitor holds the words |
+| `lend` | runtime C (temporary, the transfer section): a `transitPut` of a TWO-slot record | pins the graph of the value (each positive count becomes `PIN | owner << 32 | count`, which is negative, so inline retain / release skip it), records the pinned objects; `transitDrop` of the token restores them. A transfer by the owner SHARES pinned objects (the workers' closures reach the input that way, no copy); a transfer by any other task COPIES them (a worker's result never refers into the lent graph) |
+| thread count | `orin_rt_transfer_count(2)` (runtime) over the new L0 `orin_platform_cpu_count()` | `ORIN_THREADS` (1..1,024) or the processors online. Multiplexed onto an existing runtime symbol because the LLVM backend's list of runtime declarations is not changed in this step |
+
+**Soundness of lending (TESTED_ONLY, like the rest of the C transfer).** While a value is lent, nothing in its graph changes:
+a retain / release of a pinned object is a no-op (no shared count is written, so no data race), `orin_make_unique` copies it
+(count != 1), nothing in it is freed. The owner's obligation, kept by the only user (`array/parallel.or` and the code the fusion
+pass generates): between lend and end it only spawns the worker tasks and joins them, and a reference to a pinned object made in
+the window is gone before the end (a reference that outlived it would be uncounted). Worker results come back through a transfer
+by a non-owner, which copies pinned objects. Evidence: `runtime/tests/task_test.c` (`test_lend`: no copy, counts untouched and
+restored, a record sent back is a copy, no live object), `tests/concurrency/par_pipelines.or` and `tools/test_parallel.sh`
+(ORIN_THREADS 1..8, fused / `--no-fuse` / `--no-opt`, ThreadSanitizer at 2, 4, 8 threads, ASan + UBSan). `ORIN_STATS`: the peak
+live counters no longer wrap to 2^64 - 1 for a task whose own frees exceed its allocations (a defect found here).
 
 ## Friction found while building it
 

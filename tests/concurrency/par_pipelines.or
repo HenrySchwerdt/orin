@@ -1,0 +1,42 @@
+// Stress of parallel pipelines (ADR-0039): 300 rounds of lending an array of ints and an array of records to worker tasks,
+// fused and early-exit operations, every result checked against the sequential chain. Run plain, under ThreadSanitizer
+// and ASan + UBSan (tools/test_concurrency.sh) and with ORIN_THREADS = 1 .. 8 (tools/test_parallel.sh); no object may be
+// live at exit (the lent arrays get their counts back, the records filtered by a worker come back as copies).
+type Cell = { v: int; k: int; };
+
+function main(): void {
+  let bad = 0;
+  let total: usize = 0;
+  let round = 0;
+  while (round < 300) {
+    const n = (9000 + round * 173) % 60000 + 8200;
+    let xs: int[] = [];
+    let cs: Cell[] = [];
+    let i = 0;
+    while (i < n) {
+      const v = (i * 7919 + round) % 1009;
+      xs.push(v);
+      cs.push(Cell { v: v, k: i % 13 });
+      i += 1;
+    }
+    const a = xs.parallel().filter(x => x % 2 == 1).map(x => x + round).reduce((p, q) => p > q ? p : q, 0);
+    const b = xs.filter(x => x % 2 == 1).map(x => x + round).reduce((p, q) => p > q ? p : q, 0);
+    if (a != b) {
+      bad += 1;
+    }
+    const kept = cs.parallel().filter(c => c.k == round % 13).toArray();
+    if (kept.length != cs.filter(c => c.k == round % 13).length) {
+      bad += 1;
+    }
+    const target = (round * 31) % 1009;
+    if (cs.parallel().findIndex(c => c.v == target).unwrapOr(0) != cs.findIndex(c => c.v == target).unwrapOr(0)) {
+      bad += 1;
+    }
+    if (xs.parallel().some(x => x == target) != xs.some(x => x == target)) {
+      bad += 1;
+    }
+    total += kept.length;
+    round += 1;
+  }
+  console.log(`rounds: ${round}, kept: ${total}, mismatches: ${bad}`);
+}
