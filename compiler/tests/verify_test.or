@@ -1,5 +1,5 @@
 // Unit tests of the ownership verifier's classes and predicates (rewrite step 3b): the lattice of per-local states
-// (`joinLs`, `lsLeq`), the class `State` (holes, borrow invalidation, join), `Worklist`, `Transfer` (one block run),
+// (`joinLs`, `lsLeq`), the class `State` (holes, join), `Transfer` (one block run: borrow invalidation, holes),
 // `Fixpoint`, the reports, the shared MIR well-formedness predicates (compiler/mir) and the HIR integer kinds. Run:
 // `orin test compiler/tests/verify_test.or --runtime runtime`. `orin test` checks contracts at run time, so the class
 // invariants and the `@Requires` / `@Ensures` of every method called below run too; a broken invariant is a trap.
@@ -17,9 +17,10 @@ import {
 } from "../mir";
 import {
   verify, VerifyReport, VerifyIssue, blockInStates, State, LState, HoleEntry, HoleKey, mk, joinLs,
-  lsLeq, lsEq, isKind, isLive, Worklist, Fixpoint, Transfer, Cx, step, noRevival, issuesAt,
-  issuePlaced, reportPlaced, reachClosed, statesSized, wfFunction, wfInstr, KDead, KOwned, KUnique,
-  KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
+  lsLeq, lsEq, isKind, isLive, holeAnyIn, holeHasIn, holeMayIn, holesInRange, borrowsFlatIn,
+  Fixpoint, Transfer, Cx, step, noRevival, issuesAt, issuePlaced, reportPlaced, reachClosed,
+  statesSized, wfFunction, wfInstr, KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit,
+  KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
 } from "../verify";
 
 // ---------------------------------------------------------------- builders
@@ -174,44 +175,63 @@ function joinRules(): void {
 
 // ---------------------------------------------------------------- State
 
-function st3(): State {
-  return new State([mk(KUnique, 0), mk(KBorrowed, 0), mk(KBorrowed, 3), mk(KOwned, 0)], []);
+function hole(x: usize, sym: bool, idx: usize): HoleEntry {
+  return HoleEntry { obj: x, sym: sym, idx: idx };
 }
 
 @Test
-function killBorrowsKillsExactlyTheAliasesOfOneLocal(): void {
-  let s = st3();
-  s.killBorrows(0);
-  assertEqBool(s.kind(1) == KDead, true, "the alias of l0 dies");
+function aReleaseKillsExactlyTheAliasesOfTheReleasedLocal(): void {
+  const p = straight(0, [lr("a"), lr("b"), lr("c"), lr("d")], [IRelease(0)]);
+  const st = new State([mk(KUnique, 0), mk(KBorrowed, 0), mk(KBorrowed, 3), mk(KOwned, 0)], []);
+  let t = new Transfer(p, p.functions[0], 0, 0, st, [], []);
+  t.step(IRelease(0));
+  const s = t.state();
+  assertEqBool(s.kind(0) == KDead && s.kind(1) == KDead, true, "released, and its alias dies");
   assertEqBool(s.kind(2) == KBorrowed && s.srcOf(2) == 3, true, "the alias of l3 lives");
-  assertEqBool(s.kind(0) == KUnique, true, "the source itself is unchanged");
+  assertEqBool(s.kind(3) == KOwned, true, "l3 is untouched");
   assert(s.borrowsFlat(), "still flat");
 }
 
 @Test
 function holesAreTrackedPerObjectAndKey(): void {
-  let s = new State([mk(KUnique, 0), mk(KInit, 0), mk(KUnique, 0)], []);
-  s.addHole(0, HoleKey { sym: false, idx: 3 });
-  assert(s.holeAny(0) && !s.holeAny(2), "a hole of l0 only");
-  assert(s.holeHas(0, HoleKey { sym: false, idx: 3 }), "exact key");
-  assert(!s.holeHas(0, HoleKey { sym: false, idx: 4 }), "other slot is not taken");
-  assert(!s.holeMay(0, HoleKey { sym: false, idx: 4 }), "a different constant slot cannot alias");
-  assert(s.holeMay(0, HoleKey { sym: true, idx: 1 }), "a symbolic index may alias any slot");
-  s.addHole(2, HoleKey { sym: true, idx: 1 });
-  assert(s.holeMay(2, HoleKey { sym: false, idx: 9 }), "a symbolic hole may be any slot");
-  s.removeHole(0, HoleKey { sym: false, idx: 3 });
-  assert(!s.holeAny(0) && s.holeAny(2), "put back");
-  s.dropHolesOf(2);
-  assertEqUsize(s.holes.length, 0, "dropped");
+  const hs = [hole(0, false, 3), hole(2, true, 1)];
+  assert(holeAnyIn(hs, 0) && !holeAnyIn(hs, 1), "a hole of l0, none of l1");
+  assert(holeHasIn(hs, 0, HoleKey { sym: false, idx: 3 }), "exact key");
+  assert(!holeHasIn(hs, 0, HoleKey { sym: false, idx: 4 }), "other slot is not taken");
+  assert(
+    !holeMayIn(hs, 0, HoleKey { sym: false, idx: 4 }),
+    "a different constant slot cannot alias",
+  );
+  assert(holeMayIn(hs, 0, HoleKey { sym: true, idx: 1 }), "a symbolic index may alias any slot");
+  assert(holeMayIn(hs, 2, HoleKey { sym: false, idx: 9 }), "a symbolic hole may be any slot");
+  assert(holesInRange(hs, 3) && !holesInRange(hs, 2), "names locals below 3, not below 2");
+}
+
+@Test
+function takeAndPutOpenAndCloseAHole(): void {
+  // a = struct {s}; t = takefield a.0; putfield a.0 = t
+  const p = straight(
+    0,
+    [lr("a"), lr("t")],
+    [IStructNew(0, 0, [OStr(0)]), ITakeField(1, 0, 0), IPutField(0, 0, 1), IRelease(0)],
+  );
+  const f = p.functions[0];
+  let t = new Transfer(p, f, 0, 0, new State([mk(KDead, 0), mk(KDead, 0)], []), [], []);
+  t.step(f.blocks[0].instrs[0]);
+  t.ins = 1;
+  t.step(f.blocks[0].instrs[1]);
+  assert(holeHasIn(t.holes, 0, HoleKey { sym: false, idx: 0 }), "slot 0 of a is taken");
+  t.ins = 2;
+  t.step(f.blocks[0].instrs[2]);
+  assertEqUsize(t.holes.length, 0, "put back");
+  assertEqUsize(t.errs.length, 0, "no error");
+  assertEqUsize(verify(p).errors.length, 0, "and the function verifies");
 }
 
 @Test
 function stateJoinUnitesHolesAndBoundsBothSides(): void {
-  let a = new State([mk(KUnique, 0), mk(KInit, 0)], []);
-  a.addHole(0, HoleKey { sym: false, idx: 1 });
-  let b = new State([mk(KImm, 0), mk(KDead, 0)], []);
-  b.addHole(0, HoleKey { sym: false, idx: 2 });
-  b.addHole(0, HoleKey { sym: false, idx: 1 });
+  const a = new State([mk(KUnique, 0), mk(KInit, 0)], [hole(0, false, 1)]);
+  const b = new State([mk(KImm, 0), mk(KDead, 0)], [hole(0, false, 2), hole(0, false, 1)]);
   const j = a.join(b);
   assertEqUsize(j.holes.length, 2, "union without repeats");
   assert(a.leq(j) && b.leq(j), "an upper bound of both");
@@ -219,23 +239,6 @@ function stateJoinUnitesHolesAndBoundsBothSides(): void {
   assert(j.join(j).equals(j), "idempotent");
   assert(a.join(b).equals(b.join(a)), "the same state either way (holes compared as sets)");
   assert(!a.equals(j), "the join added information");
-}
-
-// ---------------------------------------------------------------- Worklist
-
-@Test
-function worklistQueuesEachBlockOnceLastInFirstOut(): void {
-  let w = new Worklist(4);
-  w.add(1);
-  w.add(3);
-  w.add(1);
-  assertEqUsize(w.size(), 2, "a queued block is not queued twice");
-  assertEqUsize(w.take(), 3, "last in, first out");
-  w.add(3);
-  assertEqUsize(w.size(), 2, "a taken block can be queued again");
-  assertEqUsize(w.take(), 3, "again");
-  assertEqUsize(w.take(), 1, "then the first");
-  assert(w.isEmpty(), "empty");
 }
 
 // ---------------------------------------------------------------- Transfer
@@ -263,8 +266,12 @@ function transferReportsAtTheInstructionAndRevivesNothing(): void {
   assertEqUsize(t.errs[0].instr, 3, "at the tag");
   assert(t.errs[0].message.includes("dead"), "use of a dead local");
   assert(issuesAt(t.errs, 0, f, 0, 3), "names the instruction");
-  assertEqBool(t.st.kind(0) == KDead && t.st.kind(1) == KDead, true, "released, alias invalidated");
-  assertEqBool(t.st.kind(2) == KInit, true, "the tag is defined even after the error");
+  assertEqBool(
+    t.state().kind(0) == KDead && t.state().kind(1) == KDead,
+    true,
+    "released, alias invalidated",
+  );
+  assertEqBool(t.state().kind(2) == KInit, true, "the tag is defined even after the error");
 }
 
 @Test
@@ -284,11 +291,11 @@ function borrowsOfBorrowsAreRootedAtTheOwner(): void {
   t.run();
   assertEqUsize(t.errs.length, 0, "fine");
   assertEqBool(
-    t.st.kind(2) == KBorrowed && t.st.srcOf(2) == 0,
+    t.state().kind(2) == KBorrowed && t.state().srcOf(2) == 0,
     true,
     "rooted at the parameter, not at l1",
   );
-  assert(t.st.borrowsFlat(), "flat");
+  assert(borrowsFlatIn(t.ls), "flat");
 }
 
 @Test
@@ -315,10 +322,10 @@ function stepReplaysOneInstructionForTheOptimiser(): void {
   cx = step(cx, f.blocks[0].instrs[1]);
   assertEqBool(cx.st.kind(0) == KOwned && cx.st.kind(1) == KOwned, true, "dup demotes the source");
   assert(
-    noRevival(before, cx.st, dstOf(f.blocks[0].instrs[1])),
+    noRevival(before.ls, cx.st.ls, dstOf(f.blocks[0].instrs[1])),
     "only the destination came to life",
   );
-  assert(!noRevival(before, cx.st, None), "the destination did come to life");
+  assert(!noRevival(before.ls, cx.st.ls, None), "the destination did come to life");
 }
 
 @Test
@@ -337,9 +344,9 @@ function aPushOntoAReleasedArrayDoesNotReviveIt(): void {
 
 @Test
 function noRevivalSeesAResurrectedLocal(): void {
-  const before = new State([mk(KDead, 0), mk(KMaybeDead, 0)], []);
-  const same = new State([mk(KDead, 0), mk(KMaybeDead, 0)], []);
-  const revived = new State([mk(KDead, 0), mk(KOwned, 0)], []);
+  const before = [mk(KDead, 0), mk(KMaybeDead, 0)];
+  const same = [mk(KDead, 0), mk(KMaybeDead, 0)];
+  const revived = [mk(KDead, 0), mk(KOwned, 0)];
   assert(noRevival(before, same, None), "unchanged");
   assert(!noRevival(before, revived, None), "a poisoned local became Owned without a definition");
   assert(noRevival(before, revived, Some(1)), "fine when it is the destination");
@@ -365,6 +372,7 @@ function fixpointJoinsAtTheMergeAndLeavesDeadCodeUnreached(): void {
   const f = p.functions[0];
   let fx = new Fixpoint(p, f);
   fx.run();
+  assertEqUsize(fx.pending(), 0, "nothing left in the worklist");
   assert(fx.isStable(), "stable");
   assert(reachClosed(f, fx.ins) && statesSized(fx.ins, 2), "closed, sized");
   assert(fx.ins[4].isNone(), "block 4 is unreachable");
@@ -418,7 +426,7 @@ function redefiningARootKillsItsAliases(): void {
     [],
   );
   t.run();
-  assert(t.st.borrowsFlat(), "flat");
+  assert(borrowsFlatIn(t.ls), "flat");
 }
 
 @Test

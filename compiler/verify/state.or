@@ -195,12 +195,43 @@ export function holesInRange(hs: HoleEntry[], n: usize): bool {
   return hs.every(h => h.obj < n && (!h.sym || h.idx < n));
 }
 
+// Some slot of `x` is taken.
+export function holeAnyIn(hs: HoleEntry[], x: usize): bool {
+  return hs.some(h => h.obj == x);
+}
+
+// Exactly the slot `k` of `x` is taken.
+export function holeHasIn(hs: HoleEntry[], x: usize, k: HoleKey): bool {
+  return hs.some(h => h.obj == x && h.sym == k.sym && h.idx == k.idx);
+}
+
+// Slot `k` of `x` may be taken: an equal key, or either key is symbolic (conservative).
+@Ensures(holeHasIn(hs, x, k) ==> result)
+export function holeMayIn(hs: HoleEntry[], x: usize, k: HoleKey): bool {
+  return hs.some(h => h.obj == x && (h.sym || k.sym || h.idx == k.idx));
+}
+
+// Borrows are flat: a borrowed local depends on another local that is not itself borrowed. `rootOf` (rules.or) and the
+// single `killBorrows(x)` per release rely on it.
+export function borrowsFlatIn(ls: LState[]): bool {
+  let i: usize = 0;
+  while (i < ls.length) {
+    const s = ls[i];
+    if (s.k == KBorrowed && (s.src >= ls.length || s.src == i || ls[s.src].k == KBorrowed)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------- the state at one program point
 
-// The abstract state at one program point: `ls[l]` is the state of local `l` (one entry per local of the function) and
-// `holes` the slots that are taken. Every hole names a local of the function. Borrows are flat (`borrowsFlat`): an
-// alias depends on a local that is not itself an alias, which is what lets one `killBorrows(x)` invalidate every alias
-// of the object `x` owns; the transfer functions keep this (rules.or).
+// The abstract state at one program point, a value of the lattice: `ls[l]` is the state of local `l` (one entry per
+// local of the function) and `holes` the slots that are taken. Every hole names a local of the function. Borrows are flat
+// (`borrowsFlat`); the transfer functions keep this (rules.or). The fixpoint stores one per block and joins them; the
+// transfer functions work on the two arrays directly (class `Transfer`), because a mutating method called on a
+// class-typed field copies the object and its arrays (docs/rewrite.md, step 3b).
 @Invariant(holesInRange(this.holes, this.ls.length))
 export class State {
   ls: LState[];
@@ -227,58 +258,19 @@ export class State {
     return this.ls[l].src;
   }
 
-  // Local `l` is now in state (k, src). A borrow is rooted at another local.
-  @Requires(l < this.ls.length && isKind(k))
-  @Requires(k == KBorrowed ? src < this.ls.length && src != l : src == 0)
-  @Ensures(this.ls.length == old(this.ls.length) && this.ls[l].k == k && this.ls[l].src == src)
-  set(l: usize, k: int, src: usize): void {
-    this.ls[l] = mk(k, src);
-  }
-
-  // Every `Borrowed(x)` alias dies (x is released, moved, consumed, mutated or redefined). Nothing else changes.
-  @Requires(x < this.ls.length)
-  @Ensures(this.ls.length == old(this.ls.length))
-  @Ensures(this.ls.every(s => !(s.k == KBorrowed && s.src == x)))
-  killBorrows(x: usize): void {
-    let i: usize = 0;
-    while (i < this.ls.length) {
-      if (this.ls[i].k == KBorrowed && this.ls[i].src == x) {
-        this.ls[i] = mk(KDead, 0);
-      }
-      i += 1;
-    }
-  }
-
   // Some slot of `x` is taken.
   holeAny(x: usize): bool {
-    return this.holes.some(h => h.obj == x);
+    return holeAnyIn(this.holes, x);
   }
 
   // Exactly the slot `k` of `x` is taken.
   holeHas(x: usize, k: HoleKey): bool {
-    return this.holes.some(h => h.obj == x && h.sym == k.sym && h.idx == k.idx);
+    return holeHasIn(this.holes, x, k);
   }
 
-  // Slot `k` of `x` may be taken: an equal key, or either key is symbolic (conservative).
-  @Ensures(this.holeHas(x, k) ==> result)
+  // Slot `k` of `x` may be taken.
   holeMay(x: usize, k: HoleKey): bool {
-    return this.holes.some(h => h.obj == x && (h.sym || k.sym || h.idx == k.idx));
-  }
-
-  @Requires(x < this.ls.length && (!k.sym || k.idx < this.ls.length))
-  @Ensures(this.holes.length == old(this.holes.length) + 1 && this.holeHas(x, k))
-  addHole(x: usize, k: HoleKey): void {
-    this.holes.push(HoleEntry { obj: x, sym: k.sym, idx: k.idx });
-  }
-
-  @Ensures(!this.holeHas(x, k) && this.holes.length <= old(this.holes.length))
-  removeHole(x: usize, k: HoleKey): void {
-    this.holes = this.holes.filter(h => !(h.obj == x && h.sym == k.sym && h.idx == k.idx));
-  }
-
-  @Ensures(!this.holeAny(x) && this.holes.length <= old(this.holes.length))
-  dropHolesOf(x: usize): void {
-    this.holes = this.holes.filter(h => h.obj != x);
+    return holeMayIn(this.holes, x, k);
   }
 
   // Below `o` in the lattice: every local's state is below its state in `o`, and every hole of this is a hole of `o`.
@@ -298,16 +290,7 @@ export class State {
 
   // A borrowed local depends on another local that is not itself borrowed.
   borrowsFlat(): bool {
-    let i: usize = 0;
-    while (i < this.ls.length) {
-      const s = this.ls[i];
-      if (s.k == KBorrowed
-          && (s.src >= this.ls.length || s.src == i || this.ls[s.src].k == KBorrowed)) {
-        return false;
-      }
-      i += 1;
-    }
-    return true;
+    return borrowsFlatIn(this.ls);
   }
 
   // The join of two states of the same function: per local `joinLs`, the hole sets united (the mismatch itself is

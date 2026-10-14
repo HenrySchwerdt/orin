@@ -6,9 +6,9 @@
 import { MProgram, MFunction, Operand, Instr, Terminator, dstOf } from "../mir";
 import { Builtin } from "../hir";
 import {
-  VerifyIssue, issueSpan, sameSpan, State, LState, HoleKey, mk, ownedLike, leaky, isLive, lsEq,
-  kindName, KDead, KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen,
-  KMaybeOpen,
+  VerifyIssue, issueSpan, sameSpan, State, LState, HoleEntry, HoleKey, mk, isKind, ownedLike, leaky,
+  isLive, lsEq, holeAnyIn, holeHasIn, holeMayIn, holesInRange, borrowsFlatIn, kindName, KDead,
+  KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
 } from "./state";
 import { CRef, CHandle, localClass, wfInstr, wfTerm } from "./wf";
 
@@ -42,15 +42,13 @@ export function issuesAt(
 
 // Only a defining instruction revives a local: every local that was not live before (dead or poisoned) and is not the
 // destination `d` is in exactly the same state after.
-export function noRevival(before: State, after: State, d: Option<usize>): bool {
-  if (before.ls.length != after.ls.length) {
+export function noRevival(before: LState[], after: LState[], d: Option<usize>): bool {
+  if (before.length != after.length) {
     return false;
   }
   let i: usize = 0;
-  while (i < before.ls.length) {
-    if (!isLive(before.ls[i].k)
-        && !lsEq(before.ls[i], after.ls[i])
-        && !(d.isSome() && d.unwrap() == i)) {
+  while (i < before.length) {
+    if (!isLive(before[i].k) && !lsEq(before[i], after[i]) && !(d.isSome() && d.unwrap() == i)) {
       return false;
     }
     i += 1;
@@ -73,15 +71,20 @@ function holeKey(o: Operand): HoleKey {
 // ------------------------------------------------------------------ the transfer state
 
 // The state of one run through block `blk` of `f`: the instruction `ins` it is at (the block's instruction count is the
-// terminator), the abstract state `st` (one entry per local of `f`) and the issues found so far.
-@Invariant(this.st.ls.length == this.f.locals.length)
+// terminator), the abstract state (`ls`, one entry per local of `f`, and the open `holes`; `state()` is it as a `State`)
+// and the issues found so far. The state arrays are fields of the class itself, not a `State` field: a mutating method
+// called on a class-typed field copies that object and its arrays on every call (measured: twice as many copies as the
+// old record code and +20 % self-compile time), while a write to `this.ls[l]` is done in place.
+@Invariant(this.ls.length == this.f.locals.length)
+@Invariant(holesInRange(this.holes, this.ls.length))
 @Invariant(this.blk < this.f.blocks.length && this.ins <= this.f.blocks[this.blk].instrs.length)
 export class Transfer {
   prog: MProgram;
   f: MFunction;
   blk: usize;
   ins: usize;
-  st: State;
+  ls: LState[];
+  holes: HoleEntry[];
   errs: VerifyIssue[];
   warns: VerifyIssue[];
 
@@ -98,14 +101,21 @@ export class Transfer {
     this.f = f;
     this.blk = blk;
     this.ins = ins;
-    this.st = st;
+    this.ls = st.ls;
+    this.holes = st.holes;
     this.errs = errs;
     this.warns = warns;
   }
 
+  // The abstract state after the instructions run so far.
+  @Ensures(result.ls.length == this.ls.length)
+  state(): State {
+    return new State(this.ls, this.holes);
+  }
+
   // Runs the whole block from the state it holds: every instruction, then the terminator. Borrows stay flat.
-  @Requires(this.st.borrowsFlat())
-  @Ensures(this.st.borrowsFlat())
+  @Requires(borrowsFlatIn(this.ls))
+  @Ensures(borrowsFlatIn(this.ls))
   @Ensures(this.ins == this.f.blocks[this.blk].instrs.length)
   @Ensures(this.errs.length >= old(this.errs.length) && this.warns.length >= old(this.warns.length))
   run(): void {
@@ -125,7 +135,7 @@ export class Transfer {
   @Requires(this.ins < this.f.blocks[this.blk].instrs.length)
   @Requires(wfInstr(this.prog, this.f, ins) == "")
   @Ensures(this.ins == old(this.ins))
-  @Ensures(noRevival(old(this.st), this.st, dstOf(ins)))
+  @Ensures(noRevival(old(this.ls), this.ls, dstOf(ins)))
   @Ensures(this.errs.length >= old(this.errs.length) && this.warns.length >= old(this.warns.length))
   @Ensures(issuesAt(this.errs, old(this.errs.length), this.f, this.blk, this.ins))
   @Ensures(issuesAt(this.warns, old(this.warns.length), this.f, this.blk, this.ins))
@@ -138,7 +148,7 @@ export class Transfer {
   @Requires(this.ins == this.f.blocks[this.blk].instrs.length)
   @Requires(wfTerm(this.prog, this.f, t) == "")
   @Ensures(this.ins == old(this.ins))
-  @Ensures(noRevival(old(this.st), this.st, None))
+  @Ensures(noRevival(old(this.ls), this.ls, None))
   @Ensures(issuesAt(this.errs, old(this.errs.length), this.f, this.blk, this.ins))
   @Ensures(issuesAt(this.warns, old(this.warns.length), this.f, this.blk, this.ins))
   term(t: Terminator): void {
@@ -158,8 +168,8 @@ export class Transfer {
           None => {},
         }
         let i: usize = 0;
-        while (i < this.st.ls.length) {
-          const k = this.st.ls[i].k;
+        while (i < this.ls.length) {
+          const k = this.ls[i].k;
           if (leaky(k)) {
             this.warn("leak: " + this.nm(i) + " may still own a reference at return");
           }
@@ -171,12 +181,51 @@ export class Transfer {
           }
           i += 1;
         }
-        for (const h of this.st.holes) {
+        for (const h of this.holes) {
           this.err("return with an open hole in " + this.nm(h.obj));
         }
       },
       TTrap(_) => {},
     }
+  }
+
+  // ---------------------------------------------------------------- the state arrays
+
+  // Local `l` is now in state (k, src). A borrow is rooted at another local.
+  @Requires(l < this.ls.length && isKind(k))
+  @Requires(k == KBorrowed ? src < this.ls.length && src != l : src == 0)
+  private set(l: usize, k: int, src: usize): void {
+    this.ls[l] = mk(k, src);
+  }
+
+  // Every `Borrowed(x)` alias dies (x is released, moved, consumed, mutated or redefined). Nothing else changes.
+  @Requires(x < this.ls.length)
+  @Ensures(this.ls.length == old(this.ls.length))
+  @Ensures(this.ls.every(s => !(s.k == KBorrowed && s.src == x)))
+  private killBorrows(x: usize): void {
+    let i: usize = 0;
+    while (i < this.ls.length) {
+      if (this.ls[i].k == KBorrowed && this.ls[i].src == x) {
+        this.ls[i] = mk(KDead, 0);
+      }
+      i += 1;
+    }
+  }
+
+  @Requires(x < this.ls.length && (!k.sym || k.idx < this.ls.length))
+  @Ensures(this.holes.length == old(this.holes.length) + 1 && holeHasIn(this.holes, x, k))
+  private addHole(x: usize, k: HoleKey): void {
+    this.holes.push(HoleEntry { obj: x, sym: k.sym, idx: k.idx });
+  }
+
+  @Ensures(!holeHasIn(this.holes, x, k) && this.holes.length <= old(this.holes.length))
+  private removeHole(x: usize, k: HoleKey): void {
+    this.holes = this.holes.filter(h => !(h.obj == x && h.sym == k.sym && h.idx == k.idx));
+  }
+
+  @Ensures(!holeAnyIn(this.holes, x) && this.holes.length <= old(this.holes.length))
+  private dropHolesOf(x: usize): void {
+    this.holes = this.holes.filter(h => h.obj != x);
   }
 
   // ---------------------------------------------------------------- reporting and basics
@@ -206,7 +255,7 @@ export class Transfer {
   }
 
   private kindOf(l: usize): int {
-    return this.st.ls[l].k;
+    return this.ls[l].k;
   }
 
   private isRefLocal(l: usize): bool {
@@ -235,7 +284,7 @@ export class Transfer {
   // Whole-object use of a local: live, and no slot may be missing.
   private readWhole(l: usize): void {
     this.readLocal(l);
-    if (this.isRefLocal(l) && this.st.holeAny(l)) {
+    if (this.isRefLocal(l) && holeAnyIn(this.holes, l)) {
       this.err("whole-object use of " + this.nm(l) + " while a slot is taken (open hole)");
     }
   }
@@ -286,8 +335,8 @@ export class Transfer {
 
   // Owned-like local ceases to exist (released or consumed): Dead, borrows invalidated.
   private kill(l: usize): void {
-    this.st.killBorrows(l);
-    this.st.set(l, KDead, 0);
+    this.killBorrows(l);
+    this.set(l, KDead, 0);
   }
 
   // Consume an operand (ref slots of IStructNew, stored values, pushed values, returned values).
@@ -325,17 +374,17 @@ export class Transfer {
     if (leaky(this.kindOf(d))) {
       this.warn("leak: " + this.nm(d) + " is overwritten while it may still own a reference");
     }
-    if (this.st.holeAny(d)) {
+    if (holeAnyIn(this.holes, d)) {
       this.err(this.nm(d) + " is overwritten while a slot is taken (open hole)");
-      this.st.dropHolesOf(d);
+      this.dropHolesOf(d);
     }
-    for (const h of this.st.holes) {
+    for (const h of this.holes) {
       if (h.sym && h.idx == d) {
         this.err("index local " + this.nm(d) + " is overwritten while it names an open hole");
       }
     }
-    this.st.killBorrows(d);
-    this.st.set(d, k, src);
+    this.killBorrows(d);
+    this.set(d, k, src);
   }
 
   // Destination of a result: Owned for references, initialised for scalars.
@@ -345,7 +394,7 @@ export class Transfer {
 
   // Root a new borrow of local l depends on: l itself, or l's own root (borrows are flat).
   private rootOf(l: usize): usize {
-    const s = this.st.ls[l];
+    const s = this.ls[l];
     return s.k == KBorrowed ? s.src : l;
   }
 
@@ -363,7 +412,7 @@ export class Transfer {
   // return it) is no longer provably unique.
   private demote(l: usize): void {
     if (this.kindOf(l) == KUnique) {
-      this.st.set(l, KOwned, 0);
+      this.set(l, KOwned, 0);
     }
   }
 
@@ -416,7 +465,7 @@ export class Transfer {
               if (j != i && !(j < owned.length && owned[j])) {
                 match (args[j]) {
                   OLocal(y) => {
-                    if (y == x || this.kindOf(y) == KBorrowed && this.st.ls[y].src == x) {
+                    if (y == x || this.kindOf(y) == KBorrowed && this.ls[y].src == x) {
                       this.err(
                         "borrowed argument " + this.nm(y) + " aliases consumed argument "
                             + this.nm(x),
@@ -465,7 +514,7 @@ export class Transfer {
     match (o) {
       OLocal(l) => {
         this.readLocal(l);
-        if (this.st.holeMay(l, k)) {
+        if (holeMayIn(this.holes, l, k)) {
           this.err("read of a slot of " + this.nm(l) + " that is (or may be) taken");
         }
       },
@@ -477,45 +526,45 @@ export class Transfer {
   // ISetField / IArraySet.
   private store(x: usize, k: HoleKey, v: Operand, what: string): void {
     this.needUnique(x, what);
-    if (this.st.holeMay(x, k)) {
+    if (holeMayIn(this.holes, x, k)) {
       this.err(
         what + " into a slot of " + this.nm(x)
             + " that is (or may be) taken; use the put instruction",
       );
     }
     this.consume(v);
-    this.st.killBorrows(x);
+    this.killBorrows(x);
   }
 
   // ITakeField / IArrayTake.
   private take(d: usize, x: usize, k: HoleKey, what: string): void {
     this.needUnique(x, what);
-    if (this.st.holeMay(x, k)) {
+    if (holeMayIn(this.holes, x, k)) {
       this.err(what + " of a slot of " + this.nm(x) + " that is (or may be) already taken");
     }
-    this.st.killBorrows(x);
-    this.st.addHole(x, k);
+    this.killBorrows(x);
+    this.addHole(x, k);
     this.def(d, KOwned, 0);
   }
 
   // IPutField / IArrayPut.
   private put(x: usize, k: HoleKey, s: usize, what: string): void {
     this.needUnique(x, what);
-    if (!this.st.holeHas(x, k)) {
+    if (!holeHasIn(this.holes, x, k)) {
       this.err(what + " into a slot of " + this.nm(x) + " that is not a taken slot");
     }
     this.consume(OLocal(s));
-    this.st.removeHole(x, k);
-    this.st.killBorrows(x);
+    this.removeHole(x, k);
+    this.killBorrows(x);
   }
 
   // IArrayPush / IArrayPop / IStrAppend: x must be owned (not Param/Borrowed); the runtime may
   // reallocate or mutate it, so borrows die and Unique is not kept.
   private mutateOwned(x: usize, what: string): void {
     this.needOwned(x, what);
-    this.st.killBorrows(x);
+    this.killBorrows(x);
     if (ownedLike(this.kindOf(x))) {
-      this.st.set(x, KOwned, 0);
+      this.set(x, KOwned, 0);
     }
   }
 
@@ -541,7 +590,7 @@ export class Transfer {
       OLocal(h) => {
         const k = this.kindOf(h);
         if (k == KOpen) {
-          this.st.set(h, KDead, 0);
+          this.set(h, KDead, 0);
         } else if (k == KParam) {
           this.err(
             "close of parameter " + this.nm(h)
@@ -669,7 +718,7 @@ export class Transfer {
         this.readOp(y);
         match (y) {
           OLocal(l) => {
-            if (this.kindOf(l) == KBorrowed && this.st.ls[l].src == x) {
+            if (this.kindOf(l) == KBorrowed && this.ls[l].src == x) {
               this.err(
                 "IStrAppend: " + this.nm(l) + " is borrowed from the string being appended to",
               );
@@ -710,9 +759,9 @@ export class Transfer {
       IMakeUnique(x) => {
         const k = this.kindOf(x);
         this.needOwned(x, "IMakeUnique");
-        this.st.killBorrows(x);
+        this.killBorrows(x);
         if (ownedLike(k)) {
-          this.st.set(x, KUnique, 0);
+          this.set(x, KUnique, 0);
         }
       },
       IArrayNew(d, _, elems) => {
@@ -774,7 +823,7 @@ export function step(cx: Cx, ins: Instr): Cx {
     f: t.f,
     blk: t.blk,
     ins: t.ins,
-    st: t.st,
+    st: t.state(),
     errs: t.errs,
     warns: t.warns,
   };
