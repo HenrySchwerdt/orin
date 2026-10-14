@@ -1,0 +1,954 @@
+// Run-time contract checking, second half (`orin compile --check-contracts`, ADR-0031 A1-A3 and A5).
+// Beyond Orin-B. rtcheck.or expands the contracts into wrapper functions and check statements on the AST; the
+// expanded program is type-checked; this pass then rewrites the typed HIR, where types and function ids are
+// known:
+//
+//   * violation reports (A1, A2): every check statement
+//         if (!(p)) { $contract$fail(clause, site, olds, ""); }
+//     gets its failure branch replaced by a call of `contract__fail` (the support code of rtcheck.or) with the
+//     report built from the clause: the function and its arguments, every maximal non-literal operand of the
+//     failed clause with its value (the pieces that short-circuiting skipped are not evaluated), and the
+//     `old(..)` values. The report only re-evaluates sub-terms of an already evaluated, pure clause;
+//   * caller locations (A2): a call of a function with a @Requires (the forwarder `f`) is redirected to its
+//     checking wrapper `$contract$site$f` with the location of the call as an extra argument;
+//   * contract-internal calls (A5): inside a clause a call of a function that has contracts goes to its
+//     unchecked body `$contract$body$f`, so a clause that calls its own function terminates;
+//   * record invariants (A3): every record literal of a type with an @Invariant, every field assignment (and
+//     `push` / `pop` on a field) whose place passes through such a record, and every `return` in a function
+//     whose result type is such a record is wrapped by a call of `$contract$rec$R(site, value)`.
+// Functions are found by their names (qualified: `unit.name`, generic instances `unit.name<..>`; the marker
+// is inserted before the last segment).
+
+import { Span, SourceMap } from "../diag";
+import {
+  Program, Function, Local, RecordDef, Type, BinOp, HBlock, HStmt, HExpr, HExprKind, HArm, FieldInitH, Place, PlaceElem,
+  HLet, HAssign, HExprStmt, HIf, HWhile, HForOf, HBreak, HContinue, HReturn, HBlockStmt,
+  XInt, XFloat, XBool, XStr, XLocal, XUnary, XBinary, XCall, XBuiltin, XMutMethod, XField, XIndex, XRecord, XVariant,
+  XArray, XTry, XCond, XMatch, XClosure, XCallIndirect, XIface, XCallVirtual,
+  TyInt, TyUsize, TyIntK, TyBool, TyFloat, TyF32, TyString, TyVoid, TyArray, TyOption, TyResult, TyRecord, TyUnion,
+  TyFn, TyIface, TyFile, TyGrant, grantTypeName, PField, PIndex, UnNot, UnNeg, OpAdd, OpDiv, OpRem, OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpAnd, OpOr,
+  BArrLength, BStrLength, kindName
+} from "../hir";
+
+const FAIL_STUB: string = "$contract$fail";
+const FAIL_REAL: string = "contract__fail";
+const BODY: string = "$contract$body$";
+const SITE: string = "$contract$site$";
+const REC: string = "$contract$rec$";
+const SITE_PARAM: string = "$site";
+const MAX_TERM_LABEL: usize = 60;
+
+type Ctx = {
+  sm: SourceMap;
+  records: RecordDef[];
+  fail: usize;
+  showInt: usize;
+  showUsize: usize;
+  showBool: usize;
+  showStr: usize;
+  showFloat: usize;
+  showF32: usize;
+  showLen: usize;
+  stubs: bool[];       // function id -> is the `$contract$fail` stub of some unit
+  bodyOf: int[];       // function id -> id of its unchecked body `$contract$body$..`, or -1
+  siteOf: int[];       // function id -> id of its checking wrapper `$contract$site$..` (the function is a forwarder), or -1
+  sitePos: int[];      // function id (of a forwarder) -> index of the `$site` parameter of its checking wrapper
+  recChk: int[];       // record id -> id of `$contract$rec$R`, or -1
+  fn: Function;        // the function being rewritten
+  retChk: int;         // the invariant check to apply at its `return`s, or -1
+};
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+// Start of the last segment of a qualified name: after the last `.` outside `<..>`.
+function lastSegment(name: string): usize {
+  let depth: int = 0;
+  let cut: usize = 0;
+  let i: usize = 0;
+  while (i < name.length) {
+    const ch = name.charCodeAt(i);
+    if (ch == 60) {
+      depth += 1;
+    } else if (ch == 62) {
+      depth -= 1;
+    } else if (ch == 46 && depth == 0) {
+      cut = i + 1;
+    }
+    i += 1;
+  }
+  return cut;
+}
+
+function insertBeforeLast(name: string, ins: string): string {
+  const cut = lastSegment(name);
+  return name.substring(0, cut) + ins + name.substring(cut, name.length);
+}
+
+function shortName(name: string): string {
+  return name.substring(lastSegment(name), name.length);
+}
+
+function endsWithName(name: string, suffix: string): bool {
+  return name.endsWith("." + suffix);
+}
+
+function cleanName(n: string): string {
+  return n.split(SITE).join("").split(BODY).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Building HIR
+// ---------------------------------------------------------------------------
+
+function strE(s: string, sp: Span): HExpr {
+  return HExpr { kind: XStr(s), ty: TyString, span: sp };
+}
+
+function litStr(e: HExpr): Option<string> {
+  return match (e.kind) {
+    XStr(s) => Some(s),
+    _ => None
+  };
+}
+
+// String concatenation; adjacent literals are merged, "" is dropped.
+function cat(a: HExpr, b: HExpr): HExpr {
+  const la = litStr(a);
+  const lb = litStr(b);
+  if (la.isSome() && la.unwrap() == "") {
+    return b;
+  }
+  if (lb.isSome() && lb.unwrap() == "") {
+    return a;
+  }
+  if (la.isSome() && lb.isSome()) {
+    return strE(la.unwrap() + lb.unwrap(), a.span);
+  }
+  return HExpr { kind: XBinary(OpAdd, a, b), ty: TyString, span: a.span };
+}
+
+function isEmptyStr(e: HExpr): bool {
+  const l = litStr(e);
+  return l.isSome() && l.unwrap() == "";
+}
+
+function condE(c: HExpr, t: HExpr, f: HExpr): HExpr {
+  if (isEmptyStr(t) && isEmptyStr(f)) {
+    return t;
+  }
+  return HExpr { kind: XCond(c, t, f), ty: TyString, span: c.span };
+}
+
+function typeName(c: Ctx, t: Type): string {
+  return match (t) {
+    TyInt => "int",
+    TyUsize => "usize",
+    TyIntK(k) => kindName(k.toInt()),
+    TyBool => "bool",
+    TyFloat => "float",
+    TyF32 => "f32",
+    TyString => "string",
+    TyVoid => "void",
+    TyArray(x) => typeName(c, x) + "[]",
+    TyOption(x) => "Option<" + typeName(c, x) + ">",
+    TyResult(a, b) => "Result<" + typeName(c, a) + ", " + typeName(c, b) + ">",
+    TyRecord(r) => r < c.records.length ? shortName(c.records[r].name) : "record",
+    TyUnion(_) => "enum",
+    TyFn(_, _) => "function",
+    TyIface(_) => "interface",
+    TyFile => "File",
+    TyGrant(k) => grantTypeName(k)
+  };
+}
+
+function showCall(f: usize, a: HExpr): HExpr {
+  return HExpr { kind: XCall(f, [a]), ty: TyString, span: a.span };
+}
+
+// The text of the value of `e`: ints, bools, floats and strings by value (strings quoted and truncated), arrays by
+// length, anything else as `<Type>` (not evaluated).
+function valueE(c: Ctx, e: HExpr): HExpr {
+  return match (e.ty) {
+    TyInt => showCall(c.showInt, e),
+    TyUsize => showCall(c.showUsize, e),
+    TyIntK(k) => k == 8 ? showCall(c.showUsize, e) : showCall(c.showInt, e),
+    TyBool => showCall(c.showBool, e),
+    TyString => showCall(c.showStr, e),
+    TyFloat => showCall(c.showFloat, e),
+    TyF32 => showCall(c.showF32, e),
+    TyArray(_) => HExpr {
+      kind: XCall(c.showLen, [strE(typeName(c, e.ty), e.span), HExpr { kind: XBuiltin(BArrLength, [e]), ty: TyUsize, span: e.span }]),
+      ty: TyString, span: e.span
+    },
+    _ => strE("<" + typeName(c, e.ty) + ">", e.span)
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Source text and locations
+// ---------------------------------------------------------------------------
+
+function spanKey(sp: Span): string {
+  return sp.file.toString() + ":" + sp.start.toString() + ":" + sp.end.toString() + ";";
+}
+
+function labelOf(c: Ctx, e: HExpr, olds: string): string {
+  const sp = e.span;
+  let label = "<expr>";
+  if (sp.file < c.sm.files.length) {
+    const t = c.sm.files[sp.file].text;
+    if (sp.start < sp.end && sp.end <= t.length) {
+      label = t.substring(sp.start, sp.end).split("\n").join(" ").trim();
+      if (label.length > MAX_TERM_LABEL) {
+        label = label.substring(0, MAX_TERM_LABEL - 3) + "...";
+      }
+    }
+  }
+  if (olds.includes(spanKey(sp))) {
+    return "old(" + label + ")";
+  }
+  return label;
+}
+
+// `path:line` of the start of `sp`.
+function siteOfSpan(c: Ctx, sp: Span): string {
+  if (sp.file >= c.sm.files.length) {
+    return "";
+  }
+  const f = c.sm.files[sp.file];
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < sp.start && i < f.text.length) {
+    if (f.text.charCodeAt(i) == 10) {
+      line += 1;
+    }
+    i += 1;
+  }
+  return f.path + ":" + line.toString();
+}
+
+// ---------------------------------------------------------------------------
+// The report of a failed clause
+// ---------------------------------------------------------------------------
+
+type Rep = { e: HExpr; seen: string[]; };
+
+function isLiteral(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XFloat(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XUnary(op, x) => match (op) {
+      UnNeg => isLiteral(x),
+      _ => false
+    },
+    XVariant(_, args) => args.length == 0,
+    XArray(xs) => xs.length == 0,
+    _ => false
+  };
+}
+
+function isFunctionValue(e: HExpr): bool {
+  return match (e.ty) {
+    TyFn(_, _) => true,
+    _ => false
+  };
+}
+
+function hasLabel(seen: string[], l: string): bool {
+  for (const s of seen) {
+    if (s == l) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True when evaluating parts of `e` may be skipped (a conditional, `match`, `&&`, `||`).
+function hasBranch(e: HExpr): bool {
+  const here = match (e.kind) {
+    XCond(_, _, _) => true,
+    XMatch(_, _) => true,
+    XBinary(op, _, _) => match (op) {
+      OpAnd => true,
+      OpOr => true,
+      _ => false
+    },
+    _ => false
+  };
+  if (here) {
+    return true;
+  }
+  for (const k of kids(e)) {
+    if (hasBranch(k)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function termLine(c: Ctx, label: string, e: HExpr): HExpr {
+  return cat(cat(strE("    " + label + " = ", e.span), valueE(c, e)), strE("\n", e.span));
+}
+
+// `    label = value\n`, unless `e` is a literal or its label was already printed; then the `old(..)` values
+// inside `e` (evaluated with `e`, so evaluating them again is as safe as the clause was).
+function operand(c: Ctx, e: HExpr, olds: string, seen0: string[]): Rep {
+  const none = strE("", e.span);
+  if (isLiteral(e) || isFunctionValue(e)) {
+    return Rep { e: none, seen: seen0 };
+  }
+  const label = labelOf(c, e, olds);
+  if (hasLabel(seen0, label)) {
+    return Rep { e: none, seen: seen0 };
+  }
+  let seen = seen0;
+  seen.push(label);
+  let acc = termLine(c, label, e);
+  if (olds != "") {
+    for (const x of findOlds(e, olds, [])) {
+      const l2 = labelOf(c, x, olds);
+      if (hasLabel(seen, l2)) {
+        continue;
+      }
+      seen.push(l2);
+      if (evalSafe(x) || !hasBranch(e)) {
+        acc = cat(acc, termLine(c, l2, x));
+      } else {
+        acc = cat(acc, strE("    " + l2 + " = <not shown>\n", x.span));
+      }
+    }
+  }
+  return Rep { e: acc, seen: seen };
+}
+
+function repOperands(c: Ctx, es: HExpr[], olds: string, seen0: string[]): Rep {
+  let acc = strE("", es.length > 0 ? es[0].span : c.fn.span);
+  let seen = seen0;
+  for (const x of es) {
+    const r = operand(c, x, olds, seen);
+    acc = cat(acc, r.e);
+    seen = r.seen;
+  }
+  return Rep { e: acc, seen: seen };
+}
+
+// An atom of a clause: the operands of a call (its value is the clause's, known), else the atom itself.
+function repAtom(c: Ctx, e: HExpr, olds: string, seen: string[]): Rep {
+  return match (e.kind) {
+    XCall(_, args) => repOperands(c, args, olds, seen),
+    XBuiltin(_, args) => repOperands(c, args, olds, seen),
+    XCallIndirect(_, args) => repOperands(c, args, olds, seen),
+    XCallVirtual(r, _, args) => repOperands(c, [r].concat(args), olds, seen),
+    _ => operand(c, e, olds, seen)
+  };
+}
+
+// The terms of the evaluated part of the clause `e` (parts skipped by `&&`, `||` and `==>` are guarded, never
+// evaluated). A comparison contributes its two operands, a logical operator its operands, `!x` the terms of `x`.
+function rep(c: Ctx, e: HExpr, olds: string, seen: string[]): Rep {
+  return match (e.kind) {
+    XUnary(op, x) => match (op) {
+      UnNot => rep(c, x, olds, seen),
+      _ => repAtom(c, e, olds, seen)
+    },
+    XBinary(op, a, b) => repBinary(c, e, op, a, b, olds, seen),
+    _ => repAtom(c, e, olds, seen)
+  };
+}
+
+function repBinary(c: Ctx, e: HExpr, op: BinOp, a: HExpr, b: HExpr, olds: string, seen: string[]): Rep {
+  return match (op) {
+    OpAnd => repAnd(c, a, b, olds, seen),
+    OpOr => repOr(c, a, b, olds, seen),
+    OpEq => repOperands(c, [a, b], olds, seen),
+    OpNe => repOperands(c, [a, b], olds, seen),
+    OpLt => repOperands(c, [a, b], olds, seen),
+    OpLe => repOperands(c, [a, b], olds, seen),
+    OpGt => repOperands(c, [a, b], olds, seen),
+    OpGe => repOperands(c, [a, b], olds, seen),
+    _ => operand(c, e, olds, seen)
+  };
+}
+
+// a && b: `b` was evaluated only if `a` was true.
+function repAnd(c: Ctx, a: HExpr, b: HExpr, olds: string, seen: string[]): Rep {
+  const ra = rep(c, a, olds, seen);
+  const rb = rep(c, b, olds, ra.seen);
+  return Rep { e: cat(ra.e, condE(a, rb.e, strE("", a.span))), seen: ra.seen };
+}
+
+// a || b: `b` was evaluated only if `a` was false.
+function repOr(c: Ctx, a: HExpr, b: HExpr, olds: string, seen: string[]): Rep {
+  const ra = rep(c, a, olds, seen);
+  const rb = rep(c, b, olds, ra.seen);
+  return Rep { e: cat(ra.e, condE(a, strE("", a.span), rb.e)), seen: ra.seen };
+}
+
+// The sub-expressions of `e` whose span is the argument of an `old(..)` (a flat search of the clause).
+function findOlds(e: HExpr, olds: string, out0: HExpr[]): HExpr[] {
+  let out = out0;
+  if (olds.includes(spanKey(e.span))) {
+    out.push(e);
+    return out;
+  }
+  for (const k of kids(e)) {
+    out = findOlds(k, olds, out);
+  }
+  return out;
+}
+
+function kids(e: HExpr): HExpr[] {
+  return match (e.kind) {
+    XUnary(_, x) => [x],
+    XBinary(_, a, b) => [a, b],
+    XCall(_, args) => args,
+    XBuiltin(_, args) => args,
+    XField(b, _, _) => [b],
+    XIndex(a, b) => [a, b],
+    XVariant(_, args) => args,
+    XArray(xs) => xs,
+    XCond(a, b, d) => [a, b, d],
+    XCallVirtual(r, _, args) => [r].concat(args),
+    XCallIndirect(f, args) => [f].concat(args),
+    XIface(_, v) => [v],
+    XClosure(_, caps) => caps,
+    XTry(x) => [x],
+    XRecord(_, spread, fields) => recordKids(spread, fields),
+    XMatch(x, arms) => matchKids(x, arms),
+    _ => []
+  };
+}
+
+function recordKids(spread: Option<HExpr>, fields: FieldInitH[]): HExpr[] {
+  let out: HExpr[] = [];
+  match (spread) {
+    Some(x) => { out.push(x); },
+    None => {}
+  }
+  for (const f of fields) {
+    out.push(f.value);
+  }
+  return out;
+}
+
+function matchKids(x: HExpr, arms: HArm[]): HExpr[] {
+  let out: HExpr[] = [x];
+  for (const a of arms) {
+    match (a.value) {
+      Some(v) => { out.push(v); },
+      None => {}
+    }
+  }
+  return out;
+}
+
+// True when evaluating `e` cannot trap (no division, indexing, call, unwrap): safe to evaluate in a report
+// even where the clause itself may have skipped it.
+function evalSafe(e: HExpr): bool {
+  const ok = match (e.kind) {
+    XInt(_) => true,
+    XFloat(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XLocal(_) => true,
+    XUnary(_, _) => true,
+    XBinary(op, _, _) => match (op) {
+      OpDiv => false,
+      OpRem => false,
+      _ => true
+    },
+    XField(_, _, _) => true,
+    XBuiltin(b, _) => match (b) {
+      BArrLength => true,
+      BStrLength => true,
+      _ => false
+    },
+    _ => false
+  };
+  if (!ok) {
+    return false;
+  }
+  for (const k of kids(e)) {
+    if (!evalSafe(k)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// `name = value, ..` of the parameters of the current function.
+function argsE(c: Ctx): HExpr {
+  const f = c.fn;
+  let acc = strE("", f.span);
+  let k: usize = 0;
+  let first = true;
+  while (k < f.paramCount && k < f.locals.length) {
+    const name = f.locals[k].name;
+    if (!name.startsWith("$") && name != "this$") {
+      const x = HExpr { kind: XLocal(k), ty: f.locals[k].ty, span: f.span };
+      acc = cat(acc, cat(strE((first ? "" : ", ") + name + " = ", f.span), valueE(c, x)));
+      first = false;
+    }
+    k += 1;
+  }
+  return acc;
+}
+
+// The name shown for the current function: `unit.f`, or `record R` for the invariant check of a record type.
+function displayName(c: Ctx): string {
+  const n = c.fn.name;
+  if (n.includes(REC)) {
+    return "record " + n.substring(n.indexOf(REC).unwrap() + REC.length, n.length);
+  }
+  return cleanName(n);
+}
+
+// The statement that replaces `if (!p) { $contract$fail(msg, site, olds, "") }`'s failure branch.
+function failStmt(c: Ctx, p: HExpr, args: HExpr[]): HStmt {
+  const sp = args[0].span;
+  const olds = match (litStr(args[2])) {
+    Some(s) => s,
+    None => ""
+  };
+  const disp = displayName(c);
+  let detail = strE("", sp);
+  if (disp.startsWith("record ")) {
+    detail = strE("  " + disp + "\n", sp);
+  } else {
+    detail = cat(cat(strE("  function: " + disp + "(", sp), argsE(c)), strE(")\n", sp));
+  }
+  const r1 = rep(c, p, olds, []);
+  const terms = r1.e;
+  if (!isEmptyStr(terms)) {
+    detail = cat(cat(detail, strE("  values:\n", sp)), terms);
+  }
+  const call = HExpr { kind: XCall(c.fail, [args[0], args[1], strE(disp, sp), detail]), ty: TyVoid, span: sp };
+  return HExprStmt(call);
+}
+
+// ---------------------------------------------------------------------------
+// Rewriting
+// ---------------------------------------------------------------------------
+
+function xExprs(c: Ctx, es: HExpr[], cl: bool): HExpr[] {
+  let out: HExpr[] = [];
+  for (const e of es) {
+    out.push(xExpr(c, e, cl));
+  }
+  return out;
+}
+
+function xOpt(c: Ctx, o: Option<HExpr>, cl: bool): Option<HExpr> {
+  return match (o) {
+    Some(x) => Some(xExpr(c, x, cl)),
+    None => None
+  };
+}
+
+function xPlace(c: Ctx, p: Place, cl: bool): Place {
+  let path: PlaceElem[] = [];
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => { path.push(PIndex(xExpr(c, ix, cl))); },
+      _ => { path.push(el); }
+    }
+  }
+  return Place { root: p.root, path: path, ty: p.ty };
+}
+
+function xArms(c: Ctx, arms: HArm[], cl: bool): HArm[] {
+  let out: HArm[] = [];
+  for (const a of arms) {
+    out.push(HArm { pattern: a.pattern, body: xBlock(c, a.body, cl), value: xOpt(c, a.value, cl) });
+  }
+  return out;
+}
+
+function xFields(c: Ctx, fs: FieldInitH[], cl: bool): FieldInitH[] {
+  let out: FieldInitH[] = [];
+  for (const f of fs) {
+    out.push(FieldInitH { index: f.index, value: xExpr(c, f.value, cl) });
+  }
+  return out;
+}
+
+// A call: in a clause to the unchecked body; elsewhere a call of a forwarder gets the caller's location.
+function xCall(c: Ctx, e: HExpr, id: usize, args: HExpr[], cl: bool): HExprKind {
+  const nargs = xExprs(c, args, cl);
+  if (id >= c.bodyOf.length) {
+    return XCall(id, nargs);
+  }
+  if (cl) {
+    if (c.bodyOf[id] >= 0) {
+      return XCall(c.bodyOf[id].toUsize(), nargs);
+    }
+    return XCall(id, nargs);
+  }
+  if (c.siteOf[id] >= 0) {
+    const at = c.sitePos[id].toUsize();
+    let withSite: HExpr[] = [];
+    let i: usize = 0;
+    while (i < nargs.length) {
+      if (i == at) {
+        withSite.push(strE(siteOfSpan(c, e.span), e.span));
+      }
+      withSite.push(nargs[i]);
+      i += 1;
+    }
+    if (at >= nargs.length) {
+      withSite.push(strE(siteOfSpan(c, e.span), e.span));
+    }
+    return XCall(c.siteOf[id].toUsize(), withSite);
+  }
+  return XCall(id, nargs);
+}
+
+function xExpr(c: Ctx, e: HExpr, cl: bool): HExpr {
+  const k: HExprKind = match (e.kind) {
+    XUnary(op, x) => XUnary(op, xExpr(c, x, cl)),
+    XBinary(op, a, b) => XBinary(op, xExpr(c, a, cl), xExpr(c, b, cl)),
+    XCall(id, args) => xCall(c, e, id, args, cl),
+    XBuiltin(b, args) => XBuiltin(b, xExprs(c, args, cl)),
+    XMutMethod(m, place, args) => XMutMethod(m, xPlace(c, place, cl), xExprs(c, args, cl)),
+    XField(b, r, i) => XField(xExpr(c, b, cl), r, i),
+    XIndex(a, b) => XIndex(xExpr(c, a, cl), xExpr(c, b, cl)),
+    XRecord(r, spread, fields) => XRecord(r, xOpt(c, spread, cl), xFields(c, fields, cl)),
+    XVariant(t, args) => XVariant(t, xExprs(c, args, cl)),
+    XArray(xs) => XArray(xExprs(c, xs, cl)),
+    XTry(x) => XTry(xExpr(c, x, cl)),
+    XCond(a, b, d) => XCond(xExpr(c, a, cl), xExpr(c, b, cl), xExpr(c, d, cl)),
+    XMatch(x, arms) => XMatch(xExpr(c, x, cl), xArms(c, arms, cl)),
+    XClosure(f, caps) => XClosure(f, xExprs(c, caps, cl)),
+    XCallIndirect(f, args) => XCallIndirect(xExpr(c, f, cl), xExprs(c, args, cl)),
+    XIface(v, x) => XIface(v, xExpr(c, x, cl)),
+    XCallVirtual(r, s, args) => XCallVirtual(xExpr(c, r, cl), s, xExprs(c, args, cl)),
+    _ => e.kind
+  };
+  const out = HExpr { kind: k, ty: e.ty, span: e.span };
+  // A record literal of a type with an invariant is checked (not inside a clause: the clause may build the
+  // record it constrains).
+  if (!cl) {
+    match (e.kind) {
+      XRecord(r, _, _) => {
+        if (r < c.recChk.length && c.recChk[r] >= 0) {
+          return wrapRec(c, c.recChk[r].toUsize(), out);
+        }
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+function wrapRec(c: Ctx, chk: usize, v: HExpr): HExpr {
+  return HExpr { kind: XCall(chk, [strE(siteOfSpan(c, v.span), v.span), v]), ty: v.ty, span: v.span };
+}
+
+function isCallOf(e: HExpr, f: usize): bool {
+  return match (e.kind) {
+    XCall(id, _) => id == f,
+    _ => false
+  };
+}
+
+function xBlock(c: Ctx, b: HBlock, cl: bool): HBlock {
+  let out: HStmt[] = [];
+  for (const st of b.stmts) {
+    for (const x of xStmt(c, st, cl)) {
+      out.push(x);
+    }
+  }
+  return HBlock { stmts: out };
+}
+
+// Is `e` simple enough to be evaluated twice (an index of an assigned place)?
+function simpleExpr(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XLocal(_) => true,
+    XUnary(_, x) => simpleExpr(x),
+    XBinary(_, a, b) => simpleExpr(a) && simpleExpr(b),
+    XField(b, _, _) => simpleExpr(b),
+    _ => false
+  };
+}
+
+// Checks after a write through `p`: every record on the path that has an invariant, innermost first.
+function placeChecks(c: Ctx, p: Place, sp: Span): HStmt[] {
+  let out: HStmt[] = [];
+  if (p.root >= c.fn.locals.length) {
+    return out;
+  }
+  let vals: HExpr[] = [];
+  let cur = HExpr { kind: XLocal(p.root), ty: c.fn.locals[p.root].ty, span: sp };
+  vals.push(cur);
+  for (const el of p.path) {
+    match (el) {
+      PField(r, i) => {
+        if (r >= c.records.length || i >= c.records[r].fields.length) {
+          return out;
+        }
+        cur = HExpr { kind: XField(cur, r, i), ty: c.records[r].fields[i].ty, span: sp };
+      },
+      PIndex(ix) => {
+        if (!simpleExpr(ix)) {
+          return out;
+        }
+        const et = match (cur.ty) {
+          TyArray(t) => t,
+          _ => TyVoid
+        };
+        cur = HExpr { kind: XIndex(cur, ix), ty: et, span: sp };
+      }
+    }
+    vals.push(cur);
+  }
+  let i = p.path.length;
+  while (i > 0) {
+    i -= 1;
+    match (p.path[i]) {
+      PField(r, _) => {
+        if (r < c.recChk.length && c.recChk[r] >= 0) {
+          out.push(HExprStmt(wrapRec(c, c.recChk[r].toUsize(), vals[i])));
+        }
+      },
+      _ => {}
+    }
+  }
+  return out;
+}
+
+// The check statement `if (!(p)) { $contract$fail(..) }` generated by rtcheck.or, if `st` is one.
+function checkParts(c: Ctx, st: HStmt): Option<HExpr[]> {
+  const none: Option<HExpr[]> = None;
+  return match (st) {
+    HIf(cond, th, el) => match (el) {
+      Some(_) => none,
+      None => stubCall(c, th)
+    },
+    _ => none
+  };
+}
+
+function stubCall(c: Ctx, th: HBlock): Option<HExpr[]> {
+  const none: Option<HExpr[]> = None;
+  if (th.stmts.length != 1) {
+    return none;
+  }
+  return match (th.stmts[0]) {
+    HExprStmt(e) => match (e.kind) {
+      XCall(id, args) => (id < c.stubs.length && c.stubs[id] && args.length == 4) ? Some(args) : none,
+      _ => none
+    },
+    _ => none
+  };
+}
+
+function xStmt(c: Ctx, st: HStmt, cl: bool): HStmt[] {
+  match (checkParts(c, st)) {
+    Some(args) => {
+      match (st) {
+        HIf(cond, _, _) => {
+          // `!(p)`: p is rewritten like a clause (calls go to the unchecked bodies).
+          const p = match (cond.kind) {
+            XUnary(_, x) => x,
+            _ => cond
+          };
+          const np = xExpr(c, p, true);
+          const nargs = [args[0], xExpr(c, args[1], false), args[2], args[3]];
+          const body = HBlock { stmts: [failStmt(c, np, nargs)] };
+          const none: Option<HBlock> = None;
+          return [HIf(HExpr { kind: XUnary(UnNot, np), ty: cond.ty, span: cond.span }, body, none)];
+        },
+        _ => {}
+      }
+    },
+    None => {}
+  }
+  return match (st) {
+    HLet(l, e) => xLet(c, l, e, cl),
+    HAssign(p, op, e) => xAssign(c, p, op, e, cl),
+    HExprStmt(e) => xExprStmt(c, e, cl),
+    HIf(cond, th, el) => [HIf(xExpr(c, cond, cl), xBlock(c, th, cl), xOptBlock(c, el, cl))],
+    HWhile(cond, b) => [HWhile(xExpr(c, cond, cl), xBlock(c, b, cl))],
+    HForOf(l, it, b) => [HForOf(l, xExpr(c, it, cl), xBlock(c, b, cl))],
+    HReturn(o) => [xReturn(c, o, cl)],
+    HBlockStmt(b) => [HBlockStmt(xBlock(c, b, cl))],
+    _ => [st]
+  };
+}
+
+function xOptBlock(c: Ctx, o: Option<HBlock>, cl: bool): Option<HBlock> {
+  return match (o) {
+    Some(b) => Some(xBlock(c, b, cl)),
+    None => None
+  };
+}
+
+function xLet(c: Ctx, l: usize, e: HExpr, cl: bool): HStmt[] {
+  let out: HStmt[] = [HLet(l, xExpr(c, e, cl))];
+  if (!cl) {
+    for (const x of mutChecks(c, e)) {
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+function xExprStmt(c: Ctx, e: HExpr, cl: bool): HStmt[] {
+  let out: HStmt[] = [HExprStmt(xExpr(c, e, cl))];
+  if (!cl) {
+    for (const x of mutChecks(c, e)) {
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+// `r.items.push(v)` / `pop()` writes through its place like an assignment does.
+function mutChecks(c: Ctx, e: HExpr): HStmt[] {
+  return match (e.kind) {
+    XMutMethod(_, place, _) => placeChecks(c, place, e.span),
+    _ => []
+  };
+}
+
+function xAssign(c: Ctx, p: Place, op: Option<BinOp>, e: HExpr, cl: bool): HStmt[] {
+  let out: HStmt[] = [HAssign(xPlace(c, p, cl), op, xExpr(c, e, cl))];
+  if (!cl) {
+    for (const x of placeChecks(c, p, e.span)) {
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+function xReturn(c: Ctx, o: Option<HExpr>, cl: bool): HStmt {
+  return match (o) {
+    Some(e) => {
+      const ne = xExpr(c, e, cl);
+      if (c.retChk >= 0 && !cl && !isCallOf(ne, c.retChk.toUsize())) {
+        return HReturn(Some(wrapRec(c, c.retChk.toUsize(), ne)));
+      }
+      return HReturn(Some(ne));
+    },
+    None => HReturn(o)
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The pass
+// ---------------------------------------------------------------------------
+
+function findByName(byName: Map<string, usize>, n: string): int {
+  const r = byName.get(n);
+  return match (r) {
+    Some(k) => k.toInt(),
+    None => -1
+  };
+}
+
+function findSuffix(funcs: Function[], suffix: string): int {
+  let k: usize = 0;
+  while (k < funcs.length) {
+    if (endsWithName(funcs[k].name, suffix)) {
+      return k.toInt();
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+function sitePosOf(f: Function): int {
+  let k: usize = 0;
+  while (k < f.paramCount && k < f.locals.length) {
+    if (f.locals[k].name == SITE_PARAM) {
+      return k.toInt();
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+// Adds the run-time reports, caller locations, unchecked contract-internal calls and record-invariant checks to
+// the program checked from `expandContracts` (rtcheck.or). A program without support code is returned as is.
+export function instrumentProgram(p: Program, sm: SourceMap): Program {
+  const funcs = p.functions;
+  const fail = findSuffix(funcs, FAIL_REAL);
+  const showInt = findSuffix(funcs, "contract__showInt");
+  const showUsize = findSuffix(funcs, "contract__showUsize");
+  const showBool = findSuffix(funcs, "contract__showBool");
+  const showStr = findSuffix(funcs, "contract__showStr");
+  const showFloat = findSuffix(funcs, "contract__showFloat");
+  const showF32 = findSuffix(funcs, "contract__showF32");
+  const showLen = findSuffix(funcs, "contract__showLen");
+  if (fail < 0 || showInt < 0 || showUsize < 0 || showBool < 0 || showStr < 0 || showFloat < 0 || showF32 < 0 || showLen < 0) {
+    return p;
+  }
+  let byName = new Map<string, usize>();
+  let k: usize = 0;
+  while (k < funcs.length) {
+    byName.set(funcs[k].name, k);
+    k += 1;
+  }
+  let stubs: bool[] = [];
+  let bodyOf: int[] = [];
+  let siteOf: int[] = [];
+  let sitePos: int[] = [];
+  k = 0;
+  while (k < funcs.length) {
+    const n = funcs[k].name;
+    stubs.push(endsWithName(n, FAIL_STUB));
+    bodyOf.push(findByName(byName, insertBeforeLast(n, BODY)));
+    const s = findByName(byName, insertBeforeLast(n, SITE));
+    siteOf.push(s);
+    sitePos.push(s >= 0 ? sitePosOf(funcs[s.toUsize()]) : -1);
+    k += 1;
+  }
+  let recChk: int[] = [];
+  let r: usize = 0;
+  while (r < p.records.length) {
+    recChk.push(findByName(byName, insertBeforeLast(p.records[r].name, REC)));
+    r += 1;
+  }
+  const c0 = Ctx {
+    sm: sm, records: p.records, fail: fail.toUsize(),
+    showInt: showInt.toUsize(), showUsize: showUsize.toUsize(), showBool: showBool.toUsize(), showStr: showStr.toUsize(),
+    showFloat: showFloat.toUsize(), showF32: showF32.toUsize(), showLen: showLen.toUsize(),
+    stubs: stubs, bodyOf: bodyOf, siteOf: siteOf, sitePos: sitePos, recChk: recChk,
+    fn: funcs[0], retChk: -1
+  };
+  let out: Function[] = [];
+  k = 0;
+  while (k < funcs.length) {
+    const f = funcs[k];
+    let c = c0;
+    c.fn = f;
+    c.retChk = -1;
+    // `return`s of a function whose result is a record with an invariant are checked; the check functions
+    // themselves and the forwarders of checking wrappers are not.
+    const own = f.name.includes(REC) || f.name.includes(SITE) || siteOf[k] >= 0 || stubs[k];
+    if (!own) {
+      match (f.ret) {
+        TyRecord(rid) => {
+          if (rid < recChk.length) {
+            c.retChk = recChk[rid];
+          }
+        },
+        _ => {}
+      }
+    }
+    out.push(Function {
+      name: f.name, paramCount: f.paramCount, locals: f.locals, ret: f.ret, body: xBlock(c, f.body, false), span: f.span
+    });
+    k += 1;
+  }
+  return Program {
+    records: p.records, unions: p.unions, functions: out, main: p.main, vtables: p.vtables, ifaces: p.ifaces,
+    mutating: p.mutating, inlineFns: p.inlineFns
+  };
+}
