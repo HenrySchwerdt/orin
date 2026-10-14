@@ -11,6 +11,8 @@ For every directory bench/<name>/ containing main.or / main.go / main.c it
   * runs each binary N times (plus one unrecorded warm-up) and records wall time and peak RSS
     (ru_maxrss of the child, via wait4),
   * runs the Orin binary once more with ORIN_STATS=1 to collect the runtime counters.
+A benchmark may have no Go and / or C counterpart (std:http, std:collections: bench/http_parse, bench/sortedmap); it is
+then an Orin-only row (n/a in the other columns, no output cross-check).
 It also times "orin2 compiles compiler/main.or" (the self-hosting workload) and prints Markdown.
 """
 import argparse
@@ -31,6 +33,10 @@ CFLAGS = ["-O2", "-w"]
 PROBE = os.path.join(BUILD, "rss_probe")
 HAVE_CLANG = shutil.which("clang") is not None
 LANGS = ("orin", "llvm", "go", "c") if HAVE_CLANG else ("orin", "go", "c")
+HAVE_JAVA = shutil.which("java") is not None and shutil.which("javac") is not None
+HAVE_RUST = shutil.which("rustc") is not None
+JAVA_FLAGS = ["-XX:+UseParallelGC"]
+WARM_REPS = 8   # Java: repetitions inside one JVM (bench/*/Main.java takes N as its argument)
 
 
 def sh(cmd, **kw):
@@ -160,6 +166,7 @@ def main():
 
     info = machine_info()
     results = {}  # name -> {lang: {...}}
+    extras = {}   # name -> {"java": .., "rust": ..}
     stats = {}
     mismatches = []
     rt = [os.path.join(ROOT, "runtime", "orin_runtime.c")]
@@ -178,12 +185,17 @@ def main():
                               ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c", "platform/orin_platform.c",
                                                     "runtime/orin_runtime_llvm.c", "-lm", "-o", out + "/llvm"]]
         res = {}
+        have = {"orin": True, "llvm": HAVE_CLANG,
+                "go": os.path.isfile(os.path.join(ROOT, src, "main.go")), "c": os.path.isfile(os.path.join(ROOT, src, "main.c"))}
+        present = [l for l in LANGS if have[l]]
         for lang, cmds in builds.items():
+            if not have[lang]:
+                continue
             bt = timed_build(cmds)
             res[lang] = {"exe": os.path.join(ROOT, out, lang), "build_s": bt}
         # verify outputs
         ref = None
-        for lang in ("c", "go", "orin") + (("llvm",) if HAVE_CLANG else ()):
+        for lang in [l for l in ("c", "go", "orin", "llvm") if l in res]:
             _, _, rc, so, se = run_once([res[lang]["exe"]])
             if rc != 0:
                 sys.exit("%s/%s exited %d: %s" % (name, lang, rc, se.decode("utf-8", "replace")))
@@ -193,7 +205,7 @@ def main():
                 mismatches.append((name, lang))
                 print("CHECKSUM MISMATCH in %s (%s)" % (name, lang), file=sys.stderr)
             res[lang]["output"] = so.decode()
-        for lang in LANGS:
+        for lang in present:
             r = res[lang]
             r["raw"], r["stripped"] = sizes(r["exe"])
             run_once([r["exe"]])  # warm-up
@@ -208,6 +220,43 @@ def main():
         _, _, _, _, se = run_once([res["orin"]["exe"]], env={"ORIN_STATS": "1"})
         stats[name] = json.loads(se.decode().strip().splitlines()[-1])["orin_stats"]
         results[name] = res
+        # Java and Rust counterparts (only where the toolchain is installed and the source exists)
+        ex = {}
+        ref_out = res["orin"]["output"].encode()
+        if HAVE_RUST and os.path.isfile(os.path.join(ROOT, src, "main.rs")):
+            timed_build([["rustc", "-O", "-o", out + "/rust", src + "/main.rs"]])
+            ex["rust"] = {"exe": os.path.join(ROOT, out, "rust")}
+        if HAVE_JAVA and os.path.isfile(os.path.join(ROOT, src, "Main.java")):
+            jdir = os.path.join(ROOT, out, "java_classes")
+            os.makedirs(jdir, exist_ok=True)
+            sh(["javac", "-d", jdir, os.path.join(src, "Main.java")])
+            wrapper = os.path.join(ROOT, out, "java")
+            with open(wrapper, "w") as f:
+                f.write("#!/bin/sh\nexec java %s -cp %s Main \"$@\" 2>/dev/null\n" % (" ".join(JAVA_FLAGS), jdir))
+            os.chmod(wrapper, 0o755)
+            ex["java"] = {"exe": wrapper}
+        for lang, r in ex.items():
+            _, _, rc, so, se = run_once([r["exe"]])
+            if rc != 0 or so != ref_out:
+                mismatches.append((name, lang))
+                print("CHECKSUM MISMATCH in %s (%s)" % (name, lang), file=sys.stderr)
+                continue
+            run_once([r["exe"]])
+            walls, rss = [], []
+            for _ in range(args.runs):
+                w, m, rc, so, se = run_once([r["exe"]])
+                walls.append(w)
+                rss.append(m)
+            r["wall"] = median_range(walls)
+            r["rss_kb"] = statistics.median(rss)
+            if lang == "java":
+                # warmed-up time: the last repetition of WARM_REPS inside one JVM (stderr of the real java, not the wrapper)
+                p = subprocess.run(["java"] + JAVA_FLAGS + ["-cp", os.path.join(ROOT, out, "java_classes"), "Main", str(WARM_REPS)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                reps = [int(l.split()[2]) for l in p.stderr.decode().splitlines() if l.startswith("rep ")]
+                r["warm_ms"] = reps
+            print("%-14s %-5s median %ss" % (name, lang, fmt_s(r["wall"][0])), file=sys.stderr)
+        extras[name] = ex
 
     # self-hosting workload
     selfc = None
@@ -248,13 +297,12 @@ def main():
     L.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
     for n in names:
         r = results[n]
-        cells = ["%s (%s-%s)" % (fmt_s(r[l]["wall"][0]), fmt_s(r[l]["wall"][1]), fmt_s(r[l]["wall"][2])) for l in LANGS]
-        cm = dict(zip(LANGS, cells))
-        lw = r["llvm"]["wall"][0] if "llvm" in r else None
-        L.append("| %s | %s | %s | %s | %s | %.2fx | %.2fx | %s | %s |" % (
-            n, cm["orin"], cm.get("llvm", "n/a"), cm["go"], cm["c"], r["orin"]["wall"][0] / r["go"]["wall"][0],
-            r["orin"]["wall"][0] / r["c"]["wall"][0],
-            "%.2fx" % (lw / r["go"]["wall"][0]) if lw else "n/a", "%.2fx" % (lw / r["c"]["wall"][0]) if lw else "n/a"))
+        cm = {l: ("%s (%s-%s)" % (fmt_s(r[l]["wall"][0]), fmt_s(r[l]["wall"][1]), fmt_s(r[l]["wall"][2])) if l in r else "n/a") for l in ("orin", "llvm", "go", "c")}
+
+        def ratio(a, b):
+            return "%.2fx" % (r[a]["wall"][0] / r[b]["wall"][0]) if a in r and b in r else "n/a"
+        L.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            n, cm["orin"], cm["llvm"], cm["go"], cm["c"], ratio("orin", "go"), ratio("orin", "c"), ratio("llvm", "go"), ratio("llvm", "c")))
     if selfc:
         w = selfc["wall"]
         L.append("| selfcompile (orin2 compiles compiler/main.or) | %s (%s-%s) | - | - | - | - | - | - | - |" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2])))
@@ -265,7 +313,7 @@ def main():
     L.append("|---|" + "---:|" * len(LANGS))
     for n in names:
         r = results[n]
-        L.append("| %s | %s |" % (n, " | ".join("%.1f" % (r[l]["rss_kb"] / 1024) for l in LANGS) + " "))
+        L.append("| %s | %s |" % (n, " | ".join(("%.1f" % (r[l]["rss_kb"] / 1024)) if l in r else "n/a" for l in LANGS) + " "))
     if selfc:
         extra = " |" + " - |" * (len(LANGS) - 1)
         L.append("| selfcompile (orin2) | %.1f%s" % (selfc["rss_kb"] / 1024, extra))
@@ -278,13 +326,51 @@ def main():
         return "%.0f / %s" % (r["raw"] / 1024, "%.0f" % (r["stripped"] / 1024) if r["stripped"] else "n/a")
     for n in names:
         r = results[n]
-        L.append("| %s | %s | %s |" % (n, " | ".join(sz(r[l]) for l in LANGS), " | ".join("%.2f" % r[l]["build_s"] for l in LANGS)))
+        L.append("| %s | %s | %s |" % (n, " | ".join(sz(r[l]) if l in r else "n/a" for l in LANGS), " | ".join(("%.2f" % r[l]["build_s"]) if l in r else "n/a" for l in LANGS)))
     if selfc:
         raw, stripped = selfc["size"]
         L.append("| orin2 compiler binary | %.0f / %s |%s %.2f |%s" % (
             raw / 1024, "%.0f" % (stripped / 1024) if stripped else "n/a", " - |" * (len(LANGS) - 1), selfc["build_s"],
             " - |" * (len(LANGS) - 1)))
     L.append("")
+    if any(extras.values()):
+        L.append("### Java (OpenJDK, %s) and Rust (rustc -O): same programs, wall time of the whole process in seconds (median; min-max)" % " ".join(JAVA_FLAGS))
+        L.append("")
+        L.append("| benchmark | Orin (C backend) | Java cold | Java warm (last of %d reps in one JVM, ms) | Rust | Java RSS MiB | Rust RSS MiB | Orin RSS MiB |" % WARM_REPS)
+        L.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for n in names:
+            ex = extras.get(n, {})
+            if not ex:
+                continue
+            def cell(l):
+                if l not in ex or "wall" not in ex[l]:
+                    return "n/a"
+                w = ex[l]["wall"]
+                return "%s (%s-%s)" % (fmt_s(w[0]), fmt_s(w[1]), fmt_s(w[2]))
+            warm = "%d (reps: %s)" % (ex["java"]["warm_ms"][-1], " ".join(str(x) for x in ex["java"]["warm_ms"])) if "java" in ex and ex["java"].get("warm_ms") else "n/a"
+            rss = lambda l: ("%.1f" % (ex[l]["rss_kb"] / 1024)) if l in ex and "rss_kb" in ex[l] else "n/a"
+            L.append("| %s | %s | %s | %s | %s | %s | %s | %.1f |" % (n, fmt_s(results[n]["orin"]["wall"][0]), cell("java"), warm, cell("rust"),
+                                                                    rss("java"), rss("rust"), results[n]["orin"]["rss_kb"] / 1024))
+        L.append("")
+        if HAVE_JAVA:
+            hello = os.path.join(ROOT, "build", "bench", "hello_java")
+            os.makedirs(hello, exist_ok=True)
+            with open(os.path.join(hello, "Hello.java"), "w") as f:
+                f.write("public class Hello { public static void main(String[] a) { System.out.println(\"hi\"); } }\n")
+            sh(["javac", "-d", hello, os.path.join(hello, "Hello.java")])
+            jw = []
+            jr = []
+            for _ in range(args.runs + 1):
+                w, m, rc, so, se = run_once(["java"] + JAVA_FLAGS + ["-cp", hello, "Hello"])
+                jw.append(w)
+                jr.append(m)
+            cw = []
+            for _ in range(args.runs + 1):
+                w, m, rc, so, se = run_once([os.path.join(ROOT, "build", "bench", "fib", "c")])
+                cw.append(w)
+            L.append("Startup: `java Hello` (JVM start, class load, print, exit) %s s median, %.1f MiB peak RSS. The native columns carry a ~1 MiB process-startup floor of RSS "
+                     "(see Methodology)." % (fmt_s(statistics.median(jw[1:])), statistics.median(jr[1:]) / 1024))
+            L.append("")
     L.append("### Orin runtime counters (ORIN_STATS=1; one run)")
     L.append("")
     cols = ["alloc_total", "alloc_string", "alloc_array", "alloc_struct", "retains", "releases",
@@ -300,7 +386,7 @@ def main():
         L.append("selfcompile output C is %s bytes and %s the committed-bootstrap stage2.c." %
                  ("{:,}".format(selfc["csize"]), "identical to" if selfc["same"] else "NOT identical to"))
         L.append("")
-    L.append("Checksums: %s." % ("all outputs identical across " + "/".join(LANGS) if not mismatches else
+    L.append("Checksums: %s." % ("all outputs identical across the languages of every benchmark (Orin-only rows have no counterpart)" if not mismatches else
                                   "MISMATCH in " + ", ".join("%s/%s" % m for m in mismatches)))
     text = "\n".join(L) + "\n"
     print(text)

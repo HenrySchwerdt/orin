@@ -315,6 +315,8 @@ function builtinC(op: Builtin, a: string[], rt: MType): string {
     BArrSlice => c3("orin_array_slice", a),
     BArrConcat => c2("orin_array_concat", a),
     BArrJoin => c2("orin_array_join", a),
+    BBytesToString => c3("orin_bytes_to_string", a),
+    BStringToBytes => c1("orin_string_to_bytes", a),
     BIntToString => c1("orin_int_to_string", a),
     BIntToUsize => c1("orin_int_to_usize", a),
     BUsizeToString => c1("orin_usize_to_string", a),
@@ -384,6 +386,7 @@ function instrC(fx: Fx, i: Instr): string {
     ICall(d, f, args) => callC(fx, d, f, args),
     IBuiltin(d, b, args) => builtinInstr(fx, d, b, args),
     IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
+    IArrayExtend(x, y) => lname(x) + " = orin_array_extend(" + lname(x) + ", " + opC(y) + ");",
     IStructNew(d, tag, slots) => structNewC(fx, d, tag, slots),
     INullary(d, t) => lname(d) + " = orin_nullary(" + u(t) + ");",
     ITag(d, o) => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
@@ -414,7 +417,12 @@ function unaryC(op: UnOp, usz: bool, flt: bool, a: string): string {
 }
 
 function callC(fx: Fx, d: Option<usize>, f: usize, args: Operand[]): string {
-  const call = fx.names[f] + "(" + argsC(args).join(", ") + ")";
+  let cargs = argsC(args);
+  if (fx.prog.functions[f].inout) {
+    // in/out receiver (docs/mir.md v1.10): the callee stores its final receiver through this pointer
+    cargs.push("&" + opC(args[0]));
+  }
+  const call = fx.names[f] + "(" + cargs.join(", ") + ")";
   return match (d) {
     Some(x) => lname(x) + " = " + call + ";",
     None => call + ";"
@@ -530,9 +538,13 @@ function termC(fx: Fx, t: Terminator): string {
     TGoto(b) => "goto B" + u(b) + ";",
     TBranch(c, a, b) => "if (" + opC(c) + ") goto B" + u(a) + "; else goto B" + u(b) + ";",
     TSwitch(o, cases, d) => switchC(o, cases, d),
-    TReturn(o) => match (o) {
-      Some(x) => "return " + opC(x) + ";",
-      None => "return;"
+    TReturn(o) => {
+      const out = fx.f.inout ? "{ *orin_out = l0; " : "";
+      const end = fx.f.inout ? " }" : "";
+      return match (o) {
+        Some(x) => out + "return " + opC(x) + ";" + end,
+        None => out + "return;" + end
+      };
     },
     TTrap(m) => "orin_trap(" + cString(m) + ");"
   };
@@ -563,6 +575,9 @@ function signature(name: string, f: MFunction, inl: bool): string {
     }
     s += cty(f.locals[i].ty) + " " + lname(i);
     i += 1;
+  }
+  if (f.inout) {
+    s += ", OrinObj **orin_out";
   }
   s += ")";
   return s;

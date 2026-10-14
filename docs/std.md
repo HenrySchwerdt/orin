@@ -384,7 +384,7 @@ other and sizes add up).
      but an allocation per element) or hold a filler value in dead slots (fast, the invariant cannot name the dead slots);
   3. no constant arrays or tables (top-level `const` must be a literal, E0408): the DFA tables are string constants read
      with `charCodeAt`;
-  4. no bulk byte primitives: no `u8[]` <-> string conversion (one 1-byte string per byte), no array `reserve`/capacity,
+  4. no bulk byte primitives: ~~no `u8[]` <-> string conversion~~ (now `bytesToString` / `stringToBytes`, docs/benchmarks.md fix 3), no array `reserve`/capacity,
      no `memcmp`/`memchr`-style search, no bitwise operators or shifts (so no power-of-two masks and no bit-parallel
      validators), no `slice` view type that avoids the array header;
   5. contracts cannot call a function value, so comparator-based structures cannot state their invariants;
@@ -575,7 +575,7 @@ for deployment is the unchecked one and the tests run both. Before the window an
 ran at 26 MB/s.
 
 What the numbers are made of (gprof of the generated C): about a quarter of the time is building the strings of names,
-values and the target (no bulk bytes-to-string primitive: one `String.fromCharCode` + append per byte, 7 ns), a tenth the
+values and the target (before the built-in `bytesToString`: one `String.fromCharCode` + append per byte, 7 ns; since then one runtime copy), a tenth the
 copy of the window, the rest scanning, the validation that makes `Headers`/`Request` valid by construction (the parser
 output goes through the same constructors as user code) and allocation. Two measured facts about the object model shaped
 the code: a *mutating method with a result* allocates a pair `(this, result)` per call (the first version, with
@@ -611,10 +611,11 @@ checked at run time and by tests; `orin verify --contracts` does not cover strin
 
 ### Friction found (language and tooling)
 
-* Mutating methods that return a value allocate a result pair; the hot path therefore uses `void` methods and a cursor
-  field. A big class with nested mutating calls and no private constructors forced the shape of `MessageParser`.
+* Mutating methods that returned a value allocated a result pair per call (and copied a receiver held in a field); fixed in the
+  optimiser (in/out receivers, docs/mir.md v1.10: 8-13x on a call loop, http_parse 2x). The hot path still uses `void` methods and a
+  cursor field, which is no longer necessary. `s = s + t` on a field is now an in-place append as well. A big class with nested mutating calls and no private constructors forced the shape of `MessageParser`.
 * No constant arrays (tables are string constants), no bitwise operators (class codes are ordered so ranges replace
-  masks), no bulk bytes-to-string or array-to-string primitive, no `u8[]` capacity.
+  masks), no `u8[]` capacity (the bulk bytes-to-string primitive exists since the performance pass: `bytesToString`, `stringToBytes`).
 * Orin values are copied, so a random number generator or any other stateful helper must be one class whose methods
   mutate `this`; a helper function cannot advance the caller's generator.
 * Top-level `const` must be a literal (no `+` of two strings); `from` is a keyword (a parameter named `from` is an error);

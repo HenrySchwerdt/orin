@@ -226,7 +226,7 @@ function consume(cx: Cx, o: Operand): Cx {
 
 // Define local d (every destination goes through here).
 function def(cx: Cx, d: usize, k: int, src: usize): Cx {
-  if (d < cx.f.paramCount) {
+  if (d < cx.f.paramCount && !(cx.f.inout && d == 0)) {
     return err(cx, "write to parameter " + nm(cx, d));
   }
   let c = cx;
@@ -241,6 +241,12 @@ function def(cx: Cx, d: usize, k: int, src: usize): Cx {
     if (h.sym && h.idx == d) {
       c = err(c, "index local " + nm(c, d) + " is overwritten while it names an open hole");
     }
+  }
+  // killBorrows runs whenever a local dies, so no live alias borrows from a Dead or scalar local: defining one has
+  // nothing to invalidate and the scan over all locals is skipped (it dominated the verifier's time).
+  const kd = kindOf(c, d);
+  if (kd == KDead || kd == KInit) {
+    return setLs(c, d, k, src);
   }
   return setLs(killBorrows(c, d), d, k, src);
 }
@@ -534,7 +540,17 @@ export function step(cx: Cx, ins: Instr): Cx {
       return def(readOp(readOp(cx, a), b), d, KInit, 0);
     },
     ICall(dst, fi, args) => {
-      return callOwned(cx, dst, args, cx.prog.functions[fi].paramOwned);
+      const c = callOwned(cx, dst, args, cx.prog.functions[fi].paramOwned);
+      if (!cx.prog.functions[fi].inout) {
+        return c;
+      }
+      // v1.10: argument 0 was consumed; it now holds the callee's final receiver (Owned: the callee may
+      // have kept an alias, so uniqueness is not known). Writing a parameter is an error except the
+      // in/out parameter of an inout caller (`def`).
+      return match (args[0]) {
+        OLocal(x) => def(c, x, KOwned, 0),
+        _ => c
+      };
     },
     IBuiltin(dst, b, args) => {
       return builtinStep(cx, dst, b, args);
@@ -550,6 +566,18 @@ export function step(cx: Cx, ins: Instr): Cx {
         _ => {}
       }
       return mutateOwned(c, x, "IStrAppend");
+    },
+    IArrayExtend(x, y) => {
+      let c = readOp(cx, y);
+      match (y) {
+        OLocal(l) => {
+          if (kindOf(c, l) == KBorrowed && c.st.ls[l].src == x) {
+            c = err(c, "IArrayExtend: " + nm(c, l) + " is borrowed from the array being extended");
+          }
+        },
+        _ => {}
+      }
+      return mutateOwned(c, x, "IArrayExtend");
     },
     IStructNew(d, _, slots) => {
       return def(consumeAll(cx, slots), d, KUnique, 0);
@@ -640,6 +668,14 @@ export function stepTerm(cx: Cx, t: Terminator): Cx {
           c = consume(c, o);
         },
         None => {}
+      }
+      if (c.f.inout) {
+        // v1.10: local 0 is handed back to the caller, so it must hold an owned receiver here
+        if (ownedLike(kindOf(c, 0))) {
+          c = consume(c, OLocal(0));
+        } else {
+          c = err(c, "inout parameter " + nm(c, 0) + " must hold the updated receiver at return, but it is " + kindName(kindOf(c, 0)));
+        }
       }
       let i: usize = 0;
       while (i < c.st.ls.length) {

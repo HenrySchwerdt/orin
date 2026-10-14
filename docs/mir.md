@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.0)
+# MIR and the OIM ownership verifier (v2.0; in/out receivers and `IArrayExtend` are v1.10)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -23,6 +23,11 @@ first argument. Network (ADR-0033, same version, additive): `Listener` and `Stre
 (`[listener, timeout, opt]`), `BNetConnect` (`[net, host, port, timeout, opt]`); closer `BNetClose` (a Listener or Stream; a
 grant is closed by `BGrantRevoke`); uses `BNetStatus`, `BNetPort`, `BNetNow`, `BNetRecv`, `BNetSend`, `BNetShutdown`,
 `BNetPeer`, `BNetResolve` (handle first) and `BNetErrorText`. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
+v1.10 (performance) two additions, both produced only by the optimiser (`compiler/opt`): `IArrayExtend(x, y)`, array
+concatenation in place (`x = x ++ y`, rules exactly those of `IStrAppend`), and **in/out receivers**: `MFunction.inout`
+(parameter 0 is also an output) with the matching call and return rules (see "In/out receiver" below). The textual form
+prints `(params 1, owned l0, inout)` and `arrayextend x, y`. New built-ins `BBytesToString` / `BStringToBytes`
+(`bytesToString(u8[], start, len)`, `stringToBytes(s)`) need no MIR rule (built-ins have no signature table).
 
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
@@ -73,6 +78,9 @@ hole slot when reading that slot.
   v1.1). Lowering must re-`IMakeUnique` before mutating such a local. The demotion applies to
   borrowed positions only (consumed operands are Dead afterwards).
 - `IStrAppend(x, y)`: x Owned/Unique (stays Owned); y live.
+- `IArrayExtend(x, y)` (v1.10): the same rules for arrays: x Owned/Unique (stays Owned: the runtime appends in place when x is
+  unique and otherwise replaces it by a new array), y a live reference *local* that is neither x nor borrowed from x; the
+  reference elements of y are retained by the runtime, y itself is not consumed. Borrows of x die.
 - `IStructNew(d, tag, slots)`, `IArrayNew(d, isRef, elems)`: each ref operand Owned/Unique local
   (→ Dead) or OStr; d Unique.
 - `INullary(d, t)`: d Owned (immortal).
@@ -109,6 +117,38 @@ hole slot when reading that slot.
   invalidate `Borrowed(x)`; v consumed; d Owned.
 - Any operation that makes x Dead or mutates it also invalidates `Borrowed(x)`.
 - `IDup(d, x)` / `IBorrow(d, x)` where x is Unique demote x to Owned (no longer provably unique).
+
+## In/out receiver (v1.10)
+A mutating method with a result returns a fresh record `{ self, value }` (ADR-0009): one allocation, one retain and one release
+per call for a value that never escapes. The optimiser (`compiler/opt/pairs.or`) removes it with a second kind of function:
+`MFunction.inout = true` means that **parameter 0 is an owned reference that is also an output**. The function returns its own
+result (`ret`, any type except a handle) as usual and hands the value that local 0 holds at each `TReturn` back to the caller,
+which stores it in the local it passed as argument 0. In C this is `T f(OrinObj *l0, .., OrinObj **out)` with
+`*out = l0; return v;` at each return and `&x` at the call; in the LLVM backend a `ptr` parameter and the address of the alloca.
+
+Rules (wf in `wf.or`, dataflow in `rules.or`):
+- wf: an `inout` function has `paramCount >= 1` and `paramOwned[0]` (so local 0 is a reference). A call of an `inout` function has
+  a *local* as argument 0 (not `OStr`), and its destination (if any) is not that local.
+- Callee: local 0 starts Owned like any owned parameter and may be moved from, consumed or released. It is the **only parameter
+  that may be written** (`IMove(0, a)`, any destination rule applies as for other locals: overwriting an Owned value is a leak
+  warning). At every `TReturn` it must be Owned/Unique/Imm (it is consumed: handed to the caller), otherwise **error** ("must hold
+  the updated receiver"); an open hole in it is the usual error. It is not a leak.
+- Call: `ICall(dst, g, [x, ..])` with `g.inout`: argument 0 is consumed exactly like any owned-position operand (Owned/Unique/Imm
+  -> Dead, its borrows die; a Param or Borrowed operand is an **error**), and then `x` is redefined **Owned** (not Unique: the
+  callee may have kept an alias). Redefining a parameter of the caller is an error except local 0 of an `inout` caller.
+- An `inout` function is never a closure target or a vtable entry (the optimiser does not convert those; `wf` of `IClosure` and the
+  vtable check require borrowed parameters anyway).
+
+Soundness argument: for a verified caller and callee the pair `(x consumed, x redefined Owned)` is the same ownership transfer as
+`r = call f(x); x = r.self` (the record's first slot owns one reference, the callee's final local 0 owns exactly one), without the
+record. The optimiser only converts a function whose every return is `r = struct tag0 {a, v}; [releases]; return r` with `a` a
+reference local and local 0 Dead at that point, so converting changes no count: `a` is moved into local 0 where the record
+consumed it, and `v` is returned where the record consumed it. Call sites are rewritten to `v = call f(x, ..)` followed by the
+record rebuilt (`d = struct tag0 {x, v}`) unless every use of `d` is a `getfield d.0|1`, `release d` or a move of `d` inside one
+basic block with no redefinition of `x` / `v` in between, in which case the record is not built (`getfield d.0` -> `borrow x`,
+`getfield d.1` -> `borrow v` / `copy v`, `release d` -> release of x and v, `t = getfield d.0; u = dup t` -> `u = move x`).
+Mutation corpus: `inout-drop-receiver`, `inout-release-receiver` (tools/mutate_mir.py); hand-written cases:
+`compiler/tests/verify_main.or` `inoutCases`. The Lean model covers the structured fragment without calls, so it is unaffected.
 
 ## Source spans (v2.0)
 `MBlock.spans[i]` is a `Span { file; start; end }` (byte offsets, `file` indexes the `SourceMap`) of the HIR expression or statement the
@@ -212,7 +252,8 @@ reporting). Tests: `compiler/tests/verify_main.or` (hand-written cases), `compil
   Unique), and two poisoned join results `MaybeDead` / `MaybeLeak` (MaybeLeak: some path owns a
   reference). Parameters start `Param` (refs) or `Init` (scalars); all other locals `Dead`.
   Owned reference parameters start `Owned`. Parameters (scalar ones too) can never be redefined
-  (an owned parameter may be moved/consumed/released, just not assigned).
+  (an owned parameter may be moved/consumed/released, just not assigned), except local 0 of an `inout`
+  function (v1.10, "In/out receiver").
   Well-formedness adds: `paramOwned.length == paramCount`, owned parameters are references.
 - **Joins** are a semilattice join: identical states stay; Owned-like (Owned/Unique/Imm) join to
   Owned; every other disagreement (Dead vs anything, differing `Borrowed(src)`, Owned vs

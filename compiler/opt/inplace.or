@@ -1,0 +1,504 @@
+// In-place update of a slot through take / put (stage 4 of the MIR optimiser).
+//
+// The lowering of `x.f = g(x.f, ..)` (an assignment whose right-hand side starts from the old value of the
+// same place: `r.s = r.s + t`, `this.reader = this.reader.next()` through a mutating method, `a[i] = f(a[i])`)
+// reads the slot, retains it (the callee or the append consumes a counted reference) and stores the result back:
+//
+//     d1 = getfield x.i          (or: d1 = arrayget a[k])
+//     d2 = dup d1                -- the slot AND d2 now count the object: rc >= 2
+//     ...                        -- window: nothing uses x or anything borrowed from x
+//     makeunique x               -- (any number of these)
+//     setfield x.i = v           (or: arrayset a[k] = v)
+//
+// With the object shared by the slot, every in-place operation in the window (`strappend d2`, a callee that
+// mutates its owned parameter, `makeunique d2`) sees rc >= 2 and copies the whole value: `s = s + t` on a field is
+// quadratic, every mutating call on a field copies the callee's receiver. The same code with the slot *taken*
+// gives the callee the only reference:
+//
+//     makeunique x
+//     d2 = takefield x.i         (or: arraytake a[k])
+//     ...
+//     putfield x.i = v           (or: arrayput a[k] = v)
+//
+// which is exactly the shape the lowering already emits for `x.a.b.push(v)` (docs/mir.md, holes). Meaning is
+// unchanged: the old value is owned by d2 only instead of by d2 and the slot, the slot is refilled before the
+// block ends, and nothing in the window can observe the slot (no use of x, so no read of the hole, no whole-object
+// use, no call that receives x). The pass is block-local; the verifier checks the result like any other MIR.
+
+import { MFunction, MBlock, MLocal, MType, Instr, Operand } from "../mir";
+import { Span } from "../diag";
+import { ancestors, affects, usesAffecting, instrDef, isRefTy, countsOf } from "./analysis";
+
+export function sameKey(a: Operand, b: Operand): bool {
+  return match (a) {
+    OLocal(x) => match (b) {
+      OLocal(y) => x == y,
+      _ => false
+    },
+    OInt(x) => match (b) {
+      OInt(y) => x == y,
+      _ => false
+    },
+    OUsize(x) => match (b) {
+      OUsize(y) => x == y,
+      _ => false
+    },
+    _ => false
+  };
+}
+
+export function keyLocal(k: Operand): Option<usize> {
+  return match (k) {
+    OLocal(l) => Some(l),
+    _ => None
+  };
+}
+
+// The slot a `getfield` / `arrayget` reads: object local, and (for an array) the index operand.
+type Slot = { obj: usize; field: bool; idx: usize; key: Operand; };
+
+function slotOfGet(f: MFunction, ins: Instr): Option<Slot> {
+  return match (ins) {
+    IGetField(d, o, i) => match (o) {
+      OLocal(x) => (isRefTy(f.locals[d].ty) && x >= f.paramCount) ? Some(Slot { obj: x, field: true, idx: i, key: OInt(0) }) : None,
+      _ => None
+    },
+    IArrayGet(d, o, k) => match (o) {
+      OLocal(x) => (isRefTy(f.locals[d].ty) && x >= f.paramCount) ? Some(Slot { obj: x, field: false, idx: 0, key: k }) : None,
+      _ => None
+    },
+    _ => None
+  };
+}
+
+// Does `ins` store into the slot (the closing `setfield` / `arrayset`)? The stored operand if so.
+function storeTo(s: Slot, ins: Instr): Option<Operand> {
+  return match (ins) {
+    ISetField(x, i, v) => (s.field && x == s.obj && i == s.idx) ? Some(v) : None,
+    IArraySet(x, k, v) => (!s.field && x == s.obj && sameKey(k, s.key)) ? Some(v) : None,
+    _ => None
+  };
+}
+
+export function isMakeUniqueOf(ins: Instr, x: usize): bool {
+  return match (ins) {
+    IMakeUnique(y) => y == x,
+    _ => false
+  };
+}
+
+// Index (in the block) of the closing store of the slot, searching from `start`, with the window clean (no use of
+// the object or of anything borrowed from it, no redefinition of the object or of the index local; the instruction
+// `exempt` and `makeunique` of the object are allowed), or None.
+function findStore(f: MFunction, anc: usize[][], instrs: Instr[], start: usize, exempt: usize, s: Slot, kl: Option<usize>): Option<usize> {
+  let j = start;
+  while (j < instrs.length) {
+    const ins = instrs[j];
+    match (storeTo(s, ins)) {
+      Some(_) => {
+        return Some(j);
+      },
+      None => {}
+    }
+    if (j != exempt && !isMakeUniqueOf(ins, s.obj)) {
+      if (usesAffecting(anc, ins, s.obj)) {
+        return None;
+      }
+      match (instrDef(ins)) {
+        Some(d) => {
+          if (d == s.obj) {
+            return None;
+          }
+          match (kl) {
+            Some(k) => {
+              if (d == k) {
+                return None;
+              }
+            },
+            None => {}
+          }
+        },
+        None => {}
+      }
+    }
+    j += 1;
+  }
+  return None;
+}
+
+function hasSlotGet(instrs: Instr[]): bool {
+  let i: usize = 0;
+  while (i + 1 < instrs.length) {
+    match (instrs[i]) {
+      IGetField(_, _, _) => {
+        return true;
+      },
+      IArrayGet(_, _, _) => {
+        return true;
+      },
+      _ => {}
+    }
+    i += 1;
+  }
+  return false;
+}
+
+function takePutSlots(f: MFunction): MFunction {
+  let any = false;
+  for (const blk of f.blocks) {
+    if (hasSlotGet(blk.instrs)) {
+      any = true;
+    }
+  }
+  if (!any) {
+    return f;
+  }
+  const anc = ancestors(f);
+  let locals = f.locals;
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    const instrs = blk.instrs;
+    let rep: Instr[][] = [];
+    let touched: bool[] = [];
+    for (const _x of instrs) {
+      rep.push([]);
+      touched.push(false);
+    }
+    let changed = false;
+    let i: usize = 0;
+    while (i + 1 < instrs.length) {
+      if (!touched[i] && !touched[i + 1]) {
+        match (slotOfGet(f, instrs[i])) {
+          Some(s) => {
+            match (instrs[i + 1]) {
+              IDup(d2, o) => {
+                const d1 = match (instrDef(instrs[i])) {
+                  Some(d) => d,
+                  None => 0
+                };
+                const isD1 = match (o) {
+                  OLocal(l) => l == d1,
+                  _ => false
+                };
+                if (isD1 && d2 != s.obj && d2 != d1) {
+                  const kl = keyLocal(s.key);
+                  match (findStore(f, anc, instrs, i + 2, instrs.length, s, kl)) {
+                    Some(j) => {
+                      let ok = !touched[j];
+                      let tail: Instr[] = [];
+                      match (storeTo(s, instrs[j])) {
+                        Some(v) => {
+                          match (v) {
+                            OLocal(l) => {
+                              tail.push(s.field ? IPutField(s.obj, s.idx, l) : IArrayPut(s.obj, s.key, l));
+                            },
+                            OStr(n) => {
+                              const t = locals.length;
+                              locals.push(MLocal { name: "_", ty: MRef });
+                              tail.push(ICopy(t, OStr(n)));
+                              tail.push(s.field ? IPutField(s.obj, s.idx, t) : IArrayPut(s.obj, s.key, t));
+                            },
+                            _ => {
+                              ok = false;
+                            }
+                          }
+                        },
+                        None => {
+                          ok = false;
+                        }
+                      }
+                      if (ok) {
+                        changed = true;
+                        rep[i] = [IMakeUnique(s.obj)];
+                        touched[i] = true;
+                        rep[i + 1] = [s.field ? ITakeField(d2, s.obj, s.idx) : IArrayTake(d2, s.obj, s.key)];
+                        touched[i + 1] = true;
+                        rep[j] = tail;
+                        touched[j] = true;
+                        let m = i + 2;
+                        while (m < j) {
+                          if (isMakeUniqueOf(instrs[m], s.obj)) {
+                            touched[m] = true;
+                          }
+                          m += 1;
+                        }
+                      }
+                    },
+                    None => {}
+                  }
+                }
+              },
+              _ => {}
+            }
+          },
+          None => {}
+        }
+      }
+      i += 1;
+    }
+    if (!changed) {
+      blocks.push(blk);
+    } else {
+      let out: Instr[] = [];
+      let sps: Span[] = [];
+      let k: usize = 0;
+      while (k < instrs.length) {
+        if (touched[k]) {
+          for (const r of rep[k]) {
+            out.push(r);
+            sps.push(blk.spans[k]);
+          }
+        } else {
+          out.push(instrs[k]);
+          sps.push(blk.spans[k]);
+        }
+        k += 1;
+      }
+      blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+    }
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: f.inout,
+    locals: locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Array concatenation in place: `a = a.concat(b)` allocates a new array and copies all of a each time (quadratic
+// in a loop). With the old value released right after, or stored back into the slot it was read from, the new array
+// can be the old one extended (`arrayextend`, docs/mir.md v1.10), amortised O(length of b):
+//
+//     d = builtin arr.concat(x, y)           arrayextend x, y
+//     release x                       =>
+//     x = move d
+//
+//     d1 = getfield x.i                      makeunique x
+//     ..                                     d1 = takefield x.i
+//     d3 = builtin arr.concat(d1, y)  =>     ..
+//     ..                                     arrayextend d1, y
+//     makeunique x                           ..
+//     setfield x.i = d3                      putfield x.i = d1
+//
+// (and the same for an array element `arrayget` / `arrayset`). y must not be, or be borrowed from, the array that is
+// extended (the runtime would copy anyway, but a borrow of x does not survive the mutation).
+
+function isConcat(ins: Instr): bool {
+  return match (ins) {
+    IBuiltin(_, b, _) => match (b) {
+      BArrConcat => true,
+      _ => false
+    },
+    _ => false
+  };
+}
+
+function hasConcat(f: MFunction): bool {
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      if (isConcat(ins)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// d = concat(x, y) with locals x, y: (d, x, y).
+type Concat = { d: usize; x: usize; y: usize; };
+
+function concatOf(ins: Instr): Option<Concat> {
+  return match (ins) {
+    IBuiltin(dst, b, args) => match (b) {
+      BArrConcat => match (dst) {
+        Some(d) => match (args[0]) {
+          OLocal(x) => match (args[1]) {
+            OLocal(y) => Some(Concat { d: d, x: x, y: y }),
+            _ => None
+          },
+          _ => None
+        },
+        None => None
+      },
+      _ => None
+    },
+    _ => None
+  };
+}
+
+function extendArrays(f: MFunction): MFunction {
+  if (!hasConcat(f)) {
+    return f;
+  }
+  const anc = ancestors(f);
+  const cnt = countsOf(f);
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    const instrs = blk.instrs;
+    let rep: Instr[][] = [];
+    let touched: bool[] = [];
+    for (const _x of instrs) {
+      rep.push([]);
+      touched.push(false);
+    }
+    let changed = false;
+    let i: usize = 0;
+    while (i < instrs.length) {
+      match (concatOf(instrs[i])) {
+        Some(c) => {
+          // (1) x = x.concat(y), the old x released right after (releases of other temporaries, typically y, may
+          // come first)
+          if (!touched[i] && c.x >= f.paramCount && c.y != c.x && !affects(anc, c.y, c.x) && cnt.uses[c.d] == 1 && cnt.defs[c.d] == 1) {
+            let jr = i + 1;
+            let fnd = false;
+            while (jr < instrs.length && !fnd && !touched[jr]) {
+              match (instrs[jr]) {
+                IRelease(z) => {
+                  if (z == c.x) {
+                    fnd = true;
+                  } else if (z == c.d) {
+                    jr = instrs.length;
+                  } else {
+                    jr += 1;
+                  }
+                },
+                _ => {
+                  jr = instrs.length;
+                }
+              }
+            }
+            if (fnd && jr + 1 < instrs.length && !touched[jr + 1]) {
+              match (instrs[jr + 1]) {
+                IMove(dd, ss) => {
+                  if (dd == c.x && ss == c.d) {
+                    rep[i] = [IArrayExtend(c.x, OLocal(c.y))];
+                    touched[i] = true;
+                    touched[jr] = true;
+                    touched[jr + 1] = true;
+                    changed = true;
+                  }
+                },
+                _ => {}
+              }
+            }
+          }
+        },
+        None => {}
+      }
+      // (2) slot = slot.concat(y): the read at `i`, the concat later in the window
+      if (i + 1 < instrs.length && !touched[i]) {
+        match (slotOfGet(f, instrs[i])) {
+          Some(sl) => {
+            const d1 = match (instrDef(instrs[i])) {
+              Some(d) => d,
+              None => 0
+            };
+            if (cnt.uses[d1] == 1 && cnt.defs[d1] == 1) {
+              // the concat that consumes d1
+              let b: usize = i + 1;
+              let found = false;
+              while (b < instrs.length && !found) {
+                match (concatOf(instrs[b])) {
+                  Some(c) => {
+                    if (c.x == d1) {
+                      found = true;
+                    }
+                  },
+                  None => {}
+                }
+                if (!found) {
+                  b += 1;
+                }
+              }
+              if (found && !touched[b]) {
+                const c = concatOf(instrs[b]).unwrap();
+                const kl = keyLocal(sl.key);
+                if (cnt.uses[c.d] == 1 && cnt.defs[c.d] == 1 && c.y != sl.obj && !affects(anc, c.y, sl.obj) && c.d != d1) {
+                  match (findStore(f, anc, instrs, i + 1, b, sl, kl)) {
+                    Some(j) => {
+                      let ok = !touched[j] && j > b;
+                      match (storeTo(sl, instrs[j])) {
+                        Some(v) => {
+                          match (v) {
+                            OLocal(l) => {
+                              if (l != c.d) {
+                                ok = false;
+                              }
+                            },
+                            _ => {
+                              ok = false;
+                            }
+                          }
+                        },
+                        None => {
+                          ok = false;
+                        }
+                      }
+                      if (ok) {
+                        changed = true;
+                        rep[i] = [IMakeUnique(sl.obj), sl.field ? ITakeField(d1, sl.obj, sl.idx) : IArrayTake(d1, sl.obj, sl.key)];
+                        touched[i] = true;
+                        rep[b] = [IArrayExtend(d1, OLocal(c.y))];
+                        touched[b] = true;
+                        rep[j] = [sl.field ? IPutField(sl.obj, sl.idx, d1) : IArrayPut(sl.obj, sl.key, d1)];
+                        touched[j] = true;
+                        let m = i + 1;
+                        while (m < j) {
+                          if (isMakeUniqueOf(instrs[m], sl.obj)) {
+                            touched[m] = true;
+                          }
+                          m += 1;
+                        }
+                      }
+                    },
+                    None => {}
+                  }
+                }
+              }
+            }
+          },
+          None => {}
+        }
+      }
+      i += 1;
+    }
+    if (!changed) {
+      blocks.push(blk);
+    } else {
+      let out: Instr[] = [];
+      let sps: Span[] = [];
+      let k: usize = 0;
+      while (k < instrs.length) {
+        if (touched[k]) {
+          for (const r of rep[k]) {
+            out.push(r);
+            sps.push(blk.spans[k]);
+          }
+        } else {
+          out.push(instrs[k]);
+          sps.push(blk.spans[k]);
+        }
+        k += 1;
+      }
+      blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+    }
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: f.inout,
+    locals: f.locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
+
+// The slot and concatenation rewrites of the optimiser (stage 4).
+export function inplaceSlots(f: MFunction): MFunction {
+  return extendArrays(takePutSlots(f));
+}
