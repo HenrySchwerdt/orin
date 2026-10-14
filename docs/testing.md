@@ -121,3 +121,13 @@ returns the same JSON report (docs/mcp.md).
 No `Result`-returning tests, fixtures (`@Before`/`@After`), parameterised tests, parallel execution,
 coverage, `--list`, or per-test timeouts; modules nothing imports are not discovered; the test
 executable is always built with the C backend (`-O1`).
+
+## Concurrent code (std:task)
+
+A test may start tasks (`scope` / `spawn`); everything a test starts is joined before the test function can return, so a hung
+task is a timeout of the test, not a leak into the next one. Assertions work inside a task body (a failed `assert*` ends the process
+with status 101, like in the main task: the test fails). Check **results**, not timing: join the handle or receive from a channel, and
+assert on the values (the tasks of `tests/std/task_test.or` do). A trap in a task (`unwrap` of `None`, a violated contract) is
+reported at its `join` or at the end of the scope as `task panicked: <message>`. Do not assert on the order of output of two tasks.
+`movedCount()` / `copiedCount()` of `std:task` count what this task sent by move or by deep copy; whether a fresh value is moved depends
+on the build (optimiser, contract checking), so pin it only in the default build (`tests/concurrency/move_counts.or`).
