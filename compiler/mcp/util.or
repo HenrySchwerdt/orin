@@ -4,33 +4,100 @@
 import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson } from "../json";
 import { Analysis, PathDiag, fileIndexOf, offsetToPos } from "../analysis";
 import { SourceMap, Diagnostic } from "../diag";
-import { normalizePath, joinPath, isInside, relativeTo } from "../loader";
+import { normalizePath, joinPath, isInside, relativeTo, isNormalized } from "../loader";
 
-// One check snapshot (a delta base): the diagnostics of `entry` at revision `rev`.
+// One check snapshot (a delta base): the diagnostics of `entry` at revision `rev`; `keys[i]` is the stable id of the
+// diagnostic whose compact line is `lines[i]`.
+@Invariant(this.keys.length == this.lines.length)
 export type Snap = { rev: int; entry: string; fp: string; keys: string[]; lines: string[]; };
 
-export type McpState = {
-  root: string;            // authorized root (normalized)
-  allowExec: bool;         // test/build may execute code
-  repo: string;            // directory holding runtime/ and tools/ (for build/test)
-  inited: bool;
-  nextRev: int;
-  snaps: Snap[];           // recent check snapshots (delta bases)
-};
+// The number of check snapshots a session keeps (the oldest is dropped first).
+export const MAX_SNAPS: usize = 32;
 
-export function newState(root: string, allowExec: bool, repo: string): McpState {
-  const none: Snap[] = [];
-  return McpState { root: normalizePath(root), allowExec: allowExec, repo: repo, inited: false, nextRev: 1, snaps: none };
+// Snapshot revisions are handed out in increasing order and are below the next one, so a revision names at most one
+// snapshot and a client's `sinceRevision` can never match a snapshot that was not taken yet.
+export function revsOrdered(snaps: Snap[], nextRev: int): bool {
+  let prev: int = 0;
+  for (const s of snaps) {
+    if (s.rev <= prev || s.rev >= nextRev) {
+      return false;
+    }
+    prev = s.rev;
+  }
+  return true;
+}
+
+// The state of one MCP session: the authorized root, what the client may run, and the recent `check` snapshots (the
+// bases of `sinceRevision` deltas).
+@Invariant(isNormalized(this.root))
+@Invariant(this.nextRev >= 1)
+@Invariant(this.snaps.length <= MAX_SNAPS)
+@Invariant(revsOrdered(this.snaps, this.nextRev))
+export class McpSession {
+  root: string; // authorized root (normalized)
+  allowExec: bool; // test/build may execute code
+  repo: string; // directory holding runtime/ and tools/ (for build/test)
+  inited: bool;
+  private nextRev: int;
+  private snaps: Snap[]; // recent check snapshots (delta bases), oldest first
+
+  constructor(root: string, allowExec: bool, repo: string) {
+    this.root = normalizePath(root);
+    this.allowExec = allowExec;
+    this.repo = repo;
+    this.inited = false;
+    this.nextRev = 1;
+    this.snaps = [];
+  }
+
+  // The newest snapshot of `entry`.
+  @Ensures(result.isSome() ==> result.unwrap().entry == entry && result.unwrap().rev < this.nextRev)
+  latest(entry: string): Option<Snap> {
+    let found: Option<Snap> = None;
+    for (const s of this.snaps) {
+      if (s.entry == entry) {
+        found = Some(s);
+      }
+    }
+    return found;
+  }
+
+  // The snapshot `rev` of `entry`, if the session still has it.
+  @Ensures(result.isSome() ==> result.unwrap().entry == entry && result.unwrap().rev == rev)
+  find(entry: string, rev: int): Option<Snap> {
+    const k = this.snaps.findIndex(s => s.entry == entry && s.rev == rev);
+    return k.isSome() ? Some(this.snaps[k.unwrap()]) : None;
+  }
+
+  // Records a check of `entry` whose inputs have the fingerprint `fp` and returns its revision: an unchanged project
+  // (the same fingerprint as the entry's latest snapshot) keeps that revision, anything else gets the next one.
+  @Requires(keys.length == lines.length)
+  @Ensures(this.find(entry, result).isSome() && result < this.nextRev)
+  @Ensures(this.nextRev == old(this.nextRev) || this.nextRev == old(this.nextRev) + 1)
+  @Ensures(this.nextRev == old(this.nextRev) + 1 ==> result == old(this.nextRev))
+  record(entry: string, fp: string, keys: string[], lines: string[]): int {
+    const latest = this.latest(entry);
+    if (latest.isSome() && latest.unwrap().fp == fp) {
+      return latest.unwrap().rev;
+    }
+    const rev = this.nextRev;
+    this.nextRev += 1;
+    this.snaps.push(Snap { rev: rev, entry: entry, fp: fp, keys: keys, lines: lines });
+    if (this.snaps.length > MAX_SNAPS) {
+      this.snaps = this.snaps.slice(1, this.snaps.length);
+    }
+    return rev;
+  }
+}
+
+export function newState(root: string, allowExec: bool, repo: string): McpSession {
+  return new McpSession(root, allowExec, repo);
 }
 
 // ---- JSON helpers -----------------------------------------------------------------------
 
 export function jstrs(xs: string[]): Json {
-  let out: Json[] = [];
-  for (const x of xs) {
-    out.push(JStr(x));
-  }
-  return JArr(out);
+  return JArr(xs.map(x => JStr(x)));
 }
 
 export function jtext(j: Json): string {
@@ -39,6 +106,9 @@ export function jtext(j: Json): string {
 
 // ---- hashing -----------------------------------------------------------------------------
 
+// A 31-bit polynomial hash; stays in [0, 2^31 - 1) when it starts there.
+@Requires(h0 >= 0 && h0 < 2147483647)
+@Ensures(result >= 0 && result < 2147483647)
 export function hashStr(h0: int, s: string): int {
   let h = h0;
   let i: usize = 0;
@@ -56,6 +126,8 @@ function hexDigit(n: int): string {
   return String.fromCharCode(87 + n);
 }
 
+@Requires(h0 >= 0)
+@Ensures(result.length == 8)
 export function hex8(h0: int): string {
   let h = h0;
   let out = "";
@@ -72,7 +144,8 @@ export function hex8(h0: int): string {
 
 // Resolve a client-supplied path against the root; Err when it escapes the authorized root.
 // Lexical only (symlinks are not resolved; see docs/mcp.md).
-export function resolvePath(st: McpState, p: string): Result<string, string> {
+@Ensures(result.isOk() ==> isNormalized(result.unwrap()) && isInside(st.root, result.unwrap()))
+export function resolvePath(st: McpSession, p: string): Result<string, string> {
   if (p.length == 0) {
     return Err("empty path");
   }
@@ -83,12 +156,12 @@ export function resolvePath(st: McpState, p: string): Result<string, string> {
   return Ok(r);
 }
 
-export function relPath(st: McpState, p: string): string {
+export function relPath(st: McpSession, p: string): string {
   return relativeTo(st.root, p);
 }
 
 // Every file the analysis read must lie inside the root (imports may use `../`).
-export function checkAllInside(st: McpState, a: Analysis): Option<string> {
+export function checkAllInside(st: McpSession, a: Analysis): Option<string> {
   for (const f of a.sm.files) {
     // `$...` paths are the embedded prelude roots (compiler/loader/prelude.or), not files on disk.
     if (!f.path.startsWith("$") && !isInside(st.root, f.path)) {
@@ -98,11 +171,14 @@ export function checkAllInside(st: McpState, a: Analysis): Option<string> {
   return None;
 }
 
-// Single-quote a string for /bin/sh.
+// Single-quote a string for /bin/sh: the result is one word that holds `s` (every `'` is closed, escaped and reopened).
+@Ensures(result.startsWith("'") && result.endsWith("'") && result.length >= s.length + 2)
 export function shq(s: string): string {
   return "'" + s.split("'").join("'\\''") + "'";
 }
 
+@Ensures(s.length <= n ==> result == s)
+@Ensures(s.length > n ==> result.startsWith(s.substring(0, n)) && result.endsWith(" bytes]"))
 export function trunc(s: string, n: usize): string {
   if (s.length <= n) {
     return s;
@@ -113,10 +189,10 @@ export function trunc(s: string, n: usize): string {
 // ---- diagnostics -------------------------------------------------------------------------
 
 export type DiagView = {
-  id: string;        // content-stable identity (code + file + message + occurrence)
+  id: string; // content-stable identity (code + file + message + occurrence)
   code: string;
-  file: string;      // relative to root
-  line: usize;       // 1-based
+  file: string; // relative to root
+  line: usize; // 1-based
   col: usize;
   eline: usize;
   ecol: usize;
@@ -130,10 +206,14 @@ export function compactLine(d: DiagView): string {
 
 export function detailedJson(d: DiagView): Json {
   let fs: JField[] = [
-    jField("id", JStr(d.id)), jField("code", JStr(d.code)), jField("file", JStr(d.file)),
-    jField("line", JNum(d.line.toInt())), jField("col", JNum(d.col.toInt())),
-    jField("endLine", JNum(d.eline.toInt())), jField("endCol", JNum(d.ecol.toInt())),
-    jField("message", JStr(d.message))
+    jField("id", JStr(d.id)),
+    jField("code", JStr(d.code)),
+    jField("file", JStr(d.file)),
+    jField("line", JNum(d.line.toInt())),
+    jField("col", JNum(d.col.toInt())),
+    jField("endLine", JNum(d.eline.toInt())),
+    jField("endCol", JNum(d.ecol.toInt())),
+    jField("message", JStr(d.message)),
   ];
   if (d.notes.length > 0) {
     fs.push(jField("notes", jstrs(d.notes)));
@@ -141,8 +221,10 @@ export function detailedJson(d: DiagView): Json {
   return JObj(fs);
 }
 
-// Views of diagnostics (over source map `sm`), with occurrence-disambiguated stable ids.
-export function viewsOf(st: McpState, sm: SourceMap, ds: PathDiag[]): DiagView[] {
+// Views of diagnostics (over source map `sm`), with occurrence-disambiguated stable ids; positions are 1-based.
+@Ensures(result.length == ds.length)
+@Ensures(result.every(v => v.line >= 1 && v.col >= 1 && v.id.length == 8))
+export function viewsOf(st: McpSession, sm: SourceMap, ds: PathDiag[]): DiagView[] {
   let out: DiagView[] = [];
   let seen: string[] = [];
   for (const d of ds) {
@@ -165,24 +247,33 @@ export function viewsOf(st: McpState, sm: SourceMap, ds: PathDiag[]): DiagView[]
     seen.push(base);
     out.push(DiagView {
       id: hex8(hashStr(hashStr(7, base), n.toString())),
-      code: d.code, file: rel,
-      line: s.line + 1, col: s.character + 1, eline: e.line + 1, ecol: e.character + 1,
-      message: d.message, notes: d.notes
+      code: d.code,
+      file: rel,
+      line: s.line + 1,
+      col: s.character + 1,
+      eline: e.line + 1,
+      ecol: e.character + 1,
+      message: d.message,
+      notes: d.notes,
     });
   }
   return out;
 }
 
 // Raw compiler diagnostics (build path) as PathDiags over `sm`.
+@Requires(ds.every(d => d.span.file < sm.files.length))
+@Ensures(result.length == ds.length)
 export function toPathDiags(sm: SourceMap, ds: Diagnostic[]): PathDiag[] {
-  let out: PathDiag[] = [];
-  for (const d of ds) {
-    out.push(PathDiag {
-      path: sm.files[d.span.file].path, code: d.code, message: d.message,
-      start: d.span.start, end: d.span.end, notes: d.notes
-    });
-  }
-  return out;
+  return ds.map(
+    d => PathDiag {
+      path: sm.files[d.span.file].path,
+      code: d.code,
+      message: d.message,
+      start: d.span.start,
+      end: d.span.end,
+      notes: d.notes,
+    },
+  );
 }
 
 // Fingerprint of everything the analysis read (paths + contents).

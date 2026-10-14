@@ -16,6 +16,7 @@ import { FsGrant } from "std:fs";
 import { Module, Item, parse } from "../syntax";
 import { Diagnostic, SourceMap, SourceFile } from "../diag";
 import { LoadedProgram, loadWithOverlay, normalizePath } from "../loader";
+import { isCharBoundary } from "./pos";
 import { checkWithIndex, deprecationWarnings, qualityWarnings, strictContracts } from "../check";
 import { SemanticIndex } from "../hir";
 import { Workspace } from "./workspace";
@@ -31,16 +32,24 @@ export type PathDiag = {
 };
 
 export type Analysis = {
-  revision: int;               // workspace revision this result was computed at
-  entry: string;               // normalized entry path
-  sm: SourceMap;               // every file read (index == Span.file); entry is file 0
-  diags: PathDiag[];           // errors only
-  warnings: PathDiag[];        // warnings (W codes, ADR-0024), e.g. uses of deprecated symbols; never stop compilation
-  program: Option<LoadedProgram>;   // Some when loading succeeded (even if checking failed)
+  revision: int; // workspace revision this result was computed at
+  entry: string; // normalized entry path
+  sm: SourceMap; // every file read (index == Span.file); entry is file 0
+  diags: PathDiag[]; // errors only
+  warnings: PathDiag[]; // warnings (W codes, ADR-0024), e.g. uses of deprecated symbols; never stop compilation
+  program: Option<LoadedProgram>; // Some when loading succeeded (even if checking failed)
   // Semantic index (defs/refs/types, hir/index.or). Some whenever loading succeeded; partial when
   // checking failed (see check/index.or).
   index: Option<SemanticIndex>;
 };
+
+// Every diagnostic names a file of `sm` and a range inside its text (what the editor has: for the entry, the text
+// without the synthetic `main`), so converting it to a position never clamps.
+export function diagsInRange(sm: SourceMap, ds: PathDiag[]): bool {
+  return ds.every(
+    d => d.start <= d.end && sm.files.some(f => f.path == d.path && d.end <= f.text.length),
+  );
+}
 
 // True: the checker produces a SemanticIndex (`checkWithIndex`), so the LSP advertises
 // definition/hover/references/rename.
@@ -55,10 +64,12 @@ type CheckRes = { diags: Diagnostic[]; warnings: Diagnostic[]; index: SemanticIn
 function runCheck(prog: LoadedProgram, sm: SourceMap): CheckRes {
   const r = checkWithIndex(prog, sm);
   const none: Diagnostic[] = [];
-  const warns = deprecationWarnings(prog, r.index).concat(qualityWarnings(prog, sm, strictContracts(prog, false)));
+  const warns = deprecationWarnings(prog, r.index).concat(
+    qualityWarnings(prog, sm, strictContracts(prog, false)),
+  );
   return match (r.result) {
     Ok(_) => CheckRes { diags: none, warnings: warns, index: r.index },
-    Err(ds) => CheckRes { diags: ds, warnings: warns, index: r.index }
+    Err(ds) => CheckRes { diags: ds, warnings: warns, index: r.index },
   };
 }
 
@@ -66,7 +77,7 @@ function definesMain(m: Module): bool {
   for (const it of m.items) {
     const found = match (it) {
       IFunction(f) => f.name.name == "main",
-      _ => false
+      _ => false,
     };
     if (found) {
       return true;
@@ -87,7 +98,7 @@ function prepare(ws: Workspace, entry: string, entryText: Option<string>): Prepa
   let origLen: int = -1;
   let origText = "";
   let text: Option<string> = entryText;
-  for (const f of ws.files) {
+  for (const f of ws.documents()) {
     if (f.path == entry) {
       text = Some(f.text);
     } else {
@@ -108,6 +119,8 @@ function prepare(ws: Workspace, entry: string, entryText: Option<string>): Prepa
   return Prepared { files: files, origLen: origLen, origText: origText };
 }
 
+@Ensures(result.length <= ds.length)
+@Ensures(origLen < 0 ==> result.length == ds.length)
 function convert(sm: SourceMap, ds: Diagnostic[], origLen: int): PathDiag[] {
   let out: PathDiag[] = [];
   for (const d of ds) {
@@ -124,12 +137,15 @@ function convert(sm: SourceMap, ds: Diagnostic[], origLen: int): PathDiag[] {
       message: d.message,
       start: d.span.start,
       end: end,
-      notes: d.notes
+      notes: d.notes,
     });
   }
   return out;
 }
 
+@Ensures(result.entry == normalizePath(entryPath) && result.revision == ws.revision())
+@Ensures(result.program.isSome() == result.index.isSome())
+@Ensures(diagsInRange(result.sm, result.diags) && diagsInRange(result.sm, result.warnings))
 export function analyze(fs: FsGrant, ws: Workspace, entryPath: string): Analysis {
   const entry = normalizePath(entryPath);
   // Entry text comes from the overlay; when absent the loader reads the disk and no synthetic
@@ -144,45 +160,40 @@ export function analyze(fs: FsGrant, ws: Workspace, entryPath: string): Analysis
   }
   if (lo.diags.length > 0) {
     return Analysis {
-      revision: ws.revision,
+      revision: ws.revision(),
       entry: entry,
       sm: sm,
       diags: convert(sm, lo.diags, prep.origLen),
       warnings: [],
       program: None,
-      index: None
+      index: None,
     };
   }
   const prog = lo.program.unwrap();
   const cr = runCheck(prog, lo.sm);
   return Analysis {
-    revision: ws.revision, entry: entry, sm: sm, diags: convert(sm, cr.diags, prep.origLen),
+    revision: ws.revision(),
+    entry: entry,
+    sm: sm,
+    diags: convert(sm, cr.diags, prep.origLen),
     warnings: convert(sm, cr.warnings, prep.origLen),
-    program: Some(prog), index: Some(cr.index)
+    program: Some(prog),
+    index: Some(cr.index),
   };
 }
 
 // Diagnostics located in `path` (normalized comparison).
+@Ensures(result.every(d => d.path == normalizePath(path)) && result.length <= a.diags.length)
 export function diagsForPath(a: Analysis, path: string): PathDiag[] {
   const p = normalizePath(path);
-  let out: PathDiag[] = [];
-  for (const d of a.diags) {
-    if (d.path == p) {
-      out.push(d);
-    }
-  }
-  return out;
+  return a.diags.filter(d => d.path == p);
 }
 
 // Index of `path` in the analysis SourceMap (the `file` of its spans), if it was read.
+@Ensures(result.isSome()
+    ==> result.unwrap() < a.sm.files.length
+        && a.sm.files[result.unwrap()].path == normalizePath(path))
 export function fileIndexOf(a: Analysis, path: string): Option<usize> {
   const p = normalizePath(path);
-  let i: usize = 0;
-  while (i < a.sm.files.length) {
-    if (a.sm.files[i].path == p) {
-      return Some(i);
-    }
-    i += 1;
-  }
-  return None;
+  return a.sm.files.findIndex(f => f.path == p);
 }

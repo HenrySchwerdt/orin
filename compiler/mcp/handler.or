@@ -1,15 +1,21 @@
-// MCP (protocol revision 2025-06-18) JSON-RPC handling as pure functions: one decoded message in,
-// zero or more messages out. Transport (newline-delimited JSON on stdio) is in server.or.
+// MCP (protocol revision 2025-06-18) JSON-RPC handling: one decoded message and the session in, the session and zero
+// or more messages out. Transport (newline-delimited JSON on stdio) is in server.or.
+//
+// Contract (the same rule as the language server's, lsp/handler.or `repliesTo`): a request is answered exactly once,
+// with its id; a notification or a client response is not answered.
 
 import { FsGrant } from "std:fs";
 import { ProcessGrant } from "std:process";
-import { Json, JNull, JNum, JStr, JArr, JObj, JBool, jField, getField, getStr, getPath, parseJson } from "../json";
-import { McpState } from "./util";
+import {
+  Json, JNull, JNum, JStr, JArr, JObj, JBool, jField, getField, getStr, getPath, parseJson,
+} from "../json";
+import { repliesTo, answers } from "../lsp";
+import { McpSession } from "./util";
 import { toolList, callTool } from "./tools";
 
 export const PROTOCOL_VERSION: string = "2025-06-18";
 
-export type McpStep = { st: McpState; out: Json[]; };
+export type McpStep = { st: McpSession; out: Json[]; };
 
 function respond(id: Json, result: Json): Json {
   return JObj([jField("jsonrpc", JStr("2.0")), jField("id", id), jField("result", result)]);
@@ -17,21 +23,24 @@ function respond(id: Json, result: Json): Json {
 
 function respondError(id: Json, code: int, message: string): Json {
   return JObj([
-    jField("jsonrpc", JStr("2.0")), jField("id", id),
-    jField("error", JObj([jField("code", JNum(code)), jField("message", JStr(message))]))
+    jField("jsonrpc", JStr("2.0")),
+    jField("id", id),
+    jField("error", JObj([jField("code", JNum(code)), jField("message", JStr(message))])),
   ]);
 }
 
-function step(st: McpState, out: Json[]): McpStep {
+function step(st: McpSession, out: Json[]): McpStep {
   return McpStep { st: st, out: out };
 }
 
-function quiet(st: McpState): McpStep {
+function quiet(st: McpSession): McpStep {
   const out: Json[] = [];
   return McpStep { st: st, out: out };
 }
 
-export function handleText(fs: FsGrant, proc: ProcessGrant, st: McpState, body: string): McpStep {
+@Ensures(parseJson(body).isErr() ==> result.out.length == 1 && answers(result.out[0], JNull))
+@Ensures(parseJson(body).isOk() ==> repliesTo(parseJson(body).unwrap(), result.out))
+export function handleText(fs: FsGrant, proc: ProcessGrant, st: McpSession, body: string): McpStep {
   const r = parseJson(body);
   if (r.isErr()) {
     return step(st, [respondError(JNull, -32700, "parse error: " + r.unwrapErr())]);
@@ -42,14 +51,16 @@ export function handleText(fs: FsGrant, proc: ProcessGrant, st: McpState, body: 
 function toolResult(text: string, isError: bool): Json {
   return JObj([
     jField("content", JArr([JObj([jField("type", JStr("text")), jField("text", JStr(text))])])),
-    jField("isError", JBool(isError))
+    jField("isError", JBool(isError)),
   ]);
 }
 
-export function handle(fs: FsGrant, proc: ProcessGrant, st: McpState, msg: Json): McpStep {
+@Ensures(repliesTo(msg, result.out))
+@Ensures(result.st.root == st.root && (st.inited ==> result.st.inited))
+export function handle(fs: FsGrant, proc: ProcessGrant, st: McpSession, msg: Json): McpStep {
   const method = getStr(msg, "method");
   if (method.isNone()) {
-    return quiet(st);          // response from the client or garbage: we send no requests
+    return quiet(st); // response from the client or garbage: we send no requests
   }
   const idf = getField(msg, "id");
   if (idf.isNone()) {
@@ -63,9 +74,16 @@ export function handle(fs: FsGrant, proc: ProcessGrant, st: McpState, msg: Json)
       jField("protocolVersion", JStr(PROTOCOL_VERSION)),
       jField("capabilities", JObj([jField("tools", JObj([jField("listChanged", JBool(false))]))])),
       jField("serverInfo", JObj([jField("name", JStr("orin")), jField("version", JStr("0.1.0"))])),
-      jField("instructions", JStr("Orin compiler tools. check: diagnostics (pass sinceRevision for deltas); inspect: signatures/modules/built-in API without source; edit: validated rename (dry run unless apply); test/build need --allow-exec."))
+      jField(
+        "instructions",
+        JStr(
+          "Orin compiler tools. check: diagnostics (pass sinceRevision for deltas); inspect: signatures/modules/built-in API without source; edit: validated rename (dry run unless apply); test/build need --allow-exec.",
+        ),
+      ),
     ]);
-    return step(McpState { ...st, inited: true }, [respond(id, result)]);
+    let s = st;
+    s.inited = true;
+    return step(s, [respond(id, result)]);
   }
   if (m == "ping") {
     return step(st, [respond(id, JObj([]))]);

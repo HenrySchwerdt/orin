@@ -12,7 +12,7 @@ the code may *do*, the grants a program holds are a separate matter.
 One analysis serves everybody: `orin effects`, the OSIG `MAY_PERFORM` edges (and with them `orin diff`), the LSP hover and the
 MCP `inspect` tool all consume the result of `inferEffects` (`compiler/analysis/effects.or`) over the semantic index; none of
 them reasons about calls on its own. Source: `compiler/analysis/effects.or` (engine), `effectsum.or` (names, aggregation, text
-and JSON), `effectscli.or` (command), `effectpolicy.or` (policy).
+and JSON), `effectpolicy.or` (policy); the command is `compiler/tools/effectscli.or`.
 
 ## The model
 
@@ -195,6 +195,10 @@ call may do anything.
 | `E0473` | a module may perform an effect outside its allowance. Reported once per module and effect, at the call in the module that starts the path; the notes are the explanation path |
 | `E0474` | an `allowed` entry names no effect the compiler knows (`knownEffectNames`) |
 | `E0502` | an `[effects.<module>]` table names a module that does not exist (as for `[modules.x]`) |
+
+E0474 and E0502 are located in `orin.toml` (the loader keeps the manifest's text in `Manifest.source`; `policySourceMap`
+renders the policy diagnostics against the program's files plus the manifest). Before rewrite step 3e they kept the file id of
+the manifest parse and were printed as a position in the program's first source file.
 | `E0503` | malformed table: `allowed` is not an array of strings, an unknown key (also E0500 for a duplicate table) |
 
 ```
@@ -216,23 +220,31 @@ through `Sources`, which takes the grant as a parameter).
 | Module | Effects (direct = written there) |
 |---|---|
 | `loader` | `Fs.ReadFile`, `Fs.Stat`: only `Sources.read` / `Sources.exists` |
-| `analysis` | `Fs.ReadFile`, `Fs.Stat` (`loadOsigIn`, `readText`, `resolveModulePath`), `Fs.WriteFile` (`writeOut` of `orin graph` / `diff` / `effects`), `Console.Write` (CLI output) |
-| `tools` | `Fs.ReadFile`, `Fs.WriteFile`, `Console.Write`: `orin fmt` |
-| `lsp` | `Stdio.Read`, `Stdio.Write`, `Process.Spawn`, `Console.Write`; `Fs.*` only through `analysis::readText` (document symbols) |
+| `analysis` | none of its own; `Fs.ReadFile`, `Fs.Stat` only inherited (MAY) through `loader::Sources.read` / `Sources.exists` (`readText`, `resolveModulePath`, `loadOsigIn` and the program loads) |
+| `tools` | `Fs.ReadFile`, `Fs.WriteFile`, `Console.Write`: the command-line drivers `orin fmt`, `orin graph` / `diff` (`osigcli.or`, `writeOut`) and `orin effects` (`effectscli.or`) |
+| `lsp` | `Stdio.Read`, `Stdio.Write`, `Process.Spawn`, `Console.Write`; `Fs.*` only through `analysis` (and with it `loader::Sources`) |
 | `mcp` | `Fs.ReadFile`, `Fs.Stat`, `Fs.WriteFile`, `Console.Write`; stdio and `Process.Spawn` through `lsp` |
 | `testing` | `Fs.ReadFile`, `Fs.Stat`, `Fs.WriteFile`, `Console.Write`; `Process.Spawn` through `lsp::shellRun` |
 | `vc` | `Fs.ReadFile`, `Fs.WriteFile` (the solver's files), `Process.Spawn` through `lsp::shellRun` |
 | `(root)` (`main.or`) | `Host.Acquire`, `Process.Args`, `Process.Exit`, `Fs.ReadFile`, `Fs.WriteFile`, `Console.Write`; the rest through the modules above |
 
 `main` may perform `Console.Write`, `Fs.ReadFile`, `Fs.Stat`, `Fs.WriteFile`, `Host.Acquire`, `Process.Args`, `Process.Exit`,
-`Process.Spawn`, `Stdio.Read` and `Stdio.Write`; it does not use `Clock.Now`, and **nothing is UNKNOWN**. Findings of this
+`Process.Spawn`, `Stdio.Read` and `Stdio.Write`; it does not use `Clock.Now`, and **nothing is UNKNOWN**. Findings of the
 first run: (1) the one `shell` call of the compiler sits in `lsp/stdio.or` (`shellRun`), which `testing`, `vc` and `mcp` import:
-the process-spawning primitive lives in the `lsp` module, an architectural oddity worth a module of its own; (2) the `analysis`
-module, the facade the language server uses, reaches the file system in three places (`readText`, `resolveModulePath`,
-`loadOsigIn`); each takes the grant as a parameter, so they are visible, but they are not "only `loader/sources` and the output
-module" of the capability gate sketched in the roadmap, which therefore needs the table above as its allowance rather than
-that two-module list; (3) four modules print their own usage text with `console.error` and `exit` (`usage` in `main`, `analysis`, `tools`,
-`testing`) instead of returning a status.
+the process-spawning primitive lives in the `lsp` module, an architectural oddity worth a module of its own (still so: there is
+no `spawn(proc, executable, argv)` yet, ADR-0037 D5, so `shellRun` stays until it exists); (2) the `analysis` module, the facade
+the language server uses, reached the file system in three places (`readText`, `resolveModulePath`, `loadOsigIn`) and wrote the
+output of `orin graph` / `diff` (`writeOut`); (3) four modules print their own usage text with `console.error` and `exit` (`usage`
+in `main`, `analysis`, `tools`, `testing`) instead of returning a status.
+
+**The capability gate (rewrite step 3e).** Finding (2) is resolved: the three reads go through the loader's `Sources` (the
+workspace hands its buffers to `Sources` with `Workspace.sources()`, `loadOsigIn` reads a snapshot with a `Sources` without
+overlay), and the command-line drivers `orin graph` / `diff` / `effects` with their output file moved to `tools` (`osigcli.or`,
+`effectscli.or`). Only `loader/sources` reads files and only the CLI layer (`tools`, the driver) writes them. `orin effects
+compiler/main.or --module analysis` shows no effect of `analysis` itself: every effect of the module is `Fs.ReadFile` /
+`Fs.Stat` with evidence MAY, and every explanation path ends in `loader::Sources.read` / `Sources.exists`. Pinned by
+`tools/test_effects.py` ("compiler: analysis has no direct effect", "every file access of analysis goes through
+loader::Sources"). Finding (3) no longer applies to `analysis` (its usage texts moved with the drivers).
 
 The policy can express the table; for example (not enabled, `compiler/` has no `orin.toml`):
 
