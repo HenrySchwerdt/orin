@@ -712,14 +712,14 @@ function judge(g: Gen, r: Raw, approx: string, probes: Probe[]): Verdict {
 }
 
 // The reason an obligation's counterexample is not trusted (only computed when there is a model).
-function obligApprox(g: Gen, raw: Raw, o: Obl): string {
+function obligApprox(g: Gen, base: string[], raw: Raw, o: Obl): string {
   if (raw.status != "sat") {
     return "";
   }
   if (o.approx != "") {
     return o.approx;
   }
-  return taintOf(g, o.pc, o.goal);
+  return taintOf(g, base, o.pc, o.goal);
 }
 
 // One goal at the end of one path: what holds on the path, what is to be proved, what the path used.
@@ -750,18 +750,25 @@ type Proved = { v: Verdict; used: usize; };
 
 // Why a path's counterexample is not trusted, once the solver has produced one: the path went through an
 // abstraction (a loop), or its path condition or goal mentions a value that is only known through a callee's contract.
-function pathApprox(g: Gen, r: RetGoal): string {
+function pathApprox(g: Gen, base: string[], r: RetGoal): string {
   if (r.approx != "") {
     return r.approx;
   }
-  return taintOf(g, r.pc, r.goal);
+  return taintOf(g, base, r.pc, r.goal);
 }
 
 const TAINT_REASON: string = "the counterexample depends on the result of a call that is only known through its contract (A-CALL)";
 
-function taintOf(g: Gen, pc: string[], goal: string): string {
+// The assumptions about the inputs (`base`: the @Requires and invariants) count too: a model of an input that a pure
+// helper in a @Requires only abstractly allows need not be an input the real function accepts.
+function taintOf(g: Gen, base: string[], pc: string[], goal: string): string {
   if (g.mentionsTaint(goal)) {
     return TAINT_REASON;
+  }
+  for (const b of base) {
+    if (g.mentionsTaint(b)) {
+      return TAINT_REASON;
+    }
   }
   for (const p of pc) {
     if (g.mentionsTaint(p)) {
@@ -791,7 +798,7 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: G
   let anyApprox = "";
   let allExact = true;
   for (const r of goals) {
-    const a = pathApprox(g, r);
+    const a = pathApprox(g, base, r);
     if (a != "") {
       allExact = false;
       if (anyApprox == "") {
@@ -803,7 +810,7 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: G
     return Proved { v: judge(g, raw, "", probes), used: used };
   }
   for (const r of goals) {
-    if (pathApprox(g, r) == "") {
+    if (pathApprox(g, base, r) == "") {
       const one = rawProve(fs, proc, z3, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
       used += 1;
       if (one.status == "sat") {
@@ -995,7 +1002,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     } else if (!o.exact) {
       const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
       rt.qn += 1;
-      verdicts[id] = judge(g, raw, obligApprox(g, raw, o), en.probes);
+      verdicts[id] = judge(g, raw, obligApprox(g, base, raw, o), en.probes);
       statuses[id] = verdicts[id].status;
     }
     id += 1;
@@ -1017,7 +1024,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       } else {
         const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
         rt.qn += 1;
-        verdicts[id] = judge(g, raw, obligApprox(g, raw, o), en.probes);
+        verdicts[id] = judge(g, raw, obligApprox(g, base, raw, o), en.probes);
         statuses[id] = verdicts[id].status;
       }
     }

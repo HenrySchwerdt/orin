@@ -71,6 +71,11 @@ termination is not part of purity, and neither are traps (division by zero, `unw
 range). A closure that is created counts as called, so an impure closure is rejected even if it is never called.
 (`count` is not in the prelude yet; `xs.filter(p).length` does the same.)
 
+`std:seq` (ADR-0035) adds the pure functions `range(lo, hi)` (the index array `lo .. hi - 1`), `sum(xs)` and
+`sumBy(xs, f)`: `range(1, xs.length).every(i => xs[i - 1] <= xs[i])` says `xs` is sorted, `sumBy(this.items, it =>
+it.price * it.qty)` is the total of the line items. They run as ordinary code under `--check-contracts`;
+`orin verify --contracts` reads them as bounded quantifiers and recursive sums (below).
+
 E0416 names the impure operation and where it is: `call is not provably pure: `f` -> `g` performs I/O
 (console.log) at file.or:12:3; contract expressions may only call pure functions` (the chain of calls from the
 contract to the operation), or `I/O built-in `console.log` is not allowed in a contract expression`, or `function
@@ -184,40 +189,193 @@ The test runner understands `// flags: --check-contracts` and `// stderr: text` 
 (`tools/run_tests.py`; for an error test `// stderr:` is matched against the compiler's output, which pins the
 text of an E0416 message).
 
-## `orin verify --contracts [--format=json] [--z3 PATH] [--strict] entry.or` (phase 2)
+## `orin verify --contracts [--format=json] [--z3 PATH] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0035)
 
 Generates verification conditions and discharges them with z3 (`z3 -in`, SMT-LIB 2; install with
-`pip install z3-solver` or your package manager). Query files are kept in `build/contracts-vc/`.
-Per clause the result is **VERIFIED** (solver `unsat`), **REFUTED** (`sat`, with a counterexample for
-the parameters) or **UNKNOWN** (with a reason; never upgraded to VERIFIED). Exit status 1 if any clause is REFUTED (or, with
-`--strict`, UNKNOWN).
+`pip install z3-solver` or your package manager). Query files are kept in `build/contracts-vc/` (`qN.smt2`, the solver's
+answer in `qN.out`; a bounded counterexample search writes `qNb.smt2`). Per clause the result is **VERIFIED** (solver
+`unsat`), **REFUTED** (`sat` with a counterexample that is real, see "Statuses and abstraction") or **UNKNOWN** (with a
+reason; never upgraded to VERIFIED). Exit status 1 if any clause is REFUTED (or, with `--strict`, UNKNOWN). The units of
+the program are verified; the std modules it imports (`$stdlib/..`) are *read* for their contracts (modular calls) but not
+verified. To verify a std module, give it as the entry (a copy with a `main`, see "Measuring" in docs/assurance.md).
 
-Reported clauses: every `@Ensures`, the `@Requires` of every called function at each call site
-(`call-precondition`), and `@Decreases` (always UNKNOWN: termination is not checked). `@Rule` ids are
-attached to the results as `rules`. JSON: `{"results":[{"function","file","line","kind","clause",
-"rules","status","reason","counterexample","assumptions"}],"assumptions":[{"id","text"}],
-"summary":{"verified","refuted","unknown"}}`.
+### What is reported
 
-Every VERIFIED result names the model assumptions it depends on (ADR-0020 D1), listed once per
-report and referenced by id from each result: `A-INT` (no i64 overflow on returning paths),
-`A-DIV` (no division/remainder by zero on returning paths), `A-PARTIAL` (termination not proved).
-The text output prints the same list after the results.
+| `kind` | Result for | Obligation |
+|---|---|---|
+| `ensures` | every `@Ensures`, at every return of the function or method | the clause holds (and is well defined) |
+| `call-precondition` | the `@Requires` of every called function, method or `new C(..)`, at each call site | the caller establishes it; REFUTED is `FIX_CODE` |
+| `invariant` | every class `@Invariant`, at every return of a public method that changes `this` and of every constructor | `inv && requires ==> inv'` (B8); a constructor establishes it |
+| `bounds` | an index `xs[i]`, `s.charCodeAt(i)`, `s.charAt(i)`, `slice` and `substring` range | in range |
+| `unwrap` | `unwrap` of an `Option` / `Result`, `unwrapErr` | the variant is the right one |
+| `loop-invariant` | a loop `@Invariant`, on entry and preserved by one iteration | inductive |
+| `decreases` | `@Decreases` | always UNKNOWN: termination is not checked |
 
-Supported fragment: functions whose parameters and result are `int` or `bool`; body of `const`/`let`
-of such types, assignments and `+=` etc. to locals, `if`/`else`, `return`, blocks; expressions over
-literals, locals, `+ - * / %`, comparisons, `&& || !`, `?:` and calls of named functions of the same
-fragment (modular: callee `@Requires` are obligations, callee `@Ensures` are assumed, so recursion
-works). Anything else (loops, strings, arrays, records, classes, I/O, `usize`, generics) makes that
-function's clauses UNKNOWN with the reason; nothing is silently skipped except functions without
-any clause.
+`bounds` and `unwrap` results are reported for functions that have contract clauses (and for methods of a class with
+invariants); a function without any clause only reports its `call-precondition`s. `@Rule` ids are attached to the results
+as `rules`. JSON: `{"results":[{"function","file","line","kind","clause","rules","status","reason","counterexample",
+"assumptions","action","question","options","candidates","evidence"}],"assumptions":[{"id","text"}],"warnings":[..],
+"summary":{"verified","refuted","unknown"}}`. A method is reported as `Class.method`, a constructor as `Class.constructor`.
 
-Semantics (honest limits): *partial correctness*. Contracts are read over unbounded mathematical
-integers. Program arithmetic traps on i64 overflow and division by zero, and a trapping execution
-never returns, so on each path the proof assumes the result of every arithmetic operation is in the
-i64 range and every divisor is non-zero (`/` and `%` truncate toward zero as in Orin). Termination
-and loop invariants are not proved (loops are outside the fragment). VERIFIED therefore means: for
-all inputs satisfying `@Requires`, if the function returns normally then the `@Ensures` holds,
-assuming the callee contracts hold.
+### The supported fragment
+
+| Construct | Encoding in SMT | Obligation / assumption | Not supported (UNKNOWN with the reason) |
+|---|---|---|---|
+| `int`/`i64`, `i8 i16 i32 u8 u16 u32 u64 isize usize` | `Int` with the exact range of the type | arithmetic results and conversions are in range on returning paths (A-INT); `usize` subtraction below 0 traps | floats, `i128` |
+| `bool`, `+ - * / %`, comparisons, `&& \|\| !`, `==>`, `?:` | Bool / Int; `/` and `%` truncate toward zero as in Orin | divisor non-zero on returning paths (A-DIV) | `wrapping*`, `checked*`, `saturating*` |
+| arrays `T[]` | datatype (data `Array Int T`, length); `length`, `xs[i]`, `xs[i] = v`, `push`, `pop`, `get`, `slice`, `concat`, `includes` | index / slice range in bounds (obligation `bounds`) | `join`, `indexOf`, `sort`, `reduce`, `find` |
+| `every`, `some`, `map`, `filter` (pure lambda with an expression body) | quantifier over the indices; `map` / `filter` by their defining facts | well-definedness of the lambda body is part of a contract's goal | block-bodied lambdas; in code (not contracts) a lambda body with an index or call precondition |
+| `range(a, b).every(i => ..)` / `.some(..)`, `sum(xs)`, `sumBy(xs, f)` (`std:seq`) | bounded quantifier; recursive sum with the store lemma | | `sumBy` summands that need a block |
+| records, classes | datatype with one constructor; field read, write through nested places (`a.b.f = v`, `a[i].f = v`), `{ ...r, f: v }`; record `@Invariant`s of parameters and results are assumed (A3) | | generic records; the fields of recursive types (opaque) |
+| `Option<T>`, `Result<T, E>`, user unions | datatypes; `isSome`, `isNone`, `isOk`, `isErr`, `unwrap`, `unwrapOr`, `unwrapErr`, `Some`, `None`, `Ok`, `Err`, variant constructors, `match` (expression and statement) | `unwrap` needs the right variant (obligation `unwrap`) | nested patterns, `?`, `==` on these types |
+| `Map<K, V>` | presence array, value array, size; `has`, `get`, `set`, `delete`, `keys`, `values`, `size`, `new Map` | | `entries`; map equality |
+| `string` | datatype (length, id); `length`, `+`, `==`, literals, `charCodeAt`, `charAt`, `substring`, `trim`, `startsWith`, `endsWith`, `includes`, `toString`, template literals | index / range in bounds | contents (see "Strings") |
+| calls | modular: callee `@Requires` obligation, `@Ensures` assumed; pure function = uninterpreted function; recursion assumes the callee contract | A-CALL, A-PURE | generic functions, function values, interface calls |
+| methods and constructors | receiver as a datatype value; a mutating method returns the new receiver; `new C(..)`; static methods | class invariants (B8), frames (B9) | generic classes |
+| `if`, `match`, blocks, `return`, `let`, assignment, `+=` etc. | symbolic execution with merged states | | `break` / `continue` effects (the loop is havoc'd), `?` |
+| `while`, `for .. of` | loop `@Invariant`, inferred counter bound, or havoc; also unrolled 3 iterations exactly | A-LOOP | nested loop invariants inside a loop with `break` |
+| `console.log` / `console.error`, `exit` | no effect on the values; `exit` ends the path | | any other I/O |
+
+### Semantics (honest limits)
+
+*Partial correctness.* Contracts are read over unbounded mathematical integers. Program arithmetic traps on overflow of
+the type, division by zero, an index out of range and `unwrap` of `None`, and a trapping execution never returns, so on each
+path the proof assumes the result of every arithmetic operation is in the range of its type, every divisor is non-zero, every
+index is in range and every `unwrap` finds its variant. The last two are also **reported** (`bounds`, `unwrap`): the proof that
+they cannot fail is a result of its own. A consequence: an `@Ensures` of a function that always traps (`return xs[xs.length]`)
+is vacuously VERIFIED and its `bounds` result is REFUTED; read them together. Termination is not proved. VERIFIED therefore
+means: for all inputs satisfying `@Requires`, if the function returns normally then the `@Ensures` holds and the class
+invariants hold, assuming the callee contracts and the assumptions listed on the result.
+
+*Contracts are total.* A clause that traps when evaluated (an index out of range inside a contract) is a failure: the goal of a
+clause is "well defined and true". As a hypothesis (`@Requires`, a callee's `@Ensures`, an invariant) only its value is used.
+Overflow inside a contract is ignored (unbounded integers).
+
+### Statuses and abstraction
+
+- **VERIFIED** is `unsat`. If the proof used a loop invariant, that invariant's own `loop-invariant` results (entry and
+  preservation, also the inferred counter bounds) must all be VERIFIED; otherwise the result is UNKNOWN ("relies on a loop
+  invariant that is not proved"). The assumptions it used are listed (below).
+- **REFUTED** is `sat` with a counterexample that is real: the path to the clause used no abstraction. The counterexample lists
+  the parameters (and `this`) at entry: scalars, string and array lengths with their first elements, record fields, `Option`
+  / `Result` / union variants.
+- **UNKNOWN** when the solver says `unknown` or times out (4 s soft, 15 s hard), the fragment does not cover the code (the
+  reason names the construct), or the only `sat` models go through an abstraction: a loop without a sufficient invariant
+  ("loop without invariant: i, s is unconstrained after the loop"), the size of a `Map`, derived string contents, or **the
+  result of a call that is only known through its contract** (a pure function is an uninterpreted function, a mutating method
+  returns a receiver that is only constrained by its `@Ensures` and frame: the real function computes one value, the model may
+  pick another that the contract also allows). A counterexample there need not be a real execution, so it is not reported.
+  The action is `STRENGTHEN_SPEC`. Not abstract, hence reportable: the arguments of a call (a violated `call-precondition`
+  whose arguments come from the parameters), a `new C(..)` whose fields are all determined by parameter properties and
+  initialisers.
+- A false claim is usually still REFUTED: the verifier also unrolls every top-level loop 3 iterations *exactly* and tries
+  the rest of the function from those states, and when the solver gives `unknown` on a satisfiable query it retries with every
+  array shown in the counterexample bounded to length 3 and the quantified lemmas left out (a model found that way is a model
+  of the original). Both only ever produce real counterexamples.
+
+### Modular verification (B7)
+
+Every value that is *read* (a field, an element, a payload, a match binding) gets the facts its type promises as an
+assumption at the read: a `u8` is in 0..255, a length or a map size is not negative, the empty string is the only string of
+length 0. (A datatype is free: it also contains negative lengths, so these are facts about values, never axioms over all
+values.)
+
+A call is replaced by the callee's contract: its `@Requires` (with well-definedness) is an obligation at the call site
+(`call-precondition`, REFUTED = `FIX_CODE` for the caller), its `@Ensures` is assumed for the result under the `@Requires`
+(and, for a public method, the class invariants of the receiver). A function the purity analysis (ADR-0031 A4) finds pure is an
+uninterpreted function of its arguments (`uf_f`): two calls with equal arguments return equal values, and each call site gets the
+instance `requires(args) ==> ensures(args, uf_f(args))` of its contract, so no quantifier is needed. Other functions return a
+fresh value. Recursion assumes the function's own contract at the recursive call (partial correctness); this is the assumption
+**A-CALL** on every result that went through a call. Calls of a function that is not unique by name, generic, or whose
+signature is outside the fragment make the caller UNKNOWN.
+
+### Class invariants and frames (B8, B9)
+
+For every public method that changes `this` (the mutation analysis of the checker, `Program.mutating`) and every constructor, the
+verifier proves the class `@Invariant`s at every return, assuming them (and the `@Requires`) on entry: result kind `invariant`.
+A method that can break an invariant is REFUTED with the values of `this` and the arguments, `action: NEEDS_DECISION`, and the
+three options (fix the method, add a precondition, weaken the invariant). A private method has no invariant obligation (it may be
+called in the middle of an update) and the invariant is not assumed on entry. Class-typed parameters are assumed to satisfy their
+invariants (**A-INV**: constructors establish them, public methods maintain them; a write to a public field from outside the
+class is not covered, and neither is it by the run-time check).
+
+A method's **frame** is the set of fields its body writes (assignments to `this.f..`, mutating calls on `this.f`, the frames
+of the `this` methods it calls, to a fixed point); no annotation. After a call of a mutating method the receiver is a fresh
+value that equals the old one on every field outside the frame (**A-FRAME**, listed on the results that used it). A method the
+analysis cannot read (a call it cannot resolve) has the whole object as its frame.
+
+### Loops
+
+- A user `@Invariant(e)` before `while` / `for` (syntax of ADR-0012; not checked at run time yet) is proved on entry and for one
+  iteration (`loop-invariant` results), then assumed after the loop together with the negated condition.
+- A counting loop `while (i < N)` (or `<=`) whose body only does `i += 1` once per iteration, with `N` not changed by the body,
+  gets `i0 <= i <= max(i0, N)` for free; it is proved like a user invariant but not reported by itself.
+- Otherwise what the loop assigns (variables, `this.f`, receivers of `push` / `pop` / `set` / `delete` / mutating methods)
+  is havoc'd. When the clause depends on it the result is UNKNOWN: "loop without invariant: ... is unconstrained after the loop",
+  `action: STRENGTHEN_SPEC`. In `for (const x of xs)` the element is some element of `xs`. A body with `break` or `continue`
+  gets no invariant and no exit condition.
+
+### Quantifiers and sums (C11, C12)
+
+`xs.every(x => P(x))` is `forall i. 0 <= i < xs.length ==> P(xs[i])`, `some` is `exists`; `range(a, b).every(i => P(i))` of
+`std:seq` is `forall i. a <= i < b ==> P(i)`. Nested ranges state pairwise properties (sorted, no duplicates):
+
+```
+@Invariant(range(1, this.items.length).every(i => this.items[i - 1] <= this.items[i]))
+@Invariant(range(0, this.ids.length).every(i => range(i + 1, this.ids.length).every(j => this.ids[i] != this.ids[j])))
+```
+
+`sum(xs)` and `sumBy(xs, f)` are the recursive sums `psum(d, n) = n <= 0 ? 0 : psum(d, n - 1) + F(d[n - 1])` (one definition per distinct summand)
+with the lemma `psum(store(d, i, v), n) = psum(d, n) + (0 <= i < n ? F(v) - F(d[i]) : 0)`, a theorem of the definition by
+induction on `n` (it is what lets the solver prove that a transfer between two balances keeps the total without an induction
+of its own):
+
+```
+@Ensures(sum(this.balances) == old(sum(this.balances)))
+@Invariant(this.total == sumBy(this.items, it => it.price * it.qty))
+```
+
+The runtime meaning is the code of `stdlib/seq.or` (`range` builds the index array, `sum` / `sumBy` are loops): under
+`--check-contracts` the same clauses are executed. Unsupported: a lambda with a block body, a quantifier or sum inside a
+quantifier body, `reduce`.
+
+### Strings (B6)
+
+A string is a pair (length, id): the id stands for the contents, and two strings with the same length and id are equal. The empty
+string is the only string of length 0. `length`, `+` (length adds), literals (distinct literals have distinct ids), `==` between
+variables and literals are exact. The operations on contents (`charCodeAt`, `substring`, `charAt`, `trim`, `startsWith`,
+`toString`, a template literal, `==` with a computed string) are uninterpreted functions of the ids: they give no facts about the
+contents, so a proof that needs them is UNKNOWN, and a counterexample that depends on them is not reported. A REFUTED claim about
+strings is only given when the claim and its path use lengths, `charCodeAt`, or `+`, but not `+` together with `charCodeAt` and not
+derived contents. The Z3 string theory is not used: it is undecidable together with the length arithmetic and quantifiers.
+
+### Counterexamples
+
+`x = 5`, `xs.length = 2`, `xs[0] = 5`, `p.x = -1`, `o.isSome() = false`, `s is Rect = true`, `s.Rect.0 = 1`, `this.balance = 0`:
+the values of the parameters and of `this` at entry, one line each, elements only below the length. The text report prints
+the call `f(x = 5, ..)` in the question and a `candidate` precondition that excludes exactly the counterexample (never
+verified). A `call-precondition` counterexample is the caller's parameters at entry.
+
+### Assumptions (ADR-0020 D1)
+
+Every VERIFIED result carries its assumptions (`assumptions` in JSON, listed once at the end of the text report):
+
+| Id | Assumption | On a result when |
+|---|---|---|
+| A-INT | arithmetic results and conversions are in range on returning paths (a trap never returns); inside contracts integers are unbounded | always |
+| A-DIV | no division or remainder by zero on returning paths | always |
+| A-PARTIAL | termination is not proved | always |
+| A-CALL | the contracts of called functions hold; a recursive call assumes its own contract | the proof went through a call |
+| A-PURE | a function the purity analysis finds pure is a deterministic function of its arguments | an uninterpreted function was used |
+| A-INV | class invariants hold on entry to a public method and for class-typed parameters and results; record invariants (ADR-0031 A3: such a value cannot exist) hold for record-typed parameters and results | an invariant was assumed |
+| A-FRAME | a method writes only the fields its body writes; others keep their value | a frame fact was used |
+| A-LOOP | the loop invariants used hold (each is proved) | the function has a loop |
+| A-STR | strings are modelled by length; content operations are uninterpreted | a string operation was used |
+| A-MAP | the size of a `Map` is axiomatised, not computed from its keys | `size`, `keys` or `values` was used |
+
+The soundness reasoning for each encoding choice (datatypes are free so well-formedness is stated about values, not as axioms;
+why a `sat` model through an abstraction is not a counterexample; why the lemma about sums is valid) is in ADR-0035 and in the
+header comments of `compiler/vc/*.or`.
 
 ## Contract quality (ADR-0028)
 
@@ -275,7 +433,8 @@ not weaken contracts, add assumptions or widen grants to make a result pass.
 
 ## Known limitations
 
-- Loop invariants / `@Decreases` are only type-checked.
+- `@Decreases` is only type-checked (termination is not proved). A loop `@Invariant` is type-checked and used by
+  `orin verify --contracts` (proved before it is trusted), but not checked at run time yet (ADR-0035, open question 1).
 - Contract-internal calls are unchecked only one level deep: the body of a function called from a clause is
   ordinary checked code (a recursive function with a contract that calls itself in its clause costs time
   quadratic in the depth, not an endless recursion).
