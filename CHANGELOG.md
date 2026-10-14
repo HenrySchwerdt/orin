@@ -18,8 +18,8 @@
   derived string contents, Map size make a model untrusted, UNKNOWN). Found and fixed during development: F-vc1 (a datatype
   well-formedness axiom made everything VERIFIED; docs/assurance.md). Measured on `compiler/` (444 results): before 0 VERIFIED /
   0 REFUTED / 117 UNKNOWN, after 163 / 1 / 280; `std:bytes` 1V/8U before, 80V/0R/71U after; `std:utf8` 3V/34U before,
-  60V/0R/37U; `std:seq` 7V/0R/1U (new). The one REFUTED, `boundOf` in compiler/check/env.or, is a missing precondition (listed,
-  not changed). Small spec gaps fixed with contracts, no behaviour change: `mkTok`, `entrySpan`, `sigText`, `TScope`
+  60V/0R/37U; `std:collections` 0V/8U before, 215V/2R/286U after (generics); `std:seq` 7V/0R/1U (new). REFUTED, all listed and not changed: `boundOf` (compiler/check/env.or, missing precondition) and, in std:collections,
+  `Deque.slot` / its call in `Deque.grow` (the private method's contract omits `head < buf.length`). Small spec gaps fixed with contracts, no behaviour change: `mkTok`, `entrySpan`, `sigText`, `TScope`
   constructor, `TomlEntry` invariant. The contract-checked compiler now also runs the verifier tests. Tests:
   `tests/contracts/verify_*.or`, `tests/std/seq_test.or`, `tools/test_verify_contracts.py` (809 checks).
 - **Capabilities, Stage A (ADR-0021 addendum, ADR-0027).** Standard I/O now needs a *grant*. Programs that do I/O are
