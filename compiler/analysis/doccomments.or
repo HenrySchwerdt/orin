@@ -1,0 +1,99 @@
+// TSDoc-style documentation attached to declaration source spans.
+// Comments stay out of the language grammar and executable contract semantics.
+// Source spans (including the first @Requires/@Invariant annotation) determine ownership.
+
+import { scanComments } from "../syntax";
+
+// Length of the leading run of ASCII blanks (SP, TAB, CR) of `s`.
+@Ensures(result <= s.length)
+function blankPrefix(s: string): usize {
+  let i: usize = 0;
+  while (i < s.length && (s.charCodeAt(i) == 32 || s.charCodeAt(i) == 9 || s.charCodeAt(i) == 13)) {
+    i += 1;
+  }
+  return i;
+}
+
+// Length of the trailing run of ASCII blanks (SP, TAB, CR) of `s`.
+@Ensures(result <= s.length)
+function blankSuffix(s: string): usize {
+  let n: usize = 0;
+  while (n < s.length && (s.charCodeAt(s.length - 1 - n) == 32 || s.charCodeAt(s.length - 1 - n) == 9
+      || s.charCodeAt(s.length - 1 - n) == 13)) {
+    n += 1;
+  }
+  return n;
+}
+
+// Remove /**, */, indentation and leading stars while keeping Markdown and @tags.
+export function renderDocComment(raw: string): string {
+  if (!raw.startsWith("/**") || !raw.endsWith("*/")) {
+    return "";
+  }
+  const body = raw.substring(3, raw.length - 2);
+  const lines = body.split("\n");
+  let out: string[] = [];
+  for (const line of lines) {
+    // Strip the margin (` * `): leading blanks, one `*` and one following space. Any further indentation is
+    // Markdown (an indented code example) and is kept; trailing blanks are dropped.
+    let s = line.substring(blankPrefix(line), line.length);
+    if (s.startsWith("*")) {
+      s = s.substring(1, s.length);
+      if (s.startsWith(" ")) {
+        s = s.substring(1, s.length);
+      }
+    } else {
+      s = line.trim();
+    }
+    out.push(s.substring(0, s.length - blankSuffix(s)));
+  }
+  // Trim only outer empty lines. Blank lines inside the comment are meaningful Markdown.
+  let first: usize = 0;
+  while (first < out.length && out[first] == "") {
+    first += 1;
+  }
+  let last: usize = out.length;
+  while (last > first && out[last - 1] == "") {
+    last -= 1;
+  }
+  let kept: string[] = [];
+  let j = first;
+  while (j < last) {
+    kept.push(out[j]);
+    j += 1;
+  }
+  return kept.join("\n");
+}
+
+function whitespaceOnly(text: string): bool {
+  let i: usize = 0;
+  while (i < text.length) {
+    const c = text.charCodeAt(i);
+    if (!(c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Only a directly preceding /** ... */ attaches; unrelated comments, code, or
+// another declaration break the link. declStart includes preceding contract clauses.
+export function documentationAt(source: string, declStart: usize): Option<string> {
+  if (declStart > source.length) {
+    return None;
+  }
+  const comments = scanComments(source);
+  let found: Option<string> = None;
+  for (const c of comments) {
+    if (c.end <= declStart && !c.isLine) {
+      if (c.text.startsWith("/**") && whitespaceOnly(source.substring(c.end, declStart))) {
+        const rendered = renderDocComment(c.text);
+        if (rendered != "") {
+          found = Some(rendered);
+        }
+      }
+    }
+  }
+  return found;
+}
