@@ -134,15 +134,21 @@ new call paths (entry points of head that reach the new call):
 
 ```
 effect changes (transitive primitive effects; new or removed per module and function):
-  module util:
-    + Console.Write OUTPUT
+  module (root):
+    - Fs.WriteFile OUTPUT
   module store:
     - Fs.WriteFile OUTPUT
-  + app:util::fact  Console.Write OUTPUT [MUST]
-      app:util::fact  (src/util/util.or:3)
-      reached from entry point app:(root)::main [MAY]
+  module util:
+    + Console.Write OUTPUT
+  - app:(root)::main  Fs.WriteFile OUTPUT [MAY]  (in base)
+      app:(root)::main  (src/main.or:13)
+      -> app:store::saveConfig  (src/store/store.or:11)
   - app:store::saveConfig  Fs.WriteFile OUTPUT [MUST]  (in base)
       app:store::saveConfig  (src/store/store.or:11)
+  + app:util::fact  Console.Write OUTPUT [MUST]
+      app:util::fact  (src/util/util.or:3)
+      reached from entry point app:util::fact [MUST]
+      reached from entry point app:(root)::main [MAY]
 ```
 
 The JSON report has the keys `changedSymbols`, `addedSymbols`, `removedSymbols`, `possibleRenames`

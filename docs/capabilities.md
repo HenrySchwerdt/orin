@@ -231,8 +231,8 @@ the process-spawning primitive lives in the `lsp` module, an architectural oddit
 module, the facade the language server uses, reaches the file system in three places (`readText`, `resolveModulePath`,
 `loadOsigIn`); each takes the grant as a parameter, so they are visible, but they are not "only `loader/sources` and the output
 module" of the capability gate sketched in the roadmap, which therefore needs the table above as its allowance rather than
-that two-module list; (3) five modules print their own usage text with `console.error` and `exit` (`usage` in `main`,
-`analysis`, `tools`, `testing`) instead of returning a status.
+that two-module list; (3) four modules print their own usage text with `console.error` and `exit` (`usage` in `main`, `analysis`, `tools`,
+`testing`) instead of returning a status.
 
 The policy can express the table; for example (not enabled, `compiler/` has no `orin.toml`):
 
