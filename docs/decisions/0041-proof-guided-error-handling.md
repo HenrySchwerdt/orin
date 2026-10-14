@@ -330,6 +330,14 @@ the proof or assumptions, whether a runtime check remains, its emitted
 location, and why a check was hoisted, shared or eliminated. Expose this via
 CLI, LSP, MCP and OSIG so developers and agents can audit optimisation.
 
+### Interaction with proof-guided memory layout (ADR-0038)
+
+`@NoTrap` is **not** an escape, alias, uniqueness, lifetime or data-race proof. It may justify removal of modeled trap checks, but it does not by itself justify stack promotion, no-copy task transfer, non-atomic shared RC, region reclamation or LLVM `noalias`. Conversely, unique ownership does not establish safe bounds, arithmetic or allocation success.
+
+Memory transformations must preserve which trap occurs and when, ordinary `Result.Err` values, observable I/O order, contract blame and resource cleanup. Never hoist a trapping allocation/check across an effectful operation without a semantic-equivalence proof. Task panic, cancellation, and region cleanup need explicit semantics before frozen/shared or region memory can be presented as safely recoverable; partially mutated shared state must not be resumed after a failed invariant.
+
+Future expert hints or performance contracts from ADR-0038 are **independent** obligations, not `@NoTrap` guarantees. Report their proofs and limitations separately through ADR-0035 IDs and ADR-0032 assurance levels.
+
 ## 7. Recovery semantics and safety constraints
 
 `recover` is a **fault-containment boundary**, not a general exception facility.
