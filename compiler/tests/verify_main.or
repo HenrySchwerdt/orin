@@ -5,7 +5,7 @@
 import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
 import {
   BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, BFsReadFile, BFsExists, BGrantFs, BGrantClock, BGrantUnder,
-  BGrantReadOnly, BGrantRevoke, BTimeNowMillis, UnOp, BinOp
+  BGrantReadOnly, BGrantRevoke, BTimeNowMillis, BTask, UnOp, BinOp
 } from "../hir";
 import { verify, VerifyReport } from "../verify";
 import { exit } from "std:process";
@@ -820,8 +820,63 @@ function grantCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- grants moved into a task (ADR-0017, ADR-0027 Q10)
+// grantClone (BTask 17) derives a handle from a parent (an opener), grantMove (BTask 18) ends it and returns a token (a closer: the
+// handle is moved exactly once on every path), grantAdoptFs (BTask 19) makes a handle from a token (an opener with no authorising
+// handle) that the adopting function must revoke. Locals: 0 = host (or the token), the rest as named.
+
+function gclone(d: usize, parent: usize): Instr { return IBuiltin(Some(d), BTask(17), [OLocal(parent)]); }
+function gmove(g: usize, tok: usize): Instr { return IBuiltin(Some(tok), BTask(18), [OLocal(g)]); }
+function gadopt(d: usize, tok: usize): Instr { return IBuiltin(Some(d), BTask(19), [OLocal(tok)]); }
+
+function taskGrantCases(): usize {
+  let bad: usize = 0;
+  const p1 = pos("clone, move: the derived handle is moved exactly once, the parent stays usable", straight(1, [lh("host"), lh("fs"), lh("c"), lu("tok"), lr("r")], [
+    gfs(1), gclone(2, 1), gmove(2, 3), gread(1, 4), IRelease(4), grev(1)]));
+  const p2 = pos("adopt in the task wrapper: use, revoke", prog([
+    fn("f", 1, [lu("tok"), lh("g"), lr("r")], MVoid, [bk([gadopt(1, 0), gread(1, 2), IRelease(2), grev(1)], ret())])]));
+  const p3 = pos("a derived handle may be narrowed before it is moved", straight(1, [lh("host"), lh("fs"), lh("c"), lh("ro"), lu("tok")], [
+    gfs(1), gclone(2, 1), gro(3, 2), grev(3), gmove(2, 4), grev(1)]));
+  const n1 = neg("derived handle never moved or revoked", straight(1, [lh("host"), lh("fs"), lh("c")], [gfs(1), gclone(2, 1), grev(1)]), "not closed");
+  const n2 = neg("handle moved twice", straight(1, [lh("host"), lh("fs"), lh("c"), lu("t1"), lu("t2")], [
+    gfs(1), gclone(2, 1), gmove(2, 3), gmove(2, 4), grev(1)]), "not open");
+  const n3 = neg("handle used after it was moved into the task", straight(1, [lh("host"), lh("fs"), lh("c"), lu("tok"), lr("r")], [
+    gfs(1), gclone(2, 1), gmove(2, 3), gread(2, 4), IRelease(4), grev(1)]), "dead");
+  const n4 = neg("handle revoked after it was moved", straight(1, [lh("host"), lh("fs"), lh("c"), lu("tok")], [
+    gfs(1), gclone(2, 1), gmove(2, 3), grev(2), grev(1)]), "not open");
+  const n5 = neg("adopted handle never revoked", prog([
+    fn("f", 1, [lu("tok"), lh("g")], MVoid, [bk([gadopt(1, 0)], ret())])]), "not closed");
+  const n6 = neg("adopted handle revoked twice", prog([
+    fn("f", 1, [lu("tok"), lh("g")], MVoid, [bk([gadopt(1, 0), grev(1), grev(1)], ret())])]), "not open");
+  const n7 = neg("adopt with a handle argument (it takes a token)", prog([
+    fn("f", 1, [lh("other"), lh("g")], MVoid, [bk([IBuiltin(Some(1), BTask(19), [OLocal(0)]), grev(1)], ret())])]), "token");
+  const n8 = neg("move of a parameter (only the function that derived the handle moves it)", prog([
+    fn("f", 1, [lh("g"), lu("tok")], MVoid, [bk([gmove(0, 1)], ret())])]), "parameter");
+  const n9 = neg("clone without an authorising handle", straight(0, [lh("c")], [IBuiltin(Some(0), BTask(17), [OInt(1)])]), "authorising");
+  const n10 = neg("adopt into a non-handle destination", prog([
+    fn("f", 1, [lu("tok"), li("n")], MVoid, [bk([IBuiltin(Some(1), BTask(19), [OLocal(0)])], ret())])]), "destination");
+  const n11 = neg("adopt without a destination", prog([
+    fn("f", 1, [lu("tok")], MVoid, [bk([IBuiltin(None, BTask(19), [OLocal(0)])], ret())])]), "bound to a local");
+  const n12 = neg("handle moved on one branch only", prog([
+    fn("f", 1, [lh("host"), lb("c"), lh("fs"), lh("d"), lu("tok")], MVoid, [
+      bk([gfs(2), gclone(3, 2)], TBranch(OLocal(1), 1, 2)),
+      bk([gmove(3, 4)], TGoto(3)),
+      bk([], TGoto(3)),
+      bk([grev(2)], ret())])]), "closed");
+  const n13 = neg("moved handle stored in a struct", straight(1, [lh("host"), lh("fs"), lh("c"), lr("s")], [
+    gfs(1), gclone(2, 1), IStructNew(3, 0, [OLocal(2)]), IRelease(3), grev(1)]), "cannot be stored");
+  const n14 = neg("a token (scalar) is not a handle: it cannot authorise a derived handle", prog([
+    fn("f", 1, [lu("tok"), lh("c")], MVoid, [bk([IBuiltin(Some(1), BTask(17), [OLocal(0)])], ret())])]), "authorising");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; } if (!n11) { bad += 1; } if (!n12) { bad += 1; }
+  if (!n13) { bad += 1; } if (!n14) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases();
+  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + taskGrantCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);
