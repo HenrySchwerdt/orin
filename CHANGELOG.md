@@ -1,6 +1,27 @@
 # Changelog
 
 ## Unreleased
+- **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0035).** `orin verify --contracts` now encodes arrays
+  (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
+  `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by
+  length, and generic functions and classes (type parameters are opaque). Modular verification: a callee `@Requires` is an
+  obligation at the call (`FIX_CODE`), its `@Ensures` is assumed, pure functions are uninterpreted functions, recursion assumes
+  the function's own contract. Class invariants are proved per public mutating method and constructor (`inv && requires ==>
+  inv'`; a breaking method is REFUTED with `NEEDS_DECISION` and the three options); frames come from the mutation analysis,
+  no annotations. Loops: user `@Invariant` (existing ADR-0012 syntax, proved on entry and per iteration), inferred counter
+  bounds, otherwise havoc with UNKNOWN "loop without invariant" / `STRENGTHEN_SPEC`; the first three iterations are also
+  unrolled exactly so wrong claims after loops are REFUTED. Bounded quantifiers: `xs.every/some(pure lambda)` and
+  `range(a, b).every/some` become forall/exists; `sum`/`sumBy` are axiomatised by a recursive SMT function. New std module
+  `std:seq` (`range`, `sum`, `sumBy`), no grammar or checker change. New result kinds `bounds`, `unwrap`, `invariant`,
+  `loop-invariant`; every VERIFIED lists its assumptions (A-INT, A-DIV, A-PARTIAL, A-CALL, A-PURE, A-INV, A-FRAME, A-LOOP,
+  A-STR, A-MAP). Soundness: a REFUTED needs a model on a path with no abstraction (loop havoc, uninterpreted call results,
+  derived string contents, Map size make a model untrusted, UNKNOWN). Found and fixed during development: F-vc1 (a datatype
+  well-formedness axiom made everything VERIFIED; docs/assurance.md). Measured on `compiler/` (444 results): before 0 VERIFIED /
+  0 REFUTED / 117 UNKNOWN, after 163 / 1 / 280; `std:bytes` 1V/8U before, 80V/0R/71U after; `std:utf8` 3V/34U before,
+  60V/0R/37U; `std:collections` 0V/8U before, 215V/2R/286U after (generics); `std:seq` 7V/0R/1U (new). REFUTED, all listed and not changed: `boundOf` (compiler/check/env.or, missing precondition) and, in std:collections,
+  `Deque.slot` / its call in `Deque.grow` (the private method's contract omits `head < buf.length`). Small spec gaps fixed with contracts, no behaviour change: `mkTok`, `entrySpan`, `sigText`, `TScope`
+  constructor, `TomlEntry` invariant. The contract-checked compiler now also runs the verifier tests. Tests:
+  `tests/contracts/verify_*.or`, `tests/std/seq_test.or`, `tools/test_verify_contracts.py` (809 checks).
 - **Capabilities, Stage A (ADR-0021 addendum, ADR-0027).** Standard I/O now needs a *grant*. Programs that do I/O are
   `function main(host: Host): void`; `Host` and every grant (`FsGrant`, `ProcessGrant`, `StdioGrant`, `ClockGrant`) are
   resource handles with the rules of `File` (only a parameter; E0450-E0452; the MIR verifier re-checks). Grants are derived

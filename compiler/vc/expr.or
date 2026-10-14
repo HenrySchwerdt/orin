@@ -1,0 +1,2053 @@
+// Expression translation of the contract verifier (ADR-0031 B6, B7, C11, C12): source expressions to SMT terms.
+// A translation returns the term, its type and the checks found on the way (in evaluation order). Calls are
+// modular: the callee's `@Requires` are obligations, its `@Ensures` are facts; a pure function is an
+// uninterpreted function. `every` / `some` / `range(..).every` are bounded quantifiers; `sum` / `sumBy` are
+// recursively axiomatised sums.
+
+import {
+  TypeExpr, Expr, ExprKind, UnaryOp, BinaryOp, ContractClause, FieldInit, MatchArm, ArmBody, Pattern, ArrowParam, ArrowBody,
+  EInt, EBigInt, EStr, EBool, EIdent, EUnary, EBinary, ECall, ECond, EMember, EIndex, EArray, ERecord, ENew, EThis, EArrow, EMatch, ETemplate, ETyApp, ETry, EFloat,
+  UNot, UNeg, BAdd, BSub, BMul, BDiv, BRem, BEq, BNe, BLt, BLe, BGt, BGe, BAnd, BOr, BImplies,
+  AExpr, ABlock, BExpr, BBlock, PWildcard, PIdent, PVariant, PInt, PStr, PBool, CRequires, CEnsures
+} from "../syntax";
+import {
+  VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
+  isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, resolveTy, resolveTyP, fieldTyOf, fieldIndex, isMapKey
+} from "./vt";
+import { Gen, SortR, sortOf, opaqueSort } from "./gen";
+import {
+  Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
+  andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
+  isSomeT, isOkT, recField, mapHas, mapSize, mapFact, tfOf, tfChk, clausesOfList, exprOf, isThisExpr, Fresh
+} from "./ctx";
+
+// The conjunction of the obligations among the checks (what a contract needs to be well defined).
+export function wdOf(cs: Chk[]): string {
+  let goals: string[] = [];
+  for (const c of cs) {
+    if (c.oblig) {
+      goals.push(c.goal);
+    }
+  }
+  return andAll(goals);
+}
+
+function hasObl(cs: Chk[]): bool {
+  for (const c of cs) {
+    if (c.oblig) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function asmChk(goal: string): Chk {
+  return Chk { oblig: false, kind: "", what: "", line: 0, clause: "", goal: goal };
+}
+
+function oblChk(kind: string, what: string, line: usize, clause: string, goal: string): Chk {
+  return Chk { oblig: true, kind: kind, what: what, line: line, clause: clause, goal: goal };
+}
+
+// ---------------------------------------------------------------------------------------------- entry
+
+// An expression's term can be copied several times by the term built around it (an ite repeats its operands, a
+// bounds goal repeats the index). Left alone, a deep expression grows exponentially, so a term that has become
+// large is named: a fresh constant equal to it (outside quantifier bodies, where the term may mention the bound
+// variable; there the SMT let of the string operations keeps the sharing).
+export function tr(g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT): Result<TR, string> {
+  const r = trCore(g, vars, cx, e, exp)?;
+  if (r.t.length > 1500 && !cx.inQ && !isUnit(r.vt)) {
+    const f = fresh(r.g, cx, r.vt, r.t)?;
+    return mk(f.g, f.name, r.vt, r.chks);
+  }
+  return Ok(r);
+}
+
+function trCore(g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT): Result<TR, string> {
+  return match (e.kind) {
+    EInt(n) => mk(g, lit(n), isIntTy(exp) ? exp : VInt("?"), noChks()),
+    EBigInt(n) => mk(g, "(+ 18446744073709551616 " + lit(n) + ")", isIntTy(exp) ? exp : VInt("?"), noChks()),
+    EBool(b) => mk(g, b ? "true" : "false", VBool, noChks()),
+    EStr(s) => trStr(g, cx, s),
+    EIdent(id) => trIdent(g, vars, cx, id.name, exp),
+    EThis => trIdent(g, vars, cx, "this", exp),
+    EUnary(op, x) => trUnary(g, vars, cx, op, x),
+    EBinary(op, l, r) => trBinary(g, vars, cx, op, l, r),
+    ECond(c, a, b) => trCond(g, vars, cx, c, a, b, exp),
+    ECall(callee, args) => trCall(g, vars, cx, callee, args, e, exp),
+    EMember(b, f) => trMember(g, vars, cx, b, f.name, e),
+    EIndex(b, i) => trIndex(g, vars, cx, b, i, e),
+    EArray(xs) => trArrayLit(g, vars, cx, xs, exp),
+    ERecord(name, spread, inits) => trRecordLit(g, vars, cx, name.name, spread, inits),
+    ENew(name, targs, args) => trNew(g, vars, cx, name.name, targs, args, e),
+    ETemplate(parts, xs) => trTemplate(g, vars, cx, parts, xs),
+    EMatch(scrut, arms) => trMatch(g, vars, cx, scrut, arms, exp),
+    EArrow(_, _, _) => Err("a function value is only supported as the argument of every, some, map, filter, sumBy"),
+    ETry(_) => Err("`?` (early return on Err / None) is not supported"),
+    EFloat(_) => Err("floating-point values are not modelled"),
+    _ => Err("unsupported expression")
+  };
+}
+
+// A clause translated for use as a hypothesis (`t`, without its well-definedness) or as a goal (`t` and `wd`).
+export type Cl = { g: Gen; t: string; wd: string; tf: string; };
+
+// The type facts among the checks (guarded as the checks are): what the values read by the clause satisfy.
+function tfOfChks(cs: Chk[]): string {
+  let goals: string[] = [];
+  for (const c of cs) {
+    if (!c.oblig && c.kind == "typefact") {
+      goals.push(c.goal);
+    }
+  }
+  return andAll(goals);
+}
+
+export function trClause(g: Gen, vars: Var[], cx: Cx, e: Expr): Result<Cl, string> {
+  const r = tr(g, vars, cx, e, VBool)?;
+  if (!vtEq(r.vt, VBool)) {
+    return Err("contract expression is not bool");
+  }
+  return Ok(Cl { g: r.g, t: r.t, wd: wdOf(r.chks), tf: tfOfChks(r.chks) });
+}
+
+// The clause as a hypothesis (its value, with the type facts of what it read) and as a goal (well defined and
+// true, whenever the type facts hold).
+export function clHyp(c: Cl): string {
+  return c.tf == "true" ? c.t : "(and " + c.tf + " " + c.t + ")";
+}
+
+export function clGoal(c: Cl): string {
+  const core = c.wd == "true" ? c.t : "(and " + c.t + " " + c.wd + ")";
+  return c.tf == "true" ? core : "(=> " + c.tf + " " + core + ")";
+}
+
+// ------------------------------------------------------------------------------------------ atoms
+
+function trStr(g0: Gen, cx: Cx, s: string): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, VStr)?;
+  g = so.g;
+  const known = g.litFor(s);
+  if (known.isSome()) {
+    return mk(g, known.unwrap(), VStr, noChks());
+  }
+  // A literal is a string of its length whose id is its position among the literals (the empty string has id 0):
+  // distinct literals are distinct strings.
+  const id = s.length == 0 ? 0 : g.litConsts().length + 1;
+  const name = "(mkStr " + s.length.toString() + " " + id.toString() + ")";
+  g.registerLit(s, name);
+  return mk(g, name, VStr, noChks());
+}
+
+function trIdent(g0: Gen, vars: Var[], cx: Cx, name: string, exp: VT): Result<TR, string> {
+  let g = g0;
+  const v = lookupVar(vars, name);
+  if (v.isSome()) {
+    return mk(g, v.unwrap().term, v.unwrap().vt, noChks());
+  }
+  if (name == "result" && cx.res.isSome()) {
+    return mk(g, cx.res.unwrap().term, cx.res.unwrap().vt, noChks());
+  }
+  if (name == "None") {
+    return match (exp) {
+      VOpt(_) => {
+        const so = sortS(g, cx, exp)?;
+        return mk(so.g, "none" + so.s, exp, noChks());
+      },
+      _ => Err("cannot infer the type of `None` here")
+    };
+  }
+  if (name == "this") {
+    return Err("`this` outside a method");
+  }
+  const own = cx.p.tab.variantOwner(name);
+  if (own.isSome()) {
+    return trVariant(g, vars, cx, own.unwrap(), name, []);
+  }
+  for (const c of cx.p.consts) {
+    if (c.name == name) {
+      const cc = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: c.text };
+      const dty = match (c.decl.ty) {
+        Some(t) => tyOf(cx, t),
+        None => noExp()
+      };
+      const none: Var[] = [];
+      const r = tr(g, none, cc, c.decl.value, dty)?;
+      return mk(r.g, r.t, r.vt, noChks());
+    }
+  }
+  return Err("unsupported name `" + name + "`");
+}
+
+// A union variant value `Union.V(args)`.
+function trVariant(g0: Gen, vars: Var[], cx: Cx, uni: string, vname: string, args: Expr[]): Result<TR, string> {
+  let g = g0;
+  const u = cx.p.tab.findUni(uni);
+  if (u.isNone()) {
+    return Err("unknown union `" + uni + "`");
+  }
+  const t = VUni(uni);
+  if (cx.p.tab.isCyclic("u:" + uni)) {
+    return Err("the variants of the recursive union `" + uni + "` are not modelled");
+  }
+  const so = sortS(g, cx, t)?;
+  g = so.g;
+  for (const v of u.unwrap().variants) {
+    if (v.name == vname) {
+      if (v.payload.length != args.length) {
+        return Err("variant `" + vname + "` takes " + v.payload.length.toString() + " argument(s)");
+      }
+      let terms: string[] = [];
+      let chks: Chk[] = [];
+      let i: usize = 0;
+      while (i < args.length) {
+        const pt = tyOf(cx, v.payload[i]);
+        if (isBad(pt)) {
+          const fr = freshFreeOpaque(g);
+          g = fr.g;
+          terms.push(fr.name);
+        } else {
+          const a = tr(g, vars, cx, args[i], pt)?;
+          g = a.g;
+          chks = concatChk(chks, a.chks);
+          terms.push(a.t);
+        }
+        i += 1;
+      }
+      const ctor = so.s + "." + vname;
+      return mk(g, terms.length == 0 ? ctor : "(" + ctor + " " + terms.join(" ") + ")", t, chks);
+    }
+  }
+  return Err("unknown variant `" + vname + "`");
+}
+
+// A fresh arbitrary value of the opaque sort (a field or payload type the verifier does not model).
+function freshFreeOpaque(g0: Gen): Fresh {
+  let g = g0;
+  const so = opaqueSort(g);
+  g = so.g;
+  const name = g.next("o");
+  g.declare("(declare-const " + name + " " + so.s + ")");
+  return Fresh { g: g, name: name };
+}
+
+function trUnary(g: Gen, vars: Var[], cx: Cx, op: UnaryOp, x: Expr): Result<TR, string> {
+  const a = tr(g, vars, cx, x, noExp())?;
+  return match (op) {
+    UNot => !vtEq(a.vt, VBool) ? Err("`!` on a non-bool value") : mk(a.g, "(not " + a.t + ")", VBool, a.chks),
+    UNeg => {
+      if (!isIntTy(a.vt)) {
+        return Err("`-` on a non-integer value");
+      }
+      const k = intKindOf(a.vt);
+      const t = "(- " + a.t + ")";
+      return mk(a.g, t, a.vt, concatChk(a.chks, [asmChk(k == "?" ? inRange(t) : inKind(k, t))]));
+    }
+  };
+}
+
+function trCond(g: Gen, vars: Var[], cx: Cx, c: Expr, a: Expr, b: Expr, exp: VT): Result<TR, string> {
+  const ct = tr(g, vars, cx, c, VBool)?;
+  if (!vtEq(ct.vt, VBool)) {
+    return Err("condition of `?:` is not bool");
+  }
+  const at = tr(ct.g, vars, cx, a, exp)?;
+  const bt = tr(at.g, vars, cx, b, isBad(exp) ? at.vt : exp)?;
+  let vt = at.vt;
+  if (isIntTy(at.vt) && isIntTy(bt.vt)) {
+    const k = joinKinds(intKindOf(at.vt), intKindOf(bt.vt));
+    if (k == "") {
+      return Err("branches of `?:` have different integer types");
+    }
+    vt = VInt(k);
+  } else if (!vtEq(at.vt, bt.vt)) {
+    return Err("branches of `?:` have different types");
+  }
+  const chks = concatChk(concatChk(ct.chks, guardChks(ct.t, at.chks)), guardChks("(not " + ct.t + ")", bt.chks));
+  return mk(bt.g, "(ite " + ct.t + " " + at.t + " " + bt.t + ")", vt, chks);
+}
+
+function smtCmp(op: BinaryOp): string {
+  return match (op) {
+    BLt => "<",
+    BLe => "<=",
+    BGt => ">",
+    BGe => ">=",
+    _ => "="
+  };
+}
+
+function trBinary(g: Gen, vars: Var[], cx: Cx, op: BinaryOp, l: Expr, r: Expr): Result<TR, string> {
+  const lt = tr(g, vars, cx, l, noExp())?;
+  const isAnd = match (op) { BAnd => true, _ => false };
+  const isOr = match (op) { BOr => true, _ => false };
+  const isImp = match (op) { BImplies => true, _ => false };
+  if (isAnd || isOr || isImp) {
+    // The right operand is only evaluated when the left one does not decide: guard its checks.
+    const guard = isAnd || isImp ? lt.t : "(not " + lt.t + ")";
+    const rt = tr(lt.g, vars, cx, r, VBool)?;
+    if (!vtEq(lt.vt, VBool) || !vtEq(rt.vt, VBool)) {
+      return Err("`&&`, `||`, `==>` need bool operands");
+    }
+    const chks = concatChk(lt.chks, guardChks(guard, rt.chks));
+    const term = isAnd ? "(and " + lt.t + " " + rt.t + ")" : (isOr ? "(or " + lt.t + " " + rt.t + ")" : "(=> " + lt.t + " " + rt.t + ")");
+    return mk(rt.g, term, VBool, chks);
+  }
+  const rt = tr(lt.g, vars, cx, r, lt.vt)?;
+  const chks = concatChk(lt.chks, rt.chks);
+  const arith = match (op) {
+    BAdd => true,
+    BSub => true,
+    BMul => true,
+    BDiv => true,
+    BRem => true,
+    _ => false
+  };
+  if (arith) {
+    const isAdd = match (op) { BAdd => true, _ => false };
+    if (isAdd && vtEq(lt.vt, VStr) && vtEq(rt.vt, VStr)) {
+      return trConcat(rt.g, cx, lt.t, rt.t, chks);
+    }
+    if (!isIntTy(lt.vt) || !isIntTy(rt.vt)) {
+      return Err("arithmetic on a non-integer value");
+    }
+    const k = joinKinds(intKindOf(lt.vt), intKindOf(rt.vt));
+    if (k == "") {
+      return Err("arithmetic on integers of different types");
+    }
+    const a = lt.t;
+    const b = rt.t;
+    let t = "";
+    let extra: Chk[] = [];
+    match (op) {
+      BAdd => { t = "(+ " + a + " " + b + ")"; },
+      BSub => { t = "(- " + a + " " + b + ")"; },
+      BMul => { t = "(* " + a + " " + b + ")"; },
+      BDiv => {
+        t = "(tdiv " + a + " " + b + ")";
+        extra.push(asmChk("(not (= " + b + " 0))"));
+      },
+      _ => {
+        t = "(trem " + a + " " + b + ")";
+        extra.push(asmChk("(not (= " + b + " 0))"));
+        // `MIN % -1` traps for i64 only (the narrow types give 0, ADR-0022).
+        if (k == "int" || k == "isize" || k == "?") {
+          extra.push(asmChk(inRange("(tdiv " + a + " " + b + ")")));
+        }
+      }
+    }
+    extra.push(asmChk(k == "?" ? inRange(t) : inKind(k, t)));
+    return mk(rt.g, t, VInt(k), concatChk(chks, extra));
+  }
+  const isEq = match (op) { BEq => true, _ => false };
+  const isNe = match (op) { BNe => true, _ => false };
+  if (isEq || isNe) {
+    if (isIntTy(lt.vt) && isIntTy(rt.vt)) {
+      if (joinKinds(intKindOf(lt.vt), intKindOf(rt.vt)) == "") {
+        return Err("`==` / `!=` on integers of different types");
+      }
+    } else if (!vtEq(lt.vt, rt.vt)) {
+      return Err("`==` / `!=` on operands of different types");
+    }
+    const okEq = match (lt.vt) {
+      VInt(_) => true,
+      VBool => true,
+      VStr => true,
+      _ => false
+    };
+    if (!okEq) {
+      return Err("`==` / `!=` on values of type `" + vtName(lt.vt) + "` is not supported (only integers, bool and string)");
+    }
+    const eq = "(= " + lt.t + " " + rt.t + ")";
+    let g2 = rt.g;
+    if (vtEq(lt.vt, VStr) && (lt.t.startsWith("(") || rt.t.startsWith("("))) {
+      g2.noteStr("derive");
+      g2.useAssumption("A-STR");
+    }
+    return mk(g2, isEq ? eq : "(not " + eq + ")", VBool, chks);
+  }
+  if (!isIntTy(lt.vt) || !isIntTy(rt.vt)) {
+    return Err("comparison of non-integer values");
+  }
+  return mk(rt.g, "(" + smtCmp(op) + " " + lt.t + " " + rt.t + ")", VBool, chks);
+}
+
+// String concatenation: uninterpreted, with the length axiom (strings are modelled by their length).
+function trConcat(g0: Gen, cx: Cx, a: string, b: string, chks: Chk[]): Result<TR, string> {
+  let g = g0;
+  // Only lengths are known of the result; a model is realisable by strings of those lengths unless the claim
+  // compares the concatenation with another string (`==` on a derived string notes the abstraction).
+  g.useAssumption("A-STR");
+  g.noteStr("concat");
+  if (!g.hasFun("cid")) {
+    g.registerFun("cid");
+    g.declare("(declare-fun cid (Int Int) Int)");
+  }
+  const len = "(+ (slen sa) (slen sb))";
+  return mk(g, "(let ((sa " + a + ") (sb " + b + ")) (mkStr " + len + " (ite (= " + len + " 0) 0 (cid (sid sa) (sid sb)))))", VStr, chks);
+}
+
+function trTemplate(g0: Gen, vars: Var[], cx: Cx, parts: string[], xs: Expr[]): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, VStr)?;
+  g = so.g;
+  let chks: Chk[] = [];
+  for (const x of xs) {
+    const a = tr(g, vars, cx, x, noExp())?;
+    g = a.g;
+    chks = concatChk(chks, a.chks);
+  }
+  let n: usize = 0;
+  for (const p of parts) {
+    n += p.length;
+  }
+  if (cx.inQ) {
+    return Err("template literal inside a quantifier body");
+  }
+  g.noteStr("derive");
+  g.useAssumption("A-STR");
+  const f = freshFree(g, cx, VStr)?;
+  g = f.g;
+  g.assert("(>= (slen " + f.name + ") " + n.toString() + ")");
+  return mk(g, f.name, VStr, chks);
+}
+
+// ---------------------------------------------------------------------------------- members and indexing
+
+function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr): Result<TR, string> {
+  const b = tr(g, vars, cx, base, noExp())?;
+  return match (b.vt) {
+    VArr(_) => {
+      if (name != "length") {
+        return Err("no field `" + name + "` on an array");
+      }
+      const so = sortS(b.g, cx, b.vt)?;
+      return mk(so.g, arrLen(so.s, b.t), VInt("usize"), concatChk(b.chks, [tfChk("(>= " + arrLen(so.s, b.t) + " 0)")]));
+    },
+    VStr => {
+      if (name != "length") {
+        return Err("no field `" + name + "` on a string");
+      }
+      return mk(b.g, "(slen " + b.t + ")", VInt("usize"), concatChk(b.chks, [tfChk("(>= (slen " + b.t + ") 0)")]));
+    },
+    VMap(_, _) => {
+      if (name != "size") {
+        return Err("no field `" + name + "` on a Map");
+      }
+      let g2 = b.g;
+      g2.noteApprox("the size of a Map is axiomatised, not computed from its keys");
+      g2.useAssumption("A-MAP");
+      const so = sortS(g2, cx, b.vt)?;
+      return mk(so.g, mapSize(so.s, b.t), VInt("usize"), concatChk(b.chks, [tfChk("(>= " + mapSize(so.s, b.t) + " 0)")]));
+    },
+    VRec(rn) => {
+      const rd = cx.p.tab.findRec(rn);
+      if (rd.isNone()) {
+        return Err("unknown record `" + rn + "`");
+      }
+      const fi = fieldIndex(rd.unwrap(), name);
+      if (fi.isNone()) {
+        return Err("no field `" + name + "` on `" + rn + "`");
+      }
+      const ft = fieldTyOf(cx.p.tab, rd.unwrap(), fi.unwrap());
+      if (isBad(ft)) {
+        return Err("field `" + rn + "." + name + "` has an unsupported type (" + badReason(ft) + ")");
+      }
+      const so = sortS(b.g, cx, b.vt)?;
+      if (cx.p.tab.isCyclic("r:" + rn)) {
+        return Err("the fields of the recursive type `" + rn + "` are not modelled");
+      }
+      const fterm = recField(so.s, name, b.t);
+      const tf = tfOf(so.g, cx, ft, fterm)?;
+      return mk(tf.g, fterm, ft, concatChk(b.chks, tf.chks));
+    },
+    _ => Err("no field `" + name + "` on a value of type `" + vtName(b.vt) + "`")
+  };
+}
+
+function trIndex(g: Gen, vars: Var[], cx: Cx, base: Expr, idx: Expr, e: Expr): Result<TR, string> {
+  const b = tr(g, vars, cx, base, noExp())?;
+  const i = tr(b.g, vars, cx, idx, VInt("usize"))?;
+  return match (b.vt) {
+    VArr(el) => {
+      if (!isIntTy(i.vt)) {
+        return Err("array index is not an integer");
+      }
+      const so = sortS(i.g, cx, b.vt)?;
+      const goal = inBounds(so.s, b.t, i.t);
+      const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
+      const eterm = arrSel(so.s, b.t, i.t);
+      const tf = tfOf(so.g, cx, el, eterm)?;
+      return mk(tf.g, eterm, el,
+        concatChk(concatChk(concatChk(b.chks, i.chks), [oblChk("bounds", "index", lineOf(cx.text, e.span.start), clause, goal)]), tf.chks));
+    },
+    _ => Err("indexing a value of type `" + vtName(b.vt) + "`")
+  };
+}
+
+// ----------------------------------------------------------------------------------- literals and records
+
+function trArrayLit(g0: Gen, vars: Var[], cx: Cx, xs: Expr[], exp: VT): Result<TR, string> {
+  let g = g0;
+  let elemExp = noExp();
+  match (exp) {
+    VArr(e) => { elemExp = e; },
+    _ => {}
+  }
+  let terms: string[] = [];
+  let chks: Chk[] = [];
+  let el = elemExp;
+  for (const x of xs) {
+    const a = tr(g, vars, cx, x, el)?;
+    g = a.g;
+    chks = concatChk(chks, a.chks);
+    terms.push(a.t);
+    if (isBad(el) || (isIntTy(el) && intKindOf(el) == "?")) {
+      el = a.vt;
+    }
+  }
+  if (isBad(el)) {
+    return Err("cannot infer the element type of an empty array literal here");
+  }
+  const at = VArr(concrete(el));
+  if (cx.inQ) {
+    return Err("array literal inside a quantifier body");
+  }
+  const so = sortS(g, cx, at)?;
+  g = so.g;
+  const base = freshFree(g, cx, at)?;
+  g = base.g;
+  let data = arrData(so.s, base.name);
+  let i: usize = 0;
+  while (i < terms.length) {
+    data = "(store " + data + " " + i.toString() + " " + terms[i] + ")";
+    i += 1;
+  }
+  return mk(g, arrMk(so.s, data, xs.length.toString()), at, chks);
+}
+
+function trRecordLit(g0: Gen, vars: Var[], cx: Cx, name: string, spread: Option<Expr>, inits: FieldInit[]): Result<TR, string> {
+  let g = g0;
+  const rd = cx.p.tab.findRec(name);
+  if (rd.isNone()) {
+    return Err("unknown record `" + name + "`");
+  }
+  const d = rd.unwrap();
+  if (d.generic) {
+    let inScope = d.tparams.length > 0;
+    for (const x of d.tparams) {
+      if (!cx.f.tparams.includes(x)) {
+        inScope = false;
+      }
+    }
+    if (!inScope) {
+      return Err("generic record `" + name + "`");
+    }
+  }
+  const t = VRec(name);
+  if (cx.p.tab.isCyclic("r:" + name)) {
+    return Err("record literal of the recursive type `" + name + "`");
+  }
+  const so = sortS(g, cx, t)?;
+  g = so.g;
+  let chks: Chk[] = [];
+  let sp: Option<TR> = None;
+  match (spread) {
+    Some(s) => {
+      const a = tr(g, vars, cx, s, t)?;
+      g = a.g;
+      chks = concatChk(chks, a.chks);
+      sp = Some(a);
+    },
+    None => {}
+  }
+  let args: string[] = [];
+  let i: usize = 0;
+  while (i < d.fields.length) {
+    let found: Option<Expr> = None;
+    for (const fi of inits) {
+      if (fi.name.name == d.fields[i]) {
+        found = Some(fi.value);
+      }
+    }
+    const ft = fieldTyOf(cx.p.tab, d, i);
+    if (found.isSome()) {
+      if (isBad(ft)) {
+        const fo = freshFreeOpaque(g);
+        g = fo.g;
+        args.push(fo.name);
+      } else {
+        const a = tr(g, vars, cx, found.unwrap(), ft)?;
+        g = a.g;
+        chks = concatChk(chks, a.chks);
+        if (!vtEq(a.vt, ft)) {
+          return Err("field `" + d.fields[i] + "` has type `" + vtName(a.vt) + "`, expected `" + vtName(ft) + "`");
+        }
+        args.push(a.t);
+      }
+    } else if (sp.isSome()) {
+      args.push(recField(so.s, d.fields[i], sp.unwrap().t));
+    } else {
+      return Err("field `" + d.fields[i] + "` is missing in the record literal");
+    }
+    i += 1;
+  }
+  return mk(g, "(mk" + so.s + (args.length > 0 ? " " + args.join(" ") : "") + ")", t, chks);
+}
+
+// ------------------------------------------------------------------------------------------------- calls
+
+function indexIn(xs: string[], x: string): usize {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i] == x) {
+      return i;
+    }
+    i += 1;
+  }
+  return 0;
+}
+
+function isUserFn(cx: Cx, name: string): bool {
+  return cx.p.fnCount.get(name).unwrapOr(0) > 0;
+}
+
+// Is the unique function called `name` the one of `std:seq` (stdlib/seq.or)? Its calls are axiomatised, not
+// executed: `sum`, `sumBy` as recursive sums, `range(a, b).every` as a bounded quantifier.
+function isSeqFn(cx: Cx, name: string): bool {
+  if (cx.p.fnCount.get(name).unwrapOr(0) != 1) {
+    return false;
+  }
+  const i = cx.p.fnIx.get(name);
+  return i.isSome() && cx.p.fns[i.unwrap()].unit == "$stdlib/seq";
+}
+
+function calleeCx(cx: Cx, f: Fn): Cx {
+  return Cx { p: cx.p, f: f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: f.text };
+}
+
+function trCall(g: Gen, vars: Var[], cx: Cx, callee: Expr, args: Expr[], e: Expr, exp: VT): Result<TR, string> {
+  return match (callee.kind) {
+    EIdent(id) => trNamedCall(g, vars, cx, id.name, args, e, exp),
+    EMember(recv, m) => trMethodCall(g, vars, cx, recv, m.name, args, e, exp),
+    ETyApp(_, _) => Err("call of a generic function"),
+    _ => Err("unsupported call (only calls of named functions and methods)")
+  };
+}
+
+function trNamedCall(g0: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e: Expr, exp: VT): Result<TR, string> {
+  let g = g0;
+  if (name == "old" && cx.ens && args.length == 1) {
+    const oc = Cx { p: cx.p, f: cx.f, res: cx.res, ens: false, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: cx.inQ, text: cx.text };
+    return tr(g, cx.olds, oc, args[0], exp);
+  }
+  if (name == "Some" && args.length == 1) {
+    let inner = noExp();
+    match (exp) {
+      VOpt(t) => { inner = t; },
+      _ => {}
+    }
+    const a = tr(g, vars, cx, args[0], inner)?;
+    const ot = VOpt(concrete(a.vt));
+    const so = sortS(a.g, cx, ot)?;
+    return mk(so.g, "(some" + so.s + " " + a.t + ")", ot, a.chks);
+  }
+  if (name == "Ok" && args.length == 0) {
+    // `Ok()` of a `Result<void, E>`
+    return match (exp) {
+      VRes(t, _) => {
+        if (!isUnit(t)) {
+          return Err("`Ok()` without a value for a result of `" + vtName(t) + "`");
+        }
+        const so = sortS(g, cx, exp)?;
+        return mk(so.g, "(ok" + so.s + " 0)", exp, noChks());
+      },
+      _ => Err("cannot infer the type of `Ok()` here")
+    };
+  }
+  if ((name == "Ok" || name == "Err") && args.length == 1) {
+    return match (exp) {
+      VRes(t, ee) => {
+        const a = tr(g, vars, cx, args[0], name == "Ok" ? t : ee)?;
+        const so = sortS(a.g, cx, exp)?;
+        return mk(so.g, "(" + (name == "Ok" ? "ok" : "err") + so.s + " " + a.t + ")", exp, a.chks);
+      },
+      _ => Err("cannot infer the type of `" + name + "(..)` here")
+    };
+  }
+  if (isSeqFn(cx, name)) {
+    const pre = trPrelude(g, vars, cx, name, args, e, exp);
+    if (pre.isSome()) {
+      return pre.unwrap();
+    }
+  }
+  const own = cx.p.tab.variantOwner(name);
+  if (own.isSome() && !isUserFn(cx, name)) {
+    return trVariant(g, vars, cx, own.unwrap(), name, args);
+  }
+  if (cx.p.fnCount.get(name).unwrapOr(0) != 1) {
+    return Err("call of `" + name + "`: not a unique function of the program, or a built-in");
+  }
+  const fi = cx.p.fnIx.get(name);
+  if (fi.isNone()) {
+    return Err("call of `" + name + "`: unknown function");
+  }
+  const f = cx.p.fns[fi.unwrap()];
+  if (f.kind != 0) {
+    return Err("call of `" + name + "`: not a function");
+  }
+  return callFn(g, vars, cx, f, None, args, e, exp);
+}
+
+// A call of a `std:seq` function (isSeqFn): `sum(xs)`, `sumBy(xs, f)`. (`range` is read where it is the receiver of
+// `every` / `some`.) None for any other name: the call is then an ordinary one.
+function trPrelude(g: Gen, vars: Var[], cx: Cx, name: string, args: Expr[], e: Expr, exp: VT): Option<Result<TR, string>> {
+  if (name == "sum" && args.length == 1) {
+    return Some(trSum(g, vars, cx, args[0], None, e));
+  }
+  if (name == "sumBy" && args.length == 2) {
+    return Some(trSum(g, vars, cx, args[0], Some(args[1]), e));
+  }
+  const none: Option<Result<TR, string>> = None;
+  return none;
+}
+
+function trMethodCall(g0: Gen, vars: Var[], cx: Cx, recvE: Expr, name: string, args: Expr[], e: Expr, exp: VT): Result<TR, string> {
+  let g = g0;
+  // `range(a, b).every(i => ..)` and `.some(..)`: bounded quantifiers over an index range.
+  if ((name == "every" || name == "some") && args.length == 1 && isRangeCall(cx, recvE)) {
+    return trRangeQuant(g, vars, cx, recvE, name == "every", args[0], e);
+  }
+  // `String.fromCharCode(c)`: the one-byte string of c (traps unless 0 <= c <= 255).
+  match (recvE.kind) {
+    EIdent(sid) => {
+      if (sid.name == "String" && name == "fromCharCode" && args.length == 1 && lookupVar(vars, "String").isNone()) {
+        const c = tr(g, vars, cx, args[0], VInt("int"))?;
+        let g2 = c.g;
+        const so = sortS(g2, cx, VStr)?;
+        g2 = so.g;
+        g2.noteStr("derive");
+        g2.useAssumption("A-STR");
+        if (!g2.hasFun("cfc")) {
+          g2.registerFun("cfc");
+          g2.declare("(declare-fun cfc (Int) Int)");
+        }
+        const clause = "character code in 0..255: `" + srcText(cx.text, e) + "`";
+        const goal = "(and (<= 0 " + c.t + ") (<= " + c.t + " 255))";
+        return mk(g2, "(mkStr 1 (cfc " + c.t + "))", VStr, concatChk(c.chks, [oblChk("bounds", "fromCharCode", lineOf(cx.text, e.span.start), clause, goal)]));
+      }
+    },
+    _ => {}
+  }
+  // `Class.method(..)`: a static method (the receiver is a class name, not a value).
+  match (recvE.kind) {
+    EIdent(id) => {
+      if (lookupVar(vars, id.name).isNone() && cx.p.clsIx.get(id.name).isSome()) {
+        const mi = cx.p.fnIx.get(id.name + "." + name);
+        if (mi.isSome() && cx.p.fns[mi.unwrap()].kind == 2) {
+          return callFn(g, vars, cx, cx.p.fns[mi.unwrap()], None, args, e, exp);
+        }
+        return Err("`" + id.name + "." + name + "` is not a static method");
+      }
+    },
+    _ => {}
+  }
+  const r = tr(g, vars, cx, recvE, noExp())?;
+  g = r.g;
+  return match (r.vt) {
+    VArr(el) => trArrayMethod(g, vars, cx, r, el, name, args, e),
+    VStr => trStringMethod(g, vars, cx, r, name, args, e),
+    VInt(k) => trIntMethod(g, cx, r, k, name, args),
+    VBool => {
+      if (name == "toString" && args.length == 0) {
+        return trStrOf(g, cx, r.t, r.chks);
+      }
+      return Err("no method `" + name + "` on bool");
+    },
+    VOpt(t) => trOptMethod(g, vars, cx, r, t, name, args, e),
+    VRes(a, b) => trResMethod(g, cx, r, a, b, name, args, e),
+    VMap(k, v) => trMapMethod(g, vars, cx, r, k, v, name, args, e),
+    VRec(cn) => {
+      const mi = cx.p.fnIx.get(cn + "." + name);
+      if (mi.isNone()) {
+        return Err("no method `" + name + "` on `" + cn + "` (or it is generic)");
+      }
+      const f = cx.p.fns[mi.unwrap()];
+      if (f.kind != 1) {
+        return Err("`" + cn + "." + name + "` is not an instance method");
+      }
+      if (f.mutating) {
+        return Err("call of the mutating method `" + cn + "." + name + "` inside an expression (only as a statement)");
+      }
+      return callFn(g, vars, cx, f, Some(r), args, e, exp);
+    },
+    _ => Err("method `" + name + "` on a value of type `" + vtName(r.vt) + "`")
+  };
+}
+
+function isRangeCall(cx: Cx, e: Expr): bool {
+  return match (e.kind) {
+    ECall(c, args) => match (c.kind) {
+      EIdent(id) => id.name == "range" && args.length == 2 && isSeqFn(cx, "range"),
+      _ => false
+    },
+    _ => false
+  };
+}
+
+// The array operations that need `this`-less access to the sort: `xs.every(p)` and friends first.
+function trArrayMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, name: string, args: Expr[], e: Expr): Result<TR, string> {
+  let g = g0;
+  if ((name == "every" || name == "some") && args.length == 1) {
+    return trQuantOn(g, vars, cx, r, el, name == "every", args[0], e);
+  }
+  if (name == "map" && args.length == 1) {
+    return trMapOn(g, vars, cx, r, el, args[0], e);
+  }
+  if (name == "filter" && args.length == 1) {
+    return trFilterOn(g, vars, cx, r, el, args[0], e);
+  }
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  if (name == "get" && args.length == 1) {
+    const i = tr(g, vars, cx, args[0], VInt("usize"))?;
+    const os = sortS(i.g, cx, VOpt(el))?;
+    const t = "(ite " + inBounds(so.s, r.t, i.t) + " (some" + os.s + " " + arrSel(so.s, r.t, i.t) + ") none" + os.s + ")";
+    return mk(os.g, t, VOpt(el), concatChk(r.chks, i.chks));
+  }
+  if (name == "includes" && args.length == 1) {
+    const x = tr(g, vars, cx, args[0], el)?;
+    const okEq = match (el) {
+      VInt(_) => true,
+      VBool => true,
+      VStr => true,
+      _ => false
+    };
+    if (!okEq) {
+      return Err("`includes` on an array of `" + vtName(el) + "`");
+    }
+    let xg = x.g;
+    const q = xg.next("q");
+    const t = "(exists ((" + q + " Int)) (and " + inBounds(so.s, r.t, q) + " (= " + arrSel(so.s, r.t, q) + " " + x.t + ")))";
+    return mk(xg, t, VBool, concatChk(r.chks, x.chks));
+  }
+  if (name == "concat" && args.length == 1) {
+    if (cx.inQ) {
+      return Err("`concat` inside a quantifier body");
+    }
+    const b = tr(g, vars, cx, args[0], r.vt)?;
+    g = b.g;
+    const out = freshFree(g, cx, r.vt)?;
+    g = out.g;
+    const q = g.next("q");
+    g.assert("(= " + arrLen(so.s, out.name) + " (+ " + arrLen(so.s, r.t) + " " + arrLen(so.s, b.t) + "))");
+    g.assert("(forall ((" + q + " Int)) (=> " + inBounds(so.s, r.t, q) + " (= " + arrSel(so.s, out.name, q) + " " + arrSel(so.s, r.t, q) + ")))");
+    g.assert("(forall ((" + q + " Int)) (=> " + inBounds(so.s, b.t, q) + " (= " + arrSel(so.s, out.name, "(+ " + arrLen(so.s, r.t) + " " + q + ")") + " " + arrSel(so.s, b.t, q) + ")))");
+    return mk(g, out.name, r.vt, concatChk(r.chks, b.chks));
+  }
+  if (name == "slice" && args.length == 2) {
+    if (cx.inQ) {
+      return Err("`slice` inside a quantifier body");
+    }
+    const a = tr(g, vars, cx, args[0], VInt("usize"))?;
+    const b = tr(a.g, vars, cx, args[1], VInt("usize"))?;
+    g = b.g;
+    const out = freshFree(g, cx, r.vt)?;
+    g = out.g;
+    const q = g.next("q");
+    // `slice(a, b)` traps when a > b or b > length (the runtime checks the range).
+    const goal = "(and (<= 0 " + a.t + ") (<= " + a.t + " " + b.t + ") (<= " + b.t + " " + arrLen(so.s, r.t) + "))";
+    g.assert("(=> " + goal + " (= " + arrLen(so.s, out.name) + " (- " + b.t + " " + a.t + ")))");
+    g.assert("(=> " + goal + " (forall ((" + q + " Int)) (=> " + inBounds(so.s, out.name, q) + " (= " + arrSel(so.s, out.name, q) + " " + arrSel(so.s, r.t, "(+ " + a.t + " " + q + ")") + "))))");
+    const clause = "slice range in bounds: `" + srcText(cx.text, e) + "`";
+    return mk(g, out.name, r.vt, concatChk(concatChk(r.chks, concatChk(a.chks, b.chks)), [oblChk("bounds", "slice", lineOf(cx.text, e.span.start), clause, goal)]));
+  }
+  if (name == "indexOf" && args.length == 1) {
+    // The first position of an element: `Some(i)` with xs[i] == x and no earlier match, or `None` when there is none.
+    const okEq = match (el) {
+      VInt(_) => true,
+      VBool => true,
+      VStr => true,
+      _ => false
+    };
+    if (!okEq || cx.inQ) {
+      return Err("`indexOf` on an array of `" + vtName(el) + "` (or inside a quantifier body)");
+    }
+    const x = tr(g, vars, cx, args[0], el)?;
+    g = x.g;
+    const ot = VOpt(VInt("usize"));
+    const os = sortS(g, cx, ot)?;
+    g = os.g;
+    const o = freshFree(g, cx, ot)?;
+    g = o.g;
+    const q = g.next("q");
+    const q2 = g.next("q");
+    const hit = "(and " + inBounds(so.s, r.t, "(val" + os.s + " " + o.name + ")") + " (= " + arrSel(so.s, r.t, "(val" + os.s + " " + o.name + ")") + " " + x.t + "))";
+    const before = "(forall ((" + q2 + " Int)) (=> (and (<= 0 " + q2 + ") (< " + q2 + " (val" + os.s + " " + o.name + "))) (not (= " + arrSel(so.s, r.t, q2) + " " + x.t + "))))";
+    g.assert("(=> " + isSomeT(os.s, o.name) + " (and " + hit + " " + before + "))");
+    g.assert("(=> (not " + isSomeT(os.s, o.name) + ") (forall ((" + q + " Int)) (=> " + inBounds(so.s, r.t, q) + " (not (= " + arrSel(so.s, r.t, q) + " " + x.t + ")))))");
+    return mk(g, o.name, ot, concatChk(r.chks, x.chks));
+  }
+  if (name == "join" && args.length == 1) {
+    // The contents are not modelled: a string that is empty when the array is.
+    const isStrArr = match (el) {
+      VStr => true,
+      _ => false
+    };
+    if (!isStrArr || cx.inQ) {
+      return Err("`join` on an array of `" + vtName(el) + "` (or inside a quantifier body)");
+    }
+    const sep = tr(g, vars, cx, args[0], VStr)?;
+    g = sep.g;
+    g.noteStr("derive");
+    g.useAssumption("A-STR");
+    const out = freshFree(g, cx, VStr)?;
+    g = out.g;
+    g.assert("(=> (= " + arrLen(so.s, r.t) + " 0) (= (slen " + out.name + ") 0))");
+    return mk(g, out.name, VStr, concatChk(r.chks, sep.chks));
+  }
+  return Err("array method `" + name + "` is not supported");
+}
+
+function trStrOf(g0: Gen, cx: Cx, arg: string, chks: Chk[]): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, VStr)?;
+  g = so.g;
+  g.noteStr("derive");
+  g.useAssumption("A-STR");
+  if (!g.hasFun("tl")) {
+    g.registerFun("tl");
+    g.declare("(declare-fun tl (Int) Int)");
+    g.declare("(declare-fun ti (Int) Int)");
+  }
+  // the decimal text of a number: at least one character
+  return mk(g, "(mkStr (+ 1 (ite (>= (tl " + arg + ") 0) (tl " + arg + ") (- (tl " + arg + ")))) (ti " + arg + "))", VStr, chks);
+}
+
+function trStringMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, name: string, args: Expr[], e: Expr): Result<TR, string> {
+  let g = g0;
+  g.useAssumption("A-STR");
+  const line = lineOf(cx.text, e.span.start);
+  const len = "(slen " + r.t + ")";
+  if (name == "charCodeAt" && args.length == 1) {
+    const i = tr(g, vars, cx, args[0], VInt("usize"))?;
+    g = i.g;
+    g.noteStr("chr");
+    if (!g.hasFun("chr")) {
+      g.registerFun("chr");
+      g.declare("(declare-fun chr (Int Int) Int)");
+      // the byte at a position depends on contents the model does not know (a table literal, say): not trusted
+      g.taint("chr");
+    }
+    const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
+    const goal = "(and (<= 0 " + i.t + ") (< " + i.t + " " + len + "))";
+    // the runtime reads an unsigned char: a byte in 0..255
+    const ch = "(chr (sid " + r.t + ") " + i.t + ")";
+    return mk(g, ch, VInt("int"), concatChk(concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charCodeAt", line, clause, goal)]), [tfChk("(and (<= 0 " + ch + ") (<= " + ch + " 255))")]));
+  }
+  if (name == "charAt" && args.length == 1) {
+    const i = tr(g, vars, cx, args[0], VInt("usize"))?;
+    g = i.g;
+    g.noteStr("derive");
+    if (!g.hasFun("cht")) {
+      g.registerFun("cht");
+      g.declare("(declare-fun cht (Int Int) Int)");
+    }
+    const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
+    const goal = "(and (<= 0 " + i.t + ") (< " + i.t + " " + len + "))";
+    return mk(g, "(mkStr 1 (cht (sid " + r.t + ") " + i.t + "))", VStr, concatChk(concatChk(r.chks, i.chks), [oblChk("bounds", "charAt", line, clause, goal)]));
+  }
+  if (name == "substring" && args.length == 2) {
+    const a = tr(g, vars, cx, args[0], VInt("usize"))?;
+    const b = tr(a.g, vars, cx, args[1], VInt("usize"))?;
+    g = b.g;
+    g.noteStr("derive");
+    if (!g.hasFun("sbt")) {
+      g.registerFun("sbt");
+      g.declare("(declare-fun sbt (Int Int Int) Int)");
+    }
+    const clause = "substring range in bounds: `" + srcText(cx.text, e) + "`";
+    const goal = "(and (<= 0 " + a.t + ") (<= " + a.t + " " + b.t + ") (<= " + b.t + " " + len + "))";
+    return mk(g, "(mkStr (- " + b.t + " " + a.t + ") (ite (= " + b.t + " " + a.t + ") 0 (sbt (sid " + r.t + ") " + a.t + " " + b.t + ")))", VStr, concatChk(concatChk(r.chks, concatChk(a.chks, b.chks)), [oblChk("bounds", "substring", line, clause, goal)]));
+  }
+  if ((name == "startsWith" || name == "endsWith" || name == "includes") && args.length == 1) {
+    const x = tr(g, vars, cx, args[0], VStr)?;
+    g = x.g;
+    if (cx.inQ) {
+      return Err("`" + name + "` inside a quantifier body");
+    }
+    g.noteStr("derive");
+    const f = freshFree(g, cx, VBool)?;
+    g = f.g;
+    g.assert("(=> " + f.name + " (>= " + len + " (slen " + x.t + ")))");
+    return mk(g, f.name, VBool, concatChk(r.chks, x.chks));
+  }
+  if (name == "trim" && args.length == 0) {
+    if (cx.inQ) {
+      return Err("`trim` inside a quantifier body");
+    }
+    g.noteStr("derive");
+    const f = freshFree(g, cx, VStr)?;
+    g = f.g;
+    g.assert("(<= (slen " + f.name + ") " + len + ")");
+    return mk(g, f.name, VStr, r.chks);
+  }
+  return Err("string method `" + name + "` is not supported");
+}
+
+function trIntMethod(g0: Gen, cx: Cx, r: TR, k: string, name: string, args: Expr[]): Result<TR, string> {
+  let g = g0;
+  if (name == "toString" && args.length == 0) {
+    return trStrOf(g, cx, r.t, r.chks);
+  }
+  // Explicit conversions: the value is unchanged and must fit the target type (otherwise the conversion traps).
+  let target = "";
+  if (name == "toInt" || name == "toI64") {
+    target = "int";
+  } else if (name == "toUsize") {
+    target = "usize";
+  } else if (name == "toIsize") {
+    target = "isize";
+  } else {
+    const kinds = ["i8", "i16", "i32", "u8", "u16", "u32", "u64"];
+    const names = ["toI8", "toI16", "toI32", "toU8", "toU16", "toU32", "toU64"];
+    let ki: usize = 0;
+    while (ki < names.length) {
+      if (names[ki] == name) {
+        target = kinds[ki];
+      }
+      ki += 1;
+    }
+  }
+  if (target != "" && args.length == 0) {
+    return mk(g, r.t, VInt(target), concatChk(r.chks, [asmChk(inKind(target, r.t))]));
+  }
+  return Err("integer method `" + name + "` is not supported");
+}
+
+function trOptMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, t: VT, name: string, args: Expr[], e: Expr): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  const line = lineOf(cx.text, e.span.start);
+  if (name == "isSome" && args.length == 0) {
+    return mk(g, isSomeT(so.s, r.t), VBool, r.chks);
+  }
+  if (name == "isNone" && args.length == 0) {
+    return mk(g, "(not " + isSomeT(so.s, r.t) + ")", VBool, r.chks);
+  }
+  if (name == "unwrap" && args.length == 0) {
+    const clause = "`unwrap` of Some: `" + srcText(cx.text, e) + "`";
+    const pt = "(val" + so.s + " " + r.t + ")";
+    const tf = tfOf(g, cx, t, pt)?;
+    return mk(tf.g, pt, t, concatChk(concatChk(r.chks, [oblChk("unwrap", "unwrap", line, clause, isSomeT(so.s, r.t))]), tf.chks));
+  }
+  if (name == "unwrapOr" && args.length == 1) {
+    const d = tr(g, vars, cx, args[0], t)?;
+    const pt = "(val" + so.s + " " + r.t + ")";
+    const tf = tfOf(d.g, cx, t, pt)?;
+    return mk(tf.g, "(ite " + isSomeT(so.s, r.t) + " " + pt + " " + d.t + ")", t, concatChk(concatChk(r.chks, d.chks), guardChks(isSomeT(so.s, r.t), tf.chks)));
+  }
+  return Err("Option method `" + name + "` is not supported");
+}
+
+function trResMethod(g0: Gen, cx: Cx, r: TR, a: VT, b: VT, name: string, args: Expr[], e: Expr): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  const line = lineOf(cx.text, e.span.start);
+  if (name == "isOk" && args.length == 0) {
+    return mk(g, isOkT(so.s, r.t), VBool, r.chks);
+  }
+  if (name == "isErr" && args.length == 0) {
+    return mk(g, "(not " + isOkT(so.s, r.t) + ")", VBool, r.chks);
+  }
+  if (name == "unwrap" && args.length == 0) {
+    const clause = "`unwrap` of Ok: `" + srcText(cx.text, e) + "`";
+    const pt = "(okv" + so.s + " " + r.t + ")";
+    const tf = tfOf(g, cx, a, pt)?;
+    return mk(tf.g, pt, a, concatChk(concatChk(r.chks, [oblChk("unwrap", "unwrap", line, clause, isOkT(so.s, r.t))]), tf.chks));
+  }
+  if (name == "unwrapErr" && args.length == 0) {
+    const clause = "`unwrapErr` of Err: `" + srcText(cx.text, e) + "`";
+    const pt = "(errv" + so.s + " " + r.t + ")";
+    const tf = tfOf(g, cx, b, pt)?;
+    return mk(tf.g, pt, b, concatChk(concatChk(r.chks, [oblChk("unwrap", "unwrapErr", line, clause, "(not " + isOkT(so.s, r.t) + ")")]), tf.chks));
+  }
+  return Err("Result method `" + name + "` is not supported");
+}
+
+function trMapMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, k: VT, v: VT, name: string, args: Expr[], e: Expr): Result<TR, string> {
+  let g = g0;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  if (name == "has" && args.length == 1) {
+    const a = tr(g, vars, cx, args[0], k)?;
+    let g2 = a.g;
+    g2.assert(mapFact(so.s, r.t, a.t));
+    return mk(g2, mapHas(so.s, r.t, a.t), VBool, concatChk(r.chks, a.chks));
+  }
+  if (name == "get" && args.length == 1) {
+    const a = tr(g, vars, cx, args[0], k)?;
+    let g2 = a.g;
+    g2.assert(mapFact(so.s, r.t, a.t));
+    const os = sortS(g2, cx, VOpt(v))?;
+    const pt = "(select (" + so.s + "v " + r.t + ") " + a.t + ")";
+    const tf = tfOf(os.g, cx, v, pt)?;
+    const t = "(ite " + mapHas(so.s, r.t, a.t) + " (some" + os.s + " " + pt + ") none" + os.s + ")";
+    return mk(tf.g, t, VOpt(v), concatChk(concatChk(r.chks, a.chks), guardChks(mapHas(so.s, r.t, a.t), tf.chks)));
+  }
+  if ((name == "keys" || name == "values") && args.length == 0) {
+    if (cx.inQ) {
+      return Err("`" + name + "` inside a quantifier body");
+    }
+    g.noteApprox("the size of a Map is axiomatised, not computed from its keys");
+    g.useAssumption("A-MAP");
+    const isKeys = name == "keys";
+    const at = VArr(isKeys ? k : v);
+    const as = sortS(g, cx, at)?;
+    g = as.g;
+    const out = freshFree(g, cx, at)?;
+    g = out.g;
+    g.taint(out.name);
+    g.assert("(= " + arrLen(as.s, out.name) + " " + mapSize(so.s, r.t) + ")");
+    if (isKeys) {
+      const q = g.next("q");
+      const q2 = g.next("q");
+      g.assert("(forall ((" + q + " Int)) (=> " + inBounds(as.s, out.name, q) + " " + mapHas(so.s, r.t, arrSel(as.s, out.name, q)) + "))");
+      g.assert("(forall ((" + q + " Int) (" + q2 + " Int)) (=> (and " + inBounds(as.s, out.name, q) + " " + inBounds(as.s, out.name, q2) + " (< " + q + " " + q2 + ")) (not (= " + arrSel(as.s, out.name, q) + " " + arrSel(as.s, out.name, q2) + "))))");
+    }
+    return mk(g, out.name, at, r.chks);
+  }
+  return Err("Map method `" + name + "` is not supported");
+}
+
+// ----------------------------------------------------------------------------------- calls of user code
+
+// Translate the arguments of a call against the parameter types.
+type Args = { g: Gen; terms: string[]; chks: Chk[]; };
+
+function trArgs(g0: Gen, vars: Var[], cx: Cx, f: Fn, ptys: VT[], args: Expr[]): Result<Args, string> {
+  let g = g0;
+  let terms: string[] = [];
+  let chks: Chk[] = [];
+  let i: usize = 0;
+  while (i < args.length) {
+    const a = tr(g, vars, cx, args[i], ptys[i])?;
+    if (!vtEq(a.vt, ptys[i])) {
+      return Err("call of `" + f.key + "`: argument " + (i + 1).toString() + " has type `" + vtName(a.vt) + "`, expected `" + vtName(ptys[i]) + "`");
+    }
+    g = a.g;
+    chks = concatChk(chks, a.chks);
+    terms.push(a.t);
+    i += 1;
+  }
+  return Ok(Args { g: g, terms: terms, chks: chks });
+}
+
+// The declared parameter and result types of a callee, or the reason one is outside the fragment.
+export type Sig = { ptys: VT[]; rty: VT; };
+
+export function sigOf(cx: Cx, f: Fn): Result<Sig, string> {
+  let ptys: VT[] = [];
+  let i: usize = 0;
+  while (i < f.ptys.length) {
+    const t = tyOf(cx, f.ptys[i]);
+    if (isBad(t)) {
+      return Err("parameter `" + f.pnames[i] + "` of `" + f.key + "` is outside the fragment (" + badReason(t) + ")");
+    }
+    ptys.push(t);
+    i += 1;
+  }
+  let rty = VUnit;
+  match (f.ret) {
+    Some(t) => {
+      rty = tyOf(cx, t);
+      if (isBad(rty)) {
+        return Err("result of `" + f.key + "` is outside the fragment (" + badReason(rty) + ")");
+      }
+    },
+    None => {}
+  }
+  return Ok(Sig { ptys: ptys, rty: rty });
+}
+
+function paramVarsOf(f: Fn, terms: string[], ptys: VT[]): Var[] {
+  let out: Var[] = [];
+  let i: usize = 0;
+  while (i < f.pnames.length) {
+    out.push(Var { name: f.pnames[i], term: terms[i], vt: ptys[i] });
+    i += 1;
+  }
+  return out;
+}
+
+// The class invariants of `cls` over `this` = `thisTerm`, as hypotheses (clauses outside the fragment are left
+// out: a weaker assumption is sound).
+export type Invs = { g: Gen; terms: string[]; };
+
+export function invTerms(g0: Gen, cx: Cx, cls: Cls, thisTerm: string): Invs {
+  return invTermsFor(g0, cx, cls.text, cls.invs, VRec(cls.name), thisTerm);
+}
+
+// The invariants of a value of a class (ADR-0031 B8) or of a record type (A3: a record that violates its invariant
+// cannot exist), as hypotheses about the value `term`. Clauses outside the fragment are left out.
+export function valueInvariants(g0: Gen, cx: Cx, vt: VT, term: string): Invs {
+  const none: string[] = [];
+  return match (vt) {
+    VRec(cn) => {
+      const co = cx.p.clsIx.get(cn);
+      if (co.isSome()) {
+        return invTerms(g0, cx, cx.p.classes[co.unwrap()], term);
+      }
+      const rd = cx.p.tab.findRec(cn);
+      if (rd.isSome()) {
+        return invTermsFor(g0, cx, rd.unwrap().text, clausesOfList(rd.unwrap().contracts, 4), vt, term);
+      }
+      return Invs { g: g0, terms: none };
+    },
+    _ => Invs { g: g0, terms: none }
+  };
+}
+
+function invTermsFor(g0: Gen, cx: Cx, text: string, clauses: ContractClause[], vt: VT, thisTerm: string): Invs {
+  let g = g0;
+  let out: string[] = [];
+  const cc = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: text };
+  const vars: Var[] = [Var { name: "this", term: thisTerm, vt: vt }];
+  for (const c of clauses) {
+    const ex = exprOf(c);
+    if (ex.isSome()) {
+      const n0 = g.factCount();
+      const r = trClause(g, vars, cc, ex.unwrap());
+      match (r) {
+        Ok(x) => {
+          g = x.g;
+          out.push(clHyp(x));
+        },
+        Err(_) => {
+          // The invariant is not assumed (sound for VERIFIED), but a model may then violate it: no counterexample is trusted.
+          g.noteApprox("an invariant outside the fragment is not assumed");
+        }
+      }
+    }
+  }
+  return Invs { g: g, terms: out };
+}
+
+// The result of a call: the value and, for a mutating method, the receiver after the call.
+export type CallR = { g: Gen; t: string; vt: VT; chks: Chk[]; newThis: string; };
+
+// A call of a function or method that is not a constructor, modular reasoning with its contract.
+//   obligations: the callee's @Requires (with the receiver's invariants as hypotheses elsewhere)
+//   result: an uninterpreted function of the arguments for a pure callee, a fresh value otherwise
+//   facts: `requires ==> ensures` instantiated at this call
+export function callFn(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, args: Expr[], e: Expr, exp: VT): Result<TR, string> {
+  const r = callFnX(g0, vars, cx, f, recv, args, e, exp)?;
+  return mk(r.g, r.t, r.vt, r.chks);
+}
+
+export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, args: Expr[], e: Expr, exp: VT): Result<CallR, string> {
+  let g = g0;
+  if (f.generic && !(f.cls != "" && f.cls == cx.f.cls)) {
+    return Err("call of the generic function `" + f.key + "`");
+  }
+  if (f.pnames.length != args.length) {
+    return Err("call of `" + f.key + "`: wrong number of arguments");
+  }
+  const sig = sigOf(cx, f)?;
+  const a = trArgs(g, vars, cx, f, sig.ptys, args)?;
+  g = a.g;
+  let chks = a.chks;
+  let calleeVars = paramVarsOf(f, a.terms, sig.ptys);
+  let allTerms = a.terms;
+  let allSorts: string[] = [];
+  if (recv.isSome()) {
+    chks = concatChk(recv.unwrap().chks, chks);
+    calleeVars.push(Var { name: "this", term: recv.unwrap().t, vt: recv.unwrap().vt });
+    let ts: string[] = [recv.unwrap().t];
+    for (const x of allTerms) {
+      ts.push(x);
+    }
+    allTerms = ts;
+  }
+  const ccx = calleeCx(cx, f);
+  const line = lineOf(cx.text, e.span.start);
+  // Obligations: the callee's preconditions hold here (and are well defined).
+  for (const c of clausesOfList(f.contracts, 0)) {
+    const ex = exprOf(c);
+    if (ex.isSome()) {
+      const r = trClause(g, calleeVars, ccx, ex.unwrap());
+      match (r) {
+        Ok(x) => {
+          g = x.g;
+          const goal = clGoal(x);
+          chks = concatChk(chks, [oblChk("call-precondition", f.key, line, clauseText(f.text, c) + " (call of " + f.key + ")", goal)]);
+        },
+        Err(m) => {
+          return Err("the @Requires of `" + f.key + "` is outside the fragment: " + m);
+        }
+      }
+    }
+  }
+  // The result.
+  const rty = sig.rty;
+  let resTerm = "0";
+  g.useAssumption("A-CALL");
+  // A mutating method returns the receiver after the call: a fresh object that keeps every field the method does
+  // not write (the frame, from the mutation analysis).
+  let newThis = "";
+  let postVars = calleeVars;
+  if (f.mutating && recv.isSome()) {
+    if (cx.inQ) {
+      return Err("call of a mutating method inside a quantifier body");
+    }
+    const nt = freshFree(g, cx, recv.unwrap().vt)?;
+    g = nt.g;
+    newThis = nt.name;
+    g.taint(newThis);
+    const so = sortS(g, cx, recv.unwrap().vt)?;
+    g = so.g;
+    const co = cx.p.clsIx.get(f.cls);
+    if (co.isNone()) {
+      return Err("unknown class `" + f.cls + "`");
+    }
+    if (!f.frameAll) {
+      for (const fld of cx.p.classes[co.unwrap()].fields) {
+        if (!f.frame.includes(fld)) {
+          g.assert("(= " + recField(so.s, fld, newThis) + " " + recField(so.s, fld, recv.unwrap().t) + ")");
+        }
+      }
+      g.useAssumption("A-FRAME");
+    }
+    let pv: Var[] = [];
+    for (const v of calleeVars) {
+      pv.push(v.name == "this" ? Var { name: "this", term: newThis, vt: v.vt } : v);
+    }
+    postVars = pv;
+  }
+  if (!isUnit(rty)) {
+    if (f.pure && !f.mutating) {
+      g.useAssumption("A-PURE");
+      let sorts: string[] = [];
+      if (recv.isSome()) {
+        const rs = sortS(g, cx, recv.unwrap().vt)?;
+        g = rs.g;
+        sorts.push(rs.s);
+      }
+      for (const pt of sig.ptys) {
+        const ps = sortS(g, cx, pt)?;
+        g = ps.g;
+        sorts.push(ps.s);
+      }
+      const rs2 = sortS(g, cx, rty)?;
+      g = rs2.g;
+      const fname = (f.kind == 0 ? "uf_" : "um_") + f.key;
+      if (!g.hasFun(fname)) {
+        g.registerFun(fname);
+        if (sorts.length == 0) {
+          g.declare("(declare-const " + fname + " " + rs2.s + ")");
+        } else {
+          g.declare("(declare-fun " + fname + " (" + sorts.join(" ") + ") " + rs2.s + ")");
+        }
+      }
+      resTerm = allTerms.length == 0 ? fname : "(" + fname + " " + allTerms.join(" ") + ")";
+      const wf = wfOf(g, cx, resTerm, rty, 0)?;
+      g = wf.g;
+      if (wf.f != "") {
+        g.assert(wf.f);
+      }
+    } else {
+      if (cx.inQ) {
+        return Err("call of the impure function `" + f.key + "` inside a quantifier body");
+      }
+      const fr = freshFree(g, cx, rty)?;
+      g = fr.g;
+      resTerm = fr.name;
+      g.taint(fr.name);
+    }
+  }
+  // The callee's postconditions, assumed under its preconditions (and, for a public method, its class invariants).
+  let hyp: string[] = [];
+  for (const c of clausesOfList(f.contracts, 0)) {
+    const ex = exprOf(c);
+    if (ex.isSome()) {
+      const r = trClause(g, calleeVars, ccx, ex.unwrap());
+      match (r) {
+        Ok(x) => {
+          g = x.g;
+          hyp.push(clHyp(x));
+        },
+        Err(_) => {}
+      }
+    }
+  }
+  if (recv.isSome() && !f.priv) {
+    const co = cx.p.clsIx.get(f.cls);
+    if (co.isSome()) {
+      const iv = invTerms(g, cx, cx.p.classes[co.unwrap()], recv.unwrap().t);
+      g = iv.g;
+      for (const t of iv.terms) {
+        hyp.push(t);
+      }
+      if (iv.terms.length > 0) {
+        g.useAssumption("A-INV");
+      }
+    }
+  }
+  let res: Option<Var> = None;
+  if (!isUnit(rty)) {
+    res = Some(Var { name: "result", term: resTerm, vt: rty });
+    // a value a function returns satisfies the invariant of its type (constructors and public methods establish
+    // class invariants, record invariants are enforced at literals, writes and returns: ADR-0031 A3)
+    const rinv = valueInvariants(g, cx, rty, resTerm);
+    g = rinv.g;
+    for (const t of rinv.terms) {
+      g.assert(t);
+    }
+    if (rinv.terms.length > 0) {
+      g.useAssumption("A-INV");
+    }
+  }
+  const ecx = Cx { p: cx.p, f: f, res: res, ens: true, body: false, olds: calleeVars, ret: rty, inQ: cx.inQ, text: f.text };
+  let ens: string[] = [];
+  if (newThis != "" && !f.priv) {
+    // a public method maintains the class invariants: they hold for the receiver afterwards
+    const co2 = cx.p.clsIx.get(f.cls);
+    if (co2.isSome()) {
+      const iv2 = invTerms(g, cx, cx.p.classes[co2.unwrap()], newThis);
+      g = iv2.g;
+      for (const t of iv2.terms) {
+        ens.push(t);
+      }
+    }
+  }
+  for (const c of clausesOfList(f.contracts, 1)) {
+    const ex = exprOf(c);
+    if (ex.isSome()) {
+      const r = trClause(g, postVars, ecx, ex.unwrap());
+      match (r) {
+        Ok(x) => {
+          g = x.g;
+          ens.push(clHyp(x));
+        },
+        Err(_) => {}
+      }
+    }
+  }
+  if (ens.length > 0) {
+    g.assert("(=> " + andAll(hyp) + " " + andAll(ens) + ")");
+  }
+  return Ok(CallR { g: g, t: resTerm, vt: rty, chks: chks, newThis: newThis });
+}
+
+export function isUnit(t: VT): bool {
+  return match (t) {
+    VUnit => true,
+    _ => false
+  };
+}
+
+// `new C(args)`: the constructor's @Requires are obligations; the new object satisfies the class invariants
+// (constructors establish them, proved separately) and the fields the constructor takes from its parameter
+// properties and field initialisers.
+function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], args: Expr[], e: Expr): Result<TR, string> {
+  let g = g0;
+  if (name == "Map") {
+    return trNewMap(g, cx, targs);
+  }
+  const co = cx.p.clsIx.get(name);
+  if (co.isNone()) {
+    return Err("`new " + name + "`: not a class of the program");
+  }
+  const cls = cx.p.classes[co.unwrap()];
+  if (cls.generic || targs.length > 0) {
+    return Err("`new " + name + "`: generic class");
+  }
+  if (cx.inQ) {
+    return Err("`new` inside a quantifier body");
+  }
+  const t = VRec(name);
+  let chks: Chk[] = [];
+  let argTerms: string[] = [];
+  let calleeVars: Var[] = [];
+  let ctor: Option<Fn> = None;
+  if (cls.ctor.isSome()) {
+    ctor = Some(cx.p.fns[cls.ctor.unwrap()]);
+  }
+  if (ctor.isSome()) {
+    const f = ctor.unwrap();
+    if (f.pnames.length != args.length) {
+      return Err("`new " + name + "`: wrong number of arguments");
+    }
+    const sig = sigOf(cx, f)?;
+    const a = trArgs(g, vars, cx, f, sig.ptys, args)?;
+    g = a.g;
+    chks = a.chks;
+    argTerms = a.terms;
+    calleeVars = paramVarsOf(f, a.terms, sig.ptys);
+  } else if (args.length != 0) {
+    return Err("`new " + name + "`: the class has no constructor");
+  }
+  const so = sortS(g, cx, t)?;
+  g = so.g;
+  const fr = freshFree(g, cx, t)?;
+  g = fr.g;
+  const line = lineOf(cx.text, e.span.start);
+  let reqTerms: string[] = [];
+  if (ctor.isSome()) {
+    const f = ctor.unwrap();
+    const ccx = calleeCx(cx, f);
+    for (const c of clausesOfList(f.contracts, 0)) {
+      const ex = exprOf(c);
+      if (ex.isSome()) {
+        // A constructor's @Requires may mention `this` after the leading initialisations: out of the fragment.
+        const r = trClause(g, calleeVars, ccx, ex.unwrap());
+        match (r) {
+          Ok(x) => {
+            g = x.g;
+            reqTerms.push(clHyp(x));
+            const goal = clGoal(x);
+            chks = concatChk(chks, [oblChk("call-precondition", name + ".constructor", line, clauseText(f.text, c) + " (call of new " + name + ")", goal)]);
+          },
+          Err(m) => {
+            return Err("the @Requires of the constructor of `" + name + "` is outside the fragment: " + m);
+          }
+        }
+      }
+    }
+    // Fields the constructor takes from its parameter properties and does not write afterwards.
+    const written = f.frame;
+    let i: usize = 0;
+    while (i < f.pnames.length) {
+      if (f.pacc[i] != 0 && !f.frameAll && !written.includes(f.pnames[i])) {
+        g.assert("(= " + recField(so.s, f.pnames[i], fr.name) + " " + argTerms[i] + ")");
+        g.useAssumption("A-FRAME");
+      }
+      i += 1;
+    }
+  }
+  // Fields with an initialiser that the constructor does not write and does not take from a parameter.
+  const icx = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: false, text: cls.text };
+  let fi: usize = 0;
+  while (fi < cls.fields.length) {
+    const fname = cls.fields[fi];
+    if (cls.finit[fi].isSome()) {
+      let skip = false;
+      if (ctor.isSome()) {
+        const cf = ctor.unwrap();
+        if (cf.frameAll || cf.frame.includes(fname) || cf.pnames.includes(fname)) {
+          skip = true;
+        }
+      }
+      const ft = resolveTyP(cx.p.tab, cls.ftys[fi], cls.tparams);
+      if (!skip && !isBad(ft)) {
+        const none: Var[] = [];
+        const r = tr(g, none, icx, cls.finit[fi].unwrap(), ft);
+        match (r) {
+          Ok(x) => {
+            g = x.g;
+            g.assert("(= " + recField(so.s, fname, fr.name) + " " + x.t + ")");
+            g.useAssumption("A-FRAME");
+          },
+          Err(_) => {}
+        }
+      }
+    }
+    fi += 1;
+  }
+  // The new object is known exactly when every field comes from a parameter property or an initialiser that the
+  // constructor leaves alone; otherwise (or when an argument is itself only known through a contract) a
+  // counterexample that depends on it is not trusted.
+  let determined = true;
+  let di: usize = 0;
+  while (di < cls.fields.length) {
+    const dn = cls.fields[di];
+    if (ctor.isSome()) {
+      const cf = ctor.unwrap();
+      const prop = cf.pnames.includes(dn) && cf.pacc[0 + indexIn(cf.pnames, dn)] != 0;
+      if (cf.frameAll || cf.frame.includes(dn)) {
+        determined = false;
+      } else if (!prop && cls.finit[di].isNone()) {
+        determined = false;
+      }
+    } else if (cls.finit[di].isNone()) {
+      determined = false;
+    }
+    di += 1;
+  }
+  for (const at of argTerms) {
+    if (g.mentionsTaint(at)) {
+      determined = false;
+    }
+  }
+  if (!determined) {
+    g.taint(fr.name);
+  }
+  const iv = invTerms(g, cx, cls, fr.name);
+  g = iv.g;
+  if (iv.terms.length > 0) {
+    g.assert("(=> " + andAll(reqTerms) + " " + andAll(iv.terms) + ")");
+    g.useAssumption("A-INV");
+  }
+  g.useAssumption("A-CALL");
+  return mk(g, fr.name, t, chks);
+}
+
+function trNewMap(g0: Gen, cx: Cx, targs: TypeExpr[]): Result<TR, string> {
+  let g = g0;
+  if (targs.length != 2) {
+    return Err("`new Map` needs its two type arguments");
+  }
+  const k = tyOf(cx, targs[0]);
+  const v = tyOf(cx, targs[1]);
+  if (isBad(k) || isBad(v) || !isMapKey(k)) {
+    return Err("`new Map<K, V>`: unsupported key or value type");
+  }
+  const t = VMap(k, v);
+  const so = sortS(g, cx, t)?;
+  g = so.g;
+  const ks = sortS(g, cx, k)?;
+  g = ks.g;
+  const vals = freshFree(g, cx, VArr(v))?;
+  g = vals.g;
+  // The value array of an empty map is arbitrary (no key is present).
+  const vs = sortS(g, cx, v)?;
+  g = vs.g;
+  const dflt = g.next("c");
+  g.declare("(declare-const " + dflt + " (Array " + ks.s + " " + vs.s + "))");
+  return mk(g, "(mk" + so.s + " ((as const (Array " + ks.s + " Bool)) false) " + dflt + " 0)", t, noChks());
+}
+
+// ------------------------------------------------------------------------------------------- match
+
+// `match (e) { Some(x) => a, None => b }` as an expression: a chain of conditionals over the variant tests.
+function trMatch(g0: Gen, vars: Var[], cx: Cx, scrut: Expr, arms: MatchArm[], exp: VT): Result<TR, string> {
+  let g = g0;
+  const s = tr(g, vars, cx, scrut, noExp())?;
+  g = s.g;
+  const so = sortS(g, cx, s.vt)?;
+  g = so.g;
+  let chks = s.chks;
+  // The arms from last to first: `ite (test_k) (body_k) (rest)`.
+  let acc = "";
+  let accTy = exp;
+  let have = false;
+  let k = arms.length;
+  while (k > 0) {
+    k -= 1;
+    const arm = arms[k];
+    const mp = matchPattern(g, cx, s, so.s, arm.pattern)?;
+    g = mp.g;
+    let vars2 = vars;
+    for (const b of mp.binds) {
+      vars2.push(b);
+    }
+    const body = match (arm.body) {
+      BExpr(x) => x,
+      BBlock(_) => Expr { kind: EBool(true), span: arm.span }
+    };
+    const isBlock = match (arm.body) { BBlock(_) => true, _ => false };
+    if (isBlock) {
+      return Err("a `match` with block arms is only supported as a statement");
+    }
+    let bindTf: Chk[] = [];
+    for (const bd of mp.binds) {
+      const tfb = tfOf(g, cx, bd.vt, bd.term)?;
+      g = tfb.g;
+      bindTf = concatChk(bindTf, tfb.chks);
+    }
+    const b0 = tr(g, vars2, cx, body, accTy)?;
+    const b = TR { g: b0.g, t: b0.t, vt: b0.vt, chks: concatChk(bindTf, b0.chks) };
+    g = b.g;
+    if (have && !vtEq(b.vt, accTy)) {
+      if (isIntTy(b.vt) && isIntTy(accTy)) {
+        accTy = VInt(joinKinds(intKindOf(b.vt), intKindOf(accTy)));
+      } else {
+        return Err("`match` arms have different types");
+      }
+    }
+    accTy = have ? accTy : b.vt;
+    if (!have) {
+      // The last arm is taken when no earlier one matches: its test is assumed to hold (the match is exhaustive).
+      acc = b.t;
+      chks = concatChk(chks, guardChks(mp.test, b.chks));
+      have = true;
+    } else {
+      acc = "(ite " + mp.test + " " + b.t + " " + acc + ")";
+      chks = concatChk(chks, guardChks(mp.test, b.chks));
+    }
+  }
+  if (!have) {
+    return Err("empty `match`");
+  }
+  return mk(g, acc, accTy, chks);
+}
+
+export type MatchPat = { g: Gen; test: string; binds: Var[]; };
+
+// The test and the bindings of one pattern against the scrutinee `s` (sort `sn`).
+export function matchPattern(g0: Gen, cx: Cx, s: TR, sn: string, p: Pattern): Result<MatchPat, string> {
+  let g = g0;
+  let binds: Var[] = [];
+  match (s.vt) {
+    VUni(un) => {
+      if (cx.p.tab.isCyclic("u:" + un)) {
+        return Err("`match` on the recursive union `" + un + "` is not modelled");
+      }
+    },
+    _ => {}
+  }
+  return match (p.kind) {
+    PWildcard => Ok(MatchPat { g: g, test: "true", binds: binds }),
+    PBool(b) => Ok(MatchPat { g: g, test: b ? s.t : "(not " + s.t + ")", binds: binds }),
+    PInt(n) => Ok(MatchPat { g: g, test: "(= " + s.t + " " + lit(n) + ")", binds: binds }),
+    PStr(_) => Err("string patterns are not supported"),
+    PIdent(id) => {
+      // A nullary variant, or a binding of the whole value.
+      const t = variantTest(cx, s, sn, id.name, 0);
+      if (t.isSome()) {
+        return Ok(MatchPat { g: g, test: t.unwrap(), binds: binds });
+      }
+      binds.push(Var { name: id.name, term: s.t, vt: s.vt });
+      return Ok(MatchPat { g: g, test: "true", binds: binds });
+    },
+    PVariant(id, subs) => {
+      const t = variantTest(cx, s, sn, id.name, subs.length);
+      if (t.isNone()) {
+        return Err("`match`: unknown variant `" + id.name + "`");
+      }
+      let i: usize = 0;
+      while (i < subs.length) {
+        const pt = variantPayloadTy(cx, s, id.name, i);
+        if (isBad(pt)) {
+          return Err("`match`: payload type of `" + id.name + "` is outside the fragment");
+        }
+        const acc = variantAccessor(s, sn, id.name, i);
+        match (subs[i].kind) {
+          PIdent(b) => { binds.push(Var { name: b.name, term: acc, vt: pt }); },
+          PWildcard => {},
+          _ => {
+            return Err("`match`: nested patterns are not supported");
+          }
+        }
+        i += 1;
+      }
+      return Ok(MatchPat { g: g, test: t.unwrap(), binds: binds });
+    }
+  };
+}
+
+function variantTest(cx: Cx, s: TR, sn: string, name: string, arity: usize): Option<string> {
+  return match (s.vt) {
+    VOpt(_) => name == "Some" ? Some(isSomeT(sn, s.t)) : (name == "None" ? Some("(not " + isSomeT(sn, s.t) + ")") : None),
+    VRes(_, _) => name == "Ok" ? Some(isOkT(sn, s.t)) : (name == "Err" ? Some("(not " + isOkT(sn, s.t) + ")") : None),
+    VUni(un) => {
+      const u = cx.p.tab.findUni(un);
+      if (u.isNone()) {
+        return None;
+      }
+      for (const v of u.unwrap().variants) {
+        if (v.name == name) {
+          return Some("((_ is " + sn + "." + name + ") " + s.t + ")");
+        }
+      }
+      return None;
+    },
+    _ => None
+  };
+}
+
+function variantPayloadTy(cx: Cx, s: TR, name: string, i: usize): VT {
+  return match (s.vt) {
+    VOpt(t) => t,
+    VRes(a, b) => name == "Ok" ? a : b,
+    VUni(un) => {
+      const u = cx.p.tab.findUni(un);
+      if (u.isNone()) {
+        return VBad("unknown union");
+      }
+      for (const v of u.unwrap().variants) {
+        if (v.name == name && i < v.payload.length) {
+          return tyOf(cx, v.payload[i]);
+        }
+      }
+      return VBad("unknown variant");
+    },
+    _ => VBad("not a variant type")
+  };
+}
+
+function variantAccessor(s: TR, sn: string, name: string, i: usize): string {
+  return match (s.vt) {
+    VOpt(_) => "(val" + sn + " " + s.t + ")",
+    VRes(_, _) => name == "Ok" ? "(okv" + sn + " " + s.t + ")" : "(errv" + sn + " " + s.t + ")",
+    _ => "(" + sn + "." + name + "." + i.toString() + " " + s.t + ")"
+  };
+}
+
+// ------------------------------------------------------------------------------- quantifiers and sums
+
+// The lambda of `every(p)` etc.: its parameter names and expression body.
+type Lam = { params: string[]; body: Expr; };
+
+function lamOf(e: Expr, arity: usize): Result<Lam, string> {
+  return match (e.kind) {
+    EArrow(ps, _, body) => {
+      if (ps.length != arity) {
+        return Err("function argument has " + ps.length.toString() + " parameter(s), expected " + arity.toString());
+      }
+      return match (body) {
+        AExpr(b) => {
+          let names: string[] = [];
+          for (const p of ps) {
+            names.push(p.name.name);
+          }
+          return Ok(Lam { params: names, body: b });
+        },
+        ABlock(_) => Err("a function argument with a block body is not supported")
+      };
+    },
+    _ => Err("a function argument must be a lambda written at the call")
+  };
+}
+
+// The body of a lambda for the given argument values.
+function trBody(g: Gen, vars: Var[], cx: Cx, lam: Lam, tys: VT[], terms: string[], exp: VT): Result<TR, string> {
+  let vars2 = vars;
+  let i: usize = 0;
+  while (i < lam.params.length) {
+    vars2.push(Var { name: lam.params[i], term: terms[i], vt: tys[i] });
+    i += 1;
+  }
+  const qcx = Cx { p: cx.p, f: cx.f, res: cx.res, ens: cx.ens, body: cx.body, olds: cx.olds, ret: cx.ret, inQ: true, text: cx.text };
+  return tr(g, vars2, qcx, lam.body, exp);
+}
+
+// A bounded quantifier over a domain: `q` ranges over `dom`; `body` is the lambda translated with its facts.
+function quantTerm(g0: Gen, vars: Var[], cx: Cx, q: string, dom: string, lam: Lam, tys: VT[], terms: string[], universal: bool, chks0: Chk[], line: usize): Result<TR, string> {
+  let g = g0;
+  const n0 = g.factCount();
+  const b = trBody(g, vars, cx, lam, tys, terms, VBool)?;
+  g = b.g;
+  if (!vtEq(b.vt, VBool)) {
+    return Err("the function argument must return bool");
+  }
+  const facts = g.takeFactsFrom(n0);
+  const hasFacts = facts.length > 0;
+  let chks = chks0;
+  if (hasObl(b.chks)) {
+    if (cx.body) {
+      return Err("an index, `unwrap` or call precondition inside a function argument is not supported in code (only in contracts)");
+    }
+    const wdBody = hasFacts ? "(=> " + andAll(facts) + " " + wdOf(b.chks) + ")" : wdOf(b.chks);
+    chks = concatChk(chks, [oblChk("bounds", "quantifier body", line, "well-definedness of the function argument", "(forall ((" + q + " Int)) (=> " + dom + " " + wdBody + "))")]);
+  }
+  const inner = hasFacts ? (universal ? "(=> " + andAll(facts) + " " + b.t + ")" : "(and " + andAll(facts) + " " + b.t + ")") : b.t;
+  const t = universal ? "(forall ((" + q + " Int)) (=> " + dom + " " + inner + "))" : "(exists ((" + q + " Int)) (and " + dom + " " + inner + "))";
+  return mk(g, t, VBool, chks);
+}
+
+function trQuant(g0: Gen, vars: Var[], cx: Cx, arr: Expr, universal: bool, f: Expr, e: Expr): Result<TR, string> {
+  let g = g0;
+  const r = tr(g, vars, cx, arr, noExp())?;
+  return match (r.vt) {
+    VArr(el) => trQuantOn(r.g, vars, cx, r, el, universal, f, e),
+    _ => Err("`every` / `some` on a value of type `" + vtName(r.vt) + "`")
+  };
+}
+
+function trQuantOn(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, universal: bool, f: Expr, e: Expr): Result<TR, string> {
+  let g = g0;
+  const lam = lamOf(f, 1)?;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  const q = g.next("q");
+  const dom = inBounds(so.s, r.t, q);
+  return quantTerm(g, vars, cx, q, dom, lam, [el], [arrSel(so.s, r.t, q)], universal, r.chks, lineOf(cx.text, e.span.start));
+}
+
+function trRangeQuant(g0: Gen, vars: Var[], cx: Cx, rangeE: Expr, universal: bool, f: Expr, e: Expr): Result<TR, string> {
+  let g = g0;
+  return match (rangeE.kind) {
+    ECall(_, args) => {
+      const a = tr(g, vars, cx, args[0], VInt("usize"))?;
+      const b = tr(a.g, vars, cx, args[1], VInt("usize"))?;
+      g = b.g;
+      if (!isIntTy(a.vt) || !isIntTy(b.vt)) {
+        return Err("`range` needs integer bounds");
+      }
+      const lam = lamOf(f, 1)?;
+      const q = g.next("q");
+      const dom = "(and (<= " + a.t + " " + q + ") (< " + q + " " + b.t + "))";
+      const kind = joinKinds(intKindOf(a.vt), intKindOf(b.vt));
+      return quantTerm(g, vars, cx, q, dom, lam, [VInt(kind == "" || kind == "?" ? "usize" : kind)], [q], universal, concatChk(a.chks, b.chks), lineOf(cx.text, e.span.start));
+    },
+    _ => Err("not a range")
+  };
+}
+
+// `xs.map(f)`: an array of the same length whose elements are `f` of the elements. The elements are given by
+// a quantified definition (a valid fact).
+function trMapArr(g: Gen, vars: Var[], cx: Cx, arr: Expr, f: Expr, e: Expr): Result<TR, string> {
+  const r = tr(g, vars, cx, arr, noExp())?;
+  return match (r.vt) {
+    VArr(el) => trMapOn(r.g, vars, cx, r, el, f, e),
+    _ => Err("`map` on a value of type `" + vtName(r.vt) + "`")
+  };
+}
+
+function trMapOn(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, f: Expr, e: Expr): Result<TR, string> {
+  let g = g0;
+  if (cx.inQ) {
+    return Err("`map` inside a quantifier body");
+  }
+  const lam = lamOf(f, 1)?;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  const q = g.next("q");
+  const n0 = g.factCount();
+  const b = trBody(g, vars, cx, lam, [el], [arrSel(so.s, r.t, q)], noExp())?;
+  g = b.g;
+  const facts = g.takeFactsFrom(n0);
+  if (hasObl(b.chks) && cx.body) {
+    return Err("an index, `unwrap` or call precondition inside a function argument is not supported in code");
+  }
+  const at = VArr(concrete(b.vt));
+  const os = sortS(g, cx, at)?;
+  g = os.g;
+  const out = freshFree(g, cx, at)?;
+  g = out.g;
+  g.assert("(= " + arrLen(os.s, out.name) + " " + arrLen(so.s, r.t) + ")");
+  const eq = "(= " + arrSel(os.s, out.name, q) + " " + b.t + ")";
+  g.assert("(forall ((" + q + " Int)) (=> " + inBounds(so.s, r.t, q) + " " + (facts.length > 0 ? "(=> " + andAll(facts) + " " + eq + ")" : eq) + "))");
+  return mk(g, out.name, at, r.chks);
+}
+
+function trFilterArr(g: Gen, vars: Var[], cx: Cx, arr: Expr, f: Expr, e: Expr): Result<TR, string> {
+  const r = tr(g, vars, cx, arr, noExp())?;
+  return match (r.vt) {
+    VArr(el) => trFilterOn(r.g, vars, cx, r, el, f, e),
+    _ => Err("`filter` on a value of type `" + vtName(r.vt) + "`")
+  };
+}
+
+// `xs.filter(p)`: a sub-sequence of `xs`: at most as long, every element satisfies `p` and is an element of `xs`,
+// and as long as `xs` when every element of `xs` satisfies `p`. (Partial: the order and the exact content are not
+// stated, which is sound.)
+function trFilterOn(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, f: Expr, e: Expr): Result<TR, string> {
+  let g = g0;
+  if (cx.inQ) {
+    return Err("`filter` inside a quantifier body");
+  }
+  const lam = lamOf(f, 1)?;
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  const q = g.next("q");
+  const q2 = g.next("q");
+  const n0 = g.factCount();
+  const b = trBody(g, vars, cx, lam, [el], [arrSel(so.s, r.t, q)], VBool)?;
+  g = b.g;
+  const facts = g.takeFactsFrom(n0);
+  if (!vtEq(b.vt, VBool)) {
+    return Err("the function argument of `filter` must return bool");
+  }
+  if (hasObl(b.chks) && cx.body) {
+    return Err("an index, `unwrap` or call precondition inside a function argument is not supported in code");
+  }
+  const out = freshFree(g, cx, r.vt)?;
+  g = out.g;
+  g.taint(out.name);
+  const pIn = facts.length > 0 ? "(=> " + andAll(facts) + " " + b.t + ")" : b.t;
+  g.assert("(<= " + arrLen(so.s, out.name) + " " + arrLen(so.s, r.t) + ")");
+  // Every element of the result satisfies the predicate (its own bound variable) and occurs in the input.
+  const n1 = g.factCount();
+  const b2 = trBody(g, vars, cx, lam, [el], [arrSel(so.s, out.name, q2)], VBool)?;
+  g = b2.g;
+  const facts2 = g.takeFactsFrom(n1);
+  const pOut = facts2.length > 0 ? "(=> " + andAll(facts2) + " " + b2.t + ")" : b2.t;
+  g.assert("(forall ((" + q2 + " Int)) (=> " + inBounds(so.s, out.name, q2) + " " + pOut + "))");
+  const q3 = g.next("q");
+  g.assert("(forall ((" + q2 + " Int)) (=> " + inBounds(so.s, out.name, q2) + " (exists ((" + q3 + " Int)) (and " + inBounds(so.s, r.t, q3) + " (= " + arrSel(so.s, r.t, q3) + " " + arrSel(so.s, out.name, q2) + ")))))");
+  g.assert("(=> (forall ((" + q + " Int)) (=> " + inBounds(so.s, r.t, q) + " " + pIn + ")) (= " + arrLen(so.s, out.name) + " " + arrLen(so.s, r.t) + "))");
+  return mk(g, out.name, r.vt, r.chks);
+}
+
+// `sum(xs)` / `sumBy(xs, f)`: the sum of `f` over the elements, a recursive function over the prefix length,
+// with the defining equation and the lemma that a store changes the sum by the difference of the one term. The
+// lemma is a theorem of the definition (induction on the length); it is what lets the solver reason about
+// updates without induction of its own.
+function trSum(g0: Gen, vars: Var[], cx: Cx, arr: Expr, f: Option<Expr>, e: Expr): Result<TR, string> {
+  let g = g0;
+  if (cx.inQ) {
+    return Err("`sum` inside a quantifier body");
+  }
+  const r = tr(g, vars, cx, arr, noExp())?;
+  g = r.g;
+  const el = match (r.vt) {
+    VArr(t) => t,
+    _ => VBad("`sum` of a value of type `" + vtName(r.vt) + "`")
+  };
+  if (isBad(el)) {
+    return Err(badReason(el));
+  }
+  const so = sortS(g, cx, r.vt)?;
+  g = so.g;
+  const es = sortS(g, cx, el)?;
+  g = es.g;
+  let lam: Option<Lam> = None;
+  match (f) {
+    Some(fe) => {
+      const l = lamOf(fe, 1)?;
+      lam = Some(l);
+    },
+    None => {
+      if (!isIntTy(el)) {
+        return Err("`sum` of an array of `" + vtName(el) + "`");
+      }
+    }
+  }
+  const arrSort = "(Array Int " + es.s + ")";
+  // F(t): the summand for an element term.
+  let defBody = "";
+  let lemmaDelta = "";
+  if (lam.isSome()) {
+    const n0 = g.factCount();
+    const b1 = trBody(g, vars, cx, lam.unwrap(), [el], ["(select d (- n 1))"], noExp())?;
+    g = b1.g;
+    const b2 = trBody(g, vars, cx, lam.unwrap(), [el], ["lv"], noExp())?;
+    g = b2.g;
+    const b3 = trBody(g, vars, cx, lam.unwrap(), [el], ["(select ld li)"], noExp())?;
+    g = b3.g;
+    // Facts of the summand (calls to pure functions) are not part of the recursive definition: dropped, which
+    // only loses information.
+    const dropped = g.takeFactsFrom(n0);
+    if (!isIntTy(b1.vt)) {
+      return Err("the function argument of `sumBy` must return an integer");
+    }
+    if (hasObl(b1.chks) && cx.body) {
+      return Err("an index, `unwrap` or call precondition inside a function argument is not supported in code");
+    }
+    defBody = b1.t;
+    lemmaDelta = "(- " + b2.t + " " + b3.t + ")";
+  } else {
+    defBody = "(select d (- n 1))";
+    lemmaDelta = "(- lv (select ld li))";
+  }
+  // One definition per distinct summand (two sums of the same function over different arrays are the same function).
+  const key = arrSort + "|" + defBody;
+  const known = g.memoGet(key);
+  let fname = "";
+  if (known.isSome()) {
+    fname = known.unwrap();
+  } else {
+    fname = g.next("psum");
+    g.memoPut(key, fname);
+    g.declare("(define-fun-rec " + fname + " ((d " + arrSort + ") (n Int)) Int (ite (<= n 0) 0 (+ (" + fname + " d (- n 1)) " + defBody + ")))");
+    // A lemma, not a definition: kept apart so that a bounded search for a counterexample can leave it out.
+    g.lemma("(forall ((ld " + arrSort + ") (li Int) (lv " + es.s + ") (ln Int)) (= (" + fname + " (store ld li lv) ln) (+ (" + fname + " ld ln) (ite (and (<= 0 li) (< li ln)) " + lemmaDelta + " 0))))");
+  }
+  return mk(g, "(" + fname + " " + arrData(so.s, r.t) + " " + arrLen(so.s, r.t) + ")", VInt("int"), r.chks);
+}

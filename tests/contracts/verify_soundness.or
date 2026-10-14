@@ -1,0 +1,123 @@
+// Inputs for tools/test_verify_contracts.py: the soundness rules of the verifier (ADR-0035 section 4). Each function here
+// is a place where a careless encoding gives a wrong VERIFIED or a wrong REFUTED; the expected status is the honest one.
+// expect: concat_empty ensures UNKNOWN
+// expect: ab ensures UNKNOWN
+// expect: concat_empty_length ensures VERIFIED
+// expect: two_keys ensures UNKNOWN
+// expect: two_members ensures REFUTED
+// expect: believes_bad_invariant loop-invariant REFUTED
+// expect: believes_bad_invariant loop-invariant UNKNOWN
+// expect: believes_bad_invariant ensures UNKNOWN
+// expect: five_iterations ensures UNKNOWN
+// expect: contradictory ensures VERIFIED
+// expect: needs_element bounds VERIFIED
+// expect: needs_element ensures VERIFIED
+// expect: one_past bounds REFUTED
+// expect: one_past ensures VERIFIED
+// expect: u8_sum ensures VERIFIED
+// expect: narrow ensures VERIFIED
+// warn: contradictory W0461
+// warn: one_past W0460
+// warn: u8_sum W0460
+
+// Strings are modelled by length and an id for the contents: `a + ""` is `a` for real, the model does not know.
+// Not VERIFIED (it could not be proved) and not REFUTED (the model's counterexample is not real): UNKNOWN.
+@Ensures(result == a)
+function concat_empty(a: string): string {
+  return a + "";
+}
+
+@Ensures(result == "ab")
+function ab(): string {
+  return "a" + "b";
+}
+
+// But lengths are exact: this holds, and a false claim about lengths is REFUTED.
+@Ensures(result.length == a.length)
+function concat_empty_length(a: string): string {
+  return a + "";
+}
+
+// `Map` size is axiomatised (never negative, positive with a key, exact under set / delete) and not computed from the
+// keys: two different keys give a size of at least two for real, the model does not know. UNKNOWN, never REFUTED.
+@Ensures(result.size >= 2)
+function two_keys(m: Map<int, int>): Map<int, int> {
+  let r = m;
+  r.set(1, 10);
+  r.set(2, 20);
+  return r;
+}
+
+// Membership is exact (array theory): REFUTED is allowed here, with a counterexample.
+@Ensures(result.has(2) && result.has(3))
+function two_members(m: Map<int, int>): Map<int, int> {
+  let r = m;
+  r.set(2, 20);
+  return r;
+}
+
+// A wrong loop invariant must not be believed afterwards: the invariant is false on entry (REFUTED) and the result that
+// depends on it is UNKNOWN ("relies on a loop invariant that is not proved"), not VERIFIED. (The unrolled loop cannot
+// reach the exit in 3 iterations, so nothing refutes the postcondition itself.)
+@Requires(n == 100)
+@Ensures(result == 100)
+function believes_bad_invariant(n: int): int {
+  let i = 0;
+  @Invariant(i == 100)
+  while (i < n) {
+    i += 1;
+  }
+  return i;
+}
+
+// A loop that needs more iterations than the bounded unrolling covers: the claim is false, but it is not found; the
+// abstract pass gives UNKNOWN (loop without invariant), never a wrong VERIFIED.
+@Ensures(result == 4)
+function five_iterations(): int {
+  let i = 0;
+  let x = 0;
+  while (i < 5) {
+    x += 1;
+    i += 1;
+  }
+  return x;
+}
+
+// Contradictory preconditions on an array are found (W0461): the datatype of arrays does not make every length valid.
+@Requires(xs.length > 2 && xs.length < 2)
+@Ensures(result == 1)
+function contradictory(xs: int[]): int {
+  return 1;
+}
+
+// An array of length zero is a possible input: a precondition that needs an element is not a tautology.
+@Requires(xs.length > 0)
+@Ensures(result == xs[0])
+function needs_element(xs: int[]): int {
+  return xs[0];
+}
+
+// The index goes out of range on a path (negative index cannot happen for usize, but `i + 1` can be the length).
+@Requires(i <= xs.length)
+@Ensures(result >= 0 || result < 0)
+function one_past(xs: int[], i: usize): int {
+  return xs[i];
+}
+
+// Integer widths: the sum of two u8 fits only when it does not exceed 255, otherwise the addition traps; the postcondition
+// speaks about returning paths only.
+@Ensures(result <= 255)
+function u8_sum(a: u8, b: u8): u8 {
+  return a + b;
+}
+
+// ... but the narrowing of a computed int is a conversion that traps out of range, so a claim about the unreduced value is
+// false on returning paths only when it contradicts the range: this one holds.
+@Ensures(result.toInt() == x)
+function narrow(x: int): u8 {
+  return x.toU8();
+}
+
+function main(): void {
+  console.log(ab());
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for `orin verify --contracts` (ADR-0012 phase 2; needs the z3 solver on PATH).
+"""Tests for `orin verify --contracts` (ADR-0012 phase 2, ADR-0031 B/C, ADR-0035; needs the z3 solver on PATH).
 
 Usage: python3 tools/test_verify_contracts.py [--orinc build/bootstrap/orin2] [--require-z3]
 
@@ -8,6 +8,14 @@ header lines; the test runs `verify --contracts --format=json` and compares the 
 (function, kind, status). It also checks the JSON shape (counterexample for REFUTED, reason for
 UNKNOWN), the exit status (1 iff a clause REFUTED; `--strict`: also UNKNOWN) and that the
 human-readable output works. Without z3 the test is skipped unless --require-z3 is given.
+
+The files cover one construct each, with VERIFIED, REFUTED (with counterexample) and UNKNOWN (with reason) cases:
+verify_basic (int / bool, modular calls), verify_int_widths (exact ranges), verify_arrays (sequences, bounds),
+verify_data (records, Option, Result, unions, Map, strings), verify_classes (invariants per method, constructors,
+frames, modular method calls), verify_loops (inferred bounds, user invariants, havoc, unrolling), verify_quantifiers
+(every / some / range, sorted, no duplicates, conservation, totals), verify_generics, verify_soundness (places where a
+careless encoding gives a wrong status), quality_vc (W046x). Run with the contract-checked compiler in CI
+(tools/test_compiler_contracts.sh), so the verifier's own contracts are exercised too.
 """
 import argparse
 import collections
@@ -95,8 +103,10 @@ def main():
                 check(x["action"] == "NEEDS_DECISION" and x["question"] and len(x["options"]) >= 2, "%s: REFUTED needs a question" % rel)
                 for o in x["options"]:
                     check(set(o) == {"edit", "changes_spec", "widens_authority"}, "%s: option keys %r" % (rel, o))
-                check(any(o["widens_authority"] for o in x["options"]) and any(not o["changes_spec"] for o in x["options"]),
-                      "%s: options must include a code fix and a weakening" % rel)
+                # a violated contract can be weakened (the spec side); an index or unwrap that can fail has no clause to weaken
+                weak = x["kind"] in ("ensures", "invariant")
+                check(any(not o["changes_spec"] for o in x["options"]) and (not weak or any(o["widens_authority"] for o in x["options"])),
+                      "%s: options must include a code fix%s" % (rel, " and a weakening" if weak else ""))
                 check(x["evidence"]["counterexample"] == x["counterexample"], "%s: evidence" % rel)
         s = rep["summary"]
         check(s["refuted"] == sum(1 for x in rep["results"] if x["status"] == "REFUTED"), "%s: summary" % rel)
