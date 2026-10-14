@@ -46,7 +46,7 @@ import {
   paramNameList, selfTypeExpr, tailTypes, noPre, intLiteral, bigIntLiteral, negIntLiteral,
   negBigLiteral, interpolated, negOperandErr, logicOperandErr, impliesOperandErr, binaryType,
   extendPath, purePlace, noField, unresolvedName, condHoistErr, thisErr, capturedErr, mapKeyErr,
-  testGuard, isArrayApi, elemSuffix, mapReadFn,
+  testGuard, isArrayApi, elemSuffix, mapReadFn, isOptionTy, isResultTy, isRecordTy, isUnionTy,
 } from "./ops";
 import { liftClosure, wrapperOf } from "./lift";
 import { Inference, grantMissingErr, grantMismatchErr } from "./call";
@@ -237,6 +237,7 @@ export class ExprChecker {
 
   // The one implicit conversion of the language (ADR-0019): a value of a class type converts to an
   // interface type the class declares with `implements`. Anything else is a type mismatch.
+  @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, ty) && isIface(ty))
   private coerce(r: HExpr, span: Span, ty: Type): Result<HExpr, Diagnostic> {
     match (ty) {
       TyIface(i) => {
@@ -248,6 +249,8 @@ export class ExprChecker {
     }
   }
 
+  @Requires(i < this.fx.env.ifaces.length)
+  @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, TyIface(i)))
   private toIface(r: HExpr, span: Span, i: usize): Result<HExpr, Diagnostic> {
     const env = this.fx.env;
     match (r.ty) {
@@ -285,6 +288,7 @@ export class ExprChecker {
 
   // `s.m(args)` on an interface value, or on a value of a type parameter bounded by the interface
   // (abstract check): a call through the vtable (ADR-0019).
+  @Requires(i < this.fx.env.ifaces.length)
   private ifaceCall(
     b: HExpr,
     span: Span,
@@ -335,6 +339,7 @@ export class ExprChecker {
     };
   }
 
+  @Ensures(result.isOk() ==> isFn(result.unwrap().ty))
   private arrowExp(
     span: Span,
     ps: ArrowParam[],
@@ -381,6 +386,7 @@ export class ExprChecker {
     return Err(unresolvedName(this.fx.selfName, id));
   }
 
+  @Ensures(result.isOk() ==> isFn(result.unwrap().ty))
   private funcValueOf(
     ent: ValEnt,
     id: Ident,
@@ -449,6 +455,7 @@ export class ExprChecker {
     }
   }
 
+  @Ensures(result.isOk() ==> isOptionTy(result.unwrap().ty))
   private noneLit(exp: Option<Type>, span: Span): Result<HExpr, Diagnostic> {
     match (exp) {
       Some(t) => {
@@ -653,6 +660,7 @@ export class ExprChecker {
     }
   }
 
+  @Ensures(result.isOk() ==> isResultTy(this.fx.ret))
   private tryExpr(span: Span, inner: Expr): Result<HExpr, Diagnostic> {
     const o = this.ex(inner, None)?;
     match (o.ty) {
@@ -730,6 +738,7 @@ export class ExprChecker {
     return Ok(mk(XBuiltin(BResUnwrap, [tmp]), t, span));
   }
 
+  @Ensures(result.isOk() ==> this.fx.pre.length == old(this.fx.pre.length))
   private cond(
     span: Span,
     cond: Expr,
@@ -850,6 +859,7 @@ export class ExprChecker {
   // Records
   // ---------------------------------------------------------------------------
 
+  @Ensures(result.isOk() ==> isRecordTy(result.unwrap().ty))
   private record(
     span: Span,
     name: Ident,
@@ -943,6 +953,7 @@ export class ExprChecker {
 
   // Record literal of a generic record type: the instance comes from the spread, the explicit type
   // arguments, the expected type or the field values (in that order of authority).
+  @Ensures(result.isOk() ==> isRecordTy(result.unwrap().ty))
   private genericRecord(
     span: Span,
     g: usize,
@@ -1047,6 +1058,8 @@ export class ExprChecker {
     return Ok(mk(XRecord(rid, None, out), TyRecord(rid), span));
   }
 
+  @Requires(rid < this.fx.env.records.length)
+  @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, TyRecord(rid)))
   private recordOf(
     span: Span,
     rid: usize,
@@ -1686,6 +1699,7 @@ export class ExprChecker {
     return Ok(mk(XCall(fid, io.args), ret, span));
   }
 
+  @Ensures(result.isOk() ==> isUnionTy(result.unwrap().ty))
   private genericVariant(
     span: Span,
     g: usize,
@@ -1877,6 +1891,7 @@ export class ExprChecker {
     }
   }
 
+  @Ensures(result.isOk() ==> isOptionTy(result.unwrap().ty))
   private someCtor(span: Span, args: Expr[], exp: Option<Type>): Result<HExpr, Diagnostic> {
     if (args.length != 1) {
       return Err(diag("E0404", span, "`Some` expects 1 argument, found " + args.length.toString()));
@@ -1908,6 +1923,7 @@ export class ExprChecker {
     return Ok(mk(XVariant(0, [p]), TyOption(p.ty), span));
   }
 
+  @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, TyResult(t, e)))
   private okCtor(span: Span, args: Expr[], t: Type, e: Type): Result<HExpr, Diagnostic> {
     const want: usize = isVoid(t) ? 0 : 1;
     if (args.length != want) {
@@ -1926,6 +1942,7 @@ export class ExprChecker {
     return Ok(mk(XVariant(0, [p]), TyResult(t, e), span));
   }
 
+  @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, TyResult(t, e)))
   private errCtor(span: Span, args: Expr[], t: Type, e: Type): Result<HExpr, Diagnostic> {
     if (args.length != 1) {
       return Err(diag("E0404", span, "`Err` expects 1 argument, found " + args.length.toString()));
@@ -2059,6 +2076,7 @@ export class ExprChecker {
     return Ok(none2);
   }
 
+  @Ensures(result.isOk() ==> isVoid(result.unwrap().ty) || isOptionTy(result.unwrap().ty))
   private mutMethodCall(
     span: Span,
     base: Expr,
@@ -2443,6 +2461,7 @@ export class ExprChecker {
   // function per method. A generic class (ADR-0026) has a generic function per method: the signature
   // is the one under the receiver's type arguments, and outside abstract checks and mutation probes the
   // instance is created (`instFunc`) and called. Abstract checks / probes never create instances.
+  @Ensures(result.isOk() && !mi.isStatic ==> result.unwrap().params.length >= 1)
   private methodSigOf(
     ci: ClassInfo,
     mi: MethodInfo,
@@ -2955,6 +2974,7 @@ export class ExprChecker {
   // ---------------------------------------------------------------------------
 
   // Instance of the generic Map-prelude function `fname` at `tys` (a dummy id in an abstract check).
+  @Ensures(result.isOk() ==> this.fx.abs || result.unwrap() < this.fx.env.funcs.length)
   private mapFunc(span: Span, fname: string, tys: Type[]): Result<usize, Diagnostic> {
     if (this.fx.abs) {
       return Ok(0);
@@ -2976,6 +2996,7 @@ export class ExprChecker {
   }
 
   // `new Map<K, V>()`; the type arguments may be omitted when the expected type is a Map.
+  @Ensures(result.isOk() ==> mapOrigin(this.fx.env, result.unwrap().ty).isSome())
   private newMap(
     span: Span,
     targs: TypeExpr[],
