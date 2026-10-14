@@ -29,8 +29,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:
    - bytes and UTF-8, collections (**done**, section 1c; ADR-0030 §3 layers 1-2), I/O
-   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033) and the server loop on
-     top of it
+   - `std:http` pure message layer (**done**, section 1d); `std:net` (ADR-0033, **done**: blocking TCP, `examples/http_server.or`); concurrency needs ADR-0017
    - `std:mcp`, JSX/`std:html`
 4. **Complete the Lean proofs:**
    - shape check in the verifier and the model (finding F-shape);

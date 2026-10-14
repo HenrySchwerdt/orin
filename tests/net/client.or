@@ -1,0 +1,59 @@
+// An Orin HTTP client for tools/test_net.sh: GET /health on 127.0.0.1:<port> through a grant that covers exactly that port,
+// then tries to leave the granted scope (another port, another host) and a widened narrowing; every attempt must be refused.
+// Prints one line per step.
+import { Host, withProcess, useNet } from "std:host";
+import { args } from "std:process";
+import { Bytes, bytesFromString } from "std:bytes";
+import { ResponseParser, ParseResult, NeedMore, Done, Failed, Limits, defaultLimits } from "std:http";
+import {
+  NetGrant, Stream, useConnect, useConnection, sendAll, recv, RecvData, isDenied, shutdownWrite
+} from "std:net";
+
+function getHealth(s: Stream): string {
+  sendAll(s, bytesFromString("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), 2000);
+  let p = new ResponseParser(defaultLimits(), false);
+  let out = "no response";
+  let going = true;
+  while (going) {
+    const r = recv(s, 4096, 2000);
+    match (r) {
+      RecvData(b) => {
+        const pr = p.feed(b);
+        match (pr) {
+          NeedMore => {},
+          Done(resp, used) => {
+            out = "status " + resp.status().code().toString() + " body " + resp.body().toRawString().length.toString();
+            going = false;
+          },
+          Failed(e) => { out = "parse error"; going = false; }
+        }
+      },
+      _ => { going = false; }
+    }
+  }
+  return out;
+}
+
+function attempt(net: NetGrant, host: string, port: int): string {
+  const r = useConnection(net, host, port, 1000, (s: Stream) => { console.log("CONNECTED " + host + ":" + port.toString()); });
+  if (r.isOk()) {
+    return "connected";
+  }
+  return isDenied(r.unwrapErr()) ? "denied" : "failed: " + r.unwrapErr().message;
+}
+
+function main(host: Host): void {
+  const argv = withProcess(host, p => args(p));
+  const port = match (parseInt(argv[0])) { Some(v) => v, None => 0 };
+  useNet(host, net => {
+    useConnect(net, "127.0.0.1", port, port, c => {
+      const r = useConnection(c, "127.0.0.1", port, 2000, (s: Stream) => { console.log("health: " + getHealth(s)); });
+      console.log("granted connect: " + (r.isOk() ? "ok" : "FAIL " + r.unwrapErr().message));
+      console.log("other port: " + attempt(c, "127.0.0.1", port + 1));
+      console.log("other host: " + attempt(c, "localhost", port));
+      useConnect(c, "*", 0, 65535, wide => {
+        console.log("widened: " + attempt(wide, "127.0.0.1", port + 1));
+      });
+    });
+  });
+}

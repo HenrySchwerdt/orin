@@ -1,6 +1,6 @@
 # ADR-0033: L0 network primitives for `std:net`
 
-Status: accepted (2026-10-14, project owner). Amends the closed L0 list of spec 19 §2 (an ADR is required for
+Status: accepted (2026-10-14, project owner; implemented, with the amendment at the end). Amends the closed L0 list of spec 19 §2 (an ADR is required for
 every new platform function). Related: ADR-0021 (primitive operations Bind / Accept / Connect /
 StreamRead / StreamWrite, handle identity), ADR-0027 (Stage A: root grants as resource handles),
 ADR-0030 (the trust boundary is L0 only), ADR-0025 (resources).
@@ -43,8 +43,9 @@ UDP comes in a later amendment.
 
 ### 3. Budget and assurance
 
-- About 250 lines of C.
-- L0 stays under its 1,000-line budget. CI checks this (ADR-0032 §10).
+- About 220 lines of C and 100 lines of header (mostly contracts).
+- L0 stays under its budget of 1,000 CODE lines (contracts and comments excluded: the budget limits trusted code, not
+  its specification; ADR-0030 §1). `tools/verify_platform.sh` checks this and prints code lines and total lines.
 - Assurance: the buffer and bounds properties are CBMC-verified. Socket behaviour itself is
   OS-trusted and tested. A loopback test suite runs in CI on Linux and macOS.
 
@@ -52,3 +53,52 @@ UDP comes in a later amendment.
 
 `std:net` and `std:http` (ADR-0030 §3) can be written in safe Orin on top of this. The HTTP parser
 does not depend on it: it is a pure function over `std:bytes` and can be built first.
+
+## Amendment (2026-10-14): what the implementation needed
+
+The functions of §1 keep their roles. Differences and additions (all in `platform/orin_platform.{h,c}`):
+
+- **Handles are records.** `grant`, `listener` and `stream` are `orin_platform_net` records owned by the caller (the
+  runtime keeps the table and the generation counter): magic, kind, live fd, a `deny` flag set from `ORIN_DENY=net`, and for a
+  grant two scopes (listen, connect). Every function checks magic, kind, liveness and `deny`, then the scope, and refuses
+  with `ORIN_PLATFORM_EPERM` before any system call. Replaces "out_fd".
+- **Tagged recv result.** `stream_recv` returns `0` (data, `1..cap` bytes) or `NET_EOF` / `NET_TIMEOUT` / `NET_RESET`
+  or an errno code. Why: `std:http` must tell an orderly close from a timeout and from a reset (docs/std.md).
+- **Mandatory timeouts everywhere.** `accept`, `recv`, `send` and `connect` take `timeout_ms` in `0..3,600,000`, otherwise
+  `EINVAL`. Why: no infinite wait; `send` needs it as much as `recv` (a peer that never reads).
+- **`net_shutdown(stream, how)`.** Why: a graceful close is `shutdown(write)`, a bounded drain, then close; a bare close
+  can RST and discard the response that was just sent.
+- **`net_narrow(parent, what, host, lo, hi, out)`.** Why: the decision "the narrowed scope is inside the parent's"
+  is the security-critical part of the model and belongs at the checked boundary with a CBMC harness. A request outside
+  the parent's scope yields a grant that reaches nothing (like `useUnder`).
+- **`monotonic_millis()`.** Why: whole-request deadlines (a slowloris client sends a byte per `timeout - 1` ms). The wall
+  clock can jump; the runtime exposes it only through a live net handle.
+- **Socket options as parameters.** `listen(opt & 1)`: `SO_REUSEADDR`; `accept` / `connect (opt & 1)`: `TCP_NODELAY`.
+  Sockets are non-blocking inside and every wait is a `poll` with the caller's timeout; close-on-exec; no `SIGPIPE`.
+- **Peer address as a value.** `accept` writes the numeric peer address (text) and port.
+- **`dns_resolve`** returns the numeric addresses as `\n`-separated text (no structure arrays across the boundary).
+- **Bulk buffer path.** L0 works on a plain byte buffer (`recv` into it, `send` from it). The runtime copies between
+  that buffer and an Orin `u8[]` in one loop in C (`netRecv` / `netSend`); there is never one string per byte.
+
+Honest limits found:
+- **The DNS lookup is not bounded by the timeout.** A name given to `connect`, and `dns_resolve`, call the OS resolver
+  (`getaddrinfo`) first, which has its own (long) timeout. A servers that only listens never resolves. Bounding it would
+  need a thread or `getaddrinfo_a` (not portable to macOS); documented, not fixed.
+- **DNS rebinding is not covered.** A connect scope is checked against the host text the program supplies; the addresses
+  the resolver then returns are trusted. Scope an IP literal where this matters.
+- **Host patterns match program-supplied text** (exact, `*`, `*.suffix`; ASCII case-insensitive). `example.com.` (trailing
+  dot) and alternative spellings of an address do not match; this fails closed.
+- Listening takes a numeric address only (no DNS); IPv4 and IPv6; UDP is still a later amendment.
+- Not enforced: bandwidth, connection count, the OS's own backlog and port rules, TOCTOU between scope check and use on a
+  handle table that a hostile native library could write.
+
+**Orin side (as built).** `NetGrant` is `TyGrant(5)`, `Listener` `TyGrant(6)`, `Stream` `TyGrant(7)`: handles of the grant table
+(generation-checked), not new mechanisms. `std:host.useNet(host, net => ...)` gives the root grant. `std:net.useListen(net,
+addr, port, l => ...)` and `useConnect(net, hostPattern, portLo, portHi, c => ...)` narrow it (`listenGrant`, `connectGrant`
+of §2); `useListener` / `useAccepted` / `useConnection` open and close the resources. Ten built-ins of the internal
+`std:fsraw` carry the primitives (`grantNet`, `grantListen`, `grantConnect`, `netListen`, `netAccept`, `netConnect`, `netClose`,
+`netRecv`, `netSend`, `netShutdown`, plus `netStatus`, `netPort`, `netNow`, `netPeer`, `netResolve`, `netErrorText`); the
+verifier treats `netListen` / `netAccept` / `netConnect` as openers and `netClose` as the closer. `E0470` / `E0471` now apply to
+any function whose first parameter is a grant (not only the built-ins). OSIG: `Net.Bind`, `Net.Accept`, `Net.Connect`,
+`Stream.Read`, `Stream.Write`, `Net.Narrow` with the directions of §2 (accept and recv INPUT, send OUTPUT, listen and connect
+CONTROL). No seed bridge was needed: only new runtime functions were added.

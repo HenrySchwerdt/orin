@@ -6,8 +6,8 @@
  *
  * Rules for this layer: no data structures (one opaque OS handle type, `orin_platform_stream`, excepted),
  * no global state beyond argc/argv, no knowledge of Orin
- * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 lines including
- * comments. Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
+ * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 CODE lines (non-blank;
+ * comments and ACSL contracts do not count: the budget limits trusted code, not its specification). Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
  *
  * CONTRACT FORMAT. Every function carries one ACSL-style block, machine readable (a leading
  * slash-star-at marker; clauses `requires`, `ensures`, `assigns`, each ending in `;`):
@@ -342,6 +342,105 @@ int64_t orin_platform_path_absolute(const char *path, size_t plen, char *out, si
             non-existing component is a dangling symbolic link, or the buffer is too small;
     assigns out[0..cap-1]; */
 int64_t orin_platform_path_real(const char *abs, size_t alen, char *out, size_t cap);
+
+/* ---------------------------------------------------------------- network (ADR-0033): blocking TCP
+ * Every function takes a HANDLE: an `orin_platform_net` record owned by the caller (the runtime keeps the table and
+ * the generation counter; this layer owns what a record means). A function first checks the handle (magic, kind, live,
+ * not denied by ORIN_DENY=net) and, for a grant, that its scope covers what is asked, and refuses with
+ * ORIN_PLATFORM_EPERM BEFORE any system call. Timeouts are mandatory: 0..ORIN_PLATFORM_NET_MAXMS, never infinite.
+ * A scope is a host pattern ("*" = any, "*.sfx" = names ending in ".sfx", else the exact text, ASCII case-insensitive;
+ * for listening the text is an address literal) and a port range lo..hi. Names and addresses containing '*' are invalid.
+ * Results of waiting calls are one of: 0 (done), ORIN_PLATFORM_NET_EOF / _TIMEOUT / _RESET, or an errno-style code. */
+#define ORIN_PLATFORM_EPERM 1
+#define ORIN_PLATFORM_NET_EOF 1001 /* orderly end of the stream (recv) */
+#define ORIN_PLATFORM_NET_TIMEOUT 1002
+#define ORIN_PLATFORM_NET_RESET 1003 /* connection reset / aborted / broken pipe */
+#define ORIN_PLATFORM_NET_MAXMS 3600000
+#define ORIN_PLATFORM_NET_MAGIC 0x4e455431u
+enum { ORIN_PLATFORM_NET_GRANT = 1, ORIN_PLATFORM_NET_LISTENER = 2, ORIN_PLATFORM_NET_STREAM = 3 };
+enum { ORIN_PLATFORM_NET_LISTEN = 1, ORIN_PLATFORM_NET_CONNECT = 2 }; /* grant.can bits; index of a scope = bit - 1 */
+typedef struct {
+    size_t hl;
+    char h[64];
+    unsigned lo, hi;
+} orin_platform_scope;
+typedef struct {
+    unsigned magic, kind, can, deny; /* deny != 0: the host policy denies the net family */
+    int fd;                           /* listener / stream: the socket, -1 once closed */
+    orin_platform_scope sc[2];        /* grant: what it may listen on / connect to */
+} orin_platform_net;
+
+/*@ ensures \result is a monotonic clock in milliseconds (arbitrary origin, never decreases);
+    assigns \nothing; */
+int64_t orin_platform_monotonic_millis(void);
+
+/*@ requires \valid(out) && (hl == 0 || host[0..hl-1] readable);
+    ensures \result == ORIN_PLATFORM_EPERM ==> parent is not a live grant; *out untouched; no other effect;
+    ensures \result == ORIN_PLATFORM_EINVAL ==> what not in {LISTEN, CONNECT}, bad host text or range; *out untouched;
+    ensures \result == 0 ==> *out is a grant copied from parent with out->can == parent->can & what, and (when the parent
+            may do `what` and its scope covers host:lo..hi) the `what` scope replaced by host:lo..hi, else out->can == 0:
+            a narrowed grant never covers anything the parent does not;
+    assigns *out; */
+int orin_platform_net_narrow(const orin_platform_net *parent, unsigned what, const char *host, size_t hl, int lo, int hi,
+                             orin_platform_net *out);
+
+/*@ requires \valid(out) && \valid(out_port) && (alen == 0 || addr[0..alen-1] readable) && 1 <= backlog <= 4096;
+    ensures grant not live / denied / LISTEN scope does not cover addr:port ==> \result == EPERM and no system call was made;
+    ensures \result == 0 ==> *out is a LISTENER bound to addr:port (opt & 1: SO_REUSEADDR), *out_port the bound port
+            (the real one when port == 0), non-blocking, close-on-exec; \result != 0 ==> *out untouched;
+    assigns *out, *out_port, the network; */
+int orin_platform_tcp_listen(const orin_platform_net *grant, const char *addr, size_t alen, int port, int backlog, int opt,
+                             orin_platform_net *out, int *out_port);
+
+/*@ requires \valid(out) && \valid(peer + (0..pcap-1)) && \valid(peer_port);
+    ensures listener not live / denied ==> \result == EPERM, no system call;
+    ensures \result == ORIN_PLATFORM_NET_TIMEOUT ==> no connection arrived within timeout_ms;
+    ensures \result == 0 ==> *out is a STREAM (opt & 1: TCP_NODELAY), peer[0..] the NUL-terminated numeric address of the
+            peer (truncated to pcap - 1) and *peer_port its port; \result != 0 ==> *out untouched;
+    assigns *out, peer[0..pcap-1], *peer_port, the network; */
+int orin_platform_tcp_accept(const orin_platform_net *listener, int timeout_ms, int opt, orin_platform_net *out, char *peer,
+                             size_t pcap, int *peer_port);
+
+/*@ requires \valid(out) && (hl == 0 || host[0..hl-1] readable);
+    ensures grant not live / denied / CONNECT scope does not cover host:port ==> \result == EPERM, no system call;
+    ensures \result == 0 ==> *out is a STREAM connected to host:port within timeout_ms (opt & 1: TCP_NODELAY); a name is
+            resolved by the OS resolver first (that lookup is not bounded by timeout_ms); \result == NET_TIMEOUT or an
+            errno-style code (ECONNREFUSED, ...) otherwise, *out untouched;
+    assigns *out, the network; */
+int orin_platform_tcp_connect(const orin_platform_net *grant, const char *host, size_t hl, int port, int timeout_ms, int opt,
+                              orin_platform_net *out);
+
+/*@ requires \valid(out_len) && (cap == 0 || \valid(buf + (0..cap-1)));
+    ensures stream not live / denied ==> \result == EPERM, no system call; cap == 0 ==> EINVAL;
+    ensures \result == 0 ==> 1 <= *out_len <= cap and buf[0..*out_len-1] holds the next bytes; \result in {NET_EOF, NET_TIMEOUT,
+            NET_RESET} or an errno-style code ==> *out_len == 0; nothing outside buf[0..cap-1] is written;
+    assigns buf[0..cap-1], *out_len, the network; */
+int orin_platform_stream_recv(const orin_platform_net *s, char *buf, size_t cap, int timeout_ms, size_t *out_len);
+
+/*@ requires \valid(out_sent) && (len == 0 || data[0..len-1] readable);
+    ensures stream not live / denied ==> \result == EPERM, no system call;
+    ensures \result == 0 ==> 0 <= *out_sent <= len bytes were handed to the OS (a partial write is normal; the caller
+            sends the tail again); \result == NET_TIMEOUT ==> the socket stayed unwritable for timeout_ms (*out_sent == 0);
+            \result == NET_RESET ==> the peer is gone (no SIGPIPE is raised);
+    assigns *out_sent, the network; */
+int orin_platform_stream_send(const orin_platform_net *s, const char *data, size_t len, int timeout_ms, size_t *out_sent);
+
+/*@ ensures stream not live / denied ==> \result == EPERM; how not in {0 read, 1 write, 2 both} ==> EINVAL;
+    ensures \result == 0 ==> that direction is shut down (how 1 sends FIN: the half-close of a graceful close);
+    assigns the network; */
+int orin_platform_net_shutdown(const orin_platform_net *s, int how);
+
+/*@ ensures h not an initialised record ==> \result == EPERM; otherwise \result == 0 and the socket (if any) is closed,
+            h->fd == -1 and h->can == 0: closing twice is harmless;
+    assigns *h, the network; */
+int orin_platform_net_close(orin_platform_net *h);
+
+/*@ requires \valid(out + (0..cap-1)) && \valid(out_len) && (nlen == 0 || name[0..nlen-1] readable);
+    ensures grant not live / denied / CONNECT scope does not cover name (any port) ==> EPERM, no system call;
+    ensures \result == 0 ==> out[0..*out_len-1] holds the numeric addresses of name, each followed by '\n' (IPv4 and IPv6,
+            duplicates removed, as many as fit), *out_len <= cap; \result == ENOENT when the name does not resolve;
+    assigns out[0..cap-1], *out_len, the network (DNS); */
+int orin_platform_dns_resolve(const orin_platform_net *grant, const char *name, size_t nlen, char *out, size_t cap, size_t *out_len);
 
 #ifdef __cplusplus
 }
