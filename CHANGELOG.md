@@ -1,6 +1,18 @@
 # Changelog
 
 ## Unreleased
+- **Compiler rewrite step 3d: `opt/`, `cemit/`, `llvm/` under the contract and class standard** (docs/rewrite.md "Step 3d"). No
+  change to the generated C, C with `--check-contracts` or LLVM IR (byte-identical on the corpus and on `compiler/main.or`).
+  The code generators now emit every function from a read-only, program-wide symbol table built first in a fixed order
+  (`CSymbols`, `LlvmSymbols`) and join the texts in index order (rule 8, new in docs/rewrite.md: ready for ADR-0039
+  `.parallel()`); the optimiser's per-function stage is a `map` over the functions after the program-wide parameter-mode
+  inference (`ParamInference`). New classes `BlockSink`, `RewritePlan`, `EdgeBlocks`, `RecordAliases`, `ParamInference`,
+  `CSymbols`, `CFunctionEmitter`, `LlvmSymbols`, `LlvmFunctionEmitter`; contracts for every pass (well-formedness, signature,
+  same calls in the same order, instruction-count claims) and for the emitters (only declared symbols referenced, literals
+  round-trip, unique function symbols). **Fixed**: a record or closure with more than 64 slots of which two or more past
+  slot 63 hold references crashed the compiler (`trap: usize overflow` in the reference-mask computation of both backends);
+  it now compiles and the program traps at run time with the runtime's defined "struct has more than 64 slots".
+  Unit tests `compiler/tests/opt_test.or`, `compiler/tests/emit_test.or` (run by `tools/test_tooling.sh`).
 - **Performance defects of the std fixed** (docs/benchmarks.md "Performance defects found while building the std"): `x = x + e` /
   `x = x.concat(e)` on fields, elements and nested places are in-place (take/put of the slot, new MIR instruction `IArrayExtend`;
   74 s -> 13 ms on bench/appends); mutating methods with a result no longer allocate a pair or copy a field receiver (MIR v1.10 in/out
