@@ -49,6 +49,10 @@ typedef struct OrinObj {
     int64_t rc;    /* >0 live count, <0 immortal */
     uint32_t kind; /* ORIN_K_* */
     uint32_t tag;  /* variant tag (struct kind only; records use 0) */
+#ifdef ORIN_SITE_STATS
+    uint32_t site; /* allocation-site census only (see "Allocation-site census" below): the site that allocated it */
+    uint32_t site_pad;
+#endif
 } OrinObj;
 
 typedef struct OrinString {
@@ -196,10 +200,33 @@ typedef struct OrinStats {
 #endif
 extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 
+/* Allocation-site census (opt-in, docs/perf/alloc-census.md, tools/alloc_census.py). Compiled in only when BOTH the generated C
+ * and the runtime are built with ORIN_SITE_STATS: the compiler (`orin2 compile --stats-sites`) then defines it at the top of
+ * its output, emits `ORIN_SITE(n, orin_site_caller);` before every MIR instruction and terminator (n: the site id, 1-based, in
+ * MIR order: function, block, instruction; the terminator counts as the last instruction; `orin_site_caller` is a local that
+ * every function sets on entry to the call site that entered it, one level of calling context for its allocations) and a
+ * table `orin_site_names` describing every site; the
+ * runtime must be compiled with -DORIN_SITE_STATS (a mismatch is a link error: each side references a symbol only the other
+ * defines). Every object records the site that allocated it (OrinObj.site), so the counters are both "at the site" (operations
+ * the site executed, on any object) and "of the site" (operations on the objects the site allocated). Report: ORIN_STATS=sites
+ * writes one line per site that did anything to $ORIN_SITES_OUT (stderr when unset), besides the usual summary line.
+ * Without ORIN_SITE_STATS every hook below is an empty macro: normal builds are unchanged. */
+#ifdef ORIN_SITE_STATS
+extern __thread uint32_t orin_site_cur ORIN_TLS_MODEL; /* the site executing now (0: none / runtime start-up) */
+extern __thread uint32_t orin_site_par ORIN_TLS_MODEL; /* the call site that entered the function of orin_site_cur */
+#define ORIN_SITE(n, caller) (orin_site_cur = (uint32_t)(n), orin_site_par = (caller))
+enum { ORIN_SITE_RETAIN = 0, ORIN_SITE_RELEASE = 1, ORIN_SITE_COW_COPY = 2, ORIN_SITE_COW_INPLACE = 3 };
+void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur and at o->site */
+#define ORIN_SITE_RC(o, what) orin_site_rc((o), (what))
+#else
+#define ORIN_SITE_RC(o, what) ((void)0)
+#endif
+
 static inline void orin_retain(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
         orin_stats.retains++;
+        ORIN_SITE_RC(o, ORIN_SITE_RETAIN);
     }
 }
 /* retain and return (turn a borrowed value into an owned one). */
@@ -207,6 +234,7 @@ static inline OrinObj *orin_dup(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
         orin_stats.retains++;
+        ORIN_SITE_RC(o, ORIN_SITE_RETAIN);
     }
     return o;
 }
@@ -214,6 +242,7 @@ static inline OrinObj *orin_dup(OrinObj *o) {
 static inline void orin_release(OrinObj *o) {
     if (o && o->rc > 0) {
         orin_stats.releases++;
+        ORIN_SITE_RC(o, ORIN_SITE_RELEASE);
         if (ORIN_UNLIKELY(--o->rc == 0)) orin_destroy(o);
     }
 }
@@ -224,6 +253,7 @@ OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path */
 static inline OrinObj *orin_make_unique(OrinObj *o) {
     if (ORIN_LIKELY(o->rc == 1)) {
         orin_stats.cow_inplace++;
+        ORIN_SITE_RC(o, ORIN_SITE_COW_INPLACE);
         return o;
     }
     return orin_make_unique_slow(o);
