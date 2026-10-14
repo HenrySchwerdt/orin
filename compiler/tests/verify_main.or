@@ -5,7 +5,7 @@
 import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
 import {
   BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, BFsReadFile, BFsExists, BGrantFs, BGrantClock, BGrantUnder,
-  BGrantReadOnly, BGrantRevoke, BTimeNowMillis, UnOp, BinOp
+  BGrantReadOnly, BGrantRevoke, BTimeNowMillis, BGrantNet, BGrantListen, BNetListen, BNetAccept, BNetConnect, BNetClose, BNetRecv, BNetShutdown, UnOp, BinOp
 } from "../hir";
 import { verify, VerifyReport } from "../verify";
 import { exit } from "std:process";
@@ -820,8 +820,65 @@ function grantCases(): usize {
   return bad;
 }
 
+// ---------------------------------------------------------------- network handles (v1.9, ADR-0033)
+// NetGrant -> Listener (BNetListen) -> Stream (BNetAccept) / NetGrant -> Stream (BNetConnect): openers whose first argument is the
+// authorising handle; BNetClose closes a Listener or a Stream, BGrantRevoke a grant. Locals: `host` is local 0.
+
+function gnet(d: usize): Instr { return IBuiltin(Some(d), BGrantNet, [OLocal(0)]); }
+function nlisten(d: usize, g: usize): Instr { return IBuiltin(Some(d), BNetListen, [OLocal(g), OStr(0), OInt(0), OInt(8), OInt(1)]); }
+function naccept(d: usize, l: usize): Instr { return IBuiltin(Some(d), BNetAccept, [OLocal(l), OInt(100), OInt(1)]); }
+function nconnect(d: usize, g: usize): Instr { return IBuiltin(Some(d), BNetConnect, [OLocal(g), OStr(0), OInt(80), OInt(100), OInt(1)]); }
+function nclose(h: usize): Instr { return IBuiltin(None, BNetClose, [OLocal(h)]); }
+function nrecv(h: usize, d: usize): Instr { return IBuiltin(Some(d), BNetRecv, [OLocal(h), OInt(16), OInt(100)]); }
+
+function netCases(): usize {
+  let bad: usize = 0;
+  const p1 = pos("net grant, listener, accepted stream, receive, closed in reverse order", straight(1,
+    [lh("host"), lh("net"), lh("ln"), lh("s"), lr("r")], [
+      gnet(1), nlisten(2, 1), naccept(3, 2), nrecv(3, 4), IRelease(4), nclose(3), nclose(2), grev(1)]));
+  const p2 = pos("a connected stream", straight(1, [lh("host"), lh("net"), lh("s")], [gnet(1), nconnect(2, 1), nclose(2), grev(1)]));
+  const p3 = pos("a listener narrowed by a listen grant", straight(1, [lh("host"), lh("net"), lh("l"), lh("ln")], [
+    gnet(1), IBuiltin(Some(2), BGrantListen, [OLocal(1), OStr(0), OInt(0)]), nlisten(3, 2), nclose(3), grev(2), grev(1)]));
+  const n1 = neg("listener never closed", straight(1, [lh("host"), lh("net"), lh("ln")], [gnet(1), nlisten(2, 1), grev(1)]), "not closed");
+  const n2 = neg("stream closed twice", straight(1, [lh("host"), lh("net"), lh("s")], [gnet(1), nconnect(2, 1), nclose(2), nclose(2), grev(1)]), "not open");
+  const n3 = neg("receive after close", straight(1, [lh("host"), lh("net"), lh("s"), lr("r")], [
+    gnet(1), nconnect(2, 1), nclose(2), nrecv(2, 3), IRelease(3), grev(1)]), "dead");
+  const n4 = neg("stream accepted from a closed listener", straight(1, [lh("host"), lh("net"), lh("ln"), lh("s")], [
+    gnet(1), nlisten(2, 1), nclose(2), naccept(3, 2), nclose(3), grev(1)]), "dead");
+  const n5 = neg("stream duplicated", straight(1, [lh("host"), lh("net"), lh("s"), lh("copy")], [
+    gnet(1), nconnect(2, 1), ICopy(3, OLocal(2)), nclose(2), grev(1)]), "ICopy");
+  const n6 = neg("stream stored in a struct", straight(1, [lh("host"), lh("net"), lh("s"), lr("o")], [
+    gnet(1), nconnect(2, 1), IStructNew(3, 0, [OLocal(2)]), IRelease(3), nclose(2), grev(1)]), "cannot be stored");
+  const n7 = neg("stream returned", prog([
+    fn("f", 1, [lh("host"), lh("net"), lh("s")], MHandle, [bk([gnet(1), nconnect(2, 1)], TReturn(Some(OLocal(2))))])]), "returns a resource handle");
+  const n8 = neg("stream captured by a closure", prog([
+    fn("f", 1, [lh("host"), lh("net"), lh("s"), lr("c")], MVoid, [bk([gnet(1), nconnect(2, 1), IClosure(3, 1, [OLocal(2)]), IRelease(3), nclose(2), grev(1)], ret())]),
+    lifted()]), "cannot be captured");
+  const n9 = neg("stream is the result of a call (forged)", prog([
+    fn("f", 1, [lh("host"), lh("s")], MVoid, [bk([ICall(Some(1), 1, [])], ret())]),
+    fn("g", 0, [li("x")], MInt, [bk([], TReturn(Some(OInt(1))))])]), "ICall");
+  const n10 = neg("receive without a handle first argument", straight(0, [lr("r")], [
+    IBuiltin(Some(0), BNetRecv, [OInt(5), OInt(16), OInt(100)])]), "first argument");
+  const n11 = neg("opener (listen) without an authorising handle", straight(0, [lh("ln")], [
+    IBuiltin(Some(0), BNetListen, [OInt(1), OStr(0), OInt(0), OInt(8), OInt(1)])]), "authorising");
+  const n12 = neg("two handles to a send", straight(1, [lh("host"), lh("net"), lh("s"), lr("r")], [
+    gnet(1), nconnect(2, 1), IBuiltin(Some(3), BNetShutdown, [OLocal(2), OLocal(1)]), nclose(2), grev(1)]), "only the first");
+  const n13 = neg("stream closed on one branch only", prog([
+    fn("f", 1, [lh("host"), lb("c"), lh("net"), lh("s")], MVoid, [
+      bk([gnet(2), nconnect(3, 2)], TBranch(OLocal(1), 1, 2)),
+      bk([nclose(3)], TGoto(3)),
+      bk([], TGoto(3)),
+      bk([grev(2)], ret())])]), "not closed");
+  if (!p1) { bad += 1; } if (!p2) { bad += 1; } if (!p3) { bad += 1; }
+  if (!n1) { bad += 1; } if (!n2) { bad += 1; } if (!n3) { bad += 1; } if (!n4) { bad += 1; }
+  if (!n5) { bad += 1; } if (!n6) { bad += 1; } if (!n7) { bad += 1; } if (!n8) { bad += 1; }
+  if (!n9) { bad += 1; } if (!n10) { bad += 1; } if (!n11) { bad += 1; } if (!n12) { bad += 1; }
+  if (!n13) { bad += 1; }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases();
+  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

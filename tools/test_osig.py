@@ -253,6 +253,9 @@ def main():
         ("run", "~io:Process.Spawn", "MUST", "CONTROL"), ("run", "~io:Stdio.Read", "MUST", "INPUT"),
         ("run", "~io:Console.Write", "MUST", "OUTPUT"), ("scoped", "~io:Fs.Narrow", "MUST", "CONTROL"),
         ("main", "~io:Host.Acquire", "MUST", "CONTROL"),
+        ("netio", "~io:Net.Bind", "MUST", "CONTROL"), ("netio", "~io:Net.Accept", "MAY", "INPUT"),
+        ("netio", "~io:Net.Connect", "MUST", "CONTROL"), ("netio", "~io:Net.Narrow", "MUST", "CONTROL"),
+        ("netio", "~io:Stream.Read", "MAY", "INPUT"), ("netio", "~io:Stream.Write", "MAY", "OUTPUT"),   # inside closures: MAY
     ]
     for w in want_io:
         check(w in perf, "PERFORMS_IO edge %s" % (w,))
