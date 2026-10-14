@@ -61,7 +61,7 @@
 // connection management, URI parsing beyond the shape checks of `isValidTarget`, cookies and any header semantics
 // other than the framing and `Host` rules above.
 
-import { Bytes, ByteBuilder, bytesFromString, emptyBytes } from "std:bytes";
+import { Bytes, ByteBuilder, bytesFromString, bytesFromArray, emptyBytes } from "std:bytes";
 
 // ------------------------------------------------------------------------------------ character classes
 
@@ -1371,17 +1371,19 @@ function isLineState(st: int): bool {
   return st <= S_REASON || (st >= S_HDR_NAME && st <= S_HDR_VALUE) || (st >= S_CHUNK_SIZE && st <= S_CHUNK_EXT);
 }
 
-// The bytes chunk[a, b) as a string (one byte per character, no decoding).
-@Requires(a <= b && b <= chunk.length())
+
+// The bytes xs[a, b) as a string (one byte per character, no decoding). Appending one character at a time is
+// about twice as fast as collecting 1-character strings and joining them (measured, docs/std.md).
+@Requires(a <= b && b <= xs.length)
 @Ensures(result.length == b - a)
-function sliceString(chunk: Bytes, a: usize, b: usize): string {
-  let parts: string[] = [];
+function sliceString(xs: u8[], a: usize, b: usize): string {
+  let s = "";
   let k = a;
   while (k < b) {
-    parts.push(String.fromCharCode(chunk.at(k).toInt()));
+    s += String.fromCharCode(xs[k].toInt());
     k += 1;
   }
-  return parts.join("");
+  return s;
 }
 
 // s without trailing SP / HTAB. O(trailing blanks).
@@ -1409,13 +1411,17 @@ function resultUsed<T>(r: ParseResult<T>): usize {
   };
 }
 
+// The scanner reads the input through a window: a copy of at most WINDOW bytes of the chunk as a `u8[]`, so that
+// the byte loops index an array instead of calling `Bytes.at` per byte (a call plus a reference count per byte).
+const WINDOW: usize = 4096;
+
 // The incremental parser shared by `RequestParser` and `ResponseParser`: the state machine described at the top of
-// the file. `feed` consumes input one forward pass at a time; all state is in the fields, so the input may be
-// split anywhere. Invariants (checked after every public method in a checked build) tie the state to the data:
-// the state is one of the 23 states; a failed parser holds its error and only a failed parser does; the header
-// lists are parallel and within the count limit; the line counter is within the line limit; the header section
-// never exceeds its budget; counters of the framing fields never pass one (a second one is an error at once);
-// pending body bytes exist only in a body state; a response parser never visits the request-line states.
+// the file. `feed` consumes input in one forward pass; all state is in the fields, so the input may be split
+// anywhere. Invariants (checked after every public method in a checked build) tie the state to the data: the state
+// is one of the 23 states; a failed parser holds its error and only a failed parser does; the header lists are
+// parallel and within the count limit; the line counter is within the line limit; the header section never exceeds
+// its budget; counters of the framing fields never pass one (a second one is an error at once); pending body bytes
+// exist only in a body state; a response parser never visits the request-line states.
 @Invariant(this.state >= S_METHOD && this.state <= S_ERROR)
 @Invariant((this.state == S_ERROR) == this.err.isSome())
 @Invariant(this.hnames.length == this.hvals.length && this.tnames.length == this.tvals.length)
@@ -1433,6 +1439,8 @@ function resultUsed<T>(r: ParseResult<T>): usize {
 @Invariant(this.state != S_BODY || this.framing == F_LENGTH)
 @Invariant(this.state != S_BODY_CLOSE || this.framing == F_CLOSE)
 @Invariant(this.vidx <= 8 && this.codeDigits <= 3)
+@Invariant(this.acc.length == 0 || this.state == S_METHOD || this.state == S_TARGET || this.state == S_REASON
+  || this.state == S_HDR_NAME || this.state == S_HDR_VALUE || this.state == S_ERROR)
 class MessageParser {
   private isReq: bool;
   private forHead: bool;
@@ -1444,13 +1452,15 @@ class MessageParser {
   private maxBody: usize;
   private state: int;
   private err: Option<HttpError> = None;
+  private base0: usize = 0;
   private base: usize = 0;
+  private cur: usize = 0;
   private total: usize = 0;
   private sectionEnd: usize;
   private lineLen: usize = 0;
   private lineMax: usize;
   private lineStart: usize = 0;
-  private frags: string[] = [];
+  private acc: string = "";
   private meth: Method = Get;
   private methodToken: string = "";
   private target: string = "";
@@ -1497,13 +1507,15 @@ class MessageParser {
   reset(): void {
     this.state = this.isReq ? S_METHOD : S_VERSION;
     this.err = None;
+    this.base0 = 0;
     this.base = 0;
+    this.cur = 0;
     this.total = 0;
     this.sectionEnd = this.maxHead;
     this.lineLen = 0;
     this.lineMax = this.maxStart;
     this.lineStart = 0;
-    this.frags = [];
+    this.acc = "";
     this.meth = Get;
     this.methodToken = "";
     this.target = "";
@@ -1581,6 +1593,11 @@ class MessageParser {
   // feed(chunk): consumes bytes of the message. NeedMore: all of `chunk` was consumed. Done(_, used): the message is
   // complete after `used` bytes of this chunk. Failed(e): refused. In a terminal state it answers Failed without
   // consuming anything (the stored error, or `ParserFinished` after Done).
+  //
+  // The loop takes one token per step. A step handles the bytes at the cursor `this.cur` in the current state and
+  // moves the cursor; it consumes at least one byte or ends in ERROR, so the loop terminates in at most
+  // chunk.length() + 1 steps. Scanning states read a window of the chunk (`xs`, cursor relative to the window);
+  // the body states copy nothing: they slice the chunk.
   @Ensures(resultKind(result) == 0 ==> this.state < S_DONE && this.total == old(this.total) + chunk.length())
   @Ensures(resultKind(result) == 1 ==> this.state == S_DONE && resultUsed(result) <= chunk.length())
   @Ensures(resultKind(result) == 1 ==> this.total == old(this.total) + resultUsed(result))
@@ -1593,13 +1610,91 @@ class MessageParser {
       }
       return Failed(httpError(this.total, ParserFinished));
     }
-    this.base = this.total;
+    this.base0 = this.total;
     const n = chunk.length();
     let i: usize = 0;
+    let xs: u8[] = [];
+    let w: usize = 0;
+    let we: usize = 0;
     while (i < n && this.state < S_DONE) {
-      i = this.advance(chunk, i, n);
+      const st = this.state;
+      if (st == S_BODY) {
+        this.cur = i;
+        this.doBody(chunk, n);
+        i = this.cur;
+      } else if (st == S_CHUNK_DATA) {
+        this.cur = i;
+        this.doChunkData(chunk, n);
+        i = this.cur;
+      } else if (st == S_BODY_CLOSE) {
+        this.cur = i;
+        this.doBodyClose(chunk, n);
+        i = this.cur;
+      } else {
+        let end = n;
+        if (st <= S_HEAD_END_LF) {
+          const budget = this.sectionEnd - this.base0;
+          if (budget < end) {
+            end = budget;
+          }
+          if (i >= end) {
+            this.fail(this.base0 + i, HeadersTooLarge);
+            break;
+          }
+        }
+        if (i < w || i >= we) {
+          w = i;
+          we = n - i > WINDOW ? i + WINDOW : n;
+          xs = chunk.slice(w, we).toArray();
+        }
+        const lim = (end < we ? end : we) - w;
+        this.base = this.base0 + w;
+        this.cur = i - w;
+        if (this.lineLen >= this.lineMax && isLineState(st) && HTTP_CLASS.charCodeAt(xs[this.cur].toUsize()) != C_CR) {
+          this.fail(this.base + this.cur, lineLimitReason(st));
+          break;
+        }
+        if (st == S_HDR_VALUE) {
+          this.doValue(xs, lim);
+        } else if (st == S_HDR_NAME) {
+          this.doName(xs, lim);
+        } else if (st == S_HDR_LINE) {
+          this.doLineStart(xs, lim);
+        } else if (st == S_HDR_OWS) {
+          this.doOws(xs, lim);
+        } else if (st == S_HDR_LF) {
+          this.doHeaderLf(xs);
+        } else if (st == S_METHOD) {
+          this.doMethod(xs, lim);
+        } else if (st == S_TARGET) {
+          this.doTarget(xs, lim);
+        } else if (st == S_VERSION) {
+          this.doVersion(xs, lim);
+        } else if (st == S_CODE) {
+          this.doCode(xs, lim);
+        } else if (st == S_REASON) {
+          this.doReason(xs, lim);
+        } else if (st == S_START_LF) {
+          this.doStartLf(xs);
+        } else if (st == S_HEAD_END_LF) {
+          this.doHeadEnd(xs);
+        } else if (st == S_CHUNK_SIZE) {
+          this.doChunkSize(xs, lim);
+        } else if (st == S_CHUNK_BWS) {
+          this.doChunkBws(xs, lim);
+        } else if (st == S_CHUNK_EXT) {
+          this.doChunkExt(xs, lim);
+        } else if (st == S_CHUNK_SIZE_LF) {
+          this.doChunkSizeLf(xs);
+        } else if (st == S_CHUNK_CR) {
+          this.doChunkCr(xs);
+        } else {
+          this.doChunkLf(xs);
+        }
+        i = w + this.cur;
+      }
     }
-    this.total = this.base + i;
+    this.total = this.base0 + i;
     if (this.state == S_ERROR) {
       return Failed(this.err.unwrap());
     }
@@ -1628,362 +1723,335 @@ class MessageParser {
     return Failed(this.err.unwrap());
   }
 
-  // ---- one step: handle the token at chunk[i] in the current state; returns the new index. Contract: progress.
-  // Every handler consumes at least one byte or ends in ERROR, so `feed` terminates in at most chunk.length() + 1
-  // steps per call.
-  @Requires(i < n0 && n0 <= chunk.length() && this.state < S_DONE)
-  @Ensures(result > i || this.state == S_ERROR)
-  @Ensures(result <= n0 || this.state == S_ERROR)
-  private advance(chunk: Bytes, i: usize, n0: usize): usize {
-    const st = this.state;
-    let n = n0;
-    if (st <= S_HEAD_END_LF) {
-      const budget = this.sectionEnd - this.base;
-      if (budget < n) {
-        n = budget;
-      }
-      if (i >= n) {
-        this.fail(this.base + i, HeadersTooLarge);
-        return i;
-      }
-    }
-    if (this.lineLen >= this.lineMax && isLineState(st)) {
-      if (HTTP_CLASS.charCodeAt(chunk.at(i).toUsize()) != C_CR) {
-        this.fail(this.base + i, lineLimitReason(st));
-        return i;
-      }
-    }
-    if (st == S_HDR_VALUE) {
-      return this.doValue(chunk, i, n);
-    }
-    if (st == S_HDR_NAME) {
-      return this.doName(chunk, i, n);
-    }
-    if (st == S_HDR_LINE) {
-      return this.doLineStart(chunk, i, n);
-    }
-    if (st == S_HDR_OWS) {
-      return this.doOws(chunk, i, n);
-    }
-    if (st == S_HDR_LF) {
-      return this.doHeaderLf(chunk, i);
-    }
-    if (st == S_BODY) {
-      return this.doBody(chunk, i, n);
-    }
-    if (st == S_METHOD) {
-      return this.doMethod(chunk, i, n);
-    }
-    if (st == S_TARGET) {
-      return this.doTarget(chunk, i, n);
-    }
-    if (st == S_VERSION) {
-      return this.doVersion(chunk, i, n);
-    }
-    if (st == S_CODE) {
-      return this.doCode(chunk, i, n);
-    }
-    if (st == S_REASON) {
-      return this.doReason(chunk, i, n);
-    }
-    if (st == S_START_LF) {
-      return this.doStartLf(chunk, i);
-    }
-    if (st == S_HEAD_END_LF) {
-      return this.doHeadEnd(chunk, i);
-    }
-    if (st == S_CHUNK_DATA) {
-      return this.doChunkData(chunk, i, n);
-    }
-    if (st == S_CHUNK_SIZE) {
-      return this.doChunkSize(chunk, i, n);
-    }
-    if (st == S_CHUNK_BWS) {
-      return this.doChunkBws(chunk, i, n);
-    }
-    if (st == S_CHUNK_EXT) {
-      return this.doChunkExt(chunk, i, n);
-    }
-    if (st == S_CHUNK_SIZE_LF) {
-      return this.doChunkSizeLf(chunk, i);
-    }
-    if (st == S_CHUNK_CR) {
-      return this.doChunkCr(chunk, i);
-    }
-    if (st == S_CHUNK_LF) {
-      return this.doChunkLf(chunk, i);
-    }
-    return this.doBodyClose(chunk, i, n);
-  }
-
-  // Counts one delimiter byte against the line limit; fails and answers false when the line is full.
-  private countOne(at: usize): bool {
-    if (this.lineLen >= this.lineMax) {
-      this.fail(this.base + at, lineLimitReason(this.state));
-      return false;
-    }
-    this.lineLen += 1;
-    return true;
-  }
-
   // ---------------------------------------------------------------------------------------- start line
+  // Every step below reads the cursor `this.cur`, handles the bytes xs[cur .. n) in its state and leaves the new
+  // cursor in `this.cur`: a position past at least one byte, or the position of the byte it refused (ERROR).
 
   // METHOD: a run of token characters, then SP.
-  private doMethod(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_METHOD && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doMethod(xs: u8[], n: usize): void {
+    const i = this.cur;
     const room = this.lineMax - this.lineLen;
     const lim = (n - i) < room ? n : i + room;
     let j = i;
-    while (j < lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= C_TOKEN) {
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_TOKEN) {
       j += 1;
     }
+    let tok = "";
     if (j > i) {
-      this.frags.push(sliceString(chunk, i, j));
+      tok = sliceString(xs, i, j);
       this.lineLen += j - i;
     }
+    this.cur = j;
     if (j >= n) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= C_TOKEN) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
     if (c == C_SP && this.lineLen > 0) {
-      if (!this.countOne(j)) {
-        return j;
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
       }
-      this.methodToken = this.frags.join("");
-      this.frags = [];
-      this.meth = methodFromToken(this.methodToken).unwrap();
+      this.lineLen += 1;
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.methodToken = tok;
+      this.meth = methodFromToken(tok).unwrap();
       this.go(S_TARGET);
       this.targetPos = this.base + j + 1;
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     this.fail(this.base + j, BadMethod);
-    return j;
   }
 
   // TARGET: a run of 0x21..0x7E, then SP.
-  private doTarget(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_TARGET && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doTarget(xs: u8[], n: usize): void {
+    const i = this.cur;
     const room = this.lineMax - this.lineLen;
     const lim = (n - i) < room ? n : i + room;
     let j = i;
-    while (j < lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= 6) {
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= 6) {
       j += 1;
     }
+    let tok = "";
     if (j > i) {
-      this.frags.push(sliceString(chunk, i, j));
+      tok = sliceString(xs, i, j);
       this.lineLen += j - i;
     }
+    this.cur = j;
     if (j >= n) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= 6) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
     if (c == C_SP && this.lineLen > this.methodToken.length + 1) {
-      if (!this.countOne(j)) {
-        return j;
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
       }
-      this.target = this.frags.join("");
-      this.frags = [];
+      this.lineLen += 1;
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.target = tok;
       this.go(S_VERSION);
       this.vidx = 0;
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     if (c == C_CR && this.lineLen > this.methodToken.length + 1) {
       this.fail(this.base + j, BadVersion);
-      return j;
+      return;
     }
     this.fail(this.base + j, BadTarget);
-    return j;
   }
 
   // VERSION: "HTTP/1." and a digit (0 or 1), then CR (request) or SP (response).
-  private doVersion(chunk: Bytes, i: usize, n: usize): usize {
-    let j = i;
+  @Requires(this.state == S_VERSION && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doVersion(xs: u8[], n: usize): void {
+    let j = this.cur;
     while (j < n && this.vidx < 8 && this.lineLen < this.lineMax) {
-      const c = chunk.at(j).toInt();
+      const c = xs[j].toInt();
       const k = this.vidx;
       if (k < 7) {
         if (c != "HTTP/1.".charCodeAt(k)) {
+          this.cur = j;
           if (k == 5 && c >= 48 && c <= 57) {
             this.fail(this.base + j, UnsupportedVersion);
           } else {
             this.fail(this.base + j, BadVersion);
           }
-          return j;
+          return;
         }
       } else if (c == 48) {
         this.minor = 0;
       } else if (c == 49) {
         this.minor = 1;
       } else if (c >= 50 && c <= 57) {
+        this.cur = j;
         this.fail(this.base + j, UnsupportedVersion);
-        return j;
+        return;
       } else {
+        this.cur = j;
         this.fail(this.base + j, BadVersion);
-        return j;
+        return;
       }
       this.vidx += 1;
       this.lineLen += 1;
       j += 1;
     }
+    this.cur = j;
     if (this.vidx < 8) {
       if (j < n) {
-        if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) != C_CR) {
+        if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
           this.fail(this.base + j, StartLineTooLong);
         } else {
           this.fail(this.base + j, BadVersion);
         }
       }
-      return j;
+      return;
     }
     if (j >= n) {
-      return j;
+      return;
     }
-    const d = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const d = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (this.isReq) {
       if (d == C_CR) {
         this.go(S_START_LF);
-        return j + 1;
+        this.cur = j + 1;
+        return;
       }
       if (d == C_LF) {
         this.fail(this.base + j, BareLf);
       } else {
         this.fail(this.base + j, BadVersion);
       }
-      return j;
+      return;
     }
     if (d == C_SP) {
-      if (!this.countOne(j)) {
-        return j;
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
       }
+      this.lineLen += 1;
       this.go(S_CODE);
       this.code = 0;
       this.codeDigits = 0;
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     if (d == C_LF) {
       this.fail(this.base + j, BareLf);
     } else {
       this.fail(this.base + j, BadStatusLine);
     }
-    return j;
   }
 
   // CODE: exactly three digits (first 1..5), then SP.
-  private doCode(chunk: Bytes, i: usize, n: usize): usize {
-    let j = i;
+  @Requires(this.state == S_CODE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doCode(xs: u8[], n: usize): void {
+    let j = this.cur;
     while (j < n && this.codeDigits < 3 && this.lineLen < this.lineMax) {
-      const c = chunk.at(j).toInt();
+      const c = xs[j].toInt();
       if (c < 48 || c > 57 || (this.codeDigits == 0 && (c < 49 || c > 53))) {
+        this.cur = j;
         this.fail(this.base + j, BadStatusCode);
-        return j;
+        return;
       }
       this.code = this.code * 10 + (c - 48);
       this.codeDigits += 1;
       this.lineLen += 1;
       j += 1;
     }
+    this.cur = j;
     if (this.codeDigits < 3) {
       if (j < n) {
-        if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) != C_CR) {
+        if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
           this.fail(this.base + j, StartLineTooLong);
         } else {
           this.fail(this.base + j, BadStatusCode);
         }
       }
-      return j;
+      return;
     }
     if (j >= n) {
-      return j;
+      return;
     }
-    const d = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const d = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (d == C_SP) {
-      if (!this.countOne(j)) {
-        return j;
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, StartLineTooLong);
+        return;
       }
+      this.lineLen += 1;
       this.go(S_REASON);
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     if (d == C_LF) {
       this.fail(this.base + j, BareLf);
     } else {
       this.fail(this.base + j, BadStatusLine);
     }
-    return j;
   }
 
   // REASON: a run of field bytes, then CR.
-  private doReason(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_REASON && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doReason(xs: u8[], n: usize): void {
+    const i = this.cur;
     const room = this.lineMax - this.lineLen;
     const lim = (n - i) < room ? n : i + room;
     let j = i;
-    while (j < lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= C_HTAB) {
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB) {
       j += 1;
     }
+    let tok = "";
     if (j > i) {
-      this.frags.push(sliceString(chunk, i, j));
+      tok = sliceString(xs, i, j);
       this.lineLen += j - i;
     }
+    this.cur = j;
     if (j >= n) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= C_HTAB) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
     if (c == C_CR) {
-      this.reason = this.frags.join("");
-      this.frags = [];
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.reason = tok;
       this.go(S_START_LF);
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     if (c == C_LF) {
       this.fail(this.base + j, BareLf);
     } else {
       this.fail(this.base + j, BadStatusLine);
     }
-    return j;
   }
 
   // START_LF: the LF of the start line; then the header section begins.
-  private doStartLf(chunk: Bytes, i: usize): usize {
-    if (chunk.at(i).toInt() != 10) {
+  @Requires(this.state == S_START_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doStartLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
       this.fail(this.base + i, BareCr);
-      return i;
+      return;
     }
     if (this.isReq && !isValidTarget(this.meth, this.target)) {
       this.fail(this.targetPos, BadTarget);
-      return i;
+      return;
     }
     this.go(S_HDR_LINE);
     this.lineLen = 0;
     this.lineMax = this.maxLine;
     this.lineStart = this.base + i + 1;
-    return i + 1;
+    this.cur = i + 1;
   }
 
   // ----------------------------------------------------------------------------- header and trailer fields
 
   // HDR_LINE: the first byte of a line of the header (or trailer) section.
-  private doLineStart(chunk: Bytes, i: usize, n: usize): usize {
-    const c = HTTP_CLASS.charCodeAt(chunk.at(i).toUsize());
+  @Requires(this.state == S_HDR_LINE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doLineStart(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const c = HTTP_CLASS.charCodeAt(xs[i].toUsize());
     if (c >= C_TOKEN) {
       const count = this.inTrailers ? this.tnames.length : this.hnames.length;
       if (count >= this.maxCount) {
         this.fail(this.base + i, TooManyHeaders);
-        return i;
+        return;
       }
       this.lineStart = this.base + i;
       this.lineLen = 0;
       this.go(S_HDR_NAME);
-      return this.doName(chunk, i, n);
+      this.doName(xs, n);
+      return;
     }
     if (c == C_CR) {
       this.go(S_HEAD_END_LF);
-      return i + 1;
+      this.cur = i + 1;
+      return;
     }
     if (c == C_LF) {
       this.fail(this.base + i, BareLf);
@@ -1992,36 +2060,52 @@ class MessageParser {
     } else {
       this.fail(this.base + i, BadHeaderName);
     }
-    return i;
   }
 
   // HDR_NAME: a run of token characters, then ":".
-  private doName(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_HDR_NAME && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doName(xs: u8[], n: usize): void {
+    const i = this.cur;
     const room = this.lineMax - this.lineLen;
     const lim = (n - i) < room ? n : i + room;
     let j = i;
-    while (j < lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= C_TOKEN) {
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_TOKEN) {
       j += 1;
     }
+    let tok = "";
     if (j > i) {
-      this.frags.push(sliceString(chunk, i, j));
+      tok = sliceString(xs, i, j);
       this.lineLen += j - i;
     }
+    this.cur = j;
     if (j >= n) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= C_TOKEN) {
-      return j;
+      if (j > i) {
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+      }
+      return;
     }
     if (c == C_COLON) {
-      if (!this.countOne(j)) {
-        return j;
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, HeaderLineTooLong);
+        return;
       }
-      this.curName = this.frags.join("");
-      this.frags = [];
+      this.lineLen += 1;
+      if (this.acc.length > 0) {
+        tok = this.acc + tok;
+        this.acc = "";
+      }
+      this.curName = tok;
       this.go(S_HDR_OWS);
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     if (c == C_SP || c == C_HTAB) {
       this.fail(this.base + j, SpaceBeforeColon);
@@ -2032,95 +2116,101 @@ class MessageParser {
     } else {
       this.fail(this.base + j, BadHeaderName);
     }
-    return j;
   }
 
   // HDR_OWS: optional whitespace after the colon, then the value (or CR for an empty value).
-  private doOws(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_HDR_OWS && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doOws(xs: u8[], n: usize): void {
+    const i = this.cur;
     const room = this.lineMax - this.lineLen;
     const lim = (n - i) < room ? n : i + room;
     let j = i;
-    while (j < lim && isOws(chunk.at(j).toInt())) {
+    while (j < lim && isOws(xs[j].toInt())) {
       j += 1;
     }
     this.lineLen += j - i;
+    this.cur = j;
     if (j >= n) {
-      return j;
+      return;
     }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c == C_SP || c == C_HTAB) {
-      return j;
+      return;
     }
     if (c == C_CR) {
       this.curValue = "";
       this.go(S_HDR_LF);
-      return j + 1;
+      this.cur = j + 1;
+      return;
     }
     this.go(S_HDR_VALUE);
     if (j > i) {
-      return j;
+      return;
     }
-    return this.doValue(chunk, j, n);
+    this.doValue(xs, n);
   }
 
   // HDR_VALUE: a run of field bytes, then CR; trailing blanks are not part of the value.
-  private doValue(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_HDR_VALUE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doValue(xs: u8[], n: usize): void {
+    const i = this.cur;
     const room = this.lineMax - this.lineLen;
     const lim = (n - i) < room ? n : i + room;
     let j = i;
-    while (j < lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= C_HTAB) {
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB) {
       j += 1;
     }
     this.lineLen += j - i;
-    if (j >= n || (j == lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= C_HTAB)) {
+    this.cur = j;
+    if (j >= n || (j == lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB)) {
       if (j > i) {
-        this.frags.push(sliceString(chunk, i, j));
+        const tok = sliceString(xs, i, j);
+        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
       }
-      return j;
+      return;
     }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c == C_CR) {
       let e = j;
-      while (e > i && isOws(chunk.at(e - 1).toInt())) {
+      while (e > i && isOws(xs[e - 1].toInt())) {
         e -= 1;
       }
-      if (this.frags.length == 0) {
-        this.curValue = sliceString(chunk, i, e);
+      if (this.acc.length == 0) {
+        this.curValue = sliceString(xs, i, e);
       } else {
-        if (e > i) {
-          this.frags.push(sliceString(chunk, i, e));
-        }
-        this.curValue = trimEndOws(this.frags.join(""));
-        this.frags = [];
+        this.curValue = trimEndOws(this.acc + sliceString(xs, i, e));
+        this.acc = "";
       }
       this.go(S_HDR_LF);
-      return j + 1;
-    }
-    if (j > i) {
-      this.frags.push(sliceString(chunk, i, j));
+      this.cur = j + 1;
+      return;
     }
     if (c == C_LF) {
       this.fail(this.base + j, BareLf);
     } else {
       this.fail(this.base + j, BadHeaderValue);
     }
-    return j;
   }
 
   // HDR_LF: the LF that ends a header line; the field is complete and checked.
-  private doHeaderLf(chunk: Bytes, i: usize): usize {
-    if (chunk.at(i).toInt() != 10) {
+  @Requires(this.state == S_HDR_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doHeaderLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
       this.fail(this.base + i, BareCr);
-      return i;
+      return;
     }
     this.commitHeader();
     if (this.state == S_ERROR) {
-      return i;
+      return;
     }
     this.go(S_HDR_LINE);
     this.lineLen = 0;
     this.lineStart = this.base + i + 1;
-    return i + 1;
+    this.cur = i + 1;
   }
 
   // The field (curName, curValue) is complete: apply the framing and Host rules, then store it.
@@ -2177,17 +2267,20 @@ class MessageParser {
 
   // HEAD_END_LF: the LF of the empty line. The end of the headers decides the framing; the end of the trailers
   // ends the message.
-  private doHeadEnd(chunk: Bytes, i: usize): usize {
-    if (chunk.at(i).toInt() != 10) {
+  @Requires(this.state == S_HEAD_END_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doHeadEnd(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
       this.fail(this.base + i, BareCr);
-      return i;
+      return;
     }
+    this.cur = i + 1;
     if (this.inTrailers) {
       this.go(S_DONE);
-      return i + 1;
+      return;
     }
     this.decideFraming(this.base + i - 1);
-    return i + 1;
   }
 
   // End of the header section at `at` (the CR of the empty line): apply the rules that need all the fields and pick
@@ -2251,9 +2344,13 @@ class MessageParser {
   }
 
   // ------------------------------------------------------------------------------------------------ body
+  // The body states take the cursor as an absolute index into the chunk (no window): they slice the chunk.
 
   // BODY: the next bytes of a Content-Length body: a slice of the chunk, no copy.
-  private doBody(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_BODY && this.cur < n && n <= chunk.length())
+  @Ensures(this.cur > old(this.cur))
+  private doBody(chunk: Bytes, n: usize): void {
+    const i = this.cur;
     const avail = n - i;
     const take = avail < this.remaining ? avail : this.remaining;
     this.parts.push(chunk.slice(i, i + take));
@@ -2262,168 +2359,31 @@ class MessageParser {
     if (this.remaining == 0) {
       this.go(S_DONE);
     }
-    return i + take;
+    this.cur = i + take;
   }
 
   // BODY_CLOSE: a response body that runs until the peer closes (`atEof`), within the body limit.
-  private doBodyClose(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_BODY_CLOSE && this.cur < n && n <= chunk.length())
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doBodyClose(chunk: Bytes, n: usize): void {
+    const i = this.cur;
     const room = this.maxBody - this.bodyLen;
     if (room == 0) {
-      this.fail(this.base + i, BodyTooLarge);
-      return i;
+      this.fail(this.base0 + i, BodyTooLarge);
+      return;
     }
     const avail = n - i;
     const take = avail < room ? avail : room;
     this.parts.push(chunk.slice(i, i + take));
     this.bodyLen += take;
-    return i + take;
-  }
-
-  // CHUNK_SIZE: hexadecimal digits of the chunk size, then (BWS) ";" extension or CR.
-  private doChunkSize(chunk: Bytes, i: usize, n: usize): usize {
-    const room = this.lineMax - this.lineLen;
-    const lim = (n - i) < room ? n : i + room;
-    const allowed = this.maxBody - this.bodyLen;
-    let sz = this.chunkSize;
-    let j = i;
-    while (j < lim) {
-      const hv = HTTP_HEXV.charCodeAt(chunk.at(j).toUsize());
-      if (hv > 15) {
-        break;
-      }
-      sz = sz * 16 + hv.toUsize();
-      if (sz > allowed) {
-        this.chunkSize = sz;
-        this.fail(this.base + j, BodyTooLarge);
-        return j;
-      }
-      j += 1;
-    }
-    this.chunkSize = sz;
-    this.chunkDigits += j - i;
-    this.lineLen += j - i;
-    if (j >= n) {
-      return j;
-    }
-    if (HTTP_HEXV.charCodeAt(chunk.at(j).toUsize()) <= 15) {
-      return j;
-    }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
-    if (this.chunkDigits == 0) {
-      this.fail(this.base + j, BadChunkSize);
-      return j;
-    }
-    if (c == C_CR) {
-      this.go(S_CHUNK_SIZE_LF);
-      return j + 1;
-    }
-    if (c == C_SEMI) {
-      if (!this.countOne(j)) {
-        return j;
-      }
-      this.go(S_CHUNK_EXT);
-      return j + 1;
-    }
-    if (c == C_SP || c == C_HTAB) {
-      if (!this.countOne(j)) {
-        return j;
-      }
-      this.go(S_CHUNK_BWS);
-      return j + 1;
-    }
-    if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
-    } else {
-      this.fail(this.base + j, BadChunkSize);
-    }
-    return j;
-  }
-
-  // CHUNK_BWS: blanks after the size, then ";" or CR.
-  private doChunkBws(chunk: Bytes, i: usize, n: usize): usize {
-    const room = this.lineMax - this.lineLen;
-    const lim = (n - i) < room ? n : i + room;
-    let j = i;
-    while (j < lim && isOws(chunk.at(j).toInt())) {
-      j += 1;
-    }
-    this.lineLen += j - i;
-    if (j >= n) {
-      return j;
-    }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
-    if (c == C_SP || c == C_HTAB) {
-      return j;
-    }
-    if (c == C_CR) {
-      this.go(S_CHUNK_SIZE_LF);
-      return j + 1;
-    }
-    if (c == C_SEMI) {
-      if (!this.countOne(j)) {
-        return j;
-      }
-      this.go(S_CHUNK_EXT);
-      return j + 1;
-    }
-    if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
-    } else {
-      this.fail(this.base + j, BadChunkSize);
-    }
-    return j;
-  }
-
-  // CHUNK_EXT: the chunk extension, ignored: a run of field bytes, then CR; control characters are refused.
-  private doChunkExt(chunk: Bytes, i: usize, n: usize): usize {
-    const room = this.lineMax - this.lineLen;
-    const lim = (n - i) < room ? n : i + room;
-    let j = i;
-    while (j < lim && HTTP_CLASS.charCodeAt(chunk.at(j).toUsize()) >= C_HTAB) {
-      j += 1;
-    }
-    this.lineLen += j - i;
-    if (j >= n) {
-      return j;
-    }
-    const c = HTTP_CLASS.charCodeAt(chunk.at(j).toUsize());
-    if (c >= C_HTAB) {
-      return j;
-    }
-    if (c == C_CR) {
-      this.go(S_CHUNK_SIZE_LF);
-      return j + 1;
-    }
-    if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
-    } else {
-      this.fail(this.base + j, BadChunkExtension);
-    }
-    return j;
-  }
-
-  // CHUNK_SIZE_LF: the LF of the chunk-size line. Size 0: the trailer section follows; else the chunk data.
-  private doChunkSizeLf(chunk: Bytes, i: usize): usize {
-    if (chunk.at(i).toInt() != 10) {
-      this.fail(this.base + i, BareCr);
-      return i;
-    }
-    if (this.chunkSize == 0) {
-      this.inTrailers = true;
-      this.sectionEnd = this.base + i + 1 + this.maxHead;
-      this.lineLen = 0;
-      this.lineMax = this.maxLine;
-      this.lineStart = this.base + i + 1;
-      this.go(S_HDR_LINE);
-      return i + 1;
-    }
-    this.remaining = this.chunkSize;
-    this.go(S_CHUNK_DATA);
-    return i + 1;
+    this.cur = i + take;
   }
 
   // CHUNK_DATA: the next bytes of the current chunk: a slice of the input.
-  private doChunkData(chunk: Bytes, i: usize, n: usize): usize {
+  @Requires(this.state == S_CHUNK_DATA && this.cur < n && n <= chunk.length())
+  @Ensures(this.cur > old(this.cur))
+  private doChunkData(chunk: Bytes, n: usize): void {
+    const i = this.cur;
     const avail = n - i;
     const take = avail < this.remaining ? avail : this.remaining;
     this.parts.push(chunk.slice(i, i + take));
@@ -2432,36 +2392,202 @@ class MessageParser {
     if (this.remaining == 0) {
       this.go(S_CHUNK_CR);
     }
-    return i + take;
+    this.cur = i + take;
+  }
+
+  // CHUNK_SIZE: hexadecimal digits of the chunk size, then (BWS) ";" extension or CR.
+  @Requires(this.state == S_CHUNK_SIZE && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkSize(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    const allowed = this.maxBody - this.bodyLen;
+    let sz = this.chunkSize;
+    let j = i;
+    while (j < lim) {
+      const hv = HTTP_HEXV.charCodeAt(xs[j].toUsize());
+      if (hv > 15) {
+        break;
+      }
+      sz = sz * 16 + hv.toUsize();
+      if (sz > allowed) {
+        this.chunkSize = sz;
+        this.cur = j;
+        this.fail(this.base + j, BodyTooLarge);
+        return;
+      }
+      j += 1;
+    }
+    this.chunkSize = sz;
+    this.chunkDigits += j - i;
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    if (HTTP_HEXV.charCodeAt(xs[j].toUsize()) <= 15) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (this.chunkDigits == 0) {
+      this.fail(this.base + j, BadChunkSize);
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_CHUNK_SIZE_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_SEMI || c == C_SP || c == C_HTAB) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, ChunkLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      this.go(c == C_SEMI ? S_CHUNK_EXT : S_CHUNK_BWS);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadChunkSize);
+    }
+  }
+
+  // CHUNK_BWS: blanks after the size, then ";" or CR.
+  @Requires(this.state == S_CHUNK_BWS && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkBws(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && isOws(xs[j].toInt())) {
+      j += 1;
+    }
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c == C_SP || c == C_HTAB) {
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_CHUNK_SIZE_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_SEMI) {
+      if (this.lineLen >= this.lineMax) {
+        this.fail(this.base + j, ChunkLineTooLong);
+        return;
+      }
+      this.lineLen += 1;
+      this.go(S_CHUNK_EXT);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadChunkSize);
+    }
+  }
+
+  // CHUNK_EXT: the chunk extension, ignored: a run of field bytes, then CR; control characters are refused.
+  @Requires(this.state == S_CHUNK_EXT && this.cur < n && n <= xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkExt(xs: u8[], n: usize): void {
+    const i = this.cur;
+    const room = this.lineMax - this.lineLen;
+    const lim = (n - i) < room ? n : i + room;
+    let j = i;
+    while (j < lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB) {
+      j += 1;
+    }
+    this.lineLen += j - i;
+    this.cur = j;
+    if (j >= n) {
+      return;
+    }
+    const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
+    if (c >= C_HTAB) {
+      return;
+    }
+    if (c == C_CR) {
+      this.go(S_CHUNK_SIZE_LF);
+      this.cur = j + 1;
+      return;
+    }
+    if (c == C_LF) {
+      this.fail(this.base + j, BareLf);
+    } else {
+      this.fail(this.base + j, BadChunkExtension);
+    }
+  }
+
+  // CHUNK_SIZE_LF: the LF of the chunk-size line. Size 0: the trailer section follows; else the chunk data.
+  // (The cursor is relative to the window here; the chunk data state that follows uses an absolute cursor, which
+  // `feed` recomputes from the window start.)
+  @Requires(this.state == S_CHUNK_SIZE_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkSizeLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
+      this.fail(this.base + i, BareCr);
+      return;
+    }
+    this.cur = i + 1;
+    if (this.chunkSize == 0) {
+      this.inTrailers = true;
+      this.sectionEnd = this.base + i + 1 + this.maxHead;
+      this.lineLen = 0;
+      this.lineMax = this.maxLine;
+      this.lineStart = this.base + i + 1;
+      this.go(S_HDR_LINE);
+      return;
+    }
+    this.remaining = this.chunkSize;
+    this.go(S_CHUNK_DATA);
   }
 
   // CHUNK_CR: the CR after the chunk data.
-  private doChunkCr(chunk: Bytes, i: usize): usize {
-    const c = chunk.at(i).toInt();
+  @Requires(this.state == S_CHUNK_CR && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkCr(xs: u8[]): void {
+    const i = this.cur;
+    const c = xs[i].toInt();
     if (c == 13) {
       this.go(S_CHUNK_LF);
-      return i + 1;
+      this.cur = i + 1;
+      return;
     }
     if (c == 10) {
       this.fail(this.base + i, BareLf);
     } else {
       this.fail(this.base + i, BadChunkTerminator);
     }
-    return i;
   }
 
   // CHUNK_LF: the LF after the chunk data; the next chunk-size line follows.
-  private doChunkLf(chunk: Bytes, i: usize): usize {
-    if (chunk.at(i).toInt() != 10) {
+  @Requires(this.state == S_CHUNK_LF && this.cur < xs.length)
+  @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
+  private doChunkLf(xs: u8[]): void {
+    const i = this.cur;
+    if (xs[i].toInt() != 10) {
       this.fail(this.base + i, BareCr);
-      return i;
+      return;
     }
     this.chunkSize = 0;
     this.chunkDigits = 0;
     this.lineLen = 0;
     this.lineMax = this.maxChunk;
     this.go(S_CHUNK_SIZE);
-    return i + 1;
+    this.cur = i + 1;
   }
 
   // ---------------------------------------------------------------------------------- the finished message
@@ -2476,13 +2602,18 @@ class MessageParser {
     if (this.parts.length == 1) {
       return this.parts[0];
     }
-    let out = new ByteBuilder();
+    let all: u8[] = [];
     let k: usize = 0;
     while (k < this.parts.length) {
-      out.appendBytes(this.parts[k]);
+      const a = this.parts[k].toArray();
+      let q: usize = 0;
+      while (q < a.length) {
+        all.push(a[q]);
+        q += 1;
+      }
       k += 1;
     }
-    return out.build();
+    return bytesFromArray(all);
   }
 
   // httpVersion(): the version of the start line.
@@ -2505,6 +2636,7 @@ class MessageParser {
       this.bodyBytes(), new Headers(this.tnames, this.tvals), this.forHead);
   }
 }
+
 
 // --------------------------------------------------------------------------------- public parser classes
 
@@ -2670,6 +2802,7 @@ export function parseResponseToEof(data: Bytes, limits: Limits, forHead: bool): 
   }
   return r;
 }
+
 
 
 // ------------------------------------------------------------------------------------------- serializer
