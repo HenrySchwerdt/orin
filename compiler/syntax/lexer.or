@@ -1,6 +1,6 @@
-// Lexer for Orin-B source text (docs/bootstrap-subset.md §1).
-// Produces a flat token array that always ends with one KEof token.
-// Errors are E0100 (lexical). Written in Orin-B: positions are `usize` byte offsets.
+// Lexer for Orin source text (docs/bootstrap-subset.md §1): class `Lexer`.
+// Produces a flat token array that always ends with one KEof token. The first lexical error stops the lexer;
+// errors are E0100. Positions are `usize` byte offsets.
 
 import { Span, Diagnostic, span, diag } from "../diag";
 
@@ -12,23 +12,59 @@ import { Span, Diagnostic, span, diag } from "../diag";
 // as a (negative) int. Template literals (ADR-0022) are lexed into KTplFull (`...` without interpolation), or
 // KTplHead (`...${), zero or more KTplMid (}...${), and KTplTail (}...`) with the expression tokens in between;
 // `text` is the cooked (unescaped) text of that chunk, the span covers the delimiters.
-export type TokKind = KIdent | KKeyword | KInt | KBigInt | KFloat | KStr | KPunct | KEof | KTplFull | KTplHead | KTplMid | KTplTail;
+export type TokKind =
+  KIdent
+  | KKeyword
+  | KInt
+  | KBigInt
+  | KFloat
+  | KStr
+  | KPunct
+  | KEof
+  | KTplFull
+  | KTplHead
+  | KTplMid
+  | KTplTail;
 
 // `text`: source spelling; for KStr and the template kinds the unescaped bytes. `value`: integer value for KInt /
 // KBigInt, else 0.
 export type Token = { kind: TokKind; text: string; span: Span; value: int; };
 
-type LexRes = { tok: Token; end: usize; };
-
 const INT_MAX: int = 9223372036854775807;
 
-@Requires(start <= end)
-function mkTok(kind: TokKind, text: string, file: usize, start: usize, end: usize, value: int): Token {
-  return Token { kind: kind, text: text, span: span(file, start, end), value: value };
+export function isEofTok(t: Token): bool {
+  return match (t.kind) {
+    KEof => true,
+    _ => false,
+  };
+}
+
+// The token stream of a source of `n` bytes in file `file` is well formed: every token lies in the source and in the
+// file, the tokens are in source order and do not overlap, only the last token is KEof and it is the empty span at
+// the end, every other token is non-empty. (The parser relies on the final KEof: it never reads past it.)
+export function tokensWellFormed(toks: Token[], file: usize, n: usize): bool {
+  if (toks.length == 0) {
+    return false;
+  }
+  const last = toks[toks.length - 1];
+  if (!isEofTok(last) || last.span.start != n || last.span.end != n) {
+    return false;
+  }
+  let prevEnd: usize = 0;
+  for (const t of toks) {
+    if (t.span.file != file || t.span.start < prevEnd || t.span.end > n) {
+      return false;
+    }
+    if (!isEofTok(t) && t.span.end <= t.span.start) {
+      return false;
+    }
+    prevEnd = t.span.end;
+  }
+  return toks.filter(t => isEofTok(t)).length == 1;
 }
 
 function isAlpha(c: int): bool {
-  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95;
+  return c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95;
 }
 
 function isDigit(c: int): bool {
@@ -36,6 +72,7 @@ function isDigit(c: int): bool {
 }
 
 // Value of a hex digit character, or -1.
+@Ensures(result >= -1 && result < 16)
 function hexVal(c: int): int {
   if (c >= 48 && c <= 57) {
     return c - 48;
@@ -49,69 +86,44 @@ function hexVal(c: int): int {
   return -1;
 }
 
-function isKeyword(s: string): bool {
-  return s == "const" || s == "let" || s == "function" || s == "return" || s == "if"
-    || s == "else" || s == "while" || s == "for" || s == "of" || s == "break"
-    || s == "continue" || s == "type" || s == "import" || s == "export" || s == "from"
-    || s == "match" || s == "true" || s == "false";
+export function isKeyword(s: string): bool {
+  return s == "const"
+      || s == "let"
+      || s == "function"
+      || s == "return"
+      || s == "if"
+      || s == "else"
+      || s == "while"
+      || s == "for"
+      || s == "of"
+      || s == "break"
+      || s == "continue"
+      || s == "type"
+      || s == "import"
+      || s == "export"
+      || s == "from"
+      || s == "match"
+      || s == "true"
+      || s == "false";
 }
 
 // Reserved words: lexed as keywords so they can never be identifiers.
-function isReserved(s: string): bool {
-  return s == "var" || s == "class" || s == "interface" || s == "enum" || s == "new"
-    || s == "this" || s == "null" || s == "undefined" || s == "async" || s == "await";
-}
-
-// Skip whitespace and comments starting at `start`; returns the next significant offset.
-function skipTrivia(file: usize, src: string, start: usize): Result<usize, Diagnostic> {
-  const n = src.length;
-  let i = start;
-  while (i < n) {
-    const c = src.charCodeAt(i);
-    if (c == 32 || c == 9 || c == 10 || c == 13) {
-      i += 1;
-    } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
-      i += 2;
-      while (i < n && src.charCodeAt(i) != 10) {
-        i += 1;
-      }
-    } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 42) {
-      const cstart = i;
-      i += 2;
-      let closed = false;
-      while (i < n && !closed) {
-        if (src.charCodeAt(i) == 42 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
-          closed = true;
-          i += 2;
-        } else {
-          i += 1;
-        }
-      }
-      if (!closed) {
-        return Err(diag("E0100", span(file, cstart, cstart + 2), "unterminated block comment"));
-      }
-    } else {
-      return Ok(i);
-    }
-  }
-  return Ok(i);
-}
-
-function lexIdent(file: usize, src: string, start: usize): LexRes {
-  const n = src.length;
-  let i = start + 1;
-  while (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
-    i += 1;
-  }
-  const text = src.substring(start, i);
-  let kind: TokKind = KIdent;
-  if (isKeyword(text) || isReserved(text)) {
-    kind = KKeyword;
-  }
-  return LexRes { tok: mkTok(kind, text, file, start, i, 0), end: i };
+export function isReserved(s: string): bool {
+  return s == "var"
+      || s == "class"
+      || s == "interface"
+      || s == "enum"
+      || s == "new"
+      || s == "this"
+      || s == "null"
+      || s == "undefined"
+      || s == "async"
+      || s == "await";
 }
 
 // Value of the digits src[a..b) in `base`, or -1 if it exceeds i64 max (no overflow trap).
+@Requires(a <= b && b <= src.length)
+@Ensures(result >= -1)
 function digitsValue(src: string, a: usize, b: usize, base: int): int {
   let v: int = 0;
   let i = a;
@@ -129,6 +141,8 @@ function digitsValue(src: string, a: usize, b: usize, base: int): int {
 // Value of the digits src[a..b) (at least one, base 10 or 16) when it lies in 2^63 .. 2^64-1, as the 64-bit
 // pattern (a negative int); None if it exceeds 2^64-1. The caller knows it exceeds i64 max. The last digit is
 // split off so that no intermediate overflows: value = 2 * (prefix * base/2) + d, pattern = value - 2^64.
+@Requires(a < b && b <= src.length && (base == 10 || base == 16))
+@Ensures(result.isNone() || result.unwrap() < 0)
 function bigDigitsValue(src: string, a: usize, b: usize, base: int): Option<int> {
   const prefix = digitsValue(src, a, b - 1, base);
   const half = base / 2;
@@ -140,137 +154,9 @@ function bigDigitsValue(src: string, a: usize, b: usize, base: int): Option<int>
   const y = x - INT_MAX - 1;
   const t = y + d;
   if (t > -1 - y) {
-    return None;   // 2*y + d would be >= 0, i.e. the literal exceeds 2^64-1
+    return None; // 2*y + d would be >= 0, i.e. the literal exceeds 2^64-1
   }
   return Some(y + t);
-}
-
-function lexNumber(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
-  const n = src.length;
-  let base: int = 10;
-  let i = start;
-  if (src.charCodeAt(start) == 48 && start + 1 < n && (src.charCodeAt(start + 1) == 120 || src.charCodeAt(start + 1) == 88)) {
-    base = 16;
-    i = start + 2;
-  }
-  const dstart = i;
-  if (base == 16) {
-    while (i < n && hexVal(src.charCodeAt(i)) >= 0) {
-      i += 1;
-    }
-  } else {
-    while (i < n && isDigit(src.charCodeAt(i))) {
-      i += 1;
-    }
-  }
-  if (i == dstart) {
-    return Err(diag("E0100", span(file, start, i), "hexadecimal literal has no digits"));
-  }
-  if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
-    return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
-  }
-  const v = digitsValue(src, dstart, i, base);
-  let big: Option<int> = None;
-  if (v < 0) {
-    big = bigDigitsValue(src, dstart, i, base);
-    if (big.isNone()) {
-      return Err(diag("E0100", span(file, start, i), "integer literal does not fit in 64 bits (the largest is 18446744073709551615)"));
-    }
-  }
-  if (base == 16 && i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
-    return Err(diag("E0100", span(file, start, i + 1), "hexadecimal float literals are not supported"));
-  }
-  if (big.isSome()) {
-    return Ok(LexRes { tok: mkTok(KBigInt, src.substring(start, i), file, start, i, big.unwrap()), end: i });
-  }
-  return Ok(LexRes { tok: mkTok(KInt, src.substring(start, i), file, start, i, v), end: i });
-}
-
-// Float literal (ADR-0018): `D+ . D+ [exp]` or `D+ exp` with exp = `(e|E) [+-]? D+`, starting at `start`
-// (the first digit). Returns None when the text at `start` is not a float literal (so it is an integer).
-function lexFloat(file: usize, src: string, start: usize): Result<Option<LexRes>, Diagnostic> {
-  const n = src.length;
-  let i = start;
-  while (i < n && isDigit(src.charCodeAt(i))) {
-    i += 1;
-  }
-  const intEnd = i;
-  let fracStart = i;
-  let fracEnd = i;
-  let hasFrac = false;
-  if (i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
-    hasFrac = true;
-    fracStart = i + 1;
-    i += 1;
-    while (i < n && isDigit(src.charCodeAt(i))) {
-      i += 1;
-    }
-    fracEnd = i;
-  }
-  let hasExp = false;
-  let expSign = "";
-  let expStart = i;
-  let expEnd = i;
-  if (i < n && (src.charCodeAt(i) == 101 || src.charCodeAt(i) == 69)) {
-    let j = i + 1;
-    let sg = "";
-    if (j < n && (src.charCodeAt(j) == 43 || src.charCodeAt(j) == 45)) {
-      sg = src.charAt(j);
-      j += 1;
-    }
-    if (j < n && isDigit(src.charCodeAt(j))) {
-      hasExp = true;
-      expSign = sg;
-      expStart = j;
-      while (j < n && isDigit(src.charCodeAt(j))) {
-        j += 1;
-      }
-      expEnd = j;
-      i = j;
-    }
-  }
-  if (!hasFrac && !hasExp) {
-    const none: Option<LexRes> = None;
-    return Ok(none);
-  }
-  if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
-    return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
-  }
-  // Range: decimal magnitude of the value must not exceed 308 (no float arithmetic here, so estimate
-  // from the number of significant integer digits and the exponent).
-  let intDigits: usize = 0;
-  let seenNonZero = false;
-  let k = start;
-  while (k < intEnd) {
-    if (src.charCodeAt(k) != 48) {
-      seenNonZero = true;
-    }
-    if (seenNonZero) {
-      intDigits += 1;
-    }
-    k += 1;
-  }
-  if (hasExp) {
-    if (expEnd - expStart > 4) {
-      return Err(diag("E0100", span(file, start, i), "float literal exponent out of range"));
-    }
-    const ev = digitsValue(src, expStart, expEnd, 10);
-    if (seenNonZero && expSign != "-" && intDigits.toInt() - 1 + ev > 308) {
-      return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
-    }
-  } else if (intDigits > 309) {
-    return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
-  }
-  let text = src.substring(start, intEnd) + ".";
-  if (hasFrac) {
-    text += src.substring(fracStart, fracEnd);
-  } else {
-    text += "0";
-  }
-  if (hasExp) {
-    text += "e" + expSign + src.substring(expStart, expEnd);
-  }
-  return Ok(Some(LexRes { tok: mkTok(KFloat, text, file, start, i, 0), end: i }));
 }
 
 // Character code for a simple escape letter (`n t r 0 \ " '`), or -1.
@@ -293,65 +179,21 @@ function simpleEscape(e: int): int {
   return -1;
 }
 
-// String literal starting at the opening quote. The token text is the unescaped content.
-function lexString(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
-  const n = src.length;
-  let parts: string[] = [];
-  let i = start + 1;
-  let run = i;
-  while (true) {
-    if (i >= n) {
-      return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
-    }
-    const c = src.charCodeAt(i);
-    if (c == 34) {
-      parts.push(src.substring(run, i));
-      i += 1;
-      break;
-    }
-    if (c == 10) {
-      return Err(diag("E0100", span(file, start, i), "unterminated string literal"));
-    }
-    if (c == 92) {
-      parts.push(src.substring(run, i));
-      if (i + 1 >= n) {
-        return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
-      }
-      const e = src.charCodeAt(i + 1);
-      let code = simpleEscape(e);
-      let adv: usize = 2;
-      if (e == 120) {
-        if (i + 3 >= n) {
-          return Err(diag("E0100", span(file, i, n), "invalid \\x escape"));
-        }
-        const h1 = hexVal(src.charCodeAt(i + 2));
-        const h2 = hexVal(src.charCodeAt(i + 3));
-        if (h1 < 0 || h2 < 0) {
-          return Err(diag("E0100", span(file, i, i + 4), "invalid \\x escape"));
-        }
-        code = h1 * 16 + h2;
-        adv = 4;
-      }
-      if (code < 0) {
-        return Err(diag("E0100", span(file, i, i + 2), "unknown escape sequence"));
-      }
-      parts.push(String.fromCharCode(code));
-      i += adv;
-      run = i;
-    } else {
-      i += 1;
-    }
-  }
-  return Ok(LexRes { tok: mkTok(KStr, parts.join(""), file, start, i, 0), end: i });
-}
-
 // One chunk of a template literal (ADR-0022), starting at `start` just after the opening backtick or the `}`
 // that closes an interpolation. Scans the cooked text up to the closing backtick (`ended`) or a `${`.
 // `open` is the offset of the delimiter that began the chunk (for error spans). Escapes: those of string
 // literals plus `\``, `\$`; a raw newline is kept (CRLF becomes LF); a `$` not followed by `{` is literal.
 type TplChunk = { text: string; end: usize; ended: bool; };
 
-function lexTemplateChunk(file: usize, src: string, open: usize, start: usize): Result<TplChunk, Diagnostic> {
+@Requires(open < start && start <= src.length)
+@Ensures(result.isOk() ==> result.unwrap().end > start && result.unwrap().end <= src.length)
+@Ensures(result.isErr() ==> result.unwrapErr().span.end <= src.length)
+function lexTemplateChunk(
+  file: usize,
+  src: string,
+  open: usize,
+  start: usize,
+): Result<TplChunk, Diagnostic> {
   const n = src.length;
   let parts: string[] = [];
   let i = start;
@@ -414,115 +256,466 @@ function isMemberBase(c: int): bool {
   return isAlpha(c) || isDigit(c) || c == 41 || c == 93;
 }
 
-function lexPunct(file: usize, src: string, start: usize): Result<LexRes, Diagnostic> {
-  const n = src.length;
-  const c = src.charCodeAt(start);
-  let c2: int = 0;
-  if (start + 1 < n) {
-    c2 = src.charCodeAt(start + 1);
-  }
-  const ch = src.charAt(start);
-  let len: usize = 0;
-  if (c == 46 && isDigit(c2) && !(start > 0 && isMemberBase(src.charCodeAt(start - 1)))) {
-    return Err(diag("E0100", span(file, start, start + 2), "a float literal needs a digit before the decimal point (write `0" + src.substring(start, start + 2) + "`)"));
-  }
-  if (c == 46 && c2 == 46) {
-    if (start + 2 < n && src.charCodeAt(start + 2) == 46) {
-      len = 3;
-    } else {
-      return Err(diag("E0100", span(file, start, start + 2), "unexpected `..`; did you mean `...`?"));
-    }
-  } else if (c == 61 && c2 == 61 && start + 2 < n && src.charCodeAt(start + 2) == 62) {
-    len = 3;   // `==>` (implication, contract expressions only: ADR-0012)
-  } else if (c2 == 61 && "=!+-*/%<>".includes(ch)) {
-    len = 2;
-  } else if ((c == 61 && c2 == 62) || (c == 38 && c2 == 38) || (c == 124 && c2 == 124)) {
-    len = 2;
-  } else if ("(){}[],;:.?=+-*/%<>!|&".includes(ch)) {
-    len = 1;
-  } else if (c == 64 && start + 1 < n && isAlpha(c2)) {
-    len = 1;   // `@Name`: contract clause / annotation (ADR-0012); a lone `@` stays a lexical error
-  } else {
-    if (c >= 128) {
-      return Err(diag("E0100", span(file, start, start + 1), "unexpected non-ASCII character"));
-    }
-    return Err(diag("E0100", span(file, start, start + 1), "unexpected character `" + ch + "`"));
-  }
-  const text = src.substring(start, start + len);
-  return Ok(LexRes { tok: mkTok(KPunct, text, file, start, start + len, 0), end: start + len });
-}
+// The lexer state: the source, the cursor `pos` and the tokens so far. `depth` holds the brace depth inside each open
+// `${ .. }` of a template literal (innermost last). The tokens are in source order and end at or before the cursor
+// (the full order / non-overlap property, `tokensWellFormed`, is the `@Ensures` of `run`).
+@Invariant(this.pos <= this.src.length)
+@Invariant(this.toks.length == 0 || this.toks[this.toks.length - 1].span.end <= this.pos)
+@Invariant(this.depth.every(d => d >= 0))
+@Invariant(!this.done || this.pos == this.src.length)
+export class Lexer {
+  private file: usize;
+  private src: string;
+  private pos: usize = 0;
+  private toks: Token[] = [];
+  private depth: int[] = [];
+  private done: bool = false;
 
-export function lex(file: usize, src: string): Result<Token[], Diagnostic> {
-  let toks: Token[] = [];
-  const n = src.length;
-  let i: usize = 0;
-  // brace depth inside each open `${ ... }` of a template literal (innermost last)
-  let depth: int[] = [];
-  while (true) {
-    i = skipTrivia(file, src, i)?;
+  constructor(file: usize, src: string) {
+    this.file = file;
+    this.src = src;
+  }
+
+  // The cursor: the offset of the next byte to lex.
+  position(): usize {
+    return this.pos;
+  }
+
+  // The tokens lexed so far (without the final KEof until `run` returns).
+  tokens(): Token[] {
+    return this.toks;
+  }
+
+  // True once only trivia was left: the cursor is at the end of the source and `run` appends KEof.
+  finished(): bool {
+    return this.done;
+  }
+
+  // Lexes the next token (after whitespace and comments): one token is added, it starts at or after the old cursor and
+  // ends at the new one, so the cursor advanced (progress: `run` terminates). When only trivia was left, no token is
+  // added, the cursor is at the end of the source and the lexer is `finished`.
+  @Requires(!this.done)
+  @Ensures(result.isOk() && !this.done
+      ==> this.pos > old(this.pos)
+          && this.toks.length == old(this.toks.length) + 1
+          && this.toks[this.toks.length - 1].span.start >= old(this.pos)
+          && this.toks[this.toks.length - 1].span.end == this.pos)
+  @Ensures(result.isOk() && this.done
+      ==> this.pos == this.src.length && this.toks.length == old(this.toks.length))
+  @Ensures(result.isErr()
+      ==> result.unwrapErr().code == "E0100" && result.unwrapErr().span.end <= this.src.length)
+  step(): Result<void, Diagnostic> {
+    this.pos = this.skipTrivia()?;
+    const src = this.src;
+    const n = src.length;
+    const i = this.pos;
     if (i >= n) {
-      break;
+      this.done = true;
+      return Ok();
     }
     const c = src.charCodeAt(i);
     if (isAlpha(c)) {
-      const r = lexIdent(file, src, i);
-      toks.push(r.tok);
-      i = r.end;
-      continue;
+      this.ident();
+      return Ok();
     }
     if (isDigit(c)) {
-      const isHex = c == 48 && i + 1 < n && (src.charCodeAt(i + 1) == 120 || src.charCodeAt(i + 1) == 88);
+      const isHex = c == 48
+          && i + 1 < n
+          && (src.charCodeAt(i + 1) == 120 || src.charCodeAt(i + 1) == 88);
       if (!isHex) {
-        const fr = lexFloat(file, src, i)?;
-        if (fr.isSome()) {
-          const f = fr.unwrap();
-          toks.push(f.tok);
-          i = f.end;
-          continue;
+        const isFloat = this.float()?;
+        if (isFloat) {
+          return Ok();
         }
       }
-      const r = lexNumber(file, src, i)?;
-      toks.push(r.tok);
-      i = r.end;
-      continue;
+      return this.number();
     }
     if (c == 34) {
-      const r = lexString(file, src, i)?;
-      toks.push(r.tok);
-      i = r.end;
-      continue;
+      return this.string();
     }
     if (c == 96) {
-      const ch = lexTemplateChunk(file, src, i, i + 1)?;
-      toks.push(mkTok(ch.ended ? KTplFull : KTplHead, ch.text, file, i, ch.end, 0));
+      const ch = lexTemplateChunk(this.file, src, i, i + 1)?;
+      this.emit(ch.ended ? KTplFull : KTplHead, ch.text, i, ch.end, 0);
       if (!ch.ended) {
-        depth.push(0);
+        this.depth.push(0);
       }
-      i = ch.end;
-      continue;
+      return Ok();
     }
-    if (c == 123 && depth.length > 0) {
-      depth[depth.length - 1] += 1;
+    const open = this.depth.length;
+    if (c == 123 && open > 0) {
+      this.depth[open - 1] += 1;
     }
-    if (c == 125 && depth.length > 0) {
-      if (depth[depth.length - 1] == 0) {
-        const ch = lexTemplateChunk(file, src, i, i + 1)?;
-        toks.push(mkTok(ch.ended ? KTplTail : KTplMid, ch.text, file, i, ch.end, 0));
+    if (c == 125 && open > 0) {
+      if (this.depth[open - 1] == 0) {
+        const ch = lexTemplateChunk(this.file, src, i, i + 1)?;
+        this.emit(ch.ended ? KTplTail : KTplMid, ch.text, i, ch.end, 0);
         if (ch.ended) {
-          depth.pop();
+          this.depth.pop();
         }
-        i = ch.end;
-        continue;
+        return Ok();
       }
-      depth[depth.length - 1] -= 1;
+      this.depth[open - 1] -= 1;
     }
-    const r = lexPunct(file, src, i)?;
-    toks.push(r.tok);
-    i = r.end;
+    return this.punct();
   }
-  if (depth.length > 0) {
-    return Err(diag("E0100", span(file, n, n), "unterminated template literal interpolation (missing `}`)"));
+
+  // The whole token stream: lexes to the end, checks that every template interpolation was closed and appends KEof.
+  @Requires(this.pos == 0 && this.toks.length == 0 && !this.done)
+  @Ensures(result.isOk() ==> tokensWellFormed(result.unwrap(), this.file, this.src.length))
+  @Ensures(result.isErr()
+      ==> result.unwrapErr().code == "E0100" && result.unwrapErr().span.end <= this.src.length)
+  run(): Result<Token[], Diagnostic> {
+    while (!this.done) {
+      this.step()?;
+    }
+    const n = this.src.length;
+    if (this.depth.length > 0) {
+      return Err(
+        diag(
+          "E0100",
+          span(this.file, n, n),
+          "unterminated template literal interpolation (missing `}`)",
+        ),
+      );
+    }
+    this.emit(KEof, "", n, n, 0);
+    return Ok(this.toks);
   }
-  toks.push(mkTok(KEof, "", file, n, n, 0));
-  return Ok(toks);
+
+  // Appends a token for src[start..end) and moves the cursor to its end.
+  @Requires(start >= this.pos && start <= end && end <= this.src.length)
+  @Ensures(this.pos == end && this.toks.length == old(this.toks.length) + 1)
+  private emit(kind: TokKind, text: string, start: usize, end: usize, value: int): void {
+    this.toks.push(Token {
+      kind: kind,
+      text: text,
+      span: span(this.file, start, end),
+      value: value,
+    });
+    this.pos = end;
+  }
+
+  // The next significant offset at or after the cursor (whitespace and comments skipped).
+  @Ensures(result.isOk() ==> result.unwrap() >= this.pos && result.unwrap() <= this.src.length)
+  private skipTrivia(): Result<usize, Diagnostic> {
+    const src = this.src;
+    const n = src.length;
+    let i = this.pos;
+    while (i < n) {
+      const c = src.charCodeAt(i);
+      if (c == 32 || c == 9 || c == 10 || c == 13) {
+        i += 1;
+      } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
+        i += 2;
+        while (i < n && src.charCodeAt(i) != 10) {
+          i += 1;
+        }
+      } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 42) {
+        const cstart = i;
+        i += 2;
+        let closed = false;
+        while (i < n && !closed) {
+          if (src.charCodeAt(i) == 42 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
+            closed = true;
+            i += 2;
+          } else {
+            i += 1;
+          }
+        }
+        if (!closed) {
+          return Err(
+            diag("E0100", span(this.file, cstart, cstart + 2), "unterminated block comment"),
+          );
+        }
+      } else {
+        return Ok(i);
+      }
+    }
+    return Ok(i);
+  }
+
+  // Identifier or keyword at the cursor (an alphabetic character).
+  private ident(): void {
+    const src = this.src;
+    const n = src.length;
+    const start = this.pos;
+    let i = start + 1;
+    while (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
+      i += 1;
+    }
+    const text = src.substring(start, i);
+    let kind: TokKind = KIdent;
+    if (isKeyword(text) || isReserved(text)) {
+      kind = KKeyword;
+    }
+    this.emit(kind, text, start, i, 0);
+  }
+
+  // Integer literal at the cursor (decimal or `0x` hexadecimal).
+  private number(): Result<void, Diagnostic> {
+    const src = this.src;
+    const file = this.file;
+    const n = src.length;
+    const start = this.pos;
+    let base: int = 10;
+    let i = start;
+    if (src.charCodeAt(start) == 48
+        && start + 1 < n
+        && (src.charCodeAt(start + 1) == 120 || src.charCodeAt(start + 1) == 88)) {
+      base = 16;
+      i = start + 2;
+    }
+    const dstart = i;
+    if (base == 16) {
+      while (i < n && hexVal(src.charCodeAt(i)) >= 0) {
+        i += 1;
+      }
+    } else {
+      while (i < n && isDigit(src.charCodeAt(i))) {
+        i += 1;
+      }
+    }
+    if (i == dstart) {
+      return Err(diag("E0100", span(file, start, i), "hexadecimal literal has no digits"));
+    }
+    if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
+      return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+    }
+    const v = digitsValue(src, dstart, i, base);
+    let big: Option<int> = None;
+    if (v < 0) {
+      big = bigDigitsValue(src, dstart, i, base);
+      if (big.isNone()) {
+        return Err(
+          diag(
+            "E0100",
+            span(file, start, i),
+            "integer literal does not fit in 64 bits (the largest is 18446744073709551615)",
+          ),
+        );
+      }
+    }
+    if (base == 16 && i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
+      return Err(
+        diag("E0100", span(file, start, i + 1), "hexadecimal float literals are not supported"),
+      );
+    }
+    if (big.isSome()) {
+      this.emit(KBigInt, src.substring(start, i), start, i, big.unwrap());
+    } else {
+      this.emit(KInt, src.substring(start, i), start, i, v);
+    }
+    return Ok();
+  }
+
+  // Float literal (ADR-0018) at the cursor (a digit): `D+ . D+ [exp]` or `D+ exp` with exp = `(e|E) [+-]? D+`.
+  // Ok(false), and nothing consumed, when the text is not a float literal (so it is an integer).
+  @Ensures(result.isOk() && !result.unwrap()
+      ==> this.pos == old(this.pos) && this.toks.length == old(this.toks.length))
+  @Ensures(result.isOk() && result.unwrap() ==> this.pos > old(this.pos))
+  private float(): Result<bool, Diagnostic> {
+    const src = this.src;
+    const file = this.file;
+    const n = src.length;
+    const start = this.pos;
+    let i = start;
+    while (i < n && isDigit(src.charCodeAt(i))) {
+      i += 1;
+    }
+    const intEnd = i;
+    let fracStart = i;
+    let fracEnd = i;
+    let hasFrac = false;
+    if (i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
+      hasFrac = true;
+      fracStart = i + 1;
+      i += 1;
+      while (i < n && isDigit(src.charCodeAt(i))) {
+        i += 1;
+      }
+      fracEnd = i;
+    }
+    let hasExp = false;
+    let expSign = "";
+    let expStart = i;
+    let expEnd = i;
+    if (i < n && (src.charCodeAt(i) == 101 || src.charCodeAt(i) == 69)) {
+      let j = i + 1;
+      let sg = "";
+      if (j < n && (src.charCodeAt(j) == 43 || src.charCodeAt(j) == 45)) {
+        sg = src.charAt(j);
+        j += 1;
+      }
+      if (j < n && isDigit(src.charCodeAt(j))) {
+        hasExp = true;
+        expSign = sg;
+        expStart = j;
+        while (j < n && isDigit(src.charCodeAt(j))) {
+          j += 1;
+        }
+        expEnd = j;
+        i = j;
+      }
+    }
+    if (!hasFrac && !hasExp) {
+      return Ok(false);
+    }
+    if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
+      return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+    }
+    // Range: decimal magnitude of the value must not exceed 308 (no float arithmetic here, so estimate
+    // from the number of significant integer digits and the exponent).
+    let intDigits: usize = 0;
+    let seenNonZero = false;
+    let k = start;
+    while (k < intEnd) {
+      if (src.charCodeAt(k) != 48) {
+        seenNonZero = true;
+      }
+      if (seenNonZero) {
+        intDigits += 1;
+      }
+      k += 1;
+    }
+    if (hasExp) {
+      if (expEnd - expStart > 4) {
+        return Err(diag("E0100", span(file, start, i), "float literal exponent out of range"));
+      }
+      const ev = digitsValue(src, expStart, expEnd, 10);
+      if (seenNonZero && expSign != "-" && intDigits.toInt() - 1 + ev > 308) {
+        return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+      }
+    } else if (intDigits > 309) {
+      return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+    }
+    let text = src.substring(start, intEnd) + ".";
+    if (hasFrac) {
+      text += src.substring(fracStart, fracEnd);
+    } else {
+      text += "0";
+    }
+    if (hasExp) {
+      text += "e" + expSign + src.substring(expStart, expEnd);
+    }
+    this.emit(KFloat, text, start, i, 0);
+    return Ok(true);
+  }
+
+  // String literal at the cursor (the opening quote). The token text is the unescaped content.
+  private string(): Result<void, Diagnostic> {
+    const src = this.src;
+    const file = this.file;
+    const n = src.length;
+    const start = this.pos;
+    let parts: string[] = [];
+    let i = start + 1;
+    let run = i;
+    while (true) {
+      if (i >= n) {
+        return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
+      }
+      const c = src.charCodeAt(i);
+      if (c == 34) {
+        parts.push(src.substring(run, i));
+        i += 1;
+        break;
+      }
+      if (c == 10) {
+        return Err(diag("E0100", span(file, start, i), "unterminated string literal"));
+      }
+      if (c == 92) {
+        parts.push(src.substring(run, i));
+        if (i + 1 >= n) {
+          return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
+        }
+        const e = src.charCodeAt(i + 1);
+        let code = simpleEscape(e);
+        let adv: usize = 2;
+        if (e == 120) {
+          if (i + 3 >= n) {
+            return Err(diag("E0100", span(file, i, n), "invalid \\x escape"));
+          }
+          const h1 = hexVal(src.charCodeAt(i + 2));
+          const h2 = hexVal(src.charCodeAt(i + 3));
+          if (h1 < 0 || h2 < 0) {
+            return Err(diag("E0100", span(file, i, i + 4), "invalid \\x escape"));
+          }
+          code = h1 * 16 + h2;
+          adv = 4;
+        }
+        if (code < 0) {
+          return Err(diag("E0100", span(file, i, i + 2), "unknown escape sequence"));
+        }
+        parts.push(String.fromCharCode(code));
+        i += adv;
+        run = i;
+      } else {
+        i += 1;
+      }
+    }
+    this.emit(KStr, parts.join(""), start, i, 0);
+    return Ok();
+  }
+
+  // Punctuation at the cursor (longest match), or the lexical error for a character that starts no token.
+  private punct(): Result<void, Diagnostic> {
+    const src = this.src;
+    const file = this.file;
+    const n = src.length;
+    const start = this.pos;
+    const c = src.charCodeAt(start);
+    let c2: int = 0;
+    if (start + 1 < n) {
+      c2 = src.charCodeAt(start + 1);
+    }
+    const ch = src.charAt(start);
+    let len: usize = 0;
+    if (c == 46 && isDigit(c2) && !(start > 0 && isMemberBase(src.charCodeAt(start - 1)))) {
+      return Err(
+        diag(
+          "E0100",
+          span(file, start, start + 2),
+          "a float literal needs a digit before the decimal point (write `0"
+              + src.substring(start, start + 2) + "`)",
+        ),
+      );
+    }
+    if (c == 46 && c2 == 46) {
+      if (start + 2 < n && src.charCodeAt(start + 2) == 46) {
+        len = 3;
+      } else {
+        return Err(
+          diag("E0100", span(file, start, start + 2), "unexpected `..`; did you mean `...`?"),
+        );
+      }
+    } else if (c == 61 && c2 == 61 && start + 2 < n && src.charCodeAt(start + 2) == 62) {
+      len = 3; // `==>` (implication, contract expressions only: ADR-0012)
+    } else if (c2 == 61 && "=!+-*/%<>".includes(ch)) {
+      len = 2;
+    } else if (c == 61 && c2 == 62 || c == 38 && c2 == 38 || c == 124 && c2 == 124) {
+      len = 2;
+    } else if ("(){}[],;:.?=+-*/%<>!|&".includes(ch)) {
+      len = 1;
+    } else if (c == 64 && start + 1 < n && isAlpha(c2)) {
+      len = 1; // `@Name`: contract clause / annotation (ADR-0012); a lone `@` stays a lexical error
+    } else {
+      if (c >= 128) {
+        return Err(diag("E0100", span(file, start, start + 1), "unexpected non-ASCII character"));
+      }
+      return Err(diag("E0100", span(file, start, start + 1), "unexpected character `" + ch + "`"));
+    }
+    this.emit(KPunct, src.substring(start, start + len), start, start + len, 0);
+    return Ok();
+  }
+}
+
+// The tokens of `src` (file `file`), ending with KEof; or the first lexical error (E0100), whose span lies in the source.
+@Ensures(result.isOk() ==> tokensWellFormed(result.unwrap(), file, src.length))
+@Ensures(result.isErr()
+    ==> result.unwrapErr().code == "E0100"
+        && result.unwrapErr().span.file == file
+        && result.unwrapErr().span.end <= src.length)
+export function lex(file: usize, src: string): Result<Token[], Diagnostic> {
+  let lx = new Lexer(file, src);
+  return lx.run();
 }
