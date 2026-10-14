@@ -199,3 +199,5 @@ verifier and added to the Lean model (ADR-0032):
   - array and numeric code 1.0–1.2x of C;
   - strings and maps 1.1–1.3x;
   - object-heavy code 1.2–1.5x.
+
+<!-- Future performance addendum: proof-guided memory representations, alias/escape analysis, stack/region/unboxing, safe RC/COW fallback, packed buffers, and benchmark gates. -->
