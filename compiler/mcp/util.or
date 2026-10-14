@@ -97,11 +97,7 @@ export function newState(root: string, allowExec: bool, repo: string): McpSessio
 // ---- JSON helpers -----------------------------------------------------------------------
 
 export function jstrs(xs: string[]): Json {
-  let out: Json[] = [];
-  for (const x of xs) {
-    out.push(JStr(x));
-  }
-  return JArr(out);
+  return JArr(xs.map(x => JStr(x)));
 }
 
 export function jtext(j: Json): string {
@@ -110,6 +106,9 @@ export function jtext(j: Json): string {
 
 // ---- hashing -----------------------------------------------------------------------------
 
+// A 31-bit polynomial hash; stays in [0, 2^31 - 1) when it starts there.
+@Requires(h0 >= 0 && h0 < 2147483647)
+@Ensures(result >= 0 && result < 2147483647)
 export function hashStr(h0: int, s: string): int {
   let h = h0;
   let i: usize = 0;
@@ -127,6 +126,8 @@ function hexDigit(n: int): string {
   return String.fromCharCode(87 + n);
 }
 
+@Requires(h0 >= 0)
+@Ensures(result.length == 8)
 export function hex8(h0: int): string {
   let h = h0;
   let out = "";
@@ -170,11 +171,14 @@ export function checkAllInside(st: McpSession, a: Analysis): Option<string> {
   return None;
 }
 
-// Single-quote a string for /bin/sh.
+// Single-quote a string for /bin/sh: the result is one word that holds `s` (every `'` is closed, escaped and reopened).
+@Ensures(result.startsWith("'") && result.endsWith("'") && result.length >= s.length + 2)
 export function shq(s: string): string {
   return "'" + s.split("'").join("'\\''") + "'";
 }
 
+@Ensures(s.length <= n ==> result == s)
+@Ensures(s.length > n ==> result.startsWith(s.substring(0, n)) && result.endsWith(" bytes]"))
 export function trunc(s: string, n: usize): string {
   if (s.length <= n) {
     return s;
@@ -213,7 +217,9 @@ export function detailedJson(d: DiagView): Json {
   return JObj(fs);
 }
 
-// Views of diagnostics (over source map `sm`), with occurrence-disambiguated stable ids.
+// Views of diagnostics (over source map `sm`), with occurrence-disambiguated stable ids; positions are 1-based.
+@Ensures(result.length == ds.length)
+@Ensures(result.every(v => v.line >= 1 && v.col >= 1 && v.id.length == 8))
 export function viewsOf(st: McpSession, sm: SourceMap, ds: PathDiag[]): DiagView[] {
   let out: DiagView[] = [];
   let seen: string[] = [];
@@ -246,15 +252,13 @@ export function viewsOf(st: McpSession, sm: SourceMap, ds: PathDiag[]): DiagView
 }
 
 // Raw compiler diagnostics (build path) as PathDiags over `sm`.
+@Requires(ds.every(d => d.span.file < sm.files.length))
+@Ensures(result.length == ds.length)
 export function toPathDiags(sm: SourceMap, ds: Diagnostic[]): PathDiag[] {
-  let out: PathDiag[] = [];
-  for (const d of ds) {
-    out.push(PathDiag {
-      path: sm.files[d.span.file].path, code: d.code, message: d.message,
-      start: d.span.start, end: d.span.end, notes: d.notes
-    });
-  }
-  return out;
+  return ds.map(d => PathDiag {
+    path: sm.files[d.span.file].path, code: d.code, message: d.message,
+    start: d.span.start, end: d.span.end, notes: d.notes
+  });
 }
 
 // Fingerprint of everything the analysis read (paths + contents).

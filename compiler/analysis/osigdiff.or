@@ -4,7 +4,7 @@
 // explaining path. Absence of an edge is never proof of absence: calls through function values are
 // MAY/UNKNOWN edges and a function reachable only that way may be missing from an impact list.
 
-import { OsigGraph, ONode, OEdge, OSpan, sortOrder } from "./osig";
+import { OsigGraph, ONode, OEdge, OSpan, sortOrder, hashGraph } from "./osig";
 import { cmpStr } from "./modgraph";
 
 export type SymChange = { id: string; kind: string; aspects: string[]; before: string; after: string; node: ONode; };
@@ -110,6 +110,9 @@ function indexOf(g: OsigGraph): Ix {
 }
 
 // First position in sorted `keys` that is >= k.
+@Ensures(result <= keys.length)
+@Ensures(result < keys.length ==> cmpStr(keys[result], k) >= 0)
+@Ensures(result > 0 ==> cmpStr(keys[result - 1], k) < 0)
 function lowerBound(keys: string[], k: string): usize {
   let lo: usize = 0;
   let hi: usize = keys.length;
@@ -124,6 +127,7 @@ function lowerBound(keys: string[], k: string): usize {
   return lo;
 }
 
+@Ensures(result.isSome() ==> result.unwrap() < ix.ids.length && ix.ids[result.unwrap()] == id)
 function findNode(ix: Ix, id: string): Option<usize> {
   const p = lowerBound(ix.ids, id);
   if (p < ix.ids.length && ix.ids[p] == id) {
@@ -301,31 +305,13 @@ function targetsOf(ix: Ix, id: string): string[] {
   return out;
 }
 
+// Same length and every element of `a` occurs in `b` (the call targets of a renamed function, compared as sets).
 function sameSet(a: string[], b: string[]): bool {
-  if (a.length != b.length) {
-    return false;
-  }
-  for (const x of a) {
-    let found = false;
-    for (const y of b) {
-      if (x == y) {
-        found = true;
-      }
-    }
-    if (!found) {
-      return false;
-    }
-  }
-  return true;
+  return a.length == b.length && a.every(x => b.includes(x));
 }
 
 function hasId(ns: ONode[], id: string): bool {
-  for (const n of ns) {
-    if (n.id == id) {
-      return true;
-    }
-  }
-  return false;
+  return ns.some(n => n.id == id);
 }
 
 // Renames / moves among the removed and added symbols: same kind, same signature modulo the name, and the
@@ -377,14 +363,7 @@ function findRenames(bx: Ix, hx: Ix, removed: ONode[], added: ONode[]): Rename[]
 }
 
 function cacheIndex(keys: string[], id: string): Option<usize> {
-  let i: usize = 0;
-  while (i < keys.length) {
-    if (keys[i] == id) {
-      return Some(i);
-    }
-    i += 1;
-  }
-  return None;
+  return keys.indexOf(id);
 }
 
 function edgeKeyOf(e: OEdge): string {
@@ -589,6 +568,8 @@ function diffEffects(bx: Ix, hx: Ix, truncated0: bool): EffectsDiff {
 
 type EffectsDiff = { changes: EffectChange[]; modules: ModuleEffectChange[]; truncated: bool; };
 
+// Two snapshots with the same content (hash) have no differences: the report is a function of the content only.
+@Ensures(base.hash == head.hash && base.hash == hashGraph(base) && head.hash == hashGraph(head) ==> !hasDifferences(result))
 export function diffOsig(base: OsigGraph, head: OsigGraph): OsigDiff {
   const bx = indexOf(base);
   const hx = indexOf(head);

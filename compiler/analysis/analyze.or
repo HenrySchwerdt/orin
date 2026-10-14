@@ -16,6 +16,7 @@ import { FsGrant } from "std:fs";
 import { Module, Item, parse } from "../syntax";
 import { Diagnostic, SourceMap, SourceFile } from "../diag";
 import { LoadedProgram, loadWithOverlay, normalizePath } from "../loader";
+import { isCharBoundary } from "./pos";
 import { checkWithIndex, deprecationWarnings, qualityWarnings, strictContracts } from "../check";
 import { SemanticIndex } from "../hir";
 import { Workspace } from "./workspace";
@@ -41,6 +42,13 @@ export type Analysis = {
   // checking failed (see check/index.or).
   index: Option<SemanticIndex>;
 };
+
+// Every diagnostic names a file of `sm` and a range inside its text (what the editor has: for the entry, the text
+// without the synthetic `main`), so converting it to a position never clamps.
+export function diagsInRange(sm: SourceMap, ds: PathDiag[]): bool {
+  return ds.every(d => d.start <= d.end
+    && sm.files.some(f => f.path == d.path && d.end <= f.text.length));
+}
 
 // True: the checker produces a SemanticIndex (`checkWithIndex`), so the LSP advertises
 // definition/hover/references/rename.
@@ -108,6 +116,8 @@ function prepare(ws: Workspace, entry: string, entryText: Option<string>): Prepa
   return Prepared { files: files, origLen: origLen, origText: origText };
 }
 
+@Ensures(result.length <= ds.length)
+@Ensures(origLen < 0 ==> result.length == ds.length)
 function convert(sm: SourceMap, ds: Diagnostic[], origLen: int): PathDiag[] {
   let out: PathDiag[] = [];
   for (const d of ds) {
@@ -130,6 +140,9 @@ function convert(sm: SourceMap, ds: Diagnostic[], origLen: int): PathDiag[] {
   return out;
 }
 
+@Ensures(result.entry == normalizePath(entryPath) && result.revision == ws.revision())
+@Ensures(result.program.isSome() == result.index.isSome())
+@Ensures(diagsInRange(result.sm, result.diags) && diagsInRange(result.sm, result.warnings))
 export function analyze(fs: FsGrant, ws: Workspace, entryPath: string): Analysis {
   const entry = normalizePath(entryPath);
   // Entry text comes from the overlay; when absent the loader reads the disk and no synthetic
@@ -163,26 +176,15 @@ export function analyze(fs: FsGrant, ws: Workspace, entryPath: string): Analysis
 }
 
 // Diagnostics located in `path` (normalized comparison).
+@Ensures(result.every(d => d.path == normalizePath(path)) && result.length <= a.diags.length)
 export function diagsForPath(a: Analysis, path: string): PathDiag[] {
   const p = normalizePath(path);
-  let out: PathDiag[] = [];
-  for (const d of a.diags) {
-    if (d.path == p) {
-      out.push(d);
-    }
-  }
-  return out;
+  return a.diags.filter(d => d.path == p);
 }
 
 // Index of `path` in the analysis SourceMap (the `file` of its spans), if it was read.
+@Ensures(result.isSome() ==> result.unwrap() < a.sm.files.length && a.sm.files[result.unwrap()].path == normalizePath(path))
 export function fileIndexOf(a: Analysis, path: string): Option<usize> {
   const p = normalizePath(path);
-  let i: usize = 0;
-  while (i < a.sm.files.length) {
-    if (a.sm.files[i].path == p) {
-      return Some(i);
-    }
-    i += 1;
-  }
-  return None;
+  return a.sm.files.findIndex(f => f.path == p);
 }

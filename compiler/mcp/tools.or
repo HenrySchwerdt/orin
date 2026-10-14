@@ -265,12 +265,7 @@ function analyzeEntry(fs: FsGrant, st: McpSession, entryRel: string): Result<Ana
 // ---- check ---------------------------------------------------------------------------------
 
 function indexIn(keys: string[], k: string): bool {
-  for (const x of keys) {
-    if (x == k) {
-      return true;
-    }
-  }
-  return false;
+  return keys.includes(k);
 }
 
 function view(d: DiagView, detailed: bool): Json {
@@ -678,6 +673,50 @@ function inspectPosition(st: McpSession, a: Analysis, idx: SemanticIndex, file: 
 
 // ---- edit ----------------------------------------------------------------------------------
 
+// The edits lie inside the text and do not overlap (one occurrence is never edited twice).
+function editsDisjoint(text: string, es: TextEdit[]): bool {
+  let i: usize = 0;
+  while (i < es.length) {
+    const a = es[i].span;
+    if (a.start > a.end || a.end > text.length) {
+      return false;
+    }
+    let j: usize = 0;
+    while (j < i) {
+      const b = es[j].span;
+      if (a.start < b.end && b.start < a.end || a.start == b.start) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The length of `text` after the edits: every replaced range changes the length by its new text minus its width.
+function editedLength(text: string, es: TextEdit[]): usize {
+  let n = text.length;
+  for (const e of es) {
+    n = n + e.newText.length - (e.span.end - e.span.start);
+  }
+  return n;
+}
+
+function startsDescending(es: TextEdit[]): bool {
+  let i: usize = 1;
+  while (i < es.length) {
+    if (es[i - 1].span.start < es[i].span.start) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The edits, last position first (so that applying one does not move the ranges of the others).
+@Ensures(result.length == es.length)
+@Ensures(startsDescending(result))
 function sortDesc(es: TextEdit[]): TextEdit[] {
   let out = es;
   let i: usize = 1;
@@ -694,6 +733,8 @@ function sortDesc(es: TextEdit[]): TextEdit[] {
   return out;
 }
 
+@Requires(editsDisjoint(text, es))
+@Ensures(result.length == editedLength(text, es))
 function applyEdits(text: string, es: TextEdit[]): string {
   let t = text;
   for (const e of sortDesc(es)) {
