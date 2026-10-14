@@ -390,6 +390,14 @@ static inline uint32_t orin_tag(const OrinObj *o) { return o->tag; }
 static inline OrinObj *orin_none(void) { return orin_nullary(1); }
 static inline OrinObj *orin_ok_void(void) { return orin_nullary(0); }
 uint64_t orin_opt_unwrap(OrinObj *o);
+/* Unboxed Option / Result (ADR-0038 step 1, docs/mir.md v2.2): `word` when `tag` is the expected one, else the trap of
+   the boxed builtin. what: 0 = Option.unwrap (tag 0), 1 = Result.unwrap (tag 0), 2 = Result.unwrapErr (tag 1). */
+uint64_t orin_v_unwrap(uint64_t tag, uint64_t word, int64_t what);
+/* `pop` into an unboxed Option<T>: out[0] = 0 and out[1] = the element, or out[0] = 1 (None) and out[1] = 0 when the
+   array is empty. The Option holds a scalar only: an element of a reference array is released (the Option is never
+   read as a reference; the optimiser unboxes only Options whose payload is read as a scalar or not at all). */
+void orin_array_pop_v(OrinObj *a, uint64_t *out);
+
 uint64_t orin_res_unwrap(OrinObj *o);
 uint64_t orin_res_unwrap_err(OrinObj *o);
 

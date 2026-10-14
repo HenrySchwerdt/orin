@@ -8,6 +8,13 @@
 
 #include "orin_runtime.h"
 
+/* Unboxed aggregates (docs/mir.md v2.2, ADR-0038 step 1): an Option / Result / record / pair of scalars held by value in
+   n + 1 words (w[0] the tag, w[1..n] the payload), passed and returned by value; no heap object, no reference count. */
+typedef struct { uint64_t w[1]; } OrinV0;
+typedef struct { uint64_t w[2]; } OrinV1;
+typedef struct { uint64_t w[3]; } OrinV2;
+typedef struct { uint64_t w[4]; } OrinV3;
+
 /* Take the slot's value out (the slot becomes empty/NULL until put back). Object must be unique. */
 static inline uint64_t orin_mir_struct_take(OrinObj *o, uint32_t i) {
     uint64_t *p = orin_struct_slot_ptr(o, i);

@@ -1,0 +1,554 @@
+// Unit tests of unboxing (ADR-0038 step 1, docs/mir.md v2.2): the eligibility rule of `opt/unbox.or` on hand-built MIR
+// (what is unboxed, what stays boxed and why), the verifier's rules for `MAgg` values, both backends' code for them, the
+// pair rewrite of `opt/pairs.or` when the record's release is in another block, and `optimize` end to end on programs
+// checked from source. Run: `orin test compiler/tests/unbox_test.or --runtime runtime`; `orin test` checks contracts at
+// run time, so the `@Requires` / `@Ensures` / `@Invariant` of the pass (`unboxKept`, `unboxedOk`, the web invariants) run
+// on every call below.
+
+import { Host, useFs } from "std:host";
+import { FsGrant } from "std:fs";
+import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
+import { SourceFile } from "../diag";
+import { BOptUnwrapOr, BOptIsSome, BArrLength, OpGt, OpAdd } from "../hir";
+import {
+  MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, MVTable, SwitchCase, plainBlock,
+  isAggTy, aggWords,
+} from "../mir";
+import { loadWithOverlay } from "../loader";
+import { check } from "../check";
+import { lower } from "../lower";
+import { verify } from "../verify";
+import {
+  optimize, unboxValues, unboxKept, unboxedOk, sameOrUnboxed, isWordTy, Unboxing, closureTargets,
+  pairReturns, pairsKept, progWellFormed, sameFunctions,
+} from "../opt";
+import { emitCFunction, cSymbols, emitC } from "../cemit";
+import { emitLlvmFunction, llvmSymbols, emitLlvm } from "../llvm";
+
+// ---------------------------------------------------------------- builders
+
+function lr(n: string): MLocal {
+  return MLocal { name: n, ty: MRef };
+}
+
+function li(n: string): MLocal {
+  return MLocal { name: n, ty: MInt };
+}
+
+function lf(n: string): MLocal {
+  return MLocal { name: n, ty: MFloat };
+}
+
+function la(n: string, w: usize): MLocal {
+  return MLocal { name: n, ty: MAgg(w) };
+}
+
+function bk(instrs: Instr[], term: Terminator): MBlock {
+  return plainBlock(instrs, term);
+}
+
+function fnP(name: string, params: usize, locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
+  let owned: bool[] = [];
+  let i: usize = 0;
+  while (i < params) {
+    owned.push(false);
+    i += 1;
+  }
+  return MFunction {
+    name: name,
+    paramCount: params,
+    paramOwned: owned,
+    inout: false,
+    locals: locals,
+    ret: ret,
+    blocks: blocks,
+  };
+}
+
+function prog(fs: MFunction[]): MProgram {
+  return MProgram { functions: fs, strings: ["s"], main: 0, vtables: [], inlineFns: [] };
+}
+
+function errorsOf(p: MProgram): usize {
+  return verify(p).errors.length;
+}
+
+function noPins(p: MProgram): bool[] {
+  return p.functions.map(f => false);
+}
+
+function aggW(t: MType): usize {
+  return isAggTy(t) ? aggWords(t) : 99;
+}
+
+function releases(f: MFunction): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IRelease(_) => {
+          n += 1;
+        },
+        _ => {},
+      }
+    }
+  }
+  return n;
+}
+
+function structNews(f: MFunction): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IStructNew(_, _, _) => {
+          n += 1;
+        },
+        _ => {},
+      }
+    }
+  }
+  return n;
+}
+
+// `find(x)`: Some(x + 1) when x > 0, else None (function 1); main (function 0) matches it at once.
+function optionProgram(): MProgram {
+  const find = fnP(
+    "find",
+    1,
+    [li("x"), lr("r"), li("y"), MLocal { name: "c", ty: MBool }],
+    MRef,
+    [
+      bk([IBinary(3, OpGt, OLocal(0), OInt(0))], TBranch(OLocal(3), 1, 2)),
+      bk([IBinary(2, OpAdd, OLocal(0), OInt(1)), IStructNew(1, 0, [OLocal(2)])], TReturn(Some(OLocal(1)))),
+      bk([INullary(1, 1)], TReturn(Some(OLocal(1)))),
+    ],
+  );
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("o"), li("t"), li("v"), lr("m")],
+    MVoid,
+    [
+      bk(
+        [ICall(Some(0), 1, [OInt(4)]), IMove(3, 0), ITag(1, OLocal(3))],
+        TSwitch(OLocal(1), [SwitchCase { value: 0, target: 1 }], 2),
+      ),
+      bk([IGetField(2, OLocal(3), 0), IRelease(3)], TReturn(None)),
+      bk([IRelease(3)], TReturn(None)),
+    ],
+  );
+  return prog([mainF, find]);
+}
+
+// ---------------------------------------------------------------- the eligibility rule
+
+@Test
+function anOptionOfAScalarReturnedAndMatchedIsUnboxed(): void {
+  const p = optionProgram();
+  assertEqUsize(errorsOf(p), 0, "the boxed program verifies");
+  const q = unboxValues(p, noPins(p));
+  assert(unboxKept(p, q, noPins(p)), "unboxKept");
+  assertEqUsize(aggW(q.functions[1].ret), 1, "find returns an agg1 (tag + one word)");
+  assertEqUsize(aggW(q.functions[0].locals[0].ty), 1, "the call result is an agg1");
+  assertEqUsize(aggW(q.functions[0].locals[3].ty), 1, "and the local it is moved to");
+  assertEqUsize(releases(q.functions[0]), 0, "an unboxed value is never released");
+  assert(
+    match (q.functions[0].blocks[0].instrs[1]) {
+      ICopy(d, o) => d == 3,
+      _ => false,
+    },
+    "the move became a copy",
+  );
+  assertEqUsize(errorsOf(q), 0, "the verifier accepts the unboxed program");
+  assertEqUsize(verify(q).warnings.length, 0, "no leak: an aggregate owns nothing");
+}
+
+@Test
+function aValueStoredOnTheHeapStaysBoxed(): void {
+  // main stores the Option it got from find into an array: the whole web (and find's result) stays a reference
+  const p0 = optionProgram();
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("o"), lr("arr")],
+    MVoid,
+    [bk([ICall(Some(0), 1, [OInt(4)]), IArrayNew(1, true, [OLocal(0)]), IRelease(1)], TReturn(None))],
+  );
+  const p = prog([mainF, p0.functions[1]]);
+  assertEqUsize(errorsOf(p), 0, "verifies");
+  const q = unboxValues(p, noPins(p));
+  assert(match (q.functions[1].ret) { MRef => true, _ => false }, "find keeps its reference result");
+  assert(match (q.functions[0].locals[0].ty) { MRef => true, _ => false }, "the stored local stays boxed");
+}
+
+@Test
+function pinnedFunctionsAndMainKeepTheirSignature(): void {
+  const p = optionProgram();
+  let pins = noPins(p);
+  pins[1] = true; // find is (say) a closure target
+  const q = unboxValues(p, pins);
+  assert(unboxKept(p, q, pins), "unboxKept with a pinned function");
+  assert(match (q.functions[1].ret) { MRef => true, _ => false }, "a pinned function keeps its result type");
+  assert(match (q.functions[0].locals[0].ty) { MRef => true, _ => false }, "so its callers keep a reference");
+}
+
+@Test
+function aNestedRecordInAnOptionIsFlattenedWithWordOffsets(): void {
+  // pop(): Some(Entry { priority, value }) or None; main reads e.1 (the value) of the entry
+  const pop = fnP(
+    "pop",
+    1,
+    [li("x"), lr("e"), lr("r"), MLocal { name: "c", ty: MBool }],
+    MRef,
+    [
+      bk([IBinary(3, OpGt, OLocal(0), OInt(0))], TBranch(OLocal(3), 1, 2)),
+      bk([IStructNew(1, 0, [OLocal(0), OInt(7)]), IStructNew(2, 0, [OLocal(1)])], TReturn(Some(OLocal(2)))),
+      bk([INullary(2, 1)], TReturn(Some(OLocal(2)))),
+    ],
+  );
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("o"), li("t"), lr("e"), li("v")],
+    MVoid,
+    [
+      bk([ICall(Some(0), 1, [OInt(4)]), ITag(1, OLocal(0))], TSwitch(OLocal(1), [SwitchCase { value: 0, target: 1 }], 2)),
+      bk([IGetField(2, OLocal(0), 0), IGetField(3, OLocal(2), 1), IRelease(0)], TReturn(None)),
+      bk([IRelease(0)], TReturn(None)),
+    ],
+  );
+  const p = prog([mainF, pop]);
+  assertEqUsize(errorsOf(p), 0, "verifies boxed");
+  const q = unboxValues(p, noPins(p));
+  assertEqUsize(aggW(q.functions[1].ret), 3, "Option<Entry>: tag + (entry tag + 2 words)");
+  assertEqUsize(aggW(q.functions[1].locals[1].ty), 2, "the entry itself: an agg2");
+  assertEqUsize(aggW(q.functions[0].locals[2].ty), 2, "the entry read out of the Option");
+  assert(
+    match (q.functions[0].blocks[1].instrs[1]) {
+      IGetField(_, _, k) => k == 1,
+      _ => false,
+    },
+    "a scalar slot after none nested keeps its index as word offset",
+  );
+  assertEqUsize(errorsOf(q), 0, "the verifier accepts nested aggregates");
+}
+
+@Test
+function aRecursiveTypeStaysBoxed(): void {
+  // List = Nil | Cons(int, List): a cons holding a cons
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("nil"), lr("a"), lr("b"), li("h")],
+    MVoid,
+    [
+      bk(
+        [
+          INullary(0, 0),
+          IStructNew(1, 1, [OInt(1), OLocal(0)]),
+          IStructNew(2, 1, [OInt(2), OLocal(1)]),
+          IGetField(3, OLocal(2), 0),
+          IRelease(2),
+        ],
+        TReturn(None),
+      ),
+    ],
+  );
+  const p = prog([mainF]);
+  assertEqUsize(errorsOf(p), 0, "verifies");
+  const q = unboxValues(p, noPins(p));
+  assert(q.functions[0].locals.every(l => !isAggTy(l.ty)), "nothing of a recursive web is unboxed");
+}
+
+@Test
+function aSlotThatIsAScalarInOneVariantAndNestedInAnotherStaysBoxed(): void {
+  // Lit(int) and Neg(Expr): slot 0 is a word in one variant, a nested value in the other
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("lit"), lr("neg"), lr("x")],
+    MVoid,
+    [bk([IStructNew(0, 0, [OInt(4)]), IStructNew(1, 1, [OLocal(0)]), IMove(2, 1), IRelease(2)], TReturn(None))],
+  );
+  const p = prog([mainF]);
+  const q = unboxValues(p, noPins(p));
+  // lit and neg are separate webs here (no unification of lit with neg's slot), so this checks the conflict only when
+  // the two meet: build them into one web through a common local
+  assertEqUsize(errorsOf(q), 0, "whatever is decided verifies");
+  const mainG = fnP(
+    "main",
+    0,
+    [lr("lit"), lr("neg"), lr("x"), lr("y")],
+    MVoid,
+    [
+      bk(
+        [
+          IStructNew(0, 0, [OInt(4)]),
+          IStructNew(3, 0, [OInt(5)]),
+          IStructNew(1, 1, [OLocal(0)]),
+          IMove(2, 1),
+          IRelease(2),
+        ],
+        TBranch(OBool(true), 1, 2),
+      ),
+      bk([IMove(2, 3)], TGoto(3)),
+      bk([IStructNew(2, 1, [OInt(6)])], TGoto(3)),
+      bk([IRelease(2)], TReturn(None)),
+    ],
+  );
+  const r = prog([mainG]);
+  assertEqUsize(errorsOf(r), 0, "verifies boxed");
+  const s = unboxValues(r, noPins(r));
+  assert(match (s.functions[0].locals[2].ty) { MRef => true, _ => false }, "the conflicting web stays boxed");
+  assert(match (s.functions[0].locals[0].ty) { MRef => true, _ => false }, "and the value nested in it");
+  assertEqUsize(errorsOf(s), 0, "verifies");
+}
+
+@Test
+function aPoppedOptionOfAScalarIsUnboxed(): void {
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("xs"), lr("o"), li("v")],
+    MVoid,
+    [
+      bk(
+        [
+          IArrayNew(0, false, [OInt(1), OInt(2)]),
+          IArrayPop(1, 0),
+          IBuiltin(Some(2), BOptUnwrapOr, [OLocal(1), OInt(0)]),
+          IRelease(1),
+          IRelease(0),
+        ],
+        TReturn(None),
+      ),
+    ],
+  );
+  const p = prog([mainF]);
+  assertEqUsize(errorsOf(p), 0, "verifies boxed");
+  const q = unboxValues(p, noPins(p));
+  assertEqUsize(aggW(q.functions[0].locals[1].ty), 1, "pop into an agg1");
+  assertEqUsize(releases(q.functions[0]), 1, "only the array is released");
+  assertEqUsize(errorsOf(q), 0, "verifies unboxed");
+}
+
+@Test
+function theWebsUnifySlotsOfUnifiedValues(): void {
+  const p = optionProgram();
+  let u = new Unboxing(p, noPins(p));
+  assertEqUsize(u.size(), 5 + 5, "one node per local and one per result");
+  u.union(0, 3);
+  assertEqUsize(u.find(0), u.find(3), "united");
+  const a = u.slotField(0, 0);
+  const b = u.slotField(3, 0);
+  assertEqUsize(u.find(a), u.find(b), "the same slot of one web is one node");
+  assert(isWordTy(MFloat) && !isWordTy(MRef) && !isWordTy(MAgg(1)), "words are plain scalars");
+  assert(sameOrUnboxed(MRef, MAgg(2)) && !sameOrUnboxed(MInt, MAgg(1)), "only references are unboxed");
+}
+
+// ---------------------------------------------------------------- the verifier's rules for aggregates
+
+@Test
+function theVerifierTreatsAnAggregateAsAScalar(): void {
+  // a borrowed agg parameter can be copied, read, passed on and returned: no ownership state
+  const g = fnP(
+    "g",
+    1,
+    [la("p", 1), la("q", 1), li("t"), li("w")],
+    MAgg(1),
+    [bk([ICopy(1, OLocal(0)), ITag(2, OLocal(1)), IGetField(3, OLocal(1), 0)], TReturn(Some(OLocal(0))))],
+  );
+  const mainF = fnP(
+    "main",
+    0,
+    [la("a", 1), la("b", 1), MLocal { name: "s", ty: MBool }],
+    MVoid,
+    [
+      bk(
+        [
+          IStructNew(0, 0, [OInt(3)]),
+          ICall(Some(1), 1, [OLocal(0)]),
+          ICall(Some(1), 1, [OLocal(0)]),
+          IBuiltin(Some(2), BOptIsSome, [OLocal(1)]),
+        ],
+        TReturn(None),
+      ),
+    ],
+  );
+  const p = prog([mainF, g]);
+  assertEqUsize(errorsOf(p), 0, "copies and repeated uses of an aggregate are free");
+}
+
+function rejects(locals: MLocal[], instrs: Instr[], what: string): void {
+  const p = prog([fnP("main", 0, locals, MVoid, [bk(instrs, TReturn(None))])]);
+  assert(errorsOf(p) > 0, what);
+}
+
+@Test
+function theVerifierRejectsOwnershipAndHeapUsesOfAggregates(): void {
+  rejects([la("a", 1)], [IStructNew(0, 0, [OInt(1)]), IRelease(0)], "an aggregate is never released");
+  rejects([la("a", 1), la("b", 1)], [IStructNew(0, 0, [OInt(1)]), IDup(1, OLocal(0))], "nor duplicated");
+  rejects([la("a", 1), lr("s")], [ICopy(1, OStr(0)), IStructNew(0, 0, [OLocal(1)])], "its slots are no references");
+  rejects([la("a", 1)], [IStructNew(0, 0, [OInt(1), OInt(2)])], "its slots fit into its words");
+  rejects([la("a", 1), li("x")], [IStructNew(0, 0, [OInt(1)]), IGetField(1, OLocal(0), 1)], "reads stay inside it");
+  rejects(
+    [la("a", 1), lr("arr")],
+    [IStructNew(0, 0, [OInt(1)]), IArrayNew(1, false, [OLocal(0)])],
+    "it is never an array element",
+  );
+  rejects(
+    [la("a", 1), lr("r")],
+    [IStructNew(0, 0, [OInt(1)]), IStructNew(1, 0, [OLocal(0)])],
+    "nor the slot of a heap object",
+  );
+  rejects([la("a", 1), la("b", 2)], [IStructNew(0, 0, [OInt(1)]), ICopy(1, OLocal(0))], "copies keep the width");
+  rejects(
+    [la("a", 1), li("n")],
+    [IStructNew(0, 0, [OInt(1)]), IBuiltin(Some(1), BArrLength, [OLocal(0)])],
+    "only the Option / Result builtins read it",
+  );
+  rejects([la("a", 4)], [INullary(0, 1)], "at most four words");
+}
+
+// ---------------------------------------------------------------- both backends
+
+@Test
+function bothBackendsPassAggregatesByValue(): void {
+  const g = fnP(
+    "g",
+    1,
+    [la("p", 2), lf("x"), la("r", 2)],
+    MAgg(2),
+    [bk([IGetField(1, OLocal(0), 1), IStructNew(2, 0, [OInt(1), OLocal(1)])], TReturn(Some(OLocal(2))))],
+  );
+  const mainF = fnP(
+    "main",
+    0,
+    [la("a", 2), la("b", 2), li("t")],
+    MVoid,
+    [bk([INullary(0, 1), ICall(Some(1), 1, [OLocal(0)]), ITag(2, OLocal(1))], TReturn(None))],
+  );
+  const p = prog([mainF, g]);
+  assertEqUsize(errorsOf(p), 0, "verifies");
+  const c = emitCFunction(cSymbols(p), p, 1);
+  assert(c.startsWith("OrinV2 "), "C: the result is the struct OrinV2");
+  assert(c.includes("OrinV2 l0"), "C: the parameter is passed by value");
+  assert(c.includes("orin_s2f(l0.w[2])"), "C: a float word is read by bit pattern");
+  assert(c.includes("(OrinV2){{0, ((uint64_t)(1)), orin_f2s(l1)}}"), "C: built as a compound literal, tag first");
+  const m = emitCFunction(cSymbols(p), p, 0);
+  assert(m.includes("OrinV2 l0 = {{0}};"), "C: aggregates start zeroed");
+  assert(m.includes("(int64_t)l1.w[0]"), "C: the tag is word 0");
+  const ll = emitLlvmFunction(llvmSymbols(p), p, 1);
+  assert(ll.includes("define internal noundef [3 x i64] @"), "LLVM: returned as [3 x i64]");
+  assert(ll.includes("[3 x i64] noundef %p0"), "LLVM: passed as [3 x i64]");
+  assert(ll.includes("extractvalue [3 x i64]"), "LLVM: words are extracted");
+  assert(ll.includes("insertvalue [3 x i64] zeroinitializer, i64 0, 0"), "LLVM: built from zero, tag first");
+  assert(!c.includes("orin_struct_new") && !ll.includes("orin_struct_new"), "no heap object anywhere");
+  // the whole units, with their contracts (declared symbols only)
+  assert(emitC(p).includes("OrinV2"), "the C unit");
+  assert(emitLlvm(p).includes("[3 x i64]"), "the LLVM module");
+}
+
+// ---------------------------------------------------------------- pairs: the release in another block
+
+@Test
+function aPairReleasedInAnotherBlockIsNotRebuilt(): void {
+  // put(m, k) -> {m, bool}: main moves the record to another local, takes the receiver out with getfield + dup, branches
+  // on the bool and releases the record after the join (the `if (m.put(..))` shape of bench/sortedmap)
+  const put = MFunction {
+    name: "put",
+    paramCount: 2,
+    paramOwned: [true, false],
+    inout: false,
+    locals: [lr("m"), li("k"), MLocal { name: "b", ty: MBool }, lr("r")],
+    ret: MRef,
+    blocks: [bk([IBinary(2, OpGt, OLocal(1), OInt(0)), IStructNew(3, 0, [OLocal(0), OLocal(2)])], TReturn(Some(OLocal(3))))],
+  };
+  const mainF = fnP(
+    "main",
+    0,
+    [lr("m"), lr("d"), lr("rec"), lr("t"), lr("m2"), MLocal { name: "b", ty: MBool }, lr("x")],
+    MVoid,
+    [
+      bk(
+        [
+          IArrayNew(0, false, []),
+          IMove(6, 0),
+          ICall(Some(1), 1, [OLocal(6), OInt(3)]),
+          IMove(2, 1),
+          IGetField(3, OLocal(2), 0),
+          IDup(4, OLocal(3)),
+          IGetField(5, OLocal(2), 1),
+        ],
+        TBranch(OLocal(5), 1, 2),
+      ),
+      bk([], TGoto(2)),
+      bk([IRelease(2), IRelease(4)], TReturn(None)),
+    ],
+  );
+  const p = prog([mainF, put]);
+  assertEqUsize(errorsOf(p), 0, "the boxed program verifies");
+  const pins = closureTargets(p);
+  const q = pairReturns(p, pins);
+  assert(pairsKept(p, q, pins), "pairsKept");
+  assert(q.functions[1].inout, "put became in/out");
+  assertEqUsize(structNews(q.functions[0]), 0, "the record is not rebuilt at the call");
+  assertEqUsize(releases(q.functions[0]), 1, "the record's release in the other block is gone");
+  assertEqUsize(errorsOf(q), 0, "the verifier accepts the rewrite");
+}
+
+// ---------------------------------------------------------------- end to end
+
+function optimized(fs: FsGrant, text: string): Option<MProgram> {
+  const o = loadWithOverlay(fs, "/virt/u.or", [SourceFile { path: "/virt/u.or", text: text }]);
+  return match (o.program) {
+    Some(p) => {
+      const r = check(p, o.sm);
+      return r.isOk() ? Some(lower(r.unwrap())) : None;
+    },
+    None => None,
+  };
+}
+
+function sourceProgram(): string {
+  return "type P = { x: int; y: float; };\n"
+      + "function find(xs: int[], v: int): Option<usize> {\n  let i: usize = 0;\n  while (i < xs.length) {\n"
+      + "    if (xs[i] == v) {\n      return Some(i);\n    }\n    i += 1;\n  }\n  return None;\n}\n"
+      + "function div(a: int, b: int): Result<int, string> {\n  if (b == 0) {\n    return Err(\"zero\");\n  }\n"
+      + "  return Ok(a / b);\n}\n"
+      + "function mk(a: int): P {\n  return P { x: a, y: 1.5 };\n}\n"
+      + "function main(): void {\n  const xs = [3, 4, 5];\n  match (find(xs, 4)) {\n"
+      + "    Some(i) => { console.log(i.toString()); },\n    None => {},\n  }\n"
+      + "  const p = mk(2);\n  console.log((p.y * 2.0).toString());\n"
+      + "  console.log(find(xs, 9).unwrapOr(7).toString());\n"
+      + "  const d = div(1, 0);\n  if (d.isErr()) {\n    console.log(\"err\");\n  }\n}\n";
+}
+
+function fnNamed(p: MProgram, suffix: string): MFunction {
+  return p.functions.find(f => f.name.endsWith(suffix)).unwrap();
+}
+
+@Test
+function optimizeUnboxesOptionsResultsAndRecordsOfScalars(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const m = optimized(fs, sourceProgram());
+      assert(m.isSome(), "checks and lowers");
+      const p = m.unwrap();
+      const q = optimize(p);
+      assert(sameFunctions(p, q) && progWellFormed(q), "the same functions, well formed");
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      assertEqUsize(aggW(fnNamed(q, ".find").ret), 1, "Option<usize> is unboxed");
+      assertEqUsize(aggW(fnNamed(q, ".mk").ret), 2, "a record of two scalars is unboxed");
+      assert(
+        match (fnNamed(q, ".div").ret) { MRef => true, _ => false },
+        "Result<int, string> holds a reference: boxed",
+      );
+      const c = emitC(q);
+      assert(c.includes("OrinV1 ") && c.includes("OrinV2 "), "the C unit uses the aggregate structs");
+      assert(emitLlvm(q).includes("[2 x i64]"), "and the LLVM module the aggregate arrays");
+    },
+  );
+}

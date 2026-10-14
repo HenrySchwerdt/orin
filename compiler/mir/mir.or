@@ -18,7 +18,76 @@ import { Span } from "../diag";
 // (whose first argument is the authorising handle), passed as a call argument, and closed by
 // `IBuiltin(.., BFileClose | BGrantRevoke, [h])` exactly once on every path; it is never copied, moved, stored, returned,
 // compared or captured (compiler/verify, docs/mir.md "Resource handles").
-export type MType = MInt | MUsize | MBool | MFloat | MHandle | MRef | MVoid;
+//
+// MAgg(n) (v2.2, ADR-0038 step 1, unboxing): an UNBOXED aggregate of n + 1 64-bit words held by value: word 0 is the tag,
+// words 1..n the payload. It is a value without identity (an Option / Result / record / pair of scalars), so it has no
+// heap object, no header and no reference count; for the verifier it is a scalar (`Init`, copying it is free). It is
+// produced only by the optimiser (compiler/opt/unbox.or) and only these instructions take one:
+//   IStructNew(d: MAgg(n), tag, slots)  d = { tag, the slots' words in order (a scalar slot is one word, an MAgg(m) slot
+//                                       its m + 1 words), zeros up to n }; no slot is a reference or a handle
+//   INullary(d: MAgg(n), tag)           d = { tag, zeros }
+//   ITag(d, o: MAgg(n))                 d = word 0
+//   IGetField(d, o: MAgg(n), k)         k is a WORD offset into the payload: a scalar d reads word k + 1, an MAgg(m) d
+//                                       the words k + 1 .. k + m + 1
+//   ICopy(d, o) of the same MAgg(n)     a copy of all words
+//   calls (arguments, results), TReturn, and the Option / Result builtins (`isSome` .. `unwrapOr`) on argument 0;
+//   IArrayPop(d: MAgg(1), arr)          the popped element as { 0, word } or { 1, 0 } (None); a reference element is
+//                                       released by the runtime
+// In C an MAgg(n) is the struct `OrinV<n>` (`uint64_t w[n + 1]`), in LLVM the array `[n+1 x i64]`; both pass and return
+// it by value. 1 <= n + 1 <= 4 (`aggWordsOk`).
+export type MType = MInt | MUsize | MBool | MFloat | MHandle | MRef | MVoid | MAgg(usize);
+
+// The largest payload of an unboxed aggregate: with the tag at most four words (ADR-0038 addendum, "Unboxing").
+export const AGG_MAX: usize = 3;
+
+// The payload word count of an aggregate type (0 for every other type).
+export function aggWords(t: MType): usize {
+  return match (t) {
+    MAgg(n) => n,
+    _ => 0,
+  };
+}
+
+// The builtins that read an Option / Result: the only ones an aggregate may be passed to (as argument 0).
+export function readsVariant(b: Builtin): bool {
+  return match (b) {
+    BOptIsSome => true,
+    BOptIsNone => true,
+    BOptUnwrap => true,
+    BOptUnwrapOr => true,
+    BResIsOk => true,
+    BResIsErr => true,
+    BResUnwrap => true,
+    BResUnwrapErr => true,
+    _ => false,
+  };
+}
+
+// The Option / Result builtins that read the payload word (the others read only the tag).
+export function readsPayload(b: Builtin): bool {
+  return match (b) {
+    BOptUnwrap => true,
+    BOptUnwrapOr => true,
+    BResUnwrap => true,
+    BResUnwrapErr => true,
+    _ => false,
+  };
+}
+
+export function isAggTy(t: MType): bool {
+  return match (t) {
+    MAgg(_) => true,
+    _ => false,
+  };
+}
+
+// The words a value of type `t` occupies inside an aggregate: 1 for a scalar, n + 1 for an MAgg(n).
+export function slotWords(t: MType): usize {
+  return match (t) {
+    MAgg(n) => n + 1,
+    _ => 1,
+  };
+}
 
 // A local slot. Parameters are the first `paramCount` locals; a borrowed parameter is Borrowed for
 // the whole function and must never be released, moved or mutated; an owned parameter starts Owned.

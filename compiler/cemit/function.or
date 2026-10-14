@@ -6,8 +6,10 @@
 
 import { BinOp, UnOp, Builtin, taskOpC } from "../hir";
 import {
-  MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram,
+  MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, aggWords,
+  isAggTy, slotWords,
 } from "../mir";
+
 import {
   u, isRefT, isUsizeT, isFloatT, cty, fromSlot, toSlot, commentSafe, cString, intCode, refMask,
 } from "./text";
@@ -265,7 +267,38 @@ export function targetsBelow(t: Terminator, n: usize): bool {
   };
 }
 
+// ---------------------------------------------------------------- unboxed aggregates (docs/mir.md v2.2)
+
+// Word `k` of the aggregate held by local `l` (word 0 is the tag).
+export function aggWordC(l: usize, k: usize): string {
+  return lname(l) + ".w[" + u(k) + "]";
+}
+
+// The `what` code of `orin_v_unwrap` for an unwrapping builtin (the trap message of the boxed builtin).
+function unwrapWhat(b: Builtin): string {
+  return match (b) {
+    BResUnwrap => "1",
+    BResUnwrapErr => "2",
+    _ => "0",
+  };
+}
+
+// C expression of an Option / Result builtin whose argument 0 is the aggregate local `l` (`a1` the C text of argument 1,
+// the default of `unwrapOr`); `rt` is the type of the destination (a plain scalar, or MVoid).
+export function aggBuiltinC(b: Builtin, l: usize, a1: string, rt: MType): string {
+  const tag = aggWordC(l, 0);
+  return match (b) {
+    BOptIsSome => "(" + tag + " == 0)",
+    BResIsOk => "(" + tag + " == 0)",
+    BOptIsNone => "(" + tag + " == 1)",
+    BResIsErr => "(" + tag + " == 1)",
+    BOptUnwrapOr => "(" + tag + " == 0 ? " + fromSlot(rt, aggWordC(l, 1)) + " : " + a1 + ")",
+    _ => fromSlot(rt, "orin_v_unwrap(" + tag + ", " + aggWordC(l, 1) + ", " + unwrapWhat(b) + ")"),
+  };
+}
+
 // ---------------------------------------------------------------- the emitter
+
 
 // The function being emitted is one of the program and one of the symbol table; its parameters are declared locals.
 @Invariant(this.fi < this.prog.functions.length && this.syms.count() == this.prog.functions.length)
@@ -304,7 +337,71 @@ export class CFunctionEmitter {
     return toSlot(this.opTy(o), opC(o));
   }
 
+  // The local operand `o` names, when it holds an unboxed aggregate.
+  private aggLocal(o: Operand): Option<usize> {
+    return match (o) {
+      OLocal(l) => isAggTy(this.ty(l)) ? Some(l) : None,
+      _ => None,
+    };
+  }
+
+  // The C words a slot operand contributes to an aggregate: one for a scalar, all words of an aggregate.
+  private wordsOf(o: Operand): string[] {
+    match (this.aggLocal(o)) {
+      Some(l) => {
+        let out: string[] = [];
+        let k: usize = 0;
+        while (k < slotWords(this.ty(l))) {
+          out.push(aggWordC(l, k));
+          k += 1;
+        }
+        return out;
+      },
+      None => {},
+    }
+    return [this.slotOf(o)];
+  }
+
+  // `d = (OrinV<n>){{ tag, words.. }}` (the rest of the words zero).
+  private aggNew(d: usize, tag: usize, slots: Operand[]): string {
+    let ws: string[] = [u(tag)];
+    for (const o of slots) {
+      ws = ws.concat(this.wordsOf(o));
+    }
+    return lname(d) + " = (" + cty(this.ty(d)) + "){{" + ws.join(", ") + "}};";
+  }
+
+  // `d = o.slot` where `o` is the aggregate local `l` and `k` a word offset into its payload.
+  private aggGet(d: usize, l: usize, k: usize): string {
+    const t = this.ty(d);
+    if (!isAggTy(t)) {
+      return lname(d) + " = " + fromSlot(t, aggWordC(l, k + 1)) + ";";
+    }
+    let ws: string[] = [];
+    let j: usize = 0;
+    while (j < slotWords(t)) {
+      ws.push(aggWordC(l, k + 1 + j));
+      j += 1;
+    }
+    return lname(d) + " = (" + cty(t) + "){{" + ws.join(", ") + "}};";
+  }
+
+  // A builtin: an Option / Result builtin on an aggregate reads its words, every other one is the boxed form.
+  private builtin(d: Option<usize>, b: Builtin, args: Operand[]): string {
+    const rt = match (d) {
+      Some(x) => this.ty(x),
+      None => MVoid,
+    };
+    const agg: Option<usize> = args.length > 0 ? this.aggLocal(args[0]) : None;
+    const code = match (agg) {
+      Some(l) => aggBuiltinC(b, l, args.length > 1 ? opC(args[1]) : "0", rt),
+      None => builtinC(b, args.map(opC), rt),
+    };
+    return assignOpt(d, code);
+  }
+
   private maskOf(os: Operand[]): usize {
+
     let refs: bool[] = [];
     for (const o of os) {
       refs.push(isRefT(this.opTy(o)));
@@ -332,17 +429,24 @@ export class CFunctionEmitter {
           )
           + ";",
       ICall(d, g, args) => this.call(d, g, args),
-      IBuiltin(d, b, args) => match (d) {
-        Some(x) => lname(x) + " = " + builtinC(b, args.map(opC), this.ty(x)) + ";",
-        None => builtinC(b, args.map(opC), MVoid) + ";",
-      },
+      IBuiltin(d, b, args) => this.builtin(d, b, args),
+
       IStrAppend(x, y) => lname(x) + " = orin_str_append(" + lname(x) + ", " + opC(y) + ");",
       IArrayExtend(x, y) => lname(x) + " = orin_array_extend(" + lname(x) + ", " + opC(y) + ");",
       IStructNew(d, tag, slots) => this.structNew(d, tag, slots),
-      INullary(d, t) => lname(d) + " = orin_nullary(" + u(t) + ");",
-      ITag(d, o) => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
-      IGetField(d, o, k) => lname(d) + " = "
-          + fromSlot(this.ty(d), "orin_struct_get(" + opC(o) + ", " + u(k) + ")") + ";",
+      INullary(d, t) => isAggTy(this.ty(d))
+          ? this.aggNew(d, t, [])
+          : lname(d) + " = orin_nullary(" + u(t) + ");",
+      ITag(d, o) => match (this.aggLocal(o)) {
+        Some(l) => lname(d) + " = (int64_t)" + aggWordC(l, 0) + ";",
+        None => lname(d) + " = (int64_t)orin_tag(" + opC(o) + ");",
+      },
+      IGetField(d, o, k) => match (this.aggLocal(o)) {
+        Some(l) => this.aggGet(d, l, k),
+        None => lname(d) + " = "
+            + fromSlot(this.ty(d), "orin_struct_get(" + opC(o) + ", " + u(k) + ")") + ";",
+      },
+
       ISetField(x, k, v) => "orin_mir_struct_replace(" + lname(x) + ", " + u(k) + ", "
           + this.slotOf(v) + ");",
       ITakeField(d, x, k) => lname(d) + " = ORIN_REF(orin_mir_struct_take(" + lname(x) + ", " + u(k)
@@ -361,8 +465,11 @@ export class CFunctionEmitter {
           + lname(s) + "));",
       IArrayPush(x, v) => lname(x) + " = orin_mir_array_push(" + lname(x) + ", " + this.slotOf(v)
           + ");",
-      IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); " + lname(d)
-          + " = orin_array_pop(" + lname(x) + ");",
+      IArrayPop(d, x) => lname(x) + " = orin_make_unique(" + lname(x) + "); "
+          + (isAggTy(this.ty(d))
+            ? "orin_array_pop_v(" + lname(x) + ", " + lname(d) + ".w);"
+            : lname(d) + " = orin_array_pop(" + lname(x) + ");"),
+
       IClosure(d, g, caps) => this.closure(d, g, caps),
       ICallIndirect(d, c, args) => this.callThrough(
         d,
@@ -391,7 +498,11 @@ export class CFunctionEmitter {
   }
 
   private structNew(d: usize, tag: usize, slots: Operand[]): string {
+    if (isAggTy(this.ty(d))) {
+      return this.aggNew(d, tag, slots);
+    }
     const n = lname(d);
+
     let s = n + " = orin_struct_new(" + u(tag) + ", " + u(slots.length) + ", "
         + u(this.maskOf(slots)) + "ULL);";
     let k: usize = 0;
@@ -501,7 +612,7 @@ export class CFunctionEmitter {
     let i = f.paramCount;
     while (i < f.locals.length) {
       const l = f.locals[i];
-      const init = isRefT(l.ty) ? "NULL" : "0";
+      const init = isRefT(l.ty) ? "NULL" : isAggTy(l.ty) ? "{{0}}" : "0";
       this.lines.push(
         "  " + cty(l.ty) + " " + lname(i) + " = " + init + "; /* " + commentSafe(l.name) + " */\n",
       );

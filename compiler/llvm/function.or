@@ -9,9 +9,11 @@
 import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
+  slotWords,
 } from "../mir";
 import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../cemit";
-import { u, isRefT, isUsizeT, isFloatT, lty, attrTy, paramTy } from "./text";
+import { u, isRefT, isUsizeT, isFloatT, isAggT, zeroOf, lty, attrTy, paramTy } from "./text";
+
 import { LlvmSymbols, llvmRefsDeclared, trapsIndexed } from "./symbols";
 
 // Result of a builtin: the IR text and the SSA value holding the result ("" for none).
@@ -274,7 +276,39 @@ function unwrapR(p: string, fn: string, a0: string, rt: MType): R {
   return R { text: call + d.text, val: d.val };
 }
 
+// ---------------------------------------------------------------- unboxed aggregates (docs/mir.md v2.2)
+
+// The `what` code of `orin_v_unwrap` for an unwrapping builtin (the trap message of the boxed builtin).
+function unwrapWhat(b: Builtin): string {
+  return match (b) {
+    BResUnwrap => "1",
+    BResUnwrapErr => "2",
+    _ => "0",
+  };
+}
+
+// `name = extractvalue <ty> v, k` (one word of an aggregate value).
+function extractW(name: string, ty: string, v: string, k: usize): string {
+  return "  " + name + " = extractvalue " + ty + " " + v + ", " + u(k) + "\n";
+}
+
+// An aggregate value of type `ty` built from the words `ws` (i64 values; the rest zero) under the names `<p>a<k>`; R.val
+// is the last name.
+function buildAgg(p: string, ty: string, ws: string[]): R {
+  let text = "";
+  let cur = "zeroinitializer";
+  let k: usize = 0;
+  while (k < ws.length) {
+    const nm = p + "a" + u(k);
+    text += "  " + nm + " = insertvalue " + ty + " " + cur + ", i64 " + ws[k] + ", " + u(k) + "\n";
+    cur = nm;
+    k += 1;
+  }
+  return R { text: text, val: cur };
+}
+
 // ---------------------------------------------------------------- the emitter
+
 
 // The function being emitted is one of the program and of the symbol table; its parameters are declared locals.
 @Invariant(this.fi < this.prog.functions.length && this.syms.count() == this.prog.functions.length)
@@ -361,7 +395,133 @@ export class LlvmFunctionEmitter {
     return ov(p, n, o);
   }
 
+  // The local operand `o` names, when it holds an unboxed aggregate.
+  private aggLocal(o: Operand): Option<usize> {
+    return match (o) {
+      OLocal(l) => isAggT(this.f.locals[l].ty) ? Some(l) : None,
+      _ => None,
+    };
+  }
+
+  // The i64 words that operand `n` (already loaded as `ov(p, n, o)`) contributes to an aggregate: a scalar one word (a
+  // float bit-cast), an aggregate all of its words. Returns the conversion text in `text` and the words joined by ",".
+  private wordsOf(p: string, n: usize, o: Operand): R {
+    const v = ov(p, n, o);
+    match (this.aggLocal(o)) {
+      Some(l) => {
+        const t = this.f.locals[l].ty;
+        let text = "";
+        let ws: string[] = [];
+        let k: usize = 0;
+        while (k < slotWords(t)) {
+          const nm = p + "w" + u(n) + "_" + u(k);
+          text += extractW(nm, lty(t), v, k);
+          ws.push(nm);
+          k += 1;
+        }
+        return R { text: text, val: ws.join(",") };
+      },
+      None => {},
+    }
+    if (isFloatT(this.opTy(o))) {
+      return R {
+        text: "  " + p + "w" + u(n) + " = bitcast double " + v + " to i64\n",
+        val: p + "w" + u(n),
+      };
+    }
+    return R { text: "", val: v };
+  }
+
+  // `d = { tag, slots.. }` for an aggregate destination.
+  private aggNewI(p: string, d: usize, tag: usize, slots: Operand[]): string {
+    let s = this.loadsOf(p, slots);
+    let ws: string[] = [u(tag)];
+    let k: usize = 0;
+    while (k < slots.length) {
+      const w = this.wordsOf(p, k, slots[k]);
+      s += w.text;
+      ws = ws.concat(w.val.split(","));
+      k += 1;
+    }
+    const a = buildAgg(p, lty(this.f.locals[d].ty), ws);
+    return s + a.text + this.st(d, a.val);
+  }
+
+  // `d = o.k` where `o` (operand 0) is the aggregate local `l` and `k` a word offset into its payload.
+  private aggGetI(p: string, d: usize, l: usize, k: usize): string {
+    const at = lty(this.f.locals[l].ty);
+    const dt = this.f.locals[d].ty;
+    let s = this.ld(p, 0, OLocal(l));
+    const v = ov(p, 0, OLocal(l));
+    if (!isAggT(dt)) {
+      s += extractW(p + "x", at, v, k + 1);
+      if (isFloatT(dt)) {
+        return s + "  " + p + "f = bitcast i64 " + p + "x to double\n" + this.st(d, p + "f");
+      }
+      return s + this.st(d, p + "x");
+    }
+    let ws: string[] = [];
+    let j: usize = 0;
+    while (j < slotWords(dt)) {
+      s += extractW(p + "x" + u(j), at, v, k + 1 + j);
+      ws.push(p + "x" + u(j));
+      j += 1;
+    }
+    const a = buildAgg(p, lty(dt), ws);
+    return s + a.text + this.st(d, a.val);
+  }
+
+  // An Option / Result builtin whose argument 0 is the aggregate local `l` (operands already loaded); `rt` is the type of
+  // the destination (a plain scalar, or MVoid).
+  private aggBuiltinR(p: string, b: Builtin, l: usize, args: Operand[], rt: MType): R {
+    const at = lty(this.f.locals[l].ty);
+    const v = ov(p, 0, args[0]);
+    const r = p + "r";
+    let s = extractW(p + "t", at, v, 0);
+    const isTag = match (b) {
+      BOptIsSome => Some(0),
+      BResIsOk => Some(0),
+      BOptIsNone => Some(1),
+      BResIsErr => Some(1),
+      _ => None,
+    };
+    match (isTag) {
+      Some(t) => {
+        s += "  " + p + "c = icmp eq i64 " + p + "t, " + t.toString() + "\n  " + r + " = zext i1 "
+            + p + "c to i64\n";
+        return R { text: s, val: r };
+      },
+      None => {},
+    }
+    s += extractW(p + "w", at, v, 1);
+    let word = p + "w";
+    match (b) {
+      BOptUnwrapOr => {
+        s += "  " + p + "c = icmp eq i64 " + p + "t, 0\n";
+      },
+      _ => {
+        s += "  " + p + "u = call i64 @orin_v_unwrap(i64 " + p + "t, i64 " + p + "w, i64 "
+            + unwrapWhat(b) + ")\n";
+        word = p + "u";
+      },
+    }
+    if (isFloatT(rt)) {
+      s += "  " + p + "f = bitcast i64 " + word + " to double\n";
+      word = p + "f";
+    }
+    match (b) {
+      BOptUnwrapOr => {
+        s += "  " + r + " = select i1 " + p + "c, " + lty(rt) + " " + word + ", " + lty(rt) + " "
+            + ov(p, 1, args[1]) + "\n";
+        return R { text: s, val: r };
+      },
+      _ => {},
+    }
+    return R { text: s, val: word };
+  }
+
   private maskOf(os: Operand[]): usize {
+
     let refs: bool[] = [];
     for (const o of os) {
       refs.push(isRefT(this.opTy(o)));
@@ -534,7 +694,23 @@ export class LlvmFunctionEmitter {
 
   private builtinInstr(p: string, d: Option<usize>, b: Builtin, args: Operand[]): string {
     const pre = this.loadsOf(p, args);
+    const agg: Option<usize> = args.length > 0 ? this.aggLocal(args[0]) : None;
+    match (agg) {
+      Some(l) => {
+        return match (d) {
+          Some(x) => this.builtinStore(
+            p,
+            x,
+            pre,
+            this.aggBuiltinR(p, b, l, args, this.f.locals[x].ty),
+          ),
+          None => pre + this.aggBuiltinR(p, b, l, args, MVoid).text,
+        };
+      },
+      None => {},
+    }
     return match (d) {
+
       Some(x) => this.builtinStore(p, x, pre, this.builtinR(p, b, args, this.f.locals[x].ty)),
       None => pre + this.builtinR(p, b, args, MVoid).text,
     };
@@ -560,7 +736,11 @@ export class LlvmFunctionEmitter {
   }
 
   private structNewI(p: string, d: usize, tag: usize, slots: Operand[]): string {
+    if (isAggT(this.f.locals[d].ty)) {
+      return this.aggNewI(p, d, tag, slots);
+    }
     let s = this.loadsOf(p, slots);
+
     const n = p + "n";
     s += "  " + n + " = call ptr @orin_struct_new(i32 " + u(tag) + ", i32 " + u(slots.length)
         + ", i64 " + u(this.maskOf(slots)) + ")\n";
@@ -720,13 +900,22 @@ export class LlvmFunctionEmitter {
           + "  " + p + "r = call ptr @orin_array_extend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
           + this.st(x, p + "r"),
       IStructNew(d, tag, slots) => this.structNewI(p, d, tag, slots),
-      INullary(d, t) => "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n"
-          + this.st(d, p + "r"),
-      ITag(d, o) => this.ld(p, 0, o) + "  " + p + "g = getelementptr inbounds i8, ptr "
-          + ov(p, 0, o) + ", i64 12\n  " + p + "t = load i32, ptr " + p + "g\n  " + p
-          + "r = zext i32 " + p + "t to i64\n" + this.st(d, p + "r"),
-      IGetField(d, o, k) => this.ld(p, 0, o) + slotChk(p + "g", ov(p, 0, o), k) + "  " + p
-          + "r = load " + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n" + this.st(d, p + "r"),
+      INullary(d, t) => isAggT(this.f.locals[d].ty)
+          ? this.aggNewI(p, d, t, [])
+          : "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n" + this.st(d, p + "r"),
+      ITag(d, o) => match (this.aggLocal(o)) {
+        Some(l) => this.ld(p, 0, o) + extractW(p + "r", lty(this.f.locals[l].ty), ov(p, 0, o), 0)
+            + this.st(d, p + "r"),
+        None => this.ld(p, 0, o) + "  " + p + "g = getelementptr inbounds i8, ptr " + ov(p, 0, o)
+            + ", i64 12\n  " + p + "t = load i32, ptr " + p + "g\n  " + p + "r = zext i32 " + p
+            + "t to i64\n" + this.st(d, p + "r"),
+      },
+      IGetField(d, o, k) => match (this.aggLocal(o)) {
+        Some(l) => this.aggGetI(p, d, l, k),
+        None => this.ld(p, 0, o) + slotChk(p + "g", ov(p, 0, o), k) + "  " + p + "r = load "
+            + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n" + this.st(d, p + "r"),
+      },
+
       ISetField(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, v)
           + slotChk(p + "g", p + "x", k) + this.replaceI(p, p + "g", 1, v),
       ITakeField(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n"
@@ -758,8 +947,11 @@ export class LlvmFunctionEmitter {
           + "  call void @orinl_array_push(ptr " + p + "u, i64 " + this.slotVal(p, 1, v) + ")\n"
           + this.st(x, p + "u"),
       IArrayPop(d, x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
-          + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n" + this.st(x, p + "u") + "  " + p
-          + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + this.st(d, p + "r"),
+          + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n" + this.st(x, p + "u")
+          + (isAggT(this.f.locals[d].ty)
+            ? "  call void @orin_array_pop_v(ptr " + p + "u, ptr %l" + u(d) + ")\n"
+            : "  " + p + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + this.st(d, p + "r")),
+
       IClosure(d, f, caps) => this.closureI(p, d, f, caps),
       ICallIndirect(d, f, args) => this.callIndirectI(p, d, f, args),
       IIface(d, vt, v) => this.ifaceI(p, d, vt, v),
@@ -833,12 +1025,9 @@ export class LlvmFunctionEmitter {
       const t = lty(f.locals[i].ty);
       out.push("  %l" + u(i) + " = alloca " + t + ", align 8\n");
       if (i >= f.paramCount) {
-        out.push(
-          "  store " + t + " "
-              + (isRefT(f.locals[i].ty) ? "null" : isFloatT(f.locals[i].ty) ? "0.0" : "0")
-              + ", ptr %l" + u(i) + "\n",
-        );
+        out.push("  store " + t + " " + zeroOf(f.locals[i].ty) + ", ptr %l" + u(i) + "\n");
       }
+
       i += 1;
     }
     i = 0;
