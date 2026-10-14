@@ -386,6 +386,14 @@ function targ(fx: Fx, p: string, n: usize, o: Operand): string {
   return lty(opTy(fx, o)) + " " + ov(p, n, o);
 }
 
+// The address of the local an operand names (the in/out argument of a call, docs/mir.md v1.10).
+function operandPtr(o: Operand): string {
+  return match (o) {
+    OLocal(l) => "%l" + u(l),
+    _ => "null"
+  };
+}
+
 function loadsOf(fx: Fx, p: string, os: Operand[]): string {
   let s = "";
   let i: usize = 0;
@@ -773,7 +781,9 @@ function builtinStore(fx: Fx, p: string, x: usize, pre: string, r: R): string {
 function callI(fx: Fx, p: string, d: Option<usize>, f: usize, args: Operand[]): string {
   const pre = loadsOf(fx, p, args);
   const callee = fx.prog.functions[f];
-  const call = "call " + lty(callee.ret) + " @" + fx.names[f] + "(" + argList(fx, p, args) + ")\n";
+  // in/out receiver (docs/mir.md v1.10): pass the address of the argument's local, the callee stores its final receiver there
+  const outArg = callee.inout ? ", ptr " + operandPtr(args[0]) : "";
+  const call = "call " + lty(callee.ret) + " @" + fx.names[f] + "(" + argList(fx, p, args) + outArg + ")\n";
   return pre + match (d) {
     Some(x) => "  " + p + "r = " + call + st(fx, x, p + "r"),
     None => "  " + call
@@ -965,9 +975,12 @@ function termI(fx: Fx, p: string, t: Terminator): string {
     TGoto(b) => "  br label %B" + u(b) + "\n",
     TBranch(c, a, b) => ld(fx, p, 0, c) + "  " + p + "c = icmp ne i64 " + ov(p, 0, c) + ", 0\n  br i1 " + p + "c, label %B" + u(a) + ", label %B" + u(b) + "\n",
     TSwitch(o, cases, d) => switchI(fx, p, o, cases, d),
-    TReturn(o) => match (o) {
-      Some(x) => ld(fx, p, 0, x) + "  ret " + targ(fx, p, 0, x) + "\n",
-      None => "  ret void\n"
+    TReturn(o) => {
+      const outStore = fx.f.inout ? "  " + p + "o = load ptr, ptr %l0\n  store ptr " + p + "o, ptr %pout\n" : "";
+      return match (o) {
+        Some(x) => ld(fx, p, 0, x) + outStore + "  ret " + targ(fx, p, 0, x) + "\n",
+        None => outStore + "  ret void\n"
+      };
     },
     TTrap(m) => "  call void @orin_trap(ptr @.m" + u(msgIndex(fx.msgs, m)) + ")\n  unreachable\n"
   };
@@ -994,6 +1007,9 @@ function genFunction(fx: Fx, name: string): string {
     }
     sig += lty(f.locals[i].ty) + " %p" + u(i);
     i += 1;
+  }
+  if (f.inout) {
+    sig += ", ptr %pout";
   }
   sig += (isInlineFn(fx.prog, f.name) ? ") alwaysinline nounwind {\nentry:\n" : ") nounwind {\nentry:\n");
   out.push(sig);
