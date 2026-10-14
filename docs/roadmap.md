@@ -68,6 +68,9 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      Every closure must be pure, a `reduce` must be associative (built-in operator or proved), and chunks have a
      fixed size, so the result is reproducible.
 6. **Performance push** (performance model: ADR-0038, inferred allocation and invariant-driven optimisation, no user-facing arena types):
+   - **complexity and cost insight** ([ADR-0042](decisions/0042-complexity-and-performance-insight.md)): Big-O summaries per
+     function (`O(?)` with a reason when unknown), the performance lint with estimated gains from a calibrated
+     cost model, `orin perf`, hover, MCP, and a `[complexity]` policy; the summaries start with the fusion work;
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
    - **contract-driven optimisation** (ADR-0031 §E). Only `VERIFIED` facts remove checks or change
