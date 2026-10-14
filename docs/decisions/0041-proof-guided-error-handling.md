@@ -1,11 +1,32 @@
 # ADR-0041: Proof-guided error handling, `@NoTrap`, and recoverable boundaries
 
-Status: **proposed** (2026-10-14). Design only; not yet implemented. Acceptance requires review of
-runtime isolation and verifier soundness before enabling any strict mode.
+Status: **accepted** (2026-10-14, project owner) as the semantic direction and stage gates; exact syntax,
+strict-mode switches and the fault-domain implementation stay open until the required proofs and runtime
+experiments exist. Design only; not yet implemented.
 
 Related: [contracts](../contracts.md), [capabilities](../capabilities.md), ADR-0017 (concurrency),
 ADR-0021/0027 (capabilities), ADR-0029 (honest diagnostics and refusal), ADR-0030 (trusted runtime),
 ADR-0031/0036 (contract verification), ADR-0032 (end-to-end assurance), ADR-0037 (effects).
+
+## Relation to existing decisions
+
+This ADR does not define a second verification policy. It adds the per-function claim `@NoTrap` and the
+recovery model; everything else uses the existing decisions:
+
+- **Obligations, statuses, policies:** ADR-0035 defines proof obligations with stable IDs, the
+  statuses `VERIFIED | REFUTED | UNKNOWN`, `DYNAMICALLY_CHECKED` as a separate axis, and the build
+  policies `--verify=runtime` / `--verify=strict` with a verification scope. `@NoTrap` obligations are
+  ordinary obligations in that scheme, and the strict policy of §8 below *is* ADR-0035's strict policy
+  with trap obligations in scope. No new flags are introduced by this ADR.
+- **Check elimination and placement:** §6 refines ADR-0035 D4 (erasure and proof-driven elimination),
+  ADR-0031 §E (contract-driven optimisation) and ADR-0038 §5 (only guaranteed facts reach the backend).
+  Where they differ, the stricter rule applies.
+- **Absence of run-time errors:** ADR-0032 §4 plans a `--no-runtime-errors` mode. `@NoTrap` is its
+  per-function form, and the mode is "`@NoTrap` required on every function in the verification scope".
+- **Refusal protocol:** an open obligation is reported with an ADR-0029 action (FIX_CODE,
+  STRENGTHEN_SPEC, NEEDS_DECISION, NEEDS_AUTHORITY); the recommendations of §4 map onto those actions.
+- **Order:** Stage A (§9) is implemented together with ADR-0035 phase 1 (obligation IDs, `@Decreases`,
+  runtime loop invariants, strict scope).
 
 ## Motivation
 
@@ -67,7 +88,14 @@ Initial modelled traps:
 - any additional compiler/runtime trap source must be enumerated before claiming
   completeness.
 
-**Outside the initial guarantee:** termination, deadlock, starvation, process
+**Trap inventory is generated, not hand-written.** A compiler tool lists every trap site the C and LLVM
+backends and the runtime can emit (operator lowering, conversions, bounds, unwrap, contract checks,
+resource checks, runtime traps), and CI compares that list with the published trap model. A trap kind
+that the backends can emit but the model does not list fails CI, so completeness is checked rather than
+claimed.
+
+**Outside the initial guarantee:** stack overflow from deep or unbounded recursion (until a stack bound is
+modelled, for example via `@Decreases` plus a frame-size bound), termination, deadlock, starvation, process
 kill, system power loss, OS/kernel faults, arbitrary native C corruption, failed
 allocation/oom until allocation failure is specified and modelled, and
 unmodelled host behavior. Do not report these as proved safe. If memory allocation
@@ -388,11 +416,18 @@ No existing default compilation behavior changes just by accepting this ADR.
 - Suggest `@Requires` propagation vs guard/`Result` on unsatisfied call sites,
   `@Ensures` for useful return postconditions, `@Invariant` for state,
   `@NoTrap` for safety claims, and recovery **only at eligible boundaries**.
-- Implement verified-safe MIR check elimination/sharing/hoisting using dominance, mutation/alias analysis and preservation of external effect ordering; report emitted check sites and benchmark runtime overhead.\n- Machine-readable diagnostics with explanation/witness/source/quick-fix.
+- Implement verified-safe MIR check elimination/sharing/hoisting using dominance, mutation/alias analysis and preservation of external effect ordering; report emitted check sites and benchmark runtime overhead.
+- Machine-readable diagnostics with explanation/witness/source/quick-fix.
 - Per-package policy for entrypoint safety; no hidden inference changing the
   caller-visible API. Benchmark usefulness on the agent ergonomics task set.
 
 ### Stage D: isolation, supervision and recovery
+
+**Prerequisite found in concurrency stage 0 (PR #51):** a trap ends a task without unwinding, so a panic in
+a task that itself owns a `scope` leaves that scope's child tasks running. In-process fault containment
+first needs a trap hook that registers each task's live scopes and cancels and joins them on trap, plus a
+cancellation flag in channel and monitor waits. That work is a separate change and precedes any
+`Task.runIsolated`-style API.
 - After/concurrent with ADR-0017 and R3/R4, implement isolated fault domains,
   cleanup, resource scopes and supervisor API.
 - Specify precise recoverable categories. Add adversarial tests: invariant
@@ -412,7 +447,10 @@ No existing default compilation behavior changes just by accepting this ADR.
 6. Unknown callback/interface calls remain UNKNOWN.
 7. A correctly validated JSON-to-typed-data boundary feeding a proved core
    needs no recovery solely because data originated outside.
-8. Recovery cannot continue with invalidated state or claim to undo a write.\n9. A dominating guard eliminates a redundant runtime precondition check in strict release mode, but removing the guard restores the outstanding proof obligation.\n10. Check hoisting respects mutations, conditional reachability, I/O ordering and original violation blame.\n11. An UNKNOWN obligation retains a runtime check if supported, with a safe failure boundary at an exposed strict entrypoint; an already guarded `Result.Err` path needs no recover.
+8. Recovery cannot continue with invalidated state or claim to undo a write.
+9. A dominating guard eliminates a redundant runtime precondition check in strict release mode, but removing the guard restores the outstanding proof obligation.
+10. Check hoisting respects mutations, conditional reachability, I/O ordering and original violation blame.
+11. An UNKNOWN obligation retains a runtime check if supported, with a safe failure boundary at an exposed strict entrypoint; an already guarded `Result.Err` path needs no recover.
 
 ## Non-goals
 
