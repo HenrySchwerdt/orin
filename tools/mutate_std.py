@@ -141,9 +141,13 @@ EARLY_EXIT = {"http"}
 TEST_ORDER = {"http": ["http_reject_test", "http_test", "http_split_test", "http_prop_test"]}
 
 
-def run(orinc, test_file, extra):
+def run(orinc, test_file, extra, timeout=900):
     cmd = [orinc, "test", test_file] + extra
-    r = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    try:
+        r = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # a mutant can loop forever (for example a scanner that no longer makes progress): that is a failing test
+        return 1, "FAIL (timeout after %d s)\n" % timeout
     return r.returncode, r.stdout.decode("utf-8", "replace")
 
 
@@ -197,8 +201,9 @@ def main():
             tf = os.path.join(d, tn + ".or")
             open(tf, "w", encoding="utf-8").write(t)
             rel = os.path.relpath(tf, ROOT)
-            c1, o1 = run(orinc, rel, [])
-            c2, o2 = run(orinc, rel, ["--no-contracts"])
+            tmo = 120 if mod in EARLY_EXIT else 900
+            c1, o1 = run(orinc, rel, [], tmo)
+            c2, o2 = run(orinc, rel, ["--no-contracts"], tmo)
             fails1 += len(re.findall(r"^FAIL ", o1, re.M))
             fails2 += len(re.findall(r"^FAIL ", o2, re.M))
             viol += len(re.findall(r"contract violated", o1))

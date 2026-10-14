@@ -21,6 +21,13 @@
   `std:utf8` (validated decoding, `Utf8String`, `CodePointCursor`) and `std:collections` (`IntSet`, `StringSet`,
   ring `Deque<T>`, B-tree `SortedMap<V>`/`SortedStringMap<V>`, 4-ary `PriorityQueue<T>`), every class with invariants and every method
   with contracts; `tools/test_std.sh [--mutate]`, `tests/std/`. Registered in `compiler/loader/resolve.or`; docs/std.md.
+- `std:http` (ADR-0030 §3, the pure part; no sockets): HTTP/1.1 `Request`/`Response`/`Headers`/`Status`, an incremental
+  request parser and response parser (`feed(chunk)` answers `NeedMore | Done(message, used) | Failed(HttpError)`; refuses
+  request-smuggling ambiguities: Content-Length with Transfer-Encoding, duplicate Content-Length, obs-fold, bare LF/CR,
+  whitespace before the colon, chunk-size overflow; limits as parameters; explicit state machine) and a serializer with
+  the round-trip contract `parse(serialize(m)) == m`; header injection is impossible by construction. Registered like
+  the layer-1 modules (`compiler/loader/resolve.or`), `tests/std/http_*_test.or`, 41 mutants in `tools/mutate_std.py`,
+  `tests/std/bench/http_bench.or`; docs/std.md.
 - Contract-quality diagnostics (ADR-0028): warnings W0450-W0452 (invariant without `this`, `@Ensures` that cannot
   fail, trivially true contracts), solver-based W0460-W0462 in `orin verify --contracts`, opt-in strict coverage
   W0470/W0471 (`--strict-contracts`, `[contracts] strict = true`), and `tools/contract_mutation.py` (contract

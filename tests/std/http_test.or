@@ -554,3 +554,59 @@ function feedAfterDoneOrFailureIsRefusedWithoutConsuming(): void {
   assertEqBool(f.isIdle(), true, "reset clears the error");
   assertEqString(outcome(f.feed(bs("GET / HTTP/1.0\r\n\r\n"))), "Done", "usable again");
 }
+
+// ------------------------------------------------------------------------------------------- equality
+
+function mkReq(m: Method, target: string, v: HttpVersion, names: string[], values: string[], body: string, tn: string[], tv: string[]): Request {
+  return makeRequest(m, target, v, headersFromLists(names, values).unwrap(), bs(body), headersFromLists(tn, tv).unwrap()).unwrap();
+}
+
+@Test
+function requestEqualityComparesEveryPart(): void {
+  // a chunked request, so that headers, body and trailers can each differ
+  const base = mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", ["T"], ["1"]);
+  assertEqBool(base.equals(base), true, "reflexive");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", ["T"], ["1"])), true, "same parts");
+  assertEqBool(base.equals(mkReq(Put, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", ["T"], ["1"])), false, "method");
+  assertEqBool(base.equals(mkReq(Post, "/q", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", ["T"], ["1"])), false, "target");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "2", "chunked"], "ab", ["T"], ["1"])), false, "header value");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "x", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", ["T"], ["1"])), false, "header name spelling");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["X", "Host", "Transfer-Encoding"], ["1", "a", "chunked"], "ab", ["T"], ["1"])), false, "header order");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ac", ["T"], ["1"])), false, "body");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "abc", ["T"], ["1"])), false, "body length");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", ["T"], ["2"])), false, "trailer value");
+  assertEqBool(base.equals(mkReq(Post, "/p", Http11, ["Host", "X", "Transfer-Encoding"], ["a", "1", "chunked"], "ab", [], [])), false, "trailers");
+  const old = mkReq(Get, "/", Http10, ["Host"], ["a"], "", [], []);
+  const new11 = mkReq(Get, "/", Http11, ["Host"], ["a"], "", [], []);
+  assertEqBool(old.equals(new11), false, "version");
+  assertEqBool(mkReq(Ext("PURGE"), "/", Http11, ["Host"], ["a"], "", [], []).equals(mkReq(Ext("PURGE"), "/", Http11, ["Host"], ["a"], "", [], [])), true, "extension methods");
+  assertEqBool(mkReq(Ext("PURGE"), "/", Http11, ["Host"], ["a"], "", [], []).equals(mkReq(Ext("PUSH"), "/", Http11, ["Host"], ["a"], "", [], [])), false, "different extension methods");
+  assertEqBool(old.isChunked(), false, "not chunked");
+  assertEqBool(base.isChunked(), true, "chunked");
+  assertEqUsize(base.trailers().count(), 1, "trailers accessor");
+}
+
+function mkRes(code: int, reason: string, v: HttpVersion, names: string[], values: string[], body: string, tn: string[], tv: string[], head: bool): Response {
+  return makeResponse(new Status(code, reason), v, headersFromLists(names, values).unwrap(), bs(body), headersFromLists(tn, tv).unwrap(), head).unwrap();
+}
+
+@Test
+function responseEqualityComparesEveryPart(): void {
+  const base = mkRes(200, "OK", Http11, ["Transfer-Encoding", "X"], ["chunked", "1"], "ab", ["T"], ["1"], false);
+  assertEqBool(base.equals(mkRes(200, "OK", Http11, ["Transfer-Encoding", "X"], ["chunked", "1"], "ab", ["T"], ["1"], false)), true, "same parts");
+  assertEqBool(base.equals(mkRes(201, "OK", Http11, ["Transfer-Encoding", "X"], ["chunked", "1"], "ab", ["T"], ["1"], false)), false, "code");
+  assertEqBool(base.equals(mkRes(200, "Fine", Http11, ["Transfer-Encoding", "X"], ["chunked", "1"], "ab", ["T"], ["1"], false)), false, "reason");
+  assertEqBool(base.equals(mkRes(200, "OK", Http11, ["Transfer-Encoding", "X"], ["chunked", "2"], "ab", ["T"], ["1"], false)), false, "header");
+  assertEqBool(base.equals(mkRes(200, "OK", Http11, ["Transfer-Encoding", "X"], ["chunked", "1"], "ac", ["T"], ["1"], false)), false, "body");
+  assertEqBool(base.equals(mkRes(200, "OK", Http11, ["Transfer-Encoding", "X"], ["chunked", "1"], "ab", ["T"], ["2"], false)), false, "trailer");
+  const plain = mkRes(200, "OK", Http10, [], [], "x", [], [], false);
+  assertEqBool(plain.equals(mkRes(200, "OK", Http11, [], [], "x", [], [], false)), false, "version");
+  const head = mkRes(200, "OK", Http11, ["Content-Length"], ["3"], "", [], [], true);
+  assertEqBool(head.equals(mkRes(200, "OK", Http11, ["Content-Length"], ["3"], "", [], [], true)), true, "HEAD response");
+  assertEqBool(head.isForHead(), true, "isForHead");
+  assertEqBool(plain.isForHead(), false, "not for HEAD");
+  assertEqBool(plain.isBodyless(), false, "has a body");
+  assertEqBool(mkRes(204, "No Content", Http11, [], [], "", [], [], false).isBodyless(), true, "204");
+  assertEqUsize(base.trailers().count(), 1, "trailers accessor");
+  assertEqUsize(plain.body().length(), 1, "body accessor");
+}

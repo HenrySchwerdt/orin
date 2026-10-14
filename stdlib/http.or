@@ -27,29 +27,29 @@
 // A partial message is never returned as complete. The result for a message is independent of how the bytes are
 // split into chunks (tests: every split point, 1-byte chunks, random splits).
 //
-// The state machine (explicit: `S_*` constants, `edgeAllowed`, class invariants):
+// The state machine (explicit: `S_*` constants, `edgeAllowed`, class invariants). A request starts in METHOD, a
+// response in VERSION:
 //
-//   request  START -> METHOD -> TARGET -> VERSION -> START_LF -+
-//   response START ------------> VERSION -> CODE -> REASON -> START_LF
-//                                                              |
-//        +-----------------------------------------------------+
-//        v
-//   HDR_LINE <-> HDR_NAME -> HDR_OWS -> HDR_VALUE -> HDR_LF -> HDR_LINE      (one header field per cycle)
-//        |
-//        +-> HEAD_END_LF -> DONE                                  (no body)
-//                         -> BODY -> DONE                          (Content-Length)
-//                         -> BODY_CLOSE -> (atEof) DONE            (responses only: body ends at connection close)
-//                         -> CHUNK_SIZE -> [CHUNK_BWS] -> [CHUNK_EXT] -> CHUNK_SIZE_LF
-//                              CHUNK_SIZE_LF -> CHUNK_DATA -> CHUNK_CR -> CHUNK_LF -> CHUNK_SIZE   (size > 0)
-//                              CHUNK_SIZE_LF -> HDR_LINE (trailer section; ends in HEAD_END_LF -> DONE)   (size 0)
-//   any state -> ERROR (sticky); DONE and ERROR are terminal until `reset()`.
+//   request   METHOD -> TARGET -> VERSION -> START_LF
+//   response  VERSION -> CODE -> REASON -> START_LF
+//   START_LF -> HDR_LINE <-> (HDR_NAME -> HDR_OWS -> HDR_VALUE -> HDR_LF)     one cycle per header field
+//   HDR_LINE -> HEAD_END_LF          the empty line; then, decided by the framing rules (RFC 9112 §6.3):
+//        HEAD_END_LF -> DONE                          no body (or Content-Length 0, HEAD, 1xx, 204, 304)
+//        HEAD_END_LF -> BODY -> DONE                  Content-Length
+//        HEAD_END_LF -> BODY_CLOSE -> (atEof) DONE    responses only: the body ends when the connection closes
+//        HEAD_END_LF -> CHUNK_SIZE -> [CHUNK_BWS] -> [CHUNK_EXT] -> CHUNK_SIZE_LF        Transfer-Encoding: chunked
+//          CHUNK_SIZE_LF -> CHUNK_DATA -> CHUNK_CR -> CHUNK_LF -> CHUNK_SIZE              (size > 0)
+//          CHUNK_SIZE_LF -> HDR_LINE ... HEAD_END_LF -> DONE                               (size 0: the trailer section)
+//   any non-terminal state -> ERROR (sticky); DONE and ERROR are terminal until `reset()`.
 //
 // Algorithm. One forward pass, no backtracking, no regex, no look-ahead. Bytes are classified by a 256-entry table
 // (`HTTP_CLASS`: control, LF, CR, HTAB, SP, obs-text, other VCHAR, `:`, `;`, token symbol, letter, hex letter,
 // digit; ordered so that "is a token character" is `class >= 10` and "may occur in a field value" is `class >= 3`)
 // and `HTTP_HEXV` (hex digit value or 16). Orin has no constant arrays, so both are string constants read with
-// `charCodeAt` like the DFA tables of std:utf8. Runs of ordinary bytes (a method, a header name, a header value, a
-// body) are scanned in a tight loop and handled once per run, not once per byte; the state changes once per token.
+// `charCodeAt` like the DFA tables of std:utf8. Runs of ordinary bytes (a method, a header name, a header value) are
+// scanned in a tight loop and handled once per run, not once per byte; the state changes once per token. The loops
+// index a window (a `u8[]` copy of up to 4096 bytes of the chunk) instead of calling `Bytes.at` per byte; a body is a
+// slice of the chunk and is never scanned. Measured throughput and the cost model: docs/std.md.
 //
 // Contract standard (ADR-0030 §3): classes carry `@Invariant`s that `orin test` checks after every public method;
 // `Headers`, `Status`, `Request`, `Response` validate in their constructors in EVERY build (a header with CR/LF
@@ -1746,14 +1746,14 @@ class MessageParser {
     this.cur = j;
     if (j >= n) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
     const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= C_TOKEN) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
@@ -1796,14 +1796,14 @@ class MessageParser {
     this.cur = j;
     if (j >= n) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
     const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= 6) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
@@ -1980,14 +1980,14 @@ class MessageParser {
     this.cur = j;
     if (j >= n) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
     const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= C_HTAB) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
@@ -2081,14 +2081,14 @@ class MessageParser {
     this.cur = j;
     if (j >= n) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
     const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (c >= C_TOKEN) {
       if (j > i) {
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
@@ -2167,7 +2167,7 @@ class MessageParser {
     if (j >= n || (j == lim && HTTP_CLASS.charCodeAt(xs[j].toUsize()) >= C_HTAB)) {
       if (j > i) {
         const tok = sliceString(xs, i, j);
-        this.acc = this.acc.length == 0 ? tok : this.acc + tok;
+        this.acc += tok;
       }
       return;
     }
