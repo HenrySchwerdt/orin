@@ -1,0 +1,713 @@
+// Transitive effect inference (ADR-0037 D2, graph 2 "primitive / effect graph"; Stage B of ADR-0021).
+//
+// For every function, method, constructor (and class, for its field initialisers) of a type-checked program, the set
+// of primitive effects it MAY perform transitively, from the call sites of the semantic index (hir/index.or): the one
+// semantic engine behind `orin effects`, the OSIG `MAY_PERFORM` edges and `orin diff`, the LSP hover and the MCP
+// `inspect` tool. Nothing here re-derives call targets; it only closes the index's call graph.
+//
+// An effect is a compiler-owned primitive operation (`Fs.ReadFile`, `Stream.Write`-style names, see
+// `primitiveEffects` in check/index.or) with its direction (INPUT / OUTPUT / CONTROL) and the family of grant it
+// needs ("ambient": none), or one of four UNKNOWN kinds. Effects confer no permission: possessing the grant at the
+// operation stays mandatory (ADR-0037 D2); this is what a function may *do*, not what it may do *without a grant*.
+//
+// Evidence of an effect of a function:
+//   MUST     a primitive call (or call of a std scope function) written directly in the body, outside any closure;
+//            "MUST" is the evidence class of OSIG (a static occurrence), it does not say the call is on every path;
+//   MAY      everything else that is known: inherited from a callee, from a closure body (attributed to the function
+//            that creates the closure), from an implementation of an interface method;
+//   UNKNOWN  the target is not known (below). UNKNOWN is never "pure": it is an effect of its own kind.
+//
+// Soundness (the summary of a function contains every primitive operation an execution of it may perform):
+//   * direct calls, methods, constructors, bounded type parameters: the callee's summary is inherited (MAY);
+//   * a call through an interface: the interface method's summary is the union over every implementation that the
+//     program declares (`implements`, ImplLink), and `Unknown.Interface` when there is none;
+//   * a closure literal: the calls of its body are recorded as MAY call sites of the function that contains the
+//     literal, wherever the closure is called; a named function used as a value is a MAY edge of the function that
+//     takes it. So whoever runs a function value, the effects were already accounted where the value was made;
+//   * the call of a function value inside `g` is attributed to the value's origin when that is known: when the value
+//     is a parameter of `g` ("callbacks" of `g`), `g` has no effect of its own for it and every caller that passes a
+//     closure literal / a named function inherits it from the literal (above); a caller that passes a value of any
+//     other origin (a local, a field, a call result) gets `Unknown.Callback`, a caller that passes its own parameter on
+//     becomes parametric in turn (fixed point). A call of a function value of any other origin is `Unknown.FunctionValue`;
+//   * a call whose target the index could not map to a definition is `Unknown.Unresolved`;
+//   * recursion and mutual recursion: the summaries are the least fixed point of the inheritance, computed by rounds
+//     (round r adds what a callee gained in round r-1), so the explanation of an effect is the shortest call chain and
+//     every chain ends at a primitive call;
+//   * the module an effect is attributed to is the module whose code contains the call (for a closure: where the
+//     closure is written), not where it happens to run.
+// Remaining UNKNOWN sources: function values of unknown origin (fields, array elements, call results), interface
+// methods without a visible implementation, calls the index cannot resolve, and (outside this analysis) native code /
+// FFI. A program that does not type-check has no summary (`isTyped()` is false).
+
+import { SemanticIndex, SymbolDef, SkFunction, SkInterface } from "../hir";
+import { Span } from "../diag";
+import { cmpStr } from "./modgraph";
+
+// One kind of effect. `op` is the operation ("Fs.ReadFile", "Console.Write") or an UNKNOWN kind ("Unknown.*"); `dir` is
+// INPUT / OUTPUT / CONTROL ("" for UNKNOWN); `grant` the family of grant the operation needs, "ambient" or "".
+export type EffectKey = { op: string; dir: string; grant: string; };
+
+// The effect `key` (an index into the table's keys) of one node. `next` is the callee (a def id) the node inherits it
+// from, -1 when the node performs it itself: then `span` is the primitive call, else the call of `next` in the node's
+// body (a call in a closure counts for the function that contains the closure). `route` says how: "io" (a primitive),
+// the call route of the index (direct method virtual bound value constructor), "impl" (an implementation of an
+// interface method), or for UNKNOWN the reason (indirect callback unresolved interface). `depth` is the length of the
+// shortest call chain to the primitive (0 for a direct effect).
+export type EffEntry = {
+  key: usize;
+  ev: string;
+  next: int;
+  span: Span;
+  route: string;
+  depth: usize;
+};
+
+// One hop of an explanation path: the function, the place in its body, how the next hop is reached.
+export type EffStep = { def: usize; span: Span; route: string; ev: string; };
+
+export function isUnknownOp(op: string): bool {
+  return op.startsWith("Unknown.");
+}
+
+// The family of an operation: the part before the first dot ("Fs" of "Fs.ReadFile").
+export function familyOf(op: string): string {
+  const dot = op.indexOf(".");
+  return dot.isSome() ? op.substring(0, dot.unwrap()) : op;
+}
+
+function hasUsize(xs: usize[], x: usize): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Evidence order: MUST < MAY < UNKNOWN.
+export function evRank(ev: string): usize {
+  if (ev == "MUST") {
+    return 0;
+  }
+  if (ev == "MAY") {
+    return 1;
+  }
+  return 2;
+}
+
+// The effect summaries of one program. Built by `inferEffects`; queried by def id (an index into SemanticIndex.defs).
+// Slots are the defs that can carry effects: every function / method / constructor / interface method, and every def
+// that appears as caller or callee of a call site (a class: its field initialisers).
+@Invariant(this.entries.length == this.nodes.length)
+@Invariant(this.callbacks.length == this.nodes.length)
+@Invariant(this.pos.length == this.nodes.length * this.keys.length)
+@Invariant(this.slot.length == this.ndefs)
+export class EffectTable {
+  private typed: bool;
+  private ndefs: usize;
+  private keys: EffectKey[];
+  private nodes: usize[]; // slot -> def id
+  private slot: int[]; // def id -> slot, -1 for a def without effects
+  private entries: EffEntry[][]; // slot -> its effects, in discovery order
+  private callbacks: usize[][]; // slot -> the parameters (HIR indices) whose function values the node calls
+  private pos: int[]; // slot * keys.length + key -> index into entries[slot], -1 when absent
+
+  constructor(
+    typed: bool,
+    ndefs: usize,
+    keys: EffectKey[],
+    nodes: usize[],
+    slot: int[],
+    entries: EffEntry[][],
+    callbacks: usize[][],
+    pos: int[],
+  ) {
+    this.typed = typed;
+    this.ndefs = ndefs;
+    this.keys = keys;
+    this.nodes = nodes;
+    this.slot = slot;
+    this.entries = entries;
+    this.callbacks = callbacks;
+    this.pos = pos;
+  }
+
+  // False for a program that did not type-check: its index has no call sites, so there is no summary to trust.
+  isTyped(): bool {
+    return this.typed;
+  }
+
+  keyCount(): usize {
+    return this.keys.length;
+  }
+
+  @Requires(k < this.keys.length)
+  keyAt(k: usize): EffectKey {
+    return this.keys[k];
+  }
+
+  // Every def that has a slot (a summary, possibly empty), in def order.
+  defs(): usize[] {
+    return this.nodes;
+  }
+
+  hasSummary(def: usize): bool {
+    return def < this.slot.length && this.slot[def] >= 0;
+  }
+
+  // The parameters of `def` (HIR parameter indices, a method's receiver is 0) whose function values it calls: its
+  // effects depend on the arguments, and a caller that passes a closure literal has them from the literal.
+  @Requires(this.hasSummary(def))
+  callbacksOf(def: usize): usize[] {
+    return this.callbacks[this.slot[def].toUsize()];
+  }
+
+  // The effect `key` of `def`, if it has it.
+  @Requires(this.hasSummary(def))
+  @Requires(key < this.keys.length)
+  @Ensures(result.isSome() ==> result.unwrap().key == key)
+  entryFor(def: usize, key: usize): Option<EffEntry> {
+    const s = this.slot[def].toUsize();
+    const p = this.pos[s * this.keys.length + key];
+    if (p < 0) {
+      return None;
+    }
+    return Some(this.entries[s][p.toUsize()]);
+  }
+
+  // The effects of `def` in a deterministic order: by operation name, then direction.
+  @Requires(this.hasSummary(def))
+  @Ensures(result.length == this.entries[this.slot[def].toUsize()].length)
+  summary(def: usize): EffEntry[] {
+    const es = this.entries[this.slot[def].toUsize()];
+    let out: EffEntry[] = [];
+    for (const e of es) {
+      let at = out.length;
+      while (at > 0 && this.keyLess(e.key, out[at - 1].key)) {
+        at -= 1;
+      }
+      out = out.slice(0, at).concat([e]).concat(out.slice(at, out.length));
+    }
+    return out;
+  }
+
+  // True when `a` sorts before `b`.
+  keyLess(a: usize, b: usize): bool {
+    const c = cmpStr(this.keys[a].op, this.keys[b].op);
+    if (c != 0) {
+      return c < 0;
+    }
+    return cmpStr(this.keys[a].dir, this.keys[b].dir) < 0;
+  }
+
+  // True when `def` has no effect at all and calls no function value of a parameter.
+  @Requires(this.hasSummary(def))
+  isPure(def: usize): bool {
+    const s = this.slot[def].toUsize();
+    return this.entries[s].length == 0 && this.callbacks[s].length == 0;
+  }
+
+  // The explanation of the effect `key` of `def`: the shortest call chain, from `def` to the function that performs the
+  // primitive; the last step's span is the primitive call itself.
+  @Requires(this.hasSummary(def))
+  @Requires(key < this.keys.length)
+  @Requires(this.entryFor(def, key).isSome())
+  @Ensures(result.length >= 1 && result.length == this.entryFor(def, key).unwrap().depth + 1)
+  @Ensures(result[0].def == def)
+  path(def: usize, key: usize): EffStep[] {
+    let out: EffStep[] = [];
+    let cur = def;
+    let guard: usize = 0;
+    while (guard <= this.nodes.length) {
+      const e = this.entryFor(cur, key).unwrap();
+      out.push(EffStep { def: cur, span: e.span, route: e.route, ev: e.ev });
+      if (e.next < 0) {
+        return out;
+      }
+      cur = e.next.toUsize();
+      guard += 1;
+    }
+    return out;
+  }
+
+  // The structural property every path rests on: each node holds a key at most once (at the position `pos` says); a
+  // direct effect has depth 0 and is the only kind that is MUST; an inherited effect points at a callee that has the
+  // same key one round earlier, so every path is finite and ends at a primitive call. O(entries).
+  consistent(): bool {
+    const nk = this.keys.length;
+    let s: usize = 0;
+    while (s < this.nodes.length) {
+      let i: usize = 0;
+      while (i < this.entries[s].length) {
+        const e = this.entries[s][i];
+        if (e.key >= nk || this.pos[s * nk + e.key] != i.toInt()) {
+          return false;
+        }
+        if (e.next < 0 != (e.depth == 0)) {
+          return false;
+        }
+        if (e.ev == "MUST" && (e.next >= 0 || isUnknownOp(this.keys[e.key].op))) {
+          return false;
+        }
+        // an UNKNOWN kind has evidence UNKNOWN, every other effect MUST or MAY
+        if (isUnknownOp(this.keys[e.key].op)) {
+          if (e.ev != "UNKNOWN") {
+            return false;
+          }
+        } else if (e.ev != "MUST" && e.ev != "MAY") {
+          return false;
+        }
+        if (e.next >= 0) {
+          if (e.next.toUsize() >= this.slot.length || this.slot[e.next.toUsize()] < 0) {
+            return false;
+          }
+          const ns = this.slot[e.next.toUsize()].toUsize();
+          const pn = this.pos[ns * nk + e.key];
+          if (pn < 0 || this.entries[ns][pn.toUsize()].depth + 1 != e.depth) {
+            return false;
+          }
+        }
+        i += 1;
+      }
+      s += 1;
+    }
+    return true;
+  }
+}
+
+// ---- building ------------------------------------------------------------------------------------------------
+
+type Rev = { caller: usize; span: Span; route: string; }; // caller slot, call site, route
+
+function keyOfUnknown(route: string): string {
+  if (route == "indirect") {
+    return "Unknown.FunctionValue";
+  }
+  if (route == "callback") {
+    return "Unknown.Callback";
+  }
+  if (route == "interface") {
+    return "Unknown.Interface";
+  }
+  return "Unknown.Unresolved";
+}
+
+function findKey(keys: EffectKey[], op: string, dir: string): int {
+  let i: usize = 0;
+  while (i < keys.length) {
+    if (keys[i].op == op && keys[i].dir == dir) {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+function addKey(keys0: EffectKey[], op: string, dir: string, grant: string): EffectKey[] {
+  let keys = keys0;
+  if (findKey(keys, op, dir) < 0) {
+    keys.push(EffectKey { op: op, dir: dir, grant: grant });
+  }
+  return keys;
+}
+
+function parseDigits(s: string): int {
+  let n: int = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    n = n * 10 + (s.charCodeAt(i) - 48);
+    i += 1;
+  }
+  return n;
+}
+
+// The provenance entry of argument `j` in CallSite.fnArgs ("u" when it is not recorded: never assume a safe origin).
+function argKind(parts: string[], j: usize): string {
+  if (j < parts.length && parts[j] != "") {
+    return parts[j];
+  }
+  return "u";
+}
+
+function isIfaceMethod(idx: SemanticIndex, d: usize): bool {
+  return match (idx.defs[d].container) {
+    Some(c) => match (idx.defs[c].kind) {
+      SkInterface => true,
+      _ => false,
+    },
+    None => false,
+  };
+}
+
+function isFunctionDef(d: SymbolDef): bool {
+  return match (d.kind) {
+    SkFunction => true,
+    _ => false,
+  };
+}
+
+// The summaries of the program of `idx`.
+@Ensures(result.consistent())
+@Ensures(result.isTyped() == idx.typed)
+export function inferEffects(idx: SemanticIndex): EffectTable {
+  const nd = idx.defs.length;
+  let slot: int[] = [];
+  let k: usize = 0;
+  while (k < nd) {
+    slot.push(-1);
+    k += 1;
+  }
+  let nodes: usize[] = [];
+  let entries: EffEntry[][] = [];
+  let callbacks: usize[][] = [];
+  if (!idx.typed) {
+    return new EffectTable(false, nd, [], nodes, slot, entries, callbacks, []);
+  }
+  // 1. nodes: every function-like def, and every def that is the caller or callee of a call site
+  let isNode: bool[] = [];
+  k = 0;
+  while (k < nd) {
+    isNode.push(isFunctionDef(idx.defs[k]));
+    k += 1;
+  }
+  for (const c of idx.calls) {
+    if (c.caller < nd) {
+      isNode[c.caller] = true;
+    }
+    match (c.callee) {
+      Some(d) => {
+        if (d < nd) {
+          isNode[d] = true;
+        }
+      },
+      None => {},
+    }
+  }
+  k = 0;
+  while (k < nd) {
+    if (isNode[k]) {
+      slot[k] = nodes.length.toInt();
+      nodes.push(k);
+      const noe: EffEntry[] = [];
+      entries.push(noe);
+      const noc: usize[] = [];
+      callbacks.push(noc);
+    }
+    k += 1;
+  }
+  const ns = nodes.length;
+  // 2. the implementations of every interface method (synthetic call edges interface method -> implementation)
+  let kids: usize[][] = [];
+  k = 0;
+  while (k < nd) {
+    const noc: usize[] = [];
+    kids.push(noc);
+    k += 1;
+  }
+  for (const d of idx.defs) {
+    match (d.container) {
+      Some(c) => {
+        if (c < nd && isFunctionDef(d)) {
+          kids[c].push(d.id);
+        }
+      },
+      None => {},
+    }
+  }
+  let synthFrom: usize[] = []; // slot of the interface method
+  let synthTo: usize[] = []; // slot of an implementation
+  let synthSpan: Span[] = [];
+  let implCount: usize[] = [];
+  k = 0;
+  while (k < nd) {
+    implCount.push(0);
+    k += 1;
+  }
+  for (const l of idx.impls) {
+    if (l.iface >= nd || l.cls >= nd) {
+      continue;
+    }
+    for (const m of kids[l.iface]) {
+      implCount[m] += 1;
+      for (const im of kids[l.cls]) {
+        if (idx.defs[im].name == idx.defs[m].name && slot[m] >= 0 && slot[im] >= 0) {
+          synthFrom.push(slot[m].toUsize());
+          synthTo.push(slot[im].toUsize());
+          synthSpan.push(l.span);
+        }
+      }
+    }
+  }
+  // 3. effect keys, in order of first appearance
+  let keys: EffectKey[] = [];
+  for (const c of idx.calls) {
+    if (c.callee.isNone() && c.via.startsWith("io:")) {
+      const parts = c.via.substring(3, c.via.length).split("|");
+      keys = addKey(keys, parts[0], parts[1], parts[2]);
+    }
+  }
+  keys = addKey(keys, "Unknown.FunctionValue", "", "");
+  keys = addKey(keys, "Unknown.Callback", "", "");
+  keys = addKey(keys, "Unknown.Interface", "", "");
+  keys = addKey(keys, "Unknown.Unresolved", "", "");
+  const nk = keys.length;
+  let pos: int[] = [];
+  let pi: usize = 0;
+  while (pi < ns * nk) {
+    pos.push(-1);
+    pi += 1;
+  }
+  // 4. callbacks: parameters whose function values a node calls, to a fixed point over the argument provenance
+  for (const c of idx.calls) {
+    if (c.callee.isNone() && c.param >= 0 && c.caller < nd && slot[c.caller] >= 0) {
+      const sc = slot[c.caller].toUsize();
+      if (!hasUsize(callbacks[sc], c.param.toUsize())) {
+        callbacks[sc].push(c.param.toUsize());
+      }
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const c of idx.calls) {
+      match (c.callee) {
+        Some(d) => {
+          if (d >= nd || c.caller >= nd || slot[d] < 0 || slot[c.caller] < 0 || c.fnArgs == "") {
+            continue;
+          }
+          const parts = c.fnArgs.split(",");
+          const sd = slot[d].toUsize();
+          const sc = slot[c.caller].toUsize();
+          for (const j of callbacks[sd]) {
+            const kind = argKind(parts, j);
+            if (kind.startsWith("p")) {
+              const q = parseDigits(kind.substring(1, kind.length)).toUsize();
+              if (!hasUsize(callbacks[sc], q)) {
+                callbacks[sc].push(q);
+                changed = true;
+              }
+            }
+          }
+        },
+        None => {},
+      }
+    }
+    let si: usize = 0;
+    while (si < synthFrom.length) {
+      for (const j of callbacks[synthTo[si]]) {
+        if (!hasUsize(callbacks[synthFrom[si]], j)) {
+          callbacks[synthFrom[si]].push(j);
+          changed = true;
+        }
+      }
+      si += 1;
+    }
+  }
+  // 5. direct effects
+  let rev: Rev[][] = [];
+  let r0: usize = 0;
+  while (r0 < ns) {
+    const nor: Rev[] = [];
+    rev.push(nor);
+    r0 += 1;
+  }
+  let frontS: usize[] = [];
+  let frontK: usize[] = [];
+  for (const c of idx.calls) {
+    if (c.caller >= nd || slot[c.caller] < 0) {
+      continue;
+    }
+    const sc = slot[c.caller].toUsize();
+    match (c.callee) {
+      Some(d) => {
+        if (d >= nd || slot[d] < 0) {
+          continue;
+        }
+        const sd = slot[d].toUsize();
+        rev[sd].push(Rev { caller: sc, span: c.span, route: c.via });
+        if (c.fnArgs != "") {
+          // a function value of unknown origin handed to a callee that calls it
+          const parts = c.fnArgs.split(",");
+          for (const j of callbacks[sd]) {
+            if (argKind(parts, j) == "u") {
+              const key = findKey(keys, "Unknown.Callback", "").toUsize();
+              if (pos[sc * nk + key] < 0) {
+                pos[sc * nk + key] = entries[sc].length.toInt();
+                entries[sc].push(EffEntry {
+                  key: key,
+                  ev: "UNKNOWN",
+                  next: -1,
+                  span: c.span,
+                  route: "callback",
+                  depth: 0,
+                });
+                frontS.push(sc);
+                frontK.push(key);
+              }
+            }
+          }
+        }
+      },
+      None => {
+        if (c.via.startsWith("io:")) {
+          const parts = c.via.substring(3, c.via.length).split("|");
+          const key = findKey(keys, parts[0], parts[1]).toUsize();
+          const at = pos[sc * nk + key];
+          if (at < 0) {
+            pos[sc * nk + key] = entries[sc].length.toInt();
+            entries[sc].push(EffEntry {
+              key: key,
+              ev: c.ev,
+              next: -1,
+              span: c.span,
+              route: "io",
+              depth: 0,
+            });
+            frontS.push(sc);
+            frontK.push(key);
+          } else if (c.ev == "MUST" && entries[sc][at.toUsize()].ev != "MUST") {
+            entries[sc][at.toUsize()] = EffEntry {
+              key: key,
+              ev: "MUST",
+              next: -1,
+              span: c.span,
+              route: "io",
+              depth: 0,
+            };
+          }
+        } else if (c.param < 0) {
+          const key = findKey(keys, keyOfUnknown(c.via), "").toUsize();
+          if (pos[sc * nk + key] < 0) {
+            pos[sc * nk + key] = entries[sc].length.toInt();
+            entries[sc].push(EffEntry {
+              key: key,
+              ev: "UNKNOWN",
+              next: -1,
+              span: c.span,
+              route: c.via,
+              depth: 0,
+            });
+            frontS.push(sc);
+            frontK.push(key);
+          }
+        }
+      },
+    }
+  }
+  let si: usize = 0;
+  while (si < synthFrom.length) {
+    rev[synthTo[si]].push(Rev { caller: synthFrom[si], span: synthSpan[si], route: "impl" });
+    si += 1;
+  }
+  // an interface method that nothing implements: its callers cannot know the target
+  for (const d of idx.defs) {
+    if (isFunctionDef(d) && isIfaceMethod(idx, d.id) && implCount[d.id] == 0 && slot[d.id] >= 0) {
+      const sc = slot[d.id].toUsize();
+      const key = findKey(keys, "Unknown.Interface", "").toUsize();
+      if (pos[sc * nk + key] < 0) {
+        pos[sc * nk + key] = entries[sc].length.toInt();
+        entries[sc].push(EffEntry {
+          key: key,
+          ev: "UNKNOWN",
+          next: -1,
+          span: d.declSpan,
+          route: "interface",
+          depth: 0,
+        });
+        frontS.push(sc);
+        frontK.push(key);
+      }
+    }
+  }
+  // 6. inheritance by rounds: what a callee gained in the previous round, its callers gain in this one
+  while (frontS.length > 0) {
+    let nextS: usize[] = [];
+    let nextK: usize[] = [];
+    let fi: usize = 0;
+    while (fi < frontS.length) {
+      const n = frontS[fi];
+      const key = frontK[fi];
+      const have = entries[n][pos[n * nk + key].toUsize()];
+      const ev = isUnknownOp(keys[key].op) ? "UNKNOWN" : "MAY";
+      for (const e of rev[n]) {
+        if (pos[e.caller * nk + key] < 0) {
+          pos[e.caller * nk + key] = entries[e.caller].length.toInt();
+          entries[e.caller].push(EffEntry {
+            key: key,
+            ev: ev,
+            next: nodes[n].toInt(),
+            span: e.span,
+            route: e.route,
+            depth: have.depth + 1,
+          });
+          nextS.push(e.caller);
+          nextK.push(key);
+        }
+      }
+      fi += 1;
+    }
+    frontS = nextS;
+    frontK = nextK;
+  }
+  return new EffectTable(true, nd, keys, nodes, slot, entries, callbacks, pos);
+}
+
+// ---- consistency with the purity analysis (compiler/check/purity.or) ------------------------------------------------
+//
+// A function that has an effect is impure: both analyses see the same primitives (a contract in check/index.or ties
+// the two builtin tables together), the same unknown calls and the same closures. The converse need not hold: purity
+// treats every interface call as unknown, while the effect analysis takes the union over the implementations, so a
+// function whose only "effect" is a call of a pure implementation is impure for contracts and effect-free here.
+// `purityViolations` returns the defs that have an effect although every function lowered from them is pure; it is
+// empty for a correct pair of analyses (a test and `orin effects --check-purity` assert it).
+export function purityViolations(
+  idx: SemanticIndex,
+  t: EffectTable,
+  impure: bool[],
+  reached: bool[],
+): usize[] {
+  let anyImpure: bool[] = [];
+  let seen: bool[] = [];
+  let k: usize = 0;
+  while (k < idx.defs.length) {
+    anyImpure.push(false);
+    seen.push(false);
+    k += 1;
+  }
+  let f: usize = 0;
+  while (f < idx.fnDefs.length && f < impure.length) {
+    match (idx.fnDefs[f]) {
+      Some(d) => {
+        if (idx.fnKinds[f] == 0 && d < idx.defs.length && reached[f]) {
+          seen[d] = true;
+          if (impure[f]) {
+            anyImpure[d] = true;
+          }
+        }
+      },
+      None => {},
+    }
+    f += 1;
+  }
+  let out: usize[] = [];
+  for (const d of t.defs()) {
+    if (seen[d] && !anyImpure[d] && t.summary(d).length > 0) {
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+// HIR functions the index could not map to a definition: their call sites are not in the index, so an effect that only they
+// perform would be missed. Empty for every program checked so far; `orin effects --check-purity` and the tests assert it.
+export function unmappedFunctions(idx: SemanticIndex): usize[] {
+  let out: usize[] = [];
+  let f: usize = 0;
+  while (f < idx.fnDefs.length) {
+    if (idx.fnDefs[f].isNone()) {
+      out.push(f);
+    }
+    f += 1;
+  }
+  return out;
+}
