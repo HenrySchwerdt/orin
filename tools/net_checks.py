@@ -88,12 +88,19 @@ data = read_all(s)
 check("Connection: close: answer, then EOF", data.startswith(b"HTTP/1.1 200") and data.endswith(b"ok\n"))
 s.close()
 
-# a request split in many tiny segments still works (the deadline is generous enough)
+# a request split in many tiny segments still works. The bytes are paced against an absolute schedule
+# spread over a quarter of the request deadline: a coarse sleep (macOS coalesces short timers to 10 ms
+# and more) then delays one byte but does not add up over the request and run into the deadline.
 s = connect()
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 req = b"POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello"
+start = time.monotonic()
+step = (request_ms / 1000.0) * 0.25 / len(req)
 for i in range(len(req)):
     s.sendall(req[i:i + 1])
-    time.sleep(0.002)
+    pause = start + (i + 1) * step - time.monotonic()
+    if pause > 0:
+        time.sleep(pause)
 r = read_response(s)
 check("request sent byte by byte", r is not None and r[0] == 200 and r[2] == b"hello")
 s.close()
