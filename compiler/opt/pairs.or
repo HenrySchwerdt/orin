@@ -1,0 +1,627 @@
+// Pair-return elimination (stage 5 of the MIR optimiser; docs/mir.md v1.10 "In/out receiver").
+//
+// A mutating method with a result returns a freshly built two-slot record `{ self, value }` (ADR-0009): the
+// callee allocates it, the caller reads both slots and releases it. For a method called in a loop that is one
+// allocation, one retain and one release (plus the free) per call, for a value that never escapes.
+//
+// A function f is a *pair function* when its first parameter is an owned reference and every `return` returns
+// a record built in the same block, `r = struct tag0 {a, v}; [releases]; return r`, whose first slot `a` is a
+// reference local. The pass turns f into an `inout` function: it returns `v` directly and hands `a` back
+// through parameter 0 (`l0 = move a` before the return), see docs/mir.md. Every call site
+//
+//     d = call f(x, args)                 =>      v = call f(x, args)        -- x now holds the updated receiver
+//                                                 d = struct tag0 {x, v}     -- only if d escapes
+//
+// and, because the destructuring that follows is almost always `getfield d.0; dup; ..; getfield d.1; ..;
+// release d` inside one block, the record is not built at all (scalar replacement): `getfield d.0` becomes a
+// borrow of x, `getfield d.1` a borrow or copy of v, `release d` releases x and v, and `t = getfield d.0;
+// u = dup t` becomes `u = move x`. If d is used in any other way (stored, passed, returned, used in another
+// block, or a component is reassigned while d is live) the record is rebuilt at the call, exactly as before.
+// Functions that are closure targets or vtable entries, and `main`, keep their signature.
+//
+// The result is checked by the verifier like any other MIR (the inout rules are in docs/mir.md).
+
+import { MProgram, MFunction, MBlock, MLocal, MType, Instr, Operand, Terminator } from "../mir";
+import { Span } from "../diag";
+import { State, Cx, step, blockInStates, KDead } from "../verify";
+import { Counts, countsOf, instrUses, instrDef, termUses, isRefTy } from "./analysis";
+
+// A distinct code per type (MType has no equality of its own).
+function tyCode(t: MType): int {
+  return match (t) {
+    MInt => 0,
+    MUsize => 1,
+    MBool => 2,
+    MFloat => 3,
+    MHandle => 4,
+    MRef => 5,
+    MVoid => 6
+  };
+}
+
+function operandTy(f: MFunction, o: Operand): MType {
+  return match (o) {
+    OLocal(l) => f.locals[l].ty,
+    OInt(_) => MInt,
+    OUsize(_) => MUsize,
+    OBool(_) => MBool,
+    OFloat(_) => MFloat,
+    OStr(_) => MRef
+  };
+}
+
+function isLocalOp(o: Operand, l: usize): bool {
+  return match (o) {
+    OLocal(m) => m == l,
+    _ => false
+  };
+}
+
+function inList(xs: usize[], x: usize): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- the callee side
+
+// One `return` of a pair function: the record is built by instruction `at` of block `block`.
+type RetSite = { block: usize; at: usize; a: usize; v: Operand; };
+
+type PairShape = { ok: bool; ty: MType; sites: RetSite[]; };
+
+function noShape(): PairShape {
+  return PairShape { ok: false, ty: MVoid, sites: [] };
+}
+
+// The pair shape of f (or not ok). `pinned`: f is called through a function value.
+function pairShape(p: MProgram, fi: usize, pinned: bool[]): PairShape {
+  const f = p.functions[fi];
+  if (pinned[fi] || fi == p.main || f.inout || f.paramCount == 0 || !f.paramOwned[0] || !isRefTy(f.locals[0].ty) || !isRefTy(f.ret)) {
+    return noShape();
+  }
+  const cnt = countsOf(f);
+  let sites: RetSite[] = [];
+  let ty: MType = MVoid;
+  let have = false;
+  let states: Option<State>[] = [];
+  let haveStates = false;
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    match (blk.term) {
+      TReturn(ro) => {
+        match (ro) {
+          Some(o) => {
+            match (o) {
+              OLocal(r) => {
+                // the last definition of r in the block must be the record
+                let at: usize = blk.instrs.length;
+                let k: usize = 0;
+                while (k < blk.instrs.length) {
+                  match (instrDef(blk.instrs[k])) {
+                    Some(d) => {
+                      if (d == r) {
+                        at = k;
+                      }
+                    },
+                    None => {}
+                  }
+                  k += 1;
+                }
+                if (at == blk.instrs.length || cnt.uses[r] != 1 || cnt.defs[r] != 1) {
+                  return noShape();
+                }
+                match (blk.instrs[at]) {
+                  IStructNew(_, tag, slots) => {
+                    if (tag != 0 || slots.length != 2) {
+                      return noShape();
+                    }
+                    match (slots[0]) {
+                      OLocal(a) => {
+                        if (!isRefTy(f.locals[a].ty)) {
+                          return noShape();
+                        }
+                        const vt = operandTy(f, slots[1]);
+                        if (tyCode(vt) == 4 || tyCode(vt) == 6) {
+                          return noShape();
+                        }
+                        if (have && tyCode(vt) != tyCode(ty)) {
+                          return noShape();
+                        }
+                        ty = vt;
+                        have = true;
+                        // only releases of other locals may follow the record
+                        let m = at + 1;
+                        while (m < blk.instrs.length) {
+                          match (blk.instrs[m]) {
+                            IRelease(z) => {
+                              if (z == r || z == a || isLocalOp(slots[1], z)) {
+                                return noShape();
+                              }
+                            },
+                            _ => {
+                              return noShape();
+                            }
+                          }
+                          m += 1;
+                        }
+                        if (a != 0) {
+                          // parameter 0 must be dead where the record is built: it receives the new receiver
+                          if (!haveStates) {
+                            states = blockInStates(p, f);
+                            haveStates = true;
+                          }
+                          match (states[b]) {
+                            Some(st0) => {
+                              let c = Cx { prog: p, f: f, blk: b, ins: 0, st: st0, errs: [], warns: [] };
+                              let j: usize = 0;
+                              while (j < at) {
+                                c.ins = j;
+                                c = step(c, blk.instrs[j]);
+                                j += 1;
+                              }
+                              if (c.st.ls[0].k != KDead) {
+                                return noShape();
+                              }
+                            },
+                            None => {}
+                          }
+                        }
+                        sites.push(RetSite { block: b, at: at, a: a, v: slots[1] });
+                      },
+                      _ => {
+                        return noShape();
+                      }
+                    }
+                  },
+                  _ => {
+                    return noShape();
+                  }
+                }
+              },
+              _ => {
+                return noShape();
+              }
+            }
+          },
+          None => {
+            return noShape();
+          }
+        }
+      },
+      _ => {}
+    }
+    b += 1;
+  }
+  if (!have) {
+    return noShape();
+  }
+  return PairShape { ok: true, ty: ty, sites: sites };
+}
+
+// f as an inout function returning the second slot.
+function convertCallee(f: MFunction, sh: PairShape): MFunction {
+  let blocks: MBlock[] = [];
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    let site: Option<RetSite> = None;
+    for (const s of sh.sites) {
+      if (s.block == b) {
+        site = Some(s);
+      }
+    }
+    match (site) {
+      None => {
+        blocks.push(blk);
+      },
+      Some(s) => {
+        let out: Instr[] = [];
+        let sps: Span[] = [];
+        let k: usize = 0;
+        while (k < blk.instrs.length) {
+          if (k != s.at) {
+            out.push(blk.instrs[k]);
+            sps.push(blk.spans[k]);
+          }
+          k += 1;
+        }
+        if (s.a != 0) {
+          out.push(IMove(0, s.a));
+          sps.push(blk.spans[s.at]);
+        }
+        blocks.push(MBlock { instrs: out, spans: sps, term: TReturn(Some(s.v)), termSpan: blk.termSpan });
+      }
+    }
+    b += 1;
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: true,
+    locals: f.locals,
+    ret: sh.ty,
+    blocks: blocks
+  };
+}
+
+// ---------------------------------------------------------------- the call sites
+
+// Replacement plan for the instructions after a call whose record `d` is destructured in the same block.
+type Sra = { ok: bool; hit: bool[]; rep: Instr[][]; };
+
+function noSra(): Sra {
+  return Sra { ok: false, hit: [], rep: [] };
+}
+
+// Plan the scalar replacement of the record `d` built by the call at index `i` of `blk`; x and v are the
+// locals that hold its two components after the call (v is a reference iff vRef).
+function planSra(blk: MBlock, cnt: Counts, i: usize, d: usize, x: usize, v: usize, vRef: bool): Sra {
+  const n = blk.instrs.length;
+  let hit: bool[] = [];
+  let rep: Instr[][] = [];
+  let k: usize = 0;
+  while (k < n) {
+    hit.push(false);
+    rep.push([]);
+    k += 1;
+  }
+  if (cnt.defs[d] != 1) {
+    return noSra();
+  }
+  let alias: usize[] = [d];
+  let counted: usize[] = [0];
+  let clobbered = false;
+  let gets0: usize[] = [];
+  let gets1: usize[] = [];
+  let releases: usize[] = [];
+  let j = i + 1;
+  while (j < n) {
+    const ins = blk.instrs[j];
+    let handled = false;
+    match (ins) {
+      IGetField(t, o, slot) => {
+        match (o) {
+          OLocal(a) => {
+            if (inList(alias, a)) {
+              handled = true;
+              if (clobbered || slot > 1 || t == x || t == v || inList(alias, t)) {
+                return noSra();
+              }
+              let ai: usize = 0;
+              while (alias[ai] != a) {
+                ai += 1;
+              }
+              counted[ai] += 1;
+              if (slot == 0) {
+                gets0.push(j);
+              } else {
+                gets1.push(j);
+              }
+              hit[j] = true;
+            }
+          },
+          _ => {}
+        }
+      },
+      IRelease(a) => {
+        if (inList(alias, a)) {
+          handled = true;
+          if (clobbered) {
+            return noSra();
+          }
+          let ai: usize = 0;
+          while (alias[ai] != a) {
+            ai += 1;
+          }
+          counted[ai] += 1;
+          releases.push(j);
+          hit[j] = true;
+        }
+      },
+      IMove(a2, a) => {
+        if (inList(alias, a)) {
+          handled = true;
+          if (clobbered || cnt.defs[a2] != 1 || a2 == x || a2 == v || inList(alias, a2)) {
+            return noSra();
+          }
+          let ai: usize = 0;
+          while (alias[ai] != a) {
+            ai += 1;
+          }
+          counted[ai] += 1;
+          alias.push(a2);
+          counted.push(0);
+          hit[j] = true;
+        }
+      },
+      _ => {}
+    }
+    if (!handled) {
+      for (const u of instrUses(ins)) {
+        if (inList(alias, u)) {
+          return noSra();
+        }
+      }
+      match (instrDef(ins)) {
+        Some(df) => {
+          if (inList(alias, df)) {
+            return noSra();
+          }
+          if (df == x || df == v) {
+            clobbered = true;
+          }
+        },
+        None => {}
+      }
+    }
+    j += 1;
+  }
+  for (const u of termUses(blk.term)) {
+    if (inList(alias, u)) {
+      return noSra();
+    }
+  }
+  let ai: usize = 0;
+  while (ai < alias.length) {
+    if (cnt.uses[alias[ai]] != counted[ai]) {
+      return noSra();
+    }
+    ai += 1;
+  }
+  // last use of a component by `t = getfield d.k; u = dup t` is a move of the component
+  let movedX = false;
+  let movedV = false;
+  if (gets0.length == 1) {
+    const g = gets0[0];
+    match (blk.instrs[g]) {
+      IGetField(t, _, _) => {
+        if (g + 1 < n && cnt.uses[t] == 1) {
+          match (blk.instrs[g + 1]) {
+            IDup(u, o) => {
+              if (isLocalOp(o, t) && u != x) {
+                rep[g] = [];
+                hit[g + 1] = true;
+                rep[g + 1] = [IMove(u, x)];
+                movedX = true;
+              }
+            },
+            _ => {}
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  if (vRef && gets1.length == 1) {
+    const g = gets1[0];
+    match (blk.instrs[g]) {
+      IGetField(t, _, _) => {
+        if (g + 1 < n && cnt.uses[t] == 1) {
+          match (blk.instrs[g + 1]) {
+            IDup(u, o) => {
+              if (isLocalOp(o, t) && u != v && !hit[g + 1]) {
+                rep[g] = [];
+                hit[g + 1] = true;
+                rep[g + 1] = [IMove(u, v)];
+                movedV = true;
+              }
+            },
+            _ => {}
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  for (const g of gets0) {
+    if (!movedX) {
+      match (blk.instrs[g]) {
+        IGetField(t, _, _) => {
+          rep[g] = [IBorrow(t, x)];
+        },
+        _ => {}
+      }
+    }
+  }
+  for (const g of gets1) {
+    if (!movedV) {
+      match (blk.instrs[g]) {
+        IGetField(t, _, _) => {
+          rep[g] = vRef ? [IBorrow(t, v)] : [ICopy(t, OLocal(v))];
+        },
+        _ => {}
+      }
+    }
+  }
+  for (const r of releases) {
+    let rs: Instr[] = [];
+    if (!movedX) {
+      rs.push(IRelease(x));
+    }
+    if (vRef && !movedV) {
+      rs.push(IRelease(v));
+    }
+    rep[r] = rs;
+  }
+  return Sra { ok: true, hit: hit, rep: rep };
+}
+
+// Rewrite the calls of converted functions in f. `conv[g]`: the type of the value function g now returns.
+function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFunction {
+  let any = false;
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        ICall(_, g, _) => {
+          if (conv[g].isSome()) {
+            any = true;
+          }
+        },
+        _ => {}
+      }
+    }
+  }
+  if (!any) {
+    return f;
+  }
+  const cnt = countsOf(f);
+  let locals = f.locals;
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    const n = blk.instrs.length;
+    let hit: bool[] = [];
+    let rep: Instr[][] = [];
+    for (const _x of blk.instrs) {
+      hit.push(false);
+      rep.push([]);
+    }
+    let out: Instr[] = [];
+    let sps: Span[] = [];
+    let i: usize = 0;
+    while (i < n) {
+      const cs = blk.spans[i];
+      if (hit[i]) {
+        for (const r of rep[i]) {
+          out.push(r);
+          sps.push(cs);
+        }
+        i += 1;
+      } else {
+        let done = false;
+        match (blk.instrs[i]) {
+          ICall(dst, g, args) => {
+            if (conv[g].isSome()) {
+              done = true;
+              const vty = conv[g].unwrap();
+              const vRef = isRefTy(vty);
+              // the in/out argument: a local of its own (the call redefines it)
+              let x: usize = 0;
+              let direct = false;
+              match (args[0]) {
+                OLocal(x0) => {
+                  let isDst = false;
+                  match (dst) {
+                    Some(dd) => {
+                      isDst = dd == x0;
+                    },
+                    None => {}
+                  }
+                  if (x0 >= f.paramCount && !isDst) {
+                    x = x0;
+                    direct = true;
+                  }
+                },
+                _ => {}
+              }
+              if (!direct) {
+                x = locals.length;
+                locals.push(MLocal { name: "_", ty: MRef });
+                match (args[0]) {
+                  OLocal(x0) => {
+                    out.push(IMove(x, x0));
+                  },
+                  _ => {
+                    out.push(ICopy(x, args[0]));
+                  }
+                }
+              }
+              const v = locals.length;
+              locals.push(MLocal { name: "_", ty: vty });
+              let nargs: Operand[] = [OLocal(x)];
+              let k: usize = 1;
+              while (k < args.length) {
+                nargs.push(args[k]);
+                k += 1;
+              }
+              out.push(ICall(Some(v), g, nargs));
+              match (dst) {
+                None => {
+                  out.push(IRelease(x));
+                  if (vRef) {
+                    out.push(IRelease(v));
+                  }
+                },
+                Some(d) => {
+                  const plan = planSra(blk, cnt, i, d, x, v, vRef);
+                  if (plan.ok) {
+                    let j = i + 1;
+                    while (j < n) {
+                      if (plan.hit[j]) {
+                        hit[j] = true;
+                        rep[j] = plan.rep[j];
+                      }
+                      j += 1;
+                    }
+                  } else {
+                    out.push(IStructNew(d, 0, [OLocal(x), OLocal(v)]));
+                  }
+                }
+              }
+            }
+          },
+          _ => {}
+        }
+        if (!done) {
+          out.push(blk.instrs[i]);
+        }
+        while (sps.length < out.length) {
+          sps.push(cs);
+        }
+        i += 1;
+      }
+    }
+    blocks.push(MBlock { instrs: out, spans: sps, term: blk.term, termSpan: blk.termSpan });
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: f.inout,
+    locals: locals,
+    ret: f.ret,
+    blocks: blocks
+  };
+}
+
+export function pairReturns(p: MProgram, pinned: bool[]): MProgram {
+  let shapes: PairShape[] = [];
+  let conv: Option<MType>[] = [];
+  let anyConv = false;
+  let fi: usize = 0;
+  while (fi < p.functions.length) {
+    const sh = pairShape(p, fi, pinned);
+    shapes.push(sh);
+    if (sh.ok) {
+      conv.push(Some(sh.ty));
+      anyConv = true;
+    } else {
+      conv.push(None);
+    }
+    fi += 1;
+  }
+  if (!anyConv) {
+    return p;
+  }
+  let fns: MFunction[] = [];
+  fi = 0;
+  while (fi < p.functions.length) {
+    let f = p.functions[fi];
+    if (shapes[fi].ok) {
+      f = convertCallee(f, shapes[fi]);
+    }
+    fns.push(f);
+    fi += 1;
+  }
+  fi = 0;
+  while (fi < fns.length) {
+    fns[fi] = rewriteCalls(p, conv, fns[fi]);
+    fi += 1;
+  }
+  return MProgram { functions: fns, strings: p.strings, main: p.main, vtables: p.vtables, inlineFns: p.inlineFns };
+}
