@@ -1,0 +1,477 @@
+// Tests for std:http: the parser must give the same answer however the input is split into chunks (as `recv`
+// delivers them). Every message of a corpus (valid, invalid and partial; requests and responses; with small limits
+// so that the limit errors are in the corpus too) is fed one-shot, split at every byte position, in 1-byte chunks
+// and in random chunks (including empty chunks); the answers must be identical: same kind, same consumed byte
+// count, same error reason and position, same parsed message. Also: every proper prefix of a complete message needs
+// more, and an error is reported as soon as its byte (or the next one) is available.
+// Run with `orin test tests/std/http_split_test.or`, with and without `--no-contracts`.
+import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
+import { Bytes, bytesFromString } from "std:bytes";
+import { Request, Response, Limits, ParseResult, NeedMore, Done, Failed, RequestParser, ResponseParser, methodName, versionText,
+  reasonName } from "std:http";
+
+function bs(s: string): Bytes {
+  return bytesFromString(s);
+}
+
+function rep(s: string, n: usize): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    parts.push(s);
+    i += 1;
+  }
+  return parts.join("");
+}
+
+// Small limits: the corpus contains messages that violate each of them.
+function smallLimits(): Limits {
+  return new Limits(64, 8, 48, 256, 16, 64);
+}
+
+// A canonical text of a parsed message (everything the parser returns).
+function headersDump(names: string[], values: string[]): string {
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < names.length) {
+    parts.push(names[i] + "=" + values[i]);
+    i += 1;
+  }
+  return parts.join(",");
+}
+
+function dumpRequest(q: Request): string {
+  const h = q.headers();
+  const t = q.trailers();
+  let hn: string[] = [];
+  let hv: string[] = [];
+  let i: usize = 0;
+  while (i < h.count()) {
+    hn.push(h.nameAt(i));
+    hv.push(h.valueAt(i));
+    i += 1;
+  }
+  let tn: string[] = [];
+  let tv: string[] = [];
+  let j: usize = 0;
+  while (j < t.count()) {
+    tn.push(t.nameAt(j));
+    tv.push(t.valueAt(j));
+    j += 1;
+  }
+  return methodName(q.method()) + "|" + q.target() + "|" + versionText(q.version()) + "|" + headersDump(hn, hv) + "|"
+    + q.body().toHex() + "|" + headersDump(tn, tv);
+}
+
+function dumpResponse(q: Response): string {
+  const h = q.headers();
+  const t = q.trailers();
+  let hn: string[] = [];
+  let hv: string[] = [];
+  let i: usize = 0;
+  while (i < h.count()) {
+    hn.push(h.nameAt(i));
+    hv.push(h.valueAt(i));
+    i += 1;
+  }
+  let tn: string[] = [];
+  let tv: string[] = [];
+  let j: usize = 0;
+  while (j < t.count()) {
+    tn.push(t.nameAt(j));
+    tv.push(t.valueAt(j));
+    j += 1;
+  }
+  return versionText(q.version()) + "|" + q.status().code().toString() + "|" + q.status().reason() + "|" + headersDump(hn, hv)
+    + "|" + q.body().toHex() + "|" + headersDump(tn, tv) + "|" + (q.isBodyless() ? "bodyless" : "body");
+}
+
+// "NeedMore", "Done <total used> <dump>" or "Failed <reason> <position>". `start`: bytes fed before this chunk.
+function sigRequest(r: ParseResult<Request>, start: usize): string {
+  return match (r) {
+    NeedMore => "NeedMore",
+    Done(q, used) => "Done " + (start + used).toString() + " " + dumpRequest(q),
+    Failed(e) => "Failed " + reasonName(e.reason) + " " + e.position.toString()
+  };
+}
+
+function sigResponse(r: ParseResult<Response>, start: usize): string {
+  return match (r) {
+    NeedMore => "NeedMore",
+    Done(q, used) => "Done " + (start + used).toString() + " " + dumpResponse(q),
+    Failed(e) => "Failed " + reasonName(e.reason) + " " + e.position.toString()
+  };
+}
+
+// Feeds `wire` cut at the (non-decreasing) positions `cuts`; the answer of the first chunk that is not NeedMore, or
+// "NeedMore <consumed>" when the input ended without a result.
+function runRequest(wire: Bytes, cuts: usize[]): string {
+  let p = new RequestParser(smallLimits());
+  let start: usize = 0;
+  let k: usize = 0;
+  while (k <= cuts.length) {
+    const end = k < cuts.length ? cuts[k] : wire.length();
+    const s = sigRequest(p.feed(wire.slice(start, end)), start);
+    if (s != "NeedMore") {
+      return s;
+    }
+    start = end;
+    k += 1;
+  }
+  return "NeedMore " + p.consumed().toString();
+}
+
+function runResponse(wire: Bytes, cuts: usize[], forHead: bool, eof: bool): string {
+  let p = new ResponseParser(smallLimits(), forHead);
+  let start: usize = 0;
+  let k: usize = 0;
+  while (k <= cuts.length) {
+    const end = k < cuts.length ? cuts[k] : wire.length();
+    const s = sigResponse(p.feed(wire.slice(start, end)), start);
+    if (s != "NeedMore") {
+      return s;
+    }
+    start = end;
+    k += 1;
+  }
+  if (eof) {
+    return sigResponse(p.atEof(), wire.length());
+  }
+  return "NeedMore " + p.consumed().toString();
+}
+
+const SEED: int = 12345;
+
+function nextRandom(s: int): int {
+  return (s * 1103515245 + 12345) % 2147483648;
+}
+
+// Random cut positions for a message of `len` bytes: 0..8 cuts, in order, possibly equal (empty chunks).
+function randomCuts(len: usize, s: int): usize[] {
+  let r = s;
+  let n = (r / 65536) % 9;
+  let out: usize[] = [];
+  let cuts: int[] = [];
+  let i = 0;
+  while (i < n) {
+    r = nextRandom(r);
+    cuts.push((r / 65536) % (len.toInt() + 1));
+    i += 1;
+  }
+  // insertion sort
+  let a: usize = 1;
+  while (a < cuts.length) {
+    let b = a;
+    while (b > 0 && cuts[b - 1] > cuts[b]) {
+      const t = cuts[b - 1];
+      cuts[b - 1] = cuts[b];
+      cuts[b] = t;
+      b -= 1;
+    }
+    a += 1;
+  }
+  let c: usize = 0;
+  while (c < cuts.length) {
+    out.push(cuts[c].toUsize());
+    c += 1;
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------------ corpus
+
+function requestCorpus(): string[] {
+  const te = "POST /u HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n";
+  const post = "POST /s HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+  return [
+    // valid
+    "GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+    post,
+    te + "5;e=1\r\nhello\r\n3 ; q\r\nabc\r\n0\r\nX-T: 1\r\n\r\n",
+    te + "0\r\n\r\n",
+    te + "1\r\na\r\n1\r\nb\r\n1\r\nc\r\n0\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\n\r\n" + post,
+    "GET /old HTTP/1.0\r\n\r\n",
+    "GET /ws HTTP/1.1\r\nHost:  a \t\r\nX-A:\tv  w\t \r\nX-E:\r\nX-B:    \r\n\r\n",
+    "PUT /bin HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\n\x00\r\n\r\n\xff\x80",
+    "CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\n\r\n",
+    "OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET http://h/p?q HTTP/1.1\r\nHost: h\r\n\r\n",
+    "PURGE /x HTTP/1.1\r\nHost: a\r\nA: 1\r\na: 2\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\nGET",
+    "GET / HTTP/1.1\r\nHost: a\r\nX: " + rep("v", 30) + "\r\n\r\n",
+    // invalid: each rule once
+    "GET / HTTP/1.1\nHost: a\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\rX\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\n b\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost : a\r\n\r\n",
+    "G@T / HTTP/1.1\r\n\r\n",
+    "GET / HTTP/1.1\r\nHo(st: a\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\x00\r\n\r\n",
+    "GET / HTTP/1.2\r\n\r\n",
+    "GET / HTTP/2.0\r\n\r\n",
+    "GET / http/1.1\r\n\r\n",
+    "GET foo HTTP/1.1\r\nHost: a\r\n\r\n",
+    "GET /\xc3\xa9 HTTP/1.1\r\n\r\n",
+    "GET / HTTP/1.1\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a b\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nabcd",
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 4x\r\n\r\nabcd",
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+    "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+    te + "-1\r\n",
+    te + "FFFFFFFFFFFFFFFFF\r\n",
+    te + "41\r\n",
+    te + "g\r\n",
+    te + "\r\n",
+    te + "5\r\nhelloXX\r\n",
+    te + "5\r\nhello\n0\r\n\r\n",
+    te + "5;a\x01\r\n",
+    te + "5\n",
+    te + "0\r\n X: 1\r\n\r\n",
+    te + "0\r\nContent-Length: 1\r\n\r\n",
+    te + "0\r\nX: a\r\n\r\r",
+    // limits (smallLimits: start line 64, 8 headers, header line 48, head 256, chunk line 16, body 64)
+    "GET /" + rep("a", 70) + " HTTP/1.1\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nX: " + rep("v", 50) + "\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nA: 1\r\nB: 1\r\nC: 1\r\nD: 1\r\nE: 1\r\nF: 1\r\nG: 1\r\nH: 1\r\n\r\n",
+    "GET / HTTP/1.1\r\nHost: a\r\nA: " + rep("v", 40) + "\r\nB: " + rep("v", 40) + "\r\nC: " + rep("v", 40) + "\r\nD: " + rep("v", 40)
+      + "\r\nE: " + rep("v", 40) + "\r\nF: 1\r\n\r\n",
+    "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 65\r\n\r\n" + rep("b", 65),
+    te + "41\r\n" + rep("c", 65) + "\r\n0\r\n\r\n",
+    te + "00000000000000005\r\nhello\r\n0\r\n\r\n",
+    te + "20\r\n" + rep("d", 32) + "\r\n21\r\n",
+    // partial
+    "GET / HTTP/1.1\r\nHost: a\r\n\r",
+    "GET / HTT",
+    "",
+    te + "5\r\nhel"
+  ];
+}
+
+function responseCorpus(): string[] {
+  const ch = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+  return [
+    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX: y\r\n\r\nhello",
+    "HTTP/1.0 404 Not Found\r\n\r\nclose-delimited",
+    "HTTP/1.1 200 \r\nContent-Length: 0\r\n\r\n",
+    "HTTP/1.1 304 Not Modified\r\nETag: x\r\nContent-Length: 12\r\n\r\n",
+    "HTTP/1.1 204 No Content\r\n\r\nGET / HTTP/1.1",
+    "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\n",
+    ch + "3;x\r\nabc\r\n2\r\nde\r\n0\r\nT: 1\r\n\r\n",
+    ch + "0\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc",
+    "HTTP/1.1 200 OK\r\nServer: x",
+    "HTTP/1.1 20 OK\r\n\r\n",
+    "HTTP/1.1 600 OK\r\n\r\n",
+    "HTTP/1.1 200\r\n\r\n",
+    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+    "HTTP/1.1 200 OK\nX: a\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n",
+    "HTTP/1.1 200 O\x00K\r\n\r\n",
+    ch + "5\r\nhelloXX",
+    ch + "0\r\nContent-Length: 1\r\n\r\n",
+    "HTTP/1.1 200 " + rep("r", 60) + "\r\n\r\n",
+    "HTTP/1.1 200 OK\r\nContent-Length: 65\r\n\r\n",
+    "HTTP/1.0 200 OK\r\n\r\n" + rep("z", 65)
+  ];
+}
+
+// ------------------------------------------------------------------------------------------------ tests
+
+@Test
+function requestsSplitAtEveryBytePosition(): void {
+  const corpus = requestCorpus();
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    const whole = runRequest(wire, []);
+    let k: usize = 0;
+    while (k <= wire.length()) {
+      assertEqString(runRequest(wire, [k]), whole, "split at " + k.toString() + " of message " + m.toString());
+      k += 1;
+    }
+    m += 1;
+  }
+}
+
+@Test
+function requestsInOneByteChunks(): void {
+  const corpus = requestCorpus();
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    const whole = runRequest(wire, []);
+    let cuts: usize[] = [];
+    let k: usize = 1;
+    while (k < wire.length()) {
+      cuts.push(k);
+      k += 1;
+    }
+    assertEqString(runRequest(wire, cuts), whole, "1-byte chunks of message " + m.toString());
+    m += 1;
+  }
+}
+
+@Test
+function requestsInRandomChunks(): void {
+  const corpus = requestCorpus();
+  let r = SEED;
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    const whole = runRequest(wire, []);
+    let t = 0;
+    while (t < 40) {
+      r = nextRandom(r);
+      const cuts = randomCuts(wire.length(), r);
+      let label = "";
+      let c: usize = 0;
+      while (c < cuts.length) {
+        label += cuts[c].toString() + " ";
+        c += 1;
+      }
+      assertEqString(runRequest(wire, cuts), whole, "cuts [" + label + "] of message " + m.toString());
+      t += 1;
+    }
+    m += 1;
+  }
+}
+
+@Test
+function everyProperPrefixOfACompleteRequestNeedsMore(): void {
+  const corpus = requestCorpus();
+  let checked = 0;
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    const whole = runRequest(wire, []);
+    if (whole.startsWith("Done ")) {
+      // `Done n ...`: the message is the first n bytes
+      const n = parseCount(whole);
+      let k: usize = 0;
+      while (k < n) {
+        const s = runRequest(wire.slice(0, k), []);
+        assertEqString(s, "NeedMore " + k.toString(), "prefix of " + k.toString() + " bytes of message " + m.toString());
+        checked += 1;
+        k += 1;
+      }
+    }
+    m += 1;
+  }
+  assert(checked > 500, "enough prefixes were checked");
+}
+
+// The number after "Done ".
+function parseCount(sig: string): usize {
+  let n: usize = 0;
+  let i: usize = 5;
+  while (i < sig.length && sig.charCodeAt(i) >= 48 && sig.charCodeAt(i) <= 57) {
+    n = n * 10 + (sig.charCodeAt(i) - 48).toUsize();
+    i += 1;
+  }
+  return n;
+}
+
+@Test
+function failuresAreReportedOnceTheirLineIsComplete(): void {
+  const corpus = requestCorpus();
+  let failures = 0;
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    const whole = runRequest(wire, []);
+    if (whole.startsWith("Failed ")) {
+      failures += 1;
+      // "Failed <reason> <position>": the prefix that ends with the line holding the position already fails the
+      // same way (rules over a whole line, such as a duplicate Content-Length, are decided at its LF; byte rules
+      // are decided at the byte itself, so the prefix could be shorter, but never needs to be longer)
+      const parts = whole.split(" ");
+      const pos = countOf(parts[2]);
+      let upto = pos;
+      while (upto < wire.length() && wire.at(upto).toInt() != 10) {
+        upto += 1;
+      }
+      upto = upto < wire.length() ? upto + 1 : wire.length();
+      assertEqString(runRequest(wire.slice(0, upto), []), whole, "early failure of message " + m.toString());
+    }
+    m += 1;
+  }
+  assert(failures > 30, "many failure cases");
+}
+
+function countOf(digits: string): usize {
+  let n: usize = 0;
+  let i: usize = 0;
+  while (i < digits.length) {
+    n = n * 10 + (digits.charCodeAt(i) - 48).toUsize();
+    i += 1;
+  }
+  return n;
+}
+
+@Test
+function responsesSplitAtEveryBytePosition(): void {
+  const corpus = responseCorpus();
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    let mode = 0;
+    while (mode < 3) {
+      const forHead = mode == 1;
+      const eof = mode != 2;
+      const whole = runResponse(wire, [], forHead, eof);
+      let k: usize = 0;
+      while (k <= wire.length()) {
+        assertEqString(runResponse(wire, [k], forHead, eof), whole, "split at " + k.toString() + " of response " + m.toString() + " mode " + mode.toString());
+        k += 1;
+      }
+      let cuts: usize[] = [];
+      let c: usize = 1;
+      while (c < wire.length()) {
+        cuts.push(c);
+        c += 1;
+      }
+      assertEqString(runResponse(wire, cuts, forHead, eof), whole, "1-byte chunks of response " + m.toString() + " mode " + mode.toString());
+      mode += 1;
+    }
+    m += 1;
+  }
+}
+
+@Test
+function responsesInRandomChunks(): void {
+  const corpus = responseCorpus();
+  let r = SEED + 7;
+  let m: usize = 0;
+  while (m < corpus.length) {
+    const wire = bs(corpus[m]);
+    const whole = runResponse(wire, [], false, true);
+    let t = 0;
+    while (t < 30) {
+      r = nextRandom(r);
+      const cuts = randomCuts(wire.length(), r);
+      assertEqString(runResponse(wire, cuts, false, true), whole, "random cuts of response " + m.toString());
+      t += 1;
+    }
+    m += 1;
+  }
+}
+
+@Test
+function aBodyIsOneSliceWhenItArrivesInOneChunkAndConcatenatedOtherwise(): void {
+  const head = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n";
+  const wire = bs(head + "0123456789");
+  const one = runRequest(wire, []);
+  const split = runRequest(wire, [head.length + 3, head.length + 7]);
+  assertEqString(split, one, "a body in three pieces");
+  const chunked = bs("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n0123\r\n6\r\n456789\r\n0\r\n\r\n");
+  assert(runRequest(chunked, []).indexOf("30313233343536373839").isSome(), "chunks concatenated in order");
+}
