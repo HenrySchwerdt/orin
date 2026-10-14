@@ -251,6 +251,45 @@ function lexTemplateChunk(
   return Err(diag("E0100", span(file, open, open + 1), "unterminated template literal"));
 }
 
+// The next significant offset at or after `start` (whitespace and comments skipped). A pure function, not a
+// method: it runs once per token and reads only the source.
+@Requires(start <= src.length)
+@Ensures(result.isOk() ==> result.unwrap() >= start && result.unwrap() <= src.length)
+@Ensures(result.isErr() ==> result.unwrapErr().span.end <= src.length)
+function skipTrivia(file: usize, src: string, start: usize): Result<usize, Diagnostic> {
+  const n = src.length;
+  let i = start;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      i += 1;
+    } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
+      i += 2;
+      while (i < n && src.charCodeAt(i) != 10) {
+        i += 1;
+      }
+    } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 42) {
+      const cstart = i;
+      i += 2;
+      let closed = false;
+      while (i < n && !closed) {
+        if (src.charCodeAt(i) == 42 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
+          closed = true;
+          i += 2;
+        } else {
+          i += 1;
+        }
+      }
+      if (!closed) {
+        return Err(diag("E0100", span(file, cstart, cstart + 2), "unterminated block comment"));
+      }
+    } else {
+      return Ok(i);
+    }
+  }
+  return Ok(i);
+}
+
 // A `.` right after an identifier, `)` or `]` is a member access (`a.1` is then a parse error, not a float).
 function isMemberBase(c: int): bool {
   return isAlpha(c) || isDigit(c) || c == 41 || c == 93;
@@ -258,11 +297,15 @@ function isMemberBase(c: int): bool {
 
 // The lexer state: the source, the cursor `pos` and the tokens so far. `depth` holds the brace depth inside each open
 // `${ .. }` of a template literal (innermost last). The tokens are in source order and end at or before the cursor
-// (the full order / non-overlap property, `tokensWellFormed`, is the `@Ensures` of `run`).
+// (the full order / non-overlap property, `tokensWellFormed`, is the `@Ensures` of `run`). The first lexical error is
+// kept in `err` and ends the lexer: the methods return nothing, so a call costs no `(self, result)` pair (one per token).
 @Invariant(this.pos <= this.src.length)
 @Invariant(this.toks.length == 0 || this.toks[this.toks.length - 1].span.end <= this.pos)
 @Invariant(this.depth.every(d => d >= 0))
-@Invariant(!this.done || this.pos == this.src.length)
+@Invariant(!this.done || this.err.isSome() || this.pos == this.src.length)
+@Invariant(this.err.isNone() || this.done)
+@Invariant(this.err.isNone()
+    || this.err.unwrap().code == "E0100" && this.err.unwrap().span.end <= this.src.length)
 export class Lexer {
   private file: usize;
   private src: string;
@@ -270,6 +313,7 @@ export class Lexer {
   private toks: Token[] = [];
   private depth: int[] = [];
   private done: bool = false;
+  private err: Option<Diagnostic> = None;
 
   constructor(file: usize, src: string) {
     this.file = file;
@@ -286,60 +330,84 @@ export class Lexer {
     return this.toks;
   }
 
-  // True once only trivia was left: the cursor is at the end of the source and `run` appends KEof.
+  // True once only trivia was left (the cursor is at the end of the source and `run` appends KEof) or after an error.
   finished(): bool {
     return this.done;
   }
 
+  // The first lexical error, if any (it finished the lexer).
+  error(): Option<Diagnostic> {
+    return this.err;
+  }
+
+  // Records the first error and stops.
+  @Requires(this.err.isNone() && d.code == "E0100" && d.span.end <= this.src.length)
+  @Ensures(this.done && this.err.isSome())
+  private fail(d: Diagnostic): void {
+    this.err = Some(d);
+    this.done = true;
+  }
+
   // Lexes the next token (after whitespace and comments): one token is added, it starts at or after the old cursor and
   // ends at the new one, so the cursor advanced (progress: `run` terminates). When only trivia was left, no token is
-  // added, the cursor is at the end of the source and the lexer is `finished`.
+  // added, the cursor is at the end of the source and the lexer is `finished`. A lexical error finishes it with `error`.
   @Requires(!this.done)
-  @Ensures(result.isOk() && !this.done
+  @Ensures(!this.done
       ==> this.pos > old(this.pos)
           && this.toks.length == old(this.toks.length) + 1
           && this.toks[this.toks.length - 1].span.start >= old(this.pos)
           && this.toks[this.toks.length - 1].span.end == this.pos)
-  @Ensures(result.isOk() && this.done
+  @Ensures(this.done && this.err.isNone()
       ==> this.pos == this.src.length && this.toks.length == old(this.toks.length))
-  @Ensures(result.isErr()
-      ==> result.unwrapErr().code == "E0100" && result.unwrapErr().span.end <= this.src.length)
-  step(): Result<void, Diagnostic> {
-    this.pos = this.skipTrivia()?;
+  step(): void {
+    const sk = skipTrivia(this.file, this.src, this.pos);
+    if (sk.isErr()) {
+      this.fail(sk.unwrapErr());
+      return;
+    }
+    this.pos = sk.unwrap();
     const src = this.src;
     const n = src.length;
     const i = this.pos;
     if (i >= n) {
       this.done = true;
-      return Ok();
+      return;
     }
     const c = src.charCodeAt(i);
     if (isAlpha(c)) {
       this.ident();
-      return Ok();
+      return;
     }
     if (isDigit(c)) {
       const isHex = c == 48
           && i + 1 < n
           && (src.charCodeAt(i + 1) == 120 || src.charCodeAt(i + 1) == 88);
       if (!isHex) {
-        const isFloat = this.float()?;
-        if (isFloat) {
-          return Ok();
+        const before = this.toks.length;
+        this.float();
+        if (this.done || this.toks.length > before) {
+          return;
         }
       }
-      return this.number();
+      this.number();
+      return;
     }
     if (c == 34) {
-      return this.string();
+      this.string();
+      return;
     }
     if (c == 96) {
-      const ch = lexTemplateChunk(this.file, src, i, i + 1)?;
+      const r = lexTemplateChunk(this.file, src, i, i + 1);
+      if (r.isErr()) {
+        this.fail(r.unwrapErr());
+        return;
+      }
+      const ch = r.unwrap();
       this.emit(ch.ended ? KTplFull : KTplHead, ch.text, i, ch.end, 0);
       if (!ch.ended) {
         this.depth.push(0);
       }
-      return Ok();
+      return;
     }
     const open = this.depth.length;
     if (c == 123 && open > 0) {
@@ -347,16 +415,21 @@ export class Lexer {
     }
     if (c == 125 && open > 0) {
       if (this.depth[open - 1] == 0) {
-        const ch = lexTemplateChunk(this.file, src, i, i + 1)?;
+        const r = lexTemplateChunk(this.file, src, i, i + 1);
+        if (r.isErr()) {
+          this.fail(r.unwrapErr());
+          return;
+        }
+        const ch = r.unwrap();
         this.emit(ch.ended ? KTplTail : KTplMid, ch.text, i, ch.end, 0);
         if (ch.ended) {
           this.depth.pop();
         }
-        return Ok();
+        return;
       }
       this.depth[open - 1] -= 1;
     }
-    return this.punct();
+    this.punct();
   }
 
   // The whole token stream: lexes to the end, checks that every template interpolation was closed and appends KEof.
@@ -366,7 +439,10 @@ export class Lexer {
       ==> result.unwrapErr().code == "E0100" && result.unwrapErr().span.end <= this.src.length)
   run(): Result<Token[], Diagnostic> {
     while (!this.done) {
-      this.step()?;
+      this.step();
+    }
+    if (this.err.isSome()) {
+      return Err(this.err.unwrap());
     }
     const n = this.src.length;
     if (this.depth.length > 0) {
@@ -395,45 +471,6 @@ export class Lexer {
     this.pos = end;
   }
 
-  // The next significant offset at or after the cursor (whitespace and comments skipped).
-  @Ensures(result.isOk() ==> result.unwrap() >= this.pos && result.unwrap() <= this.src.length)
-  private skipTrivia(): Result<usize, Diagnostic> {
-    const src = this.src;
-    const n = src.length;
-    let i = this.pos;
-    while (i < n) {
-      const c = src.charCodeAt(i);
-      if (c == 32 || c == 9 || c == 10 || c == 13) {
-        i += 1;
-      } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
-        i += 2;
-        while (i < n && src.charCodeAt(i) != 10) {
-          i += 1;
-        }
-      } else if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 42) {
-        const cstart = i;
-        i += 2;
-        let closed = false;
-        while (i < n && !closed) {
-          if (src.charCodeAt(i) == 42 && i + 1 < n && src.charCodeAt(i + 1) == 47) {
-            closed = true;
-            i += 2;
-          } else {
-            i += 1;
-          }
-        }
-        if (!closed) {
-          return Err(
-            diag("E0100", span(this.file, cstart, cstart + 2), "unterminated block comment"),
-          );
-        }
-      } else {
-        return Ok(i);
-      }
-    }
-    return Ok(i);
-  }
-
   // Identifier or keyword at the cursor (an alphabetic character).
   private ident(): void {
     const src = this.src;
@@ -452,7 +489,7 @@ export class Lexer {
   }
 
   // Integer literal at the cursor (decimal or `0x` hexadecimal).
-  private number(): Result<void, Diagnostic> {
+  private number(): void {
     const src = this.src;
     const file = this.file;
     const n = src.length;
@@ -476,44 +513,47 @@ export class Lexer {
       }
     }
     if (i == dstart) {
-      return Err(diag("E0100", span(file, start, i), "hexadecimal literal has no digits"));
+      this.fail(diag("E0100", span(file, start, i), "hexadecimal literal has no digits"));
+      return;
     }
     if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
-      return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+      this.fail(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+      return;
     }
     const v = digitsValue(src, dstart, i, base);
     let big: Option<int> = None;
     if (v < 0) {
       big = bigDigitsValue(src, dstart, i, base);
       if (big.isNone()) {
-        return Err(
+        this.fail(
           diag(
             "E0100",
             span(file, start, i),
             "integer literal does not fit in 64 bits (the largest is 18446744073709551615)",
           ),
         );
+        return;
       }
     }
     if (base == 16 && i + 1 < n && src.charCodeAt(i) == 46 && isDigit(src.charCodeAt(i + 1))) {
-      return Err(
+      this.fail(
         diag("E0100", span(file, start, i + 1), "hexadecimal float literals are not supported"),
       );
+      return;
     }
     if (big.isSome()) {
       this.emit(KBigInt, src.substring(start, i), start, i, big.unwrap());
     } else {
       this.emit(KInt, src.substring(start, i), start, i, v);
     }
-    return Ok();
+    return;
   }
 
   // Float literal (ADR-0018) at the cursor (a digit): `D+ . D+ [exp]` or `D+ exp` with exp = `(e|E) [+-]? D+`.
-  // Ok(false), and nothing consumed, when the text is not a float literal (so it is an integer).
-  @Ensures(result.isOk() && !result.unwrap()
-      ==> this.pos == old(this.pos) && this.toks.length == old(this.toks.length))
-  @Ensures(result.isOk() && result.unwrap() ==> this.pos > old(this.pos))
-  private float(): Result<bool, Diagnostic> {
+  // No token and nothing consumed when the text is not a float literal (so it is an integer).
+  @Ensures(!this.done && this.toks.length == old(this.toks.length) ==> this.pos == old(this.pos))
+  @Ensures(this.toks.length > old(this.toks.length) ==> this.pos > old(this.pos))
+  private float(): void {
     const src = this.src;
     const file = this.file;
     const n = src.length;
@@ -558,10 +598,11 @@ export class Lexer {
       }
     }
     if (!hasFrac && !hasExp) {
-      return Ok(false);
+      return;
     }
     if (i < n && (isAlpha(src.charCodeAt(i)) || isDigit(src.charCodeAt(i)))) {
-      return Err(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+      this.fail(diag("E0100", span(file, start, i + 1), "invalid character in number literal"));
+      return;
     }
     // Range: decimal magnitude of the value must not exceed 308 (no float arithmetic here, so estimate
     // from the number of significant integer digits and the exponent).
@@ -579,14 +620,17 @@ export class Lexer {
     }
     if (hasExp) {
       if (expEnd - expStart > 4) {
-        return Err(diag("E0100", span(file, start, i), "float literal exponent out of range"));
+        this.fail(diag("E0100", span(file, start, i), "float literal exponent out of range"));
+        return;
       }
       const ev = digitsValue(src, expStart, expEnd, 10);
       if (seenNonZero && expSign != "-" && intDigits.toInt() - 1 + ev > 308) {
-        return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+        this.fail(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+        return;
       }
     } else if (intDigits > 309) {
-      return Err(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+      this.fail(diag("E0100", span(file, start, i), "float literal out of range for `float`"));
+      return;
     }
     let text = src.substring(start, intEnd) + ".";
     if (hasFrac) {
@@ -598,11 +642,11 @@ export class Lexer {
       text += "e" + expSign + src.substring(expStart, expEnd);
     }
     this.emit(KFloat, text, start, i, 0);
-    return Ok(true);
+    return;
   }
 
   // String literal at the cursor (the opening quote). The token text is the unescaped content.
-  private string(): Result<void, Diagnostic> {
+  private string(): void {
     const src = this.src;
     const file = this.file;
     const n = src.length;
@@ -612,7 +656,8 @@ export class Lexer {
     let run = i;
     while (true) {
       if (i >= n) {
-        return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
+        this.fail(diag("E0100", span(file, start, n), "unterminated string literal"));
+        return;
       }
       const c = src.charCodeAt(i);
       if (c == 34) {
@@ -621,30 +666,35 @@ export class Lexer {
         break;
       }
       if (c == 10) {
-        return Err(diag("E0100", span(file, start, i), "unterminated string literal"));
+        this.fail(diag("E0100", span(file, start, i), "unterminated string literal"));
+        return;
       }
       if (c == 92) {
         parts.push(src.substring(run, i));
         if (i + 1 >= n) {
-          return Err(diag("E0100", span(file, start, n), "unterminated string literal"));
+          this.fail(diag("E0100", span(file, start, n), "unterminated string literal"));
+          return;
         }
         const e = src.charCodeAt(i + 1);
         let code = simpleEscape(e);
         let adv: usize = 2;
         if (e == 120) {
           if (i + 3 >= n) {
-            return Err(diag("E0100", span(file, i, n), "invalid \\x escape"));
+            this.fail(diag("E0100", span(file, i, n), "invalid \\x escape"));
+            return;
           }
           const h1 = hexVal(src.charCodeAt(i + 2));
           const h2 = hexVal(src.charCodeAt(i + 3));
           if (h1 < 0 || h2 < 0) {
-            return Err(diag("E0100", span(file, i, i + 4), "invalid \\x escape"));
+            this.fail(diag("E0100", span(file, i, i + 4), "invalid \\x escape"));
+            return;
           }
           code = h1 * 16 + h2;
           adv = 4;
         }
         if (code < 0) {
-          return Err(diag("E0100", span(file, i, i + 2), "unknown escape sequence"));
+          this.fail(diag("E0100", span(file, i, i + 2), "unknown escape sequence"));
+          return;
         }
         parts.push(String.fromCharCode(code));
         i += adv;
@@ -654,11 +704,11 @@ export class Lexer {
       }
     }
     this.emit(KStr, parts.join(""), start, i, 0);
-    return Ok();
+    return;
   }
 
   // Punctuation at the cursor (longest match), or the lexical error for a character that starts no token.
-  private punct(): Result<void, Diagnostic> {
+  private punct(): void {
     const src = this.src;
     const file = this.file;
     const n = src.length;
@@ -671,7 +721,7 @@ export class Lexer {
     const ch = src.charAt(start);
     let len: usize = 0;
     if (c == 46 && isDigit(c2) && !(start > 0 && isMemberBase(src.charCodeAt(start - 1)))) {
-      return Err(
+      this.fail(
         diag(
           "E0100",
           span(file, start, start + 2),
@@ -679,14 +729,16 @@ export class Lexer {
               + src.substring(start, start + 2) + "`)",
         ),
       );
+      return;
     }
     if (c == 46 && c2 == 46) {
       if (start + 2 < n && src.charCodeAt(start + 2) == 46) {
         len = 3;
       } else {
-        return Err(
+        this.fail(
           diag("E0100", span(file, start, start + 2), "unexpected `..`; did you mean `...`?"),
         );
+        return;
       }
     } else if (c == 61 && c2 == 61 && start + 2 < n && src.charCodeAt(start + 2) == 62) {
       len = 3; // `==>` (implication, contract expressions only: ADR-0012)
@@ -700,12 +752,14 @@ export class Lexer {
       len = 1; // `@Name`: contract clause / annotation (ADR-0012); a lone `@` stays a lexical error
     } else {
       if (c >= 128) {
-        return Err(diag("E0100", span(file, start, start + 1), "unexpected non-ASCII character"));
+        this.fail(diag("E0100", span(file, start, start + 1), "unexpected non-ASCII character"));
+        return;
       }
-      return Err(diag("E0100", span(file, start, start + 1), "unexpected character `" + ch + "`"));
+      this.fail(diag("E0100", span(file, start, start + 1), "unexpected character `" + ch + "`"));
+      return;
     }
     this.emit(KPunct, src.substring(start, start + len), start, start + len, 0);
-    return Ok();
+    return;
   }
 }
 
