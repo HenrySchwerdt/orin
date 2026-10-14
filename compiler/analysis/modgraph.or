@@ -8,12 +8,15 @@ import { Json, JNull, JStr, JArr, JObj, JField, jField, stringifyJson } from "..
 import { Manifest, ruleIndex, displayModule } from "../package";
 
 export type ModDeps = {
-  module: string;          // module id ("." = root)
-  imports: string[];       // other modules imported by any file of this module, sorted
-  allowed: Option<string[]>;   // the manifest rule for this module, if any
+  module: string; // module id ("." = root)
+  imports: string[]; // other modules imported by any file of this module, sorted
+  allowed: Option<string[]>; // the manifest rule for this module, if any
 };
 
-// Byte-wise string comparison: negative, zero or positive; "." sorts before everything else.
+// Byte-wise string comparison: negative, zero or positive; "." sorts before everything else. A total order:
+// zero exactly for equal strings, and antisymmetric (the sorts below and OSIG's `sortOrder` rely on it).
+@Ensures(result == 0 == (a == b))
+@Ensures(b == "." && a != "." ==> result > 0)
 export function cmpStr(a: string, b: string): int {
   if (a == b) {
     return 0;
@@ -36,6 +39,21 @@ export function cmpStr(a: string, b: string): int {
   return a.length.toInt() - b.length.toInt();
 }
 
+// `xs` in non-decreasing order.
+export function strsSorted(xs: string[]): bool {
+  let i: usize = 1;
+  while (i < xs.length) {
+    if (cmpStr(xs[i - 1], xs[i]) > 0) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Insertion sort (stable); the lists are short (modules of a package, imports of a module).
+@Ensures(result.length == xs.length && strsSorted(result))
+@Ensures(xs.every(x => result.includes(x)))
 export function sortStrs(xs: string[]): string[] {
   let out: string[] = [];
   for (const x of xs) {
@@ -50,12 +68,9 @@ export function sortStrs(xs: string[]): string[] {
 
 function addUnique(xs: string[], x: string): string[] {
   let out = xs;
-  for (const y of out) {
-    if (y == x) {
-      return out;
-    }
+  if (!out.includes(x)) {
+    out.push(x);
   }
-  out.push(x);
   return out;
 }
 
@@ -82,7 +97,7 @@ export function moduleDeps(prog: LoadedProgram): ModDeps[] {
               imps = addUnique(imps, tm);
             }
           },
-          ImportStd(_) => {}
+          ImportStd(_) => {},
         }
       }
     }
@@ -94,7 +109,7 @@ export function moduleDeps(prog: LoadedProgram): ModDeps[] {
           allowed = Some(mf.rules[ri.unwrap()].allowed);
         }
       },
-      None => {}
+      None => {},
     }
     out.push(ModDeps { module: m, imports: sortStrs(imps), allowed: allowed });
   }
@@ -113,14 +128,19 @@ function showList(xs: string[]): string {
 export function depsText(prog: LoadedProgram, deps: ModDeps[]): string {
   let lines: string[] = [];
   match (prog.manifest) {
-    Some(mf) => { lines.push("package " + mf.name + " " + mf.version); },
-    None => {}
+    Some(mf) => {
+      lines.push("package " + mf.name + " " + mf.version);
+    },
+    None => {},
   }
   for (const d of deps) {
-    let line = displayModule(d.module) + " -> " + (d.imports.length == 0 ? "(none)" : showList(d.imports));
+    let line = displayModule(d.module) + " -> "
+        + (d.imports.length == 0 ? "(none)" : showList(d.imports));
     match (d.allowed) {
-      Some(a) => { line += " [allowed: " + (a.length == 0 ? "none" : showList(a)) + "]"; },
-      None => {}
+      Some(a) => {
+        line += " [allowed: " + (a.length == 0 ? "none" : showList(a)) + "]";
+      },
+      None => {},
     }
     lines.push(line);
   }
@@ -140,8 +160,12 @@ export function depsJson(prog: LoadedProgram, deps: ModDeps[]): Json {
   for (const d of deps) {
     let fs: JField[] = [jField("module", JStr(d.module)), jField("imports", strArr(d.imports))];
     match (d.allowed) {
-      Some(a) => { fs.push(jField("allowed", strArr(a))); },
-      None => { fs.push(jField("allowed", JNull)); }
+      Some(a) => {
+        fs.push(jField("allowed", strArr(a)));
+      },
+      None => {
+        fs.push(jField("allowed", JNull));
+      },
     }
     mods.push(JObj(fs));
   }
@@ -151,7 +175,7 @@ export function depsJson(prog: LoadedProgram, deps: ModDeps[]): Json {
       top.push(jField("package", JStr(mf.name)));
       top.push(jField("version", JStr(mf.version)));
     },
-    None => {}
+    None => {},
   }
   top.push(jField("modules", JArr(mods)));
   return JObj(top);

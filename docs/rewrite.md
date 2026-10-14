@@ -2,7 +2,7 @@
 
 How a module of `compiler/` is rewritten with the full language and contract clauses, as it was
 actually done for the first two modules (`compiler/diag/`, `compiler/loader/`, the trial run). The
-next modules (check, lower / opt / verify, backends, tooling) follow the same checklist.
+next modules (check, lower / opt / verify, backends, tooling: step 3e below) follow the same checklist.
 
 The rules are in [ADR-0015](decisions/0015-compiler-modernisation-and-contract-dogfooding.md): one
 module per PR, **behaviour-preserving**, no new language features, contracts for real invariants,
@@ -733,6 +733,188 @@ Friction:
   before it.
 * **Session tooling**: shell loops over compiler runs are refused in a worktree-isolated session (like compound `git`
   commands, see "Pitfalls found"); the corpus and comparison drivers were small Python scripts.
+
+## Step 3e: the tooling modules (`analysis/`, `lsp/`, `mcp/`, `json/`, `fmt/`) and the capability gate
+
+Rewritten to the contract and class standard: the state that the tooling threaded through records and free functions is now
+five classes, the exported functions state what they guarantee, and `analysis` performs no I/O of its own (the capability
+gate of Stage B). The exported surface is kept: the functional interfaces (`handle(fs, st, msg) -> { state, out }`,
+`openFile(ws, ..) -> Workspace`, `newState`, `format`, `parseJson`, `stringifyJson`, ...) are thin wrappers over the classes,
+so `mcp`, `testing`, `vc`, `main.or` and the tests needed only the renames below.
+
+| Old | New |
+|---|---|
+| `type Workspace = { files: SourceFile[]; revision }` + free functions that copy it | class `Workspace` (workspace.or): the document store; `open` / `close` / `text` / `paths` / `sources()` |
+| `type LspState` record, `handleRequest` / `reqX(fs, st, id, msg) -> LspStep` | class `LspServer` (lsp/handler.or): `handle` / `handleText` / `pump`; a request is answered by one private method that returns *the* reply |
+| `type McpState` record, `toolCheck` rebuilds it with a spread literal | class `McpSession` (mcp/util.or): root, rights, `record` / `find` / `latest` of the `check` snapshots |
+| `parseValue(s, i, depth) -> { v, pos }`, `parseString`, `parseNumber` threading the offset | class `JsonCursor` (json/parse.or): the read position over one text; `document()` |
+| `emit(j, out: string[]) -> string[]` (json.or) | `write.or`: `stringifyJson` / `quoteJson` with `map` / `join`; `jsonEq`, `nesting` in json.or |
+| `type Ctx = { src; cs }` + `seq(c, ..)`, `bracketed(c, ..)`, `findChar(c, ..)`, `gapsHave(c, ..)` | class `Layout` (fmt/layout.or): the source with its comment queue and the comment-placing operations; the printer calls `c.seq(..)` |
+| `readFile` / `exists` in `analysis` (`readText`, `resolveModulePath`, `loadOsigIn`) | `Workspace.sources()` / `new Sources([])`: reads go through the loader's `Sources` |
+| `analysis/osigcli.or`, `analysis/effectscli.or` (CLI, `writeFile`, `console.*`) | moved to `tools/` (the CLI layer, next to `orin fmt`); `analysis` exports no driver |
+| linear `for` searches (`hasStr`, `hasName`, `indexIn`, `hasLabel`, `containsIdx`, `sameSet`, ...) | `includes` / `some` / `every` / `findIndex` / `filter` / `map` (rule 7) |
+
+No `Printer` with an output buffer: the printer renders an element, measures it against the line width and renders it again
+broken over lines when it does not fit (`ex` with `lim`), so its results are values; a write-only buffer would need a rollback
+for every trial. The comment queue is the `Layout` class; its placement markers (`\x01 k \x02`) are what lets an enclosing
+construct see which comments an element already placed.
+
+Files (`orin fmt` output; most of these files had never been formatted, which accounts for most of the growth, e.g.
+`mcp/apitable.or` 192 -> 848 lines with no change of content; clauses are `@Requires` / `@Ensures` / `@Invariant` lines):
+
+| file | lines before -> after | requires | ensures | invariant |
+|---|---|---|---|---|
+| `analysis/analyze.or` | 188 -> 199 | 0 | 7 | 0 |
+| `analysis/apisnap.or` | 262 -> 264 | 0 | 2 | 0 |
+| `analysis/effectpolicy.or` | 226 -> 244 | 0 | 4 -> 7 | 0 |
+| `analysis/modgraph.or` | 162 -> 186 | 0 | 4 | 0 |
+| `analysis/osig.or` | 927 -> 1,195 | 1 | 6 | 0 |
+| `analysis/osigdiff.or` | 726 -> 808 | 0 | 5 | 0 |
+| `analysis/osigreport.or` | 602 -> 837 | 0 | 4 | 0 |
+| `analysis/pos.or` | 65 -> 78 | 0 | 3 | 0 |
+| `analysis/query.or` | 289 -> 407 | 8 | 19 | 0 |
+| `analysis/symbols.or` | 364 -> 479 | 0 | 3 | 0 |
+| `analysis/workspace.or` | 75 -> 137 | 0 | 10 | 3 |
+| `analysis/{effects,effectsum,doccomments}.or` (Stage B, unchanged) | 1,536 -> 1,538 | 11 | 16 | 4 |
+| `lsp/handler.or` | 670 -> 744 | 0 | 15 | 2 |
+| `lsp/frame.or`, `uri.or`, `convert.or` | 243 -> 284 | 0 | 11 | 0 |
+| `lsp/{server,stdio,format,module}.or` | 123 -> 123 | 0 | 0 | 0 |
+| `mcp/util.or` | 195 -> 286 | 4 | 14 | 5 |
+| `mcp/handler.or` | 101 -> 119 | 0 | 4 | 0 |
+| `mcp/tools.or` | 1,130 -> 1,418 | 1 | 3 | 0 |
+| `mcp/apitable.or` | 192 -> 848 | 0 | 2 | 0 |
+| `json/parse.or` | 310 -> 412 | 2 | 13 | 1 |
+| `json/json.or` + `write.or` (new) | 228 -> 308 | 0 | 4 | 0 |
+| `fmt/printer.or` | 1,248 -> 1,502 | 0 | 6 | 0 |
+| `fmt/layout.or` | 263 -> 330 | 2 | 4 | 1 |
+| `fmt/format.or`, `text.or` | 119 -> 155 | 0 | 6 | 0 |
+| `tools/osigcli.or`, `effectscli.or` (moved from `analysis`) | 242 -> 248 | 0 | 0 | 0 |
+| **total** (with the module files) | **10,589 -> 13,264** | **35 -> 213 clauses** (29 requires, 168 ensures, 16 invariants) | | |
+
+Classes: 1 -> 6 (`EffectTable` of Stage B, plus): `Workspace` (keys normalized and distinct, the revision only grows; `open`
+ensures the text is there and the revision moved by one, `close` that the path is gone), `LspServer` (`shutdown` only after
+`initialize`; every published path once), `McpSession` (root normalized, at most `MAX_SNAPS` snapshots, revisions increasing and
+below the next one; `record` ensures that the revision it returns names a stored snapshot and that an unchanged project keeps its
+revision), `JsonCursor` (the position never leaves the text; `value` consumes at least one byte on success), `Layout`
+(comments sorted, not overlapping, inside the text: what the binary search `firstAtOrAfter` relies on). `Snap` is a record with
+an invariant (`keys` and `lines` in step).
+
+Contracts, each with the bug it catches:
+
+* **JSON round trip**: `stringifyJson` ensures `nesting(j) <= MAX_DEPTH ==> parsesBackTo(result, j)` (structural `jsonEq`),
+  `quoteJson` ensures its literal reads back. Catches a missing escape, a number the parser cannot read (it did: below), a
+  field order change. `parseJson` / `JsonCursor.document` ensure a successful parse consumed the whole text and stays within
+  `MAX_DEPTH`, and an error names an offset inside the text (`errorInRange`); `value` ensures progress (a parse that does not
+  advance would loop) and `depth + nesting(result) <= MAX_DEPTH`; `utf8` requires a scalar value (a surrogate would make the
+  output invalid UTF-8).
+* **Positions**: `offsetToPos` ensures `isCharBoundary(text, off) ==> posToOffset(text, offsetToPos(text, off)) == off`;
+  `posToOffset` ensures its result is a character boundary inside the text. Catches a unit-counting rule that drifts between
+  the two directions (a hover or rename one character off after a non-ASCII character).
+* **The reply rule** (LSP and MCP): `LspServer.handle` ensures `repliesTo(msg, result)`: a request gets exactly one response,
+  carrying the id it was given (`jsonEq`, so string, number and object ids), everything else is a notification and a
+  notification gets no response; nothing after `exit`. `handleText` ensures a text that is not JSON is answered once with id
+  null. The private `request` ensures `answers(result, id)`, `notify` that it returns only notifications. MCP `handle` /
+  `handleText` ensure the same rule. Catches a handler that answers twice, forgets to answer, or answers with another id
+  (a client hangs or mismatches replies).
+* **References point at existing definitions** (query.or): every query requires `defIdsDense(idx)` (`defs[i].id == i`, which
+  the checker's `addDef` guarantees and the hit search relies on); `hitAt` ensures the hit is an occurrence of a definition
+  that exists; `referencesOfDef` ensures every span is an occurrence of `def` (`isOccurrence`: its name or one of its refs),
+  no span twice, the declaration first when asked for and absent otherwise; `definitionAt` ensures a definition's name;
+  `implementationsOfDef` that every span is a definition's name; `renameEdits` that every edit has the new name and lies on an
+  occurrence of the symbol at the cursor. Catches a reference list that mixes symbols (a rename that edits another symbol).
+* **Formatter**: `format` ensures `sameComments(src, result)` (same multiset of comment texts) and idempotence
+  (`format(result) == result`, a self-call, ADR-0031 A5); `printModule` ensures every comment of the file is placed
+  (`allPlaced` of its marker), `Layout.seq` / `bracketed` / `block` ensure every comment of their range; `quote` ensures a
+  one-line, valid UTF-8 literal. Catches a comment lost or doubled by a new layout rule, a non-canonical output.
+* **Capability-relevant analysis**: `analyze` ensures every diagnostic names a file of the source map and a range inside its
+  text (`diagsInRange`: the synthetic `main` of a library entry never leaks a position), `program` and `index` together;
+  `readText` returns the buffer when there is one; `resolveModulePath` a normalized `.or` path, never for `std:`.
+* **OSIG**: `buildOsig` ensures the hash and sorted, distinct node ids; `osigJson` ensures `parseOsig` reads it back with the same
+  hash (a field written but not read would break every later `orin diff`); `sortOrder` (merge sort) a stable permutation;
+  `cmpStr` a total order; `diffOsig` no differences for two snapshots of equal content; `diffJson` one JSON document whose
+  `differences` is `hasDifferences`; `diffHtml` no `<script`.
+* **MCP**: `McpSession` (above), `resolvePath` a normalized path inside the root, `applyEdits` requires disjoint edits inside
+  the text and ensures the resulting length, `hashStr` stays in range, `shq` one quoted word, the API table has unique names.
+* **Framing**: `frameMessage` ensures `unframe` reads back exactly the body (a `Content-Length` in characters instead of bytes),
+  `unframe` that the rest is the tail of the buffer; `pathToUri` ensures `uriToPath` gives the path back (an unescaped `%`).
+
+Mutation check: 16 hand-made mutants of the new code (a number that does not advance the cursor, `\` not escaped, 20-digit
+numbers accepted, a reused revision, an unbounded snapshot list, an unnormalized buffer key, `close` by raw spelling,
+continuation bytes counted as characters, `initialize` answered with id null, `shutdown` answered with a notification, `ping`
+answered twice, references of other definitions included, a hit on the wrong definition, a trailing comment dropped, `%` not
+escaped in URIs, `Content-Length` off by one) against `compiler/tests/tooling_test.or`: all 16 killed, 14 by a contract trap (with the values of the clause), 2 by an
+assertion (continuation bytes, 20-digit numbers). Five survived the first run because the test never exercised the path
+(closing a buffer by another spelling, a hit on a declaration that is not the first definition, a framed message, a path with a
+valid `%XX`, a 20-digit number); the test now does, and the contracts of those paths kill them.
+
+Defects found and fixed:
+
+* **JSON: the serializer wrote numbers the parser rejected.** `parseJson` refused integers with more than 18 digits, but
+  `stringifyJson` writes any `int` (`i64::MIN`, any value from 10^18 on): the round-trip contract failed on them. The
+  parser now reads every `int` (19 digits checked against the bounds, accumulated on the side of the sign so that `i64::MIN`
+  does not overflow) and rejects only values outside the i64 range; `json_test.or` was updated (`1234567890123456789` is now
+  read, `9223372036854775808` and 20 digits are errors).
+* **Effect policy diagnostics pointed into the wrong file.** E0474 (unknown effect name) and E0502 (a table of a missing
+  module) are found after loading, but kept the file id 0 of the manifest parse, so they were rendered as a position in the
+  program's first source file (`src/main.or:19:1` for a line of `orin.toml`), and the contract-checked compiler trapped on
+  `render`'s `isRenderable` precondition. `Manifest` now carries its `source` (the loader sets it), the policy relocates the
+  spans to the manifest's place in `policySourceMap(prog, sm)`, and `main.or` / `orin effects` render against that map; the
+  location is now `orin.toml:24:12`. `effectPolicyDiags` ensures `allRenderable(policySourceMap(..), result)`;
+  `tools/test_effects.py` checks the file name. (Found by running the effect suite with the contract-checked compiler.)
+
+Not done: `lsp::shellRun` (the only `shell` call) stays: there is no `spawn(proc, executable, argv)` in the standard library
+yet (ADR-0037 D5). The 13 strict-contract warnings W0471 of `compiler/vc/` (public mutating methods of `Gen` / `Tab` without
+`@Ensures`) are older than this step and outside its modules.
+
+Unit tests: `compiler/tests/tooling_test.or` (16 `@Test`: JSON round trip, equality, cursor, error offsets, nesting limit;
+position round trip; workspace store and reads through `Sources`; index queries; the LSP and MCP reply rule on scripted
+sessions and its predicate on hand-built replies; MCP revisions; formatter idempotence and comments; `Layout`), run by
+`tools/test_tooling.sh`. `json_test.or`, `analysis_test.or`, `lsp_test.or` were adapted (`LspServer`, `revision()`, the number
+rule); they also pass when built with `--check-contracts`.
+
+Behaviour preservation (against the baseline compiler built from `origin/main` before the step):
+
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,513,150 bytes), conformance 141/141;
+* generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
+  `examples/` program and of `compiler/main.or` (426 inputs x 3), baseline compiler vs new compiler: **0 differences**;
+* `tools/diff_compilers.py`: 1,412 inputs x 3 modes, **0 differences** (no conformance input has an `[effects]` table, so the
+  relocated E0474 / E0502 do not show there; `tools/test_effects.py` checks them);
+* conformance `--suite all` 812/812 (C), default suite with `--backend=llvm` 141/141;
+* `tools/test_compiler_contracts.sh`: contract-checked self-compile byte-identical to `stage2.c`, 812/812 conformance tests,
+  verifier contracts 809/809, **no contract fired**; `tools/test_lsp.py` (100 checks), `test_mcp.py` (188), `test_osig.py` (101),
+  `test_effects.py` (89) also pass with the contract-checked compiler as the binary under test (that run found the E0474 defect);
+* `tools/test_tooling.sh`, `tools/test_fmt.py` (13 goldens, 1,584 corpus files: idempotence, AST and comment preservation,
+  61 JSON diagnostics; 1,658 passed), `test_lsp.py`, `test_mcp.py`, `test_osig.py`, `test_effects.py`: pass;
+* `orin fmt --stdout` of the 1,609-file formatter corpus with the contract-checked compiler: output byte-identical to the
+  baseline's, no contract fired (idempotence and comment contracts on every file);
+* `orin check --strict-contracts compiler/main.or`: 13 warnings, the same 13 W0471 of `compiler/vc/` as on `origin/main`;
+  none in the modules of this step (`LspServer.pump` got its `@Ensures`).
+
+Selfcompile (callgrind instruction counts of `orin2 compile compiler/main.or -o /dev/null`; the machine was shared, so
+instructions rather than wall time): baseline compiler on the old tree 38,236,442,981; new compiler on the new tree
+38,419,783,870 (+0.48 %); baseline compiler on the new tree 38,419,717,402. The two compilers on the same tree differ by
+66,468 instructions (+0.0002 %): the growth is the larger input (the formatted and annotated tooling sources), not a slower
+compiler. Contracts are erased in the normal build; the tooling code does not run during a compile.
+
+Friction:
+
+* **A class cannot hand itself out.** `LspServer.pump` returns `Pumped { state: this, .. }` for the functional interface; the
+  free functions copy the class into a `let`, call the mutating method and return the copy (`handle(fs, st, msg)`). The MCP
+  tools still thread the session through `ToolOut.st` because only `check` changes it and the tool functions are free
+  functions; a `&mut` parameter would remove both.
+* **Grants in tests.** A closure cannot capture a grant (E0452), so a test that needs both the file-system and the process grant
+  uses `useHost(host, (fs, proc, stdio, clock) => ..)` and a helper function instead of nesting `useFs` / `useProcess`.
+* **No `lastIndexOf`, no `Option.map`, `every` without an index.** `errorOffset` splits the message, `findField` uses
+  `findIndex`, `sortDesc`'s ordering predicate is a loop.
+* **`reduce` takes the function first** (`xs.reduce(f, init)`), and an `int` literal does not meet a `usize` accumulator; the
+  length sum of `unframe`'s contract is a loop.
+* **The word "digits" in a shell command** made the worktree sandbox refuse it (it contains `git`); scripts were written to
+  files instead.
+* **`orin fmt` had never run on these modules**: the first formatting is most of the line growth (`apitable.or` alone 192 ->
+  848); the clause counts are unaffected.
+* **Contract cost of self-calls.** A clause that re-renders (`ex` ensuring the broken form equals `exBreak(..)`) doubles the work
+  at every nesting level, exponential in the depth; it was dropped. `format`'s idempotence clause runs the formatter twice per
+  call, acceptable because only the contract-checked build pays it.
 
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 

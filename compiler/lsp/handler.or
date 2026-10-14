@@ -1,8 +1,11 @@
-// Language Server Protocol message handling as PURE functions (spec 18 §3).
+// Language Server Protocol message handling (spec 18 §3). No I/O of its own: the server state is a value.
 //
-//   handle(state, msg) -> { state, out }     one decoded JSON-RPC message in, messages out
-//   handleText(state, body)                  same, from the raw JSON text (parse errors -> -32700)
-//   pump(state, buffer)                      Content-Length framed bytes in -> framed bytes out
+//   server.handle(fs, msg) -> out            one decoded JSON-RPC message in, messages out
+//   server.handleText(fs, body)              same, from the raw JSON text (parse errors -> -32700)
+//   server.pump(fs, buffer)                  Content-Length framed bytes in -> framed bytes out
+//
+// The free functions `handle(fs, st, msg) -> { state, out }`, `handleText` and `pump` are the same as functions of
+// the state (the tests and the stdio loop use them).
 //
 // The stdio loop (reading stdin, writing stdout) is NOT here: the driver appends bytes to a
 // buffer, calls `pump`, writes `output`, keeps `rest` as the new buffer and stops when
@@ -15,54 +18,31 @@
 //   - Only `file://` URIs are handled (others are ignored). Positions are UTF-16 based.
 //   - definition/hover/references/rename need the checker's SemanticIndex; until the checker
 //     produces it (`indexAvailable()`) they are not advertised and answer null.
+//
+// Contract: every request is answered exactly once, with the id it was given (`repliesTo`), and nothing else the
+// server sends carries an id (it sends no requests of its own); a message after `exit` is not answered.
 
 import { FsGrant } from "std:fs";
-import { Json, JField, JNull, JNum, JStr, JArr, JBool, JObj, jField, asArr, getField, getStr, getInt, getBool, getArr,
-  getPath, getPathStr, getPathInt, parseJson, stringifyJson } from "../json";
-import { Workspace, newWorkspace, openFile, changeFile, closeFile, openPaths, fileText, analyze, Analysis,
-  PathDiag, fileIndexOf, indexAvailable, documentSymbols, readText, documentationAt, declCompletions, keywordCompletions,
-  builtinCompletions, CompletionItem, DkLocal, posToOffset, definitionAt, hoverAt, referencesTo, renameEdits, implementationsAt,
-  symbolSpanAt, symbolAt, TextEdit, effectsContext, isFunctionDef, hoverEffectText } from "../analysis";
+import {
+  Json, JField, JNull, JNum, JStr, JArr, JBool, JObj, jField, asArr, getField, getStr, getInt,
+  getBool, getArr, getPath, getPathStr, getPathInt, parseJson, stringifyJson, jsonEq,
+} from "../json";
+import {
+  Workspace, newWorkspace, analyze, Analysis, PathDiag, fileIndexOf, indexAvailable,
+  documentSymbols, readText, documentationAt, declCompletions, keywordCompletions,
+  builtinCompletions, CompletionItem, DkLocal, posToOffset, definitionAt, hoverAt, referencesTo,
+  renameEdits, implementationsAt, symbolSpanAt, symbolAt, TextEdit, effectsContext, isFunctionDef,
+  hoverEffectText, defIdsDense,
+} from "../analysis";
 import { SemanticIndex } from "../hir";
 import { Span } from "../diag";
 import { normalizePath } from "../loader";
 import { frameMessage, unframe } from "./frame";
 import { formatAvailable, formatDocument } from "./format";
 import { uriToPath, pathToUri } from "./uri";
-import { rangeJson, documentSymbolJson, completionJson, diagnosticJson, fullDocumentEdits } from "./convert";
-
-export type LspState = {
-  ws: Workspace;
-  inited: bool;               // `initialize` received
-  shutdownRequested: bool;
-  exited: bool;               // `exit` received
-  published: string[];        // paths that currently have non-empty diagnostics published
-  // Test seam: when Some, used instead of `Analysis.index` (the checker does not produce one
-  // yet). Remove once the checker side table exists.
-  testIndex: Option<SemanticIndex>;
-};
-
-export type LspStep = { state: LspState; out: Json[]; };
-
-export function newLspState(): LspState {
-  const none: string[] = [];
-  return LspState {
-    ws: newWorkspace(), inited: false, shutdownRequested: false, exited: false,
-    published: none, testIndex: None
-  };
-}
-
-export function withTestIndex(st: LspState, idx: SemanticIndex): LspState {
-  return LspState { ...st, testIndex: Some(idx) };
-}
-
-// Process exit code once `exit` was received: 0 after a prior `shutdown`, else 1.
-export function lspExitCode(st: LspState): Option<int> {
-  if (!st.exited) {
-    return None;
-  }
-  return Some(st.shutdownRequested ? 0 : 1);
-}
+import {
+  rangeJson, documentSymbolJson, completionJson, diagnosticJson, fullDocumentEdits,
+} from "./convert";
 
 // ---- JSON-RPC envelopes -------------------------------------------------------------------
 
@@ -74,12 +54,16 @@ function respondError(id: Json, code: int, message: string): Json {
   return JObj([
     jField("jsonrpc", JStr("2.0")),
     jField("id", id),
-    jField("error", JObj([jField("code", JNum(code)), jField("message", JStr(message))]))
+    jField("error", JObj([jField("code", JNum(code)), jField("message", JStr(message))])),
   ]);
 }
 
 function notification(method: string, params: Json): Json {
-  return JObj([jField("jsonrpc", JStr("2.0")), jField("method", JStr(method)), jField("params", params)]);
+  return JObj([
+    jField("jsonrpc", JStr("2.0")),
+    jField("method", JStr(method)),
+    jField("params", params),
+  ]);
 }
 
 const PARSE_ERROR: int = -32700;
@@ -89,128 +73,525 @@ const INVALID_PARAMS: int = -32602;
 const SERVER_NOT_INITIALIZED: int = -32002;
 const REQUEST_FAILED: int = -32803;
 
-function step(st: LspState, out: Json[]): LspStep {
-  return LspStep { state: st, out: out };
+// ---- the reply rule (contracts) -----------------------------------------------------------
+
+// A request: a message with a string `method` and an `id`.
+export function isRequest(msg: Json): bool {
+  return getStr(msg, "method").isSome() && getField(msg, "id").isSome();
 }
 
-function none(st: LspState): LspStep {
-  const out: Json[] = [];
-  return LspStep { state: st, out: out };
+// A response of the server: it has an `id` and a `result` or an `error`, and no `method`.
+export function isResponse(j: Json): bool {
+  return getField(j, "id").isSome()
+      && getStr(j, "method").isNone()
+      && (getField(j, "result").isSome() || getField(j, "error").isSome());
 }
 
-// ---- entry points -------------------------------------------------------------------------
-
-export function handleText(fs: FsGrant, st: LspState, body: string): LspStep {
-  const r = parseJson(body);
-  if (r.isErr()) {
-    return step(st, [respondError(JNull, PARSE_ERROR, "parse error: " + r.unwrapErr())]);
-  }
-  return handle(fs, st, r.unwrap());
+// A notification of the server: a `method` and no `id`.
+export function isNotification(j: Json): bool {
+  return getStr(j, "method").isSome() && getField(j, "id").isNone();
 }
 
-export function handle(fs: FsGrant, st: LspState, msg: Json): LspStep {
-  if (st.exited) {
-    return none(st);
-  }
-  const method = getStr(msg, "method");
-  if (method.isNone()) {
-    return none(st);   // a response from the client (we send no requests) or garbage
-  }
-  const id = getField(msg, "id");
-  if (id.isSome()) {
-    return handleRequest(fs, st, id.unwrap(), method.unwrap(), msg);
-  }
-  return handleNotification(fs, st, method.unwrap(), msg);
+// The response `j` answers the request id `id`.
+export function answers(j: Json, id: Json): bool {
+  const got = getField(j, "id");
+  return isResponse(j) && got.isSome() && jsonEq(got.unwrap(), id);
 }
 
-export type Pumped = { state: LspState; rest: string; output: string; };
+// `out` is what the server may send for `msg`: exactly one response, carrying the id of `msg`, when `msg` is a request,
+// none otherwise; everything else is a notification.
+export function repliesTo(msg: Json, out: Json[]): bool {
+  const responses = out.filter(j => isResponse(j));
+  if (!out.every(j => isResponse(j) || isNotification(j))) {
+    return false;
+  }
+  if (!isRequest(msg)) {
+    return responses.length == 0;
+  }
+  return responses.length == 1 && answers(responses[0], getField(msg, "id").unwrap());
+}
 
-// Feed raw bytes: decode all complete framed messages, handle them, return framed output.
-export function pump(fs: FsGrant, st: LspState, buffer: string): Result<Pumped, string> {
-  const u = unframe(buffer)?;
-  let cur = st;
-  let outs: string[] = [];
-  for (const body of u.messages) {
-    const s = handleText(fs, cur, body);
-    cur = s.state;
-    for (const j of s.out) {
-      outs.push(frameMessage(stringifyJson(j)));
+function noDuplicates(xs: string[]): bool {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs.indexOf(xs[i]).unwrapOr(i) != i) {
+      return false;
     }
+    i += 1;
   }
-  return Ok(Pumped { state: cur, rest: u.rest, output: outs.join("") });
+  return true;
 }
 
-// ---- requests -----------------------------------------------------------------------------
+// ---- the server state ---------------------------------------------------------------------
 
-function capabilities(st: LspState): Json {
-  let caps: JField[] = [
-    jField("textDocumentSync", JObj([
-      jField("openClose", JBool(true)),
-      jField("change", JNum(1)),
-      jField("save", JObj([jField("includeText", JBool(false))]))
-    ])),
-    jField("documentSymbolProvider", JBool(true)),
-    jField("completionProvider", JObj([jField("resolveProvider", JBool(false))]))
-  ];
-  if (formatAvailable()) {
-    caps.push(jField("documentFormattingProvider", JBool(true)));
+// Analysis of the document, its semantic index and the cursor offset (index-based requests).
+type Ctx = { a: Analysis; idx: SemanticIndex; file: usize; off: usize; };
+
+type LDiag = { path: string; key: string; json: Json; };
+
+// The state of one language-server session: the document store (open buffers) and the protocol phase. `shutdown` is
+// only accepted after `initialize`; `published` lists each file with markers on the client once.
+@Invariant(!this.shutdownRequested || this.inited)
+@Invariant(noDuplicates(this.published))
+export class LspServer {
+  ws: Workspace = newWorkspace();
+  inited: bool = false; // `initialize` received
+  shutdownRequested: bool = false;
+  exited: bool = false; // `exit` received
+  published: string[] = []; // paths that currently have non-empty diagnostics published
+  // Test seam: when Some, used instead of `Analysis.index` (hand-built indexes in compiler/tests/lsp_test.or).
+  testIndex: Option<SemanticIndex> = None;
+
+  // Process exit code once `exit` was received: 0 after a prior `shutdown`, else 1.
+  @Ensures(result.isSome() == this.exited)
+  exitCode(): Option<int> {
+    if (!this.exited) {
+      return None;
+    }
+    return Some(this.shutdownRequested ? 0 : 1);
   }
-  if (indexAvailable() || st.testIndex.isSome()) {
-    caps.push(jField("definitionProvider", JBool(true)));
-    caps.push(jField("hoverProvider", JBool(true)));
-    caps.push(jField("referencesProvider", JBool(true)));
-    caps.push(jField("implementationProvider", JBool(true)));
-    caps.push(jField("renameProvider", JObj([jField("prepareProvider", JBool(true))])));
+
+  // One decoded message in, the messages to send out.
+  @Ensures(old(this.exited) ==> result.length == 0)
+  @Ensures(!old(this.exited) ==> repliesTo(msg, result))
+  @Ensures(old(this.inited) ==> this.inited)
+  handle(fs: FsGrant, msg: Json): Json[] {
+    if (this.exited) {
+      return [];
+    }
+    const method = getStr(msg, "method");
+    if (method.isNone()) {
+      return []; // a response from the client (we send no requests) or garbage
+    }
+    const id = getField(msg, "id");
+    if (id.isSome()) {
+      const reply = this.request(fs, id.unwrap(), method.unwrap(), msg);
+      return [reply];
+    }
+    return this.notify(fs, method.unwrap(), msg);
   }
-  return JObj(caps);
+
+  // The raw JSON text of one message; a text that is not JSON is answered with a parse error (id null).
+  @Ensures(parseJson(body).isErr() ==> result.length == 1 && answers(result[0], JNull))
+  @Ensures(parseJson(body).isOk() && !old(this.exited)
+      ==> repliesTo(parseJson(body).unwrap(), result))
+  handleText(fs: FsGrant, body: string): Json[] {
+    const r = parseJson(body);
+    if (r.isErr()) {
+      return [respondError(JNull, PARSE_ERROR, "parse error: " + r.unwrapErr())];
+    }
+    const out = this.handle(fs, r.unwrap());
+    return out;
+  }
+
+  // ---- requests -----------------------------------------------------------------------------
+
+  private capabilities(): Json {
+    let caps: JField[] = [
+      jField(
+        "textDocumentSync",
+        JObj([
+          jField("openClose", JBool(true)),
+          jField("change", JNum(1)),
+          jField("save", JObj([jField("includeText", JBool(false))])),
+        ]),
+      ),
+      jField("documentSymbolProvider", JBool(true)),
+      jField("completionProvider", JObj([jField("resolveProvider", JBool(false))])),
+    ];
+    if (formatAvailable()) {
+      caps.push(jField("documentFormattingProvider", JBool(true)));
+    }
+    if (indexAvailable() || this.testIndex.isSome()) {
+      caps.push(jField("definitionProvider", JBool(true)));
+      caps.push(jField("hoverProvider", JBool(true)));
+      caps.push(jField("referencesProvider", JBool(true)));
+      caps.push(jField("implementationProvider", JBool(true)));
+      caps.push(jField("renameProvider", JObj([jField("prepareProvider", JBool(true))])));
+    }
+    return JObj(caps);
+  }
+
+  // The one reply to the request `id`.
+  @Ensures(answers(result, id))
+  private request(fs: FsGrant, id: Json, method: string, msg: Json): Json {
+    if (method == "initialize") {
+      const result = JObj([
+        jField("capabilities", this.capabilities()),
+        jField(
+          "serverInfo",
+          JObj([jField("name", JStr("orin")), jField("version", JStr("0.1.0"))]),
+        ),
+      ]);
+      this.inited = true;
+      return respond(id, result);
+    }
+    if (!this.inited) {
+      return respondError(id, SERVER_NOT_INITIALIZED, "server not initialized");
+    }
+    if (this.shutdownRequested) {
+      return respondError(id, INVALID_REQUEST, "server is shutting down");
+    }
+    if (method == "shutdown") {
+      this.shutdownRequested = true;
+      return respond(id, JNull);
+    }
+    if (method == "textDocument/documentSymbol") {
+      return this.documentSymbol(fs, id, msg);
+    }
+    if (method == "textDocument/completion") {
+      return this.completion(fs, id, msg);
+    }
+    if (method == "textDocument/formatting") {
+      return this.formatting(fs, id, msg);
+    }
+    if (method == "textDocument/definition") {
+      return this.definition(fs, id, msg);
+    }
+    if (method == "textDocument/hover") {
+      return this.hover(fs, id, msg);
+    }
+    if (method == "textDocument/implementation") {
+      return this.implementation(fs, id, msg);
+    }
+    if (method == "textDocument/references") {
+      return this.references(fs, id, msg);
+    }
+    if (method == "textDocument/prepareRename") {
+      return this.prepareRename(fs, id, msg);
+    }
+    if (method == "textDocument/rename") {
+      return this.rename(fs, id, msg);
+    }
+    return respondError(id, METHOD_NOT_FOUND, "method not found: " + method);
+  }
+
+  private documentSymbol(fs: FsGrant, id: Json, msg: Json): Json {
+    const p = docPath(msg);
+    if (p.isNone()) {
+      return invalidParams(id);
+    }
+    const text = readText(fs, this.ws, p.unwrap()).unwrapOr("");
+    const items = documentSymbols(fs, this.ws, p.unwrap()).map(s => documentSymbolJson(text, s));
+    return respond(id, JArr(items));
+  }
+
+  private completion(fs: FsGrant, id: Json, msg: Json): Json {
+    const p = docPath(msg);
+    if (p.isNone()) {
+      return invalidParams(id);
+    }
+    let items: Json[] = declCompletions(fs, this.ws, p.unwrap()).map(c => completionJson(c));
+    const lc = this.context(fs, msg, false);
+    if (lc.isSome()) {
+      items = items.concat(localCompletions(lc.unwrap()).map(c => completionJson(c)));
+    }
+    items = items.concat(keywordCompletions().map(c => completionJson(c)));
+    items = items.concat(builtinCompletions().map(c => completionJson(c)));
+    return respond(id, JObj([jField("isIncomplete", JBool(false)), jField("items", JArr(items))]));
+  }
+
+  private formatting(fs: FsGrant, id: Json, msg: Json): Json {
+    const p = docPath(msg);
+    if (p.isNone()) {
+      return invalidParams(id);
+    }
+    const t = readText(fs, this.ws, p.unwrap());
+    if (t.isNone()) {
+      return invalidParams(id);
+    }
+    if (!formatAvailable()) {
+      const none: Json[] = [];
+      return respond(id, JArr(none)); // stub: no edits
+    }
+    const r = formatDocument(t.unwrap());
+    if (r.isErr()) {
+      return respondError(id, REQUEST_FAILED, r.unwrapErr());
+    }
+    return respond(id, JArr(fullDocumentEdits(t.unwrap(), r.unwrap())));
+  }
+
+  // ---- index-based requests -----------------------------------------------------------------
+
+  // Workspace-wide queries (references, rename) need an analysis whose program contains every
+  // user of the symbol: when `path` is imported by another open document, that document is used as
+  // the entry instead (first match in open order); otherwise `path` is its own entry.
+  private wideAnalysis(fs: FsGrant, path: string): Analysis {
+    const me = normalizePath(path);
+    for (const o of this.ws.paths()) {
+      if (normalizePath(o) == me) {
+        continue;
+      }
+      const a = analyze(fs, this.ws, o);
+      if (a.index.isSome() && fileIndexOf(a, path).isSome()) {
+        return a;
+      }
+    }
+    return analyze(fs, this.ws, path);
+  }
+
+  // Analysis of the document, its semantic index and the cursor offset. None when the index is
+  // not available or the params are malformed.
+  @Ensures(result.isSome() ==> result.unwrap().file < result.unwrap().a.sm.files.length)
+  @Ensures(result.isSome()
+      ==> result.unwrap().off <= result.unwrap().a.sm.files[result.unwrap().file].text.length)
+  @Ensures(result.isSome() ==> defIdsDense(result.unwrap().idx))
+  private context(fs: FsGrant, msg: Json, wide: bool): Option<Ctx> {
+    const p = docPath(msg);
+    const line = getPathInt(msg, ["params", "position", "line"]);
+    const ch = getPathInt(msg, ["params", "position", "character"]);
+    if (p.isNone() || line.isNone() || ch.isNone() || line.unwrap() < 0 || ch.unwrap() < 0) {
+      return None;
+    }
+    const a = wide ? this.wideAnalysis(fs, p.unwrap()) : analyze(fs, this.ws, p.unwrap());
+    let idx: Option<SemanticIndex> = a.index;
+    if (this.testIndex.isSome()) {
+      idx = this.testIndex;
+    }
+    if (idx.isNone()) {
+      return None;
+    }
+    const fi = fileIndexOf(a, p.unwrap());
+    if (fi.isNone()) {
+      return None;
+    }
+    const text = a.sm.files[fi.unwrap()].text;
+    return Some(Ctx {
+      a: a,
+      idx: idx.unwrap(),
+      file: fi.unwrap(),
+      off: posToOffset(text, line.unwrap().toUsize(), ch.unwrap().toUsize()),
+    });
+  }
+
+  private definition(fs: FsGrant, id: Json, msg: Json): Json {
+    const c = this.context(fs, msg, false);
+    if (c.isNone()) {
+      return respond(id, JNull);
+    }
+    const x = c.unwrap();
+    const d = definitionAt(x.idx, x.file, x.off);
+    if (d.isNone()) {
+      return respond(id, JNull);
+    }
+    return respond(id, locationJson(x.a, d.unwrap()));
+  }
+
+  // Go to implementations (ADR-0019): classes implementing the interface at the cursor, or their methods.
+  private implementation(fs: FsGrant, id: Json, msg: Json): Json {
+    const c = this.context(fs, msg, true);
+    let locs: Json[] = [];
+    if (c.isSome()) {
+      const x = c.unwrap();
+      locs = implementationsAt(x.idx, x.file, x.off).map(sp => locationJson(x.a, sp));
+    }
+    return respond(id, JArr(locs));
+  }
+
+  private hover(fs: FsGrant, id: Json, msg: Json): Json {
+    const c = this.context(fs, msg, false);
+    if (c.isNone()) {
+      return respond(id, JNull);
+    }
+    const x = c.unwrap();
+    const h = hoverAt(x.idx, x.file, x.off);
+    if (h.isNone()) {
+      return respond(id, JNull);
+    }
+    const info = h.unwrap();
+    let value = "```orin\n" + info.text + "\n```";
+    // Documentation follows the resolved declaration (including cross-file references).
+    // Contracts are already part of the symbol signature; never claim they are verified here.
+    const sym = symbolAt(x.idx, x.file, x.off);
+    if (sym.isSome() && sym.unwrap() < x.idx.defs.length) {
+      const def = x.idx.defs[sym.unwrap()];
+      if (def.declSpan.file < x.a.sm.files.length) {
+        const source = x.a.sm.files[def.declSpan.file].text;
+        const doc = documentationAt(source, def.declSpan.start);
+        if (doc.isSome()) {
+          value += "\n\n" + doc.unwrap();
+        }
+      }
+    }
+    // A function, method or constructor: its inferred effect summary (ADR-0037 D2; the same analysis as `orin effects`).
+    if (sym.isSome() && x.a.program.isSome()) {
+      const ec = effectsContext(x.a.program.unwrap(), x.idx, x.a.sm);
+      if (isFunctionDef(ec, sym.unwrap())) {
+        value = value + "\n\n" + hoverEffectText(ec, sym.unwrap());
+      }
+    }
+    const contents = JObj([jField("kind", JStr("markdown")), jField("value", JStr(value))]);
+    return respond(
+      id,
+      JObj([
+        jField("contents", contents),
+        jField("range", rangeJson(spanText(x.a, info.span), info.span.start, info.span.end)),
+      ]),
+    );
+  }
+
+  private references(fs: FsGrant, id: Json, msg: Json): Json {
+    const c = this.context(fs, msg, true);
+    let locs: Json[] = [];
+    if (c.isSome()) {
+      const x = c.unwrap();
+      let includeDecl = false;
+      const ctx = getPath(msg, ["params", "context"]);
+      if (ctx.isSome()) {
+        includeDecl = getBool(ctx.unwrap(), "includeDeclaration").unwrapOr(false);
+      }
+      locs = referencesTo(x.idx, x.file, x.off, includeDecl).map(sp => locationJson(x.a, sp));
+    }
+    return respond(id, JArr(locs));
+  }
+
+  private prepareRename(fs: FsGrant, id: Json, msg: Json): Json {
+    const c = this.context(fs, msg, true);
+    if (c.isNone()) {
+      return respond(id, JNull);
+    }
+    const x = c.unwrap();
+    const s = symbolSpanAt(x.idx, x.file, x.off);
+    if (s.isNone()) {
+      return respond(id, JNull);
+    }
+    const sp = s.unwrap();
+    const text = spanText(x.a, sp);
+    return respond(
+      id,
+      JObj([
+        jField("range", rangeJson(text, sp.start, sp.end)),
+        jField("placeholder", JStr(text.substring(sp.start, sp.end))),
+      ]),
+    );
+  }
+
+  private rename(fs: FsGrant, id: Json, msg: Json): Json {
+    const c = this.context(fs, msg, true);
+    const newName = getPathStr(msg, ["params", "newName"]);
+    if (newName.isNone()) {
+      return invalidParams(id);
+    }
+    if (c.isNone()) {
+      return respondError(id, REQUEST_FAILED, "no semantic information available for rename");
+    }
+    const x = c.unwrap();
+    if (this.testIndex.isNone() && x.a.diags.length > 0) {
+      // The index is partial while the program has errors (type-dependent references are missing).
+      return respondError(id, REQUEST_FAILED, "fix the errors in the workspace before renaming");
+    }
+    const r = renameEdits(x.idx, x.file, x.off, newName.unwrap());
+    if (r.isErr()) {
+      return respondError(id, REQUEST_FAILED, r.unwrapErr());
+    }
+    return respond(id, JObj([jField("changes", JObj(editsByFile(x.a, r.unwrap())))]));
+  }
+
+  // ---- notifications and diagnostics --------------------------------------------------------
+
+  // The notifications to send for a notification of the client (never a response).
+  @Ensures(result.every(j => isNotification(j)))
+  private notify(fs: FsGrant, method: string, msg: Json): Json[] {
+    if (method == "exit") {
+      this.exited = true;
+      return [];
+    }
+    if (!this.inited || this.shutdownRequested) {
+      return [];
+    }
+    if (method == "textDocument/didOpen") {
+      const p = docPath(msg);
+      const text = getPathStr(msg, ["params", "textDocument", "text"]);
+      if (p.isNone() || text.isNone()) {
+        return [];
+      }
+      this.ws.open(p.unwrap(), text.unwrap());
+      return this.republish(fs, []);
+    }
+    if (method == "textDocument/didChange") {
+      const p = docPath(msg);
+      const changes = getPath(msg, ["params", "contentChanges"]);
+      if (p.isNone() || changes.isNone()) {
+        return [];
+      }
+      const itemsOpt = asArr(changes.unwrap());
+      if (itemsOpt.isNone() || itemsOpt.unwrap().length == 0) {
+        return [];
+      }
+      const items = itemsOpt.unwrap();
+      // Full sync: the last change carries the whole document.
+      const text = getStr(items[items.length - 1], "text");
+      if (text.isNone()) {
+        return [];
+      }
+      this.ws.open(p.unwrap(), text.unwrap());
+      return this.republish(fs, []);
+    }
+    if (method == "textDocument/didSave") {
+      return this.republish(fs, []);
+    }
+    if (method == "textDocument/didClose") {
+      const p = docPath(msg);
+      if (p.isNone()) {
+        return [];
+      }
+      this.ws.close(p.unwrap());
+      return this.republish(fs, [p.unwrap()]);
+    }
+    return []; // initialized, $/cancelRequest, workspace/*, ... are ignored
+  }
+
+  // Recompute diagnostics and publish them for: every open document, every file that has
+  // diagnostics, every file that had diagnostics published before, and `extra` (e.g. a document
+  // that was just closed, so its markers are cleared).
+  @Ensures(result.length >= old(this.published.length) && result.length >= this.published.length)
+  private republish(fs: FsGrant, extra: string[]): Json[] {
+    const all = collectDiags(fs, this.ws);
+    let targets: string[] = [];
+    for (const p of this.ws.paths()) {
+      targets = addUnique(targets, p);
+    }
+    let nowPublished: string[] = [];
+    for (const d of all) {
+      targets = addUnique(targets, d.path);
+      nowPublished = addUnique(nowPublished, d.path);
+    }
+    for (const p of this.published) {
+      targets = addUnique(targets, p);
+    }
+    for (const p of extra) {
+      targets = addUnique(targets, p);
+    }
+    this.published = nowPublished;
+    return targets.map(
+      t => notification(
+        "textDocument/publishDiagnostics",
+        JObj([
+          jField("uri", JStr(pathToUri(t))),
+          jField("diagnostics", JArr(all.filter(d => d.path == t).map(d => d.json))),
+        ]),
+      ),
+    );
+  }
+
+  // Feed raw bytes: decode all complete framed messages, handle them, return the framed output (and the incomplete
+  // tail). Err on a malformed header block.
+  @Ensures(result.isOk() ==> buffer.endsWith(result.unwrap().rest))
+  @Ensures(old(this.inited) ==> this.inited)
+  pump(fs: FsGrant, buffer: string): Result<Pumped, string> {
+    const u = unframe(buffer)?;
+    let outs: string[] = [];
+    for (const body of u.messages) {
+      const out = this.handleText(fs, body);
+      for (const j of out) {
+        outs.push(frameMessage(stringifyJson(j)));
+      }
+    }
+    return Ok(Pumped { state: this, rest: u.rest, output: outs.join("") });
+  }
 }
 
-function handleRequest(fs: FsGrant, st: LspState, id: Json, method: string, msg: Json): LspStep {
-  if (method == "initialize") {
-    const result = JObj([
-      jField("capabilities", capabilities(st)),
-      jField("serverInfo", JObj([jField("name", JStr("orin")), jField("version", JStr("0.1.0"))]))
-    ]);
-    return step(LspState { ...st, inited: true }, [respond(id, result)]);
-  }
-  if (!st.inited) {
-    return step(st, [respondError(id, SERVER_NOT_INITIALIZED, "server not initialized")]);
-  }
-  if (st.shutdownRequested) {
-    return step(st, [respondError(id, INVALID_REQUEST, "server is shutting down")]);
-  }
-  if (method == "shutdown") {
-    return step(LspState { ...st, shutdownRequested: true }, [respond(id, JNull)]);
-  }
-  if (method == "textDocument/documentSymbol") {
-    return reqDocumentSymbol(fs, st, id, msg);
-  }
-  if (method == "textDocument/completion") {
-    return reqCompletion(fs, st, id, msg);
-  }
-  if (method == "textDocument/formatting") {
-    return reqFormatting(fs, st, id, msg);
-  }
-  if (method == "textDocument/definition") {
-    return reqDefinition(fs, st, id, msg);
-  }
-  if (method == "textDocument/hover") {
-    return reqHover(fs, st, id, msg);
-  }
-  if (method == "textDocument/implementation") {
-    return reqImplementation(fs, st, id, msg);
-  }
-  if (method == "textDocument/references") {
-    return reqReferences(fs, st, id, msg);
-  }
-  if (method == "textDocument/prepareRename") {
-    return reqPrepareRename(fs, st, id, msg);
-  }
-  if (method == "textDocument/rename") {
-    return reqRename(fs, st, id, msg);
-  }
-  return step(st, [respondError(id, METHOD_NOT_FOUND, "method not found: " + method)]);
-}
+// ---- helpers of the requests ------------------------------------------------------------------
 
 function docPath(msg: Json): Option<string> {
   const u = getPathStr(msg, ["params", "textDocument", "uri"]);
@@ -220,25 +601,12 @@ function docPath(msg: Json): Option<string> {
   return uriToPath(u.unwrap());
 }
 
-function invalidParams(st: LspState, id: Json): LspStep {
-  return step(st, [respondError(id, INVALID_PARAMS, "invalid params")]);
-}
-
-function reqDocumentSymbol(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const p = docPath(msg);
-  if (p.isNone()) {
-    return invalidParams(st, id);
-  }
-  const text = readText(fs, st.ws, p.unwrap()).unwrapOr("");
-  let items: Json[] = [];
-  for (const s of documentSymbols(fs, st.ws, p.unwrap())) {
-    items.push(documentSymbolJson(text, s));
-  }
-  return step(st, [respond(id, JArr(items))]);
+function invalidParams(id: Json): Json {
+  return respondError(id, INVALID_PARAMS, "invalid params");
 }
 
 // Parameters and locals of the function around the cursor that are declared before it
-// (scope-insensitive approximation: sibling blocks are included).
+// (scope-insensitive approximation: sibling blocks are included). One item per name.
 function localCompletions(x: Ctx): CompletionItem[] {
   let out: CompletionItem[] = [];
   let seen: string[] = [];
@@ -246,124 +614,25 @@ function localCompletions(x: Ctx): CompletionItem[] {
     const isLocal = match (d.kind) {
       SkLocal => true,
       SkParam => true,
-      _ => false
+      _ => false,
     };
     if (!isLocal || d.nameSpan.file != x.file || d.nameSpan.start >= x.off) {
       continue;
     }
     const inFn = match (d.container) {
-      Some(f) => f < x.idx.defs.length && x.idx.defs[f].declSpan.file == x.file
-        && x.idx.defs[f].declSpan.start <= x.off && x.off <= x.idx.defs[f].declSpan.end,
-      None => false
+      Some(f) => f < x.idx.defs.length
+          && x.idx.defs[f].declSpan.file == x.file
+          && x.idx.defs[f].declSpan.start <= x.off
+          && x.off <= x.idx.defs[f].declSpan.end,
+      None => false,
     };
-    if (!inFn) {
+    if (!inFn || seen.includes(d.name)) {
       continue;
     }
-    let dup = false;
-    for (const s of seen) {
-      if (s == d.name) {
-        dup = true;
-      }
-    }
-    if (!dup) {
-      seen.push(d.name);
-      out.push(CompletionItem { label: d.name, kind: DkLocal, detail: d.detail });
-    }
+    seen.push(d.name);
+    out.push(CompletionItem { label: d.name, kind: DkLocal, detail: d.detail });
   }
   return out;
-}
-
-function reqCompletion(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const p = docPath(msg);
-  if (p.isNone()) {
-    return invalidParams(st, id);
-  }
-  let items: Json[] = [];
-  for (const c of declCompletions(fs, st.ws, p.unwrap())) {
-    items.push(completionJson(c));
-  }
-  const lc = context(fs, st, msg, false);
-  if (lc.isSome()) {
-    for (const c of localCompletions(lc.unwrap())) {
-      items.push(completionJson(c));
-    }
-  }
-  for (const c of keywordCompletions()) {
-    items.push(completionJson(c));
-  }
-  for (const c of builtinCompletions()) {
-    items.push(completionJson(c));
-  }
-  return step(st, [respond(id, JObj([jField("isIncomplete", JBool(false)), jField("items", JArr(items))]))]);
-}
-
-function reqFormatting(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const p = docPath(msg);
-  if (p.isNone()) {
-    return invalidParams(st, id);
-  }
-  const t = readText(fs, st.ws, p.unwrap());
-  if (t.isNone()) {
-    return invalidParams(st, id);
-  }
-  if (!formatAvailable()) {
-    const none: Json[] = [];
-    return step(st, [respond(id, JArr(none))]);   // stub: no edits
-  }
-  const r = formatDocument(t.unwrap());
-  if (r.isErr()) {
-    return step(st, [respondError(id, REQUEST_FAILED, r.unwrapErr())]);
-  }
-  return step(st, [respond(id, JArr(fullDocumentEdits(t.unwrap(), r.unwrap())))]);
-}
-
-// ---- index-based requests -----------------------------------------------------------------
-
-type Ctx = { a: Analysis; idx: SemanticIndex; file: usize; off: usize; };
-
-// Workspace-wide queries (references, rename) need an analysis whose program contains every
-// user of the symbol: when `path` is imported by another open document, that document is used as
-// the entry instead (first match in open order); otherwise `path` is its own entry.
-function wideAnalysis(fs: FsGrant, st: LspState, path: string): Analysis {
-  const me = normalizePath(path);
-  for (const o of openPaths(st.ws)) {
-    if (normalizePath(o) == me) {
-      continue;
-    }
-    const a = analyze(fs, st.ws, o);
-    if (a.index.isSome() && fileIndexOf(a, path).isSome()) {
-      return a;
-    }
-  }
-  return analyze(fs, st.ws, path);
-}
-
-// Analysis of the document, its semantic index and the cursor offset. None when the index is
-// not available or the params are malformed.
-function context(fs: FsGrant, st: LspState, msg: Json, wide: bool): Option<Ctx> {
-  const p = docPath(msg);
-  const line = getPathInt(msg, ["params", "position", "line"]);
-  const ch = getPathInt(msg, ["params", "position", "character"]);
-  if (p.isNone() || line.isNone() || ch.isNone() || line.unwrap() < 0 || ch.unwrap() < 0) {
-    return None;
-  }
-  const a = wide ? wideAnalysis(fs, st, p.unwrap()) : analyze(fs, st.ws, p.unwrap());
-  let idx: Option<SemanticIndex> = a.index;
-  if (st.testIndex.isSome()) {
-    idx = st.testIndex;
-  }
-  if (idx.isNone()) {
-    return None;
-  }
-  const fi = fileIndexOf(a, p.unwrap());
-  if (fi.isNone()) {
-    return None;
-  }
-  const text = a.sm.files[fi.unwrap()].text;
-  return Some(Ctx {
-    a: a, idx: idx.unwrap(), file: fi.unwrap(),
-    off: posToOffset(text, line.unwrap().toUsize(), ch.unwrap().toUsize())
-  });
 }
 
 function spanText(a: Analysis, sp: Span): string {
@@ -373,249 +642,53 @@ function spanText(a: Analysis, sp: Span): string {
 function locationJson(a: Analysis, sp: Span): Json {
   return JObj([
     jField("uri", JStr(pathToUri(a.sm.files[sp.file].path))),
-    jField("range", rangeJson(spanText(a, sp), sp.start, sp.end))
+    jField("range", rangeJson(spanText(a, sp), sp.start, sp.end)),
   ]);
 }
 
-function reqDefinition(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(fs, st, msg, false);
-  if (c.isNone()) {
-    return step(st, [respond(id, JNull)]);
-  }
-  const x = c.unwrap();
-  const d = definitionAt(x.idx, x.file, x.off);
-  if (d.isNone()) {
-    return step(st, [respond(id, JNull)]);
-  }
-  return step(st, [respond(id, locationJson(x.a, d.unwrap()))]);
-}
-
-// Go to implementations (ADR-0019): classes implementing the interface at the cursor, or their methods.
-function reqImplementation(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(fs, st, msg, true);
-  let locs: Json[] = [];
-  if (c.isSome()) {
-    const x = c.unwrap();
-    for (const sp of implementationsAt(x.idx, x.file, x.off)) {
-      locs.push(locationJson(x.a, sp));
-    }
-  }
-  return step(st, [respond(id, JArr(locs))]);
-}
-
-function reqHover(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(fs, st, msg, false);
-  if (c.isNone()) {
-    return step(st, [respond(id, JNull)]);
-  }
-  const x = c.unwrap();
-  const h = hoverAt(x.idx, x.file, x.off);
-  if (h.isNone()) {
-    return step(st, [respond(id, JNull)]);
-  }
-  const info = h.unwrap();
-  let value = "```orin\n" + info.text + "\n```";
-  // Documentation follows the resolved declaration (including cross-file references).
-  // Contracts are already part of the symbol signature; never claim they are verified here.
-  const sym = symbolAt(x.idx, x.file, x.off);
-  if (sym.isSome() && sym.unwrap() < x.idx.defs.length) {
-    const def = x.idx.defs[sym.unwrap()];
-    if (def.declSpan.file < x.a.sm.files.length) {
-      const source = x.a.sm.files[def.declSpan.file].text;
-      const doc = documentationAt(source, def.declSpan.start);
-      if (doc.isSome()) {
-        value += "\n\n" + doc.unwrap();
-      }
-    }
-  }
-  // A function, method or constructor: its inferred effect summary (ADR-0037 D2; the same analysis as `orin effects`).
-  if (sym.isSome() && x.a.program.isSome()) {
-    const ec = effectsContext(x.a.program.unwrap(), x.idx, x.a.sm);
-    if (isFunctionDef(ec, sym.unwrap())) {
-      value = value + "\n\n" + hoverEffectText(ec, sym.unwrap());
-    }
-  }
-  const contents = JObj([
-    jField("kind", JStr("markdown")),
-    jField("value", JStr(value))
-  ]);
-  return step(st, [respond(id, JObj([
-    jField("contents", contents),
-    jField("range", rangeJson(spanText(x.a, info.span), info.span.start, info.span.end))
-  ]))]);
-}
-
-function reqReferences(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(fs, st, msg, true);
-  let locs: Json[] = [];
-  if (c.isSome()) {
-    const x = c.unwrap();
-    let includeDecl = false;
-    const ctx = getPath(msg, ["params", "context"]);
-    if (ctx.isSome()) {
-      includeDecl = getBool(ctx.unwrap(), "includeDeclaration").unwrapOr(false);
-    }
-    for (const sp of referencesTo(x.idx, x.file, x.off, includeDecl)) {
-      locs.push(locationJson(x.a, sp));
-    }
-  }
-  return step(st, [respond(id, JArr(locs))]);
-}
-
-function reqPrepareRename(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(fs, st, msg, true);
-  if (c.isNone()) {
-    return step(st, [respond(id, JNull)]);
-  }
-  const x = c.unwrap();
-  const s = symbolSpanAt(x.idx, x.file, x.off);
-  if (s.isNone()) {
-    return step(st, [respond(id, JNull)]);
-  }
-  const sp = s.unwrap();
-  const text = spanText(x.a, sp);
-  return step(st, [respond(id, JObj([
-    jField("range", rangeJson(text, sp.start, sp.end)),
-    jField("placeholder", JStr(text.substring(sp.start, sp.end)))
-  ]))]);
-}
-
-function reqRename(fs: FsGrant, st: LspState, id: Json, msg: Json): LspStep {
-  const c = context(fs, st, msg, true);
-  const newName = getPathStr(msg, ["params", "newName"]);
-  if (newName.isNone()) {
-    return invalidParams(st, id);
-  }
-  if (c.isNone()) {
-    return step(st, [respondError(id, REQUEST_FAILED, "no semantic information available for rename")]);
-  }
-  const x = c.unwrap();
-  if (st.testIndex.isNone() && x.a.diags.length > 0) {
-    // The index is partial while the program has errors (type-dependent references are missing).
-    return step(st, [respondError(id, REQUEST_FAILED, "fix the errors in the workspace before renaming")]);
-  }
-  const r = renameEdits(x.idx, x.file, x.off, newName.unwrap());
-  if (r.isErr()) {
-    return step(st, [respondError(id, REQUEST_FAILED, r.unwrapErr())]);
-  }
-  // Group edits by file, in order of first appearance.
+// The `changes` of a WorkspaceEdit: the edits grouped by file, files in order of their first edit.
+@Ensures(result.length <= edits.length)
+function editsByFile(a: Analysis, edits: TextEdit[]): JField[] {
   let files: usize[] = [];
   let lists: Json[][] = [];
-  for (const e of r.unwrap()) {
-    let k: usize = 0;
-    let found = false;
-    while (k < files.length) {
-      if (files[k] == e.span.file) {
-        found = true;
-        break;
-      }
-      k += 1;
-    }
-    if (!found) {
+  for (const e of edits) {
+    const k = files.indexOf(e.span.file).unwrapOr(files.length);
+    if (k == files.length) {
       files.push(e.span.file);
       const empty: Json[] = [];
       lists.push(empty);
-      k = files.length - 1;
     }
-    lists[k].push(JObj([
-      jField("range", rangeJson(spanText(x.a, e.span), e.span.start, e.span.end)),
-      jField("newText", JStr(e.newText))
-    ]));
+    lists[k].push(
+      JObj([
+        jField("range", rangeJson(spanText(a, e.span), e.span.start, e.span.end)),
+        jField("newText", JStr(e.newText)),
+      ]),
+    );
   }
   let changes: JField[] = [];
   let i: usize = 0;
   while (i < files.length) {
-    changes.push(jField(pathToUri(x.a.sm.files[files[i]].path), JArr(lists[i])));
+    changes.push(jField(pathToUri(a.sm.files[files[i]].path), JArr(lists[i])));
     i += 1;
   }
-  return step(st, [respond(id, JObj([jField("changes", JObj(changes))]))]);
-}
-
-// ---- notifications and diagnostics --------------------------------------------------------
-
-function handleNotification(fs: FsGrant, st: LspState, method: string, msg: Json): LspStep {
-  if (method == "exit") {
-    return none(LspState { ...st, exited: true });
-  }
-  if (!st.inited || st.shutdownRequested) {
-    return none(st);
-  }
-  if (method == "textDocument/didOpen") {
-    const p = docPath(msg);
-    const text = getPathStr(msg, ["params", "textDocument", "text"]);
-    if (p.isNone() || text.isNone()) {
-      return none(st);
-    }
-    const ws = openFile(st.ws, p.unwrap(), text.unwrap());
-    const st2 = LspState { ...st, ws: ws };
-    const none2: string[] = [];
-    return republish(fs, st2, none2);
-  }
-  if (method == "textDocument/didChange") {
-    const p = docPath(msg);
-    const changes = getPath(msg, ["params", "contentChanges"]);
-    if (p.isNone() || changes.isNone()) {
-      return none(st);
-    }
-    const itemsOpt = asArr(changes.unwrap());
-    if (itemsOpt.isNone() || itemsOpt.unwrap().length == 0) {
-      return none(st);
-    }
-    const items = itemsOpt.unwrap();
-    // Full sync: the last change carries the whole document.
-    const text = getStr(items[items.length - 1], "text");
-    if (text.isNone()) {
-      return none(st);
-    }
-    const st2 = LspState { ...st, ws: changeFile(st.ws, p.unwrap(), text.unwrap()) };
-    const none2: string[] = [];
-    return republish(fs, st2, none2);
-  }
-  if (method == "textDocument/didSave") {
-    const none2: string[] = [];
-    return republish(fs, st, none2);
-  }
-  if (method == "textDocument/didClose") {
-    const p = docPath(msg);
-    if (p.isNone()) {
-      return none(st);
-    }
-    const st2 = LspState { ...st, ws: closeFile(st.ws, p.unwrap()) };
-    return republish(fs, st2, [p.unwrap()]);
-  }
-  return none(st);   // initialized, $/cancelRequest, workspace/*, ... are ignored
-}
-
-type LDiag = { path: string; key: string; json: Json; };
-
-function hasKey(ds: LDiag[], key: string): bool {
-  for (const d of ds) {
-    if (d.key == key) {
-      return true;
-    }
-  }
-  return false;
+  return changes;
 }
 
 // Diagnostics of all open documents (each analysed as its own entry), de-duplicated.
 function collectDiags(fs: FsGrant, ws: Workspace): LDiag[] {
   let out: LDiag[] = [];
-  for (const entry of openPaths(ws)) {
+  let keys: string[] = [];
+  for (const entry of ws.paths()) {
     const a = analyze(fs, ws, entry);
-    let both = a.diags;
-    for (const w of a.warnings) {
-      both.push(w);
-    }
-    for (const d of both) {
-      const key = d.path + "|" + d.code + "|" + d.start.toString() + "|" + d.end.toString() + "|" + d.message;
-      if (hasKey(out, key)) {
+    for (const d of a.diags.concat(a.warnings)) {
+      const key = d.path + "|" + d.code + "|" + d.start.toString() + "|" + d.end.toString() + "|"
+          + d.message;
+      if (keys.includes(key)) {
         continue;
       }
       const fi = fileIndexOf(a, d.path);
-      let text = "";
-      if (fi.isSome()) {
-        text = a.sm.files[fi.unwrap()].text;
-      }
+      const text = fi.isSome() ? a.sm.files[fi.unwrap()].text : "";
+      keys.push(key);
       out.push(LDiag { path: d.path, key: key, json: diagnosticJson(text, d) });
     }
   }
@@ -624,47 +697,48 @@ function collectDiags(fs: FsGrant, ws: Workspace): LDiag[] {
 
 function addUnique(xs: string[], x: string): string[] {
   let out = xs;
-  for (const y of xs) {
-    if (y == x) {
-      return out;
-    }
+  if (!out.includes(x)) {
+    out.push(x);
   }
-  out.push(x);
   return out;
 }
 
-// Recompute diagnostics and publish them for: every open document, every file that has
-// diagnostics, every file that had diagnostics published before, and `extra` (e.g. a document
-// that was just closed, so its markers are cleared).
-function republish(fs: FsGrant, st: LspState, extra: string[]): LspStep {
-  const all = collectDiags(fs, st.ws);
-  let targets: string[] = [];
-  for (const p of openPaths(st.ws)) {
-    targets = addUnique(targets, p);
-  }
-  let nowPublished: string[] = [];
-  for (const d of all) {
-    targets = addUnique(targets, d.path);
-    nowPublished = addUnique(nowPublished, d.path);
-  }
-  for (const p of st.published) {
-    targets = addUnique(targets, p);
-  }
-  for (const p of extra) {
-    targets = addUnique(targets, p);
-  }
-  let out: Json[] = [];
-  for (const t of targets) {
-    let arr: Json[] = [];
-    for (const d of all) {
-      if (d.path == t) {
-        arr.push(d.json);
-      }
-    }
-    out.push(notification("textDocument/publishDiagnostics", JObj([
-      jField("uri", JStr(pathToUri(t))),
-      jField("diagnostics", JArr(arr))
-    ])));
-  }
-  return step(LspState { ...st, published: nowPublished }, out);
+// ---- the functional interface ---------------------------------------------------------------
+
+export type LspStep = { state: LspServer; out: Json[]; };
+
+export type Pumped = { state: LspServer; rest: string; output: string; };
+
+export function newLspState(): LspServer {
+  return new LspServer();
+}
+
+export function withTestIndex(st: LspServer, idx: SemanticIndex): LspServer {
+  let s = st;
+  s.testIndex = Some(idx);
+  return s;
+}
+
+// Process exit code once `exit` was received: 0 after a prior `shutdown`, else 1.
+export function lspExitCode(st: LspServer): Option<int> {
+  return st.exitCode();
+}
+
+export function handleText(fs: FsGrant, st: LspServer, body: string): LspStep {
+  let s = st;
+  const out = s.handleText(fs, body);
+  return LspStep { state: s, out: out };
+}
+
+export function handle(fs: FsGrant, st: LspServer, msg: Json): LspStep {
+  let s = st;
+  const out = s.handle(fs, msg);
+  return LspStep { state: s, out: out };
+}
+
+// Feed raw bytes: decode all complete framed messages, handle them, return framed output.
+export function pump(fs: FsGrant, st: LspServer, buffer: string): Result<Pumped, string> {
+  let s = st;
+  const p = s.pump(fs, buffer)?;
+  return Ok(p);
 }

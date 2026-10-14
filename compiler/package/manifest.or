@@ -25,7 +25,7 @@
 // directory of the entry file). Diagnostics: E0500 syntax, E0503 invalid manifest (the effect names of an `allowed` list are
 // checked against the compiler's list by compiler/analysis/effectpolicy.or: E0473, E0474).
 
-import { Span, Diagnostic, diag, span } from "../diag";
+import { Span, Diagnostic, diag, span, SourceFile } from "../diag";
 import { TomlValue, TomlEntry, TomlTable, TomlDoc, parseToml } from "./toml";
 
 export type ModuleRule = {
@@ -52,6 +52,9 @@ export type Manifest = {
   rules: ModuleRule[];
   strictContracts: bool;   // `[contracts] strict = true` (ADR-0028): strict contract-coverage warnings
   effects: EffectRule[];   // `[effects]` / `[effects.<module>]` (ADR-0037 D4); empty = no restriction
+  // The manifest file itself (the loader sets the path): the spans above point into it. A diagnostic about a table that
+  // is found after loading (the effect policy, compiler/analysis/effectpolicy.or) is rendered against it.
+  source: SourceFile;
 };
 
 export const DEFAULT_ENTRY: string = "src/main.or";
@@ -91,14 +94,14 @@ function packageTable(file: usize, t: TomlTable, m: Manifest): Result<Manifest, 
       if (r.unwrap().length == 0) {
         return Err(invalid(file, entrySpan(file, e), "`name` must not be empty"));
       }
-      out = Manifest { file: out.file, name: r.unwrap(), version: out.version, entry: out.entry, rules: out.rules, strictContracts: out.strictContracts, effects: out.effects };
+      out = Manifest { ...out, name: r.unwrap() };
       haveName = true;
     } else if (e.key == "version") {
       const r = strOf(file, e);
       if (r.isErr()) {
         return Err(r.unwrapErr());
       }
-      out = Manifest { file: out.file, name: out.name, version: r.unwrap(), entry: out.entry, rules: out.rules, strictContracts: out.strictContracts, effects: out.effects };
+      out = Manifest { ...out, version: r.unwrap() };
     } else if (e.key == "entry") {
       const r = strOf(file, e);
       if (r.isErr()) {
@@ -107,7 +110,7 @@ function packageTable(file: usize, t: TomlTable, m: Manifest): Result<Manifest, 
       if (!r.unwrap().endsWith(".or")) {
         return Err(invalid(file, entrySpan(file, e), "`entry` must be a path to an `.or` file"));
       }
-      out = Manifest { file: out.file, name: out.name, version: out.version, entry: r.unwrap(), rules: out.rules, strictContracts: out.strictContracts, effects: out.effects };
+      out = Manifest { ...out, entry: r.unwrap() };
     } else {
       return Err(invalid(file, entrySpan(file, e), "unknown key `" + e.key + "` in [package] (expected name, version, entry)"));
     }
@@ -205,7 +208,10 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
   const doc = pr.unwrap();
   const noRules: ModuleRule[] = [];
   const noEffects: EffectRule[] = [];
-  let m = Manifest { file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules, strictContracts: false, effects: noEffects };
+  let m = Manifest {
+    file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules, strictContracts: false, effects: noEffects,
+    source: SourceFile { path: "orin.toml", text: text }
+  };
   let havePackage = false;
   for (const t of doc.tables) {
     if (t.path.length == 0) {
@@ -233,7 +239,7 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
       if (r.isErr()) {
         return Err(r.unwrapErr());
       }
-      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: m.rules, strictContracts: r.unwrap(), effects: m.effects };
+      m = Manifest { ...m, strictContracts: r.unwrap() };
     } else if (head == "effects") {
       const r = effectRule(file, t);
       if (r.isErr()) {
@@ -246,7 +252,7 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
         }
       }
       effs.push(r.unwrap());
-      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: m.rules, strictContracts: m.strictContracts, effects: effs };
+      m = Manifest { ...m, effects: effs };
     } else if (head == "modules" && t.path.length >= 2) {
       const r = moduleRule(file, t);
       if (r.isErr()) {
@@ -259,7 +265,7 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
         }
       }
       rules.push(r.unwrap());
-      m = Manifest { file: m.file, name: m.name, version: m.version, entry: m.entry, rules: rules, strictContracts: m.strictContracts, effects: m.effects };
+      m = Manifest { ...m, rules: rules };
     } else {
       return Err(invalid(file, span(file, t.start, t.end),
         "unknown table `[" + t.path.join(".") + "]` (expected [package], [architecture], [contracts], [effects] or [modules.<path>])"));

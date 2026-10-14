@@ -1,51 +1,122 @@
-// Workspace: the analysis inputs (spec 18 §2). File contents keyed by (normalized) path — an
-// overlay of unsaved editor buffers over the disk. Every change bumps `revision`.
-// All operations are pure: they return a new Workspace.
+// Workspace: the analysis inputs (spec 18 §2). The document store of the language server: file contents keyed by
+// (normalized) path, an overlay of unsaved editor buffers over the disk. Every change bumps `revision`.
+//
+// The disk is never read here: `sources()` hands the overlay to the loader's `Sources`, the one place that reads
+// files (docs/capabilities.md, "The compiler's own summary").
 
 import { SourceFile } from "../diag";
-import { normalizePath } from "../loader";
+import { normalizePath, isNormalized, Sources } from "../loader";
 
-export type Workspace = { files: SourceFile[]; revision: int; };
-
-export function newWorkspace(): Workspace {
-  const none: SourceFile[] = [];
-  return Workspace { files: none, revision: 0 };
-}
-
-function indexOfPath(ws: Workspace, p: string): Option<usize> {
+// No two documents share a path.
+export function distinctPaths(fs: SourceFile[]): bool {
   let i: usize = 0;
-  while (i < ws.files.length) {
-    if (ws.files[i].path == p) {
-      return Some(i);
+  while (i < fs.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (fs[i].path == fs[j].path) {
+        return false;
+      }
+      j += 1;
     }
     i += 1;
   }
-  return None;
+  return true;
+}
+
+// The open documents in open order. Keys are normalized and distinct, so a lookup by any spelling of a path finds the
+// one buffer (a second buffer for `a/./b.or` would shadow nothing and never be found); the revision only grows.
+@Invariant(this.docs.every(d => isNormalized(d.path)))
+@Invariant(distinctPaths(this.docs))
+@Invariant(this.rev >= 0)
+export class Workspace {
+  private docs: SourceFile[] = [];
+  private rev: int = 0;
+
+  // Number of changes so far (open, change, close).
+  revision(): int {
+    return this.rev;
+  }
+
+  // The buffers, in open order.
+  documents(): SourceFile[] {
+    return this.docs;
+  }
+
+  // Paths of the buffers, in open order.
+  @Ensures(result.length == this.docs.length)
+  paths(): string[] {
+    return this.docs.map(d => d.path);
+  }
+
+  @Ensures(result.isSome() ==> this.docs[result.unwrap()].path == normalizePath(path))
+  @Ensures(result.isNone() ==> this.docs.every(d => d.path != normalizePath(path)))
+  private indexOf(path: string): Option<usize> {
+    const p = normalizePath(path);
+    return this.docs.findIndex(d => d.path == p);
+  }
+
+  has(path: string): bool {
+    return this.indexOf(path).isSome();
+  }
+
+  // The buffer of `path` (any spelling), None when it is not open.
+  @Ensures(result.isSome() == this.has(path))
+  text(path: string): Option<string> {
+    const k = this.indexOf(path);
+    return k.isSome() ? Some(this.docs[k.unwrap()].text) : None;
+  }
+
+  // Set (insert or replace) the buffer for `path`; a replaced buffer keeps its place in the open order.
+  @Ensures(this.text(path).isSome() && this.text(path).unwrap() == text)
+  @Ensures(this.rev == old(this.rev) + 1)
+  @Ensures(this.docs.length == old(this.docs.length)
+      || this.docs.length == old(this.docs.length) + 1)
+  open(path: string, text: string): void {
+    const p = normalizePath(path);
+    const k = this.indexOf(p);
+    if (k.isSome()) {
+      this.docs[k.unwrap()] = SourceFile { path: p, text: text };
+    } else {
+      this.docs.push(SourceFile { path: p, text: text });
+    }
+    this.rev += 1;
+  }
+
+  // Drop the buffer: the file falls back to its on-disk contents. Closing a path that is not open still counts as a
+  // change (the old behaviour; the language server republishes either way).
+  @Ensures(!this.has(path) && this.rev == old(this.rev) + 1)
+  @Ensures(this.docs.length + 1 >= old(this.docs.length)
+      && this.docs.length <= old(this.docs.length))
+  close(path: string): void {
+    const p = normalizePath(path);
+    this.docs = this.docs.filter(d => d.path != p);
+    this.rev += 1;
+  }
+
+  // The buffers as the loader's file source: buffers shadow the disk.
+  @Ensures(result.size() == this.docs.length)
+  sources(): Sources {
+    return new Sources(this.docs);
+  }
+}
+
+export function newWorkspace(): Workspace {
+  return new Workspace();
 }
 
 export function hasFile(ws: Workspace, path: string): bool {
-  return indexOfPath(ws, normalizePath(path)).isSome();
+  return ws.has(path);
 }
 
 export function fileText(ws: Workspace, path: string): Option<string> {
-  const k = indexOfPath(ws, normalizePath(path));
-  if (k.isNone()) {
-    return None;
-  }
-  return Some(ws.files[k.unwrap()].text);
+  return ws.text(path);
 }
 
 // Set (insert or replace) the buffer for `path`.
 export function openFile(ws: Workspace, path: string, text: string): Workspace {
-  const p = normalizePath(path);
-  let files = ws.files;
-  const k = indexOfPath(ws, p);
-  if (k.isSome()) {
-    files[k.unwrap()] = SourceFile { path: p, text: text };
-  } else {
-    files.push(SourceFile { path: p, text: text });
-  }
-  return Workspace { files: files, revision: ws.revision + 1 };
+  let w = ws;
+  w.open(path, text);
+  return w;
 }
 
 // Full-document change (Phase 1 has no incremental edits). Same as openFile.
@@ -55,21 +126,12 @@ export function changeFile(ws: Workspace, path: string, text: string): Workspace
 
 // Drop the buffer: the file falls back to its on-disk contents.
 export function closeFile(ws: Workspace, path: string): Workspace {
-  const p = normalizePath(path);
-  let files: SourceFile[] = [];
-  for (const f of ws.files) {
-    if (f.path != p) {
-      files.push(f);
-    }
-  }
-  return Workspace { files: files, revision: ws.revision + 1 };
+  let w = ws;
+  w.close(path);
+  return w;
 }
 
 // Paths of all overlay buffers, in open order.
 export function openPaths(ws: Workspace): string[] {
-  let out: string[] = [];
-  for (const f of ws.files) {
-    out.push(f.path);
-  }
-  return out;
+  return ws.paths();
 }

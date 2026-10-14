@@ -24,6 +24,9 @@ $ORIN2 test compiler/tests/recovery_test.or --runtime runtime
 python3 tools/test_recovery.py --orinc "$ORIN2"
 $ORIN2 test compiler/tests/quality_test.or --runtime runtime
 $ORIN2 test compiler/tests/doccomments_test.or --runtime runtime
+# tooling unit tests (3e): JSON cursor / round trip, workspace, positions, index queries, LSP and MCP reply rule,
+# MCP session, formatter layout and comment preservation
+$ORIN2 test compiler/tests/tooling_test.or --runtime runtime
 sh tools/test_resources.sh
 sh tools/test_capabilities.sh
 sh tools/test_net.sh

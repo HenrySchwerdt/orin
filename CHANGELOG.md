@@ -1,6 +1,19 @@
 # Changelog
 
 ## Unreleased
+- **Rewrite step 3e: the tooling modules `analysis/`, `lsp/`, `mcp/`, `json/`, `fmt/` (ADR-0015) and the capability gate.**
+  State that was threaded through records is now five classes: `Workspace` (the document store), `LspServer`, `McpSession`,
+  `JsonCursor`, and the formatter's `Layout` (source text and comment queue); 213 contract clauses (35 before), among them the
+  JSON round trip (`parseJson(stringifyJson(v))` equals `v`), offset <-> position round trip, the reply rule of the LSP and MCP
+  servers (every request answered once with its id), references that point at existing definitions, formatter idempotence and
+  comment preservation as `@Ensures` of `format`, OSIG snapshots that read back with their hash. **Capability gate:** `analysis`
+  performs no I/O of its own: its three file reads go through the loader's `Sources`, and the drivers of `orin graph` / `diff` /
+  `effects` (with their output file) moved to `tools`; `orin effects compiler/main.or` shows only inherited `Fs.ReadFile` /
+  `Fs.Stat` for `analysis`, every path ending in `loader::Sources` (pinned by `tools/test_effects.py`). Fixes: `parseJson` reads
+  every `int` (it rejected 19-digit integers that `stringifyJson` writes); the effect-policy errors E0474 / E0502 are located in
+  `orin.toml` (they were printed as a position in the program's first source file, and the contract-checked compiler trapped).
+  Generated C / LLVM unchanged. `lsp::shellRun` stays until `spawn` exists (ADR-0037 D5). Tests: `compiler/tests/tooling_test.or`
+  (16 `@Test`). Docs: docs/rewrite.md "Step 3e", docs/capabilities.md.
 - **Parser error recovery: several syntax errors per file.** `orin check`, `orin compile`, `--format=json`, the LSP
   diagnostics and MCP `check` now report every syntax error of a file (up to 20; past that the 20th carries the note
   "further syntax errors suppressed") instead of only the first. Recovery points: the next statement of a block (after `;`,
