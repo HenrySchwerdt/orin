@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **Benchmark workflow** (`.github/workflows/bench.yml`, docs/benchmarks.md "Benchmark workflow"): nightly, manual, or on a PR
+  labelled `bench`. `tools/bench.py` gains `--json` (machine, tool versions, commit; per benchmark and language wall median / min,
+  user / sys CPU, peak RSS, output check), `--instructions` (executed instructions under valgrind cachegrind for the Orin
+  binaries, C and the self-compile: the regression metric) and a parallel section (`bench/parallel_*`, `bench/streams_parallel`
+  with 1, 2, 4 worker threads given as the first program argument: speedup, efficiency, CPU time); new `bench/parallel_collatz`.
+  `tools/bench_report.py` (stdlib only) writes the job summary, the PR comparison comment (instructions > +2 % or wall > +15 % is
+  flagged, never fails) and the SVG charts + README of the `bench-results` history branch.
 - **Rewrite step 3b: the ownership verifier `compiler/verify/`, shared MIR well-formedness, `compiler/hir/` contracts
   (ADR-0015).** The verifier's abstract state is a class `State`, the transfer functions are the methods of a class
   `Transfer` (one run through a block), the fixpoint and its worklist are the class `Fixpoint`; 98 contract clauses (0 before), among
