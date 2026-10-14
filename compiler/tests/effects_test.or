@@ -232,6 +232,47 @@ function testInterfaces(fs: FsGrant, f: string[]): string[] {
   return fails;
 }
 
+// Function values reached through an interface, a record field and a method: the callback rule through `implements`.
+function testCallbackKinds(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const src = "interface Mapper { apply(f: (x: int) => int): int; }\n"
+    + "class Doubler implements Mapper { apply(f: (x: int) => int): int { return f(2); } }\n"
+    + "function make(k: int): (x: int) => int { return x => x + k; }\n"
+    + "function viaIface(m: Mapper): int { return m.apply(x => { console.log(\"i\"); return x; }); }\n"
+    + "function viaIfaceUnknown(m: Mapper): int { const g = make(1); return m.apply(g); }\n"
+    + "type Box = { f: (x: int) => int; };\n"
+    + "function viaField(b: Box): int { return b.f(1); }\n"
+    + "function viaReturned(): int { return make(1)(2); }\n"
+    + "class Runner { run(f: (x: int) => int): int { return f(1); } }\n"
+    + "function viaMethod(r: Runner): int { return r.run(x => { console.error(\"m\"); return x; }); }\n"
+    + "function leak(): (x: int) => int { return x => { console.log(\"c\"); return x; }; }\n"
+    + "function main(): void { }\n";
+  const o = ctxFor(fs, src);
+  if (o.isNone()) {
+    fails.push("callbacks: program does not check");
+    return fails;
+  }
+  const c = o.unwrap();
+  fails = eq(fails, "closure literal to an interface method that calls its parameter", sum(c, "", "viaIface"), "Console.Write:MAY");
+  fails = eq(fails, "unknown origin to an interface method that calls its parameter", sum(c, "", "viaIfaceUnknown"), "Unknown.Callback:UNKNOWN");
+  fails = eq(fails, "a function value in a record field", sum(c, "", "viaField"), "Unknown.FunctionValue:UNKNOWN");
+  fails = eq(fails, "a returned function value that is called at once", sum(c, "", "viaReturned"), "Unknown.FunctionValue:UNKNOWN");
+  fails = eq(fails, "the implementation calls its parameter: no effect of its own", sum(c, "Doubler", "apply"), "");
+  fails = eq(fails, "the interface method is parametric like its implementation", sum(c, "Mapper", "apply"), "");
+  fails = eq(fails, "method with a callback", sum(c, "Runner", "run"), "");
+  fails = eq(fails, "closure literal to a method", sum(c, "", "viaMethod"), "Console.Write:MAY");
+  fails = eq(fails, "a closure that is only returned: its creator has the effect (MAY)", sum(c, "", "leak"), "Console.Write:MAY");
+  const dm = defOf(c, "Doubler", "apply");
+  if (dm >= 0) {
+    fails = eq(fails, "callback parameter of a method: index 1 (the receiver is 0)", c.table.callbacksOf(dm.toUsize())[0].toString(), "1");
+  } else {
+    fails.push("Doubler.apply not found");
+  }
+  fails = eq(fails, "table is consistent", c.table.consistent().toString(), "true");
+  fails = eq(fails, "agrees with purity", disagreements(c, fs, src), "");
+  return fails;
+}
+
 function testHostCallbacks(fs: FsGrant, f: string[]): string[] {
   let fails = f;
   const src = IO + "function load(fs: FsGrant): void { readFile(fs, \"a\"); }\n"
@@ -303,6 +344,7 @@ function main(host: Host): void {
     fails = testDirectAndTransitive(fs, fails);
     fails = testClosuresAndUnknown(fs, fails);
     fails = testInterfaces(fs, fails);
+    fails = testCallbackKinds(fs, fails);
     fails = testHostCallbacks(fs, fails);
     fails = testNotTyped(fs, fails);
     fails = testPolicyNames(fails);

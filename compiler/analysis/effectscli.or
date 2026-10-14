@@ -1,27 +1,30 @@
 // Command line of `orin effects` (docs/capabilities.md).
 //   orin effects <file.or | package-dir> [--format=text|json] [--no-paths] [--summary] [--module <id>] [--function <name>]
-//                [--check-purity]
+//                [--tests] [--check-purity]
 //
 // Prints the transitive effect summaries of effects.or: the entry point `main`, the package, every module and every function that
 // has an effect, each effect with its evidence and the call chain that explains it. `--summary` stops at the modules,
-// `--module` / `--function` filter, `--no-paths` drops the chains. `--check-purity` cross-checks the summaries with the
+// `--module` / `--function` filter, `--no-paths` drops the chains. The program is the one a build ships: `@Test` functions are
+// erased (ADR-0024) unless `--tests` is given. `--check-purity` cross-checks the summaries with the
 // purity analysis (check/purity.or): exit 1 when a function has an effect although it is pure. The effect policy of
 // `orin.toml` (`[effects]`, effectpolicy.or) is reported at the end; its violations make the exit code 1.
 
 import { FsGrant } from "std:fs";
 import { render } from "../diag";
 import { inferPurity, allFunctions } from "../check";
-import { loadChecked } from "./osig";
+import { LoadedProgram } from "../loader";
+import { loadProgram, checkProgram } from "./osig";
 import { purityViolations, unmappedFunctions } from "./effects";
 import { effectsContext, buildReport, reportText, reportJson, qualName } from "./effectsum";
 import { policyDiags } from "./effectpolicy";
 
 function usage(): int {
-  console.error("usage: orin effects <file.or | package-dir> [--format=text|json] [--no-paths] [--summary] [--module <id>] [--function <name>] [--check-purity]");
+  console.error("usage: orin effects <file.or | package-dir> [--format=text|json] [--no-paths] [--summary] [--module <id>] [--function <name>] [--tests] [--check-purity]");
   return 2;
 }
 
-export function runEffects(fs: FsGrant, argv: string[]): int {
+// `erase` removes the `@Test` functions of a program (the driver passes `eraseTests`; this module cannot import `testing`).
+export function runEffects(fs: FsGrant, argv: string[], erase: (p: LoadedProgram) => LoadedProgram): int {
   let path = "";
   let format = "text";
   let paths = true;
@@ -29,6 +32,7 @@ export function runEffects(fs: FsGrant, argv: string[]): int {
   let module = "";
   let fn = "";
   let checkPurity = false;
+  let withTests = false;
   let i: usize = 0;
   while (i < argv.length) {
     const a = argv[i];
@@ -49,6 +53,8 @@ export function runEffects(fs: FsGrant, argv: string[]): int {
       paths = false;
     } else if (a == "--summary") {
       summary = true;
+    } else if (a == "--tests") {
+      withTests = true;
     } else if (a == "--check-purity") {
       checkPurity = true;
     } else if (path == "" && !a.startsWith("-")) {
@@ -60,7 +66,12 @@ export function runEffects(fs: FsGrant, argv: string[]): int {
   if (path == "" || (format != "text" && format != "json")) {
     return usage();
   }
-  const cp = loadChecked(fs, path, "");
+  const lp = loadProgram(fs, path, "");
+  if (lp.isErr()) {
+    console.error(lp.unwrapErr());
+    return 1;
+  }
+  const cp = checkProgram(withTests ? lp.unwrap().program : erase(lp.unwrap().program), lp.unwrap().sm);
   if (cp.isErr()) {
     console.error(cp.unwrapErr());
     return 1;

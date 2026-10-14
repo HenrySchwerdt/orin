@@ -87,8 +87,36 @@ function viewOf(c: EffContext, d: usize, key: usize): EffView {
   return EffView { op: k.op, dir: k.dir, grant: k.grant, ev: ev, hops: hops, def: d, start: steps[0].span };
 }
 
+// True when no two views have the same operation and direction (an effect appears once).
+export function distinctViews(vs: EffView[]): bool {
+  let i: usize = 0;
+  while (i < vs.length) {
+    let j = i + 1;
+    while (j < vs.length) {
+      if (vs[i].op == vs[j].op && vs[i].dir == vs[j].dir) {
+        return false;
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// True when every view's explanation path starts at `v.def` and ends in a hop (the primitive call).
+export function pathsWellFormed(vs: EffView[]): bool {
+  for (const v of vs) {
+    if (v.hops.length == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The effects of one function, in the order of the table (operation, then direction), each with its path. Empty for a
 // def without a summary and for a program that did not type-check.
+@Ensures(!c.table.hasSummary(d) ==> result.length == 0)
+@Ensures(distinctViews(result) && pathsWellFormed(result))
 export function effectViews(c: EffContext, d: usize): EffView[] {
   let out: EffView[] = [];
   if (!c.table.hasSummary(d)) {
@@ -104,6 +132,7 @@ export function effectViews(c: EffContext, d: usize): EffView[] {
 
 // The union of the effects of `defs`: per effect the best evidence (MUST before MAY before UNKNOWN) and, among equal
 // ones, the shortest path, the first def in the given order on a tie; the path is the witness's.
+@Ensures(distinctViews(result) && pathsWellFormed(result))
 export function aggregateViews(c: EffContext, defs: usize[]): EffView[] {
   let out: EffView[] = [];
   let bestDef: usize[] = [];
@@ -187,6 +216,21 @@ export function moduleDefs(c: EffContext, m: string): usize[] {
   return out;
 }
 
+// True when the module ids are strictly ascending (byte order, "." first): the order of every report.
+export function modulesSorted(ms: ModuleView[]): bool {
+  let i: usize = 1;
+  while (i < ms.length) {
+    if (cmpStr(ms[i - 1].module, ms[i].module) >= 0) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+@Ensures(modulesSorted(result.modules))
+@Ensures(result.typed == c.table.isTyped())
+@Ensures(result.packageEffects.length >= result.entryEffects.length)
 export function buildReport(c: EffContext): EffectsReport {
   let pkg = "_";
   match (c.prog.manifest) {
@@ -389,6 +433,7 @@ export function callbackNames(c: EffContext, d: usize): string[] {
 
 // The text of `orin effects`. `summary`: modules only (no per-function blocks). `module`: only that module id ("" = all).
 // `fn`: only functions of that name ("" = all).
+@Ensures(result.endsWith("\n"))
 export function reportText(c: EffContext, r: EffectsReport, paths: bool, summary: bool, module: string, fn: string): string {
   let lines: string[] = [];
   lines.push("effects of package " + r.package + " (" + EFFECTS_SCHEMA + ")");
@@ -506,6 +551,7 @@ function kindName(c: EffContext, d: usize): string {
 }
 
 // The JSON text of `orin effects --format=json`: one line per module and per function, so that it diffs line by line.
+@Ensures(result.endsWith("\n"))
 export function reportJson(c: EffContext, r: EffectsReport, paths: bool, summary: bool, module: string, fn: string): string {
   let lines: string[] = ["{"];
   lines.push("\"schema\": " + stringifyJson(JStr(EFFECTS_SCHEMA)) + ",");

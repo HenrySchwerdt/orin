@@ -869,9 +869,12 @@ export function loadOsig(fs: FsGrant, path: string): Result<OsigGraph, string> {
 // A type-checked program with its HIR and semantic index: what OSIG, effects and the other whole-program reports start from.
 export type CheckedProgram = { program: LoadedProgram; sm: SourceMap; hir: Program; index: SemanticIndex; };
 
-// Loads and checks the entry file or package directory `path` (no std prelude, as `orin api`); every file the program reads
-// must lie inside `root` ("" = no restriction; MCP passes its root). Errors are rendered diagnostics.
-export function loadChecked(fs: FsGrant, path: string, root: string): Result<CheckedProgram, string> {
+// A loaded (not yet checked) program with the files it was read from.
+export type LoadedForCheck = { program: LoadedProgram; sm: SourceMap; };
+
+// Loads the entry file or package directory `path` (no std prelude, as `orin api`); every file the program reads must lie
+// inside `root` ("" = no restriction; MCP passes its root). Errors are rendered diagnostics.
+export function loadProgram(fs: FsGrant, path: string, root: string): Result<LoadedForCheck, string> {
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(fs, path, noOverlay, noPreludeRoots());
   if (loaded.diags.length > 0) {
@@ -888,16 +891,26 @@ export function loadChecked(fs: FsGrant, path: string, root: string): Result<Che
       }
     }
   }
-  const program = loaded.program.unwrap();
-  const ci = checkWithIndex(program, loaded.sm);
+  return Ok(LoadedForCheck { program: loaded.program.unwrap(), sm: loaded.sm });
+}
+
+// Type-checks a loaded program together with its semantic index. Errors are rendered diagnostics.
+export function checkProgram(program: LoadedProgram, sm: SourceMap): Result<CheckedProgram, string> {
+  const ci = checkWithIndex(program, sm);
   if (ci.result.isErr()) {
     let msgs: string[] = [];
     for (const d of ci.result.unwrapErr()) {
-      msgs.push(render(loaded.sm, d));
+      msgs.push(render(sm, d));
     }
     return Err(msgs.join("\n"));
   }
-  return Ok(CheckedProgram { program: program, sm: loaded.sm, hir: ci.result.unwrap(), index: ci.index });
+  return Ok(CheckedProgram { program: program, sm: sm, hir: ci.result.unwrap(), index: ci.index });
+}
+
+// Loads and checks `path` (see `loadProgram`).
+export function loadChecked(fs: FsGrant, path: string, root: string): Result<CheckedProgram, string> {
+  const l = loadProgram(fs, path, root)?;
+  return checkProgram(l.program, l.sm);
 }
 
 // Same as `loadOsig`, but every file the program reads must lie inside `root` ("" = no restriction; MCP passes its root).

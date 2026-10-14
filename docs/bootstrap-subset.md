@@ -256,10 +256,12 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | W0462 | **warning** (`orin verify --contracts`): `@Ensures` implied by the `@Requires` alone — beyond Orin-B (ADR-0028) |
 | W0470 | **warning**, strict mode only: class with state and no `@Invariant` — beyond Orin-B (ADR-0028) |
 | W0471 | **warning**, strict mode only: public method that mutates `this` and has no `@Ensures` — beyond Orin-B (ADR-0028) |
+| E0473 | a module may perform an effect outside its `[effects]` allowance in `orin.toml` (transitive; the notes carry the explanation path) — beyond Orin-B (ADR-0037 D2/D4, docs/capabilities.md) |
+| E0474 | an `[effects]` `allowed` entry names no effect the compiler knows — beyond Orin-B (docs/capabilities.md) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
-| E0502 | `orin.toml` names a module that does not exist (no `module.or`) (beyond Orin-B) |
-| E0503 | invalid `orin.toml` (unknown key/table, wrong value type, missing `[package] name`, an `[architecture]` flag set to `false`) (beyond Orin-B) |
+| E0502 | `orin.toml` names a module that does not exist (no `module.or`), in `[modules.x]` or `[effects.x]` (beyond Orin-B) |
+| E0503 | invalid `orin.toml` (unknown key/table, wrong value type, missing `[package] name`, an `[architecture]` flag set to `false`, a malformed `[effects]` table) (beyond Orin-B) |
 
 Beyond Orin-B (self-hosted compiler only), contract clauses `@Requires`, `@Ensures`, `@Invariant`,
 `@Decreases`, `@Rule` (ADR-0012) reuse existing codes where the failure is not specific to

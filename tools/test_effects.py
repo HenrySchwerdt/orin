@@ -65,12 +65,36 @@ def ops(effects):
     return sorted("%s:%s" % (e["operation"], e["evidence"]) for e in effects)
 
 
+def sweep(orin):
+    """The purity agreement and the "every HIR function has a def" check over the whole conformance corpus."""
+    import glob
+    files = []
+    for pat in ("tests/run/*.or", "tests/next/run/*.or", "tests/contracts/*.or", "examples/*.or"):
+        files += sorted(glob.glob(os.path.join(ROOT, pat)))
+    ok = skipped = 0
+    for f in files:
+        rc, out, err = run(orin, ["effects", f, "--check-purity"])
+        if out.startswith("purity: consistent"):
+            ok += 1
+        elif "error[" in err:
+            skipped += 1                # a program that is meant not to type-check
+        else:
+            check(False, "%s: %s%s" % (os.path.relpath(f, ROOT), out, err[:300]))
+    print("sweep: %d programs consistent, %d do not type-check, %d failures" % (ok, skipped, len(failures)))
+    sys.exit(1 if failures else 0)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--orin", default=os.path.join(ROOT, "build", "bootstrap", "orin2"))
     ap.add_argument("--update", action="store_true", help="rewrite the goldens")
+    ap.add_argument("--sweep", action="store_true",
+                    help="only: run `orin effects --check-purity` over every conformance program that type-checks (minutes)")
     a = ap.parse_args()
     orin = os.path.abspath(a.orin)
+    if a.sweep:
+        sweep(orin)
+        return
     app = os.path.join(ROOT, "tests", "osig", "effects", "app")
     gdir = os.path.join(ROOT, "tests", "osig", "effects")
     rel = "tests/osig/effects/app"
@@ -178,6 +202,17 @@ def main():
         check(rc == 0 and not bad_edges, "%s: summaries closed under calls (%s)" % (what, bad_edges[:3]))
         direct = {(e["src"], e["dst"], e["via"]) for e in sd["edges"] if e["kind"] == "PERFORMS_IO"}
         check(all((d_, v_) in sm.get(s_, set()) for (s_, d_, v_) in direct), "%s: every PERFORMS_IO edge is in the summary" % what)
+
+    # @Test functions are not part of what a build ships: erased unless --tests
+    tp = copy_package(app, os.path.join(tmp, "withtests"))
+    with open(os.path.join(tp, "src", "util", "util.or"), "a") as f:
+        f.write("\n@Test\nfunction loud(): void {\n  console.log(\"test\");\n}\n")
+    rc, out, err = run(orin, ["effects", tp, "--format=json"])
+    jt = {m["module"]: m for m in json.loads(out)["modules"]}
+    check(rc == 0 and jt["util"]["effects"] == [], "@Test functions are erased: the module stays pure (%s)" % err)
+    rc, out, err = run(orin, ["effects", tp, "--format=json", "--tests"])
+    jt = {m["module"]: m for m in json.loads(out)["modules"]}
+    check(rc == 0 and ops(jt["util"]["effects"]) == ["Console.Write:MUST"], "--tests includes them (%s)" % err)
 
     # ---- 3. diff: new and removed effects ------------------------------------------------------------------
     base = copy_package(app, os.path.join(tmp, "effbase"))

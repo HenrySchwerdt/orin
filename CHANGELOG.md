@@ -1,6 +1,30 @@
 # Changelog
 
 ## Unreleased
+- **Capabilities, Stage B: transitive effect inference (ADR-0037 D2, graph 2; no new syntax).** The compiler now infers, for
+  every function, method and constructor, the set of primitive effects it may perform *transitively* (`Fs.ReadFile`,
+  `Console.Write`, `Process.Spawn`, `Clock.Now`, ...; direction INPUT / OUTPUT / CONTROL; grant family), with evidence (MUST: a
+  primitive call in the body; MAY: inherited, in a closure, through an implementation; UNKNOWN: unknown target, never pure)
+  and the shortest call chain that explains it. A sound over-approximation: closures are accounted for the function that creates
+  them, a call of a parameter makes the function parametric in it (so `useHost(host, callback)` is precise), an interface call
+  is the union over all implementations (`Unknown.Interface` without any), a function value of unknown origin is
+  `Unknown.FunctionValue`, recursion is a fixed point. Agrees with the purity analysis (a function with an effect is impure;
+  a contract ties the two builtin tables). **One engine** (`compiler/analysis/effects.or`) for: `orin effects <entry|package>
+  [--format=json] [--summary] [--module M] [--function F] [--no-paths] [--check-purity]` (entry point, package, module and
+  function summaries with paths); OSIG **`osig/0.2`** with the `MAY_PERFORM` edge (and the edge field `next`; 0.1 readers
+  keep working, `PERFORMS_IO` stays); `orin diff` (`osig-diff/0.2`) sections for new and removed effects per function and
+  module with the explaining path and the entry points that reach a new effect; the LSP hover and the MCP `inspect` result
+  show the summary. **Effect policy** (prepares ADR-0037 D4): `[effects] allowed = [...]` / `[effects.<module>]` in `orin.toml`;
+  a module whose inferred effects exceed its allowance is **E0473** (explanation path in the notes), **E0474** unknown effect
+  name, **E0502** for a table of a missing module; absent configuration means no restriction. Semantic index: `CallSite` gets
+  `param` / `fnArgs`, `SemanticIndex` gets `fnDefs` / `fnKinds` / `typed` (no behaviour change of the checker or the generated
+  code; the C of every program is byte-identical). The compiler's own summary: `syntax`, `package`, `check`, `lower`, `mir`,
+  `opt`, `verify`, `cemit`, `llvm`, `fmt`, `json`, `diag`, `hir` are pure; file, stdio and process effects are only in `loader`
+  (`Sources`), `analysis`, `tools`, `lsp`, `mcp`, `testing`, `vc` and the driver, nothing is UNKNOWN (docs/capabilities.md).
+  Findings: the only `shell` call is `lsp::shellRun`, imported by `testing`, `vc` and `mcp`; `analysis` reaches the file
+  system in three places. Docs: new docs/capabilities.md, docs/osig.md, docs/mcp.md, ADR-0023 addendum.
+  Tests: `compiler/tests/effects_test.or`, `tools/test_effects.py` (goldens `tests/osig/effects/`), LSP / MCP / OSIG /
+  capability tests.
 - **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0036).** `orin verify --contracts` now encodes arrays
   (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
   `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by
