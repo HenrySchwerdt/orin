@@ -12,14 +12,14 @@
 import { Span, Diagnostic, diag } from "../diag";
 import { Ident, Block, Stmt, Expr, MatchArm, TypeExpr, AssignOp, ContractClause } from "../syntax";
 import { Type, HBlock, HStmt, HExpr, HExprKind, HArm, VariantDef, FieldInitH } from "../hir";
-import { Env, isVoid, isIntish, isBool, showType } from "./env";
+import { Env, isVoid, isIntish, isBool, showType, typeInRange } from "./env";
 import { FnCtx } from "./fnctx";
 import { checkPattern } from "./pattern";
 import {
   mk, isNop, isArrowExpr, isTrueLit, assignOpOf, compoundAllowed, condHoistErr,
 } from "./ops";
 import { Coverage, variantsOf, isLiteralScrut, coverageKept } from "./match";
-import { allStmtsBound } from "./hirok";
+import { allStmtsBound, localsBound } from "./hirok";
 import { ExprChecker, BlockHost, BlockOut, StmtOut, MatchOut } from "./expr";
 
 export type ClauseOut = { env: Env; expr: Option<HExpr>; };
@@ -639,18 +639,27 @@ export class StmtChecker {
 // What `ExprChecker` asks of the statement checker: each call builds a checker around the context it
 // is given and hands the updated context back. It has no state of its own.
 class StmtHost implements BlockHost {
+  @Ensures(result.isOk() ==> result.unwrap().fx.scope.depth() == fx.scope.depth())
+  @Ensures(result.isOk()
+      ==> allStmtsBound(result.unwrap().block.stmts, result.unwrap().fx.locals.length))
   block(fx: FnCtx, b: Block): Result<BlockOut, Diagnostic> {
     let sc = new StmtChecker(new ExprChecker(fx, new StmtHost()));
     const r = sc.block(b)?;
     return Ok(BlockOut { fx: sc.ex.fx, block: r.block, div: r.div });
   }
 
+  @Ensures(result.isOk() ==> result.unwrap().fx.scope.depth() == fx.scope.depth())
+  @Ensures(result.isOk()
+      ==> allStmtsBound([result.unwrap().stmt], result.unwrap().fx.locals.length))
   stmtExpr(fx: FnCtx, e: Expr): Result<StmtOut, Diagnostic> {
     let sc = new StmtChecker(new ExprChecker(fx, new StmtHost()));
     const r = sc.stmtExpr(e)?;
     return Ok(StmtOut { fx: sc.ex.fx, stmt: r.stmt, div: r.div });
   }
 
+  @Ensures(result.isOk() ==> result.unwrap().fx.scope.depth() == fx.scope.depth())
+  @Ensures(result.isOk() ==> localsBound(result.unwrap().expr, result.unwrap().fx.locals.length))
+  @Ensures(result.isOk() ==> typeInRange(result.unwrap().fx.env, result.unwrap().expr.ty))
   matchExpr(
     fx: FnCtx,
     span: Span,
@@ -667,6 +676,10 @@ class StmtHost implements BlockHost {
 
 // Checks the body of a function in the context `fx` (the parameters declared): the entry point of the
 // checker driver.
+@Ensures(result.isOk() ==> result.unwrap().fx.scope.depth() == fx.scope.depth())
+@Ensures(result.isOk()
+    ==> allStmtsBound(result.unwrap().block.stmts, result.unwrap().fx.locals.length))
+@Ensures(result.isOk() ==> result.unwrap().fx.loops.length == fx.loops.length)
 export function checkBlock(fx: FnCtx, b: Block): Result<BlockOut, Diagnostic> {
   let sc = new StmtChecker(new ExprChecker(fx, new StmtHost()));
   const r = sc.block(b)?;
@@ -676,6 +689,8 @@ export function checkBlock(fx: FnCtx, b: Block): Result<BlockOut, Diagnostic> {
 // Checks one contract clause of a function in (a fork of) the context `fx`; see `StmtChecker.clause`.
 // The context of the caller is not changed; the environment after the clause is returned.
 @Requires(cmode >= 1 && cmode <= 2)
+@Ensures(result.isOk() ==> result.unwrap().expr.isSome() == c.expr.isSome())
+@Ensures(result.isOk() ==> result.unwrap().env.funcs.length >= fx.env.funcs.length)
 export function checkClause(
   fx: FnCtx,
   c: ContractClause,

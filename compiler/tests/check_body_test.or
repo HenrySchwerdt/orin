@@ -18,11 +18,12 @@ import {
 } from "../hir";
 import { loadWithOverlay } from "../loader";
 import {
-  FnCtx, Scope, newFnCtx, newClosureCtx, Coverage, variantsOf, coverageKept, uncoveredCount,
-  Inference, allFilled, filledCount, localsBound, blockBound, stmtBound, placeBound, functionBound,
-  allStmtsBound, mk, nopExpr, isNop, untypedInt, fieldIndex, missingNames, tailTypes, noPre,
-  intLiteral, bigIntLiteral, negIntLiteral, negBigLiteral, interpolated, binaryType, extendPath,
-  pureH, purePlace, mapReadFn, elemSuffix, isArrayApi, emptyEnv, Env, typeEq, check,
+  FnCtx, Scope, newClosureCtx, Coverage, variantsOf, coverageKept, uncoveredCount, Inference,
+  allFilled, filledCount, localsBound, blockBound, stmtBound, placeBound, functionBound,
+  allStmtsBound, mk, nopExpr, isNop, fieldIndex, missingNames, tailTypes, noPre, intLiteral,
+  bigIntLiteral, negIntLiteral, negBigLiteral, interpolated, binaryType, extendPath, pureH,
+  purePlace, mapReadFn, elemSuffix, isArrayApi, emptyEnv, FuncInfo, dummyDecl, wrapperOf,
+  liftClosure, typeEq, check,
 } from "../check";
 
 function sp(): Span {
@@ -587,6 +588,81 @@ function blockBoundCoversStatements(): void {
     span: sp(),
   };
   assertEqBool(functionBound(f), true, "a function over its own locals");
+}
+
+// ---------------------------------------------------------------------------
+// Closure conversion (lift.or)
+// ---------------------------------------------------------------------------
+
+function plainFunc(mode: int): FuncInfo {
+  return FuncInfo {
+    unit: 0,
+    qname: "t.f",
+    decl: dummyDecl("f", sp()),
+    params: [TyInt, TyString],
+    paramLocals: [
+      Local { name: "a", ty: TyInt, mutable: false },
+      Local { name: "b", ty: TyString, mutable: false },
+    ],
+    ret: TyBool,
+    tpNames: [],
+    tpTys: [],
+    depth: 0,
+    mode: mode,
+    cls: 0,
+    srcRet: TyVoid,
+  };
+}
+
+@Test
+function functionValueWrappersAreCreatedOnce(): void {
+  let env = emptyEnv();
+  env.funcs.push(plainFunc(0));
+  env.funcs.push(plainFunc(2));
+  let fx = new FnCtx(0, "t.main", env, [], new Scope(), TyVoid);
+  const w1 = wrapperOf(fx, sp(), 0).unwrap();
+  assertEqBool(w1.created, true, "the first use creates the wrapper");
+  assertEqUsize(w1.wid, 2, "after the two functions");
+  fx.replaceEnv(w1.env);
+  assertEqUsize(fx.env.lifted.length, 1, "one lifted function");
+  assertEqBool(fx.env.wrappers.has("t.f$closure"), true, "found by name");
+  const lifted = fx.env.lifted[0];
+  assertEqUsize(lifted.paramCount, 3, "environment record, a and b");
+  assertEqBool(functionBound(lifted), true, "its locals are bound");
+  assertEqString(kinds(lifted.body), "R", "returns the call of f");
+  const w2 = wrapperOf(fx, sp(), 0).unwrap();
+  assertEqBool(w2.created, false, "the second use finds it");
+  assertEqUsize(w2.wid, w1.wid, "the same function");
+  assertEqUsize(w2.env.funcs.length, 3, "nothing was added");
+  assertEqString(
+    wrapperOf(fx, sp(), 1).unwrapErr().code,
+    "E0400",
+    "a method is not a function value",
+  );
+}
+
+@Test
+function closureConversionBuildsTheEnvironmentRecord(): void {
+  let outer = ctx();
+  const x = outer.newLocal("x", TyString, false);
+  assert(outer.declare(ident("x"), x).isOk(), "declare x");
+  const pn: string[] = ["a"];
+  const pt: Type[] = [TyInt];
+  let inner = newClosureCtx(outer, "t.main$closure0", pn, pt, TyVoid, false);
+  const cap = inner.lookupVar("x").unwrap();
+  const stmts: HStmt[] = [HReturn(Some(mk(XLocal(cap), TyString, sp())))];
+  const lo = liftClosure(inner, "t.main$closure0", pt, stmts, TyString, sp());
+  assertEqUsize(lo.env.records.length, 1, "the environment record");
+  assertEqString(lo.env.records[0].name, "t.main$closure0$env", "named after the closure");
+  assertEqUsize(lo.env.records[0].fields.length, 1, "one capture, one field");
+  assertEqString(lo.env.records[0].fields[0].name, "x", "named after the variable");
+  const fn = lo.env.lifted[0];
+  assertEqUsize(fn.paramCount, 2, "environment record and a");
+  assertEqString(kinds(fn.body), "LR", "capture prologue, then the body");
+  assertEqBool(functionBound(fn), true, "its locals are bound");
+  assertEqUsize(lo.env.funcs[lo.fid].paramLocals.length, 2, "registered with its parameters");
+  assertEqUsize(lo.env.funcs[lo.fid].mode.toUsize(), 6, "as a lifted function");
+  assertEqUsize(outer.env.records.length, 0, "lifting does not change the enclosing context");
 }
 
 // ---------------------------------------------------------------------------
