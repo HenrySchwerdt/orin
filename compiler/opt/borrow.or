@@ -30,9 +30,23 @@ import { fnWellFormed, passKept, instrCount, dupCount, releaseCount } from "./we
 export type ReadCall = { callee: usize; pos: usize; };
 
 // Per local of a function: `bad[l]`: l is not a read-only copy (a local with other than one definition, a parameter, or a
-// use that is not a read); `calls[l]`: the direct-call positions l is passed in (meaningful when !bad[l]).
-@Invariant(this.bad.length == this.calls.length)
-export type ReadInfo = { bad: bool[]; calls: ReadCall[][]; };
+// use that is not a read). The direct-call positions locals are passed in, as parallel lists (`cLocal[k]` is passed as
+// argument `cPos[k]` of function `cCallee[k]`; read them with `callsOf`).
+@Invariant(this.cLocal.length == this.cCallee.length && this.cLocal.length == this.cPos.length)
+export type ReadInfo = { bad: bool[]; cLocal: usize[]; cCallee: usize[]; cPos: usize[]; };
+
+// The direct-call positions local l is passed in.
+export function callsOf(info: ReadInfo, l: usize): ReadCall[] {
+  let out: ReadCall[] = [];
+  let k: usize = 0;
+  while (k < info.cLocal.length) {
+    if (info.cLocal[k] == l) {
+      out.push(ReadCall { callee: info.cCallee[k], pos: info.cPos[k] });
+    }
+    k += 1;
+  }
+  return out;
+}
 
 function isLocal(o: Operand, l: usize): bool {
   return match (o) {
@@ -67,16 +81,17 @@ function readsOnly(ins: Instr, l: usize): bool {
   };
 }
 
-@Ensures(result.bad.length == f.locals.length && result.calls.length == f.locals.length)
+@Ensures(result.bad.length == f.locals.length)
 export function readInfo(f: MFunction): ReadInfo {
   const n = f.locals.length;
   let bad: bool[] = [];
-  let calls: ReadCall[][] = [];
+  let cLocal: usize[] = [];
+  let cCallee: usize[] = [];
+  let cPos: usize[] = [];
   let defs: usize[] = [];
   let l: usize = 0;
   while (l < n) {
     bad.push(l < f.paramCount || !isRefTy(f.locals[l].ty));
-    calls.push([]);
     defs.push(0);
     l += 1;
   }
@@ -101,7 +116,9 @@ export function readInfo(f: MFunction): ReadInfo {
           while (j < args.length) {
             match (args[j]) {
               OLocal(a) => {
-                calls[a].push(ReadCall { callee: g, pos: j });
+                cLocal.push(a);
+                cCallee.push(g);
+                cPos.push(j);
               },
               _ => {},
             }
@@ -122,7 +139,7 @@ export function readInfo(f: MFunction): ReadInfo {
     }
     l += 1;
   }
-  return ReadInfo { bad: bad, calls: calls };
+  return ReadInfo { bad: bad, cLocal: cLocal, cCallee: cCallee, cPos: cPos };
 }
 
 // `d = dup p` with p a reference parameter and d a read-only copy.
@@ -131,6 +148,17 @@ export function isReadCopy(f: MFunction, info: ReadInfo, ins: Instr): bool {
   return match (ins) {
     IDup(d, o) => match (o) {
       OLocal(p) => p < f.paramCount && isRefTy(f.locals[p].ty) && d < info.bad.length && !info.bad[d],
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// `d = dup p` with p a reference parameter (a candidate before the uses of d are known).
+function copiesParam(f: MFunction, ins: Instr): bool {
+  return match (ins) {
+    IDup(_, o) => match (o) {
+      OLocal(p) => p < f.paramCount && isRefTy(f.locals[p].ty),
       _ => false,
     },
     _ => false,
@@ -152,6 +180,9 @@ function ownedAt(prog: MProgram, callee: usize, pos: usize): bool {
 @Ensures(instrCount(result) <= instrCount(f) && dupCount(result) <= dupCount(f))
 @Ensures(releaseCount(result) <= releaseCount(f))
 export function borrowReads(prog: MProgram, f: MFunction): MFunction {
+  if (!f.paramOwned.some(o => !o) || !f.blocks.some(blk => blk.instrs.some(ins => copiesParam(f, ins)))) {
+    return f;
+  }
   const info = readInfo(f);
   let conv: bool[] = [];
   let any = false;
@@ -167,7 +198,7 @@ export function borrowReads(prog: MProgram, f: MFunction): MFunction {
               OLocal(p) => {
                 if (p < f.paramOwned.length
                     && !f.paramOwned[p]
-                    && !info.calls[d].some(c => ownedAt(prog, c.callee, c.pos))) {
+                    && !callsOf(info, d).some(c => ownedAt(prog, c.callee, c.pos))) {
                   conv[d] = true;
                   any = true;
                 }
