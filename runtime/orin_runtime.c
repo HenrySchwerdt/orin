@@ -1909,13 +1909,27 @@ static OrinObj *deep_copy(OrinObj *root) {
 }
 
 /* Detach the value in `box` (a one-slot record the sender has just built and still owns) and publish it. Moved when
- * every reference in it is the only one (the sender's own copy is then empty and its release frees only the husk);
- * deep-copied otherwise. Either way the receiver gets a graph no other task can reach. */
+ * every reference in it is the only one, deep-copied otherwise. Either way the receiver gets a graph no other task can
+ * reach.
+ *
+ * Box once: when the box itself is referenced only by the sender (rc == 1, the normal case: std:task builds it right
+ * before the call) and its value is a scalar or a uniquely owned graph, the box itself is published: it is retained
+ * here (rc 2) and the sender's release that follows the call brings it back to 1, the reference the token owns. No
+ * second box is allocated. This relies on the protocol of the only caller, std:task (`putBox`): the sender releases its
+ * reference before the token can reach another task (putBox returns the token only after the box died in it, and a
+ * token travels only through a monitor or a thread start, both of which order the sender's release before the
+ * receiver's take). Otherwise (a shared box, which std:task never passes) a fresh box is built as before. */
 uint64_t orin_rt_transfer_put(OrinObj *box) {
     if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 1) orin_trap_shape();
     OrinStruct *s = (OrinStruct *)box;
     OrinObj *out;
-    if (!(s->refmask & 1) || !s->slots[0]) {
+    int scalar = !(s->refmask & 1) || !s->slots[0];
+    if (box->rc == 1 && (scalar || graph_unique(box))) {
+        orin_retain(box);
+        if (!scalar) orin_stats.transfer_moves++;
+        return tr_publish(box);
+    }
+    if (scalar) {
         out = orin_struct_new(box->tag, 1, s->refmask);
         ((OrinStruct *)out)->slots[0] = s->slots[0];
     } else if (graph_unique(box)) {

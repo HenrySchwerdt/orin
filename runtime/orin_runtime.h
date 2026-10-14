@@ -127,6 +127,8 @@ void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0
  *     in it was consumed by the sender); put detaches the value (moved if its whole graph is uniquely owned, deep-copied
  *     otherwise; a copy is a fresh graph nobody else can reach) and returns a token; take returns the box (owned by the
  *     caller, now in ITS heap); drop frees it. A token is valid for exactly one take or drop; anything else traps.
+ *     A box only the sender references is published itself (retained; no second box): the sender must release its
+ *     reference before the token reaches another task (std:task's putBox does; a monitor or a thread start orders it).
  *   task: spawn starts a thread that takes the closure `() => void` out of the token, runs it and ends; join waits
  *     (0: it returned, 1: it trapped, the message is then available from orin_rt_task_message). A trap on a task thread
  *     ends only that task. */

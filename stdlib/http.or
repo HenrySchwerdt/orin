@@ -48,7 +48,7 @@
 // and `HTTP_HEXV` (hex digit value or 16). Orin has no constant arrays, so both are string constants read with
 // `charCodeAt` like the DFA tables of std:utf8. Runs of ordinary bytes (a method, a header name, a header value) are
 // scanned in a tight loop and handled once per run, not once per byte; the state changes once per token. The loops
-// index a window (a `u8[]` copy of up to 4096 bytes of the chunk) instead of calling `Bytes.at` per byte; a body is a
+// index the chunk's storage array (`Bytes.storage`, no copy) instead of calling `Bytes.at` per byte; a body is a
 // slice of the chunk and is never scanned. Measured throughput and the cost model: docs/std.md.
 //
 // Contract standard (ADR-0030 §3): classes carry `@Invariant`s that `orin test` checks after every public method;
@@ -63,7 +63,7 @@
 // connection management, URI parsing beyond the shape checks of `isValidTarget`, cookies and any header semantics
 // other than the framing and `Host` rules above.
 
-import { Bytes, ByteBuilder, bytesFromString, bytesFromArray, emptyBytes } from "std:bytes";
+import { Bytes, ByteBuilder, bytesFromString, emptyBytes } from "std:bytes";
 
 // ------------------------------------------------------------------------------------ character classes
 
@@ -135,14 +135,16 @@ export function eqIgnoreCase(a: string, b: string): bool {
 
 // toLowerAscii(s): s with ASCII letters lower-cased; other bytes (including obs-text) unchanged. O(n).
 @Ensures(result.length == s.length)
+@Ensures(s.length > 0 ==> result.charCodeAt(0) == lowerAscii(s.charCodeAt(0)))
+@Ensures(s.length > 0 ==> result.charCodeAt(s.length - 1) == lowerAscii(s.charCodeAt(s.length - 1)))
 export function toLowerAscii(s: string): string {
-  let parts: string[] = [];
+  let out = "";
   let i: usize = 0;
   while (i < s.length) {
-    parts.push(String.fromCharCode(lowerAscii(s.charCodeAt(i))));
+    out += String.fromCharCode(lowerAscii(s.charCodeAt(i)));
     i += 1;
   }
-  return parts.join("");
+  return out;
 }
 
 // isToken(s): a non-empty run of token characters (a method or a field name). O(n).
@@ -1410,9 +1412,9 @@ function resultUsed<T>(r: ParseResult<T>): usize {
   };
 }
 
-// The scanner reads the input through a window: a copy of at most WINDOW bytes of the chunk as a `u8[]`, so that
-// the byte loops index an array instead of calling `Bytes.at` per byte (a call plus a reference count per byte).
-const WINDOW: usize = 4096;
+// The scanners read the chunk's storage array directly (`Bytes.storage`, no copy), so that the byte loops index an
+// array instead of calling `Bytes.at` per byte (a call plus a reference count per byte). Their cursor `this.cur` is an
+// index into that array; the chunk starts at index `this.off` of it, which is stream offset `this.base`.
 
 // The incremental parser shared by `RequestParser` and `ResponseParser`: the state machine described at the top of
 // the file. `feed` consumes input in one forward pass; all state is in the fields, so the input may be split
@@ -1438,6 +1440,7 @@ const WINDOW: usize = 4096;
 @Invariant(this.state != S_BODY || this.framing == F_LENGTH)
 @Invariant(this.state != S_BODY_CLOSE || this.framing == F_CLOSE)
 @Invariant(this.vidx <= 8 && this.codeDigits <= 3)
+@Invariant(this.noBody.length() == 0)
 @Invariant(this.acc.length == 0 || this.state == S_METHOD || this.state == S_TARGET || this.state == S_REASON
   || this.state == S_HDR_NAME || this.state == S_HDR_VALUE || this.state == S_ERROR)
 class MessageParser {
@@ -1453,6 +1456,7 @@ class MessageParser {
   private err: Option<HttpError> = None;
   private base0: usize = 0;
   private base: usize = 0;
+  private off: usize = 0;
   private cur: usize = 0;
   private total: usize = 0;
   private sectionEnd: usize;
@@ -1484,6 +1488,7 @@ class MessageParser {
   private remaining: usize = 0;
   private bodyLen: usize = 0;
   private parts: Bytes[] = [];
+  private noBody: Bytes = emptyBytes();
   private chunkSize: usize = 0;
   private chunkDigits: usize = 0;
 
@@ -1508,6 +1513,7 @@ class MessageParser {
     this.err = None;
     this.base0 = 0;
     this.base = 0;
+    this.off = 0;
     this.cur = 0;
     this.total = 0;
     this.sectionEnd = this.maxHead;
@@ -1589,14 +1595,22 @@ class MessageParser {
     this.state = S_ERROR;
   }
 
+  // posOf(j): the stream offset of index j of the storage array the scanners read (index `this.off` is the first
+  // byte of the chunk, at stream offset `this.base`).
+  @Requires(j >= this.off)
+  @Ensures(result == this.base + (j - this.off))
+  private posOf(j: usize): usize {
+    return this.base + (j - this.off);
+  }
+
   // feed(chunk): consumes bytes of the message. NeedMore: all of `chunk` was consumed. Done(_, used): the message is
   // complete after `used` bytes of this chunk. Failed(e): refused. In a terminal state it answers Failed without
   // consuming anything (the stored error, or `ParserFinished` after Done).
   //
   // The loop takes one token per step. A step handles the bytes at the cursor `this.cur` in the current state and
   // moves the cursor; it consumes at least one byte or ends in ERROR, so the loop terminates in at most
-  // chunk.length() + 1 steps. Scanning states read a window of the chunk (`xs`, cursor relative to the window);
-  // the body states copy nothing: they slice the chunk.
+  // chunk.length() + 1 steps. Scanning states read the chunk's storage array (`xs`, the cursor an index
+  // into it); the body states copy nothing: they slice the chunk.
   @Ensures(resultKind(result) == 0 ==> this.state < S_DONE && this.total == old(this.total) + chunk.length())
   @Ensures(resultKind(result) == 1 ==> this.state == S_DONE && resultUsed(result) <= chunk.length())
   @Ensures(resultKind(result) == 1 ==> this.total == old(this.total) + resultUsed(result))
@@ -1611,10 +1625,11 @@ class MessageParser {
     }
     this.base0 = this.total;
     const n = chunk.length();
+    const xs = chunk.storage();
+    const off = chunk.storageStart();
+    this.base = this.base0;
+    this.off = off;
     let i: usize = 0;
-    let xs: u8[] = [];
-    let w: usize = 0;
-    let we: usize = 0;
     while (i < n && this.state < S_DONE) {
       const st = this.state;
       if (st == S_BODY) {
@@ -1641,16 +1656,10 @@ class MessageParser {
             break;
           }
         }
-        if (i < w || i >= we) {
-          w = i;
-          we = n - i > WINDOW ? i + WINDOW : n;
-          xs = chunk.slice(w, we).toArray();
-        }
-        const lim = (end < we ? end : we) - w;
-        this.base = this.base0 + w;
-        this.cur = i - w;
+        const lim = off + end;
+        this.cur = off + i;
         if (this.lineLen >= this.lineMax && isLineState(st) && HTTP_CLASS.charCodeAt(xs[this.cur].toUsize()) != C_CR) {
-          this.fail(this.base + this.cur, lineLimitReason(st));
+          this.fail(this.posOf(this.cur), lineLimitReason(st));
           break;
         }
         if (st == S_HDR_VALUE) {
@@ -1690,7 +1699,7 @@ class MessageParser {
         } else {
           this.doChunkLf(xs);
         }
-        i = w + this.cur;
+        i = this.cur - off;
       }
     }
     this.total = this.base0 + i;
@@ -1758,22 +1767,23 @@ class MessageParser {
     }
     if (c == C_SP && this.lineLen > 0) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, StartLineTooLong);
+        this.fail(this.posOf(j), StartLineTooLong);
         return;
       }
       this.lineLen += 1;
       if (this.acc.length > 0) {
-        tok = this.acc + tok;
+        this.acc += tok;
+        tok = this.acc;
         this.acc = "";
       }
       this.methodToken = tok;
       this.meth = methodFromToken(tok).unwrap();
       this.go(S_TARGET);
-      this.targetPos = this.base + j + 1;
+      this.targetPos = this.posOf(j) + 1;
       this.cur = j + 1;
       return;
     }
-    this.fail(this.base + j, BadMethod);
+    this.fail(this.posOf(j), BadMethod);
   }
 
   // TARGET: a run of 0x21..0x7E, then SP.
@@ -1808,12 +1818,13 @@ class MessageParser {
     }
     if (c == C_SP && this.lineLen > this.methodToken.length + 1) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, StartLineTooLong);
+        this.fail(this.posOf(j), StartLineTooLong);
         return;
       }
       this.lineLen += 1;
       if (this.acc.length > 0) {
-        tok = this.acc + tok;
+        this.acc += tok;
+        tok = this.acc;
         this.acc = "";
       }
       this.target = tok;
@@ -1823,10 +1834,10 @@ class MessageParser {
       return;
     }
     if (c == C_CR && this.lineLen > this.methodToken.length + 1) {
-      this.fail(this.base + j, BadVersion);
+      this.fail(this.posOf(j), BadVersion);
       return;
     }
-    this.fail(this.base + j, BadTarget);
+    this.fail(this.posOf(j), BadTarget);
   }
 
   // VERSION: "HTTP/1." and a digit (0 or 1), then CR (request) or SP (response).
@@ -1841,9 +1852,9 @@ class MessageParser {
         if (c != "HTTP/1.".charCodeAt(k)) {
           this.cur = j;
           if (k == 5 && c >= 48 && c <= 57) {
-            this.fail(this.base + j, UnsupportedVersion);
+            this.fail(this.posOf(j), UnsupportedVersion);
           } else {
-            this.fail(this.base + j, BadVersion);
+            this.fail(this.posOf(j), BadVersion);
           }
           return;
         }
@@ -1853,11 +1864,11 @@ class MessageParser {
         this.minor = 1;
       } else if (c >= 50 && c <= 57) {
         this.cur = j;
-        this.fail(this.base + j, UnsupportedVersion);
+        this.fail(this.posOf(j), UnsupportedVersion);
         return;
       } else {
         this.cur = j;
-        this.fail(this.base + j, BadVersion);
+        this.fail(this.posOf(j), BadVersion);
         return;
       }
       this.vidx += 1;
@@ -1868,9 +1879,9 @@ class MessageParser {
     if (this.vidx < 8) {
       if (j < n) {
         if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
-          this.fail(this.base + j, StartLineTooLong);
+          this.fail(this.posOf(j), StartLineTooLong);
         } else {
-          this.fail(this.base + j, BadVersion);
+          this.fail(this.posOf(j), BadVersion);
         }
       }
       return;
@@ -1886,15 +1897,15 @@ class MessageParser {
         return;
       }
       if (d == C_LF) {
-        this.fail(this.base + j, BareLf);
+        this.fail(this.posOf(j), BareLf);
       } else {
-        this.fail(this.base + j, BadVersion);
+        this.fail(this.posOf(j), BadVersion);
       }
       return;
     }
     if (d == C_SP) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, StartLineTooLong);
+        this.fail(this.posOf(j), StartLineTooLong);
         return;
       }
       this.lineLen += 1;
@@ -1905,9 +1916,9 @@ class MessageParser {
       return;
     }
     if (d == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadStatusLine);
+      this.fail(this.posOf(j), BadStatusLine);
     }
   }
 
@@ -1920,7 +1931,7 @@ class MessageParser {
       const c = xs[j].toInt();
       if (c < 48 || c > 57 || (this.codeDigits == 0 && (c < 49 || c > 53))) {
         this.cur = j;
-        this.fail(this.base + j, BadStatusCode);
+        this.fail(this.posOf(j), BadStatusCode);
         return;
       }
       this.code = this.code * 10 + (c - 48);
@@ -1932,9 +1943,9 @@ class MessageParser {
     if (this.codeDigits < 3) {
       if (j < n) {
         if (this.lineLen >= this.lineMax && HTTP_CLASS.charCodeAt(xs[j].toUsize()) != C_CR) {
-          this.fail(this.base + j, StartLineTooLong);
+          this.fail(this.posOf(j), StartLineTooLong);
         } else {
-          this.fail(this.base + j, BadStatusCode);
+          this.fail(this.posOf(j), BadStatusCode);
         }
       }
       return;
@@ -1945,7 +1956,7 @@ class MessageParser {
     const d = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (d == C_SP) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, StartLineTooLong);
+        this.fail(this.posOf(j), StartLineTooLong);
         return;
       }
       this.lineLen += 1;
@@ -1954,9 +1965,9 @@ class MessageParser {
       return;
     }
     if (d == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadStatusLine);
+      this.fail(this.posOf(j), BadStatusLine);
     }
   }
 
@@ -1992,7 +2003,8 @@ class MessageParser {
     }
     if (c == C_CR) {
       if (this.acc.length > 0) {
-        tok = this.acc + tok;
+        this.acc += tok;
+        tok = this.acc;
         this.acc = "";
       }
       this.reason = tok;
@@ -2001,9 +2013,9 @@ class MessageParser {
       return;
     }
     if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadStatusLine);
+      this.fail(this.posOf(j), BadStatusLine);
     }
   }
 
@@ -2013,7 +2025,7 @@ class MessageParser {
   private doStartLf(xs: u8[]): void {
     const i = this.cur;
     if (xs[i].toInt() != 10) {
-      this.fail(this.base + i, BareCr);
+      this.fail(this.posOf(i), BareCr);
       return;
     }
     if (this.isReq && !isValidTarget(this.meth, this.target)) {
@@ -2023,7 +2035,7 @@ class MessageParser {
     this.go(S_HDR_LINE);
     this.lineLen = 0;
     this.lineMax = this.maxLine;
-    this.lineStart = this.base + i + 1;
+    this.lineStart = this.posOf(i) + 1;
     this.cur = i + 1;
   }
 
@@ -2038,10 +2050,10 @@ class MessageParser {
     if (c >= C_TOKEN) {
       const count = this.inTrailers ? this.tnames.length : this.hnames.length;
       if (count >= this.maxCount) {
-        this.fail(this.base + i, TooManyHeaders);
+        this.fail(this.posOf(i), TooManyHeaders);
         return;
       }
-      this.lineStart = this.base + i;
+      this.lineStart = this.posOf(i);
       this.lineLen = 0;
       this.go(S_HDR_NAME);
       this.doName(xs, n);
@@ -2053,11 +2065,11 @@ class MessageParser {
       return;
     }
     if (c == C_LF) {
-      this.fail(this.base + i, BareLf);
+      this.fail(this.posOf(i), BareLf);
     } else if (c == C_SP || c == C_HTAB) {
-      this.fail(this.base + i, ObsFold);
+      this.fail(this.posOf(i), ObsFold);
     } else {
-      this.fail(this.base + i, BadHeaderName);
+      this.fail(this.posOf(i), BadHeaderName);
     }
   }
 
@@ -2093,12 +2105,13 @@ class MessageParser {
     }
     if (c == C_COLON) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, HeaderLineTooLong);
+        this.fail(this.posOf(j), HeaderLineTooLong);
         return;
       }
       this.lineLen += 1;
       if (this.acc.length > 0) {
-        tok = this.acc + tok;
+        this.acc += tok;
+        tok = this.acc;
         this.acc = "";
       }
       this.curName = tok;
@@ -2107,13 +2120,13 @@ class MessageParser {
       return;
     }
     if (c == C_SP || c == C_HTAB) {
-      this.fail(this.base + j, SpaceBeforeColon);
+      this.fail(this.posOf(j), SpaceBeforeColon);
     } else if (c == C_CR) {
-      this.fail(this.base + j, MissingColon);
+      this.fail(this.posOf(j), MissingColon);
     } else if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadHeaderName);
+      this.fail(this.posOf(j), BadHeaderName);
     }
   }
 
@@ -2179,7 +2192,8 @@ class MessageParser {
       if (this.acc.length == 0) {
         this.curValue = sliceString(xs, i, e);
       } else {
-        this.curValue = trimEndOws(this.acc + sliceString(xs, i, e));
+        this.acc += sliceString(xs, i, e);
+        this.curValue = trimEndOws(this.acc);
         this.acc = "";
       }
       this.go(S_HDR_LF);
@@ -2187,9 +2201,9 @@ class MessageParser {
       return;
     }
     if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadHeaderValue);
+      this.fail(this.posOf(j), BadHeaderValue);
     }
   }
 
@@ -2199,7 +2213,7 @@ class MessageParser {
   private doHeaderLf(xs: u8[]): void {
     const i = this.cur;
     if (xs[i].toInt() != 10) {
-      this.fail(this.base + i, BareCr);
+      this.fail(this.posOf(i), BareCr);
       return;
     }
     this.commitHeader();
@@ -2208,7 +2222,7 @@ class MessageParser {
     }
     this.go(S_HDR_LINE);
     this.lineLen = 0;
-    this.lineStart = this.base + i + 1;
+    this.lineStart = this.posOf(i) + 1;
     this.cur = i + 1;
   }
 
@@ -2271,7 +2285,7 @@ class MessageParser {
   private doHeadEnd(xs: u8[]): void {
     const i = this.cur;
     if (xs[i].toInt() != 10) {
-      this.fail(this.base + i, BareCr);
+      this.fail(this.posOf(i), BareCr);
       return;
     }
     this.cur = i + 1;
@@ -2279,7 +2293,7 @@ class MessageParser {
       this.go(S_DONE);
       return;
     }
-    this.decideFraming(this.base + i - 1);
+    this.decideFraming(this.posOf(i) - 1);
   }
 
   // End of the header section at `at` (the CR of the empty line): apply the rules that need all the fields and pick
@@ -2413,7 +2427,7 @@ class MessageParser {
       if (sz > allowed) {
         this.chunkSize = sz;
         this.cur = j;
-        this.fail(this.base + j, BodyTooLarge);
+        this.fail(this.posOf(j), BodyTooLarge);
         return;
       }
       j += 1;
@@ -2430,7 +2444,7 @@ class MessageParser {
     }
     const c = HTTP_CLASS.charCodeAt(xs[j].toUsize());
     if (this.chunkDigits == 0) {
-      this.fail(this.base + j, BadChunkSize);
+      this.fail(this.posOf(j), BadChunkSize);
       return;
     }
     if (c == C_CR) {
@@ -2440,7 +2454,7 @@ class MessageParser {
     }
     if (c == C_SEMI || c == C_SP || c == C_HTAB) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, ChunkLineTooLong);
+        this.fail(this.posOf(j), ChunkLineTooLong);
         return;
       }
       this.lineLen += 1;
@@ -2449,9 +2463,9 @@ class MessageParser {
       return;
     }
     if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadChunkSize);
+      this.fail(this.posOf(j), BadChunkSize);
     }
   }
 
@@ -2482,7 +2496,7 @@ class MessageParser {
     }
     if (c == C_SEMI) {
       if (this.lineLen >= this.lineMax) {
-        this.fail(this.base + j, ChunkLineTooLong);
+        this.fail(this.posOf(j), ChunkLineTooLong);
         return;
       }
       this.lineLen += 1;
@@ -2491,9 +2505,9 @@ class MessageParser {
       return;
     }
     if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadChunkSize);
+      this.fail(this.posOf(j), BadChunkSize);
     }
   }
 
@@ -2523,30 +2537,30 @@ class MessageParser {
       return;
     }
     if (c == C_LF) {
-      this.fail(this.base + j, BareLf);
+      this.fail(this.posOf(j), BareLf);
     } else {
-      this.fail(this.base + j, BadChunkExtension);
+      this.fail(this.posOf(j), BadChunkExtension);
     }
   }
 
   // CHUNK_SIZE_LF: the LF of the chunk-size line. Size 0: the trailer section follows; else the chunk data.
-  // (The cursor is relative to the window here; the chunk data state that follows uses an absolute cursor, which
-  // `feed` recomputes from the window start.)
+  // (The cursor is an index into the storage array here; the chunk data state that follows uses a cursor relative to
+  // the chunk, which `feed` recomputes from the chunk's start in the array.)
   @Requires(this.state == S_CHUNK_SIZE_LF && this.cur < xs.length)
   @Ensures(this.cur > old(this.cur) || this.state == S_ERROR)
   private doChunkSizeLf(xs: u8[]): void {
     const i = this.cur;
     if (xs[i].toInt() != 10) {
-      this.fail(this.base + i, BareCr);
+      this.fail(this.posOf(i), BareCr);
       return;
     }
     this.cur = i + 1;
     if (this.chunkSize == 0) {
       this.inTrailers = true;
-      this.sectionEnd = this.base + i + 1 + this.maxHead;
+      this.sectionEnd = this.posOf(i) + 1 + this.maxHead;
       this.lineLen = 0;
       this.lineMax = this.maxLine;
-      this.lineStart = this.base + i + 1;
+      this.lineStart = this.posOf(i) + 1;
       this.go(S_HDR_LINE);
       return;
     }
@@ -2566,9 +2580,9 @@ class MessageParser {
       return;
     }
     if (c == 10) {
-      this.fail(this.base + i, BareLf);
+      this.fail(this.posOf(i), BareLf);
     } else {
-      this.fail(this.base + i, BadChunkTerminator);
+      this.fail(this.posOf(i), BadChunkTerminator);
     }
   }
 
@@ -2578,7 +2592,7 @@ class MessageParser {
   private doChunkLf(xs: u8[]): void {
     const i = this.cur;
     if (xs[i].toInt() != 10) {
-      this.fail(this.base + i, BareCr);
+      this.fail(this.posOf(i), BareCr);
       return;
     }
     this.chunkSize = 0;
@@ -2591,28 +2605,25 @@ class MessageParser {
 
   // ---------------------------------------------------------------------------------- the finished message
 
-  // bodyBytes(): the collected body (all `parts` concatenated; one part is returned as it is, without a copy).
+  // bodyBytes(): the collected body (all `parts` concatenated; one part is returned as it is, without a copy, and no
+  // part as the parser's one empty `Bytes`).
   @Requires(this.state == S_DONE)
   @Ensures(result.length() == this.bodyLen)
   bodyBytes(): Bytes {
     if (this.parts.length == 0) {
-      return emptyBytes();
+      return this.noBody;
     }
     if (this.parts.length == 1) {
       return this.parts[0];
     }
-    let all: u8[] = [];
+    let all = new ByteBuilder();
+    all.reserve(this.bodyLen);
     let k: usize = 0;
     while (k < this.parts.length) {
-      const a = this.parts[k].toArray();
-      let q: usize = 0;
-      while (q < a.length) {
-        all.push(a[q]);
-        q += 1;
-      }
+      all.appendBytes(this.parts[k]);
       k += 1;
     }
-    return bytesFromArray(all);
+    return all.build();
   }
 
   // httpVersion(): the version of the start line.
@@ -2831,16 +2842,16 @@ export function hexString(n: usize): string {
 // can contain a CR or LF: a field can never end its line early or start another one (no header injection).
 @Ensures(result.length == headerBytes(h))
 function fieldsText(h: Headers): string {
-  let parts: string[] = [];
+  let out = "";
   let i: usize = 0;
   while (i < h.count()) {
-    parts.push(h.nameAt(i));
-    parts.push(": ");
-    parts.push(h.valueAt(i));
-    parts.push("\r\n");
+    out += h.nameAt(i);
+    out += ": ";
+    out += h.valueAt(i);
+    out += "\r\n";
     i += 1;
   }
-  return parts.join("");
+  return out;
 }
 
 // The serialized size of the fields of `h`.
