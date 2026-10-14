@@ -8,7 +8,7 @@ import { Host, useFs } from "std:host";
 import { FsGrant } from "std:fs";
 import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
 import { Span, SourceFile, span } from "../diag";
-import { BArrConcat, BStrLength } from "../hir";
+import { BArrConcat, BStrLength, UnNeg, OpAdd } from "../hir";
 import {
   MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, plainBlock,
 } from "../mir";
@@ -22,6 +22,7 @@ import {
   usedFlags, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices,
+  tablesAgree,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -336,6 +337,40 @@ function anOwnedParameterIsReleasedOnTheEdgeWhereItDies(): void {
   assert(onlyEdgeBlocksAdded(f, g, 0), "the new block releases p and continues");
   assertEqUsize(releaseCount(g), 2, "released after the use and on the edge");
   assert(verifies(prog([g])), "the result verifies");
+  // the same with the branch the other way round: the edge is the `then` edge now
+  let h = f;
+  h.blocks[0] = bk([], TBranch(OLocal(1), 2, 1));
+  const k = rewriteParam(prog([h]), h, 0);
+  assertEqUsize(k.blocks.length, 4, "one edge block (0 -> 2) on the then side");
+  assert(
+    match (k.blocks[0].term) {
+      TBranch(_, a, b) => a == 3 && b == 1,
+      _ => false,
+    },
+    "the branch goes through the edge block",
+  );
+  assert(verifies(prog([k])), "the result verifies");
+}
+
+// One instruction of every kind: the optimiser's use / definition tables must agree with the lowering's (an instruction
+// kind whose operand the optimiser misses is a release it may move over a use).
+@Test
+function analysisTablesAgreeOnEveryInstructionKind(): void {
+  const all: Instr[] = [
+    ICopy(0, OInt(1)), IMove(1, 2), IBorrow(1, 2), IDup(1, OLocal(2)), IRelease(1), IUnary(0, UnNeg, OLocal(3)),
+    IBinary(0, OpAdd, OLocal(3), OLocal(4)), ICall(Some(1), 0, [OLocal(2), OInt(1)]), IBuiltin(None, BStrLength, [OLocal(2)]),
+    IStrAppend(1, OLocal(2)), IArrayExtend(1, OLocal(2)), IStructNew(1, 0, [OLocal(2), OLocal(3)]), INullary(1, 0),
+    ITag(0, OLocal(2)), IGetField(1, OLocal(2), 0), ISetField(1, 0, OLocal(2)), ITakeField(1, 2, 0), IPutField(1, 0, 2),
+    IMakeUnique(1), IArrayNew(1, true, [OLocal(2)]), IArrayGet(1, OLocal(2), OLocal(3)), IArraySet(1, OLocal(3), OLocal(2)),
+    IArrayTake(1, 2, OLocal(3)), IArrayPut(1, OLocal(3), 2), IArrayPush(1, OLocal(2)), IArrayPop(1, 2),
+    IClosure(1, 0, [OLocal(2)]), ICallIndirect(Some(1), OLocal(2), [OLocal(3)]), IIface(1, 0, OLocal(2)),
+    ICallVirtual(Some(1), OLocal(2), 0, [OLocal(3)]),
+  ];
+  const locals = [li("i"), lr("a"), lr("b"), li("j"), li("k")];
+  for (const ins of all) {
+    assert(tablesAgree(fn("f", 0, locals, [bk([ins], TReturn(Some(OLocal(4))))])), "tables agree");
+  }
+  assert(tablesAgree(fn("f", 0, locals, [bk([], TBranch(OLocal(3), 0, 0))])), "a terminator use agrees");
 }
 
 // ---------------------------------------------------------------- what the contracts check

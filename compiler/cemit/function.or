@@ -242,6 +242,28 @@ function assignOpt(d: Option<usize>, code: string): string {
   };
 }
 
+// The receiver of a call of an in/out function is a local: its address is passed (docs/mir.md v1.10; the verifier's wf
+// rule). A constant there would be `&orin_s0` in C and `ptr null` in LLVM, which the callee writes through.
+export function inoutArgOk(prog: MProgram, g: usize, args: Operand[]): bool {
+  return !prog.functions[g].inout
+      || (args.length > 0
+          && match (args[0]) {
+            OLocal(_) => true,
+            _ => false,
+          });
+}
+
+// Every block a terminator continues in is one of the `n` blocks of the function (each is a label `B<i>`).
+export function targetsBelow(t: Terminator, n: usize): bool {
+  return match (t) {
+    TGoto(a) => a < n,
+    TBranch(_, a, b) => a < n && b < n,
+    TSwitch(_, cases, d) => d < n && cases.every(k => k.target < n),
+    TReturn(_) => true,
+    TTrap(_) => true,
+  };
+}
+
 // ---------------------------------------------------------------- the emitter
 
 // The function being emitted is one of the program and one of the symbol table; its parameters are declared locals.
@@ -358,7 +380,7 @@ export class CFunctionEmitter {
   }
 
   // A direct call; an in/out callee (docs/mir.md v1.10) stores its final receiver through the extra pointer argument.
-  @Requires(g < this.prog.functions.length)
+  @Requires(g < this.prog.functions.length && inoutArgOk(this.prog, g, args))
   private call(d: Option<usize>, g: usize, args: Operand[]): string {
     let cargs = args.map(opC);
     if (this.prog.functions[g].inout) {
@@ -443,6 +465,7 @@ export class CFunctionEmitter {
         + this.slotOf(v) + ");";
   }
 
+  @Requires(targetsBelow(t, this.f.blocks.length))
   private term(t: Terminator): string {
     return match (t) {
       TGoto(b) => "goto B" + u(b) + ";",
