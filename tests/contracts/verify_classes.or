@@ -1,0 +1,163 @@
+// Inputs for tools/test_verify_contracts.py: class invariants are proved per method (ADR-0031 B8), constructors
+// establish them, a method's frame comes from the mutation analysis (B9), and calls are modular (B7).
+// `// expect:` lines are `function kind status`; methods are `Class.method`.
+// expect: Counter.constructor invariant VERIFIED
+// expect: Counter.value ensures VERIFIED
+// expect: Counter.inc ensures VERIFIED
+// expect: Counter.inc invariant VERIFIED
+// expect: Counter.dec invariant REFUTED
+// expect: Counter.safeDec ensures VERIFIED
+// expect: Counter.safeDec invariant VERIFIED
+// expect: Counter.reset ensures VERIFIED
+// expect: Counter.reset invariant VERIFIED
+// expect: Account.constructor invariant VERIFIED
+// expect: Account.constructor invariant VERIFIED
+// expect: Account.deposit ensures VERIFIED
+// expect: Account.deposit ensures VERIFIED
+// expect: Account.deposit invariant VERIFIED
+// expect: Account.deposit invariant VERIFIED
+// expect: Account.withdraw ensures VERIFIED
+// expect: Account.withdraw invariant VERIFIED
+// expect: Account.withdraw invariant VERIFIED
+// expect: Account.withdrawBad ensures VERIFIED
+// expect: Account.withdrawBad invariant REFUTED
+// expect: Account.withdrawBad invariant REFUTED
+// expect: Account.bumpOnce ensures VERIFIED
+// expect: Account.bumpTwice ensures VERIFIED
+// expect: Account.bumpTwice ensures VERIFIED
+// expect: Account.bumpTwice invariant VERIFIED
+// expect: Account.bumpTwice invariant VERIFIED
+// expect: Account.depositOne call-precondition VERIFIED
+// expect: Account.depositOne ensures UNKNOWN
+// expect: Account.depositOne invariant VERIFIED
+// expect: Account.depositOne invariant VERIFIED
+// expect: Account.setLimit ensures REFUTED
+// expect: Account.setLimit invariant VERIFIED
+// expect: Account.setLimit invariant VERIFIED
+// expect: use_counter ensures VERIFIED
+// expect: count_two ensures VERIFIED
+// expect: use_counter_bad call-precondition REFUTED
+
+@Invariant(this.count >= 0)
+class Counter {
+  private count: int = 0;
+
+  constructor() {
+  }
+
+  @Ensures(result == this.count)
+  value(): int {
+    return this.count;
+  }
+
+  @Ensures(this.count == old(this.count) + 1)
+  inc(): void {
+    this.count += 1;
+  }
+
+  // Wrong: nothing stops the count going below zero.
+  dec(): void {
+    this.count -= 1;
+  }
+
+  @Requires(this.count > 0)
+  @Ensures(this.count == old(this.count) - 1)
+  safeDec(): void {
+    this.count -= 1;
+  }
+
+  @Ensures(this.count == 0)
+  reset(): void {
+    this.count = 0;
+  }
+}
+
+// Two fields with a relation between them: the balance never exceeds the limit, and is never negative.
+@Invariant(this.balance >= 0)
+@Invariant(this.balance <= this.limit)
+class Account {
+  private balance: int;
+  private limit: int;
+  private ops: int = 0;
+
+  @Requires(limit >= 0)
+  constructor(limit: int) {
+    this.balance = 0;
+    this.limit = limit;
+  }
+
+  @Requires(amount >= 0 && this.balance + amount <= this.limit)
+  @Ensures(this.balance == old(this.balance) + amount)
+  @Ensures(this.limit == old(this.limit))
+  deposit(amount: int): void {
+    this.balance += amount;
+  }
+
+  @Requires(amount >= 0 && amount <= this.balance)
+  @Ensures(this.balance == old(this.balance) - amount)
+  withdraw(amount: int): void {
+    this.balance -= amount;
+    this.ops += 1;
+  }
+
+  // Wrong: no precondition, so the balance can go negative.
+  @Ensures(this.balance == old(this.balance) - amount)
+  withdrawBad(amount: int): void {
+    this.balance -= amount;
+  }
+
+  // The frame: bumpOnce writes only `ops`, so the balance and the limit keep their values across the call.
+  @Ensures(this.ops == old(this.ops) + 1)
+  private bumpOnce(): void {
+    this.ops += 1;
+  }
+
+  @Ensures(this.ops == old(this.ops) + 2)
+  @Ensures(this.balance == old(this.balance))
+  bumpTwice(): void {
+    this.bumpOnce();
+    this.bumpOnce();
+  }
+
+  // Wrong frame claim: deposit writes the balance, so the balance does not keep its value across the call. The receiver
+  // after the call is only known through deposit's contract, so the counterexample is not trusted: UNKNOWN, not REFUTED.
+  @Requires(this.balance + 1 <= this.limit)
+  @Ensures(this.balance == old(this.balance))
+  depositOne(): void {
+    this.deposit(1);
+  }
+
+  // Wrong: the method writes the limit itself, so the claim that it keeps its value is REFUTED (no call involved).
+  @Requires(v >= this.balance)
+  @Ensures(this.limit == old(this.limit))
+  setLimit(v: int): void {
+    this.limit = v;
+  }
+}
+
+@Ensures(result >= 0)
+function use_counter(): int {
+  let c = new Counter();
+  c.inc();
+  c.inc();
+  return c.value();
+}
+
+@Ensures(result == 2)
+function count_two(): int {
+  let c = new Counter();
+  c.inc();
+  c.inc();
+  return c.value();
+}
+
+// Wrong: a new counter holds 0, so safeDec's precondition `count > 0` does not hold.
+function use_counter_bad(): int {
+  let c = new Counter();
+  c.safeDec();
+  return c.value();
+}
+
+function main(): void {
+  console.log(use_counter().toString());
+}

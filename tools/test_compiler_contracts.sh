@@ -26,3 +26,9 @@ else
 fi
 echo "[contracts] suite '$SUITE' with the contract-checked compiler"
 python3 tools/run_tests.py --orinc $B/orin_cc --suite $SUITE
+# The verifier (compiler/vc) is part of the compiler: run its own tests with the contract-checked build, so that its
+# contracts (and its class invariants) are checked on every verification condition it generates (ADR-0036).
+if command -v z3 >/dev/null 2>&1; then
+  echo "[contracts] contract-checked verifier: tools/test_verify_contracts.py"
+  python3 tools/test_verify_contracts.py --require-z3 --orinc $B/orin_cc
+fi
