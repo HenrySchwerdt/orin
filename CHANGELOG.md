@@ -19,6 +19,18 @@
   `tools/test_parallel.sh` (threads 1..8, fused / unfused, ThreadSanitizer, ASan), now part of `tools/test_concurrency.sh`. No
   speedup could be measured on the loaded shared machine (CPU time unchanged); see docs/benchmarks.md.
 - **Fix:** `ORIN_STATS` peak live objects / bytes wrapped to 2^64 - 1 in programs whose tasks free objects other tasks allocated.
+- **Compiler rewrite step 3d: `opt/`, `cemit/`, `llvm/` under the contract and class standard** (docs/rewrite.md "Step 3d"). No
+  change to the generated C, C with `--check-contracts` or LLVM IR (byte-identical on the corpus and on `compiler/main.or`).
+  The code generators now emit every function from a read-only, program-wide symbol table built first in a fixed order
+  (`CSymbols`, `LlvmSymbols`) and join the texts in index order (rule 8, new in docs/rewrite.md: ready for ADR-0039
+  `.parallel()`); the optimiser's per-function stage is a `map` over the functions after the program-wide parameter-mode
+  inference (`ParamInference`). New classes `BlockSink`, `RewritePlan`, `EdgeBlocks`, `RecordAliases`, `ParamInference`,
+  `CSymbols`, `CFunctionEmitter`, `LlvmSymbols`, `LlvmFunctionEmitter`; contracts for every pass (well-formedness, signature,
+  same calls in the same order, instruction-count claims) and for the emitters (only declared symbols referenced, literals
+  round-trip, unique function symbols). **Fixed**: a record or closure with more than 64 slots of which two or more past
+  slot 63 hold references crashed the compiler (`trap: usize overflow` in the reference-mask computation of both backends);
+  it now compiles and the program traps at run time with the runtime's defined "struct has more than 64 slots".
+  Unit tests `compiler/tests/opt_test.or`, `compiler/tests/emit_test.or` (run by `tools/test_tooling.sh`).
 - **Benchmark workflow** (`.github/workflows/bench.yml`, docs/benchmarks.md "Benchmark workflow"): nightly, manual, or on a PR
   labelled `bench`. `tools/bench.py` gains `--json` (machine, tool versions, commit; per benchmark and language wall median / min,
   user / sys CPU, peak RSS, output check), `--instructions` (executed instructions under valgrind cachegrind for the Orin

@@ -1,0 +1,258 @@
+// The fixed part of every LLVM module: the trap messages the prelude helpers use, the prelude itself (small internal
+// `alwaysinline` IR functions for the hot runtime operations, written against the object layout asserted in
+// runtime/orin_runtime_llvm.c) and the declarations of the C runtime functions the IR calls by symbol.
+
+import { u } from "./text";
+
+// ---------------------------------------------------------------- trap messages
+
+// Messages used by the prelude helpers: indices are referenced as @.m<i> in the prelude.
+export function fixedMsgs(): string[] {
+  return [
+    "integer overflow", // 0
+    "division by zero", // 1
+    "modulo by zero", // 2
+    "usize overflow", // 3
+    "usize underflow", // 4
+    "negative int to usize", // 5
+    "usize too large for int", // 6
+    "index out of bounds", // 7
+    "integer conversion out of range", // 8
+  ];
+}
+
+// ---------------------------------------------------------------- prelude
+
+function checkedHelper(name: string, intr: string, msg: usize): string {
+  return "define internal i64 @orinl_" + name + "(i64 %a, i64 %b) alwaysinline nounwind {\n"
+      + "  %r = call { i64, i1 } @llvm." + intr + ".with.overflow.i64(i64 %a, i64 %b)\n"
+      + "  %o = extractvalue { i64, i1 } %r, 1\n" + "  br i1 %o, label %t, label %k\n"
+      + "t:\n  call void @orin_trap(ptr @.m" + u(msg) + ")\n  unreachable\n"
+      + "k:\n  %v = extractvalue { i64, i1 } %r, 0\n  ret i64 %v\n}\n";
+}
+
+function divHelper(name: string, op: string, signed: bool, zeroMsg: usize): string {
+  let s = "define internal i64 @orinl_" + name + "(i64 %a, i64 %b) alwaysinline nounwind {\n"
+      + "  %z = icmp eq i64 %b, 0\n  br i1 %z, label %t0, label %c1\n"
+      + "t0:\n  call void @orin_trap(ptr @.m" + u(zeroMsg) + ")\n  unreachable\n";
+  if (signed) {
+    s += "c1:\n  %m = icmp eq i64 %a, -9223372036854775808\n  %n = icmp eq i64 %b, -1\n"
+        + "  %x = and i1 %m, %n\n  br i1 %x, label %t1, label %k\n"
+        + "t1:\n  call void @orin_trap(ptr @.m0)\n  unreachable\n" + "k:\n";
+  } else {
+    s += "c1:\n  br label %k\nk:\n";
+  }
+  s += "  %v = " + op + " i64 %a, %b\n  ret i64 %v\n}\n";
+  return s;
+}
+
+function guardHelper(name: string, cond: string, msg: usize, result: string): string {
+  return "define internal i64 @orinl_" + name + "(i64 %a) alwaysinline nounwind {\n" + "  %c = "
+      + cond + "\n  br i1 %c, label %t, label %k\n" + "t:\n  call void @orin_trap(ptr @.m" + u(msg)
+      + ")\n  unreachable\n" + "k:\n  " + result + "\n}\n";
+}
+
+export function prelude(): string {
+  let p = "";
+  p += checkedHelper("add_i", "sadd", 0);
+  p += checkedHelper("sub_i", "ssub", 0);
+  p += checkedHelper("mul_i", "smul", 0);
+  p += checkedHelper("add_u", "uadd", 3);
+  p += checkedHelper("sub_u", "usub", 4);
+  p += checkedHelper("mul_u", "umul", 3);
+  p += divHelper("div_i", "sdiv", true, 1);
+  p += divHelper("rem_i", "srem", true, 2);
+  p += divHelper("div_u", "udiv", false, 1);
+  p += divHelper("rem_u", "urem", false, 2);
+  p += "define internal i64 @orinl_range(i64 %a, i64 %lo, i64 %hi) alwaysinline nounwind {\n"
+      + "  %l = icmp slt i64 %a, %lo\n  %h = icmp sgt i64 %a, %hi\n  %o = or i1 %l, %h\n  br i1 %o, label %t, label %k\n"
+      + "t:\n  call void @orin_trap(ptr @.m0)\n  unreachable\nk:\n  ret i64 %a\n}\n";
+  p += "define internal i64 @orinl_conv_i(i64 %a, i64 %lo, i64 %hi) alwaysinline nounwind {\n"
+      + "  %l = icmp slt i64 %a, %lo\n  %h = icmp sgt i64 %a, %hi\n  %o = or i1 %l, %h\n  br i1 %o, label %t, label %k\n"
+      + "t:\n  call void @orin_trap(ptr @.m8)\n  unreachable\nk:\n  ret i64 %a\n}\n";
+  p += "define internal i64 @orinl_conv_u(i64 %a, i64 %hi) alwaysinline nounwind {\n"
+      + "  %o = icmp ugt i64 %a, %hi\n  br i1 %o, label %t, label %k\n"
+      + "t:\n  call void @orin_trap(ptr @.m8)\n  unreachable\nk:\n  ret i64 %a\n}\n";
+  p += guardHelper(
+    "neg_i",
+    "icmp eq i64 %a, -9223372036854775808",
+    0,
+    "%v = sub i64 0, %a\n  ret i64 %v",
+  );
+  p += guardHelper("neg_u", "icmp ne i64 %a, 0", 4, "ret i64 0");
+  p += guardHelper("int_to_usize", "icmp slt i64 %a, 0", 5, "ret i64 %a");
+  p += guardHelper("usize_to_int", "icmp slt i64 %a, 0", 6, "ret i64 %a");
+  p += "define internal ptr @orinl_dup(ptr %o) alwaysinline nounwind {\n"
+      + "  %rc = load i64, ptr %o\n  %pos = icmp sgt i64 %rc, 0\n  br i1 %pos, label %inc, label %done\n"
+      + "inc:\n  %n = add i64 %rc, 1\n  store i64 %n, ptr %o\n  br label %done\n"
+      + "done:\n  ret ptr %o\n}\n";
+  p += "define internal void @orinl_release(ptr %o) alwaysinline nounwind {\n"
+      + "  %isnull = icmp eq ptr %o, null\n  br i1 %isnull, label %done, label %chk\n"
+      + "chk:\n  %rc = load i64, ptr %o\n  %pos = icmp sgt i64 %rc, 0\n  br i1 %pos, label %dec, label %done\n"
+      + "dec:\n  %n = add i64 %rc, -1\n  store i64 %n, ptr %o\n  %z = icmp eq i64 %n, 0\n  br i1 %z, label %free, label %done\n"
+      + "free:\n  call void @orin_destroy(ptr %o)\n  br label %done\n" + "done:\n  ret void\n}\n";
+  p += "define internal ptr @orinl_make_unique(ptr %o) alwaysinline nounwind {\n"
+      + "  %rc = load i64, ptr %o\n  %u = icmp eq i64 %rc, 1\n  br i1 %u, label %fast, label %slow\n"
+      + "slow:\n  %r = call ptr @orin_make_unique_slow(ptr %o)\n  ret ptr %r\n"
+      + "fast:\n  ret ptr %o\n}\n";
+  p += "define internal ptr @orinl_slot(ptr %o, i64 %ix) alwaysinline nounwind {\n"
+      + "  %kp = getelementptr inbounds i8, ptr %o, i64 8\n  %kind = load i32, ptr %kp\n"
+      + "  %np = getelementptr inbounds i8, ptr %o, i64 16\n  %n = load i32, ptr %np\n  %n64 = zext i32 %n to i64\n"
+      + "  %sk = icmp ne i32 %kind, 3\n  %oob = icmp uge i64 %ix, %n64\n  %bad = or i1 %sk, %oob\n"
+      + "  br i1 %bad, label %t, label %k\n" + "t:\n  call void @orin_trap_shape()\n  unreachable\n"
+      + "k:\n  %off = mul i64 %ix, 8\n  %o2 = add i64 %off, 32\n  %p = getelementptr inbounds i8, ptr %o, i64 %o2\n  ret ptr %p\n}\n";
+  p += "define internal ptr @orinl_array_slot(ptr %a, i64 %i) alwaysinline nounwind {\n"
+      + "  %kp = getelementptr inbounds i8, ptr %a, i64 8\n  %kind = load i32, ptr %kp\n  %nk = icmp ne i32 %kind, 2\n"
+      + "  br i1 %nk, label %ts, label %kk\n"
+      + "ts:\n  call void @orin_trap_shape()\n  unreachable\n"
+      + "kk:\n  %lp = getelementptr inbounds i8, ptr %a, i64 16\n  %len = load i64, ptr %lp\n"
+      + "  %oob = icmp uge i64 %i, %len\n  br i1 %oob, label %t, label %k\n"
+      + "t:\n  call void @orin_trap(ptr @.m7)\n  unreachable\n"
+      + "k:\n  %ip = getelementptr inbounds i8, ptr %a, i64 40\n  %items = load ptr, ptr %ip\n"
+      + "  %p = getelementptr inbounds i64, ptr %items, i64 %i\n  ret ptr %p\n}\n";
+  p += "define internal void @orinl_array_push(ptr %a, i64 %slot) alwaysinline nounwind {\n"
+      + "  %kp = getelementptr inbounds i8, ptr %a, i64 8\n  %kind = load i32, ptr %kp\n  %nk = icmp ne i32 %kind, 2\n"
+      + "  br i1 %nk, label %ts, label %kk\n"
+      + "ts:\n  call void @orin_trap_shape()\n  unreachable\n"
+      + "kk:\n  %lp = getelementptr inbounds i8, ptr %a, i64 16\n  %cp = getelementptr inbounds i8, ptr %a, i64 24\n"
+      + "  %len = load i64, ptr %lp\n  %cap = load i64, ptr %cp\n  %full = icmp eq i64 %len, %cap\n"
+      + "  br i1 %full, label %grow, label %ok\n"
+      + "grow:\n  call void @orin_array_push_grow(ptr %a, i64 %slot)\n  ret void\n"
+      + "ok:\n  %ip = getelementptr inbounds i8, ptr %a, i64 40\n  %items = load ptr, ptr %ip\n"
+      + "  %p = getelementptr inbounds i64, ptr %items, i64 %len\n  store i64 %slot, ptr %p\n"
+      + "  %nl = add i64 %len, 1\n  store i64 %nl, ptr %lp\n  ret void\n}\n";
+  return p;
+}
+
+export function declares(): string {
+  const d = [
+    "declare void @orin_init(i32, ptr)",
+    "declare void @orin_flush()",
+    "declare void @orin_trap(ptr) noreturn cold nounwind",
+    "declare void @orin_destroy(ptr)",
+    "declare ptr @orin_make_unique_slow(ptr)",
+    "declare ptr @orin_struct_new(i32, i32, i64)",
+    "declare ptr @orin_nullary(i32)",
+    "declare void @orin_trap_shape()",
+    "declare i64 @orin_opt_unwrap(ptr)",
+    "declare i64 @orin_res_unwrap(ptr)",
+    "declare i64 @orin_res_unwrap_err(ptr)",
+    "declare ptr @orin_str_append(ptr, ptr)",
+    "declare i64 @orin_str_eq(ptr, ptr)",
+    "declare ptr @orin_array_new(i64, i64)",
+    "declare void @orin_array_push_grow(ptr, i64)",
+    "declare ptr @orin_array_pop(ptr)",
+    "declare void @orin_console_log(ptr)",
+    "declare void @orin_console_error(ptr)",
+    "declare ptr @orin_string_from_char_code(i64)",
+    "declare ptr @orin_parse_int(ptr)",
+    "declare ptr @orin_fs_read_file(i64, ptr)",
+    "declare ptr @orin_fs_write_file(i64, ptr, ptr)",
+    "declare i64 @orin_fs_exists(i64, ptr)",
+    "declare i64 @orin_file_open(i64, ptr, i64)",
+    "declare i64 @orin_cap_host_root()",
+    "declare i64 @orin_cap_fs(i64)",
+    "declare i64 @orin_cap_process(i64)",
+    "declare i64 @orin_cap_stdio(i64)",
+    "declare i64 @orin_cap_clock(i64)",
+    "declare i64 @orin_cap_under(i64, ptr)",
+    "declare i64 @orin_cap_read_only(i64)",
+    "declare i64 @orin_cap_args_only(i64)",
+    "declare void @orin_cap_revoke(i64)",
+    "declare i64 @orin_cap_clone(i64)",
+    "declare i64 @orin_cap_move(i64)",
+    "declare i64 @orin_cap_adopt_fs(i64)",
+    "declare i64 @orin_cap_adopt_process(i64)",
+    "declare i64 @orin_cap_adopt_stdio(i64)",
+    "declare i64 @orin_cap_adopt_clock(i64)",
+    "declare i64 @orin_mon_new(i64)",
+    "declare void @orin_mon_free(i64)",
+    "declare void @orin_mon_lock(i64)",
+    "declare void @orin_mon_unlock(i64)",
+    "declare void @orin_mon_wait(i64, i64)",
+    "declare void @orin_mon_notify_all(i64, i64)",
+    "declare void @orin_mon_notify_one(i64, i64)",
+    "declare i64 @orin_mon_get(i64, i64)",
+    "declare void @orin_mon_set(i64, i64, i64)",
+    "declare void @orin_mon_grow(i64, i64)",
+    "declare i64 @orin_rt_transfer_put(ptr)",
+    "declare ptr @orin_rt_transfer_take(i64)",
+    "declare void @orin_rt_transfer_drop(i64)",
+    "declare i64 @orin_rt_transfer_count(i64)",
+    "declare i64 @orin_rt_task_spawn(i64)",
+    "declare i64 @orin_rt_task_join(i64)",
+    "declare ptr @orin_rt_task_message()",
+    "declare void @orin_rt_trap_str(ptr)",
+    "declare i64 @orin_cap_net(i64)",
+    "declare i64 @orin_cap_listen(i64, ptr, i64)",
+    "declare i64 @orin_cap_connect(i64, ptr, i64, i64)",
+    "declare i64 @orin_net_listen(i64, ptr, i64, i64, i64)",
+    "declare i64 @orin_net_accept(i64, i64, i64)",
+    "declare i64 @orin_net_connect(i64, ptr, i64, i64, i64)",
+    "declare i64 @orin_net_status(i64)",
+    "declare void @orin_net_close(i64)",
+    "declare i64 @orin_net_port(i64)",
+    "declare i64 @orin_net_now(i64)",
+    "declare ptr @orin_net_recv(i64, i64, i64)",
+    "declare ptr @orin_net_send(i64, ptr, i64, i64, i64)",
+    "declare i64 @orin_net_shutdown(i64, i64)",
+    "declare ptr @orin_net_peer(i64)",
+    "declare ptr @orin_net_resolve(i64, ptr)",
+    "declare ptr @orin_net_error_text(i64)",
+    "declare i64 @orin_file_is_open(i64)",
+    "declare ptr @orin_file_open_error(i64)",
+    "declare ptr @orin_file_close(i64)",
+    "declare ptr @orin_file_read_line(i64)",
+    "declare ptr @orin_file_read(i64, i64)",
+    "declare ptr @orin_file_read_all(i64)",
+    "declare void @orin_file_write(i64, ptr)",
+    "declare void @orin_file_write_line(i64, ptr)",
+    "declare void @orin_file_flush(i64)",
+    "declare ptr @orin_process_args(i64)",
+    "declare void @orin_process_exit(i64)",
+    "declare ptr @orinl_io_read_bytes(i64, i64)",
+    "declare ptr @orinl_io_read_line(i64)",
+    "declare void @orinl_io_write_stdout(i64, ptr)",
+    "declare i64 @orinl_str_char_code_at(ptr, i64)",
+    "declare i64 @orinl_io_shell(i64, ptr)",
+    "declare i64 @orinl_time_now_millis(i64)",
+    "declare ptr @orin_str_char_at(ptr, i64)",
+    "declare ptr @orin_str_substring(ptr, i64, i64)",
+    "declare ptr @orin_str_index_of(ptr, ptr)",
+    "declare i64 @orin_str_includes(ptr, ptr)",
+    "declare i64 @orin_str_starts_with(ptr, ptr)",
+    "declare i64 @orin_str_ends_with(ptr, ptr)",
+    "declare ptr @orin_str_split(ptr, ptr)",
+    "declare ptr @orin_str_trim(ptr)",
+    "declare ptr @orin_array_get(ptr, i64)",
+    "declare ptr @orin_array_slice(ptr, i64, i64)",
+    "declare ptr @orin_array_concat(ptr, ptr)",
+    "declare ptr @orin_array_join(ptr, ptr)",
+    "declare ptr @orin_bytes_to_string(ptr, i64, i64)",
+    "declare ptr @orin_string_to_bytes(ptr)",
+    "declare ptr @orin_array_extend(ptr, ptr)",
+    "declare ptr @orin_int_to_string(i64)",
+    "declare ptr @orin_usize_to_string(i64)",
+    "declare ptr @orin_bool_to_string(i64)",
+    "declare ptr @orin_parse_float(ptr)",
+    "declare i64 @orin_int_op(i64, i64, i64, i64)",
+    "declare ptr @orin_int_chk(i64, i64, i64, i64)",
+    "declare ptr @orin_parse_int_k(ptr, i64)",
+    "declare ptr @orin_float_to_string(double)",
+    "declare ptr @orin_f32_to_string(double)",
+    "declare i64 @orin_float_to_int(double)",
+    "declare double @llvm.floor.f64(double)",
+    "declare double @llvm.ceil.f64(double)",
+    "declare double @llvm.round.f64(double)",
+    "declare double @llvm.sqrt.f64(double)",
+    "declare double @llvm.fabs.f64(double)",
+    "declare double @llvm.pow.f64(double, double)",
+    "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)",
+    "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)",
+    "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)",
+    "declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64)",
+    "declare { i64, i1 } @llvm.usub.with.overflow.i64(i64, i64)",
+    "declare { i64, i1 } @llvm.umul.with.overflow.i64(i64, i64)",
+  ];
+  return d.join("\n") + "\n";
+}

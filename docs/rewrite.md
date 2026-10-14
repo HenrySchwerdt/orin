@@ -200,6 +200,8 @@ rewritten module follows these rules (the contracts are checked by the `contract
    function, such as checking a body, lowering, verifying or emitting code, numbers what it creates (temporaries,
    string literals, fresh names) locally. A program-wide numbering is assigned afterwards, in a fixed order. Then a
    phase can switch to `.parallel()` without changing its output, so the bootstrap fixed point keeps holding.
+   Step 3d (below) applies it to the optimiser and both code generators.
+
 ## Step 2a: `check/{env,fnctx,types}.or` (the checker's foundation)
 
 Rewritten: symbol tables, scope stack, type-instance caches. `body.or`, `decls.or`, `collect.or` only got the
@@ -1166,6 +1168,259 @@ Gates on the doubly merged tree, against a baseline built from `origin/main` + t
   place, the record version copied), the joins unchanged (`joinLs` 4.38 G in both, `join` 4.22 G, `joinIfChanged` 3.66 G).
   The verifier is still about 60 % of the self-compile: `killBorrows` with an index from a root to its aliases, and a join that
   stops at the first poisoned local, are the next algorithmic steps.
+
+## Step 3d: `opt/` (the MIR optimiser), `cemit/` and `llvm/` (the code generators)
+
+Rewritten: the optimiser `compiler/opt/` (nine files; every pass threaded parallel arrays through its block loop:
+`out` / `sps`, `touched` / `rep`, `gone`, `hit`, the growing `locals`, and the inference kept its modes in the program it
+was rewriting) and both code generators, `compiler/cemit/cemit.or` (676 lines) and `compiler/llvm/llvm.or` (1,163 lines),
+which were one file each with a `Fx { prog, f, names }` record passed to every function. The exported surface is unchanged
+(`optimize`, `pruneProgram`, `emitC`, `emitCSites`, `emitLlvm`; additions only). `compiler/mir/` was not touched; the
+contracts use the shared structural predicates of step 3b in `mir/wellformed.or` (`isWellFormedFunction`,
+`isWellFormedProgram`, `paramsWellFormed`, `spansAligned`, `blocksLocalsBelow`, `blockTargetsInRange`, `allReachable`,
+`spansComplete`, `instrLocals`, `termLocals`): `fnWellFormed` / `progWellFormed` of the optimiser and `emittable` of the
+emitters are those predicates. (The step was written on a base without 3b, against the same predicates in
+`lower/wellformed.or`, and switched when origin/main was merged.)
+
+The allocation-site census (`--stats-sites`, `cemit/sites.or`, merged from origin/main during the step) numbers the
+`ORIN_SITE(n, ..)` marks across the whole program, the one program-wide counter of the C backend. Under rule 8 it moved
+into the symbol step: `cSymbolsWith(prog, true)` fixes the first site id of every function (`CSymbols.firstSite`,
+ensured by `sitesNumbered`: function i starts after all sites of functions 0 .. i-1, the numbering `siteTable` uses),
+and `CFunctionEmitter.run` only reads it. The census output and the normal output are byte-identical to origin/main's
+compiler (spot check below).
+
+| Old | New |
+|---|---|
+| every block rewrite: `let out: Instr[] = []; let sps: Span[] = [];` pushed in step, `while (sps.length < out.length) sps.push(cs)` | class `BlockSink` (rewrite.or): `emit`, `emitAll`, `drop(n)`, `finish(term, span)`; spans in step by invariant |
+| replacement plans as `touched: bool[]` + `rep: Instr[][]` (inplace.or, pairs.or) or `gone: bool[]` (calls.or), applied by a copy loop in each pass | class `RewritePlan`: `replace` / `remove` at most once per instruction, `apply(blk)`, `outLength()` |
+| `locals.push(MLocal { name: "_", ty: MRef })` with the id taken from the length first | `Locals.fresh(ty)` of step 3a (lower/state.or), reused |
+| parameter-mode fixpoint: three nested loops mutating `q.functions[fi].paramOwned[k]` of the program being built | class `ParamInference` (opt.or): sites, modes, pinned functions; `wants`, `run`, `stable`; the program is rebuilt once with the result |
+| the edge blocks of the owned-parameter rewrite as `extra.push(..); nx = nb + extra.length - 1` (four copies) | class `EdgeBlocks` (params.or): `target(src, p, t, live)` |
+| scalar replacement: `alias` / `counted` parallel arrays and the `while (alias[ai] != a) ai += 1; counted[ai] += 1` loop three times | class `RecordAliases` (pairs.or): `has`, `use`, `add`, `complete(cnt)` |
+| `MFunction { name: f.name, paramCount: .., .. }` rebuilt at the end of every pass | `withBody(f, locals, blocks)` |
+| C: `Fx { prog, f, names }` passed to 25 functions; `emitC` computed names and signatures inline | `CSymbols` (symbols.or, the program-wide table), `CFunctionEmitter` (function.or, one function); text.or (pure literal and name helpers); cemit.or (join) |
+| LLVM: `Fx { prog, f, names, msgs }` passed to 29 functions; trap messages found with a linear `msgIndex` per trap | `LlvmSymbols` (symbols.or: function symbols, trap messages with a `Map` index, the runtime symbols the module declares), `LlvmFunctionEmitter` (function.or); runtime.or (prelude, declarations), text.or, llvm.or (join) |
+| `c1` .. `c5` plus a 90-arm `match` that repeats the arity in the helper name | `runtimeCall(op)` (name and arity) and `callN` |
+| index loops that answer a question about an array (`hasDup`, `hasConcat`, `usesFloat`, `entryHasPredecessor`, `termUsesAffecting`, `contains`, vtable lists, `successors`) | `some` / `every` / `includes` / `map` (rule 7); the per-instruction loops of the passes (`findRelease`, `findStore`, `readPath`, `usesAffecting`, the liveness fixpoint) stay loops: they are hot, exit early or index |
+
+Files (`orin fmt` layout; the old files in the same layout for comparison: opt 2,710, cemit 717, llvm 1,264 lines; clauses
+counted with `grep -c '^ *@Requires('` etc.):
+
+| file | role | lines | requires | ensures | invariant |
+|---|---|---|---|---|---|
+| `opt/opt.or` (was 122) | driver, `ParamInference`, `inferModes`, `optimizeFunction` | 251 | 6 | 6 | 2 |
+| `opt/rewrite.or` (new) | `BlockSink`, `RewritePlan`, `withBody`, `indices` | 181 | 6 | 10 | 3 |
+| `opt/wellformed.or` (new) | pass predicates (`fnWellFormed`, `passKept`, `effects`, counts) | 267 | 0 | 0 | 0 |
+| `opt/analysis.or` (was 274) | uses, defs, ancestors, counts, `tablesAgree` | 351 | 1 | 2 | 1 |
+| `opt/calls.or` (was 294) | stage 2 (call-site dups), stage 3 (peephole) | 285 | 3 | 8 | 0 |
+| `opt/params.or` (was 304) | owned-parameter sites, liveness, rewrite, `EdgeBlocks` | 395 | 4 | 11 | 3 |
+| `opt/inplace.or` (was 504) | take/put of slots, `arrayextend` | 488 | 3 | 10 | 0 |
+| `opt/chains.or` (was 336) | nested take/put chains | 327 | 2 | 4 | 0 |
+| `opt/pairs.or` (was 627) | pair-return elimination, `RecordAliases` | 714 | 7 | 7 | 2 |
+| `opt/prune.or` (was 122) | dead prelude functions | 149 | 1 | 2 | 0 |
+| `cemit/cemit.or` (was 676) | `emitC`, `joinC`, `emittable` | 140 | 2 | 2 | 0 |
+| `cemit/symbols.or` (new) | `CSymbols`, `signature`, `refsDeclared`, `namesDefined` | 262 | 3 | 4 | 2 |
+| `cemit/function.or` (new) | `CFunctionEmitter`, operators, builtins | 535 | 7 | 3 | 2 |
+| `cemit/text.or` (new) | types, literals, names, `refMask` | 244 | 1 | 6 | 0 |
+| `llvm/llvm.or` (was 1,163) | `emitLlvm`, `joinLlvm` | 79 | 2 | 1 | 0 |
+| `llvm/symbols.or` (new) | `LlvmSymbols`, `llvmRefsDeclared`, `globalsDefined` | 288 | 2 | 5 | 3 |
+| `llvm/function.or` (new) | `LlvmFunctionEmitter` | 884 | 7 | 3 | 2 |
+| `llvm/runtime.or` (new) | prelude, declarations, fixed messages | 234 | 0 | 0 | 0 |
+| `llvm/text.or` (new) | types, attributes, globals | 134 | 0 | 1 | 0 |
+| total, before -> after (with the three `module.or`) | | 4,431 (4,691 formatted) -> 6,248 | 0 -> 162 clauses (57 requires, 85 ensures, 20 invariants) | | |
+
+Unit tests: `compiler/tests/opt_test.or` (17 `@Test`, 518 lines) and `compiler/tests/emit_test.or` (10 `@Test`, 333 lines),
+run by `tools/test_tooling.sh`.
+
+Classes (9 new): `BlockSink` (instructions and spans in step), `RewritePlan` (one replacement slot per instruction, the
+change count never exceeds the block), `ParamInference` (one site row and one mode row per function; **no pinned function
+has an owned parameter**), `EdgeBlocks` (every added block is `release p; goto t` with t an old block), `RecordAliases` (the
+use counts are as many as the aliases, the record's own local first), `CSymbols` and `LlvmSymbols` (one symbol per
+function, **the symbol index is as large as the symbol list, so no two functions share a symbol**; the trap-message index is
+as large as the message list, the prelude's nine messages first), `CFunctionEmitter` and `LlvmFunctionEmitter` (the
+function is one of the program and of the symbol table; its parameters are declared locals). The records `PLive`,
+`PSites`, `Counts`, `Sra` got invariants (equal lengths; no sites collected for a parameter that cannot be owned; a plan
+for every instruction).
+
+### Contracts, and the bug each would catch
+
+* **A pass keeps the program's behaviour visible in its shape** (`passKept`, on every pass): the result is well formed
+  (locals declared, branch targets in range, spans in step), has the same name, parameters, parameter modes, in/out flag and
+  result type, only appends locals, keeps every span and every block reachable when the input had them, and **makes the same
+  calls and builtin calls in the same order** (`effects`, one key per `ICall` / `ICallIndirect` / `ICallVirtual` /
+  `IBuiltin`; array concatenation excluded because `extendArrays` turns it into `arrayextend`). Catches a rewrite that drops,
+  duplicates or reorders a call (mutant 2 below), a temporary that reuses an existing local id, a span lost on an inserted
+  instruction. `fnWellFormed(p, f)` adds string, function and vtable indices; `optimize` requires and ensures
+  `progWellFormed` and `sameFunctions` (same functions, names, parameter counts, `main`), and requires `allBorrowed` (what the
+  lowering produces).
+* **Instruction counts move only the way a pass claims**: `peephole` never increases the count and removes `dup`s and
+  `release`s **in pairs** (`dup(f) + release(r) == dup(r) + release(f)`: a rewrite that drops a release and keeps its dup is
+  a leak, the other way round a double free); `takePutChains` removes at least one instruction per rewrite
+  (`instr(r) + (dup(f) - dup(r)) <= instr(f)`) and at least two getters; `takePutSlots` turns exactly one getter and one dup
+  into make-unique and take per rewrite (`getter(r) + dup(f) == getter(f) + dup(r)`) and adds at most one instruction (the
+  copy of a string literal); `extendArrays` replaces concatenations by `arrayextend` one for one (`concat + extend` is
+  constant); `insertCallDups` only adds `dup` / `makeunique` (releases and blocks unchanged); `rewriteParam` only adds edge
+  blocks (`onlyEdgeBlocksAdded`) and never removes a release.
+* **The parameter-mode inference is a monotone fixpoint**: every round only flips borrowed -> owned (`modesGrew(old, new)`),
+  `run` ensures `stable()` (another round would change nothing; catches a fixpoint that stops after one round, mutant 5), and
+  the class invariant keeps every closure target and vtable entry borrowed (mutant 4). `scanSites` ensures that every
+  recorded call site really passes the parameter at that position (`passesAt`), `paramLiveness` that the liveness equations
+  hold (`livenessSolved`).
+* **The analyses agree with each other**: `ancestors` ensures the alias relation is closed under the borrow edges
+  (`ancestorsClosed`, mutant 11), and requires `tablesAgree`: the optimiser's use / definition tables (`instrUses`,
+  `instrDef`, `termUses`) mention exactly the locals of the lowering's independent `instrLocals` / `termLocals`, so an
+  instruction kind added to one table and not the other is a contract failure instead of a release moved over a use (mutant
+  12; `analysisTablesAgreeOnEveryInstructionKind` checks every kind).
+* **pairs**: `pairShape` ensures `sitesCoverReturns` (every `return` block has exactly one site and the site is the
+  two-slot record with a reference first: a missed return would hand the record to a caller that reads it as the value);
+  `convertCallee` requires it and ensures `convertedOk`; `planSra` ensures the plan touches only instructions after the call;
+  `pairReturns` ensures `pairsKept` (only unpinned, non-`main` functions become in/out, every other signature is the same).
+* **prune**: `prunedOk`: the result's function names are a subsequence of the input's that keeps every user function and
+  `main` (a dropped user function would silently leave the verifier and the output; a reordering would renumber every
+  `orin_fn_<i>_..` symbol).
+* **Every emitted function name is unique**: the `CSymbols` / `LlvmSymbols` invariant `byName.size == names.length`;
+  `fnSymbol(i, name)` ensures the `orin_fn_<i>_` prefix (two names that sanitize alike, `a.b` and `a_b`, still get two
+  symbols; mutant 17), `sanitize` ensures an identifier of the same length.
+* **The output refers only to declared symbols**: `emitCFunction` ensures `refsDeclared(text, syms)` (every `orin_fn_..`
+  identifier outside string literals and comments is a function of the table, every `orin_s<k>` a string literal of the
+  unit, every `orin_vt<k>` a vtable; mutants 18, 19); `emitLlvmFunction` ensures `llvmRefsDeclared` (every `@global` is a
+  function, a trap message `@.m<k>`, a string, a vtable or a runtime function / prelude helper / intrinsic that the module
+  declares or defines, found from the text of `declares()` and `prelude()`; mutants 20, 21, 22); `joinC` / `joinLlvm`
+  ensure it for the whole unit, and also `namesDefined` / `globalsDefined`: every function, string literal, vtable and
+  trap message the table numbers is defined in the unit (mutant 22: a join that leaves out the vtables). Together:
+  **every string literal referenced is defined**, and so is every other symbol. `emittable` (required by `emitC` / `emitLlvm`) states the same on the
+  MIR side.
+* **Literals round-trip**: `cString` ensures `cStringValue(result) == s` and `llStr` ensures `llStrValue(result) == s`
+  with decoders written independently of the encoders (a two-digit octal escape followed by a digit, an unescaped `?` that
+  forms a trigraph, a hex digit in lower case are caught; mutants 14, 15); `commentSafe` ensures no `*/` survives (mutant 16).
+* **Emitter preconditions** (what the verifier guarantees, stated where the emitter relies on it): a call of an in/out
+  function has a local receiver (`inoutArgOk`: otherwise C gets `&orin_s0` and LLVM `ptr null`, which the callee writes
+  through), every branch target is a block of the function (`targetsBelow`: an undefined label), a trap message has its
+  global (`LlvmSymbols.message` requires `hasMessage`: the old `msgIndex` answered `msgs.length` for an unknown message, an
+  undefined `@.m<n>`), the arity of a runtime call is covered by the arguments (`callN`).
+
+To see that they can fail: 25 hand-made mutants of the new code (the ones named above, plus a
+release search that ignores uses, the take/put to the wrong slot, a kept move after `arrayextend`, getters of a chain not
+dropped, a pair callee not made in/out, pruning of user functions, a reference mask without the 64 limit, repeated trap
+messages with a global each, and a counter threaded through the C functions) were run against `opt_test.or` /
+`emit_test.or`: **25 / 25 killed**. The first run left two survivors, which is why
+`anOwnedParameterIsReleasedOnTheEdgeWhereItDies` checks the `then` edge too and `analysisTablesAgreeOnEveryInstructionKind`
+exists.
+
+None of the contracts fired on the compiler's own sources, the conformance suites or the unit tests (below).
+
+### Rule 8: per-function emission
+
+Before: both emitters were already deterministic, but in one loop: the C emitter computed the symbol table and the
+signatures inline and passed them in `Fx` to every function; the LLVM emitter numbered the trap messages in a separate pass
+(`collectMsgs`) and looked each one up linearly. Nothing was threaded from one function to the next, but nothing said so
+either, and the per-function step was not a function of its own.
+
+Now each backend has three steps:
+
+1. **`cSymbols(prog)` / `llvmSymbols(prog)`**: everything that is numbered across the program, in a fixed order: the
+   function symbols `orin_fn_<i>_<name>` by function index; the C signatures; the trap-message globals `@.m<k>` (the nine
+   fixed messages of the prelude, then every other `TTrap` message in function, block order, first occurrence wins, a `Map`
+   index); the counts of string literals and vtables, whose numbers are those of the MIR (the lowering's string table,
+   `MProgram.vtables`). The table is a class with invariants and is only read afterwards.
+2. **`emitCFunction(syms, prog, i)` / `emitLlvmFunction(syms, prog, i)`**: the text of function i, a function of the table,
+   the program (callee in/out flags) and i alone. Instruction temporaries in LLVM are named after their position
+   (`%b<block>i<index>..`), block labels after the block index, C locals after the local index: no counter.
+3. **`joinC` / `joinLlvm`**: header, globals, declarations, then the function texts in index order, then `main`.
+
+`emitC` is `joinC(prog, syms, indices(n).map(i => emitCFunction(syms, prog, i)))`: the `map` is the place where ADR-0039
+`.parallel()` goes. The unit tests `aCUnitIsTheJoinOfIndependentlyEmittedFunctions` and
+`anLlvmModuleIsTheJoinOfIndependentlyEmittedFunctions` emit the functions last to first, put them in index order and compare
+with the whole unit, and check that changing one function's body leaves the other functions' texts unchanged; mutant 24
+(a counter threaded through the functions, as a comment) is killed by it.
+
+The optimiser has the same split: the program-wide steps (closure targets, the parameter-mode fixpoint `ParamInference`,
+and the pair shapes of stage 5) run first in function order; the per-function stage `optimizeFunction(q, p, i)` (stage 2
+dups, owned-parameter rewrite, chains, slots, peephole) and the call rewrite of stage 5 read only those results and the
+input program, and are `map`s over the function indices.
+
+### Defects found and fixed
+
+1. **A struct with more than 64 slots crashed the compiler.** The reference mask (`maskOf`, in both backends) kept the
+   bit value at 2^63 from slot 63 on and added it for every further reference slot, so the second reference slot past
+   slot 63 overflowed `usize`: `orin compile` of a record with 66 `string` fields ended in `trap: usize overflow` (a compiler
+   crash, no diagnostic). The runtime only has 64 mask bits and `orin_struct_new` traps on more than 64 slots ("struct has
+   more than 64 slots", a defined trap), so the mask now ignores slots from 64 on (`refMask`, shared by both backends; the
+   mask of every struct with at most 64 slots is unchanged, so the output for every corpus program is byte-identical). Such
+   a program now compiles and traps when the struct is built. Found by stating `refMask`'s contract against `maskAll(64)`;
+   pinned by `referenceMasksOfLargeStructsDoNotOverflow` (mutant 13). A compile-time error for records and closures with
+   more than 64 slots would be a language-visible change: **NEEDS_DECISION**, not done here.
+2. **The LLVM backend could emit an undefined trap-message global**: `msgIndex` returned `msgs.length` for a message that
+   `collectMsgs` had not collected, which `opt` rejects. No MIR reaches it today (both walk the same terminators), but the
+   two lists could drift; `LlvmSymbols.message` now requires the message to be in the table and the table is a `Map`.
+3. Not a defect of the output, a robustness gap: the C `builtinC` read `a[1]`, `a[2]` .. of a builtin's argument list without
+   a check; `callN` now requires the arity (a builtin with too few operands would have trapped with an index error inside
+   the emitter instead of a contract message naming the call).
+
+### Behaviour preservation
+
+All against the compiler bootstrapped from the base (this branch's merge of the performance branch and origin/main):
+
+* **generated code**: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
+  `examples/` and `bench/*/main.or` program (397 inputs x 3) **byte-identical**; `compiler/main.or` compiled by both
+  compilers on the final tree: C (8,898,915 bytes), C with contracts (12,603,446) and LLVM IR (23,632,696) byte-identical;
+* `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,898,915 bytes), conformance 141/141;
+* all suites with `orin2` (C and LLVM backends): 816 / 816 with the C backend and 816 / 816 with the LLVM backend (`run_tests.py --suite all`);
+* `tools/diff_backends.py` (build and run both, compare output): `--mode opt` 378 programs, 0 differences (4 skipped: the `--no-opt` side timed out on the loaded machine), `--mode llvm` 378 programs, 0 differences, `--mode builtins` 378 programs, 0 differences;
+* `tools/test_compiler_contracts.sh`: **not completed locally** (the run was invalidated because the tree was edited during it; GitHub CI runs it). Checked earlier in the step: the contract-checked compiler self-compiles `compiler/main.or` to output identical to the normal compiler's (C and LLVM IR), and every unit test runs with contracts (`orin test`); **no contract fired**;
+* `orin check --strict-contracts compiler/main.or`: no warning in the files of this step; the 13 `W0471` of `compiler/vc/` (`Gen`, `Tab`) are on the base too (step 3c fixes them);
+* `tools/mutate_mir.py`: **not run locally** (left to GitHub CI); the verifier and the MIR are untouched by this step;
+* `tools/test_tooling.sh` (with `opt_test` 17/17, `emit_test` 10/10): `opt_test` 17 / 17 and `emit_test` 10 / 10 run on their own; the full script was stopped (coordinator: CI is the gate) after the files before them had passed.
+* `ci_local.sh` was not run (the coordinator replaced it by the gates above, and then by GitHub CI).
+* The bootstrap, the byte-identity comparison, the suites and `diff_backends` ran on the tree before the last two compiler
+  changes of the step: the hot helpers of `opt/analysis.or` / `params.or` / `calls.or` returned to the loops of the base
+  (performance only) and one `@Ensures` on `LlvmFunctionEmitter.run`. Those were checked with `orin check`, the formatter,
+  `--strict-contracts` and `emit_test` (contracts on); the full gates on the final tree are GitHub CI's.
+
+### Performance
+
+Instruction counts (`valgrind --tool=callgrind`, deterministic; the machine was shared at load 8-20 on 4 cores, so wall
+time is not a measurement), both compilers on the same final tree:
+
+| | base compiler | new compiler | change |
+|---|---|---|---|
+| instructions, `orin compile compiler/main.or` | 36,443 M | 36,574 M | +0.36 % |
+| of which `optimize` | 16,008 M | 16,089 M | +0.5 % |
+| of which `emitC` | 768 M | 798 M | +3.9 % |
+| of which the verifier | 15,869 M | 15,874 M | 0 |
+
+The first measurement was +1.1 %: `some` / `includes` / `map` with a closure in the per-instruction and per-block helpers of
+the inference (`blockUses`, `termUsesAffecting`, `contains`, `successors`, `ancestors` with an `Edge` record per edge) cost
+170 M instructions in `scanSites` alone. Those helpers are back to loops (rule 7's exception for hot inner loops, with a
+comment each); `borrowEdges` stays as the independent edge list of the `ancestorsClosed` contract. The rest of the
+difference is the per-function `map` with its closure, the `BlockSink` / `RewritePlan` objects and the emitter class.
+
+### Design notes and friction
+
+* **The symbol table is a class that is only read.** `CSymbols` / `LlvmSymbols` are built by a free function and handed to
+  every per-function emitter; the emitters never call a mutating method on them (3b's finding: a mutating method called on
+  a class-typed field copies the object), and the emitters' own mutation is one `lines` array built in a local and stored
+  once.
+* **`Locals` from step 3a is reused** by four passes (`fresh(ty)` instead of `locals.push` after reading the length); the
+  temporaries get the same ids as before.
+* **No `export { x as y }`**: the two "refers only to declared symbols" predicates could not both be exported as
+  `refsDeclared`; the LLVM one is `llvmRefsDeclared`.
+* **`from` is still a keyword**: `EdgeBlocks.target(src, ..)`.
+* **No index-carrying `map`, no `reverse`**: a per-function `map` is `indices(n).map(i => ..)` (`indices` exists in `opt`
+  and in `cemit`; the LLVM backend imports the C one, together with `fnSymbol`, `refMask`, `emittable`, so the naming and
+  the mask are stated once for both backends).
+* **`charCodeAt` returns `int`**: the character-class helpers take `int`; mixing it with `usize` cursor arithmetic is E0400.
+* **No `\u{..}` escapes** in string literals; the tests build bytes with `String.fromCharCode`.
+* **A record invariant caught a test**: writing `blocks[0].instrs = [..]` without the spans trapped on `MBlock`'s
+  `spans.length == instrs.length`; the test now replaces the whole block.
+* **A replacement plan that may be written twice** (the old `rep[j] = ..` overwrote silently) is a `@Requires(!touched)`
+  now; it never fires, which documents that the scalar-replacement plans of two calls in one block never overlap.
+* **Long contract checks on large text**: `llvmRefsDeclared` on the whole 23 MB module of `compiler/main.or` is linear but
+  makes the contract-checked LLVM self-compile about 2x slower than the C one; only the contract-checked build pays it.
+* **The scratch directory was shared with other workers**: a baseline compiler at a generic path was overwritten by another
+  worker during the step (detected by a checksum, all comparisons redone from a copy in a private directory).
+* Rule 7 (array API): the predicates and the drivers use `map` / `some` / `every` / `filter` / `reduce` / `includes`; the
+  per-instruction scans and the fixpoints stay loops.
 
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 

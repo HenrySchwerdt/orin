@@ -1,14 +1,18 @@
-// MIR optimiser driver (ADR-0010, docs/mir.md v1.2). Input: a verified MIR program with all
-// parameters borrowed. Output: an equivalent MIR program that passes the verifier.
-//   1. parameter-mode inference: interprocedural fixpoint starting from "all borrowed";
-//      parameter k of f becomes owned when f consumes it at a last use (IDup or an owned
-//      position of a callee). Modes only ever flip borrowed -> owned, in function/parameter
-//      order, so the result is deterministic and the iteration terminates.
-//   2. per function: call-site argument retains (calls.or), callee-side owned-parameter rewrite
-//      (params.or), take/put of a slot that is read, retained and stored back (inplace.or),
-//      dup/release cancellation (calls.or).
-//   3. pair-return elimination (pairs.or): functions that return a fresh two-slot record become in/out
-//      functions, the record at their call sites is scalar-replaced (docs/mir.md v1.10).
+// MIR optimiser driver (ADR-0010, docs/mir.md v1.2). Input: a verified MIR program with all parameters borrowed.
+// Output: an equivalent MIR program that passes the verifier.
+//   1. parameter-mode inference (class `ParamInference`): interprocedural fixpoint starting from "all borrowed";
+//      parameter k of f becomes owned when f consumes it at a last use (IDup or an owned position of a callee). Modes
+//      only ever flip borrowed -> owned, in function / parameter order, so the result is deterministic and the
+//      iteration terminates.
+//   2. per function (`optimizeFunction`): call-site argument retains (calls.or), callee-side owned-parameter rewrite
+//      (params.or), take/put of nested and plain slots that are read, retained and stored back (chains.or,
+//      inplace.or), dup/release cancellation (calls.or).
+//   3. pair-return elimination (pairs.or): functions that return a fresh two-slot record become in/out functions, the
+//      record at their call sites is scalar-replaced (docs/mir.md v1.10).
+//
+// Rule 8 (rewrite step 3d): steps 1 and the shape analysis of 3 are the program-wide steps and run first, in a fixed
+// order; step 2 and the call rewrite of 3 read only their results and the input program, so each function is
+// optimised on its own (a `map` over the function indices, ready for ADR-0039 `.parallel()`).
 
 import { MProgram, MFunction } from "../mir";
 import { PSites, scanSites, rewriteParam } from "./params";
@@ -16,24 +20,16 @@ import { insertCallDups, peephole } from "./calls";
 import { inplaceSlots } from "./inplace";
 import { takePutChains } from "./chains";
 import { pairReturns } from "./pairs";
-
-function ownedAny(f: MFunction): bool {
-  for (const o of f.paramOwned) {
-    if (o) {
-      return true;
-    }
-  }
-  return false;
-}
+import { indices } from "./rewrite";
+import { progWellFormed, fnWellFormed, passKept } from "./wellformed";
 
 // Functions whose address is taken by an `IClosure` or a vtable: they are called through function values
-// (`ICallIndirect`), whose arguments are always borrowed, so their parameters stay borrowed
-// (ADR-0011, docs/mir.md v1.3). Calls through function values are not tracked by the inference.
-function closureTargets(p: MProgram): bool[] {
-  let out: bool[] = [];
-  for (const _f of p.functions) {
-    out.push(false);
-  }
+// (`ICallIndirect`, `ICallVirtual`), whose arguments are always borrowed, so their parameters stay borrowed (ADR-0011,
+// ADR-0019, docs/mir.md v1.3). Calls through function values are not tracked by the inference.
+@Requires(progWellFormed(p))
+@Ensures(result.length == p.functions.length)
+export function closureTargets(p: MProgram): bool[] {
+  let out: bool[] = p.functions.map(f => false);
   for (const f of p.functions) {
     for (const blk of f.blocks) {
       for (const ins of blk.instrs) {
@@ -41,12 +37,11 @@ function closureTargets(p: MProgram): bool[] {
           IClosure(_, g, _) => {
             out[g] = true;
           },
-          _ => {}
+          _ => {},
         }
       }
     }
   }
-  // Vtable entries (ADR-0019) are called through `ICallVirtual` with borrowed arguments as well.
   for (const v of p.vtables) {
     for (const g of v.funcs) {
       out[g] = true;
@@ -55,68 +50,202 @@ function closureTargets(p: MProgram): bool[] {
   return out;
 }
 
-export function optimize(p: MProgram): MProgram {
-  let q = p;
-  const pinned = closureTargets(p);
-  let sites: PSites[][] = [];
-  for (const f of p.functions) {
-    let row: PSites[] = [];
+// No function has an owned parameter or an in/out receiver (what the lowering produces).
+export function allBorrowed(p: MProgram): bool {
+  return p.functions.every(f => !f.inout && f.paramOwned.every(o => !o));
+}
+
+// `now` only has more owned parameters than `old` (a mode never flips back).
+export function modesGrew(old: bool[][], now: bool[][]): bool {
+  if (old.length != now.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < old.length) {
+    if (old[i].length != now[i].length) {
+      return false;
+    }
     let k: usize = 0;
-    while (k < f.paramCount) {
-      row.push(scanSites(f, k));
+    while (k < old[i].length) {
+      if (old[i][k] && !now[i][k]) {
+        return false;
+      }
       k += 1;
     }
-    sites.push(row);
+    i += 1;
   }
-  let changed = true;
-  while (changed) {
-    changed = false;
+  return true;
+}
+
+// No pinned function has an owned parameter.
+export function pinnedBorrowed(modes: bool[][], pinned: bool[]): bool {
+  let i: usize = 0;
+  while (i < modes.length) {
+    if (pinned[i] && modes[i].some(o => o)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The parameter-mode inference: one site summary and one mode per parameter of every function, the pinned functions.
+// A parameter is owned only when its sites allow it (`ok`) and the function is not pinned.
+@Invariant(this.sites.length == this.modes.length && this.pinned.length == this.modes.length)
+@Invariant(pinnedBorrowed(this.modes, this.pinned))
+export class ParamInference {
+  private sites: PSites[][];
+  private modes: bool[][];
+  private pinned: bool[];
+
+  constructor(sites: PSites[][], pinned: bool[]) {
+    this.sites = sites;
+    this.modes = sites.map(row => row.map(s => false));
+    this.pinned = pinned;
+  }
+
+  // Would parameter k of function fi be owned under the current modes? (It consumes its reference at a last use: a dup,
+  // or an owned position of a callee.)
+  @Requires(fi < this.sites.length && k < this.sites[fi].length)
+  wants(fi: usize, k: usize): bool {
+    const s = this.sites[fi][k];
+    if (!s.ok || this.pinned[fi] || this.modes[fi][k]) {
+      return false;
+    }
+    let want = s.dup;
+    for (const c of s.calls) {
+      if (c.pos < this.modes[c.callee].length && this.modes[c.callee][c.pos]) {
+        want = true;
+      }
+    }
+    return want;
+  }
+
+  // One pass over all parameters in function / parameter order; true when a mode changed.
+  @Ensures(modesGrew(old(this.modes), this.modes))
+  private round(): bool {
+    let changed = false;
     let fi: usize = 0;
-    while (fi < sites.length) {
+    while (fi < this.sites.length) {
       let k: usize = 0;
-      while (k < sites[fi].length) {
-        const s = sites[fi][k];
-        if (s.ok && !pinned[fi] && !q.functions[fi].paramOwned[k]) {
-          let want = s.dup;
-          for (const c of s.calls) {
-            if (c.pos < q.functions[c.callee].paramOwned.length && q.functions[c.callee].paramOwned[c.pos]) {
-              want = true;
-            }
-          }
-          if (want) {
-            q.functions[fi].paramOwned[k] = true;
-            changed = true;
-          }
+      while (k < this.sites[fi].length) {
+        if (this.wants(fi, k)) {
+          this.modes[fi][k] = true;
+          changed = true;
         }
         k += 1;
       }
       fi += 1;
     }
+    return changed;
   }
-  let fns: MFunction[] = [];
-  let fi: usize = 0;
-  while (fi < p.functions.length) {
-    const owned = q.functions[fi].paramOwned;
-    let f = insertCallDups(q, p, p.functions[fi], owned);
-    let k: usize = 0;
-    while (k < owned.length) {
-      if (owned[k]) {
-        f = rewriteParam(q, f, k);
-      }
-      k += 1;
+
+  // Runs the rounds to the fixpoint: afterwards no parameter wants to change (`stable`).
+  @Ensures(modesGrew(old(this.modes), this.modes) && this.stable())
+  run(): void {
+    let changed = true;
+    while (changed) {
+      changed = this.round();
     }
-    f = inplaceSlots(takePutChains(f));
-    f = peephole(f);
-    fns.push(MFunction {
-      name: f.name,
-      paramCount: f.paramCount,
-      paramOwned: owned,
-      inout: f.inout,
-      locals: f.locals,
-      ret: f.ret,
-      blocks: f.blocks
-    });
+  }
+
+  // No parameter would flip in another round.
+  stable(): bool {
+    let fi: usize = 0;
+    while (fi < this.sites.length) {
+      let k: usize = 0;
+      while (k < this.sites[fi].length) {
+        if (this.wants(fi, k)) {
+          return false;
+        }
+        k += 1;
+      }
+      fi += 1;
+    }
+    return true;
+  }
+
+  // The inferred modes, one row per function.
+  result(): bool[][] {
+    return this.modes;
+  }
+}
+
+// The modes of the parameters of `p` (step 1).
+@Requires(progWellFormed(p) && pinned.length == p.functions.length)
+@Ensures(result.length == p.functions.length && pinnedBorrowed(result, pinned))
+export function inferModes(p: MProgram, pinned: bool[]): bool[][] {
+  const sites = p.functions.map(f => indices(f.paramCount).map(k => scanSites(f, k)));
+  let inf = new ParamInference(sites, pinned);
+  inf.run();
+  return inf.result();
+}
+
+// `p` with the inferred modes (the bodies are not changed yet).
+@Requires(modes.length == p.functions.length)
+function withModes(p: MProgram, modes: bool[][]): MProgram {
+  let q = p;
+  let fi: usize = 0;
+  while (fi < modes.length) {
+    q.functions[fi].paramOwned = modes[fi];
     fi += 1;
   }
-  return pairReturns(MProgram { functions: fns, strings: p.strings, main: p.main, vtables: p.vtables, inlineFns: p.inlineFns }, pinned);
+  return q;
+}
+
+// Step 2 for function fi: `q` carries the inferred modes, `p` is the input (all borrowed, the ownership states of the
+// stage-2 replay come from it). Reads only `p` and `q`, so the functions can be optimised in any order.
+@Requires(fi < p.functions.length
+    && q.functions.length == p.functions.length
+    && fnWellFormed(q, q.functions[fi]))
+@Ensures(fnWellFormed(q, result) && passKept(q.functions[fi], result))
+export function optimizeFunction(q: MProgram, p: MProgram, fi: usize): MFunction {
+  const owned = q.functions[fi].paramOwned;
+  let f = insertCallDups(q, p, p.functions[fi], owned);
+  f.paramOwned = owned;
+  let k: usize = 0;
+  while (k < owned.length) {
+    if (owned[k]) {
+      f = rewriteParam(q, f, k);
+    }
+    k += 1;
+  }
+  return peephole(inplaceSlots(takePutChains(f)));
+}
+
+// Every function of `r` is the function of `p` with the same index and name, `main`, strings and vtables are the same.
+export function sameFunctions(p: MProgram, r: MProgram): bool {
+  if (r.functions.length != p.functions.length
+      || r.main != p.main
+      || r.strings.length != p.strings.length
+      || r.vtables.length != p.vtables.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < p.functions.length) {
+    if (r.functions[i].name != p.functions[i].name
+        || r.functions[i].paramCount != p.functions[i].paramCount) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+@Requires(progWellFormed(p) && allBorrowed(p))
+@Ensures(progWellFormed(result) && sameFunctions(p, result))
+export function optimize(p: MProgram): MProgram {
+  const pinned = closureTargets(p);
+  const q = withModes(p, inferModes(p, pinned));
+  const fns = indices(p.functions.length).map(fi => optimizeFunction(q, p, fi));
+  return pairReturns(
+    MProgram {
+      functions: fns,
+      strings: p.strings,
+      main: p.main,
+      vtables: p.vtables,
+      inlineFns: p.inlineFns,
+    },
+    pinned,
+  );
 }

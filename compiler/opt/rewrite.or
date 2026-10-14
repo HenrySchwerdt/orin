@@ -1,0 +1,181 @@
+// The two pieces of state every block rewrite of the optimiser threads: the block being built (`BlockSink`: instructions
+// and their spans in step) and the replacement plan of a block (`RewritePlan`: which instructions are replaced, and by
+// what). Before step 3d each pass kept them as parallel local arrays (`out` / `sps`, `touched` / `rep`, `gone`, `hit`).
+
+import { Instr, Terminator, MBlock, MFunction, MLocal } from "../mir";
+import { Span } from "../diag";
+
+// The instructions of a block under construction, each with the span of the source instruction it comes from.
+@Invariant(this.instrs.length == this.spans.length)
+export class BlockSink {
+  private instrs: Instr[] = [];
+  private spans: Span[] = [];
+
+  size(): usize {
+    return this.instrs.length;
+  }
+
+  @Ensures(this.instrs.length == old(this.instrs.length) + 1)
+  emit(i: Instr, sp: Span): void {
+    this.instrs.push(i);
+    this.spans.push(sp);
+  }
+
+  // Every instruction of `is`, all at `sp`.
+  @Ensures(this.instrs.length == old(this.instrs.length) + is.length)
+  emitAll(is: Instr[], sp: Span): void {
+    for (const i of is) {
+      this.instrs.push(i);
+      this.spans.push(sp);
+    }
+  }
+
+  // Removes the last `n` instructions (a pattern found after they were emitted).
+  @Requires(n <= this.instrs.length)
+  @Ensures(this.instrs.length == old(this.instrs.length) - n)
+  drop(n: usize): void {
+    let k: usize = 0;
+    while (k < n) {
+      this.instrs.pop();
+      this.spans.pop();
+      k += 1;
+    }
+  }
+
+  // The block: what was emitted, then `term`.
+  @Ensures(result.instrs.length == this.instrs.length && result.spans.length == this.spans.length)
+  finish(term: Terminator, termSpan: Span): MBlock {
+    return MBlock { instrs: this.instrs, spans: this.spans, term: term, termSpan: termSpan };
+  }
+}
+
+function falses(n: usize): bool[] {
+  let out: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(false);
+    i += 1;
+  }
+  return out;
+}
+
+function empties(n: usize): Instr[][] {
+  let out: Instr[][] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push([]);
+    i += 1;
+  }
+  return out;
+}
+
+// The replacements planned for a block of `size()` instructions: instruction i is kept as it is, or (`touched(i)`)
+// replaced by the list `rep[i]` (empty: removed). An instruction is replaced at most once, and an untouched instruction
+// has no replacement, so applying the plan is unambiguous.
+@Invariant(this.rep.length == this.hit.length)
+@Invariant(this.nHit <= this.hit.length)
+export class RewritePlan {
+  private hit: bool[];
+  private rep: Instr[][];
+  private nHit: usize;
+
+  constructor(n: usize) {
+    this.hit = falses(n);
+    this.rep = empties(n);
+    this.nHit = 0;
+  }
+
+  size(): usize {
+    return this.hit.length;
+  }
+
+  // Number of instructions replaced or removed.
+  changes(): usize {
+    return this.nHit;
+  }
+
+  @Requires(i < this.hit.length)
+  touched(i: usize): bool {
+    return this.hit[i];
+  }
+
+  // The replacement of instruction i.
+  @Requires(i < this.hit.length && this.hit[i])
+  replacement(i: usize): Instr[] {
+    return this.rep[i];
+  }
+
+  // Instruction i becomes `by` (nothing when `by` is empty).
+  @Requires(i < this.hit.length && !this.hit[i])
+  @Ensures(this.hit[i] && this.nHit == old(this.nHit) + 1)
+  replace(i: usize, by: Instr[]): void {
+    this.hit[i] = true;
+    this.rep[i] = by;
+    this.nHit += 1;
+  }
+
+  @Requires(i < this.hit.length && !this.hit[i])
+  @Ensures(this.hit[i] && this.nHit == old(this.nHit) + 1)
+  remove(i: usize): void {
+    this.replace(i, []);
+  }
+
+  // The number of instructions the plan applied to its block gives.
+  outLength(): usize {
+    let n: usize = 0;
+    let i: usize = 0;
+    while (i < this.hit.length) {
+      n += this.hit[i] ? this.rep[i].length : 1;
+      i += 1;
+    }
+    return n;
+  }
+
+  // `blk` with the plan applied: a replacement takes the span of the instruction it replaces. The block itself when
+  // nothing is planned.
+  @Requires(blk.instrs.length == this.hit.length)
+  @Ensures(result.instrs.length == this.outLength() && result.spans.length == result.instrs.length)
+  apply(blk: MBlock): MBlock {
+    if (this.nHit == 0) {
+      return blk;
+    }
+    let out = new BlockSink();
+    let k: usize = 0;
+    while (k < blk.instrs.length) {
+      if (this.hit[k]) {
+        out.emitAll(this.rep[k], blk.spans[k]);
+      } else {
+        out.emit(blk.instrs[k], blk.spans[k]);
+      }
+      k += 1;
+    }
+    return out.finish(blk.term, blk.termSpan);
+  }
+}
+
+// `f` with a new body: the same name, parameters, modes, in/out flag and result type.
+@Ensures(result.name == f.name && result.paramCount == f.paramCount && result.inout == f.inout)
+@Ensures(result.locals.length == locals.length && result.blocks.length == blocks.length)
+export function withBody(f: MFunction, locals: MLocal[], blocks: MBlock[]): MFunction {
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: f.paramOwned,
+    inout: f.inout,
+    locals: locals,
+    ret: f.ret,
+    blocks: blocks,
+  };
+}
+
+// The indices 0 .. n-1 (a per-function step is a `map` over them).
+@Ensures(result.length == n)
+export function indices(n: usize): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(i);
+    i += 1;
+  }
+  return out;
+}

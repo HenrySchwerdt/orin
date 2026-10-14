@@ -1,0 +1,886 @@
+// One function of the LLVM module: class `LlvmFunctionEmitter`.
+//
+// Every MIR local is an `alloca` in a synthetic `entry` block (LLVM's mem2reg / SROA builds SSA); MIR block i is the LLVM
+// block `B<i>`. Instructions that need control flow inside a block (`unwrap_or`) add blocks with names derived from the
+// instruction position. Temporaries are named after the instruction (`%b<block>i<index>...`), so the text needs no
+// counter: the IR of a function depends only on the function, the read-only `LlvmSymbols` and the callees' signatures
+// (rule 8; `emitLlvmFunction`).
+
+import { BinOp, UnOp, Builtin, taskOpC, taskOpRet } from "../hir";
+import {
+  MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, isInlineFn,
+} from "../mir";
+import { refMask, inoutArgOk, targetsBelow, linesOfBlocks } from "../cemit";
+import { u, isRefT, isUsizeT, isFloatT, lty, attrTy, paramTy } from "./text";
+import { LlvmSymbols, llvmRefsDeclared, trapsIndexed } from "./symbols";
+
+// Result of a builtin: the IR text and the SSA value holding the result ("" for none).
+type R = { text: string; val: string; };
+
+// ---------------------------------------------------------------- operands
+
+// SSA value of operand `n` of the instruction named `p` (a load result for locals).
+function ov(p: string, n: usize, o: Operand): string {
+  return match (o) {
+    OLocal(_) => p + "o" + u(n),
+    OInt(v) => v.toString(),
+    OUsize(v) => v.toString(),
+    OBool(b) => b ? "1" : "0",
+    OFloat(t) => t,
+    OStr(i) => "@orin_s" + u(i),
+  };
+}
+
+// The address of the local an operand names (the in/out argument of a call, docs/mir.md v1.10).
+function operandPtr(o: Operand): string {
+  return match (o) {
+    OLocal(l) => "%l" + u(l),
+    _ => "null",
+  };
+}
+
+// Unchecked slot address: only for an object that `orin_struct_new` just returned in the same instruction
+// sequence with a constant slot count that covers `k` (closure and interface construction).
+function slotGep(name: string, base: string, k: usize): string {
+  return "  " + name + " = getelementptr inbounds i8, ptr " + base + ", i64 " + u(32 + 8 * k)
+      + "\n";
+}
+
+// Checked slot address for an object of unknown provenance: traps unless it is a struct with more than `k` slots
+// (defence in depth against shape confusion, same check as `orin_chk_slot` in the C runtime).
+function slotChk(name: string, base: string, k: usize): string {
+  return "  " + name + " = call ptr @orinl_slot(ptr " + base + ", i64 " + u(k) + ")\n";
+}
+
+function lbl(p: string, sfx: string): string {
+  return p.substring(1, p.length) + sfx;
+}
+
+function arithHelper(op: BinOp, usz: bool): string {
+  const suffix = usz ? "_u" : "_i";
+  const name = match (op) {
+    OpAdd => "add",
+    OpSub => "sub",
+    OpMul => "mul",
+    OpDiv => "div",
+    OpRem => "rem",
+    _ => "?",
+  };
+  return "@orinl_" + name + suffix;
+}
+
+function cmpPred(op: BinOp, usz: bool): string {
+  return match (op) {
+    OpEq => "eq",
+    OpNe => "ne",
+    OpLt => usz ? "ult" : "slt",
+    OpLe => usz ? "ule" : "sle",
+    OpGt => usz ? "ugt" : "sgt",
+    _ => usz ? "uge" : "sge",
+  };
+}
+
+function fcmpPred(op: BinOp): string {
+  return match (op) {
+    OpEq => "oeq",
+    OpNe => "une",
+    OpLt => "olt",
+    OpLe => "ole",
+    OpGt => "ogt",
+    _ => "oge",
+  };
+}
+
+function isNe(op: BinOp): bool {
+  return match (op) {
+    OpNe => true,
+    _ => false,
+  };
+}
+
+function callBin(r: string, fn: string, a: string, b: string): string {
+  return "  " + r + " = call i64 " + fn + "(i64 " + a + ", i64 " + b + ")\n";
+}
+
+// Name of the C runtime function for builtins that are a plain call ("" for inline ones).
+function bname(op: Builtin): string {
+  return match (op) {
+    BConsoleLog => "orin_console_log",
+    BConsoleError => "orin_console_error",
+    BStringFromCharCode => "orin_string_from_char_code",
+    BParseInt => "orin_parse_int",
+    BFsReadFile => "orin_fs_read_file",
+    BFsWriteFile => "orin_fs_write_file",
+    BFsExists => "orin_fs_exists",
+    BProcessArgs => "orin_process_args",
+    BProcessExit => "orin_process_exit",
+    BIoReadBytes => "orinl_io_read_bytes",
+    BIoReadLine => "orinl_io_read_line",
+    BIoWriteStdout => "orinl_io_write_stdout",
+    BIoShell => "orinl_io_shell",
+    BTimeNowMillis => "orinl_time_now_millis",
+    BGrantFs => "orin_cap_fs",
+    BGrantProcess => "orin_cap_process",
+    BGrantStdio => "orin_cap_stdio",
+    BGrantClock => "orin_cap_clock",
+    BGrantUnder => "orin_cap_under",
+    BGrantReadOnly => "orin_cap_read_only",
+    BGrantArgsOnly => "orin_cap_args_only",
+    BGrantRevoke => "orin_cap_revoke",
+    BTask(k) => taskOpC(k),
+    BGrantNet => "orin_cap_net",
+    BGrantListen => "orin_cap_listen",
+    BGrantConnect => "orin_cap_connect",
+    BNetListen => "orin_net_listen",
+    BNetAccept => "orin_net_accept",
+    BNetConnect => "orin_net_connect",
+    BNetStatus => "orin_net_status",
+    BNetClose => "orin_net_close",
+    BNetPort => "orin_net_port",
+    BNetNow => "orin_net_now",
+    BNetRecv => "orin_net_recv",
+    BNetSend => "orin_net_send",
+    BNetShutdown => "orin_net_shutdown",
+    BNetPeer => "orin_net_peer",
+    BNetResolve => "orin_net_resolve",
+    BNetErrorText => "orin_net_error_text",
+    BFileOpen => "orin_file_open",
+    BFileIsOpen => "orin_file_is_open",
+    BFileOpenError => "orin_file_open_error",
+    BFileClose => "orin_file_close",
+    BFileReadLine => "orin_file_read_line",
+    BFileRead => "orin_file_read",
+    BFileReadAll => "orin_file_read_all",
+    BFileWrite => "orin_file_write",
+    BFileWriteLine => "orin_file_write_line",
+    BFileFlush => "orin_file_flush",
+    BStrCharCodeAt => "orinl_str_char_code_at",
+    BStrCharAt => "orin_str_char_at",
+    BStrSubstring => "orin_str_substring",
+    BStrIndexOf => "orin_str_index_of",
+    BStrIncludes => "orin_str_includes",
+    BStrStartsWith => "orin_str_starts_with",
+    BStrEndsWith => "orin_str_ends_with",
+    BStrSplit => "orin_str_split",
+    BStrTrim => "orin_str_trim",
+    BArrGet => "orin_array_get",
+    BArrSlice => "orin_array_slice",
+    BArrConcat => "orin_array_concat",
+    BArrJoin => "orin_array_join",
+    BBytesToString => "orin_bytes_to_string",
+    BStringToBytes => "orin_string_to_bytes",
+    BIntToString => "orin_int_to_string",
+    BUsizeToString => "orin_usize_to_string",
+    BBoolToString => "orin_bool_to_string",
+    BParseFloat => "orin_parse_float",
+    BFloatToString => "orin_float_to_string",
+    BF32ToString => "orin_f32_to_string",
+    BFloatToInt => "orin_float_to_int",
+    BIntToUsize => "orinl_int_to_usize",
+    BUsizeToInt => "orinl_usize_to_int",
+    BIntRange => "orinl_range",
+    BIntConv => "orinl_conv_i",
+    BUIntConv => "orinl_conv_u",
+    BIntOp => "orin_int_op",
+    BIntChk => "orin_int_chk",
+    BParseIntK => "orin_parse_int_k",
+    _ => "",
+  };
+}
+
+function bret(op: Builtin): string {
+  return match (op) {
+    BConsoleLog => "void",
+    BConsoleError => "void",
+    BIoWriteStdout => "void",
+    BProcessExit => "void",
+    BFsExists => "i64",
+    BFileOpen => "i64",
+    BGrantFs => "i64",
+    BGrantProcess => "i64",
+    BGrantStdio => "i64",
+    BGrantClock => "i64",
+    BGrantUnder => "i64",
+    BGrantReadOnly => "i64",
+    BGrantArgsOnly => "i64",
+    BGrantRevoke => "void",
+    BTask(k) => taskOpRet(k) == 0 ? "void" : taskOpRet(k) == 1 ? "i64" : "ptr",
+    BGrantNet => "i64",
+    BGrantListen => "i64",
+    BGrantConnect => "i64",
+    BNetListen => "i64",
+    BNetAccept => "i64",
+    BNetConnect => "i64",
+    BNetStatus => "i64",
+    BNetClose => "void",
+    BNetPort => "i64",
+    BNetNow => "i64",
+    BNetShutdown => "i64",
+    BFileIsOpen => "i64",
+    BFileWrite => "void",
+    BFileWriteLine => "void",
+    BFileFlush => "void",
+    BIoShell => "i64",
+    BTimeNowMillis => "i64",
+    BStrCharCodeAt => "i64",
+    BStrIncludes => "i64",
+    BStrStartsWith => "i64",
+    BStrEndsWith => "i64",
+    BIntToUsize => "i64",
+    BUsizeToInt => "i64",
+    BFloatToInt => "i64",
+    BIntRange => "i64",
+    BIntConv => "i64",
+    BUIntConv => "i64",
+    BIntOp => "i64",
+    _ => "ptr",
+  };
+}
+
+function dupIf(rt: MType, p: string, raw: string): R {
+  if (isRefT(rt)) {
+    return R {
+      text: "  " + p + "q = inttoptr i64 " + raw + " to ptr\n  " + p
+          + "d = call ptr @orinl_dup(ptr " + p + "q)\n",
+      val: p + "d",
+    };
+  }
+  return R { text: "", val: raw };
+}
+
+function lenR(p: string, a0: string): R {
+  return R {
+    text: "  " + p + "g = getelementptr inbounds i8, ptr " + a0 + ", i64 16\n  " + p
+        + "r = load i64, ptr " + p + "g\n",
+    val: p + "r",
+  };
+}
+
+function tagIs(p: string, a0: string, k: usize): R {
+  return R {
+    text: "  " + p + "g = getelementptr inbounds i8, ptr " + a0 + ", i64 12\n  " + p
+        + "t = load i32, ptr " + p + "g\n  " + p + "c = icmp eq i32 " + p + "t, " + u(k) + "\n  "
+        + p + "r = zext i1 " + p + "c to i64\n",
+    val: p + "r",
+  };
+}
+
+function unwrapR(p: string, fn: string, a0: string, rt: MType): R {
+  const call = "  " + p + "r = call i64 @" + fn + "(ptr " + a0 + ")\n";
+  if (isFloatT(rt)) {
+    return R { text: call + "  " + p + "f = bitcast i64 " + p + "r to double\n", val: p + "f" };
+  }
+  const d = dupIf(rt, p, p + "r");
+  return R { text: call + d.text, val: d.val };
+}
+
+// ---------------------------------------------------------------- the emitter
+
+// The function being emitted is one of the program and of the symbol table; its parameters are declared locals.
+@Invariant(this.fi < this.prog.functions.length && this.syms.count() == this.prog.functions.length)
+@Invariant(this.f.paramCount <= this.f.locals.length)
+export class LlvmFunctionEmitter {
+  private syms: LlvmSymbols;
+  private prog: MProgram;
+  private fi: usize;
+  private f: MFunction;
+  private lines: string[];
+
+  constructor(syms: LlvmSymbols, prog: MProgram, fi: usize) {
+    this.syms = syms;
+    this.prog = prog;
+    this.fi = fi;
+    this.f = prog.functions[fi];
+    this.lines = [];
+  }
+
+  private opTy(o: Operand): MType {
+    return match (o) {
+      OLocal(l) => this.f.locals[l].ty,
+      OInt(_) => MInt,
+      OUsize(_) => MUsize,
+      OBool(_) => MBool,
+      OFloat(_) => MFloat,
+      OStr(_) => MRef,
+    };
+  }
+
+  // The load that materialises operand `n` ("" for constants).
+  private ld(p: string, n: usize, o: Operand): string {
+    return match (o) {
+      OLocal(l) => "  " + ov(p, n, o) + " = load " + lty(this.f.locals[l].ty) + ", ptr %l" + u(l)
+          + "\n",
+      _ => "",
+    };
+  }
+
+  private targ(p: string, n: usize, o: Operand): string {
+    return lty(this.opTy(o)) + " " + ov(p, n, o);
+  }
+
+  private loadsOf(p: string, os: Operand[]): string {
+    let s = "";
+    let i: usize = 0;
+    while (i < os.length) {
+      s += this.ld(p, i, os[i]);
+      i += 1;
+    }
+    return s;
+  }
+
+  private argList(p: string, os: Operand[]): string {
+    let parts: string[] = [];
+    let i: usize = 0;
+    while (i < os.length) {
+      parts.push(this.targ(p, i, os[i]));
+      i += 1;
+    }
+    return parts.join(", ");
+  }
+
+  @Requires(d < this.f.locals.length)
+  private st(d: usize, val: string): string {
+    return "  store " + lty(this.f.locals[d].ty) + " " + val + ", ptr %l" + u(d) + "\n";
+  }
+
+  // Slot value as an i64 for the array push helper (references are converted).
+  private asSlot(p: string, n: usize, o: Operand): string {
+    if (isRefT(this.opTy(o))) {
+      return "  " + p + "q" + u(n) + " = ptrtoint ptr " + ov(p, n, o) + " to i64\n";
+    }
+    if (isFloatT(this.opTy(o))) {
+      return "  " + p + "q" + u(n) + " = bitcast double " + ov(p, n, o) + " to i64\n";
+    }
+    return "";
+  }
+
+  private slotVal(p: string, n: usize, o: Operand): string {
+    if (isRefT(this.opTy(o)) || isFloatT(this.opTy(o))) {
+      return p + "q" + u(n);
+    }
+    return ov(p, n, o);
+  }
+
+  private maskOf(os: Operand[]): usize {
+    let refs: bool[] = [];
+    for (const o of os) {
+      refs.push(isRefT(this.opTy(o)));
+    }
+    return refMask(refs);
+  }
+
+  // ---------------------------------------------------------------- operators and builtins
+
+  // IEEE operations on doubles: no traps; `!=` is true for NaN (une), every other comparison false.
+  private binaryF(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
+    const va = ov(p, 0, a);
+    const vb = ov(p, 1, b);
+    const r = p + "r";
+    const pre = this.ld(p, 0, a) + this.ld(p, 1, b);
+    return pre
+        + match (op) {
+          OpAdd => "  " + r + " = fadd double " + va + ", " + vb + "\n" + this.st(d, r),
+          OpSub => "  " + r + " = fsub double " + va + ", " + vb + "\n" + this.st(d, r),
+          OpMul => "  " + r + " = fmul double " + va + ", " + vb + "\n" + this.st(d, r),
+          OpDiv => "  " + r + " = fdiv double " + va + ", " + vb + "\n" + this.st(d, r),
+          _ => "  " + p + "c = fcmp " + fcmpPred(op) + " double " + va + ", " + vb + "\n  " + r
+              + " = zext i1 " + p + "c to i64\n" + this.st(d, r),
+        };
+  }
+
+  private binaryI(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
+    const t = this.opTy(a);
+    if (isFloatT(t)) {
+      return this.binaryF(p, d, op, a, b);
+    }
+    const va = ov(p, 0, a);
+    const vb = ov(p, 1, b);
+    const r = p + "r";
+    const pre = this.ld(p, 0, a) + this.ld(p, 1, b);
+    if (isRefT(t)) {
+      // string equality
+      let s = pre + "  " + r + " = call i64 @orin_str_eq(ptr " + va + ", ptr " + vb + ")\n";
+      if (isNe(op)) {
+        s += "  " + p + "x = xor i64 " + r + ", 1\n" + this.st(d, p + "x");
+        return s;
+      }
+      return s + this.st(d, r);
+    }
+    const usz = isUsizeT(t);
+    return pre
+        + match (op) {
+          OpAdd => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
+          OpSub => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
+          OpMul => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
+          OpDiv => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
+          OpRem => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
+          OpAnd => "  " + r + " = and i64 " + va + ", " + vb + "\n" + this.st(d, r),
+          OpOr => "  " + r + " = or i64 " + va + ", " + vb + "\n" + this.st(d, r),
+          _ => "  " + p + "c = icmp " + cmpPred(op, usz) + " i64 " + va + ", " + vb + "\n  " + r
+              + " = zext i1 " + p + "c to i64\n" + this.st(d, r),
+        };
+  }
+
+  private unaryI(p: string, d: usize, op: UnOp, o: Operand): string {
+    const v = ov(p, 0, o);
+    const pre = this.ld(p, 0, o);
+    if (isFloatT(this.f.locals[d].ty)) {
+      return pre + "  " + p + "r = fneg double " + v + "\n" + this.st(d, p + "r");
+    }
+    return pre
+        + match (op) {
+          UnNot => "  " + p + "c = icmp eq i64 " + v + ", 0\n  " + p + "r = zext i1 " + p
+              + "c to i64\n" + this.st(d, p + "r"),
+          UnNeg => "  " + p + "r = call i64 @orinl_"
+              + (isUsizeT(this.f.locals[d].ty) ? "neg_u" : "neg_i") + "(i64 " + v + ")\n"
+              + this.st(d, p + "r"),
+        };
+  }
+
+  private builtinR(p: string, b: Builtin, args: Operand[], rt: MType): R {
+    const a0 = args.length > 0 ? ov(p, 0, args[0]) : "";
+    const r = p + "r";
+    const name = bname(b);
+    if (name != "") {
+      const ret = bret(b);
+      if (ret == "void") {
+        return R { text: "  call void @" + name + "(" + this.argList(p, args) + ")\n", val: "" };
+      }
+      return R {
+        text: "  " + r + " = call " + ret + " @" + name + "(" + this.argList(p, args) + ")\n",
+        val: r,
+      };
+    }
+    return match (b) {
+      BStrLength => lenR(p, a0),
+      BArrLength => lenR(p, a0),
+      BOptIsSome => tagIs(p, a0, 0),
+      BOptIsNone => tagIs(p, a0, 1),
+      BResIsOk => tagIs(p, a0, 0),
+      BResIsErr => tagIs(p, a0, 1),
+      BOptUnwrap => unwrapR(p, "orin_opt_unwrap", a0, rt),
+      BResUnwrap => unwrapR(p, "orin_res_unwrap", a0, rt),
+      BResUnwrapErr => unwrapR(p, "orin_res_unwrap_err", a0, rt),
+      BIntToFloat => R { text: "  " + r + " = sitofp i64 " + a0 + " to double\n", val: r },
+      BUsizeToFloat => R { text: "  " + r + " = uitofp i64 " + a0 + " to double\n", val: r },
+      BF32Round => R {
+        text: "  " + p + "f = fptrunc double " + a0 + " to float\n  " + r + " = fpext float " + p
+            + "f to double\n",
+        val: r,
+      },
+      BF32ToFloat => R { text: "", val: a0 },
+      BIntId => R { text: "", val: a0 },
+      BFloatFloor => R {
+        text: "  " + r + " = call double @llvm.floor.f64(double " + a0 + ")\n",
+        val: r,
+      },
+      BFloatCeil => R {
+        text: "  " + r + " = call double @llvm.ceil.f64(double " + a0 + ")\n",
+        val: r,
+      },
+      BFloatRound => R {
+        text: "  " + r + " = call double @llvm.round.f64(double " + a0 + ")\n",
+        val: r,
+      },
+      BFloatSqrt => R {
+        text: "  " + r + " = call double @llvm.sqrt.f64(double " + a0 + ")\n",
+        val: r,
+      },
+      BFloatAbs => R {
+        text: "  " + r + " = call double @llvm.fabs.f64(double " + a0 + ")\n",
+        val: r,
+      },
+      BFloatPow => R {
+        text: "  " + r + " = call double @llvm.pow.f64(double " + a0 + ", double "
+            + ov(p, 1, args[1]) + ")\n",
+        val: r,
+      },
+      BFloatIsNaN => R {
+        text: "  " + p + "c = fcmp uno double " + a0 + ", " + a0 + "\n  " + r + " = zext i1 " + p
+            + "c to i64\n",
+        val: r,
+      },
+      BFloatIsFinite => R {
+        text: "  " + p + "a = call double @llvm.fabs.f64(double " + a0 + ")\n  " + p
+            + "c = fcmp olt double " + p + "a, 0x7FF0000000000000\n  " + r + " = zext i1 " + p
+            + "c to i64\n",
+        val: r,
+      },
+      _ => this.unwrapOrR(p, a0, args[1], rt),
+    };
+  }
+
+  private unwrapOrR(p: string, a0: string, dflt: Operand, rt: MType): R {
+    const ty = isRefT(rt) ? "ptr" : isFloatT(rt) ? "double" : "i64";
+    const lt = lbl(p, "Lt");
+    const lf = lbl(p, "Lf");
+    const lj = lbl(p, "Lj");
+    const text = "  " + p + "g = getelementptr inbounds i8, ptr " + a0 + ", i64 12\n  " + p
+        + "t = load i32, ptr " + p + "g\n" + "  " + p + "c = icmp eq i32 " + p + "t, 0\n  br i1 "
+        + p + "c, label %" + lt + ", label %" + lf + "\n" + lt + ":\n" + slotChk(p + "s", a0, 0)
+        + "  " + p + "v = load " + ty + ", ptr " + p + "s\n  br label %" + lj + "\n" + lf
+        + ":\n  br label %" + lj + "\n" + lj + ":\n  " + p + "m = phi " + ty + " [ " + p + "v, %"
+        + lt + " ], [ " + ov(p, 1, dflt) + ", %" + lf + " ]\n";
+    if (isRefT(rt)) {
+      return R {
+        text: text + "  " + p + "d = call ptr @orinl_dup(ptr " + p + "m)\n",
+        val: p + "d",
+      };
+    }
+    return R { text: text, val: p + "m" };
+  }
+
+  // ---------------------------------------------------------------- instructions
+
+  private builtinInstr(p: string, d: Option<usize>, b: Builtin, args: Operand[]): string {
+    const pre = this.loadsOf(p, args);
+    return match (d) {
+      Some(x) => this.builtinStore(p, x, pre, this.builtinR(p, b, args, this.f.locals[x].ty)),
+      None => pre + this.builtinR(p, b, args, MVoid).text,
+    };
+  }
+
+  private builtinStore(p: string, x: usize, pre: string, r: R): string {
+    return pre + r.text + this.st(x, r.val);
+  }
+
+  @Requires(f < this.prog.functions.length && inoutArgOk(this.prog, f, args))
+  private callI(p: string, d: Option<usize>, f: usize, args: Operand[]): string {
+    const pre = this.loadsOf(p, args);
+    const callee = this.prog.functions[f];
+    // in/out receiver (docs/mir.md v1.10): pass the address of the argument's local, the callee stores its final receiver there
+    const outArg = callee.inout ? ", ptr " + operandPtr(args[0]) : "";
+    const call = "call " + lty(callee.ret) + " @" + this.syms.name(f) + "(" + this.argList(p, args)
+        + outArg + ")\n";
+    return pre
+        + match (d) {
+          Some(x) => "  " + p + "r = " + call + this.st(x, p + "r"),
+          None => "  " + call,
+        };
+  }
+
+  private structNewI(p: string, d: usize, tag: usize, slots: Operand[]): string {
+    let s = this.loadsOf(p, slots);
+    const n = p + "n";
+    s += "  " + n + " = call ptr @orin_struct_new(i32 " + u(tag) + ", i32 " + u(slots.length)
+        + ", i64 " + u(this.maskOf(slots)) + ")\n";
+    let k: usize = 0;
+    while (k < slots.length) {
+      s += slotGep(p + "g" + u(k), n, k);
+      s += "  store " + this.targ(p, k, slots[k]) + ", ptr " + p + "g" + u(k) + "\n";
+      k += 1;
+    }
+    return s + this.st(d, n);
+  }
+
+  // Closure (docs/mir.md v1.3): struct { code pointer (scalar slot 0), environment (reference slot 1) }; the
+  // environment is a struct of the captured values (the nullary singleton when nothing is captured).
+  @Requires(f < this.prog.functions.length)
+  private closureI(p: string, d: usize, f: usize, caps: Operand[]): string {
+    let s = this.loadsOf(p, caps);
+    let env = p + "e";
+    if (caps.length > 0) {
+      s += "  " + env + " = call ptr @orin_struct_new(i32 0, i32 " + u(caps.length) + ", i64 "
+          + u(this.maskOf(caps)) + ")\n";
+      let k: usize = 0;
+      while (k < caps.length) {
+        s += slotGep(p + "g" + u(k), env, k);
+        s += "  store " + this.targ(p, k, caps[k]) + ", ptr " + p + "g" + u(k) + "\n";
+        k += 1;
+      }
+    } else {
+      s += "  " + env + " = call ptr @orin_nullary(i32 0)\n";
+    }
+    const n = p + "n";
+    s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+    s += slotGep(p + "c0", n, 0) + "  store ptr @" + this.syms.name(f) + ", ptr " + p + "c0\n";
+    s += slotGep(p + "c1", n, 1) + "  store ptr " + env + ", ptr " + p + "c1\n";
+    return s + this.st(d, n);
+  }
+
+  // Call through a closure: load code pointer and environment, call with the environment first.
+  private callIndirectI(p: string, d: Option<usize>, f: Operand, args: Operand[]): string {
+    let s = this.ld(p, 0, f);
+    let all: string[] = [];
+    let k: usize = 0;
+    while (k < args.length) {
+      s += this.ld(p, k + 1, args[k]);
+      all.push(this.targ(p, k + 1, args[k]));
+      k += 1;
+    }
+    const cv = ov(p, 0, f);
+    s += slotChk(p + "c0", cv, 0) + "  " + p + "fp = load ptr, ptr " + p + "c0\n";
+    s += slotChk(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+    const rt = match (d) {
+      Some(x) => lty(this.f.locals[x].ty),
+      None => "void",
+    };
+    let argl = "ptr " + p + "ev";
+    if (all.length > 0) {
+      argl += ", " + all.join(", ");
+    }
+    const call = "call " + rt + " " + p + "fp(" + argl + ")\n";
+    return s
+        + match (d) {
+          Some(x) => "  " + p + "r = " + call + this.st(x, p + "r"),
+          None => "  " + call,
+        };
+  }
+
+  // Interface value (docs/mir.md v1.5, ADR-0019): struct { vtable pointer (scalar slot 0), boxed value
+  // (reference slot 1) }; the vtable is the constant table `@orin_vtN`.
+  @Requires(vt < this.syms.vtables())
+  private ifaceI(p: string, d: usize, vt: usize, v: Operand): string {
+    let s = this.loadsOf(p, [v]);
+    const n = p + "n";
+    s += "  " + n + " = call ptr @orin_struct_new(i32 0, i32 2, i64 2)\n";
+    s += slotGep(p + "c0", n, 0) + "  store ptr @orin_vt" + u(vt) + ", ptr " + p + "c0\n";
+    s += slotGep(p + "c1", n, 1) + "  store " + this.targ(p, 0, v) + ", ptr " + p + "c1\n";
+    return s + this.st(d, n);
+  }
+
+  // Call through the vtable of an interface value: load the table and the boxed value, call entry `slot`
+  // with the boxed value first.
+  private callVirtualI(
+    p: string,
+    d: Option<usize>,
+    r: Operand,
+    slot: usize,
+    args: Operand[],
+  ): string {
+    let s = this.ld(p, 0, r);
+    let all: string[] = [];
+    let k: usize = 0;
+    while (k < args.length) {
+      s += this.ld(p, k + 1, args[k]);
+      all.push(this.targ(p, k + 1, args[k]));
+      k += 1;
+    }
+    const cv = ov(p, 0, r);
+    s += slotChk(p + "c0", cv, 0) + "  " + p + "vt = load ptr, ptr " + p + "c0\n";
+    s += slotChk(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+    s += "  " + p + "fg = getelementptr inbounds ptr, ptr " + p + "vt, i64 " + u(slot) + "\n";
+    s += "  " + p + "fp = load ptr, ptr " + p + "fg\n";
+    const rt = match (d) {
+      Some(x) => lty(this.f.locals[x].ty),
+      None => "void",
+    };
+    let argl = "ptr " + p + "ev";
+    if (all.length > 0) {
+      argl += ", " + all.join(", ");
+    }
+    const call = "call " + rt + " " + p + "fp(" + argl + ")\n";
+    return s
+        + match (d) {
+          Some(x) => "  " + p + "r = " + call + this.st(x, p + "r"),
+          None => "  " + call,
+        };
+  }
+
+  private arrayNewI(p: string, d: usize, isRef: bool, es: Operand[]): string {
+    let s = this.loadsOf(p, es);
+    const n = p + "n";
+    s += "  " + n + " = call ptr @orin_array_new(i64 " + u(es.length) + ", i64 "
+        + (isRef ? "1" : "0") + ")\n";
+    let k: usize = 0;
+    while (k < es.length) {
+      s += this.asSlot(p, k, es[k]);
+      s += "  call void @orinl_array_push(ptr " + n + ", i64 " + this.slotVal(p, k, es[k]) + ")\n";
+      k += 1;
+    }
+    return s + this.st(d, n);
+  }
+
+  // store `v` (operand n) to `slot`; if it is a reference, release the old value first read.
+  private replaceI(p: string, slot: string, n: usize, v: Operand): string {
+    if (isRefT(this.opTy(v))) {
+      return "  " + p + "old = load ptr, ptr " + slot + "\n  store ptr " + ov(p, n, v) + ", ptr "
+          + slot + "\n  call void @orinl_release(ptr " + p + "old)\n";
+    }
+    return "  store " + lty(this.opTy(v)) + " " + ov(p, n, v) + ", ptr " + slot + "\n";
+  }
+
+  private instrI(p: string, i: Instr): string {
+    return match (i) {
+      ICopy(d, o) => this.ld(p, 0, o) + this.st(d, ov(p, 0, o)),
+      IMove(d, s) => this.moveI(p, d, s),
+      IBorrow(d, s) => this.moveI(p, d, s),
+      IDup(d, o) => this.ld(p, 0, o) + "  " + p + "r = call ptr @orinl_dup(ptr " + ov(p, 0, o)
+          + ")\n" + this.st(d, p + "r"),
+      IRelease(x) => "  " + p + "r = load ptr, ptr %l" + u(x) + "\n  call void @orinl_release(ptr "
+          + p + "r)\n",
+      IUnary(d, op, o) => this.unaryI(p, d, op, o),
+      IBinary(d, op, a, b) => this.binaryI(p, d, op, a, b),
+      ICall(d, f, args) => this.callI(p, d, f, args),
+      IBuiltin(d, b, args) => this.builtinInstr(p, d, b, args),
+      IStrAppend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
+          + p + "r = call ptr @orin_str_append(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
+          + this.st(x, p + "r"),
+      IArrayExtend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y)
+          + "  " + p + "r = call ptr @orin_array_extend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
+          + this.st(x, p + "r"),
+      IStructNew(d, tag, slots) => this.structNewI(p, d, tag, slots),
+      INullary(d, t) => "  " + p + "r = call ptr @orin_nullary(i32 " + u(t) + ")\n"
+          + this.st(d, p + "r"),
+      ITag(d, o) => this.ld(p, 0, o) + "  " + p + "g = getelementptr inbounds i8, ptr "
+          + ov(p, 0, o) + ", i64 12\n  " + p + "t = load i32, ptr " + p + "g\n  " + p
+          + "r = zext i32 " + p + "t to i64\n" + this.st(d, p + "r"),
+      IGetField(d, o, k) => this.ld(p, 0, o) + slotChk(p + "g", ov(p, 0, o), k) + "  " + p
+          + "r = load " + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n" + this.st(d, p + "r"),
+      ISetField(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, v)
+          + slotChk(p + "g", p + "x", k) + this.replaceI(p, p + "g", 1, v),
+      ITakeField(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n"
+          + slotChk(p + "g", p + "x", k) + "  " + p + "r = load ptr, ptr " + p
+          + "g\n  store ptr null, ptr " + p + "g\n" + this.st(d, p + "r"),
+      IPutField(x, k, s) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
+          + "s = load ptr, ptr %l" + u(s) + "\n" + slotChk(p + "g", p + "x", k) + "  store ptr " + p
+          + "s, ptr " + p + "g\n",
+      IMakeUnique(x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
+          + "r = call ptr @orinl_make_unique(ptr " + p + "x)\n" + this.st(x, p + "r"),
+      IArrayNew(d, r, es) => this.arrayNewI(p, d, r, es),
+      IArrayGet(d, a, k) => this.ld(p, 0, a) + this.ld(p, 1, k) + "  " + p
+          + "g = call ptr @orinl_array_slot(ptr " + ov(p, 0, a) + ", i64 " + ov(p, 1, k) + ")\n"
+          + "  " + p + "r = load " + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n"
+          + this.st(d, p + "r"),
+      IArraySet(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
+          + this.ld(p, 2, v) + "  " + p + "g = call ptr @orinl_array_slot(ptr " + p + "x, i64 "
+          + ov(p, 1, k) + ")\n" + this.replaceI(p, p + "g", 2, v),
+      IArrayTake(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
+          + "  " + p + "g = call ptr @orinl_array_slot(ptr " + p + "x, i64 " + ov(p, 1, k) + ")\n"
+          + "  " + p + "r = load ptr, ptr " + p + "g\n  store ptr null, ptr " + p + "g\n"
+          + this.st(d, p + "r"),
+      IArrayPut(x, k, s) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
+          + "  " + p + "s = load ptr, ptr %l" + u(s) + "\n" + "  " + p
+          + "g = call ptr @orinl_array_slot(ptr " + p + "x, i64 " + ov(p, 1, k) + ")\n  store ptr "
+          + p + "s, ptr " + p + "g\n",
+      IArrayPush(x, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, v)
+          + this.asSlot(p, 1, v) + "  " + p + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n"
+          + "  call void @orinl_array_push(ptr " + p + "u, i64 " + this.slotVal(p, 1, v) + ")\n"
+          + this.st(x, p + "u"),
+      IArrayPop(d, x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
+          + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n" + this.st(x, p + "u") + "  " + p
+          + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + this.st(d, p + "r"),
+      IClosure(d, f, caps) => this.closureI(p, d, f, caps),
+      ICallIndirect(d, f, args) => this.callIndirectI(p, d, f, args),
+      IIface(d, vt, v) => this.ifaceI(p, d, vt, v),
+      ICallVirtual(d, r, slot, args) => this.callVirtualI(p, d, r, slot, args),
+    };
+  }
+
+  private moveI(p: string, d: usize, s: usize): string {
+    return "  " + p + "r = load ptr, ptr %l" + u(s) + "\n" + this.st(d, p + "r");
+  }
+
+  @Requires(targetsBelow(t, this.f.blocks.length))
+  private termI(p: string, t: Terminator): string {
+    return match (t) {
+      TGoto(b) => "  br label %B" + u(b) + "\n",
+      TBranch(c, a, b) => this.ld(p, 0, c) + "  " + p + "c = icmp ne i64 " + ov(p, 0, c)
+          + ", 0\n  br i1 " + p + "c, label %B" + u(a) + ", label %B" + u(b) + "\n",
+      TSwitch(o, cases, d) => this.switchI(p, o, cases, d),
+      TReturn(o) => {
+        const outStore = this.f.inout
+            ? "  " + p + "o = load ptr, ptr %l0\n  store ptr " + p + "o, ptr %pout\n"
+            : "";
+        return match (o) {
+          Some(x) => this.ld(p, 0, x) + outStore + "  ret " + this.targ(p, 0, x) + "\n",
+          None => outStore + "  ret void\n",
+        };
+      },
+      TTrap(m) => "  call void @orin_trap(ptr @.m" + u(this.syms.message(m)) + ")\n  unreachable\n",
+    };
+  }
+
+  private switchI(p: string, o: Operand, cases: SwitchCase[], d: usize): string {
+    let s = this.ld(p, 0, o) + "  switch i64 " + ov(p, 0, o) + ", label %B" + u(d) + " [";
+    for (const k of cases) {
+      s += " i64 " + k.value.toString() + ", label %B" + u(k.target);
+    }
+    return s + " ]\n";
+  }
+
+  // ---------------------------------------------------------------- functions
+
+  // Emits the whole function: the signature, the `entry` block with one `alloca` per local (non-parameters
+  // zero-initialised, parameters stored), the blocks `B<i>`.
+  // One line for the signature, two per local (alloca, initialising store), the branch to B0, a label and a terminator
+  // per block, one per instruction, the closing brace: a block or local that is skipped or emitted twice shows.
+  @Requires(this.lines.length == 0)
+  @Ensures(this.lines.length == 3 + 2 * this.f.locals.length + linesOfBlocks(this.f.blocks))
+  run(): void {
+    const name = this.syms.name(this.fi);
+    const f = this.f;
+    let out: string[] = [];
+    // ADR-0038 step 1: every value is initialised (`noundef`) and a reference is never null (`nonnull`); no function unwinds.
+    let sig = "define internal " + attrTy(f.ret) + " @" + name + "(";
+    let i: usize = 0;
+    while (i < f.paramCount) {
+      if (i > 0) {
+        sig += ", ";
+      }
+      sig += paramTy(f.locals[i].ty) + " %p" + u(i);
+      i += 1;
+    }
+    if (f.inout) {
+      sig += ", ptr noundef nonnull %pout";
+    }
+    sig += isInlineFn(this.prog, f.name)
+        ? ") alwaysinline nounwind {\nentry:\n"
+        : ") nounwind {\nentry:\n";
+    out.push(sig);
+    i = 0;
+    while (i < f.locals.length) {
+      const t = lty(f.locals[i].ty);
+      out.push("  %l" + u(i) + " = alloca " + t + ", align 8\n");
+      if (i >= f.paramCount) {
+        out.push(
+          "  store " + t + " "
+              + (isRefT(f.locals[i].ty) ? "null" : isFloatT(f.locals[i].ty) ? "0.0" : "0")
+              + ", ptr %l" + u(i) + "\n",
+        );
+      }
+      i += 1;
+    }
+    i = 0;
+    while (i < f.paramCount) {
+      const t = lty(f.locals[i].ty);
+      out.push("  store " + t + " %p" + u(i) + ", ptr %l" + u(i) + "\n");
+      i += 1;
+    }
+    out.push("  br label %B0\n");
+    let b: usize = 0;
+    for (const blk of f.blocks) {
+      out.push("B" + u(b) + ":\n");
+      let k: usize = 0;
+      for (const ins of blk.instrs) {
+        out.push(this.instrI("%b" + u(b) + "i" + u(k), ins));
+        k += 1;
+      }
+      out.push(this.termI("%b" + u(b) + "t", blk.term));
+      b += 1;
+    }
+    out.push("}\n\n");
+    this.lines = out;
+  }
+
+  // The text emitted so far.
+  text(): string {
+    return this.lines.join("");
+  }
+}
+
+// The IR definition of function `fi`: a function of the symbol table and the program only, so the functions of a program
+// can be emitted independently and joined in index order. It defines the function's own symbol and refers only to globals
+// the module declares.
+@Requires(fi < prog.functions.length
+    && syms.count() == prog.functions.length
+    && trapsIndexed(prog, syms))
+@Ensures(result.startsWith("define internal ")
+    && result.includes(" @" + syms.name(fi) + "(")
+    && result.endsWith("}\n\n"))
+@Ensures(llvmRefsDeclared(result, syms))
+export function emitLlvmFunction(syms: LlvmSymbols, prog: MProgram, fi: usize): string {
+  let e = new LlvmFunctionEmitter(syms, prog, fi);
+  e.run();
+  return e.text();
+}
