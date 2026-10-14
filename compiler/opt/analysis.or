@@ -105,7 +105,15 @@ export function successors(t: Terminator): usize[] {
   return match (t) {
     TGoto(b) => [b],
     TBranch(_, a, b) => [a, b],
-    TSwitch(_, cs, d) => cs.map(c => c.target).concat([d]),
+    TSwitch(_, cs, d) => {
+      // a loop: the liveness fixpoints call this for every block in every round
+      let out: usize[] = [];
+      for (const c of cs) {
+        out.push(c.target);
+      }
+      out.push(d);
+      return out;
+    },
     TReturn(_) => [],
     TTrap(_) => [],
   };
@@ -118,8 +126,14 @@ export function isRefTy(t: MType): bool {
   };
 }
 
+// A loop (not `includes`): `affects` calls it for every use of every instruction a pass scans.
 export function contains(xs: usize[], x: usize): bool {
-  return xs.includes(x);
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Source local of a borrowed projection `d = obj`, when d is a reference and obj a local.
@@ -183,24 +197,64 @@ export function ancestorsClosed(f: MFunction, anc: usize[][]): bool {
 @Requires(blocksLocalsBelow(f.blocks, f.locals.length) && tablesAgree(f))
 @Ensures(ancestorsClosed(f, result))
 export function ancestors(f: MFunction): usize[][] {
-  let anc: usize[][] = f.locals.map(l => []);
-  const edges = borrowEdges(f);
+  // the edges as two parallel index arrays (not `borrowEdges`' records): this runs once per parameter and pass
+  let anc: usize[][] = [];
+  let k: usize = 0;
+  while (k < f.locals.length) {
+    anc.push([]);
+    k += 1;
+  }
+  let ed: usize[] = [];
+  let eo: usize[] = [];
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IBorrow(d, s) => {
+          ed.push(d);
+          eo.push(s);
+        },
+        IGetField(d, o, _) => {
+          match (edgeSrc(f, d, o)) {
+            Some(l) => {
+              ed.push(d);
+              eo.push(l);
+            },
+            None => {},
+          }
+        },
+        IArrayGet(d, o, _) => {
+          match (edgeSrc(f, d, o)) {
+            Some(l) => {
+              ed.push(d);
+              eo.push(l);
+            },
+            None => {},
+          }
+        },
+        _ => {},
+      }
+    }
+  }
   let changed = true;
   while (changed) {
     changed = false;
-    for (const e of edges) {
-      let cur = anc[e.d];
-      if (!cur.includes(e.src)) {
-        cur.push(e.src);
+    let e: usize = 0;
+    while (e < ed.length) {
+      const d = ed[e];
+      const o = eo[e];
+      let cur = anc[d];
+      if (!contains(cur, o)) {
+        cur.push(o);
         changed = true;
       }
-      for (const a of anc[e.src]) {
-        if (!cur.includes(a)) {
+      for (const a of anc[o]) {
+        if (!contains(cur, a)) {
           cur.push(a);
           changed = true;
         }
       }
-      anc[e.d] = cur;
+      anc[d] = cur;
+      e += 1;
     }
   }
   return anc;
@@ -222,7 +276,12 @@ export function usesAffecting(anc: usize[][], ins: Instr, x: usize): bool {
 }
 
 export function termUsesAffecting(anc: usize[][], t: Terminator, x: usize): bool {
-  return termUses(t).some(u => affects(anc, u, x));
+  for (const u of termUses(t)) {
+    if (affects(anc, u, x)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The optimiser's use / definition tables agree with the lowering's independent table of the locals an instruction
@@ -281,5 +340,12 @@ export function countsOf(f: MFunction): Counts {
 
 // Is block 0 the target of some terminator?
 export function entryHasPredecessor(f: MFunction): bool {
-  return f.blocks.some(blk => successors(blk.term).includes(0));
+  for (const blk of f.blocks) {
+    for (const s of successors(blk.term)) {
+      if (s == 0) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
