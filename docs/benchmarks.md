@@ -385,3 +385,10 @@ Elision: none on reads. Unchecked `orin_struct_init` is used only for the initia
 variant payloads in the legacy codegen), where the index is a loop counter below the constant `n` passed to the
 allocation; the LLVM closure/interface constructors use the same reasoning (`slotGep`). Everything else is checked,
 including `IPutField` (a put after a take) and struct-literal/update stores in the legacy codegen.
+
+## Concurrency stage 0 (ADR-0017): cost of the thread-local runtime state
+
+Per-task heap state (`__thread` counters, free lists, work stack) replaced globals. Same generated C, old runtime (commit d55461c) vs
+current, executed instructions (callgrind): fib 1.0000, sieve 1.0000, nbody 1.0000, strings 1.0138, wordfreq 1.0132, mapfreq 1.0159,
+qsort_func 1.0143, bintrees 1.0197. The counters use the `local-exec` TLS model (one instruction per update); with the default model
+the cost was up to 1.05. Task micro-benchmarks (`bench/tasks`) and the rest: docs/concurrency.md "Measurements".

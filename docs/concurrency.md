@@ -180,7 +180,7 @@ allocated.
 | `tools/test_osig.py` section 8 | the task events of the OSIG |
 | `runtime/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
 | `platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
-| `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
+| `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `panic_chain.or`, `panic_many.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; a panic crossing three tasks and 300 simultaneous unjoined panics (exit status 101, no hang or crash under the sanitizers); no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
 | `tools/test_concurrency.sh` | all C tests and the stress tests plain, under **ThreadSanitizer** and under **ASan + UBSan**; `tools/verify_platform.sh` also runs the platform tests under ThreadSanitizer. CI: `ci_local.sh` steps "concurrency (tsan, asan)" and "platform layer" |
 
 ## Measurements
@@ -188,7 +188,31 @@ allocated.
 Machine: 4 cores shared with other workers (load average 12-14 while measuring), gcc 13 `-O2`, Linux. Numbers are medians
 unless stated; the wall-clock ones are noisy.
 
-MEASUREMENTS
+**Cost for programs that never start a task (the thread-local heap state).** The same generated C of eight benchmarks linked once
+with the runtime of the commit before this work and once with the current one, counted in executed instructions with callgrind
+(deterministic, immune to the load): `fib` 1.0000, `sieve` 1.0000, `nbody` 1.0000, `strings` 1.0138, `wordfreq` 1.0132, `mapfreq`
+1.0159, `qsort_func` 1.0143, `bintrees` 1.0197 (the allocation-heavy ones pay for the free-list counters of the per-task cap). A first
+version with the default TLS model cost up to +5% (an extra load per counter update in a position-independent executable);
+the counters now use the `local-exec` model on ELF targets, which is valid because the runtime is always linked into one
+executable. Wall-clock medians of 9 interleaved runs ranged 0.90-1.17 (noise under a load average of 12-14, no systematic
+difference; `docs/benchmarks.md` has the method).
+
+**Tasks (`bench/tasks/main.or`, `-O2`, load average about 12).** Spawn + join of a task: about 83 us (20,000 tasks in 1.66 s; 1.1 s of it
+system time: thread creation and stack mapping). Channel ping-pong between two tasks over capacity-1 channels: about 3.7 us per
+message (200,000 messages in 0.74 s). One producer, one consumer, capacity 64: about 1.5 us per message (1,000,000 in 1.46 s). Stress:
+23,254 tasks and 40,000 + 40,000 messages in 2.1 s plain.
+
+**Move versus copy (`build/mvbench` style, 1,000,000 ints and 100,000 strings).** Copying an `int[]` of 1,000,000 elements through a
+channel costs about 3.5 ms, a `string[]` of 100,000 elements about 14 ms (one allocation per string); a moved value costs the
+uniqueness walk only and was not measurable next to building the value (1.0 s vs 0.93 s for 200 builds of the array).
+
+**Parallel speedup on 4 cores (`examples/parallel_map.or`, Collatz steps of 1..1,500,000, 4 tasks).** **Not demonstrated on this
+machine.** Four cores were shared with other workers (load average 8-14), so the wall-clock ratio sequential / parallel measured
+0.74-1.17 over 14 runs (median about 1.0) and the whole process received only about 55-65% of one core
+(`time`: real 2.0 s, user 1.1 s). What the runs do show: the parallel and the sequential result are equal in every run, and
+the CPU time of the parallel version is the same as the sequential one (user 1.21 s against 1.10 s: no copying or locking
+overhead that would eat a speedup; the chunks are moved or copied once). The experiment has to be repeated on an idle machine
+(`orin run examples/parallel_map.or 3000000 4`); no speedup number is claimed here.
 
 ## Friction found while building it
 
