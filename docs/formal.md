@@ -427,7 +427,7 @@ the conformance suite. Extending `Check.lean` with a linear "open set" is a smal
 ## L0 platform layer (spec 19 R2)
 
 `platform/orin_platform.{h,c}` is the closed list of primitives through which the runtime touches the OS and
-libc (613 lines including contracts; budget 1,000). Each function has an ACSL-style block (`requires`,
+libc (700 code lines, 1,100 lines including contracts and comments; the budget of 1,000 counts code lines, ADR-0030). Each function has an ACSL-style block (`requires`,
 `ensures`, `assigns`; pseudo-locations `\stdout`, `\stdin`, `\fs`, `\process`). **No tool has checked these
 blocks as ACSL** (Frama-C/WP was not tried); they are the written specification and the intended input for R4.
 
@@ -438,6 +438,7 @@ What is established today, by label (spec 07):
 | `mem_copy/move/set/cmp` (inline wrappers over libc), `alloc/realloc/free` | bounded-verified against their contracts, *assuming CBMC's model of libc `memcpy`/`memmove`/`memset`/`memcmp`/`malloc`/`realloc`* | `harness_mem`, `harness_alloc` (arrays up to 6 bytes, allocation size up to 8; contents nondeterministic; success and failure of `malloc` both explored; frame conditions checked for `mem_move`) |
 | `mem_find` | bounded-verified (plain C loops, no libc): first occurrence / NULL exactly as in the contract | `harness_mem_find`: haystack and needle up to 6 bytes, all contents |
 | `fmt_u64`, `fmt_i64` | bounded-verified: 1..20 digits, no leading zeros, sign, digits read back to the value, no buffer overrun, no overflow (negation done without wrapping) | `harness_fmt_*`: all values with magnitude < 10^6; `harness_fmt_extremes`: `UINT64_MAX`, `INT64_MAX`, `INT64_MIN`, 0, -1. A full 64-bit nondeterministic run did not finish in 20 minutes (SAT blow-up of 64-bit division), so values >= 10^6 are covered by those concrete extremes, a 689-check test and the self-compile, not by the solver |
+| `thread_create/join/exit/id`, `monitor_new/free/lock/unlock/wait/notify/get/set/grow`, `runtime_lock/unlock` (ADR-0017 stage 0), the stdout lock inside `write/write_line/flush` | **tested only** | contracts in the header; `platform_test.c` (54 checks): handle validation (stale, forged, joined twice, freed), the lock discipline (`get`/`set` need the lock, relock refused, unlock by a non-holder refused), mutual exclusion of 8 threads x 5,000 increments, two condition queues with `notify_one` / `notify_all`, a thread that ends holding a monitor, concurrent stdout; the same under **ThreadSanitizer** (`tools/verify_platform.sh`). CBMC cannot model threads and mutexes, so there is no bounded proof; a proof needs a concurrency-aware C verifier and an OS model |
 | `init, arg_count, arg, getenv, at_exit, exit, abort, shell`, `write, write_line, flush, stdin_read, stdin_getc`, `file_read/write/exists`, `stream_open/read/getc/write/flush/error/close` (ADR-0025), `error_message` | **tested only** | `platform/tests/platform_test.c` (689 checks): error paths (missing file, directory, NUL in path, unwritable directory, `/dev/full`, short read, EOF stickiness, byte 0xff vs EOF), ordering of stdout/stderr, exit flushing, abort signal, shell statuses, `at_exit` order; also run under ASan+UBSan. CBMC cannot say anything useful about stdio/stat/system (stubs), so these wrap-the-OS functions are trusted |
 
 Reproduce: `tools/verify_platform.sh` (tests, size budget, boundary check, CBMC when installed: `apt install cbmc`,
@@ -447,6 +448,6 @@ non-freestanding include in `runtime/`); that check is a grep-level guard, not a
 function-pointer to libc would not be seen).
 
 Limits, stated plainly: the bounds are small; CBMC checks the C as compiled for the host data model (LP64);
-single-threaded use is assumed; `error_message` returns `strerror`'s buffer; the contracts of the OS-facing
+the platform functions may now be called from several threads (ADR-0017: the stdout buffer is locked, the thread / monitor tables have their own locks), which only the ThreadSanitizer runs examine; `error_message` returns `strerror`'s buffer; the contracts of the OS-facing
 functions are not proved; and L1 proofs may only assume these contracts as axioms for the functions labelled
 tested only.

@@ -1,6 +1,26 @@
 # Changelog
 
 ## Unreleased
+- **Concurrency, stage 0 (ADR-0017 Addendum A; docs/concurrency.md).** New module `std:task`, written in Orin: structured
+  `scope` / `spawn` / `TaskHandle.join`, bounded `channel<T>(capacity)` with `Sender` / `Receiver` (`send`, `recv`, `close`),
+  `parallelMap`, and `scopeFs` / `spawnFs` (also process, stdio, clock) that MOVE a derived grant into a task (ADR-0027 Q10, smallest
+  sound form, no new syntax). Tasks are isolated threads with their own heaps: a value crossing a task boundary is moved if its
+  whole graph is uniquely owned, else deep-copied; reference counts stay non-atomic; a panic in a task is a trap of the joiner
+  (`task panicked: <message>`), at `join` or when the scope ends, never lost. Layers: scheduler bookkeeping, channel buffers, join
+  results and scopes are Orin (508 code lines in `std:task` and the pure `std:taskcore`, 8 invariants, 26 contract clauses, a 16-mutant check); **L0 (C, forever)** gains thread create / join /
+  exit and handle-checked monitors (mutex, two condition queues, integer words), +243 code lines, L0 total 700 of 1,000 (the
+  budget now counts code lines, not comments or contracts, ADR-0030); **runtime C (temporary, 342 code lines)** is one
+  interface, `orin_rt_transfer_*` / `orin_rt_task_*` / `orin_rt_heap_exit`, with a 1:1 porting table to Orin R3 functions
+  (docs/concurrency.md, ADR-0017 Addendum A). Runtime made thread-safe: per-task free lists, counters, work stack, grant and file
+  tables (`ORIN_STATS` adds `transfer_moves`, `transfer_copies`, `tasks_spawned`), immortal singletons published by compare-and-swap,
+  the stdout buffer locked, grant handles carry the owning task. Compiler: one builtin `BTask(k)`; checker rules **E0481** (task
+  body captures a `Scope`), **E0482** (`channel(0)`), **E0483** (task body captures a resource handle); MIR v1.10 (`grantClone`
+  opener, `grantMove` closer, `grantAdopt*` opener: a handle moves exactly once on every path; 14 verifier cases); OSIG events
+  (`Task.Spawn` / `Task.Join` CONTROL, `Channel.Send` OUTPUT, `Channel.Receive` INPUT). Tests: 10 run + 5 error conformance programs
+  (all backend modes), 10 `@Test` + 4 expect-trap, stress tests (3,000 live tasks, 40,000 messages), C tests, everything under
+  ThreadSanitizer and ASan + UBSan (`tools/test_concurrency.sh`). Example `examples/parallel_map.or`. Assurance: the C parts are
+  `TESTED_ONLY` (ThreadSanitizer, no proof) until R3 / R4 (docs/assurance.md C17). Not in stage 0: `async` / `await`, cancellation,
+  timeouts, deadlock detection, an M:N scheduler, a concurrent HTTP server (`std:net` has not landed).
 - **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0036).** `orin verify --contracts` now encodes arrays
   (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
   `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by

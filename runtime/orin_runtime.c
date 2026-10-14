@@ -9,7 +9,7 @@
  * and free lists need no atomics. Moving an object to another task's heap is safe because a block is just malloc memory
  * (freed on any thread). The process-wide totals of finished tasks are g_fold / g_fold_live. */
 static __thread int64_t g_live;
-__thread OrinStats orin_stats;
+__thread OrinStats orin_stats __attribute__((tls_model("local-exec")));
 static OrinStats g_fold;
 static int64_t g_fold_live;
 
@@ -127,9 +127,14 @@ void orin_trap(const char *msg) {
 #endif
 #ifndef ORIN_NO_FREELIST
 enum { FL_STRUCT_CLASSES = 9 }; /* nslots 0..8 */
+/* A free list holds at most FL_CAP objects: a task that frees more than it allocates (the consumer of a channel) must not hoard
+ * the memory of a producer that keeps allocating; beyond the cap an object goes back to the allocator. fl_n[FL_STRUCT_CLASSES]
+ * counts the array headers. */
+enum { FL_CAP = 1 << 18 };
 typedef struct FreeNode { struct FreeNode *next; } FreeNode;
 static __thread FreeNode *fl_struct[FL_STRUCT_CLASSES];
 static __thread FreeNode *fl_array;
+static __thread uint32_t fl_n[FL_STRUCT_CLASSES + 1];
 #endif
 
 static void *xmalloc(size_t n) {
@@ -179,11 +184,14 @@ void orin_destroy(OrinObj *o) {
             orin_stats.live_bytes -= sizeof(OrinArray) + a->cap * 8;
             orin_platform_free(a->items);
 #ifndef ORIN_NO_FREELIST
-            ((FreeNode *)x)->next = fl_array;
-            fl_array = (FreeNode *)x;
-            g_live--;
-            orin_stats.frees++;
-            continue;
+            if (fl_n[FL_STRUCT_CLASSES] < FL_CAP) {
+                ((FreeNode *)x)->next = fl_array;
+                fl_array = (FreeNode *)x;
+                fl_n[FL_STRUCT_CLASSES]++;
+                g_live--;
+                orin_stats.frees++;
+                continue;
+            }
 #endif
             break;
         }
@@ -193,9 +201,10 @@ void orin_destroy(OrinObj *o) {
                 if ((s->refmask >> i) & 1) DEC(ORIN_REF(s->slots[i]));
             orin_stats.live_bytes -= sizeof(OrinStruct) + (uint64_t)s->nslots * 8;
 #ifndef ORIN_NO_FREELIST
-            if (s->nslots < FL_STRUCT_CLASSES) {
+            if (s->nslots < FL_STRUCT_CLASSES && fl_n[s->nslots] < FL_CAP) {
                 ((FreeNode *)x)->next = fl_struct[s->nslots];
                 fl_struct[s->nslots] = (FreeNode *)x;
+                fl_n[s->nslots]++;
                 g_live--;
                 orin_stats.frees++;
                 continue;
@@ -224,6 +233,7 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     if (nslots < FL_STRUCT_CLASSES && fl_struct[nslots]) {
         FreeNode *n = fl_struct[nslots];
         fl_struct[nslots] = n->next;
+        fl_n[nslots]--;
         s = (OrinStruct *)n;
     } else
 #endif
@@ -713,6 +723,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     if (fl_array) {
         a = (OrinArray *)fl_array;
         fl_array = fl_array->next;
+        fl_n[FL_STRUCT_CLASSES]--;
     } else
 #endif
         a = (OrinArray *)xmalloc(sizeof(OrinArray));
@@ -1494,11 +1505,13 @@ void orin_rt_heap_exit(void) {
         while (fl_struct[c]) {
             FreeNode *n = fl_struct[c];
             fl_struct[c] = n->next;
+            fl_n[c]--;
             orin_platform_free(n);
         }
     while (fl_array) {
         FreeNode *n = fl_array;
         fl_array = n->next;
+        fl_n[FL_STRUCT_CLASSES]--;
         orin_platform_free(n);
     }
 #endif

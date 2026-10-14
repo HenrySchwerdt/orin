@@ -3,7 +3,8 @@
 #   1. runtime/tests/task_test.c (transfer by move / copy, task start / join / trap, monitors, grants moved into a task):
 #      plain, ThreadSanitizer, and AddressSanitizer + UBSan;
 #   2. every tests/concurrency/*.or (thousands of tasks, tens of thousands of messages), compiled by the self-hosted compiler
-#      and run plain, under ThreadSanitizer and under ASan + UBSan; the output must equal the .out file.
+#      and run plain, under ThreadSanitizer and under ASan + UBSan; the output must equal the .out file and the plain run must
+#      leave no live object at exit (ORIN_STATS=1: allocations and frees of all tasks cancel out).
 # The platform layer has its own ThreadSanitizer run (tools/verify_platform.sh). Needs the compiler (tools/bootstrap.sh).
 #   tools/test_concurrency.sh [--quick]     --quick: only the plain and ThreadSanitizer builds of the Orin tests
 # Honest limit: ThreadSanitizer finds the races that HAPPEN in these runs; a clean run is evidence, not a proof (the C
@@ -44,6 +45,9 @@ for t in tests/concurrency/*.or; do
   $CC -O1 -w -I runtime $B/$n.c $RT -lm -o $B/$n
   timeout 120 $B/$n > $B/$n.actual
   cmp "tests/concurrency/$n.out" $B/$n.actual || { echo "[concurrency] FAIL $n (plain): output differs"; diff "tests/concurrency/$n.out" $B/$n.actual | head; exit 1; }
+  # no leak on the normal path: allocations of every task and frees of every task (also across tasks) cancel out
+  ORIN_STATS=1 timeout 120 $B/$n 2> $B/$n.stats > /dev/null
+  grep -q '"live_objs_at_exit":0' $B/$n.stats || { echo "[concurrency] FAIL $n: objects still live at exit"; cat $B/$n.stats; exit 1; }
   $CC -g -O1 -w -fsanitize=thread -I runtime $B/$n.c $RT -lm -o $B/$n.tsan
   run_tsan timeout 600 $B/$n.tsan > $B/$n.tsan.actual
   cmp "tests/concurrency/$n.out" $B/$n.tsan.actual || { echo "[concurrency] FAIL $n (tsan): output differs"; exit 1; }

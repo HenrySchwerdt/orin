@@ -39,6 +39,7 @@
 // blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
 // A panic in the BODY of a scope (not in a task) is not unwound: tasks still running keep running until the process ends.
 
+import { Ring, Ledger } from "std:taskcore";
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
@@ -63,6 +64,8 @@ function takeBox<T>(tok: usize): T {
   return b.v;
 }
 
+export { Ring, Ledger } from "std:taskcore";
+
 // movedCount(): how many values this task has sent by MOVE (no copy) since it started, and copiedCount(): by deep copy.
 // Only values that contain a reference (strings, arrays, records, ...) are counted; scalars cost nothing either way.
 export function movedCount(): usize {
@@ -74,87 +77,6 @@ export function copiedCount(): usize {
 }
 
 // ------------------------------------------------------------------------------------------------------ channels
-
-// The bookkeeping of one channel buffer, a bounded ring of `cap` slots. Pure: the channel functions load it from the
-// channel's monitor, change it and store it back inside one critical section, so the invariants hold whenever the
-// lock is released (they are checked after every method under --check-contracts, and `orin test` does).
-@Invariant(this.cap >= 1)
-@Invariant(this.head < this.cap)
-@Invariant(this.len <= this.cap)
-export class Ring {
-  cap: usize;
-  head: usize;
-  len: usize;
-  txClosed: bool;
-  rxClosed: bool;
-
-  constructor(cap: usize, head: usize, len: usize, txClosed: bool, rxClosed: bool) {
-    this.cap = cap;
-    this.head = head;
-    this.len = len;
-    this.txClosed = txClosed;
-    this.rxClosed = rxClosed;
-  }
-
-  // canPush(): a send would not block and would be accepted.
-  @Ensures(result == (!this.txClosed && !this.rxClosed && this.len < this.cap))
-  canPush(): bool {
-    return !this.txClosed && !this.rxClosed && this.len < this.cap;
-  }
-
-  // canPop(): there is a value to receive.
-  @Ensures(result == (this.len > 0))
-  canPop(): bool {
-    return this.len > 0;
-  }
-
-  // isDone(): no value will ever be received (cancelled by the receiver, or closed by the sender and drained).
-  @Ensures(result == (this.rxClosed || (this.txClosed && this.len == 0)))
-  isDone(): bool {
-    return this.rxClosed || (this.txClosed && this.len == 0);
-  }
-
-  // push(): the slot to write the next value into; the ring now holds one more value.
-  @Requires(this.len < this.cap)
-  @Ensures(result < this.cap)
-  @Ensures(this.len == old(this.len) + 1)
-  @Ensures(this.head == old(this.head))
-  push(): usize {
-    const slot = (this.head + this.len) % this.cap;
-    this.len += 1;
-    return slot;
-  }
-
-  // pop(): the slot to read the oldest value from; the ring now holds one value less.
-  @Requires(this.len > 0)
-  @Ensures(result < this.cap)
-  @Ensures(result == old(this.head))
-  @Ensures(this.len + 1 == old(this.len))
-  pop(): usize {
-    const slot = this.head;
-    this.head = (this.head + 1) % this.cap;
-    this.len -= 1;
-    return slot;
-  }
-
-  // closeTx(): no more sends (what is buffered can still be received).
-  @Ensures(this.txClosed && this.len == old(this.len))
-  closeTx(): void {
-    this.txClosed = true;
-  }
-
-  // closeRx(): no more receives; senders are refused from now on.
-  @Ensures(this.rxClosed && this.len == old(this.len))
-  closeRx(): void {
-    this.rxClosed = true;
-  }
-
-  // released(): both ends have closed, so the channel's monitor can be freed.
-  @Ensures(result == (this.txClosed && this.rxClosed))
-  released(): bool {
-    return this.txClosed && this.rxClosed;
-  }
-}
 
 // Monitor words of a channel: [0] capacity, [1] head, [2] len, [3] flags (1 = tx closed, 2 = rx closed), [4 + i] the
 // token in ring slot i.
@@ -185,10 +107,13 @@ function storeRing(m: usize, r: Ring): void {
   monSet(m, 3, flags);
 }
 
-// The sending end of a channel. A copy refers to the same channel.
+// The sending end of a channel. A copy refers to the same channel. A monitor handle is never 0: a forged `new Sender<T>(0)` is a
+// contract violation (and any other forged handle is refused by the platform layer at its first use).
+@Invariant(this.ch != 0)
 export class Sender<T> {
   ch: usize;
 
+  @Requires(ch != 0)
   constructor(ch: usize) {
     this.ch = ch;
   }
@@ -232,9 +157,11 @@ export class Sender<T> {
 }
 
 // The receiving end of a channel. A copy refers to the same channel (several receivers share the stream).
+@Invariant(this.ch != 0)
 export class Receiver<T> {
   ch: usize;
 
+  @Requires(ch != 0)
   constructor(ch: usize) {
     this.ch = ch;
   }
@@ -288,8 +215,9 @@ export class Receiver<T> {
 export type Channel<T> = { tx: Sender<T>; rx: Receiver<T>; };
 
 // channel<T>(capacity): a bounded channel of at least one slot. A capacity of 0 (rendezvous) is not supported in stage 0:
-// E0482 for a constant, a contract violation otherwise.
+// E0482 for a constant, a trap otherwise (also without contract checking). Both ends refer to the same channel.
 @Requires(capacity >= 1)
+@Ensures(result.tx.ch == result.rx.ch)
 export function channel<T>(capacity: usize): Channel<T> {
   if (capacity == 0) {
     taskTrap("channel capacity must be at least 1");
@@ -302,52 +230,6 @@ export function channel<T>(capacity: usize): Channel<T> {
 }
 
 // ------------------------------------------------------------------------------------------------------ scopes
-
-// The task table of a scope, as the scope's monitor holds it: [0] number of tasks spawned, [1] scan cursor (every entry below
-// it has been claimed), [2] closed flag, [3] size of the monitor in words, then three words per task: its thread handle
-// (0 until spawn has started the thread), its result monitor, and a state word (0 = nobody has joined it yet, 1 = claimed
-// by a join or by the scope's exit).
-@Invariant(this.cursor <= this.count)
-export class Ledger {
-  count: usize;
-  cursor: usize;
-  closed: bool;
-
-  constructor(count: usize, cursor: usize, closed: bool) {
-    this.count = count;
-    this.cursor = cursor;
-    this.closed = closed;
-  }
-
-  // add(): the index of a new task.
-  @Requires(!this.closed)
-  @Ensures(result == old(this.count) && this.count == old(this.count) + 1)
-  add(): usize {
-    const i = this.count;
-    this.count += 1;
-    return i;
-  }
-
-  // advance(): the scan has passed one more entry.
-  @Requires(this.cursor < this.count)
-  @Ensures(this.cursor == old(this.cursor) + 1)
-  advance(): void {
-    this.cursor += 1;
-  }
-
-  // isScanned(): the scan has passed every task.
-  @Ensures(result == (this.cursor == this.count))
-  isScanned(): bool {
-    return this.cursor == this.count;
-  }
-
-  // close(): no task can be added any more; legal only when the scan has passed every task.
-  @Requires(this.cursor == this.count)
-  @Ensures(this.closed)
-  close(): void {
-    this.closed = true;
-  }
-}
 
 const LG_HDR: usize = 4;
 const LG_STRIDE: usize = 3;
@@ -363,20 +245,24 @@ function entry(i: usize): usize {
 }
 
 // A scope: the handle of a task table. `scope` makes one and passes it to its body; it is valid only until `scope` returns.
+@Invariant(this.tab != 0)
 export class Scope {
   tab: usize;
 
+  @Requires(tab != 0)
   constructor(tab: usize) {
     this.tab = tab;
   }
 }
 
 // A started task. `join` may be called once; a second call, or a call after the scope has ended, traps.
+@Invariant(this.tab != 0 && this.res != 0)
 export class TaskHandle<T> {
   tab: usize;
   idx: usize;
   res: usize;
 
+  @Requires(tab != 0 && res != 0)
   constructor(tab: usize, idx: usize, res: usize) {
     this.tab = tab;
     this.idx = idx;
@@ -419,6 +305,7 @@ function runTask<T>(f: () => T, res: usize): void {
 // spawn<T>(s, f): starts `f` as a task of the scope and returns its handle. `f` and everything it captures move to the task
 // (unique values) or are copied to it; the task cannot affect the spawner's values. A body that captures a resource handle
 // is E0483, one that captures a `Scope` is E0481. Traps when the scope has ended or no thread can be started.
+@Ensures(result.tab == s.tab)
 export function spawn<T>(s: Scope, f: () => T): TaskHandle<T> {
   const res = monNew(1);
   const body: Thunk = () => runTask(f, res);
@@ -507,6 +394,7 @@ function drain(tab: usize): string {
 }
 
 // begin(): a new, empty task table.
+@Ensures(result != 0)
 function begin(): usize {
   const tab = monNew(LG_FIRST * LG_STRIDE);
   monLock(tab);

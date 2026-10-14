@@ -1,64 +1,8 @@
-// Tests for std:task (ADR-0017 stage 0): the pure bookkeeping classes (`Ring`, `Ledger`: their invariants and contracts are
-// checked by `orin test`), channel semantics in one task, transfer by move or copy (the counters), and the structure of a
-// scope. Run with `orin test` (contracts checked) and with `--no-contracts`; see tools/test_std.sh.
+// Tests for std:task (ADR-0017 stage 0): channel semantics in one task, transfer by move or copy (the counters), and the structure
+// of a scope. The pure bookkeeping classes `Ring` and `Ledger` are tested in taskcore_test.or. Run with `orin test` (contracts
+// checked) and with `--no-contracts`; see tools/test_std.sh.
 import { assert, assertEq, assertEqUsize, assertEqBool, assertEqString } from "std:test";
-import {
-  Ring, Ledger, scope, scopeDo, spawn, spawnDo, channel, movedCount, copiedCount, TaskHandle, parallelMap
-} from "std:task";
-
-// ------------------------------------------------------------------------------------------------ Ring
-
-@Test
-function ringFifoOrder(): void {
-  let r = new Ring(3, 0, 0, false, false);
-  assertEqBool(r.canPop(), false, "empty");
-  assertEqBool(r.canPush(), true, "room");
-  assertEqUsize(r.push(), 0, "first slot");
-  assertEqUsize(r.push(), 1, "second slot");
-  assertEqUsize(r.push(), 2, "third slot");
-  assertEqBool(r.canPush(), false, "full");
-  assertEqUsize(r.pop(), 0, "oldest first");
-  assertEqUsize(r.push(), 0, "the slot wraps around");
-  assertEqUsize(r.pop(), 1, "second oldest");
-  assertEqUsize(r.pop(), 2, "third");
-  assertEqUsize(r.pop(), 0, "the wrapped slot");
-  assertEqBool(r.canPop(), false, "drained");
-}
-
-@Test
-function ringClosing(): void {
-  let r = new Ring(2, 0, 0, false, false);
-  r.push();
-  assertEqBool(r.isDone(), false, "open");
-  r.closeTx();
-  assertEqBool(r.canPush(), false, "no send after close");
-  assertEqBool(r.isDone(), false, "closed but not drained");
-  assertEqBool(r.canPop(), true, "what was buffered can still be received");
-  r.pop();
-  assertEqBool(r.isDone(), true, "closed and drained");
-  assertEqBool(r.released(), false, "only one end closed");
-  r.closeRx();
-  assertEqBool(r.released(), true, "both ends closed");
-  let c = new Ring(2, 0, 0, false, false);
-  c.closeRx();
-  assertEqBool(c.isDone(), true, "cancelled by the receiver");
-}
-
-// ------------------------------------------------------------------------------------------------ Ledger
-
-@Test
-function ledgerCountsAndScans(): void {
-  let l = new Ledger(0, 0, false);
-  assertEqBool(l.isScanned(), true, "empty ledger");
-  assertEqUsize(l.add(), 0, "first task");
-  assertEqUsize(l.add(), 1, "second task");
-  assertEqBool(l.isScanned(), false, "two unscanned tasks");
-  l.advance();
-  l.advance();
-  assertEqBool(l.isScanned(), true, "scanned");
-  l.close();
-  assertEqBool(l.closed, true, "closed");
-}
+import { scope, scopeDo, spawn, spawnDo, channel, movedCount, copiedCount, TaskHandle, parallelMap } from "std:task";
 
 // ------------------------------------------------------------------------------------------------ channels (one task)
 
@@ -102,25 +46,26 @@ function makeBig(n: int): string[] {
   return xs;
 }
 
-// A fresh value (a temporary) is moved: no copy. A value that the sender still holds is deep-copied, and the receiver's copy is
-// independent of it. (That a temporary is passed by move relies on the optimiser's owned-parameter inference, ADR-0010;
-// without it the value is copied, which no program can observe except through these counters.)
+// Every value that crosses is counted exactly once, as a move or as a copy; a value that the sender still holds can only be copied, and
+// the receiver's copy is independent of it. WHETHER a fresh temporary is moved depends on the build (the optimiser's owned-parameter
+// inference, ADR-0010, passes it by move; contract checking keeps an extra reference and copies), so this test does not pin it:
+// tests/concurrency/move_counts.or does, in the default build.
 @Test
-function moveWhenUniqueCopyWhenShared(): void {
+function everyCrossingIsCountedOnce(): void {
   const ch = channel<string[]>(4);
   const m0 = movedCount();
   const c0 = copiedCount();
   ch.tx.send(makeBig(500));
-  assertEqUsize(movedCount() - m0, 1, "a fresh temporary is moved");
-  assertEqUsize(copiedCount() - c0, 0, "and not copied");
+  assertEqUsize((movedCount() - m0) + (copiedCount() - c0), 1, "one crossing, counted once");
   const keep = makeBig(500);
   ch.tx.send(keep);
-  assertEqUsize(copiedCount() - c0, 1, "a value the sender still holds is copied");
+  assertEqUsize((movedCount() - m0) + (copiedCount() - c0), 2, "two crossings, counted twice");
+  assertEqBool(copiedCount() - c0 >= 1, true, "a value the sender still holds is copied");
   assertEqUsize(keep.length, 500, "the sender's value is intact");
   ch.tx.close();
-  assertEqUsize(ch.rx.recv().unwrap().length, 500, "the moved value arrives");
+  assertEqUsize(ch.rx.recv().unwrap().length, 500, "the first value arrives");
   const got = ch.rx.recv().unwrap();
-  assertEqUsize(got.length, 500, "the copy arrives");
+  assertEqUsize(got.length, 500, "the second arrives");
   assertEqString(got[499], "item 499", "with its content");
   ch.rx.close();
 }

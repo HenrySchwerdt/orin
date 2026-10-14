@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v1.9)
+# MIR and the OIM ownership verifier (v1.10)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -19,6 +19,15 @@ discipline of a file handle. New builtins: the openers `BGrantFs` / `BGrantProce
 `BFileOpen` is now `[fs, path, mode]`, and every std I/O builtin (`BFsReadFile`, `BFsWriteFile`, `BFsExists`,
 `BProcessArgs`, `BIoShell`, `BIoReadBytes`, `BIoReadLine`, `BIoWriteStdout`, `BTimeNowMillis`) takes its grant as the
 first argument. `main` may have one `MHandle` parameter (the Host; the C / LLVM `main` passes `orin_cap_host_root()`).
+
+v1.10 (ADR-0017 stage 0, ADR-0027 Q10) tasks: **no new type or instruction**. One builtin `BTask(k)` (`compiler/hir/taskops.or`) carries the task
+primitives (monitors, transfer tokens, thread start / join). Three of them touch handles: `grantClone` (k = 17, `[grant]` -> a handle of the same
+family) is an opener like `BGrantUnder`; `grantMove` (k = 18, `[handle]` -> a `usize` token) is a CLOSER like `BGrantRevoke` (the handle must be `Open`,
+is `Dead` afterwards: moved exactly once on every path, never a parameter); `grantAdoptFs / Process / Stdio / Clock` (k = 19..22, `[token]` -> a
+handle) are openers whose argument is a scalar token: no argument may be a handle, the destination must be a bound handle local, and the function
+must revoke it. A value sent to a task is consumed by the one-field record that carries it (`IStructNew`), which already kills every borrow of
+the consumed local, so "no value used after it was moved into a task" is an existing rule; the runtime decides move or copy from the reference
+counts. Cases: `compiler/tests/verify_main.or` (`taskGrantCases`).
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute

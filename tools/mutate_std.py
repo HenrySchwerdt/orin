@@ -22,6 +22,23 @@ OUT = os.path.join(ROOT, "build", "mutate_std")
 # (module, name, old text (must occur exactly once), new text[, expect-trap test in tests/std/expect_trap/])
 # An expect-trap test must FAIL (trap) on the real code; a mutant that makes it pass is killed.
 MUTANTS = [
+    # ---- std:taskcore (the pure bookkeeping of std:task: Ring = one channel buffer, Ledger = one scope's task table)
+    ("taskcore", "ring-push-slot-ignores-head", "const slot = (this.head + this.len) % this.cap;", "const slot = this.len % this.cap;"),
+    ("taskcore", "ring-push-forgets-len", "    const slot = (this.head + this.len) % this.cap;\n    this.len += 1;\n    return slot;", "    const slot = (this.head + this.len) % this.cap;\n    return slot;"),
+    ("taskcore", "ring-pop-head-stays", "    this.head = (this.head + 1) % this.cap;\n    this.len -= 1;", "    this.len -= 1;"),
+    ("taskcore", "ring-pop-wrap-off-by-one", "this.head = (this.head + 1) % this.cap;", "this.head = (this.head + 1) % (this.cap + 1);"),
+    ("taskcore", "ring-canPush-ignores-tx-closed", "return !this.txClosed && !this.rxClosed && this.len < this.cap;", "return !this.rxClosed && this.len < this.cap;"),
+    ("taskcore", "ring-canPush-ignores-rx-closed", "return !this.txClosed && !this.rxClosed && this.len < this.cap;", "return !this.txClosed && this.len < this.cap;"),
+    ("taskcore", "ring-canPush-allows-full", "return !this.txClosed && !this.rxClosed && this.len < this.cap;", "return !this.txClosed && !this.rxClosed && this.len <= this.cap;"),
+    ("taskcore", "ring-isDone-forgets-drain", "return this.rxClosed || (this.txClosed && this.len == 0);", "return this.rxClosed || this.txClosed;"),
+    ("taskcore", "ring-isDone-forgets-cancel", "return this.rxClosed || (this.txClosed && this.len == 0);", "return this.txClosed && this.len == 0;"),
+    ("taskcore", "ring-closeTx-closes-rx", "    this.txClosed = true;", "    this.rxClosed = true;"),
+    ("taskcore", "ring-released-either", "return this.txClosed && this.rxClosed;", "return this.txClosed || this.rxClosed;"),
+    ("taskcore", "ring-canPop-needs-two", "return this.len > 0;\n  }\n\n  // isDone()", "return this.len > 1;\n  }\n\n  // isDone()"),
+    ("taskcore", "ledger-add-returns-next", "    const i = this.count;\n    this.count += 1;\n    return i;", "    this.count += 1;\n    return this.count;"),
+    ("taskcore", "ledger-advance-skips", "    this.cursor += 1;", "    this.cursor += 2;"),
+    ("taskcore", "ledger-scanned-early", "return this.cursor == this.count;\n  }\n\n  // close()", "return this.cursor + 1 >= this.count;\n  }\n\n  // close()"),
+    ("taskcore", "ledger-close-forgets", "    this.closed = true;\n  }\n}", "    this.closed = false;\n  }\n}"),
     # ---- std:bytes
     ("bytes", "slice-offset-ignored", "return new Bytes(this.data, this.start + lo, hi - lo);", "return new Bytes(this.data, this.start, hi - lo);"),
     ("bytes", "slice-length-off-by-one", "return new Bytes(this.data, this.start + lo, hi - lo);", "return new Bytes(this.data, this.start + lo, hi - lo + 1);"),
@@ -164,7 +181,7 @@ def main():
     orinc = os.path.join(ROOT, a.orinc)
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT)
-    mods = ["bytes", "utf8", "collections", "http"]
+    mods = ["bytes", "utf8", "collections", "http", "taskcore"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     survivors = 0
     rows = []

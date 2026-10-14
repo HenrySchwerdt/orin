@@ -1,0 +1,91 @@
+// Tests for std:taskcore (ADR-0017 stage 0): the pure bookkeeping of std:task. `Ring` is the state machine of one channel buffer,
+// `Ledger` of one scope's task table. Their invariants and contracts are checked by `orin test`; tools/mutate_std.py breaks them
+// on purpose and requires these tests to notice. No threads are needed.
+import { assert, assertEq, assertEqUsize, assertEqBool } from "std:test";
+import { Ring, Ledger } from "std:taskcore";
+
+// ------------------------------------------------------------------------------------------------ Ring
+
+@Test
+function ringFifoOrder(): void {
+  let r = new Ring(3, 0, 0, false, false);
+  assertEqBool(r.canPop(), false, "empty");
+  assertEqBool(r.canPush(), true, "room");
+  assertEqUsize(r.push(), 0, "first slot");
+  assertEqUsize(r.push(), 1, "second slot");
+  assertEqUsize(r.push(), 2, "third slot");
+  assertEqBool(r.canPush(), false, "full");
+  assertEqUsize(r.len, 3, "three values");
+  assertEqUsize(r.pop(), 0, "oldest first");
+  assertEqUsize(r.head, 1, "the head moved");
+  assertEqUsize(r.push(), 0, "the slot wraps around");
+  assertEqUsize(r.pop(), 1, "second oldest");
+  assertEqUsize(r.pop(), 2, "third");
+  assertEqUsize(r.pop(), 0, "the wrapped slot");
+  assertEqBool(r.canPop(), false, "drained");
+  assertEqUsize(r.len, 0, "empty again");
+}
+
+@Test
+function ringWrapsFromAnyHead(): void {
+  let r = new Ring(4, 3, 0, false, false);
+  assertEqUsize(r.push(), 3, "slot at the head");
+  assertEqUsize(r.push(), 0, "wraps to the start");
+  assertEqUsize(r.push(), 1, "next");
+  assertEqUsize(r.pop(), 3, "oldest");
+  assertEqUsize(r.head, 0, "head wrapped");
+}
+
+@Test
+function ringClosing(): void {
+  let r = new Ring(2, 0, 0, false, false);
+  r.push();
+  assertEqBool(r.isDone(), false, "open");
+  r.closeTx();
+  assertEqBool(r.canPush(), false, "no send after close");
+  assertEqBool(r.isDone(), false, "closed but not drained");
+  assertEqBool(r.canPop(), true, "what was buffered can still be received");
+  r.pop();
+  assertEqBool(r.isDone(), true, "closed and drained");
+  assertEqBool(r.released(), false, "only one end closed");
+  r.closeRx();
+  assertEqBool(r.released(), true, "both ends closed");
+  let c = new Ring(2, 0, 0, false, false);
+  assertEqBool(c.released(), false, "nothing closed");
+  c.closeRx();
+  assertEqBool(c.isDone(), true, "cancelled by the receiver");
+  assertEqBool(c.canPush(), false, "a cancelled channel refuses senders");
+  assertEqBool(c.released(), false, "only the receiver closed");
+}
+
+@Test
+function ringCloseKeepsContent(): void {
+  let r = new Ring(3, 0, 0, false, false);
+  r.push();
+  r.push();
+  r.closeTx();
+  assertEqUsize(r.len, 2, "close does not drop buffered values");
+  r.closeRx();
+  assertEqUsize(r.len, 2, "nor does the second close");
+}
+
+// ------------------------------------------------------------------------------------------------ Ledger
+
+@Test
+function ledgerCountsAndScans(): void {
+  let l = new Ledger(0, 0, false);
+  assertEqBool(l.isScanned(), true, "empty ledger");
+  assertEqUsize(l.add(), 0, "first task");
+  assertEqUsize(l.add(), 1, "second task");
+  assertEqUsize(l.count, 2, "two tasks");
+  assertEqBool(l.isScanned(), false, "two unscanned tasks");
+  l.advance();
+  assertEqBool(l.isScanned(), false, "one unscanned task");
+  assertEqUsize(l.cursor, 1, "the scan moved by one");
+  l.advance();
+  assertEqBool(l.isScanned(), true, "scanned");
+  assertEqBool(l.closed, false, "still open");
+  l.close();
+  assertEqBool(l.closed, true, "closed");
+  assertEqUsize(l.count, 2, "closing keeps the count");
+}

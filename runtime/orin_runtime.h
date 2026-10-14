@@ -187,7 +187,7 @@ typedef struct OrinStats {
 } OrinStats;
 /* Per THREAD (every task has its own heap and its own counters; a finished task's counters are folded into the
  * process totals, which the ORIN_STATS report prints together with the main thread's). */
-extern __thread OrinStats orin_stats;
+extern __thread OrinStats orin_stats __attribute__((tls_model("local-exec"))); /* one instruction per counter update: the program is one executable */
 
 static inline void orin_retain(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {

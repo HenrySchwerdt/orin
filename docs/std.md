@@ -19,6 +19,8 @@ API table (`compiler/mcp/apitable.or`).
 | `std:collections` | Orin, `stdlib/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `stdlib/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; no sockets (ADR-0033 later); ADR-0030 |
 | `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
+| `std:taskcore` | Orin, `stdlib/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
+| `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`; see docs/concurrency.md |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
