@@ -1,0 +1,519 @@
+// Effect summaries as tooling sees them (ADR-0037 D2): per-function views with their explanation paths, deterministic
+// aggregates per module, per package and for the `main` entry point, and the text / JSON renderings that `orin effects`,
+// the LSP hover and the MCP `inspect` tool all use. The numbers come from one place, `inferEffects` (effects.or); this file
+// only names things (a def becomes `module::Class.method`) and places them (a span becomes `file:line:col` relative to the
+// package's source root, like the OSIG).
+//
+// Attribution (see effects.or): the effects of a module are those of the code written in it, a closure counting for the
+// module that contains it; the abstract methods of an interface and the library (`std:`) code belong to no module.
+
+import { LoadedProgram } from "../loader";
+import { SourceMap, Span } from "../diag";
+import { SemanticIndex, SkFunction, SkInterface, SkParam } from "../hir";
+import { displayModule } from "../package";
+import { Json, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson } from "../json";
+import { OSpan, Mapper, spanMapper, mkSpan } from "./osig";
+import { cmpStr } from "./modgraph";
+import { EffectTable, EffEntry, inferEffects, isUnknownOp, evRank } from "./effects";
+
+export const EFFECTS_SCHEMA: string = "effects/0.1";
+
+// Everything a consumer needs to ask about effects: the program, its semantic index, the summaries, the span mapper.
+export type EffContext = { prog: LoadedProgram; idx: SemanticIndex; table: EffectTable; map: Mapper; };
+
+export function effectsContext(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap): EffContext {
+  return EffContext { prog: prog, idx: idx, table: inferEffects(idx), map: spanMapper(prog, sm) };
+}
+
+// One step of an explanation path: the function, the place in its body (the call that leads on, or the primitive call
+// in the last step) and how the next step is reached.
+export type HopView = { name: string; span: OSpan; route: string; };
+
+// One effect of a function, module, package or entry point, with the call chain that explains it. For an UNKNOWN kind
+// `op` is "Unknown.<reason>" and `dir` / `grant` are empty.
+// `def` is the function the path starts at and `start` the place in its body (the first hop's span, in the diagnostics'
+// SourceMap), so that a diagnostic can point at the call that begins the chain.
+export type EffView = { op: string; dir: string; grant: string; ev: string; hops: HopView[]; def: usize; start: Span; };
+
+function isIfaceMethodDef(idx: SemanticIndex, d: usize): bool {
+  return match (idx.defs[d].container) {
+    Some(c) => match (idx.defs[c].kind) {
+      SkInterface => true,
+      _ => false
+    },
+    None => false
+  };
+}
+
+// The module id of a def ("" for library code and anything outside the source root).
+export function moduleOfDef(c: EffContext, d: usize): string {
+  return c.prog.units[c.idx.defs[d].unit].module;
+}
+
+// `module::Class.method` ("std:fs::withFile" for library code).
+export function qualName(c: EffContext, d: usize): string {
+  const def = c.idx.defs[d];
+  const u = c.prog.units[def.unit];
+  let path = def.name;
+  match (def.container) {
+    Some(ct) => { path = c.idx.defs[ct].name + "." + def.name; },
+    None => {}
+  }
+  let m = displayModule(u.module);
+  if (u.module == "") {
+    m = u.name.startsWith("$stdlib/") ? "std:" + u.name.substring(8, u.name.length) : u.name;
+  }
+  return m + "::" + path;
+}
+
+function hopOf(c: EffContext, step_def: usize, sp: OSpan, route: string): HopView {
+  return HopView { name: qualName(c, step_def), span: sp, route: route };
+}
+
+// The view of effect `key` of def `d`, which must have it.
+@Requires(c.table.hasSummary(d) && key < c.table.keyCount())
+@Requires(c.table.entryFor(d, key).isSome())
+function viewOf(c: EffContext, d: usize, key: usize): EffView {
+  const k = c.table.keyAt(key);
+  let hops: HopView[] = [];
+  let ev = "";
+  const steps = c.table.path(d, key);
+  for (const s of steps) {
+    hops.push(hopOf(c, s.def, mkSpan(c.map, s.span), s.route));
+    if (ev == "") {
+      ev = s.ev;
+    }
+  }
+  return EffView { op: k.op, dir: k.dir, grant: k.grant, ev: ev, hops: hops, def: d, start: steps[0].span };
+}
+
+// The effects of one function, in the order of the table (operation, then direction), each with its path. Empty for a
+// def without a summary and for a program that did not type-check.
+export function effectViews(c: EffContext, d: usize): EffView[] {
+  let out: EffView[] = [];
+  if (!c.table.hasSummary(d)) {
+    return out;
+  }
+  for (const e of c.table.summary(d)) {
+    out.push(viewOf(c, d, e.key));
+  }
+  return out;
+}
+
+// ---- aggregation -----------------------------------------------------------------------------------------------
+
+// The union of the effects of `defs`: per effect the best evidence (MUST before MAY before UNKNOWN) and, among equal
+// ones, the shortest path, the first def in the given order on a tie; the path is the witness's.
+export function aggregateViews(c: EffContext, defs: usize[]): EffView[] {
+  let out: EffView[] = [];
+  let bestDef: usize[] = [];
+  let bestKey: usize[] = [];
+  let bestEv: string[] = [];
+  let bestDepth: usize[] = [];
+  for (const d of defs) {
+    if (!c.table.hasSummary(d)) {
+      continue;
+    }
+    for (const e of c.table.summary(d)) {
+      let at: int = -1;
+      let i: usize = 0;
+      while (i < bestKey.length) {
+        if (bestKey[i] == e.key) {
+          at = i.toInt();
+        }
+        i += 1;
+      }
+      if (at < 0) {
+        bestDef.push(d);
+        bestKey.push(e.key);
+        bestEv.push(e.ev);
+        bestDepth.push(e.depth);
+      } else {
+        const a = at.toUsize();
+        if (evRank(e.ev) < evRank(bestEv[a]) || (evRank(e.ev) == evRank(bestEv[a]) && e.depth < bestDepth[a])) {
+          bestDef[a] = d;
+          bestEv[a] = e.ev;
+          bestDepth[a] = e.depth;
+        }
+      }
+    }
+  }
+  // in key order (operation, direction)
+  let order: usize[] = [];
+  let i: usize = 0;
+  while (i < bestKey.length) {
+    let at = order.length;
+    while (at > 0 && c.table.keyLess(bestKey[i], bestKey[order[at - 1]])) {
+      at -= 1;
+    }
+    order = order.slice(0, at).concat([i]).concat(order.slice(at, order.length));
+    i += 1;
+  }
+  for (const o of order) {
+    let v = viewOf(c, bestDef[o], bestKey[o]);
+    v.ev = bestEv[o];
+    out.push(v);
+  }
+  return out;
+}
+
+export type ModuleView = { module: string; functions: usize[]; effects: EffView[]; };
+
+export type EffectsReport = {
+  package: string;
+  typed: bool;
+  entry: Option<usize>;        // the `main` function of the entry unit
+  entryEffects: EffView[];     // what running `main` may do
+  packageEffects: EffView[];   // the union over every module of the package
+  modules: ModuleView[];       // sorted by module id, "." first
+};
+
+function isFunctionLike(c: EffContext, d: usize): bool {
+  return match (c.idx.defs[d].kind) {
+    SkFunction => true,
+    _ => false
+  };
+}
+
+// The defs that are part of module `m` (a module id): every function, method, constructor and class (field
+// initialisers) of its files, except abstract interface methods.
+export function moduleDefs(c: EffContext, m: string): usize[] {
+  let out: usize[] = [];
+  for (const d of c.table.defs()) {
+    if (moduleOfDef(c, d) == m && !isIfaceMethodDef(c.idx, d)) {
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+export function buildReport(c: EffContext): EffectsReport {
+  let pkg = "_";
+  match (c.prog.manifest) {
+    Some(mf) => { pkg = mf.name; },
+    None => {}
+  }
+  let entry: Option<usize> = None;
+  let mods: string[] = [];
+  for (const d of c.table.defs()) {
+    const def = c.idx.defs[d];
+    const m = moduleOfDef(c, d);
+    if (m == "") {
+      continue;
+    }
+    let seen = false;
+    for (const x of mods) {
+      if (x == m) {
+        seen = true;
+      }
+    }
+    if (!seen) {
+      mods.push(m);
+    }
+    if (def.unit == c.prog.entry && def.name == "main" && def.container.isNone() && isFunctionLike(c, d) && entry.isNone()) {
+      entry = Some(d);
+    }
+  }
+  let sorted: string[] = [];
+  for (const m of mods) {
+    let at = sorted.length;
+    while (at > 0 && cmpStr(sorted[at - 1], m) > 0) {
+      at -= 1;
+    }
+    sorted = sorted.slice(0, at).concat([m]).concat(sorted.slice(at, sorted.length));
+  }
+  let modules: ModuleView[] = [];
+  let all: usize[] = [];
+  for (const m of sorted) {
+    const ds = moduleDefs(c, m);
+    let fns: usize[] = [];
+    for (const d of ds) {
+      if (isFunctionLike(c, d) || c.table.summary(d).length > 0) {
+        fns.push(d);
+      }
+      all.push(d);
+    }
+    modules.push(ModuleView { module: m, functions: fns, effects: aggregateViews(c, ds) });
+  }
+  let entryEffects: EffView[] = [];
+  match (entry) {
+    Some(e) => { entryEffects = effectViews(c, e); },
+    None => {}
+  }
+  return EffectsReport {
+    package: pkg, typed: c.table.isTyped(), entry: entry, entryEffects: entryEffects, packageEffects: aggregateViews(c, all),
+    modules: modules
+  };
+}
+
+// ---- text ----------------------------------------------------------------------------------------------------
+
+function loc(s: OSpan): string {
+  return s.file == "" ? "" : s.file + ":" + s.line.toString() + ":" + s.col.toString();
+}
+
+export function effectLabel(v: EffView): string {
+  if (isUnknownOp(v.op)) {
+    return v.op + " [UNKNOWN]";
+  }
+  return v.op + " " + v.dir + " [" + v.ev + "]" + (v.grant == "ambient" ? " ambient" : " " + v.grant);
+}
+
+// The explanation path as lines: `name  file:line:col`, the last one says what happens there.
+export function pathLines(v: EffView, indent: string): string[] {
+  let out: string[] = [];
+  let i: usize = 0;
+  while (i < v.hops.length) {
+    const h = v.hops[i];
+    const last = i + 1 == v.hops.length;
+    const what = last ? (isUnknownOp(v.op) ? "  <- " + reasonText(v.op) : "  <- performs " + v.op) : "";
+    out.push(indent + (i == 0 ? "" : "-> ") + h.name + "  " + loc(h.span) + what);
+    i += 1;
+  }
+  return out;
+}
+
+export function reasonText(op: string): string {
+  if (op == "Unknown.FunctionValue") {
+    return "call of a function value of unknown origin";
+  }
+  if (op == "Unknown.Callback") {
+    return "a function value of unknown origin is passed to a function that calls it";
+  }
+  if (op == "Unknown.Interface") {
+    return "interface method without an implementation in the program";
+  }
+  return "call whose target is not resolved";
+}
+
+// Lines of a function's summary: `pure`, or one block per effect. `paths`: add the explanation path of each effect.
+export function functionLines(c: EffContext, d: usize, paths: bool, indent: string): string[] {
+  let out: string[] = [];
+  const vs = effectViews(c, d);
+  if (vs.length == 0) {
+    out.push(indent + (c.table.hasSummary(d) && c.table.callbacksOf(d).length > 0 ? "no effect of its own" : "pure"));
+  }
+  for (const v of vs) {
+    out.push(indent + effectLabel(v));
+    if (paths) {
+      for (const l of pathLines(v, indent + "    ")) {
+        out.push(l);
+      }
+    }
+  }
+  if (c.table.hasSummary(d) && c.table.callbacksOf(d).length > 0) {
+    out.push(indent + "effects of the function values it calls (" + callbackNames(c, d).join(", ") + ") are those of the arguments");
+  }
+  return out;
+}
+
+// The names of the parameters of `d` whose function values it calls (HIR index 0 is a method's receiver `this`).
+export function callbackNames(c: EffContext, d: usize): string[] {
+  let params: string[] = [];
+  for (const x of c.idx.defs) {
+    const isParam = match (x.kind) {
+      SkParam => true,
+      _ => false
+    };
+    const mine = match (x.container) {
+      Some(ct) => ct == d,
+      None => false
+    };
+    if (isParam && mine) {
+      params.push(x.name);
+    }
+  }
+  const method = match (c.idx.defs[d].container) {
+    Some(ct) => !c.idx.defs[d].detail.startsWith("static ") && !c.idx.defs[d].detail.startsWith("constructor"),
+    None => false
+  };
+  let out: string[] = [];
+  for (const j of c.table.callbacksOf(d)) {
+    const at = method ? (j == 0 ? -1 : j.toInt() - 1) : j.toInt();
+    if (at < 0) {
+      out.push("this");
+    } else if (at.toUsize() < params.length) {
+      out.push(params[at.toUsize()]);
+    } else {
+      out.push("#" + j.toString());
+    }
+  }
+  return out;
+}
+
+// The text of `orin effects`. `summary`: modules only (no per-function blocks). `module`: only that module id ("" = all).
+// `fn`: only functions of that name ("" = all).
+export function reportText(c: EffContext, r: EffectsReport, paths: bool, summary: bool, module: string, fn: string): string {
+  let lines: string[] = [];
+  lines.push("effects of package " + r.package + " (" + EFFECTS_SCHEMA + ")");
+  if (!r.typed) {
+    lines.push("the program does not type-check: no effect summary");
+    return lines.join("\n") + "\n";
+  }
+  lines.push("evidence: MUST = a primitive call written in the body (outside closures); MAY = inherited from a callee, a closure or an");
+  lines.push("implementation of an interface method; UNKNOWN = the target is not known (never pure)");
+  if (module == "" && fn == "") {
+    lines.push("");
+    match (r.entry) {
+      Some(e) => {
+        lines.push("entry point " + qualName(c, e) + ":");
+        for (const l of functionLines(c, e, paths, "  ")) {
+          lines.push(l);
+        }
+      },
+      None => { lines.push("entry point: none (no `main`)"); }
+    }
+    lines.push("");
+    lines.push("package " + r.package + ": " + (r.packageEffects.length == 0 ? "no effects" : r.packageEffects.length.toString() + " effects"));
+    for (const v of r.packageEffects) {
+      lines.push("  " + effectLabel(v));
+    }
+  }
+  for (const m of r.modules) {
+    if (module != "" && displayModule(m.module) != module && m.module != module) {
+      continue;
+    }
+    lines.push("");
+    lines.push("module " + displayModule(m.module) + ": " + (m.effects.length == 0 ? "pure" : m.effects.length.toString() + " effects"));
+    for (const v of m.effects) {
+      lines.push("  " + effectLabel(v));
+      if (paths) {
+        for (const l of pathLines(v, "      ")) {
+          lines.push(l);
+        }
+      }
+    }
+    if (summary) {
+      continue;
+    }
+    for (const d of m.functions) {
+      if (fn != "" && c.idx.defs[d].name != fn) {
+        continue;
+      }
+      if (c.table.summary(d).length == 0 && c.table.callbacksOf(d).length == 0 && fn == "") {
+        continue;
+      }
+      lines.push("  function " + qualName(c, d) + "  " + loc(mkSpan(c.map, c.idx.defs[d].declSpan)));
+      for (const l of functionLines(c, d, paths, "    ")) {
+        lines.push(l);
+      }
+    }
+  }
+  return lines.join("\n") + "\n";
+}
+
+// ---- JSON ----------------------------------------------------------------------------------------------------
+
+function spanJson(s: OSpan): Json {
+  return JObj([
+    jField("file", JStr(s.file)), jField("line", JNum(s.line.toInt())), jField("col", JNum(s.col.toInt())),
+    jField("endLine", JNum(s.endLine.toInt())), jField("endCol", JNum(s.endCol.toInt()))
+  ]);
+}
+
+export function viewJson(v: EffView, paths: bool): Json {
+  let fs: JField[] = [
+    jField("operation", JStr(v.op)), jField("direction", JStr(v.dir)), jField("grant", JStr(v.grant)),
+    jField("evidence", JStr(v.ev))
+  ];
+  if (isUnknownOp(v.op)) {
+    fs.push(jField("reason", JStr(reasonText(v.op))));
+  }
+  if (paths) {
+    let hs: Json[] = [];
+    for (const h of v.hops) {
+      hs.push(JObj([jField("function", JStr(h.name)), jField("span", spanJson(h.span)), jField("route", JStr(h.route))]));
+    }
+    fs.push(jField("path", JArr(hs)));
+  }
+  return JObj(fs);
+}
+
+export function viewsJson(vs: EffView[], paths: bool): Json {
+  let out: Json[] = [];
+  for (const v of vs) {
+    out.push(viewJson(v, paths));
+  }
+  return JArr(out);
+}
+
+// The summary of one def as JSON (MCP `inspect`): `pure`, the effects with their paths, the callback parameters.
+export function defEffectsJson(c: EffContext, d: usize): Json {
+  const vs = effectViews(c, d);
+  let strs: Json[] = [];
+  if (c.table.hasSummary(d)) {
+    for (const n of callbackNames(c, d)) {
+      strs.push(JStr(n));
+    }
+  }
+  return JObj([
+    jField("pure", JBool(vs.length == 0 && strs.length == 0)), jField("effects", viewsJson(vs, true)),
+    jField("callbacks", JArr(strs))
+  ]);
+}
+
+function kindName(c: EffContext, d: usize): string {
+  if (!isFunctionLike(c, d)) {
+    return "Class";
+  }
+  return c.idx.defs[d].container.isSome() ? "Method" : "Function";
+}
+
+// The JSON text of `orin effects --format=json`: one line per module and per function, so that it diffs line by line.
+export function reportJson(c: EffContext, r: EffectsReport, paths: bool, summary: bool, module: string, fn: string): string {
+  let lines: string[] = ["{"];
+  lines.push("\"schema\": " + stringifyJson(JStr(EFFECTS_SCHEMA)) + ",");
+  lines.push("\"package\": " + stringifyJson(JStr(r.package)) + ",");
+  lines.push("\"typed\": " + stringifyJson(JBool(r.typed)) + ",");
+  match (r.entry) {
+    Some(e) => {
+      lines.push("\"entry\": " + stringifyJson(JObj([
+        jField("function", JStr(qualName(c, e))), jField("effects", viewsJson(r.entryEffects, paths))
+      ])) + ",");
+    },
+    None => { lines.push("\"entry\": null,"); }
+  }
+  lines.push("\"package_effects\": " + stringifyJson(viewsJson(r.packageEffects, paths)) + ",");
+  lines.push("\"modules\": [");
+  let rows: string[] = [];
+  let fnRows: string[] = [];
+  for (const m of r.modules) {
+    if (module != "" && displayModule(m.module) != module && m.module != module) {
+      continue;
+    }
+    rows.push(stringifyJson(JObj([
+      jField("module", JStr(displayModule(m.module))), jField("effects", viewsJson(m.effects, paths)),
+      jField("functions", JNum(m.functions.length.toInt()))
+    ])));
+    if (!summary) {
+      for (const d of m.functions) {
+        if (fn != "" && c.idx.defs[d].name != fn) {
+          continue;
+        }
+        if (c.table.summary(d).length == 0 && c.table.callbacksOf(d).length == 0 && fn == "") {
+          continue;
+        }
+        fnRows.push(stringifyJson(JObj([
+          jField("function", JStr(qualName(c, d))), jField("module", JStr(displayModule(m.module))),
+          jField("kind", JStr(kindName(c, d))), jField("span", spanJson(mkSpan(c.map, c.idx.defs[d].declSpan))),
+          jField("summary", defEffectsJson(c, d))
+        ])));
+      }
+    }
+  }
+  let i: usize = 0;
+  while (i < rows.length) {
+    lines.push("  " + rows[i] + (i + 1 < rows.length ? "," : ""));
+    i += 1;
+  }
+  lines.push("],");
+  lines.push("\"functions\": [");
+  i = 0;
+  while (i < fnRows.length) {
+    lines.push("  " + fnRows[i] + (i + 1 < fnRows.length ? "," : ""));
+    i += 1;
+  }
+  lines.push("]");
+  lines.push("}");
+  return lines.join("\n") + "\n";
+}

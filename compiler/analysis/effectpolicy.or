@@ -1,0 +1,179 @@
+// The effect policy of `orin.toml` (ADR-0037 D4, docs/capabilities.md): a module whose inferred effects exceed its
+// `allowed` list is a compile error.
+//
+//   [effects]                    # package default; absent = no restriction
+//   allowed = ["Fs.Read", "Console.Write"]
+//   [effects.loader]             # one module (same ids as [modules.x]); overrides the default for that module
+//   allowed = ["Fs"]
+//
+// An `allowed` entry is an operation ("Fs.ReadFile"), a family ("Fs": every operation of the family), a family
+// wildcard ("Fs.*"), "Unknown" / "Unknown.<kind>" (calls whose target is not known) or "*" (everything). The effects of
+// a module are those of the code written in it, transitively (effects.or): a module that only calls another module's
+// function performing `Fs.ReadFile` performs `Fs.ReadFile` too. Effects confer no authority; the policy says what the
+// code of a module may do at all, the grants a program holds are a separate matter (ADR-0037 D2).
+//
+// E0473  a module may perform an effect outside its allowance (the message names the effect, the explanation path is in
+//        the notes, the span is the call in the module that starts the path)
+// E0474  an `allowed` entry names no effect the compiler knows
+// E0502  an `[effects.<module>]` table names a module that does not exist (as for `[modules.x]`)
+
+import { LoadedProgram } from "../loader";
+import { Diagnostic, SourceMap, Span, diag } from "../diag";
+import { checkWithIndex, primitiveEffects } from "../check";
+import { EffectRule, displayModule } from "../package";
+import { isUnknownOp, familyOf } from "./effects";
+import { EffContext, EffView, effectsContext, buildReport, pathLines, reasonText } from "./effectsum";
+
+// The effect names an `allowed` list may contain: "*", every family, "Family.*", every operation, and the UNKNOWN kinds.
+export function knownEffectNames(): string[] {
+  let out: string[] = ["*", "Unknown", "Unknown.*", "Unknown.FunctionValue", "Unknown.Callback", "Unknown.Interface", "Unknown.Unresolved"];
+  for (const e of primitiveEffects()) {
+    const op = e.split("|")[0];
+    const fam = familyOf(op);
+    let seen = false;
+    for (const x of out) {
+      if (x == fam) {
+        seen = true;
+      }
+    }
+    if (!seen) {
+      out.push(fam);
+      out.push(fam + ".*");
+    }
+    out.push(op);
+  }
+  return out;
+}
+
+export function knownEffectName(entry: string): bool {
+  for (const k of knownEffectNames()) {
+    if (k == entry) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// True when the `allowed` entry `entry` permits the effect `op` ("Fs.ReadFile", "Unknown.Callback").
+@Ensures(entry == "*" ==> result)
+@Ensures(entry == op ==> result)
+export function allowsEffect(entry: string, op: string): bool {
+  if (entry == "*" || entry == op) {
+    return true;
+  }
+  if (entry.endsWith(".*")) {
+    return familyOf(op) == entry.substring(0, entry.length - 2);
+  }
+  return entry == familyOf(op) && !entry.includes(".");
+}
+
+export function allowedBy(allowed: string[], op: string): bool {
+  for (const a of allowed) {
+    if (allowsEffect(a, op)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function listText(xs: string[]): string {
+  return xs.length == 0 ? "no effects" : "[" + xs.join(", ") + "]";
+}
+
+// E0474 / E0502 for the tables themselves.
+function ruleDiags(prog: LoadedProgram, rules: EffectRule[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const r of rules) {
+    if (r.module != "") {
+      let found = false;
+      for (const u of prog.units) {
+        if (u.module == r.module) {
+          found = true;
+        }
+      }
+      if (!found) {
+        out.push(diag("E0502", r.span, "orin.toml: [effects." + (r.module == "." ? "\".\"" : r.module.split("/").join(".")) + "] names module `" + displayModule(r.module) + "`, which does not exist"));
+      }
+    }
+    let i: usize = 0;
+    while (i < r.allowed.length) {
+      if (!knownEffectName(r.allowed[i])) {
+        out.push(diag("E0474", i < r.allowedSpans.length ? r.allowedSpans[i] : r.span, "orin.toml: unknown effect `" + r.allowed[i]
+          + "` in [effects] allowed (an operation such as `Fs.ReadFile`, a family such as `Fs`, `Fs.*`, `Unknown` or `*`)"));
+      }
+      i += 1;
+    }
+  }
+  return out;
+}
+
+// E0473 for every module of `c` whose effects exceed the allowance of its table (or of the package default).
+export function policyDiags(c: EffContext): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  match (c.prog.manifest) {
+    None => { return out; },
+    Some(mf) => {
+      if (mf.effects.length == 0 || !c.table.isTyped()) {
+        return out;
+      }
+      const bad = ruleDiags(c.prog, mf.effects);
+      if (bad.length > 0) {
+        return bad;
+      }
+      let dflt: Option<EffectRule> = None;
+      for (const r of mf.effects) {
+        if (r.module == "") {
+          dflt = Some(r);
+        }
+      }
+      const rep = buildReport(c);
+      for (const m of rep.modules) {
+        let rule = dflt;
+        let own = false;
+        for (const r of mf.effects) {
+          if (r.module == m.module) {
+            rule = Some(r);
+            own = true;
+          }
+        }
+        if (rule.isNone()) {
+          continue;
+        }
+        const allowed = rule.unwrap().allowed;
+        for (const v of m.effects) {
+          if (allowedBy(allowed, v.op)) {
+            continue;
+          }
+          const what = isUnknownOp(v.op)
+            ? "an effect whose target is not known (" + reasonText(v.op) + ")"
+            : "`" + v.op + "` (" + v.dir + ", " + v.ev + ")";
+          let d = diag("E0473", v.start, "module `" + displayModule(m.module) + "` may perform " + what + ", but "
+            + (own ? "its [effects." + (m.module == "." ? "\".\"" : m.module.split("/").join(".")) + "]" : "the package [effects]")
+            + " allows only " + listText(allowed));
+          d.notes = pathLines(v, "");
+          out.push(d);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// The policy of `prog` (a program that type-checks, tests already erased): the diagnostics, empty without an `[effects]`
+// table. Runs the checker once more, only when there is a policy.
+export function effectPolicyDiags(prog: LoadedProgram, sm: SourceMap): Diagnostic[] {
+  let none: Diagnostic[] = [];
+  match (prog.manifest) {
+    None => { return none; },
+    Some(mf) => {
+      if (mf.effects.length == 0) {
+        return none;
+      }
+    }
+  }
+  const ci = checkWithIndex(prog, sm);
+  if (ci.result.isErr()) {
+    return none;
+  }
+  return policyDiags(effectsContext(prog, ci.index, sm));
+}

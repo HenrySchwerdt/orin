@@ -1,0 +1,92 @@
+// Command line of `orin effects` (docs/capabilities.md).
+//   orin effects <file.or | package-dir> [--format=text|json] [--no-paths] [--summary] [--module <id>] [--function <name>]
+//                [--check-purity]
+//
+// Prints the transitive effect summaries of effects.or: the entry point `main`, the package, every module and every function that
+// has an effect, each effect with its evidence and the call chain that explains it. `--summary` stops at the modules,
+// `--module` / `--function` filter, `--no-paths` drops the chains. `--check-purity` cross-checks the summaries with the
+// purity analysis (check/purity.or): exit 1 when a function has an effect although it is pure. The effect policy of
+// `orin.toml` (`[effects]`, effectpolicy.or) is reported at the end; its violations make the exit code 1.
+
+import { FsGrant } from "std:fs";
+import { render } from "../diag";
+import { inferPurity, allFunctions } from "../check";
+import { loadChecked } from "./osig";
+import { purityViolations } from "./effects";
+import { effectsContext, buildReport, reportText, reportJson, qualName } from "./effectsum";
+import { policyDiags } from "./effectpolicy";
+
+function usage(): int {
+  console.error("usage: orin effects <file.or | package-dir> [--format=text|json] [--no-paths] [--summary] [--module <id>] [--function <name>] [--check-purity]");
+  return 2;
+}
+
+export function runEffects(fs: FsGrant, argv: string[]): int {
+  let path = "";
+  let format = "text";
+  let paths = true;
+  let summary = false;
+  let module = "";
+  let fn = "";
+  let checkPurity = false;
+  let i: usize = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    i += 1;
+    if (a == "--module" || a == "--function") {
+      if (i >= argv.length) {
+        return usage();
+      }
+      if (a == "--module") {
+        module = argv[i];
+      } else {
+        fn = argv[i];
+      }
+      i += 1;
+    } else if (a.startsWith("--format=")) {
+      format = a.substring(9, a.length);
+    } else if (a == "--no-paths") {
+      paths = false;
+    } else if (a == "--summary") {
+      summary = true;
+    } else if (a == "--check-purity") {
+      checkPurity = true;
+    } else if (path == "" && !a.startsWith("-")) {
+      path = a;
+    } else {
+      return usage();
+    }
+  }
+  if (path == "" || (format != "text" && format != "json")) {
+    return usage();
+  }
+  const cp = loadChecked(fs, path, "");
+  if (cp.isErr()) {
+    console.error(cp.unwrapErr());
+    return 1;
+  }
+  const p = cp.unwrap();
+  const c = effectsContext(p.program, p.index, p.sm);
+  const r = buildReport(c);
+  let rc = 0;
+  if (checkPurity) {
+    const pu = inferPurity(p.hir.functions, allFunctions(p.hir.functions));
+    const bad = purityViolations(p.index, c.table, pu.impure, pu.reached);
+    if (bad.length > 0) {
+      for (const d of bad) {
+        console.error("purity disagrees: " + qualName(c, d) + " has an effect but every function lowered from it is pure");
+      }
+      return 1;
+    }
+    console.log("purity: consistent (" + c.table.defs().length.toString() + " summaries, " + p.hir.functions.length.toString() + " functions)");
+    return 0;
+  }
+  const text = format == "json" ? reportJson(c, r, paths, summary, module, fn) : reportText(c, r, paths, summary, module, fn);
+  console.log(text.substring(0, text.length - 1));
+  const ds = policyDiags(c);
+  for (const d of ds) {
+    console.error(render(p.sm, d));
+    rc = 1;
+  }
+  return rc;
+}
