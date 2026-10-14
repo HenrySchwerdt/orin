@@ -1,4 +1,4 @@
-# ADR-0035: The verifier fragment of ADR-0031 B/C, loop invariants and `std:seq`
+# ADR-0036: The verifier fragment of ADR-0031 B/C, loop invariants and `std:seq`
 
 Status: accepted for implementation (2026-10-14), as the "own ADR" ADR-0031 asks for before quantifiers and
 aggregates ship. Related: ADR-0012 (contract clauses), ADR-0020 D1 (statuses), ADR-0028 (W046x), ADR-0029 (refusal

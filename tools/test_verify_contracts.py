@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for `orin verify --contracts` (ADR-0012 phase 2, ADR-0031 B/C, ADR-0035; needs the z3 solver on PATH).
+"""Tests for `orin verify --contracts` (ADR-0012 phase 2, ADR-0031 B/C, ADR-0036; needs the z3 solver on PATH).
 
 Usage: python3 tools/test_verify_contracts.py [--orinc build/bootstrap/orin2] [--require-z3]
 

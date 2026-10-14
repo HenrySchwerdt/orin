@@ -19,12 +19,12 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      calls are unchecked; docs/contracts.md);
    - static verification of arrays, records, `Option` / `Result` / `Map`, exact integer widths, modular calls, per-method
      proofs of class invariants, frames inferred from the mutation analysis, loop invariants (the existing `@Invariant`
-     syntax, inferred counter bounds, bounded unrolling); **done** (ADR-0031 B 6-9, ADR-0035);
+     syntax, inferred counter bounds, bounded unrolling); **done** (ADR-0031 B 6-9, ADR-0036);
    - business-logic patterns: bounded quantifiers (`every` / `some` / `range`), `sum` / `sumBy` (`std:seq`) and conservation
-     laws; **done** (C 11-13, ADR-0035); executable specs, state machines, `std:decimal` and `@Property` remain.
+     laws; **done** (C 11-13, ADR-0036); executable specs, state machines, `std:decimal` and `@Property` remain.
 
    ADR-0031 parts A (items 1-5), B (6-9) and C 11-13 are done; the rest of C, D and E remain. What the verifier still cannot do
-   is listed in docs/contracts.md ("Semantics (honest limits)") and ADR-0035; the biggest gaps are loop invariants that nobody
+   is listed in docs/contracts.md ("Semantics (honest limits)") and ADR-0036; the biggest gaps are loop invariants that nobody
    has written, `?`, and unit-aware type names.
    The acceptance test is `examples/ledger/`.
 3. **Provable std** on a minimal trusted runtime (ADR-0030), together with capabilities Stage A/B:

@@ -71,7 +71,7 @@ termination is not part of purity, and neither are traps (division by zero, `unw
 range). A closure that is created counts as called, so an impure closure is rejected even if it is never called.
 (`count` is not in the prelude yet; `xs.filter(p).length` does the same.)
 
-`std:seq` (ADR-0035) adds the pure functions `range(lo, hi)` (the index array `lo .. hi - 1`), `sum(xs)` and
+`std:seq` (ADR-0036) adds the pure functions `range(lo, hi)` (the index array `lo .. hi - 1`), `sum(xs)` and
 `sumBy(xs, f)`: `range(1, xs.length).every(i => xs[i - 1] <= xs[i])` says `xs` is sorted, `sumBy(this.items, it =>
 it.price * it.qty)` is the total of the line items. They run as ordinary code under `--check-contracts`;
 `orin verify --contracts` reads them as bounded quantifiers and recursive sums (below).
@@ -189,7 +189,7 @@ The test runner understands `// flags: --check-contracts` and `// stderr: text` 
 (`tools/run_tests.py`; for an error test `// stderr:` is matched against the compiler's output, which pins the
 text of an E0416 message).
 
-## `orin verify --contracts [--format=json] [--z3 PATH] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0035)
+## `orin verify --contracts [--format=json] [--z3 PATH] [--strict] entry.or` (phase 2, ADR-0031 B/C, ADR-0036)
 
 Generates verification conditions and discharges them with z3 (`z3 -in`, SMT-LIB 2; install with
 `pip install z3-solver` or your package manager). Query files are kept in `build/contracts-vc/` (`qN.smt2`, the solver's
@@ -376,7 +376,7 @@ Every VERIFIED result carries its assumptions (`assumptions` in JSON, listed onc
 | A-MAP | the size of a `Map` is axiomatised, not computed from its keys | `size`, `keys` or `values` was used |
 
 The soundness reasoning for each encoding choice (datatypes are free so well-formedness is stated about values, not as axioms;
-why a `sat` model through an abstraction is not a counterexample; why the lemma about sums is valid) is in ADR-0035 and in the
+why a `sat` model through an abstraction is not a counterexample; why the lemma about sums is valid) is in ADR-0036 and in the
 header comments of `compiler/vc/*.or`.
 
 ## Contract quality (ADR-0028)
@@ -436,7 +436,7 @@ not weaken contracts, add assumptions or widen grants to make a result pass.
 ## Known limitations
 
 - `@Decreases` is only type-checked (termination is not proved). A loop `@Invariant` is type-checked and used by
-  `orin verify --contracts` (proved before it is trusted), but not checked at run time yet (ADR-0035, open question 1).
+  `orin verify --contracts` (proved before it is trusted), but not checked at run time yet (ADR-0036, open question 1).
 - Contract-internal calls are unchecked only one level deep: the body of a function called from a clause is
   ordinary checked code (a recursive function with a contract that calls itself in its clause costs time
   quadratic in the depth, not an endless recursion).

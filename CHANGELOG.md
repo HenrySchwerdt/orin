@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0035).** `orin verify --contracts` now encodes arrays
+- **Contract verifier, bigger fragment (ADR-0031 B6-B9, C11-C12; ADR-0036).** `orin verify --contracts` now encodes arrays
   (length, index with a bounds obligation, push/pop/slice/element writes), records and classes (fields, `{ ..r, f: v }`),
   `Option` / `Result` / unions with `match`, `Map` (size, membership), every integer width with its exact range, strings by
   length, and generic functions and classes (type parameters are opaque). Modular verification: a callee `@Requires` is an

@@ -18,7 +18,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:utf8` | Orin, `stdlib/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
 | `std:collections` | Orin, `stdlib/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `stdlib/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; no sockets (ADR-0033 later); ADR-0030 |
-| `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0035) |
+| `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
@@ -389,7 +389,7 @@ other and sizes add up).
   6. generic *contract helpers over records of a generic type* work (`btreeIntShapeOk<V>`), but a recursive structure has to
      be an arena with indices plus explicit-stack loops: there is no termination measure checking for loops
      (`@Decreases` is only type-checked) and `orin verify --contracts` proves only some of these clauses (arrays, classes and
-     loops are in its fragment since ADR-0035, but loop invariants and recursive structures are mostly missing; counts in
+     loops are in its fragment since ADR-0036, but loop invariants and recursive structures are mostly missing; counts in
      docs/assurance.md), so most invariants here are run-time checks (tests, `--check-contracts`), not proofs;
   7. a mutating method cannot be called inside `&&`/`||`/`?:` or on a temporary (E0408/E0401), and `private constructor` is
      rejected (E0411).
