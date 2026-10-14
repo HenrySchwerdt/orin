@@ -1,6 +1,24 @@
 # Changelog
 
 ## Unreleased
+- **Closure inlining and fusion (ADR-0038 §2; `compiler/fuse`).** A chain of `map` / `filter` stages ended by `map`, `filter`,
+  `reduce`, `some`, `every`, `find`, `findIndex`, `forEach`, `includes` or `indexOf`, with pure arrow functions or named
+  functions at the call, becomes one loop: no intermediate arrays, no closure objects, closure bodies inlined, early exit, exact
+  capacity for a final `map`. Not fused: function values, impure closures, non-simple value arguments, results bound to a
+  variable, `sort` (a barrier). Traps: the same (stage, element) pairs are evaluated, so a fused chain traps iff the unfused one
+  does; the first of two traps may differ; early exit never hides a trap. `filter -> map -> reduce` over 5 M ints: 3.9x the loop's
+  CPU time before, 1.02x after. New flags `--no-fuse` and `--fuse-report`; `tools/diff_backends.py --mode fuse`; programs without
+  an array-API call compile to byte-identical code. The rewrite exception "hot loops stay loops" is gone (docs/rewrite.md rule 7).
+- **Parallel pipelines (ADR-0039 steps 1-3).** `xs.parallel()` with `map`, `filter`, `reduce`, `some`, `every`, `find`,
+  `findIndex`, `toArray`: fixed chunks of 4,096 (bit-identical results for every thread count), fused per chunk by the optimiser,
+  run by a new work-stealing fork/join pool in `std:task` (`forkJoin`, `forkJoinUntil`, `parallelism`; `std:taskcore` `Ranges`).
+  The input is lent to the workers without a copy (runtime: pinned reference counts; a transfer by another task copies pinned
+  objects). New rules: **E0484** (impure or unknown function), **E0485** (reducer not a built-in associative operator), **E0486**
+  (input element type not a scalar or flat record of scalars), warnings **W0480** (float reduce) and **W0481** (signed `+` or `*`
+  reduce may overflow differently). L0 gains `orin_platform_cpu_count`; `ORIN_THREADS` sets the thread count. Tests:
+  `tools/test_parallel.sh` (threads 1..8, fused / unfused, ThreadSanitizer, ASan), now part of `tools/test_concurrency.sh`. No
+  speedup could be measured on the loaded shared machine (CPU time unchanged); see docs/benchmarks.md.
+- **Fix:** `ORIN_STATS` peak live objects / bytes wrapped to 2^64 - 1 in programs whose tasks free objects other tasks allocated.
 - **Concurrency, stage 0 (ADR-0017 Addendum A; docs/concurrency.md).** New module `std:task`, written in Orin: structured
   `scope` / `spawn` / `TaskHandle.join`, bounded `channel<T>(capacity)` with `Sender` / `Receiver` (`send`, `recv`, `close`),
   `parallelMap`, and `scopeFs` / `spawnFs` (also process, stdio, clock) that MOVE a derived grant into a task (ADR-0027 Q10, smallest

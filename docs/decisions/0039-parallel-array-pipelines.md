@@ -111,6 +111,48 @@ law applies because of the sequential load and collect phases and the final join
 **Test harness:** independently of this, the test tools (the std mutants, std and tooling test files, Z3 cases)
 run their independent cases in a process pool now. That needs no Orin threads.
 
+## Implementation status (2026-10-14)
+
+Steps 1 to 3 of the order below are done; 4 and 5 are not. User documentation: docs/std.md "Parallel pipelines"; runtime:
+docs/concurrency.md "Fork/join pool and lending".
+
+- **Surface (§1).** The array method `parallel()` returns a view `Parallel<T>` (prelude `array/parallel.or`, loaded only for a
+  file that calls it, so other programs compile to the same code as before). Methods: `map`, `filter` (views), `reduce`, `some`,
+  `every`, `find`, `findIndex`, and `toArray()` to get the elements (a view is not an array; `toArray` is the one addition to the
+  sketch). Not yet: `sort`, `forEach`, `indexOf`, `includes`.
+- **Semantics (§2).** Fixed chunks of 4,096 elements, kept by every operation (a filtered chunk may become empty); results in
+  chunk order; `reduce` folds each chunk, then `init` with the chunk results, left to right; early-exit operations cancel the
+  chunks after the first hit and run every chunk before it. Below 8,192 elements, or with one thread, the chunks run in order
+  on the calling task: the same result. Without the optimiser every operation runs on its own (the prelude functions); with it,
+  a chain becomes one fused loop per chunk (`compiler/fuse`), with the same result: grouping by chunks of the SOURCE array
+  makes fused and unfused bit-identical, also for floats.
+- **Requirements (§3).** E0484: every function is a pure arrow function or named function (the message names the effect and
+  where it happens). E0485: the reducer is a built-in associative operator (`+` on integers, floats and strings, `*`, `&&`,
+  `||`, min and max as `?:` of a comparison or `Math.min` / `Math.max`), a user function needs the proof obligation of §3.2,
+  which is step 4. §3.3, the simplest sound rule: unsigned `+` is accepted silently (a partial sum is at most the total, so it
+  overflows only when the total does); signed `+` and any `*` warn (W0481), because a chunk's partial result can overflow where
+  the sequential fold does not, or the reverse. §3.4: a float `reduce` warns (W0480).
+- **Memory (§4).** Element types of the input: scalars and records of scalars (E0486); stages may produce any type. The input is
+  LENT, not copied: the runtime pins its graph (counts frozen, so inline retain / release do not write them) while the workers
+  run; a transfer by the owner shares pinned objects, a transfer by anybody else copies them, so no result refers into the lent
+  graph after the lend ends. Results are built per chunk and moved to the caller. Lending is the temporary runtime C of
+  ADR-0017 (TESTED_ONLY), to move to Orin with R3.
+- **Pool.** `std:task` `forkJoin` / `forkJoinUntil`: a pool per call, `ORIN_THREADS` (or the processors online) worker tasks,
+  work stealing over chunk ranges (`std:taskcore` `Ranges`, invariants checked by `orin test`); a panic in a chunk cancels the
+  rest, joins every worker and traps the caller with the chunk's own message.
+- **Tests (§5).** `tests/next/run/par_ops.or` (every operation against the sequential chain at sizes 0, 1, 2, 4095 to 4097,
+  8191 to 8193, 12287 to 12289, 40000), `par_float_reduce.or`, `par_trap.or`, `tests/concurrency/par_pipelines.or`, seven error
+  tests; `tools/test_parallel.sh` runs them fused, `--no-fuse` and `--no-opt` with ORIN_THREADS = 1 .. 8 and the default, then
+  under ThreadSanitizer (2, 4, 8 threads) and ASan + UBSan; it is part of `tools/test_concurrency.sh`.
+- **Measured** (`bench/streams_parallel`, docs/benchmarks.md): no speedup could be measured on the shared 4-core machine (load
+  average 15 to 22 while measuring: a process got about half of one core); the CPU time of the parallel runs equals the
+  sequential one within noise (no measurable overhead of chunking, lending or the pool). The speedup claim waits for an idle
+  machine.
+- **Not done:** parallel `sort` and user reducers with the associativity obligation (step 4), all element types (step 5), a
+  persistent pool (needs process-wide state), the Lean statement of §5, the parallel compiler of §6. A parallel `some` /
+  `every` / `find` / `findIndex` whose predicate can trap may trap on an element after the first match (a chunk to the right
+  may run before the hit is known); documented, not prevented.
+
 ## Order
 
 1. Concurrency stage 0 (ADR-0017): pool, tasks, per-thread heaps.

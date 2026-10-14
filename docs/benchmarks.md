@@ -392,3 +392,39 @@ Per-task heap state (`__thread` counters, free lists, work stack) replaced globa
 current, executed instructions (callgrind): fib 1.0000, sieve 1.0000, nbody 1.0000, strings 1.0138, wordfreq 1.0132, mapfreq 1.0159,
 qsort_func 1.0143, bintrees 1.0197. The counters use the `local-exec` TLS model (one instruction per update); with the default model
 the cost was up to 1.05. Task micro-benchmarks (`bench/tasks`) and the rest: docs/concurrency.md "Measurements".
+
+## Streams: closure inlining and fusion (ADR-0038 §2)
+
+`bench/streams/main.or`: `filter -> map -> reduce` over 5,000,000 ints, 10 times, as a hand-written loop (`loop`) and as an
+array-API chain with arrow functions (`chain`); the time includes building the input once. C backend, `cc -O2`, 9 interleaved
+runs, median (min-max); CPU = user + system. The machine was shared (load average 15 while measuring), so the wall times are
+about twice the CPU times; compare the CPU column.
+
+| | loop wall | loop CPU | chain wall | chain CPU | chain / loop (CPU) |
+|---|---:|---:|---:|---:|---:|
+| before (baseline compiler, prelude functions with closure calls) | 0.274 (0.233-0.329) | 0.117 | 0.954 (0.792-1.113) | 0.456 | 3.9x |
+| after (fused into one loop) | 0.221 (0.206-0.268) | 0.107 | 0.252 (0.216-0.290) | 0.109 | 1.02x |
+
+The fused chain is the loop: no intermediate arrays, no closure objects, no indirect calls. `--no-fuse` gives the old numbers.
+
+## Streams, parallel (ADR-0039)
+
+`bench/streams_parallel/main.or`, the first argument picks: `seq` / `par` = the chain above without and with `parallel()`;
+`seqheavy` / `parheavy` = the Collatz step count of 1..2,000,000 summed (about 100 steps per element, compute-bound). Same
+build, 5 interleaved runs, median; ORIN_THREADS sets the worker count. 4 vCPUs, **load average 16 while measuring**.
+
+| variant | threads | wall | CPU |
+|---|---:|---:|---:|
+| seq | - | 0.263 | 0.118 |
+| par | 1 | 0.282 | 0.124 |
+| par | 2 | 0.343 | 0.129 |
+| par | 4 | 0.348 | 0.132 |
+| seqheavy | - | 1.509 | 0.671 |
+| parheavy | 1 | 1.616 | 0.743 |
+| parheavy | 2 | 1.605 | 0.712 |
+| parheavy | 4 | 1.660 | 0.721 |
+
+**No speedup is claimed.** With a load average of 16 on 4 cores the process got about half of one core (wall is twice CPU even
+for the sequential run), so more threads could not run at the same time. What the numbers do show: the CPU time of the parallel
+runs is within 10 % of the sequential one, so chunking, lending the input (no copy) and the pool cost little; the results are
+identical for every thread count. Repeat on an idle machine: `ORIN_THREADS=4 ./streams_parallel parheavy` against `seqheavy`.
