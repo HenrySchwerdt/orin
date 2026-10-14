@@ -194,7 +194,7 @@ the C compiler and allocator are correct; the MIR → C emitter is a direct tran
 ## Verifier implementation notes
 Implementation: `compiler/verify/` (`wf.or` well-formedness, `state.or` abstract domain and joins (class `State`),
 `rules.or` one transfer function per instruction/terminator (methods of class `Transfer`), `verify.or` worklist fixpoint
-(classes `Worklist`, `Fixpoint`) and reporting). The structural predicates shared with the lowering are in
+(class `Fixpoint`, which owns the worklist) and reporting). The structural predicates shared with the lowering are in
 `compiler/mir/wellformed.or` (`isWellFormedFunction`, `isWellFormedProgram`, `instrInRange`, `termInRange`, ...); the
 verifier's own check is independent of them, and its contracts state that it implies them (docs/rewrite.md, step 3b). Tests: `compiler/tests/verify_main.or` (hand-written cases), `compiler/tests/verify_text.or` (batch driver over textual MIR: differential test against the Lean checker, `tools/diff_verifier_lean.py`, and mutation corpus, `tools/mutate_mir.py`). Choices where the rules above were ambiguous:
 
