@@ -2,7 +2,8 @@
 // checks the outcome. One line per case; exit status 1 if any case fails.
 //   build/bootstrap/orin2 build compiler/tests/verify_main.or -o build/verify_main && ./build/verify_main
 
-import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase } from "../mir";
+import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, plainBlock, hasSpan } from "../mir";
+import { Span } from "../diag";
 import {
   BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, BFsReadFile, BFsExists, BGrantFs, BGrantClock, BGrantUnder,
   BGrantReadOnly, BGrantRevoke, BTimeNowMillis, UnOp, BinOp
@@ -19,7 +20,7 @@ function lh(n: string): MLocal { return MLocal { name: n, ty: MHandle }; }
 function lb(n: string): MLocal { return MLocal { name: n, ty: MBool }; }
 
 function bk(instrs: Instr[], term: Terminator): MBlock {
-  return MBlock { instrs: instrs, term: term };
+  return plainBlock(instrs, term);
 }
 
 function fn(name: string, params: usize, locals: MLocal[], ret: MType, blocks: MBlock[]): MFunction {
@@ -639,7 +640,7 @@ function withAuth(p0: MProgram): MProgram {
       for (const i of b.instrs) {
         is.push(sInstr(i));
       }
-      blocks.push(MBlock { instrs: is, term: sTerm(b.term) });
+      blocks.push(plainBlock(is, sTerm(b.term)));
     }
     fs.push(MFunction {
       name: f.name, paramCount: f.paramCount + 1, paramOwned: [false].concat(f.paramOwned), inout: false,
@@ -905,8 +906,49 @@ function inoutCases(): usize {
   return bad;
 }
 
+// Source positions (docs/mir.md v2.0): an ownership error is reported at the span of the offending instruction, a
+// well-formedness error and an error in MIR without spans carry none.
+function spanCases(): usize {
+  let bad: usize = 0;
+  const first = Span { file: 0, start: 10, end: 20 };
+  const second = Span { file: 0, start: 30, end: 41 };
+  const end = Span { file: 0, start: 50, end: 52 };
+  // `release x; release x`: the second release is the double free, at the second span.
+  const blk = MBlock {
+    instrs: [IDup(1, OStr(0)), IRelease(1), IRelease(1)],
+    spans: [first, first, second],
+    term: TReturn(None),
+    termSpan: end
+  };
+  const r = verify(prog([fn("f", 1, [lr("p"), lr("x")], MVoid, [blk])]));
+  if (r.errors.length != 1 || r.errors[0].instr != 2 || !hasSpan(r.errors[0].span) || r.errors[0].span.start != 30 || r.errors[0].span.end != 41) {
+    console.log("FAIL span of the double release");
+    bad += 1;
+  } else {
+    console.log("PASS span of the double release");
+  }
+  // a leak is a warning at the terminator that returns it (the span of the `return`).
+  const leak = MBlock { instrs: [IDup(1, OStr(0))], spans: [first], term: TReturn(None), termSpan: end };
+  const w = verify(prog([fn("f", 1, [lr("p"), lr("x")], MVoid, [leak])]));
+  if (w.errors.length != 0 || w.warnings.length != 1 || w.warnings[0].span.start != 50) {
+    console.log("FAIL span of the leak warning");
+    bad += 1;
+  } else {
+    console.log("PASS span of the leak warning");
+  }
+  // hand-written MIR has no spans
+  const plain = verify(prog([fn("f", 1, [lr("p"), lr("x")], MVoid, [bk([IDup(1, OStr(0)), IRelease(1), IRelease(1)], ret())])]));
+  if (plain.errors.length != 1 || hasSpan(plain.errors[0].span)) {
+    console.log("FAIL no span without spans");
+    bad += 1;
+  } else {
+    console.log("PASS no span without spans");
+  }
+  return bad;
+}
+
 function main(): void {
-  const bad = negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + inoutCases();
+  const bad = spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + inoutCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

@@ -132,3 +132,19 @@ Phase C: pilot on a minimal generic byte-stream listener with a typed decoder an
 Phase D: implement the Lean milestones progressively and add a gated proof/implementation correspondence matrix; do not wait to add compiler/runtime safety tests.
 
 **Project owner decisions still pending (ADR-0027):** grant-only vs borrowed local syntax, new console policy and trusted panic path, safe process spawn, host policy format, path-relative semantics, `exists` result type, env/entropy families, network scoped listeners, runtime grant quotas and async grant transfer. This ADR proposes directions for console/spawn but **does not silently freeze their API**.
+
+## Implementation status
+
+- **Phase B, D2 (transitive effects): implemented** (Stage B of ADR-0021), no new syntax. One engine over the semantic index,
+  `compiler/analysis/effects.or`, behind `orin effects <entry|package>`, the OSIG `MAY_PERFORM` edge (`osig/0.2`, ADR-0023
+  addendum), the `orin diff` effect sections, the LSP hover and the MCP `inspect` result. Soundness argument, the UNKNOWN
+  sources and the purity agreement: [capabilities.md](../capabilities.md). Acceptance criterion 6 (module / package summaries
+  with all reachable primitive effects and explanation paths, LSP and OSIG on the identical analysis) holds; criterion 3 (an
+  indirect call or callback cannot cause an output without an independent grant) is enforced by the Stage A checker, the
+  summary shows the effect.
+- **D4, minimal policy hook:** `[effects] allowed` / `[effects.<module>]` in `orin.toml`; E0473 (module exceeds its allowance,
+  with the explanation path), E0474 (unknown effect name). The strict policies on semantic boundaries are open.
+- Not started: D1 derived capability types, D3 boundaries / lineage, D5 migration of `console.*` and `shell`, D6 Lean model.
+  The effect summary treats `console.*` as an ambient OUTPUT effect and `shell` as `Process.Spawn` (CONTROL) already, so the
+  D5 migration changes the grant column of `Console.Write` and nothing else.
+

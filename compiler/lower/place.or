@@ -1,0 +1,191 @@
+// Updating a place in place (`a.b[i].c = v`, `a.b.push(x)`, `s.f += "x"`): the take / make_unique / put walk of
+// docs/mir.md. A pure planner: it is given the number of the first free local and returns the instructions and the types
+// of the temporaries it uses (temporary `k` is local `base + k`), so the caller declares them in order and emits the
+// instructions. Every object the walk takes out of its container is put back.
+
+import { Type, Place, PlaceElem, BinOp, Builtin } from "../hir";
+import { MType, Operand, Instr } from "../mir";
+import { isF32Ty, mty } from "./util";
+import { rangeCheck } from "./ops";
+
+// What the walk does at the end of the path.
+export type Fin =
+  FSet(Operand)
+  | FArith(BinOp, Operand)
+  | FAppend(Operand)
+  | FPush(Operand)
+  | FPop(usize);
+
+export type Walk = { instrs: Instr[]; temps: MType[]; };
+
+function finIsWhole(f: Fin): bool {
+  return match (f) {
+    FPush(_) => true,
+    FPop(_) => true,
+    _ => false,
+  };
+}
+
+function takeElem(t: usize, cont: usize, el: PlaceElem, ix: Operand): Instr {
+  return match (el) {
+    PField(_, i) => ITakeField(t, cont, i),
+    PIndex(_) => IArrayTake(t, cont, ix),
+  };
+}
+
+function putElem(cont: usize, el: PlaceElem, ix: Operand, t: usize): Instr {
+  return match (el) {
+    PField(_, i) => IPutField(cont, i, t),
+    PIndex(_) => IArrayPut(cont, ix, t),
+  };
+}
+
+function isTake(i: Instr): bool {
+  return match (i) {
+    ITakeField(_, _, _) => true,
+    IArrayTake(_, _, _) => true,
+    _ => false,
+  };
+}
+
+function isPut(i: Instr): bool {
+  return match (i) {
+    IPutField(_, _, _) => true,
+    IArrayPut(_, _, _) => true,
+    _ => false,
+  };
+}
+
+// Number of take instructions (a slot left empty until a put) in `is`.
+export function takeCount(is: Instr[]): usize {
+  let n: usize = 0;
+  for (const i of is) {
+    if (isTake(i)) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+export function putCount(is: Instr[]): usize {
+  let n: usize = 0;
+  for (const i of is) {
+    if (isPut(i)) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+// Update `place` (path non-empty or whole-array mutation) via take / make_unique / put. `idx` holds one operand per path
+// element (the evaluated index of a `PIndex`, anything for a field).
+@Requires(idx.length == place.path.length)
+@Ensures(takeCount(result.instrs) == putCount(result.instrs))
+@Ensures(place.path.length == 0 ==> result.temps.length == 0 && result.instrs.length <= 1)
+@Ensures(place.path.length > 0 ==> result.instrs.length >= 1)
+export function walkPlace(base: usize, place: Place, idx: Operand[], fin: Fin, ty: Type): Walk {
+  let instrs: Instr[] = [];
+  let temps: MType[] = [];
+  const n = place.path.length;
+  const whole = finIsWhole(fin);
+  if (n == 0) {
+    match (fin) {
+      FPush(v) => {
+        instrs.push(IArrayPush(place.root, v));
+      },
+      FPop(d) => {
+        instrs.push(IArrayPop(d, place.root));
+      },
+      _ => {},
+    }
+    return Walk { instrs: instrs, temps: temps };
+  }
+  instrs.push(IMakeUnique(place.root));
+  let cur = place.root;
+  let conts: usize[] = [];
+  let taken: usize[] = [];
+  let k: usize = 0;
+  while (k < n) {
+    const last = k + 1 == n;
+    const el = place.path[k];
+    if (last && !whole) {
+      match (fin) {
+        FSet(v) => {
+          match (el) {
+            PField(_, i) => {
+              instrs.push(ISetField(cur, i, v));
+            },
+            PIndex(_) => {
+              instrs.push(IArraySet(cur, idx[k], v));
+            },
+          }
+        },
+        FArith(op, v) => {
+          const prev = base + temps.length;
+          temps.push(mty(ty));
+          match (el) {
+            PField(_, i) => {
+              instrs.push(IGetField(prev, OLocal(cur), i));
+            },
+            PIndex(_) => {
+              instrs.push(IArrayGet(prev, OLocal(cur), idx[k]));
+            },
+          }
+          const nw = base + temps.length;
+          temps.push(mty(ty));
+          instrs.push(IBinary(nw, op, OLocal(prev), v));
+          for (const r of rangeCheck(ty, op, nw)) {
+            instrs.push(r);
+          }
+          if (isF32Ty(ty)) {
+            instrs.push(IBuiltin(Some(nw), BF32Round, [OLocal(nw)]));
+          }
+          match (el) {
+            PField(_, i) => {
+              instrs.push(ISetField(cur, i, OLocal(nw)));
+            },
+            PIndex(_) => {
+              instrs.push(IArraySet(cur, idx[k], OLocal(nw)));
+            },
+          }
+        },
+        FAppend(v) => {
+          const t = base + temps.length;
+          temps.push(MRef);
+          instrs.push(takeElem(t, cur, el, idx[k]));
+          instrs.push(IStrAppend(t, v));
+          instrs.push(putElem(cur, el, idx[k], t));
+        },
+        _ => {},
+      }
+    } else {
+      const t = base + temps.length;
+      temps.push(MRef);
+      instrs.push(takeElem(t, cur, el, idx[k]));
+      conts.push(cur);
+      taken.push(t);
+      cur = t;
+      if (last) {
+        match (fin) {
+          FPush(v) => {
+            instrs.push(IArrayPush(cur, v));
+          },
+          FPop(d) => {
+            instrs.push(IArrayPop(d, cur));
+          },
+          _ => {},
+        }
+      } else {
+        instrs.push(IMakeUnique(cur));
+      }
+    }
+    k += 1;
+  }
+  // unwind: put every taken object back into its container (innermost first)
+  let j = taken.length;
+  while (j > 0) {
+    j -= 1;
+    instrs.push(putElem(conts[j], place.path[j], idx[j], taken[j]));
+  }
+  return Walk { instrs: instrs, temps: temps };
+}

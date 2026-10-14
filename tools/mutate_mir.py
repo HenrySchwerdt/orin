@@ -93,13 +93,19 @@ class Func:
         return self.locals[i][1] == "ref"
 
 
+SPAN_RE = re.compile(r" @\d+:\d+-\d+$")
+
+
 def parse(text):
-    """-> (prefix text up to and including `main = ..`, [Func])"""
+    """-> (prefix text up to and including `main = ..`, [Func])
+
+    The source positions the lowering records (` @file:start-end` after an instruction or terminator,
+    docs/mir.md v2.0) are dropped: the mutations are about ownership, and a mutant has no source position."""
     prefix, funcs = [], []
     cur = None
     seen_main = False
     for line in text.split("\n"):
-        s = line.strip()
+        s = SPAN_RE.sub("", line.strip())
         if not seen_main:
             prefix.append(line)
             if s.startswith("main = fn"):

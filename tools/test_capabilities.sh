@@ -85,4 +85,27 @@ for b in $backends; do
     [ ! -s build/capabilities/fs_open.$b.out ] || fail "$b: user code ran under the malformed policy '$bad'"
   done
 done
+# 5. static and dynamic agree (ADR-0037 D2, Stage B): the effects `orin effects` infers for a program cover the families the
+#    runtime denies above -- the program that traps under ORIN_DENY=<family> has an inferred effect of that family, and the
+#    inferred summary agrees with the purity analysis. (The static summary is an over-approximation: it may list more than
+#    one run performs, never less.)
+effects_of() { $ORIN2 effects tests/next/deny/$1.or --summary --no-paths; }
+has() { # program effect-name
+  effects_of "$1" | grep -qF -- "  $2 " || fail "effects of $1: expected $2 in the inferred summary"
+}
+has fs_open Fs.Open
+has fs_open Fs.Read
+has fs_open Fs.ReadFile
+has fs_open Fs.WriteFile
+has fs_exists Fs.Stat
+has process_args Process.Args
+has process_shell Process.Spawn
+has stdio_read Stdio.Read
+has clock_now Clock.Now
+for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now; do
+  has $n Host.Acquire
+  $ORIN2 effects tests/next/deny/$n.or --check-purity >/dev/null || fail "effects of $n disagree with the purity analysis"
+done
+# a program without grants performs no grant-requiring effect, and says so
+if effects_of ../run/cap_pure_no_grants | grep -E "Fs\.|Process\.|Stdio\.|Clock\." >/dev/null; then fail "cap_pure_no_grants has a grant-requiring effect"; fi
 echo "capabilities ok ($backends)"

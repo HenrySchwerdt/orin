@@ -10,7 +10,8 @@
 // Liveness is alias-aware (a use of a borrowed projection of p counts as a use of p), which keeps
 // the release after every use of an alias that the verifier would otherwise see dead.
 
-import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr, Terminator, SwitchCase } from "../mir";
+import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr, Terminator, SwitchCase, spanAt } from "../mir";
+import { Span } from "../diag";
 import {
   instrUses, successors, contains, ancestors, affects, usesAffecting, termUsesAffecting,
   entryHasPredecessor, isRefTy
@@ -201,6 +202,11 @@ function rewriteUse(prog: MProgram, anc: usize[][], ins: Instr, p: usize, dead: 
   };
 }
 
+// The block that releases `p` on the edge out of `blk` towards `target`; its code has the position of `blk`'s terminator.
+function edgeBlock(blk: MBlock, p: usize, target: usize): MBlock {
+  return MBlock { instrs: [IRelease(p)], spans: [blk.termSpan], term: TGoto(target), termSpan: blk.termSpan };
+}
+
 // Make parameter p (already flagged owned in prog) own its reference in f's body.
 export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction {
   const anc = ancestors(f);
@@ -214,24 +220,31 @@ export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction 
     const blk = f.blocks[b];
     const la = liveAfter(blk, anc, p, lv.liveOut[b]);
     let out: Instr[] = [];
+    let sps: Span[] = [];
     if (b == 0 && !lv.liveIn[0]) {
       out.push(IRelease(p));
+      sps.push(spanAt(blk, 0));
     }
     let i: usize = 0;
     while (i < blk.instrs.length) {
       const ins = blk.instrs[i];
+      const here = blk.spans[i];
       if (!usesAffecting(anc, ins, p)) {
         out.push(ins);
+        sps.push(here);
       } else {
         const dead = !la[i];
         const ru = rewriteUse(prog, anc, ins, p, dead, locals.length);
         for (const pi of ru.pre) {
           locals.push(MLocal { name: "_", ty: MRef });
           out.push(pi);
+          sps.push(here);
         }
         out.push(ru.main);
+        sps.push(here);
         if (dead && !ru.consumed) {
           out.push(IRelease(p));
+          sps.push(here);
         }
       }
       i += 1;
@@ -244,11 +257,11 @@ export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction 
           let nx = x;
           let ny = y;
           if (!lv.liveIn[x]) {
-            extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(x) });
+            extra.push(edgeBlock(blk, p, x));
             nx = nb + extra.length - 1;
           }
           if (!lv.liveIn[y]) {
-            extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(y) });
+            extra.push(edgeBlock(blk, p, y));
             ny = nb + extra.length - 1;
           }
           term = TBranch(c, nx, ny);
@@ -258,14 +271,14 @@ export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction 
           for (const k of cs) {
             let t = k.target;
             if (!lv.liveIn[t]) {
-              extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(t) });
+              extra.push(edgeBlock(blk, p, t));
               t = nb + extra.length - 1;
             }
             ncs.push(SwitchCase { value: k.value, target: t });
           }
           let nd = d;
           if (!lv.liveIn[d]) {
-            extra.push(MBlock { instrs: [IRelease(p)], term: TGoto(d) });
+            extra.push(edgeBlock(blk, p, d));
             nd = nb + extra.length - 1;
           }
           term = TSwitch(o, ncs, nd);
@@ -273,7 +286,7 @@ export function rewriteParam(prog: MProgram, f: MFunction, p: usize): MFunction 
         _ => {}
       }
     }
-    blocks.push(MBlock { instrs: out, term: term });
+    blocks.push(MBlock { instrs: out, spans: sps, term: term, termSpan: blk.termSpan });
     b += 1;
   }
   for (const e of extra) {

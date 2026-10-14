@@ -8,6 +8,7 @@
 // (compiler/verify) checks these states by dataflow; codegen trusts a verified MIR.
 
 import { Builtin, UnOp, BinOp } from "../hir";
+import { Span } from "../diag";
 
 // MFloat (v1.4, ADR-0018): an IEEE-754 binary64 scalar; an `f32` is an MFloat holding a value exactly
 // representable in binary32 (lowering rounds with `IBuiltin(BF32Round)` after every f32 operation).
@@ -93,7 +94,36 @@ export type Terminator =
   | TReturn(Option<Operand>)                    // ref result must be Owned (consumed) or OStr
   | TTrap(string);                              // defined trap: "trap: <msg>", exit 101
 
-export type MBlock = { instrs: Instr[]; term: Terminator; };
+// A basic block. `spans[i]` is the source span of the HIR node `instrs[i]` was lowered from and `termSpan` that of the
+// terminator (v2.0, ADR-0020 D3); `noSpan()` marks code with no source (hand-written MIR, instructions the optimiser
+// invents). The spans never reach the C / LLVM output; the verifier reports them in its messages.
+@Invariant(this.spans.length == this.instrs.length)
+export type MBlock = { instrs: Instr[]; spans: Span[]; term: Terminator; termSpan: Span; };
+
+// The span of code that has no source position.
+@Ensures(!hasSpan(result))
+export function noSpan(): Span {
+  return Span { file: 4294967295, start: 0, end: 0 };
+}
+
+// True when `s` names a source position (anything but `noSpan()`).
+export function hasSpan(s: Span): bool {
+  return s.file != 4294967295;
+}
+
+// A block without source positions (hand-written MIR in tests and tools).
+@Ensures(result.instrs.length == instrs.length && result.spans.length == instrs.length)
+@Ensures(result.spans.every(s => !hasSpan(s)) && !hasSpan(result.termSpan))
+export function plainBlock(instrs: Instr[], term: Terminator): MBlock {
+  const spans: Span[] = instrs.map(i => noSpan());
+  return MBlock { instrs: instrs, spans: spans, term: term, termSpan: noSpan() };
+}
+
+// The span of instruction `i` of block `blk`; `i == blk.instrs.length` is the terminator.
+@Requires(i <= blk.instrs.length)
+export function spanAt(blk: MBlock, i: usize): Span {
+  return i < blk.instrs.length ? blk.spans[i] : blk.termSpan;
+}
 
 export type MFunction = {
   name: string;            // qualified, unique, deterministic (same as HIR)
