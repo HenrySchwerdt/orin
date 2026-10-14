@@ -413,6 +413,23 @@ int64_t orin_cap_clock(int64_t host);
 int64_t orin_cap_under(int64_t fs, OrinObj *path);
 int64_t orin_cap_read_only(int64_t fs);
 int64_t orin_cap_args_only(int64_t proc);
+/* network (ADR-0033; handles: NetGrant 5, Listener 6, Stream 7; openers return the handle or the negated error code) */
+int64_t orin_cap_net(int64_t host);
+int64_t orin_cap_listen(int64_t net, OrinObj *addr, int64_t port);
+int64_t orin_cap_connect(int64_t net, OrinObj *pattern, int64_t lo, int64_t hi);
+int64_t orin_net_listen(int64_t net, OrinObj *addr, int64_t port, int64_t backlog, int64_t opt);
+int64_t orin_net_accept(int64_t listener, int64_t timeout_ms, int64_t opt);
+int64_t orin_net_connect(int64_t net, OrinObj *host, int64_t port, int64_t timeout_ms, int64_t opt);
+int64_t orin_net_status(int64_t h);
+void orin_net_close(int64_t h);
+int64_t orin_net_port(int64_t listener);
+int64_t orin_net_now(int64_t h);
+OrinObj *orin_net_recv(int64_t stream, uint64_t cap, int64_t timeout_ms); /* Result<u8[], int> */
+OrinObj *orin_net_send(int64_t stream, OrinObj *data, uint64_t off, uint64_t len, int64_t timeout_ms); /* Result<usize, int> */
+int64_t orin_net_shutdown(int64_t stream, int64_t how);
+OrinObj *orin_net_peer(int64_t stream);
+OrinObj *orin_net_resolve(int64_t net, OrinObj *name); /* Result<string, int> */
+OrinObj *orin_net_error_text(int64_t code);
 void orin_cap_revoke(int64_t grant);                           /* end of the scope that acquired / narrowed it */
 void orin_cap_require(int64_t grant, int64_t kind, const char *what); /* traps unless valid, of `kind` and not denied */
 void orin_cap_require_spawn(int64_t proc);                     /* traps unless the process grant may spawn */

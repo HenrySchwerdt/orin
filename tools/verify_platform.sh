@@ -1,7 +1,7 @@
 #!/bin/sh
 # L0 platform layer checks (spec 19 R2, docs/formal.md "L0 platform layer"):
 #   1. executable contract tests (platform/tests/platform_test.c), plain and under ASan+UBSan
-#   2. size budget (<= 1,000 lines in platform/*.c, platform/*.h) and the runtime boundary check
+#   2. size budget (<= 1,000 code lines in platform/*.c, platform/*.h; contracts and comments excluded) and the runtime boundary check
 #   3. bounded model checking of the pure/memory primitives with CBMC (platform/tests/cbmc_harness.c);
 #      skipped with a notice when `cbmc` is not installed (apt install cbmc);
 #      REQUIRE_CBMC=1 turns the skip into a failure
@@ -19,9 +19,21 @@ $CC -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefine
 ASAN_OPTIONS=allocator_may_return_null=1 $B/platform_test_asan < /dev/null 2>/dev/null
 
 echo "[platform] size budget"
-n=$(cat platform/*.c platform/*.h | wc -l)
-echo "platform/*.c, platform/*.h: $n lines (budget 1000)"
-[ "$n" -le 1000 ] || { echo "platform layer exceeds its size budget" >&2; exit 1; }
+# Budget: <= 1,000 CODE lines (non-blank, comments and ACSL contracts excluded) in platform/*.c, platform/*.h.
+# The budget limits trusted code, not its specification (ADR-0030 section 1).
+code=$(python3 - platform/*.c platform/*.h <<'PY'
+import re, sys
+n = 0
+for f in sys.argv[1:]:
+    t = re.sub(r'/\*.*?\*/', lambda m: '\n' * m.group(0).count('\n'), open(f).read(), flags=re.S)
+    t = re.sub(r'//[^\n]*', '', t)
+    n += sum(1 for l in t.split('\n') if l.strip())
+print(n)
+PY
+)
+total=$(cat platform/*.c platform/*.h | wc -l)
+echo "platform/*.c, platform/*.h: $code code lines (budget 1000; comments, contracts, blank lines excluded), $total lines in total"
+[ "$code" -le 1000 ] || { echo "platform layer exceeds its size budget" >&2; exit 1; }
 
 echo "[platform] boundary"
 tools/check_platform_boundary.sh

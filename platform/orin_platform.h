@@ -6,8 +6,8 @@
  *
  * Rules for this layer: no data structures (one opaque OS handle type, `orin_platform_stream`, excepted),
  * no global state beyond argc/argv, no knowledge of Orin
- * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 lines including
- * comments. Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
+ * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 CODE lines (non-blank;
+ * comments and ACSL contracts do not count: the budget limits trusted code, not its specification). Single-threaded: no function may be called concurrently (threads are OPEN, spec 12 #5).
  *
  * CONTRACT FORMAT. Every function carries one ACSL-style block, machine readable (a leading
  * slash-star-at marker; clauses `requires`, `ensures`, `assigns`, each ending in `;`):
