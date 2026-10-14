@@ -60,7 +60,10 @@ ships with tests and docs and passes the full CI, including the bootstrap.
      extend by "disjoint heaps, send transfers ownership" instead of a new memory model;
    - *before performance*, because allocation, RC elision and escape analysis depend on the
      threading model, and the comparison with Go needs parallelism;
-   - the HTTP server becomes concurrent here.
+   - the HTTP server becomes concurrent here;
+   - parallel array pipelines (`xs.parallel()`, ADR-0039) build on the task pool, fusion and borrow inference.
+     Every closure must be pure, a `reduce` must be associative (built-in operator or proved), and chunks have a
+     fixed size, so the result is reproducible.
 6. **Performance push** (performance model: ADR-0038, inferred allocation and invariant-driven optimisation, no user-facing arena types):
    - unboxing, RC elision, escape analysis and region/stack allocation;
    - LLVM tuning and a parallel compiler;
