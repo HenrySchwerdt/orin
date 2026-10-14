@@ -1,0 +1,592 @@
+// std:net -- blocking TCP on the L0 network primitives (ADR-0033, ADR-0027, ADR-0025). UNSTABLE (ADR-0016).
+//
+// Authority. Every function that touches the network takes a handle as its first argument. The root `NetGrant` comes
+// from `main(host: Host)` through `useNet(host, net => ...)` (std:host). It is NARROWED, never widened:
+//   useListen(net, addr, port, l => ...)                       `l` may listen on `addr:port` only
+//   useConnect(net, hostPattern, portLo, portHi, c => ...)     `c` may connect / resolve only names matching the pattern
+// A host pattern is "*" (any), "*.example.com" (names below example.com) or an exact name or address, compared with the
+// text the program supplies (ASCII case-insensitive; see ADR-0033 for the limits). A request outside the scope is refused
+// with `Err(NetError)` (isDenied) by L0 before any system call. `ORIN_DENY=net` denies the whole family the same way.
+//
+// Resources. `Listener` and `Stream` are RESOURCE HANDLES (ADR-0025, like `File`): they exist only as the parameter of a
+// scope function (`withListener`, `withAccepted`, `withConnection`) and are closed when it returns, on every path; they
+// cannot be stored, copied, returned or captured by a closure (E0450-E0452 and the MIR verifier). Because a Stream
+// cannot be stored, state that belongs to one connection (the bytes read ahead, a parser) lives in a normal value
+// next to it: a `StreamReader`, an `http.RequestParser`.
+//
+// Time. Every call that can wait takes a timeout in milliseconds (0 .. 3,600,000); there is no infinite wait. A timeout
+// of `readUntil` / `readExact` / `sendAll` is a DEADLINE for the whole operation (a client that sends one byte per
+// `timeout - 1` ms does not extend it); `recv` / `send` / `accept` time out per call.
+//
+// Blocking and single threaded: one connection is served at a time until tasks exist (ADR-0017); a slow client holds
+// the server up to the deadlines you set.
+//
+// Errors never trap, except a forged / stale / wrong-kind handle (the runtime traps: it is a bug, not a condition).
+//
+// Contract standard (ADR-0030): every class has an @Invariant, every public function states @Requires / @Ensures.
+
+import { Bytes, bytesFromArray, emptyBytes } from "std:bytes";
+import {
+  NetGrant, Listener, Stream, grantListen, grantConnect, grantRevoke, netListen, netAccept, netConnect, netStatus, netClose,
+  netPort, netNow, netRecv, netSend, netShutdown, netPeer, netResolve, netErrorText
+} from "std:fsraw";
+
+export { NetGrant, Listener, Stream } from "std:fsraw";
+
+// ------------------------------------------------------------------------------------------------ errors
+
+// An error of this module: the L0 code and a message. Codes: 1 permission denied (scope or ORIN_DENY), 1001 closed by the
+// peer, 1002 timeout, 1003 reset; others are the errno of the OS (ECONNREFUSED, EADDRINUSE, ENOENT for an unknown name ...).
+export type NetError = { code: int; message: string; };
+
+const CODE_DENIED: int = 1;
+const CODE_EOF: int = 1001;
+const CODE_TIMEOUT: int = 1002;
+const CODE_RESET: int = 1003;
+const MAX_MS: int = 3600000;
+const CHUNK: usize = 65536;
+
+// makeError(code): the NetError of an L0 code. O(1).
+@Ensures(result.code == code)
+export function makeError(code: int): NetError {
+  return NetError { code: code, message: netErrorText(code) };
+}
+
+// isDenied(e): refused by the grant's scope or by the host policy. O(1).
+export function isDenied(e: NetError): bool {
+  return e.code == CODE_DENIED;
+}
+
+// isTimeout(e): nothing happened within the time given. O(1).
+export function isTimeout(e: NetError): bool {
+  return e.code == CODE_TIMEOUT;
+}
+
+// isReset(e): the connection was reset or broke. O(1).
+export function isReset(e: NetError): bool {
+  return e.code == CODE_RESET;
+}
+
+@Ensures(result >= 0 && result <= MAX_MS)
+@Ensures(ms >= 0 && ms <= MAX_MS ==> result == ms)
+function clampMs(ms: int): int {
+  if (ms < 0) {
+    return 0;
+  }
+  return ms > MAX_MS ? MAX_MS : ms;
+}
+
+// ------------------------------------------------------------------------------------------------ peers
+
+// The address of the other end of a stream: `host` is the numeric address, `port` its port.
+export type Peer = { host: string; port: int; };
+
+// parsePeer(text): "1.2.3.4:5" or "[::1]:5" to a Peer; Peer { host: text, port: 0 } if the text has no port. O(n).
+@Ensures(result.port >= 0 && result.port <= 100001)
+export function parsePeer(text: string): Peer {
+  let i = text.length;
+  while (i > 0) {
+    i -= 1;
+    if (text.charCodeAt(i) == 58) {
+      const port = text.substring(i + 1, text.length);
+      const p = parseDigits(port);
+      let h = text.substring(0, i);
+      if (h.length >= 2 && h.charCodeAt(0) == 91 && h.charCodeAt(h.length - 1) == 93) {
+        h = h.substring(1, h.length - 1);
+      }
+      return Peer { host: h, port: p };
+    }
+  }
+  return Peer { host: text, port: 0 };
+}
+
+function parseDigits(s: string): int {
+  let v: int = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c < 48 || c > 57 || v > 100000) {
+      return 0;
+    }
+    v = v * 10 + (c - 48);
+    i += 1;
+  }
+  return v;
+}
+
+// ------------------------------------------------------------------------------------------------ narrowing
+
+// withListen(net, addr, port, body): runs body with a grant that can only listen on exactly `addr:port` (addr is an
+// address literal; "0.0.0.0", "127.0.0.1", "::1" ...; port 0 = any port the OS picks). If `net` does not allow that, the
+// grant reaches nothing (every listen is refused). The grant is revoked when body returns. O(1).
+export function withListen<T>(net: NetGrant, addr: string, port: int, body: (l: NetGrant) => T): T {
+  const g = grantListen(net, addr, port);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+// useListen: `withListen` for a body that returns nothing.
+export function useListen(net: NetGrant, addr: string, port: int, body: (l: NetGrant) => void): void {
+  const g = grantListen(net, addr, port);
+  body(g);
+  grantRevoke(g);
+}
+
+// withConnect(net, hostPattern, portLo, portHi, body): a grant that can only connect to / resolve hosts matching
+// `hostPattern` on ports portLo..portHi. A pattern or range outside `net`'s scope yields a grant that reaches nothing. O(1).
+export function withConnect<T>(net: NetGrant, hostPattern: string, portLo: int, portHi: int, body: (c: NetGrant) => T): T {
+  const g = grantConnect(net, hostPattern, portLo, portHi);
+  const r = body(g);
+  grantRevoke(g);
+  return r;
+}
+
+// useConnect: `withConnect` for a body that returns nothing.
+export function useConnect(net: NetGrant, hostPattern: string, portLo: int, portHi: int, body: (c: NetGrant) => void): void {
+  const g = grantConnect(net, hostPattern, portLo, portHi);
+  body(g);
+  grantRevoke(g);
+}
+
+// ------------------------------------------------------------------------------------------------ listeners
+
+// withListener(net, addr, port, backlog, body): binds a listener on addr:port (SO_REUSEADDR), runs body(listener) and
+// closes it. `Err` if `net` does not allow it (isDenied), the port is in use or the arguments are invalid; body is not
+// called then. `port` 0 binds a free port, `portOf(listener)` tells which. backlog 1..4096. The listener is created
+// through a grant narrowed to exactly addr:port.
+export function withListener<T>(net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener) => T): Result<T, NetError> {
+  const g = grantListen(net, addr, port);
+  const ln = netListen(g, addr, port, backlog, 1);
+  const code = netStatus(ln);
+  if (code != 0) {
+    netClose(ln);
+    grantRevoke(g);
+    return Err(makeError(code));
+  }
+  const r = body(ln);
+  netClose(ln);
+  grantRevoke(g);
+  return Ok(r);
+}
+
+// useListener: `withListener` for a body that returns nothing.
+export function useListener(net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener) => void): Result<void, NetError> {
+  const g = grantListen(net, addr, port);
+  const ln = netListen(g, addr, port, backlog, 1);
+  const code = netStatus(ln);
+  if (code != 0) {
+    netClose(ln);
+    grantRevoke(g);
+    return Err(makeError(code));
+  }
+  body(ln);
+  netClose(ln);
+  grantRevoke(g);
+  return Ok();
+}
+
+// useListenerNet(net, addr, port, backlog, body): `useListener` whose body also receives `net` again as a parameter (a
+// closure cannot capture a grant, so a body that must also connect, for example a loopback test, gets it this way).
+export function useListenerNet(
+  net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener, net: NetGrant) => void
+): Result<void, NetError> {
+  const g = grantListen(net, addr, port);
+  const ln = netListen(g, addr, port, backlog, 1);
+  const code = netStatus(ln);
+  if (code != 0) {
+    netClose(ln);
+    grantRevoke(g);
+    return Err(makeError(code));
+  }
+  body(ln, net);
+  netClose(ln);
+  grantRevoke(g);
+  return Ok();
+}
+
+// portOf(ln): the port the listener is bound to (the real one when it was asked for port 0). O(1).
+@Ensures(result >= 0 && result <= 65535)
+export function portOf(ln: Listener): int {
+  return netPort(ln);
+}
+
+// withAccepted(ln, timeoutMs, body): waits up to timeoutMs for a connection, runs body(stream, peer) and closes the
+// stream (a graceful `close` after `shutdownWrite` is the body's business). `Err(timeout)` if none came (isTimeout:
+// normal in a server loop), another Err on failure. TCP_NODELAY is on.
+export function withAccepted<T>(ln: Listener, timeoutMs: int, body: (s: Stream, peer: Peer) => T): Result<T, NetError> {
+  const s = netAccept(ln, clampMs(timeoutMs), 1);
+  const code = netStatus(s);
+  if (code != 0) {
+    netClose(s);
+    return Err(makeError(code));
+  }
+  const peer = parsePeer(netPeer(s));
+  const r = body(s, peer);
+  netClose(s);
+  return Ok(r);
+}
+
+// useAccepted: `withAccepted` for a body that returns nothing.
+export function useAccepted(ln: Listener, timeoutMs: int, body: (s: Stream, peer: Peer) => void): Result<void, NetError> {
+  const s = netAccept(ln, clampMs(timeoutMs), 1);
+  const code = netStatus(s);
+  if (code != 0) {
+    netClose(s);
+    return Err(makeError(code));
+  }
+  const peer = parsePeer(netPeer(s));
+  body(s, peer);
+  netClose(s);
+  return Ok();
+}
+
+// ------------------------------------------------------------------------------------------------ connections
+
+// withConnection(net, host, port, timeoutMs, body): connects (a name is resolved by the OS first: that lookup is not
+// bounded by timeoutMs), runs body(stream) and closes the stream. `Err` if refused (isDenied), unreachable or timed out.
+export function withConnection<T>(net: NetGrant, host: string, port: int, timeoutMs: int, body: (s: Stream) => T): Result<T, NetError> {
+  const s = netConnect(net, host, port, clampMs(timeoutMs), 1);
+  const code = netStatus(s);
+  if (code != 0) {
+    netClose(s);
+    return Err(makeError(code));
+  }
+  const r = body(s);
+  netClose(s);
+  return Ok(r);
+}
+
+// useConnection: `withConnection` for a body that returns nothing.
+export function useConnection(net: NetGrant, host: string, port: int, timeoutMs: int, body: (s: Stream) => void): Result<void, NetError> {
+  const s = netConnect(net, host, port, clampMs(timeoutMs), 1);
+  const code = netStatus(s);
+  if (code != 0) {
+    netClose(s);
+    return Err(makeError(code));
+  }
+  body(s);
+  netClose(s);
+  return Ok();
+}
+
+// useConnectionBeside(net, host, port, timeoutMs, ln, body): `useConnection` whose body also receives the listener `ln`
+// again (a closure cannot capture a handle): a client and the server side of the same process, for example a loopback test.
+// The connection completes before `accept` (the kernel queues it, backlog permitting).
+export function useConnectionBeside(
+  net: NetGrant, host: string, port: int, timeoutMs: int, ln: Listener, body: (s: Stream, ln: Listener) => void
+): Result<void, NetError> {
+  const s = netConnect(net, host, port, clampMs(timeoutMs), 1);
+  const code = netStatus(s);
+  if (code != 0) {
+    netClose(s);
+    return Err(makeError(code));
+  }
+  body(s, ln);
+  netClose(s);
+  return Ok();
+}
+
+// resolve(net, name): the numeric addresses of `name` (IPv4 and IPv6, no duplicates), or Err. The grant's scope must
+// cover `name` (any port). Not bounded by a timeout (the OS resolver's own).
+export function resolve(net: NetGrant, name: string): Result<string[], NetError> {
+  const r = netResolve(net, name);
+  return match (r) {
+    Ok(text) => Ok(splitLines(text)),
+    Err(code) => Err(makeError(code))
+  };
+}
+
+function splitLines(text: string): string[] {
+  let out: string[] = [];
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < text.length) {
+    if (text.charCodeAt(i) == 10) {
+      if (i > start) {
+        out.push(text.substring(start, i));
+      }
+      start = i + 1;
+    }
+    i += 1;
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------------ stream operations
+
+// The result of one `recv`.
+export type RecvResult = RecvData(Bytes) | RecvEof | RecvTimeout | RecvReset | RecvError(NetError);
+
+// recvWithin(r, max): a RecvData holds between 1 and `max` bytes (a recv never returns more than it was asked for, and
+// never an empty chunk: that is RecvEof). Other results hold no bytes. Used in contracts.
+export function recvWithin(r: RecvResult, max: usize): bool {
+  return match (r) {
+    RecvData(b) => b.length() >= 1 && b.length() <= max,
+    _ => true
+  };
+}
+
+// recvIsError(r): the result is RecvError. Used in contracts.
+export function recvIsError(r: RecvResult): bool {
+  return match (r) {
+    RecvError(e) => true,
+    _ => false
+  };
+}
+
+// recv(s, maxBytes, timeoutMs): waits up to timeoutMs for bytes and returns 1..min(maxBytes, 65536) of them
+// (RecvData), or RecvEof (the peer closed: no more data ever), RecvTimeout (nothing arrived), RecvReset, or RecvError.
+// maxBytes 0 is an error. One system call; the bytes are copied once from the L0 buffer into the result.
+@Ensures(recvWithin(result, maxBytes))
+@Ensures(maxBytes == 0 ==> recvIsError(result))
+export function recv(s: Stream, maxBytes: usize, timeoutMs: int): RecvResult {
+  if (maxBytes == 0) {
+    return RecvError(makeError(22));
+  }
+  const r = netRecv(s, maxBytes, clampMs(timeoutMs));
+  return match (r) {
+    Ok(arr) => RecvData(bytesFromArray(arr)),
+    Err(code) => recvFailure(code)
+  };
+}
+
+function recvFailure(code: int): RecvResult {
+  if (code == CODE_EOF) {
+    return RecvEof;
+  }
+  if (code == CODE_TIMEOUT) {
+    return RecvTimeout;
+  }
+  if (code == CODE_RESET) {
+    return RecvReset;
+  }
+  return RecvError(makeError(code));
+}
+
+// send(s, data, timeoutMs): one attempt: waits up to timeoutMs until the socket is writable and hands the OS at most
+// 65536 bytes of `data`; Ok(n) with 0 <= n <= min(length, 65536) (a partial write is normal), Err otherwise (isTimeout,
+// isReset: the peer is gone). `sendAll` loops.
+export function send(s: Stream, data: Bytes, timeoutMs: int): Result<usize, NetError> {
+  return sendFrom(s, data.toArray(), 0, timeoutMs);
+}
+
+function sendFrom(s: Stream, arr: u8[], off: usize, timeoutMs: int): Result<usize, NetError> {
+  const r = netSend(s, arr, off, arr.length - off, clampMs(timeoutMs));
+  return match (r) {
+    Ok(n) => Ok(n),
+    Err(code) => Err(makeError(code))
+  };
+}
+
+// sendAll(s, data, timeoutMs): sends all of `data`, resending the tail after partial writes; timeoutMs is a deadline for
+// the whole call. Err(timeout) if the peer does not read fast enough, Err(reset) if it is gone. O(length) copying.
+export function sendAll(s: Stream, data: Bytes, timeoutMs: int): Result<void, NetError> {
+  const arr = data.toArray();
+  const deadline = netNow(s) + clampMs(timeoutMs);
+  let off: usize = 0;
+  while (off < arr.length) {
+    const left = deadline - netNow(s);
+    if (left <= 0) {
+      return Err(makeError(CODE_TIMEOUT));
+    }
+    const r = sendFrom(s, arr, off, left > MAX_MS ? MAX_MS : left);
+    match (r) {
+      Ok(n) => {
+        if (n == 0) {
+          return Err(makeError(CODE_RESET));
+        }
+        off += n;
+      },
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  return Ok();
+}
+
+// shutdownWrite(s): half-close: sends FIN so the peer reads EOF while this side can still read. The first step of a
+// graceful close (then drain with `recv` for a bounded time, then let the scope close the stream); a bare close with
+// unread input makes the OS send RST, which can discard the response just written.
+export function shutdownWrite(s: Stream): Result<void, NetError> {
+  const code = netShutdown(s, 1);
+  if (code != 0) {
+    return Err(makeError(code));
+  }
+  return Ok();
+}
+
+// nowMillis(s): a monotonic clock in milliseconds (arbitrary origin) for deadlines; it needs a live stream, so a function
+// that has no clock grant can still enforce a deadline on the connection it was given. O(1).
+export function nowMillis(s: Stream): int {
+  return netNow(s);
+}
+
+// ------------------------------------------------------------------------------------------------ reading with a buffer
+
+// The result of `readExact` / `readUntil`: Filled(bytes), FillClosed(bytes read before the peer closed), FillLimit
+// (the limit was reached without the delimiter), FillTimeout (the deadline passed; bytes read so far stay buffered),
+// FillError.
+export type Fill = Filled(Bytes) | FillClosed(Bytes) | FillLimit | FillTimeout | FillError(NetError);
+
+// A read buffer for one stream: the bytes read ahead of what the caller consumed. A normal value (a Stream cannot be
+// stored). `cap` bounds the buffered bytes: no operation ever holds more, so a hostile peer cannot grow it.
+@Invariant(this.cap >= 1 && this.pending.length() <= this.cap)
+export class StreamReader {
+  private pending: Bytes;
+  private cap: usize;
+
+  // new StreamReader(cap): an empty buffer that holds at most `cap` bytes (1 .. 268435456).
+  @Requires(cap >= 1 && cap <= 268435456)
+  constructor(cap: usize) {
+    this.pending = emptyBytes();
+    this.cap = cap;
+  }
+
+  // buffered(): the bytes read ahead and not yet consumed. O(1).
+  @Ensures(result.length() <= this.cap)
+  buffered(): Bytes {
+    return this.pending;
+  }
+
+  // capacity(): the most bytes the buffer holds. O(1).
+  @Ensures(result == this.cap)
+  capacity(): usize {
+    return this.cap;
+  }
+
+  // unread(data): puts `data` back in front of the buffered bytes (for example the rest of a chunk a parser did not use).
+  @Requires(data.length() + this.pending.length() <= this.cap)
+  @Ensures(this.buffered().length() == old(this.buffered().length()) + data.length())
+  unread(data: Bytes): void {
+    this.pending = data.concat(this.pending);
+  }
+
+  // take(n): removes and returns the first n buffered bytes.
+  @Requires(n <= this.pending.length())
+  @Ensures(result.length() == n)
+  @Ensures(this.pending.length() == old(this.pending.length()) - n)
+  take(n: usize): Bytes {
+    const head = this.pending.slice(0, n);
+    this.pending = this.pending.slice(n, this.pending.length());
+    return head;
+  }
+
+  // readSome(s, maxBytes, timeoutMs): buffered bytes if there are any (at most maxBytes, no system call), else one `recv`.
+  @Requires(maxBytes >= 1)
+  readSome(s: Stream, maxBytes: usize, timeoutMs: int): RecvResult {
+    if (this.pending.length() > 0) {
+      const n = this.pending.length() < maxBytes ? this.pending.length() : maxBytes;
+      return RecvData(this.take(n));
+    }
+    return recv(s, maxBytes < this.cap ? maxBytes : this.cap, timeoutMs);
+  }
+
+  // readExact(s, n, timeoutMs): exactly n bytes (Filled), or what arrived before the peer closed (FillClosed), or
+  // FillTimeout when the DEADLINE timeoutMs (for the whole call) passed. Never reads past n bytes: further bytes stay in
+  // the stream.
+  @Requires(n <= this.cap)
+  @Ensures(match (result) { Filled(b) => b.length() == n, _ => true })
+  @Ensures(this.pending.length() <= this.cap)
+  readExact(s: Stream, n: usize, timeoutMs: int): Fill {
+    const deadline = netNow(s) + clampMs(timeoutMs);
+    while (this.pending.length() < n) {
+      const left = deadline - netNow(s);
+      if (left < 0) {
+        return FillTimeout;
+      }
+      const want = n - this.pending.length();
+      const r = recv(s, want, left);
+      match (r) {
+        RecvData(b) => {
+          this.pending = this.pending.concat(b);
+        },
+        RecvEof => {
+          return FillClosed(this.take(this.pending.length()));
+        },
+        RecvTimeout => {
+          return FillTimeout;
+        },
+        RecvReset => {
+          return FillError(makeError(CODE_RESET));
+        },
+        RecvError(e) => {
+          return FillError(e);
+        }
+      }
+    }
+    return Filled(this.take(n));
+  }
+
+  // readUntil(s, delim, limit, timeoutMs): the bytes up to and including the first occurrence of `delim` (Filled), with
+  // at most `limit` bytes examined: FillLimit if `limit` bytes contain no delimiter (the buffer then keeps them), FillClosed
+  // (the bytes so far) if the peer closed first, FillTimeout at the DEADLINE timeoutMs for the whole call. Receives at
+  // most limit - buffered bytes each time, so at most `limit` bytes are buffered by the call.
+  @Requires(delim.length() >= 1 && limit >= delim.length() && limit <= this.cap)
+  @Ensures(match (result) { Filled(b) => b.length() <= limit && b.length() >= delim.length(), _ => true })
+  @Ensures(this.pending.length() <= this.cap)
+  readUntil(s: Stream, delim: Bytes, limit: usize, timeoutMs: int): Fill {
+    const deadline = netNow(s) + clampMs(timeoutMs);
+    let begin: usize = 0;
+    while (true) {
+      const at = findFrom(this.pending, delim, begin, limit);
+      match (at) {
+        Some(end) => {
+          return Filled(this.take(end));
+        },
+        None => {}
+      }
+      if (this.pending.length() >= limit) {
+        return FillLimit;
+      }
+      begin = this.pending.length() >= delim.length() ? this.pending.length() - delim.length() + 1 : 0;
+      const left = deadline - netNow(s);
+      if (left < 0) {
+        return FillTimeout;
+      }
+      const r = recv(s, limit - this.pending.length(), left);
+      match (r) {
+        RecvData(b) => {
+          this.pending = this.pending.concat(b);
+        },
+        RecvEof => {
+          return FillClosed(this.take(this.pending.length()));
+        },
+        RecvTimeout => {
+          return FillTimeout;
+        },
+        RecvReset => {
+          return FillError(makeError(CODE_RESET));
+        },
+        RecvError(e) => {
+          return FillError(e);
+        }
+      }
+    }
+    return FillLimit;
+  }
+}
+
+// findFrom(hay, delim, begin, limit): the end index (exclusive) of the first occurrence of `delim` in hay that starts at an
+// index >= begin and ends at <= limit, or None. O(length * delim) worst case, O(length) typical.
+@Ensures(result.isSome() ==> result.unwrap() >= delim.length() && result.unwrap() <= limit && result.unwrap() <= hay.length())
+export function findFrom(hay: Bytes, delim: Bytes, begin: usize, limit: usize): Option<usize> {
+  const n = hay.length() < limit ? hay.length() : limit;
+  const m = delim.length();
+  if (m == 0 || n < m) {
+    return None;
+  }
+  let i = begin;
+  while (i + m <= n) {
+    let k: usize = 0;
+    while (k < m && hay.at(i + k) == delim.at(k)) {
+      k += 1;
+    }
+    if (k == m) {
+      return Some(i + m);
+    }
+    i += 1;
+  }
+  return None;
+}
