@@ -421,7 +421,7 @@ Files (`orin fmt` output; clauses are `@Requires` / `@Ensures` / `@Invariant` an
 | `wellformed.or` (new) | MIR predicates (`allReachable`, `blocksLocalsBelow`, `operandMatches`, `fnWellLowered`, ...) | 241 | 0 | 0 | 0 |
 | `util.or` (was 321) | type mapping, effects, string table | 388 | 1 | 7 | 0 |
 | `lower.or` (was 23) | `lower` | 36 | 0 | 4 | 0 |
-| total, before -> after | | 2,204 -> 2,853 | | 0 -> 70 ensures + 16 requires + 13 invariants (99 clauses) | |
+| total, before -> after | | 2,204 -> 2,853 | | 0 -> 69 ensures + 15 requires + 13 invariants (97 clauses) | |
 
 Unit tests: `compiler/tests/lower_test.or` (15 `@Test`, 437 lines), run by `tools/test_tooling.sh` together with the checker tests; `compiler/tests/verify_main.or` gained 3 span cases.
 

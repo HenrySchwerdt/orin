@@ -2,7 +2,7 @@
 
 ## Unreleased
 - **Rewrite step 3a: `compiler/lower/` and MIR source spans (ADR-0015, ADR-0020 D3).** HIR -> MIR lowering is now a `Lowerer`
-  class per function with a `BlockBuilder`, a `Locals` table and an `OwnedScope` (99 contract clauses, 15 unit tests in
+  class per function with a `BlockBuilder`, a `Locals` table and an `OwnedScope` (97 contract clauses, 15 unit tests in
   `compiler/tests/lower_test.or`), split into `lowerer` / `builder` / `state` / `ops` / `place` / `values` / `wellformed`.
   **MIR v2.0**: every instruction and terminator carries the span of the HIR node it was lowered from
   (`MBlock { instrs, spans, term, termSpan }`, `noSpan()` for hand-written MIR); the optimiser keeps them; the text format
