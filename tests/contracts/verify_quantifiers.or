@@ -1,0 +1,213 @@
+// Inputs for tools/test_verify_contracts.py: bounded quantifiers and sums in contracts (ADR-0031 C11-C13): `every` /
+// `some` over an array (a quantifier over its indices), `range(a, b).every(i => ..)` over an index range, `sum` and
+// `sumBy` (std:seq, recursive sums). Class invariants over sequences: sorted, no duplicates, a total that matches
+// its line items, money that is conserved by a transfer.
+// expect: at bounds VERIFIED
+// expect: at ensures VERIFIED
+// expect: push_pos ensures VERIFIED
+// expect: push_pos ensures VERIFIED
+// expect: push_any ensures REFUTED
+// expect: trivial_or ensures VERIFIED
+// expect: index_form_is_element_form ensures VERIFIED
+// expect: some_implies_nonempty ensures VERIFIED
+// expect: SortedList.constructor invariant VERIFIED
+// expect: SortedList.append ensures VERIFIED
+// expect: SortedList.append invariant VERIFIED
+// expect: SortedList.pushAny invariant REFUTED
+// expect: SortedList.size ensures VERIFIED
+// expect: IdSet.constructor invariant VERIFIED
+// expect: IdSet.has loop-invariant VERIFIED
+// expect: IdSet.has loop-invariant VERIFIED
+// expect: IdSet.has bounds VERIFIED
+// expect: IdSet.has loop-invariant VERIFIED
+// expect: IdSet.has loop-invariant VERIFIED
+// expect: IdSet.has ensures VERIFIED
+// expect: IdSet.add ensures VERIFIED
+// expect: IdSet.add invariant VERIFIED
+// expect: IdSet.addAny invariant REFUTED
+// expect: Ledger.transfer bounds VERIFIED
+// expect: Ledger.transfer bounds VERIFIED
+// expect: Ledger.transfer ensures VERIFIED
+// expect: Ledger.transfer ensures VERIFIED
+// expect: Ledger.leak bounds VERIFIED
+// expect: Ledger.leak ensures REFUTED
+// expect: Ledger.total ensures VERIFIED
+// expect: Invoice.constructor invariant VERIFIED
+// expect: Invoice.add ensures VERIFIED
+// expect: Invoice.add invariant VERIFIED
+// expect: Invoice.addForgetful invariant REFUTED
+// expect: empty_sum ensures VERIFIED
+// expect: sum_push ensures VERIFIED
+// warn: index_form_is_element_form W0462
+// warn: some_implies_nonempty W0462
+
+import { range, sum, sumBy } from "std:seq";
+
+type Item = { price: int; qty: int; };
+
+@Requires(i < xs.length && xs.every(x => x > 0))
+@Ensures(result > 0)
+function at(xs: int[], i: usize): int {
+  return xs[i];
+}
+
+@Requires(xs.every(x => x > 0) && v > 0)
+@Ensures(result.every(x => x > 0))
+@Ensures(result.some(x => x == v))
+function push_pos(xs: int[], v: int): int[] {
+  let r = xs;
+  r.push(v);
+  return r;
+}
+
+// Wrong: v is not required to be positive.
+@Requires(xs.every(x => x > 0))
+@Ensures(result.every(x => x > 0))
+function push_any(xs: int[], v: int): int[] {
+  let r = xs;
+  r.push(v);
+  return r;
+}
+
+@Ensures(result.every(x => x > 0) == xs.every(x => x > 0) || true)
+function trivial_or(xs: int[]): int[] {
+  return xs;
+}
+
+@Requires(range(0, xs.length).every(i => xs[i] >= 0))
+@Ensures(xs.every(x => x >= 0))
+function index_form_is_element_form(xs: int[]): int {
+  return 0;
+}
+
+@Requires(xs.some(x => x == 7))
+@Ensures(xs.length > 0)
+function some_implies_nonempty(xs: int[]): int {
+  return 0;
+}
+
+// A sorted list: appending keeps it sorted when the new element is not smaller than the last one.
+@Invariant(range(1, this.items.length).every(i => this.items[i - 1] <= this.items[i]))
+class SortedList {
+  private items: int[] = [];
+
+  constructor() {
+  }
+
+  @Requires(this.items.length == 0 || this.items[this.items.length - 1] <= x)
+  @Ensures(this.items.length == old(this.items.length) + 1)
+  append(x: int): void {
+    this.items.push(x);
+  }
+
+  // Wrong: any element is appended, so the list can become unsorted.
+  pushAny(x: int): void {
+    this.items.push(x);
+  }
+
+  @Ensures(result == this.items.length)
+  size(): usize {
+    return this.items.length;
+  }
+}
+
+// No duplicates: adding an id that is not there keeps the ids distinct.
+@Invariant(range(0, this.ids.length).every(i => range(i + 1, this.ids.length).every(j => this.ids[i] != this.ids[j])))
+class IdSet {
+  private ids: int[] = [];
+
+  constructor() {
+  }
+
+  @Ensures(result == this.ids.some(x => x == id))
+  has(id: int): bool {
+    let i: usize = 0;
+    @Invariant(i <= this.ids.length)
+    @Invariant(range(0, i).every(j => this.ids[j] != id))
+    while (i < this.ids.length) {
+      if (this.ids[i] == id) {
+        return true;
+      }
+      i += 1;
+    }
+    return false;
+  }
+
+  @Requires(!this.ids.some(x => x == id))
+  @Ensures(this.ids.some(x => x == id))
+  add(id: int): void {
+    this.ids.push(id);
+  }
+
+  // Wrong: the id may already be there.
+  addAny(id: int): void {
+    this.ids.push(id);
+  }
+}
+
+// Conservation: a transfer between two balances keeps the total.
+class Ledger {
+  private balances: int[];
+
+  constructor(a: int, b: int, c: int) {
+    this.balances = [a, b, c];
+  }
+
+  @Requires(src < this.balances.length && dst < this.balances.length && src != dst && amount >= 0)
+  @Ensures(sum(this.balances) == old(sum(this.balances)))
+  @Ensures(this.balances.length == old(this.balances.length))
+  transfer(src: usize, dst: usize, amount: int): void {
+    this.balances[src] -= amount;
+    this.balances[dst] += amount;
+  }
+
+  // Wrong: the amount is taken from one balance and not given to the other.
+  @Requires(src < this.balances.length)
+  @Ensures(sum(this.balances) == old(sum(this.balances)))
+  leak(src: usize, amount: int): void {
+    this.balances[src] -= amount;
+  }
+
+  @Ensures(result == sum(this.balances))
+  total(): int {
+    return sum(this.balances);
+  }
+}
+
+// Totals match their line items: the invariant ties `total` dst the items.
+@Invariant(this.total == sumBy(this.items, it => it.price * it.qty))
+class Invoice {
+  private items: Item[] = [];
+  private total: int = 0;
+
+  constructor() {
+  }
+
+  @Ensures(this.total == old(this.total) + price * qty)
+  add(price: int, qty: int): void {
+    this.items.push(Item { price: price, qty: qty });
+    this.total += price * qty;
+  }
+
+  // Wrong: the line item is stored but the total is not updated.
+  addForgetful(price: int, qty: int): void {
+    this.items.push(Item { price: price, qty: qty });
+  }
+}
+
+@Ensures(result == 0)
+function empty_sum(): int {
+  const e: int[] = [];
+  return sum(e);
+}
+
+@Ensures(result == sum(xs) + v)
+function sum_push(xs: int[], v: int): int {
+  let r = xs;
+  r.push(v);
+  return sum(r);
+}
+
+function main(): void {
+  console.log(sum([1, 2, 3]).toString());
+}

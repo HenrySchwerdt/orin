@@ -18,6 +18,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:utf8` | Orin, `stdlib/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
 | `std:collections` | Orin, `stdlib/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `stdlib/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; no sockets (ADR-0033 later); ADR-0030 |
+| `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0035) |
 | `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
 | `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
 | `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
@@ -28,7 +29,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `stdlib/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `std/` and `array/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:collections`, `std:http`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:collections`, `std:http`, `std:seq`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -302,6 +303,23 @@ values, every continuation byte, every lead byte followed by a space, truncation
 the surrogate range and CESU-8 pairs, above `U+10FFFF`, impossible bytes, error positions, and an encode/decode
 round trip over all code points up to `U+0898` and a stride through the rest.
 
+### std:seq
+
+```
+range(lo: usize, hi: usize): usize[]          // lo, lo + 1, .., hi - 1; empty when hi <= lo
+sum(xs: int[]): int                           // 0 for the empty array
+sumBy<T>(xs: T[], f: (x: T) => int): int      // the sum of f over the elements
+```
+
+Pure functions (ADR-0031 A4), written for contracts: `range(1, xs.length).every(i => xs[i - 1] <= xs[i])` is "sorted",
+`sum(this.balances) == old(sum(this.balances))` is conservation, `this.total == sumBy(this.items, it => it.price * it.qty)`
+ties a total to its line items. Under `--check-contracts` they run as written (`range` allocates the index array, so a
+quantifier over `n` indices costs O(n) per evaluation); `orin verify --contracts` does not run them, it reads
+`range(a, b).every(..)` / `.some(..)` as a bounded quantifier and `sum` / `sumBy` as the recursive sum with the store lemma
+(docs/contracts.md "Quantifiers and sums"). `sum` and `range` carry loop invariants and are proved by the verifier
+itself; `sumBy` is generic and so outside the fragment. Tests: `tests/std/seq_test.or`, `tests/contracts/verify_quantifiers.or`,
+`tests/next/run/contracts_quantifiers_seq.or`.
+
 ### std:collections
 
 ```
@@ -370,8 +388,9 @@ other and sizes add up).
   5. contracts cannot call a function value, so comparator-based structures cannot state their invariants;
   6. generic *contract helpers over records of a generic type* work (`btreeIntShapeOk<V>`), but a recursive structure has to
      be an arena with indices plus explicit-stack loops: there is no termination measure checking for loops
-     (`@Decreases` is only type-checked) and `orin verify --contracts` supports none of this (loops, arrays, classes), so
-     every invariant here is a run-time check (tests, `--check-contracts`), not a proof;
+     (`@Decreases` is only type-checked) and `orin verify --contracts` proves only some of these clauses (arrays, classes and
+     loops are in its fragment since ADR-0035, but loop invariants and recursive structures are mostly missing; counts in
+     docs/assurance.md), so most invariants here are run-time checks (tests, `--check-contracts`), not proofs;
   7. a mutating method cannot be called inside `&&`/`||`/`?:` or on a temporary (E0408/E0401), and `private constructor` is
      rejected (E0411).
 * There are no private constructors (`private constructor` is rejected with E0411), so `Bytes` and `Utf8String` have public
