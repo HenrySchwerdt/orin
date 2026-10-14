@@ -79,6 +79,18 @@ ships with tests and docs and passes the full CI, including the bootstrap.
    - every optimisation is translation-validated or proved; the goal is at least on par with Go,
      measured.
 7. Flagship: TypeScript tooling in Orin (3a). **Deferred** (project owner, 2026-10-13): starts only after the owner has set up a separate GitHub organisation for Orin, so the extra repositories do not land in the personal account.
+8. **WebAssembly target** (project owner, 2026-10-14, at the very end):
+   - **Toolchain:** the LLVM backend's `.ll` goes through `clang --target=wasm64-wasip1` (or `wasm32`) with
+     wasi-libc.
+   - **Prerequisite:** R3/R4 are done, so L0 is the only C and only L0 needs a second implementation.
+   - **Capabilities:** WASI is capability-based itself. `host.fs()` maps to the host's preopened directories, and
+     `useUnder` / `useReadOnly` map to subtrees of them.
+   - **Pointer width:** `usize` is i64 in the IR today, so wasm64 (Memory64) is the first target. wasm32 needs a
+     target-dependent `usize`.
+   - **Limits:** sockets need WASI preview 2, and threads need wasi-threads. Until then `std:net` and `.parallel()`
+     are limited or sequential there, and this is documented.
+   - **Browser:** a browser target uses an L0 over imported JS host functions, which pairs with JSX.
+   - **CI:** all suites run under `wasmtime`.
 
 ### 1. Language 1.0 core (ADR-0016), then a two-stage freeze
 - **done:**
