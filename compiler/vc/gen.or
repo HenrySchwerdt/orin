@@ -3,7 +3,7 @@
 // verifier types (arrays as a data array plus a length, records / classes / unions / `Option` / `Result` as
 // datatypes, `Map` as presence array, value array and size, strings as an uninterpreted sort with a length).
 
-import { VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad, Tab, vtKey, vtName, resolveTy, isBad, badReason, intLo, intHi } from "./vt";
+import { VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VOpq, VBad, Tab, vtKey, vtName, resolveTy, isBad, badReason, intLo, intHi } from "./vt";
 
 // A proof obligation found while executing a function: it must hold on every execution that reaches it.
 //   kind: "call-precondition" | "bounds" | "unwrap" | "loop-invariant" | "invariant" | "ensures"
@@ -38,6 +38,7 @@ export class Gen {
   private loopObls: usize[][] = [];
   private approxWhy: string = "";
   private strKinds: string[] = [];
+  private taints: string[] = [];
   private exactMode: bool = false;
   private memoKeys: string[] = [];
   private memoVals: string[] = [];
@@ -153,7 +154,30 @@ export class Gen {
   registerFun(name: string): void {
     if (!this.funNames.includes(name)) {
       this.funNames.push(name);
+      // The result of a pure function is known only through its contract.
+      if (name.startsWith("uf_") || name.startsWith("um_")) {
+        this.taints.push(name);
+      }
     }
+  }
+
+  // A symbol whose value is only constrained by the contract of a callee (the result of a call, the receiver after a
+  // mutating call, a function the solver may interpret freely). A counterexample that depends on it is not trusted:
+  // the real function computes one definite value, the model may pick another that the contract also allows.
+  taint(sym: string): void {
+    if (!this.taints.includes(sym)) {
+      this.taints.push(sym);
+    }
+  }
+
+  // Does the SMT text mention a tainted symbol (as a whole token)?
+  mentionsTaint(text: string): bool {
+    for (const t of this.taints) {
+      if (hasToken(text, t)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // The SMT constant of a string literal (a fresh one for a new text).
@@ -247,6 +271,31 @@ export class Gen {
   }
 }
 
+function isSymChar(c: usize): bool {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 46;
+}
+
+// Does `text` contain `tok` as a whole SMT symbol (not as part of a longer one)?
+export function hasToken(text: string, tok: string): bool {
+  let pos: usize = 0;
+  while (pos < text.length) {
+    const rest = text.substring(pos, text.length);
+    const at = rest.indexOf(tok);
+    if (at.isNone()) {
+      return false;
+    }
+    const start = pos + at.unwrap();
+    const end = start + tok.length;
+    const before = start == 0 || !isSymChar(text.charCodeAt(start - 1).toUsize());
+    const after = end >= text.length || !isSymChar(text.charCodeAt(end).toUsize());
+    if (before && after) {
+      return true;
+    }
+    pos = start + 1;
+  }
+  return false;
+}
+
 export type SortR = { g: Gen; s: string; };
 
 // ---------------------------------------------------------------------------------------------- sorts
@@ -284,6 +333,16 @@ export function sortOf(g0: Gen, tab: Tab, t: VT): Result<SortR, string> {
     VBool => Ok(SortR { g: g, s: "Bool" }),
     VUnit => Ok(SortR { g: g, s: "Int" }),
     VStr => Ok(strSort(g)),
+    VOpq(n) => {
+      const key = "opq:" + n;
+      const known = g.sortFor(key);
+      if (known.isSome()) {
+        return Ok(SortR { g: g, s: known.unwrap() });
+      }
+      g.registerSort(key, "Opq_" + n);
+      g.declare("(declare-sort Opq_" + n + " 0)");
+      return Ok(SortR { g: g, s: "Opq_" + n });
+    },
     VBad(why) => Err(why),
     _ => sortOfData(g, tab, t)
   };

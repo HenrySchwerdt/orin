@@ -247,6 +247,9 @@ export function fresh(g0: Gen, cx: Cx, vt: VT, term: string): Result<Fresh, stri
   const name = g.next("v");
   g.declare("(declare-const " + name + " " + so.s + ")");
   g.assert("(= " + name + " " + term + ")");
+  if (g.mentionsTaint(term)) {
+    g.taint(name);
+  }
   return Ok(Fresh { g: g, name: name });
 }
 
@@ -359,6 +362,46 @@ function isBadT(t: VT): bool {
     VBad(_) => true,
     _ => false
   };
+}
+
+// What every real value of a type satisfies, as checks on a value that was *read* (from a field, an element, a
+// payload, a match binding): a fixed-width integer is in its range, a length or size is not negative, the empty
+// string is the only string of length 0. They are assumptions about real values, so they are sound to use as
+// premises (they never make a clause easier to prove than it is); they are generated where the value is read and
+// not as a quantified fact over everything that is stored, which keeps the queries small.
+export type TFR = { g: Gen; chks: Chk[]; };
+
+export function tfChk(goal: string): Chk {
+  return Chk { oblig: false, kind: "typefact", what: "", line: 0, clause: "", goal: goal };
+}
+
+export function tfOf(g0: Gen, cx: Cx, vt: VT, term: string): Result<TFR, string> {
+  let g = g0;
+  let out: Chk[] = [];
+  match (vt) {
+    VInt(k) => {
+      if (k != "?") {
+        out.push(tfChk(inKind(k, term)));
+      }
+    },
+    VStr => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      out.push(tfChk("(and (>= (slen " + term + ") 0) (=> (= (slen " + term + ") 0) (= (sid " + term + ") 0)))"));
+    },
+    VArr(_) => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      out.push(tfChk("(>= " + arrLen(so.s, term) + " 0)"));
+    },
+    VMap(_, _) => {
+      const so = sortS(g, cx, vt)?;
+      g = so.g;
+      out.push(tfChk("(>= " + mapSize(so.s, term) + " 0)"));
+    },
+    _ => {}
+  }
+  return Ok(TFR { g: g, chks: out });
 }
 
 // A fresh unconstrained constant of the type, constrained only by its well-formedness.
@@ -651,7 +694,7 @@ function writesExpr(p: Prog, cls: Cls, e: Expr, w0: Writes): Writes {
             if (m.name == "push" || m.name == "pop" || m.name == "set" || m.name == "delete") {
               w = addField(w, r.field);
             } else {
-              const rd = RecDef { name: cls.name, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [] };
+              const rd = RecDef { name: cls.name, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [], text: "" };
               const fi = fieldIndex(rd, r.field);
               if (fi.isSome()) {
                 const ft = resolveTy(p.tab, cls.ftys[fi.unwrap()]);

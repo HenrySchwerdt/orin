@@ -44,7 +44,7 @@ import {
   noChks, noExp, lookupVar, sortS, tyOf, fresh, freshFree, wfOf, recField, arrLen, arrSel, clausesOfList, exprOf, rulesOfList, hasClauses,
   Writes, writesStmts
 } from "./ctx";
-import { tr, trClause, wdOf, sigOf, invTerms, Cl, Sig, isUnit } from "./expr";
+import { tr, trClause, wdOf, sigOf, invTerms, valueInvariants, Cl, Sig, isUnit, clHyp, clGoal } from "./expr";
 import { execStmts, emit } from "./stmt";
 
 export { Report, Res, QWarn } from "./report";
@@ -248,13 +248,13 @@ function buildProg(prog: LoadedProgram, sm: SourceMap, hir: Program): Prog {
       match (it) {
         IType(d) => {
           match (d.body) {
-            DRecord(fs) => { tab.addRec(recOfType(d, fs)); },
+            DRecord(fs) => { tab.addRec(recOfType(d, fs, f.text)); },
             DUnion(vs) => { tab.addUni(uniOfType(d, vs)); },
             DAlias(t) => { tab.addAlias(AliasDef { name: d.name.name, target: t, generic: d.typeParams.length > 0 }); }
           }
         },
         IClass(c) => {
-          tab.addRec(recOfClass(c));
+          tab.addRec(recOfClass(c, f.text));
         },
         IConst(c) => {
           consts.push(ConstInfo { name: c.name.name, decl: c, text: f.text });
@@ -620,20 +620,17 @@ function assumeInvariants(rt: Rt, f: Fn, en0: Entry): Entry {
   let en = en0;
   for (const v of en.vars) {
     match (v.vt) {
-      VRec(cn) => {
-        const co = rt.p.clsIx.get(cn);
-        if (co.isSome() && rt.p.classes[co.unwrap()].invs.length > 0) {
-          if (v.name == "this" && (f.priv || f.kind == 3)) {
-            continue;
-          }
-          const iv = invTerms(en.g, en.cx, rt.p.classes[co.unwrap()], v.term);
-          en.g = iv.g;
-          for (const t of iv.terms) {
-            en.base.push(t);
-          }
-          if (iv.terms.length > 0) {
-            en.g.useAssumption("A-INV");
-          }
+      VRec(_) => {
+        if (v.name == "this" && (f.priv || f.kind == 3)) {
+          continue;
+        }
+        const iv = valueInvariants(en.g, en.cx, v.vt, v.term);
+        en.g = iv.g;
+        for (const t of iv.terms) {
+          en.base.push(t);
+        }
+        if (iv.terms.length > 0) {
+          en.g.useAssumption("A-INV");
         }
       },
       _ => {}
@@ -714,6 +711,17 @@ function judge(g: Gen, r: Raw, approx: string, probes: Probe[]): Verdict {
   return unknownV(describeSolverUnknown());
 }
 
+// The reason an obligation's counterexample is not trusted (only computed when there is a model).
+function obligApprox(g: Gen, raw: Raw, o: Obl): string {
+  if (raw.status != "sat") {
+    return "";
+  }
+  if (o.approx != "") {
+    return o.approx;
+  }
+  return taintOf(g, o.pc, o.goal);
+}
+
 // One goal at the end of one path: what holds on the path, what is to be proved, what the path used.
 type RetGoal = { pc: string[]; goal: string; approx: string; deps: usize[]; };
 
@@ -740,40 +748,70 @@ function depsVerdict(g: Gen, statuses: string[], deps: usize[], v: Verdict): Ver
 // abstraction, the exact paths are tried alone (a counterexample on one of them is a real one).
 type Proved = { v: Verdict; used: usize; };
 
+// Why a path's counterexample is not trusted, once the solver has produced one: the path went through an
+// abstraction (a loop), or its path condition or goal mentions a value that is only known through a callee's contract.
+function pathApprox(g: Gen, r: RetGoal): string {
+  if (r.approx != "") {
+    return r.approx;
+  }
+  return taintOf(g, r.pc, r.goal);
+}
+
+const TAINT_REASON: string = "the counterexample depends on the result of a call that is only known through its contract (A-CALL)";
+
+function taintOf(g: Gen, pc: string[], goal: string): string {
+  if (g.mentionsTaint(goal)) {
+    return TAINT_REASON;
+  }
+  for (const p of pc) {
+    if (g.mentionsTaint(p)) {
+      return TAINT_REASON;
+    }
+  }
+  return "";
+}
+
 function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: Gen, base: string[], goals: RetGoal[], statuses: string[], probes: Probe[]): Proved {
   let parts: string[] = [];
   let deps: usize[] = [];
-  let anyApprox = "";
-  let allExact = true;
   for (const r of goals) {
     parts.push("(=> " + andAll(r.pc) + " " + r.goal + ")");
     deps = unionUsize(deps, r.deps);
-    if (r.approx != "") {
-      allExact = false;
-      if (anyApprox == "") {
-        anyApprox = r.approx;
-      }
-    }
   }
   let used: usize = 1;
   const raw = rawProve(fs, proc, z3, qn0, g, base, [], andAll(parts), probes);
   if (raw.status == "unsat") {
     return Proved { v: depsVerdict(g, statuses, deps, Verdict { status: "VERIFIED", reason: "", cex: [] }), used: used };
   }
-  if (raw.status == "sat" && !allExact) {
-    // paths without abstraction are judged alone
-    for (const r of goals) {
-      if (r.approx == "") {
-        const one = rawProve(fs, proc, z3, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
-        used += 1;
-        if (one.status == "sat") {
-          return Proved { v: judge(g, one, "", probes), used: used };
-        }
+  if (raw.status != "sat") {
+    return Proved { v: judge(g, raw, "", probes), used: used };
+  }
+  // A model: it is a counterexample only if some path that is exact (no abstraction, no dependence on a callee's
+  // contract) can violate the clause. Paths without such a flaw are judged alone.
+  let anyApprox = "";
+  let allExact = true;
+  for (const r of goals) {
+    const a = pathApprox(g, r);
+    if (a != "") {
+      allExact = false;
+      if (anyApprox == "") {
+        anyApprox = a;
       }
     }
-    return Proved { v: unknownV(anyApprox), used: used };
   }
-  return Proved { v: judge(g, raw, anyApprox, probes), used: used };
+  if (allExact) {
+    return Proved { v: judge(g, raw, "", probes), used: used };
+  }
+  for (const r of goals) {
+    if (pathApprox(g, r) == "") {
+      const one = rawProve(fs, proc, z3, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
+      used += 1;
+      if (one.status == "sat") {
+        return Proved { v: judge(g, one, "", probes), used: used };
+      }
+    }
+  }
+  return Proved { v: unknownV(anyApprox), used: used };
 }
 
 // ---------------------------------------------------------------------------------------- the function
@@ -909,7 +947,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       match (r) {
         Ok(x) => {
           en.g = x.g;
-          reqTerms.push(x.t);
+          reqTerms.push(clHyp(x));
         },
         Err(m) => {
           return allUnknown(rt, f, cls, "@Requires: " + m);
@@ -957,7 +995,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     } else if (!o.exact) {
       const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
       rt.qn += 1;
-      verdicts[id] = judge(g, raw, o.approx, en.probes);
+      verdicts[id] = judge(g, raw, obligApprox(g, raw, o), en.probes);
       statuses[id] = verdicts[id].status;
     }
     id += 1;
@@ -979,7 +1017,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       } else {
         const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
         rt.qn += 1;
-        verdicts[id] = judge(g, raw, o.approx, en.probes);
+        verdicts[id] = judge(g, raw, obligApprox(g, raw, o), en.probes);
         statuses[id] = verdicts[id].status;
       }
     }
@@ -1054,7 +1092,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
         Err(m) => { failure = m; },
         Ok(x) => {
           g = x.g;
-          goals.push(RetGoal { pc: r.st.pc, goal: x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")", approx: r.st.approx, deps: r.st.deps });
+          goals.push(RetGoal { pc: r.st.pc, goal: clGoal(x), approx: r.st.approx, deps: r.st.deps });
         }
       }
     }
@@ -1123,7 +1161,7 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
     }
     g = t.unwrap().g;
     if (!isSyntacticallyTrivial(d, c)) {
-      const r = entails(fs, proc, rt, g, en.rangeBase, t.unwrap().t);
+      const r = entails(fs, proc, rt, g, en.rangeBase, clGoal(t.unwrap()));
       rt = r.rt;
       if (r.holds && g.approxReason() == "") {
         rt = pushWarn(rt, f, W_TAUTOLOGY, "tautology", c, "`@Requires` is valid without any premises: it excludes no input and catches no bug");
@@ -1161,7 +1199,7 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
       continue;
     }
     g2 = t.unwrap().g;
-    const goal = t.unwrap().wd == "true" ? t.unwrap().t : "(and " + t.unwrap().t + " " + t.unwrap().wd + ")";
+    const goal = clGoal(t.unwrap());
     const taut = entails(fs, proc, rt, g2, resBase, goal);
     rt = taut.rt;
     if (taut.holds) {

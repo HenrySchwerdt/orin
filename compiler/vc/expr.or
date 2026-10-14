@@ -18,7 +18,7 @@ import { Gen, SortR, sortOf, opaqueSort } from "./gen";
 import {
   Var, Chk, TR, Fn, Cls, Prog, Cx, I64_MIN, I64_MAX, lineOf, clauseText, srcText, lit, inRange, inKind, guarded, guardChks, concat, concatChk,
   andAll, noChks, noExp, lookupVar, mk, sortS, tyOf, symName, fresh, freshFree, wfOf, arrLen, arrData, arrMk, arrSel, inBounds,
-  isSomeT, isOkT, recField, mapHas, mapSize, mapFact, clausesOfList, exprOf, isThisExpr, Fresh
+  isSomeT, isOkT, recField, mapHas, mapSize, mapFact, tfOf, tfChk, clausesOfList, exprOf, isThisExpr, Fresh
 } from "./ctx";
 
 // The conjunction of the obligations among the checks (what a contract needs to be well defined).
@@ -89,14 +89,36 @@ function trCore(g: Gen, vars: Var[], cx: Cx, e: Expr, exp: VT): Result<TR, strin
 }
 
 // A clause translated for use as a hypothesis (`t`, without its well-definedness) or as a goal (`t` and `wd`).
-export type Cl = { g: Gen; t: string; wd: string; };
+export type Cl = { g: Gen; t: string; wd: string; tf: string; };
+
+// The type facts among the checks (guarded as the checks are): what the values read by the clause satisfy.
+function tfOfChks(cs: Chk[]): string {
+  let goals: string[] = [];
+  for (const c of cs) {
+    if (!c.oblig && c.kind == "typefact") {
+      goals.push(c.goal);
+    }
+  }
+  return andAll(goals);
+}
 
 export function trClause(g: Gen, vars: Var[], cx: Cx, e: Expr): Result<Cl, string> {
   const r = tr(g, vars, cx, e, VBool)?;
   if (!vtEq(r.vt, VBool)) {
     return Err("contract expression is not bool");
   }
-  return Ok(Cl { g: r.g, t: r.t, wd: wdOf(r.chks) });
+  return Ok(Cl { g: r.g, t: r.t, wd: wdOf(r.chks), tf: tfOfChks(r.chks) });
+}
+
+// The clause as a hypothesis (its value, with the type facts of what it read) and as a goal (well defined and
+// true, whenever the type facts hold).
+export function clHyp(c: Cl): string {
+  return c.tf == "true" ? c.t : "(and " + c.tf + " " + c.t + ")";
+}
+
+export function clGoal(c: Cl): string {
+  const core = c.wd == "true" ? c.t : "(and " + c.t + " " + c.wd + ")";
+  return c.tf == "true" ? core : "(=> " + c.tf + " " + core + ")";
 }
 
 // ------------------------------------------------------------------------------------------ atoms
@@ -400,13 +422,13 @@ function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr
         return Err("no field `" + name + "` on an array");
       }
       const so = sortS(b.g, cx, b.vt)?;
-      return mk(so.g, arrLen(so.s, b.t), VInt("usize"), b.chks);
+      return mk(so.g, arrLen(so.s, b.t), VInt("usize"), concatChk(b.chks, [tfChk("(>= " + arrLen(so.s, b.t) + " 0)")]));
     },
     VStr => {
       if (name != "length") {
         return Err("no field `" + name + "` on a string");
       }
-      return mk(b.g, "(slen " + b.t + ")", VInt("usize"), b.chks);
+      return mk(b.g, "(slen " + b.t + ")", VInt("usize"), concatChk(b.chks, [tfChk("(>= (slen " + b.t + ") 0)")]));
     },
     VMap(_, _) => {
       if (name != "size") {
@@ -416,7 +438,7 @@ function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr
       g2.noteApprox("the size of a Map is axiomatised, not computed from its keys");
       g2.useAssumption("A-MAP");
       const so = sortS(g2, cx, b.vt)?;
-      return mk(so.g, mapSize(so.s, b.t), VInt("usize"), b.chks);
+      return mk(so.g, mapSize(so.s, b.t), VInt("usize"), concatChk(b.chks, [tfChk("(>= " + mapSize(so.s, b.t) + " 0)")]));
     },
     VRec(rn) => {
       const rd = cx.p.tab.findRec(rn);
@@ -435,7 +457,9 @@ function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr
       if (cx.p.tab.isCyclic("r:" + rn)) {
         return Err("the fields of the recursive type `" + rn + "` are not modelled");
       }
-      return mk(so.g, recField(so.s, name, b.t), ft, b.chks);
+      const fterm = recField(so.s, name, b.t);
+      const tf = tfOf(so.g, cx, ft, fterm)?;
+      return mk(tf.g, fterm, ft, concatChk(b.chks, tf.chks));
     },
     _ => Err("no field `" + name + "` on a value of type `" + vtName(b.vt) + "`")
   };
@@ -452,8 +476,10 @@ function trIndex(g: Gen, vars: Var[], cx: Cx, base: Expr, idx: Expr, e: Expr): R
       const so = sortS(i.g, cx, b.vt)?;
       const goal = inBounds(so.s, b.t, i.t);
       const clause = "index in bounds: `" + srcText(cx.text, e) + "`";
-      return mk(so.g, arrSel(so.s, b.t, i.t), el,
-        concatChk(concatChk(b.chks, i.chks), [oblChk("bounds", "index", lineOf(cx.text, e.span.start), clause, goal)]));
+      const eterm = arrSel(so.s, b.t, i.t);
+      const tf = tfOf(so.g, cx, el, eterm)?;
+      return mk(tf.g, eterm, el,
+        concatChk(concatChk(concatChk(b.chks, i.chks), [oblChk("bounds", "index", lineOf(cx.text, e.span.start), clause, goal)]), tf.chks));
     },
     _ => Err("indexing a value of type `" + vtName(b.vt) + "`")
   };
@@ -562,6 +588,17 @@ function trRecordLit(g0: Gen, vars: Var[], cx: Cx, name: string, spread: Option<
 }
 
 // ------------------------------------------------------------------------------------------------- calls
+
+function indexIn(xs: string[], x: string): usize {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i] == x) {
+      return i;
+    }
+    i += 1;
+  }
+  return 0;
+}
 
 function isUserFn(cx: Cx, name: string): bool {
   return cx.p.fnCount.get(name).unwrapOr(0) > 0;
@@ -783,6 +820,50 @@ function trArrayMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, name: string
     const clause = "slice range in bounds: `" + srcText(cx.text, e) + "`";
     return mk(g, out.name, r.vt, concatChk(concatChk(r.chks, concatChk(a.chks, b.chks)), [oblChk("bounds", "slice", lineOf(cx.text, e.span.start), clause, goal)]));
   }
+  if (name == "indexOf" && args.length == 1) {
+    // The first position of an element: `Some(i)` with xs[i] == x and no earlier match, or `None` when there is none.
+    const okEq = match (el) {
+      VInt(_) => true,
+      VBool => true,
+      VStr => true,
+      _ => false
+    };
+    if (!okEq || cx.inQ) {
+      return Err("`indexOf` on an array of `" + vtName(el) + "` (or inside a quantifier body)");
+    }
+    const x = tr(g, vars, cx, args[0], el)?;
+    g = x.g;
+    const ot = VOpt(VInt("usize"));
+    const os = sortS(g, cx, ot)?;
+    g = os.g;
+    const o = freshFree(g, cx, ot)?;
+    g = o.g;
+    const q = g.next("q");
+    const q2 = g.next("q");
+    const hit = "(and " + inBounds(so.s, r.t, "(val" + os.s + " " + o.name + ")") + " (= " + arrSel(so.s, r.t, "(val" + os.s + " " + o.name + ")") + " " + x.t + "))";
+    const before = "(forall ((" + q2 + " Int)) (=> (and (<= 0 " + q2 + ") (< " + q2 + " (val" + os.s + " " + o.name + "))) (not (= " + arrSel(so.s, r.t, q2) + " " + x.t + "))))";
+    g.assert("(=> " + isSomeT(os.s, o.name) + " (and " + hit + " " + before + "))");
+    g.assert("(=> (not " + isSomeT(os.s, o.name) + ") (forall ((" + q + " Int)) (=> " + inBounds(so.s, r.t, q) + " (not (= " + arrSel(so.s, r.t, q) + " " + x.t + ")))))");
+    return mk(g, o.name, ot, concatChk(r.chks, x.chks));
+  }
+  if (name == "join" && args.length == 1) {
+    // The contents are not modelled: a string that is empty when the array is.
+    const isStrArr = match (el) {
+      VStr => true,
+      _ => false
+    };
+    if (!isStrArr || cx.inQ) {
+      return Err("`join` on an array of `" + vtName(el) + "` (or inside a quantifier body)");
+    }
+    const sep = tr(g, vars, cx, args[0], VStr)?;
+    g = sep.g;
+    g.noteStr("derive");
+    g.useAssumption("A-STR");
+    const out = freshFree(g, cx, VStr)?;
+    g = out.g;
+    g.assert("(=> (= " + arrLen(so.s, r.t) + " 0) (= (slen " + out.name + ") 0))");
+    return mk(g, out.name, VStr, concatChk(r.chks, sep.chks));
+  }
   return Err("array method `" + name + "` is not supported");
 }
 
@@ -911,11 +992,15 @@ function trOptMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, t: VT, name: string, a
   }
   if (name == "unwrap" && args.length == 0) {
     const clause = "`unwrap` of Some: `" + srcText(cx.text, e) + "`";
-    return mk(g, "(val" + so.s + " " + r.t + ")", t, concatChk(r.chks, [oblChk("unwrap", "unwrap", line, clause, isSomeT(so.s, r.t))]));
+    const pt = "(val" + so.s + " " + r.t + ")";
+    const tf = tfOf(g, cx, t, pt)?;
+    return mk(tf.g, pt, t, concatChk(concatChk(r.chks, [oblChk("unwrap", "unwrap", line, clause, isSomeT(so.s, r.t))]), tf.chks));
   }
   if (name == "unwrapOr" && args.length == 1) {
     const d = tr(g, vars, cx, args[0], t)?;
-    return mk(d.g, "(ite " + isSomeT(so.s, r.t) + " (val" + so.s + " " + r.t + ") " + d.t + ")", t, concatChk(r.chks, d.chks));
+    const pt = "(val" + so.s + " " + r.t + ")";
+    const tf = tfOf(d.g, cx, t, pt)?;
+    return mk(tf.g, "(ite " + isSomeT(so.s, r.t) + " " + pt + " " + d.t + ")", t, concatChk(concatChk(r.chks, d.chks), guardChks(isSomeT(so.s, r.t), tf.chks)));
   }
   return Err("Option method `" + name + "` is not supported");
 }
@@ -933,11 +1018,15 @@ function trResMethod(g0: Gen, cx: Cx, r: TR, a: VT, b: VT, name: string, args: E
   }
   if (name == "unwrap" && args.length == 0) {
     const clause = "`unwrap` of Ok: `" + srcText(cx.text, e) + "`";
-    return mk(g, "(okv" + so.s + " " + r.t + ")", a, concatChk(r.chks, [oblChk("unwrap", "unwrap", line, clause, isOkT(so.s, r.t))]));
+    const pt = "(okv" + so.s + " " + r.t + ")";
+    const tf = tfOf(g, cx, a, pt)?;
+    return mk(tf.g, pt, a, concatChk(concatChk(r.chks, [oblChk("unwrap", "unwrap", line, clause, isOkT(so.s, r.t))]), tf.chks));
   }
   if (name == "unwrapErr" && args.length == 0) {
     const clause = "`unwrapErr` of Err: `" + srcText(cx.text, e) + "`";
-    return mk(g, "(errv" + so.s + " " + r.t + ")", b, concatChk(r.chks, [oblChk("unwrap", "unwrapErr", line, clause, "(not " + isOkT(so.s, r.t) + ")")]));
+    const pt = "(errv" + so.s + " " + r.t + ")";
+    const tf = tfOf(g, cx, b, pt)?;
+    return mk(tf.g, pt, b, concatChk(concatChk(r.chks, [oblChk("unwrap", "unwrapErr", line, clause, "(not " + isOkT(so.s, r.t) + ")")]), tf.chks));
   }
   return Err("Result method `" + name + "` is not supported");
 }
@@ -957,8 +1046,10 @@ function trMapMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, k: VT, v: VT, name: st
     let g2 = a.g;
     g2.assert(mapFact(so.s, r.t, a.t));
     const os = sortS(g2, cx, VOpt(v))?;
-    const t = "(ite " + mapHas(so.s, r.t, a.t) + " (some" + os.s + " (select (" + so.s + "v " + r.t + ") " + a.t + ")) none" + os.s + ")";
-    return mk(os.g, t, VOpt(v), concatChk(r.chks, a.chks));
+    const pt = "(select (" + so.s + "v " + r.t + ") " + a.t + ")";
+    const tf = tfOf(os.g, cx, v, pt)?;
+    const t = "(ite " + mapHas(so.s, r.t, a.t) + " (some" + os.s + " " + pt + ") none" + os.s + ")";
+    return mk(tf.g, t, VOpt(v), concatChk(concatChk(r.chks, a.chks), guardChks(mapHas(so.s, r.t, a.t), tf.chks)));
   }
   if ((name == "keys" || name == "values") && args.length == 0) {
     if (cx.inQ) {
@@ -972,6 +1063,7 @@ function trMapMethod(g0: Gen, vars: Var[], cx: Cx, r: TR, k: VT, v: VT, name: st
     g = as.g;
     const out = freshFree(g, cx, at)?;
     g = out.g;
+    g.taint(out.name);
     g.assert("(= " + arrLen(as.s, out.name) + " " + mapSize(so.s, r.t) + ")");
     if (isKeys) {
       const q = g.next("q");
@@ -1049,11 +1141,35 @@ function paramVarsOf(f: Fn, terms: string[], ptys: VT[]): Var[] {
 export type Invs = { g: Gen; terms: string[]; };
 
 export function invTerms(g0: Gen, cx: Cx, cls: Cls, thisTerm: string): Invs {
+  return invTermsFor(g0, cx, cls.text, cls.invs, VRec(cls.name), thisTerm);
+}
+
+// The invariants of a value of a class (ADR-0031 B8) or of a record type (A3: a record that violates its invariant
+// cannot exist), as hypotheses about the value `term`. Clauses outside the fragment are left out.
+export function valueInvariants(g0: Gen, cx: Cx, vt: VT, term: string): Invs {
+  const none: string[] = [];
+  return match (vt) {
+    VRec(cn) => {
+      const co = cx.p.clsIx.get(cn);
+      if (co.isSome()) {
+        return invTerms(g0, cx, cx.p.classes[co.unwrap()], term);
+      }
+      const rd = cx.p.tab.findRec(cn);
+      if (rd.isSome()) {
+        return invTermsFor(g0, cx, rd.unwrap().text, clausesOfList(rd.unwrap().contracts, 4), vt, term);
+      }
+      return Invs { g: g0, terms: none };
+    },
+    _ => Invs { g: g0, terms: none }
+  };
+}
+
+function invTermsFor(g0: Gen, cx: Cx, text: string, clauses: ContractClause[], vt: VT, thisTerm: string): Invs {
   let g = g0;
   let out: string[] = [];
-  const cc = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: cls.text };
-  const vars: Var[] = [Var { name: "this", term: thisTerm, vt: VRec(cls.name) }];
-  for (const c of cls.invs) {
+  const cc = Cx { p: cx.p, f: cx.f, res: None, ens: false, body: false, olds: [], ret: VUnit, inQ: cx.inQ, text: text };
+  const vars: Var[] = [Var { name: "this", term: thisTerm, vt: vt }];
+  for (const c of clauses) {
     const ex = exprOf(c);
     if (ex.isSome()) {
       const n0 = g.factCount();
@@ -1061,7 +1177,7 @@ export function invTerms(g0: Gen, cx: Cx, cls: Cls, thisTerm: string): Invs {
       match (r) {
         Ok(x) => {
           g = x.g;
-          out.push(x.t);
+          out.push(clHyp(x));
         },
         Err(_) => {
           // translation may have declared symbols; they are harmless
@@ -1118,7 +1234,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       match (r) {
         Ok(x) => {
           g = x.g;
-          const goal = x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")";
+          const goal = clGoal(x);
           chks = concatChk(chks, [oblChk("call-precondition", f.key, line, clauseText(f.text, c) + " (call of " + f.key + ")", goal)]);
         },
         Err(m) => {
@@ -1142,6 +1258,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
     const nt = freshFree(g, cx, recv.unwrap().vt)?;
     g = nt.g;
     newThis = nt.name;
+    g.taint(newThis);
     const so = sortS(g, cx, recv.unwrap().vt)?;
     g = so.g;
     const co = cx.p.clsIx.get(f.cls);
@@ -1200,6 +1317,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       const fr = freshFree(g, cx, rty)?;
       g = fr.g;
       resTerm = fr.name;
+      g.taint(fr.name);
     }
   }
   // The callee's postconditions, assumed under its preconditions (and, for a public method, its class invariants).
@@ -1211,7 +1329,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       match (r) {
         Ok(x) => {
           g = x.g;
-          hyp.push(x.t);
+          hyp.push(clHyp(x));
         },
         Err(_) => {}
       }
@@ -1233,6 +1351,16 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
   let res: Option<Var> = None;
   if (!isUnit(rty)) {
     res = Some(Var { name: "result", term: resTerm, vt: rty });
+    // a value a function returns satisfies the invariant of its type (constructors and public methods establish
+    // class invariants, record invariants are enforced at literals, writes and returns: ADR-0031 A3)
+    const rinv = valueInvariants(g, cx, rty, resTerm);
+    g = rinv.g;
+    for (const t of rinv.terms) {
+      g.assert(t);
+    }
+    if (rinv.terms.length > 0) {
+      g.useAssumption("A-INV");
+    }
   }
   const ecx = Cx { p: cx.p, f: f, res: res, ens: true, body: false, olds: calleeVars, ret: rty, inQ: cx.inQ, text: f.text };
   let ens: string[] = [];
@@ -1254,7 +1382,7 @@ export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, a
       match (r) {
         Ok(x) => {
           g = x.g;
-          ens.push(x.t);
+          ens.push(clHyp(x));
         },
         Err(_) => {}
       }
@@ -1331,8 +1459,8 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
         match (r) {
           Ok(x) => {
             g = x.g;
-            reqTerms.push(x.t);
-            const goal = x.wd == "true" ? x.t : "(and " + x.t + " " + x.wd + ")";
+            reqTerms.push(clHyp(x));
+            const goal = clGoal(x);
             chks = concatChk(chks, [oblChk("call-precondition", name + ".constructor", line, clauseText(f.text, c) + " (call of new " + name + ")", goal)]);
           },
           Err(m) => {
@@ -1380,6 +1508,34 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
       }
     }
     fi += 1;
+  }
+  // The new object is known exactly when every field comes from a parameter property or an initialiser that the
+  // constructor leaves alone; otherwise (or when an argument is itself only known through a contract) a
+  // counterexample that depends on it is not trusted.
+  let determined = true;
+  let di: usize = 0;
+  while (di < cls.fields.length) {
+    const dn = cls.fields[di];
+    if (ctor.isSome()) {
+      const cf = ctor.unwrap();
+      const prop = cf.pnames.includes(dn) && cf.pacc[0 + indexIn(cf.pnames, dn)] != 0;
+      if (cf.frameAll || cf.frame.includes(dn)) {
+        determined = false;
+      } else if (!prop && cls.finit[di].isNone()) {
+        determined = false;
+      }
+    } else if (cls.finit[di].isNone()) {
+      determined = false;
+    }
+    di += 1;
+  }
+  for (const at of argTerms) {
+    if (g.mentionsTaint(at)) {
+      determined = false;
+    }
+  }
+  if (!determined) {
+    g.taint(fr.name);
   }
   const iv = invTerms(g, cx, cls, fr.name);
   g = iv.g;
@@ -1448,7 +1604,14 @@ function trMatch(g0: Gen, vars: Var[], cx: Cx, scrut: Expr, arms: MatchArm[], ex
     if (isBlock) {
       return Err("a `match` with block arms is only supported as a statement");
     }
-    const b = tr(g, vars2, cx, body, accTy)?;
+    let bindTf: Chk[] = [];
+    for (const bd of mp.binds) {
+      const tfb = tfOf(g, cx, bd.vt, bd.term)?;
+      g = tfb.g;
+      bindTf = concatChk(bindTf, tfb.chks);
+    }
+    const b0 = tr(g, vars2, cx, body, accTy)?;
+    const b = TR { g: b0.g, t: b0.t, vt: b0.vt, chks: concatChk(bindTf, b0.chks) };
     g = b.g;
     if (have && !vtEq(b.vt, accTy)) {
       if (isIntTy(b.vt) && isIntTy(accTy)) {
@@ -1747,6 +1910,7 @@ function trFilterOn(g0: Gen, vars: Var[], cx: Cx, r: TR, el: VT, f: Expr, e: Exp
   }
   const out = freshFree(g, cx, r.vt)?;
   g = out.g;
+  g.taint(out.name);
   const pIn = facts.length > 0 ? "(=> " + andAll(facts) + " " + b.t + ")" : b.t;
   g.assert("(<= " + arrLen(so.s, out.name) + " " + arrLen(so.s, r.t) + ")");
   // Every element of the result satisfies the predicate (its own bound variable) and occurs in the input.

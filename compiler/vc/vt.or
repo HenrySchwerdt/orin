@@ -19,6 +19,7 @@ export type VT =
   | VMap(VT, VT)
   | VRec(string)        // record type or class, by simple name
   | VUni(string)        // user union, by simple name
+  | VOpq(string)        // an opaque handle (a capability grant, a file): passed around, never inspected
   | VBad(string);       // outside the fragment, with the reason
 
 // ---------------------------------------------------------------------------------------------- integers
@@ -101,6 +102,7 @@ export function vtName(t: VT): string {
     VMap(k, v) => "Map<" + vtName(k) + ", " + vtName(v) + ">",
     VRec(n) => n,
     VUni(n) => n,
+    VOpq(n) => n,
     VBad(why) => "an unsupported type (" + why + ")"
   };
 }
@@ -119,6 +121,7 @@ export function vtKey(t: VT): string {
     VMap(k, v) => "map(" + vtKey(k) + "," + vtKey(v) + ")",
     VRec(n) => "rec(" + n + ")",
     VUni(n) => "uni(" + n + ")",
+    VOpq(n) => "opq(" + n + ")",
     VBad(why) => "bad(" + why + ")"
   };
 }
@@ -174,7 +177,7 @@ export function concrete(t: VT): VT {
 // ------------------------------------------------------------------------------------------ type tables
 
 export type RecDef = {
-  name: string; fields: string[]; ftys: TypeExpr[]; isClass: bool; generic: bool; contracts: ContractClause[];
+  name: string; fields: string[]; ftys: TypeExpr[]; isClass: bool; generic: bool; contracts: ContractClause[]; text: string;
 };
 
 export type UniVariantDef = { name: string; payload: TypeExpr[]; };
@@ -308,17 +311,17 @@ export class Tab {
   }
 }
 
-export function recOfType(d: TypeDecl, fields: FieldDecl[]): RecDef {
+export function recOfType(d: TypeDecl, fields: FieldDecl[], text: string): RecDef {
   let names: string[] = [];
   let tys: TypeExpr[] = [];
   for (const f of fields) {
     names.push(f.name.name);
     tys.push(f.ty);
   }
-  return RecDef { name: d.name.name, fields: names, ftys: tys, isClass: false, generic: d.typeParams.length > 0, contracts: d.contracts };
+  return RecDef { name: d.name.name, fields: names, ftys: tys, isClass: false, generic: d.typeParams.length > 0, contracts: d.contracts, text: text };
 }
 
-export function recOfClass(c: ClassDecl): RecDef {
+export function recOfClass(c: ClassDecl, text: string): RecDef {
   let names: string[] = [];
   let tys: TypeExpr[] = [];
   for (const m of c.members) {
@@ -344,7 +347,7 @@ export function recOfClass(c: ClassDecl): RecDef {
       _ => {}
     }
   }
-  return RecDef { name: c.name.name, fields: names, ftys: tys, isClass: true, generic: c.typeParams.length > 0, contracts: c.contracts };
+  return RecDef { name: c.name.name, fields: names, ftys: tys, isClass: true, generic: c.typeParams.length > 0, contracts: c.contracts, text: text };
 }
 
 export function uniOfType(d: TypeDecl, vs: VariantDecl[]): UniDef {
@@ -391,6 +394,9 @@ function resolveNamed(tab: Tab, n: string, args: TypeExpr[], depth: usize): VT {
   }
   if (n == "void" && args.length == 0) {
     return VUnit;
+  }
+  if ((n == "Host" || n == "FsGrant" || n == "ProcessGrant" || n == "StdioGrant" || n == "ClockGrant" || n == "NetGrant" || n == "File") && args.length == 0 && tab.declared(n) == 0) {
+    return VOpq(n);
   }
   if (n == "float" || n == "f32") {
     return VBad("floating-point values are not modelled");
