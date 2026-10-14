@@ -9,7 +9,7 @@ import {
   ECall, EUnary, EBinary, ECond, EMember, EIndex, EIdent, EThis, EMatch, BExpr, BBlock,
   CRequires, CEnsures, CInvariant, CDecreases, CRule
 } from "../syntax";
-import { VT, VInt, VStr, VBad, VArr, VOpt, VRes, VMap, VRec, intLo, intHi, resolveTy, RecDef, Tab, fieldIndex } from "./vt";
+import { VT, VInt, VStr, VBad, VArr, VOpt, VRes, VMap, VRec, intLo, intHi, resolveTy, resolveTyP, fieldTyOf, RecDef, Tab, fieldIndex } from "./vt";
 import { Gen, SortR, sortOf } from "./gen";
 
 export const I64_MIN: string = "(- 9223372036854775808)";
@@ -38,12 +38,12 @@ export type Ex = { g: Gen; st: St; fall: bool; rets: Ret[]; };
 export type Fn = {
   key: string; name: string; unit: string; file: string; text: string; cls: string; kind: int; priv: bool; generic: bool;
   pnames: string[]; ptys: TypeExpr[]; pacc: int[]; ret: Option<TypeExpr>; body: Block; contracts: ContractClause[];
-  span: Span; pure: bool; mutating: bool; frame: string[]; frameAll: bool; line: usize; params: Param[]; verify: bool;
+  span: Span; pure: bool; mutating: bool; frame: string[]; frameAll: bool; line: usize; params: Param[]; verify: bool; tparams: string[];
 };
 
 export type Cls = {
   name: string; unit: string; file: string; text: string; fields: string[]; ftys: TypeExpr[]; finit: Option<Expr>[];
-  invs: ContractClause[]; generic: bool; ctor: Option<usize>;
+  invs: ContractClause[]; generic: bool; ctor: Option<usize>; tparams: string[];
 };
 
 export type ConstInfo = { name: string; decl: ConstDecl; text: string; };
@@ -220,7 +220,7 @@ export function sortS(g: Gen, cx: Cx, vt: VT): Result<SortR, string> {
 }
 
 export function tyOf(cx: Cx, t: TypeExpr): VT {
-  return resolveTy(cx.p.tab, t);
+  return resolveTyP(cx.p.tab, t, cx.f.tparams);
 }
 
 // Name an SMT symbol after a source name: letters, digits and `_` only.
@@ -341,7 +341,7 @@ export function wfOf(g0: Gen, cx: Cx, term: string, vt: VT, depth: usize): Resul
       const d = rd.unwrap();
       let i: usize = 0;
       while (i < d.fields.length) {
-        const ft = resolveTy(cx.p.tab, d.ftys[i]);
+        const ft = fieldTyOf(cx.p.tab, d, i);
         if (!isBadT(ft)) {
           const inner = wfOf(g, cx, recField(so.s, d.fields[i], term), ft, depth + 1)?;
           g = inner.g;
@@ -694,10 +694,10 @@ function writesExpr(p: Prog, cls: Cls, e: Expr, w0: Writes): Writes {
             if (m.name == "push" || m.name == "pop" || m.name == "set" || m.name == "delete") {
               w = addField(w, r.field);
             } else {
-              const rd = RecDef { name: cls.name, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [], text: "" };
+              const rd = RecDef { name: cls.name, fields: cls.fields, ftys: cls.ftys, isClass: true, generic: false, contracts: [], text: "", tparams: cls.tparams };
               const fi = fieldIndex(rd, r.field);
               if (fi.isSome()) {
-                const ft = resolveTy(p.tab, cls.ftys[fi.unwrap()]);
+                const ft = resolveTyP(p.tab, cls.ftys[fi.unwrap()], cls.tparams);
                 match (ft) {
                   VRec(cn) => {
                     const mi = p.fnIx.get(cn + "." + m.name);

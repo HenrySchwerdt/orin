@@ -36,7 +36,7 @@ import { Res, QWarn, Report, assumptionsFor } from "./report";
 import { replyValues } from "./sx";
 import {
   VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
-  vtKey, vtName, isBad, badReason, vtEq, isIntTy, RecDef, UniDef, AliasDef, Tab, recOfType, recOfClass, uniOfType, resolveTy, sealTab, fieldIndex
+  vtKey, vtName, isBad, badReason, vtEq, isIntTy, RecDef, UniDef, AliasDef, Tab, recOfType, recOfClass, uniOfType, resolveTy, resolveTyP, fieldTyOf, identNames, sealTab, fieldIndex
 } from "./vt";
 import { Gen, Obl, SortR, sortOf, opaqueSort } from "./gen";
 import {
@@ -55,6 +55,14 @@ const W_IMPLIED_ENSURES: string = "W0462";
 
 // ------------------------------------------------------------------------------------- program tables
 
+function concatNames(a: string[], b: string[]): string[] {
+  let out = a;
+  for (const x of b) {
+    out.push(x);
+  }
+  return out;
+}
+
 function unitFns(u: string, file: string, text: string, d: FunctionDecl): Fn {
   let names: string[] = [];
   let tys: TypeExpr[] = [];
@@ -67,7 +75,7 @@ function unitFns(u: string, file: string, text: string, d: FunctionDecl): Fn {
   return Fn {
     key: d.name.name, name: d.name.name, unit: u, file: file, text: text, cls: "", kind: 0, priv: false, generic: d.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: d.ret, body: d.body, contracts: d.contracts, span: d.span, pure: false, mutating: false,
-    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params, verify: !u.startsWith("$")
+    frame: [], frameAll: false, line: lineOf(text, d.span.start), params: d.params, verify: !u.startsWith("$"), tparams: identNames(d.typeParams)
   };
 }
 
@@ -83,7 +91,7 @@ function methodFn(u: string, file: string, text: string, c: ClassDecl, m: Method
   return Fn {
     key: c.name.name + "." + m.name.name, name: m.name.name, unit: u, file: file, text: text, cls: c.name.name, kind: m.isStatic ? 2 : 1, priv: m.priv,
     generic: m.typeParams.length > 0 || c.typeParams.length > 0, pnames: names, ptys: tys, pacc: acc, ret: m.ret, body: m.body, contracts: m.contracts,
-    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params, verify: !u.startsWith("$")
+    span: m.span, pure: false, mutating: false, frame: [], frameAll: false, line: lineOf(text, m.span.start), params: m.params, verify: !u.startsWith("$"), tparams: concatNames(identNames(c.typeParams), identNames(m.typeParams))
   };
 }
 
@@ -101,7 +109,7 @@ function ctorFn(u: string, file: string, text: string, c: ClassDecl, k: CtorDecl
   return Fn {
     key: c.name.name + ".constructor", name: "constructor", unit: u, file: file, text: text, cls: c.name.name, kind: 3, priv: false, generic: c.typeParams.length > 0,
     pnames: names, ptys: tys, pacc: acc, ret: None, body: k.body, contracts: k.contracts, span: k.span, pure: false, mutating: false,
-    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps, verify: !u.startsWith("$")
+    frame: [], frameAll: false, line: lineOf(text, k.span.start), params: ps, verify: !u.startsWith("$"), tparams: identNames(c.typeParams)
   };
 }
 
@@ -133,7 +141,7 @@ function classInfo(u: string, file: string, text: string, c: ClassDecl, ctor: Op
       _ => {}
     }
   }
-  return Cls { name: c.name.name, unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor };
+  return Cls { name: c.name.name, unit: u, file: file, text: text, fields: fields, ftys: ftys, finit: finit, invs: clausesOfList(c.contracts, 4), generic: c.typeParams.length > 0, ctor: ctor, tparams: identNames(c.typeParams) };
 }
 
 // Count of a name in a map (0 when absent).
@@ -464,7 +472,7 @@ function probesOf(g: Gen, tab: Tab, label: string, term: string, vt: VT, depth: 
         let i: usize = 0;
         const d = rd.unwrap();
         while (i < d.fields.length) {
-          const ft = resolveTy(tab, d.ftys[i]);
+          const ft = fieldTyOf(tab, d, i);
           if (!isBad(ft)) {
             out = probesOf(g, tab, label + "." + d.fields[i], "(" + sn.unwrap() + "." + d.fields[i] + " " + term + ")", ft, depth + 1, out);
           }
@@ -863,7 +871,7 @@ function ctorEntry(en0: Entry, f: Fn, cls: Cls): Result<Entry, string> {
   let i: usize = 0;
   while (i < cls.fields.length) {
     const name = cls.fields[i];
-    const ft = resolveTy(en.cx.p.tab, cls.ftys[i]);
+    const ft = resolveTyP(en.cx.p.tab, cls.ftys[i], cls.tparams);
     let term = "";
     let k: usize = 0;
     while (k < f.pnames.length) {
@@ -925,9 +933,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
   for (const c of clausesOfList(f.contracts, 2)) {
     rt = pushRes(rt, f, lineOf(f.text, c.span.start), "decreases", clauseText(f.text, c), unknownV("termination measures are not checked (v1)"), []);
   }
-  if (f.generic) {
-    return allUnknown(rt, f, cls, "generic function or method of a generic class (type parameters are not modelled)");
-  }
+
   if (f.kind != 0 && cls.isNone()) {
     return allUnknown(rt, f, cls, "class `" + f.cls + "` is outside the fragment");
   }

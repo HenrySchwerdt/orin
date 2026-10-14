@@ -12,7 +12,7 @@ import {
 } from "../syntax";
 import {
   VT, VInt, VBool, VStr, VUnit, VArr, VOpt, VRes, VMap, VRec, VUni, VBad,
-  isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, resolveTy, fieldIndex, isMapKey
+  isIntKind, intLo, intHi, joinKinds, vtName, vtKey, isBad, badReason, vtEq, isIntTy, intKindOf, concrete, resolveTy, resolveTyP, fieldTyOf, fieldIndex, isMapKey
 } from "./vt";
 import { Gen, SortR, sortOf, opaqueSort } from "./gen";
 import {
@@ -451,7 +451,7 @@ function trMember(g: Gen, vars: Var[], cx: Cx, base: Expr, name: string, e: Expr
       if (fi.isNone()) {
         return Err("no field `" + name + "` on `" + rn + "`");
       }
-      const ft = tyOf(cx, rd.unwrap().ftys[fi.unwrap()]);
+      const ft = fieldTyOf(cx.p.tab, rd.unwrap(), fi.unwrap());
       if (isBad(ft)) {
         return Err("field `" + rn + "." + name + "` has an unsupported type (" + badReason(ft) + ")");
       }
@@ -536,7 +536,15 @@ function trRecordLit(g0: Gen, vars: Var[], cx: Cx, name: string, spread: Option<
   }
   const d = rd.unwrap();
   if (d.generic) {
-    return Err("generic record `" + name + "`");
+    let inScope = d.tparams.length > 0;
+    for (const x of d.tparams) {
+      if (!cx.f.tparams.includes(x)) {
+        inScope = false;
+      }
+    }
+    if (!inScope) {
+      return Err("generic record `" + name + "`");
+    }
   }
   const t = VRec(name);
   if (cx.p.tab.isCyclic("r:" + name)) {
@@ -564,7 +572,7 @@ function trRecordLit(g0: Gen, vars: Var[], cx: Cx, name: string, spread: Option<
         found = Some(fi.value);
       }
     }
-    const ft = tyOf(cx, d.ftys[i]);
+    const ft = fieldTyOf(cx.p.tab, d, i);
     if (found.isSome()) {
       if (isBad(ft)) {
         const fo = freshFreeOpaque(g);
@@ -1242,7 +1250,7 @@ export function callFn(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, ar
 
 export function callFnX(g0: Gen, vars: Var[], cx: Cx, f: Fn, recv: Option<TR>, args: Expr[], e: Expr, exp: VT): Result<CallR, string> {
   let g = g0;
-  if (f.generic) {
+  if (f.generic && !(f.cls != "" && f.cls == cx.f.cls)) {
     return Err("call of the generic function `" + f.key + "`");
   }
   if (f.pnames.length != args.length) {
@@ -1533,7 +1541,7 @@ function trNew(g0: Gen, vars: Var[], cx: Cx, name: string, targs: TypeExpr[], ar
           skip = true;
         }
       }
-      const ft = tyOf(cx, cls.ftys[fi]);
+      const ft = resolveTyP(cx.p.tab, cls.ftys[fi], cls.tparams);
       if (!skip && !isBad(ft)) {
         const none: Var[] = [];
         const r = tr(g, none, icx, cls.finit[fi].unwrap(), ft);

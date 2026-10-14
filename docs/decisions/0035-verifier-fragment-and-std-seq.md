@@ -47,7 +47,7 @@ paths that return did not overflow (A-INT).
 
 ### 3. The verification fragment (the table is in docs/contracts.md)
 
-Arrays are a data array plus a length (`select` / `store`; index with an in-bounds obligation, `push`, `pop`, `slice`,
+Generic functions and classes are checked once, abstractly: a type parameter is an opaque value. Arrays are a data array plus a length (`select` / `store`; index with an in-bounds obligation, `push`, `pop`, `slice`,
 element assignment); records and classes are datatypes (field read, write through nested places, `{ ..r, f: v }`);
 `Option`, `Result` and unions are datatypes with `match`; `Map` is a presence array, a value array and a size; strings are a
 pair (length, id) with uninterpreted content operations; every integer width has its exact range. Unsupported constructs give
@@ -59,8 +59,12 @@ pair (length, id) with uninterpreted content operations; every integer width has
 - `VERIFIED` is solver `unsat`, plus: every loop invariant it relied on is itself proved (entry and one iteration), else
   `UNKNOWN`.
 - `REFUTED` needs a counterexample that is real: a `sat` model on a path that used no abstraction. A path through a loop
-  without a proved-complete invariant, a `Map` size, or string contents that were derived is *abstract*: `sat` there is
-  `UNKNOWN` ("the counterexample is not trusted"), with `action: STRENGTHEN_SPEC`.
+  without a proved-complete invariant, a `Map` size, string contents that were derived, or **a value that is only known through
+  a callee's contract** (a pure function is an uninterpreted function; the result of an impure call and a receiver after a
+  mutating call are constrained only by `@Ensures` and the frame; this includes the assumptions about the inputs, a pure
+  helper in a `@Requires`) is *abstract*: `sat` there is `UNKNOWN` ("the counterexample is not trusted"), with
+  `action: STRENGTHEN_SPEC`. The arguments of a call, and a `new C(..)` whose fields are determined by parameter properties and
+  initialisers, are not abstract.
 - To keep refutation useful, a loop is also **unrolled a few iterations exactly** (3); obligations and postconditions found
   on those paths are real. A false claim after a loop, and an index that goes out of range within three iterations, are
   `REFUTED`.
@@ -95,7 +99,11 @@ value (A-FRAME, listed on every result that used it). There are no annotations.
   (A-INV). The run-time check has the same hole (invariants are checked at constructors and after methods).
 - Strings are modelled by length. `REFUTED` is only given when the claim and the path use lengths, `charCodeAt` or `+`, not
   all together and not derived contents.
-- Floats, interfaces, closures as values, generics, recursive types (their fields are opaque) are outside the fragment.
+- Floats, interfaces, closures as values, `?`, `reduce`, calls of generic functions from outside their class and recursive
+  types (their fields are opaque) are outside the fragment. Types with the same simple name in two units are ambiguous
+  (UNKNOWN); resolving names per unit is the next step for the compiler's own sources.
+- `charCodeAt` is a byte (0..255): the runtime reads an unsigned char. A `charCodeAt` value that reaches a goal or a path
+  condition makes a counterexample untrusted (the model does not know the contents, e.g. of a table literal).
 
 ## Open questions for the owner
 
