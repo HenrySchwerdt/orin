@@ -247,6 +247,58 @@ class CliTests(unittest.TestCase):
             ["git", "-C", str(project / ".orin/packages/shared"), "rev-parse", "HEAD"], text=True).strip()
         self.assertEqual(old_commit, cached_commit)
 
+    def test_malformed_child_manifest_rolls_back_add(self):
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        bad = self.cwd / "badlib"
+        (bad / "src").mkdir(parents=True)
+        (bad / "src/module.or").write_text("export const value = 1;\n")
+        (bad / "orin.toml").write_text('[package]\nname = "badlib"\ninvalid = true\n')
+        before = (project / "orin.toml").read_bytes()
+        self.run_cli("add", "--path", "../badlib", "--name", "badlib", cwd=project, code=1)
+        self.assertEqual(before, (project / "orin.toml").read_bytes())
+        self.assertFalse((project / "orin.lock").exists())
+
+    def test_consumers_ignore_library_dev_dependencies(self):
+        self.run_cli("init", "shared", "--lib")
+        shared = self.cwd / "shared"
+        with (shared / "orin.toml").open("a") as manifest:
+            manifest.write('\n[dev-dependencies]\ntestkit = { path = "../absent-testkit" }\n')
+        subprocess.run(["git", "init", "-q"], cwd=shared, check=True)
+        subprocess.run(["git", "add", "."], cwd=shared, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "initial"], cwd=shared, check=True)
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--git", str(shared), cwd=project)
+        self.run_cli("build", cwd=project)
+        self.assertNotIn("testkit", (project / "orin.lock").read_text())
+
+    def test_shared_path_dependency_cannot_override_root_lock(self):
+        for name in ("base", "shared"):
+            self.run_cli("init", name, "--lib")
+        base = self.cwd / "base"
+        def git(*args):
+            return subprocess.check_output(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+                cwd=base, text=True).strip()
+        git("init", "-q"); git("add", "."); git("commit", "-qm", "v1")
+        self.run_cli("add", "--git", str(base), cwd=self.cwd / "shared")
+        (self.cwd / "shared/src/module.or").write_text('export { greeting } from "base";\n')
+        for name in ("app1", "app2"):
+            self.run_cli("init", name)
+            project = self.cwd / name
+            self.run_cli("add", "--path", "../shared", cwd=project)
+            (project / "src/main.or").write_text('import { greeting } from "shared";\nfunction main(): void { console.log(greeting()); }\n')
+        self.assertIn("Hello", self.run_cli("run", cwd=self.cwd / "app1").stdout)
+        (base / "src/module.or").write_text('export function greeting(): string { return "Changed"; }\n')
+        git("add", "."); git("commit", "-qm", "v2")
+        self.run_cli("update", cwd=self.cwd / "app2")
+        result = self.run_cli("run", cwd=self.cwd / "app1", code=1)
+        self.assertIn("locked", (result.stdout + result.stderr).lower())
+        self.run_cli("fetch", "--locked", cwd=self.cwd / "app1")
+        self.assertIn("Hello", self.run_cli("run", cwd=self.cwd / "app1").stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
