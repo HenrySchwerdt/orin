@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import time
 import subprocess
 import tempfile
 import unittest
@@ -143,6 +145,45 @@ class CliTests(unittest.TestCase):
         self.run_cli("add", "--path", "../shared", "--dev", cwd=project)
         (project / "src/main.or").write_text('import { greeting } from "shared";\nfunction main(): void { console.log(greeting()); }\n')
         self.run_cli("check", cwd=project, code=1)
+
+    def test_transitive_sources_invalidate_build_cache(self):
+        self.run_cli("init", "base", "--lib")
+        self.run_cli("init", "shared", "--lib")
+        self.run_cli("add", "--path", "../base", cwd=self.cwd / "shared")
+        (self.cwd / "shared/src/module.or").write_text('export { greeting } from "base";\n')
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--path", "../shared", cwd=project)
+        (project / "src/main.or").write_text('import { greeting } from "shared";\nfunction main(): void { console.log(greeting()); }\n')
+        self.assertIn("Hello", self.run_cli("run", cwd=project).stdout)
+        (self.cwd / "base/src/module.or").write_text('export function greeting(): string { return "Changed"; }\n')
+        self.assertIn("Changed", self.run_cli("run", cwd=project).stdout)
+
+    def test_watch_restarts_after_change_and_stops_cleanly(self):
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        log = self.cwd / "watch.log"
+        with log.open("w") as output:
+            process = subprocess.Popen([str(self.cli), "dev"], cwd=project,
+                                       stdout=output, stderr=output, start_new_session=True)
+            try:
+                deadline = time.monotonic() + 30
+                while "Hello from Orin!" not in log.read_text() and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                self.assertIn("Hello from Orin!", log.read_text())
+                (project / "src/main.or").write_text('function main(): void { console.log("Rebuilt"); }\n')
+                deadline = time.monotonic() + 30
+                while "Rebuilt" not in log.read_text() and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                self.assertIn("Rebuilt", log.read_text())
+            finally:
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+            self.assertEqual(process.returncode, 130, log.read_text())
 
     def test_machine_init_and_invalid_flags(self):
         result = self.run_cli("init", "hello", "--format=json")
