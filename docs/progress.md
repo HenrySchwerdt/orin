@@ -63,28 +63,23 @@ instruction parity (#69, ADR-0038 §8 gate 1); the last four through the integra
 executed instructions, -93% retains; census numbers and the lever ranking in
 [`perf/alloc-census.md`](perf/alloc-census.md).
 
-1. **Performance, lever 1: verifier and optimiser data structures** (class g; 27% of the self-compile's allocations,
-   977 MB of `ls` copies in `Transfer.set`). Scratch `ls` per Fixpoint, one reusable Transfer, `State.join` in place,
-   visitor-style `instrUses` / `termUses`, one `successors`, no receiver dup around `callOwned`. Includes the open item
-   "verifier cost on long fused functions".
-2. **Performance, lever 2: field and element access code** (not a census class): `make_unique` + `struct_get` /
-   `struct_replace` per field write and repeated bounds-checked element reads (mutres 10.6x C instructions, pqueue
-   4.8x, nbody 3.7x, sieve 3.4x). MIR-level CSE of loads and uniqueness checks, bounds-check hoisting, unique receivers
-   through in/out methods.
-3. **Performance, next ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
+1. **Performance, lever 2: field and element access code** (not a census class; design accepted 2026-10-15, ADR-0038
+   addendum "lever 2"): `make_unique` + `struct_get` / `struct_replace` per field write and repeated bounds-checked element
+   reads (mutres 10.6x C instructions, pqueue 4.8x, nbody 3.7x, sieve 3.4x). Rollout T1 (drop `makeunique` the verifier
+   proves `Unique`) and T3 (scalar stores without the run-time refmask test) in progress, then T2, T4, T5 with the new
+   verifier rules U1, F1, U2-U5; T6 (range facts) needs its own decision. The `orin_stats` counters become a build option.
+   Lever 1 (verifier and optimiser data structures) is done: self-compile -23% allocations, -3.2% instructions; the
+   remaining self-compile time is no longer allocation.
+2. **Performance, next ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
-4. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
+3. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
-5. **Benchmark harness:** `tools/bench.py`'s parallel section passes the thread count as `argv[1]` and sets
-   `ORIN_BENCH_THREADS`; `bench/streams_parallel` reads its workload from `argv[1]` and its thread count from `ORIN_THREADS`,
-   so its rows run the default workload with the default thread count and report a checksum mismatch at 2 and 4 threads
-   (on main before the wave too). Pass the workload and `ORIN_THREADS` for it.
-6. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
+4. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
    global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.
-7. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
+5. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
    `.parallel()` per compiler phase (ADR-0039 §6).
-8. **Follow-ups:**
+6. **Follow-ups:**
    - `HStmt` spans for break/continue/return;
    - trap hook and cancellation for tasks (prerequisite for ADR-0041 Stage D);
    - ADR-0040 (generic methods);
