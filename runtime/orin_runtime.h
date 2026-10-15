@@ -429,6 +429,12 @@ uint64_t orin_res_unwrap_err(OrinObj *o);
 /* ---------------------------------------------------------------- strings (all byte strings) */
 
 OrinObj *orin_str_new(const char *p, uint64_t n); /* owned copy */
+/*@ orin_str_with_capacity(cap): a new, empty buffer for appending (OX markup roots, ADR-0044).
+    ensures  \result is a fresh unique string (rc == 1), len(\result) == 0, capacity >= min(cap, ORIN_STR_HINT_MAX),
+             so orin_str_append onto it is in place (no growth) while the total length stays within that capacity;
+    assigns  the heap (one allocation). cap is a hint only: it never changes the value, and is clamped to 1 MiB. */
+#define ORIN_STR_HINT_MAX ((uint64_t)1 << 20)
+OrinObj *orin_str_with_capacity(uint64_t cap);
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b);
 /* a += b. CONSUMES a, returns owned result; in place (amortised O(1)) when a is unique. */
 OrinObj *orin_str_append(OrinObj *a, OrinObj *b);

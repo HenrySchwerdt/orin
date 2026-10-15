@@ -159,8 +159,8 @@ shape as the hand-written concatenation.
 
 ## Not done (follow-ups, in order of expected gain)
 
-1. **Pre-sized buffer.** The static length of a root is known at compile time; a capacity hint (a string-with-capacity
-   primitive, MIR + both backends) would remove most of the geometric re-growths (`string_grows` in the benchmark).
+1. ~~**Pre-sized buffer.**~~ Done (ADR-0044, "Pre-sized buffer"): a root starts from `str.withCapacity(hint)`;
+   `string_grows` 4.23 M -> 0.25 M and executed instructions 3.99 G -> 3.10 G on the benchmark.
 2. **Append without temporaries.** Integers and escaped text are converted into a temporary string and then appended; an
    append-escaped / append-int primitive would write straight into the buffer.
 3. **Component fusion.** A small component could be inlined (`@Inline` / the inliner) so that its tags merge into the

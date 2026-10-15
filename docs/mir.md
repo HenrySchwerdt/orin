@@ -68,6 +68,8 @@ scalars held **by value** in n + 1 64-bit words (word 0 the tag, words 1..n the 
 object, no header and no reference count. Produced only by the optimiser (`compiler/opt/unbox.or`); no new instruction: the existing ones
 take an aggregate where noted in "Unboxed aggregates" below. The verifier treats an aggregate as a scalar (`Init`).
 
+v2.4 (ADR-0044) `BStrWithCapacity(n)`: **no new instruction**. `IBuiltin(Some(d), BStrWithCapacity, [n: usize])` (printed `str.withCapacity`) defines `d` as a new, owned, unique, empty string with room for `n` bytes (runtime `orin_str_with_capacity`, `n` clamped to 1 MiB). The checker emits it only as the start of an OX markup root; the lowering then appends every piece in place (`IStrAppend`).
+
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
 in order; each block ends in exactly one terminator. Scalars (`MInt`, `MUsize`, `MBool`, `MFloat`) are plain

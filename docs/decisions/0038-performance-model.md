@@ -402,6 +402,13 @@ relational fact the interval domain of T6 cannot prove, so its bounds check stay
   "requires ... to be Unique". The BENIGN classification of `drop-makeunique` (:391) shrinks to zero for pass output.
 - *Census:* allocations, frees, retains, releases and `cow_copies` identical; only `cow_inplace` decreases, by exactly the number
   of deleted executions. Code changes only where a `makeunique` was deleted.
+- *As built (2026-10-15, `compiler/opt/unique.or`):* a second run of the verifier's fixpoint per function cost +19% self-compile
+  instructions (the verifier is two thirds of compile time), far over the +1% gate. The pass instead runs a local forward must-analysis
+  of the set of certainly-`Unique` locals (created by `structnew`, `arraynew`, `makeunique`, a move of a `Unique` local; any other
+  mention removes a local, except stores / takes / puts on it, field and element reads, a borrowed argument of a call without a
+  reference result, and a scalar `length`; join is intersection). It admits at most what the verifier admits, and its output is
+  verified as usual. Self-compile -0.016%; 1037 `orin_make_unique` calls removed across the corpus, no other code change; only
+  `cow_inplace` moves (nbody 75.0M -> 0).
 
 #### T2. Repeated bounds / kind checks on the same (array, index)
 

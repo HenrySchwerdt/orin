@@ -18,6 +18,9 @@ Mutation classes (id: injected bug -> required reaction)
   store-shared-dup    `t = dup x` before a store/take/put on x    -> ERROR (x no longer Unique)
   store-shared-alias  store through `t = borrow x` instead of x   -> ERROR (Borrowed is not Unique)
   drop-makeunique     delete `makeunique x` before a store on x  -> ERROR (x only Owned)
+  redundant-makeunique-census  a `makeunique x` left after the optimiser on a certainly-Unique x -> SURVIVOR (T1 missed it)
+  dup-before-store-after-drop  `t = dup x` before a store on a certainly-Unique x with no `makeunique x` earlier in
+                      its block (what T1 leaves after deleting the check) -> ERROR
   release-borrowed    `release d` right after d = borrow/getfield -> ERROR
   release-param       `release p` for a borrowed parameter p      -> ERROR
   move-param          `t = move p` for a borrowed parameter p     -> ERROR
@@ -384,6 +387,8 @@ def sites(f):
                     out.append(Mut("use-after-consume", f, (bi, ii), "read l%s after `%s` (b%d i%d)" % (refs[0], line, bi, ii), None, "is dead", "error"))
             x = store_obj(line)
             if x is not None:
+                if certainly_unique(f, bi, ii, x) and not any(op(l2) == "makeunique" and toks(l2)[0] == x for l2 in ins[:ii]):
+                    out.append(Mut("dup-before-store-after-drop", f, (bi, ii), "dup l%d before `%s` (b%d i%d), Unique without a makeunique in the block" % (x, line, bi, ii), None, "to be Unique", "error"))
                 out.append(Mut("store-shared-dup", f, (bi, ii), "dup l%d before `%s` (b%d i%d)" % (x, line, bi, ii), None, "to be Unique", "error"))
                 out.append(Mut("store-shared-alias", f, (bi, ii), "borrow l%d, store through the alias in `%s` (b%d i%d)" % (x, line, bi, ii), None, "to be Unique", "error"))
             if w == "makeunique":
@@ -396,8 +401,11 @@ def sites(f):
                         later = k
                         break
                 if later is not None:
-                    benign = ("redundant: l%d is definitely Unique here (independent dataflow in mutate_mir.py)" % x) if certainly_unique(f, bi, ii, x) else None
-                    out.append(Mut("drop-makeunique", f, (bi, ii), "delete `%s` (b%d i%d) before `%s`" % (line, bi, ii, ins[later]), benign, "to be Unique", "error"))
+                    # ADR-0038 addendum T1: the optimiser deletes every `makeunique` of a local the verifier proves
+                    # Unique, so one that is certainly Unique by the independent dataflow is a census finding (the
+                    # mutant is accepted, so it is a SURVIVOR); no BENIGN classification remains for this class.
+                    cls = "redundant-makeunique-census" if certainly_unique(f, bi, ii, x) else "drop-makeunique"
+                    out.append(Mut(cls, f, (bi, ii), "delete `%s` (b%d i%d) before `%s`" % (line, bi, ii, ins[later]), None, "to be Unique", "error"))
             if (w == "borrow" or w == "getfield" or w == "arrayget") and d is not None and f.is_ref(d):
                 out.append(Mut("release-borrowed", f, (bi, ii), "release l%d after `%s` (b%d i%d)" % (d, line, bi, ii), None, "of borrowed", "error"))
             if w == "dup" and d is not None:
@@ -582,7 +590,7 @@ def apply(m):
         refs = [int(y) for y in re.findall(r"\bl(\d+)\b", line[line.index("{"):]) if f.is_ref(int(y))]
         n = f.new_local()
         ins.insert(ii + 1, "l%d = borrow l%d" % (n, refs[0]))
-    elif m.cls == "store-shared-dup":
+    elif m.cls in ("store-shared-dup", "dup-before-store-after-drop"):
         x = store_obj(line)
         n = f.new_local()
         ins.insert(ii, "l%d = dup l%d" % (n, x))
@@ -591,7 +599,7 @@ def apply(m):
         n = f.new_local()
         ins[ii] = replace_obj(line, x, n)
         ins.insert(ii, "l%d = borrow l%d" % (n, x))
-    elif m.cls == "drop-makeunique":
+    elif m.cls in ("drop-makeunique", "redundant-makeunique-census"):
         del ins[ii]
     elif m.cls == "release-borrowed":
         ins.insert(ii + 1, "release l%d" % dest(line))

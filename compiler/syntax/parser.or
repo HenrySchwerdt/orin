@@ -2226,8 +2226,32 @@ export class Parser {
     const open = this.toks[this.pos];
     this.pos += 1;
     let name: Option<Ident> = None;
+    let recv: Option<Expr> = None;
+    let path: string[] = [];
     if (this.isIdentAt(0)) {
-      name = Some(this.parseIdent()?);
+      let id = this.parseIdent()?;
+      path.push(id.name);
+      if (this.isP(".")) {
+        // a member tag `<a.b.C>` (ADR-0044): `recv` is the path before the last segment
+        let r = mkExpr(id.name == "this" ? EThis : EIdent(id), id.span);
+        while (this.isP(".")) {
+          this.pos += 1;
+          if (!this.isIdentAt(0)) {
+            return Err(this.errExpected("a name after `.` in an OX tag"));
+          }
+          const seg = this.parseIdent()?;
+          path.push(seg.name);
+          if (this.isP(".")) {
+            r = mkExpr(EMember(r, seg), spanTo(r.span, seg.span));
+          }
+          id = seg;
+        }
+        if (id.name.charCodeAt(0) < 65 || id.name.charCodeAt(0) > 90) {
+          return Err(diag("E0200", id.span, "a dotted OX tag `<" + path.join(".") + ">` must end in an upper-case name (a member tag calls a method)"));
+        }
+        recv = Some(r);
+      }
+      name = Some(id);
     } else if (!this.isOxEnd(">")) {
       return Err(this.errExpected("an OX tag name or `>`"));
     }
@@ -2271,6 +2295,7 @@ export class Parser {
       }
       this.pos += 1;
       return Ok(OxElement {
+        recv: recv,
         name: name,
         attrs: attrs,
         children: noKids,
@@ -2291,15 +2316,22 @@ export class Parser {
       return Err(errAt(this.toks[this.pos], "a slot closing tag `</:..>` without its opening tag"));
     }
     this.pos += 1;
-    const want = match (name) {
-      Some(n) => n.name,
-      None => "",
-    };
+    const want = path.join(".");
     if (want.length > 0) {
-      if (!this.isIdentText(0, want)) {
-        return Err(this.errExpected("`" + want + "` to close `<" + want + ">`"));
+      let k: usize = 0;
+      while (k < path.length) {
+        if (k > 0) {
+          if (!this.isP(".")) {
+            return Err(this.errExpected("`" + want + "` to close `<" + want + ">`"));
+          }
+          this.pos += 1;
+        }
+        if (!this.isIdentText(0, path[k])) {
+          return Err(this.errExpected("`" + want + "` to close `<" + want + ">`"));
+        }
+        this.pos += 1;
+        k += 1;
       }
-      this.pos += 1;
     } else if (this.isIdentAt(0)) {
       return Err(this.errExpected("`>` to close the fragment `<>`"));
     }
@@ -2308,6 +2340,7 @@ export class Parser {
     }
     this.pos += 1;
     return Ok(OxElement {
+      recv: recv,
       name: name,
       attrs: attrs,
       children: kids,
