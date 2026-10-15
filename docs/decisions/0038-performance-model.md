@@ -186,6 +186,10 @@ proof.
      par with the C backend on every benchmark, judged by instruction counts. Known outliers such as `fib`
      (about 0.89 s LLVM against 0.54 s C, measured under load) are root-caused and fixed first. The
      suspect is how checked arithmetic is lowered.
+     **Status (2026-10-14):** the lowering was not the cause; a trap call blocking shrink-wrapping and gcc's
+     partial inlining of the recursion guard were (`fib` 1.50x C instructions, now 0.78x). 14 of 16 benchmarks are
+     at or below the C backend; `appends` (+0.9 %) and `bintrees` (+0.5 %) are still above, caused by the C
+     runtime being compiled by clang instead of gcc. Table and causes: docs/benchmarks.md, "Backends: ADR-0038 §8 gate 1".
   2. **Fixed point:** the LLVM backend also reproduces itself, `stage2.ll == stage3.ll`, in CI.
   3. **Toolchain:** a pinned LLVM version is used, as described below.
 - **Toolchain: pinned, not bundled into the compiler.**

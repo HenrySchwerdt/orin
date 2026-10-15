@@ -473,7 +473,15 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     s->nslots = nslots;
     s->pad = 0;
     s->refmask = refmask;
-    orin_platform_mem_set(s->slots, 0, (size_t)nslots * 8);
+    /* Small records dominate: plain stores, so the compiler neither calls memset nor loops (clang turns the loop into a call). */
+    switch (nslots) {
+    case 4: s->slots[3] = 0; /* fallthrough */
+    case 3: s->slots[2] = 0; /* fallthrough */
+    case 2: s->slots[1] = 0; /* fallthrough */
+    case 1: s->slots[0] = 0; /* fallthrough */
+    case 0: break;
+    default: orin_platform_mem_set(s->slots, 0, (size_t)nslots * 8);
+    }
     g_live++;
     stat_alloc(&orin_stats.alloc_struct, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     SITE_ALLOC(&s->h, 3, sizeof(OrinStruct) + (uint64_t)nslots * 8);
