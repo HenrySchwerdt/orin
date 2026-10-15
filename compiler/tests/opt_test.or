@@ -8,7 +8,7 @@ import { Host, useFs } from "std:host";
 import { FsGrant } from "std:fs";
 import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
 import { Span, SourceFile, span } from "../diag";
-import { BArrConcat, BStrLength, UnNeg, OpAdd } from "../hir";
+import { BArrConcat, BArrLength, BStrLength, UnNeg, OpAdd } from "../hir";
 import {
   MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, plainBlock,
 } from "../mir";
@@ -763,7 +763,7 @@ function aMakeUniqueOfAFreshObjectIsDropped(): void {
   const p = prog([f]);
   assert(verifies(p), "the input verifies");
   assertEqUsize(makeUniqueCount(f), 2, "two before");
-  const g = dropUniqueChecks(p, f);
+  const g = dropUniqueChecks(prog([f]), f);
   assertEqUsize(makeUniqueCount(g), 0, "both are redundant: the struct is Unique from its creation");
   assertEqUsize(instrCount(g), instrCount(f) - 2, "nothing else changed");
   assert(verifies(prog([g])), "the verifier accepts the result");
@@ -784,7 +784,7 @@ function aMakeUniqueOfASharedObjectStays(): void {
   );
   const p = prog([f]);
   assert(verifies(p), "the input verifies");
-  const g = dropUniqueChecks(p, f);
+  const g = dropUniqueChecks(prog([f]), f);
   assertEqUsize(makeUniqueCount(g), 1, "x was shared by the dup: the check is needed");
   assert(verifies(prog([g])), "the verifier accepts the result");
 }
@@ -800,7 +800,7 @@ function aMakeUniqueAfterAFirstOneIsDroppedAndOneParameterStays(): void {
   );
   const p = prog([f]);
   assert(verifies(p), "the input verifies");
-  const g = dropUniqueChecks(p, f);
+  const g = dropUniqueChecks(prog([f]), f);
   assertEqUsize(makeUniqueCount(g), 1, "the first stays, the second is redundant");
   assert(verifies(prog([g])), "the verifier accepts the result");
 }
@@ -873,5 +873,45 @@ function aCallArgumentDemotesTheLocalBeforeTheNextMakeUnique(): void {
   assert(verifies(p), "the input verifies");
   const q = dropUniqueProgram(p);
   assertEqUsize(makeUniqueCount(q.functions[0]), 1, "x may be shared with the result");
+  assert(verifies(q), "the verifier accepts the result");
+}
+
+@Test
+function aCallWithAScalarResultAndAMoveKeepUniqueness(): void {
+  // len(a) -> int and arr.length(x) do not demote x; y = move x keeps the kind, so neither makeunique is needed
+  const callee = MFunction {
+    name: "len",
+    paramCount: 1,
+    paramOwned: [false],
+    inout: false,
+    locals: [lr("a"), li("n")],
+    ret: MInt,
+    blocks: [bk([ICopy(1, OInt(0))], TReturn(Some(OLocal(1))))],
+  };
+  const f = fn(
+    "f",
+    0,
+    [lr("x"), li("n"), lr("y")],
+    [
+      bk(
+        [
+          IStructNew(0, 0, [OStr(0)]),
+          ICall(Some(1), 1, [OLocal(0)]),
+          IMakeUnique(0),
+          IBuiltin(Some(1), BArrLength, [OLocal(0)]),
+          IMakeUnique(0),
+          IMove(2, 0),
+          IMakeUnique(2),
+          ISetField(2, 0, OStr(0)),
+          IRelease(2),
+        ],
+        TReturn(None),
+      ),
+    ],
+  );
+  const p = prog([f, callee]);
+  assert(verifies(p), "the input verifies");
+  const q = dropUniqueProgram(p);
+  assertEqUsize(makeUniqueCount(q.functions[0]), 0, "x stays Unique over the call and over the move");
   assert(verifies(q), "the verifier accepts the result");
 }
