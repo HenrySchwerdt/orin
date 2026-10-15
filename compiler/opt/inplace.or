@@ -270,6 +270,11 @@ function takePutSlots(f: MFunction): MFunction {
 //     release x                       =>
 //     x = move d
 //
+// and, when x only dies there (it is owned, being released; `qs(lo).concat(eq)` with a fresh temporary x):
+//
+//     d = builtin arr.concat(x, y)           arrayextend x, y
+//     release x                       =>     d = move x
+//
 //     d1 = getfield x.i                      makeunique x
 //     ..                                     d1 = takefield x.i
 //     d3 = builtin arr.concat(d1, y)  =>     ..
@@ -365,16 +370,27 @@ function extendArrays(f: MFunction): MFunction {
                 },
               }
             }
-            if (fnd && jr + 1 < instrs.length && !plan.touched(jr + 1)) {
-              match (instrs[jr + 1]) {
-                IMove(dd, ss) => {
-                  if (dd == c.x && ss == c.d) {
-                    plan.replace(i, [IArrayExtend(c.x, OLocal(c.y))]);
-                    plan.remove(jr);
-                    plan.remove(jr + 1);
-                  }
-                },
-                _ => {},
+            if (fnd) {
+              let moved = false;
+              if (jr + 1 < instrs.length && !plan.touched(jr + 1)) {
+                match (instrs[jr + 1]) {
+                  IMove(dd, ss) => {
+                    if (dd == c.x && ss == c.d) {
+                      plan.replace(i, [IArrayExtend(c.x, OLocal(c.y))]);
+                      plan.remove(jr);
+                      plan.remove(jr + 1);
+                      moved = true;
+                    }
+                  },
+                  _ => {},
+                }
+              }
+              if (!moved) {
+                // (1b) a dying operand: x is owned (it is released here) and dead after the concat, so the result
+                // can be x itself extended (the runtime still copies when x is shared):
+                //   d = concat(x, y); release x   =>   arrayextend x, y; d = move x
+                plan.replace(i, [IArrayExtend(c.x, OLocal(c.y)), IMove(c.d, c.x)]);
+                plan.remove(jr);
               }
             }
           }
