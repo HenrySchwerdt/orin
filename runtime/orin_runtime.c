@@ -473,7 +473,15 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     s->nslots = nslots;
     s->pad = 0;
     s->refmask = refmask;
-    orin_platform_mem_set(s->slots, 0, (size_t)nslots * 8);
+    /* Small records dominate: plain stores, so the compiler neither calls memset nor loops (clang turns the loop into a call). */
+    switch (nslots) {
+    case 4: s->slots[3] = 0; /* fallthrough */
+    case 3: s->slots[2] = 0; /* fallthrough */
+    case 2: s->slots[1] = 0; /* fallthrough */
+    case 1: s->slots[0] = 0; /* fallthrough */
+    case 0: break;
+    default: orin_platform_mem_set(s->slots, 0, (size_t)nslots * 8);
+    }
     g_live++;
     stat_alloc(&orin_stats.alloc_struct, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     SITE_ALLOC(&s->h, 3, sizeof(OrinStruct) + (uint64_t)nslots * 8);
@@ -635,6 +643,35 @@ OrinObj *orin_str_append(OrinObj *a, OrinObj *b) {
     OrinString *r = str_alloc(n, n + n / 2 + 8);
     if (x->len) orin_platform_mem_copy(r->data, x->data, x->len);
     orin_platform_mem_copy(r->data + x->len, y->data, y->len);
+    orin_release(a);
+    return &r->h;
+}
+
+OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b) {
+    OrinString *x = (OrinString *)a, *y = (OrinString *)b;
+    if (y->len == 0) return a;
+    uint64_t n = x->len + y->len;
+    if (a->rc == 1 && a != b) {
+        if (n > x->cap) {
+            uint64_t cap = x->cap * 2;
+            if (cap < n) cap = n;
+            if (cap < 16) cap = 16;
+            uint64_t oldcap = x->cap;
+            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            orin_stats.live_bytes += cap - oldcap;
+            orin_stats.string_grows++;
+            SITE_GROW(&x->h, cap - oldcap);
+            x->cap = cap;
+        }
+        orin_platform_mem_move(x->data + y->len, x->data, x->len);
+        orin_platform_mem_copy(x->data, y->data, y->len);
+        x->len = n;
+        x->data[n] = 0;
+        return &x->h;
+    }
+    OrinString *r = str_alloc(n, n);
+    orin_platform_mem_copy(r->data, y->data, y->len);
+    if (x->len) orin_platform_mem_copy(r->data + y->len, x->data, x->len);
     orin_release(a);
     return &r->h;
 }
@@ -2056,7 +2093,6 @@ static OrinObj *deep_copy(OrinObj *root) {
  * token travels only through a monitor or a thread start, both of which order the sender's release before the
  * receiver's take). Otherwise (a shared box, which std:task never passes) a fresh box is built as before. */
 uint64_t orin_rt_transfer_put(OrinObj *box) {
-    if (box->kind == ORIN_K_STRUCT && ((OrinStruct *)box)->nslots == 2) return lend_put(box);
     if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 1) orin_trap_shape();
     OrinStruct *s = (OrinStruct *)box;
     OrinObj *out;
@@ -2107,12 +2143,20 @@ static uint64_t par_threads(void) {
     return orin_platform_cpu_count();
 }
 
-/* 0: values moved by this task so far, 1: copied; 2: the thread count of parallel pipelines (par_threads). Query 2 shares
- * this function because both backends already declare it (the LLVM backend's list of runtime declarations was not
- * extended for parallel pipelines); it becomes `core.task.threads` with the rest of this section in R3. */
+/* 0: values moved by this task so far, 1: copied. */
 uint64_t orin_rt_transfer_count(uint64_t which) {
-    return which == 0 ? orin_stats.transfer_moves : which == 1 ? orin_stats.transfer_copies : which == 2 ? par_threads() : 0;
+    return which == 0 ? orin_stats.transfer_moves : which == 1 ? orin_stats.transfer_copies : 0;
 }
+
+/* Lend (ADR-0039 §4, see "lending" above): `box` is a TWO-slot record { value, _ } the caller has just built; returns the lend
+ * token (end it with orin_rt_transfer_drop). It becomes `core.lend.put` in R3. */
+uint64_t orin_rt_lend(OrinObj *box) {
+    if (box->kind != ORIN_K_STRUCT || ((OrinStruct *)box)->nslots != 2) orin_trap_shape();
+    return lend_put(box);
+}
+
+/* The thread count of parallel pipelines: ORIN_THREADS (1..1,024) or the processors online. It becomes `core.task.threads` in R3. */
+uint64_t orin_rt_par_threads(void) { return par_threads(); }
 
 /* ---------------------------------------------------------------- tasks */
 

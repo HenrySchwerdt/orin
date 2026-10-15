@@ -132,13 +132,15 @@ void orin_destroy(OrinObj *o); /* internal: free an object whose count reached 0
  *   task: spawn starts a thread that takes the closure `() => void` out of the token, runs it and ends; join waits
  *     (0: it returned, 1: it trapped, the message is then available from orin_rt_task_message). A trap on a task thread
  *     ends only that task.
- *   lend (ADR-0039, `.parallel()`): put of a TWO-slot record { value, _ } pins the value's graph for reading by the tasks
+ *   lend (ADR-0039, `.parallel()`): orin_rt_lend of a TWO-slot record { value, _ } pins the value's graph for reading by the tasks
  *     the owner spawns next (their closures share it instead of copying it); drop of that token ends the lend and
  *     restores the counts; take of it traps. A transfer by another task copies pinned objects. See "lending" in the .c. */
 uint64_t orin_rt_transfer_put(OrinObj *box);
 OrinObj *orin_rt_transfer_take(uint64_t token);
 void orin_rt_transfer_drop(uint64_t token);
-uint64_t orin_rt_transfer_count(uint64_t which); /* 0: values moved by this task so far, 1: copied, 2: parallel threads */
+uint64_t orin_rt_transfer_count(uint64_t which); /* 0: values moved by this task so far, 1: copied */
+uint64_t orin_rt_lend(OrinObj *box);             /* lend the value of a two-slot record { value, _ } (end: orin_rt_transfer_drop) */
+uint64_t orin_rt_par_threads(void);              /* the thread count of parallel pipelines */
 uint64_t orin_rt_task_spawn(uint64_t token);
 uint64_t orin_rt_task_join(uint64_t thread);
 OrinObj *orin_rt_task_message(void);
@@ -412,6 +414,14 @@ OrinObj *orin_str_new(const char *p, uint64_t n); /* owned copy */
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b);
 /* a += b. CONSUMES a, returns owned result; in place (amortised O(1)) when a is unique. */
 OrinObj *orin_str_append(OrinObj *a, OrinObj *b);
+/*@ orin_str_prepend(a, b): a = b ++ a.  CONSUMES a (the result replaces it), b is only read.
+    requires a and b are strings, each kept alive by its caller;
+    ensures  \result is a string equal to b followed by a (len(result) == len(a) + len(b)); b is unchanged;
+    ensures  a->rc == 1 && a != b ==> \result == a, extended in place (the old bytes are moved up; capacity at least
+             doubles on growth), so a string that is shared (rc > 1, e.g. an alias of a literal or of another binding)
+             is never modified: \result is then a fresh string and a has been released (one reference dropped);
+    assigns  the heap (a, or a new string). */
+OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b);
 int64_t orin_str_eq(OrinObj *a, OrinObj *b);
 static inline uint64_t orin_str_len(const OrinObj *s) { return ((const OrinString *)s)->len; }
 static inline const char *orin_str_data(const OrinObj *s) { return ((const OrinString *)s)->data; }

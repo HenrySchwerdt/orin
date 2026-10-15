@@ -29,6 +29,15 @@ concatenation in place (`x = x ++ y`, rules exactly those of `IStrAppend`), and 
 prints `(params 1, owned l0, inout)` and `arrayextend x, y`. New built-ins `BBytesToString` / `BStringToBytes`
 (`bytesToString(u8[], start, len)`, `stringToBytes(s)`) need no MIR rule (built-ins have no signature table).
 
+v2.3 (ADR-0038 class (e), reuse in place) one new instruction, `IStrPrepend(x, y)`: `x = y ++ x`, the consuming form of string
+concatenation. The lowering emits it for `a + b` when `b` is an owned temporary that dies there and `a` is borrowed or a literal
+(`"w" + n.toString()`): instead of copying `a` and appending `b` (two allocations), `b`'s buffer is extended at the front, in place
+when `b` is unique (the runtime checks `rc == 1`; a shared `b` is copied and released, so value semantics and COW are unchanged).
+Verifier rules are exactly those of `IStrAppend` (x is mutated, consumed and replaced: Owned/Unique/Imm, stays Owned; y live and
+not `x`, not borrowed from `x`). Textual form `strprepend x, y`. The optimiser also gains a second `extendArrays` rewrite
+(`d = concat(x, y); release x` becomes `arrayextend x, y; d = move x`, no new instruction): the release proves that `x` is owned and
+dead after the concatenation, so `qs(lo).concat(eq)` extends the temporary `qs(lo)` instead of copying it.
+
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
 `spans.length == instrs.length`); `noSpan()` (file index 4294967295) marks code without a source position (hand-written MIR, code the
@@ -92,6 +101,7 @@ hole slot when reading that slot.
   v1.1). Lowering must re-`IMakeUnique` before mutating such a local. The demotion applies to
   borrowed positions only (consumed operands are Dead afterwards).
 - `IStrAppend(x, y)`: x Owned/Unique (stays Owned); y live.
+- `IStrPrepend(x, y)` (v2.3): the same rules as `IStrAppend` with the roles of the operands in the result swapped (`x = y ++ x`).
 - `IArrayExtend(x, y)` (v1.10): the same rules for arrays: x Owned/Unique (stays Owned: the runtime appends in place when x is
   unique and otherwise replaces it by a new array), y a live reference *local* that is neither x nor borrowed from x; the
   reference elements of y are retained by the runtime, y itself is not consumed. Borrows of x die.
@@ -131,6 +141,14 @@ hole slot when reading that slot.
   invalidate `Borrowed(x)`; v consumed; d Owned.
 - Any operation that makes x Dead or mutates it also invalidates `Borrowed(x)`.
 - `IDup(d, x)` / `IBorrow(d, x)` where x is Unique demote x to Owned (no longer provably unique).
+
+## Borrowed read-only copies of parameters (borrow inference, ADR-0038 class (d))
+The lowering copies a reference parameter into a local (`d = dup p` ... `release d`). `compiler/opt/borrow.or` recognises the
+copies that are only read and rewrites them to `d = borrow p` (no retain, no release), so that the parameter stays borrowed
+(`paramOwned[p] = false`) and no caller retains its argument. **No new rule**: `IBorrow(d, p)` of a `Param` gives `Borrowed(Param)`,
+valid for the whole call, and the uses the pass allows (field and element reads, builtins, borrowed call positions) are the uses
+the verifier already accepts for a `Borrowed` local. A copy that is moved, stored, returned, retained again, mutated, or passed to an
+owned position keeps its `dup` (default deny).
 
 ## In/out receiver (v1.10)
 A mutating method with a result returns a fresh record `{ self, value }` (ADR-0009): one allocation, one retain and one release
@@ -312,22 +330,22 @@ verifier's own check is independent of them, and its contracts state that it imp
   that overwrites a local that may still own a reference. A discarded reference result
   (`ICall(None, ..)` of a ref-returning function) is *not* flagged (no obligation tracked).
 - **Invalidation** of `Borrowed(x)` happens on release, move/consume, redefinition, and on every
-  mutating op including `IPutField`/`IArrayPut` and `IStrAppend`. `IGetField`/`IArrayGet` of a
+  mutating op including `IPutField`/`IArrayPut`, `IStrAppend` and `IStrPrepend`. `IGetField`/`IArrayGet` of a
   borrowed object get the same root; of a Param the root is the Param itself. `Borrowed(x)` is
   also dead after `IMakeUnique(x)`, `IArrayPush`, `IArrayPop`.
 - **Holes.** A hole key is a constant slot/index or a `usize` local used as array index
   (symbolic). Reads/takes/sets use a conservative "may alias" test (any symbolic key matches
   anything); `put` needs the identical key. Redefining a local that names an open hole is an
   error. *Any whole-object use* of an object with an open hole (call argument, `IDup`,
-  `IBorrow`, move, release, consume, return, `IMakeUnique`, push/pop/`IStrAppend`) is an error:
+  `IBorrow`, move, release, consume, return, `IMakeUnique`, push/pop/`IStrAppend`/`IStrPrepend`) is an error:
   the callee/runtime would see an empty slot. `ISetField` into a taken slot is an error (use put).
 - **Calls and uniqueness (rule strengthened).** The table says calls do not change argument
   states. That is unsound for `Unique`: a callee can return (a dup of) its argument, leaving a
   second reference to an object still believed Unique. The verifier therefore demotes a `Unique`
   local passed directly as an argument of an `ICall`/`IBuiltin` **whose destination is a
   reference** to `Owned` (re-establish with `IMakeUnique`). Scalar-result calls keep Unique.
-- `IMakeUnique`/`IArrayPush`/`IArrayPop`/`IStrAppend` accept Owned/Unique/Imm; push/pop/append
-  leave the local `Owned`, `IMakeUnique` leaves it `Unique`. `IStrAppend` rejects `y` being `x`
+- `IMakeUnique`/`IArrayPush`/`IArrayPop`/`IStrAppend`/`IStrPrepend` accept Owned/Unique/Imm; push/pop/append
+  leave the local `Owned`, `IMakeUnique` leaves it `Unique`. `IStrAppend`/`IStrPrepend` reject `y` being `x`
   or borrowed from `x`.
 - Not checked (no type information in MIR): field/slot index bounds, tags, `ITag`/`IGetField`
   on the right union, builtin signatures.

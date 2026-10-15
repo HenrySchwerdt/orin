@@ -96,8 +96,16 @@ the lever that unlocks the fastest one.
     the verifier cheaper on long straight-line loops; the gate "not worse" is missed by 0.84 %.
   - *Kept for ADR-0042:* the pass returns, for every chain it saw, a `ChainInfo` (function, span, stages, parallel or not,
     fused or not and why, loops left over the data, early exit, exact capacity); `orin compile --fuse-report` prints it.
-  - *Not done:* borrow inference, reuse in place, freeze after construction (the rest of this section); fusion of a chain
+  - *Not done:* reuse in place, freeze after construction (the rest of this section); fusion of a chain
     through a variable that is used once; translation validation of the pass (ADR-0032).
+- **Borrow inference (class (d)), 2026-10-14: read-only copies of parameters** (`compiler/opt/borrow.or`). The lowering copies a
+  reference parameter into a local (`d = dup p`, `this` of every method); that retain made the parameter *owned* (callers
+  retained, the callee released). Now a copy that is only read (single definition; used only by `release`, `getfield`, `arrayget`,
+  `tag`, builtins, binary operations, indirect and virtual calls and borrowed positions of direct calls) does not consume the
+  parameter: the mode inference leaves it borrowed, and once the modes are final the copy becomes `d = borrow p` and its releases
+  go. Default deny: any other use of the copy (move, store, return, second `dup`, mutation) keeps the old behaviour; function
+  values and vtable targets keep borrowed parameters as before. No new MIR rule: a borrow of a `Param` is valid for the whole
+  call (docs/mir.md). Measured in docs/perf/alloc-census.md ("After borrow inference").
 
 ### 3. Layout
 
@@ -178,6 +186,10 @@ proof.
      par with the C backend on every benchmark, judged by instruction counts. Known outliers such as `fib`
      (about 0.89 s LLVM against 0.54 s C, measured under load) are root-caused and fixed first. The
      suspect is how checked arithmetic is lowered.
+     **Status (2026-10-14):** the lowering was not the cause; a trap call blocking shrink-wrapping and gcc's
+     partial inlining of the recursion guard were (`fib` 1.50x C instructions, now 0.78x). 14 of 16 benchmarks are
+     at or below the C backend; `appends` (+0.9 %) and `bintrees` (+0.5 %) are still above, caused by the C
+     runtime being compiled by clang instead of gcc. Table and causes: docs/benchmarks.md, "Backends: ADR-0038 §8 gate 1".
   2. **Fixed point:** the LLVM backend also reproduces itself, `stage2.ll == stage3.ll`, in CI.
   3. **Toolchain:** a pinned LLVM version is used, as described below.
 - **Toolchain: pinned, not bundled into the compiler.**

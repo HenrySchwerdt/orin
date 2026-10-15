@@ -31,3 +31,14 @@ void orinl_io_write_stdout(int64_t g, OrinObj *s) { orin_io_write_stdout(g, s); 
 int64_t orinl_io_shell(int64_t g, OrinObj *cmd) { return orin_io_shell(g, cmd); }
 int64_t orinl_time_now_millis(int64_t g) { return orin_time_now_millis(g); }
 int64_t orinl_str_char_code_at(OrinObj *s, uint64_t i) { return orin_str_char_code_at(s, i); }
+
+/*
+ * Trap entry points whose result type is the result type of the generated function that calls them (ADR-0038 §8 gate 1).
+ * The IR traps with `ret (tail call @orinl_trap_<t>(msg))`: unlike `call @orin_trap` + `unreachable` this is a plain
+ * tail call (a `jmp`), so the trap block needs no stack frame and LLVM can shrink-wrap the prologue of a function with
+ * checked arithmetic. None of them returns.
+ */
+void orinl_trap_v(const char *msg) { orin_trap(msg); }
+void *orinl_trap_p(const char *msg) { orin_trap(msg); }
+double orinl_trap_f(const char *msg) { orin_trap(msg); }
+int64_t orinl_trap_i(const char *msg) { orin_trap(msg); }

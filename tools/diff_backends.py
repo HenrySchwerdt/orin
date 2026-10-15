@@ -17,7 +17,11 @@ pipelines, compiler/fuse, ADR-0038 §2): fused against unfused on every program.
 (ADR-0010) over tests/run and tests/next/run.
 
 Usage: python3 tools/diff_backends.py [--orinc build/bootstrap/orin2] [--cc cc] [--filter s]
-                                      [--sanitize] --mode opt|llvm|builtins|fuse
+                                      [--sanitize] [--shard I/N] [--list] --mode opt|llvm|builtins|fuse
+
+--shard I/N runs every N-th program (after --filter) starting at the I-th, like tools/mutate_std.py: the CI splits the
+slow fuse run over several jobs and the shards together run every program exactly once. --list prints the selected
+program names and exits (used to check that the union of the shards is all programs).
 """
 import argparse
 import os
@@ -42,6 +46,22 @@ def entries(suites=("run",)):
             elif e.endswith(".or"):
                 out.append((prefix + e[:-3], p))
     return out
+
+
+def select_shard(tests, shard):
+    """The programs of shard i/N (1-based): every N-th program starting at the i-th."""
+    i, n = shard
+    return [t for k, t in enumerate(tests) if k % n == i - 1]
+
+
+def parse_shard(text):
+    try:
+        i, n = (int(x) for x in text.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("--shard expects I/N, for example 2/3")
+    if not 1 <= i <= n:
+        raise argparse.ArgumentTypeError("--shard I/N needs 1 <= I <= N")
+    return i, n
 
 
 def sh(cmd, timeout):
@@ -81,12 +101,18 @@ def main():
     ap.add_argument("--filter", default="")
     ap.add_argument("--sanitize", action="store_true")
     ap.add_argument("--mode", choices=["opt", "llvm", "builtins", "fuse"], required=True)
+    ap.add_argument("--shard", type=parse_shard, default=(1, 1), help="run shard I of N (default 1/1: everything)")
+    ap.add_argument("--list", action="store_true", help="print the selected program names and exit")
     args = ap.parse_args()
     if not os.path.isabs(args.orinc):
         args.orinc = os.path.join(ROOT, args.orinc)
     os.makedirs(os.path.join(ROOT, OUT), exist_ok=True)
     suites = ("run", os.path.join("next", "run"))
     tests = [t for t in entries(suites) if args.filter in t[0]]
+    tests = select_shard(tests, args.shard)
+    if args.list:
+        print("\n".join(t[0] for t in tests))
+        return 0
     old_flags = {"opt": ["--no-opt"], "llvm": ["--backend=llvm"], "builtins": ["--c-builtins"],
                  "fuse": ["--no-fuse"]}[args.mode]
     old_is_llvm = args.mode == "llvm"

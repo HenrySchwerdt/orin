@@ -54,6 +54,15 @@ function slotChk(name: string, base: string, k: usize): string {
   return "  " + name + " = call ptr @orinl_slot(ptr " + base + ", i64 " + u(k) + ")\n";
 }
 
+// Indices into the fixed trap messages of `fixedMsgs` (runtime.or).
+function msgShape(): usize {
+  return 9;
+}
+
+function msgCharAt(): usize {
+  return 10;
+}
+
 function lbl(p: string, sfx: string): string {
   return p.substring(1, p.length) + sfx;
 }
@@ -156,7 +165,6 @@ function bname(op: Builtin): string {
     BFileWrite => "orin_file_write",
     BFileWriteLine => "orin_file_write_line",
     BFileFlush => "orin_file_flush",
-    BStrCharCodeAt => "orinl_str_char_code_at",
     BStrCharAt => "orin_str_char_at",
     BStrSubstring => "orin_str_substring",
     BStrIndexOf => "orin_str_index_of",
@@ -178,11 +186,6 @@ function bname(op: Builtin): string {
     BFloatToString => "orin_float_to_string",
     BF32ToString => "orin_f32_to_string",
     BFloatToInt => "orin_float_to_int",
-    BIntToUsize => "orinl_int_to_usize",
-    BUsizeToInt => "orinl_usize_to_int",
-    BIntRange => "orinl_range",
-    BIntConv => "orinl_conv_i",
-    BUIntConv => "orinl_conv_u",
     BIntOp => "orin_int_op",
     BIntChk => "orin_int_chk",
     BParseIntK => "orin_parse_int_k",
@@ -318,6 +321,7 @@ export class LlvmFunctionEmitter {
   private fi: usize;
   private f: MFunction;
   private lines: string[];
+  private wrapper: string;
 
   constructor(syms: LlvmSymbols, prog: MProgram, fi: usize) {
     this.syms = syms;
@@ -325,6 +329,7 @@ export class LlvmFunctionEmitter {
     this.fi = fi;
     this.f = prog.functions[fi];
     this.lines = [];
+    this.wrapper = "";
   }
 
   private opTy(o: Operand): MType {
@@ -546,6 +551,110 @@ export class LlvmFunctionEmitter {
         };
   }
 
+  // The trap of a failed check as the function's own return: a tail call of the `orinl_trap_*` shim whose result type is the
+  // function's result type, then `ret` of it. The shim never returns. Written like this (and not as `call @orin_trap` +
+  // `unreachable`) the trap block needs no stack frame, so the prologue is not hoisted above the check (shrink-wrapping)
+  // and the early-return path of a recursive function stays free of push/pop (ADR-0038 §8 gate 1, bench/fib).
+  private trapRet(p: string, msg: usize): string {
+    const z = p + "_t";
+    const arg = "(ptr @.m" + u(msg) + ")\n";
+    return match (this.f.ret) {
+      MVoid => "  tail call void @orinl_trap_v" + arg + "  ret void\n",
+      MRef => "  " + z + " = tail call ptr @orinl_trap_p" + arg + "  ret ptr " + z + "\n",
+      MFloat => "  " + z + " = tail call double @orinl_trap_f" + arg + "  ret double " + z + "\n",
+      // an unboxed aggregate result (v2.2): the shim returns nothing, the `ret` of a zero aggregate is never reached
+      MAgg(_) => "  tail call void @orinl_trap_v" + arg + "  ret " + lty(this.f.ret) + " zeroinitializer\n",
+      _ => "  " + z + " = tail call i64 @orinl_trap_i" + arg + "  ret i64 " + z + "\n",
+    };
+  }
+
+  // Checked arithmetic written out in the function (same checks and messages as the `@orinl_<op>_<i|u>` prelude helpers).
+  private checkedInline(p: string, intr: string, msg: usize, va: string, vb: string): string {
+    return "  " + p + "v = call { i64, i1 } @llvm." + intr + ".with.overflow.i64(i64 " + va
+        + ", i64 " + vb + ")\n" + "  " + p + "o = extractvalue { i64, i1 } " + p + "v, 1\n"
+        + "  br i1 " + p + "o, label %" + lbl(p, "Tr") + ", label %" + lbl(p, "Ok") + "\n"
+        + lbl(p, "Tr") + ":\n" + this.trapRet(p, msg) + lbl(p, "Ok") + ":\n" + "  " + p
+        + "r = extractvalue { i64, i1 } " + p + "v, 0\n";
+  }
+
+  // `if (cond) trap(msg)` then continue: `cond` is the text that defines the i1 `cv`; the failing side is `trapRet`.
+  // `tag` makes the labels and the trap value unique within the instruction.
+  private guardInline(tag: string, cond: string, cv: string, msg: usize): string {
+    return cond + "  br i1 " + cv + ", label %" + lbl(tag, "Tr") + ", label %" + lbl(tag, "Ok")
+        + "\n" + lbl(tag, "Tr") + ":\n" + this.trapRet(tag, msg) + lbl(tag, "Ok") + ":\n";
+  }
+
+  // Division and remainder: zero divisor, and for the signed forms MIN / -1 (messages as in the `@orinl_div_*` helpers).
+  private divInline(p: string, op: BinOp, usz: bool, va: string, vb: string): string {
+    const isDiv = match (op) {
+      OpDiv => true,
+      _ => false,
+    };
+    const ins = usz ? isDiv ? "udiv" : "urem" : isDiv ? "sdiv" : "srem";
+    let s = this.guardInline(
+      p + "a",
+      "  " + p + "az = icmp eq i64 " + vb + ", 0\n",
+      p + "az",
+      isDiv ? 1 : 2,
+    );
+    if (!usz) {
+      s += this.guardInline(
+        p + "b",
+        "  " + p + "bm = icmp eq i64 " + va + ", -9223372036854775808\n  " + p + "bn = icmp eq i64 "
+            + vb + ", -1\n  " + p + "bx = and i1 " + p + "bm, " + p + "bn\n",
+        p + "bx",
+        0,
+      );
+    }
+    return s + "  " + p + "r = " + ins + " i64 " + va + ", " + vb + "\n";
+  }
+
+  // The address of slot `k` of an object that must be a struct with more than `k` slots (same check as `@orinl_slot`).
+  private slotInline(name: string, base: string, k: usize): string {
+    return this.guardInline(
+      name,
+      "  " + name + "kp = getelementptr inbounds i8, ptr " + base + ", i64 8\n  " + name
+          + "kind = load i32, ptr " + name + "kp\n  " + name
+          + "np = getelementptr inbounds i8, ptr " + base + ", i64 16\n  " + name
+          + "n = load i32, ptr " + name + "np\n  " + name + "n64 = zext i32 " + name
+          + "n to i64\n  " + name + "sk = icmp ne i32 " + name + "kind, 3\n  " + name
+          + "oob = icmp ule i64 " + name + "n64, " + u(k) + "\n  " + name + "bad = or i1 " + name
+          + "sk, " + name + "oob\n",
+      name + "bad",
+      msgShape(),
+    )
+        + "  " + name + " = getelementptr inbounds i8, ptr " + base + ", i64 " + u(32 + 8 * k)
+        + "\n";
+  }
+
+  // The kind check of the array helpers (`@orinl_array_slot`, `@orinl_array_push`).
+  private arrayKindInline(name: string, a: string): string {
+    return this.guardInline(
+      name + "s",
+      "  " + name + "kp = getelementptr inbounds i8, ptr " + a + ", i64 8\n  " + name
+          + "kind = load i32, ptr " + name + "kp\n  " + name + "nk = icmp ne i32 " + name
+          + "kind, 2\n",
+      name + "nk",
+      msgShape(),
+    );
+  }
+
+  // The address of element `i` of array `a`: kind check, bounds check (same checks as `@orinl_array_slot`).
+  private arraySlotInline(name: string, a: string, i: string): string {
+    return this.arrayKindInline(name, a)
+        + this.guardInline(
+          name + "o",
+          "  " + name + "lp = getelementptr inbounds i8, ptr " + a + ", i64 16\n  " + name
+              + "len = load i64, ptr " + name + "lp\n  " + name + "oob = icmp uge i64 " + i + ", "
+              + name + "len\n",
+          name + "oob",
+          7,
+        )
+        + "  " + name + "ip = getelementptr inbounds i8, ptr " + a + ", i64 40\n  " + name
+        + "items = load ptr, ptr " + name + "ip\n  " + name + " = getelementptr inbounds i64, ptr "
+        + name + "items, i64 " + i + "\n";
+  }
+
   private binaryI(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
     const t = this.opTy(a);
     if (isFloatT(t)) {
@@ -567,11 +676,20 @@ export class LlvmFunctionEmitter {
     const usz = isUsizeT(t);
     return pre
         + match (op) {
-          OpAdd => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
-          OpSub => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
-          OpMul => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
-          OpDiv => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
-          OpRem => callBin(r, arithHelper(op, usz), va, vb) + this.st(d, r),
+          OpAdd => this.checkedInline(p, usz ? "uadd" : "sadd", usz ? 3 : 0, va, vb)
+              + this.st(d, r),
+          OpSub => this.checkedInline(p, usz ? "usub" : "ssub", usz ? 4 : 0, va, vb)
+              + this.st(d, r),
+          // x * 2 is checked as x + x: InstCombine would turn `smul.with.overflow(x, 2)` into a range test plus an add.
+          OpMul => vb == "2"
+              ? this.checkedInline(p, usz ? "uadd" : "sadd", usz ? 3 : 0, va, va) + this.st(d, r)
+              : va == "2"
+                  ? this.checkedInline(p, usz ? "uadd" : "sadd", usz ? 3 : 0, vb, vb)
+                      + this.st(d, r)
+                  : this.checkedInline(p, usz ? "umul" : "smul", usz ? 3 : 0, va, vb)
+                      + this.st(d, r),
+          OpDiv => this.divInline(p, op, usz, va, vb) + this.st(d, r),
+          OpRem => this.divInline(p, op, usz, va, vb) + this.st(d, r),
           OpAnd => "  " + r + " = and i64 " + va + ", " + vb + "\n" + this.st(d, r),
           OpOr => "  " + r + " = or i64 " + va + ", " + vb + "\n" + this.st(d, r),
           _ => "  " + p + "c = icmp " + cmpPred(op, usz) + " i64 " + va + ", " + vb + "\n  " + r
@@ -589,10 +707,44 @@ export class LlvmFunctionEmitter {
         + match (op) {
           UnNot => "  " + p + "c = icmp eq i64 " + v + ", 0\n  " + p + "r = zext i1 " + p
               + "c to i64\n" + this.st(d, p + "r"),
-          UnNeg => "  " + p + "r = call i64 @orinl_"
-              + (isUsizeT(this.f.locals[d].ty) ? "neg_u" : "neg_i") + "(i64 " + v + ")\n"
-              + this.st(d, p + "r"),
+          UnNeg => isUsizeT(this.f.locals[d].ty)
+              ? this.guardInline(p, "  " + p + "c = icmp ne i64 " + v + ", 0\n", p + "c", 4)
+                  + this.st(d, "0")
+              : this.guardInline(
+                p,
+                "  " + p + "c = icmp eq i64 " + v + ", -9223372036854775808\n",
+                p + "c",
+                0,
+              )
+                  + "  " + p + "r = sub i64 0, " + v + "\n" + this.st(d, p + "r"),
         };
+  }
+
+  private guardR(p: string, cond: string, msg: usize, val: string): R {
+    return R { text: this.guardInline(p, cond, p + "c", msg), val: val };
+  }
+
+  private rangeCond(p: string, a: string, lo: string, hi: string): string {
+    return "  " + p + "l = icmp slt i64 " + a + ", " + lo + "\n  " + p + "h = icmp sgt i64 " + a
+        + ", " + hi + "\n  " + p + "c = or i1 " + p + "l, " + p + "h\n";
+  }
+
+  // `s.charCodeAt(i)`: bounds check against the length, then the byte (same as `orin_str_char_code_at`).
+  private charCodeAtR(p: string, s: string, i: string): R {
+    return R {
+      text: this.guardInline(
+        p,
+        "  " + p + "lp = getelementptr inbounds i8, ptr " + s + ", i64 16\n  " + p
+            + "len = load i64, ptr " + p + "lp\n  " + p + "c = icmp uge i64 " + i + ", " + p
+            + "len\n",
+        p + "c",
+        msgCharAt(),
+      )
+          + "  " + p + "dp = getelementptr inbounds i8, ptr " + s + ", i64 32\n  " + p
+          + "bp = getelementptr inbounds i8, ptr " + p + "dp, i64 " + i + "\n  " + p
+          + "b = load i8, ptr " + p + "bp\n  " + p + "r = zext i8 " + p + "b to i64\n",
+      val: p + "r",
+    };
   }
 
   private builtinR(p: string, b: Builtin, args: Operand[], rt: MType): R {
@@ -610,6 +762,27 @@ export class LlvmFunctionEmitter {
       };
     }
     return match (b) {
+      BStrCharCodeAt => this.charCodeAtR(p, a0, ov(p, 1, args[1])),
+      BIntToUsize => this.guardR(p, "  " + p + "c = icmp slt i64 " + a0 + ", 0\n", 5, a0),
+      BUsizeToInt => this.guardR(p, "  " + p + "c = icmp slt i64 " + a0 + ", 0\n", 6, a0),
+      BIntRange => this.guardR(
+        p,
+        this.rangeCond(p, a0, ov(p, 1, args[1]), ov(p, 2, args[2])),
+        0,
+        a0,
+      ),
+      BIntConv => this.guardR(
+        p,
+        this.rangeCond(p, a0, ov(p, 1, args[1]), ov(p, 2, args[2])),
+        8,
+        a0,
+      ),
+      BUIntConv => this.guardR(
+        p,
+        "  " + p + "c = icmp ugt i64 " + a0 + ", " + ov(p, 1, args[1]) + "\n",
+        8,
+        a0,
+      ),
       BStrLength => lenR(p, a0),
       BArrLength => lenR(p, a0),
       BOptIsSome => tagIs(p, a0, 0),
@@ -786,8 +959,8 @@ export class LlvmFunctionEmitter {
       k += 1;
     }
     const cv = ov(p, 0, f);
-    s += slotChk(p + "c0", cv, 0) + "  " + p + "fp = load ptr, ptr " + p + "c0\n";
-    s += slotChk(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+    s += this.slotInline(p + "c0", cv, 0) + "  " + p + "fp = load ptr, ptr " + p + "c0\n";
+    s += this.slotInline(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
     const rt = match (d) {
       Some(x) => lty(this.f.locals[x].ty),
       None => "void",
@@ -834,8 +1007,8 @@ export class LlvmFunctionEmitter {
       k += 1;
     }
     const cv = ov(p, 0, r);
-    s += slotChk(p + "c0", cv, 0) + "  " + p + "vt = load ptr, ptr " + p + "c0\n";
-    s += slotChk(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
+    s += this.slotInline(p + "c0", cv, 0) + "  " + p + "vt = load ptr, ptr " + p + "c0\n";
+    s += this.slotInline(p + "c1", cv, 1) + "  " + p + "ev = load ptr, ptr " + p + "c1\n";
     s += "  " + p + "fg = getelementptr inbounds ptr, ptr " + p + "vt, i64 " + u(slot) + "\n";
     s += "  " + p + "fp = load ptr, ptr " + p + "fg\n";
     const rt = match (d) {
@@ -893,6 +1066,9 @@ export class LlvmFunctionEmitter {
       IStrAppend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
           + p + "r = call ptr @orin_str_append(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
           + this.st(x, p + "r"),
+      IStrPrepend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y) + "  "
+          + p + "r = call ptr @orin_str_prepend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
+          + this.st(x, p + "r"),
       IArrayExtend(x, y) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, y)
           + "  " + p + "r = call ptr @orin_array_extend(ptr " + p + "x, ptr " + ov(p, 1, y) + ")\n"
           + this.st(x, p + "r"),
@@ -909,40 +1085,37 @@ export class LlvmFunctionEmitter {
       },
       IGetField(d, o, k) => match (this.aggLocal(o)) {
         Some(l) => this.aggGetI(p, d, l, k),
-        None => this.ld(p, 0, o) + slotChk(p + "g", ov(p, 0, o), k) + "  " + p + "r = load "
+        None => this.ld(p, 0, o) + this.slotInline(p + "g", ov(p, 0, o), k) + "  " + p + "r = load "
             + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n" + this.st(d, p + "r"),
       },
-
       ISetField(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, v)
-          + slotChk(p + "g", p + "x", k) + this.replaceI(p, p + "g", 1, v),
+          + this.slotInline(p + "g", p + "x", k) + this.replaceI(p, p + "g", 1, v),
       ITakeField(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n"
-          + slotChk(p + "g", p + "x", k) + "  " + p + "r = load ptr, ptr " + p
+          + this.slotInline(p + "g", p + "x", k) + "  " + p + "r = load ptr, ptr " + p
           + "g\n  store ptr null, ptr " + p + "g\n" + this.st(d, p + "r"),
       IPutField(x, k, s) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
-          + "s = load ptr, ptr %l" + u(s) + "\n" + slotChk(p + "g", p + "x", k) + "  store ptr " + p
-          + "s, ptr " + p + "g\n",
+          + "s = load ptr, ptr %l" + u(s) + "\n" + this.slotInline(p + "g", p + "x", k)
+          + "  store ptr " + p + "s, ptr " + p + "g\n",
       IMakeUnique(x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
           + "r = call ptr @orinl_make_unique(ptr " + p + "x)\n" + this.st(x, p + "r"),
       IArrayNew(d, r, es) => this.arrayNewI(p, d, r, es),
-      IArrayGet(d, a, k) => this.ld(p, 0, a) + this.ld(p, 1, k) + "  " + p
-          + "g = call ptr @orinl_array_slot(ptr " + ov(p, 0, a) + ", i64 " + ov(p, 1, k) + ")\n"
-          + "  " + p + "r = load " + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n"
-          + this.st(d, p + "r"),
+      IArrayGet(d, a, k) => this.ld(p, 0, a) + this.ld(p, 1, k)
+          + this.arraySlotInline(p + "g", ov(p, 0, a), ov(p, 1, k)) + "  " + p + "r = load "
+          + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n" + this.st(d, p + "r"),
       IArraySet(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
-          + this.ld(p, 2, v) + "  " + p + "g = call ptr @orinl_array_slot(ptr " + p + "x, i64 "
-          + ov(p, 1, k) + ")\n" + this.replaceI(p, p + "g", 2, v),
+          + this.ld(p, 2, v) + this.arraySlotInline(p + "g", p + "x", ov(p, 1, k))
+          + this.replaceI(p, p + "g", 2, v),
       IArrayTake(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
-          + "  " + p + "g = call ptr @orinl_array_slot(ptr " + p + "x, i64 " + ov(p, 1, k) + ")\n"
-          + "  " + p + "r = load ptr, ptr " + p + "g\n  store ptr null, ptr " + p + "g\n"
-          + this.st(d, p + "r"),
+          + this.arraySlotInline(p + "g", p + "x", ov(p, 1, k)) + "  " + p + "r = load ptr, ptr "
+          + p + "g\n  store ptr null, ptr " + p + "g\n" + this.st(d, p + "r"),
       IArrayPut(x, k, s) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
-          + "  " + p + "s = load ptr, ptr %l" + u(s) + "\n" + "  " + p
-          + "g = call ptr @orinl_array_slot(ptr " + p + "x, i64 " + ov(p, 1, k) + ")\n  store ptr "
-          + p + "s, ptr " + p + "g\n",
+          + "  " + p + "s = load ptr, ptr %l" + u(s) + "\n"
+          + this.arraySlotInline(p + "g", p + "x", ov(p, 1, k)) + "  store ptr " + p + "s, ptr " + p
+          + "g\n",
       IArrayPush(x, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, v)
           + this.asSlot(p, 1, v) + "  " + p + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n"
-          + "  call void @orinl_array_push(ptr " + p + "u, i64 " + this.slotVal(p, 1, v) + ")\n"
-          + this.st(x, p + "u"),
+          + this.arrayKindInline(p + "k", p + "u") + "  call void @orinl_array_push_nc(ptr " + p
+          + "u, i64 " + this.slotVal(p, 1, v) + ")\n" + this.st(x, p + "u"),
       IArrayPop(d, x) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n  " + p
           + "u = call ptr @orinl_make_unique(ptr " + p + "x)\n" + this.st(x, p + "u")
           + (isAggT(this.f.locals[d].ty)
@@ -976,7 +1149,7 @@ export class LlvmFunctionEmitter {
           None => outStore + "  ret void\n",
         };
       },
-      TTrap(m) => "  call void @orin_trap(ptr @.m" + u(this.syms.message(m)) + ")\n  unreachable\n",
+      TTrap(m) => this.trapRet(p, this.syms.message(m)),
     };
   }
 
@@ -990,6 +1163,77 @@ export class LlvmFunctionEmitter {
 
   // ---------------------------------------------------------------- functions
 
+  // Is `ins` cheap, side-effect free (it may trap, which is deterministic) scalar code that may run twice?
+  private cheapScalar(ins: Instr): bool {
+    return match (ins) {
+      ICopy(d, o) => !isRefT(this.opTy(o)) && !isRefT(this.f.locals[d].ty),
+      IBinary(d, _, a, b) => !isRefT(this.opTy(a))
+          && !isRefT(this.opTy(b))
+          && !isRefT(this.f.locals[d].ty),
+      IUnary(d, _, o) => !isRefT(this.opTy(o)) && !isRefT(this.f.locals[d].ty),
+      _ => false,
+    };
+  }
+
+  private selfCalls(): bool {
+    return this.f.blocks.some(
+      blk => blk.instrs.some(
+        ins => match (ins) {
+          ICall(_, g, _) => g == this.fi,
+          _ => false,
+        },
+      ),
+    );
+  }
+
+  // Block `b` only copies scalars and returns.
+  private returnOnly(b: usize): bool {
+    const blk = this.f.blocks[b];
+    return blk.instrs.length <= 1
+        && blk.instrs.every(ins => this.cheapScalar(ins))
+        && match (blk.term) {
+          TReturn(_) => true,
+          _ => false,
+        };
+  }
+
+  // ADR-0038 §8 gate 1 (what gcc's `-fipa-split` does for the C backend): a small self-recursive function whose entry block
+  // is cheap scalar code ending in a branch to a block that only returns (`if (n < 2) return n;`). The function is split into
+  // an `alwaysinline` wrapper holding the entry block, the return block and a tail call of the original body, which keeps
+  // the whole code under the name `<f>.body`. Every recursive call in the body then tests the guard in place and only
+  // calls when the work is not trivial: for `fib` two of three calls disappear. Scalar parameters and result only (no
+  // ownership operations are duplicated); a guard block is `Some(b)`, the block `b` returns, the other branch target is
+  // the slow path.
+  private guardBlock(): Option<usize> {
+    const f = this.f;
+    if (f.inout
+        || f.blocks.length < 3
+        || f.blocks.length > 8
+        || f.locals.length > 12
+        || isRefT(f.ret)
+        || isInlineFn(this.prog, f.name)
+        || !this.selfCalls()) {
+      return None;
+    }
+    let i: usize = 0;
+    while (i < f.paramCount) {
+      if (isRefT(f.locals[i].ty)) {
+        return None;
+      }
+      i += 1;
+    }
+    const b0 = f.blocks[0];
+    if (b0.instrs.length > 6 || !b0.instrs.every(ins => this.cheapScalar(ins))) {
+      return None;
+    }
+    return match (b0.term) {
+      TBranch(_, t, e) => t != 0 && e != 0 && t != e && this.returnOnly(t)
+          ? Some(t)
+          : t != 0 && e != 0 && t != e && this.returnOnly(e) ? Some(e) : None,
+      _ => None,
+    };
+  }
+
   // Emits the whole function: the signature, the `entry` block with one `alloca` per local (non-parameters
   // zero-initialised, parameters stored), the blocks `B<i>`.
   // One line for the signature, two per local (alloca, initialising store), the branch to B0, a label and a terminator
@@ -999,9 +1243,11 @@ export class LlvmFunctionEmitter {
   run(): void {
     const name = this.syms.name(this.fi);
     const f = this.f;
+    const guard = this.guardBlock();
     let out: string[] = [];
     // ADR-0038 step 1: every value is initialised (`noundef`) and a reference is never null (`nonnull`); no function unwinds.
-    let sig = "define internal " + attrTy(f.ret) + " @" + name + "(";
+    let sig = "define internal " + attrTy(f.ret) + " @" + name + (guard.isSome() ? ".body" : "")
+        + "(";
     let i: usize = 0;
     while (i < f.paramCount) {
       if (i > 0) {
@@ -1033,9 +1279,12 @@ export class LlvmFunctionEmitter {
       out.push("  store " + t + " %p" + u(i) + ", ptr %l" + u(i) + "\n");
       i += 1;
     }
+    const entryEnd = out.length;
     out.push("  br label %B0\n");
+    let starts: usize[] = [];
     let b: usize = 0;
     for (const blk of f.blocks) {
+      starts.push(out.length);
       out.push("B" + u(b) + ":\n");
       let k: usize = 0;
       for (const ins of blk.instrs) {
@@ -1046,12 +1295,53 @@ export class LlvmFunctionEmitter {
       b += 1;
     }
     out.push("}\n\n");
+    if (guard.isSome()) {
+      this.wrapper = this.wrapperText(name, out, entryEnd, starts, guard.unwrap());
+    }
     this.lines = out;
+  }
+
+  // The wrapper of a split function (`guardBlock`): the signature and entry block of the body, the blocks B0 and `g` (the
+  // guard block), and the slow path as a tail call of `<f>.body`.
+  private wrapperText(
+    name: string,
+    out: string[],
+    entryEnd: usize,
+    starts: usize[],
+    g: usize,
+  ): string {
+    const f = this.f;
+    const slow = match (f.blocks[0].term) {
+      TBranch(_, t, e) => t == g ? e : t,
+      _ => g,
+    };
+    let sig = "define internal " + attrTy(f.ret) + " @" + name + "(";
+    let call = "@" + name + ".body(";
+    let i: usize = 0;
+    while (i < f.paramCount) {
+      if (i > 0) {
+        sig += ", ";
+        call += ", ";
+      }
+      sig += paramTy(f.locals[i].ty) + " %p" + u(i);
+      call += lty(f.locals[i].ty) + " %p" + u(i);
+      i += 1;
+    }
+    let t = sig + ") alwaysinline nounwind {\nentry:\n";
+    t += out.slice(1, entryEnd).join("") + "  br label %B0\n";
+    t += out.slice(starts[0], starts[1]).join("");
+    t += out.slice(starts[g], g + 1 < starts.length ? starts[g + 1] : out.length - 1).join("");
+    t += "B" + u(slow) + ":\n";
+    t += match (f.ret) {
+      MVoid => "  tail call void " + call + ")\n  ret void\n",
+      _ => "  %wr = tail call " + lty(f.ret) + " " + call + ")\n  ret " + lty(f.ret) + " %wr\n",
+    };
+    return t + "}\n\n";
   }
 
   // The text emitted so far.
   text(): string {
-    return this.lines.join("");
+    return this.wrapper + this.lines.join("");
   }
 }
 
