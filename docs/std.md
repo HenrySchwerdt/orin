@@ -876,3 +876,9 @@ above; a pool lives for one call (worker threads are started per operation, abou
 
 Strict byte-based Hex, Base64 and Base64URL codecs with explicit padding policy
 and structured errors containing byte offsets. See [API, errors and complexity](std-encoding.md).
+
+## std:jsonnumber
+
+Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion,
+with full i64 preservation and structured errors. Separate from legacy std:json;
+see [API, bounds and validation](std-jsonnumber.md).
