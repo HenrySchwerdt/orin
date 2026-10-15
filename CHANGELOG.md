@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **OX roots are built in a pre-sized buffer (ADR-0044).** A markup root with a dynamic piece starts from `str.withCapacity(static bytes + 16 per dynamic piece)` (new builtin, runtime `orin_str_with_capacity`), so the pieces are appended in place without regrowth. `bench/html`: `string_grows` 4.23 M -> 0.25 M, executed instructions 3.99 G -> 3.10 G.
 - **Verifier and optimiser without per-block allocations (ADR-0038 lever 1).** The ownership verifier's fixpoint joins
   out-states into the successors in place and replays every block with one reusable `Transfer`; the optimiser's analyses use
   a reusable use buffer and one allocation-free successor walk (`succCount` / `succAt`). Self-compile: -23% allocations,

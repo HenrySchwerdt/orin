@@ -256,9 +256,22 @@ Migration: a program with markup adds `import ox from "std:html";` next to its o
   for testing a provider's static encoding against its runtime one.
 - Breaking for ADR-0043 programs: they need `import ox from "std:html";`.
 
+## Pre-sized buffer
+
+A `Markup` root with at least one dynamic piece starts its concatenation from `str.withCapacity(hint)` (builtin
+`BStrWithCapacity`, runtime `orin_str_with_capacity`, no surface method): `withCapacity(hint) + p0 + p1 + ..`. The empty
+string is a fresh owned temporary, so the lowering appends every piece in place (`IStrAppend`), with no copy of the
+first piece; the MIR of a root is one `builtin str.withCapacity(n)` followed by `strappend`s. The hint is the total byte
+length of the static pieces plus 16 bytes per dynamic piece (`OX_DYN_ESTIMATE` in `check/ox.or`; 32 was measured and
+gains nothing but memory). The runtime clamps it to 1 MiB (`ORIN_STR_HINT_MAX`). The hint never changes the value: a
+dynamic piece larger than the estimate just grows the buffer as before. A root without a dynamic piece stays one literal.
+Measured on `bench/html`: `string_grows` 4.23 M -> 0.25 M, executed instructions 3.99 G -> 3.10 G (C backend), see
+docs/benchmarks.md.
+
 ## Not done
 
 - Namespaces; member tags on a type name (static methods) or on a module; per-block provider selection.
 - Generic slot parameters whose type is inferred from the children (a generic component's slot type must be fixed by
   its other arguments or written explicitly).
-- The ADR-0043 performance follow-ups (pre-sized buffers, append without temporaries, component fusion, streaming).
+- The ADR-0043 performance follow-ups that remain (append without temporaries, component fusion, streaming). Pre-sized
+  buffers are done (below).

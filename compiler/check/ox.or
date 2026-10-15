@@ -13,7 +13,7 @@
 // flattened into their parent's buffer: no tree, no virtual DOM, one buffer per root.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Type, HExpr, HExprKind, BinOp } from "../hir";
+import { Type, HExpr, HExprKind, BinOp, Builtin } from "../hir";
 import { Expr, ExprKind, FieldInit, StmtKind, Ident } from "../syntax";
 import { Env, globalVal, ValEnt } from "./env";
 import { mk } from "./ops";
@@ -441,7 +441,13 @@ export function oxOutDyn(o: OxOut, e: HExpr, span: Span): OxOut {
   return OxOut { parts: ps, pending: "" };
 }
 
-// The string of the whole buffer: the left-nested concatenation of the pieces (one literal if all were static).
+// Capacity hint of a root (ADR-0044): the buffer starts with room for the static bytes plus this many bytes per
+// dynamic piece, so that the common root is built without a regrowth. Measured on the html benchmark (docs/benchmarks.md).
+const OX_DYN_ESTIMATE: usize = 16;
+
+// The string of the whole buffer: the left-nested concatenation of the pieces (one literal if all were static). A root
+// with a dynamic piece starts from `withCapacity(hint)`, an empty owned string sized for the whole output, so every piece
+// is appended in place into it.
 export function oxOutFinish(o: OxOut, span: Span): HExpr {
   let ps = o.parts;
   if (o.pending.length > 0 || ps.length == 0) {
@@ -449,6 +455,21 @@ export function oxOutFinish(o: OxOut, span: Span): HExpr {
   }
   let acc = ps[0];
   let i: usize = 1;
+  if (ps.length > 1) {
+    let hint: usize = 0;
+    for (const p of ps) {
+      match (p.kind) {
+        XStr(t) => {
+          hint += t.length;
+        },
+        _ => {
+          hint += OX_DYN_ESTIMATE;
+        },
+      }
+    }
+    acc = mk(XBuiltin(BStrWithCapacity, [mk(XInt(hint.toInt()), TyUsize, span)]), TyString, span);
+    i = 0;
+  }
   while (i < ps.length) {
     acc = mk(XBinary(OpAdd, acc, ps[i]), TyString, span);
     i += 1;

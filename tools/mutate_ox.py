@@ -42,6 +42,8 @@ MUTANTS = [
     ("overridden-value-not-evaluated", "check/expr.or", "            if (d.parts.length > 0) {", "            if (false) {"),
     ("option-attribute-inverted", "check/expr.or", "mk(XCond(test, text, mk(XStr(\"\"), TyString, span)), TyString, span)",
      "mk(XCond(test, mk(XStr(\"\"), TyString, span), text), TyString, span)"),
+    # the capacity hint (ADR-0044) only sizes the buffer; this mutant starts the concatenation after the first piece
+    ("capacity-start-drops-first-piece", "check/ox.or", "    i = 0;\n  }", "    i = 1;\n  }"),
     # ---- the checker (check/expr.or, check/stmt.or)
     ("dynamic-child-not-encoded", "check/expr.or",
      "      return Ok(oxOutDyn(o, mk(XCall(p.text, [v]), TyString, span), span));",
