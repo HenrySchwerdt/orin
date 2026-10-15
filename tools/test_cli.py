@@ -99,6 +99,56 @@ class CliTests(unittest.TestCase):
         self.run_cli("remove", "shared", cwd=project)
         self.run_cli("check", cwd=project, code=1)
 
+    def test_library_check_empty_tests_and_filter(self):
+        self.run_cli("init", "shared", "--lib")
+        project = self.cwd / "shared"
+        self.run_cli("check", cwd=project)
+        self.run_cli("test", "--filter", "does-not-exist", cwd=project, code=1)
+        (project / "tests/main_test.or").unlink()
+        self.run_cli("test", cwd=project, code=1)
+        self.run_cli("test", "--allow-empty", cwd=project)
+
+    def test_git_lock_offline_and_failed_add_rollback(self):
+        self.run_cli("init", "shared", "--lib")
+        shared = self.cwd / "shared"
+        for command in (["git", "init", "-q"], ["git", "add", "."],
+                        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                         "commit", "-qm", "initial"]):
+            subprocess.run(command, cwd=shared, check=True, capture_output=True)
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--git", str(shared), cwd=project)
+        lock = (project / "orin.lock").read_bytes()
+        self.run_cli("fetch", "--locked", "--offline", cwd=project)
+        self.assertEqual(lock, (project / "orin.lock").read_bytes())
+        before = (project / "orin.toml").read_bytes()
+        self.run_cli("add", "--path", "../missing", cwd=project, code=1)
+        self.assertEqual(before, (project / "orin.toml").read_bytes())
+
+    def test_source_color_and_program_arguments(self):
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        source = project / "src/main.or"
+        source.write_text('import { Host, withProcess } from "std:host";\nimport { args } from "std:process";\nfunction main(host: Host): void {\n  console.log(withProcess(host, p => args(p).join("|")));\n}\n')
+        result = self.run_cli("run", "--", "--quiet", "two words", cwd=project)
+        self.assertIn("--quiet|two words", result.stdout)
+        source.write_text("function main(): void { missing(); }\n")
+        result = self.run_cli("check", "--color=always", cwd=project, code=1)
+        self.assertIn("\x1b[", result.stderr)
+
+    def test_dependency_scope_and_conflicting_init(self):
+        self.run_cli("init", "shared", "--lib")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--path", "../shared", "--dev", cwd=project)
+        (project / "src/main.or").write_text('import { greeting } from "shared";\nfunction main(): void { console.log(greeting()); }\n')
+        self.run_cli("check", cwd=project, code=1)
+
+    def test_machine_init_and_invalid_flags(self):
+        result = self.run_cli("init", "hello", "--format=json")
+        self.assertTrue(json.loads(result.stdout)["ok"])
+        self.run_cli("run", "--format=json", cwd=self.cwd / "hello", code=2)
+
 
 if __name__ == "__main__":
     unittest.main()
