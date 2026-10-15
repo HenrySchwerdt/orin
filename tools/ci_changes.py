@@ -21,7 +21,7 @@ import json
 import subprocess
 import sys
 
-MODULES = ["bytes", "utf8", "collections", "http", "net", "text", "taskcore"]
+MODULES = ["bytes", "utf8", "collections", "http", "net", "text", "html", "taskcore"]
 # modules whose mutants are split over several CI jobs (tools/mutate_std.py --shard I/N): the http mutants run the slow
 # property tests, about 15 minutes on one runner
 SHARDS = {"http": 3}

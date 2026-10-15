@@ -1,0 +1,219 @@
+// std:html -- escaping and rendering for HTML output; the run-time side of JSX (ADR-0043).
+//
+// `Html` is rendered, trusted HTML. Only JSX, `trustHtml` and this module construct it (the compiler rejects
+// the record literal `Html { .. }` and assignment to `.html` outside this module). Everything else is `string`
+// and is escaped on its way into an `Html`, so a string can never become markup by accident.
+// Orin strings are byte strings (see std:utf8): the five escaped characters are ASCII, every other byte
+// (UTF-8 multi-byte sequences included) is copied unchanged.
+// Only HTML text and quoted attribute values are covered. CSS, JavaScript, unquoted attribute values and
+// attribute or tag names are other contexts and are NOT handled by `escape`.
+// No platform calls, no additional trusted code, no runtime reflection.
+// Every function is total (never traps) and O(n) in the size of its input and output.
+
+// Rendered, trusted HTML.
+export type Html = { html: string; };
+
+// What `safeUrl` returns instead of a URL with a scheme that is not allowed.
+const UNSAFE_URL: string = "about:invalid#orin-unsafe-url";
+
+// True for the five characters `escape` replaces: & < > " ' (the character code `c` of a byte).
+function isSpecial(c: int): bool {
+  return c == 38 || c == 60 || c == 62 || c == 34 || c == 39;
+}
+
+// The entity for the character code `c`: "" for every character that is not escaped.
+function entityOf(c: int): string {
+  if (c == 38) {
+    return "&amp;";
+  }
+  if (c == 60) {
+    return "&lt;";
+  }
+  if (c == 62) {
+    return "&gt;";
+  }
+  if (c == 34) {
+    return "&quot;";
+  }
+  if (c == 39) {
+    return "&#39;";
+  }
+  return "";
+}
+
+// True when `s` contains one of & < > " ' (so `escape(s)` differs from `s`).
+export function needsEscape(s: string): bool {
+  let i: usize = 0;
+  while (i < s.length) {
+    if (isSpecial(s.charCodeAt(i))) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+// HTML escaping for text and for (double- or single-quoted) attribute values: & < > " ' become
+// &amp; &lt; &gt; &quot; &#39;; every other byte is copied unchanged. A string without those characters is
+// returned as is (the hot path: one scan, no allocation); otherwise the result is built from the runs between
+// the special characters, not byte by byte.
+@Ensures(result.indexOf("<").isNone() && result.indexOf(">").isNone())
+@Ensures(result.indexOf("\"").isNone() && result.indexOf("'").isNone())
+@Ensures(result.length >= s.length)
+@Ensures(!needsEscape(s) ==> result == s)
+@Ensures(needsEscape(s) ==> result.length > s.length)
+export function escape(s: string): string {
+  const n = s.length;
+  let i: usize = 0;
+  while (i < n && !isSpecial(s.charCodeAt(i))) {
+    i += 1;
+  }
+  if (i == n) {
+    return s;
+  }
+  let out = "";
+  let start: usize = 0;
+  while (i < n) {
+    const e = entityOf(s.charCodeAt(i));
+    if (e.length > 0) {
+      out += s.substring(start, i);
+      out += e;
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += s.substring(start, n);
+  return out;
+}
+
+// The index of the ':' that ends a URL scheme: the first of ':' '/' '?' '#' in `u` when it is a ':', else -1
+// (a relative URL: no scheme).
+function schemeEnd(u: string): int {
+  let i: usize = 0;
+  while (i < u.length) {
+    const c = u.charCodeAt(i);
+    if (c == 58) {
+      return i.toInt();
+    }
+    if (c == 47 || c == 63 || c == 35) {
+      return -1;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// True when the first `end` bytes of `u`, ASCII-lowercased, are exactly `lit` (`lit` is lowercase ASCII).
+function schemeIs(u: string, end: usize, lit: string): bool {
+  if (end != lit.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < end) {
+    let c = u.charCodeAt(i);
+    if (c >= 65 && c <= 90) {
+      c += 32;
+    }
+    if (c != lit.charCodeAt(i)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The URL rule: true when `u` is relative (no ':' before the first '/', '?' or '#') or its scheme, compared
+// ASCII-case-insensitively, is exactly http, https, mailto or tel. A scheme with a leading space, a control
+// character or an embedded TAB is not one of those, so " javascript:" and "java\tscript:" are rejected.
+export function hasSafeScheme(u: string): bool {
+  const e = schemeEnd(u);
+  if (e < 0) {
+    return true;
+  }
+  const end = e.toUsize();
+  return schemeIs(u, end, "http") || schemeIs(u, end, "https") || schemeIs(u, end, "mailto") || schemeIs(u, end, "tel");
+}
+
+// True when `u` may be put into a URL attribute: it passes the scheme rule or it is the constant `safeUrl`
+// substitutes for a rejected URL.
+export function isSafeUrl(u: string): bool {
+  return hasSafeScheme(u) || u == UNSAFE_URL;
+}
+
+// URL attribute sanitising (href, src, action, ...), the rule of Go's html/template: a URL whose scheme is not
+// http, https, mailto or tel (javascript:, vbscript:, data:, ...) becomes "about:invalid#orin-unsafe-url"; a
+// relative URL, and an allowed one, is returned unchanged (the same string, no allocation). The result is not
+// HTML-escaped: use `escapeUrl` for the attribute value.
+@Ensures(result == s || result == "about:invalid#orin-unsafe-url")
+@Ensures(isSafeUrl(result))
+@Ensures(hasSafeScheme(s) ==> result == s)
+@Ensures(!hasSafeScheme(s) ==> result == "about:invalid#orin-unsafe-url")
+export function safeUrl(s: string): string {
+  if (hasSafeScheme(s)) {
+    return s;
+  }
+  return UNSAFE_URL;
+}
+
+// escape(safeUrl(s)): a URL as the value of a quoted attribute.
+@Ensures(result == escape(safeUrl(s)))
+@Ensures(result.indexOf("<").isNone() && result.indexOf(">").isNone())
+@Ensures(result.indexOf("\"").isNone() && result.indexOf("'").isNone())
+export function escapeUrl(s: string): string {
+  return escape(safeUrl(s));
+}
+
+// The concatenation of the rendered strings of `xs` (the children `{items.map(i => <li>..</li>)}` of JSX).
+@Ensures(xs.length == 0 ==> result == "")
+@Ensures(xs.length == 1 ==> result == xs[0].html)
+@Ensures(xs.length >= 1 ==> result.startsWith(xs[0].html) && result.endsWith(xs[xs.length - 1].html))
+export function joinAll(xs: Html[]): string {
+  let out = "";
+  for (const x of xs) {
+    out += x.html;
+  }
+  return out;
+}
+
+// The explicit, auditable escape hatch: `raw` is HTML and is NOT escaped. Every use is a place to review.
+@Ensures(result.html == raw)
+export function trustHtml(raw: string): Html {
+  return Html { html: raw };
+}
+
+// `s` as text: escaped.
+@Ensures(result.html == escape(s))
+export function text(s: string): Html {
+  return Html { html: escape(s) };
+}
+
+// No markup.
+@Ensures(result.html == "")
+export function empty(): Html {
+  return Html { html: "" };
+}
+
+// Several elements, one after the other.
+@Ensures(result.html == joinAll(xs))
+export function fragment(xs: Html[]): Html {
+  return Html { html: joinAll(xs) };
+}
+
+// The markup as a string.
+@Ensures(result == h.html)
+export function render(h: Html): string {
+  return h.html;
+}
+
+// A whole page: the doctype, then `h`.
+@Ensures(result.startsWith("<!DOCTYPE html>") && result.endsWith(h.html))
+@Ensures(result.length == 15 + h.html.length)
+export function document(h: Html): string {
+  return "<!DOCTYPE html>" + h.html;
+}
+
+// True when `h` renders to nothing.
+@Ensures(result == (h.html.length == 0))
+export function isEmpty(h: Html): bool {
+  return h.html.length == 0;
+}
