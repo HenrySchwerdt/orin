@@ -490,42 +490,56 @@ RESULT_BUILTINS = {"fs.readFile", "fs.writeFile", "net.recv", "net.send", "net.r
 # why; "?" means the census could not decide it.
 RULES = [
     # ---- self-compile: the ownership verifier (compiler/verify)
-    (r"^verify/state\.mk$", r"struct", "a", "record LState {k, src} (2 scalars)",
-     "elements of the verifier's `ls: LState[]`: stored inline (2 scalar fields) the array becomes a scalar array, so the "
-     "4.1M objects, the retains of every COW copy of `ls` and the dups around `joinLs` disappear"),
-    (r"^verify/rules\.setLs$", r"makeunique l7", "-", "COW copy of LState[]",
-     "first write to the block's in-state, which `runBlock(.., ins[b].unwrap())` shares with the fixpoint table: the copy is "
-     "the algorithm (the in-state is still needed for later joins). Its 164M element retains go with (a) on LState, which "
-     "also turns the 1.3 GB of copying into a plain memcpy"),
-    (r"^verify/rules\.setLs$", r"makeunique l6", "-", "COW copy of record State {ls, holes}", "as above (the State around ls)"),
-    (r"^verify/rules\.setLs$", r"makeunique l4", "?", "COW copy of record Cx (7 fields)",
-     "the context is threaded through `c = step(c, ..)` and should be unique; a second owner exists on some path the census "
-     "cannot name (call-site dup in opt/calls.insertCallDups or rules.def are candidates)"),
-    (r"^verify/rules\.killBorrows$", r"makeunique", "-", "COW copy of LState[]", "as setLs: first write to the shared in-state"),
-    (r"^verify/verify\.runBlock$", r"arraynew ref \[\]", "c", "array<ref> (empty)",
-     "`errs: []` / `warns: []` of the per-block context Cx; `fixpoint` keeps only `runBlock(..).st` and drops them empty: "
-     "scalar replacement once runBlock is inlined there (verifyFunction does read them)"),
-    (r"^verify/verify\.runBlock$", r"struct tag0", "c", "record Cx (7 fields)",
-     "per-block context threaded through `c = step(c, ..)`; fixpoint keeps only `.st` (scalar replacement after inlining)"),
-    (r"^verify/verify\.fixpoint$", r"arraypop", "a", None, "`work.pop()` Option, unwrapped at once"),
-    (r"^verify/verify\.fixpoint$", r"struct tag0 \{l\d+\}", "a", None, "`Some(nw)` stored into `ins[s]`: an Option<State> field inline"),
-    (r"^verify/verify\.(successors|fixpoint)$|^opt/analysis\.successors$", r"arraynew val", "c", "array<usize> (1-2 elements)",
-     "successor list `[b]` / `[a, b]` iterated once by the caller; bounded (<= 2) and does not escape the caller's loop"),
-    (r"^verify/state\.joinState$", r"arraynew ref", "e", "array<ref>",
-     "joined `ls` array (built only when the join changes something); it replaces `ins[s]`, whose old state dies right "
-     "there: join into the old array in place when it is unique"),
-    (r"^verify/state\.joinState$", r"struct tag0 \{l\d+, l\d+\}", "e", "record State {ls, holes}", "as above"),
-    (r"^verify/state\.joinChanged$", r"struct tag0 \{l\d+\}", "a", None, "Some(joinState(..)) returned and matched by the caller"),
-    (r"^verify/rules\.slotKey$", r"struct", "a", "record HoleEntryKey {sym, idx} (2 scalars)", "map key built per lookup; 2 scalars"),
-    (r"^verify/rules\.step$", r"struct tag0 \{l\d+\}", "a", "variant OLocal(s) (1 scalar)",
-     "a temporary Operand built to call a helper; unboxed (1 scalar payload) or matched directly"),
+    (r"^verify/rules\.Transfer\.set$", r"makeunique l6$", "g", "COW copy of the ls array (int[], ~290 entries)",
+     "ONE per block run (427k, 977 MB): `Fixpoint.outOf(b, ins[b].unwrap())` builds `new Transfer(.., st, ..)`, whose constructor "
+     "does `this.ls = st.ls`, so the array has two owners (the table entry `ins[b]`, which must survive for later joins, and "
+     "the Transfer) and the first `this.ls[l] = ..` copies it. Remove: a per-Fixpoint scratch ls buffer that outOf fills "
+     "(element copy, no malloc / free / COW; take-put it into the Transfer) and from which a fresh array is cut only when "
+     "the out-state is stored (first visit of a successor); or pack ls as i32[] (b) to halve the bytes"),
+    (r"^verify/rules\.Transfer\.set$", r"makeunique l4$", "d", "COW copy of the Transfer record (8 fields)",
+     "`this.callOwned(dst, args, this.prog.functions[fi].paramOwned)` in Transfer.instr: the argument is borrowed from "
+     "`this.prog`, so opt/calls.insertCallDups dups the whole receiver (`dup l2` / call / `release l2`) and the first write "
+     "inside the callee copies the record and retains its 6 reference fields; the ls array then has a third owner and "
+     "is copied once more. Dup the argument (a retain of the paramOwned array) instead of the receiver, or hoist it "
+     "into a `const po` before the call"),
+    (r"^verify/rules\.Transfer\.killBorrows$", r"makeunique", "g", "COW copy of the ls array", "as Transfer.set: first write to the shared in-state"),
+    (r"^verify/rules\.Transfer\.constructor$", r"struct", "c", "class object Transfer (8 fields)",
+     "one per block run (outOf / runBlock), dead when `.state()` / errs are read: keep one Transfer in the Fixpoint and "
+     "reset it per block (e), or scalar-replace it after inlining outOf; a class with reference fields is not unboxed"),
+    (r"^verify/state\.State\.constructor$", r"struct", "c", "class object State {ls, holes} (2 refs)",
+     "54% are `Transfer.state()` results that outOf returns and joinIfChanged only reads (scalar replacement / pass ls and "
+     "holes); 46% are `join` results stored into `ins[s]` (class e). Not unboxed: a class with two reference fields"),
+    (r"^verify/state\.State\.join$", r"arraynew val", "e", "array<int> (joined ls)",
+     "built by pushing `joinLs` per local; it replaces `ins[s]`, whose old state dies at the store: join into prev.ls in "
+     "place (the table owns it uniquely once `Some(prev)` is not kept alive by the match)"),
+    (r"^verify/state\.State\.joinIfChanged$", r"struct", "e", "Option<State> (ref payload)",
+     "`Some(this.join(o))` returned to Fixpoint.run and matched at once: a `joinInto(o): bool` that joins in place returns "
+     "no Option at all. Unboxing rejects it today: the payload is a reference"),
+    (r"^verify/verify\.Fixpoint\.run$", r"struct tag0 \{l\d+\}", "g", "Option<State> stored in the table",
+     "`ins[s] = Some(out)` / `Some(nw)`: the Option is stored in the array `ins` (unboxing rejects heap slots); keep a "
+     "State[] and a `reached: bool[]` so the table holds no Option"),
+    (r"^verify/verify\.Fixpoint\.outOf$|^verify/verify\.runBlock$", r"arraynew ref \[\]", "c", "array<ref> (empty)",
+     "`errs: []` / `warns: []` of a Transfer whose issues are discarded (`this.none` shared in outOf)"),
+    (r"^verify/verify\.fixpoint$|^verify/verify\.Fixpoint\.take$", r"arraypop", "a", None, "`work.pop()` Option, unwrapped at once"),
+    (r"^verify/rules\.Transfer\.(instr|put|term)$", r"struct tag0 \{l\d+\}", "g", "variant OLocal(s) (1 scalar)",
+     "a temporary Operand built only to call `readOp` / `consume` on a local; not unboxed because the Operand web also "
+     "contains operands stored in Instr nodes (heap slots): call `readLocal(s)` / `consumeLocal(s)` directly"),
+    (r"^verify/rules\.Transfer\.call$", r"arraynew val \[\]", "c", "array<usize> (empty)",
+     "per-call scratch list of argument roots, consumed in the same function"),
     (r"^verify/verify\.entryState$", r"arraynew ref", "-", "array<ref>", "the entry state of a function: real data"),
     # ---- self-compile: optimiser analyses (compiler/opt)
+    (r"^opt/analysis\.successors$", r"arraynew val", "c", "array<usize> (0-2 elements)",
+     "successor list `[b]` / `[a, b]` / `[]` iterated once by the caller; bounded (<= 2) and does not escape the caller's loop"),
+    (r"^mir/wellformed\.successors$", r"arraynew val|task\.arrayWithCapacity|arr\.concat", "g", "array<usize> (0-2 elements)",
+     "the same function as opt/analysis.successors (a duplicate): iterated once by Fixpoint.run / verifyFunction; offer "
+     "`succAt(t, k)` / a visitor and share one implementation (a TSwitch builds `cases.map(..).concat([d])`)"),
     (r"^opt/calls\.insertCallDups$", r"arraynew ref|struct tag0 \{l\d+, l\d+, l\d+, l\d+, l\d+, l\d+, l\d+\}", "c",
      "record Cx (7 fields) + its empty errs / warns",
      "a verifier context built per call site only to run `step` once and read `.st`: scalar replacement after inlining"),
     (r"^verify/rules\.holeKey$", r"struct", "a", "record HoleEntryKey {sym, idx} (2 scalars)", "as slotKey"),
-    (r"^cemit/cemit\.commentSafe$", r"strappend", "-", "string (comment text)", "the result (one per call)"),
+    (r"^cemit/text\.commentSafe$", r"strappend", "g", "string (one char)",
+     "`out += name.charAt(i)`: a one-character string per character of every local name (census-mode comments `/* name */`); "
+     "append the character code / copy runs with substring, or skip the comment when no `*/` occurs"),
     (r"^lower/lowerer\.Lowerer\.args$", r"struct tag0 \{l\d+, l\d+, l\d+, l\d+\}", "a", "record Args (4 fields)",
      "returned and destructured by the caller"),
     (r"^(lower/lowerer\.Lowerer\.emit|syntax/parser\.Parser\.expectP|check/fnctx\.FnCtx\.restorePre)$", r"makeunique", "?",
@@ -536,30 +550,129 @@ RULES = [
      "`instrUses` returns a fresh `usize[]` per operand / instruction (`lo(o)` = `[l]` or `[]`) only to be iterated: a visitor "
      "or an out-parameter array removes it; (c) would need inlining first"),
     (r"^opt/analysis\.ancestors$", r"arraynew val \[\]", "g", "array<usize>", "per-call worklists; reuse one buffer per function"),
-    (r"^opt/analysis\.ancestors$", r"arraypush", "?", "COW copy of array<usize>", "copy on push to a shared worklist"),
+    (r"^opt/analysis\.ancestors$", r"arraypush", "e", "COW copy of array<usize> (element of anc: usize[][])",
+     "`anc[d].push(o)`: the inner array is an element of `anc` and so has a second owner while it is pushed to: every push "
+     "copies it (quadratic in the list length). Take the element out of `anc`, push, put it back (opt/inplace.or take / put "
+     "for array elements), or build the lists in a flat array with offsets"),
+    (r"^opt/analysis\.ancestors$", r"arraynew ref \[\]", "g", "array<ref> (anc table)", "per-call table; reuse one buffer per function"),
+    (r"^opt/rewrite\.empties$", r"arraynew ref", "g", "array<Instr[]> (empty)",
+     "`RewritePlan(n)` makes n empty replacement lists for a block of n instructions although only the touched ones get "
+     "one: keep the replacements sparse (a list of (index, instrs)) or share one immortal empty array"),
+    (r"^opt/rewrite\.falses$", r"arraynew val", "g", "array<bool>", "the `hit` flags of every plan, even when nothing is touched: allocate at the first touch"),
+    (r"^opt/rewrite\.RewritePlan\.constructor$", r"struct", "c", "class object RewritePlan (3 fields)",
+     "built, filled and applied by one pass per block; with sparse replacements it is a local of the pass"),
+    (r"^opt/rewrite\.BlockSink\.constructor$", r"struct", "c", "class object BlockSink (2 refs)", "a per-block builder that finish() turns into an MBlock"),
+    (r"^opt/rewrite\.BlockSink\.constructor$", r"arraynew ref", "-", "array<Instr> / array<Span>", "become the instrs / spans of the new block: data"),
+    (r"^opt/rewrite\.BlockSink\.finish$", r"struct", "-", "record MBlock {instrs, spans, term, termSpan}", "the rewritten block: data"),
+    (r"^opt/unbox\.Unboxing\.scanInstr$", r"arraynew val", "g", "array<usize> (0-2 locals)",
+     "`okUses` / `[s]`: the locals an instruction may use without poisoning them, per instruction; test each use inline "
+     "against the instruction's allowed operands, no list"),
+    (r"^opt/params\.liveAfter$", r"arraynew val", "g", "array<bool> (per-instruction liveness)",
+     "one `bool[]` per (block, parameter), grown by push and read once; fill a reused buffer"),
+    (r"^opt/params\.|^opt/chains\.|^opt/pairs\.|^opt/inplace\.|^opt/borrow\.|^opt/calls\.|^opt/prune\.", r"arraynew|task\.arrayWithCapacity|arr\.map", "g",
+     "array (pass scratch list)", "scratch list of a pass (instruction lists, slot lists, ancestors): reuse a buffer or iterate without it"),
     (r"^opt/analysis\.edgeSrc$", r"struct", "a", None, "Option<usize> returned and matched at once"),
     (r"^opt/inplace\.takePutSlots$", r"arraynew ref", "c", "array<ref> (empty)", "per-function scratch list, usually stays empty"),
     # ---- self-compile: front end
     (r"^diag/diag\.(span|spanTo)$", r"struct", "a", "record Span {file, start, end} (3 scalars)",
-     "3 scalars stored in every token / AST node: inline it in the containing record"),
+     "3 scalars stored in every token / AST node. Remains boxed because the unboxing pass rejects a value stored in a slot of a "
+     "boxed object (Token, Ident, Expr, Stmt, ...): it needs flattening of scalar-only records into their container (a layout "
+     "change); cf. (a) for values that stay in registers"),
     (r"^syntax/lexer\.Lexer\.emit$", r"struct", "-", "record Token {kind, text, span, ...}",
      "the token stream is real data (lives until parsing ends); a region per compiler phase ((f)) would batch-free it"),
-    (r"^syntax/lexer\.skipTrivia$", r"struct", "a", None, "`Ok(i)`: Result<usize, Diag> matched by the caller"),
+    (r"^syntax/lexer\.skipTrivia$", r"struct", "a", None, "`Ok(i)`: Result<usize, Diag> matched by the caller. Remains boxed because the Err variant carries a Diag reference "
+     "(slots must be scalar in every variant); returning the position and leaving the error in `this.err` (g) removes it"),
     (r"^syntax/lexer\.Lexer\.punct$", r"str\.substring", "g", "string (punctuation token text)",
      "`src.substring(start, start + len)` per punctuation token: the text is one of a fixed set, use the literal"),
     (r"^syntax/lexer\.Lexer\.ident$", r"str\.substring", "-", "string (identifier text)", "the token's text: data"),
     (r"^syntax/parser\.Parser\.parseIdent$", r"struct tag0 \{l\d+, l\d+\}", "-", "record Ident {name, span}", "AST data"),
     (r"^syntax/parser\.Parser\.parseIdent$", r"struct tag0 \{l\d+\}", "a", None, "`Ok(Ident)` matched by the caller"),
     (r"^check/ops\.mk$", r"struct", "-", "record HExpr {kind, ty, span}", "typed AST: real data"),
-    (r"^cemit/cemit\.lname$", r"strappend", "e", "string (\"l\" + n)",
-     "`\"l\" + u(i)`: the number string is fresh, unique and dies right there (capacity >= 9): prepend into it"),
-    (r"^cemit/cemit\.genFunction$", r"strappend", "g", "string (one C line)", "per-line strings joined at the end; one builder"),
+    (r"^cemit/function\.lname$|^cemit/function\.CFunctionEmitter\.run$", r"strprepend l\d+, str#\d+$", "g", "string (\"l\" + n, \"B\" + n, \" \" + ..)",
+     "`\"l\" + u(i)`: prepend allocates a new string (the number string from usizeToString is the second allocation per name); "
+     "memoise `lname(i)` / `\"B\" + b` in a table (the same names are rebuilt for every operand), and append the pieces of a "
+     "line to one builder instead of concatenating each"),
+    (r"^cemit/function\.CFunctionEmitter\.run$", r"strappend|strprepend", "g", "string (one C line)", "per-line strings joined at the end; one builder"),
+    (r"^cemit/(text|function|symbols|cemit)\.", r"strappend|strprepend|str\.substring", "g", "string",
+     "C text assembled by concatenation (`ORIN_REF(${code})`, `name + \"(\"`, escapes): append into one line builder"),
+    (r"^check/env\.originKey$", r"strappend", "g", "string (`${kind}:${id}`)",
+     "a string key built per lookup of an instance: key the table by (kind, id) as an int (kind * 2^32 + id)"),
     (r"^lower/builder\.BlockBuilder\.emit$", r"makeunique|arraypush", "e", "COW copy of BlockBuilder and its cur / curSpans arrays",
      "`Lowerer.emit` calls `this.b.emit(i, this.sp)` as `dup this.b; call; setfield this.b`: the builder has two owners during "
      "the call, so EVERY emitted instruction copies the builder and both arrays (quadratic in the block length). The field's "
      "old value dies at the setfield: the take / put rewrite of opt/inplace.or (fix 1 of docs/benchmarks.md) does not fire "
      "here, apparently because a second field of `this` (`this.sp`) is an argument"),
     (r"^lower/state\.Locals\.fresh$", r"arraypush", "?", "COW copy of array<ref>", "`this.ls.push` copies the locals table: `table()` hands out `this.ls`, so the table has a second owner when a temporary is created later; whether that owner is still alive is not visible in the census"),
+    # ---- self-compile: front end and lowering, by shape (reviewed per module; the remaining small sites follow these)
+    (r"^lower/(values\.v\w+|lowerer\.Lowerer\.(localRef|projected))$", r"struct", "a", "record V {op, k, root, stable} / its Operand",
+     "the value descriptor returned by `expr` and destructured by the caller at once. Remains boxed because it holds a "
+     "reference (the Operand variant), which the unboxing pass does not accept; needs unboxing with reference slots (the "
+     "copies then retain the payload instead of the box)"),
+    (r"^(check/(stmt|expr|types)|lower/(lowerer|ops))\.", r"struct tag0 \{l\d+, l\d+\}|struct tag0 \{l\d+\}", "a",
+     "returned pair (StmtRes / BlockRes / TyOut / Pair / HBlock)",
+     "a result record built to return two values and destructured by the caller at once; reference fields (HStmt / HBlock / Env) "
+     "keep it boxed today: needs unboxing with reference slots (or a multi-value return)", r"^(StmtRes|BlockRes|TyOut|Pair|HBlock)\b"),
+    (r"^(syntax/parser|check/\w+|lower/\w+)\.", r"struct", "a", None,
+     "Option / Result returned and matched at once by the caller. Remains boxed because its payload is a reference (Expr, "
+     "HExpr, Ident, Type) and the Err variant carries a Diag: the unboxing pass takes scalar slots only; needs unboxing "
+     "with reference slots", r"^(Some|Ok)\("),
+    (r"^syntax/lexer\.", r"str\.substring|strappend|arraynew ref", "g", "string / list (string literal pieces)",
+     "`src.substring(run, i)` pieces of a string literal collected in a list and joined: build the value in one buffer"),
+    (r"^check/fnctx\.Scope\.bind$", r"struct", "-", "record Shadowed / Bind", "scope log entry and binding: stored in the scope's map / log"),
+    (r"^check/fnctx\.Scope\.close$", r"arraypop", "a", None, "`this.log.pop()` Option, unwrapped at once"),
+    (r"^(check/(fnctx|expr|env|stmt|types|pattern)|lower/(state|builder|lowerer)|opt/(opt|params)|verify/rules|\$array/map)\.", r"makeunique|arraypush", "e",
+     "COW copy of the receiver / of its arrays",
+     "a mutating method on a class-typed FIELD (`this.vis.set(..)`, `this.log.push(..)`, `this.locals.push(..)`, "
+     "`this.vars.push(..)`): `dup field; call; setfield` leaves two owners during the call, so the first write copies the "
+     "object and its arrays (also Map.set: keys, vals, live). The old value dies at the setfield: the take / put rewrite "
+     "of opt/inplace.or should fire (see BlockBuilder.emit)"),
+    (r"^(syntax/parser|check/\w+|lower/\w+|fuse/fuse|loader/\w+|mir/\w+|opt/\w+)\.", r"struct tag[1-9]\d*", "-", "variant node (AST / HIR / MIR)",
+     "node of the tree or IR the pass produces (EIdent, XLocal, ECall, TGoto, ...): lives until the phase ends; a region per "
+     "phase ((f)) would batch-free it", r"^(?!(Some|Ok|Err)\()"),
+    (r"^(syntax/parser|check/\w+|lower/\w+|fuse/fuse|loader/\w+|mir/\w+|opt/\w+)\.", r"struct tag0", "-", "record (AST / HIR / MIR data)",
+     "record of the tree or IR the pass produces (Stmt, Block, MBlock, MFunction, ...) or of a table: lives until the phase ends "
+     "((f) per phase)", r"^(?!(Some|Ok|Err)\()"),
+    (r"^(syntax/parser|check/\w+|lower/\w+|fuse/fuse|loader/\w+|mir/\w+)\.", r"arraynew ref \[\]|arraynew val \[\]|arraynew ref \[[^\]]+\]", "-",
+     "list (children of a node / a table)",
+     "built by push and then stored in the node it belongs to: real data (the empty header is paid once per list; a shared "
+     "immortal empty array (f) would save it only for lists that stay empty)"),
+    (r"^(check/\w+|lower/\w+|syntax/parser|\$array/array|\$std/strings|mir/\w+)\.", r"task\.arrayWithCapacity|arr\.map|arr\.slice|arr\.concat", "g",
+     "array (map / slice result)", "intermediate array of a `map` / `slice` consumed once: fuse it into its consumer"),
+    (r"^(\$array/array\.map|\$array/map\.(mapNew|buildTab)|verify/verify\.(initialIns|entryQueued|entryState|Fixpoint\.constructor)|opt/(unbox|rewrite)\.\w+)", r"arraynew|task\.arrayWithCapacity", "-",
+     "array (result of a map / table storage / per-function setup)", "the result array of a `map`, the storage of a Map, or per-function tables: data"),
+    (r"^(cemit/function|fuse/fuse|loader/path|check/\w+|lower/\w+|syntax/parser)\.", r"arraynew|task\.arrayWithCapacity|arr\.map|arr\.slice", "g",
+     "array (temporary)", "short-lived argument / part list consumed once (`args.map(opC)`, `a.slice(0, n)`): join / emit directly"),
+    (r"^(\$array/map|\$std/strings|verify/\w+|syntax/\w+|opt/\w+|loader/\w+|fuse/\w+|cemit/\w+)\.", r"struct tag0", "-", "record / class object (table, row, report)", "data or per-function pass state"),
+    (r"^(fuse/fuse|loader/path)\.", r"strappend|strprepend|str\.substring", "g", "string", "name / path built by concatenation: build once at the use"),
+    (r"^(check/\w+|lower/\w+|syntax/parser)\.", r"strappend|strprepend|str\.substring", "g", "string",
+     "message / name built by concatenation: build once at the use, or key by an id"),
+    (r"^(check/\w+|lower/\w+|syntax/parser)\.", r"struct", "-", "class object / record (table, scope, context)", "long-lived pass state"),
+    # ---- sortedmap (B-tree arena) and the parallel stream pool
+    (r"^\$stdlib/collections\.SortedMap\.release", r"arraynew|struct", "g", "IntNode {[], [], []} (a freed arena slot)",
+     "`release` stores a fresh empty node (a record and three empty arrays) into the slot only to mark it free: the free list "
+     "already records that; leave the old arrays in place (dropped at reuse) or truncate them"),
+    (r"^\$stdlib/collections\.SortedMap\.alloc", r"struct", "-", "record IntNode {keys, vals, kids}", "the B-tree node: data"),
+    (r"^\$stdlib/collections\.SortedMap\.splitChild", r"arr\.slice", "e", "array<int> (node half)",
+     "the two halves of a split node are copied out with `slice`; the left half could stay in the old node's arrays "
+     "(truncate in place, the old arrays are unique), only the right half is new", r"slice\(0,"),
+    (r"^\$stdlib/collections\.SortedMap\.splitChild", r"arr\.slice|arraynew", "-", "array<int> (new right half)", "the new node's keys / vals: data"),
+    (r"^\$stdlib/taskcore\.Ranges\.constructor$", r"struct", "c", "class object Ranges (4 fields)",
+     "loaded from the pool's monitor words by `loadRanges`, advanced and stored back inside one critical section: scalar-"
+     "replace it (as Ring / Ledger)"),
+    (r"^\$stdlib/task\.loadRanges$", r"arraynew", "g", "array<usize> (lo / hi of the workers)",
+     "two arrays rebuilt from the monitor words at every chunk grab: read the one worker's words directly"),
+    (r"^\$stdlib/task\.poolWork", r"struct", "g", "record Done<R> {k, r}",
+     "one record per processed chunk pushed into `out` and later ordered by `inOrder`: write the result into slot k of a "
+     "preallocated result array instead"),
+    (r"^main\.run\$par0$", r"struct", "a", "record (1 field) of the fused stage",
+     "a one-field record per element in the fused filter / map / reduce body; scalar payload but it crosses the closure "
+     "boundary (pinned), so unboxing rejects it"),
+    (r"^\$std/strings\.strSplit$", r"arraynew", "-", "array<string> (the parts)", "the result"),
+    (r"^\$stdlib/http\.fieldsText$", r"strappend", "g", "string (header line)", "as the part list above: append to one builder"),
+    (r"^verify/(rules\.Transfer\.removeHole|verify\.(wellFormed|verifyFunction))$", r"arraynew|arr\.filter", "g", "array (filter result / empty issue list)",
+     "`holes.filter(..)` copies the hole list to drop one entry (remove in place); the empty `errors` / `warnings` lists of a "
+     "report that is usually clean could share one immortal empty array (f)"),
+    (r"^http_server\.(route|text)$", r"struct|strappend", "-", "record Answer / body text", "the response being built: data"),
     # ---- std prelude and library
     (r"^\$std/numbers\.usizeToString$", r"strappend", "-", "string (decimal digits)",
      "the result (one allocation per call: the first append copies the immortal \"\" into a buffer of capacity 9, the other "
