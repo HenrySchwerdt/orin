@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **Project CLI and terminal UX.** `orin init` (application, library, HTTP template), project discovery,
+  content-cached native builds, `dev`/test watch, project-wide formatting and independent test discovery.
+  Source diagnostics have themed colors, source excerpts and bounded multiline highlights; compact/JSON,
+  LSP and MCP formats remain available. `add`/`remove`/`deps`/`fetch`/`update` support path and Git libraries,
+  root lockfiles including transitive commits, offline/locked resolution and rollback on failed adds.
+  Release CLI requires Bash 3.2+. Source checkouts can use `./tools/orin`. See `docs/cli.md`.
 - **Verifier and optimiser without per-block allocations (ADR-0038 lever 1).** The ownership verifier's fixpoint joins
   out-states into the successors in place and replays every block with one reusable `Transfer`; the optimiser's analyses use
   a reusable use buffer and one allocation-free successor walk (`succCount` / `succAt`). Self-compile: -23% allocations,

@@ -12,9 +12,9 @@ Orin ships as a tarball per platform. Every release (all are experimental pre-re
 plus `<file>.sha256` for each and one combined `SHA256SUMS`. Windows: [windows.md](windows.md) (WSL2 today,
 native later).
 
-**Requirement:** a C compiler (`cc`, gcc or clang) on PATH, because the default backend emits C and
+**Requirements:** Bash 3.2 or later for the release CLI, and a C compiler (`cc`, gcc or clang) on PATH, because the default backend emits C and
 `orin build/run/test` compile it. The release binaries are built on glibc (Linux) and the macOS runners'
-system libraries; on Alpine/musl see "Troubleshooting".
+system libraries; Git is needed for Git dependencies. On Alpine/musl see "Troubleshooting".
 
 ## One-line install (Linux, macOS)
 

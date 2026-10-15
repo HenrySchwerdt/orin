@@ -1,10 +1,19 @@
 import { assert, assertEqString } from "std:test";
-import { SourceMap, SourceFile, diag, span, renderTerminal, terminalSafe } from "../diag";
+import {
+  SourceMap, SourceFile, diag, span, renderTerminal, terminalSafe, terminalOptions,
+} from "../diag";
 
 @Test
 function sourceExcerpt(): void {
-  const sm = SourceMap { files: [SourceFile { path: "src/main.or", text: "function main(): void {\n  missing();\n}\n" }] };
-  const out = renderTerminal(sm, diag("E0300", span(0, 26, 33), "unknown name `missing`"), false, true);
+  const sm = SourceMap {
+    files: [SourceFile { path: "src/main.or", text: "function main(): void {\n  missing();\n}\n" }],
+  };
+  const out = renderTerminal(
+    sm,
+    diag("E0300", span(0, 26, 33), "unknown name `missing`"),
+    false,
+    true,
+  );
   assert(out.startsWith("error[E0300]: unknown name `missing`"), "headline");
   assert(out.includes("src/main.or:2:3"), "location remains clickable");
   assert(out.includes("missing();"), "source excerpt");
@@ -13,12 +22,21 @@ function sourceExcerpt(): void {
 
 @Test
 function controlCharactersAndEof(): void {
-  assertEqString(terminalSafe("a" + String.fromCharCode(27) + "[31m"), "a\\x1b[31m", "escape injection");
+  assertEqString(
+    terminalSafe("a" + String.fromCharCode(27) + "[31m"),
+    "a\\x1b[31m",
+    "escape injection",
+  );
   const sm = SourceMap { files: [SourceFile { path: "empty.or", text: "" }] };
   const out = renderTerminal(sm, diag("E0200", span(0, 0, 0), "expected expression"), false, true);
   assert(out.includes("empty.or:1:1"), "empty source");
   assert(out.includes("^"), "EOF marker");
-  assert(!renderTerminal(sm, diag("E0200", span(9, 0, 0), "missing source"), false, true).includes("empty.or"), "invalid file falls back");
+  assert(
+    !renderTerminal(sm, diag("E0200", span(9, 0, 0), "missing source"), false, true).includes(
+      "empty.or",
+    ),
+    "invalid file falls back",
+  );
 }
 
 @Test
@@ -30,4 +48,34 @@ function colorAndNotes(): void {
   assert(out.includes(String.fromCharCode(27) + "["), "colored output");
   assert(out.includes("note: use the new API"), "notes preserved");
   assert(!out.includes("\r"), "CRLF normalized for display");
+}
+
+@Test
+function multilineAndLongSource(): void {
+  const text = "first line\nsecond line\nthird line\n";
+  const sm = SourceMap { files: [SourceFile { path: "multi.or", text: text }] };
+  const out = renderTerminal(sm, diag("E0200", span(0, 2, 28), "multiline"), false, true);
+  assert(out.includes("1 | first line"), "first line visible");
+  assert(out.includes("3 | third line"), "last line visible");
+  let long = "";
+  let i: usize = 0;
+  while (i < 1000) {
+    long += "a";
+    i += 1;
+  }
+  const wide = SourceMap { files: [SourceFile { path: "long.or", text: long }] };
+  const clipped = renderTerminal(wide, diag("E0200", span(0, 900, 903), "long"), false, true);
+  assert(clipped.length < 500, "long source is bounded");
+  assert(clipped.includes("^^^"), "highlight retained");
+}
+
+@Test
+function terminalOptionsDoNotLeakIntoCompilerArgs(): void {
+  const opts = terminalOptions(["check", "a.or", "--color=always", "--max-errors", "3", "--ascii"]);
+  assert(opts.color && opts.ascii && opts.maxErrors == 3, "presentation parsed");
+  assertEqString(opts.args.join(" "), "check a.or", "compiler args preserved");
+  assert(
+    terminalOptions(["--max-errors=0"]).args.includes("--invalid-max-errors"),
+    "zero rejected",
+  );
 }

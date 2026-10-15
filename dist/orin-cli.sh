@@ -7,10 +7,30 @@ HERE=${ORIN_PACKAGE_ROOT:?missing package root}
 BIN=$HERE/libexec/orin
 RT=$HERE/lib/orin/runtime
 PF=$HERE/lib/orin/platform
+CC_EXPLICIT=${CC:+yes}
 CC=${CC:-cc}
+transaction_project='' transaction_backup=''
+cleanup_dirs=() cleanup_files=()
+cleanup() {
+  if [ -n "$transaction_backup" ] && [ -f "$transaction_backup/orin.toml" ]; then
+    cp "$transaction_backup/orin.toml" "$transaction_project/orin.toml"
+    if [ -f "$transaction_backup/orin.lock" ]; then cp "$transaction_backup/orin.lock" "$transaction_project/orin.lock"; else rm -f "$transaction_project/orin.lock"; fi
+    rm -rf "$transaction_backup"
+  fi
+  local entry
+  for entry in "${cleanup_files[@]}"; do rm -f -- "$entry"; done
+  for entry in "${cleanup_dirs[@]}"; do rm -rf -- "$entry"; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 color=auto quiet=false verbose=false ascii=false json=false
+leading=()
+while [ $# -gt 0 ]; do
+  case $1 in --color=*|--quiet|--verbose|--ascii|--format=json) leading+=("$1"); shift;; *) break;; esac
+done
 command=${1:---help}
 [ $# -eq 0 ] || shift
+set -- "${leading[@]}" "$@"
 args=()
 # Program arguments after -- belong exclusively to the program.
 while [ $# -gt 0 ]; do
@@ -28,6 +48,8 @@ while [ $# -gt 0 ]; do
 done
 use_color=false
 if [ "$color" = always ] || { [ "$color" = auto ] && [ -t 2 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; }; then use_color=true; fi
+if [ "$color" = auto ] && [ "$command" = test ] && [ ! -t 1 ]; then use_color=false; fi
+[ "${TERM:-}" != dumb ] || ascii=true
 ui=(--diagnostic-style=rich "--color=$($use_color && echo always || echo never)")
 $ascii && ui+=(--ascii)
 $quiet && ui+=(--quiet)
@@ -118,6 +140,7 @@ init_project() {
   [ ! -e "$target/$entry" ] && [ ! -L "$target/$entry" ] || fail "File already exists: $target/$entry"
   for file in src tests; do [ ! -L "$target/$file" ] || fail "Refusing a symlink destination: $target/$file"; [ ! -e "$target/$file" ] || [ -d "$target/$file" ] || fail "Not a directory: $target/$file"; done
   staging=$(mktemp -d)
+  cleanup_dirs+=("$staging")
   mkdir -p "$staging/src" "$staging/tests"
   printf '[package]\nname = "%s"\nversion = "0.1.0"\nentry = "%s"\n' "$name" "$entry" > "$staging/orin.toml"
   if $lib; then
@@ -156,7 +179,7 @@ HTTP
     cp "$HERE/examples/http_server.or" "$staging/$entry"
   fi
   printf '# %s\n\nRun `orin run`, `orin test`, and `orin check`.\n\nBuild an optimized executable with `orin build --release`.\n' "$name" > "$staging/README.md"
-  printf '/build/\n/.orin/\n' > "$staging/.gitignore"
+  printf '/build/\n/.orin/\n/.orin-tests-*\n/.orin-lock-*\n' > "$staging/.gitignore"
   mkdir -p "$target/src" "$target/tests"
   cp "$staging/orin.toml" "$staging/README.md" "$target/"
   cp "$staging/$entry" "$target/$entry"
@@ -171,7 +194,7 @@ HTTP
 compiler() { "$BIN" "$@" "${ui[@]}"; }
 project_target() {
   local path=${1:-}
-  if [ -z "$path" ]; then need_project; target=$project
+  if [ -z "$path" ]; then need_project; target=$project; [ "$project" != "$PWD" ] || target=.
   elif [ -d "$path" ]; then project=$(cd "$path" && pwd); target=$project
   else target=$path; project=$(cd "$(dirname "$path")" && pwd); fi
 }
@@ -187,16 +210,17 @@ fingerprint() {
     source_fingerprint "$root" ""
   } | cksum
 }
+join_path() { case $2 in /*) printf '%s\n' "$2";; *) printf '%s/%s\n' "$1" "$2";; esac; }
 source_fingerprint() {
   local root=$1 trail=$2 file depname deppath depgit deptag deprev depdev dependencies
   case "|$trail|" in *"|$root|"*) printf 'error: dependency cycle at %s\n' "$root" >&2; return 1;; esac
-  while IFS= read -r -d '' file; do printf '%s\n' "$file"; cksum "$file" || return; done < <(find "$root" -type d \( -name .git -o -name build -o -name .orin \) -prune -o -type f \( -name '*.or' -o -name orin.toml -o -name orin.lock \) -print0 | sort -z)
+  while IFS= read -r -d '' file; do printf '%s\n' "$file"; cksum "$file" || return; done < <(find -L "$root" -type d \( -name .git -o -name build -o -name .orin \) -prune -o -type f \( -name '*.or' -o -name orin.toml -o -name orin.lock \) -print0 | sort -z)
   if [ -f "$root/orin.toml" ]; then
     dependencies=$(info dependencies "$root") || return
     while IFS='|' read -r depname deppath depgit deptag deprev depdev; do
       [ -n "$depname" ] || continue
       local dep_root
-      dep_root=$(cd "$root/${deppath:-.orin/packages/$depname}" 2>/dev/null && pwd) || { printf "error: Dependency '%s' is unavailable. Run 'orin fetch'.\n" "$depname" >&2; return 1; }
+      dep_root=$(cd "$(join_path "$root" "${deppath:-.orin/packages/$depname}")" 2>/dev/null && pwd) || { printf "error: Dependency '%s' is unavailable. Run 'orin fetch'.\n" "$depname" >&2; return 1; }
       source_fingerprint "$dep_root" "$trail|$root" || return
     done <<< "$dependencies"
   fi
@@ -205,21 +229,27 @@ native_build() {
   local src=$1 out=$2 tmp key previous='' ccflags=-O1
   [ "$profile" != release ] || ccflags=-O2
   tmp=$(mktemp -d)
+  cleanup_dirs+=("$tmp")
   # Compile output goes to an adjacent temporary executable; failed builds preserve the last success.
   local generated=$tmp/out.c
   [ "$backend" != llvm ] || generated=$tmp/out.ll
-  if ! compiler compile "$src" -o "$generated" "--backend=$backend"; then rm -rf "$tmp"; return 1; fi
+  if ! compiler compile "$src" -o "$generated" "--backend=$backend" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
+    if $json; then result_json false error "$(cat "$tmp/compile.err")"; else cat "$tmp/compile.err" >&2; fi
+    rm -rf "$tmp"; return 1
+  fi
+  cat "$tmp/compile.err" >&2
   local ccbin=${CC%% *}
   if ! command -v "$ccbin" >/dev/null 2>&1; then rm -rf "$tmp"; fail "C compiler '$ccbin' was not found. Run 'orin doctor' for installation help."; fi
   mkdir -p "$(dirname "$out")"
   local emit=$out.tmp.$$
+  cleanup_files+=("$emit")
   local sources=("$RT/orin_runtime.c" "$PF/orin_platform.c")
   [ "$backend" != llvm ] || sources+=("$RT/orin_runtime_llvm.c")
   $verbose && printf 'Compiling with %s %s\n' "$CC" "$ccflags" >&2
   if ! ${CC} "$ccflags" -w -I "$RT" "$generated" "${sources[@]}" -lm -pthread -o "$emit" > "$tmp/cc.log" 2>&1; then
     local logfile=$out.build.log
     cp "$tmp/cc.log" "$logfile"
-    printf 'error: Native build failed\n\n' >&2; head -15 "$logfile" >&2
+    if $json; then result_json false error "Native build failed. See $logfile"; else printf 'error: Native build failed\n\n' >&2; head -15 "$logfile" >&2; fi
     printf '\nFull compiler output: %s\n' "$logfile" >&2
     rm -f "$emit"; rm -rf "$tmp"; return 1
   fi
@@ -239,6 +269,7 @@ build_command() {
       *) [ -z "$src" ] || { if [ "$command" = run ]; then program_args+=("$1"); else fail 'Expected one source path.' 2; fi; }; [ -n "$src" ] || src=$1 ;;
     esac; shift
   done
+  if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then CC=clang; fi
   project_target "$src"
   local name
   if [ -f "$project/orin.toml" ]; then name=$(info name "$project"); else name=$(basename "$target" .or); fi
@@ -252,7 +283,7 @@ build_command() {
     native_build "$target" "$artifact" || return 1
     printf '%s\n' "$key" > "$cache"
     status "Built $name"
-    $quiet || printf '  %s\n' "$artifact" >&2
+    $quiet || printf '  %s\n' "${artifact#"$PWD/"}" >&2
   fi
 }
 project_sources() {
@@ -283,9 +314,11 @@ test_command() {
   done
   $json && flags+=(--format=json)
   project_target "$src"
+  $allow && flags+=(--allow-empty)
   if [ -f "$target" ]; then compiler test --runtime "$RT" --cc "$CC" "$target" "${flags[@]}"; return; fi
   local entry; entry=$(info entry "$project")
   aggregate=$(mktemp "$project/.orin-tests-XXXXXXXX.or")
+  cleanup_files+=("$aggregate")
   # An import-only entry discovers tests in the application and independent test files.
   printf 'import {} from "%s";\n' "$(quote_toml "./${entry%.or}")" > "$aggregate"
   if [ -d "$project/tests" ]; then
@@ -293,66 +326,122 @@ test_command() {
       printf 'import {} from "%s";\n' "$(quote_toml "./${file#"$project/"}")" | sed 's/\.or";/";/' >> "$aggregate"
     done < <(find "$project/tests" -type f -name '*_test.or' -print0 | sort -z)
   fi
-  local st=0
-  compiler test --runtime "$RT" --cc "$CC" "$aggregate" "${flags[@]}" $($allow && printf '%s' '--allow-empty' || true) || st=$?
+  local st=0 aggregate_target=$aggregate
+  [ "$project" != "$PWD" ] || aggregate_target=./${aggregate##*/}
+  compiler test --runtime "$RT" --cc "$CC" "$aggregate_target" "${flags[@]}" || st=$?
   rm -f "$aggregate"
   return "$st"
 }
 # Dependency management uses the compiler's manifest parser and immutable Git commits.
-fetch_dependencies() {
-  local root=$1 offline=${2:-false} locked=${3:-false} updating=${4:-} trail=${5:-}
-  local name path giturl tag rev dev commit cached source lockline records='' existing='' spec
-  case "|$trail|" in *"|$root|"*) fail "Package dependency cycle at $root" ;; esac
-  local nexttrail=$trail\|$root
-  local newlock; newlock=$(mktemp "$root/.orin-lock-XXXXXXXX")
-  printf '# Orin lock v1: name|kind|source|selector|commit\n' > "$newlock"
-  local depfile; depfile=$(mktemp)
-  info dependencies "$root" > "$depfile" || { rm -f "$newlock" "$depfile"; return 1; }
+register_resolution() {
+  local root=$1 identity=$2 seen=$3 package_name previous
+  package_name=$(info name "$root") || return
+  valid_name "$package_name" || fail "Invalid dependency package name: $package_name"
+  previous=$(awk -F '|' -v n="$package_name" '$1 == n { print $2; exit }' "$seen")
+  if [ -n "$previous" ] && [ "$previous" != "$identity" ]; then fail "Conflicting sources for package '$package_name': $previous and $identity"; fi
+  printf '%s|%s\n' "$package_name" "$identity" >> "$seen"
+}
+fetch_dependencies() (
+  local root=$1 offline=${2:-false} locked=${3:-false} updating=${4:-}
+  local resolution_seen resolution_output resolution_input=$root/orin.lock resolution_committed=false
+  local cache_paths=() cache_backups=()
+  transaction_project='' transaction_backup=''
+  resolution_seen=$(mktemp)
+  resolution_output=$(mktemp "$root/.orin-lock-XXXXXXXX")
+  trap resolution_cleanup EXIT
+  printf '# Orin lock v1: name|kind|source|selector|commit\n' > "$resolution_output"
+  resolve_dependencies "$root" "$offline" "$updating" "path:$root" ""
+  if $locked; then
+    [ -f "$resolution_input" ] && cmp -s "$resolution_output" "$resolution_input" || fail 'Lockfile is out of date. Run `orin fetch`.'
+  else
+    mv "$resolution_output" "$resolution_input"
+  fi
+  resolution_committed=true
+)
+resolution_cleanup() {
+  local i backup
+  if ! $resolution_committed; then
+    i=$((${#cache_paths[@]} - 1))
+    while [ "$i" -ge 0 ]; do
+      rm -rf -- "${cache_paths[$i]}"
+      if [ -e "${cache_backups[$i]}/original" ] || [ -L "${cache_backups[$i]}/original" ]; then mv "${cache_backups[$i]}/original" "${cache_paths[$i]}"; fi
+      i=$((i - 1))
+    done
+  fi
+  for backup in "${cache_backups[@]}"; do rm -rf -- "$backup"; done
+  rm -f "$resolution_seen" "$resolution_output"
+  cleanup
+}
+resolve_dependencies() {
+  local root=$1 offline=$2 updating=$3 trail=$4 scope=$5
+  local name path giturl tag rev dev commit cached source spec dependencies key update_child
+  dependencies=$(info dependencies "$root") || return
   while IFS='|' read -r name path giturl tag rev dev; do
     [ -n "$name" ] || continue
+    key=${scope:+$scope/}$name
+    update_child=''; if [ "$updating" = '*' ] || [ "$updating" = "$name" ]; then update_child='*'; fi
     if [ -n "$path" ]; then
-      source=$(cd "$root/$path" 2>/dev/null && pwd) || { rm -f "$newlock" "$depfile"; fail "Dependency '$name' does not exist: $path"; }
+      source=$(cd "$(join_path "$root" "$path")" 2>/dev/null && pwd -P) || fail "Dependency '$name' does not exist: $path"
       [ -f "$source/src/module.or" ] || fail "Dependency '$name' has no src/module.or."
-      printf '%s|path|%s||local\n' "$name" "$path" >> "$newlock"
-      fetch_dependencies "$source" "$offline" "$locked" "$updating" "$nexttrail"
+      printf '%s|path|%s||local\n' "$key" "$path" >> "$resolution_output"
+      case "|$trail|" in *"|path:$source|"*) fail "Package dependency cycle at $name";; esac
+      register_resolution "$source" "path:$source" "$resolution_seen"
+      resolve_dependencies "$source" "$offline" "$update_child" "$trail|path:$source" "$key"
     else
       spec=${rev:-${tag:-HEAD}}
       commit=''
-      if [ -f "$root/orin.lock" ] && [ "$updating" != '*' ] && [ "$updating" != "$name" ]; then
-        commit=$(awk -F '|' -v n="$name" -v u="$giturl" -v s="$spec" '$1==n && $2=="git" && $3==u && $4==s {print $5}' "$root/orin.lock")
+      if [ -f "$resolution_input" ] && [ -z "$update_child" ]; then
+        commit=$(awk -F '|' -v n="$key" -v u="$giturl" -v s="$spec" '$1==n && $2=="git" && $3==u && $4==s {print $5}' "$resolution_input")
       fi
-      [ -n "$commit" ] || ! $locked || fail "Lockfile needs an update for '$name'. Run 'orin fetch'."
+      [ -n "$commit" ] || ! $locked || fail "Lockfile needs an update for '$key'. Run 'orin fetch'."
       cached=$root/.orin/packages/$name
       if [ -z "$commit" ]; then
-        $offline && fail "Cannot resolve '$name' offline without a matching lockfile."
-        commit=$(git ls-remote -- "$giturl" "$spec" "refs/tags/$spec" "refs/tags/$spec^{}" "refs/heads/$spec" | tail -1 | cut -f1)
+        $offline && fail "Cannot resolve '$key' offline without a matching lockfile."
+        # Absolute/local Git locations and normal Git transports are supported; Git rejects unsafe remote helpers.
+        commit=$(git ls-remote -- "$giturl" "$spec" "refs/tags/$spec" "refs/tags/$spec^{}" "refs/heads/$spec" | tail -1 | cut -f1) || fail "Cannot resolve '$key'."
         if [ -z "$commit" ] && [[ "$spec" =~ ^[0-9a-fA-F]{40}$ ]]; then commit=$spec; fi
-        [ -n "$commit" ] || fail "Cannot resolve '$name' at '$spec'."
+        [ -n "$commit" ] || fail "Cannot resolve '$key' at '$spec'."
       fi
-      [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || fail "Invalid locked Git commit for '$name'."
+      [[ "$commit" =~ ^[0-9a-fA-F]{40}$ ]] || fail "Invalid locked Git commit for '$key'."
       if [ ! -d "$cached/.git" ] || [ "$(git -C "$cached" rev-parse HEAD 2>/dev/null || true)" != "$commit" ]; then
-        $offline && fail "Dependency '$name' is not cached at its locked commit."
-        local download; mkdir -p "$root/.orin/packages"; download=$(mktemp -d "$root/.orin/packages/.download-XXXXXXXX")
+        $offline && fail "Dependency '$key' is not cached at its locked commit."
+        local download
+        mkdir -p "$root/.orin/packages"
+        download=$(mktemp -d "$root/.orin/packages/.download-XXXXXXXX")
+        cleanup_dirs+=("$download")
         git -C "$download" init -q
-        git -C "$download" -c protocol.file.allow=always fetch -q --depth 1 -- "$giturl" "$commit" || { rm -rf "$download"; fail "Could not fetch '$name'."; }
+        git -C "$download" -c protocol.file.allow=always fetch -q --depth 1 -- "$giturl" "$commit" || { rm -rf "$download"; fail "Could not fetch '$key'."; }
         git -C "$download" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
-        [ -f "$download/src/module.or" ] || { rm -rf "$download"; fail "Dependency '$name' has no src/module.or."; }
-        rm -rf "$cached"; mv "$download" "$cached"
+        [ -f "$download/src/module.or" ] || { rm -rf "$download"; fail "Dependency '$key' has no src/module.or."; }
+        local cache_backup
+        cache_backup=$(mktemp -d "$root/.orin/packages/.backup-XXXXXXXX")
+        cache_paths+=("$cached"); cache_backups+=("$cache_backup")
+        if [ -e "$cached" ] || [ -L "$cached" ]; then mv "$cached" "$cache_backup/original"; fi
+        mv "$download" "$cached"
       fi
-      printf '%s|git|%s|%s|%s\n' "$name" "$giturl" "$spec" "$commit" >> "$newlock"
-      fetch_dependencies "$cached" "$offline" "$locked" '' "$nexttrail"
+      printf '%s|git|%s|%s|%s\n' "$key" "$giturl" "$spec" "$commit" >> "$resolution_output"
+      case "|$trail|" in *"|git:$giturl@$commit|"*) fail "Package dependency cycle at $name";; esac
+      register_resolution "$cached" "git:$giturl@$commit" "$resolution_seen"
+      resolve_dependencies "$cached" "$offline" "$update_child" "$trail|git:$giturl@$commit" "$key"
     fi
-  done < "$depfile"
-  local have_deps=false; [ ! -s "$depfile" ] || have_deps=true
-  rm -f "$depfile"
-  if $locked && ! $have_deps && [ ! -f "$root/orin.lock" ]; then rm -f "$newlock"; return; fi
-  if $locked; then
-    if [ ! -f "$root/orin.lock" ] || ! cmp -s "$newlock" "$root/orin.lock"; then rm -f "$newlock"; fail 'Lockfile is out of date.'; fi
-    rm -f "$newlock"
-  else mv "$newlock" "$root/orin.lock"; fi
+  done <<< "$dependencies"
+}
+print_dependencies() {
+  local root=$1 tree=$2 trail=$3 dn dp dg dt dr dd dependencies suffix subroot
+  case "|$trail|" in *"|$root|"*) fail "Dependency cycle at $root";; esac
+  dependencies=$(info dependencies "$root") || return
+  while IFS='|' read -r dn dp dg dt dr dd; do
+    [ -n "$dn" ] || continue
+    suffix=''; [ "$dd" != true ] || suffix=' (dev)'
+    printf '%s  %s%s\n' "$dn" "${dp:-$dg}" "$suffix" | safe
+    if $tree; then
+      subroot=$(cd "$(join_path "$root" "${dp:-.orin/packages/$dn}")" 2>/dev/null && pwd) || fail "Dependency '$dn' is unavailable. Run 'orin fetch'."
+      print_dependencies "$subroot" true "$trail|$root" | sed 's/^/  /'
+    fi
+  done <<< "$dependencies"
 }
 package_command() {
-  if [ -z "${ORIN_TREE_ROOT:-}" ]; then need_project; else project=$ORIN_TREE_ROOT; fi
+  need_project
   local name='' path='' giturl='' refkey='' ref='' dev=false offline=false locked=false tree=false arg
   while [ $# -gt 0 ]; do
     case $1 in
@@ -364,15 +453,7 @@ package_command() {
     esac; shift
   done
   if [ "$command" = deps ]; then
-    local dn dp dg dt dr dd
-    while IFS='|' read -r dn dp dg dt dr dd; do
-      local suffix=''; [ "$dd" != true ] || suffix=' (dev)'
-      printf '%s  %s%s\n' "$dn" "${dp:-$dg}" "$suffix"
-      if $tree; then
-        local subroot=$project/${dp:-.orin/packages/$dn}
-        (ORIN_TREE_ROOT=$subroot; command=deps; package_command --tree) | sed 's/^/  /'
-      fi
-    done < <(info dependencies "$project")
+    print_dependencies "$project" "$tree" ""
     return
   fi
   if [ "$command" = fetch ] || [ "$command" = update ]; then fetch_dependencies "$project" "$offline" "$locked" "$([ "$command" = update ] && echo "${name:-*}" || true)"; if $json; then result_json true message 'Dependencies ready'; else status 'Dependencies ready'; fi; return; fi
@@ -391,6 +472,7 @@ package_command() {
   else [ -n "$name" ] || fail 'Missing dependency name.' 2; fi
   local backup; backup=$(mktemp -d); cp "$project/orin.toml" "$backup/orin.toml"
   [ ! -f "$project/orin.lock" ] || cp "$project/orin.lock" "$backup/orin.lock"
+  transaction_project=$project; transaction_backup=$backup
   if [ "$command" = add ]; then
     "$BIN" __package edit add "$project" "$name" "$([ -n "$path" ] && echo path || echo git)" "${path:-$giturl}" "$refkey" "$ref" "$dev" || { rm -rf "$backup"; return 1; }
   else "$BIN" __package edit remove "$project" "$name" || { rm -rf "$backup"; return 1; }; fi
@@ -398,8 +480,10 @@ package_command() {
   if ! (fetch_dependencies "$project" "$offline" "$locked"); then
     cp "$backup/orin.toml" "$project/orin.toml"
     if [ -f "$backup/orin.lock" ]; then cp "$backup/orin.lock" "$project/orin.lock"; else rm -f "$project/orin.lock"; fi
+    transaction_backup=''; transaction_project=''
     rm -rf "$backup"; return 1
   fi
+  transaction_backup=''; transaction_project=''
   rm -rf "$backup"; if $json; then result_json true dependency "$name"; else status "Updated orin.toml and orin.lock · $name"; fi
 }
 watch_command() {
@@ -439,7 +523,7 @@ watch_command() {
   done
 }
 if $json; then
-  case $command in init|add|remove|fetch|update|build|clean|test|check|compile|verify|api|effects|graph|diff) ;; *) fail "--format=json is not supported by $command." 2;; esac
+  case $command in init|add|remove|fetch|update|build|clean|test|check|compile|verify|effects|graph|diff) ;; *) fail "--format=json is not supported by $command." 2;; esac
 fi
 case $command in
   --help|-h|help)
@@ -473,8 +557,8 @@ case $command in
           if $expect; then expect=false; continue; fi
           case $arg in --z3|--module|--function|--check|-o) expect=true;; -*) ;; *) haspath=true;; esac
         done
-        if ! $haspath; then need_project; args=("$project" "${args[@]}"); fi
-        $json && args+=(--format=json)
+        if ! $haspath; then need_project; local_target=$project; [ "$project" != "$PWD" ] || local_target=.; args=("$local_target" "${args[@]}"); fi
+        if $json && [ "$command" != graph ]; then args+=(--format=json); fi
         compiler "$command" "${args[@]}" ;;
       compile|diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
       *) fail "Unknown command '$command'. Run 'orin --help' to see available commands." 2 ;;

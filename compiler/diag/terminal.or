@@ -1,19 +1,59 @@
 // Human terminal rendering is deliberately separate from compact diagnostics and JSON/LSP data.
 import { SourceMap, Diagnostic, isWarning } from "./diag";
 
-export type TerminalOptions = { rich: bool; color: bool; ascii: bool; quiet: bool; verbose: bool; args: string[]; };
+export type TerminalOptions = {
+  maxErrors: usize;
+  rich: bool;
+  color: bool;
+  ascii: bool;
+  quiet: bool;
+  verbose: bool;
+  args: string[];
+};
 
 export function terminalOptions(args: string[]): TerminalOptions {
-  let out = TerminalOptions { rich: false, color: false, ascii: false, quiet: false, verbose: false, args: [] };
-  for (const a of args) {
-    if (a == "--diagnostic-style=rich") { out.rich = true; }
-    else if (a == "--diagnostic-style=compact") { out.rich = false; }
-    else if (a == "--color=always") { out.color = true; }
-    else if (a == "--color=never" || a == "--color=auto") { out.color = false; }
-    else if (a == "--ascii") { out.ascii = true; }
-    else if (a == "--quiet") { out.quiet = true; }
-    else if (a == "--verbose") { out.verbose = true; }
-    else { out.args.push(a); }
+  let out = TerminalOptions {
+    maxErrors: 10,
+    rich: false,
+    color: false,
+    ascii: false,
+    quiet: false,
+    verbose: false,
+    args: [],
+  };
+  let i: usize = 0;
+  while (i < args.length) {
+    const a = args[i];
+    i += 1;
+    if (a == "--max-errors" || a.startsWith("--max-errors=")) {
+      let value = a.startsWith("--max-errors=") ? a.substring(13, a.length) : "";
+      if (a == "--max-errors" && i < args.length) {
+        value = args[i];
+        i += 1;
+      }
+      const n = parseInt(value);
+      if (n.isSome() && n.unwrap() > 0 && n.unwrap() <= 10000) {
+        out.maxErrors = n.unwrap().toUsize();
+      } else {
+        out.args.push("--invalid-max-errors");
+      }
+    } else if (a == "--diagnostic-style=rich") {
+      out.rich = true;
+    } else if (a == "--diagnostic-style=compact") {
+      out.rich = false;
+    } else if (a == "--color=always") {
+      out.color = true;
+    } else if (a == "--color=never" || a == "--color=auto") {
+      out.color = false;
+    } else if (a == "--ascii") {
+      out.ascii = true;
+    } else if (a == "--quiet") {
+      out.quiet = true;
+    } else if (a == "--verbose") {
+      out.verbose = true;
+    } else {
+      out.args.push(a);
+    }
   }
   return out;
 }
@@ -32,7 +72,9 @@ export function terminalSafe(s: string): string {
     const c = s.charCodeAt(i);
     if (c < 32 || c == 127) {
       out += "\\x" + hex.charAt((c / 16).toUsize()) + hex.charAt((c % 16).toUsize());
-    } else { out += s.charAt(i); }
+    } else {
+      out += s.charAt(i);
+    }
     i += 1;
   }
   return out;
@@ -41,14 +83,19 @@ export function terminalSafe(s: string): string {
 function repeat(s: string, n: usize): string {
   let out = "";
   let i: usize = 0;
-  while (i < n) { out += s; i += 1; }
+  while (i < n) {
+    out += s;
+    i += 1;
+  }
   return out;
 }
 
 // Decode a UTF-8 scalar only for terminal cell width; machine offsets remain byte-based.
 function scalar(s: string, at: usize): int {
   const c = s.charCodeAt(at);
-  if (c < 128) { return c; }
+  if (c < 128) {
+    return c;
+  }
   let n: usize = c < 224 ? 2 : c < 240 ? 3 : 4;
   let v = c % (n == 2 ? 32 : n == 3 ? 16 : 8);
   let i: usize = 1;
@@ -60,9 +107,17 @@ function scalar(s: string, at: usize): int {
 }
 
 function cells(c: int): usize {
-  if (c >= 768 && c <= 879 || c >= 65024 && c <= 65039 || c == 8205) { return 0; }
-  if (c >= 4352 && c <= 4607 || c >= 11904 && c <= 42191 || c >= 44032 && c <= 55203
-      || c >= 65281 && c <= 65376 || c >= 127744 && c <= 129791 || c >= 131072 && c <= 196605) { return 2; }
+  if (c >= 768 && c <= 879 || c >= 65024 && c <= 65039 || c == 8205) {
+    return 0;
+  }
+  if (c >= 4352 && c <= 4607
+      || c >= 11904 && c <= 42191
+      || c >= 44032 && c <= 55203
+      || c >= 65281 && c <= 65376
+      || c >= 127744 && c <= 129791
+      || c >= 131072 && c <= 196605) {
+    return 2;
+  }
   return 1;
 }
 
@@ -76,27 +131,56 @@ function display(s: string): Display {
     const c = s.charCodeAt(i);
     if (c == 9) {
       const n = 4 - width % 4;
-      out += repeat(" ", n); width += n; i += 1;
+      out += repeat(" ", n);
+      width += n;
+      i += 1;
     } else if (c < 32 || c == 127) {
-      out += terminalSafe(s.charAt(i)); width += 4; i += 1;
+      out += terminalSafe(s.charAt(i));
+      width += 4;
+      i += 1;
     } else {
       const n: usize = c < 128 ? 1 : c < 224 ? 2 : c < 240 ? 3 : 4;
       const end = i + n < s.length ? i + n : s.length;
-      out += s.substring(i, end); width += cells(scalar(s, i)); i = end;
+      out += s.substring(i, end);
+      width += cells(scalar(s, i));
+      i = end;
     }
   }
   return Display { text: out, width: width };
 }
 
-function sourceRow(text: string, line: usize, start: usize, end: usize, digits: usize, gutter: string, tone: string, color: bool): string {
+function sourceRow(
+  text: string,
+  line: usize,
+  start: usize,
+  end: usize,
+  digits: usize,
+  gutter: string,
+  tone: string,
+  color: bool,
+): string {
   const number = line.toString();
   const prefix = "  " + repeat(" ", digits - number.length) + number + " " + gutter + " ";
+  // Bound terminal output for generated/minified source. Crop only at UTF-8 boundaries.
+  let left = start > 48 ? start - 48 : 0;
+  while (left > 0 && text.charCodeAt(left) >= 128 && text.charCodeAt(left) < 192) {
+    left -= 1;
+  }
+  let right = left + 128 < text.length ? left + 128 : text.length;
+  while (right < text.length && text.charCodeAt(right) >= 128 && text.charCodeAt(right) < 192) {
+    right += 1;
+  }
+  const visibleEnd = end < right ? end : right;
   const before = display(text.substring(0, start));
-  const marked = display(text.substring(0, end));
+  const omitted = display(text.substring(0, left));
+  const marked = display(text.substring(0, visibleEnd));
+  const prefixWidth: usize = left > 0 ? 3 : 0;
   const n = marked.width > before.width ? marked.width - before.width : 1;
-  return paint(prefix, "2", color) + display(text).text + "\n"
-    + paint("  " + repeat(" ", digits) + " " + gutter + " ", "2", color)
-    + repeat(" ", before.width) + paint(repeat("^", n), tone, color);
+  return paint(prefix, "2", color) + (left > 0 ? "..." : "")
+      + display(text.substring(left, right)).text + (right < text.length ? "..." : "") + "\n"
+      + paint("  " + repeat(" ", digits) + " " + gutter + " ", "2", color)
+      + repeat(" ", before.width - omitted.width + prefixWidth)
+      + paint(repeat("^", n), tone, color);
 }
 
 export function renderTerminal(sm: SourceMap, d: Diagnostic, color: bool, ascii: bool): string {
@@ -111,18 +195,64 @@ export function renderTerminal(sm: SourceMap, d: Diagnostic, color: bool, ascii:
     let begin: usize = 0;
     let i: usize = 0;
     while (i < start) {
-      if (f.text.charCodeAt(i) == 10) { line += 1; begin = i + 1; }
+      if (f.text.charCodeAt(i) == 10) {
+        line += 1;
+        begin = i + 1;
+      }
       i += 1;
     }
     let stop = start;
-    while (stop < f.text.length && f.text.charCodeAt(stop) != 10) { stop += 1; }
-    if (stop > begin && f.text.charCodeAt(stop - 1) == 13) { stop -= 1; }
+    while (stop < f.text.length && f.text.charCodeAt(stop) != 10) {
+      stop += 1;
+    }
+    if (stop > begin && f.text.charCodeAt(stop - 1) == 13) {
+      stop -= 1;
+    }
     const a = start < stop ? start - begin : stop - begin;
-    const b = end < stop ? (end > begin ? end - begin : a) : stop - begin;
-    out += "\n\n  " + terminalSafe(f.path) + ":" + line.toString() + ":" + (start - begin + 1).toString();
-    out += "\n\n" + sourceRow(f.text.substring(begin, stop), line, a, b, line.toString().length, ascii ? "|" : "│", tone, color);
-    if (end > stop + 1) { out += "\n  " + paint("... span continues on following lines", "2", color); }
+    const b = end < stop ? end > begin ? end - begin : a : stop - begin;
+    out += "\n\n  " + terminalSafe(f.path) + ":" + line.toString() + ":"
+        + (start - begin + 1).toString();
+    let lastLine = line;
+    let lastBegin = begin;
+    i = start;
+    while (i + 1 < end) {
+      if (f.text.charCodeAt(i) == 10) {
+        lastLine += 1;
+        lastBegin = i + 1;
+      }
+      i += 1;
+    }
+    const digits = lastLine.toString().length;
+    const gutter = ascii ? "|" : "│";
+    out += "\n\n"
+        + sourceRow(f.text.substring(begin, stop), line, a, b, digits, gutter, tone, color);
+    if (lastLine > line) {
+      let lastStop = lastBegin;
+      while (lastStop < f.text.length && f.text.charCodeAt(lastStop) != 10) {
+        lastStop += 1;
+      }
+      if (lastStop > lastBegin && f.text.charCodeAt(lastStop - 1) == 13) {
+        lastStop -= 1;
+      }
+      const lastEnd = end < lastStop ? end : lastStop;
+      if (lastLine > line + 1) {
+        out += "\n  " + paint("...", "2", color);
+      }
+      out += "\n"
+          + sourceRow(
+            f.text.substring(lastBegin, lastStop),
+            lastLine,
+            0,
+            lastEnd - lastBegin,
+            digits,
+            gutter,
+            tone,
+            color,
+          );
+    }
   }
-  for (const note of d.notes) { out += "\n\n  note: " + terminalSafe(note); }
+  for (const note of d.notes) {
+    out += "\n\n  note: " + terminalSafe(note);
+  }
   return out;
 }
