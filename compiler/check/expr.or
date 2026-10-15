@@ -15,7 +15,7 @@
 import { Span, Diagnostic, diag } from "../diag";
 import {
   Ident, Block, Expr, ExprKind, FieldInit, MatchArm, TypeExpr, TFn, ArrowParam, ArrowBody, UnaryOp,
-  BinaryOp, DRecord, DUnion, JsxElement, JsxAttr, JsxChild, jsxIsComponent, Param,
+  BinaryOp, DRecord, DUnion, OxElement, OxAttr, OxChild, oxIsComponent, Param,
 } from "../syntax";
 import {
   Type, HBlock, HStmt, Place, PlaceElem, HExpr, HExprKind, FieldInitH, Builtin, MutBuiltin, UnOp,
@@ -52,9 +52,9 @@ import { liftClosure, wrapperOf } from "./lift";
 import { Inference, grantMissingErr, grantMismatchErr } from "./call";
 import { localsBound, placeBound } from "./hirok";
 import {
-  HtmlLib, JsxOut, htmlLib, sealedErr, htmlEscapeStatic, isVoidElement, isRawTextElement, isUrlAttr, isEventAttr,
-  isTagName, isAttrName, jsxOutNew, jsxOutStatic, jsxOutDyn, jsxOutFinish,
-} from "./jsx";
+  HtmlLib, OxOut, htmlLib, sealedErr, htmlEscapeStatic, isVoidElement, isRawTextElement, isUrlAttr, isEventAttr,
+  isTagName, isAttrName, oxOutNew, oxOutStatic, oxOutDyn, oxOutFinish,
+} from "./ox";
 
 export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
 export type StmtOut = { fx: FnCtx; stmt: HStmt; div: bool; };
@@ -226,8 +226,8 @@ export class ExprChecker {
       EArrow(ps, rte, body) => {
         return this.arrowExp(span, ps, rte, body, exp);
       },
-      EJsx(el) => {
-        return this.jsx(el);
+      EOx(el) => {
+        return this.ox(el);
       },
     }
   }
@@ -347,19 +347,19 @@ export class ExprChecker {
   }
 
   // ---------------------------------------------------------------------------
-  // JSX (ADR-0043; the HTML rules and the output buffer are in jsx.or)
+  // OX (ADR-0043; the HTML rules and the output buffer are in ox.or)
   // ---------------------------------------------------------------------------
 
-  // A JSX root: a component call (an `Html`), or an HTML element / fragment rendered into one fused buffer and wrapped
+  // An OX root: a component call (an `Html`), or an HTML element / fragment rendered into one fused buffer and wrapped
   // in `Html`.
   @Ensures(result.isOk() ==> isRecordTy(result.unwrap().ty))
-  private jsx(el: JsxElement): Result<HExpr, Diagnostic> {
+  private ox(el: OxElement): Result<HExpr, Diagnostic> {
     const lib = htmlLib(this.fx.env, el.span)?;
-    if (jsxIsComponent(el)) {
-      return this.jsxComponent(lib, el);
+    if (oxIsComponent(el)) {
+      return this.oxComponent(lib, el);
     }
-    const o = this.jsxEmit(lib, el, jsxOutNew())?;
-    return Ok(this.htmlOf(lib, jsxOutFinish(o, el.span), el.span));
+    const o = this.oxEmit(lib, el, oxOutNew())?;
+    return Ok(this.htmlOf(lib, oxOutFinish(o, el.span), el.span));
   }
 
   private htmlOf(lib: HtmlLib, s: HExpr, span: Span): HExpr {
@@ -373,13 +373,13 @@ export class ExprChecker {
 
   // Appends the rendering of `el` to `o`: a component as the text of its `Html`, an HTML element as its tags with the
   // attributes and children in between (nested elements inline, in the same buffer), a fragment as its children.
-  private jsxEmit(lib: HtmlLib, el: JsxElement, o0: JsxOut): Result<JsxOut, Diagnostic> {
-    if (jsxIsComponent(el)) {
-      const c = this.jsxComponent(lib, el)?;
-      return Ok(jsxOutDyn(o0, this.htmlText(lib, c), el.span));
+  private oxEmit(lib: HtmlLib, el: OxElement, o0: OxOut): Result<OxOut, Diagnostic> {
+    if (oxIsComponent(el)) {
+      const c = this.oxComponent(lib, el)?;
+      return Ok(oxOutDyn(o0, this.htmlText(lib, c), el.span));
     }
     if (el.name.isNone()) {
-      return this.jsxChildren(lib, el.children, false, o0);
+      return this.oxChildren(lib, el.children, false, o0);
     }
     const tag = el.name.unwrap();
     if (!isTagName(tag.name)) {
@@ -391,46 +391,49 @@ export class ExprChecker {
         ),
       );
     }
-    let o = jsxOutStatic(o0, "<" + tag.name);
+    let o = oxOutStatic(o0, "<" + tag.name);
     for (const a of el.attrs) {
-      o = this.jsxAttr(lib, a, o)?;
+      o = this.oxAttr(lib, a, o)?;
     }
-    o = jsxOutStatic(o, ">");
+    o = oxOutStatic(o, ">");
     if (isVoidElement(tag.name)) {
       if (el.children.length > 0) {
         return Err(diag("E0494", tag.span, "`<" + tag.name + ">` is a void element and cannot have children"));
       }
       return Ok(o);
     }
-    o = this.jsxChildren(lib, el.children, isRawTextElement(tag.name), o)?;
-    return Ok(jsxOutStatic(o, "</" + tag.name + ">"));
+    o = this.oxChildren(lib, el.children, isRawTextElement(tag.name), o)?;
+    return Ok(oxOutStatic(o, "</" + tag.name + ">"));
   }
 
   // One attribute of an HTML element: ` name` (a bare name, or a `bool` that is true), ` name="value"` with the value
   // escaped (at compile time for a literal, by std:html `escape` / `escapeUrl` otherwise).
-  private jsxAttr(lib: HtmlLib, a: JsxAttr, o: JsxOut): Result<JsxOut, Diagnostic> {
+  private oxAttr(lib: HtmlLib, a: OxAttr, o: OxOut): Result<OxOut, Diagnostic> {
     const name = a.name.name;
     if (!isAttrName(name)) {
       return Err(diag("E0494", a.name.span, "`" + name + "` is not an attribute name"));
     }
     match (a.value) {
+      JVSpread(x) => {
+        return Err(diag("E0491", x.span, "spread attributes are not supported yet"));
+      },
       JVTrue => {
-        return Ok(jsxOutStatic(o, " " + name));
+        return Ok(oxOutStatic(o, " " + name));
       },
       JVStr(v) => {
-        return Ok(jsxOutStatic(o, " " + name + "=\"" + htmlEscapeStatic(v) + "\""));
+        return Ok(oxOutStatic(o, " " + name + "=\"" + htmlEscapeStatic(v) + "\""));
       },
       JVExpr(x) => {
         match (x.kind) {
           EStr(v) => {
-            return Ok(jsxOutStatic(o, " " + name + "=\"" + htmlEscapeStatic(v) + "\""));
+            return Ok(oxOutStatic(o, " " + name + "=\"" + htmlEscapeStatic(v) + "\""));
           },
           _ => {},
         }
-        const lits = this.jsxLiteralChoice(x, false)?;
+        const lits = this.oxLiteralChoice(x, false)?;
         if (lits.isSome()) {
-          const o2 = jsxOutStatic(o, " " + name + "=\"");
-          return Ok(jsxOutStatic(jsxOutDyn(o2, lits.unwrap(), x.span), "\""));
+          const o2 = oxOutStatic(o, " " + name + "=\"");
+          return Ok(oxOutStatic(oxOutDyn(o2, lits.unwrap(), x.span), "\""));
         }
         if (isEventAttr(name)) {
           return Err(
@@ -446,7 +449,7 @@ export class ExprChecker {
         if (isBool(v.ty)) {
           const on = mk(XStr(" " + name), TyString, x.span);
           const off = mk(XStr(""), TyString, x.span);
-          return Ok(jsxOutDyn(o, mk(XCond(v, on, off), TyString, x.span), x.span));
+          return Ok(oxOutDyn(o, mk(XCond(v, on, off), TyString, x.span), x.span));
         }
         let piece = v;
         if (isString(v.ty)) {
@@ -463,29 +466,32 @@ export class ExprChecker {
             ),
           );
         }
-        const o2 = jsxOutStatic(o, " " + name + "=\"");
-        return Ok(jsxOutStatic(jsxOutDyn(o2, piece, x.span), "\""));
+        const o2 = oxOutStatic(o, " " + name + "=\"");
+        return Ok(oxOutStatic(oxOutDyn(o2, piece, x.span), "\""));
       },
     }
   }
 
   // The children of an element or fragment. `raw`: the element is `<script>` / `<style>`, whose content is written
   // unescaped and therefore must be static.
-  private jsxChildren(lib: HtmlLib, kids: JsxChild[], raw: bool, o0: JsxOut): Result<JsxOut, Diagnostic> {
+  private oxChildren(lib: HtmlLib, kids: OxChild[], raw: bool, o0: OxOut): Result<OxOut, Diagnostic> {
     let o = o0;
     for (const k of kids) {
       match (k) {
         JText(t, _) => {
-          o = jsxOutStatic(o, raw ? t : htmlEscapeStatic(t));
+          o = oxOutStatic(o, raw ? t : htmlEscapeStatic(t));
         },
         JElem(sub) => {
           if (raw) {
             return Err(diag("E0493", sub.span, "`<script>` and `<style>` can only contain static text"));
           }
-          o = this.jsxEmit(lib, sub, o)?;
+          o = this.oxEmit(lib, sub, o)?;
         },
         JExpr(x) => {
-          o = this.jsxChildExpr(lib, x, raw, o)?;
+          o = this.oxChildExpr(lib, x, raw, o)?;
+        },
+        JSlot(n, _, _) => {
+          return Err(diag("E0491", n.span, "named slots are not supported yet"));
         },
       }
     }
@@ -494,19 +500,19 @@ export class ExprChecker {
 
   // A `{x}` child: a `string` is escaped, an `Html` inserted as it is, an `Html[]` joined, a number converted; a string
   // literal is escaped at compile time.
-  private jsxChildExpr(lib: HtmlLib, x: Expr, raw: bool, o: JsxOut): Result<JsxOut, Diagnostic> {
+  private oxChildExpr(lib: HtmlLib, x: Expr, raw: bool, o: OxOut): Result<OxOut, Diagnostic> {
     match (x.kind) {
       EStr(v) => {
         if (raw && v.includes("</")) {
           return Err(diag("E0493", x.span, "the text of `<script>` / `<style>` cannot contain `</`"));
         }
-        return Ok(jsxOutStatic(o, raw ? v : htmlEscapeStatic(v)));
+        return Ok(oxOutStatic(o, raw ? v : htmlEscapeStatic(v)));
       },
       _ => {},
     }
-    const lits = this.jsxLiteralChoice(x, raw)?;
+    const lits = this.oxLiteralChoice(x, raw)?;
     if (lits.isSome()) {
-      return Ok(jsxOutDyn(o, lits.unwrap(), x.span));
+      return Ok(oxOutDyn(o, lits.unwrap(), x.span));
     }
     if (raw) {
       return Err(
@@ -515,22 +521,22 @@ export class ExprChecker {
     }
     const v = this.ex(x, None)?;
     if (isString(v.ty)) {
-      return Ok(jsxOutDyn(o, mk(XCall(lib.esc, [v]), TyString, x.span), x.span));
+      return Ok(oxOutDyn(o, mk(XCall(lib.esc, [v]), TyString, x.span), x.span));
     }
     if (typeEq(v.ty, TyRecord(lib.rec))) {
-      return Ok(jsxOutDyn(o, this.htmlText(lib, v), x.span));
+      return Ok(oxOutDyn(o, this.htmlText(lib, v), x.span));
     }
     if (typeEq(v.ty, TyArray(TyRecord(lib.rec)))) {
-      return Ok(jsxOutDyn(o, mk(XCall(lib.join, [v]), TyString, x.span), x.span));
+      return Ok(oxOutDyn(o, mk(XCall(lib.join, [v]), TyString, x.span), x.span));
     }
     if (isIntish(v.ty) || isFloatTy(v.ty)) {
-      return Ok(jsxOutDyn(o, interpolated(this.fx.env, v, x.span)?, x.span));
+      return Ok(oxOutDyn(o, interpolated(this.fx.env, v, x.span)?, x.span));
     }
     return Err(
       diag(
         "E0492",
         x.span,
-        "a JSX child must be a `string`, `Html`, `Html[]` or a number, found `" + showType(this.fx.env, v.ty)
+        "an OX child must be a `string`, `Html`, `Html[]` or a number, found `" + showType(this.fx.env, v.ty)
             + "` (a `bool` renders nothing in React; write `c ? <x /> : <></>`)",
       ),
     );
@@ -539,7 +545,7 @@ export class ExprChecker {
   // `c ? "a" : "b"` with string literals in both branches (nested choices too): the choice between the two texts
   // escaped at compile time (`raw`: unescaped, for `<script>` / `<style>`), so no escaping happens at run time. None
   // for any other expression.
-  private jsxLiteralChoice(x: Expr, raw: bool): Result<Option<HExpr>, Diagnostic> {
+  private oxLiteralChoice(x: Expr, raw: bool): Result<Option<HExpr>, Diagnostic> {
     match (x.kind) {
       EStr(v) => {
         if (raw && v.includes("</")) {
@@ -548,8 +554,8 @@ export class ExprChecker {
         return Ok(Some(mk(XStr(raw ? v : htmlEscapeStatic(v)), TyString, x.span)));
       },
       ECond(c, a, b) => {
-        const ha = this.jsxLiteralChoice(a, raw)?;
-        const hb = this.jsxLiteralChoice(b, raw)?;
+        const ha = this.oxLiteralChoice(a, raw)?;
+        const hb = this.oxLiteralChoice(b, raw)?;
         if (ha.isNone() || hb.isNone()) {
           return Ok(None);
         }
@@ -566,7 +572,7 @@ export class ExprChecker {
   // parameter name; the children are the argument of a parameter named `children` (an `Html`; empty when none are
   // written). A bare attribute is `true`, a string attribute a string literal. The function must return `Html`.
   @Ensures(result.isOk() ==> typeEq(result.unwrap().ty, TyRecord(lib.rec)))
-  private jsxComponent(lib: HtmlLib, el: JsxElement): Result<HExpr, Diagnostic> {
+  private oxComponent(lib: HtmlLib, el: OxElement): Result<HExpr, Diagnostic> {
     const tag = el.name.unwrap();
     let params: Param[] = [];
     let found = false;
@@ -606,6 +612,7 @@ export class ExprChecker {
             JVStr(v) => Expr { kind: EStr(v), span: a.span },
             JVExpr(x) => x,
             JVTrue => Expr { kind: EBool(true), span: a.span },
+            JVSpread(x) => x,
           });
           used += 1;
         }
@@ -614,9 +621,9 @@ export class ExprChecker {
         if (arg.isSome()) {
           return Err(diag("E0491", tag.span, "pass the children of `" + tag.name + "` between its tags, not as an attribute"));
         }
-        const noAttrs: JsxAttr[] = [];
-        const frag = JsxElement { name: None, attrs: noAttrs, children: el.children, selfClosing: false, span: el.span };
-        arg = Some(Expr { kind: EJsx(frag), span: el.span });
+        const noAttrs: OxAttr[] = [];
+        const frag = OxElement { name: None, attrs: noAttrs, children: el.children, selfClosing: false, span: el.span };
+        arg = Some(Expr { kind: EOx(frag), span: el.span });
         kidsUsed = true;
       }
       if (arg.isNone()) {

@@ -61,7 +61,7 @@ import {
   VariantDecl, ConstDecl,
   TypeExpr, TypeExprKind, Block, Stmt, AssignOp, StmtKind, Expr, UnaryOp, BinaryOp,
   ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ClassDecl, ClassMember, CtorParam, Param,
-  FnTyParam, ArrowParam, ArrowBody, ContractClause, Annotation, JsxElement, JsxAttr, JsxChild
+  FnTyParam, ArrowParam, ArrowBody, ContractClause, Annotation, OxElement, OxAttr, OxChild
 } from "../syntax";
 import { Span } from "../diag";
 
@@ -244,7 +244,8 @@ function annotationsTail(as: Annotation[]): string {
     const t = match (a.kind) {
       ATest => "(test" + spanStr(a.span) + ")",
       ADeprecated => "(deprecated" + spanStr(a.span) + " " + quote(a.message) + ")",
-      AInline => "(inline" + spanStr(a.span) + ")"
+      AInline => "(inline" + spanStr(a.span) + ")",
+      ASealed => "(sealed" + spanStr(a.span) + ")"
     };
     parts.push(t);
   }
@@ -486,29 +487,44 @@ function templateParts(parts: string[]): string {
   return "[" + out.join(" ") + "]";
 }
 
-// JSX (ADR-0043): `(jsx@span name (attr name value)* child*)`; a fragment has the name `<>`.
-function dumpJsx(el: JsxElement, ind: string): string {
+// OX (ADR-0043, ADR-0044): `(ox@span name (attr name value)* child*)`; a fragment has the name `<>`, a spread attribute
+// is `(spread expr)`, a named slot `(slot name child*)`.
+function dumpOx(el: OxElement, ind: string): string {
   const nm = match (el.name) {
     Some(n) => n.name,
     None => "<>",
   };
-  let out = "(jsx" + spanStr(el.span) + " " + nm + (el.selfClosing ? " /" : "");
+  let out = "(ox" + spanStr(el.span) + " " + nm + (el.selfClosing ? " /" : "");
   for (const a of el.attrs) {
     const v = match (a.value) {
       JVStr(s) => quote(s),
       JVExpr(x) => dumpExpr(x, ind),
       JVTrue => "true",
+      JVSpread(x) => dumpExpr(x, ind),
     };
-    out += " (attr " + a.name.name + " " + v + ")";
+    match (a.value) {
+      JVSpread(_) => {
+        out += " (spread " + v + ")";
+      },
+      _ => {
+        out += " (attr " + a.name.name + " " + v + ")";
+      },
+    }
   }
-  for (const c of el.children) {
+  return out + dumpOxKids(el.children, ind) + ")";
+}
+
+function dumpOxKids(kids: OxChild[], ind: string): string {
+  let out = "";
+  for (const c of kids) {
     out += " " + match (c) {
       JText(t, _) => "(text " + quote(t) + ")",
       JExpr(x) => dumpExpr(x, ind),
-      JElem(sub) => dumpJsx(sub, ind),
+      JElem(sub) => dumpOx(sub, ind),
+      JSlot(n, ks, _) => "(slot " + n.name + dumpOxKids(ks, ind) + ")",
     };
   }
-  return out + ")";
+  return out;
 }
 
 function optExpr(o: Option<Expr>, ind: string): string {
@@ -525,7 +541,7 @@ function dumpExpr(e: Expr, ind: string): string {
     EFloat(t) => "(float" + sp + " " + t + ")",
     EBigInt(v) => "(bigint" + sp + " " + v.toString() + ")",
     ETemplate(parts, xs) => "(template" + sp + " " + templateParts(parts) + exprsTail(xs, ind) + ")",
-    EJsx(el) => dumpJsx(el, ind),
+    EOx(el) => dumpOx(el, ind),
     EStr(s) => "(str" + sp + " " + quote(s) + ")",
     EBool(b) => "(bool" + sp + " " + b.toString() + ")",
     EIdent(id) => "(ident" + sp + " " + id.name + ")",

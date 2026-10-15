@@ -1,11 +1,11 @@
-// JSX (ADR-0043): the pure parts of checking JSX. The expression checker (expr.or, section "JSX") walks the element
+// OX (ADR-0043): the pure parts of checking OX. The expression checker (expr.or, section "OX") walks the element
 // tree; this file holds the HTML rules it applies (element and attribute classes, escaping of static text at compile
-// time), the lookup of the std:html library the generated code calls, and the fused output buffer `JsxOut`.
+// time), the lookup of the std:html library the generated code calls, and the fused output buffer `OxOut`.
 //
-// Lowering: a JSX element is one string built by appending pieces, `((p0 + p1) + p2) + ..`, exactly like a template
+// Lowering: an OX element is one string built by appending pieces, `((p0 + p1) + p2) + ..`, exactly like a template
 // literal (the lowering appends in place, `IStrAppend`), wrapped in the `Html` record of std:html. Adjacent static
 // pieces (tags, attribute names, static text, escaped at compile time) are merged into one literal, and nested HTML
-// elements are flattened into their parent's buffer: no tree, no virtual DOM, one buffer per JSX root. Only dynamic
+// elements are flattened into their parent's buffer: no tree, no virtual DOM, one buffer per OX root. Only dynamic
 // values (escaped by std:html at run time) and component calls (a function call returning `Html`) are separate pieces.
 
 import { Span, Diagnostic, diag } from "../diag";
@@ -16,7 +16,7 @@ import { mk } from "./ops";
 // The unit of std:html (the loader resolves `std:html` to `$stdlib/html.or`).
 const HTML_UNIT: string = "$stdlib/html";
 
-// What the generated code of JSX uses from std:html: the `Html` record (one field `html: string`) and the functions
+// What the generated code of OX uses from std:html: the `Html` record (one field `html: string`) and the functions
 // `escape`, `escapeUrl` (both `string -> string`) and `joinAll` (`Html[] -> string`).
 export type HtmlLib = { rec: usize; esc: usize; escUrl: usize; join: usize; };
 
@@ -54,7 +54,7 @@ export function htmlRecord(env: Env): Option<usize> {
   return None;
 }
 
-// The std:html parts JSX needs, or E0490 when the program does not load std:html (JSX is library-backed: the program
+// The std:html parts OX needs, or E0490 when the program does not load std:html (OX is library-backed: the program
 // imports `Html` from it to declare components anyway).
 @Ensures(result.isOk() ==> result.unwrap().rec < env.records.length && result.unwrap().esc < env.funcs.length)
 @Ensures(result.isErr() ==> result.unwrapErr().code == "E0490")
@@ -68,14 +68,14 @@ export function htmlLib(env: Env, span: Span): Result<HtmlLib, Diagnostic> {
       diag(
         "E0490",
         span,
-        "JSX needs the std:html library; add `import { Html } from \"std:html\";` to this program",
+        "OX needs the std:html library; add `import { Html } from \"std:html\";` to this program",
       ),
     );
   }
   return Ok(HtmlLib { rec: rec.unwrap(), esc: esc.unwrap(), escUrl: escUrl.unwrap(), join: join.unwrap() });
 }
 
-// E0495 when record `rid` is the sealed `Html` of std:html and `unit` is not std:html itself: only JSX, `trustHtml`
+// E0495 when record `rid` is the sealed `Html` of std:html and `unit` is not std:html itself: only OX, `trustHtml`
 // and the functions of std:html construct or change an `Html`, so a value of that type is never unescaped text.
 export function sealedErr(env: Env, rid: usize, unit: usize, span: Span): Option<Diagnostic> {
   const sealed = rid < env.records.length && env.records[rid].name == HTML_UNIT + ".Html";
@@ -86,7 +86,7 @@ export function sealedErr(env: Env, rid: usize, unit: usize, span: Span): Option
     diag(
       "E0495",
       span,
-      "an `Html` value can only be built by JSX or std:html (`text`, `trustHtml`, ...) and cannot be changed",
+      "an `Html` value can only be built by OX or std:html (`text`, `trustHtml`, ...) and cannot be changed",
     ),
   );
 }
@@ -96,7 +96,7 @@ export function sealedErr(env: Env, rid: usize, unit: usize, span: Span): Option
 // ---------------------------------------------------------------------------
 
 // The HTML escape of std:html `escape`, applied at compile time to static text and static attribute values: `&` `<`
-// `>` `"` `'` become `&amp;` `&lt;` `&gt;` `&quot;` `&#39;`, every other byte is kept. tests/next/run/jsx_escape_diff.or
+// `>` `"` `'` become `&amp;` `&lt;` `&gt;` `&quot;` `&#39;`, every other byte is kept. tests/next/run/ox_escape_diff.or
 // checks that the two agree on every byte value.
 @Ensures(!result.includes("<") && !result.includes(">") && !result.includes("\"") && !result.includes("'"))
 @Ensures(result.length >= s.length)
@@ -200,33 +200,33 @@ export function isAttrName(name: string): bool {
 // The fused output buffer
 // ---------------------------------------------------------------------------
 
-// The pieces of one JSX root so far: `parts` are string-typed HIR expressions in output order, `pending` the static
+// The pieces of one OX root so far: `parts` are string-typed HIR expressions in output order, `pending` the static
 // text after the last of them (not yet a piece, so that the next static text merges with it).
-export type JsxOut = { parts: HExpr[]; pending: string; };
+export type OxOut = { parts: HExpr[]; pending: string; };
 
-export function jsxOutNew(): JsxOut {
+export function oxOutNew(): OxOut {
   const ps: HExpr[] = [];
-  return JsxOut { parts: ps, pending: "" };
+  return OxOut { parts: ps, pending: "" };
 }
 
 @Ensures(result.parts.length == o.parts.length && result.pending == o.pending + s)
-export function jsxOutStatic(o: JsxOut, s: string): JsxOut {
-  return JsxOut { parts: o.parts, pending: o.pending + s };
+export function oxOutStatic(o: OxOut, s: string): OxOut {
+  return OxOut { parts: o.parts, pending: o.pending + s };
 }
 
 // Appends the dynamic piece `e` (of type string); the pending static text becomes a piece before it.
 @Ensures(result.pending == "")
-export function jsxOutDyn(o: JsxOut, e: HExpr, span: Span): JsxOut {
+export function oxOutDyn(o: OxOut, e: HExpr, span: Span): OxOut {
   let ps = o.parts;
   if (o.pending.length > 0) {
     ps.push(mk(XStr(o.pending), TyString, span));
   }
   ps.push(e);
-  return JsxOut { parts: ps, pending: "" };
+  return OxOut { parts: ps, pending: "" };
 }
 
 // The string of the whole buffer: the left-nested concatenation of the pieces (one literal if all were static).
-export function jsxOutFinish(o: JsxOut, span: Span): HExpr {
+export function oxOutFinish(o: OxOut, span: Span): HExpr {
   let ps = o.parts;
   if (o.pending.length > 0 || ps.length == 0) {
     ps.push(mk(XStr(o.pending), TyString, span));
@@ -241,7 +241,7 @@ export function jsxOutFinish(o: JsxOut, span: Span): HExpr {
 }
 
 // Number of pieces of a finished buffer (for tests and `--fuse-report`-style statistics).
-export function jsxOutPieces(o: JsxOut): usize {
+export function oxOutPieces(o: OxOut): usize {
   const extra: usize = o.pending.length > 0 ? 1 : 0;
   return o.parts.length + extra;
 }

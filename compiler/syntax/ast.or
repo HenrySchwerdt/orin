@@ -20,8 +20,9 @@ export type Item =
   // --- beyond Orin-B (interfaces, ADR-0019) ---
   | IInterface(InterfaceDecl);
 
-// `import { a, b } from "path";` and `export { a, b } from "path";`
-export type ImportDecl = { names: Ident[]; path: string; pathSpan: Span; span: Span; };
+// `import { a, b } from "path";` and `export { a, b } from "path";`. `provider`: `import ox from "path";` (ADR-0044),
+// which selects the OX provider of the file and binds no name (`names` is empty).
+export type ImportDecl = { names: Ident[]; path: string; pathSpan: Span; span: Span; provider: bool; };
 
 export type FunctionDecl = {
   exported: bool;
@@ -49,7 +50,7 @@ export type ContractClause = { kind: ContractKind; expr: Option<Expr>; rule: str
 // Built-in annotations (ADR-0024, spec 05): a closed set of compiler-defined markers. They are NOT a
 // general annotation mechanism (user-defined annotations are post-1.0) and, like contract clauses, have
 // dedicated grammar and AST nodes. `message` is the string argument of `@Deprecated`, "" otherwise.
-export type AnnotationKind = ATest | ADeprecated | AInline;
+export type AnnotationKind = ATest | ADeprecated | AInline | ASealed;
 
 export type Annotation = { kind: AnnotationKind; message: string; span: Span; };
 
@@ -191,51 +192,65 @@ export type ExprKind =
   | EThis
   // --- beyond Orin-B (closures, ADR-0011) ---
   | EArrow(ArrowParam[], Option<TypeExpr>, ArrowBody)  // `(x: T, y) [: R] => body` / `x => body`
-  // --- beyond Orin-B (JSX, ADR-0043) ---
-  | EJsx(JsxElement);                                 // `<div class="a">{x}</div>`, `<Card title={t} />`, `<>..</>`
+  // --- beyond Orin-B (OX, ADR-0043) ---
+  | EOx(OxElement);                                 // `<div class="a">{x}</div>`, `<Card title={t} />`, `<>..</>`
 
 // A parameter type may be omitted when the checker knows the expected function type.
 export type ArrowParam = { name: Ident; ty: Option<TypeExpr>; span: Span; };
 
 export type ArrowBody = AExpr(Expr) | ABlock(Block);
 
-// JSX (ADR-0043). `name` is None for a fragment `<>..</>`. A name starting with an upper-case letter is a component
-// (a function called with the attributes as named arguments), any other an HTML element. The closing tag is not kept
+// OX markup (ADR-0043, ADR-0044). `name` is None for a fragment `<>..</>`. A name starting with an upper-case letter is
+// a component (a function called with the attributes as named arguments), any other an intrinsic element of the file's
+// OX provider. The closing tag is not kept
 // (the parser checks that it repeats the name). `selfClosing`: written `<x />` (then `children` is empty).
-export type JsxElement = {
+export type OxElement = {
   name: Option<Ident>;
-  attrs: JsxAttr[];
-  children: JsxChild[];
+  attrs: OxAttr[];
+  children: OxChild[];
   selfClosing: bool;
   span: Span;
 };
 
-// `name="text"` (JSX string: no backslash escapes, entities decoded), `name={expr}` or a bare `name` (the value `true`).
-export type JsxAttr = { name: Ident; value: JsxValue; span: Span; };
+// `name="text"` (OX string: no backslash escapes, entities decoded), `name={expr}`, a bare `name` (the value `true`) or
+// a spread `{...expr}` (JVSpread; `name` is then `...` at the span of the braces).
+export type OxAttr = { name: Ident; value: OxValue; span: Span; };
 
-export type JsxValue = JVStr(string) | JVExpr(Expr) | JVTrue;
+export type OxValue = JVStr(string) | JVExpr(Expr) | JVTrue | JVSpread(Expr);
 
-// Text between tags (cooked: JSX whitespace rules applied, entities decoded; never empty), `{expr}`, a nested element.
-export type JsxChild = JText(string, Span) | JExpr(Expr) | JElem(JsxElement);
+// Text between tags (cooked: OX whitespace rules applied, entities decoded; never empty), `{expr}`, a nested element,
+// or a named slot `<:name>..</:name>` (only directly inside a component; its children fill the parameter `name`).
+export type OxChild = JText(string, Span) | JExpr(Expr) | JElem(OxElement) | JSlot(Ident, OxChild[], Span);
 
 // The expressions written inside `el` (attribute values and `{..}` children, nested elements included), in source order.
-export function jsxExprs(el: JsxElement): Expr[] {
+export function oxExprs(el: OxElement): Expr[] {
   let out: Expr[] = [];
   for (const a of el.attrs) {
     match (a.value) {
       JVExpr(x) => {
         out.push(x);
       },
+      JVSpread(x) => {
+        out.push(x);
+      },
       _ => {},
     }
   }
-  for (const c of el.children) {
+  return out.concat(oxKidExprs(el.children));
+}
+
+function oxKidExprs(kids: OxChild[]): Expr[] {
+  let out: Expr[] = [];
+  for (const c of kids) {
     match (c) {
       JExpr(x) => {
         out.push(x);
       },
       JElem(sub) => {
-        out = out.concat(jsxExprs(sub));
+        out = out.concat(oxExprs(sub));
+      },
+      JSlot(_, ks, _) => {
+        out = out.concat(oxKidExprs(ks));
       },
       JText(_, _) => {},
     }
@@ -243,39 +258,53 @@ export function jsxExprs(el: JsxElement): Expr[] {
   return out;
 }
 
-// `el` with `f` applied to every expression written inside it (the same order as `jsxExprs`); the shape is unchanged.
-export function jsxMapExprs(el: JsxElement, f: (x: Expr) => Expr): JsxElement {
-  let attrs: JsxAttr[] = [];
+// `el` with `f` applied to every expression written inside it (the same order as `oxExprs`); the shape is unchanged.
+export function oxMapExprs(el: OxElement, f: (x: Expr) => Expr): OxElement {
+  let attrs: OxAttr[] = [];
   for (const a of el.attrs) {
     const v = match (a.value) {
       JVExpr(x) => JVExpr(f(x)),
+      JVSpread(x) => JVSpread(f(x)),
       JVStr(s) => JVStr(s),
       JVTrue => JVTrue,
     };
-    attrs.push(JsxAttr { name: a.name, value: v, span: a.span });
+    attrs.push(OxAttr { name: a.name, value: v, span: a.span });
   }
-  let kids: JsxChild[] = [];
-  for (const c of el.children) {
+  return OxElement { name: el.name, attrs: attrs, children: oxMapKids(el.children, f), selfClosing: el.selfClosing, span: el.span };
+}
+
+function oxMapKids(kids: OxChild[], f: (x: Expr) => Expr): OxChild[] {
+  let out: OxChild[] = [];
+  for (const c of kids) {
     const k = match (c) {
       JExpr(x) => JExpr(f(x)),
-      JElem(sub) => JElem(jsxMapExprs(sub, f)),
+      JElem(sub) => JElem(oxMapExprs(sub, f)),
+      JSlot(n, ks, sp) => JSlot(n, oxMapKids(ks, f), sp),
       JText(t, sp) => JText(t, sp),
     };
-    kids.push(k);
+    out.push(k);
   }
-  return JsxElement { name: el.name, attrs: attrs, children: kids, selfClosing: el.selfClosing, span: el.span };
+  return out;
 }
 
 // The names of the component tags in `el` (itself and nested elements), in source order: references to functions.
-export function jsxComponents(el: JsxElement): Ident[] {
+export function oxComponents(el: OxElement): Ident[] {
   let out: Ident[] = [];
-  if (jsxIsComponent(el)) {
+  if (oxIsComponent(el)) {
     out.push(el.name.unwrap());
   }
-  for (const c of el.children) {
+  return out.concat(oxKidComponents(el.children));
+}
+
+function oxKidComponents(kids: OxChild[]): Ident[] {
+  let out: Ident[] = [];
+  for (const c of kids) {
     match (c) {
       JElem(sub) => {
-        out = out.concat(jsxComponents(sub));
+        out = out.concat(oxComponents(sub));
+      },
+      JSlot(_, ks, _) => {
+        out = out.concat(oxKidComponents(ks));
       },
       _ => {},
     }
@@ -284,7 +313,7 @@ export function jsxComponents(el: JsxElement): Ident[] {
 }
 
 // A component tag: the name starts with an upper-case ASCII letter (`<Card />`); `<div>` and fragments are not.
-export function jsxIsComponent(el: JsxElement): bool {
+export function oxIsComponent(el: OxElement): bool {
   return match (el.name) {
     Some(n) => n.name.length > 0 && n.name.charCodeAt(0) >= 65 && n.name.charCodeAt(0) <= 90,
     None => false,
