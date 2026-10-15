@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Mutation check for the OX part of the compiler (ADR-0043).
+"""Mutation check for the OX part of the compiler (ADR-0043, ADR-0044).
 
 Each mutant is a small, deliberately wrong change of the OX lexer, parser or checker (compiler/syntax/lexer.or,
-parser.or, compiler/check/ox.or, expr.or, stmt.or): a missing escape, a URL attribute that is no longer sanitised,
-an event handler that accepts a computed value, a sealed `Html` that can be built, broken whitespace rules, ... The
+parser.or, compiler/check/ox.or, expr.or, stmt.or): a provider rule that is ignored (static encoding, attribute rules,
+void and raw-text elements, presence attributes), a value that is not encoded, a sealed record that can be built,
+attributes evaluated out of source order, broken whitespace rules, ... The
 compiler sources are copied to build/mutate_ox/<mutant>/, the mutation is applied, the mutated compiler is built (one
 self-compile by --orinc, then cc -O1) and the OX conformance tests (`tests/next/{run,errors}/ox_*`) are run with it.
 A mutant is killed when a test fails (or the mutated compiler does not build). Every mutant must be killed.
@@ -26,36 +27,37 @@ OUT = os.path.join(ROOT, "build", "mutate_ox")
 
 # (name, file under compiler/, old text (must occur exactly once), new text)
 MUTANTS = [
-    # ---- compile-time escaping (check/ox.or)
-    ("static-escape-drops-apostrophe", "check/ox.or", 'c == 39 ? "&#39;" : ""', 'c == 39 ? "\'" : ""'),
-    ("static-escape-ampersand", "check/ox.or", 'c == 38 ? "&amp;"', 'c == 38 ? "&"'),
-    ("static-escape-less-than", "check/ox.or", 'c == 60 ? "&lt;"', 'c == 60 ? "<"'),
-    # ---- HTML rules (check/ox.or)
-    ("href-not-a-url-attribute", "check/ox.or", '    "href" => true,\n', ''),
-    ("event-handlers-accept-values", "check/ox.or", "  return name.length > 2\n", "  return name.length > 200\n"),
-    ("br-not-void", "check/ox.or", '    "br" => true,\n', ''),
-    ("script-not-raw-text", "check/ox.or", 'return name == "script" || name == "style";', 'return name == "style";'),
-    ("html-not-sealed", "check/ox.or", "  if (!sealed || unit < env.units.length", "  if (true || unit < env.units.length"),
+    # ---- provider rules and the buffer (check/ox.or)
+    ("static-encoding-ignored", "check/ox.or", "      if (e.code == c) {", "      if (e.code == c + 1000) {"),
+    ("rule-prefix-ignored", "check/ox.or", " || r.prefix.length > 0 && n.startsWith(r.prefix)", ""),
+    ("rule-names-case-sensitive", "check/ox.or", "  const n = asciiLower(name);\n  for (const r of p.rules) {",
+     "  const n = name;\n  for (const r of p.rules) {"),
+    ("void-tags-ignored", "check/ox.or", "  return listed(p.voidTags, tag);", "  return false;"),
+    ("raw-text-tags-ignored", "check/ox.or", "  return listed(p.rawTextTags, tag);", "  return false;"),
+    ("sealed-ignored", "check/ox.or", "  if (!env.sealed.some(x => x == qname)) {", "  if (true) {"),
     ("pending-text-dropped", "check/ox.or", "  if (o.pending.length > 0) {\n    ps.push(mk(XStr(o.pending), TyString, span));\n  }\n  ps.push(e);",
      "  ps.push(e);"),
     # ---- the checker (check/expr.or, check/stmt.or)
-    ("dynamic-child-not-escaped", "check/expr.or",
-     "      return Ok(oxOutDyn(o, mk(XCall(lib.esc, [v]), TyString, x.span), x.span));",
-     "      return Ok(oxOutDyn(o, v, x.span));"),
-    ("url-attribute-not-sanitised", "check/expr.or", "isUrlAttr(name) ? lib.escUrl : lib.esc", "lib.esc"),
-    ("dynamic-attribute-not-escaped", "check/expr.or",
-     "          piece = mk(XCall(isUrlAttr(name) ? lib.escUrl : lib.esc, [v]), TyString, x.span);",
+    ("dynamic-child-not-encoded", "check/expr.or",
+     "      return Ok(oxOutDyn(o, mk(XCall(p.text, [v]), TyString, span), span));",
+     "      return Ok(oxOutDyn(o, v, span));"),
+    ("rule-convert-ignored", "check/expr.or", "              conv = f;", "              conv = p.attr;"),
+    ("dynamic-attribute-not-encoded", "check/expr.or", "          piece = mk(XCall(conv, [v]), TyString, x.span);",
      "          piece = v;"),
-    ("static-attribute-not-escaped", "check/expr.or",
-     "      JVStr(v) => {\n        return Ok(oxOutStatic(o, \" \" + name + \"=\\\"\" + htmlEscapeStatic(v) + \"\\\"\"));",
+    ("static-attribute-not-encoded", "check/expr.or",
+     "      JVStr(v) => {\n        return Ok(oxOutStatic(o, \" \" + name + \"=\\\"\" + oxEncodeStatic(p, v) + \"\\\"\"));",
      "      JVStr(v) => {\n        return Ok(oxOutStatic(o, \" \" + name + \"=\\\"\" + v + \"\\\"\"));"),
-    ("static-text-not-escaped", "check/expr.or", "o = oxOutStatic(o, raw ? t : htmlEscapeStatic(t));",
+    ("static-text-not-encoded", "check/expr.or", "o = oxOutStatic(o, raw ? t : oxEncodeStatic(p, t));",
      "o = oxOutStatic(o, t);"),
     ("bool-attribute-inverted", "check/expr.or", "mk(XCond(v, on, off), TyString, x.span)", "mk(XCond(v, off, on), TyString, x.span)"),
-    ("children-param-ignored", "check/expr.or", "        kidsUsed = true;\n", ""),
-    ("closing-tag-of-void-written", "check/expr.or",
-     "      return Ok(o);\n    }\n    o = this.oxChildren(lib, el.children, isRawTextElement(tag.name), o)?;",
-     "      return Ok(oxOutStatic(o, \"</\" + tag.name + \">\"));\n    }\n    o = this.oxChildren(lib, el.children, isRawTextElement(tag.name), o)?;"),
+    ("void-end-ignored", "check/expr.or", "      return Ok(oxOutStatic(o, p.voidEnd));", "      return Ok(oxOutStatic(o, \">\"));"),
+    ("presence-not-checked", "check/expr.or", "  private oxPresent(p: OxProvider, name: string, span: Span, o: OxOut): Result<OxOut, Diagnostic> {\n    if (!p.presence) {",
+     "  private oxPresent(p: OxProvider, name: string, span: Span, o: OxOut): Result<OxOut, Diagnostic> {\n    if (false) {"),
+    ("source-order-ignored", "check/expr.or", "          if (pi <= last) {\n            ordered = true;\n          }\n          last = pi;\n        },",
+     "          last = pi;\n        },"),
+    ("option-param-required", "check/expr.or", 'if (pn != "children" && !isOptionTe(params[i].ty)) {', 'if (pn != "children") {'),
+    ("single-child-wrapped-in-fragment", "check/expr.or", "      if (items.length == 1 && !items[0].splice) {", "      if (false) {"),
+    ("spread-later-attribute-lost", "check/expr.or", "          args[pi] = Some(x);\n", "          if (args[pi].isNone()) {\n            args[pi] = Some(x);\n          }\n"),
     ("field-assignment-not-sealed", "check/stmt.or",
      "          if (sealed.isSome()) {\n            return Err(sealed.unwrap());\n          }\n", ""),
     # ---- lexer and parser (syntax/)
