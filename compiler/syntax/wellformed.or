@@ -14,7 +14,7 @@ import {
   VariantDecl, ConstDecl, TypeExpr, TypeExprKind, Block, Stmt, StmtKind, Expr, ExprKind, FieldInit,
   MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl, IfaceMethod, ContractClause, Annotation,
   ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam, ArrowParam,
-  ArrowBody,
+  ArrowBody, JsxElement, JsxAttr, JsxChild,
 } from "./ast";
 
 // `c` lies inside `p` (same file).
@@ -73,6 +73,41 @@ function optIdent(o: Option<Ident>): Span[] {
   return [];
 }
 
+// The children of a JSX element (ADR-0043): its name, its attributes, its children (an `{expr}` child by the span of
+// the expression).
+export function jsxKids(el: JsxElement): Span[] {
+  return optIdent(el.name)
+      .concat(el.attrs.map(a => a.span))
+      .concat(el.children.map(c => jsxChildSpan(c)));
+}
+
+function jsxChildSpan(c: JsxChild): Span {
+  return match (c) {
+    JText(_, sp) => sp,
+    JExpr(x) => x.span,
+    JElem(el) => el.span,
+  };
+}
+
+function jsxAttrOk(a: JsxAttr): bool {
+  return match (a.value) {
+    JVExpr(x) => nestedIn([a.name.span, x.span], a.span) && exprOk(x),
+    _ => inside(a.name.span, a.span),
+  };
+}
+
+// Every node of the JSX element `el` is shallow-well-formed (its expressions deeply).
+export function jsxOk(el: JsxElement): bool {
+  if (!nestedIn(jsxKids(el), el.span) || !el.attrs.every(a => jsxAttrOk(a))) {
+    return false;
+  }
+  return el.children.every(c => match (c) {
+    JText(t, _) => t.length > 0,
+    JExpr(x) => exprOk(x),
+    JElem(sub) => jsxOk(sub),
+  });
+}
+
 function armBodySpan(b: ArmBody): Span {
   return match (b) {
     BExpr(e) => e.span,
@@ -112,6 +147,7 @@ export function exprKids(e: Expr): Span[] {
         .concat(fields.map(f => f.span)),
     EMatch(x, arms) => [x.span].concat(arms.map(a => a.span)),
     ETemplate(_, xs) => exprSpans(xs),
+    EJsx(el) => [el.span],
     ENew(id, tys, args) => [id.span].concat(typeSpans(tys)).concat(exprSpans(args)),
     EArrow(ps, ret, body) => ps.map(p => p.span).concat(optType(ret)).concat([arrowBodySpan(body)]),
     _ => [],
@@ -354,6 +390,7 @@ export function exprOk(e: Expr): bool {
         && fields.every(f => fieldInitOk(f)),
     EMatch(x, arms) => exprOk(x) && arms.every(a => armOk(a)),
     ETemplate(_, xs) => xs.every(x => exprOk(x)),
+    EJsx(el) => jsxOk(el),
     ENew(_, tys, args) => tys.every(t => typeOk(t)) && args.every(a => exprOk(a)),
     EArrow(ps, ret, body) => ps.every(p => arrowParamOk(p)) && optTypeOk(ret) && arrowBodyOk(body),
     _ => true,

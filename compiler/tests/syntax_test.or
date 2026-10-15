@@ -13,7 +13,8 @@ import {
   tokensWellFormed, Parser, parse, isSyntaxCode, OpRow, OpTable, binaryOps, opRowsOk, MAX_LEVEL,
   T_FUNCTION, T_METHOD, T_CLASS, T_LOOP, T_CONST, clauseAllowed, annotationAllowed, checkPlacement,
   checkAnnoPlacement, inside, nestedIn, exprOk, exprShallowOk, stmtOk, typeOk, itemSpan,
-  moduleWellFormed, Comment, scanComments, commentsWellFormed,
+  moduleWellFormed, Comment, scanComments, commentsWellFormed, cookJsxText, decodeEntities, jsxExprs,
+  jsxComponents, jsxIsComponent,
 } from "../syntax";
 
 function sp(a: usize, b: usize): Span {
@@ -572,4 +573,128 @@ function commentsAreFoundInOrder(): void {
     Comment { start: 0, end: 4, text: "// b", isLine: true, ownLine: true, blankBefore: false },
   ];
   assert(!commentsWellFormed(wrongText, src), "text differs from the source");
+}
+
+// ---------------------------------------------------------------------------
+// JSX (ADR-0043)
+// ---------------------------------------------------------------------------
+
+function kindName(t: Token): string {
+  return match (t.kind) {
+    KJsxOpen => "open",
+    KJsxEnd => "end",
+    KJsxText => "text",
+    KIdent => "ident",
+    KPunct => "punct",
+    KStr => "str",
+    KKeyword => "kw",
+    KEof => "eof",
+    _ => "other",
+  };
+}
+
+function jsxShape(src: string): string {
+  return toks(src).map(t => kindName(t) + ":" + t.text).join(" ");
+}
+
+@Test
+function lexerSplitsJsxIntoTagsTextAndExpressions(): void {
+  assertEqString(
+    jsxShape("x = <a class=\"c\" n={1}>hi {y} <b /></a>;"),
+    "ident:x punct:= open:< ident:a ident:class punct:= str:c ident:n punct:= punct:{ other:1 punct:} end:> text:hi  punct:{ ident:y punct:} text:  open:< ident:b end:/> open:</ ident:a end:> punct:; eof:",
+    "tokens of an element",
+  );
+}
+
+@Test
+function lexerKeepsLessThanAfterAnOperand(): void {
+  assertEqString(jsxShape("a <b"), "ident:a punct:< ident:b eof:", "comparison after a name");
+  assertEqString(jsxShape("f(x) <y"), "ident:f punct:( ident:x punct:) punct:< ident:y eof:", "after `)`");
+  assertEqString(jsxShape("xs[0] <y"), "ident:xs punct:[ other:0 punct:] punct:< ident:y eof:", "after `]`");
+  assertEqString(jsxShape("return <br/>"), "kw:return open:< ident:br end:/> eof:", "after `return`");
+  assertEqString(jsxShape("(<>t</>)"), "punct:( open:< end:> text:t open:</ end:> punct:) eof:", "fragment after `(`");
+}
+
+@Test
+function lexerJsxAttributeNamesAndStrings(): void {
+  assertEqString(
+    jsxShape("(<a data-id='x &amp; \"y\"' class for />)"),
+    "punct:( open:< ident:a ident:data-id punct:= str:x & \"y\" ident:class ident:for end:/> punct:) eof:",
+    "dashes, keywords as names, single quotes, entities",
+  );
+}
+
+@Test
+function lexerJsxStepContractHolds(): void {
+  // every step adds exactly one token and advances (the @Ensures of `step`), also over whitespace-only text
+  const src = "(<ul>\n  <li>a</li>\n  {/* c */}\n  <li>{b}</li>\n</ul>)";
+  let lx = new Lexer(0, src);
+  while (!lx.finished()) {
+    lx.step();
+  }
+  assert(lx.error().isNone(), "no error");
+  assert(tokensWellFormed(toks(src), 0, src.length), "well formed");
+}
+
+@Test
+function lexerJsxErrors(): void {
+  const bad = ["(<a>x", "(<a>x } y</a>)", "(<a>x > y</a>)", "(<a b=\"x></a>)", "(<a @ />)", "(<a>< </a>)"];
+  for (const b of bad) {
+    const r = lex(0, b);
+    assert(r.isErr(), "rejected: " + b);
+    assertEqString(r.unwrapErr().code, "E0100", "lexical error: " + b);
+    assert(r.unwrapErr().span.end <= b.length, "span inside: " + b);
+  }
+}
+
+@Test
+function jsxTextWhitespaceRules(): void {
+  assertEqString(cookJsxText("  a  b  "), "  a  b  ", "one line: kept as written");
+  assertEqString(cookJsxText("\n    a\n    b\n  "), "a b", "lines trimmed and joined");
+  assertEqString(cookJsxText("\n   \n  "), "", "whitespace with a line break: nothing");
+  assertEqString(cookJsxText("a \n\t b"), "a b", "tabs are spaces");
+  assertEqString(cookJsxText("x\r\n  y"), "x y", "CRLF");
+}
+
+@Test
+function jsxEntities(): void {
+  assertEqString(decodeEntities("a &amp; b &lt;&gt; &quot;&apos;"), "a & b <> \"'", "named");
+  assertEqString(decodeEntities("&#65;&#x42;&#X43;"), "ABC", "numeric");
+  assertEqString(decodeEntities("&#169;"), "\xc2\xa9", "UTF-8 of U+00A9");
+  assertEqString(decodeEntities("&#x20AC;"), "\xe2\x82\xac", "UTF-8 of U+20AC");
+  assertEqString(decodeEntities("&#x1F600;"), "\xf0\x9f\x98\x80", "UTF-8 of U+1F600");
+  assertEqString(decodeEntities("&nope; & &amp &#0; &#xD800; &#x110000;"), "&nope; & &amp &#0; &#xD800; &#x110000;", "kept");
+}
+
+function parseExpr1(src: string): Expr {
+  let p = new Parser(toks(src));
+  return p.parseExpr().unwrap();
+}
+
+@Test
+function parserBuildsJsxElements(): void {
+  const e = parseExpr1("<div id=\"a\" n={x} on>t {y}<b/><Card k={1}>c</Card></div>");
+  assert(exprOk(e), "well formed");
+  match (e.kind) {
+    EJsx(el) => {
+      assertEqString(el.name.unwrap().name, "div", "name");
+      assertEqUsize(el.attrs.length, 3, "attributes");
+      assertEqUsize(el.children.length, 4, "children: text, expr, b, Card");
+      assertEqUsize(jsxExprs(el).length, 3, "expressions: x, y, 1");
+      assertEqUsize(jsxComponents(el).length, 1, "one component");
+      assert(!jsxIsComponent(el), "div is an element");
+    },
+    _ => {
+      assert(false, "not JSX");
+    },
+  }
+}
+
+@Test
+function parserRejectsMalformedJsx(): void {
+  const bad = ["<a></b>", "<a x=1 />", "<a {...p} />", "<a x=\"1\" x=\"2\" />", "</>", "<>x</a>", "<a>x</>"];
+  for (const b of bad) {
+    const r = parse(0, "const v = " + b + ";");
+    assert(r.isErr(), "rejected: " + b);
+  }
 }

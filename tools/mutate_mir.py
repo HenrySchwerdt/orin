@@ -503,7 +503,9 @@ def corpus():
 
 
 def mir_of(orinc, path):
-    r = subprocess.run([orinc, "mir", os.path.relpath(path, ROOT)], cwd=ROOT, capture_output=True, text=True, timeout=600)
+    # MIR string constants are raw bytes (e.g. folded String.fromCharCode(0x80)); keep them byte-exact.
+    r = subprocess.run([orinc, "mir", os.path.relpath(path, ROOT)], cwd=ROOT, capture_output=True, text=True,
+                       errors="surrogateescape", timeout=600)
     return r.stdout if r.returncode == 0 else None
 
 
@@ -558,10 +560,10 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         exe = a.verify_text or build_driver(a.orinc, tmp)
         path = os.path.join(tmp, "mutants.txt")
-        with open(path, "w") as fh:
+        with open(path, "w", errors="surrogateescape") as fh:
             for name, text in entries:
                 fh.write("=== %s\n%s" % (name, text))
-        r = subprocess.run([exe, path], capture_output=True, text=True, timeout=1800)
+        r = subprocess.run([exe, path], capture_output=True, text=True, errors="replace", timeout=1800)
         if r.returncode != 0:
             sys.exit("verify_text failed: " + r.stderr[:500])
     res = {}

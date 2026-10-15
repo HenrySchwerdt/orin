@@ -21,6 +21,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:net` | Orin, `stdlib/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:text` | Orin, `stdlib/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
+| `std:html` | Orin, `stdlib/html.or` | `Html`, `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the functions JSX (ADR-0043) compiles to; below, "std:html" |
 | `std:taskcore` | Orin, `stdlib/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
 | `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
 | `parallel()` on arrays | Orin prelude (`array/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
@@ -34,7 +35,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `stdlib/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `std/` and `array/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
@@ -725,6 +726,91 @@ What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it 
 
 None of this changes `std:http` itself; items 1, 3 and 4 are L0/L1 additions (about 40 lines of C with contracts), the
 rest is `std:net` design.
+
+## std:html: escaping and rendering for JSX
+
+`std:html` (`stdlib/html.or`, pure Orin, no platform calls) is the run-time side of JSX (ADR-0043, being written): a JSX
+element compiles to calls of the functions below, and the only way to put a `string` into HTML is through them. `Html`
+is *rendered, trusted HTML*: only JSX, `trustHtml` and this module construct it (the compiler rejects the record
+literal `Html { .. }` and an assignment to `.html` outside the module), so text from the outside can reach the page
+only escaped, and raw markup is always a visible `trustHtml(...)` call.
+
+### API
+
+| Function | Result |
+|---|---|
+| `type Html = { html: string }` | rendered, trusted HTML |
+| `escape(s): string` | `& < > " '` become `&amp; &lt; &gt; &quot; &#39;`; every other byte is copied unchanged |
+| `safeUrl(s): string` | `s`, or `"about:invalid#orin-unsafe-url"` when `s` has a scheme other than `http`, `https`, `mailto`, `tel` |
+| `escapeUrl(s): string` | `escape(safeUrl(s))`: a URL as a quoted attribute value |
+| `joinAll(xs: Html[]): string` | the concatenation of `x.html` (children from `{items.map(..)}`), in one accumulating string |
+| `trustHtml(raw): Html` | raw HTML, **not** escaped: the explicit, auditable escape hatch |
+| `text(s): Html` | `Html { html: escape(s) }` |
+| `empty(): Html`, `fragment(xs): Html` | no markup; several elements one after the other |
+| `render(h): string`, `document(h): string`, `isEmpty(h): bool` | `h.html`; `"<!DOCTYPE html>" + h.html`; `h.html == ""` |
+| `needsEscape(s)`, `hasSafeScheme(u)`, `isSafeUrl(u)` | predicates used by the contracts (exported so that they can be tested and used in other contracts) |
+
+The names and signatures are the interface JSX is compiled against.
+
+### Escaping
+
+`escape` covers HTML **text** and **quoted attribute values** (double or single quotes). The five characters are ASCII,
+so UTF-8 multi-byte sequences never contain them and are copied byte for byte. `escape` is not idempotent on purpose
+(`&amp;` becomes `&amp;amp;`): it is applied exactly once, when a string becomes `Html`. When `s` contains none of the
+five characters `escape` returns `s` itself after one scan (no allocation, the common case); otherwise it copies the runs
+between the special characters with `substring` and appends the entities, so the work is O(n) and the number of
+allocations does not depend on the number of special characters.
+
+### The URL rule
+
+URL-valued attributes (`href`, `src`, `action`, ...) are a second context: `javascript:` is harmless in text and
+dangerous in `href`. `safeUrl` applies the rule of Go's `html/template`: if `s` contains a `:` that comes before any `/`,
+`?` or `#`, the text before it, ASCII-lowercased, must be exactly `http`, `https`, `mailto` or `tel`; otherwise the result
+is the constant `about:invalid#orin-unsafe-url`. A URL without such a `:` is relative and returned unchanged (`/a:b`,
+`?q=a:b`, `#frag:x`). The check compares the *whole* scheme text, so ` javascript:`, `java\tscript:` and `\x01javascript:`
+are rejected (a browser strips such characters and would run them), and so are `data:`, `vbscript:`, `file:` and the empty
+scheme `:x`. `safeUrl` does not escape: use `escapeUrl` for the attribute value.
+
+### Contracts
+
+Every exported function has `@Ensures`; the executable ones (checked by `orin test`, trapping on violation):
+
+* `escape`: the result contains none of `<`, `>`, `"`, `'`; `result.length >= s.length`; `!needsEscape(s) ==> result == s`;
+  `needsEscape(s) ==> result.length > s.length`.
+* `safeUrl`: `result == s || result == "about:invalid#orin-unsafe-url"`; `isSafeUrl(result)`;
+  `hasSafeScheme(s) ==> result == s`; `!hasSafeScheme(s) ==> result` is the constant. `escapeUrl`: equals `escape(safeUrl(s))`,
+  so it contains none of `<>"'` either.
+* `joinAll`: empty gives `""`, one element gives its `html`, and the result starts with the first and ends with the last
+  element (so no element is skipped at the ends). `text`, `trustHtml`, `fragment`, `render`, `document`, `isEmpty`: the
+  equation of the table above.
+
+### Tests
+
+`tests/std/html_test.or` (18 tests; with and without contract checks): every function; edge cases of `escape` (empty,
+only specials, specials first, last and adjacent, UTF-8 around a special, long strings); the URL rule (upper and mixed case
+schemes, relative URLs with a `:` after `/`, `?` or `#`, leading whitespace and control characters, a tab or NUL in place of
+a letter, prefixes and extensions of an allowed scheme, `data:`); and **differential tests** of `escape` against
+`escapeSpec`, the char-by-char reference kept in the test file: all 256 single bytes (alone and inside a string), 3000
+pseudo-random mixes of the special characters, letters, entities and multi-byte UTF-8, and long strings. A generated-URL
+test checks that `safeUrl` is the identity or the constant and that `isSafeUrl` always holds for the result.
+`tools/mutate_std.py --module html`: 41 mutants (dropped or wrong entities, off-by-one in the run copying, `javascript` or
+`data` accepted, `tel`/`mailto` rejected, case-sensitive or length-agnostic scheme comparison, the `/`, `?`, `#` cut-offs,
+empty scheme accepted, `safeUrl` or `escapeUrl` skipping a step, `joinAll` skipping the first or last element, wrong
+`document`/`text`/`trustHtml`/`fragment`/`isEmpty`), all killed with and without contracts (23 by a contract violation).
+
+### Not guaranteed
+
+* `escape` is for HTML text and quoted attribute values only. It does **not** make a string safe inside `<script>`,
+  `<style>`, an event-handler attribute (`onclick="..."`), an unquoted attribute value, a tag or attribute name, or a
+  comment; those contexts need their own encoders (or must not be fed with untrusted data).
+* `safeUrl` is an allow-list of four schemes; it does not parse or normalise the URL (no percent-decoding, no host
+  checks) and does not validate that the rest is a well-formed URL.
+* `trustHtml` is the only raw path: what is passed to it is the caller's responsibility. The guarantee "a string is never
+  markup unless escaped or trusted" is partly enforced by the compiler (no `Html { .. }` literals, no `.html` assignment
+  outside this module), not by this module alone.
+* The input is treated as bytes; an invalid UTF-8 byte sequence is copied unchanged (validate with `std:utf8` first when
+  the encoding matters).
+* The contracts are checked at run time and by tests; `orin verify --contracts` does not cover strings, arrays or loops.
 
 ## Parallel pipelines: `parallel()` (ADR-0039)
 

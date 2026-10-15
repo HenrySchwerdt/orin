@@ -1,0 +1,247 @@
+// JSX (ADR-0043): the pure parts of checking JSX. The expression checker (expr.or, section "JSX") walks the element
+// tree; this file holds the HTML rules it applies (element and attribute classes, escaping of static text at compile
+// time), the lookup of the std:html library the generated code calls, and the fused output buffer `JsxOut`.
+//
+// Lowering: a JSX element is one string built by appending pieces, `((p0 + p1) + p2) + ..`, exactly like a template
+// literal (the lowering appends in place, `IStrAppend`), wrapped in the `Html` record of std:html. Adjacent static
+// pieces (tags, attribute names, static text, escaped at compile time) are merged into one literal, and nested HTML
+// elements are flattened into their parent's buffer: no tree, no virtual DOM, one buffer per JSX root. Only dynamic
+// values (escaped by std:html at run time) and component calls (a function call returning `Html`) are separate pieces.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Type, HExpr, HExprKind, BinOp } from "../hir";
+import { Env } from "./env";
+import { mk } from "./ops";
+
+// The unit of std:html (the loader resolves `std:html` to `$stdlib/html.or`).
+const HTML_UNIT: string = "$stdlib/html";
+
+// What the generated code of JSX uses from std:html: the `Html` record (one field `html: string`) and the functions
+// `escape`, `escapeUrl` (both `string -> string`) and `joinAll` (`Html[] -> string`).
+export type HtmlLib = { rec: usize; esc: usize; escUrl: usize; join: usize; };
+
+function unitIndex(env: Env, name: string): Option<usize> {
+  let i: usize = 0;
+  while (i < env.units.length) {
+    if (env.units[i].name == name) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function funcIndex(env: Env, qname: string): Option<usize> {
+  let i: usize = 0;
+  while (i < env.funcs.length) {
+    if (env.funcs[i].qname == qname && env.funcs[i].params.length == 1) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The id of the `Html` record of std:html, if the program loads std:html.
+export function htmlRecord(env: Env): Option<usize> {
+  let i: usize = 0;
+  while (i < env.records.length) {
+    if (env.records[i].name == HTML_UNIT + ".Html" && env.records[i].fields.length == 1) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The std:html parts JSX needs, or E0490 when the program does not load std:html (JSX is library-backed: the program
+// imports `Html` from it to declare components anyway).
+@Ensures(result.isOk() ==> result.unwrap().rec < env.records.length && result.unwrap().esc < env.funcs.length)
+@Ensures(result.isErr() ==> result.unwrapErr().code == "E0490")
+export function htmlLib(env: Env, span: Span): Result<HtmlLib, Diagnostic> {
+  const rec = htmlRecord(env);
+  const esc = funcIndex(env, HTML_UNIT + ".escape");
+  const escUrl = funcIndex(env, HTML_UNIT + ".escapeUrl");
+  const join = funcIndex(env, HTML_UNIT + ".joinAll");
+  if (unitIndex(env, HTML_UNIT).isNone() || rec.isNone() || esc.isNone() || escUrl.isNone() || join.isNone()) {
+    return Err(
+      diag(
+        "E0490",
+        span,
+        "JSX needs the std:html library; add `import { Html } from \"std:html\";` to this program",
+      ),
+    );
+  }
+  return Ok(HtmlLib { rec: rec.unwrap(), esc: esc.unwrap(), escUrl: escUrl.unwrap(), join: join.unwrap() });
+}
+
+// E0495 when record `rid` is the sealed `Html` of std:html and `unit` is not std:html itself: only JSX, `trustHtml`
+// and the functions of std:html construct or change an `Html`, so a value of that type is never unescaped text.
+export function sealedErr(env: Env, rid: usize, unit: usize, span: Span): Option<Diagnostic> {
+  const sealed = rid < env.records.length && env.records[rid].name == HTML_UNIT + ".Html";
+  if (!sealed || unit < env.units.length && env.units[unit].name == HTML_UNIT) {
+    return None;
+  }
+  return Some(
+    diag(
+      "E0495",
+      span,
+      "an `Html` value can only be built by JSX or std:html (`text`, `trustHtml`, ...) and cannot be changed",
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HTML rules
+// ---------------------------------------------------------------------------
+
+// The HTML escape of std:html `escape`, applied at compile time to static text and static attribute values: `&` `<`
+// `>` `"` `'` become `&amp;` `&lt;` `&gt;` `&quot;` `&#39;`, every other byte is kept. tests/next/run/jsx_escape_diff.or
+// checks that the two agree on every byte value.
+@Ensures(!result.includes("<") && !result.includes(">") && !result.includes("\"") && !result.includes("'"))
+@Ensures(result.length >= s.length)
+export function htmlEscapeStatic(s: string): string {
+  let parts: string[] = [];
+  let run: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    const rep = c == 38 ? "&amp;" : c == 60 ? "&lt;" : c == 62 ? "&gt;" : c == 34 ? "&quot;" : c == 39 ? "&#39;" : "";
+    if (rep.length > 0) {
+      parts.push(s.substring(run, i));
+      parts.push(rep);
+      run = i + 1;
+    }
+    i += 1;
+  }
+  parts.push(s.substring(run, s.length));
+  return parts.join("");
+}
+
+// Void elements: no closing tag, no children (`<br>`, `<img src=..>`).
+export function isVoidElement(name: string): bool {
+  return match (name) {
+    "area" => true,
+    "base" => true,
+    "br" => true,
+    "col" => true,
+    "embed" => true,
+    "hr" => true,
+    "img" => true,
+    "input" => true,
+    "link" => true,
+    "meta" => true,
+    "source" => true,
+    "track" => true,
+    "wbr" => true,
+    _ => false,
+  };
+}
+
+// Raw text elements: their content is not HTML, so escaping would not make a dynamic value safe there. Only static
+// text (and string literals) are allowed as children, written unescaped.
+export function isRawTextElement(name: string): bool {
+  return name == "script" || name == "style";
+}
+
+// Attributes whose value is a URL: a dynamic value goes through `escapeUrl` (an unsafe scheme such as `javascript:`
+// becomes a harmless constant).
+export function isUrlAttr(name: string): bool {
+  return match (name) {
+    "href" => true,
+    "src" => true,
+    "action" => true,
+    "formaction" => true,
+    "cite" => true,
+    "poster" => true,
+    "background" => true,
+    "manifest" => true,
+    "ping" => true,
+    "data" => true,
+    "xlink-href" => true,
+    _ => false,
+  };
+}
+
+// Event handler attributes (`onclick`, `onLoad`, ...): their value is JavaScript, so a dynamic value is refused.
+export function isEventAttr(name: string): bool {
+  return name.length > 2
+      && (name.charCodeAt(0) == 111 || name.charCodeAt(0) == 79)
+      && (name.charCodeAt(1) == 110 || name.charCodeAt(1) == 78);
+}
+
+// An HTML element name: a lower-case ASCII letter, then lower-case letters, digits and `-` (custom elements).
+export function isTagName(name: string): bool {
+  if (name.length == 0 || name.charCodeAt(0) < 97 || name.charCodeAt(0) > 122) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < name.length) {
+    const c = name.charCodeAt(i);
+    if (!(c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 45)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// An attribute name: an ASCII letter, then letters, digits, `-` and `_` (the lexer guarantees the shape except for a
+// leading `_`).
+export function isAttrName(name: string): bool {
+  if (name.length == 0) {
+    return false;
+  }
+  const c0 = name.charCodeAt(0);
+  return c0 >= 65 && c0 <= 90 || c0 >= 97 && c0 <= 122;
+}
+
+// ---------------------------------------------------------------------------
+// The fused output buffer
+// ---------------------------------------------------------------------------
+
+// The pieces of one JSX root so far: `parts` are string-typed HIR expressions in output order, `pending` the static
+// text after the last of them (not yet a piece, so that the next static text merges with it).
+export type JsxOut = { parts: HExpr[]; pending: string; };
+
+export function jsxOutNew(): JsxOut {
+  const ps: HExpr[] = [];
+  return JsxOut { parts: ps, pending: "" };
+}
+
+@Ensures(result.parts.length == o.parts.length && result.pending == o.pending + s)
+export function jsxOutStatic(o: JsxOut, s: string): JsxOut {
+  return JsxOut { parts: o.parts, pending: o.pending + s };
+}
+
+// Appends the dynamic piece `e` (of type string); the pending static text becomes a piece before it.
+@Ensures(result.pending == "")
+export function jsxOutDyn(o: JsxOut, e: HExpr, span: Span): JsxOut {
+  let ps = o.parts;
+  if (o.pending.length > 0) {
+    ps.push(mk(XStr(o.pending), TyString, span));
+  }
+  ps.push(e);
+  return JsxOut { parts: ps, pending: "" };
+}
+
+// The string of the whole buffer: the left-nested concatenation of the pieces (one literal if all were static).
+export function jsxOutFinish(o: JsxOut, span: Span): HExpr {
+  let ps = o.parts;
+  if (o.pending.length > 0 || ps.length == 0) {
+    ps.push(mk(XStr(o.pending), TyString, span));
+  }
+  let acc = ps[0];
+  let i: usize = 1;
+  while (i < ps.length) {
+    acc = mk(XBinary(OpAdd, acc, ps[i]), TyString, span);
+    i += 1;
+  }
+  return acc;
+}
+
+// Number of pieces of a finished buffer (for tests and `--fuse-report`-style statistics).
+export function jsxOutPieces(o: JsxOut): usize {
+  const extra: usize = o.pending.length > 0 ? 1 : 0;
+  return o.parts.length + extra;
+}
