@@ -1,0 +1,82 @@
+// Redundant `makeunique` removal (ADR-0038 addendum, lever 2, step T1). `makeunique x` on a local the ownership verifier
+// already proves `Unique` at that point is the identity at run time (the `rc == 1` path), so it is deleted.
+//
+// The fact is the verifier's own: the in-state of every block comes from `blockInStates` and each block is replayed with
+// the verifier's `Transfer`, so "Unique" here means exactly what `needUnique` accepts. The pass adds no rule and no state
+// of its own. Deleting the instruction cannot lose that fact for the instructions after it: on a `Unique` local the
+// instruction leaves the local `Unique`; it only kills the borrows rooted at the local, and a borrow that stays alive is
+// never read (the input verified, and a store or `makeunique` of the root still kills it). The result is re-verified like
+// the output of every pass (a wrongly deleted `makeunique` makes a later store fail with "requires ... to be Unique").
+
+import { MProgram, MFunction, MBlock, Instr } from "../mir";
+import { Transfer, State, stateOrDead, lsKind, blockInStates, KUnique } from "../verify";
+import { RewritePlan, withBody } from "./rewrite";
+import { passKept, fnWellFormed, instrCount } from "./wellformed";
+
+function isMakeUnique(i: Instr): bool {
+  return match (i) {
+    IMakeUnique(_) => true,
+    _ => false,
+  };
+}
+
+// The number of `makeunique` instructions of `f`.
+export function makeUniqueCount(f: MFunction): usize {
+  return f.blocks.reduce((n: usize, b: MBlock) => n + b.instrs.filter(isMakeUnique).length, 0);
+}
+
+// `blk` (block `b` of `f`, entered in the verifier state `st`) without the `makeunique` of a `Unique` local.
+function dropInBlock(prog: MProgram, f: MFunction, b: usize, st: Option<State>): MBlock {
+  const blk = f.blocks[b];
+  // a block that is not reached has no state to replay and keeps its instructions
+  if (st.isNone() || !blk.instrs.some(isMakeUnique)) {
+    return blk;
+  }
+  let plan = new RewritePlan(blk.instrs.length);
+  let rp = new Transfer(prog, f, b, 0, stateOrDead(st, f.locals.length), [], []);
+  let i: usize = 0;
+  while (i < blk.instrs.length) {
+    const ins = blk.instrs[i];
+    match (ins) {
+      IMakeUnique(x) => {
+        if (lsKind(rp.ls[x]) == KUnique) {
+          plan.remove(i);
+        }
+      },
+      _ => {},
+    }
+    rp.ins = i;
+    rp.step(ins);
+    i += 1;
+  }
+  return plan.apply(blk);
+}
+
+// `f` of `prog` without the `makeunique` instructions whose operand the verifier proves `Unique`.
+@Requires(fnWellFormed(prog, f))
+@Ensures(passKept(f, result) && result.blocks.length == f.blocks.length)
+@Ensures(makeUniqueCount(result) <= makeUniqueCount(f) && instrCount(result) <= instrCount(f))
+export function dropUniqueChecks(prog: MProgram, f: MFunction): MFunction {
+  if (makeUniqueCount(f) == 0) {
+    return f;
+  }
+  const states = blockInStates(prog, f);
+  let blocks: MBlock[] = [];
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    blocks.push(dropInBlock(prog, f, b, states[b]));
+    b += 1;
+  }
+  return withBody(f, f.locals, blocks);
+}
+
+// Every function of `p` through `dropUniqueChecks`.
+export function dropUniqueProgram(p: MProgram): MProgram {
+  return MProgram {
+    functions: p.functions.map(f => dropUniqueChecks(p, f)),
+    strings: p.strings,
+    main: p.main,
+    vtables: p.vtables,
+    inlineFns: p.inlineFns,
+  };
+}
