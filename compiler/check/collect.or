@@ -3,7 +3,7 @@
 // order (dependencies first), then declaration order.
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantDecl } from "../syntax";
+import { Ident, Item, TypeDeclBody, DAlias, DRecord, DUnion, FieldDecl, VariantDecl, AnnotationKind } from "../syntax";
 import { Type, Builtin, FieldDef, RecordDef, UnionDef, VariantDef, Local, Function, VTable, taskOpFromName } from "../hir";
 import { LoadedProgram, ImportTarget, ImportUnit, ImportStd, StdModule, StdFs, StdProcess, StdIo, StdClock } from "../loader";
 import {
@@ -168,6 +168,7 @@ export function collect(prog: LoadedProgram): Collected {
   let aliases: AliasInfo[] = [];
   let records: RecordDef[] = [];
   let recordSrc: RecordSrc[] = [];
+  let sealed: string[] = [];
   let unions: UnionDef[] = [];
   let unionSrc: UnionSrc[] = [];
   let funcs: FuncInfo[] = [];
@@ -229,6 +230,9 @@ export function collect(prog: LoadedProgram): Collected {
           }
         },
         IType(t) => {
+          if (t.annotations.some(a => match (a.kind) { ASealed => true, _ => false })) {
+            sealed.push(unit.name + "." + t.name.name);
+          }
           if (isBuiltinTypeName(t.name.name)) {
             diags.push(diag("E0304", t.name.span, "`" + t.name.name + "` is a built-in type name"));
           } else if (t.typeParams.length > 0) {
@@ -349,13 +353,21 @@ export function collect(prog: LoadedProgram): Collected {
     }
     // Imports and re-exports.
     let imp: usize = 0;
+    let oxUnit = -1;
     for (const item of unit.ast.items) {
       let isImport = false;
       let isReexport = false;
       let names: Ident[] = [];
       let path = "";
       match (item) {
-        IImport(d) => { isImport = true; names = d.names; path = d.path; },
+        IImport(d) => {
+          isImport = true;
+          names = d.names;
+          path = d.path;
+          if (d.provider && imp < unit.imports.length) {
+            match (unit.imports[imp]) { ImportUnit(t) => { oxUnit = t.toInt(); }, _ => {} }
+          }
+        },
         IReExport(d) => { isImport = true; isReexport = true; names = d.names; path = d.path; },
         _ => {}
       }
@@ -417,7 +429,7 @@ export function collect(prog: LoadedProgram): Collected {
         imp += 1;
       }
     }
-    units.push(UnitInfo { name: unit.name, file: unit.file, scope: scope });
+    units.push(UnitInfo { name: unit.name, file: unit.file, scope: scope, ox: oxUnit });
     exportsAll.push(exports);
     ui += 1;
   }
@@ -442,7 +454,8 @@ export function collect(prog: LoadedProgram): Collected {
     wrappers: new Map<string, usize>(),
     prelude: -1,
     mapUnit: -1,
-    parUnit: -1
+    parUnit: -1,
+    sealed: sealed
   };
   return Collected { env: env, recordSrc: recordSrc, unionSrc: unionSrc, diags: diags };
 }

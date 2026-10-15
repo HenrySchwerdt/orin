@@ -205,6 +205,24 @@ MUTANTS = [
     ("html", "document-wrong-doctype", "return \"<!DOCTYPE html>\" + h.html;", "return \"<!doctype>\" + h.html;"),
     ("html", "render-escapes", "  return h.html;\n}\n\n// A whole page", "  return escape(h.html);\n}\n\n// A whole page"),
     ("html", "isEmpty-short-is-empty", "return h.html.length == 0;\n}", "return h.html.length < 2;\n}"),
+    # ---- std:html, the OX provider literal `ox()` (ADR-0044 §5)
+    ("html", "provider-voidEnd-xml", "voidEnd: \">\",", "voidEnd: \"/>\","),
+    ("html", "provider-no-presence-attrs", "presenceAttrs: true,", "presenceAttrs: false,"),
+    ("html", "provider-wrap-escapes", "wrap: trustHtml,", "wrap: text,"),
+    ("html", "provider-embed-empty", "embed: render,", "embed: (h: Html) => \"\","),
+    ("html", "provider-embedAll-empty", "embedAll: joinAll,", "embedAll: (hs: Html[]) => \"\","),
+    ("html", "provider-text-unescaped", "text: escape,", "text: (s: string) => s,"),
+    ("html", "provider-attr-unescaped", "attr: escape,", "attr: (s: string) => s,"),
+    ("html", "provider-url-rule-no-sanitising", "convert: Some(escapeUrl),", "convert: Some(escape),"),
+    ("html", "provider-url-rule-drops-href", "names: [\"href\", ", "names: ["),
+    ("html", "provider-url-rule-drops-xlink", ", \"xlink-href\"]", "]"),
+    ("html", "provider-event-prefix-wrong", "prefix: \"on\"", "prefix: \"no\""),
+    ("html", "provider-event-attrs-dynamic", "prefix: \"on\", convert: None", "prefix: \"on\", convert: Some(escape)"),
+    ("html", "provider-escape-apostrophe-raw", "encoded: \"&#39;\" },", "encoded: \"'\" },"),
+    ("html", "provider-escape-lt-wrong", "encoded: \"&lt;\" },", "encoded: \"&gt;\" },"),
+    ("html", "provider-void-drops-wbr", "\"track\", \"wbr\"]", "\"track\"]"),
+    ("html", "provider-void-adds-p", "\"area\", \"base\"", "\"p\", \"area\", \"base\""),
+    ("html", "provider-rawtext-drops-style", "rawTextTags: [\"script\", \"style\"]", "rawTextTags: [\"script\"]"),
     ("text", "dedent-last-indent-wins", "      common = found ? commonPrefix(common, ind) : ind;", "      common = ind;"),
     ("text", "dedent-width-not-prefix", "  while (i < a.length && i < b.length && a.charCodeAt(i) == b.charCodeAt(i)) {", "  while (i < a.length && i < b.length) {"),
     ("text", "cr-not-blank", "    if (c != 32 && c != 9 && c != 13) {\n      return false;", "    if (c != 32 && c != 9) {\n      return false;"),
@@ -307,7 +325,7 @@ def run(orinc, test_file, extra, timeout=900):
 
 def std_mutant(orinc, mutant):
     """One mutant of a pure std module (see the module doc). Returns (row, output line, error message or None)."""
-    mods = ["bytes", "utf8", "collections", "http", "text", "html", "taskcore"]
+    mods = ["bytes", "utf8", "collections", "http", "text", "html", "ox", "taskcore"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     mod, name, old, new = mutant[:4]
     extra = mutant[4] if len(mutant) > 4 else ""

@@ -1,0 +1,484 @@
+// OX markup (ADR-0043, ADR-0044): the parts of checking markup that do not walk expressions. The expression checker
+// (expr.or, section "OX") walks the element tree; this file reads the file's OX provider (the literal returned by the
+// provider module's `ox()` function), applies the provider's rules (static encoding, void / raw-text elements,
+// attribute rules) and holds the fused output buffer `OxOut`.
+//
+// The compiler knows no library: everything a provider means by markup is in its `ox()` literal, of type
+// `std:ox.Markup<R>` (a serialiser: intrinsic elements become text in one fused buffer, wrapped into an R) or
+// `std:ox.Components<R>` (intrinsic elements are the provider's functions; text and lists become R through it).
+//
+// Lowering of a `Markup` root: one string built by appending pieces, `((p0 + p1) + p2) + ..`, exactly like a template
+// literal (the lowering appends in place, `IStrAppend`), passed to the provider's `wrap`. Adjacent static pieces (tags,
+// attribute names, static text encoded at compile time) are merged into one literal, and nested intrinsic elements are
+// flattened into their parent's buffer: no tree, no virtual DOM, one buffer per root.
+
+import { Span, Diagnostic, diag } from "../diag";
+import { Type, HExpr, HExprKind, BinOp, Builtin } from "../hir";
+import { Expr, ExprKind, FieldInit, StmtKind, Ident } from "../syntax";
+import { Env, globalVal, ValEnt } from "./env";
+import { mk } from "./ops";
+
+// The two provider kinds of std:ox.
+export const OX_MARKUP: int = 0;
+export const OX_COMPONENTS: int = 1;
+
+// One attribute rule of a `Markup` provider: attribute names (lower case) and a name prefix (lower case, "" = none)
+// it applies to, and the function a computed string value goes through (None: only a written value is allowed).
+export type OxRule = { names: string[]; prefix: string; convert: Option<usize>; };
+
+// One byte of static text and its encoding.
+export type OxEscape = { code: int; to: string; };
+
+// The provider of a file, read from its `ox()` literal. Function fields are function ids (Env.funcs); `result` is R.
+// `Markup` uses wrap .. presence, `Components` uses fragment and ctext.
+export type OxProvider = {
+  unit: usize;
+  kind: int;
+  result: Type;
+  wrap: usize;
+  embed: usize;
+  embedAll: usize;
+  text: usize;
+  attr: usize;
+  rules: OxRule[];
+  escapes: OxEscape[];
+  voidTags: string[];
+  voidEnd: string;
+  rawTextTags: string[];
+  presence: bool;
+  fragment: usize;
+  ctext: usize;
+};
+
+const NO_PROVIDER: string = "OX markup needs a provider: add `import ox from \"std:html\";` (or another provider module) to this file";
+
+// The OX provider of `unit`, or E0490: the file selects none, the module has no exported non-generic `ox()`, or `ox()`
+// does not return a provider literal.
+@Ensures(result.isErr() ==> result.unwrapErr().code == "E0490")
+export function oxProvider(env: Env, unit: usize, span: Span): Result<OxProvider, Diagnostic> {
+  const pu = env.units[unit].ox;
+  if (pu < 0) {
+    return Err(diag("E0490", span, NO_PROVIDER));
+  }
+  const u = pu.toUsize();
+  const mname = env.units[u].name;
+  const fid = match (globalVal(env, u, "ox")) {
+    Some(v) => match (v) {
+      VFunc(f) => f,
+      _ => env.funcs.length,
+    },
+    None => env.funcs.length,
+  };
+  if (fid >= env.funcs.length || env.funcs[fid].unit != u || !env.funcs[fid].decl.exported
+      || env.funcs[fid].params.length != 0) {
+    return Err(diag("E0490", span, "`" + mname + "` is not an OX provider: it must export `function ox()` returning a `std:ox` `Markup` or `Components` literal"));
+  }
+  const decl = env.funcs[fid].decl;
+  const bad = diag("E0490", decl.name.span, "the OX provider `ox()` of `" + mname + "` must consist of one `return` of a `Markup<..> { .. }` or `Components<..> { .. }` literal");
+  if (decl.body.stmts.length != 1) {
+    return Err(bad);
+  }
+  const lit = match (decl.body.stmts[0].kind) {
+    SReturn(r) => r,
+    _ => None,
+  };
+  if (lit.isNone()) {
+    return Err(bad);
+  }
+  let fields: FieldInit[] = [];
+  let kindName = "";
+  match (lit.unwrap().kind) {
+    ERecord(n, sp, fs) => {
+      if (sp.isNone()) {
+        kindName = n.name;
+        fields = fs;
+      }
+    },
+    ERecordT(n, _, sp, fs) => {
+      if (sp.isNone()) {
+        kindName = n.name;
+        fields = fs;
+      }
+    },
+    _ => {},
+  }
+  if (kindName != "Markup" && kindName != "Components") {
+    return Err(bad);
+  }
+  const r = new OxReader(env, u, mname, fields);
+  if (kindName == "Components") {
+    const frag = r.func("fragment")?;
+    return Ok(OxProvider {
+      unit: u, kind: OX_COMPONENTS, result: env.funcs[frag].ret,
+      wrap: 0, embed: 0, embedAll: 0, text: 0, attr: 0, rules: [], escapes: [], voidTags: [], voidEnd: "", rawTextTags: [],
+      presence: false, fragment: frag, ctext: r.func("text")?,
+    });
+  }
+  const wrap = r.func("wrap")?;
+  return Ok(OxProvider {
+    unit: u,
+    kind: OX_MARKUP,
+    result: env.funcs[wrap].ret,
+    wrap: wrap,
+    embed: r.func("embed")?,
+    embedAll: r.func("embedAll")?,
+    text: r.func("text")?,
+    attr: r.func("attr")?,
+    rules: r.rules()?,
+    escapes: r.escapes()?,
+    voidTags: r.strs(r.field("voidTags")?)?,
+    voidEnd: r.str(r.field("voidEnd")?)?,
+    rawTextTags: r.strs(r.field("rawTextTags")?)?,
+    presence: r.flag(r.field("presenceAttrs")?)?,
+    fragment: 0,
+    ctext: 0,
+  });
+}
+
+// Reads the fields of a provider literal (only literals and names of functions of the provider module).
+class OxReader {
+  env: Env;
+  unit: usize;
+  mname: string;
+  fields: FieldInit[];
+
+  constructor(env: Env, unit: usize, mname: string, fields: FieldInit[]) {
+    this.env = env;
+    this.unit = unit;
+    this.mname = mname;
+    this.fields = fields;
+  }
+
+  private bad(e: Expr, what: string): Diagnostic {
+    return diag("E0490", e.span, "the OX provider of `" + this.mname + "`: " + what + " must be written as a literal here");
+  }
+
+  field(name: string): Result<Expr, Diagnostic> {
+    for (const f of this.fields) {
+      if (f.name.name == name) {
+        return Ok(f.value);
+      }
+    }
+    return Err(diag("E0490", this.fields.length > 0 ? this.fields[0].span : Span { file: 0, start: 0, end: 0 }, "the OX provider of `" + this.mname + "` has no field `" + name + "`"));
+  }
+
+  // The function named by `e` (a non-generic function visible in the provider module).
+  fnOf(e: Expr): Result<usize, Diagnostic> {
+    match (e.kind) {
+      EIdent(id) => {
+        match (globalVal(this.env, this.unit, id.name)) {
+          Some(v) => {
+            match (v) {
+              VFunc(f) => {
+                return Ok(f);
+              },
+              _ => {},
+            }
+          },
+          None => {},
+        }
+      },
+      _ => {},
+    }
+    return Err(this.bad(e, "a function (the name of a non-generic function)"));
+  }
+
+  func(name: string): Result<usize, Diagnostic> {
+    return this.fnOf(this.field(name)?);
+  }
+
+  str(e: Expr): Result<string, Diagnostic> {
+    return match (e.kind) {
+      EStr(s) => Ok(s),
+      _ => Err(this.bad(e, "a string")),
+    };
+  }
+
+  flag(e: Expr): Result<bool, Diagnostic> {
+    return match (e.kind) {
+      EBool(b) => Ok(b),
+      _ => Err(this.bad(e, "a `bool`")),
+    };
+  }
+
+  private items(e: Expr): Result<Expr[], Diagnostic> {
+    return match (e.kind) {
+      EArray(xs) => Ok(xs),
+      _ => Err(this.bad(e, "an array")),
+    };
+  }
+
+  // A `string[]` literal; the strings are kept in lower case (names are compared ASCII case-insensitively).
+  strs(e: Expr): Result<string[], Diagnostic> {
+    let out: string[] = [];
+    for (const x of this.items(e)?) {
+      out.push(asciiLower(this.str(x)?));
+    }
+    return Ok(out);
+  }
+
+  private recFields(e: Expr, name: string): Result<FieldInit[], Diagnostic> {
+    return match (e.kind) {
+      ERecord(n, sp, fs) => sp.isNone() && n.name == name ? Ok(fs) : Err(this.bad(e, "an `" + name + "`")),
+      _ => Err(this.bad(e, "an `" + name + " { .. }`")),
+    };
+  }
+
+  private sub(fs: FieldInit[]): OxReader {
+    return new OxReader(this.env, this.unit, this.mname, fs);
+  }
+
+  rules(): Result<OxRule[], Diagnostic> {
+    let out: OxRule[] = [];
+    for (const x of this.items(this.field("rules")?)?) {
+      const r = this.sub(this.recFields(x, "AttrRule")?);
+      const cv = r.field("convert")?;
+      let conv: Option<usize> = None;
+      match (cv.kind) {
+        EIdent(id) => {
+          if (id.name != "None") {
+            return Err(this.bad(cv, "`Some(f)` or `None`"));
+          }
+        },
+        ECall(c, args) => {
+          const isSome = match (c.kind) { EIdent(id) => id.name == "Some", _ => false };
+          if (!isSome || args.length != 1) {
+            return Err(this.bad(cv, "`Some(f)` or `None`"));
+          }
+          conv = Some(this.fnOf(args[0])?);
+        },
+        _ => {
+          return Err(this.bad(cv, "`Some(f)` or `None`"));
+        },
+      }
+      out.push(OxRule { names: r.strs(r.field("names")?)?, prefix: asciiLower(r.str(r.field("prefix")?)?), convert: conv });
+    }
+    return Ok(out);
+  }
+
+  escapes(): Result<OxEscape[], Diagnostic> {
+    let out: OxEscape[] = [];
+    for (const x of this.items(this.field("escapes")?)?) {
+      const r = this.sub(this.recFields(x, "Escape")?);
+      const fe = r.field("char")?;
+      const one = r.str(fe)?;
+      if (one.length != 1) {
+        return Err(diag("E0490", fe.span, "the OX provider of `" + this.mname + "`: an `Escape` replaces exactly one byte"));
+      }
+      out.push(OxEscape { code: one.charCodeAt(0), to: r.str(r.field("encoded")?)? });
+    }
+    return Ok(out);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sealed records (`@Sealed`, ADR-0044)
+// ---------------------------------------------------------------------------
+
+// E0495 when record `rid` is (an instance of) a `@Sealed` record type and `unit` is not the module that declares it:
+// only that module builds or changes values of the type (std:html's `Html` is never unescaped text).
+export function sealedErr(env: Env, rid: usize, unit: usize, span: Span): Option<Diagnostic> {
+  if (rid >= env.records.length || env.sealed.length == 0) {
+    return None;
+  }
+  const full = env.records[rid].name;
+  const lt = full.indexOf("<");
+  const qname = lt.isSome() ? full.substring(0, lt.unwrap()) : full;
+  if (!env.sealed.some(x => x == qname)) {
+    return None;
+  }
+  let dot = qname.length;
+  let i: usize = 0;
+  while (i < qname.length) {
+    if (qname.charCodeAt(i) == 46) {
+      dot = i;
+    }
+    i += 1;
+  }
+  const owner = dot < qname.length ? qname.substring(0, dot) : "";
+  const tname = dot < qname.length ? qname.substring(dot + 1, qname.length) : qname;
+  if (unit < env.units.length && env.units[unit].name == owner) {
+    return None;
+  }
+  return Some(
+    diag(
+      "E0495",
+      span,
+      "`" + tname + "` is sealed: only its module `" + owner + "` can build a `" + tname
+          + "` or change its fields (use that module's functions)",
+    ),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Provider rules
+// ---------------------------------------------------------------------------
+
+export function asciiLower(s: string): string {
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c >= 65 && c <= 90) {
+      let out = s.substring(0, i);
+      let j = i;
+      while (j < s.length) {
+        const d = s.charCodeAt(j);
+        out += d >= 65 && d <= 90 ? String.fromCharCode(d + 32) : s.charAt(j);
+        j += 1;
+      }
+      return out;
+    }
+    i += 1;
+  }
+  return s;
+}
+
+function listed(xs: string[], name: string): bool {
+  const n = asciiLower(name);
+  return xs.some(x => x == n);
+}
+
+export function oxIsVoid(p: OxProvider, tag: string): bool {
+  return listed(p.voidTags, tag);
+}
+
+export function oxIsRawText(p: OxProvider, tag: string): bool {
+  return listed(p.rawTextTags, tag);
+}
+
+// The rule for attribute `name`: the first rule that lists it or whose (non-empty) prefix it starts with, ASCII
+// case-insensitively.
+export function oxRuleFor(p: OxProvider, name: string): Option<OxRule> {
+  const n = asciiLower(name);
+  for (const r of p.rules) {
+    if (r.names.some(x => x == n) || r.prefix.length > 0 && n.startsWith(r.prefix)) {
+      return Some(r);
+    }
+  }
+  return None;
+}
+
+// The provider's static encoding of `s`, applied at compile time to static text and static attribute values: every
+// byte listed in `escapes` becomes its replacement, every other byte is kept. A provider tests that this agrees with
+// its run-time encoding (tests/next/run/ox_escape_diff.or for std:html).
+@Ensures(result.length >= s.length || p.escapes.length > 0)
+export function oxEncodeStatic(p: OxProvider, s: string): string {
+  let parts: string[] = [];
+  let run: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    for (const e of p.escapes) {
+      if (e.code == c) {
+        parts.push(s.substring(run, i));
+        parts.push(e.to);
+        run = i + 1;
+        break;
+      }
+    }
+    i += 1;
+  }
+  if (parts.length == 0) {
+    return s;
+  }
+  parts.push(s.substring(run, s.length));
+  return parts.join("");
+}
+
+// An intrinsic element name: a lower-case ASCII letter, then letters, digits, `-` and `_` (the notation's rule; a
+// component name starts with an upper-case letter).
+export function isTagName(name: string): bool {
+  if (name.length == 0 || name.charCodeAt(0) < 97 || name.charCodeAt(0) > 122) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < name.length) {
+    const c = name.charCodeAt(i);
+    if (!(c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 45 || c == 95)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// An attribute name: an ASCII letter, then letters, digits, `-` and `_` (the lexer guarantees the shape except for a
+// leading `_`).
+export function isAttrName(name: string): bool {
+  if (name.length == 0) {
+    return false;
+  }
+  const c0 = name.charCodeAt(0);
+  return c0 >= 65 && c0 <= 90 || c0 >= 97 && c0 <= 122;
+}
+
+// ---------------------------------------------------------------------------
+// The fused output buffer
+// ---------------------------------------------------------------------------
+
+// The pieces of one markup root so far: `parts` are string-typed HIR expressions in output order, `pending` the static
+// text after the last of them (not yet a piece, so that the next static text merges with it).
+export type OxOut = { parts: HExpr[]; pending: string; };
+
+export function oxOutNew(): OxOut {
+  const ps: HExpr[] = [];
+  return OxOut { parts: ps, pending: "" };
+}
+
+@Ensures(result.parts.length == o.parts.length && result.pending == o.pending + s)
+export function oxOutStatic(o: OxOut, s: string): OxOut {
+  return OxOut { parts: o.parts, pending: o.pending + s };
+}
+
+// Appends the dynamic piece `e` (of type string); the pending static text becomes a piece before it.
+@Ensures(result.pending == "")
+export function oxOutDyn(o: OxOut, e: HExpr, span: Span): OxOut {
+  let ps = o.parts;
+  if (o.pending.length > 0) {
+    ps.push(mk(XStr(o.pending), TyString, span));
+  }
+  ps.push(e);
+  return OxOut { parts: ps, pending: "" };
+}
+
+// Capacity hint of a root (ADR-0044): the buffer starts with room for the static bytes plus this many bytes per
+// dynamic piece, so that the common root is built without a regrowth. Measured on the html benchmark (docs/benchmarks.md).
+const OX_DYN_ESTIMATE: usize = 16;
+
+// The string of the whole buffer: the left-nested concatenation of the pieces (one literal if all were static). A root
+// with a dynamic piece starts from `withCapacity(hint)`, an empty owned string sized for the whole output, so every piece
+// is appended in place into it.
+export function oxOutFinish(o: OxOut, span: Span): HExpr {
+  let ps = o.parts;
+  if (o.pending.length > 0 || ps.length == 0) {
+    ps.push(mk(XStr(o.pending), TyString, span));
+  }
+  let acc = ps[0];
+  let i: usize = 1;
+  if (ps.length > 1) {
+    let hint: usize = 0;
+    for (const p of ps) {
+      match (p.kind) {
+        XStr(t) => {
+          hint += t.length;
+        },
+        _ => {
+          hint += OX_DYN_ESTIMATE;
+        },
+      }
+    }
+    acc = mk(XBuiltin(BStrWithCapacity, [mk(XInt(hint.toInt()), TyUsize, span)]), TyString, span);
+    i = 0;
+  }
+  while (i < ps.length) {
+    acc = mk(XBinary(OpAdd, acc, ps[i]), TyString, span);
+    i += 1;
+  }
+  return acc;
+}
+
+// Number of pieces of a finished buffer (for tests and statistics).
+export function oxOutPieces(o: OxOut): usize {
+  const extra: usize = o.pending.length > 0 ? 1 : 0;
+  return o.parts.length + extra;
+}

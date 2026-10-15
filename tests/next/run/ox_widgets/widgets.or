@@ -1,0 +1,156 @@
+// A `Components<Widget>` OX provider (ADR-0044 §3): markup builds a tree of widgets, not text. No std:html anywhere.
+// A file that says `import ox from "./widgets";` gets: an intrinsic tag `t` is the function `t` of this module, text
+// where a Widget is expected is `plain(text)`, several children where one Widget is expected are `group([..])`.
+import { Components } from "std:ox";
+
+export type Widget =
+  WText(string)
+  | WLabel(string)
+  | WSpacer(int)
+  | WButton(string, () => void)
+  | WColumn(int, Widget[])
+  | WGroup(Widget[])
+  | WDialog(string, Widget, Widget[], Option<Widget>);
+
+export function ox(): Components<Widget> {
+  return Components<Widget> { fragment: group, text: plain };
+}
+
+// The two functions of the provider literal.
+export function plain(value: string): Widget {
+  return WText(value);
+}
+
+export function group(items: Widget[]): Widget {
+  return WGroup(items);
+}
+
+// Intrinsic elements: `<label value="x" />`, `<spacer size={2} />`, `<button title="Ok" onClick={f} />`,
+// `<column spacing={1}>..</column>`, `<dialog title=".." header={h} footer={f}>..</dialog>`.
+export function label(value: string): Widget {
+  return WLabel(value);
+}
+
+export function spacer(size: int): Widget {
+  return WSpacer(size);
+}
+
+export function button(title: string, onClick: () => void): Widget {
+  return WButton(title, onClick);
+}
+
+export function column(spacing: int, children: Widget[]): Widget {
+  return WColumn(spacing, children);
+}
+
+export function dialog(title: string, header: Widget, children: Widget[], footer: Option<Widget>): Widget {
+  return WDialog(title, header, children, footer);
+}
+
+// ---------------------------------------------------------------------------
+// A deterministic rendering and a click simulation
+// ---------------------------------------------------------------------------
+
+function pad(depth: int): string {
+  let s = "";
+  let i = 0;
+  while (i < depth) {
+    s += "  ";
+    i += 1;
+  }
+  return s;
+}
+
+function quote(s: string): string {
+  return "\"" + s + "\"";
+}
+
+function nested(head: string, kids: Widget[], depth: int): string[] {
+  let out: string[] = [pad(depth) + head];
+  for (const k of kids) {
+    for (const l of linesOf(k, depth + 1)) {
+      out.push(l);
+    }
+  }
+  return out;
+}
+
+function section(name: string, kids: Widget[], depth: int): string[] {
+  let out: string[] = [pad(depth) + name];
+  for (const k of kids) {
+    for (const l of linesOf(k, depth + 1)) {
+      out.push(l);
+    }
+  }
+  return out;
+}
+
+function dialogLines(title: string, header: Widget, body: Widget[], footer: Option<Widget>, depth: int): string[] {
+  let out: string[] = [pad(depth) + "dialog " + quote(title)];
+  for (const l of section("header:", [header], depth + 1)) {
+    out.push(l);
+  }
+  for (const l of section("body:", body, depth + 1)) {
+    out.push(l);
+  }
+  match (footer) {
+    Some(f) => {
+      for (const l of section("footer:", [f], depth + 1)) {
+        out.push(l);
+      }
+    },
+    None => {},
+  }
+  return out;
+}
+
+function linesOf(w: Widget, depth: int): string[] {
+  return match (w) {
+    WText(s) => [pad(depth) + "text " + quote(s)],
+    WLabel(s) => [pad(depth) + "label " + quote(s)],
+    WSpacer(n) => [pad(depth) + "spacer " + n.toString()],
+    WButton(t, f) => [pad(depth) + "button " + quote(t)],
+    WColumn(sp, kids) => nested("column spacing=" + sp.toString(), kids, depth),
+    WGroup(kids) => nested("group", kids, depth),
+    WDialog(t, h, b, f) => dialogLines(t, h, b, f, depth),
+  };
+}
+
+export function show(w: Widget): string {
+  return linesOf(w, 0).join("\n");
+}
+
+function pressAll(ws: Widget[]): void {
+  for (const w of ws) {
+    press(w);
+  }
+}
+
+// Clicks every button of the tree, in tree order (header, body, footer for a dialog).
+export function press(w: Widget): void {
+  match (w) {
+    WText(s) => {},
+    WLabel(s) => {},
+    WSpacer(n) => {},
+    WButton(t, f) => {
+      console.log("press " + quote(t));
+      f();
+    },
+    WColumn(sp, kids) => {
+      pressAll(kids);
+    },
+    WGroup(kids) => {
+      pressAll(kids);
+    },
+    WDialog(t, h, b, f) => {
+      press(h);
+      pressAll(b);
+      match (f) {
+        Some(x) => {
+          press(x);
+        },
+        None => {},
+      }
+    },
+  }
+}

@@ -20,7 +20,7 @@ claim about Orin in general.
   Build times are a single, uncached-for-C/Orin but Go-build-cache-warm measurement and are only indicative.
 - **Orin counters**: `ORIN_STATS=1 ./prog` prints a one-line JSON summary to stderr at exit (allocations by
   kind, frees, retains, releases, COW copies vs in-place `make_unique` hits, array/string growth
-  reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). Counters are plain increments compiled in always.
+  reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). The counters are a **build-time option**: compile the generated C and the runtime with `-DORIN_STATS_ENABLED` (e.g. `cc -O2 -DORIN_STATS_ENABLED prog.c runtime/orin_runtime.c platform/orin_platform.c`); the default build compiles the hot ones (allocations, frees, retains, releases, COW, growth, live/peak bytes) out, so `ORIN_STATS=1` then reports `"counters":"cold"` with those fields 0. The cold ones (`file_opens`/`file_closes`, `transfer_moves`/`transfer_copies`, `tasks_spawned`) and `live_objs_at_exit` are always kept. `tools/bench.py` times a build without the option and takes the counters from a second binary built with it; `tools/alloc_census.py` and `tools/test_resources.sh` build with it. `orin test` and `orin compile` have no flag for it (the driver does not invoke the C compiler for builds); pass the define on your own `cc` line.
   **Per allocation site** (opt-in, not compiled into normal builds): `orin2 compile --stats-sites` plus a runtime built with
   `-DORIN_SITE_STATS`, then `ORIN_STATS=sites` reports allocations, bytes, retains, releases and COW copies per MIR instruction;
   `tools/alloc_census.py` runs it on every benchmark, the HTTP server and the self-compile (docs/perf/alloc-census.md).
@@ -699,7 +699,7 @@ page lengths (about 144.6 MB in all) and hashes the last page. Every 7th name co
 characters are escaped) and every 11th URL is `javascript:alert(i)`, which the Go `html/template`-style rule replaces by
 `about:invalid#orin-unsafe-url`. All programs print byte-identical `bytes`, `hash` and `head` lines.
 
-- `bench/html/main.or`: **JSX** (ADR-0043), a `Row` and a `Page` component; each component is one fused buffer.
+- `bench/html/main.or`: **OX** markup with `std:html` (ADR-0043, ADR-0044), a `Row` and a `Page` component; each component is one fused buffer.
 - `bench/html_hand/main.or`: the same page **hand-written** in Orin, plain concatenation into one accumulating string
   (`out += ...`) with the same `std:html` `escape` / `safeUrl` (Orin-only row).
 - `bench/html/main.c`: one growing buffer, `memcpy`, an escape loop copying runs; `main.go`: `strings.Builder`.
@@ -708,17 +708,26 @@ characters are escaped) and every 11th URL is `javascript:alert(i)`, which the G
 
 | program | Orin C backend | Orin LLVM backend | Go | C |
 |---|---:|---:|---:|---:|
-| executed instructions, JSX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
+| executed instructions, OX (`html`) | 3.10 G | 3.00 G | | 1.58 G |
 | executed instructions, hand-written Orin (`html_hand`) | 4.71 G | 4.63 G | | |
-| wall, JSX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
-| allocations, JSX: strings / `Html` records | 2.74 M / 0.80 M | | | |
+| wall, OX (5 runs, median) | 0.286 s | 0.298 s | 0.597 s | 0.173 s |
+| allocations, OX: strings / `Html` records | 3.54 M / 0.80 M | | | |
+| `string_grows`, OX | 0.25 M | | | |
 | allocations, hand-written: strings | 5.03 M | | | |
 
-JSX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
-parts are merged at compile time and appended into one buffer, while `out += a + b + c` builds a temporary per
-operator. It is 2.5x the instructions of C. What remains, in order (ADR-0043 "Not done"): geometric re-growth of each
-buffer (`string_grows` 4.2 M; a capacity hint from the known static length), the temporary string of every converted
-integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` + `joinAll`).
+OX executes 34 % fewer instructions than the hand-written concatenation: its static parts are merged at compile time and
+appended into one pre-sized buffer, while `out += a + b + c` builds a temporary per operator. It is 2.0x the instructions
+of C. The buffer of each root starts from a capacity hint (ADR-0044, "Pre-sized buffer": static bytes plus 16 per dynamic
+piece), which cut `string_grows` from 4.23 M to 0.25 M and the instructions from 3.99 G (C backend; 3.88 G LLVM) to
+3.10 G (3.00 G); wall time on the same machine moved from 0.427 s / 0.392 s to 0.286 s / 0.298 s. The cost is
+0.8 M more string allocations (3.54 M against 2.74 M: a root whose first piece is a dynamic string used to append into
+that string, and now appends into a new buffer) and a higher peak (2.3 MiB against 1.7 MiB live); a per-piece estimate
+of 32 changed the instructions by 0.1 % only. What remains, in order (ADR-0043 "Not done"): the temporary string of every
+converted integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` +
+`joinAll`).
+Before the capacity hint, the generic provider mechanism (ADR-0044) had changed none of this: re-measured on the OX branch the counts were identical
+(3,991,618,263 / 4,711,876,261 instructions, same allocation counters), since `std:html`'s rules are applied at compile
+time and its `@Inline` functions are the same calls as before.
 
 ## Benchmark workflow (CI), metrics and history
 
@@ -772,9 +781,12 @@ compare such counts with full-size ones), `bench/<name>/instructions.skip` holds
 skipped, because valgrind serialises threads.
 
 **Parallel speedup.** `bench/parallel_*/` and `bench/streams_parallel/` (picked up automatically when present) take the
-number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. There is no
-runtime knob: std:task has no thread pool, every task is one OS thread, so the worker count is the `parts` argument of
-`parallelMap` (or the number of tasks the program spawns). Each program runs with 1, 2 and 4 threads (`--threads`); the output
+number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. std:task has
+no thread pool, every task is one OS thread, so for `bench/parallel_*` the worker count is the `parts` argument of
+`parallelMap` (or the number of tasks the program spawns). `bench/streams_parallel` uses `parallel()`, whose pool reads
+`ORIN_THREADS` (also set); it picks its workload by its first argument and runs `parheavy` in this section (`PAR_ARGV` in
+`tools/bench.py`; before 2026-10-15 it got the thread count as its workload argument and measured the default workload
+with the default pool size). Each program runs with 1, 2 and 4 threads (`--threads`); the output
 must not depend on the count. `bench/parallel_collatz` is the Collatz-steps map of `examples/parallel_map.or` over
 1..2,000,000 with deterministic output. With more threads than free cores the speedup flattens; `cpu_ratio` above 1 shows the
 cost of copying chunks, joining and oversubscription.

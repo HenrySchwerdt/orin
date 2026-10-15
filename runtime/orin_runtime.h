@@ -179,8 +179,14 @@ void orin_file_write(int64_t h, OrinObj *s);
 void orin_file_write_line(int64_t h, OrinObj *s);     /* s followed by "\n" */
 void orin_file_flush(int64_t h);
 
-/* Opt-in statistics (plain counters, always compiled in; printed as one JSON line on stderr at
- * exit only when the environment variable ORIN_STATS=1). retains/releases count only
+/* Opt-in statistics, a BUILD-TIME option (ADR-0038 lever 2): the hot counters (allocations, frees, retains, releases, COW copies and
+ * in-place reuses, buffer growths, live and peak bytes / objects) are updated only when the runtime and the generated C are compiled
+ * with -DORIN_STATS_ENABLED (implied by -DORIN_SITE_STATS); otherwise every update is an empty macro and release builds pay nothing.
+ * The cold counters stay always on (file opens / closes, values moved / copied between tasks, which std:task's movedCount() and
+ * copiedCount() return, tasks spawned), and so does the live-object balance (live_objs_at_exit, used by the leak checks). One JSON
+ * line is printed on stderr at exit only when the environment variable ORIN_STATS=1; its "counters" field says "all" (option on) or
+ * "cold" (option off: the hot counters read 0). tools/bench.py, tools/alloc_census.py and tools/test_resources.sh build with the
+ * option; `orin test` and the default build do not. retains/releases count only
  * non-immortal objects. Bytes are approximate (object + buffer capacity, excluding malloc
  * overhead). */
 typedef struct OrinStats {
@@ -206,6 +212,16 @@ typedef struct OrinStats {
 #define ORIN_TLS_MODEL
 #endif
 extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
+#if defined(ORIN_SITE_STATS) && !defined(ORIN_STATS_ENABLED)
+#define ORIN_STATS_ENABLED 1
+#endif
+#ifdef ORIN_STATS_ENABLED
+#define ORIN_STAT(...) do { __VA_ARGS__; } while (0)
+#define ORIN_STAT_ON 1
+#else
+#define ORIN_STAT(...) ((void)0)
+#define ORIN_STAT_ON 0
+#endif
 
 /* Allocation-site census (opt-in, docs/perf/alloc-census.md, tools/alloc_census.py). Compiled in only when BOTH the generated C
  * and the runtime are built with ORIN_SITE_STATS: the compiler (`orin2 compile --stats-sites`) then defines it at the top of
@@ -232,7 +248,7 @@ void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur
 static inline void orin_retain(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
-        orin_stats.retains++;
+        ORIN_STAT(orin_stats.retains++);
         ORIN_SITE_RC(o, ORIN_SITE_RETAIN);
     }
 }
@@ -240,7 +256,7 @@ static inline void orin_retain(OrinObj *o) {
 static inline OrinObj *orin_dup(OrinObj *o) {
     if (ORIN_LIKELY(o->rc > 0)) {
         o->rc++;
-        orin_stats.retains++;
+        ORIN_STAT(orin_stats.retains++);
         ORIN_SITE_RC(o, ORIN_SITE_RETAIN);
     }
     return o;
@@ -248,7 +264,7 @@ static inline OrinObj *orin_dup(OrinObj *o) {
 /* NULL-safe. */
 static inline void orin_release(OrinObj *o) {
     if (o && o->rc > 0) {
-        orin_stats.releases++;
+        ORIN_STAT(orin_stats.releases++);
         ORIN_SITE_RC(o, ORIN_SITE_RELEASE);
         if (ORIN_UNLIKELY(--o->rc == 0)) orin_destroy(o);
     }
@@ -259,7 +275,7 @@ static inline void orin_release(OrinObj *o) {
 OrinObj *orin_make_unique_slow(OrinObj *o); /* internal: the copying path */
 static inline OrinObj *orin_make_unique(OrinObj *o) {
     if (ORIN_LIKELY(o->rc == 1)) {
-        orin_stats.cow_inplace++;
+        ORIN_STAT(orin_stats.cow_inplace++);
         ORIN_SITE_RC(o, ORIN_SITE_COW_INPLACE);
         return o;
     }
@@ -411,6 +427,12 @@ uint64_t orin_res_unwrap_err(OrinObj *o);
 /* ---------------------------------------------------------------- strings (all byte strings) */
 
 OrinObj *orin_str_new(const char *p, uint64_t n); /* owned copy */
+/*@ orin_str_with_capacity(cap): a new, empty buffer for appending (OX markup roots, ADR-0044).
+    ensures  \result is a fresh unique string (rc == 1), len(\result) == 0, capacity >= min(cap, ORIN_STR_HINT_MAX),
+             so orin_str_append onto it is in place (no growth) while the total length stays within that capacity;
+    assigns  the heap (one allocation). cap is a hint only: it never changes the value, and is clamped to 1 MiB. */
+#define ORIN_STR_HINT_MAX ((uint64_t)1 << 20)
+OrinObj *orin_str_with_capacity(uint64_t cap);
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b);
 /* a += b. CONSUMES a, returns owned result; in place (amortised O(1)) when a is unique. */
 OrinObj *orin_str_append(OrinObj *a, OrinObj *b);

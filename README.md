@@ -33,8 +33,9 @@ experience, not a misleading promise of full ecosystem compatibility.
 ### What you can do today
 
 - Compile a statically typed Orin program to native code (C backend and an LLVM IR backend).
-- Render HTML on the server with JSX: `<Card title={t}>{body}</Card>` compiles to one fused string buffer, every
-  dynamic value escaped by construction ([docs/jsx.md](docs/jsx.md), experimental).
+- Write markup with OX, TSX-like syntax whose meaning a library provides: with `import ox from "std:html";`,
+  `<Card title={t}>{body}</Card>` compiles to one fused string buffer, every dynamic value escaped by construction; other
+  providers build widget trees or XML ([docs/ox.md](docs/ox.md), experimental).
 - Use classes, interfaces, generics, closures, value-semantics collections, Option/Result,
   modules and packages.
 - Check ownership in MIR, run tests, use contract clauses and verify a supported pure

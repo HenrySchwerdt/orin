@@ -17,7 +17,7 @@ For every directory bench/<name>/ containing main.or / main.go / main.c it
   * runs each binary once to verify that the stdout (the checksum lines) is identical,
   * runs each binary N times (plus one unrecorded warm-up) and records wall time and peak RSS
     (ru_maxrss of the child, via wait4),
-  * runs the Orin binary once more with ORIN_STATS=1 to collect the runtime counters.
+  * runs a second Orin binary, built with -DORIN_STATS_ENABLED, once with ORIN_STATS=1 to collect the runtime counters.
 A benchmark may have no Go and / or C counterpart (std:http, std:collections: bench/http_parse, bench/sortedmap); it is
 then an Orin-only row (n/a in the other columns, no output cross-check).
 It also times "orin2 compiles compiler/main.or" (the self-hosting workload) and prints Markdown.
@@ -255,11 +255,22 @@ def count_instructions(cmd, timeout):
 # of worker threads as its FIRST command-line argument (std:task has no thread pool and no global knob: one task is one
 # OS thread, so the worker count is the `parts` of `parallelMap` or the number of tasks the program spawns), and the same
 # number is also in the environment as ORIN_BENCH_THREADS for programs that read it there. The output must not depend on
-# the count (checked against the 1-thread run). A parallel directory without main.go / main.c is measured only in the
+# the count (checked against the 1-thread run). Programs whose worker count is the `parallel()` pool's read ORIN_THREADS,
+# which is set too; PAR_ARGV gives the argv of those that pick a workload by their first argument. A parallel directory without main.go / main.c is measured only in the
 # parallel section; one with counterparts is also a normal row (run without arguments).
 
 def is_parallel(name):
     return name.startswith("parallel_") or name == "streams_parallel"
+
+
+# Parallel benchmarks that do not follow the argument convention: their argv in the parallel section. Their worker count is
+# the `parallel()` pool's, which reads ORIN_THREADS (set for every parallel run). bench/streams_parallel picks its workload by
+# its first argument; `parheavy` is the compute-bound one, where a speedup can show.
+PAR_ARGV = {"streams_parallel": ["parheavy"]}
+
+
+def par_cmd(exe, name, threads):
+    return [exe] + PAR_ARGV.get(name, [str(threads)])
 
 
 def main():
@@ -362,7 +373,11 @@ def main():
                     continue
                 n, why = count_instructions([res[lang]["exe"]] + iargs, args.instr_timeout)
                 instr[name][lang] = ({"count": n, "args": iargs} if iargs else {"count": n}) if n is not None else {"skipped": why}
-        _, _, _, _, se = run_once([res["orin"]["exe"]], env={"ORIN_STATS": "1"})
+        # the counters are a build-time option (-DORIN_STATS_ENABLED); the timed binary is built without them, so the counter run
+        # uses a second binary of the same C
+        sh(["cc"] + CFLAGS + ["-DORIN_STATS_ENABLED", "-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "platform/orin_platform.c",
+                              "-lm", "-o", out + "/orin_stats"])
+        _, _, _, _, se = run_once([os.path.join(ROOT, out, "orin_stats")], env={"ORIN_STATS": "1"})
         stats[name] = json.loads(se.decode().strip().splitlines()[-1])["orin_stats"]
         results[name] = res
         # Java and Rust counterparts (only where the toolchain is installed and the source exists)
@@ -402,7 +417,7 @@ def main():
     if run_selfcompile:
         out = os.path.join("build", "bench", "selfcompile")
         os.makedirs(os.path.join(ROOT, out), exist_ok=True)
-        # rebuild orin2 from its own C with the *current* runtime so counters are available.
+        # rebuild orin2 from its own C with the *current* runtime (timed build: no counters; a second build with them follows)
         stage = os.path.join(out, "orin2_cur")
         bt = timed_build([[orinc, "compile", "compiler/main.or", "-o", out + "/orin2_cur.c"],
                           ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin2_cur.c", "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", stage]])
@@ -415,7 +430,9 @@ def main():
         digest = hashlib.sha256(open(os.path.join(ROOT, out, "out.c"), "rb").read()).hexdigest()
         ref = os.path.join(ROOT, "build", "bootstrap", "stage2.c")
         same = os.path.exists(ref) and hashlib.sha256(open(ref, "rb").read()).hexdigest() == digest
-        _, _, _, _, se = run_once(cmd, env={"ORIN_STATS": "1"})
+        sh(["cc"] + CFLAGS + ["-DORIN_STATS_ENABLED", "-I", "runtime", out + "/orin2_cur.c", "runtime/orin_runtime.c",
+                              "platform/orin_platform.c", "-o", out + "/orin2_stats"])
+        _, _, _, _, se = run_once([os.path.join(ROOT, out, "orin2_stats")] + cmd[1:], env={"ORIN_STATS": "1"})
         st = json.loads(se.decode().strip().splitlines()[-1])["orin_stats"]
         selfc.update({"stats": st, "same": same, "size": sizes(os.path.join(ROOT, stage)), "build_s": bt,
                       "csize": os.path.getsize(os.path.join(ROOT, out, "out.c"))})
@@ -437,8 +454,8 @@ def main():
         rows = {}
         ref_out = None
         for t in threads:
-            cmd = [exe, str(t)]
-            env = {"ORIN_BENCH_THREADS": str(t)}
+            cmd = par_cmd(exe, name, t)
+            env = {"ORIN_BENCH_THREADS": str(t), "ORIN_THREADS": str(t)}
             _, _, rc, so, se = run_once(cmd, env=env)
             if rc != 0:
                 sys.exit("%s with %d threads exited %d: %s" % (name, t, rc, se.decode("utf-8", "replace")))

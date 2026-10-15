@@ -1,59 +1,88 @@
 # Allocation census
 
-Status: measurement, 2026-10-14. Related: ADR-0038 (performance model, its 2026-10-14 addendum and §8), docs/benchmarks.md.
+Status: measurement, re-run 2026-10-15 on main `46b9834` (after the performance wave: #62 unboxing, #64 packed verifier state,
+#65 census quick wins, #67 borrow inference, #68 concat reuse, #66, #69 LLVM gate 1). First run 2026-10-14 on `7431756`.
+Related: ADR-0038 (performance model, its 2026-10-14 addendum and §8), docs/benchmarks.md.
 Reproduce: `./tools/bootstrap.sh && python3 tools/alloc_census.py run && python3 tools/alloc_census.py report`.
 
 Where do the heap allocations and the reference-count operations of Orin programs come from, and which transformation of
 ADR-0038 would remove each of them? This report counts them per allocation site on every benchmark, on the HTTP server under
 load and on the self-compile, and ranks the transformations by what they would remove. All numbers are counts, which are
-deterministic; nothing here is a time measurement.
+deterministic; nothing here is a time measurement (the time and instruction numbers in the summary come from
+`tools/bench.py --instructions`, see below).
 
-## Summary: the ranking for the performance wave
+## Summary: what the wave did, and the ranking now
 
-18 workloads, 85.7M allocations, 393M retains, 479M releases, 3.2M COW copies (tables below). Ranked by what each
-transformation would remove (raw = all workloads summed; mean = every workload weighted equally):
+### Before / after the performance wave
 
-| rank | class | allocations removed: raw / mean per workload | RC ops removed: raw / mean per workload | where it comes from |
-|---:|---|---:|---:|---|
-| 1 | (a) unboxing | 24.7% / 37.4% | 76.7% / 26.7% | `LState {k, src}` records of the ownership verifier (4.1M objects that receive 647M RC operations, 74% of all RC operations measured, through the COW copies of `ls: LState[]` and the dups around `joinLs`); Option from `pop()`, `get()`, `Map.get`, `recv()`; `Result` in the parser and lexer; the `{receiver, result}` pairs that `opt/pairs.or` rebuilds after an in/out call (3.0M); the `Bytes` view; `Span` |
-| 2 | (d) borrow | - / - | 8.1% / 20.7% | methods whose `this` is an owned parameter they only read (`Bytes.length` / `at`, `isDone`, `isFailed`, `canPop`, `canPush`, `Reader.cur`, `SortedMap.get` ...): the caller dups the receiver, the callee releases it. 85% of the HTTP server's RC operations, 59% of http_parse's, all of mutres's |
-| 3 | (c) escape / scalar replacement | 6.4% / 12.7% | 1.8% / 11.6% | the channel `Ring` of std:task (40% of tasks' allocations, 60% of its RC), the verifier's per-block context `Cx` and its empty `errs` / `warns`, `let xs: u8[] = []` per `feed`, `[i]` passed to `concat` |
-| 4 | (e) reuse in place | 5.7% / 12.3% | - | `"w" + n.toString()` (the number string dies right there), `qs(lo).concat(eq).concat(qs(hi))`, `joinState` replacing a dying in-state, `MessageParser.reset`'s five new arrays per message, and a copy of the lowerer's `BlockBuilder` and both its arrays for **every** emitted instruction (quadratic; see the COW table) |
-| 5 | (g) algorithm / library | 8.0% / 8.1% | 1.4% / 3.4% | quick wins below: `Bytes.toArray` copies in the HTTP parser, the double box per task message, temporary `u8[]` per `ByteBuilder.appendString`, fresh `usize[]` per operand in the optimiser's `instrUses` |
-| 6 | (f) region / freeze | 39.0% / 7.7% | 3.8% / 7.1% | one workload: bintrees (a tree built, checked and dropped per iteration). Compiler phases (tokens, AST, HIR: classed `-` here) are the next candidates once regions exist |
-| 7 | (b) packed arrays | bytes only | - | 384 MB of buffer bytes (4.5% of all bytes): `u8[]` from `stringToBytes`, `ByteBuilder`, the parser's body bytes; another 117 MB in sieve's `int[]` of 0/1 flags needs a range proof |
+Census counts, all workloads (the new run adds parallel_collatz, streams and streams_parallel: 74k allocations and 0.15M
+RC operations, too few to change the comparison):
 
-What stays: 9.7% of the allocations are real data (`-`: tokens, AST, header names and values, results) and 6.5% are
-not decided (`?`, mostly the long tail of the self-compile and a few COW copies whose second owner the census cannot name);
-8.2% of the RC operations are not removed by any class (mean 30.4%; the census credits only what it can show).
+| | 2026-10-14 (`7431756`) | 2026-10-15 (`46b9834`) | change |
+|---|---:|---:|---:|
+| allocations | 85.7M | 59.9M | -30% |
+| retains | 393.3M | 27.6M | -93% |
+| releases | 479.1M | 87.5M | -82% |
+| COW copies | 3.22M | 1.22M | -62% |
+| self-compile: allocations / retains | 24.8M / 353.8M | 17.1M / 23.7M | -31% / -93% |
+| self-compile: executed instructions (valgrind) | 38.97G | 23.85G | -38.8% |
 
-**Recommendation.** Start with (a): it is first in three of the four columns (raw allocations go to (f), which is one
-benchmark), its biggest single item is one record type of the verifier, and its cheapest part needs no new analysis: in
-the cases inspected (pqueue, sortedmap, the HTTP parser, the compiler's parser) the rebuilt in/out pairs (3.0M in all) are pairs that
-`opt/pairs.or` leaves in place because the call's result is moved to another local and matched from there (`l24 = struct
-tag0 {l59, l63}; l4 = move l24; l25 = getfield l4.0; ...`), and Option / Result of scalars returned and matched at once
-are the textbook case. Then (d):
-inferring that a method only reads its owned `this` removes most of the RC traffic of the HTTP workloads. (c) and (e)
-follow; (f) matters for allocation-heavy tree code, (b) for byte-heavy I/O.
+Executed instructions of the Orin binaries (valgrind; the regression metric, reliable on a shared machine; wall times of
+the same runs were too noisy to quote), ratio to the C version of the benchmark, C backend / LLVM backend:
 
-### After borrow inference (class (d), `compiler/opt/borrow.or`)
+| benchmark | before C / LLVM | after C / LLVM | Orin (C backend) change |
+|---|---:|---:|---:|
+| pqueue | 6.37 / 5.70 | 4.82 / 4.40 | -24.3% |
+| qsort_inplace | 3.58 / 2.99 | 2.80 / 2.39 | -21.8% |
+| mapfreq | 2.82 / 2.95 | 2.29 / 2.21 | -18.7% |
+| sortedmap (no C version) | | | -16.0% |
+| wordfreq | 1.70 / 1.69 | 1.43 / 1.37 | -15.7% |
+| qsort_func | 1.56 / 1.56 | 1.35 / 1.36 | -13.0% |
+| strings | 1.91 / 1.97 | 1.68 / 1.61 | -12.1% |
+| http_parse (no C version) | | | -9.7% (LLVM -22.4%) |
+| mutres | 11.63 / 9.03 | 10.60 / 7.90 | -8.8% |
+| bintrees | 0.99 / 1.03 | 0.94 / 0.94 | -4.7% |
+| fib | 1.01 / 1.51 | 1.01 / 0.78 | 0 (LLVM -48%) |
+| appends | 4.97 / 5.02 | 4.97 / 5.01 | 0 |
+| nbody | 3.68 / 3.07 | 3.68 / 3.14 | 0 |
+| sieve | 3.44 / 2.57 | 3.44 / 2.62 | 0 |
+| bytesstr | 2.84 / 2.37 | 2.84 / 2.37 | 0 |
 
-`ORIN_STATS=1` counters of the normal build, before (main) and after; allocations are unchanged except for the optimiser's own
-(+0.25% in the self-compile). The census above was taken before this change.
+LLVM is now at or below the C backend on 13 of 15 instruction rows (appends +0.8%, qsort_func +0.5%; bintrees at par).
+What did not move are the benchmarks that allocate almost nothing: their cost is the code around field and element
+access, which no census class covers (lever 2 below).
 
-| workload | retains before | after | releases before | after |
-|---|---:|---:|---:|---:|
-| mutres | 20,000,002 | 2 | 20,000,015 | 15 |
-| http_parse | 8,374,350 | 2,934,040 | 10,951,367 | 5,511,057 |
-| sortedmap | 970,321 | 498,021 | 2,878,596 | 2,406,296 |
-| pqueue | 800,003 | 600,000 | 4,400,015 | 4,200,012 |
-| mapfreq, wordfreq | unchanged | | unchanged | |
-| self-compile | 358,945,500 | 342,271,731 | 388,149,213 | 371,548,740 |
+### Ranking of the remaining levers
 
-The inference is by read-only *copies* of a parameter: the lowering writes `d = dup p` for every use of a parameter in a
-body, and that retain made the parameter owned. The remaining dup/release pairs of the census's (d) rows are copies of
-borrowed projections (`getfield` results held across a call that may release the owner), which need an invalidation analysis
-and are not covered; and methods that mutate `this` (in/out receivers) keep it owned.
+18.0% of the self-compile's allocations are still (a), but the RC traffic that made (a) and (d) first is gone (retains
+-93%). What is left, ranked by expected gain per unit of work:
+
+| rank | lever | class | evidence | what removes it |
+|---:|---|---|---|---|
+| 1 | verifier and optimiser data structures | (g), with (c)/(e) parts | 27.0% of the self-compile's allocations and 14.2% of its RC are (g), plus 12.6% (c) and 7.2% (e), mostly in `compiler/verify` and `compiler/opt/analysis`; one site alone, the `ls` COW copy in `Transfer.set`, copies 977 MB (427k times) | a per-Fixpoint scratch `ls` filled by `outOf` instead of sharing `ins[b].ls` with the Transfer; one reusable Transfer per Fixpoint; `State.join` in place into the dying `ins[s]`; `instrUses` / `termUses` / `lo` as visitors (553k + 340k arrays); one `successors`; the receiver dup around `callOwned` (class d, 119k record copies). No new analysis; library-level changes inside the compiler |
+| 2 | field and element access code | outside the census | instruction ratios to C that the wave did not move: mutres 10.6x, appends 5.0x, pqueue 4.8x, nbody 3.7x, sieve 3.4x | per field write a `make_unique` check plus `struct_get` / `struct_replace` and a reload of the same field (mutres `Reader.next`); per element read a bounds-checked `orin_array_at` and `s2f` even when the same element was read on the line before (nbody). Needs MIR CSE of loads and uniqueness checks within a block, bounds-check hoisting in counted loops, and unique-receiver propagation through in/out methods |
+| 3 | escape analysis / scalar replacement | (c) | mean 11.4% of allocations, 9.5% of RC per workload; appends 100%, streams_parallel 16.8%, the verifier's `Transfer` / `State` objects | the ADR-0038 step as planned; overlaps with lever 1 for the verifier |
+| 4 | unboxing beyond scalar-only immutable values | (a) | http_server 40.5%, http_parse 37.1%, self-compile 18.0% | flatten `Span` (3 scalars) into `Token` and AST records; `Result`/`Option` with a reference payload returned and matched at once; `Ok(i)` of `skipTrivia` |
+| 5 | reuse in place | (e) | 24.1% of all bytes (1.65 GB), sortedmap 20.3% of allocations | join into the dying in-state; field and element take/put in `opt/inplace.or` for `Scope`, `Map.set`, `Locals` |
+| 6 | regions / freeze | (f) | 55.7% of raw allocations, but one workload (bintrees), which is already at 0.94x C instructions | regions as planned; low priority until a real program needs it |
+| 7 | packed arrays | (b) | 372 MB of buffer bytes, bytesstr and sieve | as planned |
+| 8 | LLVM gates 2 + 3 | process | gate 1 (instruction parity) is met | LLVM fixed point of the self-compile and a pinned toolchain; no runtime gain, required for LLVM as the release default |
+
+**Recommendation.** Lever 1 first. It is the cheapest work (no new compiler analysis), it shortens every build, and the
+self-compile is the largest workload measured. Lever 2 is the biggest gap to C in user programs and the next real
+compiler work, ahead of (c), because the benchmarks it affects allocate nothing. The verifier cost on long fused
+functions (open item from the fusion work) is part of lever 1.
+
+Classification note: the RULES were revised for this run. The sites of the verifier, the optimiser and the std changed
+with the wave, and the first report left 15.6% of allocations (53.6% of the self-compile) unsure. The revised rules
+cover the top ~50 sites one by one and the front end, lowering and optimiser by shape (AST / HIR / MIR nodes are `-`,
+field in/out COW copies are (e)); unsure is now 0.1%.
+
+### Previous ranking (2026-10-14, before the wave)
+
+(a) unboxing (24.7% of allocations, 76.7% of RC: mostly the verifier's `LState` records), then (d) borrow (85% of the HTTP
+server's RC), (c), (e), (g), (f), (b). (a), (d), (e) and the quick wins of (g) were done in the wave; the verifier's
+`LState` became a packed `int` (#64) rather than an unboxed record.
 
 ## How it is measured
 
@@ -126,25 +155,28 @@ Totals of one run each (`ORIN_STATS=sites`; the summary counters of the same run
 
 | workload | allocations | bytes | retains | releases | COW copies | census = total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| selfcompile | 24,840,827 | 4125.2 MB | 353,841,685 | 378,682,512 | 3,223,780 | yes |
-| http_server (2,000 requests) | 144,660 | 29.1 MB | 1,026,208 | 1,170,868 | 0 | yes |
-| http_parse | 3,882,460 | 524.6 MB | 9,010,898 | 12,893,358 | 0 | yes |
-| tasks | 6,502,724 | 345.0 MB | 7,626,197 | 14,128,921 | 0 | yes |
-| bintrees | 33,405,905 | 1603.5 MB | 0 | 33,405,905 | 0 | yes |
-| sortedmap | 1,908,275 | 96.2 MB | 970,321 | 2,878,596 | 0 | yes |
-| pqueue | 3,600,012 | 159.9 MB | 800,003 | 4,400,015 | 0 | yes |
-| mapfreq | 2,999,821 | 135.5 MB | 50,000 | 3,049,821 | 0 | yes |
-| wordfreq | 2,003,865 | 90.0 MB | 5,001 | 2,008,866 | 0 | yes |
-| strings | 2,500,003 | 130.5 MB | 0 | 2,500,003 | 0 | yes |
-| qsort_func | 2,388,909 | 699.2 MB | 1 | 2,388,910 | 0 | yes |
-| qsort_inplace | 1,355,402 | 70.6 MB | 1 | 1,355,403 | 1 | yes |
-| appends | 200,027 | 16.3 MB | 0 | 200,027 | 0 | yes |
-| mutres | 13 | 794 B | 20,000,002 | 20,000,015 | 0 | yes |
-| bytesstr | 125 | 378.5 MB | 40 | 165 | 0 | yes |
-| sieve | 3 | 134.2 MB | 0 | 3 | 0 | yes |
-| nbody | 13 | 950 B | 0 | 13 | 0 | yes |
-| fib | 2 | 108 B | 0 | 2 | 0 | yes |
-| **all** | **85,733,046** | **8538.4 MB** | **393,330,357** | **479,063,403** | **3,223,781** |  |
+| selfcompile | 17,110,746 | 3346.4 MB | 23,693,095 | 40,803,841 | 1,215,387 | yes |
+| http_server (2,000 requests) | 97,335 | 16.5 MB | 104,085 | 201,420 | 0 | yes |
+| http_parse | 2,025,739 | 209.3 MB | 2,493,288 | 4,519,027 | 0 | yes |
+| tasks | 1,480,868 | 61.4 MB | 1,240,213 | 2,721,081 | 0 | yes |
+| bintrees | 33,405,901 | 1603.5 MB | 0 | 33,405,901 | 0 | yes |
+| sortedmap | 86,604 | 18.9 MB | 25,725 | 112,329 | 0 | yes |
+| pqueue | 9 | 6.3 MB | 0 | 9 | 0 | yes |
+| mapfreq | 1,050,017 | 47.9 MB | 50,000 | 1,100,017 | 0 | yes |
+| wordfreq | 1,006,028 | 42.3 MB | 5,001 | 1,011,029 | 0 | yes |
+| strings | 1,500,009 | 87.2 MB | 0 | 1,500,009 | 0 | yes |
+| qsort_func | 1,911,127 | 623.1 MB | 1 | 1,911,128 | 0 | yes |
+| qsort_inplace | 5 | 16.4 MB | 1 | 6 | 1 | yes |
+| appends | 200,021 | 16.3 MB | 0 | 200,021 | 0 | yes |
+| mutres | 9 | 612 B | 2 | 11 | 0 | yes |
+| bytesstr | 123 | 378.5 MB | 0 | 123 | 0 | yes |
+| sieve | 2 | 134.2 MB | 0 | 2 | 0 | yes |
+| nbody | 9 | 754 B | 0 | 9 | 0 | yes |
+| fib | 1 | 51 B | 0 | 1 | 0 | yes |
+| parallel_collatz | 8 | 33.6 MB | 1 | 9 | 0 | yes |
+| streams | 8 | 134.2 MB | 0 | 8 | 0 | yes |
+| streams_parallel | 74,285 | 72.0 MB | 36,880 | 111,165 | 0 | yes |
+| **all** | **59,948,854** | **6848.0 MB** | **27,648,292** | **87,597,146** | **1,215,388** |  |
 
 ## Ranking by transformation (ADR-0038)
 
@@ -152,16 +184,16 @@ Each allocation site is attributed to the one transformation that would remove i
 
 | class | transformation | allocations removed (raw) | share | mean share per workload | RC ops removed (raw) | share | mean share per workload | bytes not allocated |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| (a) | unboxing | 21,209,713 | 24.7% | 37.4% | 669,029,929 | 76.7% | 26.7% | 941.9 MB (11.0%) |
-| (b) | packed arrays | 0 | 0.0% | 0.0% | 0 | 0.0% | 0.0% | 383.5 MB (4.5%) |
-| (c) | escape / stack / scalar replacement | 5,461,477 | 6.4% | 12.7% | 15,833,433 | 1.8% | 11.6% | 356.4 MB (4.2%) |
-| (d) | borrow | 0 | 0.0% | 0.0% | 70,469,666 | 8.1% | 20.7% | 0 B (0.0%) |
-| (e) | reuse in place | 4,927,075 | 5.7% | 12.3% | 0 | 0.0% | 0.0% | 1656.7 MB (19.4%) |
-| (f) | region or freeze | 33,405,887 | 39.0% | 7.7% | 33,405,887 | 3.8% | 7.1% | 0 B (0.0%) |
-| (g) | algorithmic or library | 6,699,738 | 7.8% | 8.0% | 9,905,952 | 1.1% | 3.4% | 578.3 MB (6.8%) |
-| - | inherent | 8,446,228 | 9.9% | 19.7% | 0 | 0.0% | 0.0% |  |
-| ? | unsure | 5,582,928 | 6.5% | 2.2% | 0 | 0.0% | 0.0% |  |
-|  | RC operations not removed by any class |  |  |  | 73,748,893 | 8.5% | 30.4% |  |
+| (a) | unboxing | 3,903,956 | 6.5% | 10.7% | 8,539,750 | 7.4% | 7.1% | 184.4 MB (2.7%) |
+| (b) | packed arrays | 0 | 0.0% | 0.0% | 0 | 0.0% | 0.0% | 372.3 MB (5.4%) |
+| (c) | escape / stack / scalar replacement | 2,407,213 | 4.0% | 11.4% | 2,407,213 | 2.1% | 9.5% | 142.7 MB (2.1%) |
+| (d) | borrow | 119,252 | 0.2% | 0.1% | 6,388,284 | 5.5% | 4.4% | 0 B (0.0%) |
+| (e) | reuse in place | 1,850,425 | 3.1% | 5.3% | 0 | 0.0% | 0.0% | 1653.2 MB (24.1%) |
+| (f) | region or freeze | 33,405,887 | 55.7% | 8.3% | 33,405,887 | 29.0% | 8.3% | 0 B (0.0%) |
+| (g) | algorithmic or library | 6,588,153 | 11.0% | 20.5% | 13,734,953 | 11.9% | 17.8% | 1375.9 MB (20.1%) |
+| - | inherent | 11,637,184 | 19.4% | 43.7% | 0 | 0.0% | 0.0% |  |
+| ? | unsure | 36,784 | 0.1% | 0.1% | 0 | 0.0% | 0.0% |  |
+|  | RC operations not removed by any class |  |  |  | 50,769,351 | 44.1% | 52.9% |  |
 
 *Bytes not allocated*: the bytes of the objects a class removes; for (b) the 7/8 of the buffers of `u8[]` arrays that stay allocated; (f) keeps the bytes (a region still holds them) and removes the per-object frees and RC.
 
@@ -169,38 +201,36 @@ Per workload (share of the workload's allocations / of its RC operations; `-` wh
 
 | workload | (a) | (b) | (c) | (d) | (e) | (f) | (g) | - | ? |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| selfcompile | 40.7% / 89.8% | 0.0% / 0.0% | 8.8% / 0.3% | 0.0% / 1.6% | 5.1% / 0.0% | 0.0% / 0.0% | 12.1% / 0.5% | 11.2% / 0.0% | 22.1% / 0.0% |
-| http_server | 37.4% / 2.5% | 0.0% / 0.0% | 4.2% / 0.3% | 0.0% / 84.9% | 6.9% / 0.0% | 0.0% / 0.0% | 17.5% / 1.2% | 31.9% / 0.0% | 2.1% / 0.0% |
-| http_parse | 40.0% / 7.1% | 0.0% / 0.0% | 11.2% / 2.0% | 0.0% / 58.7% | 5.2% / 0.0% | 0.0% / 0.0% | 15.5% / 3.5% | 28.0% / 0.0% | 0.0% / 0.0% |
-| tasks | 18.8% / 5.6% | 0.0% / 0.0% | 40.3% / 59.7% | 0.0% / 11.2% | 0.0% / 0.0% | 0.0% / 0.0% | 39.4% / 22.8% | 1.5% / 0.0% | 0.0% / 0.0% |
+| selfcompile | 18.0% / 11.9% | 0.0% / 0.0% | 12.6% / 3.3% | 0.7% / 9.6% | 7.2% / 0.0% | 0.0% / 0.0% | 27.0% / 14.2% | 34.3% / 0.0% | 0.2% / 0.0% |
+| http_server | 40.5% / 12.9% | 0.0% / 0.0% | 4.2% / 1.3% | 0.0% / 4.8% | 4.7% / 0.0% | 0.0% / 0.0% | 2.2% / 0.7% | 48.0% / 0.0% | 0.4% / 0.0% |
+| http_parse | 37.1% / 10.7% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 1.6% | 6.0% / 0.0% | 0.0% / 0.0% | 2.9% / 3.3% | 53.9% / 0.0% | 0.0% / 0.0% |
+| tasks | 0.0% / 0.0% | 0.0% / 0.0% | 2.7% / 1.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 90.5% / 95.4% | 6.8% / 0.0% | 0.0% / 0.0% |
 | bintrees | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 100.0% / 100.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% |
-| sortedmap | 95.5% / 47.3% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 25.9% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 4.5% / 0.0% |
-| pqueue | 100.0% / 69.2% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 7.7% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% |
-| mapfreq | 33.3% / 32.3% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 33.3% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 33.3% / 0.0% | 0.0% / 0.0% |
-| wordfreq | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 49.9% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 50.0% / 0.0% | 0.1% / 0.0% |
-| strings | 20.0% / 20.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 20.0% / 0.0% | 0.0% / 0.0% | 20.0% / 20.0% | 40.0% / 0.0% | 0.0% / 0.0% |
-| qsort_func | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 40.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 60.0% / 0.0% | 0.0% / 0.0% |
-| qsort_inplace | 100.0% / 100.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% |
+| sortedmap | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 37.3% | 20.3% / 0.0% | 0.0% / 0.0% | 39.6% / 24.9% | 40.1% / 0.0% | 0.0% / 0.0% |
+| mapfreq | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 100.0% / 0.0% | 0.0% / 0.0% |
+| wordfreq | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 99.7% / 0.0% | 0.3% / 0.0% |
+| strings | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 33.3% / 33.3% | 66.7% / 0.0% | 0.0% / 0.0% |
+| qsort_func | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 25.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 75.0% / 0.0% | 0.0% / 0.0% |
 | appends | 0.0% / 0.0% | 0.0% / 0.0% | 100.0% / 100.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% |
-| mutres | - / 0.0% | - / 0.0% | - / 0.0% | - / 100.0% | - / 0.0% | - / 0.0% | - / 0.0% | - / 0.0% | - / 0.0% |
+| streams_parallel | 32.9% / 49.5% | 0.0% / 0.0% | 16.8% / 8.4% | 0.0% / 0.0% | 0.0% / 0.0% | 0.0% / 0.0% | 50.0% / 41.6% | 0.2% / 0.0% | 0.2% / 0.0% |
 
 ## Allocations by object kind
 
 | kind | allocations | share | bytes | RC on these objects | mostly in |
 | --- | ---: | ---: | ---: | ---: | --- |
-| record / variant | 44,076,234 | 51.4% | 2143.7 MB | 716,896,766 | bintrees, selfcompile, tasks +6 more |
-| Option | 9,793,590 | 11.4% | 391.7 MB | 11,024,200 | pqueue, selfcompile, qsort_inplace +6 more |
-| string | 8,918,031 | 10.4% | 520.2 MB | 13,975,561 | strings, mapfreq, wordfreq +15 more |
-| array (scalar elements) | 7,463,552 | 8.7% | 1838.5 MB | 10,221,276 | selfcompile, qsort_func, http_parse +10 more |
-| class object | 3,765,835 | 4.4% | 253.3 MB | 77,107,511 | tasks, http_parse, selfcompile +6 more |
-| COW copy | 3,054,379 | 3.6% | 1775.7 MB | 19,103,953 | selfcompile, qsort_inplace |
-| pair (in/out result rebuilt) | 3,035,167 | 3.5% | 145.7 MB | 4,018,505 | selfcompile, pqueue, http_parse +3 more |
-| array (reference elements) | 2,523,873 | 2.9% | 1265.5 MB | 11,331,379 | selfcompile, http_parse, http_server +5 more |
-| Result | 1,434,713 | 1.7% | 64.3 MB | 3,974,347 | selfcompile, http_server |
-| task transfer box (runtime) | 1,320,025 | 1.5% | 53.3 MB | 3,720,031 | tasks |
-| map (internal arrays and entries) | 242,764 | 0.3% | 81.7 MB | 677,360 | selfcompile, mapfreq |
-| closure | 99,490 | 0.1% | 4.6 MB | 139,494 | tasks, selfcompile, http_server |
-| interface box | 5,393 | 0.0% | 0.3 MB | 203,377 | selfcompile |
+| record / variant | 40,770,765 | 68.0% | 1991.8 MB | 69,475,139 | bintrees, selfcompile, tasks +6 more |
+| string | 6,290,600 | 10.5% | 398.0 MB | 11,773,786 | selfcompile, strings, mapfreq +18 more |
+| array (scalar elements) | 5,753,912 | 9.6% | 2942.7 MB | 13,500,196 | selfcompile, qsort_func, appends +14 more |
+| class object | 2,062,318 | 3.4% | 126.3 MB | 4,364,350 | selfcompile, http_parse, tasks +7 more |
+| Result | 1,732,042 | 2.9% | 76.5 MB | 4,730,666 | selfcompile, http_server |
+| Option | 1,062,080 | 1.8% | 42.5 MB | 2,129,862 | selfcompile, http_parse, http_server +1 more |
+| COW copy | 1,002,688 | 1.7% | 1110.8 MB | 4,783,924 | selfcompile, qsort_inplace |
+| map (internal arrays and entries) | 486,527 | 0.8% | 104.3 MB | 1,028,267 | selfcompile, mapfreq |
+| closure | 414,676 | 0.7% | 19.1 MB | 454,920 | selfcompile, tasks, streams_parallel +3 more |
+| array (reference elements) | 265,166 | 0.4% | 31.2 MB | 2,831,632 | selfcompile, http_parse, http_server +7 more |
+| task transfer box (runtime) | 100,343 | 0.2% | 4.5 MB | 100,343 | tasks, streams_parallel |
+| interface box | 7,696 | 0.0% | 0.4 MB | 72,312 | selfcompile |
+| pair (in/out result rebuilt) | 41 | 0.0% | 2 kB | 41 | http_server, selfcompile |
 
 ## Packed arrays (b)
 
@@ -208,18 +238,18 @@ Scalar arrays every freed instance of which held only values below 256. *u8[]*: 
 
 | workload | site | u8[] / bool[] by type | arrays | buffer bytes | saved by 1-byte elements | class of the allocation |
 | --- | --- | --- | ---: | ---: | ---: | --- |
-| bytesstr | `stdlib/bytes.bytesFromString` stdlib/bytes.or:239 `l2 = builtin string.toBytes(l0)` | yes | 40 | 335.5 MB | 293.6 MB | - |
-| http_parse | `stdlib/bytes.Bytes.toArray` stdlib/bytes.or:165 `l7 = builtin arr.slice(l2, l3, l6)` | yes | 459,251 | 219.2 MB | 191.8 MB | (g) |
+| bytesstr | `stdlib/bytes.bytesFromString` stdlib/bytes.or:254 `l2 = builtin string.toBytes(l0)` | yes | 40 | 335.5 MB | 293.6 MB | - |
 | sieve | `main.sieve` bench/sieve/main.or:3 `l5 = arraynew val []` | no (range proof) | 1 | 134.2 MB | 117.4 MB | ? |
-| http_parse | `stdlib/http.MessageParser.bodyBytes` stdlib/http.or:2604 `l16 = arraynew val []` | yes | 11,300 | 40.9 MB | 35.8 MB | - |
-| http_parse | `stdlib/bytes.ByteBuilder.constructor` stdlib/bytes.or:270 `l1 = arraynew val []` | yes | 6,000 | 37.4 MB | 32.8 MB | - |
-| http_parse | `stdlib/bytes.ByteBuilder.appendString` stdlib/bytes.or:376 `l4 = builtin string.toBytes(l1)` | yes | 48,000 | 18.8 MB | 16.5 MB | (g) |
-| selfcompile | `array/map.mapSet<string,check/env.ValEnt>` array/map.or:207 `arraypush l36, true` | yes | 6,567 | 9.7 MB | 8.5 MB | ? |
-| http_server | `stdlib/bytes.Bytes.toArray` stdlib/bytes.or:165 `l7 = builtin arr.slice(l2, l3, l6)` | yes | 4,000 | 9.1 MB | 7.9 MB | (g) |
-| http_server | `stdlib/bytes.ByteBuilder.constructor` stdlib/bytes.or:270 `l1 = arraynew val []` | yes | 2,000 | 6.9 MB | 6.1 MB | - |
-| selfcompile | `opt/params.liveAfter` compiler/opt/params.or:76 `l10 = arraynew val []` | no (range proof) | 107,862 | 5.9 MB | 5.2 MB | ? |
+| http_parse | `stdlib/bytes.ByteBuilder.constructor` stdlib/bytes.or:288 `l1 = arraynew val []` | yes | 17,300 | 78.3 MB | 68.5 MB | - |
+| http_parse | `stdlib/bytes.ByteBuilder.appendString` stdlib/bytes.or:415 `l12 = builtin string.toBytes(l1)` | yes | 6,000 | 17.5 MB | 15.3 MB | (g) |
+| selfcompile | `array/map.mapSet<string,check/env.ValEnt>` array/map.or:207 `arraypush l36, true` | yes | 7,430 | 11.0 MB | 9.7 MB | (e) |
+| http_server | `stdlib/bytes.ByteBuilder.constructor` stdlib/bytes.or:288 `l1 = arraynew val []` | yes | 2,000 | 6.9 MB | 6.0 MB | - |
+| selfcompile | `opt/params.liveAfter` compiler/opt/params.or:116 `l11 = arraynew val []` | no (range proof) | 121,608 | 6.5 MB | 5.7 MB | (g) |
 | http_server | `stdlib/net.recv` stdlib/net.or:347 `l10 = builtin net.recv(l0, l1, l9)` | yes | 2,000 | 4.7 MB | 4.1 MB | - |
-| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:207 `arraypush l36, true` | yes | 23,121 | 2.1 MB | 1.9 MB | ? |
+| selfcompile | `opt/rewrite.falses` compiler/opt/rewrite.or:53 `l3 = arraynew val []` | no (range proof) | 77,116 | 3.9 MB | 3.4 MB | (g) |
+| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:207 `arraypush l36, true` | yes | 32,545 | 2.8 MB | 2.5 MB | (e) |
+| selfcompile | `verify/verify.entryState` compiler/verify/verify.or:69 `l4 = arraynew val []` | no (range proof) | 4,723 | 2.3 MB | 2.0 MB | - |
+| selfcompile | `opt/unbox.falses` compiler/opt/unbox.or:145 `l3 = arraynew val []` | no (range proof) | 2 | 2.1 MB | 1.8 MB | - |
 
 ## Top 20 allocation sites (all workloads)
 
@@ -229,94 +259,89 @@ Sites are MIR instructions (`function` + block.instruction); the same std functi
 | ---: | --- | --- | ---: | ---: | ---: | --- | --- | --- |
 | 1 | `main.make` bench/bintrees/main.or:5 | variant Node(Tree, Tree) | 16,842,752 | 808.5 MB | 16,842,752 | (f) | bintrees | the tree is built, checked and dropped per iteration: a region per iteration (bump allocate, free in one step); the long-lived tree is (f) freeze |
 | 2 | `main.make` bench/bintrees/main.or:6 | variant Node(Tree, Tree) | 16,563,135 | 795.0 MB | 16,563,135 | (f) | bintrees | the tree is built, checked and dropped per iteration: a region per iteration (bump allocate, free in one step); the long-lived tree is (f) freeze |
-| 3 | `verify/state.mk` compiler/verify/state.or:50 | record LState {k, src} (2 scalars) | 4,088,444 | 196.2 MB | 646,793,200 | (a) | selfcompile | elements of the verifier's `ls: LState[]`: stored inline (2 scalar fields) the array becomes a scalar array, so the 4.1M objects, the retains of every COW copy of `ls` and the dups around `joinLs` disappear |
-| 4 | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 2,848,147 | 119.6 MB | 2,861,477 | - | mapfreq, wordfreq, strings +15 more | the result (one allocation per call: the first append copies the immortal "" into a buffer of capacity 9, the other digits are appended in place). The cost is the per-digit loop, not allocations; the second string of `"w" + n.toString()` is counted at the concatenation, class (e) |
-| 5 | `stdlib/taskcore.Ring.constructor` stdlib/taskcore.or:19 | class object Ring (5 scalars) | 2,581,847 | 185.9 MB | 12,873,391 | (c) | tasks | loaded from the channel monitor's words, changed and stored back inside one function: scalar-replace it |
-| 6 | `stdlib/task.putBox<int>` stdlib/task.or:59 | record Box<T> (1 field) | 1,220,000 | 48.8 MB | 1,220,000 | (g) | tasks | a message is boxed in a one-field record, and the runtime moves it into a second box (its own row): two allocations per send; transfer a scalar payload without boxing (runtime API change) |
-| 7 | `stdlib/task.putBox<int>` stdlib/task.or:59 | record (the runtime's transfer box) | 1,220,000 | 48.8 MB | 1,220,000 | (g) | tasks | orin_rt_transfer_put re-boxes the sender's box for the receiving task (see the Box<T> row) |
-| 8 | `stdlib/task.Receiver.recv<int>` stdlib/task.or:188 | Option | 1,200,000 | 48.0 MB | 1,200,000 | (a) | tasks | `Some(v)` returned by recv and matched |
-| 9 | `main.main` bench/mapfreq/main.or:6 | string ("w" / "item" + n.toString()) | 1,000,000 | 49.6 MB | 1,100,000 | (e) | mapfreq | literal + number: the number string is fresh, unique and dies right there; prepend the literal into it instead of allocating a second string |
-| 10 | `main.main` bench/wordfreq/main.or:41 | string ("w" / "item" + n.toString()) | 1,000,000 | 47.7 MB | 1,010,000 | (e) | wordfreq | literal + number: the number string is fresh, unique and dies right there; prepend the literal into it instead of allocating a second string |
-| 11 | `array/map.mapGet<string,int>` array/map.or:179 | Option | 950,001 | 38.0 MB | 950,001 | (a) | mapfreq | `Map.get` returns Option<V>; unwrapped / matched at once |
-| 12 | `stdlib/http.sliceString` stdlib/http.or:1385 | string (header name / value / token) | 947,252 | 43.8 MB | 2,801,972 | - | http_parse, http_server | the header names and values of the parsed request are its result; one allocation each since bytesToString |
-| 13 | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 924,020 | 51.7 MB | 10,995,882 | (a) | http_parse, http_server, bytesstr | a 3-field view created by `Bytes.slice` per chunk / line and dropped after the parse step: unbox the view (pass data/start/len) -- (c) where it does not leave the caller |
-| 14 | `opt/analysis.lo` compiler/opt/analysis.or:8 | array<usize> (0-1 elements) | 717,614 | 40.2 MB | 717,614 | (g) | selfcompile | `instrUses` returns a fresh `usize[]` per operand / instruction (`lo(o)` = `[l]` or `[]`) only to be iterated: a visitor or an out-parameter array removes it; (c) would need inlining first |
-| 15 | `main.sortInts` bench/qsort_inplace/main.or:13 | Option | 677,698 | 27.1 MB | 677,698 | (a) | qsort_inplace | `stack.pop()` Option unwrapped at once |
-| 16 | `main.sortInts` bench/qsort_inplace/main.or:14 | Option | 677,698 | 27.1 MB | 677,698 | (a) | qsort_inplace | `stack.pop()` Option unwrapped at once |
-| 17 | `opt/analysis.ancestors` compiler/opt/analysis.or:152 | array<usize> | 654,294 | 31.4 MB | 1,291,002 | (g) | selfcompile | per-call worklists; reuse one buffer per function |
-| 18 | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2229 | record Entry {priority, value} | 600,000 | 28.8 MB | 600,000 | (a) | pqueue | returned in Some(..) and destructured by the caller |
-| 19 | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2230 | Option | 600,000 | 24.0 MB | 600,000 | (a) | pqueue | `pop().unwrap()`: the Option dies at once |
-| 20 | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2231 | Option | 600,000 | 24.0 MB | 600,000 | (a) | pqueue | `pop().unwrap()`: the Option dies at once |
+| 3 | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 2,912,182 | 132.8 MB | 3,091,132 | - | mapfreq, wordfreq, strings +18 more | the result (one allocation per call: the first append copies the immortal "" into a buffer of capacity 9, the other digits are appended in place). The cost is the per-digit loop, not allocations; the second string of `"w" + n.toString()` is counted at the concatenation, class (e) |
+| 4 | `stdlib/task.putBox<int>` stdlib/task.or:62 | record Box<T> (1 field) | 1,220,000 | 48.8 MB | 3,660,000 | (g) | tasks | a message is boxed in a one-field record, and the runtime moves it into a second box (its own row): two allocations per send; transfer a scalar payload without boxing (runtime API change) |
+| 5 | `stdlib/http.sliceString` stdlib/http.or:1387 | string (header name / value / token) | 947,252 | 43.8 MB | 2,801,972 | - | http_parse, http_server | the header names and values of the parsed request are its result; one allocation each since bytesToString |
+| 6 | `verify/state.State.constructor` compiler/verify/state.or:267 | class object State {ls, holes} (2 refs) | 649,374 | 31.2 MB | 2,329,054 | (c) | selfcompile | 54% are `Transfer.state()` results that outOf returns and joinIfChanged only reads (scalar replacement / pass ls and holes); 46% are `join` results stored into `ins[s]` (class e). Not unboxed: a class with two reference fields |
+| 7 | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 586,281 | 32.8 MB | 791,509 | (a) | http_parse, http_server, bytesstr | a 3-field view created by `Bytes.slice` per chunk / line and dropped after the parse step: unbox the view (pass data/start/len) -- (c) where it does not leave the caller |
+| 8 | `opt/analysis.instrUses` compiler/opt/analysis.or:17 | array<usize> (0-1 elements) | 553,765 | 43.6 MB | 553,765 | (g) | selfcompile | `instrUses` returns a fresh `usize[]` per operand / instruction (`lo(o)` = `[l]` or `[]`) only to be iterated: a visitor or an out-parameter array removes it; (c) would need inlining first |
+| 9 | `std/strings.strSplit` std/strings.or:87 | string (split part) | 515,354 | 22.0 MB | 568,084 | - | strings, selfcompile | the parts are the result |
+| 10 | `main.main` bench/strings/main.or:20 | string (temporary) | 500,000 | 19.4 MB | 500,000 | (g) | strings | `p.substring(4, ..)` only to parse it: parse from an offset |
+| 11 | `main.qs` bench/qsort_func/main.or:10 | array<int> | 477,781 | 158.6 MB | 477,781 | - | qsort_func | the partitions of the functional quicksort (inherent to the algorithm) |
+| 12 | `main.qs` bench/qsort_func/main.or:11 | array<int> | 477,781 | 38.3 MB | 477,781 | - | qsort_func | the partitions of the functional quicksort (inherent to the algorithm) |
+| 13 | `main.qs` bench/qsort_func/main.or:12 | array<int> | 477,781 | 156.1 MB | 477,781 | - | qsort_func | the partitions of the functional quicksort (inherent to the algorithm) |
+| 14 | `main.qs` bench/qsort_func/main.or:18 | array<int> | 477,781 | 261.7 MB | 477,781 | (e) | qsort_func | `qs(lo).concat(eq).concat(qs(hi))`: the left operand is a fresh unique array each time -- extend it in place |
+| 15 | `diag/diag.span` compiler/diag/diag.or:36 | record Span {file, start, end} (3 scalars) | 474,312 | 26.6 MB | 1,823,790 | (a) | selfcompile | 3 scalars stored in every token / AST node. Remains boxed because the unboxing pass rejects a value stored in a slot of a boxed object (Token, Ident, Expr, Stmt, ...): it needs flattening of scalar-only records into their container (a layout change); cf. (a) for values that stay in registers |
+| 16 | `syntax/lexer.Lexer.emit` compiler/syntax/lexer.or:465 | record Token {kind, text, span, ...} | 474,309 | 30.4 MB | 1,861,715 | - | selfcompile | the token stream is real data (lives until parsing ends); a region per compiler phase ((f)) would batch-free it |
+| 17 | `syntax/lexer.skipTrivia` compiler/syntax/lexer.or:287 | Result | 474,130 | 19.0 MB | 474,130 | (a) | selfcompile | `Ok(i)`: Result<usize, Diag> matched by the caller. Remains boxed because the Err variant carries a Diag reference (slots must be scalar in every variant); returning the position and leaving the error in `this.err` (g) removes it |
+| 18 | `verify/rules.Transfer.set` compiler/verify/rules.or:243 | COW copy of the ls array (int[], ~290 entries) | 427,235 | 976.8 MB | 1,363,117 | (g) | selfcompile | ONE per block run (427k, 977 MB): `Fixpoint.outOf(b, ins[b].unwrap())` builds `new Transfer(.., st, ..)`, whose constructor does `this.ls = st.ls`, so the array has two owners (the table entry `ins[b]`, which must survive for later joins, and the Transfer) and the first `this.ls[l] = ..` copies it. Remove: a per-Fixpoint scratch ls buffer that outOf fills (element copy, no malloc / free / COW; take-put it into the Transfer) and from which a fresh array is cut only when the out-state is stored (first visit of a successor); or pack ls as i32[] (b) to halve the bytes |
+| 19 | `verify/rules.Transfer.constructor` compiler/verify/rules.or:124 | class object Transfer (8 fields) | 414,234 | 39.8 MB | 587,618 | (c) | selfcompile | one per block run (outOf / runBlock), dead when `.state()` / errs are read: keep one Transfer in the Fixpoint and reset it per block (e), or scalar-replace it after inlining outOf; a class with reference fields is not unboxed |
+| 20 | `opt/rewrite.empties` compiler/opt/rewrite.or:66 | array<Instr[]> (empty) | 313,975 | 15.1 MB | 313,975 | (g) | selfcompile | `RewritePlan(n)` makes n empty replacement lists for a block of n instructions although only the touched ones get one: keep the replacements sparse (a list of (index, instrs)) or share one immortal empty array |
 
 ## Top 5 allocation sites per workload
 
 | workload | site | kind | allocations | share | class |
 | --- | --- | --- | ---: | ---: | --- |
-| selfcompile | `verify/state.mk` compiler/verify/state.or:50 | record LState {k, src} (2 scalars) | 4,088,444 | 16.5% | (a) |
-| selfcompile | `opt/analysis.lo` compiler/opt/analysis.or:8 | array<usize> (0-1 elements) | 717,614 | 2.9% | (g) |
-| selfcompile | `opt/analysis.ancestors` compiler/opt/analysis.or:152 | array<usize> | 654,294 | 2.6% | (g) |
-| selfcompile | `verify/rules.setLs` compiler/verify/rules.or:48 | COW copy of LState[] | 580,599 | 2.3% | - |
-| selfcompile | `verify/rules.setLs` compiler/verify/rules.or:48 | COW copy of record State {ls, holes} | 580,401 | 2.3% | - |
-| http_server | `stdlib/http.sliceString` stdlib/http.or:1385 | string (header name / value / token) | 17,336 | 12.0% | - |
-| http_server | `stdlib/bytes.ByteBuilder.appendString` stdlib/bytes.or:376 | array<u8> (temporary) | 16,000 | 11.1% | (g) |
-| http_server | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 13,373 | 9.2% | (a) |
-| http_server | `stdlib/http.Headers.get` stdlib/http.or:633 | Option | 9,334 | 6.5% | (a) |
-| http_server | `stdlib/http.Headers.constructor` stdlib/http.or:570 | class object Headers | 8,000 | 5.5% | - |
-| http_parse | `stdlib/http.sliceString` stdlib/http.or:1385 | string (header name / value / token) | 929,916 | 24.0% | - |
-| http_parse | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 910,607 | 23.5% | (a) |
-| http_parse | `stdlib/bytes.Bytes.toArray` stdlib/bytes.or:165 | array<u8> | 459,251 | 11.8% | (g) |
-| http_parse | `stdlib/http.MessageParser.feed` stdlib/http.or:1615 | array<u8> (empty) | 434,751 | 11.2% | (c) |
-| http_parse | `stdlib/http.RequestParser.feed` stdlib/http.or:2658 | pair (in/out result rebuilt) | 428,751 | 11.0% | (a) |
-| tasks | `stdlib/taskcore.Ring.constructor` stdlib/taskcore.or:19 | class object Ring (5 scalars) | 2,581,847 | 39.7% | (c) |
-| tasks | `stdlib/task.putBox<int>` stdlib/task.or:59 | record Box<T> (1 field) | 1,220,000 | 18.8% | (g) |
-| tasks | `stdlib/task.putBox<int>` stdlib/task.or:59 | record (the runtime's transfer box) | 1,220,000 | 18.8% | (g) |
-| tasks | `stdlib/task.Receiver.recv<int>` stdlib/task.or:188 | Option | 1,200,000 | 18.5% | (a) |
-| tasks | `stdlib/task.putBox<()=>void>` stdlib/task.or:59 | record (the runtime's transfer box) | 100,023 | 1.5% | (g) |
+| selfcompile | `verify/state.State.constructor` compiler/verify/state.or:267 | class object State {ls, holes} (2 refs) | 649,374 | 3.8% | (c) |
+| selfcompile | `opt/analysis.instrUses` compiler/opt/analysis.or:17 | array<usize> (0-1 elements) | 553,765 | 3.2% | (g) |
+| selfcompile | `diag/diag.span` compiler/diag/diag.or:36 | record Span {file, start, end} (3 scalars) | 474,312 | 2.8% | (a) |
+| selfcompile | `syntax/lexer.Lexer.emit` compiler/syntax/lexer.or:465 | record Token {kind, text, span, ...} | 474,309 | 2.8% | - |
+| selfcompile | `syntax/lexer.skipTrivia` compiler/syntax/lexer.or:287 | Result | 474,130 | 2.8% | (a) |
+| http_server | `stdlib/http.sliceString` stdlib/http.or:1387 | string (header name / value / token) | 17,336 | 17.8% | - |
+| http_server | `stdlib/http.Headers.get` stdlib/http.or:635 | Option | 9,334 | 9.6% | (a) |
+| http_server | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 8,080 | 8.3% | (a) |
+| http_server | `stdlib/http.Headers.constructor` stdlib/http.or:572 | class object Headers | 8,000 | 8.2% | - |
+| http_server | `stdlib/net.recv` stdlib/net.or:347 | Result<u8[], int> + array<u8> | 4,040 | 4.2% | - |
+| http_parse | `stdlib/http.sliceString` stdlib/http.or:1387 | string (header name / value / token) | 929,916 | 45.9% | - |
+| http_parse | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 578,161 | 28.5% | (a) |
+| http_parse | `stdlib/http.Headers.constructor` stdlib/http.or:572 | class object Headers | 81,202 | 4.0% | - |
+| http_parse | `stdlib/http.Headers.get` stdlib/http.or:635 | Option | 57,902 | 2.9% | (a) |
+| http_parse | `stdlib/http.MessageParser.feed` stdlib/http.or:1727 | variant Done(z, used) | 40,601 | 2.0% | (a) |
+| tasks | `stdlib/task.putBox<int>` stdlib/task.or:62 | record Box<T> (1 field) | 1,220,000 | 82.4% | (g) |
+| tasks | `stdlib/task.putBox<()=>void>` stdlib/task.or:62 | record (the runtime's transfer box) | 100,023 | 6.8% | (g) |
+| tasks | `stdlib/taskcore.Ledger.constructor` stdlib/taskcore.or:122 | class object Ledger (3 fields) | 40,206 | 2.7% | (c) |
+| tasks | `stdlib/task.spawn<int>` stdlib/task.or:360 | closure | 40,000 | 2.7% | - |
+| tasks | `main.spawnJoin$closure0` bench/tasks/main.or:19 | closure | 40,000 | 2.7% | - |
 | bintrees | `main.make` bench/bintrees/main.or:5 | variant Node(Tree, Tree) | 16,842,752 | 50.4% | (f) |
 | bintrees | `main.make` bench/bintrees/main.or:6 | variant Node(Tree, Tree) | 16,563,135 | 49.6% | (f) |
 | bintrees | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 12 | 0.0% | - |
-| bintrees | `main.main` bench/bintrees/main.or:28 | string ("w" / "item" + n.toString()) | 4 | 0.0% | (e) |
-| bintrees | `main.main` bench/bintrees/main.or:32 | string ("w" / "item" + n.toString()) | 1 | 0.0% | (e) |
-| sortedmap | `stdlib/collections.SortedMap.floorKey<int>` stdlib/collections.or:1247 | Option | 362,328 | 19.0% | (a) |
-| sortedmap | `stdlib/collections.SortedMap.removeKey<int>` stdlib/collections.or:982 | Option | 215,728 | 11.3% | (a) |
-| sortedmap | `stdlib/collections.SortedMap.removeKey<int>` stdlib/collections.or:983 | Option | 215,728 | 11.3% | (a) |
-| sortedmap | `main.main` bench/sortedmap/main.or:18 | pair (in/out result rebuilt) | 200,000 | 10.5% | (a) |
-| sortedmap | `stdlib/collections.SortedMap.remove<int>` stdlib/collections.or:1157 | Option | 173,685 | 9.1% | (a) |
-| pqueue | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2229 | record Entry {priority, value} | 600,000 | 16.7% | (a) |
-| pqueue | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2230 | Option | 600,000 | 16.7% | (a) |
-| pqueue | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2231 | Option | 600,000 | 16.7% | (a) |
-| pqueue | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2232 | Option | 600,000 | 16.7% | (a) |
-| pqueue | `stdlib/collections.PriorityQueue.pop<int>` stdlib/collections.or:2262 | Option | 600,000 | 16.7% | (a) |
-| mapfreq | `main.main` bench/mapfreq/main.or:6 | string ("w" / "item" + n.toString()) | 1,000,000 | 33.3% | (e) |
-| mapfreq | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 999,803 | 33.3% | - |
-| mapfreq | `array/map.mapGet<string,int>` array/map.or:179 | Option | 950,001 | 31.7% | (a) |
-| mapfreq | `array/map.mapEntries<string,int>` array/map.or:255 | record entry {key, value} | 50,000 | 1.7% | (a) |
-| mapfreq | `array/map.buildTab<string>` array/map.or:114 | array<scalar> | 8 | 0.0% | ?* |
-| wordfreq | `main.main` bench/wordfreq/main.or:41 | string ("w" / "item" + n.toString()) | 1,000,000 | 49.9% | (e) |
-| wordfreq | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 997,837 | 49.8% | - |
-| wordfreq | `main.main` bench/wordfreq/main.or:47 | record Entry {word, count} | 5,000 | 0.2% | - |
+| bintrees | `main.main` bench/bintrees/main.or:28 | string | 2 | 0.0% | ?* |
+| bintrees | `main.main` bench/bintrees/main.or:27 | record (0 fields) | 0 | 0.0% | ?* |
+| sortedmap | `stdlib/collections.SortedMap.alloc<int>` stdlib/collections.or:952 | record IntNode {keys, vals, kids} | 8,578 | 9.9% | - |
+| sortedmap | `stdlib/collections.SortedMap.release<int>` stdlib/collections.or:958 | IntNode {[], [], []} (a freed arena slot) | 8,578 | 9.9% | (g) |
+| sortedmap | `stdlib/collections.SortedMap.release<int>` stdlib/collections.or:958 | IntNode {[], [], []} (a freed arena slot) | 8,578 | 9.9% | (g) |
+| sortedmap | `stdlib/collections.SortedMap.release<int>` stdlib/collections.or:958 | IntNode {[], [], []} (a freed arena slot) | 8,578 | 9.9% | (g) |
+| sortedmap | `stdlib/collections.SortedMap.release<int>` stdlib/collections.or:958 | IntNode {[], [], []} (a freed arena slot) | 8,578 | 9.9% | (g) |
+| mapfreq | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 999,803 | 95.2% | - |
+| mapfreq | `array/map.mapEntries<string,int>` array/map.or:255 | record / class object (table, row, report) | 50,000 | 4.8% | - |
+| mapfreq | `main.main` bench/mapfreq/main.or:6 | string | 200 | 0.0% | ?* |
+| mapfreq | `array/map.buildTab<string>` array/map.or:114 | array (result of a map / table storage / per-function setup) | 8 | 0.0% | - |
+| mapfreq | `array/map.mapNew<string,int>` array/map.or:171 | array (result of a map / table storage / per-function setup) | 1 | 0.0% | - |
+| wordfreq | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 997,837 | 99.2% | - |
+| wordfreq | `main.main` bench/wordfreq/main.or:47 | record Entry {word, count} | 5,000 | 0.5% | - |
+| wordfreq | `main.main` bench/wordfreq/main.or:41 | string | 2,166 | 0.2% | ?* |
 | wordfreq | `main.main` bench/wordfreq/main.or:33 | array<ref> | 1,024 | 0.1% | ?* |
 | wordfreq | `main.main` bench/wordfreq/main.or:30 | array<ref> | 1 | 0.0% | ?* |
-| strings | `std/strings.strSplit` std/strings.or:87 | string (split part) | 500,000 | 20.0% | - |
-| strings | `std/numbers.strParseInt` std/numbers.or:72 | Option | 500,000 | 20.0% | (a) |
-| strings | `main.build` bench/strings/main.or:6 | string ("w" / "item" + n.toString()) | 500,000 | 20.0% | (e) |
-| strings | `main.main` bench/strings/main.or:20 | string (temporary) | 500,000 | 20.0% | (g) |
-| strings | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 499,995 | 20.0% | - |
-| qsort_func | `main.qs` bench/qsort_func/main.or:10 | array<int> | 477,781 | 20.0% | - |
-| qsort_func | `main.qs` bench/qsort_func/main.or:11 | array<int> | 477,781 | 20.0% | - |
-| qsort_func | `main.qs` bench/qsort_func/main.or:12 | array<int> | 477,781 | 20.0% | - |
-| qsort_func | `main.qs` bench/qsort_func/main.or:18 | array<int> | 477,781 | 20.0% | (e) |
-| qsort_func | `main.qs` bench/qsort_func/main.or:18 | array<int> | 477,781 | 20.0% | (e) |
-| qsort_inplace | `main.sortInts` bench/qsort_inplace/main.or:13 | Option | 677,698 | 50.0% | (a) |
-| qsort_inplace | `main.sortInts` bench/qsort_inplace/main.or:14 | Option | 677,698 | 50.0% | (a) |
-| qsort_inplace | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 1 | 0.0% | - |
-| qsort_inplace | `main.sortInts` bench/qsort_inplace/main.or:9 | array<scalar> | 1 | 0.0% | ?* |
-| qsort_inplace | `main.sortInts` bench/qsort_inplace/main.or:21 | COW copy of array<scalar> | 1 | 0.0% | ?* |
+| strings | `std/strings.strSplit` std/strings.or:87 | string (split part) | 500,000 | 33.3% | - |
+| strings | `main.main` bench/strings/main.or:20 | string (temporary) | 500,000 | 33.3% | (g) |
+| strings | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 499,995 | 33.3% | - |
+| strings | `main.build` bench/strings/main.or:6 | string | 10 | 0.0% | ?* |
+| strings | `std/strings.strSplit` std/strings.or:76 | array<string> (the parts) | 1 | 0.0% | - |
+| qsort_func | `main.qs` bench/qsort_func/main.or:10 | array<int> | 477,781 | 25.0% | - |
+| qsort_func | `main.qs` bench/qsort_func/main.or:11 | array<int> | 477,781 | 25.0% | - |
+| qsort_func | `main.qs` bench/qsort_func/main.or:12 | array<int> | 477,781 | 25.0% | - |
+| qsort_func | `main.qs` bench/qsort_func/main.or:18 | array<int> | 477,781 | 25.0% | (e) |
+| qsort_func | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 1 | 0.0% | - |
 | appends | `main.main` bench/appends/main.or:49 | array<int> (1-2 elements) | 100,000 | 50.0% | (c) |
 | appends | `main.main` bench/appends/main.or:55 | array<int> (1-2 elements) | 100,000 | 50.0% | (c) |
 | appends | `std/numbers.usizeToString` std/numbers.or:16 | string (decimal digits) | 8 | 0.0% | - |
 | appends | `main.Buf.constructor` bench/appends/main.or:9 | class object Buf (1 fields) | 1 | 0.0% | ?* |
 | appends | `main.Buf.add` bench/appends/main.or:13 | string | 1 | 0.0% | ?* |
+| streams_parallel | `stdlib/taskcore.Ranges.constructor` stdlib/taskcore.or:172 | class object Ranges (4 fields) | 12,260 | 16.5% | (c) |
+| streams_parallel | `stdlib/task.loadRanges` stdlib/task.or:647 | array<usize> (lo / hi of the workers) | 12,250 | 16.5% | (g) |
+| streams_parallel | `stdlib/task.loadRanges` stdlib/task.or:648 | array<usize> (lo / hi of the workers) | 12,250 | 16.5% | (g) |
+| streams_parallel | `stdlib/task.inOrder<Option<int>>` stdlib/task.or:762 | Option | 12,210 | 16.4% | (a)* |
+| streams_parallel | `stdlib/task.poolWork<Option<int>>` stdlib/task.or:691 | record Done<R> {k, r} | 12,210 | 16.4% | (g) |
 
 ## Top RC sites
 
@@ -324,51 +349,51 @@ Retains at borrow candidates (class d: the retained value is only read before it
 
 | workload | retain site | MIR | RC ops removed (2 x retains) |
 | --- | --- | --- | ---: |
-| mutres | `main.Q.stepVoid` bench/mutres/main.or:43 | `l8 = dup l2` | 20,000,000 |
-| mutres | `main.main` bench/mutres/main.or:62 | `l47 = dup l2` | 20,000,000 |
-| selfcompile | `verify/rules.def` compiler/verify/rules.or:240 | `l30 = dup l29` | 2,109,208 |
-| tasks | `main.throughput$closure0` bench/tasks/main.or:87 | `l14 = dup l10` | 2,000,002 |
-| http_parse | `stdlib/bytes.ByteBuilder.appendBytes` stdlib/bytes.or:366 | `l9 = dup l1` | 1,836,000 |
-| http_parse | `stdlib/bytes.ByteBuilder.appendBytes` stdlib/bytes.or:367 | `l10 = dup l1` | 1,824,000 |
-| http_parse | `stdlib/http.RequestParser.isDone` stdlib/http.or:2691 | `l4 = dup l2` | 878,700 |
-| http_parse | `stdlib/http.MessageParser.feed` stdlib/http.or:1613 | `l156 = dup l1` | 869,502 |
-| http_parse | `main.parseOnce` bench/http_parse/main.or:68 | `l35 = dup l0` | 830,700 |
-| http_server | `stdlib/bytes.ByteBuilder.appendBytes` stdlib/bytes.or:366 | `l9 = dup l1` | 821,722 |
-| http_server | `stdlib/bytes.ByteBuilder.appendBytes` stdlib/bytes.or:367 | `l10 = dup l1` | 817,722 |
-| selfcompile | `syntax/lexer.Lexer.step` compiler/syntax/lexer.or:369 | `l3 = dup l27` | 811,362 |
-| http_parse | `main.parseOnce` bench/http_parse/main.or:70 | `l40 = dup l0` | 809,500 |
-| http_parse | `main.parseOnce` bench/http_parse/main.or:69 | `l38 = dup l0` | 809,500 |
-| http_parse | `stdlib/http.RequestParser.isFailed` stdlib/http.or:2695 | `l4 = dup l2` | 809,500 |
+| selfcompile | `syntax/lexer.Lexer.step` compiler/syntax/lexer.or:369 | `l3 = dup l27` | 919,482 |
+| selfcompile | `verify/rules.Transfer.run` compiler/verify/rules.or:155 | `l2 = dup l7` | 786,518 |
+| selfcompile | `verify/verify.Fixpoint.run` compiler/verify/verify.or:210 | `l45 = dup l6` | 756,060 |
+| selfcompile | `opt/unbox.Unboxing.isRef` compiler/opt/unbox.or:396 | `l4 = dup l7` | 680,868 |
+| selfcompile | `syntax/lexer.Lexer.punct` compiler/syntax/lexer.or:712 | `l2 = dup l10` | 516,936 |
+| selfcompile | `syntax/lexer.Lexer.ident` compiler/syntax/lexer.or:476 | `l2 = dup l8` | 366,570 |
+| selfcompile | `syntax/parser.Parser.parseIdent` compiler/syntax/parser.or:601 | `l2 = dup l8` | 304,472 |
+| selfcompile | `syntax/parser.Parser.levelHere` compiler/syntax/parser.or:1907 | `l2 = dup l5` | 227,008 |
+| selfcompile | `syntax/parser.Parser.parseUnary` compiler/syntax/parser.or:1933 | `l2 = dup l12` | 196,252 |
+| selfcompile | `syntax/parser.Parser.parsePrimary` compiler/syntax/parser.or:2043 | `l2 = dup l22` | 194,078 |
+| selfcompile | `verify/state.State.joinIfChanged` compiler/verify/state.or:360 | `l7 = dup l2` | 167,814 |
+| selfcompile | `opt/opt.ParamInference.wants` compiler/opt/opt.or:117 | `l4 = dup l10` | 94,008 |
+| selfcompile | `lower/builder.BlockBuilder.finish` compiler/lower/builder.or:167 | `l13 = dup l50` | 82,106 |
+| selfcompile | `check/stmt.StmtChecker.block` compiler/check/stmt.or:104 | `l82 = dup l81` | 80,696 |
+| selfcompile | `verify/rules.Transfer.term` compiler/verify/rules.or:229 | `l40 = dup l39` | 76,932 |
 
 | workload | allocation site | kind | objects | retains + releases on them | per object | class |
 | --- | --- | --- | ---: | ---: | ---: | --- |
-| selfcompile | `verify/state.mk` compiler/verify/state.or:50 | record LState {k, src} (2 scalars) | 4,088,444 | 646,793,200 | 158.2 | (a) |
-| mutres | `main.Reader.constructor` bench/mutres/main.or:7 | class object (the parser / reader) | 2 | 40,000,002 | 20000001.0 | - |
 | bintrees | `main.make` bench/bintrees/main.or:5 | variant Node(Tree, Tree) | 16,842,752 | 16,842,752 | 1.0 | (f) |
 | bintrees | `main.make` bench/bintrees/main.or:6 | variant Node(Tree, Tree) | 16,563,135 | 16,563,135 | 1.0 | (f) |
-| tasks | `stdlib/taskcore.Ring.constructor` stdlib/taskcore.or:19 | class object Ring (5 scalars) | 2,581,847 | 12,873,391 | 5.0 | (c) |
-| http_parse | `stdlib/bytes.Bytes.constructor` stdlib/bytes.or:43 | class object Bytes {data, start, len} (view) | 910,607 | 9,282,943 | 10.2 | (a) |
-| selfcompile | `lower/state.Locals.fresh` compiler/lower/state.or:51 | record MLocal {name, ty} | 70,885 | 3,789,785 | 53.5 | - |
-| selfcompile | `diag/diag.spanTo` compiler/diag/diag.or:46 | record Span {file, start, end} (3 scalars) | 140,688 | 3,766,566 | 26.8 | (a) |
-| selfcompile | `verify/verify.entryState` compiler/verify/verify.or:52 | array<ref> | 3,976 | 3,541,438 | 890.7 | - |
-| http_parse | `stdlib/http.MessageParser.constructor` stdlib/http.or:1490 | class object (the parser / reader) | 5 | 2,801,313 | 560262.6 | - |
-| http_parse | `stdlib/http.sliceString` stdlib/http.or:1385 | string (header name / value / token) | 929,916 | 2,721,960 | 2.9 | - |
-| tasks | `stdlib/task.putBox<()=>void>` stdlib/task.or:59 | record (the runtime's transfer box) | 100,023 | 2,500,029 | 25.0 | (g) |
+| selfcompile | `check/decls.resolveFunc` compiler/check/decls.or:168 | record (AST / HIR / MIR data) | 3,051 | 3,743,671 | 1227.0 | - |
+| tasks | `stdlib/task.putBox<int>` stdlib/task.or:62 | record Box<T> (1 field) | 1,220,000 | 3,660,000 | 3.0 | (g) |
+| http_parse | `stdlib/http.sliceString` stdlib/http.or:1387 | string (header name / value / token) | 929,916 | 2,721,960 | 2.9 | - |
+| selfcompile | `diag/diag.spanTo` compiler/diag/diag.or:46 | record Span {file, start, end} (3 scalars) | 162,519 | 2,710,789 | 16.7 | (a) |
+| selfcompile | `syntax/lexer.Lexer.ident` compiler/syntax/lexer.or:483 | string (identifier text) | 189,457 | 2,608,883 | 13.8 | - |
+| selfcompile | `verify/state.State.constructor` compiler/verify/state.or:267 | class object State {ls, holes} (2 refs) | 649,374 | 2,329,054 | 3.6 | (c) |
+| http_parse | `stdlib/bytes.bytesFromString` stdlib/bytes.or:254 | array<u8> | 5 | 2,291,409 | 458281.8 | - |
+| selfcompile | `verify/verify.entryState` compiler/verify/verify.or:85 | array<ref> | 4,723 | 2,163,041 | 458.0 | - |
+| selfcompile | `syntax/lexer.Lexer.emit` compiler/syntax/lexer.or:465 | record Token {kind, text, span, ...} | 474,309 | 1,861,715 | 3.9 | - |
+| selfcompile | `loader/sources.Sources.read` compiler/loader/sources.or:61 | Result | 336 | 1,851,604 | 5510.7 | (a) |
 
 ## COW copies
 
 | workload | site | copies | allocations there | class |
 | --- | --- | ---: | ---: | --- |
-| selfcompile | `verify/rules.setLs` compiler/verify/rules.or:48 `makeunique l7` | 580,599 | 580,599 | - |
-| selfcompile | `verify/rules.setLs` compiler/verify/rules.or:48 `makeunique l6` | 580,401 | 580,401 | - |
-| selfcompile | `verify/rules.setLs` compiler/verify/rules.or:48 `makeunique l4` | 285,306 | 285,306 | ? |
-| selfcompile | `opt/analysis.ancestors` compiler/opt/analysis.or:195 `arraypush l20, l19` | 151,440 | 151,440 | ? |
-| selfcompile | `lower/builder.BlockBuilder.emit` compiler/lower/builder.or:96 `makeunique l3` | 123,440 | 123,440 | (e) |
-| selfcompile | `lower/builder.BlockBuilder.emit` compiler/lower/builder.or:96 `arraypush l6, l5` | 123,440 | 123,440 | (e) |
-| selfcompile | `lower/builder.BlockBuilder.emit` compiler/lower/builder.or:97 `arraypush l8, l7` | 123,440 | 123,440 | (e) |
-| selfcompile | `verify/rules.killBorrows` compiler/verify/rules.or:139 `makeunique l20` | 54,754 | 54,754 | - |
-| selfcompile | `verify/rules.killBorrows` compiler/verify/rules.or:139 `makeunique l21` | 54,754 | 54,754 | - |
-| selfcompile | `syntax/parser.Parser.expectP` compiler/syntax/parser.or:582 `makeunique l2` | 54,382 | 54,382 | ? |
+| selfcompile | `verify/rules.Transfer.set` compiler/verify/rules.or:243 `makeunique l6` | 427,235 | 427,235 | (g) |
+| selfcompile | `opt/analysis.ancestors` compiler/opt/analysis.or:469 `arraypush l50, l19` | 166,116 | 166,116 | (e) |
+| selfcompile | `verify/rules.Transfer.set` compiler/verify/rules.or:243 `makeunique l4` | 119,252 | 119,252 | (d) |
+| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:205 `arraypush l33, l32` | 32,545 | 32,545 | (e) |
+| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:206 `arraypush l35, l34` | 32,545 | 32,545 | (e) |
+| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:207 `arraypush l36, true` | 32,545 | 32,545 | (e) |
+| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:204 `makeunique l3` | 24,855 | 24,855 | (e) |
+| selfcompile | `array/map.mapSet<string,check/fnctx.Bind>` array/map.or:204 `makeunique l31` | 24,855 | 24,855 | (e) |
+| selfcompile | `check/fnctx.FnCtx.newLocal` compiler/check/fnctx.or:254 `arraypush l12, l11` | 21,161 | 21,161 | (e) |
+| selfcompile | `check/fnctx.Scope.bind` compiler/check/fnctx.or:72 `makeunique l3` | 20,975 | 20,975 | (e) |
 
 <!-- generated: end -->
 

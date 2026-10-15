@@ -21,7 +21,8 @@ API table (`compiler/mcp/apitable.or`).
 | `std:net` | Orin, `stdlib/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
 | `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
 | `std:text` | Orin, `stdlib/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
-| `std:html` | Orin, `stdlib/html.or` | `Html`, `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the functions JSX (ADR-0043) compiles to; below, "std:html" |
+| `std:html` | Orin, `stdlib/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
+| `std:ox` | Orin, `stdlib/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
 | `std:taskcore` | Orin, `stdlib/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
 | `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
 | `parallel()` on arrays | Orin prelude (`array/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
@@ -727,13 +728,21 @@ What ADR-0033 provides is enough to do that *correctly*; what it lacks to do it 
 None of this changes `std:http` itself; items 1, 3 and 4 are L0/L1 additions (about 40 lines of C with contracts), the
 rest is `std:net` design.
 
-## std:html: escaping and rendering for JSX
+## std:ox: the OX provider protocol
 
-`std:html` (`stdlib/html.or`, pure Orin, no platform calls) is the run-time side of JSX (ADR-0043, being written): a JSX
-element compiles to calls of the functions below, and the only way to put a `string` into HTML is through them. `Html`
-is *rendered, trusted HTML*: only JSX, `trustHtml` and this module construct it (the compiler rejects the record
-literal `Html { .. }` and an assignment to `.html` outside the module), so text from the outside can reach the page
-only escaped, and raw markup is always a visible `trustHtml(...)` call.
+`std:ox` (`stdlib/ox.or`) holds only types: `Markup<R>` (a provider that serialises markup to text: `wrap`, `embed`,
+`embedAll`, `text`, `attr`, attribute `rules`, the static `escapes` table, `voidTags`, `voidEnd`, `rawTextTags`,
+`presenceAttrs`), `Components<R>` (a provider that builds values: `fragment`, `text`), `AttrRule` and `Escape`. A provider
+module exports `function ox()` returning one such literal; the compiler reads it (ADR-0044, docs/ox.md).
+
+## std:html: escaping and rendering for OX
+
+`std:html` (`stdlib/html.or`, pure Orin, no platform calls) is the HTML provider of OX (ADR-0044): `import ox from
+"std:html";` selects it, and its `ox()` literal holds every HTML rule (escape table, void and raw-text elements, URL and
+event attributes). Markup compiles to calls of the functions below, and the only way to put a `string` into HTML is
+through them. `Html` is *rendered, trusted HTML* and `@Sealed`: only OX, `trustHtml` and this module construct it (the
+compiler rejects the record literal `Html { .. }` and an assignment to `.html` outside the module), so text from the
+outside can reach the page only escaped, and raw markup is always a visible `trustHtml(...)` call.
 
 ### API
 
@@ -750,7 +759,8 @@ only escaped, and raw markup is always a visible `trustHtml(...)` call.
 | `render(h): string`, `document(h): string`, `isEmpty(h): bool` | `h.html`; `"<!DOCTYPE html>" + h.html`; `h.html == ""` |
 | `needsEscape(s)`, `hasSafeScheme(u)`, `isSafeUrl(u)` | predicates used by the contracts (exported so that they can be tested and used in other contracts) |
 
-The names and signatures are the interface JSX is compiled against.
+`ox()` names `trustHtml`, `render`, `joinAll`, `escape` and `escapeUrl` as the provider functions (`wrap`, `embed`,
+`embedAll`, `text` / `attr`, the URL rule); the first three are `@Inline`.
 
 ### Escaping
 
