@@ -21,7 +21,7 @@ while [ $# -gt 0 ]; do
     --quiet) quiet=true ;;
     --verbose) verbose=true ;;
     --ascii) ascii=true ;;
-    --format=json) json=true; args+=("$1") ;;
+    --format=json) json=true ;;
     *) args+=("$1") ;;
   esac
   shift
@@ -37,7 +37,8 @@ if $ascii || [ "${TERM:-}" = dumb ]; then mark_ok=OK; mark_fail=FAIL; mark_arrow
 safe() { LC_ALL=C sed 's/[[:cntrl:]]/?/g'; }
 paint() { if $use_color; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
 status() { $quiet || { paint 32 "$mark_ok"; printf ' %s\n' "$1" | safe; } >&2; }
-fail() { paint '1;31' 'error:' >&2; printf ' %s\n' "$1" | safe >&2; exit "${2:-1}"; }
+result_json() { "$BIN" __result "$command" "$1" "${2:-message}" "${3:-}"; }
+fail() { if $json; then result_json false error "$1"; exit "${2:-1}"; fi; paint '1;31' 'error:' >&2; printf ' %s\n' "$1" | safe >&2; exit "${2:-1}"; }
 need_project() {
   project=$PWD
   while [ ! -f "$project/orin.toml" ]; do
@@ -162,6 +163,7 @@ HTTP
   cp "$staging/tests/main_test.or" "$target/tests/main_test.or"
   [ -e "$target/.gitignore" ] || cp "$staging/.gitignore" "$target/.gitignore"
   rm -rf "$staging"
+  if $json; then result_json true path "$target"; return; fi
   status "Created $name"
   if ! $quiet; then printf '\nNext steps\n' >&2; [ "$target" = . ] || printf '  cd %q\n' "$target" >&2; printf '  orin run\n  orin test\n' >&2; fi
 }
@@ -180,16 +182,24 @@ fingerprint() {
     printf '%s\n' "$CC" "$profile" "$backend" "${target:-}"
     cksum "$BIN" "$HERE/bin/orin-cli.sh"
     for file in "$RT"/*.[ch] "$PF"/*.[ch]; do cksum "$file"; done
-    while IFS= read -r -d '' file; do printf '%s\n' "$file"; cksum "$file"; done < <(find "$root" -type d \( -name .git -o -name build \) -prune -o -type f \( -name '*.or' -o -name orin.toml -o -name orin.lock \) -print0 | sort -z)
-    if [ -f "$root/orin.toml" ]; then
-      while IFS='|' read -r depname deppath depgit deptag deprev depdev; do
-        [ -n "$deppath" ] || continue
-        while IFS= read -r -d '' file; do printf '%s\n' "$file"; cksum "$file"; done < <(find "$root/$deppath" -type f \( -name '*.or' -o -name orin.toml \) -print0 | sort -z)
-      done < <(info dependencies "$root")
-    fi
     command -v "${CC%% *}" || true
     ${CC} --version 2>/dev/null || true
+    source_fingerprint "$root" ""
   } | cksum
+}
+source_fingerprint() {
+  local root=$1 trail=$2 file depname deppath depgit deptag deprev depdev dependencies
+  case "|$trail|" in *"|$root|"*) printf 'error: dependency cycle at %s\n' "$root" >&2; return 1;; esac
+  while IFS= read -r -d '' file; do printf '%s\n' "$file"; cksum "$file" || return; done < <(find "$root" -type d \( -name .git -o -name build -o -name .orin \) -prune -o -type f \( -name '*.or' -o -name orin.toml -o -name orin.lock \) -print0 | sort -z)
+  if [ -f "$root/orin.toml" ]; then
+    dependencies=$(info dependencies "$root") || return
+    while IFS='|' read -r depname deppath depgit deptag deprev depdev; do
+      [ -n "$depname" ] || continue
+      local dep_root
+      dep_root=$(cd "$root/${deppath:-.orin/packages/$depname}" 2>/dev/null && pwd) || { printf "error: Dependency '%s' is unavailable. Run 'orin fetch'.\n" "$depname" >&2; return 1; }
+      source_fingerprint "$dep_root" "$trail|$root" || return
+    done <<< "$dependencies"
+  fi
 }
 native_build() {
   local src=$1 out=$2 tmp key previous='' ccflags=-O1
@@ -271,6 +281,7 @@ test_command() {
       *) [ -z "$src" ] || fail 'Expected one test target.' 2; src=$1 ;;
     esac; shift
   done
+  $json && flags+=(--format=json)
   project_target "$src"
   if [ -f "$target" ]; then compiler test --runtime "$RT" --cc "$CC" "$target" "${flags[@]}"; return; fi
   local entry; entry=$(info entry "$project")
@@ -332,19 +343,21 @@ fetch_dependencies() {
       fetch_dependencies "$cached" "$offline" "$locked" '' "$nexttrail"
     fi
   done < "$depfile"
+  local have_deps=false; [ ! -s "$depfile" ] || have_deps=true
   rm -f "$depfile"
+  if $locked && ! $have_deps && [ ! -f "$root/orin.lock" ]; then rm -f "$newlock"; return; fi
   if $locked; then
     if [ ! -f "$root/orin.lock" ] || ! cmp -s "$newlock" "$root/orin.lock"; then rm -f "$newlock"; fail 'Lockfile is out of date.'; fi
     rm -f "$newlock"
   else mv "$newlock" "$root/orin.lock"; fi
 }
 package_command() {
-  need_project
+  if [ -z "${ORIN_TREE_ROOT:-}" ]; then need_project; else project=$ORIN_TREE_ROOT; fi
   local name='' path='' giturl='' refkey='' ref='' dev=false offline=false locked=false tree=false arg
   while [ $# -gt 0 ]; do
     case $1 in
       --path|--git|--tag|--rev|--name) [ $# -ge 2 ] || fail "Missing value for $1" 2
-        case $1 in --path) path=$2;; --git) giturl=$2;; --tag) refkey=tag; ref=$2;; --rev) refkey=rev; ref=$2;; --name) name=$2;; esac; shift ;;
+        case $1 in --path) path=$2;; --git) giturl=$2;; --tag) [ -z "$refkey" ] || fail 'Choose --tag or --rev once.' 2; refkey=tag; ref=$2;; --rev) [ -z "$refkey" ] || fail 'Choose --tag or --rev once.' 2; refkey=rev; ref=$2;; --name) name=$2;; esac; shift ;;
       --dev) dev=true;; --offline) offline=true;; --locked) locked=true;; --tree) tree=true;;
       -*) fail "Unknown $command option: $1" 2;;
       *) [ -z "$name" ] || fail 'Expected one dependency name.' 2; name=$1;;
@@ -355,16 +368,19 @@ package_command() {
     while IFS='|' read -r dn dp dg dt dr dd; do
       local suffix=''; [ "$dd" != true ] || suffix=' (dev)'
       printf '%s  %s%s\n' "$dn" "${dp:-$dg}" "$suffix"
-      if $tree; then printf '  public API: src/module.or\n'; fi
+      if $tree; then
+        local subroot=$project/${dp:-.orin/packages/$dn}
+        (ORIN_TREE_ROOT=$subroot; command=deps; package_command --tree) | sed 's/^/  /'
+      fi
     done < <(info dependencies "$project")
     return
   fi
-  if [ "$command" = fetch ] || [ "$command" = update ]; then fetch_dependencies "$project" "$offline" "$locked" "$([ "$command" = update ] && echo "${name:-*}" || true)"; status 'Dependencies ready'; return; fi
+  if [ "$command" = fetch ] || [ "$command" = update ]; then fetch_dependencies "$project" "$offline" "$locked" "$([ "$command" = update ] && echo "${name:-*}" || true)"; if $json; then result_json true message 'Dependencies ready'; else status 'Dependencies ready'; fi; return; fi
   if [ "$command" = add ]; then
     [ -n "$path" ] || [ -n "$giturl" ] || fail 'Use --path or --git. Registry packages are not available yet.' 2
     [ -z "$path" ] || [ -z "$giturl" ] || fail 'Choose --path or --git.' 2
     if [ -n "$path" ]; then
-      local depdir; depdir=$(cd "$path" && pwd)
+      local depdir; depdir=$(cd "$path" 2>/dev/null && pwd) || fail "Dependency path does not exist: $path"
       [ -n "$name" ] || name=$(info name "$depdir")
       # Store an absolute path if the user invokes add from a nested project directory.
       [ "$PWD" = "$project" ] || path=$depdir
@@ -384,7 +400,7 @@ package_command() {
     if [ -f "$backup/orin.lock" ]; then cp "$backup/orin.lock" "$project/orin.lock"; else rm -f "$project/orin.lock"; fi
     rm -rf "$backup"; return 1
   fi
-  rm -rf "$backup"; status "Updated orin.toml and orin.lock · $name"
+  rm -rf "$backup"; if $json; then result_json true dependency "$name"; else status "Updated orin.toml and orin.lock · $name"; fi
 }
 watch_command() {
   local mode=$1; shift
@@ -422,6 +438,9 @@ watch_command() {
     sleep 0.3
   done
 }
+if $json; then
+  case $command in init|add|remove|fetch|update|build|clean|test|check|compile|verify|api|effects|graph|diff) ;; *) fail "--format=json is not supported by $command." 2;; esac
+fi
 case $command in
   --help|-h|help)
     if [ ${#args[@]} -gt 0 ]; then help_command "${args[0]}"; else help_main; fi ;;
@@ -431,15 +450,15 @@ case $command in
     for arg in "${args[@]}"; do if [ "$arg" = --help ] || [ "$arg" = -h ]; then help_command "$command"; exit 0; fi; done
     case $command in
       init) init_project "${args[@]}" ;;
-      build) build_command "${args[@]}" ;;
-      run) build_command "${args[@]}"; $quiet || printf '%s Running %s\n\n' "$mark_arrow" "$(basename "$artifact")" >&2; exec "$artifact" "${program_args[@]}" ;;
+      build) build_command "${args[@]}"; if $json; then result_json true artifact "$artifact"; fi ;;
+      run) $json && fail 'run does not support --format=json; application stdout belongs to the program.' 2; build_command "${args[@]}"; $quiet || printf '%s Running %s\n\n' "$mark_arrow" "$(basename "$artifact")" >&2; exec "$artifact" "${program_args[@]}" ;;
       dev) watch_command run "${args[@]}" ;;
       test)
         watching=false; testargs=(); for arg in "${args[@]}"; do if [ "$arg" = --watch ]; then watching=true; else testargs+=("$arg"); fi; done
         if $watching; then watch_command test "${testargs[@]}"; else test_command "${testargs[@]}"; fi ;;
       fmt) format_command "${args[@]}" ;;
       add|remove|fetch|update|deps) package_command "${args[@]}" ;;
-      clean) need_project; [ ! -L "$project/build" ] || fail 'Refusing to clean a symlinked build directory.'; rm -rf "$project/build"; status 'Cleaned build artifacts' ;;
+      clean) need_project; [ ! -L "$project/build" ] || fail 'Refusing to clean a symlinked build directory.'; rm -rf "$project/build"; if $json; then result_json true message 'Cleaned build artifacts'; else status 'Cleaned build artifacts'; fi ;;
       doctor) ORIN_LEGACY_DRIVER=1 exec "$HERE/bin/orin" doctor ;;
       explain) [ ${#args[@]} -eq 1 ] || fail 'Usage: orin explain <diagnostic-code>' 2; case ${args[0]} in
         E0300) printf 'E0300: Unknown name or type\n\nCheck spelling, imports, and the declaration scope.\n' ;;
@@ -455,8 +474,9 @@ case $command in
           case $arg in --z3|--module|--function|--check|-o) expect=true;; -*) ;; *) haspath=true;; esac
         done
         if ! $haspath; then need_project; args=("$project" "${args[@]}"); fi
+        $json && args+=(--format=json)
         compiler "$command" "${args[@]}" ;;
-      compile|diff) compiler "$command" "${args[@]}" ;;
+      compile|diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
       *) fail "Unknown command '$command'. Run 'orin --help' to see available commands." 2 ;;
     esac ;;
 esac

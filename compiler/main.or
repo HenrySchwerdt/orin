@@ -27,7 +27,7 @@ import { SourceMap, Diagnostic, render, describeSpan, TerminalOptions, terminalO
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
 import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts, parallelWarnings } from "./check";
-import { runTestCommand, hasTests, eraseTests } from "./testing";
+import { runTestCommand, hasTests, eraseTests, ensureMain } from "./testing";
 import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
 import { moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff, effectPolicyDiags, policySourceMap } from "./analysis";
@@ -40,7 +40,7 @@ import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
 import { fuseProgram, FuseOut, ChainInfo } from "./fuse";
 import { Program } from "./hir";
-import { runFmt, printDiagnosticsJson, runGraph, runDiff, runEffects, runPackage } from "./tools";
+import { runFmt, printDiagnosticsJson, runGraph, runDiff, runEffects, runPackage, jsonString } from "./tools";
 import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
@@ -139,7 +139,12 @@ function main(host: Host): void {
 }
 
 function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
-  const ui = terminalOptions(args(proc));
+  const raw = args(proc);
+  if (raw.length == 5 && raw[0] == "__result") {
+    console.log("{\"schemaVersion\":1,\"command\":" + jsonString(raw[1]) + ",\"ok\":" + raw[2] + "," + jsonString(raw[3]) + ":" + jsonString(raw[4]) + "}");
+    return;
+  }
+  const ui = terminalOptions(raw);
   const all = ui.args;
   if (all.length >= 1 && all[0] == "__package") {
     exit(runPackage(fs, all.slice(1, all.length)));
@@ -266,6 +271,9 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   let program = loaded.program.unwrap();
+  if (cmd == "check" && program.manifest.isSome() && program.manifest.unwrap().entry.endsWith("module.or")) {
+    program = ensureMain(program);
+  }
   if (cmd == "api") {
     const ci = checkWithIndex(program, loaded.sm);
     if (ci.result.isErr()) {
@@ -318,7 +326,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     printDiagnosticsJson(loaded.sm, pw);
   } else if (pw.length > 0 && !json) {
     for (const d of pw) {
-      console.error(render(loaded.sm, d));
+      console.error(ui.rich ? renderTerminal(loaded.sm, d, ui.color, ui.ascii) : render(loaded.sm, d));
     }
   }
   if (!withTests) {
