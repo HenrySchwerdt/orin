@@ -1,16 +1,21 @@
 # Installing Orin
 
-Orin ships as a tarball per platform. Every release (all are experimental pre-releases today) has:
+Orin ships experimental pre-release tarballs. The [current release workflow](../.github/workflows/release.yml)
+targets four platforms; available downloads depend on the version:
 
-| Platform | File |
-|---|---|
-| Linux x86-64 | `orin-<version>-linux-x86_64.tar.gz` |
-| Linux arm64 | `orin-<version>-linux-aarch64.tar.gz` |
-| macOS Apple silicon | `orin-<version>-macos-arm64.tar.gz` |
-| macOS Intel | `orin-<version>-macos-x86_64.tar.gz` |
+| Platform | Workflow filename | Published v0.1.0-alpha.2 asset |
+|---|---|---|
+| Linux x86-64 | `orin-<version>-linux-x86_64.tar.gz` | available |
+| Linux arm64 | `orin-<version>-linux-aarch64.tar.gz` | absent |
+| macOS Apple silicon | `orin-<version>-macos-arm64.tar.gz` | available |
+| macOS Intel | `orin-<version>-macos-x86_64.tar.gz` | absent |
 
-plus `<file>.sha256` for each and one combined `SHA256SUMS`. Windows: [windows.md](windows.md) (WSL2 today,
-native later).
+As checked on 2026-10-15, [v0.1.0-alpha.2](https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.2)
+is the latest published release. It contains those two tarballs and a combined `SHA256SUMS`, without
+individual `.sha256` assets. The current workflow additionally generates `<file>.sha256` for each tarball
+and a combined `SHA256SUMS`; that configuration is not a claim that older releases contain all four targets.
+Features documented on main can be newer than the downloaded alpha. Check the selected release's assets
+before choosing a platform/version. Windows: [windows.md](windows.md) (WSL2 today, native later).
 
 **Requirements:** Bash 3.2 or later for the release CLI, and a C compiler (`cc`, gcc or clang) on PATH, because the default backend emits C and
 `orin build/run/test` compile it. The release binaries are built on glibc (Linux) and the macOS runners'
