@@ -10,7 +10,7 @@ mkdir -p build/tests build/resources
 
 build() { # name
   $ORIN2 compile tests/next/run/$1.or -o build/resources/$1.c
-  cc -O1 -w -I runtime build/resources/$1.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/resources/$1
+  cc -O1 -w -DORIN_STATS_ENABLED -I runtime build/resources/$1.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/resources/$1
 }
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
