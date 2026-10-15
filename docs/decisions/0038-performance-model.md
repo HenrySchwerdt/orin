@@ -448,7 +448,9 @@ only at the forwarded loads (77 in `compiler/main.or`). Deviations from the
 text below, all on the conservative side: an `IForward` is also a source for the forwards after it (otherwise the third load of a slot could never be
 forwarded); the scan is an allow-list (an instruction that mentions `o` and is not one of the listed harmless reads ends it); reference slots
 (`IBorrow(d, earlier)`) are not forwarded: accepting that needs the verifier's state at every position, so the pass leaves them as they are; the
-object of an `IForward` must be a reference local (an unboxed aggregate is already in registers).
+object of an `IForward` must be a reference local (an unboxed aggregate is already in registers); a load that overwrites its own index local
+(`i = arrayget o[i]`) is not a source (found in review: the first version accepted it). Lean lemmas: `formal/Orin/Forward.lean`
+(`load_load`, `store_load`, `store_frame_other_slot`, `store_frame_other_local`, `makeUnique_frame`).
 
 - *MIR change:* v2.4. `IForward(d, s, o, key)`: `d = s` (a scalar copy), claiming that `s` holds the current value of slot
   `key` of `o` (a field index, or an array index operand). It is emitted in place of the second `getfield` / `arrayget` of a

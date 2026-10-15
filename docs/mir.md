@@ -225,8 +225,10 @@ under it (`run_tests.py --assert-facts`). Evidence, not proof (ADR-0032 addendum
 *Tests.* `compiler/tests/verify_main.or` `forwardCases`, `compiler/tests/opt_test.or` (T4 section). Mutation corpus (`tools/mutate_mir.py`, run on
 every `forward` of the optimised conformance corpus): `fwd-across-write`, `fwd-other-slot-ok` (a positive control: a write to a different slot is
 accepted), `fwd-after-redef-obj`, `fwd-after-redef-src`, `fwd-across-push`, `fwd-wrong-slot`, `fwd-across-block`.
-Lean: the two lemmas T4 needs (a load after a load or store of the same slot with no write and no redefinition in between returns the same value; `makeUnique` preserves every
-slot) are not in `formal/` yet; F1 is listed with the rules not yet in the model (docs/tcb.md).
+Lean (`formal/Orin/Forward.lean`): `load_load` and `store_load` (a load after a load or store of the same slot, with no write and no
+redefinition in between, returns the same value), `store_frame_other_slot`, `store_frame_other_local` (a store through another local cannot
+change `o`'s slots in a well-formed state) and `makeUnique_frame` (`makeUnique` keeps every slot). They prove the facts F1 relies on in the
+model; the Orin scan itself is not proved equal to them, and calls and array length are outside the model.
 
 ## Unboxed aggregates (v2.2, ADR-0038 step 1)
 `MAgg(n)` is a value of n + 1 words: `w[0]` the tag, `w[1..n]` the payload. A payload is a sequence of *slots*: a scalar slot (int, usize,

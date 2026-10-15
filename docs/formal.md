@@ -126,6 +126,14 @@ Uniqueness and value semantics (`COW.lean`, `Final.lean`):
   other local `z` and every pending entry has exactly the same `view` (at every depth) as before.
   In particular an alias of the old object keeps observing the old contents.
 
+Load forwarding (`Forward.lean`, ADR-0038 lever 2 T4, the facts behind verifier rule F1):
+* `load_load` / `store_load` - a load of slot `i` of `x` after a load of the same slot into `y ≠ x`, or after a store of `y`
+  into it, returns exactly the value of `y`.
+* `store_frame_other_slot`, `store_frame_other_local` - a store into another slot of the same object, or through another local
+  (which needs count 1, so it cannot be `x`'s object in a well-formed state), leaves every slot of `x` unchanged.
+* `makeUnique_frame` - `makeUnique x` keeps every slot value of `x` (shallow copy).
+Calls and array length are outside the model; F1 ends its scan at any call that receives the object.
+
 `view H f v` (`View.lean`) is the depth-`f` structural unfolding of the value denoted by `v`:
 scalars are themselves, a reference denotes the tuple of the views of its fields. Counts and
 addresses are not observable. The statement is therefore the logical-snapshot semantics of
