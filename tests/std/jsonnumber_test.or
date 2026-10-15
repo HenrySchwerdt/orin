@@ -1,0 +1,217 @@
+import { assert, assertEq, assertEqString, assertEqUsize } from "std:test";
+import {
+  JsonNumber, NumberErrorKind, jsonNumber, numberFromInt, numberAsInt, numberErrorMessage,
+} from "std:jsonnumber";
+
+function kindName(k: NumberErrorKind): string {
+  return match (k) {
+    InvalidNumber => "syntax",
+    NumberLimit => "limit",
+    InvalidLimits => "limits",
+    NotIntegral => "fraction",
+    IntegerRange => "range",
+    NonFinite => "finite",
+    FloatOverflow => "overflow",
+    FloatUnderflow => "underflow",
+  };
+}
+
+function integer(s: string, expected: int): void {
+  const n = jsonNumber(s, s.length).unwrap();
+  assertEqString(n.token, s, "exact spelling");
+  assertEq(numberAsInt(n).unwrap(), expected, s);
+}
+
+function conversionError(s: string, expected: string): void {
+  const r = numberAsInt(jsonNumber(s, s.length).unwrap());
+  assert(r.isErr(), "conversion fails");
+  assertEqString(kindName(r.unwrapErr().kind), expected, s);
+  assert(r.unwrapErr().offset.isNone(), "valid-token conversion has no source offset");
+}
+
+function invalid(s: string, at: usize): void {
+  const r = jsonNumber(s, s.length + 1);
+  assert(r.isErr(), "malformed token");
+  assertEqString(kindName(r.unwrapErr().kind), "syntax", "syntax error kind");
+  assertEqUsize(r.unwrapErr().offset.unwrap(), at, s);
+}
+
+@Test
+function knownExactIntegers(): void {
+  integer("0", 0);
+  integer("-0", 0);
+  integer("-0.000e999999999999999999999999", 0);
+  integer("0e-999999999999999999999999999999", 0);
+  integer("1", 1);
+  integer("-42", -42);
+  integer("1.00", 1);
+  integer("1e3", 1000);
+  integer("1E+0003", 1000);
+  integer("1000e-3", 1);
+  integer("0.00100e3", 1);
+  integer("100.0e-2", 1);
+  integer("1.0e-0", 1);
+  integer("9007199254740993", 9007199254740993);
+  integer("9223372036854775807", 9223372036854775807);
+  integer("-9223372036854775808", -9223372036854775807 - 1);
+  integer("92233720368547758070e-1", 9223372036854775807);
+  integer("-9.223372036854775808e18", -9223372036854775807 - 1);
+  integer("0.09223372036854775807e20", 9223372036854775807);
+  integer("-92233720368547758080000e-4", -9223372036854775807 - 1);
+}
+
+@Test
+function rangesAndFractions(): void {
+  for (const s of [
+    "9223372036854775808",
+    "-9223372036854775809",
+    "18446744073709551615",
+    "1e19",
+    "-1e19",
+    "1e9999999999999999999999999999",
+    "1.000e100",
+    "922337203685477580700e-1",
+  ]) {
+    conversionError(s, "range");
+  }
+  for (const s of [
+    "1.25",
+    "1e-1",
+    "-0.001",
+    "1e-9999999999999999999999999999",
+    "922337203685477580700.1",
+    "100e-3",
+    "0.0001e3",
+  ]) {
+    conversionError(s, "fraction");
+  }
+  integer("1e0000000000000000000000000", 1);
+  integer("100000000000000000000e-20", 1);
+}
+
+@Test
+function grammarAndOffsets(): void {
+  invalid("", 0);
+  invalid("-", 1);
+  invalid("+1", 0);
+  invalid("01", 1);
+  invalid("-01", 2);
+  invalid(".5", 0);
+  invalid("1.", 2);
+  invalid("1e", 2);
+  invalid("1e+", 3);
+  invalid("1e-", 3);
+  invalid("1e+x", 3);
+  invalid("1.e1", 2);
+  invalid("1E2x", 3);
+  invalid("0x1", 1);
+  invalid("NaN", 0);
+  invalid("Infinity", 0);
+  invalid("-Infinity", 1);
+  invalid(" 1", 0);
+  invalid("1 ", 1);
+  invalid("1\n", 1);
+  invalid("1\0", 1);
+  invalid("1\xff", 1);
+  invalid("--1", 1);
+  invalid("1_000", 1);
+  invalid("1e1.2", 3);
+  const token = "12.3e+45";
+  let i: usize = 0;
+  while (i <= token.length) {
+    const s = token.substring(0, i);
+    const r = jsonNumber(s, 100);
+    const valid = i == 1 || i == 2 || i == 4 || i == 7 || i == 8;
+    assert(r.isOk() == valid, "every truncation point");
+    if (!valid) {
+      assertEqUsize(r.unwrapErr().offset.unwrap(), i, "missing digit at EOF");
+    }
+    i += 1;
+  }
+}
+
+@Test
+function limitsAndMessages(): void {
+  const zero = jsonNumber("1", 0).unwrapErr();
+  assertEqString(kindName(zero.kind), "limits", "zero budget rejected first");
+  assert(zero.offset.isNone(), "invalid configuration has no byte position");
+  assert(jsonNumber("1e3", 3).isOk(), "exact byte limit");
+  const short = jsonNumber("1e3", 2).unwrapErr();
+  assertEqString(kindName(short.kind), "limit", "length limit");
+  assertEqUsize(short.offset.unwrap(), 2, "first byte beyond budget");
+  const precedence = jsonNumber("x---", 1).unwrapErr();
+  assertEqString(kindName(precedence.kind), "limit", "budget check precedes syntax scan");
+  assertEqString(
+    numberErrorMessage(jsonNumber("1e+", 4).unwrapErr()),
+    "invalid JSON number at byte 3",
+    "syntax message",
+  );
+  assertEqString(
+    numberErrorMessage(numberAsInt(jsonNumber("1.5", 3).unwrap()).unwrapErr()),
+    "JSON number is not an integer",
+    "conversion message",
+  );
+}
+
+@Test
+function allByteClasses(): void {
+  let i = 0;
+  while (i < 256) {
+    const c = String.fromCharCode(i);
+    const isDigit = i >= 48 && i <= 57;
+    assert(jsonNumber(c, 10).isOk() == isDigit, "one byte grammar");
+    assert(jsonNumber("1" + c, 10).isOk() == isDigit, "integer suffix byte");
+    assert(
+      jsonNumber("1e" + c + "1", 10).isOk() == (isDigit || i == 43 || i == 45),
+      "exponent byte classes",
+    );
+    i += 1;
+  }
+}
+
+@Test
+function fromIntRoundTrips(): void {
+  const min = -9223372036854775807 - 1;
+  assertEq(numberAsInt(numberFromInt(min)).unwrap(), min, "minimum round trip");
+  assertEq(
+    numberAsInt(numberFromInt(9223372036854775807)).unwrap(),
+    9223372036854775807,
+    "maximum round trip",
+  );
+  let state = 1729;
+  let i = 0;
+  while (i < 2000) {
+    state = (state * 251 + 17) % 65521;
+    const v = (state - 32760) * 100000000000;
+    const n = numberFromInt(v);
+    assertEqString(n.token, v.toString(), "int spelling");
+    assertEq(numberAsInt(n).unwrap(), v, "int round trip");
+    i += 1;
+  }
+}
+
+@Test
+function largeExponentAndCancellation(): void {
+  // Geometric doubling keeps fixture construction linear with contracts enabled.
+  // Per-byte ByteBuilder append contracts snapshot old(this), retaining the
+  // backing array across each mutation and forcing a copy on every append.
+  let zeros = "0";
+  let nines = "9";
+  while (zeros.length < 100000) {
+    zeros = zeros + zeros;
+    nines = nines + nines;
+  }
+  const z = zeros.substring(0, 100000);
+  const e = nines.substring(0, 100000);
+  assertEqUsize(z.length, 100000, "stress zero-run length");
+  assertEqUsize(e.length, 100000, "stress exponent-run length");
+  integer("0e" + e, 0);
+  integer("-0.0e-" + e, 0);
+  conversionError("1e" + e, "range");
+  conversionError("1e-" + e, "fraction");
+  integer("0." + z + "1e100001", 1);
+  integer("1" + z + "e-100000", 1);
+  conversionError("0." + z + "1e100000", "fraction");
+  // Values just beyond token-length saturation can still fit after cancellation.
+  integer("0.000000000000001e21", 1000000);
+}
