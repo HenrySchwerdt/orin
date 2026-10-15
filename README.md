@@ -49,14 +49,20 @@ experience, not a misleading promise of full ecosystem compatibility.
 
 ### Where we're going
 
-The next major goal is **enforced capabilities and process-level data lineage**. With trusted
+Current source implements **root capability grants and effect-policy checks** (Stages A/B).
+Grant-based std I/O checks authority at each operation; grants do not sandbox native code or spawned
+commands. The std I/O APIs remain unstable pending the owner's freeze decision. See
+[capabilities and their limits](docs/capabilities.md). Older published alpha packages may predate
+APIs described on main.
+
+The next major goal is **process-level data lineage**. With trusted
 I/O boundaries and protocol/resource bindings, OSIG should eventually be able to trace
 an input (such as an HTTP request or Kafka message) through service calls and field
 transformations to an external output — and show how a PR changes that process.
 The [capability design](docs/decisions/0021-capabilities-and-io-provenance.md) and
 [verifiable-software roadmap](docs/decisions/0020-verifiable-software-roadmap.md) specify this work.
 
-**These capabilities, field-level lineage, cross-service process discovery and signed
+**Field-level lineage, cross-service process discovery and signed
 `.orcert` attestations are planned, not shipping features.** Even when implemented,
 static analysis may report MAY or UNKNOWN rather than claiming complete certainty.
 
