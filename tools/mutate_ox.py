@@ -37,6 +37,8 @@ MUTANTS = [
     ("sealed-ignored", "check/ox.or", "  if (!env.sealed.some(x => x == qname)) {", "  if (true) {"),
     ("pending-text-dropped", "check/ox.or", "  if (o.pending.length > 0) {\n    ps.push(mk(XStr(o.pending), TyString, span));\n  }\n  ps.push(e);",
      "  ps.push(e);"),
+    # the capacity hint (ADR-0044) only sizes the buffer; this mutant starts the concatenation after the first piece
+    ("capacity-start-drops-first-piece", "check/ox.or", "    i = 0;\n  }", "    i = 1;\n  }"),
     # ---- the checker (check/expr.or, check/stmt.or)
     ("dynamic-child-not-encoded", "check/expr.or",
      "      return Ok(oxOutDyn(o, mk(XCall(p.text, [v]), TyString, span), span));",
