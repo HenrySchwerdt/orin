@@ -692,9 +692,115 @@ function parserBuildsOxElements(): void {
 
 @Test
 function parserRejectsMalformedOx(): void {
-  const bad = ["<a></b>", "<a x=1 />", "<a {...p} />", "<a x=\"1\" x=\"2\" />", "</>", "<>x</a>", "<a>x</>"];
+  const bad = ["<a></b>", "<a x=1 />", "<a {p} />", "<a {...p x=\"1\" />", "<a x=\"1\" x=\"2\" />", "</>", "<>x</a>", "<a>x</>"];
   for (const b of bad) {
     const r = parse(0, "const v = " + b + ";");
     assert(r.isErr(), "rejected: " + b);
   }
+}
+
+// ADR-0044 syntax: `import ox`, spread attributes, named slots.
+
+@Test
+function parserImportOxIsAProvider(): void {
+  const r = parse(0, "import ox from \"std:html\";\nimport { a } from \"m\";");
+  assert(r.isOk(), "parses");
+  match (r.unwrap().items[0]) {
+    IImport(d) => {
+      assert(d.provider, "provider");
+      assertEqUsize(d.names.length, 0, "binds no name");
+      assertEqString(d.path, "std:html", "path");
+    },
+    _ => {
+      assert(false, "not an import");
+    },
+  }
+  match (r.unwrap().items[1]) {
+    IImport(d) => {
+      assert(!d.provider, "ordinary import");
+    },
+    _ => {
+      assert(false, "not an import");
+    },
+  }
+  assertEqString(errOf("import ox from \"a\";\nimport ox from \"b\";").code, "E0200", "second provider");
+  assert(parse(0, "import { ox } from \"a\"; import ox from \"b\";").isOk(), "ox as a name is still a name");
+  assert(parse(0, "export ox from \"a\";").isErr(), "no export ox");
+}
+
+@Test
+function parserBuildsOxSpreads(): void {
+  const e = parseExpr1("<Card {...p} a=\"1\" {...q.r} />");
+  assert(exprOk(e), "well formed");
+  match (e.kind) {
+    EOx(el) => {
+      assertEqUsize(el.attrs.length, 3, "attributes");
+      assertEqString(el.attrs[0].name.name, "...", "spread name");
+      match (el.attrs[0].value) {
+        JVSpread(_) => {},
+        _ => {
+          assert(false, "not a spread");
+        },
+      }
+      assertEqUsize(oxExprs(el).length, 2, "p and q.r");
+    },
+    _ => {
+      assert(false, "not OX");
+    },
+  }
+  assert(parseExpr1("<div {...p} {...p} />").span.end > 0, "spreads may repeat, on any element at parse time");
+}
+
+@Test
+function parserBuildsOxSlots(): void {
+  const e = parseExpr1("<Dialog><:header>Title {t}<b/></:header>body<:footer></:footer></Dialog>");
+  assert(exprOk(e), "well formed");
+  match (e.kind) {
+    EOx(el) => {
+      assertEqUsize(el.children.length, 3, "slot, text, slot");
+      match (el.children[0]) {
+        JSlot(n, ks, _) => {
+          assertEqString(n.name, "header", "slot name");
+          assertEqUsize(ks.length, 3, "text, expr, element");
+        },
+        _ => {
+          assert(false, "not a slot");
+        },
+      }
+      match (el.children[2]) {
+        JSlot(n, ks, _) => {
+          assertEqString(n.name, "footer", "slot name");
+          assertEqUsize(ks.length, 0, "empty slot");
+        },
+        _ => {
+          assert(false, "not a slot");
+        },
+      }
+      assertEqUsize(oxExprs(el).length, 1, "t");
+    },
+    _ => {
+      assert(false, "not OX");
+    },
+  }
+}
+
+@Test
+function parserRejectsMisplacedOxSlots(): void {
+  const bad = [
+    "<div><:x>a</:x></div>",
+    "<><:x>a</:x></>",
+    "<Card><div><:x>a</:x></div></Card>",
+    "<Card><:x><:y>a</:y></:x></Card>",
+    "<Card><:x>a</:y></Card>",
+    "<Card><:x/></Card>",
+    "<Card><:x a=\"1\">a</:x></Card>",
+    "<Card><:x>a</x></Card>",
+    "<Card>a</:x></Card>",
+  ];
+  for (const b of bad) {
+    const r = parse(0, "const v = " + b + ";");
+    assert(r.isErr(), "rejected: " + b);
+    assertEqString(r.unwrapErr().code, "E0200", "syntax error code: " + b);
+  }
+  assert(parse(0, "const v = <Card><:x>a</Card>;").isErr(), "slot not closed (lexical error)");
 }
