@@ -36,8 +36,9 @@ children, the `<` rule), plus:
 | Form | Meaning |
 |---|---|
 | `import ox from "module";` | selects the file's **OX provider** (§3). At most one per file; it binds no name. |
-| `<Card {...props} title="x" />` | **spread**: every field of the record `props` is an attribute. Components only. |
-| `<Dialog><:header>..</:header>..</Dialog>` | **named slot** `header`: its children fill the component's parameter `header`. Only directly inside a component. `</:header>` must repeat the name. |
+| `<Card {...props} title="x" />` | **spread**: every field of the record `props` is an attribute. On a component it fills parameters (§4.1); on an intrinsic element of a `Markup` provider it expands statically (§4.3). |
+| `<Dialog><:header>..</:header>..</Dialog>` | **named slot** `header`: its children fill the component's parameter `header`. Only directly inside a component or member tag. `</:header>` must repeat the name. |
+| `<ui.Card title="x">..</ui.Card>` | **member tag**: the tag is a dotted path whose last segment starts upper-case; the call of the method `Card` of the value `ui` (§4.5). The closing tag repeats the whole path. |
 | `@Sealed type T = { .. };` | record literals of `T` and assignments to its fields are only allowed in the declaring module (E0495). |
 
 Why `<:name>` for named slots: `<slot name="..">` is a real HTML element (Web Components) and would make the
@@ -45,8 +46,13 @@ notation ambiguous for exactly the provider it must serve; `slot="name"` attribu
 marker on an element and need a wrapper for text; `<template #name>` (Vue) needs a new attribute syntax. `<:name>` is
 not valid HTML or XML, so no provider can mean anything else by it, it is short, and the parser recognises it at `<:`.
 
-Not supported (syntax error or E0491): member tags `<ui.Card>` (Orin has no namespaces or static members yet), spread
-on intrinsic elements (§4.3), namespaced names `xlink:href`.
+A tag is a path `p1.p2. .. .pn`: `p1` is an identifier or `this`, the others identifiers, and `pn` (the last) names what
+is called. With `n > 1` and `pn` starting upper-case the tag is a member tag. A path with `n > 1` whose last segment is
+lower-case is a syntax error, **E0200** (the nearest existing code for "this token is not allowed here"; E0494 is
+reserved for names that are invalid by the notation's lexical rules, and `a.b` is a valid path that only lacks a
+meaning). A closing tag that does not repeat the path is the existing mismatched-closing-tag error (E0200).
+
+Not supported (syntax error or E0491): namespaced names `xlink:href`.
 
 ### 3. Providers
 
@@ -168,24 +174,55 @@ As ADR-0043 §2 / §3, with every HTML rule taken from the provider (`P` = the p
 | `a={s}`, `s: string` | ` a="` + `conv(s)` + `"` where `conv` is the `convert` of the first rule matching `a`, else `P.attr`; a matching rule with `convert: None` makes a computed value **E0493** (static only) |
 | `a={n}`, integer / float | ` a="` + decimal text + `"` (digits, sign, point, exponent: never encoded) |
 | `a={b}`, `b: bool`; bare `a` | ` a` or nothing when `P.presenceAttrs`; E0492 otherwise |
+| `a={o}`, `o: Option<T>` | `None`: nothing; `Some(v)`: as if written `a={v}`. One dynamic piece of the buffer (a match giving the whole ` a="..."` text or `""`). A `convert: None` rule rejects a computed `Option` too (E0493) |
+| `{...r}` | `r` must have a record type (E0492); evaluated once into a temporary, then each field `f` in declaration order is the attribute `f={tmp.f}` at the spread's position (below) |
 | `{s}` child, `s: string` | `P.text(s)` |
 | `{h}` / `{hs}` child of type `R` / `R[]` | `P.embed(h)` / `P.embedAll(hs)` |
 | `{n}` child, number | decimal text |
 | text, `{"s"}`, `{c ? "a" : "b"}` | static encoding at compile time |
 | children of `t` in `P.rawTextTags` | static text only, unencoded, must not contain `</`; anything computed is E0493 |
-| spread, named slot | E0491 (an intrinsic element has no parameters) |
+| named slot | E0491 (an intrinsic element has no parameters) |
 
 A rule matches attribute `a` when `a` is in `names` or starts with a non-empty `prefix`, both compared ASCII
 case-insensitively (HTML attribute names are case-insensitive: `HREF={u}` is a URL attribute, which ADR-0043 missed).
 The static encoding replaces each byte listed in `P.escapes` by its `encoded` text.
+
+**Spread.** The record type of `r` is known at compile time, so no reflection is needed: the spread expands statically
+into the attributes `f={tmp.f}`, one per field, and everything above applies by field name (case-insensitive rule
+matching included). A field named like a `convert: None` rule (`onclick`) is E0493, a URL field (`href`) goes through the
+rule's `convert`, a `bool` field is a presence attribute (E0492 without `presenceAttrs`), numbers are decimal text, an
+`Option<T>` field may be left out, and a field of any other type is E0492 naming the field. A spread therefore cannot
+add an event handler or an unsanitised URL. When a name occurs more than once (written and spread, or in two spreads;
+compared ASCII case-insensitively) the one written later wins in the output, as for components (§4.1); every value is
+still evaluated exactly once, in source order, and the dropped ones are evaluated and discarded. Two attributes written
+with the same name stay a syntax error.
 
 Tag names start with a lower-case ASCII letter and continue with letters, digits, `-` and `_`; attribute names start
 with a letter (E0494 otherwise). These are the notation's lexical rules, not HTML's.
 
 #### 4.4 Intrinsic elements of a `Components` provider
 
-`<t ..>..</t>` is a call of the provider module's exported function `t` with the component rules (§4.1); no such
-function is E0491.
+`<t ..>..</t>` is a call of the provider module's exported function `t` with the component rules (§4.1), spread
+included; no such function is E0491.
+
+#### 4.5 Member tags
+
+`<a.b.C attrs>kids</a.b.C>` is the call of the **method** `C` of the receiver `a.b`, with exactly the rules of §4.1 for
+an upper-case function component: the method's parameters (without the receiver) give the attribute names; spread,
+omitted `Option` parameters, the default slot `children`, `<:name>` slots and source-order evaluation are the same; the
+result is the method's return type, checked where the element is used. The receiver is a class instance or an interface
+value (a mutating method needs a receiver that is a mutable place, as for `a.b.C(..)`). Static methods and private
+methods follow the method-call rules (E0405).
+
+The checker does not build a second call path: after the attributes are matched to parameters it checks the ordinary
+method call `a.b.C(args)`, so visibility, mutation, generic classes and interface dispatch behave as in that call. The
+receiver is a pure path (names, `this`, field reads), so reading it at the call is observably the same as evaluating it
+before the attributes.
+
+Errors, all **E0491** with the member written in the message: the member is not a method, e.g. a field of function type
+(`` `ui.Card` is not a method; a member tag calls a method, whose parameters give the attribute names ``: a function type
+has no parameter names to match attributes with); the receiver's type has no method of that name; and every error of
+§4.1 (unknown attribute, missing parameter, ...).
 
 ### 5. std:html as a provider
 
@@ -219,9 +256,22 @@ Migration: a program with markup adds `import ox from "std:html";` next to its o
   for testing a provider's static encoding against its runtime one.
 - Breaking for ADR-0043 programs: they need `import ox from "std:html";`.
 
+## Pre-sized buffer
+
+A `Markup` root with at least one dynamic piece starts its concatenation from `str.withCapacity(hint)` (builtin
+`BStrWithCapacity`, runtime `orin_str_with_capacity`, no surface method): `withCapacity(hint) + p0 + p1 + ..`. The empty
+string is a fresh owned temporary, so the lowering appends every piece in place (`IStrAppend`), with no copy of the
+first piece; the MIR of a root is one `builtin str.withCapacity(n)` followed by `strappend`s. The hint is the total byte
+length of the static pieces plus 16 bytes per dynamic piece (`OX_DYN_ESTIMATE` in `check/ox.or`; 32 was measured and
+gains nothing but memory). The runtime clamps it to 1 MiB (`ORIN_STR_HINT_MAX`). The hint never changes the value: a
+dynamic piece larger than the estimate just grows the buffer as before. A root without a dynamic piece stays one literal.
+Measured on `bench/html`: `string_grows` 4.23 M -> 0.25 M, executed instructions 3.99 G -> 3.10 G (C backend), see
+docs/benchmarks.md.
+
 ## Not done
 
-- Member tags and namespaces; spread on intrinsic elements (needs record reflection); per-block provider selection.
+- Namespaces; member tags on a type name (static methods) or on a module; per-block provider selection.
 - Generic slot parameters whose type is inferred from the children (a generic component's slot type must be fixed by
   its other arguments or written explicitly).
-- The ADR-0043 performance follow-ups (pre-sized buffers, append without temporaries, component fusion, streaming).
+- The ADR-0043 performance follow-ups that remain (append without temporaries, component fusion, streaming). Pre-sized
+  buffers are done (below).
