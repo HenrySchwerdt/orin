@@ -691,6 +691,25 @@ pairs across loop iterations, `bintrees`-style constructor chains) and escape an
 function; with it `Some(x)` for `pop().unwrap()` disappears). Each is a MIR pass with its verifier rules, in the style of `opt/pairs.or`.
 
 
+## HTML rendering
+
+`bench/html` (C, Go) and `bench/html_hand` (Orin) render the same page: a 2000-row product table (`<tr>` with an id, an even / odd class,
+an HTML-escaped name, a price, an escaped and URL-sanitised link, and a checkbox that is `disabled` for every third row) 400 times from
+scratch, sum the page lengths (about 144.6 MB in all), and hash the last page. Every 7th name contains `<b>&"sale"</b> it's`
+(all five characters are escaped) and every 11th URL is `javascript:alert(i)`, which the Go `html/template`-style rule replaces by
+`about:invalid#orin-unsafe-url`. The three programs print byte-identical `bytes`, `hash` and `head` lines. C uses one growing buffer
+(`memcpy`, an escape loop that copies runs between special characters), Go a `strings.Builder`, Orin plain concatenation into one
+accumulating string (`out += ...`, appended in place while the string is unique) with `escape` and `safeUrl` written in the same file
+(the later `std:html` replaces them). `bench/html_hand` is an Orin-only row; the JSX version will be `bench/html/main.or`, compared against the
+same C and Go baselines. 4-core Xeon 2.8 GHz VM with other work running, 3 runs, median (min-max):
+
+| program | Orin C backend | Orin LLVM backend | Go | C |
+|---|---:|---:|---:|---:|
+| html (hand-written, `bench/html_hand` source) | 0.384 s (0.356-0.517) | 0.433 s (0.390-0.512) | 0.494 s (0.433-0.536) | 0.183 s (0.159-0.206) |
+
+Orin allocates 6.9M strings for 400 pages (about 17,000 per page: the concatenation operands of each `out += a + b + c`), which is the
+cost a JSX lowering that appends the parts directly should avoid.
+
 ## Benchmark workflow (CI), metrics and history
 
 `.github/workflows/bench.yml` runs `tools/bench.py` on a GitHub-hosted `ubuntu-latest` runner (4 vCPUs, shared) with Go 1.24
