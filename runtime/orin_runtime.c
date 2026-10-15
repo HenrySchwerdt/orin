@@ -536,6 +536,14 @@ uint64_t orin_res_unwrap_err(OrinObj *o) {
     return orin_struct_get(o, 0);
 }
 
+uint64_t orin_v_unwrap(uint64_t tag, uint64_t word, int64_t what) {
+    if (what == 0 && tag != 0) orin_trap("unwrap on None");
+    if (what == 1 && tag != 0) orin_trap("unwrap on Err");
+    if (what == 2 && tag != 1) orin_trap("unwrapErr on Ok");
+    return word;
+}
+
+
 /* ---------------------------------------------------------------- make_unique */
 
 OrinObj *orin_make_unique_slow(OrinObj *o) {
@@ -990,6 +998,23 @@ OrinObj *orin_array_pop(OrinObj *o) {
     if (a->len == 0) return orin_none();
     return orin_variant1(0, a->is_ref, a->items[--a->len]);
 }
+
+void orin_array_pop_v(OrinObj *o, uint64_t *out) {
+    OrinArray *a = (OrinArray *)o;
+    if (a->len == 0) {
+        out[0] = 1;
+        out[1] = 0;
+        return;
+    }
+    uint64_t v = a->items[--a->len];
+    if (a->is_ref) {
+        orin_release(ORIN_REF(v));
+        v = 0;
+    }
+    out[0] = 0;
+    out[1] = v;
+}
+
 
 OrinObj *orin_array_get(OrinObj *o, uint64_t i) {
     OrinArray *a = (OrinArray *)o;

@@ -15,8 +15,12 @@
 // and, because the destructuring that follows is almost always `getfield d.0; dup; ..; getfield d.1; ..;
 // release d` inside one block, the record is not built at all (scalar replacement): `getfield d.0` becomes a
 // borrow of x, `getfield d.1` a borrow or copy of v, `release d` releases x and v, and `t = getfield d.0;
-// u = dup t` becomes `u = move x`. If d is used in any other way (stored, passed, returned, used in another
-// block, or a component is reassigned while d is live) the record is rebuilt at the call, exactly as before.
+// u = dup t` becomes `u = move x`. The record may be moved to other locals first (`l4 = move d`), and its
+// release may be in another block (the end of the scope of an `if (m.put(..))` condition, ADR-0038 census) when
+// the receiver was moved out by `u = move x`: that release then only releases v (a reference) or nothing. If d is
+// used in any other way (stored, passed, returned, read in another block, or a component is reassigned while d is
+// live) the record is rebuilt at the call, exactly as before.
+
 // Functions that are closure targets or vtable entries, and `main`, keep their signature.
 //
 // The result is checked by the verifier like any other MIR (the inout rules are in docs/mir.md).
@@ -39,6 +43,7 @@ function tyCode(t: MType): int {
     MHandle => 4,
     MRef => 5,
     MVoid => 6,
+    MAgg(n) => 10 + n.toInt(),
   };
 }
 
@@ -290,21 +295,55 @@ function convertCallee(f: MFunction, sh: PairShape): MFunction {
 
 // ---------------------------------------------------------------- the call sites
 
-// Replacement plan for the instructions after a call whose record `d` is destructured in the same block.
+// Replacement plan for the instructions after a call whose record `d` is destructured in the same block. `remote` are the
+// aliases of the record released in other blocks; each such release becomes `remoteRep` (a release of v, or nothing).
 @Invariant(!this.ok || this.hit.length == this.rep.length)
-type Sra = { ok: bool; hit: bool[]; rep: Instr[][]; };
+type Sra = { ok: bool; hit: bool[]; rep: Instr[][]; remote: usize[]; remoteRep: Instr[]; };
 
 // The locals that hold the record of an in/out call while it is destructured: the call's destination first, then the
-// locals it is moved to, each with the number of its uses seen so far. The plan holds only when every alias is used
-// exactly by the instructions that the plan rewrites (`complete`).
-@Invariant(this.alias.length == this.counted.length && this.alias.length >= 1)
+// locals it is moved to, each with the number of its uses seen so far in the call's block (`counted`, of which
+// `released` are releases). The plan holds only when every alias is used exactly by the instructions that the plan
+// rewrites: the counted uses in the block plus the releases in other blocks (`complete`).
+@Invariant(this.alias.length == this.counted.length && this.alias.length == this.released.length)
+@Invariant(this.alias.length >= 1)
 class RecordAliases {
   private alias: usize[];
   private counted: usize[];
+  private released: usize[];
 
   constructor(d: usize) {
     this.alias = [d];
     this.counted = [0];
+    this.released = [0];
+  }
+
+  // The aliases, the call's destination first.
+  all(): usize[] {
+    return this.alias;
+  }
+
+  // Counts a release of the alias `a` in the call's block.
+  @Requires(this.has(a))
+  @Ensures(this.alias.length == old(this.alias.length))
+  release(a: usize): void {
+    this.use(a);
+    let k: usize = 0;
+    while (this.alias[k] != a) {
+      k += 1;
+    }
+    this.released[k] += 1;
+  }
+
+  // Some alias is released in another block (`relTotal[l]`: the releases of local l in the whole function).
+  remote(relTotal: usize[]): bool {
+    let k: usize = 0;
+    while (k < this.alias.length) {
+      if (relTotal[this.alias[k]] > this.released[k]) {
+        return true;
+      }
+      k += 1;
+    }
+    return false;
   }
 
   has(l: usize): bool {
@@ -328,19 +367,42 @@ class RecordAliases {
   add(a2: usize): void {
     this.alias.push(a2);
     this.counted.push(0);
+    this.released.push(0);
   }
 
-  // Every alias is used exactly as often as counted (no use the plan does not rewrite).
-  complete(cnt: Counts): bool {
+  // Every alias is used exactly as often as counted in the block plus its releases in other blocks (no use the plan
+  // does not rewrite).
+  complete(cnt: Counts, relTotal: usize[]): bool {
     let k: usize = 0;
     while (k < this.alias.length) {
-      if (cnt.uses[this.alias[k]] != this.counted[k]) {
+      const a = this.alias[k];
+      if (relTotal[a] < this.released[k]
+          || cnt.uses[a] != this.counted[k] + relTotal[a] - this.released[k]) {
         return false;
       }
       k += 1;
     }
     return true;
   }
+}
+
+// The number of `release l` instructions of every local l of f.
+@Ensures(result.length == f.locals.length)
+export function releaseTotals(f: MFunction): usize[] {
+  let out: usize[] = f.locals.map(l => 0);
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IRelease(x) => {
+          if (x < out.length) {
+            out[x] += 1;
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  return out;
 }
 
 // The plan of a scalar replacement touches only instructions after the call `i`.
@@ -356,16 +418,19 @@ function laterOnly(r: Sra, i: usize): bool {
 }
 
 function noSra(): Sra {
-  return Sra { ok: false, hit: [], rep: [] };
+  return Sra { ok: false, hit: [], rep: [], remote: [], remoteRep: [] };
 }
 
 // Plan the scalar replacement of the record `d` built by the call at index `i` of `blk`; x and v are the
-// locals that hold its two components after the call (v is a reference iff vRef).
-@Requires(i < blk.instrs.length && d < cnt.uses.length)
+// locals that hold its two components after the call (v is a reference iff vRef; v is a fresh local, defined only by
+// the call). `relTotal[l]`: the releases of local l in the whole function.
+@Requires(i < blk.instrs.length && d < cnt.uses.length && relTotal.length == cnt.uses.length)
 @Ensures(!result.ok || result.hit.length == blk.instrs.length && laterOnly(result, i))
+@Ensures(!result.ok || result.remoteRep.length <= 1)
 function planSra(
   blk: MBlock,
   cnt: Counts,
+  relTotal: usize[],
   i: usize,
   d: usize,
   x: usize,
@@ -420,11 +485,12 @@ function planSra(
           if (clobbered) {
             return noSra();
           }
-          ra.use(a);
+          ra.release(a);
           releases.push(j);
           hit[j] = true;
         }
       },
+
       IMove(a2, a) => {
         if (ra.has(a)) {
           handled = true;
@@ -456,9 +522,10 @@ function planSra(
     }
     j += 1;
   }
-  if (termUses(blk.term).some(u => ra.has(u)) || !ra.complete(cnt)) {
+  if (termUses(blk.term).some(u => ra.has(u)) || !ra.complete(cnt, relTotal)) {
     return noSra();
   }
+
   // last use of a component by `t = getfield d.k; u = dup t` is a move of the component
   let movedX = false;
   let movedV = false;
@@ -534,7 +601,16 @@ function planSra(
     }
     rep[r] = rs;
   }
-  return Sra { ok: true, hit: hit, rep: rep };
+  if (!ra.remote(relTotal)) {
+    return Sra { ok: true, hit: hit, rep: rep, remote: [], remoteRep: [] };
+  }
+  // A release in another block: only when the receiver was moved out (x may be redefined before that release; v is
+  // fresh, so releasing it there releases exactly what the record's release did).
+  if (!movedX) {
+    return noSra();
+  }
+  const rr: Instr[] = vRef && !movedV ? [IRelease(v)] : [];
+  return Sra { ok: true, hit: hit, rep: rep, remote: ra.all(), remoteRep: rr };
 }
 
 // Does f call a function that `conv` converts?
@@ -549,8 +625,78 @@ function callsConverted(conv: Option<MType>[], f: MFunction): bool {
   );
 }
 
+// One call of a converted function, as planned before the function is rewritten: the call at instruction `at` of block
+// `block`, the local `x` that passes the receiver (`direct`: the argument's own local, else a fresh one the argument is
+// moved or copied into), the fresh local `v` of the value, and the scalar replacement of its record (`plan.ok`) or not.
+type PairCall = { block: usize; at: usize; x: usize; direct: bool; v: usize; plan: Sra; };
+
+// The planned calls of a function and its locals table with the fresh locals they need.
+type Planned = { sites: PairCall[]; locals: MLocal[]; };
+
+// The calls of converted functions in f, in block and instruction order, with the fresh locals they need appended to the
+// locals of f (in the order of one pass over the blocks).
+@Requires(conv.length == p.functions.length)
+@Ensures(result.sites.every(
+  s => s.block < f.blocks.length && s.at < f.blocks[s.block].instrs.length,
+))
+@Ensures(result.locals.length >= f.locals.length)
+function planCalls(
+  p: MProgram,
+  conv: Option<MType>[],
+  f: MFunction,
+  cnt: Counts,
+  relTotal: usize[],
+): Planned {
+  let locals = new Locals(f.locals);
+  let out: PairCall[] = [];
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      match (blk.instrs[i]) {
+        ICall(dst, g, args) => {
+          if (g < conv.length && conv[g].isSome()) {
+            const vty = conv[g].unwrap();
+            // the in/out argument: a local of its own (the call redefines it)
+            let x: usize = 0;
+            let direct = false;
+            match (args[0]) {
+              OLocal(x0) => {
+                const isDst = match (dst) {
+                  Some(dd) => dd == x0,
+                  None => false,
+                };
+                if (x0 >= f.paramCount && !isDst) {
+                  x = x0;
+                  direct = true;
+                }
+              },
+              _ => {},
+            }
+            if (!direct) {
+              x = locals.fresh(MRef);
+            }
+            const v = locals.fresh(vty);
+            const plan = match (dst) {
+              Some(d) => planSra(blk, cnt, relTotal, i, d, x, v, isRefTy(vty)),
+              None => noSra(),
+            };
+            out.push(PairCall { block: b, at: i, x: x, direct: direct, v: v, plan: plan });
+          }
+        },
+        _ => {},
+      }
+      i += 1;
+    }
+    b += 1;
+  }
+  return Planned { sites: out, locals: locals.table() };
+}
+
 // Rewrite the calls of converted functions in f. `conv[g]`: the type of the value function g now returns. The calls are
-// the same calls in the same order (the record they returned is built after the call, or not at all).
+// the same calls in the same order (the record they returned is built after the call, or not at all). First every call
+// is planned (`planCalls`): a plan may remove a release in another block, which can come before the call's block.
 @Requires(conv.length == p.functions.length && fnWellFormed(p, f))
 @Ensures(passKept(f, result) && result.blocks.length == f.blocks.length)
 function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFunction {
@@ -558,9 +704,25 @@ function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFuncti
     return f;
   }
   const cnt = countsOf(f);
-  let locals = new Locals(f.locals);
+  const relTotal = releaseTotals(f);
+  const planned = planCalls(p, conv, f, cnt, relTotal);
+  const sites = planned.sites;
+  // releases of record aliases in other blocks, and what each becomes
+  let remote: bool[] = f.locals.map(l => false);
+  let remoteRep: Instr[][] = f.locals.map(l => []);
+  for (const s of sites) {
+    if (s.plan.ok) {
+      for (const a of s.plan.remote) {
+        remote[a] = true;
+        remoteRep[a] = s.plan.remoteRep;
+      }
+    }
+  }
   let blocks: MBlock[] = [];
-  for (const blk of f.blocks) {
+  let si: usize = 0;
+  let b: usize = 0;
+  while (b < f.blocks.length) {
+    const blk = f.blocks[b];
     const n = blk.instrs.length;
     // replacements of later instructions of the block, planned at the call whose record they destructure
     let later = new RewritePlan(n);
@@ -570,82 +732,71 @@ function rewriteCalls(p: MProgram, conv: Option<MType>[], f: MFunction): MFuncti
       const cs = blk.spans[i];
       if (later.touched(i)) {
         out.emitAll(later.replacement(i), cs);
-        i += 1;
-      } else {
-        let done = false;
+      } else if (si < sites.length && sites[si].block == b && sites[si].at == i) {
+        const s = sites[si];
+        si += 1;
         match (blk.instrs[i]) {
           ICall(dst, g, args) => {
-            if (conv[g].isSome()) {
-              done = true;
-              const vty = conv[g].unwrap();
-              const vRef = isRefTy(vty);
-              // the in/out argument: a local of its own (the call redefines it)
-              let x: usize = 0;
-              let direct = false;
+            const vRef = isRefTy(conv[g].unwrap());
+            if (!s.direct) {
               match (args[0]) {
                 OLocal(x0) => {
-                  let isDst = false;
-                  match (dst) {
-                    Some(dd) => {
-                      isDst = dd == x0;
-                    },
-                    None => {},
-                  }
-                  if (x0 >= f.paramCount && !isDst) {
-                    x = x0;
-                    direct = true;
-                  }
+                  out.emit(IMove(s.x, x0), cs);
                 },
-                _ => {},
-              }
-              if (!direct) {
-                x = locals.fresh(MRef);
-                match (args[0]) {
-                  OLocal(x0) => {
-                    out.emit(IMove(x, x0), cs);
-                  },
-                  _ => {
-                    out.emit(ICopy(x, args[0]), cs);
-                  },
-                }
-              }
-              const v = locals.fresh(vty);
-              out.emit(ICall(Some(v), g, [OLocal(x)].concat(args.slice(1, args.length))), cs);
-              match (dst) {
-                None => {
-                  out.emit(IRelease(x), cs);
-                  if (vRef) {
-                    out.emit(IRelease(v), cs);
-                  }
-                },
-                Some(d) => {
-                  const plan = planSra(blk, cnt, i, d, x, v, vRef);
-                  if (plan.ok) {
-                    let j = i + 1;
-                    while (j < n) {
-                      if (plan.hit[j]) {
-                        later.replace(j, plan.rep[j]);
-                      }
-                      j += 1;
-                    }
-                  } else {
-                    out.emit(IStructNew(d, 0, [OLocal(x), OLocal(v)]), cs);
-                  }
+                _ => {
+                  out.emit(ICopy(s.x, args[0]), cs);
                 },
               }
             }
+            out.emit(ICall(Some(s.v), g, [OLocal(s.x)].concat(args.slice(1, args.length))), cs);
+            match (dst) {
+              None => {
+                out.emit(IRelease(s.x), cs);
+                if (vRef) {
+                  out.emit(IRelease(s.v), cs);
+                }
+              },
+              Some(d) => {
+                if (s.plan.ok) {
+                  let j = i + 1;
+                  while (j < n) {
+                    if (s.plan.hit[j]) {
+                      later.replace(j, s.plan.rep[j]);
+                    }
+                    j += 1;
+                  }
+                } else {
+                  out.emit(IStructNew(d, 0, [OLocal(s.x), OLocal(s.v)]), cs);
+                }
+              },
+            }
           },
-          _ => {},
+          _ => {
+            out.emit(blk.instrs[i], cs);
+          },
         }
-        if (!done) {
+      } else {
+        const rel = match (blk.instrs[i]) {
+          IRelease(a) => a < remote.length && remote[a],
+          _ => false,
+        };
+        if (rel) {
+          match (blk.instrs[i]) {
+            IRelease(a) => {
+              out.emitAll(remoteRep[a], cs);
+            },
+            _ => {},
+          }
+        } else {
           out.emit(blk.instrs[i], cs);
         }
-        i += 1;
       }
+      i += 1;
     }
     blocks.push(out.finish(blk.term, blk.termSpan));
+    b += 1;
   }
-  return withBody(f, locals.table(), blocks);
+  return withBody(f, planned.locals, blocks);
 }
 
 // A converted function: in/out now, and its result is the value (the second slot) of the record it returned.

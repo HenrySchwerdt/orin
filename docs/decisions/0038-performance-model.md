@@ -251,3 +251,35 @@ A future separate language/CLI decision may allow ignorable optimization hints v
 
 Measure every pass on matched HTTP+JSON, allocation-heavy and compiler workloads: `ORIN_STATS` allocations/retains/releases/COW, RSS, instruction counts, throughput, p50/p99 latency, compilation and verification time, with Go/C/Rust comparators. Roll out packed bytes, the direct writer **and unboxing of small aggregates** (`Result`, `Option`, pairs and small records, which are 1.7M of the 3.9M allocations measured in `http_parse`); then escape/alias and stack/SROA; then R3 regions/frozen sharing; finally proof-backed LLVM metadata and check removal, which lands mainly in the LLVM backend (§8, the release default once its gates hold). C/LLVM differential, sanitizer, alias/closure/recursion, panic and self-hosting tests are required. Speedup ratios remain hypotheses until measured.
 
+
+## Addendum (2026-10-14): unboxing, step 1 (eligibility rule)
+
+The first transformation of the performance wave, chosen by the allocation census (`docs/perf/alloc-census.md`, class (a)). The
+ADR names unboxing but not its eligibility rule; this addendum fixes it. **No language-visible change**: no syntax, no new type, no
+change in behaviour; the representation is the compiler's choice (§6), and the safe RC fallback stays for everything else.
+
+**Representation.** An *unboxed aggregate* `MAgg(n)` (MIR v2.2, `docs/mir.md` "Unboxed aggregates") is n + 1 64-bit words held by
+value: the tag, then the payload; a scalar slot is one word, a nested aggregate its words (flattened). No heap object, header or
+reference count; passed and returned by value (`OrinV<n>` structs in C, `[n+1 x i64]` in LLVM; whether that ends in registers is
+the C / LLVM ABI's decision, see the addendum above). For the ownership verifier it is a scalar: copying it is free.
+
+**Eligibility rule** (conservative; implemented by `compiler/opt/unbox.or`, default deny). A value is unboxed when every place it
+flows to — locals connected by moves, dups, borrows, call arguments and parameters, call results and returns, *one web* — satisfies:
+1. **Small and scalar.** All slots are scalars (int, usize, bool, float and the fixed-width integers) or themselves unboxed; the
+   whole value fits in four words (tag + three payload words). Not recursive. A slot index is a scalar in every variant or a nested
+   value in every variant.
+2. **Immutable, no identity.** It is only built (`IStructNew`, `INullary`, `pop` into an Option of a scalar) and read (tag, field,
+   the Option / Result builtins). Any mutation of it (`this` mutation after construction: set / take / put / make-unique), any
+   comparison, and any instruction the pass does not know keep the whole web boxed.
+3. **Never on the heap.** It is not an array element, a slot of a boxed value, a closure capture or an interface value.
+4. **Known boundaries.** Parameters and results of `main`, of closure targets and vtable entries (called through a function value,
+   whose signature both sides cannot agree on) and the in/out receiver stay references.
+
+So in scope today: `Option<T>` / `Result<T, E>` of scalars or of small scalar records, tuples / pairs and small records of scalars
+(`Span`, `P { x, y }`, `PQEntry<int>`), across direct calls in both directions. Out of scope (still boxed), each a later step:
+values with reference fields (`Bytes {data, start, len}`: unboxing would move the RC to the field), records stored inline in arrays
+(the verifier's `LState[]`: an array layout change, ADR-0038 §3), values that reach a function value or the heap.
+
+**The pair gap** (`opt/pairs.or`, census): the `{receiver, result}` record of an in/out call was rebuilt when its release was in
+another block (`if (m.put(..))`, `Lowerer` helpers whose result is released at the function's end). The release is now rewritten
+in place (to nothing, or a release of the result) when the receiver was moved out of the record.
