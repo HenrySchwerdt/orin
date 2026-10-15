@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **Redundant uniqueness checks removed (ADR-0038 lever 2, T1; `compiler/opt/unique.or`).** A `makeunique` of a local that is
+  certainly `Unique` (fresh, or already made unique and not shared since) is deleted. nbody -13.8%, sieve -10.4%, pqueue -8.4%
+  executed instructions; only the `cow_inplace` counter changes; the verifier re-checks the result.
+- **Scalar stores without the release test (ADR-0038 lever 2, T3), statistics counters as a build option.** `ISetField` /
+  `IArraySet` of an `int`, `usize`, `bool`, `float` or handle store directly; the hot `orin_stats` counters are compiled in only
+  with `-DORIN_STATS_ENABLED` (implied by `-DORIN_SITE_STATS`; `tools/bench.py` builds a separate counting binary). nbody -21%,
+  mutres -17.6% executed instructions.
 - **OX roots are built in a pre-sized buffer (ADR-0044).** A markup root with a dynamic piece starts from `str.withCapacity(static bytes + 16 per dynamic piece)` (new builtin, runtime `orin_str_with_capacity`), so the pieces are appended in place without regrowth. `bench/html`: `string_grows` 4.23 M -> 0.25 M, executed instructions 3.99 G -> 3.10 G.
 - **Verifier and optimiser without per-block allocations (ADR-0038 lever 1).** The ownership verifier's fixpoint joins
   out-states into the successors in place and replays every block with one reusable `Transfer`; the optimiser's analyses use
