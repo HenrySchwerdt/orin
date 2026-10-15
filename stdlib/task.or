@@ -39,7 +39,7 @@
 // blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
 // A panic in the BODY of a scope (not in a task) is not unwound: tasks still running keep running until the process ends.
 
-import { Ring, Ledger, Ranges } from "std:taskcore";
+import { Ledger, Ranges, ringCanPush, ringSlot, ringNextHead, ringIsDone } from "std:taskcore";
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
@@ -85,9 +85,15 @@ export function copiedCount(): usize {
 // token in ring slot i.
 const CH_HDR: usize = 4;
 
-function loadRing(m: usize): Ring {
-  const flags = monGet(m, 3);
-  return new Ring(monGet(m, 0), monGet(m, 1), monGet(m, 2), flags % 2 == 1, flags >= 2);
+// The channel functions work on the monitor's words as plain locals (cap, head, len, flags) with the arithmetic of
+// std:taskcore's `Ring` (`ringCanPush`, `ringSlot`, ...): a `Ring` object per send / receive was 40% of the allocations
+// of a channel benchmark. The words are loaded, changed and stored back inside one critical section, as before.
+function chTx(flags: usize): bool {
+  return flags % 2 == 1;
+}
+
+function chRx(flags: usize): bool {
+  return flags >= 2;
 }
 
 // A monitor has two condition queues: 0 = "there is room" (blocked senders), 1 = "there is a value" (blocked receivers). A
@@ -97,16 +103,9 @@ function wakeAll(m: usize): void {
   monNotifyAll(m, 1);
 }
 
-function storeRing(m: usize, r: Ring): void {
-  monSet(m, 1, r.head);
-  monSet(m, 2, r.len);
-  let flags: usize = 0;
-  if (r.txClosed) {
-    flags += 1;
-  }
-  if (r.rxClosed) {
-    flags += 2;
-  }
+function storeRing(m: usize, head: usize, len: usize, flags: usize): void {
+  monSet(m, 1, head);
+  monSet(m, 2, len);
   monSet(m, 3, flags);
 }
 
@@ -125,36 +124,45 @@ export class Sender<T> {
   // copied otherwise); false when the channel is closed by either end, in which case `v` is dropped.
   send(v: T): bool {
     const tok = putBox(v);
-    monLock(this.ch);
-    let r = loadRing(this.ch);
-    while (!r.canPush() && !r.txClosed && !r.rxClosed) {
-      monWait(this.ch, 0);
-      r = loadRing(this.ch);
+    const ch = this.ch;
+    monLock(ch);
+    const cap = monGet(ch, 0);
+    let head = monGet(ch, 1);
+    let len = monGet(ch, 2);
+    let flags = monGet(ch, 3);
+    while (!ringCanPush(len, cap, chTx(flags), chRx(flags)) && flags == 0) {
+      monWait(ch, 0);
+      head = monGet(ch, 1);
+      len = monGet(ch, 2);
+      flags = monGet(ch, 3);
     }
-    if (!r.canPush()) {
-      monUnlock(this.ch);
+    if (!ringCanPush(len, cap, chTx(flags), chRx(flags))) {
+      monUnlock(ch);
       transitDrop(tok);
       return false;
     }
-    const slot = r.push();
-    monSet(this.ch, CH_HDR + slot, tok);
-    storeRing(this.ch, r);
-    monNotifyOne(this.ch, 1);
-    monUnlock(this.ch);
+    const slot = ringSlot(cap, head, len);
+    monSet(ch, CH_HDR + slot, tok);
+    storeRing(ch, head, len + 1, flags);
+    monNotifyOne(ch, 1);
+    monUnlock(ch);
     return true;
   }
 
   // close(): no more values will be sent; receivers drain what is buffered and then get None.
   close(): void {
-    monLock(this.ch);
-    let r = loadRing(this.ch);
-    r.closeTx();
-    storeRing(this.ch, r);
-    wakeAll(this.ch);
-    const done = r.released();
-    monUnlock(this.ch);
+    const ch = this.ch;
+    monLock(ch);
+    let flags = monGet(ch, 3);
+    if (!chTx(flags)) {
+      flags += 1;
+    }
+    monSet(ch, 3, flags);
+    wakeAll(ch);
+    const done = chTx(flags) && chRx(flags);
+    monUnlock(ch);
     if (done) {
-      monFree(this.ch);
+      monFree(ch);
     }
   }
 }
@@ -172,44 +180,56 @@ export class Receiver<T> {
   // recv(): blocks while the channel is empty; Some(v) with the oldest value, or None once the channel is closed and
   // drained (or cancelled by rx.close()).
   recv(): Option<T> {
-    monLock(this.ch);
-    let r = loadRing(this.ch);
-    while (!r.canPop() && !r.isDone()) {
-      monWait(this.ch, 1);
-      r = loadRing(this.ch);
+    const ch = this.ch;
+    monLock(ch);
+    const cap = monGet(ch, 0);
+    let head = monGet(ch, 1);
+    let len = monGet(ch, 2);
+    let flags = monGet(ch, 3);
+    while (len == 0 && !ringIsDone(len, chTx(flags), chRx(flags))) {
+      monWait(ch, 1);
+      head = monGet(ch, 1);
+      len = monGet(ch, 2);
+      flags = monGet(ch, 3);
     }
-    if (!r.canPop()) {
-      monUnlock(this.ch);
+    if (len == 0) {
+      monUnlock(ch);
       return None;
     }
-    const slot = r.pop();
-    const tok = monGet(this.ch, CH_HDR + slot);
-    storeRing(this.ch, r);
-    monNotifyOne(this.ch, 0);
-    monUnlock(this.ch);
+    const tok = monGet(ch, CH_HDR + head);
+    storeRing(ch, ringNextHead(cap, head), len - 1, flags);
+    monNotifyOne(ch, 0);
+    monUnlock(ch);
     const v: T = takeBox(tok);
     return Some(v);
   }
 
   // close(): this end is done: buffered values are dropped, a blocked or later send returns false.
   close(): void {
-    monLock(this.ch);
-    let r = loadRing(this.ch);
+    const ch = this.ch;
+    monLock(ch);
+    const cap = monGet(ch, 0);
+    let head = monGet(ch, 1);
+    let len = monGet(ch, 2);
+    let flags = monGet(ch, 3);
     let toks: usize[] = [];
-    while (r.canPop()) {
-      const slot = r.pop();
-      toks.push(monGet(this.ch, CH_HDR + slot));
+    while (len > 0) {
+      toks.push(monGet(ch, CH_HDR + head));
+      head = ringNextHead(cap, head);
+      len -= 1;
     }
-    r.closeRx();
-    storeRing(this.ch, r);
-    wakeAll(this.ch);
-    const done = r.released();
-    monUnlock(this.ch);
+    if (!chRx(flags)) {
+      flags += 2;
+    }
+    storeRing(ch, head, len, flags);
+    wakeAll(ch);
+    const done = chTx(flags) && chRx(flags);
+    monUnlock(ch);
     for (const t of toks) {
       transitDrop(t);
     }
     if (done) {
-      monFree(this.ch);
+      monFree(ch);
     }
   }
 }
