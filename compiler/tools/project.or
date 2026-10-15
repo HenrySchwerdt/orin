@@ -1,0 +1,69 @@
+// Package metadata/editing for the release driver. TOML is parsed by the compiler, never sourced.
+import { FsGrant, readFile, writeFile } from "std:fs";
+import { parseManifest, parseToml, validPackageName } from "../package";
+import { SourceMap, SourceFile, renderTerminal } from "../diag";
+import { jsonString } from "./json";
+
+export function runPackage(fs: FsGrant, args: string[]): int {
+  if (args.length < 3) { console.error("error: invalid package command"); return 2; }
+  const path = args[2] + "/orin.toml";
+  const read = readFile(fs, path);
+  if (read.isErr()) { console.error("error: cannot read " + path + ": " + read.unwrapErr()); return 1; }
+  const text = read.unwrap();
+  const parsed = parseManifest(0, text);
+  if (parsed.isErr()) {
+    console.error(renderTerminal(SourceMap { files: [SourceFile { path: path, text: text }] }, parsed.unwrapErr(), false, true)); return 1;
+  }
+  const m = parsed.unwrap();
+  if (args[0] == "info") {
+    if (args[1] == "name") { console.log(m.name); }
+    else if (args[1] == "version") { console.log(m.version); }
+    else if (args[1] == "entry") { console.log(m.entry); }
+    else if (args[1] == "dependencies") {
+      for (const d of m.dependencies) {
+        console.log(d.name + "|" + d.path + "|" + d.git + "|" + d.tag + "|" + d.rev + "|" + d.dev.toString());
+      }
+    } else { return 2; }
+    return 0;
+  }
+  if (args[0] != "edit" || args.length < 4) { return 2; }
+  const name = args[3];
+  if (!validPackageName(name)) { console.error("error: invalid dependency name"); return 2; }
+  let replacement = "";
+  let section = "dependencies";
+  if (args[1] == "add") {
+    if (args.length != 9 || args[4] != "path" && args[4] != "git") { return 2; }
+    section = args[8] == "true" ? "dev-dependencies" : "dependencies";
+    replacement = name + " = { " + args[4] + " = " + jsonString(args[5]);
+    if (args[6] != "") { replacement += ", " + args[6] + " = " + jsonString(args[7]); }
+    replacement += " }";
+  } else if (args[1] != "remove") { return 2; }
+  const doc = parseToml(0, text).unwrap();
+  let out = text;
+  let found = false;
+  for (const t of doc.tables) {
+    if (t.path.length == 1 && (t.path[0] == "dependencies" || t.path[0] == "dev-dependencies")) {
+      for (const e of t.entries) {
+        if (e.key == name) {
+          if (replacement != "" && t.path[0] != section) { console.error("error: remove the existing dependency before changing its scope"); return 1; }
+          out = text.substring(0, e.start) + replacement + text.substring(e.end, text.length);
+          found = true;
+        }
+      }
+    }
+  }
+  if (!found && replacement != "") {
+    let inserted = false;
+    for (const t of doc.tables) {
+      if (t.path.length == 1 && t.path[0] == section) {
+        out = text.substring(0, t.end) + "\n" + replacement + text.substring(t.end, text.length); inserted = true;
+      }
+    }
+    if (!inserted) { out = text + "\n[" + section + "]\n" + replacement + "\n"; }
+  } else if (!found) { console.error("error: dependency `" + name + "` is not declared"); return 1; }
+  const validated = parseManifest(0, out);
+  if (validated.isErr()) { console.error("error: " + validated.unwrapErr().message); return 1; }
+  const written = writeFile(fs, path, out);
+  if (written.isErr()) { console.error("error: " + written.unwrapErr()); return 1; }
+  return 0;
+}

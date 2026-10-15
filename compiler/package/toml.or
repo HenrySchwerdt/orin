@@ -11,7 +11,7 @@
 
 import { Span, Diagnostic, diag, span } from "../diag";
 
-export type TomlValue = TStr(string) | TBool(bool) | TInt(int) | TArr(string[]);
+export type TomlValue = TStr(string) | TBool(bool) | TInt(int) | TArr(string[]) | TInline(string[], string[]);
 
 // `start`/`end`: byte range of the whole `key = value`; `elems`: the span of each array element.
 @Invariant(this.start <= this.end)
@@ -199,7 +199,7 @@ function parseValue(file: usize, s: string, start: usize): Result<VRes, Diagnost
     return parseArray(file, s, start);
   }
   if (c == 123) {
-    return Err(bad(file, s, start, "inline tables are not supported"));
+    return parseInline(file, s, start);
   }
   if (matchWord(s, start, "true")) {
     return Ok(VRes { value: TBool(true), pos: start + 4, elems: none });
@@ -369,4 +369,27 @@ export function parseToml(file: usize, s: string): Result<TomlDoc, Diagnostic> {
     i = eol.unwrap();
   }
   return Ok(TomlDoc { file: file, tables: tables });
+}
+
+// Dependency inline tables have string values; no execution or implicit coercion.
+function parseInline(file: usize, s: string, start: usize): Result<VRes, Diagnostic> {
+  let keys: string[] = [];
+  let values: string[] = [];
+  let i = skipBlank(s, start + 1);
+  while (i < s.length && s.charCodeAt(i) != 125) {
+    const key = parseKeySeg(file, s, i)?;
+    if (keys.includes(key.text)) { return Err(bad(file, s, i, "duplicate inline key")); }
+    i = skipBlank(s, key.pos);
+    if (i >= s.length || s.charCodeAt(i) != 61) { return Err(bad(file, s, i, "expected `=`")); }
+    i = skipBlank(s, i + 1);
+    if (i >= s.length || s.charCodeAt(i) != 34 && s.charCodeAt(i) != 39) { return Err(bad(file, s, i, "expected a string")); }
+    const value = parseString(file, s, i)?;
+    keys.push(key.text); values.push(value.text); i = skipBlank(s, value.pos);
+    if (i < s.length && s.charCodeAt(i) == 44) {
+      i = skipBlank(s, i + 1);
+      if (i < s.length && s.charCodeAt(i) == 125) { return Err(bad(file, s, i, "trailing comma in inline table")); }
+    } else if (i >= s.length || s.charCodeAt(i) != 125) { return Err(bad(file, s, i, "expected `,` or `}`")); }
+  }
+  if (i >= s.length) { return Err(bad(file, s, i, "unterminated inline table")); }
+  return Ok(VRes { value: TInline(keys, values), pos: i + 1, elems: [] });
 }

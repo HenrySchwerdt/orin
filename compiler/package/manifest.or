@@ -44,7 +44,10 @@ export type EffectRule = {
   allowedSpans: Span[];    // one per entry of `allowed`
 };
 
+export type Dependency = { name: string; path: string; git: string; tag: string; rev: string; dev: bool; };
+
 export type Manifest = {
+  dependencies: Dependency[];
   file: usize;             // file id of the manifest in the diagnostics' SourceMap (set by the loader)
   name: string;
   version: string;
@@ -209,7 +212,7 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
   const noRules: ModuleRule[] = [];
   const noEffects: EffectRule[] = [];
   let m = Manifest {
-    file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules, strictContracts: false, effects: noEffects,
+    dependencies: [], file: file, name: "", version: "0.0.0", entry: DEFAULT_ENTRY, rules: noRules, strictContracts: false, effects: noEffects,
     source: SourceFile { path: "orin.toml", text: text }
   };
   let havePackage = false;
@@ -229,6 +232,13 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
       }
       m = r.unwrap();
       havePackage = true;
+    } else if (head == "dependencies" || head == "dev-dependencies") {
+      if (t.path.length != 1) { return Err(invalid(file, span(file, t.start, t.end), "dependencies use inline tables: name = { path = \"...\" }")); }
+      for (const e of t.entries) {
+        const dep = dependencyEntry(file, e, head == "dev-dependencies")?;
+        for (const prior of m.dependencies) { if (prior.name == dep.name) { return Err(invalid(file, entrySpan(file, e), "duplicate dependency `" + dep.name + "`")); } }
+        m.dependencies.push(dep);
+      }
     } else if (head == "architecture" && t.path.length == 1) {
       const r = architectureTable(file, t);
       if (r.isErr()) {
@@ -299,4 +309,40 @@ export function effectRuleIndex(m: Manifest, module: string): Option<usize> {
     i += 1;
   }
   return None;
+}
+
+export function validPackageName(s: string): bool {
+  if (s.length == 0 || s == "." || s == ".." || s.startsWith("-")) { return false; }
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (!(c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 || c == 45 || c == 95)) { return false; }
+    i += 1;
+  }
+  return true;
+}
+
+function dependencyEntry(file: usize, e: TomlEntry, dev: bool): Result<Dependency, Diagnostic> {
+  let dep = Dependency { name: e.key, path: "", git: "", tag: "", rev: "", dev: dev };
+  if (!validPackageName(e.key)) { return Err(invalid(file, entrySpan(file, e), "invalid dependency name")); }
+  match (e.value) {
+    TInline(keys, values) => {
+      let i: usize = 0;
+      while (i < keys.length) {
+        const key = keys[i]; const value = values[i];
+        if (value.length == 0 || value.includes("\n") || value.includes("\r") || value.includes("\t")) { return Err(invalid(file, entrySpan(file, e), "invalid dependency value")); }
+        if (key == "path") { dep.path = value; }
+        else if (key == "git") { dep.git = value; }
+        else if (key == "tag") { dep.tag = value; }
+        else if (key == "rev") { dep.rev = value; }
+        else { return Err(invalid(file, entrySpan(file, e), "unknown dependency key `" + key + "`")); }
+        i += 1;
+      }
+    },
+    _ => { return Err(invalid(file, entrySpan(file, e), "dependency must be an inline table")); }
+  }
+  if ((dep.path == "") == (dep.git == "") || dep.tag != "" && dep.rev != "" || dep.path != "" && (dep.tag != "" || dep.rev != "")) {
+    return Err(invalid(file, entrySpan(file, e), "choose one dependency source: path or git (with tag or rev)"));
+  }
+  return Ok(dep);
 }

@@ -14,7 +14,7 @@
 
 import { FsGrant } from "std:fs";
 import { ProcessGrant } from "std:process";
-import { SourceMap, render } from "../diag";
+import { SourceMap, render, TerminalOptions, terminalOptions, renderTerminal, paint } from "../diag";
 import { printDiagnosticsJson } from "../tools";
 import { quoteJson } from "../json";
 import { TestOpts, TestRun, runTests, reportText, reportJson, runOk } from "./runner";
@@ -25,6 +25,9 @@ function usage(): int {
 }
 
 export function runTestCommand(fs: FsGrant, proc: ProcessGrant, args: string[]): int {
+  const ui = terminalOptions(args);
+  const argv = ui.args;
+  let allowEmpty = false;
   let filter = "";
   let json = false;
   let runtime = "runtime";
@@ -35,20 +38,22 @@ export function runTestCommand(fs: FsGrant, proc: ProcessGrant, args: string[]):
   let timeout: int = 10;
   let entry = "";
   let i: usize = 0;
-  while (i < args.length) {
-    const a = args[i];
+  while (i < argv.length) {
+    const a = argv[i];
     i += 1;
-    if (a == "--format=json") {
+    if (a == "--allow-empty") {
+      allowEmpty = true;
+    } else if (a == "--format=json") {
       json = true;
     } else if (a == "--keep") {
       keep = true;
     } else if (a == "--no-contracts") {
       contracts = false;
     } else if (a == "--filter" || a == "--runtime" || a == "--cc" || a == "--out-dir" || a == "--timeout") {
-      if (i >= args.length) {
+      if (i >= argv.length) {
         return usage();
       }
-      const v = args[i];
+      const v = argv[i];
       i += 1;
       if (a == "--filter") {
         filter = v;
@@ -81,16 +86,21 @@ export function runTestCommand(fs: FsGrant, proc: ProcessGrant, args: string[]):
   const r = runTests(fs, proc, TestOpts {
     entry: entry, filter: filter, runtime: runtime, cc: cc, outDir: outDir, keep: keep, timeout: timeout, contracts: contracts, root: ""
   });
-  return finish(r, json);
+  const code = finish(r, json, ui);
+  if (code == 0 && ui.rich && r.results.length == 0 && (!allowEmpty || filter != "")) {
+    if (!json) { console.error("error: No tests matched. Use --allow-empty only when an empty suite is intentional."); }
+    return 1;
+  }
+  return code;
 }
 
-function finish(r: TestRun, json: bool): int {
+function finish(r: TestRun, json: bool, ui: TerminalOptions): int {
   if (r.diags.length > 0) {
     if (json) {
       printDiagnosticsJson(r.sm, r.diags);
     } else {
       for (const d of r.diags) {
-        console.error(render(r.sm, d));
+        console.error(ui.rich ? renderTerminal(r.sm, d, ui.color, ui.ascii) + "\n" : render(r.sm, d));
       }
     }
     return 1;
@@ -107,9 +117,40 @@ function finish(r: TestRun, json: bool): int {
     console.log(reportJson(r));
   } else {
     for (const d of r.warnings) {
-      console.error(render(r.sm, d));
+      console.error(ui.rich ? renderTerminal(r.sm, d, ui.color, ui.ascii) + "\n" : render(r.sm, d));
     }
-    console.log(reportText(r));
+    console.log(ui.rich ? reportTerminal(r, ui) : reportText(r));
   }
   return runOk(r) ? 0 : 1;
+}
+
+// Compact per-file success rows; failed tests keep their actual captured evidence.
+function reportTerminal(r: TestRun, ui: TerminalOptions): string {
+  let lines: string[] = [];
+  let files: string[] = [];
+  for (const x of r.results) { if (!files.includes(x.path)) { files.push(x.path); } }
+  for (const path of files) {
+    let passed: usize = 0;
+    let failed: usize = 0;
+    for (const x of r.results) {
+      if (x.path == path) { if (x.pass) { passed += 1; } else { failed += 1; } }
+    }
+    const mark = failed > 0 ? (ui.ascii ? "FAIL" : "✗") : (ui.ascii ? "OK" : "✓");
+    if (!ui.quiet || failed > 0) {
+      lines.push(paint(mark, failed > 0 ? "31" : "32", ui.color) + " " + path + "  " + passed.toString() + " passed" + (failed > 0 ? " · " + failed.toString() + " failed" : ""));
+    }
+  }
+  for (const x of r.results) {
+    if (!x.pass) {
+      lines.push("\n" + paint("FAIL " + x.test.id, "1;31", ui.color));
+      lines.push("  " + x.path + ":" + x.line.toString() + ":" + x.col.toString());
+      lines.push("  " + x.reason + " (exit " + x.exitCode.toString() + ")");
+      if (x.stderr.length > 0) { lines.push("\n  stderr: " + x.stderr); }
+      if (x.stdout.length > 0) { lines.push("  stdout: " + x.stdout); }
+    } else if (ui.verbose) { lines.push(paint("PASS " + x.test.id, "32", ui.color)); }
+  }
+  let passed: usize = 0;
+  for (const x of r.results) { if (x.pass) { passed += 1; } }
+  lines.push("\n" + paint((r.results.length - passed).toString() + " failed · " + passed.toString() + " passed", passed == r.results.length ? "32" : "31", ui.color));
+  return lines.join("\n");
 }

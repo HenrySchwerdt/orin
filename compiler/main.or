@@ -23,7 +23,7 @@ import { FsGrant } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { StdioGrant } from "std:io";
 import { writeFile } from "std:fs";
-import { SourceMap, Diagnostic, render, describeSpan } from "./diag";
+import { SourceMap, Diagnostic, render, describeSpan, TerminalOptions, terminalOptions, renderTerminal } from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
 import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts, parallelWarnings } from "./check";
@@ -40,7 +40,7 @@ import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
 import { fuseProgram, FuseOut, ChainInfo } from "./fuse";
 import { Program } from "./hir";
-import { runFmt, printDiagnosticsJson, runGraph, runDiff, runEffects } from "./tools";
+import { runFmt, printDiagnosticsJson, runGraph, runDiff, runEffects, runPackage } from "./tools";
 import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
@@ -49,22 +49,23 @@ function usage(): void {
   exit(2);
 }
 
-function report(sm: SourceMap, diags: Diagnostic[], json: bool): void {
+function report(sm: SourceMap, diags: Diagnostic[], json: bool, ui: TerminalOptions): void {
   if (json) {
     printDiagnosticsJson(sm, diags);
     exit(1);
     return;
   }
   for (const d of diags) {
-    console.error(render(sm, d));
+    console.error(ui.rich ? renderTerminal(sm, d, ui.color, ui.ascii) + "\n" : render(sm, d));
   }
+  if (ui.rich) { console.error("Check failed · " + diags.length.toString() + " error(s)"); }
   exit(1);
 }
 
 // Prints the warnings of the program without failing: `@Deprecated` uses (ADR-0024) and contract-quality
 // warnings (ADR-0028; the strict ones when `strictFlag` or `[contracts] strict = true` is set), to stderr as
 // text, or as JSON objects on stdout with --format=json.
-function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool, strictFlag: bool): void {
+function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool, strictFlag: bool, ui: TerminalOptions): void {
   let ws: Diagnostic[] = [];
   if (hasDeprecated(program)) {
     ws = deprecationWarnings(program, checkWithIndex(program, sm).index);
@@ -78,17 +79,17 @@ function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool, strict
     return;
   }
   for (const d of ws) {
-    console.error(render(sm, d));
+    console.error(ui.rich ? renderTerminal(sm, d, ui.color, ui.ascii) + "\n" : render(sm, d));
   }
 }
 
 // The effect policy of `orin.toml` (`[effects]`, ADR-0037 D4): a module whose inferred effects exceed its allowance is a
 // compile error (E0473). Checked on the program a build ships (`@Test` functions erased); a no-op without an `[effects]` table.
-function policyCheck(program: LoadedProgram, sm: SourceMap, json: bool): void {
+function policyCheck(program: LoadedProgram, sm: SourceMap, json: bool, ui: TerminalOptions): void {
   const shipped = hasTests(program) ? eraseTests(program) : program;
   const ds = effectPolicyDiags(shipped, sm);
   if (ds.length > 0) {
-    report(policySourceMap(shipped, sm), ds, json);
+    report(policySourceMap(shipped, sm), ds, json, ui);
   }
 }
 
@@ -138,9 +139,14 @@ function main(host: Host): void {
 }
 
 function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
-  const all = args(proc);
+  const ui = terminalOptions(args(proc));
+  const all = ui.args;
+  if (all.length >= 1 && all[0] == "__package") {
+    exit(runPackage(fs, all.slice(1, all.length)));
+    return;
+  }
   if (all.length >= 1 && all[0] == "fmt") {
-    const code = runFmt(fs, all.slice(1, all.length));
+    const code = runFmt(fs, all.slice(1, all.length), ui);
     if (code != 0) {
       exit(code);
     }
@@ -163,7 +169,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   if (all.length >= 1 && all[0] == "test") {
-    exit(runTestCommand(fs, proc, all.slice(1, all.length)));
+    exit(runTestCommand(fs, proc, args(proc).slice(1, args(proc).length)));
     return;
   }
   if (all.length >= 1 && all[0] == "mcp") {
@@ -256,14 +262,14 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(fs, entry, noOverlay, usePrelude ? preludeRoots() : noPreludeRoots());
   if (loaded.diags.length > 0) {
-    report(loaded.sm, loaded.diags, json);
+    report(loaded.sm, loaded.diags, json, ui);
     return;
   }
   let program = loaded.program.unwrap();
   if (cmd == "api") {
     const ci = checkWithIndex(program, loaded.sm);
     if (ci.result.isErr()) {
-      report(loaded.sm, ci.result.unwrapErr(), json);
+      report(loaded.sm, ci.result.unwrapErr(), json, ui);
       return;
     }
     const snap = apiSnapshot(program, ci.index);
@@ -294,18 +300,18 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     // program that is lowered: nothing they use reaches the output (ADR-0024).
     const full = check(program, loaded.sm);
     if (full.isErr()) {
-      report(loaded.sm, full.unwrapErr(), json);
+      report(loaded.sm, full.unwrapErr(), json, ui);
       return;
     }
-    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
+    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag, ui);
     program = eraseTests(program);
   }
   const checked = checkContracts ? checkRuntime(program, loaded.sm) : check(program, loaded.sm);
   if (checked.isErr()) {
-    report(loaded.sm, checked.unwrapErr(), json);
+    report(loaded.sm, checked.unwrapErr(), json, ui);
     return;
   }
-  policyCheck(program, loaded.sm, json);
+  policyCheck(program, loaded.sm, json, ui);
   // Warnings that need the typed program: the parallel reductions of ADR-0039 (W0480, W0481).
   const pw = parallelWarnings(checked.unwrap().functions);
   if (pw.length > 0 && json && !verifyContractsFlag) {
@@ -316,7 +322,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     }
   }
   if (!withTests) {
-    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
+    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag, ui);
   }
   if (cmd == "check") {
     if (deps) {
