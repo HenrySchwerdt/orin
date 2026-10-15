@@ -37,7 +37,8 @@ children, the `<` rule), plus:
 |---|---|
 | `import ox from "module";` | selects the file's **OX provider** (§3). At most one per file; it binds no name. |
 | `<Card {...props} title="x" />` | **spread**: every field of the record `props` is an attribute. On a component it fills parameters (§4.1); on an intrinsic element of a `Markup` provider it expands statically (§4.3). |
-| `<Dialog><:header>..</:header>..</Dialog>` | **named slot** `header`: its children fill the component's parameter `header`. Only directly inside a component. `</:header>` must repeat the name. |
+| `<Dialog><:header>..</:header>..</Dialog>` | **named slot** `header`: its children fill the component's parameter `header`. Only directly inside a component or member tag. `</:header>` must repeat the name. |
+| `<ui.Card title="x">..</ui.Card>` | **member tag**: the tag is a dotted path whose last segment starts upper-case; the call of the method `Card` of the value `ui` (§4.5). The closing tag repeats the whole path. |
 | `@Sealed type T = { .. };` | record literals of `T` and assignments to its fields are only allowed in the declaring module (E0495). |
 
 Why `<:name>` for named slots: `<slot name="..">` is a real HTML element (Web Components) and would make the
@@ -45,8 +46,13 @@ notation ambiguous for exactly the provider it must serve; `slot="name"` attribu
 marker on an element and need a wrapper for text; `<template #name>` (Vue) needs a new attribute syntax. `<:name>` is
 not valid HTML or XML, so no provider can mean anything else by it, it is short, and the parser recognises it at `<:`.
 
-Not supported (syntax error or E0491): member tags `<ui.Card>` (Orin has no namespaces or static members yet),
-namespaced names `xlink:href`.
+A tag is a path `p1.p2. .. .pn`: `p1` is an identifier or `this`, the others identifiers, and `pn` (the last) names what
+is called. With `n > 1` and `pn` starting upper-case the tag is a member tag. A path with `n > 1` whose last segment is
+lower-case is a syntax error, **E0200** (the nearest existing code for "this token is not allowed here"; E0494 is
+reserved for names that are invalid by the notation's lexical rules, and `a.b` is a valid path that only lacks a
+meaning). A closing tag that does not repeat the path is the existing mismatched-closing-tag error (E0200).
+
+Not supported (syntax error or E0491): namespaced names `xlink:href`.
 
 ### 3. Providers
 
@@ -199,6 +205,25 @@ with a letter (E0494 otherwise). These are the notation's lexical rules, not HTM
 `<t ..>..</t>` is a call of the provider module's exported function `t` with the component rules (§4.1), spread
 included; no such function is E0491.
 
+#### 4.5 Member tags
+
+`<a.b.C attrs>kids</a.b.C>` is the call of the **method** `C` of the receiver `a.b`, with exactly the rules of §4.1 for
+an upper-case function component: the method's parameters (without the receiver) give the attribute names; spread,
+omitted `Option` parameters, the default slot `children`, `<:name>` slots and source-order evaluation are the same; the
+result is the method's return type, checked where the element is used. The receiver is a class instance or an interface
+value (a mutating method needs a receiver that is a mutable place, as for `a.b.C(..)`). Static methods and private
+methods follow the method-call rules (E0405).
+
+The checker does not build a second call path: after the attributes are matched to parameters it checks the ordinary
+method call `a.b.C(args)`, so visibility, mutation, generic classes and interface dispatch behave as in that call. The
+receiver is a pure path (names, `this`, field reads), so reading it at the call is observably the same as evaluating it
+before the attributes.
+
+Errors, all **E0491** with the member written in the message: the member is not a method, e.g. a field of function type
+(`` `ui.Card` is not a method; a member tag calls a method, whose parameters give the attribute names ``: a function type
+has no parameter names to match attributes with); the receiver's type has no method of that name; and every error of
+§4.1 (unknown attribute, missing parameter, ...).
+
 ### 5. std:html as a provider
 
 `std:html` keeps its API and adds `export function ox(): Markup<Html>` with the rules of ADR-0043 as data. `Html` is
@@ -233,7 +258,7 @@ Migration: a program with markup adds `import ox from "std:html";` next to its o
 
 ## Not done
 
-- Member tags and namespaces; per-block provider selection.
+- Namespaces; member tags on a type name (static methods) or on a module; per-block provider selection.
 - Generic slot parameters whose type is inferred from the children (a generic component's slot type must be fixed by
   its other arguments or written explicitly).
 - The ADR-0043 performance follow-ups (pre-sized buffers, append without temporaries, component fusion, streaming).

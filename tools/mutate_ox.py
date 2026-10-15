@@ -60,7 +60,7 @@ MUTANTS = [
      "  private oxPresent(p: OxProvider, name: string, span: Span, o: OxOut): Result<OxOut, Diagnostic> {\n    if (false) {"),
     ("source-order-ignored", "check/expr.or", "          if (pi <= last) {\n            ordered = true;\n          }\n          last = pi;\n        },",
      "          last = pi;\n        },"),
-    ("option-param-required", "check/expr.or", 'if (pn != "children" && !isOptionTe(params[i].ty)) {', 'if (pn != "children") {'),
+    ("option-param-required", "check/expr.or", 'if (pn != "children" && !sig.opt[i]) {', 'if (pn != "children") {'),
     ("single-child-wrapped-in-fragment", "check/expr.or", "      if (items.length == 1 && !items[0].splice) {", "      if (false) {"),
     ("spread-later-attribute-lost", "check/expr.or", "          args[pi] = Some(x);\n", "          if (args[pi].isNone()) {\n            args[pi] = Some(x);\n          }\n"),
     ("field-assignment-not-sealed", "check/stmt.or",
@@ -71,7 +71,12 @@ MUTANTS = [
     ("no-ox-after-return", "syntax/lexer.or", 'KKeyword => t.text == "return",', "KKeyword => false,"),
     ("ox-after-identifier", "syntax/lexer.or", 'KPunct => t.text != ")" && t.text != "]" && t.text != "}",',
      'KPunct => t.text != ")" && t.text != "]" && t.text != "}",\n      KIdent => true,'),
-    ("closing-tag-name-unchecked", "syntax/parser.or", "      if (!this.isIdentText(0, want)) {", "      if (!this.isIdentAt(0)) {"),
+    ("closing-tag-name-unchecked", "syntax/parser.or", "        if (!this.isIdentText(0, path[k])) {", "        if (!this.isIdentAt(0)) {"),
+    # ---- member tags (ADR-0044 §4.5)
+    ("member-receiver-dropped", "syntax/parser.or", "        recv = Some(r);", "        recv = None;"),
+    ("member-lowercase-accepted", "syntax/parser.or", "        if (id.name.charCodeAt(0) < 65 || id.name.charCodeAt(0) > 90) {",
+     "        if (false) {"),
+    ("member-receiver-param-counted", "check/expr.or", "ps.slice(1, ps.length)", "ps"),
 ]
 
 

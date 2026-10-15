@@ -204,7 +204,12 @@ export type ArrowBody = AExpr(Expr) | ABlock(Block);
 // a component (a function called with the attributes as named arguments), any other an intrinsic element of the file's
 // OX provider. The closing tag is not kept
 // (the parser checks that it repeats the name). `selfClosing`: written `<x />` (then `children` is empty).
+//
+// A member tag `<a.b.C ..>` (ADR-0044) has `recv` = the value path `a.b` (identifiers, `this`, field accesses) and `name`
+// = its last segment `C`, which starts upper-case: the element is a call of the method `C` of `recv`. `recv` is None
+// for every other element.
 export type OxElement = {
+  recv: Option<Expr>;
   name: Option<Ident>;
   attrs: OxAttr[];
   children: OxChild[];
@@ -225,6 +230,9 @@ export type OxChild = JText(string, Span) | JExpr(Expr) | JElem(OxElement) | JSl
 // The expressions written inside `el` (attribute values and `{..}` children, nested elements included), in source order.
 export function oxExprs(el: OxElement): Expr[] {
   let out: Expr[] = [];
+  if (el.recv.isSome()) {
+    out.push(el.recv.unwrap());
+  }
   for (const a of el.attrs) {
     match (a.value) {
       JVExpr(x) => {
@@ -270,7 +278,11 @@ export function oxMapExprs(el: OxElement, f: (x: Expr) => Expr): OxElement {
     };
     attrs.push(OxAttr { name: a.name, value: v, span: a.span });
   }
-  return OxElement { name: el.name, attrs: attrs, children: oxMapKids(el.children, f), selfClosing: el.selfClosing, span: el.span };
+  const recv = match (el.recv) {
+    Some(r) => Some(f(r)),
+    None => None,
+  };
+  return OxElement { recv: recv, name: el.name, attrs: attrs, children: oxMapKids(el.children, f), selfClosing: el.selfClosing, span: el.span };
 }
 
 function oxMapKids(kids: OxChild[], f: (x: Expr) => Expr): OxChild[] {
@@ -290,7 +302,7 @@ function oxMapKids(kids: OxChild[], f: (x: Expr) => Expr): OxChild[] {
 // The names of the component tags in `el` (itself and nested elements), in source order: references to functions.
 export function oxComponents(el: OxElement): Ident[] {
   let out: Ident[] = [];
-  if (oxIsComponent(el)) {
+  if (oxIsComponent(el) && el.recv.isNone()) {
     out.push(el.name.unwrap());
   }
   return out.concat(oxKidComponents(el.children));
