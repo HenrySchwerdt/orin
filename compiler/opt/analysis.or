@@ -2,282 +2,342 @@
 // ("ancestor") relation between borrowed locals and the locals they borrow from, successors.
 
 import { MType, MFunction, Operand, Instr, Terminator, SwitchCase } from "../mir";
-import { blocksLocalsBelow, instrLocals, termLocals } from "../mir";
+import { blocksLocalsBelow, instrLocals, termLocals, succCount, succAt } from "../mir";
 
-function lo(o: Operand): usize[] {
-  return match (o) {
-    OLocal(l) => [l],
-    _ => [],
-  };
+// The successors are the MIR's (compiler/mir/wellformed.or): one table for the verifier, the lowering and the passes.
+export { successors, succCount, succAt } from "../mir";
+
+// The locals read (or mutated through) by instructions and terminators, including IRelease, one instruction at a time
+// into a buffer that is reused: `ofInstr` / `ofTerm` leave them in `xs[0..n)`. The passes call it for every instruction of
+// every function, so the callers walk the buffer by index (a `for` over `xs` would hold it and the next fill would copy it).
+@Invariant(this.n <= this.xs.length)
+export class UseBuf {
+  xs: usize[];
+  n: usize;
+
+  constructor() {
+    this.xs = [];
+    this.n = 0;
+  }
+
+  private put(l: usize): void {
+    if (this.n < this.xs.length) {
+      this.xs[this.n] = l;
+    } else {
+      this.xs.push(l);
+    }
+    this.n += 1;
+  }
+
+  // The locals instruction `i` reads, in `xs[0..n)`.
+  ofInstr(i: Instr): void {
+    this.n = 0;
+    match (i) {
+      ICopy(_, o) => {
+        match (o) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IMove(_, s) => {
+        this.put(s);
+      },
+      IBorrow(_, s) => {
+        this.put(s);
+      },
+      IDup(_, o) => {
+        match (o) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IRelease(x) => {
+        this.put(x);
+      },
+      IUnary(_, _, o) => {
+        match (o) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IBinary(_, _, a, b) => {
+        match (a) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+        match (b) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      ICall(_, _, args) => {
+        for (const e of args) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+      IBuiltin(_, _, args) => {
+        for (const e of args) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+      IStrAppend(x, y) => {
+        this.put(x);
+        match (y) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IStrPrepend(x, y) => {
+        this.put(x);
+        match (y) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IArrayExtend(x, y) => {
+        this.put(x);
+        match (y) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IStructNew(_, _, s) => {
+        for (const e of s) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+      INullary(_, _) => {},
+      ITag(_, o) => {
+        match (o) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IGetField(_, o, _) => {
+        match (o) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      ISetField(x, _, v) => {
+        this.put(x);
+        match (v) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      ITakeField(_, x, _) => {
+        this.put(x);
+      },
+      IPutField(x, _, s) => {
+        this.put(x);
+        this.put(s);
+      },
+      IMakeUnique(x) => {
+        this.put(x);
+      },
+      IArrayNew(_, _, es) => {
+        for (const e of es) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+      IArrayGet(_, a, k) => {
+        match (a) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+        match (k) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IArraySet(x, k, v) => {
+        this.put(x);
+        match (k) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+        match (v) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IArrayTake(_, x, k) => {
+        this.put(x);
+        match (k) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IArrayPut(x, k, s) => {
+        this.put(x);
+        this.put(s);
+        match (k) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IArrayPush(x, v) => {
+        this.put(x);
+        match (v) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      IArrayPop(_, x) => {
+        this.put(x);
+      },
+      IClosure(_, _, caps) => {
+        for (const e of caps) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+      ICallIndirect(_, f, args) => {
+        match (f) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+        for (const e of args) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+      IIface(_, _, v) => {
+        match (v) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+      },
+      ICallVirtual(_, r, _, args) => {
+        match (r) {
+          OLocal(l) => {
+            this.put(l);
+          },
+          _ => {},
+        }
+        for (const e of args) {
+          match (e) {
+            OLocal(l) => {
+              this.put(l);
+            },
+            _ => {},
+          }
+        }
+      },
+    }
+  }
+
+  // The locals terminator `t` reads, in `xs[0..n)`.
+  ofTerm(t: Terminator): void {
+    this.n = 0;
+    match (t) {
+      TBranch(o, _, _) => {
+        this.op(o);
+      },
+      TSwitch(o, _, _) => {
+        this.op(o);
+      },
+      TReturn(r) => {
+        match (r) {
+          Some(o) => {
+            this.op(o);
+          },
+          None => {},
+        }
+      },
+      _ => {},
+    }
+  }
+
+  private op(o: Operand): void {
+    match (o) {
+      OLocal(l) => {
+        this.put(l);
+      },
+      _ => {},
+    }
+  }
+
+  // The locals in `xs[0..n)` as a list.
+  list(): usize[] {
+    return this.xs.slice(0, this.n);
+  }
 }
 
-// Locals read (or mutated through) by an instruction, including IRelease. One array per call, filled in place: no array
-// per operand and no `concat` copies (this runs for every instruction of every pass).
+// Locals read (or mutated through) by an instruction, including IRelease.
 export function instrUses(i: Instr): usize[] {
-  let out: usize[] = [];
-  match (i) {
-    ICopy(_, o) => {
-      match (o) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IMove(_, s) => {
-      out.push(s);
-    },
-    IBorrow(_, s) => {
-      out.push(s);
-    },
-    IDup(_, o) => {
-      match (o) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IRelease(x) => {
-      out.push(x);
-    },
-    IUnary(_, _, o) => {
-      match (o) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IBinary(_, _, a, b) => {
-      match (a) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-      match (b) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    ICall(_, _, args) => {
-      for (const e of args) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-    IBuiltin(_, _, args) => {
-      for (const e of args) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-    IStrAppend(x, y) => {
-      out.push(x);
-      match (y) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IStrPrepend(x, y) => {
-      out.push(x);
-      match (y) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IArrayExtend(x, y) => {
-      out.push(x);
-      match (y) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IStructNew(_, _, s) => {
-      for (const e of s) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-    INullary(_, _) => {},
-    ITag(_, o) => {
-      match (o) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IGetField(_, o, _) => {
-      match (o) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    ISetField(x, _, v) => {
-      out.push(x);
-      match (v) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    ITakeField(_, x, _) => {
-      out.push(x);
-    },
-    IPutField(x, _, s) => {
-      out.push(x);
-      out.push(s);
-    },
-    IMakeUnique(x) => {
-      out.push(x);
-    },
-    IArrayNew(_, _, es) => {
-      for (const e of es) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-    IArrayGet(_, a, k) => {
-      match (a) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-      match (k) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IArraySet(x, k, v) => {
-      out.push(x);
-      match (k) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-      match (v) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IArrayTake(_, x, k) => {
-      out.push(x);
-      match (k) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IArrayPut(x, k, s) => {
-      out.push(x);
-      out.push(s);
-      match (k) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IArrayPush(x, v) => {
-      out.push(x);
-      match (v) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    IArrayPop(_, x) => {
-      out.push(x);
-    },
-    IClosure(_, _, caps) => {
-      for (const e of caps) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-    ICallIndirect(_, f, args) => {
-      match (f) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-      for (const e of args) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-    IIface(_, _, v) => {
-      match (v) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-    },
-    ICallVirtual(_, r, _, args) => {
-      match (r) {
-        OLocal(l) => {
-          out.push(l);
-        },
-        _ => {},
-      }
-      for (const e of args) {
-        match (e) {
-          OLocal(l) => {
-            out.push(l);
-          },
-          _ => {},
-        }
-      }
-    },
-  }
-  return out;
+  let u = new UseBuf();
+  u.ofInstr(i);
+  return u.list();
 }
 
 // The local an instruction (re)defines, if any.
@@ -309,34 +369,9 @@ export function instrDef(i: Instr): Option<usize> {
 }
 
 export function termUses(t: Terminator): usize[] {
-  return match (t) {
-    TGoto(_) => [],
-    TBranch(o, _, _) => lo(o),
-    TSwitch(o, _, _) => lo(o),
-    TReturn(r) => match (r) {
-      Some(o) => lo(o),
-      None => [],
-    },
-    TTrap(_) => [],
-  };
-}
-
-export function successors(t: Terminator): usize[] {
-  return match (t) {
-    TGoto(b) => [b],
-    TBranch(_, a, b) => [a, b],
-    TSwitch(_, cs, d) => {
-      // a loop: the liveness fixpoints call this for every block in every round
-      let out: usize[] = [];
-      for (const c of cs) {
-        out.push(c.target);
-      }
-      out.push(d);
-      return out;
-    },
-    TReturn(_) => [],
-    TTrap(_) => [],
-  };
+  let u = new UseBuf();
+  u.ofTerm(t);
+  return u.list();
 }
 
 export function isRefTy(t: MType): bool {
@@ -546,12 +581,15 @@ export function usesAffecting(anc: usize[][], ins: Instr, x: usize): bool {
 }
 
 export function termUsesAffecting(anc: usize[][], t: Terminator, x: usize): bool {
-  for (const u of termUses(t)) {
-    if (affects(anc, u, x)) {
-      return true;
-    }
-  }
-  return false;
+  return match (t) {
+    TBranch(o, _, _) => opAffects(anc, o, x),
+    TSwitch(o, _, _) => opAffects(anc, o, x),
+    TReturn(r) => match (r) {
+      Some(o) => opAffects(anc, o, x),
+      None => false,
+    },
+    _ => false,
+  };
 }
 
 // The optimiser's use / definition tables agree with the shared, independent table of the locals an instruction
@@ -589,10 +627,14 @@ export function countsOf(f: MFunction): Counts {
     uses.push(0);
     defs.push(0);
   }
+  let ub = new UseBuf();
   for (const blk of f.blocks) {
     for (const ins of blk.instrs) {
-      for (const u of instrUses(ins)) {
-        uses[u] += 1;
+      ub.ofInstr(ins);
+      let k: usize = 0;
+      while (k < ub.n) {
+        uses[ub.xs[k]] += 1;
+        k += 1;
       }
       match (instrDef(ins)) {
         Some(d) => {
@@ -601,8 +643,11 @@ export function countsOf(f: MFunction): Counts {
         None => {},
       }
     }
-    for (const u of termUses(blk.term)) {
-      uses[u] += 1;
+    ub.ofTerm(blk.term);
+    let k: usize = 0;
+    while (k < ub.n) {
+      uses[ub.xs[k]] += 1;
+      k += 1;
     }
   }
   return Counts { uses: uses, defs: defs };
@@ -611,10 +656,12 @@ export function countsOf(f: MFunction): Counts {
 // Is block 0 the target of some terminator?
 export function entryHasPredecessor(f: MFunction): bool {
   for (const blk of f.blocks) {
-    for (const s of successors(blk.term)) {
-      if (s == 0) {
+    let k: usize = 0;
+    while (k < succCount(blk.term)) {
+      if (succAt(blk.term, k) == 0) {
         return true;
       }
+      k += 1;
     }
   }
   return false;
