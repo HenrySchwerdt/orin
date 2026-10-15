@@ -1,16 +1,21 @@
-// std:html -- escaping and rendering for HTML output; the run-time side of OX (ADR-0043).
+// std:html -- escaping and rendering for HTML output, and the OX provider for HTML (ADR-0043, ADR-0044).
 //
-// `Html` is rendered, trusted HTML. Only OX, `trustHtml` and this module construct it (the compiler rejects
-// the record literal `Html { .. }` and assignment to `.html` outside this module). Everything else is `string`
+// `Html` is rendered, trusted HTML. Only OX, `trustHtml` and this module construct it (`Html` is @Sealed: the compiler
+// rejects the record literal `Html { .. }` and assignment to `.html` outside this module). Everything else is `string`
 // and is escaped on its way into an `Html`, so a string can never become markup by accident.
 // Orin strings are byte strings (see std:utf8): the five escaped characters are ASCII, every other byte
 // (UTF-8 multi-byte sequences included) is copied unchanged.
 // Only HTML text and quoted attribute values are covered. CSS, JavaScript, unquoted attribute values and
 // attribute or tag names are other contexts and are NOT handled by `escape`.
+// A file selects this module as its OX provider with `import ox from "std:html";`; `ox()` below is the provider
+// literal (the HTML rules: escape table, void and raw-text elements, URL and event attributes).
 // No platform calls, no additional trusted code, no runtime reflection.
 // Every function is total (never traps) and O(n) in the size of its input and output.
 
+import { Markup, AttrRule, Escape } from "std:ox";
+
 // Rendered, trusted HTML.
+@Sealed
 export type Html = { html: string; };
 
 // What `safeUrl` returns instead of a URL with a scheme that is not allowed.
@@ -167,6 +172,7 @@ export function escapeUrl(s: string): string {
 @Ensures(xs.length == 0 ==> result == "")
 @Ensures(xs.length == 1 ==> result == xs[0].html)
 @Ensures(xs.length >= 1 ==> result.startsWith(xs[0].html) && result.endsWith(xs[xs.length - 1].html))
+@Inline
 export function joinAll(xs: Html[]): string {
   let out = "";
   for (const x of xs) {
@@ -177,6 +183,7 @@ export function joinAll(xs: Html[]): string {
 
 // The explicit, auditable escape hatch: `raw` is HTML and is NOT escaped. Every use is a place to review.
 @Ensures(result.html == raw)
+@Inline
 export function trustHtml(raw: string): Html {
   return Html { html: raw };
 }
@@ -201,6 +208,7 @@ export function fragment(xs: Html[]): Html {
 
 // The markup as a string.
 @Ensures(result == h.html)
+@Inline
 export function render(h: Html): string {
   return h.html;
 }
@@ -216,4 +224,38 @@ export function document(h: Html): string {
 @Ensures(result == (h.html.length == 0))
 export function isEmpty(h: Html): bool {
   return h.html.length == 0;
+}
+
+// The OX provider of HTML (ADR-0044 §5): the compiler reads this literal and calls the named functions. A root of
+// markup is `trustHtml(buffer)`, an `Html` child is `render(h)`, an `Html[]` child is `joinAll(hs)`, a computed
+// string child or attribute value is `escape(s)`; the attributes of `names` take `escapeUrl` (an unsafe scheme such
+// as `javascript:` becomes a harmless constant), attributes starting with `on` are static only (their value is
+// JavaScript). `escapes` is the compile-time twin of `escape` (tests/next/run/ox_escape_diff.or compares them).
+export function ox(): Markup<Html> {
+  return Markup<Html> {
+    wrap: trustHtml,
+    embed: render,
+    embedAll: joinAll,
+    text: escape,
+    attr: escape,
+    rules: [
+      AttrRule {
+        names: ["href", "src", "action", "formaction", "cite", "poster", "background", "manifest", "ping", "data", "xlink-href"],
+        prefix: "",
+        convert: Some(escapeUrl),
+      },
+      AttrRule { names: [], prefix: "on", convert: None },
+    ],
+    escapes: [
+      Escape { char: "&", encoded: "&amp;" },
+      Escape { char: "<", encoded: "&lt;" },
+      Escape { char: ">", encoded: "&gt;" },
+      Escape { char: "\"", encoded: "&quot;" },
+      Escape { char: "'", encoded: "&#39;" },
+    ],
+    voidTags: ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"],
+    voidEnd: ">",
+    rawTextTags: ["script", "style"],
+    presenceAttrs: true,
+  };
 }

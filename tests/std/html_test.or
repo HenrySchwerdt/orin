@@ -3,7 +3,8 @@
 // see tools/test_std.sh.
 import { assert, assertEqString, assertEqBool, assertEqUsize } from "std:test";
 import { Html, escape, needsEscape, safeUrl, escapeUrl, hasSafeScheme, isSafeUrl, joinAll, trustHtml, text, empty,
-  fragment, render, document, isEmpty } from "std:html";
+  fragment, render, document, isEmpty, ox } from "std:html";
+import { Escape } from "std:ox";
 
 const UNSAFE: string = "about:invalid#orin-unsafe-url";
 
@@ -329,4 +330,88 @@ function renderingAndDocument(): void {
   assertEqBool(isEmpty(fragment([])), true, "empty fragment is empty");
   assertEqBool(isEmpty(trustHtml(" ")), false, "a space is not empty");
   assertEqBool(isEmpty(text("<")), false, "escaped text is not empty");
+}
+
+// The provider literal `ox()` (ADR-0044 §5): what the compiler reads to serve OX with HTML rules.
+// Applies a provider's escape table to `s` byte by byte, the way the compiler does for static text.
+function applyEscapes(s: string, es: Escape[]): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.substring(i, i + 1);
+    let rep = c;
+    for (const e of es) {
+      if (e.char == c) {
+        rep = e.encoded;
+      }
+    }
+    out += rep;
+    i += 1;
+  }
+  return out;
+}
+
+function has(xs: string[], x: string): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+@Test
+function providerShape(): void {
+  const p = ox();
+  assertEqString(p.voidEnd, ">", "void tags end with >");
+  assertEqBool(p.presenceAttrs, true, "presence attributes");
+  assertEqUsize(p.escapes.length, 5, "five escapes");
+  assertEqUsize(p.voidTags.length, 13, "thirteen void elements");
+  for (const t of ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]) {
+    assertEqBool(has(p.voidTags, t), true, "void " + t);
+  }
+  assertEqBool(has(p.voidTags, "p"), false, "p is not void");
+  assertEqUsize(p.rawTextTags.length, 2, "two raw text elements");
+  assertEqBool(has(p.rawTextTags, "script") && has(p.rawTextTags, "style"), true, "script and style");
+}
+
+@Test
+function providerFunctions(): void {
+  const p = ox();
+  assertEqString(render(p.wrap("<b>x</b>")), "<b>x</b>", "wrap");
+  assertEqString(p.embed(trustHtml("<i>")), "<i>", "embed");
+  assertEqString(p.embedAll([text("a<"), text("b")]), "a&lt;b", "embedAll");
+  assertEqString(p.text("<&>"), "&lt;&amp;&gt;", "text escapes");
+  assertEqString(p.attr("\"'"), "&quot;&#39;", "attr escapes");
+}
+
+@Test
+function providerEscapesAgreeWithEscape(): void {
+  const es = ox().escapes;
+  let all = "";
+  let b = 0;
+  while (b < 256) {
+    all += String.fromCharCode(b);
+    b += 1;
+  }
+  assertEqString(applyEscapes(all, es), escape(all), "static table equals escape on all bytes");
+  assertEqString(applyEscapes("a & b < c > d \" e ' f", es), escape("a & b < c > d \" e ' f"), "special characters");
+}
+
+@Test
+function providerRules(): void {
+  const rules = ox().rules;
+  assertEqUsize(rules.length, 2, "two rules");
+  const urls = rules[0];
+  assertEqUsize(urls.names.length, 11, "eleven URL attributes");
+  for (const n of ["href", "src", "action", "formaction", "cite", "poster", "background", "manifest", "ping", "data", "xlink-href"]) {
+    assertEqBool(has(urls.names, n), true, "URL attribute " + n);
+  }
+  assertEqString(urls.prefix, "", "URL rule has no prefix");
+  assertEqString(urls.convert.unwrap()("javascript:alert(1)"), "about:invalid#orin-unsafe-url", "URL rule sanitises");
+  assertEqString(urls.convert.unwrap()("/a?b=1&c=2"), "/a?b=1&amp;c=2", "URL rule escapes");
+  const events = rules[1];
+  assertEqUsize(events.names.length, 0, "event rule has no names");
+  assertEqString(events.prefix, "on", "event prefix");
+  assertEqBool(events.convert.isNone(), true, "event attributes are static only");
 }
