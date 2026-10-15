@@ -299,7 +299,8 @@ in place (to nothing, or a release of the result) when the receiver was moved ou
 
 ## Addendum (2026-10-15): lever 2, field and element access code
 
-**Status: proposed, awaiting owner approval.** Design only; no compiler code is written until the owner approves, because the
+**Status: accepted by the owner 2026-10-15 for T1-T5 and rules U1, F1, U2-U5 (T6's interval domain needs its own decision);
+the `orin_stats` counters become a build-time option.** Originally a design only; no compiler code was written before approval, because the
 change touches the trusted base: the MIR ownership verifier (`compiler/verify`), `docs/mir.md`, `docs/tcb.md`, the ADR-0032
 translation-validation story and Lean model, and `tools/mutate_mir.py`. Same rule as the rest of this ADR: an optimisation acts
 only on a fact the independent verifier re-checks (or that the language guarantees), and the RC/COW path stays the fallback. A
