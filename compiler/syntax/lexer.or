@@ -12,6 +12,10 @@ import { Span, Diagnostic, span, diag } from "../diag";
 // as a (negative) int. Template literals (ADR-0022) are lexed into KTplFull (`...` without interpolation), or
 // KTplHead (`...${), zero or more KTplMid (}...${), and KTplTail (}...`) with the expression tokens in between;
 // `text` is the cooked (unescaped) text of that chunk, the span covers the delimiters.
+// JSX (ADR-0043) is lexed in its own modes: KJsxOpen (`<` starting a tag, `</` starting a closing tag), KJsxEnd (`>` or
+// `/>` ending a tag) and KJsxText (text between tags, cooked: whitespace rules applied and entities decoded, never
+// empty). Inside a tag, names (which may contain `-`, and are never keywords) are KIdent, `=` and the braces of
+// `{expr}` are KPunct and values are KStr; between `{` and `}` the ordinary tokens.
 export type TokKind =
   KIdent
   | KKeyword
@@ -24,7 +28,10 @@ export type TokKind =
   | KTplFull
   | KTplHead
   | KTplMid
-  | KTplTail;
+  | KTplTail
+  | KJsxOpen
+  | KJsxEnd
+  | KJsxText;
 
 // `text`: source spelling; for KStr and the template kinds the unescaped bytes. `value`: integer value for KInt /
 // KBigInt, else 0.
@@ -290,18 +297,186 @@ function skipTrivia(file: usize, src: string, start: usize): Result<usize, Diagn
   return Ok(i);
 }
 
+// ---------------------------------------------------------------------------
+// JSX text (ADR-0043)
+// ---------------------------------------------------------------------------
+
+// Lexical contexts (Lexer.ctx).
+const CTX_TPL: int = 0;
+const CTX_JSX_EXPR: int = 1;
+const CTX_JSX_TAG: int = 2;
+const CTX_JSX_KIDS: int = 3;
+const CTX_JSX_CLOSE: int = 4;
+
+// The UTF-8 bytes of code point `cp`, or "" when `cp` is not a Unicode scalar value (0, a surrogate, above U+10FFFF).
+@Ensures(result.length <= 4)
+@Ensures(cp > 0 && cp < 128 ==> result.length == 1)
+export function utf8Of(cp: int): string {
+  if (cp <= 0 || cp > 1114111 || cp >= 55296 && cp <= 57343) {
+    return "";
+  }
+  if (cp < 128) {
+    return String.fromCharCode(cp);
+  }
+  if (cp < 2048) {
+    return String.fromCharCode(192 + cp / 64) + String.fromCharCode(128 + cp % 64);
+  }
+  if (cp < 65536) {
+    return String.fromCharCode(224 + cp / 4096)
+        + String.fromCharCode(128 + cp / 64 % 64)
+        + String.fromCharCode(128 + cp % 64);
+  }
+  return String.fromCharCode(240 + cp / 262144)
+      + String.fromCharCode(128 + cp / 4096 % 64)
+      + String.fromCharCode(128 + cp / 64 % 64)
+      + String.fromCharCode(128 + cp % 64);
+}
+
+// The code point of the named character reference `name` (without `&` and `;`), or -1. A small table: the five XML
+// entities, `nbsp` and common typography; any other `&name;` stays literal text (it is then escaped on output).
+@Ensures(result == -1 || result > 0)
+export function namedEntity(name: string): int {
+  return match (name) {
+    "amp" => 38,
+    "lt" => 60,
+    "gt" => 62,
+    "quot" => 34,
+    "apos" => 39,
+    "nbsp" => 160,
+    "copy" => 169,
+    "reg" => 174,
+    "deg" => 176,
+    "middot" => 183,
+    "laquo" => 171,
+    "raquo" => 187,
+    "times" => 215,
+    "ndash" => 8211,
+    "mdash" => 8212,
+    "lsquo" => 8216,
+    "rsquo" => 8217,
+    "ldquo" => 8220,
+    "rdquo" => 8221,
+    "hellip" => 8230,
+    "euro" => 8364,
+    "trade" => 8482,
+    _ => -1,
+  };
+}
+
+// The code point of the reference `body` (between `&` and `;`): a name, `#ddd` or `#xhh`; -1 if it is none of them or
+// out of range.
+export function entityCode(body: string): int {
+  if (body.length < 2 || body.charCodeAt(0) != 35) {
+    return namedEntity(body);
+  }
+  let base: int = 10;
+  let i: usize = 1;
+  if (body.charCodeAt(1) == 120 || body.charCodeAt(1) == 88) {
+    base = 16;
+    i = 2;
+  }
+  if (i >= body.length || body.length - i > 6) {
+    return -1;
+  }
+  let v: int = 0;
+  while (i < body.length) {
+    const d = hexVal(body.charCodeAt(i));
+    if (d < 0 || d >= base) {
+      return -1;
+    }
+    v = v * base + d;
+    i += 1;
+  }
+  return v;
+}
+
+// `s` with every character reference (`&amp;`, `&#169;`, `&#xA9;`, ...) replaced by the UTF-8 bytes it denotes. A `&`
+// that starts no known reference is kept. Never longer than `s` (a reference is at least as long as its bytes).
+@Ensures(result.length <= s.length)
+export function decodeEntities(s: string): string {
+  if (!s.includes("&")) {
+    return s;
+  }
+  let parts: string[] = [];
+  let run: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    if (s.charCodeAt(i) == 38) {
+      let j = i + 1;
+      while (j < s.length && j - i <= 10 && s.charCodeAt(j) != 59 && s.charCodeAt(j) != 38) {
+        j += 1;
+      }
+      if (j < s.length && s.charCodeAt(j) == 59) {
+        const bytes = utf8Of(entityCode(s.substring(i + 1, j)));
+        if (bytes.length > 0) {
+          parts.push(s.substring(run, i));
+          parts.push(bytes);
+          i = j + 1;
+          run = i;
+          continue;
+        }
+      }
+    }
+    i += 1;
+  }
+  parts.push(s.substring(run, s.length));
+  return parts.join("");
+}
+
+// One line of JSX text with the whitespace rules applied (`first` / `last`: the first / last line of the text): tabs
+// count as spaces; leading spaces are dropped except on the first line, trailing spaces except on the last line.
+@Ensures(result.length <= line.length)
+function jsxTrimLine(line: string, first: bool, last: bool): string {
+  let a: usize = 0;
+  let b = line.length;
+  if (!first) {
+    while (a < b && (line.charCodeAt(a) == 32 || line.charCodeAt(a) == 9)) {
+      a += 1;
+    }
+  }
+  if (!last) {
+    while (b > a && (line.charCodeAt(b - 1) == 32 || line.charCodeAt(b - 1) == 9 || line.charCodeAt(b - 1) == 13)) {
+      b -= 1;
+    }
+  }
+  const t = line.substring(a, b);
+  return t.includes("\t") ? t.split("\t").join(" ") : t;
+}
+
+// The value of raw JSX text `raw` (between tags), as React / TypeScript define it: entities decoded, then the text is
+// split into lines, each line trimmed (`jsxTrimLine`), empty lines dropped and the rest joined with one space. Text that
+// is only whitespace with a line break yields "" (no child); `a  b` on one line keeps both spaces.
+@Ensures(result.length <= raw.length)
+export function cookJsxText(raw: string): string {
+  const lines = decodeEntities(raw).split("\n");
+  let kept: string[] = [];
+  let i: usize = 0;
+  while (i < lines.length) {
+    const t = jsxTrimLine(lines[i], i == 0, i + 1 == lines.length);
+    if (t.length > 0) {
+      kept.push(t);
+    }
+    i += 1;
+  }
+  return kept.join(" ");
+}
+
 // A `.` right after an identifier, `)` or `]` is a member access (`a.1` is then a parse error, not a float).
 function isMemberBase(c: int): bool {
   return isAlpha(c) || isDigit(c) || c == 41 || c == 93;
 }
 
-// The lexer state: the source, the cursor `pos` and the tokens so far. `depth` holds the brace depth inside each open
-// `${ .. }` of a template literal (innermost last). The tokens are in source order and end at or before the cursor
+// The lexer state: the source, the cursor `pos` and the tokens so far. `ctx` is the stack of open lexical contexts
+// (innermost last): CTX_TPL an open `${ .. }` of a template literal, CTX_JSX_EXPR an open `{ .. }` inside JSX,
+// CTX_JSX_TAG / CTX_JSX_CLOSE the inside of a JSX opening / closing tag, CTX_JSX_KIDS the children of a JSX element.
+// `depth` (parallel to `ctx`) holds the brace depth inside each open `{` context (0 for the others). The tokens are in source order and end at or before the cursor
 // (the full order / non-overlap property, `tokensWellFormed`, is the `@Ensures` of `run`). The first lexical error is
 // kept in `err` and ends the lexer: the methods return nothing, so a call costs no `(self, result)` pair (one per token).
 @Invariant(this.pos <= this.src.length)
 @Invariant(this.toks.length == 0 || this.toks[this.toks.length - 1].span.end <= this.pos)
 @Invariant(this.depth.every(d => d >= 0))
+@Invariant(this.depth.length == this.ctx.length)
+@Invariant(this.ctx.every(k => k >= CTX_TPL && k <= CTX_JSX_CLOSE))
 @Invariant(!this.done || this.err.isSome() || this.pos == this.src.length)
 @Invariant(this.err.isNone() || this.done)
 @Invariant(this.err.isNone()
@@ -312,6 +487,7 @@ export class Lexer {
   private pos: usize = 0;
   private toks: Token[] = [];
   private depth: int[] = [];
+  private ctx: int[] = [];
   private done: bool = false;
   private err: Option<Diagnostic> = None;
 
@@ -360,6 +536,11 @@ export class Lexer {
   @Ensures(this.done && this.err.isNone()
       ==> this.pos == this.src.length && this.toks.length == old(this.toks.length))
   step(): void {
+    const mode = this.mode();
+    if (mode == CTX_JSX_KIDS) {
+      this.jsxChild();
+      return;
+    }
     const sk = skipTrivia(this.file, this.src, this.pos);
     if (sk.isErr()) {
       this.fail(sk.unwrapErr());
@@ -373,9 +554,18 @@ export class Lexer {
       this.done = true;
       return;
     }
+    if (mode == CTX_JSX_TAG || mode == CTX_JSX_CLOSE) {
+      this.jsxTag(mode);
+      return;
+    }
     const c = src.charCodeAt(i);
     if (isAlpha(c)) {
       this.ident();
+      return;
+    }
+    if (c == 60 && this.jsxStarts(i)) {
+      this.emit(KJsxOpen, "<", i, i + 1, 0);
+      this.enter(CTX_JSX_TAG);
       return;
     }
     if (isDigit(c)) {
@@ -405,7 +595,7 @@ export class Lexer {
       const ch = r.unwrap();
       this.emit(ch.ended ? KTplFull : KTplHead, ch.text, i, ch.end, 0);
       if (!ch.ended) {
-        this.depth.push(0);
+        this.enter(CTX_TPL);
       }
       return;
     }
@@ -414,6 +604,12 @@ export class Lexer {
       this.depth[open - 1] += 1;
     }
     if (c == 125 && open > 0) {
+      if (this.depth[open - 1] == 0 && this.ctx[open - 1] == CTX_JSX_EXPR) {
+        // the `}` of a JSX `{expr}`: back to the tag or the children it was written in
+        this.emit(KPunct, "}", i, i + 1, 0);
+        this.leave();
+        return;
+      }
       if (this.depth[open - 1] == 0) {
         const r = lexTemplateChunk(this.file, src, i, i + 1);
         if (r.isErr()) {
@@ -423,7 +619,7 @@ export class Lexer {
         const ch = r.unwrap();
         this.emit(ch.ended ? KTplTail : KTplMid, ch.text, i, ch.end, 0);
         if (ch.ended) {
-          this.depth.pop();
+          this.leave();
         }
         return;
       }
@@ -445,6 +641,9 @@ export class Lexer {
       return Err(this.err.unwrap());
     }
     const n = this.src.length;
+    if (this.ctx.length > 0 && this.ctx[this.ctx.length - 1] != CTX_TPL) {
+      return Err(diag("E0100", span(this.file, n, n), "unterminated JSX element (missing closing tag or `}`)"));
+    }
     if (this.depth.length > 0) {
       return Err(
         diag(
@@ -456,6 +655,176 @@ export class Lexer {
     }
     this.emit(KEof, "", n, n, 0);
     return Ok(this.toks);
+  }
+
+  // The innermost lexical context, or -1 at the top level.
+  @Ensures(result >= -1 && result <= CTX_JSX_CLOSE)
+  private mode(): int {
+    const k = this.ctx.length;
+    return k == 0 ? -1 : this.ctx[k - 1];
+  }
+
+  @Requires(k >= CTX_TPL && k <= CTX_JSX_CLOSE)
+  @Ensures(this.ctx.length == old(this.ctx.length) + 1)
+  private enter(k: int): void {
+    this.ctx.push(k);
+    this.depth.push(0);
+  }
+
+  @Requires(this.ctx.length > 0)
+  @Ensures(this.ctx.length == old(this.ctx.length) - 1)
+  private leave(): void {
+    this.ctx.pop();
+    this.depth.pop();
+  }
+
+  // Replaces the innermost context (a JSX tag becomes the children of its element, the children its closing tag).
+  @Requires(this.ctx.length > 0 && k >= CTX_TPL && k <= CTX_JSX_CLOSE)
+  @Ensures(this.ctx.length == old(this.ctx.length))
+  private become(k: int): void {
+    this.ctx[this.ctx.length - 1] = k;
+  }
+
+  // Whether the `<` at `i` starts a JSX element (ADR-0043): it is followed by a tag name or `>` (a fragment), and the
+  // previous token cannot end an operand, so `<` cannot be the less-than operator (`a < b`, `f<T>(x)` and
+  // `Map<K, V>` all have a name, literal, `)` or `]` before it).
+  @Requires(i < this.src.length)
+  private jsxStarts(i: usize): bool {
+    if (i + 1 >= this.src.length) {
+      return false;
+    }
+    const c2 = this.src.charCodeAt(i + 1);
+    if (!isAlpha(c2) && c2 != 62) {
+      return false;
+    }
+    const k = this.toks.length;
+    if (k == 0) {
+      return true;
+    }
+    const t = this.toks[k - 1];
+    return match (t.kind) {
+      KPunct => t.text != ")" && t.text != "]" && t.text != "}",
+      KKeyword => t.text == "return",
+      KTplHead => true,
+      KTplMid => true,
+      _ => false,
+    };
+  }
+
+  // One token inside a JSX opening (`mode` CTX_JSX_TAG) or closing tag (CTX_JSX_CLOSE), at a significant offset: a name,
+  // `=`, a string value, the `{` of an expression value, or the `>` / `/>` that ends the tag.
+  @Requires(!this.done && this.pos < this.src.length)
+  private jsxTag(mode: int): void {
+    const src = this.src;
+    const n = src.length;
+    const i = this.pos;
+    const c = src.charCodeAt(i);
+    if (c == 62) {
+      this.emit(KJsxEnd, ">", i, i + 1, 0);
+      if (mode == CTX_JSX_TAG) {
+        this.become(CTX_JSX_KIDS);
+      } else {
+        this.leave();
+      }
+      return;
+    }
+    if (c == 47 && i + 1 < n && src.charCodeAt(i + 1) == 62 && mode == CTX_JSX_TAG) {
+      this.emit(KJsxEnd, "/>", i, i + 2, 0);
+      this.leave();
+      return;
+    }
+    if (isAlpha(c)) {
+      let j = i + 1;
+      while (j < n && (isAlpha(src.charCodeAt(j)) || isDigit(src.charCodeAt(j)) || src.charCodeAt(j) == 45)) {
+        j += 1;
+      }
+      this.emit(KIdent, src.substring(i, j), i, j, 0);
+      return;
+    }
+    if (c == 61) {
+      this.emit(KPunct, "=", i, i + 1, 0);
+      return;
+    }
+    if (c == 34 || c == 39) {
+      this.jsxString();
+      return;
+    }
+    if (c == 123 && mode == CTX_JSX_TAG) {
+      this.emit(KPunct, "{", i, i + 1, 0);
+      this.enter(CTX_JSX_EXPR);
+      return;
+    }
+    this.fail(diag("E0100", span(this.file, i, i + 1), "unexpected `" + src.charAt(i) + "` in a JSX tag"));
+  }
+
+  // A JSX attribute string at the cursor (`"` or `'`), as in TypeScript: no backslash escapes, line breaks allowed,
+  // character references decoded (`title="Tom &amp; Jerry"` is `Tom & Jerry`). The token is a KStr.
+  private jsxString(): void {
+    const src = this.src;
+    const start = this.pos;
+    const q = src.charCodeAt(start);
+    let j = start + 1;
+    while (j < src.length && src.charCodeAt(j) != q) {
+      j += 1;
+    }
+    if (j >= src.length) {
+      this.fail(diag("E0100", span(this.file, start, src.length), "unterminated JSX attribute string"));
+      return;
+    }
+    this.emit(KStr, decodeEntities(src.substring(start + 1, j)), start, j + 1, 0);
+  }
+
+  // One child of a JSX element (ADR-0043), at the cursor (no trivia: whitespace and `//` are text here): text up to the
+  // next `<` or `{` (not emitted when it cooks to nothing), then that `{` (an expression child), `</` (the closing tag)
+  // or `<` (a nested element). `}` and `>` are not allowed in text (as in TypeScript): write `{"}"}` or `&gt;`.
+  @Requires(!this.done)
+  private jsxChild(): void {
+    const src = this.src;
+    const n = src.length;
+    const i = this.pos;
+    let j = i;
+    while (j < n && src.charCodeAt(j) != 60 && src.charCodeAt(j) != 123) {
+      const c = src.charCodeAt(j);
+      if (c == 125 || c == 62) {
+        this.fail(
+          diag(
+            "E0100",
+            span(this.file, j, j + 1),
+            "`" + src.charAt(j) + "` is not allowed in JSX text; write {\"" + src.charAt(j) + "\"}"
+                + (c == 62 ? " or &gt;" : " (or a closing tag is missing before it)"),
+          ),
+        );
+        return;
+      }
+      j += 1;
+    }
+    if (j > i) {
+      const text = cookJsxText(src.substring(i, j));
+      if (text.length > 0) {
+        this.emit(KJsxText, text, i, j, 0);
+        return;
+      }
+    }
+    if (j >= n) {
+      this.fail(diag("E0100", span(this.file, n, n), "unterminated JSX element (missing closing tag)"));
+      return;
+    }
+    if (src.charCodeAt(j) == 123) {
+      this.emit(KPunct, "{", j, j + 1, 0);
+      this.enter(CTX_JSX_EXPR);
+      return;
+    }
+    if (j + 1 < n && src.charCodeAt(j + 1) == 47) {
+      this.emit(KJsxOpen, "</", j, j + 2, 0);
+      this.become(CTX_JSX_CLOSE);
+      return;
+    }
+    if (j + 1 < n && (isAlpha(src.charCodeAt(j + 1)) || src.charCodeAt(j + 1) == 62)) {
+      this.emit(KJsxOpen, "<", j, j + 1, 0);
+      this.enter(CTX_JSX_TAG);
+      return;
+    }
+    this.fail(diag("E0100", span(this.file, j, j + 1), "expected a tag name, `>` or `/` after `<` in JSX"));
   }
 
   // Appends a token for src[start..end) and moves the cursor to its end.

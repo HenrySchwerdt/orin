@@ -36,6 +36,10 @@ post-freeze cleanup; HIR is lowered to MIR and emitted by `compiler/cemit` or `c
 Planned later passes (spec 09): annotation expansion and class lowering between AST and HIR;
 MIR/OIM memory IR + independent verifier between HIR and codegen.
 
+JSX (ADR-0043, docs/jsx.md) has no stage of its own: the lexer has JSX modes, the parser builds `EJsx`, and the checker
+(`check/expr.or` "JSX", rules in `check/jsx.or`) lowers each JSX root to ordinary HIR (one fused string concatenation
+wrapped in `std:html`'s sealed `Html`), so MIR, the verifier, the optimiser and both backends see no new construct.
+
 ## Runtime object model (v1, ADR-0002)
 
 - **Scalars** (`int`→`int64_t`, `usize`→`uint64_t`, `bool`→`int64_t` 0/1 or C `bool`) are unboxed.

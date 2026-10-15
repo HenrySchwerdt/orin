@@ -23,6 +23,7 @@ import {
   BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl,
   IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam,
   ArrowParam, ArrowBody, ContractKind, ContractClause, AnnotationKind, Annotation,
+  JsxElement, JsxAttr, JsxValue, JsxChild,
 } from "./ast";
 import { Token, lex, isEofTok } from "./lexer";
 import { OpTable } from "./precedence";
@@ -53,6 +54,7 @@ function describe(t: Token): string {
     KTplHead => "template literal",
     KTplMid => "`}` in a template literal",
     KTplTail => "`}` in a template literal",
+    KJsxText => "JSX text",
     _ => "`" + t.text + "`",
   };
 }
@@ -2072,6 +2074,16 @@ export class Parser {
       KTplTail => {
         return Err(this.errExpected("expression"));
       },
+      KJsxOpen => {
+        const el = this.parseJsxElement()?;
+        return Ok(mkExpr(EJsx(el), el.span));
+      },
+      KJsxEnd => {
+        return Err(this.errExpected("expression"));
+      },
+      KJsxText => {
+        return Err(this.errExpected("expression"));
+      },
       KIdent => {
         return this.parseIdentExpr();
       },
@@ -2085,6 +2097,141 @@ export class Parser {
         return Err(this.errExpected("expression"));
       },
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // JSX (ADR-0043)
+  // ---------------------------------------------------------------------------
+
+  private isJsxEnd(s: string): bool {
+    const t = this.toks[this.pos];
+    return match (t.kind) {
+      KJsxEnd => t.text == s,
+      _ => false,
+    };
+  }
+
+  private isJsxOpen(s: string): bool {
+    const t = this.toks[this.pos];
+    return match (t.kind) {
+      KJsxOpen => t.text == s,
+      _ => false,
+    };
+  }
+
+  // A JSX element or fragment at its KJsxOpen `<`: `<name attrs />`, `<name attrs> children </name>` or
+  // `<> children </>`. The lexer has already split tags, text and `{..}`; this checks the structure (the closing tag
+  // repeats the name, fragments have no attributes and are not self-closing, no spread attributes).
+  @Requires(this.isJsxOpen("<"))
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseJsxElement(): Result<JsxElement, Diagnostic> {
+    const open = this.toks[this.pos];
+    this.pos += 1;
+    let name: Option<Ident> = None;
+    if (this.isIdentAt(0)) {
+      name = Some(this.parseIdent()?);
+    } else if (!this.isJsxEnd(">")) {
+      return Err(this.errExpected("a JSX tag name or `>`"));
+    }
+    let attrs: JsxAttr[] = [];
+    while (this.isIdentAt(0)) {
+      if (name.isNone()) {
+        return Err(errAt(this.toks[this.pos], "a fragment `<>` cannot have attributes"));
+      }
+      const an = this.parseIdent()?;
+      let v: JsxValue = JVTrue;
+      if (this.isP("=")) {
+        this.pos += 1;
+        const t = this.toks[this.pos];
+        if (isStrTok(t)) {
+          this.pos += 1;
+          v = JVStr(t.text);
+        } else if (this.isP("{")) {
+          this.pos += 1;
+          const e = this.parseExpr()?;
+          this.expectP("}")?;
+          v = JVExpr(e);
+        } else {
+          return Err(this.errExpected("a string literal or `{` for the JSX attribute value"));
+        }
+      }
+      for (const a of attrs) {
+        if (a.name.name == an.name) {
+          return Err(diag("E0200", an.span, "duplicate JSX attribute `" + an.name + "`"));
+        }
+      }
+      attrs.push(JsxAttr { name: an, value: v, span: spanTo(an.span, this.lastSpan()) });
+    }
+    if (this.isP("{")) {
+      return Err(errAt(this.toks[this.pos], "spread attributes `{...x}` are not supported in JSX"));
+    }
+    const noKids: JsxChild[] = [];
+    if (this.isJsxEnd("/>")) {
+      if (name.isNone()) {
+        return Err(errAt(this.toks[this.pos], "a fragment cannot be self-closing; write `<></>`"));
+      }
+      this.pos += 1;
+      return Ok(JsxElement {
+        name: name,
+        attrs: attrs,
+        children: noKids,
+        selfClosing: true,
+        span: spanTo(open.span, this.lastSpan()),
+      });
+    }
+    if (!this.isJsxEnd(">")) {
+      return Err(this.errExpected("`>` or `/>` to end the JSX tag"));
+    }
+    this.pos += 1;
+    let kids: JsxChild[] = [];
+    while (!this.isJsxOpen("</")) {
+      const t = this.toks[this.pos];
+      const isText = match (t.kind) {
+        KJsxText => true,
+        _ => false,
+      };
+      if (isText) {
+        kids.push(JText(t.text, t.span));
+        this.pos += 1;
+      } else if (this.isJsxOpen("<")) {
+        kids.push(JElem(this.parseJsxElement()?));
+      } else if (this.isP("{")) {
+        this.pos += 1;
+        if (this.isP("}")) {
+          this.pos += 1; // `{}` or `{/* comment */}`: no child
+        } else {
+          const e = this.parseExpr()?;
+          this.expectP("}")?;
+          kids.push(JExpr(e));
+        }
+      } else {
+        return Err(this.errExpected("JSX text, `{`, an element or a closing tag"));
+      }
+    }
+    this.pos += 1;
+    const want = match (name) {
+      Some(n) => n.name,
+      None => "",
+    };
+    if (want.length > 0) {
+      if (!this.isIdentText(0, want)) {
+        return Err(this.errExpected("`" + want + "` to close `<" + want + ">`"));
+      }
+      this.pos += 1;
+    } else if (this.isIdentAt(0)) {
+      return Err(this.errExpected("`>` to close the fragment `<>`"));
+    }
+    if (!this.isJsxEnd(">")) {
+      return Err(this.errExpected("`>`"));
+    }
+    this.pos += 1;
+    return Ok(JsxElement {
+      name: name,
+      attrs: attrs,
+      children: kids,
+      selfClosing: false,
+      span: spanTo(open.span, this.lastSpan()),
+    });
   }
 
   // `( e )` or `[a, b]`. Parentheses produce no node: the result is the inner expression with
@@ -2309,6 +2456,15 @@ export class Parser {
         return Err(this.errExpected("pattern"));
       },
       KTplTail => {
+        return Err(this.errExpected("pattern"));
+      },
+      KJsxOpen => {
+        return Err(this.errExpected("pattern (JSX cannot be matched)"));
+      },
+      KJsxEnd => {
+        return Err(this.errExpected("pattern"));
+      },
+      KJsxText => {
         return Err(this.errExpected("pattern"));
       },
       KStr => {

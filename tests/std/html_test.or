@@ -1,0 +1,332 @@
+// Tests for std:html: escaping, the URL rule, the Html constructors, and a differential test of `escape` against a
+// char-by-char executable specification. Run with `orin test` (contracts checked) and with `--no-contracts`;
+// see tools/test_std.sh.
+import { assert, assertEqString, assertEqBool, assertEqUsize } from "std:test";
+import { Html, escape, needsEscape, safeUrl, escapeUrl, hasSafeScheme, isSafeUrl, joinAll, trustHtml, text, empty,
+  fragment, render, document, isEmpty } from "std:html";
+
+const UNSAFE: string = "about:invalid#orin-unsafe-url";
+
+// The executable specification of `escape`: the obviously correct one-character-at-a-time version.
+function escapeSpec(s: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 38) {
+      out += "&amp;";
+    } else if (c == 60) {
+      out += "&lt;";
+    } else if (c == 62) {
+      out += "&gt;";
+    } else if (c == 34) {
+      out += "&quot;";
+    } else if (c == 39) {
+      out += "&#39;";
+    } else {
+      out += s.substring(i, i + 1);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+@Test
+function escapesTheFiveCharacters(): void {
+  assertEqString(escape("&"), "&amp;", "ampersand");
+  assertEqString(escape("<"), "&lt;", "less");
+  assertEqString(escape(">"), "&gt;", "greater");
+  assertEqString(escape("\""), "&quot;", "double quote");
+  assertEqString(escape("'"), "&#39;", "single quote");
+  assertEqString(escape("<script>alert(\"x\" & 'y')</script>"),
+    "&lt;script&gt;alert(&quot;x&quot; &amp; &#39;y&#39;)&lt;/script&gt;", "markup");
+}
+
+@Test
+function escapeEdgeCases(): void {
+  assertEqString(escape(""), "", "empty");
+  assertEqString(escape("<<<>>>"), "&lt;&lt;&lt;&gt;&gt;&gt;", "only specials");
+  assertEqString(escape("&&"), "&amp;&amp;", "adjacent ampersands");
+  assertEqString(escape("&amp;"), "&amp;amp;", "an entity in the input is escaped again");
+  assertEqString(escape("<a"), "&lt;a", "special at the start");
+  assertEqString(escape("a>"), "a&gt;", "special at the end");
+  assertEqString(escape("a<b"), "a&lt;b", "special in the middle");
+  assertEqString(escape("a<>b"), "a&lt;&gt;b", "adjacent specials");
+  assertEqString(escape("ab<cd>ef"), "ab&lt;cd&gt;ef", "runs between specials");
+  assertEqString(escape("\"'"), "&quot;&#39;", "both quotes");
+  assertEqString(escape("\n\t\r\\/`="), "\n\t\r\\/`=", "other punctuation and controls unchanged");
+}
+
+@Test
+function escapeKeepsUtf8Bytes(): void {
+  assertEqString(escape("héllo wörld"), "héllo wörld", "latin");
+  assertEqString(escape("日本語"), "日本語", "CJK");
+  assertEqString(escape("😀<😀"), "😀&lt;😀", "four-byte sequence around a special");
+  assertEqString(escape("é&é"), "é&amp;é", "two-byte sequences around a special");
+  assertEqString(escape("＜"), "＜", "full-width less-than is not special");
+}
+
+@Test
+function escapeHotPathReturnsInput(): void {
+  assertEqBool(needsEscape(""), false, "empty");
+  assertEqBool(needsEscape("plain text 123 é"), false, "plain");
+  assertEqBool(needsEscape("a&"), true, "amp last");
+  assertEqBool(needsEscape("'a"), true, "quote first");
+  assertEqBool(needsEscape("a>b"), true, "greater");
+  const s = "no special characters here";
+  assert(escape(s) == s, "unchanged string is returned unchanged");
+  assertEqUsize(escape("a<b").length, 6, "length of the escaped string");
+}
+
+@Test
+function escapeIsNotIdempotent(): void {
+  const once = escape("<&>");
+  assertEqString(once, "&lt;&amp;&gt;", "once");
+  assertEqString(escape(once), "&amp;lt;&amp;amp;&amp;gt;", "twice");
+}
+
+@Test
+function escapeMatchesSpecOnEveryByte(): void {
+  let b = 0;
+  while (b < 256) {
+    const s = String.fromCharCode(b);
+    assertEqString(escape(s), escapeSpec(s), "single byte " + b.toString());
+    const t = "x" + s + "y" + s;
+    assertEqString(escape(t), escapeSpec(t), "byte in context " + b.toString());
+    b += 1;
+  }
+}
+
+// A small deterministic generator (a linear congruential one) for the differential tests. Orin values are
+// copied, so the generators are methods of the class that owns the state.
+class Rng {
+  state: int;
+  constructor(seed: int) {
+    this.state = seed;
+  }
+  roll(bound: int): int {
+    this.state = (this.state * 1103515245 + 12345) % 2147483648;
+    return (this.state / 65536) % bound;
+  }
+  // One piece of a generated string: a special character, a letter, a multi-byte sequence, a control, or a run.
+  piece(): string {
+    const k = this.roll(14);
+    if (k == 0) { return "&"; }
+    if (k == 1) { return "<"; }
+    if (k == 2) { return ">"; }
+    if (k == 3) { return "\""; }
+    if (k == 4) { return "'"; }
+    if (k == 5) { return "é"; }
+    if (k == 6) { return "日"; }
+    if (k == 7) { return "😀"; }
+    if (k == 8) { return "\n"; }
+    if (k == 9) { return "&amp;"; }
+    if (k == 10) { return "abc"; }
+    if (k == 11) { return " "; }
+    return String.fromCharCode(97 + this.roll(26));
+  }
+  // A string of up to 23 pieces.
+  generated(): string {
+    const n = this.roll(24);
+    let s = "";
+    let i = 0;
+    while (i < n) {
+      s += this.piece();
+      i += 1;
+    }
+    return s;
+  }
+}
+
+@Test
+function escapeMatchesSpecOnGeneratedStrings(): void {
+  let r = new Rng(20260101);
+  let i = 0;
+  let special = 0;
+  while (i < 3000) {
+    const s = r.generated();
+    const e = escape(s);
+    assertEqString(e, escapeSpec(s), "generated string " + i.toString());
+    assertEqBool(needsEscape(s), e != s, "needsEscape agrees with a change");
+    if (needsEscape(s)) {
+      special += 1;
+    }
+    i += 1;
+  }
+  assert(special > 1000 && special < 3000, "the generator produces both kinds of strings");
+}
+
+@Test
+function escapeMatchesSpecOnLongStrings(): void {
+  let r = new Rng(7);
+  let s = "";
+  let i = 0;
+  while (i < 2000) {
+    s += r.piece();
+    i += 1;
+  }
+  assertEqString(escape(s), escapeSpec(s), "long mixed string");
+  let plain = "";
+  i = 0;
+  while (i < 5000) {
+    plain += "abcdefghij";
+    i += 1;
+  }
+  assert(escape(plain) == plain, "long plain string is returned unchanged");
+  assertEqString(escape(plain + "<"), plain + "&lt;", "long plain string, special last");
+  assertEqString(escape("<" + plain), "&lt;" + plain, "long plain string, special first");
+}
+
+@Test
+function safeUrlAllowsTheFourSchemes(): void {
+  assertEqString(safeUrl("http://example.com/a?b=c#d"), "http://example.com/a?b=c#d", "http");
+  assertEqString(safeUrl("https://example.com"), "https://example.com", "https");
+  assertEqString(safeUrl("mailto:x@example.com"), "mailto:x@example.com", "mailto");
+  assertEqString(safeUrl("tel:+491234"), "tel:+491234", "tel");
+  assertEqString(safeUrl("tel:1"), "tel:1", "tel short");
+  assertEqString(safeUrl("HTTPS://x"), "HTTPS://x", "uppercase https");
+  assertEqString(safeUrl("HtTp://x"), "HtTp://x", "mixed case http");
+  assertEqString(safeUrl("MAILTO:a@b"), "MAILTO:a@b", "uppercase mailto");
+  assertEqString(safeUrl("http:"), "http:", "scheme only");
+}
+
+@Test
+function safeUrlRejectsOtherSchemes(): void {
+  assertEqString(safeUrl("javascript:alert(1)"), UNSAFE, "javascript");
+  assertEqString(safeUrl("JAVASCRIPT:alert(1)"), UNSAFE, "JAVASCRIPT");
+  assertEqString(safeUrl("JaVaScRiPt:alert(1)"), UNSAFE, "mixed case javascript");
+  assertEqString(safeUrl("vbscript:msgbox(1)"), UNSAFE, "vbscript");
+  assertEqString(safeUrl("data:text/html,<script>alert(1)</script>"), UNSAFE, "data");
+  assertEqString(safeUrl("file:///etc/passwd"), UNSAFE, "file");
+  assertEqString(safeUrl("ftp://x"), UNSAFE, "ftp is not allowed");
+  assertEqString(safeUrl("about:blank"), UNSAFE, "about");
+  assertEqString(safeUrl(":x"), UNSAFE, "empty scheme");
+  assertEqString(safeUrl(":"), UNSAFE, "only a colon");
+  assertEqString(safeUrl("httpx:y"), UNSAFE, "longer than an allowed scheme");
+  assertEqString(safeUrl("htt:y"), UNSAFE, "prefix of an allowed scheme");
+  assertEqString(safeUrl("https :y"), UNSAFE, "space inside the scheme");
+  assertEqString(safeUrl("telx:1"), UNSAFE, "tel plus a letter");
+  assertEqString(safeUrl("mailt:x"), UNSAFE, "mailto minus a letter");
+  assertEqString(safeUrl("httpq:x"), UNSAFE, "same length as https, different last letter");
+}
+
+@Test
+function safeUrlRejectsObfuscatedSchemes(): void {
+  assertEqString(safeUrl(" javascript:alert(1)"), UNSAFE, "leading space");
+  assertEqString(safeUrl("\tjavascript:alert(1)"), UNSAFE, "leading tab");
+  assertEqString(safeUrl(String.fromCharCode(1) + "javascript:alert(1)"), UNSAFE, "leading control char");
+  assertEqString(safeUrl("java\tscript:alert(1)"), UNSAFE, "tab inside");
+  assertEqString(safeUrl("java\nscript:alert(1)"), UNSAFE, "newline inside");
+  assertEqString(safeUrl(" https://x"), UNSAFE, "leading space before an allowed scheme");
+  assertEqString(safeUrl("\nhttps://x"), UNSAFE, "leading newline before an allowed scheme");
+  assertEqString(safeUrl("https\t://x"), UNSAFE, "tab before the colon");
+  assertEqString(safeUrl("ht\tp:x"), UNSAFE, "tab in place of a letter of http");
+  assertEqString(safeUrl("te\0:1"), UNSAFE, "NUL in place of a letter of tel");
+  assertEqString(safeUrl("ｊavascript:x"), UNSAFE, "full-width letter is not a letter of a scheme");
+  assertEqString(safeUrl("HTTP" + String.fromCharCode(200) + ":x"), UNSAFE, "high byte after an allowed scheme");
+}
+
+@Test
+function safeUrlKeepsRelativeUrls(): void {
+  assertEqString(safeUrl(""), "", "empty");
+  assertEqString(safeUrl("/a:b"), "/a:b", "colon after a slash");
+  assertEqString(safeUrl("a/b:c"), "a/b:c", "colon after a slash, no leading slash");
+  assertEqString(safeUrl("?q=a:b"), "?q=a:b", "colon in the query");
+  assertEqString(safeUrl("#frag:x"), "#frag:x", "colon in the fragment");
+  assertEqString(safeUrl("page.html"), "page.html", "file name");
+  assertEqString(safeUrl("../up/page"), "../up/page", "dot segments");
+  assertEqString(safeUrl("//example.com/x"), "//example.com/x", "scheme-relative");
+  assertEqString(safeUrl("a?javascript:x"), "a?javascript:x", "scheme text after a question mark");
+  assertEqString(safeUrl("a#javascript:x"), "a#javascript:x", "scheme text after a hash");
+  assertEqString(safeUrl("/javascript:x"), "/javascript:x", "scheme text after a slash");
+  assertEqString(safeUrl("ü/x"), "ü/x", "UTF-8 path");
+}
+
+@Test
+function safeUrlPredicates(): void {
+  assertEqBool(hasSafeScheme("https://x"), true, "https");
+  assertEqBool(hasSafeScheme("/x:y"), true, "relative");
+  assertEqBool(hasSafeScheme(""), true, "empty is relative");
+  assertEqBool(hasSafeScheme("javascript:x"), false, "javascript");
+  assertEqBool(hasSafeScheme(UNSAFE), false, "the substitute has the scheme about");
+  assertEqBool(isSafeUrl(UNSAFE), true, "the substitute is safe to emit");
+  assertEqBool(isSafeUrl("javascript:x"), false, "javascript is not safe to emit");
+  assertEqBool(isSafeUrl("tel:1"), true, "tel");
+  assertEqString(safeUrl(UNSAFE), UNSAFE, "the substitute stays the substitute");
+}
+
+@Test
+function safeUrlResultIsAlwaysSafe(): void {
+  const parts = ["javascript", "JAVASCRIPT", "http", "Https", "mailto", "tel", "data", "x", " ", "\t", ":", ":", "/",
+    "?", "#", "a", "é", "<", "\""];
+  let r = new Rng(99);
+  let i = 0;
+  while (i < 3000) {
+    let u = "";
+    const n = r.roll(8);
+    let j = 0;
+    while (j < n) {
+      u += parts[r.roll(19).toUsize()];
+      j += 1;
+    }
+    const v = safeUrl(u);
+    assert(isSafeUrl(v), "result is safe: " + u);
+    assert(v == u || v == UNSAFE, "result is the input or the constant: " + u);
+    assertEqBool(v == u, hasSafeScheme(u), "unchanged exactly when the scheme is fine: " + u);
+    i += 1;
+  }
+}
+
+@Test
+function escapeUrlEscapesAfterSanitising(): void {
+  assertEqString(escapeUrl("https://x/?a=1&b=2"), "https://x/?a=1&amp;b=2", "ampersand in the query");
+  assertEqString(escapeUrl("/a\"b'c<d>"), "/a&quot;b&#39;c&lt;d&gt;", "quotes and brackets");
+  assertEqString(escapeUrl("javascript:alert(\"x\")"), UNSAFE, "rejected scheme");
+  assertEqString(escapeUrl(""), "", "empty");
+  assertEqString(escapeUrl("data:text/html,<b>"), UNSAFE, "data URL");
+  assertEqString(escapeUrl("tel:1"), "tel:1", "plain tel");
+}
+
+@Test
+function joinsAllElements(): void {
+  assertEqString(joinAll([]), "", "no elements");
+  assertEqString(joinAll([trustHtml("<b>")]), "<b>", "one element");
+  assertEqString(joinAll([trustHtml("<li>1</li>"), trustHtml("<li>2</li>"), trustHtml("<li>3</li>")]),
+    "<li>1</li><li>2</li><li>3</li>", "three elements: the last one is included");
+  assertEqString(joinAll([empty(), trustHtml("a"), empty(), trustHtml("b"), empty()]), "ab", "empty elements");
+  assertEqString(joinAll([text("<"), text("&")]), "&lt;&amp;", "text elements stay escaped");
+  const items = ["a", "b", "c"].map(i => trustHtml("<i>" + i + "</i>"));
+  assertEqString(joinAll(items), "<i>a</i><i>b</i><i>c</i>", "map result");
+  let many: Html[] = [];
+  let k = 0;
+  while (k < 2000) {
+    many.push(trustHtml("x"));
+    k += 1;
+  }
+  assertEqUsize(joinAll(many).length, 2000, "many elements");
+}
+
+@Test
+function constructors(): void {
+  assertEqString(trustHtml("<b>&</b>").html, "<b>&</b>", "trustHtml does not escape");
+  assertEqString(text("<b>&</b>").html, "&lt;b&gt;&amp;&lt;/b&gt;", "text escapes");
+  assertEqString(text("plain").html, "plain", "plain text");
+  assertEqString(text("").html, "", "empty text");
+  assertEqString(empty().html, "", "empty");
+  assertEqString(fragment([]).html, "", "empty fragment");
+  assertEqString(fragment([trustHtml("<p>"), text("a<b"), trustHtml("</p>")]).html, "<p>a&lt;b</p>", "fragment");
+  assertEqString(fragment([fragment([text("1"), text("2")]), text("3")]).html, "123", "nested fragments");
+}
+
+@Test
+function renderingAndDocument(): void {
+  assertEqString(render(trustHtml("<p>x</p>")), "<p>x</p>", "render");
+  assertEqString(render(empty()), "", "render empty");
+  assertEqString(document(trustHtml("<html></html>")), "<!DOCTYPE html><html></html>", "document");
+  assertEqString(document(empty()), "<!DOCTYPE html>", "document of nothing");
+  assertEqBool(isEmpty(empty()), true, "empty is empty");
+  assertEqBool(isEmpty(text("")), true, "empty text is empty");
+  assertEqBool(isEmpty(fragment([])), true, "empty fragment is empty");
+  assertEqBool(isEmpty(trustHtml(" ")), false, "a space is not empty");
+  assertEqBool(isEmpty(text("<")), false, "escaped text is not empty");
+}

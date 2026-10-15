@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Mutation check for the provable std modules (ADR-0030 §3, ADR-0028).
 
-Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http,text}.or. The module and its
+Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http,text,html}.or. The module and its
 test file are copied to build/mutate_std/, the std imports are rewritten to relative ones, the mutation is applied and
 `orin test` is run twice: with runtime contract checking (the default) and with `--no-contracts`. A mutant is
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
 
-Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http|net|text|taskcore] [--list]
+Usage: python3 tools/mutate_std.py [--orinc build/bootstrap/orin2] [--module bytes|utf8|collections|http|net|text|html|taskcore] [--list]
                                   [-j N] [--shard I/N]
 The mutants are independent (each has its own directory) and run in parallel: -j N (default: $ORIN_JOBS, else the CPU
 count); the output is printed in the fixed mutant order whatever the -j. --shard I/N runs every N-th selected mutant from
@@ -163,6 +163,48 @@ MUTANTS = [
     ("http", "response-ctor-skips-validation", "    enforce(responseProblem(status, version, headers, body, trailers, forHead) == \"\", \"invalid Response\");", "", "http_response_ctor_rejects_204_body"),
     ("http", "limits-ctor-skips-validation", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776, \"invalid Limits\");", "      && maxChunkLine >= 8 && maxChunkLine <= 65536 && maxBody <= 1099511627776 || true, \"invalid Limits\");", "http_limits_ctor_rejects_zero"),
     # ---- std:text
+    # ---- std:html
+    ("html", "drop-apostrophe", "c == 34 || c == 39;", "c == 34;"),
+    ("html", "apostrophe-wrong-entity", "return \"&#39;\";", "return \"'\";"),
+    ("html", "ampersand-wrong-entity", "return \"&amp;\";", "return \"&\";"),
+    ("html", "less-than-wrong-entity", "return \"&lt;\";", "return \"&gt;\";"),
+    ("html", "greater-than-unescaped", "  if (c == 62) {\n    return \"&gt;\";", "  if (c == 63) {\n    return \"&gt;\";"),
+    ("html", "quote-wrong-entity", "return \"&quot;\";", "return \"&#34\";"),
+    ("html", "run-copy-keeps-special", "      out += s.substring(start, i);\n      out += e;", "      out += s.substring(start, i + 1);\n      out += e;"),
+    ("html", "run-start-off-by-one", "      start = i + 1;", "      start = i;"),
+    ("html", "run-tail-dropped", "  out += s.substring(start, n);\n  return out;", "  out += s.substring(start, n - 1);\n  return out;"),
+    ("html", "scan-skips-first-byte", "  let i: usize = 0;\n  while (i < n && !isSpecial", "  let i: usize = 1;\n  while (i < n && !isSpecial"),
+    ("html", "needsEscape-misses-last", "  while (i < s.length) {\n    if (isSpecial(s.charCodeAt(i))) {", "  while (i + 1 < s.length) {\n    if (isSpecial(s.charCodeAt(i))) {"),
+    ("html", "safeUrl-returns-input", "  return UNSAFE_URL;\n}\n\n// escape(safeUrl", "  return s;\n}\n\n// escape(safeUrl"),
+    ("html", "safeUrl-accepts-javascript", "schemeIs(u, end, \"tel\");", "schemeIs(u, end, \"tel\") || schemeIs(u, end, \"javascript\");"),
+    ("html", "safeUrl-accepts-data", "schemeIs(u, end, \"tel\");", "schemeIs(u, end, \"tel\") || schemeIs(u, end, \"data\");"),
+    ("html", "safeUrl-rejects-tel", " || schemeIs(u, end, \"tel\");", ";"),
+    ("html", "safeUrl-rejects-mailto", " || schemeIs(u, end, \"mailto\")", ""),
+    ("html", "scheme-case-sensitive", "      c += 32;", "      c += 0;"),
+    ("html", "scheme-lowercase-range-low", "if (c >= 65 && c <= 90) {", "if (c >= 66 && c <= 90) {"),
+    ("html", "scheme-lowercase-range-high", "if (c >= 65 && c <= 90) {", "if (c >= 65 && c <= 76) {"),
+    ("html", "scheme-prefix-accepted", "  if (end != lit.length) {", "  if (end < lit.length) {"),
+    ("html", "scheme-longer-accepted", "  if (end != lit.length) {", "  if (end > lit.length) {"),
+    ("html", "scheme-compare-skips-last", "  while (i < end) {\n    let c = u.charCodeAt(i);", "  while (i + 1 < end) {\n    let c = u.charCodeAt(i);"),
+    ("html", "empty-scheme-accepted", "  if (e < 0) {\n    return true;", "  if (e <= 0) {\n    return true;"),
+    ("html", "colon-after-slash-is-scheme", "if (c == 47 || c == 63 || c == 35) {", "if (c == 63 || c == 35) {"),
+    ("html", "colon-after-query-is-scheme", "if (c == 47 || c == 63 || c == 35) {", "if (c == 47 || c == 35) {"),
+    ("html", "colon-after-hash-is-scheme", "if (c == 47 || c == 63 || c == 35) {", "if (c == 47 || c == 63) {"),
+    ("html", "scheme-ignores-control-bytes", "    if (c != lit.charCodeAt(i)) {\n      return false;", "    if (c != lit.charCodeAt(i) && c > 32) {\n      return false;"),
+    ("html", "isSafeUrl-rejects-substitute", "return hasSafeScheme(u) || u == UNSAFE_URL;", "return hasSafeScheme(u);"),
+    ("html", "escapeUrl-skips-safeUrl", "return escape(safeUrl(s));", "return escape(s);"),
+    ("html", "escapeUrl-skips-escape", "return escape(safeUrl(s));", "return safeUrl(s);"),
+    ("html", "joinAll-skips-last", "  for (const x of xs) {\n    out += x.html;\n  }", "  let k: usize = 0;\n  while (k + 1 < xs.length) {\n    out += xs[k].html;\n    k += 1;\n  }"),
+    ("html", "joinAll-skips-first", "  for (const x of xs) {\n    out += x.html;\n  }", "  let k: usize = 1;\n  while (k < xs.length) {\n    out += xs[k].html;\n    k += 1;\n  }"),
+    ("html", "joinAll-reverses", "  for (const x of xs) {\n    out += x.html;\n  }", "  for (const x of xs) {\n    out = x.html + out;\n  }"),
+    ("html", "trustHtml-escapes", "return Html { html: raw };", "return Html { html: escape(raw) };"),
+    ("html", "text-forgets-escape", "return Html { html: escape(s) };", "return Html { html: s };"),
+    ("html", "empty-not-empty", "return Html { html: \"\" };", "return Html { html: \" \" };"),
+    ("html", "fragment-drops-children", "return Html { html: joinAll(xs) };", "return Html { html: \"\" };"),
+    ("html", "document-forgets-doctype", "return \"<!DOCTYPE html>\" + h.html;", "return h.html;"),
+    ("html", "document-wrong-doctype", "return \"<!DOCTYPE html>\" + h.html;", "return \"<!doctype>\" + h.html;"),
+    ("html", "render-escapes", "  return h.html;\n}\n\n// A whole page", "  return escape(h.html);\n}\n\n// A whole page"),
+    ("html", "isEmpty-short-is-empty", "return h.html.length == 0;\n}", "return h.html.length < 2;\n}"),
     ("text", "dedent-last-indent-wins", "      common = found ? commonPrefix(common, ind) : ind;", "      common = ind;"),
     ("text", "dedent-width-not-prefix", "  while (i < a.length && i < b.length && a.charCodeAt(i) == b.charCodeAt(i)) {", "  while (i < a.length && i < b.length) {"),
     ("text", "cr-not-blank", "    if (c != 32 && c != 9 && c != 13) {\n      return false;", "    if (c != 32 && c != 9) {\n      return false;"),
@@ -265,7 +307,7 @@ def run(orinc, test_file, extra, timeout=900):
 
 def std_mutant(orinc, mutant):
     """One mutant of a pure std module (see the module doc). Returns (row, output line, error message or None)."""
-    mods = ["bytes", "utf8", "collections", "http", "text", "taskcore"]
+    mods = ["bytes", "utf8", "collections", "http", "text", "html", "taskcore"]
     rewrite = {"std:" + m: "./" + m for m in mods}
     mod, name, old, new = mutant[:4]
     extra = mutant[4] if len(mutant) > 4 else ""
