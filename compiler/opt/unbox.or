@@ -31,7 +31,7 @@ import {
   readsPayload, spansComplete, allReachable,
 } from "../mir";
 import { mtyEq } from "../lower";
-import { instrUses, instrDef, isRefTy } from "./analysis";
+import { UseBuf, instrDef, isRefTy } from "./analysis";
 import { BlockSink, indices } from "./rewrite";
 import { fnShapeOk, progWellFormed, sameSignature, effects } from "./wellformed";
 
@@ -428,9 +428,11 @@ export class Unboxing {
     if (f.inout && f.paramCount > 0) {
       this.markBad(this.node(fi, 0));
     }
+    let ub = new UseBuf();
     for (const blk of f.blocks) {
       for (const ins of blk.instrs) {
-        this.scanInstr(fi, ins);
+        ub.ofInstr(ins);
+        this.scanInstr(fi, ins, ub);
       }
       match (blk.term) {
         TReturn(ro) => {
@@ -459,7 +461,8 @@ export class Unboxing {
   // The rule of one instruction. Every reference local it uses or defines that the rule does not allow is marked bad
   // (default deny: an instruction the pass does not know keeps its operands boxed).
   @Requires(fi < this.prog.functions.length)
-  private scanInstr(fi: usize, ins: Instr): void {
+  // `uses` holds the locals `ins` reads (`UseBuf.ofInstr`).
+  private scanInstr(fi: usize, ins: Instr, uses: UseBuf): void {
     let okUses: usize[] = [];
     let okDef = false;
     match (ins) {
@@ -597,10 +600,13 @@ export class Unboxing {
       },
       _ => {},
     }
-    for (const u of instrUses(ins)) {
+    let k: usize = 0;
+    while (k < uses.n) {
+      const u = uses.xs[k];
       if (this.isRef(fi, u) && !okUses.includes(u)) {
         this.markBad(this.node(fi, u));
       }
+      k += 1;
     }
     match (instrDef(ins)) {
       Some(d) => {
