@@ -46,3 +46,15 @@ by the coordinator. No worker should edit another module or revert another contr
 Report merged PRs and their validation, open PRs, measured performance with limits, blocked work,
 usage-related pauses, and the remaining 1.0 gaps. Stop new dispatches at the checkpoint, save state,
 and disable the night-shift heartbeat. Do not claim feature completeness or proof beyond evidence.
+
+## 22:00 coordination checkpoint
+
+- PR #83 (project CLI) merged after independent follow-up approval and green exact-head CI,
+  including the 19 CLI regression cases.
+- PR #84 (`std:url`) merged after independent review and green CI. PR #85 (`std:encoding`)
+  also passed independent review and CI; integration preserves both modules in loader diagnostics
+  and requires fresh CI after the merge with main.
+- Two implementation chats are active: portable bounded MCP/CLI execution, and the PR #82
+  C/LLVM assertion-order regression where an IForward destination aliases its index local.
+- Five-hour usage reset was confirmed (1% at this checkpoint). Claude CLI remains unauthenticated;
+  existing Claude PR #82 is being fixed in place without duplicate implementation or auth retries.
