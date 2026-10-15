@@ -55,34 +55,35 @@ ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a, 3b (verifier), 3c, 3d (optimiser and both backends, per-function code generation ready for ADR-0039 `.parallel()`) and 3e (tooling) done (3a added MIR source spans, ADR-0020 D3; 3c the lexer and parser); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...).
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.
 
-## Open work, in order (handoff 2026-10-14)
-1. **Unboxing (ADR-0038 step 1), [PR #62](https://github.com/HenrySchwerdt/orin/pull/62)**, branch
-   `worktree-agent-acf1c47e958560311`.
-   - **Done:** MIR v2.2 `MAgg(n)` (`compiler/opt/unbox.or`), verifier rules, C/LLVM by-value passing, and the
-     `opt/pairs.or` fix for result pairs that are moved before they are destructured.
-   - **Blocking:** CI `assurance` is red. `tools/mutate_mir.py` reports 16 rejected baselines: unbox puts an
-     aggregate into a builtin argument other than 0, and the verifier rule forbids that (e.g.
-     `float_records_unions_options.main:b0:i76`). Fix it in unbox or relax the rule with a test.
-   - **Before merging:** run `mutate_mir.py` locally, then measure with `tools/alloc_census.py` and compare
-     with `docs/perf/alloc-census.md`.
-2. **CI:** split the `backends` job, the new bottleneck at about 12 minutes since `diff_backends --mode fuse`, into
-   shards, like the http mutants.
-3. **Fusion follow-up:**
-   - Make the verifier cheaper on long fused functions. The self-compile currently takes +0.84 % instructions
-     with fusion.
-   - Declare the runtime entry points that `.parallel()` uses in `compiler/llvm/runtime.or`, instead of
-     multiplexing them over `transfer_count` / `transitPut`.
-4. **Performance wave (ADR-0038 order):**
-   - escape analysis + stack allocation / scalar replacement;
-   - borrow inference (85 % of the HTTP server's RC ops are `this` taken owned but only read);
-   - regions / freeze (bintrees).
+## Open work, in order (updated 2026-10-15, after the performance wave)
+Merged 2026-10-15: unboxing (#62, MIR v2.2), packed verifier state (#64), census quick wins (#65), borrow inference (#67),
+concat reuse in place (#68, MIR v2.3), CI sharding of `backends` plus LLVM `.parallel()` declarations (#66), LLVM/C
+instruction parity (#69, ADR-0038 §8 gate 1); the last four through the integration PR #70. Effect: self-compile -38.8%
+executed instructions, -93% retains; census numbers and the lever ranking in
+[`perf/alloc-census.md`](perf/alloc-census.md).
 
-   The census ranks these levers.
-5. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
+1. **Performance, lever 1: verifier and optimiser data structures** (class g; 27% of the self-compile's allocations,
+   977 MB of `ls` copies in `Transfer.set`). Scratch `ls` per Fixpoint, one reusable Transfer, `State.join` in place,
+   visitor-style `instrUses` / `termUses`, one `successors`, no receiver dup around `callOwned`. Includes the open item
+   "verifier cost on long fused functions".
+2. **Performance, lever 2: field and element access code** (not a census class): `make_unique` + `struct_get` /
+   `struct_replace` per field write and repeated bounds-checked element reads (mutres 10.6x C instructions, pqueue
+   4.8x, nbody 3.7x, sieve 3.4x). MIR-level CSE of loads and uniqueness checks, bounds-check hoisting, unique receivers
+   through in/out methods.
+3. **Performance, next ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
+   payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
+   bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
+4. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
+   below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
+5. **Benchmark harness:** `tools/bench.py`'s parallel section passes the thread count as `argv[1]` and sets
+   `ORIN_BENCH_THREADS`; `bench/streams_parallel` reads its workload from `argv[1]` and its thread count from `ORIN_THREADS`,
+   so its rows run the default workload with the default thread count and report a checksum mismatch at 2 and 4 threads
+   (on main before the wave too). Pass the workload and `ORIN_THREADS` for it.
+6. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
    global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.
-6. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
+7. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
    `.parallel()` per compiler phase (ADR-0039 §6).
-7. **Follow-ups:**
+8. **Follow-ups:**
    - `HStmt` spans for break/continue/return;
    - trap hook and cancellation for tasks (prerequisite for ADR-0041 Stage D);
    - ADR-0040 (generic methods);
