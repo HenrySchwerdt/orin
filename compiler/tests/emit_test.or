@@ -12,6 +12,7 @@ import {
   MType, Operand, SwitchCase, MLocal, MBlock, Instr, Terminator, MFunction, MProgram, MVTable,
   plainBlock,
 } from "../mir";
+import { BinOp } from "../hir";
 import { loadWithOverlay } from "../loader";
 import { check } from "../check";
 import { lower } from "../lower";
@@ -210,7 +211,7 @@ function theLlvmSymbolTableNumbersTrapMessagesOnce(): void {
   assert(introducedNames(declares()).includes("orin_str_eq"), "declarations are runtime symbols");
   assert(introducedNames(prelude()).includes("orinl_dup"), "prelude helpers too");
   assert(
-    llvmRefsDeclared("call void @orin_trap(ptr @.m9) call ptr @orinl_dup(ptr %x)", syms),
+    llvmRefsDeclared("call void @orin_trap(ptr @.m11) call ptr @orinl_dup(ptr %x)", syms),
     "known globals pass",
   );
   assert(
@@ -218,7 +219,7 @@ function theLlvmSymbolTableNumbersTrapMessagesOnce(): void {
     "an undeclared runtime function is caught",
   );
   assert(
-    !llvmRefsDeclared("call void @orin_trap(ptr @.m10)", syms),
+    !llvmRefsDeclared("call void @orin_trap(ptr @.m12)", syms),
     "a message past the table is caught",
   );
   assert(
@@ -285,7 +286,7 @@ function anLlvmModuleIsTheJoinOfIndependentlyEmittedFunctions(): void {
     "a missing vtable is caught",
   );
   assert(
-    whole.includes("@.m9 = private unnamed_addr constant [15 x i8] c\"custom failure\\00\""),
+    whole.includes("@.m11 = private unnamed_addr constant [15 x i8] c\"custom failure\\00\""),
     "the trap message global",
   );
 }
@@ -330,4 +331,50 @@ function realProgramsReferOnlyToDeclaredSymbolsInBothBackends(host: Host): void 
       assert(ll.includes("ptr noundef nonnull %pout"), "and in LLVM");
     },
   );
+}
+
+// ADR-0038 §8 gate 1: a small self-recursive function with a scalar early return is split into an inlined wrapper and `.body`.
+function fibLike(callsItself: bool): MProgram {
+  const mi = MLocal { name: "n", ty: MInt };
+  const t = MLocal { name: "t", ty: MBool };
+  const r = MLocal { name: "r", ty: MInt };
+  const f = MFunction {
+    name: "m.fib",
+    paramCount: 1,
+    paramOwned: [false],
+    inout: false,
+    locals: [mi, t, r],
+    ret: MInt,
+    blocks: [
+      bk([IBinary(1, OpLt, OLocal(0), OInt(2))], TBranch(OLocal(1), 1, 2)),
+      bk([], TReturn(Some(OLocal(0)))),
+      bk([ICall(Some(2), callsItself ? 1 : 0, [OLocal(0)])], TReturn(Some(OLocal(2)))),
+    ],
+  };
+  const mainF = fn("main", [], [bk([], TReturn(None))]);
+  return MProgram { functions: [mainF, f], strings: [], main: 0, vtables: [], inlineFns: [] };
+}
+
+@Test
+function aSmallRecursiveFunctionWithAnEarlyReturnIsSplitIntoWrapperAndBody(): void {
+  const p = fibLike(true);
+  const syms = llvmSymbols(p);
+  const text = emitLlvmFunction(syms, p, 1);
+  const name = syms.name(1);
+  assert(
+    text.startsWith(
+      "define internal noundef i64 @" + name + "(i64 noundef %p0) alwaysinline nounwind {",
+    ),
+    "the wrapper",
+  );
+  assert(
+    text.includes("define internal noundef i64 @" + name + ".body(i64 noundef %p0) nounwind {"),
+    "the body",
+  );
+  assert(text.includes("tail call i64 @" + name + ".body(i64 %p0)"), "the wrapper calls the body");
+  assert(llvmRefsDeclared(text, syms), "the body symbol is declared");
+  assert(text.endsWith("}\n\n"), "ends with the closing brace");
+  const q = fibLike(false);
+  const plain = emitLlvmFunction(llvmSymbols(q), q, 1);
+  assert(!plain.includes(".body"), "a function that does not call itself is not split");
 }

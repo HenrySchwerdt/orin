@@ -607,6 +607,70 @@ column: none distinguishable from noise (fib 0.894 s vs 0.787 s in the baseline 
 against 1-4); `diff_backends.py --mode llvm` and the LLVM suites pass. The C backend has no equivalent attributes that the language
 guarantees (the C compilers already see `static` functions).
 
+### Backends: ADR-0038 §8 gate 1 (LLVM against C, executed instructions)
+
+Gate 1 asks for the LLVM backend to be at least on par with the C backend on every benchmark, judged by executed instructions
+(valgrind `cachegrind --cache-sim=no`, "I refs", one run, the `instructions.args` inputs; C backend = `orin2 compile` + `cc -O2` (gcc 13.3),
+LLVM = `--backend=llvm` + `clang -O2` (clang 18.1), same runtime sources). Wall time was not used (shared machine). `tasks` (skipped) and the
+parallel benchmarks are not counted. "Before" is `origin/main` at the start of the change, "after" the change; the C column moves a little
+because the same change also removes a `memset` call from `orin_struct_new` (see below).
+
+| benchmark | C before | LLVM before | LLVM/C before | C after | LLVM after | LLVM/C after |
+|---|---:|---:|---:|---:|---:|---:|
+| appends | 126.4 M | 127.6 M | 1.009 | 126.4 M | 127.6 M | 1.009 |
+| bintrees | 7,135.1 M | 7,437.5 M | 1.042 | 6,801.0 M | 6,835.6 M | 1.005 |
+| bytesstr | 507.1 M | 423.3 M | 0.835 | 507.1 M | 423.3 M | 0.835 |
+| fib | 3,200.4 M | 4,802.1 M | **1.501** | 3,200.4 M | 2,484.0 M | 0.776 |
+| http_parse | 2,243.8 M | 2,252.8 M | 1.004 | 2,230.4 M | 1,907.5 M | 0.855 |
+| mapfreq | 2,031.9 M | 2,123.7 M | 1.045 | 2,021.9 M | 1,979.4 M | 0.979 |
+| mutres | 3,390.3 M | 2,632.8 M | 0.777 | 3,390.3 M | 2,602.8 M | 0.768 |
+| nbody | 2,397.4 M | 1,997.3 M | 0.833 | 2,397.4 M | 2,046.3 M | 0.854 |
+| pqueue | 2,263.9 M | 2,025.3 M | 0.895 | 2,227.9 M | 2,111.2 M | 0.948 |
+| qsort_func | 2,381.9 M | 2,377.6 M | 0.998 | 2,381.9 M | 2,378.6 M | 0.999 |
+| qsort_inplace | 980.5 M | 817.5 M | 0.834 | 966.9 M | 829.6 M | 0.858 |
+| sieve | 658.9 M | 492.5 M | 0.747 | 658.9 M | 502.5 M | 0.763 |
+| sortedmap | 1,871.7 M | 1,729.2 M | 0.924 | 1,853.3 M | 1,788.2 M | 0.965 |
+| streams | 1,183.8 M | 1,250.5 M | 1.056 | 1,183.8 M | 1,173.8 M | 0.992 |
+| strings | 1,310.2 M | 1,350.5 M | 1.031 | 1,305.2 M | 1,266.0 M | 0.970 |
+| wordfreq | 1,500.1 M | 1,488.5 M | 0.992 | 1,500.1 M | 1,434.8 M | 0.956 |
+
+Root causes (the checked-arithmetic lowering itself, `llvm.*.with.overflow` + branch, was already optimal: the optimised IR of `fib` is the same
+add/jo sequence gcc emits):
+
+1. **A trap call blocks shrink-wrapping.** Every trap was `call @orin_trap` + `unreachable` inside an `alwaysinline` helper. A call in a block
+   with no return needs a stack frame, so LLVM hoisted the whole prologue (3 pushes, 3 pops) above the `n < 2` test: every call of `fib`,
+   including the leaf calls (about 60 % of all), paid it. Now the trap is written at function level as the function's own return,
+   `%t = tail call <ret> @orinl_trap_<i|p|f|v>(msg); ret %t` (four tiny shims in `runtime/orin_runtime_llvm.c` that call `orin_trap`).
+   That is a `jmp` with no frame, the check blocks stay out of the frame, and the prologue moves to the slow path. Checked `+ - *`, `/ %`, negation, the
+   range / conversion guards, struct slot checks, array slot / push kind and bounds checks, and `charCodeAt` are therefore expanded in the function
+   instead of called as prelude helpers (the helpers remain for `unwrap_or` and `array_new`). The check keeps its `llvm.*.with.overflow` form, so the
+   `nsw` / `nuw` facts after a check survive. `fib`: 4,802 M to 3,809 M.
+2. **Partial inlining of the recursion guard.** gcc splits `fib` (`-fipa-split`: `fib.part.0`) so the `n < 2` test runs in the caller and only
+   non-trivial calls happen; LLVM `-O2` does not (`-enable-partial-inlining` is not part of the default pipeline and changed nothing). The backend now does
+   the split itself for a small (at most 8 blocks, 12 locals), directly self-recursive function with scalar parameters and result whose entry block is
+   cheap scalar code ending in a branch to a block that only returns: an `alwaysinline` wrapper `f` (entry block, return block, tail call) and the
+   original code as `f.body`. `fib`: 3,809 M to 2,484 M.
+3. **`charCodeAt` was an out-of-line call** to the shim `orinl_str_char_code_at` (the C backend inlines the header function): now inline. `mapfreq`
+   2,124 M to 1,992 M, `strings` 1,350 M to 1,273 M.
+4. **`x * 2` checked as a range test.** InstCombine rewrites `smul.with.overflow(x, 2)` into `x + 2^62 < 0` plus a separate `add` (3 + 1 instructions
+   against gcc's `imul; jo`). A multiplication by the literal 2 is now emitted as `x + x` with the same check and message. `streams` 1,241 M to 1,174 M.
+5. **Runtime, both backends:** `orin_struct_new` zeroed the slots with `memset(p, 0, n * 8)`; clang calls glibc `memset` for the variable length
+   (367 M instructions in `bintrees`), gcc inlined it. Up to four slots are now cleared with plain stores. `bintrees` C 7,135 M to 6,801 M, LLVM
+   7,437 M to 6,836 M.
+
+Behaviour is unchanged: same checks in the same order, same messages (two moved into the fixed message table: the wrong-shape message and the
+`charCodeAt` message), same exit status 101; `diff_backends.py --mode llvm`, the LLVM suites and the tooling tests pass.
+
+**Still above 1.0:** `appends` (+0.9 %) and `bintrees` (+0.5 %). In both, every function the backend generates is at or below the C backend's count; the
+difference is in the C runtime compiled by clang instead of gcc: `orin_destroy` costs clang about 45 % more instructions per call in `appends`
+(10.4 M against 15.0 M; clang materialises the thread-local addresses of `orin_stats`, `fl_*` and `g_live` in the prologue and spills them) and
+`orin_str_append` 10 % more (25.6 M against 28.0 M). Not a backend problem; to be closed by restructuring the thread-local state of the
+runtime (one `__thread` struct) or by a lighter `orin_destroy` entry. Gate 1 is therefore met on 14 of 16 benchmarks and missed by under 1 % on two.
+
+Cost of the change on the LLVM column: the check blocks now return instead of ending in `unreachable`, so LLVM no longer knows the path is dead after a
+trap; a few loops got 2-4 % longer (`pqueue` 2,025 M to 2,111 M, `sieve` 492 M to 502 M, `nbody` 1,997 M to 2,046 M, `sortedmap` 1,729 M to 1,788 M), all still
+below the C backend.
+
 ### Further defects, not fixed (listed, in the order of expected gain)
 
 * **Option / Result / pair results still allocate** (`pop()`, `get()`, `indexOf`, `Some(x)`): 1.69M of http_parse's 3.88M allocations, 2 per
