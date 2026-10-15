@@ -699,7 +699,7 @@ page lengths (about 144.6 MB in all) and hashes the last page. Every 7th name co
 characters are escaped) and every 11th URL is `javascript:alert(i)`, which the Go `html/template`-style rule replaces by
 `about:invalid#orin-unsafe-url`. All programs print byte-identical `bytes`, `hash` and `head` lines.
 
-- `bench/html/main.or`: **JSX** (ADR-0043), a `Row` and a `Page` component; each component is one fused buffer.
+- `bench/html/main.or`: **OX** markup with `std:html` (ADR-0043, ADR-0044), a `Row` and a `Page` component; each component is one fused buffer.
 - `bench/html_hand/main.or`: the same page **hand-written** in Orin, plain concatenation into one accumulating string
   (`out += ...`) with the same `std:html` `escape` / `safeUrl` (Orin-only row).
 - `bench/html/main.c`: one growing buffer, `memcpy`, an escape loop copying runs; `main.go`: `strings.Builder`.
@@ -708,17 +708,20 @@ characters are escaped) and every 11th URL is `javascript:alert(i)`, which the G
 
 | program | Orin C backend | Orin LLVM backend | Go | C |
 |---|---:|---:|---:|---:|
-| executed instructions, JSX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
+| executed instructions, OX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
 | executed instructions, hand-written Orin (`html_hand`) | 4.71 G | 4.63 G | | |
-| wall, JSX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
-| allocations, JSX: strings / `Html` records | 2.74 M / 0.80 M | | | |
+| wall, OX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
+| allocations, OX: strings / `Html` records | 2.74 M / 0.80 M | | | |
 | allocations, hand-written: strings | 5.03 M | | | |
 
-JSX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
+OX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
 parts are merged at compile time and appended into one buffer, while `out += a + b + c` builds a temporary per
 operator. It is 2.5x the instructions of C. What remains, in order (ADR-0043 "Not done"): geometric re-growth of each
 buffer (`string_grows` 4.2 M; a capacity hint from the known static length), the temporary string of every converted
 integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` + `joinAll`).
+The generic provider mechanism (ADR-0044) changed none of this: re-measured on the OX branch the counts are identical
+(3,991,618,263 / 4,711,876,261 instructions, same allocation counters), since `std:html`'s rules are applied at compile
+time and its `@Inline` functions are the same calls as before.
 
 ## Benchmark workflow (CI), metrics and history
 

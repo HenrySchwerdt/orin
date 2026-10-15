@@ -1,6 +1,7 @@
 # ADR-0043: JSX and `std:html` — server-side HTML as a fused string, safe by construction
 
-Status: proposed (2026-10-15), awaiting the project owner's acceptance. Related: ADR-0016 (additive syntax after the
+Status: accepted (2026-10-15, merged as PR #72); the semantics (§2) are superseded by ADR-0044 (OX: generic providers);
+the syntax (§1) and the fused lowering (§3) remain, as the `Markup` provider kind. Related: ADR-0016 (additive syntax after the
 freeze needs its own ADR), ADR-0030 §4 (direction for JSX), ADR-0038 (performance model: no hidden allocation, fusion),
 ADR-0022 (template literals: the lowering JSX reuses), ADR-0028 (contract quality), docs/jsx.md (user guide),
 docs/std.md "std:html".
