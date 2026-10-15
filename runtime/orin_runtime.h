@@ -412,6 +412,14 @@ OrinObj *orin_str_new(const char *p, uint64_t n); /* owned copy */
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b);
 /* a += b. CONSUMES a, returns owned result; in place (amortised O(1)) when a is unique. */
 OrinObj *orin_str_append(OrinObj *a, OrinObj *b);
+/*@ orin_str_prepend(a, b): a = b ++ a.  CONSUMES a (the result replaces it), b is only read.
+    requires a and b are strings, each kept alive by its caller;
+    ensures  \result is a string equal to b followed by a (len(result) == len(a) + len(b)); b is unchanged;
+    ensures  a->rc == 1 && a != b ==> \result == a, extended in place (the old bytes are moved up; capacity at least
+             doubles on growth), so a string that is shared (rc > 1, e.g. an alias of a literal or of another binding)
+             is never modified: \result is then a fresh string and a has been released (one reference dropped);
+    assigns  the heap (a, or a new string). */
+OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b);
 int64_t orin_str_eq(OrinObj *a, OrinObj *b);
 static inline uint64_t orin_str_len(const OrinObj *s) { return ((const OrinString *)s)->len; }
 static inline const char *orin_str_data(const OrinObj *s) { return ((const OrinString *)s)->data; }

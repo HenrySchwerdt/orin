@@ -639,6 +639,35 @@ OrinObj *orin_str_append(OrinObj *a, OrinObj *b) {
     return &r->h;
 }
 
+OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b) {
+    OrinString *x = (OrinString *)a, *y = (OrinString *)b;
+    if (y->len == 0) return a;
+    uint64_t n = x->len + y->len;
+    if (a->rc == 1 && a != b) {
+        if (n > x->cap) {
+            uint64_t cap = x->cap * 2;
+            if (cap < n) cap = n;
+            if (cap < 16) cap = 16;
+            uint64_t oldcap = x->cap;
+            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            orin_stats.live_bytes += cap - oldcap;
+            orin_stats.string_grows++;
+            SITE_GROW(&x->h, cap - oldcap);
+            x->cap = cap;
+        }
+        orin_platform_mem_move(x->data + y->len, x->data, x->len);
+        orin_platform_mem_copy(x->data, y->data, y->len);
+        x->len = n;
+        x->data[n] = 0;
+        return &x->h;
+    }
+    OrinString *r = str_alloc(n, n);
+    orin_platform_mem_copy(r->data, y->data, y->len);
+    if (x->len) orin_platform_mem_copy(r->data + y->len, x->data, x->len);
+    orin_release(a);
+    return &r->h;
+}
+
 int64_t orin_str_eq(OrinObj *a, OrinObj *b) {
     if (a == b) return 1;
     OrinString *x = (OrinString *)a, *y = (OrinString *)b;

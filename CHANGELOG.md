@@ -6,6 +6,10 @@
   longer retains the argument and the callee no longer releases it. Interprocedural fixpoint inside the existing parameter-mode
   inference; default deny (stores, moves, returns, mutation, a second retain keep the parameter owned). The verifier is unchanged
   (a borrow of a borrowed parameter was already a rule). Unit tests in `compiler/tests/opt_test.or`.
+- **Reuse in place for dying concatenation operands (ADR-0038 class (e)).** `"w" + n.toString()` prepends onto the fresh number string
+  (new MIR instruction `IStrPrepend`, runtime `orin_str_prepend`, in place when unique) instead of copying the literal and appending;
+  `qs(lo).concat(eq)` extends the dying temporary (`extendArrays`, `d = concat(x, y); release x`). Value semantics unchanged: a shared
+  operand is copied by the runtime. See docs/mir.md v2.3.
 - **Closure inlining and fusion (ADR-0038 §2; `compiler/fuse`).** A chain of `map` / `filter` stages ended by `map`, `filter`,
   `reduce`, `some`, `every`, `find`, `findIndex`, `forEach`, `includes` or `indexOf`, with pure arrow functions or named
   functions at the call, becomes one loop: no intermediate arrays, no closure objects, closure bodies inlined, early exit, exact
