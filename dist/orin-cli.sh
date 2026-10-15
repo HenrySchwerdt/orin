@@ -197,6 +197,15 @@ project_target() {
   if [ -z "$path" ]; then need_project; target=$project; [ "$project" != "$PWD" ] || target=.
   elif [ -d "$path" ]; then project=$(cd "$path" && pwd); target=$project
   else target=$path; project=$(cd "$(dirname "$path")" && pwd); fi
+  local ancestor=$project
+  while [ "$ancestor" != / ] && [ ! -f "$ancestor/orin.toml" ]; do ancestor=${ancestor%/*}; [ -n "$ancestor" ] || ancestor=/; done
+  [ ! -f "$ancestor/orin.toml" ] || project=$ancestor
+}
+validate_locked_dependencies() {
+  local root=$1 dependencies
+  [ -f "$root/orin.toml" ] || return 0
+  dependencies=$(info dependencies "$root") || return 1
+  [ -z "$dependencies" ] || fetch_dependencies "$root" true true
 }
 # The cache hashes contents, not mtimes. Sources, manifests, toolchain, runtime and flags participate.
 fingerprint() {
@@ -219,6 +228,7 @@ source_fingerprint() {
     dependencies=$(info dependencies "$root") || return
     while IFS='|' read -r depname deppath depgit deptag deprev depdev; do
       [ -n "$depname" ] || continue
+      if [ -n "$trail" ] && [ "$depdev" = true ]; then continue; fi
       local dep_root
       dep_root=$(cd "$(join_path "$root" "${deppath:-.orin/packages/$depname}")" 2>/dev/null && pwd) || { printf "error: Dependency '%s' is unavailable. Run 'orin fetch'.\n" "$depname" >&2; return 1; }
       source_fingerprint "$dep_root" "$trail|$root" || return
@@ -271,6 +281,7 @@ build_command() {
   done
   if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then CC=clang; fi
   project_target "$src"
+  validate_locked_dependencies "$project" || return 1
   local name
   if [ -f "$project/orin.toml" ]; then name=$(info name "$project"); else name=$(basename "$target" .or); fi
   valid_name "$name" || fail 'Invalid executable name in package manifest.'
@@ -314,6 +325,7 @@ test_command() {
   done
   $json && flags+=(--format=json)
   project_target "$src"
+  validate_locked_dependencies "$project" || return 1
   $allow && flags+=(--allow-empty)
   if [ -f "$target" ]; then compiler test --runtime "$RT" --cc "$CC" "$target" "${flags[@]}"; return; fi
   local entry; entry=$(info entry "$project")
@@ -350,7 +362,7 @@ fetch_dependencies() (
   resolution_output=$(mktemp "$root/.orin-lock-XXXXXXXX")
   trap resolution_cleanup EXIT
   printf '# Orin lock v1: name|kind|source|selector|commit\n' > "$resolution_output"
-  resolve_dependencies "$root" "$offline" "$updating" "path:$root" ""
+  resolve_dependencies "$root" "$offline" "$updating" "path:$root" "" || return 1
   if $locked; then
     [ -f "$resolution_input" ] && cmp -s "$resolution_output" "$resolution_input" || fail 'Lockfile is out of date. Run `orin fetch`.'
   else
@@ -378,6 +390,7 @@ resolve_dependencies() {
   dependencies=$(info dependencies "$root") || return
   while IFS='|' read -r name path giturl tag rev dev; do
     [ -n "$name" ] || continue
+    if [ -n "$scope" ] && [ "$dev" = true ]; then continue; fi
     key=${scope:+$scope/}$name
     update_child=''; if [ "$updating" = '*' ] || [ "$updating" = "$name" ]; then update_child='*'; fi
     if [ -n "$path" ]; then
@@ -385,8 +398,8 @@ resolve_dependencies() {
       [ -f "$source/src/module.or" ] || fail "Dependency '$name' has no src/module.or."
       printf '%s|path|%s||local\n' "$key" "$path" >> "$resolution_output"
       case "|$trail|" in *"|path:$source|"*) fail "Package dependency cycle at $name";; esac
-      register_resolution "$source" "path:$source" "$resolution_seen"
-      resolve_dependencies "$source" "$offline" "$update_child" "$trail|path:$source" "$key"
+      register_resolution "$source" "path:$source" "$resolution_seen" || return 1
+      resolve_dependencies "$source" "$offline" "$update_child" "$trail|path:$source" "$key" || return 1
     else
       spec=${rev:-${tag:-HEAD}}
       commit=''
@@ -421,8 +434,8 @@ resolve_dependencies() {
       fi
       printf '%s|git|%s|%s|%s\n' "$key" "$giturl" "$spec" "$commit" >> "$resolution_output"
       case "|$trail|" in *"|git:$giturl@$commit|"*) fail "Package dependency cycle at $name";; esac
-      register_resolution "$cached" "git:$giturl@$commit" "$resolution_seen"
-      resolve_dependencies "$cached" "$offline" "$update_child" "$trail|git:$giturl@$commit" "$key"
+      register_resolution "$cached" "git:$giturl@$commit" "$resolution_seen" || return 1
+      resolve_dependencies "$cached" "$offline" "$update_child" "$trail|git:$giturl@$commit" "$key" || return 1
     fi
   done <<< "$dependencies"
 }
@@ -432,6 +445,7 @@ print_dependencies() {
   dependencies=$(info dependencies "$root") || return
   while IFS='|' read -r dn dp dg dt dr dd; do
     [ -n "$dn" ] || continue
+    if [ -n "$trail" ] && [ "$dd" = true ]; then continue; fi
     suffix=''; [ "$dd" != true ] || suffix=' (dev)'
     printf '%s  %s%s\n' "$dn" "${dp:-$dg}" "$suffix" | safe
     if $tree; then
@@ -513,7 +527,7 @@ watch_command() {
       else
         if [ -n "$child" ] && kill -0 "$child" 2>/dev/null; then printf 'Previous process is still running\n' >&2; fi
       fi
-      last=$(fingerprint "$project")
+      last=$current
     fi
     if [ -n "$child" ] && ! kill -0 "$child" 2>/dev/null; then
       st=0; wait "$child" || st=$?; child=''
@@ -552,15 +566,27 @@ case $command in
         *) fail 'No extended explanation is available for this code yet.' 2;; esac ;;
       check|verify|api|effects|graph|mir)
         # Commands with no explicit path target the nearest project.
-        haspath=false; expect=false
+        haspath=false; expect=false; validation_path=
         for arg in "${args[@]}"; do
           if $expect; then expect=false; continue; fi
-          case $arg in --z3|--module|--function|--check|-o) expect=true;; -*) ;; *) haspath=true;; esac
+          case $arg in --z3|--module|--function|--check|-o) expect=true;; -*) ;; *) haspath=true; [ -n "$validation_path" ] || validation_path=$arg;; esac
         done
         if ! $haspath; then need_project; local_target=$project; [ "$project" != "$PWD" ] || local_target=.; args=("$local_target" "${args[@]}"); fi
+        project_target "$validation_path"
+        validate_locked_dependencies "$project" || exit 1
         if $json && [ "$command" != graph ]; then args+=(--format=json); fi
         compiler "$command" "${args[@]}" ;;
-      compile|diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
+      compile)
+        validation_path=''; expect=false
+        for arg in "${args[@]}"; do
+          if $expect; then expect=false; continue; fi
+          case $arg in -o|--z3) expect=true;; -*) ;; *) [ -n "$validation_path" ] || validation_path=$arg;; esac
+        done
+        project_target "$validation_path"
+        validate_locked_dependencies "$project" || exit 1
+        $json && args+=(--format=json)
+        compiler "$command" "${args[@]}" ;;
+      diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
       *) fail "Unknown command '$command'. Run 'orin --help' to see available commands." 2 ;;
     esac ;;
 esac

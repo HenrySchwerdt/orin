@@ -118,7 +118,7 @@ and lockfile; failed Git updates also restore the previous cached source. Resolv
 `orin.lock` is a versioned, pipe-delimited text file. Git entries record immutable commits, including transitive entries such as `shared/base`; local
 path entries are marked live. Commit the lockfile. `fetch` reuses matching locks, `update` deliberately
 re-resolves a named package or all packages, `--locked` refuses required changes, and `--offline`
-forbids Git downloads. Ordinary builds use the cache and do not silently update dependencies.
+forbids Git downloads. Builds, tests, checks, and compilation validate the root lock against cached sources without network access. If another project updated a shared path dependency’s Git cache, the command fails rather than using a different commit; `orin fetch --locked` restores the pinned graph. Ordinary builds do not silently update dependencies. Development dependencies of consumed libraries are excluded from the graph.
 Git's normal authentication mechanisms apply. Do not embed credentials in dependency URLs.
 
 Each package resolves its own direct dependencies. Conflicting sources for the same declared
