@@ -53,7 +53,7 @@ import { Inference, grantMissingErr, grantMismatchErr } from "./call";
 import { localsBound, placeBound } from "./hirok";
 import {
   OxOut, OxProvider, OX_MARKUP, OX_COMPONENTS, oxProvider, sealedErr, oxEncodeStatic, oxIsVoid, oxIsRawText, oxRuleFor,
-  isTagName, isAttrName, oxOutNew, oxOutStatic, oxOutDyn, oxOutFinish,
+  isTagName, isAttrName, asciiLower, oxOutNew, oxOutStatic, oxOutDyn, oxOutFinish,
 } from "./ox";
 
 export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
@@ -62,6 +62,7 @@ export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
 // component call evaluated in source order (`ref` names it, `lets` are all temporaries so far).
 type OxItem = { value: HExpr; splice: bool; };
 type OxTemp = { ref: Expr; lets: HStmt[]; };
+type OxPiece = { presence: bool; piece: HExpr; };
 
 // The index of the parameter named `name`, -1 if none.
 function indexOfParam(ps: Param[], name: string): int {
@@ -81,6 +82,33 @@ function isOptionTe(te: TypeExpr): bool {
     TNamed(n, args) => n.name == "Option" && args.length == 1,
     _ => false,
   };
+}
+
+// Entry `k` of attribute `j` (names are lower-cased) is overridden when the same name occurs later: after it in the
+// same spread, or in a later attribute.
+function oxOverridden(names: string[][], j: usize, k: usize): bool {
+  const n = names[j][k];
+  let i = k + 1;
+  while (i < names[j].length) {
+    if (names[j][i] == n) {
+      return true;
+    }
+    i += 1;
+  }
+  let a = j + 1;
+  while (a < names.length) {
+    if (names[a].some(x => x == n)) {
+      return true;
+    }
+    a += 1;
+  }
+  return false;
+}
+
+// `lets` evaluated, then `value`: `match (true) { _ => { lets; value } }`.
+function oxBlock(lets: HStmt[], value: HExpr, span: Span): HExpr {
+  const arm = HArm { pattern: HPWildcard, body: HBlock { stmts: lets }, value: Some(value) };
+  return mk(XMatch(mk(XBool(true), TyBool, span), [arm]), value.ty, span);
 }
 
 // An attribute value whose evaluation has no effect, so its order does not matter: a literal, a name, a function.
@@ -442,9 +470,7 @@ export class ExprChecker {
       );
     }
     let o = oxOutStatic(o0, "<" + tag.name);
-    for (const a of el.attrs) {
-      o = this.oxAttr(p, a, o)?;
-    }
+    o = this.oxAttrs(p, el.attrs, o)?;
     if (oxIsVoid(p, tag.name)) {
       if (el.children.length > 0) {
         return Err(
@@ -458,19 +484,107 @@ export class ExprChecker {
     return Ok(oxOutStatic(o, "</" + tag.name + ">"));
   }
 
+  // The attributes of an intrinsic element. Without a spread, one after the other. With spreads (ADR-0044 §4.3): each
+  // `{...r}` evaluates `r` once into a temporary, then every field `f` is the attribute `f={tmp.f}` at that position.
+  // When a name occurs more than once (ASCII case-insensitively), the one written later wins; the others are still
+  // evaluated, in source order, and their text is dropped.
+  private oxAttrs(p: OxProvider, attrs: OxAttr[], o0: OxOut): Result<OxOut, Diagnostic> {
+    let o = o0;
+    let spread = false;
+    for (const a of attrs) {
+      match (a.value) {
+        JVSpread(_) => {
+          spread = true;
+        },
+        _ => {},
+      }
+    }
+    if (!spread) {
+      for (const a of attrs) {
+        o = this.oxAttr(p, a, o)?;
+      }
+      return Ok(o);
+    }
+    const env = this.fx.env;
+    // Pass 1: the lower-cased attribute names of each entry (a spread contributes its fields), and for each spread
+    // its temporary and record.
+    let names: string[][] = [];
+    let temps: OxTemp[] = [];
+    let recs: usize[] = [];
+    for (const a of attrs) {
+      let ns: string[] = [];
+      match (a.value) {
+        JVSpread(x) => {
+          const v = this.ex(x, None)?;
+          const rid = match (v.ty) {
+            TyRecord(r) => r,
+            _ => env.records.length,
+          };
+          if (rid >= env.records.length) {
+            return Err(
+              diag("E0492", x.span, "a spread `{...}` needs a record value, found `" + showType(env, v.ty) + "`"),
+            );
+          }
+          temps.push(this.oxTemp(v, a.span, [])?);
+          recs.push(rid);
+          for (const f of env.records[rid].fields) {
+            ns.push(asciiLower(f.name));
+          }
+        },
+        _ => {
+          temps.push(OxTemp { ref: Expr { kind: EBool(true), span: a.span }, lets: [] });
+          recs.push(0);
+          ns.push(asciiLower(a.name.name));
+        },
+      }
+      names.push(ns);
+    }
+    // Pass 2: in source order.
+    let j: usize = 0;
+    while (j < attrs.length) {
+      const a = attrs[j];
+      match (a.value) {
+        JVSpread(x) => {
+          let s = oxOutNew();
+          let k: usize = 0;
+          for (const f of env.records[recs[j]].fields) {
+            const fa = OxAttr {
+              name: Ident { name: f.name, span: x.span },
+              value: JVExpr(Expr { kind: EMember(temps[j].ref, Ident { name: f.name, span: x.span }), span: x.span }),
+              span: x.span,
+            };
+            if (oxOverridden(names, j, k)) {
+              this.oxAttr(p, fa, oxOutNew())?;
+            } else {
+              s = this.oxAttr(p, fa, s)?;
+            }
+            k += 1;
+          }
+          o = oxOutDyn(o, oxBlock(temps[j].lets, oxOutFinish(s, x.span), x.span), x.span);
+        },
+        _ => {
+          if (oxOverridden(names, j, 0)) {
+            const d = this.oxAttr(p, a, oxOutNew())?;
+            if (d.parts.length > 0) {
+              const id = this.fx.newTemp("$ox", TyString);
+              const lets = [HLet(id, oxOutFinish(d, a.span))];
+              o = oxOutDyn(o, oxBlock(lets, mk(XStr(""), TyString, a.span), a.span), a.span);
+            }
+          } else {
+            o = this.oxAttr(p, a, o)?;
+          }
+        },
+      }
+      j += 1;
+    }
+    return Ok(o);
+  }
+
   // One attribute of an intrinsic element: ` name` (a bare name, or a `bool` that is true, if the provider has presence
   // attributes), ` name="value"` with the value encoded (at compile time for a literal, by the provider's `attr` or the
   // matching rule's `convert` otherwise).
   private oxAttr(p: OxProvider, a: OxAttr, o: OxOut): Result<OxOut, Diagnostic> {
     const name = a.name.name;
-    match (a.value) {
-      JVSpread(x) => {
-        return Err(
-          diag("E0491", a.span, "a spread `{...}` can only pass attributes to a component (an intrinsic element has no parameters)"),
-        );
-      },
-      _ => {},
-    }
     if (!isAttrName(name)) {
       return Err(diag("E0494", a.name.span, "`" + name + "` is not an attribute name"));
     }
@@ -516,33 +630,69 @@ export class ExprChecker {
           }
         }
         const v = this.ex(x, None)?;
-        if (isBool(v.ty)) {
-          if (!p.presence) {
-            return Err(this.oxNoPresence(p, name, x.span));
-          }
-          const on = mk(XStr(" " + name), TyString, x.span);
-          const off = mk(XStr(""), TyString, x.span);
-          return Ok(oxOutDyn(o, mk(XCond(v, on, off), TyString, x.span), x.span));
+        if (isOptionTy(v.ty)) {
+          return this.oxAttrOption(p, name, v, conv, x.span, o);
         }
-        let piece = v;
-        if (isString(v.ty)) {
-          piece = mk(XCall(conv, [v]), TyString, x.span);
-        } else if (isIntish(v.ty) || isFloatTy(v.ty)) {
-          piece = interpolated(this.fx.env, v, x.span)?;
-        } else {
-          return Err(
-            diag(
-              "E0492",
-              x.span,
-              "an attribute value must be a `string`, a number" + (p.presence ? " or a `bool`" : "") + ", found `"
-                  + showType(this.fx.env, v.ty) + "`",
-            ),
-          );
+        const pc = this.oxAttrPiece(p, name, v, conv, x.span)?;
+        if (pc.presence) {
+          return Ok(oxOutDyn(o, pc.piece, x.span));
         }
         const o2 = oxOutStatic(o, " " + name + "=\"");
-        return Ok(oxOutStatic(oxOutDyn(o2, piece, x.span), "\""));
+        return Ok(oxOutStatic(oxOutDyn(o2, pc.piece, x.span), "\""));
       },
     }
+  }
+
+  // The computed value `v` of attribute `name`: a `bool` is the presence text (` name` or nothing), a string goes
+  // through `conv`, a number is decimal text; anything else is E0492.
+  private oxAttrPiece(p: OxProvider, name: string, v: HExpr, conv: usize, span: Span): Result<OxPiece, Diagnostic> {
+    if (isBool(v.ty)) {
+      if (!p.presence) {
+        return Err(this.oxNoPresence(p, name, span));
+      }
+      const on = mk(XStr(" " + name), TyString, span);
+      const off = mk(XStr(""), TyString, span);
+      return Ok(OxPiece { presence: true, piece: mk(XCond(v, on, off), TyString, span) });
+    }
+    if (isString(v.ty)) {
+      return Ok(OxPiece { presence: false, piece: mk(XCall(conv, [v]), TyString, span) });
+    }
+    if (isIntish(v.ty) || isFloatTy(v.ty)) {
+      return Ok(OxPiece { presence: false, piece: interpolated(this.fx.env, v, span)? });
+    }
+    return Err(
+      diag(
+        "E0492",
+        span,
+        "the attribute `" + name + "` must be a `string`, a number" + (p.presence ? ", a `bool`" : "")
+            + " or an `Option` of one of these, found `" + showType(this.fx.env, v.ty) + "`",
+      ),
+    );
+  }
+
+  // `a={opt}` with `opt: Option<T>`: nothing for `None`, the attribute for `Some(v)` as if written `a={v}`. One
+  // dynamic piece: `opt` is evaluated once into a temporary.
+  private oxAttrOption(p: OxProvider, name: string, v: HExpr, conv: usize, span: Span, o: OxOut): Result<OxOut, Diagnostic> {
+    const inner = match (v.ty) {
+      TyOption(e) => e,
+      _ => v.ty,
+    };
+    const id = this.fx.newTemp("$ox", v.ty);
+    const ref = mk(XLocal(id), v.ty, span);
+    const some = mk(XBuiltin(BOptUnwrap, [ref]), inner, span);
+    const pc = this.oxAttrPiece(p, name, some, conv, span)?;
+    let text = pc.piece;
+    if (!pc.presence) {
+      const pre = mk(XStr(" " + name + "=\""), TyString, span);
+      text = mk(
+        XBinary(OpAdd, mk(XBinary(OpAdd, pre, pc.piece), TyString, span), mk(XStr("\""), TyString, span)),
+        TyString,
+        span,
+      );
+    }
+    const test = mk(XBuiltin(BOptIsSome, [ref]), TyBool, span);
+    const value = mk(XCond(test, text, mk(XStr(""), TyString, span)), TyString, span);
+    return Ok(oxOutDyn(o, oxBlock([HLet(id, v)], value, span), span));
   }
 
   private oxPresent(p: OxProvider, name: string, span: Span, o: OxOut): Result<OxOut, Diagnostic> {
