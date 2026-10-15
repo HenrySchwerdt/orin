@@ -1,0 +1,1064 @@
+// Unboxing of small immutable values (stage 6 of the MIR optimiser; ADR-0038 step 1, docs/mir.md v2.2).
+//
+// The lowering gives every Option, Result, record and pair a heap object: one allocation, a header, a retain per copy and
+// a release per drop, for values that have no identity and are never mutated. This pass gives such values the unboxed
+// representation `MAgg(n)`: n + 1 words held by value (tag, payload), passed and returned in registers or a C struct.
+//
+// Values are grouped into *webs*: the locals, parameters and function results that one value can flow between (moves,
+// dups, borrows, call arguments, call results, returns) must share one representation, so they are unified (a union-find
+// over all locals of the program plus one node per function result). The payload of a web is unified too, slot by slot
+// (`slotScalar` / `ensureField`, Steensgaard-style): a slot is a plain scalar word or another web (a nested Option /
+// record). A web is unboxed only when every member satisfies the eligibility rule (ADR-0038 addendum, "Unboxing"):
+//
+//   * it is built only by `IStructNew` of scalar or unboxed slots, `INullary`, or `IArrayPop` (an Option of a scalar),
+//     and otherwise only copied around (moves, dups, borrows, call results, parameters);
+//   * it is only read: `ITag`, `IGetField` into a scalar or an unboxed local, the Option / Result builtins, `release`;
+//     never mutated (no `ISetField` / take / put / `IMakeUnique`), never stored on the heap (array element, slot of a
+//     boxed object, closure capture, interface value), never compared, never passed through a function value;
+//   * it crosses no function boundary it cannot change: parameters and results of `main`, closure targets and vtable
+//     entries (pinned), and the in/out receiver keep their reference representation;
+//   * it is not recursive, its slots are consistent (a slot is a scalar in every variant or a web in every one) and it
+//     fits in four words (tag + AGG_MAX payload words); every web it contains or is contained in is unboxed too.
+//
+// Everything else stays an RC reference (the safe fallback). The rewrite only retypes locals, results and parameters
+// (an unboxed owned parameter becomes borrowed: it is a scalar), turns `move` / `dup` / `borrow` of an unboxed value
+// into `copy`, drops its `release`, and turns the slot index of an `IGetField` into the word offset of that slot.
+// The calls, builtins and blocks are the same, so the effects of every function are unchanged (`unboxKept`), and the
+// verifier checks the result like any other MIR: an unboxed value is a scalar (`Init`), copying it is free.
+
+import {
+  MProgram, MFunction, MBlock, MLocal, MType, Instr, Operand, Terminator, AGG_MAX, readsVariant,
+  readsPayload, spansComplete, allReachable,
+} from "../mir";
+import { mtyEq } from "../lower";
+import { instrUses, instrDef, isRefTy } from "./analysis";
+import { BlockSink, indices } from "./rewrite";
+import { fnShapeOk, progWellFormed, sameSignature, effects } from "./wellformed";
+
+// "No node" / "a scalar slot" in the slot lists.
+const NIL: usize = 4294967295;
+// Slots up to this index are tracked; a value with more slots is far wider than four words and stays boxed.
+const MAX_SLOTS: usize = 16;
+
+// A plain scalar: one word of an aggregate (not a reference, handle, void or aggregate).
+export function isWordTy(t: MType): bool {
+  return match (t) {
+    MInt => true,
+    MUsize => true,
+    MBool => true,
+    MFloat => true,
+    _ => false,
+  };
+}
+
+function isLocalOf(o: Operand): Option<usize> {
+  return match (o) {
+    OLocal(l) => Some(l),
+    _ => None,
+  };
+}
+
+// ---------------------------------------------------------------- the decisions
+
+// What the analysis decided, as plain arrays (read by the rewrite of every function independently). Node `base[fi] + l`
+// is local l of function fi, node `base[fi] + locals.length` its result. `root[n]` is the web of node n; a web r is
+// unboxed when `good[r]`, as an MAgg(`width[r]`) whose slot k starts at payload word `offVals[offStart[r] + k]`
+// (k < `offLen[r]`; with no table, slot k is word k: every slot is one word).
+@Invariant(this.root.length == this.good.length && this.root.length == this.width.length)
+@Invariant(this.root.length == this.offStart.length && this.root.length == this.offLen.length)
+@Invariant(this.base.length == this.nFns)
+export type UnboxPlan = {
+  nFns: usize;
+  base: usize[];
+  root: usize[];
+  good: bool[];
+  width: usize[];
+  offStart: usize[];
+  offLen: usize[];
+  offVals: usize[];
+  count: usize;
+};
+
+// The unboxed type of node n, if its web is unboxed.
+export function aggOfNode(plan: UnboxPlan, n: usize): Option<MType> {
+  if (n >= plan.root.length) {
+    return None;
+  }
+  const r = plan.root[n];
+  return r < plan.good.length && plan.good[r] ? Some(MAgg(plan.width[r])) : None;
+}
+
+// The payload word where slot k of the (unboxed) web of node n starts.
+@Requires(n < plan.root.length)
+export function wordOffset(plan: UnboxPlan, n: usize, k: usize): usize {
+  const r = plan.root[n];
+  if (r >= plan.offLen.length || plan.offLen[r] == 0) {
+    return k;
+  }
+  const i = k < plan.offLen[r] ? k : plan.offLen[r] - 1;
+  return plan.offVals[plan.offStart[r] + i];
+}
+
+// ---------------------------------------------------------------- the analysis
+
+// The node of local 0 of every function (its locals, then its result, then the next function).
+@Ensures(result.length == p.functions.length)
+function nodeBases(p: MProgram): usize[] {
+  let base: usize[] = [];
+  let n: usize = 0;
+  for (const f of p.functions) {
+    base.push(n);
+    n += f.locals.length + 1;
+  }
+  return base;
+}
+
+// Number of value nodes before any slot node: every local and every result.
+function nodeCount(p: MProgram): usize {
+  return p.functions.reduce((n: usize, f: MFunction) => n + f.locals.length + 1, 0);
+}
+
+@Ensures(result.length == n)
+function identity(n: usize): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(i);
+    i += 1;
+  }
+  return out;
+}
+
+@Ensures(result.length == n)
+function ones(n: usize): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(1);
+    i += 1;
+  }
+  return out;
+}
+
+@Ensures(result.length == n)
+function falses(n: usize): bool[] {
+  let out: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(false);
+    i += 1;
+  }
+  return out;
+}
+
+@Ensures(result.length == n)
+function nils(n: usize): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(NIL);
+    i += 1;
+  }
+  return out;
+}
+
+// The webs of a program: a union-find over the value nodes (every local of every function, every function result, and
+// the slot nodes created for nested values), each root with a list of its slots (`k` -> a slot node, or NIL for a
+// scalar word), a `bad` flag (some member breaks the eligibility rule) and a `pops` flag (some member is the result of
+// `IArrayPop`: an Option of one scalar word). The slot lists are linked lists in flat arrays (`head` per node, entries
+// `ek` / `en` / `enext`), so every update is in place. The union is by weight (the smaller web joins the larger), so a
+// root is found in O(log n) steps without path compression: no method both mutates and returns a value (a mutating
+// method with a result returns `{this, result}` and costs a copy of these arrays in code compiled by an older compiler,
+// such as stage 1 of the bootstrap).
+@Invariant(this.parent.length == this.bad.length && this.parent.length == this.pops.length)
+@Invariant(this.parent.length == this.weight.length)
+@Invariant(this.parent.length == this.head.length)
+@Invariant(this.ek.length == this.en.length && this.ek.length == this.enext.length)
+@Invariant(this.base.length == this.prog.functions.length && this.pinned.length == this.base.length)
+export class Unboxing {
+  private prog: MProgram;
+  private pinned: bool[];
+  private base: usize[];
+  private parent: usize[];
+  private weight: usize[];
+  private bad: bool[];
+  private pops: bool[];
+  private head: usize[];
+  private ek: usize[];
+  private en: usize[];
+  private enext: usize[];
+  private work: usize[];
+
+  @Requires(pinned.length == p.functions.length)
+  constructor(p: MProgram, pinned: bool[]) {
+    this.prog = p;
+    this.pinned = pinned;
+    this.base = nodeBases(p);
+    this.parent = identity(nodeCount(p));
+    this.weight = ones(nodeCount(p));
+    this.bad = falses(nodeCount(p));
+    this.pops = falses(nodeCount(p));
+    this.head = nils(nodeCount(p));
+    this.ek = [];
+    this.en = [];
+    this.enext = [];
+    this.work = [];
+  }
+
+  // Number of nodes.
+  size(): usize {
+    return this.parent.length;
+  }
+
+  @Requires(fi < this.base.length && l <= this.prog.functions[fi].locals.length)
+  @Ensures(result < this.parent.length)
+  private node(fi: usize, l: usize): usize {
+    return this.base[fi] + l;
+  }
+
+  @Requires(fi < this.base.length)
+  @Ensures(result < this.parent.length)
+  private retNode(fi: usize): usize {
+    return this.base[fi] + this.prog.functions[fi].locals.length;
+  }
+
+  // The root of node a (its web).
+  @Requires(a < this.parent.length)
+  @Ensures(result < this.parent.length && this.parent[result] == result)
+  rootOf(a: usize): usize {
+    let x = a;
+    while (this.parent[x] != x) {
+      x = this.parent[x];
+    }
+    return x;
+  }
+
+  // A new node (number `parent.length` before the call), its own web.
+  @Ensures(this.parent.length == old(this.parent.length) + 1)
+  private addNode(): void {
+    const n = this.parent.length;
+    this.parent.push(n);
+    this.weight.push(1);
+    this.bad.push(false);
+    this.pops.push(false);
+    this.head.push(NIL);
+  }
+
+  @Requires(a < this.parent.length)
+  @Ensures(this.bad[this.rootOf(a)] && this.parent.length == old(this.parent.length))
+  markBad(a: usize): void {
+    const r = this.rootOf(a);
+    this.bad[r] = true;
+  }
+
+  // The slot entry k of root r (an index into the entry arrays), or NIL.
+  @Requires(r < this.head.length)
+  private entry(r: usize, k: usize): usize {
+    let e = this.head[r];
+    while (e != NIL) {
+      if (this.ek[e] == k) {
+        return e;
+      }
+      e = this.enext[e];
+    }
+    return NIL;
+  }
+
+  @Requires(r < this.head.length)
+  @Ensures(this.ek.length == old(this.ek.length) + 1)
+  private addEntry(r: usize, k: usize, n: usize): void {
+    this.ek.push(k);
+    this.en.push(n);
+    this.enext.push(this.head[r]);
+    this.head[r] = this.ek.length - 1;
+  }
+
+  // Slot k of the web of a holds a plain scalar word.
+  @Requires(a < this.parent.length)
+  @Ensures(this.parent.length == old(this.parent.length))
+  slotScalar(a: usize, k: usize): void {
+    const r = this.rootOf(a);
+    if (k >= MAX_SLOTS) {
+      this.bad[r] = true;
+      return;
+    }
+    const e = this.entry(r, k);
+    if (e == NIL) {
+      this.addEntry(r, k, NIL);
+    } else if (this.en[e] != NIL) {
+      // a scalar in one variant, a nested value in another: both stay boxed
+      this.bad[r] = true;
+      this.markBad(this.en[e]);
+    }
+  }
+
+  // Slot k of the web of a holds a nested value: its node exists afterwards (`fieldOf`).
+  @Requires(a < this.parent.length)
+  @Ensures(this.parent.length >= old(this.parent.length))
+  ensureField(a: usize, k: usize): void {
+    const r = this.rootOf(a);
+    if (k >= MAX_SLOTS) {
+      this.bad[r] = true;
+      return;
+    }
+    const e = this.entry(r, k);
+    if (e == NIL) {
+      const n = this.parent.length;
+      this.addNode();
+      this.addEntry(r, k, n);
+    } else if (this.en[e] == NIL) {
+      this.bad[r] = true; // a nested value in one variant, a scalar in another
+    }
+  }
+
+  // The node of the nested value in slot k of the web of a, after `ensureField`: the web itself when that slot cannot
+  // hold one (which is then bad, so whatever is unified with it stays boxed too).
+  @Requires(a < this.parent.length)
+  @Ensures(result < this.parent.length)
+  fieldOf(a: usize, k: usize): usize {
+    const r = this.rootOf(a);
+    const e = k < MAX_SLOTS ? this.entry(r, k) : NIL;
+    return e != NIL && this.en[e] != NIL ? this.en[e] : r;
+  }
+
+  // a and b hold the same value: one web (their slots are unified too).
+  @Requires(a < this.parent.length && b < this.parent.length)
+  @Ensures(this.rootOf(a) == this.rootOf(b))
+  union(a: usize, b: usize): void {
+    this.work.push(a);
+    this.work.push(b);
+    while (this.work.length > 0) {
+      const y = this.work.pop().unwrap();
+      const x = this.work.pop().unwrap();
+      const rx = this.rootOf(x);
+      const ry = this.rootOf(y);
+      if (rx != ry) {
+        if (this.weight[rx] >= this.weight[ry]) {
+          this.merge(rx, ry);
+        } else {
+          this.merge(ry, rx);
+        }
+      }
+    }
+  }
+
+  // Root ry joins root rx: flags, and the slots of ry (a slot both have is unified later, through the work list).
+  @Requires(rx < this.parent.length && ry < this.parent.length && rx != ry)
+  @Requires(this.parent[rx] == rx && this.parent[ry] == ry)
+  private merge(rx: usize, ry: usize): void {
+    this.parent[ry] = rx;
+    this.weight[rx] += this.weight[ry];
+    if (this.bad[ry]) {
+      this.bad[rx] = true;
+    }
+    if (this.pops[ry]) {
+      this.pops[rx] = true;
+    }
+    let e = this.head[ry];
+    while (e != NIL) {
+      const k = this.ek[e];
+      const ny = this.en[e];
+      const ex = this.entry(rx, k);
+      if (ex == NIL) {
+        this.addEntry(rx, k, ny);
+      } else {
+        const nx = this.en[ex];
+        if (nx == NIL && ny == NIL) {
+          // both a scalar word
+        } else if (nx == NIL || ny == NIL) {
+          // a scalar in one, a nested value in the other: the container and the nested value stay boxed
+          this.bad[rx] = true;
+          this.markBad(nx == NIL ? ny : nx);
+        } else {
+          this.work.push(nx);
+          this.work.push(ny);
+        }
+      }
+      e = this.enext[e];
+    }
+    this.head[ry] = NIL;
+  }
+
+  // ---------------------------------------------------------------- scanning
+
+  // All functions, in order. Nodes are only added (slot nodes), never removed.
+  @Ensures(this.parent.length >= old(this.parent.length))
+  scanAll(): void {
+    let fi: usize = 0;
+    while (fi < this.prog.functions.length) {
+      this.scanFunction(fi);
+      fi += 1;
+    }
+  }
+
+  @Requires(fi < this.prog.functions.length)
+  private isRef(fi: usize, l: usize): bool {
+    const f = this.prog.functions[fi];
+    return l < f.locals.length && isRefTy(f.locals[l].ty);
+  }
+
+  @Requires(fi < this.prog.functions.length)
+  private isWord(fi: usize, l: usize): bool {
+    const f = this.prog.functions[fi];
+    return l < f.locals.length && isWordTy(f.locals[l].ty);
+  }
+
+  // A scalar operand (a constant other than a string, or a local of a plain scalar type).
+  @Requires(fi < this.prog.functions.length)
+  private wordOp(fi: usize, o: Operand): bool {
+    return match (o) {
+      OLocal(l) => this.isWord(fi, l),
+      OStr(_) => false,
+      _ => true,
+    };
+  }
+
+  // The rules of one function: the boundary (pinned, main, in/out), each instruction, each return.
+  @Requires(fi < this.prog.functions.length)
+  private scanFunction(fi: usize): void {
+    const f = this.prog.functions[fi];
+    if (this.pinned[fi] || fi == this.prog.main) {
+      this.markBad(this.retNode(fi));
+      let k: usize = 0;
+      while (k < f.paramCount) {
+        this.markBad(this.node(fi, k));
+        k += 1;
+      }
+    }
+    if (f.inout && f.paramCount > 0) {
+      this.markBad(this.node(fi, 0));
+    }
+    for (const blk of f.blocks) {
+      for (const ins of blk.instrs) {
+        this.scanInstr(fi, ins);
+      }
+      match (blk.term) {
+        TReturn(ro) => {
+          match (ro) {
+            Some(o) => {
+              match (o) {
+                OLocal(r) => {
+                  if (this.isRef(fi, r)) {
+                    this.union(this.node(fi, r), this.retNode(fi));
+                  }
+                },
+                OStr(_) => {
+                  this.markBad(this.retNode(fi));
+                },
+                _ => {},
+              }
+            },
+            None => {},
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+
+  // The rule of one instruction. Every reference local it uses or defines that the rule does not allow is marked bad
+  // (default deny: an instruction the pass does not know keeps its operands boxed).
+  @Requires(fi < this.prog.functions.length)
+  private scanInstr(fi: usize, ins: Instr): void {
+    let okUses: usize[] = [];
+    let okDef = false;
+    match (ins) {
+      IMove(d, s) => {
+        this.union(this.node(fi, d), this.node(fi, s));
+        okUses = [s];
+        okDef = true;
+      },
+      IBorrow(d, s) => {
+        this.union(this.node(fi, d), this.node(fi, s));
+        okUses = [s];
+        okDef = true;
+      },
+      IDup(d, o) => {
+        match (o) {
+          OLocal(s) => {
+            this.union(this.node(fi, d), this.node(fi, s));
+            okUses = [s];
+            okDef = true;
+          },
+          _ => {},
+        }
+      },
+      IRelease(x) => {
+        okUses = [x];
+      },
+      ICall(dst, g, args) => {
+        const callee = this.prog.functions[g];
+        let k: usize = 0;
+        while (k < args.length && k < callee.paramCount) {
+          if (isRefTy(callee.locals[k].ty)) {
+            match (args[k]) {
+              OLocal(a) => {
+                this.union(this.node(fi, a), this.node(g, k));
+                okUses.push(a);
+              },
+              _ => {
+                this.markBad(this.node(g, k));
+              },
+            }
+          }
+          k += 1;
+        }
+        match (dst) {
+          Some(d) => {
+            if (this.isRef(fi, d)) {
+              this.union(this.node(fi, d), this.retNode(g));
+            }
+          },
+          None => {},
+        }
+        okDef = true;
+      },
+      IBuiltin(dst, b, args) => {
+        if (readsVariant(b) && args.length > 0) {
+          match (args[0]) {
+            OLocal(a) => {
+              const dstOk = match (dst) {
+                Some(d) => this.isWord(fi, d),
+                None => true,
+              };
+              if (dstOk && this.isRef(fi, a)) {
+                okUses = [a];
+                if (readsPayload(b)) {
+                  this.slotScalar(this.node(fi, a), 0);
+                }
+              }
+            },
+            _ => {},
+          }
+        }
+      },
+      IStructNew(d, _, slots) => {
+        let ok = true;
+        let k: usize = 0;
+        while (k < slots.length) {
+          match (slots[k]) {
+            OLocal(s) => {
+              if (this.isRef(fi, s)) {
+                this.ensureField(this.node(fi, d), k);
+                this.union(this.node(fi, s), this.fieldOf(this.node(fi, d), k));
+                okUses.push(s);
+              } else if (this.isWord(fi, s)) {
+                this.slotScalar(this.node(fi, d), k);
+              } else {
+                ok = false;
+              }
+            },
+            OStr(_) => {
+              ok = false;
+            },
+            _ => {
+              this.slotScalar(this.node(fi, d), k);
+            },
+          }
+          k += 1;
+        }
+        okDef = ok;
+      },
+      INullary(_, _) => {
+        okDef = true;
+      },
+      ITag(_, o) => {
+        match (o) {
+          OLocal(a) => {
+            okUses = [a];
+          },
+          _ => {},
+        }
+      },
+      IGetField(d, o, k) => {
+        match (o) {
+          OLocal(a) => {
+            if (this.isRef(fi, a)) {
+              if (this.isWord(fi, d)) {
+                this.slotScalar(this.node(fi, a), k);
+                okUses = [a];
+              } else if (this.isRef(fi, d)) {
+                this.ensureField(this.node(fi, a), k);
+                this.union(this.node(fi, d), this.fieldOf(this.node(fi, a), k));
+                okUses = [a];
+                okDef = true;
+              }
+            }
+          },
+          _ => {},
+        }
+      },
+      IArrayPop(d, _) => {
+        const n = this.node(fi, d);
+        this.slotScalar(n, 0);
+        const r = this.rootOf(n);
+        this.pops[r] = true;
+        okDef = true;
+      },
+      _ => {},
+    }
+    for (const u of instrUses(ins)) {
+      if (this.isRef(fi, u) && !okUses.includes(u)) {
+        this.markBad(this.node(fi, u));
+      }
+    }
+    match (instrDef(ins)) {
+      Some(d) => {
+        if (this.isRef(fi, d) && !okDef) {
+          this.markBad(this.node(fi, d));
+        }
+      },
+      None => {},
+    }
+  }
+
+  // ---------------------------------------------------------------- solving
+
+  // The decisions: every web's width and slot offsets, bad webs and everything nested in or around them excluded.
+  @Ensures(result.root.length == this.parent.length && result.base.length == this.base.length)
+  solve(): UnboxPlan {
+    const n = this.parent.length;
+    let root: usize[] = [];
+    let i: usize = 0;
+    while (i < n) {
+      root.push(this.rootOf(i));
+      i += 1;
+    }
+    let sizer = new WebSizer(root, this.bad, this.pops, this.head, this.ek, this.en, this.enext);
+    sizer.run();
+    return sizer.plan(this.base);
+  }
+}
+
+// ---------------------------------------------------------------- sizes and layouts
+
+// The widths of the webs (`root[n]` is the web of node n; the slot lists of the roots are `head` / `ek` / `en` / `enext`):
+// a scalar slot is one word, a nested slot the words of its web (tag + payload), a missing slot one word. A web is good
+// when it is not bad, not recursive, fits in AGG_MAX payload words (a popped Option: exactly one scalar word) and every
+// web it contains or is contained in is good.
+@Invariant(this.root.length == this.good.length && this.root.length == this.width.length)
+@Invariant(this.root.length == this.state.length)
+export class WebSizer {
+  private root: usize[];
+  private good: bool[];
+  private pops: bool[];
+  private width: usize[];
+  private state: int[];
+  private head: usize[];
+  private ek: usize[];
+  private en: usize[];
+  private enext: usize[];
+
+  @Requires(bad.length == root.length && pops.length == root.length && head.length == root.length)
+  constructor(
+    root: usize[],
+    bad: bool[],
+    pops: bool[],
+    head: usize[],
+    ek: usize[],
+    en: usize[],
+    enext: usize[],
+  ) {
+    this.root = root;
+    this.good = bad.map(b => !b);
+    this.pops = pops;
+    this.width = root.map(r => 0);
+    this.state = root.map(r => 0);
+    this.head = head;
+    this.ek = ek;
+    this.en = en;
+    this.enext = enext;
+  }
+
+  // Number of slots of root r (one more than its largest slot index; 0 without slots).
+  @Requires(r < this.head.length)
+  private slotCount(r: usize): usize {
+    let m: usize = 0;
+    let e = this.head[r];
+    while (e != NIL) {
+      if (this.ek[e] + 1 > m) {
+        m = this.ek[e] + 1;
+      }
+      e = this.enext[e];
+    }
+    return m;
+  }
+
+  // The node in slot k of root r (NIL: a scalar or no slot).
+  @Requires(r < this.head.length)
+  private slotNode(r: usize, k: usize): usize {
+    let e = this.head[r];
+    while (e != NIL) {
+      if (this.ek[e] == k) {
+        return this.en[e];
+      }
+      e = this.enext[e];
+    }
+    return NIL;
+  }
+
+  // The words slot k of root r takes (after its nested web is sized).
+  @Requires(r < this.head.length)
+  private slotWords(r: usize, k: usize): usize {
+    const s = this.slotNode(r, k);
+    return s == NIL ? 1 : this.width[this.root[s]] + 1;
+  }
+
+  // The width of root r (memoised; a cycle makes the web bad).
+  @Requires(r < this.root.length)
+  private size(r: usize): void {
+    if (this.state[r] == 2) {
+      return;
+    }
+    if (this.state[r] == 1) {
+      this.good[r] = false; // recursive
+      return;
+    }
+    this.state[r] = 1;
+    let e = this.head[r];
+    while (e != NIL) {
+      if (this.en[e] != NIL) {
+        const q = this.root[this.en[e]];
+        this.size(q);
+        if (!this.good[q]) {
+          this.good[r] = false;
+        }
+      }
+      e = this.enext[e];
+    }
+    const m = this.slotCount(r);
+    let w: usize = 0;
+    let k: usize = 0;
+    while (k < m) {
+      w += this.slotWords(r, k);
+      k += 1;
+    }
+    if (this.pops[r]) {
+      if (m > 1 || this.slotNode(r, 0) != NIL) {
+        this.good[r] = false;
+      }
+      w = 1;
+    }
+    if (w > AGG_MAX) {
+      this.good[r] = false;
+    }
+    this.width[r] = w;
+    this.state[r] = 2;
+  }
+
+  // Sizes every web, then excludes everything nested in a bad web and every web holding a bad one, to the fixpoint.
+  @Ensures(this.root.length == old(this.root.length) && this.sound())
+  run(): void {
+    let i: usize = 0;
+    while (i < this.root.length) {
+      if (this.root[i] == i) {
+        this.size(i);
+      }
+      i += 1;
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      i = 0;
+      while (i < this.root.length) {
+        if (this.root[i] == i) {
+          let e = this.head[i];
+          while (e != NIL) {
+            const s = this.en[e];
+            if (s != NIL) {
+              const q = this.root[s];
+              if (this.good[i] != this.good[q]) {
+                this.good[i] = false;
+                this.good[q] = false;
+                changed = true;
+              }
+            }
+            e = this.enext[e];
+          }
+        }
+        i += 1;
+      }
+    }
+  }
+
+  // Every good web fits into AGG_MAX payload words, and a good web holds only good webs (and is held only by good ones).
+  sound(): bool {
+    let i: usize = 0;
+    while (i < this.root.length) {
+      if (this.root[i] == i) {
+        if (this.good[i] && this.width[i] > AGG_MAX) {
+          return false;
+        }
+        let e = this.head[i];
+        while (e != NIL) {
+          const s = this.en[e];
+          if (s != NIL && this.good[i] != this.good[this.root[s]]) {
+            return false;
+          }
+          e = this.enext[e];
+        }
+      }
+      i += 1;
+    }
+    return true;
+  }
+
+  // The plan: per node its web, per web good / width / the start word of every slot.
+  @Ensures(result.root.length == this.root.length && result.base.length == base.length)
+  plan(base: usize[]): UnboxPlan {
+    let offStart: usize[] = [];
+    let offLen: usize[] = [];
+    let offVals: usize[] = [];
+    let count: usize = 0;
+    let i: usize = 0;
+    while (i < this.root.length) {
+      offStart.push(offVals.length);
+      let len: usize = 0;
+      if (this.root[i] == i && this.good[i]) {
+        count += 1;
+        let nested = false;
+        let e = this.head[i];
+        while (e != NIL) {
+          if (this.en[e] != NIL) {
+            nested = true;
+          }
+          e = this.enext[e];
+        }
+        if (nested) {
+          const m = this.slotCount(i);
+          let at: usize = 0;
+          let k: usize = 0;
+          while (k < m) {
+            offVals.push(at);
+            const s = this.slotNode(i, k);
+            at += s == NIL ? 1 : this.width[this.root[s]] + 1;
+            k += 1;
+          }
+          len = m;
+        }
+      }
+      offLen.push(len);
+      i += 1;
+    }
+    return UnboxPlan {
+      nFns: base.length,
+      base: base,
+      root: this.root,
+      good: this.good,
+      width: this.width,
+      offStart: offStart,
+      offLen: offLen,
+      offVals: offVals,
+      count: count,
+    };
+  }
+}
+
+// ---------------------------------------------------------------- the rewrite
+
+// The unboxed type of local l of function fi, if any (only references are unboxed).
+@Requires(fi < plan.base.length && l < f.locals.length)
+function localAgg(plan: UnboxPlan, fi: usize, f: MFunction, l: usize): Option<MType> {
+  if (!isRefTy(f.locals[l].ty)) {
+    return None;
+  }
+  return aggOfNode(plan, plan.base[fi] + l);
+}
+
+// Function fi with its unboxed locals, result and parameters retyped and the instructions on them rewritten.
+@Requires(fi < plan.base.length && fnShapeOk(f))
+@Ensures(unboxedOk(f, result))
+export function unboxFunction(plan: UnboxPlan, fi: usize, f: MFunction): MFunction {
+  let agg: bool[] = [];
+  let locals: MLocal[] = [];
+  let l: usize = 0;
+  while (l < f.locals.length) {
+    match (localAgg(plan, fi, f, l)) {
+      Some(t) => {
+        agg.push(true);
+        locals.push(MLocal { name: f.locals[l].name, ty: t });
+      },
+      None => {
+        agg.push(false);
+        locals.push(f.locals[l]);
+      },
+    }
+    l += 1;
+  }
+  const ret = isRefTy(f.ret)
+      ? match (aggOfNode(plan, plan.base[fi] + f.locals.length)) {
+        Some(t) => t,
+        None => f.ret,
+      }
+      : f.ret;
+  if (!agg.some(a => a) && mtyEq(ret, f.ret)) {
+    return f;
+  }
+  let owned: bool[] = [];
+  let k: usize = 0;
+  while (k < f.paramCount) {
+    owned.push(f.paramOwned[k] && !agg[k]);
+    k += 1;
+  }
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    let out = new BlockSink();
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      const sp = blk.spans[i];
+      match (blk.instrs[i]) {
+        IMove(d, s) => {
+          out.emit(agg[d] ? ICopy(d, OLocal(s)) : blk.instrs[i], sp);
+        },
+        IBorrow(d, s) => {
+          out.emit(agg[d] ? ICopy(d, OLocal(s)) : blk.instrs[i], sp);
+        },
+        IDup(d, o) => {
+          out.emit(agg[d] ? ICopy(d, o) : blk.instrs[i], sp);
+        },
+        IRelease(x) => {
+          if (!agg[x]) {
+            out.emit(blk.instrs[i], sp);
+          }
+        },
+        IGetField(d, o, slot) => {
+          const a = match (o) {
+            OLocal(x) => agg[x],
+            _ => false,
+          };
+          out.emit(
+            a
+                ? IGetField(d, o, wordOffset(plan, plan.base[fi] + operandLocal(o), slot))
+                : blk.instrs[i],
+            sp,
+          );
+        },
+        _ => {
+          out.emit(blk.instrs[i], sp);
+        },
+      }
+      i += 1;
+    }
+    blocks.push(out.finish(blk.term, blk.termSpan));
+  }
+  return MFunction {
+    name: f.name,
+    paramCount: f.paramCount,
+    paramOwned: owned,
+    inout: f.inout,
+    locals: locals,
+    ret: ret,
+    blocks: blocks,
+  };
+}
+
+function operandLocal(o: Operand): usize {
+  return match (o) {
+    OLocal(l) => l,
+    _ => 0,
+  };
+}
+
+// ---------------------------------------------------------------- what the pass keeps
+
+// `b` is `a` or `a` unboxed: the same type, or a reference that became an aggregate.
+export function sameOrUnboxed(a: MType, b: MType): bool {
+  return mtyEq(a, b) || isRefTy(a) && isAggTyOpt(b);
+}
+
+function isAggTyOpt(t: MType): bool {
+  return match (t) {
+    MAgg(n) => n <= AGG_MAX,
+    _ => false,
+  };
+}
+
+function keysEq(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The function after unboxing: the same name, parameters, in/out flag, blocks and locals (only references retyped to
+// aggregates), a parameter that stays a reference keeps its mode, the same calls and builtins in the same order, spans
+// and reachability kept.
+export function unboxedOk(before: MFunction, after: MFunction): bool {
+  if (!fnShapeOk(after)
+      || after.name != before.name
+      || after.paramCount != before.paramCount
+      || after.inout != before.inout
+      || after.blocks.length != before.blocks.length
+      || after.locals.length != before.locals.length
+      || !sameOrUnboxed(before.ret, after.ret)) {
+    return false;
+  }
+  let l: usize = 0;
+  while (l < before.locals.length) {
+    if (!sameOrUnboxed(before.locals[l].ty, after.locals[l].ty)) {
+      return false;
+    }
+    if (l < before.paramCount
+        && isRefTy(after.locals[l].ty)
+        && after.paramOwned[l] != before.paramOwned[l]) {
+      return false;
+    }
+    l += 1;
+  }
+  return keysEq(effects(before), effects(after))
+      && (!spansComplete(before.blocks) || spansComplete(after.blocks))
+      && (!allReachable(before.blocks) || allReachable(after.blocks));
+}
+
+// The program after unboxing: the same functions in the same order (each `unboxedOk`), `main` and the pinned functions
+// (closure targets, vtable entries) with their signatures unchanged, the same strings and vtables.
+export function unboxKept(p: MProgram, r: MProgram, pinned: bool[]): bool {
+  if (r.functions.length != p.functions.length
+      || r.main != p.main
+      || r.strings.length != p.strings.length
+      || r.vtables.length != p.vtables.length
+      || pinned.length != p.functions.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < p.functions.length) {
+    const a = p.functions[i];
+    const b = r.functions[i];
+    if (!unboxedOk(a, b)) {
+      return false;
+    }
+    if ((pinned[i] || i == p.main) && !sameSignature(a, b)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// Stage 6: the webs of the whole program are found first (a program-wide step in function order); then every function is
+// rewritten on its own from the plan.
+@Requires(pinned.length == p.functions.length && progWellFormed(p))
+@Ensures(unboxKept(p, result, pinned) && progWellFormed(result))
+export function unboxValues(p: MProgram, pinned: bool[]): MProgram {
+  let u = new Unboxing(p, pinned);
+  u.scanAll();
+  const plan = u.solve();
+  if (plan.count == 0) {
+    return p;
+  }
+  const fns = indices(p.functions.length).map(fi => unboxFunction(plan, fi, p.functions[fi]));
+  return MProgram {
+    functions: fns,
+    strings: p.strings,
+    main: p.main,
+    vtables: p.vtables,
+    inlineFns: p.inlineFns,
+  };
+}

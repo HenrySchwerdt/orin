@@ -3,6 +3,30 @@
 // it back inside one critical section, so the invariants below hold whenever a lock is released, and they can be tested and mutated
 // (tools/mutate_std.py) without a single thread. Part of the std:task implementation; import `std:task` for the API.
 
+// The ring arithmetic on plain numbers: `Ring` is built on these, and std:task calls them directly on locals loaded from the
+// channel's monitor (a `Ring` object per send / receive was 40% of the allocations of a channel benchmark), so the tests and
+// the mutants of `Ring` below cover the code the channels run.
+
+// A send would not block and would be accepted.
+export function ringCanPush(len: usize, cap: usize, txClosed: bool, rxClosed: bool): bool {
+  return !txClosed && !rxClosed && len < cap;
+}
+
+// The slot of the next value to write (requires len < cap).
+export function ringSlot(cap: usize, head: usize, len: usize): usize {
+  return (head + len) % cap;
+}
+
+// The head after one pop (requires cap >= 1).
+export function ringNextHead(cap: usize, head: usize): usize {
+  return (head + 1) % cap;
+}
+
+// No value will ever be received (cancelled by the receiver, or closed by the sender and drained).
+export function ringIsDone(len: usize, txClosed: bool, rxClosed: bool): bool {
+  return rxClosed || (txClosed && len == 0);
+}
+
 // The bookkeeping of one channel buffer, a bounded ring of `cap` slots. Pure: the channel functions load it from the
 // channel's monitor, change it and store it back inside one critical section, so the invariants hold whenever the
 // lock is released (they are checked after every method under --check-contracts, and `orin test` does).
@@ -28,7 +52,7 @@ export class Ring {
   // canPush(): a send would not block and would be accepted.
   @Ensures(result == (!this.txClosed && !this.rxClosed && this.len < this.cap))
   canPush(): bool {
-    return !this.txClosed && !this.rxClosed && this.len < this.cap;
+    return ringCanPush(this.len, this.cap, this.txClosed, this.rxClosed);
   }
 
   // canPop(): there is a value to receive.
@@ -40,7 +64,7 @@ export class Ring {
   // isDone(): no value will ever be received (cancelled by the receiver, or closed by the sender and drained).
   @Ensures(result == (this.rxClosed || (this.txClosed && this.len == 0)))
   isDone(): bool {
-    return this.rxClosed || (this.txClosed && this.len == 0);
+    return ringIsDone(this.len, this.txClosed, this.rxClosed);
   }
 
   // push(): the slot to write the next value into; the ring now holds one more value.
@@ -49,7 +73,7 @@ export class Ring {
   @Ensures(this.len == old(this.len) + 1)
   @Ensures(this.head == old(this.head))
   push(): usize {
-    const slot = (this.head + this.len) % this.cap;
+    const slot = ringSlot(this.cap, this.head, this.len);
     this.len += 1;
     return slot;
   }
@@ -61,7 +85,7 @@ export class Ring {
   @Ensures(this.len + 1 == old(this.len))
   pop(): usize {
     const slot = this.head;
-    this.head = (this.head + 1) % this.cap;
+    this.head = ringNextHead(this.cap, this.head);
     this.len -= 1;
     return slot;
   }

@@ -6,8 +6,8 @@
 import { MProgram, MFunction, Operand, Instr, Terminator, dstOf } from "../mir";
 import { Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 import {
-  VerifyIssue, issueSpan, sameSpan, State, LState, HoleEntry, HoleKey, mk, isKind, ownedLike, leaky,
-  isLive, lsEq, holeAnyIn, holeHasIn, holeMayIn, holesInRange, borrowsFlatIn, kindName, KDead,
+  VerifyIssue, issueSpan, sameSpan, State, HoleEntry, HoleKey, mk, isKind, ownedLike, leaky,
+  isLive, lsEq, lsKind, lsSrc, holeAnyIn, holeHasIn, holeMayIn, holesInRange, borrowsFlatIn, kindName, KDead,
   KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
 } from "./state";
 import { CRef, CHandle, localClass, wfInstr, wfTerm } from "./wf";
@@ -42,13 +42,13 @@ export function issuesAt(
 
 // Only a defining instruction revives a local: every local that was not live before (dead or poisoned) and is not one
 // of the locals the instruction defines (`defs`) is in exactly the same state after.
-export function noRevival(before: LState[], after: LState[], defs: usize[]): bool {
+export function noRevival(before: int[], after: int[], defs: usize[]): bool {
   if (before.length != after.length) {
     return false;
   }
   let i: usize = 0;
   while (i < before.length) {
-    if (!isLive(before[i].k) && !lsEq(before[i], after[i]) && !defs.includes(i)) {
+    if (!isLive(lsKind(before[i])) && !lsEq(before[i], after[i]) && !defs.includes(i)) {
       return false;
     }
     i += 1;
@@ -81,9 +81,11 @@ export function defsOf(p: MProgram, ins: Instr): usize[] {
 
 // No alias is rooted at a Dead or scalar local: every way a local dies invalidates its aliases first, and a scalar is
 // never a root. `def` relies on it to skip the alias scan.
-export function rootsLive(ls: LState[]): bool {
+export function rootsLive(ls: int[]): bool {
   return ls.every(
-    s => s.k != KBorrowed || s.src >= ls.length || ls[s.src].k != KDead && ls[s.src].k != KInit,
+    s => lsKind(s) != KBorrowed
+        || lsSrc(s) >= ls.length
+        || lsKind(ls[lsSrc(s)]) != KDead && lsKind(ls[lsSrc(s)]) != KInit,
   );
 }
 
@@ -114,7 +116,7 @@ export class Transfer {
   f: MFunction;
   blk: usize;
   ins: usize;
-  ls: LState[];
+  ls: int[];
   holes: HoleEntry[];
   errs: VerifyIssue[];
   warns: VerifyIssue[];
@@ -212,7 +214,7 @@ export class Transfer {
         }
         let i: usize = 0;
         while (i < this.ls.length) {
-          const k = this.ls[i].k;
+          const k = lsKind(this.ls[i]);
           if (leaky(k)) {
             this.warn("leak: " + this.nm(i) + " may still own a reference at return");
           }
@@ -244,11 +246,12 @@ export class Transfer {
   // Every `Borrowed(x)` alias dies (x is released, moved, consumed, mutated or redefined). Nothing else changes.
   @Requires(x < this.ls.length)
   @Ensures(this.ls.length == old(this.ls.length))
-  @Ensures(this.ls.every(s => !(s.k == KBorrowed && s.src == x)))
+  @Ensures(this.ls.every(s => !(lsKind(s) == KBorrowed && lsSrc(s) == x)))
   private killBorrows(x: usize): void {
     let i: usize = 0;
     while (i < this.ls.length) {
-      if (this.ls[i].k == KBorrowed && this.ls[i].src == x) {
+      const s = this.ls[i];
+      if (lsKind(s) == KBorrowed && lsSrc(s) == x) {
         this.ls[i] = mk(KDead, 0);
       }
       i += 1;
@@ -298,7 +301,7 @@ export class Transfer {
   }
 
   private kindOf(l: usize): int {
-    return this.ls[l].k;
+    return lsKind(this.ls[l]);
   }
 
   private isRefLocal(l: usize): bool {
@@ -421,9 +424,11 @@ export class Transfer {
       this.err(this.nm(d) + " is overwritten while a slot is taken (open hole)");
       this.dropHolesOf(d);
     }
-    for (const h of this.holes) {
-      if (h.sym && h.idx == d) {
-        this.err("index local " + this.nm(d) + " is overwritten while it names an open hole");
+    if (this.holes.length > 0) {
+      for (const h of this.holes) {
+        if (h.sym && h.idx == d) {
+          this.err("index local " + this.nm(d) + " is overwritten while it names an open hole");
+        }
       }
     }
     // No alias is rooted at a Dead or scalar local (`rootsLive`, a precondition of `run`): every way a local dies runs
@@ -444,7 +449,7 @@ export class Transfer {
   // Root a new borrow of local l depends on: l itself, or l's own root (borrows are flat).
   private rootOf(l: usize): usize {
     const s = this.ls[l];
-    return s.k == KBorrowed ? s.src : l;
+    return lsKind(s) == KBorrowed ? lsSrc(s) : l;
   }
 
   // d becomes Borrowed(root). A borrow rooted at its own destination would leave d aliasing an
@@ -514,7 +519,7 @@ export class Transfer {
               if (j != i && !(j < owned.length && owned[j])) {
                 match (args[j]) {
                   OLocal(y) => {
-                    if (y == x || this.kindOf(y) == KBorrowed && this.ls[y].src == x) {
+                    if (y == x || this.kindOf(y) == KBorrowed && lsSrc(this.ls[y]) == x) {
                       this.err(
                         "borrowed argument " + this.nm(y) + " aliases consumed argument "
                             + this.nm(x),
@@ -813,7 +818,7 @@ export class Transfer {
         this.readOp(y);
         match (y) {
           OLocal(l) => {
-            if (this.kindOf(l) == KBorrowed && this.ls[l].src == x) {
+            if (this.kindOf(l) == KBorrowed && lsSrc(this.ls[l]) == x) {
               this.err(
                 "IStrAppend: " + this.nm(l) + " is borrowed from the string being appended to",
               );
@@ -841,7 +846,7 @@ export class Transfer {
         this.readOp(y);
         match (y) {
           OLocal(l) => {
-            if (this.kindOf(l) == KBorrowed && this.ls[l].src == x) {
+            if (this.kindOf(l) == KBorrowed && lsSrc(this.ls[l]) == x) {
               this.err(
                 "IArrayExtend: " + this.nm(l) + " is borrowed from the array being extended",
               );
@@ -852,12 +857,14 @@ export class Transfer {
         this.mutateOwned(x, "IArrayExtend");
       },
       IStructNew(d, _, slots) => {
+        // v2.2: an unboxed aggregate is a scalar (its slots are scalars, only read): Init, no ownership
         this.consumeAll(slots);
-        this.def(d, KUnique, 0);
+        this.def(d, this.isRefLocal(d) ? KUnique : KInit, 0);
       },
       INullary(d, _) => {
-        this.def(d, KImm, 0);
+        this.def(d, this.isRefLocal(d) ? KImm : KInit, 0);
       },
+
       ITag(d, o) => {
         match (o) {
           OLocal(l) => {
@@ -913,7 +920,7 @@ export class Transfer {
       },
       IArrayPop(d, x) => {
         this.mutateOwned(x, "IArrayPop");
-        this.def(d, KOwned, 0);
+        this.defResult(d);
       },
       IClosure(d, _, caps) => {
         this.consumeAll(caps);

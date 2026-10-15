@@ -7,8 +7,9 @@
 
 import {
   MProgram, MFunction, MType, Operand, Instr, Terminator, SwitchCase, dstOf, instrInRange,
-  termInRange, paramsWellFormed, spansAligned,
+  termInRange, paramsWellFormed, spansAligned, AGG_MAX, slotWords, readsVariant, readsPayload,
 } from "../mir";
+
 import { UnOp, BinOp, Builtin, taskOpOpensFrom, taskOpAdopts, taskOpMoves } from "../hir";
 
 // Operand/local classes.
@@ -19,8 +20,21 @@ export const CRef: int = 3;
 export const CVoid: int = 4;
 export const CFloat: int = 5;
 export const CHandle: int = 6; // resource handle (v1.8, ADR-0025)
+// Unboxed aggregates (v2.2, ADR-0038 step 1): MAgg(n) has class CAgg0 + n, so every class comparison (copies, call
+// arguments and results, returns) also compares the width.
+export const CAgg0: int = 10;
 
-@Ensures(result >= CInt && result <= CHandle)
+// A class of an unboxed aggregate (any width, also one wider than AGG_MAX: `wfFunction` rejects that local).
+export function isAggClass(c: int): bool {
+  return c >= CAgg0;
+}
+
+// A plain scalar class: what an aggregate word holds (no reference, no handle, not void, not an aggregate).
+export function isWordClass(c: int): bool {
+  return c == CInt || c == CUsize || c == CBool || c == CFloat;
+}
+
+@Ensures(result >= CInt && result <= CHandle || isAggClass(result))
 export function tyClass(t: MType): int {
   return match (t) {
     MInt => 0,
@@ -30,6 +44,7 @@ export function tyClass(t: MType): int {
     MHandle => 6,
     MRef => 3,
     MVoid => 4,
+    MAgg(n) => CAgg0 + n.toInt(),
   };
 }
 
@@ -107,7 +122,12 @@ function opIs(p: MProgram, f: MFunction, o: Operand, c: int): bool {
 }
 
 function constsOk(p: MProgram, f: MFunction, os: Operand[], isRef: bool): bool {
-  return os.every(o => opOk(p, f, o) && opClass(f, o) == CRef == isRef && opClass(f, o) != CHandle);
+  return os.every(
+    o => opOk(p, f, o)
+        && opClass(f, o) == CRef == isRef
+        && opClass(f, o) != CHandle
+        && !isAggClass(opClass(f, o)),
+  );
 }
 
 // Operand that is a *local* of class ref (OStr is not an object that can be indexed/mutated).
@@ -115,6 +135,113 @@ function refLocalOp(f: MFunction, o: Operand): bool {
   return match (o) {
     OLocal(l) => isCls(f, l, CRef),
     _ => false,
+  };
+}
+
+// ---- unboxed aggregates (v2.2): the structural rules (the verifier treats an aggregate as a scalar: `Init`) ----
+
+// Local `l` is in range and an unboxed aggregate.
+function isAggLocal(f: MFunction, l: usize): bool {
+  return l < f.locals.length && isAggClass(localClass(f, l));
+}
+
+// Operand that is a local holding an unboxed aggregate.
+function aggLocalOp(f: MFunction, o: Operand): bool {
+  return match (o) {
+    OLocal(l) => isAggLocal(f, l),
+    _ => false,
+  };
+}
+
+// The payload width n of aggregate local `l` (class CAgg0 + n).
+@Requires(isAggLocal(f, l))
+function aggWidth(f: MFunction, l: usize): usize {
+  return (localClass(f, l) - CAgg0).toUsize();
+}
+
+// None of `os` is an unboxed aggregate (a slot, an element, a capture, a boxed value or an argument through a function
+// value holds one 64-bit word or a reference: an aggregate is never stored on the heap).
+function noAggs(f: MFunction, os: Operand[]): bool {
+  return !os.some(o => aggLocalOp(f, o));
+}
+
+// The words that the slots of an aggregate built from `slots` take (a scalar one word, an MAgg(m) m + 1).
+@Requires(slots.every(o => opLocalOk(f, o)))
+function slotsWords(f: MFunction, slots: Operand[]): usize {
+  let n: usize = 0;
+  for (const o of slots) {
+    n += match (o) {
+      OLocal(l) => slotWords(f.locals[l].ty),
+      _ => 1,
+    };
+  }
+  return n;
+}
+
+// IStructNew into an aggregate: every slot a plain scalar or an aggregate (no reference, no handle, no string constant),
+// and all of them fit into the payload.
+@Requires(isAggLocal(f, d))
+function aggNewMsg(p: MProgram, f: MFunction, d: usize, slots: Operand[]): string {
+  if (!opsOk(p, f, slots)) {
+    return "IStructNew: bad slot operand";
+  }
+  if (!slots.every(o => isWordClass(opClass(f, o)) || isAggClass(opClass(f, o)))) {
+    return "IStructNew of an unboxed aggregate: a slot is a reference or a handle";
+  }
+  return slotsWords(f, slots) <= aggWidth(f, d)
+      ? ""
+      : "IStructNew of an unboxed aggregate: the slots do not fit into its words";
+}
+
+// IGetField from an aggregate: the destination is a plain scalar (one word) or an aggregate (its words), and the words
+// read lie inside the payload (`k` is a word offset).
+@Requires(isAggLocal(f, o) && d < f.locals.length)
+function aggGetMsg(f: MFunction, d: usize, o: usize, k: usize): string {
+  const c = localClass(f, d);
+  if (!isWordClass(c) && !isAggClass(c)) {
+    return "IGetField of an unboxed aggregate: the destination must be a scalar or an aggregate";
+  }
+  return k + slotWords(f.locals[d].ty) <= aggWidth(f, o)
+      ? ""
+      : "IGetField of an unboxed aggregate: word offset out of range";
+}
+
+// An aggregate is only argument 0 of an Option / Result builtin, whose result is then a plain scalar; no builtin defines
+// an aggregate.
+function aggBuiltinMsg(f: MFunction, dst: Option<usize>, b: Builtin, args: Operand[]): string {
+  const dAgg = match (dst) {
+    Some(d) => isAggLocal(f, d),
+    None => false,
+  };
+  if (dAgg) {
+    return "IBuiltin: no builtin returns an unboxed aggregate";
+  }
+  if (noAggs(f, args)) {
+    return "";
+  }
+  if (!readsVariant(b) || !noAggs(f, args.slice(1, args.length))) {
+    return "IBuiltin: an unboxed aggregate is only argument 0 of an Option / Result builtin";
+  }
+  const l = match (args[0]) {
+    OLocal(x) => x,
+    _ => 0,
+  };
+  if (readsPayload(b) && aggWidth(f, l) == 0) {
+    return "IBuiltin: unwrapping an unboxed aggregate without payload words";
+  }
+  return match (dst) {
+    Some(d) => isWordClass(localClass(f, d))
+        ? ""
+        : "IBuiltin: the payload of an unboxed aggregate is a plain scalar",
+    None => "",
+  };
+}
+
+// A call through a function value never takes or returns an aggregate (it has no signature both sides could agree on).
+function aggDst(f: MFunction, dst: Option<usize>): bool {
+  return match (dst) {
+    Some(d) => isAggLocal(f, d),
+    None => false,
   };
 }
 
@@ -128,8 +255,9 @@ function binOk(f: MFunction, op: BinOp, d: usize, a: Operand, b: Operand): bool 
     OpMul => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == ca,
     OpDiv => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == ca,
     OpRem => ca == cb && (ca == CInt || ca == CUsize) && cd == ca,
-    OpEq => ca == cb && ca != CHandle && cd == CBool,
-    OpNe => ca == cb && ca != CHandle && cd == CBool,
+    OpEq => ca == cb && ca != CHandle && !isAggClass(ca) && cd == CBool,
+    OpNe => ca == cb && ca != CHandle && !isAggClass(ca) && cd == CBool,
+
     OpLt => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
     OpLe => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
     OpGt => ca == cb && (ca == CInt || ca == CUsize || ca == CFloat) && cd == CBool,
@@ -230,6 +358,10 @@ function closureMsg(p: MProgram, f: MFunction, d: usize, fi: usize, caps: Operan
   if (!noHandles(f, caps)) {
     return "IClosure: a resource handle cannot be captured";
   }
+  if (!noAggs(f, caps)) {
+    return "IClosure: an unboxed aggregate cannot be captured";
+  }
+
   return opsOk(p, f, caps) ? "" : "IClosure: bad capture operand";
 }
 
@@ -245,9 +377,10 @@ function refPair(f: MFunction, a: usize, b: usize): bool {
   return isCls(f, a, CRef) && isCls(f, b, CRef) && a != b;
 }
 
-// `v` (a consumed/stored operand) must be well-formed and not the object being written.
+// `v` (a consumed/stored operand) must be well-formed and not the object being written; a slot never holds a handle or
+// an unboxed aggregate.
 function valueOk(p: MProgram, f: MFunction, x: usize, v: Operand): bool {
-  return opOk(p, f, v) && !isLocal(v, x) && !isHandleOp(f, v);
+  return opOk(p, f, v) && !isLocal(v, x) && !isHandleOp(f, v) && !aggLocalOp(f, v);
 }
 
 // ---- resource handles (v1.8, ADR-0025): the structural half of the rules (the dataflow half is in rules.or) ----
@@ -461,9 +594,10 @@ function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
       return "IBinary: operand class mismatch";
     },
     ICall(dst, fi, args) => callMsg(p, f, dst, fi, args),
-    IBuiltin(dst, _, args) => optDstOk(f, dst) && opsOk(p, f, args)
-        ? ""
+    IBuiltin(dst, b, args) => optDstOk(f, dst) && opsOk(p, f, args)
+        ? aggBuiltinMsg(f, dst, b, args)
         : "IBuiltin: bad local or operand",
+
     IStrAppend(x, y) => {
       if (!isCls(f, x, CRef) || !opIs(p, f, y, CRef)) {
         return "IStrAppend: needs reference operands";
@@ -483,20 +617,43 @@ function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
       return isLocal(y, x) ? "IArrayExtend: extending an array by itself" : "";
     },
     IStructNew(d, _, slots) => {
+      if (isAggLocal(f, d)) {
+        return aggNewMsg(p, f, d, slots);
+      }
       if (isCls(f, d, CRef) && !noHandles(f, slots)) {
         return "IStructNew: a resource handle cannot be stored";
+      }
+      if (isCls(f, d, CRef) && opsOk(p, f, slots) && !noAggs(f, slots)) {
+        return "IStructNew: an unboxed aggregate cannot be stored in a heap slot";
       }
       return isCls(f, d, CRef) && opsOk(p, f, slots)
           ? ""
           : "IStructNew: bad destination or slot operand";
     },
-    INullary(d, _) => isCls(f, d, CRef) ? "" : "INullary: destination must be a reference local",
-    ITag(d, o) => isCls(f, d, CInt) && opIs(p, f, o, CRef)
+    INullary(d, _) => isCls(f, d, CRef) || isAggLocal(f, d)
         ? ""
-        : "ITag: needs an int destination and a reference operand",
-    IGetField(d, o, _) => d < f.locals.length && refLocalOp(f, o)
+        : "INullary: destination must be a reference or aggregate local",
+    ITag(d, o) => isCls(f, d, CInt) && opOk(p, f, o) && (opClass(f, o) == CRef || aggLocalOp(f, o))
         ? ""
-        : "IGetField: bad destination or object",
+        : "ITag: needs an int destination and a reference or aggregate operand",
+    IGetField(d, o, k) => {
+      if (d >= f.locals.length) {
+        return "IGetField: bad destination or object";
+      }
+      match (o) {
+        OLocal(l) => {
+          if (isAggLocal(f, l)) {
+            return aggGetMsg(f, d, l, k);
+          }
+        },
+        _ => {},
+      }
+      if (isAggLocal(f, d)) {
+        return "IGetField: an aggregate is read only from an aggregate";
+      }
+      return refLocalOp(f, o) ? "" : "IGetField: bad destination or object";
+    },
+
     ISetField(x, _, v) => isCls(f, x, CRef) && valueOk(p, f, x, v)
         ? ""
         : "ISetField: bad object or value",
@@ -508,7 +665,10 @@ function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
     IArrayNew(d, isRef, elems) => isCls(f, d, CRef) && constsOk(p, f, elems, isRef)
         ? ""
         : "IArrayNew: bad destination or element class",
-    IArrayGet(d, a, i) => d < f.locals.length && refLocalOp(f, a) && opIs(p, f, i, CUsize)
+    IArrayGet(d, a, i) => d < f.locals.length
+        && !isAggLocal(f, d)
+        && refLocalOp(f, a)
+        && opIs(p, f, i, CUsize)
         ? ""
         : "IArrayGet: bad destination, array or index",
     IArraySet(x, i, v) => isCls(f, x, CRef) && opIs(p, f, i, CUsize) && valueOk(p, f, x, v)
@@ -523,10 +683,13 @@ function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
     IArrayPush(x, v) => isCls(f, x, CRef) && valueOk(p, f, x, v)
         ? ""
         : "IArrayPush: bad array or value",
-    IArrayPop(d, x) => refPair(f, d, x) ? "" : "IArrayPop: needs two distinct reference locals",
+    IArrayPop(d, x) => refPair(f, d, x) || isCls(f, x, CRef) && isCls(f, d, CAgg0 + 1)
+        ? ""
+        : "IArrayPop: needs two distinct reference locals (or an agg1 destination)",
+
     IClosure(d, fi, caps) => closureMsg(p, f, d, fi, caps),
     ICallIndirect(dst, c, args) => {
-      if (!optDstOk(f, dst) || !opsOk(p, f, args)) {
+      if (!optDstOk(f, dst) || !opsOk(p, f, args) || !noAggs(f, args) || aggDst(f, dst)) {
         return "ICallIndirect: bad destination or argument";
       }
       return refLocalOp(f, c) ? "" : "ICallIndirect: the callee must be a reference local";
@@ -541,7 +704,7 @@ function wfInstrBase(p: MProgram, f: MFunction, ins: Instr): string {
       return opIs(p, f, v, CRef) ? "" : "IIface: the boxed value must be a reference operand";
     },
     ICallVirtual(dst, c, _, args) => {
-      if (!optDstOk(f, dst) || !opsOk(p, f, args)) {
+      if (!optDstOk(f, dst) || !opsOk(p, f, args) || !noAggs(f, args) || aggDst(f, dst)) {
         return "ICallVirtual: bad destination or argument";
       }
       return refLocalOp(f, c) ? "" : "ICallVirtual: the interface value must be a reference local";
@@ -631,6 +794,15 @@ export function wfFunction(f: MFunction): string {
       return "local `" + l.name + "` has type void";
     },
     None => {},
+  }
+  match (f.locals.find(l => tyClass(l.ty) > CAgg0 + AGG_MAX.toInt())) {
+    Some(l) => {
+      return "local `" + l.name + "` is an unboxed aggregate wider than four words";
+    },
+    None => {},
+  }
+  if (tyClass(f.ret) > CAgg0 + AGG_MAX.toInt()) {
+    return "the result is an unboxed aggregate wider than four words";
   }
   if (!spansAligned(f.blocks)) {
     return "a block has a different number of source spans and instructions";
