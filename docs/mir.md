@@ -218,8 +218,9 @@ the object `o` names, through an in/out call or a consuming call on a local that
 shared: it needs `rc == 1`; this is the argument behind borrows, docs/tcb.md), or by redefining a local the claim depends on. The scan rejects the
 first group and the redefinitions; the second is the existing ownership argument. Trap semantics: the forwarded access had already succeeded on
 the same `(o, key)` in the same block, so its trap cannot fire; the checks stay where they are.
-*Dynamic check.* `orin2 compile --assert-facts` (never on by default; C and LLVM backend) emits, after every `d = s`, a call of
-`orin_assert_fact(o, key, d)` (runtime/orin_runtime.c), which reads the slot as the original `getfield` / `arrayget` would have and exits
+*Dynamic check.* `orin2 compile --assert-facts` (never on by default; C and LLVM backend) emits a call of
+`orin_assert_fact(o, key, s)` **before** each `d = s` (runtime/orin_runtime.c). It uses the original object, key and source,
+including when `d` is the key local. It reads the slot as the original `getfield` / `arrayget` would have and exits
 **70** with `internal error: --assert-facts: a forwarded load differs from the slot it was forwarded from` if the value differs. The test suites run
 under it (`run_tests.py --assert-facts`). Evidence, not proof (ADR-0032 addendum).
 *Tests.* `compiler/tests/verify_main.or` `forwardCases`, `compiler/tests/opt_test.or` (T4 section). Mutation corpus (`tools/mutate_mir.py`, run on
