@@ -1,0 +1,221 @@
+// Load forwarding (ADR-0038 lever 2, T4; docs/mir.md v2.4). The second `getfield` / `arrayget` of a scalar slot in one block
+// becomes `IForward(d, s, o, key)` (`d = s`) when an earlier load or store in the block left the slot's value in the scalar
+// local `s` and nothing has changed it since:
+//
+//     s = getfield o.1                         s = getfield o.1
+//     ...                          ==>         ...
+//     d = getfield o.1                         d = forward s, o[1u]
+//
+// The pass finds the candidate `s` (the nearest instruction that touches the slot) and asks the verifier's own rule F1
+// (`forwardJustified`, compiler/verify/forward.or) whether the claim holds; it never emits an `IForward` that rule rejects, and
+// the verifier checks the result again like that of every other pass.
+//
+// Scalar slots only. A reference slot would become `IBorrow(d, earlier)`, which is accepted only while `earlier` is still a
+// live borrow of `o`; knowing that needs the verifier's states for every position, so reference slots are not forwarded.
+// No check moves and no trap changes: the forwarded access had already succeeded on the same slot (docs/mir.md v2.4).
+
+import { MProgram, MFunction, MType, Operand, Instr } from "../mir";
+import { forwardJustified, WINDOW } from "../verify";
+import { isWordTy } from "./unbox";
+import { fnWellFormed, passKept } from "./wellformed";
+
+function isLocal(x: Operand, l: usize): bool {
+  return match (x) {
+    OLocal(m) => m == l,
+    _ => false,
+  };
+}
+
+function sameKey(a: Operand, b: Operand): bool {
+  return match (a) {
+    OLocal(x) => isLocal(b, x),
+    OUsize(x) => match (b) {
+      OUsize(y) => x == y,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// The local that holds slot `key` of `o` right after `ins`, when `ins` is a load of that slot or a store of a local into it.
+function holder(ins: Instr, o: usize, key: Operand): Option<usize> {
+  match (ins) {
+    IGetField(d, x, k) => {
+      if (isLocal(x, o) && sameKey(key, OUsize(k.toInt()))) {
+        return Some(d);
+      }
+    },
+    IArrayGet(d, x, i) => {
+      if (isLocal(x, o) && sameKey(key, i)) {
+        return Some(d);
+      }
+    },
+    IForward(d, _, x, i) => {
+      if (isLocal(x, o) && sameKey(key, i)) {
+        return Some(d);
+      }
+    },
+    ISetField(x, k, v) => {
+      if (x == o && sameKey(key, OUsize(k.toInt()))) {
+        return localOf(v);
+      }
+    },
+    IArraySet(x, i, v) => {
+      if (x == o && sameKey(key, i)) {
+        return localOf(v);
+      }
+    },
+    _ => {},
+  }
+  return None;
+}
+
+function localOf(o: Operand): Option<usize> {
+  return match (o) {
+    OLocal(l) => Some(l),
+    _ => None,
+  };
+}
+
+function loadOk(f: MFunction, d: usize, o: usize): bool {
+  return isWordTy(f.locals[d].ty) && sameRef(f.locals[o].ty);
+}
+
+function sameRef(t: MType): bool {
+  return match (t) {
+    MRef => true,
+    _ => false,
+  };
+}
+
+function sameTy(a: MType, b: MType): bool {
+  return match (a) {
+    MInt => match (b) {
+      MInt => true,
+      _ => false,
+    },
+    MUsize => match (b) {
+      MUsize => true,
+      _ => false,
+    },
+    MBool => match (b) {
+      MBool => true,
+      _ => false,
+    },
+    MFloat => match (b) {
+      MFloat => true,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// The nearest holder of (o, key) within the window before position `at` of block `bi`, if any.
+function nearestHolder(f: MFunction, bi: usize, at: usize, o: usize, key: Operand): Option<usize> {
+  const instrs = f.blocks[bi].instrs;
+  let i = at;
+  let n: usize = 0;
+  while (i > 0 && n < WINDOW) {
+    i -= 1;
+    n += 1;
+    match (holder(instrs[i], o, key)) {
+      Some(s) => {
+        return Some(s);
+      },
+      None => {},
+    }
+  }
+  return None;
+}
+
+// The `IForward` that replaces the load at position `at` of block `bi`, if the load is a scalar one and rule F1 accepts it.
+function forwarded(p: MProgram, f: MFunction, bi: usize, at: usize): Option<Instr> {
+  match (f.blocks[bi].instrs[at]) {
+    IGetField(d, x, k) => {
+      return tryForward(p, f, bi, at, d, x, OUsize(k.toInt()));
+    },
+    IArrayGet(d, x, i) => {
+      return tryForward(p, f, bi, at, d, x, i);
+    },
+    _ => {},
+  }
+  return None;
+}
+
+function tryForward(
+  p: MProgram,
+  f: MFunction,
+  bi: usize,
+  at: usize,
+  d: usize,
+  x: Operand,
+  key: Operand,
+): Option<Instr> {
+  match (x) {
+    OLocal(o) => {
+      if (loadOk(f, d, o)) {
+        match (nearestHolder(f, bi, at, o, key)) {
+          Some(s) => {
+            if (s != d && sameTy(f.locals[s].ty, f.locals[d].ty) && forwardJustified(p, f, bi, at, s, x, key)) {
+              return Some(IForward(d, s, x, key));
+            }
+          },
+          None => {},
+        }
+      }
+    },
+    _ => {},
+  }
+  return None;
+}
+
+// `f` with every forwardable scalar load replaced by an `IForward`. The loads are visited in block and instruction order on
+// the function as rewritten so far, so a forward is itself a source for the loads after it.
+@Requires(fnWellFormed(p, f))
+@Ensures(fnWellFormed(p, result) && passKept(f, result))
+export function forwardLoads(p: MProgram, f: MFunction): MFunction {
+  let g = f;
+  let bi: usize = 0;
+  while (bi < g.blocks.length) {
+    let i: usize = 0;
+    while (i < g.blocks[bi].instrs.length) {
+      match (forwarded(p, g, bi, i)) {
+        Some(r) => {
+          g.blocks[bi].instrs[i] = r;
+        },
+        None => {},
+      }
+      i += 1;
+    }
+    bi += 1;
+  }
+  return g;
+}
+
+// `p` with `forwardLoads` applied to every function (each reads only `p` and itself, so the order does not matter).
+@Requires(p.functions.every(f => fnWellFormed(p, f)))
+export function forwardProgram(p: MProgram): MProgram {
+  return MProgram {
+    functions: p.functions.map(f => forwardLoads(p, f)),
+    strings: p.strings,
+    main: p.main,
+    vtables: p.vtables,
+    inlineFns: p.inlineFns,
+  };
+}
+
+// The number of `IForward` instructions of `f`.
+export function forwardCount(f: MFunction): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IForward(_, _, _, _) => {
+          n += 1;
+        },
+        _ => {},
+      }
+    }
+  }
+  return n;
+}

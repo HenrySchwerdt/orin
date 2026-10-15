@@ -599,6 +599,7 @@ function sInstr(i: Instr): Instr {
     IArrayPut(x, k, y) => IArrayPut(x + 1, so(k), y + 1),
     IArrayPush(x, o) => IArrayPush(x + 1, so(o)),
     IArrayPop(d, x) => IArrayPop(d + 1, x + 1),
+    IForward(d, x, o, k) => IForward(d + 1, x + 1, so(o), so(k)),
     IClosure(d, f, caps) => IClosure(d + 1, f, sos(caps)),
     ICallIndirect(d, c, args) => ICallIndirect(sd(d), so(c), sos(args)),
     IIface(d, v, o) => IIface(d + 1, v, so(o)),
@@ -1097,8 +1098,95 @@ function robustnessCases(): usize {
   return bad;
 }
 
+// Load forwarding, rule F1 (docs/mir.md v2.4, ADR-0038 lever 2 T4). Locals: 0 = the object `o` (a record of two ints, or an
+// array of three), 1 = the scalar `s` that holds a slot, 2 = the forwarded `d`, 3 = an int `w`, 4 = an index `i`.
+function cnt(ok: bool): usize { return ok ? 0 : 1; }
+
+function fwd(name: string, instrs: Instr[]): bool {
+  return pos("forward " + name, straight(0, [lr("o"), li("s"), li("d"), li("w"), lu("i")], instrs));
+}
+
+function nfwd(name: string, instrs: Instr[]): bool {
+  return neg("forward " + name, straight(0, [lr("o"), li("s"), li("d"), li("w"), lu("i")], instrs), "unjustified forward");
+}
+
+function rec(): Instr { return IStructNew(0, 0, [OInt(1), OInt(2)]); }
+function arr(): Instr { return IArrayNew(0, false, [OInt(1), OInt(2), OInt(3)]); }
+function load0(): Instr { return IGetField(1, OLocal(0), 0); }
+function fwd0(): Instr { return IForward(2, 1, OLocal(0), OUsize(0)); }
+function done(): Instr { return IRelease(0); }
+
+function callProg(instrs: Instr[]): MProgram {
+  return prog([fn("f", 0, [lr("o"), li("s"), li("d"), li("w"), lu("i")], MVoid, [bk(instrs, ret())]), gVoid()]);
+}
+
+function forwardCases(): usize {
+  let bad: usize = 0;
+  // accepted
+  bad += cnt(fwd("after a load of the same field", [rec(), load0(), fwd0(), done()]));
+  bad += cnt(fwd("after a store of the local into the field", [
+    rec(), ICopy(1, OInt(7)), ISetField(0, 1, OLocal(1)), IForward(2, 1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(fwd("across a write to another field (positive control)", [
+    rec(), load0(), ICopy(3, OInt(9)), ISetField(0, 1, OLocal(3)), fwd0(), done()]));
+  bad += cnt(fwd("across makeunique of the object", [rec(), load0(), IMakeUnique(0), fwd0(), done()]));
+  bad += cnt(pos("forward across a call that does not receive the object", callProg([rec(), load0(), ICall(None, 1, [OStr(0)]), fwd0(), done()])));
+  bad += cnt(fwd("after an array load, constant index", [
+    arr(), IArrayGet(1, OLocal(0), OUsize(1)), IForward(2, 1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(fwd("after an array load, local index", [
+    arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), IForward(2, 1, OLocal(0), OLocal(4)), done()]));
+  bad += cnt(fwd("across an array store at a different constant index", [
+    arr(), IArrayGet(1, OLocal(0), OUsize(1)), ICopy(3, OInt(5)), IArraySet(0, OUsize(2), OLocal(3)),
+    IForward(2, 1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(fwd("after a forward (a forward is a source)", [
+    rec(), load0(), fwd0(), IForward(3, 2, OLocal(0), OUsize(0)), done()]));
+  // rejected
+  bad += cnt(nfwd("across a write to the same field", [rec(), load0(), ICopy(3, OInt(9)), ISetField(0, 0, OLocal(3)), fwd0(), done()]));
+  bad += cnt(nfwd("after the object was redefined", [rec(), load0(), done(), rec(), fwd0(), done()]));
+  bad += cnt(nfwd("after the source was redefined", [rec(), load0(), ICopy(1, OInt(5)), fwd0(), done()]));
+  bad += cnt(nfwd("across an array push", [
+    arr(), IArrayGet(1, OLocal(0), OUsize(1)), IArrayPush(0, OInt(4)), IForward(2, 1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(nfwd("for another field", [rec(), load0(), IForward(2, 1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(nfwd("with no earlier access", [rec(), fwd0(), done()]));
+  bad += cnt(neg("forward across a call that receives the object", callProg([rec(), load0(), ICall(None, 1, [OLocal(0)]), fwd0(), done()]), "unjustified forward"));
+  bad += cnt(nfwd("across an array store at an index that may be the same", [
+    arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OUsize(1)), ICopy(3, OInt(5)), IArraySet(0, OLocal(4), OLocal(3)),
+    IForward(2, 1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(nfwd("after the index local was redefined", [
+    arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), ICopy(4, OUsize(2)), IForward(2, 1, OLocal(0), OLocal(4)), done()]));
+  // the source load redefines its own index local (`i = arrayget o[i]`): `o[i]` now names another element
+  bad += cnt(neg("forward after a load that redefines its index", straight(0, [lr("o"), lu("s"), lu("d")], [
+    IArrayNew(0, false, [OUsize(1), OUsize(0)]), ICopy(1, OUsize(0)), IArrayGet(1, OLocal(0), OLocal(1)),
+    IForward(2, 1, OLocal(0), OLocal(1)), done()]), "unjustified forward"));
+  bad += cnt(neg("forward after a forward that redefines its index", straight(0, [lr("o"), lu("s"), lu("d")], [
+    IArrayNew(0, false, [OUsize(1), OUsize(0)]), ICopy(1, OUsize(0)), IArrayGet(2, OLocal(0), OLocal(1)),
+    IForward(1, 2, OLocal(0), OLocal(1)), IForward(2, 1, OLocal(0), OLocal(1)), done()]), "unjustified forward"));
+  bad += cnt(nfwd("from a load into another local", [
+    rec(), load0(), IGetField(3, OLocal(0), 0), fwd0(), done()]));
+  bad += cnt(neg("forward across blocks", prog([fn("f", 0, [lr("o"), li("s"), li("d")], MVoid, [
+    bk([rec(), load0()], TGoto(1)), bk([fwd0(), done()], ret())])]), "unjustified forward"));
+  bad += cnt(neg("forward of a dead source", straight(0, [lr("o"), li("s"), li("d")], [rec(), fwd0(), done()]), "unjustified forward"));
+  bad += cnt(neg("forward with a reference destination", straight(0, [lr("o"), lr("s"), lr("d")], [
+    rec(), IGetField(1, OLocal(0), 0), IForward(2, 1, OLocal(0), OUsize(0)), done()]), "IForward: destination and source must be scalars"));
+  bad += cnt(neg("forward from a source of another class", straight(0, [lr("o"), li("s"), lu("d")], [
+    rec(), load0(), fwd0(), done()]), "IForward: destination and source must be scalars"));
+  // the window is 64 instructions
+  let near: Instr[] = [rec(), load0()];
+  let far: Instr[] = [rec(), load0()];
+  let k: usize = 0;
+  while (k < 70) {
+    if (k < 60) { near.push(ICopy(3, OInt(1))); }
+    far.push(ICopy(3, OInt(1)));
+    k += 1;
+  }
+  near.push(fwd0()); near.push(done());
+  far.push(fwd0()); far.push(done());
+  bad += cnt(fwd("within the window of 64 instructions", near));
+  bad += cnt(nfwd("beyond the window of 64 instructions", far));
+  return bad;
+}
+
 function main(): void {
-  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases();
+  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases() + forwardCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

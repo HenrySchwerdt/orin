@@ -68,7 +68,8 @@ executed instructions, -93% retains; census numbers and the lever ranking in
    addendum "lever 2"): `make_unique` + `struct_get` / `struct_replace` per field write and repeated bounds-checked element
    reads (mutres 10.6x C instructions, pqueue 4.8x, nbody 3.7x, sieve 3.4x). Done: T3 (scalar stores without the run-time
    refmask test) and the `orin_stats` hot counters as a build option (#79); T1 (drop `makeunique` of a local proven `Unique`:
-   nbody -13.8%, sieve -10.4% instructions). Next T4 (in progress), T5, T2 with the new verifier rules F1, U2-U5, U1;
+   nbody -13.8%, sieve -10.4% instructions); T4 (load forwarding: MIR v2.4 `IForward`, verifier rule F1, `orin2 compile --assert-facts`;
+   nbody -6.0%, mutres +0.05% instructions, the other three unchanged, self-compile unchanged; 77 forwarded loads in the compiler itself). Next T5, T2 with the new verifier rules U2-U5, U1;
    T6 (range facts) needs its own decision.
    Lever 1 (verifier and optimiser data structures) is done: self-compile -23% allocations, -3.2% instructions; the
    remaining self-compile time is no longer allocation.

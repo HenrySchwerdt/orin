@@ -323,14 +323,17 @@ export class LlvmFunctionEmitter {
   private f: MFunction;
   private lines: string[];
   private wrapper: string;
+  private facts: bool;
 
-  constructor(syms: LlvmSymbols, prog: MProgram, fi: usize) {
+  // `facts`: the `--assert-facts` build, which checks every `IForward` against the slot it was forwarded from.
+  constructor(syms: LlvmSymbols, prog: MProgram, fi: usize, facts: bool) {
     this.syms = syms;
     this.prog = prog;
     this.fi = fi;
     this.f = prog.functions[fi];
     this.lines = [];
     this.wrapper = "";
+    this.facts = facts;
   }
 
   private opTy(o: Operand): MType {
@@ -1123,6 +1126,9 @@ export class LlvmFunctionEmitter {
               ? "  call void @orin_array_pop_v(ptr " + p + "u, ptr %l" + u(d) + ")\n"
               : "  " + p + "r = call ptr @orin_array_pop(ptr " + p + "u)\n" + this.st(d, p + "r")),
 
+      // Operand 0 holds the source; assertion operands 1/2 load the original object/index before d changes.
+      IForward(d, s, o, k) => this.ld(p, 0, OLocal(s))
+          + (this.facts ? this.assertFactI(p, s, o, k) : "") + this.st(d, ov(p, 0, OLocal(s))),
       IClosure(d, f, caps) => this.closureI(p, d, f, caps),
       ICallIndirect(d, f, args) => this.callIndirectI(p, d, f, args),
       IIface(d, vt, v) => this.ifaceI(p, d, vt, v),
@@ -1152,6 +1158,14 @@ export class LlvmFunctionEmitter {
       },
       TTrap(m) => this.trapRet(p, this.syms.message(m)),
     };
+  }
+
+  // `--assert-facts`: check the pre-instruction slot before IForward writes its destination (which can be key).
+  // The caller already loaded s into %<p>o0; operands 1/2 and the optional slot conversion use distinct names.
+  private assertFactI(p: string, s: usize, o: Operand, k: Operand): string {
+    return this.ld(p, 1, o) + this.ld(p, 2, k) + this.asSlot(p, 0, OLocal(s))
+        + "  call void @orin_assert_fact(ptr " + ov(p, 1, o) + ", i64 " + ov(p, 2, k) + ", i64 "
+        + this.slotVal(p, 0, OLocal(s)) + ")\n";
   }
 
   private switchI(p: string, o: Operand, cases: SwitchCase[], d: usize): string {
@@ -1357,7 +1371,19 @@ export class LlvmFunctionEmitter {
     && result.endsWith("}\n\n"))
 @Ensures(llvmRefsDeclared(result, syms))
 export function emitLlvmFunction(syms: LlvmSymbols, prog: MProgram, fi: usize): string {
-  let e = new LlvmFunctionEmitter(syms, prog, fi);
+  return emitLlvmFunctionWith(syms, prog, fi, false);
+}
+
+// `emitLlvmFunction`, and with `facts` (`--assert-facts`) a call of `orin_assert_fact` after every `IForward`.
+@Requires(fi < prog.functions.length
+    && syms.count() == prog.functions.length
+    && trapsIndexed(prog, syms))
+@Ensures(result.startsWith("define internal ")
+    && result.includes(" @" + syms.name(fi) + "(")
+    && result.endsWith("}\n\n"))
+@Ensures(llvmRefsDeclared(result, syms))
+export function emitLlvmFunctionWith(syms: LlvmSymbols, prog: MProgram, fi: usize, facts: bool): string {
+  let e = new LlvmFunctionEmitter(syms, prog, fi, facts);
   e.run();
   return e.text();
 }

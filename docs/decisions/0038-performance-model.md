@@ -438,6 +438,20 @@ relational fact the interval domain of T6 cannot prove, so its bounds check stay
 
 #### T4. Load forwarding
 
+**Status (2026-10-15): implemented** (branch `claude/project-thread-niggkx-t4-forward`; MIR v2.4, rule F1 in `compiler/verify/forward.or`,
+pass `compiler/opt/forward.or`, `orin2 compile --assert-facts`, mutation classes `fwd-*`; measurements below)
+Measured (valgrind, executed instructions, orin2 of main c544cfa against the same plus T4): nbody 1,491.4M -> 1,402.4M (-5.97 %, 9 forwarded loads),
+mutres 2,540.3M -> 2,541.6M (+0.05 %, 3 forwards: the saved loads are not on the hot path and the extra copy costs a little), pqueue (1 forward), qsort_inplace
+and sieve (0): unchanged; self-compile 24,080.36M -> 24,080.23M (-0.001 %; the gate is +1 %). The estimate in the table above (-20 on nbody per pair, -3 on mutres) was
+optimistic for mutres. Census: allocs, retains, releases, cow_* identical on all five benchmarks (built with `-DORIN_STATS_ENABLED`); the generated C differs
+only at the forwarded loads (77 in `compiler/main.or`). Deviations from the
+text below, all on the conservative side: an `IForward` is also a source for the forwards after it (otherwise the third load of a slot could never be
+forwarded); the scan is an allow-list (an instruction that mentions `o` and is not one of the listed harmless reads ends it); reference slots
+(`IBorrow(d, earlier)`) are not forwarded: accepting that needs the verifier's state at every position, so the pass leaves them as they are; the
+object of an `IForward` must be a reference local (an unboxed aggregate is already in registers); a load that overwrites its own index local
+(`i = arrayget o[i]`) is not a source (found in review: the first version accepted it). Lean lemmas: `formal/Orin/Forward.lean`
+(`load_load`, `store_load`, `store_frame_other_slot`, `store_frame_other_local`, `makeUnique_frame`).
+
 - *MIR change:* v2.4. `IForward(d, s, o, key)`: `d = s` (a scalar copy), claiming that `s` holds the current value of slot
   `key` of `o` (a field index, or an array index operand). It is emitted in place of the second `getfield` / `arrayget` of a
   scalar slot. Emitters: `d = s`.

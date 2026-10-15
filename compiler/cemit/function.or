@@ -309,13 +309,16 @@ export class CFunctionEmitter {
   private fi: usize;
   private f: MFunction;
   private lines: string[];
+  private facts: bool;
 
-  constructor(syms: CSymbols, prog: MProgram, fi: usize) {
+  // `facts`: the `--assert-facts` build, which checks every `IForward` against the slot it was forwarded from.
+  constructor(syms: CSymbols, prog: MProgram, fi: usize, facts: bool) {
     this.syms = syms;
     this.prog = prog;
     this.fi = fi;
     this.f = prog.functions[fi];
     this.lines = [];
+    this.facts = facts;
   }
 
   private ty(l: usize): MType {
@@ -483,6 +486,11 @@ export class CFunctionEmitter {
               ? "orin_array_pop_v(" + lname(x) + ", " + lname(d) + ".w);"
               : lname(d) + " = orin_array_pop(" + lname(x) + ");"),
 
+      // Check the pre-instruction slot: d may also be the index local k.
+      IForward(d, s, o, k) => (this.facts
+          ? "orin_assert_fact(" + opC(o) + ", " + opC(k) + ", " + this.slotOf(OLocal(s)) + "); "
+          : "")
+          + lname(d) + " = " + lname(s) + ";",
       IClosure(d, g, caps) => this.closure(d, g, caps),
       ICallIndirect(d, c, args) => this.callThrough(
         d,
@@ -677,7 +685,15 @@ export function linesOfBlocks(blocks: MBlock[]): usize {
 @Ensures(result.startsWith(syms.sig(fi) + " {\n") && result.endsWith("}\n"))
 @Ensures(refsDeclared(result, syms))
 export function emitCFunction(syms: CSymbols, prog: MProgram, fi: usize): string {
-  let e = new CFunctionEmitter(syms, prog, fi);
+  return emitCFunctionWith(syms, prog, fi, false);
+}
+
+// `emitCFunction`, and with `facts` (`--assert-facts`) a check of the forwarded value after every `IForward`.
+@Requires(fi < prog.functions.length && syms.count() == prog.functions.length)
+@Ensures(result.startsWith(syms.sig(fi) + " {\n") && result.endsWith("}\n"))
+@Ensures(refsDeclared(result, syms))
+export function emitCFunctionWith(syms: CSymbols, prog: MProgram, fi: usize, facts: bool): string {
+  let e = new CFunctionEmitter(syms, prog, fi, facts);
   e.run();
   return e.text();
 }

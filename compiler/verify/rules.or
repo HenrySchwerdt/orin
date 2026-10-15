@@ -11,6 +11,7 @@ import {
   KOwned, KUnique, KImm, KBorrowed, KParam, KInit, KMaybeLeak, KMaybeDead, KOpen, KMaybeOpen,
 } from "./state";
 import { CRef, CHandle, localClass, wfInstr, wfTerm } from "./wf";
+import { forwardJustified } from "./forward";
 
 // One step of the replay used by the optimiser (compiler/opt/calls.or): the position, the state before the
 // instruction and the issues so far. `step` runs one instruction on it.
@@ -940,6 +941,26 @@ export class Transfer {
       IArrayPop(d, x) => {
         this.mutateOwned(x, "IArrayPop");
         this.defResult(d);
+      },
+      IForward(d, s, o, k) => {
+        // v2.4, rule F1 (forward.or): `s` holds the current value of slot `k` of `o`; `d` is a plain copy of it
+        this.readLocal(s);
+        this.readOp(k);
+        match (o) {
+          OLocal(l) => {
+            this.readLocal(l);
+            if (holeMayIn(this.holes, l, holeKey(k))) {
+              this.err("read of a slot of " + this.nm(l) + " that is (or may be) taken");
+            }
+          },
+          _ => {},
+        }
+        if (!forwardJustified(this.prog, this.f, this.blk, this.ins, s, o, k)) {
+          this.err(
+            "unjustified forward: no load or store of the same slot reaches it unchanged within the block",
+          );
+        }
+        this.def(d, KInit, 0);
       },
       IClosure(d, _, caps) => {
         this.consumeAll(caps);

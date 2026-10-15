@@ -42,6 +42,7 @@ mkdir -p build
   # optimiser and code generator unit tests (3d): passes, inference, pruning, emitters, symbol tables, rule 8
   echo '$ORIN2 test compiler/tests/opt_test.or --runtime runtime'
   echo '$ORIN2 test compiler/tests/emit_test.or --runtime runtime'
+  echo 'python3 tools/test_forward_assert.py --orinc "$ORIN2"'
   # unboxing (ADR-0038 step 1): the eligibility rule, the verifier's aggregate rules, both backends, the pair release fix
   echo '$ORIN2 test compiler/tests/unbox_test.or --runtime runtime'
   # syntax unit tests (3c): Lexer, Parser progress and spans, operator table, well-formedness predicates, garbage input

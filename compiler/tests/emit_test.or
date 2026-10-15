@@ -20,11 +20,11 @@ import { optimize, pruneProgram } from "../opt";
 import {
   emitC, joinC, emittable, indices, CSymbols, cSymbols, refsDeclared, symbolsWellFormed,
   namesDefined, emitCFunction, sanitize, fnSymbol, commentSafe, cString, cStringValue, refMask,
-  maskAll, identChars, inoutArgOk, targetsBelow,
+  maskAll, identChars, inoutArgOk, targetsBelow, emitCFacts,
 } from "../cemit";
 import {
   emitLlvm, joinLlvm, LlvmSymbols, llvmSymbols, trapsIndexed, introducedNames, llvmRefsDeclared,
-  globalsDefined, emitLlvmFunction, llStr, llStrValue, prelude, declares, fixedMsgs,
+  globalsDefined, emitLlvmFunction, llStr, llStrValue, prelude, declares, fixedMsgs, emitLlvmFacts,
 } from "../llvm";
 
 // ---------------------------------------------------------------- builders
@@ -377,4 +377,100 @@ function aSmallRecursiveFunctionWithAnEarlyReturnIsSplitIntoWrapperAndBody(): vo
   const q = fibLike(false);
   const plain = emitLlvmFunction(llvmSymbols(q), q, 1);
   assert(!plain.includes(".body"), "a function that does not call itself is not split");
+}
+
+// `IForward` (docs/mir.md v2.4): a plain copy in both backends; with `--assert-facts` also a call of `orin_assert_fact` on the
+// original object, key and slot bits of the source before the destination is written.
+function forwarding(): MProgram {
+  const f = MFunction {
+    name: "main",
+    paramCount: 0,
+    paramOwned: [],
+    inout: false,
+    locals: [lr("o"), MLocal { name: "s", ty: MInt }, MLocal { name: "d", ty: MInt }],
+    ret: MVoid,
+    blocks: [
+      bk(
+        [IStructNew(0, 0, [OInt(1)]), IGetField(1, OLocal(0), 0), IForward(2, 1, OLocal(0), OUsize(0)), IRelease(0)],
+        TReturn(None),
+      ),
+    ],
+  };
+  return MProgram { functions: [f], strings: [], main: 0, vtables: [], inlineFns: [] };
+}
+
+@Test
+function aForwardedLoadIsACopyAndTheFactsBuildChecksIt(): void {
+  const p = forwarding();
+  const c = emitC(p);
+  assert(c.includes("l2 = l1;"), "C: a copy");
+  assert(!c.includes("orin_assert_fact"), "C: no check in a normal build");
+  const cf = emitCFacts(p, true);
+  assert(
+    cf.includes("orin_assert_fact(l0, ((uint64_t)0ULL), ((uint64_t)(l1))); l2 = l1;"),
+    "C: the check reads the source before copying it",
+  );
+  assert(emitCFacts(p, false) == c, "C: facts off is the normal build");
+  const ll = emitLlvm(p);
+  assert(!ll.includes("orin_assert_fact"), "LLVM: no check in a normal build");
+  const lf = emitLlvmFacts(p, true);
+  assert(lf.includes("call void @orin_assert_fact(ptr "), "LLVM: the check");
+  assert(lf.includes("declare void @orin_assert_fact(ptr, i64, i64)"), "LLVM: declared");
+  assert(llvmRefsDeclared(lf, llvmSymbols(p)), "LLVM: every global is declared");
+  assert(emitLlvmFacts(p, false) == ll, "LLVM: facts off is the normal build");
+}
+
+// The destination is also the array index: the fact refers to its value BEFORE the copy.
+// Exported so tools/test_forward_assert.py can execute this exact verifier-accepted MIR on both backends.
+export function forwardingOntoIndex(initial: usize): MProgram {
+  const expected: usize = initial == 0 ? 1 : 0;
+  const f = fn(
+    "main",
+    [
+      lr("o"),
+      MLocal { name: "k", ty: MUsize },
+      MLocal { name: "s", ty: MUsize },
+      MLocal { name: "ok", ty: MBool },
+    ],
+    [
+      bk(
+        [
+          IArrayNew(0, false, [OUsize(1), OUsize(0)]),
+          ICopy(1, OUsize(initial.toInt())),
+          IArrayGet(2, OLocal(0), OLocal(1)),
+          IForward(1, 2, OLocal(0), OLocal(1)),
+          IRelease(0),
+          IBinary(3, OpEq, OLocal(1), OUsize(expected.toInt())),
+        ],
+        TBranch(OLocal(3), 1, 2),
+      ),
+      bk([], TReturn(None)),
+      bk([], TTrap("forward did not copy the source")),
+    ],
+  );
+  return MProgram { functions: [f], strings: [], main: 0, vtables: [], inlineFns: [] };
+}
+
+@Test
+function cForwardChecksTheOriginalIndexBeforeWritingIt(): void {
+  const p = forwardingOntoIndex(0);
+  const text = emitCFacts(p, true);
+  assert(
+    text.includes("orin_assert_fact(l0, l1, ((uint64_t)(l2))); l1 = l2;"),
+    "the fact uses the original index and source before the destination is overwritten",
+  );
+}
+
+@Test
+function llvmForwardChecksTheOriginalIndexBeforeWritingIt(): void {
+  const p = forwardingOntoIndex(0);
+  const text = emitLlvmFacts(p, true);
+  const checkAt = text
+      .indexOf("  call void @orin_assert_fact(ptr %b0i3o1, i64 %b0i3o2, i64 %b0i3o0)")
+      .unwrap();
+  const storeAt = text.indexOf("  store i64 %b0i3o0, ptr %l1").unwrap();
+  assert(
+    checkAt < storeAt,
+    "the assertion must read the original index before the destination store",
+  );
 }
