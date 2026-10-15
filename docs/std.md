@@ -870,3 +870,8 @@ above; a pool lives for one call (worker threads are started per operation, abou
 * Diagnostics print std types with their unit name (`$stdlib/graph.GraphId<int>`).
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
+
+## std:encoding
+
+Strict byte-based Hex, Base64 and Base64URL codecs with explicit padding policy
+and structured errors containing byte offsets. See [API, errors and complexity](std-encoding.md).
