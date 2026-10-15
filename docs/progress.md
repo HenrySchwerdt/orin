@@ -54,3 +54,38 @@ ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), ~~resources~~ (done, ADR-0025), ~~generic classes~~ (done, ADR-0026: all language-freeze prerequisites are in; the language freeze and the compiler rewrite of ADR-0015 can start); capabilities (ADR-0021 Stage A, ADR-0027: done) → std I/O freeze (owner decision, open questions in ADR-0027).
 3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a, 3b (verifier), 3c, 3d (optimiser and both backends, per-function code generation ready for ADR-0039 `.parallel()`) and 3e (tooling) done (3a added MIR source spans, ADR-0020 D3; 3c the lexer and parser); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...).
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.
+
+## Open work, in order (handoff 2026-10-14)
+1. **Unboxing (ADR-0038 step 1), [PR #62](https://github.com/HenrySchwerdt/orin/pull/62)**, branch
+   `worktree-agent-acf1c47e958560311`.
+   - **Done:** MIR v2.2 `MAgg(n)` (`compiler/opt/unbox.or`), verifier rules, C/LLVM by-value passing, and the
+     `opt/pairs.or` fix for result pairs that are moved before they are destructured.
+   - **Blocking:** CI `assurance` is red. `tools/mutate_mir.py` reports 16 rejected baselines: unbox puts an
+     aggregate into a builtin argument other than 0, and the verifier rule forbids that (e.g.
+     `float_records_unions_options.main:b0:i76`). Fix it in unbox or relax the rule with a test.
+   - **Before merging:** run `mutate_mir.py` locally, then measure with `tools/alloc_census.py` and compare
+     with `docs/perf/alloc-census.md`.
+2. **CI:** split the `backends` job, the new bottleneck at about 12 minutes since `diff_backends --mode fuse`, into
+   shards, like the http mutants.
+3. **Fusion follow-up:**
+   - Make the verifier cheaper on long fused functions. The self-compile currently takes +0.84 % instructions
+     with fusion.
+   - Declare the runtime entry points that `.parallel()` uses in `compiler/llvm/runtime.or`, instead of
+     multiplexing them over `transfer_count` / `transitPut`.
+4. **Performance wave (ADR-0038 order):**
+   - escape analysis + stack allocation / scalar replacement;
+   - borrow inference (85 % of the HTTP server's RC ops are `this` taken owned but only read);
+   - regions / freeze (bintrees).
+
+   The census ranks these levers.
+5. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
+   global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.
+6. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
+   `.parallel()` per compiler phase (ADR-0039 §6).
+7. **Follow-ups:**
+   - `HStmt` spans for break/continue/return;
+   - trap hook and cancellation for tasks (prerequisite for ADR-0041 Stage D);
+   - ADR-0040 (generic methods);
+   - ADR-0037 D5;
+   - ADR-0042 stage 1 (complexity summaries);
+   - decide whether a struct with more than 64 slots is a compile-time error (it currently traps at run time).
