@@ -64,7 +64,7 @@ export function ox(): Markup<Html> {
     wrap: trustHtml, embed: render, embedAll: joinAll, text: escape, attr: escape,
     rules: [AttrRule { names: ["href", "src", "action", ...], prefix: "", convert: Some(escapeUrl) },
             AttrRule { names: [], prefix: "on", convert: None }],
-    escapes: [Escape { from: "&", to: "&amp;" }, Escape { from: "<", to: "&lt;" }, ...],
+    escapes: [Escape { char: "&", encoded: "&amp;" }, Escape { char: "<", encoded: "&lt;" }, ...],
     voidTags: ["area", "base", "br", ...], voidEnd: ">", rawTextTags: ["script", "style"], presenceAttrs: true,
   };
 }
@@ -79,7 +79,7 @@ constant because top-level constants are scalar literals.
 The protocol types live in the new module **`std:ox`** (types only, no code):
 
 ```ts
-export type Escape = { from: string; to: string; };                       // one byte -> its encoding
+export type Escape = { char: string; encoded: string; };                  // one byte -> its encoding
 export type AttrRule = { names: string[]; prefix: string; convert: Option<(value: string) => string>; };
 export type Markup<R> = {
   wrap: (markup: string) => R;           // the finished text of a root -> the result value
@@ -177,7 +177,7 @@ As ADR-0043 §2 / §3, with every HTML rule taken from the provider (`P` = the p
 
 A rule matches attribute `a` when `a` is in `names` or starts with a non-empty `prefix`, both compared ASCII
 case-insensitively (HTML attribute names are case-insensitive: `HREF={u}` is a URL attribute, which ADR-0043 missed).
-The static encoding replaces each byte listed in `P.escapes` by its `to` text.
+The static encoding replaces each byte listed in `P.escapes` by its `encoded` text.
 
 Tag names start with a lower-case ASCII letter and continue with letters, digits, `-` and `_`; attribute names start
 with a letter (E0494 otherwise). These are the notation's lexical rules, not HTML's.
