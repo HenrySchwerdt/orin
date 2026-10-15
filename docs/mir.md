@@ -199,7 +199,8 @@ Mutation corpus: `inout-drop-receiver`, `inout-release-receiver` (tools/mutate_m
 `d = forward s, o[key]` is accepted when a backward scan of **the same block**, over at most 64 instructions (`WINDOW` in `forward.or`),
 finds the *source* before anything that could have changed the slot. Going back from the `forward`, each instruction is classified:
 - **source** (accepted): a load of the slot `(o, key)` into `s` (`getfield`, `arrayget`, or an `IForward` into `s`: it was itself checked, so a chain
-  of forwards is justified step by step), or a store of the local `s` into the slot (`setfield o.k = s`, `arrayset o[key] = s`). The slot is the
+  of forwards is justified step by step), or a store of the local `s` into the slot (`setfield o.k = s`, `arrayset o[key] = s`). A load
+  that overwrites its own index local (`i = arrayget o[i]`) is not a source: after it, `o[i]` names another element; it ends the scan. The slot is the
   same when the field index / array index is the same constant or the same local.
 - **no change** (the scan goes on): an instruction that does not mention `o` (including calls and builtins that do not receive `o`: a live
   reference to `o` excludes an in-place write by the callee, which needs `rc == 1`); `IMakeUnique(o)` (a shallow copy keeps every slot);
