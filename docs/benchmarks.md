@@ -699,7 +699,7 @@ page lengths (about 144.6 MB in all) and hashes the last page. Every 7th name co
 characters are escaped) and every 11th URL is `javascript:alert(i)`, which the Go `html/template`-style rule replaces by
 `about:invalid#orin-unsafe-url`. All programs print byte-identical `bytes`, `hash` and `head` lines.
 
-- `bench/html/main.or`: **JSX** (ADR-0043), a `Row` and a `Page` component; each component is one fused buffer.
+- `bench/html/main.or`: **OX** markup with `std:html` (ADR-0043, ADR-0044), a `Row` and a `Page` component; each component is one fused buffer.
 - `bench/html_hand/main.or`: the same page **hand-written** in Orin, plain concatenation into one accumulating string
   (`out += ...`) with the same `std:html` `escape` / `safeUrl` (Orin-only row).
 - `bench/html/main.c`: one growing buffer, `memcpy`, an escape loop copying runs; `main.go`: `strings.Builder`.
@@ -708,17 +708,20 @@ characters are escaped) and every 11th URL is `javascript:alert(i)`, which the G
 
 | program | Orin C backend | Orin LLVM backend | Go | C |
 |---|---:|---:|---:|---:|
-| executed instructions, JSX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
+| executed instructions, OX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
 | executed instructions, hand-written Orin (`html_hand`) | 4.71 G | 4.63 G | | |
-| wall, JSX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
-| allocations, JSX: strings / `Html` records | 2.74 M / 0.80 M | | | |
+| wall, OX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
+| allocations, OX: strings / `Html` records | 2.74 M / 0.80 M | | | |
 | allocations, hand-written: strings | 5.03 M | | | |
 
-JSX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
+OX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
 parts are merged at compile time and appended into one buffer, while `out += a + b + c` builds a temporary per
 operator. It is 2.5x the instructions of C. What remains, in order (ADR-0043 "Not done"): geometric re-growth of each
 buffer (`string_grows` 4.2 M; a capacity hint from the known static length), the temporary string of every converted
 integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` + `joinAll`).
+The generic provider mechanism (ADR-0044) changed none of this: re-measured on the OX branch the counts are identical
+(3,991,618,263 / 4,711,876,261 instructions, same allocation counters), since `std:html`'s rules are applied at compile
+time and its `@Inline` functions are the same calls as before.
 
 ## Benchmark workflow (CI), metrics and history
 
@@ -772,9 +775,12 @@ compare such counts with full-size ones), `bench/<name>/instructions.skip` holds
 skipped, because valgrind serialises threads.
 
 **Parallel speedup.** `bench/parallel_*/` and `bench/streams_parallel/` (picked up automatically when present) take the
-number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. There is no
-runtime knob: std:task has no thread pool, every task is one OS thread, so the worker count is the `parts` argument of
-`parallelMap` (or the number of tasks the program spawns). Each program runs with 1, 2 and 4 threads (`--threads`); the output
+number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. std:task has
+no thread pool, every task is one OS thread, so for `bench/parallel_*` the worker count is the `parts` argument of
+`parallelMap` (or the number of tasks the program spawns). `bench/streams_parallel` uses `parallel()`, whose pool reads
+`ORIN_THREADS` (also set); it picks its workload by its first argument and runs `parheavy` in this section (`PAR_ARGV` in
+`tools/bench.py`; before 2026-10-15 it got the thread count as its workload argument and measured the default workload
+with the default pool size). Each program runs with 1, 2 and 4 threads (`--threads`); the output
 must not depend on the count. `bench/parallel_collatz` is the Collatz-steps map of `examples/parallel_map.or` over
 1..2,000,000 with deterministic output. With more threads than free cores the speedup flattens; `cpu_ratio` above 1 shows the
 cost of copying chunks, joining and oversubscription.

@@ -23,7 +23,7 @@ import {
   BinaryOp, ExprKind, FieldInit, MatchArm, ArmBody, Pattern, PatternKind, InterfaceDecl,
   IfaceMethod, ClassDecl, ClassMember, ClassField, CtorDecl, CtorParam, MethodDecl, FnTyParam,
   ArrowParam, ArrowBody, ContractKind, ContractClause, AnnotationKind, Annotation,
-  JsxElement, JsxAttr, JsxValue, JsxChild,
+  OxElement, OxAttr, OxValue, OxChild,
 } from "./ast";
 import { Token, lex, isEofTok } from "./lexer";
 import { OpTable } from "./precedence";
@@ -54,7 +54,7 @@ function describe(t: Token): string {
     KTplHead => "template literal",
     KTplMid => "`}` in a template literal",
     KTplTail => "`}` in a template literal",
-    KJsxText => "JSX text",
+    KOxText => "OX text",
     _ => "`" + t.text + "`",
   };
 }
@@ -230,6 +230,7 @@ export class Parser {
   private errs: Diagnostic[] = [];
   private floor: usize = 0;
   private unwinding: bool = false;
+  private sawProvider: bool = false; // an `import ox from` was parsed (ADR-0044: at most one per file)
 
   constructor(toks: Token[]) {
     this.toks = toks;
@@ -872,7 +873,7 @@ export class Parser {
       return Err(diag("E0441", spanTo(at, nt.span), "`@" + nt.text + "` takes no arguments"));
     }
     this.pos += 2;
-    const kind: AnnotationKind = nt.text == "Test" ? ATest : AInline;
+    const kind: AnnotationKind = nt.text == "Test" ? ATest : nt.text == "Sealed" ? ASealed : AInline;
     return Ok(Annotation { kind: kind, message: "", span: spanTo(at, nt.span) });
   }
 
@@ -940,7 +941,20 @@ export class Parser {
   private parseImportDecl(): Result<ImportDecl, Diagnostic> {
     const start = this.toks[this.pos].span;
     this.pos += 1;
+    if (this.isIdentText(0, "ox") && this.isKwAt(1, "from")) {
+      if (this.sawProvider) {
+        return Err(diag("E0200", this.toks[this.pos].span, "a file selects at most one OX provider"));
+      }
+      this.sawProvider = true;
+      this.pos += 1;
+      return this.parseImportRest(start, [], true);
+    }
     const names = this.parseNameList()?;
+    return this.parseImportRest(start, names, false);
+  }
+
+  // `from "path";` of an import (the names or `ox` are parsed).
+  private parseImportRest(start: Span, names: Ident[], provider: bool): Result<ImportDecl, Diagnostic> {
     this.expectKw("from")?;
     const pt = this.toks[this.pos];
     if (!isStrTok(pt)) {
@@ -953,6 +967,7 @@ export class Parser {
       path: pt.text,
       pathSpan: pt.span,
       span: spanTo(start, this.lastSpan()),
+      provider: provider,
     });
   }
 
@@ -2074,14 +2089,14 @@ export class Parser {
       KTplTail => {
         return Err(this.errExpected("expression"));
       },
-      KJsxOpen => {
-        const el = this.parseJsxElement()?;
-        return Ok(mkExpr(EJsx(el), el.span));
+      KOxOpen => {
+        const el = this.parseOxElement()?;
+        return Ok(mkExpr(EOx(el), el.span));
       },
-      KJsxEnd => {
+      KOxEnd => {
         return Err(this.errExpected("expression"));
       },
-      KJsxText => {
+      KOxText => {
         return Err(this.errExpected("expression"));
       },
       KIdent => {
@@ -2100,46 +2115,133 @@ export class Parser {
   }
 
   // ---------------------------------------------------------------------------
-  // JSX (ADR-0043)
+  // OX (ADR-0043)
   // ---------------------------------------------------------------------------
 
-  private isJsxEnd(s: string): bool {
+  private isOxEnd(s: string): bool {
     const t = this.toks[this.pos];
     return match (t.kind) {
-      KJsxEnd => t.text == s,
+      KOxEnd => t.text == s,
       _ => false,
     };
   }
 
-  private isJsxOpen(s: string): bool {
+  private isOxOpen(s: string): bool {
     const t = this.toks[this.pos];
     return match (t.kind) {
-      KJsxOpen => t.text == s,
+      KOxOpen => t.text == s,
       _ => false,
     };
   }
 
-  // A JSX element or fragment at its KJsxOpen `<`: `<name attrs />`, `<name attrs> children </name>` or
-  // `<> children </>`. The lexer has already split tags, text and `{..}`; this checks the structure (the closing tag
-  // repeats the name, fragments have no attributes and are not self-closing, no spread attributes).
-  @Requires(this.isJsxOpen("<"))
+  // `{...expr}` in an opening tag: the attribute named `...` with the value JVSpread (ADR-0044). The cursor is at `{`.
+  @Requires(this.isP("{"))
   @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
-  private parseJsxElement(): Result<JsxElement, Diagnostic> {
+  private parseOxSpread(): Result<OxAttr, Diagnostic> {
+    const open = this.toks[this.pos];
+    this.pos += 1;
+    if (!this.isP("...")) {
+      return Err(this.errExpected("`...` (an OX attribute is a name or a spread `{...expr}`)"));
+    }
+    this.pos += 1;
+    const e = this.parseExpr()?;
+    this.expectP("}")?;
+    const sp = spanTo(open.span, this.lastSpan());
+    return Ok(OxAttr { name: Ident { name: "...", span: sp }, value: JVSpread(e), span: sp });
+  }
+
+  // The children of an element or slot, up to (not including) its closing tag `</` or `</:`. Named slots `<:x>` are
+  // children only where `slots` holds (directly inside a component, ADR-0044).
+  @Ensures(result.isOk() ==> this.isOxOpen("</") || this.isOxOpen("</:"))
+  private parseOxKids(slots: bool): Result<OxChild[], Diagnostic> {
+    let kids: OxChild[] = [];
+    while (!this.isOxOpen("</") && !this.isOxOpen("</:")) {
+      const t = this.toks[this.pos];
+      const isText = match (t.kind) {
+        KOxText => true,
+        _ => false,
+      };
+      if (isText) {
+        kids.push(JText(t.text, t.span));
+        this.pos += 1;
+      } else if (this.isOxOpen("<:")) {
+        if (!slots) {
+          return Err(errAt(t, "a named slot `<:x>` can only appear directly inside a component"));
+        }
+        kids.push(this.parseOxSlot()?);
+      } else if (this.isOxOpen("<")) {
+        kids.push(JElem(this.parseOxElement()?));
+      } else if (this.isP("{")) {
+        this.pos += 1;
+        if (this.isP("}")) {
+          this.pos += 1; // `{}` or `{/* comment */}`: no child
+        } else {
+          const e = this.parseExpr()?;
+          this.expectP("}")?;
+          kids.push(JExpr(e));
+        }
+      } else {
+        return Err(this.errExpected("OX text, `{`, an element or a closing tag"));
+      }
+    }
+    return Ok(kids);
+  }
+
+  // A named slot `<:name> children </:name>` at its `<:` (ADR-0044): no attributes, not self-closing, the closing tag
+  // repeats the name, the children are text, `{expr}` and elements (no slot directly inside a slot).
+  @Requires(this.isOxOpen("<:"))
+  private parseOxSlot(): Result<OxChild, Diagnostic> {
+    const open = this.toks[this.pos];
+    this.pos += 1;
+    const name = this.parseIdent()?;
+    if (this.isOxEnd("/>")) {
+      return Err(errAt(this.toks[this.pos], "a named slot cannot be self-closing; write `<:" + name.name + "></:" + name.name + ">`"));
+    }
+    if (!this.isOxEnd(">")) {
+      return Err(errAt(this.toks[this.pos], "a named slot `<:" + name.name + ">` has no attributes"));
+    }
+    this.pos += 1;
+    const kids = this.parseOxKids(false)?;
+    if (!this.isOxOpen("</:")) {
+      return Err(this.errExpected("`</:" + name.name + ">` to close `<:" + name.name + ">`"));
+    }
+    this.pos += 1;
+    if (!this.isIdentText(0, name.name)) {
+      return Err(this.errExpected("`" + name.name + "` to close `<:" + name.name + ">`"));
+    }
+    this.pos += 1;
+    if (!this.isOxEnd(">")) {
+      return Err(this.errExpected("`>`"));
+    }
+    this.pos += 1;
+    return Ok(JSlot(name, kids, spanTo(open.span, this.lastSpan())));
+  }
+
+  // An OX element or fragment at its KOxOpen `<`: `<name attrs />`, `<name attrs> children </name>` or
+  // `<> children </>`. The lexer has already split tags, text and `{..}`; this checks the structure (the closing tag
+  // repeats the name, fragments have no attributes and are not self-closing).
+  @Requires(this.isOxOpen("<"))
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseOxElement(): Result<OxElement, Diagnostic> {
     const open = this.toks[this.pos];
     this.pos += 1;
     let name: Option<Ident> = None;
     if (this.isIdentAt(0)) {
       name = Some(this.parseIdent()?);
-    } else if (!this.isJsxEnd(">")) {
-      return Err(this.errExpected("a JSX tag name or `>`"));
+    } else if (!this.isOxEnd(">")) {
+      return Err(this.errExpected("an OX tag name or `>`"));
     }
-    let attrs: JsxAttr[] = [];
-    while (this.isIdentAt(0)) {
+    let attrs: OxAttr[] = [];
+    while (this.isIdentAt(0) || this.isP("{")) {
       if (name.isNone()) {
         return Err(errAt(this.toks[this.pos], "a fragment `<>` cannot have attributes"));
       }
+      if (this.isP("{")) {
+        attrs.push(this.parseOxSpread()?);
+        continue;
+      }
       const an = this.parseIdent()?;
-      let v: JsxValue = JVTrue;
+      let v: OxValue = JVTrue;
       if (this.isP("=")) {
         this.pos += 1;
         const t = this.toks[this.pos];
@@ -2152,26 +2254,23 @@ export class Parser {
           this.expectP("}")?;
           v = JVExpr(e);
         } else {
-          return Err(this.errExpected("a string literal or `{` for the JSX attribute value"));
+          return Err(this.errExpected("a string literal or `{` for the OX attribute value"));
         }
       }
       for (const a of attrs) {
         if (a.name.name == an.name) {
-          return Err(diag("E0200", an.span, "duplicate JSX attribute `" + an.name + "`"));
+          return Err(diag("E0200", an.span, "duplicate OX attribute `" + an.name + "`"));
         }
       }
-      attrs.push(JsxAttr { name: an, value: v, span: spanTo(an.span, this.lastSpan()) });
+      attrs.push(OxAttr { name: an, value: v, span: spanTo(an.span, this.lastSpan()) });
     }
-    if (this.isP("{")) {
-      return Err(errAt(this.toks[this.pos], "spread attributes `{...x}` are not supported in JSX"));
-    }
-    const noKids: JsxChild[] = [];
-    if (this.isJsxEnd("/>")) {
+    const noKids: OxChild[] = [];
+    if (this.isOxEnd("/>")) {
       if (name.isNone()) {
         return Err(errAt(this.toks[this.pos], "a fragment cannot be self-closing; write `<></>`"));
       }
       this.pos += 1;
-      return Ok(JsxElement {
+      return Ok(OxElement {
         name: name,
         attrs: attrs,
         children: noKids,
@@ -2179,34 +2278,17 @@ export class Parser {
         span: spanTo(open.span, this.lastSpan()),
       });
     }
-    if (!this.isJsxEnd(">")) {
-      return Err(this.errExpected("`>` or `/>` to end the JSX tag"));
+    if (!this.isOxEnd(">")) {
+      return Err(this.errExpected("`>` or `/>` to end the OX tag"));
     }
     this.pos += 1;
-    let kids: JsxChild[] = [];
-    while (!this.isJsxOpen("</")) {
-      const t = this.toks[this.pos];
-      const isText = match (t.kind) {
-        KJsxText => true,
-        _ => false,
-      };
-      if (isText) {
-        kids.push(JText(t.text, t.span));
-        this.pos += 1;
-      } else if (this.isJsxOpen("<")) {
-        kids.push(JElem(this.parseJsxElement()?));
-      } else if (this.isP("{")) {
-        this.pos += 1;
-        if (this.isP("}")) {
-          this.pos += 1; // `{}` or `{/* comment */}`: no child
-        } else {
-          const e = this.parseExpr()?;
-          this.expectP("}")?;
-          kids.push(JExpr(e));
-        }
-      } else {
-        return Err(this.errExpected("JSX text, `{`, an element or a closing tag"));
-      }
+    const isComponent = match (name) {
+      Some(n) => n.name.length > 0 && n.name.charCodeAt(0) >= 65 && n.name.charCodeAt(0) <= 90,
+      None => false,
+    };
+    const kids = this.parseOxKids(isComponent)?;
+    if (this.isOxOpen("</:")) {
+      return Err(errAt(this.toks[this.pos], "a slot closing tag `</:..>` without its opening tag"));
     }
     this.pos += 1;
     const want = match (name) {
@@ -2221,11 +2303,11 @@ export class Parser {
     } else if (this.isIdentAt(0)) {
       return Err(this.errExpected("`>` to close the fragment `<>`"));
     }
-    if (!this.isJsxEnd(">")) {
+    if (!this.isOxEnd(">")) {
       return Err(this.errExpected("`>`"));
     }
     this.pos += 1;
-    return Ok(JsxElement {
+    return Ok(OxElement {
       name: name,
       attrs: attrs,
       children: kids,
@@ -2458,13 +2540,13 @@ export class Parser {
       KTplTail => {
         return Err(this.errExpected("pattern"));
       },
-      KJsxOpen => {
-        return Err(this.errExpected("pattern (JSX cannot be matched)"));
+      KOxOpen => {
+        return Err(this.errExpected("pattern (OX cannot be matched)"));
       },
-      KJsxEnd => {
+      KOxEnd => {
         return Err(this.errExpected("pattern"));
       },
-      KJsxText => {
+      KOxText => {
         return Err(this.errExpected("pattern"));
       },
       KStr => {

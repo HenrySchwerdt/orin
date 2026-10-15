@@ -40,7 +40,7 @@ _Updated: 2026-10-15_
 | Compiler rewrite with the full language (ADR-0015, docs/rewrite.md): `diag` + `loader` (step 1), checker foundation `check/{env,fnctx,types}` (step 2a: Map-based symbol tables / instance indexes, `Scope` class), expression and statement checker `check/body.or` split into `fnctx` / `ops` / `match` / `call` / `lift` / `hirok` / `expr` / `stmt` (step 2b: classes `FnCtx`, `ExprChecker`, `StmtChecker`, `Coverage`, `Inference`; 230 contract clauses; byte-identical output), `lower/` (step 3a: class `Lowerer`, `BlockBuilder`, `Locals`, `OwnedScope`; 97 contract clauses; **MIR source spans**, ADR-0020 D3, MIR v2.0; byte-identical C / LLVM output), `syntax/` (step 3c: classes `Lexer`, `Parser`, `OpTable`; precedence climbing over an operator table; AST well-formedness predicates; 129 contract clauses; parse errors and generated code byte-identical; then parser error recovery, several syntax errors per file), `opt/` + `cemit/` + `llvm/` (step 3d: classes `ParamInference`, `BlockSink`, `RewritePlan`, `CSymbols`, `CFunctionEmitter`, `LlvmSymbols`, `LlvmFunctionEmitter`, ...; per-function code generation from a read-only symbol table, rule 8; byte-identical C / LLVM output) | in progress (remaining `check` files) |
 | Capabilities, Stage A (ADR-0021, ADR-0027): `main(host: Host)`, grants as resource handles, narrowing, `ORIN_DENY`, path scopes, `PERFORMS_IO` OSIG edges | done; std I/O signatures await the owner's freeze confirmation. **Stage B done** (transitive effect inference, `orin effects`, OSIG `MAY_PERFORM`, `[effects]` policy; docs/capabilities.md). Stages C-D (library adapters, lineage, strict policy gates) not started |
 | Concurrency, stage 0 (ADR-0017 Addendum A, docs/concurrency.md): `std:task` (scope / spawn / join, bounded channels, grants moved into tasks, `parallelMap`), L0 threads and monitors, one temporary C interface with a porting table to R3 | done; C parts `TESTED_ONLY` (ThreadSanitizer, ASan + UBSan, stress); no `async` / `await`, cancellation, deadlock detection or M:N scheduler; concurrent HTTP server waits for `std:net` |
-| JSX and `std:html` (ADR-0043, docs/jsx.md): TSX-compatible elements, attributes, text rules, components called by parameter name, fused single-buffer lowering to HIR, sealed `Html`, escaping and URL sanitising by construction | first slice done: 4 run + 20 error tests, compile-time/run-time escaping differential, `std:html` 41/41 mutants, `tools/mutate_jsx.py` on the compiler, `bench/html` vs hand-written; spread, member tags, pre-sized buffers, component fusion not started |
+| OX markup and `std:html` (ADR-0043, ADR-0044, docs/ox.md): TSX-compatible syntax, providers selected by `import ox from`, `Markup` (fused single-buffer text) and `Components` (values) provider kinds, typed slots and fragments, named slots, spread, source-order evaluation, `@Sealed`; `std:html` is a provider, `std:ox` the protocol | done: 6 run + 30 error tests incl. a widget and an XML provider, compile-time/run-time escaping differential, `std:html` mutants, `tools/mutate_ox.py` on the compiler, `bench/html` vs hand-written; member tags, spread on intrinsics, pre-sized buffers, component fusion not started |
 | Incremental analysis | not started |
 | Closure inlining and fusion (ADR-0038 §2, `compiler/fuse`) | done for `map` / `filter` chains ended by every array-API terminal; chain = loop in CPU time (`bench/streams`); borrow inference, reuse in place not started |
 | Parallel pipelines (ADR-0039 steps 1-3): `parallel()`, work-stealing fork/join pool in `std:task`, lending without copies, E0484-E0486, W0480-W0481 | done; speedup not yet measured on an idle machine; parallel `sort`, user reducers, all element types not started |
@@ -55,3 +55,34 @@ ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 2. ~~Fixed-width integers, interpolation~~ (done, ADR-0022), ~~`@Test`/`@Deprecated`/`@Inline`~~ (done, ADR-0024), ~~resources~~ (done, ADR-0025), ~~generic classes~~ (done, ADR-0026: all language-freeze prerequisites are in; the language freeze and the compiler rewrite of ADR-0015 can start); capabilities (ADR-0021 Stage A, ADR-0027: done) → std I/O freeze (owner decision, open questions in ADR-0027).
 3. Compiler rewrite with the full language and MIR source spans (ADR-0015): steps 1, 2a, 2b, 3a, 3b (verifier), 3c, 3d (optimiser and both backends, per-function code generation ready for ADR-0039 `.parallel()`) and 3e (tooling) done (3a added MIR source spans, ADR-0020 D3; 3c the lexer and parser); next the remaining checker files (`collect`, `decls`, `classes`, `index`, ...).
 4. v0.1.0-alpha.2 with closures, floats, maps, interfaces, std modules.
+
+## Open work, in order (updated 2026-10-15, after the performance wave)
+Merged 2026-10-15: unboxing (#62, MIR v2.2), packed verifier state (#64), census quick wins (#65), borrow inference (#67),
+concat reuse in place (#68, MIR v2.3), CI sharding of `backends` plus LLVM `.parallel()` declarations (#66), LLVM/C
+instruction parity (#69, ADR-0038 §8 gate 1); the last four through the integration PR #70. Effect: self-compile -38.8%
+executed instructions, -93% retains; census numbers and the lever ranking in
+[`perf/alloc-census.md`](perf/alloc-census.md).
+
+1. **Performance, lever 2: field and element access code** (not a census class; design accepted 2026-10-15, ADR-0038
+   addendum "lever 2"): `make_unique` + `struct_get` / `struct_replace` per field write and repeated bounds-checked element
+   reads (mutres 10.6x C instructions, pqueue 4.8x, nbody 3.7x, sieve 3.4x). Rollout T1 (drop `makeunique` the verifier
+   proves `Unique`) and T3 (scalar stores without the run-time refmask test) in progress, then T2, T4, T5 with the new
+   verifier rules U1, F1, U2-U5; T6 (range facts) needs its own decision. The `orin_stats` counters become a build option.
+   Lever 1 (verifier and optimiser data structures) is done: self-compile -23% allocations, -3.2% instructions; the
+   remaining self-compile time is no longer allocation.
+2. **Performance, next ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
+   payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
+   bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
+3. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
+   below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
+4. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
+   global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.
+5. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
+   `.parallel()` per compiler phase (ADR-0039 §6).
+6. **Follow-ups:**
+   - `HStmt` spans for break/continue/return;
+   - trap hook and cancellation for tasks (prerequisite for ADR-0041 Stage D);
+   - ADR-0040 (generic methods);
+   - ADR-0037 D5;
+   - ADR-0042 stage 1 (complexity summaries);
+   - decide whether a struct with more than 64 slots is a compile-time error (it currently traps at run time).
