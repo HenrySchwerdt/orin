@@ -190,6 +190,28 @@ class CliTests(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout)["ok"])
         self.run_cli("run", "--format=json", cwd=self.cwd / "hello", code=2)
 
+    def test_absolute_dependency_from_nested_directory(self):
+        self.run_cli("init", "shared", "--lib")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--path", str(self.cwd / "shared"), cwd=project / "src")
+        self.run_cli("build", cwd=project)
+
+    def test_root_lock_pins_transitive_git_dependencies(self):
+        for name in ("base", "shared"):
+            self.run_cli("init", name, "--lib")
+        base = self.cwd / "base"
+        subprocess.run(["git", "init", "-q"], cwd=base, check=True)
+        subprocess.run(["git", "add", "."], cwd=base, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit", "-qm", "initial"], cwd=base, check=True)
+        self.run_cli("add", "--git", str(base), cwd=self.cwd / "shared")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--path", "../shared", cwd=project)
+        self.assertIn("shared/base|git|", (project / "orin.lock").read_text())
+        self.run_cli("fetch", "--locked", "--offline", cwd=project)
+
 
 if __name__ == "__main__":
     unittest.main()
