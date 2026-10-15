@@ -29,6 +29,7 @@ class CliTests(unittest.TestCase):
         (package / "lib/orin").mkdir(parents=True)
         (package / "lib/orin/runtime").symlink_to(ROOT / "runtime")
         (package / "lib/orin/platform").symlink_to(ROOT / "platform")
+        (package / "examples").symlink_to(ROOT / "examples")
         (package / "VERSION").write_text("test\n")
         cls.cli = package / "bin/orin"
 
@@ -190,6 +191,17 @@ class CliTests(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout)["ok"])
         self.run_cli("run", "--format=json", cwd=self.cwd / "hello", code=2)
 
+    def test_http_template_and_llvm_release(self):
+        self.run_cli("init", "server", "--template", "http")
+        self.run_cli("check", cwd=self.cwd / "server")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("build", "--release", "--backend=llvm", cwd=project)
+        binary = project / "build/release/hello"
+        self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
+        self.run_cli("clean", cwd=project)
+        self.assertFalse(binary.exists())
+
     def test_absolute_dependency_from_nested_directory(self):
         self.run_cli("init", "shared", "--lib")
         self.run_cli("init", "hello")
@@ -211,6 +223,29 @@ class CliTests(unittest.TestCase):
         self.run_cli("add", "--path", "../shared", cwd=project)
         self.assertIn("shared/base|git|", (project / "orin.lock").read_text())
         self.run_cli("fetch", "--locked", "--offline", cwd=project)
+
+    def test_failed_git_update_restores_cached_source(self):
+        self.run_cli("init", "shared", "--lib")
+        shared = self.cwd / "shared"
+        def git(*args):
+            return subprocess.check_output(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", *args],
+                cwd=shared, text=True).strip()
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-qm", "initial")
+        old_commit = git("rev-parse", "HEAD")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("add", "--git", str(shared), cwd=project)
+        with (shared / "orin.toml").open("a") as manifest:
+            manifest.write('\n[dependencies]\nmissing = { path = "../missing" }\n')
+        git("add", ".")
+        git("commit", "-qm", "broken dependency")
+        self.run_cli("update", "shared", cwd=project, code=1)
+        cached_commit = subprocess.check_output(
+            ["git", "-C", str(project / ".orin/packages/shared"), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(old_commit, cached_commit)
 
 
 if __name__ == "__main__":
