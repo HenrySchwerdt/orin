@@ -187,6 +187,12 @@ bin/orin fmt --stdout examples/generics.or   # canonical formatting
 
 ### Packages
 
+Start a project with `orin init hello`, then `cd hello` and `orin run`. Use `orin dev` for rebuilds,
+`orin test` for project tests, and `orin add --path ../shared` for a library dependency. The release
+CLI includes colored source diagnostics, project discovery, and cached native builds.
+See the [CLI guide](docs/cli.md) for commands, dependencies, terminal options, and current limits.
+From a source checkout, `./tools/orin` provides the same interface without changing your installation.
+
 A directory with an `orin.toml` is a package; `check`, `compile`, `build` and `run` accept it in
 place of a file and use the manifest's `entry` (default `src/main.or`).
 
