@@ -102,6 +102,11 @@ Every edit replaces the identifier of length `len(symbol)` at the listed positio
 * `entry`: compiles and runs one program (10 s timeout) and compares stdout with `<name>.out`
   (or `expected.out` next to `main.or`); honours a `// exit: N` first line.
   `{"passed":true,"exit":0}`; on failure `why`, `stdout`, `stderr` (truncated).
+  Execution uses a native monotonic deadline on macOS/Linux; timeout reports
+  `{"passed":false,"exit":-2,"why":"timeout after 10 seconds",...}` even if an
+  expected-exit comment asks for -2. No external `timeout` tool is required.
+  Background children in the same process group are killed on completion; see
+  [execution limits](testing.md#execution-deadlines).
 * otherwise runs the conformance runner (`suite` `default|next|all`, `filter`):
   `{"passed":78,"failed":0,"ok":true}` plus `failures` (names, at most 30) when any.
 

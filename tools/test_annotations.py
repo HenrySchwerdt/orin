@@ -12,7 +12,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,7 +44,6 @@ def main():
     a = ap.parse_args()
     orin = a.orinc if os.path.isabs(a.orinc) else os.path.join(ROOT, a.orinc)
     t = lambda *x: run([orin, "test"] + list(x))
-    have_timeout = shutil.which("timeout") is not None
 
     # --- orin test: all pass --------------------------------------------------------------------------
     rc, out, err = t(os.path.join(FIX, "pass.or"))
@@ -114,10 +112,7 @@ def main():
         check("test: json output is deterministic", out == out2)
 
 
-    if have_timeout:
-        mixed_tests()
-    else:
-        print("skip mixed/filter/json tests: they include a hanging test and need timeout(1)")
+    mixed_tests()
 
     # --- no tests, compile errors, usage --------------------------------------------------------------
     rc, out, err = t(os.path.join(FIX, "none.or"))

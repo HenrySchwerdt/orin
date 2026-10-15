@@ -21,17 +21,17 @@ precise errors, deterministic behavior, pure validation, explicit I/O, limits, a
 - The local Claude CLI currently reports loggedIn=false. Do not seek credentials or repeatedly call
   unauthenticated Claude. Continue consuming completed Claude PRs; use Codex sparingly as fallback.
 
-## Current queue
+## Current queue — 22:30 Europe/Berlin checkpoint
 
-| Track | Owner | Scope / acceptance |
+| Track | Owner | Status / next acceptance |
 | --- | --- | --- |
-| CLI integration | Coordinator | Merge latest main, fix independent review findings, submit CLI PR, review CI and merge only after checks |
-| Load forwarding, PR #82 | Claude / coordinator review | Review F1 soundness and mutant evidence; merge only after exact-head CI completes |
-| `std:encoding` | Implementation chat A | Hex, Base64 and Base64URL over Bytes; strict decoding and structured errors; vectors, round trips, malformed input, linear-time benchmark |
-| `std:url` | Implementation chat B | Percent encoding/decoding and query parsing/serialization; explicit UTF-8 and plus behavior; duplicate order preserved; vectors, malformed input, round trips and benchmark |
-| Portable execution timeout | Next available worker | Reproduce the macOS MCP timeout failure, implement a tested bounded execution path without silently disabling deadlines |
-| JSON completeness | Next std ticket | Design float/exponent JSON support with a compatibility plan before implementation |
-| Release readiness | Coordinator | Reconcile actual shipped features with docs; prepare a 1.0 gap list with evidence and remaining decisions |
+| CLI integration, PR #83 | Coordinator | Merged after independent approval and green CI |
+| `std:url`, PR #84 | Implementation chat B / coordinator | Merged after independent approval and green CI |
+| `std:encoding`, PR #85 | Implementation chat A / coordinator | Merged; URL and encoding registration preserved together |
+| Load forwarding, PR #82 | Claude / coordinator review | Assertion-order fix independently approved; main integration `2734d9b` freshly pushed, awaiting exact-head CI; not yet merged |
+| Portable execution timeout, PR #86 | Implementation chat A / coordinator | Worker head `48de511` passed CI and independent review; main integration `613b653` approved, fresh CI pending; not yet merged |
+| JSON completeness | Design chat / coordinator | Design active: float/exponent support and decoder helpers need a compatibility plan before implementation |
+| Release readiness | Audit chat / coordinator | Audit active; [English evidence and gap document](release-1.0-readiness.md) separates release gates from follow-ups |
 
 ## Coordination state
 
@@ -58,3 +58,17 @@ and disable the night-shift heartbeat. Do not claim feature completeness or proo
   C/LLVM assertion-order regression where an IForward destination aliases its index local.
 - Five-hour usage reset was confirmed (1% at this checkpoint). Claude CLI remains unauthenticated;
   existing Claude PR #82 is being fixed in place without duplicate implementation or auth retries.
+
+## 22:30 coordination checkpoint
+
+- CLI #83, URL #84 and encoding #85 are merged. Completion here means mainline source;
+  it does not mean the older published alpha packages contain these features.
+- PR #82's C/LLVM assertion-order correction is independently approved. Integration head
+  `2734d9b` includes main and is awaiting fresh CI. Eight runtime regression cases pass.
+- PR #86 worker head `48de511` has green CI and independent approval. Main integration
+  `613b653` is independently approved and awaits fresh CI. Both PRs remain open at this checkpoint.
+- The coordinator reports that the integration bootstrap passed the stage2/stage3 fixed point.
+  That is reproducibility evidence; exact integration-head CI and final merge review still apply.
+- JSON compatibility design and the release-readiness audit are active. The coordinator's
+  checkout is now on main. `build/overnight/state.json` remains the generated local coordination
+  source; this documentation update does not modify it.

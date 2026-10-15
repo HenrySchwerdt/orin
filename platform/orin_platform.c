@@ -10,6 +10,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -87,6 +89,52 @@ int64_t orin_platform_shell(const char *cmd, size_t n) {
     if (r == -1) return -1;
     if (WIFEXITED(r)) return (int64_t)WEXITSTATUS(r);
     return -1;
+}
+
+/* ADR-0045. Observe without reaping: the pinned leader PID cannot be reused
+ * before group cleanup. Kill both the group and direct child (even if it escaped). */
+extern char **environ;
+int64_t orin_platform_shell_timeout(const char *cmd, size_t n, int64_t seconds) {
+    struct timespec begin, now, pause = {0, 10000000};
+    if (seconds <= 0 || n == SIZE_MAX || clock_gettime(CLOCK_MONOTONIC, &begin)) return -1;
+    struct sigaction disposition;
+    if (sigaction(SIGCHLD, NULL, &disposition) || disposition.sa_handler != SIG_DFL || (disposition.sa_flags & SA_NOCLDWAIT)) return -1;
+    orin_platform_flush();
+    char *buf = (char *)orin_platform_alloc(n + 1);
+    if (!buf) return -1;
+    orin_platform_mem_copy(buf, cmd, n);
+    buf[n] = 0;
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr)) { orin_platform_free(buf); return -1; }
+    int err = posix_spawnattr_setpgroup(&attr, 0);
+    if (!err) err = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    pid_t pid = -1;
+    char *argv[] = {"sh", "-c", buf, NULL};
+    if (!err) err = posix_spawn(&pid, "/bin/sh", NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    orin_platform_free(buf);
+    if (err) return -1;
+    int result = -1, status;
+    for (;;) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) break;
+        int64_t elapsed = (int64_t)now.tv_sec - (int64_t)begin.tv_sec;
+        if (elapsed > seconds || (elapsed == seconds && now.tv_nsec >= begin.tv_nsec)) { result = -2; break; }
+        siginfo_t info = {0};
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT)) {
+            if (errno == EINTR) continue;
+            if (errno == ECHILD) return -1; /* ownership was lost: never signal a possibly reused PID */
+            break;
+        }
+        if (info.si_pid == pid) { result = 0; break; }
+        if (nanosleep(&pause, NULL) && errno != EINTR) break;
+    }
+    /* SIGKILL is deliberate: user handlers cannot defer the deadline. */
+    (void)kill(-pid, SIGKILL);
+    (void)kill(pid, SIGKILL);
+    pid_t reaped;
+    do { reaped = waitpid(pid, &status, 0); } while (reaped < 0 && errno == EINTR);
+    if (reaped != pid) return -1;
+    return result == 0 ? (WIFEXITED(status) ? WEXITSTATUS(status) : -1) : result;
 }
 
 int64_t orin_platform_now_millis(void) {

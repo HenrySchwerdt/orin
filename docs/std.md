@@ -872,6 +872,32 @@ above; a pool lives for one call (worker threads are started per operation, abou
 * `std:clock` is importable but internal; so is `std:fsraw` (the raw open/close and grant primitives behind `std:fs` and `std:host`; only library code may import it).
 * `std:fs` streaming: text/byte-string API without seek, no directory operations, at most 256 open files.
 
+## Bounded shell execution (unstable)
+
+`std:io.shellTimeout(proc: ProcessGrant, cmd: string, seconds: int): int` runs the
+same `/bin/sh -c` command as `shell`, with a strictly positive monotonic deadline.
+It returns 0..255 for ordinary exit, -2 for timeout, and -1 for invalid duration,
+spawn failure, signal termination or OS error. It retains process denial and
+args-only restrictions. `shell` remains unlimited; shell commands are outside
+grant scopes after spawning. Bounded calls kill their process group on completion
+and reap the direct child. See [execution limits](testing.md#execution-deadlines)
+and [ADR-0045](decisions/0045-portable-bounded-execution.md).
+
+Complexity: O(command bytes + elapsed time / 10ms), sleeping between deadline
+checks; O(command bytes) allocation plus a child process and its process group.
+Output is inherited, not captured or size-limited by this primitive.
+
+```typescript
+import { Host, useProcess } from "std:host";
+import { shellTimeout } from "std:io";
+function main(host: Host): void {
+  useProcess(host, proc => {
+    const status = shellTimeout(proc, "printf hello", 1);
+    console.log(status.toString()); // 0, or -2 if the deadline expires
+  });
+}
+```
+
 ## std:encoding
 
 Strict byte-based Hex, Base64 and Base64URL codecs with explicit padding policy
