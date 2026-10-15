@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.2; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2)
+# MIR and the OIM ownership verifier (v2.4; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -37,6 +37,15 @@ Verifier rules are exactly those of `IStrAppend` (x is mutated, consumed and rep
 not `x`, not borrowed from `x`). Textual form `strprepend x, y`. The optimiser also gains a second `extendArrays` rewrite
 (`d = concat(x, y); release x` becomes `arrayextend x, y; d = move x`, no new instruction): the release proves that `x` is owned and
 dead after the concatenation, so `qs(lo).concat(eq)` extends the temporary `qs(lo)` instead of copying it.
+
+v2.4 (ADR-0038 lever 2, T4) **load forwarding**: one new instruction, `IForward(d, s, o, key)`, textual form `d = forward s, o[key]`.
+It means `d = s` (a scalar copy) and *claims* that the scalar local `s` holds the current value of slot `key` of the object `o` (a
+field index written as a `usize` constant, `o[1u]`, or an array index operand, `o[l4]`). The optimiser (`compiler/opt/forward.or`) emits
+it in place of the second `getfield` / `arrayget` of a scalar slot in a block. The verifier re-checks the claim with rule **F1**
+(`compiler/verify/forward.or`, section "Load forwarding" below) and rejects an `IForward` it cannot justify, error text
+`unjustified forward`. Forwarding is behaviour-only, not memory safety (an unjustified one reads a stale scalar, never a freed
+object), but it is checked to the standard of ADR-0032 like every other fact the optimiser acts on. Both emitters print `d = s`;
+`orin2 compile --assert-facts` additionally checks the claim at run time.
 
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
@@ -111,6 +120,8 @@ hole slot when reading that slot.
   (→ Dead) or OStr; d Unique.
 - `INullary(d, t)`: d Owned (immortal).
 - `IGetField(d, o, i)` / `IArrayGet(d, a, i)`: o live, slot i not a hole; ref d → `Borrowed(root(o))`.
+- `IForward(d, s, o, key)` (v2.4): d and s plain scalars of one class (int, usize, bool, float), o a reference local, key a usize operand;
+  s and o live, slot `key` of o not a hole; d `Init`. Rule F1 must justify the claim (below), else **error** `unjustified forward`.
 - `ISetField(x, i, v)` / `IArraySet(x, i, v)`: x **Unique**; v consumed as for StructNew.
   Effect: invalidates every `Borrowed(x)` local (→ Dead) because the old slot value is released.
 - `ITakeField(d, x, i)` / `IArrayTake(d, x, i)`: x Unique; i not already a hole → d Owned, i added
@@ -183,6 +194,42 @@ basic block with no redefinition of `x` / `v` in between (a `release` of `d` or 
 `getfield d.1` -> `borrow v` / `copy v`, `release d` -> release of x and v, `t = getfield d.0; u = dup t` -> `u = move x`).
 Mutation corpus: `inout-drop-receiver`, `inout-release-receiver` (tools/mutate_mir.py); hand-written cases:
 `compiler/tests/verify_main.or` `inoutCases`. The Lean model covers the structured fragment without calls, so it is unaffected.
+
+## Load forwarding (v2.4, ADR-0038 lever 2 T4, rule F1)
+`d = forward s, o[key]` is accepted when a backward scan of **the same block**, over at most 64 instructions (`WINDOW` in `forward.or`),
+finds the *source* before anything that could have changed the slot. Going back from the `forward`, each instruction is classified:
+- **source** (accepted): a load of the slot `(o, key)` into `s` (`getfield`, `arrayget`, or an `IForward` into `s`: it was itself checked, so a chain
+  of forwards is justified step by step), or a store of the local `s` into the slot (`setfield o.k = s`, `arrayset o[key] = s`). A load
+  that overwrites its own index local (`i = arrayget o[i]`) is not a source: after it, `o[i]` names another element; it ends the scan. The slot is the
+  same when the field index / array index is the same constant or the same local.
+- **no change** (the scan goes on): an instruction that does not mention `o` (including calls and builtins that do not receive `o`: a live
+  reference to `o` excludes an in-place write by the callee, which needs `rc == 1`); `IMakeUnique(o)` (a shallow copy keeps every slot);
+  `ITag`, `IBorrow`, `IDup` of `o`; a load, store, take or put of a *provably different* slot (two different constants).
+- **rejected** (`unjustified forward`): any other instruction that mentions `o` (a call or builtin that receives it, `arraypush` / `arraypop` /
+  `arrayextend`, a move, a release, a consuming constructor ...), a write that may hit the slot (the same slot, or an index that is not provably
+  different), a load of the slot into another local (the first access that touches the slot must be the source), a **definition of `s`, `o` or
+  the key local** (a call of an in/out function defines its receiver), the start of the block, or 64 instructions without a source.
+The rule is fail-closed: anything it does not know about and that mentions `o` ends the scan. Step 1 is deliberately conservative: a call that
+receives `o` ends the window; a later step may let calls through once the Lean lemma "a live reference excludes in-place mutation" is merged.
+Reference slots are not forwarded (`IBorrow(d, earlier)` would be accepted only while `earlier` is still a live borrow of `o`; the pass would need the
+verifier's states at every position).
+*Soundness argument.* The value of a scalar slot changes only through an instruction that stores into, takes from, puts into, grows or shrinks
+the object `o` names, through an in/out call or a consuming call on a local that aliases it (impossible while `o` is live and the object is
+shared: it needs `rc == 1`; this is the argument behind borrows, docs/tcb.md), or by redefining a local the claim depends on. The scan rejects the
+first group and the redefinitions; the second is the existing ownership argument. Trap semantics: the forwarded access had already succeeded on
+the same `(o, key)` in the same block, so its trap cannot fire; the checks stay where they are.
+*Dynamic check.* `orin2 compile --assert-facts` (never on by default; C and LLVM backend) emits a call of
+`orin_assert_fact(o, key, s)` **before** each `d = s` (runtime/orin_runtime.c). It uses the original object, key and source,
+including when `d` is the key local. It reads the slot as the original `getfield` / `arrayget` would have and exits
+**70** with `internal error: --assert-facts: a forwarded load differs from the slot it was forwarded from` if the value differs. The test suites run
+under it (`run_tests.py --assert-facts`). Evidence, not proof (ADR-0032 addendum).
+*Tests.* `compiler/tests/verify_main.or` `forwardCases`, `compiler/tests/opt_test.or` (T4 section). Mutation corpus (`tools/mutate_mir.py`, run on
+every `forward` of the optimised conformance corpus): `fwd-across-write`, `fwd-other-slot-ok` (a positive control: a write to a different slot is
+accepted), `fwd-after-redef-obj`, `fwd-after-redef-src`, `fwd-across-push`, `fwd-wrong-slot`, `fwd-across-block`.
+Lean (`formal/Orin/Forward.lean`): `load_load` and `store_load` (a load after a load or store of the same slot, with no write and no
+redefinition in between, returns the same value), `store_frame_other_slot`, `store_frame_other_local` (a store through another local cannot
+change `o`'s slots in a well-formed state) and `makeUnique_frame` (`makeUnique` keeps every slot). They prove the facts F1 relies on in the
+model; the Orin scan itself is not proved equal to them, and calls and array length are outside the model.
 
 ## Unboxed aggregates (v2.2, ADR-0038 step 1)
 `MAgg(n)` is a value of n + 1 words: `w[0]` the tag, `w[1..n]` the payload. A payload is a sequence of *slots*: a scalar slot (int, usize,

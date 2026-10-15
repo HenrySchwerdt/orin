@@ -1,0 +1,212 @@
+// Rule F1, load forwarding (docs/mir.md v2.4, ADR-0038 lever 2, T4). `d = IForward(s, o, key)` claims that the scalar local
+// `s` holds the current value of slot `key` of the object `o`. The claim is accepted when a backward scan of the SAME block,
+// over at most WINDOW instructions, finds an instruction that put that value in `s` before anything could have changed it:
+//   the source:   the first instruction that touches the slot (o, key) is a load into s (IGetField, IArrayGet, or an
+//                 IForward that was itself checked) or a store of s (ISetField / IArraySet with the value `OLocal(s)`);
+//   no change:    on the way back there is no definition of s, o or the key local, no write that may hit the slot (the same
+//                 slot, or an index that is not provably different), no instruction that grows, shrinks or consumes `o`, and
+//                 no instruction that gives `o` to anyone else (calls and builtins included).
+// `IMakeUnique(o)` does not end the scan: a shallow copy keeps every slot. A call that does not mention `o` does not end it
+// either: a live reference to `o` excludes an in-place write by the callee (an in-place write needs rc == 1; docs/tcb.md).
+// Anything this scan does not know about and that mentions `o` ends it. Fail closed: no source found is "not justified".
+
+import { MProgram, MFunction, Instr, Operand, dstOf, instrLocals } from "../mir";
+
+// How far back the scan looks: bounds the cost of the rule and keeps it local.
+export const WINDOW: usize = 64;
+
+// What one instruction means for the claim: it changes nothing relevant (the scan continues), it is the source (accepted),
+// or it ends the scan (rejected).
+const PASS: int = 0;
+const SOURCE: int = 1;
+const STOP: int = 2;
+
+function isLocal(x: Operand, l: usize): bool {
+  return match (x) {
+    OLocal(m) => m == l,
+    _ => false,
+  };
+}
+
+// The slot of a field instruction as a key operand (a field index is an OUsize constant).
+function fieldKey(k: usize): Operand {
+  return OUsize(k.toInt());
+}
+
+// The same constant or the same local.
+function sameKey(a: Operand, b: Operand): bool {
+  return match (a) {
+    OLocal(x) => isLocal(b, x),
+    OUsize(x) => match (b) {
+      OUsize(y) => x == y,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// Two different constants name different slots; anything else may be the same slot.
+function differ(a: Operand, b: Operand): bool {
+  return match (a) {
+    OUsize(x) => match (b) {
+      OUsize(y) => x != y,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// `ins` defines local `l`: its destination, or the in/out argument of a call of an in/out function (as `defsOf` in rules.or).
+function defines(p: MProgram, ins: Instr, l: usize): bool {
+  match (dstOf(ins)) {
+    Some(d) => {
+      if (d == l) {
+        return true;
+      }
+    },
+    None => {},
+  }
+  return match (ins) {
+    ICall(_, g, args) => g < p.functions.length && p.functions[g].inout && args.length > 0 && isLocal(args[0], l),
+    _ => false,
+  };
+}
+
+// A load of slot `at` of the object into `d`: the source when it is our slot and our local, unless the load overwrites
+// its own index local (`i = arrayget o[i]`: after it, `o[i]` names another element).
+function load(d: usize, s: usize, key: Operand, at: Operand): int {
+  if (differ(key, at)) {
+    return PASS;
+  }
+  return sameKey(key, at) && d == s && !isLocal(at, d) ? SOURCE : STOP;
+}
+
+// A store of `v` into slot `at` of the object: the source when it is our slot and stores our local.
+function store(s: usize, key: Operand, at: Operand, v: Operand): int {
+  if (differ(key, at)) {
+    return PASS;
+  }
+  return sameKey(key, at) && isLocal(v, s) ? SOURCE : STOP;
+}
+
+// A write (take, put) or an unknown store into slot `at`: harmless only when it is a different slot.
+function write(key: Operand, at: Operand): int {
+  return differ(key, at) ? PASS : STOP;
+}
+
+// The verdict on one instruction of the scan, for the claim (s, o, key).
+function verdict(ins: Instr, s: usize, o: usize, key: Operand): int {
+  match (ins) {
+    IGetField(d, x, k) => {
+      if (isLocal(x, o)) {
+        return load(d, s, key, fieldKey(k));
+      }
+    },
+    IArrayGet(d, x, i) => {
+      if (isLocal(x, o)) {
+        return load(d, s, key, i);
+      }
+    },
+    IForward(d, _, x, i) => {
+      if (isLocal(x, o)) {
+        return load(d, s, key, i);
+      }
+    },
+    ISetField(x, k, v) => {
+      if (x == o) {
+        return store(s, key, fieldKey(k), v);
+      }
+    },
+    IArraySet(x, i, v) => {
+      if (x == o) {
+        return store(s, key, i, v);
+      }
+    },
+    ITakeField(_, x, k) => {
+      if (x == o) {
+        return write(key, fieldKey(k));
+      }
+    },
+    IPutField(x, k, _) => {
+      if (x == o) {
+        return write(key, fieldKey(k));
+      }
+    },
+    IArrayTake(_, x, i) => {
+      if (x == o) {
+        return write(key, i);
+      }
+    },
+    IArrayPut(x, i, _) => {
+      if (x == o) {
+        return write(key, i);
+      }
+    },
+    IMakeUnique(x) => {
+      if (x == o) {
+        return PASS;
+      }
+    },
+    ITag(_, x) => {
+      if (isLocal(x, o)) {
+        return PASS;
+      }
+    },
+    IBorrow(_, x) => {
+      if (x == o) {
+        return PASS;
+      }
+    },
+    IDup(_, x) => {
+      if (isLocal(x, o)) {
+        return PASS;
+      }
+    },
+    _ => {},
+  }
+  // everything else: harmless unless it mentions `o` (a call or builtin that receives it, a push / pop / extend, a move,
+  // a release, a consuming constructor ...)
+  return instrLocals(ins).includes(o) ? STOP : PASS;
+}
+
+// Rule F1: is `IForward(_, s, OLocal(o) , key)` at position `at` of block `blk` of `f` justified?
+export function forwardJustified(
+  p: MProgram,
+  f: MFunction,
+  blk: usize,
+  at: usize,
+  s: usize,
+  x: Operand,
+  key: Operand,
+): bool {
+  match (x) {
+    OLocal(o) => {
+      const instrs = f.blocks[blk].instrs;
+      let i = at;
+      let n: usize = 0;
+      while (i > 0 && n < WINDOW) {
+        i -= 1;
+        n += 1;
+        const ins = instrs[i];
+        const v = verdict(ins, s, o, key);
+        if (v == SOURCE) {
+          return true;
+        }
+        if (v == STOP || defines(p, ins, s) || defines(p, ins, o) || keyDefined(p, ins, key)) {
+          return false;
+        }
+      }
+      return false;
+    },
+    _ => {
+      return false;
+    },
+  }
+}
+
+function keyDefined(p: MProgram, ins: Instr, key: Operand): bool {
+  return match (key) {
+    OLocal(l) => defines(p, ins, l),
+    _ => false,
+  };
+}

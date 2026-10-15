@@ -45,3 +45,8 @@ import Orin
 #print axioms Orin.check_sound
 #print axioms Orin.check_no_use_after_free
 #print axioms Orin.check_no_shared_store
+#print axioms Orin.load_load
+#print axioms Orin.store_load
+#print axioms Orin.store_frame_other_slot
+#print axioms Orin.store_frame_other_local
+#print axioms Orin.makeUnique_frame

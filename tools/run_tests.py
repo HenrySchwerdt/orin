@@ -3,7 +3,7 @@
 
 Usage: python3 tools/run_tests.py --orinc <compiler> [--cc cc] [--filter substr]
                                   [-j/--jobs N] [--sanitize] [--suite default|next|all]
-                                  [--backend c|llvm]
+                                  [--backend c|llvm] [--assert-facts]
 
 Suites: `default` = tests/run + tests/errors (the Orin-B contract, every compiler stage);
 `next` = tests/next/run + tests/next/errors (language beyond Orin-B, self-hosted compiler only);
@@ -92,6 +92,7 @@ def run_cmd(cmd, timeout, env=None, stdin_data=None):
 def compile_orin(args, entry, c_out, flags=()):
     rel = os.path.relpath(entry, ROOT)
     extra = ["--backend=llvm"] if args.backend == "llvm" else []
+    extra += ["--assert-facts"] if args.assert_facts else []
     extra += list(flags)
     return run_cmd([args.orinc, "compile", rel, "-o", c_out] + extra, COMPILE_TIMEOUT)
 
@@ -255,6 +256,8 @@ def main():
                     help="default: tests/run + tests/errors; next: tests/next/*; all: both")
     ap.add_argument("--backend", choices=["c", "llvm"], default="c",
                     help="c: emit C (default); llvm: emit LLVM IR and build with clang")
+    ap.add_argument("--assert-facts", action="store_true",
+                    help="compile with `--assert-facts`: every forwarded load is checked against its slot at run time (exit 70)")
     args = ap.parse_args()
 
     if not os.path.isabs(args.orinc) and os.sep in args.orinc:

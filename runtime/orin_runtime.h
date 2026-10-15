@@ -384,6 +384,8 @@ void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j);
  * confuses value shapes becomes a clean trap instead of an out-of-bounds read or write. The ownership verifier
  * does not check value shapes. The LLVM backend does the same check in its inline helper @orinl_slot. */
 void orin_trap_shape(void) __attribute__((noreturn, cold));
+/* `--assert-facts` builds only (docs/mir.md v2.4): checks the value an IForward claims for slot `key` of `o`; exit 70 if it differs. */
+void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got);
 static inline void orin_chk_slot(const OrinObj *o, uint32_t i) {
     if (ORIN_UNLIKELY(o->kind != ORIN_K_STRUCT || i >= ((const OrinStruct *)o)->nslots)) orin_trap_shape();
 }
