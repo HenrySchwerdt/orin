@@ -190,12 +190,106 @@ export type ExprKind =
   | ENew(Ident, TypeExpr[], Expr[])                   // `new C(args)` / `new C<T>(args)` (generic classes, ADR-0026)
   | EThis
   // --- beyond Orin-B (closures, ADR-0011) ---
-  | EArrow(ArrowParam[], Option<TypeExpr>, ArrowBody);  // `(x: T, y) [: R] => body` / `x => body`
+  | EArrow(ArrowParam[], Option<TypeExpr>, ArrowBody)  // `(x: T, y) [: R] => body` / `x => body`
+  // --- beyond Orin-B (JSX, ADR-0043) ---
+  | EJsx(JsxElement);                                 // `<div class="a">{x}</div>`, `<Card title={t} />`, `<>..</>`
 
 // A parameter type may be omitted when the checker knows the expected function type.
 export type ArrowParam = { name: Ident; ty: Option<TypeExpr>; span: Span; };
 
 export type ArrowBody = AExpr(Expr) | ABlock(Block);
+
+// JSX (ADR-0043). `name` is None for a fragment `<>..</>`. A name starting with an upper-case letter is a component
+// (a function called with the attributes as named arguments), any other an HTML element. The closing tag is not kept
+// (the parser checks that it repeats the name). `selfClosing`: written `<x />` (then `children` is empty).
+export type JsxElement = {
+  name: Option<Ident>;
+  attrs: JsxAttr[];
+  children: JsxChild[];
+  selfClosing: bool;
+  span: Span;
+};
+
+// `name="text"` (JSX string: no backslash escapes, entities decoded), `name={expr}` or a bare `name` (the value `true`).
+export type JsxAttr = { name: Ident; value: JsxValue; span: Span; };
+
+export type JsxValue = JVStr(string) | JVExpr(Expr) | JVTrue;
+
+// Text between tags (cooked: JSX whitespace rules applied, entities decoded; never empty), `{expr}`, a nested element.
+export type JsxChild = JText(string, Span) | JExpr(Expr) | JElem(JsxElement);
+
+// The expressions written inside `el` (attribute values and `{..}` children, nested elements included), in source order.
+export function jsxExprs(el: JsxElement): Expr[] {
+  let out: Expr[] = [];
+  for (const a of el.attrs) {
+    match (a.value) {
+      JVExpr(x) => {
+        out.push(x);
+      },
+      _ => {},
+    }
+  }
+  for (const c of el.children) {
+    match (c) {
+      JExpr(x) => {
+        out.push(x);
+      },
+      JElem(sub) => {
+        out = out.concat(jsxExprs(sub));
+      },
+      JText(_, _) => {},
+    }
+  }
+  return out;
+}
+
+// `el` with `f` applied to every expression written inside it (the same order as `jsxExprs`); the shape is unchanged.
+export function jsxMapExprs(el: JsxElement, f: (x: Expr) => Expr): JsxElement {
+  let attrs: JsxAttr[] = [];
+  for (const a of el.attrs) {
+    const v = match (a.value) {
+      JVExpr(x) => JVExpr(f(x)),
+      JVStr(s) => JVStr(s),
+      JVTrue => JVTrue,
+    };
+    attrs.push(JsxAttr { name: a.name, value: v, span: a.span });
+  }
+  let kids: JsxChild[] = [];
+  for (const c of el.children) {
+    const k = match (c) {
+      JExpr(x) => JExpr(f(x)),
+      JElem(sub) => JElem(jsxMapExprs(sub, f)),
+      JText(t, sp) => JText(t, sp),
+    };
+    kids.push(k);
+  }
+  return JsxElement { name: el.name, attrs: attrs, children: kids, selfClosing: el.selfClosing, span: el.span };
+}
+
+// The names of the component tags in `el` (itself and nested elements), in source order: references to functions.
+export function jsxComponents(el: JsxElement): Ident[] {
+  let out: Ident[] = [];
+  if (jsxIsComponent(el)) {
+    out.push(el.name.unwrap());
+  }
+  for (const c of el.children) {
+    match (c) {
+      JElem(sub) => {
+        out = out.concat(jsxComponents(sub));
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+// A component tag: the name starts with an upper-case ASCII letter (`<Card />`); `<div>` and fragments are not.
+export function jsxIsComponent(el: JsxElement): bool {
+  return match (el.name) {
+    Some(n) => n.name.length > 0 && n.name.charCodeAt(0) >= 65 && n.name.charCodeAt(0) <= 90,
+    None => false,
+  };
+}
 
 export type FieldInit = { name: Ident; value: Expr; span: Span; };
 

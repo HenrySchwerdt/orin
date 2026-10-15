@@ -693,22 +693,32 @@ function; with it `Some(x)` for `pop().unwrap()` disappears). Each is a MIR pass
 
 ## HTML rendering
 
-`bench/html` (C, Go) and `bench/html_hand` (Orin) render the same page: a 2000-row product table (`<tr>` with an id, an even / odd class,
-an HTML-escaped name, a price, an escaped and URL-sanitised link, and a checkbox that is `disabled` for every third row) 400 times from
-scratch, sum the page lengths (about 144.6 MB in all), and hash the last page. Every 7th name contains `<b>&"sale"</b> it's`
-(all five characters are escaped) and every 11th URL is `javascript:alert(i)`, which the Go `html/template`-style rule replaces by
-`about:invalid#orin-unsafe-url`. The three programs print byte-identical `bytes`, `hash` and `head` lines. C uses one growing buffer
-(`memcpy`, an escape loop that copies runs between special characters), Go a `strings.Builder`, Orin plain concatenation into one
-accumulating string (`out += ...`, appended in place while the string is unique) with `escape` and `safeUrl` written in the same file
-(the later `std:html` replaces them). `bench/html_hand` is an Orin-only row; the JSX version will be `bench/html/main.or`, compared against the
-same C and Go baselines. 4-core Xeon 2.8 GHz VM with other work running, 3 runs, median (min-max):
+`bench/html` renders a 2000-row product table (`<tr>` with an id, an even / odd class, an HTML-escaped name, a price, an
+escaped and URL-sanitised link, and a checkbox that is `disabled` for every third row) 400 times from scratch, sums the
+page lengths (about 144.6 MB in all) and hashes the last page. Every 7th name contains `<b>&"sale"</b> it's` (all five
+characters are escaped) and every 11th URL is `javascript:alert(i)`, which the Go `html/template`-style rule replaces by
+`about:invalid#orin-unsafe-url`. All programs print byte-identical `bytes`, `hash` and `head` lines.
+
+- `bench/html/main.or`: **JSX** (ADR-0043), a `Row` and a `Page` component; each component is one fused buffer.
+- `bench/html_hand/main.or`: the same page **hand-written** in Orin, plain concatenation into one accumulating string
+  (`out += ...`) with the same `std:html` `escape` / `safeUrl` (Orin-only row).
+- `bench/html/main.c`: one growing buffer, `memcpy`, an escape loop copying runs; `main.go`: `strings.Builder`.
+
+4-core Xeon 2.8 GHz VM with other work running (wall times are noisy; the instruction counts are the metric):
 
 | program | Orin C backend | Orin LLVM backend | Go | C |
 |---|---:|---:|---:|---:|
-| html (hand-written, `bench/html_hand` source) | 0.384 s (0.356-0.517) | 0.433 s (0.390-0.512) | 0.494 s (0.433-0.536) | 0.183 s (0.159-0.206) |
+| executed instructions, JSX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
+| executed instructions, hand-written Orin (`html_hand`) | 4.71 G | 4.63 G | | |
+| wall, JSX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
+| allocations, JSX: strings / `Html` records | 2.74 M / 0.80 M | | | |
+| allocations, hand-written: strings | 5.03 M | | | |
 
-Orin allocates 6.9M strings for 400 pages (about 17,000 per page: the concatenation operands of each `out += a + b + c`), which is the
-cost a JSX lowering that appends the parts directly should avoid.
+JSX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
+parts are merged at compile time and appended into one buffer, while `out += a + b + c` builds a temporary per
+operator. It is 2.5x the instructions of C. What remains, in order (ADR-0043 "Not done"): geometric re-growth of each
+buffer (`string_grows` 4.2 M; a capacity hint from the known static length), the temporary string of every converted
+integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` + `joinAll`).
 
 ## Benchmark workflow (CI), metrics and history
 
