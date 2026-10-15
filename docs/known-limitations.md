@@ -49,8 +49,10 @@
   parameter only: a closure cannot capture one (E0452; take all grants with `useHost`, pass them as arguments, or use
   `withFileFs`), there is no `host.fs()` returning a grant, and at most 256 grants are live at once. `console.*` and
   `exit` need no grant (ambient output). Path scopes are checked lexically and through symbolic links at the time of the
-  operation (no protection against races, hard links or mounts); `shell` is outside every grant; a denied
-  operation that cannot return an `Err` traps; the network and environment families are reserved only.
+  operation (no protection against races, hard links or mounts). `shell` (exported by `std:io`) requires a
+  process grant with spawn authority, but the spawned command is outside Orin's grant restrictions. A denied
+  operation that cannot return an `Err` traps. Network grants are implemented by `std:net` (ADR-0033), including
+  listen/connect narrowing and `ORIN_DENY=net`; the environment family remains reserved.
 - Effect inference (Stage B, `orin effects`, docs/capabilities.md): the summary is a sound over-approximation *per operation
   family*, not per resource (it does not say which file), and it is about the program text: native code, FFI, the OS and
   spawned children are outside it. Function values of unknown origin (a struct field, an array element, a call result), interface

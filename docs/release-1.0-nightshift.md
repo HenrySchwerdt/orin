@@ -72,3 +72,16 @@ and disable the night-shift heartbeat. Do not claim feature completeness or proo
 - JSON compatibility design and the release-readiness audit are active. The coordinator's
   checkout is now on main. `build/overnight/state.json` remains the generated local coordination
   source; this documentation update does not modify it.
+
+## 23:30 coordination checkpoint
+
+- PR #82 (forwarding, including the assertion-order correction) and PR #86 (portable bounded
+  execution) are merged. GitHub records their merges at 23:00:50 and 23:30:54 Europe/Berlin,
+  respectively, on 2026-10-15. Their earlier checkpoint statuses remain historical observations.
+- PR #87's factual correction is approved, pending merge. Its audit keeps the dated source
+  baseline and does not treat later integrations as evidence for that earlier tree.
+- PR #88 (JSON completeness/compatibility design) is merged. This is a design, not numeric JSON
+  implementation or a stable API freeze decision.
+- PR #89 (numeric utilities) is under review; correction of its std CI failure has been requested.
+- This R4 documentation pass reconciles capability/network status, platform evidence counts and
+  published package availability. It does not change runtime code, API stability or proof scope.
