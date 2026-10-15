@@ -8,7 +8,7 @@ import { Host, useFs } from "std:host";
 import { FsGrant } from "std:fs";
 import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
 import { Span, SourceFile, span } from "../diag";
-import { BArrConcat, BStrLength, UnNeg, OpAdd } from "../hir";
+import { BArrConcat, BArrLength, BStrLength, UnNeg, OpAdd } from "../hir";
 import {
   MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, plainBlock,
 } from "../mir";
@@ -22,7 +22,7 @@ import {
   usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
-  instrUses, usesAffecting,
+  instrUses, usesAffecting, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -749,4 +749,169 @@ function usesAffectingAgreesWithInstrUses(host: Host): void {
       assert(usesAffectingAgrees(optimize(p)), "optimised");
     },
   );
+}
+
+
+// ---------------------------------------------------------------- redundant makeunique (ADR-0038 addendum T1)
+
+@Test
+function aMakeUniqueOfAFreshObjectIsDropped(): void {
+  const f = straight(
+    [lr("x")],
+    [IStructNew(0, 0, [OStr(0)]), IMakeUnique(0), ISetField(0, 0, OStr(0)), IMakeUnique(0), ISetField(0, 0, OStr(0)), IRelease(0)],
+  );
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  assertEqUsize(makeUniqueCount(f), 2, "two before");
+  const g = dropUniqueChecks(prog([f]), f);
+  assertEqUsize(makeUniqueCount(g), 0, "both are redundant: the struct is Unique from its creation");
+  assertEqUsize(instrCount(g), instrCount(f) - 2, "nothing else changed");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aMakeUniqueOfASharedObjectStays(): void {
+  const f = straight(
+    [lr("x"), lr("d")],
+    [
+      IStructNew(0, 0, [OStr(0)]),
+      IDup(1, OLocal(0)),
+      IMakeUnique(0),
+      ISetField(0, 0, OStr(0)),
+      IRelease(1),
+      IRelease(0),
+    ],
+  );
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = dropUniqueChecks(prog([f]), f);
+  assertEqUsize(makeUniqueCount(g), 1, "x was shared by the dup: the check is needed");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aMakeUniqueAfterAFirstOneIsDroppedAndOneParameterStays(): void {
+  // f(p, q): makeunique of a borrowed-parameter copy is needed; the second one on the same local is not
+  const f = fn(
+    "f",
+    1,
+    [lr("p"), lr("x")],
+    [bk([IDup(1, OLocal(0)), IMakeUnique(1), IMakeUnique(1), ISetField(1, 0, OStr(0)), IRelease(1)], TReturn(None))],
+  );
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = dropUniqueChecks(prog([f]), f);
+  assertEqUsize(makeUniqueCount(g), 1, "the first stays, the second is redundant");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aLoopKeepsUniquenessOnlyWhenEveryPathDoes(): void {
+  // b0: x = struct; goto b1.  b1: makeunique x; setfield; branch c b1 b2.  b2: release x
+  const f = fn(
+    "f",
+    1,
+    [lb("c"), lr("x")],
+    [
+      bk([IStructNew(1, 0, [OStr(0)])], TGoto(1)),
+      bk([IMakeUnique(1), ISetField(1, 0, OStr(0))], TBranch(OLocal(0), 1, 2)),
+      bk([IRelease(1)], TReturn(None)),
+    ],
+  );
+  assert(verifies(prog([f])), "the input verifies");
+  assertEqUsize(makeUniqueCount(dropUniqueChecks(prog([f]), f)), 0, "Unique on entry and around the back edge");
+  // a dup on the back edge path makes the join Owned: the check in the loop head is needed
+  const g = fn(
+    "g",
+    1,
+    [lb("c"), lr("x"), lr("d")],
+    [
+      bk([IStructNew(1, 0, [OStr(0)])], TGoto(1)),
+      bk([IMakeUnique(1), ISetField(1, 0, OStr(0))], TBranch(OLocal(0), 3, 2)),
+      bk([IRelease(1)], TReturn(None)),
+      bk([IDup(2, OLocal(1)), IRelease(2)], TGoto(1)),
+    ],
+  );
+  const pg = prog([g]);
+  assert(verifies(pg), "the input verifies");
+  const h = dropUniqueChecks(pg, g);
+  assertEqUsize(makeUniqueCount(h), 1, "the dup demotes x on one path into the head");
+  assert(verifies(prog([h])), "the verifier accepts the result");
+}
+
+@Test
+function aCallArgumentDemotesTheLocalBeforeTheNextMakeUnique(): void {
+  // g(x) returns a reference: passing a Unique x to it demotes x (docs/mir.md), so the check after the call stays
+  const callee = MFunction {
+    name: "id",
+    paramCount: 1,
+    paramOwned: [false],
+    inout: false,
+    locals: [lr("a"), lr("r")],
+    ret: MRef,
+    blocks: [bk([IDup(1, OLocal(0))], TReturn(Some(OLocal(1))))],
+  };
+  const f = fn(
+    "f",
+    0,
+    [lr("x"), lr("r")],
+    [
+      bk(
+        [
+          IStructNew(0, 0, [OStr(0)]),
+          ICall(Some(1), 1, [OLocal(0)]),
+          IMakeUnique(0),
+          ISetField(0, 0, OStr(0)),
+          IRelease(1),
+          IRelease(0),
+        ],
+        TReturn(None),
+      ),
+    ],
+  );
+  const p = prog([f, callee]);
+  assert(verifies(p), "the input verifies");
+  const q = dropUniqueProgram(p);
+  assertEqUsize(makeUniqueCount(q.functions[0]), 1, "x may be shared with the result");
+  assert(verifies(q), "the verifier accepts the result");
+}
+
+@Test
+function aCallWithAScalarResultAndAMoveKeepUniqueness(): void {
+  // len(a) -> int and arr.length(x) do not demote x; y = move x keeps the kind, so neither makeunique is needed
+  const callee = MFunction {
+    name: "len",
+    paramCount: 1,
+    paramOwned: [false],
+    inout: false,
+    locals: [lr("a"), li("n")],
+    ret: MInt,
+    blocks: [bk([ICopy(1, OInt(0))], TReturn(Some(OLocal(1))))],
+  };
+  const f = fn(
+    "f",
+    0,
+    [lr("x"), li("n"), lr("y")],
+    [
+      bk(
+        [
+          IStructNew(0, 0, [OStr(0)]),
+          ICall(Some(1), 1, [OLocal(0)]),
+          IMakeUnique(0),
+          IBuiltin(Some(1), BArrLength, [OLocal(0)]),
+          IMakeUnique(0),
+          IMove(2, 0),
+          IMakeUnique(2),
+          ISetField(2, 0, OStr(0)),
+          IRelease(2),
+        ],
+        TReturn(None),
+      ),
+    ],
+  );
+  const p = prog([f, callee]);
+  assert(verifies(p), "the input verifies");
+  const q = dropUniqueProgram(p);
+  assertEqUsize(makeUniqueCount(q.functions[0]), 0, "x stays Unique over the call and over the move");
+  assert(verifies(q), "the verifier accepts the result");
 }
