@@ -14,7 +14,7 @@
 import { MProgram, MFunction, MLocal, MBlock, MType, Operand, Instr } from "../mir";
 import { Span } from "../diag";
 import { Locals } from "../lower";
-import { State, Cx, step, blockInStates, KUnique } from "../verify";
+import { Transfer, stateOrDead, lsKind, blockInStates, KUnique } from "../verify";
 import { instrDef, ancestors, usesAffecting, isRefTy } from "./analysis";
 import { BlockSink, RewritePlan, withBody } from "./rewrite";
 import {
@@ -145,7 +145,10 @@ export function insertCallDups(
   while (b < f.blocks.length) {
     const blk = f.blocks[b];
     let out = new BlockSink();
-    let st: Option<State> = states[b];
+    // one replay of the block, advanced in place instruction by instruction (a context per step would copy the state
+    // each time); a block that is not reached has no state to replay
+    const reached = states[b].isSome();
+    let rp = new Transfer(orig, f, b, 0, stateOrDead(states[b], f.locals.length), [], []);
     let i: usize = 0;
     while (i < blk.instrs.length) {
       const ins = blk.instrs[i];
@@ -167,18 +170,11 @@ export function insertCallDups(
                     const t = locals.fresh(MRef);
                     pre.push(IDup(t, a));
                     a = OLocal(t);
-                    if (!isRefDst(f, dst)) {
-                      match (st) {
-                        Some(s) => {
-                          if (s.ls[x].k == KUnique) {
-                            // nothing is planned in this pass: an empty plan (only built here, the rare case)
-                            const none = new RewritePlan(blk.instrs.length);
-                            if (findRelease(blk.instrs, none, i + 1, x, anc).isNone()) {
-                              post.push(IMakeUnique(x));
-                            }
-                          }
-                        },
-                        None => {},
+                    if (!isRefDst(f, dst) && reached && lsKind(rp.ls[x]) == KUnique) {
+                      // nothing is planned in this pass: an empty plan (only built here, the rare case)
+                      const none = new RewritePlan(blk.instrs.length);
+                      if (findRelease(blk.instrs, none, i + 1, x, anc).isNone()) {
+                        post.push(IMakeUnique(x));
                       }
                     }
                   }
@@ -202,12 +198,9 @@ export function insertCallDups(
         out.emit(ins, here);
       }
       // advance the replayed verifier state over the *original* instruction
-      match (st) {
-        Some(s) => {
-          const c = step(Cx { prog: orig, f: f, blk: b, ins: i, st: s, errs: [], warns: [] }, ins);
-          st = Some(c.st);
-        },
-        None => {},
+      if (reached) {
+        rp.ins = i;
+        rp.step(ins);
       }
       i += 1;
     }

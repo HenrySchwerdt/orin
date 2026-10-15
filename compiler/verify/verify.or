@@ -12,7 +12,7 @@ import {
   isWellFormedProgram,
 } from "../mir";
 import {
-  VerifyIssue, issueSpan, sameSpan, State, LState, mk, holesEq, KDead, KOwned, KParam, KInit,
+  VerifyIssue, issueSpan, sameSpan, State, mk, holesEq, KDead, KOwned, KParam, KInit,
 } from "./state";
 import { CRef, CHandle, localClass, wfInstr, wfTerm, wfFunction } from "./wf";
 import { Transfer } from "./rules";
@@ -66,7 +66,7 @@ function entryQueued(n: usize): bool[] {
 @Requires(isWellFormedFunction(p, f))
 @Ensures(result.ls.length == f.locals.length && result.holes.length == 0 && result.borrowsFlat())
 function entryState(p: MProgram, f: MFunction): State {
-  let ls: LState[] = [];
+  let ls: int[] = [];
   let i: usize = 0;
   while (i < f.locals.length) {
     if (i < f.paramCount) {
@@ -131,12 +131,17 @@ export function reachClosed(f: MFunction, ins: Option<State>[]): bool {
 @Invariant(this.ins.length > 0 && this.ins[0].isSome())
 @Invariant(this.queued.length == this.ins.length)
 @Invariant(this.work.length <= this.queued.length)
+@Invariant(this.none.length == 0)
 export class Fixpoint {
   private prog: MProgram;
   private f: MFunction;
   ins: Option<State>[];
   private work: usize[];
   private queued: bool[];
+  // An empty issue list shared by every block run of the fixpoint, which discards what it reports (the reporting pass
+  // keeps its own): a block run takes it by reference instead of allocating two fresh empty lists, and an issue
+  // pushed to it (only for MIR that fails the verifier) copies it first, so it stays empty.
+  private none: VerifyIssue[];
 
   constructor(prog: MProgram, f: MFunction) {
     this.prog = prog;
@@ -144,6 +149,7 @@ export class Fixpoint {
     this.ins = initialIns(prog, f);
     this.work = [0];
     this.queued = entryQueued(f.blocks.length);
+    this.none = [];
   }
 
   // Number of blocks waiting to be run.
@@ -173,6 +179,15 @@ export class Fixpoint {
     return b;
   }
 
+  // The state after block `b` run from `st`, its issues discarded.
+  @Requires(b < this.f.blocks.length && st.ls.length == this.f.locals.length)
+  @Ensures(result.ls.length == st.ls.length)
+  private outOf(b: usize, st: State): State {
+    let t = new Transfer(this.prog, this.f, b, 0, st, this.none, this.none);
+    t.run();
+    return t.state();
+  }
+
   // Iterates to the fixpoint. Afterwards the worklist is empty, every reached block's successors are reached, and the
   // in-states are stable: running any reached block and joining its out-state into a successor's in-state changes
   // nothing (a block that was forgotten in the worklist would show here).
@@ -184,7 +199,7 @@ export class Fixpoint {
   run(): void {
     while (this.work.length > 0) {
       const b = this.take();
-      const out = runBlock(this.prog, this.f, b, this.ins[b].unwrap()).state();
+      const out = this.outOf(b, this.ins[b].unwrap());
       for (const s of successors(this.f.blocks[b].term)) {
         match (this.ins[s]) {
           None => {
@@ -212,7 +227,7 @@ export class Fixpoint {
       match (this.ins[b]) {
         None => {},
         Some(st) => {
-          const out = runBlock(this.prog, this.f, b, st).state();
+          const out = this.outOf(b, st);
           for (const s of successors(this.f.blocks[b].term)) {
             match (this.ins[s]) {
               None => {
