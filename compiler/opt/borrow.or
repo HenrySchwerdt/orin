@@ -1,0 +1,252 @@
+// Borrow inference for read-only copies of parameters (ADR-0038 class (d), docs/mir.md "Borrowed parameters").
+//
+// The lowering copies a reference parameter into a local before using it (`this` in every method): `d = dup p; ..reads of
+// d..; release d`. That `dup` is a use of p at its last use, so the owned-parameter inference (params.or) would make p
+// owned, and every caller would retain the argument for the callee to release. When the copy is only *read*, the retain
+// and the release are pure overhead: the caller keeps its reference for the whole call anyway.
+//
+// A local d is a *read-only copy* when it has exactly one definition (the `dup`, in a local that is not a parameter) and
+// every use of it is one of
+//   - `release d` (removed with the copy),
+//   - the object of `getfield` / `arrayget`, a `tag`, an operand of a builtin or of a binary operation,
+//   - the callee or an argument of an indirect or virtual call (always borrowed),
+//   - an argument of a direct call, in the callee's parameter position (a *dependent* position: the copy is read-only
+//     only while that parameter stays borrowed).
+// Any other use (a move, a store into a record, a return, a second `dup`, a mutation, a terminator) consumes or changes
+// the copy: it is not read-only, and the `dup` counts as the consuming last use it always was (default deny).
+//
+// `readInfo` collects the facts; params.or reads them in the mode inference (a read-only copy at the last use of p does
+// not make p owned, unless one of its dependent positions is owned); `borrowReads` rewrites a function once the modes
+// are final: for every borrowed parameter p, `d = dup p` of a read-only copy whose dependent positions are all borrowed
+// becomes `d = borrow p` and the `release d` instructions go. The verifier sees an alias of a borrowed parameter, which
+// is valid for the whole call.
+
+import { MProgram, MFunction, MBlock, Operand, Instr } from "../mir";
+import { instrUses, instrDef, termUses, isRefTy } from "./analysis";
+import { BlockSink, withBody } from "./rewrite";
+import { fnWellFormed, passKept, instrCount, dupCount, releaseCount } from "./wellformed";
+
+// Argument `pos` of a direct call of function `callee`.
+export type ReadCall = { callee: usize; pos: usize; };
+
+// Per local of a function: `bad[l]`: l is not a read-only copy (a local with other than one definition, a parameter, or a
+// use that is not a read). The direct-call positions locals are passed in, as parallel lists (`cLocal[k]` is passed as
+// argument `cPos[k]` of function `cCallee[k]`; read them with `callsOf`).
+@Invariant(this.cLocal.length == this.cCallee.length && this.cLocal.length == this.cPos.length)
+export type ReadInfo = { bad: bool[]; cLocal: usize[]; cCallee: usize[]; cPos: usize[]; };
+
+// The direct-call positions local l is passed in.
+export function callsOf(info: ReadInfo, l: usize): ReadCall[] {
+  let out: ReadCall[] = [];
+  let k: usize = 0;
+  while (k < info.cLocal.length) {
+    if (info.cLocal[k] == l) {
+      out.push(ReadCall { callee: info.cCallee[k], pos: info.cPos[k] });
+    }
+    k += 1;
+  }
+  return out;
+}
+
+function isLocal(o: Operand, l: usize): bool {
+  return match (o) {
+    OLocal(m) => m == l,
+    _ => false,
+  };
+}
+
+function mentions(os: Operand[], l: usize): bool {
+  for (const o of os) {
+    if (isLocal(o, l)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Does instruction `ins` use local l in a way that does not consume or change it? Direct-call positions are not decided
+// here (see `readInfo`).
+function readsOnly(ins: Instr, l: usize): bool {
+  return match (ins) {
+    IRelease(_) => true,
+    IGetField(_, o, _) => isLocal(o, l),
+    IArrayGet(_, a, k) => isLocal(a, l) && !isLocal(k, l),
+    ITag(_, o) => isLocal(o, l),
+    IBuiltin(_, _, _) => true,
+    IBinary(_, _, _, _) => true,
+    ICallIndirect(_, _, _) => true,
+    ICallVirtual(_, _, _, _) => true,
+    ICall(_, _, _) => true,
+    _ => false,
+  };
+}
+
+@Ensures(result.bad.length == f.locals.length)
+export function readInfo(f: MFunction): ReadInfo {
+  const n = f.locals.length;
+  let bad: bool[] = [];
+  let cLocal: usize[] = [];
+  let cCallee: usize[] = [];
+  let cPos: usize[] = [];
+  let defs: usize[] = [];
+  let l: usize = 0;
+  while (l < n) {
+    bad.push(l < f.paramCount || !isRefTy(f.locals[l].ty));
+    defs.push(0);
+    l += 1;
+  }
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (instrDef(ins)) {
+        Some(d) => {
+          defs[d] += 1;
+        },
+        None => {},
+      }
+      for (const u of instrUses(ins)) {
+        if (!bad[u]) {
+          if (!readsOnly(ins, u)) {
+            bad[u] = true;
+          }
+        }
+      }
+      match (ins) {
+        ICall(_, g, args) => {
+          let j: usize = 0;
+          while (j < args.length) {
+            match (args[j]) {
+              OLocal(a) => {
+                cLocal.push(a);
+                cCallee.push(g);
+                cPos.push(j);
+              },
+              _ => {},
+            }
+            j += 1;
+          }
+        },
+        _ => {},
+      }
+    }
+    for (const u of termUses(blk.term)) {
+      bad[u] = true;
+    }
+  }
+  l = 0;
+  while (l < n) {
+    if (defs[l] != 1) {
+      bad[l] = true;
+    }
+    l += 1;
+  }
+  return ReadInfo { bad: bad, cLocal: cLocal, cCallee: cCallee, cPos: cPos };
+}
+
+// `d = dup p` with p a reference parameter and d a read-only copy.
+@Requires(info.bad.length == f.locals.length)
+export function isReadCopy(f: MFunction, info: ReadInfo, ins: Instr): bool {
+  return match (ins) {
+    IDup(d, o) => match (o) {
+      OLocal(p) => p < f.paramCount && isRefTy(f.locals[p].ty) && d < info.bad.length && !info.bad[d],
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// `d = dup p` with p a reference parameter (a candidate before the uses of d are known).
+function copiesParam(f: MFunction, ins: Instr): bool {
+  return match (ins) {
+    IDup(_, o) => match (o) {
+      OLocal(p) => p < f.paramCount && isRefTy(f.locals[p].ty),
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// Is argument `pos` of `callee` an owned parameter?
+function ownedAt(prog: MProgram, callee: usize, pos: usize): bool {
+  const o = prog.functions[callee].paramOwned;
+  return pos < o.length && o[pos];
+}
+
+// `f` (whose `paramOwned` holds the final modes of its parameters; `prog` those of every callee) with the read-only
+// copies of its borrowed parameters turned into borrows. Only `dup` and `release` instructions change: the copy's `dup`
+// becomes an `IBorrow` (same operands) and its `release`s are removed.
+@Requires(fnWellFormed(prog, f))
+@Ensures(passKept(f, result) && fnWellFormed(prog, result))
+@Ensures(result.blocks.length == f.blocks.length && result.locals.length == f.locals.length)
+@Ensures(instrCount(result) <= instrCount(f) && dupCount(result) <= dupCount(f))
+@Ensures(releaseCount(result) <= releaseCount(f))
+export function borrowReads(prog: MProgram, f: MFunction): MFunction {
+  if (!f.paramOwned.some(o => !o) || !f.blocks.some(blk => blk.instrs.some(ins => copiesParam(f, ins)))) {
+    return f;
+  }
+  const info = readInfo(f);
+  let conv: bool[] = [];
+  let any = false;
+  for (const _l of f.locals) {
+    conv.push(false);
+  }
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      if (isReadCopy(f, info, ins)) {
+        match (ins) {
+          IDup(d, o) => {
+            match (o) {
+              OLocal(p) => {
+                if (p < f.paramOwned.length
+                    && !f.paramOwned[p]
+                    && !callsOf(info, d).some(c => ownedAt(prog, c.callee, c.pos))) {
+                  conv[d] = true;
+                  any = true;
+                }
+              },
+              _ => {},
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+  }
+  if (!any) {
+    return f;
+  }
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    let out = new BlockSink();
+    let i: usize = 0;
+    while (i < blk.instrs.length) {
+      const ins = blk.instrs[i];
+      match (ins) {
+        IDup(d, o) => {
+          match (o) {
+            OLocal(p) => {
+              if (conv[d]) {
+                out.emit(IBorrow(d, p), blk.spans[i]);
+              } else {
+                out.emit(ins, blk.spans[i]);
+              }
+            },
+            _ => {
+              out.emit(ins, blk.spans[i]);
+            },
+          }
+        },
+        IRelease(x) => {
+          if (!conv[x]) {
+            out.emit(ins, blk.spans[i]);
+          }
+        },
+        _ => {
+          out.emit(ins, blk.spans[i]);
+        },
+      }
+      i += 1;
+    }
+    blocks.push(out.finish(blk.term, blk.termSpan));
+  }
+  return withBody(f, f.locals, blocks);
+}

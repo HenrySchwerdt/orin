@@ -19,7 +19,7 @@ import { verify } from "../verify";
 import {
   optimize, inferModes, ParamInference, closureTargets, allBorrowed, sameFunctions, pruneProgram,
   prunedOk, insertCallDups, peephole, rewriteParam, scanSites, paramLiveness, livenessSolved,
-  usedFlags, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
+  usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
   instrUses, usesAffecting,
@@ -275,8 +275,8 @@ function modesProgram(): MProgram {
   const keep = fn(
     "keep",
     1,
-    [lr("p"), lr("d")],
-    [bk([IDup(1, OLocal(0)), IRelease(1)], TReturn(None))],
+    [lr("p"), lr("d"), lr("box")],
+    [bk([IDup(1, OLocal(0)), IStructNew(2, 0, [OLocal(1)]), IRelease(2)], TReturn(None))],
   );
   const boxed = fn(
     "boxed",
@@ -350,6 +350,134 @@ function anOwnedParameterIsReleasedOnTheEdgeWhereItDies(): void {
     "the branch goes through the edge block",
   );
   assert(verifies(prog([k])), "the result verifies");
+}
+
+
+// ---------------------------------------------------------------- borrow inference (ADR-0038 class (d))
+
+function isBorrow(i: Instr, d: usize, s: usize): bool {
+  return match (i) {
+    IBorrow(a, b) => a == d && b == s,
+    _ => false,
+  };
+}
+
+// peek(p): reads a copy of p. relay(q): hands a copy to peek. keep(r): stores a copy. relayKeep(t): hands a copy to keep.
+// mutate(m): makes the copy unique and writes a field. twice(u): reads the copy, then copies it again.
+// main passes a string to relayKeep, so the parameters of relayKeep and keep hold a real reference (otherwise unboxing
+// would turn the never-built value into an empty aggregate).
+function borrowProgram(): MProgram {
+  const mainF = fn("main", 0, [], [bk([ICall(None, 4, [OStr(0)])], TReturn(None))]);
+  const peek = fn(
+    "peek",
+    1,
+    [lr("p"), lr("d"), li("n")],
+    [bk([IDup(1, OLocal(0)), IBuiltin(Some(2), BStrLength, [OLocal(1)]), IRelease(1)], TReturn(None))],
+  );
+  const relay = fn(
+    "relay",
+    1,
+    [lr("q"), lr("d")],
+    [bk([IDup(1, OLocal(0)), ICall(None, 1, [OLocal(1)]), IRelease(1)], TReturn(None))],
+  );
+  const keep = fn(
+    "keep",
+    1,
+    [lr("r"), lr("d"), lr("box")],
+    [bk([IDup(1, OLocal(0)), IStructNew(2, 0, [OLocal(1)]), IRelease(2)], TReturn(None))],
+  );
+  const relayKeep = fn(
+    "relayKeep",
+    1,
+    [lr("t"), lr("d")],
+    [bk([IDup(1, OLocal(0)), ICall(None, 3, [OLocal(1)]), IRelease(1)], TReturn(None))],
+  );
+  const mutate = fn(
+    "mutate",
+    1,
+    [lr("m"), lr("d")],
+    [bk([IDup(1, OLocal(0)), IMakeUnique(1), ISetField(1, 0, OInt(1)), IRelease(1)], TReturn(None))],
+  );
+  const twice = fn(
+    "twice",
+    1,
+    [lr("u"), lr("d"), li("n"), lr("e")],
+    [bk(
+      [
+        IDup(1, OLocal(0)),
+        IBuiltin(Some(2), BStrLength, [OLocal(1)]),
+        IDup(3, OLocal(1)),
+        IRelease(3),
+        IRelease(1),
+      ],
+      TReturn(None),
+    )],
+  );
+  return prog([mainF, peek, relay, keep, relayKeep, mutate, twice]);
+}
+
+@Test
+function readInfoSeparatesReadOnlyCopiesFromConsumedOnes(): void {
+  const p = borrowProgram();
+  assert(progWellFormed(p) && allBorrowed(p), "lowering-shaped input");
+  assert(!readInfo(p.functions[1]).bad[1], "a copy that is measured and released is read-only");
+  const rl = readInfo(p.functions[2]);
+  assert(!rl.bad[1] && callsOf(rl, 1).length == 1 && callsOf(rl, 1)[0].callee == 1, "a copy passed to a call: dependent position");
+  assert(readInfo(p.functions[3]).bad[1], "a copy stored in a record is consumed");
+  assert(readInfo(p.functions[5]).bad[1], "a copy that is made unique is mutated");
+  assert(readInfo(p.functions[6]).bad[1], "a copy that is duplicated again is not read-only");
+  assert(readInfo(p.functions[1]).bad[0], "a parameter is never a copy");
+}
+
+@Test
+function aReadOnlyCopyDoesNotMakeTheParameterOwned(): void {
+  const p = borrowProgram();
+  const modes = inferModes(p, closureTargets(p));
+  assert(!modes[1][0], "peek only reads its parameter: borrowed");
+  assert(!modes[2][0], "relay passes a copy to a borrowed position: borrowed");
+  assert(modes[3][0], "keep stores a copy: owned");
+  assert(modes[4][0], "relayKeep passes a copy to an owned position: owned");
+  assert(modes[5][0], "mutate changes its copy: owned");
+  assert(modes[6][0], "twice retains the copy again: owned");
+}
+
+@Test
+function borrowReadsTurnsTheCopyIntoABorrowOfTheParameter(): void {
+  const p = borrowProgram();
+  const q = optimize(p);
+  assert(sameFunctions(p, q), "the same functions");
+  const peek = q.functions[1];
+  assertEqUsize(dupCount(peek), 0, "no retain");
+  assertEqUsize(releaseCount(peek), 0, "no release");
+  assert(isBorrow(peek.blocks[0].instrs[0], 1, 0), "d = borrow p");
+  assert(!peek.paramOwned[0], "the parameter stays borrowed");
+  const relay = q.functions[2];
+  assertEqUsize(dupCount(relay) + releaseCount(relay), 0, "relay neither retains nor releases");
+  assert(q.functions[3].paramOwned[0], "keep owns the parameter it stores");
+  assertEqUsize(dupCount(q.functions[3]), 0, "and moves it into the record");
+  assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the borrowed parameters");
+  // the program as hand-written (without the inferred modes) is also accepted
+  assertEqUsize(verify(p).errors.length, 0, "the input verifies");
+}
+
+@Test
+function borrowReadsLeavesAnOwnedParameterAlone(): void {
+  const p = borrowProgram();
+  let q = p;
+  q.functions[1].paramOwned = [true];
+  const g = borrowReads(q, q.functions[1]);
+  assertEqUsize(dupCount(g), 1, "the copy of an owned parameter is not turned into a borrow");
+  assertEqUsize(releaseCount(g), 1, "and keeps its release");
+}
+
+@Test
+function aCallToAnOwnedPositionKeepsTheCopy(): void {
+  // relay hands its copy to peek; with peek's parameter owned the copy is consumed there
+  let p = borrowProgram();
+  p.functions[1].paramOwned = [true];
+  const g = borrowReads(p, p.functions[2]);
+  assertEqUsize(dupCount(g), 1, "the dup stays");
+  assertEqUsize(releaseCount(g), 1, "the release stays");
 }
 
 // One instruction of every kind: the optimiser's use / definition tables must agree with the lowering's (an instruction
@@ -514,6 +642,41 @@ function optimizingTwiceFromTheSameInputGivesTheSameProgram(host: Host): void {
         assertEqBool(a.functions[i].inout, b.functions[i].inout, "same in/out flags");
         i += 1;
       }
+    },
+  );
+}
+
+function readerSource(): string {
+  return "class Reader {\n  data: int[];\n  pos: usize;\n  constructor(d: int[]) {\n    this.data = d;\n    this.pos = 0;\n  }\n"
+      + "  cur(): int {\n    return this.data[this.pos];\n  }\n"
+      + "  twoAhead(): int {\n    return this.cur() + this.data[this.pos];\n  }\n"
+      + "  skip(): void {\n    this.pos += 1;\n  }\n}\n"
+      + "function main(): void {\n  let r = new Reader([1, 2, 3]);\n  r.skip();\n  console.log(r.twoAhead().toString());\n}\n";
+}
+
+@Test
+function aMethodThatOnlyReadsThisBorrowsIt(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = optimized(fs, readerSource()).unwrap();
+      const q = optimize(p);
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      let seen: usize = 0;
+      let i: usize = 0;
+      while (i < q.functions.length) {
+        const f = q.functions[i];
+        if (f.name.endsWith("Reader.cur") || f.name.endsWith("Reader.twoAhead")) {
+          seen += 1;
+          assert(!f.paramOwned[0], f.name + ": this is borrowed");
+          assertEqUsize(dupCount(f) + releaseCount(f), 0, f.name + ": no reference counting");
+        }
+        if (f.name.endsWith("Reader.skip")) {
+          assert(f.paramOwned[0], "a method that updates this owns it");
+        }
+        i += 1;
+      }
+      assertEqUsize(seen, 2, "both read-only methods found");
     },
   );
 }

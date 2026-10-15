@@ -36,6 +36,25 @@ are the textbook case. Then (d):
 inferring that a method only reads its owned `this` removes most of the RC traffic of the HTTP workloads. (c) and (e)
 follow; (f) matters for allocation-heavy tree code, (b) for byte-heavy I/O.
 
+### After borrow inference (class (d), `compiler/opt/borrow.or`)
+
+`ORIN_STATS=1` counters of the normal build, before (main) and after; allocations are unchanged except for the optimiser's own
+(+0.25% in the self-compile). The census above was taken before this change.
+
+| workload | retains before | after | releases before | after |
+|---|---:|---:|---:|---:|
+| mutres | 20,000,002 | 2 | 20,000,015 | 15 |
+| http_parse | 8,374,350 | 2,934,040 | 10,951,367 | 5,511,057 |
+| sortedmap | 970,321 | 498,021 | 2,878,596 | 2,406,296 |
+| pqueue | 800,003 | 600,000 | 4,400,015 | 4,200,012 |
+| mapfreq, wordfreq | unchanged | | unchanged | |
+| self-compile | 358,945,500 | 342,271,731 | 388,149,213 | 371,548,740 |
+
+The inference is by read-only *copies* of a parameter: the lowering writes `d = dup p` for every use of a parameter in a
+body, and that retain made the parameter owned. The remaining dup/release pairs of the census's (d) rows are copies of
+borrowed projections (`getfield` results held across a call that may release the owner), which need an invalidation analysis
+and are not covered; and methods that mutate `this` (in/out receivers) keep it owned.
+
 ## How it is measured
 
 **Census build (opt-in).** `orin2 compile --stats-sites prog.or -o prog.c` emits the normal C plus, before every MIR
