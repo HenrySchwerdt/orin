@@ -23,14 +23,22 @@ import { FsGrant } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { StdioGrant } from "std:io";
 import { writeFile } from "std:fs";
-import { SourceMap, Diagnostic, render, describeSpan } from "./diag";
+import {
+  SourceMap, Diagnostic, render, describeSpan, TerminalOptions, terminalOptions, renderTerminal,
+  paint,
+} from "./diag";
 import { loadWithRoots, preludeRoots, noPreludeRoots } from "./loader";
 import { SourceFile } from "./diag";
-import { check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts, parallelWarnings } from "./check";
-import { runTestCommand, hasTests, eraseTests } from "./testing";
+import {
+  check, checkWithIndex, checkRuntime, deprecationWarnings, hasDeprecated, qualityWarnings,
+  strictContracts, parallelWarnings,
+} from "./check";
+import { runTestCommand, hasTests, eraseTests, ensureMain } from "./testing";
 import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
-import { moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff, effectPolicyDiags, policySourceMap } from "./analysis";
+import {
+  moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff, effectPolicyDiags, policySourceMap,
+} from "./analysis";
 import { readFile } from "std:fs";
 import { lower } from "./lower";
 import { emitCFacts, emitCSites } from "./cemit";
@@ -40,23 +48,43 @@ import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
 import { fuseProgram, FuseOut, ChainInfo } from "./fuse";
 import { Program } from "./hir";
-import { runFmt, printDiagnosticsJson, runGraph, runDiff, runEffects } from "./tools";
+import {
+  runFmt, printDiagnosticsJson, runGraph, runDiff, runEffects, runPackage, jsonString,
+} from "./tools";
 import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
+  console.error(
+    "usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
+  );
   exit(2);
 }
 
-function report(sm: SourceMap, diags: Diagnostic[], json: bool): void {
+function report(sm: SourceMap, diags: Diagnostic[], json: bool, ui: TerminalOptions): void {
   if (json) {
     printDiagnosticsJson(sm, diags);
     exit(1);
     return;
   }
+  let shown: usize = 0;
   for (const d of diags) {
-    console.error(render(sm, d));
+    if (ui.rich && shown >= ui.maxErrors) {
+      break;
+    }
+    shown += 1;
+    console.error(ui.rich ? renderTerminal(sm, d, ui.color, ui.ascii) + "\n" : render(sm, d));
+  }
+  if (ui.rich) {
+    if (shown < diags.length) {
+      console.error(
+        (diags.length - shown).toString() + " more errors; use --max-errors N to show more.\n",
+      );
+    }
+    const task = ui.args.length > 0 && ui.args[0] == "check" ? "Check" : "Compilation";
+    console.error(
+      task + " failed · " + diags.length.toString() + (diags.length == 1 ? " error" : " errors"),
+    );
   }
   exit(1);
 }
@@ -64,7 +92,13 @@ function report(sm: SourceMap, diags: Diagnostic[], json: bool): void {
 // Prints the warnings of the program without failing: `@Deprecated` uses (ADR-0024) and contract-quality
 // warnings (ADR-0028; the strict ones when `strictFlag` or `[contracts] strict = true` is set), to stderr as
 // text, or as JSON objects on stdout with --format=json.
-function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool, strictFlag: bool): void {
+function printWarnings(
+  program: LoadedProgram,
+  sm: SourceMap,
+  json: bool,
+  strictFlag: bool,
+  ui: TerminalOptions,
+): void {
   let ws: Diagnostic[] = [];
   if (hasDeprecated(program)) {
     ws = deprecationWarnings(program, checkWithIndex(program, sm).index);
@@ -78,17 +112,17 @@ function printWarnings(program: LoadedProgram, sm: SourceMap, json: bool, strict
     return;
   }
   for (const d of ws) {
-    console.error(render(sm, d));
+    console.error(ui.rich ? renderTerminal(sm, d, ui.color, ui.ascii) + "\n" : render(sm, d));
   }
 }
 
 // The effect policy of `orin.toml` (`[effects]`, ADR-0037 D4): a module whose inferred effects exceed its allowance is a
 // compile error (E0473). Checked on the program a build ships (`@Test` functions erased); a no-op without an `[effects]` table.
-function policyCheck(program: LoadedProgram, sm: SourceMap, json: bool): void {
+function policyCheck(program: LoadedProgram, sm: SourceMap, json: bool, ui: TerminalOptions): void {
   const shipped = hasTests(program) ? eraseTests(program) : program;
   const ds = effectPolicyDiags(shipped, sm);
   if (ds.length > 0) {
-    report(policySourceMap(shipped, sm), ds, json);
+    report(policySourceMap(shipped, sm), ds, json, ui);
   }
 }
 
@@ -109,7 +143,10 @@ function runVerify(prog: MProgram, sm: SourceMap, verbose: bool): usize {
     for (const d of rep.warnings) {
       console.log("warning: " + issueWhere(sm, d) + ": " + d.message);
     }
-    console.log("verify: " + rep.errors.length.toString() + " errors, " + rep.warnings.length.toString() + " warnings");
+    console.log(
+      "verify: " + rep.errors.length.toString() + " errors, " + rep.warnings.length.toString()
+          + " warnings",
+    );
   }
   return rep.errors.length;
 }
@@ -127,20 +164,40 @@ function fused(p: Program, sm: SourceMap, report: bool): Program {
       const how = c.fused
           ? `fused into one loop${c.parallel ? " per chunk" : ""}${c.earlyExit ? ", early exit" : ""}${c.exactCap ? ", exact capacity" : ""}`
           : `not fused: ${c.reason}`;
-      console.error(`${describeSpan(sm, c.span)}: ${c.parallel ? "parallel " : ""}${c.stages.join(" -> ")}: ${how}`);
+      console.error(
+        `${describeSpan(sm, c.span)}: ${c.parallel ? "parallel " : ""}${c.stages.join(" -> ")}: ${how}`,
+      );
     }
   }
   return out.program;
 }
 
 function main(host: Host): void {
-  useHost(host, (fs, proc, stdio, clock) => { driver(fs, proc, stdio); });
+  useHost(
+    host,
+    (fs, proc, stdio, clock) => {
+      driver(fs, proc, stdio);
+    },
+  );
 }
 
 function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
-  const all = args(proc);
+  const raw = args(proc);
+  if (raw.length == 5 && raw[0] == "__result") {
+    console.log(
+      "{\"schemaVersion\":1,\"command\":" + jsonString(raw[1]) + ",\"ok\":" + raw[2] + ","
+          + jsonString(raw[3]) + ":" + jsonString(raw[4]) + "}",
+    );
+    return;
+  }
+  const ui = terminalOptions(raw);
+  const all = ui.args;
+  if (all.length >= 1 && all[0] == "__package") {
+    exit(runPackage(fs, all.slice(1, all.length)));
+    return;
+  }
   if (all.length >= 1 && all[0] == "fmt") {
-    const code = runFmt(fs, all.slice(1, all.length));
+    const code = runFmt(fs, all.slice(1, all.length), ui);
     if (code != 0) {
       exit(code);
     }
@@ -163,7 +220,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     return;
   }
   if (all.length >= 1 && all[0] == "test") {
-    exit(runTestCommand(fs, proc, all.slice(1, all.length)));
+    exit(runTestCommand(fs, proc, args(proc).slice(1, args(proc).length)));
     return;
   }
   if (all.length >= 1 && all[0] == "mcp") {
@@ -236,6 +293,10 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
       statsSites = true;
     } else if (a == "--assert-facts") {
       assertFacts = true;
+    } else if (a.startsWith("-") && a != "-o") {
+      console.error("error: Unknown option `" + a + "`. Run `orin help` for available options.");
+      exit(2);
+      return;
     } else {
       argv.push(a);
     }
@@ -257,16 +318,27 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
   }
   const usePrelude = !cBuiltins && cmd != "check" && cmd != "api";
   const noOverlay: SourceFile[] = [];
-  const loaded = loadWithRoots(fs, entry, noOverlay, usePrelude ? preludeRoots() : noPreludeRoots());
+  const loaded = loadWithRoots(
+    fs,
+    entry,
+    noOverlay,
+    usePrelude ? preludeRoots() : noPreludeRoots(),
+  );
   if (loaded.diags.length > 0) {
-    report(loaded.sm, loaded.diags, json);
+    report(loaded.sm, loaded.diags, json, ui);
     return;
   }
   let program = loaded.program.unwrap();
+  if (cmd == "check"
+      && program.manifest.isSome()
+      && (program.manifest.unwrap().entry == "module.or"
+          || program.manifest.unwrap().entry.endsWith("/module.or"))) {
+    program = ensureMain(program);
+  }
   if (cmd == "api") {
     const ci = checkWithIndex(program, loaded.sm);
     if (ci.result.isErr()) {
-      report(loaded.sm, ci.result.unwrapErr(), json);
+      report(loaded.sm, ci.result.unwrapErr(), json, ui);
       return;
     }
     const snap = apiSnapshot(program, ci.index);
@@ -297,29 +369,31 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     // program that is lowered: nothing they use reaches the output (ADR-0024).
     const full = check(program, loaded.sm);
     if (full.isErr()) {
-      report(loaded.sm, full.unwrapErr(), json);
+      report(loaded.sm, full.unwrapErr(), json, ui);
       return;
     }
-    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
+    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag, ui);
     program = eraseTests(program);
   }
   const checked = checkContracts ? checkRuntime(program, loaded.sm) : check(program, loaded.sm);
   if (checked.isErr()) {
-    report(loaded.sm, checked.unwrapErr(), json);
+    report(loaded.sm, checked.unwrapErr(), json, ui);
     return;
   }
-  policyCheck(program, loaded.sm, json);
+  policyCheck(program, loaded.sm, json, ui);
   // Warnings that need the typed program: the parallel reductions of ADR-0039 (W0480, W0481).
   const pw = parallelWarnings(checked.unwrap().functions);
   if (pw.length > 0 && json && !verifyContractsFlag) {
     printDiagnosticsJson(loaded.sm, pw);
   } else if (pw.length > 0 && !json) {
     for (const d of pw) {
-      console.error(render(loaded.sm, d));
+      console.error(
+        ui.rich ? renderTerminal(loaded.sm, d, ui.color, ui.ascii) : render(loaded.sm, d),
+      );
     }
   }
   if (!withTests) {
-    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag);
+    printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictContractsFlag, ui);
   }
   if (cmd == "check") {
     if (deps) {
@@ -327,28 +401,50 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
       const text = json ? depsJsonText(program, md) : depsText(program, md);
       console.log(text.substring(0, text.length - 1));
     }
+    if (ui.rich && !json && !deps && !ui.quiet) {
+      console.error(paint(ui.ascii ? "OK Check passed" : "✓ Check passed", "32", ui.color));
+    }
     return;
   }
   if (cmd == "mir") {
-    console.log(printProgram(noOpt ? lower(checked.unwrap()) : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)))));
+    console.log(
+      printProgram(
+        noOpt
+            ? lower(checked.unwrap())
+            : optimize(
+              lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)),
+            ),
+      ),
+    );
     return;
   }
   if (cmd == "verify" && verifyContractsFlag) {
     const rep = verifyContracts(fs, proc, program, loaded.sm, checked.unwrap(), z3);
     console.log(json ? reportJson(rep) : reportText(rep));
-    if (failedCount(rep) > 0 || (strict && unknownCount(rep) > 0)) {
+    if (failedCount(rep) > 0 || strict && unknownCount(rep) > 0) {
       exit(1);
     }
     return;
   }
   if (cmd == "verify") {
-    if (runVerify(noOpt ? lower(checked.unwrap()) : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport))), loaded.sm, true) > 0) {
+    if (runVerify(
+      noOpt
+          ? lower(checked.unwrap())
+          : optimize(
+            lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)),
+          ),
+      loaded.sm,
+      true,
+    )
+        > 0) {
       exit(1);
     }
     return;
   }
   let c = "";
-  const mir = noOpt ? lower(checked.unwrap()) : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)));
+  const mir = noOpt
+      ? lower(checked.unwrap())
+      : optimize(lower(noFuse ? checked.unwrap() : fused(checked.unwrap(), loaded.sm, fuseReport)));
   if (!noVerify && runVerify(mir, loaded.sm, false) > 0) {
     console.error("error: internal compiler error: MIR ownership verification failed");
     exit(70);

@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **Project CLI and terminal UX.** `orin init` (application, library, HTTP template), project discovery,
+  content-cached native builds, `dev`/test watch, project-wide formatting and independent test discovery.
+  Source diagnostics have themed colors, source excerpts and bounded multiline highlights; compact/JSON,
+  LSP and MCP formats remain available. `add`/`remove`/`deps`/`fetch`/`update` support path and Git libraries,
+  root lockfiles including transitive commits, offline/locked resolution and rollback on failed adds.
+  Release CLI requires Bash 3.2+. Source checkouts can use `./tools/orin`. See `docs/cli.md`.
 - **Redundant uniqueness checks removed (ADR-0038 lever 2, T1; `compiler/opt/unique.or`).** A `makeunique` of a local that is
   certainly `Unique` (fresh, or already made unique and not shared since) is deleted. nbody -13.8%, sieve -10.4%, pqueue -8.4%
   executed instructions; only the `cow_inplace` counter changes; the verifier re-checks the result.

@@ -28,6 +28,7 @@ mkdir -p build
   for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test; do
     echo "sh tools/test_tooling.sh --unit $t"
   done
+  echo '$ORIN2 test compiler/tests/terminal_test.or --runtime runtime'
   # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
   echo '$ORIN2 test compiler/tests/loader_test.or --runtime runtime'
   echo '$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime'
