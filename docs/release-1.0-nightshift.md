@@ -3,6 +3,8 @@
 Owner: the coordinating Codex chat. The user authorized implementation chats, reviews, CI fixes,
 and merging verified pull requests overnight. Morning checkpoint: 2026-10-16 07:30 Europe/Berlin.
 This is a bounded work plan, not a promise to declare 1.0 complete overnight.
+Library selection and acceptance follow [agent-stdlib-priorities.md](agent-stdlib-priorities.md):
+precise errors, deterministic behavior, pure validation, explicit I/O, limits, and executable evidence.
 
 ## Operating rules
 
