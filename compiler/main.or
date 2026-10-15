@@ -33,8 +33,8 @@ import { verifyContracts, reportJson, reportText, failedCount, unknownCount } fr
 import { moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff, effectPolicyDiags, policySourceMap } from "./analysis";
 import { readFile } from "std:fs";
 import { lower } from "./lower";
-import { emitC, emitCSites } from "./cemit";
-import { emitLlvm } from "./llvm";
+import { emitCFacts, emitCSites } from "./cemit";
+import { emitLlvmFacts } from "./llvm";
 import { MProgram, printProgram, hasSpan } from "./mir";
 import { verify, VerifyIssue } from "./verify";
 import { optimize, pruneProgram } from "./opt";
@@ -45,7 +45,7 @@ import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
 function usage(): void {
-  console.error("usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
+  console.error("usage:\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>");
   exit(2);
 }
 
@@ -177,6 +177,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
   let fuseReport = false;
   let llvm = false;
   let cBuiltins = false;
+  let assertFacts = false; // check every forwarded load against its slot at run time (docs/mir.md v2.4); never on by default
   let statsSites = false; // allocation-site census build (runtime/orin_runtime.h, tools/alloc_census.py); C backend only
   let checkContracts = false;
   let verifyContractsFlag = false;
@@ -233,6 +234,8 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
       cBuiltins = true;
     } else if (a == "--stats-sites") {
       statsSites = true;
+    } else if (a == "--assert-facts") {
+      assertFacts = true;
     } else {
       argv.push(a);
     }
@@ -351,6 +354,11 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     exit(70);
     return;
   }
+  if (assertFacts && statsSites) {
+    console.error("error: --assert-facts cannot be combined with --stats-sites");
+    exit(2);
+    return;
+  }
   if (statsSites && llvm) {
     console.error("error: --stats-sites needs the C backend");
     exit(2);
@@ -363,7 +371,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
     }
     c = emitCSites(pruneProgram(mir), paths);
   } else {
-    c = llvm ? emitLlvm(pruneProgram(mir)) : emitC(pruneProgram(mir));
+    c = llvm ? emitLlvmFacts(pruneProgram(mir), assertFacts) : emitCFacts(pruneProgram(mir), assertFacts);
   }
   const written = writeFile(fs, argv[3], c);
   if (written.isErr()) {

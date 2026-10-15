@@ -20,11 +20,11 @@ import { optimize, pruneProgram } from "../opt";
 import {
   emitC, joinC, emittable, indices, CSymbols, cSymbols, refsDeclared, symbolsWellFormed,
   namesDefined, emitCFunction, sanitize, fnSymbol, commentSafe, cString, cStringValue, refMask,
-  maskAll, identChars, inoutArgOk, targetsBelow,
+  maskAll, identChars, inoutArgOk, targetsBelow, emitCFacts,
 } from "../cemit";
 import {
   emitLlvm, joinLlvm, LlvmSymbols, llvmSymbols, trapsIndexed, introducedNames, llvmRefsDeclared,
-  globalsDefined, emitLlvmFunction, llStr, llStrValue, prelude, declares, fixedMsgs,
+  globalsDefined, emitLlvmFunction, llStr, llStrValue, prelude, declares, fixedMsgs, emitLlvmFacts,
 } from "../llvm";
 
 // ---------------------------------------------------------------- builders
@@ -377,4 +377,42 @@ function aSmallRecursiveFunctionWithAnEarlyReturnIsSplitIntoWrapperAndBody(): vo
   const q = fibLike(false);
   const plain = emitLlvmFunction(llvmSymbols(q), q, 1);
   assert(!plain.includes(".body"), "a function that does not call itself is not split");
+}
+
+// `IForward` (docs/mir.md v2.4): a plain copy in both backends; with `--assert-facts` also a call of `orin_assert_fact` on the
+// object, the key and the slot bits of the forwarded local.
+function forwarding(): MProgram {
+  const f = MFunction {
+    name: "main",
+    paramCount: 0,
+    paramOwned: [],
+    inout: false,
+    locals: [lr("o"), MLocal { name: "s", ty: MInt }, MLocal { name: "d", ty: MInt }],
+    ret: MVoid,
+    blocks: [
+      bk(
+        [IStructNew(0, 0, [OInt(1)]), IGetField(1, OLocal(0), 0), IForward(2, 1, OLocal(0), OUsize(0)), IRelease(0)],
+        TReturn(None),
+      ),
+    ],
+  };
+  return MProgram { functions: [f], strings: [], main: 0, vtables: [], inlineFns: [] };
+}
+
+@Test
+function aForwardedLoadIsACopyAndTheFactsBuildChecksIt(): void {
+  const p = forwarding();
+  const c = emitC(p);
+  assert(c.includes("l2 = l1;"), "C: a copy");
+  assert(!c.includes("orin_assert_fact"), "C: no check in a normal build");
+  const cf = emitCFacts(p, true);
+  assert(cf.includes("l2 = l1; orin_assert_fact(l0, ((uint64_t)0ULL), ((uint64_t)(l2)));"), "C: the check reads the forwarded local");
+  assert(emitCFacts(p, false) == c, "C: facts off is the normal build");
+  const ll = emitLlvm(p);
+  assert(!ll.includes("orin_assert_fact"), "LLVM: no check in a normal build");
+  const lf = emitLlvmFacts(p, true);
+  assert(lf.includes("call void @orin_assert_fact(ptr "), "LLVM: the check");
+  assert(lf.includes("declare void @orin_assert_fact(ptr, i64, i64)"), "LLVM: declared");
+  assert(llvmRefsDeclared(lf, llvmSymbols(p)), "LLVM: every global is declared");
+  assert(emitLlvmFacts(p, false) == ll, "LLVM: facts off is the normal build");
 }

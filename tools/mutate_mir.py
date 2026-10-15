@@ -25,6 +25,14 @@ Mutation classes (id: injected bug -> required reaction)
   extra-dup           `t = dup x` before `release x`, t unused    -> a leak WARNING (or an error)
   inout-drop-receiver delete `l0 = move ..` in an inout function  -> ERROR (l0 must hold the receiver at return)
   inout-release-receiver `release l0` before a return of an inout function -> ERROR (same)
+  load forwarding (rule F1, docs/mir.md v2.4; applied to every `d = forward s, o[key]` of the optimised corpus):
+  fwd-across-write    write the same slot of o between the source and the forward      -> ERROR unjustified forward
+  fwd-other-slot-ok   write a DIFFERENT slot of o there (positive control)             -> ACCEPTED (rejection is a finding)
+  fwd-after-redef-obj redefine o between them                                          -> ERROR unjustified forward
+  fwd-after-redef-src redefine the forwarded local s between them                      -> ERROR unjustified forward
+  fwd-across-push     `arraypush o` between them (array objects)                       -> ERROR unjustified forward
+  fwd-wrong-slot      forward from the load of another slot (key differs)              -> ERROR unjustified forward
+  fwd-across-block    split the block between the source and the forward               -> ERROR unjustified forward
 
 A mutant that is accepted without a new warning is a SURVIVOR, a finding, unless it is one of the
 explicitly classified BENIGN cases below (each has a precise, local reason). A mutant that is
@@ -272,7 +280,7 @@ def reaches_return(f, bi):
 # Independent, deliberately conservative "definitely Unique" dataflow (not the verifier's rules):
 # a local is Unique after struct/arraynew/closure/makeunique and after a move of a Unique local;
 # every other mention that is not a plain read or an in-place store loses it; join = intersection.
-KEEP_READS = ("getfield", "arrayget", "tag")
+KEEP_READS = ("getfield", "arrayget", "tag", "forward")
 
 
 def uniq_transfer(f, U, line):
@@ -402,6 +410,8 @@ def sites(f):
                 elif nxt == "def":
                     benign = "l%d is overwritten before any use in the block" % d
                 out.append(Mut("drop-dup", f, (bi, ii), "delete `%s` (b%d i%d)" % (line, bi, ii), benign, "dead", "error"))
+            if w == "forward":
+                out += forward_sites(f, bi, ii, line)
     if f.inout:
         # v1.10: parameter 0 is handed back to the caller at every return
         for bi, (label, ins, term) in enumerate(f.blocks):
@@ -417,6 +427,119 @@ def sites(f):
             out.append(Mut("release-param", f, (0, 0), "release borrowed parameter l%d at entry" % p, None, "of parameter", "error"))
             out.append(Mut("move-param", f, (0, 0), "move borrowed parameter l%d at entry" % p, None, "of parameter", "error"))
     return out
+
+
+FWD_RE = re.compile(r"l(\d+) = forward l(\d+), l(\d+)\[([^\]]+)\]$")
+ZERO = {"int": "0", "usize": "0u", "bool": "false", "float": "f0.0"}
+
+
+def fwd_parts(line):
+    """(d, s, o, key text) of a `forward` line."""
+    d, s_, o, key = FWD_RE.match(line).groups()
+    return int(d), int(s_), int(o), key
+
+
+def fwd_kind(ins, ii, o, key):
+    """'field' or 'array' (the form of the nearest earlier access to slot (o, key), looking through forwards), else None."""
+    for j in range(ii - 1, -1, -1):
+        line = ins[j]
+        m = re.match(r"(?:l\d+ = getfield|setfield) l%d\.%s\b" % (o, re.escape(key[:-1])), line)
+        if m and key.endswith("u"):
+            return "field"
+        if re.match(r"(?:l\d+ = arrayget|arrayset) l%d\[%s\]" % (o, re.escape(key)), line):
+            return "array"
+        if re.match(r"l\d+ = forward l\d+, l%d\[%s\]$" % (o, re.escape(key)), line):
+            continue
+    return None
+
+
+def no_ref_alias_of(f, o):
+    """No reference local is projected or borrowed from o: a store through o kills such borrows, which would reject a
+    positive control for a reason that has nothing to do with forwarding."""
+    pat = re.compile(r"l(\d+) = (?:getfield|borrow) l%d\b|l(\d+) = arrayget l%d\[" % (o, o))
+    for _, ins, _t in f.blocks:
+        for line in ins:
+            m = pat.match(line)
+            if m and f.is_ref(int(m.group(1) or m.group(2))):
+                return False
+    return True
+
+
+def slot_span(f, o):
+    """(largest constant slot / index that any instruction of f uses on local o, or -1; True if some access uses a local index)."""
+    top, symbolic = -1, False
+    for _, ins, _t in f.blocks:
+        for line in ins:
+            for m in re.finditer(r"\bl%d(?:\.|\[)(l)?(\d+)u?" % o, line):
+                if m.group(1):
+                    symbolic = True
+                else:
+                    top = max(top, int(m.group(2)))
+            if re.search(r"\bl%d\[l\d+\]" % o, line):
+                symbolic = True
+    return top, symbolic
+
+
+def forward_sites(f, bi, ii, line):
+    d, s_, o, key = fwd_parts(line)
+    ins = f.blocks[bi][1]
+    kind = fwd_kind(ins, ii, o, key)
+    if kind is None:
+        return []
+    where = "(b%d i%d)" % (bi, ii)
+    need = "unjustified forward"
+    out = [
+        Mut("fwd-across-write", f, (bi, ii), "write the same slot of l%d before `%s` %s" % (o, line, where), None, need, "error"),
+        Mut("fwd-after-redef-obj", f, (bi, ii), "redefine l%d before `%s` %s" % (o, line, where), None, need, "error"),
+        Mut("fwd-after-redef-src", f, (bi, ii), "redefine l%d before `%s` %s" % (s_, line, where), None, need, "error"),
+        Mut("fwd-wrong-slot", f, (bi, ii), "forward from another slot: `%s` %s" % (line, where), None, need, "error"),
+        Mut("fwd-across-block", f, (bi, ii), "split the block before `%s` %s" % (line, where), None, need, "error"),
+    ]
+    if kind == "array":
+        out.append(Mut("fwd-across-push", f, (bi, ii), "arraypush l%d before `%s` %s" % (o, line, where), None, need, "error"))
+    const = key.endswith("u") and key[:-1].isdigit()
+    if const and not slot_span(f, o)[1] and certainly_unique(f, bi, ii, o) and no_ref_alias_of(f, o):
+        out.append(Mut("fwd-other-slot-ok", f, (bi, ii), "write another slot of l%d before `%s` %s" % (o, line, where),
+                       "positive control: a write to a different slot must not end the forwarding", None, "accept"))
+    return out
+
+
+def apply_forward(m, f):
+    b = f.blocks[m.bi]
+    ins = b[1]
+    ii = m.ii
+    d, s_, o, key = fwd_parts(ins[ii])
+    kind = fwd_kind(ins, ii, o, key)
+    if m.cls == "fwd-across-write":
+        # a store of s itself would be a source of the claim, so the write stores another value
+        w = f.new_local(f.locals[s_][1])
+        ins.insert(ii, "l%d = copy %s" % (w, ZERO[f.locals[s_][1]]))
+        ins.insert(ii + 1, "setfield l%d.%s = l%d" % (o, key[:-1], w) if kind == "field" else "arrayset l%d[%s] = l%d" % (o, key, w))
+    elif m.cls == "fwd-other-slot-ok":
+        # a slot no instruction of the function reads or writes, so no other forward depends on it
+        k2 = slot_span(f, o)[0] + 1
+        ins.insert(ii, "setfield l%d.%d = l%d" % (o, k2, s_) if kind == "field" else "arrayset l%d[%du] = l%d" % (o, k2, s_))
+    elif m.cls == "fwd-after-redef-obj":
+        n = f.new_local()
+        ins.insert(ii, "l%d = dup l%d" % (n, o))
+        ins.insert(ii + 1, "l%d = move l%d" % (o, n))
+    elif m.cls == "fwd-after-redef-src":
+        ins.insert(ii, "l%d = copy %s" % (s_, ZERO[f.locals[s_][1]]))
+    elif m.cls == "fwd-across-push":
+        ins.insert(ii, "arraypush l%d, l%d" % (o, s_))
+    elif m.cls == "fwd-wrong-slot":
+        k2 = "%du" % (int(key[:-1]) + 1) if key.endswith("u") else "0u"
+        ins[ii] = "l%d = forward l%d, l%d[%s]" % (d, s_, o, k2)
+    elif m.cls == "fwd-across-block":
+        rest = ins[ii:]
+        del ins[ii:]
+        label = "b%d" % len(f.blocks)
+        ins_term = b[2]
+        b[2] = "goto %s" % label
+        f.blocks.append([label, rest, ins_term])
+    else:
+        raise ValueError(m.cls)
+    return f
 
 
 def apply(m):
@@ -438,6 +561,8 @@ def apply(m):
         return f
     line = ins[ii]
     t = toks(line)
+    if m.cls.startswith("fwd-"):
+        return apply_forward(m, f)
     if m.cls == "inout-drop-receiver":
         del ins[ii]
     elif m.cls == "drop-release":
@@ -528,7 +653,7 @@ def main():
     files = corpus()
     if a.limit:
         files = files[:a.limit]
-    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+    with ThreadPoolExecutor(max_workers=int(os.environ.get("ORIN_JOBS") or os.cpu_count() or 4)) as pool:
         mirs = list(pool.map(lambda f: mir_of(a.orinc, f), files))
     seen = {}
     nprog = 0
@@ -591,7 +716,11 @@ def main():
         s = stats.setdefault(m.cls, {"n": 0, "rejected": 0, "warned": 0, "benign": 0, "survived": 0, "wrong": 0})
         s["n"] += 1
         verdict, cnt, errs = res[mid]
-        if verdict == "REJECT":
+        if m.expect == "accept" and verdict == "REJECT":
+            # a positive control that the verifier rejects: the rule is too strict (or the mutation invalid)
+            s["wrong"] += 1
+            wrong.append((m, errs))
+        elif verdict == "REJECT":
             if m.needle and not any(m.needle in e for e in errs):
                 s["wrong"] += 1
                 wrong.append((m, errs))

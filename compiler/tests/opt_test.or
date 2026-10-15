@@ -22,7 +22,7 @@ import {
   usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
-  instrUses, usesAffecting,
+  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -545,6 +545,7 @@ function analysisTablesAgreeOnEveryInstructionKind(): void {
     IArrayPut(1, OLocal(3), 2),
     IArrayPush(1, OLocal(2)),
     IArrayPop(1, 2),
+    IForward(0, 3, OLocal(2), OLocal(4)),
     IClosure(1, 0, [OLocal(2)]),
     ICallIndirect(Some(1), OLocal(2), [OLocal(3)]),
     IIface(1, 0, OLocal(2)),
@@ -747,6 +748,174 @@ function usesAffectingAgreesWithInstrUses(host: Host): void {
       const p = optimized(fs, sampleSource()).unwrap();
       assert(usesAffectingAgrees(p), "lowered");
       assert(usesAffectingAgrees(optimize(p)), "optimised");
+    },
+  );
+}
+
+// ---------------------------------------------------------------- load forwarding (T4, docs/mir.md v2.4)
+
+function lu(n: string): MLocal {
+  return MLocal { name: n, ty: MUsize };
+}
+
+// The positions of the `IForward` instructions of block 0.
+function forwardsAt(f: MFunction): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < f.blocks[0].instrs.length) {
+    match (f.blocks[0].instrs[i]) {
+      IForward(_, _, _, _) => {
+        out.push(i);
+      },
+      _ => {},
+    }
+    i += 1;
+  }
+  return out;
+}
+
+@Test
+function aSecondLoadOfAScalarFieldIsForwarded(): void {
+  const f = straight([lr("o"), li("s"), li("d")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = forwardLoads(p, f);
+  assertEqUsize(forwardCount(g), 1, "one forward");
+  assertEqUsize(getterCount(g), 1, "one load left");
+  assertEqUsize(forwardsAt(g)[0], 2, "the second load");
+  match (g.blocks[0].instrs[2]) {
+    IForward(d, s, _, _) => {
+      assertEqUsize(d, 2, "into the second local");
+      assertEqUsize(s, 1, "from the first load");
+    },
+    _ => {
+      assert(false, "an IForward");
+    },
+  }
+  assert(passKept(f, g), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aLoadAfterAStoreOfALocalIsForwardedFromTheStore(): void {
+  const f = straight([lr("o"), li("v"), li("d")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    ICopy(1, OInt(7)),
+    ISetField(0, 1, OLocal(1)),
+    IGetField(2, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  const p = prog([f]);
+  const g = forwardLoads(p, f);
+  assertEqUsize(forwardCount(g), 1, "forwarded from the store");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aLoadAfterAnArrayLoadWithTheSameIndexLocalIsForwarded(): void {
+  const f = straight([lr("a"), lu("i"), li("s"), li("d")], [
+    IArrayNew(0, false, [OInt(1), OInt(2)]),
+    ICopy(1, OUsize(1)),
+    IArrayGet(2, OLocal(0), OLocal(1)),
+    IArrayGet(3, OLocal(0), OLocal(1)),
+    IRelease(0),
+  ]);
+  const g = forwardLoads(prog([f]), f);
+  assertEqUsize(forwardCount(g), 1, "forwarded");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aWriteOfThePrecedingSlotBlocksTheForward(): void {
+  const f = straight([lr("o"), li("s"), li("d")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    IGetField(1, OLocal(0), 0),
+    ISetField(0, 0, OInt(9)),
+    IGetField(2, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  const g = forwardLoads(prog([f]), f);
+  assertEqUsize(forwardCount(g), 0, "the value changed in between");
+  assertEqUsize(getterCount(g), 2, "both loads stay");
+}
+
+@Test
+function aWriteToAnotherSlotDoesNotBlockTheForward(): void {
+  const f = straight([lr("o"), li("s"), li("d")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    IGetField(1, OLocal(0), 0),
+    ISetField(0, 1, OInt(9)),
+    IGetField(2, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  const g = forwardLoads(prog([f]), f);
+  assertEqUsize(forwardCount(g), 1, "slot 0 is unchanged");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aCallThatReceivesTheObjectBlocksTheForward(): void {
+  const callee = fn("g", 1, [lr("p")], [bk([], TReturn(None))]);
+  const f = straight([lr("o"), li("s"), li("d")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    IGetField(1, OLocal(0), 0),
+    ICall(None, 1, [OLocal(0)]),
+    IGetField(2, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  const g = forwardLoads(prog([f, callee]), f);
+  assertEqUsize(forwardCount(g), 0, "step 1 ends the window at a call that receives the object");
+}
+
+@Test
+function referenceSlotsAndOtherSlotsAreNotForwarded(): void {
+  const refs = straight([lr("o"), lr("s"), lr("d")], [
+    IStructNew(0, 0, [OStr(0), OStr(0)]),
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  assertEqUsize(forwardCount(forwardLoads(prog([refs]), refs)), 0, "a reference slot is not forwarded");
+  const other = straight([lr("o"), li("s"), li("d")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  assertEqUsize(forwardCount(forwardLoads(prog([other]), other)), 0, "another slot is not forwarded");
+}
+
+@Test
+function aForwardIsASourceForTheLoadsAfterIt(): void {
+  const f = straight([lr("o"), li("a"), li("b"), li("c")], [
+    IStructNew(0, 0, [OInt(1), OInt(2)]),
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 0),
+    IGetField(3, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  const g = forwardLoads(prog([f]), f);
+  assertEqUsize(forwardCount(g), 2, "the second and the third load");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function optimizeForwardsLoadsAndTheVerifierAcceptsThem(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = optimized(fs, sampleSource()).unwrap();
+      const q = optimize(p);
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      const n = q.functions.reduce((k: usize, f: MFunction) => k + forwardCount(f), 0);
+      assert(n >= 1, "Counter.next reads this.n back after storing it: a forward");
+      const r = forwardProgram(q);
+      assertEqUsize(r.functions.reduce((k: usize, f: MFunction) => k + forwardCount(f), 0), n, "forwarding again changes nothing");
     },
   );
 }

@@ -516,6 +516,23 @@ OrinObj *orin_nullary(uint32_t tag) {
 
 void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
 
+/* `orin2 compile --assert-facts` (docs/mir.md v2.4, ADR-0038 lever 2): the dynamic check of a forwarded load. `got` is the value
+ * an IForward claimed for slot `key` of `o` (a field index or an array index); the slot itself is read here, as the original
+ * getfield / arrayget would have. A difference is an optimiser or verifier bug, not a program error: exit 70 (internal error). */
+void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got) {
+    const char *why = 0;
+    uint64_t want = 0;
+    if (o->kind == ORIN_K_STRUCT && key < ((const OrinStruct *)o)->nslots) want = ((const OrinStruct *)o)->slots[key];
+    else if (o->kind == ORIN_K_ARRAY && key < ((const OrinArray *)o)->len) want = ((const OrinArray *)o)->items[key];
+    else why = "internal error: --assert-facts: a forwarded load names a slot that does not exist";
+    if (!why && want != got) why = "internal error: --assert-facts: a forwarded load differs from the slot it was forwarded from";
+    if (!why) return;
+    size_t n = 0;
+    while (why[n]) n++;
+    orin_platform_write_line(ORIN_PLATFORM_STDERR, why, n);
+    orin_platform_exit(70);
+}
+
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;

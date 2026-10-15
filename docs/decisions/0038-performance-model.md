@@ -431,6 +431,13 @@ relational fact the interval domain of T6 cannot prove, so its bounds check stay
 
 #### T4. Load forwarding
 
+**Status (2026-10-15): implemented** (branch `claude/project-thread-niggkx-t4-forward`; MIR v2.4, rule F1 in `compiler/verify/forward.or`,
+pass `compiler/opt/forward.or`, `orin2 compile --assert-facts`, mutation classes `fwd-*`; measurements in docs/benchmarks.md). Deviations from the
+text below, all on the conservative side: an `IForward` is also a source for the forwards after it (otherwise the third load of a slot could never be
+forwarded); the scan is an allow-list (an instruction that mentions `o` and is not one of the listed harmless reads ends it); reference slots
+(`IBorrow(d, earlier)`) are not forwarded: accepting that needs the verifier's state at every position, so the pass leaves them as they are; the
+object of an `IForward` must be a reference local (an unboxed aggregate is already in registers).
+
 - *MIR change:* v2.4. `IForward(d, s, o, key)`: `d = s` (a scalar copy), claiming that `s` holds the current value of slot
   `key` of `o` (a field index, or an array index operand). It is emitted in place of the second `getfield` / `arrayget` of a
   scalar slot. Emitters: `d = s`.
