@@ -134,3 +134,10 @@ coefficient lengths, without expansion. Bootstrap reached stage2 == stage3
 (10,980,860 bytes) and passed 141 default conformance tests. Two sealed-type
 negative cases and all 12 existing std_json conformance cases passed. MCP
 inspection of the four functions and the runnable example also passed.
+
+CI follow-up: the initial checked std run hit its 10-second deadline while
+building the 100,000-byte stress fixture. Per-byte ByteBuilder append contracts
+retain an old receiver snapshot, forcing repeated copy-on-write of the growing
+array. The fixture now uses geometric string doubling and an exact-length slice,
+with explicit 100,000-byte assertions. All numeric cases, contracts and deadlines
+are retained; this correction changes test-input construction only.
