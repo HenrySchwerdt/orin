@@ -66,9 +66,10 @@ executed instructions, -93% retains; census numbers and the lever ranking in
 
 1. **Performance, lever 2: field and element access code** (not a census class; design accepted 2026-10-15, ADR-0038
    addendum "lever 2"): `make_unique` + `struct_get` / `struct_replace` per field write and repeated bounds-checked element
-   reads (mutres 10.6x C instructions, pqueue 4.8x, nbody 3.7x, sieve 3.4x). Rollout T1 (drop `makeunique` the verifier
-   proves `Unique`) and T3 (scalar stores without the run-time refmask test) in progress, then T2, T4, T5 with the new
-   verifier rules U1, F1, U2-U5; T6 (range facts) needs its own decision. The `orin_stats` counters become a build option.
+   reads (mutres 10.6x C instructions, pqueue 4.8x, nbody 3.7x, sieve 3.4x). Done: T3 (scalar stores without the run-time
+   refmask test) and the `orin_stats` hot counters as a build option (#79); T1 (drop `makeunique` of a local proven `Unique`:
+   nbody -13.8%, sieve -10.4% instructions). Next T4 (in progress), T5, T2 with the new verifier rules F1, U2-U5, U1;
+   T6 (range facts) needs its own decision.
    Lever 1 (verifier and optimiser data structures) is done: self-compile -23% allocations, -3.2% instructions; the
    remaining self-compile time is no longer allocation.
 2. **Performance, next ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference

@@ -708,18 +708,24 @@ characters are escaped) and every 11th URL is `javascript:alert(i)`, which the G
 
 | program | Orin C backend | Orin LLVM backend | Go | C |
 |---|---:|---:|---:|---:|
-| executed instructions, OX (`html`) | 3.99 G | 3.88 G | | 1.58 G |
+| executed instructions, OX (`html`) | 3.10 G | 3.00 G | | 1.58 G |
 | executed instructions, hand-written Orin (`html_hand`) | 4.71 G | 4.63 G | | |
-| wall, OX (5 runs, median) | 0.415 s | 0.412 s | 0.449 s | 0.206 s |
-| allocations, OX: strings / `Html` records | 2.74 M / 0.80 M | | | |
+| wall, OX (5 runs, median) | 0.286 s | 0.298 s | 0.597 s | 0.173 s |
+| allocations, OX: strings / `Html` records | 3.54 M / 0.80 M | | | |
+| `string_grows`, OX | 0.25 M | | | |
 | allocations, hand-written: strings | 5.03 M | | | |
 
-OX executes 15 % fewer instructions than the hand-written concatenation and allocates 30 % fewer objects: its static
-parts are merged at compile time and appended into one buffer, while `out += a + b + c` builds a temporary per
-operator. It is 2.5x the instructions of C. What remains, in order (ADR-0043 "Not done"): geometric re-growth of each
-buffer (`string_grows` 4.2 M; a capacity hint from the known static length), the temporary string of every converted
-integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` + `joinAll`).
-The generic provider mechanism (ADR-0044) changed none of this: re-measured on the OX branch the counts are identical
+OX executes 34 % fewer instructions than the hand-written concatenation: its static parts are merged at compile time and
+appended into one pre-sized buffer, while `out += a + b + c` builds a temporary per operator. It is 2.0x the instructions
+of C. The buffer of each root starts from a capacity hint (ADR-0044, "Pre-sized buffer": static bytes plus 16 per dynamic
+piece), which cut `string_grows` from 4.23 M to 0.25 M and the instructions from 3.99 G (C backend; 3.88 G LLVM) to
+3.10 G (3.00 G); wall time on the same machine moved from 0.427 s / 0.392 s to 0.286 s / 0.298 s. The cost is
+0.8 M more string allocations (3.54 M against 2.74 M: a root whose first piece is a dynamic string used to append into
+that string, and now appends into a new buffer) and a higher peak (2.3 MiB against 1.7 MiB live); a per-piece estimate
+of 32 changed the instructions by 0.1 % only. What remains, in order (ADR-0043 "Not done"): the temporary string of every
+converted integer and escaped value, and one `Html` record plus a second copy per row (component fusion, `map` +
+`joinAll`).
+Before the capacity hint, the generic provider mechanism (ADR-0044) had changed none of this: re-measured on the OX branch the counts were identical
 (3,991,618,263 / 4,711,876,261 instructions, same allocation counters), since `std:html`'s rules are applied at compile
 time and its `@Inline` functions are the same calls as before.
 

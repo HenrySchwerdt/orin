@@ -58,13 +58,14 @@ compiler knows no library by name. Migrating an ADR-0043 program is adding this 
 | string attribute | `title="Tom &amp; Jerry"`, `title='say "hi"'` | TSX rules: no backslash escapes, entities decoded |
 | expression attribute | `size={n}`, `href={url}`, `disabled={off}` | checked against what the provider or the component accepts |
 | bare attribute | `required` | the value `true` |
-| spread | `<Card {...props} title="x" />` | components only: every field of the record `props` is an attribute |
+| spread | `<Card {...props} title="x" />` | every field of the record `props` is an attribute (on a `Markup` provider's elements as `f={props.f}`, see below) |
 | text | `Hello, world &copy;` | lines trimmed and joined with one space; entities decoded |
 | expression child | `{name}`, `{count}`, `{h}`, `{items.map(i => <li>{i}</li>)}` | see the provider |
 | component | `<Card title="x" count={3}>body</Card>` | an upper-case tag is a call of the function `Card` |
-| named slot | `<Dialog><:header>..</:header>body</Dialog>` | directly inside a component; fills the parameter `header` |
+| member tag | `<ui.Card title="x">body</ui.Card>`, `<this.Row a="1" />` | a dotted path whose last segment starts upper-case: a call of the method `Card` of the value `ui` |
+| named slot | `<Dialog><:header>..</:header>body</Dialog>` | directly inside a component or member tag; fills the parameter `header` |
 
-Not supported: member tags `<ui.Card>`, namespaced names `xlink:href`, `key`, spread on intrinsic elements.
+Not supported: namespaced names `xlink:href`, `key`.
 
 ## Two kinds of provider
 
@@ -101,10 +102,17 @@ export function ox(): Markup<Html> {
 | `{n}` child, number | decimal text |
 | text, `{"s"}`, `{c ? "a" : "b"}` | static encoding at compile time |
 | children of a `rawTextTags` tag | static text only, unencoded, no `</`; anything computed is E0493 |
-| spread, named slot | E0491 (an intrinsic element has no parameters) |
+| `a={o}`, `o: Option<T>` | nothing for `None`, ` a="..."` for `Some(v)` as if written `a={v}`; a `convert: None` rule still rejects it (E0493) |
+| spread `{...r}` | `r` (a record, else E0492) is evaluated once, then each field `f` in declaration order is the attribute `f={r.f}` at that position, with every rule above applied by the field name |
+| named slot | E0491 (an intrinsic element has no parameters) |
 
 A rule matches attribute `a` when `a` is in `names` or starts with the non-empty `prefix`, compared ASCII
 case-insensitively (`HREF={u}` is a URL attribute).
+
+When a name occurs more than once on an element, through a spread or written (compared ASCII case-insensitively), the
+one written later wins and the others are left out of the output; every value is still evaluated exactly once, in
+source order. Two attributes written with the same name stay a syntax error. A field of a spread record that has no
+valid attribute type is E0492 (naming the field); a field named like a `convert: None` rule (`onclick`) is E0493.
 
 ### `Components<R>`: build values
 
@@ -146,6 +154,18 @@ An upper-case tag `C` names a function in scope. The element is a call of `C`:
 - **evaluation order is source order**: attributes written in another order than the parameters are evaluated left to
   right into temporaries before the call; every value is evaluated once.
 
+### Member tags
+
+`<ui.Card title="x">body</ui.Card>` is the method call `ui.Card(title: "x", children: ..)`, with exactly the rules above:
+attributes fill the method's parameters by name, spreads, omitted `Option` parameters, the default slot, `<:name>` slots
+and source-order evaluation all work the same, and the result is checked where the element is used. `ui` is a class
+instance or an interface value, `this.Row` calls a method of the current class from inside it, and the prefix may be a
+path of field reads (`<app.theme.Button>`); the closing tag repeats the whole path (`</app.theme.Button>`). The prefix is
+only names, `this` and fields, so reading it at the call is the same as evaluating it first.
+
+A member that is not a method (a field of function type has no parameter names) or does not exist is E0491. A dotted tag
+whose last segment is lower-case (`<ui.card>`) is a syntax error (E0200): no provider element has a dotted name.
+
 ### Slots
 
 The children of a slot (and of a fragment) are checked against the expected type `T`. Whitespace-only text is dropped.
@@ -182,6 +202,8 @@ function Dialog(title: string, header: Widget, children: Widget[], footer: Optio
   attributes (`href`, `src`, `action`, ...) with a computed value are sanitised (`javascript:`, `data:`, ... become
   `about:invalid#orin-unsafe-url`); computed `on*` event attributes are rejected (E0493); `<script>` / `<style>` take
   only static text.
+- A spread cannot smuggle an event handler or an unsanitised URL into an element: the spread is expanded at compile
+  time and the rules apply by field name, so an `onclick` field is E0493 and an `href` field is sanitised like `href={..}`.
 - A provider can still declare a wrong rule (a missing escape). Test its static encoding against its run-time one the way
   `tests/next/run/ox_escape_diff.or` does for `std:html`.
 
@@ -196,9 +218,9 @@ no node object. See docs/benchmarks.md "HTML rendering".
 | Code | Meaning |
 |---|---|
 | E0490 | markup without `import ox from ".."`, or the provider's `ox()` does not return a literal |
-| E0491 | component: unknown, not a function, unknown / missing attribute, unknown slot, attribute and slot for one parameter, spread field without parameter, `Option` slot with several children, spread or slot on an intrinsic element |
-| E0492 | a value of a type that cannot be used there (wrong child type in a slot, `bool` attribute without `presenceAttrs`) |
-| E0493 | static only: computed attribute of a `convert: None` rule (event handlers), computed `<script>` / `<style>` content |
+| E0491 | component: unknown, not a function, unknown / missing attribute, unknown slot, attribute and slot for one parameter, spread field without parameter, `Option` slot with several children, named slot on an intrinsic element |
+| E0492 | a value of a type that cannot be used there (wrong child type in a slot, `bool` attribute without `presenceAttrs`, spread of a non-record, spread field or attribute of an unsupported type) |
+| E0493 | static only: computed attribute (or spread field) of a `convert: None` rule (event handlers), computed `<script>` / `<style>` content |
 | E0494 | malformed element: children of a void element, invalid tag or attribute name |
 | E0495 | record literal or field assignment of a `@Sealed` type outside its module |
 | E0200 / E0100 | syntax: mismatched closing tag, duplicate attribute / unterminated element, `}` or `>` in text |

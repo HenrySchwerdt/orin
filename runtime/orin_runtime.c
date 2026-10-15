@@ -613,6 +613,11 @@ OrinObj *orin_str_new(const char *p, uint64_t n) {
     return &s->h;
 }
 
+OrinObj *orin_str_with_capacity(uint64_t cap) {
+    if (cap > ORIN_STR_HINT_MAX) cap = ORIN_STR_HINT_MAX;
+    return &str_alloc(0, cap)->h;
+}
+
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b) {
     OrinString *x = (OrinString *)a, *y = (OrinString *)b;
     if (y->len == 0) return orin_dup(a);

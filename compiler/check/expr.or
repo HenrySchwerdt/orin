@@ -12,7 +12,7 @@
 // body) are checked by the statement checker (stmt.or), which depends on this file; the cycle is
 // closed by the interface `BlockHost`, which the statement checker implements.
 
-import { Span, Diagnostic, diag } from "../diag";
+import { Span, Diagnostic, diag, spanTo } from "../diag";
 import {
   Ident, Block, Expr, ExprKind, FieldInit, MatchArm, TypeExpr, TFn, ArrowParam, ArrowBody, UnaryOp,
   BinaryOp, DRecord, DUnion, OxElement, OxAttr, OxChild, OxValue, oxIsComponent, Param, TypeExprKind,
@@ -25,7 +25,7 @@ import {
   ClassInfo, MethodInfo, ValEnt, Inst, mapOrigin, parOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
   EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isBool, isString, isVoid, isIntish, isFloatTy,
   isArrayTy, isIface, isSignedInt, isFn, showType, mismatch, globalVal, findType, findVal, originOf,
-  boundOf, ifaceMethodIndex, typeInRange, isWellFormedEnv,
+  boundOf, ifaceMethodIndex, IfaceSig, typeInRange, isWellFormedEnv,
 } from "./env";
 import { checkBounds, internVtable } from "./ifaces";
 import {
@@ -53,7 +53,7 @@ import { Inference, grantMissingErr, grantMismatchErr } from "./call";
 import { localsBound, placeBound } from "./hirok";
 import {
   OxOut, OxProvider, OX_MARKUP, OX_COMPONENTS, oxProvider, sealedErr, oxEncodeStatic, oxIsVoid, oxIsRawText, oxRuleFor,
-  isTagName, isAttrName, oxOutNew, oxOutStatic, oxOutDyn, oxOutFinish,
+  isTagName, isAttrName, asciiLower, oxOutNew, oxOutStatic, oxOutDyn, oxOutFinish,
 } from "./ox";
 
 export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
@@ -62,17 +62,34 @@ export type BlockOut = { fx: FnCtx; block: HBlock; div: bool; };
 // component call evaluated in source order (`ref` names it, `lets` are all temporaries so far).
 type OxItem = { value: HExpr; splice: bool; };
 type OxTemp = { ref: Expr; lets: HStmt[]; };
+type OxPiece = { presence: bool; piece: HExpr; };
+// The parameters of a called function or method as a component call sees them: names, whether each may be left out
+// (`Option<T>`) and the types when known (for evaluating attribute values in order).
+type OxSig = { names: string[]; opt: bool[]; tys: Option<Type[]>; };
 
-// The index of the parameter named `name`, -1 if none.
-function indexOfParam(ps: Param[], name: string): int {
+function oxSigOfParams(ps: Param[], tys: Option<Type[]>): OxSig {
+  return OxSig { names: ps.map(p => p.name.name), opt: ps.map(p => isOptionTe(p.ty)), tys: tys };
+}
+
+function oxIndexOf(names: string[], name: string): int {
   let i: usize = 0;
-  while (i < ps.length) {
-    if (ps[i].name.name == name) {
+  while (i < names.length) {
+    if (names[i] == name) {
       return i.toInt();
     }
     i += 1;
   }
   return -1;
+}
+
+// The dotted text of a member tag's receiver path (`ui`, `this`, `a.b`).
+function oxPathText(e: Expr): string {
+  return match (e.kind) {
+    EIdent(id) => id.name,
+    EThis => "this",
+    EMember(b, n) => oxPathText(b) + "." + n.name,
+    _ => "?",
+  };
 }
 
 // A parameter written as `Option<..>` (it may be left out of a markup call).
@@ -81,6 +98,33 @@ function isOptionTe(te: TypeExpr): bool {
     TNamed(n, args) => n.name == "Option" && args.length == 1,
     _ => false,
   };
+}
+
+// Entry `k` of attribute `j` (names are lower-cased) is overridden when the same name occurs later: after it in the
+// same spread, or in a later attribute.
+function oxOverridden(names: string[][], j: usize, k: usize): bool {
+  const n = names[j][k];
+  let i = k + 1;
+  while (i < names[j].length) {
+    if (names[j][i] == n) {
+      return true;
+    }
+    i += 1;
+  }
+  let a = j + 1;
+  while (a < names.length) {
+    if (names[a].some(x => x == n)) {
+      return true;
+    }
+    a += 1;
+  }
+  return false;
+}
+
+// `lets` evaluated, then `value`: `match (true) { _ => { lets; value } }`.
+function oxBlock(lets: HStmt[], value: HExpr, span: Span): HExpr {
+  const arm = HArm { pattern: HPWildcard, body: HBlock { stmts: lets }, value: Some(value) };
+  return mk(XMatch(mk(XBool(true), TyBool, span), [arm]), value.ty, span);
 }
 
 // An attribute value whose evaluation has no effect, so its order does not matter: a literal, a name, a function.
@@ -99,7 +143,7 @@ function oxTrivial(x: Expr): bool {
 // The fragment `<>kids</>` (a slot's content, checked against the parameter type).
 function oxFragmentOf(kids: OxChild[], span: Span): Expr {
   const noAttrs: OxAttr[] = [];
-  return Expr { kind: EOx(OxElement { name: None, attrs: noAttrs, children: kids, selfClosing: false, span: span }), span: span };
+  return Expr { kind: EOx(OxElement { recv: None, name: None, attrs: noAttrs, children: kids, selfClosing: false, span: span }), span: span };
 }
 export type StmtOut = { fx: FnCtx; stmt: HStmt; div: bool; };
 export type MatchOut = { fx: FnCtx; expr: HExpr; div: bool; };
@@ -442,9 +486,7 @@ export class ExprChecker {
       );
     }
     let o = oxOutStatic(o0, "<" + tag.name);
-    for (const a of el.attrs) {
-      o = this.oxAttr(p, a, o)?;
-    }
+    o = this.oxAttrs(p, el.attrs, o)?;
     if (oxIsVoid(p, tag.name)) {
       if (el.children.length > 0) {
         return Err(
@@ -458,19 +500,107 @@ export class ExprChecker {
     return Ok(oxOutStatic(o, "</" + tag.name + ">"));
   }
 
+  // The attributes of an intrinsic element. Without a spread, one after the other. With spreads (ADR-0044 §4.3): each
+  // `{...r}` evaluates `r` once into a temporary, then every field `f` is the attribute `f={tmp.f}` at that position.
+  // When a name occurs more than once (ASCII case-insensitively), the one written later wins; the others are still
+  // evaluated, in source order, and their text is dropped.
+  private oxAttrs(p: OxProvider, attrs: OxAttr[], o0: OxOut): Result<OxOut, Diagnostic> {
+    let o = o0;
+    let spread = false;
+    for (const a of attrs) {
+      match (a.value) {
+        JVSpread(_) => {
+          spread = true;
+        },
+        _ => {},
+      }
+    }
+    if (!spread) {
+      for (const a of attrs) {
+        o = this.oxAttr(p, a, o)?;
+      }
+      return Ok(o);
+    }
+    const env = this.fx.env;
+    // Pass 1: the lower-cased attribute names of each entry (a spread contributes its fields), and for each spread
+    // its temporary and record.
+    let names: string[][] = [];
+    let temps: OxTemp[] = [];
+    let recs: usize[] = [];
+    for (const a of attrs) {
+      let ns: string[] = [];
+      match (a.value) {
+        JVSpread(x) => {
+          const v = this.ex(x, None)?;
+          const rid = match (v.ty) {
+            TyRecord(r) => r,
+            _ => env.records.length,
+          };
+          if (rid >= env.records.length) {
+            return Err(
+              diag("E0492", x.span, "a spread `{...}` needs a record value, found `" + showType(env, v.ty) + "`"),
+            );
+          }
+          temps.push(this.oxTemp(v, a.span, [])?);
+          recs.push(rid);
+          for (const f of env.records[rid].fields) {
+            ns.push(asciiLower(f.name));
+          }
+        },
+        _ => {
+          temps.push(OxTemp { ref: Expr { kind: EBool(true), span: a.span }, lets: [] });
+          recs.push(0);
+          ns.push(asciiLower(a.name.name));
+        },
+      }
+      names.push(ns);
+    }
+    // Pass 2: in source order.
+    let j: usize = 0;
+    while (j < attrs.length) {
+      const a = attrs[j];
+      match (a.value) {
+        JVSpread(x) => {
+          let s = oxOutNew();
+          let k: usize = 0;
+          for (const f of env.records[recs[j]].fields) {
+            const fa = OxAttr {
+              name: Ident { name: f.name, span: x.span },
+              value: JVExpr(Expr { kind: EMember(temps[j].ref, Ident { name: f.name, span: x.span }), span: x.span }),
+              span: x.span,
+            };
+            if (oxOverridden(names, j, k)) {
+              this.oxAttr(p, fa, oxOutNew())?;
+            } else {
+              s = this.oxAttr(p, fa, s)?;
+            }
+            k += 1;
+          }
+          o = oxOutDyn(o, oxBlock(temps[j].lets, oxOutFinish(s, x.span), x.span), x.span);
+        },
+        _ => {
+          if (oxOverridden(names, j, 0)) {
+            const d = this.oxAttr(p, a, oxOutNew())?;
+            if (d.parts.length > 0) {
+              const id = this.fx.newTemp("$ox", TyString);
+              const lets = [HLet(id, oxOutFinish(d, a.span))];
+              o = oxOutDyn(o, oxBlock(lets, mk(XStr(""), TyString, a.span), a.span), a.span);
+            }
+          } else {
+            o = this.oxAttr(p, a, o)?;
+          }
+        },
+      }
+      j += 1;
+    }
+    return Ok(o);
+  }
+
   // One attribute of an intrinsic element: ` name` (a bare name, or a `bool` that is true, if the provider has presence
   // attributes), ` name="value"` with the value encoded (at compile time for a literal, by the provider's `attr` or the
   // matching rule's `convert` otherwise).
   private oxAttr(p: OxProvider, a: OxAttr, o: OxOut): Result<OxOut, Diagnostic> {
     const name = a.name.name;
-    match (a.value) {
-      JVSpread(x) => {
-        return Err(
-          diag("E0491", a.span, "a spread `{...}` can only pass attributes to a component (an intrinsic element has no parameters)"),
-        );
-      },
-      _ => {},
-    }
     if (!isAttrName(name)) {
       return Err(diag("E0494", a.name.span, "`" + name + "` is not an attribute name"));
     }
@@ -516,33 +646,69 @@ export class ExprChecker {
           }
         }
         const v = this.ex(x, None)?;
-        if (isBool(v.ty)) {
-          if (!p.presence) {
-            return Err(this.oxNoPresence(p, name, x.span));
-          }
-          const on = mk(XStr(" " + name), TyString, x.span);
-          const off = mk(XStr(""), TyString, x.span);
-          return Ok(oxOutDyn(o, mk(XCond(v, on, off), TyString, x.span), x.span));
+        if (isOptionTy(v.ty)) {
+          return this.oxAttrOption(p, name, v, conv, x.span, o);
         }
-        let piece = v;
-        if (isString(v.ty)) {
-          piece = mk(XCall(conv, [v]), TyString, x.span);
-        } else if (isIntish(v.ty) || isFloatTy(v.ty)) {
-          piece = interpolated(this.fx.env, v, x.span)?;
-        } else {
-          return Err(
-            diag(
-              "E0492",
-              x.span,
-              "an attribute value must be a `string`, a number" + (p.presence ? " or a `bool`" : "") + ", found `"
-                  + showType(this.fx.env, v.ty) + "`",
-            ),
-          );
+        const pc = this.oxAttrPiece(p, name, v, conv, x.span)?;
+        if (pc.presence) {
+          return Ok(oxOutDyn(o, pc.piece, x.span));
         }
         const o2 = oxOutStatic(o, " " + name + "=\"");
-        return Ok(oxOutStatic(oxOutDyn(o2, piece, x.span), "\""));
+        return Ok(oxOutStatic(oxOutDyn(o2, pc.piece, x.span), "\""));
       },
     }
+  }
+
+  // The computed value `v` of attribute `name`: a `bool` is the presence text (` name` or nothing), a string goes
+  // through `conv`, a number is decimal text; anything else is E0492.
+  private oxAttrPiece(p: OxProvider, name: string, v: HExpr, conv: usize, span: Span): Result<OxPiece, Diagnostic> {
+    if (isBool(v.ty)) {
+      if (!p.presence) {
+        return Err(this.oxNoPresence(p, name, span));
+      }
+      const on = mk(XStr(" " + name), TyString, span);
+      const off = mk(XStr(""), TyString, span);
+      return Ok(OxPiece { presence: true, piece: mk(XCond(v, on, off), TyString, span) });
+    }
+    if (isString(v.ty)) {
+      return Ok(OxPiece { presence: false, piece: mk(XCall(conv, [v]), TyString, span) });
+    }
+    if (isIntish(v.ty) || isFloatTy(v.ty)) {
+      return Ok(OxPiece { presence: false, piece: interpolated(this.fx.env, v, span)? });
+    }
+    return Err(
+      diag(
+        "E0492",
+        span,
+        "the attribute `" + name + "` must be a `string`, a number" + (p.presence ? ", a `bool`" : "")
+            + " or an `Option` of one of these, found `" + showType(this.fx.env, v.ty) + "`",
+      ),
+    );
+  }
+
+  // `a={opt}` with `opt: Option<T>`: nothing for `None`, the attribute for `Some(v)` as if written `a={v}`. One
+  // dynamic piece: `opt` is evaluated once into a temporary.
+  private oxAttrOption(p: OxProvider, name: string, v: HExpr, conv: usize, span: Span, o: OxOut): Result<OxOut, Diagnostic> {
+    const inner = match (v.ty) {
+      TyOption(e) => e,
+      _ => v.ty,
+    };
+    const id = this.fx.newTemp("$ox", v.ty);
+    const ref = mk(XLocal(id), v.ty, span);
+    const some = mk(XBuiltin(BOptUnwrap, [ref]), inner, span);
+    const pc = this.oxAttrPiece(p, name, some, conv, span)?;
+    let text = pc.piece;
+    if (!pc.presence) {
+      const pre = mk(XStr(" " + name + "=\""), TyString, span);
+      text = mk(
+        XBinary(OpAdd, mk(XBinary(OpAdd, pre, pc.piece), TyString, span), mk(XStr("\""), TyString, span)),
+        TyString,
+        span,
+      );
+    }
+    const test = mk(XBuiltin(BOptIsSome, [ref]), TyBool, span);
+    const value = mk(XCond(test, text, mk(XStr(""), TyString, span)), TyString, span);
+    return Ok(oxOutDyn(o, oxBlock([HLet(id, v)], value, span), span));
   }
 
   private oxPresent(p: OxProvider, name: string, span: Span, o: OxOut): Result<OxOut, Diagnostic> {
@@ -888,6 +1054,9 @@ export class ExprChecker {
   // `<Card title={t} count={3}>children</Card>`: a call of the function `Card` (ADR-0044 §4.1).
   private oxComponent(p: OxProvider, el: OxElement): Result<HExpr, Diagnostic> {
     const tag = el.name.unwrap();
+    if (el.recv.isSome()) {
+      return this.oxMember(p, el);
+    }
     if (this.fx.lookupVar(tag.name).isSome()) {
       return Err(
         diag("E0491", tag.span, "the component `" + tag.name + "` must be a function declared with `function`"),
@@ -898,8 +1067,11 @@ export class ExprChecker {
       return Err(diag("E0491", tag.span, "unknown component `" + tag.name + "` (no function of that name in scope)"));
     }
     return match (g.unwrap()) {
-      VFunc(fid) => this.oxCall(p, el, "component `" + tag.name + "`", Some(fid), None),
-      VGFunc(gi) => this.oxCall(p, el, "component `" + tag.name + "`", None, Some(gi)),
+      VFunc(fid) => this.oxCall(p, el, "component `" + tag.name + "`", Some(fid), None, this.oxSigOfFunc(fid)),
+      VGFunc(gi) => this.oxCall(
+        p, el, "component `" + tag.name + "`", None, Some(gi),
+        oxSigOfParams(this.fx.env.gfuncs[gi].decl.params, None),
+      ),
       _ => Err(diag("E0491", tag.span, "the component `" + tag.name + "` must be a function declared with `function`")),
     };
   }
@@ -926,7 +1098,89 @@ export class ExprChecker {
         ),
       );
     }
-    return this.oxCall(p, el, "element `" + tag.name + "`", Some(fid), None);
+    return this.oxCall(p, el, "element `" + tag.name + "`", Some(fid), None, this.oxSigOfFunc(fid));
+  }
+
+  private oxSigOfFunc(fid: usize): OxSig {
+    const f = this.fx.env.funcs[fid];
+    return oxSigOfParams(f.decl.params, Some(f.params));
+  }
+
+  // `<ui.Card title="x">..</ui.Card>`: a call of the method `Card` of the value `ui` (ADR-0044 §4.5), with the
+  // component rules; the method's parameters give the attribute names. The receiver is a pure path (names, `this`,
+  // field reads), so it is the same value whenever it is read: the final call reads it once, like `ui.Card(..)`.
+  private oxMember(p: OxProvider, el: OxElement): Result<HExpr, Diagnostic> {
+    const tag = el.name.unwrap();
+    const recv = el.recv.unwrap();
+    const shown = oxPathText(recv) + "." + tag.name;
+    const env = this.fx.env;
+    const saved = this.fx;
+    const b = this.ex(recv, None)?;
+    this.fx = saved;
+    const notMethod = diag(
+      "E0491",
+      tag.span,
+      "`" + shown + "` is not a method; a member tag calls a method, whose parameters give the attribute names",
+    );
+    const noMethod = diag(
+      "E0491",
+      tag.span,
+      "no method `" + tag.name + "` on `" + oxPathText(recv) + "` (type `" + showType(env, b.ty) + "`)",
+    );
+    let sig: Option<OxSig> = None;
+    match (b.ty) {
+      TyRecord(r) => {
+        const co = classOfRec(env, r);
+        let isMethod = false;
+        if (co.isSome()) {
+          const ci = env.classes[co.unwrap()];
+          const mo = findMethod(ci, tag.name);
+          if (mo.isSome()) {
+            isMethod = true;
+            const mi = ci.methods[mo.unwrap()];
+            const ps = ci.gid < 0 ? env.funcs[mi.fid].decl.params : env.gfuncs[mi.fid].decl.params;
+            const own = mi.isStatic ? ps : ps.slice(1, ps.length);
+            const tys: Option<Type[]> = ci.gid < 0 && !mi.isStatic ? Some(tailTypes(env.funcs[mi.fid].params)) : None;
+            sig = Some(oxSigOfParams(own, tys));
+          }
+        }
+        if (!isMethod) {
+          const bd = boundOf(env, r);
+          if (bd.isSome()) {
+            const info = env.ifaces[bd.unwrap()];
+            const so = ifaceMethodIndex(info, tag.name);
+            if (so.isNone()) {
+              return Err(noMethod);
+            }
+            sig = Some(this.oxSigOfIface(info.methods[so.unwrap()]));
+          } else if (recordHasFnField(env.records[r].fields, tag.name)) {
+            return Err(notMethod);
+          } else {
+            return Err(noMethod);
+          }
+        }
+      },
+      TyIface(i) => {
+        const info = env.ifaces[i];
+        const so = ifaceMethodIndex(info, tag.name);
+        if (so.isNone()) {
+          return Err(noMethod);
+        }
+        sig = Some(this.oxSigOfIface(info.methods[so.unwrap()]));
+      },
+      _ => {
+        return Err(noMethod);
+      },
+    }
+    return this.oxCall(p, el, "method `" + shown + "`", None, None, sig.unwrap());
+  }
+
+  private oxSigOfIface(m: IfaceSig): OxSig {
+    return OxSig {
+      names: m.paramNames,
+      opt: m.params.map(t => isOptionTy(t)),
+      tys: Some(m.params),
+    };
   }
 
   // The call of function `fid` (or generic function `gi`) for element `el`: attributes, spreads and slots fill the
@@ -938,11 +1192,12 @@ export class ExprChecker {
     what: string,
     fid: Option<usize>,
     gi: Option<usize>,
+    sig: OxSig,
   ): Result<HExpr, Diagnostic> {
     const tag = el.name.unwrap();
     const env = this.fx.env;
-    const params: Param[] = fid.isSome() ? env.funcs[fid.unwrap()].decl.params : env.gfuncs[gi.unwrap()].decl.params;
-    const ptys: Option<Type[]> = fid.isSome() ? Some(env.funcs[fid.unwrap()].params) : None;
+    const params = sig.names;
+    const ptys = sig.tys;
     // The slots: the named ones, then the default slot (`children`) with the remaining children.
     let slotNames: Ident[] = [];
     let slotKids: OxChild[][] = [];
@@ -969,7 +1224,7 @@ export class ExprChecker {
       slotSpans.push(el.span);
     }
     for (const n of slotNames) {
-      if (indexOfParam(params, n.name) < 0) {
+      if (oxIndexOf(params, n.name) < 0) {
         if (n.name == "children") {
           return Err(diag("E0491", tag.span, "the " + what + " takes no children (it has no parameter `children`)"));
         }
@@ -986,7 +1241,7 @@ export class ExprChecker {
           ordered = true;
         },
         _ => {
-          const pi = indexOfParam(params, a.name.name);
+          const pi = oxIndexOf(params, a.name.name);
           if (pi < 0) {
             return Err(diag("E0491", a.name.span, "the " + what + " has no parameter `" + a.name.name + "`"));
           }
@@ -999,7 +1254,7 @@ export class ExprChecker {
     }
     let si: usize = 0;
     while (si < slotNames.length) {
-      const pi = indexOfParam(params, slotNames[si].name);
+      const pi = oxIndexOf(params, slotNames[si].name);
       if (pi <= last) {
         ordered = true;
       }
@@ -1028,7 +1283,7 @@ export class ExprChecker {
           const tmp = this.oxTemp(v, a.span, lets)?;
           lets = tmp.lets;
           for (const f of this.fx.env.records[rid].fields) {
-            const pi = indexOfParam(params, f.name);
+            const pi = oxIndexOf(params, f.name);
             if (pi < 0) {
               return Err(
                 diag("E0491", x.span, "the " + what + " has no parameter `" + f.name + "` (a field of the spread record)"),
@@ -1040,7 +1295,7 @@ export class ExprChecker {
           }
         },
         _ => {
-          const pi = indexOfParam(params, a.name.name).toUsize();
+          const pi = oxIndexOf(params, a.name.name).toUsize();
           let x = match (a.value) {
             JVStr(v) => Expr { kind: EStr(v), span: a.span },
             JVExpr(e) => e,
@@ -1060,7 +1315,7 @@ export class ExprChecker {
     si = 0;
     while (si < slotNames.length) {
       const n = slotNames[si];
-      const pi = indexOfParam(params, n.name).toUsize();
+      const pi = oxIndexOf(params, n.name).toUsize();
       if (args[pi].isSome() && n.name != "children") {
         return Err(diag("E0491", n.span, "`" + n.name + "` is given both as an attribute and as a slot"));
       }
@@ -1083,8 +1338,8 @@ export class ExprChecker {
     let i: usize = 0;
     while (i < params.length) {
       if (args[i].isNone()) {
-        const pn = params[i].name.name;
-        if (pn != "children" && !isOptionTe(params[i].ty)) {
+        const pn = params[i];
+        if (pn != "children" && !sig.opt[i]) {
           return Err(diag("E0491", tag.span, "the " + what + " needs the attribute `" + pn + "`"));
         }
         args[i] = Some(oxFragmentOf([], el.span));
@@ -1093,7 +1348,11 @@ export class ExprChecker {
       i += 1;
     }
     let call = mk(XInt(0), TyInt, el.span);
-    if (fid.isSome()) {
+    if (el.recv.isSome()) {
+      // a method: the checker's own method call, so visibility, static and mutating methods behave as in `a.b.C(..)`
+      const callee = Expr { kind: EMember(el.recv.unwrap(), tag), span: spanTo(el.recv.unwrap().span, tag.span) };
+      call = this.ex(Expr { kind: ECall(callee, all), span: el.span }, None)?;
+    } else if (fid.isSome()) {
       const f = this.fx.env.funcs[fid.unwrap()];
       const tg = testGuard(f, el.span);
       if (tg.isSome()) {
