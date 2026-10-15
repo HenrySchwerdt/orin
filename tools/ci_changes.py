@@ -25,6 +25,8 @@ MODULES = ["bytes", "utf8", "collections", "http", "net", "text", "html", "taskc
 # modules whose mutants are split over several CI jobs (tools/mutate_std.py --shard I/N): the http mutants run the slow
 # property tests, about 15 minutes on one runner
 SHARDS = {"http": 3}
+# std modules that only declare types for another module's tests (stdlib/ox.or: the OX provider types std:html uses)
+DEPENDENTS = {"stdlib/ox.or": "html"}
 ALL_MUTANTS = ["tools/mutate_std.py", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
 MACOS = ("compiler/", "runtime/", "platform/", "seed/", "tools/", ".github/")
 
@@ -45,7 +47,8 @@ def decide(files, everything=False):
         mutants = list(MODULES)
     else:
         mutants = [m for m in MODULES
-                   if any(f == "stdlib/%s.or" % m or f.startswith("tests/std/%s" % m) for f in files)]
+                   if any(f == "stdlib/%s.or" % m or f.startswith("tests/std/%s" % m) or DEPENDENTS.get(f) == m
+                          for f in files)]
     return {"code": code, "macos": macos, "vscode": vscode, "mutants": mutants}
 
 
@@ -59,6 +62,7 @@ def selftest():
         (["docs/roadmap.md"], {"code": False, "macos": False, "vscode": False, "mutants": []}),
         (["README.md", "docs/decisions/0040-x.md"], {"code": False, "macos": False, "vscode": False, "mutants": []}),
         (["stdlib/text.or", "tests/std/text_test.or"], {"code": True, "macos": False, "vscode": False, "mutants": ["text"]}),
+        (["stdlib/ox.or"], {"code": True, "macos": False, "vscode": False, "mutants": ["html"]}),
         (["stdlib/README.md"], {"code": True, "macos": False, "vscode": False, "mutants": []}),
         (["compiler/lower/ops.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tests/std/http_prop_test.or"], {"code": True, "macos": False, "vscode": False, "mutants": ["http"]}),
