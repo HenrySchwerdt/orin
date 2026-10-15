@@ -52,8 +52,8 @@ function name in two modules is fine. `--filter S` runs the tests whose id conta
 
 `orin test` builds **one** executable: the tests are renamed and exported, the entry module's `main` is
 replaced by a dispatcher that runs the test whose index is `argv[1]`. The runner starts that
-executable once per selected test as a separate process (through the shell, with `timeout(1)` when it
-exists, default 10 s, `--timeout 0` = none) and records the exit status, stdout and stderr. A test that
+executable once per selected test as a separate process (through the shell with a native monotonic
+deadline, default 10 s, `--timeout 0` = explicitly unlimited) and records the exit status, stdout and stderr. A test that
 traps, exits, crashes, hangs or corrupts state therefore cannot affect any other test. The build
 directory is `/tmp/orin-test-N` (removed afterwards; `--out-dir DIR` builds in `DIR` and keeps it,
 `--keep` keeps the temporary one).
@@ -177,3 +177,21 @@ bootstrap passed. A push to `main`, the nightly run and a manual run never read 
 seed, so a cache cannot hide a broken fixed point on `main`. The http mutants run as three matrix jobs (`--shard`,
 `tools/ci_changes.py`). The tooling job runs the LSP and MCP tests against `orin2` instead of building the same compiler
 twice more.
+
+## Execution deadlines
+
+CLI tests and MCP program/unit tests use native POSIX process groups and a
+monotonic deadline on macOS and Linux; no external `timeout` utility is needed.
+Timeouts have exit code **-2** and reason `timeout` in unit-test reports. Ordinary
+exit 124 remains `exit 124`. MCP program tests return `passed:false`, `exit:-2`,
+`why:"timeout after 10 seconds"`; an expected exit comment cannot turn a timeout
+into a passing test. Explicit CLI `--timeout 0` retains unlimited execution.
+
+Bounded calls kill the child's process group and reap the direct child on normal
+exit as well as timeout, including background children that remain in the group.
+Descendants that deliberately change process groups are outside this cleanup;
+this is a deadline facility, not a sandbox. OS scheduling and uninterruptible
+kernel operations may delay termination. Compiler/linker time and output sizes
+are not bounded by this per-execution deadline. Details and test evidence:
+[ADR-0045](decisions/0045-portable-bounded-execution.md),
+`python3 tools/test_execution.py` (includes independent Python safety deadlines).

@@ -221,6 +221,7 @@ static void t_double_revoke(void) {
 static void t_clock_ok(void) { (void)orin_time_now_millis(orin_cap_acquire(g_host, 4)); }
 static void t_denied_exists(void) { (void)orin_fs_exists(g_fs, S("/")); }
 static void t_denied_args(void) { (void)orin_process_args(orin_cap_acquire(g_host, 2)); }
+static void t_nospawn_timeout(void) { (void)orin_io_shell_timeout(orin_cap_narrow(orin_cap_acquire(g_host, 2), 2, S("")), S("echo MUST_NOT_RUN"), 1); }
 static void t_nospawn(void) { (void)orin_io_shell(orin_cap_narrow(orin_cap_acquire(g_host, 2), 2, S("")), S("true")); }
 static void t_scope_exists(void) { (void)orin_fs_exists(orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in")), S("/etc")); }
 
@@ -232,6 +233,7 @@ static void test_grants(void) {
     CHECK(trap_code(t_wrong_kind) == 101 && trap_code(t_double_revoke) == 101);
     CHECK(trap_code(t_clock_ok) == 0);
     CHECK(trap_code(t_nospawn) == 101);
+    CHECK(trap_code(t_nospawn_timeout) == 101);
     CHECK(system("rm -rf /tmp/orin_rt_scope && mkdir -p /tmp/orin_rt_scope/in /tmp/orin_rt_scope/out && "
                  "echo hi > /tmp/orin_rt_scope/in/a.txt && echo secret > /tmp/orin_rt_scope/out/s.txt && "
                  "ln -s ../out /tmp/orin_rt_scope/in/esc") == 0);

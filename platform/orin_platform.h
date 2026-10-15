@@ -163,6 +163,17 @@ void orin_platform_abort(void) __attribute__((noreturn));
     assigns \stdout, \process; */
 int64_t orin_platform_shell(const char *cmd, size_t n);
 
+/*@ requires n == 0 || cmd[0..n-1] readable; (first NUL ends command, as with shell)
+    requires the caller does not reap this call's child or change SIGCHLD during the call;
+    ensures non-default SIGCHLD disposition or SA_NOCLDWAIT ==> \result == -1 and no child is started;
+    ensures seconds <= 0 ==> \result == -1 and no child is started;
+    ensures \result >= 0 ==> \result is the shell exit status (0..255);
+    ensures \result == -2 ==> the monotonic deadline expired;
+    ensures \result == -1 ==> invalid duration, memory, spawn, signal or OS error;
+    ensures the direct child is reaped and its process group signaled SIGKILL on completion;
+    assigns \stdout, \process; */
+int64_t orin_platform_shell_timeout(const char *cmd, size_t n, int64_t seconds);
+
 /*@ ensures \result is the wall-clock time in milliseconds since the Unix epoch (CLOCK_REALTIME);
     assigns \nothing; */
 int64_t orin_platform_now_millis(void);

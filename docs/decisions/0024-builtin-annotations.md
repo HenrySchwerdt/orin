@@ -58,8 +58,8 @@ parser-level (E0440-E0442) or checker-level (E0443-E0445) *errors*, never silent
   unique exported `__orin_test_<N>`, the entry module imports them, its own `main` is replaced by a
   dispatcher that runs the test whose index is `argv[1]`, and a small harness module owns the argument
   handling (so the entry's own imports cannot collide with it). The runner then starts the executable
-  **once per selected test** through the shell (`./tests 3 > t3.out 2> t3.err`), under `timeout(1)`
-  when available (`--timeout`, default 10 s) and records the exit status. *Why re-exec instead of
+  **once per selected test** through the shell (`./tests 3 > t3.out 2> t3.err`), under a native deadline
+  (ADR-0045; `--timeout`, default 10 s, 0 explicitly disables it) and records the exit status. *Why re-exec instead of
   running all tests in one process:* a trap calls `exit(101)`; the language has no `fork`, no
   exceptions and no unwinding, and an in-process runner would stop at the first failure and share
   heap/global state between tests. Re-executing needs only the shell support the compiler already has

@@ -81,4 +81,10 @@ static inline int64_t orin_io_shell(int64_t g, OrinObj *cmd) {
     return orin_platform_shell(orin_str_data(cmd), (size_t)orin_str_len(cmd));
 }
 
+/* Bounded shell; -2 timeout, -1 spawn/signal/invalid-duration/system error, 0..255 exit. */
+static inline int64_t orin_io_shell_timeout(int64_t g, OrinObj *cmd, int64_t seconds) {
+    orin_cap_require_spawn(g);
+    return orin_platform_shell_timeout(orin_str_data(cmd), (size_t)orin_str_len(cmd), seconds);
+}
+
 #endif

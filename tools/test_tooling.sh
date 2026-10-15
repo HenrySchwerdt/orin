@@ -25,6 +25,7 @@ esac
 mkdir -p build
 # one line per case, in the order of the output; `first:` starts a slow case before the others (tools/parallel.py)
 {
+  echo 'python3 tools/test_execution.py --orinc "$ORIN2"'
   for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test; do
     echo "sh tools/test_tooling.sh --unit $t"
   done
