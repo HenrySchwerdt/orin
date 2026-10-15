@@ -62,9 +62,10 @@ compiler knows no library by name. Migrating an ADR-0043 program is adding this 
 | text | `Hello, world &copy;` | lines trimmed and joined with one space; entities decoded |
 | expression child | `{name}`, `{count}`, `{h}`, `{items.map(i => <li>{i}</li>)}` | see the provider |
 | component | `<Card title="x" count={3}>body</Card>` | an upper-case tag is a call of the function `Card` |
-| named slot | `<Dialog><:header>..</:header>body</Dialog>` | directly inside a component; fills the parameter `header` |
+| member tag | `<ui.Card title="x">body</ui.Card>`, `<this.Row a="1" />` | a dotted path whose last segment starts upper-case: a call of the method `Card` of the value `ui` |
+| named slot | `<Dialog><:header>..</:header>body</Dialog>` | directly inside a component or member tag; fills the parameter `header` |
 
-Not supported: member tags `<ui.Card>`, namespaced names `xlink:href`, `key`, spread on intrinsic elements.
+Not supported: namespaced names `xlink:href`, `key`, spread on intrinsic elements.
 
 ## Two kinds of provider
 
@@ -145,6 +146,18 @@ An upper-case tag `C` names a function in scope. The element is a call of `C`:
   the same parameter, two slots of one name, or a slot without a parameter are E0491;
 - **evaluation order is source order**: attributes written in another order than the parameters are evaluated left to
   right into temporaries before the call; every value is evaluated once.
+
+### Member tags
+
+`<ui.Card title="x">body</ui.Card>` is the method call `ui.Card(title: "x", children: ..)`, with exactly the rules above:
+attributes fill the method's parameters by name, spreads, omitted `Option` parameters, the default slot, `<:name>` slots
+and source-order evaluation all work the same, and the result is checked where the element is used. `ui` is a class
+instance or an interface value, `this.Row` calls a method of the current class from inside it, and the prefix may be a
+path of field reads (`<app.theme.Button>`); the closing tag repeats the whole path (`</app.theme.Button>`). The prefix is
+only names, `this` and fields, so reading it at the call is the same as evaluating it first.
+
+A member that is not a method (a field of function type has no parameter names) or does not exist is E0491. A dotted tag
+whose last segment is lower-case (`<ui.card>`) is a syntax error (E0200): no provider element has a dotted name.
 
 ### Slots
 
