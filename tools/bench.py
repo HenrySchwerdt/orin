@@ -255,11 +255,22 @@ def count_instructions(cmd, timeout):
 # of worker threads as its FIRST command-line argument (std:task has no thread pool and no global knob: one task is one
 # OS thread, so the worker count is the `parts` of `parallelMap` or the number of tasks the program spawns), and the same
 # number is also in the environment as ORIN_BENCH_THREADS for programs that read it there. The output must not depend on
-# the count (checked against the 1-thread run). A parallel directory without main.go / main.c is measured only in the
+# the count (checked against the 1-thread run). Programs whose worker count is the `parallel()` pool's read ORIN_THREADS,
+# which is set too; PAR_ARGV gives the argv of those that pick a workload by their first argument. A parallel directory without main.go / main.c is measured only in the
 # parallel section; one with counterparts is also a normal row (run without arguments).
 
 def is_parallel(name):
     return name.startswith("parallel_") or name == "streams_parallel"
+
+
+# Parallel benchmarks that do not follow the argument convention: their argv in the parallel section. Their worker count is
+# the `parallel()` pool's, which reads ORIN_THREADS (set for every parallel run). bench/streams_parallel picks its workload by
+# its first argument; `parheavy` is the compute-bound one, where a speedup can show.
+PAR_ARGV = {"streams_parallel": ["parheavy"]}
+
+
+def par_cmd(exe, name, threads):
+    return [exe] + PAR_ARGV.get(name, [str(threads)])
 
 
 def main():
@@ -437,8 +448,8 @@ def main():
         rows = {}
         ref_out = None
         for t in threads:
-            cmd = [exe, str(t)]
-            env = {"ORIN_BENCH_THREADS": str(t)}
+            cmd = par_cmd(exe, name, t)
+            env = {"ORIN_BENCH_THREADS": str(t), "ORIN_THREADS": str(t)}
             _, _, rc, so, se = run_once(cmd, env=env)
             if rc != 0:
                 sys.exit("%s with %d threads exited %d: %s" % (name, t, rc, se.decode("utf-8", "replace")))

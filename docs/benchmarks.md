@@ -772,9 +772,12 @@ compare such counts with full-size ones), `bench/<name>/instructions.skip` holds
 skipped, because valgrind serialises threads.
 
 **Parallel speedup.** `bench/parallel_*/` and `bench/streams_parallel/` (picked up automatically when present) take the
-number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. There is no
-runtime knob: std:task has no thread pool, every task is one OS thread, so the worker count is the `parts` argument of
-`parallelMap` (or the number of tasks the program spawns). Each program runs with 1, 2 and 4 threads (`--threads`); the output
+number of worker threads as their first command-line argument; `tools/bench.py` also sets `ORIN_BENCH_THREADS`. std:task has
+no thread pool, every task is one OS thread, so for `bench/parallel_*` the worker count is the `parts` argument of
+`parallelMap` (or the number of tasks the program spawns). `bench/streams_parallel` uses `parallel()`, whose pool reads
+`ORIN_THREADS` (also set); it picks its workload by its first argument and runs `parheavy` in this section (`PAR_ARGV` in
+`tools/bench.py`; before 2026-10-15 it got the thread count as its workload argument and measured the default workload
+with the default pool size). Each program runs with 1, 2 and 4 threads (`--threads`); the output
 must not depend on the count. `bench/parallel_collatz` is the Collatz-steps map of `examples/parallel_map.or` over
 1..2,000,000 with deterministic output. With more threads than free cores the speedup flattens; `cpu_ratio` above 1 shows the
 cost of copying chunks, joining and oversubscription.
