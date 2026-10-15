@@ -8,11 +8,13 @@
 // every in[b] changes finitely often. This holds even if a transfer function is not monotone.
 
 import {
-  MProgram, MFunction, MBlock, noSpan, hasSpan, successors, isWellFormedFunction,
+  MProgram, MFunction, MBlock, noSpan, hasSpan, succCount, succAt,
+  isWellFormedFunction,
   isWellFormedProgram,
 } from "../mir";
 import {
-  VerifyIssue, issueSpan, sameSpan, State, mk, holesEq, KDead, KOwned, KParam, KInit,
+  VerifyIssue, issueSpan, sameSpan, State, HoleEntry, mk, joinLs, holeIn, holesEq, KDead, KOwned, KParam,
+  KInit,
 } from "./state";
 import { CRef, CHandle, localClass, wfInstr, wfTerm, wfFunction } from "./wf";
 import { Transfer } from "./rules";
@@ -47,7 +49,7 @@ export function reportPlaced(p: MProgram, es: VerifyIssue[]): bool {
   );
 }
 
-// The queue flags of a fresh fixpoint over `n` blocks: only the entry block is queued.
+// The queue flags of a fresh fixpoint over `n` blocks: only the entry block is queued (and, the same shape, reached).
 @Requires(n > 0)
 @Ensures(result.length == n && result[0] && result.filter(q => q).length == 1)
 function entryQueued(n: usize): bool[] {
@@ -98,6 +100,32 @@ function initialIns(p: MProgram, f: MFunction): Option<State>[] {
   return ins;
 }
 
+// The local states of the in-states `ins` (`ins[0]` is reached), one array per block: empty for a block not reached yet.
+@Requires(ins.length > 0 && ins[0].isSome())
+@Ensures(result.length == ins.length)
+function insLs(ins: Option<State>[]): int[][] {
+  let out: int[][] = [ins[0].unwrap().ls];
+  let i: usize = 1;
+  while (i < ins.length) {
+    out.push([]);
+    i += 1;
+  }
+  return out;
+}
+
+// The hole sets of the in-states `ins`, like `insLs`.
+@Requires(ins.length > 0 && ins[0].isSome())
+@Ensures(result.length == ins.length)
+function insHoles(ins: Option<State>[]): HoleEntry[][] {
+  let out: HoleEntry[][] = [ins[0].unwrap().holes];
+  let i: usize = 1;
+  while (i < ins.length) {
+    out.push([]);
+    i += 1;
+  }
+  return out;
+}
+
 // Run block b from `st`; the result's state is the state after the terminator.
 function runBlock(p: MProgram, f: MFunction, b: usize, st: State): Transfer {
   let t = new Transfer(p, f, b, 0, st, [], []);
@@ -114,28 +142,44 @@ export function statesSized(ins: Option<State>[], n: usize): bool {
 export function reachClosed(f: MFunction, ins: Option<State>[]): bool {
   let b: usize = 0;
   while (b < f.blocks.length) {
-    if (ins[b].isSome() && !successors(f.blocks[b].term).every(s => ins[s].isSome())) {
-      return false;
+    if (ins[b].isSome()) {
+      const t = f.blocks[b].term;
+      let k: usize = 0;
+      while (k < succCount(t)) {
+        if (ins[succAt(t, k)].isNone()) {
+          return false;
+        }
+        k += 1;
+      }
     }
     b += 1;
   }
   return true;
 }
 
-// The forward dataflow of one well-formed function: `ins[b]` is the in-state of block `b` (None while `b` has not been
-// reached); the worklist `work` holds the blocks whose in-state changed since they were last run, each at most once
-// (`queued[b]` iff `b` is in `work`), last in first out. Only block ids get in (`add` requires one), so the worklist is
-// never longer than the block list. The worklist is part of this class rather than a class of its own because a
-// mutating method called on a class-typed field copies the object and its arrays on every call (step 3b, measured).
+// The forward dataflow of one well-formed function: the in-state of block `b` is `lsIn[b]` / `holesIn[b]` while `b` has
+// been reached (`reached[b]`; nothing yet otherwise); the worklist `work` holds the blocks whose in-state changed since
+// they were last run, each at most once (`queued[b]` iff `b` is in `work`), last in first out. Only block ids get in
+// (`add` requires one), so the worklist is never longer than the block list. `ins` is the same in-states as `State`
+// values (None while `b` has not been reached), built once when `run` is done: the iteration itself allocates no state
+// per block run. One `Transfer` replays every block (`load` resets it), its out-state is joined into the successors'
+// in-states in place, and a new array is cut only when a block is reached for the first time. The worklist and the state
+// arrays are part of this class rather than classes of their own because a mutating method called on a class-typed
+// field copies the object and its arrays on every call (step 3b, measured).
 @Invariant(this.ins.length == this.f.blocks.length)
 @Invariant(this.ins.length > 0 && this.ins[0].isSome())
 @Invariant(this.queued.length == this.ins.length)
+@Invariant(this.lsIn.length == this.ins.length && this.holesIn.length == this.ins.length)
+@Invariant(this.reached.length == this.ins.length && this.reached[0])
 @Invariant(this.work.length <= this.queued.length)
 @Invariant(this.none.length == 0)
 export class Fixpoint {
   private prog: MProgram;
   private f: MFunction;
   ins: Option<State>[];
+  private lsIn: int[][];
+  private holesIn: HoleEntry[][];
+  private reached: bool[];
   private work: usize[];
   private queued: bool[];
   // An empty issue list shared by every block run of the fixpoint, which discards what it reports (the reporting pass
@@ -147,6 +191,9 @@ export class Fixpoint {
     this.prog = prog;
     this.f = f;
     this.ins = initialIns(prog, f);
+    this.lsIn = insLs(initialIns(prog, f));
+    this.holesIn = insHoles(initialIns(prog, f));
+    this.reached = entryQueued(f.blocks.length);
     this.work = [0];
     this.queued = entryQueued(f.blocks.length);
     this.none = [];
@@ -179,13 +226,55 @@ export class Fixpoint {
     return b;
   }
 
-  // The state after block `b` run from `st`, its issues discarded.
-  @Requires(b < this.f.blocks.length && st.ls.length == this.f.locals.length)
-  @Ensures(result.ls.length == st.ls.length)
-  private outOf(b: usize, st: State): State {
-    let t = new Transfer(this.prog, this.f, b, 0, st, this.none, this.none);
-    t.run();
-    return t.state();
+  // The transfer functions' replay of every block of this fixpoint: it holds the entry state until the first `load`;
+  // its issues are discarded.
+  private runner(): Transfer {
+    return new Transfer(
+      this.prog,
+      this.f,
+      0,
+      0,
+      new State(this.lsIn[0], this.holesIn[0]),
+      this.none,
+      this.none,
+    );
+  }
+
+  // Joining the out-state (`ls`, `holes`) into the in-state of the reached block `s` would change it.
+  @Requires(s < this.reached.length && this.reached[s] && ls.length == this.lsIn[s].length)
+  private joinChanges(s: usize, ls: int[], holes: HoleEntry[]): bool {
+    let i: usize = 0;
+    while (i < ls.length) {
+      if (joinLs(this.lsIn[s][i], ls[i]) != this.lsIn[s][i]) {
+        return true;
+      }
+      i += 1;
+    }
+    return !holes.every(h => holeIn(h, this.holesIn[s]));
+  }
+
+  // Joins the out-state (`ls`, `holes`) into the in-state of the reached block `s` in place (`State.join`: per local
+  // `joinLs`, the holes of the out-state that are not there yet appended); true when that changed it.
+  @Requires(s < this.reached.length && this.reached[s] && ls.length == this.lsIn[s].length)
+  @Ensures(this.lsIn[s].length == old(this.lsIn[s].length))
+  private joinInto(s: usize, ls: int[], holes: HoleEntry[]): bool {
+    let changed = false;
+    let i: usize = 0;
+    while (i < ls.length) {
+      const j = joinLs(this.lsIn[s][i], ls[i]);
+      if (j != this.lsIn[s][i]) {
+        this.lsIn[s][i] = j;
+        changed = true;
+      }
+      i += 1;
+    }
+    for (const h of holes) {
+      if (!holeIn(h, this.holesIn[s])) {
+        this.holesIn[s].push(h);
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   // Iterates to the fixpoint. Afterwards the worklist is empty, every reached block's successors are reached, and the
@@ -197,50 +286,52 @@ export class Fixpoint {
   @Ensures(reachClosed(this.f, this.ins))
   @Ensures(this.isStable())
   run(): void {
+    let t = this.runner();
     while (this.work.length > 0) {
       const b = this.take();
-      const out = this.outOf(b, this.ins[b].unwrap());
-      for (const s of successors(this.f.blocks[b].term)) {
-        match (this.ins[s]) {
-          None => {
-            this.ins[s] = Some(out);
-            this.add(s);
-          },
-          Some(prev) => {
-            match (prev.joinIfChanged(out)) {
-              Some(nw) => {
-                this.ins[s] = Some(nw);
-                this.add(s);
-              },
-              None => {},
-            }
-          },
+      t.load(b, this.lsIn[b], this.holesIn[b]);
+      t.run();
+      const term = this.f.blocks[b].term;
+      let k: usize = 0;
+      while (k < succCount(term)) {
+        const s = succAt(term, k);
+        if (!this.reached[s]) {
+          this.reached[s] = true;
+          this.lsIn[s] = t.ls;
+          this.holesIn[s] = t.holes;
+          this.add(s);
+        } else if (this.joinInto(s, t.ls, t.holes)) {
+          this.add(s);
         }
+        k += 1;
       }
+    }
+    let b: usize = 0;
+    while (b < this.ins.length) {
+      if (this.reached[b]) {
+        this.ins[b] = Some(new State(this.lsIn[b], this.holesIn[b]));
+      }
+      b += 1;
     }
   }
 
   // No reached block's out-state adds anything to the in-state of a successor.
   isStable(): bool {
+    let t = this.runner();
     let b: usize = 0;
     while (b < this.ins.length) {
-      match (this.ins[b]) {
-        None => {},
-        Some(st) => {
-          const out = this.outOf(b, st);
-          for (const s of successors(this.f.blocks[b].term)) {
-            match (this.ins[s]) {
-              None => {
-                return false;
-              },
-              Some(prev) => {
-                if (prev.joinIfChanged(out).isSome()) {
-                  return false;
-                }
-              },
-            }
+      if (this.reached[b]) {
+        t.load(b, this.lsIn[b], this.holesIn[b]);
+        t.run();
+        const term = this.f.blocks[b].term;
+        let k: usize = 0;
+        while (k < succCount(term)) {
+          const s = succAt(term, k);
+          if (!this.reached[s] || this.joinChanges(s, t.ls, t.holes)) {
+            return false;
           }
-        },
+          k += 1;
+        }
       }
       b += 1;
     }
@@ -308,7 +399,10 @@ function verifyFunction(p: MProgram, f: MFunction): VerifyReport {
           rep.warnings.push(w);
         }
         // Join rule: hole sets must agree on every edge into a block.
-        for (const s of successors(f.blocks[b].term)) {
+        const term = f.blocks[b].term;
+        let k: usize = 0;
+        while (k < succCount(term)) {
+          const s = succAt(term, k);
           if (!holesEq(t.holes, ins[s].unwrap().holes)) {
             rep.errors.push(
               issue(
@@ -319,6 +413,7 @@ function verifyFunction(p: MProgram, f: MFunction): VerifyReport {
               ),
             );
           }
+          k += 1;
         }
       },
     }
