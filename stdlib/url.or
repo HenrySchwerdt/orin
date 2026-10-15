@@ -1,0 +1,223 @@
+// std:url: byte-oriented percent components and strict UTF-8 query pairs.
+// See docs/std-url.md for the wire format, offsets, allocation and complexity.
+import { Bytes, ByteBuilder, bytesFromString } from "std:bytes";
+import { checkUtf8 } from "std:utf8";
+
+export type UrlErrorKind = TruncatedEscape | InvalidHex | InvalidUtf8;
+// offset is always a byte offset in the original input, including for UTF-8 errors.
+export type UrlError = { kind: UrlErrorKind; offset: usize; };
+export type QueryPair = { key: string; value: string; };
+
+// urlErrorMessage(e): diagnostic text. Never fails; O(1), allocates message.
+@Ensures(result.length > 0)
+export function urlErrorMessage(e: UrlError): string {
+  const why = match (e.kind) {
+    TruncatedEscape => "truncated percent escape",
+    InvalidHex => "invalid percent escape",
+    InvalidUtf8 => "invalid UTF-8",
+  };
+  return `${why} at byte ${e.offset.toString()}`;
+}
+
+function unreserved(c: int): bool {
+  return c >= 65 && c <= 90
+      || c >= 97 && c <= 122
+      || c >= 48 && c <= 57
+      || c == 45
+      || c == 46
+      || c == 95
+      || c == 126;
+}
+
+@Ensures(result >= -1 && result <= 15)
+function hexValue(c: int): int {
+  if (c >= 48 && c <= 57) {
+    return c - 48;
+  }
+  if (c >= 65 && c <= 70) {
+    return c - 55;
+  }
+  if (c >= 97 && c <= 102) {
+    return c - 87;
+  }
+  return -1;
+}
+
+// Only ALPHA / DIGIT / "-._~" pass through. Upper-case %HH; optionally space -> +.
+// Strings hold bytes: no validation, normalization or Unicode conversion occurs here.
+// Never fails; O(s.length) time and allocation.
+@Ensures(result.length >= s.length && result.length <= s.length * 3)
+export function percentEncode(s: string, spaceAsPlus: bool): string {
+  let out = new ByteBuilder();
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (unreserved(c)) {
+      out.appendU8(c.toU8());
+    } else if (spaceAsPlus && c == 32) {
+      out.appendU8(43);
+    } else {
+      out.appendU8(37);
+      out.appendU8("0123456789ABCDEF".charCodeAt((c / 16).toUsize()).toU8());
+      out.appendU8("0123456789ABCDEF".charCodeAt((c % 16).toUsize()).toU8());
+    }
+    i += 1;
+  }
+  return out.build().toRawString();
+}
+
+// Encodes an arbitrary Bytes view, including NUL and invalid UTF-8.
+// Never fails; O(b.length()) time and allocation (including a temporary raw string).
+@Ensures(result.length >= b.length() && result.length <= b.length() * 3)
+export function percentEncodeBytes(b: Bytes, spaceAsPlus: bool): string {
+  return percentEncode(b.toRawString(), spaceAsPlus);
+}
+
+// Decode a range without copying the encoded substring. Every '%' must have two hex digits.
+@Requires(start <= end && end <= s.length)
+@Ensures(result.isOk() ==> result.unwrap().length <= end - start)
+@Ensures(result.isErr() ==> result.unwrapErr().offset >= start && result.unwrapErr().offset < end)
+function decodeRange(
+  s: string,
+  start: usize,
+  end: usize,
+  plusAsSpace: bool,
+  text: bool,
+): Result<string, UrlError> {
+  let out = new ByteBuilder();
+  let i = start;
+  while (i < end) {
+    const c = s.charCodeAt(i);
+    if (c == 37) {
+      if (end - i < 3) {
+        return Err(UrlError { kind: TruncatedEscape, offset: i });
+      }
+      const hi = hexValue(s.charCodeAt(i + 1));
+      const lo = hexValue(s.charCodeAt(i + 2));
+      if (hi < 0 || lo < 0) {
+        return Err(UrlError { kind: InvalidHex, offset: i });
+      }
+      out.appendU8((hi * 16 + lo).toU8());
+      i += 3;
+    } else {
+      out.appendU8((plusAsSpace && c == 43 ? 32 : c).toU8());
+      i += 1;
+    }
+  }
+  const decoded = out.build().toRawString();
+  if (text) {
+    const valid = checkUtf8(decoded);
+    if (valid.isErr()) {
+      // Translate the decoded sequence start back to the encoded source in one extra scan.
+      const target = valid.unwrapErr().position;
+      let source = start;
+      let pos: usize = 0;
+      while (pos < target) {
+        source += s.charCodeAt(source) == 37 ? 3 : 1;
+        pos += 1;
+      }
+      return Err(UrlError { kind: InvalidUtf8, offset: source });
+    }
+  }
+  return Ok(decoded);
+}
+
+// Byte decoder: raw non-'%' bytes pass through, arbitrary decoded bytes are accepted.
+// Err on malformed escapes, source offset at '%'; O(n) time and allocation.
+@Ensures(result.isOk() ==> result.unwrap().length() <= s.length)
+@Ensures(result.isErr() ==> result.unwrapErr().offset < s.length)
+export function percentDecodeBytes(s: string, plusAsSpace: bool): Result<Bytes, UrlError> {
+  const r = decodeRange(s, 0, s.length, plusAsSpace, false);
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  return Ok(bytesFromString(r.unwrap()));
+}
+
+// Text decoder: rejects invalid UTF-8; '+' stays literal unless explicitly enabled.
+// Err on malformed escapes or invalid UTF-8 with original source offset; O(n) time/allocation.
+@Ensures(result.isOk() ==> result.unwrap().length <= s.length)
+@Ensures(result.isErr() ==> result.unwrapErr().offset < s.length)
+export function percentDecode(s: string, plusAsSpace: bool): Result<string, UrlError> {
+  return decodeRange(s, 0, s.length, plusAsSpace, true);
+}
+
+// Query body only (no leading '?'). Split on '&', then the first '=', before decoding.
+// Empty fields are skipped; a bare key has value ""; empty keys and duplicates survive.
+// Err on malformed escapes or invalid UTF-8 with absolute source offset; O(n) time/allocation.
+@Ensures(s.length == 0 ==> result.isOk() && result.unwrap().length == 0)
+@Ensures(result.isErr() ==> result.unwrapErr().offset < s.length)
+export function parseQuery(s: string, plusAsSpace: bool): Result<QueryPair[], UrlError> {
+  let pairs: QueryPair[] = [];
+  let start: usize = 0;
+  while (start < s.length) {
+    let end = start;
+    while (end < s.length && s.charCodeAt(end) != 38) {
+      end += 1;
+    }
+    if (end > start) {
+      let eq = start;
+      while (eq < end && s.charCodeAt(eq) != 61) {
+        eq += 1;
+      }
+      const key = decodeRange(s, start, eq, plusAsSpace, true);
+      if (key.isErr()) {
+        return Err(key.unwrapErr());
+      }
+      let value = "";
+      if (eq < end) {
+        const v = decodeRange(s, eq + 1, end, plusAsSpace, true);
+        if (v.isErr()) {
+          return Err(v.unwrapErr());
+        }
+        value = v.unwrap();
+      }
+      pairs.push(QueryPair { key: key.unwrap(), value: value });
+    }
+    start = end + 1;
+  }
+  return Ok(pairs);
+}
+
+// Every pair emits key=value in input order. Rejects invalid UTF-8 in keys/values.
+// Error offset is relative to that key/value, identified by pairIndex and inValue.
+export type QueryEncodeError = { pairIndex: usize; inValue: bool; offset: usize; };
+
+// stringifyQuery(pairs, spaceAsPlus): ordered key=value fields, with no leading question mark.
+// Err(QueryEncodeError) on invalid UTF-8; O(total bytes + pair count) time and allocation.
+@Ensures(pairs.length == 0 ==> result.isOk() && result.unwrap().length == 0)
+@Ensures(result.isErr() ==> result.unwrapErr().pairIndex < pairs.length)
+export function stringifyQuery(
+  pairs: QueryPair[],
+  spaceAsPlus: bool,
+): Result<string, QueryEncodeError> {
+  let out = new ByteBuilder();
+  let i: usize = 0;
+  while (i < pairs.length) {
+    const p = pairs[i];
+    const key = checkUtf8(p.key);
+    if (key.isErr()) {
+      return Err(QueryEncodeError {
+        pairIndex: i,
+        inValue: false,
+        offset: key.unwrapErr().position,
+      });
+    }
+    const value = checkUtf8(p.value);
+    if (value.isErr()) {
+      return Err(QueryEncodeError {
+        pairIndex: i,
+        inValue: true,
+        offset: value.unwrapErr().position,
+      });
+    }
+    if (i > 0) {
+      out.appendU8(38);
+    }
+    out.appendString(percentEncode(p.key, spaceAsPlus));
+    out.appendU8(61);
+    out.appendString(percentEncode(p.value, spaceAsPlus));
+    i += 1;
+  }
+  return Ok(out.build().toRawString());
+}

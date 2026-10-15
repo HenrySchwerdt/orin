@@ -1,0 +1,220 @@
+import { assert, assertEqUsize, assertEqString, assertEqBool } from "std:test";
+import { bytesFromInts, bytesFromHex } from "std:bytes";
+import {
+  percentEncode, percentEncodeBytes, percentDecode, percentDecodeBytes, parseQuery, stringifyQuery,
+  UrlError, UrlErrorKind, QueryPair, urlErrorMessage,
+} from "std:url";
+
+function bad(s: string, kind: UrlErrorKind, offset: usize): void {
+  const r = percentDecode(s, false);
+  assert(r.isErr(), "bad component rejected");
+  const e = r.unwrapErr();
+  assertEqUsize(e.offset, offset, "source offset");
+  assertEqString(
+    urlErrorMessage(e),
+    urlErrorMessage(UrlError { kind: kind, offset: offset }),
+    "error kind",
+  );
+}
+
+function pair(p: QueryPair, key: string, value: string): void {
+  assertEqString(p.key, key, "key");
+  assertEqString(p.value, value, "value");
+}
+
+@Test
+function percentVectors(): void {
+  assertEqString(percentEncode("", false), "", "empty");
+  assertEqString(percentEncode("AZaz09-._~", false), "AZaz09-._~", "unreserved");
+  assertEqString(
+    percentEncode(" /?:@&=+$,#[]!*'()", false),
+    "%20%2F%3F%3A%40%26%3D%2B%24%2C%23%5B%5D%21%2A%27%28%29",
+    "reserved and other punctuation",
+  );
+  assertEqString(percentEncode("café 🐈", false), "caf%C3%A9%20%F0%9F%90%88", "UTF-8 bytes");
+  assertEqString(percentEncode("a +", true), "a+%2B", "space vs plus");
+  assertEqString(
+    percentDecode("a+%2b%2520", false).unwrap(),
+    "a++%20",
+    "literal plus, decode once",
+  );
+  assertEqString(percentDecode("a+%2B", true).unwrap(), "a +", "form plus");
+  assertEqString(
+    percentDecode("caf%c3%a9%20%f0%9f%90%88", false).unwrap(),
+    "café 🐈",
+    "lowercase hex",
+  );
+  assertEqString(percentDecode("café", false).unwrap(), "café", "raw UTF-8 accepted");
+  assertEqString(percentDecode("%00%7F", false).unwrap(), "\0\x7f", "NUL and DEL");
+  assertEqString(
+    percentEncodeBytes(bytesFromHex("00ff2b").unwrap(), false),
+    "%00%FF%2B",
+    "raw bytes",
+  );
+  assertEqString(
+    percentDecodeBytes("%00%ff+", false).unwrap().toHex(),
+    "00ff2b",
+    "byte decoder permits invalid UTF-8",
+  );
+  const view = bytesFromHex("0001ff00").unwrap().slice(1, 3);
+  assertEqString(percentEncodeBytes(view, false), "%01%FF", "Bytes view");
+}
+
+@Test
+function malformedComponents(): void {
+  bad("%", TruncatedEscape, 0);
+  bad("ok%0", TruncatedEscape, 2);
+  bad("%gg", InvalidHex, 0);
+  bad("a%0z", InvalidHex, 1);
+  bad("%+0", InvalidHex, 0);
+  bad("%%20", InvalidHex, 0);
+  bad("%FF", InvalidUtf8, 0);
+  bad("a%20%80", InvalidUtf8, 4);
+  bad("%C0%AF", InvalidUtf8, 0);
+  bad("%ED%A0%80", InvalidUtf8, 0);
+  bad("%F4%90%80%80", InvalidUtf8, 0);
+  bad("a%C3", InvalidUtf8, 1);
+  bad("%61\xff", InvalidUtf8, 3);
+  bad("a\xc3%28", InvalidUtf8, 1);
+  bad("%F0%9F%90%88%FF", InvalidUtf8, 12);
+  // Escapes are validated before UTF-8 within each component.
+  bad("%FF%z0", InvalidHex, 3);
+  assert(percentDecodeBytes("abc%", false).isErr(), "bytes rejects malformed escape too");
+  assertEqUsize(percentDecodeBytes("%xx", false).unwrapErr().offset, 0, "bytes source offset");
+}
+
+@Test
+function queryVectors(): void {
+  const q = parseQuery("a=1&a=2&flag&=x&empty=&x=a=b&escaped=a%26b%3Dc&plus=a+b%2Bc", true).unwrap();
+  assertEqUsize(q.length, 8, "all pairs and duplicates");
+  pair(q[0], "a", "1");
+  pair(q[1], "a", "2");
+  pair(q[2], "flag", "");
+  pair(q[3], "", "x");
+  pair(q[4], "empty", "");
+  pair(q[5], "x", "a=b");
+  pair(q[6], "escaped", "a&b=c");
+  pair(q[7], "plus", "a b+c");
+  assertEqString(
+    stringifyQuery(q, true).unwrap(),
+    "a=1&a=2&flag=&=x&empty=&x=a%3Db&escaped=a%26b%3Dc&plus=a+b%2Bc",
+    "canonical serialization",
+  );
+  assertEqUsize(parseQuery("", true).unwrap().length, 0, "empty query");
+  assertEqUsize(parseQuery("&&", true).unwrap().length, 0, "empty fields skipped");
+  const empties = parseQuery("&=&a&&b=&", true).unwrap();
+  assertEqUsize(empties.length, 3, "empty field policy");
+  pair(empties[0], "", "");
+  pair(empties[1], "a", "");
+  pair(empties[2], "b", "");
+  pair(parseQuery("a+b=c+d", false).unwrap()[0], "a+b", "c+d");
+  pair(parseQuery("?a=1#frag;rest", true).unwrap()[0], "?a", "1#frag;rest");
+  pair(parseQuery("%26=%3D&café=🐈", true).unwrap()[1], "café", "🐈");
+  assertEqString(stringifyQuery([], true).unwrap(), "", "no pairs");
+  assertEqString(
+    stringifyQuery([QueryPair { key: "", value: "" }], true).unwrap(),
+    "=",
+    "one empty pair survives",
+  );
+  assertEqString(
+    stringifyQuery([QueryPair { key: "a b", value: "+ " }], false).unwrap(),
+    "a%20b=%2B%20",
+    "percent spaces",
+  );
+}
+
+@Test
+function queryErrors(): void {
+  assertEqUsize(
+    parseQuery("ok=1&bad=%Q0", true).unwrapErr().offset,
+    9,
+    "value escape absolute offset",
+  );
+  assertEqUsize(parseQuery("ok=1&%FF=x", true).unwrapErr().offset, 5, "key UTF-8 absolute offset");
+  assertEqUsize(
+    parseQuery("ok=1&k=a%20%FF", true).unwrapErr().offset,
+    11,
+    "decoded UTF-8 absolute offset",
+  );
+  assertEqUsize(
+    parseQuery("k=%&a=b", true).unwrapErr().offset,
+    2,
+    "escape cannot cross field boundary",
+  );
+  assertEqUsize(parseQuery("a%=b", true).unwrapErr().offset, 1, "escape cannot cross equals");
+  assertEqUsize(parseQuery("a=\xff", true).unwrapErr().offset, 2, "raw invalid UTF-8");
+  const key = stringifyQuery(
+    [QueryPair { key: "ok", value: "v" }, QueryPair { key: "a\xff", value: "" }],
+    true,
+  ).unwrapErr();
+  assertEqUsize(key.pairIndex, 1, "bad pair index");
+  assertEqBool(key.inValue, false, "bad key");
+  assertEqUsize(key.offset, 1, "key byte offset");
+  const value = stringifyQuery(
+    [QueryPair { key: "", value: "\xf0\x9f\x90\x88\xff" }],
+    true,
+  ).unwrapErr();
+  assertEqBool(value.inValue, true, "bad value");
+  assertEqUsize(value.offset, 4, "value byte offset");
+}
+
+@Test
+function everyByteRoundtrips(): void {
+  let ints: int[] = [];
+  let i = 0;
+  while (i < 256) {
+    ints.push(i);
+    const b = bytesFromInts([i]);
+    assert(
+      percentDecodeBytes(percentEncodeBytes(b, false), false).unwrap().equals(b),
+      "single byte roundtrip",
+    );
+    assert(
+      percentDecodeBytes(percentEncodeBytes(b, true), true).unwrap().equals(b),
+      "single byte form roundtrip",
+    );
+    i += 1;
+  }
+  const all = bytesFromInts(ints);
+  assert(
+    percentDecodeBytes(percentEncodeBytes(all, false), false).unwrap().equals(all),
+    "all bytes roundtrip",
+  );
+  assert(
+    percentDecodeBytes(percentEncodeBytes(all, true), true).unwrap().equals(all),
+    "all bytes form roundtrip",
+  );
+}
+
+@Test
+function queryRoundtrips(): void {
+  const texts = ["", "ASCII", "café", "🐈", "a&b=c+d %", "\0", "\r\n", "?/#", "重复"];
+  let pairs: QueryPair[] = [];
+  let i: usize = 0;
+  while (i < texts.length) {
+    let j: usize = 0;
+    while (j < texts.length) {
+      pairs.push(QueryPair { key: texts[i], value: texts[j] });
+      j += 1;
+    }
+    assertEqString(
+      percentDecode(percentEncode(texts[i], false), false).unwrap(),
+      texts[i],
+      "text roundtrip",
+    );
+    i += 1;
+  }
+  let mode = 0;
+  while (mode < 2) {
+    const wire = stringifyQuery(pairs, mode == 1).unwrap();
+    const decoded = parseQuery(wire, mode == 1).unwrap();
+    assertEqUsize(decoded.length, pairs.length, "pair count");
+    i = 0;
+    while (i < pairs.length) {
+      pair(decoded[i], pairs[i].key, pairs[i].value);
+      i += 1;
+    }
+    assertEqString(stringifyQuery(decoded, mode == 1).unwrap(), wire, "canonical idempotence");
+    mode += 1;
+  }
+}
