@@ -1,4 +1,4 @@
-// Abstract domain of the OIM ownership verifier (docs/mir.md, "Abstract ownership state"): one `LState` per local plus a
+// Abstract domain of the OIM ownership verifier (docs/mir.md, "Abstract ownership state"): one packed local state (`int`, see `mk`) per local plus a
 // set of open holes, held by the class `State`. The join is a semilattice join (commutative, idempotent, an upper bound
 // in the order `lsLeq`), so the fixpoint iteration in verify.or terminates: in-states only ever grow, and the lattice is
 // finite.
@@ -31,7 +31,7 @@ export function sameSpan(a: Span, b: Span): bool {
   return a.file == b.file && a.start == b.start && a.end == b.end;
 }
 
-// Kinds of LState. Imm = immortal reference (OStr copy, INullary): readable, consumable,
+// Kinds of local state. Imm = immortal reference (OStr copy, INullary): readable, consumable,
 // releasable, never a leak. Init = initialised scalar. MaybeLeak / MaybeDead are the poisoned
 // results of a join that disagrees (MaybeLeak: some path still owns a reference); any use of a
 // poisoned local is an error, a redefinition silently repairs it.
@@ -66,15 +66,31 @@ export function isLive(k: int): bool {
       || k == KOpen;
 }
 
-// `src` is meaningful only for KBorrowed (the root local the alias depends on); otherwise 0.
-@Invariant(isKind(this.k))
-@Invariant(this.k == KBorrowed || this.src == 0)
-export type LState = { k: int; src: usize; };
+// The state of one local, packed into one int: `kind + 16 * src` (`mk`, `lsKind`, `lsSrc`). `src` is meaningful only
+// for KBorrowed (the root local the alias depends on); otherwise 0. Arrays of these (`State.ls`) are scalar arrays: a
+// record per local would be one heap object per entry (4.1M of them, and 74 % of all reference-count operations, in a
+// self-compile) and every copy of the array would retain each entry.
+export function isLs(p: int): bool {
+  return p >= 0 && isKind(p % 16) && (p % 16 == KBorrowed || p / 16 == 0);
+}
 
 @Requires(isKind(k) && (k == KBorrowed || src == 0))
-@Ensures(result.k == k && result.src == src)
-export function mk(k: int, src: usize): LState {
-  return LState { k: k, src: src };
+@Ensures(isLs(result) && lsKind(result) == k && lsSrc(result) == src)
+export function mk(k: int, src: usize): int {
+  return src.toInt() * 16 + k;
+}
+
+// The kind of a packed local state.
+@Requires(isLs(p))
+@Ensures(isKind(result))
+export function lsKind(p: int): int {
+  return p % 16;
+}
+
+// The root of a packed local state (0 unless it is KBorrowed).
+@Requires(isLs(p))
+export function lsSrc(p: int): usize {
+  return (p / 16).toUsize();
 }
 
 export function ownedLike(k: int): bool {
@@ -121,46 +137,53 @@ export function kindName(k: int): string {
   return "MaybeDead";
 }
 
-export function lsEq(a: LState, b: LState): bool {
-  return a.k == b.k && a.src == b.src;
+export function lsEq(a: int, b: int): bool {
+  return a == b;
 }
 
 // The order of the per-local lattice, stated independently of `joinLs`: equal states; Unique and Imm below Owned; the
 // states that hold no counted reference below MaybeDead; everything that is not a handle below MaybeLeak; everything
 // below MaybeOpen (the top).
-export function lsLeq(a: LState, b: LState): bool {
-  if (lsEq(a, b) || b.k == KMaybeOpen) {
+@Requires(isLs(a) && isLs(b))
+export function lsLeq(a: int, b: int): bool {
+  const ak = lsKind(a);
+  const bk = lsKind(b);
+  if (a == b || bk == KMaybeOpen) {
     return true;
   }
-  if (b.k == KMaybeLeak) {
-    return a.k != KOpen && a.k != KMaybeOpen;
+  if (bk == KMaybeLeak) {
+    return ak != KOpen && ak != KMaybeOpen;
   }
-  if (b.k == KOwned) {
-    return a.k == KUnique || a.k == KImm;
+  if (bk == KOwned) {
+    return ak == KUnique || ak == KImm;
   }
-  if (b.k == KMaybeDead) {
-    return a.k == KDead || a.k == KImm || a.k == KBorrowed || a.k == KParam || a.k == KInit;
+  if (bk == KMaybeDead) {
+    return ak == KDead || ak == KImm || ak == KBorrowed || ak == KParam || ak == KInit;
   }
   return false;
 }
 
 // Join of two per-local states. Owned-like states join to Owned (Unique/Imm information is
 // lost); identical states are kept; anything else is poisoned.
+@Requires(isLs(a) && isLs(b))
+@Ensures(isLs(result))
 @Ensures(lsEq(result, joinLs(b, a)))
 @Ensures(lsEq(a, b) ==> lsEq(result, a))
 @Ensures(lsLeq(a, result) && lsLeq(b, result))
-@Ensures(result.k == KBorrowed ==> lsEq(a, b))
-export function joinLs(a: LState, b: LState): LState {
-  if (a.k == b.k && a.src == b.src) {
+@Ensures(lsKind(result) == KBorrowed ==> lsEq(a, b))
+export function joinLs(a: int, b: int): int {
+  if (a == b) {
     return a;
   }
-  if (ownedLike(a.k) && ownedLike(b.k)) {
+  const ak = lsKind(a);
+  const bk = lsKind(b);
+  if (ownedLike(ak) && ownedLike(bk)) {
     return mk(KOwned, 0);
   }
-  if (a.k == KOpen || a.k == KMaybeOpen || b.k == KOpen || b.k == KMaybeOpen) {
+  if (ak == KOpen || ak == KMaybeOpen || bk == KOpen || bk == KMaybeOpen) {
     return mk(KMaybeOpen, 0);
   }
-  if (leaky(a.k) || leaky(b.k)) {
+  if (leaky(ak) || leaky(bk)) {
     return mk(KMaybeLeak, 0);
   }
   return mk(KMaybeDead, 0);
@@ -213,12 +236,15 @@ export function holeMayIn(hs: HoleEntry[], x: usize, k: HoleKey): bool {
 
 // Borrows are flat: a borrowed local depends on another local that is not itself borrowed. `rootOf` (rules.or) and the
 // single `killBorrows(x)` per release rely on it.
-export function borrowsFlatIn(ls: LState[]): bool {
+export function borrowsFlatIn(ls: int[]): bool {
   let i: usize = 0;
   while (i < ls.length) {
     const s = ls[i];
-    if (s.k == KBorrowed && (s.src >= ls.length || s.src == i || ls[s.src].k == KBorrowed)) {
-      return false;
+    if (lsKind(s) == KBorrowed) {
+      const r = lsSrc(s);
+      if (r >= ls.length || r == i || lsKind(ls[r]) == KBorrowed) {
+        return false;
+      }
     }
     i += 1;
   }
@@ -232,12 +258,13 @@ export function borrowsFlatIn(ls: LState[]): bool {
 // (`borrowsFlat`); the transfer functions keep this (rules.or). The fixpoint stores one per block and joins them; the
 // transfer functions work on the two arrays directly (class `Transfer`), because a mutating method called on a
 // class-typed field copies the object and its arrays (docs/rewrite.md, step 3b).
+@Invariant(this.ls.every(p => isLs(p)))
 @Invariant(holesInRange(this.holes, this.ls.length))
 export class State {
-  ls: LState[];
+  ls: int[];
   holes: HoleEntry[];
 
-  constructor(ls: LState[], holes: HoleEntry[]) {
+  constructor(ls: int[], holes: HoleEntry[]) {
     this.ls = ls;
     this.holes = holes;
   }
@@ -249,13 +276,13 @@ export class State {
 
   @Requires(l < this.ls.length)
   kind(l: usize): int {
-    return this.ls[l].k;
+    return lsKind(this.ls[l]);
   }
 
   // The root of a borrowed local (0 for any other state).
   @Requires(l < this.ls.length)
   srcOf(l: usize): usize {
-    return this.ls[l].src;
+    return lsSrc(this.ls[l]);
   }
 
   // Some slot of `x` is taken.
@@ -300,7 +327,7 @@ export class State {
   @Ensures(this.leq(result) && o.leq(result))
   @Ensures(result.holes.length <= this.holes.length + o.holes.length)
   join(o: State): State {
-    let ls: LState[] = [];
+    let ls: int[] = [];
     let i: usize = 0;
     while (i < this.ls.length) {
       ls.push(joinLs(this.ls[i], o.ls[i]));
@@ -324,8 +351,7 @@ export class State {
     let changed = false;
     let i: usize = 0;
     while (i < this.ls.length && !changed) {
-      const j = joinLs(this.ls[i], o.ls[i]);
-      if (j.k != this.ls[i].k || j.src != this.ls[i].src) {
+      if (joinLs(this.ls[i], o.ls[i]) != this.ls[i]) {
         changed = true;
       }
       i += 1;
@@ -345,11 +371,31 @@ export class State {
   equals(o: State): bool {
     let i: usize = 0;
     while (i < this.ls.length) {
-      if (this.ls[i].k != o.ls[i].k || this.ls[i].src != o.ls[i].src) {
+      if (this.ls[i] != o.ls[i]) {
         return false;
       }
       i += 1;
     }
     return holesEq(this.holes, o.holes);
+  }
+}
+
+// `st`, or the state of `n` dead locals when there is none (a block that is not reached): lets a caller replay a block
+// with one `Transfer` and skip it when `st` was `None`.
+@Ensures(result.ls.length == n && result.holes.length == 0)
+export function stateOrDead(st: Option<State>, n: usize): State {
+  match (st) {
+    Some(s) => {
+      return s;
+    },
+    None => {
+      let ls: int[] = [];
+      let i: usize = 0;
+      while (i < n) {
+        ls.push(mk(KDead, 0));
+        i += 1;
+      }
+      return new State(ls, []);
+    },
   }
 }

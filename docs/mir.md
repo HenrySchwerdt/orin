@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.0; in/out receivers and `IArrayExtend` are v1.10)
+# MIR and the OIM ownership verifier (v2.2; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -44,6 +44,11 @@ handle) are openers whose argument is a scalar token: no argument may be a handl
 must revoke it. A value sent to a task is consumed by the one-field record that carries it (`IStructNew`), which already kills every borrow of
 the consumed local, so "no value used after it was moved into a task" is an existing rule; the runtime decides move or copy from the reference
 counts. Cases: `compiler/tests/verify_main.or` (`taskGrantCases`).
+
+v2.2 (ADR-0038 step 1, unboxing) **unboxed aggregates**: a new type `MAgg(n)` (printed `agg<n>`), an Option / Result / record / pair of
+scalars held **by value** in n + 1 64-bit words (word 0 the tag, words 1..n the payload; 0 <= n <= 3, at most four words). It has no heap
+object, no header and no reference count. Produced only by the optimiser (`compiler/opt/unbox.or`); no new instruction: the existing ones
+take an aggregate where noted in "Unboxed aggregates" below. The verifier treats an aggregate as a scalar (`Init`).
 
 ## Execution model
 A function has locals (`MLocal`) and basic blocks; `blocks[0]` is the entry. Instructions execute
@@ -154,10 +159,35 @@ record. The optimiser only converts a function whose every return is `r = struct
 reference local and local 0 Dead at that point, so converting changes no count: `a` is moved into local 0 where the record
 consumed it, and `v` is returned where the record consumed it. Call sites are rewritten to `v = call f(x, ..)` followed by the
 record rebuilt (`d = struct tag0 {x, v}`) unless every use of `d` is a `getfield d.0|1`, `release d` or a move of `d` inside one
-basic block with no redefinition of `x` / `v` in between, in which case the record is not built (`getfield d.0` -> `borrow x`,
+basic block with no redefinition of `x` / `v` in between (a `release` of `d` or of a local it was moved to may also be in a later block when the receiver was moved out: it then releases only `v`, v2.2), in which case the record is not built (`getfield d.0` -> `borrow x`,
 `getfield d.1` -> `borrow v` / `copy v`, `release d` -> release of x and v, `t = getfield d.0; u = dup t` -> `u = move x`).
 Mutation corpus: `inout-drop-receiver`, `inout-release-receiver` (tools/mutate_mir.py); hand-written cases:
 `compiler/tests/verify_main.or` `inoutCases`. The Lean model covers the structured fragment without calls, so it is unaffected.
+
+## Unboxed aggregates (v2.2, ADR-0038 step 1)
+`MAgg(n)` is a value of n + 1 words: `w[0]` the tag, `w[1..n]` the payload. A payload is a sequence of *slots*: a scalar slot (int, usize,
+bool, float: its 64-bit pattern, as in a heap slot) takes one word, a nested aggregate `MAgg(m)` its m + 1 words (tag included), in slot
+order; unused words are zero. Instructions (anything not listed rejects an aggregate operand or destination, wf in `wf.or`):
+- `IStructNew(d: MAgg(n), tag, slots)`: `d = { tag, the slots' words, zeros }`; every slot is a plain scalar or an aggregate (no reference,
+  handle or string constant) and they fit into n words. `INullary(d: MAgg(n), tag)`: `{ tag, zeros }`.
+- `ITag(d, o: MAgg(n))`: word 0. `IGetField(d, o: MAgg(n), k)`: **k is a word offset into the payload** (not a slot index): a plain scalar `d`
+  reads word k + 1, an aggregate `d: MAgg(m)` the words k + 1 .. k + m + 1 (k + words(d) <= n).
+- `ICopy(d, o)` between aggregates of the same width; call arguments and results (`ICall` only: the class comparison includes the width),
+  `TReturn`; argument 0 of the Option / Result builtins (`isSome`, `isNone`, `isOk`, `isErr`, `unwrap`, `unwrapOr`, `unwrapErr`; the
+  payload readers need n >= 1 and a plain scalar destination; the traps are those of the boxed builtins).
+- `IArrayPop(d: MAgg(1), arr)`: `{ 0, element }` or `{ 1, 0 }` when empty; the runtime releases an element of a reference array (the
+  optimiser only pops into an aggregate whose payload is read as a scalar or not at all).
+- Never: `IMove` / `IBorrow` / `IDup` / `IRelease` (ownership), a slot of a heap object, an array element, a closure capture, an interface
+  value, an argument or result of `ICallIndirect` / `ICallVirtual`, an operand of `IBinary`, an owned parameter, a local wider than four words.
+
+Verifier: an aggregate local is `Init` once defined (parameters start `Init`); every read needs it defined (no join with `Dead`), nothing
+else: no leak, no borrow, no uniqueness. Soundness: an aggregate contains no reference, so no rule about references depends on it; every
+operation on it is a pure function of its words. The optimiser converts a value only when every instruction that touches it is one of the
+above (default deny), so the program does the same calls in the same order and the retains / releases it drops are exactly those of the
+heap object that no longer exists. Backends: C `OrinV<n>` (`typedef struct { uint64_t w[n + 1]; }`, `orin_runtime_mir.h`), compound
+literals, by-value parameters and results; LLVM `[n+1 x i64]` with `insertvalue` / `extractvalue`, by-value parameters and results. Unwrap
+traps call `orin_v_unwrap(tag, word, what)`, pop calls `orin_array_pop_v(arr, out)` (both in `orin_runtime.c`). Cases:
+`compiler/tests/unbox_test.or`.
 
 ## Source spans (v2.0)
 `MBlock.spans[i]` is a `Span { file; start; end }` (byte offsets, `file` indexes the `SourceMap`) of the HIR expression or statement the
