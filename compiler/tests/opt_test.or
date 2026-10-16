@@ -22,7 +22,7 @@ import {
   usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
-  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
+  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -1081,6 +1081,137 @@ function optimizeForwardsLoadsAndTheVerifierAcceptsThem(host: Host): void {
       assert(n >= 1, "Counter.next reads this.n back after storing it: a forward");
       const r = forwardProgram(q);
       assertEqUsize(r.functions.reduce((k: usize, f: MFunction) => k + forwardCount(f), 0), n, "forwarding again changes nothing");
+    },
+  );
+}
+
+// ---------------------------------------------------------------- repeated bounds / kind checks (T2, docs/mir.md v2.5)
+
+// The positions of the unchecked accesses of block 0.
+function uncheckedAt(f: MFunction): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < f.blocks[0].instrs.length) {
+    match (f.blocks[0].instrs[i]) {
+      IArrayGetU(_, _, _) => {
+        out.push(i);
+      },
+      IArraySetU(_, _, _) => {
+        out.push(i);
+      },
+      _ => {},
+    }
+    i += 1;
+  }
+  return out;
+}
+
+@Test
+function anArrayStoreAfterALoadOfTheSameElementIsUnchecked(): void {
+  const f = straight([lr("a"), li("s"), li("w")], [
+    IArrayNew(0, false, [OInt(1), OInt(2), OInt(3)]),
+    IArrayGet(1, OLocal(0), OUsize(1)),
+    ICopy(2, OInt(9)),
+    IArraySet(0, OUsize(1), OLocal(2)),
+    IRelease(0),
+  ]);
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = uncheckAccesses(p, f);
+  assertEqUsize(uncheckedCount(g), 1, "one unchecked access");
+  assertEqUsize(uncheckedAt(g)[0], 3, "the store, not the load");
+  match (g.blocks[0].instrs[3]) {
+    IArraySetU(x, _, _) => {
+      assertEqUsize(x, 0, "on the array");
+    },
+    _ => {
+      assert(false, "an IArraySetU");
+    },
+  }
+  assert(passKept(f, g), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function everyLaterAccessOfTheSameElementIsUnchecked(): void {
+  const f = straight([lr("a"), lu("i"), li("s"), li("d")], [
+    IArrayNew(0, false, [OInt(1), OInt(2)]),
+    ICopy(1, OUsize(1)),
+    IArrayGet(2, OLocal(0), OLocal(1)),
+    IArrayGet(3, OLocal(0), OLocal(1)),
+    IArraySet(0, OLocal(1), OLocal(3)),
+    IRelease(0),
+  ]);
+  const g = uncheckAccesses(prog([f]), f);
+  assertEqUsize(uncheckedCount(g), 2, "the second load and the store");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aPushOrAnotherElementOrAnotherArrayKeepsTheCheck(): void {
+  const pushed = straight([lr("a"), li("s"), li("d")], [
+    IArrayNew(0, false, [OInt(1), OInt(2)]),
+    IArrayGet(1, OLocal(0), OUsize(0)),
+    IArrayPush(0, OInt(4)),
+    IArrayGet(2, OLocal(0), OUsize(0)),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([pushed]), pushed)), 0, "the push can reallocate and change the length");
+  const other = straight([lr("a"), li("s"), li("d")], [
+    IArrayNew(0, false, [OInt(1), OInt(2)]),
+    IArrayGet(1, OLocal(0), OUsize(0)),
+    IArrayGet(2, OLocal(0), OUsize(1)),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([other]), other)), 0, "another index has not been checked");
+  const twoArrays = straight([lr("a"), lr("b"), li("s"), li("d")], [
+    IArrayNew(0, false, [OInt(1), OInt(2)]),
+    IArrayNew(1, false, [OInt(1), OInt(2)]),
+    IArrayGet(2, OLocal(0), OUsize(0)),
+    IArrayGet(3, OLocal(1), OUsize(0)),
+    IRelease(0),
+    IRelease(1),
+  ]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([twoArrays]), twoArrays)), 0, "another array has not been checked");
+}
+
+@Test
+function aCallThatReceivesTheArrayKeepsTheCheck(): void {
+  const callee = fn("g", 1, [lr("p")], [bk([], TReturn(None))]);
+  const f = straight([lr("a"), li("s"), li("d")], [
+    IArrayNew(0, false, [OInt(1), OInt(2)]),
+    IArrayGet(1, OLocal(0), OUsize(0)),
+    ICall(None, 1, [OLocal(0)]),
+    IArrayGet(2, OLocal(0), OUsize(0)),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([f, callee]), f)), 0, "calls that receive the array end the window");
+}
+
+@Test
+function aLoadThatOverwritesItsOwnIndexIsNotASource(): void {
+  const f = straight([lr("a"), lu("i"), lu("d")], [
+    IArrayNew(0, false, [OUsize(1), OUsize(0)]),
+    ICopy(1, OUsize(0)),
+    IArrayGet(1, OLocal(0), OLocal(1)),
+    IArrayGet(2, OLocal(0), OLocal(1)),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([f]), f)), 0, "a[i] names another element after `i = a[i]`");
+}
+
+@Test
+function optimizeUnchecksRepeatedAccessesAndTheVerifierAcceptsThem(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = optimized(fs, sampleSource()).unwrap();
+      const q = optimize(p);
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      const n = q.functions.reduce((k: usize, f: MFunction) => k + uncheckedCount(f), 0);
+      const r = uncheckProgram(q);
+      assertEqUsize(r.functions.reduce((k: usize, f: MFunction) => k + uncheckedCount(f), 0), n, "doing it again changes nothing");
+      assertEqUsize(verify(r).errors.length, 0, "and the verifier still accepts it");
     },
   );
 }

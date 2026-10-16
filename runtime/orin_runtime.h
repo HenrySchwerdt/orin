@@ -386,6 +386,8 @@ void orin_struct_copy_slot(OrinObj *dst, uint32_t i, OrinObj *src, uint32_t j);
 void orin_trap_shape(void) __attribute__((noreturn, cold));
 /* `--assert-facts` builds only (docs/mir.md v2.4): checks the value an IForward claims for slot `key` of `o`; exit 70 if it differs. */
 void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got);
+/* `--assert-facts` builds only (docs/mir.md v2.5): the kind and bounds checks an IArrayGetU / IArraySetU omits; exit 70 if they would fail. */
+void orin_assert_array(const OrinObj *o, uint64_t i);
 static inline void orin_chk_slot(const OrinObj *o, uint32_t i) {
     if (ORIN_UNLIKELY(o->kind != ORIN_K_STRUCT || i >= ((const OrinStruct *)o)->nslots)) orin_trap_shape();
 }
@@ -505,6 +507,11 @@ static inline uint64_t *orin_array_slot_ptr(OrinObj *o, uint64_t i) {
     if (ORIN_UNLIKELY(i >= a->len)) orin_trap("index out of bounds");
     return &a->items[i];
 }
+/* Unchecked variants for IArrayGetU / IArraySetU (docs/mir.md v2.5, rule U1): the verifier has shown that an earlier access of the
+ * same block already passed the kind check and the bounds check for this array and index, and that nothing since changed them.
+ * These are the only helpers whose memory safety rests on a verified fact; `orin2 compile --assert-facts` runs orin_assert_array first. */
+static inline uint64_t orin_array_at_u(OrinObj *o, uint64_t i) { return ((OrinArray *)o)->items[i]; }
+static inline uint64_t *orin_array_slot_ptr_u(OrinObj *o, uint64_t i) { return &((OrinArray *)o)->items[i]; }
 OrinObj *orin_array_get(OrinObj *a, uint64_t i); /* Option<T> (element retained) */
 OrinObj *orin_array_slice(OrinObj *a, uint64_t from, uint64_t to);
 OrinObj *orin_array_concat(OrinObj *a, OrinObj *b);

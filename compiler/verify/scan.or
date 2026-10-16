@@ -1,0 +1,73 @@
+// Helpers shared by the two backward-scan rules of the verifier: F1 (forward.or, load forwarding) and U1 (unchecked.or,
+// unchecked array access). Both accept a claim about an instruction only when a scan of the SAME block, over at most WINDOW
+// instructions going backwards, finds the instruction that justifies it before anything could have invalidated it.
+
+import { MProgram, Instr, Operand, dstOf } from "../mir";
+
+// How far back the scan looks: bounds the cost of the rule and keeps it local.
+export const WINDOW: usize = 64;
+
+// What one instruction means for the claim: it changes nothing relevant (the scan continues), it is the source (accepted),
+// or it ends the scan (rejected).
+export const PASS: int = 0;
+export const SOURCE: int = 1;
+export const STOP: int = 2;
+
+export function isLocal(x: Operand, l: usize): bool {
+  return match (x) {
+    OLocal(m) => m == l,
+    _ => false,
+  };
+}
+
+// The slot of a field instruction as a key operand (a field index is an OUsize constant).
+export function fieldKey(k: usize): Operand {
+  return OUsize(k.toInt());
+}
+
+// The same constant or the same local.
+export function sameKey(a: Operand, b: Operand): bool {
+  return match (a) {
+    OLocal(x) => isLocal(b, x),
+    OUsize(x) => match (b) {
+      OUsize(y) => x == y,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// Two different constants name different slots; anything else may be the same slot.
+export function differ(a: Operand, b: Operand): bool {
+  return match (a) {
+    OUsize(x) => match (b) {
+      OUsize(y) => x != y,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+// `ins` defines local `l`: its destination, or the in/out argument of a call of an in/out function (as `defsOf` in rules.or).
+export function defines(p: MProgram, ins: Instr, l: usize): bool {
+  match (dstOf(ins)) {
+    Some(d) => {
+      if (d == l) {
+        return true;
+      }
+    },
+    None => {},
+  }
+  return match (ins) {
+    ICall(_, g, args) => g < p.functions.length && p.functions[g].inout && args.length > 0 && isLocal(args[0], l),
+    _ => false,
+  };
+}
+
+// The key operand is a local that `ins` defines.
+export function keyDefined(p: MProgram, ins: Instr, key: Operand): bool {
+  return match (key) {
+    OLocal(l) => defines(p, ins, l),
+    _ => false,
+  };
+}

@@ -474,3 +474,115 @@ function llvmForwardChecksTheOriginalIndexBeforeWritingIt(): void {
     "the assertion must read the original index before the destination store",
   );
 }
+
+// `IArrayGetU` / `IArraySetU` (docs/mir.md v2.5, rule U1): the checked access without the kind and bounds checks; with
+// `--assert-facts` the original checks run first (`orin_assert_array`, exit 70 if they would fail).
+function unchecked(): MProgram {
+  const f = MFunction {
+    name: "main",
+    paramCount: 0,
+    paramOwned: [],
+    inout: false,
+    locals: [lr("a"), MLocal { name: "s", ty: MInt }, MLocal { name: "d", ty: MInt }],
+    ret: MVoid,
+    blocks: [
+      bk(
+        [
+          IArrayNew(0, false, [OInt(1), OInt(2)]),
+          IArrayGet(1, OLocal(0), OUsize(1)),
+          IArrayGetU(2, OLocal(0), OUsize(1)),
+          IArraySetU(0, OUsize(1), OLocal(2)),
+          IRelease(0),
+        ],
+        TReturn(None),
+      ),
+    ],
+  };
+  return MProgram { functions: [f], strings: [], main: 0, vtables: [], inlineFns: [] };
+}
+
+@Test
+function cUncheckedAccessUsesTheUncheckedHelpersAndTheFactsBuildChecksFirst(): void {
+  const p = unchecked();
+  const c = emitC(p);
+  assert(c.includes("orin_array_at(l0, ((uint64_t)1ULL))"), "C: the first access stays checked");
+  assert(c.includes("l2 = (int64_t)orin_array_at_u(l0, ((uint64_t)1ULL));") || c.includes("orin_array_at_u(l0, "), "C: the load is unchecked");
+  assert(c.includes("orin_mir_array_put_u(l0, "), "C: the store is unchecked");
+  assert(!c.includes("orin_assert_array"), "C: no check in a normal build");
+  const cf = emitCFacts(p, true);
+  assert(cf.includes("orin_assert_array(l0, ((uint64_t)1ULL)); "), "C: the facts build checks first");
+  assert(emitCFacts(p, false) == c, "C: facts off is the normal build");
+}
+
+@Test
+function llvmUncheckedAccessHasNoGuardAndTheFactsBuildChecksFirst(): void {
+  const p = unchecked();
+  const ll = emitLlvm(p);
+  assert(!ll.includes("orin_assert_array"), "LLVM: no check in a normal build");
+  const lf = emitLlvmFacts(p, true);
+  assert(lf.includes("call void @orin_assert_array(ptr "), "LLVM: the check");
+  assert(lf.includes("declare void @orin_assert_array(ptr, i64)"), "LLVM: declared");
+  assert(llvmRefsDeclared(lf, llvmSymbols(p)), "LLVM: every global is declared");
+  assert(emitLlvmFacts(p, false) == ll, "LLVM: facts off is the normal build");
+  const checked = emitLlvm(MProgram {
+    functions: [MFunction {
+      name: "main",
+      paramCount: 0,
+      paramOwned: [],
+      inout: false,
+      locals: p.functions[0].locals,
+      ret: MVoid,
+      blocks: [bk(
+        [
+          IArrayNew(0, false, [OInt(1), OInt(2)]),
+          IArrayGet(1, OLocal(0), OUsize(1)),
+          IArrayGet(2, OLocal(0), OUsize(1)),
+          IArraySet(0, OUsize(1), OLocal(2)),
+          IRelease(0),
+        ],
+        TReturn(None),
+      )],
+    }],
+    strings: [],
+    main: 0,
+    vtables: [],
+    inlineFns: [],
+  });
+  assert(ll.length < checked.length, "LLVM: the unchecked form emits fewer instructions than the checked one");
+}
+
+// Programs for tools/test_unchecked_assert.py, which executes them on both backends with `--assert-facts` on and off.
+// variant 0: verifier-accepted (the unchecked load also overwrites its own index local); 1: an unchecked access out of bounds and
+// 2: an unchecked access on a struct, both NOT verifier-accepted, so only the facts build may run them (it must exit 70).
+export function uncheckedMir(variant: usize): MProgram {
+  const locals = [
+    lr("a"),
+    MLocal { name: "i", ty: MUsize },
+    MLocal { name: "s", ty: MUsize },
+    MLocal { name: "ok", ty: MBool },
+  ];
+  let body: Instr[] = [];
+  if (variant == 0) {
+    body = [
+      IArrayNew(0, false, [OUsize(1), OUsize(0)]),
+      ICopy(1, OUsize(0)),
+      IArrayGet(2, OLocal(0), OUsize(0)),
+      IArrayGet(2, OLocal(0), OLocal(1)),
+      IArrayGetU(1, OLocal(0), OLocal(1)),
+      IArraySetU(0, OUsize(0), OUsize(7)),
+      IArrayGetU(2, OLocal(0), OUsize(0)),
+      IRelease(0),
+      IBinary(3, OpEq, OLocal(2), OUsize(7)),
+    ];
+  } else if (variant == 1) {
+    body = [IArrayNew(0, false, [OUsize(1), OUsize(0)]), IArrayGetU(2, OLocal(0), OUsize(5)), IRelease(0), ICopy(3, OBool(true))];
+  } else {
+    body = [IStructNew(0, 0, [OUsize(1), OUsize(2)]), IArrayGetU(2, OLocal(0), OUsize(0)), IRelease(0), ICopy(3, OBool(true))];
+  }
+  const f = fn(
+    "main",
+    locals,
+    [bk(body, TBranch(OLocal(3), 1, 2)), bk([], TReturn(None)), bk([], TTrap("unchecked access computed the wrong value"))],
+  );
+  return MProgram { functions: [f], strings: [], main: 0, vtables: [], inlineFns: [] };
+}

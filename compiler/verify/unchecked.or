@@ -1,0 +1,104 @@
+// Rule U1, unchecked array access (docs/mir.md v2.5, ADR-0038 lever 2, T2). `IArrayGetU(d, a, i)` and `IArraySetU(a, i, v)`
+// are `IArrayGet` / `IArraySet` WITHOUT the kind check and the bounds check, so the emitters read or write `items[i]` directly.
+// That is memory safety, so the verifier accepts one only when an earlier access of the SAME array local and the SAME index
+// already passed both checks and nothing could have changed the kind or the length of the object since. The scan is a
+// backward walk over the same block, at most WINDOW instructions (scan.or):
+//   the source: the first instruction that touches (a, i) with a checked or unchecked IArrayGet / IArraySet of the same
+//               array local and the same index (the same constant or the same local). It must not define `a` or the index
+//               local itself: `i = arrayget a[i]` leaves `i` naming another element, so it justifies nothing after it.
+//   no change:  on the way back there is no definition of `a` or of the index local (a move, a call result, the receiver of
+//               an in/out call ...), and no instruction that mentions `a` other than a plain read: nothing that pushes,
+//               pops, extends, takes from or puts into `a`, hands `a` to a call or builtin, moves, releases or dups it into
+//               a consumer. `IMakeUnique(a)` does not end the scan (a copy has the same kind and length), nor does an
+//               access of another index or a forward from `a` (neither changes a length).
+// The verdict is the rule F1 of forward.or with a different question: F1 asks whether a SLOT still holds a value, U1 whether
+// the OBJECT still has its kind and length. A call that does not mention `a` cannot shrink it: that needs `rc == 1`, which a
+// live local `a` excludes (docs/tcb.md, the argument behind borrows); the verifier already rejects a call that gives the
+// same object to an in/out receiver and to another argument. Fail closed: anything this scan does not know about and that
+// mentions `a` ends it; no source found is "not justified".
+
+import { MProgram, MFunction, Instr, Operand, instrLocals } from "../mir";
+import { WINDOW, PASS, SOURCE, STOP, isLocal, sameKey, defines, keyDefined } from "./scan";
+
+// An access of `x[at]` that defines `d` (a load; `None` for a store) and is by itself checked: the source when it is our
+// array and our index and defines neither; any other index of the array changes no length.
+function access(d: Option<usize>, a: usize, key: Operand, at: Operand): int {
+  if (!sameKey(key, at)) {
+    return PASS;
+  }
+  match (d) {
+    Some(m) => {
+      return m == a || isLocal(key, m) ? STOP : SOURCE;
+    },
+    None => {
+      return SOURCE;
+    },
+  }
+}
+
+// The verdict on one instruction of the scan, for the claim (a, key).
+function verdict(ins: Instr, a: usize, key: Operand): int {
+  match (ins) {
+    IArrayGet(d, x, i) => {
+      if (isLocal(x, a)) {
+        return access(Some(d), a, key, i);
+      }
+    },
+    IArrayGetU(d, x, i) => {
+      if (isLocal(x, a)) {
+        return access(Some(d), a, key, i);
+      }
+    },
+    IArraySet(x, i, _) => {
+      if (x == a) {
+        return access(None, a, key, i);
+      }
+    },
+    IArraySetU(x, i, _) => {
+      if (x == a) {
+        return access(None, a, key, i);
+      }
+    },
+    IMakeUnique(x) => {
+      if (x == a) {
+        return PASS;
+      }
+    },
+    IForward(_, _, x, _) => {
+      if (isLocal(x, a)) {
+        return PASS;
+      }
+    },
+    _ => {},
+  }
+  // everything else: harmless unless it mentions `a` (push / pop / extend / take / put, a call or builtin that receives it,
+  // a move, a release, a dup, a borrow, a consuming constructor ...)
+  return instrLocals(ins).includes(a) ? STOP : PASS;
+}
+
+// Rule U1: is the unchecked access of `x[key]` at position `at` of block `blk` of `f` justified?
+export function uncheckedJustified(p: MProgram, f: MFunction, blk: usize, at: usize, x: Operand, key: Operand): bool {
+  match (x) {
+    OLocal(a) => {
+      const instrs = f.blocks[blk].instrs;
+      let i = at;
+      let n: usize = 0;
+      while (i > 0 && n < WINDOW) {
+        i -= 1;
+        n += 1;
+        const ins = instrs[i];
+        const v = verdict(ins, a, key);
+        if (v == SOURCE) {
+          return true;
+        }
+        if (v == STOP || defines(p, ins, a) || keyDefined(p, ins, key)) {
+          return false;
+        }
+      }
+      return false;
+    },
+    _ => {
+      return false;
+    },
+  }
+}

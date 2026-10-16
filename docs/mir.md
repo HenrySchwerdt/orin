@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.4; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4)
+# MIR and the OIM ownership verifier (v2.5; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4, unchecked array access `IArrayGetU` / `IArraySetU` v2.5)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -68,6 +68,16 @@ scalars held **by value** in n + 1 64-bit words (word 0 the tag, words 1..n the 
 object, no header and no reference count. Produced only by the optimiser (`compiler/opt/unbox.or`); no new instruction: the existing ones
 take an aggregate where noted in "Unboxed aggregates" below. The verifier treats an aggregate as a scalar (`Init`).
 
+v2.5 (ADR-0038 lever 2, T2) **unchecked array access**: two new instructions, `IArrayGetU(d, a, i)` (`d = arraygetu a[i]`) and
+`IArraySetU(x, i, v)` (`arraysetu x[i] = v`). Each means exactly `IArrayGet` / `IArraySet` **without the kind check and without the
+bounds check**: the C backend reads and writes `items[i]` directly (`orin_array_at_u`, `orin_mir_array_put_u` / `orin_mir_array_replace_u`),
+the LLVM backend emits the `getelementptr inbounds` and no compare. Unlike `IForward` this is a **memory-safety** fact, so the verifier
+rejects an unchecked access it cannot justify (rule **U1**, `compiler/verify/unchecked.or`, section "Unchecked array access" below, error
+text `unchecked array access without a dominating check`). The optimiser (`compiler/opt/bounds.or`, its last pass) emits them where U1 accepts
+them; the lowering never does. Textual forms `l3 = arraygetu l0[1u]` and `arraysetu l0[l4] = l2`. `orin2 compile --assert-facts` re-runs the
+omitted checks before each one. (The ADR text calls this step v2.6; T5, which would be v2.5, is parked in draft PR #91 and not in main, so T2
+took the next free number. Whichever of the two merges second renumbers.)
+
 v2.4 (ADR-0044) `BStrWithCapacity(n)`: **no new instruction**. `IBuiltin(Some(d), BStrWithCapacity, [n: usize])` (printed `str.withCapacity`) defines `d` as a new, owned, unique, empty string with room for `n` bytes (runtime `orin_str_with_capacity`, `n` clamped to 1 MiB). The checker emits it only as the start of an OX markup root; the lowering then appends every piece in place (`IStrAppend`).
 
 ## Execution model
@@ -122,7 +132,9 @@ hole slot when reading that slot.
 - `IGetField(d, o, i)` / `IArrayGet(d, a, i)`: o live, slot i not a hole; ref d → `Borrowed(root(o))`.
 - `IForward(d, s, o, key)` (v2.4): d and s plain scalars of one class (int, usize, bool, float), o a reference local, key a usize operand;
   s and o live, slot `key` of o not a hole; d `Init`. Rule F1 must justify the claim (below), else **error** `unjustified forward`.
-- `ISetField(x, i, v)` / `IArraySet(x, i, v)`: x **Unique**; v consumed as for StructNew.
+- `IArrayGetU(d, a, i)` (v2.5): the rules of `IArrayGet`, and rule U1 must justify the omitted checks (below), else **error**
+  `unchecked array access without a dominating check`.
+- `ISetField(x, i, v)` / `IArraySet(x, i, v)` / `IArraySetU(x, i, v)` (v2.5, plus rule U1): x **Unique**; v consumed as for StructNew.
   Effect: invalidates every `Borrowed(x)` local (→ Dead) because the old slot value is released.
 - `ITakeField(d, x, i)` / `IArrayTake(d, x, i)`: x Unique; i not already a hole → d Owned, i added
   to holes(x); invalidates `Borrowed(x)` locals.
@@ -230,6 +242,42 @@ Lean (`formal/Orin/Forward.lean`): `load_load` and `store_load` (a load after a 
 redefinition in between, returns the same value), `store_frame_other_slot`, `store_frame_other_local` (a store through another local cannot
 change `o`'s slots in a well-formed state) and `makeUnique_frame` (`makeUnique` keeps every slot). They prove the facts F1 relies on in the
 model; the Orin scan itself is not proved equal to them, and calls and array length are outside the model.
+
+## Unchecked array access (v2.5, ADR-0038 lever 2 T2, rule U1)
+`d = arraygetu a[i]` and `arraysetu a[i] = v` skip the two checks of the runtime (`orin_array_at`: the object is an array, `i < len`). Skipping
+them is memory safety, so the verifier accepts one only when a backward scan of **the same block**, over at most 64 instructions (`WINDOW`,
+`scan.or`, shared with F1), finds the access that already passed both checks, before anything could have changed the kind or the length of
+the object. Going back from the unchecked access, for the array local `a` and the index operand `i`:
+- **source** (accepted): the first `arrayget`, `arraygetu`, `arrayset` or `arraysetu` of the same array local and the same index (the same
+  `usize` constant or the same local) that does **not define `a` or the index local itself**. `i = arrayget a[i]` (and `a = arrayget a[i]`)
+  leaves `a[i]` naming another element, so it justifies nothing after it (the bug rule F1 had until review; U1 has a case for it).
+- **no change** (the scan goes on): an instruction that does not mention `a` (including calls and builtins that do not receive `a`: a live local
+  `a` holds a reference, so a callee cannot shrink the object in place, which needs `rc == 1`; the verifier already rejects giving one object to an
+  in/out receiver and to another argument, rule `callOwned`); `IMakeUnique(a)` (a copy has the same kind and length); an `arrayget` / `arrayset` /
+  `arraygetu` / `arraysetu` of **another index** of `a` (it changes no length); an `IForward` from `a`.
+- **rejected**: any other instruction that mentions `a`: `arraypush`, `arraypop`, `arrayextend`, `arraytake`, `arrayput` (conservative: they do
+  not change the length, but they are the instructions that open and close holes, and the ADR lists them), a call or builtin that receives `a`, a
+  move, a release, a dup, a borrow, a consuming constructor; a **definition of `a` or of the index local** (a destination, a move, the
+  receiver of an in/out call); the start of the block; 64 instructions without a source. Fail closed: anything the scan does not know that mentions
+  `a` ends it.
+Everything else is the ordinary rule: `arraygetu` is an `arrayget` (the slot must not be a hole, a reference result is `Borrowed`), `arraysetu` is
+an `arrayset` (the array must be `Unique`). *Soundness.* The first access executed the kind and the bounds check on the object `a` holds; the
+object a live local holds changes its kind never and its length only through the instructions the scan rejects, through a redefinition of the
+local (rejected), or through an in/out call or a consuming call on an alias (impossible while `a` is live: it needs `rc == 1`; the argument
+behind borrows, docs/tcb.md). *Trap semantics.* The removed check is an exact duplicate of one that passed with no length change since, so it
+cannot fire; the first access keeps its check, in its place, with its message. No trap moves.
+*Dynamic check.* `orin2 compile --assert-facts` emits `orin_assert_array(a, i)` (runtime/orin_runtime.c) before every unchecked access (C and LLVM;
+the operands as they are before the instruction, so a destination that is the index local is fine); a failure exits **70** with
+`internal error: --assert-facts: an unchecked array access ...`. The suites run under it. Evidence, not proof.
+*Tests.* `compiler/tests/verify_main.or` `uncheckedCases` (accepted: get / set after get / set, local index, chain of unchecked accesses,
+`makeunique`, another index, a store to the same element, a call that does not receive `a`, the window; rejected: no earlier access, another
+constant / local index, another array, push, pop, extend, take, put, dup, redefinition, move, index redefinition, a call that receives `a`, an in/out
+call, a source that redefines its own index (checked and unchecked, get and set), another block, beyond the window), `compiler/tests/opt_test.or`
+and `emit_test.or` (T2 sections). Mutation corpus (`tools/mutate_mir.py`, every `arraygetu` / `arraysetu` of the optimised corpus, and every checked
+access without an earlier one): `bce-no-fact`, `bce-across-push`, `bce-after-redef`, `bce-after-redef-index`, `bce-other-index`, `bce-across-block`,
+and the positive controls `bce-makeunique-ok` and `bce-other-index-ok` (accepted; a rejection is a finding). Lean: array length is outside the
+model (`formal/Orin/Machine.lean` has no arrays with a length), so U1 has no lemma; it is listed with the other rules not yet in the model
+(docs/tcb.md, docs/formal.md), not claimed as proved.
 
 ## Unboxed aggregates (v2.2, ADR-0038 step 1)
 `MAgg(n)` is a value of n + 1 words: `w[0]` the tag, `w[1..n]` the payload. A payload is a sequence of *slots*: a scalar slot (int, usize,

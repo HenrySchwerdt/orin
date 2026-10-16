@@ -36,6 +36,15 @@ Mutation classes (id: injected bug -> required reaction)
   fwd-across-push     `arraypush o` between them (array objects)                       -> ERROR unjustified forward
   fwd-wrong-slot      forward from the load of another slot (key differs)              -> ERROR unjustified forward
   fwd-across-block    split the block between the source and the forward               -> ERROR unjustified forward
+  unchecked array access (rule U1, docs/mir.md v2.5; applied to every `arraygetu` / `arraysetu` of the optimised corpus):
+  bce-no-fact         make a checked access unchecked that has no earlier access of (a, i) in its block -> ERROR without a dominating check
+  bce-across-push     `arraypush a` between the checked access and the unchecked one         -> ERROR without a dominating check
+  bce-after-redef     redefine the array local there (`t = dup a; a = move t`)               -> ERROR without a dominating check
+  bce-after-redef-index redefine the index local there                                       -> ERROR without a dominating check
+  bce-other-index     access an index that no earlier access of the block names              -> ERROR without a dominating check
+  bce-across-block    split the block between the checked access and the unchecked one       -> ERROR without a dominating check
+  bce-makeunique-ok   `makeunique a` there (positive control)                                -> ACCEPTED (rejection is a finding)
+  bce-other-index-ok  read another index of a there (positive control)                       -> ACCEPTED (rejection is a finding)
 
 A mutant that is accepted without a new warning is a SURVIVOR, a finding, unless it is one of the
 explicitly classified BENIGN cases below (each has a precise, local reason). A mutant that is
@@ -152,7 +161,7 @@ def op(line):
     return m.group(1)
 
 
-STORES = ("setfield", "putfield", "arrayset", "arrayput")
+STORES = ("setfield", "putfield", "arrayset", "arraysetu", "arrayput")
 TAKES = ("takefield", "arraytake")
 
 
@@ -283,7 +292,7 @@ def reaches_return(f, bi):
 # Independent, deliberately conservative "definitely Unique" dataflow (not the verifier's rules):
 # a local is Unique after struct/arraynew/closure/makeunique and after a move of a Unique local;
 # every other mention that is not a plain read or an in-place store loses it; join = intersection.
-KEEP_READS = ("getfield", "arrayget", "tag", "forward")
+KEEP_READS = ("getfield", "arrayget", "arraygetu", "tag", "forward")
 
 
 def uniq_transfer(f, U, line):
@@ -420,6 +429,10 @@ def sites(f):
                 out.append(Mut("drop-dup", f, (bi, ii), "delete `%s` (b%d i%d)" % (line, bi, ii), benign, "dead", "error"))
             if w == "forward":
                 out += forward_sites(f, bi, ii, line)
+            if w in ("arraygetu", "arraysetu"):
+                out += unchecked_sites(f, bi, ii, line)
+            if w in ("arrayget", "arrayset"):
+                out += nofact_sites(f, bi, ii, line)
     if f.inout:
         # v1.10: parameter 0 is handed back to the caller at every return
         for bi, (label, ins, term) in enumerate(f.blocks):
@@ -454,7 +467,7 @@ def fwd_kind(ins, ii, o, key):
         m = re.match(r"(?:l\d+ = getfield|setfield) l%d\.%s\b" % (o, re.escape(key[:-1])), line)
         if m and key.endswith("u"):
             return "field"
-        if re.match(r"(?:l\d+ = arrayget|arrayset) l%d\[%s\]" % (o, re.escape(key)), line):
+        if re.match(r"(?:l\d+ = arrayget|arrayset)u? l%d\[%s\]" % (o, re.escape(key)), line):
             return "array"
         if re.match(r"l\d+ = forward l\d+, l%d\[%s\]$" % (o, re.escape(key)), line):
             continue
@@ -464,7 +477,7 @@ def fwd_kind(ins, ii, o, key):
 def no_ref_alias_of(f, o):
     """No reference local is projected or borrowed from o: a store through o kills such borrows, which would reject a
     positive control for a reason that has nothing to do with forwarding."""
-    pat = re.compile(r"l(\d+) = (?:getfield|borrow) l%d\b|l(\d+) = arrayget l%d\[" % (o, o))
+    pat = re.compile(r"l(\d+) = (?:getfield|borrow) l%d\b|l(\d+) = arraygetu? l%d\[" % (o, o))
     for _, ins, _t in f.blocks:
         for line in ins:
             m = pat.match(line)
@@ -510,6 +523,139 @@ def forward_sites(f, bi, ii, line):
         out.append(Mut("fwd-other-slot-ok", f, (bi, ii), "write another slot of l%d before `%s` %s" % (o, line, where),
                        "positive control: a write to a different slot must not end the forwarding", None, "accept"))
     return out
+
+
+UGET_RE = re.compile(r"l(\d+) = arraygetu l(\d+)\[([^\]]+)\]$")
+USET_RE = re.compile(r"arraysetu l(\d+)\[([^\]]+)\] = (.+)$")
+GET_RE = re.compile(r"l(\d+) = arrayget l(\d+)\[([^\]]+)\]$")
+SET_RE = re.compile(r"arrayset l(\d+)\[([^\]]+)\] = (.+)$")
+
+
+def acc_parts(line):
+    """(array local, key text, value operand text or None, destination local or None) of an array access line (any form)."""
+    for rx, kind in ((UGET_RE, "get"), (GET_RE, "get")):
+        m = rx.match(line)
+        if m:
+            return int(m.group(2)), m.group(3), None, int(m.group(1))
+    for rx in (USET_RE, SET_RE):
+        m = rx.match(line)
+        if m:
+            return int(m.group(1)), m.group(2), m.group(3), None
+    return None
+
+
+def scalar_ty(f, a, key, val, d):
+    """The scalar type of the element the access moves (int, usize, bool, float), or None for a reference / unknown."""
+    if d is not None:
+        return f.locals[d][1] if f.locals[d][1] in ZERO else None
+    if re.fullmatch(r"l\d+", val):
+        t = f.locals[int(val[1:])][1]
+        return t if t in ZERO else None
+    if re.fullmatch(r"-?\d+", val):
+        return "int"
+    if re.fullmatch(r"\d+u", val):
+        return "usize"
+    if val in ("true", "false"):
+        return "bool"
+    return None
+
+
+def touches(line, a):
+    """The array local a occurs in an array access, a push/pop/extend, a call or anything else: any mention."""
+    return a in toks(line)
+
+
+def earlier_access(ins, ii, a, key):
+    """Some earlier line of the block is an access of a[key] (any form), or a forward from it."""
+    pat = re.compile(r"(?:l\d+ = arrayget|arrayset)u? l%d\[%s\]" % (a, re.escape(key)))
+    return any(pat.match(l) for l in ins[:ii])
+
+
+def nofact_sites(f, bi, ii, line):
+    """A checked access with no earlier access of the same array and index in its block (so no dominating check): making it
+    unchecked is the bce-no-fact mutant. An access with an earlier one is skipped (it may be justified)."""
+    p = acc_parts(line)
+    if p is None:
+        return []
+    a, key, val, d = p
+    ins = f.blocks[bi][1]
+    fw = re.compile(r"l\d+ = forward l\d+, l%d\[%s\]$" % (a, re.escape(key)))
+    if earlier_access(ins, ii, a, key) or any(fw.match(l) for l in ins[:ii]):
+        return []
+    return [Mut("bce-no-fact", f, (bi, ii), "make `%s` unchecked, with no earlier access of l%d[%s] in the block (b%d i%d)" % (line, a, key, bi, ii),
+                None, "without a dominating check", "error")]
+
+
+def unchecked_sites(f, bi, ii, line):
+    a, key, val, d = acc_parts(line)
+    ins = f.blocks[bi][1]
+    where = "(b%d i%d)" % (bi, ii)
+    need = "without a dominating check"
+    out = [
+        Mut("bce-after-redef", f, (bi, ii), "redefine l%d before `%s` %s" % (a, line, where), None, need, "error"),
+        Mut("bce-across-block", f, (bi, ii), "split the block before `%s` %s" % (line, where), None, need, "error"),
+    ]
+    ty = scalar_ty(f, a, key, val, d)
+    if ty is not None:
+        out.append(Mut("bce-across-push", f, (bi, ii), "arraypush l%d before `%s` %s" % (a, line, where), None, need, "error"))
+    # an index that no earlier access of the block names
+    if re.fullmatch(r"\d+u", key):
+        k2 = int(key[:-1]) + 1
+    else:
+        k2 = 7919
+    while earlier_access(ins, ii, a, "%du" % k2):
+        k2 += 1
+    out.append(Mut("bce-other-index", f, (bi, ii), "access l%d[%du] instead of l%d[%s] in `%s` %s" % (a, k2, a, key, line, where), None, need, "error"))
+    if re.fullmatch(r"l\d+", key):
+        out.append(Mut("bce-after-redef-index", f, (bi, ii), "redefine the index %s before `%s` %s" % (key, line, where), None, need, "error"))
+    # positive controls: makeunique of the array, and an access of another index, change neither kind nor length
+    if ty is not None and no_ref_alias_of(f, a):
+        if a >= f.nparams and certainly_unique(f, bi, ii, a):
+            out.append(Mut("bce-makeunique-ok", f, (bi, ii), "makeunique l%d before `%s` %s" % (a, line, where),
+                           "positive control: makeunique keeps kind and length", None, "accept"))
+        out.append(Mut("bce-other-index-ok", f, (bi, ii), "read l%d[%du] before `%s` %s" % (a, k2, line, where),
+                       "positive control: an access of another index changes no length", None, "accept"))
+    return out
+
+
+def apply_bounds(m, f):
+    b = f.blocks[m.bi]
+    ins = b[1]
+    ii = m.ii
+    line = ins[ii]
+    a, key, val, d = acc_parts(line)
+    if m.cls == "bce-no-fact":
+        ins[ii] = line.replace("arrayget ", "arraygetu ", 1) if val is None else line.replace("arrayset ", "arraysetu ", 1)
+    elif m.cls == "bce-across-push":
+        ty = scalar_ty(f, a, key, val, d)
+        w = f.new_local(ty)
+        ins.insert(ii, "l%d = copy %s" % (w, ZERO[ty]))
+        ins.insert(ii + 1, "arraypush l%d, l%d" % (a, w))
+    elif m.cls == "bce-after-redef":
+        n = f.new_local()
+        ins.insert(ii, "l%d = dup l%d" % (n, a))
+        ins.insert(ii + 1, "l%d = move l%d" % (a, n))
+    elif m.cls == "bce-across-block":
+        rest = ins[ii:]
+        del ins[ii:]
+        label = "b%d" % len(f.blocks)
+        ins_term = b[2]
+        b[2] = "goto %s" % label
+        f.blocks.append([label, rest, ins_term])
+    elif m.cls == "bce-other-index":
+        k2 = re.search(r"\[(\d+)u\] instead", m.desc).group(1) + "u"
+        ins[ii] = line.replace("[%s]" % key, "[%s]" % k2, 1)
+    elif m.cls == "bce-after-redef-index":
+        ins.insert(ii, "%s = copy 0u" % key)
+    elif m.cls == "bce-makeunique-ok":
+        ins.insert(ii, "makeunique l%d" % a)
+    elif m.cls == "bce-other-index-ok":
+        k2 = re.search(r"\[(\d+)u\] before", m.desc).group(1) + "u"
+        w = f.new_local(scalar_ty(f, a, key, val, d))
+        ins.insert(ii, "l%d = arrayget l%d[%s]" % (w, a, k2))
+    else:
+        raise ValueError(m.cls)
+    return f
 
 
 def apply_forward(m, f):
@@ -571,6 +717,8 @@ def apply(m):
     t = toks(line)
     if m.cls.startswith("fwd-"):
         return apply_forward(m, f)
+    if m.cls.startswith("bce-"):
+        return apply_bounds(m, f)
     if m.cls == "inout-drop-receiver":
         del ins[ii]
     elif m.cls == "drop-release":

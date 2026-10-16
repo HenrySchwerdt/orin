@@ -536,6 +536,19 @@ void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got) {
     orin_platform_exit(70);
 }
 
+/* `orin2 compile --assert-facts` (docs/mir.md v2.5, rule U1): the kind check and the bounds check that an IArrayGetU / IArraySetU
+ * leaves out, executed before it. A failure is a verifier or optimiser bug, not a program error: exit 70 (internal error). */
+void orin_assert_array(const OrinObj *o, uint64_t i) {
+    const char *why = 0;
+    if (o->kind != ORIN_K_ARRAY) why = "internal error: --assert-facts: an unchecked array access on an object that is not an array";
+    else if (i >= ((const OrinArray *)o)->len) why = "internal error: --assert-facts: an unchecked array access is out of bounds";
+    if (!why) return;
+    size_t n = 0;
+    while (why[n]) n++;
+    orin_platform_write_line(ORIN_PLATFORM_STDERR, why, n);
+    orin_platform_exit(70);
+}
+
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;

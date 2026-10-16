@@ -595,6 +595,8 @@ function sInstr(i: Instr): Instr {
     IArrayNew(d, r, os) => IArrayNew(d + 1, r, sos(os)),
     IArrayGet(d, a, k) => IArrayGet(d + 1, so(a), so(k)),
     IArraySet(x, k, o) => IArraySet(x + 1, so(k), so(o)),
+    IArrayGetU(d, a, k) => IArrayGetU(d + 1, so(a), so(k)),
+    IArraySetU(x, k, o) => IArraySetU(x + 1, so(k), so(o)),
     IArrayTake(d, x, k) => IArrayTake(d + 1, x + 1, so(k)),
     IArrayPut(x, k, y) => IArrayPut(x + 1, so(k), y + 1),
     IArrayPush(x, o) => IArrayPush(x + 1, so(o)),
@@ -1185,8 +1187,102 @@ function forwardCases(): usize {
   return bad;
 }
 
+// Unchecked array access, rule U1 (docs/mir.md v2.5, ADR-0038 lever 2 T2). Locals: 0 = the array `a` (three ints), 1 = an int `s`,
+// 2 = an int `d`, 3 = an int `w`, 4 = an index `i`, 5 = a reference `r`, 6 = a second array `b`, 7 = another index `j`.
+function ulocs(): MLocal[] {
+  return [lr("a"), li("s"), li("d"), li("w"), lu("i"), lr("r"), lr("b"), lu("j")];
+}
+
+function uok(name: string, instrs: Instr[]): bool {
+  return pos("unchecked " + name, straight(0, ulocs(), instrs));
+}
+
+const UNCHECKED_NEEDLE: string = "unchecked array access without a dominating check";
+
+function ubad(name: string, instrs: Instr[]): bool {
+  return neg("unchecked " + name, straight(0, ulocs(), instrs), UNCHECKED_NEEDLE);
+}
+
+function ubadCall(name: string, instrs: Instr[]): bool {
+  return neg("unchecked " + name, prog([fn("f", 0, ulocs(), MVoid, [bk(instrs, ret())]), gVoid(), ioNext()]), UNCHECKED_NEEDLE);
+}
+
+function get1(): Instr { return IArrayGet(1, OLocal(0), OUsize(1)); }
+function getU1(): Instr { return IArrayGetU(2, OLocal(0), OUsize(1)); }
+function setU1(): Instr { return IArraySetU(0, OUsize(1), OLocal(3)); }
+function w5(): Instr { return ICopy(3, OInt(5)); }
+
+function uncheckedCases(): usize {
+  let bad: usize = 0;
+  // accepted
+  bad += cnt(uok("get after get, constant index", [arr(), get1(), getU1(), done()]));
+  bad += cnt(uok("set after get", [arr(), get1(), w5(), setU1(), done()]));
+  bad += cnt(uok("get after set", [arr(), w5(), IArraySet(0, OUsize(1), OLocal(3)), getU1(), done()]));
+  bad += cnt(uok("set after set", [arr(), w5(), IArraySet(0, OUsize(1), OLocal(3)), setU1(), done()]));
+  bad += cnt(uok("same local index", [arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), IArrayGetU(2, OLocal(0), OLocal(4)), done()]));
+  bad += cnt(uok("an unchecked access is a source for the next", [arr(), get1(), getU1(), IArrayGetU(1, OLocal(0), OUsize(1)), done()]));
+  bad += cnt(uok("across makeunique of the array (positive control)", [arr(), get1(), IMakeUnique(0), getU1(), done()]));
+  bad += cnt(uok("across an access of another index (positive control)", [arr(), get1(), IArrayGet(3, OLocal(0), OUsize(2)), IArraySet(0, OUsize(0), OLocal(3)), getU1(), done()]));
+  bad += cnt(uok("across a store to the same element", [arr(), get1(), w5(), IArraySet(0, OUsize(1), OLocal(3)), getU1(), done()]));
+  bad += cnt(uok("across a forward from the array", [arr(), get1(), IForward(3, 1, OLocal(0), OUsize(1)), getU1(), done()]));
+  bad += cnt(uok("across an index local that is only read", [arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), IBinary(3, OpAdd, OInt(1), OInt(2)), IArrayGetU(2, OLocal(0), OLocal(4)), done()]));
+  bad += cnt(pos("unchecked across a call that does not receive the array",
+    callProg([arr(), get1(), ICall(None, 1, [OStr(0)]), getU1(), done()])));
+  // rejected
+  bad += cnt(ubad("get with no earlier access", [arr(), getU1(), done()]));
+  bad += cnt(ubad("set with no earlier access", [arr(), w5(), setU1(), done()]));
+  bad += cnt(ubad("access of another constant index", [arr(), IArrayGet(1, OLocal(0), OUsize(2)), getU1(), done()]));
+  bad += cnt(ubad("access of another index local", [arr(), ICopy(4, OUsize(1)), ICopy(7, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)),
+    IArrayGetU(2, OLocal(0), OLocal(7)), done()]));
+  bad += cnt(ubad("constant index against a local index", [arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), getU1(), done()]));
+  bad += cnt(ubad("access of another array", [arr(), IArrayNew(6, false, [OInt(1), OInt(2), OInt(3)]), IArrayGet(1, OLocal(6), OUsize(1)), getU1(), IRelease(6), done()]));
+  bad += cnt(ubad("across arraypush", [arr(), get1(), IArrayPush(0, OInt(4)), getU1(), done()]));
+  bad += cnt(ubad("across arraypop", [arr(), get1(), IArrayPop(5, 0), getU1(), IRelease(5), done()]));
+  bad += cnt(ubad("across arrayextend", [arr(), IArrayNew(6, false, [OInt(1)]), get1(), IArrayExtend(0, OLocal(6)), getU1(), done()]));
+  bad += cnt(ubad("across arraytake of another element", [arr(), get1(), IArrayTake(5, 0, OUsize(2)), IArrayPut(0, OUsize(2), 5), getU1(), done()]));
+  bad += cnt(ubad("across arraytake", [arr(), get1(), IArrayTake(5, 0, OUsize(2)), getU1(), IArrayPut(0, OUsize(2), 5), done()]));
+  bad += cnt(ubad("after the array was redefined", [arr(), get1(), done(), arr(), getU1(), done()]));
+  bad += cnt(ubad("after the array was moved in", [arr(), IArrayNew(6, false, [OInt(1), OInt(2), OInt(3)]), get1(), done(), IMove(0, 6), getU1(), done()]));
+  bad += cnt(ubad("after the index local was redefined", [arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), ICopy(4, OUsize(2)), IArrayGetU(2, OLocal(0), OLocal(4)), done()]));
+  bad += cnt(ubad("across a dup of the array", [arr(), get1(), IDup(5, OLocal(0)), getU1(), IRelease(5), done()]));
+  bad += cnt(ubadCall("across a call that receives the array", [arr(), get1(), ICall(None, 1, [OLocal(0)]), getU1(), done()]));
+  bad += cnt(ubadCall("across an in/out call on the array", [arr(), get1(), ICall(Some(3), 2, [OLocal(0)]), getU1(), done()]));
+  // the source redefines its own index local (`i = arrayget a[i]`): afterwards `a[i]` names another element
+  const ixs = [lr("a"), lu("i"), lu("d")];
+  bad += cnt(neg("unchecked get after a load that redefines its index", straight(0, ixs, [
+    IArrayNew(0, false, [OUsize(1), OUsize(0)]), ICopy(1, OUsize(0)), IArrayGet(1, OLocal(0), OLocal(1)),
+    IArrayGetU(2, OLocal(0), OLocal(1)), done()]), UNCHECKED_NEEDLE));
+  bad += cnt(neg("unchecked get after an unchecked load that redefines its index", straight(0, ixs, [
+    IArrayNew(0, false, [OUsize(1), OUsize(0)]), ICopy(1, OUsize(0)), IArrayGet(2, OLocal(0), OLocal(1)),
+    IArrayGetU(1, OLocal(0), OLocal(1)), IArrayGetU(2, OLocal(0), OLocal(1)), done()]), UNCHECKED_NEEDLE));
+  bad += cnt(neg("unchecked set after a load that redefines its index", straight(0, ixs, [
+    IArrayNew(0, false, [OUsize(1), OUsize(0)]), ICopy(1, OUsize(0)), IArrayGet(1, OLocal(0), OLocal(1)),
+    IArraySetU(0, OLocal(1), OUsize(7)), done()]), UNCHECKED_NEEDLE));
+  bad += cnt(neg("unchecked access across blocks", prog([fn("f", 0, ulocs(), MVoid, [
+    bk([arr(), get1()], TGoto(1)), bk([getU1(), done()], ret())])]), UNCHECKED_NEEDLE));
+  bad += cnt(neg("unchecked access of a non-local array", straight(0, ulocs(), [IArrayGetU(2, OStr(0), OUsize(1))]), "IArrayGetU: bad destination"));
+  bad += cnt(neg("unchecked store into a scalar", straight(0, ulocs(), [IArraySetU(1, OUsize(1), OInt(1))]), "IArraySetU: bad array"));
+  // an unchecked access is still a read or a store: the ordinary rules apply to it
+  bad += cnt(neg("unchecked store into an array that is not unique", straight(0, ulocs(), [
+    arr(), IDup(6, OLocal(0)), get1(), w5(), setU1(), IRelease(6), done()]), "Unique"));
+  // the window is 64 instructions
+  let near: Instr[] = [arr(), get1()];
+  let far: Instr[] = [arr(), get1()];
+  let k: usize = 0;
+  while (k < 70) {
+    if (k < 60) { near.push(ICopy(3, OInt(1))); }
+    far.push(ICopy(3, OInt(1)));
+    k += 1;
+  }
+  near.push(getU1()); near.push(done());
+  far.push(getU1()); far.push(done());
+  bad += cnt(uok("within the window of 64 instructions", near));
+  bad += cnt(ubad("beyond the window of 64 instructions", far));
+  return bad;
+}
+
 function main(): void {
-  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases() + forwardCases();
+  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases() + forwardCases() + uncheckedCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);
