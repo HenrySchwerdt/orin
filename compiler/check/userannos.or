@@ -1,0 +1,689 @@
+// User-defined annotations, metadata only (ADR-0046 S1). Beyond Orin-B.
+//
+// The parser accepts `@Name` / `@Name(args)` for every name that is not a built-in (syntax/parser.or, `ACustom`) and the
+// built-in `@Annotation(targets..)` on record types (`AAnnotation`). This pass does what needs name resolution:
+//   * an annotation name resolves like a type name (declared in the module or imported, ordinary visibility). An unknown
+//     name, or a name that is not a record marked `@Annotation`, is E0408;
+//   * the use must sit on one of the targets listed by the definition (E0440);
+//   * the arguments are positional in field order, trailing `Option` fields may be omitted, and every argument is a
+//     constant of the field's type: a literal (integers and floats with a unary `-`), an array literal of constants, a
+//     tag of the field's payload-free union, `None` / `Some(c)` / `c` for an `Option` field, or a module `const` whose
+//     initialiser is itself such a constant (E0441);
+//   * the field types of a definition are `bool`, `int`, `usize`, `float`, `f32`, `string`, a payload-free union, and
+//     `T[]` / `Option<T>` / `Option<T[]>` of those; the record must not be generic (E0446);
+//   * the names `Test`, `Deprecated`, `Inline`, `Sealed`, `Annotation`, `Processor` and the contract clause names cannot be
+//     declared as `@Annotation` definitions (E0447). Identifiers starting with `__g` are rejected by the parser.
+// A duplicate use of one annotation on a declaration is E0442 and is reported by the parser. Without a processor an
+// annotation is metadata: nothing here changes the checked program (later slices read the AST).
+
+import { Diagnostic, diag } from "../diag";
+import {
+  Ident, Item, Annotation, TypeDecl, TypeExpr, Expr, FieldDecl, VariantDecl, isReservedAnnotationName,
+} from "../syntax";
+import { LoadedProgram, ImportUnit, ImportStd } from "../loader";
+
+// A declaration found by name: the unit that declares it and the item.
+type Res = { unit: usize; item: Item; };
+
+// The name of a declaration item, "" for an import or re-export.
+function declName(it: Item): string {
+  return match (it) {
+    IFunction(f) => f.name.name,
+    IType(t) => t.name.name,
+    IConst(k) => k.name.name,
+    IClass(c) => c.name.name,
+    IInterface(i) => i.name.name,
+    _ => "",
+  };
+}
+
+function declExported(it: Item): bool {
+  return match (it) {
+    IFunction(f) => f.exported,
+    IType(t) => t.exported,
+    IConst(k) => k.exported,
+    IClass(c) => c.exported,
+    IInterface(i) => i.exported,
+    _ => false,
+  };
+}
+
+function hasName(ids: Ident[], name: string): bool {
+  for (const i of ids) {
+    if (i.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The exported declaration `name` of unit `ui`, following re-exports.
+function lookupExported(prog: LoadedProgram, ui: usize, name: string, depth: usize): Option<Res> {
+  if (depth > prog.units.length) {
+    return None;
+  }
+  const u = prog.units[ui];
+  for (const it of u.ast.items) {
+    if (declName(it) == name && declExported(it)) {
+      return Some(Res { unit: ui, item: it });
+    }
+  }
+  let k: usize = 0;
+  for (const it of u.ast.items) {
+    match (it) {
+      IImport(_) => {
+        k += 1;
+      },
+      IReExport(d) => {
+        if (hasName(d.names, name)) {
+          match (u.imports[k]) {
+            ImportUnit(j) => {
+              return lookupExported(prog, j, name, depth + 1);
+            },
+            ImportStd(_) => {
+              return None;
+            },
+          }
+        }
+        k += 1;
+      },
+      _ => {},
+    }
+  }
+  return None;
+}
+
+// The declaration `name` as seen from unit `ui`: declared there, or imported.
+function lookupDecl(prog: LoadedProgram, ui: usize, name: string): Option<Res> {
+  const u = prog.units[ui];
+  for (const it of u.ast.items) {
+    if (declName(it) == name) {
+      return Some(Res { unit: ui, item: it });
+    }
+  }
+  let k: usize = 0;
+  for (const it of u.ast.items) {
+    match (it) {
+      IImport(d) => {
+        if (hasName(d.names, name)) {
+          match (u.imports[k]) {
+            ImportUnit(j) => {
+              return lookupExported(prog, j, name, 0);
+            },
+            ImportStd(_) => {
+              return None;
+            },
+          }
+        }
+        k += 1;
+      },
+      IReExport(_) => {
+        k += 1;
+      },
+      _ => {},
+    }
+  }
+  return None;
+}
+
+// The target words of `@Annotation(..)` on `t`, or None when `t` is not an annotation definition.
+function targetsOf(t: TypeDecl): Option<string[]> {
+  const isRec = match (t.body) {
+    DRecord(_) => true,
+    _ => false,
+  };
+  if (!isRec) {
+    return None;
+  }
+  for (const a of t.annotations) {
+    match (a.kind) {
+      AAnnotation(ts) => {
+        let ws: string[] = [];
+        for (const w of ts) {
+          ws.push(w.name);
+        }
+        return Some(ws);
+      },
+      _ => {},
+    }
+  }
+  return None;
+}
+
+function recordFields(t: TypeDecl): FieldDecl[] {
+  return match (t.body) {
+    DRecord(fs) => fs,
+    _ => [],
+  };
+}
+
+function typeText(t: TypeExpr): string {
+  match (t.kind) {
+    TNamed(id, args) => {
+      if (args.length == 0) {
+        return id.name;
+      }
+      let xs: string[] = [];
+      for (const a of args) {
+        xs.push(typeText(a));
+      }
+      return id.name + "<" + xs.join(", ") + ">";
+    },
+    TArray(el) => {
+      return typeText(el) + "[]";
+    },
+    TFn(_, _) => {
+      return "a function type";
+    },
+  }
+}
+
+function isOptionType(t: TypeExpr): bool {
+  return match (t.kind) {
+    TNamed(id, args) => id.name == "Option" && args.length == 1,
+    _ => false,
+  };
+}
+
+// The payload-free union that the type names, as seen from unit `ui`.
+function tagUnion(prog: LoadedProgram, ui: usize, t: TypeExpr): Option<TypeDecl> {
+  match (t.kind) {
+    TNamed(id, args) => {
+      if (args.length > 0) {
+        return None;
+      }
+      const r = lookupDecl(prog, ui, id.name);
+      if (r.isNone()) {
+        return None;
+      }
+      match (r.unwrap().item) {
+        IType(d) => {
+          if (d.typeParams.length > 0 || variantsOf(d).length == 0) {
+            return None;
+          }
+          for (const v of variantsOf(d)) {
+            if (v.payload.length > 0) {
+              return None;
+            }
+          }
+          return Some(d);
+        },
+        _ => {
+          return None;
+        },
+      }
+    },
+    _ => {
+      return None;
+    },
+  }
+}
+
+function variantsOf(d: TypeDecl): VariantDecl[] {
+  return match (d.body) {
+    DUnion(vs) => vs,
+    _ => [],
+  };
+}
+
+function isScalarName(n: string): bool {
+  return n == "bool" || n == "int" || n == "usize" || n == "float" || n == "f32" || n == "string";
+}
+
+// bool, the numbers, string, or a payload-free union.
+function isScalarType(prog: LoadedProgram, ui: usize, t: TypeExpr): bool {
+  return match (t.kind) {
+    TNamed(id, args) => (args.length == 0 && isScalarName(id.name)) || tagUnion(prog, ui, t).isSome(),
+    _ => false,
+  };
+}
+
+function isScalarOrArray(prog: LoadedProgram, ui: usize, t: TypeExpr): bool {
+  return match (t.kind) {
+    TArray(el) => isScalarType(prog, ui, el),
+    _ => isScalarType(prog, ui, t),
+  };
+}
+
+function fieldTypeAllowed(prog: LoadedProgram, ui: usize, t: TypeExpr): bool {
+  if (isOptionType(t)) {
+    return match (t.kind) {
+      TNamed(_, args) => isScalarOrArray(prog, ui, args[0]),
+      _ => false,
+    };
+  }
+  return isScalarOrArray(prog, ui, t);
+}
+
+// E0446 for an annotation definition `t` declared in unit `ui`.
+function definitionDiags(prog: LoadedProgram, ui: usize, t: TypeDecl): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  if (t.typeParams.length > 0) {
+    out.push(diag("E0446", t.name.span, "annotation `" + t.name.name + "` must not be generic"));
+  }
+  for (const f of recordFields(t)) {
+    if (!fieldTypeAllowed(prog, ui, f.ty)) {
+      out.push(
+        diag(
+          "E0446",
+          f.ty.span,
+          "field `" + f.name.name + "` of annotation `" + t.name.name + "` has type `" + typeText(f.ty)
+              + "`, which an annotation cannot hold (allowed: bool, int, usize, float, f32, string, a union of tags, and "
+              + "arrays and `Option`s of those)",
+        ),
+      );
+    }
+  }
+  return out;
+}
+
+// The module `const` that the identifier `name` refers to in unit `ui`.
+function lookupConst(prog: LoadedProgram, ui: usize, name: string): Option<Res> {
+  const r = lookupDecl(prog, ui, name);
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap().item) {
+    IConst(_) => r,
+    _ => None,
+  };
+}
+
+function badArg(e: Expr, field: string, ty: TypeExpr): Option<Diagnostic> {
+  return Some(
+    diag(
+      "E0441",
+      e.span,
+      "argument for field `" + field + "` must be a constant of type `" + typeText(ty)
+          + "` (a literal, an array literal of constants, a tag of the field's union, or a module constant)",
+    ),
+  );
+}
+
+// `-x` is `x` for the purpose of checking a numeric literal.
+function stripNeg(e: Expr): Expr {
+  return match (e.kind) {
+    EUnary(op, x) => match (op) {
+      UNeg => x,
+      _ => e,
+    },
+    _ => e,
+  };
+}
+
+// None when `e` (written in unit `uu`) is a constant of type `ty` (as written in the definition's unit `du`); otherwise
+// the E0441 diagnostic. `depth` bounds chains of constants.
+function constErr(prog: LoadedProgram, du: usize, uu: usize, field: string, ty: TypeExpr, e: Expr, depth: usize): Option<Diagnostic> {
+  if (depth > 16) {
+    return Some(diag("E0441", e.span, "constant for field `" + field + "` is too deeply nested or cyclic"));
+  }
+  // `None`, a tag of the field's union, or a module constant.
+  match (e.kind) {
+    EIdent(id) => {
+      if (isOptionType(ty) && id.name == "None") {
+        return None;
+      }
+      const un = tagUnion(prog, du, ty);
+      if (un.isSome()) {
+        for (const v of variantsOf(un.unwrap())) {
+          if (v.name.name == id.name) {
+            return None;
+          }
+        }
+      }
+      const k = lookupConst(prog, uu, id.name);
+      if (k.isSome()) {
+        return match (k.unwrap().item) {
+          IConst(c) => constErr(prog, du, k.unwrap().unit, field, ty, c.value, depth + 1),
+          _ => badArg(e, field, ty),
+        };
+      }
+      return badArg(e, field, ty);
+    },
+    _ => {},
+  }
+  return constLiteralErr(prog, du, uu, field, ty, e, depth);
+}
+
+// The argument of `Some(x)`.
+function someArg(e: Expr): Option<Expr> {
+  return match (e.kind) {
+    ECall(callee, cargs) => match (callee.kind) {
+      EIdent(f) => f.name == "Some" && cargs.length == 1 ? Some(cargs[0]) : None,
+      _ => None,
+    },
+    _ => None,
+  };
+}
+
+// The first argument error among the elements `xs` of an array literal of element type `el`.
+function firstErr(prog: LoadedProgram, du: usize, uu: usize, field: string, el: TypeExpr, xs: Expr[], depth: usize): Option<Diagnostic> {
+  for (const x of xs) {
+    const r = constErr(prog, du, uu, field, el, x, depth);
+    if (r.isSome()) {
+      return r;
+    }
+  }
+  return None;
+}
+
+// `e` is not an identifier: it must be a literal or an array literal of the field's type.
+function constLiteralErr(prog: LoadedProgram, du: usize, uu: usize, field: string, ty: TypeExpr, e: Expr, depth: usize): Option<Diagnostic> {
+  return match (ty.kind) {
+    TArray(el) => match (e.kind) {
+      EArray(xs) => firstErr(prog, du, uu, field, el, xs, depth),
+      _ => badArg(e, field, ty),
+    },
+    TFn(_, _) => badArg(e, field, ty),
+    TNamed(id, targs) => {
+      if (id.name == "Option" && targs.length == 1) {
+        // `Some(c)`, or `c` itself.
+        const inner = someArg(e);
+        if (inner.isSome()) {
+          return constErr(prog, du, uu, field, targs[0], inner.unwrap(), depth);
+        }
+        return constErr(prog, du, uu, field, targs[0], e, depth);
+      }
+      if (id.name == "bool") {
+        return match (e.kind) {
+          EBool(_) => None,
+          _ => badArg(e, field, ty),
+        };
+      }
+      if (id.name == "string") {
+        return match (e.kind) {
+          EStr(_) => None,
+          _ => badArg(e, field, ty),
+        };
+      }
+      if (id.name == "int") {
+        return match (stripNeg(e).kind) {
+          EInt(_) => None,
+          EBigInt(_) => None,
+          _ => badArg(e, field, ty),
+        };
+      }
+      if (id.name == "usize") {
+        return match (e.kind) {
+          EInt(n) => n >= 0 ? None : badArg(e, field, ty),
+          _ => badArg(e, field, ty),
+        };
+      }
+      if (id.name == "float" || id.name == "f32") {
+        return match (stripNeg(e).kind) {
+          EFloat(_) => None,
+          _ => badArg(e, field, ty),
+        };
+      }
+      return badArg(e, field, ty);
+    },
+  };
+}
+
+// The number of arguments a use must at least have: the fields minus the trailing `Option` fields.
+function requiredArgs(fs: FieldDecl[]): usize {
+  let n = fs.length;
+  while (n > 0 && isOptionType(fs[n - 1].ty)) {
+    n -= 1;
+  }
+  return n;
+}
+
+// E0408, E0440, E0441 for one use of a user annotation written in unit `ui` on a declaration of kind `target`.
+function useDiags(prog: LoadedProgram, ui: usize, a: Annotation, id: Ident, args: Expr[], target: string): Diagnostic[] {
+  const r = lookupDecl(prog, ui, id.name);
+  if (r.isNone()) {
+    return [
+      diag(
+        "E0408",
+        a.span,
+        "unknown annotation `@" + id.name
+            + "`: it is neither a built-in annotation, a contract clause, nor an `@Annotation` record that is declared or "
+            + "imported in this module",
+      ),
+    ];
+  }
+  const def = r.unwrap();
+  const decl = match (def.item) {
+    IType(t) => Some(t),
+    _ => None,
+  };
+  if (decl.isNone() || targetsOf(decl.unwrap()).isNone()) {
+    return [
+      diag(
+        "E0408",
+        a.span,
+        "`" + id.name + "` is not an annotation: mark the record type with `@Annotation(targets..)` to use it as `@"
+            + id.name + "`",
+      ),
+    ];
+  }
+  const t = decl.unwrap();
+  const targets = targetsOf(t).unwrap();
+  let allowed = false;
+  for (const w of targets) {
+    if (w == target) {
+      allowed = true;
+    }
+  }
+  if (!allowed) {
+    return [
+      diag(
+        "E0440",
+        a.span,
+        "annotation `@" + id.name + "` cannot be applied to a " + target + " (it applies to: " + targets.join(", ") + ")",
+      ),
+    ];
+  }
+  const fs = recordFields(t);
+  if (args.length > fs.length) {
+    return [
+      diag(
+        "E0441",
+        args[fs.length].span,
+        "`@" + id.name + "` takes " + (fs.length == 0 ? "no arguments" : "at most " + fs.length.toString() + " argument(s)")
+            + " (its fields), found " + args.length.toString(),
+      ),
+    ];
+  }
+  const need = requiredArgs(fs);
+  if (args.length < need) {
+    return [
+      diag(
+        "E0441",
+        a.span,
+        "`@" + id.name + "` is missing the argument for field `" + fs[args.length].name.name
+            + "` (only trailing `Option` fields may be omitted)",
+      ),
+    ];
+  }
+  let out: Diagnostic[] = [];
+  let i: usize = 0;
+  while (i < args.length) {
+    const e = constErr(prog, def.unit, ui, fs[i].name.name, fs[i].ty, args[i], 0);
+    if (e.isSome()) {
+      out.push(e.unwrap());
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function annoDiags(prog: LoadedProgram, ui: usize, as: Annotation[], target: string): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        out = out.concat(useDiags(prog, ui, a, id, args, target));
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+function reservedDiag(id: Ident, what: string): Diagnostic[] {
+  if (isReservedAnnotationName(id.name)) {
+    return [
+      diag(
+        "E0447",
+        id.span,
+        "`" + id.name + "` is reserved for a built-in annotation or contract clause and cannot be " + what + " (ADR-0046)",
+      ),
+    ];
+  }
+  return [];
+}
+
+// E0447: an `@Annotation` definition whose name is reserved. Ordinary declarations, imports and type parameters
+// may use these names: `@Test`, `@Rule`, ... are decided by the parser before name resolution, so only an annotation
+// definition of such a name could be confused with a built-in.
+function reservedDiags(items: Item[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const it of items) {
+    match (it) {
+      IType(t) => {
+        if (isAnnotationDef(t.annotations)) {
+          out = out.concat(reservedDiag(t.name, "declared as an annotation"));
+        }
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+function isAnnotationDef(as: Annotation[]): bool {
+  for (const a of as) {
+    const d = match (a.kind) {
+      AAnnotation(_) => true,
+      _ => false
+    };
+    if (d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Whether any declaration of the module carries a user annotation or an `@Annotation` definition (a cheap pre-check).
+function usesAnnotations(items: Item[]): bool {
+  for (const it of items) {
+    match (it) {
+      IFunction(f) => {
+        if (f.annotations.length > 0) {
+          return true;
+        }
+      },
+      IType(t) => {
+        if (t.annotations.length > 0) {
+          return true;
+        }
+        for (const f of recordFields(t)) {
+          if (f.annotations.length > 0) {
+            return true;
+          }
+        }
+      },
+      IConst(k) => {
+        if (k.annotations.length > 0) {
+          return true;
+        }
+      },
+      IClass(c) => {
+        if (c.annotations.length > 0) {
+          return true;
+        }
+        for (const m of c.members) {
+          match (m) {
+            MField(f) => {
+              if (f.annotations.length > 0) {
+                return true;
+              }
+            },
+            MMethod(md) => {
+              if (md.annotations.length > 0) {
+                return true;
+              }
+            },
+            _ => {},
+          }
+        }
+      },
+      IInterface(i) => {
+        if (i.annotations.length > 0) {
+          return true;
+        }
+        for (const m of i.methods) {
+          if (m.annotations.length > 0) {
+            return true;
+          }
+        }
+      },
+      _ => {},
+    }
+  }
+  return false;
+}
+
+function unitDiags(prog: LoadedProgram, ui: usize): Diagnostic[] {
+  const items = prog.units[ui].ast.items;
+  let out = reservedDiags(items);
+  if (!usesAnnotations(items)) {
+    return out;
+  }
+  for (const it of items) {
+    match (it) {
+      IFunction(f) => {
+        out = out.concat(annoDiags(prog, ui, f.annotations, "function"));
+      },
+      IType(t) => {
+        if (targetsOf(t).isSome()) {
+          out = out.concat(definitionDiags(prog, ui, t));
+        }
+        out = out.concat(annoDiags(prog, ui, t.annotations, "type"));
+        for (const f of recordFields(t)) {
+          out = out.concat(annoDiags(prog, ui, f.annotations, "field"));
+        }
+      },
+      IConst(k) => {
+        out = out.concat(annoDiags(prog, ui, k.annotations, "const"));
+      },
+      IClass(c) => {
+        out = out.concat(annoDiags(prog, ui, c.annotations, "class"));
+        for (const m of c.members) {
+          match (m) {
+            MField(f) => {
+              out = out.concat(annoDiags(prog, ui, f.annotations, "field"));
+            },
+            MMethod(md) => {
+              out = out.concat(annoDiags(prog, ui, md.annotations, "method"));
+            },
+            MCtor(_) => {},
+          }
+        }
+      },
+      IInterface(i) => {
+        out = out.concat(annoDiags(prog, ui, i.annotations, "interface"));
+        for (const m of i.methods) {
+          out = out.concat(annoDiags(prog, ui, m.annotations, "method"));
+        }
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+// The diagnostics (E0408, E0440, E0441, E0446, E0447) of the user annotations of all user units, in unit order.
+export function userAnnotationDiags(prog: LoadedProgram): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  let ui: usize = 0;
+  while (ui < prog.units.length) {
+    if (!prog.units[ui].name.startsWith("$")) {
+      out = out.concat(unitDiags(prog, ui));
+    }
+    ui += 1;
+  }
+  return out;
+}
