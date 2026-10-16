@@ -12,8 +12,8 @@ import { args } from "std:process";
 import { assertEqUsize } from "std:test";
 import { forwardingOntoIndex } from "../../compiler/tests/emit_test";
 import { verify } from "../../compiler/verify";
-import { emitCFacts } from "../../compiler/cemit";
-import { emitLlvmFacts } from "../../compiler/llvm";
+import { emitCFacts } from "../../compiler/backends/c";
+import { emitLlvmFacts } from "../../compiler/backends/llvm";
 
 function main(host: Host): void {
   useProcess(host, proc => {

@@ -28,8 +28,8 @@ import {
   getBool, getArr, getPath, getPathStr, getPathInt, parseJson, stringifyJson, jsonEq,
 } from "../json";
 import {
-  Workspace, newWorkspace, analyze, Analysis, PathDiag, fileIndexOf, indexAvailable,
-  documentSymbols, readText, documentationAt, declCompletions, keywordCompletions,
+  Workspace, newWorkspace, AnalysisCache, newAnalysisCache, Analysis, PathDiag, fileIndexOf,
+  indexAvailable, documentSymbols, readText, documentationAt, declCompletions, keywordCompletions,
   builtinCompletions, CompletionItem, DkLocal, posToOffset, definitionAt, hoverAt, referencesTo,
   renameEdits, implementationsAt, symbolSpanAt, symbolAt, TextEdit, effectsContext, isFunctionDef,
   hoverEffectText, defIdsDense,
@@ -136,6 +136,8 @@ type LDiag = { path: string; key: string; json: Json; };
 @Invariant(noDuplicates(this.published))
 export class LspServer {
   ws: Workspace = newWorkspace();
+  // Analyses of the open documents at the current workspace revision (analysis/cache.or); cleared on save and close.
+  cache: AnalysisCache = newAnalysisCache(64);
   inited: bool = false; // `initialize` received
   shutdownRequested: bool = false;
   exited: bool = false; // `exit` received
@@ -323,12 +325,19 @@ export class LspServer {
       if (normalizePath(o) == me) {
         continue;
       }
-      const a = analyze(fs, this.ws, o);
+      const a = this.cache.analyze(fs, this.ws, o);
       if (a.index.isSome() && fileIndexOf(a, path).isSome()) {
         return a;
       }
     }
-    return analyze(fs, this.ws, path);
+    return this.cache.analyze(fs, this.ws, path);
+  }
+
+  private analysisFor(fs: FsGrant, path: string, wide: bool): Analysis {
+    if (wide) {
+      return this.wideAnalysis(fs, path);
+    }
+    return this.cache.analyze(fs, this.ws, path);
   }
 
   // Analysis of the document, its semantic index and the cursor offset. None when the index is
@@ -344,7 +353,7 @@ export class LspServer {
     if (p.isNone() || line.isNone() || ch.isNone() || line.unwrap() < 0 || ch.unwrap() < 0) {
       return None;
     }
-    const a = wide ? this.wideAnalysis(fs, p.unwrap()) : analyze(fs, this.ws, p.unwrap());
+    const a = this.analysisFor(fs, p.unwrap(), wide);
     let idx: Option<SemanticIndex> = a.index;
     if (this.testIndex.isSome()) {
       idx = this.testIndex;
@@ -529,6 +538,7 @@ export class LspServer {
       return this.republish(fs, []);
     }
     if (method == "textDocument/didSave") {
+      this.cache.clear(); // the disk may have changed under the files that are not open
       return this.republish(fs, []);
     }
     if (method == "textDocument/didClose") {
@@ -537,9 +547,35 @@ export class LspServer {
         return [];
       }
       this.ws.close(p.unwrap());
+      this.cache.clear();
       return this.republish(fs, [p.unwrap()]);
     }
+    if (method == "workspace/didChangeWatchedFiles") {
+      this.cache.clear();
+      return [];
+    }
     return []; // initialized, $/cancelRequest, workspace/*, ... are ignored
+  }
+
+  // Diagnostics of all open documents (each analysed as its own entry), de-duplicated.
+  private collectDiags(fs: FsGrant): LDiag[] {
+    let out: LDiag[] = [];
+    let keys: string[] = [];
+    for (const entry of this.ws.paths()) {
+      const a = this.cache.analyze(fs, this.ws, entry);
+      for (const d of a.diags.concat(a.warnings)) {
+        const key = d.path + "|" + d.code + "|" + d.start.toString() + "|" + d.end.toString() + "|"
+            + d.message;
+        if (keys.includes(key)) {
+          continue;
+        }
+        const fi = fileIndexOf(a, d.path);
+        const text = fi.isSome() ? a.sm.files[fi.unwrap()].text : "";
+        keys.push(key);
+        out.push(LDiag { path: d.path, key: key, json: diagnosticJson(text, d) });
+      }
+    }
+    return out;
   }
 
   // Recompute diagnostics and publish them for: every open document, every file that has
@@ -547,7 +583,7 @@ export class LspServer {
   // that was just closed, so its markers are cleared).
   @Ensures(result.length >= old(this.published.length) && result.length >= this.published.length)
   private republish(fs: FsGrant, extra: string[]): Json[] {
-    const all = collectDiags(fs, this.ws);
+    const all = this.collectDiags(fs);
     let targets: string[] = [];
     for (const p of this.ws.paths()) {
       targets = addUnique(targets, p);
@@ -675,27 +711,6 @@ function editsByFile(a: Analysis, edits: TextEdit[]): JField[] {
   return changes;
 }
 
-// Diagnostics of all open documents (each analysed as its own entry), de-duplicated.
-function collectDiags(fs: FsGrant, ws: Workspace): LDiag[] {
-  let out: LDiag[] = [];
-  let keys: string[] = [];
-  for (const entry of ws.paths()) {
-    const a = analyze(fs, ws, entry);
-    for (const d of a.diags.concat(a.warnings)) {
-      const key = d.path + "|" + d.code + "|" + d.start.toString() + "|" + d.end.toString() + "|"
-          + d.message;
-      if (keys.includes(key)) {
-        continue;
-      }
-      const fi = fileIndexOf(a, d.path);
-      const text = fi.isSome() ? a.sm.files[fi.unwrap()].text : "";
-      keys.push(key);
-      out.push(LDiag { path: d.path, key: key, json: diagnosticJson(text, d) });
-    }
-  }
-  return out;
-}
-
 // ---- the functional interface ---------------------------------------------------------------
 
 export type LspStep = { state: LspServer; out: Json[]; };
@@ -710,6 +725,15 @@ export function withTestIndex(st: LspServer, idx: SemanticIndex): LspServer {
   let s = st;
   s.testIndex = Some(idx);
   return s;
+}
+
+// How many analyses the session answered from its cache / by running them (tests, benchmarks).
+export function lspCacheHits(st: LspServer): usize {
+  return st.cache.hits;
+}
+
+export function lspCacheMisses(st: LspServer): usize {
+  return st.cache.misses;
 }
 
 // Process exit code once `exit` was received: 0 after a prior `shutdown`, else 1.

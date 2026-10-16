@@ -29,7 +29,7 @@ import { lower } from "../lower";
 import { optimize } from "../opt";
 import { fuseProgram } from "../fuse";
 import { verify } from "../verify";
-import { emitC } from "../cemit";
+import { emitC } from "../backends/c";
 import { readFile, writeFile, exists } from "std:fs";
 import { shellRun, shellRunTimeout, readOr, addUnique, shq, trunc } from "../util";
 import {
@@ -359,25 +359,6 @@ function toolDiff(fs: FsGrant, st: McpSession, args: Json): ToolOut {
   return ToolOut { st: st, text: text, err: false };
 }
 
-// ---- analysis helper -----------------------------------------------------------------------
-
-// Analyse the project rooted at `entryRel` (disk contents; the entry goes through the overlay so
-// a library entry gets the synthetic `main`, exactly as in the language server).
-function analyzeEntry(fs: FsGrant, st: McpSession, entryRel: string): Result<Analysis, string> {
-  const p = resolvePath(st, entryRel)?;
-  const t = readFile(fs, p);
-  if (t.isErr()) {
-    return Err("cannot read " + entryRel);
-  }
-  const ws = openFile(newWorkspace(), p, t.unwrap());
-  const a = analyze(fs, ws, p);
-  const bad = checkAllInside(st, a);
-  if (bad.isSome()) {
-    return Err(bad.unwrap());
-  }
-  return Ok(a);
-}
-
 // ---- check ---------------------------------------------------------------------------------
 
 function indexIn(keys: string[], k: string): bool {
@@ -391,12 +372,13 @@ function view(d: DiagView, detailed: bool): Json {
   return JStr(compactLine(d));
 }
 
-function toolCheck(fs: FsGrant, st: McpSession, args: Json): ToolOut {
+function toolCheck(fs: FsGrant, st0: McpSession, args: Json): ToolOut {
+  let st = st0; // the analysis cache of the session is updated by `analyzeEntry`
   const entry = getStr(args, "entry");
   if (entry.isNone()) {
     return fail(st, "missing required argument: entry");
   }
-  const ar = analyzeEntry(fs, st, entry.unwrap());
+  const ar = st.analyzeEntry(fs, entry.unwrap());
   if (ar.isErr()) {
     return fail(st, ar.unwrapErr());
   }
@@ -613,7 +595,8 @@ function importName(a: Analysis, t: ImportTarget): string {
 
 // ---- inspect -------------------------------------------------------------------------------
 
-function toolInspect(fs: FsGrant, st: McpSession, args: Json): ToolOut {
+function toolInspect(fs: FsGrant, st0: McpSession, args: Json): ToolOut {
+  let st = st0; // the analysis cache of the session is updated by `analyzeEntry`
   const includeSource = getBool(args, "includeSource").unwrapOr(false);
   const sym = getStr(args, "symbol");
   const mod = getStr(args, "module");
@@ -634,7 +617,7 @@ function toolInspect(fs: FsGrant, st: McpSession, args: Json): ToolOut {
       "give one of: symbol (with entry for project symbols), module, or file+position",
     );
   }
-  const ar = analyzeEntry(fs, st, entry.unwrap());
+  const ar = st.analyzeEntry(fs, entry.unwrap());
   if (ar.isErr()) {
     return fail(st, ar.unwrapErr());
   }
@@ -888,7 +871,8 @@ function applyEdits(text: string, es: TextEdit[]): string {
   return t;
 }
 
-function toolEdit(fs: FsGrant, st: McpSession, args: Json): ToolOut {
+function toolEdit(fs: FsGrant, st0: McpSession, args: Json): ToolOut {
+  let st = st0; // the analysis cache of the session is updated by `analyzeEntry`
   const kind = getStr(args, "kind").unwrapOr("");
   if (kind != "rename") {
     return fail(st, "unsupported edit kind (supported: rename)");
@@ -908,7 +892,7 @@ function toolEdit(fs: FsGrant, st: McpSession, args: Json): ToolOut {
     return fail(st, fp.unwrapErr());
   }
   const entry = getStr(args, "entry").unwrapOr(file.unwrap());
-  const ar = analyzeEntry(fs, st, entry);
+  const ar = st.analyzeEntry(fs, entry);
   if (ar.isErr()) {
     return fail(st, ar.unwrapErr());
   }
