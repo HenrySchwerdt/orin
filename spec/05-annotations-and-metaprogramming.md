@@ -47,7 +47,7 @@ Parse -> name resolution -> annotation collection -> bounded expansion -> re-res
 
 ## OPEN
 
-**Resolved by [ADR-0046](../docs/decisions/0046-typed-annotation-processors.md) (2026-10-16, accepted, not yet implemented):** definitions are record types marked `@Annotation(targets)`, uses take constant positional arguments, retention is compile-time only, processors are verified-pure Orin functions marked `@Processor(A)` run out of process without grants, output goes into a companion module `<module>.gen` that is re-checked like user code. The paragraph below is the original open list.
+**Resolved by [ADR-0046](../docs/decisions/0046-typed-annotation-processors.md) (2026-10-16, accepted; slice S1, definitions and uses as checked metadata, is implemented, processors are not):** definitions are record types marked `@Annotation(targets)`, uses take constant positional arguments, retention is compile-time only, processors are verified-pure Orin functions marked `@Processor(A)` run out of process without grants, output goes into a companion module `<module>.gen` that is re-checked like user code. The paragraph below is the original open list.
 
 
 Exact annotation-definition syntax, metadata retention policies, hygienic symbol generation, plugin distribution/permissions, evaluation order and interaction with generic specialization remain unresolved. `@Get`, `@Service`, etc. are framework conventions built atop the annotation mechanism, NOT all mandatory compiler keywords.

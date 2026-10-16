@@ -546,6 +546,39 @@ export function runLsp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, tm
   s.check(fs, cnt(at(changes, [uriOf(glib)])) == 1 && cnt(at(changes, [uriOf(gmain)])) == 1,
     "generic classes: rename method in both files (" + countsOf(changes) + ")");
 
+  // ---- analysis cache: requests after an edit / a save / a change on disk never see stale analyses -------------------
+  // (in tmp itself as cachelib.or / cachemain.or: std:fs has no mkdir; the test is the same)
+  const cacheLib = tmp + "/cachelib.or";
+  const cacheMain = tmp + "/cachemain.or";
+  const cacheLibText = "export function g(x: int): int {\n  return x;\n}\n";
+  const cacheMainText = "import { g } from \"./cachelib\";\nfunction main(): void {\n  const n: int = g(1);\n}\n";
+  write(fs, cacheLib, cacheLibText);
+  openDoc(s, fs, p, cacheMain, cacheMainText, 1);
+  const gpos = posOf(cacheMainText, "g(1)", 0, 0);
+  const h1 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h1.includes("function g(x: int): int"), "cache: hover on an import from a file that is not open (" + h1 + ")");
+  s.check(fs, show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"])) == h1,
+    "cache: the same hover twice gives the same answer");
+  // the imported file changes on disk and is saved: the next hover sees it
+  write(fs, cacheLib, replaceAll(cacheLibText, "(x: int): int {\n  return x;", "(x: int): string {\n  return \"s\";"));
+  s.notify(fs, p, "textDocument/didSave", O([F("textDocument", O([F("uri", S(uriOf(cacheMain)))]))]));
+  const h2 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h2.includes("function g(x: int): string"), "cache: hover after the imported file changed on disk and didSave (" + h2 + ")");
+  // and without a save notification the content check still notices a change on disk
+  write(fs, cacheLib, cacheLibText);
+  const h3 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h3 == h1, "cache: hover after the file changed back on disk (" + h3 + ")");
+  // didChange of the open document, then hover
+  changeDoc(s, fs, p, cacheMain, replaceAll(cacheMainText, "g(1)", "g(2)") + "\n", 2);
+  const h4 = show(at(s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, gpos)), ["result"]));
+  s.check(fs, h4 == h1, "cache: hover after didChange of the open document");
+  const newMain = replaceAll(cacheMainText, "const n: int = g(1);", "const n: string = \"s\";");
+  changeDoc(s, fs, p, cacheMain, newMain, 3);
+  r = s.lspRequest(fs, p, "textDocument/hover", td(cacheMain, posOf(newMain, "n:", 0, 0)));
+  s.check(fs, show(at(r, ["result"])).includes("const n: string"), "cache: hover sees the new local type after didChange (" + show(at(r, ["result"])) + ")");
+  s.notify(fs, p, "textDocument/didClose", O([F("textDocument", O([F("uri", S(uriOf(cacheMain)))]))]));
+  sync(s, fs, p, uriOf(cacheMain));
+
   // ---- shutdown / exit --------------------------------------------------------------------
   r = s.lspRequest(fs, p, "shutdown", nil());
   s.check(fs, has(r, "result") && isNull(at(r, ["result"])) && !has(r, "error"), "shutdown: null result");

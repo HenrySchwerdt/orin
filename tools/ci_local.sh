@@ -18,6 +18,7 @@ step "diff builtins"           tools/differential.sh --mode builtins
 step "diff opt"                tools/differential.sh --mode opt
 step "diff fuse"               tools/differential.sh --mode fuse
 step "formatter"               python3 tools/test_fmt.py
+step "thread-count equality"   python3 tools/test_threads.py
 step "tooling"                 ./tools/test_tooling.sh
 step "protocol harness (unit)" tools/protocol.sh --unit-tests
 step "lsp"                     tools/protocol.sh lsp

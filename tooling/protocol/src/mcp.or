@@ -171,6 +171,24 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   v = t.value;
   s.check(fs, isIntEq(at(v, ["errors"]), 0), "main still valid");
 
+  // ---- analysis cache: repeated calls agree; a file that main.or imports changing on disk is never served stale ----------
+  const inspectDouble = O([F("symbol", S("double")), F("entry", S("main.or"))]);
+  const i1 = s.mcpCall(fs, p, "inspect", inspectDouble);
+  const i2 = s.mcpCall(fs, p, "inspect", inspectDouble);
+  s.check(fs, !i2.err && i1.raw == i2.raw, "repeated inspect gives the same answer (" + i2.raw + ")");
+  writeFile(fs, proj + "/lib.or", replaceAll(libText(), "return n * 2;", "return \"two\";"));
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("main.or"))]));
+  s.check(fs, !t.err && has(t.value, "errors") && !isIntEq(at(t.value, ["errors"]), 0),
+    "imported file changed on disk: the next check sees its error (" + t.raw + ")");
+  writeFile(fs, proj + "/lib.or", replaceAll(libText(), "export function double(n: int): int", "export function double(n: int, m: int): int"));
+  t = s.mcpCall(fs, p, "inspect", inspectDouble);
+  s.check(fs, !t.err && t.raw.includes("m: int"), "inspect after an imported file changed on disk sees the new signature (" + t.raw + ")");
+  writeFile(fs, proj + "/lib.or", libText());
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("main.or"))]));
+  s.check(fs, !t.err && isIntEq(at(t.value, ["errors"]), 0), "restored file: clean again (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", inspectDouble);
+  s.check(fs, !t.err && t.raw == i1.raw, "restored file: inspect as before (" + t.raw + ")");
+
   // ---- delta across an edit ---------------------------------------------------------------
   writeFile(fs, proj + "/bad.or", replaceAll(BAD, "const a: int = \"x\";", "const a: int = 1;"));
   t = s.mcpCall(fs, p, "check", O([F("entry", S("bad.or")), F("sinceRevision", revBad)]));
