@@ -373,9 +373,10 @@ other and sizes add up).
 
 ### Limitations of this layer (language friction, honest list)
 
-* `Map<K, V>` needs a *concrete* key type (`int`, `usize`, `bool`, `string`; E0400 for a type parameter) and a type
-  parameter has no `==`, `<` or hash (E0410). So there is no generic `Set<T>` or `SortedMap<K, V>`: the sets and maps are
-  specialised by key class (`IntSet`/`StringSet`, `SortedMap<V>`/`SortedStringMap<V>`); `Deque<T>`, the values `V` and the
+* `Map<K, V>` accepts any `Hash` key (ADR-0034, slice 1: integers, `bool`, `string`, records, unions, `Option`, `Result`, arrays and
+  classes with `hash`; a key type parameter is `K extends Hash`). The std collections are not generic over the key yet: `Set<T>`,
+  `SortedMap<K extends Ord, V>` and `PriorityQueue<T extends Ord>` (ADR-0034 §Consequences) are the next slice, so for now the sets and
+  maps are specialised by key class (`IntSet`/`StringSet`, `SortedMap<V>`/`SortedStringMap<V>`); `Deque<T>`, the values `V` and the
   queue elements `T` are generic.
 * The same missing `==` on type parameters means the contracts of the generic containers cannot say "the value that
   comes back is the one that was put in" (`get` after `put`, the popped element is the pushed one); they state sizes,
@@ -385,7 +386,8 @@ other and sizes add up).
   invariant: `PriorityQueue<T>` takes an explicit `int` priority until the Eq/Ord ADR lands. A `T extends Ranked`
   interface would do for ordered classes, but cannot cover `int`/`string` without wrapper classes.
 * **Tooling gaps found while applying the algorithm rule** (feed ADR-0031 A and the Eq/Ord/Hash constraints ADR):
-  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`): no generic `Set<T>`, `SortedMap<K, V>`,
+  1. no equality/ordering/hash on type parameters (E0410, E0400 for `Map<K, _>`; **fixed in the language by ADR-0034 slice 1,
+     `T extends Eq/Ord/Hash`; the std is not rewritten on it yet**): no generic `Set<T>`, `SortedMap<K, V>`,
      comparator queue; the B-tree needed a code generator to exist for two key types; contracts cannot say "the same
      value comes back";
   2. no uninitialised or default value for a type parameter (a `MaybeUninit`/`default<T>()` or a `T[]` with capacity):

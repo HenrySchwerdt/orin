@@ -30,8 +30,10 @@ import {
 } from "./env";
 import { checkBounds, internVtable } from "./ifaces";
 import {
-  classOfRec, classOfGeneric, findMethod, fieldIsPrivate, recordImplements,
+  classOfRec, classOfGeneric, findMethod, fieldIsPrivate, recordImplements, mapKeyError,
 } from "./classes";
+import { cmpOperator, cmpMethodKind, cmpMethodApplies, cmpMethodExpr, opCmpKind, isCompositeTy } from "./cmpexpr";
+import { eqFunc, hashFunc } from "./derive";
 import { FnCtx, newClosureCtx } from "./fnctx";
 import { builtinSig, methodSig, grantNeeded } from "./builtins";
 import { hasResource } from "./resources";
@@ -1634,14 +1636,17 @@ export class ExprChecker {
   }
 
   // The operands of a binary operator; an untyped literal side takes the type of the other.
-  private operands(lhs: Expr, rhs: Expr, hint: Option<Type>): Result<Pair, Diagnostic> {
+  private operands(lhs: Expr, rhs: Expr, hint: Option<Type>, cmp: bool): Result<Pair, Diagnostic> {
     if (untypedInt(lhs) && !untypedInt(rhs)) {
       const r = this.ex(rhs, hint)?;
       const l = this.ex(lhs, hintOf(r.ty))?;
       return Ok(Pair { l: l, r: r });
     }
     const l = this.ex(lhs, hint)?;
-    const h: Option<Type> = untypedInt(rhs) ? hintOf(l.ty) : None;
+    let h: Option<Type> = untypedInt(rhs) ? hintOf(l.ty) : None;
+    if (cmp && h.isNone() && isCompositeTy(l.ty)) {
+      h = Some(l.ty);   // `xs == []`, `o == None`, `l == Cons(1, Nil)` (ADR-0034): the right side takes the type of the left
+    }
     const r = this.ex(rhs, h)?;
     return Ok(Pair { l: l, r: r });
   }
@@ -1697,7 +1702,12 @@ export class ExprChecker {
       return Ok(mk(XBinary(hop, l, r), TyBool, span));
     }
     const hint: Option<Type> = isArithOp(op) ? intishHint(exp) : None;
-    const p = this.operands(lhs, rhs, hint)?;
+    const p = this.operands(lhs, rhs, hint, opCmpKind(op) > 0)?;
+    const cmpo = cmpOperator(this.fx, op, p.l, p.r, span)?;
+    if (cmpo.isSome()) {
+      this.fx.adopt(cmpo.unwrap().env);
+      return Ok(cmpo.unwrap().e);
+    }
     const rt = binaryType(this.fx.env, op, p.l.ty, p.r.ty, span)?;
     return Ok(mk(XBinary(hop, p.l, p.r), rt, span));
   }
@@ -2834,11 +2844,38 @@ export class ExprChecker {
     }
     let fid: usize = 0;
     if (!this.fx.abs) {
-      const fo = instFunc(this.fx.env, g, io.tys, this.fx.depth + 1, span)?;
-      this.fx.adopt(fo.env);
-      fid = fo.fid;
+      const kr = this.keyRedirect(g, io.tys, span)?;
+      if (kr.isSome()) {
+        fid = kr.unwrap();
+      } else {
+        const fo = instFunc(this.fx.env, g, io.tys, this.fx.depth + 1, span)?;
+        this.fx.adopt(fo.env);
+        fid = fo.fid;
+      }
     }
     return Ok(mk(XCall(fid, io.args), ret, span));
+  }
+
+  // `keyHash<K>` / `keyEq<K>` of the Map prelude for a key type that is not a scalar (ADR-0034): the derived (or, for a class, the
+  // explicit) `hash` / `equals`. The scalar keys are redirected to `hashInt`, `eqStr`, ... by `instFunc`. None: not a key function.
+  private keyRedirect(g: usize, tys: Type[], span: Span): Result<Option<usize>, Diagnostic> {
+    const q = this.fx.env.gfuncs[g].qname;
+    const none: Option<usize> = None;
+    if (q != "$array/map.keyHash" && q != "$array/map.keyEq" || tys.length != 1 || isMapKeyType(tys[0])) {
+      return Ok(none);
+    }
+    const bad = mapKeyError(this.fx.env, tys[0], true, span);
+    if (bad.isSome()) {
+      return Err(bad.unwrap());
+    }
+    if (q == "$array/map.keyHash") {
+      const o = hashFunc(this.fx.env, tys[0], this.fx.unit, this.fx.depth, span)?;
+      this.fx.adopt(o.env);
+      return Ok(Some(o.fid));
+    }
+    const o = eqFunc(this.fx.env, tys[0], this.fx.unit, this.fx.depth, span)?;
+    this.fx.adopt(o.env);
+    return Ok(Some(o.fid));
   }
 
   @Ensures(result.isOk() ==> isUnionTy(result.unwrap().ty))
@@ -3268,6 +3305,15 @@ export class ExprChecker {
     const bo = this.ex(base, None);
     if (bo.isOk()) {
       const b0 = bo.unwrap();
+      // `equals` / `compare` / `hash` of an `Eq` / `Ord` / `Hash` type (ADR-0034)
+      const ck = cmpMethodKind(n);
+      if (ck > 0 && cmpMethodApplies(this.fx, b0.ty, ck)) {
+        const cps: Type[] = ck == 3 ? [] : [b0.ty];
+        const ca = this.argsExpect(span, "method `" + n + "`", args, cps)?;
+        const cm = cmpMethodExpr(this.fx, ck, b0, ca, span)?;
+        this.fx.adopt(cm.env);
+        return Ok(cm.e);
+      }
       match (b0.ty) {
         TyRecord(r) => {
           const po = parOrigin(this.fx.env, b0.ty);
@@ -4417,8 +4463,9 @@ export class ExprChecker {
     } else {
       return Err(diag("E0400", span, "`Map` takes exactly two type arguments"));
     }
-    if (!isMapKeyType(kt)) {
-      return Err(mapKeyErr(this.fx.env, span, kt));
+    const keyBad = mapKeyError(this.fx.env, kt, true, span);
+    if (keyBad.isSome()) {
+      return Err(keyBad.unwrap());
     }
     const gm = mapGenType(this.fx.env, "Map").unwrap();
     const inst = instType(this.fx.env, gm, [kt, vt], 0, span)?;
