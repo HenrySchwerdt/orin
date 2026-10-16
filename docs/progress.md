@@ -70,6 +70,8 @@ ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 5. After the ADR-0047 layout move and the escape-analysis work: unify the std API per
    [ADR-0048](decisions/0048-std-api-conventions.md) and clean up and parallelise the compiler per
    [ADR-0049](decisions/0049-compiler-cleanup-and-parallel-compilation.md); evidence in [`audits/`](audits).
+   Row 13 (sharing decision) is done: the program is lent read-only to the workers via a new `std:task` `forkJoinLent`
+   (row 13a), then the parallel verifier (row 14) and optimiser/emitter (row 15); see the ADR's addendum for measurements.
 
 ## Open work and decision gates (performance history retained)
 Merged 2026-10-15: unboxing (#62, MIR v2.2), packed verifier state (#64), census quick wins (#65), borrow inference (#67),
