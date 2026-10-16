@@ -822,6 +822,7 @@ export class LlvmFunctionEmitter {
       },
       BF32ToFloat => R { text: "", val: a0 },
       BIntId => R { text: "", val: a0 },
+      BCore(k) => this.coreR(p, k, args),
       BFloatFloor => R {
         text: "  " + r + " = call double @llvm.floor.f64(double " + a0 + ")\n",
         val: r,
@@ -860,6 +861,72 @@ export class LlvmFunctionEmitter {
       },
       _ => this.unwrapOrR(p, a0, args[1], rt),
     };
+  }
+
+  // The core operations (hir/coreops.or): the same behaviour as cemit's `coreC`. Loads and stores are unaligned
+  // (`align 1`); allocation maps `n == 0` to one byte like orin_platform_alloc and calls libc malloc / free, copy and set
+  // use the LLVM memory intrinsics (the L0 functions are static inline in a C header, so there is no symbol to call).
+  private coreR(p: string, k: usize, args: Operand[]): R {
+    const a0 = ov(p, 0, args[0]);
+    const r = p + "r";
+    const q = p + "q";
+    const ptr0 = "  " + q + " = inttoptr i64 " + a0 + " to ptr\n";
+    if (k <= 2) {
+      const ty = k == 0 ? "i8" : k == 1 ? "i32" : "i64";
+      if (k == 2) {
+        return R { text: ptr0 + "  " + r + " = load i64, ptr " + q + ", align 1\n", val: r };
+      }
+      return R {
+        text: ptr0 + "  " + p + "v = load " + ty + ", ptr " + q + ", align 1\n  " + r + " = zext " + ty + " " + p
+            + "v to i64\n",
+        val: r,
+      };
+    }
+    if (k == 3) {
+      return R { text: ptr0 + "  " + r + " = load double, ptr " + q + ", align 1\n", val: r };
+    }
+    if (k >= 4 && k <= 7) {
+      const v = ov(p, 1, args[1]);
+      if (k == 6 || k == 7) {
+        return R {
+          text: ptr0 + "  store " + (k == 7 ? "double" : "i64") + " " + v + ", ptr " + q + ", align 1\n",
+          val: "",
+        };
+      }
+      const ty = k == 4 ? "i8" : "i32";
+      return R {
+        text: ptr0 + "  " + p + "t = trunc i64 " + v + " to " + ty + "\n  store " + ty + " " + p + "t, ptr " + q
+            + ", align 1\n",
+        val: "",
+      };
+    }
+    if (k == 8) {
+      return R {
+        text: "  " + p + "z = icmp eq i64 " + a0 + ", 0\n  " + p + "n = select i1 " + p + "z, i64 1, i64 " + a0 + "\n  "
+            + p + "m = call ptr @malloc(i64 " + p + "n)\n  " + r + " = ptrtoint ptr " + p + "m to i64\n",
+        val: r,
+      };
+    }
+    if (k == 9) {
+      return R { text: ptr0 + "  call void @free(ptr " + q + ")\n", val: "" };
+    }
+    if (k == 10 || k == 11) {
+      const a1 = ov(p, 1, args[1]);
+      const n = ov(p, 2, args[2]);
+      if (k == 10) {
+        return R {
+          text: ptr0 + "  " + p + "s = inttoptr i64 " + a1 + " to ptr\n  call void @llvm.memcpy.p0.p0.i64(ptr " + q
+              + ", ptr " + p + "s, i64 " + n + ", i1 false)\n",
+          val: "",
+        };
+      }
+      return R {
+        text: ptr0 + "  " + p + "t = trunc i64 " + a1 + " to i8\n  call void @llvm.memset.p0.i64(ptr " + q + ", i8 " + p
+            + "t, i64 " + n + ", i1 false)\n",
+        val: "",
+      };
+    }
+    return R { text: "  " + r + " = ptrtoint ptr " + a0 + " to i64\n", val: r };
   }
 
   private unwrapOrR(p: string, a0: string, dflt: Operand, rt: MType): R {
