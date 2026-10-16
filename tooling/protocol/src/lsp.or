@@ -373,6 +373,53 @@ export function runLsp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, tm
   s.check(fs, len(d) == 1 && isStrEq(at(d, ["0", "code"]), "E0432") && eq(at(d, ["0", "range", "start"]), pj(posOf(tplBad, "p}`", 0, 0))),
     "template: diagnostic E0432 on an interpolated record, located at the expression (got " + show(d) + ")");
 
+  // ---- user annotations (ADR-0046 S2): a use is a reference to its @Annotation record ---------------
+  const alib = tmp + "/alib.or";
+  const amain = tmp + "/amain.or";
+  const alibText = "export type Verb = Get | Post;\n\n"
+    + "@Annotation(function, method, field)\nexport type Route = { path: string; verb: Verb; };\n";
+  const amainText = "import { Route, Verb } from \"./alib\";\n\n"
+    + "class Api {\n  @Route(\"/n\", Get) n: int = 0;\n"
+    + "  @Route(\"/c\", Post)\n  call(): int {\n    return this.n;\n  }\n}\n\n"
+    + "@Route(\"/users/:id\", Get)\nfunction find(id: int): int {\n  return id;\n}\n\n"
+    + "function main(): void {\n  console.log(find(new Api().call()).toString());\n}\n";
+  openDoc(s, fs, p, alib, alibText, 1);
+  openDoc(s, fs, p, amain, amainText, 1);
+  d = sync(s, fs, p, uriOf(amain));
+  s.check(fs, eq(d, A([])), "annotations: no diagnostics (got " + show(d) + ")");
+  const useFind = posOf(amainText, "Route(\"/users", 0, 0);
+  r = s.lspRequest(fs, p, "textDocument/definition", td(amain, useFind));
+  locs = asLocs(at(r, ["result"]));
+  s.check(fs, locs.length == 1 && isLoc(locs[0], uriOf(alib), posOf(alibText, "Route =", 0, 0)),
+    "annotations: go to definition of a use is the @Annotation record (got " + show(A(locs)) + ")");
+  locs = items(at(s.lspRequest(fs, p, "textDocument/references", tdRefs(alib, posOf(alibText, "Route =", 0, 0), true)), ["result"]));
+  let inMain = 0;
+  for (const l of locs) {
+    if (isStrEq(at(l, ["uri"]), uriOf(amain))) {
+      inMain += 1;
+    }
+  }
+  s.check(fs, locs.length == 5 && inMain == 4,
+    "annotations: references of the record are the import and the 3 uses (got " + inMain.toString() + " in main, " + locs.length.toString() + " in all)");
+  hv = hoverAt(s, fs, p, amain, useFind);
+  s.check(fs, hv.includes("@Annotation(function, method, field)") && hv.includes("type Route = { path: string; verb: Verb }"),
+    "annotations: hover on the annotation name shows the definition (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, amain, posOf(amainText, "find(id", 0, 0));
+  s.check(fs, hv.includes("@Route(\"/users/:id\", Get)") && hv.includes("function find(id: int): int"),
+    "annotations: hover on a declaration shows its annotations with their arguments (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, amain, posOf(amainText, "call()", 0, 0));
+  s.check(fs, hv.includes("@Route(\"/c\", Post)"), "annotations: hover on a method shows its annotation (got " + reprStr(hv) + ")");
+  hv = hoverAt(s, fs, p, amain, posOf(amainText, "n: int", 0, 0));
+  s.check(fs, hv.includes("@Route(\"/n\", Get)"), "annotations: hover on a field shows its annotation (got " + reprStr(hv) + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(alib, posOf(alibText, "Route =", 0, 0), "Endpoint"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(alib)])) == 1 && cnt(at(changes, [uriOf(amain)])) == 4 && allNewText(changes, "Endpoint"),
+    "annotations: rename of the record renames the import and every use (got " + countsOf(changes) + ")");
+  r = s.lspRequest(fs, p, "textDocument/rename", tdName(amain, useFind, "Endpoint"));
+  changes = at(r, ["result", "changes"]);
+  s.check(fs, cnt(at(changes, [uriOf(alib)])) == 1 && cnt(at(changes, [uriOf(amain)])) == 4,
+    "annotations: rename from a use renames the definition too (got " + countsOf(changes) + ")");
+
   // ---- contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses ----
   const kc = tmp + "/contracts.or";
   const kcGood = "@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int {\n  return a;\n}\n\n"

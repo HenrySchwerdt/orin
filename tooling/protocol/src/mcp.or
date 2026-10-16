@@ -12,7 +12,7 @@ import { Json, JNum, parse } from "std:json";
 import { Session, ToolResult } from "./session";
 import { replaceAll, shq, sortedStrs, reprStr } from "./text";
 import {
-  S, N, B, A, O, F, nil, at, has, isNull, isStrEq, isIntEq, isBoolEq, str, items, len, strs, keysOf, eq, show,
+  S, N, B, A, O, F, SA, nil, at, has, isNull, isStrEq, isIntEq, isBoolEq, str, items, len, strs, keysOf, eq, show,
   containsStr, strEq
 } from "./jx";
 
@@ -295,6 +295,31 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   t = s.mcpCall(fs, p, "inspect", O([]));
   s.check(fs, t.err, "inspect without target is an error");
 
+  // user annotations (ADR-0046 S2): `annotations` lists each use with its arguments and the definition
+  writeFile(fs, proj + "/anno.or",
+    "type Verb = Get | Post;\n\n@Annotation(function, method)\ntype Route = { path: string; verb: Verb; };\n\n"
+    + "@Annotation(function, field)\ntype Doc = { text: string; };\n\n"
+    + "class Api {\n  @Doc(\"field\") n: int = 0;\n  @Route(\"/a\", Post)\n  call(): int {\n    return this.n;\n  }\n}\n\n"
+    + "@Route(\"/users/:id\", Get)\n@Doc(\"Finds\")\nfunction lookupUser(id: int): int {\n  return id;\n}\n\n"
+    + "function plain(): int {\n  return 1;\n}\n\nfunction main(): void {\n  console.log(lookupUser(new Api().call()).toString());\n}\n");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("lookupUser")), F("entry", S("anno.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && eq(at(v, ["annotations"]), A([
+    O([F("name", S("Route")), F("args", SA(["\"/users/:id\"", "Get"])), F("definition", S("anno.or:4:6"))]),
+    O([F("name", S("Doc")), F("args", SA(["\"Finds\""])), F("definition", S("anno.or:7:6"))])])),
+    "inspect: user annotations of a function (" + t.raw + ")");
+  s.check(fs, !t.err && str(at(v, ["sig"])).startsWith("@Route(\"/users/:id\", Get)\n@Doc(\"Finds\")\nfunction lookupUser"),
+    "inspect: sig carries the annotation lines (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Api.call")), F("entry", S("anno.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && eq(at(v, ["annotations"]), A([
+    O([F("name", S("Route")), F("args", SA(["\"/a\"", "Post"])), F("definition", S("anno.or:4:6"))])])),
+    "inspect: user annotations of a method (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("plain")), F("entry", S("anno.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && !has(v, "annotations"), "inspect: a declaration without annotations has no annotations key (" + t.raw + ")");
+  shell(p, "rm -f " + shq(proj + "/anno.or"));
+
   // ---- packages (orin.toml, spec 04): module inspect shows the rule; violations are diagnostics
   if (!copyTree(p, root + "/tests/next/packages/shop", proj + "/shop")) {
     s.setFatal(fs, "cannot copy tests/next/packages/shop");
@@ -391,7 +416,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   }
   t = s.mcpCall(fs, p, "graph", ent("osig/head"));
   v = t.value;
-  s.check(fs, !t.err && isStrEq(at(v, ["schema"]), "osig/0.3") && isStrEq(at(v, ["package"]), "acme") && str(at(v, ["hash"])).startsWith("h62:")
+  s.check(fs, !t.err && isStrEq(at(v, ["schema"]), "osig/0.4") && isStrEq(at(v, ["package"]), "acme") && str(at(v, ["hash"])).startsWith("h62:")
     && intVal(at(v, ["nodes"])) > 5 && intVal(at(v, ["edges"])) > 5 && !has(v, "snapshot"), "graph summary (" + t.raw + ")");
   const graphV = v;
   t = s.mcpCall(fs, p, "graph", O([F("entry", S("osig/head")), F("full", B(true)), F("out", S("osig/head.json"))]));
