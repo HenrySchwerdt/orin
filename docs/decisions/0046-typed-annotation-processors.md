@@ -71,8 +71,8 @@ export class Users {
   defaults other than `Option` and repeated application are not in this ADR (repeat is E0442 as today).
 * **Resolution.** An annotation name resolves like a type name: declared in the module or imported. Built-in names
   (`Test`, `Deprecated`, `Inline`, `Sealed`, `Annotation`, `Processor`) and the contract clauses (`Requires`,
-  `Ensures`, `Invariant`, `Decreases`, `Rule`) stay keywords of the grammar and cannot be declared, imported under
-  that name, shadowed or generated (E0447). An unknown `@Name` stays E0408; a known name on a wrong target is E0440,
+  `Ensures`, `Invariant`, `Decreases`, `Rule`) stay keywords of the grammar; an `@Annotation` definition cannot take
+  one of these names (E0447). An unknown `@Name` stays E0408; a known name on a wrong target is E0440,
   wrong arguments E0441 (both extended from built-ins to user annotations).
 * **Placement.** As today: annotations precede the declaration, any order with contract clauses; fields of records and
   classes gain annotations (they are E0408 today). The formatter prints each on its own line; a field annotation
@@ -84,10 +84,11 @@ export class Users {
   OSIG gets `ANNOTATED_WITH` edges (declaration -> annotation type, with the argument values) and MCP `symbols` lists
   them. This makes metadata-only annotations (`@Description`, `@Permission`, `@Example`) useful on their own.
 
-* **As built in S1 (2026-10-16).** `Annotation` is exempt from E0447 because the compiler's own AST declares a type
-  of that name; `@Annotation(...)` is decided by the parser before name resolution, so there is no ambiguity. The
-  `__g` check is in the parser (`parseIdent`), so S4 builds generated AST directly and `orin expand` output that
-  contains `__g` names is for review, not for re-parsing. A `@Name` on a statement stays E0408 (parse time).
+* **As built in S1 (2026-10-16).** The reserved names only restrict `@Annotation` definitions (E0447): an ordinary
+  type, function or import called `Rule` or `Inline` stays legal, because `@Rule`, `@Inline`, ... are decided by the
+  parser before name resolution and cannot be confused with a user annotation. The `__g` check is in the parser
+  (`parseIdent`), so S4 builds generated AST directly and `orin expand` output that contains `__g` names is for review,
+  not for re-parsing. A `@Name` on a statement stays E0408 (parse time).
 
 ## 2. Processors
 

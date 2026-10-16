@@ -248,7 +248,7 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0444 | `@Inline` function that is part of a call cycle (recursive) — beyond Orin-B (ADR-0024) |
 | E0445 | a `@Test` function is called or used as a value (tests are only run by `orin test` and erased from ordinary builds) — beyond Orin-B (ADR-0024) |
 | E0446 | a field of an `@Annotation` record has a type an annotation cannot hold (allowed: `bool`, `int`, `usize`, `float`, `f32`, `string`, a union of payload-free tags, and arrays and `Option`s of those), or the record is generic — beyond Orin-B (ADR-0046) |
-| E0447 | a reserved name is declared, imported, re-exported or used as a type parameter (`Test`, `Deprecated`, `Inline`, `Sealed`, `Processor`, `Requires`, `Ensures`, `Invariant`, `Decreases`, `Rule`; `Annotation` is exempt because the compiler's own syntax tree declares a type of that name), or an identifier starts with `__g` (reserved for generated code) — beyond Orin-B (ADR-0046) |
+| E0447 | an `@Annotation` definition takes a reserved name (`Test`, `Deprecated`, `Inline`, `Sealed`, `Annotation`, `Processor`, `Requires`, `Ensures`, `Invariant`, `Decreases`, `Rule`), or an identifier starts with `__g` (reserved for generated code) (ADR-0046) |
 | W0440 | **warning** (never fails a build): use of a `@Deprecated` symbol; printed as `warning[W0440]`, JSON `"severity":"warning"`, LSP severity 2 with the Deprecated tag — beyond Orin-B (ADR-0024) |
 | W0450 | **warning**: `@Invariant` of a class or record that mentions no `this` (constrains no state) — beyond Orin-B (ADR-0028) |
 | W0451 | **warning**: `@Ensures` that mentions neither `result` nor (non-static method) `this`; parameters are immutable, so it cannot fail — beyond Orin-B (ADR-0028) |
