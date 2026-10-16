@@ -7,6 +7,8 @@
 //   orin effects <entry.or | package-dir> [--format=json] [--summary] [--module M] [--function F] [--no-paths] [--tests] [--check-purity]
 //       transitive effect summaries per function, module, package and `main`, with explanation paths (docs/capabilities.md)
 //   orin expand [--input] <entry.or | package-dir>   the companion modules (`m.gen`) of the program, through the formatter (ADR-0046)
+//   check/expand/compile run annotation processors (ADR-0046 S5) for the `.gen` modules they import:
+//       [--processor-timeout S] [--processor-cache DIR] [--cc CMD] [--runtime DIR] [--verbose]
 //   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--check-contracts] [--strict-contracts]
 //       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
@@ -37,7 +39,10 @@ import {
   strictContracts, parallelWarnings,
 } from "./check";
 import { runTestCommand, hasTests, eraseTests, ensureMain } from "./testing";
-import { expandProgram, expandCompanions, noteGenerated, companionsText, inputsText, Cause } from "./expand";
+import {
+  expandProgram, expandCompanions, noteGenerated, companionsText, inputsText, Cause, ProcConfig, defaultProcConfig,
+  processorDiags,
+} from "./expand";
 import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
 import {
@@ -60,7 +65,7 @@ import { runMcp } from "./mcp";
 
 function usage(): void {
   console.error(
-    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
+    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
   );
   exit(2);
 }
@@ -210,7 +215,13 @@ function runTool(
 
 // The options of `check`, `api`, `mir`, `verify` and `compile`. `switches` holds the boolean flags that were given (see
 // `switchNames`); the remaining words are the command, the entry and, for `compile`, `-o <out>`.
-type Options = { switches: string[]; z3: string; checkSnap: Option<string>; argv: string[]; };
+type Options = {
+  switches: string[];
+  z3: string;
+  checkSnap: Option<string>;
+  argv: string[];
+  procs: ProcConfig;   // `--processor-timeout`, `--cc`, `--runtime`, `--processor-cache` (ADR-0046 S5)
+};
 
 // Every boolean flag of the build commands. `--backend=c` is the absence of `--backend=llvm`.
 function switchNames(): string[] {
@@ -240,7 +251,7 @@ function on(o: Options, flag: string): bool {
 // None after printing the usage or the unknown-option error (both exit).
 function parseOptions(all: string[]): Option<Options> {
   const known = switchNames();
-  let o = Options { switches: [], z3: "z3", checkSnap: None, argv: [] };
+  let o = Options { switches: [], z3: "z3", checkSnap: None, argv: [], procs: defaultProcConfig() };
   let expectZ3 = false;
   let ai: usize = 0;
   while (ai < all.length) {
@@ -251,6 +262,31 @@ function parseOptions(all: string[]): Option<Options> {
       expectZ3 = false;
     } else if (a == "--z3") {
       expectZ3 = true;
+    } else if (a == "--processor-timeout"
+        || a == "--cc"
+        || a == "--runtime"
+        || a == "--processor-cache") {
+      if (ai >= all.length) {
+        usage();
+        return None;
+      }
+      const v = all[ai];
+      ai += 1;
+      if (a == "--cc") {
+        o.procs.cc = v;
+      } else if (a == "--runtime") {
+        o.procs.runtime = v;
+      } else if (a == "--processor-cache") {
+        o.procs.cacheDir = v;
+      } else {
+        const n = parseInt(v);
+        if (n.isNone() || n.unwrap() < 0) {
+          console.error("error: --processor-timeout needs a number of seconds (0 = unlimited)");
+          exit(2);
+          return None;
+        }
+        o.procs.timeout = n.unwrap();
+      }
     } else if (a == "--check") {
       if (ai >= all.length) {
         usage();
@@ -413,6 +449,12 @@ function runCompile(fs: FsGrant, sm: SourceMap, checked: Program, o: Options, ou
   }
 }
 
+// The settings for running processors: the command line options, `--verbose`, and whether a missing C compiler is only a
+// warning (`orin check`, W0490).
+function procConfig(o: Options, ui: TerminalOptions, lenient: bool): ProcConfig {
+  return ProcConfig { ...o.procs, verbose: ui.verbose, lenient: lenient };
+}
+
 function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o: Options): void {
   const argv = o.argv;
   if (argv.length < 2) {
@@ -446,7 +488,7 @@ function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o
   }
   let program = loaded.program.unwrap();
   if (cmd == "expand") {
-    const cs = expandCompanions(fs, program, loaded.sm);
+    const cs = expandCompanions(fs, proc, program, loaded.sm, procConfig(o, ui, false));
     if (cs.isErr()) {
       report(loaded.sm, cs.unwrapErr(), json, ui);
       return;
@@ -456,7 +498,7 @@ function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o
     return;
   }
   // Companion modules (`import .. from "./m.gen"`, ADR-0046): filled from the recorded outputs; any other program is unchanged.
-  const expanded = expandProgram(fs, program, loaded.sm);
+  const expanded = expandProgram(fs, proc, program, loaded.sm, procConfig(o, ui, cmd == "check"));
   if (expanded.isErr()) {
     report(loaded.sm, expanded.unwrapErr(), json, ui);
     return;
@@ -494,6 +536,12 @@ function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o
       : check(program, loaded.sm);
   if (checked.isErr()) {
     report(loaded.sm, noteGenerated(generated, checked.unwrapErr()), json, ui);
+    return;
+  }
+  // `@Processor` rules and purity (ADR-0046 S5, E0448).
+  const procDiags = processorDiags(program, loaded.sm, checked.unwrap().functions);
+  if (procDiags.length > 0) {
+    report(loaded.sm, procDiags, json, ui);
     return;
   }
   policyCheck(program, loaded.sm, json, ui);

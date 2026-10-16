@@ -1,6 +1,6 @@
 # ADR-0046: User-defined annotations and pure annotation processors
 
-Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below; S1 and S4 implemented, S2, S3, S5 and S6 see the slice table).
+Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below; S1, S4 and S5 implemented, S2, S3 and S6 see the slice table).
 Related: spec/05-annotations-and-metaprogramming.md, ADR-0012 (contract clauses), ADR-0016 (1.0 scope, amended
 here), ADR-0024 (built-in annotations), ADR-0027 (capabilities), ADR-0044 (OX, `@Sealed`), ADR-0020/0023 (OSIG).
 Supersedes the first draft of this ADR (PR #109), whose three-capability split, safety rules and alternatives are kept.
@@ -191,6 +191,25 @@ diagnostic reported by the processor, W0491 a processor warning. The span of gen
 annotated declaration of the run; diagnostics inside generated code carry a note naming the run. Compiler code: `compiler/meta`
 (snapshot, Output to AST, hygiene), `compiler/expand` (pipeline, `orin expand` text). Not done in S4: LSP, MCP, `orin test`
 and OSIG do not run the expansion (a `.gen` import is E0300 there); OSIG `GENERATED_BY` edges.
+
+**As built in S5.** `@Processor(A)` is read by the parser as the user annotation `Processor` with one argument (no parser change);
+`check/userannos.or` skips that name and `compiler/expand/processors.or` does the rest: placement, signature, "same module as `A`",
+one per annotation, and purity (`inferPurity` of the contract checker; the explanation is the one `E0416` prints), all E0448. The
+purity analysis already counts every I/O built-in and every grant as impure, and the signature gives a processor no grant, so no
+separate effects pass runs. `compiler/expand/helper.or` builds the helper by loading the processor module together with a
+generated overlay file `__orin_processor_main.or` through the ordinary loader (module rules apply as for any file of that
+directory), compiles it like `orin test` does (C backend only; `--cc`, `--runtime`) and runs it with `ORIN_DENY=fs,process,clock,net`
+(not `all`: the harness exchanges `Input`/`Output` over stdio, and the processor has no grant to reach it), the deadline of
+`std:io.shellTimeout` (`--processor-timeout`, default 10 s), the output piped through `head -c` (16 MiB) and the global limit of 10,000
+generated declarations; every failure is E0520 with the stderr as a note. A heap limit is not implemented (deadline and output cap
+only). The cache lives in `<package>/.orin/processors/<helper key>/` (`--processor-cache`): `helper` and `out-<input key>.json`;
+the helper key hashes the format version, the generated main and path and text of the processor module's import closure (std
+included); the C compiler is not in the key, so `orin check` can use a cache built by another compiler. `orin check` without a C
+compiler and without a cached helper reports W0490 and leaves the companion empty; `compile` and `expand` fail with E0520. The
+trust policy is `[annotations] processors = ["dep", "dep/module"]` (a dependency name, or dependency and module path below its
+`src`); an unlisted dependency processor is not run and reports W0492. A recorded sidecar output (the S4 hook) wins over a processor.
+New codes: E0448, W0490, W0492. Not done in S5: LSP, MCP, `orin test`, `orin graph`, `orin effects` do not expand; OSIG `GENERATED_BY`;
+the helper is always built with the C backend; no memory limit.
 
 S1 and S3 can run in parallel (parser/checker vs. std only). S2 follows S1; S4 needs S1 and S3; S5 follows S4; S6
 follows S5. Every slice keeps contracts, built-ins and their codes unchanged.
