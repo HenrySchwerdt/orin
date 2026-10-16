@@ -74,6 +74,13 @@ static inline int64_t orin_time_now_millis(int64_t g) {
     return orin_platform_now_millis();
 }
 
+/* Option<int>: None on a failed/invalid monotonic read; grant checks precede the read. */
+static inline OrinObj *orin_time_monotonic_millis(int64_t g) {
+    orin_cap_require(g, 4, "monotonicMillis");
+    int64_t now = orin_platform_monotonic_millis();
+    return now < 0 ? orin_nullary(1) : orin_variant1(0, 0, (uint64_t)now);
+}
+
 /* Runs `cmd` through /bin/sh (system(3)); returns the exit status (-1 if it could not start or
  * was killed by a signal). Used by `orin mcp` (test/build) behind --allow-exec. */
 static inline int64_t orin_io_shell(int64_t g, OrinObj *cmd) {

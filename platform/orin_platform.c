@@ -769,7 +769,8 @@ void orin_platform_runtime_unlock(void) { pthread_mutex_unlock(&g_rt); }
 
 int64_t orin_platform_monotonic_millis(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) || ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return -1;
+    if ((uint64_t)ts.tv_sec > (uint64_t)(INT64_MAX - ts.tv_nsec / 1000000) / 1000) return -1;
     return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
 }
 

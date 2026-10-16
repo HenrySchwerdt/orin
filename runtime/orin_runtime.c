@@ -1833,7 +1833,9 @@ int64_t orin_net_port(int64_t lh) { return grant_ref(lh, GK_LISTENER)->port; }
 int64_t orin_net_now(int64_t h) {
     Grant *g = grant_ref(h, -1);
     if (g->kind < GK_NET) orin_trap("invalid capability grant (forged, revoked, or of the wrong kind)");
-    return orin_platform_monotonic_millis();
+    int64_t now = orin_platform_monotonic_millis();
+    if (now < 0) orin_trap("monotonic clock unavailable"); /* never fabricate or disable a deadline */
+    return now;
 }
 
 /* Result<u8[], int>: Ok(1..min(cap, 64 KiB) bytes) or Err(code: NET_EOF / TIMEOUT / RESET / errno). One copy from the
