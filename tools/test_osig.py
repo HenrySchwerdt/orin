@@ -65,7 +65,7 @@ def main():
         want = f.read()
     check(g1 == want, "graph of the demo package equals tests/osig/demo.graph.json (run with --update after a deliberate change)")
     snap = json.loads(g1)
-    check(snap["schema"] == "osig/0.2" and snap["package"] == "demo" and snap["hash"].startswith("h62:"), "schema, package, hash")
+    check(snap["schema"] == "osig/0.3" and snap["package"] == "demo" and snap["hash"].startswith("h62:"), "schema, package, hash")
 
     # ---- 2. determinism -------------------------------------------------------------------
     rc, g2, _ = run(orin, ["graph", "tests/osig/demo"])

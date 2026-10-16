@@ -22,6 +22,11 @@ trap 'rm -f "$tmp"' EXIT
   echo
   echo "export const THEME_VERSION: string = \"$version\";"
   echo
+  echo "// The same stylesheet as a string, for producers that write it to a file next to a multi-page site."
+  printf 'export const THEME_CSS: string = "'
+  awk 'BEGIN { first = 1 } { if (!first) printf "\\n"; first = 0; printf "%s", $0 } END { printf "\\n" }' "$css"
+  echo '";'
+  echo
   echo "// The whole stylesheet as one static literal: <style> accepts nothing computed (E0493), so nothing is spliced in."
   echo "export function ThemeStyle(): Html {"
   printf '  return <style>{"'

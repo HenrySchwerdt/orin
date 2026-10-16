@@ -1,0 +1,170 @@
+// The data the explorer reads: an OSIG snapshot (`orin graph`, docs/osig.md) and, optionally, an `orin diff --format=json`
+// report (osig-diff/0.x). Both decoders are lenient about absent fields and refuse only what is not an object or has the wrong
+// schema family; unknown fields are ignored (the schemas grow additively, ADR-0023).
+
+import { JsonValue } from "std:jsonvalue";
+import { parse, items, isObject, strOf, intOf, boolOf, listOf, stringsOf, objOf } from "./jv";
+
+export type Sym = {
+  id: string; kind: string; name: string; module: string; owner: string; sig: string; exported: bool; entry: bool;
+  file: string; line: int; endLine: int; doc: string;
+};
+
+export type Rel = { kind: string; src: string; dst: string; ev: string; via: string; file: string; line: int; next: string; };
+
+export type Snap = { schema: string; pkg: string; hash: string; nodes: Sym[]; edges: Rel[]; };
+
+function spanFile(v: JsonValue): string {
+  return strOf(objOf(v, "span"), "file");
+}
+
+function spanLine(v: JsonValue): int {
+  return intOf(objOf(v, "span"), "line");
+}
+
+export function decodeSnap(text: string): Result<Snap, string> {
+  const doc = parse(text)?;
+  if (!isObject(doc)) {
+    return Err("not an OSIG snapshot (the top level is not an object)");
+  }
+  const schema = strOf(doc, "schema");
+  if (!schema.startsWith("osig/0.")) {
+    return Err("not an OSIG snapshot (schema \"" + schema + "\"; this tool reads osig/0.x)");
+  }
+  let nodes: Sym[] = [];
+  for (const n of listOf(doc, "nodes")) {
+    nodes.push(Sym {
+      id: strOf(n, "id"), kind: strOf(n, "kind"), name: strOf(n, "name"), module: strOf(n, "module"), owner: strOf(n, "owner"),
+      sig: strOf(n, "sig"), exported: boolOf(n, "exported"), entry: boolOf(n, "entry"),
+      file: spanFile(n), line: spanLine(n), endLine: intOf(objOf(n, "span"), "endLine"), doc: strOf(n, "doc"),
+    });
+  }
+  let edges: Rel[] = [];
+  for (const e of listOf(doc, "edges")) {
+    edges.push(Rel {
+      kind: strOf(e, "kind"), src: strOf(e, "src"), dst: strOf(e, "dst"), ev: strOf(e, "evidence"), via: strOf(e, "via"),
+      file: spanFile(e), line: spanLine(e), next: strOf(e, "next"),
+    });
+  }
+  return Ok(Snap { schema: schema, pkg: strOf(doc, "package"), hash: strOf(doc, "hash"), nodes: nodes, edges: edges });
+}
+
+// ---- the diff report (osig-diff/0.x) ---------------------------------------------------------------------------------
+
+export type DSym = { id: string; kind: string; sig: string; before: string; after: string; aspects: string[]; file: string; line: int; };
+export type DEdge = { kind: string; src: string; dst: string; ev: string; via: string; file: string; line: int; };
+export type DRename = { oldId: string; newId: string; kind: string; confidence: string; basis: string; };
+export type DEffect = { kind: string; fn: string; module: string; op: string; dir: string; ev: string; was: string; };
+export type DModEffect = { module: string; added: string[]; removed: string[]; };
+// a call path from an entry point of the graph to the changed edge or symbol: node ids and the evidence of the whole path
+export type DPath = { ev: string; nodes: string[]; };
+export type DReach = { target: string; truncated: bool; paths: DPath[]; };
+export type DCallPath = { edge: DEdge; reach: DReach; };
+
+export type Diff = {
+  schema: string; basePkg: string; baseHash: string; headPkg: string; headHash: string; differences: bool; effectsComparable: bool;
+  truncated: bool;
+  changed: DSym[]; added: DSym[]; removed: DSym[]; renames: DRename[];
+  addedEdges: DEdge[]; removedEdges: DEdge[]; effects: DEffect[]; moduleEffects: DModEffect[];
+  newPaths: DCallPath[]; removedPaths: DCallPath[]; impact: DReach[];
+};
+
+function dsym(v: JsonValue): DSym {
+  return DSym {
+    id: strOf(v, "id"), kind: strOf(v, "kind"), sig: strOf(v, "sig"), before: strOf(v, "before"), after: strOf(v, "after"),
+    aspects: stringsOf(v, "aspects"), file: spanFile(v), line: spanLine(v),
+  };
+}
+
+function dedge(v: JsonValue): DEdge {
+  return DEdge {
+    kind: strOf(v, "kind"), src: strOf(v, "src"), dst: strOf(v, "dst"), ev: strOf(v, "evidence"), via: strOf(v, "via"),
+    file: spanFile(v), line: spanLine(v),
+  };
+}
+
+function dreach(v: JsonValue): DReach {
+  let paths: DPath[] = [];
+  for (const p of listOf(v, "entryPaths")) {
+    let ns: string[] = [];
+    for (const s of listOf(p, "steps")) {
+      ns.push(strOf(s, "node"));
+    }
+    paths.push(DPath { ev: strOf(p, "evidence"), nodes: ns });
+  }
+  return DReach { target: strOf(v, "target"), truncated: boolOf(v, "truncated"), paths: paths };
+}
+
+function dcallpath(v: JsonValue): DCallPath {
+  return DCallPath { edge: dedge(objOf(v, "edge")), reach: dreach(objOf(v, "reach")) };
+}
+
+export function decodeDiff(text: string): Result<Diff, string> {
+  const doc = parse(text)?;
+  if (!isObject(doc)) {
+    return Err("not an OSIG diff (the top level is not an object)");
+  }
+  const schema = strOf(doc, "schema");
+  if (!schema.startsWith("osig-diff/0.")) {
+    return Err("not an OSIG diff (schema \"" + schema + "\"; this tool reads osig-diff/0.x from `orin diff --format=json`)");
+  }
+  let changed: DSym[] = [];
+  for (const x of listOf(doc, "changedSymbols")) {
+    changed.push(dsym(x));
+  }
+  let added: DSym[] = [];
+  for (const x of listOf(doc, "addedSymbols")) {
+    added.push(dsym(x));
+  }
+  let removed: DSym[] = [];
+  for (const x of listOf(doc, "removedSymbols")) {
+    removed.push(dsym(x));
+  }
+  let renames: DRename[] = [];
+  for (const x of listOf(doc, "possibleRenames")) {
+    renames.push(DRename {
+      oldId: strOf(x, "from"), newId: strOf(x, "to"), kind: strOf(x, "kind"), confidence: strOf(x, "confidence"),
+      basis: stringsOf(x, "basis").join("; "),
+    });
+  }
+  let addedEdges: DEdge[] = [];
+  for (const x of listOf(doc, "addedEdges")) {
+    addedEdges.push(dedge(x));
+  }
+  let removedEdges: DEdge[] = [];
+  for (const x of listOf(doc, "removedEdges")) {
+    removedEdges.push(dedge(x));
+  }
+  let effects: DEffect[] = [];
+  for (const x of listOf(doc, "effectChanges")) {
+    effects.push(DEffect {
+      kind: strOf(x, "kind"), fn: strOf(x, "function"), module: strOf(x, "module"), op: strOf(x, "operation"),
+      dir: strOf(x, "direction"), ev: strOf(x, "evidence"), was: strOf(x, "was"),
+    });
+  }
+  let moduleEffects: DModEffect[] = [];
+  for (const x of listOf(doc, "moduleEffects")) {
+    moduleEffects.push(DModEffect { module: strOf(x, "module"), added: stringsOf(x, "added"), removed: stringsOf(x, "removed") });
+  }
+  let newPaths: DCallPath[] = [];
+  for (const x of listOf(doc, "newCallPaths")) {
+    newPaths.push(dcallpath(x));
+  }
+  let removedPaths: DCallPath[] = [];
+  for (const x of listOf(doc, "removedCallPaths")) {
+    removedPaths.push(dcallpath(x));
+  }
+  let impact: DReach[] = [];
+  for (const x of listOf(doc, "impact")) {
+    impact.push(dreach(x));
+  }
+  const base = objOf(doc, "base");
+  const head = objOf(doc, "head");
+  return Ok(Diff {
+    schema: schema, basePkg: strOf(base, "package"), baseHash: strOf(base, "hash"), headPkg: strOf(head, "package"),
+    headHash: strOf(head, "hash"), differences: boolOf(doc, "differences"), effectsComparable: boolOf(doc, "effectsComparable"),
+    truncated: boolOf(objOf(doc, "summary"), "truncated"),
+    changed: changed, added: added, removed: removed, renames: renames, addedEdges: addedEdges, removedEdges: removedEdges,
+    effects: effects, moduleEffects: moduleEffects, newPaths: newPaths, removedPaths: removedPaths, impact: impact,
+  });
+}

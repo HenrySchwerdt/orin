@@ -127,7 +127,7 @@ carrying the rendered diagnostics.
 
 ```json
 → {"entry":"shop"}
-← {"schema":"osig/0.2","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
+← {"schema":"osig/0.3","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
 ```
 
 ### `diff` {base, head, format?, out?}
