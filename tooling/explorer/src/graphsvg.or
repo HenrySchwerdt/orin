@@ -1,0 +1,344 @@
+// The graphs of the explorer as sealed SVG documents: the module dependency / call-flow graph and the neighbourhood of a
+// symbol. Positions come from layout.or; the drawing is done by orin-reports' Canvas (every string escaped there). The
+// elements carry classes (`ex-node`, `ex-edge`, ...) that explorer.css styles with the page's theme tokens, so the graphs
+// follow light and dark mode without a stylesheet of their own.
+
+import { SvgDoc, Canvas, Pt, newBareCanvas, flowPath } from "orin-reports";
+import { Ix, ModStat, MEdge, NONE, isPageKind } from "./index";
+import { Rel } from "./model";
+import { layered, LNode, LEdge, Layout } from "./layout";
+import { clip, plural, afterLast, strCmp } from "./util";
+
+// width of `s` at about `px` pixels in the system font (an estimate: the layout never measures text)
+function tw(s: string, px: float): float {
+  return s.length.toFloat() * px * 0.56;
+}
+
+function maxF(a: float, b: float): float {
+  return a > b ? a : b;
+}
+
+// ---- module graph ------------------------------------------------------------------------------------------------------
+
+export type ModGraph = { svg: SvgDoc; drawn: int; total: int; implied: int; };
+
+// reachability of `to` from `from` over the import edges, without using the direct edge from -> to
+function impliedBy(succ: usize[][], start: usize, goal: usize): bool {
+  let seen: bool[] = [];
+  let k: usize = 0;
+  while (k < succ.length) {
+    seen.push(false);
+    k += 1;
+  }
+  let stack: usize[] = [];
+  for (const s of succ[start]) {
+    if (s != goal) {
+      stack.push(s);
+      seen[s] = true;
+    }
+  }
+  while (stack.length > 0) {
+    const u = stack[stack.length - 1];
+    stack = stack.slice(0, stack.length - 1);
+    if (u == goal) {
+      return true;
+    }
+    for (const v of succ[u]) {
+      if (!seen[v]) {
+        seen[v] = true;
+        stack.push(v);
+      }
+    }
+  }
+  return false;
+}
+
+// mode "imports": the IMPORTS edges without those implied by a longer path (transitive reduction, so the picture shows the
+// structure, not every shortcut); mode "calls": the CALLS between modules, line width by the number of calls, line style by
+// the evidence (solid: some MUST, dashed: only MAY, dotted: only UNKNOWN).
+export function moduleGraph(ix: Ix, mode: string, idPrefix: string, linkPrefix: string): ModGraph {
+  const mods = ix.mods;
+  const calls = mode == "calls";
+  let succ: usize[][] = [];
+  let k: usize = 0;
+  while (k < mods.length) {
+    succ.push([]);
+    k += 1;
+  }
+  for (const e of ix.medges) {
+    if (e.imports) {
+      succ[e.a].push(e.b);
+    }
+  }
+  let picked: usize[] = [];
+  let implied: int = 0;
+  let ei: usize = 0;
+  while (ei < ix.medges.length) {
+    const e = ix.medges[ei];
+    if (calls ? e.calls > 0 : e.imports) {
+      if (!calls && impliedBy(succ, e.a, e.b)) {
+        implied += 1;
+      } else {
+        picked.push(ei);
+      }
+    }
+    ei += 1;
+  }
+  // the call flow keeps the strongest flows only (a picture of every pair of modules is a hairball): about two per module
+  const total = picked.length.toInt();
+  const keep: usize = mods.length * 2 > 24 ? mods.length * 2 : 24;
+  if (calls && picked.length > keep) {
+    const strongest = picked.sort((p: usize, q: usize): int => ix.medges[p].calls != ix.medges[q].calls
+      ? (ix.medges[p].calls > ix.medges[q].calls ? -1 : 1) : (p < q ? -1 : 1));
+    picked = strongest.slice(0, keep).sort((p: usize, q: usize): int => p < q ? -1 : (p > q ? 1 : 0));
+  }
+  let lnodes: LNode[] = [];
+  k = 0;
+  while (k < mods.length) {
+    const m = mods[k];
+    const w = maxF(maxF(tw(clip(m.name, 24), 14.0) + 44.0, tw(shortStats(m), 12.0) + 32.0), 120.0);
+    lnodes.push(LNode { w: w, h: 50.0 });
+    k += 1;
+  }
+  let ledges: LEdge[] = [];
+  for (const p of picked) {
+    ledges.push(LEdge { a: ix.medges[p].a, b: ix.medges[p].b });
+  }
+  const lay = layered(lnodes, ledges, calls ? 80.0 : 46.0, 14.0);
+  let c = newBareCanvas(lay.width.toInt() + 1, lay.height.toInt() + 1, calls ? "Module call flow" : "Module dependencies",
+    plural(mods.length.toInt(), "module", "modules") + " and " + plural(picked.length.toInt(), "edge", "edges") + ", laid out left to right.",
+    idPrefix, "ex-graph-svg");
+  // edges first, nodes on top
+  let pi: usize = 0;
+  while (pi < picked.length) {
+    const e = ix.medges[picked[pi]];
+    const r = lay.routes[pi];
+    if (r.pts.length >= 2) {
+      let cls = "ex-edge";
+      let dash = "";
+      let width = 1.4;
+      let tip = mods[e.a].name + " imports " + mods[e.b].name;
+      if (calls) {
+        tip = mods[e.a].name + " calls " + mods[e.b].name + ": " + plural(e.calls, "call", "calls") + " (" + e.must.toString() + " MUST, "
+          + e.may.toString() + " MAY, " + e.unknown.toString() + " UNKNOWN)";
+        width = 1.2 + logScale(e.calls);
+        if (e.must == 0 && e.may > 0) {
+          cls = "ex-edge ex-ev-may";
+          dash = "6 4";
+        } else if (e.must == 0) {
+          cls = "ex-edge ex-ev-unknown";
+          dash = "2 4";
+        }
+      }
+      c.group(cls, tip);
+      c.flow("ex-edge-line", r.pts, width, dash);
+      const last = r.pts[r.pts.length - 1];
+      const first = r.pts[0];
+      if (r.back) {
+        c.arrowhead("ex-edge-head", first.x, first.y, -1);
+      } else {
+        c.arrowhead("ex-edge-head", last.x, last.y, 1);
+      }
+      c.endGroup();
+    }
+    pi += 1;
+  }
+  k = 0;
+  while (k < mods.length) {
+    c = drawModule(c, mods[k], lay.nodes[k].x, lay.nodes[k].y, lnodes[k].w, lnodes[k].h, linkPrefix);
+    k += 1;
+  }
+  return ModGraph { svg: c.finish(), drawn: picked.length.toInt(), total: total, implied: implied };
+}
+
+function logScale(n: int): float {
+  // 1 call: 0, 10 calls: about 1, 100: about 2, capped
+  let x = 0.0;
+  let v = n;
+  while (v >= 10) {
+    x += 1.0;
+    v = v / 10;
+  }
+  x += (v.toFloat() - 1.0) / 9.0;
+  return x > 2.8 ? 2.8 : x;
+}
+
+function shortStats(m: ModStat): string {
+  return m.symbols.toString() + " sym" + (m.contracts > 0 ? " · " + m.contracts.toString() + " C" : "");
+}
+
+function statsLine(m: ModStat): string {
+  return plural(m.symbols, "symbol", "symbols") + (m.contracts > 0 ? " · " + m.contracts.toString() + " C" : "");
+}
+
+function drawModule(c0: Canvas, m: ModStat, x: float, y: float, w: float, h: float, linkPrefix: string): Canvas {
+  let c = c0;
+  const accent = m.effectful > 0 ? "ex-acc-effect" : (m.contracts > 0 ? "ex-acc-contract" : "ex-acc-plain");
+  c.link(linkPrefix + "m/" + m.slug + ".html", "ex-node", m.name + ": " + statsLine(m) + (m.effectful > 0 ? ", " + plural(m.effectful, "effectful function", "effectful functions") : ""));
+  c.rrect("ex-node-box", x, y, w, h, 9.0);
+  c.rrect("ex-node-bar " + accent, x, y + 8.0, 4.0, h - 16.0, 2.0);
+  c.text(x + 16.0, y + 22.0, clip(m.name, 24), "ex-t", 14, "start", "600", 0);
+  c.text(x + 16.0, y + 39.0, shortStats(m), "ex-t2", 12, "start", "400", 0);
+  if (m.effectful > 0) {
+    c.rrect("ex-pill ex-pill-effect", x + w - 30.0, y + 7.0, 22.0, 14.0, 7.0);
+    c.text(x + w - 19.0, y + 17.5, "IO", "ex-pill-t", 9, "middle", "700", 0);
+  }
+  c.endLink();
+  return c;
+}
+
+// ---- the neighbourhood of one symbol ------------------------------------------------------------------------------------
+
+export type Nb = { node: usize; label: string; href: string; ev: string; count: int; kind: string; site: string; };
+
+function evRank(ev: string): int {
+  return ev == "MUST" ? 0 : (ev == "MAY" ? 1 : 2);
+}
+
+// the distinct page nodes at the other end of CALLS edges (`incoming`: the callers), strongest evidence first
+export function neighbours(ix: Ix, i: usize, incoming: bool): Nb[] {
+  let res: Nb[] = [];
+  let at = new Map<string, usize>();
+  const list = incoming ? ix.inn[i] : ix.out[i];
+  for (const e of list) {
+    const ed = ix.snap.edges[e];
+    if (ed.kind != "CALLS") {
+      continue;
+    }
+    const other = incoming ? ed.src : ed.dst;
+    const o = ix.byId.get(other);
+    let node = NONE;
+    let label = "function value";
+    let href = "";
+    let kind = "Unknown";
+    if (o.isSome()) {
+      node = ix.page[o.unwrap()];
+      if (node != NONE) {
+        label = afterLast(ix.snap.nodes[node].id, "::");
+        href = "../s/" + ix.slug[node] + ".html";
+        kind = ix.snap.nodes[node].kind;
+      }
+    }
+    if (node == i) {
+      continue;
+    }
+    const key = node == NONE ? "~" + other : node.toString();
+    const x = at.get(key);
+    if (x.isSome()) {
+      const j = x.unwrap();
+      res[j].count += 1;
+      if (evRank(ed.ev) < evRank(res[j].ev)) {
+        res[j].ev = ed.ev;
+      }
+    } else {
+      at.set(key, res.length);
+      res.push(Nb { node: node, label: label, href: href, ev: ed.ev, count: 1, kind: kind, site: ed.file.length > 0 ? ed.file + ":" + ed.line.toString() : "" });
+    }
+  }
+  return res.sort((a: Nb, b: Nb): int => evRank(a.ev) != evRank(b.ev) ? (evRank(a.ev) < evRank(b.ev) ? -1 : 1) : (strCmp(a.label, b.label)));
+}
+
+const EGO_MAX: usize = 10;
+
+function evClass(ev: string): string {
+  return ev == "MUST" ? "ex-edge" : (ev == "MAY" ? "ex-edge ex-ev-may" : "ex-edge ex-ev-unknown");
+}
+
+function evDash(ev: string): string {
+  return ev == "MUST" ? "" : (ev == "MAY" ? "6 4" : "2 4");
+}
+
+// callers on the left, the symbol in the middle, callees (and the effects it may perform) on the right
+export function egoGraph(ix: Ix, i: usize, idPrefix: string): Option<SvgDoc> {
+  const callers = neighbours(ix, i, true);
+  const callees = neighbours(ix, i, false);
+  let effects: Rel[] = [];
+  for (const e of ix.out[i]) {
+    if (ix.snap.edges[e].kind == "MAY_PERFORM") {
+      effects.push(ix.snap.edges[e]);
+    }
+  }
+  if (callers.length == 0 && callees.length == 0 && effects.length == 0) {
+    return None;
+  }
+  const nl = callers.length > EGO_MAX ? EGO_MAX + 1 : callers.length;
+  const rightN = callees.length + effects.length;
+  const nr = rightN > EGO_MAX ? EGO_MAX + 1 : rightN;
+  const rowH = 38.0;
+  const rows = nl > nr ? nl : nr;
+  const innerH = (rows > 1 ? rows : 1).toFloat() * rowH;
+  const h = innerH + 32.0;
+  const boxW = 200.0;
+  const midW = 220.0;
+  const gap = 90.0;
+  const w = 16.0 + boxW + gap + midW + gap + boxW + 16.0;
+  const xm = 16.0 + boxW + gap;
+  const xr = xm + midW + gap;
+  const sym = ix.snap.nodes[i];
+  let c = newBareCanvas(w.toInt(), h.toInt(), "Call neighbourhood of " + sym.name, plural(callers.length.toInt(), "caller", "callers") + " and "
+    + plural(callees.length.toInt(), "callee", "callees") + " of " + sym.id + ".", idPrefix, "ex-graph-svg");
+  const cyMid = h / 2.0;
+  const topL = (h - nl.toFloat() * rowH) / 2.0;
+  const topR = (h - nr.toFloat() * rowH) / 2.0;
+  let li: usize = 0;
+  while (li < nl) {
+    const cy = topL + (li.toFloat() + 0.5) * rowH;
+    if (li == EGO_MAX && callers.length > EGO_MAX) {
+      c.group("ex-more", "");
+      c.text(16.0 + boxW, cy + 4.0, "+" + (callers.length - EGO_MAX).toString() + " more callers", "ex-t2", 12, "end", "400", 0);
+      c.endGroup();
+    } else {
+      const nb = callers[li];
+      c.group(evClass(nb.ev), nb.label + " calls " + sym.name + " (" + nb.ev + (nb.count > 1 ? ", " + nb.count.toString() + " call sites" : "") + ")");
+      c.flow("ex-edge-line", [Pt { x: 16.0 + boxW, y: cy }, Pt { x: xm, y: cyMid }], 1.4, evDash(nb.ev));
+      c.arrowhead("ex-edge-head", xm, cyMid, 1);
+      c.endGroup();
+      c = drawSym(c, nb, 16.0, cy - 14.0, boxW, 28.0);
+    }
+    li += 1;
+  }
+  let ri: usize = 0;
+  while (ri < nr) {
+    const cy = topR + (ri.toFloat() + 0.5) * rowH;
+    if (ri == EGO_MAX && rightN > EGO_MAX) {
+      c.group("ex-more", "");
+      c.text(xr, cy + 4.0, "+" + (rightN - EGO_MAX).toString() + " more", "ex-t2", 12, "start", "400", 0);
+      c.endGroup();
+    } else if (ri < callees.length) {
+      const nb = callees[ri];
+      c.group(evClass(nb.ev), sym.name + " calls " + nb.label + " (" + nb.ev + (nb.count > 1 ? ", " + nb.count.toString() + " call sites" : "") + ")");
+      c.flow("ex-edge-line", [Pt { x: xm + midW, y: cyMid }, Pt { x: xr, y: cy }], 1.4, evDash(nb.ev));
+      c.arrowhead("ex-edge-head", xr, cy, 1);
+      c.endGroup();
+      c = drawSym(c, nb, xr, cy - 14.0, boxW, 28.0);
+    } else {
+      const ef = effects[ri - callees.length];
+      c.group(evClass(ef.ev), sym.name + " may perform " + afterLast(ef.dst, ":") + " (" + ef.ev + ")");
+      c.flow("ex-edge-line", [Pt { x: xm + midW, y: cyMid }, Pt { x: xr, y: cy }], 1.4, evDash(ef.ev));
+      c.arrowhead("ex-edge-head", xr, cy, 1);
+      c.endGroup();
+      c.group("ex-node", afterLast(ef.dst, ":") + " " + ef.via + " (" + ef.ev + ")");
+      c.rrect("ex-node-box ex-box-effect", xr, cy - 14.0, boxW, 28.0, 14.0);
+      c.text(xr + 14.0, cy + 4.0, clip(afterLast(ef.dst, ":"), 22), "ex-t", 12, "start", "600", 0);
+      c.text(xr + boxW - 14.0, cy + 4.0, ef.via, "ex-t2", 10, "end", "400", 0);
+      c.endGroup();
+    }
+    ri += 1;
+  }
+  // the symbol itself
+  c.group("ex-node ex-node-focus", sym.id);
+  c.rrect("ex-node-box ex-box-focus", xm, cyMid - 22.0, midW, 44.0, 10.0);
+  c.text(xm + midW / 2.0, cyMid - 2.0, clip(afterLast(sym.id, "::"), 28), "ex-t", 13, "middle", "700", 0);
+  c.text(xm + midW / 2.0, cyMid + 13.0, sym.kind, "ex-t2", 10, "middle", "400", 0);
+  c.endGroup();
+  return Some(c.finish());
+}
+
+function drawSym(c0: Canvas, nb: Nb, x: float, y: float, w: float, h: float): Canvas {
+  let c = c0;
+  c.link(nb.href, "ex-node", nb.label + " (" + nb.kind + ")");
+  c.rrect(nb.node == NONE ? "ex-node-box ex-box-unknown" : "ex-node-box", x, y, w, h, 8.0);
+  c.text(x + 12.0, y + h / 2.0 + 4.0, clip(nb.label, 26), nb.node == NONE ? "ex-t2" : "ex-t", 12, "start", "500", 0);
+  c.endLink();
+  return c;
+}

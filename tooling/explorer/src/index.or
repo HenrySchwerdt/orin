@@ -1,0 +1,261 @@
+// The explorer's index over a snapshot: node lookup, page ownership and slugs, adjacency, per-module statistics and the
+// module-level graphs. Everything is computed once, in node order (nodes are sorted by id in a snapshot), so every list and
+// every slug is deterministic.
+
+import { Snap, Sym, Rel } from "./model";
+import { strCmp, slugOf } from "./util";
+
+export const NONE: usize = 4294967295;
+
+// the kinds that get a page of their own; Field, Variant and Contract are shown on the page of their owner
+export function isPageKind(k: string): bool {
+  return k == "Function" || k == "Method" || k == "Class" || k == "Interface" || k == "Record" || k == "Union" || k == "Alias" || k == "Const";
+}
+
+export function isMemberKind(k: string): bool {
+  return k == "Field" || k == "Variant" || k == "Contract";
+}
+
+export type ModStat = {
+  name: string; slug: string;
+  symbols: int; exported: int; contracts: int; documented: int; effectful: int; entries: int;
+  importsOut: usize[]; importsIn: usize[];   // indices into Ix.mods
+};
+
+// An edge of a module-level graph: `imports` (IMPORTS edge exists) and the CALLS between the modules by evidence
+export type MEdge = { a: usize; b: usize; imports: bool; calls: int; must: int; may: int; unknown: int; };
+
+export type Ix = {
+  snap: Snap;
+  byId: Map<string, usize>;
+  page: usize[];            // per node: the node whose page shows it (itself, its owner's, ...); NONE for Package / Module / Effect
+  slug: string[];           // per node with a page: its file name stem; "" otherwise
+  out: usize[][];           // per node: indices of the edges that start there
+  inn: usize[][];           // per node: indices of the edges that end there
+  kids: usize[][];          // per node: the nodes it owns
+  contracts: int[];         // per page node: number of contract clauses
+  mods: ModStat[];          // sorted by name
+  modNode: Map<string, usize>;   // module name -> index into mods
+  medges: MEdge[];          // between distinct modules, sorted by (a, b)
+};
+
+function pageOf(nodes: Sym[], byId: Map<string, usize>, i: usize): usize {
+  let cur = i;
+  let guard: usize = 0;
+  while (guard < 8) {
+    const k = nodes[cur].kind;
+    if (isPageKind(k)) {
+      return cur;
+    }
+    if (!isMemberKind(k)) {
+      return NONE;
+    }
+    const o = byId.get(nodes[cur].owner);
+    if (o.isNone()) {
+      return NONE;
+    }
+    cur = o.unwrap();
+    guard += 1;
+  }
+  return NONE;
+}
+
+export function buildIx(snap: Snap): Ix {
+  const nodes = snap.nodes;
+  const n = nodes.length;
+  let byId = new Map<string, usize>();
+  let i: usize = 0;
+  while (i < n) {
+    byId.set(nodes[i].id, i);
+    i += 1;
+  }
+  let page: usize[] = [];
+  let slug: string[] = [];
+  let out: usize[][] = [];
+  let inn: usize[][] = [];
+  let kids: usize[][] = [];
+  let contracts: int[] = [];
+  i = 0;
+  while (i < n) {
+    page.push(pageOf(nodes, byId, i));
+    slug.push("");
+    out.push([]);
+    inn.push([]);
+    kids.push([]);
+    contracts.push(0);
+    i += 1;
+  }
+  // slugs: lower-case, unique (a collision of two ids that differ in case or punctuation gets -2, -3, ... in node order)
+  let used = new Map<string, bool>();
+  i = 0;
+  while (i < n) {
+    if (page[i] == i) {
+      const colon = nodes[i].id.indexOf(":");
+      let base = slugOf(colon.isSome() ? nodes[i].id.substring(colon.unwrap() + 1, nodes[i].id.length) : nodes[i].id);
+      let cand = base;
+      let k: int = 2;
+      while (used.has(cand)) {
+        cand = base + "-" + k.toString();
+        k += 1;
+      }
+      used.set(cand, true);
+      slug[i] = cand;
+    }
+    const o = byId.get(nodes[i].owner);
+    if (o.isSome()) {
+      kids[o.unwrap()].push(i);
+    }
+    if (nodes[i].kind == "Contract" && page[i] != NONE) {
+      contracts[page[i]] += 1;
+    }
+    i += 1;
+  }
+  let e: usize = 0;
+  while (e < snap.edges.length) {
+    const s = byId.get(snap.edges[e].src);
+    const d = byId.get(snap.edges[e].dst);
+    if (s.isSome()) {
+      out[s.unwrap()].push(e);
+    }
+    if (d.isSome()) {
+      inn[d.unwrap()].push(e);
+    }
+    e += 1;
+  }
+  // modules
+  let names: string[] = [];
+  i = 0;
+  while (i < n) {
+    if (nodes[i].kind == "Module") {
+      names.push(nodes[i].name);
+    }
+    i += 1;
+  }
+  names = names.sort((a: string, b: string): int => strCmp(a, b));
+  let modNode = new Map<string, usize>();
+  let mods: ModStat[] = [];
+  let mi: usize = 0;
+  while (mi < names.length) {
+    modNode.set(names[mi], mi);
+    mods.push(ModStat {
+      name: names[mi], slug: slugOf(names[mi] == "(root)" ? "root" : names[mi]), symbols: 0, exported: 0, contracts: 0, documented: 0,
+      effectful: 0, entries: 0, importsOut: [], importsIn: [],
+    });
+    mi += 1;
+  }
+  // make the module slugs unique as well
+  let mused = new Map<string, bool>();
+  mi = 0;
+  while (mi < mods.length) {
+    let cand = mods[mi].slug;
+    let k: int = 2;
+    while (mused.has(cand)) {
+      cand = mods[mi].slug + "-" + k.toString();
+      k += 1;
+    }
+    mused.set(cand, true);
+    mods[mi].slug = cand;
+    mi += 1;
+  }
+  i = 0;
+  while (i < n) {
+    const sy = nodes[i];
+    const m = modNode.get(sy.module);
+    if (m.isSome() && page[i] == i) {
+      const x = m.unwrap();
+      mods[x].symbols += 1;
+      mods[x].exported += sy.exported ? 1 : 0;
+      mods[x].contracts += contracts[i];
+      mods[x].documented += sy.doc.length > 0 ? 1 : 0;
+      mods[x].entries += sy.entry ? 1 : 0;
+      let eff = false;
+      for (const ei of out[i]) {
+        if (snap.edges[ei].kind == "MAY_PERFORM") {
+          eff = true;
+        }
+      }
+      mods[x].effectful += eff ? 1 : 0;
+    }
+    i += 1;
+  }
+  // module-level edges: IMPORTS between modules, CALLS aggregated over the symbols' modules
+  let medges: MEdge[] = [];
+  let mix = new Map<string, usize>();
+  e = 0;
+  while (e < snap.edges.length) {
+    const ed = snap.edges[e];
+    let a: usize = NONE;
+    let b: usize = NONE;
+    const s = byId.get(ed.src);
+    const d = byId.get(ed.dst);
+    if (s.isSome() && d.isSome()) {
+      const ma = modNode.get(ed.kind == "IMPORTS" ? nodes[s.unwrap()].name : nodes[s.unwrap()].module);
+      const mb = modNode.get(ed.kind == "IMPORTS" ? nodes[d.unwrap()].name : nodes[d.unwrap()].module);
+      if (ma.isSome() && mb.isSome()) {
+        a = ma.unwrap();
+        b = mb.unwrap();
+      }
+    }
+    if (a != NONE && a != b && (ed.kind == "IMPORTS" || ed.kind == "CALLS")) {
+      const key = a.toString() + ">" + b.toString();
+      const at = mix.get(key);
+      let x: usize = 0;
+      if (at.isSome()) {
+        x = at.unwrap();
+      } else {
+        x = medges.length;
+        mix.set(key, x);
+        medges.push(MEdge { a: a, b: b, imports: false, calls: 0, must: 0, may: 0, unknown: 0 });
+      }
+      if (ed.kind == "IMPORTS") {
+        medges[x].imports = true;
+      } else {
+        medges[x].calls += 1;
+        if (ed.ev == "MUST") {
+          medges[x].must += 1;
+        } else if (ed.ev == "MAY") {
+          medges[x].may += 1;
+        } else {
+          medges[x].unknown += 1;
+        }
+      }
+    }
+    e += 1;
+  }
+  medges = medges.sort((p: MEdge, q: MEdge): int => p.a != q.a ? (p.a < q.a ? -1 : 1) : (p.b < q.b ? -1 : (p.b > q.b ? 1 : 0)));
+  for (const me of medges) {
+    if (me.imports) {
+      mods[me.a].importsOut.push(me.b);
+      mods[me.b].importsIn.push(me.a);
+    }
+  }
+  return Ix { snap: snap, byId: byId, page: page, slug: slug, out: out, inn: inn, kids: kids, contracts: contracts, mods: mods,
+              modNode: modNode, medges: medges };
+}
+
+// the indices (into snap.edges) of the edges of `kind` that start at / end at node `i`
+export function outOf(ix: Ix, i: usize, kind: string): usize[] {
+  let r: usize[] = [];
+  for (const e of ix.out[i]) {
+    if (ix.snap.edges[e].kind == kind) {
+      r.push(e);
+    }
+  }
+  return r;
+}
+
+export function inOf(ix: Ix, i: usize, kind: string): usize[] {
+  let r: usize[] = [];
+  for (const e of ix.inn[i]) {
+    if (ix.snap.edges[e].kind == kind) {
+      r.push(e);
+    }
+  }
+  return r;
+}
+
+// the page node of the node with id `id` (NONE when the id is not in the snapshot or has no page)
+export function pageNodeOf(ix: Ix, id: string): usize {
+  const x = ix.byId.get(id);
+  return x.isNone() ? NONE : ix.page[x.unwrap()];
+}

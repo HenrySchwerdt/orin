@@ -51,6 +51,22 @@ file-based discovery. No matching tests fails; `--allow-empty` explicitly permit
 A nonmatching explicit `--filter` still fails. Development and release builds retain the compiler's
 ownership verifier; release does not weaken checking.
 
+## Workspaces
+
+A directory with an `orin-workspace.toml` ([workspace.md](workspace.md)) groups several packages. At its root
+`orin build|check|test|fmt` act on `default-members` (all members when unset); `--workspace` selects every member and
+`-p <name>` one or more, in deterministic dependency order. `--locked` (implied when `CI` is set; `--unlocked` overrides)
+fails with E0509 when `orin.lock` is missing or differs from the members. `build` and `check` stop at the first failing
+member, `test` and `fmt` run all members and then exit 1; `--keep-going` and `--fail-fast` flip these. Inside a member
+directory without flags, or with an explicit path, commands behave exactly like a standalone project.
+
+```sh
+orin workspace list --default
+orin test --workspace --locked
+orin fmt --check --workspace
+orin build -p app --release
+```
+
 ## Terminal output
 
 Compiler failures include source excerpts, carets, and notes. Status and diagnostic colors follow

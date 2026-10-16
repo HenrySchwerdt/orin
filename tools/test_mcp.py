@@ -364,7 +364,7 @@ def main():
     for side in ("base", "head"):
         shutil.copytree(os.path.join(ROOT, "tests", "osig", "accept", side), os.path.join(proj, "osig", side))
     err, v, raw = c.call("graph", {"entry": "osig/head"})
-    check(not err and v["schema"] == "osig/0.2" and v["package"] == "acme" and v["hash"].startswith("h62:")
+    check(not err and v["schema"] == "osig/0.3" and v["package"] == "acme" and v["hash"].startswith("h62:")
           and v["nodes"] > 5 and v["edges"] > 5 and "snapshot" not in v, "graph summary (%s)" % raw)
     err, v2, raw = c.call("graph", {"entry": "osig/head", "full": True, "out": "osig/head.json"})
     check(not err and v2["hash"] == v["hash"] and json.loads(v2["snapshot"])["hash"] == v["hash"], "graph full is deterministic")

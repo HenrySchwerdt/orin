@@ -1,0 +1,530 @@
+// A deterministic layered ("Sugiyama style") graph layout, left to right:
+//   1. cycle removal: a depth-first search reverses the edges that close a cycle (they are drawn flowing backwards),
+//   2. layering: longest path from the sources, sources pulled next to their targets,
+//   3. long edges get one dummy vertex per crossed layer, so they are routed between the nodes,
+//   4. crossing reduction: alternating barycenter sweeps,
+//   5. coordinates: layer columns; inside a layer an isotonic fit (pool adjacent violators) puts every vertex as close as
+//      possible to the mean height of its neighbours while keeping the order and the minimum distance,
+//   6. ports: the edges of a node leave and enter it at distinct heights, ordered by the height of the other end.
+// No randomness and no hash order anywhere: the same graph always gives the same drawing.
+
+import { Pt } from "orin-reports";
+
+export type LNode = { w: float; h: float; };
+export type LEdge = { a: usize; b: usize; };
+export type Placed = { x: float; y: float; };
+// pts: the polyline the edge follows (start on the source node's right side, end on the target's left side when `back` is
+// false); for a `back` edge (it closes a cycle) the points run from the target's right side to the source's left side
+export type Route = { pts: Pt[]; back: bool; };
+export type Layout = { nodes: Placed[]; layer: usize[]; routes: Route[]; width: float; height: float; };
+
+const MARGIN: float = 16.0;
+
+// the isotonic (non-decreasing) least-squares fit of `d`, unit weights
+function isotonic(d: float[]): float[] {
+  let sums: float[] = [];
+  let cnt: int[] = [];
+  for (const v of d) {
+    sums.push(v);
+    cnt.push(1);
+    let l = sums.length;
+    while (l >= 2 && sums[l - 2] / cnt[l - 2].toFloat() > sums[l - 1] / cnt[l - 1].toFloat()) {
+      sums[l - 2] = sums[l - 2] + sums[l - 1];
+      cnt[l - 2] = cnt[l - 2] + cnt[l - 1];
+      sums = sums.slice(0, l - 1);
+      cnt = cnt.slice(0, l - 1);
+      l -= 1;
+    }
+  }
+  let out: float[] = [];
+  let b: usize = 0;
+  while (b < sums.length) {
+    const mean = sums[b] / cnt[b].toFloat();
+    let k: int = 0;
+    while (k < cnt[b]) {
+      out.push(mean);
+      k += 1;
+    }
+    b += 1;
+  }
+  return out;
+}
+
+function sortedBy(items: usize[], keys: float[], tie: int[]): usize[] {
+  return items.sort((p: usize, q: usize): int => keys[p] < keys[q] ? -1 : (keys[p] > keys[q] ? 1 : (tie[p] < tie[q] ? -1 : (tie[p] > tie[q] ? 1 : 0))));
+}
+
+export function layered(nodes: LNode[], edges: LEdge[], gapX: float, gapY: float): Layout {
+  const n = nodes.length;
+  // ---- adjacency without self loops and duplicates
+  let succ: usize[][] = [];
+  let pred: usize[][] = [];
+  let k: usize = 0;
+  while (k < n) {
+    succ.push([]);
+    pred.push([]);
+    k += 1;
+  }
+  let seen = new Map<string, bool>();
+  let kept: usize[] = [];     // indices of the edges that take part
+  let ei: usize = 0;
+  while (ei < edges.length) {
+    const a = edges[ei].a;
+    const b = edges[ei].b;
+    const key = a.toString() + ">" + b.toString();
+    if (a != b && a < n && b < n && !seen.has(key)) {
+      seen.set(key, true);
+      succ[a].push(b);
+      pred[b].push(a);
+      kept.push(ei);
+    }
+    ei += 1;
+  }
+  // ---- 1. cycle removal (iterative DFS, roots: sources first, then the rest in index order)
+  let color: int[] = [];
+  let nextChild: usize[] = [];
+  k = 0;
+  while (k < n) {
+    color.push(0);
+    nextChild.push(0);
+    k += 1;
+  }
+  let flipped = new Map<string, bool>();
+  let rootOrder: usize[] = [];
+  k = 0;
+  while (k < n) {
+    if (pred[k].length == 0) {
+      rootOrder.push(k);
+    }
+    k += 1;
+  }
+  k = 0;
+  while (k < n) {
+    if (pred[k].length > 0) {
+      rootOrder.push(k);
+    }
+    k += 1;
+  }
+  for (const r of rootOrder) {
+    if (color[r] != 0) {
+      continue;
+    }
+    let stack: usize[] = [r];
+    color[r] = 1;
+    while (stack.length > 0) {
+      const u = stack[stack.length - 1];
+      if (nextChild[u] < succ[u].length) {
+        const v = succ[u][nextChild[u]];
+        nextChild[u] += 1;
+        if (color[v] == 0) {
+          color[v] = 1;
+          stack.push(v);
+        } else if (color[v] == 1) {
+          flipped.set(u.toString() + ">" + v.toString(), true);
+        }
+      } else {
+        color[u] = 2;
+        stack = stack.slice(0, stack.length - 1);
+      }
+    }
+  }
+  // oriented edges (fa -> fb), one per kept edge
+  let fa: usize[] = [];
+  let fb: usize[] = [];
+  let fback: bool[] = [];
+  for (const e of kept) {
+    const a = edges[e].a;
+    const b = edges[e].b;
+    const back = flipped.has(a.toString() + ">" + b.toString());
+    fa.push(back ? b : a);
+    fb.push(back ? a : b);
+    fback.push(back);
+  }
+  // ---- 2. layering
+  let osucc: usize[][] = [];
+  let indeg: int[] = [];
+  k = 0;
+  while (k < n) {
+    osucc.push([]);
+    indeg.push(0);
+    k += 1;
+  }
+  let o: usize = 0;
+  while (o < fa.length) {
+    osucc[fa[o]].push(fb[o]);
+    indeg[fb[o]] += 1;
+    o += 1;
+  }
+  let layer: int[] = [];
+  k = 0;
+  while (k < n) {
+    layer.push(0);
+    k += 1;
+  }
+  let order: usize[] = [];
+  let work: int[] = [];
+  k = 0;
+  while (k < n) {
+    work.push(indeg[k]);
+    if (indeg[k] == 0) {
+      order.push(k);
+    }
+    k += 1;
+  }
+  let qi: usize = 0;
+  while (qi < order.length) {
+    const u = order[qi];
+    qi += 1;
+    for (const v of osucc[u]) {
+      if (layer[v] < layer[u] + 1) {
+        layer[v] = layer[u] + 1;
+      }
+      work[v] -= 1;
+      if (work[v] == 0) {
+        order.push(v);
+      }
+    }
+  }
+  // a source sits directly in front of its nearest target
+  k = 0;
+  while (k < n) {
+    if (indeg[k] == 0 && osucc[k].length > 0) {
+      let m = layer[osucc[k][0]];
+      for (const v of osucc[k]) {
+        if (layer[v] < m) {
+          m = layer[v];
+        }
+      }
+      layer[k] = m - 1 > 0 ? m - 1 : 0;
+    }
+    k += 1;
+  }
+  // ---- 3. dummy vertices
+  let vl: int[] = [];       // layer of every vertex (real ones first)
+  let vw: float[] = [];
+  let vh: float[] = [];
+  k = 0;
+  while (k < n) {
+    vl.push(layer[k]);
+    vw.push(nodes[k].w);
+    vh.push(nodes[k].h);
+    k += 1;
+  }
+  let up: usize[][] = [];
+  let down: usize[][] = [];
+  k = 0;
+  while (k < n) {
+    up.push([]);
+    down.push([]);
+    k += 1;
+  }
+  let chains: usize[][] = [];
+  o = 0;
+  while (o < fa.length) {
+    let chain: usize[] = [fa[o]];
+    let prev = fa[o];
+    let l = layer[fa[o]] + 1;
+    while (l < layer[fb[o]]) {
+      const d = vl.length;
+      vl.push(l);
+      vw.push(0.0);
+      vh.push(4.0);
+      up.push([]);
+      down.push([]);
+      down[prev].push(d);
+      up[d].push(prev);
+      chain.push(d);
+      prev = d;
+      l += 1;
+    }
+    down[prev].push(fb[o]);
+    up[fb[o]].push(prev);
+    chain.push(fb[o]);
+    chains.push(chain);
+    o += 1;
+  }
+  const nv = vl.length;
+  let nl: usize = 1;
+  k = 0;
+  while (k < n) {
+    if (layer[k].toUsize() + 1 > nl) {
+      nl = layer[k].toUsize() + 1;
+    }
+    k += 1;
+  }
+  let rows: usize[][] = [];
+  k = 0;
+  while (k < nl) {
+    rows.push([]);
+    k += 1;
+  }
+  k = 0;
+  while (k < nv) {
+    rows[vl[k].toUsize()].push(k);
+    k += 1;
+  }
+  // ---- 4. crossing reduction
+  let pos: float[] = [];
+  let tie: int[] = [];
+  k = 0;
+  while (k < nv) {
+    pos.push(0.0);
+    tie.push(k.toInt());
+    k += 1;
+  }
+  let li: usize = 0;
+  while (li < nl) {
+    let j: usize = 0;
+    while (j < rows[li].length) {
+      pos[rows[li][j]] = j.toFloat();
+      j += 1;
+    }
+    li += 1;
+  }
+  let sweep: int = 0;
+  while (sweep < 12) {
+    const goDown = sweep % 2 == 0;
+    let step: usize = 1;
+    while (step < nl) {
+      const l = goDown ? step : nl - 1 - step;
+      let keys: float[] = [];
+      let t: usize = 0;
+      while (t < nv) {
+        keys.push(pos[t]);
+        t += 1;
+      }
+      for (const v of rows[l]) {
+        const nb = goDown ? up[v] : down[v];
+        if (nb.length > 0) {
+          let s = 0.0;
+          for (const u of nb) {
+            s += pos[u];
+          }
+          keys[v] = s / nb.length.toFloat();
+        }
+      }
+      rows[l] = sortedBy(rows[l], keys, tie);
+      let j: usize = 0;
+      while (j < rows[l].length) {
+        pos[rows[l][j]] = j.toFloat();
+        j += 1;
+      }
+      step += 1;
+    }
+    sweep += 1;
+  }
+  // ---- 5. coordinates
+  let colW: float[] = [];
+  li = 0;
+  while (li < nl) {
+    let w = 0.0;
+    for (const v of rows[li]) {
+      if (vw[v] > w) {
+        w = vw[v];
+      }
+    }
+    colW.push(w);
+    li += 1;
+  }
+  let colX: float[] = [];
+  let x = MARGIN;
+  li = 0;
+  while (li < nl) {
+    colX.push(x);
+    x += colW[li] + gapX;
+    li += 1;
+  }
+  let vx: float[] = [];
+  k = 0;
+  while (k < nv) {
+    const l = vl[k].toUsize();
+    vx.push(vw[k] == 0.0 ? colX[l] + colW[l] / 2.0 : colX[l] + (colW[l] - vw[k]) / 2.0);
+    k += 1;
+  }
+  // centres: stacked first, then relaxed towards the neighbours
+  let cy: float[] = [];
+  k = 0;
+  while (k < nv) {
+    cy.push(0.0);
+    k += 1;
+  }
+  let offs: float[] = [];     // per vertex: its offset inside its layer when stacked tightly
+  k = 0;
+  while (k < nv) {
+    offs.push(0.0);
+    k += 1;
+  }
+  li = 0;
+  while (li < nl) {
+    let acc = 0.0;
+    let j: usize = 0;
+    while (j < rows[li].length) {
+      const v = rows[li][j];
+      if (j > 0) {
+        const p = rows[li][j - 1];
+        const gap = (vw[v] == 0.0 || vw[p] == 0.0) ? 10.0 : gapY;
+        acc += vh[p] / 2.0 + gap + vh[v] / 2.0;
+      }
+      offs[v] = acc;
+      cy[v] = acc;
+      j += 1;
+    }
+    li += 1;
+  }
+  let iter: int = 0;
+  while (iter < 14) {
+    const goDown = iter % 2 == 0;
+    let step: usize = 0;
+    while (step < nl) {
+      const l = goDown ? step : nl - 1 - step;
+      let d: float[] = [];
+      for (const v of rows[l]) {
+        let nb: usize[] = [];
+        for (const u of up[v]) {
+          nb.push(u);
+        }
+        for (const u of down[v]) {
+          nb.push(u);
+        }
+        if (iter < 6) {
+          nb = goDown ? up[v] : down[v];
+          if (nb.length == 0) {
+            nb = goDown ? down[v] : up[v];
+          }
+        }
+        if (nb.length == 0) {
+          d.push(cy[v] - offs[v]);
+        } else {
+          let s = 0.0;
+          for (const u of nb) {
+            s += cy[u];
+          }
+          d.push(s / nb.length.toFloat() - offs[v]);
+        }
+      }
+      const z = isotonic(d);
+      let j: usize = 0;
+      while (j < rows[l].length) {
+        cy[rows[l][j]] = z[j] + offs[rows[l][j]];
+        j += 1;
+      }
+      step += 1;
+    }
+    iter += 1;
+  }
+  let minTop = 1000000000.0;
+  let maxBot = 0.0;
+  k = 0;
+  while (k < nv) {
+    if (cy[k] - vh[k] / 2.0 < minTop) {
+      minTop = cy[k] - vh[k] / 2.0;
+    }
+    if (cy[k] + vh[k] / 2.0 > maxBot) {
+      maxBot = cy[k] + vh[k] / 2.0;
+    }
+    k += 1;
+  }
+  const shift = MARGIN - minTop;
+  k = 0;
+  while (k < nv) {
+    cy[k] = cy[k] + shift;
+    k += 1;
+  }
+  // ---- 6. ports and routes
+  let outCount: int[] = [];
+  let inCount: int[] = [];
+  let outSeen: int[] = [];
+  let inSeen: int[] = [];
+  k = 0;
+  while (k < n) {
+    outCount.push(0);
+    inCount.push(0);
+    outSeen.push(0);
+    inSeen.push(0);
+    k += 1;
+  }
+  o = 0;
+  while (o < fa.length) {
+    outCount[fa[o]] += 1;
+    inCount[fb[o]] += 1;
+    o += 1;
+  }
+  // edges by the height of the neighbour on the other side (ties: edge order)
+  let outKey: float[] = [];
+  let inKey: float[] = [];
+  let eIdx: usize[] = [];
+  o = 0;
+  while (o < fa.length) {
+    outKey.push(cy[chains[o][1]]);
+    inKey.push(cy[chains[o][chains[o].length - 2]]);
+    eIdx.push(o);
+    o += 1;
+  }
+  let etie: int[] = [];
+  o = 0;
+  while (o < fa.length) {
+    etie.push(o.toInt());
+    o += 1;
+  }
+  const byOut = sortedBy(eIdx, outKey, etie);
+  const byIn = sortedBy(eIdx, inKey, etie);
+  let srcY: float[] = [];
+  let dstY: float[] = [];
+  o = 0;
+  while (o < fa.length) {
+    srcY.push(0.0);
+    dstY.push(0.0);
+    o += 1;
+  }
+  for (const e of byOut) {
+    const u = fa[e];
+    const cnt = outCount[u];
+    const stepY = cnt > 1 ? minF(7.0, (nodes[u].h - 16.0) / (cnt - 1).toFloat()) : 0.0;
+    srcY[e] = cy[u] + (outSeen[u].toFloat() - (cnt - 1).toFloat() / 2.0) * stepY;
+    outSeen[u] += 1;
+  }
+  for (const e of byIn) {
+    const v = fb[e];
+    const cnt = inCount[v];
+    const stepY = cnt > 1 ? minF(7.0, (nodes[v].h - 16.0) / (cnt - 1).toFloat()) : 0.0;
+    dstY[e] = cy[v] + (inSeen[v].toFloat() - (cnt - 1).toFloat() / 2.0) * stepY;
+    inSeen[v] += 1;
+  }
+  let routes: Route[] = [];
+  k = 0;
+  while (k < edges.length) {
+    routes.push(Route { pts: [], back: false });
+    k += 1;
+  }
+  o = 0;
+  while (o < fa.length) {
+    const ch = chains[o];
+    let pts: Pt[] = [Pt { x: vx[ch[0]] + vw[ch[0]], y: srcY[o] }];
+    let c: usize = 1;
+    while (c + 1 < ch.length) {
+      pts.push(Pt { x: vx[ch[c]], y: cy[ch[c]] });
+      c += 1;
+    }
+    pts.push(Pt { x: vx[ch[ch.length - 1]], y: dstY[o] });
+    routes[kept[o]] = Route { pts: pts, back: fback[o] };
+    o += 1;
+  }
+  let placed: Placed[] = [];
+  k = 0;
+  while (k < n) {
+    placed.push(Placed { x: vx[k], y: cy[k] - vh[k] / 2.0 });
+    k += 1;
+  }
+  let lay: usize[] = [];
+  k = 0;
+  while (k < n) {
+    lay.push(vl[k].toUsize());
+    k += 1;
+  }
+  const last = nl - 1;
+  return Layout { nodes: placed, layer: lay, routes: routes, width: colX[last] + colW[last] + MARGIN, height: maxBot + shift + MARGIN };
+}
+
+function minF(a: float, b: float): float {
+  return a < b ? a : b;
+}

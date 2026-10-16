@@ -29,6 +29,7 @@ mkdir -p build
 {
   echo 'python3 tools/test_execution.py --orinc "$ORIN2"'
   echo 'sh tooling/benchmarks/test.sh'
+  echo 'sh tooling/explorer/test.sh'
   for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test workspace_fixtures workspace_cli; do
     echo "sh tools/test_tooling.sh --unit $t"
   done
