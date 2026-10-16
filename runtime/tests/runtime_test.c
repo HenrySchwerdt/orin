@@ -391,6 +391,29 @@ static OrinObj *u8array(const unsigned char *p, uint64_t n) {
     return a;
 }
 
+/* Zero-capacity arrays have NULL items: an empty conversion must not form NULL + 0. */
+static void test_empty_byte_strings(void) {
+    int64_t base = orin_live_count();
+    OrinObj *empty = orin_array_new(0, 0), *reserved = orin_array_new(4, 0);
+    CHECK(((OrinArray *)empty)->items == NULL && orin_array_len(empty) == 0);
+    CHECK(((OrinArray *)reserved)->items != NULL && orin_array_len(reserved) == 0);
+    OrinObj *e0 = orin_bytes_to_string(empty, 0, 0);
+    OrinObj *e1 = orin_bytes_to_string(empty, 0, 0);
+    OrinObj *er = orin_bytes_to_string(reserved, 0, 0);
+    CHECK(streq(e0, "") && streq(e1, "") && streq(er, ""));
+    CHECK(e0 != e1 && e0 != er && e1 != er && e0->rc == 1 && e1->rc == 1 && er->rc == 1);
+    CHECK(orin_str_data(e0)[0] == 0 && orin_str_data(e1)[0] == 0);
+    unsigned char data[3] = {0, 65, 255};
+    OrinObj *bytes = u8array(data, 3);
+    OrinObj *start = orin_bytes_to_string(bytes, 0, 0), *end = orin_bytes_to_string(bytes, 3, 0);
+    OrinObj *full = orin_bytes_to_string(bytes, 0, 3);
+    CHECK(streq(start, "") && streq(end, "") && start != end);
+    CHECK(orin_str_len(full) == 3 && memcmp(orin_str_data(full), data, 3) == 0);
+    OrinObj *all[] = {empty, reserved, e0, e1, er, bytes, start, end, full};
+    for (size_t i = 0; i < sizeof all / sizeof *all; i++) orin_release(all[i]);
+    CHECK(orin_live_count() == base);
+}
+
 static int bulk_traps(int which) {
     fflush(stdout);
     pid_t pid = fork();
@@ -400,6 +423,7 @@ static int bulk_traps(int which) {
         OrinObj *a = u8array(b, 3);
         OrinObj *refs = orin_array_new(1, 1);
         OrinObj *str = S("x");
+        OrinObj *empty = orin_array_new(0, 0);
         switch (which) {
         case 0: (void)orin_bytes_to_string(a, 2, 2); break;                 /* start + len > length */
         case 1: (void)orin_bytes_to_string(a, 4, 0); break;                 /* start > length */
@@ -410,6 +434,9 @@ static int bulk_traps(int which) {
         case 6: (void)orin_string_to_bytes(a); break;                       /* an array is not a string */
         case 7: (void)orin_array_extend(str, a); break;                     /* a string cannot be extended */
         case 8: (void)orin_array_extend(a, str); break;
+        case 9: (void)orin_bytes_to_string(empty, 1, 0); break;             /* empty array: start past end */
+        case 10: (void)orin_bytes_to_string(empty, 0, 1); break;            /* empty array: length past end */
+        case 11: (void)orin_bytes_to_string(str, 0, 0); break;              /* empty range still checks shape */
         }
         _exit(0);
     }
@@ -436,7 +463,7 @@ static void test_bulk(void) {
     OrinObj *emp = S("");
     OrinObj *eb = orin_string_to_bytes(emp);
     CHECK(orin_array_len(eb) == 0);
-    for (int i = 0; i < 9; i++) CHECK(bulk_traps(i));
+    for (int i = 0; i < 12; i++) CHECK(bulk_traps(i));
     /* extend: in place when unique (same object), a copy when shared; b is never changed */
     OrinObj *x = orin_array_new(0, 0);
     for (uint64_t i = 0; i < 3; i++) orin_array_push(x, i);
@@ -480,6 +507,7 @@ int main(int argc, char **argv) {
     test_deep_chain();
     test_misc();
     test_shape_traps();
+    test_empty_byte_strings();
     test_bulk();
     test_grants();
     test_net_handles();

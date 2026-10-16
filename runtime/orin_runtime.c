@@ -1151,10 +1151,10 @@ OrinObj *orin_bytes_to_string(OrinObj *o, uint64_t start, uint64_t len) {
     if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY || a->is_ref)) orin_trap_shape();
     if (ORIN_UNLIKELY(start > a->len || len > a->len - start)) orin_trap("slice out of range");
     OrinString *s = str_alloc(len, len);
-    const uint64_t *src = a->items + start;
     uint64_t bad = 0;
     for (uint64_t i = 0; i < len; i++) {
-        uint64_t v = src[i];
+        /* Empty arrays may have NULL items; only form an element address when len > 0. */
+        uint64_t v = a->items[start + i];
         bad |= v;
         s->data[i] = (char)(unsigned char)v;
     }
