@@ -61,24 +61,29 @@ function runModes(fs: FsGrant, proc: ProcessGrant, o: Options): int {
   }
   const oldFlags = modeFlags(o.mode);
   const oldIsLlvm = o.mode == "llvm";
-  // two pipelines per program (default, alternative): jobs 2i and 2i+1
+  // two pipelines per program (default, alternative): pipes 2i and 2i+1. The two sides of one program never run at the
+  // same time (as in the Python script, which ran them one after the other): a program that works in a fixed directory
+  // such as build/tests/cap_scope would otherwise race with itself. So all default sides run first, then all
+  // alternative sides.
   let pipes: Pipe[] = [];
-  let jobs: Job[] = [];
+  let jobsA: Job[] = [];
+  let jobsB: Job[] = [];
   for (const p of selected) {
     const a = pipeline(o, p, "new", [], false);
     const b = pipeline(o, p, "old", oldFlags, oldIsLlvm);
-    for (const pipe of [a, b]) {
-      pipes.push(pipe);
-      jobs.push(Job { id: jobs.length, cmds: pipe.cmds, timeouts: pipe.timeouts, stop: true });
-    }
+    pipes.push(a);
+    pipes.push(b);
+    jobsA.push(Job { id: jobsA.length, cmds: a.cmds, timeouts: a.timeouts, stop: true });
+    jobsB.push(Job { id: jobsB.length, cmds: b.cmds, timeouts: b.timeouts, stop: true });
   }
-  const ran = runAll(proc, jobs, cpuCount(fs, proc, o.root));
+  const ranA = runAll(proc, jobsA, cpuCount(fs, proc, o.root));
+  const ranB = runAll(proc, jobsB, cpuCount(fs, proc, o.root));
   let sidesA: Side[] = [];
   let sidesB: Side[] = [];
   k = 0;
   while (k < selected.length) {
-    sidesA.push(sideOf(fs, o.root, pipes[2 * k], ran[2 * k].rcs));
-    sidesB.push(sideOf(fs, o.root, pipes[2 * k + 1], ran[2 * k + 1].rcs));
+    sidesA.push(sideOf(fs, o.root, pipes[2 * k], ranA[k].rcs));
+    sidesB.push(sideOf(fs, o.root, pipes[2 * k + 1], ranB[k].rcs));
     k += 1;
   }
   // byte comparison of the stdout files, for the programs that ran to completion with the same status
