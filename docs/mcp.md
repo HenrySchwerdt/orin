@@ -59,7 +59,7 @@ No source text unless `includeSource: true`.
   mutates, cost, allocation, example); `Array.find` is flagged `planned` because the self-hosted
   compiler does not implement it yet. Project symbols resolve in the program rooted at `entry`:
   `{"name","kind","sig","at":"file:line:col","exported","in","mutates"}` — `mutates` (methods only) is
-  the checker's inferred receiver mutability. Interfaces (ADR-0019) have kind `interface` with
+  the checker's inferred receiver mutability. A declaration with user-defined annotations (ADR-0046) also has `"annotations":[{"name":"Route","args":["\"/users/:id\"","Get"],"definition":"routes.or:4:6"}]` in source order (`args` as written, `definition` the `@Annotation` record; `sig` starts with the annotation lines as well); the key is absent without annotations. Interfaces (ADR-0019) have kind `interface` with
   `"implementedBy":["Circle at shape.or:7:7", ..]`; a class has `"implements":["Shape", ..]`; an interface
   method is a `method` whose `in` is the interface. A function, method or constructor also has
   `"effects":{"pure":false,"effects":[{"operation":"Fs.ReadFile","direction":"INPUT","grant":"FsGrant","evidence":"MAY",
@@ -127,7 +127,7 @@ carrying the rendered diagnostics.
 
 ```json
 → {"entry":"shop"}
-← {"schema":"osig/0.3","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
+← {"schema":"osig/0.4","package":"shop","hash":"h62:7467802e45ac2dcd","nodes":23,"edges":44}
 ```
 
 ### `diff` {base, head, format?, out?}

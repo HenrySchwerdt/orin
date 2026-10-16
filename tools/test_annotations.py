@@ -176,6 +176,34 @@ def main():
         rc, out, err = run([orin, "api", before])
         check("api: snapshot lists the deprecation indented under its declaration", '  @Deprecated("use h")\n  function f(): int' in out, out)
 
+        # --- api snapshot and user annotations (ADR-0046 S2): the annotation lines are part of the API ------------------
+        usrc = ("@Annotation(function, type, field)\nexport type Doc = { text: string; };\n\n"
+                "export type U = {\n  id: int;\n  name: string;\n};\n\n"
+                "export function g(): int {\n  return 1;\n}\n\nfunction main(): void {\n}\n")
+        upath = os.path.join(tmp, "u.or")
+        with open(upath, "w") as fh:
+            fh.write(usrc)
+        rc, usnap, err = run([orin, "api", upath])
+        check("api: no user annotation, no annotation line besides the definition", rc == 0 and '@Doc' not in usnap and "  @Annotation(function, type, field)\n  type Doc" in usnap, usnap + err)
+        with open(os.path.join(tmp, "usnap.txt"), "w") as fh:
+            fh.write(usnap + "\n")
+        with open(upath, "w") as fh:
+            fh.write(usrc.replace("export function g", "@Doc(\"gets one\")\nexport function g")
+                     .replace("  name: string;", "  @Doc(\"the name\") name: string;"))
+        rc, out, err = run([orin, "api", "--check", os.path.join(tmp, "usnap.txt"), upath])
+        check("api --check reports an added user annotation on a function and on a field (exit 1)",
+              rc == 1 and '+   @Doc("gets one")' in err and '+     @Doc("the name")' in err, out + err)
+        rc, out, err = run([orin, "api", upath])
+        check("api: snapshot lists the user annotation indented under its declaration",
+              '  @Doc("gets one")\n  function g(): int' in out and '    @Doc("the name")\n    name: string' in out, out)
+        with open(upath, "w") as fh:
+            fh.write(usrc.replace("export function g", "@Doc(\"changed\")\nexport function g")
+                     .replace("  name: string;", "  @Doc(\"the name\") name: string;"))
+        with open(os.path.join(tmp, "usnap2.txt"), "w") as fh:
+            fh.write(out)
+        rc, out, err = run([orin, "api", "--check", os.path.join(tmp, "usnap2.txt"), upath])
+        check("api --check reports a changed argument (exit 1)", rc == 1 and '-   @Doc("gets one")' in err and '+   @Doc("changed")' in err, out + err)
+
     # --- @Inline reaches both backends ------------------------------------------------------------------
     inl = os.path.join("tests", "next", "run", "annotations_inline.or")
     with tempfile.TemporaryDirectory() as tmp:
