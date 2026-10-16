@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- **bench/url prints no wall-clock time.** The benchmark printed `ms=<elapsed>` next to its checksum, so every run differed from the
+  previous one (also C against C) and `tools/bench.py` reported "CHECKSUM MISMATCH in url (llvm)". This was not an LLVM miscompile:
+  output of the C and LLVM binaries is identical apart from the timing field. The benchmark now prints only deterministic values
+  (timing is measured by `tools/bench.py`), like every other benchmark.
 - **String intermediates removed (ADR-0038 addendum 2026-10-16, MIR v2.5).** New instructions `IStrAppendNum` (append the decimal
   text of an `int`/`usize` to a string) and `IStrAppendSub` (append `s.substring(i, j)` without the substring object), with the
   ownership rule of `IStrAppend`; runtime `orin_str_append_int` / `_usize` / `_sub`. `s + n.toString()`, `${n}`, `s += n.toString()`,
