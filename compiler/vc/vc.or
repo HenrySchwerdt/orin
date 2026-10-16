@@ -334,7 +334,7 @@ function prelude(): string {
     + "(define-fun trem ((a Int) (b Int)) Int (- a (* b (tdiv a b))))\n";
 }
 
-type Rt = { p: Prog; z3: string; qn: usize; out: Res[]; warns: QWarn[]; };
+type Rt = { p: Prog; z3: string; fi: usize; qn: usize; out: Res[]; warns: QWarn[]; };
 
 // A value the counterexample shows: `label = value`, shown when its guard holds (an element only below the
 // length, a payload only when present).
@@ -365,8 +365,8 @@ function queryText(g: Gen, base: string[], pc: string[], goal: string, probes: P
     + assertAll(extra) + "(assert (not " + goal + "))\n(check-sat)\n" + get;
 }
 
-function solve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, tag: string, query: string): Result<Solved, string> {
-  const base = "build/contracts-vc/q" + qn.toString() + tag;
+function solve(fs: FsGrant, proc: ProcessGrant, z3: string, fi: usize, qn: usize, tag: string, query: string): Result<Solved, string> {
+  const base = "build/contracts-vc/f" + fi.toString() + "q" + qn.toString() + tag;
   const w = writeFile(fs, base + ".smt2", prelude() + query);
   if (w.isErr()) {
     return Err("cannot write " + base + ".smt2: " + w.unwrapErr());
@@ -669,9 +669,9 @@ type Raw = { status: string; reason: string; values: string[]; };
 // drops the lemmas (they follow from the definitions, so a model of the definitions satisfies them) and limits the
 // length of every array and string that is shown in the counterexample: a model found that way is a model of the
 // original query, hence a real counterexample.
-function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): Raw {
+function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, fi: usize, qn: usize, g: Gen, base: string[], pc: string[], goal: string, probes: Probe[]): Raw {
   const q = queryText(g, base, pc, goal, probes, true, []);
-  const s = solve(fs, proc, z3, qn, "", q);
+  const s = solve(fs, proc, z3, fi, qn, "", q);
   if (s.isErr()) {
     return Raw { status: "error", reason: s.unwrapErr(), values: [] };
   }
@@ -685,7 +685,7 @@ function rawProve(fs: FsGrant, proc: ProcessGrant, z3: string, qn: usize, g: Gen
     }
     if (bounds.length > 0) {
       const q2 = queryText(g, base, pc, goal, probes, false, bounds);
-      const s2 = solve(fs, proc, z3, qn, "b", q2);
+      const s2 = solve(fs, proc, z3, fi, qn, "b", q2);
       if (s2.isOk() && s2.unwrap().status == "sat") {
         return Raw { status: "sat", reason: "", values: s2.unwrap().values };
       }
@@ -786,7 +786,7 @@ function taintOf(g: Gen, base: string[], pc: string[], goal: string): string {
   return "";
 }
 
-function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: Gen, base: string[], goals: RetGoal[], statuses: string[], probes: Probe[]): Proved {
+function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, fi: usize, qn0: usize, g: Gen, base: string[], goals: RetGoal[], statuses: string[], probes: Probe[]): Proved {
   let parts: string[] = [];
   let deps: usize[] = [];
   for (const r of goals) {
@@ -794,7 +794,7 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: G
     deps = unionUsize(deps, r.deps);
   }
   let used: usize = 1;
-  const raw = rawProve(fs, proc, z3, qn0, g, base, [], andAll(parts), probes);
+  const raw = rawProve(fs, proc, z3, fi, qn0, g, base, [], andAll(parts), probes);
   if (raw.status == "unsat") {
     return Proved { v: depsVerdict(g, statuses, deps, Verdict { status: "VERIFIED", reason: "", cex: [] }), used: used };
   }
@@ -819,7 +819,7 @@ function proveRets(fs: FsGrant, proc: ProcessGrant, z3: string, qn0: usize, g: G
   }
   for (const r of goals) {
     if (pathApprox(g, base, r) == "") {
-      const one = rawProve(fs, proc, z3, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
+      const one = rawProve(fs, proc, z3, fi, qn0 + used, g, base, [], "(=> " + andAll(r.pc) + " " + r.goal + ")", probes);
       used += 1;
       if (one.status == "sat") {
         return Proved { v: judge(g, one, "", probes), used: used };
@@ -1006,7 +1006,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     if (!wanted) {
       statuses[id] = "SKIPPED";
     } else if (!o.exact) {
-      const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
+      const raw = rawProve(fs, proc, rt.z3, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);
       rt.qn += 1;
       verdicts[id] = judge(g, raw, obligApprox(g, base, raw, o), en.probes);
       statuses[id] = verdicts[id].status;
@@ -1028,7 +1028,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
       if (covered) {
         statuses[id] = "COVERED";
       } else {
-        const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, o.pc, o.goal, en.probes);
+        const raw = rawProve(fs, proc, rt.z3, rt.fi, rt.qn, g, base, o.pc, o.goal, en.probes);
         rt.qn += 1;
         verdicts[id] = judge(g, raw, obligApprox(g, base, raw, o), en.probes);
         statuses[id] = verdicts[id].status;
@@ -1112,7 +1112,7 @@ function verifyFn(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn): Rt {
     if (failure != "") {
       rt = pushRes(rt, f, t.line, t.kind, t.text, unknownV(failure), []);
     } else {
-      const pr = proveRets(fs, proc, rt.z3, rt.qn, g, base, goals, statuses, en.probes);
+      const pr = proveRets(fs, proc, rt.z3, rt.fi, rt.qn, g, base, goals, statuses, en.probes);
       rt.qn += pr.used;
       rt = pushRes(rt, f, t.line, t.kind, t.text, pr.v, g.usedList());
     }
@@ -1129,7 +1129,7 @@ type Entail = { rt: Rt; holds: bool; };
 function entails(fs: FsGrant, proc: ProcessGrant, rt0: Rt, g: Gen, base: string[], goal: string): Entail {
   let rt = rt0;
   const none: Probe[] = [];
-  const raw = rawProve(fs, proc, rt.z3, rt.qn, g, base, [], goal, none);
+  const raw = rawProve(fs, proc, rt.z3, rt.fi, rt.qn, g, base, [], goal, none);
   rt.qn += 1;
   return Entail { rt: rt, holds: raw.status == "unsat" };
 }
@@ -1232,17 +1232,39 @@ function qualityChecks(fs: FsGrant, proc: ProcessGrant, rt0: Rt, f: Fn, en: Entr
 
 // ----------------------------------------------------------------------------------------------- driver
 
+// What proving one function yields; the driver concatenates these in function order.
+type FnRes = { out: Res[]; warns: QWarn[]; };
+
+// Functions are independent: query files are named after the function index (f<fi>q<n>), and nothing but the
+// read-only program is shared.
+function verifyOne(fs: FsGrant, proc: ProcessGrant, p: Prog, z3: string, fi: usize): FnRes {
+  const rt = verifyFn(fs, proc, Rt { p: p, z3: z3, fi: fi, qn: 0, out: [], warns: [] }, p.fns[fi]);
+  return FnRes { out: rt.out, warns: rt.warns };
+}
+
 export function verifyContracts(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, sm: SourceMap, hir: Program, z3: string): Report {
   const p = buildProg(prog, sm, hir);
   shellRun(proc, "mkdir -p build/contracts-vc");
-  let rt = Rt { p: p, z3: z3, qn: 0, out: [], warns: [] };
-  for (const f of p.fns) {
-    if (!f.verify) {
-      continue;
+  // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
+  // if they are outside the fragment nothing is reported for them.
+  let todo: usize[] = [];
+  let i: usize = 0;
+  while (i < p.fns.length) {
+    if (p.fns[i].verify) {
+      todo.push(i);
     }
-    // Functions without clauses are still analysed (their calls of contracted functions are proof obligations);
-    // if they are outside the fragment nothing is reported for them.
-    rt = verifyFn(fs, proc, rt, f);
+    i += 1;
   }
-  return Report { results: rt.out, warnings: rt.warns };
+  let results: Res[] = [];
+  let warns: QWarn[] = [];
+  for (const fi of todo) {
+    const r = verifyOne(fs, proc, p, z3, fi);
+    for (const x of r.out) {
+      results.push(x);
+    }
+    for (const w of r.warns) {
+      warns.push(w);
+    }
+  }
+  return Report { results: results, warnings: warns };
 }
