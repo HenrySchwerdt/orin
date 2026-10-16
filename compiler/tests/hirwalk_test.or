@@ -1,0 +1,132 @@
+// Unit tests of the generic HIR fold (compiler/hir/walk.or, ADR-0049 A4): the visiting order that the passes of check/
+// rely on, on hand-built HIR, and a state that is threaded (counted) rather than mutated through a capture.
+// Run: `orin test compiler/tests/hirwalk_test.or --runtime runtime/core`.
+
+import { assertEqString, assertEqUsize } from "std:test";
+import { span } from "../diag";
+import {
+  HExpr, HExprKind, HStmt, HBlock, HArm, Place, PlaceElem, FieldInitH, Type, BinOp, UnOp, MutBuiltin, Builtin, HPattern, foldExpr, foldBlock, foldStmt,
+} from "../hir";
+
+function e(k: HExprKind): HExpr {
+  return HExpr { kind: k, ty: TyInt, span: span(0, 0, 0) };
+}
+
+function n(v: int): HExpr {
+  return e(XInt(v));
+}
+
+function blk(ss: HStmt[]): HBlock {
+  return HBlock { stmts: ss };
+}
+
+// A short name per node: the literal for XInt, the local number for XLocal, a tag for the others.
+function tag(x: HExpr, out0: string[]): string[] {
+  let out = out0;
+  const t = match (x.kind) {
+    XInt(v) => v.toString(),
+    XLocal(l) => "l" + l.toString(),
+    XUnary(_, _) => "un",
+    XBinary(_, _, _) => "bin",
+    XCall(_, _) => "call",
+    XBuiltin(_, _) => "bi",
+    XMutMethod(_, _, _) => "mut",
+    XField(_, _, _) => "fld",
+    XIndex(_, _) => "idx",
+    XRecord(_, _, _) => "rec",
+    XVariant(_, _) => "var",
+    XArray(_) => "arr",
+    XTry(_) => "try",
+    XCond(_, _, _) => "cond",
+    XMatch(_, _) => "match",
+    XClosure(_, _) => "clo",
+    XCallIndirect(_, _) => "calli",
+    XIface(_, _) => "iface",
+    XCallVirtual(_, _, _) => "callv",
+    _ => "?",
+  };
+  out.push(t);
+  return out;
+}
+
+function trace(x: HExpr): string {
+  const out: string[] = [];
+  return foldExpr(x, out, tag).join(" ");
+}
+
+@Test
+function expressionsArePreOrderLeftToRight(): void {
+  assertEqString(trace(n(1)), "1", "a leaf");
+  assertEqString(trace(e(XBinary(OpAdd, n(1), e(XUnary(UnNeg, n(2)))))), "bin 1 un 2", "unary and binary");
+  assertEqString(trace(e(XCall(0, [n(1), n(2)]))), "call 1 2", "call arguments");
+  assertEqString(trace(e(XCond(n(1), n(2), n(3)))), "cond 1 2 3", "condition, then, else");
+  assertEqString(trace(e(XIndex(n(1), n(2)))), "idx 1 2", "base, index");
+  assertEqString(trace(e(XField(e(XTry(n(1))), 0, 0))), "fld try 1", "field of try");
+  assertEqString(trace(e(XCallIndirect(e(XLocal(0)), [n(1)]))), "calli l0 1", "callee before arguments");
+  assertEqString(trace(e(XCallVirtual(e(XLocal(0)), 1, [n(1)]))), "callv l0 1", "receiver before arguments");
+  assertEqString(trace(e(XClosure(3, [n(1), n(2)]))), "clo 1 2", "captures");
+  assertEqString(trace(e(XIface(0, n(1)))), "iface 1", "interface value");
+  assertEqString(trace(e(XVariant(0, [n(1)]))), "var 1", "payload");
+  assertEqString(trace(e(XArray([n(1), n(2)]))), "arr 1 2", "elements");
+  assertEqString(trace(e(XBuiltin(BArrLength, [n(1)]))), "bi 1", "builtin arguments");
+}
+
+@Test
+function recordsMutMethodsAndMatches(): void {
+  const spread: Option<HExpr> = Some(n(1));
+  const fields = [FieldInitH { index: 0, value: n(2) }, FieldInitH { index: 1, value: n(3) }];
+  assertEqString(trace(e(XRecord(0, spread, fields))), "rec 1 2 3", "spread, then the fields in order");
+  const none: Option<HExpr> = None;
+  assertEqString(trace(e(XRecord(0, none, fields))), "rec 2 3", "no spread");
+  const p = Place { root: 0, path: [PIndex(n(1)), PField(0, 1), PIndex(n(2))], ty: TyInt };
+  assertEqString(trace(e(XMutMethod(MArrPush, p, [n(3)]))), "mut 1 2 3", "place indexes, then arguments");
+  const body = blk([HExprStmt(n(2))]);
+  const withValue = HArm { pattern: HPWildcard, body: body, value: Some(n(3)) };
+  const noValue = HArm { pattern: HPInt(0), body: blk([HExprStmt(n(4))]), value: None };
+  assertEqString(trace(e(XMatch(n(1), [withValue, noValue]))), "match 1 2 3 4", "scrutinee, then body and value of each arm");
+}
+
+@Test
+function statementsAreVisitedInSourceOrder(): void {
+  const none: Option<HBlock> = None;
+  const pl = Place { root: 0, path: [PIndex(n(1))], ty: TyInt };
+  const stmts = [
+    HLet(0, n(1)),
+    HAssign(pl, None, n(2)),
+    HIf(n(3), blk([HExprStmt(n(4))]), Some(blk([HExprStmt(n(5))]))),
+    HIf(n(6), blk([]), none),
+    HWhile(n(7), blk([HBreak, HContinue, HExprStmt(n(8))])),
+    HForOf(1, n(9), blk([HExprStmt(n(10))])),
+    HReturn(Some(n(11))),
+    HReturn(None),
+    HBlockStmt(blk([HExprStmt(n(12))])),
+  ];
+  const out: string[] = [];
+  assertEqString(
+    foldBlock(blk(stmts), out, tag).join(" "),
+    "1 1 2 3 4 5 6 7 8 9 10 11 12",
+    "let, assign (place index first), if/else, while, for-of, return, nested block",
+  );
+  const out2: string[] = [];
+  assertEqString(foldStmt(HBreak, out2, tag).join(" "), "", "break has no children");
+}
+
+// The state is threaded through the callback and returned: a plain count.
+function count(x: HExpr, k: usize): usize {
+  return k + 1;
+}
+
+@Test
+function stateIsThreaded(): void {
+  const zero: usize = 0;
+  const big = e(XBinary(OpAdd, e(XCall(0, [n(1), n(2), e(XUnary(UnNeg, n(3)))])), n(4)));
+  assertEqUsize(foldExpr(big, zero, count), 7, "bin, call, 1, 2, un, 3, 4");
+  const threshold: int = 2;
+  const above = foldExpr(big, zero, (x, k) => {
+    return match (x.kind) {
+      XInt(v) => v > threshold ? k + 1 : k,
+      _ => k,
+    };
+  });
+  assertEqUsize(above, 2, "a closure capturing a value (3 and 4 exceed 2)");
+}
