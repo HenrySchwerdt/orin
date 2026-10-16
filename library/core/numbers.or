@@ -71,3 +71,69 @@ export function strParseInt(s: string): Option<int> {
   }
   return Some(acc);
 }
+
+// Largest value of the kind (see strParseIntK for the kind numbering).
+function kindMax(kind: int): usize {
+  const big = 9223372036854775807.toUsize();
+  if (kind == 0) { return 127; }
+  if (kind == 1) { return 32767; }
+  if (kind == 2) { return 2147483647; }
+  if (kind == 5) { return 255; }
+  if (kind == 6) { return 65535; }
+  if (kind == 7) { return 4294967295; }
+  if (kind == 8 || kind == 9) { return big + big + 1; }
+  return big;
+}
+
+// parseI8 .. parseUsize (ADR-0022). `kind`: 0 i8, 1 i16, 2 i32, 3 i64, 4 isize, 5 u8, 6 u16, 7 u32, 8 u64, 9 usize.
+// Same grammar as strParseInt (`-? digits`), None when the value is outside the kind's range; `-0` is 0 for every
+// kind, any other negative number is None for the unsigned kinds. The result is the kind's 64-bit pattern, as the
+// C runtime held it: sign-extended for the signed kinds (computed modulo 2^64 here), zero-extended for the others,
+// which is why the declared result is Option<usize> for every kind (the call site's own type is Option<kind>).
+export function strParseIntK(s: string, kind: int): Option<usize> {
+  const n = s.length;
+  let i: usize = 0;
+  let neg = false;
+  if (n > 0 && s.charCodeAt(0) == 45) {
+    neg = true;
+    i = 1;
+  }
+  if (i >= n) {
+    return None;
+  }
+  // magnitude, with the overflow test of a 64-bit unsigned accumulator (cutoff = (2^64 - 1) / 10, cutlim = 5)
+  const cutoff: usize = 1844674407370955161;
+  let acc: usize = 0;
+  while (i < n) {
+    const c = s.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return None;
+    }
+    const d = (c - 48).toUsize();
+    if (acc > cutoff || (acc == cutoff && d > 5)) {
+      return None;
+    }
+    acc = acc * 10 + d;
+    i += 1;
+  }
+  const hi = kindMax(kind);
+  if (!neg) {
+    if (acc > hi) {
+      return None;
+    }
+    return Some(acc);
+  }
+  if (kind >= 5) {
+    // unsigned: only -0
+    if (acc != 0) {
+      return None;
+    }
+    return Some(acc);
+  }
+  // signed: magnitude up to hi + 1; the pattern is 2^64 - acc
+  if (acc > hi + 1) {
+    return None;
+  }
+  const zero: usize = 0;
+  return Some(zero.wrappingSub(acc));
+}

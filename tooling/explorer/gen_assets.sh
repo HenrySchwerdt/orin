@@ -31,4 +31,5 @@ gen() {
 gen theme/explorer.css src/explorer_css.or EXPLORER_CSS
 gen theme/explorer.js src/explorer_js.or EXPLORER_JS
 gen theme/business.css src/business_css.or BUSINESS_CSS
+gen theme/runs.css src/runs_css.or RUNS_CSS
 exit $status

@@ -382,3 +382,16 @@ fails instead of silently dropping their test bodies. The runner defaults still 
 These are targeted regression checks, not a new all-stdlib LLVM matrix or implementation proof.
 `python3 tools/ci_changes.py --selftest` checks module/dependency selection, docs exclusions and main's
 full-selection behavior; run it when changing selection rules.
+
+## Compile times and the run record (explorer `--runs`)
+
+`orin compile <entry.or> -o out.c --timings phases.json` also writes the wall time per pipeline phase (`load` = parse and load,
+`check`, `hir` = fusion, `mir`, `optimise`, `verify`, `emit`) as `orin-timings/0.1`. The clock is `std:time`'s monotonic one, in whole
+milliseconds (a phase below a millisecond reads 0; read trends, not single small programs); it is read only when the flag is given
+(`ORIN_DENY=clock` plus `--timings` traps), and the generated C / LLVM IR is byte-identical with and without it
+(`tools/test_timings.py`, part of `tools/test_tooling.sh`).
+
+`tools/run_record.py` turns that into one CI run record (`orin-runs/0.1`: commit, date, per-phase timings of a few builds, suite
+outcomes with the `orin-reports` status words); the `run-record` CI job uploads the record of its commit as the `run-record`
+artifact. A history is a directory of such records. `explore SNAPSHOT.json --runs FILE-OR-DIR --out SITE` adds the latest
+per-phase bars, a trend per phase, the suite outcomes and a run table to the Processes page (`tooling/explorer/test.sh`).
