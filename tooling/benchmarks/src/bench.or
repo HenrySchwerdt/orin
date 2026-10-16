@@ -1,0 +1,327 @@
+// The typed model of one benchmark run (the JSON that tools/bench.py --json writes) and its decoder.
+// Absent values are `None`; the report code decides how each is shown ("n/a"). Names that Python sorts (`sorted(dict)`)
+// are sorted here by bytes, which is Python's code-point order for UTF-8.
+
+import { JsonValue, JsonMember } from "std:jsonvalue";
+import { members, items, get, path2, asStr, asFloat, asInt, truthy, boolOrTrue, show, isObject } from "./jv";
+
+export function strCmp(a: string, b: string): int {
+  const n = a.length < b.length ? a.length : b.length;
+  let i: usize = 0;
+  while (i < n) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x != y) {
+      return x < y ? -1 : 1;
+    }
+    i += 1;
+  }
+  if (a.length == b.length) {
+    return 0;
+  }
+  return a.length < b.length ? -1 : 1;
+}
+
+export function sortedStrings(xs: string[]): string[] {
+  return xs.sort((a: string, b: string): int => strCmp(a, b));
+}
+
+// One cell of `benchmarks.<name>.langs.<lang>`. `present` is "the dict is not empty" (Python truthiness).
+export type LangCell = {
+  present: bool;
+  wallMedian: Option<float>;
+  wallMin: Option<float>;
+  wallMax: Option<float>;
+  cpuMedian: Option<float>;
+  rssKb: Option<float>;
+  outputMatched: bool;
+};
+
+export type LangEntry = { lang: string; cell: LangCell; };
+
+// One entry of `benchmarks.<name>.instructions.<lang>`.
+export type InstrCell = { count: Option<int>; args: string[]; skipped: Option<string>; };
+
+export type InstrEntry = { lang: string; cell: InstrCell; };
+
+export type Bench = { name: string; langs: LangEntry[]; instructions: InstrEntry[]; };
+
+export type ThreadRow = {
+  threads: int;
+  wallMedian: Option<float>;
+  wallMin: Option<float>;
+  wallMax: Option<float>;
+  cpuMedian: Option<float>;
+  speedup: Option<float>;
+  efficiency: Option<float>;
+  cpuRatio: Option<float>;
+  outputMatched: bool;
+};
+
+export type ParBench = { name: string; rows: ThreadRow[]; };
+
+export type SelfCompile = {
+  wallMedian: Option<float>;
+  wallMin: Option<float>;
+  wallMax: Option<float>;
+  cpuMedian: Option<float>;
+  rssKb: Option<float>;
+  instrCount: Option<int>;
+  instrSkipped: Option<string>;
+  identical: bool;
+};
+
+export type Tool = { name: string; value: string; };
+
+export type BenchRun = {
+  file: string;
+  commit: Option<string>;
+  ref: Option<string>;
+  date: Option<string>;       // as in the file; None when absent or not a string
+  runs: string;
+  cpu: string;
+  cores: string;
+  mem: string;
+  os: string;
+  tools: Tool[];              // sorted by name, only the truthy ones
+  benches: Bench[];           // sorted by name
+  parallel: ParBench[];       // sorted by name; rows sorted by thread count
+  selfcompile: Option<SelfCompile>;
+  mismatches: string[];
+};
+
+function emptyLang(): LangCell {
+  return LangCell { present: false, wallMedian: None, wallMin: None, wallMax: None, cpuMedian: None, rssKb: None, outputMatched: true };
+}
+
+export function langCell(b: Bench, lang: string): LangCell {
+  for (const e of b.langs) {
+    if (e.lang == lang) {
+      return e.cell;
+    }
+  }
+  return emptyLang();
+}
+
+export function instrCell(b: Bench, lang: string): Option<InstrCell> {
+  for (const e of b.instructions) {
+    if (e.lang == lang) {
+      return Some(e.cell);
+    }
+  }
+  return None;
+}
+
+export function benchByName(run: BenchRun, name: string): Option<Bench> {
+  for (const b of run.benches) {
+    if (b.name == name) {
+      return Some(b);
+    }
+  }
+  return None;
+}
+
+function decodeLang(v: JsonValue): LangCell {
+  const out = LangCell {
+    present: members(v).length > 0,
+    wallMedian: asFloat(get(v, "wall_median")),
+    wallMin: asFloat(get(v, "wall_min")),
+    wallMax: asFloat(get(v, "wall_max")),
+    cpuMedian: asFloat(get(v, "cpu_median")),
+    rssKb: asFloat(get(v, "rss_kb")),
+    outputMatched: boolOrTrue(get(v, "output_matched")),
+  };
+  return out;
+}
+
+function decodeInstr(v: JsonValue): InstrCell {
+  let args: string[] = [];
+  const raw = get(v, "args");
+  if (raw.isSome()) {
+    for (const a of items(raw.unwrap())) {
+      args.push(show(Some(a), ""));
+    }
+  }
+  return InstrCell { count: asInt(get(v, "count")), args: args, skipped: get(v, "skipped").isSome() ? Some(show(get(v, "skipped"), "")) : None };
+}
+
+function decodeBench(name: string, v: JsonValue): Bench {
+  let langs: LangEntry[] = [];
+  const lv = get(v, "langs");
+  if (lv.isSome()) {
+    for (const m of uniqueMembers(members(lv.unwrap()))) {
+      langs.push(LangEntry { lang: m.key, cell: decodeLang(m.value) });
+    }
+  }
+  let ins: InstrEntry[] = [];
+  const iv = get(v, "instructions");
+  if (iv.isSome()) {
+    for (const m of uniqueMembers(members(iv.unwrap()))) {
+      ins.push(InstrEntry { lang: m.key, cell: decodeInstr(m.value) });
+    }
+  }
+  return Bench { name: name, langs: langs, instructions: ins };
+}
+
+// the last occurrence of every key, in first-occurrence order (what `json.load` + dict gives)
+function uniqueMembers(ms: JsonMember[]): JsonMember[] {
+  let out: JsonMember[] = [];
+  for (const m of ms) {
+    let at: int = -1;
+    let i: usize = 0;
+    while (i < out.length) {
+      if (out[i].key == m.key) {
+        at = i.toInt();
+      }
+      i += 1;
+    }
+    if (at >= 0) {
+      out[at.toUsize()] = m;
+    } else {
+      out.push(m);
+    }
+  }
+  return out;
+}
+
+function decodeThreads(v: JsonValue): ThreadRow[] {
+  let rows: ThreadRow[] = [];
+  const tv = get(v, "threads");
+  if (tv.isNone()) {
+    return rows;
+  }
+  for (const m of uniqueMembers(members(tv.unwrap()))) {
+    const n = parseInt(m.key);
+    if (n.isNone()) {
+      continue;
+    }
+    rows.push(ThreadRow {
+      threads: n.unwrap(),
+      wallMedian: asFloat(get(m.value, "wall_median")),
+      wallMin: asFloat(get(m.value, "wall_min")),
+      wallMax: asFloat(get(m.value, "wall_max")),
+      cpuMedian: asFloat(get(m.value, "cpu_median")),
+      speedup: asFloat(get(m.value, "speedup")),
+      efficiency: asFloat(get(m.value, "efficiency")),
+      cpuRatio: asFloat(get(m.value, "cpu_ratio")),
+      outputMatched: truthy(get(m.value, "output_matched")),
+    });
+  }
+  return rows.sort((a: ThreadRow, b: ThreadRow): int => a.threads < b.threads ? -1 : (a.threads > b.threads ? 1 : 0));
+}
+
+function decodeSelf(v: JsonValue): SelfCompile {
+  const ins = get(v, "instructions");
+  const insObj: JsonValue = ins.isSome() ? ins.unwrap() : ValueNull;
+  return SelfCompile {
+    wallMedian: asFloat(get(v, "wall_median")),
+    wallMin: asFloat(get(v, "wall_min")),
+    wallMax: asFloat(get(v, "wall_max")),
+    cpuMedian: asFloat(get(v, "cpu_median")),
+    rssKb: asFloat(get(v, "rss_kb")),
+    instrCount: asInt(get(insObj, "count")),
+    instrSkipped: get(insObj, "skipped").isSome() ? Some(show(get(insObj, "skipped"), "")) : None,
+    identical: truthy(get(v, "identical_to_stage2")),
+  };
+}
+
+// Decode a parsed run document. The only failure is a document that is not a JSON object.
+export function decodeRun(doc: JsonValue, file: string): Result<BenchRun, string> {
+  if (!isObject(doc)) {
+    return Err("not a JSON object");
+  }
+  let benches: Bench[] = [];
+  const bv = get(doc, "benchmarks");
+  if (bv.isSome()) {
+    for (const m of uniqueMembers(members(bv.unwrap()))) {
+      benches.push(decodeBench(m.key, m.value));
+    }
+  }
+  benches = benches.sort((a: Bench, b: Bench): int => strCmp(a.name, b.name));
+  let parallel: ParBench[] = [];
+  const pv = get(doc, "parallel");
+  if (pv.isSome()) {
+    for (const m of uniqueMembers(members(pv.unwrap()))) {
+      parallel.push(ParBench { name: m.key, rows: decodeThreads(m.value) });
+    }
+  }
+  parallel = parallel.sort((a: ParBench, b: ParBench): int => strCmp(a.name, b.name));
+  let tools: Tool[] = [];
+  const tv = get(doc, "tools");
+  if (tv.isSome()) {
+    for (const m of uniqueMembers(members(tv.unwrap()))) {
+      if (truthy(Some(m.value))) {
+        tools.push(Tool { name: m.key, value: show(Some(m.value), "") });
+      }
+    }
+  }
+  tools = tools.sort((a: Tool, b: Tool): int => strCmp(a.name, b.name));
+  let mismatches: string[] = [];
+  const mv = get(doc, "mismatches");
+  if (mv.isSome()) {
+    for (const x of items(mv.unwrap())) {
+      mismatches.push(show(Some(x), ""));
+    }
+  }
+  const machine: JsonValue = get(doc, "machine").isSome() ? get(doc, "machine").unwrap() : ValueNull;
+  const sc = get(doc, "selfcompile");
+  return Ok(BenchRun {
+    file: file,
+    commit: asStr(get(doc, "commit")),
+    ref: asStr(get(doc, "ref")),
+    date: asStr(get(doc, "date")),
+    runs: show(get(doc, "runs"), "?"),
+    cpu: show(get(machine, "cpu"), "?"),
+    cores: show(get(machine, "cores"), "?"),
+    mem: show(get(machine, "mem"), "?"),
+    os: show(get(machine, "os"), "?"),
+    tools: tools,
+    benches: benches,
+    parallel: parallel,
+    selfcompile: sc.isSome() && truthy(sc) ? Some(decodeSelf(sc.unwrap())) : None,
+    mismatches: mismatches,
+  });
+}
+
+// ---- accessors of the Python module (wall, instr, self_instr, self_wall)
+
+export function wallOf(run: BenchRun, bench: string, lang: string): Option<float> {
+  const b = benchByName(run, bench);
+  if (b.isNone()) {
+    return None;
+  }
+  return langCell(b.unwrap(), lang).wallMedian;
+}
+
+// executed instructions; a count measured on a reduced input is not comparable with others
+export function instrOf(run: BenchRun, bench: string, lang: string): Option<int> {
+  const b = benchByName(run, bench);
+  if (b.isNone()) {
+    return None;
+  }
+  const c = instrCell(b.unwrap(), lang);
+  if (c.isNone()) {
+    return None;
+  }
+  return c.unwrap().args.length > 0 ? None : c.unwrap().count;
+}
+
+export function selfInstr(run: BenchRun): Option<int> {
+  return run.selfcompile.isSome() ? run.selfcompile.unwrap().instrCount : None;
+}
+
+export function selfWall(run: BenchRun): Option<float> {
+  return run.selfcompile.isSome() ? run.selfcompile.unwrap().wallMedian : None;
+}
+
+export function dateOrQ(run: BenchRun): string {
+  return run.date.isSome() && run.date.unwrap().length > 0 ? run.date.unwrap() : "?";
+}
+
+export function dateRaw(run: BenchRun): string {
+  return run.date.unwrapOr("?");
+}
+
+export function commitStr(run: BenchRun): string {
+  return run.commit.unwrapOr("");
+}

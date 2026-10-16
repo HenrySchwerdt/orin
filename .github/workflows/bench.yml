@@ -57,6 +57,11 @@ jobs:
           rustc --version; valgrind --version
       - name: Seed bootstrap (seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance)
         run: ./tools/bootstrap.sh
+      - name: Build bench-report (tooling/benchmarks, Orin + OX; replaces tools/bench_report.py)
+        run: |
+          mkdir -p build/bench
+          build/bootstrap/orin2 compile tooling/benchmarks -o build/bench/bench-report.c
+          cc -O1 -w -I runtime build/bench/bench-report.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/bench/bench-report
       - name: Run benchmarks (wall time, CPU time, RSS, instructions, parallel speedup, self-compile)
         id: run
         env:
@@ -73,7 +78,7 @@ jobs:
           test -s build/bench/results.json
       - name: Job summary
         run: |
-          python3 tools/bench_report.py summary build/bench/results.json > build/bench/summary.md
+          build/bench/bench-report summary build/bench/results.json > build/bench/summary.md
           cat build/bench/summary.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
@@ -82,6 +87,7 @@ jobs:
             build/bench/results.json
             build/bench/results.md
             build/bench/summary.md
+            build/bench/bench-report
           retention-days: 30
       - name: Output check (a checksum mismatch between languages or thread counts fails the run after the upload)
         if: steps.run.outputs.status != '0'
@@ -90,7 +96,7 @@ jobs:
           exit 1
 
   # Every run on main appends history/<date>-<sha>.json to the orphan branch `bench-results` and re-renders its README and
-  # SVG charts (tools/bench_report.py). The branch is created on the first run; pushes are plain fast-forwards.
+  # SVG charts, README and report.html (tooling/benchmarks). The branch is created on the first run; pushes are plain fast-forwards.
   history:
     needs: bench
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -130,9 +136,10 @@ jobs:
             fi
             mkdir -p ../results/history
             cp ../run/results.json "../results/history/$name"
-            python3 tools/bench_report.py render --history ../results/history --out ../results --repo "$REPO"
+            chmod +x ../run/bench-report
+            ../run/bench-report render --history ../results/history --out ../results --repo "$REPO"
             cd ../results
-            git add -A history charts README.md
+            git add -A history charts README.md report.html
             git commit -q -m "bench: $name"
             if git push origin HEAD:refs/heads/bench-results; then
               echo "### History: appended \`history/$name\` to [bench-results](https://github.com/$REPO/tree/bench-results)" >> "$GITHUB_STEP_SUMMARY"
@@ -165,7 +172,8 @@ jobs:
             git worktree add --detach base FETCH_HEAD
           fi
           mkdir -p base/history
-          python3 tools/bench_report.py compare --history base/history run/results.json > comment.md
+          chmod +x run/bench-report
+          run/bench-report compare --history base/history run/results.json > comment.md
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
       - name: Post or update the PR comment
         # a pull request from a fork gets a read-only token; the comparison is still in the job summary

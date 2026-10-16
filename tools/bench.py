@@ -7,7 +7,7 @@ Usage: python3 tools/bench.py [--runs N] [--only name,name] [--orinc build/boots
                               [--threads 1,2,4] [--no-parallel]
 
 --only takes benchmark names; `selfcompile` in the list also runs the self-compile (without --only it always runs).
---json writes the machine-readable result (schema in docs/benchmarks.md, read by tools/bench_report.py and the
+--json writes the machine-readable result (schema in docs/benchmarks.md, read by tooling/benchmarks (bench-report) and the
 benchmark workflow .github/workflows/bench.yml). --instructions adds executed-instruction counts under valgrind (the
 regression metric). The parallel section runs bench/parallel_* and bench/streams_parallel with 1, 2 and 4 worker threads.
 

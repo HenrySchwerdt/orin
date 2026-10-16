@@ -1,0 +1,468 @@
+// The Markdown reports of the former tools/bench_report.py: `summary` (the job summary) and `compare` (the pull-request comment).
+// The text must stay byte-for-byte what the Python tool prints; tooling/benchmarks/test.sh diffs the two.
+
+import { fixed, fixedSigned, grouped } from "orin-reports";
+import {
+  BenchRun, Bench, LangCell, InstrCell, ParBench, ThreadRow, SelfCompile, strCmp, sortedStrings, langCell, instrCell, benchByName,
+  wallOf, instrOf, selfInstr, selfWall, dateRaw, commitStr,
+} from "./bench";
+
+export const INSTR_THRESHOLD: float = 0.02;   // +2 % executed instructions = regression
+export const WALL_THRESHOLD: float = 0.15;    // +15 % wall-time median = regression (wall time on shared runners is noisy)
+export const MARKER: string = "<!-- orin-bench-comment -->";
+
+export function langName(l: string): string {
+  return match (l) {
+    "orin" => "Orin (C backend)",
+    "llvm" => "Orin (LLVM backend)",
+    "c" => "C",
+    "go" => "Go",
+    "java" => "Java",
+    "rust" => "Rust",
+    _ => l,
+  };
+}
+
+// ---- value formatting (the helpers of the Python module)
+
+export function s3(x: Option<float>): string {
+  if (x.isNone()) {
+    return "n/a";
+  }
+  return x.unwrap() < 100.0 ? fixed(x.unwrap(), 3) : fixed(x.unwrap(), 1);
+}
+
+export function big(n: Option<int>): string {
+  return n.isNone() ? "n/a" : grouped(n.unwrap());
+}
+
+function intRatio(a: Option<int>, b: Option<int>): string {
+  if (a.isNone() || b.isNone() || b.unwrap() == 0) {
+    return "n/a";
+  }
+  return fixed(a.unwrap().toFloat() / b.unwrap().toFloat(), 2) + "x";
+}
+
+export function ratio(a: Option<float>, b: Option<float>): string {
+  if (a.isNone() || b.isNone() || b.unwrap() == 0.0) {
+    return "n/a";
+  }
+  return fixed(a.unwrap() / b.unwrap(), 2) + "x";
+}
+
+export function pctF(newV: Option<float>, old: Option<float>): Option<float> {
+  if (newV.isNone() || old.isNone() || old.unwrap() == 0.0) {
+    return None;
+  }
+  return Some((newV.unwrap() - old.unwrap()) / old.unwrap());
+}
+
+export function pctI(newV: Option<int>, old: Option<int>): Option<float> {
+  if (newV.isNone() || old.isNone() || old.unwrap() == 0) {
+    return None;
+  }
+  return Some((newV.unwrap() - old.unwrap()).toFloat() / old.unwrap().toFloat());
+}
+
+export function fpct(p: Option<float>): string {
+  return p.isNone() ? "n/a" : fixedSigned(100.0 * p.unwrap(), 1, true) + " %";
+}
+
+// (sha or "?")[:10]
+export function short(sha: Option<string>): string {
+  const s = sha.isSome() && sha.unwrap().length > 0 ? sha.unwrap() : "?";
+  return s.length > 10 ? s.substring(0, 10) : s;
+}
+
+// s[:n] for a possibly shorter string
+export function head(s: string, n: usize): string {
+  return s.length > n ? s.substring(0, n) : s;
+}
+
+function orQ(s: Option<string>): string {
+  return s.isSome() && s.unwrap().length > 0 ? s.unwrap() : "?";
+}
+
+function repeat(s: string, n: int): string {
+  let out = "";
+  let i: int = 0;
+  while (i < n) {
+    out += s;
+    i += 1;
+  }
+  return out;
+}
+
+function langs6(): string[] {
+  return ["orin", "llvm", "c", "go", "java", "rust"];
+}
+
+function header(doc: BenchRun): string {
+  let tools: string[] = [];
+  for (const t of doc.tools) {
+    tools.push("- " + t.name + ": `" + t.value + "`");
+  }
+  return "Commit `" + short(doc.commit) + "` (" + orQ(doc.ref) + "), " + dateRaw(doc) + ". Machine: " + doc.cpu + ", " + doc.cores
+    + " cores, " + doc.mem + ", " + doc.os + ". Runs per cell: " + doc.runs + " (median after one warm-up)."
+    + "\n\n<details><summary>Tool versions</summary>\n\n" + tools.join("\n") + "\n\n</details>\n";
+}
+
+function hasInstructions(doc: BenchRun): bool {
+  for (const b of doc.benches) {
+    if (b.instructions.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function dedupSorted(xs: string[]): string[] {
+  const sorted = sortedStrings(xs);
+  let out: string[] = [];
+  for (const x of sorted) {
+    if (out.length == 0 || out[out.length - 1] != x) {
+      out.push(x);
+    }
+  }
+  return out;
+}
+
+export function summary(doc: BenchRun): string {
+  let L: string[] = ["## Orin benchmarks", "", header(doc)];
+  const langs = langs6();
+  const names = doc.benches;
+  if (names.length > 0) {
+    L.push("### Wall time, seconds (median; min-max)");
+    L.push("");
+    L.push("| benchmark | " + langs.map((l: string): string => langName(l)).join(" | ") + " |");
+    L.push("|---|" + repeat("---:|", 6));
+    for (const b of names) {
+      let cells: string[] = [];
+      for (const l of langs) {
+        const c = langCell(b, l);
+        if (!c.present || c.wallMedian.isNone()) {
+          cells.push(!c.present ? "n/a" : "MISMATCH");
+        } else {
+          cells.push(s3(c.wallMedian) + " (" + s3(c.wallMin) + "-" + s3(c.wallMax) + ")" + (c.outputMatched ? "" : " MISMATCH"));
+        }
+      }
+      L.push("| " + b.name + " | " + cells.join(" | ") + " |");
+    }
+    L.push("");
+    L.push("### Ratio to C (wall-time median; lower is better, 1.00x = as fast as C)");
+    L.push("");
+    L.push("| benchmark | Orin C/C | Orin LLVM/C | Go/C | Java/C | Rust/C |");
+    L.push("|---|---:|---:|---:|---:|---:|");
+    for (const b of names) {
+      const c = langCell(b, "c").wallMedian;
+      let cells: string[] = [];
+      for (const l of ["orin", "llvm", "go", "java", "rust"]) {
+        cells.push(ratio(langCell(b, l).wallMedian, c));
+      }
+      L.push("| " + b.name + " | " + cells.join(" | ") + " |");
+    }
+    L.push("");
+    L.push("### CPU time (user + sys, median s) and peak RSS (MiB)");
+    L.push("");
+    L.push("| benchmark | " + langs.map((l: string): string => l + " CPU").join(" | ") + " | "
+      + langs.map((l: string): string => l + " RSS").join(" | ") + " |");
+    L.push("|---|" + repeat("---:|", 12));
+    for (const b of names) {
+      let cpu: string[] = [];
+      let rss: string[] = [];
+      for (const l of langs) {
+        const c = langCell(b, l);
+        cpu.push(s3(c.cpuMedian));
+        rss.push(c.rssKb.isNone() ? "n/a" : fixed(c.rssKb.unwrap() / 1024.0, 1));
+      }
+      L.push("| " + b.name + " | " + cpu.join(" | ") + " | " + rss.join(" | ") + " |");
+    }
+    L.push("");
+  }
+  if (hasInstructions(doc) || selfInstr(doc).isSome()) {
+    L.push("### Executed instructions (valgrind; the regression metric)");
+    L.push("");
+    L.push("| benchmark | Orin C | Orin LLVM | C | Orin C/C | Orin LLVM/C | note |");
+    L.push("|---|---:|---:|---:|---:|---:|---|");
+    for (const b of names) {
+      if (b.instructions.length == 0) {
+        continue;
+      }
+      const cOrin = countOf(b, "orin");
+      const cLlvm = countOf(b, "llvm");
+      const cC = countOf(b, "c");
+      let notes: string[] = [];
+      for (const e of b.instructions) {
+        if (e.cell.skipped.isSome()) {
+          notes.push(e.lang + " skipped: " + e.cell.skipped.unwrap());
+        }
+      }
+      for (const e of b.instructions) {
+        if (e.cell.args.length > 0) {
+          notes.push("reduced input: " + e.cell.args.join(" "));
+        }
+      }
+      L.push("| " + b.name + " | " + big(cOrin) + " | " + big(cLlvm) + " | " + big(cC) + " | " + intRatio(cOrin, cC) + " | "
+        + intRatio(cLlvm, cC) + " | " + dedupSorted(notes).join("; ") + " |");
+    }
+    L.push("");
+  }
+  const par = doc.parallel;
+  if (par.length > 0) {
+    L.push("### Parallel speedup (std:task; worker threads = first argument of the program)");
+    L.push("");
+    L.push("| benchmark | threads | wall s (min-max) | CPU s (user+sys) | speedup | efficiency | CPU vs 1 thread | output |");
+    L.push("|---|---:|---:|---:|---:|---:|---:|---|");
+    for (const p of par) {
+      for (const r of p.rows) {
+        L.push("| " + p.name + " | " + r.threads.toString() + " | " + s3(r.wallMedian) + " (" + s3(r.wallMin) + "-" + s3(r.wallMax) + ") | "
+          + s3(r.cpuMedian) + " | " + (r.speedup.isNone() ? "n/a" : fixed(r.speedup.unwrap(), 2) + "x") + " | "
+          + (r.efficiency.isNone() ? "n/a" : fixed(100.0 * r.efficiency.unwrap(), 0) + " %") + " | "
+          + (r.cpuRatio.isNone() ? "n/a" : fixed(r.cpuRatio.unwrap(), 2) + "x") + " | " + (r.outputMatched ? "same" : "DIFFERS") + " |");
+      }
+    }
+    L.push("");
+    L.push("Speedup = wall(1 thread) / wall(n); efficiency = speedup / n. CPU time that grows with n is overhead or "
+      + "oversubscription (more threads than free cores).");
+    L.push("");
+  }
+  if (doc.selfcompile.isSome()) {
+    const sc = doc.selfcompile.unwrap();
+    L.push("### Self-compile (orin2 compiles compiler/main.or)");
+    L.push("");
+    L.push("| wall s (min-max) | CPU s | peak RSS MiB | instructions | output identical to stage2.c |");
+    L.push("|---:|---:|---:|---:|---|");
+    L.push("| " + s3(sc.wallMedian) + " (" + s3(sc.wallMin) + "-" + s3(sc.wallMax) + ") | " + s3(sc.cpuMedian) + " | "
+      + (sc.rssKb.isNone() ? "n/a" : fixed(sc.rssKb.unwrap() / 1024.0, 1)) + " | "
+      + (sc.instrSkipped.isSome() ? "skipped: " + sc.instrSkipped.unwrap() : big(sc.instrCount)) + " | "
+      + (sc.identical ? "yes" : "no") + " |");
+    L.push("");
+  }
+  if (doc.mismatches.length > 0) {
+    L.push("**Output mismatches:** " + doc.mismatches.join(", "));
+    L.push("");
+  }
+  return L.join("\n") + "\n";
+}
+
+// `ins.get(l, {}).get("count")`
+function countOf(b: Bench, lang: string): Option<int> {
+  const c = instrCell(b, lang);
+  return c.isNone() ? None : c.unwrap().count;
+}
+
+// ---- compare
+
+export type Regression = { bench: string; lang: string; instrDelta: Option<float>; wallDelta: Option<float>; };
+
+export type CompareResult = { text: string; regressions: Regression[]; };
+
+export type Row = {
+  bench: string; lang: string;
+  baseInstr: Option<int>; headInstr: Option<int>; baseWall: Option<float>; headWall: Option<float>;
+};
+
+type FoundI = { value: Option<int>; file: Option<string>; };
+type FoundF = { value: Option<float>; file: Option<string>; };
+
+// the newest earlier run (history order) that has a value, with its file name
+function latestInstr(base: BenchRun[], bench: string, lang: string): FoundI {
+  let i: int = base.length.toInt() - 1;
+  while (i >= 0) {
+    const v = instrOf(base[i.toUsize()], bench, lang);
+    if (v.isSome()) {
+      return FoundI { value: v, file: Some(base[i.toUsize()].file) };
+    }
+    i -= 1;
+  }
+  return FoundI { value: None, file: None };
+}
+
+function latestWall(base: BenchRun[], bench: string, lang: string): FoundF {
+  let i: int = base.length.toInt() - 1;
+  while (i >= 0) {
+    const v = wallOf(base[i.toUsize()], bench, lang);
+    if (v.isSome()) {
+      return FoundF { value: v, file: Some(base[i.toUsize()].file) };
+    }
+    i -= 1;
+  }
+  return FoundF { value: None, file: None };
+}
+
+function latestSelfInstr(base: BenchRun[]): FoundI {
+  let i: int = base.length.toInt() - 1;
+  while (i >= 0) {
+    const v = selfInstr(base[i.toUsize()]);
+    if (v.isSome()) {
+      return FoundI { value: v, file: Some(base[i.toUsize()].file) };
+    }
+    i -= 1;
+  }
+  return FoundI { value: None, file: None };
+}
+
+function latestSelfWall(base: BenchRun[]): FoundF {
+  let i: int = base.length.toInt() - 1;
+  while (i >= 0) {
+    const v = selfWall(base[i.toUsize()]);
+    if (v.isSome()) {
+      return FoundF { value: v, file: Some(base[i.toUsize()].file) };
+    }
+    i -= 1;
+  }
+  return FoundF { value: None, file: None };
+}
+
+function sameCommit(a: Option<string>, b: Option<string>): bool {
+  if (a.isNone() || b.isNone()) {
+    return a.isNone() && b.isNone();
+  }
+  return a.unwrap() == b.unwrap();
+}
+
+function contains(xs: string[], x: string): bool {
+  for (const y of xs) {
+    if (y == x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The comparison rows of `head` against the newest earlier entry per benchmark, and the history files they came from.
+export type Rows = { rows: Row[]; used: string[]; };
+
+export function collectRows(base: BenchRun[], head: BenchRun): Rows {
+  let rows: Row[] = [];
+  let used: string[] = [];
+  for (const b of head.benches) {
+    for (const l of ["orin", "llvm"]) {
+      const hi = instrOf(head, b.name, l);
+      const hw = wallOf(head, b.name, l);
+      if (hi.isNone() && hw.isNone()) {
+        continue;
+      }
+      const bi = latestInstr(base, b.name, l);
+      const bw = latestWall(base, b.name, l);
+      rows.push(Row { bench: b.name, lang: langName(l), baseInstr: bi.value, headInstr: hi, baseWall: bw.value, headWall: hw });
+      if (bi.file.isSome()) { used.push(bi.file.unwrap()); }
+      if (bw.file.isSome()) { used.push(bw.file.unwrap()); }
+    }
+  }
+  const hi = selfInstr(head);
+  const hw = selfWall(head);
+  if (hi.isSome() || hw.isSome()) {
+    const bi = latestSelfInstr(base);
+    const bw = latestSelfWall(base);
+    rows.push(Row { bench: "selfcompile", lang: "orin2", baseInstr: bi.value, headInstr: hi, baseWall: bw.value, headWall: hw });
+    if (bi.file.isSome()) { used.push(bi.file.unwrap()); }
+    if (bw.file.isSome()) { used.push(bw.file.unwrap()); }
+  }
+  return Rows { rows: rows, used: used };
+}
+
+export type Verdict = { labels: string[]; regression: bool; instrDelta: Option<float>; wallDelta: Option<float>; };
+
+// The verdict of one comparison row: the flags of the Python tool, in its order.
+export function verdictOf(bi: Option<int>, hi: Option<int>, bw: Option<float>, hw: Option<float>): Verdict {
+  const di = pctI(hi, bi);
+  const dw = pctF(hw, bw);
+  let labels: string[] = [];
+  if (di.isSome() && di.unwrap() > INSTR_THRESHOLD) {
+    labels.push("**regression (instructions)**");
+  }
+  if (dw.isSome() && dw.unwrap() > WALL_THRESHOLD) {
+    labels.push("**regression (wall time)**");
+  }
+  if (di.isSome() && di.unwrap() < -INSTR_THRESHOLD) {
+    labels.push("improvement");
+  }
+  const isReg = labels.length > 0 && labels[0].startsWith("**");
+  return Verdict { labels: labels, regression: isReg, instrDelta: di, wallDelta: dw };
+}
+
+// The runs of `history` that `head` is compared against: every run of another commit.
+export function baseRuns(history: BenchRun[], head: BenchRun): BenchRun[] {
+  let base: BenchRun[] = [];
+  for (const r of history) {
+    if (!sameCommit(r.commit, head.commit)) {
+      base.push(r);
+    }
+  }
+  return base;
+}
+
+// `history` ordered as load_history returns it (by date, then file name)
+export function compare(history: BenchRun[], head: BenchRun): CompareResult {
+  const base = baseRuns(history, head);
+  const collected = collectRows(base, head);
+  let L: string[] = [MARKER, "## Benchmark comparison", ""];
+  if (base.length == 0) {
+    L.push("No `main` entry on the `bench-results` branch yet: nothing to compare against. The numbers of this run are in the "
+      + "job summary.");
+    L.push("");
+    return CompareResult { text: L.join("\n") + "\n", regressions: [] };
+  }
+  let descs: string[] = [];
+  for (const r of base) {
+    if (contains(collected.used, r.file)) {
+      descs.push("`" + short(r.commit) + "` (" + head10(r) + ")");
+    }
+  }
+  const baseDesc = descs.length == 0 ? "n/a" : dedupSorted(descs).join(", ");
+  L.push("Head `" + short(head.commit) + "` against `main` " + baseDesc + ". Regression thresholds: executed instructions **> +"
+    + (INSTR_THRESHOLD * 100.0).toInt().toString() + " %** (the reliable metric), wall-time median **> +"
+    + (WALL_THRESHOLD * 100.0).toInt().toString() + " %** (noisy on shared runners). This comment reports only; it does not "
+    + "fail the job.");
+  L.push("");
+  let table: string[] = [
+    "| benchmark | binary | instructions main | instructions PR | change | wall main s | wall PR s | change | verdict |",
+    "|---|---|---:|---:|---:|---:|---:|---:|---|",
+  ];
+  let regressions: Regression[] = [];
+  for (const r of collected.rows) {
+    const v = verdictOf(r.baseInstr, r.headInstr, r.baseWall, r.headWall);
+    if (v.regression) {
+      regressions.push(Regression { bench: r.bench, lang: r.lang, instrDelta: v.instrDelta, wallDelta: v.wallDelta });
+    }
+    table.push("| " + r.bench + " | " + r.lang + " | " + big(r.baseInstr) + " | " + big(r.headInstr) + " | " + fpct(v.instrDelta) + " | "
+      + s3(r.baseWall) + " | " + s3(r.headWall) + " | " + fpct(v.wallDelta) + " | "
+      + (v.labels.length == 0 ? "ok" : v.labels.join(", ")) + " |");
+  }
+  if (regressions.length > 0) {
+    let names: string[] = [];
+    for (const g of regressions) {
+      names.push(g.bench + " / " + g.lang);
+    }
+    L.push("**" + regressions.length.toString() + " regression(s) flagged:** " + names.join(", ") + ".");
+    L.push("");
+  } else {
+    L.push("No regression above the thresholds.");
+    L.push("");
+  }
+  for (const t of table) {
+    L.push(t);
+  }
+  L.push("");
+  if (head.parallel.length > 0) {
+    let parts: string[] = [];
+    for (const p of head.parallel) {
+      let speeds: string[] = [];
+      for (const r of p.rows) {
+        if (r.speedup.isSome()) {
+          speeds.push(r.threads.toString() + " thr " + fixed(r.speedup.unwrap(), 2) + "x");
+        }
+      }
+      parts.push(p.name + " " + speeds.join(", "));
+    }
+    L.push("Parallel speedup of this run (informational): " + parts.join("; ") + ".");
+    L.push("");
+  }
+  return CompareResult { text: L.join("\n") + "\n", regressions: regressions };
+}
+
+// r.get("date", "?")[:10]
+function head10(r: BenchRun): string {
+  return head(dateRaw(r), 10);
+}
