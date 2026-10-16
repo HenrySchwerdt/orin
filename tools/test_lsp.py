@@ -588,6 +588,47 @@ def run(exe):
     check(len(changes.get(uri_of(glib), [])) == 1 and len(changes.get(uri_of(gmain), [])) == 1,
           "generic classes: rename method in both files (%r)" % ({k: len(v) for k, v in changes.items()},))
 
+    # ---- analysis cache: requests after an edit / a save / a change on disk never see stale analyses -------------------
+    cdir = os.path.join(tmp, "cache")
+    os.makedirs(cdir)
+    clib = os.path.join(cdir, "lib.or")
+    cmain = os.path.join(cdir, "main.or")
+    clib_text = "export function g(x: int): int {\n  return x;\n}\n"
+    cmain_text = "import { g } from \"./lib\";\nfunction main(): void {\n  const n: int = g(1);\n}\n"
+    with open(clib, "w") as fh:
+        fh.write(clib_text)
+    open_doc(c, cmain, cmain_text)
+    gpos = pos_of(cmain_text, "g(1)", 0)
+
+    def hover_main():
+        r = c.request("textDocument/hover", td(cmain, gpos))
+        return json.dumps(r.get("result"), sort_keys=True)
+
+    h1 = hover_main()
+    check("function g(x: int): int" in h1, "cache: hover on an import from a file that is not open (%r)" % (h1,))
+    check(hover_main() == h1, "cache: the same hover twice gives the same answer")
+    # the imported file changes on disk and is saved: the next hover sees it
+    with open(clib, "w") as fh:
+        fh.write(clib_text.replace("(x: int): int {\n  return x;", "(x: int): string {\n  return \"s\";"))
+    c.notify("textDocument/didSave", {"textDocument": {"uri": uri_of(cmain)}})
+    h2 = hover_main()
+    check("function g(x: int): string" in h2, "cache: hover after the imported file changed on disk and didSave (%r)" % (h2,))
+    # and without a save notification the content check still notices a change on disk
+    with open(clib, "w") as fh:
+        fh.write(clib_text)
+    h3 = hover_main()
+    check(h3 == h1, "cache: hover after the file changed back on disk (%r)" % (h3,))
+    # didChange of the open document, then hover
+    change_doc(c, cmain, cmain_text.replace("g(1)", "g(2)") + "\n", 2)
+    h4 = hover_main()
+    check(h4 == h1, "cache: hover after didChange of the open document")
+    new_main = cmain_text.replace("const n: int = g(1);", "const n: string = \"s\";")
+    change_doc(c, cmain, new_main, 3)
+    r = c.request("textDocument/hover", td(cmain, pos_of(new_main, "n:", 0)))
+    check("const n: string" in json.dumps(r.get("result")), "cache: hover sees the new local type after didChange (%r)" % (r.get("result"),))
+    c.notify("textDocument/didClose", {"textDocument": {"uri": uri_of(cmain)}})
+    sync(c, uri_of(cmain))
+
     # ---- shutdown / exit --------------------------------------------------------------------
     r = c.request("shutdown", None)
     check(r.get("result", 0) is None and "error" not in r, "shutdown: null result")
