@@ -16,7 +16,10 @@ export ORIN2
 case "${1:-}" in
   --one)
     t=$2; flag=$3
-    out=$($ORIN2 test "$t" $flag 2>&1) || { echo "$out" | grep -v '^PASS'; echo "[std] FAIL $t $flag"; exit 1; }
+    # --timeout 60: `orin test` defaults to 10 s per test, but the property tests run for seconds each (e.g.
+    # http_prop_test.fuzzRequestMutations20000: ~4.5 s alone) and every case here runs in parallel, so on a loaded CI
+    # runner the default produced spurious timeouts; 60 s still catches a hang
+    out=$($ORIN2 test "$t" $flag --timeout 60 2>&1) || { echo "$out" | grep -v '^PASS'; echo "[std] FAIL $t $flag"; exit 1; }
     echo "[std] $t ${flag:-(contracts checked)}: $(echo "$out" | tail -1)"
     exit 0 ;;
   --trap)
