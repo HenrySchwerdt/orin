@@ -211,6 +211,9 @@ export class Transfer {
         this.readOp(o);
       },
       TReturn(r) => {
+        if (this.f.uniqueOut) {
+          this.uniqueReturn(r);
+        }
         match (r) {
           Some(o) => {
             this.consume(o);
@@ -248,6 +251,40 @@ export class Transfer {
         }
       },
       TTrap(_) => {},
+    }
+  }
+
+  // Rule U3 (v2.5): a `unique-out` function hands back a Unique value at this return: local 0 for an inout function, the
+  // returned local otherwise. Checked before the return consumes it.
+  private uniqueReturn(r: Option<Operand>): void {
+    if (this.f.inout) {
+      if (this.kindOf(0) != KUnique) {
+        this.err(
+          "unique-out function returns its receiver " + this.nm(0) + " as " + kindName(this.kindOf(0))
+              + ", not Unique (rule U3)",
+        );
+      }
+      return;
+    }
+    let ok = false;
+    match (r) {
+      Some(o) => {
+        match (o) {
+          OLocal(l) => {
+            ok = true;
+            if (this.kindOf(l) != KUnique) {
+              this.err(
+                "unique-out function returns " + this.nm(l) + " as " + kindName(this.kindOf(l)) + ", not Unique (rule U3)",
+              );
+            }
+          },
+          _ => {},
+        }
+      },
+      None => {},
+    }
+    if (!ok) {
+      this.err("unique-out function returns a value that is not a local, so it is not Unique (rule U3)");
     }
   }
 
@@ -818,16 +855,46 @@ export class Transfer {
         // in locals: an argument read from `this.prog` would make the call duplicate the whole receiver
         const po = this.prog.functions[fi].paramOwned;
         const io = this.prog.functions[fi].inout;
+        const uin = this.prog.functions[fi].uniqueIn;
+        const uout = this.prog.functions[fi].uniqueOut;
+        if (uin) {
+          // rule U4 (v2.5): the callee starts with a Unique receiver and does not test it, so it must be Unique here
+          match (args[0]) {
+            OLocal(x) => {
+              this.needUnique(x, "call of the unique-in function " + this.prog.functions[fi].name);
+            },
+            _ => {},
+          }
+        }
         this.callOwned(dst, args, po);
         if (io) {
           // v1.10: argument 0 was consumed; it now holds the callee's final receiver (Owned: the callee may have kept
           // an alias, so uniqueness is not known). Writing a parameter is an error except the in/out parameter of an
           // inout caller (`def`).
+          // The callee can keep a counted reference to any borrowed argument in the receiver it hands back, whatever the
+          // type of its result (`push(items, item)`), so no borrowed argument stays Unique across an in/out call. For a
+          // reference result `callOwned` has demoted them already.
+          let k: usize = 1;
+          while (k < args.length) {
+            if (!(k < po.length && po[k])) {
+              this.demoteOp(args[k]);
+            }
+            k += 1;
+          }
           match (args[0]) {
             OLocal(x) => {
-              this.def(x, KOwned, 0);
+              // rule U5 (v2.5): a `unique-out` callee hands back a Unique receiver (U3 checked it in the callee)
+              this.def(x, uout ? KUnique : KOwned, 0);
             },
             _ => {},
+          }
+        } else if (uout) {
+          // rule U5: the result of a `unique-out` function is the only reference to it. `callOwned` has defined it Owned.
+          match (dst) {
+            Some(d) => {
+              this.set(d, KUnique, 0);
+            },
+            None => {},
           }
         }
       },

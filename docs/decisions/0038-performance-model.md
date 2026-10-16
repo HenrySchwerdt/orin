@@ -478,6 +478,36 @@ object of an `IForward` must be a reference local (an unboxed aggregate is alrea
 
 #### T5. Unique receivers and results across calls
 
+**Status (2026-10-16): implemented** (branch `claude/project-thread-niggkx-t5-unique-calls`, on main with T1, T3, T4; MIR v2.5, rules U2-U5 in
+`compiler/verify/{wf,verify,rules}.or` (+76 code lines), pass `compiler/opt/uniqflags.or`, T1 extended in `compiler/opt/unique.or`, mutation classes
+`uniq-*`, `docs/mir.md` section "Unique receivers and results").
+Measured (valgrind, executed instructions, orin2 of main b5bf508 against the same plus T5): mutres 2,541.6M -> 2,400.3M (**-5.56 %**; `cow_inplace`
+60.0M -> 40.0M, the only counter that moves), nbody, sieve, pqueue, qsort_inplace unchanged (+-6 instructions); self-compile 24,643.1M -> 24,846.9M
+(**+0.83 %**, gate +1 %; the first version, which analysed every candidate, cost +20 %, see below). Census (`-DORIN_STATS_ENABLED`): allocations, frees, retains,
+releases, `cow_copies` identical on the five benchmarks. Generated C of the 407-program corpus, the benchmarks and the compiler: 41 programs
+differ, 221 `orin_make_unique` calls removed and 86 added (the ones put before calls), no other line. In the compiler itself: 36 of 284 in/out functions are
+`unique-in`, 82 of 3,817 functions `unique-out`. The estimate in the table above (mutres -4 of 55 per call) held; **pqueue's -2 % did not**: the std collection
+methods that were meant to benefit have their `makeunique` outside block 0, which the final candidate rule (below) excludes, and with them included the first version saved
+2 % of pqueue's `cow_inplace` tests (600,000 of 28.2M), against a +20 % self-compile.
+Checked in the code before relying on the soundness argument (details in `docs/mir.md`): (a) an `inout` function can never be a closure target, vtable
+entry or indirect callee: `closureMsg` and `vtableMsg` require borrowed parameters and `inout` needs an owned parameter 0; `main` is rejected as `unique-in`.
+(b) The receiver is the only reference at an `inout` call: the call consumes argument 0 (`killBorrows`), and a borrowed argument aliasing it is already an
+error. **This check found a hole in the pre-existing verifier**: a `Unique` argument in a *borrowed* position stayed `Unique` after an `inout` call with a
+scalar or void result, although the callee can `dup` it into the receiver it hands back (`push(items, item)`). Harmless while only a runtime `makeunique`
+consumed the fact, wrong once a callee skips the test. Fixed: an `inout` call demotes its borrowed arguments (case in `verify_main.or`, and T1's analysis already did
+so). (c) For a non-`inout` `unique-out` result, `KUnique` already implies that nothing the callee keeps can reach the object (no globals; closures consume
+their captures; a borrowed parameter cannot be stored through; the receiver is covered by (b)); U3 therefore checks only the kind.
+Deviations from the text below, all on the conservative side: a `unique-in` candidate is an `inout` function whose **block 0** starts with the `makeunique` of
+its receiver, so a `makeunique` put before a call is exactly the copy the callee would have made (`cow_copies` identical, no pessimisation of a callee that does not
+write); a call site outside every loop never costs the flag and gets the `makeunique` (open question 6: accepted in this form, it is cost-neutral by
+construction), a site inside a loop with a non-`Unique` receiver does (the flag is not set). Compile-time gate: the verifier's fixpoint is not rerun; the
+pass uses T1's local analysis, analyses only functions that can change a verdict (214 of 3,817 in the compiler, 252 analyses in all, so 38 re-analyses for
+retractions), runs callees before callers, takes a function without a loop as always satisfiable (it gets the `makeunique` before each call, T1 removes the redundant
+ones), makes a `unique-out` a candidate only where a caller can use it, and skips functions over 12,000 blocks times locals. T1 also learned that a
+closure and an interface value are `Unique` (the verifier says so) and got a fast path for instructions that name no `Unique` local. Without the budget measures the pass
+cost +20 % self-compile, with them +0.83 %. Mutation classes: 1,638 `uniq-flag-flip-out`, 190 `uniq-flag-flip-in`, 94 `uniq-in-shared-caller`, 29 `uniq-out-then-dup` mutants
+among 54,672 in all: 0 survivors, 0 wrong-reason (776 benign, each classified with a reason). Lean: outside the model (calls), listed in docs/tcb.md and docs/formal.md.
+
 - *MIR change:* v2.5. Two flags on `MFunction`, printed after the existing ones: `unique-in` (the `inout` receiver, local 0, is
   `Unique` on entry) and `unique-out` (the value handed back is `Unique`: local 0 at each return for an `inout` function, the
   returned local for any other function with a reference result). Parser, printer, `wf`, `tools/mutate_mir.py` (`Func` header regex, :62) updated.
