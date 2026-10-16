@@ -203,6 +203,53 @@ def joinS (a1 a2 : AState) : Option AState :=
 
 /-! ### the checker -/
 
+/-! ### calls -/
+
+/-- Signature of a callee as the caller sees it. -/
+structure Sig where
+  params : List PM
+  retRef : Bool
+
+/-- the operands in owned-parameter positions (consumed by the call) -/
+def ownedArgs (ps : List PM) (args : List Nat) : List Nat :=
+  (args.zip ps).filterMap (fun p => if p.2 = .owned then some p.1 else none)
+
+/-- The caller's state while the callee runs: consumed operands and their aliases are dead, and no
+local is `Unique` any more (the callee may hold, and drop, a reference to the object). -/
+def midK (own : List Nat) (a : List AS) : List AS :=
+  a.mapIdx fun i k =>
+    if i ∈ own then .dead else
+    match k with
+    | .borrowed r => if r ∈ own then .dead else .borrowed r
+    | .unique => .owned
+    | k => k
+
+/-- one operand against its parameter mode: a scalar parameter takes an initialised scalar, a
+borrowed one any readable reference whose root is not consumed by the same call, an owned one a
+counted local. -/
+def argOK (a : List AS) (own : List Nat) : Nat × PM → Bool
+  | (j, .scalar) => decide (gk a j = .init)
+  | (j, .borrowed) => (gk a j).isRef && decide (rootOf a j ∉ own)
+  | (j, .owned) => (gk a j).counted
+
+def stepCall (sg : List Sig) (np : Nat) (a : List AS) (d f : Nat) (args : List Nat) :
+    Option (List AS) :=
+  match sg[f]? with
+  | none => none
+  | some sig =>
+    if args.length = sig.params.length ∧ d < a.length ∧ np ≤ d ∧
+        (ownedArgs sig.params args).Nodup ∧
+        (args.zip sig.params).all (argOK a (ownedArgs sig.params args)) = true then
+      some (defK (midK (ownedArgs sig.params args) a) d (if sig.retRef then .owned else .init))
+    else none
+
+def stepAC (np : Nat) (sg : List Sig) (a : AState) (d f : Nat) (args : List Nat) :
+    Option AState :=
+  match stepCall sg np a.ls d f args with
+  | none => none
+  | some ls' =>
+    if args.any (hasHole a.holes) || hasHole a.holes d then none else some ⟨ls', a.holes⟩
+
 /-- Loop invariant search: from the head state `b`, run the body, join the result into the head
 state, and stop when the head state no longer changes (kinds only move up the join order, so a
 bounded number of rounds suffices; running out of fuel rejects).  Returns the invariant. -/
@@ -218,18 +265,19 @@ def loopFix (body : AState → Option AState) (c : Nat) : Nat → AState → Opt
 def loopFuel (a : AState) : Nat := 2 * a.ls.length + 3
 
 /-- Abstract execution of structured code; `none` = rejected. -/
-def chk (np : Nat) : AState → Code → Option AState
+def chk (np : Nat) (sg : List Sig) : AState → Code → Option AState
   | a, .nil => some a
-  | a, .op i k => (stepA np a i).bind (fun a1 => chk np a1 k)
+  | a, .op i k => (stepA np a i).bind (fun a1 => chk np sg a1 k)
   | a, .ite c t e k =>
     if c < a.ls.length ∧ gk a.ls c = .init then
-      (chk np a t).bind fun at' =>
-      (chk np a e).bind fun ae =>
+      (chk np sg a t).bind fun at' =>
+      (chk np sg a e).bind fun ae =>
       (joinS at' ae).bind fun aj =>
-      chk np aj k
+      chk np sg aj k
     else none
   | a, .loop c t k =>
-    (loopFix (fun b => chk np b t) c (loopFuel a) a).bind fun b => chk np b k
+    (loopFix (fun b => chk np sg b t) c (loopFuel a) a).bind fun b => chk np sg b k
+  | a, .call d f args k => (stepAC np sg a d f args).bind fun a1 => chk np sg a1 k
 
 structure Prog where
   /-- number of locals -/
@@ -245,7 +293,7 @@ def Prog.entry (p : Prog) : AState :=
 /-- Whole-function check: the code is accepted and no hole is open at the end. -/
 def check (p : Prog) : Bool :=
   p.params.length ≤ p.n &&
-  match chk p.params.length p.entry p.code with
+  match chk p.params.length [] p.entry p.code with
   | some af => af.holes.isEmpty
   | none => false
 

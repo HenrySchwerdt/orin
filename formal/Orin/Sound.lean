@@ -3,7 +3,7 @@ import Orin.SimArr
 /-!
 # Soundness of the ownership checker
 
-`Cont np a code` : the checker accepts `code` from abstract state `a` (a derivation that mirrors
+`Cont sg np a code` : the checker accepts `code` from abstract state `a` (a derivation that mirrors
 `chk`, closed under weakening so that it survives the join at the end of an `if`).
 `sound_step` : a configuration whose code is accepted and whose state is related to `a` takes a
 step that is never `bad`, and the successor is again accepted and related.
@@ -15,37 +15,41 @@ that is not uniquely owned).
 namespace Orin
 open Heap
 
-variable {ext : List Val} {np : Nat}
+variable {ext : List Val} {np : Nat} {sg : List Sig}
 
-/-- `Cont np E a code`: the checker accepts `code` from abstract state `a`, and when the code runs
+/-- `Cont sg np E a code`: the checker accepts `code` from abstract state `a`, and when the code runs
 out the abstract state satisfies `E` (a derivation that mirrors `chk`, closed under weakening so
 that it survives the join at the end of an `if` and the loop invariant).  The end condition `E`
 is what lets a loop body be checked against "return to the loop head": `loop` takes a body
 derivation whose end condition is `Fle · b`, `b` the loop invariant. -/
-inductive Cont (np : Nat) : (AState → Prop) → AState → Code → Prop
-  | nil {E : AState → Prop} {a : AState} : E a → Cont np E a .nil
+inductive Cont (sg : List Sig) (np : Nat) : (AState → Prop) → AState → Code → Prop
+  | nil {E : AState → Prop} {a : AState} : E a → Cont sg np E a .nil
   | op {E : AState → Prop} {a a1 : AState} {i : MI} {k : Code} :
-      stepA np a i = some a1 → Cont np E a1 k → Cont np E a (.op i k)
+      stepA np a i = some a1 → Cont sg np E a1 k → Cont sg np E a (.op i k)
   | ite {E : AState → Prop} {a : AState} {c : Nat} {t e k : Code} :
-      c < a.ls.length → gk a.ls c = .init → Cont np E a (t.app k) → Cont np E a (e.app k) →
-      Cont np E a (.ite c t e k)
+      c < a.ls.length → gk a.ls c = .init → Cont sg np E a (t.app k) → Cont sg np E a (e.app k) →
+      Cont sg np E a (.ite c t e k)
   | loop {E : AState → Prop} {a b : AState} {c : Nat} {t k : Code} :
       Fle a.ls b.ls → c < b.ls.length → gk b.ls c = .init →
-      Cont np (fun x => Fle x.ls b.ls) b t → Cont np E b k → Cont np E a (.loop c t k)
+      Cont sg np (fun x => Fle x.ls b.ls) b t → Cont sg np E b k → Cont sg np E a (.loop c t k)
+  | call {E : AState → Prop} {a a1 : AState} {d f : Nat} {args : List Nat} {k : Code} :
+      stepAC np sg a d f args = some a1 → Cont sg np E a1 k → Cont sg np E a (.call d f args k)
   | weak {E : AState → Prop} {a b : AState} {code : Code} :
-      Fle a.ls b.ls → Cont np E b code → Cont np E a code
+      Fle a.ls b.ls → Cont sg np E b code → Cont sg np E a code
 
 theorem Code.app_nil : ∀ c : Code, c.app .nil = c
   | .nil => rfl
   | .op i c => by simp [Code.app, Code.app_nil c]
   | .ite c t e k => by simp [Code.app, Code.app_nil k]
   | .loop c t k => by simp [Code.app, Code.app_nil k]
+  | .call d f args k => by simp [Code.app, Code.app_nil k]
 
 theorem Code.app_assoc : ∀ (c k1 k2 : Code), (c.app k1).app k2 = c.app (k1.app k2)
   | .nil, _, _ => rfl
   | .op i c, k1, k2 => by simp [Code.app, Code.app_assoc c k1 k2]
   | .ite c t e k, k1, k2 => by simp [Code.app, Code.app_assoc k k1 k2]
   | .loop c t k, k1, k2 => by simp [Code.app, Code.app_assoc k k1 k2]
+  | .call d f args k, k1, k2 => by simp [Code.app, Code.app_assoc k k1 k2]
 
 theorem stepA_ls {a a1 : AState} {i : MI} (h : stepA np a i = some a1) :
     stepL np a.ls i = some a1.ls := by
@@ -60,8 +64,8 @@ theorem stepA_ls {a a1 : AState} {i : MI} (h : stepA np a i = some a1) :
 
 /-- Sequencing: code accepted with end condition `E1` can be followed by any continuation that
 is accepted from every state satisfying `E1`. -/
-theorem Cont.seq {E1 E : AState → Prop} {a : AState} {t : Code} (h : Cont np E1 a t) :
-    ∀ K : Code, (∀ x, E1 x → Cont np E x K) → Cont np E a (t.app K) := by
+theorem Cont.seq {E1 E : AState → Prop} {a : AState} {t : Code} (h : Cont sg np E1 a t) :
+    ∀ K : Code, (∀ x, E1 x → Cont sg np E x K) → Cont sg np E a (t.app K) := by
   induction h with
   | nil hE => intro K hK; exact hK _ hE
   | op hstep _ ih => intro K hK; exact Cont.op hstep (ih K hK)
@@ -75,6 +79,7 @@ theorem Cont.seq {E1 E : AState → Prop} {a : AState} {t : Code} (h : Cont np E
   | loop hF hcb hini hbody _ _ ihk =>
     intro K hK
     exact Cont.loop hF hcb hini hbody (ihk K hK)
+  | call hstep _ ih => intro K hK; exact Cont.call hstep (ih K hK)
   | weak hF _ ih => intro K hK; exact Cont.weak hF (ih K hK)
 
 /-! ### the loop invariant search -/
@@ -124,7 +129,7 @@ theorem loopFix_spec (body : AState → Option AState) (c : Nat) :
 /-! ### the checker yields a `Cont` derivation -/
 
 theorem chk_cont : ∀ (t : Code) (a at' : AState) (k : Code) (E : AState → Prop),
-    chk np a t = some at' → Cont np E at' k → Cont np E a (t.app k) := by
+    chk np sg a t = some at' → Cont sg np E at' k → Cont sg np E a (t.app k) := by
   intro t
   induction t with
   | nil =>
@@ -152,10 +157,10 @@ theorem chk_cont : ∀ (t : Code) (a at' : AState) (k : Code) (E : AState → Pr
         subst haj
         have hkc := ihk _ at' k E hk1 hk
         have hl : at1.ls.length = ae.ls.length := hjc.1
-        have hct : Cont np E at1 (k1.app k) :=
+        have hct : Cont sg np E at1 (k1.app k) :=
           Cont.weak (a := at1) (b := ⟨joinL at1.ls ae.ls, at1.holes⟩)
             (joinL_fle_left _ _ hl) hkc
-        have hce : Cont np E ae (k1.app k) :=
+        have hce : Cont sg np E ae (k1.app k) :=
           Cont.weak (a := ae) (b := ⟨joinL at1.ls ae.ls, at1.holes⟩)
             (joinL_fle_right _ _ hl) hkc
         exact Cont.ite hc.1 hc.2 (iht a at1 _ E ht hct) (ihe a ae _ E he hce)
@@ -166,17 +171,22 @@ theorem chk_cont : ∀ (t : Code) (a at' : AState) (k : Code) (E : AState → Pr
     simp only [chk, Option.bind_eq_some_iff] at h
     obtain ⟨b, hfix, hkb⟩ := h
     obtain ⟨hF, hcb, hini, b2, hb2, hFb2⟩ := loopFix_spec _ _ _ _ _ hfix
-    have hbody : Cont np (fun x => Fle x.ls b.ls) b t1 := by
+    have hbody : Cont sg np (fun x => Fle x.ls b.ls) b t1 := by
       have := iht b b2 .nil (fun x => Fle x.ls b.ls) hb2 (Cont.nil hFb2)
       rwa [Code.app_nil] at this
     exact Cont.loop hF hcb hini hbody (ihk b at' k E hkb hk)
+  | call d f args k1 ih =>
+    intro a at' k E h hk
+    simp only [chk, Option.bind_eq_some_iff] at h
+    obtain ⟨a1, h1, h2⟩ := h
+    exact Cont.call h1 (ih a1 at' k E h2 hk)
 
 /-! ### one step -/
 
 theorem opsafe_step {E : AState → Prop} {a1 : AState} {k : Code} {r : Res St}
-    (hs : OpSafe ext a1.ls r) (hc : Cont np E a1 k) :
+    (hs : OpSafe ext a1.ls r) (hc : Cont sg np E a1 k) :
     (∀ k', Res.liftC k r ≠ .bad k') ∧
-    ∀ c', Res.liftC k r = .ok c' → ∃ a', Cont np E a' c'.1 ∧ Inv ext a'.ls c'.2 := by
+    ∀ c', Res.liftC k r = .ok c' → ∃ a', Cont sg np E a' c'.1 ∧ Inv ext a'.ls c'.2 := by
   refine ⟨?_, ?_⟩
   · intro k' hh
     cases r with
@@ -195,10 +205,10 @@ theorem opsafe_step {E : AState → Prop} {a1 : AState} {k : Code} {r : Res St}
     | ill => simp [Res.liftC] at hh
 
 theorem sound_step_nopending {E : AState → Prop} {a : AState} {code : Code}
-    (hC : Cont np E a code) :
+    (hC : Cont sg np E a code) :
     ∀ s, Inv ext a.ls s → s.pending = [] →
       (mstep (code, s) = none ∨ ∃ r, mstep (code, s) = some r ∧ (∀ k, r ≠ .bad k) ∧
-        ∀ c', r = .ok c' → ∃ a', Cont np E a' c'.1 ∧ Inv ext a'.ls c'.2) := by
+        ∀ c', r = .ok c' → ∃ a', Cont sg np E a' c'.1 ∧ Inv ext a'.ls c'.2) := by
   induction hC with
   | nil _ =>
     intro s hI hp
@@ -251,7 +261,7 @@ theorem sound_step_nopending {E : AState → Prop} {a : AState} {code : Code}
     have hcl : c < s.locals.length := hIb.len ▸ hcb
     obtain ⟨n, hn⟩ := (hIb.cl c).ini hinit
     have hFbb : Fle b.ls b.ls := ⟨rfl, fun i => Or.inl rfl, hF.2.2⟩
-    have hself : Cont np E b (.loop c t k) := Cont.loop hFbb hcb hinit hBody hK
+    have hself : Cont sg np E b (.loop c t k) := Cont.loop hFbb hcb hinit hBody hK
     by_cases h0 : n = 0
     · subst h0
       refine ⟨.ok (t.app (.loop c t k), s), by simp [mstep, hp, hcl, hn], ?_, ?_⟩
@@ -264,15 +274,19 @@ theorem sound_step_nopending {E : AState → Prop} {a : AState} {code : Code}
       · intro c' hh
         cases hh
         exact ⟨b, hK, hIb⟩
+  | call _ _ _ =>
+    intro s hI hp
+    left
+    simp [mstep, hp]
   | @weak E a b code hF hk ih =>
     intro s hI hp
     exact ih s (hI.weaken hF) hp
 
-theorem sound_step {E : AState → Prop} {a : AState} {code : Code} (hC : Cont np E a code)
+theorem sound_step {E : AState → Prop} {a : AState} {code : Code} (hC : Cont sg np E a code)
     {s : St}
     (hI : Inv ext a.ls s) :
     (mstep (code, s) = none ∨ ∃ r, mstep (code, s) = some r ∧ (∀ k, r ≠ .bad k) ∧
-      ∀ c', r = .ok c' → ∃ a', Cont np E a' c'.1 ∧ Inv ext a'.ls c'.2) := by
+      ∀ c', r = .ok c' → ∃ a', Cont sg np E a' c'.1 ∧ Inv ext a'.ls c'.2) := by
   by_cases hp : s.pending = []
   · exact sound_step_nopending hC s hI hp
   · right
@@ -302,9 +316,9 @@ theorem sound_step {E : AState → Prop} {a : AState} {code : Code} (hC : Cont n
 /-! ### runs -/
 
 theorem reach_inv {E : AState → Prop} {a : AState} {code : Code} {s : St}
-    (hC : Cont np E a code)
+    (hC : Cont sg np E a code)
     (hI : Inv ext a.ls s) {c : Code × St} (hr : MReach (code, s) c) :
-    ∃ a', Cont np E a' c.1 ∧ Inv ext a'.ls c.2 := by
+    ∃ a', Cont sg np E a' c.1 ∧ Inv ext a'.ls c.2 := by
   generalize hc0 : (code, s) = c0 at hr
   induction hr generalizing code s a with
   | refl => cases hc0; exact ⟨a, hC, hI⟩
@@ -318,7 +332,7 @@ theorem reach_inv {E : AState → Prop} {a : AState} {code : Code} {s : St}
       exact ih hC' hI' rfl
 
 theorem reach_safe {E : AState → Prop} {a : AState} {code : Code} {s : St}
-    (hC : Cont np E a code)
+    (hC : Cont sg np E a code)
     (hI : Inv ext a.ls s) {c : Code × St} (hr : MReach (code, s) c) :
     ∀ k, mstep c ≠ some (.bad k) := by
   obtain ⟨a', hC', hI'⟩ := reach_inv hC hI hr

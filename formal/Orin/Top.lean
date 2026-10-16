@@ -23,12 +23,12 @@ def initSt (p : Prog) (H : Heap) (vals : List Val) : St :=
   ⟨H, vals ++ List.replicate (p.n - p.params.length) (.int 0), []⟩
 
 theorem check_cont {p : Prog} (hp : check p = true) :
-    p.params.length ≤ p.n ∧ Cont p.params.length (fun _ => True) p.entry p.code := by
+    p.params.length ≤ p.n ∧ Cont [] p.params.length (fun _ => True) p.entry p.code := by
   unfold check at hp
   simp only [Bool.and_eq_true] at hp
   obtain ⟨hn, hm⟩ := hp
   refine ⟨by simpa using hn, ?_⟩
-  cases hc : chk p.params.length p.entry p.code with
+  cases hc : chk p.params.length [] p.entry p.code with
   | none => rw [hc] at hm; simp at hm
   | some af =>
     have h1 := chk_cont (np := p.params.length) p.code p.entry af .nil (fun _ => True) hc (Cont.nil trivial)

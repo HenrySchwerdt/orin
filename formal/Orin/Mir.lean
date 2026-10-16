@@ -21,6 +21,14 @@ non-live location or in-place store into an object whose count is not 1".
 
 namespace Orin
 
+/-- Parameter modes (`MFunction.paramOwned`, `docs/mir.md`): a scalar, a reference borrowed from the
+caller for the whole call, or an owned reference (one count handed over by the caller). -/
+inductive PM where
+  | scalar
+  | borrowed
+  | owned
+  deriving DecidableEq, Repr
+
 /-- Straight-line MIR core instructions (`ite` lives in `Code`). -/
 inductive MI where
   /-- `ICopy` of a scalar constant -/
@@ -68,6 +76,10 @@ inductive Code where
   leaves the loop and continues with `k`.  (The condition is recomputed at the end of the body;
   a MIR header block that computes it is duplicated in front of the loop.) -/
   | loop (c : Nat) (t k : Code) : Code
+  /-- `ICall d f args`: call function `f` of the program with the operands `args`; the result
+  goes to the local `d`.  The machine step of a call is `cstep` (`Call.lean`); the single-frame
+  `mstep` treats a call as a stop. -/
+  | call (d f : Nat) (args : List Nat) (k : Code) : Code
 
 namespace Code
 
@@ -76,6 +88,7 @@ def app : Code → Code → Code
   | .op i c, k => .op i (app c k)
   | .ite c t e k', k => .ite c t e (app k' k)
   | .loop c t k', k => .loop c t (app k' k)
+  | .call d f args k', k => .call d f args (app k' k)
 
 /-- operands stored into slots `i, i+1, …` of the fresh object `d` -/
 def storeAll (d : Nat) : Nat → List Nat → Code → Code
@@ -271,6 +284,7 @@ def mstep (c : Code × St) : Option (Res (Code × St)) :=
         | .int _ => some (.ok (e.app k, c.2))
         | .ref _ => some .ill
       else some .ill
+    | .call .. => none
     | .loop cnd t k =>
       if cnd < c.2.locals.length then
         match c.2.get cnd with

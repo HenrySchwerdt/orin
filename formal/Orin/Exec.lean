@@ -62,8 +62,9 @@ def diag (np : Nat) : AState → Code → Except String AState
           | none => .error "join rejected (hole sets differ)"
           | some aj => diag np aj k
     else .error s!"if condition l{c} is not an initialised scalar"
+  | _, .call .. => .error "calls are not part of the text format"
   | a, .loop c t k =>
-    match loopFix (fun b => chk np b t) c (loopFuel a) a with
+    match loopFix (fun b => chk np [] b t) c (loopFuel a) a with
     | none => .error s!"loop: no invariant (condition l{c} not an initialised scalar, body rejected, or no fixpoint)"
     | some b => diag np b k
 

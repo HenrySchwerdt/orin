@@ -23,3 +23,5 @@ import Orin.Sound
 import Orin.Top
 import Orin.Examples
 import Orin.Forward
+import Orin.Frozen
+import Orin.SoundFz
