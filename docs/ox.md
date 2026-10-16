@@ -62,7 +62,7 @@ compiler knows no library by name. Migrating an ADR-0043 program is adding this 
 | text | `Hello, world &copy;` | lines trimmed and joined with one space; entities decoded |
 | expression child | `{name}`, `{count}`, `{h}`, `{items.map(i => <li>{i}</li>)}` | see the provider |
 | component | `<Card title="x" count={3}>body</Card>` | an upper-case tag is a call of the function `Card` |
-| member tag | `<ui.Card title="x">body</ui.Card>`, `<this.Row a="1" />` | a dotted path whose last segment starts upper-case: a call of the method `Card` of the value `ui` |
+| member tag | `<ui.Card title="x">body</ui.Card>`, `<this.Row a="1" />`, `<Ui.Card title="x" />` | a dotted path whose last segment starts upper-case: a call of the method `Card` of the value `ui`, or of the static method `Card` of the class `Ui` |
 | named slot | `<Dialog><:header>..</:header>body</Dialog>` | directly inside a component or member tag; fills the parameter `header` |
 
 Not supported: namespaced names `xlink:href`, `key`.
@@ -162,6 +162,11 @@ and source-order evaluation all work the same, and the result is checked where t
 instance or an interface value, `this.Row` calls a method of the current class from inside it, and the prefix may be a
 path of field reads (`<app.theme.Button>`); the closing tag repeats the whole path (`</app.theme.Button>`). The prefix is
 only names, `this` and fields, so reading it at the call is the same as evaluating it first.
+
+When the prefix is a single name that is no value in scope but a class (`<Ui.Card title="x" />`, with `Ui` declared or
+imported), the tag calls the class's **static** method, as `Ui.Card(..)` does; an instance method there is E0491
+(call it on a value instead). Modules are not values in orin (there is no `import * as m`), so there are no member
+tags on a module: import the component by name (`import { Card } from "./ui";`) and write `<Card>`.
 
 A member that is not a method (a field of function type has no parameter names) or does not exist is E0491. A dotted tag
 whose last segment is lower-case (`<ui.card>`) is a syntax error (E0200): no provider element has a dotted name.

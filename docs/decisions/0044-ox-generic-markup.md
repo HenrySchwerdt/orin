@@ -38,7 +38,7 @@ children, the `<` rule), plus:
 | `import ox from "module";` | selects the file's **OX provider** (§3). At most one per file; it binds no name. |
 | `<Card {...props} title="x" />` | **spread**: every field of the record `props` is an attribute. On a component it fills parameters (§4.1); on an intrinsic element of a `Markup` provider it expands statically (§4.3). |
 | `<Dialog><:header>..</:header>..</Dialog>` | **named slot** `header`: its children fill the component's parameter `header`. Only directly inside a component or member tag. `</:header>` must repeat the name. |
-| `<ui.Card title="x">..</ui.Card>` | **member tag**: the tag is a dotted path whose last segment starts upper-case; the call of the method `Card` of the value `ui` (§4.5). The closing tag repeats the whole path. |
+| `<ui.Card title="x">..</ui.Card>` | **member tag**: the tag is a dotted path whose last segment starts upper-case; the call of the method `Card` of the value `ui`, or of the static method `Card` when `ui` names a class (§4.5). The closing tag repeats the whole path. |
 | `@Sealed type T = { .. };` | record literals of `T` and assignments to its fields are only allowed in the declaring module (E0495). |
 
 Why `<:name>` for named slots: `<slot name="..">` is a real HTML element (Web Components) and would make the
@@ -211,8 +211,22 @@ included; no such function is E0491.
 an upper-case function component: the method's parameters (without the receiver) give the attribute names; spread,
 omitted `Option` parameters, the default slot `children`, `<:name>` slots and source-order evaluation are the same; the
 result is the method's return type, checked where the element is used. The receiver is a class instance or an interface
-value (a mutating method needs a receiver that is a mutable place, as for `a.b.C(..)`). Static methods and private
-methods follow the method-call rules (E0405).
+value (a mutating method needs a receiver that is a mutable place, as for `a.b.C(..)`). Private methods follow the
+method-call rules (E0405).
+
+**Static methods.** `<T.C attrs>kids</T.C>`, where `T` is a single name that is no value in scope (no local, parameter
+or global) and names a class (imported or local, generic or not), is the call of the static method `C` of `T`, with the
+same component rules; the static method's parameters give the attribute names. This is the rule of `T.C(..)` itself, so
+a value named `T` shadows the class for a tag exactly as for a call. Errors (E0491): `T` has no method `C`
+(`` no static method `C` on class `T` ``), or `C` is an instance method (`` `T.C` is an instance method; a member tag on
+a class name calls a static method ``); a private static method outside the class is E0405, as for the call. Inside a
+class, `<T.C>` with `T` the class itself calls its own static method (`<this.C>` is the instance form).
+
+**Modules are not receivers.** orin has no module values: an import binds the listed names, `import * as m` is a syntax
+error (E0200), and `import ox from "M"` binds nothing. A member tag on a module therefore has nothing to name; a
+component exported by a module is used as `<C>` after `import { C } from "M";`. Should namespace imports be added to
+the language, `<m.C>` would be the call of `m`'s exported function `C` with the component rules; that is a change to
+the module system (spec 04), not to OX.
 
 The checker does not build a second call path: after the attributes are matched to parameters it checks the ordinary
 method call `a.b.C(args)`, so visibility, mutation, generic classes and interface dispatch behave as in that call. The
@@ -270,7 +284,8 @@ docs/benchmarks.md.
 
 ## Not done
 
-- Namespaces; member tags on a type name (static methods) or on a module; per-block provider selection.
+- Namespaces; per-block provider selection. (Member tags on a class name, i.e. static methods, are done, §4.5; member
+  tags on a module need namespace imports, which the language does not have, §4.5.)
 - Generic slot parameters whose type is inferred from the children (a generic component's slot type must be fixed by
   its other arguments or written explicitly).
 - The ADR-0043 performance follow-ups that remain (append without temporaries, component fusion, streaming). Pre-sized

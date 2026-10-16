@@ -34,6 +34,11 @@
   `IArraySet` of an `int`, `usize`, `bool`, `float` or handle store directly; the hot `orin_stats` counters are compiled in only
   with `-DORIN_STATS_ENABLED` (implied by `-DORIN_SITE_STATS`; `tools/bench.py` builds a separate counting binary). nbody -21%,
   mutres -17.6% executed instructions.
+- **OX member tags on a class name (ADR-0044 §4.5).** `<Ui.Card title="x">..</Ui.Card>`, where `Ui` names a class and no value,
+  calls the static method `Ui.Card` with the component rules (attributes by parameter name, slots, `Option` parameters, spread,
+  source-order evaluation), for local, imported and generic classes. An instance method there is E0491, a private static
+  method outside its class E0405. Member tags on a module are not added: orin has no module values (`import * as m` is E0200),
+  so a module's component is imported by name and written `<Card>`.
 - **OX roots are built in a pre-sized buffer (ADR-0044).** A markup root with a dynamic piece starts from `str.withCapacity(static bytes + 16 per dynamic piece)` (new builtin, runtime `orin_str_with_capacity`), so the pieces are appended in place without regrowth. `bench/html`: `string_grows` 4.23 M -> 0.25 M, executed instructions 3.99 G -> 3.10 G.
 - **Verifier and optimiser without per-block allocations (ADR-0038 lever 1).** The ownership verifier's fixpoint joins
   out-states into the successors in place and replays every block with one reusable `Transfer`; the optimiser's analyses use
