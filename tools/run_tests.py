@@ -219,7 +219,7 @@ def run_test(args, label, test):
 
     env = dict(os.environ)
     if args.sanitize:
-        env["ASAN_OPTIONS"] = "detect_leaks=0"
+        env["ASAN_OPTIONS"] = "detect_leaks=0:allocator_may_return_null=1"
     # Optional stdin: `name.in` next to `name.or`, or `input.in` next to `main.or`.
     stdin_data = None
     in_path = os.path.join(os.path.dirname(entry), "input.in" if os.path.basename(entry) == "main.or" else name + ".in")
