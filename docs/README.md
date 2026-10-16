@@ -11,6 +11,7 @@ that a feature has shipped. [Progress](progress.md) records implementation statu
 - [Language specification](../spec/spec.md), [TypeScript migration guide](ts-developers.md).
 - [Standard library](std.md), [capabilities and effects](capabilities.md).
 - [Encoding](std-encoding.md), [URL components/query pairs](std-url.md).
+- [std:meta, the annotation-processor interface (unstable, ADR-0046 S3)](std-meta.md).
 - Opt-in exact JSON: [numbers](std-jsonnumber.md), [documents](std-jsonvalue.md),
   [field-path decoders](std-jsondecode.md), [pure config example](../examples/json_config.or).
   Legacy `std:json` remains separate.

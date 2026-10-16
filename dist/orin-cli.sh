@@ -436,19 +436,30 @@ build_command() {
       *) [ -z "$src" ] || { if [ "$command" = run ]; then program_args+=("$1"); else fail 'Expected one source path.' 2; fi; }; [ -n "$src" ] || src=$1 ;;
     esac; shift
   done
-  # ADR-0038 section 8: the backend of a --release build when none is given. Flipping this to llvm is the owner's
-  # decision (gates 1-3 are met); it is deliberately still the C backend.
-  local release_backend=c
+  # ADR-0038 section 8: --release defaults to the LLVM backend (the owner's decision, 2026-10-16); --backend=c is the
+  # explicit fallback. Both backends run the same MIR optimiser and are compiled at -O2 (native_build).
+  local release_backend=llvm explicit_backend=$backend
   if [ -z "$backend" ]; then if [ "$profile" = release ]; then backend=$release_backend; else backend=c; fi; fi
   if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then
-    # The pinned LLVM (orin toolchain install) is preferred. A release build without it falls back to the C backend.
-    local pinned
+    # The pinned LLVM (orin toolchain install) is preferred. Without it a dev build uses the system clang; a release
+    # build uses the system clang only when the backend was not asked for and its major version is at least the pin's,
+    # and otherwise falls back to the C backend.
+    local pinned pin_version sys_major
     if pinned=$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain path 2>/dev/null); then CC=$pinned
-    elif [ "$profile" = release ]; then
-      backend=c
-      $quiet || printf 'note: the pinned LLVM %s is not installed (run `orin toolchain install`); building --release with the C backend\n' \
-        "$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain version 2>/dev/null || echo '?')" >&2
-    else CC=clang; fi
+    elif [ "$profile" != release ]; then CC=clang
+    else
+      pin_version=$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain version 2>/dev/null || true)
+      sys_major=$(clang --version 2>/dev/null | sed -n 's/.*clang version \([0-9][0-9]*\)\..*/\1/p' | head -n 1)
+      if [ -z "$explicit_backend" ] && [ -n "$sys_major" ] && [ -n "$pin_version" ] && [ "$sys_major" -ge "${pin_version%%.*}" ]; then CC=clang
+      else
+        backend=c
+        $quiet || printf 'note: the pinned LLVM %s is not installed (run `orin toolchain install`); building --release with the C backend\n' \
+          "${pin_version:-?}" >&2
+      fi
+    fi
+  elif [ "$backend" = llvm ] && [ -z "$explicit_backend" ]; then
+    # An explicit CC that is not clang cannot compile the .ll: the default release build stays on the C backend.
+    case ${CC%% *} in *clang*) ;; *) backend=c ;; esac
   fi
   project_target "$src"
   validate_locked_dependencies "$project" || return 1
