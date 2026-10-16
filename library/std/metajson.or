@@ -1,0 +1,1218 @@
+// std:metajson -- the stable JSON encoding of `std:metacore`'s `Input` and `Output` (ADR-0046 §3, slice S3). Import
+// `std:meta`, which re-exports this module.
+//
+// UNSTABLE until ADR-0046 is fully implemented.
+//
+// The compiler's processor harness (S5) reads an encoded `Input` from stdin and writes an encoded `Output` to
+// stdout; the compiler side (S4) reads the `Output` back. Both directions use this module.
+//
+//   * Pure: builds on `std:json` (integers only; floats travel as text, see `MCFloat`). No grants, no I/O.
+//   * Deterministic and stable: object keys are written in a FIXED order (the order of the field lists in
+//     `std:metacore`; every union value is an object with the tag `"k"` first), arrays keep their order, nothing
+//     depends on time, paths or memory addresses. The same value always encodes to the same bytes (compact JSON of
+//     `std:json.stringify`). The envelope carries `"format"` and `"version"` (1).
+//   * Decoding is strict and TOTAL: wrong format/version, a missing key, a wrong kind of value, an unknown tag or
+//     nesting deeper than 200 (the `std:json` limit) give `Err(message)` with the path of the offending value (for
+//     example `.decls[0].fields[1].ty: unknown type kind "x"`). It never traps. Key order and unknown extra keys are
+//     accepted on input.
+//
+// Complexity: O(size of the value) time and allocation for encoding and decoding (plus the JSON parse).
+
+import {
+  Json, JField, JNull, JBool, JNum, JStr, JArr, JObj, field, parse, stringify, get, formatError,
+} from "std:json";
+import {
+  MRef, MConst, MCBool, MCInt, MCFloat, MCString, MCTag, MCArray, MCNone, MCSome, MType, MNamed,
+  MArray, MOption, MResult, MFn, MUnion, MVariant, MParam, MArg, MAnnotation, MContractKind,
+  MRequires, MEnsures, MInvariant, MDecreases, MRule, MContract, MDeclKind, MKRecord, MKUnion,
+  MKAlias, MKClass, MKInterface, MKFunction, MKConst, MFieldView, MMethodView, MDeclView, MShape,
+  MSRecord, MSUnion, MSAlias, MSOpaque, MTypeShape, Input, MUnOp, OpNeg, OpNot, OpBitNot, MBinOp,
+  OpAdd, OpSub, OpMul, OpDiv, OpRem, OpEq, OpNe, OpLt, OpLe, OpGt, OpGe, OpAnd, OpOr, OpBitAnd,
+  OpBitOr, OpBitXor, OpShl, OpShr, MPattern, MPWild, MPBind, MPVariant, MPLit, MExpr, MEInt,
+  MEFloat, MEString, MEBool, MEName, MECall, MEMethod, MEField, MEIndex, MERecord, MEArray, MEUnary,
+  MEBinary, MEMatch, METry, MECond, MFieldInit, MArm, MStmt, MSConst, MSLet, MSAssign, MSReturn,
+  MSExpr, MSIf, MSWhile, MSForOf, MSMatch, MFnDecl, MConstDecl, MRecordDecl, MUnionDecl,
+  MClassField, MCtorDecl, MClassDecl, MDecl, MDFn, MDConst, MDRecord, MDUnion, MDClass, MImport,
+  MSeverity, MError, MWarning, MDiagnostic, Output,
+} from "std:metacore";
+
+const FORMAT_VERSION: int = 1;
+const INPUT_FORMAT: string = "orin.meta.input";
+const OUTPUT_FORMAT: string = "orin.meta.output";
+
+// ---- encoding helpers -----------------------------------------------------------------------------------------------
+
+function obj(fields: JField[]): Json {
+  return JObj(fields);
+}
+
+// A union value: {"k": kind, ...fields}.
+function tagged(kind: string, fields: JField[]): Json {
+  let all: JField[] = [field("k", JStr(kind))];
+  for (const f of fields) {
+    all.push(f);
+  }
+  return JObj(all);
+}
+
+function list<T>(xs: T[], f: (x: T) => Json): Json {
+  let out: Json[] = [];
+  for (const x of xs) {
+    out.push(f(x));
+  }
+  return JArr(out);
+}
+
+function strs(xs: string[]): Json {
+  let out: Json[] = [];
+  for (const x of xs) {
+    out.push(JStr(x));
+  }
+  return JArr(out);
+}
+
+function opt<T>(o: Option<T>, f: (x: T) => Json): Json {
+  return match (o) {
+    Some(x) => f(x),
+    None => JNull,
+  };
+}
+
+// ---- encoding: input side -------------------------------------------------------------------------------------------
+
+function encRef(r: MRef): Json {
+  return JNum(r.id);
+}
+
+function encConst(c: MConst): Json {
+  return match (c) {
+    MCBool(b) => tagged("bool", [field("v", JBool(b))]),
+    MCInt(n) => tagged("int", [field("v", JNum(n))]),
+    MCFloat(s) => tagged("float", [field("v", JStr(s))]),
+    MCString(s) => tagged("string", [field("v", JStr(s))]),
+    MCTag(s) => tagged("tag", [field("v", JStr(s))]),
+    MCArray(xs) => tagged("array", [field("v", list(xs, x => encConst(x)))]),
+    MCNone => tagged("none", []),
+    MCSome(x) => tagged("some", [field("v", encConst(x))]),
+  };
+}
+
+function encType(t: MType): Json {
+  return match (t) {
+    MNamed(n, args) => tagged(
+      "named",
+      [field("name", JStr(n)), field("args", list(args, a => encType(a)))],
+    ),
+    MArray(e) => tagged("array", [field("elem", encType(e))]),
+    MOption(e) => tagged("option", [field("elem", encType(e))]),
+    MResult(o, e) => tagged("result", [field("ok", encType(o)), field("err", encType(e))]),
+    MFn(ps, r) => tagged(
+      "fn",
+      [field("params", list(ps, p => encType(p))), field("returns", encType(r))],
+    ),
+    MUnion(vs) => tagged("union", [field("variants", list(vs, v => encVariant(v)))]),
+  };
+}
+
+function encVariant(v: MVariant): Json {
+  return obj([field("name", JStr(v.name)), field("payload", list(v.payload, t => encType(t)))]);
+}
+
+function encParam(p: MParam): Json {
+  return obj([field("name", JStr(p.name)), field("ty", encType(p.ty))]);
+}
+
+function encArg(a: MArg): Json {
+  return obj([field("name", JStr(a.name)), field("value", encConst(a.value))]);
+}
+
+function encAnnotation(a: MAnnotation): Json {
+  return obj([
+    field("source", JStr(a.source)),
+    field("name", JStr(a.name)),
+    field("args", list(a.args, x => encArg(x))),
+  ]);
+}
+
+function contractKindName(k: MContractKind): string {
+  return match (k) {
+    MRequires => "requires",
+    MEnsures => "ensures",
+    MInvariant => "invariant",
+    MDecreases => "decreases",
+    MRule => "rule",
+  };
+}
+
+function encContract(c: MContract): Json {
+  return obj([field("kind", JStr(contractKindName(c.kind))), field("text", JStr(c.text))]);
+}
+
+function declKindName(k: MDeclKind): string {
+  return match (k) {
+    MKRecord => "record",
+    MKUnion => "union",
+    MKAlias => "alias",
+    MKClass => "class",
+    MKInterface => "interface",
+    MKFunction => "function",
+    MKConst => "const",
+  };
+}
+
+function encFieldView(f: MFieldView): Json {
+  return obj([
+    field("ref", encRef(f.ref)),
+    field("name", JStr(f.name)),
+    field("ty", encType(f.ty)),
+    field("exported", JBool(f.exported)),
+    field("annotations", list(f.annotations, a => encAnnotation(a))),
+  ]);
+}
+
+function encMethodView(m: MMethodView): Json {
+  return obj([
+    field("ref", encRef(m.ref)),
+    field("name", JStr(m.name)),
+    field("exported", JBool(m.exported)),
+    field("typeParams", strs(m.typeParams)),
+    field("params", list(m.params, p => encParam(p))),
+    field("returns", encType(m.returns)),
+    field("doc", JStr(m.doc)),
+    field("annotations", list(m.annotations, a => encAnnotation(a))),
+    field("contracts", list(m.contracts, c => encContract(c))),
+  ]);
+}
+
+function encDeclView(d: MDeclView): Json {
+  return obj([
+    field("ref", encRef(d.ref)),
+    field("kind", JStr(declKindName(d.kind))),
+    field("name", JStr(d.name)),
+    field("exported", JBool(d.exported)),
+    field("typeParams", strs(d.typeParams)),
+    field("doc", JStr(d.doc)),
+    field("annotations", list(d.annotations, a => encAnnotation(a))),
+    field("contracts", list(d.contracts, c => encContract(c))),
+    field("fields", list(d.fields, f => encFieldView(f))),
+    field("ctorParams", list(d.ctorParams, p => encParam(p))),
+    field("methods", list(d.methods, m => encMethodView(m))),
+    field("variants", list(d.variants, v => encVariant(v))),
+    field("params", list(d.params, p => encParam(p))),
+    field("ty", opt(d.ty, t => encType(t))),
+  ]);
+}
+
+function encShape(s: MShape): Json {
+  return match (s) {
+    MSRecord(fs) => tagged("record", [field("fields", list(fs, f => encFieldView(f)))]),
+    MSUnion(vs) => tagged("union", [field("variants", list(vs, v => encVariant(v)))]),
+    MSAlias(t) => tagged("alias", [field("ty", encType(t))]),
+    MSOpaque => tagged("opaque", []),
+  };
+}
+
+function encTypeShape(t: MTypeShape): Json {
+  return obj([
+    field("name", JStr(t.name)),
+    field("source", JStr(t.source)),
+    field("typeParams", strs(t.typeParams)),
+    field("shape", encShape(t.shape)),
+  ]);
+}
+
+// inputToJson(i: Input): Json -- the document of `encodeInput` as a `Json` value. O(size).
+export function inputToJson(i: Input): Json {
+  return obj([
+    field("format", JStr(INPUT_FORMAT)),
+    field("version", JNum(FORMAT_VERSION)),
+    field("modulePath", JStr(i.modulePath)),
+    field("annotation", JStr(i.annotation)),
+    field("freshBase", JNum(i.freshBase)),
+    field("decls", list(i.decls, d => encDeclView(d))),
+    field("types", list(i.types, t => encTypeShape(t))),
+  ]);
+}
+
+// encodeInput(i: Input): string -- compact, deterministic JSON text. O(size).
+export function encodeInput(i: Input): string {
+  return stringify(inputToJson(i));
+}
+
+// ---- encoding: output side ------------------------------------------------------------------------------------------
+
+function unOpName(op: MUnOp): string {
+  return match (op) {
+    OpNeg => "neg",
+    OpNot => "not",
+    OpBitNot => "bitnot",
+  };
+}
+
+function binOpName(op: MBinOp): string {
+  return match (op) {
+    OpAdd => "+",
+    OpSub => "-",
+    OpMul => "*",
+    OpDiv => "/",
+    OpRem => "%",
+    OpEq => "==",
+    OpNe => "!=",
+    OpLt => "<",
+    OpLe => "<=",
+    OpGt => ">",
+    OpGe => ">=",
+    OpAnd => "&&",
+    OpOr => "||",
+    OpBitAnd => "&",
+    OpBitOr => "|",
+    OpBitXor => "^",
+    OpShl => "<<",
+    OpShr => ">>",
+  };
+}
+
+function encPattern(p: MPattern): Json {
+  return match (p) {
+    MPWild => tagged("wild", []),
+    MPBind(n) => tagged("bind", [field("name", JStr(n))]),
+    MPVariant(n, subs) => tagged(
+      "variant",
+      [field("name", JStr(n)), field("subs", list(subs, s => encPattern(s)))],
+    ),
+    MPLit(c) => tagged("lit", [field("value", encConst(c))]),
+  };
+}
+
+function encExpr(e: MExpr): Json {
+  return match (e) {
+    MEInt(n) => tagged("int", [field("v", JNum(n))]),
+    MEFloat(s) => tagged("float", [field("v", JStr(s))]),
+    MEString(s) => tagged("string", [field("v", JStr(s))]),
+    MEBool(b) => tagged("bool", [field("v", JBool(b))]),
+    MEName(n) => tagged("name", [field("name", JStr(n))]),
+    MECall(f, targs, args) => tagged(
+      "call",
+      [
+        field("callee", encExpr(f)),
+        field("typeArgs", list(targs, t => encType(t))),
+        field("args", list(args, a => encExpr(a))),
+      ],
+    ),
+    MEMethod(r, n, args) => tagged(
+      "method",
+      [
+        field("recv", encExpr(r)),
+        field("name", JStr(n)),
+        field("args", list(args, a => encExpr(a))),
+      ],
+    ),
+    MEField(r, n) => tagged("field", [field("recv", encExpr(r)), field("name", JStr(n))]),
+    MEIndex(r, i) => tagged("index", [field("recv", encExpr(r)), field("index", encExpr(i))]),
+    MERecord(n, inits) => tagged(
+      "record",
+      [field("type", JStr(n)), field("fields", list(inits, i => encInit(i)))],
+    ),
+    MEArray(xs) => tagged("array", [field("items", list(xs, x => encExpr(x)))]),
+    MEUnary(op, x) => tagged(
+      "unary",
+      [field("op", JStr(unOpName(op))), field("operand", encExpr(x))],
+    ),
+    MEBinary(op, a, b) => tagged(
+      "binary",
+      [field("op", JStr(binOpName(op))), field("left", encExpr(a)), field("right", encExpr(b))],
+    ),
+    MEMatch(s, arms) => tagged(
+      "match",
+      [field("scrutinee", encExpr(s)), field("arms", list(arms, a => encArm(a)))],
+    ),
+    METry(x) => tagged("try", [field("operand", encExpr(x))]),
+    MECond(c, a, b) => tagged(
+      "cond",
+      [field("cond", encExpr(c)), field("then", encExpr(a)), field("else", encExpr(b))],
+    ),
+  };
+}
+
+function encInit(i: MFieldInit): Json {
+  return obj([field("name", JStr(i.name)), field("value", encExpr(i.value))]);
+}
+
+function encArm(a: MArm): Json {
+  return obj([
+    field("pattern", encPattern(a.pattern)),
+    field("stmts", list(a.stmts, s => encStmt(s))),
+    field("value", opt(a.value, v => encExpr(v))),
+  ]);
+}
+
+function encStmt(s: MStmt): Json {
+  return match (s) {
+    MSConst(n, t, v) => tagged(
+      "const",
+      [field("name", JStr(n)), field("ty", opt(t, x => encType(x))), field("value", encExpr(v))],
+    ),
+    MSLet(n, t, v) => tagged(
+      "let",
+      [field("name", JStr(n)), field("ty", opt(t, x => encType(x))), field("value", encExpr(v))],
+    ),
+    MSAssign(t, v) => tagged("assign", [field("target", encExpr(t)), field("value", encExpr(v))]),
+    MSReturn(v) => tagged("return", [field("value", opt(v, x => encExpr(x)))]),
+    MSExpr(x) => tagged("expr", [field("expr", encExpr(x))]),
+    MSIf(c, a, b) => tagged(
+      "if",
+      [
+        field("cond", encExpr(c)),
+        field("then", list(a, x => encStmt(x))),
+        field("else", list(b, x => encStmt(x))),
+      ],
+    ),
+    MSWhile(c, b) => tagged(
+      "while",
+      [field("cond", encExpr(c)), field("body", list(b, x => encStmt(x)))],
+    ),
+    MSForOf(n, it, b) => tagged(
+      "forof",
+      [field("var", JStr(n)), field("iter", encExpr(it)), field("body", list(b, x => encStmt(x)))],
+    ),
+    MSMatch(x, arms) => tagged(
+      "match",
+      [field("scrutinee", encExpr(x)), field("arms", list(arms, a => encArm(a)))],
+    ),
+  };
+}
+
+function encFnDecl(f: MFnDecl): Json {
+  return obj([
+    field("name", JStr(f.name)),
+    field("exported", JBool(f.exported)),
+    field("typeParams", strs(f.typeParams)),
+    field("params", list(f.params, p => encParam(p))),
+    field("returns", encType(f.returns)),
+    field("body", list(f.body, s => encStmt(s))),
+    field("doc", JStr(f.doc)),
+  ]);
+}
+
+function encClassField(f: MClassField): Json {
+  return obj([
+    field("name", JStr(f.name)),
+    field("ty", encType(f.ty)),
+    field("exported", JBool(f.exported)),
+  ]);
+}
+
+function encCtor(c: MCtorDecl): Json {
+  return obj([
+    field("params", list(c.params, p => encParam(p))),
+    field("body", list(c.body, s => encStmt(s))),
+  ]);
+}
+
+function encConstDecl(c: MConstDecl): Json {
+  return obj([
+    field("name", JStr(c.name)),
+    field("exported", JBool(c.exported)),
+    field("ty", encType(c.ty)),
+    field("value", encExpr(c.value)),
+    field("doc", JStr(c.doc)),
+  ]);
+}
+
+function encRecordDecl(r: MRecordDecl): Json {
+  return obj([
+    field("name", JStr(r.name)),
+    field("exported", JBool(r.exported)),
+    field("typeParams", strs(r.typeParams)),
+    field("fields", list(r.fields, p => encParam(p))),
+    field("doc", JStr(r.doc)),
+  ]);
+}
+
+function encUnionDecl(u: MUnionDecl): Json {
+  return obj([
+    field("name", JStr(u.name)),
+    field("exported", JBool(u.exported)),
+    field("typeParams", strs(u.typeParams)),
+    field("variants", list(u.variants, v => encVariant(v))),
+    field("doc", JStr(u.doc)),
+  ]);
+}
+
+function encClassDecl(c: MClassDecl): Json {
+  return obj([
+    field("name", JStr(c.name)),
+    field("exported", JBool(c.exported)),
+    field("typeParams", strs(c.typeParams)),
+    field("fields", list(c.fields, f => encClassField(f))),
+    field("ctor", opt(c.ctor, k => encCtor(k))),
+    field("methods", list(c.methods, m => encFnDecl(m))),
+    field("doc", JStr(c.doc)),
+  ]);
+}
+
+function encDecl(d: MDecl): Json {
+  return match (d) {
+    MDFn(f) => tagged("fn", [field("decl", encFnDecl(f))]),
+    MDConst(c) => tagged("const", [field("decl", encConstDecl(c))]),
+    MDRecord(r) => tagged("record", [field("decl", encRecordDecl(r))]),
+    MDUnion(u) => tagged("union", [field("decl", encUnionDecl(u))]),
+    MDClass(c) => tagged("class", [field("decl", encClassDecl(c))]),
+  };
+}
+
+function encImport(i: MImport): Json {
+  return obj([field("names", strs(i.names)), field("source", JStr(i.source))]);
+}
+
+function encDiagnostic(d: MDiagnostic): Json {
+  const sev = match (d.severity) {
+    MError => "error",
+    MWarning => "warning",
+  };
+  return obj([
+    field("severity", JStr(sev)),
+    field("message", JStr(d.message)),
+    field("at", encRef(d.at)),
+  ]);
+}
+
+// outputToJson(o: Output): Json / encodeOutput(o: Output): string -- like the input side. O(size).
+export function outputToJson(o: Output): Json {
+  return obj([
+    field("format", JStr(OUTPUT_FORMAT)),
+    field("version", JNum(FORMAT_VERSION)),
+    field("imports", list(o.imports, i => encImport(i))),
+    field("decls", list(o.decls, d => encDecl(d))),
+    field("diagnostics", list(o.diagnostics, d => encDiagnostic(d))),
+  ]);
+}
+
+export function encodeOutput(o: Output): string {
+  return stringify(outputToJson(o));
+}
+
+// ---- decoding helpers -----------------------------------------------------------------------------------------------
+
+function at(path: string, msg: string): string {
+  return path == "" ? msg : path + ": " + msg;
+}
+
+function member(j: Json, k: string, path: string): Result<Json, string> {
+  return match (j) {
+    JObj(_) => match (get(j, k)) {
+      Some(v) => Ok(v),
+      None => Err(at(path, "missing key `" + k + "`")),
+    },
+    _ => Err(at(path, "expected an object")),
+  };
+}
+
+function dStr(j: Json, k: string, path: string): Result<string, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JStr(s) => Ok(s),
+    _ => Err(at(path + "." + k, "expected a string")),
+  };
+}
+
+function dInt(j: Json, k: string, path: string): Result<int, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JNum(n) => Ok(n),
+    _ => Err(at(path + "." + k, "expected an integer")),
+  };
+}
+
+function dBool(j: Json, k: string, path: string): Result<bool, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JBool(b) => Ok(b),
+    _ => Err(at(path + "." + k, "expected a boolean")),
+  };
+}
+
+// The members of the array at key `k`, each decoded by `f` with the path `path.k[i]`.
+function dList<T>(
+  j: Json,
+  k: string,
+  path: string,
+  f: (x: Json, p: string) => Result<T, string>,
+): Result<T[], string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JArr(items) => decodeItems(items, path + "." + k, f),
+    _ => Err(at(path + "." + k, "expected an array")),
+  };
+}
+
+function decodeItems<T>(
+  items: Json[],
+  path: string,
+  f: (x: Json, p: string) => Result<T, string>,
+): Result<T[], string> {
+  let out: T[] = [];
+  let i: usize = 0;
+  while (i < items.length) {
+    const v = f(items[i], path + "[" + i.toString() + "]")?;
+    out.push(v);
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function decString(x: Json, p: string): Result<string, string> {
+  return match (x) {
+    JStr(s) => Ok(s),
+    _ => Err(at(p, "expected a string")),
+  };
+}
+
+function dStrs(j: Json, k: string, path: string): Result<string[], string> {
+  return dList(j, k, path, (x, p) => decString(x, p));
+}
+
+// An optional member: absent or null is None.
+function dOpt<T>(
+  j: Json,
+  k: string,
+  path: string,
+  f: (x: Json, p: string) => Result<T, string>,
+): Result<Option<T>, string> {
+  const v = member(j, k, path)?;
+  return match (v) {
+    JNull => Ok(None),
+    _ => {
+      const x = f(v, path + "." + k)?;
+      return Ok(Some(x));
+    },
+  };
+}
+
+function dKind(j: Json, path: string): Result<string, string> {
+  return dStr(j, "k", path);
+}
+
+function badKind(what: string, kind: string, path: string): string {
+  return at(path, "unknown " + what + " kind \"" + kind + "\"");
+}
+
+// ---- decoding: input side -------------------------------------------------------------------------------------------
+
+function decRef(j: Json, k: string, path: string): Result<MRef, string> {
+  const n = dInt(j, k, path)?;
+  return Ok(MRef { id: n });
+}
+
+function decConst(j: Json, path: string): Result<MConst, string> {
+  const k = dKind(j, path)?;
+  if (k == "bool") {
+    return Ok(MCBool(dBool(j, "v", path)?));
+  }
+  if (k == "int") {
+    return Ok(MCInt(dInt(j, "v", path)?));
+  }
+  if (k == "float") {
+    return Ok(MCFloat(dStr(j, "v", path)?));
+  }
+  if (k == "string") {
+    return Ok(MCString(dStr(j, "v", path)?));
+  }
+  if (k == "tag") {
+    return Ok(MCTag(dStr(j, "v", path)?));
+  }
+  if (k == "array") {
+    return Ok(MCArray(dList(j, "v", path, (x, p) => decConst(x, p))?));
+  }
+  if (k == "none") {
+    return Ok(MCNone);
+  }
+  if (k == "some") {
+    const v = member(j, "v", path)?;
+    return Ok(MCSome(decConst(v, path + ".v")?));
+  }
+  return Err(badKind("constant", k, path));
+}
+
+function dType(j: Json, k: string, path: string): Result<MType, string> {
+  return decType(member(j, k, path)?, path + "." + k);
+}
+
+function decType(j: Json, path: string): Result<MType, string> {
+  const k = dKind(j, path)?;
+  if (k == "named") {
+    const n = dStr(j, "name", path)?;
+    return Ok(MNamed(n, dList(j, "args", path, (x, p) => decType(x, p))?));
+  }
+  if (k == "array") {
+    return Ok(MArray(dType(j, "elem", path)?));
+  }
+  if (k == "option") {
+    return Ok(MOption(dType(j, "elem", path)?));
+  }
+  if (k == "result") {
+    const ok = dType(j, "ok", path)?;
+    return Ok(MResult(ok, dType(j, "err", path)?));
+  }
+  if (k == "fn") {
+    const ps = dList(j, "params", path, (x, p) => decType(x, p))?;
+    return Ok(MFn(ps, dType(j, "returns", path)?));
+  }
+  if (k == "union") {
+    return Ok(MUnion(dList(j, "variants", path, (x, p) => decVariant(x, p))?));
+  }
+  return Err(badKind("type", k, path));
+}
+
+function decVariant(j: Json, path: string): Result<MVariant, string> {
+  const n = dStr(j, "name", path)?;
+  const payload = dList(j, "payload", path, (x, p) => decType(x, p))?;
+  return Ok(MVariant { name: n, payload: payload });
+}
+
+function decParam(j: Json, path: string): Result<MParam, string> {
+  const n = dStr(j, "name", path)?;
+  return Ok(MParam { name: n, ty: dType(j, "ty", path)? });
+}
+
+function decArg(j: Json, path: string): Result<MArg, string> {
+  const n = dStr(j, "name", path)?;
+  const v = decConst(member(j, "value", path)?, path + ".value")?;
+  return Ok(MArg { name: n, value: v });
+}
+
+function decAnnotation(j: Json, path: string): Result<MAnnotation, string> {
+  const s = dStr(j, "source", path)?;
+  const n = dStr(j, "name", path)?;
+  const args = dList(j, "args", path, (x, p) => decArg(x, p))?;
+  return Ok(MAnnotation { source: s, name: n, args: args });
+}
+
+function decContract(j: Json, path: string): Result<MContract, string> {
+  const k = dStr(j, "kind", path)?;
+  const text = dStr(j, "text", path)?;
+  if (k == "requires") {
+    return Ok(MContract { kind: MRequires, text: text });
+  }
+  if (k == "ensures") {
+    return Ok(MContract { kind: MEnsures, text: text });
+  }
+  if (k == "invariant") {
+    return Ok(MContract { kind: MInvariant, text: text });
+  }
+  if (k == "decreases") {
+    return Ok(MContract { kind: MDecreases, text: text });
+  }
+  if (k == "rule") {
+    return Ok(MContract { kind: MRule, text: text });
+  }
+  return Err(at(path + ".kind", "unknown contract kind \"" + k + "\""));
+}
+
+function decDeclKind(k: string, path: string): Result<MDeclKind, string> {
+  if (k == "record") {
+    return Ok(MKRecord);
+  }
+  if (k == "union") {
+    return Ok(MKUnion);
+  }
+  if (k == "alias") {
+    return Ok(MKAlias);
+  }
+  if (k == "class") {
+    return Ok(MKClass);
+  }
+  if (k == "interface") {
+    return Ok(MKInterface);
+  }
+  if (k == "function") {
+    return Ok(MKFunction);
+  }
+  if (k == "const") {
+    return Ok(MKConst);
+  }
+  return Err(at(path + ".kind", "unknown declaration kind \"" + k + "\""));
+}
+
+function decFieldView(j: Json, path: string): Result<MFieldView, string> {
+  const r = decRef(j, "ref", path)?;
+  const n = dStr(j, "name", path)?;
+  const t = dType(j, "ty", path)?;
+  const e = dBool(j, "exported", path)?;
+  const anns = dList(j, "annotations", path, (x, p) => decAnnotation(x, p))?;
+  return Ok(MFieldView { ref: r, name: n, ty: t, exported: e, annotations: anns });
+}
+
+function decMethodView(j: Json, path: string): Result<MMethodView, string> {
+  const r = decRef(j, "ref", path)?;
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const ps = dList(j, "params", path, (x, p) => decParam(x, p))?;
+  const ret = dType(j, "returns", path)?;
+  const doc = dStr(j, "doc", path)?;
+  const anns = dList(j, "annotations", path, (x, p) => decAnnotation(x, p))?;
+  const cs = dList(j, "contracts", path, (x, p) => decContract(x, p))?;
+  return Ok(MMethodView {
+    ref: r,
+    name: n,
+    exported: e,
+    typeParams: tps,
+    params: ps,
+    returns: ret,
+    doc: doc,
+    annotations: anns,
+    contracts: cs,
+  });
+}
+
+function decDeclView(j: Json, path: string): Result<MDeclView, string> {
+  const r = decRef(j, "ref", path)?;
+  const kind = decDeclKind(dStr(j, "kind", path)?, path)?;
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const doc = dStr(j, "doc", path)?;
+  const anns = dList(j, "annotations", path, (x, p) => decAnnotation(x, p))?;
+  const cs = dList(j, "contracts", path, (x, p) => decContract(x, p))?;
+  const fs = dList(j, "fields", path, (x, p) => decFieldView(x, p))?;
+  const cps = dList(j, "ctorParams", path, (x, p) => decParam(x, p))?;
+  const ms = dList(j, "methods", path, (x, p) => decMethodView(x, p))?;
+  const vs = dList(j, "variants", path, (x, p) => decVariant(x, p))?;
+  const ps = dList(j, "params", path, (x, p) => decParam(x, p))?;
+  const t = dOpt(j, "ty", path, (x, p) => decType(x, p))?;
+  return Ok(MDeclView {
+    ref: r,
+    kind: kind,
+    name: n,
+    exported: e,
+    typeParams: tps,
+    doc: doc,
+    annotations: anns,
+    contracts: cs,
+    fields: fs,
+    ctorParams: cps,
+    methods: ms,
+    variants: vs,
+    params: ps,
+    ty: t,
+  });
+}
+
+function decShape(j: Json, path: string): Result<MShape, string> {
+  const k = dKind(j, path)?;
+  if (k == "record") {
+    return Ok(MSRecord(dList(j, "fields", path, (x, p) => decFieldView(x, p))?));
+  }
+  if (k == "union") {
+    return Ok(MSUnion(dList(j, "variants", path, (x, p) => decVariant(x, p))?));
+  }
+  if (k == "alias") {
+    return Ok(MSAlias(dType(j, "ty", path)?));
+  }
+  if (k == "opaque") {
+    return Ok(MSOpaque);
+  }
+  return Err(badKind("shape", k, path));
+}
+
+function decTypeShape(j: Json, path: string): Result<MTypeShape, string> {
+  const n = dStr(j, "name", path)?;
+  const s = dStr(j, "source", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const shape = decShape(member(j, "shape", path)?, path + ".shape")?;
+  return Ok(MTypeShape { name: n, source: s, typeParams: tps, shape: shape });
+}
+
+function checkEnvelope(j: Json, format: string): Result<bool, string> {
+  const f = dStr(j, "format", "")?;
+  if (f != format) {
+    return Err("format: expected \"" + format + "\", got \"" + f + "\"");
+  }
+  const v = dInt(j, "version", "")?;
+  if (v != FORMAT_VERSION) {
+    return Err(
+      "version: unsupported " + v.toString() + " (this std:meta reads " + FORMAT_VERSION.toString()
+          + ")",
+    );
+  }
+  return Ok(true);
+}
+
+// inputFromJson(j: Json): Result<Input, string> -- strict decoding of `inputToJson`; the message names the path of the
+// first problem. O(size).
+export function inputFromJson(j: Json): Result<Input, string> {
+  checkEnvelope(j, INPUT_FORMAT)?;
+  const mp = dStr(j, "modulePath", "")?;
+  const an = dStr(j, "annotation", "")?;
+  const fb = dInt(j, "freshBase", "")?;
+  const ds = dList(j, "decls", "", (x, p) => decDeclView(x, p))?;
+  const ts = dList(j, "types", "", (x, p) => decTypeShape(x, p))?;
+  return Ok(Input { modulePath: mp, annotation: an, freshBase: fb, decls: ds, types: ts });
+}
+
+// decodeInput(text: string): Result<Input, string> -- parses the text with std:json (syntax errors are reported as
+// "invalid JSON: line L, column C: ...") and decodes it. Total: malformed input is an `Err`, never a trap. O(size).
+export function decodeInput(text: string): Result<Input, string> {
+  const r = parse(text);
+  if (r.isErr()) {
+    return Err("invalid JSON: " + formatError(r.unwrapErr()));
+  }
+  return inputFromJson(r.unwrap());
+}
+
+// ---- decoding: output side ------------------------------------------------------------------------------------------
+
+function decUnOp(s: string, path: string): Result<MUnOp, string> {
+  if (s == "neg") {
+    return Ok(OpNeg);
+  }
+  if (s == "not") {
+    return Ok(OpNot);
+  }
+  if (s == "bitnot") {
+    return Ok(OpBitNot);
+  }
+  return Err(at(path, "unknown unary operator \"" + s + "\""));
+}
+
+function decBinOp(s: string, path: string): Result<MBinOp, string> {
+  if (s == "+") {
+    return Ok(OpAdd);
+  }
+  if (s == "-") {
+    return Ok(OpSub);
+  }
+  if (s == "*") {
+    return Ok(OpMul);
+  }
+  if (s == "/") {
+    return Ok(OpDiv);
+  }
+  if (s == "%") {
+    return Ok(OpRem);
+  }
+  if (s == "==") {
+    return Ok(OpEq);
+  }
+  if (s == "!=") {
+    return Ok(OpNe);
+  }
+  if (s == "<") {
+    return Ok(OpLt);
+  }
+  if (s == "<=") {
+    return Ok(OpLe);
+  }
+  if (s == ">") {
+    return Ok(OpGt);
+  }
+  if (s == ">=") {
+    return Ok(OpGe);
+  }
+  if (s == "&&") {
+    return Ok(OpAnd);
+  }
+  if (s == "||") {
+    return Ok(OpOr);
+  }
+  if (s == "&") {
+    return Ok(OpBitAnd);
+  }
+  if (s == "|") {
+    return Ok(OpBitOr);
+  }
+  if (s == "^") {
+    return Ok(OpBitXor);
+  }
+  if (s == "<<") {
+    return Ok(OpShl);
+  }
+  if (s == ">>") {
+    return Ok(OpShr);
+  }
+  return Err(at(path, "unknown binary operator \"" + s + "\""));
+}
+
+function decPattern(j: Json, path: string): Result<MPattern, string> {
+  const k = dKind(j, path)?;
+  if (k == "wild") {
+    return Ok(MPWild);
+  }
+  if (k == "bind") {
+    return Ok(MPBind(dStr(j, "name", path)?));
+  }
+  if (k == "variant") {
+    const n = dStr(j, "name", path)?;
+    const subs = dList(j, "subs", path, (x, p) => decPattern(x, p))?;
+    return Ok(MPVariant(n, subs));
+  }
+  if (k == "lit") {
+    return Ok(MPLit(decConst(member(j, "value", path)?, path + ".value")?));
+  }
+  return Err(badKind("pattern", k, path));
+}
+
+function dExpr(j: Json, k: string, path: string): Result<MExpr, string> {
+  return decExpr(member(j, k, path)?, path + "." + k);
+}
+
+function decExpr(j: Json, path: string): Result<MExpr, string> {
+  const k = dKind(j, path)?;
+  if (k == "int") {
+    return Ok(MEInt(dInt(j, "v", path)?));
+  }
+  if (k == "float") {
+    return Ok(MEFloat(dStr(j, "v", path)?));
+  }
+  if (k == "string") {
+    return Ok(MEString(dStr(j, "v", path)?));
+  }
+  if (k == "bool") {
+    return Ok(MEBool(dBool(j, "v", path)?));
+  }
+  if (k == "name") {
+    return Ok(MEName(dStr(j, "name", path)?));
+  }
+  if (k == "call") {
+    const f = dExpr(j, "callee", path)?;
+    const targs = dList(j, "typeArgs", path, (x, p) => decType(x, p))?;
+    const args = dList(j, "args", path, (x, p) => decExpr(x, p))?;
+    return Ok(MECall(f, targs, args));
+  }
+  if (k == "method") {
+    const r = dExpr(j, "recv", path)?;
+    const n = dStr(j, "name", path)?;
+    const args = dList(j, "args", path, (x, p) => decExpr(x, p))?;
+    return Ok(MEMethod(r, n, args));
+  }
+  if (k == "field") {
+    const r = dExpr(j, "recv", path)?;
+    return Ok(MEField(r, dStr(j, "name", path)?));
+  }
+  if (k == "index") {
+    const r = dExpr(j, "recv", path)?;
+    return Ok(MEIndex(r, dExpr(j, "index", path)?));
+  }
+  if (k == "record") {
+    const n = dStr(j, "type", path)?;
+    return Ok(MERecord(n, dList(j, "fields", path, (x, p) => decInit(x, p))?));
+  }
+  if (k == "array") {
+    return Ok(MEArray(dList(j, "items", path, (x, p) => decExpr(x, p))?));
+  }
+  if (k == "unary") {
+    const op = decUnOp(dStr(j, "op", path)?, path + ".op")?;
+    return Ok(MEUnary(op, dExpr(j, "operand", path)?));
+  }
+  if (k == "binary") {
+    const op = decBinOp(dStr(j, "op", path)?, path + ".op")?;
+    const a = dExpr(j, "left", path)?;
+    return Ok(MEBinary(op, a, dExpr(j, "right", path)?));
+  }
+  if (k == "match") {
+    const s = dExpr(j, "scrutinee", path)?;
+    return Ok(MEMatch(s, dList(j, "arms", path, (x, p) => decArm(x, p))?));
+  }
+  if (k == "try") {
+    return Ok(METry(dExpr(j, "operand", path)?));
+  }
+  if (k == "cond") {
+    const c = dExpr(j, "cond", path)?;
+    const a = dExpr(j, "then", path)?;
+    return Ok(MECond(c, a, dExpr(j, "else", path)?));
+  }
+  return Err(badKind("expression", k, path));
+}
+
+function decInit(j: Json, path: string): Result<MFieldInit, string> {
+  const n = dStr(j, "name", path)?;
+  return Ok(MFieldInit { name: n, value: dExpr(j, "value", path)? });
+}
+
+function decArm(j: Json, path: string): Result<MArm, string> {
+  const p = decPattern(member(j, "pattern", path)?, path + ".pattern")?;
+  const ss = dList(j, "stmts", path, (x, q) => decStmt(x, q))?;
+  const v = dOpt(j, "value", path, (x, q) => decExpr(x, q))?;
+  return Ok(MArm { pattern: p, stmts: ss, value: v });
+}
+
+function dBlock(j: Json, k: string, path: string): Result<MStmt[], string> {
+  return dList(j, k, path, (x, p) => decStmt(x, p));
+}
+
+function decStmt(j: Json, path: string): Result<MStmt, string> {
+  const k = dKind(j, path)?;
+  if (k == "const" || k == "let") {
+    const n = dStr(j, "name", path)?;
+    const t = dOpt(j, "ty", path, (x, p) => decType(x, p))?;
+    const v = dExpr(j, "value", path)?;
+    if (k == "const") {
+      return Ok(MSConst(n, t, v));
+    }
+    return Ok(MSLet(n, t, v));
+  }
+  if (k == "assign") {
+    const t = dExpr(j, "target", path)?;
+    return Ok(MSAssign(t, dExpr(j, "value", path)?));
+  }
+  if (k == "return") {
+    return Ok(MSReturn(dOpt(j, "value", path, (x, p) => decExpr(x, p))?));
+  }
+  if (k == "expr") {
+    return Ok(MSExpr(dExpr(j, "expr", path)?));
+  }
+  if (k == "if") {
+    const c = dExpr(j, "cond", path)?;
+    const a = dBlock(j, "then", path)?;
+    return Ok(MSIf(c, a, dBlock(j, "else", path)?));
+  }
+  if (k == "while") {
+    const c = dExpr(j, "cond", path)?;
+    return Ok(MSWhile(c, dBlock(j, "body", path)?));
+  }
+  if (k == "forof") {
+    const n = dStr(j, "var", path)?;
+    const it = dExpr(j, "iter", path)?;
+    return Ok(MSForOf(n, it, dBlock(j, "body", path)?));
+  }
+  if (k == "match") {
+    const s = dExpr(j, "scrutinee", path)?;
+    return Ok(MSMatch(s, dList(j, "arms", path, (x, p) => decArm(x, p))?));
+  }
+  return Err(badKind("statement", k, path));
+}
+
+function decFnDecl(j: Json, path: string): Result<MFnDecl, string> {
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const ps = dList(j, "params", path, (x, p) => decParam(x, p))?;
+  const r = dType(j, "returns", path)?;
+  const body = dBlock(j, "body", path)?;
+  const doc = dStr(j, "doc", path)?;
+  return Ok(MFnDecl {
+    name: n,
+    exported: e,
+    typeParams: tps,
+    params: ps,
+    returns: r,
+    body: body,
+    doc: doc,
+  });
+}
+
+function decClassField(j: Json, path: string): Result<MClassField, string> {
+  const n = dStr(j, "name", path)?;
+  const t = dType(j, "ty", path)?;
+  return Ok(MClassField { name: n, ty: t, exported: dBool(j, "exported", path)? });
+}
+
+function decCtor(j: Json, path: string): Result<MCtorDecl, string> {
+  const ps = dList(j, "params", path, (x, p) => decParam(x, p))?;
+  return Ok(MCtorDecl { params: ps, body: dBlock(j, "body", path)? });
+}
+
+function decConstDecl(j: Json, path: string): Result<MConstDecl, string> {
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const t = dType(j, "ty", path)?;
+  const v = dExpr(j, "value", path)?;
+  const doc = dStr(j, "doc", path)?;
+  return Ok(MConstDecl { name: n, exported: e, ty: t, value: v, doc: doc });
+}
+
+function decRecordDecl(j: Json, path: string): Result<MRecordDecl, string> {
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const fs = dList(j, "fields", path, (x, q) => decParam(x, q))?;
+  const doc = dStr(j, "doc", path)?;
+  return Ok(MRecordDecl { name: n, exported: e, typeParams: tps, fields: fs, doc: doc });
+}
+
+function decUnionDecl(j: Json, path: string): Result<MUnionDecl, string> {
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const vs = dList(j, "variants", path, (x, q) => decVariant(x, q))?;
+  const doc = dStr(j, "doc", path)?;
+  return Ok(MUnionDecl { name: n, exported: e, typeParams: tps, variants: vs, doc: doc });
+}
+
+function decClassDecl(j: Json, path: string): Result<MClassDecl, string> {
+  const n = dStr(j, "name", path)?;
+  const e = dBool(j, "exported", path)?;
+  const tps = dStrs(j, "typeParams", path)?;
+  const fs = dList(j, "fields", path, (x, q) => decClassField(x, q))?;
+  const c = dOpt(j, "ctor", path, (x, q) => decCtor(x, q))?;
+  const ms = dList(j, "methods", path, (x, q) => decFnDecl(x, q))?;
+  const doc = dStr(j, "doc", path)?;
+  return Ok(MClassDecl {
+    name: n,
+    exported: e,
+    typeParams: tps,
+    fields: fs,
+    ctor: c,
+    methods: ms,
+    doc: doc,
+  });
+}
+
+function decDecl(j: Json, path: string): Result<MDecl, string> {
+  const k = dKind(j, path)?;
+  const body = member(j, "decl", path)?;
+  const p = path + ".decl";
+  if (k == "fn") {
+    return Ok(MDFn(decFnDecl(body, p)?));
+  }
+  if (k == "const") {
+    return Ok(MDConst(decConstDecl(body, p)?));
+  }
+  if (k == "record") {
+    return Ok(MDRecord(decRecordDecl(body, p)?));
+  }
+  if (k == "union") {
+    return Ok(MDUnion(decUnionDecl(body, p)?));
+  }
+  if (k == "class") {
+    return Ok(MDClass(decClassDecl(body, p)?));
+  }
+  return Err(badKind("declaration", k, path));
+}
+
+function decImport(j: Json, path: string): Result<MImport, string> {
+  const names = dStrs(j, "names", path)?;
+  return Ok(MImport { names: names, source: dStr(j, "source", path)? });
+}
+
+function decDiagnostic(j: Json, path: string): Result<MDiagnostic, string> {
+  const s = dStr(j, "severity", path)?;
+  const m = dStr(j, "message", path)?;
+  const r = decRef(j, "at", path)?;
+  if (s == "error") {
+    return Ok(MDiagnostic { severity: MError, message: m, at: r });
+  }
+  if (s == "warning") {
+    return Ok(MDiagnostic { severity: MWarning, message: m, at: r });
+  }
+  return Err(at(path + ".severity", "unknown severity \"" + s + "\""));
+}
+
+// outputFromJson / decodeOutput: like the input side. decodeOutput is what the compiler runs on the harness's stdout, so
+// a processor that wrote garbage is an `Err` with a path, not a crash. O(size).
+export function outputFromJson(j: Json): Result<Output, string> {
+  checkEnvelope(j, OUTPUT_FORMAT)?;
+  const imports = dList(j, "imports", "", (x, p) => decImport(x, p))?;
+  const decls = dList(j, "decls", "", (x, p) => decDecl(x, p))?;
+  const diags = dList(j, "diagnostics", "", (x, p) => decDiagnostic(x, p))?;
+  return Ok(Output { imports: imports, decls: decls, diagnostics: diags });
+}
+
+export function decodeOutput(text: string): Result<Output, string> {
+  const r = parse(text);
+  if (r.isErr()) {
+    return Err("invalid JSON: " + formatError(r.unwrapErr()));
+  }
+  return outputFromJson(r.unwrap());
+}
