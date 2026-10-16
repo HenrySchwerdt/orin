@@ -49,6 +49,23 @@ Mutation classes (id: injected bug -> required reaction)
   bce-across-block    split the block between the checked access and the unchecked one       -> ERROR without a dominating check
   bce-makeunique-ok   `makeunique a` there (positive control)                                -> ACCEPTED (rejection is a finding)
   bce-other-index-ok  read another index of a there (positive control)                       -> ACCEPTED (rejection is a finding)
+  The bce-* classes are applied to the unchecked accesses that only the dominating-access fact justifies, and bce-no-fact to every
+  checked access left after the optimiser (so none of them is justified by an interval); `verify_text --facts` tells the kinds apart.
+  range facts (rule U1, interval fact, docs/mir.md v2.6; applied to every unchecked access that ONLY the interval analysis justifies):
+  range-widen-off-by-one    the loop bound one too large (`lt i, N` -> `le i, N`, `le i, N-1` -> `le i, N`) -> ERROR without a dominating check
+  range-after-push          `arraypush a` before the access                                  -> ERROR
+  range-after-pop           `arraypop a` before the access                                   -> ERROR
+  range-across-dup          `t = dup a` before the access                                    -> ERROR (the array is mentioned by a dup)
+  range-after-redef-array   redefine the array local there (`t = dup a; a = move t`)         -> ERROR
+  range-after-inout-call    `a` is the receiver of an in/out call before the access           -> ERROR
+  range-param-array         the array is not built here (`a = call ..` instead of arraynew) -> ERROR (no shape fact, like a parameter)
+  range-after-redef-index   the index local gets an unknown value there                      -> ERROR
+  range-index-add-large     `i = add i, 1000000u` before the access                          -> ERROR (the add transfer is not ignored)
+  range-no-branch-refinement the compares of the index counter are replaced by `copy true`    -> ERROR (the guard is what bounds the index)
+  range-move-roundtrip-ok   `t = move a; a = move t` (positive control: a move carries the fact)  -> ACCEPTED
+  range-borrowed-call-ok    a call that gets the array in a borrowed position (positive control)    -> ACCEPTED
+  range-copy-index-ok       the index read through a copy (positive control)                        -> ACCEPTED
+  range-addsub-ok           the index read through `(i + 1) - 1` (positive control)                 -> ACCEPTED
 
 A mutant that is accepted without a new warning is a SURVIVOR, a finding, unless it is one of the
 explicitly classified BENIGN cases below (each has a precise, local reason). A mutant that is
@@ -70,6 +87,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Fact kind of every unchecked access of a baseline function: {(function key, block, instruction): kind}, filled by the
+# `verify_text --facts` pass before the mutants are generated (kind: dominated-by-check, interval, both or none).
+FACTS = {}
+
 # Known surviving mutants that are real verifier findings: {(class, function name): explanation}.
 KNOWN = {}
 
@@ -86,9 +107,13 @@ class Func:
         self.nparams = int(m.group(2))
         self.owned = set(int(x[1:]) for x in (m.group(3) or "").split())
         self.inout = bool(m.group(4))     # v1.10: parameter 0 is handed back to the caller at every return
+        self.extra = []                   # stub functions a mutant adds after the program's own (their index is len(funcs) + k)
+        self._key = None
 
     def key(self):
-        return self.name + "\n" + self.render(normalise=True)
+        if self._key is None:
+            self._key = self.name + "\n" + self.render(normalise=True)
+        return self._key
 
     def render(self, normalise=False):
         h = self.header
@@ -107,7 +132,9 @@ class Func:
             self.header, " ".join("%s:%s" % lt for lt in self.locals))
 
     def clone(self):
-        return Func(self.header, list(self.locals), [[b[0], list(b[1]), b[2]] for b in self.blocks])
+        c = Func(self.header, list(self.locals), [[b[0], list(b[1]), b[2]] for b in self.blocks])
+        c.extra = list(self.extra)
+        return c
 
     def new_local(self, ty="ref"):
         self.locals.append(("l%d" % len(self.locals), ty))
@@ -445,7 +472,11 @@ def sites(f):
             if w == "forward":
                 out += forward_sites(f, bi, ii, line)
             if w in ("arraygetu", "arraysetu"):
-                out += unchecked_sites(f, bi, ii, line)
+                kind = FACTS.get((f.key(), bi, ii), "dominated-by-check")
+                if kind == "dominated-by-check":
+                    out += unchecked_sites(f, bi, ii, line)
+                elif kind == "interval":
+                    out += range_sites(f, bi, ii, line)
             if w in ("arrayget", "arrayset"):
                 out += nofact_sites(f, bi, ii, line)
     if f.inout:
@@ -673,6 +704,282 @@ def apply_bounds(m, f):
     return f
 
 
+# ---------------------------------------------------------------- range facts (rule U1, interval fact)
+
+ARRAYNEW_RE = re.compile(r"l\d+ = arraynew \w+ \[(.*)\]$")
+CMP_RE = re.compile(r"l(\d+) = (lt|le|gt|ge|eq|ne) (\S+), (\S+)$")
+BRANCH_RE = re.compile(r"branch l(\d+) \? b\d+ : b\d+$")
+
+
+def arr_len(f, a, depth=0):
+    """The element count of array local a when every definition of it in f is an `arraynew` of the same count (looking
+    through moves), else None (a parameter, a call result, a field ...)."""
+    if depth > 4 or a < f.nparams:
+        return None
+    lens = set()
+    for _, ins, _t in f.blocks:
+        for line in ins:
+            if dest(line) != a:
+                continue
+            m = ARRAYNEW_RE.match(line)
+            if m:
+                body = m.group(1).strip()
+                lens.add(0 if not body else body.count(",") + 1)
+                continue
+            m = re.match(r"l\d+ = move l(\d+)$", line)
+            if m:
+                n = arr_len(f, int(m.group(1)), depth + 1)
+                if n is None:
+                    return None
+                lens.add(n)
+                continue
+            return None
+    return lens.pop() if len(lens) == 1 else None
+
+
+def bound_is_len(f, x, n, a):
+    """The operand text x is the length n of array a: the constant `n`u, or a local all of whose definitions are `copy nu` or
+    `arr.length(a')` of an array of that length."""
+    if re.fullmatch(r"\d+u", x):
+        return int(x[:-1]) == n
+    if not re.fullmatch(r"l\d+", x):
+        return False
+    xl = int(x[1:])
+    found = False
+    for _, ins, _t in f.blocks:
+        for line in ins:
+            if dest(line) != xl:
+                continue
+            m = re.match(r"l\d+ = copy (\d+)u$", line)
+            if m and int(m.group(1)) == n:
+                found = True
+                continue
+            m = re.match(r"l\d+ = builtin arr\.length\(l(\d+)\)$", line)
+            if m and arr_len(f, int(m.group(1))) == n:
+                found = True
+                continue
+            return False
+    return found
+
+
+def has_store(f, a):
+    """Some instruction of f stores into, takes from or puts into the array local a (it must stay Unique for that)."""
+    for _, ins, _t in f.blocks:
+        for line in ins:
+            if store_obj(line) == a:
+                return True
+    return False
+
+
+def branch_cmps(f, k):
+    """[(block, instruction)] of the compares with local k as an operand whose result is the condition of the branch ending its block."""
+    out = []
+    for bi, (_l, ins, term) in enumerate(f.blocks):
+        bm = BRANCH_RE.match(term)
+        if not bm:
+            continue
+        for ii, line in enumerate(ins):
+            m = CMP_RE.match(line)
+            if m and m.group(1) == bm.group(1) and ("l%d" % k) in (m.group(3), m.group(4)):
+                out.append((bi, ii))
+    return out
+
+
+def is_counter(f, k):
+    """The local k is stepped by an `add` of itself somewhere in f (a loop counter)."""
+    pat = re.compile(r"l%d = add l%d, " % (k, k))
+    return any(pat.match(line) for _, ins, _t in f.blocks for line in ins)
+
+
+def off_by_one(f, line, k, n, a):
+    """The compare line with its bound made one too large, or None when it is not a compare of the counter k against the length n."""
+    m = CMP_RE.match(line)
+    if not m:
+        return None
+    c, op, x, y = m.group(1), m.group(2), m.group(3), m.group(4)
+    kk = "l%d" % k
+    if op == "lt" and x == kk and bound_is_len(f, y, n, a):
+        return "l%s = le %s, %s" % (c, x, y)
+    if op == "le" and x == kk and re.fullmatch(r"\d+u", y) and int(y[:-1]) + 1 == n:
+        return "l%s = le %s, %du" % (c, x, n)
+    if op == "gt" and y == kk and bound_is_len(f, x, n, a):
+        return "l%s = ge %s, %s" % (c, x, y)
+    if op == "ge" and y == kk and re.fullmatch(r"\d+u", x) and int(x[:-1]) + 1 == n:
+        return "l%s = ge %du, %s" % (c, n, y)
+    return None
+
+
+def array_defs(f, a, depth=0):
+    """[(block, instruction)] of the `arraynew` lines that build array local a (through moves); [] when a has another kind of definition."""
+    if depth > 4 or a < f.nparams:
+        return []
+    out = []
+    for bi, (_l, ins, _t) in enumerate(f.blocks):
+        for ii, line in enumerate(ins):
+            if dest(line) != a:
+                continue
+            if ARRAYNEW_RE.match(line):
+                out.append((bi, ii))
+                continue
+            m = re.match(r"l\d+ = move l(\d+)$", line)
+            if not m:
+                return []
+            sub = array_defs(f, int(m.group(1)), depth + 1)
+            if not sub:
+                return []
+            out += sub
+    return out
+
+
+def guards_block(f, cbi, cii, bi):
+    """The compare at (cbi, cii) is the condition of the branch ending its block and every path from the entry to block bi takes
+    its true edge (bi is dominated by the true successor), so loosening it changes what the access in bi can be proved from."""
+    bm = BRANCH_RE.match(f.blocks[cbi][2])
+    cm = CMP_RE.match(f.blocks[cbi][1][cii])
+    if not bm or not cm or cm.group(1) != bm.group(1):
+        return False
+    t = succs(f.blocks[cbi][2])[0]
+    if bi == t:
+        return True
+    seen, work = set(), [0]
+    while work:
+        b = work.pop()
+        if b in seen or b == t:
+            continue
+        seen.add(b)
+        work += succs(f.blocks[b][2])
+    return bi not in seen
+
+
+def range_sites(f, bi, ii, line):
+    """Mutants of an unchecked access that only the interval analysis justifies."""
+    a, key, val, d = acc_parts(line)
+    where = "(b%d i%d)" % (bi, ii)
+    need = "without a dominating check"
+    out = []
+
+    def mut(cls, loc, desc, expect="error", benign=None, arg=None):
+        m = Mut(cls, f, loc, "%s `%s` %s" % (desc, line, where), benign, need if expect == "error" else None, expect)
+        m.arg = arg
+        out.append(m)
+
+    ty = scalar_ty(f, a, key, val, d)
+    n = arr_len(f, a)
+    if ty is not None:
+        mut("range-after-push", (bi, ii), "arraypush l%d before" % a)
+    mut("range-after-pop", (bi, ii), "arraypop l%d before" % a)
+    mut("range-across-dup", (bi, ii), "dup l%d before" % a)
+    mut("range-after-redef-array", (bi, ii), "redefine l%d before" % a)
+    if d is not None and not has_store(f, a):
+        mut("range-after-inout-call", (bi, ii), "in/out call on l%d before" % a)
+    defs = array_defs(f, a)
+    if defs and n is not None:
+        mut("range-param-array", defs[0], "build l%d by a call instead of arraynew, for" % a, arg=defs)
+    if re.fullmatch(r"l\d+", key):
+        k = int(key[1:])
+        mut("range-after-redef-index", (bi, ii), "give the index %s an unknown value before" % key)
+        mut("range-index-add-large", (bi, ii), "add 1000000u to the index %s before" % key)
+        if is_counter(f, k):
+            cm = branch_cmps(f, k)
+            if cm:
+                mut("range-no-branch-refinement", cm[0], "replace the compares of the counter %s, guarding" % key, arg=cm)
+        if n is not None:
+            seen = set()
+            for cbi, (_l, ins, _t) in enumerate(f.blocks):
+                for cii, cl in enumerate(ins):
+                    nl = off_by_one(f, cl, k, n, a)
+                    if nl is not None and (cbi, cii) not in seen and guards_block(f, cbi, cii, bi):
+                        seen.add((cbi, cii))
+                        mut("range-widen-off-by-one", (cbi, cii), "loosen the bound `%s` of the guard of" % cl, arg=nl)
+        if ty is not None and True:
+            mut("range-copy-index-ok", (bi, ii), "read the index %s through a copy, in" % key, "accept",
+                "positive control: a copy keeps the interval")
+            mut("range-addsub-ok", (bi, ii), "read the index %s through (i + 1) - 1, in" % key, "accept",
+                "positive control: add and sub of constants transfer the interval")
+    if a >= f.nparams and no_ref_alias_of(f, a):
+        mut("range-move-roundtrip-ok", (bi, ii), "move l%d away and back before" % a, "accept",
+            "positive control: a move carries the length fact")
+        if d is not None and not has_store(f, a):
+            mut("range-borrowed-call-ok", (bi, ii), "call a function that borrows l%d before" % a, "accept",
+                "positive control: a borrowed argument cannot change the length")
+    return out
+
+
+def stub_func(f, k, header_tail, locals_):
+    """A stub function appended to the program: index len(funcs) + k (`header_tail`: everything after its name)."""
+    return (header_tail, locals_, k)
+
+
+def apply_range(m, f):
+    b = f.blocks[m.bi]
+    ins = b[1]
+    ii = m.ii
+    cls = m.cls
+    if cls == "range-widen-off-by-one":
+        ins[ii] = m.arg
+        return f
+    if cls == "range-no-branch-refinement":
+        for cbi, cii in m.arg:
+            c = dest(f.blocks[cbi][1][cii])
+            f.blocks[cbi][1][cii] = "l%d = copy true" % c
+        return f
+    if cls == "range-param-array":
+        f.extra.append(("__mk", "(params 0) -> ref", [("l0", "ref")]))
+        for dbi, dii in m.arg:
+            dl = f.blocks[dbi][1]
+            dd = dest(dl[dii])
+            dl[dii] = "l%d = call fnEXTRA0()" % dd
+            dl.insert(dii + 1, "makeunique l%d" % dd)
+        return f
+    line = ins[ii]
+    a, key, val, d = acc_parts(line)
+    if cls == "range-after-push":
+        ty = scalar_ty(f, a, key, val, d)
+        w = f.new_local(ty)
+        ins.insert(ii, "l%d = copy %s" % (w, ZERO[ty]))
+        ins.insert(ii + 1, "arraypush l%d, l%d" % (a, w))
+    elif cls == "range-after-pop":
+        n = f.new_local()
+        ins.insert(ii, "l%d = arraypop l%d" % (n, a))
+    elif cls == "range-across-dup":
+        n = f.new_local()
+        ins.insert(ii, "l%d = dup l%d" % (n, a))
+    elif cls == "range-after-redef-array":
+        n = f.new_local()
+        ins.insert(ii, "l%d = dup l%d" % (n, a))
+        ins.insert(ii + 1, "l%d = move l%d" % (a, n))
+    elif cls == "range-after-inout-call":
+        f.extra.append(("__io", "(params 1, owned l0, inout) -> int", [("l0", "ref")]))
+        n = f.new_local("int")
+        ins.insert(ii, "l%d = call fnEXTRA0(l%d)" % (n, a))
+    elif cls == "range-after-redef-index":
+        s_ = f.new_local("ref")
+        ins.insert(ii, "l%d = copy str#0" % s_)
+        ins.insert(ii + 1, "%s = builtin str.length(l%d)" % (key, s_))
+    elif cls == "range-index-add-large":
+        ins.insert(ii, "%s = add %s, 1000000u" % (key, key))
+    elif cls == "range-move-roundtrip-ok":
+        n = f.new_local()
+        ins.insert(ii, "l%d = move l%d" % (n, a))
+        ins.insert(ii + 1, "l%d = move l%d" % (a, n))
+    elif cls == "range-borrowed-call-ok":
+        f.extra.append(("__borrow", "(params 1) -> void", [("l0", "ref")]))
+        ins.insert(ii, "call fnEXTRA0(l%d)" % a)
+    elif cls == "range-copy-index-ok":
+        n = f.new_local("usize")
+        ins.insert(ii, "l%d = copy %s" % (n, key))
+        ins[ii + 1] = line.replace("[%s]" % key, "[l%d]" % n, 1)
+    elif cls == "range-addsub-ok":
+        n = f.new_local("usize")
+        n2 = f.new_local("usize")
+        ins.insert(ii, "l%d = add %s, 1u" % (n, key))
+        ins.insert(ii + 1, "l%d = sub l%d, 1u" % (n2, n))
+        ins[ii + 2] = line.replace("[%s]" % key, "[l%d]" % n2, 1)
+    else:
+        raise ValueError(cls)
+    return f
+
+
 def apply_forward(m, f):
     b = f.blocks[m.bi]
     ins = b[1]
@@ -728,12 +1035,16 @@ def apply(m):
     if m.cls == "inout-release-receiver":
         ins.append("release l0")
         return f
+    if m.cls.startswith("range-"):
+        return apply_range(m, f)
     line = ins[ii]
     t = toks(line)
     if m.cls.startswith("fwd-"):
         return apply_forward(m, f)
     if m.cls.startswith("bce-"):
         return apply_bounds(m, f)
+    if m.cls.startswith("range-"):
+        return apply_range(m, f)
     if m.cls == "inout-drop-receiver":
         del ins[ii]
     elif m.cls == "drop-release":
@@ -821,7 +1132,11 @@ def program_text(prefix, funcs, target_idx, target):
     for i, f in enumerate(funcs):
         parts.append(target.render() if i == target_idx else f.stub())
         parts.append("\n")
-    return "".join(parts)
+    for k, (name, tail, locs) in enumerate(target.extra):
+        hdr = "fn%d %s %s" % (len(funcs) + k, name, tail)
+        parts.append(Func(hdr, locs, [["b0", [], 'trap "stub"']]).render().replace("fnEXTRA0", "fn%d" % len(funcs)))
+        parts.append("\n")
+    return "".join(parts).replace("fnEXTRA0", "fn%d" % len(funcs))
 
 
 def main():
@@ -851,6 +1166,32 @@ def main():
                 seen[k] = (prefix, funcs, i)
     print("corpus: %d programs, %d distinct functions (%.1fs)" % (nprog, len(seen), time.time() - t0))
 
+    tmpdir = tempfile.TemporaryDirectory()
+    tmp = tmpdir.name
+    exe = a.verify_text or build_driver(a.orinc, tmp)
+
+    # the fact (dominated-by-check / interval / both) behind every unchecked access of every baseline function
+    path = os.path.join(tmp, "baselines.txt")
+    with open(path, "w", errors="surrogateescape") as fh:
+        for n, (k, (prefix, funcs, i)) in enumerate(sorted(seen.items())):
+            fh.write("=== base%d\n%s" % (n, program_text(prefix, funcs, i, funcs[i])))
+    r = subprocess.run([exe, path, "--facts"], capture_output=True, text=True, errors="replace", timeout=1800)
+    if r.returncode != 0:
+        sys.exit("verify_text --facts failed: " + r.stderr[:500])
+    keys = sorted(seen.items())
+    for line in r.stdout.splitlines():
+        p = line.split("\t")
+        n = int(p[0][4:])
+        ti = keys[n][1][2]
+        for tok in p[2:]:
+            m = re.fullmatch(r"f(\d+):b(\d+):i(\d+):(.*)", tok)
+            if m and int(m.group(1)) == ti:
+                FACTS[(keys[n][0], int(m.group(2)), int(m.group(3)))] = m.group(4)
+    kinds = {}
+    for v in FACTS.values():
+        kinds[v] = kinds.get(v, 0) + 1
+    print("unchecked accesses by fact: %s" % ", ".join("%s %d" % kv for kv in sorted(kinds.items())))
+
     entries = []   # (id, text)
     meta = {}
     for n, (k, (prefix, funcs, i)) in enumerate(sorted(seen.items())):
@@ -864,15 +1205,14 @@ def main():
             entries.append((mid, program_text(prefix, funcs, i, mf)))
             meta[mid] = ("mut", fn, m)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        exe = a.verify_text or build_driver(a.orinc, tmp)
-        path = os.path.join(tmp, "mutants.txt")
-        with open(path, "w", errors="surrogateescape") as fh:
-            for name, text in entries:
-                fh.write("=== %s\n%s" % (name, text))
-        r = subprocess.run([exe, path], capture_output=True, text=True, errors="replace", timeout=1800)
-        if r.returncode != 0:
-            sys.exit("verify_text failed: " + r.stderr[:500])
+    path = os.path.join(tmp, "mutants.txt")
+    with open(path, "w", errors="surrogateescape") as fh:
+        for name, text in entries:
+            fh.write("=== %s\n%s" % (name, text))
+    r = subprocess.run([exe, path], capture_output=True, text=True, errors="replace", timeout=1800)
+    if r.returncode != 0:
+        sys.exit("verify_text failed: " + r.stderr[:500])
+    tmpdir.cleanup()
     res = {}
     for line in r.stdout.splitlines():
         p = line.split("\t")

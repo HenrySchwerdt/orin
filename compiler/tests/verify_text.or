@@ -25,7 +25,7 @@ import { ProcessGrant } from "std:process";
 import { MProgram, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, MVTable, noSpan, spanSuffix } from "../mir";
 import { Span } from "../diag";
 import { Builtin, UnOp, BinOp, taskOpFromName } from "../hir";
-import { verify, VerifyReport } from "../verify";
+import { verify, VerifyReport, accessFacts } from "../verify";
 import { readFile } from "std:fs";
 import { args, exit } from "std:process";
 
@@ -153,12 +153,14 @@ function callVirtual(dst: Option<usize>, rhs: string): Instr {
 }
 
 // The verifier distinguishes only the resource builtins (ADR-0025) and the task primitives that touch handles (ADR-0017: `task.<name>`);
-// the Option / Result builtins (the only ones that may take an unboxed aggregate, ADR-0038); every other builtin is an ordinary scalar/reference call for it and is read as BArrLength.
+// the Option / Result builtins (the only ones that may take an unboxed aggregate, ADR-0038); `arr.length` (which the range facts of
+// rule U1 read, MIR v2.6); every other builtin is an ordinary scalar/reference call for it and is read as BStrLength.
 function builtinOf(name: string): Builtin {
+  if (name == "arr.length") { return BArrLength; }
   if (name.startsWith("task.")) {
     return match (taskOpFromName(tail(name, 5))) {
       Some(k) => BTask(k),
-      None => BArrLength
+      None => BStrLength
     };
   }
   if (name == "opt.isSome") { return BOptIsSome; }
@@ -213,7 +215,7 @@ function builtinOf(name: string): Builtin {
   if (name == "file.write") { return BFileWrite; }
   if (name == "file.writeLine") { return BFileWriteLine; }
   if (name == "file.flush") { return BFileFlush; }
-  return BArrLength;
+  return BStrLength;
 }
 
 function callLike(dst: Option<usize>, rhs: string): Instr {
@@ -587,7 +589,11 @@ function parseProgram(lines: string[]): MProgram {
   return MProgram { functions: funcs, strings: strs, main: mainIdx, vtables: vts, inlineFns: inl };
 }
 
-function runOne(name: string, lines: string[]): void {
+function runOne(name: string, lines: string[], facts: bool): void {
+  if (facts) {
+    factsOne(name, lines);
+    return;
+  }
   const r: VerifyReport = verify(parseProgram(lines));
   if (r.errors.length == 0) {
     console.log(name + "\tACCEPT\t" + r.warnings.length.toString());
@@ -600,16 +606,42 @@ function runOne(name: string, lines: string[]): void {
   console.log(out);
 }
 
+// `--facts`: instead of the verdict, the fact that justifies each unchecked array access (rule U1), one line per program:
+//   <name> FACTS <fN:bB:iI:kind> ...      kind: none, dominated-by-check, interval or both
+function factsOne(name: string, lines: string[]): void {
+  const prog = parseProgram(lines);
+  let out = name + "\tFACTS";
+  let fi: usize = 0;
+  while (fi < prog.functions.length) {
+    const f = prog.functions[fi];
+    let reached: bool[] = [];
+    for (const b of f.blocks) {
+      reached.push(true);
+    }
+    const fs = accessFacts(prog, f, reached);
+    let q: usize = 0;
+    while (q < fs.length) {
+      const k = fs[q + 2];
+      const kind = k == 0 ? "none" : k == 1 ? "dominated-by-check" : k == 2 ? "interval" : "both";
+      out += "\tf" + fi.toString() + ":b" + fs[q].toString() + ":i" + fs[q + 1].toString() + ":" + kind;
+      q += 3;
+    }
+    fi += 1;
+  }
+  console.log(out);
+}
+
 function main(host: Host): void {
   useHost(host, (fs, proc, stdio, clock) => { run(fs, proc); });
 }
 
 function run(fs: FsGrant, proc: ProcessGrant): void {
   const a = args(proc);
-  if (a.length != 1) {
-    die("usage: verify_text <file>");
+  if (a.length != 1 && !(a.length == 2 && a[1] == "--facts")) {
+    die("usage: verify_text <file> [--facts]");
     return;
   }
+  const facts = a.length == 2;
   const text = readFile(fs, a[0]);
   if (text.isErr()) {
     die("cannot read " + a[0] + ": " + text.unwrapErr());
@@ -621,7 +653,7 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
   for (const l of text.unwrap().split("\n")) {
     if (l.startsWith("=== ")) {
       if (have) {
-        runOne(name, cur);
+        runOne(name, cur, facts);
       }
       name = tail(l, 4).trim();
       cur = [];
@@ -632,6 +664,6 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
     }
   }
   if (have && (name != "-" || cur.length > 0)) {
-    runOne(name, cur);
+    runOne(name, cur, facts);
   }
 }

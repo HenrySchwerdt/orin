@@ -5,7 +5,7 @@
 import { MProgram, MVTable, MFunction, MType, MLocal, MBlock, Instr, Terminator, Operand, SwitchCase, plainBlock, hasSpan } from "../mir";
 import { Span } from "../diag";
 import {
-  BStrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, BFsReadFile, BFsExists, BGrantFs, BGrantClock, BGrantUnder,
+  BStrLength, BArrLength, BFileOpen, BFileClose, BFileIsOpen, BFileReadLine, BFileWrite, BFsReadFile, BFsExists, BGrantFs, BGrantClock, BGrantUnder,
   BGrantReadOnly, BGrantRevoke, BTimeNowMillis, BTask, BGrantNet, BGrantListen, BNetListen, BNetAccept, BNetConnect, BNetClose, BNetRecv, BNetShutdown, UnOp, BinOp
 } from "../hir";
 import { verify, VerifyReport } from "../verify";
@@ -1147,7 +1147,9 @@ function nfwd(name: string, instrs: Instr[]): bool {
 }
 
 function rec(): Instr { return IStructNew(0, 0, [OInt(1), OInt(2)]); }
-function arr(): Instr { return IArrayNew(0, false, [OInt(1), OInt(2), OInt(3)]); }
+// One element: the indices the cases below use (1, 2, a local holding 1) are out of its length, so no interval fact (T6) justifies
+// them and the cases test the dominating-access fact (T2) alone.
+function arr(): Instr { return IArrayNew(0, false, [OInt(1)]); }
 function load0(): Instr { return IGetField(1, OLocal(0), 0); }
 function fwd0(): Instr { return IForward(2, 1, OLocal(0), OUsize(0)); }
 function done(): Instr { return IRelease(0); }
@@ -1228,7 +1230,7 @@ function forwardCases(): usize {
   return bad;
 }
 
-// Unchecked array access, rule U1 (docs/mir.md v2.6, ADR-0038 lever 2 T2). Locals: 0 = the array `a` (three ints), 1 = an int `s`,
+// Unchecked array access, rule U1 (docs/mir.md v2.6, ADR-0038 lever 2 T2). Locals: 0 = the array `a` (one int), 1 = an int `s`,
 // 2 = an int `d`, 3 = an int `w`, 4 = an index `i`, 5 = a reference `r`, 6 = a second array `b`, 7 = another index `j`.
 function ulocs(): MLocal[] {
   return [lr("a"), li("s"), li("d"), li("w"), lu("i"), lr("r"), lr("b"), lu("j")];
@@ -1283,7 +1285,7 @@ function uncheckedCases(): usize {
   bad += cnt(ubad("across arraytake of another element", [arr(), get1(), IArrayTake(5, 0, OUsize(2)), IArrayPut(0, OUsize(2), 5), getU1(), done()]));
   bad += cnt(ubad("across arraytake", [arr(), get1(), IArrayTake(5, 0, OUsize(2)), getU1(), IArrayPut(0, OUsize(2), 5), done()]));
   bad += cnt(ubad("after the array was redefined", [arr(), get1(), done(), arr(), getU1(), done()]));
-  bad += cnt(ubad("after the array was moved in", [arr(), IArrayNew(6, false, [OInt(1), OInt(2), OInt(3)]), get1(), done(), IMove(0, 6), getU1(), done()]));
+  bad += cnt(ubad("after the array was moved in", [arr(), IArrayNew(6, false, [OInt(1)]), get1(), done(), IMove(0, 6), getU1(), done()]));
   bad += cnt(ubad("after the index local was redefined", [arr(), ICopy(4, OUsize(1)), IArrayGet(1, OLocal(0), OLocal(4)), ICopy(4, OUsize(2)), IArrayGetU(2, OLocal(0), OLocal(4)), done()]));
   bad += cnt(ubad("across a dup of the array", [arr(), get1(), IDup(5, OLocal(0)), getU1(), IRelease(5), done()]));
   bad += cnt(ubadCall("across a call that receives the array", [arr(), get1(), ICall(None, 1, [OLocal(0)]), getU1(), done()]));
@@ -1322,8 +1324,270 @@ function uncheckedCases(): usize {
   return bad;
 }
 
+
+// Range facts for unchecked array access, rule U1 (docs/mir.md v2.6, ADR-0038 lever 2 T6, compiler/verify/range.or). Locals: 0 = the array
+// `a` (four ints), 1 = an index `i`, 2 = a second index `j`, 3 = a bound `n`, 4 = a bool `c`, 5 = an int `d`, 6 = an int `w`, 7 = a
+// second array `b`, 8 = a usize `m`, 9 = a reference `r`.
+function rlocals(): MLocal[] {
+  return [lr("a"), lu("i"), lu("j"), lu("n"), lb("c"), li("d"), li("w"), lr("b"), lu("m"), lr("r")];
+}
+
+function gOwn(): MFunction {
+  return MFunction { name: "own", paramCount: 1, paramOwned: [true], inout: false, locals: [lr("p")], ret: MVoid,
+    blocks: [bk([IRelease(0)], TReturn(None))] };
+}
+
+// fn1 = g(borrowed ref), fn2 = in/out next(owned this), fn3 = own(owned ref)
+function rprog(blocks: MBlock[]): MProgram {
+  return prog([fn("f", 0, rlocals(), MVoid, blocks), gVoid(), ioNext(), gOwn()]);
+}
+
+function rnew4(): Instr { return IArrayNew(0, false, [OInt(1), OInt(2), OInt(3), OInt(4)]); }
+function rget(k: usize): Instr { return IArrayGetU(5, OLocal(0), OLocal(k)); }
+function rset(k: usize): Instr { return IArraySetU(0, OLocal(k), OLocal(6)); }
+function unk(): Instr { return IBuiltin(Some(3), BStrLength, [OStr(0)]); }
+function cmp(op: BinOp, x: Operand, y: Operand): Instr { return IBinary(4, op, x, y); }
+function inc(): Instr { return IBinary(1, OpAdd, OLocal(1), OUsize(1)); }
+function u(n: int): Operand { return OUsize(n); }
+function lo(k: usize): Operand { return OLocal(k); }
+
+// `i = 0; while (cmp) { body; i = i + 1 }` (setup builds the array): b0 setup, b1 header, b2 body, b3 exit.
+function rloop(setup: Instr[], header: Instr[], body: Instr[], bodyOnTrue: bool): MProgram {
+  return rprog([
+    bk(setup, TGoto(1)),
+    bk(header, bodyOnTrue ? TBranch(OLocal(4), 2, 3) : TBranch(OLocal(4), 3, 2)),
+    bk(body.concat([inc()]), TGoto(1)),
+    bk([IRelease(0)], ret())]);
+}
+
+function rinit(): Instr[] { return [rnew4(), ICopy(1, u(0))]; }
+
+function rok(name: string, p: MProgram): bool { return pos("range " + name, p); }
+function rbad(name: string, p: MProgram): bool { return neg("range " + name, p, UNCHECKED_NEEDLE); }
+
+// straight-line function over the range locals
+function rstr(instrs: Instr[]): MProgram { return rprog([bk(instrs, ret())]); }
+
+// `unk(); c = n < 1; branch c ? b1 : b2` after the setup: a branch whose condition says nothing about the array.
+function rfork(setup: Instr[]): MBlock {
+  return bk(setup.concat([unk(), cmp(OpLt, lo(3), u(1))]), TBranch(OLocal(4), 1, 2));
+}
+
+function rangeCases(): usize {
+  let bad: usize = 0;
+  // constant indices against the literal length
+  bad += cnt(rok("constant index in range", rstr([rnew4(), IArrayGetU(5, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rok("constant index 0", rstr([rnew4(), IArrayGetU(5, lo(0), u(0)), IRelease(0)])));
+  bad += cnt(rok("unchecked store, constant index in range", rstr([rnew4(), ICopy(6, OInt(7)), IArraySetU(0, u(3), lo(6)), IRelease(0)])));
+  bad += cnt(rbad("constant index at the length", rstr([rnew4(), IArrayGetU(5, lo(0), u(4)), IRelease(0)])));
+  bad += cnt(rbad("constant index beyond the length", rstr([rnew4(), IArrayGetU(5, lo(0), u(100)), IRelease(0)])));
+  bad += cnt(rbad("store, constant index at the length", rstr([rnew4(), ICopy(6, OInt(7)), IArraySetU(0, u(4), lo(6)), IRelease(0)])));
+  bad += cnt(rbad("empty array", rstr([IArrayNew(0, false, []), IArrayGetU(5, lo(0), u(0)), IRelease(0)])));
+  bad += cnt(rok("index in a local", rstr([rnew4(), ICopy(1, u(2)), rget(1), IRelease(0)])));
+  bad += cnt(rbad("index in a local, out of range", rstr([rnew4(), ICopy(1, u(4)), rget(1), IRelease(0)])));
+
+  // loops: the guard of the branch refines the index
+  bad += cnt(rok("while (i < 4)", rloop(rinit(), [cmp(OpLt, lo(1), u(4))], [rget(1)], true)));
+  bad += cnt(rok("store in while (i < 4)", rloop(rinit().concat([ICopy(6, OInt(1))]), [cmp(OpLt, lo(1), u(4))], [rset(1)], true)));
+  bad += cnt(rok("while (i <= 3)", rloop(rinit(), [cmp(OpLe, lo(1), u(3))], [rget(1)], true)));
+  bad += cnt(rok("while (4 > i)", rloop(rinit(), [cmp(OpGt, u(4), lo(1))], [rget(1)], true)));
+  bad += cnt(rok("while (3 >= i)", rloop(rinit(), [cmp(OpGe, u(3), lo(1))], [rget(1)], true)));
+  bad += cnt(rok("exit on i >= 4, body on the false edge", rloop(rinit(), [cmp(OpGe, lo(1), u(4))], [rget(1)], false)));
+  bad += cnt(rok("bound in a local", rloop(rinit().concat([ICopy(3, u(4))]), [cmp(OpLt, lo(1), lo(3))], [rget(1)], true)));
+  bad += cnt(rok("bound is the array length", rloop(rinit(), [IBuiltin(Some(3), BArrLength, [lo(0)]), cmp(OpLt, lo(1), lo(3))], [rget(1)], true)));
+  bad += cnt(rok("array length known after a store", rloop(rinit().concat([ICopy(6, OInt(1))]),
+    [IBuiltin(Some(3), BArrLength, [lo(0)]), cmp(OpLt, lo(1), lo(3))], [rset(1), rget(1)], true)));
+  bad += cnt(rok("the body also reads a constant index", rloop(rinit(), [cmp(OpLt, lo(1), u(4))], [rget(1), IArrayGetU(6, lo(0), u(0))], true)));
+  bad += cnt(rok("start at 2", rloop([rnew4(), ICopy(1, u(2))], [cmp(OpLt, lo(1), u(4))], [rget(1)], true)));
+
+  // off by one: the bound is one too large
+  bad += cnt(rbad("while (i <= 4)", rloop(rinit(), [cmp(OpLe, lo(1), u(4))], [rget(1)], true)));
+  bad += cnt(rbad("while (i < 5)", rloop(rinit(), [cmp(OpLt, lo(1), u(5))], [rget(1)], true)));
+  bad += cnt(rbad("while (5 > i)", rloop(rinit(), [cmp(OpGt, u(5), lo(1))], [rget(1)], true)));
+  bad += cnt(rbad("while (4 >= i)", rloop(rinit(), [cmp(OpGe, u(4), lo(1))], [rget(1)], true)));
+  bad += cnt(rbad("exit on i >= 5", rloop(rinit(), [cmp(OpGe, lo(1), u(5))], [rget(1)], false)));
+  bad += cnt(rbad("bound in a local, one too large", rloop(rinit().concat([ICopy(3, u(5))]), [cmp(OpLt, lo(1), lo(3))], [rget(1)], true)));
+  bad += cnt(rbad("bound is an unknown value", rloop(rinit().concat([unk()]), [cmp(OpLt, lo(1), lo(3))], [rget(1)], true)));
+  bad += cnt(rbad("bound is the length of a shorter array", rloop(rinit().concat([IArrayNew(7, false, [OInt(1), OInt(2)])]),
+    [IBuiltin(Some(3), BArrLength, [lo(7)]), cmp(OpLt, lo(1), lo(3))], [rget(1), IRelease(7)], true)));
+  bad += cnt(rbad("the index is incremented before the access", rloop(rinit(), [cmp(OpLt, lo(1), u(4))], [inc(), rget(1)], true)));
+  bad += cnt(rbad("step 2 past the guard", rloop(rinit(), [cmp(OpLt, lo(1), u(4))], [IBinary(1, OpAdd, lo(1), u(2)), rget(1)], true)));
+  bad += cnt(rbad("no guard at all", rloop(rinit(), [cmp(OpLt, lo(2), u(4))], [rget(1)], true)));
+  bad += cnt(rbad("the guard is about another index", rloop(rinit().concat([ICopy(2, u(0))]), [cmp(OpLt, lo(2), u(4))], [rget(1)], true)));
+  bad += cnt(rbad("the access is on the exit edge", rprog([
+    bk(rinit(), TGoto(1)),
+    bk([cmp(OpLt, lo(1), u(4))], TBranch(OLocal(4), 2, 3)),
+    bk([inc()], TGoto(1)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rbad("a != guard says nothing about the body", rloop(rinit(), [cmp(OpNe, lo(1), u(4))], [rget(1)], true)));
+
+  // the guard must still hold at the branch, in the same block
+  bad += cnt(rbad("index redefined between the guard and the branch", rloop(rinit(), [cmp(OpLt, lo(1), u(4)), IBinary(1, OpAdd, lo(1), u(1))], [rget(1)], true)));
+  bad += cnt(rbad("bound redefined between the guard and the branch", rloop(rinit().concat([ICopy(3, u(4))]),
+    [cmp(OpLt, lo(1), lo(3)), ICopy(3, u(9))], [rget(1)], true)));
+  bad += cnt(rbad("guard bool redefined", rloop(rinit(), [cmp(OpLt, lo(1), u(4)), ICopy(4, OBool(true))], [rget(1)], true)));
+  bad += cnt(rbad("guard in an earlier block", rprog([
+    bk([rnew4(), IBuiltin(Some(1), BStrLength, [OStr(0)]), cmp(OpLt, lo(1), u(4))], TGoto(1)),
+    bk([], TBranch(OLocal(4), 2, 3)),
+    bk([rget(1)], TGoto(3)),
+    bk([IRelease(0)], ret())])));
+
+  // eq refines the true edge, ne the false edge
+  bad += cnt(rok("== 2 on the true edge", rprog([
+    bk(rinit().concat([unk(), cmp(OpEq, lo(3), u(2))]), TBranch(OLocal(4), 1, 2)),
+    bk([IArrayGetU(5, lo(0), lo(3)), IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])));
+  bad += cnt(rbad("== on the false edge", rprog([
+    bk(rinit().concat([unk(), cmp(OpEq, lo(3), u(2))]), TBranch(OLocal(4), 2, 1)),
+    bk([IArrayGetU(5, lo(0), lo(3)), IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])));
+  bad += cnt(rbad("== 4 on the true edge", rprog([
+    bk(rinit().concat([unk(), cmp(OpEq, lo(3), u(4))]), TBranch(OLocal(4), 1, 2)),
+    bk([IArrayGetU(5, lo(0), lo(3)), IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])));
+  bad += cnt(rok("!= 1 on the false edge", rprog([
+    bk(rinit().concat([unk(), cmp(OpNe, lo(3), u(1))]), TBranch(OLocal(4), 2, 1)),
+    bk([IArrayGetU(5, lo(0), lo(3)), IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])));
+  bad += cnt(rok("two guards in a row (n < 4, then j < n)", rprog([
+    bk(rinit().concat([unk(), cmp(OpLt, lo(3), u(4))]), TBranch(OLocal(4), 1, 3)),
+    bk([IBuiltin(Some(2), BStrLength, [OStr(0)]), cmp(OpLt, lo(2), lo(3))], TBranch(OLocal(4), 2, 3)),
+    bk([IArrayGetU(5, lo(0), lo(2)), IArrayGetU(5, lo(0), lo(3)), IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])));
+  bad += cnt(rbad("j < n with n unknown", rprog([
+    bk(rinit().concat([unk(), IBuiltin(Some(2), BStrLength, [OStr(0)]), cmp(OpLt, lo(2), lo(3))]), TBranch(OLocal(4), 1, 2)),
+    bk([IArrayGetU(5, lo(0), lo(2)), IRelease(0)], ret()),
+    bk([IRelease(0)], ret())])));
+
+  // transfer through add and sub
+  bad += cnt(rok("n - 1", rstr([rnew4(), ICopy(3, u(4)), IBinary(8, OpSub, lo(3), u(1)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rbad("n - 0", rstr([rnew4(), ICopy(3, u(4)), IBinary(8, OpSub, lo(3), u(0)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rok("1 + 2", rstr([rnew4(), ICopy(3, u(1)), IBinary(8, OpAdd, lo(3), u(2)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rbad("1 + 3", rstr([rnew4(), ICopy(3, u(1)), IBinary(8, OpAdd, lo(3), u(3)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rbad("an unknown plus a constant", rstr([rnew4(), unk(), IBinary(8, OpAdd, lo(3), u(1)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rbad("an unknown minus a constant", rstr([rnew4(), unk(), IBinary(8, OpSub, lo(3), u(1)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rbad("a product is not tracked", rstr([rnew4(), ICopy(3, u(1)), IBinary(8, OpMul, lo(3), u(1)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rok("copy keeps the interval", rstr([rnew4(), ICopy(3, u(3)), ICopy(8, lo(3)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  bad += cnt(rbad("a huge constant", rstr([rnew4(), ICopy(3, OUsize(-1)), IArrayGetU(5, lo(0), lo(3)), IRelease(0)])));
+  bad += cnt(rbad("a sum that cannot be bounded", rstr([rnew4(), ICopy(3, OUsize(1152921504606846976)), IBinary(8, OpAdd, lo(3), lo(3)),
+    IArrayGetU(5, lo(0), lo(8)), IRelease(0)])));
+  // a path that always traps leaves no state: nothing is justified there
+  bad += cnt(rbad("after a subtraction that always underflows", rstr([rnew4(), ICopy(3, u(0)), IBinary(8, OpSub, lo(3), u(1)),
+    IArrayGetU(5, lo(0), u(0)), IRelease(0)])));
+  // index arithmetic on the guarded index
+  bad += cnt(rok("nested loop, j = i + 1", rprog([
+    bk(rinit(), TGoto(1)),
+    bk([cmp(OpLt, lo(1), u(4))], TBranch(OLocal(4), 2, 6)),
+    bk([IBinary(2, OpAdd, lo(1), u(1))], TGoto(3)),
+    bk([cmp(OpLt, lo(2), u(4))], TBranch(OLocal(4), 4, 5)),
+    bk([rget(1), rget(2), IBinary(2, OpAdd, lo(2), u(1))], TGoto(3)),
+    bk([inc()], TGoto(1)),
+    bk([IRelease(0)], ret())])));
+  bad += cnt(rbad("nested loop, j = i + 2 and j <= 4", rprog([
+    bk(rinit(), TGoto(1)),
+    bk([cmp(OpLt, lo(1), u(4))], TBranch(OLocal(4), 2, 6)),
+    bk([IBinary(2, OpAdd, lo(1), u(2))], TGoto(3)),
+    bk([cmp(OpLe, lo(2), u(4))], TBranch(OLocal(4), 4, 5)),
+    bk([rget(2), IBinary(2, OpAdd, lo(2), u(1))], TGoto(3)),
+    bk([inc()], TGoto(1)),
+    bk([IRelease(0)], ret())])));
+  // the narrowing round: after `while (i < 4)` the index is exactly 4
+  bad += cnt(rok("after the loop (needs the narrowing round)", rprog([
+    bk(rinit(), TGoto(1)),
+    bk([cmp(OpLt, lo(1), u(4))], TBranch(OLocal(4), 2, 3)),
+    bk([inc()], TGoto(1)),
+    bk([IBinary(8, OpSub, lo(1), u(1)), IArrayGetU(5, lo(0), lo(8)), IRelease(0)], ret())])));
+  bad += cnt(rbad("after the loop, the index itself", rprog([
+    bk(rinit(), TGoto(1)),
+    bk([cmp(OpLt, lo(1), u(4))], TBranch(OLocal(4), 2, 3)),
+    bk([inc()], TGoto(1)),
+    bk([rget(1), IRelease(0)], ret())])));
+  // joins
+  bad += cnt(rok("join of 1 and 3", rprog([
+    rfork(rinit()),
+    bk([ICopy(1, u(1))], TGoto(3)),
+    bk([ICopy(1, u(3))], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rbad("join of 1 and 4", rprog([
+    rfork(rinit()),
+    bk([ICopy(1, u(1))], TGoto(3)),
+    bk([ICopy(1, u(4))], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rbad("join with a path that does not know the index", rprog([
+    rfork(rinit()),
+    bk([ICopy(1, u(1))], TGoto(3)),
+    bk([IBuiltin(Some(1), BStrLength, [OStr(0)])], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rok("join of two arrays of different length (hull [2, 4])", rprog([
+    rfork([]),
+    bk([rnew4(), ICopy(1, u(1))], TGoto(3)),
+    bk([IArrayNew(0, false, [OInt(1), OInt(2)]), ICopy(1, u(1))], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rbad("join of two arrays of different length, the longer index", rprog([
+    rfork([]),
+    bk([rnew4(), ICopy(1, u(3))], TGoto(3)),
+    bk([IArrayNew(0, false, [OInt(1), OInt(2)]), ICopy(1, u(3))], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rbad("join with a path where the array is not built here", rprog([
+    rfork([]),
+    bk([rnew4(), ICopy(1, u(1))], TGoto(3)),
+    bk([IStructNew(0, 0, []), ICopy(1, u(1))], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  // a loop whose index grows without a guard still terminates (widening) and justifies nothing
+  bad += cnt(rbad("unguarded counter", rprog([
+    bk(rinit(), TGoto(1)),
+    bk([rget(1), inc(), unk(), cmp(OpLt, lo(3), u(2))], TBranch(OLocal(4), 1, 2)),
+    bk([IRelease(0)], ret())])));
+  // the array: destroyed by anything but a plain read
+  bad += cnt(rbad("after arraypush", rstr([rnew4(), IArrayPush(0, OInt(5)), IArrayGetU(5, lo(0), u(0)), IRelease(0)])));
+  bad += cnt(rbad("after arraypop", rstr([rnew4(), IArrayPop(9, 0), IArrayGetU(5, lo(0), u(0)), IRelease(9), IRelease(0)])));
+  bad += cnt(rbad("after arrayextend", rstr([rnew4(), IArrayNew(7, false, [OInt(1)]), IArrayExtend(0, lo(7)), IArrayGetU(5, lo(0), u(0)), IRelease(7), IRelease(0)])));
+  bad += cnt(rbad("after arraytake", rstr([rnew4(), IArrayTake(9, 0, u(1)), IArrayPut(0, u(1), 9), IArrayGetU(5, lo(0), u(0)), IRelease(0)])));
+  bad += cnt(rbad("push in the loop body before the access", rloop(rinit(), [cmp(OpLt, lo(1), u(4))], [IArrayPush(0, OInt(5)), rget(1)], true)));
+  bad += cnt(rbad("push in the loop body after the access", rloop(rinit(), [cmp(OpLt, lo(1), u(4))], [rget(1), IArrayPush(0, OInt(5))], true)));
+  bad += cnt(rbad("push before the loop", rloop(rinit().concat([IArrayPush(0, OInt(5))]), [cmp(OpLt, lo(1), u(4))], [rget(1)], true)));
+  bad += cnt(rbad("push on one path", rprog([
+    rfork(rinit()),
+    bk([IArrayPush(0, OInt(5))], TGoto(3)),
+    bk([], TGoto(3)),
+    bk([rget(1), IRelease(0)], ret())])));
+  bad += cnt(rbad("after a dup of the array", rstr([rnew4(), IDup(9, lo(0)), IArrayGetU(5, lo(0), u(0)), IRelease(9), IRelease(0)])));
+  bad += cnt(rbad("after a borrow of the array", rstr([rnew4(), IBorrow(9, 0), IArrayGetU(5, lo(0), u(0)), IRelease(0)])));
+  bad += cnt(rbad("the array stored into a record", rstr([rnew4(), IStructNew(9, 0, [lo(0)]), IArrayGetU(5, lo(0), u(0)), IRelease(9)])));
+  bad += cnt(rbad("the array redefined by a shorter one", rstr([rnew4(), IRelease(0), IArrayNew(0, false, [OInt(1)]), IArrayGetU(5, lo(0), u(2)), IRelease(0)])));
+  bad += cnt(rok("the array redefined by a longer one", rstr([rnew4(), IRelease(0), IArrayNew(0, false, [OInt(1), OInt(2), OInt(3), OInt(4), OInt(5)]),
+    IArrayGetU(5, lo(0), u(4)), IRelease(0)])));
+  bad += cnt(rbad("the array redefined in the loop by an unknown", rloop(rinit(), [cmp(OpLt, lo(1), u(4))],
+    [IRelease(0), IStructNew(0, 0, []), rget(1)], true)));
+  bad += cnt(rok("moved to another local: the new name has the fact", rstr([rnew4(), IMove(7, 0), IArrayGetU(5, lo(7), u(3)), IRelease(7)])));
+  bad += cnt(rbad("moved to another local: the old name has none", rstr([rnew4(), IMove(7, 0), IArrayGetU(5, lo(0), u(3)), IRelease(7)])));
+  bad += cnt(rbad("moved to another local, then pushed", rstr([rnew4(), IMove(7, 0), IArrayPush(7, OInt(1)), IArrayGetU(5, lo(7), u(3)), IRelease(7)])));
+  bad += cnt(rbad("the other array has another length", rstr([rnew4(), IArrayNew(7, false, [OInt(1)]), IArrayGetU(5, lo(7), u(3)), IRelease(7), IRelease(0)])));
+  bad += cnt(rok("two arrays, each with its own length", rstr([rnew4(), IArrayNew(7, false, [OInt(1)]), IArrayGetU(5, lo(0), u(3)),
+    IArrayGetU(5, lo(7), u(0)), IRelease(7), IRelease(0)])));
+  // kept: reads, stores, makeunique, forwards and borrowed calls
+  bad += cnt(rok("across a store into the array", rstr([rnew4(), ICopy(6, OInt(1)), IArraySet(0, u(0), lo(6)), IArrayGetU(5, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rok("across makeunique", rstr([rnew4(), IMakeUnique(0), IArrayGetU(5, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rok("across a checked read", rstr([rnew4(), IArrayGet(5, lo(0), u(9)), IArrayGetU(6, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rok("across a call that gets the array borrowed", rstr([rnew4(), ICall(None, 1, [lo(0)]), IArrayGetU(5, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rbad("across a call that gets the array owned", rstr([rnew4(), IDup(7, lo(0)), ICall(None, 3, [lo(7)]), ICall(None, 3, [lo(0)]), IArrayGetU(5, lo(0), u(3))])));
+  bad += cnt(rbad("across an in/out call on the array", rstr([rnew4(), ICall(Some(5), 2, [lo(0)]), IArrayGetU(5, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rbad("across a borrowed call and then an owned one", rstr([
+    rnew4(), ICall(None, 1, [lo(0)]), ICall(None, 3, [lo(0)]), IArrayNew(0, false, [OInt(1)]), IArrayGetU(5, lo(0), u(3)), IRelease(0)])));
+  bad += cnt(rbad("across an indirect call that mentions the array", rprog([
+    bk([rnew4(), IClosure(9, 1, []), ICallIndirect(None, lo(9), [lo(0)]), IArrayGetU(5, lo(0), u(3)), IRelease(9), IRelease(0)], ret())])));
+  // no shape fact
+  bad += cnt(rbad("a parameter array", prog([fn("f", 1, [lr("p"), li("d")], MVoid, [bk([IArrayGetU(1, lo(0), u(0))], ret())])])));
+  bad += cnt(rbad("an array returned by a call", prog([
+    fn("f", 0, [lr("a"), li("d")], MVoid, [bk([ICall(Some(0), 1, []), IArrayGetU(1, lo(0), u(0)), IRelease(0)], ret())]),
+    fn("mk", 0, [lr("a")], MRef, [bk([IArrayNew(0, false, [OInt(1)])], TReturn(Some(lo(0))))])])));
+  bad += cnt(rbad("an array read from a record", rstr([IStructNew(9, 0, [OInt(1)]), IGetField(0, lo(9), 0), IArrayGetU(5, lo(0), u(0)), IRelease(9)])));
+  bad += cnt(rbad("a string", rstr([ICopy(0, OStr(0)), IArrayGetU(5, lo(0), u(0))])));
+  return bad;
+}
+
 function main(): void {
-  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases() + forwardCases() + uncheckedCases();
+  const bad = robustnessCases() + spanCases() + negatives1() + negatives2() + positives() + ownedCases() + closureCases() + ifaceCases() + handleCases() + grantCases() + netCases() + taskGrantCases() + inoutCases() + forwardCases() + uncheckedCases() + rangeCases();
   if (bad > 0) {
     console.log(bad.toString() + " case(s) FAILED");
     exit(1);

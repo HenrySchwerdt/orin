@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Unchecked array accesses from range facts (ADR-0038 lever 2, T6, MIR v2.6; draft).** The verifier gains an interval analysis
+  (`compiler/verify/range.or`, rules R1-R5 in docs/mir.md) that accepts `arraygetu` / `arraysetu` when the index is provably below the length
+  of an array built by `arraynew` in the same function; the optimiser pass `opt/bounds.or` emits them where the verifier agrees.
+  nbody -53.1 % executed instructions, the other benchmarks unchanged, self-compile +0.37 %. Array length stays outside the Lean model
+  (docs/tcb.md). New mutation classes `range-*`, regression programs `tests/next/run/bce_range_*`.
 - **bench/url prints no wall-clock time.** The benchmark printed `ms=<elapsed>` next to its checksum, so every run differed from the
   previous one (also C against C) and `tools/bench.py` reported "CHECKSUM MISMATCH in url (llvm)". This was not an LLVM miscompile:
   output of the C and LLVM binaries is identical apart from the timing field. The benchmark now prints only deterministic values

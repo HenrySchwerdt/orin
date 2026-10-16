@@ -82,6 +82,9 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    instructions, and flattening `Span` itself needs value types (every `toks[i].span` / `spanTo` would re-allocate it).
    T2 (unchecked dominated accesses, draft #98) is parked: gcc -O2 already removes the second check, gain nil; it is the
    base for T6, whose ceiling (all array kind + bounds checks removed) is nbody -53%, pqueue -37%, sieve -18% instructions.
+   T6 (range facts, same branch, draft #98) is built: `compiler/verify/range.or`, nbody -53.1% (the ceiling), pqueue / sieve /
+   qsort_inplace / mutres unchanged (parameter and push-built arrays have no shape fact), self-compile +0.37%; verifier 2476 -> 3461
+   code lines (T2 +115, T6 +870). Needs the owner's decision on the interval domain before merge (ADR-0038 T6).
 3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).

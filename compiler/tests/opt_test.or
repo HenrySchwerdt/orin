@@ -8,7 +8,7 @@ import { Host, useFs } from "std:host";
 import { FsGrant } from "std:fs";
 import { assert, assertEqUsize, assertEqBool, assertEqString } from "std:test";
 import { Span, SourceFile, span } from "../diag";
-import { BArrConcat, BArrLength, BStrLength, UnNeg, OpAdd } from "../hir";
+import { BArrConcat, BArrLength, BStrLength, UnNeg, OpAdd, OpLt, OpLe, BinOp } from "../hir";
 import {
   MType, MLocal, MBlock, Instr, Terminator, Operand, MFunction, MProgram, plainBlock,
 } from "../mir";
@@ -1108,10 +1108,30 @@ function uncheckedAt(f: MFunction): usize[] {
   return out;
 }
 
+// A function whose first `n` locals are owned array parameters: parameters have no shape fact, so only the dominating-access rule (T2)
+// can justify an unchecked access here; the interval rule (T6) needs an array built in the function.
+function withArrays(n: usize, locals: MLocal[], instrs: Instr[]): MFunction {
+  let owned: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    owned.push(true);
+    i += 1;
+  }
+  return MFunction {
+    name: "f",
+    paramCount: n,
+    paramOwned: owned,
+    inout: false,
+    locals: locals,
+    ret: MVoid,
+    blocks: [bk(instrs, TReturn(None))],
+  };
+}
+
 @Test
 function anArrayStoreAfterALoadOfTheSameElementIsUnchecked(): void {
-  const f = straight([lr("a"), li("s"), li("w")], [
-    IArrayNew(0, false, [OInt(1), OInt(2), OInt(3)]),
+  const f = withArrays(1, [lr("a"), li("s"), li("w")], [
+    IMakeUnique(0),
     IArrayGet(1, OLocal(0), OUsize(1)),
     ICopy(2, OInt(9)),
     IArraySet(0, OUsize(1), OLocal(2)),
@@ -1136,8 +1156,8 @@ function anArrayStoreAfterALoadOfTheSameElementIsUnchecked(): void {
 
 @Test
 function everyLaterAccessOfTheSameElementIsUnchecked(): void {
-  const f = straight([lr("a"), lu("i"), li("s"), li("d")], [
-    IArrayNew(0, false, [OInt(1), OInt(2)]),
+  const f = withArrays(1, [lr("a"), lu("i"), li("s"), li("d")], [
+    IMakeUnique(0),
     ICopy(1, OUsize(1)),
     IArrayGet(2, OLocal(0), OLocal(1)),
     IArrayGet(3, OLocal(0), OLocal(1)),
@@ -1151,24 +1171,20 @@ function everyLaterAccessOfTheSameElementIsUnchecked(): void {
 
 @Test
 function aPushOrAnotherElementOrAnotherArrayKeepsTheCheck(): void {
-  const pushed = straight([lr("a"), li("s"), li("d")], [
-    IArrayNew(0, false, [OInt(1), OInt(2)]),
+  const pushed = withArrays(1, [lr("a"), li("s"), li("d")], [
     IArrayGet(1, OLocal(0), OUsize(0)),
     IArrayPush(0, OInt(4)),
     IArrayGet(2, OLocal(0), OUsize(0)),
     IRelease(0),
   ]);
   assertEqUsize(uncheckedCount(uncheckAccesses(prog([pushed]), pushed)), 0, "the push can reallocate and change the length");
-  const other = straight([lr("a"), li("s"), li("d")], [
-    IArrayNew(0, false, [OInt(1), OInt(2)]),
+  const other = withArrays(1, [lr("a"), li("s"), li("d")], [
     IArrayGet(1, OLocal(0), OUsize(0)),
     IArrayGet(2, OLocal(0), OUsize(1)),
     IRelease(0),
   ]);
   assertEqUsize(uncheckedCount(uncheckAccesses(prog([other]), other)), 0, "another index has not been checked");
-  const twoArrays = straight([lr("a"), lr("b"), li("s"), li("d")], [
-    IArrayNew(0, false, [OInt(1), OInt(2)]),
-    IArrayNew(1, false, [OInt(1), OInt(2)]),
+  const twoArrays = withArrays(2, [lr("a"), lr("b"), li("s"), li("d")], [
     IArrayGet(2, OLocal(0), OUsize(0)),
     IArrayGet(3, OLocal(1), OUsize(0)),
     IRelease(0),
@@ -1180,8 +1196,7 @@ function aPushOrAnotherElementOrAnotherArrayKeepsTheCheck(): void {
 @Test
 function aCallThatReceivesTheArrayKeepsTheCheck(): void {
   const callee = fn("g", 1, [lr("p")], [bk([], TReturn(None))]);
-  const f = straight([lr("a"), li("s"), li("d")], [
-    IArrayNew(0, false, [OInt(1), OInt(2)]),
+  const f = withArrays(1, [lr("a"), li("s"), li("d")], [
     IArrayGet(1, OLocal(0), OUsize(0)),
     ICall(None, 1, [OLocal(0)]),
     IArrayGet(2, OLocal(0), OUsize(0)),
@@ -1192,8 +1207,7 @@ function aCallThatReceivesTheArrayKeepsTheCheck(): void {
 
 @Test
 function aLoadThatOverwritesItsOwnIndexIsNotASource(): void {
-  const f = straight([lr("a"), lu("i"), lu("d")], [
-    IArrayNew(0, false, [OUsize(1), OUsize(0)]),
+  const f = withArrays(1, [lr("a"), lu("i"), lu("d")], [
     ICopy(1, OUsize(0)),
     IArrayGet(1, OLocal(0), OLocal(1)),
     IArrayGet(2, OLocal(0), OLocal(1)),
@@ -1216,4 +1230,54 @@ function optimizeUnchecksRepeatedAccessesAndTheVerifierAcceptsThem(host: Host): 
       assertEqUsize(verify(r).errors.length, 0, "and the verifier still accepts it");
     },
   );
+}
+
+// ---------------------------------------------------------------- range facts (T6, docs/mir.md v2.6)
+
+// `a = [1,2,3,4]; i = 0; while (i <op> 4) { body; i = i + 1 }` over locals 0 = a, 1 = i, 2 = c, 3 = d.
+function rangeLoop(op: BinOp, body: Instr[]): MFunction {
+  return fn("f", 0, [lr("a"), lu("i"), lb("c"), li("d")], [
+    bk([IArrayNew(0, false, [OInt(1), OInt(2), OInt(3), OInt(4)]), ICopy(1, OUsize(0))], TGoto(1)),
+    bk([IBinary(2, op, OLocal(1), OUsize(4))], TBranch(OLocal(2), 2, 3)),
+    bk(body.concat([IBinary(1, OpAdd, OLocal(1), OUsize(1))]), TGoto(1)),
+    bk([IRelease(0)], TReturn(None)),
+  ]);
+}
+
+@Test
+function aLoopBelowTheLengthOfALiteralArrayGetsUncheckedAccesses(): void {
+  const f = rangeLoop(OpLt, [IArrayGet(3, OLocal(0), OLocal(1)), IArraySet(0, OLocal(1), OLocal(3))]);
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = uncheckAccesses(p, f);
+  assertEqUsize(uncheckedCount(g), 2, "the load and the store are justified by the interval of i");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([g]), g)), 2, "doing it again changes nothing");
+}
+
+@Test
+function aLoopThatIsOneTooLongKeepsTheChecks(): void {
+  const f = rangeLoop(OpLe, [IArrayGet(3, OLocal(0), OLocal(1))]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([f]), f)), 0, "i <= 4 reaches the length");
+}
+
+@Test
+function aPushInTheLoopBodyKeepsTheChecks(): void {
+  const f = rangeLoop(OpLt, [IArrayPush(0, OInt(5)), IArrayGet(3, OLocal(0), OLocal(1))]);
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([f]), f)), 0, "the length is not known after a push");
+}
+
+@Test
+function anArrayParameterHasNoShapeFact(): void {
+  const f = MFunction {
+    name: "f", paramCount: 1, paramOwned: [false], inout: false,
+    locals: [lr("a"), lu("i"), lb("c"), li("d")], ret: MVoid,
+    blocks: [
+      bk([ICopy(1, OUsize(0))], TGoto(1)),
+      bk([IBinary(2, OpLt, OLocal(1), OUsize(4))], TBranch(OLocal(2), 2, 3)),
+      bk([IArrayGet(3, OLocal(0), OLocal(1)), IBinary(1, OpAdd, OLocal(1), OUsize(1))], TGoto(1)),
+      bk([], TReturn(None)),
+    ],
+  };
+  assertEqUsize(uncheckedCount(uncheckAccesses(prog([f]), f)), 0, "nothing says the parameter has four elements");
 }

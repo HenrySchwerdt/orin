@@ -1,0 +1,955 @@
+// Rule U1, second fact source: range facts (docs/mir.md v2.6, ADR-0038 lever 2, T6). `IArrayGetU(d, a, i)` / `IArraySetU(a, i, v)`
+// omit the kind check and the bounds check. Besides the dominating access of unchecked.or, this module proves them with an interval
+// analysis that is independent of the optimiser and of the ownership state: a forward dataflow over the CFG of one function.
+//
+// The abstract state at a program point is, per local, an interval [lo, hi] (two parallel int arrays):
+//   a usize / int local   the interval of its value; -BIG as lo and BIG as hi mean "no bound" (usize: lo >= 0 always);
+//   an array local        the interval of its LENGTH, set by IArrayNew with n elements to [n, n] and moved by IMove. A local
+//                         with lo >= 0 is KNOWN to hold an array (every path to the point built it with IArrayNew); every
+//                         other reference local has the unknown interval [-BIG, BIG] (a parameter, a call result, a
+//                         field ...: parameters have no shape fact).
+// Transfer (`RStep.step`): copy / move / forward copy the interval; add and sub transfer it, with the overflow and underflow traps
+// of the runtime leaving no state (a sub that always underflows ends the path); anything else that defines a local sets it
+// to "unknown". An array fact is destroyed by every instruction that mentions the array other than a plain read (push, pop, extend,
+// take, put, a move, dup, release, a consuming constructor, a call or builtin that receives it as an owned or in/out argument ...)
+// and by every definition of the local. A call that receives the array in a BORROWED position keeps it: a borrowed parameter is
+// never mutated by the callee (the ownership rules: only an Owned local is pushed to, popped, made unique), and the caller's own
+// live reference makes any other holder copy before writing (an in-place write needs rc == 1; docs/tcb.md, the argument behind
+// borrows). `TBranch` on a comparison (lt / le / gt / ge / eq / ne of two int or two usize operands) defined in the same block and
+// not disturbed since refines both operands on each edge; an edge whose refinement is empty is infeasible. States join by interval
+// hull; a block whose in-state changed more than WIDEN_AFTER times widens the bound that moved to the nearest constant of the
+// function beyond it (or to "no bound"); after the fixpoint one narrowing round recomputes every in-state from the predecessors'
+// exit states.
+//
+// An access is accepted when the state before it is live, the array local is known and lo(i) >= 0 and hi(i) < lo(length). Fail closed:
+// a block the analysis does not reach, or the rest of a block after a dead point, justifies nothing. Intervals are mathematical
+// integers (usize: unsigned); BIG = 2^60 keeps every sum of two bounds inside int, so the verifier's own arithmetic never traps.
+
+import { MProgram, MFunction, Operand, Instr, Terminator, dstOf, instrLocals, instrOperands, succCount, succAt, isWellFormedFunction } from "../mir";
+import { tyClass, CInt, CUsize, CBool, CRef } from "./wf";
+import { isLocal } from "./scan";
+import { Builtin } from "../hir";
+
+export const BIG: int = 1152921504606846976;
+const NEG: int = -1152921504606846976;
+
+// A block whose in-state changed this often is widened on its next change: the bound that moved goes to "no bound".
+const WIDEN_AFTER: usize = 2;
+
+// The classes of the locals of `f`.
+function classes(f: MFunction): int[] {
+  return f.locals.map(l => tyClass(l.ty));
+}
+
+// The lower bound of the unknown value of a local of class `c` (a usize is never negative).
+function floorOf(c: int): int {
+  return c == CUsize ? 0 : NEG;
+}
+
+// ---- bound arithmetic: NEG as a lower bound and BIG as an upper bound are infinite and absorb; every other result is clamped
+
+function addLo(a: int, b: int): int {
+  if (a <= NEG || b <= NEG) {
+    return NEG;
+  }
+  const s = a + b;
+  return s < NEG ? NEG : s > BIG ? BIG : s;
+}
+
+function addHi(a: int, b: int): int {
+  if (a >= BIG || b >= BIG) {
+    return BIG;
+  }
+  const s = a + b;
+  return s < NEG ? NEG : s > BIG ? BIG : s;
+}
+
+// lower bound of x - y from lo(x) and hi(y)
+function subLo(a: int, b: int): int {
+  if (a <= NEG || b >= BIG) {
+    return NEG;
+  }
+  const s = a - b;
+  return s < NEG ? NEG : s > BIG ? BIG : s;
+}
+
+// upper bound of x - y from hi(x) and lo(y)
+function subHi(a: int, b: int): int {
+  if (a >= BIG || b <= NEG) {
+    return BIG;
+  }
+  const s = a - b;
+  return s < NEG ? NEG : s > BIG ? BIG : s;
+}
+
+// ---- the state at one point, transferred through one block
+
+// One run through a block: the state (`lo`, `hi`), whether the point is dead (no execution reaches it), the comparison that
+// defined the last bool local (for the branch that ends the block) and, after `edge`, the exit state (`elo`, `ehi`).
+export class RStep {
+  prog: MProgram;
+  f: MFunction;
+  cls: int[];
+  lo: int[];
+  hi: int[];
+  dead: bool;
+  cmpOn: bool;
+  cmpC: usize;
+  cmpOp: int;
+  cmpX: Operand;
+  cmpY: Operand;
+  rl: int;
+  rh: int;
+  elo: int[];
+  ehi: int[];
+
+  constructor(prog: MProgram, f: MFunction, cls: int[]) {
+    this.prog = prog;
+    this.f = f;
+    this.cls = cls;
+    this.lo = [];
+    this.hi = [];
+    this.dead = false;
+    this.cmpOn = false;
+    this.cmpC = 0;
+    this.cmpOp = 0;
+    this.cmpX = OInt(0);
+    this.cmpY = OInt(0);
+    this.rl = NEG;
+    this.rh = BIG;
+    this.elo = [];
+    this.ehi = [];
+  }
+
+  // Start a run from the in-state (`lo`, `hi`).
+  load(lo: int[], hi: int[]): void {
+    this.lo = lo;
+    this.hi = hi;
+    this.dead = false;
+    this.cmpOn = false;
+  }
+
+  private opLo(o: Operand): int {
+    return match (o) {
+      OLocal(l) => this.lo[l],
+      OInt(n) => n > NEG && n < BIG ? n : NEG,
+      OUsize(n) => n >= 0 && n < BIG ? n : 0,
+      _ => NEG,
+    };
+  }
+
+  private opHi(o: Operand): int {
+    return match (o) {
+      OLocal(l) => this.hi[l],
+      OInt(n) => n > NEG && n < BIG ? n : BIG,
+      OUsize(n) => n >= 0 && n < BIG ? n : BIG,
+      _ => BIG,
+    };
+  }
+
+  private opCls(o: Operand): int {
+    return match (o) {
+      OLocal(l) => this.cls[l],
+      OInt(_) => CInt,
+      OUsize(_) => CUsize,
+      _ => -1,
+    };
+  }
+
+  // The local becomes "unknown" (a usize is still never negative).
+  private forget(l: usize): void {
+    this.lo[l] = floorOf(this.cls[l]);
+    this.hi[l] = BIG;
+  }
+
+  // Assigns the interval [lo, hi] to the defined local `d`, normalised: a usize is at least 0, an empty interval is "unknown".
+  private assign(d: usize, lo: int, hi: int): void {
+    const c = this.cls[d];
+    let l = lo;
+    if (c == CUsize && l < 0) {
+      l = 0;
+    }
+    if (l > hi) {
+      this.forget(d);
+      return;
+    }
+    this.lo[d] = l;
+    this.hi[d] = hi;
+  }
+
+  // The array local `a` is known to be an array.
+  private known(a: usize): bool {
+    return this.cls[a] == CRef && this.lo[a] >= 0;
+  }
+
+  // Does `ins` leave the length (and the kind) of the array held by local `a` as it was? Only a plain read, a store of an
+  // element, `makeunique`, a forward or the length itself do, and a call that gets the array in a borrowed position.
+  private keeps(ins: Instr, a: usize): bool {
+    return match (ins) {
+      IArrayGet(d, x, i) => d != a && isLocal(x, a) && !isLocal(i, a),
+      IArrayGetU(d, x, i) => d != a && isLocal(x, a) && !isLocal(i, a),
+      IArraySet(x, i, v) => x == a && !isLocal(i, a) && !isLocal(v, a),
+      IArraySetU(x, i, v) => x == a && !isLocal(i, a) && !isLocal(v, a),
+      IMakeUnique(x) => x == a,
+      IForward(d, s, o, k) => d != a && s != a && isLocal(o, a) && !isLocal(k, a),
+      IBuiltin(dst, b, args) => this.lengthOf(dst, b, args, a),
+      ICall(dst, g, args) => this.borrowedCall(dst, g, args, a),
+      _ => false,
+    };
+  }
+
+  // `dst = arr.length(a)`
+  private lengthOf(dst: Option<usize>, b: Builtin, args: Operand[], a: usize): bool {
+    const isLen = match (b) {
+      BArrLength => true,
+      _ => false,
+    };
+    const dOk = match (dst) {
+      Some(d) => d != a,
+      None => true,
+    };
+    return isLen && dOk && args.length == 1 && isLocal(args[0], a);
+  }
+
+  // A call of a known function that gets `a` only in borrowed positions (not as the in/out receiver) and does not define it.
+  private borrowedCall(dst: Option<usize>, g: usize, args: Operand[], a: usize): bool {
+    if (g >= this.prog.functions.length) {
+      return false;
+    }
+    const callee = this.prog.functions[g];
+    const dOk = match (dst) {
+      Some(d) => d != a,
+      None => true,
+    };
+    if (!dOk || args.length != callee.paramOwned.length) {
+      return false;
+    }
+    let j: usize = 0;
+    while (j < args.length) {
+      if (isLocal(args[j], a) && (callee.paramOwned[j] || callee.inout && j == 0)) {
+        return false;
+      }
+      j += 1;
+    }
+    return true;
+  }
+
+  // `d = x + y` or `d = x - y` for int / usize operands: the result interval in (`rl`, `rh`); a path that always traps ends the run.
+  private arith(c: int, sub: bool, x: Operand, y: Operand): void {
+    if (this.opCls(x) != c || this.opCls(y) != c) {
+      return;
+    }
+    const xl = this.opLo(x);
+    const xh = this.opHi(x);
+    const yl = this.opLo(y);
+    const yh = this.opHi(y);
+    if (!sub) {
+      this.rl = addLo(xl, yl);
+      this.rh = addHi(xh, yh);
+      return;
+    }
+    this.rl = subLo(xl, yh);
+    this.rh = subHi(xh, yl);
+    if (c == CUsize) {
+      // x - y traps when x < y: only the results >= 0 continue
+      if (this.rh < 0) {
+        this.dead = true;
+      }
+      if (this.rl < 0) {
+        this.rl = 0;
+      }
+    }
+  }
+
+  // Is this instruction a comparison of two ints or two usizes that a following branch can use? Records it.
+  private noteCompare(ins: Instr): void {
+    match (ins) {
+      IBinary(d, op, x, y) => {
+        if (this.cls[d] != CBool) {
+          return;
+        }
+        const c = this.opCls(x);
+        if ((c != CInt && c != CUsize) || this.opCls(y) != c) {
+          return;
+        }
+        const k = match (op) {
+          OpLt => 0,
+          OpLe => 1,
+          OpGt => 2,
+          OpGe => 3,
+          OpEq => 4,
+          OpNe => 5,
+          _ => -1,
+        };
+        if (k >= 0) {
+          this.cmpOn = true;
+          this.cmpC = d;
+          this.cmpOp = k;
+          this.cmpX = x;
+          this.cmpY = y;
+        }
+      },
+      _ => {},
+    }
+  }
+
+  // A local the recorded comparison depends on is defined: the comparison is forgotten.
+  private disturb(l: usize): void {
+    if (this.cmpOn && (l == this.cmpC || isLocal(this.cmpX, l) || isLocal(this.cmpY, l))) {
+      this.cmpOn = false;
+    }
+  }
+
+  // One instruction.
+  step(ins: Instr): void {
+    if (this.dead) {
+      return;
+    }
+    this.rl = NEG;
+    this.rh = BIG;
+    match (ins) {
+      ICopy(_, o) => {
+        this.rl = this.opLo(o);
+        this.rh = this.opHi(o);
+      },
+      IMove(_, s) => {
+        this.rl = this.lo[s];
+        this.rh = this.hi[s];
+      },
+      IForward(_, s, _, _) => {
+        this.rl = this.lo[s];
+        this.rh = this.hi[s];
+      },
+      IArrayNew(_, _, es) => {
+        this.rl = es.length.toInt();
+        this.rh = this.rl;
+      },
+      IBuiltin(_, b, args) => {
+        match (b) {
+          BArrLength => {
+            if (args.length == 1) {
+              match (args[0]) {
+                OLocal(a) => {
+                  if (this.known(a)) {
+                    this.rl = this.lo[a];
+                    this.rh = this.hi[a];
+                  } else {
+                    this.rl = 0;
+                  }
+                },
+                _ => {},
+              }
+            }
+          },
+          _ => {},
+        }
+      },
+      IBinary(d, op, x, y) => {
+        const c = this.cls[d];
+        if (c == CInt || c == CUsize) {
+          match (op) {
+            OpAdd => {
+              this.arith(c, false, x, y);
+            },
+            OpSub => {
+              this.arith(c, true, x, y);
+            },
+            _ => {},
+          }
+        }
+      },
+      _ => {},
+    }
+    if (this.dead) {
+      return;
+    }
+    // arrays: every mention that is not a plain read destroys the fact
+    for (const l of instrLocals(ins)) {
+      if (this.known(l) && !this.keeps(ins, l)) {
+        this.lo[l] = NEG;
+        this.hi[l] = BIG;
+      }
+    }
+    // the in/out receiver of a call is redefined by it
+    match (ins) {
+      ICall(_, g, args) => {
+        if (g < this.prog.functions.length && this.prog.functions[g].inout && args.length > 0) {
+          match (args[0]) {
+            OLocal(x) => {
+              this.forget(x);
+              this.disturb(x);
+            },
+            _ => {},
+          }
+        }
+      },
+      _ => {},
+    }
+    match (dstOf(ins)) {
+      Some(d) => {
+        this.disturb(d);
+        this.assign(d, this.rl, this.rh);
+      },
+      None => {},
+    }
+    this.noteCompare(ins);
+  }
+
+  // ---- branch refinement
+
+  // hi(o) <= v
+  private capHi(o: Operand, v: int): void {
+    match (o) {
+      OLocal(l) => {
+        const w = v < NEG ? NEG : v;
+        if (w < this.hi[l]) {
+          this.hi[l] = w;
+          if (this.lo[l] > w) {
+            this.dead = true;
+          }
+        }
+      },
+      _ => {},
+    }
+  }
+
+  // lo(o) >= v
+  private raiseLo(o: Operand, v: int): void {
+    match (o) {
+      OLocal(l) => {
+        const w = v > BIG ? BIG : v;
+        if (w > this.lo[l]) {
+          this.lo[l] = w;
+          if (w > this.hi[l]) {
+            this.dead = true;
+          }
+        }
+      },
+      _ => {},
+    }
+  }
+
+  // a < b
+  private less(a: Operand, b: Operand): void {
+    const bh = this.opHi(b);
+    const al = this.opLo(a);
+    if (bh < BIG) {
+      this.capHi(a, bh - 1);
+    }
+    if (al > NEG) {
+      this.raiseLo(b, al + 1);
+    }
+  }
+
+  // a <= b
+  private atMost(a: Operand, b: Operand): void {
+    const bh = this.opHi(b);
+    const al = this.opLo(a);
+    if (bh < BIG) {
+      this.capHi(a, bh);
+    }
+    if (al > NEG) {
+      this.raiseLo(b, al);
+    }
+  }
+
+  // a == b
+  private same(a: Operand, b: Operand): void {
+    this.atMost(a, b);
+    this.atMost(b, a);
+  }
+
+  // The recorded comparison holds (`truth`) or does not hold on the edge. Operators: 0 lt, 1 le, 2 gt, 3 ge, 4 eq, 5 ne.
+  private refine(truth: bool): void {
+    const x = this.cmpX;
+    const y = this.cmpY;
+    const op = this.cmpOp;
+    if (op == 0) {
+      if (truth) {
+        this.less(x, y);
+      } else {
+        this.atMost(y, x);
+      }
+    } else if (op == 1) {
+      if (truth) {
+        this.atMost(x, y);
+      } else {
+        this.less(y, x);
+      }
+    } else if (op == 2) {
+      if (truth) {
+        this.less(y, x);
+      } else {
+        this.atMost(x, y);
+      }
+    } else if (op == 3) {
+      if (truth) {
+        this.atMost(y, x);
+      } else {
+        this.less(x, y);
+      }
+    } else if (op == 4) {
+      if (truth) {
+        this.same(x, y);
+      }
+    } else if (!truth) {
+      this.same(x, y);
+    }
+  }
+
+  // The exit state along edge `k` of terminator `t` in (`elo`, `ehi`); false when no execution takes the edge. The run's own
+  // state is unchanged.
+  edge(t: Terminator, k: usize): bool {
+    if (this.dead) {
+      return false;
+    }
+    const bl = this.lo;
+    const bh = this.hi;
+    match (t) {
+      TBranch(cnd, _, _) => {
+        match (cnd) {
+          OLocal(c) => {
+            if (this.cmpOn && this.cmpC == c) {
+              this.refine(k == 0);
+            }
+          },
+          _ => {},
+        }
+      },
+      _ => {},
+    }
+    const live = !this.dead;
+    this.elo = this.lo;
+    this.ehi = this.hi;
+    this.lo = bl;
+    this.hi = bh;
+    this.dead = false;
+    return live;
+  }
+
+  // Rule U1: the unchecked access of `a[i]` at this point is justified by the interval facts.
+  accessOk(ins: Instr): bool {
+    if (this.dead) {
+      return false;
+    }
+    return match (ins) {
+      IArrayGet(_, a, i) => this.inRange(a, i),
+      IArrayGetU(_, a, i) => this.inRange(a, i),
+      IArraySet(x, i, _) => this.inRange(OLocal(x), i),
+      IArraySetU(x, i, _) => this.inRange(OLocal(x), i),
+      _ => false,
+    };
+  }
+
+  private inRange(a: Operand, i: Operand): bool {
+    match (a) {
+      OLocal(l) => {
+        const il = this.opLo(i);
+        const ih = this.opHi(i);
+        return this.known(l) && il >= 0 && ih < BIG && ih < this.lo[l];
+      },
+      _ => {
+        return false;
+      },
+    }
+  }
+}
+
+// ---- the fixpoint
+
+// The unknown state of a function: every local at its widest interval.
+function unknown(cls: int[], lower: bool): int[] {
+  let out: int[] = [];
+  for (const c of cls) {
+    out.push(lower ? floorOf(c) : BIG);
+  }
+  return out;
+}
+
+// The in-states of `n` blocks: the unknown state for the entry block, nothing for the others.
+function entryIn(cls: int[], n: usize, lower: bool): int[][] {
+  let out: int[][] = [unknown(cls, lower)];
+  let b: usize = 1;
+  while (b < n) {
+    out.push([]);
+    b += 1;
+  }
+  return out;
+}
+
+// `n` flags, the first one `first`, the others false (the entry block is reached and queued).
+function entryFlags(n: usize, first: bool): bool[] {
+  let out: bool[] = [first];
+  let b: usize = 1;
+  while (b < n) {
+    out.push(false);
+    b += 1;
+  }
+  return out;
+}
+
+function zeros(n: usize): usize[] {
+  let out: usize[] = [];
+  let b: usize = 0;
+  while (b < n) {
+    out.push(0);
+    b += 1;
+  }
+  return out;
+}
+
+
+// The widening thresholds of a function: the constants it uses (an operand, the length of an array literal) and their neighbours.
+// A bound that keeps moving is widened to the nearest threshold beyond it, not straight to "no bound": the loop bounds of a
+// function are exactly such constants, so `while (i < 5)` keeps its head state [0, 5] (and an inner loop does not lose the bound
+// of the outer index). Every threshold is just a number a bound is rounded up (or down) to, which is always sound.
+function thresholds(f: MFunction): int[] {
+  let out: int[] = [0, 1];
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      let ns: int[] = [];
+      for (const o of instrOperands(ins)) {
+        match (o) {
+          OInt(n) => {
+            ns.push(n);
+          },
+          OUsize(n) => {
+            ns.push(n);
+          },
+          _ => {},
+        }
+      }
+      match (ins) {
+        IArrayNew(_, _, es) => {
+          ns.push(es.length.toInt());
+        },
+        _ => {},
+      }
+      for (const n of ns) {
+        if (n > -1099511627776 && n < 1099511627776) {
+          for (const v of [n - 1, n, n + 1]) {
+            if (!out.includes(v)) {
+              out.push(v);
+            }
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// The interval analysis of one well-formed function: the in-state of every block (`loIn`, `hiIn`, valid while `reached`).
+export class RangeFx {
+  private prog: MProgram;
+  private f: MFunction;
+  private cls: int[];
+  private thr: int[];
+  private loIn: int[][];
+  private hiIn: int[][];
+  private reached: bool[];
+  private hits: usize[];
+  private work: usize[];
+  private queued: bool[];
+
+  constructor(prog: MProgram, f: MFunction) {
+    this.prog = prog;
+    this.f = f;
+    this.cls = classes(f);
+    this.thr = thresholds(f);
+    this.loIn = entryIn(classes(f), f.blocks.length, true);
+    this.hiIn = entryIn(classes(f), f.blocks.length, false);
+    this.reached = entryFlags(f.blocks.length, true);
+    this.hits = zeros(f.blocks.length);
+    this.work = [0];
+    this.queued = entryFlags(f.blocks.length, true);
+  }
+
+  // The widened upper bound for a bound that moved up to `v`: the nearest threshold at or above it, else "no bound".
+  private widenHi(v: int): int {
+    let best = BIG;
+    for (const t of this.thr) {
+      if (t >= v && t < best) {
+        best = t;
+      }
+    }
+    return best;
+  }
+
+  // The widened lower bound for a bound that moved down to `v` (`floor`: the bound of an unknown value of the local).
+  private widenLo(v: int, floor: int): int {
+    let best = floor;
+    for (const t of this.thr) {
+      if (t <= v && t > best) {
+        best = t;
+      }
+    }
+    return best;
+  }
+
+  // Joins the exit state (`lo`, `hi`) into the in-state of the reached block `s`; true when that changed it. From the third change
+  // of a block on, a bound that moves is widened (to a threshold, `widenHi`, `widenLo`).
+  private joinInto(s: usize, lo: int[], hi: int[]): bool {
+    const widen = this.hits[s] >= WIDEN_AFTER;
+    let changed = false;
+    let l: usize = 0;
+    while (l < lo.length) {
+      if (lo[l] < this.loIn[s][l]) {
+        this.loIn[s][l] = widen ? this.widenLo(lo[l], floorOf(this.cls[l])) : lo[l];
+        changed = true;
+      }
+      if (hi[l] > this.hiIn[s][l]) {
+        this.hiIn[s][l] = widen ? this.widenHi(hi[l]) : hi[l];
+        changed = true;
+      }
+      l += 1;
+    }
+    if (changed) {
+      this.hits[s] += 1;
+    }
+    return changed;
+  }
+
+  // Iterates to the fixpoint.
+  run(): void {
+    let t = new RStep(this.prog, this.f, this.cls);
+    while (this.work.length > 0) {
+      const b = this.work.pop().unwrap();
+      this.queued[b] = false;
+      t.load(this.loIn[b], this.hiIn[b]);
+      for (const ins of this.f.blocks[b].instrs) {
+        t.step(ins);
+      }
+      const term = this.f.blocks[b].term;
+      let k: usize = 0;
+      while (k < succCount(term)) {
+        const s = succAt(term, k);
+        if (t.edge(term, k)) {
+          if (!this.reached[s]) {
+            this.reached[s] = true;
+            this.loIn[s] = t.elo;
+            this.hiIn[s] = t.ehi;
+            this.queued[s] = true;
+            this.work.push(s);
+          } else if (this.joinInto(s, t.elo, t.ehi) && !this.queued[s]) {
+            this.queued[s] = true;
+            this.work.push(s);
+          }
+        }
+        k += 1;
+      }
+    }
+  }
+
+  // One narrowing round: in block order, every in-state is recomputed from the exit states of its predecessors (those already
+  // recomputed in this round, and the entry state for block 0) with the plain hull. Every in-state before and after is an
+  // over-approximation of the executions that reach the block, so the result is sound whatever the widening lost; a block that no
+  // feasible edge reaches any more becomes unreached.
+  narrow(): void {
+    const n = this.f.blocks.length;
+    let preds: usize[][] = [];
+    let b: usize = 0;
+    while (b < n) {
+      preds.push([]);
+      b += 1;
+    }
+    b = 0;
+    while (b < n) {
+      if (this.reached[b]) {
+        const term = this.f.blocks[b].term;
+        let k: usize = 0;
+        while (k < succCount(term)) {
+          const s = succAt(term, k);
+          if (!preds[s].includes(b)) {
+            preds[s].push(b);
+          }
+          k += 1;
+        }
+      }
+      b += 1;
+    }
+    let t = new RStep(this.prog, this.f, this.cls);
+    b = 0;
+    while (b < n) {
+      if (this.reached[b]) {
+        let have = b == 0;
+        let nlo: int[] = b == 0 ? unknown(this.cls, true) : [];
+        let nhi: int[] = b == 0 ? unknown(this.cls, false) : [];
+        for (const p of preds[b]) {
+          if (this.reached[p]) {
+            t.load(this.loIn[p], this.hiIn[p]);
+            for (const ins of this.f.blocks[p].instrs) {
+              t.step(ins);
+            }
+            const term = this.f.blocks[p].term;
+            let k: usize = 0;
+            while (k < succCount(term)) {
+              let live = false;
+              if (succAt(term, k) == b) {
+                live = t.edge(term, k);
+              }
+              if (live) {
+                if (!have) {
+                  have = true;
+                  nlo = t.elo;
+                  nhi = t.ehi;
+                } else {
+                  let l: usize = 0;
+                  while (l < nlo.length) {
+                    if (t.elo[l] < nlo[l]) {
+                      nlo[l] = t.elo[l];
+                    }
+                    if (t.ehi[l] > nhi[l]) {
+                      nhi[l] = t.ehi[l];
+                    }
+                    l += 1;
+                  }
+                }
+              }
+              k += 1;
+            }
+          }
+        }
+        if (have) {
+          this.loIn[b] = nlo;
+          this.hiIn[b] = nhi;
+        } else {
+          this.reached[b] = false;
+        }
+      }
+      b += 1;
+    }
+  }
+
+  // For every instruction of every block: is it an array access that the interval facts justify?
+  accepted(): bool[][] {
+    let t = new RStep(this.prog, this.f, this.cls);
+    let out: bool[][] = [];
+    let b: usize = 0;
+    while (b < this.f.blocks.length) {
+      let row: bool[] = [];
+      const instrs = this.f.blocks[b].instrs;
+      if (this.reached[b]) {
+        t.load(this.loIn[b], this.hiIn[b]);
+      }
+      let i: usize = 0;
+      while (i < instrs.length) {
+        row.push(this.reached[b] && t.accessOk(instrs[i]));
+        if (this.reached[b]) {
+          t.step(instrs[i]);
+        }
+        i += 1;
+      }
+      out.push(row);
+      b += 1;
+    }
+    return out;
+  }
+}
+
+// Is the operand a local that may hold a shaped array?
+const MAX_CELLS: usize = 4000;
+
+function shapedOperand(shaped: bool[], o: Operand): bool {
+  match (o) {
+    OLocal(l) => {
+      return shaped[l];
+    },
+    _ => {
+      return false;
+    },
+  }
+}
+
+// Is there anything for the analysis to prove? An access of a local that an `arraynew` with at least one element defines here, directly
+// or through moves (a superset of the accesses the analysis can accept: it accepts only arrays of known shape).
+function worth(f: MFunction): bool {
+  // A function whose state table (locals x blocks) is large is not analysed: the cost of the fixpoint grows with that product, and
+  // refusing is always sound (nothing is then justified by intervals).
+  if (f.locals.length * f.blocks.length > MAX_CELLS) {
+    return false;
+  }
+  let shaped: bool[] = [];
+  for (const l of f.locals) {
+    shaped.push(false);
+  }
+  let any = false;
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IArrayNew(d, _, es) => {
+          if (es.length > 0) {
+            shaped[d] = true;
+            any = true;
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  if (!any) {
+    return false;
+  }
+  let round: usize = 0;
+  while (round < 3) {
+    for (const blk of f.blocks) {
+      for (const ins of blk.instrs) {
+        match (ins) {
+          IMove(d, s) => {
+            if (shaped[s]) {
+              shaped[d] = true;
+            }
+          },
+          _ => {},
+        }
+      }
+    }
+    round += 1;
+  }
+  for (const blk of f.blocks) {
+    for (const ins of blk.instrs) {
+      match (ins) {
+        IArrayGet(_, a, _) => {
+          if (shapedOperand(shaped, a)) {
+            return true;
+          }
+        },
+        IArrayGetU(_, a, _) => {
+          if (shapedOperand(shaped, a)) {
+            return true;
+          }
+        },
+        IArraySet(a, _, _) => {
+          if (shaped[a]) {
+            return true;
+          }
+        },
+        IArraySetU(a, _, _) => {
+          if (shaped[a]) {
+            return true;
+          }
+        },
+        _ => {},
+      }
+    }
+  }
+  return false;
+}
+
+// The accesses of `f` that the interval facts justify: `result[b][i]` for instruction `i` of block `b`; empty when the function
+// has nothing to prove (no array built here, or no access).
+@Requires(isWellFormedFunction(p, f))
+export function rangeAccepted(p: MProgram, f: MFunction): bool[][] {
+  if (!worth(f)) {
+    return [];
+  }
+  let fx = new RangeFx(p, f);
+  fx.run();
+  fx.narrow();
+  return fx.accepted();
+}
+
+// Instruction `i` of block `b` is justified by `table` (a result of `rangeAccepted`).
+export function rangeOk(table: bool[][], b: usize, i: usize): bool {
+  return b < table.length && i < table[b].length && table[b][i];
+}
