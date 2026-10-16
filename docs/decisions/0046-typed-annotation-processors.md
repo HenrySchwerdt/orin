@@ -84,6 +84,11 @@ export class Users {
   OSIG gets `ANNOTATED_WITH` edges (declaration -> annotation type, with the argument values) and MCP `symbols` lists
   them. This makes metadata-only annotations (`@Description`, `@Permission`, `@Example`) useful on their own.
 
+* **As built in S1 (2026-10-16).** `Annotation` is exempt from E0447 because the compiler's own AST declares a type
+  of that name; `@Annotation(...)` is decided by the parser before name resolution, so there is no ambiguity. The
+  `__g` check is in the parser (`parseIdent`), so S4 builds generated AST directly and `orin expand` output that
+  contains `__g` names is for review, not for re-parsing. A `@Name` on a statement stays E0408 (parse time).
+
 ## 2. Processors
 
 ```ts
