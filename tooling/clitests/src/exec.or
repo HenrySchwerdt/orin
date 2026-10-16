@@ -1,0 +1,95 @@
+// Parallel execution of shell command lists. One std:task worker per slot takes jobs from a channel and runs the commands
+// of each job in order through `shellTimeout`, so every command has its own native deadline (a timed-out command kills
+// its process group). A worker only needs the process grant (a task body cannot hold two grants), so it returns exit
+// statuses only; the files the commands wrote are read afterwards by the main task. The outcomes come back in the order
+// of the jobs, whatever the number of workers (the `ThreadPoolExecutor.map` of the Python scripts).
+
+import { ProcessGrant } from "std:process";
+import { shellTimeout } from "std:io";
+import { scopeProcess, spawnProcess, channel, TaskHandle } from "std:task";
+
+// `cmds[k]` runs with the deadline `timeouts[k]` seconds. With `stop`, the first command that does not exit 0 ends the job
+// (a build pipeline: compile, link, run); without it every command runs (independent runs whose exit status is data).
+export type Job = { id: usize; cmds: string[]; timeouts: int[]; stop: bool; };
+
+// Exit statuses: 0..255, -2 timeout, -1 killed by a signal or not started. `NOT_RUN` for a command that was not executed.
+export const NOT_RUN: int = 100000;
+
+export type Outcome = { id: usize; rcs: int[]; };
+
+export const MAX_WORKERS: usize = 128;
+
+export function runJob(p: ProcessGrant, j: Job): Outcome {
+  let rcs: int[] = [];
+  let stopped = false;
+  let k: usize = 0;
+  while (k < j.cmds.length) {
+    if (stopped) {
+      rcs.push(NOT_RUN);
+    } else {
+      const rc = shellTimeout(p, j.cmds[k], j.timeouts[k]);
+      rcs.push(rc);
+      if (rc != 0 && j.stop) {
+        stopped = true;
+      }
+    }
+    k += 1;
+  }
+  return Outcome { id: j.id, rcs: rcs };
+}
+
+// Runs every job with up to `workers` at the same time and returns the outcomes indexed by job id (`jobs[i].id == i`).
+export function runAll(proc: ProcessGrant, jobs: Job[], workers: usize): Outcome[] {
+  let n = workers;
+  if (n > MAX_WORKERS) {
+    n = MAX_WORKERS;
+  }
+  if (n > jobs.length) {
+    n = jobs.length;
+  }
+  if (n < 1) {
+    n = 1;
+  }
+  const unordered = scopeProcess(proc, (s, g) => {
+    // all jobs are queued before the workers start: the channel never blocks the sender
+    const ch = channel<Job>(jobs.length + 1);
+    for (const j of jobs) {
+      ch.tx.send(j);
+    }
+    ch.tx.close();
+    let handles: TaskHandle<Outcome[]>[] = [];
+    let w: usize = 0;
+    while (w < n) {
+      const rx = ch.rx;
+      handles.push(spawnProcess(s, g, p => {
+        let done: Outcome[] = [];
+        while (true) {
+          const next = rx.recv();
+          if (next.isNone()) {
+            break;
+          }
+          done.push(runJob(p, next.unwrap()));
+        }
+        return done;
+      }));
+      w += 1;
+    }
+    let all: Outcome[] = [];
+    for (const h of handles) {
+      for (const o of h.join()) {
+        all.push(o);
+      }
+    }
+    return all;
+  });
+  let ordered: Outcome[] = [];
+  let i: usize = 0;
+  while (i < jobs.length) {
+    ordered.push(Outcome { id: i, rcs: [] });
+    i += 1;
+  }
+  for (const o of unordered) {
+    ordered[o.id] = o;
+  }
+  return ordered;
+}

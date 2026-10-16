@@ -1,0 +1,631 @@
+// The OSIG tests (ADR-0023, docs/osig.md): the Orin port of tools/test_osig.py. `orin graph` and `orin diff` of the
+// compiler under test, checked against the golden snapshots tests/osig/*.graph.json and against the structural
+// expectations of the Python script, in the same order, with the same `FAIL: <what>` messages.
+//
+//   1. golden: `orin graph tests/osig/demo` equals tests/osig/demo.graph.json (rewritten with --update);
+//   2. determinism: byte-identical runs, from another working directory, from a copy, no absolute path;
+//   3. evidence classes: closures and function values are UNKNOWN or MAY, never MUST; interface calls;
+//   4. snapshot files: `orin diff` reads `orin graph` output and refuses a tampered one;
+//   5. phase-1 acceptance: a rename, an API signature change and a new call path, text and JSON reports;
+//   6. the HTML report is one self-contained file;
+//   7. primitive I/O edges (ADR-0027);  8. task events (ADR-0017 stage 0);  9. user annotations (ADR-0046 S2).
+
+import { FsGrant, writeFile } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { shell } from "std:io";
+import { Json, JNull, JNum, JArr, parse } from "std:json";
+import { shq, replaceAll, sortedStrs, reprStr } from "./text";
+import { reprList, reprList2, uniqueSorted, isSorted, isDistinct, containsAll, sameList, symmetricDiff, lastPart, head, tail } from "./strs";
+import { at, has, isNull, str, isStrEq, isIntEq, isBoolEq, items, strs, len, show } from "./jx";
+import { Ctx, Ran, readText } from "./ctx";
+
+function J(text: string): Json {
+  const r = parse(text);
+  return r.isOk() ? r.unwrap() : JNull;
+}
+
+function numOf(j: Json): int {
+  return match (j) {
+    JNum(x) => x,
+    _ => 0
+  };
+}
+
+function nodeOf(snap: Json, id: string): Json {
+  let found: Json = JNull;
+  for (const n of items(at(snap, ["nodes"]))) {
+    if (isStrEq(at(n, ["id"]), id)) {
+      found = n;
+    }
+  }
+  return found;
+}
+
+// The first edge of the given kind from `src` to `dst` (and `via`, unless it is None); JNull when there is none.
+function edgeVia(snap: Json, kind: string, src: string, dst: string, via: Option<string>): Json {
+  for (const e of items(at(snap, ["edges"]))) {
+    if (isStrEq(at(e, ["kind"]), kind) && isStrEq(at(e, ["src"]), src) && isStrEq(at(e, ["dst"]), dst)
+        && (via.isNone() || isStrEq(at(e, ["via"]), via.unwrap()))) {
+      return e;
+    }
+  }
+  return JNull;
+}
+
+function edge(snap: Json, kind: string, src: string, dst: string): Json {
+  return edgeVia(snap, kind, src, dst, None);
+}
+
+// `e and e["evidence"] == ev`
+function ev(e: Json, evidence: string): bool {
+  return !isNull(e) && isStrEq(at(e, ["evidence"]), evidence);
+}
+
+// `e and e["evidence"] == ev and e["via"] == via`
+function evVia(e: Json, evidence: string, via: string): bool {
+  return ev(e, evidence) && isStrEq(at(e, ["via"]), via);
+}
+
+function nodeIds(snap: Json): string[] {
+  let out: string[] = [];
+  for (const n of items(at(snap, ["nodes"]))) {
+    out.push(str(at(n, ["id"])));
+  }
+  return out;
+}
+
+// "last part of src|dst|evidence|via" of every edge of `kind`: the tuples of the PERFORMS_IO sets.
+function ioTuples(snap: Json): string[] {
+  let out: string[] = [];
+  for (const e of items(at(snap, ["edges"]))) {
+    if (isStrEq(at(e, ["kind"]), "PERFORMS_IO")) {
+      out.push(lastPart(str(at(e, ["src"])), "::") + "|" + str(at(e, ["dst"])) + "|" + str(at(e, ["evidence"])) + "|" + str(at(e, ["via"])));
+    }
+  }
+  return out;
+}
+
+function hasSrc(tuples: string[], src: string): bool {
+  for (const t of tuples) {
+    if (t.startsWith(src + "|")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The paths of a reach record as lists of node ids: `[[s["node"] for s in p["steps"]] for p in paths]`.
+function stepLists(paths: Json): string[][] {
+  let out: string[][] = [];
+  for (const p of items(paths)) {
+    let ids: string[] = [];
+    for (const s of items(at(p, ["steps"]))) {
+      ids.push(str(at(s, ["node"])));
+    }
+    out.push(ids);
+  }
+  return out;
+}
+
+function hasList(lists: string[][], want: string[]): bool {
+  for (const l of lists) {
+    if (sameList(l, want)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// `{k(x): x for x in xs}[key]`: the last element whose field `field` is `key` (JNull when none).
+function byField(xs: Json, field: string, key: string): Json {
+  let found: Json = JNull;
+  for (const x of items(xs)) {
+    if (isStrEq(at(x, [field]), key)) {
+      found = x;
+    }
+  }
+  return found;
+}
+
+function evidenceIn(paths: Json, allowed: string[]): bool {
+  for (const p of items(paths)) {
+    for (const s of items(at(p, ["steps"]))) {
+      if (!allowed.includes(str(at(s, ["evidence"])))) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function sh(proc: ProcessGrant, cmd: string): int {
+  return shell(proc, cmd);
+}
+
+// ---- 1. golden -------------------------------------------------------------------------------------------------
+
+function golden(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, update: bool): string {
+  const r = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/demo"]);
+  c.check(fs, r.rc == 0, "graph demo exits 0 (" + r.err + ")");
+  const goldenFile = c.root + "/tests/osig/demo.graph.json";
+  if (update) {
+    writeFile(fs, goldenFile, r.out);
+  }
+  c.check(fs, r.out == readText(fs, goldenFile),
+    "graph of the demo package equals tests/osig/demo.graph.json (run with --update after a deliberate change)");
+  const snap = J(r.out);
+  c.check(fs, isStrEq(at(snap, ["schema"]), "osig/0.4") && isStrEq(at(snap, ["package"]), "demo")
+    && str(at(snap, ["hash"])).startsWith("h62:"), "schema, package, hash");
+  return r.out;
+}
+
+// ---- 2. determinism --------------------------------------------------------------------------------------------
+
+// Returns the path of the file written by `graph -o`.
+function determinism(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, tmp: string, g1: string): string {
+  const demo = c.root + "/tests/osig/demo";
+  const r2 = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/demo"]);
+  c.check(fs, r2.out == g1, "two runs are byte-identical");
+  const otherCwd = tmp + "/elsewhere";
+  sh(proc, "mkdir -p " + shq(otherCwd));
+  const r3 = c.run(fs, proc, otherCwd, orin, ["graph", demo]);
+  c.check(fs, r3.out == g1, "same snapshot from another working directory (absolute package path)");
+  const copy = tmp + "/some/deep/copy-of-demo";
+  sh(proc, "mkdir -p " + shq(tmp + "/some/deep") + " && cp -R " + shq(demo) + " " + shq(copy));
+  const r4 = c.run(fs, proc, otherCwd, orin, ["graph", copy]);
+  c.check(fs, r4.out == g1, "same snapshot from a copy of the package at another path");
+  const r5 = c.run(fs, proc, otherCwd, orin, ["graph", copy + "/src/main.or"]);
+  c.check(fs, r5.out == g1, "same snapshot for the entry file inside the package");
+  c.check(fs, !g1.includes(c.root) && !r4.out.includes(tmp) && !g1.includes("/home/") && !r4.out.includes("/tmp/"),
+    "no absolute path in the snapshot");
+  const outFile = tmp + "/demo.json";
+  c.run(fs, proc, c.root, orin, ["graph", "tests/osig/demo", "-o", outFile]);
+  c.check(fs, readText(fs, outFile) == g1, "graph -o writes the same text");
+  return outFile;
+}
+
+// ---- 3. structure and evidence classes ----------------------------------------------------------------------------
+
+function structure(fs: FsGrant, c: Ctx, snap: Json): void {
+  const ids = nodeIds(snap);
+  c.check(fs, isSorted(ids), "nodes sorted by id");
+  let keys: string[] = [];
+  let kinds: string[] = [];
+  let ekinds: string[] = [];
+  for (const n of items(at(snap, ["nodes"]))) {
+    kinds.push(str(at(n, ["kind"])));
+  }
+  for (const e of items(at(snap, ["edges"]))) {
+    keys.push([str(at(e, ["kind"])), str(at(e, ["src"])), str(at(e, ["dst"])), str(at(e, ["evidence"])), str(at(e, ["via"]))].join("|"));
+    ekinds.push(str(at(e, ["kind"])));
+  }
+  c.check(fs, isSorted(keys) && isDistinct(keys), "edges sorted and unique");
+  c.check(fs, containsAll(kinds, ["Package", "Module", "Function", "Method", "Class", "Interface", "Field", "Contract", "Unknown"]),
+    "node kinds: " + reprList(uniqueSorted(kinds)));
+  c.check(fs, containsAll(ekinds, ["DEFINES", "IMPORTS", "CALLS", "IMPLEMENTS", "HAS_FIELD", "REFERENCES_TYPE", "HAS_CONTRACT"]),
+    "edge kinds: " + reprList(uniqueSorted(ekinds)));
+  let connected = true;
+  let classes = true;
+  let neverMust = true;
+  for (const e of items(at(snap, ["edges"]))) {
+    if (!ids.includes(str(at(e, ["src"]))) || !ids.includes(str(at(e, ["dst"])))) {
+      connected = false;
+    }
+    const evid = str(at(e, ["evidence"]));
+    if (evid != "MUST" && evid != "MAY" && evid != "UNKNOWN") {
+      classes = false;
+    }
+    const via = str(at(e, ["via"]));
+    if ((via == "value" || via == "indirect" || via == "impl") && evid == "MUST") {
+      neverMust = false;
+    }
+  }
+  c.check(fs, connected, "every edge connects existing nodes");
+  c.check(fs, classes, "evidence classes");
+  c.check(fs, neverMust, "function values, indirect calls and implementation targets are never MUST");
+
+  let e = edgeVia(snap, "CALLS", "demo:util::mapAll", "~unknown", None);
+  c.check(fs, ev(e, "UNKNOWN") && isStrEq(at(e, ["via"]), "indirect"), "call of a function parameter is UNKNOWN");
+  e = edge(snap, "CALLS", "demo:(root)::main", "~unknown");
+  c.check(fs, ev(e, "UNKNOWN"), "call of a closure value is UNKNOWN");
+  e = edgeVia(snap, "CALLS", "demo:(root)::main", "demo:(root)::double", Some("value"));
+  c.check(fs, ev(e, "MAY"), "a function used as a value is a MAY edge");
+  e = edge(snap, "CALLS", "demo:(root)::scale", "demo:(root)::double");
+  c.check(fs, ev(e, "MAY"), "a call inside a closure body is a MAY edge of the enclosing function");
+  e = edge(snap, "CALLS", "demo:shapes::describeFirst", "demo:shapes::Shape.area");
+  c.check(fs, evVia(e, "MUST", "virtual"), "call through an interface: the interface method (MUST)");
+  for (const impl of ["Circle", "Square"]) {
+    e = edge(snap, "CALLS", "demo:shapes::describeFirst", "demo:shapes::" + impl + ".area");
+    c.check(fs, evVia(e, "MAY", "impl"), "MAY edge to the implementation " + impl + ".area");
+  }
+  e = edge(snap, "CALLS", "demo:shapes::totalArea", "demo:shapes::Shape.area");
+  c.check(fs, ev(e, "MUST"), "call through a bounded type parameter reaches the interface method");
+  // generic classes (ADR-0026): one node per declaration, instantiations are not symbols
+  c.check(fs, isStrEq(at(nodeOf(snap, "demo:util::Stack"), ["sig"]), "class Stack<T>"),
+    "a generic class is one Class node with its type parameters");
+  c.check(fs, isStrEq(at(nodeOf(snap, "demo:shapes::Bag"), ["sig"]), "class Bag<T extends Shape>"),
+    "the bound is part of the class signature");
+  let instantiation = false;
+  for (const n of items(at(snap, ["nodes"]))) {
+    const id = str(at(n, ["id"]));
+    if (id.includes("<") && !isStrEq(at(n, ["kind"]), "Unknown") && id.includes("::") && !id.includes("(")) {
+      instantiation = true;
+    }
+  }
+  c.check(fs, !instantiation, "no node for an instantiation (Stack<int>, Stack<string>)");
+  c.check(fs, isStrEq(at(nodeOf(snap, "demo:util::Stack.push"), ["sig"]), "mut method push(x: T): void")
+    && isStrEq(at(nodeOf(snap, "demo:util::Stack.size"), ["sig"]), "method size(): usize"),
+    "inferred mutability of generic-class methods in the signature");
+  e = edge(snap, "CALLS", "demo:(root)::main", "demo:util::Stack.push");
+  c.check(fs, evVia(e, "MUST", "method"), "calls on both instantiations are one edge to the generic method");
+  c.check(fs, !isNull(edgeVia(snap, "CALLS", "demo:(root)::main", "demo:util::Stack", Some("constructor"))),
+    "new Stack<..>() is a constructor call of the class");
+  e = edge(snap, "CALLS", "demo:shapes::Bag.total", "demo:shapes::Shape.area");
+  c.check(fs, evVia(e, "MUST", "bound"), "call on a bounded class type parameter reaches the interface method");
+  e = edge(snap, "CALLS", "demo:shapes::Bag.total", "demo:shapes::Circle.area");
+  c.check(fs, evVia(e, "MAY", "impl"), "... and MAY edges to the implementations");
+  c.check(fs, !isNull(edge(snap, "REFERENCES_TYPE", "demo:shapes::Bag", "demo:shapes::Shape")), "the bound is a type reference of the class");
+  c.check(fs, !isNull(edge(snap, "IMPLEMENTS", "demo:shapes::Circle", "demo:shapes::Shape")), "IMPLEMENTS edge");
+  c.check(fs, !isNull(edge(snap, "IMPORTS", "demo:(root)", "demo:shapes")), "IMPORTS edge between modules");
+  c.check(fs, !isNull(edge(snap, "HAS_CONTRACT", "demo:ledger::Ledger.deposit", "demo:ledger::Ledger.deposit@requires#0")),
+    "HAS_CONTRACT edge");
+  c.check(fs, !isNull(edge(snap, "HAS_FIELD", "demo:shapes::Circle", "demo:shapes::Circle.radius")), "HAS_FIELD edge");
+  c.check(fs, !isNull(edge(snap, "REFERENCES_TYPE", "demo:(root)::main", "demo:ledger::Ledger")), "REFERENCES_TYPE edge");
+  c.check(fs, isBoolEq(at(nodeOf(snap, "demo:(root)::main"), ["entry"]), true)
+    && isBoolEq(at(nodeOf(snap, "demo:(root)::double"), ["entry"]), false), "entry points");
+  let spans = true;
+  for (const n of items(at(snap, ["nodes"]))) {
+    const k = str(at(n, ["kind"]));
+    if ((k == "Function" || k == "Class") && !(numOf(at(n, ["span", "line"])) > 0 && !str(at(n, ["span", "file"])).startsWith("/"))) {
+      spans = false;
+    }
+  }
+  c.check(fs, spans, "source spans with relative file names");
+}
+
+// ---- 4. snapshot files -------------------------------------------------------------------------------------------
+
+function snapshotFiles(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, tmp: string, g1: string, outFile: string): void {
+  let r = c.run(fs, proc, c.root, orin, ["diff", "--base", outFile, "--head", "tests/osig/demo"]);
+  c.check(fs, r.rc == 0 && r.out.includes("no differences"),
+    "a snapshot file equals its package (" + tail(r.out, 120) + r.err + ")");
+  const bad = tmp + "/tampered.json";
+  writeFile(fs, bad, replaceAll(g1, "\"sig\":\"function double(x: int): int\"", "\"sig\":\"function double(x: int): bool\""));
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", bad, "--head", "tests/osig/demo"]);
+  c.check(fs, r.rc == 1 && r.err.includes("hash mismatch"), "a tampered snapshot is refused (" + r.err + ")");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", "tests/osig/demo/orin.toml", "--head", "tests/osig/demo"]);
+  c.check(fs, r.rc != 0, "a non-package base is an error");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", "tests/osig/demo"]);
+  c.check(fs, r.rc == 2 && r.err.includes("usage"), "diff without --head is a usage error");
+}
+
+// ---- 5. acceptance: rename + signature change + new call path ----------------------------------------------------
+
+function acceptance(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, tmp: string): string {
+  const base = "tests/osig/accept/base";
+  const head_ = "tests/osig/accept/head";
+  let r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", head_]);
+  const txt = r.out;
+  c.check(fs, r.rc == 0, "diff exits 0 when the heads differ (report only): " + r.err);
+  c.check(fs, txt.includes("changed symbols:") && txt.includes("[signature] Function acme:orders::checkout"), "text: API signature change");
+  c.check(fs, txt.includes("- function checkout(qty: int): int") && txt.includes("+ function checkout(qty: int, express: bool): int"),
+    "text: before/after signature");
+  c.check(fs, txt.includes("possible renames (HEURISTIC, not proven identity")
+    && txt.includes("acme:orders::applyDiscount => acme:orders::applyRebate"), "text: rename marked heuristic");
+  c.check(fs, txt.includes("new call paths") && txt.includes("<- NEW"), "text: new call path section");
+  c.check(fs, txt.includes("entry acme:(root)::main") && txt.includes("-> CALLS/direct [MUST] acme:orders::checkout")
+    && txt.includes("-> CALLS/direct [MUST] acme:audit::record"), "text: call path explained from main through checkout to record");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", head_, "--format=json"]);
+  const d = J(r.out);
+  c.check(fs, isStrEq(at(d, ["schema"]), "osig-diff/0.2") && isBoolEq(at(d, ["differences"]), true), "json: schema");
+  const changed = items(at(d, ["changedSymbols"]));
+  let ids: string[] = [];
+  for (const x of changed) {
+    ids.push(str(at(x, ["id"])));
+  }
+  c.check(fs, sameList(ids, ["acme:orders::checkout"]) && sameList(strs(at(d, ["changedSymbols", "0", "aspects"])), ["signature"])
+    && isStrEq(at(d, ["changedSymbols", "0", "before"]), "function checkout(qty: int): int"), "json: signature change");
+  const rn = at(d, ["possibleRenames"]);
+  c.check(fs, len(rn) == 1 && isBoolEq(at(rn, ["0", "heuristic"]), true) && isStrEq(at(rn, ["0", "from"]), "acme:orders::applyDiscount")
+    && isStrEq(at(rn, ["0", "to"]), "acme:orders::applyRebate") && str(at(rn, ["0", "confidence"])) != "proven",
+    "json: rename candidate is heuristic");
+  let removed: string[] = [];
+  for (const x of items(at(d, ["removedSymbols"]))) {
+    removed.push(str(at(x, ["id"])));
+  }
+  let added: string[] = [];
+  for (const x of items(at(d, ["addedSymbols"]))) {
+    added.push(str(at(x, ["id"])));
+  }
+  c.check(fs, removed.includes("acme:orders::applyDiscount") && added.includes("acme:orders::applyRebate"),
+    "json: the rename is not hidden: the symbols stay listed as removed and added");
+  const paths = at(d, ["newCallPaths"]);
+  let f = byField2(paths, "acme:audit::record");
+  c.check(fs, !isNull(f) && isStrEq(at(f, ["edge", "src"]), "acme:orders::checkout"), "json: new call checkout -> record");
+  const steps = stepLists(at(f, ["reach", "entryPaths"]));
+  c.check(fs, hasList(steps, ["acme:(root)::main", "acme:orders::checkout"]),
+    "json: path main -> checkout (entry point to the new call) (" + reprList2(steps) + ")");
+  c.check(fs, evidenceIn(at(f, ["reach", "entryPaths"]), ["", "MUST", "MAY", "UNKNOWN"]), "json: evidence on every hop");
+  f = byField2(paths, "acme:audit::sink");
+  c.check(fs, !isNull(f) && hasList(stepLists(at(f, ["reach", "entryPaths"])),
+    ["acme:(root)::main", "acme:orders::checkout", "acme:audit::record"]), "json: path main -> checkout -> record -> sink");
+  let importAdded = false;
+  for (const e of items(at(d, ["addedEdges"]))) {
+    if (isStrEq(at(e, ["kind"]), "IMPORTS") && isStrEq(at(e, ["dst"]), "acme:audit")) {
+      importAdded = true;
+    }
+  }
+  c.check(fs, importAdded, "json: new import edge");
+  const imp = byField(at(d, ["impact"]), "target", "acme:orders::checkout");
+  let reachesMain = false;
+  for (const p of items(at(imp, ["entryPaths"]))) {
+    if (isStrEq(at(p, ["steps", "0", "node"]), "acme:(root)::main")) {
+      reachesMain = true;
+    }
+  }
+  c.check(fs, reachesMain, "json: impact of the changed checkout reaches main");
+  c.check(fs, isIntEq(at(d, ["summary", "possibleRenames"]), 1) && isIntEq(at(d, ["summary", "changed"]), 1), "json: summary");
+
+  // ---- no change
+  const base2 = tmp + "/base2";
+  sh(proc, "cp -R " + shq(c.root + "/" + base) + " " + shq(base2));
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", base2, "--exit-code"]);
+  c.check(fs, r.rc == 0 && r.out.includes("no differences") && !r.out.includes("changed symbols"), "no-change run reports nothing (text)");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", base2, "--format=json"]);
+  const d0 = J(r.out);
+  c.check(fs, isBoolEq(at(d0, ["differences"]), false) && len(at(d0, ["changedSymbols"])) == 0 && len(at(d0, ["addedSymbols"])) == 0
+    && len(at(d0, ["removedSymbols"])) == 0 && len(at(d0, ["addedEdges"])) == 0 && len(at(d0, ["removedEdges"])) == 0
+    && len(at(d0, ["possibleRenames"])) == 0 && len(at(d0, ["newCallPaths"])) == 0, "no-change run reports nothing (json)");
+  // a comment and blank lines shift every line number: spans change, the graph does not
+  const p = base2 + "/src/orders/orders.or";
+  writeFile(fs, p, "// a new header comment\n\n\n" + readText(fs, p));
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", base2, "--exit-code"]);
+  c.check(fs, r.rc == 0 && r.out.includes("no differences"), "a pure line shift reports nothing (" + tail(r.out, 200) + ")");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", head_, "--exit-code"]);
+  c.check(fs, r.rc == 1, "--exit-code returns 1 when there are differences");
+  return base2;
+}
+
+// `{f["edge"]["dst"]: f for f in d["newCallPaths"]}[dst]`
+function byField2(paths: Json, dst: string): Json {
+  let found: Json = JNull;
+  for (const f of items(paths)) {
+    if (isStrEq(at(f, ["edge", "dst"]), dst)) {
+      found = f;
+    }
+  }
+  return found;
+}
+
+// ---- 6. HTML -------------------------------------------------------------------------------------------------------
+
+// `re.sub(r'href="https://example\.invalid/[^"]*"', "", html)`
+function dropLinks(html: string): string {
+  const needle = "href=\"https://example.invalid/";
+  let out = "";
+  let i: usize = 0;
+  while (i < html.length) {
+    if (i + needle.length <= html.length && html.substring(i, i + needle.length) == needle) {
+      let j = i + needle.length;
+      while (j < html.length && html.charCodeAt(j) != 34) {
+        j += 1;
+      }
+      if (j < html.length) {
+        i = j + 1;
+        continue;
+      }
+    }
+    out += html.charAt(i);
+    i += 1;
+  }
+  return out;
+}
+
+function html(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, base2: string): void {
+  const base = "tests/osig/accept/base";
+  const head_ = "tests/osig/accept/head";
+  let r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", head_, "--format=html", "--link-base", "https://example.invalid/blob/abc"]);
+  const h = r.out;
+  c.check(fs, r.rc == 0 && h.startsWith("<!doctype html>"), "html report");
+  for (const sect of ["<h2>Summary</h2>", "<h2>Changed symbols</h2>", "<h2>New and removed call paths</h2>",
+                      "<h2>Impact on entry points</h2>", "<h2>Possible renames</h2>"]) {
+    c.check(fs, h.includes(sect), "html section " + sect);
+  }
+  c.check(fs, h.includes("Heuristic matches, never proven identity"), "html: rename disclaimer");
+  c.check(fs, h.includes("href=\"https://example.invalid/blob/abc/src/orders/orders.or#L8\""), "html: path:line links");
+  const outside = dropLinks(h);
+  c.check(fs, !outside.includes("src=\"http:") && !outside.includes("src=\"https:") && !outside.includes("href=\"http:")
+    && !outside.includes("href=\"https:") && !h.includes("<script") && !h.includes("<link") && !h.includes("@import")
+    && !h.includes("url("), "html is self-contained (no external assets)");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", head_, "--format=html"]);
+  c.check(fs, !r.out.includes("<a ") && r.out.includes("orders.or:8"), "html without --link-base: plain path:line text");
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", base2, "--format=html"]);
+  c.check(fs, r.out.includes("No differences."), "html of a no-change run");
+  // XSS: a symbol name cannot inject markup (escaping of the report)
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", base, "--head", head_, "--format=html"]);
+  c.check(fs, !r.out.includes("<script"), "no script element");
+}
+
+// ---- 7. primitive I/O edges (ADR-0027) -------------------------------------------------------------------------------
+
+function ioEdges(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, tmp: string): void {
+  let r = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/io/main.or"]);
+  c.check(fs, r.rc == 0, "graph of the I/O program exits 0 (" + r.err + ")");
+  const sio = J(r.out);
+  const perf = ioTuples(sio);
+  const wantIo: string[][] = [
+    ["load", "~io:Fs.ReadFile", "MUST", "INPUT"], ["save", "~io:Fs.WriteFile", "MUST", "OUTPUT"],
+    ["stream", "~io:Fs.Open", "MUST", "CONTROL"], ["stream", "~io:Fs.Read", "MAY", "INPUT"],   // inside a closure: MAY
+    ["tick", "~io:Clock.Now", "MUST", "INPUT"], ["run", "~io:Process.Args", "MUST", "INPUT"],
+    ["run", "~io:Process.Spawn", "MUST", "CONTROL"], ["run", "~io:Stdio.Read", "MUST", "INPUT"],
+    ["run", "~io:Console.Write", "MUST", "OUTPUT"], ["scoped", "~io:Fs.Narrow", "MUST", "CONTROL"],
+    ["main", "~io:Host.Acquire", "MUST", "CONTROL"],
+    ["netio", "~io:Net.Bind", "MUST", "CONTROL"], ["netio", "~io:Net.Accept", "MAY", "INPUT"],
+    ["netio", "~io:Net.Connect", "MUST", "CONTROL"], ["netio", "~io:Net.Narrow", "MUST", "CONTROL"],
+    ["netio", "~io:Stream.Read", "MAY", "INPUT"], ["netio", "~io:Stream.Write", "MAY", "OUTPUT"]   // inside closures: MAY
+  ];
+  for (const w of wantIo) {
+    c.check(fs, perf.includes(w.join("|")), "PERFORMS_IO edge " + reprTuple(w));
+  }
+  c.check(fs, !hasSrc(perf, "pure"), "a pure function has no PERFORMS_IO edge");
+  const consoleWrite = nodeOf(sio, "~io:Console.Write");
+  const fsReadFile = nodeOf(sio, "~io:Fs.ReadFile");
+  c.check(fs, isStrEq(at(consoleWrite, ["sig"]), "OUTPUT; grant: ambient") && isStrEq(at(fsReadFile, ["sig"]), "INPUT; grant: FsGrant"),
+    "Effect nodes carry the direction and the grant family");
+  c.check(fs, onlyMustMay(sio), "primitive I/O edges are never UNKNOWN");
+  r = c.run(fs, proc, c.root, orin, ["graph", "tests/next/run/cap_pure_no_grants.or"]);
+  const spure = J(r.out);
+  let pureIo: string[] = [];
+  let otherIo = false;
+  for (const e of items(at(spure, ["edges"]))) {
+    const dst = str(at(e, ["dst"]));
+    if (isStrEq(at(e, ["kind"]), "PERFORMS_IO")) {
+      pureIo.push(dst);
+    }
+    if (dst.startsWith("~io:") && dst != "~io:Console.Write") {
+      otherIo = true;
+    }
+  }
+  const pureSet = uniqueSorted(pureIo);
+  c.check(fs, sameList(pureSet, ["~io:Console.Write"]),
+    "a pure calculation has no effect but the ambient console output (" + reprList(pureSet) + ")");
+  c.check(fs, !otherIo, "a program without grants performs no grant-requiring I/O");
+  // the diff reports a new I/O call as a new edge
+  const iobase = tmp + "/iobase";
+  const iohead = tmp + "/iohead";
+  sh(proc, "mkdir -p " + shq(iobase) + " " + shq(iohead));
+  const srcIo = readText(fs, c.root + "/tests/osig/io/main.or");
+  writeFile(fs, iobase + "/main.or", srcIo);
+  writeFile(fs, iohead + "/main.or", replaceAll(srcIo, "function pure(n: int): int {\n  return n * 2;",
+    "function pure(n: int): int {\n  console.error(\"x\");\n  return n * 2;"));
+  r = c.run(fs, proc, c.root, orin, ["diff", "--base", iobase + "/main.or", "--head", iohead + "/main.or"]);
+  c.check(fs, r.rc == 0 && r.out.includes("+ PERFORMS_IO [MUST] (OUTPUT)") && r.out.includes("~io:Console.Write"),
+    "diff shows the new primitive I/O edge (" + r.err + ")");
+}
+
+// Python's repr of a tuple of strings: ('a', 'b').
+function reprTuple(xs: string[]): string {
+  let parts: string[] = [];
+  for (const x of xs) {
+    parts.push(reprStr(x));
+  }
+  return "(" + parts.join(", ") + ")";
+}
+
+// All PERFORMS_IO edges have the evidence MUST or MAY.
+function onlyMustMay(snap: Json): bool {
+  for (const e of items(at(snap, ["edges"]))) {
+    if (isStrEq(at(e, ["kind"]), "PERFORMS_IO")) {
+      const evid = str(at(e, ["evidence"]));
+      if (evid != "MUST" && evid != "MAY") {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+// ---- 8. task events (ADR-0017 stage 0) ---------------------------------------------------------------------------------
+
+function taskEvents(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string): void {
+  let r = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/tasks/main.or"]);
+  const gt = r.out;
+  c.check(fs, r.rc == 0, "graph of the task program exits 0 (" + r.err + ")");
+  const st = J(gt);
+  const tperf = ioTuples(st);
+  const wantTasks: string[][] = [
+    ["fanOut", "~io:Channel.Open", "MUST", "CONTROL"], ["fanOut", "~io:Task.Join", "MUST", "CONTROL"],
+    ["fanOut", "~io:Task.Spawn", "MAY", "CONTROL"],                       // spawn is a CONTROL event (inside the scope body: MAY)
+    ["produce", "~io:Channel.Send", "MUST", "OUTPUT"],                    // a send is an OUTPUT event ...
+    ["consume", "~io:Channel.Receive", "MUST", "INPUT"],                  // ... a receive an INPUT event
+    ["withAuthority", "~io:Task.SpawnFs", "MAY", "CONTROL"]               // delegating a grant names the family
+  ];
+  for (const w of wantTasks) {
+    c.check(fs, tperf.includes(w.join("|")), "PERFORMS_IO edge " + reprTuple(w));
+  }
+  c.check(fs, isStrEq(at(nodeOf(st, "~io:Task.Spawn"), ["sig"]), "CONTROL; grant: ambient")
+    && isStrEq(at(nodeOf(st, "~io:Task.SpawnFs"), ["sig"]), "CONTROL; grant: FsGrant"),
+    "spawning is a CONTROL effect; delegating a grant names its family");
+  c.check(fs, isStrEq(at(nodeOf(st, "~io:Channel.Send"), ["sig"]), "OUTPUT; grant: ambient")
+    && isStrEq(at(nodeOf(st, "~io:Channel.Receive"), ["sig"]), "INPUT; grant: ambient"), "send is OUTPUT, receive is INPUT");
+  c.check(fs, !hasSrc(tperf, "pure"), "a pure function has no PERFORMS_IO edge");
+  c.check(fs, onlyMustMay(st), "task events are never UNKNOWN");
+  r = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/tasks/main.or"]);
+  c.check(fs, r.out == gt, "the task graph is deterministic");
+}
+
+// ---- 9. user annotations (ADR-0046 S2): ANNOTATED_WITH edges ---------------------------------------------------------------
+
+function annotations(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, update: bool, demoSnap: Json): void {
+  let r = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/annotated"]);
+  const ga = r.out;
+  c.check(fs, r.rc == 0, "graph of the annotated package exits 0 (" + r.err + ")");
+  const annGolden = c.root + "/tests/osig/annotated.graph.json";
+  if (update) {
+    writeFile(fs, annGolden, ga);
+  }
+  c.check(fs, ga == readText(fs, annGolden),
+    "graph of the annotated package equals tests/osig/annotated.graph.json (run with --update after a deliberate change)");
+  const sa = J(ga);
+  let annotated: string[] = [];
+  for (const e of items(at(sa, ["edges"]))) {
+    if (isStrEq(at(e, ["kind"]), "ANNOTATED_WITH")) {
+      annotated.push([str(at(e, ["src"])), str(at(e, ["dst"])), str(at(e, ["via"])), str(at(e, ["evidence"]))].join("\t"));
+    }
+  }
+  const root = "annotated:(root)::";
+  const meta = "annotated:meta::";
+  const wantAnn: string[] = [
+    [root + "User", meta + "Json", "", "MUST"].join("\t"),
+    [root + "User", meta + "Doc", "(\"A user of the service\")", "MUST"].join("\t"),
+    [root + "User.name", meta + "JsonName", "(\"display_name\")", "MUST"].join("\t"),
+    [root + "LIMIT", meta + "Doc", "(\"The limit\")", "MUST"].join("\t"),
+    [root + "Handlers.list", meta + "Route", "(\"/users\", Get, Some(\"admin\"))", "MUST"].join("\t"),
+    [root + "create", meta + "Route", "(\"/users/:id\", Post)", "MUST"].join("\t"),
+    [root + "create", meta + "Doc", "(\"Creates a user\")", "MUST"].join("\t")
+  ];
+  c.check(fs, sameList(uniqueSorted(annotated), uniqueSorted(wantAnn)),
+    "ANNOTATED_WITH edges: declaration -> annotation type, arguments as written in via (got "
+    + reprList(symmetricDiff(annotated, wantAnn)) + ")");
+  const annIds = nodeIds(sa);
+  let annConnected = true;
+  for (const e of items(at(sa, ["edges"]))) {
+    if (!annIds.includes(str(at(e, ["src"]))) || !annIds.includes(str(at(e, ["dst"])))) {
+      annConnected = false;
+    }
+  }
+  c.check(fs, annConnected, "annotated: every edge connects existing nodes");
+  let one: Json[] = [];
+  for (const e of items(at(sa, ["edges"]))) {
+    if (isStrEq(at(e, ["kind"]), "ANNOTATED_WITH") && isStrEq(at(e, ["src"]), root + "create") && isStrEq(at(e, ["dst"]), meta + "Route")) {
+      one.push(e);
+    }
+  }
+  c.check(fs, one.length == 1 && isStrEq(at(one[0], ["span", "file"]), "src/main.or") && numOf(at(one[0], ["span", "line"])) == 21
+    && numOf(at(one[0], ["span", "col"])) == 2, "ANNOTATED_WITH span is the annotation name (got " + show(JArr(one)) + ")");
+  c.check(fs, isStrEq(at(sa, ["schema"]), "osig/0.4"), "schema osig/0.4 (the new edge kind)");
+  let demoAnnotated = false;
+  for (const e of items(at(demoSnap, ["edges"]))) {
+    if (isStrEq(at(e, ["kind"]), "ANNOTATED_WITH")) {
+      demoAnnotated = true;
+    }
+  }
+  c.check(fs, !demoAnnotated, "a program without user annotations has no ANNOTATED_WITH edge");
+  r = c.run(fs, proc, c.root, orin, ["graph", "tests/osig/annotated"]);
+  c.check(fs, r.out == ga, "the annotated graph is deterministic");
+}
+
+// Runs every section. `orin` is the absolute path of the compiler under test; the work directory `tmp` is removed by
+// the caller.
+export function runOsig(fs: FsGrant, proc: ProcessGrant, c: Ctx, orin: string, tmp: string, update: bool): void {
+  const g1 = golden(fs, proc, c, orin, update);
+  const snap = J(g1);
+  const outFile = determinism(fs, proc, c, orin, tmp, g1);
+  structure(fs, c, snap);
+  snapshotFiles(fs, proc, c, orin, tmp, g1, outFile);
+  const base2 = acceptance(fs, proc, c, orin, tmp);
+  html(fs, proc, c, orin, base2);
+  ioEdges(fs, proc, c, orin, tmp);
+  taskEvents(fs, proc, c, orin);
+  annotations(fs, proc, c, orin, update, snap);
+}

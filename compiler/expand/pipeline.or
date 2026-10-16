@@ -17,6 +17,7 @@
 //      generated import names a module that was loaded after the companion. The caller checks the complete program next.
 
 import { FsGrant, exists, readFile } from "std:fs";
+import { ProcessGrant } from "std:process";
 import { Diagnostic, SourceMap, Span, diag } from "../diag";
 import { Item, Module, ImportDecl, Ident } from "../syntax";
 import { LoadedProgram, Unit, ImportTarget, ImportUnit, ImportStd, ImportResolver, Sources, dirname, companionPath } from "../loader";
@@ -28,6 +29,8 @@ import {
   Run, Snapshot, findRuns, buildSnapshot, outputItems, GenOutput, ProcDiag, moduleLabel, isUserUnit, RunItems,
   hygieneDiags,
 } from "../meta";
+import { Processor, findProcessors, processorFor, processorDiags, trusted, W_NOT_TRUSTED } from "./processors";
+import { ProcConfig, runProcessor, DECLARATION_LIMIT } from "./helper";
 
 // Where generated code points: the span of the annotation use, and what to tell the user about it.
 export type Cause = { span: Span; note: string; };
@@ -48,9 +51,10 @@ export type Expansion = {
 // The distance between the `freshBase` of two runs (a processor makes far fewer fresh names than this).
 const FRESH_STRIDE: int = 10000;
 
-// The error code of an unusable recorded output (S5: of a failed processor run) and of a diagnostic the processor
-// reported itself.
+// The error code of an unusable recorded output or a failed processor run (S5), and of a diagnostic the processor reported
+// itself. W0490: the processors could not be run (`orin check` without a C compiler).
 const E_OUTPUT: string = "E0520";
+const W_NOT_RUN: string = "W0490";
 const E_PROCESSOR: string = "E0522";
 const W_PROCESSOR: string = "W0491";
 
@@ -147,12 +151,18 @@ function runLabel(r: Run): string {
   return "`" + annotationText(r) + "` on " + names;
 }
 
-type Planned = { run: Run; path: string; text: string; };
+// `proc` is the processor to execute for the run; None when the output is the recorded one (the test hook, which wins over a
+// processor of the same annotation).
+type Planned = { run: Run; path: string; text: string; proc: Option<Processor>; };
+
+type Plan = { runs: Planned[]; warnings: Diagnostic[]; };
 
 // The runs of the program that have a recorded output, per unit in unit order, each unit's runs ordered by annotation
 // module path and annotation name (ADR-0046 §4: processor order).
-function plan(fs: FsGrant, prog: LoadedProgram): Result<Planned[], Diagnostic[]> {
+function plan(fs: FsGrant, prog: LoadedProgram): Result<Plan, Diagnostic[]> {
+  const procs = findProcessors(prog).procs;
   let out: Planned[] = [];
+  let warnings: Diagnostic[] = [];
   let ui: usize = 0;
   while (ui < prog.units.length) {
     if (isUserUnit(prog, ui)) {
@@ -164,14 +174,31 @@ function plan(fs: FsGrant, prog: LoadedProgram): Result<Planned[], Diagnostic[]>
           if (t.isErr()) {
             return Err([diag(E_OUTPUT, r.cause, "cannot read the recorded output `" + path + "`: " + t.unwrapErr())]);
           }
-          mine.push(Planned { run: r, path: path, text: t.unwrap() });
+          mine.push(Planned { run: r, path: path, text: t.unwrap(), proc: None });
+          continue;
         }
+        const pr = processorFor(procs, r.annoUnit, r.annoName);
+        if (pr.isNone()) {
+          continue;
+        }
+        const tr = trusted(prog, pr.unwrap().unit);
+        if (tr.isErr()) {
+          warnings.push(
+            diag(
+              W_NOT_TRUSTED,
+              r.cause,
+              "the processor `" + pr.unwrap().name + "` of `" + annotationText(r) + "` was not run: " + tr.unwrapErr(),
+            ),
+          );
+          continue;
+        }
+        mine.push(Planned { run: r, path: "", text: "", proc: pr });
       }
       out = out.concat(sortPlanned(prog, mine));
     }
     ui += 1;
   }
-  return Ok(out);
+  return Ok(Plan { runs: out, warnings: warnings });
 }
 
 function before(prog: LoadedProgram, a: Run, b: Run): bool {
@@ -358,16 +385,66 @@ function visitUnit(prog: LoadedProgram, i: usize, vis: Vis): Vis {
   return v;
 }
 
+// The companions of the runs, and the warnings of runs that were not executed.
+type Ran = { companions: Companion[]; warnings: Diagnostic[]; };
+
+// The result of executing a processor: its encoded `Output`, or the W0490 warning when the run was skipped.
+type Exec = { text: string; skip: Option<Diagnostic>; };
+
+// Executes the processor of a run (S5).
+function execute(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  p: Planned,
+  label: string,
+  input: string,
+  cfg: ProcConfig,
+): Result<Exec, Diagnostic> {
+  const pr = p.proc.unwrap();
+  const where = "module `" + moduleLabel(prog, p.run.unit) + "`";
+  const ex = runProcessor(fs, proc, prog, sm, pr, where, input, cfg);
+  if (ex.isErr()) {
+    const f = ex.unwrapErr();
+    let d = diag(E_OUTPUT, p.run.cause, "processor `" + pr.name + "` (" + label + ", " + where + ") failed: " + f.message);
+    if (f.stderr != "") {
+      d.notes.push("stderr: " + f.stderr);
+    }
+    return Err(d);
+  }
+  if (ex.unwrap().skipped) {
+    return Ok(
+      Exec {
+        text: "",
+        skip: Some(
+          diag(
+            W_NOT_RUN,
+            p.run.cause,
+            "processors not run: " + ex.unwrap().why + "; the companion module of " + where + " stays empty",
+          ),
+        ),
+      },
+    );
+  }
+  return Ok(Exec { text: ex.unwrap().text, skip: None });
+}
+
 // The runs of the program with their snapshots and converted outputs, grouped per source module. Errors: E0520 (output not
-// usable), E0522 (the processor reported an error).
+// usable, processor failed, too many generated declarations), E0522 (the processor reported an error).
 function runAll(
+  fs: FsGrant,
+  proc: ProcessGrant,
   prog: LoadedProgram,
   sm: SourceMap,
   planned: Planned[],
   display: bool,
-): Result<Companion[], Diagnostic[]> {
+  cfg: ProcConfig,
+): Result<Ran, Diagnostic[]> {
   let companions: Companion[] = [];
   let diags: Diagnostic[] = [];
+  let warns: Diagnostic[] = [];
+  let declared: usize = 0;
   let k: usize = 0;
   while (k < planned.length) {
     const p = planned[k];
@@ -376,14 +453,36 @@ function runAll(
     if (snap.isErr()) {
       return Err([diag(E_OUTPUT, p.run.cause, "cannot build the input for " + label + ": " + snap.unwrapErr())]);
     }
+    let text = p.text;
+    let origin = "the recorded output `" + p.path + "`";
+    if (p.proc.isSome()) {
+      const ex = execute(fs, proc, prog, sm, p, label, snap.unwrap().text, cfg);
+      if (ex.isErr()) {
+        return Err([ex.unwrapErr()]);
+      }
+      if (ex.unwrap().skip.isSome()) {
+        warns.push(ex.unwrap().skip.unwrap());
+        k += 1;
+        continue;
+      }
+      text = ex.unwrap().text;
+      origin = "the output of the processor `" + p.proc.unwrap().name + "`";
+    }
     const sp = display ? Span { file: 0, start: 0, end: 2 } : p.run.cause;
-    const out = outputItems(p.text, sp);
+    const out = outputItems(text, sp);
     if (out.isErr()) {
+      return Err([
+        diag(E_OUTPUT, p.run.cause, origin + " for " + label + " is not usable: " + out.unwrapErr()),
+      ]);
+    }
+    declared += out.unwrap().items.length;
+    if (declared > DECLARATION_LIMIT) {
       return Err([
         diag(
           E_OUTPUT,
           p.run.cause,
-          "the recorded output `" + p.path + "` for " + label + " is not usable: " + out.unwrapErr(),
+          origin + " for " + label + " exceeds the limit of " + DECLARATION_LIMIT.toString()
+              + " generated declarations per program",
         ),
       ]);
     }
@@ -392,7 +491,7 @@ function runAll(
       if (d.at >= 0 && d.at.toUsize() < snap.unwrap().refs.length) {
         at = snap.unwrap().refs[d.at.toUsize()];
       } else {
-        diags.push(diag(E_OUTPUT, p.run.cause, "the recorded output `" + p.path + "` has a diagnostic with the unknown ref " + d.at.toString()));
+        diags.push(diag(E_OUTPUT, p.run.cause, origin + " has a diagnostic with the unknown ref " + d.at.toString()));
       }
       if (d.error) {
         let e = diag(E_PROCESSOR, at, d.message);
@@ -408,7 +507,7 @@ function runAll(
       }
       c += 1;
     }
-    const rr = RunResult { run: p.run, label: label, path: p.path, snap: snap.unwrap(), out: out.unwrap(), text: p.text };
+    const rr = RunResult { run: p.run, label: label, path: p.path, snap: snap.unwrap(), out: out.unwrap(), text: text };
     if (at.isSome()) {
       companions[at.unwrap()].runs.push(rr);
     } else {
@@ -419,7 +518,7 @@ function runAll(
   if (diags.length > 0) {
     return Err(diags);
   }
-  return Ok(companions);
+  return Ok(Ran { companions: companions, warnings: warns });
 }
 
 // The warnings the processors reported (`MWarning`).
@@ -540,11 +639,12 @@ function genUnitOf(prog: LoadedProgram, src: usize): Option<usize> {
   return None;
 }
 
-// The shared first part: runs, cycles, the sub-program check. None when the program has no run.
-function prepare(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): Result<Planned[], Diagnostic[]> {
-  const planned = plan(fs, prog)?;
+// The shared first part: runs, cycles, the sub-program check and the rules for processors. No runs when the program has none.
+function prepare(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): Result<Plan, Diagnostic[]> {
+  const pl = plan(fs, prog)?;
+  const planned = pl.runs;
   if (planned.length == 0) {
-    return Ok(planned);
+    return Ok(pl);
   }
   const dep = dependsOnGen(prog);
   const cyc = cycleDiags(prog, planned, dep);
@@ -555,24 +655,37 @@ function prepare(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): Result<Planne
   for (const d of dep) {
     keep.push(!d);
   }
-  const sub = check(subProgram(prog, keep), sm);
+  const subProg = subProgram(prog, keep);
+  const sub = check(subProg, sm);
   if (sub.isErr()) {
     return Err(sub.unwrapErr());
   }
-  return Ok(planned);
+  const pd = processorDiags(subProg, sm, sub.unwrap().functions);
+  if (pd.length > 0) {
+    return Err(pd);
+  }
+  return Ok(pl);
 }
 
 // Expands the companion modules of `prog`: the placeholders get the generated code of the recorded outputs. A program
 // without a placeholder is returned unchanged (nothing is read, nothing is checked).
-export function expandProgram(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): Result<Expansion, Diagnostic[]> {
+export function expandProgram(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  cfg: ProcConfig,
+): Result<Expansion, Diagnostic[]> {
   if (!hasGenUnit(prog)) {
     return Ok(unchanged(prog));
   }
-  const planned = prepare(fs, prog, sm)?;
+  const pl = prepare(fs, prog, sm)?;
+  const planned = pl.runs;
   if (planned.length == 0) {
-    return Ok(unchanged(prog));
+    return Ok(Expansion { program: prog, causes: [], warnings: pl.warnings, companions: [] });
   }
-  const companions = runAll(prog, sm, planned, false)?;
+  const ran = runAll(fs, proc, prog, sm, planned, false, cfg)?;
+  const companions = ran.companions;
   const hy = hygiene(prog, companions);
   if (hy.length > 0) {
     return Err(hy);
@@ -612,7 +725,7 @@ export function expandProgram(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): 
   return Ok(Expansion {
     program: reordered(LoadedProgram { units: units, entry: prog.entry, manifest: prog.manifest }),
     causes: causes,
-    warnings: processorWarnings(companions),
+    warnings: pl.warnings.concat(ran.warnings).concat(processorWarnings(companions)),
     companions: companions,
   });
 }
@@ -627,12 +740,19 @@ function labelsOf(c: Companion): string {
 
 // `orin expand`: the runs of every module that has a recorded output, without the second check of the program. Each
 // companion's runs are converted with empty spans for printing.
-export function expandCompanions(fs: FsGrant, prog: LoadedProgram, sm: SourceMap): Result<Companion[], Diagnostic[]> {
-  const planned = prepare(fs, prog, sm)?;
+export function expandCompanions(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  cfg: ProcConfig,
+): Result<Companion[], Diagnostic[]> {
+  const pl = prepare(fs, prog, sm)?;
+  const planned = pl.runs;
   if (planned.length == 0) {
     return Ok([]);
   }
-  const companions = runAll(prog, sm, planned, true)?;
+  const companions = runAll(fs, proc, prog, sm, planned, true, cfg)?.companions;
   const hy = hygiene(prog, companions);
   if (hy.length > 0) {
     return Err(hy);

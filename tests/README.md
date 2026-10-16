@@ -89,4 +89,4 @@ ordinary conformance cases that run in every backend mode; they print only value
 `tests/concurrency/` holds the stress tests (thousands of tasks, tens of thousands of messages) and `move_counts.or`, which pins
 what the *default* build moves and copies; they are driven by `tools/test_concurrency.sh` (plain, ThreadSanitizer, ASan + UBSan,
 no object live at exit), not by `run_tests.py`. `tests/std/task_test.or`, `taskcore_test.or` and `tests/std/expect_trap/task_*.or`
-run with `tools/test_std.sh`; `tests/osig/tasks` is checked by `tools/test_osig.py`.
+run with `tools/test_std.sh`; `tests/osig/tasks` is checked by `tools/clitests.sh osig`.

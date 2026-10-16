@@ -1,0 +1,104 @@
+// `@Route("/users/:id", Get)` on methods generates a static route table (ADR-0046 S6 example, not part of std).
+//
+// In the companion module of the annotated module the processor generates
+//   export function routeTable(): string[]                      // "GET /users/:id -> Users.find", in source order
+//   export function matchRoute(verb: string, path: string): string   // "Users.find id=7", or "" when nothing matches
+// Matching is a chain of `if`s over the path segments, generated at compile time; `:name` segments capture.
+// Not done: the handlers are not called (the table names them), because a processor cannot reference a method value.
+import {
+  Input, Output, MDecl, MStmt, MExpr, MDeclView, MMethodView, MAnnotation, MConst, fn, param, named,
+  arrayOf, ret, constS, ifS, exprS, str, intLit, name, call, method, dot, index, add, eq, andAlso,
+  ne, arrayLit, exportDecl, output, withImports, importFrom, MCTag, findAnnotation, annotationArg,
+  constString,
+} from "std:meta";
+
+export type Verb = Get | Post | Put | Delete;
+
+@Annotation(method)
+export type Route = { path: string; verb: Verb; };
+
+// One route: the handler name, the verb, the path split into segments.
+type Entry = { handler: string; verb: string; path: string; segments: string[]; };
+
+function verbText(c: MConst): string {
+  return match (c) {
+    MCTag(t) => t == "Get" ? "GET" : t == "Post" ? "POST" : t == "Put" ? "PUT" : "DELETE",
+    _ => "GET",
+  };
+}
+
+function entriesOf(input: Input): Entry[] {
+  let out: Entry[] = [];
+  for (const d of input.decls) {
+    for (const m of d.methods) {
+      const a = findAnnotation(m.annotations, "Route");
+      if (a.isSome()) {
+        const p = constString(annotationArg(a.unwrap(), "path").unwrap()).unwrapOr("/");
+        out.push(Entry {
+          handler: d.name + "." + m.name,
+          verb: verbText(annotationArg(a.unwrap(), "verb").unwrap()),
+          path: p,
+          segments: splitPath(p),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+// path equals the route: same number of segments, equal literal segments, `:x` segments captured as "x=value ".
+function matchStmt(e: Entry): MStmt {
+  let cond: MExpr = andAlso(
+    eq(name("verb"), str(e.verb)),
+    eq(dot(name("parts"), "length"), intLit(e.segments.length.toInt())),
+  );
+  let caps: MExpr = str(e.handler);
+  let i = 0;
+  while (i < e.segments.length.toInt()) {
+    const s = e.segments[i.toUsize()];
+    if (s.startsWith(":")) {
+      caps = add(
+        caps,
+        add(str(" " + s.substring(1, s.length) + "="), index(name("parts"), intLit(i))),
+      );
+    } else {
+      cond = andAlso(cond, eq(index(name("parts"), intLit(i)), str(s)));
+    }
+    i += 1;
+  }
+  return ifS(cond, [ret(caps)], []);
+}
+
+@Processor(Route)
+export function routeProc(input: Input): Output {
+  const entries = entriesOf(input);
+  let table: MExpr[] = [];
+  let body: MStmt[] = [constS("parts", call("splitPath", [name("path")]))];
+  for (const e of entries) {
+    table.push(str(e.verb + " " + e.path + " -> " + e.handler));
+    body.push(matchStmt(e));
+  }
+  body.push(ret(str("")));
+  const tableFn = fn("routeTable", [], arrayOf(named("string")), [ret(arrayLit(table))]);
+  const matchFn = fn(
+    "matchRoute",
+    [param("verb", named("string")), param("path", named("string"))],
+    named("string"),
+    body,
+  );
+  return withImports(
+    output([exportDecl(tableFn, true), exportDecl(matchFn, true)]),
+    [importFrom(["splitPath"], "./route")],
+  );
+}
+
+// Used by the generated `matchRoute`: the non-empty segments of a path.
+export function splitPath(path: string): string[] {
+  let out: string[] = [];
+  for (const s of path.split("/")) {
+    if (s != "") {
+      out.push(s);
+    }
+  }
+  return out;
+}
