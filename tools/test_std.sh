@@ -4,7 +4,7 @@
 #      std:bytes, std:utf8, std:collections and std:http is a run-time trap),
 #   2. with --no-contracts (the logic must be right without the contracts as well).
 # Needs build/bootstrap/orin2 (tools/bootstrap.sh). Usage: tools/test_std.sh [-j N] [--mutate] [FILE...]
-#   --mutate  also run the mutation check (tools/mutate_std.py): every deliberately broken implementation must fail
+#   --mutate  also run the mutation check (tools/mutation.sh std): every deliberately broken implementation must fail
 #   -j N      parallel cases (default: $ORIN_JOBS, else the CPU count); the output is in the same fixed order as with -j 1
 #   FILE...   only these test files (tests/std/*_test.or or tests/std/expect_trap/*.or); default: all
 set -eu
@@ -56,6 +56,6 @@ for t in $FILES; do
   esac
 done | python3 tools/parallel.py $JOBS
 if [ -n "$MUTATE" ]; then
-  python3 tools/mutate_std.py --orinc "$ORIN2" $JOBS
+  tools/mutation.sh std --orinc "$ORIN2" $JOBS
 fi
 echo "[std] ok"

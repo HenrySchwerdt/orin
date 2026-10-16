@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **Mutation checks in Orin (ADR-0047 phase 5).** New package `tooling/mutation` (`tools/mutation.sh std|ox`) replaces
+  `tools/mutate_std.py` and `tools/mutate_ox.py`, which are deleted: the same flags, the same 188 std mutants, 10 `std:net`
+  mutants and 33 OX mutants in the same order, the same result lines and exit status; the CI `std-mutants` jobs run it (and the
+  package's `@Test` unit tests). Parallelism is `std:task`, deadlines are native (`shellTimeout`). Parity was checked against the scripts on one
+  commit for every CI matrix target and `mutate_ox` (identical mutant counts and killed/survived results). A change under
+  `tooling/mutation/` (or `tools/mutation.sh`) now selects every std mutant job in `tools/ci_changes.py`.
 - **Pinned LLVM toolchain (ADR-0038 section 8, gate 3).** New `orin toolchain install [--force]` / `status` (in `dist/orin`, wired
   into `dist/orin-cli.sh`): it downloads the LLVM release pinned in `dist/llvm.pin` (19.1.7; linux-x86_64, linux-aarch64,
   macos-arm64), refuses the archive unless its sha256 matches the pin, unpacks `clang`, `llc` and clang's resource directory (about
