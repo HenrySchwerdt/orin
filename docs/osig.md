@@ -29,11 +29,11 @@ orin diff --base <package-dir | entry.or | snapshot.json> --head <package-dir | 
 `orin api --check` is unchanged: it stays the small, reviewed public-API contract (full signature lines
 of exported symbols). `orin diff` covers everything else (call/import/type edges, impact).
 
-## Snapshot shape (`osig/0.2`)
+## Snapshot shape (`osig/0.3`)
 
 ```json
 {
-"schema": "osig/0.2",
+"schema": "osig/0.3",
 "package": "demo",
 "hash": "h62:0123456789abcdef",
 "nodes": [
@@ -59,7 +59,9 @@ closures, contract clauses).
 
 **Schema history** (ADR-0023 versioning: additive changes bump the minor version, readers ignore what they do not know, a
 reader refuses another major): `osig/0.1` the first schema; `osig/0.2` adds the edge kind `MAY_PERFORM` and the edge field
-`next` (present on `MAY_PERFORM` edges only, so every other edge line is unchanged). `orin diff` reads every `osig/0.*`
+`next` (present on `MAY_PERFORM` edges only, so every other edge line is unchanged); `osig/0.3` adds the node field `doc` (the
+rendered `/** ... */` documentation comment attached to the declaration, Markdown with `@tags`, see `analysis/doccomments.or`;
+written only when the declaration has one, so every other node line is unchanged). `orin diff` reads every `osig/0.*`
 snapshot; against a snapshot older than 0.2 the effect sections are skipped ("not compared").
 
 **Effects (`MAY_PERFORM`, ADR-0037 D2, [capabilities.md](capabilities.md)):** for every function, method, constructor and class

@@ -11,7 +11,8 @@ import {
   LoadedProgram, loadWithRoots, noPreludeRoots, isInside, normalizePath, Sources,
 } from "../loader";
 import { SourceFile, SourceMap, Span, render } from "../diag";
-import { Item, ContractClause, ClassMember } from "../syntax";
+import { Item, ContractClause, ClassMember, Comment, scanComments } from "../syntax";
+import { documentationFrom } from "./doccomments";
 import { checkWithIndex } from "../check";
 import {
   Program, SemanticIndex, SymbolDef, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst,
@@ -25,9 +26,12 @@ import {
 import { cmpStr } from "./modgraph";
 import { inferEffects, isUnknownOp } from "./effects";
 
+// osig/0.3 (ADR-0023 versioning, ADR-0050): additive over 0.2 -- the node field `doc` (the rendered `/** ... */` documentation
+// comment of the declaration, analysis/doccomments.or; written only when the declaration has one, so every other node line
+// is unchanged).
 // osig/0.2 (ADR-0023 versioning, ADR-0037 D2): additive over 0.1 -- the edge kind `MAY_PERFORM` (the transitive effect
 // summary, compiler/analysis/effects.or) and the edge field `next` (set on those edges only).
-export const OSIG_SCHEMA: string = "osig/0.2";
+export const OSIG_SCHEMA: string = "osig/0.3";
 
 // 1-based line and column (columns count bytes) of the start and end of a source range.
 export type OSpan = { file: string; line: usize; col: usize; endLine: usize; endCol: usize; };
@@ -42,6 +46,7 @@ export type ONode = {
   exported: bool;
   entry: bool; // an entry point: `main`, exported functions, exported public methods and constructors
   span: OSpan;
+  doc: string; // the rendered documentation comment (Markdown with @tags); "" = none (osig/0.3)
 };
 
 export type OEdge = {
@@ -370,6 +375,23 @@ export function nodesSorted(ns: ONode[]): bool {
   return true;
 }
 
+// The comments of every source file, scanned once: a snapshot documents thousands of declarations of few files.
+function scanAll(sm: SourceMap): Comment[][] {
+  let all: Comment[][] = [];
+  for (const f of sm.files) {
+    all.push(scanComments(f.text));
+  }
+  return all;
+}
+
+// The rendered `/** */` documentation of the declaration at `sp` ("" = none).
+function docOf(sm: SourceMap, sp: Span, scans: Comment[][]): string {
+  if (sp.file >= sm.files.length) {
+    return "";
+  }
+  return documentationFrom(sm.files[sp.file].text, scans[sp.file], sp.start).unwrapOr("");
+}
+
 // The OSIG of a successfully checked program.
 @Ensures(result.hash == hashGraph(result) && result.schema == OSIG_SCHEMA)
 @Ensures(nodesSorted(result.nodes))
@@ -382,6 +404,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
     None => {},
   }
   const mp = spanMapper(prog, sm);
+  const scans = scanAll(sm);
   let fi: usize = 0;
   const nd = idx.defs.length;
 
@@ -468,6 +491,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
     exported: false,
     entry: false,
     span: noSpan(),
+    doc: "",
   });
   // modules
   let modNames: string[] = [];
@@ -497,6 +521,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
       exported: false,
       entry: false,
       span: noSpan(),
+      doc: "",
     });
     raw = addEdge(raw, "DEFINES", pkgId, mid, "MUST", "", noSpan());
   }
@@ -540,6 +565,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
       exported: exported,
       entry: entry,
       span: mkSpan(mp, d.declSpan),
+      doc: docOf(sm, d.declSpan, scans),
     });
     if (kind == "Field") {
       raw = addEdge(raw, "HAS_FIELD", owner, id, "MUST", "", mkSpan(mp, d.declSpan));
@@ -793,6 +819,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
               exported: false,
               entry: false,
               span: noSpan(),
+              doc: "",
             });
           }
         } else {
@@ -831,6 +858,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
             exported: false,
             entry: false,
             span: noSpan(),
+            doc: "",
           });
         }
       }
@@ -861,6 +889,7 @@ export function buildOsig(prog: LoadedProgram, idx: SemanticIndex, sm: SourceMap
       exported: false,
       entry: false,
       span: noSpan(),
+      doc: "",
     });
   }
   // sort
@@ -917,6 +946,7 @@ function addContracts(
       exported: false,
       entry: false,
       span: sp,
+      doc: "",
     });
     x = addEdge(x, "HAS_CONTRACT", owner, id, "MUST", "", sp);
   }
@@ -935,19 +965,27 @@ function spanJson(s: OSpan): Json {
   ]);
 }
 
+function nodeFields(n: ONode): JField[] {
+  let fs: JField[] = [
+    jField("id", JStr(n.id)),
+    jField("kind", JStr(n.kind)),
+    jField("name", JStr(n.name)),
+    jField("module", JStr(n.module)),
+    jField("owner", JStr(n.owner)),
+    jField("sig", JStr(n.sig)),
+    jField("exported", JBool(n.exported)),
+    jField("entry", JBool(n.entry)),
+    jField("span", spanJson(n.span)),
+  ];
+  if (n.doc != "") {
+    fs.push(jField("doc", JStr(n.doc)));
+  }
+  return fs;
+}
+
 function nodeLine(n: ONode): string {
   return stringifyJson(
-    JObj([
-      jField("id", JStr(n.id)),
-      jField("kind", JStr(n.kind)),
-      jField("name", JStr(n.name)),
-      jField("module", JStr(n.module)),
-      jField("owner", JStr(n.owner)),
-      jField("sig", JStr(n.sig)),
-      jField("exported", JBool(n.exported)),
-      jField("entry", JBool(n.entry)),
-      jField("span", spanJson(n.span)),
-    ]),
+    JObj(nodeFields(n)),
   );
 }
 
@@ -1081,6 +1119,7 @@ export function parseOsig(text: string): Result<OsigGraph, string> {
       exported: getBool(n, "exported").unwrapOr(false),
       entry: getBool(n, "entry").unwrapOr(false),
       span: spanOf(n),
+      doc: getStr(n, "doc").unwrapOr(""),
     });
   }
   let edges: OEdge[] = [];
