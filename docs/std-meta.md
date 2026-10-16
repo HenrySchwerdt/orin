@@ -87,5 +87,6 @@ companion module never produce the same helper name. `__g` names are reserved fo
 
 ## Not here
 
-No compiler integration (S4/S5), no formatter for `MDecl` trees (S4: `orin expand`), no validation that a built tree
+Processor execution (S5) is not built. The compiler consumes recorded `Output`s since S4 (docs/annotation-processors.md,
+`orin expand` prints the generated code through the formatter). No validation that a built tree
 type-checks: generated code is checked like hand-written code by the compiler.
