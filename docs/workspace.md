@@ -1,8 +1,8 @@
 # Workspace manifest (`orin-workspace.toml`) — specification
 
-Status: specification for ADR-0047 phase 1 (syntax, semantics, failcase fixtures). Parser (`compiler/package/workspace.or`), resolution and lockfile (`compiler/package/resolve.or`) are implemented and
-unit-tested (`compiler/tests/workspace_test.or`); the CLI and the file-system tree (it needs a directory-listing
-primitive) come next. No files move.
+Status: parser, pure resolution and lockfile implemented and unit-tested (`compiler/tests/workspace_test.or`).
+The CLI adapter is staged but not exported or dispatched until the seed refresh; workspace-aware build/check/test/fmt
+and upwards root discovery remain pending. No files move.
 
 ## 1. File and discovery
 
@@ -51,7 +51,7 @@ no backslashes. Resolution is lexicographic, so the member order is deterministi
 
 ## 4. Lockfile (`orin.lock`)
 
-- One lockfile at the workspace root, written only by `orin lock`, never by a build.
+- One lockfile at the workspace root, written by the planned `orin workspace lock`, never by a build.
 - It holds one `[member.<name>]` table per member, in build order, with `path`, `version` and `dependencies` (the
   member names it depends on). `lockText` in `compiler/package/resolve.or` is the canonical text.
 - A build whose resolution differs from the lock (a member added, removed, moved, re-versioned or with changed member
@@ -70,15 +70,16 @@ member's `orin.toml` for dependency errors) and are never downgraded to warnings
 | E0506 | duplicate: two members with the same package name, or a path listed twice |
 | E0507 | ambiguous or overlapping layout: a member inside another member, a tool inside a member, an `exclude` that matches nothing, a `default-members` entry that is not a member, a nested workspace |
 | E0508 | dependency error: a path dependency to a non-member, a dependency cycle (the message lists the cycle) |
-| E0509 | stale lockfile: member set or a member manifest hash differs from `orin.lock` (span in `orin.lock`) |
+| E0509 | stale lockfile: member paths, versions or member dependencies differ from `orin.lock` (span in `orin.lock`); no manifest/content hashes yet |
 
 ## 6. Commands (phase 2)
 
-`orin build|check|test|fmt` in a workspace act on `default-members` (all members when absent); `-p <name>` selects one
+Planned: `orin build|check|test|fmt` in a workspace act on `default-members` (all members when absent); `-p <name>` selects one
 package, `--workspace` all. `orin workspace list` prints the members in build order. Standalone projects are unchanged.
 
 ## 7. Fixtures
 
 `tests/workspace/` holds one directory per case. `ok/<case>/` must resolve; its `expected.txt` lists the members in build
 order. `fail/<case>/` must be rejected; its `expected.txt` holds the expected code and the line of the span, as
-`E0505 3`. Phase 2 adds the runner; until then the fixtures are the reviewed contract.
+`E0505 3`. `compiler/tests/workspace_fixtures.or` executes every fixture, including stale locks, in the tooling CI
+suite. `compiler/package/wscli_smoke.or` compiles and checks usage of the staged CLI adapter before dispatch is wired.

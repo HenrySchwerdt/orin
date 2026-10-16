@@ -1579,7 +1579,7 @@ static void dir_collect(void *ctx, const char *name, size_t len, int is_dir) {
     }
     char *buf = (char *)orin_platform_alloc(len + 2);
     if (!buf) { a->oom = 1; return; }
-    memcpy(buf, name, len);
+    orin_platform_mem_copy(buf, name, len);
     if (is_dir) buf[len++] = '/';
     a->items[a->n++] = orin_str_new(buf, len);
     orin_platform_free(buf);
@@ -1601,9 +1601,13 @@ OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
     int scoped, den = fs_check(gh, 0, path, eff, &scoped);
     if (den) trap_denied(GK_FS, "listDir", den_text(den));
     DirAcc a = {NULL, 0, 0, 0};
-    if (scoped) (void)orin_platform_dir_list(eff, strlen_(eff), dir_collect, &a);
-    else (void)orin_platform_dir_list(p->data, p->len, dir_collect, &a);
-    if (a.oom) orin_trap("out of memory");
+    int rc = scoped ? orin_platform_dir_list(eff, strlen_(eff), dir_collect, &a)
+                    : orin_platform_dir_list(p->data, p->len, dir_collect, &a);
+    if (a.oom || rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) { /* Never return an apparently complete listing after a partial enumeration. */
+        for (size_t i = 0; i < a.n; i++) orin_release(a.items[i]);
+        a.n = 0;
+    }
     for (size_t i = 1; i < a.n; i++) { /* insertion sort: directories are small */
         OrinObj *x = a.items[i];
         size_t j = i;

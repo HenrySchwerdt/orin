@@ -119,8 +119,8 @@ function duplicatesAndLayout(): void {
         "members = [\"tooling/*\"]\n\n[workspace.tools.v]\npath = \"tooling/v\"\ntype = \"npm\"\n",
       ),
     ),
-    "E0507 5",
-    "tool inside a pattern member",
+    "ok",
+    "tool under a pattern is checked after member expansion",
   );
 }
 
@@ -158,6 +158,7 @@ function tree(dirs: string[], manifests: string[], workspaces: string[]): Tree {
   return Tree {
     dirs: dirs,
     workspaceDirs: workspaces,
+    npmDirs: [],
     manifest: (d: string) => {
       let i: usize = 0;
       while (i < dirs.length) {
@@ -291,5 +292,73 @@ function lockfile(): void {
     checkLock(r, 9, lock + "\n[member.ghost]\npath = \"g\"\n").unwrap().code,
     "E0509",
     "unknown member",
+  );
+}
+
+@Test
+function resolutionRegressions(): void {
+  assertEqString(
+    resolved(ws("members = [\"*\"]\n"), tree(["a", "b"], [pkg("same", ""), pkg("same", "")], [])),
+    "E0506",
+    "root wildcard duplicate reports rather than traps",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"library/*\"]\nexclude = [\"library/*\"]\n"),
+      tree(["library/a"], [pkg("a", "")], []),
+    ),
+    "",
+    "wildcard exclusions expand consistently",
+  );
+  assertEqString(
+    resolved(ws("members = [\"nested/a\"]\n"), tree(["nested/a"], [pkg("a", "")], ["nested"])),
+    "E0507",
+    "member cannot cross nested workspace boundary",
+  );
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n[workspace.tools.editor]\npath = \"a\"\ntype = \"npm\"\n")),
+    "E0507 4",
+    "tool cannot equal a member",
+  );
+  const base = tree(["library/a", "library/editor"], [pkg("a", ""), ""], []);
+  const text = ws(
+    "members = [\"library/*\"]\n[workspace.tools.editor]\npath = \"library/editor\"\ntype = \"npm\"\n",
+  );
+  assertEqString(resolved(text, base), "E0507", "missing native tool manifest rejected");
+  const tools = Tree {
+    dirs: base.dirs,
+    workspaceDirs: [],
+    npmDirs: ["library/editor"],
+    manifest: base.manifest,
+  };
+  assertEqString(resolved(text, tools), "library/a", "nonmember npm tool under wildcard accepted");
+}
+
+@Test
+function escapedLockfile(): void {
+  const dir = "a\"b";
+  const manifest = "[package]\nname = \"a.b\\\"c\\\\d\\ne\\tf\\rg\"\nentry = \"main.or\"\nversion = \"v\\\"1\\\\2\\n3\"\n";
+  const r = resolveWorkspace(
+    parseWorkspace(0, ws("members = ['a\"b']\n")).unwrap(),
+    tree([dir], [manifest], []),
+    1,
+  ).unwrap();
+  assertEqBool(
+    checkLock(r, 9, lockText(r)).isNone(),
+    true,
+    "all accepted TOML string escapes round trip",
+  );
+  const spaced = resolveWorkspace(
+    parseWorkspace(0, ws("members = [\"app\", \"lib\"]\n")).unwrap(),
+    tree(["app", "lib"], [pkg("app", "lib = { path = \"../lib\" }\n"), pkg("a b", "")], []),
+    1,
+  ).unwrap();
+  const stale = lockText(spaced)
+      .split("dependencies = [\"a b\"]")
+      .join("dependencies = [\"a\", \"b\"]");
+  assertEqBool(
+    checkLock(spaced, 9, stale).isSome(),
+    true,
+    "dependency arrays compared element by element",
   );
 }
