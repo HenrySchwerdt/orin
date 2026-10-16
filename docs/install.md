@@ -106,6 +106,18 @@ can compile and link a program, that a small Orin program builds and runs, and t
 install. Each problem prints a `fix:` line; failures give exit status 1, warnings (for example PATH) do not.
 `orin --version` prints the package version.
 
+## Editor (VS Code)
+
+The VS Code extension in [`editors/vscode`](../editors/vscode/README.md) needs no LSP path once Orin is
+installed. It looks for `orin` in this order: the `orin.serverPath` setting, `build/bootstrap/orin2` /
+`build/dev/orin` / `tools/orin` when the opened folder is the orin repository, `PATH`, then the install
+locations above (`$ORIN_HOME/bin`, `~/.orin/bin`, `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`).
+It runs `orin --version` and refuses to start the language server for a compiler outside the supported
+range (currently `0.1.0-alpha.2` or newer in the `0.1.x` series), with a notification that links back to
+this page. The status bar shows the compiler version; **Orin: Show Compiler Info** prints the path, how it
+was found and the output of `orin doctor`. The extension is not yet published on the Marketplace (ADR-0047);
+build it locally with `npx @vscode/vsce package` in `editors/vscode`.
+
 ## Updating and uninstalling
 
 Update by running the installer again (it replaces the previous version). Uninstall with `--uninstall`
