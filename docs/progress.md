@@ -61,6 +61,9 @@ ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
    interruptible waits before a scheduler experiment; syntax changes require their own ADR decision.
 4. Continue the remaining checker/VC rewrite under ADR-0015. Performance PRs #91 and #98 remain
    decision/parked work, as detailed below; their existence is not implementation on main.
+5. After the ADR-0047 layout move and the escape-analysis work: unify the std API per
+   [ADR-0048](decisions/0048-std-api-conventions.md) and clean up and parallelise the compiler per
+   [ADR-0049](decisions/0049-compiler-cleanup-and-parallel-compilation.md); evidence in [`audits/`](audits).
 
 ## Open work and decision gates (performance history retained)
 Merged 2026-10-15: unboxing (#62, MIR v2.2), packed verifier state (#64), census quick wins (#65), borrow inference (#67),

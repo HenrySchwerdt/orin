@@ -162,7 +162,7 @@ must emit the same C and the same `.ll` as `orin2` (ADR-0038 gate 2; the CI `llv
 **Parallel cases.** Every test tool runs its independent cases in parallel, as many as there are CPUs; `-j N` or
 `ORIN_JOBS=N` overrides it (`-j 1` = sequential). The output does not depend on `-j`: results are printed in the fixed
 order of the sequential run, and failures are reported as before (the shell scripts stop at the first failing case in
-that order). Parallel: `run_tests.py` (tests), `test_std.sh` (test files with and without contracts, expect-trap
+that order). Parallel: `tools/conformance.sh` / `run_tests.py` (tests), `test_std.sh` (test files with and without contracts, expect-trap
 tests), `test_tooling.sh` (unit test files and the resources / capabilities / net scripts; the guard for unwired unit
 tests still runs), `mutate_std.py` (mutants, each in its own directory; also `--shard I/N`), `test_verify_contracts.py`
 (the files; each runs in its own working directory because the verifier writes its solver queries to
@@ -179,6 +179,39 @@ bootstrap passed. A push to `main`, the nightly run and a manual run never read 
 seed, so a cache cannot hide a broken fixed point on `main`. The http mutants run as three matrix jobs (`--shard`,
 `tools/ci_changes.py`). The tooling job runs the LSP and MCP tests against `orin2` instead of building the same compiler
 twice more.
+
+## Conformance runner (Orin) and its Python oracle
+
+The conformance suites (`tests/run`, `tests/errors`, `tests/next/*`; formats in `tests/README.md`) are run by
+`tooling/conformance`, an Orin package (ADR-0047 phase 5). `tools/conformance.sh` builds it with the bootstrapped
+compiler (never with the compiler under test) and runs it; the flags are those of the old script:
+
+```bash
+tools/conformance.sh --orinc build/bootstrap/orin2 --suite all            # default | next | all
+tools/conformance.sh --suite next --filter ox -j 4 --backend llvm --sanitize --assert-facts --cc clang
+tools/conformance.sh --unit-tests                                          # @Test tests of the runner itself
+```
+
+Same output, same exit status (0 pass, 1 failure or no match, 2 usage). `--root DIR` names the repository root (default: the
+current directory; the Python script derives it from its location). Parallelism is `std:task`: one worker per `-j` slot
+(default `$ORIN_JOBS`, else the CPU count, at most 128) takes tests from a channel and runs compile, C build and run through
+`shellTimeout`, so each step has its own native deadline (compile and C build 120 s, run 10 s; a hung executable's process
+group is killed). Workers return exit statuses; the main task reads the captured files and judges in test order, so the output
+does not depend on `-j`.
+
+Known differences from `tools/run_tests.py` (none changes a verdict on the repository): a signal-killed step is reported as
+exit `-1` or `128+n`, not `-n`; a missing compiler is `sh`'s "not found" (exit 127) instead of "cannot execute"; stdout is
+compared byte for byte (Python decodes with replacement and translates newlines of the expectation file); a `// warns:`
+mismatch is reported without skipping the (then wasted) build step; the unified diff is an exact LCS diff, which equals
+`difflib` on every case of the suites; `--root`, `--orinc` relative paths are relative to the root as before. The language has no
+environment access, so `$ORIN_JOBS` and the CPU count come from one shell command.
+
+**Why the Python script stays.** ADR-0047 section 3: the self-hosted compiler must not be its only judge. `tools/run_tests.py`
+is the independent oracle (also still used by `orin mcp` and `tools/mutate_ox.py`). `tools/check_conformance_parity.py` runs
+both over `--suite all` for the C and LLVM backends (`--sanitize` optionally), over a tree of deliberately broken tests (wrong
+expected output, missing expectation, wrong exit status, compile failure, wrong or missing error code, wrong `// warns:` /
+`// stderr:`, a hanging executable) and over the command line, and requires identical output and exit status. The CI job
+`conformance-parity` runs it on every change, so the two cannot drift. All other CI jobs use the Orin runner.
 
 ## Execution deadlines
 

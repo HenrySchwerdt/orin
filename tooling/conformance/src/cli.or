@@ -1,0 +1,233 @@
+// Command line of the conformance runner. Mirrors the argparse interface of tools/run_tests.py:
+//   --orinc PATH  --cc CMD  --filter SUBSTR  -j/--jobs N  --sanitize  --suite default|next|all  --backend c|llvm
+//   --assert-facts  -h/--help
+// argparse conventions are kept: `--opt=value`, `-jN`, unambiguous prefixes of long options (`--orin`), the last
+// occurrence wins, a value that starts with `-` is not accepted as the value of the previous option, errors exit
+// with status 2 and print `usage` and `error:` to stderr. One addition: `--root DIR` (the repository root; the Python
+// runner derives it from the location of the script, the Orin runner from this flag, default: the current directory).
+// Pure functions: tests/cli_test.or.
+
+import { strip, reprStr } from "./text";
+
+export type Options = {
+  orinc: string;
+  cc: string;
+  filter: string;
+  jobs: int;          // 0: not given (use $ORIN_JOBS, else the CPU count)
+  sanitize: bool;
+  suite: string;      // default | next | all
+  backend: string;    // c | llvm
+  assertFacts: bool;
+  root: string;
+  help: bool;
+};
+
+export type Parsed = { ok: bool; options: Options; error: string; };
+
+
+export function defaultOptions(): Options {
+  return Options {
+    orinc: "build/bootstrap/orin2", cc: "cc", filter: "", jobs: 0, sanitize: false, suite: "default", backend: "c",
+    assertFacts: false, root: ".", help: false
+  };
+}
+
+export function usage(): string {
+  return "usage: orin-conformance [-h] [--orinc ORINC] [--cc CC] [--filter FILTER] [-j JOBS] [--sanitize]\n"
+  + "                        [--suite {default,next,all}] [--backend {c,llvm}] [--assert-facts] [--root ROOT]";
+}
+
+export function helpText(): string {
+  return usage() + "\n\n"
+  + "Orin conformance test runner\n\n"
+  + "options:\n"
+  + "  -h, --help            show this help message and exit\n"
+  + "  --orinc ORINC         compiler under test (default: build/bootstrap/orin2)\n"
+  + "  --cc CC               C compiler for the test executables (default: cc; clang for --backend llvm)\n"
+  + "  --filter FILTER       run the tests whose \"<suite>/<name>\" contains FILTER\n"
+  + "  -j JOBS, --jobs JOBS  parallel cases (default: $ORIN_JOBS, else the CPU count; 1 = sequential)\n"
+  + "  --sanitize            build the test executables with ASan + UBSan\n"
+  + "  --suite {default,next,all}\n"
+  + "                        default: tests/run + tests/errors; next: tests/next/*; all: both\n"
+  + "  --backend {c,llvm}    c: emit C (default); llvm: emit LLVM IR and build with clang\n"
+  + "  --assert-facts        compile with `--assert-facts`: every forwarded load is checked against its slot at run time (exit 70)\n"
+  + "  --root ROOT           repository root holding tests/, runtime/ and platform/ (default: the current directory)";
+}
+
+function fail(msg: string): Parsed {
+  return Parsed { ok: false, options: defaultOptions(), error: msg };
+}
+
+function longOptions(): string[] {
+  return ["--help", "--orinc", "--cc", "--filter", "--jobs", "--sanitize", "--suite", "--backend", "--assert-facts", "--root"];
+}
+
+function takesValue(name: string): bool {
+  return name == "--orinc" || name == "--cc" || name == "--filter" || name == "--jobs" || name == "--suite"
+    || name == "--backend" || name == "--root";
+}
+
+// The full name of a long option given as `--x...` (exact or an unambiguous prefix), or the error text.
+function resolveLong(given: string): Result<string, string> {
+  for (const n of longOptions()) {
+    if (n == given) {
+      return Ok(n);
+    }
+  }
+  let hits: string[] = [];
+  for (const n of longOptions()) {
+    if (n.startsWith(given)) {
+      hits.push(n);
+    }
+  }
+  if (hits.length == 1) {
+    return Ok(hits[0]);
+  }
+  if (hits.length > 1) {
+    return Err("ambiguous option: " + given + " could match " + hits.join(", "));
+  }
+  return Err("unrecognized arguments: " + given);
+}
+
+// argparse refuses a value that looks like an option (starts with `-`) unless it is a negative number.
+function looksLikeOption(v: string): bool {
+  if (v.length < 2 || v.charCodeAt(0) != 45) {
+    return false;
+  }
+  return parseInt(v).isNone();
+}
+
+function displayName(name: string): string {
+  return name == "--jobs" ? "-j/--jobs" : name;
+}
+
+// int(v) of Python for the values of -j: optional surrounding blanks, optional sign, digits.
+export function parseIntLoose(v: string): Option<int> {
+  const t = strip(v);
+  let k: usize = 0;
+  if (t.length > 0 && (t.charCodeAt(0) == 43 || t.charCodeAt(0) == 45)) {
+    k = 1;
+  }
+  if (k >= t.length) {
+    return None;
+  }
+  let i = k;
+  while (i < t.length) {
+    const c = t.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return None;
+    }
+    i += 1;
+  }
+  return parseInt(t.charCodeAt(0) == 43 ? t.substring(1, t.length) : t);
+}
+
+function apply(o: Options, name: string, value: string): Result<Options, string> {
+  if (name == "--orinc") {
+    return Ok(Options { ...o, orinc: value });
+  }
+  if (name == "--cc") {
+    return Ok(Options { ...o, cc: value });
+  }
+  if (name == "--filter") {
+    return Ok(Options { ...o, filter: value });
+  }
+  if (name == "--root") {
+    return Ok(Options { ...o, root: value });
+  }
+  if (name == "--jobs") {
+    const n = parseIntLoose(value);
+    if (n.isNone()) {
+      return Err("argument -j/--jobs: invalid int value: " + reprStr(value));
+    }
+    return Ok(Options { ...o, jobs: n.unwrap() < 1 ? 1 : n.unwrap() });
+  }
+  if (name == "--suite") {
+    if (value != "default" && value != "next" && value != "all") {
+      return Err("argument --suite: invalid choice: " + reprStr(value) + " (choose from 'default', 'next', 'all')");
+    }
+    return Ok(Options { ...o, suite: value });
+  }
+  if (value != "c" && value != "llvm") {
+    return Err("argument --backend: invalid choice: " + reprStr(value) + " (choose from 'c', 'llvm')");
+  }
+  return Ok(Options { ...o, backend: value });
+}
+
+export function parseArgs(argv: string[]): Parsed {
+  let o = defaultOptions();
+  let unknown: string[] = [];
+  let i: usize = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    i += 1;
+    let name = "";
+    let inline = "";
+    let hasInline = false;
+    if (a.startsWith("--") && a.length > 2) {
+      const eq = a.indexOf("=");
+      const given = eq.isSome() ? a.substring(0, eq.unwrap()) : a;
+      const r = resolveLong(given);
+      if (r.isErr()) {
+        if (r.unwrapErr().startsWith("ambiguous")) {
+          return fail(r.unwrapErr());
+        }
+        unknown.push(a);
+        continue;
+      }
+      name = r.unwrap();
+      if (eq.isSome()) {
+        if (!takesValue(name)) {
+          return fail("argument " + displayName(name) + ": ignored explicit argument " + reprStr(a.substring(eq.unwrap() + 1, a.length)));
+        }
+        hasInline = true;
+        inline = a.substring(eq.unwrap() + 1, a.length);
+      }
+    } else if (a == "-h") {
+      name = "--help";
+    } else if (a.startsWith("-j")) {
+      name = "--jobs";
+      if (a.length > 2) {
+        hasInline = true;
+        inline = a.substring(2, a.length);
+        if (inline.startsWith("=")) {
+          inline = inline.substring(1, inline.length);
+        }
+      }
+    } else if (a.startsWith("-") && a.length > 1) {
+      unknown.push(a);
+      continue;
+    } else {
+      unknown.push(a);
+      continue;
+    }
+    if (name == "--help") {
+      o = Options { ...o, help: true };
+    } else if (name == "--sanitize") {
+      o = Options { ...o, sanitize: true };
+    } else if (name == "--assert-facts") {
+      o = Options { ...o, assertFacts: true };
+    } else {
+      let value = inline;
+      if (!hasInline) {
+        if (i >= argv.length || looksLikeOption(argv[i])) {
+          return fail("argument " + displayName(name) + ": expected one argument");
+        }
+        value = argv[i];
+        i += 1;
+      }
+      const r = apply(o, name, value);
+      if (r.isErr()) {
+        return fail(r.unwrapErr());
+      }
+      o = r.unwrap();
+    }
+  }
+  if (o.help) {
+    return Parsed { ok: true, options: o, error: "" };
+  }
+  if (unknown.length > 0) {
+    return fail("unrecognized arguments: " + unknown.join(" "));
+  }
+  return Parsed { ok: true, options: o, error: "" };
+}

@@ -1,0 +1,78 @@
+import { assertEq, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { parseSpec, headerValue, parseExit, isErrorCode, warningCodes, firstLine, headerLines } from "../src/headers";
+
+@Test
+function headerValueMatchesTheRegexes(): void {
+  assertEqString(headerValue("// exit: 101", "exit").unwrap(), "101", "plain");
+  assertEqString(headerValue("//exit:3", "exit").unwrap(), "3", "no blanks");
+  assertEqString(headerValue("//   flags:   --a  --b   ", "flags").unwrap(), "--a  --b", "stripped");
+  assertEqBool(headerValue("// exits: 1", "exit").isNone(), true, "other key");
+  assertEqBool(headerValue("not a header", "exit").isNone(), true, "no slashes");
+  assertEqString(headerValue("// stderr:", "stderr").unwrap(), "", "empty value");
+}
+
+@Test
+function exitValues(): void {
+  assertEq(parseExit("101").unwrap(), 101, "positive");
+  assertEq(parseExit("-11").unwrap(), -11, "negative");
+  assertEqBool(parseExit("1x").isNone(), true, "garbage");
+  assertEqBool(parseExit("-").isNone(), true, "sign only");
+  assertEqBool(parseExit("").isNone(), true, "empty");
+}
+
+@Test
+function errorCodes(): void {
+  assertEqBool(isErrorCode("E0100"), true, "valid");
+  assertEqBool(isErrorCode("E010"), false, "short");
+  assertEqBool(isErrorCode("E01000"), false, "long");
+  assertEqBool(isErrorCode("W0100"), false, "warning");
+  assertEqBool(isErrorCode("E01a0"), false, "letter");
+}
+
+@Test
+function specOfARunTest(): void {
+  const s = parseSpec("// exit: 3\n// exit: 4\n// flags: --check-contracts\n// flags: --x --y\n// warns: W0452 W0450\n// stderr: one\n// stderr: two words\nfunction main(): void {}\n");
+  assertEq(s.wantExit, 4, "the last exit wins");
+  assertEqUsize(s.flags.length, 3, "flags of all lines");
+  assertEqString(s.flags[2], "--y", "third flag");
+  assertEqBool(s.hasWarns, true, "warns present");
+  assertEqString(s.warns.join(" "), "W0450 W0452", "warns sorted");
+  assertEqUsize(s.stderrs.length, 2, "both stderr lines");
+  assertEqString(s.stderrs[1], "two words", "second stderr");
+  assertEqString(s.errorCode, "", "not an error test");
+}
+
+@Test
+function specOfAnErrorTest(): void {
+  assertEqString(parseSpec("// error: E0416\n// stderr: text\n").errorCode, "E0416", "code");
+  assertEqString(parseSpec("// error: E0416 extra\n").errorCode, "", "trailing text");
+  assertEqString(parseSpec("// stderr: x\n// error: E0416\n").errorCode, "", "only the first line counts");
+  assertEqString(parseSpec("").errorCode, "", "empty file");
+}
+
+@Test
+function warnsNoneMeansNoWarnings(): void {
+  const s = parseSpec("// warns: none\nfunction main(): void {}\n");
+  assertEqBool(s.hasWarns, true, "present");
+  assertEqUsize(s.warns.length, 0, "empty list");
+  assertEqBool(parseSpec("function main(): void {}\n").hasWarns, false, "absent");
+}
+
+@Test
+function headerBlockEndsAtTheFirstOtherLine(): void {
+  const ls = headerLines("// a\n// b\ncode\n// c\n", 16);
+  assertEqUsize(ls.length, 2, "two header lines");
+  assertEqString(firstLine("  // error: E0100  \nrest"), "// error: E0100", "first line stripped");
+  const s = parseSpec("// flags: --a\n\n// flags: --b\n");
+  assertEqUsize(s.flags.length, 1, "a blank line ends the block");
+}
+
+@Test
+function warningCodesAreFound(): void {
+  const t = "f.or:1:1: warning[W0451]: x\nf.or:2:1: error[E0100]: y\nf.or:3:1: warning[W0450]: z warning[W045]: no warning[W04501]\n";
+  const w = warningCodes(t);
+  assertEqUsize(w.length, 2, "two codes");
+  assertEqString(w[0], "W0451", "first");
+  assertEqString(w[1], "W0450", "second");
+  assertEqUsize(warningCodes("").length, 0, "empty");
+}
