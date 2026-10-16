@@ -1,0 +1,240 @@
+import { buildSite, OutFile } from "../src/site";
+import { Snap, Sym, Rel, Diff, decodeDiff } from "../src/model";
+import { buildIx, NONE } from "../src/index";
+import {
+  ruleSentences, sentencesOfSig, contractKindOf, exprOfSig, capPhrase, capArea, titleOfId, plainDoc, assuranceKey, buildBiz, behaviourChanges,
+  BChange,
+} from "../src/business";
+import { assertEqString, assertEqBool, assertEq, assert } from "std:test";
+
+function one(kind: string, expr: string): string {
+  return ruleSentences(kind, expr).join(" | ");
+}
+
+@Test
+function simple_comparisons_read_as_sentences(): void {
+  assertEqString(one("requires", "n > 0"), "N must be positive.", "> 0");
+  assertEqString(one("requires", "qty >= 0"), "Qty must be zero or greater.", ">= 0");
+  assertEqString(one("requires", "x < 0"), "X must be negative.", "< 0");
+  assertEqString(one("requires", "x <= 0"), "X must be zero or less.", "<= 0");
+  assertEqString(one("requires", "age >= 18"), "Age must be at least 18.", ">= N");
+  assertEqString(one("requires", "age > 17"), "Age must be greater than 17.", "> N");
+  assertEqString(one("requires", "age < 130"), "Age must be less than 130.", "< N");
+  assertEqString(one("requires", "age <= 129"), "Age must be at most 129.", "<= N");
+  assertEqString(one("requires", "code == 200"), "Code must be equal to 200.", "==");
+  assertEqString(one("requires", "x != 5"), "X must not be equal to 5.", "!=");
+  assertEqString(one("requires", "0 < n"), "N must be positive.", "a literal on the left is turned around");
+  assertEqString(one("requires", "(n > 0)"), "N must be positive.", "parentheses");
+}
+
+@Test
+function the_kind_of_clause_chooses_the_wording(): void {
+  assertEqString(one("ensures", "result >= 0"), "The result will be zero or greater.", "ensures");
+  assertEqString(one("invariant", "this.items >= 0"), "Items is always zero or greater.", "invariant, this. dropped");
+  assertEqString(one("invariant", "this.items != 7"), "Items is never equal to 7.", "invariant, negated");
+  assertEqString(one("ensures", "result != 0"), "The result will not be equal to zero.", "ensures, negated");
+  assertEqString(one("other", "n > 0"), "N must be positive.", "an unknown kind reads like requires");
+}
+
+@Test
+function emptiness_flags_and_checks(): void {
+  assertEqString(one("requires", "name.length > 0"), "Name must not be empty.", "non-empty");
+  assertEqString(one("requires", "name.length == 0"), "Name must be empty.", "empty");
+  assertEqString(one("requires", "name.length >= 3"), "The length of name must be at least 3.", "a real length bound");
+  assertEqString(one("requires", "ready"), "Ready must be true.", "a flag");
+  assertEqString(one("requires", "!ready"), "Ready must be false.", "a negated flag");
+  assertEqString(one("requires", "isValid(x)"), "The check isValid(x) must be true.", "a call");
+}
+
+@Test
+function conjunctions_and_alternatives(): void {
+  assertEqString(one("requires", "percent >= 0 && percent <= 100"), "Percent must be zero or greater. | Percent must be at most 100.", "&& gives two sentences");
+  assertEqString(one("requires", "a == 1 || a == 2"), "Either a must be equal to 1, or a must be equal to 2.", "|| gives one sentence");
+  assertEqString(one("requires", "(a > 0 && b > 0) || c > 0"), "Either a must be positive and b must be positive, or c must be positive.", "nesting");
+  assertEqString(one("ensures", "a > 0 => b > 0"), "If a will be positive, then b will be positive.", "implication");
+  assertEqString(one("requires", "ok(a && b)"), "The check ok(a && b) must be true.", "a call is not split");
+}
+
+@Test
+function odd_input_never_traps(): void {
+  assertEqString(one("requires", ""), "The condition  must hold.", "empty");
+  assertEqString(one("requires", "<script>alert(1)</script>"), "The condition <script>alert(1)</script> must hold.", "hostile text stays text");
+  assertEqString(one("requires", "x >"), "The condition x > must hold.", "an operator without a right side");
+  assertEqString(one("requires", "\"a&&b\" == s"), "\"a&&b\" must be equal to s.", "a string literal is not split");
+}
+
+@Test
+function clause_text_is_taken_apart(): void {
+  assertEqString(contractKindOf("@Requires(n > 0)"), "requires", "kind");
+  assertEqString(contractKindOf("@Invariant(this.items >= 0)"), "invariant", "kind of an invariant");
+  assertEqString(contractKindOf("function f()"), "", "not a clause");
+  assertEqString(exprOfSig("@Requires(f(a) > 0)"), "f(a) > 0", "nested parentheses");
+  assertEqString(sentencesOfSig("@Ensures(result >= 0)").join(""), "The result will be zero or greater.", "from the source text");
+}
+
+@Test
+function capabilities_and_titles_in_plain_words(): void {
+  assertEqString(capPhrase("Fs.ReadFile"), "read files", "files");
+  assertEqString(capPhrase("Clock.Now"), "read the clock", "clock");
+  assertEqString(capPhrase("Net.Connect"), "open network connections", "network");
+  assertEqString(capPhrase("Thing.Odd"), "perform Thing.Odd", "unknown operations are named, not guessed");
+  assertEqString(capArea("Fs.WriteFile"), "Files", "area");
+  assertEqString(titleOfId("shop:store::saveOrder"), "Save order", "camel case");
+  assertEqString(titleOfId("shop:(root)::main"), "Start the program", "main");
+  assertEqString(titleOfId("shop:cart::Cart.add"), "Cart: add", "method");
+  assertEqString(plainDoc("Adds `n` items.\n\nMore.\n@param n x"), "Adds n items.", "first paragraph without code marks");
+  assertEqString(plainDoc("@param n x"), "", "tags only");
+  assertEqString(assuranceKey("proved"), "proved", "known");
+  assertEqString(assuranceKey("whatever"), "unknown", "unknown stays unknown");
+  assertEqString(assuranceKey(""), "unknown", "absent is unknown");
+}
+
+// ---- a small package and its diff -------------------------------------------------------------------------------------------------------
+
+function sym(id: string, kind: string, name: string, module: string, owner: string, sig: string, doc: string, entry: bool): Sym {
+  return Sym { id: id, kind: kind, name: name, module: module, owner: owner, sig: sig, exported: true, entry: entry,
+               file: "src/a.or", line: 3, endLine: 5, doc: doc, assurance: "" };
+}
+
+function rel(kind: string, src: string, dst: string, ev: string, via: string, next: string): Rel {
+  return Rel { kind: kind, src: src, dst: dst, ev: ev, via: via, file: "src/a.or", line: 4, next: next };
+}
+
+// checkout (an entry point) calls total (two clauses, one effect); helper is not an entry point
+function shop(): Snap {
+  const m = "p:m";
+  return Snap {
+    schema: "osig/0.3", pkg: "p", hash: "h",
+    nodes: [
+      sym(m, "Module", "m", "m", "p", "", "", false),
+      sym(m + "::checkout", "Function", "checkout", "m", m, "function checkout(): void", "Charges the cart.\n\nSecond paragraph.", true),
+      sym(m + "::checkout@requires#0", "Contract", "requires", "m", m + "::checkout", "@Requires(user.length > 0)", "", false),
+      sym(m + "::helper", "Function", "helper", "m", m, "function helper(): void", "", false),
+      sym(m + "::total", "Function", "total", "m", m, "function total(): int", "", false),
+      sym(m + "::total@ensures#0", "Contract", "ensures", "m", m + "::total", "@Ensures(result >= 0)", "", false),
+      sym(m + "::total@requires#0", "Contract", "requires", "m", m + "::total", "@Requires(qty >= 0)", "", false),
+      sym("~io:Net.Connect", "Effect", "Net.Connect", "", "", "OUTPUT; grant: Host", "", false),
+    ],
+    edges: [
+      rel("CALLS", m + "::checkout", m + "::total", "MUST", "direct", ""),
+      rel("MAY_PERFORM", m + "::total", "~io:Net.Connect", "MUST", "OUTPUT", ""),
+      rel("MAY_PERFORM", m + "::checkout", "~io:Net.Connect", "MAY", "OUTPUT", m + "::total"),
+    ],
+  };
+}
+
+@Test
+function use_cases_collect_rules_and_capabilities(): void {
+  const ix = buildIx(shop());
+  const b = buildBiz(ix);
+  assertEq(b.usecases.length.toInt(), 1, "only the entry point is a use case");
+  const u = b.usecases[0];
+  assertEqString(u.title, "Checkout", "title");
+  assertEqString(u.desc, "Charges the cart.", "description is the first paragraph");
+  assertEq(u.rules.length.toInt(), 3, "its own clause and the two of total, which it calls");
+  assertEq(u.ownRules, 1, "one clause is its own");
+  assertEqString(b.rules[u.rules[0]].sentences[0], "User must not be empty.", "own rules come first");
+  assertEq(u.caps.length.toInt(), 1, "one capability");
+  assertEqString(capPhrase(u.caps[0].op), "open network connections", "in plain words");
+  assertEqString(b.rules[u.rules[1]].assurance, "unknown", "no status in the snapshot is unknown, never guessed");
+  assertEq(b.rules[u.rules[1]].users, 1, "the clause knows how many use cases rely on it");
+  assertEq(b.caps.length.toInt(), 1, "one package capability");
+  assertEqString(b.caps[0].grant, "host permission", "permission");
+}
+
+function diffOf(body: string): Diff {
+  const d = decodeDiff("{\"schema\":\"osig-diff/0.2\",\"base\":{\"package\":\"p\",\"hash\":\"a\"},\"head\":{\"package\":\"p\",\"hash\":\"b\"},\"differences\":true,"
+    + "\"effectsComparable\":true,\"summary\":{\"truncated\":false}," + body + "}");
+  assertEqBool(d.isOk(), true, "the diff decodes");
+  return d.unwrap();
+}
+
+function heads(cs: BChange[]): string {
+  let r: string[] = [];
+  for (const c of cs) {
+    r.push(c.area + "/" + c.op + ": " + c.headline);
+  }
+  return r.join("\n");
+}
+
+@Test
+function behaviour_diff_names_rules_use_cases_and_capabilities(): void {
+  const d = diffOf("\"addedSymbols\":[{\"id\":\"p:m::total@requires#0\",\"kind\":\"Contract\",\"sig\":\"@Requires(qty >= 0)\"},"
+    + "{\"id\":\"p:m::checkout\",\"kind\":\"Function\",\"entry\":true,\"sig\":\"function checkout(): void\"}],"
+    + "\"removedSymbols\":[{\"id\":\"p:m::oldFlow\",\"kind\":\"Function\",\"entry\":true},{\"id\":\"p:m::total@requires#1\",\"kind\":\"Contract\",\"sig\":\"@Requires(unit > 0)\"}],"
+    + "\"changedSymbols\":[{\"id\":\"p:m::total@ensures#0\",\"kind\":\"Contract\",\"aspects\":[\"contract\"],\"before\":\"@Ensures(result > 0)\",\"after\":\"@Ensures(result >= 0)\"}],"
+    + "\"effectChanges\":[{\"kind\":\"added\",\"function\":\"p:m::total\",\"module\":\"m\",\"operation\":\"Net.Connect\",\"direction\":\"OUTPUT\",\"evidence\":\"MUST\","
+    + "\"reach\":{\"target\":\"p:m::total\",\"entryPaths\":[{\"evidence\":\"MUST\",\"steps\":[{\"node\":\"p:m::checkout\"},{\"node\":\"p:m::total\"}]}]}},"
+    + "{\"kind\":\"added\",\"function\":\"p:m::checkout\",\"module\":\"m\",\"operation\":\"Net.Connect\",\"direction\":\"OUTPUT\",\"evidence\":\"MAY\"}]");
+  const cs = behaviourChanges(buildIx(shop()), d);
+  const text = heads(cs);
+  assertEqBool(text.indexOf("rule/added: New rule: Qty must be zero or greater.").isSome(), true, "new rule");
+  assertEqBool(text.indexOf("rule/removed: Rule removed: Unit must be positive.").isSome(), true, "removed rule");
+  assertEqBool(text.indexOf("rule/changed: Rule changed: The result will be zero or greater.").isSome(), true, "changed rule");
+  assertEqBool(text.indexOf("usecase/added: New use case: Checkout").isSome(), true, "new use case");
+  assertEqBool(text.indexOf("usecase/removed: Use case removed: Old flow").isSome(), true, "removed use case");
+  assertEqBool(text.indexOf("capability/added: Use case Checkout may now open network connections.").isSome(), true, "capability of the entry point");
+  assertEqBool(text.indexOf("New capability for the whole software: it may now open network connections.").isSome(), true, "first time in the package");
+  assertEqString(cs[0].area, "capability", "capabilities are listed first");
+  let wasChanged = "";
+  for (const c of cs) {
+    if (c.op == "changed") {
+      wasChanged = c.detail;
+    }
+  }
+  assertEqBool(wasChanged.indexOf("Was: The result will be positive.").isSome(), true, "the old wording of a changed rule");
+}
+
+@Test
+function a_renamed_use_case_is_one_change(): void {
+  const d = diffOf("\"addedSymbols\":[{\"id\":\"p:m::checkout\",\"kind\":\"Function\",\"entry\":true}],"
+    + "\"removedSymbols\":[{\"id\":\"p:m::payNow\",\"kind\":\"Function\",\"entry\":true}],"
+    + "\"possibleRenames\":[{\"kind\":\"Function\",\"from\":\"p:m::payNow\",\"to\":\"p:m::checkout\",\"confidence\":\"medium\"}]");
+  const text = heads(behaviourChanges(buildIx(shop()), d));
+  assertEqBool(text.indexOf("Use case renamed: Pay now is now called Checkout").isSome(), true, "one rename line");
+  assertEqBool(text.indexOf("New use case").isSome() || text.indexOf("Use case removed").isSome(), false, "no addition and removal besides it");
+}
+
+@Test
+function an_effect_that_other_functions_had_is_not_new_for_the_package(): void {
+  let snap = shop();
+  snap.edges.push(rel("MAY_PERFORM", "p:m::helper", "~io:Net.Connect", "MUST", "OUTPUT", ""));
+  const d = diffOf("\"effectChanges\":[{\"kind\":\"added\",\"function\":\"p:m::total\",\"module\":\"m\",\"operation\":\"Net.Connect\",\"direction\":\"OUTPUT\",\"evidence\":\"MUST\"}]");
+  const text = heads(behaviourChanges(buildIx(snap), d));
+  assertEqBool(text.indexOf("Function Total may now open network connections.").isSome(), true, "without entry paths the function is named");
+  assertEqBool(text.indexOf("whole software").isSome(), false, "not a new capability of the package");
+}
+
+@Test
+function no_differences_give_no_behaviour_changes(): void {
+  assertEq(behaviourChanges(buildIx(shop()), diffOf("\"changedSymbols\":[]")).length.toInt(), 0, "empty");
+}
+
+@Test
+function hostile_text_is_escaped_on_the_business_pages(): void {
+  const evil = "<script>alert(1)</script>&\"'";
+  const m = "p:m";
+  const snap = Snap {
+    schema: "osig/0.3", pkg: "p", hash: evil,
+    nodes: [
+      sym(m, "Module", "m", "m", "p", "", "", false),
+      sym(m + "::f", "Function", "f", "m", m, "function f(): void", "Does " + evil + "\n\n```\n" + evil + "\n```", true),
+      sym(m + "::f@requires#0", "Contract", "requires", "m", m + "::f", "@Requires(" + evil + ")", "", false),
+      sym("~io:Fs." + evil, "Effect", "Fs." + evil, "", "", "INPUT; grant: FsGrant", "", false),
+    ],
+    edges: [rel("MAY_PERFORM", m + "::f", "~io:Fs." + evil, "MUST", "INPUT", "")],
+  };
+  const d = diffOf("\"addedSymbols\":[{\"id\":\"p:m::f@requires#0\",\"kind\":\"Contract\",\"sig\":\"@Requires(<b>x</b>)\"}]");
+  let any = false;
+  for (const f of buildSite(snap, Some(d))) {
+    if (f.path.endsWith(".html") && (f.path.startsWith("business") || f.path == "rules.html" || f.path == "usecases.html" || f.path == "capabilities.html"
+        || f.path == "behaviour.html" || f.path.startsWith("u/"))) {
+      any = true;
+      assertEqBool(f.text.indexOf("<script>alert").isSome(), false, f.path + ": raw script");
+      assertEqBool(f.text.indexOf("<b>x</b>").isSome(), false, f.path + ": raw tag");
+      assertEqBool(f.text.indexOf("<style").isSome(), false, f.path + ": inline style");
+      assertEqBool(f.text.indexOf("https://").isSome(), false, f.path + ": remote");
+    }
+  }
+  assertEqBool(any, true, "business pages were written");
+}
