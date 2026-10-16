@@ -1,0 +1,101 @@
+// Orin CLI test harness (ADR-0047 phase 5): the Orin port of tools/test_osig.py and tools/test_fmt.py, with the same test
+// cases, assertions, `FAIL ...` lines, summaries and exit status. See tooling/clitests/README.md and docs/testing.md.
+//
+//   orin-clitests osig [--orin PATH] [--update] [--root DIR]
+//   orin-clitests fmt [--orin2 PATH] [--no-build] [--jobs N] [-v] [--root DIR]
+//
+// `osig` runs `orin graph` / `orin diff` of the compiler under test (--orin, default build/bootstrap/orin2) against the
+// golden snapshots in tests/osig. `fmt` builds compiler/main.or and compiler/tests/parse_main.or with the bootstrapped
+// compiler (--orin2) into build/fmt/ and checks `orin fmt` and `orin check --format=json` with them.
+// Exit status: 0 every check passed, 1 a check failed or the run could not be completed, 2 usage.
+
+import { Host, withHost } from "std:host";
+import { ProcessGrant, args, exit } from "std:process";
+import { FsGrant, exists } from "std:fs";
+import { shell } from "std:io";
+import { shq, strip } from "./text";
+import { absolute } from "./strs";
+import { Options, parseArgs, usage, helpText } from "./cli";
+import { Ctx, makeTemp, readText } from "./ctx";
+import { runOsig } from "./osig";
+import { Fmt, runFmt, buildExe, cpuCount } from "./fmt";
+
+function runOsigSuite(fs: FsGrant, proc: ProcessGrant, o: Options, cwd: string, root: string): int {
+  const orin = o.orin == "" ? root + "/build/bootstrap/orin2" : absolute(cwd, o.orin);
+  const note = "/tmp/orin-clitests-osig.note";
+  const tmp = makeTemp(fs, proc, "orin-osig-", note);
+  const work = makeTemp(fs, proc, "orin-osig-ctx-", note);
+  if (tmp == "" || work == "") {
+    console.error("orin-clitests: cannot create a work directory");
+    return 1;
+  }
+  const c = new Ctx(work, root);
+  runOsig(fs, proc, c, orin, tmp, o.update);
+  const t = c.totals(fs);
+  shell(proc, "rm -rf " + shq(tmp) + " " + shq(work) + " " + shq(note));
+  console.log(t.checks.toString() + " checks, " + t.failures.toString() + " failures");
+  return t.failures > 0 ? 1 : 0;
+}
+
+function runFmtSuite(fs: FsGrant, proc: ProcessGrant, o: Options, root: string): int {
+  const out = root + "/build/fmt";
+  const orin2 = absolute(root, o.orin2);
+  if (!exists(fs, orin2)) {
+    console.error("missing " + o.orin2 + " (run tools/bootstrap.sh)");
+    return 1;
+  }
+  const work = out + "/work";
+  if (shell(proc, "mkdir -p " + shq(out) + " && rm -rf " + shq(work) + " && mkdir -p " + shq(work)) != 0) {
+    console.error("orin-clitests: cannot create " + work);
+    return 1;
+  }
+  let fmtExe = out + "/orin";
+  let parseExe = out + "/parse_main";
+  if (!(o.noBuild && exists(fs, fmtExe))) {
+    fmtExe = buildExe(fs, proc, root, orin2, out, "compiler/main.or", "orin");
+    if (fmtExe == "") {
+      return 1;
+    }
+    parseExe = buildExe(fs, proc, root, orin2, out, "compiler/tests/parse_main.or", "parse_main");
+    if (parseExe == "") {
+      return 1;
+    }
+  }
+  const workers = o.jobs > 0 ? o.jobs.toUsize() : 2 * cpuCount(fs, proc, work + "/cpus");
+  const c = new Ctx(work, root);
+  runFmt(fs, proc, c, new Fmt(root, work, fmtExe, parseExe, o.verbose), workers);
+  const t = c.totals(fs);
+  shell(proc, "rm -rf " + shq(work));
+  return t.failures > 0 ? 1 : 0;
+}
+
+function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  const parsed = parseArgs(argv);
+  if (!parsed.ok) {
+    console.error(usage());
+    console.error("orin-clitests: error: " + parsed.error);
+    return 2;
+  }
+  if (parsed.options.help) {
+    console.log(helpText());
+    return 0;
+  }
+  const o: Options = parsed.options;
+  // the working directory and the repository root, absolute (the commands below `cd`)
+  const scratch = "/tmp/orin-clitests-cwd." + o.suite;
+  if (shell(proc, "pwd -P > " + shq(scratch) + " && cd " + shq(o.root) + " && pwd -P >> " + shq(scratch)) != 0) {
+    console.error("orin-clitests: cannot enter the root " + o.root);
+    return 1;
+  }
+  const where = readText(fs, scratch).split("\n");
+  shell(proc, "rm -f " + shq(scratch));
+  if (o.suite == "osig") {
+    return runOsigSuite(fs, proc, o, where[0], where[1]);
+  }
+  return runFmtSuite(fs, proc, o, where[1]);
+}
+
+function main(host: Host): void {
+  const code = withHost(host, (fs, proc, stdio, clock) => run(fs, proc, args(proc)));
+  exit(code);
+}
