@@ -28,6 +28,10 @@ Mutation classes (id: injected bug -> required reaction)
   extra-dup           `t = dup x` before `release x`, t unused    -> a leak WARNING (or an error)
   inout-drop-receiver delete `l0 = move ..` in an inout function  -> ERROR (l0 must hold the receiver at return)
   inout-release-receiver `release l0` before a return of an inout function -> ERROR (same)
+  string appends (`strappend`, `strprepend`, `strappendi` / `strappendu`, `strappendsub`, docs/mir.md v2.5; every one in the corpus):
+  append-after-release  `release x` right before `strappend* x, ..`               -> ERROR (x is dead)
+  append-borrowed       `t = borrow x`, then `strappend* t, ..`                    -> ERROR (a borrowed string is not mutated in place)
+  append-kills-borrow   `t = borrow x` before `strappend* x, ..`, read t after it -> ERROR (the append invalidated the borrow)
   load forwarding (rule F1, docs/mir.md v2.4; applied to every `d = forward s, o[key]` of the optimised corpus):
   fwd-across-write    write the same slot of o between the source and the forward      -> ERROR unjustified forward
   fwd-other-slot-ok   write a DIFFERENT slot of o there (positive control)             -> ACCEPTED (rejection is a finding)
@@ -36,7 +40,7 @@ Mutation classes (id: injected bug -> required reaction)
   fwd-across-push     `arraypush o` between them (array objects)                       -> ERROR unjustified forward
   fwd-wrong-slot      forward from the load of another slot (key differs)              -> ERROR unjustified forward
   fwd-across-block    split the block between the source and the forward               -> ERROR unjustified forward
-  unchecked array access (rule U1, docs/mir.md v2.5; applied to every `arraygetu` / `arraysetu` of the optimised corpus):
+  unchecked array access (rule U1, docs/mir.md v2.6; applied to every `arraygetu` / `arraysetu` of the optimised corpus):
   bce-no-fact         make a checked access unchecked that has no earlier access of (a, i) in its block -> ERROR without a dominating check
   bce-across-push     `arraypush a` between the checked access and the unchecked one         -> ERROR without a dominating check
   bce-after-redef     redefine the array local there (`t = dup a; a = move t`)               -> ERROR without a dominating check
@@ -161,6 +165,7 @@ def op(line):
     return m.group(1)
 
 
+APPENDS = ("strappend", "strprepend", "strappendi", "strappendu", "strappendsub")
 STORES = ("setfield", "putfield", "arrayset", "arraysetu", "arrayput")
 TAKES = ("takefield", "arraytake")
 
@@ -174,6 +179,11 @@ def store_obj(line):
     if w in TAKES:
         return t[1]
     return None
+
+
+def replace_obj_first(line, old, new):
+    """Replace the first local of an instruction that has no destination (`strappend l3, l4`)."""
+    return re.sub(r"\bl%d\b" % old, "l%d" % new, line, count=1)
 
 
 def replace_obj(line, old, new):
@@ -427,6 +437,11 @@ def sites(f):
                 elif nxt == "def":
                     benign = "l%d is overwritten before any use in the block" % d
                 out.append(Mut("drop-dup", f, (bi, ii), "delete `%s` (b%d i%d)" % (line, bi, ii), benign, "dead", "error"))
+            if w in APPENDS:
+                x = t[0]
+                out.append(Mut("append-after-release", f, (bi, ii), "release l%d before `%s` (b%d i%d)" % (x, line, bi, ii), None, "is dead", "error"))
+                out.append(Mut("append-borrowed", f, (bi, ii), "append through a borrow of l%d in `%s` (b%d i%d)" % (x, line, bi, ii), None, None, "error"))
+                out.append(Mut("append-kills-borrow", f, (bi, ii), "read a borrow of l%d taken before `%s` (b%d i%d)" % (x, line, bi, ii), None, "is dead", "error"))
             if w == "forward":
                 out += forward_sites(f, bi, ii, line)
             if w in ("arraygetu", "arraysetu"):
@@ -749,6 +764,17 @@ def apply(m):
         ins.insert(ii, "l%d = borrow l%d" % (n, x))
     elif m.cls in ("drop-makeunique", "redundant-makeunique-census"):
         del ins[ii]
+    elif m.cls == "append-after-release":
+        ins.insert(ii, "release l%d" % t[0])
+    elif m.cls == "append-borrowed":
+        n = f.new_local()
+        ins[ii] = replace_obj_first(line, t[0], n)
+        ins.insert(ii, "l%d = borrow l%d" % (n, t[0]))
+    elif m.cls == "append-kills-borrow":
+        n = f.new_local()
+        ins.insert(ii, "l%d = borrow l%d" % (n, t[0]))
+        n2 = f.new_local()
+        ins.insert(ii + 2, "l%d = borrow l%d" % (n2, n))
     elif m.cls == "release-borrowed":
         ins.insert(ii + 1, "release l%d" % dest(line))
     elif m.cls == "drop-dup":

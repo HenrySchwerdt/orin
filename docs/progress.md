@@ -63,6 +63,7 @@ concat reuse in place (#68, MIR v2.3), CI sharding of `backends` plus LLVM `.par
 instruction parity (#69, ADR-0038 §8 gate 1); the last four through the integration PR #70. Effect: self-compile -38.8%
 executed instructions, -93% retains; census numbers and the lever ranking in
 [`perf/alloc-census.md`](perf/alloc-census.md).
+Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ranking (string intermediates first, then `Span`/`Token` flattening, escape analysis; T6 pending): [`perf/alloc-census.md`](perf/alloc-census.md) section "Since #71".
 
 1. **Performance, lever 2: field and element access code** (not a census class; design accepted 2026-10-15, ADR-0038
    addendum "lever 2"): `make_unique` + `struct_get` / `struct_replace` per field write and repeated bounds-checked element
@@ -73,16 +74,24 @@ executed instructions, -93% retains; census numbers and the lever ranking in
    T6 (range facts) needs its own decision.
    Lever 1 (verifier and optimiser data structures) is done: self-compile -23% allocations, -3.2% instructions; the
    remaining self-compile time is no longer allocation.
-2. **Performance, next ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
+2. **Performance, census row 1 (string intermediates) is done** (ADR-0038 addendum 2026-10-16, MIR v2.5: `IStrAppendNum`,
+   `IStrAppendSub`): mapfreq -27.7%, wordfreq -28.9%, html -36.6%, strings -37.8% executed instructions; html -60% and html_hand
+   -98% allocations (html_hand -65% instructions); self-compile -0.5%. The mapfreq / wordfreq allocations stay (the number string is the map key). Next in the
+   census ranking: `Span` / `Token` flattening, then escape analysis. `Span` / `Token` flattening was measured 2026-10-16 and
+   dropped: its cheapest part (`skipTrivia` returning a plain `usize`, removing ~507k `Ok(i)`) gives only -0.29% self-compile
+   instructions, and flattening `Span` itself needs value types (every `toks[i].span` / `spanTo` would re-allocate it).
+   T2 (unchecked dominated accesses, draft #98) is parked: gcc -O2 already removes the second check, gain nil; it is the
+   base for T6, whose ceiling (all array kind + bounds checks removed) is nbody -53%, pqueue -37%, sieve -18% instructions.
+3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
-3. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
+4. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
-4. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
+5. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
    global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.
-5. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
+6. **Rewrite:** `compiler/vc/` and the remaining checker files. Then the rule-7 stream-style sweep, and later
    `.parallel()` per compiler phase (ADR-0039 §6).
-6. **Follow-ups:**
+7. **Follow-ups:**
    - `HStmt` spans for break/continue/return;
    - trap hook and cancellation for tasks (prerequisite for ADR-0041 Stage D);
    - ADR-0040 (generic methods);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute IArrayGetU / IArraySetU MIR on the C and LLVM backends (ADR-0038 lever 2 T2, docs/mir.md v2.5).
+"""Execute IArrayGetU / IArraySetU MIR on the C and LLVM backends (ADR-0038 lever 2 T2, docs/mir.md v2.6).
 
 variant 0 is verifier-accepted (the unchecked load also overwrites its own index local): it must run to completion with
 `--assert-facts` on and off. Variants 1 (index out of bounds) and 2 (an unchecked access on a struct) are NOT verifier-accepted:

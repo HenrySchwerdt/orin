@@ -170,6 +170,12 @@ similar bounded builders; do not reuse legacy recursive concatenation unchecked.
 
 ## Decision 4: field-path-aware decoders, with ordinary Result composition
 
+Implemented initial slice: [std:jsondecode](../std-jsondecode.md) provides the
+non-floating-point helpers below, plus `cursorValue`, `cursorPath`, and
+`formatPath`. Error constructors use a `Decode` prefix to coexist with imported
+number errors. The sealed wrapper contains opaque read-only state to protect
+array paths; getters return COW copies. Float conversion remains deferred.
+
 Add a proposed `std:jsondecode` library over JsonValue, separately from I/O:
 
 ```typescript
@@ -213,7 +219,7 @@ array cursors allocate O(elements * path depth). State those bounds, cap them,
 and measure before adding an indexed object API. Repeated caller operations are
 not covered by a hidden global work quota. Fail-fast errors keep ordering stable.
 
-Illustrative future API example (not compilable until the proposed libraries exist):
+The pure config example is now executable in `examples/json_config.or`:
 
 ```typescript
 type Config = { endpoint: string; port: int; enabled: bool; };
@@ -309,3 +315,14 @@ owned by std:jsonnumber; a future JsonValue module can import/re-export them
 rather than define a second number type. Float utilities, document parsing/writing,
 decoders and bridges remain proposals, not shipped APIs. See
 [the concrete number API](../std-jsonnumber.md) for this slice's contract.
+
+## Approved document slice: std:jsonvalue
+
+The bounded parser/compact-writer slice is a separate std:jsonvalue module,
+consistent with the reviewed std:jsonnumber placement. It owns JsonValue,
+JsonMember, document limits/options and document errors, and imports the existing
+sealed number type instead of duplicating it. This keeps opt-in tree semantics
+and stricter Unicode/duplicate policies distinct from both legacy parsers.
+No JsonValue re-export or behavior change is added to std:json. Float conversion,
+decoders and protocol migration remain deferred. See the
+[document API and exact error policies](../std-jsonvalue.md).

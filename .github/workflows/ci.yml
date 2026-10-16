@@ -27,6 +27,7 @@ jobs:
       vscode: ${{ steps.f.outputs.vscode }}
       mutants: ${{ steps.f.outputs.mutants }}
       mutant_jobs: ${{ steps.f.outputs.mutant_jobs }}
+      std_backend_checks: ${{ steps.f.outputs.std_backend_checks }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -232,7 +233,7 @@ jobs:
       - name: Runtime unit tests incl. shape-confusion traps (ASan + UBSan, finding F-shape)
         run: |
           mkdir -p build
-          cc -g -fsanitize=address,undefined -I runtime runtime/tests/runtime_test.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/runtime_test
+          cc -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime runtime/tests/runtime_test.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/runtime_test
           build/runtime_test
       - name: Mutation corpus (injected ownership bugs must be rejected by the verifier, docs/assurance.md P0)
         run: python3 tools/mutate_mir.py
@@ -273,6 +274,38 @@ jobs:
       - run: tar -xzf bootstrap.tgz
       - name: "Provable std (std:bytes, std:utf8, std:collections, std:http, std:task: tests with and without contract checking)"
         run: tools/test_std.sh
+
+  # New std modules already have C @Test coverage; their independent oracles/backend harnesses
+  # run only when selected. Ubuntu's runner supplies clang; Python 3.12 is pinned explicitly.
+  std-backends:
+    needs: [changes, build]
+    if: needs.changes.outputs.std_backend_checks != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.std_backend_checks != '[]'
+        with:
+          python-version: '3.12'
+      - name: Check targeted std runner tools
+        if: needs.changes.outputs.std_backend_checks != '[]'
+        run: python3 --version && clang --version
+      - name: Encoding vectors, Python oracle, C/LLVM contracts on/off and C sanitizers
+        if: contains(fromJSON(needs.changes.outputs.std_backend_checks), 'encoding')
+        timeout-minutes: 8
+        run: python3 tools/check_encoding.py --orinc build/bootstrap/orin2 --skip-bench
+      - name: JSON-number vectors, Python oracle, C/LLVM contracts on/off and C sanitizers
+        if: contains(fromJSON(needs.changes.outputs.std_backend_checks), 'jsonnumber')
+        timeout-minutes: 8
+        run: python3 tools/check_jsonnumber.py --orinc build/bootstrap/orin2 --skip-bench
+      - name: URL vectors and round trips, C/LLVM contracts on/off
+        if: contains(fromJSON(needs.changes.outputs.std_backend_checks), 'url')
+        timeout-minutes: 8
+        run: python3 bench/url/check.py --orin build/bootstrap/orin2 --skip-bench
 
   std-mutants:
     needs: [changes, build]
@@ -332,6 +365,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bootstrap on macOS arm64 (clang, BSD userland)
         run: ./tools/bootstrap.sh
+      - uses: actions/setup-python@v5
+        if: needs.changes.outputs.std_backend_checks != '[]'
+        with:
+          python-version: '3.12'
+      - name: Check targeted std runner tools
+        if: needs.changes.outputs.std_backend_checks != '[]'
+        run: python3 --version && clang --version
+      - name: Encoding vectors, Python oracle, C/LLVM contracts on/off and C sanitizers
+        if: contains(fromJSON(needs.changes.outputs.std_backend_checks), 'encoding')
+        timeout-minutes: 8
+        run: python3 tools/check_encoding.py --orinc build/bootstrap/orin2 --skip-bench
+      - name: JSON-number vectors, Python oracle, C/LLVM contracts on/off and C sanitizers
+        if: contains(fromJSON(needs.changes.outputs.std_backend_checks), 'jsonnumber')
+        timeout-minutes: 8
+        run: python3 tools/check_jsonnumber.py --orinc build/bootstrap/orin2 --skip-bench
+      - name: URL vectors and round trips, C/LLVM contracts on/off
+        if: contains(fromJSON(needs.changes.outputs.std_backend_checks), 'url')
+        timeout-minutes: 8
+        run: python3 bench/url/check.py --orin build/bootstrap/orin2 --skip-bench
       - name: Release CLI journeys on macOS
         env:
           ORIN2: build/bootstrap/orin2

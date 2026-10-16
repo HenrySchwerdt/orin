@@ -24,7 +24,7 @@ import { Locals, OwnedScope } from "./state";
 import { preludeSlot } from "./prelude";
 import {
   Lits, litId, isRefTy, isHandleTy, isVoidTy, isUsizeTy, isStringTy, isF32Ty, mty, isSimple,
-  hasEffects, armsHaveEffects,
+  hasEffects, armsHaveEffects, numTextArg, numTextUnsigned,
 } from "./util";
 import {
   Kind, V, Args, kindIsO, kindIsB, localOf, isLocalOp, isOStr, vConst, vVoid, vOwned, vScalar,
@@ -36,6 +36,20 @@ import {
 } from "./ops";
 import { Fin, walkPlace } from "./place";
 import { operandMatches, localsMatchHir, fnWellLowered } from "./wellformed";
+
+// The operands of a left-nested string concatenation `((a + b) + c) + d`, left to right; any other expression is its own
+// single operand.
+function addChain(e: HExpr): HExpr[] {
+  match (e.kind) {
+    XBinary(op, l, r) => {
+      if (isStringTy(e.ty) && isAdd(op)) {
+        return addChain(l).concat([r]);
+      }
+    },
+    _ => {},
+  }
+  return [e];
+}
 
 @Invariant(this.sc.depth() <= this.t.count())
 @Invariant(this.t.count() >= this.fn.locals.length && this.t.hirCount() == this.fn.locals.length)
@@ -427,6 +441,21 @@ export class Lowerer {
       },
       _ => {},
     }
+    if (isStringTy(lhs.ty) && isAdd(op)) {
+      match (numTextArg(rhs)) {
+        Some(n) => {
+          // a + n.toString(): append the digits of n onto an owned copy of a, no temporary string
+          const na = this.args([lhs, n]);
+          let acc = na.ops[0];
+          if (!na.own[0]) {
+            acc = this.dupOf(na.ops[0]);
+          }
+          this.emit(IStrAppendNum(localOf(acc), na.ops[1], numTextUnsigned(rhs)));
+          return vOwned(localOf(acc));
+        },
+        None => {},
+      }
+    }
     const es: HExpr[] = [lhs, rhs];
     const a = this.args(es);
     if (isStringTy(lhs.ty) && isAdd(op)) {
@@ -588,6 +617,17 @@ export class Lowerer {
   }
 
   private builtin(e: HExpr, b: Builtin, args: HExpr[]): V {
+    match (numTextArg(e)) {
+      Some(n) => {
+        // n.toString() as a value: one buffer sized for any number, the digits appended in place
+        const na = this.args([n]);
+        const t = this.temp(MRef);
+        this.emit(IBuiltin(Some(t), BStrWithCapacity, [OInt(24)]));
+        this.emit(IStrAppendNum(t, na.ops[0], numTextUnsigned(e)));
+        return vOwned(t);
+      },
+      None => {},
+    }
     // Built-ins that migrated to the Orin prelude (spec 19 R1) become ordinary calls.
     const slot = preludeSlot(b);
     if (slot >= 0 && slot.toUsize() < this.lits.pre.length && this.lits.pre[slot.toUsize()] >= 0) {
@@ -1225,6 +1265,94 @@ export class Lowerer {
     }
   }
 
+  // `root += value` on a string local. A left-nested chain `a + b + c` is appended piece by piece instead of being
+  // concatenated into a temporary first (`s += "item" + i.toString() + ","`): s ++ ((a ++ b) ++ c) == ((s ++ a) ++ b) ++ c.
+  // Every piece is evaluated, in order, before the first byte is appended, so evaluation order and traps are those of the
+  // single concatenation; the pieces are only appended afterwards. A number converted by `.toString()` appends its digits
+  // (IStrAppendNum) and a piece borrowed from the destination is duplicated first, as for a single `s += x`.
+  private appendPieces(root: usize, value: HExpr): void {
+    const ps = addChain(value);
+    const np = ps.length;
+    let es: HExpr[] = [];
+    let num: bool[] = [];
+    let uns: bool[] = [];
+    // the last piece `x.substring(i, j)` is appended without the substring object (IStrAppendSub); only the last one,
+    // so that no later piece is evaluated before the substring's range check traps (the trap order is unchanged)
+    let sub = false;
+    let k: usize = 0;
+    for (const p of ps) {
+      k += 1;
+      match (numTextArg(p)) {
+        Some(n) => {
+          es.push(n);
+          num.push(true);
+          uns.push(numTextUnsigned(p));
+        },
+        None => {
+          num.push(false);
+          uns.push(false);
+          match (p.kind) {
+            XBuiltin(b, bargs) => {
+              match (b) {
+                BStrSubstring => {
+                  if (k == np) {
+                    sub = true;
+                  }
+                },
+                _ => {},
+              }
+              if (sub) {
+                es.push(bargs[0]);
+                es.push(bargs[1]);
+                es.push(bargs[2]);
+              } else {
+                es.push(p);
+              }
+            },
+            _ => {
+              es.push(p);
+            },
+          }
+        },
+      }
+    }
+    const a = this.args(es);
+    // a piece that is the destination's own value (`s += "a" + s`) must keep the value it had before the first append:
+    // take a reference to it now (the append then copies instead of changing it)
+    let ops: Operand[] = [];
+    let own: bool[] = [];
+    let i: usize = 0;
+    while (i < es.length) {
+      let vop = a.ops[i];
+      let vown = a.own[i];
+      const isStr = i < np - 1 ? !num[i] : (sub ? i == np - 1 : !num[i]);
+      if (isStr && !vown && !isOStr(vop) && a.roots[i] == root) {
+        vop = this.dupOf(vop);
+        vown = true;
+      }
+      ops.push(vop);
+      own.push(vown);
+      i += 1;
+    }
+    i = 0;
+    while (i < np) {
+      if (sub && i == np - 1) {
+        this.emit(IStrAppendSub(root, ops[i], ops[i + 1], ops[i + 2]));
+        if (own[i]) {
+          this.emit(IRelease(localOf(ops[i])));
+        }
+      } else if (num[i]) {
+        this.emit(IStrAppendNum(root, ops[i], uns[i]));
+      } else {
+        this.emit(IStrAppend(root, ops[i]));
+        if (own[i]) {
+          this.emit(IRelease(localOf(ops[i])));
+        }
+      }
+      i += 1;
+    }
+  }
+
   private stAssign(place: Place, op0: Option<BinOp>, value0: HExpr): void {
     const ty = place.ty;
     const root = place.root;
@@ -1240,6 +1368,17 @@ export class Lowerer {
           }
         },
         _ => {},
+      }
+    }
+    if (place.path.length == 0 && isStringTy(ty)) {
+      match (op) {
+        Some(o) => {
+          if (isAdd(o)) {
+            this.appendPieces(root, value);
+            return;
+          }
+        },
+        None => {},
       }
     }
     let es = placeIdxExprs(place);

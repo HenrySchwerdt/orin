@@ -1,0 +1,458 @@
+// Pure validation over JsonValue. No coercion, I/O, source offsets or value leakage.
+// API/error ordering/complexity: docs/std-jsondecode.md.
+import { JsonValue, JsonMember, JsonLimits } from "std:jsonvalue";
+import { JsonNumber, NumberErrorKind, numberAsInt } from "std:jsonnumber";
+import { checkUtf8 } from "std:utf8";
+
+export type PathSegment = Key(string) | Index(usize);
+export type DecodeErrorKind =
+  DecodeMissingField
+  | DecodeWrongType
+  | DecodeNotIntegral
+  | DecodeIntegerRange
+  | DecodeFloatOverflow
+  | DecodeFloatUnderflow
+  | DecodeUnknownField
+  | DecodeDuplicateField
+  | DecodeLimitExceeded
+  | DecodeInvalidLimits
+  | DecodeInvalidSchema;
+export type DecodeError = {
+  kind: DecodeErrorKind;
+  path: PathSegment[];
+  expected: string;
+  actual: string;
+};
+export type UnknownFieldPolicy = RejectUnknown | IgnoreUnknown;
+
+// The private class has only read-only methods. Sealing a wrapper with exposed
+// arrays alone would not protect against all inferred array-method mutations.
+@Invariant(this.segments.length <= this.caps.maxDepth
+    && this.bytes <= this.caps.maxDecodedStringBytes)
+class CursorState {
+  private item: JsonValue;
+  private segments: PathSegment[];
+  private caps: JsonLimits;
+  private bytes: usize;
+  constructor(item: JsonValue, segments: PathSegment[], caps: JsonLimits, bytes: usize) {
+    this.item = item;
+    this.segments = segments;
+    this.caps = caps;
+    this.bytes = bytes;
+  }
+  itemValue(): JsonValue {
+    return this.item;
+  }
+  @Ensures(result.length <= this.caps.maxDepth)
+  pathSegments(): PathSegment[] {
+    return this.segments;
+  }
+  budget(): JsonLimits {
+    return this.caps;
+  }
+  @Ensures(result <= this.caps.maxDecodedStringBytes)
+  pathBytes(): usize {
+    return this.bytes;
+  }
+}
+
+@Sealed
+export type DecodeCursor = { _state: CursorState; };
+
+// Returned values/arrays are COW copies: mutating them cannot change a cursor.
+export function cursorValue(c: DecodeCursor): JsonValue {
+  return c._state.itemValue();
+}
+@Ensures(result.length <= c._state.budget().maxDepth)
+export function cursorPath(c: DecodeCursor): PathSegment[] {
+  return c._state.pathSegments();
+}
+
+function cursor(v: JsonValue, path: PathSegment[], l: JsonLimits, bytes: usize): DecodeCursor {
+  return DecodeCursor { _state: new CursorState(v, path, l, bytes) };
+}
+function extend(path: PathSegment[], segment: PathSegment): PathSegment[] {
+  let out = path;
+  out.push(segment);
+  return out;
+}
+function failure(
+  k: DecodeErrorKind,
+  path: PathSegment[],
+  expected: string,
+  actual: string,
+): DecodeError {
+  return DecodeError { kind: k, path: path, expected: expected, actual: actual };
+}
+function typeName(v: JsonValue): string {
+  return match (v) {
+    ValueNull => "null",
+    ValueBool(_) => "boolean",
+    ValueNumber(_) => "number",
+    ValueString(_) => "string",
+    ValueArray(_) => "array",
+    ValueObject(_) => "object",
+  };
+}
+function wrong(c: DecodeCursor, expected: string): DecodeError {
+  return failure(DecodeWrongType, cursorPath(c), expected, typeName(cursorValue(c)));
+}
+function validLimits(l: JsonLimits): bool {
+  return l.maxInputBytes > 0
+      && l.maxDepth > 0
+      && l.maxDepth <= 200
+      && l.maxNodes > 0
+      && l.maxContainerItems > 0
+      && l.maxStringBytes > 0
+      && l.maxDecodedStringBytes > 0
+      && l.maxNumberBytes > 0
+      && l.maxOutputBytes > 0;
+}
+
+@Invariant(this.path.length <= this.limits.maxDepth
+    && this.nodes <= this.limits.maxNodes
+    && this.decoded <= this.limits.maxDecodedStringBytes
+    && this.bytes <= this.decoded)
+class RootValidator {
+  private limits: JsonLimits;
+  private nodes: usize = 0;
+  private decoded: usize = 0;
+  private path: PathSegment[] = [];
+  private bytes: usize = 0;
+  constructor(limits: JsonLimits) {
+    this.limits = limits;
+  }
+  private bad(k: DecodeErrorKind, expected: string, actual: string): DecodeError {
+    return failure(k, this.path, expected, actual);
+  }
+  private text(s: string, key: bool): Result<void, DecodeError> {
+    if (s.length > this.limits.maxStringBytes) {
+      return Err(
+        this.bad(DecodeLimitExceeded, "maxStringBytes", key ? "key bytes" : "string bytes"),
+      );
+    }
+    if (s.length > this.limits.maxDecodedStringBytes - this.decoded) {
+      return Err(this.bad(DecodeLimitExceeded, "maxDecodedStringBytes", "decoded bytes"));
+    }
+    if (checkUtf8(s).isErr()) {
+      return Err(
+        this.bad(DecodeWrongType, key ? "UTF-8 object key" : "UTF-8 string", "invalid UTF-8"),
+      );
+    }
+    this.decoded += s.length;
+    return Ok();
+  }
+  private visit(v: JsonValue, depth: usize): Result<void, DecodeError> {
+    if (this.nodes == this.limits.maxNodes) {
+      return Err(this.bad(DecodeLimitExceeded, "maxNodes", typeName(v)));
+    }
+    this.nodes += 1;
+    match (v) {
+      ValueNull => {},
+      ValueBool(_) => {},
+      ValueNumber(n) => {
+        if (n.token.length > this.limits.maxNumberBytes) {
+          return Err(this.bad(DecodeLimitExceeded, "maxNumberBytes", "number bytes"));
+        }
+      },
+      ValueString(s) => {
+        this.text(s, false)?;
+      },
+      ValueArray(values) => {
+        if (depth == this.limits.maxDepth) {
+          return Err(this.bad(DecodeLimitExceeded, "maxDepth", "array"));
+        }
+        if (values.length > this.limits.maxContainerItems) {
+          return Err(this.bad(DecodeLimitExceeded, "maxContainerItems", "array items"));
+        }
+        let i: usize = 0;
+        while (i < values.length) {
+          this.path.push(Index(i));
+          this.visit(values[i], depth + 1)?;
+          this.path.pop();
+          i += 1;
+        }
+      },
+      ValueObject(fields) => {
+        if (depth == this.limits.maxDepth) {
+          return Err(this.bad(DecodeLimitExceeded, "maxDepth", "object"));
+        }
+        if (fields.length > this.limits.maxContainerItems) {
+          return Err(this.bad(DecodeLimitExceeded, "maxContainerItems", "object members"));
+        }
+        let seen = new Map<string, bool>();
+        for (const field of fields) {
+          // Invalid/oversized key names are reported at the parent, before adding
+          // an invalid/unbounded string to an error path.
+          this.text(field.key, true)?;
+          this.path.push(Key(field.key));
+          this.bytes += field.key.length;
+          if (seen.has(field.key)) {
+            return Err(this.bad(DecodeDuplicateField, "unique object field", "duplicate field"));
+          }
+          seen.set(field.key, true);
+          this.visit(field.value, depth + 1)?;
+          this.path.pop();
+          this.bytes -= field.key.length;
+        }
+      },
+    }
+    return Ok();
+  }
+  @Ensures(result.isErr() ==> result.unwrapErr().path.length <= this.limits.maxDepth)
+  validate(v: JsonValue): Result<void, DecodeError> {
+    return this.visit(v, 0);
+  }
+}
+
+@Ensures(result.isOk() ==> cursorPath(result.unwrap()).length == 0)
+export function decodeRoot(v: JsonValue, limits: JsonLimits): Result<DecodeCursor, DecodeError> {
+  if (!validLimits(limits)) {
+    return Err(failure(DecodeInvalidLimits, [], "valid JSON limits", "invalid limits"));
+  }
+  let validator = new RootValidator(limits);
+  validator.validate(v)?;
+  return Ok(cursor(v, [], limits, 0));
+}
+
+// Schema names are caller input, bounded separately from the validated tree.
+function schemaKey(c: DecodeCursor, key: string): Result<void, DecodeError> {
+  const l = c._state.budget();
+  if (key.length > l.maxStringBytes) {
+    return Err(failure(DecodeLimitExceeded, cursorPath(c), "maxStringBytes", "schema key bytes"));
+  }
+  if (checkUtf8(key).isErr()) {
+    return Err(failure(DecodeInvalidSchema, cursorPath(c), "UTF-8 field name", "invalid schema"));
+  }
+  return Ok();
+}
+
+function lookup(c: DecodeCursor, key: string): Result<Option<DecodeCursor>, DecodeError> {
+  match (cursorValue(c)) {
+    ValueObject(fields) => {
+      schemaKey(c, key)?;
+      for (const f of fields) {
+        if (f.key == key) {
+          return Ok(
+            Some(
+              cursor(
+                f.value,
+                extend(cursorPath(c), Key(key)),
+                c._state.budget(),
+                c._state.pathBytes() + key.length,
+              ),
+            ),
+          );
+        }
+      }
+      return Ok(None);
+    },
+    _ => {
+      return Err(wrong(c, "object"));
+    },
+  }
+}
+
+@Ensures(result.isOk() ==> cursorPath(result.unwrap()).length == cursorPath(c).length + 1)
+export function requiredField(c: DecodeCursor, key: string): Result<DecodeCursor, DecodeError> {
+  const found = lookup(c, key)?;
+  if (found.isSome()) {
+    return Ok(found.unwrap());
+  }
+  return Err(
+    failure(DecodeMissingField, extend(cursorPath(c), Key(key)), "field present", "missing"),
+  );
+}
+
+// Missing only: a present ValueNull returns Some(cursor), never None.
+@Ensures(result.isOk() && result.unwrap().isSome()
+    ==> cursorPath(result.unwrap().unwrap()).length == cursorPath(c).length + 1)
+export function optionalField(
+  c: DecodeCursor,
+  key: string,
+): Result<Option<DecodeCursor>, DecodeError> {
+  return lookup(c, key);
+}
+
+@Ensures(result.isOk() ==> result.unwrap().length <= c._state.budget().maxStringBytes)
+export function decodeString(c: DecodeCursor): Result<string, DecodeError> {
+  return match (cursorValue(c)) {
+    ValueString(s) => Ok(s),
+    _ => Err(wrong(c, "string")),
+  };
+}
+export function decodeBool(c: DecodeCursor): Result<bool, DecodeError> {
+  return match (cursorValue(c)) {
+    ValueBool(b) => Ok(b),
+    _ => Err(wrong(c, "boolean")),
+  };
+}
+@Ensures(result.isOk() ==> result.unwrap().token.length <= c._state.budget().maxNumberBytes)
+export function decodeNumber(c: DecodeCursor): Result<JsonNumber, DecodeError> {
+  return match (cursorValue(c)) {
+    ValueNumber(n) => Ok(n),
+    _ => Err(wrong(c, "number")),
+  };
+}
+
+@Ensures(result.isOk() ==> result.unwrap() >= min && result.unwrap() <= max)
+export function decodeInt(c: DecodeCursor, min: int, max: int): Result<int, DecodeError> {
+  if (min > max) {
+    return Err(failure(DecodeInvalidSchema, cursorPath(c), "min <= max", "invalid range"));
+  }
+  const n = decodeNumber(c)?;
+  const r = numberAsInt(n);
+  if (r.isErr()) {
+    const k = match (r.unwrapErr().kind) {
+      NotIntegral => DecodeNotIntegral,
+      IntegerRange => DecodeIntegerRange,
+      FloatOverflow => DecodeFloatOverflow,
+      FloatUnderflow => DecodeFloatUnderflow,
+      _ => DecodeWrongType,
+    };
+    const actual = match (r.unwrapErr().kind) {
+      NotIntegral => "non-integral number",
+      IntegerRange => "out-of-range integer",
+      FloatOverflow => "float overflow",
+      FloatUnderflow => "float underflow",
+      _ => "invalid number",
+    };
+    return Err(failure(k, cursorPath(c), "exact int", actual));
+  }
+  const v = r.unwrap();
+  if (v < min || v > max) {
+    return Err(
+      failure(
+        DecodeIntegerRange,
+        cursorPath(c),
+        "integer in inclusive range",
+        "out-of-range integer",
+      ),
+    );
+  }
+  return Ok(v);
+}
+
+@Ensures(result.isOk() ==> result.unwrap().length <= c._state.budget().maxContainerItems)
+export function decodeArray(c: DecodeCursor): Result<DecodeCursor[], DecodeError> {
+  match (cursorValue(c)) {
+    ValueArray(values) => {
+      let out: DecodeCursor[] = [];
+      let i: usize = 0;
+      while (i < values.length) {
+        out.push(
+          cursor(
+            values[i],
+            extend(cursorPath(c), Index(i)),
+            c._state.budget(),
+            c._state.pathBytes(),
+          ),
+        );
+        i += 1;
+      }
+      return Ok(out);
+    },
+    _ => {
+      return Err(wrong(c, "array"));
+    },
+  }
+}
+
+export function checkFields(
+  c: DecodeCursor,
+  allowed: string[],
+  policy: UnknownFieldPolicy,
+): Result<void, DecodeError> {
+  match (cursorValue(c)) {
+    ValueObject(fields) => {
+      const l = c._state.budget();
+      if (allowed.length > l.maxContainerItems) {
+        return Err(
+          failure(DecodeLimitExceeded, cursorPath(c), "maxContainerItems", "schema items"),
+        );
+      }
+      let names = new Map<string, bool>();
+      let total: usize = 0;
+      for (const name of allowed) {
+        schemaKey(c, name)?;
+        if (name.length > l.maxDecodedStringBytes - total) {
+          return Err(
+            failure(
+              DecodeLimitExceeded,
+              cursorPath(c),
+              "maxDecodedStringBytes",
+              "schema key bytes",
+            ),
+          );
+        }
+        total += name.length;
+        if (names.has(name)) {
+          return Err(
+            failure(
+              DecodeInvalidSchema,
+              cursorPath(c),
+              "unique schema fields",
+              "duplicate schema field",
+            ),
+          );
+        }
+        names.set(name, true);
+      }
+      const reject = match (policy) {
+        RejectUnknown => true,
+        IgnoreUnknown => false,
+      };
+      if (reject) {
+        for (const f of fields) {
+          if (!names.has(f.key)) {
+            return Err(
+              failure(
+                DecodeUnknownField,
+                extend(cursorPath(c), Key(f.key)),
+                "allowed field",
+                "unknown field",
+              ),
+            );
+          }
+        }
+      }
+      return Ok();
+    },
+    _ => {
+      return Err(wrong(c, "object"));
+    },
+  }
+}
+
+// JSON Pointer string form. Root is empty; Key("") is "/". Structural Key vs
+// Index identity stays in the PathSegment array, even if their display coincides.
+@Ensures(path.length == 0 ==> result.length == 0)
+@Ensures(path.length > 0 ==> result.length > 0 && result.charCodeAt(0) == 47)
+export function formatPath(path: PathSegment[]): string {
+  let out: u8[] = [];
+  for (const segment of path) {
+    out.push(47);
+    const s = match (segment) {
+      Key(key) => key,
+      Index(i) => i.toString(),
+    };
+    let i: usize = 0;
+    while (i < s.length) {
+      const c = s.charCodeAt(i);
+      if (c == 126) {
+        out.push(126);
+        out.push(48);
+      } else if (c == 47) {
+        out.push(126);
+        out.push(49);
+      } else {
+        out.push(c.toU8());
+      }
+      i += 1;
+    }
+  }
+  if (out.length == 0) {
+    return "";
+  }
+  return bytesToString(out, 0, out.length);
+}

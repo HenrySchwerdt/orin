@@ -21,17 +21,15 @@ precise errors, deterministic behavior, pure validation, explicit I/O, limits, a
 - The local Claude CLI currently reports loggedIn=false. Do not seek credentials or repeatedly call
   unauthenticated Claude. Continue consuming completed Claude PRs; use Codex sparingly as fallback.
 
-## Current queue — 22:30 Europe/Berlin checkpoint
+## Current queue — 03:30 Europe/Berlin checkpoint
 
 | Track | Owner | Status / next acceptance |
 | --- | --- | --- |
-| CLI integration, PR #83 | Coordinator | Merged after independent approval and green CI |
-| `std:url`, PR #84 | Implementation chat B / coordinator | Merged after independent approval and green CI |
-| `std:encoding`, PR #85 | Implementation chat A / coordinator | Merged; URL and encoding registration preserved together |
-| Load forwarding, PR #82 | Claude / coordinator review | Assertion-order fix independently approved; main integration `2734d9b` freshly pushed, awaiting exact-head CI; not yet merged |
-| Portable execution timeout, PR #86 | Implementation chat A / coordinator | Worker head `48de511` passed CI and independent review; main integration `613b653` approved, fresh CI pending; not yet merged |
-| JSON completeness | Design chat / coordinator | Design active: float/exponent support and decoder helpers need a compatibility plan before implementation |
-| Release readiness | Audit chat / coordinator | Audit active; [English evidence and gap document](release-1.0-readiness.md) separates release gates from follow-ups |
+| PRs #82–#90 | Coordinator / independent reviewers | All merged; main CI green at this checkpoint |
+| JSON completeness RFC #88 | Coordinator | Approved design; implementation remains split into reviewed slices |
+| Exact numbers, PR #89 | Implementation chat A / coordinator | Merged, including checked stress-fixture correction; no legacy parser migration |
+| Bounded JSON documents | Implementation chat A | Active: opt-in std:jsonvalue parser and compact writer, limits, exact tokens, duplicate/UTF-8 policies; no float conversion or decoders |
+| Release readiness | Coordinator | Preserve evidence-based gates and 07:30 checkpoint; no release declaration |
 
 ## Coordination state
 
@@ -85,3 +83,14 @@ and disable the night-shift heartbeat. Do not claim feature completeness or proo
 - PR #89 (numeric utilities) is under review; correction of its std CI failure has been requested.
 - This R4 documentation pass reconciles capability/network status, platform evidence counts and
   published package availability. It does not change runtime code, API stability or proof scope.
+
+## 03:30 coordination checkpoint (2026-10-16)
+
+- PRs #82–#90 are merged and main CI is green, per coordinator confirmation.
+- The five-hour usage guard reached 85%; workers checkpointed and stopped.
+  The coordinator subsequently verified the usage reset to 0% and authorized resumption.
+- A new isolated JSON-document worktree is active from current main. Its narrow
+  slice is a bounded opt-in parser and compact writer using std:jsonnumber;
+  legacy Json/public/internal parsers, float conversion and decoders stay outside scope.
+- Maximum two writers, independent review and coordinator-only merging remain in
+  force. Morning checkpoint remains 07:30 Europe/Berlin; incomplete work is reported honestly.

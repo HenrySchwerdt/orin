@@ -1,6 +1,17 @@
 # Changelog
 
 ## Unreleased
+- **bench/url prints no wall-clock time.** The benchmark printed `ms=<elapsed>` next to its checksum, so every run differed from the
+  previous one (also C against C) and `tools/bench.py` reported "CHECKSUM MISMATCH in url (llvm)". This was not an LLVM miscompile:
+  output of the C and LLVM binaries is identical apart from the timing field. The benchmark now prints only deterministic values
+  (timing is measured by `tools/bench.py`), like every other benchmark.
+- **String intermediates removed (ADR-0038 addendum 2026-10-16, MIR v2.5).** New instructions `IStrAppendNum` (append the decimal
+  text of an `int`/`usize` to a string) and `IStrAppendSub` (append `s.substring(i, j)` without the substring object), with the
+  ownership rule of `IStrAppend`; runtime `orin_str_append_int` / `_usize` / `_sub`. `s + n.toString()`, `${n}`, `s += n.toString()`,
+  a bare `n.toString()`, the operands of a string `+=` chain and the pieces of `html.escape` no longer build temporary strings
+  (same text, evaluation order and traps). Executed instructions: mapfreq -27.7%, wordfreq -28.9%, html -36.6%, strings -37.8%;
+  allocations: html -60%, html_hand -98%, strings -33%; self-compile -0.5% (same input). The verifier gains one arm per instruction;
+  `tools/mutate_mir.py` gains three classes for string appends.
 - **Verifier: an in/out call demotes its borrowed arguments.** A `Unique` local passed in a borrowed position to an in/out
   function stayed `Unique` after the call, although the callee can keep a counted reference to it in the receiver it hands
   back (`push(items, item)`). The verifier now demotes such arguments, as it already did for calls with a reference result.

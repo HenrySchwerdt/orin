@@ -908,3 +908,16 @@ and structured errors containing byte offsets. See [API, errors and complexity](
 Exact validated JSON numeric tokens and checked decimal/exponent-to-int conversion,
 with full i64 preservation and structured errors. Separate from legacy std:json;
 see [API, bounds and validation](std-jsonnumber.md).
+
+## std:jsonvalue
+
+Opt-in bounded JSON document parser and compact writer, with exact std:jsonnumber
+tokens, ordered members, explicit duplicate policy, strict Unicode and per-call
+budgets. Legacy std:json is unchanged. See [API, limits and errors](std-jsonvalue.md).
+
+## std:jsondecode
+
+Pure field-path validation over bounded JsonValue trees: sealed cursors, exact
+integer ranges, absent/null distinction, explicit unknown-field policy, and
+structural JSON Pointer errors. See [API, ordering and complexity](std-jsondecode.md)
+and the [config example](../examples/json_config.or).
