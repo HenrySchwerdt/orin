@@ -1,0 +1,367 @@
+import { assert, assertEq, assertEqBool, assertEqString, assertEqUsize } from "std:test";
+import {
+  JsonValue, JsonMember, JsonLimits, JsonReadOptions, JsonDuplicatePolicy, parseDocument,
+  defaultJsonOptions, defaultJsonLimits,
+} from "std:jsonvalue";
+import { jsonNumber, numberFromInt } from "std:jsonnumber";
+import {
+  DecodeCursor, DecodeError, DecodeErrorKind, PathSegment, UnknownFieldPolicy, decodeRoot,
+  cursorValue, cursorPath, formatPath, requiredField, optionalField, decodeString, decodeBool,
+  decodeNumber, decodeInt, decodeArray, checkFields,
+} from "std:jsondecode";
+import { decodeConfig } from "../../examples/json_config";
+
+function root(v: JsonValue): DecodeCursor {
+  return decodeRoot(v, defaultJsonLimits()).unwrap();
+}
+function read(s: string): DecodeCursor {
+  return root(parseDocument(s, defaultJsonOptions()).unwrap());
+}
+function kind(k: DecodeErrorKind): string {
+  return match (k) {
+    DecodeMissingField => "missing",
+    DecodeWrongType => "type",
+    DecodeNotIntegral => "fraction",
+    DecodeIntegerRange => "range",
+    DecodeFloatOverflow => "overflow",
+    DecodeFloatUnderflow => "underflow",
+    DecodeUnknownField => "unknown",
+    DecodeDuplicateField => "duplicate",
+    DecodeLimitExceeded => "limit",
+    DecodeInvalidLimits => "limits",
+    DecodeInvalidSchema => "schema",
+  };
+}
+function error(e: DecodeError, expectedKind: string, path: string): void {
+  assertEqString(kind(e.kind), expectedKind, "error category");
+  assertEqString(formatPath(e.path), path, "independent pointer");
+  assert(e.expected.length > 0 && e.actual.length > 0, "category descriptors present");
+}
+
+@Test
+function pointerStructureAndEscapes(): void {
+  assertEqString(formatPath([]), "", "root pointer");
+  assertEqString(formatPath([Key("")]), "/", "empty key");
+  assertEqString(
+    formatPath([Key("a.b"), Key("a/b~c"), Index(12)]),
+    "/a.b/a~1b~0c/12",
+    "pointer escaping",
+  );
+  assertEqString(formatPath([Key("~1/~0")]), "/~01~1~00", "no recursive replacement");
+  assertEqString(formatPath([Key("é"), Index(0)]), "/é/0", "Unicode key");
+  const c = requiredField(read("{\"a.b\":[{\"x/y~\":null}]}"), "a.b").unwrap();
+  const element = decodeArray(c).unwrap()[0];
+  const leaf = requiredField(element, "x/y~").unwrap();
+  assertEqString(formatPath(cursorPath(leaf)), "/a.b/0/x~1y~0", "mixed structural path");
+  const p = cursorPath(leaf);
+  assertEqUsize(p.length, 3, "three segments");
+  assert(
+    match (p[0]) {
+      Key(s) => s == "a.b",
+      _ => false,
+    },
+    "literal dotted key stays one segment",
+  );
+  assert(
+    match (p[1]) {
+      Index(i) => i == 0,
+      _ => false,
+    },
+    "array position remains Index",
+  );
+}
+
+@Test
+function absentNullTypesAndParents(): void {
+  const c = read("{\"null\":null,\"false\":false,\"empty\":\"\",\"n\":1.00e3}");
+  assert(optionalField(c, "absent").unwrap().isNone(), "missing optional is None");
+  const nil = optionalField(c, "null").unwrap();
+  assert(nil.isSome(), "present null is Some");
+  assert(
+    match (cursorValue(nil.unwrap())) {
+      ValueNull => true,
+      _ => false,
+    },
+    "null value available without coercion",
+  );
+  error(decodeBool(nil.unwrap()).unwrapErr(), "type", "/null");
+  assertEqBool(decodeBool(requiredField(c, "false").unwrap()).unwrap(), false, "false not absent");
+  assertEqString(
+    decodeString(requiredField(c, "empty").unwrap()).unwrap(),
+    "",
+    "empty string not absent",
+  );
+  assertEqString(
+    decodeNumber(requiredField(c, "n").unwrap()).unwrap().token,
+    "1.00e3",
+    "exact number",
+  );
+  error(requiredField(c, "missing/name").unwrapErr(), "missing", "/missing~1name");
+  const scalar = root(ValueString("DO_NOT_ECHO_SECRET"));
+  for (const key of ["x", String.fromCharCode(255)]) {
+    const e = requiredField(scalar, key).unwrapErr();
+    error(e, "type", "");
+    assertEqString(e.expected, "object", "wrong parent before schema");
+    assertEqString(e.actual, "string", "no raw secret");
+    error(optionalField(scalar, key).unwrapErr(), "type", "");
+  }
+  error(decodeArray(scalar).unwrapErr(), "type", "");
+  error(decodeNumber(scalar).unwrapErr(), "type", "");
+  error(decodeString(root(ValueBool(true))).unwrapErr(), "type", "");
+  error(decodeBool(root(ValueNumber(numberFromInt(1)))).unwrapErr(), "type", "");
+}
+
+@Test
+function exactIntegersAndBounds(): void {
+  const min = -9223372036854775807 - 1;
+  assertEq(
+    decodeInt(read("-9223372036854775808"), min, 9223372036854775807).unwrap(),
+    min,
+    "minimum",
+  );
+  assertEq(
+    decodeInt(read("9223372036854775807"), min, 9223372036854775807).unwrap(),
+    9223372036854775807,
+    "maximum",
+  );
+  assertEq(
+    decodeInt(read("9007199254740993"), min, 9223372036854775807).unwrap(),
+    9007199254740993,
+    "exact ID",
+  );
+  assertEq(
+    decodeInt(read("1.00e3"), 1000, 1000).unwrap(),
+    1000,
+    "inclusive equal bounds and exponent",
+  );
+  error(decodeInt(read("1.5"), 0, 100).unwrapErr(), "fraction", "");
+  error(decodeInt(read("9223372036854775808"), min, 9223372036854775807).unwrapErr(), "range", "");
+  error(decodeInt(read("1e999"), min, 9223372036854775807).unwrapErr(), "range", "");
+  error(decodeInt(read("1000"), 0, 999).unwrapErr(), "range", "");
+  error(decodeInt(read("-1"), 0, 100).unwrapErr(), "range", "");
+  const bad = decodeInt(root(ValueString("SECRET")), 5, 1).unwrapErr();
+  error(bad, "schema", "");
+  assertEqString(bad.actual, "invalid range", "reversed range before type and no value echo");
+  const c = read("{\"servers\":[{\"port\":80},{\"port\":1.5}]}");
+  const rows = decodeArray(requiredField(c, "servers").unwrap()).unwrap();
+  error(
+    decodeInt(requiredField(rows[1], "port").unwrap(), 1, 65535).unwrapErr(),
+    "fraction",
+    "/servers/1/port",
+  );
+}
+
+@Test
+function rootDuplicatesUtf8AndOrdering(): void {
+  const preserved = parseDocument(
+    "{\"a\":1,\"\\u0061\":2}",
+    JsonReadOptions { limits: defaultJsonLimits(), duplicates: PreserveDuplicates },
+  ).unwrap();
+  error(decodeRoot(preserved, defaultJsonLimits()).unwrapErr(), "duplicate", "/a");
+  const manual = ValueArray([
+    ValueObject([
+      JsonMember { key: "a/b", value: ValueNull },
+      JsonMember { key: "a/b", value: ValueBool(true) },
+    ]),
+  ]);
+  error(decodeRoot(manual, defaultJsonLimits()).unwrapErr(), "duplicate", "/0/a~1b");
+  const earlier = ValueObject([
+    JsonMember { key: "a", value: ValueString(String.fromCharCode(255)) },
+    JsonMember { key: "a", value: ValueNull },
+  ]);
+  const e = decodeRoot(earlier, defaultJsonLimits()).unwrapErr();
+  error(e, "type", "/a");
+  assertEqString(e.actual, "invalid UTF-8", "depth first child error before later duplicate");
+  const invalidKey = ValueObject([JsonMember { key: String.fromCharCode(255), value: ValueNull }]);
+  error(decodeRoot(invalidKey, defaultJsonLimits()).unwrapErr(), "type", "");
+  error(
+    decodeRoot(ValueString(String.fromCharCode(255)), defaultJsonLimits()).unwrapErr(),
+    "type",
+    "",
+  );
+  const distinct = ValueObject([
+    JsonMember { key: "é", value: ValueNull },
+    JsonMember { key: "é", value: ValueNull },
+  ]);
+  assert(decodeRoot(distinct, defaultJsonLimits()).isOk(), "no Unicode normalization");
+}
+
+function limit(v: JsonValue, l: JsonLimits, path: string, name: string): void {
+  const e = decodeRoot(v, l).unwrapErr();
+  error(e, "limit", path);
+  assertEqString(e.expected, name, "limit descriptor");
+}
+@Test
+function everyRootBudgetAndInvalidLimits(): void {
+  let l = defaultJsonLimits();
+  l.maxNodes = 2;
+  assert(decodeRoot(ValueArray([ValueNull]), l).isOk(), "nodes N");
+  limit(ValueArray([ValueNull, ValueNull]), l, "/1", "maxNodes");
+  l = defaultJsonLimits();
+  l.maxDepth = 1;
+  assert(decodeRoot(ValueArray([]), l).isOk(), "depth N");
+  limit(ValueArray([ValueArray([])]), l, "/0", "maxDepth");
+  l = defaultJsonLimits();
+  l.maxContainerItems = 1;
+  assert(decodeRoot(ValueArray([ValueNull]), l).isOk(), "items N");
+  limit(ValueArray([ValueNull, ValueNull]), l, "", "maxContainerItems");
+  const obj = ValueObject([
+    JsonMember { key: "a", value: ValueNull },
+    JsonMember { key: "b", value: ValueNull },
+  ]);
+  limit(obj, l, "", "maxContainerItems");
+  l = defaultJsonLimits();
+  l.maxStringBytes = 1;
+  assert(decodeRoot(ValueString("a"), l).isOk(), "single bytes N");
+  limit(ValueString("ab"), l, "", "maxStringBytes");
+  limit(ValueObject([JsonMember { key: "ab", value: ValueNull }]), l, "", "maxStringBytes");
+  l = defaultJsonLimits();
+  l.maxDecodedStringBytes = 2;
+  assert(
+    decodeRoot(ValueObject([JsonMember { key: "a", value: ValueString("b") }]), l).isOk(),
+    "decoded bytes N",
+  );
+  limit(
+    ValueObject([JsonMember { key: "a", value: ValueString("bc") }]),
+    l,
+    "/a",
+    "maxDecodedStringBytes",
+  );
+  l = defaultJsonLimits();
+  l.maxNumberBytes = 3;
+  assert(decodeRoot(ValueNumber(jsonNumber("1e2", 3).unwrap()), l).isOk(), "number bytes N");
+  limit(ValueNumber(jsonNumber("1e23", 4).unwrap()), l, "", "maxNumberBytes");
+  const base = defaultJsonLimits();
+  const invalid = [
+    JsonLimits { ...base, maxInputBytes: 0 },
+    JsonLimits { ...base, maxOutputBytes: 0 },
+    JsonLimits { ...base, maxDepth: 0 },
+    JsonLimits { ...base, maxDepth: 201 },
+    JsonLimits { ...base, maxNodes: 0 },
+    JsonLimits { ...base, maxContainerItems: 0 },
+    JsonLimits { ...base, maxStringBytes: 0 },
+    JsonLimits { ...base, maxDecodedStringBytes: 0 },
+    JsonLimits { ...base, maxNumberBytes: 0 },
+  ];
+  for (const cap of invalid) {
+    error(decodeRoot(ValueNull, cap).unwrapErr(), "limits", "");
+  }
+}
+
+@Test
+function unknownFieldsAndSchemaErrors(): void {
+  const c = read("{\"known\":0,\"z/~\":\"SECRET\",\"a\":0}");
+  error(checkFields(c, ["known"], RejectUnknown).unwrapErr(), "unknown", "/z~1~0");
+  assert(checkFields(c, ["known"], IgnoreUnknown).isOk(), "explicit ignore");
+  assert(checkFields(read("{}"), [], RejectUnknown).isOk(), "empty schema and object");
+  error(checkFields(c, [], RejectUnknown).unwrapErr(), "unknown", "/known");
+  error(checkFields(c, ["known", "known"], IgnoreUnknown).unwrapErr(), "schema", "");
+  error(checkFields(c, [String.fromCharCode(255)], IgnoreUnknown).unwrapErr(), "schema", "");
+  error(
+    checkFields(root(ValueNull), [String.fromCharCode(255)], RejectUnknown).unwrapErr(),
+    "type",
+    "",
+  );
+  error(requiredField(c, String.fromCharCode(255)).unwrapErr(), "schema", "");
+  let l = defaultJsonLimits();
+  l.maxContainerItems = 1;
+  const empty = decodeRoot(ValueObject([]), l).unwrap();
+  error(checkFields(empty, ["a", "b"], IgnoreUnknown).unwrapErr(), "limit", "");
+  l = defaultJsonLimits();
+  l.maxStringBytes = 1;
+  error(requiredField(decodeRoot(ValueObject([]), l).unwrap(), "ab").unwrapErr(), "limit", "");
+  l = defaultJsonLimits();
+  l.maxDecodedStringBytes = 1;
+  error(
+    checkFields(decodeRoot(ValueObject([]), l).unwrap(), ["a", "b"], IgnoreUnknown).unwrapErr(),
+    "limit",
+    "",
+  );
+  // Missing query names are schema input, not newly decoded JSON bytes.
+  const tight = decodeRoot(
+    ValueObject([JsonMember { key: "a", value: ValueObject([]) }]),
+    l,
+  ).unwrap();
+  const nested = requiredField(tight, "a").unwrap();
+  assert(
+    optionalField(nested, "absent").unwrap().isNone(),
+    "absent query after tree budget exactly used",
+  );
+  error(requiredField(nested, "absent").unwrapErr(), "missing", "/a/absent");
+}
+
+@Test
+function cursorCopiesAndValidationSnapshot(): void {
+  let fields: JsonMember[] = [JsonMember { key: "a", value: ValueString("original") }];
+  let v = ValueObject(fields);
+  let l = defaultJsonLimits();
+  const c = decodeRoot(v, l).unwrap();
+  fields[0].value = ValueString(String.fromCharCode(255));
+  v = ValueString("changed");
+  l.maxDepth = 0;
+  const child = requiredField(c, "a").unwrap();
+  assertEqString(decodeString(child).unwrap(), "original", "root owns validated snapshot");
+  let p = cursorPath(child);
+  p.push(Key("changed"));
+  assertEqString(formatPath(cursorPath(child)), "/a", "path copy cannot mutate cursor");
+  const copy = child;
+  assertEqString(decodeString(copy).unwrap(), "original", "cursor value copy");
+  let copied = cursorValue(c);
+  match (copied) {
+    ValueObject(xs) => {
+      let mutable = xs;
+      mutable[0].value = ValueNull;
+    },
+    _ => {},
+  }
+  assertEqString(
+    decodeString(requiredField(c, "a").unwrap()).unwrap(),
+    "original",
+    "extracted tree is COW",
+  );
+}
+
+@Test
+function pureConfigAndDepth(): void {
+  const v = parseDocument(
+    "{\"endpoint\":\"localhost\",\"port\":8.080e3}",
+    defaultJsonOptions(),
+  ).unwrap();
+  const cfg = decodeConfig(v).unwrap();
+  assertEqString(cfg.endpoint, "localhost", "pure config endpoint");
+  assertEq(cfg.port, 8080, "exact config port");
+  assert(cfg.enabled, "default optional enabled");
+  error(
+    decodeConfig(
+      parseDocument("{\"endpoint\":\"x\",\"port\":0}", defaultJsonOptions()).unwrap(),
+    ).unwrapErr(),
+    "range",
+    "/port",
+  );
+  error(
+    decodeConfig(
+      parseDocument(
+        "{\"endpoint\":\"x\",\"port\":80,\"enabled\":null}",
+        defaultJsonOptions(),
+      ).unwrap(),
+    ).unwrapErr(),
+    "type",
+    "/enabled",
+  );
+  let deep: JsonValue = ValueNull;
+  let i = 0;
+  while (i < 200) {
+    deep = ValueArray([deep]);
+    i += 1;
+  }
+  let l = defaultJsonLimits();
+  l.maxDepth = 200;
+  let c = decodeRoot(deep, l).unwrap();
+  i = 0;
+  while (i < 200) {
+    c = decodeArray(c).unwrap()[0];
+    i += 1;
+  }
+  assertEqUsize(cursorPath(c).length, 200, "maximum path depth");
+  error(decodeRoot(ValueArray([deep]), l).unwrapErr(), "limit", formatPath(cursorPath(c)));
+}
