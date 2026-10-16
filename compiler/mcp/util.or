@@ -2,7 +2,11 @@
 // JSON construction and diagnostic rendering.
 
 import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, jField, stringifyJson } from "../json";
-import { Analysis, PathDiag, fileIndexOf, offsetToPos } from "../analysis";
+import { FsGrant, readFile } from "std:fs";
+import {
+  Analysis, AnalysisCache, newAnalysisCache, newWorkspace, openFile, PathDiag, fileIndexOf,
+  offsetToPos,
+} from "../analysis";
 import { SourceMap, Diagnostic } from "../diag";
 import { normalizePath, joinPath, isInside, relativeTo, isNormalized } from "../loader";
 import { hexDigitLower } from "../util";
@@ -14,6 +18,9 @@ export type Snap = { rev: int; entry: string; fp: string; keys: string[]; lines:
 
 // The number of check snapshots a session keeps (the oldest is dropped first).
 export const MAX_SNAPS: usize = 32;
+
+// The number of analyses a session keeps (the oldest is dropped first).
+export const MAX_CACHED: usize = 8;
 
 // Snapshot revisions are handed out in increasing order and are below the next one, so a revision names at most one
 // snapshot and a client's `sinceRevision` can never match a snapshot that was not taken yet.
@@ -41,6 +48,9 @@ export class McpSession {
   inited: bool;
   private nextRev: int;
   private snaps: Snap[]; // recent check snapshots (delta bases), oldest first
+  // Analyses of recent entries (analysis/cache.or): the tools of one session that look at the same, unchanged project
+  // share one analysis; a changed file on disk is noticed by the cache's content check.
+  cache: AnalysisCache;
 
   constructor(root: string, allowExec: bool, repo: string) {
     this.root = normalizePath(root);
@@ -49,6 +59,24 @@ export class McpSession {
     this.inited = false;
     this.nextRev = 1;
     this.snaps = [];
+    this.cache = newAnalysisCache(MAX_CACHED);
+  }
+
+  // Analyse the project rooted at `entryRel` (disk contents; the entry goes through the overlay so a library entry gets
+  // the synthetic `main`, exactly as in the language server), from the cache when nothing it read has changed.
+  analyzeEntry(fs: FsGrant, entryRel: string): Result<Analysis, string> {
+    const p = resolvePath(this, entryRel)?;
+    const t = readFile(fs, p);
+    if (t.isErr()) {
+      return Err("cannot read " + entryRel);
+    }
+    const ws = openFile(newWorkspace(), p, t.unwrap());
+    const a = this.cache.analyze(fs, ws, p);
+    const bad = checkAllInside(this, a);
+    if (bad.isSome()) {
+      return Err(bad.unwrap());
+    }
+    return Ok(a);
   }
 
   // The newest snapshot of `entry`.

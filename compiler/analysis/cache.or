@@ -1,0 +1,106 @@
+// Analysis cache (ADR-0049 §2.3, audit P11/P12): the result of `analyze` per entry, so a request that repeats an
+// analysis of the same inputs (hover after the diagnostics of a change, several MCP tools on one entry) does not parse,
+// load, check and index again.
+//
+// A cached result is served only when it cannot differ from a fresh `analyze`:
+//   * it was computed at the workspace revision the caller has now (the language server bumps the revision on every
+//     open / change / close, so a change drops every entry), and
+//   * every file it read still has the contents it read (the overlay buffer when there is one, else the disk), which
+//     catches a file that changed on disk without a notification and makes the cache sound for the MCP server, whose
+//     workspace is a fresh overlay of one entry per call.
+// Results whose load failed (`program` is None) are never cached: they stop early (cheap) and a file that the missing
+// import would resolve to may appear without any of the checks above noticing.
+//
+// The cache is a class, i.e. a value: it lives in the state of one server (`LspServer`, `McpSession`) and is used through
+// a method on that field (`this.cache.analyze(..)`) so the update stays in the owner.
+
+import { FsGrant } from "std:fs";
+import { normalizePath } from "../loader";
+import { Workspace } from "./workspace";
+import { Analysis, analyze } from "./analyze";
+
+// At most `capacity` entries (the oldest is dropped first); `order` lists the keys of `entries`.
+@Invariant(this.order.length <= this.capacity)
+@Invariant(this.rev >= -1)
+export class AnalysisCache {
+  private rev: int;
+  private entries: Map<string, Analysis>;
+  private order: string[];
+  private capacity: usize;
+  // Number of requests answered from the cache / by running the analysis (observable by tests and benchmarks).
+  hits: usize;
+  misses: usize;
+
+  constructor(capacity: usize) {
+    this.rev = -1;
+    this.entries = new Map<string, Analysis>();
+    this.order = [];
+    this.capacity = capacity < 1 ? 1 : capacity;
+    this.hits = 0;
+    this.misses = 0;
+  }
+
+  // Number of cached entries.
+  @Ensures(result <= this.capacity)
+  size(): usize {
+    return this.order.length;
+  }
+
+  // Forget everything (the language server calls this on save, close and watched-file changes).
+  @Ensures(this.size() == 0)
+  clear(): void {
+    this.entries = new Map<string, Analysis>();
+    this.order = [];
+  }
+
+  // True when every file `a` read has the contents it read: from the overlay of `ws` when it holds the file, else from
+  // the disk. Embedded prelude files (`$...` paths) are part of the compiler.
+  private inputsUnchanged(fs: FsGrant, ws: Workspace, a: Analysis): bool {
+    const src = ws.sources();
+    for (const f of a.sm.files) {
+      if (f.path.startsWith("$")) {
+        continue;
+      }
+      const r = src.read(fs, f.path);
+      if (r.isErr() || r.unwrap() != f.text) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private forget(key: string): void {
+    this.entries.delete(key);
+    this.order = this.order.filter(k => k != key);
+  }
+
+  // `analyze(fs, ws, entryPath)`, from the cache when the inputs are unchanged.
+  @Ensures(result.entry == normalizePath(entryPath) && result.revision == ws.revision())
+  analyze(fs: FsGrant, ws: Workspace, entryPath: string): Analysis {
+    const key = normalizePath(entryPath);
+    if (this.rev != ws.revision()) {
+      this.clear();
+      this.rev = ws.revision();
+    }
+    const hit = this.entries.get(key);
+    if (hit.isSome() && this.inputsUnchanged(fs, ws, hit.unwrap())) {
+      this.hits += 1;
+      return hit.unwrap();
+    }
+    this.misses += 1;
+    const a = analyze(fs, ws, key);
+    this.forget(key);
+    if (a.program.isSome()) {
+      if (this.order.length >= this.capacity) {
+        this.forget(this.order[0]);
+      }
+      this.entries.set(key, a);
+      this.order.push(key);
+    }
+    return a;
+  }
+}
+
+export function newAnalysisCache(capacity: usize): AnalysisCache {
+  return new AnalysisCache(capacity);
+}

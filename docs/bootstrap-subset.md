@@ -241,12 +241,14 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | E0430 | integer literal does not fit its type (`const x: i8 = 128`, a `u64`-only literal above 2^63-1 used as another type) — beyond Orin-B (ADR-0022) |
 | E0431 | the 128-bit integer types `i128` / `u128` (and `toI128`, `parseU128`, ...) are not supported yet — beyond Orin-B (ADR-0022) |
 | E0432 | a value that is not `string`, an integer, `float`, `f32` or `bool` interpolated in a template literal — beyond Orin-B (ADR-0022) |
-| E0440 | built-in annotation on a declaration it does not apply to (`@Test` on a method or class, `@Inline` on a class or type, `@Deprecated` on a constant, field, constructor, import or statement) — beyond Orin-B (ADR-0024) |
-| E0441 | wrong annotation arguments: `@Test(..)` / `@Inline(..)` take none, `@Deprecated` needs exactly one string literal — beyond Orin-B (ADR-0024) |
-| E0442 | duplicate annotation on one declaration — beyond Orin-B (ADR-0024) |
+| E0440 | annotation on a declaration it does not apply to (`@Test` on a method or class, `@Inline` on a class or type, `@Deprecated` on a constant, field, constructor, import or statement; `@Annotation` on anything but a record type; a user annotation on a target missing from its `@Annotation(..)` list, or on a constructor, import or statement) — beyond Orin-B (ADR-0024, ADR-0046) |
+| E0441 | wrong annotation arguments: `@Test(..)` / `@Inline(..)` take none, `@Deprecated` needs exactly one string literal; `@Annotation(..)` needs one or more distinct target words (`function method class type interface field const`); an argument of a user annotation that is missing, surplus, of the wrong type or not a constant — beyond Orin-B (ADR-0024, ADR-0046) |
+| E0442 | duplicate annotation on one declaration (built-in or user-defined) — beyond Orin-B (ADR-0024, ADR-0046) |
 | E0443 | invalid `@Test` function: generic, has parameters, or does not return `void` — beyond Orin-B (ADR-0024) |
 | E0444 | `@Inline` function that is part of a call cycle (recursive) — beyond Orin-B (ADR-0024) |
 | E0445 | a `@Test` function is called or used as a value (tests are only run by `orin test` and erased from ordinary builds) — beyond Orin-B (ADR-0024) |
+| E0446 | a field of an `@Annotation` record has a type an annotation cannot hold (allowed: `bool`, `int`, `usize`, `float`, `f32`, `string`, a union of payload-free tags, and arrays and `Option`s of those), or the record is generic — beyond Orin-B (ADR-0046) |
+| E0447 | an `@Annotation` definition takes a reserved name (`Test`, `Deprecated`, `Inline`, `Sealed`, `Annotation`, `Processor`, `Requires`, `Ensures`, `Invariant`, `Decreases`, `Rule`), or an identifier starts with `__g` (reserved for generated code) (ADR-0046) |
 | W0440 | **warning** (never fails a build): use of a `@Deprecated` symbol; printed as `warning[W0440]`, JSON `"severity":"warning"`, LSP severity 2 with the Deprecated tag — beyond Orin-B (ADR-0024) |
 | W0450 | **warning**: `@Invariant` of a class or record that mentions no `this` (constrains no state) — beyond Orin-B (ADR-0028) |
 | W0451 | **warning**: `@Ensures` that mentions neither `result` nor (non-static method) `this`; parameters are immutable, so it cannot fail — beyond Orin-B (ADR-0028) |
@@ -266,9 +268,9 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 Beyond Orin-B (self-hosted compiler only), contract clauses `@Requires`, `@Ensures`, `@Invariant`,
 `@Decreases`, `@Rule` (ADR-0012) reuse existing codes where the failure is not specific to
 contracts: E0200 (a clause in the wrong place, e.g. `@Ensures` on a class), E0300 (`result` outside
-`@Ensures`, or in a `void` function; unknown names), E0408 (any `@Name` that is neither a contract clause
-nor one of the built-in annotations `@Test`, `@Deprecated`, `@Inline` of ADR-0024; `@Invariant` on a
-generic record).
+`@Ensures`, or in a `void` function; unknown names), E0408 (a `@Name` that is neither a contract clause,
+a built-in annotation (`@Test`, `@Deprecated`, `@Inline` of ADR-0024), nor an `@Annotation` record declared or imported
+in the module (ADR-0046); `@Invariant` on a generic record).
 
 ## 10. Clarifications (v1.1, from conformance-suite review)
 
