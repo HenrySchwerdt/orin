@@ -52,6 +52,8 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 
 ## Next milestones
 
+**Consolidated plan to 1.0:** [Orin 1.0 roadmap](roadmaps/orin-1.0.md) (proposal for owner review, 2026-10-16): definition of done, gaps, milestones M0-M5 and the open owner decisions.
+
 **User-defined annotations (ADR-0046, accepted 2026-10-16):** design done, implementation in slices S1-S6 (definitions and uses, tooling metadata, `std:meta`, expansion, processor execution, `@Json` + route example); compiler slices start after the ADR-0047 layout move.
 
 See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-software tracks of

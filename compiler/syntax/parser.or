@@ -29,8 +29,8 @@ import { Token, lex, isEofTok } from "./lexer";
 import { OpTable } from "./precedence";
 import {
   T_FUNCTION, T_METHOD, T_CTOR, T_CLASS, T_RECORD, T_TYPE, T_LOOP, T_INTERFACE, T_IFACE_METHOD,
-  T_CONST, T_IMPORT, checkPlacement, checkAnnoPlacement, isBuiltinAnnotation, annotationName,
-  annotationTargets,
+  T_CONST, T_IMPORT, T_FIELD, checkPlacement, checkAnnoPlacement, isBuiltinAnnotation, annotationName,
+  annotationTargets, isClauseName, isTargetWord,
 } from "./rules";
 import {
   exprShallowOk, stmtShallowOk, typeShallowOk, patShallowOk, blockShallowOk, itemShallowOk,
@@ -209,7 +209,8 @@ export function isSyntaxCode(code: string): bool {
       || code == "E0408"
       || code == "E0440"
       || code == "E0441"
-      || code == "E0442";
+      || code == "E0442"
+      || code == "E0447";
 }
 
 // The parser over a token stream that ends with KEof (`lex` output). The cursor stays on a token: it never moves past
@@ -607,6 +608,11 @@ export class Parser {
       _ => false,
     };
     if (ok) {
+      if (t.text.startsWith("__g")) {
+        return Err(
+          diag("E0447", t.span, "identifiers starting with `__g` are reserved for generated code (ADR-0046)"),
+        );
+      }
       this.pos += 1;
       return Ok(Ident { name: t.text, span: t.span });
     }
@@ -798,8 +804,8 @@ export class Parser {
           "E0408",
           spanTo(at, nt.span),
           "unknown annotation `@" + nt.text
-              + "`: only the built-in annotations @Test, @Deprecated and @Inline and the contract clauses "
-              + "@Requires, @Ensures, @Invariant, @Decreases and @Rule exist (user-defined annotations are post-1.0, ADR-0024)",
+              + "`: here only the contract clauses @Requires, @Ensures, @Invariant, @Decreases and @Rule "
+              + "are allowed (annotations cannot be applied to statements)",
         ),
       );
     }
@@ -842,6 +848,9 @@ export class Parser {
   private parseAnnotation(): Result<Annotation, Diagnostic> {
     const at = this.toks[this.pos].span;
     const nt = this.at(1);
+    if (nt.text == "Annotation") {
+      return this.parseAnnotationDef();
+    }
     if (nt.text == "Deprecated") {
       if (!this.isPAt(2, "(")) {
         return Err(
@@ -877,7 +886,87 @@ export class Parser {
     return Ok(Annotation { kind: kind, message: "", span: spanTo(at, nt.span) });
   }
 
-  // Contract clauses and built-in annotations in any order; the cursor is at the first `@`. `first` is the span of
+  // `@Annotation(function, method, ...)` (ADR-0046): the cursor is at `@Annotation`. The target words are keywords or
+  // identifiers; each must be one of `isTargetWord`, at most once, and there is at least one.
+  @Requires(this.isP("@") && this.isIdentAt(1))
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  @Ensures(result.isErr() ==> result.unwrapErr().code == "E0441")
+  private parseAnnotationDef(): Result<Annotation, Diagnostic> {
+    const at = this.toks[this.pos].span;
+    const nt = this.at(1);
+    if (!this.isPAt(2, "(")) {
+      return Err(
+        diag(
+          "E0441",
+          spanTo(at, nt.span),
+          "`@Annotation` requires target words: `@Annotation(function, method, class, type, interface, field, const)`",
+        ),
+      );
+    }
+    this.pos += 3;
+    let ts: Ident[] = [];
+    while (!this.isP(")")) {
+      const t = this.toks[this.pos];
+      const word = match (t.kind) {
+        KIdent => true,
+        KKeyword => true,
+        _ => false,
+      };
+      if (!word || !isTargetWord(t.text)) {
+        return Err(
+          diag(
+            "E0441",
+            t.span,
+            "unknown annotation target " + describe(t)
+                + " (targets: function, method, class, type, interface, field, const)",
+          ),
+        );
+      }
+      if (ts.some(x => x.name == t.text)) {
+        return Err(diag("E0441", t.span, "duplicate annotation target `" + t.text + "`"));
+      }
+      ts.push(Ident { name: t.text, span: t.span });
+      this.pos += 1;
+      if (this.isP(",")) {
+        this.pos += 1;
+      } else if (!this.isP(")")) {
+        return Err(this.errExpected("`,` or `)`"));
+      }
+    }
+    if (ts.length == 0) {
+      return Err(diag("E0441", spanTo(at, this.toks[this.pos].span), "`@Annotation` needs at least one target"));
+    }
+    this.pos += 1;
+    return Ok(Annotation { kind: AAnnotation(ts), message: "", span: spanTo(at, this.lastSpan()) });
+  }
+
+  // `@Name` or `@Name(a1, ..)` of an annotation that is not a built-in (ADR-0046): the cursor is at `@`. The arguments
+  // are parsed as expressions; the checker resolves the name and requires constants.
+  @Requires(this.isP("@") && this.isIdentAt(1))
+  @Ensures(result.isOk() ==> this.spansFrom(result.unwrap().span, old(this.pos)))
+  private parseUserAnnotation(): Result<Annotation, Diagnostic> {
+    const at = this.toks[this.pos].span;
+    const nt = this.at(1);
+    this.pos += 2;
+    let args: Expr[] = [];
+    if (this.isP("(")) {
+      this.pos += 1;
+      while (!this.isP(")")) {
+        const e = this.parseExpr()?;
+        args.push(e);
+        if (this.isP(",")) {
+          this.pos += 1;
+        } else if (!this.isP(")")) {
+          return Err(this.errExpected("`,` or `)`"));
+        }
+      }
+      this.pos += 1;
+    }
+    const id = Ident { name: nt.text, span: nt.span };
+    return Ok(Annotation { kind: ACustom(id, args), message: "", span: spanTo(at, this.lastSpan()) });
+  }
+
+  // Contract clauses and annotations in any order; the cursor is at the first `@`. `first` is the span of
   // the first one (the declaration's span starts there).
   @Requires(this.isP("@"))
   @Ensures(result.isOk()
@@ -892,6 +981,9 @@ export class Parser {
     while (this.isP("@")) {
       if (this.isIdentAt(1) && isBuiltinAnnotation(this.at(1).text)) {
         const a = this.parseAnnotation()?;
+        as.push(a);
+      } else if (this.isIdentAt(1) && !isClauseName(this.at(1).text)) {
+        const a = this.parseUserAnnotation()?;
         as.push(a);
       } else {
         const c = this.parseClause()?;
@@ -1019,7 +1111,7 @@ export class Parser {
         return Err(diag("E0200", cls[0].span, "contract clauses cannot precede a constant"));
       }
       checkAnnoPlacement(annos, T_CONST)?;
-      return this.parseConstDecl(exported, start);
+      return this.parseConstDecl(exported, start, annos);
     }
     if (this.isKw("class")) {
       checkPlacement(cls, T_CLASS)?;
@@ -1341,15 +1433,7 @@ export class Parser {
       if (cls.length > 0) {
         return Err(diag("E0200", cls[0].span, "contract clauses cannot be applied to a field"));
       }
-      if (annos.length > 0) {
-        return Err(
-          diag(
-            "E0440",
-            annos[0].span,
-            "annotation `" + annotationName(annos[0].kind) + "` cannot be applied to a field",
-          ),
-        );
-      }
+      checkAnnoPlacement(annos, T_FIELD)?;
       if (isStatic) {
         return Err(
           diag("E0408", spanTo(start, name.span), "static fields are not supported (ADR-0009)"),
@@ -1370,6 +1454,7 @@ export class Parser {
           name: name,
           ty: ft,
           init: init,
+          annotations: annos,
           span: spanTo(start, this.lastSpan()),
         }),
       );
@@ -1502,11 +1587,22 @@ export class Parser {
     this.pos += 1;
     let fields: FieldDecl[] = [];
     while (!this.isP("}")) {
+      let fannos: Annotation[] = [];
+      let fstart = this.toks[this.pos].span;
+      if (this.isP("@")) {
+        const dr = this.parseDecos()?;
+        if (dr.clauses.length > 0) {
+          return Err(diag("E0200", dr.clauses[0].span, "contract clauses cannot be applied to a field"));
+        }
+        checkAnnoPlacement(dr.annos, T_FIELD)?;
+        fannos = dr.annos;
+        fstart = dr.first;
+      }
       const fname = this.parseIdent()?;
       this.expectP(":")?;
       const ft = this.parseType()?;
       this.expectP(";")?;
-      fields.push(FieldDecl { name: fname, ty: ft, span: spanTo(fname.span, this.lastSpan()) });
+      fields.push(FieldDecl { name: fname, ty: ft, annotations: fannos, span: spanTo(fstart, this.lastSpan()) });
     }
     this.pos += 1;
     return Ok(DRecord(fields));
@@ -1543,7 +1639,7 @@ export class Parser {
   // The cursor is at `const`: `const NAME: T = expr;`
   @Requires(this.isKw("const"))
   @Ensures(result.isOk() ==> this.pos > old(this.pos))
-  private parseConstDecl(exported: bool, start: Span): Result<Item, Diagnostic> {
+  private parseConstDecl(exported: bool, start: Span, annos: Annotation[]): Result<Item, Diagnostic> {
     this.pos += 1;
     const name = this.parseIdent()?;
     let ty: Option<TypeExpr> = None;
@@ -1561,6 +1657,7 @@ export class Parser {
         name: name,
         ty: ty,
         value: value,
+        annotations: annos,
         span: spanTo(start, this.lastSpan()),
       }),
     );

@@ -74,6 +74,14 @@ package directory with tests in several modules); they are driven by `tools/test
 `run_tests.py` (some of their tests fail on purpose). `tools/test_annotation_erasure.py` compiles
 `annotations_test_*.or` with and without their `@Test` functions and requires identical C and LLVM IR.
 
+## User-defined annotations (ADR-0046 S1)
+
+`tests/next/run/user_annotations/` (annotations declared in one module, imported and applied in another, on every target) and
+`tests/next/errors/e0408_annotation_not_an_annotation_record.or`, `e0440_user_annotation_*`, `e0441_user_annotation_*`,
+`e0441_annotation_def_*`, `e0442_duplicate_user_annotation`, `e0446_*`, `e0447_*` are ordinary conformance cases. The formatter
+golden is `tests/fmt/user_annotations`. Annotations are metadata in S1: the generated C of an annotated program equals that of the
+program with the annotations deleted, and the existing suites (`run`, `next/run`) compile to the same C as before the change.
+
 ## Concurrency (ADR-0017 stage 0)
 
 `tests/next/run/task_*.or` and `tests/next/errors/e048*.or` (+ `e0450_channel_of_grant`, `e0301_task_primitives_are_internal`) are

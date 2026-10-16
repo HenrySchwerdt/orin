@@ -6,10 +6,22 @@
 // Exit status: 0 ok, 1 changes found with --check or a file had a syntax error, 2 usage / I/O error.
 
 import { FsGrant } from "std:fs";
-import { SourceMap, SourceFile, render, TerminalOptions, renderTerminal } from "../diag";
+import { Diagnostic, SourceMap, SourceFile, render, TerminalOptions, renderTerminal } from "../diag";
 import { format } from "../fmt";
 import { readFile, writeFile } from "std:fs";
-import { usageError } from "../util";
+import { usageError, mapOrderedFs } from "../util";
+
+// What a worker found out about one file; `result` is only meaningful when `readError` is empty.
+type FmtJob = { readError: string; src: string; result: Result<string, Diagnostic>; };
+
+function formatOne(fs: FsGrant, path: string): FmtJob {
+  const rf = readFile(fs, path);
+  if (rf.isErr()) {
+    return FmtJob { readError: rf.unwrapErr(), src: "", result: Ok("") };
+  }
+  const src = rf.unwrap();
+  return FmtJob { readError: "", src: src, result: format(0, src) };
+}
 
 function usage(): int {
   return usageError(
@@ -36,16 +48,21 @@ export function runFmt(fs: FsGrant, args: string[], ui: TerminalOptions): int {
   if (files.length == 0) {
     return usage();
   }
+  // Read and format in worker tasks (ADR-0049, P10); diagnostics, output and writes below follow argument order.
+  const jobs = mapOrderedFs(fs, files.length, (i: usize, g: FsGrant) => formatOne(g, files[i]));
   let code: int = 0;
-  for (const path of files) {
-    const rf = readFile(fs, path);
-    if (rf.isErr()) {
-      console.error("error: cannot read " + path + ": " + rf.unwrapErr());
+  let k: usize = 0;
+  while (k < files.length) {
+    const path = files[k];
+    const job = jobs[k];
+    k += 1;
+    if (job.readError.length > 0) {
+      console.error("error: cannot read " + path + ": " + job.readError);
       code = 2;
       continue;
     }
-    const src = rf.unwrap();
-    const res = format(0, src);
+    const src = job.src;
+    const res = job.result;
     if (res.isErr()) {
       const sm = SourceMap { files: [SourceFile { path: path, text: src }] };
       console.error(

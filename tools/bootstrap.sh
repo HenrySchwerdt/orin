@@ -2,7 +2,7 @@
 # Full bootstrap; checks stage2.c == stage3.c and runs the conformance suite with the self-built
 # compiler. See docs/bootstrap.md and docs/decisions/0014-seed-bootstrap.md.
 #
-#   tools/bootstrap.sh               seed (seed/orin-seed.c.gz) -> orin0 -> orin1 -> orin2 -> stage3
+#   tools/bootstrap.sh               seed (bootstrap/seed/orin-seed.c.gz) -> orin0 -> orin1 -> orin2 -> stage3
 #                                    (needs only a C compiler, python3, gzip, sha256sum/shasum)
 #   tools/bootstrap.sh --seed-only   only seed -> build/bootstrap/orin0 (a few seconds; enough to compile
 #                                    test drivers such as compiler/tests/verify_text.or)
@@ -25,7 +25,7 @@ CC=${CC:-cc}
 STAGE01_CFLAGS=${STAGE01_CFLAGS:-${CFLAGS:--O1 -w}}
 CFLAGS=${CFLAGS:--O2 -w}
 B=build/bootstrap
-SEED_DIR=${ORIN_SEED_DIR:-seed}
+SEED_DIR=${ORIN_SEED_DIR:-bootstrap/seed}
 mkdir -p "$B"
 python3 tools/embed_prelude.py --check
 cc_link() { flags=$1; shift; $CC $flags -I runtime/core "$1" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -o "$2"; }

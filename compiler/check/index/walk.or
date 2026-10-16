@@ -1,0 +1,549 @@
+// Pass 2 over the source AST: references of identifiers, types and fields to their definitions; lexical scopes.
+// Part of the semantic index (check/index/build.or).
+
+import {
+  Ident, Item, Annotation, FunctionDecl, TypeDecl, TypeExpr, Block, Stmt, Expr, FieldInit, MatchArm, Pattern, oxExprs, oxComponents
+} from "../../syntax";
+import { Type, Local, Function, SkRecord, SkLocal, SkParam } from "../../hir";
+import {
+  Ctx, W, addRef, declare, fieldDef, isTypeParam, lookupLocal, lookupType, lookupVal, popScope, pushScope
+} from "./state";
+
+// ---- pass 2: bodies ---------------------------------------------------------------------------------
+
+export function typeRefs(w: W, c: Ctx, te: TypeExpr): W {
+  let x = w;
+  match (te.kind) {
+    TNamed(id, args) => {
+      if (!isTypeParam(x, id.name)) {
+        const d = lookupType(x, c, id.name);
+        if (d.isSome()) {
+          x = addRef(x, id.span, d.unwrap());
+        }
+      }
+      for (const a of args) {
+        x = typeRefs(x, c, a);
+      }
+    },
+    TArray(e) => { x = typeRefs(x, c, e); },
+    TFn(ps, ret) => {
+      for (const p of ps) {
+        x = typeRefs(x, c, p.ty);
+      }
+      x = typeRefs(x, c, ret);
+    }
+  }
+  return x;
+}
+
+export function optTypeRefs(w: W, c: Ctx, t: Option<TypeExpr>): W {
+  return match (t) {
+    Some(te) => typeRefs(w, c, te),
+    None => w
+  };
+}
+
+function walkExprs(w: W, c: Ctx, es: Expr[]): W {
+  let x = w;
+  for (const e of es) {
+    x = walkExpr(x, c, e);
+  }
+  return x;
+}
+
+function walkRecordInits(w: W, c: Ctx, tname: Ident, spread: Option<Expr>, fields: FieldInit[]): W {
+  let x = w;
+  const td = lookupType(x, c, tname.name);
+  let rec: Option<usize> = None;
+  if (td.isSome()) {
+    x = addRef(x, tname.span, td.unwrap());
+    const isRec = match (x.defs[td.unwrap()].kind) {
+      SkRecord => true,
+      _ => false
+    };
+    if (isRec) {
+      rec = td;
+    }
+  }
+  match (spread) {
+    Some(s) => { x = walkExpr(x, c, s); },
+    None => {}
+  }
+  for (const f of fields) {
+    if (rec.isSome()) {
+      const fd = fieldDef(x, rec.unwrap(), f.name.name);
+      if (fd.isSome()) {
+        x = addRef(x, f.name.span, fd.unwrap());
+      }
+    }
+    x = walkExpr(x, c, f.value);
+  }
+  return x;
+}
+
+export function walkExpr(w: W, c: Ctx, e: Expr): W {
+  let x = w;
+  match (e.kind) {
+    EIdent(id) => {
+      const lo = lookupLocal(x, id.name);
+      if (lo.isSome()) {
+        x = addRef(x, id.span, lo.unwrap().def);
+      } else {
+        const d = lookupVal(x, c, id.name);
+        if (d.isSome()) {
+          x = addRef(x, id.span, d.unwrap());
+        }
+      }
+    },
+    EUnary(_, a) => { x = walkExpr(x, c, a); },
+    EBinary(_, a, b) => {
+      x = walkExpr(x, c, a);
+      x = walkExpr(x, c, b);
+    },
+    ECall(f, args) => {
+      x = walkExpr(x, c, f);
+      x = walkExprs(x, c, args);
+    },
+    EMember(b, _) => {
+      // `C.m(..)`: a class name used as a receiver refers to the class.
+      match (b.kind) {
+        EIdent(bid) => {
+          if (lookupLocal(x, bid.name).isNone() && lookupVal(x, c, bid.name).isNone()) {
+            const td = lookupType(x, c, bid.name);
+            if (td.isSome()) {
+              x = addRef(x, bid.span, td.unwrap());
+            }
+          }
+        },
+        _ => {}
+      }
+      x = walkExpr(x, c, b);
+    },
+    ENew(id, targs, args) => {
+      const td = lookupType(x, c, id.name);
+      if (td.isSome()) {
+        x = addRef(x, id.span, td.unwrap());
+      }
+      for (const t of targs) {
+        x = typeRefs(x, c, t);
+      }
+      x = walkExprs(x, c, args);
+    },
+    EIndex(a, b) => {
+      x = walkExpr(x, c, a);
+      x = walkExpr(x, c, b);
+    },
+    ETry(a) => { x = walkExpr(x, c, a); },
+    ECond(a, b, d) => {
+      x = walkExpr(x, c, a);
+      x = walkExpr(x, c, b);
+      x = walkExpr(x, c, d);
+    },
+    EArray(es) => { x = walkExprs(x, c, es); },
+    ETemplate(_, es) => { x = walkExprs(x, c, es); },
+    EOx(el) => {
+      for (const id of oxComponents(el)) {
+        const d = lookupVal(x, c, id.name);
+        if (d.isSome()) {
+          x = addRef(x, id.span, d.unwrap());
+        }
+      }
+      x = walkExprs(x, c, oxExprs(el));
+    },
+    ERecord(tn, sp, fs) => { x = walkRecordInits(x, c, tn, sp, fs); },
+    ETyApp(id, targs) => {
+      const d = lookupVal(x, c, id.name);
+      if (d.isSome()) {
+        x = addRef(x, id.span, d.unwrap());
+      }
+      for (const t of targs) {
+        x = typeRefs(x, c, t);
+      }
+    },
+    ERecordT(tn, targs, sp, fs) => {
+      for (const t of targs) {
+        x = typeRefs(x, c, t);
+      }
+      x = walkRecordInits(x, c, tn, sp, fs);
+    },
+    EMatch(s, arms) => {
+      x = walkExpr(x, c, s);
+      for (const a of arms) {
+        x = walkArm(x, c, a);
+      }
+    },
+    EArrow(ps, rte, body) => {
+      // The arrow's parameters and locals belong to a lifted HIR function, not to the enclosing one:
+      // walk it with its own (empty) HIR local table so the enclosing function's cursor is untouched.
+      const sHl = x.hl;
+      const sK = x.hk;
+      const noLocals: Local[] = [];
+      x.hl = noLocals;
+      x.hk = 0;
+      x = pushScope(x);
+      for (const p of ps) {
+        x = optTypeRefs(x, c, p.ty);
+        x = declare(x, c, p.name, p.span, SkParam, "(parameter)", p.ty);
+      }
+      x = optTypeRefs(x, c, rte);
+      match (body) {
+        AExpr(b) => { x = walkExpr(x, c, b); },
+        ABlock(b) => { x = walkBlock(x, c, b); }
+      }
+      x = popScope(x);
+      x.hl = sHl;
+      x.hk = sK;
+    },
+    _ => {}
+  }
+  return x;
+}
+
+function walkArm(w: W, c: Ctx, a: MatchArm): W {
+  let x = pushScope(w);
+  x = walkPattern(x, c, a.pattern, false);
+  match (a.body) {
+    BExpr(e) => { x = walkExpr(x, c, e); },
+    BBlock(b) => { x = walkBlock(x, c, b); }
+  }
+  return popScope(x);
+}
+
+// `nested`: a sub-pattern of a variant pattern, where an identifier is always a binding.
+function walkPattern(w: W, c: Ctx, p: Pattern, nested: bool): W {
+  let x = w;
+  match (p.kind) {
+    PIdent(id) => {
+      if (nested) {
+        x = declare(x, c, id, p.span, SkLocal, "const", None);
+      } else {
+        const d = lookupVal(x, c, id.name);
+        if (d.isSome()) {
+          x = addRef(x, id.span, d.unwrap());
+        }
+      }
+    },
+    PVariant(id, subs) => {
+      const d = lookupVal(x, c, id.name);
+      if (d.isSome()) {
+        x = addRef(x, id.span, d.unwrap());
+      }
+      for (const s of subs) {
+        x = walkPattern(x, c, s, true);
+      }
+    },
+    _ => {}
+  }
+  return x;
+}
+
+function walkBlock(w: W, c: Ctx, b: Block): W {
+  let x = pushScope(w);
+  for (const s of b.stmts) {
+    x = walkStmt(x, c, s);
+  }
+  return popScope(x);
+}
+
+type TyW = { w: W; ty: Option<Type>; };
+
+// Resolves the fields of an assignment target (`p.x`, `a.b[i].c`) through the declared types of
+// locals, recording a field reference for each; returns the type of the place.
+function placeFields(w: W, c: Ctx, e: Expr): TyW {
+  let x = w;
+  return match (e.kind) {
+    EIdent(id) => {
+      const lo = lookupLocal(x, id.name);
+      if (lo.isSome()) {
+        return TyW { w: x, ty: lo.unwrap().ty };
+      }
+      return TyW { w: x, ty: None };
+    },
+    EThis => {
+      // The lowered `this` local of the enclosing method / constructor.
+      let k: usize = 0;
+      while (k < x.hl.length) {
+        if (x.hl[k].name == "this") {
+          return TyW { w: x, ty: Some(x.hl[k].ty) };
+        }
+        k += 1;
+      }
+      return TyW { w: x, ty: None };
+    },
+    EMember(b, name) => {
+      const r = placeFields(x, c, b);
+      x = r.w;
+      match (r.ty) {
+        Some(t) => {
+          match (t) {
+            TyRecord(rid) => {
+              match (c.hir) {
+                Some(p) => {
+                  if (rid < p.records.length && rid < c.recDef.length) {
+                    for (const f of p.records[rid].fields) {
+                      if (f.name == name.name) {
+                        match (c.recDef[rid]) {
+                          Some(rd) => {
+                            const fd = fieldDef(x, rd, name.name);
+                            if (fd.isSome()) {
+                              x = addRef(x, name.span, fd.unwrap());
+                            }
+                          },
+                          None => {}
+                        }
+                        return TyW { w: x, ty: Some(f.ty) };
+                      }
+                    }
+                  }
+                },
+                None => {}
+              }
+            },
+            _ => {}
+          }
+        },
+        None => {}
+      }
+      return TyW { w: x, ty: None };
+    },
+    EIndex(b, _) => {
+      const r = placeFields(x, c, b);
+      match (r.ty) {
+        Some(t) => {
+          match (t) {
+            TyArray(el) => { return TyW { w: r.w, ty: Some(el) }; },
+            _ => {}
+          }
+        },
+        None => {}
+      }
+      return TyW { w: r.w, ty: None };
+    },
+    _ => TyW { w: x, ty: None }
+  };
+}
+
+function walkStmt(w: W, c: Ctx, s: Stmt): W {
+  let x = w;
+  match (s.kind) {
+    SLet(mutable, name, ty, init) => {
+      x = optTypeRefs(x, c, ty);
+      x = walkExpr(x, c, init);
+      x = declare(x, c, name, s.span, SkLocal, mutable ? "let" : "const", ty);
+    },
+    SAssign(t, _, v) => {
+      x = walkExpr(x, c, t);
+      x = walkExpr(x, c, v);
+      const r = placeFields(x, c, t);
+      x = r.w;
+    },
+    SExpr(e) => { x = walkExpr(x, c, e); },
+    SReturn(o) => {
+      match (o) {
+        Some(e) => { x = walkExpr(x, c, e); },
+        None => {}
+      }
+    },
+    SIf(cond, b, els) => {
+      x = walkExpr(x, c, cond);
+      x = walkBlock(x, c, b);
+      match (els) {
+        Some(st) => { x = walkStmt(x, c, st); },
+        None => {}
+      }
+    },
+    SWhile(cond, b) => {
+      x = walkExpr(x, c, cond);
+      x = walkBlock(x, c, b);
+    },
+    SForOf(id, it, b) => {
+      x = walkExpr(x, c, it);
+      x = pushScope(x);
+      x = declare(x, c, id, id.span, SkLocal, "const", None);
+      x = walkBlock(x, c, b);
+      x = popScope(x);
+    },
+    SBlock(b) => { x = walkBlock(x, c, b); },
+    SContract(k) => {
+      match (k.expr) {
+        Some(e) => { x = walkExpr(x, c, e); },
+        None => {}
+      }
+    },
+    _ => {}
+  }
+  return x;
+}
+
+// The HIR locals of function `hf`, for `declare`.
+function loadHirLocals(w: W, hf: Option<Function>): W {
+  let x = w;
+  let locals: Local[] = [];
+  match (hf) {
+    Some(f) => { locals = f.locals; },
+    None => {}
+  }
+  x.hl = locals;
+  x.hk = 0;
+  return x;
+}
+
+export function walkFunction(w: W, c: Ctx, f: FunctionDecl, fnDef: usize, hf: Option<Function>): W {
+  let x = loadHirLocals(w, hf);
+  x.fn = Some(fnDef);
+  let tps: string[] = [];
+  for (const t of f.typeParams) {
+    tps.push(t.name);
+  }
+  x.tps = tps;
+  for (const b of f.bounds) {
+    match (b) {
+      Some(id) => {
+        const bd = lookupType(x, c, id.name);
+        if (bd.isSome()) {
+          x = addRef(x, id.span, bd.unwrap());
+        }
+      },
+      None => {}
+    }
+  }
+  x = pushScope(x);
+  for (const p of f.params) {
+    x = typeRefs(x, c, p.ty);
+    x = declare(x, c, p.name, p.span, SkParam, "(parameter)", Some(p.ty));
+  }
+  x = optTypeRefs(x, c, f.ret);
+  for (const k of f.contracts) {
+    match (k.expr) {
+      Some(e) => { x = walkExpr(x, c, e); },
+      None => {}
+    }
+  }
+  x = walkBlock(x, c, f.body);
+  x = popScope(x);
+  x.fn = None;
+  const none: string[] = [];
+  x.tps = none;
+  return x;
+}
+
+export function walkTypeDecl(w: W, c: Ctx, t: TypeDecl): W {
+  let x = w;
+  let tps: string[] = [];
+  for (const p of t.typeParams) {
+    tps.push(p.name);
+  }
+  x.tps = tps;
+  match (t.body) {
+    DAlias(te) => { x = typeRefs(x, c, te); },
+    DRecord(fs) => {
+      for (const f of fs) {
+        x = typeRefs(x, c, f.ty);
+      }
+    },
+    DUnion(vs) => {
+      for (const v of vs) {
+        for (const te of v.payload) {
+          x = typeRefs(x, c, te);
+        }
+      }
+    }
+  }
+  const none: string[] = [];
+  x.tps = none;
+  return x;
+}
+
+// ---- user annotation uses (ADR-0046 S2) ------------------------------------------------------------------
+
+// An argument of a user annotation: only a module constant (or a union tag of the field) can be a name; those that
+// resolve to a constant of the module are references, the rest are literals.
+export function annoArgRefs(w: W, c: Ctx, e: Expr): W {
+  let x = w;
+  match (e.kind) {
+    EIdent(id) => {
+      const d = lookupVal(x, c, id.name);
+      if (d.isSome()) {
+        x = addRef(x, id.span, d.unwrap());
+      }
+    },
+    EUnary(_, a) => { x = annoArgRefs(x, c, a); },
+    EArray(xs) => {
+      for (const a of xs) {
+        x = annoArgRefs(x, c, a);
+      }
+    },
+    ECall(_, as) => {
+      for (const a of as) {
+        x = annoArgRefs(x, c, a);
+      }
+    },
+    _ => {}
+  }
+  return x;
+}
+
+// Each `@Name(..)` use is a reference to the `@Annotation` record `Name` (go to definition, find references, rename).
+function annoRefs(w: W, c: Ctx, as: Annotation[]): W {
+  let x = w;
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        const td = lookupType(x, c, id.name);
+        if (td.isSome()) {
+          x = addRef(x, id.span, td.unwrap());
+          let k: usize = 0;
+          while (k < x.annos.length) {
+            if (x.annos[k].nameSpan.file == id.span.file && x.annos[k].nameSpan.start == id.span.start) {
+              x.annos[k].def = Some(td.unwrap());
+            }
+            k += 1;
+          }
+        }
+        for (const e of args) {
+          x = annoArgRefs(x, c, e);
+        }
+      },
+      _ => {}
+    }
+  }
+  return x;
+}
+
+// The annotation uses of one top-level item and of its members.
+export function itemAnnoRefs(w: W, c: Ctx, item: Item): W {
+  let x = w;
+  match (item) {
+    IFunction(f) => { x = annoRefs(x, c, f.annotations); },
+    IConst(k) => { x = annoRefs(x, c, k.annotations); },
+    IType(t) => {
+      x = annoRefs(x, c, t.annotations);
+      match (t.body) {
+        DRecord(fs) => {
+          for (const f of fs) {
+            x = annoRefs(x, c, f.annotations);
+          }
+        },
+        _ => {}
+      }
+    },
+    IInterface(k) => {
+      x = annoRefs(x, c, k.annotations);
+      for (const m of k.methods) {
+        x = annoRefs(x, c, m.annotations);
+      }
+    },
+    IClass(cd) => {
+      x = annoRefs(x, c, cd.annotations);
+      for (const m of cd.members) {
+        match (m) {
+          MField(f) => { x = annoRefs(x, c, f.annotations); },
+          MMethod(md) => { x = annoRefs(x, c, md.annotations); },
+          _ => {}
+        }
+      }
+    },
+    _ => {}
+  }
+  return x;
+}

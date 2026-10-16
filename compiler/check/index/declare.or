@@ -1,0 +1,293 @@
+// Pass 1: the top-level declarations of every unit (types, classes, interfaces), imports and re-exports.
+// Part of the semantic index (check/index/build.or).
+
+import { Span, SourceMap } from "../../diag";
+import { Ident, Item, TypeDecl, TypeExpr, ClassDecl, CtorDecl, InterfaceDecl, ContractClause } from "../../syntax";
+import { LoadedProgram, ImportTarget } from "../../loader";
+import { Program, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkField, SkInterface } from "../../hir";
+import { contractText, paramsText, renderTE, tpList, tpListB, variantText } from "./render";
+import { W, addDef, addDefA, addRef, children } from "./state";
+import { UnitTab, bindFirst } from "./tables";
+
+// Pass 1 state: the walker state, the tables of the unit being declared, and the qualified names ("unit.Name") of all
+// classes, types and interfaces so far -> their defs (the first declaration of a name wins).
+export type P1 = { w: W; tab: UnitTab; tq: Map<string, usize>; };
+
+export function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
+  let w = p.w;
+  let tab = p.tab;
+  let tq = p.tq;
+  const id = w.defs.length;
+  const head = "type " + t.name.name + tpList(t.typeParams);
+  const cdetail = contractText(sm, t.contracts);
+  match (t.body) {
+    DAlias(te) => {
+      w = addDefA(w, t.name.name, SkAlias, t.name.span, t.span, None, t.exported, head + " = " + renderTE(te) + cdetail, t.annotations, sm);
+    },
+    DRecord(fs) => {
+      let parts: string[] = [];
+      for (const f of fs) {
+        parts.push(f.name.name + ": " + renderTE(f.ty));
+      }
+      w = addDefA(w, t.name.name, SkRecord, t.name.span, t.span, None, t.exported,
+        head + " = { " + parts.join("; ") + " }" + cdetail, t.annotations, sm);
+      for (const f of fs) {
+        w = addDefA(w, f.name.name, SkField, f.name.span, f.span, Some(id), t.exported,
+          f.name.name + ": " + renderTE(f.ty), f.annotations, sm);
+      }
+    },
+    DUnion(vs) => {
+      let parts: string[] = [];
+      for (const v of vs) {
+        parts.push(variantText(v.name.name, v.payload));
+      }
+      w = addDefA(w, t.name.name, SkUnion, t.name.span, t.span, None, t.exported,
+        head + " = " + parts.join(" | ") + cdetail, t.annotations, sm);
+      for (const v of vs) {
+        w = addDef(w, v.name.name, SkVariant, v.name.span, v.span, Some(id), t.exported,
+          variantText(v.name.name, v.payload) + ": " + t.name.name + tpList(t.typeParams));
+      }
+    }
+  }
+  tab.bindType(t.name.name, id, t.exported);
+  tq = bindFirst(tq, unitName + "." + t.name.name, id);
+  match (t.body) {
+    DUnion(vs) => {
+      let k: usize = 0;
+      for (const v of vs) {
+        k += 1;
+        tab.bindVal(v.name.name, id + k, t.exported);
+      }
+    },
+    _ => {}
+  }
+  return P1 { w: w, tab: tab, tq: tq };
+}
+
+// Classes (ADR-0009): the class is an SkRecord def ("class C"), followed by its fields (parameter
+// properties first, then declared fields; SkField) and then the constructor / methods in member
+// order (SkFunction, container = the class).
+export function classFieldCount(c: ClassDecl): usize {
+  let n: usize = 0;
+  for (const m of c.members) {
+    match (m) {
+      MField(_) => { n += 1; },
+      MCtor(k) => {
+        for (const p of k.params) {
+          if (p.access > 0) {
+            n += 1;
+          }
+        }
+      },
+      MMethod(_) => {}
+    }
+  }
+  return n;
+}
+
+// Class invariants then the constructor's own clauses (the checker attaches both to the constructor).
+export function allCtorClauses(c: ClassDecl, k: CtorDecl): ContractClause[] {
+  let out: ContractClause[] = [];
+  for (const x of c.contracts) {
+    out.push(x);
+  }
+  for (const x of k.contracts) {
+    out.push(x);
+  }
+  return out;
+}
+
+// Inferred mutability of a method (ADR-0009): the lowered HIR function of an instance method
+// returns the updated receiver (declared `void`) or a `$ret` record.
+function methodMutating(hir: Option<Program>, qname: string, declRet: Option<TypeExpr>): bool {
+  match (hir) {
+    Some(h) => {
+      // the checker's table (the only source for methods of generic classes, which have no function until used)
+      for (const n of h.mutating) {
+        if (n == qname) {
+          return true;
+        }
+      }
+      for (const f of h.functions) {
+        if (f.name == qname && f.paramCount > 0 && f.locals[0].name == "this$") {
+          match (f.ret) {
+            TyVoid => { return false; },
+            TyRecord(r) => {
+              if (h.records[r].name.endsWith("$ret")) {
+                return true;
+              }
+              const isVoidDecl = match (declRet) {
+                None => true,
+                Some(t) => match (t.kind) {
+                  TNamed(id, _) => id.name == "void",
+                  _ => false
+                }
+              };
+              return isVoidDecl;
+            },
+            _ => { return false; }
+          }
+        }
+      }
+    },
+    None => {}
+  }
+  return false;
+}
+
+export function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program>, sm: SourceMap): P1 {
+  let w = p.w;
+  let tab = p.tab;
+  let tq = p.tq;
+  const id = w.defs.length;
+  let cdetail = "class " + c.name.name + tpListB(c.typeParams, c.bounds);
+  if (c.impls.length > 0) {
+    let ins: string[] = [];
+    for (const i of c.impls) {
+      ins.push(i.name);
+    }
+    cdetail += " implements " + ins.join(", ");
+  }
+  cdetail += contractText(sm, c.contracts);
+  w = addDefA(w, c.name.name, SkRecord, c.name.span, c.span, None, c.exported, cdetail, c.annotations, sm);
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        for (const cp of k.params) {
+          if (cp.access > 0) {
+            w = addDef(w, cp.name.name, SkField, cp.name.span, cp.span, Some(id), c.exported,
+              (cp.access == 2 ? "private " : "") + cp.name.name + ": " + renderTE(cp.ty));
+          }
+        }
+      },
+      _ => {}
+    }
+  }
+  for (const m of c.members) {
+    match (m) {
+      MField(f) => {
+        w = addDefA(w, f.name.name, SkField, f.name.span, f.span, Some(id), c.exported,
+          (f.priv ? "private " : "") + f.name.name + ": " + renderTE(f.ty), f.annotations, sm);
+      },
+      _ => {}
+    }
+  }
+  for (const m of c.members) {
+    match (m) {
+      MCtor(k) => {
+        // `constructor` follows the contract clauses (the member's span starts at the first one).
+        let kwStart = k.span.start;
+        if (k.contracts.length > 0) {
+          const after = k.contracts[k.contracts.length - 1].span.end;
+          const ftext = sm.files[k.span.file].text;
+          kwStart = after + ftext.substring(after, ftext.length).indexOf("constructor").unwrapOr(0);
+        }
+        const nsp = Span { file: k.span.file, start: kwStart, end: kwStart + 11 };
+        let ps: string[] = [];
+        for (const cp of k.params) {
+          ps.push(cp.name.name + ": " + renderTE(cp.ty));
+        }
+        w = addDef(w, "constructor", SkFunction, nsp, k.span, Some(id), c.exported,
+          "constructor(" + ps.join(", ") + ")" + contractText(sm, k.contracts));
+      },
+      MMethod(md) => {
+        const mutating = !md.isStatic && methodMutating(hir, unitName + "." + c.name.name + "." + md.name.name, md.ret);
+        let d = (md.priv ? "private " : "") + (md.isStatic ? "static " : "") + (mutating ? "mut method " : "method ")
+          + md.name.name + "(" + paramsText(md.params) + ")";
+        match (md.ret) {
+          Some(t) => { d += ": " + renderTE(t); },
+          None => {}
+        }
+        w = addDefA(w, md.name.name, SkFunction, md.name.span, md.span, Some(id), c.exported, d + contractText(sm, md.contracts), md.annotations, sm);
+      },
+      MField(_) => {}
+    }
+  }
+  tab.bindType(c.name.name, id, c.exported);
+  tq = bindFirst(tq, unitName + "." + c.name.name, id);
+  return P1 { w: w, tab: tab, tq: tq };
+}
+
+// Interfaces (ADR-0019): the interface is an SkInterface def ("interface I"), followed by its methods
+// (SkFunction, container = the interface) in declaration order.
+export function declareInterface(p: P1, unitName: string, k: InterfaceDecl, sm: SourceMap): P1 {
+  let w = p.w;
+  let tab = p.tab;
+  let tq = p.tq;
+  const id = w.defs.length;
+  w = addDefA(w, k.name.name, SkInterface, k.name.span, k.span, None, k.exported, "interface " + k.name.name, k.annotations, sm);
+  for (const m of k.methods) {
+    let d = "method " + m.name.name + "(" + paramsText(m.params) + ")";
+    match (m.ret) {
+      Some(t) => { d += ": " + renderTE(t); },
+      None => {}
+    }
+    w = addDefA(w, m.name.name, SkFunction, m.name.span, m.span, Some(id), k.exported, d, m.annotations, sm);
+  }
+  tab.bindType(k.name.name, id, k.exported);
+  tq = bindFirst(tq, unitName + "." + k.name.name, id);
+  return P1 { w: w, tab: tab, tq: tq };
+}
+
+function importOf(item: Item): Option<ImportDeclRe> {
+  return match (item) {
+    IImport(d) => Some(ImportDeclRe { names: d.names, reexport: false }),
+    IReExport(d) => Some(ImportDeclRe { names: d.names, reexport: true }),
+    _ => None
+  };
+}
+
+type ImportDeclRe = { names: Ident[]; reexport: bool; };
+
+function isUnionDef(w: W, d: usize): bool {
+  return match (w.defs[d].kind) {
+    SkUnion => true,
+    _ => false
+  };
+}
+
+export function resolveImports(p: P1, unit: usize, prog: LoadedProgram, tabs: UnitTab[]): P1 {
+  let w = p.w;
+  let tab = p.tab;
+  const u = prog.units[unit];
+  let imp: usize = 0;
+  for (const item of u.ast.items) {
+    const io = importOf(item);
+    if (io.isNone()) {
+      continue;
+    }
+    const d = io.unwrap();
+    const target: ImportTarget = u.imports[imp];
+    imp += 1;
+    match (target) {
+      ImportUnit(j) => {
+        if (j >= tabs.length) {
+          continue;
+        }
+        const src = tabs[j];
+        for (const n of d.names) {
+          const td = src.exportedType(n.name);
+          const vd = src.exportedVal(n.name);
+          if (td.isSome()) {
+            w = addRef(w, n.span, td.unwrap());
+          } else if (vd.isSome()) {
+            w = addRef(w, n.span, vd.unwrap());
+          }
+          if (td.isSome()) {
+            tab.importType(n.name, td.unwrap(), d.reexport);
+            if (isUnionDef(w, td.unwrap())) {
+              for (const k of children(w.defs, td.unwrap())) {
+                tab.importVal(w.defs[k].name, k, d.reexport);
+              }
+            }
+          }
+          if (vd.isSome()) {
+            tab.importVal(n.name, vd.unwrap(), d.reexport);
+          }
+        }
+      },
+      ImportStd(_) => {}
+    }
+  }
+  return P1 { w: w, tab: tab, tq: p.tq };
+}

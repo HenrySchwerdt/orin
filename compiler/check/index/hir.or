@@ -1,0 +1,513 @@
+// Pass 2 over the typed HIR: method references, call sites (OSIG CALLS edges) and expression types.
+// Part of the semantic index (check/index/build.or).
+
+import { Span } from "../../diag";
+import { Function, HBlock, HStmt, HExpr, Place, SymbolDef, TypeAt, CallSite, SkFunction, foldBlock } from "../../hir";
+import { ioOpOf, ioOpOfLib } from "./effects";
+import { renderTy } from "./render";
+import { Ctx, W, addRef, children, fieldDef, isParamOf } from "./state";
+import { isOrdinaryKind, isWrapperKind } from "./tables";
+
+// ---- HIR walk: field references and expression types ----------------------------------------------
+
+// The first child of def `parent` (the members of a class or interface follow it) named `name`; `fnOnly`: only methods.
+function childNamed(defs: SymbolDef[], parent: usize, name: string, fnOnly: bool): Option<usize> {
+  for (const k of children(defs, parent)) {
+    const isFn = match (defs[k].kind) { SkFunction => true, _ => false };
+    if (defs[k].name == name && (isFn || !fnOnly)) {
+      return Some(k);
+    }
+  }
+  return None;
+}
+
+// A reference to method def `md` at the method name `mname` that follows the first `.` at or after `start` inside the
+// source text of call `e` (the receiver ends before it; `C.` for a static method).
+function memberNameRef(w: W, c: Ctx, e: HExpr, start: usize, mname: string, md: usize): W {
+  let x = w;
+  const sp = e.span;
+  const text = c.sm.files[sp.file].text;
+  let pos = start;
+  while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
+    pos += 1;
+  }
+  pos += 1;
+  while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) == 32 || text.charCodeAt(pos) == 10)) {
+    pos += 1;
+  }
+  const end = pos + mname.length;
+  if (end <= sp.end && end <= text.length && text.substring(pos, end) == mname) {
+    x = addRef(x, Span { file: sp.file, start: pos, end: end }, md);
+  }
+  return x;
+}
+
+// A call of a lowered method (`unit.C.m`): reference to the method's def at the method name in the
+// source text (after the receiver, or after `C.` for a static method).
+function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      if (fid >= p.functions.length) {
+        return x;
+      }
+      const f = p.functions[fid];
+      // instances of generic functions / generic-class methods are named `unit.C.m<args>`
+      let fname = f.name;
+      const lt = fname.indexOf("<");
+      if (lt.isSome()) {
+        fname = fname.substring(0, lt.unwrap());
+      }
+      let dot: Option<usize> = None;
+      let di: usize = 0;
+      while (di < fname.length) {
+        if (fname.charCodeAt(di) == 46) {
+          dot = Some(di);
+        }
+        di += 1;
+      }
+      if (dot.isNone()) {
+        return x;
+      }
+      const mname = fname.substring(dot.unwrap() + 1, fname.length);
+      const cname = fname.substring(0, dot.unwrap());
+      if (mname == "constructor") {
+        return x;
+      }
+      let md: Option<usize> = None;
+      // Inside an instance of a generic function with bounded type parameters, a call of an interface
+      // method refers to the interface method, not to the method of the class of this instance.
+      for (const bd of x.bnd) {
+        if (md.isNone()) {
+          md = childNamed(x.defs, bd, mname, false);
+        }
+      }
+      if (md.isNone()) {
+        const cd = c.tq.get(cname);
+        if (cd.isNone()) {
+          return x;
+        }
+        md = childNamed(x.defs, cd.unwrap(), mname, true);
+      }
+      if (md.isNone()) {
+        return x;
+      }
+      const instance = f.paramCount > 0 && f.locals[0].name == "this$";
+      let start = e.span.start;
+      if (instance) {
+        if (args.length == 0) {
+          return x;
+        }
+        start = args[0].span.end;
+      }
+      x = memberNameRef(x, c, e, start, mname, md.unwrap());
+    },
+    None => {}
+  }
+  return x;
+}
+
+// A call through an interface value (`s.area()`): reference to the interface method declaration, at the
+// method name after the receiver.
+function virtRef(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      const iface = match (recv.ty) {
+        TyIface(i) => Some(i),
+        _ => None
+      };
+      if (iface.isNone() || iface.unwrap() >= p.ifaces.length || slot >= p.ifaces[iface.unwrap()].methods.length) {
+        return x;
+      }
+      const info = p.ifaces[iface.unwrap()];
+      const mname = info.methods[slot];
+      const idf = c.tq.get(info.name);
+      if (idf.isNone()) {
+        return x;
+      }
+      const md = childNamed(x.defs, idf.unwrap(), mname, false);
+      if (md.isNone()) {
+        return x;
+      }
+      x = memberNameRef(x, c, e, recv.span.end, mname, md.unwrap());
+    },
+    None => {}
+  }
+  return x;
+}
+
+// ---- call sites (OSIG) ---------------------------------------------------------------------------------
+
+function addCallP(w: W, callee: Option<usize>, ev: string, via: string, sp: Span, param: int, fnArgs: string): W {
+  let x = w;
+  match (x.cur) {
+    Some(cl) => {
+      x.calls.push(CallSite {
+        caller: cl, callee: callee, ev: x.curMay && ev == "MUST" ? "MAY" : ev, via: via, span: sp, param: param, fnArgs: fnArgs
+      });
+    },
+    None => {}
+  }
+  return x;
+}
+
+function addCall(w: W, callee: Option<usize>, ev: string, via: string, sp: Span): W {
+  return addCallP(w, callee, ev, via, sp, -1, "");
+}
+
+// The provenance of the function-typed arguments of a call (CallSite.fnArgs). `lead`: a leading empty entry for the
+// receiver of a virtual call.
+function fnArgKinds(w: W, c: Ctx, args: HExpr[], lead: bool): string {
+  let parts: string[] = lead ? [""] : [];
+  let any = false;
+  for (const a of args) {
+    let k = "";
+    match (a.ty) {
+      TyFn(_, _) => {
+        any = true;
+        k = "u";
+        match (a.kind) {
+          XClosure(fid, _) => {
+            if (fid < c.fnKind.length) {
+              k = isWrapperKind(c.fnKind[fid]) ? "v" : "c";
+            }
+          },
+          XLocal(q) => {
+            if (isParamOf(w.np, q)) {
+              k = "p" + q.toString();
+            }
+          },
+          _ => {}
+        }
+      },
+      _ => {}
+    }
+    parts.push(k);
+  }
+  return any ? parts.join(",") : "";
+}
+
+function isContained(w: W, d: usize): bool {
+  return match (w.defs[d].container) {
+    Some(_) => true,
+    None => false
+  };
+}
+
+// A direct call (XCall) of a function, method or constructor. Inside an instance of a generic function
+// with bounded type parameters the call of a method of the instance's class is a call of the interface method.
+function callSite(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
+  let x = w;
+  if (fid >= c.fnDef.length || !isOrdinaryKind(c.fnKind[fid])) {
+    return x;
+  }
+  const fa = fnArgKinds(x, c, args, false);
+  match (c.fnDef[fid]) {
+    Some(d) => {
+      let callee = d;
+      let via = isContained(x, d) ? (x.defs[d].name == "constructor" ? "constructor" : "method") : "direct";
+      if (x.defs[d].name == "constructor" || x.defs[d].container.isNone() && x.defs[d].detail.startsWith("class ")) {
+        via = "constructor";
+      }
+      if (isContained(x, d)) {
+        for (const bd of x.bnd) {
+          for (const k of children(x.defs, bd)) {
+            if (x.defs[k].name == x.defs[d].name) {
+              callee = k;
+              via = "bound";
+            }
+          }
+        }
+      }
+      x = addCallP(x, Some(callee), "MUST", via, e.span, -1, fa);
+    },
+    None => {
+      // A function the index cannot map to a definition: the call is recorded with an unknown target, so that the
+      // effect analysis never takes it for pure.
+      x = addCallP(x, None, "UNKNOWN", "unresolved", e.span, -1, "");
+    }
+  }
+  return x;
+}
+
+// A call through an interface value: the interface method.
+function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize, args: HExpr[]): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      match (recv.ty) {
+        TyIface(i) => {
+          if (i < p.ifaces.length && slot < p.ifaces[i].methods.length) {
+            const idf = c.tq.get(p.ifaces[i].name);
+            if (idf.isSome()) {
+              const k = childNamed(x.defs, idf.unwrap(), p.ifaces[i].methods[slot], false);
+              if (k.isSome()) {
+                return addCallP(x, k, "MUST", "virtual", e.span, -1, fnArgKinds(x, c, args, true));
+              }
+            }
+          }
+        },
+        _ => {}
+      }
+    },
+    None => {}
+  }
+  return addCallP(x, None, "UNKNOWN", "indirect", e.span, -1, "");
+}
+
+// A function used as a value (the lifted wrapper `f$closure`, ADR-0011): the wrapped function may be
+// called wherever the value flows.
+function valueRef(w: W, c: Ctx, e: HExpr, fid: usize): W {
+  if (fid < c.fnDef.length && isWrapperKind(c.fnKind[fid])) {
+    match (c.fnDef[fid]) {
+      Some(d) => { return addCall(w, Some(d), "MAY", "value", e.span); },
+      None => {}
+    }
+  }
+  return w;
+}
+
+function litKind(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    _ => false
+  };
+}
+
+// The expressions seen so far by the types fold, newest first. A fold threads its state by value; a list that grows by
+// one node per row keeps that O(1), where pushing onto a shared array would copy it at every node.
+type Rows = { row: TypeAt; rest: Option<Rows>; };
+
+// The rendered type of every non-literal expression occurrence in `b`, in the pre-order of the HIR fold, for hover
+// and inlay hints. A separate fold: the call-site walk below acts after the children, the types before them.
+export function typeRows(w: W, c: Ctx, b: HBlock): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      const none: Option<Rows> = None;
+      let list = foldBlock(b, none, (e, acc) => {
+        if (litKind(e)) {
+          return acc;
+        }
+        return Some(Rows { row: TypeAt { span: e.span, ty: renderTy(p, e.ty) }, rest: acc });
+      });
+      let rows: TypeAt[] = [];
+      while (list.isSome()) {
+        rows.push(list.unwrap().row);
+        list = list.unwrap().rest;
+      }
+      let i = rows.length;
+      while (i > 0) {
+        i -= 1;
+        x.types.push(rows[i]);
+      }
+    },
+    None => {}
+  }
+  return x;
+}
+
+function hExprs(w: W, c: Ctx, es: HExpr[]): W {
+  let x = w;
+  for (const e of es) {
+    x = hExpr(x, c, e);
+  }
+  return x;
+}
+
+export function hBlock(w: W, c: Ctx, b: HBlock): W {
+  let x = w;
+  for (const s of b.stmts) {
+    x = hStmt(x, c, s);
+  }
+  return x;
+}
+
+function hPlace(w: W, c: Ctx, p: Place): W {
+  let x = w;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(e) => { x = hExpr(x, c, e); },
+      _ => {}
+    }
+  }
+  return x;
+}
+
+function hStmt(w: W, c: Ctx, s: HStmt): W {
+  let x = w;
+  match (s) {
+    HLet(_, e) => { x = hExpr(x, c, e); },
+    HAssign(p, _, e) => {
+      x = hPlace(x, c, p);
+      x = hExpr(x, c, e);
+    },
+    HExprStmt(e) => { x = hExpr(x, c, e); },
+    HIf(cond, a, b) => {
+      x = hExpr(x, c, cond);
+      x = hBlock(x, c, a);
+      match (b) {
+        Some(blk) => { x = hBlock(x, c, blk); },
+        None => {}
+      }
+    },
+    HWhile(cond, b) => {
+      x = hExpr(x, c, cond);
+      x = hBlock(x, c, b);
+    },
+    HForOf(_, e, b) => {
+      x = hExpr(x, c, e);
+      x = hBlock(x, c, b);
+    },
+    HReturn(o) => {
+      match (o) {
+        Some(e) => { x = hExpr(x, c, e); },
+        None => {}
+      }
+    },
+    HBlockStmt(b) => { x = hBlock(x, c, b); },
+    _ => {}
+  }
+  return x;
+}
+
+function hExpr(w: W, c: Ctx, e: HExpr): W {
+  let x = w;
+  match (e.kind) {
+    XUnary(_, a) => { x = hExpr(x, c, a); },
+    XBinary(_, a, b) => {
+      x = hExpr(x, c, a);
+      x = hExpr(x, c, b);
+    },
+    XCall(fid, args) => {
+      x = hExprs(x, c, args);
+      x = methodRef(x, c, e, fid, args);
+      x = callSite(x, c, e, fid, args);
+      match (c.hir) {
+        Some(p) => {
+          if (fid < p.functions.length) {
+            const op = ioOpOfLib(p.functions[fid].name);
+            if (op != "") {
+              x = addCall(x, None, "MUST", "io:" + op, e.span);
+            }
+          }
+        },
+        None => {}
+      }
+    },
+    XBuiltin(b, args) => {
+      x = hExprs(x, c, args);
+      const op = ioOpOf(b);
+      if (op != "") {
+        x = addCall(x, None, "MUST", "io:" + op, e.span);
+      }
+    },
+    XMutMethod(_, p, args) => {
+      x = hPlace(x, c, p);
+      x = hExprs(x, c, args);
+    },
+    XField(b, rid, fi) => {
+      x = hExpr(x, c, b);
+      match (c.hir) {
+        Some(p) => {
+          if (rid < p.records.length && rid < c.recDef.length && fi < p.records[rid].fields.length) {
+            const name = p.records[rid].fields[fi].name;
+            const sp = e.span;
+            if (sp.file < c.sm.files.length && sp.end >= name.length && sp.end - name.length >= sp.start) {
+              const start = sp.end - name.length;
+              const text = c.sm.files[sp.file].text;
+              if (sp.end <= text.length && text.substring(start, sp.end) == name) {
+                match (c.recDef[rid]) {
+                  Some(rd) => {
+                    const fd = fieldDef(x, rd, name);
+                    if (fd.isSome()) {
+                      x = addRef(x, Span { file: sp.file, start: start, end: sp.end }, fd.unwrap());
+                    }
+                  },
+                  None => {}
+                }
+              }
+            }
+          }
+        },
+        None => {}
+      }
+    },
+    XIndex(a, b) => {
+      x = hExpr(x, c, a);
+      x = hExpr(x, c, b);
+    },
+    XRecord(_, sp, inits) => {
+      match (sp) {
+        Some(s) => { x = hExpr(x, c, s); },
+        None => {}
+      }
+      for (const fi of inits) {
+        x = hExpr(x, c, fi.value);
+      }
+    },
+    XVariant(_, args) => { x = hExprs(x, c, args); },
+    XArray(es) => { x = hExprs(x, c, es); },
+    XTry(a) => { x = hExpr(x, c, a); },
+    XCond(a, b, d) => {
+      x = hExpr(x, c, a);
+      x = hExpr(x, c, b);
+      x = hExpr(x, c, d);
+    },
+    XMatch(s, arms) => {
+      x = hExpr(x, c, s);
+      for (const a of arms) {
+        x = hBlock(x, c, a.body);
+        match (a.value) {
+          Some(v) => { x = hExpr(x, c, v); },
+          None => {}
+        }
+      }
+    },
+    XClosure(fid, caps) => {
+      x = hExprs(x, c, caps);
+      x = valueRef(x, c, e, fid);
+    },
+    XCallIndirect(f, args) => {
+      x = hExpr(x, c, f);
+      x = hExprs(x, c, args);
+      let pk: int = -1;
+      match (f.kind) {
+        XLocal(q) => {
+          if (isParamOf(x.np, q)) {
+            pk = q.toInt();
+          }
+        },
+        _ => {}
+      }
+      x = addCallP(x, None, "UNKNOWN", "indirect", e.span, pk, "");
+    },
+    XIface(_, v) => { x = hExpr(x, c, v); },
+    XCallVirtual(r, slot, args) => {
+      x = hExpr(x, c, r);
+      x = hExprs(x, c, args);
+      x = virtRef(x, c, e, r, slot);
+      x = virtCall(x, c, e, r, slot, args);
+    },
+    _ => {}
+  }
+  return x;
+}
+
+// Walks the lowered body of `hf` for the call sites, method and field references of the def `caller` (None: not
+// attributed), and, when `withTypes`, records the expression types. `np`: see W.
+export function hirBody(w: W, c: Ctx, caller: Option<usize>, np: Option<usize>, hf: Function, withTypes: bool): W {
+  let x = w;
+  x.cur = caller;
+  x.np = np;
+  x = hBlock(x, c, hf.body);
+  if (withTypes) {
+    x = typeRows(x, c, hf.body);
+  }
+  x.cur = None;
+  x.np = None;
+  return x;
+}

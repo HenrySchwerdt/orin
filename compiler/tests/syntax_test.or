@@ -5,13 +5,13 @@
 // token consumed, the node spans exactly the consumed tokens) and the `@Ensures` of `lex` / `parse` (tokens and trees
 // well formed, error spans inside the source) run on every call below.
 
-import { assert, assertEq, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { assert, assertEq, assertEqString, assertEqUsize, assertEqBool, fail } from "std:test";
 import { Span, Diagnostic, span } from "../diag";
 import {
   Ident, Module, Item, Expr, ExprKind, BinaryOp, UnaryOp, ContractKind, AnnotationKind, Stmt,
   Pattern, TypeExpr, Block, ContractClause, Annotation, Token, TokKind, Lexer, lex, isEofTok,
   tokensWellFormed, Parser, parse, isSyntaxCode, OpRow, OpTable, binaryOps, opRowsOk, MAX_LEVEL,
-  T_FUNCTION, T_METHOD, T_CLASS, T_LOOP, T_CONST, clauseAllowed, annotationAllowed, checkPlacement,
+  T_FUNCTION, T_METHOD, T_CTOR, T_CLASS, T_LOOP, T_CONST, T_FIELD, annotationName, clauseAllowed, annotationAllowed, checkPlacement,
   checkAnnoPlacement, inside, nestedIn, exprOk, exprShallowOk, stmtOk, typeOk, itemSpan,
   moduleWellFormed, Comment, scanComments, commentsWellFormed, cookOxText, decodeEntities, oxExprs,
   oxComponents, oxIsComponent,
@@ -479,8 +479,13 @@ function firstErrorIsReportedUnchanged(): void {
   assertEqString(e4.message, "contract clauses cannot precede a constant", "placement");
   const e5 = errOf("@Test @Test function f(): void {}");
   assertEqString(e5.code, "E0442", "duplicate annotation");
-  const e6 = errOf("@Foo function f(): void {}");
-  assertEqString(e6.code, "E0408", "unknown annotation");
+  const e6 = errOf("@Annotation function f(): void {}");
+  assertEqString(e6.code, "E0441", "@Annotation without targets");
+  assertEqString(errOf("@Annotation(function, statement) type T = {};").code, "E0441", "unknown target word");
+  assertEqString(errOf("@Annotation(function) function f(): void {}").code, "E0440", "@Annotation only on records");
+  assertEqString(errOf("@Foo @Foo function f(): void {}").code, "E0442", "duplicate user annotation");
+  assertEqString(errOf("@Foo(1 function f(): void {}").code, "E0200", "unclosed argument list");
+  assertEqString(errOf("function __g1(): void {}").code, "E0447", "reserved prefix");
   const e7 = errOf("interface I { x: int; }");
   assertEqString(e7.code, "E0408", "interface field");
   const e8 = errOf("type T<A extends B> = A;");
@@ -554,6 +559,47 @@ function placementRules(): void {
     Annotation { kind: AInline, message: "", span: sp(8, 15) },
   ];
   assertEqString(checkAnnoPlacement(twice, T_FUNCTION).unwrapErr().code, "E0442", "duplicate");
+}
+
+@Test
+function userAnnotationsParse(): void {
+  const m = parse(0, "@Foo(1, -2, [\"a\"], Get) @Annotation(field, const) type T = { @Bar x: int; };\n@Baz const K: int = 1;").unwrap();
+  match (m.items[0]) {
+    IType(d) => {
+      assertEqUsize(d.annotations.length, 2, "two annotations");
+      assertEqString(annotationName(d.annotations[0].kind), "@Foo", "user annotation name");
+      match (d.annotations[0].kind) {
+        ACustom(_, args) => {
+          assertEqUsize(args.length, 4, "four arguments");
+        },
+        _ => {
+          fail("expected a user annotation");
+        },
+      }
+      match (d.body) {
+        DRecord(fs) => {
+          assertEqUsize(fs[0].annotations.length, 1, "field annotation");
+          assert(fs[0].span.start < fs[0].name.span.start, "the field span starts at its annotation");
+        },
+        _ => {
+          fail("expected a record");
+        },
+      }
+    },
+    _ => {
+      fail("expected a type");
+    },
+  }
+  match (m.items[1]) {
+    IConst(k) => {
+      assertEqUsize(k.annotations.length, 1, "constant annotation");
+    },
+    _ => {
+      fail("expected a constant");
+    },
+  }
+  assert(annotationAllowed(ACustom(Ident { name: "Foo", span: sp(0, 3) }, []), T_FIELD), "user annotations on fields");
+  assert(!annotationAllowed(ACustom(Ident { name: "Foo", span: sp(0, 3) }, []), T_CTOR), "not on constructors");
 }
 
 @Test
