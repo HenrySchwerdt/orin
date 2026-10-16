@@ -1,0 +1,421 @@
+// The pages of the business view (ADR-0051): summary, use cases (a list and one page each), business rules, capabilities and,
+// with a diff, what changed. Written for people who do not read code: sentences first, no signatures up front; every technical
+// detail is one link away (the symbol pages of the explorer). OX components over the records of business.or; every dynamic
+// string is escaped by std:html.
+
+import ox from "std:html";
+import { Html, document, empty } from "std:html";
+import { ShellWith, CardGrid, Card, card } from "orin-reports";
+import { Ix, NONE } from "./index";
+import { Diff } from "./model";
+import {
+  Rule, UseCase, CapRow, CapUse, Biz, BChange, buildBiz, behaviourChanges, capPhrase, capArea, capitalise, assuranceLabel, assuranceMeaning, kindLabel,
+  grantPhrase, plainDoc,
+} from "./business";
+import { Ctx, Nav, PageHead, Section, Empty, SymLink, IdLink, DocView, Loc, qualified, symHref, modHref, lastSegment } from "./components";
+import { plural, strCmp, lower } from "./util";
+
+function BFrame(ctx: Ctx, active: string, title: string, body: Html): Html {
+  const styles = <><link rel="stylesheet" href={ctx.root + "assets/explorer.css"} /><link rel="stylesheet" href={ctx.root + "assets/business.css"} /></>;
+  return <ShellWith title={title + " · " + ctx.ix.snap.pkg} brand={"Orin explorer"} styles={styles}
+    sidebar={<Nav ctx={ctx} active={active} />} content={<main id="main" class="ex-main">{body}</main>} foot={empty()} />;
+}
+
+function ucHref(ctx: Ctx, b: Biz, ui: usize): string {
+  return ctx.root + "u/" + ctx.ix.slug[b.usecases[ui].node] + ".html";
+}
+
+// the domain a module stands for ("(root)" is the entry module of the package)
+function domainName(m: string): string {
+  return m == "(root)" ? "Application start" : capitalise(m);
+}
+
+function domainSlug(ix: Ix, m: string): string {
+  const x = ix.modNode.get(m);
+  return x.isSome() ? ix.mods[x.unwrap()].slug : "x";
+}
+
+// ---- small pieces -------------------------------------------------------------------------------------------------------------------
+
+function Assure(key: string): Html {
+  return <span class={"bz-a bz-a-" + key} title={assuranceMeaning(key)}>{assuranceLabel(key)}</span>;
+}
+
+function Sentences(r: Rule): Html {
+  return <p class="bz-sentence">{r.sentences.map(s => <span>{s + " "}</span>)}</p>;
+}
+
+function OwnerLink(ctx: Ctx, r: Rule): Html {
+  return r.owner == NONE ? <span class="ex-muted">unknown</span> : <SymLink ctx={ctx} i={r.owner} label={lastSegment(ctx.ix.snap.nodes[r.owner].id)} />;
+}
+
+function RuleItem(ctx: Ctx, b: Biz, ri: usize): Html {
+  const r = b.rules[ri];
+  return <li class={"bz-rule bz-r-" + r.assurance}>
+    <Sentences r={r} />
+    <p class="bz-meta">
+      <span class="bz-kind">{kindLabel(r.kind)}</span>
+      <Assure key={r.assurance} />
+      <span>Applies to <OwnerLink ctx={ctx} r={r} /></span>
+      <span>{r.users == 0 ? "Not used by a use case" : "Relied on by " + plural(r.users, "use case", "use cases")}</span>
+    </p>
+  </li>;
+}
+
+function CapChip(op: string): Html {
+  return <li class={"bz-chip bz-area-" + lower(capArea(op)).split(" ").join("-")} title={capArea(op)}>{capitalise(capPhrase(op))}</li>;
+}
+
+function CapChips(caps: CapUse[], max: usize): Html {
+  const shown = caps.length > max ? caps.slice(0, max) : caps;
+  return <ul class="bz-chips">{shown.map(c => <CapChip op={c.op} />)}{caps.length > max ? <li class="bz-chip bz-chip-more">{"+" + (caps.length - max).toString() + " more"}</li> : <></>}</ul>;
+}
+
+function UseCaseCard(ctx: Ctx, b: Biz, ui: usize): Html {
+  const u = b.usecases[ui];
+  return <li class="bz-card">
+    <h3 class="bz-card-title"><a href={ucHref(ctx, b, ui)}>{u.title}</a></h3>
+    {u.desc.length > 0 ? <p class="bz-card-desc">{u.desc}</p> : <p class="bz-card-desc ex-muted">No description yet.</p>}
+    <p class="bz-meta"><span>{plural(u.rules.length.toInt(), "rule", "rules")}</span>{u.http ? <span class="bz-kind">HTTP handler</span> : <></>}</p>
+    {u.caps.length == 0 ? <p class="bz-quiet">Touches nothing outside the program.</p> : <CapChips caps={u.caps} max={3} />}
+  </li>;
+}
+
+function orderedUseCases(b: Biz): usize[] {
+  let idx: usize[] = [];
+  let i: usize = 0;
+  while (i < b.usecases.length) {
+    idx.push(i);
+    i += 1;
+  }
+  return idx.sort((x: usize, y: usize): int => {
+    const mx = b.usecases[x].title == "Start the program" ? 0 : 1;
+    const my = b.usecases[y].title == "Start the program" ? 0 : 1;
+    if (mx != my) {
+      return mx < my ? -1 : 1;
+    }
+    const c = strCmp(b.usecases[x].module, b.usecases[y].module);
+    if (c != 0) {
+      return c;
+    }
+    const t = strCmp(b.usecases[x].title, b.usecases[y].title);
+    return t != 0 ? t : (x < y ? -1 : 1);
+  });
+}
+
+function countAssurance(b: Biz, key: string): int {
+  let n: int = 0;
+  for (const r of b.rules) {
+    n += r.assurance == key ? 1 : 0;
+  }
+  return n;
+}
+
+function domains(b: Biz): string[] {
+  let ms: string[] = [];
+  for (const r of b.rules) {
+    let have = false;
+    for (const m of ms) {
+      have = have || m == r.module;
+    }
+    if (!have) {
+      ms.push(r.module);
+    }
+  }
+  return ms;
+}
+
+function ChangeItem(ctx: Ctx, c: BChange): Html {
+  let target: usize = NONE;
+  if (c.id.length > 0) {
+    const x = ctx.ix.byId.get(c.id);
+    target = x.isSome() ? ctx.ix.page[x.unwrap()] : NONE;
+  }
+  return <li class={"bz-change bz-c-" + c.op}>
+    <span class="bz-op">{c.op == "added" ? "New" : (c.op == "removed" ? "Removed" : "Changed")}</span>
+    <div>
+      <p class="bz-ch-head">{c.headline}</p>
+      {c.detail.length > 0 ? <p class="bz-ch-detail">{c.detail}</p> : <></>}
+    </div>
+    {target != NONE ? <a class="bz-ch-link" href={symHref(ctx, target)}>Technical details</a> : <></>}
+  </li>;
+}
+
+function Changes(ctx: Ctx, cs: BChange[], max: usize): Html {
+  const shown = cs.length > max ? cs.slice(0, max) : cs;
+  return <><ul class="bz-changes">{shown.map(c => <ChangeItem ctx={ctx} c={c} />)}</ul>
+    {cs.length > max ? <p class="ex-muted">{"and " + (cs.length - max).toString() + " more; the technical changes page lists every change."}</p> : <></>}</>;
+}
+
+function ofArea(cs: BChange[], area: string): BChange[] {
+  let r: BChange[] = [];
+  for (const c of cs) {
+    if (c.area == area) {
+      r.push(c);
+    }
+  }
+  return r;
+}
+
+// ---- summary --------------------------------------------------------------------------------------------------------------------------
+
+export function BusinessPage(ctx: Ctx, b: Biz, changes: BChange[]): string {
+  const ix = ctx.ix;
+  let described: int = 0;
+  for (const u of b.usecases) {
+    described += u.desc.length > 0 ? 1 : 0;
+  }
+  const known = countAssurance(b, "proved") + countAssurance(b, "runtime") + countAssurance(b, "open");
+  const doms = domains(b);
+  let cards: Card[] = [
+    card("Use cases", b.usecases.length.toString(), Some(described.toString() + " described in words"), None),
+    card("Business rules", b.rules.length.toString(), Some("in " + plural(doms.length.toInt(), "area", "areas")), None),
+    card("Rules with a known status", known.toString() + " of " + b.rules.length.toString(),
+      Some(countAssurance(b, "proved").toString() + " proved, " + countAssurance(b, "runtime").toString() + " checked at run time, " + countAssurance(b, "open").toString() + " open"), None),
+    card("Kinds of access", b.caps.length.toString(), Some(b.caps.length == 0 ? "nothing outside the program" : "files, network, clock ... the software may use"), None),
+  ];
+  if (ctx.diff.isSome()) {
+    cards.push(card("Behaviour changes", changes.length.toString(), Some("between the two versions"), None));
+  }
+  const order = orderedUseCases(b);
+  const topUse = order.length > 6 ? order.slice(0, 6) : order;
+  let ruleOrder: usize[] = [];
+  let ri: usize = 0;
+  while (ri < b.rules.length) {
+    ruleOrder.push(ri);
+    ri += 1;
+  }
+  ruleOrder = ruleOrder.sort((x: usize, y: usize): int => b.rules[x].users != b.rules[y].users ? (b.rules[x].users > b.rules[y].users ? -1 : 1) : (x < y ? -1 : 1));
+  const topRules = ruleOrder.length > 5 ? ruleOrder.slice(0, 5) : ruleOrder;
+  let capsAsUse: CapUse[] = [];
+  for (const c of b.caps) {
+    capsAsUse.push(CapUse { op: c.op, ev: "MUST", next: "" });
+  }
+  const lead = "What " + ix.snap.pkg + " does, which rules it keeps and what it is allowed to touch, in plain language. Everything here is read from the code; "
+    + "the technical view is one click away on every page.";
+  const body = <>
+    <PageHead eyebrow={<>Business view</>} title={ix.snap.pkg} lead={lead} />
+    <CardGrid cards={cards} />
+    {Section("usecases", "What it does", "Use cases are the things a person or another system can ask the software to do. The first lines of their documentation describe them.",
+      b.usecases.length == 0 ? Empty("No entry points were found. A use case is a main function or an exported function or method.")
+      : <><ul class="bz-grid">{topUse.map(u => <UseCaseCard ctx={ctx} b={b} ui={u} />)}</ul>
+        <p class="ex-more"><a href="usecases.html">{"All " + plural(b.usecases.length.toInt(), "use case", "use cases")}</a></p></>)}
+    {Section("rules", "What it promises", "Business rules are conditions the code insists on: what must be true before something runs, what it guarantees afterwards and what is always true. Shown here: the rules that most use cases rely on.",
+      b.rules.length == 0 ? Empty("No rules are written down yet. Rules are written as @Requires, @Ensures and @Invariant clauses in the code.")
+      : <><ul class="bz-rules">{topRules.map(r => <RuleItem ctx={ctx} b={b} ri={r} />)}</ul>
+        <p class="ex-more"><a href="rules.html">{"All " + plural(b.rules.length.toInt(), "rule", "rules")}</a></p></>)}
+    {Section("capabilities", "What it may touch", "Capabilities are the ways the software can reach outside itself. Anything not listed here it cannot do.",
+      b.caps.length == 0 ? <p class="bz-quiet">As far as the analysis can see, the software touches nothing outside the program.</p>
+      : <><CapChips caps={capsAsUse} max={40} /><p class="ex-more"><a href="capabilities.html">Who may do what</a></p></>)}
+    {ctx.diff.isSome() ? Section("changes", "What changed", "The differences that matter to the business between the two versions.",
+      changes.length == 0 ? Empty("No rule, use case or capability changed.")
+      : <><Changes ctx={ctx} cs={changes} max={5} /><p class="ex-more"><a href="behaviour.html">All behaviour changes</a></p></>) : <></>}
+    {Section("read", "How to read this", "",
+      <dl class="bz-glossary">
+        <div><dt>Use case</dt><dd>Something the software can be asked to do: an entry point of the code.</dd></div>
+        <div><dt>Business rule</dt><dd>A condition written into the code. It is checked or proved, so it cannot silently stop being true.</dd></div>
+        <div><dt>Status of a rule</dt><dd>Proved: a verifier showed it always holds. Checked at run time: the program stops when it is broken. Open: nothing enforces it. Unknown: the snapshot does not say.</dd></div>
+        <div><dt>Capability</dt><dd>A way to reach outside the program: files, network, the clock, other programs, the console. The software has exactly the capabilities listed.</dd></div>
+      </dl>)}
+  </>;
+  return document(<BFrame ctx={ctx} active="biz" title="Business view" body={body} />);
+}
+
+// ---- use cases --------------------------------------------------------------------------------------------------------------------------
+
+export function UseCasesPage(ctx: Ctx, b: Biz): string {
+  const order = orderedUseCases(b);
+  const shown = order.length > 300 ? order.slice(0, 300) : order;
+  const body = <>
+    <PageHead eyebrow={<>Business view</>} title="Use cases" lead={"The " + plural(b.usecases.length.toInt(), "thing", "things") + " the software can be asked to do, with the rules each relies on and what it may touch."} />
+    {b.usecases.length == 0 ? Empty("No entry points were found.") : <ul class="bz-grid">{shown.map(u => <UseCaseCard ctx={ctx} b={b} ui={u} />)}</ul>}
+    {order.length > 300 ? <p class="ex-muted">{"The first 300 of " + order.length.toString() + " use cases are shown."}</p> : <></>}
+  </>;
+  return document(<BFrame ctx={ctx} active="biz-usecases" title="Use cases" body={body} />);
+}
+
+function viaText(c: CapUse): string {
+  return c.ev == "MUST" && c.next.length == 0 ? "It does this itself." : (c.next.length > 0 ? "Through " + qualified(c.next) + "." : "Possibly, the analysis cannot rule it out.");
+}
+
+function CapLine(ctx: Ctx, c: CapUse, grant: string): Html {
+  return <li class="bz-capline">
+    <p class="bz-capline-head"><span class="bz-may">May</span> {capPhrase(c.op)}<span class="bz-chip bz-chip-area">{capArea(c.op)}</span></p>
+    <p class="bz-meta"><span>{viaText(c)}</span>{c.next.length > 0 ? <IdLink ctx={ctx} id={c.next} /> : <></>}<span>{"Permission: " + grant}</span></p>
+  </li>;
+}
+
+export function UseCasePage(ctx: Ctx, b: Biz, ui: usize): string {
+  const ix = ctx.ix;
+  const u = b.usecases[ui];
+  const s = ix.snap.nodes[u.node];
+  let grants = new Map<string, string>();
+  for (const cr of b.caps) {
+    grants.set(cr.op, cr.grant);
+  }
+  let ownList: usize[] = [];
+  let viaList: usize[] = [];
+  let k: usize = 0;
+  while (k < u.rules.length) {
+    if (k.toInt() < u.ownRules) {
+      ownList.push(u.rules[k]);
+    } else {
+      viaList.push(u.rules[k]);
+    }
+    k += 1;
+  }
+  const shownVia = viaList.length > 40 ? viaList.slice(0, 40) : viaList;
+  const cards: Card[] = [
+    card("Rules", u.rules.length.toString(), Some(u.ownRules.toString() + " written on it directly"), None),
+    card("Capabilities", u.caps.length.toString(), Some(u.caps.length == 0 ? "touches nothing outside the program" : "ways it may reach outside"), None),
+    card("Reaches", u.reached.toString(), Some("other functions through calls"), None),
+  ];
+  const lead = u.desc.length > 0 ? u.desc : "No description yet. A /** ... */ comment above the function appears here.";
+  const body = <>
+    <PageHead eyebrow={<><a href="../business.html">Business view</a> / <a href="../usecases.html">Use cases</a></>} title={u.title} lead={lead} />
+    <p class="ex-meta">
+      <span class="bz-kind">{s.name == "main" ? "Program start" : "Entry point"}</span>
+      {u.http ? <span class="bz-kind">HTTP handler (recognised by its signature)</span> : <></>}
+      <span class="bz-kind">{domainName(u.module)}</span>
+    </p>
+    <CardGrid cards={cards} />
+    {Section("may", "What it may do", "Everything this use case can do to the outside world, including what the things it uses can do.",
+      u.caps.length == 0 ? <p class="bz-quiet">It touches nothing outside the program: no files, network, clock, other programs or console, as far as the analysis can see.</p>
+      : <ul class="bz-caplines">{u.caps.map(c => <CapLine ctx={ctx} c={c} grant={grants.get(c.op).unwrap()} />)}</ul>)}
+    {Section("rules", "Rules it relies on", "",
+      u.rules.length == 0 ? Empty("No rule is written on this use case or on anything it uses.")
+      : <>
+        {ownList.length > 0 ? <><h3>Written on this use case</h3><ul class="bz-rules">{ownList.map(r => <RuleItem ctx={ctx} b={b} ri={r} />)}</ul></> : <></>}
+        {viaList.length > 0 ? <><h3>Rules of the things it uses</h3><ul class="bz-rules">{shownVia.map(r => <RuleItem ctx={ctx} b={b} ri={r} />)}</ul>
+          {viaList.length > 40 ? <p class="ex-muted">{"and " + (viaList.length - 40).toString() + " more"}</p> : <></>}</> : <></>}
+      </>)}
+    <section class="ex-section" id="technical">
+      <details class="r-details bz-tech">
+        <summary>Technical details</summary>
+        <pre class="ex-sig"><code>{s.sig}</code></pre>
+        <p><SymLink ctx={ctx} i={u.node} label="Open the symbol page" /> <Loc file={s.file} line={s.line} /></p>
+        {s.doc.length > 0 ? <DocView doc={s.doc} /> : <></>}
+      </details>
+    </section>
+  </>;
+  return document(<BFrame ctx={ctx} active="biz-usecases" title={u.title} body={body} />);
+}
+
+// ---- business rules ---------------------------------------------------------------------------------------------------------------------
+
+function AssuranceLegend(): Html {
+  return <ul class="bz-legend" aria-label="Status of a rule">
+    <li><Assure key="proved" /><span>{assuranceMeaning("proved")}</span></li>
+    <li><Assure key="runtime" /><span>{assuranceMeaning("runtime")}</span></li>
+    <li><Assure key="open" /><span>{assuranceMeaning("open")}</span></li>
+    <li><Assure key="unknown" /><span>{assuranceMeaning("unknown")}</span></li>
+  </ul>;
+}
+
+function DomainSection(ctx: Ctx, b: Biz, m: string, shownLeft: usize): Html {
+  let mine: usize[] = [];
+  let ri: usize = 0;
+  while (ri < b.rules.length) {
+    if (b.rules[ri].module == m) {
+      mine.push(ri);
+    }
+    ri += 1;
+  }
+  const shown = mine.length > shownLeft ? mine.slice(0, shownLeft) : mine;
+  return Section("d-" + domainSlug(ctx.ix, m), domainName(m), plural(mine.length.toInt(), "rule", "rules") + " in the module " + m + ".",
+    <><ul class="bz-rules">{shown.map(r => <RuleItem ctx={ctx} b={b} ri={r} />)}</ul>
+      {mine.length > shown.length ? <p class="ex-muted">{"and " + (mine.length - shown.length).toString() + " more; the technical symbol pages list every clause."}</p> : <></>}</>);
+}
+
+export function RulesPage(ctx: Ctx, b: Biz): string {
+  const doms = domains(b);
+  let sections: Html[] = [];
+  let left: usize = 500;
+  for (const m of doms) {
+    let n: usize = 0;
+    for (const r of b.rules) {
+      if (r.module == m) {
+        n += 1;
+      }
+    }
+    const take = n > left ? left : n;
+    if (take > 0) {
+      sections.push(DomainSection(ctx, b, m, take));
+      left -= take;
+    }
+  }
+  const unknown = countAssurance(b, "unknown");
+  const body = <>
+    <PageHead eyebrow={<>Business view</>} title="Business rules" lead={plural(b.rules.length.toInt(), "rule", "rules") + " in " + plural(doms.length.toInt(), "area", "areas") + ", written as sentences. A rule is a condition the code insists on."} />
+    {unknown.toUsize() == b.rules.length && b.rules.length > 0
+      ? <p class="bz-notice">The snapshot does not record whether a rule is proved or checked at run time, so every status reads Unknown. The explorer shows a status as soon as the snapshot carries one; it never guesses.</p> : <></>}
+    <AssuranceLegend />
+    {b.rules.length == 0 ? Empty("No rules are written down yet. Rules are @Requires, @Ensures and @Invariant clauses in the code.") : <>{sections}</>}
+  </>;
+  return document(<BFrame ctx={ctx} active="biz-rules" title="Business rules" body={body} />);
+}
+
+// ---- capabilities -----------------------------------------------------------------------------------------------------------------------
+
+function UseChips(ctx: Ctx, b: Biz, us: usize[]): Html {
+  const shown = us.length > 8 ? us.slice(0, 8) : us;
+  return us.length == 0 ? <span class="ex-muted">no use case</span>
+    : <ul class="ex-chips">{shown.map(u => <li><a class="ex-chip" href={ucHref(ctx, b, u)}>{b.usecases[u].title}</a></li>)}{us.length > 8 ? <li class="ex-muted">{"+" + (us.length - 8).toString()}</li> : <></>}</ul>;
+}
+
+function ModChips2(ctx: Ctx, ms: string[]): Html {
+  return <ul class="ex-chips">{ms.map(m => <li>{ctx.ix.modNode.get(m).isSome()
+    ? <a class="ex-chip" href={modHref(ctx, ctx.ix.modNode.get(m).unwrap())}>{m}</a> : <span class="ex-chip">{m}</span>}</li>)}</ul>;
+}
+
+function CapRowView(ctx: Ctx, b: Biz, c: CapRow): Html {
+  return <tr>
+    <th scope="row"><span class="bz-may">May</span> {capPhrase(c.op)}</th>
+    <td><span class="bz-chip bz-chip-area">{capArea(c.op)}</span></td>
+    <td>{c.grant}</td>
+    <td>{UseChips(ctx, b, c.users)}</td>
+    <td><ModChips2 ctx={ctx} ms={c.modules} /></td>
+  </tr>;
+}
+
+export function CapabilitiesPage(ctx: Ctx, b: Biz): string {
+  let quiet: int = 0;
+  for (const u of b.usecases) {
+    quiet += u.caps.length == 0 ? 1 : 0;
+  }
+  const body = <>
+    <PageHead eyebrow={<>Business view</>} title="Capabilities" lead="What the software is allowed to do, in plain language. If an access is not on this page, no code of the package can perform it." />
+    {b.caps.length == 0 ? <p class="bz-quiet">As far as the analysis can see, nothing in this package reaches outside the program.</p>
+      : Section("all", "Who may do what", "The permission is what a caller has to hand over before the code may do it; the console needs none.",
+        <div class="r-table-wrap ex-table" role="region" aria-label="Capabilities" tabindex={0}><table class="r-table">
+          <thead><tr><th scope="col">Capability</th><th scope="col">Area</th><th scope="col">Permission</th><th scope="col">Use cases</th><th scope="col">Modules</th></tr></thead>
+          <tbody>{b.caps.map(c => <CapRowView ctx={ctx} b={b} c={c} />)}</tbody></table></div>)}
+    {b.usecases.length > 0 ? <p class="ex-muted">{quiet.toString() + " of " + plural(b.usecases.length.toInt(), "use case", "use cases") + " touch nothing outside the program."}</p> : <></>}
+  </>;
+  return document(<BFrame ctx={ctx} active="biz-caps" title="Capabilities" body={body} />);
+}
+
+// ---- what changed ----------------------------------------------------------------------------------------------------------------------
+
+export function BehaviourPage(ctx: Ctx, d: Diff, cs: BChange[]): string {
+  const caps = ofArea(cs, "capability");
+  const rules = ofArea(cs, "rule");
+  const uses = ofArea(cs, "usecase");
+  const cards: Card[] = [
+    card("Capabilities", caps.length.toString(), Some("may do more or less"), None),
+    card("Rules", rules.length.toString(), Some("added, removed or changed"), None),
+    card("Use cases", uses.length.toString(), Some("added, removed or changed"), None),
+  ];
+  const body = <>
+    <PageHead eyebrow={<>Business view</>} title="What changed" lead="The differences between the two versions that matter to the business: what the software may now do, which rules apply and which use cases exist." />
+    <CardGrid cards={cards} />
+    {d.truncated ? <p class="bz-notice">The diff was cut off at its size limit, so this list may be incomplete.</p> : <></>}
+    {!d.effectsComparable ? <p class="bz-notice">One of the snapshots is too old to compare capabilities; only rules and use cases are compared.</p> : <></>}
+    {cs.length == 0 ? <p class="bz-quiet">No rule, use case or capability changed.</p> : <></>}
+    {caps.length > 0 ? Section("capabilities", "Capabilities", "What the software, or one of its use cases, may now do differently.", <Changes ctx={ctx} cs={caps} max={100} />) : <></>}
+    {rules.length > 0 ? Section("rules", "Business rules", "", <Changes ctx={ctx} cs={rules} max={100} />) : <></>}
+    {uses.length > 0 ? Section("usecases", "Use cases", "", <Changes ctx={ctx} cs={uses} max={100} />) : <></>}
+    <p class="ex-more"><a href="diff.html">Every technical change</a></p>
+  </>;
+  return document(<BFrame ctx={ctx} active="biz-behaviour" title="What changed" body={body} />);
+}

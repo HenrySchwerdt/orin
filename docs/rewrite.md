@@ -324,7 +324,7 @@ Contracts (highlights; `grep -n '@Requires\|@Ensures\|@Invariant' compiler/check
   least one outside a probe; `FnCtx.stashPre` / `restorePre` / `hoist` state their effect on `pre`;
 * **inference**: `Inference.learn` ensures `bindsKept` (a binding is never changed), `fill` requires an empty slot,
   `typeArgs` ensures `length == tp.length` and no `void`; `inferPre` ensures one checked argument per parameter;
-* **closures**: `registerLifted` ensures a new lifted function with `mode == 6` that points at its HIR,
+* **closures**: `registerLifted` ensures a new lifted function with `mode` `FmLifted` that points at its HIR,
   `liftClosure` ensures `functionBound` of the lifted function (every local it mentions is its own),
   `arrow` ensures a `TyFn` and a closure counted in `ncl`; `wrapperOf` ensures the wrapper is indexed under its name;
 * **contexts**: `FnCtx.newLocal` ensures the id is the old length and the local is what was asked for, `declare` fails only
