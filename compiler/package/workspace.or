@@ -1,0 +1,379 @@
+// `orin-workspace.toml` (ADR-0047, docs/workspace.md): typed view of the workspace manifest and the checks that need no
+// file system. Resolution of member directories, member manifests and the lockfile build on this (phase 2b).
+//
+// Diagnostics: E0504 invalid manifest (syntax, unknown table or key, wrong type, missing or empty `members`, unknown tool
+// type), E0505 invalid member path, E0506 duplicate path, E0507 overlapping layout among the literal entries, E0508
+// dependency cycle (buildOrder). Every diagnostic carries the span of the offending key or array element.
+
+import { Span, Diagnostic, diag, span } from "../diag";
+import { TomlEntry, TomlTable, parseToml } from "./toml";
+
+// One path or pattern of `members`, `exclude` or `default-members`, with the span of its array element.
+@Invariant(this.start <= this.end)
+export type WsPath = { text: string; start: usize; end: usize; };
+
+// A non-Orin tool (`[workspace.tools.<name>]`): `kind` is "npm".
+export type WsTool = { name: string; path: WsPath; kind: string; };
+
+export type Workspace = {
+  file: usize;
+  members: WsPath[];
+  exclude: WsPath[];
+  defaults: WsPath[];
+  tools: WsTool[];
+};
+
+// The closed set of tool types.
+export function isToolKind(s: string): bool {
+  return s == "npm";
+}
+
+function err(code: string, file: usize, start: usize, end: usize, msg: string): Diagnostic {
+  return diag(code, span(file, start, end), "orin-workspace.toml: " + msg);
+}
+
+@Requires(e.start <= e.end)
+function entryErr(code: string, file: usize, e: TomlEntry, msg: string): Diagnostic {
+  return err(code, file, e.start, e.end, msg);
+}
+
+// Why `p` is not a valid member path or pattern, or "" if it is: relative, `/` separated, no `..` or `.` segments,
+// no backslash, no trailing `/`, and at most one wildcard, which must be a whole last segment `*`.
+export function pathProblem(p: string): string {
+  if (p.length == 0) {
+    return "empty path";
+  }
+  if (p.startsWith("/")) {
+    return "absolute path";
+  }
+  if (p.includes("\\")) {
+    return "backslash in path (use `/`)";
+  }
+  if (p.endsWith("/")) {
+    return "trailing `/`";
+  }
+  const segs = p.split("/");
+  let i: usize = 0;
+  while (i < segs.length) {
+    const s = segs[i];
+    if (s.length == 0) {
+      return "empty path segment";
+    }
+    if (s == ".." || s == ".") {
+      return "`" + s + "` segment (members must lie inside the workspace)";
+    }
+    if (s.includes("*") && (s != "*" || i + 1 != segs.length)) {
+      return "unsupported wildcard (only a last segment `*` is allowed)";
+    }
+    i += 1;
+  }
+  return "";
+}
+
+export function isPattern(p: string): bool {
+  return p.endsWith("/*") || p == "*";
+}
+
+// True when `inner` is `outer` or lies below it (literal paths).
+export function pathWithin(inner: string, outer: string): bool {
+  return inner == outer || inner.startsWith(outer + "/");
+}
+
+function pathsOf(file: usize, e: TomlEntry): Result<WsPath[], Diagnostic> {
+  let items: string[] = [];
+  match (e.value) {
+    TArr(xs) => {
+      items = xs;
+    },
+    _ => {
+      return Err(entryErr("E0504", file, e, "`" + e.key + "` must be an array of strings"));
+    },
+  }
+  let out: WsPath[] = [];
+  let i: usize = 0;
+  while (i < items.length) {
+    const sp = i < e.elems.length ? e.elems[i] : span(file, e.start, e.end);
+    const problem = pathProblem(items[i]);
+    if (problem != "") {
+      return Err(
+        err(
+          "E0505",
+          file,
+          sp.start,
+          sp.end,
+          "invalid path `" + items[i] + "` in `" + e.key + "`: " + problem,
+        ),
+      );
+    }
+    out.push(WsPath { text: items[i], start: sp.start, end: sp.end });
+    i += 1;
+  }
+  return Ok(out);
+}
+
+function firstDuplicate(file: usize, key: string, ps: WsPath[]): Option<Diagnostic> {
+  let i: usize = 0;
+  while (i < ps.length) {
+    let j: usize = 0;
+    while (j < i) {
+      if (ps[j].text == ps[i].text) {
+        return Some(
+          err(
+            "E0506",
+            file,
+            ps[i].start,
+            ps[i].end,
+            "`" + ps[i].text + "` is listed twice in `" + key + "`",
+          ),
+        );
+      }
+      j += 1;
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function toolTable(file: usize, t: TomlTable): Result<WsTool, Diagnostic> {
+  const name = t.path[2];
+  let path: Option<WsPath> = None;
+  let kind = "";
+  for (const e of t.entries) {
+    if (e.key == "path") {
+      match (e.value) {
+        TStr(s) => {
+          const problem = pathProblem(s);
+          if (problem != "" || isPattern(s)) {
+            const why = problem != "" ? problem : "a tool path cannot be a pattern";
+            return Err(entryErr("E0505", file, e, "invalid tool path `" + s + "`: " + why));
+          }
+          path = Some(WsPath { text: s, start: e.start, end: e.end });
+        },
+        _ => {
+          return Err(entryErr("E0504", file, e, "`path` must be a string"));
+        },
+      }
+    } else if (e.key == "type") {
+      match (e.value) {
+        TStr(s) => {
+          if (!isToolKind(s)) {
+            return Err(
+              entryErr("E0504", file, e, "unknown tool type `" + s + "` (expected \"npm\")"),
+            );
+          }
+          kind = s;
+        },
+        _ => {
+          return Err(entryErr("E0504", file, e, "`type` must be a string"));
+        },
+      }
+    } else {
+      return Err(
+        entryErr("E0504", file, e, "unknown key `" + e.key + "` in [workspace.tools." + name + "]"),
+      );
+    }
+  }
+  return match (path) {
+    Some(p) => kind == ""
+        ? Err(err("E0504", file, t.start, t.end, "[workspace.tools." + name + "] needs `type`"))
+        : Ok(WsTool { name: name, path: p, kind: kind }),
+    None => Err(err("E0504", file, t.start, t.end, "[workspace.tools." + name + "] needs `path`")),
+  };
+}
+
+// Parses and checks `orin-workspace.toml`. A TOML syntax error is reported as E0504 at the same position.
+@Ensures(result.isErr() || result.unwrap().members.length > 0)
+export function parseWorkspace(file: usize, text: string): Result<Workspace, Diagnostic> {
+  const pr = parseToml(file, text);
+  if (pr.isErr()) {
+    const d = pr.unwrapErr();
+    return Err(diag("E0504", d.span, "orin-workspace.toml: " + d.message));
+  }
+  let ws = Workspace { file: file, members: [], exclude: [], defaults: [], tools: [] };
+  let haveWorkspace = false;
+  let haveMembers = false;
+  for (const t of pr.unwrap().tables) {
+    if (t.path.length == 0) {
+      if (t.entries.length > 0) {
+        return Err(
+          entryErr(
+            "E0504",
+            file,
+            t.entries[0],
+            "key `" + t.entries[0].key + "` outside [workspace]",
+          ),
+        );
+      }
+      continue;
+    }
+    if (t.path.length == 1 && t.path[0] == "workspace") {
+      haveWorkspace = true;
+      for (const e of t.entries) {
+        if (e.key == "members" || e.key == "exclude" || e.key == "default-members") {
+          const r = pathsOf(file, e);
+          if (r.isErr()) {
+            return Err(r.unwrapErr());
+          }
+          const ps = r.unwrap();
+          match (firstDuplicate(file, e.key, ps)) {
+            Some(d) => {
+              return Err(d);
+            },
+            None => {},
+          }
+          if (e.key == "members") {
+            if (ps.length == 0) {
+              return Err(entryErr("E0504", file, e, "`members` must list at least one member"));
+            }
+            ws.members = ps;
+            haveMembers = true;
+          } else if (e.key == "exclude") {
+            ws.exclude = ps;
+          } else {
+            ws.defaults = ps;
+          }
+        } else {
+          return Err(entryErr("E0504", file, e, "unknown key `" + e.key + "` in [workspace]"));
+        }
+      }
+    } else if (t.path.length == 3 && t.path[0] == "workspace" && t.path[1] == "tools") {
+      const r = toolTable(file, t);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      ws.tools.push(r.unwrap());
+    } else {
+      return Err(err("E0504", file, t.start, t.end, "unknown table [" + t.path.join(".") + "]"));
+    }
+  }
+  if (!haveWorkspace || !haveMembers) {
+    return Err(err("E0504", file, 0, 0, "missing `members` in [workspace]"));
+  }
+  return match (literalOverlap(ws)) {
+    Some(d) => Err(d),
+    None => Ok(ws),
+  };
+}
+
+// E0507 among the literal entries: a member inside another literal member, a tool inside a member.
+function literalOverlap(ws: Workspace): Option<Diagnostic> {
+  for (const a of ws.members) {
+    for (const b of ws.members) {
+      if (!isPattern(a.text)
+          && !isPattern(b.text)
+          && a.text != b.text
+          && pathWithin(a.text, b.text)) {
+        return Some(
+          err(
+            "E0507",
+            ws.file,
+            a.start,
+            a.end,
+            "member `" + a.text + "` lies inside member `" + b.text + "`",
+          ),
+        );
+      }
+    }
+  }
+  for (const t of ws.tools) {
+    for (const m of ws.members) {
+      const base = isPattern(m.text) ? m.text.substring(0, m.text.length - 1) : m.text + "/";
+      if (t.path.text.startsWith(base) && !ws.exclude.some(x => pathWithin(t.path.text, x.text))) {
+        return Some(
+          err(
+            "E0507",
+            ws.file,
+            t.path.start,
+            t.path.end,
+            "tool `" + t.name + "` lies inside member `" + m.text + "`",
+          ),
+        );
+      }
+    }
+  }
+  return None;
+}
+
+// Deterministic build order of `n` packages named `names` with `deps[i]` the indices package i depends on: a
+// topological order, ties broken by name. Err holds the members of one cycle, in dependency order.
+@Requires(names.length == deps.length)
+@Ensures(result.isErr() || result.unwrap().length == names.length)
+export function buildOrder(names: string[], deps: usize[][]): Result<usize[], usize[]> {
+  const n = names.length;
+  let done: bool[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    done.push(false);
+    i += 1;
+  }
+  let order: usize[] = [];
+  while (order.length < n) {
+    let pick: Option<usize> = None;
+    let k: usize = 0;
+    while (k < n) {
+      if (!done[k] && deps[k].every(d => done[d])) {
+        pick = match (pick) {
+          Some(p) => before(names[k], names[p]) ? Some(k) : Some(p),
+          None => Some(k),
+        };
+      }
+      k += 1;
+    }
+    match (pick) {
+      Some(p) => {
+        done[p] = true;
+        order.push(p);
+      },
+      None => {
+        return Err(findCycle(done, deps));
+      },
+    }
+  }
+  return Ok(order);
+}
+
+// Byte-wise lexicographic order.
+export function before(a: string, b: string): bool {
+  let i: usize = 0;
+  while (i < a.length && i < b.length) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x != y) {
+      return x < y;
+    }
+    i += 1;
+  }
+  return a.length < b.length;
+}
+
+// A cycle among the not-done packages: walk to an undone dependency until a package repeats.
+function findCycle(done: bool[], deps: usize[][]): usize[] {
+  let start: usize = 0;
+  while (done[start]) {
+    start += 1;
+  }
+  let path: usize[] = [];
+  let cur = start;
+  while (!path.includes(cur)) {
+    path.push(cur);
+    let next = cur;
+    for (const d of deps[cur]) {
+      if (!done[d]) {
+        next = d;
+        break;
+      }
+    }
+    cur = next;
+  }
+  let cycle: usize[] = [];
+  let seen = false;
+  for (const x of path) {
+    if (x == cur) {
+      seen = true;
+    }
+    if (seen) {
+      cycle.push(x);
+    }
+  }
+  return cycle;
+}

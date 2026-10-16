@@ -1,0 +1,145 @@
+// Unit tests of the workspace manifest (compiler/package/workspace.or, docs/workspace.md; run:
+// `orin test compiler/tests/workspace_test.or`). The cases mirror the static fixtures in tests/workspace/.
+
+import { assertEqString, assertEqBool, assertEqUsize } from "std:test";
+import { Diagnostic } from "../diag";
+import { parseWorkspace, buildOrder, pathProblem } from "../package";
+
+// "CODE line" of the diagnostic for `text`, or "ok".
+function outcome(text: string): string {
+  const r = parseWorkspace(0, text);
+  if (r.isOk()) {
+    return "ok";
+  }
+  const d: Diagnostic = r.unwrapErr();
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < d.span.start && i < text.length) {
+    if (text.charAt(i) == "\n") {
+      line += 1;
+    }
+    i += 1;
+  }
+  return d.code + " " + line.toString();
+}
+
+function ws(body: string): string {
+  return "[workspace]\n" + body;
+}
+
+@Test
+function accepted(): void {
+  assertEqString(outcome(ws("members = [\"app\"]\n")), "ok", "single");
+  assertEqString(outcome(ws("members = [\"library/*\"]\n")), "ok", "glob");
+  assertEqString(
+    outcome(ws("members = [\"tooling/*\"]\nexclude = [\"tooling/vscode\"]\n")),
+    "ok",
+    "exclude",
+  );
+  assertEqString(
+    outcome(
+      ws(
+        "members = [\"compiler\"]\n\n[workspace.tools.vscode]\npath = \"tooling/vscode\"\ntype = \"npm\"\n",
+      ),
+    ),
+    "ok",
+    "npm tool",
+  );
+  assertEqString(
+    outcome(ws("members = [\"a\", \"b\"]\ndefault-members = [\"b\"]\n")),
+    "ok",
+    "defaults",
+  );
+  assertEqString(
+    outcome(
+      ws(
+        "members = [\"tooling/*\"]\nexclude = [\"tooling/vscode\"]\n\n[workspace.tools.vscode]\npath = \"tooling/vscode\"\ntype = \"npm\"\n",
+      ),
+    ),
+    "ok",
+    "excluded tool directory",
+  );
+}
+
+@Test
+function manifestShape(): void {
+  assertEqString(outcome(ws("members = [\"a\"\n")), "E0504 2", "syntax");
+  assertEqString(outcome(ws("members = [\"a\"]\nmembrs = [\"b\"]\n")), "E0504 3", "unknown key");
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.extra]\nx = \"1\"\n")),
+    "E0504 4",
+    "unknown table",
+  );
+  assertEqString(outcome(ws("exclude = [\"a\"]\n")), "E0504 1", "missing members");
+  assertEqString(outcome(ws("members = []\n")), "E0504 2", "empty members");
+  assertEqString(outcome(ws("members = \"a\"\n")), "E0504 2", "members not an array");
+  assertEqString(outcome("members = [\"a\"]\n"), "E0504 1", "key outside [workspace]");
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.tools.t]\npath = \"t\"\ntype = \"pip\"\n")),
+    "E0504 6",
+    "unknown tool type",
+  );
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.tools.t]\ntype = \"npm\"\n")),
+    "E0504 4",
+    "tool without path",
+  );
+}
+
+@Test
+function memberPaths(): void {
+  assertEqString(outcome(ws("members = [\"/abs/a\"]\n")), "E0505 2", "absolute");
+  assertEqString(outcome(ws("members = [\"../outside\"]\n")), "E0505 2", "dotdot");
+  assertEqString(outcome(ws("members = [\"library\\\\a\"]\n")), "E0505 2", "backslash");
+  assertEqString(outcome(ws("members = [\"a/\"]\n")), "E0505 2", "trailing slash");
+  assertEqString(outcome(ws("members = [\"library/**\"]\n")), "E0505 2", "deep wildcard");
+  assertEqString(outcome(ws("members = [\"lib*/a\"]\n")), "E0505 2", "inner wildcard");
+  assertEqString(
+    pathProblem("a/./b"),
+    "`.` segment (members must lie inside the workspace)",
+    "dot segment",
+  );
+  assertEqString(pathProblem("library/*"), "", "pattern ok");
+}
+
+@Test
+function duplicatesAndLayout(): void {
+  assertEqString(outcome(ws("members = [\"a\", \"a\"]\n")), "E0506 2", "duplicate path");
+  assertEqString(outcome(ws("members = [\"a\", \"a/inner\"]\n")), "E0507 2", "nested member");
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.tools.ext]\npath = \"a/ext\"\ntype = \"npm\"\n")),
+    "E0507 5",
+    "tool inside member",
+  );
+  assertEqString(
+    outcome(
+      ws(
+        "members = [\"tooling/*\"]\n\n[workspace.tools.v]\npath = \"tooling/v\"\ntype = \"npm\"\n",
+      ),
+    ),
+    "E0507 5",
+    "tool inside a pattern member",
+  );
+}
+
+function orderText(names: string[], deps: usize[][]): string {
+  return match (buildOrder(names, deps)) {
+    Ok(o) => o.map(i => names[i]).join(" "),
+    Err(c) => "cycle " + c.map(i => names[i]).join(" "),
+  };
+}
+
+@Test
+function order(): void {
+  assertEqString(orderText(["b", "a"], [[], []]), "a b", "ties by name");
+  assertEqString(orderText(["app", "lib"], [[1], []]), "lib app", "dependency first");
+  assertEqString(orderText(["c", "b", "a"], [[1], [2], []]), "a b c", "chain");
+  assertEqString(orderText(["a", "b"], [[1], [0]]), "cycle a b", "two-cycle");
+  assertEqString(
+    orderText(["x", "a", "b"], [[], [2], [1]]),
+    "cycle a b",
+    "cycle beside a free package",
+  );
+  assertEqBool(buildOrder([], []).isOk(), true, "empty");
+  assertEqUsize(buildOrder(["a"], [[]]).unwrap().length, 1, "one");
+}
