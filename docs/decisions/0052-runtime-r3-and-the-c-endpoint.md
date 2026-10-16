@@ -83,7 +83,7 @@ Orin and still links libc. It becomes worth doing only when Orin's verifier cove
 
 ## Addendum A: R3d object model in Orin (design)
 
-Status: proposed (2026-10-16), design only, no code. Read against PR #141 (R3a `BCore`, R3b). *(inference)* marks a conclusion from the code,
+Status: proposed (2026-10-16). Step R3d.0 is implemented on the working assumptions of section 6 (spec 19 "R3d.0 preparation"); the rest is design only. Read against PR #141 (R3a `BCore`, R3b). *(inference)* marks a conclusion from the code,
 not something the code states. Open questions for the owner: section 6.
 
 ### 1. Where the L1 modules live, how they load, how the gate narrows
