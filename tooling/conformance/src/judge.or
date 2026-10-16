@@ -1,0 +1,94 @@
+// Verdict of one test from the exit statuses and files its steps produced. Port of the checks of `run_test` in
+// tools/run_tests.py, with the same messages. A verdict is (ok, detail); `detail` is "" for a pass.
+
+import { FsGrant } from "std:fs";
+import { head, splitLines, unifiedDiff, reprList, reprStr, sortedStrings, strip } from "./text";
+import { warningCodes } from "./headers";
+import { Case, readText, RUN_TIMEOUT } from "./suite";
+import { Outcome, NOT_RUN } from "./exec";
+
+export type Verdict = { tag: string; ok: bool; detail: string; };
+
+function pass(c: Case): Verdict {
+  return Verdict { tag: c.tag, ok: true, detail: "" };
+}
+
+function fail(c: Case, detail: string): Verdict {
+  return Verdict { tag: c.tag, ok: false, detail: detail };
+}
+
+// Python formats a timed-out step (`rc is None`) as "None"
+function rcText(rc: int): string {
+  return rc == -2 ? "None" : rc.toString();
+}
+
+export function judge(fs: FsGrant, root: string, c: Case, r: Outcome): Verdict {
+  if (c.early != "") {
+    return fail(c, c.early);
+  }
+  const spec = c.spec;
+  if (c.kind == "errors") {
+    if (r.compileRc == -2) {
+      return fail(c, "compiler timed out");
+    }
+    if (r.compileRc == 0) {
+      return fail(c, "expected compile failure with " + spec.errorCode + " but compilation succeeded");
+    }
+    const err = readText(fs, root + "/" + c.cerr);
+    if (!err.includes(spec.errorCode)) {
+      return fail(c, "expected " + spec.errorCode + " in stderr (exit " + r.compileRc.toString() + "); stderr head:\n" + head(err, 15, 1500));
+    }
+    for (const w of spec.stderrs) {
+      if (!err.includes(w)) {
+        return fail(c, "compiler stderr does not contain " + reprStr(w) + "; stderr head:\n" + head(err, 15, 1500));
+      }
+    }
+    return pass(c);
+  }
+  // run test
+  const wantOut = readText(fs, root + "/" + c.exp);
+  if (r.compileRc == -2) {
+    return fail(c, "compiler timed out");
+  }
+  if (r.compileRc != 0) {
+    return fail(c, "compile failed (exit " + r.compileRc.toString() + "); stderr head:\n" + head(readText(fs, root + "/" + c.cerr), 15, 1500));
+  }
+  if (spec.hasWarns) {
+    const err = readText(fs, root + "/" + c.cerr);
+    const got = sortedStrings(warningCodes(err));
+    if (reprList(got) != reprList(spec.warns)) {
+      return fail(c, "warnings differ: expected " + reprList(spec.warns) + ", got " + reprList(got) + "; stderr head:\n" + head(err, 15, 1500));
+    }
+  }
+  if (r.ccRc != 0) {
+    if (r.ccRc == NOT_RUN) {
+      return fail(c, "runner error: the build step did not run");
+    }
+    return fail(c, "C compilation failed (exit " + rcText(r.ccRc) + "); stderr head:\n" + head(readText(fs, root + "/" + c.ccerr), 15, 1500));
+  }
+  if (r.runRc == -2) {
+    return fail(c, "executable timed out after " + RUN_TIMEOUT.toString() + " s");
+  }
+  const out = readText(fs, root + "/" + c.rout);
+  const err = readText(fs, root + "/" + c.rerr);
+  let problems: string[] = [];
+  if (out != wantOut) {
+    const diff = unifiedDiff(splitLines(wantOut), splitLines(out), "expected", "actual", 1);
+    problems.push("stdout differs:\n" + head(diff, 20, 1500));
+  }
+  if (r.runRc != spec.wantExit) {
+    problems.push("exit status " + r.runRc.toString() + ", expected " + spec.wantExit.toString());
+  }
+  for (const w of spec.stderrs) {
+    if (!err.includes(w)) {
+      problems.push("stderr does not contain " + reprStr(w));
+    }
+  }
+  if (problems.length > 0) {
+    if (strip(err).length > 0) {
+      problems.push("stderr head:\n" + head(err, 8, 1500));
+    }
+    return fail(c, problems.join("\n"));
+  }
+  return pass(c);
+}

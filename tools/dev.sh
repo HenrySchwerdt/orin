@@ -19,7 +19,7 @@
 # a PR run the full bootstrap, which checks the three-stage fixed point (stage2.c == stage3.c) and runs the conformance
 # suite, and then the suites your change touches with build/bootstrap/orin2:
 #     tools/bootstrap.sh
-#     python3 tools/run_tests.py --suite all; tools/test_std.sh; tools/test_tooling.sh; ...
+#     tools/conformance.sh --suite all; tools/test_std.sh; tools/test_tooling.sh; ...
 set -eu
 cd "$(dirname "$0")/.."
 D=build/dev
@@ -75,10 +75,10 @@ case "$CMD" in
   build) exit 0 ;;
   test)
     case "${ARG:-all}" in
-      default|next|all) python3 tools/run_tests.py --orinc $D/orin --suite "${ARG:-all}" ;;
+      default|next|all) tools/conformance.sh --orinc $D/orin --suite "${ARG:-all}" ;;
       *)
         f=${ARG#tests/}; f=${f%/main.or}; f=${f%.or}
-        python3 tools/run_tests.py --orinc $D/orin --suite all --filter "$f" ;;
+        tools/conformance.sh --orinc $D/orin --suite all --filter "$f" ;;
     esac ;;
   std)
     case "$ARG" in

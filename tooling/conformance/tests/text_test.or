@@ -1,0 +1,112 @@
+import { assertEqString, assertEqUsize } from "std:test";
+import { strip, splitWords, shq, splitLines, cutBytes, head, reprList, reprStr, sortedStrings, unifiedDiff } from "../src/text";
+
+@Test
+function stripRemovesSurroundingWhitespace(): void {
+  assertEqString(strip("  a b \t\r\n"), "a b", "both sides");
+  assertEqString(strip(""), "", "empty");
+  assertEqString(strip(" \n "), "", "only blanks");
+}
+
+@Test
+function splitWordsLikePythonSplit(): void {
+  const w = splitWords("  --check-contracts   --x\t y ");
+  assertEqUsize(w.length, 3, "three words");
+  assertEqString(w[0], "--check-contracts", "first");
+  assertEqString(w[2], "y", "last");
+  assertEqUsize(splitWords("   ").length, 0, "blank");
+}
+
+@Test
+function shellQuoting(): void {
+  assertEqString(shq("a b"), "'a b'", "plain");
+  assertEqString(shq("it's"), "'it'\\''s'", "quote");
+  assertEqString(shq(""), "''", "empty");
+}
+
+@Test
+function splitLinesLikePython(): void {
+  assertEqUsize(splitLines("a\nb\n").length, 2, "trailing newline adds no line");
+  assertEqUsize(splitLines("a\r\nb").length, 2, "crlf");
+  assertEqUsize(splitLines("a\n\nb").length, 3, "blank line");
+  assertEqUsize(splitLines("").length, 0, "empty");
+  assertEqString(splitLines("a\rb")[1], "b", "cr");
+}
+
+@Test
+function cutNeverSplitsACharacter(): void {
+  // "é" is 2 bytes (0xC3 0xA9); a cut between them backs up
+  const s = "aé" + "b";
+  assertEqString(cutBytes(s, 2), "a", "inside the character");
+  assertEqString(cutBytes(s, 3), "aé", "after the character");
+  assertEqString(cutBytes(s, 99), s, "longer than the text");
+}
+
+@Test
+function headKeepsLinesAndChars(): void {
+  assertEqString(head("1\n2\n3\n4\n", 2, 100), "1\n2", "two lines");
+  assertEqString(head("abcdef", 5, 3), "abc", "three chars");
+  assertEqString(head("", 5, 100), "", "empty");
+}
+
+@Test
+function pythonRepr(): void {
+  assertEqString(reprList(["W0450", "W0452"]), "['W0450', 'W0452']", "list");
+  assertEqString(reprList([]), "[]", "empty list");
+  assertEqString(reprStr("it's"), "\"it's\"", "single quote inside");
+  assertEqString(reprStr("a\\b"), "'a\\\\b'", "backslash");
+}
+
+@Test
+function sortsInByteOrder(): void {
+  const s = sortedStrings(["b", "a.or", "a", "B", "a-b.or"]);
+  assertEqString(s.join(","), "B,a,a-b.or,a.or,b", "byte order");
+  assertEqUsize(sortedStrings([]).length, 0, "empty");
+}
+
+@Test
+function equalSequencesHaveNoDiff(): void {
+  assertEqString(unifiedDiff(["a", "b"], ["a", "b"], "expected", "actual", 1), "", "equal");
+  assertEqString(unifiedDiff([], [], "expected", "actual", 1), "", "both empty");
+}
+
+@Test
+function diffMatchesDifflib(): void {
+  // difflib.unified_diff(["a","b","c"], ["a","X","c"], "expected", "actual", lineterm="", n=1)
+  assertEqString(
+    unifiedDiff(["a", "b", "c"], ["a", "X", "c"], "expected", "actual", 1),
+    "--- expected\n+++ actual\n@@ -1,3 +1,3 @@\n a\n-b\n+X\n c",
+    "one replaced line"
+  );
+  // a whole-file difference of single lines: ranges of length 1 print without a count
+  assertEqString(
+    unifiedDiff(["goodbye"], ["hello"], "expected", "actual", 1),
+    "--- expected\n+++ actual\n@@ -1 +1 @@\n-goodbye\n+hello",
+    "single line"
+  );
+  // an insertion at the end, and deletion of everything
+  assertEqString(
+    unifiedDiff(["a"], ["a", "b"], "e", "a", 1),
+    "--- e\n+++ a\n@@ -1 +1,2 @@\n a\n+b",
+    "appended line"
+  );
+  assertEqString(
+    unifiedDiff(["a", "b"], [], "e", "a", 1),
+    "--- e\n+++ a\n@@ -1,2 +0,0 @@\n-a\n-b",
+    "everything deleted"
+  );
+}
+
+@Test
+function distantChangesMakeTwoHunks(): void {
+  const a = ["1", "2", "3", "4", "5", "6", "7", "8"];
+  const b = ["X", "2", "3", "4", "5", "6", "7", "Y"];
+  const d = unifiedDiff(a, b, "e", "a", 1);
+  assertEqString(d, "--- e\n+++ a\n@@ -1,2 +1,2 @@\n-1\n+X\n 2\n@@ -7,2 +7,2 @@\n 7\n-8\n+Y", "two hunks");
+  // changes with exactly 2 * context equal lines between them stay in one hunk
+  assertEqString(
+    unifiedDiff(["1", "2", "3", "4"], ["X", "2", "3", "Y"], "e", "a", 1),
+    "--- e\n+++ a\n@@ -1,4 +1,4 @@\n-1\n+X\n 2\n 3\n-4\n+Y",
+    "one hunk"
+  );
+}

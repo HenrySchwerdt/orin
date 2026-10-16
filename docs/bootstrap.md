@@ -14,7 +14,7 @@ Rust Stage 0 is retired (see "Retired Stage 0" below).
 
 ```bash
 ./tools/bootstrap.sh                 # seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance
-python3 tools/run_tests.py --orinc build/bootstrap/orin2
+tools/conformance.sh --orinc build/bootstrap/orin2   # the Orin runner; tools/run_tests.py is the Python oracle
 sh tools/llvm_fixpoint.sh [--deep]   # LLVM fixed point (needs clang), see below
 ```
 
@@ -94,7 +94,7 @@ Components began as ports of the Stage 0 Rust components with the same behaviour
 
 Until the Stage 0 retirement `compiler/` had to stay within Orin-B; that restriction is lifted (see
 above), though `compiler/` has not been rewritten yet. Features beyond Orin-B get an ADR and tests under
-`tests/next/` (run with `python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite next`;
+`tests/next/` (run with `tools/conformance.sh --orinc build/bootstrap/orin2 --suite next`;
 `--suite all` runs both suites).
 
 * Generics (ADR-0007): `check/types.or` (type resolution, instantiation, unification),
