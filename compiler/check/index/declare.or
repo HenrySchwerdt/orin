@@ -7,15 +7,16 @@ import { LoadedProgram, ImportTarget } from "../../loader";
 import { Program, SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkField, SkInterface } from "../../hir";
 import { contractText, paramsText, renderTE, tpList, tpListB, variantText } from "./render";
 import { W, addDef, addDefA, addRef, children } from "./state";
-import { UnitTab, addT, addV, dropScopeT, dropScopeV, findName } from "./tables";
+import { UnitTab, bindFirst } from "./tables";
 
-export type P1 = { w: W; tab: UnitTab; tq: string[]; tqDefs: usize[]; };
+// Pass 1 state: the walker state, the tables of the unit being declared, and the qualified names ("unit.Name") of all
+// classes, types and interfaces so far -> their defs (the first declaration of a name wins).
+export type P1 = { w: W; tab: UnitTab; tq: Map<string, usize>; };
 
 export function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
-  let tqDefs = p.tqDefs;
   const id = w.defs.length;
   const head = "type " + t.name.name + tpList(t.typeParams);
   const cdetail = contractText(sm, t.contracts);
@@ -48,20 +49,19 @@ export function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap)
       }
     }
   }
-  tab = addT(tab, t.name.name, id, t.exported);
-  tq.push(unitName + "." + t.name.name);
-  tqDefs.push(id);
+  tab.bindType(t.name.name, id, t.exported);
+  tq = bindFirst(tq, unitName + "." + t.name.name, id);
   match (t.body) {
     DUnion(vs) => {
       let k: usize = 0;
       for (const v of vs) {
         k += 1;
-        tab = addV(tab, v.name.name, id + k, t.exported);
+        tab.bindVal(v.name.name, id + k, t.exported);
       }
     },
     _ => {}
   }
-  return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
+  return P1 { w: w, tab: tab, tq: tq };
 }
 
 // Classes (ADR-0009): the class is an SkRecord def ("class C"), followed by its fields (parameter
@@ -139,7 +139,6 @@ export function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
-  let tqDefs = p.tqDefs;
   const id = w.defs.length;
   let cdetail = "class " + c.name.name + tpListB(c.typeParams, c.bounds);
   if (c.impls.length > 0) {
@@ -204,10 +203,9 @@ export function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<
       MField(_) => {}
     }
   }
-  tab = addT(tab, c.name.name, id, c.exported);
-  tq.push(unitName + "." + c.name.name);
-  tqDefs.push(id);
-  return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
+  tab.bindType(c.name.name, id, c.exported);
+  tq = bindFirst(tq, unitName + "." + c.name.name, id);
+  return P1 { w: w, tab: tab, tq: tq };
 }
 
 // Interfaces (ADR-0019): the interface is an SkInterface def ("interface I"), followed by its methods
@@ -216,7 +214,6 @@ export function declareInterface(p: P1, unitName: string, k: InterfaceDecl, sm: 
   let w = p.w;
   let tab = p.tab;
   let tq = p.tq;
-  let tqDefs = p.tqDefs;
   const id = w.defs.length;
   w = addDefA(w, k.name.name, SkInterface, k.name.span, k.span, None, k.exported, "interface " + k.name.name, k.annotations, sm);
   for (const m of k.methods) {
@@ -227,10 +224,9 @@ export function declareInterface(p: P1, unitName: string, k: InterfaceDecl, sm: 
     }
     w = addDefA(w, m.name.name, SkFunction, m.name.span, m.span, Some(id), k.exported, d, m.annotations, sm);
   }
-  tab = addT(tab, k.name.name, id, k.exported);
-  tq.push(unitName + "." + k.name.name);
-  tqDefs.push(id);
-  return P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
+  tab.bindType(k.name.name, id, k.exported);
+  tq = bindFirst(tq, unitName + "." + k.name.name, id);
+  return P1 { w: w, tab: tab, tq: tq };
 }
 
 function importOf(item: Item): Option<ImportDeclRe> {
@@ -270,38 +266,28 @@ export function resolveImports(p: P1, unit: usize, prog: LoadedProgram, tabs: Un
         }
         const src = tabs[j];
         for (const n of d.names) {
-          const td = findName(src.xtNames, src.xtDefs, n.name);
-          const vd = findName(src.xvNames, src.xvDefs, n.name);
+          const td = src.exportedType(n.name);
+          const vd = src.exportedVal(n.name);
           if (td.isSome()) {
             w = addRef(w, n.span, td.unwrap());
           } else if (vd.isSome()) {
             w = addRef(w, n.span, vd.unwrap());
           }
           if (td.isSome()) {
-            tab = addT(tab, n.name, td.unwrap(), d.reexport);
-            if (d.reexport) {
-              // addT already exported; the scope must not gain it.
-              tab = dropScopeT(tab);
-            }
+            tab.importType(n.name, td.unwrap(), d.reexport);
             if (isUnionDef(w, td.unwrap())) {
               for (const k of children(w.defs, td.unwrap())) {
-                tab = addV(tab, w.defs[k].name, k, d.reexport);
-                if (d.reexport) {
-                  tab = dropScopeV(tab);
-                }
+                tab.importVal(w.defs[k].name, k, d.reexport);
               }
             }
           }
           if (vd.isSome()) {
-            tab = addV(tab, n.name, vd.unwrap(), d.reexport);
-            if (d.reexport) {
-              tab = dropScopeV(tab);
-            }
+            tab.importVal(n.name, vd.unwrap(), d.reexport);
           }
         }
       },
       ImportStd(_) => {}
     }
   }
-  return P1 { w: w, tab: tab, tq: p.tq, tqDefs: p.tqDefs };
+  return P1 { w: w, tab: tab, tq: p.tq };
 }

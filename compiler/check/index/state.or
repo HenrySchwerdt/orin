@@ -4,9 +4,14 @@
 import { Span, SourceMap } from "../../diag";
 import { Ident, TypeExpr, Annotation } from "../../syntax";
 import { LoadedProgram } from "../../loader";
-import { Type, Program, SymbolKind, SymbolDef, SymbolRef, TypeAt, ImplLink, CallSite } from "../../hir";
+import { Type, Local, Program, SymbolKind, SymbolDef, SymbolRef, TypeAt, ImplLink, CallSite } from "../../hir";
 import { renderTE, renderTy } from "./render";
-import { FnKind, UnitTab, findName } from "./tables";
+import { FnKind, UnitTab } from "./tables";
+
+// The interface defs bounding the type parameters of a generic declaration, found for the HIR instances made from it:
+// `name` is the HIR name of the function (`prefix` false: "unit.f") or the prefix of the names of the constructor and
+// methods of a generic class (`prefix` true: "unit.C."), ADR-0019 / ADR-0026.
+export type BoundRule = { name: string; prefix: bool; defs: usize[]; };
 
 // Read-only context of pass 2.
 export type Ctx = {
@@ -15,11 +20,11 @@ export type Ctx = {
   tabs: UnitTab[];
   hir: Option<Program>;
   recDef: Option<usize>[];     // HIR record id -> its SkRecord def
-  tq: string[];                // qualified type name ("unit.Name") -> def, for classes' method references
-  tqDefs: usize[];
+  tq: Map<string, usize>;      // qualified type name ("unit.Name") -> def, for classes' method references
   fnDef: Option<usize>[];      // HIR function id -> the def it was lowered from (generic instances and lifted closures: the
                                // enclosing generic function / function / method; function-value wrappers: the wrapped function)
   fnKind: FnKind[];            // HIR function id -> what it was lowered from
+  bounds: BoundRule[];         // the declarations with bounded type parameters, in program order
 };
 
 // `q` is a parameter of the ordinary function body being walked (`np`, see W).
@@ -29,6 +34,9 @@ export function isParamOf(np: Option<usize>, q: usize): bool {
     None => false,
   };
 }
+
+// A visible local or parameter of the AST walk: its name, def and the type the HIR gave it (None without HIR).
+export type Binding = { name: string; def: usize; ty: Option<Type>; };
 
 // Mutable walker state.
 export type W = {
@@ -42,16 +50,14 @@ export type W = {
   np: Option<usize>;           // parameter count of the ordinary function body being walked; None in a closure body (a
                                // parameter of a closure is not one of the enclosing function)
   bnd: usize[];                // interface defs bounding the type parameters of the generic function instance being walked
-  lNames: string[];            // flat scope stack of visible locals: name, def id, HIR type
-  lIds: usize[];
-  lTys: Option<Type>[];
-  marks: usize[];
+  scope: Binding[];            // flat scope stack of the visible locals
+  marks: usize[];                // scope length at each open block
+  hn: usize;                   // next ordinary (non-generic) HIR function (pass 2 walks the HIR functions in source order)
   tps: string[];               // type parameters in scope
   unit: usize;
   fn: Option<usize>;           // enclosing function def
-  hl: string[];                // HIR local names of the current function ...
-  hlTy: Type[];                // ... and their types
-  hk: usize;                   // cursor into hl
+  hl: Local[];                 // HIR locals of the current function, matched by name along `hk` ...
+  hk: usize;                   // ... cursor into hl
 };
 
 // ---- state helpers ------------------------------------------------------------------------------
@@ -102,7 +108,7 @@ export function addRef(w: W, sp: Span, def: usize): W {
 
 export function pushScope(w: W): W {
   let x = w;
-  x.marks.push(x.lNames.length);
+  x.marks.push(x.scope.length);
   return x;
 }
 
@@ -110,20 +116,18 @@ export function popScope(w: W): W {
   let x = w;
   const m = x.marks.pop();
   const k = m.unwrapOr(0);
-  while (x.lNames.length > k) {
-    x.lNames.pop();
-    x.lIds.pop();
-    x.lTys.pop();
+  while (x.scope.length > k) {
+    x.scope.pop();
   }
   return x;
 }
 
-export function lookupLocal(w: W, name: string): Option<usize> {
-  let i = w.lNames.length;
+export function lookupLocal(w: W, name: string): Option<Binding> {
+  let i = w.scope.length;
   while (i > 0) {
     i -= 1;
-    if (w.lNames[i] == name) {
-      return Some(i);
+    if (w.scope[i].name == name) {
+      return Some(w.scope[i]);
     }
   }
   return None;
@@ -162,8 +166,8 @@ export function declare(w: W, c: Ctx, id: Ident, declSpan: Span, kind: SymbolKin
   let ty: Option<Type> = None;
   let k = x.hk;
   while (k < x.hl.length) {
-    if (x.hl[k] == id.name) {
-      ty = Some(x.hlTy[k]);
+    if (x.hl[k].name == id.name) {
+      ty = Some(x.hl[k].ty);
       x.hk = k + 1;
       break;
     }
@@ -190,41 +194,27 @@ export function declare(w: W, c: Ctx, id: Ident, declSpan: Span, kind: SymbolKin
   }
   const did = x.defs.length;
   x = addDef(x, id.name, kind, id.span, declSpan, x.fn, false, detail);
-  x.lNames.push(id.name);
-  x.lIds.push(did);
-  x.lTys.push(ty);
+  x.scope.push(Binding { name: id.name, def: did, ty: ty });
   return x;
 }
 
 export function isTypeParam(w: W, name: string): bool {
-  for (const t of w.tps) {
-    if (t == name) {
-      return true;
-    }
-  }
-  return false;
+  return w.tps.includes(name);
 }
 
 export function newW(): W {
-  const d: SymbolDef[] = [];
-  const r: SymbolRef[] = [];
-  const t: TypeAt[] = [];
-  const s: string[] = [];
-  const ids: usize[] = [];
-  const tys: Option<Type>[] = [];
-  const tt: Type[] = [];
   return W {
-    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, np: None, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
-    hl: s, hlTy: tt, hk: 0
+    defs: [], refs: [], types: [], impls: [], calls: [], cur: None, curMay: false, np: None, bnd: [], scope: [],
+    marks: [], hn: 0, tps: [], unit: 0, fn: None, hl: [], hk: 0
   };
 }
 
 export function lookupVal(w: W, c: Ctx, name: string): Option<usize> {
   const t = c.tabs[w.unit];
-  return findName(t.vNames, t.vDefs, name);
+  return t.valDef(name);
 }
 
 export function lookupType(w: W, c: Ctx, name: string): Option<usize> {
   const t = c.tabs[w.unit];
-  return findName(t.tNames, t.tDefs, name);
+  return t.typeDef(name);
 }

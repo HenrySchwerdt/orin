@@ -2,32 +2,11 @@
 // Part of the semantic index (check/index/build.or).
 
 import {
-  Ident,
-  FunctionDecl,
-  TypeDecl,
-  TypeExpr,
-  Block,
-  Stmt,
-  Expr,
-  FieldInit,
-  MatchArm,
-  Pattern,
-  oxExprs,
-  oxComponents
+  Ident, FunctionDecl, TypeDecl, TypeExpr, Block, Stmt, Expr, FieldInit, MatchArm, Pattern, oxExprs, oxComponents
 } from "../../syntax";
-import { Type, Function, SkRecord, SkLocal, SkParam } from "../../hir";
+import { Type, Local, Function, SkRecord, SkLocal, SkParam } from "../../hir";
 import {
-  Ctx,
-  W,
-  addRef,
-  declare,
-  fieldDef,
-  isTypeParam,
-  lookupLocal,
-  lookupType,
-  lookupVal,
-  popScope,
-  pushScope
+  Ctx, W, addRef, declare, fieldDef, isTypeParam, lookupLocal, lookupType, lookupVal, popScope, pushScope
 } from "./state";
 
 // ---- pass 2: bodies ---------------------------------------------------------------------------------
@@ -108,7 +87,7 @@ export function walkExpr(w: W, c: Ctx, e: Expr): W {
     EIdent(id) => {
       const lo = lookupLocal(x, id.name);
       if (lo.isSome()) {
-        x = addRef(x, id.span, x.lIds[lo.unwrap()]);
+        x = addRef(x, id.span, lo.unwrap().def);
       } else {
         const d = lookupVal(x, c, id.name);
         if (d.isSome()) {
@@ -197,12 +176,9 @@ export function walkExpr(w: W, c: Ctx, e: Expr): W {
       // The arrow's parameters and locals belong to a lifted HIR function, not to the enclosing one:
       // walk it with its own (empty) HIR local table so the enclosing function's cursor is untouched.
       const sHl = x.hl;
-      const sTy = x.hlTy;
       const sK = x.hk;
-      const noNames: string[] = [];
-      const noTys: Type[] = [];
-      x.hl = noNames;
-      x.hlTy = noTys;
+      const noLocals: Local[] = [];
+      x.hl = noLocals;
       x.hk = 0;
       x = pushScope(x);
       for (const p of ps) {
@@ -216,7 +192,6 @@ export function walkExpr(w: W, c: Ctx, e: Expr): W {
       }
       x = popScope(x);
       x.hl = sHl;
-      x.hlTy = sTy;
       x.hk = sK;
     },
     _ => {}
@@ -280,7 +255,7 @@ function placeFields(w: W, c: Ctx, e: Expr): TyW {
     EIdent(id) => {
       const lo = lookupLocal(x, id.name);
       if (lo.isSome()) {
-        return TyW { w: x, ty: x.lTys[lo.unwrap()] };
+        return TyW { w: x, ty: lo.unwrap().ty };
       }
       return TyW { w: x, ty: None };
     },
@@ -288,8 +263,8 @@ function placeFields(w: W, c: Ctx, e: Expr): TyW {
       // The lowered `this` local of the enclosing method / constructor.
       let k: usize = 0;
       while (k < x.hl.length) {
-        if (x.hl[k] == "this") {
-          return TyW { w: x, ty: Some(x.hlTy[k]) };
+        if (x.hl[k].name == "this") {
+          return TyW { w: x, ty: Some(x.hl[k].ty) };
         }
         k += 1;
       }
@@ -400,22 +375,15 @@ function walkStmt(w: W, c: Ctx, s: Stmt): W {
   return x;
 }
 
-// HIR local names/types of function `hf`, for `declare`.
+// The HIR locals of function `hf`, for `declare`.
 function loadHirLocals(w: W, hf: Option<Function>): W {
   let x = w;
-  let names: string[] = [];
-  let tys: Type[] = [];
+  let locals: Local[] = [];
   match (hf) {
-    Some(f) => {
-      for (const l of f.locals) {
-        names.push(l.name);
-        tys.push(l.ty);
-      }
-    },
+    Some(f) => { locals = f.locals; },
     None => {}
   }
-  x.hl = names;
-  x.hlTy = tys;
+  x.hl = locals;
   x.hk = 0;
   return x;
 }

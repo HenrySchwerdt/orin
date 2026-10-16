@@ -101,7 +101,7 @@ effect can be reached:
 `compiler/check/purity.or` (E0416, contract purity) and the effect analysis see the same primitives, unknown calls and closures,
 so: **a function that has an effect is impure, and a pure function has no effect.** Three things keep it that way:
 
-1. the two builtin tables are tied by a contract: `ioOpOf` in `check/index.or` ensures `result != "" ==> isIoBuiltin(b)` and
+1. the two builtin tables are tied by a contract: `ioOpOf` in `check/index/effects.or` ensures `result != "" ==> isIoBuiltin(b)` and
    that its operation is in the registry `primitiveEffects()`; the contract-checked compiler runs it on every compile;
 2. `orin effects <entry> --check-purity` runs both analyses over the HIR and fails if a def has an effect although every
    function lowered from it is pure (and if any HIR function has no def in the index); `tools/test_effects.py`,

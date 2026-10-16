@@ -2,13 +2,45 @@
 // Part of the semantic index (check/index/build.or).
 
 import { Span } from "../../diag";
-import { HBlock, HStmt, HExpr, Place, TypeAt, CallSite, SkFunction } from "../../hir";
+import { Function, HBlock, HStmt, HExpr, Place, SymbolDef, TypeAt, CallSite, SkFunction, foldBlock } from "../../hir";
 import { ioOpOf, ioOpOfLib } from "./effects";
 import { renderTy } from "./render";
 import { Ctx, W, addRef, children, fieldDef, isParamOf } from "./state";
-import { findName, isOrdinaryKind, isWrapperKind } from "./tables";
+import { isOrdinaryKind, isWrapperKind } from "./tables";
 
 // ---- HIR walk: field references and expression types ----------------------------------------------
+
+// The first child of def `parent` (the members of a class or interface follow it) named `name`; `fnOnly`: only methods.
+function childNamed(defs: SymbolDef[], parent: usize, name: string, fnOnly: bool): Option<usize> {
+  for (const k of children(defs, parent)) {
+    const isFn = match (defs[k].kind) { SkFunction => true, _ => false };
+    if (defs[k].name == name && (isFn || !fnOnly)) {
+      return Some(k);
+    }
+  }
+  return None;
+}
+
+// A reference to method def `md` at the method name `mname` that follows the first `.` at or after `start` inside the
+// source text of call `e` (the receiver ends before it; `C.` for a static method).
+function memberNameRef(w: W, c: Ctx, e: HExpr, start: usize, mname: string, md: usize): W {
+  let x = w;
+  const sp = e.span;
+  const text = c.sm.files[sp.file].text;
+  let pos = start;
+  while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
+    pos += 1;
+  }
+  pos += 1;
+  while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) == 32 || text.charCodeAt(pos) == 10)) {
+    pos += 1;
+  }
+  const end = pos + mname.length;
+  if (end <= sp.end && end <= text.length && text.substring(pos, end) == mname) {
+    x = addRef(x, Span { file: sp.file, start: pos, end: end }, md);
+  }
+  return x;
+}
 
 // A call of a lowered method (`unit.C.m`): reference to the method's def at the method name in the
 // source text (after the receiver, or after `C.` for a static method).
@@ -46,48 +78,29 @@ function methodRef(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
       // Inside an instance of a generic function with bounded type parameters, a call of an interface
       // method refers to the interface method, not to the method of the class of this instance.
       for (const bd of x.bnd) {
-        for (const k of children(x.defs, bd)) {
-          if (x.defs[k].name == mname && md.isNone()) {
-            md = Some(k);
-          }
+        if (md.isNone()) {
+          md = childNamed(x.defs, bd, mname, false);
         }
       }
       if (md.isNone()) {
-        const cd = findName(c.tq, c.tqDefs, cname);
+        const cd = c.tq.get(cname);
         if (cd.isNone()) {
           return x;
         }
-        for (const k of children(x.defs, cd.unwrap())) {
-          const isFn = match (x.defs[k].kind) { SkFunction => true, _ => false };
-          if (isFn && x.defs[k].name == mname && md.isNone()) {
-            md = Some(k);
-          }
-        }
+        md = childNamed(x.defs, cd.unwrap(), mname, true);
       }
       if (md.isNone()) {
         return x;
       }
       const instance = f.paramCount > 0 && f.locals[0].name == "this$";
-      const sp = e.span;
-      const text = c.sm.files[sp.file].text;
-      let pos = sp.start;
+      let start = e.span.start;
       if (instance) {
         if (args.length == 0) {
           return x;
         }
-        pos = args[0].span.end;
+        start = args[0].span.end;
       }
-      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
-        pos += 1;
-      }
-      pos += 1;
-      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) == 32 || text.charCodeAt(pos) == 10)) {
-        pos += 1;
-      }
-      const end = pos + mname.length;
-      if (end <= sp.end && end <= text.length && text.substring(pos, end) == mname) {
-        x = addRef(x, Span { file: sp.file, start: pos, end: end }, md.unwrap());
-      }
+      x = memberNameRef(x, c, e, start, mname, md.unwrap());
     },
     None => {}
   }
@@ -109,33 +122,15 @@ function virtRef(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize): W {
       }
       const info = p.ifaces[iface.unwrap()];
       const mname = info.methods[slot];
-      const idf = findName(c.tq, c.tqDefs, info.name);
+      const idf = c.tq.get(info.name);
       if (idf.isNone()) {
         return x;
       }
-      let md: Option<usize> = None;
-      for (const k of children(x.defs, idf.unwrap())) {
-        if (x.defs[k].name == mname && md.isNone()) {
-          md = Some(k);
-        }
-      }
+      const md = childNamed(x.defs, idf.unwrap(), mname, false);
       if (md.isNone()) {
         return x;
       }
-      const sp = e.span;
-      const text = c.sm.files[sp.file].text;
-      let pos = recv.span.end;
-      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) != 46)) {
-        pos += 1;
-      }
-      pos += 1;
-      while (pos < sp.end && pos < text.length && (text.charCodeAt(pos) == 32 || text.charCodeAt(pos) == 10)) {
-        pos += 1;
-      }
-      const end = pos + mname.length;
-      if (end <= sp.end && end <= text.length && text.substring(pos, end) == mname) {
-        x = addRef(x, Span { file: sp.file, start: pos, end: end }, md.unwrap());
-      }
+      x = memberNameRef(x, c, e, recv.span.end, mname, md.unwrap());
     },
     None => {}
   }
@@ -244,13 +239,11 @@ function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize, args: HExpr[
       match (recv.ty) {
         TyIface(i) => {
           if (i < p.ifaces.length && slot < p.ifaces[i].methods.length) {
-            const idf = findName(c.tq, c.tqDefs, p.ifaces[i].name);
+            const idf = c.tq.get(p.ifaces[i].name);
             if (idf.isSome()) {
-              for (const k of children(x.defs, idf.unwrap())) {
-                if (x.defs[k].name == p.ifaces[i].methods[slot]) {
-                  x = addCallP(x, Some(k), "MUST", "virtual", e.span, -1, fnArgKinds(x, c, args, true));
-                  return x;
-                }
+              const k = childNamed(x.defs, idf.unwrap(), p.ifaces[i].methods[slot], false);
+              if (k.isSome()) {
+                return addCallP(x, k, "MUST", "virtual", e.span, -1, fnArgKinds(x, c, args, true));
               }
             }
           }
@@ -284,86 +277,113 @@ function litKind(e: HExpr): bool {
   };
 }
 
-function hExprs(w: W, c: Ctx, es: HExpr[], ty: bool): W {
+// The expressions seen so far by the types fold, newest first. A fold threads its state by value; a list that grows by
+// one node per row keeps that O(1), where pushing onto a shared array would copy it at every node.
+type Rows = { row: TypeAt; rest: Option<Rows>; };
+
+// The rendered type of every non-literal expression occurrence in `b`, in the pre-order of the HIR fold, for hover
+// and inlay hints. A separate fold: the call-site walk below acts after the children, the types before them.
+export function typeRows(w: W, c: Ctx, b: HBlock): W {
+  let x = w;
+  match (c.hir) {
+    Some(p) => {
+      const none: Option<Rows> = None;
+      let list = foldBlock(b, none, (e, acc) => {
+        if (litKind(e)) {
+          return acc;
+        }
+        return Some(Rows { row: TypeAt { span: e.span, ty: renderTy(p, e.ty) }, rest: acc });
+      });
+      let rows: TypeAt[] = [];
+      while (list.isSome()) {
+        rows.push(list.unwrap().row);
+        list = list.unwrap().rest;
+      }
+      let i = rows.length;
+      while (i > 0) {
+        i -= 1;
+        x.types.push(rows[i]);
+      }
+    },
+    None => {}
+  }
+  return x;
+}
+
+function hExprs(w: W, c: Ctx, es: HExpr[]): W {
   let x = w;
   for (const e of es) {
-    x = hExpr(x, c, e, ty);
+    x = hExpr(x, c, e);
   }
   return x;
 }
 
-export function hBlock(w: W, c: Ctx, b: HBlock, ty: bool): W {
+export function hBlock(w: W, c: Ctx, b: HBlock): W {
   let x = w;
   for (const s of b.stmts) {
-    x = hStmt(x, c, s, ty);
+    x = hStmt(x, c, s);
   }
   return x;
 }
 
-function hPlace(w: W, c: Ctx, p: Place, ty: bool): W {
+function hPlace(w: W, c: Ctx, p: Place): W {
   let x = w;
   for (const el of p.path) {
     match (el) {
-      PIndex(e) => { x = hExpr(x, c, e, ty); },
+      PIndex(e) => { x = hExpr(x, c, e); },
       _ => {}
     }
   }
   return x;
 }
 
-function hStmt(w: W, c: Ctx, s: HStmt, ty: bool): W {
+function hStmt(w: W, c: Ctx, s: HStmt): W {
   let x = w;
   match (s) {
-    HLet(_, e) => { x = hExpr(x, c, e, ty); },
+    HLet(_, e) => { x = hExpr(x, c, e); },
     HAssign(p, _, e) => {
-      x = hPlace(x, c, p, ty);
-      x = hExpr(x, c, e, ty);
+      x = hPlace(x, c, p);
+      x = hExpr(x, c, e);
     },
-    HExprStmt(e) => { x = hExpr(x, c, e, ty); },
+    HExprStmt(e) => { x = hExpr(x, c, e); },
     HIf(cond, a, b) => {
-      x = hExpr(x, c, cond, ty);
-      x = hBlock(x, c, a, ty);
+      x = hExpr(x, c, cond);
+      x = hBlock(x, c, a);
       match (b) {
-        Some(blk) => { x = hBlock(x, c, blk, ty); },
+        Some(blk) => { x = hBlock(x, c, blk); },
         None => {}
       }
     },
     HWhile(cond, b) => {
-      x = hExpr(x, c, cond, ty);
-      x = hBlock(x, c, b, ty);
+      x = hExpr(x, c, cond);
+      x = hBlock(x, c, b);
     },
     HForOf(_, e, b) => {
-      x = hExpr(x, c, e, ty);
-      x = hBlock(x, c, b, ty);
+      x = hExpr(x, c, e);
+      x = hBlock(x, c, b);
     },
     HReturn(o) => {
       match (o) {
-        Some(e) => { x = hExpr(x, c, e, ty); },
+        Some(e) => { x = hExpr(x, c, e); },
         None => {}
       }
     },
-    HBlockStmt(b) => { x = hBlock(x, c, b, ty); },
+    HBlockStmt(b) => { x = hBlock(x, c, b); },
     _ => {}
   }
   return x;
 }
 
-function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
+function hExpr(w: W, c: Ctx, e: HExpr): W {
   let x = w;
-  if (ty && !litKind(e)) {
-    match (c.hir) {
-      Some(p) => { x.types.push(TypeAt { span: e.span, ty: renderTy(p, e.ty) }); },
-      None => {}
-    }
-  }
   match (e.kind) {
-    XUnary(_, a) => { x = hExpr(x, c, a, ty); },
+    XUnary(_, a) => { x = hExpr(x, c, a); },
     XBinary(_, a, b) => {
-      x = hExpr(x, c, a, ty);
-      x = hExpr(x, c, b, ty);
+      x = hExpr(x, c, a);
+      x = hExpr(x, c, b);
     },
     XCall(fid, args) => {
-      x = hExprs(x, c, args, ty);
+      x = hExprs(x, c, args);
       x = methodRef(x, c, e, fid, args);
       x = callSite(x, c, e, fid, args);
       match (c.hir) {
@@ -379,18 +399,18 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       }
     },
     XBuiltin(b, args) => {
-      x = hExprs(x, c, args, ty);
+      x = hExprs(x, c, args);
       const op = ioOpOf(b);
       if (op != "") {
         x = addCall(x, None, "MUST", "io:" + op, e.span);
       }
     },
     XMutMethod(_, p, args) => {
-      x = hPlace(x, c, p, ty);
-      x = hExprs(x, c, args, ty);
+      x = hPlace(x, c, p);
+      x = hExprs(x, c, args);
     },
     XField(b, rid, fi) => {
-      x = hExpr(x, c, b, ty);
+      x = hExpr(x, c, b);
       match (c.hir) {
         Some(p) => {
           if (rid < p.records.length && rid < c.recDef.length && fi < p.records[rid].fields.length) {
@@ -417,43 +437,43 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       }
     },
     XIndex(a, b) => {
-      x = hExpr(x, c, a, ty);
-      x = hExpr(x, c, b, ty);
+      x = hExpr(x, c, a);
+      x = hExpr(x, c, b);
     },
     XRecord(_, sp, inits) => {
       match (sp) {
-        Some(s) => { x = hExpr(x, c, s, ty); },
+        Some(s) => { x = hExpr(x, c, s); },
         None => {}
       }
       for (const fi of inits) {
-        x = hExpr(x, c, fi.value, ty);
+        x = hExpr(x, c, fi.value);
       }
     },
-    XVariant(_, args) => { x = hExprs(x, c, args, ty); },
-    XArray(es) => { x = hExprs(x, c, es, ty); },
-    XTry(a) => { x = hExpr(x, c, a, ty); },
+    XVariant(_, args) => { x = hExprs(x, c, args); },
+    XArray(es) => { x = hExprs(x, c, es); },
+    XTry(a) => { x = hExpr(x, c, a); },
     XCond(a, b, d) => {
-      x = hExpr(x, c, a, ty);
-      x = hExpr(x, c, b, ty);
-      x = hExpr(x, c, d, ty);
+      x = hExpr(x, c, a);
+      x = hExpr(x, c, b);
+      x = hExpr(x, c, d);
     },
     XMatch(s, arms) => {
-      x = hExpr(x, c, s, ty);
+      x = hExpr(x, c, s);
       for (const a of arms) {
-        x = hBlock(x, c, a.body, ty);
+        x = hBlock(x, c, a.body);
         match (a.value) {
-          Some(v) => { x = hExpr(x, c, v, ty); },
+          Some(v) => { x = hExpr(x, c, v); },
           None => {}
         }
       }
     },
     XClosure(fid, caps) => {
-      x = hExprs(x, c, caps, ty);
+      x = hExprs(x, c, caps);
       x = valueRef(x, c, e, fid);
     },
     XCallIndirect(f, args) => {
-      x = hExpr(x, c, f, ty);
-      x = hExprs(x, c, args, ty);
+      x = hExpr(x, c, f);
+      x = hExprs(x, c, args);
       let pk: int = -1;
       match (f.kind) {
         XLocal(q) => {
@@ -465,14 +485,29 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       }
       x = addCallP(x, None, "UNKNOWN", "indirect", e.span, pk, "");
     },
-    XIface(_, v) => { x = hExpr(x, c, v, ty); },
+    XIface(_, v) => { x = hExpr(x, c, v); },
     XCallVirtual(r, slot, args) => {
-      x = hExpr(x, c, r, ty);
-      x = hExprs(x, c, args, ty);
+      x = hExpr(x, c, r);
+      x = hExprs(x, c, args);
       x = virtRef(x, c, e, r, slot);
       x = virtCall(x, c, e, r, slot, args);
     },
     _ => {}
   }
+  return x;
+}
+
+// Walks the lowered body of `hf` for the call sites, method and field references of the def `caller` (None: not
+// attributed), and, when `withTypes`, records the expression types. `np`: see W.
+export function hirBody(w: W, c: Ctx, caller: Option<usize>, np: Option<usize>, hf: Function, withTypes: bool): W {
+  let x = w;
+  x.cur = caller;
+  x.np = np;
+  x = hBlock(x, c, hf.body);
+  if (withTypes) {
+    x = typeRows(x, c, hf.body);
+  }
+  x.cur = None;
+  x.np = None;
   return x;
 }

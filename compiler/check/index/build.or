@@ -16,127 +16,44 @@
 // Determinism: defs are numbered per unit (units in loader order): top-level declarations (with
 // their fields / variants right behind them) first, then locals and parameters in source order
 // per function. `refs` and `types` are sorted by position; duplicates are removed.
+//
+// The steps, one function each: `declareUnits` (pass 1, declare.or), `mapFunctions` / `recordDefs` (HIR ids -> defs),
+// `walkUnits` (pass 2: the AST walk of walk.or and the HIR walk of hir.or per top-level item), `walkGenericInstances`,
+// `noteImplementors`, then the sorting.
 
 import { Span, SourceMap } from "../../diag";
-import { FunctionDecl, Param } from "../../syntax";
+import { Ident, Item, FunctionDecl, ClassDecl, CtorDecl, ConstDecl, InterfaceDecl, Param } from "../../syntax";
 import { LoadedProgram } from "../../loader";
 import {
-  Program,
-  Function,
-  SymbolDef,
-  SymbolRef,
-  TypeAt,
-  SemanticIndex,
-  ImplLink,
-  SkFunction,
-  SkConst,
-  SkInterface
+  Program, Function, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink, SkFunction, SkConst, SkInterface
 } from "../../hir";
-import {
-  P1,
-  allCtorClauses,
-  classFieldCount,
-  declareClass,
-  declareInterface,
-  declareType,
-  resolveImports
-} from "./declare";
-import { hBlock } from "./hir";
+import { P1, allCtorClauses, classFieldCount, declareClass, declareInterface, declareType, resolveImports } from "./declare";
+import { hirBody } from "./hir";
 import { constDetail, funcDetail } from "./render";
-import { Ctx, addDef, addDefA, addRef, children, lookupType, newW } from "./state";
-import {
-  FnKind,
-  UnitTab,
-  addV,
-  emptyTab,
-  findName,
-  fnKindNos,
-  isClosureKind,
-  isOrdinaryKind,
-  isWrapperKind
-} from "./tables";
+import { BoundRule, Ctx, W, addDef, addDefA, addRef, children, lookupType, newW } from "./state";
+import { FnKind, UnitTab, bindFirst, fnKindNos, isClosureKind, isOrdinaryKind, isWrapperKind } from "./tables";
 import { optTypeRefs, typeRefs, walkExpr, walkFunction, walkTypeDecl } from "./walk";
 
-// ---- sorting ----------------------------------------------------------------------------------------
+// ---- sorting and duplicates ---------------------------------------------------------------------------
 
-function spanLess(a: Span, b: Span): bool {
+function compareSpans(a: Span, b: Span): int {
   if (a.file != b.file) {
-    return a.file < b.file;
+    return a.file < b.file ? -1 : 1;
   }
   if (a.start != b.start) {
-    return a.start < b.start;
+    return a.start < b.start ? -1 : 1;
   }
-  return a.end < b.end;
+  if (a.end != b.end) {
+    return a.end < b.end ? -1 : 1;
+  }
+  return 0;
 }
 
-function sortRefs(xs: SymbolRef[]): SymbolRef[] {
-  if (xs.length < 2) {
-    return xs;
-  }
-  const mid = xs.length / 2;
-  const l = sortRefs(xs.slice(0, mid));
-  const r = sortRefs(xs.slice(mid, xs.length));
+// The references by position (stable: equal spans keep their discovery order), without consecutive duplicates.
+function sortedRefs(xs: SymbolRef[]): SymbolRef[] {
   let out: SymbolRef[] = [];
-  let i: usize = 0;
-  let j: usize = 0;
-  while (i < l.length && j < r.length) {
-    if (spanLess(r[j].span, l[i].span)) {
-      out.push(r[j]);
-      j += 1;
-    } else {
-      out.push(l[i]);
-      i += 1;
-    }
-  }
-  while (i < l.length) {
-    out.push(l[i]);
-    i += 1;
-  }
-  while (j < r.length) {
-    out.push(r[j]);
-    j += 1;
-  }
-  return out;
-}
-
-function sortTypes(xs: TypeAt[]): TypeAt[] {
-  if (xs.length < 2) {
-    return xs;
-  }
-  const mid = xs.length / 2;
-  const l = sortTypes(xs.slice(0, mid));
-  const r = sortTypes(xs.slice(mid, xs.length));
-  let out: TypeAt[] = [];
-  let i: usize = 0;
-  let j: usize = 0;
-  while (i < l.length && j < r.length) {
-    if (spanLess(r[j].span, l[i].span)) {
-      out.push(r[j]);
-      j += 1;
-    } else {
-      out.push(l[i]);
-      i += 1;
-    }
-  }
-  while (i < l.length) {
-    out.push(l[i]);
-    i += 1;
-  }
-  while (j < r.length) {
-    out.push(r[j]);
-    j += 1;
-  }
-  return out;
-}
-
-function sameSpan(a: Span, b: Span): bool {
-  return a.file == b.file && a.start == b.start && a.end == b.end;
-}
-
-function dedupRefs(xs: SymbolRef[]): SymbolRef[] {
-  let out: SymbolRef[] = [];
-  for (const r of xs) {
-    if (out.length > 0 && sameSpan(out[out.length - 1].span, r.span) && out[out.length - 1].def == r.def) {
+  for (const r of xs.sort((a, b) => compareSpans(a.span, b.span))) {
+    if (out.length > 0 && compareSpans(out[out.length - 1].span, r.span) == 0 && out[out.length - 1].def == r.def) {
       continue;
     }
     out.push(r);
@@ -144,13 +61,62 @@ function dedupRefs(xs: SymbolRef[]): SymbolRef[] {
   return out;
 }
 
-function dedupTypes(xs: TypeAt[]): TypeAt[] {
+// The expression types by position, one per span (the first discovered, that is the outermost occurrence).
+function sortedTypes(xs: TypeAt[]): TypeAt[] {
   let out: TypeAt[] = [];
-  for (const t of xs) {
-    if (out.length > 0 && sameSpan(out[out.length - 1].span, t.span)) {
+  for (const t of xs.sort((a, b) => compareSpans(a.span, b.span))) {
+    if (out.length > 0 && compareSpans(out[out.length - 1].span, t.span) == 0) {
       continue;
     }
     out.push(t);
+  }
+  return out;
+}
+
+// ---- name maps ----------------------------------------------------------------------------------------
+
+// The interface defs named by the bounds of a declaration of the unit with name tables `tab`.
+function boundTypes(tab: UnitTab, bounds: Option<Ident>[]): usize[] {
+  let out: usize[] = [];
+  for (const b of bounds) {
+    match (b) {
+      Some(id) => {
+        const d = tab.typeDef(id.name);
+        if (d.isSome()) {
+          out.push(d.unwrap());
+        }
+      },
+      None => {}
+    }
+  }
+  return out;
+}
+
+// The declarations with bounded type parameters, in program order (units, then items): the interface defs their
+// bounds name.
+function boundRules(prog: LoadedProgram, tabs: UnitTab[]): BoundRule[] {
+  let out: BoundRule[] = [];
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    for (const item of u.ast.items) {
+      match (item) {
+        IFunction(f) => {
+          const defs = boundTypes(tabs[ui], f.bounds);
+          if (defs.length > 0) {
+            out.push(BoundRule { name: u.name + "." + f.name.name, prefix: false, defs: defs });
+          }
+        },
+        IClass(cd) => {
+          // the constructor and instance methods of a generic class (ADR-0026) carry the bounds of the class
+          const defs = boundTypes(tabs[ui], cd.bounds);
+          if (defs.length > 0) {
+            out.push(BoundRule { name: u.name + "." + cd.name.name + ".", prefix: true, defs: defs });
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
   }
   return out;
 }
@@ -164,41 +130,43 @@ function boundDefs(c: Ctx, hirName: string): usize[] {
     return out;
   }
   const base = hirName.substring(0, lt.unwrap());
+  for (const r of c.bounds) {
+    if (r.prefix ? base.startsWith(r.name) : base == r.name) {
+      for (const d of r.defs) {
+        out.push(d);
+      }
+    }
+  }
+  return out;
+}
+
+// Qualified HIR names ("unit.f", "unit.C.m", "unit.C.constructor") of the functions, methods and constructors
+// of the program -> their defs. A class without explicit constructor maps `constructor` to the class def.
+function functionNames(prog: LoadedProgram, tabs: UnitTab[], defs: SymbolDef[]): Map<string, usize> {
+  let out = new Map<string, usize>();
   let ui: usize = 0;
-  for (const u of c.prog.units) {
+  for (const u of prog.units) {
+    let k: usize = 0;
     for (const item of u.ast.items) {
+      const did = tabs[ui].itemDef(k);
+      k += 1;
       match (item) {
         IFunction(f) => {
-          if (u.name + "." + f.name.name == base) {
-            for (const b of f.bounds) {
-              match (b) {
-                Some(id) => {
-                  const t = c.tabs[ui];
-                  const d = findName(t.tNames, t.tDefs, id.name);
-                  if (d.isSome()) {
-                    out.push(d.unwrap());
-                  }
-                },
-                None => {}
+          out = bindFirst(out, u.name + "." + f.name.name, did);
+        },
+        IClass(cd) => {
+          let explicitCtor = false;
+          for (const m of children(defs, did)) {
+            const isFn = match (defs[m].kind) { SkFunction => true, _ => false };
+            if (isFn) {
+              out = bindFirst(out, u.name + "." + cd.name.name + "." + defs[m].name, m);
+              if (defs[m].name == "constructor") {
+                explicitCtor = true;
               }
             }
           }
-        },
-        IClass(cd) => {
-          // the constructor and instance methods of a generic class (ADR-0026) carry the bounds of the class
-          if (base.startsWith(u.name + "." + cd.name.name + ".")) {
-            for (const b of cd.bounds) {
-              match (b) {
-                Some(id) => {
-                  const t = c.tabs[ui];
-                  const d = findName(t.tNames, t.tDefs, id.name);
-                  if (d.isSome()) {
-                    out.push(d.unwrap());
-                  }
-                },
-                None => {}
-              }
-            }
+          if (!explicitCtor) {
+            out = bindFirst(out, u.name + "." + cd.name.name + ".constructor", did);
           }
         },
         _ => {}
@@ -209,102 +177,72 @@ function boundDefs(c: Ctx, hirName: string): usize[] {
   return out;
 }
 
-// Qualified HIR names ("unit.f", "unit.C.m", "unit.C.constructor") of the functions, methods and constructors
-// of the program, with their defs. A class without explicit constructor maps `constructor` to the class def.
-type FnNames = { names: string[]; defs: usize[]; };
+// ---- pass 1 ---------------------------------------------------------------------------------------------
 
-function functionNames(prog: LoadedProgram, tabs: UnitTab[], defs: SymbolDef[]): FnNames {
-  let names: string[] = [];
-  let ds: usize[] = [];
-  let ui: usize = 0;
-  for (const u of prog.units) {
-    let k: usize = 0;
-    for (const item of u.ast.items) {
-      const did = tabs[ui].itemDefs[k];
-      k += 1;
-      match (item) {
-        IFunction(f) => {
-          names.push(u.name + "." + f.name.name);
-          ds.push(did);
-        },
-        IClass(cd) => {
-          let explicitCtor = false;
-          for (const m of children(defs, did)) {
-            const isFn = match (defs[m].kind) { SkFunction => true, _ => false };
-            if (isFn) {
-              names.push(u.name + "." + cd.name.name + "." + defs[m].name);
-              ds.push(m);
-              if (defs[m].name == "constructor") {
-                explicitCtor = true;
-              }
-            }
-          }
-          if (!explicitCtor) {
-            names.push(u.name + "." + cd.name.name + ".constructor");
-            ds.push(did);
-          }
-        },
-        _ => {}
-      }
-    }
-    ui += 1;
-  }
-  return FnNames { names: names, defs: ds };
+// What pass 1 produced: the walker state with all top-level defs, the name tables of every unit, and the qualified
+// type names ("unit.Name") -> def.
+type Declared = { w: W; tabs: UnitTab[]; tq: Map<string, usize>; };
+
+// Does the item introduce a definition (and so an entry of `UnitTab.itemDef`)?
+function declaresDef(item: Item): bool {
+  return match (item) {
+    IFunction(_) => true,
+    IConst(_) => true,
+    IType(_) => true,
+    IClass(_) => true,
+    IInterface(_) => true,
+    _ => false
+  };
 }
 
-// ---- driver -------------------------------------------------------------------------------------------
+function declareItem(p: P1, unitName: string, item: Item, hir: Option<Program>, sm: SourceMap): P1 {
+  let x = p;
+  match (item) {
+    IFunction(f) => {
+      const did = x.w.defs.length;
+      x.w = addDefA(x.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm), f.annotations, sm);
+      x.tab.bindVal(f.name.name, did, f.exported);
+    },
+    IConst(k) => {
+      const did = x.w.defs.length;
+      x.w = addDef(x.w, k.name.name, SkConst, k.name.span, k.span, None, k.exported, constDetail(k));
+      x.tab.bindVal(k.name.name, did, k.exported);
+    },
+    IType(t) => { x = declareType(x, unitName, t, sm); },
+    IClass(cd) => { x = declareClass(x, unitName, cd, hir, sm); },
+    IInterface(ik) => { x = declareInterface(x, unitName, ik, sm); },
+    _ => {}
+  }
+  return x;
+}
 
-export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): SemanticIndex {
-  // Pass 1: top-level definitions, imports and exports, units in loader order.
+// Pass 1: top-level definitions, imports and exports, units in loader order.
+function declareUnits(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): Declared {
   let w = newW();
   let tabs: UnitTab[] = [];
-  let tq: string[] = [];
-  let tqDefs: usize[] = [];
+  let tq = new Map<string, usize>();
   let ui: usize = 0;
   for (const u of prog.units) {
     w.unit = ui;
-    let tab = emptyTab();
+    let p = P1 { w: w, tab: new UnitTab(), tq: tq };
     let itemDefs: usize[] = [];
-    let p = P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
     for (const item of u.ast.items) {
-      let did: usize = 0;
-      match (item) {
-        IFunction(f) => {
-          did = p.w.defs.length;
-          p.w = addDefA(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm), f.annotations, sm);
-          p.tab = addV(p.tab, f.name.name, did, f.exported);
-        },
-        IConst(k) => {
-          did = p.w.defs.length;
-          p.w = addDef(p.w, k.name.name, SkConst, k.name.span, k.span, None, k.exported, constDetail(k));
-          p.tab = addV(p.tab, k.name.name, did, k.exported);
-        },
-        IType(t) => {
-          did = p.w.defs.length;
-          p = declareType(p, u.name, t, sm);
-        },
-        IClass(cd) => {
-          did = p.w.defs.length;
-          p = declareClass(p, u.name, cd, hir, sm);
-        },
-        IInterface(ik) => {
-          did = p.w.defs.length;
-          p = declareInterface(p, u.name, ik, sm);
-        },
-        _ => {}
-      }
-      itemDefs.push(did);
+      itemDefs.push(declaresDef(item) ? p.w.defs.length : 0);
+      p = declareItem(p, u.name, item, hir, sm);
     }
     p = resolveImports(p, ui, prog, tabs);
-    p.tab.itemDefs = itemDefs;
+    p.tab.setItemDefs(itemDefs);
     w = p.w;
     tabs.push(p.tab);
     tq = p.tq;
-    tqDefs = p.tqDefs;
     ui += 1;
   }
-  // HIR record id -> SkRecord def (generic instances map to their generic declaration).
-  let recDef: Option<usize>[] = [];
+  return Declared { w: w, tabs: tabs, tq: tq };
+}
+
+// HIR record id -> SkRecord def (generic instances map to their generic declaration).
+function recordDefs(hir: Option<Program>, tq: Map<string, usize>): Option<usize>[] {
+  let out: Option<usize>[] = [];
   match (hir) {
     Some(h) => {
       for (const r of h.records) {
@@ -313,16 +251,23 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         if (lt.isSome()) {
           base = base.substring(0, lt.unwrap());
         }
-        recDef.push(findName(tq, tqDefs, base));
+        out.push(tq.get(base));
       }
     },
     None => {}
   }
-  let fnDef: Option<usize>[] = [];
-  let fnKind: FnKind[] = [];
+  return out;
+}
+
+// HIR function id -> the def it was lowered from, and what kind of function it is.
+type FnMap = { defs: Option<usize>[]; kinds: FnKind[]; };
+
+function mapFunctions(prog: LoadedProgram, hir: Option<Program>, d: Declared): FnMap {
+  let defs: Option<usize>[] = [];
+  let kinds: FnKind[] = [];
   match (hir) {
     Some(h) => {
-      const fq = functionNames(prog, tabs, w.defs);
+      const fq = functionNames(prog, d.tabs, d.w.defs);
       for (const f of h.functions) {
         let nm = f.name;
         let kind: FnKind = FkOrdinary;
@@ -335,237 +280,260 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         if (lt.isSome()) {
           nm = nm.substring(0, lt.unwrap());
         }
-        fnDef.push(findName(fq.names, fq.defs, nm));
-        fnKind.push(kind);
+        defs.push(fq.get(nm));
+        kinds.push(kind);
       }
     },
     None => {}
   }
-  const c = Ctx {
-    prog: prog, sm: sm, tabs: tabs, hir: hir, recDef: recDef, tq: tq, tqDefs: tqDefs, fnDef: fnDef, fnKind: fnKind
+  return FnMap { defs: defs, kinds: kinds };
+}
+
+// ---- pass 2 ---------------------------------------------------------------------------------------------
+
+// The next ordinary (non-generic) HIR function, when it was lowered from the declaration called `name`. The caller
+// advances `hn` whether or not the name matches (the checker may have dropped the function).
+function nextHir(w: W, c: Ctx, name: string): Option<Function> {
+  return match (c.hir) {
+    Some(h) => {
+      if (w.hn < h.functions.length && h.functions[w.hn].name == name) {
+        return Some(h.functions[w.hn]);
+      }
+      return None;
+    },
+    None => None
   };
-  // Pass 2: bodies.
-  let hn: usize = 0;     // next ordinary (non-generic) HIR function
-  ui = 0;
-  for (const u of prog.units) {
-    w.unit = ui;
+}
+
+// A function with its own lowered body: references, call sites and types of the HIR, then the AST walk.
+function walkFunctionItem(w: W, c: Ctx, unitName: string, f: FunctionDecl, did: usize): W {
+  let x = w;
+  let hf: Option<Function> = None;
+  if (f.typeParams.length == 0) {
+    hf = nextHir(x, c, unitName + "." + f.name.name);
+    if (hf.isSome()) {
+      x = hirBody(x, c, Some(did), Some(hf.unwrap().paramCount), hf.unwrap(), true);
+    }
+    x.hn += 1;
+  }
+  return walkFunction(x, c, f, did, hf);
+}
+
+function walkConstItem(w: W, c: Ctx, k: ConstDecl): W {
+  let x = w;
+  x.tps = [];
+  x = optTypeRefs(x, c, k.ty);
+  return walkExpr(x, c, k.value);
+}
+
+function walkInterfaceItem(w: W, c: Ctx, ik: InterfaceDecl): W {
+  let x = w;
+  x.tps = [];
+  for (const m of ik.methods) {
+    for (const p of m.params) {
+      x = typeRefs(x, c, p.ty);
+    }
+    x = optTypeRefs(x, c, m.ret);
+  }
+  return x;
+}
+
+function hasExplicitCtor(cd: ClassDecl): bool {
+  for (const m of cd.members) {
+    match (m) {
+      MCtor(_) => { return true; },
+      _ => {}
+    }
+  }
+  return false;
+}
+
+// The constructor member `k` of `cd` as the function declaration the AST walk takes.
+function ctorDecl(cd: ClassDecl, k: CtorDecl): FunctionDecl {
+  let ps: Param[] = [];
+  for (const cp of k.params) {
+    ps.push(Param { name: cp.name, ty: cp.ty, span: cp.span });
+  }
+  return FunctionDecl {
+    exported: false, name: cd.name, typeParams: cd.typeParams, bounds: [], params: ps,
+    ret: None, body: k.body, contracts: allCtorClauses(cd, k), annotations: [], span: k.span
+  };
+}
+
+// Class `cd` (def `did`): `implements` links, then its members in order. The HIR functions of a class are the
+// constructor, then the methods in member order. A generic class (ADR-0026): its constructor and instance methods are
+// generic functions (instances come after the ordinary functions); only its static methods are in this sequence.
+function walkClassItem(w: W, c: Ctx, unitName: string, cd: ClassDecl, did: usize): W {
+  let x = w;
+  for (const im of cd.impls) {
+    const idf = lookupType(x, c, im.name);
+    if (idf.isSome()) {
+      x = addRef(x, im.span, idf.unwrap());
+      x.impls.push(ImplLink { cls: did, iface: idf.unwrap(), span: im.span });
+    }
+  }
+  const genericCls = cd.typeParams.length > 0;
+  let ctorHf: Option<Function> = None;
+  if (!genericCls) {
+    ctorHf = nextHir(x, c, unitName + "." + cd.name.name + ".constructor");
+    x.hn += 1;
+  }
+  let dk = did + 1 + classFieldCount(cd);
+  let ctps: string[] = [];
+  for (const t of cd.typeParams) {
+    ctps.push(t.name);
+  }
+  x.tps = ctps;
+  for (const b of cd.bounds) {
+    match (b) {
+      Some(id) => {
+        const bd = lookupType(x, c, id.name);
+        if (bd.isSome()) {
+          x = addRef(x, id.span, bd.unwrap());
+        }
+      },
+      None => {}
+    }
+  }
+  for (const m of cd.members) {
+    match (m) {
+      MField(f) => {
+        x.tps = ctps;
+        x = typeRefs(x, c, f.ty);
+        match (f.init) {
+          Some(ie) => { x = walkExpr(x, c, ie); },
+          None => {}
+        }
+      },
+      MCtor(k) => {
+        x.tps = ctps;
+        for (const cp of k.params) {
+          x = typeRefs(x, c, cp.ty);
+        }
+        match (ctorHf) {
+          Some(hf) => { x = hirBody(x, c, Some(dk), Some(hf.paramCount), hf, true); },
+          None => {}
+        }
+        x = walkFunction(x, c, ctorDecl(cd, k), dk, ctorHf);
+        dk += 1;
+      },
+      MMethod(md) => {
+        let hf: Option<Function> = None;
+        if (!genericCls || md.isStatic) {
+          hf = nextHir(x, c, unitName + "." + cd.name.name + "." + md.name.name);
+          if (hf.isSome()) {
+            x = hirBody(x, c, Some(dk), Some(hf.unwrap().paramCount), hf.unwrap(), true);
+          }
+          x.hn += 1;
+        }
+        const fd = FunctionDecl {
+          exported: false, name: md.name, typeParams: md.isStatic ? [] : cd.typeParams, bounds: [], params: md.params,
+          ret: md.ret, body: md.body, contracts: md.contracts, annotations: md.annotations, span: md.span
+        };
+        x = walkFunction(x, c, fd, dk, hf);
+        dk += 1;
+      }
+    }
+  }
+  if (!hasExplicitCtor(cd)) {
+    // the implicit constructor is attributed to the class itself (field initialisers), without types
+    match (ctorHf) {
+      Some(hf) => { x = hirBody(x, c, Some(did), Some(hf.paramCount), hf, false); },
+      None => {}
+    }
+  }
+  return x;
+}
+
+// Pass 2: the bodies of every unit, in the order the checker lowered the HIR functions.
+function walkUnits(w: W, c: Ctx): W {
+  let x = w;
+  let ui: usize = 0;
+  for (const u of c.prog.units) {
+    x.unit = ui;
     let k: usize = 0;
     for (const item of u.ast.items) {
-      const did = tabs[ui].itemDefs[k];
+      const did = c.tabs[ui].itemDef(k);
       k += 1;
       match (item) {
-        IFunction(f) => {
-          let hf: Option<Function> = None;
-          if (f.typeParams.length == 0) {
-            match (hir) {
-              Some(h) => {
-                if (hn < h.functions.length && h.functions[hn].name == u.name + "." + f.name.name) {
-                  hf = Some(h.functions[hn]);
-                  w.cur = Some(did);
-                  w.np = Some(h.functions[hn].paramCount);
-                  w = hBlock(w, c, h.functions[hn].body, true);
-                  w.cur = None;
-                  w.np = None;
-                }
-              },
-              None => {}
-            }
-            hn += 1;
-          }
-          w = walkFunction(w, c, f, did, hf);
-        },
-        IConst(kd) => {
-          const none: string[] = [];
-          w.tps = none;
-          w = optTypeRefs(w, c, kd.ty);
-          w = walkExpr(w, c, kd.value);
-        },
-        IType(t) => { w = walkTypeDecl(w, c, t); },
-        IInterface(ik) => {
-          const none: string[] = [];
-          w.tps = none;
-          for (const m of ik.methods) {
-            for (const p of m.params) {
-              w = typeRefs(w, c, p.ty);
-            }
-            w = optTypeRefs(w, c, m.ret);
-          }
-        },
-        IClass(cd) => {
-          for (const im of cd.impls) {
-            const idf = lookupType(w, c, im.name);
-            if (idf.isSome()) {
-              w = addRef(w, im.span, idf.unwrap());
-              w.impls.push(ImplLink { cls: did, iface: idf.unwrap(), span: im.span });
-            }
-          }
-          // HIR functions of a class: the constructor, then the methods in member order.
-          // A generic class (ADR-0026): its constructor and instance methods are generic functions (instances
-          // come after the ordinary functions); only its static methods are in this sequence.
-          const genericCls = cd.typeParams.length > 0;
-          let ctorHf: Option<Function> = None;
-          let explicitCtor = false;
-          if (!genericCls) {
-            match (hir) {
-              Some(h) => {
-                if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + ".constructor") {
-                  ctorHf = Some(h.functions[hn]);
-                }
-              },
-              None => {}
-            }
-            hn += 1;
-          }
-          for (const m of cd.members) {
-            match (m) {
-              MCtor(_) => { explicitCtor = true; },
-              _ => {}
-            }
-          }
-          let dk = did + 1 + classFieldCount(cd);
-          let ctps: string[] = [];
-          for (const t of cd.typeParams) {
-            ctps.push(t.name);
-          }
-          w.tps = ctps;
-          for (const b of cd.bounds) {
-            match (b) {
-              Some(id) => {
-                const bd = lookupType(w, c, id.name);
-                if (bd.isSome()) {
-                  w = addRef(w, id.span, bd.unwrap());
-                }
-              },
-              None => {}
-            }
-          }
-          for (const m of cd.members) {
-            match (m) {
-              MField(f) => {
-                w.tps = ctps;
-                w = typeRefs(w, c, f.ty);
-                match (f.init) {
-                  Some(ie) => { w = walkExpr(w, c, ie); },
-                  None => {}
-                }
-              },
-              MCtor(k) => {
-                let ps: Param[] = [];
-                w.tps = ctps;
-                for (const cp of k.params) {
-                  w = typeRefs(w, c, cp.ty);
-                  ps.push(Param { name: cp.name, ty: cp.ty, span: cp.span });
-                }
-                const fd = FunctionDecl {
-                  exported: false, name: cd.name, typeParams: cd.typeParams, bounds: [], params: ps,
-                  ret: None, body: k.body, contracts: allCtorClauses(cd, k), annotations: [], span: k.span
-                };
-                match (ctorHf) {
-                  Some(hf) => {
-                    w.cur = Some(dk);
-                    w.np = Some(hf.paramCount);
-                    w = hBlock(w, c, hf.body, true);
-                    w.cur = None;
-                    w.np = None;
-                  },
-                  None => {}
-                }
-                w = walkFunction(w, c, fd, dk, ctorHf);
-                dk += 1;
-              },
-              MMethod(md) => {
-                let hf: Option<Function> = None;
-                const inSeq = !genericCls || md.isStatic;
-                if (inSeq) {
-                  match (hir) {
-                    Some(h) => {
-                      if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
-                        hf = Some(h.functions[hn]);
-                        w.cur = Some(dk);
-                        w.np = Some(h.functions[hn].paramCount);
-                        w = hBlock(w, c, h.functions[hn].body, true);
-                        w.cur = None;
-                        w.np = None;
-                      }
-                    },
-                    None => {}
-                  }
-                  hn += 1;
-                }
-                const fd = FunctionDecl {
-                  exported: false, name: md.name, typeParams: md.isStatic ? [] : cd.typeParams, bounds: [], params: md.params,
-                  ret: md.ret, body: md.body, contracts: md.contracts, annotations: md.annotations, span: md.span
-                };
-                w = walkFunction(w, c, fd, dk, hf);
-                dk += 1;
-              }
-            }
-          }
-          if (!explicitCtor) {
-            match (ctorHf) {
-              Some(hf) => {
-                w.cur = Some(did);
-                w.np = Some(hf.paramCount);
-                w = hBlock(w, c, hf.body, false);
-                w.cur = None;
-                w.np = None;
-              },
-              None => {}
-            }
-          }
-        },
+        IFunction(f) => { x = walkFunctionItem(x, c, u.name, f, did); },
+        IConst(kd) => { x = walkConstItem(x, c, kd); },
+        IType(t) => { x = walkTypeDecl(x, c, t); },
+        IInterface(ik) => { x = walkInterfaceItem(x, c, ik); },
+        IClass(cd) => { x = walkClassItem(x, c, u.name, cd, did); },
         _ => {}
       }
     }
     ui += 1;
   }
-  // Generic function instances (after the ordinary functions): field references only.
-  match (hir) {
-    Some(h) => {
-      while (hn < h.functions.length) {
-        // Lifted closure bodies (arrow functions, ADR-0011) also contribute expression types.
-        w.bnd = boundDefs(c, h.functions[hn].name);
-        w.cur = isWrapperKind(c.fnKind[hn]) ? None : c.fnDef[hn];
-        w.curMay = isClosureKind(c.fnKind[hn]);
-        w.np = isOrdinaryKind(c.fnKind[hn]) ? Some(h.functions[hn].paramCount) : None;
-        w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
-        w.cur = None;
-        w.curMay = false;
-        w.np = None;
-        const noB: usize[] = [];
-        w.bnd = noB;
-        hn += 1;
-      }
-    },
-    None => {}
+  return x;
+}
+
+// Generic function instances (after the ordinary functions): field references and call sites. Lifted closure bodies
+// (arrow functions, ADR-0011) also contribute expression types.
+function walkGenericInstances(w: W, c: Ctx, h: Program): W {
+  let x = w;
+  while (x.hn < h.functions.length) {
+    const hf = h.functions[x.hn];
+    const kind = c.fnKind[x.hn];
+    x.bnd = boundDefs(c, hf.name);
+    x.curMay = isClosureKind(kind);
+    x = hirBody(
+      x, c, isWrapperKind(kind) ? None : c.fnDef[x.hn], isOrdinaryKind(kind) ? Some(hf.paramCount) : None, hf,
+      hf.name.includes("$closure")
+    );
+    x.curMay = false;
+    x.bnd = [];
+    x.hn += 1;
   }
-  // The hover text of an interface lists the classes that implement it (ADR-0019).
-  let impl: usize = 0;
-  while (impl < w.defs.length) {
-    match (w.defs[impl].kind) {
+  return x;
+}
+
+// The hover text of an interface lists the classes that implement it (ADR-0019).
+function noteImplementors(w: W): W {
+  let x = w;
+  let d: usize = 0;
+  while (d < x.defs.length) {
+    match (x.defs[d].kind) {
       SkInterface => {
         let names: string[] = [];
-        for (const l of w.impls) {
-          if (l.iface == impl) {
-            names.push(w.defs[l.cls].name);
+        for (const l of x.impls) {
+          if (l.iface == d) {
+            names.push(x.defs[l.cls].name);
           }
         }
         if (names.length > 0) {
-          w.defs[impl].detail = w.defs[impl].detail + " (implemented by " + names.join(", ") + ")";
+          x.defs[d].detail = x.defs[d].detail + " (implemented by " + names.join(", ") + ")";
         }
       },
       _ => {}
     }
-    impl += 1;
+    d += 1;
   }
+  return x;
+}
+
+export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): SemanticIndex {
+  const d = declareUnits(prog, sm, hir);
+  const fm = mapFunctions(prog, hir, d);
+  const c = Ctx {
+    prog: prog, sm: sm, tabs: d.tabs, hir: hir, recDef: recordDefs(hir, d.tq), tq: d.tq, fnDef: fm.defs, fnKind: fm.kinds,
+    bounds: boundRules(prog, d.tabs)
+  };
+  let w = walkUnits(d.w, c);
+  match (hir) {
+    Some(h) => { w = walkGenericInstances(w, c, h); },
+    None => {}
+  }
+  w = noteImplementors(w);
   return SemanticIndex {
     defs: w.defs,
-    refs: dedupRefs(sortRefs(w.refs)),
-    types: dedupTypes(sortTypes(w.types)),
+    refs: sortedRefs(w.refs),
+    types: sortedTypes(w.types),
     impls: w.impls,
     calls: w.calls,
-    fnDefs: fnDef,
-    fnKinds: fnKindNos(fnKind),
+    fnDefs: fm.defs,
+    fnKinds: fnKindNos(fm.kinds),
     typed: hir.isSome()
   };
 }
