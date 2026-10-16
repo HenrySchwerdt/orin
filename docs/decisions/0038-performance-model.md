@@ -412,6 +412,18 @@ relational fact the interval domain of T6 cannot prove, so its bounds check stay
 
 #### T2. Repeated bounds / kind checks on the same (array, index)
 
+**Status (2026-10-16): implemented on branch `claude/project-thread-niggkx-t2-checks`, gain measured as nil; not recommended for merge as is.**
+MIR v2.5 (T5, which would be v2.5, is parked in draft PR #91, so T2 took the next free number instead of the v2.6 below): `IArrayGetU` /
+`IArraySetU`, rule U1 (`compiler/verify/unchecked.or`, helpers shared with F1 in `scan.or`), pass `compiler/opt/bounds.or` (last pass),
+`--assert-facts` via `orin_assert_array`, mutation classes `bce-*` (0 survivors, positive controls accepted), Lean: outside the model
+(array length), documented in docs/tcb.md and docs/formal.md. Deviations from the text below, all conservative: `arraytake` / `arrayput`
+on the array end the scan; a source that redefines its own index (or the array) is not a source; an `IForward` from the array does not end it.
+Measured (valgrind, executed instructions, main 8587609 against the same plus T2, same benchmark inputs): nbody 1,402,363,100 -> 1,402,363,072,
+mutres -28, pqueue -28, sieve -28 (all within noise: 9 / 0 / 0 / 0 static sites), qsort_inplace 583,004,355 -> 584,039,634 (+0.18 %, 4 sites).
+`ORIN_STATS` counters identical on all five; the generated C differs only at the converted accesses (compiler/main.or: 44 lines, nbody 9,
+qsort_inplace 4). The reason is that `gcc -O2` already removes the second kind and bounds check of the same `(array, index)` inside one C
+function, so the estimate of -30 instructions per pair for nbody above does not hold; what remains in nbody's inner loop is not a repeated check.
+
 - *MIR change:* v2.6. Two instructions, `IArrayGetU(d, a, i)` and `IArraySetU(x, i, v)`: same meaning as `IArrayGet` / `IArraySet`
   with the kind check and the bounds check omitted. (Take / put variants later if `pqueue` shows they matter.) Emitters: C
   `items[i]` directly; LLVM `getelementptr inbounds` and no compare.
