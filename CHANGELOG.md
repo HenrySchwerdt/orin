@@ -5,8 +5,8 @@
   (e) is worth at most 0.54 % of the self-compile (the field in/out pattern; all COW copies together are 2.25 %, mostly real sharing) and
   nothing on the benchmarks: not built. Full packed storage would give bytesstr -99 % and http_parse at most -9 % and nothing on the
   compiler, for a MIR version, a lowering change and the runtime's array sites: not built. Built instead, runtime only:
-  `orin_bytes_to_string` / `orin_string_to_bytes` narrow and widen with SSE2 (plain C 4 per iteration elsewhere), same checks and
-  traps. Executed instructions: bytesstr -58.9 %, http_parse -1.5 %, the other benchmarks and the self-compile unchanged.
+  `orin_bytes_to_string` / `orin_string_to_bytes` narrow and widen 4 elements per iteration, same checks and
+  traps. Executed instructions: bytesstr -26.9 % (LLVM -35.2 %), http_parse -0.1 % (LLVM -1.5 %), the other benchmarks and the self-compile unchanged.
 - **Mutation checks in Orin (ADR-0047 phase 5).** New package `tooling/mutation` (`tools/mutation.sh std|ox`) replaces
   `tools/mutate_std.py` and `tools/mutate_ox.py`, which are deleted: the same flags, the same 188 std mutants, 10 `std:net`
   mutants and 33 OX mutants in the same order, the same result lines and exit status; the CI `std-mutants` jobs run it (and the

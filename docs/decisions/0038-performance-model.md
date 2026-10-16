@@ -931,17 +931,22 @@ second array kind with a slow path in every runtime array operation (a `slot_ptr
 MIR version (v2.7), a lowering change outside this branch's directories, a rewrite of the runtime's 40 array sites and of the LLVM
 runtime IR, for one micro-benchmark (-99 %) and at most -9 % on http_parse, nothing on the compiler. Not built.
 
-### Built: the conversion loops, 16 elements per iteration (runtime only)
+### Built: the conversion loops, 4 elements per iteration (runtime only)
 
 What packing would have saved on those two operations is the per-byte loop, not the storage width. `orin_bytes_to_string` and
-`orin_string_to_bytes` now narrow and widen with SSE2 (16 elements per iteration; plain C 4 per iteration elsewhere), the same
-checks (`byte out of range` from the OR of all slots, slice bounds, shape). No MIR, verifier, backend or compiler change, so no
-new trusted code beyond two runtime loops.
+`orin_string_to_bytes` now narrow and widen 4 elements per iteration in plain C, with the same checks (`byte out of range` from
+the OR of all slots, slice bounds, shape). No MIR, verifier, backend or compiler change, so no new trusted code beyond two
+runtime loops.
 
-| executed instructions (valgrind) | before | after | change |
+| executed instructions (valgrind, C backend / LLVM backend) | before | after | change |
 |---|---:|---:|---:|
-| bytesstr | 507,236,700 | 208,392,640 | -58.9 % |
-| http_parse | 1,537,905,177 | 1,514,322,528 | -1.5 % |
+| bytesstr, C | 507,236,033 | 370,922,073 | -26.9 % |
+| bytesstr, LLVM | 506,826,797 | 328,569,037 | -35.2 % |
+| http_parse, C | 1,537,904,468 | 1,535,635,006 | -0.1 % |
+| http_parse, LLVM | 1,489,300,029 | 1,466,340,146 | -1.5 % |
 
-The remaining 208 M of bytesstr are the 8-byte slot traffic (2 x 8 MB per round trip); only packed storage removes it. http_parse
-gains little because its strings are short (the vector loop starts at 16 elements).
+An SSE2 version (16 per iteration) reached bytesstr -58.9 %, but `<emmintrin.h>` is outside the platform boundary
+(`tools/check_platform_boundary.sh`, ADR-0030); GCC's generic vector types (`__builtin_convertvector`) stay inside it but GCC 13
+compiles them worse than the plain loop (bytesstr 444 M, http_parse +5 %). The plain loop is kept; an intrinsics path would need
+its own place in the platform layer. The rest of bytesstr is the 8-byte slot traffic (2 x 8 MB per round trip); only packed
+storage removes it. http_parse gains little because its strings are short.
