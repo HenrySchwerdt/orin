@@ -1,0 +1,104 @@
+import { assertEq, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { frameLsp, frameLine, nextLspFrame, nextLine, parseLength, posOf, uriOf } from "../src/rpc";
+
+@Test
+function lspFramingRoundTrips(): void {
+  const body = "{\"jsonrpc\":\"2.0\",\"id\":1}";
+  const wire = frameLsp(body);
+  assertEqString(wire, "Content-Length: 24\r\n\r\n" + body, "wire format");
+  const f = nextLspFrame(wire, 0);
+  assertEqBool(f.found, true, "complete");
+  assertEqString(f.body, body, "body");
+  assertEqUsize(f.next, wire.length, "consumed everything");
+  assertEqString(f.error, "", "no error");
+}
+
+@Test
+function lspFramesFollowEachOther(): void {
+  const a = "{\"a\":1}";
+  const b = "{\"b\":22}";
+  const wire = frameLsp(a) + frameLsp(b);
+  const f1 = nextLspFrame(wire, 0);
+  assertEqString(f1.body, a, "first");
+  const f2 = nextLspFrame(wire, f1.next);
+  assertEqString(f2.body, b, "second");
+  assertEqUsize(f2.next, wire.length, "end");
+  assertEqBool(nextLspFrame(wire, f2.next).found, false, "nothing after the last frame");
+}
+
+@Test
+function lspIncompleteFramesWait(): void {
+  const wire = frameLsp("{\"a\":1}");
+  let n: usize = 0;
+  while (n < wire.length) {
+    assertEqBool(nextLspFrame(wire.substring(0, n), 0).found, false, "prefix of " + n.toString() + " bytes");
+    n += 1;
+  }
+  assertEqBool(nextLspFrame(wire, 0).found, true, "whole frame");
+}
+
+@Test
+function lspHeaderNameIsCaseInsensitiveAndOtherHeadersAreIgnored(): void {
+  const wire = "content-LENGTH: 2\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\n{}";
+  const f = nextLspFrame(wire, 0);
+  assertEqBool(f.found, true, "found");
+  assertEqString(f.body, "{}", "body");
+  assertEqString(f.error, "", "no error");
+}
+
+@Test
+function lspBareNewlinesEndHeaders(): void {
+  const f = nextLspFrame("Content-Length: 2\n\n{}", 0);
+  assertEqBool(f.found, true, "found");
+  assertEqString(f.body, "{}", "body");
+}
+
+@Test
+function lspFrameWithoutLengthIsAnError(): void {
+  const f = nextLspFrame("Content-Type: x\r\n\r\n{}", 0);
+  assertEqBool(f.found, true, "reported");
+  assertEqBool(f.error.length > 0, true, "error text");
+  const g = nextLspFrame("Content-Length: x\r\n\r\n{}", 0);
+  assertEqBool(g.error.length > 0, true, "not a number");
+}
+
+@Test
+function contentLengthValues(): void {
+  assertEq(parseLength("12"), 12, "plain");
+  assertEq(parseLength(" 7 "), 7, "blanks");
+  assertEq(parseLength("0"), 0, "zero");
+  assertEq(parseLength("-1"), -1, "negative");
+  assertEq(parseLength("1x"), -1, "garbage");
+  assertEq(parseLength(""), -1, "empty");
+}
+
+@Test
+function mcpLines(): void {
+  const wire = frameLine("{\"a\":1}") + frameLine("{\"b\":2}") + "{\"c\"";
+  const l1 = nextLine(wire, 0);
+  assertEqString(l1.body, "{\"a\":1}", "first");
+  const l2 = nextLine(wire, l1.next);
+  assertEqString(l2.body, "{\"b\":2}", "second");
+  assertEqBool(nextLine(wire, l2.next).found, false, "a partial line waits");
+  assertEqString(nextLine("{}\r\n", 0).body, "{}", "CRLF");
+}
+
+@Test
+function positionsAreLineAndColumn(): void {
+  const text = "ab\ncd\nxyz dist(p)\n";
+  const p = posOf(text, "dist(p)", 0, 1);
+  assertEq(p.line, 2, "line");
+  assertEq(p.character, 5, "column of the second letter");
+  const q = posOf(text, "d", 1, 0);
+  assertEq(q.line, 2, "second match is on line 2");
+  assertEq(q.character, 4, "column of the second match");
+  const first = posOf(text, "ab", 0, 0);
+  assertEq(first.line, 0, "first line");
+  assertEq(first.character, 0, "first column");
+  assertEq(posOf(text, "nope", 0, 0).line, -1, "no match");
+}
+
+@Test
+function uris(): void {
+  assertEqString(uriOf("/tmp/x/main.or"), "file:///tmp/x/main.or", "file uri");
+}

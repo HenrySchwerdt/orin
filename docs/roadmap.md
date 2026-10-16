@@ -6,6 +6,8 @@ connect the vision to this plan are in [ADR-0020](decisions/0020-verifiable-soft
 Current status per area is in [progress.md](progress.md). Order matters more than dates. Each step
 ships with tests and docs and passes the full CI, including the bootstrap.
 
+Path to 1.0 (milestones, gaps, owner decisions): [roadmaps/orin-1.0.md](roadmaps/orin-1.0.md).
+
 ## Backbone
 
 **Order** (project owner, 2026-10-13). The numbered sections below give the details.
