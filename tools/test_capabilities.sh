@@ -46,7 +46,7 @@ backends=c
 if command -v clang >/dev/null 2>&1; then backends="c llvm"; CC=clang; fi
 
 for b in $backends; do
-  for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now net_listen; do build $b $n; done
+  for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now clock_monotonic net_listen; do build $b $n; done
 
   # 1. control run: everything works (stdin is the file itself: readLine finds a line)
   expect $b all_ok "" 0 "fs true" ""
@@ -78,6 +78,9 @@ for b in $backends; do
   expect $b stdio_read stdio 101 "before" "trap: capability denied: stdio readLine"
   expect $b clock_now clock 101 "before" "trap: capability denied: clock nowMillis"
   expect $b clock_now all 101 "before" "trap: capability denied: clock nowMillis"
+  expect $b clock_monotonic "" 0 "true" ""
+  expect $b clock_monotonic clock 101 "" "trap: capability denied: clock monotonicMillis"
+  expect $b clock_monotonic all 101 "" "trap: capability denied: clock monotonicMillis"
 
   # network (ADR-0033): ORIN_DENY=net refuses listen / connect / resolve with an Err (no trap), other families are unaffected
   expect $b net_listen "" 0 "listen: ok" ""
@@ -112,7 +115,8 @@ has process_args Process.Args
 has process_shell Process.Spawn
 has stdio_read Stdio.Read
 has clock_now Clock.Now
-for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now; do
+has clock_monotonic Clock.Now
+for n in all_ok fs_open fs_exists process_args process_shell stdio_read clock_now clock_monotonic; do
   has $n Host.Acquire
   $ORIN2 effects tests/next/deny/$n.or --check-purity >/dev/null || fail "effects of $n disagree with the purity analysis"
 done

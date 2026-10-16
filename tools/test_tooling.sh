@@ -60,6 +60,7 @@ mkdir -p build
   echo '$ORIN2 test compiler/tests/tooling_test.or --runtime runtime'
   echo "first: sh tools/test_resources.sh"
   echo "first: sh tools/test_capabilities.sh"
+  echo 'python3 tools/test_time.py --orinc "$ORIN2"'
   echo "first: sh tools/test_net.sh"
 } | python3 tools/parallel.py $JOBS
 # Guard: every compiler unit test file must be run by some test script or CI step (an unwired test

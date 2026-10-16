@@ -31,6 +31,7 @@ void orinl_io_write_stdout(int64_t g, OrinObj *s) { orin_io_write_stdout(g, s); 
 int64_t orinl_io_shell(int64_t g, OrinObj *cmd) { return orin_io_shell(g, cmd); }
 int64_t orinl_io_shell_timeout(int64_t g, OrinObj *cmd, int64_t seconds) { return orin_io_shell_timeout(g, cmd, seconds); }
 int64_t orinl_time_now_millis(int64_t g) { return orin_time_now_millis(g); }
+OrinObj *orinl_time_monotonic_millis(int64_t g) { return orin_time_monotonic_millis(g); }
 int64_t orinl_str_char_code_at(OrinObj *s, uint64_t i) { return orin_str_char_code_at(s, i); }
 
 /*
