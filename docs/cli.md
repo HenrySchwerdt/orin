@@ -37,6 +37,8 @@ orin fmt --check
 orin test --filter greeting
 orin test --watch
 orin build --release
+orin expand src/main.or           # print the generated companion modules (ADR-0046)
+orin expand --input src/main.or   # print the std:meta Input of every processor run
 orin build --backend=llvm
 ```
 

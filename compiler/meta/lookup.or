@@ -1,0 +1,194 @@
+// Declaration lookup over the syntax trees of a loaded program (ADR-0046 S4): which declaration a name denotes as seen
+// from a unit, and how a unit is called in the `std:meta` model. Purely syntactic (no checker): the expansion pipeline
+// runs on a program whose sub-program the checker has already accepted.
+import { Span } from "../diag";
+import { Ident, Item, Annotation } from "../syntax";
+import { LoadedProgram, ImportUnit, ImportStd } from "../loader";
+
+// A declaration found by name: the unit that declares it and the item.
+export type Res = { unit: usize; item: Item; };
+
+// The name of a declaration item, "" for an import or re-export.
+export function declName(it: Item): string {
+  return match (it) {
+    IFunction(f) => f.name.name,
+    IType(t) => t.name.name,
+    IConst(k) => k.name.name,
+    IClass(c) => c.name.name,
+    IInterface(i) => i.name.name,
+    _ => "",
+  };
+}
+
+export function declExported(it: Item): bool {
+  return match (it) {
+    IFunction(f) => f.exported,
+    IType(t) => t.exported,
+    IConst(k) => k.exported,
+    IClass(c) => c.exported,
+    IInterface(i) => i.exported,
+    _ => false,
+  };
+}
+
+function hasName(ids: Ident[], name: string): bool {
+  for (const i of ids) {
+    if (i.name == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The exported declaration `name` of unit `ui`, following re-exports.
+export function lookupExported(prog: LoadedProgram, ui: usize, name: string, depth: usize): Option<Res> {
+  if (depth > prog.units.length) {
+    return None;
+  }
+  const u = prog.units[ui];
+  for (const it of u.ast.items) {
+    if (declName(it) == name && declExported(it)) {
+      return Some(Res { unit: ui, item: it });
+    }
+  }
+  let k: usize = 0;
+  for (const it of u.ast.items) {
+    match (it) {
+      IImport(_) => {
+        k += 1;
+      },
+      IReExport(d) => {
+        if (hasName(d.names, name) && k < u.imports.length) {
+          match (u.imports[k]) {
+            ImportUnit(j) => {
+              return lookupExported(prog, j, name, depth + 1);
+            },
+            ImportStd(_) => {
+              return None;
+            },
+          }
+        }
+        k += 1;
+      },
+      _ => {},
+    }
+  }
+  return None;
+}
+
+// The declaration `name` as seen from unit `ui`: declared there, or imported.
+export function lookupDecl(prog: LoadedProgram, ui: usize, name: string): Option<Res> {
+  const u = prog.units[ui];
+  for (const it of u.ast.items) {
+    if (declName(it) == name) {
+      return Some(Res { unit: ui, item: it });
+    }
+  }
+  let k: usize = 0;
+  for (const it of u.ast.items) {
+    match (it) {
+      IImport(d) => {
+        if (hasName(d.names, name) && k < u.imports.length) {
+          match (u.imports[k]) {
+            ImportUnit(j) => {
+              return lookupExported(prog, j, name, 0);
+            },
+            ImportStd(_) => {
+              return None;
+            },
+          }
+        }
+        k += 1;
+      },
+      IReExport(_) => {
+        k += 1;
+      },
+      _ => {},
+    }
+  }
+  return None;
+}
+
+// How the model names unit `ui` (`MAnnotation.source`, `MTypeShape.source`, `Input.modulePath`): `std:json` for the
+// embedded standard library, `./<name>` (relative to the entry file's directory) for everything else.
+export function moduleLabel(prog: LoadedProgram, ui: usize): string {
+  const n = prog.units[ui].name;
+  if (n.startsWith("$stdlib/")) {
+    return "std:" + n.substring(8, n.length);
+  }
+  if (n == "$array/math") {
+    return "std:math";
+  }
+  if (n.startsWith("$")) {
+    return n;
+  }
+  return "./" + n;
+}
+
+// True for a unit the user wrote: not a prelude / library unit, not a companion.
+export function isUserUnit(prog: LoadedProgram, ui: usize): bool {
+  const u = prog.units[ui];
+  return !u.name.startsWith("$") && !u.path.endsWith(".gen");
+}
+
+// The annotations written on the members of a declaration: fields of records and classes, methods of classes and
+// interfaces. (Constructors carry none.)
+export function memberAnnotations(it: Item): Annotation[] {
+  let out: Annotation[] = [];
+  match (it) {
+    IType(t) => {
+      match (t.body) {
+        DRecord(fs) => {
+          for (const f of fs) {
+            out = out.concat(f.annotations);
+          }
+        },
+        _ => {},
+      }
+    },
+    IClass(c) => {
+      for (const m of c.members) {
+        match (m) {
+          MField(f) => {
+            out = out.concat(f.annotations);
+          },
+          MMethod(md) => {
+            out = out.concat(md.annotations);
+          },
+          MCtor(_) => {},
+        }
+      }
+    },
+    IInterface(i) => {
+      for (const m of i.methods) {
+        out = out.concat(m.annotations);
+      }
+    },
+    _ => {},
+  }
+  return out;
+}
+
+// The annotations written on the declaration itself.
+export function ownAnnotations(it: Item): Annotation[] {
+  return match (it) {
+    IFunction(f) => f.annotations,
+    IType(t) => t.annotations,
+    IConst(k) => k.annotations,
+    IClass(c) => c.annotations,
+    IInterface(i) => i.annotations,
+    _ => [],
+  };
+}
+
+// The span of the name of a declaration item.
+export function declNameSpan(it: Item): Option<Span> {
+  return match (it) {
+    IFunction(f) => Some(f.name.span),
+    IType(t) => Some(t.name.span),
+    IConst(k) => Some(k.name.span),
+    IClass(c) => Some(c.name.span),
+    IInterface(i) => Some(i.name.span),
+    _ => None,
+  };
+}

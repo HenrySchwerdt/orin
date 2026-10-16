@@ -67,6 +67,7 @@ mkdir -p build
   # tooling unit tests (3e): JSON cursor / round trip, workspace, positions, index queries, LSP and MCP reply rule,
   # MCP session, formatter layout and comment preservation
   echo '$ORIN2 test compiler/tests/tooling_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/expand_test.or --runtime runtime/core'
   echo "first: sh tools/test_resources.sh"
   echo "first: sh tools/test_capabilities.sh"
   echo 'python3 tools/test_time.py --orinc "$ORIN2"'
