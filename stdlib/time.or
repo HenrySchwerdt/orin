@@ -1,20 +1,21 @@
 // std:time -- wall clock, durations with explicit units and UTC calendar conversion (spec 08).
 //
-// The only runtime primitive is `nowMillis` (builtin `std:clock`, runtime function
-// orin_time_now_millis); everything else is pure Orin. All quantities are `int` milliseconds
+// Runtime reads are `nowMillis` and the fallible monotonic clock (`std:clock`); arithmetic
+// and calendar helpers are pure Orin. All quantities are `int` milliseconds
 // unless the name says otherwise ("explicit units": there is no unit-less number in this API).
 //   * Calendar functions use the proleptic Gregorian calendar in UTC; there are no time zones,
-//     no leap seconds. Instants are milliseconds since 1970-01-01T00:00:00Z (negative before).
+//     no leap seconds. Wall-clock instants are milliseconds since 1970-01-01T00:00:00Z (negative before).
 //   * Arithmetic on ints traps on overflow like everywhere in Orin; values here stay far from
 //     the limits for any date in years -292000000 .. 292000000.
 //
-// TODO(after floats/map): fractional seconds (`seconds(1.5)`), `sleep` (needs a second runtime
-// primitive), time zones / locale formatting.
+// TODO: fractional seconds (`seconds(1.5)`), `sleep` (needs a new L0 primitive; not implemented),
+// time zones / locale formatting.
 
 // nowMillis(clock: ClockGrant): int
 // Wall-clock time in milliseconds since the Unix epoch (CLOCK_REALTIME). Not monotonic: the system
 // clock may jump. Needs the clock grant (ADR-0027: `useClock(host, clock => ...)` of std:host). Cannot fail. O(1), no allocation.
 export { nowMillis, ClockGrant } from "std:clock";
+import { monotonicMillis, ClockGrant } from "std:clock";
 
 // A span of time in whole milliseconds (may be negative: a difference of two instants).
 export type Duration = { millis: int; };
@@ -212,4 +213,98 @@ export function formatIso(instant: int): string {
   const ys = t.year < 0 ? "-" + pad(0 - t.year, 4) : pad(t.year, 4);
   return ys + "-" + pad(t.month, 2) + "-" + pad(t.day, 2) + "T" + pad(t.hour, 2) + ":"
     + pad(t.minute, 2) + ":" + pad(t.second, 2) + "." + pad(t.millisecond, 3) + "Z";
+}
+
+// ---- monotonic clock and pure deadline arithmetic (UNSTABLE, ADR-0027) ----------------------
+// Separate record types prevent accidental use of wall-clock ints in deadline helpers. Explicitly
+// constructed records must have nonnegative millis; helpers return errors for invalid records.
+// Values are process-local observations, not Unix times or persistable/cross-boot timestamps.
+export type MonotonicInstant = { millis: int; };
+export type Deadline = { at: MonotonicInstant; };
+export type TimeErrorKind =
+  ClockUnavailable
+  | InvalidInstant
+  | NegativeDuration
+  | TimeOverflow
+  | ReversedInstants;
+export type TimeError = { kind: TimeErrorKind; };
+
+// monotonicNow(clock): a fallible monotonic millisecond observation. Clock grant required; denied,
+// wrong-family or revoked grants trap like nowMillis. Clock failures return Err(ClockUnavailable).
+// O(1) time and allocation; no wall-clock fallback, sleep or scheduler semantics.
+@Ensures(result.isOk() ==> result.unwrap().millis >= 0)
+export function monotonicNow(clock: ClockGrant): Result<MonotonicInstant, TimeError> {
+  const now = monotonicMillis(clock);
+  if (now.isNone()) {
+    return Err(TimeError { kind: ClockUnavailable });
+  }
+  return Ok(MonotonicInstant { millis: now.unwrap() });
+}
+
+// elapsed(start, end): end - start as a Duration. Err on a negative record or reversed observations.
+// Nonnegative ordered i64 timestamps cannot overflow on subtraction. Pure; O(1) time/allocation.
+@Ensures(result.isOk() ==> result.unwrap().millis >= 0)
+export function elapsed(
+  start: MonotonicInstant,
+  end: MonotonicInstant,
+): Result<Duration, TimeError> {
+  if (start.millis < 0 || end.millis < 0) {
+    return Err(TimeError { kind: InvalidInstant });
+  }
+  if (end.millis < start.millis) {
+    return Err(TimeError { kind: ReversedInstants });
+  }
+  return Ok(Duration { millis: end.millis - start.millis });
+}
+
+// deadlineAfter(start, delay): start + delay. Zero expires at start; negative delays and overflowing
+// additions are errors, not traps. Validate before arithmetic. Pure; O(1) time/allocation.
+@Ensures(result.isOk() ==> result.unwrap().at.millis >= start.millis)
+export function deadlineAfter(
+  start: MonotonicInstant,
+  delay: Duration,
+): Result<Deadline, TimeError> {
+  if (start.millis < 0) {
+    return Err(TimeError { kind: InvalidInstant });
+  }
+  if (delay.millis < 0) {
+    return Err(TimeError { kind: NegativeDuration });
+  }
+  if (delay.millis > 9223372036854775807 - start.millis) {
+    return Err(TimeError { kind: TimeOverflow });
+  }
+  return Ok(Deadline { at: MonotonicInstant { millis: start.millis + delay.millis } });
+}
+
+// remaining(deadline, now): max(deadline - now, 0); equality is expired. Err on negative records.
+// The comparison precedes subtraction, so expired deadlines cannot underflow. Pure; O(1) time/allocation.
+@Ensures(result.isOk() ==> result.unwrap().millis >= 0)
+export function remaining(deadline: Deadline, now: MonotonicInstant): Result<Duration, TimeError> {
+  if (deadline.at.millis < 0 || now.millis < 0) {
+    return Err(TimeError { kind: InvalidInstant });
+  }
+  if (now.millis >= deadline.at.millis) {
+    return Ok(Duration { millis: 0 });
+  }
+  return Ok(Duration { millis: deadline.at.millis - now.millis });
+}
+
+// isExpired(deadline, now): now >= deadline; Err on negative records. Pure; O(1) time/allocation.
+export function isExpired(deadline: Deadline, now: MonotonicInstant): Result<bool, TimeError> {
+  if (deadline.at.millis < 0 || now.millis < 0) {
+    return Err(TimeError { kind: InvalidInstant });
+  }
+  return Ok(now.millis >= deadline.at.millis);
+}
+
+// timeErrorMessage(error): stable nonempty explanation. O(1), returns constant string storage.
+@Ensures(result.length > 0)
+export function timeErrorMessage(error: TimeError): string {
+  return match (error.kind) {
+    ClockUnavailable => "monotonic clock unavailable",
+    InvalidInstant => "monotonic milliseconds must be nonnegative",
+    NegativeDuration => "deadline delay must be nonnegative",
+    TimeOverflow => "monotonic deadline overflow",
+    ReversedInstants => "monotonic observations are reversed",
+  };
 }

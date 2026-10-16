@@ -79,6 +79,8 @@ MUTANTS = [
     ("member-lowercase-accepted", "syntax/parser.or", "        if (id.name.charCodeAt(0) < 65 || id.name.charCodeAt(0) > 90) {",
      "        if (false) {"),
     ("member-receiver-param-counted", "check/expr.or", "ps.slice(1, ps.length)", "ps"),
+    ("member-static-class-ignored", "check/expr.or", "    const sc = this.oxStaticClass(recv);",
+     "    const sc: Option<usize> = None;"),
 ]
 
 

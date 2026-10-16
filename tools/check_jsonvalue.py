@@ -185,11 +185,14 @@ def expected_source(n, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orinc", default="build/bootstrap/orin2")
+    parser.add_argument("--skip-bench", action="store_true", help="run vectors/oracles and backend checks only")
     opts = parser.parse_args()
     orinc = (ROOT / opts.orinc).resolve()
     OUT.mkdir(parents=True, exist_ok=True)
     tests = (ROOT / "tests/std/jsonvalue_test.or").read_text()
     names = re.findall(r"@Test\s+function (\w+)\(", tests)
+    if not names:
+        raise RuntimeError("no jsonvalue tests discovered")
     entries = oracle_cases()
     oracle = OUT / "oracle.or"
     oracle.write_text(tests.replace("@Test", "") + '''
@@ -216,6 +219,8 @@ function main(): void {
         assert run([binary], env) == "jsonvalue oracle passed\n"
         print(f"PASS {len(entries)} independent tree/token vectors + {len(names)} test groups: "
               f"{backend} contracts={contracts} sanitizers={sanitize}", flush=True)
+    if opts.skip_bench:
+        return
     source = OUT / "benchmark.or"
     source.write_text(BENCHMARK)
     binaries = {b: build(orinc, source, b) for b in ["c", "llvm"]}

@@ -481,7 +481,8 @@ typedef struct {
     orin_platform_scope sc[2];        /* grant: what it may listen on / connect to */
 } orin_platform_net;
 
-/*@ ensures \result is a monotonic clock in milliseconds (arbitrary origin, never decreases);
+/*@ ensures \result == -1 on clock failure, invalid timespec or millisecond overflow;
+    ensures \result >= 0 on success: monotonic milliseconds, arbitrary origin, never decreases between successful reads;
     assigns \nothing; */
 int64_t orin_platform_monotonic_millis(void);
 

@@ -12,7 +12,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
 | `std:path` | Orin, `stdlib/path.or` | done (POSIX, lexical) |
 | `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
-| `std:time` | Orin, `stdlib/time.or` + one built-in (`nowMillis`) | clock, durations, UTC calendar; no `sleep`; `nowMillis(clock: ClockGrant)` **unstable** (ADR-0027) |
+| `std:time` | Orin, `stdlib/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
 | `std:graph` | Orin, `stdlib/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:bytes` | Orin, `stdlib/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
 | `std:url` | Orin, `stdlib/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit plus mode and structured byte offsets; [API and policies](std-url.md) |
@@ -43,9 +43,9 @@ imported modules disappear in `compiler/opt/prune.or`. The sources use the full 
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the
 unit (`$stdlib/json.Json`).
 
-The single new built-in is `nowMillis(clock: ClockGrant): int` (`hir.BTimeNowMillis`, C function
+The wall-clock built-in is `nowMillis(clock: ClockGrant): int` (`hir.BTimeNowMillis`, C function
 `orin_time_now_millis` in `runtime/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
-It is reachable as the internal module `std:clock`; `std:time` re-exports it. Use `std:time`.
+It is reachable through the internal module `std:clock`; `std:time` re-exports it. The internal monotonic read returns `Option<int>` and is wrapped by the fallible public `monotonicNow`. Use `std:time`.
 
 ## std:host and capability grants (UNSTABLE until the I/O freeze, ADR-0021 Stage A, ADR-0027)
 
@@ -147,6 +147,8 @@ U+FFFD); raw control characters in strings are errors; duplicate keys are kept a
 `parse(stringify(j))` round-trips. Codegen-based `parse<T>` is post-1.0 (ADR-0016).
 
 ## std:time
+
+[Monotonic observations and checked deadline helpers](std-time-monotonic.md) are separate from the wall-clock API below. Sleep remains deferred.
 
 `nowMillis(clock: ClockGrant): int` (wall clock, ms since the Unix epoch, not monotonic; the grant comes from `useClock` / `useHost` of `std:host`). Durations are explicit-unit
 records `Duration { millis }`: `milliseconds/seconds/minutes/hours/days(n)`, `toMillis`, `toSeconds`,

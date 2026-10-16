@@ -6,6 +6,10 @@
   of an array built by `arraynew` in the same function; the optimiser pass `opt/bounds.or` emits them where the verifier agrees.
   nbody -53.1 % executed instructions, the other benchmarks unchanged, self-compile +0.37 %. Array length stays outside the Lean model
   (docs/tcb.md). New mutation classes `range-*`, regression programs `tests/next/run/bce_range_*`.
+- **LLVM fixed point (ADR-0038 section 8, gate 2).** New `tools/llvm_fixpoint.sh` (run in the CI `llvm` job): `orin2` compiles
+  `compiler/main.or` with `--backend=llvm`, clang links `orin2-llvm`, and `orin2-llvm` reproduces both the C (`== stage2.c`,
+  11,055,024 bytes) and the LLVM IR (45,279,878 bytes) byte for byte; `--deep` adds a third stage. No differences were found,
+  so no backend or runtime change. LLVM is still not the release default (gate 3, the pinned toolchain, is open).
 - **bench/url prints no wall-clock time.** The benchmark printed `ms=<elapsed>` next to its checksum, so every run differed from the
   previous one (also C against C) and `tools/bench.py` reported "CHECKSUM MISMATCH in url (llvm)". This was not an LLVM miscompile:
   output of the C and LLVM binaries is identical apart from the timing field. The benchmark now prints only deterministic values
@@ -35,6 +39,11 @@
   `IArraySet` of an `int`, `usize`, `bool`, `float` or handle store directly; the hot `orin_stats` counters are compiled in only
   with `-DORIN_STATS_ENABLED` (implied by `-DORIN_SITE_STATS`; `tools/bench.py` builds a separate counting binary). nbody -21%,
   mutres -17.6% executed instructions.
+- **OX member tags on a class name (ADR-0044 §4.5).** `<Ui.Card title="x">..</Ui.Card>`, where `Ui` names a class and no value,
+  calls the static method `Ui.Card` with the component rules (attributes by parameter name, slots, `Option` parameters, spread,
+  source-order evaluation), for local, imported and generic classes. An instance method there is E0491, a private static
+  method outside its class E0405. Member tags on a module are not added: orin has no module values (`import * as m` is E0200),
+  so a module's component is imported by name and written `<Card>`.
 - **OX roots are built in a pre-sized buffer (ADR-0044).** A markup root with a dynamic piece starts from `str.withCapacity(static bytes + 16 per dynamic piece)` (new builtin, runtime `orin_str_with_capacity`), so the pieces are appended in place without regrowth. `bench/html`: `string_grows` 4.23 M -> 0.25 M, executed instructions 3.99 G -> 3.10 G.
 - **Verifier and optimiser without per-block allocations (ADR-0038 lever 1).** The ownership verifier's fixpoint joins
   out-states into the successors in place and replays every block with one reusable `Transfer`; the optimiser's analyses use
