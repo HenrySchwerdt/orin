@@ -73,6 +73,12 @@ spec 07: *safe Orin* (language guarantees, MIR-verified), *tested only*, *truste
 | `orin_array_join` | L2 | moved: `strJoin` (grows the result by repeated in-place append instead of a pre-sized buffer); C copy kept |
 | `orin_parse_int` | L2 | moved: `library/core/numbers.or` `strParseInt` (overflow checks done by hand; same accepted syntax); C copy kept |
 | `orin_int_to_string`, `orin_usize_to_string`, `orin_bool_to_string` | L2 | moved: `intToString`, `usizeToString`, `boolToString` (no `snprintf`); C copies kept |
+| `orin_parse_int_k` (`parseI8` .. `parseUsize`) | L2 | **R3b:** moved: `strParseIntK` (`library/core/numbers.or`; returns `Option<usize>` holding the kind's 64-bit pattern, signed kinds computed modulo 2^64); C copy kept for `--c-builtins` only |
+| `orin_float_to_string`, `orin_f32_to_string`, `orin_parse_float` | L2 | **R3b: stay in C.** Shortest round-trip printing and correctly rounded parsing need `orin_platform_double_to_exp` / `parse_double` (L0, `printf`/`strtod`); R3a has no core operation for them and L0 is not touched by R3b. They become portable only with an Orin shortest-digits algorithm (Ryu/Grisu class) plus a correctly rounded decimal parser, or a new L0 entry exposed as a core operation (needs an ADR-0052 amendment) |
+| `orin_float_to_int` | L1 intrinsic | **R3b: stays in C.** It is the float-to-int conversion itself (the cast and its `float to int out of range` trap); Orin has no other way to truncate a float |
+| `orin_str_prepend`, `orin_str_append_int`, `orin_str_append_usize`, `orin_str_append_sub` | L1 | **R3b: stay in C.** In-place string growth under `rc == 1` and the sharing rule are the object model (R3d); the compiler fuses `s += x.toString()` into them |
+| `orin_array_slice`, `orin_array_concat`, `orin_array_extend` | L1 | **R3b: stay in C.** They copy element slots and retain reference elements by the array's `is_ref` flag (object model); the generic prelude would need per-element-type instances, and ADR-0038 packed arrays rewrite them |
+| `orin_bytes_to_string`, `orin_string_to_bytes` | L1 | **R3b: untouched** (perf thread, PR #142) |
 | `orin_str_char_code_at` | L1 primitive | stays in C; now `static inline` in the header (the prelude loops over it) |
 | `orin_str_char_at`, `orin_str_substring`, `orin_string_from_char_code` | L1 primitive | stay in C: allocation, bounds traps, shared 1-byte immortals |
 | `orin_str_new`, `orin_str_concat`, `orin_str_append`, `orin_str_eq`, `orin_str_len`, `orin_str_data` | L1 | stay in C until R3 (object model, allocation, in-place append) |
@@ -106,6 +112,37 @@ separator is raised through `process.exit(101)` after printing the same message.
   access) restricted to `core` modules; reimplement the object model (retain/release/make_unique,
   allocation, arrays, strings) in Orin; the C object model is deleted. Stage 0 keeps its own C
   runtime (frozen) or links the generated C of L1.
+  - **R3a core operations (done, ADR-0052).** The first piece of the core dialect: ONE builtin family
+    `BCore(k)` (table and doc in `compiler/hir/coreops.or`, same pattern as the task primitives `BTask`),
+    exported by the internal module `std:fsraw`. An address is a plain `usize`; there is no new type and no
+    operation that turns an address back into a reference. Library code only (user code gets E0301); the gate
+    narrows to runtime modules with the first R3 module. All operations are impure for contracts and effects
+    (loads read mutable memory). Both backends emit the same behaviour: loads and stores are native-endian and
+    unaligned-safe (C: `__builtin_memcpy` of a constant size, LLVM: `align 1`); the memory operations are
+    the L0 functions in C and libc malloc/free plus the LLVM intrinsics in LLVM. Self-test: `std:coreprobe`
+    (`library/std/coreprobe.or`, `tests/run/core_ops.or`, compared on both backends).
+
+    | operation | meaning |
+    |---|---|
+    | `load8/load32/load64(addr) -> usize` | zero-extended load of 1/4/8 bytes |
+    | `loadF64(addr) -> float` | 8-byte IEEE load |
+    | `store8/store32/store64(addr, v: usize)` | store of the low 8/32/64 bits |
+    | `storeF64(addr, v: float)` | 8-byte IEEE store |
+    | `memAlloc(n) -> usize` | `orin_platform_alloc` (never 0; `n = 0` gives one byte) |
+    | `memFree(addr)` | `orin_platform_free` |
+    | `memCopy(dst, src, n)` | `orin_platform_mem_copy` (no overlap) |
+    | `memSet(dst, byte, n)` | `orin_platform_mem_set` (low 8 bits of `byte`) |
+    | `addrOf(x) -> usize` | object address of a string, array or record; read-only, the reference count is unchanged |
+  - **R3b strings and numbers (partly done).** `parseI8` .. `parseUsize` moved (`strParseIntK`, one more slot in
+    `compiler/lower/prelude.or`). The rest of the inventory above stays in C for the stated reasons; no core operation
+    was needed (the port is plain safe Orin). **What still needs the C copies of the R1/R3b functions** (none is
+    referenced by code generated in the default path, and none is deleted): (1) `--c-builtins`
+    (`tools/differential.sh --mode builtins`, `BStr*`/`BParseInt*`/`BIntToString`/... fall back to the `orin_*` calls in
+    `compiler/backends/c/function.or` and `compiler/backends/llvm/function.or`; `compiler/backends/llvm/runtime.or` declares them); (2) the
+    frozen seed `bootstrap/seed/orin-seed.c.gz` is the compiler program compiled WITH the prelude, so the seed program itself
+    does not call them (they appear there only as strings of the emitter tables), but it links the same
+    `runtime/core/orin_runtime.c` and its `--c-builtins` mode needs them. Deleting them means deleting `--c-builtins`
+    and the builtins differential mode; that is the R3f step, not R3b.
 - **R4 — proofs:** L0 contracts verified with a C verification tool; L1 refinement proofs against
   the Lean machine; update the safety-status table.
 
