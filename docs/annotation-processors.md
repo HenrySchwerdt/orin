@@ -1,6 +1,6 @@
 # Annotation processors, companion modules and `orin expand` (ADR-0046 S4, S5)
 
-Status: processors run (S5). `std:json`'s own processor and the route-table example follow in S6.
+Status: processors run (S5). Two complete examples (S6): `examples/json-codec` (`@Json` / `@JsonName` codecs) and `examples/routes` (`@Route` table), both ordinary packages, not part of `std`.
 
 ## Writing a processor
 
@@ -132,5 +132,4 @@ deterministic (a processor is a pure function of its input).
 
 LSP, MCP, `orin test`, `orin graph`, `orin effects` do not expand (a `.gen` import is E0300 there). A processor has no memory limit
 (deadline and output cap only). Generated code cannot use anonymous unions or bit operators. Contract text in snapshots is
-whitespace-collapsed source. A processor module that itself depends on a companion cannot be verified and is E0448. The processors
-of `std` (`@Json`) arrive with S6.
+whitespace-collapsed source. A processor module that itself depends on a companion cannot be verified and is E0448. A companion module cannot import another companion module (E0520), so generated code that needs another module's generated code is not possible; there is no `@Json` in `std` (it is the example `examples/json-codec`).

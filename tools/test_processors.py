@@ -12,6 +12,8 @@ Usage: python3 tools/test_processors.py [--orinc build/bootstrap/orin2] [--cc cc
   build with another input reuses the helper (`--verbose` reports it, and the helper file is not touched).
 * `orin check` without a C compiler: W0490 and the companion stays empty; with a warm cache the compiler is not needed.
 * The recorded-output sidecar (S4 test hook) wins over a processor.
+* Examples (S6): `examples/json-codec` (`@Json` codecs) and `examples/routes` (`@Route` table) expand to a golden and print
+  the same output on C and LLVM; `tests/processors/json_bad` has the processor diagnostics for unsupported field types.
 * Trust: a processor of a dependency runs only when `[annotations] processors` lists the dependency or its module.
 """
 import argparse
@@ -189,6 +191,37 @@ def main():
         run([a.cc, "-O1", "-w", "-I", "runtime/core", dc] + rt + ["-lm", "-o", dexe])
         rc, so, se = run([dexe])
         check("dependency processor listed (%s): runs" % d, rc == 0 and so == "generated for Thing\n", so + se)
+
+    # --- example packages: @Json codecs and a route table (ADR-0046 S6; examples/, not std) -------------------
+    for label, d in (("json-codec", "examples/json-codec/app"), ("routes", "examples/routes")):
+        full = os.path.join(ROOT, d)
+        rc, so, se = run([orin, "expand", d, "--processor-cache", cache])
+        check(label + ": orin expand matches the golden", rc == 0 and so == read(os.path.join(full, "expected.expand.txt")), se + so[:400])
+        want = read(os.path.join(full, "expected.out"))
+        cf = os.path.join(out, label + ".c")
+        rc, so, se = run([orin, "compile", d, "-o", cf, "--processor-cache", cache])
+        check(label + ": compiles (C)", rc == 0, se)
+        cexe = os.path.join(out, label + "_c")
+        rc, so, se = run([a.cc, "-O1", "-w", "-I", "runtime/core", cf] + rt + ["-lm", "-o", cexe])
+        rc, so, se2 = run([cexe])
+        check(label + ": runs (C) with the expected output", rc == 0 and so == want, so + se2)
+        if shutil.which(a.clang):
+            lf = os.path.join(out, label + ".ll")
+            rc, so, se = run([orin, "compile", d, "-o", lf, "--backend=llvm", "--processor-cache", cache])
+            check(label + ": compiles (llvm)", rc == 0, se)
+            lexe = os.path.join(out, label + "_llvm")
+            run([a.clang, "-O2", "-w", "-I", "runtime/core", lf] + rt + ["runtime/core/orin_runtime_llvm.c", "-lm", "-o", lexe])
+            rc, so, se2 = run([lexe])
+            check(label + ": runs (LLVM), same output as C", rc == 0 and so == want, so + se2)
+    rc, so, se = run([orin, "check", "tests/processors/json_bad", "--processor-cache", cache])
+    for frag in (
+        "models.or:10:3: error[E0522]: @Json cannot encode field `ratio` of `Shape`: `float` is not supported: std:json has integers only",
+        "models.or:11:3: error[E0522]: @Json cannot encode field `color` of `Shape`: the type `Color` is not supported",
+        "models.or:12:3: error[E0522]: @Json cannot encode field `inner` of `Shape`: the record `Plain` needs @Json for its codecs",
+        "models.or:13:3: error[E0522]: @Json cannot encode field `maybe` of `Shape`: Option<Option<...>> is not supported",
+        "error[E0522]: @Json: the JSON key \"id\" is used twice in `Shape`",
+    ):
+        check("json-codec: diagnostic " + frag[frag.index("E0522"):][:60], rc == 1 and frag in se, se)
 
     print("\n%d passed, %d failed" % (passed, len(failures)))
     if failures:

@@ -44,7 +44,7 @@
 - Companion modules (`./m.gen`, ADR-0046 S4) are filled by processors (S5): `check`, `compile`, `expand` run them through a helper
   executable, which needs a C compiler (without one `orin check` only reports W0490 and uses cached outputs). LSP, MCP, `orin test`,
   `orin graph` and `orin effects` do not expand a `.gen` import (E0300); a processor has a deadline and output limits but no memory
-  limit; two compilers on one `.orin/processors` cache at once are unsupported; see docs/annotation-processors.md.
+  limit; no OSIG `GENERATED_BY` edges; two compilers on one `.orin/processors` cache at once are unsupported; a companion cannot import another companion (one round of expansion). `@Json` is the example package `examples/json-codec` (integers only, no cross-module nesting), not part of `std`; see docs/annotation-processors.md.
 - Built-in annotations (ADR-0024, self-hosted compiler only): `@Test`, `@Deprecated`, `@Inline` and
   `@Sealed` (record construction/update restriction outside the declaring module, ADR-0044) exist;
   user-defined annotations (ADR-0046 S1) are metadata only: records marked `@Annotation(targets..)`, constant
