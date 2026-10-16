@@ -39,8 +39,8 @@ def build_driver(orinc, out_dir):
     c = os.path.join(out_dir, "verify_text.c")
     exe = os.path.join(out_dir, "verify_text")
     subprocess.run([orinc, "compile", "compiler/tests/verify_text.or", "-o", c], cwd=ROOT, check=True)
-    subprocess.run(["cc", "-O1", "-w", "-I", "runtime", c, "runtime/orin_runtime.c",
-                    "platform/orin_platform.c", "-lm", "-o", exe], cwd=ROOT, check=True)
+    subprocess.run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c",
+                    "runtime/platform/orin_platform.c", "-lm", "-o", exe], cwd=ROOT, check=True)
     return exe
 
 

@@ -7,36 +7,36 @@ API table (`compiler/mcp/apitable.or`).
 
 | Module | Implemented in | Status |
 |---|---|---|
-| `std:host` | Orin, `stdlib/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
-| `std:fs` | Orin, `stdlib/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
-| `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
-| `std:path` | Orin, `stdlib/path.or` | done (POSIX, lexical) |
-| `std:json` | Orin, `stdlib/json.or` | done, **integers only** |
-| `std:time` | Orin, `stdlib/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
-| `std:graph` | Orin, `stdlib/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
-| `std:bytes` | Orin, `stdlib/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
-| `std:url` | Orin, `stdlib/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit plus mode and structured byte offsets; [API and policies](std-url.md) |
-| `std:utf8` | Orin, `stdlib/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
-| `std:collections` | Orin, `stdlib/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
-| `std:http` | Orin, `stdlib/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
-| `std:net` | Orin, `stdlib/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
-| `std:seq` | Orin, `stdlib/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
-| `std:text` | Orin, `stdlib/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
-| `std:html` | Orin, `stdlib/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
-| `std:ox` | Orin, `stdlib/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
-| `std:taskcore` | Orin, `stdlib/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
-| `std:task` | Orin, `stdlib/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
-| `parallel()` on arrays | Orin prelude (`array/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
-| `std:test` | Orin, `stdlib/test.or` | done (assertions for `@Test`, ADR-0024) |
-| `std:math` | Orin, `array/math.or` (to move to `stdlib/`) | done (ADR-0018) |
-| `Map<K, V>` | Orin prelude (`array/map.or`), built-in type | done (ADR-0018) |
+| `std:host` | Orin, `library/std/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
+| `std:fs` | Orin, `library/std/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
+| `std:process`, `std:io` | C runtime built-ins (`runtime/core/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
+| `std:path` | Orin, `library/std/path.or` | done (POSIX, lexical) |
+| `std:json` | Orin, `library/std/json.or` | done, **integers only** |
+| `std:time` | Orin, `library/std/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
+| `std:graph` | Orin, `library/std/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
+| `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
+| `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit plus mode and structured byte offsets; [API and policies](std-url.md) |
+| `std:utf8` | Orin, `library/std/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
+| `std:collections` | Orin, `library/std/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
+| `std:http` | Orin, `library/std/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
+| `std:net` | Orin, `library/std/net.or` over the network primitives of `std:fsraw` (L0: ADR-0033) | blocking TCP: `Listener`, `Stream` (resources), `connect`, `resolve`, `readExact`, `readUntil`, deadlines, half-close; takes a `NetGrant` first, narrowed by `useListen` / `useConnect`; **unstable** (ADR-0033, below) |
+| `std:seq` | Orin, `library/std/seq.or` | `range(lo, hi)`, `sum(xs)`, `sumBy(xs, f)`: pure aggregates for contracts and code; `orin verify --contracts` reads them as bounded quantifiers and recursive sums (ADR-0036) |
+| `std:text` | Orin, `library/std/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
+| `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
+| `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
+| `std:taskcore` | Orin, `library/std/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
+| `std:task` | Orin, `library/std/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
+| `parallel()` on arrays | Orin prelude (`library/collections/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
+| `std:test` | Orin, `library/std/test.or` | done (assertions for `@Test`, ADR-0024) |
+| `std:math` | Orin, `library/collections/math.or` (to move to `library/std/`) | done (ADR-0018) |
+| `Map<K, V>` | Orin prelude (`library/collections/map.or`), built-in type | done (ADR-0018) |
 
 ## How the Orin-written modules are organised
 
-`stdlib/*.or` is embedded into the compiler like the other preludes (`tools/embed_prelude.py` writes
-`compiler/loader/embedded_stdlib.or`; run it after editing `stdlib/`, `tools/bootstrap.sh` checks it).
+`library/std/*.or` is embedded into the compiler like the other preludes (`tools/embed_prelude.py` writes
+`compiler/loader/embedded_stdlib.or`; run it after editing `library/std/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
-`$stdlib/<name>.or` but, unlike `std/` and `array/`, **not** imported implicitly. The loader maps
+`$stdlib/<name>.or` but, unlike `library/core/` and `library/collections/`, **not** imported implicitly. The loader maps
 `import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
@@ -44,7 +44,7 @@ records, closures); only the compiler itself has to stay Orin-B. Type names in d
 unit (`$stdlib/json.Json`).
 
 The wall-clock built-in is `nowMillis(clock: ClockGrant): int` (`hir.BTimeNowMillis`, C function
-`orin_time_now_millis` in `runtime/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
+`orin_time_now_millis` in `runtime/core/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
 It is reachable through the internal module `std:clock`; `std:time` re-exports it. The internal monotonic read returns `Option<int>` and is wrapped by the fallible public `monotonicNow`. Use `std:time`.
 
 ## std:host and capability grants (UNSTABLE until the I/O freeze, ADR-0021 Stage A, ADR-0027)
@@ -538,7 +538,7 @@ serializer and the round trip for random messages (1000), random chunk sizes and
 
 The parser is a table of 23 explicit states (`stateName`): `METHOD TARGET VERSION CODE REASON START_LF HDR_LINE HDR_NAME
 HDR_OWS HDR_VALUE HDR_LF HEAD_END_LF BODY CHUNK_SIZE CHUNK_BWS CHUNK_EXT CHUNK_SIZE_LF CHUNK_DATA CHUNK_CR CHUNK_LF
-BODY_CLOSE DONE ERROR` (the diagram is at the top of `stdlib/http.or`). The transition relation is the function
+BODY_CLOSE DONE ERROR` (the diagram is at the top of `library/std/http.or`). The transition relation is the function
 `edgeAllowed(src, dst)`; every state change goes through one private method that `@Requires` the edge, so a checked
 build traps on a transition that is not in the diagram. The class invariant ties state to data (the state is one of the
 23; `ERROR` iff an error is stored; header lists parallel and within the count limit; line length within its limit;
@@ -559,7 +559,7 @@ once per token and handled once per run; the state changes once per token. Bodie
 that arrives in one chunk is a slice of the input (O(1)). The scanner reads the input through a 4096-byte window
 (`chunk.slice(w, we).toArray()`): indexing a `u8[]` is two orders of magnitude cheaper than calling `Bytes.at` per byte.
 
-Contract counts (`stdlib/http.or`, 2977 lines): 34 `@Invariant`, 49 `@Requires`, 131 `@Ensures`.
+Contract counts (`library/std/http.or`, 2977 lines): 34 `@Invariant`, 49 `@Requires`, 131 `@Ensures`.
 
 Throughput (`tests/std/bench/http_bench.or`, production build without contract checks, 1 MB = 1048576 bytes; corpus: a
 763-byte browser GET with 15 headers and a 160-byte cookie, a curl GET, a 544-byte JSON POST with a bearer token, a
@@ -733,14 +733,14 @@ rest is `std:net` design.
 
 ## std:ox: the OX provider protocol
 
-`std:ox` (`stdlib/ox.or`) holds only types: `Markup<R>` (a provider that serialises markup to text: `wrap`, `embed`,
+`std:ox` (`library/std/ox.or`) holds only types: `Markup<R>` (a provider that serialises markup to text: `wrap`, `embed`,
 `embedAll`, `text`, `attr`, attribute `rules`, the static `escapes` table, `voidTags`, `voidEnd`, `rawTextTags`,
 `presenceAttrs`), `Components<R>` (a provider that builds values: `fragment`, `text`), `AttrRule` and `Escape`. A provider
 module exports `function ox()` returning one such literal; the compiler reads it (ADR-0044, docs/ox.md).
 
 ## std:html: escaping and rendering for OX
 
-`std:html` (`stdlib/html.or`, pure Orin, no platform calls) is the HTML provider of OX (ADR-0044): `import ox from
+`std:html` (`library/std/html.or`, pure Orin, no platform calls) is the HTML provider of OX (ADR-0044): `import ox from
 "std:html";` selects it, and its `ox()` literal holds every HTML rule (escape table, void and raw-text elements, URL and
 event attributes). Markup compiles to calls of the functions below, and the only way to put a `string` into HTML is
 through them. `Html` is *rendered, trusted HTML* and `@Sealed`: only OX, `trustHtml` and this module construct it (the
@@ -835,7 +835,7 @@ const hit = xs.parallel().findIndex(x => x > limit);                 // Option<u
 
 `xs.parallel()` returns a view `Parallel<T>`. Its methods: `map(f)` and `filter(p)` return a view, `reduce(f, init)`, `some(p)`,
 `every(p)`, `find(p)`, `findIndex(p)` return what the sequential method returns, `toArray()` returns the elements. No import is
-needed (the prelude `array/parallel.or` is loaded for every file that calls `parallel()`); parallelism is explicit, the compiler
+needed (the prelude `library/collections/parallel.or` is loaded for every file that calls `parallel()`); parallelism is explicit, the compiler
 never parallelises on its own.
 
 **Semantics: the result of the sequential chain.** The input is split into chunks of 4,096 consecutive elements (fixed: it does

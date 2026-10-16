@@ -47,14 +47,14 @@ now() { date +%s; }
 build() {
   mkdir -p $D
   if ! python3 tools/embed_prelude.py --check >/dev/null; then
-    python3 tools/embed_prelude.py   # the embedded std/ array/ stdlib/ sources are stale: regenerate (commit the result)
+    python3 tools/embed_prelude.py   # the embedded library/ sources are stale: regenerate (commit the result)
   fi
   if [ -x $B/orin2 ]; then host=$B/orin2; else
     [ -x $B/orin0 ] || { echo "[dev] no $B/orin2: building the seed compiler"; ./tools/bootstrap.sh --seed-only >/dev/null; }
     host=$B/orin0
   fi
   # inputs of the build: the compiler and every source it embeds, the runtime, and the compiler that builds it
-  stamp=$(cat "$host" $(find compiler std array stdlib runtime platform -type f | LC_ALL=C sort) | cksum)
+  stamp=$(cat "$host" $(find compiler library runtime -type f | LC_ALL=C sort) | cksum)
   if [ -x $D/orin ] && [ "$(cat $D/stamp 2>/dev/null)" = "$stamp" ]; then
     echo "[dev] $D/orin is up to date"
     return
@@ -62,7 +62,7 @@ build() {
   t0=$(now)
   echo "[dev] $host compiles compiler/main.or -> $D/orin (cc -O1)"
   $host compile compiler/main.or -o $D/orin.c
-  $CC -O1 -w -I runtime $D/orin.c runtime/orin_runtime.c platform/orin_platform.c -lm -o $D/orin.tmp
+  $CC -O1 -w -I runtime/core $D/orin.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $D/orin.tmp
   mv $D/orin.tmp $D/orin
   echo "$stamp" > $D/stamp
   echo "[dev] built $D/orin in $(( $(now) - t0 )) s"

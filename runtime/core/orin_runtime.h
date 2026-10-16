@@ -470,7 +470,7 @@ OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b);
 int64_t orin_str_eq(OrinObj *a, OrinObj *b);
 static inline uint64_t orin_str_len(const OrinObj *s) { return ((const OrinString *)s)->len; }
 static inline const char *orin_str_data(const OrinObj *s) { return ((const OrinString *)s)->data; }
-/* Inline: the std prelude (std/) loops over bytes with it. */
+/* Inline: the std prelude (library/core/) loops over bytes with it. */
 static inline int64_t orin_str_char_code_at(OrinObj *s, uint64_t i) {
     const OrinString *x = (const OrinString *)s;
     if (ORIN_UNLIKELY(i >= x->len)) orin_trap("charCodeAt index out of range");

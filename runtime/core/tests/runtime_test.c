@@ -1,4 +1,4 @@
-/* Runtime-only tests. Build: cc -I runtime runtime/tests/runtime_test.c runtime/orin_runtime.c platform/orin_platform.c
+/* Runtime-only tests. Build: cc -I runtime/core runtime/core/tests/runtime_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c
  * Optionally with -fsanitize=address,undefined. Exits 0 and prints "ok" on success. */
 #define _GNU_SOURCE
 #include "orin_runtime.h"

@@ -14,7 +14,7 @@ if [ "${1:-}" = "--unit" ]; then
   source=compiler/tests/$t.or
   [ "$t" != workspace_cli ] || source=compiler/package/wscli_smoke.or
   $ORIN2 compile "$source" -o build/$t.c
-  cc -O1 -w -I runtime build/$t.c runtime/orin_runtime.c platform/orin_platform.c -o build/$t
+  cc -O1 -w -I runtime/core build/$t.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -o build/$t
   exec ./build/$t
 fi
 JOBS=
@@ -33,37 +33,37 @@ mkdir -p build
   for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test workspace_fixtures workspace_cli; do
     echo "sh tools/test_tooling.sh --unit $t"
   done
-  echo '$ORIN2 test compiler/tests/terminal_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/terminal_test.or --runtime runtime/core'
   # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
-  echo '$ORIN2 test compiler/tests/loader_test.or --runtime runtime'
-  echo '$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/loader_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime/core'
   # checker unit tests: the env / fnctx foundation (2a) and the body checker's classes (2b)
-  echo '$ORIN2 test compiler/tests/check_env_test.or --runtime runtime'
-  echo '$ORIN2 test compiler/tests/check_body_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/check_env_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/check_body_test.or --runtime runtime/core'
   # lowering unit tests (3a): block builder, locals, owned scope, place walk, MIR spans, Lowerer end to end
-  echo '$ORIN2 test compiler/tests/lower_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/lower_test.or --runtime runtime/core'
   # fusion of array pipelines (ADR-0038 §2): recognisers, chain analysis, verifier on fused MIR
-  echo '$ORIN2 test compiler/tests/fuse_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/fuse_test.or --runtime runtime/core'
   # optimiser and code generator unit tests (3d): passes, inference, pruning, emitters, symbol tables, rule 8
-  echo '$ORIN2 test compiler/tests/opt_test.or --runtime runtime'
-  echo '$ORIN2 test compiler/tests/emit_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/opt_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/emit_test.or --runtime runtime/core'
   echo 'python3 tools/test_forward_assert.py --orinc "$ORIN2"'
   echo 'python3 tools/test_unchecked_assert.py --orinc "$ORIN2"'
   # unboxing (ADR-0038 step 1): the eligibility rule, the verifier's aggregate rules, both backends, the pair release fix
-  echo '$ORIN2 test compiler/tests/unbox_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/unbox_test.or --runtime runtime/core'
   # syntax unit tests (3c): Lexer, Parser progress and spans, operator table, well-formedness predicates, garbage input
-  echo '$ORIN2 test compiler/tests/syntax_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/syntax_test.or --runtime runtime/core'
   # parser error recovery: several syntax errors per file, first error unchanged, no cascades, cap, termination on garbage
-  echo '$ORIN2 test compiler/tests/recovery_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/recovery_test.or --runtime runtime/core'
   echo 'python3 tools/test_recovery.py --orinc "$ORIN2"'
   # verifier unit tests (3b): ownership lattice, State / Worklist / Transfer / Fixpoint, reports, MIR + HIR predicates
-  echo '$ORIN2 test compiler/tests/verify_test.or --runtime runtime'
-  echo '$ORIN2 test compiler/tests/workspace_test.or --runtime runtime'
-  echo '$ORIN2 test compiler/tests/quality_test.or --runtime runtime'
-  echo '$ORIN2 test compiler/tests/doccomments_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/verify_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/workspace_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/quality_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/doccomments_test.or --runtime runtime/core'
   # tooling unit tests (3e): JSON cursor / round trip, workspace, positions, index queries, LSP and MCP reply rule,
   # MCP session, formatter layout and comment preservation
-  echo '$ORIN2 test compiler/tests/tooling_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/tooling_test.or --runtime runtime/core'
   echo "first: sh tools/test_resources.sh"
   echo "first: sh tools/test_capabilities.sh"
   echo 'python3 tools/test_time.py --orinc "$ORIN2"'

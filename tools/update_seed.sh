@@ -20,7 +20,7 @@ size: $(wc -c < $B/stage2.c)
 produced-by: $how
 date: $(date -u +%Y-%m-%d)
 INFO
-if [ -n "$(git status --porcelain -- compiler runtime platform std)" ]; then
-  echo "note: uncommitted changes in compiler/runtime/platform/std; source-commit is only HEAD" >&2
+if [ -n "$(git status --porcelain -- compiler runtime library)" ]; then
+  echo "note: uncommitted changes in compiler/runtime/library; source-commit is only HEAD" >&2
 fi
 echo "seed written: $SEED/orin-seed.c.gz ($(wc -c < $SEED/orin-seed.c.gz) bytes)"

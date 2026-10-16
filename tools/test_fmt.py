@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "build", "fmt")
 SPAN = re.compile(r"@\d+-\d+")
-CORPUS_DIRS = ["tests/run", "tests/next", "tests/contracts", "tests/parse_edge", "compiler", "bench", "std", "array"]
+CORPUS_DIRS = ["tests/run", "tests/next", "tests/contracts", "tests/parse_edge", "compiler", "bench", "library"]
 
 
 def run(cmd, timeout=120):
@@ -41,7 +41,7 @@ def build(orin2, src, name):
     rc, _, err = run([orin2, "compile", src, "-o", c])
     if rc != 0:
         sys.exit("cannot compile %s:\n%s" % (src, err.decode()))
-    rc, _, err = run(["cc", "-O1", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", exe])
+    rc, _, err = run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", exe])
     if rc != 0:
         sys.exit("cc failed for %s:\n%s" % (src, err.decode()))
     return exe

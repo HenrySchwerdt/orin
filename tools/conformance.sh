@@ -43,12 +43,12 @@ fi
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi; }
 CC=${CC:-cc}
 stamp=$({ echo "$CC"; cat "$BUILDER" tooling/conformance/orin.toml tooling/conformance/src/*.or \
-  runtime/*.c runtime/*.h platform/*.c platform/*.h; } | sha256)
+  runtime/core/*.c runtime/core/*.h runtime/platform/*.c runtime/platform/*.h; } | sha256)
 if [ ! -x "$RUNNER" ] || [ "$(cat "$OUT/stamp" 2>/dev/null || true)" != "$stamp" ]; then
   mkdir -p "$OUT"
   echo "[conformance] $BUILDER builds tooling/conformance -> $RUNNER" >&2
   "$BUILDER" compile tooling/conformance/src/main.or -o "$OUT/runner.c"
-  $CC -O1 -w -I runtime "$OUT/runner.c" runtime/orin_runtime.c platform/orin_platform.c -lm -o "$OUT/runner.tmp"
+  $CC -O1 -w -I runtime/core "$OUT/runner.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$OUT/runner.tmp"
   mv "$OUT/runner.tmp" "$RUNNER"
   echo "$stamp" > "$OUT/stamp"
 fi

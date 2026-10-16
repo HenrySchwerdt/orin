@@ -2,7 +2,7 @@
 """Embed the Orin prelude sources into the compiler (spec 19, R1; docs/architecture.md "Preludes").
 
 The self-hosted compiler is a single native binary and cannot locate files next to itself, so each
-prelude directory (std/, ...) is compiled into the compiler as a generated Orin file that returns
+prelude directory (library/core/, ...) is compiled into the compiler as a generated Orin file that returns
 its sources as `SourceFile[]` (virtual paths `<unit prefix>/<file>`). The loader serves them through
 its overlay mechanism (compiler/loader/prelude.or).
 
@@ -20,9 +20,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # (source dir, unit prefix, generated file, exported function)
 PRELUDES = [
-    ("std", "$std", "compiler/loader/embedded_std.or", "embeddedStdFiles"),
-    ("array", "$array", "compiler/loader/embedded_array.or", "embeddedArrayFiles"),
-    ("stdlib", "$stdlib", "compiler/loader/embedded_stdlib.or", "embeddedStdlibFiles"),
+    ("library/core", "$std", "compiler/loader/embedded_std.or", "embeddedStdFiles"),
+    ("library/collections", "$array", "compiler/loader/embedded_array.or", "embeddedArrayFiles"),
+    ("library/std", "$stdlib", "compiler/loader/embedded_stdlib.or", "embeddedStdlibFiles"),
 ]
 
 

@@ -4,7 +4,7 @@ with an alternative, build and run both, compare stdout + exit code. (The former
 vs the legacy HIR -> C backend, was removed together with that backend.)
 
 `--mode llvm` compares the C backend (default) against the LLVM IR backend
-(`--backend=llvm`, built with clang -O2 + runtime/orin_runtime_llvm.c) over tests/run and
+(`--backend=llvm`, built with clang -O2 + runtime/core/orin_runtime_llvm.c) over tests/run and
 tests/next/run (ADR-0006).
 `--mode builtins` compares the default pipeline (library built-ins implemented by the Orin
 std prelude, spec 19 R1) against `--c-builtins` (the C runtime implementations) over tests/run and
@@ -79,14 +79,14 @@ def build_and_run(args, name, entry, tag, extra, llvm=False):
     if rc != 0:
         return ("compile-fail", err.decode("utf-8", "replace")[:300])
     if llvm:
-        cc = ["clang", "-O2", "-w", "-I", "runtime"]
+        cc = ["clang", "-O2", "-w", "-I", "runtime/core"]
     else:
-        cc = [args.cc, "-O1", "-w", "-I", "runtime"]
+        cc = [args.cc, "-O1", "-w", "-I", "runtime/core"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
-    srcs = [os.path.join("runtime", "orin_runtime.c"), os.path.join("platform", "orin_platform.c")]
+    srcs = [os.path.join("runtime", "core", "orin_runtime.c"), os.path.join("runtime", "platform", "orin_platform.c")]
     if llvm:
-        srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
+        srcs.append(os.path.join("runtime", "core", "orin_runtime_llvm.c"))
     rc, _, err = sh(cc + [c] + srcs + ["-lm", "-o", exe], 120)
     if rc != 0:
         return ("cc-fail", err.decode("utf-8", "replace")[:300])

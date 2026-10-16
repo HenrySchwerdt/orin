@@ -22,9 +22,9 @@ its conformance step:
 ```sh
 tools/bootstrap.sh --seed-only
 build/bootstrap/orin0 compile compiler/main.or -o build/bootstrap/stage1.c
-cc -O1 -w -I runtime build/bootstrap/stage1.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/bootstrap/orin1
+cc -O1 -w -I runtime/core build/bootstrap/stage1.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/bootstrap/orin1
 build/bootstrap/orin1 compile compiler/main.or -o build/bootstrap/stage2.c
-cc -O2 -w -I runtime build/bootstrap/stage2.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/bootstrap/orin2
+cc -O2 -w -I runtime/core build/bootstrap/stage2.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/bootstrap/orin2
 build/bootstrap/orin2 compile compiler/main.or -o build/bootstrap/stage3.c
 cmp build/bootstrap/stage2.c build/bootstrap/stage3.c
 tools/package.sh 0.0.0-dryrun.8587609 macos-arm64

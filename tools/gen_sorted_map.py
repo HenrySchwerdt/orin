@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the two B-tree sorted maps of stdlib/collections.or from tools/sorted_map.tmpl.
+"""Generate the two B-tree sorted maps of library/std/collections.or from tools/sorted_map.tmpl.
 
 `SortedMap<V>` (int keys) and `SortedStringMap<V>` (string keys) are the same algorithm; Orin has no equality or
 ordering on type parameters (docs/std.md "Limitations"), so the key type and its comparisons are template
-parameters and the two classes are generated, not copied by hand. The generated region of stdlib/collections.or is
+parameters and the two classes are generated, not copied by hand. The generated region of library/std/collections.or is
 between the markers `// BEGIN GENERATED` and `// END GENERATED`.
 
 Usage: python3 tools/gen_sorted_map.py [--check]   (--check: exit 1 if collections.or is stale)
@@ -88,19 +88,19 @@ def generated():
 
 
 def main():
-    path = os.path.join(ROOT, "stdlib", "collections.or")
+    path = os.path.join(ROOT, "library", "std", "collections.or")
     src = open(path, encoding="utf-8").read()
     a = src.index(BEGIN)
     b = src.index(END) + len(END)
     new = src[:a] + generated() + src[b:]
     if "--check" in sys.argv[1:]:
         if new != src:
-            print("stdlib/collections.or is stale: run python3 tools/gen_sorted_map.py")
+            print("library/std/collections.or is stale: run python3 tools/gen_sorted_map.py")
             return 1
         return 0
     if new != src:
         open(path, "w", encoding="utf-8").write(new)
-        print("wrote stdlib/collections.or")
+        print("wrote library/std/collections.or")
     return 0
 
 

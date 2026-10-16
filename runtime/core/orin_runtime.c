@@ -1,6 +1,6 @@
 /* Orin runtime implementation. API and conventions: orin_runtime.h */
 /* Layers (spec 19): this file is the C object model (future L1). Every OS / libc interaction goes
- * through the closed platform API (../platform/orin_platform.h); tools/check_platform_boundary.sh
+ * through the closed platform API (../platform/orin_platform.h, i.e. runtime/platform/); tools/check_platform_boundary.sh
  * enforces it. */
 #include "orin_runtime.h"
 #include "../platform/orin_platform.h"
@@ -2061,7 +2061,7 @@ void orin_process_exit(int64_t code) { orin_platform_exit((int)code); }
  * of a value between task heaps), orin_rt_task_* (start / join / trap of a task), orin_rt_heap_* (the per-thread
  * allocator state), plus forwarders that trap on a failed L0 call (orin_mon_*). Each function maps 1:1 onto a planned
  * Orin core-dialect function; no logic of the task library (scheduler bookkeeping, channels, scopes) lives here:
- * that is std:task (stdlib/task.or). Every task owns its heap: reference counts stay NON-atomic because an object
+ * that is std:task (library/std/task.or). Every task owns its heap: reference counts stay NON-atomic because an object
  * graph is only ever reachable from one thread at a time (a transfer moves a uniquely owned graph, or copies). */
 
 /* Transfer slots: a value in flight between two tasks, owned by nobody. A token is `generation << 32 | (index + 1)`. */

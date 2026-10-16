@@ -21,7 +21,7 @@ the compiler source is not restricted to Orin-B any more.
    `$S/orin2_base compile compiler/main.or -o $S/n.c` (about 4 s, type-checks everything). The
    baseline compiler is enough while the module only uses features it knows; the seed has the same
    front end.
-4. **Fast unit tests** while rewriting: `orin test compiler/tests/<module>_test.or --runtime runtime`
+4. **Fast unit tests** while rewriting: `orin test compiler/tests/<module>_test.or --runtime runtime/core`
    (needs no bootstrap). The tests are `@Test` functions (ADR-0024); `orin test` runs with runtime
    contract checking, so the contracts of the module are exercised by every test. Write the tests
    against the *old* code first (copy the test into `$S/base/compiler/tests/` and run it with

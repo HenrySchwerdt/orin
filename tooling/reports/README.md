@@ -14,7 +14,7 @@ calls `renderReport`; it never builds HTML strings.
 
 Safety: all dynamic text reaches the page through `std:html` (escaped by construction); the only `trustHtml` call embeds a
 `SvgDoc`, which only `canvas.or` can build. Pages work without JavaScript and offline. Status is always text plus an icon, never
-colour alone. Tests: `orin test tooling/reports/tests/report_test.or --runtime runtime` (escaping, empty states, diff markers,
+colour alone. Tests: `orin test tooling/reports/tests/report_test.or --runtime runtime/core` (escaping, empty states, diff markers,
 determinism, number formats); `tooling/benchmarks/test.sh` runs them together with the benchmark golden tests.
 
 Using it: add `orin-reports = { path = "../reports" }` to `[dependencies]` and `import { Report, renderReport, ... } from "orin-reports";`.

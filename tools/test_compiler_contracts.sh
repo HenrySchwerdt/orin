@@ -16,7 +16,7 @@ SUITE=all
 mkdir -p "$B"
 echo "[contracts] orin2 --check-contracts compiles compiler/main.or"
 $ORIN2 compile compiler/main.or --check-contracts -o $B/orin_cc.c
-cc -O2 -w -I runtime $B/orin_cc.c runtime/orin_runtime.c platform/orin_platform.c -lm -o $B/orin_cc
+cc -O2 -w -I runtime/core $B/orin_cc.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $B/orin_cc
 # Steps 1 and 2 are independent and run at the same time (the suite runs in parallel itself); the suite's output is
 # held back and printed after step 1, so the output is in the same order as when they ran one after the other.
 echo "[contracts] suite '$SUITE' with the contract-checked compiler" > $B/suite.out

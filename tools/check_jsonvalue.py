@@ -35,10 +35,10 @@ def build(orinc, source, backend, contracts=False, sanitize=False):
         cmd += ["--check-contracts"]
     run(cmd)
     binary = OUT / stem
-    cmd = ["clang", "-O1" if sanitize else "-O2", "-w", "-I", "runtime", generated,
-           "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", binary]
+    cmd = ["clang", "-O1" if sanitize else "-O2", "-w", "-I", "runtime/core", generated,
+           "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", binary]
     if backend == "llvm":
-        cmd += ["runtime/orin_runtime_llvm.c"]
+        cmd += ["runtime/core/orin_runtime_llvm.c"]
     if sanitize:
         cmd += ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
     run(cmd)

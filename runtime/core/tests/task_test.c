@@ -1,6 +1,6 @@
 /* Task runtime tests (ADR-0017 stage 0): transfer by move or deep copy, task start / join / trap, monitors, grants moving
  * into a task, per-task heaps. Build and run:
- *     cc -g -I runtime runtime/tests/task_test.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/task_test
+ *     cc -g -I runtime/core runtime/core/tests/task_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/task_test
  * and the same with -fsanitize=thread, and with -fsanitize=address,undefined (tools/test_concurrency.sh does all three).
  * Exits 0 and prints "task_test: N checks passed" on success. */
 #define _GNU_SOURCE

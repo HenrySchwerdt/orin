@@ -11,15 +11,32 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `docs/bootstrap-subset.md` | Historical: the frozen Orin-B subset of the retired Stage 0 (diagnostics table still valid). |
 | `docs/decisions/` | ADRs (interpretations of OPEN points, deviations). |
 | `seed/` | The committed **seed** (generated C of the self-hosted compiler, `orin-seed.c.gz` + `SEED_INFO`), the single bootstrap root. The Rust Stage 0 is retired to branch `archive/stage0-final`. |
-| `platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `platform/tests/` (contract tests, CBMC harnesses). |
-| `runtime/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `platform/`. |
+| `runtime/platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `runtime/platform/tests/` (contract tests, CBMC harnesses). |
+| `runtime/core/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `runtime/platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
-| `stdlib/` | **Std modules in Orin** (`std:host`, `std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`; `std:host` and `std:fs` implement the capability grants of ADR-0027): embedded library root, see docs/std.md. |
-| `std/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
+| `library/std/` | **Std modules in Orin** (`std:host`, `std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`; `std:host` and `std:fs` implement the capability grants of ADR-0027): embedded library root, see docs/std.md. |
+| `library/core/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
 | `tests/next/` | Same formats (`run/`, `errors/`) for language beyond Orin-B; self-hosted compiler only (`--suite next`). |
 | `tools/` | Test runner and bootstrap scripts. |
+
+### Old to new paths (ADR-0047 phase 3)
+
+The libraries and the runtime moved without any semantic change. Public `std:*` import names, the virtual prelude roots
+(`$std`, `$array`, `$stdlib`) and the C ABI are unchanged.
+
+| Before | Now | Release package (unchanged) |
+|---|---|---|
+| `std/` | `library/core/` (prelude `$std`) | embedded in the compiler |
+| `array/` | `library/collections/` (prelude `$array`) | embedded in the compiler |
+| `stdlib/` | `library/std/` (`std:*` modules, `$stdlib`) | embedded in the compiler |
+| `runtime/` | `runtime/core/` | `lib/orin/runtime/` |
+| `platform/` | `runtime/platform/` | `lib/orin/platform/` |
+
+`runtime/core/` includes `../platform/orin_platform.h`; that relative path resolves in the source tree (`runtime/platform/`)
+and in a release (`lib/orin/platform/`). `tools/package.sh` maps source to release, so `install.sh` and installed
+releases keep working. `orin test` defaults to `--runtime runtime/core` in a checkout (the `orin` launcher passes its own).
 
 ## Pipeline
 
@@ -75,11 +92,11 @@ A **prelude** is a directory of ordinary Orin sources that the self-hosted compi
 into every program, so library logic can be written in Orin instead of C. Mechanism (all deterministic,
 so `stage2.c == stage3.c` still holds):
 
-- **Source and embedding.** `std/` (repo root) holds the std prelude: `module.or` (entry, lists the
+- **Source and embedding.** `library/core/` (repo root) holds the std prelude: `module.or` (entry, lists the
   rules) + `strings.or`, `numbers.or`. The compiler is one native binary and cannot find files next to
   itself, so `tools/embed_prelude.py` turns each prelude directory into a generated Orin file
   (`compiler/loader/embedded_std.or`, a function returning `SourceFile[]`). Run the script after
-  editing `std/`; `tools/bootstrap.sh` fails on a stale file (`--check`).
+  editing `library/core/`; `tools/bootstrap.sh` fails on a stale file (`--check`).
 - **Prelude roots (the general mechanism).** `compiler/loader/prelude.or` has `preludeRoots()`, a list
   of `PreludeRoot { entry, files }`. `loadWithRoots` (loader.or) serves every root's files from memory under
   virtual paths `$<name>/...` and adds an empty import of each root's `entry` to the program's entry
@@ -105,22 +122,22 @@ so `stage2.c == stage3.c` still holds):
 - **Flags.** `--c-builtins` keeps the C runtime path (differential testing:
   `python3 tools/diff_backends.py --mode builtins`); `orin check` loads no
   prelude.
-- **Rules for prelude code** (also in `std/module.or`): only the primitives the C runtime keeps
+- **Rules for prelude code** (also in `library/core/module.or`): only the primitives the C runtime keeps
   (`length`, `charCodeAt`, `charAt`, `substring`, `String.fromCharCode`, `+`, array `push`/index/`length`,
   console, `process.exit`); never call a built-in that is itself implemented in the prelude (the lowering
   would make it a recursive call); keep within what the self-hosted compiler accepts.
 
 ## Platform layer (spec 19 R2)
 
-Everything the runtime needs from the OS or libc goes through `platform/orin_platform.h`: memory
+Everything the runtime needs from the OS or libc goes through `runtime/platform/orin_platform.h`: memory
 (`alloc`/`realloc`/`free`, `mem_copy/move/set/cmp/find`), decimal formatting, process (`init`, `arg_count/arg`,
 `getenv`, `at_exit`, `exit`, `abort`, `shell`), byte I/O (`write`, `write_line`, `flush`, `stdin_read`,
-`stdin_getc`) and whole-file operations (`file_read/write/exists`, `error_message`). `runtime/*.{c,h}` include only
+`stdin_getc`) and whole-file operations (`file_read/write/exists`, `error_message`). `runtime/core/*.{c,h}` include only
 freestanding headers (`stddef.h`, `stdint.h`) plus the platform header; `tools/check_platform_boundary.sh`
-(run in CI) fails on any direct libc call or libc include in `runtime/`. The runtime includes the header as
-`../platform/orin_platform.h`, so `platform/` must be a sibling directory of `runtime/` in a checkout and in
-a package (`lib/orin/runtime`, `lib/orin/platform`); every link line is
-`cc -I runtime out.c runtime/orin_runtime.c platform/orin_platform.c`. The memory primitives are `static inline`
+(run in CI) fails on any direct libc call or libc include in `runtime/core/`. The runtime includes the header as
+`../platform/orin_platform.h`, so `platform/` must be a sibling directory of the runtime directory (`runtime/platform` next to
+`runtime/core` in a checkout) and in a package (`lib/orin/runtime`, `lib/orin/platform`); every link line is
+`cc -I runtime/core out.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c`. The memory primitives are `static inline`
 in the header (no cost on hot paths); everything else is out of line. The platform layer owns the process-wide
 stdout buffer and the argv copy; the runtime keeps no libc state. Contracts, status labels and verification:
 docs/formal.md "L0 platform layer".
@@ -139,12 +156,12 @@ queues, integer words). The platform layer is now thread-safe (the stdout buffer
 |---|---|
 | Bounds-checked indexing, checked arithmetic | Implemented in runtime/codegen; tested only |
 | Struct/variant field access and array slot access check object kind and slot count (backstop for lowering bugs the ownership verifier cannot see, docs/assurance.md F-shape) | Implemented in the runtime and both backends; a mismatch traps (exit 101); tested only. Not a proof: the verifier does not check value shapes yet (P0 proof debt) |
-| Library string/number functions (R1) | Safe Orin in `std/` (checked by the compiler, verified by the MIR verifier, `tools/verify_all.py`); functional behaviour tested only, differentially against the C implementations |
+| Library string/number functions (R1) | Safe Orin in `library/core/` (checked by the compiler, verified by the MIR verifier, `tools/verify_all.py`); functional behaviour tested only, differentially against the C implementations |
 | RC never under-counts (no UAF/double free) | Generated code: tested + ASan/UBSan on all suites and on the compiler self-compiling. Abstract machine: **proven** in Lean (`formal/`, theorem `run_safe`; rc ≥ owners invariant) — see docs/formal.md |
 | Value semantics / COW | Abstract machine: **proven** for `makeUnique; store` (`makeUnique_store_cow`); generated code: tested |
 | MIR ownership discipline | Independent verifier implemented (`compiler/verify`, docs/mir.md); lowering to MIR in progress; verifier itself not mechanically verified |
 | Link verifier ⇄ Lean model | **Proven for the structured MIR core** (`check_sound`: Lean checker transcribing docs/mir.md accepts ⇒ no use-after-free/double free/shared store), given a caller contract. Not covered: calls/builtins, loops, switch, arrays/strings; the Orin verifier source is not itself verified against the Lean checker (manual transcription). See docs/formal.md |
 | Source type safety (progress/preservation) | Not started |
-| L0 platform layer (`platform/`) | Contracts written (ACSL-style); memory/string/format primitives bounded-verified with CBMC; I/O, process and file primitives tested only (docs/formal.md) |
+| L0 platform layer (`runtime/platform/`) | Contracts written (ACSL-style); memory/string/format primitives bounded-verified with CBMC; I/O, process and file primitives tested only (docs/formal.md) |
 | Task isolation (ADR-0017 stage 0) | Static: handles cannot be captured / stored / sent, E0481-E0483, MIR verifier handle rules for grants moved into tasks. Run time: handle validation, one-shot tokens. **Tested only** (ThreadSanitizer, ASan + UBSan, stress): the C transfer and the L0 thread / monitor primitives; not verified, see docs/concurrency.md "Safety argument" |
 | Native artifact | TCB: runtime, C compiler, allocator, emitter — unverified |

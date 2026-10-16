@@ -17,11 +17,11 @@ def build(orin, source, target, backend, contracts, sanitize):
     generated = target.with_suffix(".ll" if backend == "llvm" else ".c")
     flags = ["--check-contracts"] if contracts else []
     run([orin, "compile", str(source), "-o", str(generated), "--backend=" + backend] + flags)
-    sources = [str(generated), "runtime/orin_runtime.c", "platform/orin_platform.c"]
+    sources = [str(generated), "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
     if backend == "llvm":
-        sources.append("runtime/orin_runtime_llvm.c")
+        sources.append("runtime/core/orin_runtime_llvm.c")
     sanitizer = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if sanitize else []
-    run(["clang", "-O2", "-w", "-I", "runtime"] + sanitizer + sources + ["-lm", "-o", str(target)])
+    run(["clang", "-O2", "-w", "-I", "runtime/core"] + sanitizer + sources + ["-lm", "-o", str(target)])
 
 
 def main():

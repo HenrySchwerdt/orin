@@ -1,6 +1,6 @@
-/* L0 platform layer: executable test of every contract in platform/orin_platform.h, including error
+/* L0 platform layer: executable test of every contract in runtime/platform/orin_platform.h, including error
  * paths (missing file, NUL in path, directory, EOF, short read, huge request). Tests may use libc.
- * Build/run: tools/verify_platform.sh  (or cc -I platform platform/tests/platform_test.c platform/orin_platform.c) */
+ * Build/run: tools/verify_platform.sh  (or cc -I platform runtime/platform/tests/platform_test.c runtime/platform/orin_platform.c) */
 #define _GNU_SOURCE
 #include "../orin_platform.h"
 

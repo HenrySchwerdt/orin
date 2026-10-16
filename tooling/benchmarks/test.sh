@@ -19,11 +19,11 @@ bad() { echo "FAIL $1"; fail=1; }
 ok() { echo "ok   $1"; }
 
 tooling/reports/gen_theme.sh --check && ok "theme_css.or is generated from theme/report.css" || bad "theme_css.or is stale"
-out=$($ORIN2 test tooling/reports/tests/report_test.or --runtime runtime 2>&1) \
+out=$($ORIN2 test tooling/reports/tests/report_test.or --runtime runtime/core 2>&1) \
   && ok "tooling/reports tests: $(echo "$out" | tail -1)" || { echo "$out"; bad "tooling/reports tests"; }
 
 $ORIN2 compile tooling/benchmarks -o "$B/br.c"
-cc -O1 -w -I runtime "$B/br.c" runtime/orin_runtime.c platform/orin_platform.c -lm -o "$B/bench-report"
+cc -O1 -w -I runtime/core "$B/br.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$B/bench-report"
 BR=$B/bench-report
 
 # case NAME HISTORY-DIR RUN-FILE

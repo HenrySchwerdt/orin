@@ -74,7 +74,7 @@ point. That is a chain argument, not a repeated diverse-root check. The only rem
 choice of C compiler (and the C-backend vs LLVM-backend equality); a new independent root would need a
 second implementation of the then-current language, which is not planned.
 
-The self-hosted compiler also embeds the std prelude (`std/`, spec 19 R1; docs/architecture.md
+The self-hosted compiler also embeds the std prelude (`library/core/`, spec 19 R1; docs/architecture.md
 "Preludes"). `tools/bootstrap.sh` first checks that `compiler/loader/embedded_std.or` is up to date
 (`tools/embed_prelude.py --check`). Every stage compiles `compiler/` with the prelude (library calls inside the compiler become Orin
 code); `--c-builtins` keeps the C runtime implementations, and `tools/diff_backends.py --mode builtins`
@@ -112,11 +112,11 @@ above), though `compiler/` has not been rewritten yet. Features beyond Orin-B ge
 * Closures (ADR-0011): `syntax/` (`EArrow`, `TFn`), `check/fnctx.or` (captures), `check/body.or` (closure
   conversion, function values, array methods), `check/types.or` (`TyFn`), HIR `TyFn` / `XClosure` /
   `XCallIndirect`, MIR `IClosure` / `ICallIndirect` (docs/mir.md v1.3), `lower`, `opt` (closure targets keep
-  borrowed parameters), `verify`, `cemit`, `llvm`. The array API prelude is `array/array.or`
+  borrowed parameters), `verify`, `cemit`, `llvm`. The array API prelude is `library/collections/array.or`
   (prelude root `$array`, embedded via `tools/embed_prelude.py`). `compiler/` itself still uses no closures.
 
 * Fixed-width integers and template literals (ADR-0022): `syntax/lexer.or` (`KBigInt`, `KTpl*`, brace-depth stack), `ast.or` (`EBigInt`, `ETemplate`), `hir.or` (`TyIntK`, the integer kind helpers, `BInt*` built-ins), `check/ints.or` (type names, literal fitting, conversions, `wrapping*` etc.), `check/body.or` (`checkIntLit`, `checkTemplate`, `intMethodCall`), `lower` (`rangeCheck` after narrow arithmetic), `cemit` / `llvm` (the seven built-ins), runtime `orin_int_op` / `orin_int_chk` / `orin_parse_int_k`, `fmt/printer.or` (verbatim templates), `syntax/trivia.or` (comment scan skips templates). The compiler source itself uses none of it.
-* Floats and `Map<K, V>` (ADR-0018): `syntax/lexer.or` (`KFloat`), `EFloat`, HIR `TyFloat`/`TyF32`/`XFloat` and the `BFloat*` builtins, `check/` (literal typing, `methodSig`, `Map` hooks in `types.or`/`body.or`), MIR `MFloat`/`OFloat`, `lower` (f32 rounding), `verify`, `cemit`, `llvm`, runtime `orin_float_to_string` etc.; Map and std:math are Orin prelude code (`array/map.or`, `array/math.or`). Programs using floats link with `-lm`.
+* Floats and `Map<K, V>` (ADR-0018): `syntax/lexer.or` (`KFloat`), `EFloat`, HIR `TyFloat`/`TyF32`/`XFloat` and the `BFloat*` builtins, `check/` (literal typing, `methodSig`, `Map` hooks in `types.or`/`body.or`), MIR `MFloat`/`OFloat`, `lower` (f32 rounding), `verify`, `cemit`, `llvm`, runtime `orin_float_to_string` etc.; Map and std:math are Orin prelude code (`library/collections/map.or`, `library/collections/math.or`). Programs using floats link with `-lm`.
 
 ## Writing efficient Orin-B (important for Stage 1 authors)
 

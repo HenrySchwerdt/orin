@@ -28,7 +28,7 @@ done
 mkdir -p $O
 T0=$(date +%s)
 elapsed() { echo "$(( $(date +%s) - T0 )) s"; }
-link() { $CLANG $LLVM_CFLAGS -I runtime "$1" runtime/orin_runtime.c platform/orin_platform.c runtime/orin_runtime_llvm.c -lm -o "$2"; }
+link() { $CLANG $LLVM_CFLAGS -I runtime/core "$1" runtime/core/orin_runtime.c runtime/platform/orin_platform.c runtime/core/orin_runtime_llvm.c -lm -o "$2"; }
 same() {
   if cmp -s "$1" "$2"; then echo "[compare] $1 == $2 ($(wc -c < "$1") bytes)"
   else echo "[compare] FAIL: $1 and $2 differ" >&2; diff "$1" "$2" | head -20 >&2 || true; exit 1; fi

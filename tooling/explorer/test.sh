@@ -26,11 +26,11 @@ cmp -s "$B/base.json" $T/shop.base.graph.json && cmp -s "$B/head.json" $T/shop.h
   && ok "fixture snapshots and diff are current (testdata/regen.sh)" || bad "fixture snapshots or diff are stale: run tooling/explorer/testdata/regen.sh"
 grep -q '"doc":"Price of `qty` items' $T/shop.head.graph.json && ok "the snapshot carries the documentation comments (osig/0.3)" || bad "no doc field in the snapshot"
 
-out=$($ORIN2 test tooling/explorer/tests/explorer_test.or --runtime runtime 2>&1) \
+out=$($ORIN2 test tooling/explorer/tests/explorer_test.or --runtime runtime/core 2>&1) \
   && ok "tooling/explorer tests: $(echo "$out" | tail -1)" || { echo "$out"; bad "tooling/explorer tests"; }
 
 $ORIN2 compile tooling/explorer -o "$B/ex.c"
-cc -O1 -w -I runtime "$B/ex.c" runtime/orin_runtime.c platform/orin_platform.c -lm -o "$B/explore"
+cc -O1 -w -I runtime/core "$B/ex.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$B/explore"
 EX=$B/explore
 
 "$EX" $T/shop.head.graph.json --diff $T/shop.diff.json --out "$B/site1" 2> /dev/null

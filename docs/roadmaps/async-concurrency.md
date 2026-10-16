@@ -19,18 +19,18 @@ places async/await post-1.0 and requires ADR approval for syntax/semantic change
 
 | Area | Implemented at the baseline | Gap relevant to this roadmap |
 |---|---|---|
-| Isolated tasks | `scope`, `spawn`, `join` in [std:task](../../stdlib/task.or); one OS thread per task; move/deep-copy transfer, non-atomic per-task RC | No general cancellation, timed join, or task scheduler that parks logical tasks |
+| Isolated tasks | `scope`, `spawn`, `join` in [std:task](../../library/std/task.or); one OS thread per task; move/deep-copy transfer, non-atomic per-task RC | No general cancellation, timed join, or task scheduler that parks logical tasks |
 | Channels | Bounded FIFO, blocking send/recv, explicit sender/receiver close; receiver close discards buffered tokens and wakes waiters | Close affects the shared channel; it is not per-operation or per-task cancellation. No timed waits or `select` |
 | Traps | Task trap records failure, closes its grants/files, folds counters and exits its thread; join traps the joiner | No stack unwind or live-scope registry; nested children can survive their owner's trap. Live heap objects can leak. Releasing held monitor locks does not prove protected state consistent |
 | Parallel arrays | ADR-0039 fork/join workers, chunk stealing, scoped immutable lending, ordered results; pool stops unstarted chunks after failure/early hit | This is a bounded computation pool for one call, not a general I/O scheduler or general sibling cancellation |
-| TCP | [std:net](../../stdlib/net.or) resources with per-call timeouts and whole-operation deadlines in sendAll/read helpers | Sockets use nonblocking mode internally, but each `poll` blocks the caller's OS thread. DNS is synchronous and outside connect timeout; no cancellation wakeup |
+| TCP | [std:net](../../library/std/net.or) resources with per-call timeouts and whole-operation deadlines in sendAll/read helpers | Sockets use nonblocking mode internally, but each `poll` blocks the caller's OS thread. DNS is synchronous and outside connect timeout; no cancellation wakeup |
 | Clock | Public `std:time.nowMillis(ClockGrant)` is wall-clock time; Duration helpers exist. Live network handles expose monotonic time | General public monotonic/sleep/deadline work is separate and not landed here; wall time cannot implement elapsed deadlines |
 | Network ownership | Listener/Stream are scoped resource handles in the owning thread's grant table | They cannot be captured, returned, stored in values or sent. Task grant delegation covers fs/process/stdio/clock, not net. An accepted stream cannot currently be handed to a task |
 
 Source anchors: runtime `task_trap`, `task_main`, `orin_rt_heap_exit`,
-`orin_rt_task_join` in [orin_runtime.c](../../runtime/orin_runtime.c);
+`orin_rt_task_join` in [orin_runtime.c](../../runtime/core/orin_runtime.c);
 `orin_platform_thread_exit`, `orin_platform_monitor_wait`, `net_wait`,
-`orin_platform_tcp_connect` in [orin_platform.c](../../platform/orin_platform.c).
+`orin_platform_tcp_connect` in [orin_platform.c](../../runtime/platform/orin_platform.c).
 The source calls `pthread_join` / `pthread_cond_wait`; `net_wait` polls one fd.
 Internal socket nonblocking mode alone does not provide nonblocking task waits.
 Existing timeout documentation is not evidence of a total DNS/connect bound:
@@ -192,11 +192,11 @@ The rows refine the milestones above, rather than authorize implementation.
 
 | Slice | Main implementation area | Merge gate |
 |---|---|---|
-| Cancellation/termination model | ADR-0017 amendment and pure `stdlib/taskcore.or` machines | Terminal-event and ownership transition tests |
-| Channel waits | Minimal L0 timed/wake primitives and `stdlib/task.or` | No lost wake or token leak under cancel/close/deadline races |
+| Cancellation/termination model | ADR-0017 amendment and pure `library/std/taskcore.or` machines | Terminal-event and ownership transition tests |
+| Channel waits | Minimal L0 timed/wake primitives and `library/std/task.or` | No lost wake or token leak under cancel/close/deadline races |
 | Completion waits | Runtime completion publication plus Orin join bookkeeping | Timeout leaves a valid join obligation; exactly one final claimant |
 | Nested-scope termination | Runtime live-scope registration and Orin cancellation/drain | Trapping parent joins cooperative descendants before state release |
-| TCP wait interruption | L0 readiness/wake and `stdlib/net.or` adapters | Numeric loopback cancellation and total-deadline tests; DNS limitation explicit |
+| TCP wait interruption | L0 readiness/wake and `library/std/net.or` adapters | Numeric loopback cancellation and total-deadline tests; DNS limitation explicit |
 | Concurrent server ownership | Separate resource/grant ADR and bounded example | No forbidden capture or authority widening; admission/cleanup campaign |
 | Reclamation | R3/R4 object model or approved alternative | Repeated faults restore accounting including transfers/lends |
 | Scheduler experiment | Explicit task state, bounded queues/timers, readiness backend | One-worker progress, worker-bound and fairness evidence before multi-worker migration |

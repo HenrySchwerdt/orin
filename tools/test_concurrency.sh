@@ -1,6 +1,6 @@
 #!/bin/sh
 # Concurrency stage 0 (ADR-0017): the C parts and the Orin stress tests under the sanitizers.
-#   1. runtime/tests/task_test.c (transfer by move / copy, task start / join / trap, monitors, grants moved into a task):
+#   1. runtime/core/tests/task_test.c (transfer by move / copy, task start / join / trap, monitors, grants moved into a task):
 #      plain, ThreadSanitizer, and AddressSanitizer + UBSan;
 #   2. every tests/concurrency/*.or (thousands of tasks, tens of thousands of messages), compiled by the self-hosted compiler
 #      and run plain, under ThreadSanitizer and under ASan + UBSan; the output must equal the .out file and the plain run must
@@ -32,20 +32,20 @@ run_tsan() {
 }
 
 echo "[concurrency] runtime task tests"
-SRC="runtime/tests/task_test.c runtime/orin_runtime.c platform/orin_platform.c"
-$CC -g -O1 -Wall -I runtime $SRC -lm -o $B/task_test
+SRC="runtime/core/tests/task_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
+$CC -g -O1 -Wall -I runtime/core $SRC -lm -o $B/task_test
 $B/task_test
-$CC -g -O1 -fsanitize=thread -I runtime $SRC -lm -o $B/task_test_tsan
+$CC -g -O1 -fsanitize=thread -I runtime/core $SRC -lm -o $B/task_test_tsan
 run_tsan $B/task_test_tsan
-$CC -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime $SRC -lm -o $B/task_test_asan
+$CC -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I runtime/core $SRC -lm -o $B/task_test_asan
 ASAN_OPTIONS=detect_leaks=0 $B/task_test_asan
 
 for t in tests/concurrency/*.or; do
   n=$(basename "$t" .or)
   echo "[concurrency] $n"
   $ORIN2 compile "$t" -o $B/$n.c
-  RT="runtime/orin_runtime.c platform/orin_platform.c"
-  $CC -O1 -w -I runtime $B/$n.c $RT -lm -o $B/$n
+  RT="runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
+  $CC -O1 -w -I runtime/core $B/$n.c $RT -lm -o $B/$n
   # a first line `// exit: N` says the program must end with status N (a panic test); default 0
   want=$(sed -n '1s|^// exit: *\([0-9][0-9]*\) *$|\1|p' "$t")
   want=${want:-0}
@@ -64,11 +64,11 @@ for t in tests/concurrency/*.or; do
   else
     grep -q "trap: task panicked" $B/$n.stderr || { echo "[concurrency] FAIL $n: no task panic message on stderr"; cat $B/$n.stderr; exit 1; }
   fi
-  $CC -g -O1 -w -fsanitize=thread -I runtime $B/$n.c $RT -lm -o $B/$n.tsan
+  $CC -g -O1 -w -fsanitize=thread -I runtime/core $B/$n.c $RT -lm -o $B/$n.tsan
   expect_status tsan run_tsan timeout 600 $B/$n.tsan
   cmp "tests/concurrency/$n.out" $B/$n.actual || { echo "[concurrency] FAIL $n (tsan): output differs"; exit 1; }
   if [ "$QUICK" = 0 ]; then
-    $CC -g -O1 -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -I runtime $B/$n.c $RT -lm -o $B/$n.asan
+    $CC -g -O1 -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -I runtime/core $B/$n.c $RT -lm -o $B/$n.asan
     expect_status asan env ASAN_OPTIONS=detect_leaks=0 timeout 600 $B/$n.asan
     cmp "tests/concurrency/$n.out" $B/$n.actual || { echo "[concurrency] FAIL $n (asan): output differs"; exit 1; }
   fi

@@ -20,13 +20,13 @@ def run(command, expected=0, stdout=None, stderr=None, env=None):
 
 def link(source, binary, llvm=False, fake=False):
     flags = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
-    sources = [source, "runtime/orin_runtime.c", "platform/orin_platform.c"]
+    sources = [source, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
     if llvm:
-        sources.append("runtime/orin_runtime_llvm.c")
+        sources.append("runtime/core/orin_runtime_llvm.c")
     if fake:
         flags += ["-Dclock_gettime=orin_test_clock_gettime", "-DCLOCK_STUB_ONLY", "-ftrivial-auto-var-init=pattern"]
-        sources.append("runtime/tests/clock_test.c")
-    run(["clang", "-O1", "-g", *flags, "-I", "runtime", *sources, "-lm", "-o", binary])
+        sources.append("runtime/core/tests/clock_test.c")
+    run(["clang", "-O1", "-g", *flags, "-I", "runtime/core", *sources, "-lm", "-o", binary])
 
 
 
@@ -53,8 +53,8 @@ def main():
     env["ASAN_OPTIONS"] = "detect_leaks=0"
     native = OUT / "native"
     run(["clang", "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
-         "-ftrivial-auto-var-init=pattern", "-Dclock_gettime=orin_test_clock_gettime", "-I", "runtime",
-         "runtime/tests/clock_test.c", "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", native])
+         "-ftrivial-auto-var-init=pattern", "-Dclock_gettime=orin_test_clock_gettime", "-I", "runtime/core",
+         "runtime/core/tests/clock_test.c", "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-lm", "-o", native])
     run([native, "platform"], stdout="platform clock cases passed\n", env=env)
     run([native], stdout="clock failure returned None\n", env=env)
     run([native, "wrong"], expected=101, stderr="invalid capability grant", env=env)

@@ -11,7 +11,7 @@ orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]
 |---|---|
 | `--root <dir>` | Authorized workspace root (default: cwd). Every path a client passes, and every file a project imports, must lie inside it. Prefer an absolute path. |
 | `--allow-exec` | Enables `test` and `build` (they run the compiler backend, `cc` and project code). Without it they return a tool error. |
-| `--repo <dir>` | Orin checkout providing `runtime/` (for linking) and `tools/run_tests.py` + `build/bootstrap/orin2` (for suites). Default: cwd. |
+| `--repo <dir>` | Orin checkout providing `runtime/core/` and `runtime/platform/` (for linking) and `tools/run_tests.py` + `build/bootstrap/orin2` (for suites). Default: cwd. |
 
 Transport: stdio, newline-delimited JSON-RPC (one message per line, no embedded newlines).
 Protocol revision: **2025-06-18** (`initialize`, `ping`, `tools/list`, `tools/call`; notifications

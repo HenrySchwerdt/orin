@@ -99,18 +99,18 @@ def compile_orin(args, entry, c_out, flags=()):
 
 def runtime_sources(backend):
     """C runtime sources to link; the LLVM backend also needs the out-of-line shim."""
-    srcs = [os.path.join("runtime", "orin_runtime.c"), os.path.join("platform", "orin_platform.c")]
+    srcs = [os.path.join("runtime", "core", "orin_runtime.c"), os.path.join("runtime", "platform", "orin_platform.c")]
     if backend == "llvm":
-        srcs.append(os.path.join("runtime", "orin_runtime_llvm.c"))
+        srcs.append(os.path.join("runtime", "core", "orin_runtime_llvm.c"))
     return srcs
 
 
 def cc_base(args):
     """The C compiler command and flags a test executable is built with (without the inputs)."""
     if args.backend == "llvm":
-        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime"]
+        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime/core"]
     else:
-        cc = [args.cc, "-O1", "-w", "-I", "runtime"]
+        cc = [args.cc, "-O1", "-w", "-I", "runtime/core"]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     return cc
@@ -126,7 +126,7 @@ def runtime_objects(args):
     cc = cc_base(args)
     h = hashlib.sha256(repr(cc).encode())
     h.update(run_cmd([cc[0], "--version"], 30)[1].encode())  # a C compiler upgrade rebuilds the objects
-    for d in ("runtime", "platform"):
+    for d in ("runtime/core", "runtime/platform"):
         for f in sorted(os.listdir(os.path.join(ROOT, d))):
             if f.endswith((".c", ".h")):
                 h.update(f.encode())
