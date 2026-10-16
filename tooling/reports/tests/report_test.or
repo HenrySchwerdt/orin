@@ -1,0 +1,187 @@
+import {
+  renderReport, Report, Section, MetaItem, Table, Column, Cell, Card, Cards, Paragraph, Notice, Heading, Data, Diff, DiffTable, DiffRow,
+  DiffAdded, DiffRemoved, DiffChanged, DiffSame, Details, Figure, Failed, Passed, Regression, cell, statusCell, monoCell, left, right,
+  card, cardFull, section, newCanvas, newBareCanvas, svgText, safeRelativeUrl, compact, xmlEscape, fixed, fixedSigned, general, round3,
+  grouped, THEME_VERSION,
+} from "../src";
+import { assertEqString, assertEqBool, assert } from "std:test";
+
+const EVIL: string = "<script>alert(1)</script>&\"'";
+
+function contains(s: string, needle: string): bool {
+  return s.indexOf(needle).isSome();
+}
+
+function evilReport(): Report {
+  const table = Table {
+    caption: EVIL, columns: [left(EVIL), right("n")],
+    rows: [[monoCell(EVIL), statusCell(EVIL, Failed)]], emptyText: EVIL,
+  };
+  let canvas = newCanvas(100, 50, EVIL, EVIL, "x-");
+  canvas.text(1.0, 2.0, EVIL, "t", 12, "start", "normal", 0);
+  return Report {
+    title: EVIL, subtitle: EVIL, meta: [MetaItem { label: EVIL, value: EVIL }],
+    sections: [section("s" + "\"><script>", EVIL, Some(EVIL), [
+      Cards([card(EVIL, EVIL, Some(EVIL), Some(Regression))]), Paragraph(EVIL), Notice(Failed, EVIL), Heading(EVIL), Data(table),
+      Diff(DiffTable { caption: EVIL, labelHeader: EVIL, beforeHeader: EVIL, afterHeader: EVIL,
+                       rows: [DiffRow { kind: DiffAdded, label: EVIL, before: EVIL, after: EVIL }], emptyText: EVIL }),
+      Figure(EVIL, EVIL, canvas.finish()), Details(EVIL, EVIL),
+    ])],
+    footer: EVIL,
+  };
+}
+
+@Test
+function hostile_text_is_escaped_everywhere(): void {
+  const html = renderReport(evilReport());
+  // the only <script> a page may contain is none at all
+  assertEqBool(contains(html, "<script"), false, "raw <script> in the page");
+  assertEqBool(contains(html, "alert(1)</script>"), false, "raw closing tag");
+  assertEqBool(contains(html, "&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;&#39;"), true, "escaped text present");
+  assertEqBool(contains(html, "\"><script>"), false, "attribute breakout");
+}
+
+@Test
+function page_has_no_remote_resources_and_no_scripts(): void {
+  const html = renderReport(evilReport());
+  assertEqBool(contains(html, "http://"), contains(html, "http://www.w3.org/2000/svg"), "only the SVG namespace may look like a URL");
+  assertEqBool(contains(html, "https://"), false, "remote https");
+  assertEqBool(contains(html, "<link"), false, "stylesheet link");
+  assertEqBool(contains(html, "<img"), false, "image");
+  assertEqBool(html.startsWith("<!DOCTYPE html><html lang=\"en\">"), true, "doctype and language");
+  assertEqBool(contains(html, "name=\"viewport\""), true, "viewport");
+}
+
+@Test
+function status_is_text_not_only_colour(): void {
+  const html = renderReport(Report { title: "T", subtitle: "S", meta: [], footer: "F", sections: [
+    section("a", "A", None, [Notice(Passed, "ok"), Notice(Regression, "slower")])] });
+  assertEqBool(contains(html, "r-badge-passed"), true, "passed class");
+  assertEqBool(contains(html, ">Passed<"), true, "passed label");
+  assertEqBool(contains(html, "r-badge-regression"), true, "regression class");
+  assertEqBool(contains(html, "role=\"alert\""), false, "only failures are alerts");
+}
+
+@Test
+function empty_table_shows_its_empty_text(): void {
+  const t = Table { caption: "C", columns: [left("a")], rows: [], emptyText: "nothing here" };
+  const html = renderReport(Report { title: "T", subtitle: "S", meta: [], footer: "F", sections: [section("a", "A", None, [Data(t)])] });
+  assertEqBool(contains(html, "<p class=\"r-empty\">nothing here</p>"), true, "empty state");
+}
+
+@Test
+function diff_rows_carry_text_markers(): void {
+  const t = DiffTable { caption: "C", labelHeader: "k", beforeHeader: "b", afterHeader: "a", emptyText: "-", rows: [
+    DiffRow { kind: DiffAdded, label: "x", before: "", after: "1" }, DiffRow { kind: DiffRemoved, label: "y", before: "2", after: "" },
+    DiffRow { kind: DiffChanged, label: "z", before: "1", after: "2" }, DiffRow { kind: DiffSame, label: "w", before: "3", after: "3" }] };
+  const html = renderReport(Report { title: "T", subtitle: "S", meta: [], footer: "F", sections: [section("a", "A", None, [Diff(t)])] });
+  assertEqBool(contains(html, "r-diff-added"), true, "added");
+  assertEqBool(contains(html, "r-diff-removed"), true, "removed");
+  assertEqBool(contains(html, "r-diff-changed"), true, "changed");
+  assertEqBool(contains(html, "<span class=\"r-sr\">added: </span>"), true, "screen reader text");
+}
+
+@Test
+function rendering_is_deterministic(): void {
+  assertEqString(renderReport(evilReport()), renderReport(evilReport()), "same input, same bytes");
+}
+
+@Test
+function xml_escape_matches_saxutils(): void {
+  assertEqString(xmlEscape("a&b<c>d\"e'"), "a&amp;b&lt;c&gt;d\"e'", "& < > only");
+  assertEqString(xmlEscape("plain"), "plain", "no change");
+}
+
+@Test
+function svg_text_is_escaped(): void {
+  let canvas = newCanvas(10, 10, EVIL, EVIL, "p-");
+  canvas.marker("s1", 1.0, 2.0, EVIL);
+  const xml = canvas.finish().xml;
+  assertEqBool(contains(xml, "<script"), false, "raw <script> in svg");
+  assertEqBool(contains(xml, "aria-labelledby=\"p-title p-desc\""), true, "id prefix");
+}
+
+@Test
+function fixed_rounds_like_printf(): void {
+  assertEqString(fixed(0.5, 0), "0", "half to even");
+  assertEqString(fixed(1.5, 0), "2", "half to even");
+  assertEqString(fixed(2.675, 2), "2.67", "binary value below the tie");
+  assertEqString(fixed(1.0005, 3), "1.000", "binary value below the tie");
+  assertEqString(fixed(-0.0004, 3), "-0.000", "sign kept");
+  assertEqString(fixed(0.0009765625, 3), "0.001", "k = 63 corner");
+  assertEqString(fixed(123456.789, 1), "123456.8", "plain");
+  assertEqString(fixedSigned(3.14159, 1, true), "+3.1", "plus flag");
+  assertEqString(fixed(100000000000000000.0, 1), "100000000000000000.0", "large integral value");
+}
+
+@Test
+function general_is_percent_g(): void {
+  assertEqString(general(round3(0.5)), "0.5", "trailing zeros removed");
+  assertEqString(general(round3(100.0)), "100", "integral");
+  assertEqString(general(round3(1234567.0)), "1.23457e+06", "exponent form");
+  assertEqString(general(round3(-6514.4547750365155)), "-6514.45", "tie decided by the binary value");
+  assertEqString(general(0.0), "0", "zero");
+}
+
+@Test
+function grouped_inserts_commas(): void {
+  assertEqString(grouped(0), "0", "zero");
+  assertEqString(grouped(999), "999", "three digits");
+  assertEqString(grouped(1000), "1,000", "four digits");
+  assertEqString(grouped(24496056957), "24,496,056,957", "large");
+  assertEqString(grouped(-1234567), "-1,234,567", "negative");
+}
+
+@Test
+function theme_version_is_declared(): void {
+  assert(THEME_VERSION.length > 0, "theme version");
+}
+
+@Test
+function compact_is_a_short_exact_form(): void {
+  assertEqString(compact(0), "0", "zero");
+  assertEqString(compact(999), "999", "below a thousand");
+  assertEqString(compact(12345), "12.35 k", "thousands");
+  assertEqString(compact(1500000), "1.50 M", "millions");
+  assertEqString(compact(24496056957), "24.50 G", "billions");
+  assertEqString(compact(3100000000000), "3.10 T", "trillions");
+}
+
+@Test
+function card_values_are_one_line_and_carry_the_exact_value(): void {
+  const html = renderReport(Report { title: "T", subtitle: "S", meta: [], footer: "F", sections: [
+    section("a", "A", None, [Cards([cardFull("L", "24.50 G", "24,496,056,957 instructions", None, None)])])] });
+  assertEqBool(contains(html, "<div class=\"r-card-value\" title=\"24,496,056,957 instructions\">24.50 G</div>"), true, "tooltip");
+  assertEqBool(contains(html, "tabular-nums; white-space: nowrap; overflow: hidden"), true, "a number never breaks mid-way");
+}
+
+@Test
+function card_grid_has_no_orphan_row(): void {
+  let six: Card[] = [];
+  let i: int = 0;
+  while (i < 6) {
+    six.push(card("c", "1", None, None));
+    i += 1;
+  }
+  const html = renderReport(Report { title: "T", subtitle: "S", meta: [], footer: "F", sections: [section("a", "A", None, [Cards(six)])] });
+  assertEqBool(contains(html, "<ul class=\"r-cards r-cols-3\">"), true, "6 cards: 3 + 3");
+}
+
+@Test
+function svg_links_are_relative_only(): void {
+  assertEqBool(safeRelativeUrl("modules/a.html#x"), true, "relative page and fragment");
+  assertEqBool(safeRelativeUrl("#x"), true, "fragment");
+  assertEqBool(safeRelativeUrl("javascript:alert(1)"), false, "script scheme");
+  assertEqBool(safeRelativeUrl("https://example.org/"), false, "absolute URL");
+  assertEqBool(safeRelativeUrl("//example.org/"), false, "protocol relative");
+  assertEqBool(safeRelativeUrl("a\"b"), false, "quote");
+  assertEqBool(safeRelativeUrl(""), false, "empty");
+  let c = newBareCanvas(10, 10, "t", "d", "x-", "g");
+  c.link("javascript:alert(1)", "n", EVIL);
+  c.rrect("a\"><script>", 0.0, 0.0, 1.0, 1.0, 1.0);
+  c.endLink();
+  const xml = svgText(c.finish());
+  assertEqBool(contains(xml, "<a "), false, "unsafe link is not an anchor");
+  assertEqBool(contains(xml, "<script"), false, "class names are reduced to tokens");
+  assertEqBool(contains(xml, "&lt;script&gt;"), true, "tooltip text escaped");
+}

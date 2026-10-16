@@ -1,8 +1,8 @@
 # Workspace manifest (`orin-workspace.toml`) — specification
 
-Status: parser, pure resolution, lockfile and inspection CLI implemented and tested.
+Status: parser, pure resolution, lockfile, inspection CLI and workspace-wide `build|check|test|fmt` implemented and tested.
 `orin workspace list|lock|check` discovers the nearest workspace, including from member source directories.
-Workspace-aware build/check/test/fmt and the shared external-dependency lock design remain pending. No files move.
+The shared external-dependency lock design remains pending.
 
 ## 1. File and discovery
 
@@ -55,7 +55,8 @@ no backslashes. Resolution is lexicographic, so the member order is deterministi
 - It holds one `[member.<name>]` table per member, in build order, with `path`, `version` and `dependencies` (the
   member names it depends on). `lockText` in `compiler/package/resolve.or` is the canonical text.
 - A build whose resolution differs from the lock (a member added, removed, moved, re-versioned or with changed member
-  dependencies) fails with E0509 at the differing table; `--locked` is the default in CI. External dependencies join the
+  dependencies) fails with E0509 at the differing table when run with `--locked` (see section 6); `--locked` is the default
+  when the `CI` environment variable is set to anything but empty, `0` or `false`. External dependencies join the
   lock when the package manager resolves them.
 
 ## 5. Diagnostics
@@ -86,13 +87,58 @@ quiet/verbose options are accepted; list output remains data even in quiet mode.
 cannot yet record external dependency resolutions. Existing project dependency commands retain their current meaning;
 `orin update` still updates Git dependencies. Read/write and directory enumeration errors must abort before lock mutation.
 
-Planned: `orin build|check|test|fmt` in a workspace act on `default-members` (all members when absent); `-p <name>` selects one
-package, `--workspace` all. `orin workspace list` prints the members in build order. Standalone projects are unchanged.
+### Workspace-wide `build`, `check`, `test`, `fmt`
+
+```sh
+orin build                     # at the workspace root: the default-members (all members if the key is absent)
+orin build --workspace         # every member, dependency order, ties by package name
+orin test -p app -p lib        # only these members, still in dependency order
+orin fmt --check --workspace
+orin check --workspace --locked
+```
+
+| flag | meaning |
+|---|---|
+| `--workspace` | all members |
+| `-p <name>`, `--package <name>`, `--package=<name>` | one member (repeatable); an unknown name is a usage error (exit 2) listing the members; cannot be combined with `--workspace` |
+| `--locked` / `--unlocked` | require / do not require a current `orin.lock` (E0509 on drift or when it is missing); `--locked` is implied when `CI` is set, `--unlocked` overrides |
+| `--keep-going` / `--fail-fast` | continue after / stop at the first failing member (defaults below) |
+
+Mode selection. Workspace mode starts when `--workspace`, `-p` or `--package` is present (from the root or from inside any
+member), or when the command has no path argument and the current directory is itself a workspace root. Everything else
+(a member directory without flags, an explicit path, no workspace file at all) is the unchanged single-project command,
+byte for byte; the workspace-only flags `--locked`, `--unlocked`, `--keep-going` and `--fail-fast` are then rejected as unknown
+options exactly as before. Workspace flags with no workspace file are an error (exit 1), never a silent single-project run.
+
+Execution. The compiler validates the whole workspace first (manifest, member graph, `--locked` lock) and prints every
+error with its span before any member runs, so a cycle, missing member or stale lock stops the command with exit 1 and no
+member output. Each selected member then runs the ordinary single-project command in its own directory, announced as
+`→ build app (2/3)` (`>` with `--ascii`) on stderr. The member's own flags, output and exit status are unchanged. Arguments after the
+workspace flags are passed to every member (`--release`, `--backend`, `--filter`, `--check`...). An explicit path argument,
+`--format=json` and `test --watch` are usage errors (exit 2) in workspace mode; run those inside one member.
+
+Failure rule.
+- `build` and `check` stop at the first failing member (a later member may depend on it) and exit with that member's status.
+  The message says how many members were not run. `--keep-going` runs the rest, then exits 1 naming every failed member.
+- `test` and `fmt` run every member, then exit 1 naming the failed members. `--fail-fast` stops at the first failure.
+- Exit statuses: 0 all selected members succeeded; 1 a member or the workspace validation failed; 2 usage error.
+
+Per-command notes.
+- `build`: a member whose entry file defines no `function main(` is a library; it is type-checked (`check`) instead of
+  producing an executable, and the driver says so.
+- `test`: members without tests are not an error (`--allow-empty` is implied). With `--filter`, members matching nothing are
+  skipped, and the command fails only if the filter matches in no member. Use `-p <name>` to require tests of one member.
+- `fmt`: `orin fmt --check --workspace` reports every unformatted member; `orin fmt --workspace` rewrites them.
+- Path dependencies between members still need each member's project `orin.lock` (`orin fetch` in that member); the
+  workspace `orin.lock` only records the member snapshot.
+
+`orin workspace list --default` prints only the `default-members` (all members if absent), still in build order.
 
 ## 7. Fixtures
 
 `tests/workspace/` holds one directory per case. `ok/<case>/` must resolve; its `expected.txt` lists the members in build
 order. `fail/<case>/` must be rejected; its `expected.txt` holds the expected code and the line of the span, as
 `E0505 3`. `compiler/tests/workspace_fixtures.or` executes every fixture, including stale locks, in the tooling CI
-suite. `compiler/package/wscli_smoke.or` checks adapter usage; `tools/test_cli.py` exercises all 30 fixtures through the packaged
+suite. `tests/workspace_cli/ok/` is a runnable three-member workspace (`app` depends on `lib`, plus `tool`) that
+`tools/test_cli.py` copies and mutates for the workspace-wide command journeys: member selection, `--locked`, cycle, missing member, stale lock, the failure rules and `fmt --check`. `compiler/package/wscli_smoke.or` checks adapter usage; `tools/test_cli.py` exercises all 30 fixtures through the packaged
 CLI, discovery, diagnostics, stale locks and overwrite protection.

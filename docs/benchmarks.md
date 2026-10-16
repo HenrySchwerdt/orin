@@ -745,7 +745,7 @@ and valgrind from apt, after the seed bootstrap of `tools/bootstrap.sh`. It does
 
 Locally the same numbers come from
 `python3 tools/bench.py --runs 1 --only fib,sieve --json build/bench/x.json --instructions` and
-`python3 tools/bench_report.py summary build/bench/x.json`.
+`build/bench/bench-report summary build/bench/x.json` (built from `tooling/benchmarks`, see "Benchmark report tool").
 
 Permissions are least privilege: the workflow token is `contents: read`; only the `history` job has `contents: write` (to
 push to `bench-results`) and only the `compare` job has `pull-requests: write` (to comment). A pull request from a fork gets
@@ -795,7 +795,7 @@ cost of copying chunks, joining and oversubscription.
 
 The job summary has: wall time of Orin (C and LLVM backend), C, Go, Java and Rust; ratios to C; CPU time and RSS; executed
 instructions with the Orin/C ratios; the parallel table (wall, CPU, speedup, efficiency); the self-compile (time, CPU, RSS,
-instructions). The PR comment (`tools/bench_report.py compare`) is one table per Orin binary and benchmark plus the
+instructions). The PR comment (`bench-report compare`) is one table per Orin binary and benchmark plus the
 self-compile: instructions on `main` and on the PR, wall time on `main` and on the PR, the changes, and a verdict:
 **regression (instructions)** above +2 %, **regression (wall time)** above +15 %, *improvement* below -2 % instructions. The
 baseline of each row is the newest `main` entry of the history that has that row. The comment only reports; the job does not
@@ -813,6 +813,32 @@ An orphan branch of this repository, created by the first run on `main` and only
     charts/parallel.svg                 speedup by worker threads (latest run, with the ideal line) and at 4 threads over time
     README.md                           the charts, the latest run's tables, the list of runs
 
-`tools/bench_report.py render --history history --out .` regenerates the charts and the README (stdlib only). Opening the
+`bench-report render --history history --out .` regenerates the charts, the README and `report.html`. Opening the
 branch on GitHub shows the README with the charts; no GitHub Pages. The SVGs have their own light background, axis titles, a
 legend and a `<title>` / `<desc>`; under a dark system color scheme they switch to the dark steps of the same palette.
+
+### Benchmark report tool (`tooling/benchmarks`, ADR-0047 phase 6)
+
+The reports of the workflow are written in Orin: `tooling/benchmarks` (package `orin-bench-report`) replaces
+`tools/bench_report.py` and depends on `tooling/reports` (package `orin-reports`: typed report model, shared OX components,
+the static CSS design system, an SVG canvas and exact number formatting). Build and use:
+
+```sh
+build/bootstrap/orin2 compile tooling/benchmarks -o build/bench/bench-report.c
+cc -O1 -w -I runtime build/bench/bench-report.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/bench/bench-report
+build/bench/bench-report summary RUN.json                      # job summary (Markdown)
+build/bench/bench-report compare --history DIR RUN.json        # PR comment (Markdown, always exit 0)
+build/bench/bench-report render --history DIR --out DIR [--repo owner/name]   # charts/*.svg, README.md, report.html
+```
+
+`report.html` is a stand-alone page (no script, no remote resources; light and dark): summary cards, regression and mismatch
+notices, the four charts inline, wall-time and ratio tables, executed instructions with a verdict against the previous run,
+memory, parallel speedup, self-compile and the history. The `bench-results` branch gets it next to `README.md`.
+`tooling/benchmarks/test.sh` (run by `tools/test_tooling.sh`) diffs Markdown, SVG and README byte for byte against goldens
+produced by the Python tool (real history plus a synthetic multi-run, a hostile benchmark name, a broken history file and an
+empty history), checks escaping and the offline property, and runs the `tooling/reports` unit tests.
+Differences from the Python tool: the README names the new tool and links `report.html`; a run file that is invalid JSON or not an
+object exits 1 with a one-line message instead of a traceback; `--repo` has no `GITHUB_REPOSITORY` default (Orin has no
+environment access; the workflow passes it). Workarounds for missing language/library features: `std:fs` cannot create
+directories (`render` runs `mkdir -p` through `std:io.shell`), floats have no fixed-precision formatting
+(`tooling/reports/src/numfmt.or` implements `%.Nf`, `%g` and `round` exactly with 64-bit integers), and `float` has no `log10`.

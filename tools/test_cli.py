@@ -46,8 +46,10 @@ class CliTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_cli(self, *args, code=0, cwd=None, env=None):
+        # CI implies --locked in workspace mode; tests set it explicitly where they mean it.
+        base = {k: v for k, v in os.environ.items() if k != "CI"}
         result = subprocess.run([str(self.cli), *args], cwd=cwd or self.cwd,
-                                env={**os.environ, "NO_COLOR": "1", **(env or {})},
+                                env={**base, "NO_COLOR": "1", **(env or {})},
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
@@ -226,6 +228,159 @@ class CliTests(unittest.TestCase):
                     count += 1
         self.assertEqual(count, 30)
 
+
+    # ADR-0047 phase 2: workspace-wide build/check/test/fmt over tests/workspace_cli/ok (app -> lib, tool).
+    def cli_workspace(self):
+        root = self.cwd / "ws"
+        shutil.copytree(ROOT / "tests/workspace_cli/ok", root)
+        self.run_cli("workspace", "lock", cwd=root)
+        return root
+
+    @staticmethod
+    def steps(result, command):
+        return [line.split()[2] for line in result.stderr.splitlines()
+                if line.startswith(("→ " + command + " ", "> " + command + " "))]
+
+    def test_workspace_commands_select_members(self):
+        root = self.cli_workspace()
+        # No flags at the root: default-members only.
+        result = self.run_cli("build", cwd=root)
+        self.assertEqual(self.steps(result, "build"), ["app"])
+        self.assertFalse((root / "tool/build").exists())
+        # --workspace: every member in dependency order, ties by name; a library is checked, not built.
+        result = self.run_cli("build", "--workspace", cwd=root)
+        self.assertEqual(self.steps(result, "build"), ["lib", "app", "tool"])
+        self.assertIn("lib is a library", result.stderr)
+        self.assertTrue((root / "tool/build/dev/tool").exists())
+        # -p selects one member from the root or from inside another member.
+        result = self.run_cli("check", "-p", "tool", cwd=root / "app")
+        self.assertEqual(self.steps(result, "check"), ["tool"])
+        result = self.run_cli("check", "--package=lib", "-p", "app", cwd=root)
+        self.assertEqual(self.steps(result, "check"), ["lib", "app"])
+        result = self.run_cli("test", "--workspace", cwd=root)
+        self.assertEqual(self.steps(result, "test"), ["lib", "app", "tool"])
+        self.assertIn("1 passed", result.stdout)
+        # --filter: members matching nothing are skipped; a filter matching in no member fails.
+        self.assertIn("1 passed", self.run_cli("test", "--workspace", "--filter", "addition", cwd=root).stdout)
+        nothing = self.run_cli("test", "--workspace", "--filter", "nonexistent", cwd=root, code=1)
+        self.assertIn("No tests matched in any workspace member", nothing.stderr)
+        # Inside a member without flags the command is the unchanged single-project command.
+        result = self.run_cli("check", cwd=root / "app")
+        self.assertNotIn("(1/", result.stderr)
+
+    def test_workspace_list_default_members(self):
+        fixture = ROOT / "tests/workspace/ok/default_members"
+        for invoke in (self.run_cli, self.run_compiler):
+            self.assertEqual(invoke("workspace", "list", "--default", cwd=fixture).stdout, "b  b\n")
+            self.assertEqual(invoke("workspace", "list", cwd=fixture).stdout, "a  a\nb  b\n")
+        # Without `default-members` every member is a default member.
+        single = ROOT / "tests/workspace/ok/topo_order"
+        self.assertEqual(self.run_cli("workspace", "list", "--default", cwd=single).stdout,
+                         self.run_cli("workspace", "list", cwd=single).stdout)
+        self.run_cli("workspace", "lock", "--default", cwd=fixture, code=2)
+
+    def test_repository_root_workspace(self):
+        # The repository's own orin-workspace.toml and orin.lock stay valid and discoverable from nested directories.
+        for cwd in (ROOT, ROOT / "compiler/package", ROOT / "docs"):
+            self.run_cli("workspace", "check", cwd=cwd)
+            self.assertIn("orin-compiler  compiler\n", self.run_cli("workspace", "list", cwd=cwd).stdout)
+
+    def test_workspace_command_usage_errors(self):
+        root = self.cli_workspace()
+        for args in (("build", "--workspace", "-p", "app"), ("build", "-p"), ("build", "-p", "ghost"),
+                     ("check", "--workspace", "app"), ("build", "--workspace", "--format=json"),
+                     ("test", "--workspace", "--watch")):
+            with self.subTest(args=args):
+                self.run_cli(*args, cwd=root, code=2)
+        self.assertIn("Members: lib app tool", self.run_cli("build", "-p", "ghost", cwd=root, code=2).stderr)
+        # Workspace flags outside a workspace are an error, never a silent single-project run.
+        self.run_cli("build", "--workspace", code=1)
+        # Standalone projects keep rejecting workspace-only flags and building as before.
+        project = self.cwd / "solo"
+        shutil.copytree(ROOT / "tests/workspace_cli/ok/tool", project)
+        self.run_cli("build", "--locked", cwd=project, code=2)
+        self.run_cli("build", cwd=project)
+
+    def test_workspace_locked_enforcement(self):
+        root = self.cwd / "ws"
+        shutil.copytree(ROOT / "tests/workspace_cli/ok", root)
+        # Not locked by default outside CI; --locked demands a current orin.lock (E0509); CI makes it the default.
+        self.run_cli("check", "--workspace", cwd=root)
+        missing = self.run_cli("check", "--workspace", "--locked", cwd=root, code=1)
+        self.assertIn("E0509", missing.stderr)
+        self.assertIn("E0509", self.run_cli("check", "--workspace", cwd=root, code=1, env={"CI": "true"}).stderr)
+        self.run_cli("check", "--workspace", "--unlocked", cwd=root, env={"CI": "true"})
+        self.run_cli("workspace", "lock", cwd=root)
+        self.run_cli("check", "--workspace", "--locked", cwd=root)
+        self.run_cli("build", "--locked", cwd=root, env={"CI": "true"})
+        # Drift: a member re-versioned. The error names orin.lock and the offending line.
+        manifest = root / "tool/orin.toml"
+        manifest.write_text(manifest.read_text().replace("0.1.0", "0.2.0"))
+        stale = self.run_cli("build", "--workspace", "--locked", cwd=root, code=1)
+        self.assertIn("error[E0509]", stale.stderr)
+        self.assertRegex(stale.stderr, r"orin\.lock:\d+:\d+")
+        self.assertEqual(self.steps(stale, "build"), [])
+        self.run_cli("test", "-p", "tool", "--locked", cwd=root, code=1)
+        # Without --locked the same drift is not enforced.
+        self.run_cli("check", "--workspace", cwd=root)
+
+    def test_workspace_manifest_errors_stop_before_any_member(self):
+        root = self.cli_workspace()
+        lib = root / "lib/orin.toml"
+        original = lib.read_text()
+        lib.write_text(original + '\n[dependencies]\napp = { path = "../app" }\n')
+        cycle = self.run_cli("check", "--workspace", cwd=root, code=1)
+        self.assertIn("E0508", cycle.stderr)
+        self.assertIn("cycle", cycle.stderr)
+        self.assertEqual(self.steps(cycle, "check"), [])
+        lib.write_text(original)
+        (root / "orin-workspace.toml").write_text('[workspace]\nmembers = ["app", "lib", "tool", "ghost"]\n')
+        missing = self.run_cli("build", "--workspace", cwd=root, code=1)
+        self.assertIn("E0505", missing.stderr)
+        self.assertRegex(missing.stderr, r"orin-workspace\.toml:2:\d+")
+        self.assertEqual(self.steps(missing, "build"), [])
+        # Default selection validates the whole workspace too.
+        self.assertIn("E0505", self.run_cli("test", cwd=root, code=1).stderr)
+
+    def test_workspace_failing_member_rules(self):
+        root = self.cli_workspace()
+        (root / "app/main.or").write_text("function main(): void {\n  const x: int = \"no\";\n}\n")
+        # build/check stop at the first failing member and exit with its status.
+        stopped = self.run_cli("build", "--workspace", cwd=root, code=1)
+        self.assertEqual(self.steps(stopped, "build"), ["lib", "app"])
+        self.assertIn("not running the remaining 1 member(s)", stopped.stderr)
+        self.assertFalse((root / "tool/build").exists())
+        # --keep-going continues, then exits 1 and names every failed member.
+        kept = self.run_cli("check", "--workspace", "--keep-going", cwd=root, code=1)
+        self.assertEqual(self.steps(kept, "check"), ["lib", "app", "tool"])
+        self.assertIn("failed in 1 of 3 workspace member(s): app", kept.stderr)
+        # test continues by default; --fail-fast stops.
+        (root / "app/main.or").write_text("function main(): void {}\n")
+        (root / "lib/tests").mkdir()
+        (root / "lib/tests/lib_test.or").write_text(
+            'import { assertEq } from "std:test";\n\n@Test\nfunction broken(): void {\n  assertEq(1, 2, "mismatch");\n}\n')
+        all_tests = self.run_cli("test", "--workspace", cwd=root, code=1)
+        self.assertEqual(self.steps(all_tests, "test"), ["lib", "app", "tool"])
+        self.assertIn("failed in 1 of 3 workspace member(s): lib", all_tests.stderr)
+        self.assertIn("1 passed", all_tests.stdout)
+        early = self.run_cli("test", "--workspace", "--fail-fast", cwd=root, code=1)
+        self.assertEqual(self.steps(early, "test"), ["lib"])
+        # Running the failing member alone gives the same exit status as standalone.
+        self.run_cli("test", cwd=root / "lib", code=1)
+
+    def test_workspace_fmt_check_across_members(self):
+        root = self.cli_workspace()
+        self.run_cli("fmt", "--check", "--workspace", cwd=root)
+        bad = root / "tool/main.or"
+        bad.write_text('function main():void{console.log( "tool" );}\n')
+        result = self.run_cli("fmt", "--check", "--workspace", cwd=root, code=1)
+        self.assertEqual(self.steps(result, "fmt"), ["lib", "app", "tool"])
+        self.assertIn("failed in 1 of 3 workspace member(s): tool", result.stderr)
+        self.assertEqual(bad.read_text(), 'function main():void{console.log( "tool" );}\n')
+        self.run_cli("fmt", "-p", "app", "--check", cwd=root)
+        self.run_cli("fmt", "--workspace", cwd=root)
+        self.assertEqual(bad.read_text(), 'function main(): void {\n  console.log("tool");\n}\n')
+        self.run_cli("fmt", "--check", "--workspace", cwd=root)
 
     def test_help_and_usage(self):
         self.assertIn("init", self.run_cli("--help").stdout)

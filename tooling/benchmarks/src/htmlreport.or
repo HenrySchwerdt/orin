@@ -1,0 +1,334 @@
+// report.html: the stand-alone benchmark report. This module only builds the typed `Report` (orin-reports' model) from the
+// benchmark runs; all markup, escaping and styling is done by orin-reports' OX components.
+
+import {
+  Report, Section, MetaItem, Block, Cards, Paragraph, Notice, Heading, Data, Figure, Details, Table, Column, Cell, Card, Status,
+  Passed, Failed, Regression, Diff, DiffTable, DiffRow, DiffKind, DiffChanged, DiffSame, Improvement, Skipped, Info, cell, monoCell, statusCell, left, right, card, cardFull, section, fixed, compact, grouped, renderReport,
+} from "orin-reports";
+import {
+  BenchRun, Bench, langCell, instrCell, selfInstr, selfWall, dateRaw, dateOrQ,
+} from "./bench";
+import {
+  s3, big, ratio, fpct, short, head, langName, baseRuns, collectRows, verdictOf, Row, INSTR_THRESHOLD, WALL_THRESHOLD,
+} from "./markdown";
+import { chartRatio, chartSelfcompile, chartParallel, Wall, Instructions } from "./charts";
+
+function langs6(): string[] {
+  return ["orin", "llvm", "c", "go", "java", "rust"];
+}
+
+function orQ(s: Option<string>): string {
+  return s.isSome() && s.unwrap().length > 0 ? s.unwrap() : "?";
+}
+
+function wallTable(latest: BenchRun): Table {
+  let rows: Cell[][] = [];
+  for (const b of latest.benches) {
+    let r: Cell[] = [cell(b.name)];
+    for (const l of langs6()) {
+      const c = langCell(b, l);
+      if (!c.present) {
+        r.push(cell("n/a"));
+      } else if (c.wallMedian.isNone() || !c.outputMatched) {
+        r.push(statusCell(c.wallMedian.isNone() ? "n/a" : s3(c.wallMedian), Failed));
+      } else {
+        r.push(cell(s3(c.wallMedian)));
+      }
+    }
+    rows.push(r);
+  }
+  let cols: Column[] = [left("Benchmark")];
+  for (const l of langs6()) {
+    cols.push(right(langName(l)));
+  }
+  return Table { caption: "Wall time in seconds (median of the timed runs; lower is better)", columns: cols, rows: rows,
+                 emptyText: "This run has no benchmark results." };
+}
+
+function ratioTable(latest: BenchRun): Table {
+  let rows: Cell[][] = [];
+  for (const b of latest.benches) {
+    const c = langCell(b, "c").wallMedian;
+    let r: Cell[] = [cell(b.name)];
+    for (const l of ["orin", "llvm", "go", "java", "rust"]) {
+      r.push(cell(ratio(langCell(b, l).wallMedian, c)));
+    }
+    rows.push(r);
+  }
+  return Table {
+    caption: "Wall-time ratio to C (1.00x = as fast as C; lower is better)",
+    columns: [left("Benchmark"), right("Orin (C backend) / C"), right("Orin (LLVM backend) / C"), right("Go / C"), right("Java / C"),
+              right("Rust / C")],
+    rows: rows, emptyText: "This run has no benchmark results.",
+  };
+}
+
+// the short form on the card (24.50 G), the exact count as its tooltip
+function selfInstrCard(n: Option<int>): Card {
+  const note = Some("orin2 compiling compiler/main.or");
+  return n.isNone() ? card("Self-compile instructions", "n/a", note, None)
+                    : cardFull("Self-compile instructions", compact(n.unwrap()), grouped(n.unwrap()) + " instructions", note, None);
+}
+
+function intRatio(a: Option<int>, b: Option<int>): string {
+  if (a.isNone() || b.isNone() || b.unwrap() == 0) {
+    return "n/a";
+  }
+  return fixed(a.unwrap().toFloat() / b.unwrap().toFloat(), 2) + "x";
+}
+
+function countOf(b: Bench, lang: string): Option<int> {
+  const c = instrCell(b, lang);
+  return c.isNone() ? None : c.unwrap().count;
+}
+
+// verdict of one benchmark against the previous run: the worst of its Orin rows
+function verdictCell(rows: Row[], bench: string): Cell {
+  let reg = false;
+  let imp = false;
+  let seen = false;
+  for (const r of rows) {
+    if (r.bench == bench) {
+      seen = true;
+      const v = verdictOf(r.baseInstr, r.headInstr, r.baseWall, r.headWall);
+      if (v.regression) {
+        reg = true;
+      }
+      for (const lab of v.labels) {
+        if (lab == "improvement") {
+          imp = true;
+        }
+      }
+    }
+  }
+  if (!seen) {
+    return statusCell("no baseline", Skipped);
+  }
+  if (reg) {
+    return statusCell("vs previous run", Regression);
+  }
+  if (imp) {
+    return statusCell("vs previous run", Improvement);
+  }
+  return statusCell("vs previous run", Passed);
+}
+
+function instrTable(latest: BenchRun, rows: Row[], haveBase: bool): Table {
+  let out: Cell[][] = [];
+  for (const b of latest.benches) {
+    if (b.instructions.length == 0) {
+      continue;
+    }
+    const o = countOf(b, "orin");
+    const l = countOf(b, "llvm");
+    const c = countOf(b, "c");
+    let notes: string[] = [];
+    for (const e of b.instructions) {
+      if (e.cell.skipped.isSome()) {
+        notes.push(e.lang + " skipped: " + e.cell.skipped.unwrap());
+      }
+      if (e.cell.args.length > 0) {
+        notes.push("reduced input: " + e.cell.args.join(" "));
+      }
+    }
+    out.push([cell(b.name), cell(big(o)), cell(big(l)), cell(big(c)), cell(intRatio(o, c)), cell(intRatio(l, c)),
+              haveBase ? verdictCell(rows, b.name) : statusCell("no baseline", Skipped), cell(notes.join("; "))]);
+  }
+  return Table {
+    caption: "Executed instructions under valgrind (deterministic for single-threaded programs; the regression metric)",
+    columns: [left("Benchmark"), right("Orin (C backend)"), right("Orin (LLVM backend)"), right("C"), right("Orin C / C"),
+              right("Orin LLVM / C"), left("Verdict"), left("Note")],
+    rows: out, emptyText: "This run has no instruction counts.",
+  };
+}
+
+function memoryTable(latest: BenchRun): Table {
+  let rows: Cell[][] = [];
+  for (const b of latest.benches) {
+    let r: Cell[] = [cell(b.name)];
+    for (const l of langs6()) {
+      const rss = langCell(b, l).rssKb;
+      r.push(cell(rss.isNone() ? "n/a" : fixed(rss.unwrap() / 1024.0, 1)));
+    }
+    rows.push(r);
+  }
+  let cols: Column[] = [left("Benchmark")];
+  for (const l of langs6()) {
+    cols.push(right(langName(l)));
+  }
+  return Table { caption: "Peak resident set size in MiB", columns: cols, rows: rows, emptyText: "This run has no benchmark results." };
+}
+
+function parallelTable(latest: BenchRun): Table {
+  let rows: Cell[][] = [];
+  for (const p of latest.parallel) {
+    for (const r of p.rows) {
+      rows.push([
+        cell(p.name), cell(r.threads.toString()),
+        cell(s3(r.wallMedian) + " (" + s3(r.wallMin) + "-" + s3(r.wallMax) + ")"), cell(s3(r.cpuMedian)),
+        cell(r.speedup.isNone() ? "n/a" : fixed(r.speedup.unwrap(), 2) + "x"),
+        cell(r.efficiency.isNone() ? "n/a" : fixed(100.0 * r.efficiency.unwrap(), 0) + " %"),
+        r.outputMatched ? statusCell("same", Passed) : statusCell("differs", Failed),
+      ]);
+    }
+  }
+  return Table {
+    caption: "Parallel speedup of std:task (worker threads = first argument of the program)",
+    columns: [left("Benchmark"), right("Threads"), right("Wall s (min-max)"), right("CPU s"), right("Speedup"), right("Efficiency"),
+              left("Output")],
+    rows: rows, emptyText: "This run has no parallel results.",
+  };
+}
+
+function historyTable(runs: BenchRun[]): Table {
+  let rows: Cell[][] = [];
+  let i: int = runs.length.toInt() - 1;
+  while (i >= 0) {
+    const r = runs[i.toUsize()];
+    rows.push([
+      cell(dateRaw(r)), monoCell(short(r.commit)), cell(orQ(r.ref)), cell(big(selfInstr(r))), cell(s3(selfWall(r))),
+      r.mismatches.length > 0 ? statusCell("mismatch", Failed) : statusCell("ok", Passed), monoCell(r.file),
+    ]);
+    i -= 1;
+  }
+  return Table {
+    caption: "Every recorded run on main, newest first",
+    columns: [left("Date"), left("Commit"), left("Ref"), right("Self-compile instructions"), right("Self-compile wall s"),
+              left("Outputs"), left("File")],
+    rows: rows, emptyText: "No runs have been recorded yet.",
+  };
+}
+
+// before / after of the Orin rows against the previous run, as a diff table
+function changesDiff(rows: Row[]): DiffTable {
+  let out: DiffRow[] = [];
+  for (const r of rows) {
+    const same = r.baseInstr.isSome() && r.headInstr.isSome() && r.baseInstr.unwrap() == r.headInstr.unwrap();
+    out.push(DiffRow { kind: same ? DiffSame : DiffChanged, label: r.bench + " / " + r.lang,
+                       before: big(r.baseInstr) + " instr, " + s3(r.baseWall) + " s", after: big(r.headInstr) + " instr, " + s3(r.headWall) + " s" });
+  }
+  return DiffTable { caption: "Change against the previous run", labelHeader: "Benchmark / binary", beforeHeader: "Previous run",
+                     afterHeader: "This run", rows: out, emptyText: "Nothing to compare." };
+}
+
+function plural(n: int, one: string, many: string): string {
+  return n.toString() + " " + (n == 1 ? one : many);
+}
+
+// The report model of a history (oldest run first, as load_history returns it). An empty history gives a report that says so.
+export function buildReport(runs: BenchRun[]): Report {
+  if (runs.length == 0) {
+    return Report {
+      title: "Orin benchmark report",
+      subtitle: "Orin against C, Go, Java and Rust, and the self-compile of the compiler.",
+      meta: [],
+      sections: [section("overview", "Overview", None, [
+        Notice(Info, "No benchmark runs have been recorded yet."),
+        Data(historyTable([])),
+      ])],
+      footer: "Generated by tooling/benchmarks (Orin + OX). No scripts, fonts or images are loaded from the network.",
+    };
+  }
+  const latest = runs[runs.length - 1];
+  const earlier = runs.slice(0, runs.length - 1);
+  const base = baseRuns(earlier, latest);
+  const collected = collectRows(base, latest);
+  const haveBase = base.length > 0;
+  let regressions: string[] = [];
+  for (const r of collected.rows) {
+    const v = verdictOf(r.baseInstr, r.headInstr, r.baseWall, r.headWall);
+    if (v.regression) {
+      regressions.push(r.bench + " / " + r.lang);
+    }
+  }
+  const mism = latest.mismatches.length;
+  const cards: Card[] = [
+    card("Runs recorded", runs.length.toString(), Some(head(dateRaw(runs[0]), 10) + " to " + head(dateRaw(latest), 10)), None),
+    card("Benchmarks", latest.benches.length.toString(), Some("in the latest run"), None),
+    card("Output check", mism == 0 ? "all match" : plural(mism.toInt(), "mismatch", "mismatches"),
+         Some("checksums across languages and thread counts"), Some(mism == 0 ? Passed : Failed)),
+    card("Regressions", haveBase ? regressions.length.toString() : "n/a",
+         Some(haveBase ? "against the previous run" : "no earlier run to compare with"),
+         Some(!haveBase ? Skipped : (regressions.length == 0 ? Passed : Regression))),
+    selfInstrCard(selfInstr(latest)),
+    card("Self-compile wall time", s3(selfWall(latest)) + " s", Some("median"), None),
+  ];
+  let overview: Block[] = [Cards(cards)];
+  if (mism > 0) {
+    overview.push(Notice(Failed, "Output mismatches: " + latest.mismatches.join(", ")));
+  }
+  if (haveBase && regressions.length > 0) {
+    overview.push(Notice(Regression, plural(regressions.length.toInt(), "regression", "regressions") + " against the previous run: "
+      + regressions.join(", ") + "."));
+  } else if (haveBase) {
+    overview.push(Notice(Passed, "No regression against the previous run (thresholds: executed instructions +"
+      + (INSTR_THRESHOLD * 100.0).toInt().toString() + " %, wall time +" + (WALL_THRESHOLD * 100.0).toInt().toString() + " %)."));
+  }
+  overview.push(Paragraph("Instruction counts are the regression metric: they are deterministic for single-threaded programs, while "
+    + "wall time on a shared runner moves by 10-25 % between identical binaries."));
+
+  const charts: Block[] = [
+    Figure("Wall-time ratio of Orin to C per benchmark, over all runs", "wall ratio chart", chartRatio(runs, Wall, "c1-")),
+    Figure("Executed-instruction ratio of Orin to C per benchmark, over all runs", "instruction ratio chart",
+           chartRatio(runs, Instructions, "c2-")),
+    Figure("Self-compile instructions and wall time, over all runs", "self-compile chart", chartSelfcompile(runs, "c3-")),
+    Figure("Parallel speedup by worker threads", "parallel speedup chart", chartParallel(runs, "c4-")),
+  ];
+
+  let tools: string[] = [];
+  for (const t of latest.tools) {
+    tools.push(t.name + ": " + t.value);
+  }
+  const sc = latest.selfcompile;
+  let selfBlocks: Block[] = [];
+  if (sc.isSome()) {
+    const s = sc.unwrap();
+    selfBlocks.push(Data(Table {
+      caption: "Self-compile of the latest run",
+      columns: [right("Wall s (min-max)"), right("CPU s"), right("Peak RSS MiB"), right("Instructions"), left("Output identical to stage2.c")],
+      rows: [[cell(s3(s.wallMedian) + " (" + s3(s.wallMin) + "-" + s3(s.wallMax) + ")"), cell(s3(s.cpuMedian)),
+              cell(s.rssKb.isNone() ? "n/a" : fixed(s.rssKb.unwrap() / 1024.0, 1)),
+              cell(s.instrSkipped.isSome() ? "skipped: " + s.instrSkipped.unwrap() : big(s.instrCount)),
+              s.identical ? statusCell("yes", Passed) : statusCell("no", Failed)]],
+      emptyText: "",
+    }));
+  } else {
+    selfBlocks.push(Notice(Info, "The latest run has no self-compile measurement."));
+  }
+
+  let sections: Section[] = [
+    section("overview", "Overview", None, overview),
+    section("charts", "Trends", Some("One point per recorded run on main. Charts are inline SVG and follow the colour scheme of the page."),
+            charts),
+    section("wall", "Wall time", Some("Timed runs of the latest benchmark run."),
+            [Data(wallTable(latest)), Data(ratioTable(latest))]),
+    section("instructions", "Executed instructions", None, haveBase
+            ? [Data(instrTable(latest, collected.rows, haveBase)), Diff(changesDiff(collected.rows))]
+            : [Data(instrTable(latest, collected.rows, haveBase))]),
+    section("memory", "Memory", None, [Data(memoryTable(latest))]),
+    section("parallel", "Parallel speedup", Some("Speedup = wall(1 thread) / wall(n); efficiency = speedup / n."),
+            [Data(parallelTable(latest))]),
+    section("selfcompile", "Self-compile", None, selfBlocks),
+    section("history", "History", None, [Data(historyTable(runs))]),
+  ];
+  if (tools.length > 0) {
+    sections.push(section("tools", "Tool versions", None, [Details("Show tool versions", tools.join("\n"))]));
+  }
+  return Report {
+    title: "Orin benchmark report",
+    subtitle: "Commit " + short(latest.commit) + " (" + orQ(latest.ref) + "), " + dateRaw(latest)
+      + ". Orin against C, Go, Java and Rust, and the self-compile of the compiler.",
+    meta: [
+      MetaItem { label: "Commit", value: short(latest.commit) },
+      MetaItem { label: "Date", value: dateRaw(latest) },
+      MetaItem { label: "Machine", value: latest.cpu + ", " + latest.cores + " cores, " + latest.mem + ", " + latest.os },
+      MetaItem { label: "Runs per cell", value: latest.runs + " (median after one warm-up)" },
+    ],
+    sections: sections,
+    footer: "Generated by tooling/benchmarks (Orin + OX). No scripts, fonts or images are loaded from the network.",
+  };
+}
+
+export function renderHtml(runs: BenchRun[]): string {
+  return renderReport(buildReport(runs));
+}

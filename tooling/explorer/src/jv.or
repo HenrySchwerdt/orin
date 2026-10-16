@@ -1,0 +1,117 @@
+// Lenient readers over std:jsonvalue trees: a missing or mistyped field is `None` (and the callers pick a default), never a
+// trap. Snapshots written by a newer compiler may carry fields this tool does not know; they are ignored.
+
+import { JsonValue, JsonMember, JsonReadOptions, JsonLimits, PreserveDuplicates, parseDocument } from "std:jsonvalue";
+import { numberAsInt } from "std:jsonnumber";
+
+export function limits(): JsonLimits {
+  return JsonLimits {
+    maxInputBytes: 268435456,
+    maxDepth: 64,
+    maxNodes: 40000000,
+    maxContainerItems: 10000000,
+    maxStringBytes: 16777216,
+    maxDecodedStringBytes: 134217728,
+    maxNumberBytes: 1024,
+    maxOutputBytes: 4194304,
+  };
+}
+
+export function parse(text: string): Result<JsonValue, string> {
+  const r = parseDocument(text, JsonReadOptions { limits: limits(), duplicates: PreserveDuplicates });
+  return match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err("invalid JSON at line " + e.line.toString() + ", column " + e.column.toString()),
+  };
+}
+
+export function members(v: JsonValue): JsonMember[] {
+  return match (v) {
+    ValueObject(ms) => ms,
+    _ => [],
+  };
+}
+
+export function items(v: JsonValue): JsonValue[] {
+  return match (v) {
+    ValueArray(xs) => xs,
+    _ => [],
+  };
+}
+
+export function isObject(v: JsonValue): bool {
+  return match (v) {
+    ValueObject(ms) => true,
+    _ => false,
+  };
+}
+
+// the last member named `key` (duplicates are kept by the parser, the last one wins as in every JSON reader)
+export function get(v: JsonValue, key: string): Option<JsonValue> {
+  let found: Option<JsonValue> = None;
+  for (const m of members(v)) {
+    if (m.key == key) {
+      found = Some(m.value);
+    }
+  }
+  return found;
+}
+
+export function strOf(v: JsonValue, key: string): string {
+  const x = get(v, key);
+  if (x.isNone()) {
+    return "";
+  }
+  return match (x.unwrap()) {
+    ValueString(s) => s,
+    _ => "",
+  };
+}
+
+export function intOf(v: JsonValue, key: string): int {
+  const x = get(v, key);
+  if (x.isNone()) {
+    return 0;
+  }
+  return match (x.unwrap()) {
+    ValueNumber(n) => {
+      const r = numberAsInt(n);
+      return r.isOk() ? r.unwrap() : 0;
+    },
+    _ => 0,
+  };
+}
+
+export function boolOf(v: JsonValue, key: string): bool {
+  const x = get(v, key);
+  if (x.isNone()) {
+    return false;
+  }
+  return match (x.unwrap()) {
+    ValueBool(b) => b,
+    _ => false,
+  };
+}
+
+export function listOf(v: JsonValue, key: string): JsonValue[] {
+  const x = get(v, key);
+  return x.isNone() ? [] : items(x.unwrap());
+}
+
+export function stringsOf(v: JsonValue, key: string): string[] {
+  let out: string[] = [];
+  for (const e of listOf(v, key)) {
+    match (e) {
+      ValueString(s) => {
+        out.push(s);
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+export function objOf(v: JsonValue, key: string): JsonValue {
+  const x = get(v, key);
+  return x.isNone() ? ValueObject([]) : x.unwrap();
+}

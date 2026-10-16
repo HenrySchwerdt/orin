@@ -1,0 +1,447 @@
+// The SVG charts of the former tools/bench_report.py render, written with orin-reports' Canvas. Every coordinate expression is the
+// Python one (same operations in the same order), so the stand-alone .svg files are byte-identical.
+
+import {
+  Canvas, SvgDoc, Pt, newCanvas, pathData, fixed, general, round3, round10,
+} from "orin-reports";
+import { BenchRun, strCmp, sortedStrings, instrOf, wallOf, selfInstr, selfWall, dateOrQ } from "./bench";
+import { short, head } from "./markdown";
+
+// ---- helpers of the Python module
+
+// math.floor(math.log10(raw)) for a positive finite raw, by comparing with the decimal powers of ten
+function floorLog10(raw: float): int {
+  let k: int = 0;
+  while (pow10(k + 1) <= raw) {
+    k += 1;
+  }
+  while (pow10(k) > raw) {
+    k -= 1;
+  }
+  return k;
+}
+
+// 10 ** k: exact for k >= 0 (up to 1e22) and the correctly rounded double for k < 0
+function pow10(k: int): float {
+  return parseFloat("1e" + k.toString()).unwrap();
+}
+
+export function niceTicks(lo0: float, hi0: float, n: int): float[] {
+  let lo = lo0;
+  let hi = hi0;
+  if (hi <= lo) {
+    const a = lo.abs();
+    const unit = a == 0.0 ? 1.0 : a;
+    hi = lo + unit * 0.1;
+    lo = lo - unit * 0.1;
+  }
+  const span = hi - lo;
+  const raw = span / n.toFloat();
+  const mag = pow10(floorLog10(raw));
+  let step = 10.0 * mag;
+  let found = false;
+  for (const m of [1.0, 2.0, 2.5, 5.0, 10.0]) {
+    if (!found && m * mag >= raw) {
+      step = m * mag;
+      found = true;
+    }
+  }
+  const start = (lo / step).floor() * step;
+  let ticks: float[] = [];
+  let v = start;
+  while (v <= hi + step * 1.0e-9) {
+    ticks.push(round10(v));
+    v += step;
+  }
+  if (ticks[ticks.length - 1] < hi) {
+    ticks.push(round10(ticks[ticks.length - 1] + step));
+  }
+  return ticks;
+}
+
+export function fmtTick(v: float): string {
+  if (v.abs() >= 1.0e9) {
+    return general(round3(v / 1.0e9)) + "G";
+  }
+  if (v.abs() >= 1.0e6) {
+    return general(round3(v / 1.0e6)) + "M";
+  }
+  return general(round3(v));
+}
+
+// len(s) in code points
+function charCount(s: string): int {
+  let n: int = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c < 128 || c >= 192) {
+      n += 1;
+    }
+    i += 1;
+  }
+  return n;
+}
+
+// s[a:b] for ASCII text, as Python slices out of range
+function slice(s: string, a: usize, b: usize): string {
+  if (a >= s.length) {
+    return "";
+  }
+  return s.substring(a, b < s.length ? b : s.length);
+}
+
+function runLabel(r: BenchRun): string {
+  return slice(dateOrQ(r), 5, 10) + " " + slice(short(r.commit), 0, 7);
+}
+
+function axisLabels(runs: BenchRun[]): string[] {
+  return runs.map((r: BenchRun): string => slice(dateOrQ(r), 5, 10));
+}
+
+export type LegendItem = { label: string; cls: string; dashed: bool; };
+
+function legend(svg: Canvas, x0: float, y: float, items: LegendItem[]): Canvas {
+  let c = svg;
+  let x = x0;
+  for (const it of items) {
+    c.line(it.cls, x, y - 4.0, x + 22.0, y - 4.0, "2", it.dashed);
+    if (!it.dashed) {
+      c.marker(it.cls, x + 11.0, y - 4.0, "");
+    }
+    c.text(x + 28.0, y, it.label, "t", 12, "start", "normal", 0);
+    x += 28.0 + 7.2 * charCount(it.label).toFloat() + 18.0;
+  }
+  return c;
+}
+
+export type SPoint = { i: int; v: Option<float>; };
+export type Series = { cls: string; pts: SPoint[]; dashed: bool; };
+
+function series(cls: string, pts: SPoint[], dashed: bool): Series {
+  return Series { cls: cls, pts: pts, dashed: dashed };
+}
+
+// A line panel. `refLine`: Some(value) draws a dashed reference line; `xtitle` "" draws none.
+function panel(
+  svg: Canvas, x: float, y: float, w: float, h: float, title: string, ser: Series[], xlabels: string[], ylabel: string,
+  refLine: Option<float>, ymin0: bool, xtitle: string,
+): Canvas {
+  let c = svg;
+  c.text(x, y + 13.0, title, "t", 13, "start", "600", 0);
+  const left = x + 52.0;
+  const top = y + 26.0;
+  const bottom = y + h - (xtitle.length > 0 ? 34.0 : 22.0);
+  const right = x + w - 8.0;
+  let vals: float[] = [];
+  for (const s of ser) {
+    for (const p of s.pts) {
+      if (p.v.isSome()) {
+        vals.push(p.v.unwrap());
+      }
+    }
+  }
+  if (refLine.isSome()) {
+    vals.push(refLine.unwrap());
+  }
+  if (vals.length == 0) {
+    c.text(x + w / 2.0, y + h / 2.0, "no data", "t2", 12, "middle", "normal", 0);
+    return c;
+  }
+  let lo = vals[0];
+  let hi = vals[0];
+  for (const v of vals) {
+    if (v < lo) {
+      lo = v;
+    }
+    if (v > hi) {
+      hi = v;
+    }
+  }
+  if (ymin0) {
+    lo = 0.0;
+  }
+  let pad = (hi - lo) * 0.08;
+  if (pad == 0.0) {
+    pad = hi.abs() * 0.05;
+  }
+  if (pad == 0.0) {
+    pad = 1.0;
+  }
+  const ticks = niceTicks(ymin0 ? lo : lo - pad, hi + pad, 4);
+  const y0 = ticks[0];
+  const y1 = ticks[ticks.length - 1];
+  const n: int = xlabels.length > 1 ? xlabels.length.toInt() : 1;
+  const denom = (y1 - y0) == 0.0 ? 1.0 : (y1 - y0);
+  for (const t of ticks) {
+    const ty = bottom - (bottom - top) * (t - y0) / denom;
+    c.line("grid", left, ty, right, ty, "1", false);
+    c.text(left - 6.0, ty + 4.0, fmtTick(t), "t2", 11, "end", "normal", 0);
+  }
+  c.text(x + 12.0, (top + bottom) / 2.0, ylabel, "t2", 11, "middle", "normal", -90);
+  if (refLine.isSome()) {
+    const rv = refLine.unwrap();
+    if (y0 <= rv && rv <= y1) {
+      const ry = bottom - (bottom - top) * (rv - y0) / denom;
+      c.line("ref", left, ry, right, ry, "1.5", true);
+    }
+  }
+  const step: int = (n + 4) / 5 > 1 ? (n + 4) / 5 : 1;   // at most ~5 x labels
+  let li: int = 0;
+  for (const lab of xlabels) {
+    if (li % step == 0 || li == n - 1) {
+      c.text(pxOf(left, right, n, li), bottom + 15.0, lab, "t2", 11, "middle", "normal", 0);
+    }
+    li += 1;
+  }
+  if (xtitle.length > 0) {
+    c.text((left + right) / 2.0, bottom + 30.0, xtitle, "t2", 11, "middle", "normal", 0);
+  }
+  for (const s of ser) {
+    let pts: SPoint[] = [];
+    for (const p of s.pts) {
+      if (p.v.isSome()) {
+        pts.push(p);
+      }
+    }
+    if (pts.length == 0) {
+      continue;
+    }
+    if (pts.length > 1) {
+      let path: Pt[] = [];
+      for (const p of pts) {
+        path.push(Pt { x: pxOf(left, right, n, p.i), y: bottom - (bottom - top) * (p.v.unwrap() - y0) / denom });
+      }
+      c.path(s.cls, pathData(path), s.dashed);
+    }
+    if (!s.dashed) {
+      for (const p of pts) {
+        c.marker(s.cls, pxOf(left, right, n, p.i), bottom - (bottom - top) * (p.v.unwrap() - y0) / denom,
+          xlabels[p.i.toUsize()] + ": " + fmtTick(p.v.unwrap()));
+      }
+    }
+  }
+  return c;
+}
+
+// left + 14 + (right - left - 28) * (0.5 if n == 1 else i / (n - 1))
+function pxOf(left: float, right: float, n: int, i: int): float {
+  const frac = n == 1 ? 0.5 : i.toFloat() / (n - 1).toFloat();
+  return left + 14.0 + (right - left - 28.0) * frac;
+}
+
+// ---- the charts
+
+export type Metric = Wall | Instructions;
+
+function ratioValue(r: BenchRun, bench: string, lang: string, metric: Metric): Option<float> {
+  if (isWall(metric)) {
+    return wallOf(r, bench, lang);
+  }
+  const v = instrOf(r, bench, lang);
+  return v.isSome() ? Some(v.unwrap().toFloat()) : None;
+}
+
+function isWall(metric: Metric): bool {
+  return match (metric) {
+    Wall => true,
+    Instructions => false,
+  };
+}
+
+function ratioNames(runs: BenchRun[], metric: Metric): string[] {
+  let names: string[] = [];
+  for (const r of runs) {
+    for (const b of r.benches) {
+      const c = ratioValue(r, b.name, "c", metric);
+      if (c.isSome() && c.unwrap() != 0.0) {
+        names.push(b.name);
+      }
+    }
+  }
+  const sorted = sortedStrings(names);
+  let out: string[] = [];
+  for (const n of sorted) {
+    if (out.length == 0 || out[out.length - 1] != n) {
+      out.push(n);
+    }
+  }
+  return out;
+}
+
+// Small multiples: one panel per benchmark with a C counterpart, Orin C/C and Orin LLVM/C over time.
+export function chartRatio(runs: BenchRun[], metric: Metric, idPrefix: string): SvgDoc {
+  const names = ratioNames(runs, metric);
+  const cols: int = names.length > 3 ? 3 : (names.length > 1 ? names.length.toInt() : 1);
+  const pw: int = 300;
+  const ph: int = 190;
+  const rows: int = (names.length.toInt() + cols - 1) / cols > 1 ? (names.length.toInt() + cols - 1) / cols : 1;
+  const W: int = cols * pw + 24;
+  const H: int = rows * ph + 92;
+  const what = match (metric) {
+    Wall => "wall-time median",
+    Instructions => "executed instructions",
+  };
+  const title = "Orin / C ratio per benchmark over time (" + what + ")";
+  let svg = newCanvas(W, H, title, "Small multiples, one per benchmark: the ratio of Orin (C backend) and Orin (LLVM backend) to C, "
+    + "by " + what + ", for every run on main. 1.0 (dashed) means as fast as C; lower is better.", idPrefix);
+  svg.text(12.0, 24.0, title, "t", 15, "start", "600", 0);
+  svg = legend(svg, 12.0, 48.0, [
+    LegendItem { label: "Orin (C backend) / C", cls: "s1", dashed: false },
+    LegendItem { label: "Orin (LLVM backend) / C", cls: "s2", dashed: false },
+    LegendItem { label: "1.0 = C", cls: "ref", dashed: true },
+  ]);
+  const labels = axisLabels(runs);
+  if (names.length == 0) {
+    svg.text(W.toFloat() / 2.0, H.toFloat() / 2.0, "no runs with " + what + " yet", "t2", 12, "middle", "normal", 0);
+  }
+  let k: int = 0;
+  for (const n of names) {
+    const cx: float = (12 + (k % cols) * pw).toFloat();
+    const cy: float = (64 + (k / cols) * ph).toFloat();
+    let ser: Series[] = [];
+    for (const pair of [["s1", "orin"], ["s2", "llvm"]]) {
+      let pts: SPoint[] = [];
+      let i: int = 0;
+      for (const r of runs) {
+        const a = ratioValue(r, n, pair[1], metric);
+        const c = ratioValue(r, n, "c", metric);
+        pts.push(SPoint { i: i, v: a.isSome() && c.isSome() && c.unwrap() != 0.0 ? Some(a.unwrap() / c.unwrap()) : None });
+        i += 1;
+      }
+      ser.push(series(pair[0], pts, false));
+    }
+    svg = panel(svg, cx, cy, (pw - 12).toFloat(), (ph - 8).toFloat(), n, ser, labels, "ratio to C", Some(1.0), false, "");
+    k += 1;
+  }
+  return svg.finish();
+}
+
+export function chartSelfcompile(runs: BenchRun[], idPrefix: string): SvgDoc {
+  const labels = axisLabels(runs);
+  const W: int = 760;
+  const H: int = 300;
+  const title = "Self-compile (orin2 compiles compiler/main.or) over time";
+  let svg = newCanvas(W, H, title, "Two panels: executed instructions (the regression metric) and wall-time median in seconds, "
+    + "for every run on main.", idPrefix);
+  svg.text(12.0, 24.0, title, "t", 15, "start", "600", 0);
+  let instr: SPoint[] = [];
+  let wall: SPoint[] = [];
+  let i: int = 0;
+  for (const r of runs) {
+    const a = selfInstr(r);
+    instr.push(SPoint { i: i, v: a.isSome() ? Some(a.unwrap().toFloat()) : None });
+    wall.push(SPoint { i: i, v: selfWall(r) });
+    i += 1;
+  }
+  svg = panel(svg, 12.0, 40.0, 360.0, 250.0, "Executed instructions", [series("s1", instr, false)], labels, "instructions", None,
+    false, "run date (MM-DD)");
+  svg = panel(svg, 388.0, 40.0, 360.0, 250.0, "Wall time, median (noisy)", [series("s1", wall, false)], labels, "seconds", None,
+    true, "run date (MM-DD)");
+  return svg.finish();
+}
+
+function indexOfInt(xs: int[], v: int): int {
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (xs[i] == v) {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// Left: speedup against threads in the latest run that has parallel data, with the ideal line. Right: speedup at the
+// largest thread count over time. At most three benchmarks get a color (palette cap).
+export function chartParallel(runs: BenchRun[], idPrefix: string): SvgDoc {
+  let withPar: BenchRun[] = [];
+  for (const r of runs) {
+    if (r.parallel.length > 0) {
+      withPar.push(r);
+    }
+  }
+  const W: int = 760;
+  const H: int = 330;
+  const title = "Parallel speedup (std:task, worker threads = first program argument)";
+  let svg = newCanvas(W, H, title, "Left: speedup over one thread against the number of worker threads in the latest run, with the "
+    + "ideal linear speedup dashed. Right: speedup at the largest thread count for every run on main.", idPrefix);
+  svg.text(12.0, 24.0, title, "t", 15, "start", "600", 0);
+  if (withPar.length == 0) {
+    svg.text(W.toFloat() / 2.0, H.toFloat() / 2.0, "no parallel results yet", "t2", 12, "middle", "normal", 0);
+    return svg.finish();
+  }
+  const last = withPar[withPar.length - 1];
+  let ts: int[] = [];
+  let names: string[] = [];
+  let kk: usize = 0;
+  while (kk < last.parallel.length && kk < 3) {
+    names.push(last.parallel[kk].name);
+    for (const row of last.parallel[kk].rows) {
+      if (indexOfInt(ts, row.threads) < 0) {
+        ts.push(row.threads);
+      }
+    }
+    kk += 1;
+  }
+  ts = ts.sort((a: int, b: int): int => a < b ? -1 : (a > b ? 1 : 0));
+  if (ts.length == 0) {
+    svg.text(W.toFloat() / 2.0, H.toFloat() / 2.0, "no parallel results yet", "t2", 12, "middle", "normal", 0);
+    return svg.finish();
+  }
+  const palette = ["s1", "s2", "s3"];
+  let items: LegendItem[] = [];
+  let k: usize = 0;
+  while (k < names.length) {
+    items.push(LegendItem { label: names[k], cls: palette[k], dashed: false });
+    k += 1;
+  }
+  items.push(LegendItem { label: "ideal", cls: "ref", dashed: true });
+  svg = legend(svg, 12.0, 48.0, items);
+  let ser: Series[] = [];
+  k = 0;
+  while (k < names.length) {
+    let pts: SPoint[] = [];
+    for (const row of last.parallel[k].rows) {
+      pts.push(SPoint { i: indexOfInt(ts, row.threads), v: row.speedup });
+    }
+    pts = pts.sort((a: SPoint, b: SPoint): int => a.i < b.i ? -1 : (a.i > b.i ? 1 : 0));
+    ser.push(series(palette[k], pts, false));
+    k += 1;
+  }
+  let ideal: SPoint[] = [];
+  let i: int = 0;
+  for (const t of ts) {
+    ideal.push(SPoint { i: i, v: Some(t.toFloat() / ts[0].toFloat()) });
+    i += 1;
+  }
+  ser.push(series("ref", ideal, true));
+  svg = panel(svg, 12.0, 60.0, 360.0, 262.0, "Latest run (" + runLabel(last) + ")", ser, ts.map((t: int): string => t.toString()),
+    "speedup (x)", None, true, "worker threads");
+  const tmax = ts[ts.length - 1];
+  let hist: Series[] = [];
+  k = 0;
+  while (k < names.length) {
+    let pts: SPoint[] = [];
+    let j: int = 0;
+    for (const r of withPar) {
+      let sp: Option<float> = None;
+      for (const pb of r.parallel) {
+        if (pb.name == names[k]) {
+          for (const row of pb.rows) {
+            if (row.threads == tmax) {
+              sp = row.speedup;
+            }
+          }
+        }
+      }
+      pts.push(SPoint { i: j, v: sp });
+      j += 1;
+    }
+    hist.push(series(palette[k], pts, false));
+    k += 1;
+  }
+  svg = panel(svg, 388.0, 60.0, 360.0, 262.0, "Speedup at " + tmax.toString() + " threads over time", hist, axisLabels(withPar),
+    "speedup (x)", None, true, "run date (MM-DD)");
+  return svg.finish();
+}
