@@ -30,17 +30,22 @@ export type MapEntry<K, V> = { key: K; value: V; };
 
 // ---------------------------------------------------------------- key classes
 // `keyHash` / `keyEq` are placeholders: a generic body cannot compare or hash a `K`, so the checker
-// replaces an instance `keyHash<int>` by `hashInt`, `keyHash<string>` by `hashStr`, ... (check/types.or,
+// replaces an instance `keyHash<int>` by `hashInt`, `keyHash<string>` by `hashString`, ... (check/types.or,
 // instFunc). The bodies below are only ever type-checked (abstractly), never run.
+// keyHash(k): usize -- placeholder for the hash of a key; the checker replaces every instance by `hashInt`, `hashUsize`,
+// `hashBool` or `hashString`. Implementation hook, not API; the body is never run.
 export function keyHash<K>(k: K): usize {
   return 0;
 }
 
+// keyEq(a, b): bool -- placeholder for key equality; replaced like `keyHash` by `eqInt`, `eqUsize`, `eqBool` or
+// `eqString`. Implementation hook, not API; the body is never run.
 export function keyEq<K>(a: K, b: K): bool {
   return false;
 }
 
-// Hashes are < 2^32 and never trap: all intermediate products stay below 2^64.
+// hashInt(k): usize -- the hash of an int key. Hooks `hashInt`/`hashUsize`/`hashBool`/`hashString` are implementation
+// details of `Map`, not API. Hashes are < 2^32 and never trap: all intermediate products stay below 2^64. O(1).
 export function hashInt(k: int): usize {
   let r = k % 2147483647;
   if (r < 0) {
@@ -49,15 +54,18 @@ export function hashInt(k: int): usize {
   return (r.toUsize() * 2654435761) % 4294967291;
 }
 
+// hashUsize(k): usize -- the hash of a usize key. O(1).
 export function hashUsize(k: usize): usize {
   return ((k % 2147483647) * 2654435761) % 4294967291;
 }
 
+// hashBool(k): usize -- the hash of a bool key. O(1).
 export function hashBool(k: bool): usize {
   return k ? 1 : 0;
 }
 
-export function hashStr(s: string): usize {
+// hashString(s): usize -- the hash of a string key (polynomial, modulus 1000000007). O(s.length).
+export function hashString(s: string): usize {
   let h: usize = 5381;
   const n = s.length;
   let i: usize = 0;
@@ -68,6 +76,7 @@ export function hashStr(s: string): usize {
   return h;
 }
 
+// eqInt(a, b): bool -- key equality for int keys. `eqUsize`, `eqBool`, `eqString` likewise. O(1) (O(n) for strings).
 export function eqInt(a: int, b: int): bool {
   return a == b;
 }
@@ -80,7 +89,7 @@ export function eqBool(a: bool, b: bool): bool {
   return a == b;
 }
 
-export function eqStr(a: string, b: string): bool {
+export function eqString(a: string, b: string): bool {
   return a == b;
 }
 
@@ -167,10 +176,15 @@ function rebuild<K, V>(m: Map<K, V>, extra: usize): Map<K, V> {
 }
 
 // ---------------------------------------------------------------- API
+// Map methods (user code writes `m.get(k)`; the checker lowers a call to the function below with the map as the first
+// argument and assigns the result back for the mutating ones). Expected O(1) per operation, see the header.
+//
+// new Map<K, V>(): Map<K, V> -- an empty map. O(1).
 export function mapNew<K, V>(): Map<K, V> {
   return Map { size: 0, _keys: [], _vals: [], _live: [], _tab: [] };
 }
 
+// get(k): Option<V> -- the value stored under k, or None. Never traps. O(1) expected.
 export function mapGet<K, V>(m: Map<K, V>, k: K): Option<V> {
   const e = findEntry(m, k);
   if (e < 0) {
@@ -179,10 +193,13 @@ export function mapGet<K, V>(m: Map<K, V>, k: K): Option<V> {
   return Some(m._vals[e.toUsize()]);
 }
 
+// has(k): bool -- is there an entry for k? Never traps. O(1) expected.
 export function mapHas<K, V>(m: Map<K, V>, k: K): bool {
   return findEntry(m, k) >= 0;
 }
 
+// set(k, v): void -- associates k with v, replacing an existing value. Never traps. O(1) expected, amortised over
+// rebuilds.
 export function mapSet<K, V>(m: Map<K, V>, k: K, v: V): Map<K, V> {
   let r = m;
   const at = findEntry(r, k);
@@ -209,6 +226,8 @@ export function mapSet<K, V>(m: Map<K, V>, k: K, v: V): Map<K, V> {
   return r;
 }
 
+// delete(k): void -- removes the entry for k; a no-op when absent. ADR-0048 wants the spelling `remove(k): Option<V>`
+// like the other keyed collections; that is a checker change (method table), not made here. O(1) expected.
 export function mapDelete<K, V>(m: Map<K, V>, k: K): Map<K, V> {
   let r = m;
   const at = findEntry(r, k);
@@ -223,6 +242,7 @@ export function mapDelete<K, V>(m: Map<K, V>, k: K): Map<K, V> {
   return r;
 }
 
+// keys(): K[] -- the live keys in insertion order. Never traps. O(n); allocates the result.
 export function mapKeys<K, V>(m: Map<K, V>): K[] {
   let out: K[] = [];
   let i: usize = 0;
@@ -235,6 +255,7 @@ export function mapKeys<K, V>(m: Map<K, V>): K[] {
   return out;
 }
 
+// values(): V[] -- the live values in insertion order. Never traps. O(n); allocates the result.
 export function mapValues<K, V>(m: Map<K, V>): V[] {
   let out: V[] = [];
   let i: usize = 0;
@@ -247,6 +268,7 @@ export function mapValues<K, V>(m: Map<K, V>): V[] {
   return out;
 }
 
+// entries(): MapEntry<K, V>[] -- the live entries in insertion order. Never traps. O(n); allocates the result.
 export function mapEntries<K, V>(m: Map<K, V>): MapEntry<K, V>[] {
   let out: MapEntry<K, V>[] = [];
   let i: usize = 0;

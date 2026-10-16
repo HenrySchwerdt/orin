@@ -23,7 +23,7 @@ INT = {
     "cmp": False,
 }
 STR = {
-    "CLASS": "SortedStringMap", "P": "Str", "K": "string", "ENTRY": "SortedStringEntry", "ZERO": '""',
+    "CLASS": "SortedStringMap", "P": "String", "K": "string", "ENTRY": "SortedStringEntry", "ZERO": '""',
     "INC": "isStrictlyIncreasingStrings",
     "ops": {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=="},
     "cmp": True,

@@ -4,7 +4,7 @@
 // child ids (indices into the arena `nodes` of the map).
 export type @P@Node<V> = { keys: @K@[]; vals: V[]; kids: usize[]; };
 
-// An entry returned by `@CLASS@.popFirst` / `popLast`.
+// An entry of `@CLASS@`: what `first`, `last`, `popFirst`, `popLast` return and `entries` lists.
 export type @ENTRY@<V> = { key: @K@; value: V; };
 
 // The first index whose key is >= k (keys.length when there is none). Binary search, O(log keys.length).
@@ -294,9 +294,9 @@ export function btree@P@Vals<V>(nodes: @P@Node<V>[], root: usize): V[] {
 // Invariants (`@Invariant`, checked after every public method by `orin test` / `--check-contracts`): the arena is a
 // valid B-tree of degree t (shape, occupancy, equal leaf depth, no dangling or shared ids, consistent free list),
 // keys are ordered (sorted within nodes and bounded by the separators above them) and the stored count equals the
-// number of keys. Complexity: has/get/put/remove/floorKey/ceilKey/firstKey/lastKey/popFirst/popLast O(t log_t n)
+// number of keys. Complexity: has/get/set/remove/floorKey/ceilKey/firstKey/lastKey/first/last/popFirst/popLast O(t log_t n)
 // (a binary search of O(log t) in each of O(log_t n) nodes, plus O(t) to shift keys inside one node per level on
-// updates); size/isEmpty O(1); keyArray/valueArray O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
+// updates); size/isEmpty O(1); keys/values/entries O(n); `height()` <= 1 + log_t((n+1)/2). Use t = 16 unless you
 // have measured otherwise; `minDegree` 2 gives the smallest nodes and deepest trees (useful for tests).
 @Invariant(this.t >= 2)
 @Invariant(btree@P@ShapeOk(this.nodes, this.root, this.t, this.free))
@@ -315,19 +315,19 @@ export class @CLASS@<V> {
     this.t = minDegree;
   }
 
-  // size(): number of entries. O(1).
+  // size(): usize -- number of entries. O(1).
   @Ensures(result == this.count)
   size(): usize {
     return this.count;
   }
 
-  // isEmpty(): no entries. O(1).
+  // isEmpty(): bool -- no entries. O(1).
   @Ensures(result == (this.size() == 0))
   isEmpty(): bool {
     return this.count == 0;
   }
 
-  // height(): number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
+  // height(): usize -- number of levels of the tree (1 for the root leaf). It is logarithmic: a tree with this many levels
   // holds at least 2 t^(h-1) - 1 keys, so n keys need at most about log_t(n/2) + 1 levels. O(height).
   @Ensures(result >= 1)
   @Ensures(this.count > 0 ==> btreeMinKeys@P@(result, this.t) <= this.count)
@@ -335,7 +335,7 @@ export class @CLASS@<V> {
     return btree@P@Height(this.nodes, this.root);
   }
 
-  // has(k): is there an entry for k? O(t log_t n).
+  // has(k): bool -- is there an entry for k? O(t log_t n).
   @Ensures(result ==> this.size() > 0)
   has(k: @K@): bool {
     let x = this.root;
@@ -352,7 +352,7 @@ export class @CLASS@<V> {
     return false;
   }
 
-  // get(k): the value for k, None when absent. O(t log_t n).
+  // get(k): Option<V> -- the value for k, None when absent. O(t log_t n).
   @Ensures(result.isSome() == this.has(k))
   get(k: @K@): Option<V> {
     let x = this.root;
@@ -450,13 +450,13 @@ export class @CLASS@<V> {
     this.insertKid(x, i + 1, z);
   }
 
-  // put(k, v): set the value for k; true when k was new (the size grows by 1), false when an existing value was
-  // replaced. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
+  // set(k, v): bool -- associate k with v; true when k was new (the size grows by 1), false when an existing value was
+  // replaced. Never traps. One root-to-leaf pass that splits full nodes on the way down. O(t log_t n).
   @Ensures(this.has(k) && this.get(k).isSome())
   @Ensures(result == !old(this.has(k)))
   @Ensures(result ==> this.size() == old(this.size()) + 1)
   @Ensures(!result ==> this.size() == old(this.size()))
-  put(k: @K@, v: V): bool {
+  set(k: @K@, v: V): bool {
     const maxKeys = 2 * this.t - 1;
     if (this.nodes[this.root].keys.length == maxKeys) {
       const nr = this.alloc([], [], [this.root]);
@@ -494,6 +494,13 @@ export class @CLASS@<V> {
 
   // Child number ci of x has t-1 keys: give it one more from a sibling (rotation through x) or merge it with a
   // sibling. Returns the id of the child to descend into afterwards. May shrink the root.
+  @Deprecated("use set(k, v) (ADR-0048)")
+  @Ensures(this.has(k) && this.get(k).isSome())
+  @Ensures(result == !old(this.has(k)))
+  put(k: @K@, v: V): bool {
+    return this.set(k, v);
+  }
+
   private fill(x: usize, ci: usize): usize {
     const t = this.t;
     const len = this.nodes[x].keys.length;
@@ -560,7 +567,7 @@ export class @CLASS@<V> {
     }
   }
 
-  // remove(k): delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
+  // remove(k): Option<V> -- delete the entry for k and return its value, None when absent. One root-to-leaf pass (CLRS
   // top-down deletion): a node is only entered when it has at least t keys, so removing from a leaf never
   // underflows. A key in an inner node is replaced by its predecessor or successor (or the children are merged) and
   // that key is deleted further down. O(t log_t n).
@@ -631,7 +638,7 @@ export class @CLASS@<V> {
     return removed;
   }
 
-  // firstKey(): the smallest key, None when empty. O(height).
+  // firstKey(): Option<@K@> -- the smallest key, None when empty. O(height).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> this.has(result.unwrap()))
   firstKey(): Option<@K@> {
@@ -645,7 +652,7 @@ export class @CLASS@<V> {
     return Some(this.nodes[x].keys[0]);
   }
 
-  // lastKey(): the largest key, None when empty. O(height).
+  // lastKey(): Option<@K@> -- the largest key, None when empty. O(height).
   @Ensures(result.isSome() == (this.size() > 0))
   @Ensures(result.isSome() ==> this.has(result.unwrap()))
   lastKey(): Option<@K@> {
@@ -659,7 +666,7 @@ export class @CLASS@<V> {
     return Some(this.nodes[x].keys[this.nodes[x].keys.length - 1]);
   }
 
-  // floorKey(k): the greatest key <= k, None when there is none. One descent. O(t log_t n).
+  // floorKey(k): Option<@K@> -- the greatest key <= k, None when there is none. One descent. O(t log_t n).
   @Ensures(result.isSome() ==> LE(result.unwrap(), k) && this.has(result.unwrap()))
   @Ensures(result.isNone() ==> this.firstKey().isNone() || GT(this.firstKey().unwrap(), k))
   floorKey(k: @K@): Option<@K@> {
@@ -681,7 +688,7 @@ export class @CLASS@<V> {
     return best;
   }
 
-  // ceilKey(k): the smallest key >= k, None when there is none. One descent. O(t log_t n).
+  // ceilKey(k): Option<@K@> -- the smallest key >= k, None when there is none. One descent. O(t log_t n).
   @Ensures(result.isSome() ==> GE(result.unwrap(), k) && this.has(result.unwrap()))
   @Ensures(result.isNone() ==> this.lastKey().isNone() || LT(this.lastKey().unwrap(), k))
   ceilKey(k: @K@): Option<@K@> {
@@ -703,7 +710,29 @@ export class @CLASS@<V> {
     return best;
   }
 
-  // popFirst(): remove the entry with the smallest key and return it, None when empty. O(t log_t n).
+  // first(): Option<@ENTRY@<V>> -- the entry with the smallest key, None when empty; nothing is removed. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> EQ(result.unwrap().key, this.firstKey().unwrapOr(@ZERO@)))
+  first(): Option<@ENTRY@<V>> {
+    const f = this.firstKey();
+    if (f.isNone()) {
+      return None;
+    }
+    return Some(@ENTRY@<V> { key: f.unwrap(), value: this.get(f.unwrap()).unwrap() });
+  }
+
+  // last(): Option<@ENTRY@<V>> -- the entry with the largest key, None when empty; nothing is removed. O(height).
+  @Ensures(result.isSome() == (this.size() > 0))
+  @Ensures(result.isSome() ==> EQ(result.unwrap().key, this.lastKey().unwrapOr(@ZERO@)))
+  last(): Option<@ENTRY@<V>> {
+    const l = this.lastKey();
+    if (l.isNone()) {
+      return None;
+    }
+    return Some(@ENTRY@<V> { key: l.unwrap(), value: this.get(l.unwrap()).unwrap() });
+  }
+
+  // popFirst(): Option<@ENTRY@<V>> -- remove the entry with the smallest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
   @Ensures(result.isSome() ==> EQ(result.unwrap().key, old(this.firstKey().unwrapOr(@ZERO@))))
@@ -717,7 +746,7 @@ export class @CLASS@<V> {
     return Some(@ENTRY@<V> { key: f.unwrap(), value: v });
   }
 
-  // popLast(): remove the entry with the largest key and return it, None when empty. O(t log_t n).
+  // popLast(): Option<@ENTRY@<V>> -- remove the entry with the largest key and return it, None when empty. O(t log_t n).
   @Ensures(result.isSome() == (old(this.size()) > 0))
   @Ensures(result.isSome() ==> this.size() == old(this.size()) - 1 && !this.has(result.unwrap().key))
   @Ensures(result.isSome() ==> EQ(result.unwrap().key, old(this.lastKey().unwrapOr(@ZERO@))))
@@ -731,19 +760,45 @@ export class @CLASS@<V> {
     return Some(@ENTRY@<V> { key: l.unwrap(), value: v });
   }
 
-  // keyArray(): all keys in increasing order. O(n).
+  // keys(): @K@[] -- all keys in increasing order. Never fails. O(n).
   @Ensures(result.length == this.size() && @INC@(result))
-  keyArray(): @K@[] {
+  keys(): @K@[] {
     return btree@P@Keys(this.nodes, this.root);
   }
 
-  // valueArray(): all values in key order. O(n).
+  // values(): V[] -- all values in key order. Never fails. O(n).
   @Ensures(result.length == this.size())
-  valueArray(): V[] {
+  values(): V[] {
     return btree@P@Vals(this.nodes, this.root);
   }
 
-  // clear(): remove all entries. O(1).
+  // entries(): @ENTRY@<V>[] -- all entries in increasing key order. Never fails. O(n).
+  @Ensures(result.length == this.size())
+  entries(): @ENTRY@<V>[] {
+    const ks = btree@P@Keys(this.nodes, this.root);
+    const vs = btree@P@Vals(this.nodes, this.root);
+    let out: @ENTRY@<V>[] = [];
+    let i: usize = 0;
+    while (i < ks.length) {
+      out.push(@ENTRY@<V> { key: ks[i], value: vs[i] });
+      i += 1;
+    }
+    return out;
+  }
+
+  @Deprecated("use keys() (ADR-0048)")
+  @Ensures(result.length == this.size() && @INC@(result))
+  keyArray(): @K@[] {
+    return this.keys();
+  }
+
+  @Deprecated("use values() (ADR-0048)")
+  @Ensures(result.length == this.size())
+  valueArray(): V[] {
+    return this.values();
+  }
+
+  // clear(): void -- remove all entries. O(1).
   @Ensures(this.size() == 0)
   clear(): void {
     this.nodes = [@P@Node<V> { keys: [], vals: [], kids: [] }];
