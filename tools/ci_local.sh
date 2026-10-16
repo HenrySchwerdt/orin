@@ -18,14 +18,15 @@ step "diff llvm"               tools/differential.sh --mode llvm
 step "diff builtins"           tools/differential.sh --mode builtins
 step "diff opt"                tools/differential.sh --mode opt
 step "diff fuse"               tools/differential.sh --mode fuse
-step "formatter"               python3 tools/test_fmt.py
+step "formatter"               tools/clitests.sh fmt
 step "thread-count equality"   python3 tools/test_threads.py
 step "tooling"                 ./tools/test_tooling.sh
 step "protocol harness (unit)" tools/protocol.sh --unit-tests
+step "cli tests harness (unit)" tools/clitests.sh --unit-tests
 step "lsp"                     tools/protocol.sh lsp
 step "mcp"                     tools/protocol.sh mcp
 step "packages"                ./tools/test_packages.sh
-step "osig graph/diff"         python3 tools/test_osig.py --orin build/bootstrap/orin2
+step "osig graph/diff"         tools/clitests.sh osig --orin build/bootstrap/orin2
 step "effects (Stage B)"       python3 tools/test_effects.py --orin build/bootstrap/orin2
 step "companion modules"       python3 tools/test_expand.py --orinc build/bootstrap/orin2
 step "annotation processors"    python3 tools/test_processors.py --orinc build/bootstrap/orin2

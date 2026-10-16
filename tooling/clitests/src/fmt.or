@@ -1,0 +1,412 @@
+// The formatter tests (spec 18 section 3): the Orin port of tools/test_fmt.py. With the compiler built from the current
+// compiler/main.or and the parse dump built from compiler/tests/parse_main.or it checks
+//   1. tests/fmt/*.in.or formats to *.out.or, and *.out.or is a fixed point (comments and AST preserved);
+//   2. every .or file under tests/run, tests/next, tests/contracts, tests/parse_edge, compiler/, bench/, library/:
+//      idempotence fmt(fmt(x)) == fmt(x), AST preservation (parse_main dump without spans), comment preservation;
+//      files that do not parse must be reported by fmt and left untouched;
+//   3. `check --format=json` on tests/errors prints valid JSON lines with the documented keys.
+// The Python script ran the checks on a thread pool; here the commands of all checks run through exec.or on `jobs` workers,
+// in two rounds (the second round needs the outcome of the first), and the verdicts are computed afterwards in the order
+// of the lists, so the FAIL lines come out in a fixed order.
+
+import { FsGrant, readFile, writeFile, exists, listDir, useFile, Append } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { shell } from "std:io";
+import { Json, JNull, JNum, parse } from "std:json";
+import { shq, strip, sortedStrs, reprStr } from "./text";
+import { head, reprList, lastPart } from "./strs";
+import { at, isStr, isArr, keysOf, items, str } from "./jx";
+import { Ctx, readText } from "./ctx";
+import { Job, Outcome, runAll } from "./exec";
+import { commentsOf, sameStrs, stripSpans, errorCodes, isErrorCode, firstDiag, splitLines } from "./fmtlogic";
+
+const TIMEOUT: int = 120;
+function corpusDirs(): string[] {
+  return ["tests/run", "tests/next", "tests/contracts", "tests/parse_edge", "compiler", "bench", "library"];
+}
+
+// `cpu_count() or 4`, through the shell.
+export function cpuCount(fs: FsGrant, proc: ProcessGrant, scratch: string): usize {
+  const sh = "{ getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; } > " + shq(scratch);
+  if (shell(proc, sh) == 0) {
+    const n = parseInt(strip(readText(fs, scratch)));
+    if (n.isSome() && n.unwrap() > 0) {
+      return n.unwrap().toUsize();
+    }
+  }
+  return 4;
+}
+
+// Compiles `src` with orin2 and links it; the executable, or "" after printing the error (`build` of the Python script).
+export function buildExe(fs: FsGrant, proc: ProcessGrant, root: string, orin2: string, outDir: string, src: string, name: string): string {
+  const cFile = outDir + "/" + name + ".c";
+  const exe = outDir + "/" + name;
+  const err = outDir + "/" + name + ".err";
+  const compile = "cd " + shq(root) + " && " + shq(orin2) + " compile " + shq(src) + " -o " + shq(cFile) + " 2> " + shq(err);
+  if (shell(proc, compile) != 0) {
+    console.error("cannot compile " + src + ":\n" + readText(fs, err));
+    return "";
+  }
+  const cc = "cd " + shq(root) + " && cc -O1 -w -I runtime/core " + shq(cFile)
+    + " runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o " + shq(exe) + " 2> " + shq(err);
+  if (shell(proc, cc) != 0) {
+    console.error("cc failed for " + src + ":\n" + readText(fs, err));
+    return "";
+  }
+  return exe;
+}
+
+function report(fs: FsGrant, c: Ctx, passed: bool, name: string, msg: string, verbose: bool): void {
+  useFile(fs, c.dir + "/log", Append, f => { f.write(passed ? "ok\n" : "FAIL\n"); });
+  if (!passed) {
+    console.log("FAIL " + name + ": " + msg);
+  } else if (verbose) {
+    console.log("ok   " + name);
+  }
+}
+
+// A command of a job: `cd root && <cmd>`.
+function inRoot(root: string, cmd: string): string {
+  return "cd " + shq(root) + " && " + cmd;
+}
+
+function sortedListing(fs: FsGrant, dir: string): string[] {
+  let names: string[] = [];
+  for (const e of listDir(fs, dir)) {
+    names.push(e.endsWith("/") ? e.substring(0, e.length - 1) : e);
+  }
+  return sortedStrs(names);
+}
+
+// One job of one shell command that runs `cmds` in order and appends each exit status to `rcFile`: the pool polls a
+// finished command every 10 ms, so one command per job instead of one per step cuts the waiting by the number of steps.
+function batch(id: usize, cmds: string[], rcFile: string): Job {
+  let parts: string[] = ["rm -f " + shq(rcFile)];
+  for (const cmd of cmds) {
+    parts.push(cmd + "; echo $? >> " + shq(rcFile));
+  }
+  return Job { id: id, cmds: [parts.join("; ")], timeouts: [TIMEOUT * cmds.length.toInt()], stop: false };
+}
+
+// The exit statuses a batch wrote; -1 for a step that did not run (the batch timed out or died).
+function readRcs(fs: FsGrant, rcFile: string, n: usize): int[] {
+  let out: int[] = [];
+  for (const ln of readText(fs, rcFile).split("\n")) {
+    if (ln != "") {
+      out.push(parseInt(ln).unwrapOr(-1));
+    }
+  }
+  while (out.length < n) {
+    out.push(-1);
+  }
+  return out;
+}
+
+function collect(fs: FsGrant, files: string[], counts: usize[]): Outcome[] {
+  let out: Outcome[] = [];
+  let i: usize = 0;
+  while (i < files.length) {
+    out.push(Outcome { id: i, rcs: readRcs(fs, files[i], counts[i]) });
+    i += 1;
+  }
+  return out;
+}
+
+// ---- the three kinds of checks -----------------------------------------------------------------------------------------
+
+export class Fmt {
+  root: string;
+  dir: string;       // work directory
+  fmt: string;       // the formatter (compiler built from compiler/main.or)
+  parse: string;     // the parse dump
+  verbose: bool;
+
+  constructor(root: string, dir: string, fmt: string, parse: string, verbose: bool) {
+    this.root = root;
+    this.dir = dir;
+    this.fmt = fmt;
+    this.parse = parse;
+    this.verbose = verbose;
+  }
+
+  w(name: string): string {
+    return this.dir + "/" + name;
+  }
+
+  // `fmt fmt --stdout IN > OUT 2> ERR`
+  fmtStdout(input: string, out: string, err: string): string {
+    return inRoot(this.root, shq(this.fmt) + " fmt --stdout " + shq(input) + " > " + shq(out) + " 2> " + shq(err));
+  }
+
+  // `parse_main IN > OUT 2> /dev/null`
+  dump(input: string, out: string): string {
+    return inRoot(this.root, shq(this.parse) + " " + shq(input) + " > " + shq(out) + " 2> /dev/null");
+  }
+
+  // The AST of a file as `self.ast` returns it: the exit status and the dump without spans.
+  astKey(fs: FsGrant, rc: int, file: string): string {
+    return rc.toString() + "\n" + stripSpans(readText(fs, file));
+  }
+}
+
+// Verdict of one golden pair (`check_pair`). rcs: fmt IN, fmt EXP, parse IN, parse EXP, diff.
+function judgePair(fs: FsGrant, f: Fmt, i: usize, inp: string, rcs: int[]): string {
+  const exp = inp.substring(0, inp.length - 6) + ".out.or";
+  const want = readText(fs, f.root + "/" + exp);
+  const out = readText(fs, f.w("p" + i.toString() + ".o1"));
+  if (rcs[0] != 0) {
+    return "fmt failed: " + readText(fs, f.w("p" + i.toString() + ".e1"));
+  }
+  if (out != want) {
+    const d = readText(fs, f.w("p" + i.toString() + ".d"));
+    const baseName = lastPart(exp, "/");
+    return "output differs from " + baseName + "\n" + (d.endsWith("\n") ? d.substring(0, d.length - 1) : d);
+  }
+  if (rcs[1] != 0 || readText(fs, f.w("p" + i.toString() + ".o2")) != out) {
+    return "expected output is not a fixed point";
+  }
+  const src = readText(fs, f.root + "/" + inp);
+  if (!sameStrs(commentsOf(src), commentsOf(want))) {
+    return "comments changed";
+  }
+  if (f.astKey(fs, rcs[2], f.w("p" + i.toString() + ".a")) != f.astKey(fs, rcs[3], f.w("p" + i.toString() + ".b"))) {
+    return "AST changed";
+  }
+  return "";
+}
+
+// Verdict of one `check --format=json` case (`check_json`). rcs: json run, text run.
+function judgeJson(fs: FsGrant, f: Fmt, i: usize, rcs: int[]): string {
+  if (rcs[0] != 1 || rcs[1] != 1) {
+    return "expected exit 1 (json rc=" + rcs[0].toString() + ", text rc=" + rcs[1].toString() + ")";
+  }
+  const lines = splitLines(readText(fs, f.w("j" + i.toString() + ".o")));
+  if (lines.length == 0) {
+    return "no JSON output";
+  }
+  const keys = ["code", "severity", "file", "line", "col", "endLine", "endCol", "message", "notes"];
+  let codes: string[] = [];
+  let first: Json = JNull;
+  let haveFirst = false;
+  for (const ln of lines) {
+    const r = parse(ln);
+    if (r.isErr()) {
+      return "invalid JSON " + reprStr(ln) + ": " + r.unwrapErr().message;
+    }
+    const o = r.unwrap();
+    if (!haveFirst) {
+      first = o;
+      haveFirst = true;
+    }
+    if (!sameStrs(keysOf(o), keys)) {
+      return "keys differ: " + reprList(keysOf(o));
+    }
+    const code = str(at(o, ["code"]));
+    if (!isErrorCode(code) || str(at(o, ["severity"])) != "error") {
+      return "bad code/severity";
+    }
+    const line = numOf(at(o, ["line"]));
+    const col = numOf(at(o, ["col"]));
+    const endLine = numOf(at(o, ["endLine"]));
+    const endCol = numOf(at(o, ["endCol"]));
+    if (!(line >= 1 && col >= 1 && (endLine > line || (endLine == line && endCol >= col)))) {
+      return "bad position: " + ln;
+    }
+    if (!isStr(at(o, ["message"])) || !isArr(at(o, ["notes"]))) {
+      return "bad message/notes";
+    }
+    codes.push(code);
+  }
+  const err0 = readText(fs, f.w("j" + i.toString() + ".e"));
+  const textCodes = errorCodes(err0);
+  if (!sameStrs(codes, textCodes)) {
+    return "codes " + reprList(codes) + " differ from text mode " + reprList(textCodes);
+  }
+  const m = firstDiag(err0);
+  if (m.found && (str(at(first, ["file"])) != m.file || numOf(at(first, ["line"])) != m.line || numOf(at(first, ["col"])) != m.col)) {
+    return "position differs from text mode";
+  }
+  return "";
+}
+
+function numOf(j: Json): int {
+  return match (j) {
+    JNum(x) => x,
+    _ => 0
+  };
+}
+
+// Runs the whole suite.
+export function runFmt(fs: FsGrant, proc: ProcessGrant, c: Ctx, f: Fmt, workers: usize): void {
+  const root = f.root;
+  // ---- the inputs
+  let pairs: string[] = [];
+  for (const n of sortedListing(fs, root + "/tests/fmt")) {
+    if (n.endsWith(".in.or")) {
+      pairs.push("tests/fmt/" + n);
+    }
+  }
+  const listing = f.w("corpus.txt");
+  let finds: string[] = [];
+  for (const d of corpusDirs()) {
+    finds.push("find -L " + d + " -type f -name '*.or' -not -name '.*' -not -path '*/.*'");
+  }
+  shell(proc, inRoot(root, "{ " + finds.join("; ") + "; } | LC_ALL=C sort > " + shq(listing)));
+  let files: string[] = [];
+  for (const ln of readText(fs, listing).split("\n")) {
+    if (ln != "") {
+      files.push(ln);
+    }
+  }
+  let errs: string[] = [];
+  const errListing = listDir(fs, root + "/tests/errors");
+  for (const n of sortedListing(fs, root + "/tests/errors")) {
+    if (n.startsWith(".")) {
+      continue;
+    }
+    const p = "tests/errors/" + n;
+    const entry = errListing.includes(n + "/") ? p + "/main.or" : p;
+    if (exists(fs, root + "/" + entry)) {
+      errs.push(entry);
+    }
+  }
+
+  // ---- round 1: one job per pair, per corpus file, per error entry
+  let jobs: Job[] = [];
+  let rcFiles: string[] = [];
+  let rcCounts: usize[] = [];
+  let pi: usize = 0;
+  for (const inp of pairs) {
+    const exp = inp.substring(0, inp.length - 6) + ".out.or";
+    const k = pi.toString();
+    rcFiles.push(f.w("p" + k + ".rc"));
+    rcCounts.push(5);
+    jobs.push(batch(jobs.length, [
+        f.fmtStdout(inp, f.w("p" + k + ".o1"), f.w("p" + k + ".e1")),
+        f.fmtStdout(exp, f.w("p" + k + ".o2"), f.w("p" + k + ".e2")),
+        f.dump(inp, f.w("p" + k + ".a")),
+        f.dump(exp, f.w("p" + k + ".b")),
+        inRoot(root, "diff -u --label expected --label actual " + shq(exp) + " " + shq(f.w("p" + k + ".o1")) + " > " + shq(f.w("p" + k + ".d")) + " 2>&1")
+      ], f.w("p" + k + ".rc")));
+    pi += 1;
+  }
+  let ci: usize = 0;
+  const corpusBase = jobs.length;
+  for (const p of files) {
+    const k = ci.toString();
+    rcFiles.push(f.w("c" + k + ".rc1"));
+    rcCounts.push(2);
+    jobs.push(batch(jobs.length, [f.dump(p, f.w("c" + k + ".a0")), f.fmtStdout(p, f.w("c" + k + ".o1.or"), f.w("c" + k + ".e1"))],
+      f.w("c" + k + ".rc1")));
+    ci += 1;
+  }
+  let ji: usize = 0;
+  const jsonBase = jobs.length;
+  for (const e of errs) {
+    const k = ji.toString();
+    rcFiles.push(f.w("j" + k + ".rc"));
+    rcCounts.push(2);
+    jobs.push(batch(jobs.length, [
+        inRoot(root, shq(f.fmt) + " check --format=json " + shq(e) + " > " + shq(f.w("j" + k + ".o")) + " 2> /dev/null"),
+        inRoot(root, shq(f.fmt) + " check " + shq(e) + " > /dev/null 2> " + shq(f.w("j" + k + ".e")))
+      ], f.w("j" + k + ".rc")));
+    ji += 1;
+  }
+  runAll(proc, jobs, workers);
+  const r1 = collect(fs, rcFiles, rcCounts);
+
+  // ---- round 2: the corpus files that parse are formatted again and parsed; the ones that do not are formatted in place
+  let jobs2: Job[] = [];
+  let rcFiles2: string[] = [];
+  let rcCounts2: usize[] = [];
+  let slot: int[] = [];       // corpus index -> job in round 2 (-1: none)
+  ci = 0;
+  while (ci < files.length) {
+    const k = ci.toString();
+    const rcs = r1[corpusBase + ci].rcs;
+    if (rcs[0] != 0) {
+      slot.push(jobs2.length.toInt());
+      rcFiles2.push(f.w("c" + k + ".rc2"));
+      rcCounts2.push(1);
+      jobs2.push(batch(jobs2.length, [inRoot(root, "cp " + shq(files[ci]) + " " + shq(f.w("c" + k + ".x.or")) + " && " + shq(f.fmt) + " fmt "
+          + shq(f.w("c" + k + ".x.or")) + " > /dev/null 2> " + shq(f.w("c" + k + ".e3")))], f.w("c" + k + ".rc2")));
+    } else if (rcs[1] == 0) {
+      slot.push(jobs2.length.toInt());
+      rcFiles2.push(f.w("c" + k + ".rc2"));
+      rcCounts2.push(2);
+      jobs2.push(batch(jobs2.length, [f.fmtStdout(f.w("c" + k + ".o1.or"), f.w("c" + k + ".o2"), f.w("c" + k + ".e2")),
+        f.dump(f.w("c" + k + ".o1.or"), f.w("c" + k + ".a1"))], f.w("c" + k + ".rc2")));
+    } else {
+      slot.push(-1);
+    }
+    ci += 1;
+  }
+  runAll(proc, jobs2, workers);
+  const r2 = collect(fs, rcFiles2, rcCounts2);
+
+  // ---- verdicts, in the order of the lists
+  pi = 0;
+  while (pi < pairs.length) {
+    const msg = judgePair(fs, f, pi, pairs[pi], r1[pi].rcs);
+    report(fs, c, msg == "", pairs[pi], msg, f.verbose);
+    pi += 1;
+  }
+  ci = 0;
+  while (ci < files.length) {
+    judgeCorpus(fs, c, f, ci, files[ci], r1[corpusBase + ci].rcs, slot[ci] < 0 ? Outcome { id: 0, rcs: [] } : r2[slot[ci].toUsize()]);
+    ci += 1;
+  }
+  ji = 0;
+  while (ji < errs.length) {
+    const msg = judgeJson(fs, f, ji, r1[jsonBase + ji].rcs);
+    report(fs, c, msg == "", errs[ji], msg, f.verbose);
+    ji += 1;
+  }
+  const t = c.totals(fs);
+  console.log("pairs " + pairs.length.toString() + ", corpus " + files.length.toString() + ", json " + errs.length.toString()
+    + ": " + (t.checks - t.failures).toString() + " passed, " + t.failures.toString() + " failed");
+}
+
+// Verdict of one corpus file (`check_corpus`). `r1` are the exit statuses of round 1 (parse, fmt), `second` those of round 2.
+function judgeCorpus(fs: FsGrant, c: Ctx, f: Fmt, i: usize, path: string, r1: int[], second: Outcome): void {
+  const k = i.toString();
+  const data = readText(fs, f.root + "/" + path);
+  const prc = r1[0];
+  const rc = r1[1];
+  if (prc != 0) {
+    // syntax error: must be reported, file untouched
+    const rc3 = second.rcs.length > 0 ? second.rcs[0] : -1;
+    if (rc3 == 0 || !readText(fs, f.w("c" + k + ".e3")).includes("error[E")) {
+      report(fs, c, false, path, "syntax error not reported by fmt (rc=" + rc3.toString() + ")", f.verbose);
+    } else if (readText(fs, f.w("c" + k + ".x.or")) != data) {
+      report(fs, c, false, path, "file with syntax error was modified", f.verbose);
+    } else {
+      report(fs, c, true, path + " (syntax error kept)", "", f.verbose);
+    }
+    return;
+  }
+  if (rc != 0) {
+    report(fs, c, false, path, "fmt failed: " + head(readText(fs, f.w("c" + k + ".e1")), 300), f.verbose);
+    return;
+  }
+  const out1 = readText(fs, f.w("c" + k + ".o1.or"));
+  const rc2 = second.rcs[0];
+  if (rc2 != 0) {
+    report(fs, c, false, path, "formatted output does not parse: " + head(readText(fs, f.w("c" + k + ".e2")), 300), f.verbose);
+    return;
+  }
+  if (readText(fs, f.w("c" + k + ".o2")) != out1) {
+    report(fs, c, false, path, "not idempotent", f.verbose);
+    return;
+  }
+  const rc3 = second.rcs[1];
+  if (rc3 != 0 || stripSpans(readText(fs, f.w("c" + k + ".a1"))) != stripSpans(readText(fs, f.w("c" + k + ".a0")))) {
+    report(fs, c, false, path, "AST changed by formatting", f.verbose);
+    return;
+  }
+  if (!sameStrs(commentsOf(data), commentsOf(out1))) {
+    report(fs, c, false, path, "comments not preserved", f.verbose);
+    return;
+  }
+  report(fs, c, true, path, "", f.verbose);
+}
