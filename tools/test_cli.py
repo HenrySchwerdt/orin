@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Release CLI journeys, isolated from the user's installation and network."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ class CliTests(unittest.TestCase):
         (package / "lib/orin/runtime").symlink_to(ROOT / "runtime" / "core")
         (package / "lib/orin/platform").symlink_to(ROOT / "runtime" / "platform")
         (package / "examples").symlink_to(ROOT / "examples")
+        shutil.copy2(ROOT / "dist/llvm.pin", package / "lib/orin/llvm.pin")
         (package / "VERSION").write_text("test\n")
         cls.cli = package / "bin/orin"
         cls.compiler = compiler
@@ -522,16 +524,57 @@ class CliTests(unittest.TestCase):
         self.assertTrue(json.loads(result.stdout)["ok"])
         self.run_cli("run", "--format=json", cwd=self.cwd / "hello", code=2)
 
+    def fake_toolchain(self, version="19.1.7"):
+        """A local archive of a fake `clang` (it logs its use and runs the system clang) and a pin that names it."""
+        src = self.cwd / "fake-llvm/clang+llvm-fake/bin"
+        src.mkdir(parents=True)
+        log = self.cwd / "fake-clang.log"
+        clang = src / "clang"
+        clang.write_text(f'#!/bin/sh\nif [ "$1" = --version ]; then echo "clang version {version} (fake)"; exit 0; fi\n'
+                         f'echo used >> "{log}"\nexec clang "$@"\n')
+        clang.chmod(0o755)
+        for extra in ("llc", "clang-19"):
+            (src / extra).write_text("#!/bin/sh\n")
+            (src / extra).chmod(0o755)
+        (self.cwd / "fake-llvm/clang+llvm-fake/lib/clang/19/include").mkdir(parents=True)
+        archive = self.cwd / "fake-llvm.tar.gz"
+        subprocess.run(["tar", "-czf", str(archive), "-C", str(self.cwd / "fake-llvm"), "clang+llvm-fake"], check=True)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        pin = self.cwd / "fake.pin"
+        pin.write_text(f"version {version}\nasset linux-x86_64 {digest} file://{archive}\n"
+                       f"asset linux-aarch64 {digest} file://{archive}\nasset macos-arm64 {digest} file://{archive}\n"
+                       f"asset macos-x86_64 {digest} file://{archive}\n")
+        return {"ORIN_LLVM_PIN": str(pin), "ORIN_HOME": str(self.cwd / "orin-home")}, log
+
     def test_http_template_and_llvm_release(self):
         self.run_cli("init", "server", "--template", "http")
         self.run_cli("check", cwd=self.cwd / "server")
         self.run_cli("init", "hello")
         project = self.cwd / "hello"
-        self.run_cli("build", "--release", "--backend=llvm", cwd=project)
+        env, log = self.fake_toolchain()
+        # Without the pinned toolchain a --release --backend=llvm build falls back to the C backend and says so.
+        result = self.run_cli("build", "--release", "--backend=llvm", cwd=project, env=env)
+        self.assertIn("pinned LLVM 19.1.7 is not installed", result.stderr)
+        self.assertFalse(log.exists())
         binary = project / "build/release/hello"
         self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
         self.run_cli("clean", cwd=project)
         self.assertFalse(binary.exists())
+        # `orin toolchain install` then makes --backend=llvm use the pinned clang.
+        self.run_cli("toolchain", "status", code=1, env=env)
+        self.assertIn("sha256 verified", self.run_cli("toolchain", "install", env=env).stdout)
+        self.assertIn("installed:   yes", self.run_cli("toolchain", "status", env=env).stdout)
+        result = self.run_cli("build", "--release", "--backend=llvm", cwd=project, env=env)
+        self.assertNotIn("not installed", result.stderr)
+        self.assertTrue(log.exists(), "the pinned clang was not used")
+        self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
+        # An explicit CC still wins over the pinned toolchain.
+        log.unlink()
+        self.run_cli("clean", cwd=project)
+        self.run_cli("build", "--release", "--backend=llvm", cwd=project, env={**env, "CC": "clang"})
+        self.assertFalse(log.exists())
+        # doctor reports the pinned toolchain.
+        self.assertIn("LLVM toolchain: pinned 19.1.7 installed", self.run_cli("doctor", env=env).stdout)
 
     def test_absolute_dependency_from_nested_directory(self):
         self.run_cli("init", "shared", "--lib")

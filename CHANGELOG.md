@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Pinned LLVM toolchain (ADR-0038 section 8, gate 3).** New `orin toolchain install [--force]` / `status` (in `dist/orin`, wired
+  into `dist/orin-cli.sh`): it downloads the LLVM release pinned in `dist/llvm.pin` (19.1.7; linux-x86_64, linux-aarch64,
+  macos-arm64), refuses the archive unless its sha256 matches the pin, unpacks `clang`, `llc` and clang's resource directory (about
+  400 MB) into `~/.orin/toolchains/llvm-19.1.7`. `orin build|run --backend=llvm` then uses that clang; `--release --backend=llvm`
+  without it falls back to the C backend and prints a note; `orin doctor` reports the toolchain (informational). With the pinned
+  clang the llvm suite (925 tests) and `tools/llvm_fixpoint.sh` pass unchanged. `tools/test_llvm_toolchain.sh` (CI job `llvm`) checks
+  the pin and the install against a local fake archive (wrong checksum, tampered file, wrong version, unpinned platform);
+  `tools/test_cli.py` covers fallback, install, use and `CC` precedence. LLVM is still not the release default (all three gates
+  are met; the decision is the owner's). 18.1.8 was rejected: its Linux x86_64 archive needs `libtinfo.so.5`.
 - **Small-block cache for strings and array buffers; bintrees regions measured and deferred (ADR-0038 addendum 2026-10-16).** Profiling
   bintrees showed no malloc to remove (struct free lists and the iterative `orin_destroy` already exist; 0.6 % malloc), and regions
   would give at most about -50 % on that one workload, so they stay deferred. The same profiles put 9-20 % of the string and map
