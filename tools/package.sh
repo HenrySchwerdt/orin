@@ -17,7 +17,8 @@ test -f "$OUT/lib/orin/platform/orin_platform.c" || { echo "package lacks platfo
 cp -r examples "$OUT/examples"
 mkdir -p "$OUT/examples/osig" && cp -r tests/osig/accept/base tests/osig/accept/head "$OUT/examples/osig/"   # orin diff demo (README)
 cp build/bootstrap/stage2.c "$OUT/share/orin/orin-seed.c"   # self-hosted compiler as C
-cp README.md CHANGELOG.md "$OUT/"
+cp README.md "$OUT/"
+python3 tools/changelog.py --render -o "$OUT/CHANGELOG.md"   # with the unreleased fragments from changes/
 mkdir -p "$OUT/docs/assets" && cp docs/assets/orin-logo-256.png "$OUT/docs/assets/"
 [ -f LICENSE ] && cp LICENSE "$OUT/"
 echo "$VER" > "$OUT/VERSION"
