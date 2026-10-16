@@ -48,7 +48,7 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 | Parallel pipelines (ADR-0039 steps 1-3): `parallel()`, work-stealing fork/join pool in `std:task`, lending without copies, E0484-E0486, W0480-W0481 | done; speedup not yet measured on an idle machine; parallel `sort`, user reducers, all element types not started |
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
-| Runtime R3/R4 (object model in Orin, refinement proofs) | R3a done (core operations `BCore`, ADR-0052: all of `runtime/core` to Orin in R3a-R3f, L0 stays C); R3b-R3f and R4 not started |
+| Runtime R3/R4 (object model in Orin, refinement proofs) | R3a done (core operations `BCore`, ADR-0052: all of `runtime/core` to Orin in R3a-R3f, L0 stays C); R3b partly done (`parseI8`..`parseUsize` in Orin; float format/parse, prepend/append-decimal, array slice/concat/extend stay C, see spec 19 inventory); R3c-R3f and R4 not started |
 
 ## Next milestones
 
