@@ -1,0 +1,167 @@
+// Tests of the run history on the Processes page (ADR-0050, "Processes with data"): the reader of orin-runs/0.1 records, the
+// charts and the outcome table, escaping of hostile record text, and that a site without a history is the one without the feature.
+
+import { buildSite, buildSiteWith, OutFile } from "../src/site";
+import { Snap, Sym } from "../src/model";
+import { Run, decodeRuns, sortRuns, statusOf } from "../src/runs";
+import { assertEqString, assertEqBool, assertEq, assert } from "std:test";
+import { Passed, Failed, Regression, Unproven, Timeout, Info, statusToken } from "orin-reports";
+
+const EVIL: string = "<script>alert(1)</script>&\"'";
+
+function contains(s: string, needle: string): bool {
+  return s.indexOf(needle).isSome();
+}
+
+function snap(): Snap {
+  return Snap {
+    schema: "osig/0.3", pkg: "p", hash: "h",
+    nodes: [Sym { id: "p:m", kind: "Module", name: "m", module: "m", owner: "p", sig: "", exported: true, entry: false,
+                  file: "src/a.or", line: 1, endLine: 2, doc: "", assurance: "" }],
+    edges: [],
+  };
+}
+
+function record(commit: string, date: string, check: int, hir: int, suite: string, status: string): string {
+  return "{\"schema\":\"orin-runs/0.1\",\"commit\":\"" + commit + "\",\"date\":\"" + date + "\",\"builds\":[{\"name\":\"compiler\",\"entry\":\"compiler/main.or\","
+    + "\"backend\":\"c\",\"total\":" + (check + hir).toString() + ",\"phases\":[{\"name\":\"check\",\"ms\":" + check.toString() + "},{\"name\":\"hir\",\"ms\":" + hir.toString() + "}]}],"
+    + "\"suites\":[{\"name\":\"" + suite + "\",\"status\":\"" + status + "\",\"passed\":3,\"failed\":0,\"total\":3}]}";
+}
+
+function processes(files: OutFile[]): string {
+  for (const f of files) {
+    if (f.path == "processes.html") {
+      return f.text;
+    }
+  }
+  return "";
+}
+
+function load(texts: string[]): Run[] {
+  let all: Run[] = [];
+  for (const t of texts) {
+    const r = decodeRuns(t);
+    assertEqBool(r.isOk(), true, "record decodes");
+    for (const x of r.unwrap()) {
+      all.push(x);
+    }
+  }
+  return sortRuns(all);
+}
+
+@Test
+function a_record_an_array_and_an_object_with_runs_decode(): void {
+  const one = record("aaa1111", "2026-10-01T00:00:00Z", 10, 5, "unit", "passed");
+  assertEq(decodeRuns(one).unwrap().length.toInt(), 1, "one record");
+  assertEq(decodeRuns("[" + one + "," + one + "]").unwrap().length.toInt(), 2, "an array of records");
+  assertEq(decodeRuns("{\"runs\":[" + one + "]}").unwrap().length.toInt(), 1, "an object with runs");
+  const r = decodeRuns(one).unwrap()[0];
+  assertEqString(r.commit, "aaa1111", "commit");
+  assertEq(r.builds[0].phases.length.toInt(), 2, "phases");
+  assertEq(r.builds[0].total, 15, "total");
+  assertEqString(r.suites[0].status, "passed", "status");
+  assertEq(r.suites[0].total, 3, "suite total");
+}
+
+@Test
+function other_documents_are_refused(): void {
+  assertEqBool(decodeRuns("{\"schema\":\"osig/0.3\"}").isErr(), true, "a snapshot is not a run");
+  assertEqBool(decodeRuns("[1,2,3]").isErr(), true, "numbers are not runs");
+  assertEqBool(decodeRuns("{\"schema\":\"orin-runs/0.1\", ").isErr(), true, "broken JSON");
+  assertEqBool(decodeRuns("[]").isErr(), true, "no record at all");
+  assertEqBool(decodeRuns("{\"schema\":\"orin-runs/0.7\",\"commit\":\"c\",\"future\":[1]}").isOk(), true, "a newer minor version with unknown fields is read");
+}
+
+@Test
+function runs_are_ordered_by_date_then_commit(): void {
+  const rs = load([record("bbb", "2026-10-02T00:00:00Z", 1, 1, "s", "passed"), record("zzz", "2026-10-01T00:00:00Z", 1, 1, "s", "passed"), record("aaa", "2026-10-02T00:00:00Z", 1, 1, "s", "passed")]);
+  assertEqString(rs[0].commit, "zzz", "oldest first");
+  assertEqString(rs[1].commit, "aaa", "same date: by commit");
+  assertEqString(rs[2].commit, "bbb", "newest last");
+}
+
+@Test
+function the_status_vocabulary_of_orin_reports_is_used(): void {
+  assertEqString(statusToken(statusOf("passed")), "passed", "passed");
+  assertEqString(statusToken(statusOf("failed")), "failed", "failed");
+  assertEqString(statusToken(statusOf("unproven")), "unproven", "unproven");
+  assertEqString(statusToken(statusOf("timeout")), "timeout", "timeout");
+  assertEqString(statusToken(statusOf("regression")), "regression", "regression");
+  assertEqString(statusToken(statusOf("something else")), "info", "an unknown word is shown as info, never as passed");
+}
+
+@Test
+function without_a_history_the_site_is_the_one_without_the_feature(): void {
+  const a = buildSite(snap(), None);
+  const b = buildSiteWith(snap(), None, []);
+  assertEq(a.length.toInt(), b.length.toInt(), "same files");
+  let i: usize = 0;
+  while (i < a.length) {
+    assertEqBool(a[i].text == b[i].text, true, a[i].path + ": same bytes");
+    assertEqBool(a[i].path != "assets/runs.css", true, "no runs.css");
+    i += 1;
+  }
+  assertEqBool(contains(processes(a), "runs.css"), false, "no link to runs.css");
+  assertEqBool(contains(processes(a), "rn-"), false, "no run classes");
+  assertEqBool(contains(processes(a), "Time per phase"), false, "no run charts");
+}
+
+@Test
+function a_history_adds_bars_trends_outcomes_and_its_stylesheet(): void {
+  const rs = load([record("1111111aaaa", "2026-10-01T00:00:00Z", 100, 20, "unit", "passed"), record("2222222bbbb", "2026-10-02T00:00:00Z", 120, 20, "unit", "failed"),
+                   record("3333333cccc", "2026-10-03T00:00:00Z", 90, 25, "unit", "regression")]);
+  const files = buildSiteWith(snap(), None, rs);
+  const page = processes(files);
+  assertEqBool(contains(page, "assets/runs.css"), true, "stylesheet linked");
+  let css = false;
+  for (const f of files) {
+    css = css || f.path == "assets/runs.css";
+  }
+  assertEqBool(css, true, "runs.css written");
+  assertEqBool(contains(page, "Time per phase: compiler"), true, "bar chart");
+  assertEqBool(contains(page, "Trend per phase: compiler"), true, "trend chart");
+  assertEqBool(contains(page, "3333333"), true, "latest commit shown short");
+  assertEqBool(contains(page, "3333333cccc"), false, "only seven characters of the commit");
+  assertEqBool(contains(page, "r-badge-regression"), true, "latest status as a badge");
+  assertEqBool(contains(page, "was failed"), true, "change against the run before");
+  assertEqBool(contains(page, "-30 ms"), true, "check phase got 30 ms faster");
+  assertEqBool(contains(page, "+5 ms"), true, "hir phase got 5 ms slower");
+  assertEqBool(contains(page, "Run history"), true, "section");
+  assertEqBool(contains(page, "<script>"), false, "no inline script");
+  assertEqBool(contains(page, "<style"), false, "no inline style");
+  assertEqBool(contains(page, " style="), false, "no style attribute");
+  assertEqBool(contains(page, "https://"), false, "nothing remote");
+}
+
+@Test
+function one_run_has_no_trend_line_and_a_missing_phase_does_not_break_the_chart(): void {
+  const one = load([record("1111111aaaa", "2026-10-01T00:00:00Z", 100, 20, "unit", "passed")]);
+  const page = processes(buildSiteWith(snap(), None, one));
+  assertEqBool(contains(page, "Trend per phase"), true, "trend chart present");
+  assertEqBool(contains(page, "class=\"rn-spark\""), false, "a single point has no line");
+  const gap = load([record("1111111aaaa", "2026-10-01T00:00:00Z", 100, 20, "unit", "passed"),
+                    "{\"schema\":\"orin-runs/0.1\",\"commit\":\"2222222bbbb\",\"date\":\"2026-10-02T00:00:00Z\",\"builds\":[{\"name\":\"compiler\",\"phases\":[{\"name\":\"check\",\"ms\":80}]}],\"suites\":[]}"]);
+  const p2 = processes(buildSiteWith(snap(), None, gap));
+  assertEqBool(contains(p2, "Trend per phase: compiler"), true, "chart with a phase missing from the latest run");
+  assertEqBool(contains(p2, "The latest run has no suite outcomes."), true, "empty suites say so");
+  const none = load(["{\"schema\":\"orin-runs/0.1\",\"commit\":\"c\",\"date\":\"d\"}"]);
+  const p3 = processes(buildSiteWith(snap(), None, none));
+  assertEqBool(contains(p3, "The latest run has no compile timings."), true, "no builds says so");
+}
+
+@Test
+function hostile_record_text_is_escaped(): void {
+  const t = "{\"schema\":\"orin-runs/0.1\",\"commit\":\"" + "x" + "\",\"date\":\"2026-10-01\",\"builds\":[{\"name\":\"b\\u003cscript\\u003e\",\"entry\":\"<script>alert(1)</script>\",\"backend\":\"<b>\","
+    + "\"phases\":[{\"name\":\"<script>alert(1)</script>&\\\"'\",\"ms\":5}]}],\"suites\":[{\"name\":\"<script>alert(1)</script>\",\"status\":\"<script>alert(1)</script>\",\"passed\":1}]}";
+  const rs = load([t]);
+  const page = processes(buildSiteWith(snap(), None, rs));
+  assertEqBool(contains(page, "<script>alert(1)"), false, "no raw script tag");
+  assertEqBool(contains(page, "&lt;script&gt;alert(1)&lt;/script&gt;"), true, "the text is present, escaped");
+  assertEqBool(contains(page, "r-badge-info"), true, "an unknown status is info");
+}
+
+@Test
+function output_with_a_history_is_deterministic(): void {
+  const rs = load([record("1111111aaaa", "2026-10-01T00:00:00Z", 100, 20, "unit", "passed"), record("2222222bbbb", "2026-10-02T00:00:00Z", 90, 21, "unit", "passed")]);
+  assertEqBool(processes(buildSiteWith(snap(), None, rs)) == processes(buildSiteWith(snap(), None, rs)), true, "same bytes");
+}

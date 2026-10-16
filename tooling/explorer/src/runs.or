@@ -1,0 +1,323 @@
+// Run history for the Processes page (ADR-0050, "Processes with data"): the reader of `orin-runs/0.1` records and the
+// section that shows them: per-phase time bars of the latest run, a trend per phase over all runs (inline SVG, no
+// script) and the latest outcome of every suite with the status vocabulary of orin-reports.
+//
+// A record (written by tools/run_record.py in CI; ADR-0023 rules: additive minor versions, unknown fields ignored):
+//   { "schema": "orin-runs/0.1", "commit": "<sha>", "date": "<ISO 8601>",
+//     "builds": [ { "name", "entry", "backend", "total", "phases": [ { "name", "ms" } ] } ],      // `orin compile --timings`
+//     "suites": [ { "name", "status": passed|failed|unproven|timeout|regression|improvement|skipped|info, "passed", "failed", "total" } ] }
+// A history is a list of records: one record, a JSON array of records or {"runs": [...]}, in one file or a directory of files.
+
+import ox from "std:html";
+import { Html, empty } from "std:html";
+import {
+  Badge, Status, Passed, Failed, Regression, Improvement, Unproven, Timeout, Skipped, Info, newBareCanvas, Pt, SvgDoc,
+} from "orin-reports";
+import { JsonValue } from "std:jsonvalue";
+import { parse, items, isObject, strOf, intOf, listOf, get } from "./jv";
+import { Ctx, Section, Figure } from "./components";
+import { strCmp, plural, clip } from "./util";
+
+export type Phase = { name: string; ms: int; };
+export type Build = { name: string; entry: string; backend: string; total: int; phases: Phase[]; };
+export type Suite = { name: string; status: string; passed: int; failed: int; total: int; };
+export type Run = { commit: string; date: string; builds: Build[]; suites: Suite[]; };
+
+const MAX_RUNS: usize = 60;
+
+function decodeRun(v: JsonValue): Option<Run> {
+  if (!isObject(v)) {
+    return None;
+  }
+  const schema = strOf(v, "schema");
+  if (!schema.startsWith("orin-runs/")) {
+    return None;
+  }
+  let builds: Build[] = [];
+  for (const b of listOf(v, "builds")) {
+    let phases: Phase[] = [];
+    for (const p of listOf(b, "phases")) {
+      phases.push(Phase { name: strOf(p, "name"), ms: intOf(p, "ms") });
+    }
+    let total = intOf(b, "total");
+    if (get(b, "total").isNone()) {
+      for (const p of phases) {
+        total += p.ms;
+      }
+    }
+    builds.push(Build { name: strOf(b, "name"), entry: strOf(b, "entry"), backend: strOf(b, "backend"), total: total, phases: phases });
+  }
+  let suites: Suite[] = [];
+  for (const s of listOf(v, "suites")) {
+    suites.push(Suite { name: strOf(s, "name"), status: strOf(s, "status"), passed: intOf(s, "passed"), failed: intOf(s, "failed"), total: intOf(s, "total") });
+  }
+  return Some(Run { commit: strOf(v, "commit"), date: strOf(v, "date"), builds: builds, suites: suites });
+}
+
+// The records of one JSON document: a record, an array of records or {"runs": [...]}. Err when it holds none.
+export function decodeRuns(text: string): Result<Run[], string> {
+  const doc = parse(text)?;
+  let cands: JsonValue[] = [];
+  if (isObject(doc) && get(doc, "runs").isSome()) {
+    cands = listOf(doc, "runs");
+  } else if (isObject(doc)) {
+    cands = [doc];
+  } else {
+    cands = items(doc);
+  }
+  let out: Run[] = [];
+  for (const c of cands) {
+    const r = decodeRun(c);
+    if (r.isSome()) {
+      out.push(r.unwrap());
+    }
+  }
+  if (out.length == 0) {
+    return Err("no orin-runs record found (expected \"schema\": \"orin-runs/0.x\")");
+  }
+  return Ok(out);
+}
+
+// oldest first (date, then commit); at most the newest MAX_RUNS
+export function sortRuns(runs: Run[]): Run[] {
+  const sorted = runs.sort((a: Run, b: Run): int => {
+    const c = strCmp(a.date, b.date);
+    return c != 0 ? c : strCmp(a.commit, b.commit);
+  });
+  return sorted.length > MAX_RUNS ? sorted.slice(sorted.length - MAX_RUNS, sorted.length) : sorted;
+}
+
+export function statusOf(s: string): Status {
+  return match (s) {
+    "passed" => Passed,
+    "failed" => Failed,
+    "regression" => Regression,
+    "improvement" => Improvement,
+    "unproven" => Unproven,
+    "timeout" => Timeout,
+    "skipped" => Skipped,
+    _ => Info,
+  };
+}
+
+function shortCommit(c: string): string {
+  return c.length > 7 ? c.substring(0, 7) : c;
+}
+
+function dayOf(d: string): string {
+  return d.length > 10 ? d.substring(0, 10) : d;
+}
+
+function findBuild(r: Run, name: string): Option<Build> {
+  for (const b of r.builds) {
+    if (b.name == name) {
+      return Some(b);
+    }
+  }
+  return None;
+}
+
+function phaseMs(b: Build, name: string): Option<int> {
+  for (const p of b.phases) {
+    if (p.name == name) {
+      return Some(p.ms);
+    }
+  }
+  return None;
+}
+
+function signed(n: int): string {
+  return n > 0 ? "+" + n.toString() : n.toString();
+}
+
+// ---- charts ---------------------------------------------------------------------------------------------------------------
+
+const LABEL_W: float = 112.0;
+
+// one horizontal bar per phase, scaled to the longest phase; the label names the share of the total
+function barsSvg(b: Build, idp: string): SvgDoc {
+  const rowH = 26.0;
+  const barW = 360.0;
+  const w = LABEL_W + barW + 150.0;
+  const h = 12.0 + rowH * b.phases.length.toFloat();
+  let mx: int = 1;
+  for (const p of b.phases) {
+    mx = p.ms > mx ? p.ms : mx;
+  }
+  let c = newBareCanvas(w.toInt(), h.toInt(), "Time per phase: " + b.name, "Wall time of each compile phase of " + b.name + " in the latest run, in milliseconds.", idp, "rn-svg");
+  let k: usize = 0;
+  while (k < b.phases.length) {
+    const p = b.phases[k];
+    const y = 6.0 + rowH * k.toFloat();
+    const bw = (barW * p.ms.toFloat()) / mx.toFloat();
+    c.group("rn-row", p.name + ": " + p.ms.toString() + " ms");
+    c.text(LABEL_W - 10.0, y + 15.0, p.name, "rn-t", 13, "end", "600", 0);
+    c.rrect("rn-track", LABEL_W, y + 3.0, barW, 16.0, 4.0);
+    if (p.ms > 0) {
+      c.rrect("rn-bar", LABEL_W, y + 3.0, bw < 3.0 ? 3.0 : bw, 16.0, 4.0);
+    }
+    const share = b.total > 0 ? ((p.ms * 100) / b.total).toString() + " %" : "";
+    c.text(LABEL_W + barW + 10.0, y + 15.0, p.ms.toString() + " ms" + (share.length > 0 ? "  ·  " + share : ""), "rn-t2", 12, "start", "400", 0);
+    c.endGroup();
+    k += 1;
+  }
+  return c.finish();
+}
+
+// small multiples: per phase a line over the runs (each row has its own scale), the latest value and the change since the run before
+function trendSvg(runs: Run[], name: string, phaseNames: string[], idp: string): SvgDoc {
+  const rowH = 38.0;
+  const sparkW = 320.0;
+  const w = LABEL_W + sparkW + 170.0;
+  const h = 10.0 + rowH * phaseNames.length.toFloat();
+  let c = newBareCanvas(w.toInt(), h.toInt(), "Trend per phase: " + name, "Wall time of each compile phase of " + name + " over " + plural(runs.length.toInt(), "run", "runs") + ", oldest on the left.", idp, "rn-svg");
+  let k: usize = 0;
+  while (k < phaseNames.length) {
+    const ph = phaseNames[k];
+    const y0 = 6.0 + rowH * k.toFloat();
+    // the series: (run index, ms) for the runs that have the phase
+    let xs: usize[] = [];
+    let vs: int[] = [];
+    let i: usize = 0;
+    while (i < runs.length) {
+      const b = findBuild(runs[i], name);
+      if (b.isSome()) {
+        const v = phaseMs(b.unwrap(), ph);
+        if (v.isSome()) {
+          xs.push(i);
+          vs.push(v.unwrap());
+        }
+      }
+      i += 1;
+    }
+    let lo: int = 0;
+    let hi: int = 0;
+    if (vs.length > 0) {
+      lo = vs[0];
+      hi = vs[0];
+      for (const v of vs) {
+        lo = v < lo ? v : lo;
+        hi = v > hi ? v : hi;
+      }
+    }
+    const top = y0 + 6.0;
+    const bottom = y0 + rowH - 12.0;
+    c.group("rn-row", ph);
+    c.text(LABEL_W - 10.0, y0 + 20.0, ph, "rn-t", 13, "end", "600", 0);
+    c.line("rn-axis", LABEL_W, bottom + 4.0, LABEL_W + sparkW, bottom + 4.0, "1", false);
+    let pts: Pt[] = [];
+    let j: usize = 0;
+    while (j < vs.length) {
+      const fx = runs.length <= 1 ? 0.5 : xs[j].toFloat() / (runs.length - 1).toFloat();
+      const fy = hi == lo ? 0.5 : 1.0 - (vs[j] - lo).toFloat() / (hi - lo).toFloat();
+      pts.push(Pt { x: LABEL_W + 8.0 + fx * (sparkW - 16.0), y: top + fy * (bottom - top) });
+      j += 1;
+    }
+    if (pts.length >= 2) {
+      c.flow("rn-spark", pts, 1.8, "");
+    }
+    j = 0;
+    while (j < pts.length) {
+      const last = j + 1 == pts.length;
+      c.marker(last ? "rn-dot-last" : "rn-dot", pts[j].x, pts[j].y, shortCommit(runs[xs[j]].commit) + " " + dayOf(runs[xs[j]].date) + ": " + vs[j].toString() + " ms");
+      j += 1;
+    }
+    if (vs.length > 0) {
+      const now = vs[vs.length - 1];
+      c.text(LABEL_W + sparkW + 12.0, y0 + 20.0, now.toString() + " ms", "rn-t", 13, "start", "600", 0);
+      if (vs.length >= 2) {
+        const d = now - vs[vs.length - 2];
+        c.text(LABEL_W + sparkW + 70.0, y0 + 20.0, d == 0 ? "±0" : signed(d) + " ms", d > 0 ? "rn-up" : (d < 0 ? "rn-down" : "rn-t2"), 12, "start", "600", 0);
+      }
+    } else {
+      c.text(LABEL_W + sparkW + 12.0, y0 + 20.0, "no data", "rn-t2", 12, "start", "400", 0);
+    }
+    c.endGroup();
+    k += 1;
+  }
+  return c.finish();
+}
+
+// ---- components ---------------------------------------------------------------------------------------------------------
+
+function BuildBlock(runs: Run[], b: Build, n: usize): Html {
+  const names = b.phases.map(p => p.name);
+  return <div class="rn-build">
+    <h3>{b.name}</h3>
+    <p class="rn-meta"><code>{clip(b.entry, 80)}</code>{b.backend.length > 0 ? ", backend " + b.backend : ""}, {b.total.toString()} ms in total (monotonic clock, whole milliseconds)</p>
+    {Figure("Time per phase in the latest run", barsSvg(b, "rb" + n.toString() + "-"), false)}
+    {Figure("Trend per phase over " + plural(runs.length.toInt(), "run", "runs") + ", oldest on the left; each row has its own scale", trendSvg(runs, b.name, names, "rt" + n.toString() + "-"), false)}
+  </div>;
+}
+
+function SuiteRow(s: Suite, before: Option<Suite>): Html {
+  const counts = s.total > 0 ? s.passed.toString() + " of " + s.total.toString() : (s.passed > 0 ? s.passed.toString() : "–");
+  return <tr>
+    <th scope="row">{s.name}</th>
+    <td><Badge status={statusOf(s.status)} /></td>
+    <td class="r-num">{counts}</td>
+    <td class="r-num">{s.failed > 0 ? s.failed.toString() : "–"}</td>
+    <td class="rn-was">{before.isSome() && before.unwrap().status != s.status ? "was " + before.unwrap().status : ""}</td>
+  </tr>;
+}
+
+function RunRow(r: Run, compiler: Option<Build>): Html {
+  let bad: int = 0;
+  for (const s of r.suites) {
+    bad += s.status == "failed" || s.status == "regression" || s.status == "timeout" ? 1 : 0;
+  }
+  return <tr>
+    <th scope="row"><span class="rn-commit">{shortCommit(r.commit)}</span></th>
+    <td>{dayOf(r.date)}</td>
+    <td class="r-num">{compiler.isSome() ? compiler.unwrap().total.toString() + " ms" : "–"}</td>
+    <td class="r-num">{r.suites.length.toString()}</td>
+    <td class="r-num">{bad > 0 ? bad.toString() : "–"}</td>
+  </tr>;
+}
+
+function findSuite(r: Run, name: string): Option<Suite> {
+  for (const s of r.suites) {
+    if (s.name == name) {
+      return Some(s);
+    }
+  }
+  return None;
+}
+
+// The "Run history" section of the Processes page; `runs` is sorted, oldest first, and not empty.
+export function RunHistory(ctx: Ctx, runs: Run[]): Html {
+  const latest = runs[runs.length - 1];
+  const prev: Option<Run> = runs.length >= 2 ? Some(runs[runs.length - 2]) : None;
+  const shownBuilds = latest.builds.length > 6 ? latest.builds.slice(0, 6) : latest.builds;
+  let lastRows: Run[] = [];
+  let ri = runs.length;
+  while (ri > 0 && lastRows.length < 10) {
+    ri -= 1;
+    lastRows.push(runs[ri]);
+  }
+  const intro = plural(runs.length.toInt(), "run", "runs") + ", latest " + shortCommit(latest.commit) + " (" + dayOf(latest.date) + "). Times come from orin compile --timings, outcomes from the CI steps of that run (orin-runs/0.1).";
+  let blocks: Html[] = [];
+  let bn: usize = 0;
+  while (bn < shownBuilds.length) {
+    blocks.push(<BuildBlock runs={runs} b={shownBuilds[bn]} n={bn} />);
+    bn += 1;
+  }
+  const phasesSection = latest.builds.length == 0
+    ? <p class="ex-empty">The latest run has no compile timings.</p>
+    : <>{blocks}</>;
+  const suiteBody = latest.suites.length == 0
+    ? <p class="ex-empty">The latest run has no suite outcomes.</p>
+    : <div class="r-table-wrap ex-table" role="region" aria-label="Suite outcomes" tabindex={0}><table class="r-table">
+        <thead><tr><th scope="col">Suite</th><th scope="col">Status</th><th scope="col" class="r-num">Passed</th><th scope="col" class="r-num">Failed</th><th scope="col">Change</th></tr></thead>
+        <tbody>{latest.suites.map(s => <SuiteRow s={s} before={prev.isSome() ? findSuite(prev.unwrap(), s.name) : None} />)}</tbody></table></div>;
+  const firstName = latest.builds.length > 0 ? latest.builds[0].name : "";
+  return <>
+    {Section("history", "Run history", intro, <>
+      <h3>Compile time per phase</h3>
+      {phasesSection}</>)}
+    {Section("outcomes", "Outcomes of the latest run", "Status vocabulary of orin-reports: passed, failed, unproven, timeout, regression.", suiteBody)}
+    {Section("runs", "Runs", runs.length > 10 ? "The newest 10 of " + runs.length.toString() + " runs." : "", <div class="r-table-wrap ex-table" role="region" aria-label="Runs" tabindex={0}><table class="r-table">
+      <thead><tr><th scope="col">Commit</th><th scope="col">Date</th><th scope="col" class="r-num">{firstName.length > 0 ? firstName : "Compile"}</th><th scope="col" class="r-num">Suites</th><th scope="col" class="r-num">Not passing</th></tr></thead>
+      <tbody>{lastRows.map(r => <RunRow r={r} compiler={firstName.length > 0 ? findBuild(r, firstName) : None} />)}</tbody></table></div>)}
+  </>;
+}
