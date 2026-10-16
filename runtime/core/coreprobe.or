@@ -7,7 +7,8 @@
 // touches no memory but its own allocations. Delete it when the runtime modules of R3b+ exercise the operations for real.
 
 import {
-  load8, load32, load64, loadF64, store8, store32, store64, storeF64, memAlloc, memFree, memCopy, memSet, addrOf
+  load8, load32, load64, loadF64, store8, store32, store64, storeF64, memAlloc, memFree, memCopy, memSet, addrOf,
+  and, or, xor, shl, shr, expect, cfg, heapBase, memRealloc, memMove, memCmp
 } from "std:core";
 
 function line(name: string, ok: bool): string {
@@ -75,6 +76,71 @@ export function coreProbe(): string {
   out += line("addrOf aligned", addrOf(s) / 8 * 8 == addrOf(s) && addrOf(xs) / 8 * 8 == addrOf(xs));
   out += line("addrOf leaves value", s == "core" && xs.length == 3 && xs[2] == 3);
 
+  // bit operations on usize
+  out += line("and", and(0xF0F0, 0xFF00) == 0xF000 && and(18446744073709551615, 5) == 5);
+  out += line("or", or(0xF0F0, 0x0F0F) == 0xFFFF && or(0, 0) == 0);
+  out += line("xor", xor(0xFF, 0x0F) == 0xF0 && xor(18446744073709551615, 18446744073709551615) == 0);
+  out += line("shl", shl(1, 3) == 8 && shl(1, 63) == 9223372036854775808 && shl(3, 63) == 9223372036854775808);
+  out += line("shl 64 or more", shl(1, 64) == 0 && shl(18446744073709551615, 200) == 0);
+  out += line("shr", shr(256, 4) == 16 && shr(18446744073709551615, 63) == 1 && shr(5, 0) == 5);
+  out += line("shr 64 or more", shr(18446744073709551615, 64) == 0 && shr(1, 1000) == 0);
+  out += line("shr is logical", shr(9223372036854775808, 62) == 2);
+  const refmask: usize = 5;
+  out += line("bit test", and(shr(refmask, 2), 1) == 1 && and(shr(refmask, 1), 1) == 0);
+
+  // expect is the identity on its first argument
+  const yes = a != 0;
+  out += line("expect", expect(yes, true) && !expect(!yes, true) && expect(yes, false) && !expect(!yes, false));
+
+  // cfg: 0 or 1 for the three switches, 0 for an unknown number
+  out += line("cfg", cfg(0) <= 1 && cfg(1) <= 1 && cfg(2) <= 1 && cfg(3) == 0 && cfg(100) == 0);
+
+  // heapBase: a stable 8-aligned address; the last of the 64 reserved words is ours (zero at first, then what we store)
+  const h = heapBase();
+  out += line("heapBase", h != 0 && h == heapBase() && h / 8 * 8 == h);
+  out += line("heapBase zeroed", load64(h + 504) == 0);
+  store64(h + 504, 77);
+  out += line("heapBase usable", load64(h + 504) == 77 && load64(heapBase() + 504) == 77);
+  store64(h + 504, 0);
+
+  // memRealloc keeps the contents, grows and shrinks, and a size of 0 is one byte
+  const c = memAlloc(16);
+  store64(c, 0x1122334455667788);
+  store64(c + 8, 0x99AABBCCDDEEFF00);
+  const c2 = memRealloc(c, 4096);
+  out += line("memRealloc grow", c2 != 0 && load64(c2) == 0x1122334455667788 && load64(c2 + 8) == 0x99AABBCCDDEEFF00);
+  store8(c2 + 4095, 5);
+  out += line("memRealloc usable", load8(c2 + 4095) == 5);
+  const c3 = memRealloc(c2, 8);
+  out += line("memRealloc shrink", c3 != 0 && load64(c3) == 0x1122334455667788);
+  const c4 = memRealloc(c3, 0);
+  out += line("memRealloc zero", c4 != 0 && load8(c4) == 0x88);
+
+  // memMove: overlapping ranges in both directions
+  memSet(b, 0, 64);
+  store64(b, 0x0807060504030201);
+  memMove(b + 2, b, 8);
+  out += line("memMove up", load8(b) == 1 && load8(b + 1) == 2 && load8(b + 2) == 1 && load8(b + 9) == 8);
+  memMove(b, b + 2, 8);
+  out += line("memMove down", load8(b) == 1 && load8(b + 7) == 8);
+  memMove(b, a, 0);
+  out += line("memMove zero length", load8(b) == 1);
+
+  // memCmp: -1, 0, 1 by the first differing byte, bytes compare unsigned
+  const x = memAlloc(8);
+  const y = memAlloc(8);
+  memSet(x, 3, 8);
+  memSet(y, 3, 8);
+  out += line("memCmp equal", memCmp(x, y, 8) == 0 && memCmp(x, y, 0) == 0);
+  store8(y + 5, 4);
+  out += line("memCmp less", memCmp(x, y, 8) == -1 && memCmp(x, y, 5) == 0);
+  out += line("memCmp greater", memCmp(y, x, 8) == 1);
+  store8(y + 1, 200);
+  out += line("memCmp unsigned", memCmp(x, y, 8) == -1 && memCmp(y, x, 8) == 1);
+  memFree(y);
+  memFree(x);
+
+  memFree(c4);
   memFree(z);
   memFree(b);
   memFree(a);

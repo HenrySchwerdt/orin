@@ -223,6 +223,30 @@ extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 #define ORIN_STAT_ON 0
 #endif
 
+/* Build configuration as seen by the core operation cfg(k) (ADR-0052 Addendum A section 2; compiler/hir/coreops.or): 0 free lists
+ * on (off under ASan / MSan or -DORIN_NO_FREELIST), 1 hot counters, 2 allocation-site census. Constants, so Orin code folds them. */
+#if defined(ORIN_NO_FREELIST) || defined(__SANITIZE_ADDRESS__)
+#define ORIN_CFG_FREELIST 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)
+#define ORIN_CFG_FREELIST 0
+#endif
+#endif
+#ifndef ORIN_CFG_FREELIST
+#define ORIN_CFG_FREELIST 1
+#endif
+#define ORIN_CFG_STATS ORIN_STAT_ON
+#ifdef ORIN_SITE_STATS
+#define ORIN_CFG_SITES 1
+#else
+#define ORIN_CFG_SITES 0
+#endif
+
+/* The per-thread block of the core operation heapBase() (ADR-0052 Addendum A section 5): zero-initialised, so a new thread starts
+ * with empty state. R3d.0 only reserves it; R3d.1 moves the free lists, the small-block cache and the counters into it. */
+enum { ORIN_HEAP_WORDS = 64 };
+extern __thread uint64_t orin_heap[ORIN_HEAP_WORDS] ORIN_TLS_MODEL;
+
 /* Allocation-site census (opt-in, docs/perf/alloc-census.md, tools/alloc_census.py). Compiled in only when BOTH the generated C
  * and the runtime are built with ORIN_SITE_STATS: the compiler (`orin2 compile --stats-sites`) then defines it at the top of
  * its output, emits `ORIN_SITE(n, orin_site_caller);` before every MIR instruction and terminator (n: the site id, 1-based, in

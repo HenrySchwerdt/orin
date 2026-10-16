@@ -867,7 +867,7 @@ export class LlvmFunctionEmitter {
   // (`align 1`); allocation maps `n == 0` to one byte like orin_platform_alloc and calls libc malloc / free, copy and set
   // use the LLVM memory intrinsics (the L0 functions are static inline in a C header, so there is no symbol to call).
   private coreR(p: string, k: usize, args: Operand[]): R {
-    const a0 = ov(p, 0, args[0]);
+    const a0 = args.length > 0 ? ov(p, 0, args[0]) : "";
     const r = p + "r";
     const q = p + "q";
     const ptr0 = "  " + q + " = inttoptr i64 " + a0 + " to ptr\n";
@@ -926,7 +926,69 @@ export class LlvmFunctionEmitter {
         val: "",
       };
     }
-    return R { text: "  " + r + " = ptrtoint ptr " + a0 + " to i64\n", val: r };
+    if (k == 12) {
+      return R { text: "  " + r + " = ptrtoint ptr " + a0 + " to i64\n", val: r };
+    }
+    return this.coreExtraR(p, k, a0, args);
+  }
+
+  // Core operations 13..23 (hir/coreops.or): the bit operations, expect, cfg, heapBase, realloc, memmove and memcmp.
+  private coreExtraR(p: string, k: usize, a0: string, args: Operand[]): R {
+    const r = p + "r";
+    const q = p + "q";
+    const ptr0 = "  " + q + " = inttoptr i64 " + a0 + " to ptr\n";
+    if (k >= 13 && k <= 17) {
+      const a1 = ov(p, 1, args[1]);
+      if (k <= 15) {
+        const ins = k == 13 ? "and" : k == 14 ? "or" : "xor";
+        return R { text: "  " + r + " = " + ins + " i64 " + a0 + ", " + a1 + "\n", val: r };
+      }
+      // a shift of 64 or more gives 0 (a bare `shl` / `lshr` would be poison)
+      return R {
+        text: "  " + p + "c = icmp ult i64 " + a1 + ", 64\n  " + p + "s = " + (k == 16 ? "shl" : "lshr") + " i64 " + a0 + ", "
+            + a1 + "\n  " + r + " = select i1 " + p + "c, i64 " + p + "s, i64 0\n",
+        val: r,
+      };
+    }
+    if (k == 18) {
+      // identity on the bool; the hint applies when `likely` is a literal
+      return match (args[1]) {
+        OBool(lk) => R {
+          text: "  " + p + "b = trunc i64 " + a0 + " to i1\n  " + p + "e = call i1 @llvm.expect.i1(i1 " + p + "b, i1 "
+              + (lk ? "true" : "false") + ")\n  " + r + " = zext i1 " + p + "e to i64\n",
+          val: r,
+        },
+        _ => R { text: "", val: a0 },
+      };
+    }
+    if (k == 19) {
+      // 0 free lists on, 1 hot counters (off), 2 site census (off); any other k gives 0 (no driver flags yet: R3d.3)
+      return R { text: "  " + p + "c = icmp eq i64 " + a0 + ", 0\n  " + r + " = zext i1 " + p + "c to i64\n", val: r };
+    }
+    if (k == 20) {
+      return R { text: "  " + r + " = ptrtoint ptr @orin_heap to i64\n", val: r };
+    }
+    if (k == 21) {
+      const a1 = ov(p, 1, args[1]);
+      return R {
+        text: ptr0 + "  " + p + "z = icmp eq i64 " + a1 + ", 0\n  " + p + "n = select i1 " + p + "z, i64 1, i64 " + a1 + "\n  "
+            + p + "m = call ptr @realloc(ptr " + q + ", i64 " + p + "n)\n  " + r + " = ptrtoint ptr " + p + "m to i64\n",
+        val: r,
+      };
+    }
+    const a1 = ov(p, 1, args[1]);
+    const n = ov(p, 2, args[2]);
+    const src = ptr0 + "  " + p + "s = inttoptr i64 " + a1 + " to ptr\n";
+    if (k == 22) {
+      return R { text: src + "  call void @llvm.memmove.p0.p0.i64(ptr " + q + ", ptr " + p + "s, i64 " + n + ", i1 false)\n", val: "" };
+    }
+    // memCmp: -1, 0 or 1
+    return R {
+      text: src + "  " + p + "c = call i32 @memcmp(ptr " + q + ", ptr " + p + "s, i64 " + n + ")\n  " + p + "g = icmp sgt i32 " + p
+          + "c, 0\n  " + p + "l = icmp slt i32 " + p + "c, 0\n  " + p + "gz = zext i1 " + p + "g to i64\n  " + p + "lz = zext i1 "
+          + p + "l to i64\n  " + r + " = sub i64 " + p + "gz, " + p + "lz\n",
+      val: r,
+    };
   }
 
   private unwrapOrR(p: string, a0: string, dflt: Operand, rt: MType): R {
