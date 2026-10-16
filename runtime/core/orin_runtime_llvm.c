@@ -1,5 +1,5 @@
 /*
- * Out-of-line symbols for the LLVM IR backend (compiler/llvm, ADR-0006).
+ * Out-of-line symbols for the LLVM IR backend (compiler/backends/llvm, ADR-0006).
  *
  * The textual IR emitted by `orin compile --backend=llvm` implements the small hot operations
  * (retain/release, field and array access, checked arithmetic) itself, against the object layout
