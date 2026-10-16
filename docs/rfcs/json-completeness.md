@@ -170,6 +170,12 @@ similar bounded builders; do not reuse legacy recursive concatenation unchecked.
 
 ## Decision 4: field-path-aware decoders, with ordinary Result composition
 
+Implemented initial slice: [std:jsondecode](../std-jsondecode.md) provides the
+non-floating-point helpers below, plus `cursorValue`, `cursorPath`, and
+`formatPath`. Error constructors use a `Decode` prefix to coexist with imported
+number errors. The sealed wrapper contains opaque read-only state to protect
+array paths; getters return COW copies. Float conversion remains deferred.
+
 Add a proposed `std:jsondecode` library over JsonValue, separately from I/O:
 
 ```typescript
@@ -213,7 +219,7 @@ array cursors allocate O(elements * path depth). State those bounds, cap them,
 and measure before adding an indexed object API. Repeated caller operations are
 not covered by a hidden global work quota. Fail-fast errors keep ordering stable.
 
-Illustrative future API example (not compilable until the proposed libraries exist):
+The pure config example is now executable in `examples/json_config.or`:
 
 ```typescript
 type Config = { endpoint: string; port: int; enabled: bool; };
