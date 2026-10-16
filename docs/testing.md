@@ -172,7 +172,7 @@ is the shared helper. `test_lsp.py` and `test_mcp.py` are one protocol session e
 take seconds, so they stay sequential; `--orin PATH` skips their compiler build.
 
 **CI.** The `build` job caches `build/bootstrap/orin2` and `stage2.c` (`actions/cache`), keyed by the hash of
-`compiler/`, `library/core/`, `library/collections/`, `library/std/`, `runtime/`, `seed/`, `tools/bootstrap.sh` and
+`compiler/`, `library/core/`, `library/collections/`, `library/std/`, `runtime/`, `bootstrap/seed/`, `tools/bootstrap.sh` and
 `tools/embed_prelude.py`. A pull request with a hit skips the bootstrap (the conformance run it would do is covered by the
 `sanitize` job: the same tests with the same compiler, under ASan + UBSan). An entry is only written after a full
 bootstrap passed. A push to `main`, the nightly run and a manual run never read the cache: they always bootstrap from the
