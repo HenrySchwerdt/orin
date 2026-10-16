@@ -262,5 +262,5 @@ allowed = ["Fs", "Process.Spawn"]
 `compiler/tests/effects_test.or` (direct, transitive, closures and function values, interfaces, recursion, `useHost` / `useFs`,
 purity agreement, not-typed program, policy matching; `tools/test_tooling.sh`), `tools/test_effects.py` (the CLI goldens
 `tests/osig/effects/app.*`, determinism, OSIG `MAY_PERFORM` invariants on four programs including the compiler, the diff
-sections, the policy cases), the LSP hover tests in `compiler/tests/lsp_test.or` and `tools/test_lsp.py`, the MCP `inspect`
-tests in `tools/test_mcp.py`, and `tools/test_capabilities.sh` (the inferred effects cover what the runtime denies).
+sections, the policy cases), the LSP hover tests in `compiler/tests/lsp_test.or` and `tools/protocol.sh lsp`, the MCP `inspect`
+tests in `tools/protocol.sh mcp`, and `tools/test_capabilities.sh` (the inferred effects cover what the runtime denies).
