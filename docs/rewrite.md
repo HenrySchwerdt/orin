@@ -43,10 +43,10 @@ Diagnostics are the contract of the front end, so compare them byte for byte ins
 suites (the error tests only check the code and the line):
 
 ```
-python3 tools/diff_compilers.py $S/orin2_base build/bootstrap/orin2
+tools/differential.sh compilers $S/orin2_base build/bootstrap/orin2
 ```
 
-`tools/diff_compilers.py` runs both compilers over every input of `tests/{errors,next/errors,parse_edge,run,next/run,
+`tools/differential.sh compilers` runs both compilers over every input of `tests/{errors,next/errors,parse_edge,run,next/run,
 contracts}`, all package test directories and `compiler/main.or` itself, in three modes (`compile X -o
 /dev/null`, `check X`, `check --format=json X`), and compares exit status, stdout and stderr. For
 `loader` + `diag`: 1304 inputs x 3 modes, 0 differences.
@@ -368,7 +368,7 @@ Design:
 
 Behaviour preservation (all against the baseline compiler built before the step):
 
-* `tools/diff_compilers.py`: 1,396 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
+* `tools/differential.sh compilers`: 1,396 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
 * generated code: the C of `compile`, of `compile --check-contracts` and the LLVM IR of `compile --backend=llvm` of
   every `tests/run`, `tests/next/run`, `tests/contracts` and `examples/` program and of `compiler/main.or`
   (415 inputs x 3) is **byte-identical** between the two compilers (the diagnostics diff cannot see instance order,
@@ -459,7 +459,7 @@ before:  verify error: f b0 i2: use of `l1` which is dead (uninitialised, moved,
 after:   verify error: f b0 i2 at src/main.or:12:5: use of `l1` which is dead (uninitialised, moved, released or invalidated)
 ```
 
-and through the batch driver (`verify_text`): `f:b0:i2: use of .. @0:78-89`. A function-level well-formedness error and MIR without spans keep the old text. Only a compiler bug triggers a verifier error, so no conformance input changes (`diff_compilers.py`: 0 differences).
+and through the batch driver (`verify_text`): `f:b0:i2: use of .. @0:78-89`. A function-level well-formedness error and MIR without spans keep the old text. Only a compiler bug triggers a verifier error, so no conformance input changes (`tools/differential.sh compilers`: 0 differences).
 
 Design notes and friction:
 
@@ -471,7 +471,7 @@ Design notes and friction:
 
 Behaviour preservation (against the baseline compiler built before the step):
 
-* `tools/diff_compilers.py`: 1,396 inputs x 3 modes, **0 differences** (diagnostics unchanged; the verifier message gains a location only for compiler bugs, so no input shows it);
+* `tools/differential.sh compilers`: 1,396 inputs x 3 modes, **0 differences** (diagnostics unchanged; the verifier message gains a location only for compiler bugs, so no input shows it);
 * generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`, `examples/` program and of `compiler/main.or` (381 inputs x 3) **byte-identical** (spans never reach the emitters);
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (6,617,344 bytes), conformance 141/141; `tools/test_compiler_contracts.sh`: contract-checked self-compile byte-identical to `stage2.c`, 804 / 804 conformance tests, **no contract fired**;
 * `orin check --strict-contracts compiler/main.or`: 0 warnings;
@@ -576,7 +576,7 @@ Behaviour preservation (against the baseline compiler built before the step):
   built from the old and the new tree, run over every `.or` file of the repository (1,707, after merging origin/main) and 1,500 garbage files (random
   token soups, truncations, deletions and duplications of real files): 3,207 inputs, **0 differences** (1,908 of them are
   parse errors: code, message and span identical). The same inputs through a contract-checked `parse_main`: no contract fired.
-* `tools/diff_compilers.py`: 1,406 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
+* `tools/differential.sh compilers`: 1,406 inputs x 3 modes (`compile`, `check`, `check --format=json`), **0 differences**;
 * generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`, `examples/` program and of `compiler/main.or` (390 inputs x 3) **byte-identical**;
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,666,960 bytes, after merging origin/main with Capabilities Stage B), conformance 141/141; all suites with `orin2`: 806 / 806;
 * `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806 / 806 conformance tests, `test_verify_contracts` 809 checks, **no contract fired**;
@@ -883,7 +883,7 @@ Behaviour preservation (against the baseline compiler built from `origin/main` b
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,513,150 bytes), conformance 141/141;
 * generated code: C, C with `--check-contracts` and LLVM IR of every `tests/run`, `tests/next/run`, `tests/contracts`,
   `examples/` program and of `compiler/main.or` (426 inputs x 3), baseline compiler vs new compiler: **0 differences**;
-* `tools/diff_compilers.py`: 1,412 inputs x 3 modes, **0 differences** (no conformance input has an `[effects]` table, so the
+* `tools/differential.sh compilers`: 1,412 inputs x 3 modes, **0 differences** (no conformance input has an `[effects]` table, so the
   relocated E0474 / E0502 do not show there; `tools/test_effects.py` checks them);
 * conformance `--suite all` 812/812 (C), default suite with `--backend=llvm` 141/141;
 * `tools/test_compiler_contracts.sh`: contract-checked self-compile byte-identical to `stage2.c`, 812/812 conformance tests,
@@ -1051,9 +1051,9 @@ before the merge against the 3a baseline, with the same results):
 * `tools/mutate_mir.py`: 41,315 mutants, 28,412 rejected, 12,354 warned, 549 benign, 0 survivors, 0 wrong-reason (the
   same as before); `tools/diff_verifier_lean.py` (12,000 programs): 4,592 both ACCEPT, 7,396 both REJECT, 12 divergences,
   all in the allow-listed class F6, the same numbers with the old driver; `verify_main.or`: all cases pass (4 new);
-* generated code (`tools/diff_compilers.py`-style comparison of C, C with `--check-contracts` and LLVM IR of every `tests/run`,
+* generated code (`tools/differential.sh compilers`-style comparison of C, C with `--check-contracts` and LLVM IR of every `tests/run`,
   `tests/next/run`, `tests/contracts`, `examples/` program and `compiler/main.or`): **390 inputs x 3, 0 differences**;
-  diagnostics (`tools/diff_compilers.py`): 1,406 inputs x 3 modes, 0 differences;
+  diagnostics (`tools/differential.sh compilers`): 1,406 inputs x 3 modes, 0 differences;
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,373,446 bytes), conformance 141/141; all suites with `orin2`: 806/806;
 * `tools/test_compiler_contracts.sh`: the contract-checked compiler self-compiles to output identical to `stage2.c`, 806/806
   conformance tests, `test_verify_contracts` 809 checks: **no contract fired**;
@@ -1152,7 +1152,7 @@ Gates on the doubly merged tree, against a baseline built from `origin/main` + t
   `verify_main.or`: all cases pass (241: every set of main, the perf branch and this step, summed);
   `verify_test.or`: 26 `@Test` (3 new: an inout call's `defsOf`, `rootsLive` / `joinIfChanged`, `IArrayExtend`);
 * generated code (C, C with `--check-contracts`, LLVM IR): 408 inputs x 3, **0 differences**; diagnostics
-  (`tools/diff_compilers.py`): 1,432 inputs x 3, 0 differences;
+  (`tools/differential.sh compilers`): 1,432 inputs x 3, 0 differences;
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,890,058 bytes), conformance 141/141; all suites 832/832;
 * `tools/test_compiler_contracts.sh`: contract-checked self-compile identical to `stage2.c`; suites 832/832 (one test,
   `std_http_basic`, hit the harness timeout at load 22 and passed on rerun: 1.7 s with contracts, 0.5 s without);
@@ -1366,13 +1366,13 @@ All against the compiler bootstrapped from the base (this branch's merge of the 
   compilers on the final tree: C (8,898,915 bytes), C with contracts (12,603,446) and LLVM IR (23,632,696) byte-identical;
 * `tools/bootstrap.sh`: `stage2.c == stage3.c` (8,898,915 bytes), conformance 141/141;
 * all suites with `orin2` (C and LLVM backends): 816 / 816 with the C backend and 816 / 816 with the LLVM backend (`run_tests.py --suite all`);
-* `tools/diff_backends.py` (build and run both, compare output): `--mode opt` 378 programs, 0 differences (4 skipped: the `--no-opt` side timed out on the loaded machine), `--mode llvm` 378 programs, 0 differences, `--mode builtins` 378 programs, 0 differences;
+* `tools/differential.sh` (build and run both, compare output): `--mode opt` 378 programs, 0 differences (4 skipped: the `--no-opt` side timed out on the loaded machine), `--mode llvm` 378 programs, 0 differences, `--mode builtins` 378 programs, 0 differences;
 * `tools/test_compiler_contracts.sh`: **not completed locally** (the run was invalidated because the tree was edited during it; GitHub CI runs it). Checked earlier in the step: the contract-checked compiler self-compiles `compiler/main.or` to output identical to the normal compiler's (C and LLVM IR), and every unit test runs with contracts (`orin test`); **no contract fired**;
 * `orin check --strict-contracts compiler/main.or`: no warning in the files of this step; the 13 `W0471` of `compiler/vc/` (`Gen`, `Tab`) are on the base too (step 3c fixes them);
 * `tools/mutate_mir.py`: **not run locally** (left to GitHub CI); the verifier and the MIR are untouched by this step;
 * `tools/test_tooling.sh` (with `opt_test` 17/17, `emit_test` 10/10): `opt_test` 17 / 17 and `emit_test` 10 / 10 run on their own; the full script was stopped (coordinator: CI is the gate) after the files before them had passed.
 * `ci_local.sh` was not run (the coordinator replaced it by the gates above, and then by GitHub CI).
-* The bootstrap, the byte-identity comparison, the suites and `diff_backends` ran on the tree before the last two compiler
+* The bootstrap, the byte-identity comparison, the suites and `differential` ran on the tree before the last two compiler
   changes of the step: the hot helpers of `opt/analysis.or` / `params.or` / `calls.or` returned to the loops of the base
   (performance only) and one `@Ensures` on `LlvmFunctionEmitter.run`. Those were checked with `orin check`, the formatter,
   `--strict-contracts` and `emit_test` (contracts on); the full gates on the final tree are GitHub CI's.
@@ -1425,7 +1425,7 @@ difference is the per-function `map` with its closure, the `BlockSink` / `Rewrit
 ## Step 1b: hardening `diag` and `loader` (more classes, more contracts)
 
 Review finding after step 1: too few invariants and assertions, too few classes. Behaviour-preserving
-(`tools/diff_compilers.py`: 1304 inputs x 3 modes, 0 differences; `stage2.c == stage3.c`; the
+(`tools/differential.sh compilers`: 1304 inputs x 3 modes, 0 differences; `stage2.c == stage3.c`; the
 contract-checked compiler self-compiles to byte-identical C and passes all 713 conformance tests, no
 contract fired; `ci_local.sh` green).
 

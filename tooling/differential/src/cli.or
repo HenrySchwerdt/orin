@@ -1,0 +1,239 @@
+// Command line of the differential harness. Mirrors the argparse interface of tools/diff_backends.py:
+//   --orinc PATH  --cc CMD  --filter SUBSTR  --sanitize  --shard I/N  --list  --mode opt|llvm|builtins|fuse (required)  -h/--help
+// argparse conventions are kept: `--opt=value`, unambiguous prefixes of long options (`--ori`), the last occurrence wins, a
+// value that starts with `-` is not accepted as the value of the previous option, errors exit with status 2 and print
+// `usage` and `error:` to stderr. One addition: `--root DIR` (the repository root; the Python script derives it from the
+// location of the script, this one from the flag, default: the current directory).
+// Pure functions: tests/cli_test.or.
+
+import { strip, reprStr } from "./text";
+
+export type Options = {
+  orinc: string;
+  cc: string;
+  filter: string;
+  sanitize: bool;
+  mode: string;       // "" (not given), opt | llvm | builtins | fuse
+  shardIndex: int;    // 1-based
+  shardCount: int;
+  list: bool;
+  root: string;
+  help: bool;
+};
+
+export type Parsed = { ok: bool; options: Options; error: string; };
+
+export function defaultOptions(): Options {
+  return Options {
+    orinc: "build/bootstrap/orin2", cc: "cc", filter: "", sanitize: false, mode: "", shardIndex: 1, shardCount: 1,
+    list: false, root: ".", help: false
+  };
+}
+
+export function usage(): string {
+  return "usage: orin-differential [-h] [--orinc ORINC] [--cc CC] [--filter FILTER] [--sanitize] --mode {opt,llvm,builtins,fuse}\n"
+  + "                         [--shard SHARD] [--list] [--root ROOT]\n"
+  + "       orin-differential compilers BASE_ORIN NEW_ORIN [--root ROOT]";
+}
+
+export function helpText(): string {
+  return usage() + "\n\n"
+  + "Differential tests of compiler modes: compile every program with the default pipeline and with an alternative, build and run\n"
+  + "both, compare stdout and exit code. `compilers` compares the diagnostics of two compilers.\n\n"
+  + "options:\n"
+  + "  -h, --help            show this help message and exit\n"
+  + "  --orinc ORINC         compiler under test (default: build/bootstrap/orin2)\n"
+  + "  --cc CC               C compiler (default: cc)\n"
+  + "  --filter FILTER       only the programs whose name contains FILTER\n"
+  + "  --sanitize            build the executables with ASan + UBSan\n"
+  + "  --mode {opt,llvm,builtins,fuse}\n"
+  + "                        opt: optimised MIR vs --no-opt; llvm: C backend vs --backend=llvm; builtins: Orin std prelude vs\n"
+  + "                        --c-builtins; fuse: fused array pipelines vs --no-fuse\n"
+  + "  --shard SHARD         run shard I of N (default 1/1: everything)\n"
+  + "  --list                print the selected program names and exit\n"
+  + "  --root ROOT           repository root holding tests/ and runtime/{core,platform}/ (default: the current directory)";
+}
+
+function fail(msg: string): Parsed {
+  return Parsed { ok: false, options: defaultOptions(), error: msg };
+}
+
+function longOptions(): string[] {
+  return ["--help", "--orinc", "--cc", "--filter", "--sanitize", "--mode", "--shard", "--list", "--root"];
+}
+
+function takesValue(name: string): bool {
+  return name == "--orinc" || name == "--cc" || name == "--filter" || name == "--mode" || name == "--shard" || name == "--root";
+}
+
+// The full name of a long option given as `--x...` (exact or an unambiguous prefix), or the error text.
+function resolveLong(given: string): Result<string, string> {
+  for (const n of longOptions()) {
+    if (n == given) {
+      return Ok(n);
+    }
+  }
+  let hits: string[] = [];
+  for (const n of longOptions()) {
+    if (n.startsWith(given)) {
+      hits.push(n);
+    }
+  }
+  if (hits.length == 1) {
+    return Ok(hits[0]);
+  }
+  if (hits.length > 1) {
+    return Err("ambiguous option: " + given + " could match " + hits.join(", "));
+  }
+  return Err("unrecognized arguments: " + given);
+}
+
+// argparse refuses a value that looks like an option (starts with `-`) unless it is a negative number.
+function looksLikeOption(v: string): bool {
+  if (v.length < 2 || v.charCodeAt(0) != 45) {
+    return false;
+  }
+  return parseInt(v).isNone();
+}
+
+// int(v) of Python: optional surrounding blanks, optional sign, digits.
+export function parseIntLoose(v: string): Option<int> {
+  const t = strip(v);
+  let k: usize = 0;
+  if (t.length > 0 && (t.charCodeAt(0) == 43 || t.charCodeAt(0) == 45)) {
+    k = 1;
+  }
+  if (k >= t.length) {
+    return None;
+  }
+  let i = k;
+  while (i < t.length) {
+    const c = t.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return None;
+    }
+    i += 1;
+  }
+  return parseInt(t.charCodeAt(0) == 43 ? t.substring(1, t.length) : t);
+}
+
+export type Shard = { index: int; count: int; };
+
+// `parse_shard` of tools/diff_backends.py: "I/N" with 1 <= I <= N, or the error text (without the "argument --shard: " prefix).
+export function parseShard(text: string): Result<Shard, string> {
+  const parts = text.split("/");
+  const bad = "--shard expects I/N, for example 2/3";
+  if (parts.length != 2) {
+    return Err(bad);
+  }
+  const i = parseIntLoose(parts[0]);
+  const n = parseIntLoose(parts[1]);
+  if (i.isNone() || n.isNone()) {
+    return Err(bad);
+  }
+  if (i.unwrap() < 1 || i.unwrap() > n.unwrap()) {
+    return Err("--shard I/N needs 1 <= I <= N");
+  }
+  return Ok(Shard { index: i.unwrap(), count: n.unwrap() });
+}
+
+// `select_shard`: program number `k` (0-based, after the filter) belongs to shard `index` of `count` (1-based) iff
+// k % count == index - 1: every count-th program starting at the index-th.
+export function inShard(k: usize, index: int, count: int): bool {
+  return k.toInt() % count == index - 1;
+}
+
+function apply(o: Options, name: string, value: string): Result<Options, string> {
+  if (name == "--orinc") {
+    return Ok(Options { ...o, orinc: value });
+  }
+  if (name == "--cc") {
+    return Ok(Options { ...o, cc: value });
+  }
+  if (name == "--filter") {
+    return Ok(Options { ...o, filter: value });
+  }
+  if (name == "--root") {
+    return Ok(Options { ...o, root: value });
+  }
+  if (name == "--mode") {
+    if (value != "opt" && value != "llvm" && value != "builtins" && value != "fuse") {
+      return Err("argument --mode: invalid choice: " + reprStr(value) + " (choose from 'opt', 'llvm', 'builtins', 'fuse')");
+    }
+    return Ok(Options { ...o, mode: value });
+  }
+  const s = parseShard(value);
+  if (s.isErr()) {
+    return Err("argument --shard: " + s.unwrapErr());
+  }
+  return Ok(Options { ...o, shardIndex: s.unwrap().index, shardCount: s.unwrap().count });
+}
+
+export function parseArgs(argv: string[]): Parsed {
+  let o = defaultOptions();
+  let unknown: string[] = [];
+  let i: usize = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    i += 1;
+    let name = "";
+    let inline = "";
+    let hasInline = false;
+    if (a.startsWith("--") && a.length > 2) {
+      const eq = a.indexOf("=");
+      const given = eq.isSome() ? a.substring(0, eq.unwrap()) : a;
+      const r = resolveLong(given);
+      if (r.isErr()) {
+        if (r.unwrapErr().startsWith("ambiguous")) {
+          return fail(r.unwrapErr());
+        }
+        unknown.push(a);
+        continue;
+      }
+      name = r.unwrap();
+      if (eq.isSome()) {
+        if (!takesValue(name)) {
+          return fail("argument " + name + ": ignored explicit argument " + reprStr(a.substring(eq.unwrap() + 1, a.length)));
+        }
+        hasInline = true;
+        inline = a.substring(eq.unwrap() + 1, a.length);
+      }
+    } else if (a == "-h") {
+      name = "--help";
+    } else {
+      unknown.push(a);
+      continue;
+    }
+    if (name == "--help") {
+      o = Options { ...o, help: true };
+    } else if (name == "--sanitize") {
+      o = Options { ...o, sanitize: true };
+    } else if (name == "--list") {
+      o = Options { ...o, list: true };
+    } else {
+      let value = inline;
+      if (!hasInline) {
+        if (i >= argv.length || looksLikeOption(argv[i])) {
+          return fail("argument " + name + ": expected one argument");
+        }
+        value = argv[i];
+        i += 1;
+      }
+      const r = apply(o, name, value);
+      if (r.isErr()) {
+        return fail(r.unwrapErr());
+      }
+      o = r.unwrap();
+    }
+  }
+  if (o.help) {
+    return Parsed { ok: true, options: o, error: "" };
+  }
+  if (o.mode == "") {
+    return fail("the following arguments are required: --mode");
+  }
+  if (unknown.length > 0) {
+    return fail("unrecognized arguments: " + unknown.join(" "));
+  }
+  return Parsed { ok: true, options: o, error: "" };
+}

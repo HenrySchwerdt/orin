@@ -1,0 +1,162 @@
+// `compilers BASE_ORIN NEW_ORIN`: the behaviour-preservation check for compiler changes (port of tools/diff_compilers.py,
+// docs/rewrite.md). Compares exit status, stdout and stderr of two compilers over every test input in three modes
+// (`compile X -o /dev/null`, `check X`, `check --format=json X`); diagnostics must be byte-identical.
+
+import { ProcessGrant } from "std:process";
+import { FsGrant, exists, listDir } from "std:fs";
+import { shell } from "std:io";
+import { shq, sortedStrings, reprStr, reprBytes, cutBytes, strip } from "./text";
+import { Job, Outcome, runAll } from "./exec";
+import { OUT, readText, compilerPath } from "./suite";
+
+export const WORKERS: usize = 4;
+export const TIMEOUT_SECONDS: int = 300;
+
+// The directories whose `.or` files and `<name>/main.or` programs are inputs, in the order of the Python script.
+export function inputDirs(): string[] {
+  return ["tests/errors", "tests/next/errors", "tests/parse_edge", "tests/run", "tests/next/run", "tests/contracts"];
+}
+
+// The three invocations compared for one input.
+export function modeArgs(x: string): string[][] {
+  return [["compile", x, "-o", "/dev/null"], ["check", x], ["check", "--format=json", x]];
+}
+
+// Python's repr of a list of strings: ['compile', 'x.or'].
+export function reprArgs(args: string[]): string {
+  let parts: string[] = [];
+  for (const a of args) {
+    parts.push(reprStr(a));
+  }
+  return "[" + parts.join(", ") + "]";
+}
+
+// A compiler named with a `/` is a path (relative to the root); a bare name is looked up in PATH, like subprocess does.
+export function compilerCommand(c: string): string {
+  return c.includes("/") ? compilerPath(c) : c;
+}
+
+function dropSlash(e: string): string {
+  return e.endsWith("/") ? e.substring(0, e.length - 1) : e;
+}
+
+// Every test input: the programs of the six directories, then every directory under tests/ that holds an orin.toml
+// (found with `find`; the language has no directory walk), then compiler/main.or.
+export function collect(fs: FsGrant, proc: ProcessGrant, root: string): string[] {
+  let found: string[] = [];
+  for (const d of inputDirs()) {
+    let raw: string[] = [];
+    for (const e of listDir(fs, root + "/" + d)) {
+      raw.push(e);
+    }
+    let names: string[] = [];
+    for (const e of raw) {
+      names.push(dropSlash(e));
+    }
+    for (const n of sortedStrings(names)) {
+      if (n.endsWith(".or")) {
+        found.push(d + "/" + n);
+      } else if (raw.includes(n + "/") && exists(fs, root + "/" + d + "/" + n + "/main.or")) {
+        found.push(d + "/" + n + "/main.or");
+      }
+    }
+  }
+  const list = OUT + "/.package-dirs";
+  shell(proc, "cd " + shq(root) + " && find tests -type f -name orin.toml > " + shq(list) + " 2>/dev/null");
+  let dirs: string[] = [];
+  for (const line of readText(fs, root + "/" + list).split("\n")) {
+    const l = strip(line);
+    if (l.endsWith("/orin.toml")) {
+      dirs.push(l.substring(0, l.length - 10));
+    }
+  }
+  for (const d of sortedStrings(dirs)) {
+    found.push(d);
+  }
+  found.push("compiler/main.or");
+  return found;
+}
+
+// The shell command that runs `compiler` with `args` and keeps stdout and stderr in the given files.
+export function runCommand(root: string, compiler: string, args: string[], outFile: string, errFile: string): string {
+  let ws: string[] = [shq(compilerCommand(compiler))];
+  for (const a of args) {
+    ws.push(shq(a));
+  }
+  return "cd " + shq(root) + " && " + ws.join(" ") + " >" + shq(outFile) + " 2>" + shq(errFile) + " </dev/null";
+}
+
+function rcText(rc: int): string {
+  return rc == -2 ? "None" : rc.toString();
+}
+
+// Returns the exit status of the check: 0 identical, 1 differences.
+export function runCompilers(fs: FsGrant, proc: ProcessGrant, root: string, base: string, next: string): int {
+  shell(proc, "cd " + shq(root) + " && mkdir -p " + shq(OUT + "/compilers"));
+  const xs = collect(fs, proc, root);
+  const dir = OUT + "/compilers";
+  // one job per (input, mode): the two compilers, in order
+  let jobs: Job[] = [];
+  let args: string[][] = [];
+  let names: string[] = [];
+  for (const x of xs) {
+    for (const a of modeArgs(x)) {
+      const k = jobs.length;
+      const stem = dir + "/" + k.toString();
+      jobs.push(Job {
+        id: k,
+        cmds: [runCommand(root, base, a, stem + ".base.out", stem + ".base.err"),
+               runCommand(root, next, a, stem + ".new.out", stem + ".new.err")],
+        timeouts: [TIMEOUT_SECONDS, TIMEOUT_SECONDS],
+        stop: false
+      });
+      args.push(a);
+      names.push(x);
+    }
+  }
+  const ran = runAll(proc, jobs, WORKERS);
+  // byte comparison of the captured files, for the runs whose exit statuses agree
+  let cmpJobs: Job[] = [];
+  let cmpOf: int[] = [];
+  let k: usize = 0;
+  while (k < jobs.length) {
+    const rcs = ran[k].rcs;
+    if (rcs[0] == rcs[1]) {
+      const stem = dir + "/" + k.toString();
+      cmpOf.push(cmpJobs.length.toInt());
+      cmpJobs.push(Job {
+        id: cmpJobs.length,
+        cmds: ["cd " + shq(root) + " && cmp -s " + shq(stem + ".base.out") + " " + shq(stem + ".new.out"),
+               "cd " + shq(root) + " && cmp -s " + shq(stem + ".base.err") + " " + shq(stem + ".new.err")],
+        timeouts: [60, 60],
+        stop: false
+      });
+    } else {
+      cmpOf.push(-1);
+    }
+    k += 1;
+  }
+  const cmps = runAll(proc, cmpJobs, WORKERS);
+  let bad: usize = 0;
+  k = 0;
+  while (k < jobs.length) {
+    const rcs = ran[k].rcs;
+    const c = cmpOf[k];
+    const same = c >= 0 && cmps[c.toUsize()].rcs[0] == 0 && cmps[c.toUsize()].rcs[1] == 0;
+    if (!same) {
+      bad += 1;
+      const stem = dir + "/" + k.toString();
+      console.log("DIFF " + names[k] + " " + reprArgs(args[k]) + " " + rcText(rcs[0]) + " " + rcText(rcs[1]));
+      console.log("  base: " + errHead(readText(fs, root + "/" + stem + ".base.err")));
+      console.log("  new : " + errHead(readText(fs, root + "/" + stem + ".new.err")));
+    }
+    k += 1;
+  }
+  console.log("compared " + xs.length.toString() + " inputs x 3 modes, " + bad.toString() + " differences");
+  return bad > 0 ? 1 : 0;
+}
+
+// `a[2][:300]` printed by Python: the repr of the first 300 bytes of stderr.
+export function errHead(err: string): string {
+  return reprBytes(cutBytes(err, 300));
+}
