@@ -77,7 +77,11 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
 2. **Performance, census row 1 (string intermediates) is done** (ADR-0038 addendum 2026-10-16, MIR v2.5: `IStrAppendNum`,
    `IStrAppendSub`): mapfreq -27.7%, wordfreq -28.9%, html -36.6%, strings -37.8% executed instructions; html -60% and html_hand
    -98% allocations (html_hand -65% instructions); self-compile -0.5%. The mapfreq / wordfreq allocations stay (the number string is the map key). Next in the
-   census ranking: `Span` / `Token` flattening, then escape analysis.
+   census ranking: `Span` / `Token` flattening, then escape analysis. `Span` / `Token` flattening was measured 2026-10-16 and
+   dropped: its cheapest part (`skipTrivia` returning a plain `usize`, removing ~507k `Ok(i)`) gives only -0.29% self-compile
+   instructions, and flattening `Span` itself needs value types (every `toks[i].span` / `spanTo` would re-allocate it).
+   T2 (unchecked dominated accesses, draft #98) is parked: gcc -O2 already removes the second check, gain nil; it is the
+   base for T6, whose ceiling (all array kind + bounds checks removed) is nbody -53%, pqueue -37%, sieve -18% instructions.
 3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
