@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **Small-block cache for strings and array buffers; bintrees regions measured and deferred (ADR-0038 addendum 2026-10-16).** Profiling
+  bintrees showed no malloc to remove (struct free lists and the iterative `orin_destroy` already exist; 0.6 % malloc), and regions
+  would give at most about -50 % on that one workload, so they stay deferred. The same profiles put 9-20 % of the string and map
+  workloads in glibc `malloc`/`free`/`realloc`. The runtime now caches string objects and array item buffers of up to 256 bytes in
+  per-thread 16-byte size-class lists (`sb_*` in `runtime/orin_runtime.c`; off under ASan). Executed instructions: self-compile -4.9 %
+  (identical output), wordfreq -13.0 %, http_parse -11.8 %, mapfreq -9.4 %, strings -6.7 %, html -3.5 %, appends -16.7 %, bintrees 0;
+  peak RSS +2 % on the self-compile. Runtime only: no compiler, MIR or verifier change.
 - **Unchecked array accesses from range facts (ADR-0038 lever 2, T6, MIR v2.6; draft).** The verifier gains an interval analysis
   (`compiler/verify/range.or`, rules R1-R5 in docs/mir.md) that accepts `arraygetu` / `arraysetu` when the index is provably below the length
   of an array built by `arraynew` in the same function; the optimiser pass `opt/bounds.or` emits them where the verifier agrees.

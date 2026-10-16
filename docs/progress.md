@@ -93,7 +93,9 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    code lines (T2 +115, T6 +870). Needs the owner's decision on the interval domain before merge (ADR-0038 T6).
 3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
-   bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
+   bintrees (f, deferred: measured 2026-10-16, free lists and iterative release already exist, regions would give about -50 %
+   on bintrees alone and nothing elsewhere; ADR-0038 addendum); packed arrays (b). Done on the way: small-block cache for
+   strings and array buffers, self-compile -4.9 %, wordfreq -13 %, mapfreq -9 %.
 4. **LLVM gate 3** (ADR-0038 §8): pinned toolchain (`orin toolchain install`). Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
    the LLVM-built compiler emits the same C and the same `.ll` as orin2, also with a third stage). Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).

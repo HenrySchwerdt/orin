@@ -378,6 +378,67 @@ static void *xrealloc(void *q, size_t n) {
     return p;
 }
 
+/* Small-block cache for the variable-size buffers: string objects and array item buffers of at most SB_MAX bytes (16-byte
+ * size classes). Every such block is allocated with its size rounded up to the class, and its free passes the same size
+ * (string: sizeof(OrinString) + cap + 1; items: cap * 8), so a block can sit on any thread's list and no header is needed.
+ * Per thread like the object lists above (a block is plain malloc memory), capped per class, and compiled out with them
+ * (ASan, -DORIN_NO_FREELIST). Larger buffers go to the allocator (realloc keeps its in-place growth for them). */
+#ifndef ORIN_NO_FREELIST
+enum { SB_MAX = 256, SB_CLASSES = SB_MAX / 16, SB_CAP = 1 << 15 };
+static __thread FreeNode *sb_list[SB_CLASSES + 1];
+static __thread uint32_t sb_cnt[SB_CLASSES + 1];
+static inline void *sb_alloc(size_t n) {
+    if (n <= SB_MAX) {
+        size_t c = (n + 15) >> 4;
+        FreeNode *f = sb_list[c];
+        if (f) {
+            sb_list[c] = f->next;
+            sb_cnt[c]--;
+            return f;
+        }
+        return xmalloc(c << 4);
+    }
+    return xmalloc(n);
+}
+static inline void sb_free(void *p, size_t n) {
+    if (n <= SB_MAX) {
+        size_t c = (n + 15) >> 4;
+        if (sb_cnt[c] < SB_CAP) {
+            ((FreeNode *)p)->next = sb_list[c];
+            sb_list[c] = (FreeNode *)p;
+            sb_cnt[c]++;
+            return;
+        }
+    }
+    orin_platform_free(p);
+}
+/* Grow (or shrink) a buffer from `old` to `n` bytes; p may be NULL when old is 0. */
+static void *sb_realloc(void *p, size_t old, size_t n) {
+    if (old > SB_MAX && n > SB_MAX) return xrealloc(p, n);
+    if (p && old <= SB_MAX && n <= SB_MAX && ((old + 15) >> 4) == ((n + 15) >> 4)) return p;
+    void *q = sb_alloc(n);
+    if (p) {
+        orin_platform_mem_copy(q, p, old < n ? old : n);
+        sb_free(p, old);
+    }
+    return q;
+}
+static void sb_drain(void) {
+    for (int c = 0; c <= SB_CLASSES; c++)
+        while (sb_list[c]) {
+            FreeNode *n = sb_list[c];
+            sb_list[c] = n->next;
+            sb_cnt[c]--;
+            orin_platform_free(n);
+        }
+}
+#else
+#define sb_alloc(n) xmalloc(n)
+#define sb_free(p, n) orin_platform_free(p)
+#define sb_realloc(p, old, n) xrealloc((p), (n))
+#define sb_drain() ((void)0)
+#endif
+
 /* ---------------------------------------------------------------- destroy */
 
 static __thread OrinObj **t_dstack; /* the work stack of orin_destroy: per task, freed when the task ends */
@@ -414,7 +475,7 @@ void orin_destroy(OrinObj *o) {
             if (a->is_ref)
                 for (uint64_t i = 0; i < a->len; i++) DEC(ORIN_REF(a->items[i]));
             ORIN_STAT(orin_stats.live_bytes -= sizeof(OrinArray) + a->cap * 8);
-            orin_platform_free(a->items);
+            if (a->items) sb_free(a->items, a->cap * 8);
 #ifndef ORIN_NO_FREELIST
             if (fl_n[FL_STRUCT_CLASSES] < FL_CAP) {
                 ((FreeNode *)x)->next = fl_array;
@@ -444,7 +505,12 @@ void orin_destroy(OrinObj *o) {
 #endif
             break;
         }
-        default: ORIN_STAT(orin_stats.live_bytes -= sizeof(OrinString) + ((OrinString *)x)->cap + 1); break;
+        default:
+            ORIN_STAT(orin_stats.live_bytes -= sizeof(OrinString) + ((OrinString *)x)->cap + 1);
+            sb_free(x, sizeof(OrinString) + ((OrinString *)x)->cap + 1);
+            g_live--;
+            ORIN_STAT(orin_stats.frees++);
+            continue;
         }
         orin_platform_free(x);
         g_live--;
@@ -624,7 +690,7 @@ OrinObj *orin_make_unique_slow(OrinObj *o) {
 static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     if (cap < len) cap = len;
     if (cap > ((uint64_t)1 << 48)) orin_trap("string too large");
-    OrinString *s = (OrinString *)xmalloc(sizeof(OrinString) + cap + 1);
+    OrinString *s = (OrinString *)sb_alloc(sizeof(OrinString) + cap + 1);
     s->h.rc = 1;
     s->h.kind = ORIN_K_STRING;
     s->h.tag = 0;
@@ -667,7 +733,7 @@ OrinObj *orin_str_append(OrinObj *a, OrinObj *b) {
             uint64_t cap = x->cap * 2;
             if (cap < n) cap = n;
             if (cap < 16) cap = 16;
-            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            x = (OrinString *)sb_realloc(x, sizeof(OrinString) + x->cap + 1, sizeof(OrinString) + cap + 1);
             ORIN_STAT(orin_stats.live_bytes += cap - x->cap);
             ORIN_STAT(orin_stats.string_grows++);
             SITE_GROW(&x->h, cap - x->cap);
@@ -701,7 +767,7 @@ static OrinObj *str_append_decimal(OrinObj *a, uint64_t v, int neg) {
             if (cap < n) cap = n;
             if (cap < 16) cap = 16;
             uint64_t oldcap = x->cap; (void)oldcap;
-            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            x = (OrinString *)sb_realloc(x, sizeof(OrinString) + x->cap + 1, sizeof(OrinString) + cap + 1);
             ORIN_STAT(orin_stats.live_bytes += cap - oldcap);
             ORIN_STAT(orin_stats.string_grows++);
             SITE_GROW(&x->h, cap - oldcap);
@@ -732,7 +798,7 @@ OrinObj *orin_str_append_sub(OrinObj *a, OrinObj *s, uint64_t i, uint64_t j) {
             if (cap < n) cap = n;
             if (cap < 16) cap = 16;
             uint64_t oldcap = x->cap; (void)oldcap;
-            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            x = (OrinString *)sb_realloc(x, sizeof(OrinString) + x->cap + 1, sizeof(OrinString) + cap + 1);
             ORIN_STAT(orin_stats.live_bytes += cap - oldcap);
             ORIN_STAT(orin_stats.string_grows++);
             SITE_GROW(&x->h, cap - oldcap);
@@ -766,7 +832,7 @@ OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b) {
             if (cap < n) cap = n;
             if (cap < 16) cap = 16;
             uint64_t oldcap = x->cap; (void)oldcap;
-            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            x = (OrinString *)sb_realloc(x, sizeof(OrinString) + x->cap + 1, sizeof(OrinString) + cap + 1);
             ORIN_STAT(orin_stats.live_bytes += cap - oldcap);
             ORIN_STAT(orin_stats.string_grows++);
             SITE_GROW(&x->h, cap - oldcap);
@@ -1120,7 +1186,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     a->len = 0;
     a->cap = cap;
     a->is_ref = is_ref ? 1 : 0;
-    a->items = cap ? (uint64_t *)xmalloc(cap * 8) : NULL;
+    a->items = cap ? (uint64_t *)sb_alloc(cap * 8) : NULL;
     g_live++;
     stat_alloc(&orin_stats.alloc_array, sizeof(OrinArray) + cap * 8);
     SITE_ALLOC(&a->h, is_ref ? 2 : 1, sizeof(OrinArray) + cap * 8);
@@ -1130,7 +1196,7 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
 void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     OrinArray *a = (OrinArray *)o;
     uint64_t cap = a->cap ? a->cap * 2 : 4;
-    a->items = (uint64_t *)xrealloc(a->items, cap * 8);
+    a->items = (uint64_t *)sb_realloc(a->items, a->cap * 8, cap * 8);
     ORIN_STAT(orin_stats.live_bytes += (cap - a->cap) * 8);
     ORIN_STAT(if ((int64_t)orin_stats.live_bytes > (int64_t)orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes);
     ORIN_STAT(orin_stats.array_grows++);
@@ -1206,7 +1272,7 @@ OrinObj *orin_array_extend(OrinObj *x, OrinObj *y) {
             if (cap < n) cap = n;
             if (cap < 4) cap = 4;
             if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
-            a->items = (uint64_t *)xrealloc(a->items, cap * 8);
+            a->items = (uint64_t *)sb_realloc(a->items, a->cap * 8, cap * 8);
             ORIN_STAT(orin_stats.live_bytes += (cap - a->cap) * 8);
             ORIN_STAT(if (orin_stats.live_bytes > orin_stats.peak_live_bytes) orin_stats.peak_live_bytes = orin_stats.live_bytes);
             ORIN_STAT(orin_stats.array_grows++);
@@ -2302,6 +2368,7 @@ void orin_rt_heap_exit(void) {
         fl_n[FL_STRUCT_CLASSES]--;
         orin_platform_free(n);
     }
+    sb_drain();
 #endif
     orin_platform_runtime_lock();
     g_fold_live += g_live;
