@@ -6,6 +6,7 @@
 //   orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html]   OSIG diff report
 //   orin effects <entry.or | package-dir> [--format=json] [--summary] [--module M] [--function F] [--no-paths] [--tests] [--check-purity]
 //       transitive effect summaries per function, module, package and `main`, with explanation paths (docs/capabilities.md)
+//   orin expand [--input] <entry.or | package-dir>   the companion modules (`m.gen`) of the program, through the formatter (ADR-0046)
 //   orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--c-builtins] [--check-contracts] [--strict-contracts]
 //       default pipeline: HIR -> MIR -> ownership verifier -> C (--backend=llvm: LLVM IR, -o x.ll)
 //   orin fmt [--check] [--stdout] <file.or>...
@@ -37,6 +38,7 @@ import {
   strictContracts, parallelWarnings,
 } from "./check";
 import { runTestCommand, hasTests, eraseTests, ensureMain } from "./testing";
+import { expandProgram, expandCompanions, noteGenerated, companionsText, inputsText, Cause } from "./expand";
 import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount } from "./vc";
 import {
@@ -59,7 +61,7 @@ import { runMcp } from "./mcp";
 
 function usage(): void {
   console.error(
-    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
+    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
   );
   exit(2);
 }
@@ -219,6 +221,7 @@ function switchNames(): string[] {
     "--strict-contracts",
     "--check-contracts",
     "--deps",
+    "--input", // `orin expand --input`: the std:meta inputs of the processor runs instead of the companions
     "--format=json",
     "--no-verify",
     "--no-opt",
@@ -496,7 +499,7 @@ function runBuildCommand(
   const cmd = argv[0];
   const entry = argv[1];
   const isCompile = cmd == "compile";
-  if (!isCompile && cmd != "check" && cmd != "mir" && cmd != "verify" && cmd != "api") {
+  if (!isCompile && cmd != "check" && cmd != "mir" && cmd != "verify" && cmd != "api" && cmd != "expand") {
     usage();
     return;
   }
@@ -510,7 +513,7 @@ function runBuildCommand(
     return;
   }
   const timer0 = newTimer(clock, o.timings.isSome());
-  const usePrelude = !on(o, "--c-builtins") && cmd != "check" && cmd != "api";
+  const usePrelude = !on(o, "--c-builtins") && cmd != "check" && cmd != "api" && cmd != "expand";
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(
     fs,
@@ -524,6 +527,27 @@ function runBuildCommand(
   }
   const timer1 = lapped(timer0, clock, "load");
   let program = loaded.program.unwrap();
+  if (cmd == "expand") {
+    const cs = expandCompanions(fs, program, loaded.sm);
+    if (cs.isErr()) {
+      report(loaded.sm, cs.unwrapErr(), json, ui);
+      return;
+    }
+    const text = on(o, "--input") ? inputsText(cs.unwrap()) : companionsText(program, cs.unwrap());
+    console.log(text.endsWith("\n") ? text.substring(0, text.length - 1) : text);
+    return;
+  }
+  // Companion modules (`import .. from "./m.gen"`, ADR-0046): filled from the recorded outputs; any other program is unchanged.
+  const expanded = expandProgram(fs, program, loaded.sm);
+  if (expanded.isErr()) {
+    report(loaded.sm, expanded.unwrapErr(), json, ui);
+    return;
+  }
+  program = expanded.unwrap().program;
+  const generated: Cause[] = expanded.unwrap().causes;
+  for (const w of expanded.unwrap().warnings) {
+    console.error(render(loaded.sm, w));
+  }
   if (cmd == "check"
       && program.manifest.isSome()
       && (program.manifest.unwrap().entry == "module.or"
@@ -541,7 +565,7 @@ function runBuildCommand(
     // program that is lowered: nothing they use reaches the output (ADR-0024).
     const full = check(program, loaded.sm);
     if (full.isErr()) {
-      report(loaded.sm, full.unwrapErr(), json, ui);
+      report(loaded.sm, noteGenerated(generated, full.unwrapErr()), json, ui);
       return;
     }
     printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictFlag, ui);
@@ -551,7 +575,7 @@ function runBuildCommand(
       ? checkRuntime(program, loaded.sm)
       : check(program, loaded.sm);
   if (checked.isErr()) {
-    report(loaded.sm, checked.unwrapErr(), json, ui);
+    report(loaded.sm, noteGenerated(generated, checked.unwrapErr()), json, ui);
     return;
   }
   policyCheck(program, loaded.sm, json, ui);

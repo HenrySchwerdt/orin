@@ -1,0 +1,176 @@
+// The constant arguments of annotation uses as `MConst` JSON values (ADR-0046 S4; library/std/metacore.or `MConst`,
+// library/std/metajson.or `encConst`). The checker (check/userannos.or) has already accepted every use, so this pass
+// only translates: literals, array literals, tags of the field's union, `None` / `Some(c)` / `c` for `Option`, and module
+// constants (their initialiser, translated in the unit that declares the constant).
+
+import { Expr, TypeExpr, TypeDecl } from "../syntax";
+import { Json } from "../json";
+import { LoadedProgram } from "../loader";
+import { lookupDecl } from "./lookup";
+import { tagged, fld, jstr, jint, jbool, jarr } from "./jsonutil";
+
+function unionVariants(t: TypeDecl): string[] {
+  let out: string[] = [];
+  match (t.body) {
+    DUnion(vs) => {
+      for (const v of vs) {
+        out.push(v.name.name);
+      }
+    },
+    _ => {},
+  }
+  return out;
+}
+
+// The variant names of the union that the named type `name` denotes in unit `du`, or an empty list.
+function tagsOf(prog: LoadedProgram, du: usize, name: string): string[] {
+  const r = lookupDecl(prog, du, name);
+  if (r.isNone()) {
+    return [];
+  }
+  return match (r.unwrap().item) {
+    IType(t) => unionVariants(t),
+    _ => [],
+  };
+}
+
+function isNegation(e: Expr): bool {
+  return match (e.kind) {
+    EUnary(op, _) => match (op) {
+      UNeg => true,
+      _ => false,
+    },
+    _ => false,
+  };
+}
+
+function negated(e: Expr): Expr {
+  return match (e.kind) {
+    EUnary(_, x) => x,
+    _ => e,
+  };
+}
+
+function someArg(e: Expr): Option<Expr> {
+  return match (e.kind) {
+    ECall(callee, args) => match (callee.kind) {
+      EIdent(f) => f.name == "Some" && args.length == 1 ? Some(args[0]) : None,
+      _ => None,
+    },
+    _ => None,
+  };
+}
+
+// The JSON `MConst` for the expression `e` written in unit `uu` as the argument of a field of type `ty` (as written in the
+// definition's unit `du`). `depth` bounds chains of constants.
+export function constJson(prog: LoadedProgram, du: usize, uu: usize, ty: TypeExpr, e: Expr, depth: usize): Result<Json, string> {
+  if (depth > 16) {
+    return Err("annotation argument is too deeply nested or cyclic");
+  }
+  match (ty.kind) {
+    TArray(el) => {
+      match (e.kind) {
+        EArray(xs) => {
+          let items: Json[] = [];
+          for (const x of xs) {
+            items.push(constJson(prog, du, uu, el, x, depth)?);
+          }
+          return Ok(tagged("array", [fld("v", jarr(items))]));
+        },
+        EIdent(id) => {
+          return constIdent(prog, du, uu, ty, id.name, depth);
+        },
+        _ => {},
+      }
+      return Err("annotation argument is not an array literal");
+    },
+    TFn(_, _) => {
+      return Err("a function type is not an annotation field type");
+    },
+    TNamed(tn, targs) => {
+      if (tn.name == "Option" && targs.length == 1) {
+        const inner = someArg(e);
+        if (inner.isSome()) {
+          return Ok(tagged("some", [fld("v", constJson(prog, du, uu, targs[0], inner.unwrap(), depth)?)]));
+        }
+        match (e.kind) {
+          EIdent(id) => {
+            if (id.name == "None") {
+              return Ok(tagged("none", []));
+            }
+            // A module constant of the Option type itself, or a constant of the element type.
+            const k = lookupDecl(prog, uu, id.name);
+            if (k.isSome()) {
+              match (k.unwrap().item) {
+                IConst(c) => {
+                  return constJson(prog, du, k.unwrap().unit, ty, c.value, depth + 1);
+                },
+                _ => {},
+              }
+            }
+          },
+          _ => {},
+        }
+        return Ok(tagged("some", [fld("v", constJson(prog, du, uu, targs[0], e, depth)?)]));
+      }
+      match (e.kind) {
+        EIdent(id) => {
+          return constIdent(prog, du, uu, ty, id.name, depth);
+        },
+        _ => {},
+      }
+      if (tn.name == "bool") {
+        return match (e.kind) {
+          EBool(b) => Ok(tagged("bool", [fld("v", jbool(b))])),
+          _ => Err("annotation argument is not a bool literal"),
+        };
+      }
+      if (tn.name == "string") {
+        return match (e.kind) {
+          EStr(s) => Ok(tagged("string", [fld("v", jstr(s))])),
+          _ => Err("annotation argument is not a string literal"),
+        };
+      }
+      if (tn.name == "float" || tn.name == "f32") {
+        const neg = isNegation(e);
+        const x = neg ? negated(e) : e;
+        return match (x.kind) {
+          EFloat(text) => Ok(tagged("float", [fld("v", jstr(neg ? "-" + text : text))])),
+          _ => Err("annotation argument is not a float literal"),
+        };
+      }
+      // int, usize and the other integer types.
+      const neg = isNegation(e);
+      const x = neg ? negated(e) : e;
+      return match (x.kind) {
+        EInt(n) => Ok(tagged("int", [fld("v", jint(neg ? 0 - n : n))])),
+        EBigInt(n) => Ok(tagged("int", [fld("v", jint(n))])),
+        _ => Err("annotation argument is not an integer literal"),
+      };
+    },
+  }
+}
+
+// An identifier argument: a tag of the field's union, or a module constant.
+function constIdent(prog: LoadedProgram, du: usize, uu: usize, ty: TypeExpr, name: string, depth: usize): Result<Json, string> {
+  match (ty.kind) {
+    TNamed(tn, _) => {
+      for (const v of tagsOf(prog, du, tn.name)) {
+        if (v == name) {
+          return Ok(tagged("tag", [fld("v", jstr(name))]));
+        }
+      }
+    },
+    _ => {},
+  }
+  const k = lookupDecl(prog, uu, name);
+  if (k.isSome()) {
+    match (k.unwrap().item) {
+      IConst(c) => {
+        return constJson(prog, du, k.unwrap().unit, ty, c.value, depth + 1);
+      },
+      _ => {},
+    }
+  }
+  return Err("`" + name + "` is not a constant");
+}
