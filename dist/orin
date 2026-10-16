@@ -5,7 +5,8 @@
 #                                         a directory containing orin.toml is a package (its entry is built)
 #   orin run <file.or|dir> [args...]      build to a temp dir and run
 #   orin test [--filter S] [--format=json] <file.or|dir>   run the @Test functions (needs a C compiler)
-#   orin --version                    print the package version
+#   orin toolchain install|status     the pinned LLVM for --backend=llvm (ADR-0038 section 8; pin: lib/orin/llvm.pin)
+#   orin --version                  print the package version
 #   orin doctor                       check the install (version, layout, C compiler, PATH); exit 1 on a problem
 #   orin <anything else>              forwarded to the compiler (check, compile, fmt, lsp, ...)
 set -e
@@ -37,6 +38,121 @@ native() { # native <src> <exe>
   "$BIN" compile "$1" -o "$tmp/out.c" || { rm -rf "$tmp"; exit 1; }
   $CC -O2 -w -I "$RT" "$tmp/out.c" "$RT"/*.c "$PF"/*.c -lm -pthread -o "$2" || { rm -rf "$tmp"; exit 1; }
   rm -rf "$tmp"
+}
+
+# ---- pinned LLVM toolchain (ADR-0038 section 8, gate 3) ----------------------------------------------------------
+# The pin (version, and per platform the archive URL and its sha256) is lib/orin/llvm.pin (dist/llvm.pin in the source tree).
+#   orin toolchain install [--force]   download the pinned LLVM, verify its sha256, unpack to ~/.orin/toolchains/llvm-<version>
+#   orin toolchain status              pinned version, platform, install state (exit 1 if not installed)
+#   orin toolchain path                print the pinned clang when installed (exit 1 otherwise); used by orin-cli.sh
+#   orin toolchain version             print the pinned version
+# Environment: ORIN_HOME (default ~/.orin), ORIN_LLVM_PIN (alternative pin file), ORIN_PLATFORM (platform override).
+PIN=${ORIN_LLVM_PIN:-$HERE/lib/orin/llvm.pin}
+TC_HOME=${ORIN_HOME:-${HOME:-}/.orin}/toolchains
+
+tc_die() { echo "orin toolchain: error: $*" >&2; exit 1; }
+
+tc_platform() {
+  if [ -n "${ORIN_PLATFORM:-}" ]; then printf '%s\n' "$ORIN_PLATFORM"; return; fi
+  _os=$(uname -s 2>/dev/null || echo unknown); _m=$(uname -m 2>/dev/null || echo unknown)
+  case $_m in x86_64|amd64) _a=x86_64 ;; aarch64|arm64) _a=arm64 ;; *) _a=$_m ;; esac
+  case $_os in
+    Linux) [ "$_a" = arm64 ] && _a=aarch64; printf 'linux-%s\n' "$_a" ;;
+    Darwin)
+      if [ "$_a" = x86_64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then _a=arm64; fi
+      printf 'macos-%s\n' "$_a" ;;
+    *) printf '%s-%s\n' "$_os" "$_a" ;;
+  esac
+}
+
+tc_version() { # the pinned version, or empty when there is no usable pin file
+  [ -r "$PIN" ] || return 0
+  awk '$1 == "version" { print $2; exit }' "$PIN"
+}
+
+tc_asset() { # tc_asset <platform>: prints "<sha256> <url>" of the pinned archive for the platform
+  [ -r "$PIN" ] || return 0
+  awk -v p="$1" '$1 == "asset" && $2 == p { print $3, $4; exit }' "$PIN"
+}
+
+tc_dir() { printf '%s/llvm-%s\n' "$TC_HOME" "$1"; }
+
+tc_installed_clang() { # prints the pinned clang when the pinned version is installed
+  _v=$(tc_version); [ -n "$_v" ] || return 1
+  _c=$(tc_dir "$_v")/bin/clang
+  [ -x "$_c" ] && [ -f "$(tc_dir "$_v")/.orin-toolchain" ] || return 1
+  printf '%s\n' "$_c"
+}
+
+tc_sha256() { # tc_sha256 <file>
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f 1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d ' ' -f 1
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$1" | sed 's/^.*= *//'
+  else tc_die "need sha256sum, shasum or openssl to verify the download (refusing to install unverified)"; fi
+}
+
+tc_install() {
+  force=0
+  for _a in "$@"; do case $_a in --force) force=1 ;; *) tc_die "unknown option '$_a' (usage: orin toolchain install [--force])" ;; esac; done
+  ver=$(tc_version); [ -n "$ver" ] || tc_die "no usable pin file ($PIN)"
+  plat=$(tc_platform)
+  entry=$(tc_asset "$plat")
+  [ -n "$entry" ] || tc_die "the pin has no LLVM $ver archive for platform '$plat'; use a system clang instead (CC=clang orin build --backend=llvm)"
+  want=${entry%% *}; url=${entry#* }
+  case $want in *[!0-9a-f]*|"") tc_die "malformed sha256 in $PIN for $plat" ;; esac
+  [ "${#want}" = 64 ] || tc_die "malformed sha256 in $PIN for $plat"
+  case $TC_HOME in /*) ;; *) tc_die "ORIN_HOME must be an absolute path (got $TC_HOME)" ;; esac
+  case $TC_HOME in *[[:space:]]*) tc_die "ORIN_HOME must not contain whitespace (got $TC_HOME)" ;; esac
+  dest=$(tc_dir "$ver")
+  if [ "$force" = 0 ] && tc_installed_clang >/dev/null; then echo "LLVM $ver is already installed: $dest"; return 0; fi
+  mkdir -p "$TC_HOME"
+  work=$(mktemp -d "$TC_HOME/.install.XXXXXX") || tc_die "cannot write under $TC_HOME"
+  trap 'rm -rf "$work"' EXIT
+  archive=$work/archive
+  echo "Downloading LLVM $ver for $plat"
+  echo "  $url"
+  if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 -sS -o "$archive" "$url" || tc_die "download failed: $url"
+  elif command -v wget >/dev/null 2>&1; then wget -q -O "$archive" "$url" || tc_die "download failed: $url"
+  else tc_die "need curl or wget to download the toolchain"; fi
+  got=$(tc_sha256 "$archive")
+  if [ "$got" != "$want" ]; then
+    tc_die "sha256 mismatch for $url: expected $want, got $got. Nothing was installed."
+  fi
+  echo "  sha256 verified"
+  mkdir "$work/x"
+  # Only what compiling C and LLVM IR needs (the full archive unpacks to several GB): clang, llc and clang's resource directory.
+  wild=; if tar --version 2>/dev/null | grep -q 'GNU tar'; then wild=--wildcards; fi
+  tar -xf "$archive" -C "$work/x" --strip-components=1 $wild '*/bin/clang' '*/bin/clang-[0-9]*' '*/bin/llc' '*/lib/clang' \
+    || tc_die "cannot unpack the archive (tar needs xz support for .tar.xz)"
+  rm -f "$archive"
+  [ -x "$work/x/bin/clang" ] && [ -x "$work/x/bin/llc" ] || tc_die "the archive has no bin/clang and bin/llc; nothing was installed"
+  "$work/x/bin/clang" --version 2>/dev/null | grep -q "clang version $ver" \
+    || tc_die "the unpacked clang does not report version $ver; nothing was installed"
+  printf 'version %s\nplatform %s\nsha256 %s\nurl %s\n' "$ver" "$plat" "$want" "$url" > "$work/x/.orin-toolchain"
+  rm -rf "$dest.old"; [ ! -e "$dest" ] || mv "$dest" "$dest.old"
+  mv "$work/x" "$dest"
+  rm -rf "$dest.old"
+  echo "Installed LLVM $ver: $dest"
+  echo "  orin build --backend=llvm now uses $dest/bin/clang"
+}
+
+tc_status() {
+  ver=$(tc_version); [ -n "$ver" ] || tc_die "no usable pin file ($PIN)"
+  plat=$(tc_platform)
+  echo "pinned LLVM: $ver ($plat)"
+  if [ -z "$(tc_asset "$plat")" ]; then echo "archive:     none pinned for this platform"; fi
+  if c=$(tc_installed_clang); then echo "installed:   yes ($c)"
+  else echo "installed:   no (orin toolchain install)"; return 1; fi
+}
+
+toolchain() {
+  case "${1:-}" in
+    install) shift; tc_install "$@" ;;
+    status) tc_status ;;
+    path) tc_installed_clang ;;
+    version) v=$(tc_version); [ -n "$v" ] || exit 1; echo "$v" ;;
+    *) echo "usage: orin toolchain install [--force] | status | path | version" >&2; exit 2 ;;
+  esac
 }
 
 cc_hint() { # print how to install a C compiler on this system
@@ -96,6 +212,14 @@ doctor() {
     rm -rf "$t"
   fi
 
+  # pinned LLVM toolchain (optional: only --backend=llvm --release needs it)
+  tcv=$(tc_version)
+  if [ -z "$tcv" ]; then wn "LLVM toolchain: no pin file ($PIN)"
+  elif tcc=$(tc_installed_clang); then ok "LLVM toolchain: pinned $tcv installed ($tcc)"
+  else
+    ok "LLVM toolchain: pinned $tcv is not installed (optional; --release --backend=llvm falls back to C; orin toolchain install)"
+  fi
+
   # end to end: compile and run a tiny program
   if [ "$bad" -eq 0 ]; then
     t=$(mktemp -d)
@@ -148,6 +272,10 @@ case "${1:-}" in
     native "$src" "$dir/prog"
     set +e; "$dir/prog" "$@"; st=$?; set -e
     rm -rf "$dir"; exit $st
+    ;;
+  toolchain)
+    shift
+    toolchain "$@"
     ;;
   test)
     shift

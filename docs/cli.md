@@ -51,6 +51,20 @@ file-based discovery. No matching tests fails; `--allow-empty` explicitly permit
 A nonmatching explicit `--filter` still fails. Development and release builds retain the compiler's
 ownership verifier; release does not weaken checking.
 
+## LLVM backend and the pinned toolchain
+
+```sh
+orin toolchain install
+orin toolchain status
+orin build --backend=llvm
+```
+
+`--backend=llvm` compiles the generated LLVM IR with clang. `orin toolchain install` downloads the one LLVM version Orin is
+tested with (`lib/orin/llvm.pin`), checks the archive's sha256 against the pin, and installs `clang`, `llc` and clang's resource
+files (about 400 MB) into `~/.orin/toolchains/llvm-<version>` (`ORIN_HOME` relocates it). `--backend=llvm` uses it when present;
+an explicit `CC` wins; without it a dev build uses the system `clang`, and `build --release --backend=llvm` falls back to the C
+backend with a note. `orin doctor` reports whether the pinned toolchain is installed. The default backend is still C.
+
 ## Workspaces
 
 A directory with an `orin-workspace.toml` ([workspace.md](workspace.md)) groups several packages. At its root

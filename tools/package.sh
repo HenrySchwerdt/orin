@@ -9,6 +9,7 @@ OUT=build/dist/$NAME
 rm -rf "$OUT"; mkdir -p "$OUT/bin" "$OUT/libexec" "$OUT/lib/orin/runtime" "$OUT/share/orin"
 cp dist/orin "$OUT/bin/orin"
 cp dist/orin-cli.sh "$OUT/bin/orin-cli.sh"
+cp dist/llvm.pin "$OUT/lib/orin/llvm.pin"   # the pinned LLVM for orin toolchain install (ADR-0038 section 8)
 cp build/bootstrap/orin2 "$OUT/libexec/orin"
 cp runtime/*.h runtime/*.c "$OUT/lib/orin/runtime/"
 mkdir -p "$OUT/lib/orin/platform" && cp platform/*.h platform/*.c "$OUT/lib/orin/platform/"
