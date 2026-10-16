@@ -4,7 +4,7 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 
 ## Current stage: self-hosting alpha, first public pre-release
 - Release **v0.1.0-alpha.1** (Linux x86-64, macOS arm64):
-  https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.1
+  https://github.com/orin-lang/orin-lang/releases/tag/v0.1.0-alpha.1
 - Self-hosted compiler (`compiler/`, full Orin source) bootstraps reproducibly (`stage2.c == stage3.c`);
   a compiler built through the LLVM backend reproduces the same `stage3.c`.
 - Pipeline: parse → load (modules, preludes) → check → HIR → MIR → optimise (owned params, moves)

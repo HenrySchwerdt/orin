@@ -34,7 +34,7 @@ case_of() {
   fi
   "$BR" compare --history "$h" "$r" > "$B/$n.compare.md"
   cmp -s "$B/$n.compare.md" "$G/$n/compare.md" && ok "$n: compare (exit 0)" || bad "$n: compare differs from golden"
-  "$BR" render --history "$h" --out "$B/$n" --repo HenrySchwerdt/orin 2> "$B/$n.render.log"
+  "$BR" render --history "$h" --out "$B/$n" --repo orin-lang/orin-lang 2> "$B/$n.render.log"
   if diff -r -x compare.md -x summary.md "$G/$n" "$B/$n" > "$B/$n.diff"; then ok "$n: render (charts, README.md, report.html)"; else head -20 "$B/$n.diff"; bad "$n: render differs from golden"; fi
 }
 
@@ -48,7 +48,7 @@ grep -q "skipping .*0-broken.json" "$B/invalid.render.log" && ok "invalid: the b
 mkdir -p "$B/emptyhist"
 "$BR" compare --history "$B/emptyhist" $T/history/2026-10-16-9f83f16af402.json > "$B/empty.compare.md"
 cmp -s "$B/empty.compare.md" "$G/empty/compare.md" && ok "empty: compare" || bad "empty: compare differs from golden"
-"$BR" render --history "$B/emptyhist" --out "$B/empty" --repo HenrySchwerdt/orin 2> /dev/null
+"$BR" render --history "$B/emptyhist" --out "$B/empty" --repo orin-lang/orin-lang 2> /dev/null
 diff -r -x compare.md "$G/empty" "$B/empty" > /dev/null && ok "empty: render (no runs yet)" || bad "empty: render differs from golden"
 # a missing history directory behaves like an empty one for compare
 "$BR" compare --history "$B/nonexistent" $T/history/2026-10-16-9f83f16af402.json | cmp -s - "$G/empty/compare.md" && ok "missing history directory" || bad "missing history directory"

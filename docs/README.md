@@ -33,8 +33,8 @@ that a feature has shipped. [Progress](progress.md) records implementation statu
 - [JSON compatibility design](rfcs/json-completeness.md); consult the concrete API guides
   above for shipped functions rather than assuming every RFC proposal is implemented.
 - [ADR directory](decisions): accepted decisions, amendments and explicitly open questions.
-- Claude optimization PRs [#91](https://github.com/HenrySchwerdt/orin/pull/91) and
-  [#98](https://github.com/HenrySchwerdt/orin/pull/98) are held for a benefit/cost decision
+- Claude optimization PRs [#91](https://github.com/orin-lang/orin-lang/pull/91) and
+  [#98](https://github.com/orin-lang/orin-lang/pull/98) are held for a benefit/cost decision
   and parked groundwork respectively at the 2026-10-16 status refresh. They are
   not merged guarantees; their descriptions preserve measurements and caveats.
 

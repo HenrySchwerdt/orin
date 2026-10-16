@@ -10,7 +10,7 @@ targets four platforms; available downloads depend on the version:
 | macOS Apple silicon | `orin-<version>-macos-arm64.tar.gz` | available |
 | macOS Intel | `orin-<version>-macos-x86_64.tar.gz` | absent |
 
-As checked on 2026-10-15, [v0.1.0-alpha.2](https://github.com/HenrySchwerdt/orin/releases/tag/v0.1.0-alpha.2)
+As checked on 2026-10-15, [v0.1.0-alpha.2](https://github.com/orin-lang/orin-lang/releases/tag/v0.1.0-alpha.2)
 is the latest published release. It contains those two tarballs and a combined `SHA256SUMS`, without
 individual `.sha256` assets. The current workflow additionally generates `<file>.sha256` for each tarball
 and a combined `SHA256SUMS`; that configuration is not a claim that older releases contain all four targets.
@@ -24,7 +24,7 @@ system libraries; Git is needed for Git dependencies. On Alpine/musl see "Troubl
 ## One-line install (Linux, macOS)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/HenrySchwerdt/orin/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/orin-lang/orin-lang/main/install.sh | sh
 ```
 
 (Read the script first if you like: it is [`install.sh`](../install.sh), about 250 lines of POSIX sh.)
