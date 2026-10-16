@@ -260,6 +260,19 @@ live counters no longer wrap to 2^64 - 1 for a task whose own frees exceed its a
 * The sandbox / CI cost of a full compiler build (7-8 minutes under load) dominated the loop; a one-stage `-O0` build
   of the compiler with the previous compiler (27 s) was used for iteration, the fixed point was checked separately.
 
+## Gate 1, C0: cancellation and outcomes (ADR-0017 Addendum B)
+
+C0 adds the semantics and the pure state machines only; nothing blocks differently yet. `std:taskcore` gains `CancelState` (a token's
+first-cause-wins cancellation cause plus an absolute monotonic deadline that only moves earlier, with `observe`/`budget`),
+`CancelScope` (a scope's counters; a trapping child cancels the scope), `TaskCell` (a result settled once and taken once), and
+pure functions for the outcome lattice (`Completed < Closed < Cancelled < Deadline < Error`, `outcomeJoin`), checkpoint precedence
+(`checkpointOutcome`) and deadline arithmetic (`deadlineMin`, saturating `deadlineAfterMillis`, `deadlineExpired`, `waitBudget`), all with
+`@Requires`/`@Ensures`/`@Invariant` contracts and tests in `tests/std/taskcancel_test.or`. The L0 budget for what follows is
+ADR-0053 (1,400 code lines).
+
+Next: **C1** timed monitor wait (L0), `recvTimeout`/`joinTimeout`/`select`/`sleep` and scope cancellation in `std:task`, wired to these
+machines; C3 interruptible network waits.
+
 ## Not in stage 0 (and where it goes)
 
 `async` / `await` (ADR-0017: only if blocking tasks prove insufficient); cancellation beyond `rx.close()` and cooperative
