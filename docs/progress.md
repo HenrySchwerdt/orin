@@ -63,6 +63,7 @@ concat reuse in place (#68, MIR v2.3), CI sharding of `backends` plus LLVM `.par
 instruction parity (#69, ADR-0038 §8 gate 1); the last four through the integration PR #70. Effect: self-compile -38.8%
 executed instructions, -93% retains; census numbers and the lever ranking in
 [`perf/alloc-census.md`](perf/alloc-census.md).
+Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ranking (string intermediates first, then `Span`/`Token` flattening, escape analysis; T6 pending): [`perf/alloc-census.md`](perf/alloc-census.md) section "Since #71".
 
 1. **Performance, lever 2: field and element access code** (not a census class; design accepted 2026-10-15, ADR-0038
    addendum "lever 2"): `make_unique` + `struct_get` / `struct_replace` per field write and repeated bounds-checked element
