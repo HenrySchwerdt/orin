@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- **`u8[]` <-> string conversions 16 bytes per iteration; packed arrays (b) and in-place field/element reuse (e) measured first (ADR-0038 addendum 2026-10-16).**
+- **`u8[]` <-> string conversions 4 elements per iteration; packed arrays (b) and in-place field/element reuse (e) measured first (ADR-0038 addendum 2026-10-16).**
   (e) is worth at most 0.54 % of the self-compile (the field in/out pattern; all COW copies together are 2.25 %, mostly real sharing) and
   nothing on the benchmarks: not built. Full packed storage would give bytesstr -99 % and http_parse at most -9 % and nothing on the
   compiler, for a MIR version, a lowering change and the runtime's array sites: not built. Built instead, runtime only:
