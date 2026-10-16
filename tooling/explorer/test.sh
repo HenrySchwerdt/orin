@@ -32,6 +32,9 @@ out=$($ORIN2 test tooling/explorer/tests/explorer_test.or --runtime runtime/core
 out=$($ORIN2 test tooling/explorer/tests/business_test.or --runtime runtime/core 2>&1) \
   && ok "business view tests (ADR-0051): $(echo "$out" | tail -1)" || { echo "$out"; bad "business view tests"; }
 
+out=$($ORIN2 test tooling/explorer/tests/runs_test.or --runtime runtime/core 2>&1) \
+  && ok "run history tests (ADR-0050 step 3): $(echo "$out" | tail -1)" || { echo "$out"; bad "run history tests"; }
+
 $ORIN2 compile tooling/explorer -o "$B/ex.c"
 cc -O1 -w -I runtime/core "$B/ex.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$B/explore"
 EX=$B/explore
@@ -42,6 +45,26 @@ if diff -r $T/golden "$B/site1" > "$B/golden.diff"; then ok "site for the fixtur
 diff -r "$B/site1" "$B/site2" > /dev/null && ok "two runs are byte-identical" || bad "output is not deterministic"
 "$EX" $T/shop.head.graph.json --out "$B/nodiff" 2> /dev/null
 [ ! -e "$B/nodiff/diff.html" ] && ! grep -q 'href="diff.html"' "$B/nodiff/index.html" && ok "without --diff there is no changes page and no link to it" || bad "diff page without --diff"
+
+# run history (--runs, ADR-0050 step 3): the processes page and runs.css equal testdata/golden-runs; every other page is the one of a
+# site without a history; a single record file works; bad paths fail without writing
+"$EX" $T/shop.head.graph.json --diff $T/shop.diff.json --runs $T/runs --out "$B/runs1" 2> /dev/null
+cmp -s $T/golden-runs/processes.html "$B/runs1/processes.html" && cmp -s $T/golden-runs/assets/runs.css "$B/runs1/assets/runs.css" \
+  && ok "--runs: processes page and runs.css equal testdata/golden-runs" || bad "--runs: differs from testdata/golden-runs (testdata/regen.sh after a deliberate change)"
+same=1
+for f in $(cd "$B/site1" && find . -type f | sort); do
+  [ "$f" = ./processes.html ] || cmp -s "$B/site1/$f" "$B/runs1/$f" || { echo "--runs changed $f"; same=0; }
+done
+[ "$same" = 1 ] && [ ! -e "$B/site1/assets/runs.css" ] && ! grep -q runs.css "$B/site1/processes.html" \
+  && ok "--runs changes only processes.html (+ assets/runs.css); without it there is no stylesheet and no link" || bad "--runs changed other files"
+"$EX" $T/shop.head.graph.json --runs $T/runs/2026-10-16-9f83f16af402.json --out "$B/runs2" 2> /dev/null
+grep -q 'Time per phase: compiler' "$B/runs2/processes.html" && ! grep -q 'class="rn-spark"' "$B/runs2/processes.html" \
+  && ok "--runs FILE: a single record is a history of one run" || bad "--runs FILE"
+if "$EX" $T/shop.head.graph.json --runs "$B/nonexistent" --out "$B/never3" > /dev/null 2> "$B/runs.err"; then bad "a missing --runs path must fail"; else
+  grep -q "no such file" "$B/runs.err" && [ ! -e "$B/never3" ] && ok "--runs with a missing path: exit 1, diagnostic, nothing written" || bad "--runs missing path: output"; fi
+mkdir -p "$B/emptyruns"
+if "$EX" $T/shop.head.graph.json --runs "$B/emptyruns" --out "$B/never4" > /dev/null 2>&1; then bad "an empty --runs directory must fail"; else ok "--runs with a directory without records fails"; fi
+if "$EX" $T/shop.head.graph.json --runs $T/shop.diff.json --out "$B/never5" > /dev/null 2>&1; then bad "a diff given as --runs must fail"; else ok "a diff is not a run history"; fi
 
 for f in business.html usecases.html rules.html capabilities.html behaviour.html u/root-main.html assets/business.css; do
   [ -f "$B/site1/$f" ] || bad "business view: $f missing"

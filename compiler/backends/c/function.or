@@ -198,6 +198,42 @@ function dupIf(rt: MType, code: string): string {
   return code;
 }
 
+// The address operand `a` as a C pointer.
+function addrC(a: string): string {
+  return "(void *)(uintptr_t)(" + a + ")";
+}
+
+// A core load (ADR-0052 R3a): `n` bytes at the address, native-endian, no alignment needed. `__builtin_memcpy` with a
+// constant size is not a libc call: the compiler folds it into one (possibly unaligned) load and it is not an aliasing
+// violation, unlike a pointer cast.
+function loadC(a: string, cty0: string, n: string, wide: string): string {
+  return "({ " + cty0 + " v_; __builtin_memcpy(&v_, " + addrC(a) + ", " + n + "); (" + wide + ")v_; })";
+}
+
+// A core store of the low `n` bytes of `v`.
+function storeC(a: string, cty0: string, n: string, v: string): string {
+  return "({ " + cty0 + " v_ = (" + cty0 + ")(" + v + "); __builtin_memcpy(" + addrC(a) + ", &v_, " + n + "); })";
+}
+
+// The C code of core operation k (hir/coreops.or) over the operands `a`. The memory operations are the L0 functions.
+function coreC(k: usize, a: string[]): string {
+  return match (k) {
+    0 => loadC(a[0], "uint8_t", "1", "uint64_t"),
+    1 => loadC(a[0], "uint32_t", "4", "uint64_t"),
+    2 => loadC(a[0], "uint64_t", "8", "uint64_t"),
+    3 => loadC(a[0], "double", "8", "double"),
+    4 => storeC(a[0], "uint8_t", "1", a[1]),
+    5 => storeC(a[0], "uint32_t", "4", a[1]),
+    6 => storeC(a[0], "uint64_t", "8", a[1]),
+    7 => storeC(a[0], "double", "8", a[1]),
+    8 => "((uint64_t)(uintptr_t)orin_platform_alloc((size_t)(" + a[0] + ")))",
+    9 => "orin_platform_free(" + addrC(a[0]) + ")",
+    10 => "(void)orin_platform_mem_copy(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2] + "))",
+    11 => "(void)orin_platform_mem_set(" + addrC(a[0]) + ", (int)(uint8_t)(" + a[1] + "), (size_t)(" + a[2] + "))",
+    _ => "((uint64_t)(uintptr_t)(" + a[0] + "))",
+  };
+}
+
 // C expression for a builtin whose result is a fresh Owned ref or a scalar. `rt` is the type of the destination (MVoid
 // when there is none).
 export function builtinC(op: Builtin, a: string[], rt: MType): string {
@@ -228,6 +264,7 @@ export function builtinC(op: Builtin, a: string[], rt: MType): string {
     BFloatIsFinite => "((int64_t)(!!__builtin_isfinite(" + a[0] + ")))",
     BIntId => "(" + a[0] + ")",
     BTask(k) => taskOpC(k) + "(" + a.join(", ") + ")",
+    BCore(k) => coreC(k, a),
     _ => "?",
   };
 }
