@@ -1561,8 +1561,8 @@ int64_t orin_fs_exists(int64_t gh, OrinObj *path) {
     return scoped ? orin_platform_file_exists(eff, strlen_(eff)) : orin_platform_file_exists(p->data, p->len);
 }
 
-/* listDir: the entries in byte order, subdirectories with a trailing '/'; [] when the directory cannot be read. A
- * refused query traps, like exists. */
+/* listDir: the entries in byte order, subdirectories with a trailing '/'. Enumeration failures and refused
+ * queries trap; an unreadable or partial directory must never appear successfully empty. */
 typedef struct { OrinObj **items; size_t n, cap; int oom; } DirAcc;
 
 static void dir_collect(void *ctx, const char *name, size_t len, int is_dir) {
@@ -1603,10 +1603,11 @@ OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
     DirAcc a = {NULL, 0, 0, 0};
     int rc = scoped ? orin_platform_dir_list(eff, strlen_(eff), dir_collect, &a)
                     : orin_platform_dir_list(p->data, p->len, dir_collect, &a);
-    if (a.oom || rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
-    if (rc) { /* Never return an apparently complete listing after a partial enumeration. */
+    if (a.oom || rc) {
         for (size_t i = 0; i < a.n; i++) orin_release(a.items[i]);
-        a.n = 0;
+        if (a.items) orin_platform_free(a.items);
+        if (a.oom || rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+        orin_trap("listDir: directory enumeration failed");
     }
     for (size_t i = 1; i < a.n; i++) { /* insertion sort: directories are small */
         OrinObj *x = a.items[i];

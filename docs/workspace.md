@@ -1,8 +1,8 @@
 # Workspace manifest (`orin-workspace.toml`) — specification
 
-Status: parser, pure resolution and lockfile implemented and unit-tested (`compiler/tests/workspace_test.or`).
-The CLI adapter is staged but not exported or dispatched until the seed refresh; workspace-aware build/check/test/fmt
-and upwards root discovery remain pending. No files move.
+Status: parser, pure resolution, lockfile and inspection CLI implemented and tested.
+`orin workspace list|lock|check` discovers the nearest workspace, including from member source directories.
+Workspace-aware build/check/test/fmt and the shared external-dependency lock design remain pending. No files move.
 
 ## 1. File and discovery
 
@@ -51,7 +51,7 @@ no backslashes. Resolution is lexicographic, so the member order is deterministi
 
 ## 4. Lockfile (`orin.lock`)
 
-- One lockfile at the workspace root, written by the planned `orin workspace lock`, never by a build.
+- One lockfile at the workspace root, written by `orin workspace lock`, never by a build.
 - It holds one `[member.<name>]` table per member, in build order, with `path`, `version` and `dependencies` (the
   member names it depends on). `lockText` in `compiler/package/resolve.or` is the canonical text.
 - A build whose resolution differs from the lock (a member added, removed, moved, re-versioned or with changed member
@@ -74,6 +74,18 @@ member's `orin.toml` for dependency errors) and are never downgraded to warnings
 
 ## 6. Commands (phase 2)
 
+Available: `orin workspace list|lock|check [--root <directory>]`.
+`list` prints `name  relative-directory` in dependency order, escaping terminal control bytes. `lock` writes the member snapshot; `check` validates it
+without changing files. The release driver searches physical ancestors, continuing past member `orin.toml` files.
+Direct compiler invocation probes up to 256 ancestors; a missing workspace reports an error and suggests `--root`.
+An explicit `--root` names the workspace directory itself and bypasses discovery. Paths containing spaces are supported.
+JSON output is not supported for these commands; requesting it is a usage error. Existing terminal color, ASCII and
+quiet/verbose options are accepted; list output remains data even in quiet mode.
+
+`lock` refuses to replace a standalone pipe-format project lock or an unrecognized file. The member-only TOML lock
+cannot yet record external dependency resolutions. Existing project dependency commands retain their current meaning;
+`orin update` still updates Git dependencies. Read/write and directory enumeration errors must abort before lock mutation.
+
 Planned: `orin build|check|test|fmt` in a workspace act on `default-members` (all members when absent); `-p <name>` selects one
 package, `--workspace` all. `orin workspace list` prints the members in build order. Standalone projects are unchanged.
 
@@ -82,4 +94,5 @@ package, `--workspace` all. `orin workspace list` prints the members in build or
 `tests/workspace/` holds one directory per case. `ok/<case>/` must resolve; its `expected.txt` lists the members in build
 order. `fail/<case>/` must be rejected; its `expected.txt` holds the expected code and the line of the span, as
 `E0505 3`. `compiler/tests/workspace_fixtures.or` executes every fixture, including stale locks, in the tooling CI
-suite. `compiler/package/wscli_smoke.or` compiles and checks usage of the staged CLI adapter before dispatch is wired.
+suite. `compiler/package/wscli_smoke.or` checks adapter usage; `tools/test_cli.py` exercises all 30 fixtures through the packaged
+CLI, discovery, diagnostics, stale locks and overwrite protection.
