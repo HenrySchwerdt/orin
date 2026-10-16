@@ -342,6 +342,10 @@ int orin_platform_file_write(const char *path, size_t plen, const char *data, si
     ensures \result == 1 <==> path has no NUL byte and stat(2) on it succeeds; otherwise 0;
     assigns \nothing; */
 int orin_platform_file_exists(const char *path, size_t plen);
+/* Calls `each(ctx, name, len, is_dir)` for every entry of directory `path` except "." and "..", in readdir order.
+ * Returns 0, or an errno-style code when the directory cannot be opened (nothing is reported then). */
+int orin_platform_dir_list(const char *path, size_t plen, void (*each)(void *ctx, const char *name, size_t len, int is_dir),
+                           void *ctx);
 
 /* ---------------------------------------------------------------- file streams (ADR-0025)
  * An open file for incremental reading and writing (the substrate of the resource handle `File` of

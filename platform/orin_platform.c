@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -426,6 +427,40 @@ int orin_platform_file_exists(const char *path, size_t plen) {
     int r = stat(p, &st) == 0;
     orin_platform_free(p);
     return r;
+}
+
+int orin_platform_dir_list(const char *path, size_t plen, void (*each)(void *ctx, const char *name, size_t len, int is_dir),
+                           void *ctx) {
+    int err = 0;
+    char *p = path_copy(path, plen, &err);
+    if (!p) return err ? err : ENOMEM;
+    DIR *d = opendir(p);
+    if (!d) {
+        int e = errno ? errno : EIO;
+        orin_platform_free(p);
+        return e;
+    }
+    size_t base = strlen(p);
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *n = de->d_name;
+        if (n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0))) continue;
+        size_t nl = strlen(n);
+        int is_dir = 0;
+        char *full = (char *)orin_platform_alloc(base + nl + 2);
+        if (full) {
+            memcpy(full, p, base);
+            full[base] = '/';
+            memcpy(full + base + 1, n, nl + 1);
+            struct stat st;
+            is_dir = stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+            orin_platform_free(full);
+        }
+        each(ctx, n, nl, is_dir);
+    }
+    closedir(d);
+    orin_platform_free(p);
+    return 0;
 }
 
 /* ---------------------------------------------------------------- file streams */
