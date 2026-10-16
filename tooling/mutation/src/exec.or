@@ -1,0 +1,82 @@
+// Parallel execution of the mutants. One std:task worker per job slot takes mutants from a channel and runs the shell
+// steps of each through `shellTimeout`, so every step has its own native deadline and a timed-out step kills its process
+// group. A worker only needs the process grant (a task body cannot hold two grants), so it returns exit statuses only;
+// the files the steps wrote are read and judged afterwards by the main task. Port of `ordered_map` of tools/parallel.py:
+// the results come back in the order of the mutants, whatever the number of workers.
+
+import { ProcessGrant } from "std:process";
+import { scopeProcess, spawnProcess, channel, TaskHandle } from "std:task";
+
+// Exit statuses of a step: 0..255, -2 timeout, -1 killed by a signal or not started. `NOT_RUN` for a step that was not
+// executed (an earlier step failed or decided the outcome).
+export const NOT_RUN: int = 100000;
+
+export const MAX_WORKERS: usize = 128;
+
+type Item<J> = { id: usize; job: J; };
+type Done<R> = { id: usize; result: R; };
+
+// Runs `run(p, job)` for every job with up to `workers` at the same time and returns the results in the order of the jobs.
+export function runAll<J, R>(proc: ProcessGrant, jobs: J[], workers: usize, run: (p: ProcessGrant, j: J) => R): R[] {
+  let n = workers;
+  if (n > MAX_WORKERS) {
+    n = MAX_WORKERS;
+  }
+  if (n > jobs.length) {
+    n = jobs.length;
+  }
+  if (n < 1) {
+    n = 1;
+  }
+  const unordered = scopeProcess(proc, (s, g) => {
+    // all jobs are queued before the workers start: the channel never blocks the sender
+    const ch = channel<Item<J>>(jobs.length + 1);
+    let k: usize = 0;
+    for (const j of jobs) {
+      ch.tx.send(Item { id: k, job: j });
+      k += 1;
+    }
+    ch.tx.close();
+    let handles: TaskHandle<Done<R>[]>[] = [];
+    let w: usize = 0;
+    while (w < n) {
+      const rx = ch.rx;
+      handles.push(spawnProcess(s, g, p => {
+        let done: Done<R>[] = [];
+        while (true) {
+          const next = rx.recv();
+          if (next.isNone()) {
+            break;
+          }
+          const item = next.unwrap();
+          done.push(Done { id: item.id, result: run(p, item.job) });
+        }
+        return done;
+      }));
+      w += 1;
+    }
+    let all: Done<R>[] = [];
+    for (const h of handles) {
+      for (const d of h.join()) {
+        all.push(d);
+      }
+    }
+    return all;
+  });
+  let at: usize[] = [];
+  let i: usize = 0;
+  while (i < jobs.length) {
+    at.push(0);
+    i += 1;
+  }
+  let k: usize = 0;
+  while (k < unordered.length) {
+    at[unordered[k].id] = k;
+    k += 1;
+  }
+  let ordered: R[] = [];
+  for (const pos of at) {
+    ordered.push(unordered[pos].result);
+  }
+  return ordered;
+}

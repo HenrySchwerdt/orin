@@ -1,0 +1,106 @@
+// Mutation check of std:net (port of `net_mutant` / `run_net_mutants` of tools/mutate_std.py). library/std/net.or imports the
+// internal std:fsraw, so a copy outside the library root cannot be compiled: the compiler sources and the libraries it
+// embeds are copied to the mutant's directory, the mutant is applied to the copy of library/std/net.or, the copy's embedded
+// library is regenerated (tools/embed_prelude.py) and the copy of the compiler is built with the given compiler;
+// tests/std/net_test.or then runs with the mutated compiler. The working tree is never changed, so the mutants can run
+// in parallel.
+
+import { ProcessGrant } from "std:process";
+import { FsGrant, writeFile, readFile } from "std:fs";
+import { shellTimeout } from "std:io";
+import { shq, replaceFirst, countOf, countLinePrefix, cutBytes, padEnd, padStart } from "./text";
+import { StdMutant } from "./mutants_std";
+import { OUT, FAIL_TIMEOUT } from "./std_check";
+import { NOT_RUN } from "./exec";
+
+export type NetJob = { root: string; orinc: string; dir: string; };
+
+// Exit status of the build steps (0: built, otherwise the status of the step that failed; NOT_RUN for the tests that did not
+// run) and of the two runs of the tests (with contracts, without).
+export type NetRun = { build: int; t1: int; t2: int; };
+
+export function netDir(m: StdMutant): string {
+  return OUT + "/net_" + m.name;
+}
+
+function cdRoot(root: string): string {
+  return "cd " + shq(root) + " && ";
+}
+
+export function runNet(p: ProcessGrant, j: NetJob): NetRun {
+  const d = shq(j.dir);
+  const src = shq(j.dir + "/src");
+  const log = " > " + shq(j.dir + "/build.log") + " 2>&1 </dev/null";
+  const root = cdRoot(j.root);
+  const copy = root + "mkdir -p " + src + "/tools && cp -R compiler " + src + "/compiler && cp -R library " + src + "/library"
+    + " && cp tools/embed_prelude.py " + src + "/tools/ && cp " + shq(j.dir + "/net.or.mutant") + " " + shq(j.dir + "/src/library/std/net.or") + log;
+  let rc = shellTimeout(p, copy, 900);
+  if (rc != 0) {
+    return NetRun { build: rc, t1: NOT_RUN, t2: NOT_RUN };
+  }
+  rc = shellTimeout(p, root + "(cd " + src + " && python3 tools/embed_prelude.py)" + log, 900);
+  if (rc != 0) {
+    return NetRun { build: rc, t1: NOT_RUN, t2: NOT_RUN };
+  }
+  rc = shellTimeout(p, root + shq(j.orinc) + " compile " + shq(j.dir + "/src/compiler/main.or") + " -o " + shq(j.dir + "/orin.c") + log, 900);
+  if (rc == 0) {
+    rc = shellTimeout(p, root + "cc -O0 -w -I runtime/core " + shq(j.dir + "/orin.c") + " runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "
+      + shq(j.dir + "/orin") + log, 900);
+  }
+  if (rc != 0) {
+    return NetRun { build: rc, t1: NOT_RUN, t2: NOT_RUN };
+  }
+  shellTimeout(p, root + "rm -rf " + src, 900);
+  const test = root + shq("./" + j.dir + "/orin") + " test tests/std/net_test.or --runtime runtime/core";
+  const t1 = shellTimeout(p, test + " > " + shq(j.dir + "/test1.out") + " 2>&1 </dev/null", 120);
+  const t2 = shellTimeout(p, test + " --no-contracts > " + shq(j.dir + "/test2.out") + " 2>&1 </dev/null", 120);
+  return NetRun { build: 0, t1: t1, t2: t2 };
+}
+
+export type NetResult = { ok: bool; survived: bool; line: string; error: string; };
+
+function readOut(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+// The failing tests of one run: the `FAIL ` lines, plus one for a run that failed without a compile error and without
+// naming a test; a timeout is one failure.
+function failures(fs: FsGrant, root: string, rc: int, path: string): usize {
+  if (rc == FAIL_TIMEOUT) {
+    return 1;
+  }
+  const out = readOut(fs, root + "/" + path);
+  const n = countLinePrefix(out, "FAIL ");
+  if (rc != 0 && !out.includes("error[") && n == 0) {
+    return 1;
+  }
+  return n;
+}
+
+export function judgeNet(fs: FsGrant, m: StdMutant, j: NetJob, r: NetRun): NetResult {
+  if (r.build != 0) {
+    const log = readOut(fs, j.root + "/" + j.dir + "/build.log");
+    return NetResult { ok: false, survived: false, line: "",
+      error: "COMPILE ERROR in mutant net/" + m.name + ":\n" + cutBytes(log, 600) };
+  }
+  const f1 = failures(fs, j.root, r.t1, j.dir + "/test1.out");
+  const f2 = failures(fs, j.root, r.t2, j.dir + "/test2.out");
+  const status = f1 > 0 ? "killed" : "SURVIVED";
+  const line = padEnd(m.target, 12) + " " + padEnd(m.name, 44) + " " + padEnd(status, 9) + " tests failing: "
+    + padStart(f1.toString(), 2) + "; without contracts: " + padStart(f2.toString(), 2);
+  return NetResult { ok: true, survived: f1 == 0, line: line, error: "" };
+}
+
+// Writes the mutated library/std/net.or beside the directory's sources; an error text for a pattern that is not found.
+export function prepareNet(fs: FsGrant, root: string, orinc: string, orig: string, m: StdMutant): Result<NetJob, string> {
+  if (countOf(orig, m.oldText) < 1) {
+    return Err("BAD MUTANT " + m.target + "/" + m.name + ": pattern not found");
+  }
+  const dir = netDir(m);
+  writeFile(fs, root + "/" + dir + "/net.or.mutant", replaceFirst(orig, m.oldText, m.newText));
+  return Ok(NetJob { root: root, orinc: orinc, dir: dir });
+}

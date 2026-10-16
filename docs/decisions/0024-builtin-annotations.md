@@ -110,7 +110,7 @@ or removing `@Deprecated` is reported by `orin api --check` like any signature c
 `mir.MProgram.inlineFns`, MIR v1.7) and the backends use them: the C backend emits `static inline`
 (a hint the C compiler may ignore; not `always_inline`, which GCC turns into an error for the
 constructs it cannot inline), the LLVM backend `alwaysinline`. **Semantics are unchanged**: the
-differential tests (`diff_backends.py`, all modes) and the conformance suites pass identically with and
+differential tests (`tools/differential.sh`, all modes) and the conformance suites pass identically with and
 without it. Generic functions: every instance is marked. A function used as a value (`f(square, 3)`)
 is an ordinary function value. **Recursion is an error (E0444):** an `@Inline` function that is part of
 a call cycle (directly, through other functions or through closure creation) is rejected, because the

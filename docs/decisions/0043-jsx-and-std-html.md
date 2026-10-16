@@ -145,7 +145,7 @@ shape as the hand-written concatenation.
   `jsx_escape_diff.or` (differential: compile-time vs run-time escaping, all byte values), 20 error tests
   `tests/next/errors/jsx_*.or` (every code, every safety rule).
 - `std:html`: 18 `@Test`s run with and without runtime contract checking, a differential test against an executable
-  specification of `escape`, 41 mutants all killed (`tools/mutate_std.py --module html`); docs/std.md.
+  specification of `escape`, 41 mutants all killed (`tools/mutation.sh std --module html`); docs/std.md.
 - Compiler mutation check: `tools/mutate_jsx.py` builds the compiler with each of 23 deliberate bugs in the JSX lexer,
   parser and checker (missing escapes, unsanitised URL attributes, accepted event handlers, unsealed `Html`, broken text
   rules, the `<` heuristic) and requires the JSX tests to fail: 23 of 23 killed (2026-10-15).
@@ -154,7 +154,7 @@ shape as the hand-written concatenation.
   and 1.58 G for C, with 30 % fewer allocations than the hand-written version (docs/benchmarks.md "HTML rendering").
 - The bootstrap fixed point holds with JSX in the compiler (`stage2.c == stage3.c`); all conformance, std, fmt and
   tooling suites pass unchanged.
-- Differential backends: the JSX tests are ordinary conformance tests, so `tools/diff_backends.py` (C vs LLVM, opt,
+- Differential backends: the JSX tests are ordinary conformance tests, so `tools/differential.sh` (C vs LLVM, opt,
   fuse) covers them.
 
 ## Not done (follow-ups, in order of expected gain)

@@ -1,0 +1,331 @@
+// Orin mutation checks (ADR-0047 phase 5): the Orin port of tools/mutate_std.py (`std`) and tools/mutate_ox.py (`ox`), with the
+// same flags, mutants, output lines and exit status. See tooling/mutation/README.md and docs/testing.md.
+//
+//   orin-mutation std [--orinc COMPILER] [--module bytes|utf8|collections|http|net|text|html|taskcore] [--list] [--shard I/N] [-j N] [--root DIR]
+//   orin-mutation ox  [--orinc COMPILER] [--cc CC] [--list] [--only NAME[,NAME]] [-j N] [--root DIR]
+//
+// Exit status: 0 every mutant was killed, 1 a mutant survived (or $ORIN_JOBS is not a number), 2 usage or a broken mutant.
+
+import { Host, withHost } from "std:host";
+import { ProcessGrant, args, exit } from "std:process";
+import { FsGrant, readFile } from "std:fs";
+import { shell } from "std:io";
+import { strip, shq } from "./text";
+import { StdOptions, OxOptions, parseStdArgs, parseOxArgs, stdUsage, stdHelp, oxUsage, oxHelp, parseIntLoose } from "./cli";
+import { StdMutant, stdMutants, netMutants } from "./mutants_std";
+import { OxMutant, oxMutants } from "./mutants_ox";
+import { runAll } from "./exec";
+import { OUT, Row, StdJob, StdRun, StdResult, selectStd, dirName, neededTests, loadSources, prepareStd, runStd, judgeStd, summaryLines } from "./std_check";
+import { NetJob, NetRun, NetResult, netDir, prepareNet, runNet, judgeNet } from "./net_check";
+import { OX_OUT, OxJob, OxRun, OxResult, selectOx, listLine, resultLine, summaryLine, prepareOx, runOx, judgeOx } from "./ox_check";
+
+function inRoot(root: string, cmd: string): string {
+  return "cd " + shq(root) + " && " + cmd;
+}
+
+function readText(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+export type Env = { jobs: int; cc: string; };
+
+// `$ORIN_JOBS` (blank: unset), the CPU count and `$CC`, through the shell: the language has no environment access.
+// `jobs` is -1 after printing the error of an invalid $ORIN_JOBS.
+function readEnv(fs: FsGrant, proc: ProcessGrant, root: string): Env {
+  const file = "build/.mutation-env";
+  const sh = "mkdir -p build && { printf '%s\\n' \"${ORIN_JOBS:-}\"; { getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null"
+    + " || sysctl -n hw.ncpu 2>/dev/null || echo 4; } | head -n 1; printf '%s\\n' \"${CC:-cc}\"; } > " + shq(file);
+  if (shell(proc, inRoot(root, sh)) != 0) {
+    return Env { jobs: 4, cc: "cc" };
+  }
+  const lines = readText(fs, root + "/" + file).split("\n");
+  const env = lines.length > 0 ? strip(lines[0]) : "";
+  const cc = lines.length > 2 && strip(lines[2]) != "" ? strip(lines[2]) : "cc";
+  if (env != "") {
+    const n = parseIntLoose(env);
+    if (n.isNone()) {
+      console.error("ORIN_JOBS must be a number, got '" + env + "'");
+      return Env { jobs: -1, cc: cc };
+    }
+    return Env { jobs: n.unwrap() < 1 ? 1 : n.unwrap(), cc: cc };
+  }
+  if (lines.length > 1) {
+    const cpus = parseIntLoose(strip(lines[1]));
+    if (cpus.isSome() && cpus.unwrap() > 0) {
+      return Env { jobs: cpus.unwrap(), cc: cc };
+    }
+  }
+  return Env { jobs: 4, cc: cc };
+}
+
+// A path as a command word run after `cd <root>`: a relative one is relative to the root.
+function commandPath(path: string): string {
+  return path.startsWith("/") || path.startsWith("./") ? path : "./" + path;
+}
+
+function mkdirs(proc: ProcessGrant, root: string, dirs: string[]): bool {
+  if (dirs.length == 0) {
+    return true;
+  }
+  let q: string[] = [];
+  for (const d of dirs) {
+    q.push(shq(d));
+  }
+  return shell(proc, inRoot(root, "mkdir -p " + q.join(" "))) == 0;
+}
+
+function removeDirs(proc: ProcessGrant, root: string, dirs: string[]): void {
+  let k: usize = 0;
+  while (k < dirs.length) {
+    let q: string[] = [];
+    while (k < dirs.length && q.length < 100) {
+      q.push(shq(dirs[k]));
+      k += 1;
+    }
+    shell(proc, inRoot(root, "rm -rf " + q.join(" ")));
+  }
+}
+
+// ----------------------------------------------------------------------------------------------------------- std
+
+function runStdModules(fs: FsGrant, proc: ProcessGrant, o: StdOptions, workers: usize, orinc: string, selected: StdMutant[]): int {
+  let dirs: string[] = [];
+  for (const m of selected) {
+    dirs.push(dirName(m));
+  }
+  mkdirs(proc, o.root, dirs);
+  const src = loadSources(fs, o.root, neededTests(selected));
+  // prepare in order; the first broken mutant ends the run after the lines before it
+  let jobs: StdJob[] = [];
+  let ready: StdMutant[] = [];
+  let error = "";
+  for (const m of selected) {
+    const r = prepareStd(fs, o.root, orinc, src, m);
+    if (!r.ok) {
+      error = r.error;
+      break;
+    }
+    jobs.push(r.job);
+    ready.push(m);
+  }
+  const runs = runAll(proc, jobs, workers, (p, j) => runStd(p, j));
+  let rows: Row[] = [];
+  let survivors: usize = 0;
+  let k: usize = 0;
+  while (k < jobs.length) {
+    const res = judgeStd(fs, ready[k], jobs[k], runs[k]);
+    if (!res.ok) {
+      console.log(res.error);
+      return 2;
+    }
+    if (res.row.status == "SURVIVED") {
+      survivors += 1;
+    }
+    rows.push(res.row);
+    console.log(res.line);
+    k += 1;
+  }
+  if (error != "") {
+    console.log(error);
+    return 2;
+  }
+  for (const l of summaryLines(rows)) {
+    console.log(l);
+  }
+  return survivors > 0 ? 1 : 0;
+}
+
+function runNetModule(fs: FsGrant, proc: ProcessGrant, o: StdOptions, workers: usize, orinc: string, selected: StdMutant[]): int {
+  let dirs: string[] = [];
+  for (const m of selected) {
+    dirs.push(netDir(m));
+  }
+  mkdirs(proc, o.root, dirs);
+  const orig = readText(fs, o.root + "/library/std/net.or");
+  let jobs: NetJob[] = [];
+  let ready: StdMutant[] = [];
+  let error = "";
+  for (const m of selected) {
+    const r = prepareNet(fs, o.root, orinc, orig, m);
+    if (r.isErr()) {
+      error = r.unwrapErr();
+      break;
+    }
+    jobs.push(r.unwrap());
+    ready.push(m);
+  }
+  const runs = runAll(proc, jobs, workers, (p, j) => runNet(p, j));
+  let survivors: usize = 0;
+  let k: usize = 0;
+  while (k < jobs.length) {
+    const res = judgeNet(fs, ready[k], jobs[k], runs[k]);
+    if (!res.ok) {
+      console.log(res.error);
+      return 2;
+    }
+    if (res.survived) {
+      survivors += 1;
+    }
+    console.log(res.line);
+    k += 1;
+  }
+  if (error != "") {
+    console.log(error);
+    return 2;
+  }
+  return survivors > 0 ? 1 : 0;
+}
+
+function runStdCheck(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  const parsed = parseStdArgs(argv);
+  if (!parsed.ok) {
+    console.error(stdUsage());
+    console.error("orin-mutation std: error: " + parsed.error);
+    return 2;
+  }
+  const o = parsed.value;
+  const env = readEnv(fs, proc, o.root);
+  if (env.jobs < 0) {
+    return 1;
+  }
+  if (parsed.help) {
+    console.log(stdHelp());
+    return 0;
+  }
+  if (o.list) {
+    for (const m of stdMutants().concat(netMutants())) {
+      console.log(m.target + " " + m.name);
+    }
+    return 0;
+  }
+  const workers = (o.jobs > 0 ? o.jobs : env.jobs).toUsize();
+  const orinc = commandPath(o.orinc);
+  const selected = selectStd(stdMutants(), netMutants(), o.target, o.shardI, o.shardN);
+  // remove the old directories of the selected mutants only: other modules or shards may run in the same tree
+  mkdirs(proc, o.root, [OUT]);
+  let old: string[] = [];
+  for (const m of selected) {
+    old.push(o.target == "net" ? netDir(m) : dirName(m));
+  }
+  removeDirs(proc, o.root, old);
+  if (o.target == "net") {
+    return runNetModule(fs, proc, o, workers, orinc, selected);
+  }
+  return runStdModules(fs, proc, o, workers, orinc, selected);
+}
+
+// ------------------------------------------------------------------------------------------------------------ ox
+
+function runOxCheck(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  const parsed = parseOxArgs(argv);
+  if (!parsed.ok) {
+    console.error(oxUsage());
+    console.error("orin-mutation ox: error: " + parsed.error);
+    return 2;
+  }
+  const o = parsed.value;
+  const env = readEnv(fs, proc, o.root);
+  if (env.jobs < 0) {
+    return 1;
+  }
+  if (parsed.help) {
+    console.log(oxHelp());
+    return 0;
+  }
+  const selected = selectOx(oxMutants(), o.only);
+  if (o.list) {
+    for (const m of selected) {
+      console.log(listLine(m));
+    }
+    return 0;
+  }
+  if (shell(proc, inRoot(o.root, "test -e " + shq(o.orinc))) != 0) {
+    console.error("no compiler " + o.orinc + " (tools/dev.sh build)");
+    return 1;
+  }
+  const workers = (o.jobs > 0 ? o.jobs : env.jobs).toUsize();
+  const orinc = commandPath(o.orinc);
+  const cc = o.cc != "" ? o.cc : env.cc;
+  mkdirs(proc, o.root, [OX_OUT]);
+  // per mutant: the result known before anything runs (a bad pattern), or a job
+  let jobs: OxJob[] = [];
+  let jobOf: int[] = [];
+  let early: string[] = [];
+  let sources: string[] = [];
+  let paths: string[] = [];
+  for (const m of selected) {
+    let at: int = -1;
+    let k: usize = 0;
+    while (k < paths.length) {
+      if (paths[k] == m.rel) {
+        at = k.toInt();
+      }
+      k += 1;
+    }
+    if (at < 0) {
+      paths.push(m.rel);
+      sources.push(readText(fs, o.root + "/compiler/" + m.rel));
+      at = (paths.length - 1).toInt();
+    }
+    const r = prepareOx(fs, o.root, orinc, cc, sources[at.toUsize()], m);
+    if (r.isErr()) {
+      jobOf.push(-1);
+      early.push(r.unwrapErr());
+    } else {
+      jobOf.push(jobs.length.toInt());
+      early.push("");
+      jobs.push(r.unwrap());
+    }
+  }
+  const runs = runAll(proc, jobs, workers, (p, j) => runOx(p, j));
+  let killed: usize = 0;
+  let survived: usize = 0;
+  let k: usize = 0;
+  while (k < selected.length) {
+    let res = OxResult { status: "ERROR", detail: early[k] };
+    if (jobOf[k] >= 0) {
+      res = judgeOx(fs, jobs[jobOf[k].toUsize()], runs[jobOf[k].toUsize()]);
+    }
+    console.log(resultLine(selected[k].name, res.status, res.detail));
+    if (res.status == "killed") {
+      killed += 1;
+    } else {
+      survived += 1;
+    }
+    k += 1;
+  }
+  console.log(summaryLine(selected.length, killed, survived));
+  return survived > 0 ? 1 : 0;
+}
+
+function usageTop(): string {
+  return "usage: orin-mutation {std,ox} ...\n"
+  + "  std  mutation check of the provable std modules\n"
+  + "  ox   mutation check of the OX part of the compiler";
+}
+
+function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  if (argv.length == 0 || (argv[0] != "std" && argv[0] != "ox")) {
+    console.error(usageTop());
+    return 2;
+  }
+  let rest: string[] = [];
+  let i: usize = 1;
+  while (i < argv.length) {
+    rest.push(argv[i]);
+    i += 1;
+  }
+  if (argv[0] == "std") {
+    return runStdCheck(fs, proc, rest);
+  }
+  return runOxCheck(fs, proc, rest);
+}
+
+function main(host: Host): void {
+  const code = withHost(host, (fs, proc, stdio, clock) => run(fs, proc, args(proc)));
+  exit(code);
+}

@@ -34,6 +34,7 @@ mkdir -p build
     echo "sh tools/test_tooling.sh --unit $t"
   done
   echo '$ORIN2 test compiler/tests/terminal_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/util_test.or --runtime runtime/core'
   # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
   echo '$ORIN2 test compiler/tests/loader_test.or --runtime runtime/core'
   echo '$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime/core'
