@@ -15,7 +15,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:time` | Orin, `library/std/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
 | `std:graph` | Orin, `library/std/graph.or` | `class Graph<T>` with generational, tagged `GraphId<T>` (ADR-0026) |
 | `std:bytes` | Orin, `library/std/bytes.or` | `Bytes`, `ByteBuilder`, `ByteReader`; provable-std layer 1 (ADR-0030), contract standard |
-| `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit plus mode and structured byte offsets; [API and policies](std-url.md) |
+| `std:url` | Orin, `library/std/url.or` | percent encode/decode over bytes or strict UTF-8, ordered query pairs; explicit `FormSpace` mode (`PlusAsSpace` or `PercentSpace`) and structured byte offsets; [API and policies](std-url.md) |
 | `std:utf8` | Orin, `library/std/utf8.or` | validated decoding, encoding, `Utf8String` ("always valid UTF-8"), `CodePointCursor`; ADR-0030 |
 | `std:collections` | Orin, `library/std/collections.or` | `IntSet`, `StringSet`, `Deque<T>`, `SortedMap<V>`, `SortedStringMap<V>`, `PriorityQueue<T>`; ADR-0030 |
 | `std:http` | Orin, `library/std/http.or` | the **pure** part of HTTP/1.1: `Request`, `Response`, `Headers`, `Status`, an incremental request and response parser (smuggling-safe, limits as parameters) and a serializer with a round-trip contract; the sockets are `std:net` (ADR-0033); `examples/http_server.or` joins them; ADR-0030 |
