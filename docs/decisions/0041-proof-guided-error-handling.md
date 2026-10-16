@@ -431,6 +431,10 @@ No existing default compilation behavior changes just by accepting this ADR.
 
 ### Stage D: isolation, supervision and recovery
 
+The [proposed concurrency roadmap](../roadmaps/async-concurrency.md) breaks the
+cleanup, interruptible-wait and task-heap prerequisites into reviewable work. It
+does not implement recovery or change the gates below.
+
 **Prerequisite found in concurrency stage 0 (PR #51):** a trap ends a task without unwinding, so a panic in
 a task that itself owns a `scope` leaves that scope's child tasks running. In-process fault containment
 first needs a trap hook that registers each task's live scopes and cancels and joins them on trap, plus a
