@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -177,11 +178,7 @@ int orin_platform_policy_parse(const char *spec, size_t n, unsigned *mask) {
 
 int orin_platform_policy_load(unsigned *mask) {
     const char *v = getenv("ORIN_DENY");
-    if (!v) {
-        *mask = 0;
-        return 0;
-    }
-    return orin_platform_policy_parse(v, strlen(v), mask);
+    return orin_platform_policy_parse(v ? v : "", v ? strlen(v) : 0, mask);
 }
 
 int64_t orin_platform_path_normalize(const char *path, size_t plen, char *out, size_t cap) {
@@ -292,31 +289,22 @@ double orin_platform_parse_double(const char *s, int is_f32) {
  * (ADR-0017). Stdin needs none: getc / fread of stdio lock internally. */
 static pthread_mutex_t g_io = PTHREAD_MUTEX_INITIALIZER;
 
-void orin_platform_write(int stream, const char *p, size_t n) {
+static void write_bytes(int stream, const char *p, size_t n, int newline) {
     pthread_mutex_lock(&g_io);
     if (stream == ORIN_PLATFORM_STDOUT) {
         if (n) ORIN_FWRITE(p, 1, n, stdout);
+        if (newline) ORIN_PUTC('\n', stdout);
     } else {
         fflush(stdout);
         if (n) fwrite(p, 1, n, stderr);
+        if (newline) fputc('\n', stderr);
         fflush(stderr);
     }
     pthread_mutex_unlock(&g_io);
 }
 
-void orin_platform_write_line(int stream, const char *p, size_t n) {
-    pthread_mutex_lock(&g_io);
-    if (stream == ORIN_PLATFORM_STDOUT) {
-        if (n) ORIN_FWRITE(p, 1, n, stdout);
-        ORIN_PUTC('\n', stdout);
-    } else {
-        fflush(stdout);
-        if (n) fwrite(p, 1, n, stderr);
-        fputc('\n', stderr);
-        fflush(stderr);
-    }
-    pthread_mutex_unlock(&g_io);
-}
+void orin_platform_write(int stream, const char *p, size_t n) { write_bytes(stream, p, n, 0); }
+void orin_platform_write_line(int stream, const char *p, size_t n) { write_bytes(stream, p, n, 1); }
 
 void orin_platform_flush(void) {
     pthread_mutex_lock(&g_io);
@@ -426,6 +414,35 @@ int orin_platform_file_exists(const char *path, size_t plen) {
     int r = stat(p, &st) == 0;
     orin_platform_free(p);
     return r;
+}
+
+int orin_platform_dir_list(const char *path, size_t plen, void (*each)(void *ctx, const char *name, size_t len, int is_dir),
+                           void *ctx) {
+    int err = 0;
+    char *p = path_copy(path, plen, &err);
+    if (!p) return err;
+    DIR *d = opendir(p);
+    err = d ? 0 : errno;
+    orin_platform_free(p);
+    if (!d) return err;
+    for (;;) {
+        errno = 0;
+        struct dirent *de = readdir(d);
+        if (!de) {
+            err = errno;
+            break;
+        }
+        const char *n = de->d_name;
+        if (n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0))) continue;
+        struct stat st;
+        if (fstatat(dirfd(d), n, &st, AT_SYMLINK_NOFOLLOW)) {
+            err = errno;
+            break;
+        }
+        each(ctx, n, strlen(n), S_ISDIR(st.st_mode));
+    }
+    if (closedir(d) && !err) err = errno;
+    return err;
 }
 
 /* ---------------------------------------------------------------- file streams */

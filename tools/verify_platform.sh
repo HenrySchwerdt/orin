@@ -18,6 +18,22 @@ $B/platform_test < /dev/null
 $CC -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
     platform/tests/platform_test.c platform/orin_platform.c -o $B/platform_test_asan
 ASAN_OPTIONS=allocator_may_return_null=1 $B/platform_test_asan < /dev/null 2>/dev/null
+echo "[platform] directory fault injection"
+$CC -Wall -Wextra -O1 -g platform/tests/dir_fault_test.c -o $B/dir_fault_test
+$B/dir_fault_test
+$CC -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+    platform/tests/dir_fault_test.c -o $B/dir_fault_test_asan
+ASAN_OPTIONS=allocator_may_return_null=1 $B/dir_fault_test_asan
+echo "[platform] runtime directory adapter faults"
+for mode in plain asan; do
+    flags="-O1 -g"
+    [ "$mode" != asan ] || flags="-g -fsanitize=address,undefined -fno-sanitize-recover=undefined"
+    $CC -Wall -Wextra $flags -Dorin_platform_dir_list=orin_platform_dir_list_real \
+        -c platform/orin_platform.c -o $B/dir_adapter_platform_$mode.o
+    $CC -Wall -Wextra $flags -I runtime runtime/tests/dir_fault_test.c runtime/orin_runtime.c \
+        $B/dir_adapter_platform_$mode.o -lm -o $B/dir_adapter_$mode
+    $B/dir_adapter_$mode
+done
 # the thread and monitor primitives (ADR-0017) are tested only: ThreadSanitizer is the evidence that they are race free
 echo "[platform] ThreadSanitizer"
 $CC -Wall -Wextra -g -fsanitize=thread platform/tests/platform_test.c platform/orin_platform.c -o $B/platform_test_tsan

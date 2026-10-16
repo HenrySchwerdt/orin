@@ -152,6 +152,49 @@ static void test_files(void) {
     if (access("/dev/full", W_OK) == 0) CHECK(orin_platform_file_write("/dev/full", 9, "x", 1) == ENOSPC);
 }
 
+/* Directory order is intentionally unspecified here; the Orin adapter sorts the entries. */
+typedef struct { int file, subdir, loop, dangling, bytes, count; } DirectoryEntries;
+static void directory_entry(void *ctx, const char *name, size_t len, int is_dir) {
+    DirectoryEntries *e = (DirectoryEntries *)ctx;
+    e->count++;
+    CHECK(name[len] == 0 && strlen(name) == len);
+    CHECK(strcmp(name, ".") && strcmp(name, ".."));
+    if (!strcmp(name, "file")) { e->file++; CHECK(!is_dir); }
+    else if (!strcmp(name, "subdir")) { e->subdir++; CHECK(is_dir); }
+    else if (!strcmp(name, "loop")) { e->loop++; CHECK(!is_dir); }
+    else if (!strcmp(name, "dangling")) { e->dangling++; CHECK(!is_dir); }
+    else if (len == 2 && (unsigned char)name[0] == 195 && (unsigned char)name[1] == 169) { e->bytes++; CHECK(!is_dir); }
+    else CHECK(0);
+    errno = EIO; /* A successful callback may leave errno set; enumeration must ignore it. */
+}
+
+static void test_directories(void) {
+    char directory[512], path[540];
+    snprintf(directory, sizeof directory, "%s/listing", tmpdir);
+    CHECK(mkdir(directory, 0700) == 0);
+    DirectoryEntries e = {0};
+    CHECK(orin_platform_dir_list(directory, strlen(directory), directory_entry, &e) == 0 && e.count == 0);
+    snprintf(path, sizeof path, "%s/file", directory);
+    CHECK(orin_platform_file_write(path, strlen(path), "", 0) == 0);
+    CHECK(orin_platform_dir_list(path, strlen(path), directory_entry, &e) == ENOTDIR && e.count == 0);
+    snprintf(path, sizeof path, "%s/subdir", directory);
+    CHECK(mkdir(path, 0700) == 0);
+    snprintf(path, sizeof path, "%s/loop", directory);
+    CHECK(symlink(".", path) == 0);
+    snprintf(path, sizeof path, "%s/dangling", directory);
+    CHECK(symlink("missing", path) == 0);
+    snprintf(path, sizeof path, "%s/\303\251", directory);
+    CHECK(orin_platform_file_write(path, strlen(path), "", 0) == 0);
+    CHECK(orin_platform_dir_list(directory, strlen(directory), directory_entry, &e) == 0);
+    CHECK(e.count == 5 && e.file == 1 && e.subdir == 1 && e.loop == 1 && e.dangling == 1 && e.bytes == 1);
+    e = (DirectoryEntries){0};
+    CHECK(orin_platform_dir_list("a\0b", 3, directory_entry, &e) == EINVAL && e.count == 0);
+    CHECK(orin_platform_dir_list("", 0, directory_entry, &e) == ENOENT && e.count == 0);
+    snprintf(path, sizeof path, "%s/missing", directory);
+    CHECK(orin_platform_dir_list(path, strlen(path), directory_entry, &e) == ENOENT && e.count == 0);
+    CHECK(orin_platform_dir_list(directory, strlen(directory) - 1, directory_entry, &e) == ENOENT && e.count == 0);
+}
+
 static void test_streams(void) {
     orin_platform_stream *s = (orin_platform_stream *)1;
     char buf[64];
@@ -750,6 +793,7 @@ int main(void) {
     test_find();
     test_fmt();
     test_files();
+    test_directories();
     test_streams();
     test_process_and_output();
     test_stdin();

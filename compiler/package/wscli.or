@@ -1,0 +1,125 @@
+// `orin workspace list|lock|check` (ADR-0047 phase 2c, docs/workspace.md §6): reads the tree below the current directory
+// with `listDir`, resolves the workspace and prints the members in build order, writes `orin.lock`, or checks it.
+// Exit status: 0 ok, 1 a diagnostic, 2 usage.
+//
+// Not wired yet: the compiler's own source can use `listDir` only after the seed knows the primitive. Order: merge the
+// primitive, refresh the seed (tools/refresh_seed or the seed procedure in docs/bootstrap.md), then export
+// `runWorkspace` from module.or and dispatch `orin workspace` in main.or.
+
+import { FsGrant, readFile, writeFile, exists, listDir } from "std:fs";
+import { SourceFile, SourceMap, Diagnostic, render } from "../diag";
+import { parseWorkspace } from "./workspace";
+import { Tree, Resolved, resolveWorkspace, lockText, checkLock } from "./resolve";
+
+// Directories never searched for members: hidden ones (.git, ...), build output and npm installs.
+function skipped(name: string): bool {
+  return name.startsWith(".") || name == "build/" || name == "node_modules/";
+}
+
+// Every directory below `root` ("" = the current directory), relative, in byte order per level.
+function walk(fs: FsGrant, root: string): string[] {
+  let out: string[] = [];
+  let todo: string[] = [root];
+  while (todo.length > 0) {
+    const d = todo.pop().unwrap();
+    for (const e of listDir(fs, d == "" ? "." : d)) {
+      if (e.endsWith("/") && !skipped(e)) {
+        const name = e.substring(0, e.length - 1);
+        const path = d == "" ? name : d + "/" + name;
+        out.push(path);
+        todo.push(path);
+      }
+    }
+  }
+  return out;
+}
+
+function report(files: SourceFile[], d: Diagnostic): usize {
+  console.error(render(SourceMap { files: files }, d));
+  return 1;
+}
+
+export function runWorkspace(fs: FsGrant, argv: string[]): usize {
+  const sub = argv.length > 0 ? argv[0] : "";
+  if (sub != "list" && sub != "lock" && sub != "check") {
+    console.error("usage: orin workspace list|lock|check");
+    return 2;
+  }
+  if (!exists(fs, "orin-workspace.toml")) {
+    console.error("error: no orin-workspace.toml in the current directory");
+    return 1;
+  }
+  const wsRead = readFile(fs, "orin-workspace.toml");
+  if (wsRead.isErr()) {
+    console.error("error: cannot read orin-workspace.toml: " + wsRead.unwrapErr());
+    return 1;
+  }
+  const wsText = wsRead.unwrap();
+  let files: SourceFile[] = [SourceFile { path: "orin-workspace.toml", text: wsText }];
+  const wr = parseWorkspace(0, wsText);
+  if (wr.isErr()) {
+    return report(files, wr.unwrapErr());
+  }
+  const dirs = walk(fs, "");
+  let workspaces: string[] = [];
+  let npmDirs: string[] = [];
+  for (const d of dirs) {
+    if (exists(fs, d + "/orin-workspace.toml")) {
+      workspaces.push(d);
+    }
+    if (exists(fs, d + "/package.json")) {
+      npmDirs.push(d);
+    }
+  }
+  // files[1 + k] is the manifest of dirs[k] ("" when it has none): the resolver's file ids.
+  let texts: string[] = [];
+  for (const d of dirs) {
+    const r = readFile(fs, d + "/orin.toml");
+    texts.push(r.isOk() ? r.unwrap() : "");
+    files.push(SourceFile { path: d + "/orin.toml", text: r.isOk() ? r.unwrap() : "" });
+  }
+  const tree = Tree {
+    dirs: dirs,
+    workspaceDirs: workspaces,
+    npmDirs: npmDirs,
+    manifest: (d: string) => {
+      let i: usize = 0;
+      while (i < dirs.length) {
+        if (dirs[i] == d && texts[i] != "") {
+          return Some(texts[i]);
+        }
+        i += 1;
+      }
+      return None;
+    },
+  };
+  const rr = resolveWorkspace(wr.unwrap(), tree, 1);
+  if (rr.isErr()) {
+    return report(files, rr.unwrapErr());
+  }
+  const r: Resolved = rr.unwrap();
+  if (sub == "list") {
+    for (const i of r.order) {
+      console.log(r.members[i].name + "  " + r.members[i].dir);
+    }
+    return 0;
+  }
+  if (sub == "lock") {
+    const w = writeFile(fs, "orin.lock", lockText(r));
+    if (w.isErr()) {
+      console.error("error: cannot write orin.lock: " + w.unwrapErr());
+      return 1;
+    }
+    return 0;
+  }
+  const lock = readFile(fs, "orin.lock");
+  if (lock.isErr()) {
+    console.error("error[E0509]: no orin.lock, run `orin workspace lock`");
+    return 1;
+  }
+  files.push(SourceFile { path: "orin.lock", text: lock.unwrap() });
+  return match (checkLock(r, files.length - 1, lock.unwrap())) {
+    Some(d) => report(files, d),
+    None => 0,
+  };
+}

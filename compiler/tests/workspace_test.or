@@ -1,0 +1,364 @@
+// Unit tests of the workspace manifest (compiler/package/workspace.or, docs/workspace.md; run:
+// `orin test compiler/tests/workspace_test.or`). The cases mirror the static fixtures in tests/workspace/.
+
+import { assertEqString, assertEqBool, assertEqUsize } from "std:test";
+import { Diagnostic } from "../diag";
+import {
+  parseWorkspace, buildOrder, pathProblem, Tree, resolveWorkspace, lockText, checkLock,
+} from "../package";
+
+// "CODE line" of the diagnostic for `text`, or "ok".
+function outcome(text: string): string {
+  const r = parseWorkspace(0, text);
+  if (r.isOk()) {
+    return "ok";
+  }
+  const d: Diagnostic = r.unwrapErr();
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < d.span.start && i < text.length) {
+    if (text.charAt(i) == "\n") {
+      line += 1;
+    }
+    i += 1;
+  }
+  return d.code + " " + line.toString();
+}
+
+function ws(body: string): string {
+  return "[workspace]\n" + body;
+}
+
+@Test
+function accepted(): void {
+  assertEqString(outcome(ws("members = [\"app\"]\n")), "ok", "single");
+  assertEqString(outcome(ws("members = [\"library/*\"]\n")), "ok", "glob");
+  assertEqString(
+    outcome(ws("members = [\"tooling/*\"]\nexclude = [\"tooling/vscode\"]\n")),
+    "ok",
+    "exclude",
+  );
+  assertEqString(
+    outcome(
+      ws(
+        "members = [\"compiler\"]\n\n[workspace.tools.vscode]\npath = \"tooling/vscode\"\ntype = \"npm\"\n",
+      ),
+    ),
+    "ok",
+    "npm tool",
+  );
+  assertEqString(
+    outcome(ws("members = [\"a\", \"b\"]\ndefault-members = [\"b\"]\n")),
+    "ok",
+    "defaults",
+  );
+  assertEqString(
+    outcome(
+      ws(
+        "members = [\"tooling/*\"]\nexclude = [\"tooling/vscode\"]\n\n[workspace.tools.vscode]\npath = \"tooling/vscode\"\ntype = \"npm\"\n",
+      ),
+    ),
+    "ok",
+    "excluded tool directory",
+  );
+}
+
+@Test
+function manifestShape(): void {
+  assertEqString(outcome(ws("members = [\"a\"\n")), "E0504 2", "syntax");
+  assertEqString(outcome(ws("members = [\"a\"]\nmembrs = [\"b\"]\n")), "E0504 3", "unknown key");
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.extra]\nx = \"1\"\n")),
+    "E0504 4",
+    "unknown table",
+  );
+  assertEqString(outcome(ws("exclude = [\"a\"]\n")), "E0504 1", "missing members");
+  assertEqString(outcome(ws("members = []\n")), "E0504 2", "empty members");
+  assertEqString(outcome(ws("members = \"a\"\n")), "E0504 2", "members not an array");
+  assertEqString(outcome("members = [\"a\"]\n"), "E0504 1", "key outside [workspace]");
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.tools.t]\npath = \"t\"\ntype = \"pip\"\n")),
+    "E0504 6",
+    "unknown tool type",
+  );
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.tools.t]\ntype = \"npm\"\n")),
+    "E0504 4",
+    "tool without path",
+  );
+}
+
+@Test
+function memberPaths(): void {
+  assertEqString(outcome(ws("members = [\"/abs/a\"]\n")), "E0505 2", "absolute");
+  assertEqString(outcome(ws("members = [\"../outside\"]\n")), "E0505 2", "dotdot");
+  assertEqString(outcome(ws("members = [\"library\\\\a\"]\n")), "E0505 2", "backslash");
+  assertEqString(outcome(ws("members = [\"a/\"]\n")), "E0505 2", "trailing slash");
+  assertEqString(outcome(ws("members = [\"library/**\"]\n")), "E0505 2", "deep wildcard");
+  assertEqString(outcome(ws("members = [\"lib*/a\"]\n")), "E0505 2", "inner wildcard");
+  assertEqString(
+    pathProblem("a/./b"),
+    "`.` segment (members must lie inside the workspace)",
+    "dot segment",
+  );
+  assertEqString(pathProblem("library/*"), "", "pattern ok");
+}
+
+@Test
+function duplicatesAndLayout(): void {
+  assertEqString(outcome(ws("members = [\"a\", \"a\"]\n")), "E0506 2", "duplicate path");
+  assertEqString(outcome(ws("members = [\"a\", \"a/inner\"]\n")), "E0507 2", "nested member");
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n\n[workspace.tools.ext]\npath = \"a/ext\"\ntype = \"npm\"\n")),
+    "E0507 5",
+    "tool inside member",
+  );
+  assertEqString(
+    outcome(
+      ws(
+        "members = [\"tooling/*\"]\n\n[workspace.tools.v]\npath = \"tooling/v\"\ntype = \"npm\"\n",
+      ),
+    ),
+    "ok",
+    "tool under a pattern is checked after member expansion",
+  );
+}
+
+function orderText(names: string[], deps: usize[][]): string {
+  return match (buildOrder(names, deps)) {
+    Ok(o) => o.map(i => names[i]).join(" "),
+    Err(c) => "cycle " + c.map(i => names[i]).join(" "),
+  };
+}
+
+@Test
+function order(): void {
+  assertEqString(orderText(["b", "a"], [[], []]), "a b", "ties by name");
+  assertEqString(orderText(["app", "lib"], [[1], []]), "lib app", "dependency first");
+  assertEqString(orderText(["c", "b", "a"], [[1], [2], []]), "a b c", "chain");
+  assertEqString(orderText(["a", "b"], [[1], [0]]), "cycle a b", "two-cycle");
+  assertEqString(
+    orderText(["x", "a", "b"], [[], [2], [1]]),
+    "cycle a b",
+    "cycle beside a free package",
+  );
+  assertEqBool(buildOrder([], []).isOk(), true, "empty");
+  assertEqUsize(buildOrder(["a"], [[]]).unwrap().length, 1, "one");
+}
+
+// ---- resolution (phase 2b) -------------------------------------------------------------------
+
+function pkg(name: string, deps: string): string {
+  const head = "[package]\nname = \"" + name + "\"\nentry = \"main.or\"\nversion = \"0.1.0\"\n";
+  return deps == "" ? head : head + "\n[dependencies]\n" + deps;
+}
+
+// `dirs[i]` holds `manifests[i]` ("" = no orin.toml).
+function tree(dirs: string[], manifests: string[], workspaces: string[]): Tree {
+  return Tree {
+    dirs: dirs,
+    workspaceDirs: workspaces,
+    npmDirs: [],
+    manifest: (d: string) => {
+      let i: usize = 0;
+      while (i < dirs.length) {
+        if (dirs[i] == d && manifests[i] != "") {
+          return Some(manifests[i]);
+        }
+        i += 1;
+      }
+      return None;
+    },
+  };
+}
+
+// Member directories in build order, or "CODE".
+function resolved(text: string, t: Tree): string {
+  const w = parseWorkspace(0, text);
+  if (w.isErr()) {
+    return "parse " + w.unwrapErr().code;
+  }
+  return match (resolveWorkspace(w.unwrap(), t, 1)) {
+    Ok(r) => r.order.map(i => r.members[i].dir).join(" "),
+    Err(d) => d.code,
+  };
+}
+
+@Test
+function resolution(): void {
+  const lib = pkg("lib", "");
+  const app = pkg("app", "lib = { path = \"../lib\" }\n");
+  assertEqString(
+    resolved(ws("members = [\"app\", \"lib\"]\n"), tree(["app", "lib"], [app, lib], [])),
+    "lib app",
+    "topological",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"library/*\"]\n"),
+      tree(
+        ["library", "library/b", "library/a", "library/x"],
+        ["", pkg("b", ""), pkg("a", ""), ""],
+        [],
+      ),
+    ),
+    "library/a library/b",
+    "pattern expands to directories with orin.toml, in byte order",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"tooling/*\"]\nexclude = [\"tooling/vscode\"]\n"),
+      tree(["tooling/bench", "tooling/vscode"], [pkg("bench", ""), pkg("vsc", "")], []),
+    ),
+    "tooling/bench",
+    "exclude",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"a\", \"nothing\"]\n"),
+      tree(["a", "nothing"], [pkg("a", ""), ""], []),
+    ),
+    "E0505",
+    "literal member without orin.toml",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"x\", \"y\"]\n"),
+      tree(["x", "y"], [pkg("same", ""), pkg("same", "")], []),
+    ),
+    "E0506",
+    "duplicate package name",
+  );
+  assertEqString(
+    resolved(ws("members = [\"a\"]\nexclude = [\"b\"]\n"), tree(["a"], [pkg("a", "")], [])),
+    "E0507",
+    "exclude matches nothing",
+  );
+  assertEqString(
+    resolved(ws("members = [\"a\"]\ndefault-members = [\"b\"]\n"), tree(["a"], [pkg("a", "")], [])),
+    "E0507",
+    "default not a member",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"*\"]\n"),
+      tree(["a", "a/inner"], [pkg("a", ""), pkg("inner", "")], []),
+    ),
+    "a",
+    "a pattern only takes direct children",
+  );
+  assertEqString(
+    resolved(ws("members = [\"a\"]\n"), tree(["a"], [pkg("a", "")], ["", "a"])),
+    "E0507",
+    "nested workspace",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"app\"]\n"),
+      tree(["app", "util"], [pkg("app", "util = { path = \"../util\" }\n"), pkg("util", "")], []),
+    ),
+    "E0508",
+    "path dependency to a non-member",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"a\", \"b\"]\n"),
+      tree(
+        ["a", "b"],
+        [pkg("a", "b = { path = \"../b\" }\n"), pkg("b", "a = { path = \"../a\" }\n")],
+        [],
+      ),
+    ),
+    "E0508",
+    "dependency cycle",
+  );
+}
+
+@Test
+function lockfile(): void {
+  const t = tree(["app", "lib"], [pkg("app", "lib = { path = \"../lib\" }\n"), pkg("lib", "")], []);
+  const r = resolveWorkspace(
+    parseWorkspace(0, ws("members = [\"app\", \"lib\"]\n")).unwrap(),
+    t,
+    1,
+  ).unwrap();
+  const lock = lockText(r);
+  assertEqBool(checkLock(r, 9, lock).isNone(), true, "fresh lock accepted");
+  const stale = lock.split("version = \"0.1.0\"").join("version = \"0.0.9\"");
+  assertEqString(checkLock(r, 9, stale).unwrap().code, "E0509", "changed version");
+  const missing = "[member.lib]\npath = \"lib\"\nversion = \"0.1.0\"\ndependencies = []\n";
+  assertEqString(checkLock(r, 9, missing).unwrap().code, "E0509", "member missing");
+  assertEqString(
+    checkLock(r, 9, lock + "\n[member.ghost]\npath = \"g\"\n").unwrap().code,
+    "E0509",
+    "unknown member",
+  );
+}
+
+@Test
+function resolutionRegressions(): void {
+  assertEqString(
+    resolved(ws("members = [\"*\"]\n"), tree(["a", "b"], [pkg("same", ""), pkg("same", "")], [])),
+    "E0506",
+    "root wildcard duplicate reports rather than traps",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"library/*\"]\nexclude = [\"library/*\"]\n"),
+      tree(["library/a"], [pkg("a", "")], []),
+    ),
+    "",
+    "wildcard exclusions expand consistently",
+  );
+  assertEqString(
+    resolved(ws("members = [\"nested/a\"]\n"), tree(["nested/a"], [pkg("a", "")], ["nested"])),
+    "E0507",
+    "member cannot cross nested workspace boundary",
+  );
+  assertEqString(
+    outcome(ws("members = [\"a\"]\n[workspace.tools.editor]\npath = \"a\"\ntype = \"npm\"\n")),
+    "E0507 4",
+    "tool cannot equal a member",
+  );
+  const base = tree(["library/a", "library/editor"], [pkg("a", ""), ""], []);
+  const text = ws(
+    "members = [\"library/*\"]\n[workspace.tools.editor]\npath = \"library/editor\"\ntype = \"npm\"\n",
+  );
+  assertEqString(resolved(text, base), "E0507", "missing native tool manifest rejected");
+  const tools = Tree {
+    dirs: base.dirs,
+    workspaceDirs: [],
+    npmDirs: ["library/editor"],
+    manifest: base.manifest,
+  };
+  assertEqString(resolved(text, tools), "library/a", "nonmember npm tool under wildcard accepted");
+}
+
+@Test
+function escapedLockfile(): void {
+  const dir = "a\"b";
+  const manifest = "[package]\nname = \"a.b\\\"c\\\\d\\ne\\tf\\rg\"\nentry = \"main.or\"\nversion = \"v\\\"1\\\\2\\n3\"\n";
+  const r = resolveWorkspace(
+    parseWorkspace(0, ws("members = ['a\"b']\n")).unwrap(),
+    tree([dir], [manifest], []),
+    1,
+  ).unwrap();
+  assertEqBool(
+    checkLock(r, 9, lockText(r)).isNone(),
+    true,
+    "all accepted TOML string escapes round trip",
+  );
+  const spaced = resolveWorkspace(
+    parseWorkspace(0, ws("members = [\"app\", \"lib\"]\n")).unwrap(),
+    tree(["app", "lib"], [pkg("app", "lib = { path = \"../lib\" }\n"), pkg("a b", "")], []),
+    1,
+  ).unwrap();
+  const stale = lockText(spaced)
+      .split("dependencies = [\"a b\"]")
+      .join("dependencies = [\"a\", \"b\"]");
+  assertEqBool(
+    checkLock(spaced, 9, stale).isSome(),
+    true,
+    "dependency arrays compared element by element",
+  );
+}

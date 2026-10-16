@@ -1561,6 +1561,65 @@ int64_t orin_fs_exists(int64_t gh, OrinObj *path) {
     return scoped ? orin_platform_file_exists(eff, strlen_(eff)) : orin_platform_file_exists(p->data, p->len);
 }
 
+/* listDir: the entries in byte order, subdirectories with a trailing '/'; [] when the directory cannot be read. A
+ * refused query traps, like exists. */
+typedef struct { OrinObj **items; size_t n, cap; int oom; } DirAcc;
+
+static void dir_collect(void *ctx, const char *name, size_t len, int is_dir) {
+    DirAcc *a = (DirAcc *)ctx;
+    if (a->oom) return;
+    if (a->n == a->cap) {
+        size_t nc = a->cap ? a->cap * 2 : 16;
+        OrinObj **ni = (OrinObj **)orin_platform_alloc(nc * sizeof(OrinObj *));
+        if (!ni) { a->oom = 1; return; }
+        for (size_t i = 0; i < a->n; i++) ni[i] = a->items[i];
+        if (a->items) orin_platform_free(a->items);
+        a->items = ni;
+        a->cap = nc;
+    }
+    char *buf = (char *)orin_platform_alloc(len + 2);
+    if (!buf) { a->oom = 1; return; }
+    orin_platform_mem_copy(buf, name, len);
+    if (is_dir) buf[len++] = '/';
+    a->items[a->n++] = orin_str_new(buf, len);
+    orin_platform_free(buf);
+}
+
+static int str_before(OrinObj *x, OrinObj *y) {
+    OrinString *a = (OrinString *)x, *b = (OrinString *)y;
+    size_t n = a->len < b->len ? a->len : b->len;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char p = (unsigned char)a->data[i], q = (unsigned char)b->data[i];
+        if (p != q) return p < q;
+    }
+    return a->len < b->len;
+}
+
+OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
+    OrinString *p = (OrinString *)path;
+    char eff[CAP_PATH + 1];
+    int scoped, den = fs_check(gh, 0, path, eff, &scoped);
+    if (den) trap_denied(GK_FS, "listDir", den_text(den));
+    DirAcc a = {NULL, 0, 0, 0};
+    int rc = scoped ? orin_platform_dir_list(eff, strlen_(eff), dir_collect, &a)
+                    : orin_platform_dir_list(p->data, p->len, dir_collect, &a);
+    if (a.oom || rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
+    if (rc) { /* Never return an apparently complete listing after a partial enumeration. */
+        for (size_t i = 0; i < a.n; i++) orin_release(a.items[i]);
+        a.n = 0;
+    }
+    for (size_t i = 1; i < a.n; i++) { /* insertion sort: directories are small */
+        OrinObj *x = a.items[i];
+        size_t j = i;
+        while (j > 0 && str_before(x, a.items[j - 1])) { a.items[j] = a.items[j - 1]; j--; }
+        a.items[j] = x;
+    }
+    OrinObj *arr = orin_array_new((uint64_t)a.n, 1);
+    for (size_t i = 0; i < a.n; i++) orin_array_push(arr, ORIN_SLOT(a.items[i]));
+    if (a.items) orin_platform_free(a.items);
+    return arr;
+}
+
 /* ---------------------------------------------------------------- file resources (ADR-0025) */
 
 enum { FILE_SLOTS = 256 };

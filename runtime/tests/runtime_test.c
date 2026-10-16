@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include <unistd.h>
 
 static int failures;
@@ -225,6 +227,91 @@ static void t_nospawn_timeout(void) { (void)orin_io_shell_timeout(orin_cap_narro
 static void t_nospawn(void) { (void)orin_io_shell(orin_cap_narrow(orin_cap_acquire(g_host, 2), 2, S("")), S("true")); }
 static void t_scope_exists(void) { (void)orin_fs_exists(orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in")), S("/etc")); }
 
+static void t_list_forged(void) { (void)orin_fs_list_dir(0x12345, S("/")); }
+static void t_list_wrong_kind(void) { (void)orin_fs_list_dir(orin_cap_acquire(g_host, 2), S("/")); }
+static void t_list_stale(void) {
+    int64_t g = orin_cap_acquire(g_host, 1);
+    orin_cap_revoke(g);
+    (void)orin_fs_list_dir(g, S("/"));
+}
+static void t_list_denied(void) { (void)orin_fs_list_dir(g_fs, S("/")); }
+static void t_list_scope(void) {
+    (void)orin_fs_list_dir(orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in")), S("/tmp/orin_rt_scope/out"));
+}
+static void t_list_escape(void) {
+    (void)orin_fs_list_dir(orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in")), S("/tmp/orin_rt_scope/in/esc"));
+}
+
+static void test_list_dir(void) {
+    int64_t baseline = orin_live_count();
+    char directory[] = "/tmp/orin_rt_listing_XXXXXX", path[128];
+    CHECK(mkdtemp(directory) != NULL);
+    unsetenv("ORIN_DENY");
+    int64_t host = orin_cap_host_root(), fs = orin_cap_acquire(host, 1);
+    OrinObj *dir = S(directory);
+    OrinObj *entries = orin_fs_list_dir(fs, dir);
+    CHECK(orin_array_len(entries) == 0);
+    orin_release(entries);
+    const char *files[] = {"a.", "Aa", ".hidden", "a0", "\303\251"};
+    for (size_t i = 0; i < sizeof files / sizeof *files; i++) {
+        snprintf(path, sizeof path, "%s/%s", directory, files[i]);
+        FILE *f = fopen(path, "wb");
+        CHECK(f != NULL);
+        if (f) CHECK(fclose(f) == 0);
+    }
+    const char *dirs[] = {"a-", "a"};
+    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+        snprintf(path, sizeof path, "%s/%s", directory, dirs[i]);
+        CHECK(mkdir(path, 0700) == 0);
+    }
+    snprintf(path, sizeof path, "%s/loop", directory);
+    CHECK(symlink(".", path) == 0);
+    snprintf(path, sizeof path, "%s/dangling", directory);
+    CHECK(symlink("absent", path) == 0);
+    const char *expected[] = {".hidden", "Aa", "a-/", "a.", "a/", "a0", "dangling", "loop", "\303\251"};
+    int64_t live = orin_live_count();
+    for (int round = 0; round < 64; round++) {
+        entries = orin_fs_list_dir(fs, dir);
+        CHECK(orin_array_len(entries) == sizeof expected / sizeof *expected);
+        for (size_t i = 0; i < orin_array_len(entries) && i < sizeof expected / sizeof *expected; i++)
+            CHECK(streq(ORIN_REF(orin_array_at(entries, i)), expected[i]));
+        orin_release(entries);
+        CHECK(orin_live_count() == live);
+    }
+    int64_t scoped = orin_cap_narrow(fs, 0, dir), ro = orin_cap_narrow(scoped, 1, NULL);
+    entries = orin_fs_list_dir(ro, dir);
+    CHECK(orin_array_len(entries) == sizeof expected / sizeof *expected);
+    orin_release(entries);
+    snprintf(path, sizeof path, "%s/absent", directory);
+    entries = orin_fs_list_dir(fs, S(path));
+    CHECK(orin_array_len(entries) == 0);
+    orin_release(entries);
+    snprintf(path, sizeof path, "%s/a.", directory);
+    entries = orin_fs_list_dir(fs, S(path));
+    CHECK(orin_array_len(entries) == 0);
+    orin_release(entries);
+    entries = orin_fs_list_dir(fs, lit_nul);
+    CHECK(orin_array_len(entries) == 0);
+    orin_release(entries);
+    /* Root can read mode-000 directories; only assert permission refusal for ordinary users. */
+    if (geteuid() != 0) {
+        CHECK(chmod(directory, 0) == 0);
+        entries = orin_fs_list_dir(fs, dir);
+        CHECK(orin_array_len(entries) == 0);
+        orin_release(entries);
+        CHECK(chmod(directory, 0700) == 0);
+    }
+    for (size_t i = 0; i < sizeof expected / sizeof *expected; i++) {
+        snprintf(path, sizeof path, "%s/%s", directory, expected[i]);
+        if (expected[i][strlen(expected[i]) - 1] == '/') CHECK(rmdir(path) == 0);
+        else CHECK(unlink(path) == 0);
+    }
+    CHECK(rmdir(directory) == 0);
+    orin_cap_revoke(ro); orin_cap_revoke(scoped); orin_cap_revoke(fs); orin_cap_revoke(host);
+    while (nkeep) orin_release(keep[--nkeep]);
+    CHECK(orin_live_count() == baseline);
+}
+
 static void test_grants(void) {
     unsetenv("ORIN_DENY");
     g_host = orin_cap_host_root();
@@ -234,6 +321,7 @@ static void test_grants(void) {
     CHECK(trap_code(t_clock_ok) == 0);
     CHECK(trap_code(t_nospawn) == 101);
     CHECK(trap_code(t_nospawn_timeout) == 101);
+    CHECK(trap_code(t_list_forged) == 101 && trap_code(t_list_wrong_kind) == 101 && trap_code(t_list_stale) == 101);
     CHECK(system("rm -rf /tmp/orin_rt_scope && mkdir -p /tmp/orin_rt_scope/in /tmp/orin_rt_scope/out && "
                  "echo hi > /tmp/orin_rt_scope/in/a.txt && echo secret > /tmp/orin_rt_scope/out/s.txt && "
                  "ln -s ../out /tmp/orin_rt_scope/in/esc") == 0);
@@ -268,6 +356,7 @@ static void test_grants(void) {
     /* relative scopes resolve against the working directory */
     CHECK(system("mkdir -p /tmp/orin_rt_scope/rel") == 0);
     CHECK(trap_code(t_scope_exists) == 101);
+    CHECK(trap_code(t_list_scope) == 101 && trap_code(t_list_escape) == 101);
     orin_cap_revoke(ro); orin_cap_revoke(disjoint); orin_cap_revoke(wide); orin_cap_revoke(in);
     CHECK(system("rm -rf /tmp/orin_rt_scope") == 0);
     /* host policy: families named in ORIN_DENY are refused (re-read by orin_cap_host_root) */
@@ -278,6 +367,7 @@ static void test_grants(void) {
     CHECK(orin_tag(d) == 1 && streq(ORIN_REF(orin_res_unwrap_err(d)), "cannot read '/etc/passwd': denied by the host policy (ORIN_DENY)"));
     CHECK(orin_file_open(g_fs, S("/etc/passwd"), 0) == -100001);
     CHECK(trap_code(t_denied_exists) == 101 && trap_code(t_denied_args) == 101);
+    CHECK(trap_code(t_list_denied) == 101);
     CHECK(trap_code(t_clock_ok) == 0); /* clock is not denied */
     unsetenv("ORIN_DENY");
     while (nkeep) orin_release(keep[--nkeep]);
@@ -509,6 +599,7 @@ int main(int argc, char **argv) {
     test_shape_traps();
     test_empty_byte_strings();
     test_bulk();
+    test_list_dir();
     test_grants();
     test_net_handles();
     if (failures) return 1;

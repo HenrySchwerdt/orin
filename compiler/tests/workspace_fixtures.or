@@ -1,0 +1,124 @@
+// Execute the on-disk workspace fixtures against the parser, resolver and lock checker.
+import { Host, useFs } from "std:host";
+import { FsGrant, readFile, exists, listDir } from "std:fs";
+import { assert, assertEqString } from "std:test";
+import { Diagnostic, SourceFile } from "../diag";
+import { parseWorkspace, Tree, resolveWorkspace, checkLock } from "../package";
+
+function directories(fs: FsGrant, root: string): string[] {
+  let dirs: string[] = [];
+  let todo: string[] = [""];
+  while (todo.length > 0) {
+    const parent = todo.pop().unwrap();
+    for (const entry of listDir(fs, root + (parent == "" ? "" : "/" + parent))) {
+      if (entry.endsWith("/")) {
+        const name = entry.substring(0, entry.length - 1);
+        const dir = parent == "" ? name : parent + "/" + name;
+        dirs.push(dir);
+        todo.push(dir);
+      }
+    }
+  }
+  return dirs;
+}
+
+function diagnosticText(files: SourceFile[], d: Diagnostic): string {
+  assert(d.span.file < files.length, "diagnostic references a known fixture source");
+  const text = files[d.span.file].text;
+  assert(d.span.start <= text.length, "diagnostic offset lies inside its own source");
+  let line: usize = 1;
+  let i: usize = 0;
+  while (i < d.span.start) {
+    if (text.charAt(i) == "\n") {
+      line += 1;
+    }
+    i += 1;
+  }
+  return d.code + " " + line.toString();
+}
+
+function outcome(fs: FsGrant, root: string): string {
+  const text = readFile(fs, root + "/orin-workspace.toml").unwrap();
+  let files: SourceFile[] = [SourceFile { path: root + "/orin-workspace.toml", text: text }];
+  const parsed = parseWorkspace(0, text);
+  if (parsed.isErr()) {
+    return diagnosticText(files, parsed.unwrapErr());
+  }
+  const dirs = directories(fs, root);
+  let manifests: Option<string>[] = [];
+  let workspaceDirs: string[] = [];
+  let npmDirs: string[] = [];
+  for (const dir of dirs) {
+    const path = root + "/" + dir;
+    const manifest = readFile(fs, path + "/orin.toml");
+    manifests.push(manifest.isOk() ? Some(manifest.unwrap()) : None);
+    files.push(SourceFile {
+      path: path + "/orin.toml",
+      text: manifest.isOk() ? manifest.unwrap() : "",
+    });
+    if (exists(fs, path + "/orin-workspace.toml")) {
+      workspaceDirs.push(dir);
+    }
+    if (exists(fs, path + "/package.json")) {
+      npmDirs.push(dir);
+    }
+  }
+  const tree = Tree {
+    dirs: dirs,
+    workspaceDirs: workspaceDirs,
+    npmDirs: npmDirs,
+    manifest: (dir: string) => {
+      let i: usize = 0;
+      while (i < dirs.length) {
+        if (dirs[i] == dir) {
+          return manifests[i];
+        }
+        i += 1;
+      }
+      return None;
+    },
+  };
+  const resolved = resolveWorkspace(parsed.unwrap(), tree, 1);
+  if (resolved.isErr()) {
+    return diagnosticText(files, resolved.unwrapErr());
+  }
+  const r = resolved.unwrap();
+  if (exists(fs, root + "/orin.lock")) {
+    const lock = readFile(fs, root + "/orin.lock").unwrap();
+    const file = files.length;
+    files.push(SourceFile { path: root + "/orin.lock", text: lock });
+    const problem = checkLock(r, file, lock);
+    if (problem.isSome()) {
+      return diagnosticText(files, problem.unwrap());
+    }
+  }
+  return r.order.map(i => r.members[i].name).join("\n");
+}
+
+function fixtures(fs: FsGrant, group: string): usize {
+  const base = "tests/workspace/" + group;
+  let count: usize = 0;
+  for (const entry of listDir(fs, base)) {
+    if (!entry.endsWith("/")) {
+      continue;
+    }
+    const root = base + "/" + entry.substring(0, entry.length - 1);
+    const expected = readFile(fs, root + "/expected.txt").unwrap().trim();
+    assert(expected != "", root + " has a nonempty expectation");
+    assertEqString(outcome(fs, root), expected, root);
+    console.log("PASS " + root);
+    count += 1;
+  }
+  assert(count > 0, base + " must contain fixture directories");
+  return count;
+}
+
+function main(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const count = fixtures(fs, "ok") + fixtures(fs, "fail");
+      console.log("workspace fixtures passed: " + count.toString());
+    },
+  );
+}
