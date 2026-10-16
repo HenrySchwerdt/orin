@@ -24,10 +24,7 @@
 // Violations are E0416; the message names the impure operation and its location.
 
 import { Span, Diagnostic, SourceMap, diag, describeSpan } from "../diag";
-import {
-  Function, HBlock, HStmt, HExpr, HExprKind, Builtin, Place, PlaceElem, HArm, FieldInitH,
-  HLet, HAssign, HExprStmt, HIf, HWhile, HForOf, HBreak, HContinue, HReturn, HBlockStmt
-} from "../hir";
+import { Function, HExpr, Builtin, foldExpr, foldBlock } from "../hir";
 
 // One call (or closure creation) found in a body.
 type Call = { callee: usize; span: Span; args: HExpr[]; };
@@ -105,25 +102,6 @@ export function isIoBuiltin(b: Builtin): bool {
   return ioName(b) != "";
 }
 
-function scanExprs(es: HExpr[], s0: Scan): Scan {
-  let s = s0;
-  for (const e of es) {
-    s = scanExpr(e, s);
-  }
-  return s;
-}
-
-function scanPlace(p: Place, s0: Scan): Scan {
-  let s = s0;
-  for (const el of p.path) {
-    match (el) {
-      PIndex(ix) => { s = scanExpr(ix, s); },
-      _ => {}
-    }
-  }
-  return s;
-}
-
 function hasUsize(xs: usize[], k: usize): bool {
   for (const x of xs) {
     if (x == k) {
@@ -148,77 +126,28 @@ function markUnknown(s0: Scan, what: string, sp: Span): Scan {
   return s;
 }
 
-function scanExpr(e: HExpr, s0: Scan): Scan {
+// What one node contributes to the scan; the traversal (hir/walk.or) visits the children afterwards, in the same order.
+function scanNode(e: HExpr, s0: Scan): Scan {
   let s = s0;
   match (e.kind) {
-    XUnary(_, x) => { s = scanExpr(x, s); },
-    XBinary(_, a, b) => {
-      s = scanExpr(a, s);
-      s = scanExpr(b, s);
-    },
-    XCall(id, args) => {
-      s = addCall(s, id, e.span, args);
-      s = scanExprs(args, s);
-    },
-    XBuiltin(b, args) => {
+    XCall(id, args) => { s = addCall(s, id, e.span, args); },
+    XBuiltin(b, _) => {
       const n = ioName(b);
       if (n != "" && s.io == "") {
         s.io = n;
         s.ioSpan = e.span;
       }
-      s = scanExprs(args, s);
     },
-    XMutMethod(_, place, args) => {
+    XMutMethod(_, _, _) => {
       if (!s.mut) {
         s.mut = true;
         s.mutSpan = e.span;
       }
-      s = scanPlace(place, s);
-      s = scanExprs(args, s);
     },
-    XField(b, _, _) => { s = scanExpr(b, s); },
-    XIndex(a, b) => {
-      s = scanExpr(a, s);
-      s = scanExpr(b, s);
-    },
-    XRecord(_, spread, fields) => {
-      match (spread) {
-        Some(x) => { s = scanExpr(x, s); },
-        None => {}
-      }
-      for (const f of fields) {
-        s = scanExpr(f.value, s);
-      }
-    },
-    XVariant(_, args) => { s = scanExprs(args, s); },
-    XArray(xs) => { s = scanExprs(xs, s); },
-    XTry(x) => { s = scanExpr(x, s); },
-    XCond(a, b, c) => {
-      s = scanExpr(a, s);
-      s = scanExpr(b, s);
-      s = scanExpr(c, s);
-    },
-    XMatch(x, arms) => {
-      s = scanExpr(x, s);
-      for (const a of arms) {
-        s = scanBlock(a.body, s);
-        match (a.value) {
-          Some(v) => { s = scanExpr(v, s); },
-          None => {}
-        }
-      }
-    },
-    XClosure(fid, caps) => {
-      s = addCall(s, fid, e.span, []);
-      s = scanExprs(caps, s);
-    },
-    XIface(_, v) => { s = scanExpr(v, s); },
-    XCallVirtual(r, _, args) => {
-      s = markUnknown(s, "call of an interface method", e.span);
-      s = scanExpr(r, s);
-      s = scanExprs(args, s);
-    },
-    XCallIndirect(c, args) => {
+    XClosure(fid, _) => { s = addCall(s, fid, e.span, []); },
+    XCallVirtual(_, _, _) => { s = markUnknown(s, "call of an interface method", e.span); },
+    XCallIndirect(c, _) => {
+      // a call of a parameter applies it; the callee expression is then a plain local, nothing to scan
       match (c.kind) {
         XLocal(k) => {
           if (k < s.nparams) {
@@ -229,59 +158,10 @@ function scanExpr(e: HExpr, s0: Scan): Scan {
             s = markUnknown(s, "call through a function value", e.span);
           }
         },
-        XClosure(_, _) => { s = scanExpr(c, s); },
-        _ => {
-          s = markUnknown(s, "call through a function value", e.span);
-          s = scanExpr(c, s);
-        }
-      }
-      s = scanExprs(args, s);
-    },
-    _ => {}
-  }
-  return s;
-}
-
-function scanBlock(b: HBlock, s0: Scan): Scan {
-  let s = s0;
-  for (const st of b.stmts) {
-    s = scanStmt(st, s);
-  }
-  return s;
-}
-
-function scanStmt(st: HStmt, s0: Scan): Scan {
-  let s = s0;
-  match (st) {
-    HLet(_, e) => { s = scanExpr(e, s); },
-    HAssign(p, _, e) => {
-      s = scanPlace(p, s);
-      s = scanExpr(e, s);
-    },
-    HExprStmt(e) => { s = scanExpr(e, s); },
-    HIf(c, t, el) => {
-      s = scanExpr(c, s);
-      s = scanBlock(t, s);
-      match (el) {
-        Some(b) => { s = scanBlock(b, s); },
-        None => {}
+        XClosure(_, _) => {},
+        _ => { s = markUnknown(s, "call through a function value", e.span); }
       }
     },
-    HWhile(c, b) => {
-      s = scanExpr(c, s);
-      s = scanBlock(b, s);
-    },
-    HForOf(_, it, b) => {
-      s = scanExpr(it, s);
-      s = scanBlock(b, s);
-    },
-    HReturn(o) => {
-      match (o) {
-        Some(e) => { s = scanExpr(e, s); },
-        None => {}
-      }
-    },
-    HBlockStmt(b) => { s = scanBlock(b, s); },
     _ => {}
   }
   return s;
@@ -298,7 +178,7 @@ function emptyScan(sp: Span, nparams: usize): Scan {
 // Functions called or closed over by `f` (with repeats).
 export function callTargets(f: Function): usize[] {
   let out: usize[] = [];
-  for (const c of scanBlock(f.body, emptyScan(f.span, f.paramCount)).calls) {
+  for (const c of foldBlock(f.body, emptyScan(f.span, f.paramCount), scanNode).calls) {
     out.push(c.callee);
   }
   return out;
@@ -363,7 +243,7 @@ export function inferPurity(funcs: Function[], roots: usize[]): Purity {
     }
     p.reached[k] = true;
     order.push(k);
-    const sc = scanBlock(funcs[k].body, emptyScan(funcs[k].span, funcs[k].paramCount));
+    const sc = foldBlock(funcs[k].body, emptyScan(funcs[k].span, funcs[k].paramCount), scanNode);
     scans[k] = sc;
     p.applied[k] = sc.applied;
     for (const c of sc.calls) {
@@ -474,7 +354,7 @@ export function purityDiags(sm: SourceMap, funcs: Function[], exprs: HExpr[]): D
   let scans: Scan[] = [];
   let roots: usize[] = [];
   for (const e of exprs) {
-    const s = scanExpr(e, emptyScan(e.span, 0));
+    const s = foldExpr(e, emptyScan(e.span, 0), scanNode);
     for (const c of s.calls) {
       roots.push(c.callee);
     }
