@@ -91,6 +91,39 @@ def badOpenHole : Prog :=
   { n := 3, params := [],
     code := .op (.alloc 0 0) <| Code.structNew 1 [0] <| .op (.takeField 2 1 0) .nil }
 
+/-- an array of length `l0`: write element `l2 := 0`, read it back, read the length -/
+def exArray : Prog :=
+  { n := 6, params := [false],
+    code :=
+      .op (.arrayNew 1 0) <|
+      .op (.const 2 0) <|
+      .op (.const 3 7) <|
+      .op (.arraySet 1 2 3) <|
+      .op (.arrayGet 4 1 2 false) <|
+      .op (.arrayLen 5 1) <|
+      .op (.release 1) .nil }
+
+/-- array store through a shared (duplicated) array -/
+def badArraySetShared : Prog :=
+  { n := 5, params := [false],
+    code := .op (.arrayNew 1 0) <| .op (.dup 2 1) <| .op (.const 3 0) <| .op (.const 4 0) <|
+      .op (.arraySet 1 3 4) .nil }
+
+/-- the index must be an initialised scalar -/
+def badArrayIndexRef : Prog :=
+  { n := 4, params := [false],
+    code := .op (.arrayNew 1 0) <| .op (.alloc 2 0) <| .op (.arrayGet 3 1 2 false) .nil }
+
+/-- reading an element of an array after it was released -/
+def badArrayAfterRelease : Prog :=
+  { n := 4, params := [false],
+    code := .op (.arrayNew 1 0) <| .op (.const 2 0) <| .op (.release 1) <|
+      .op (.arrayGet 3 1 2 false) .nil }
+
+example : check exArray = true := by decide
+example : check badArraySetShared = false := by decide
+example : check badArrayIndexRef = false := by decide
+example : check badArrayAfterRelease = false := by decide
 example : check exBorrowDup = true := by decide
 example : check badMakeUniqueBorrowed = false := by decide
 example : check badStoreIntoParam = false := by decide

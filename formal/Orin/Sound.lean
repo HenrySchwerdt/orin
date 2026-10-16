@@ -1,4 +1,4 @@
-import Orin.Weaken
+import Orin.SimArr
 
 /-!
 # Soundness of the ownership checker
@@ -133,6 +133,10 @@ theorem sound_step_nopending {a : AState} {code : Code} (hC : Cont np a code) :
       | takeField d x j => exact op_takeField hI hL
       | putField x j y => exact op_putField hI hL
       | makeUnique x => exact op_makeUnique hI hL
+      | arrayLen d x => exact op_arrayLen hI hL
+      | arrayGet d x i r => exact op_arrayGet hI hL
+      | arraySet x i v => exact op_arraySet hI hL
+      | arrayNew d nl => exact op_arrayNew hI hL
     exact opsafe_step (r := mop s i) key hk
   | @ite a c t e k hc hinit hT hE ihT ihE =>
     intro s hI hp

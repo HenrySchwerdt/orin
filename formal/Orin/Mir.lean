@@ -48,6 +48,16 @@ inductive MI where
   | putField (x i s : Nat)
   /-- `IMakeUnique x` -/
   | makeUnique (x : Nat)
+  /-- `IArrayLen d a`: `d` receives the length of the array (the number of slots) -/
+  | arrayLen (d a : Nat)
+  /-- `IArrayGet d a i`: bounds-checked element read; the index is the scalar local `i`
+  (`getField` with a run-time index; out of range = `trap`) -/
+  | arrayGet (d a i : Nat) (isRef : Bool)
+  /-- `IArraySet x i v`: bounds-checked in-place element store (`setField` with a run-time index) -/
+  | arraySet (x i v : Nat)
+  /-- `IArrayNew d nl`: fresh count-1 array of `n` zero elements, `n` the scalar local `nl`
+  (a negative length traps) -/
+  | arrayNew (d nl : Nat)
 
 /-- Structured code: straight line, with if/else and a continuation after the join. -/
 inductive Code where
@@ -160,6 +170,60 @@ def opTakeField (s : St) (d x i : Nat) : Res St :=
                   heap := s.heap.setObj l { ob with fields := ob.fields.set i (.int 0) } }
   else .ill
 
+/-- Array access with a run-time index: a negative index is a `trap` and never a `bad`; the
+array itself is inspected first (a dead array is `bad dead`, a scalar is `ill`), then the bounds
+check fires. -/
+def opArrayGet (s : St) (d a i : Nat) (isRef : Bool) : Res St :=
+  if i < s.locals.length then
+    match s.get i with
+    | .ref _ => .ill
+    | .int n =>
+      if 0 ≤ n then opGetField s d a n.toNat isRef
+      else if d < s.locals.length ∧ a < s.locals.length then
+        match s.get a with
+        | .int _ => .ill
+        | .ref l =>
+          match s.heap.objs l with
+          | none => .bad .dead
+          | some _ => .trap
+      else .ill
+  else .ill
+
+def opArraySet (s : St) (x i v : Nat) : Res St :=
+  if i < s.locals.length then
+    match s.get i with
+    | .ref _ => .ill
+    | .int n =>
+      if 0 ≤ n then opSetField s x n.toNat v
+      else if x < s.locals.length ∧ v < s.locals.length then
+        match s.get x with
+        | .int _ => .ill
+        | .ref l =>
+          match s.heap.objs l with
+          | none => .bad .dead
+          | some ob => if ob.rc ≠ 1 then .bad .shared else .trap
+      else .ill
+  else .ill
+
+def opArrayLen (s : St) (d a : Nat) : Res St :=
+  if d < s.locals.length ∧ a < s.locals.length then
+    match s.get a with
+    | .int _ => .ill
+    | .ref l =>
+      match s.heap.objs l with
+      | none => .bad .dead
+      | some ob => .ok (s.setL d (.int ob.fields.length))
+  else .ill
+
+def opArrayNew (s : St) (d nl : Nat) : Res St :=
+  if nl < s.locals.length then
+    match s.get nl with
+    | .ref _ => .ill
+    | .int n =>
+      if 0 ≤ n then opAllocN s d n.toNat
+      else if d < s.locals.length then .trap else .ill
+  else .ill
+
 def Res.liftC (rest : Code) : Res St → Res (Code × St)
   | .ok s' => .ok (rest, s')
   | .trap => .trap
@@ -179,6 +243,10 @@ def mop (s : St) : MI → Res St
   | .takeField d x j => opTakeField s d x j
   | .putField x j y => opSetField s x j y
   | .makeUnique x => opMakeUnique s x
+  | .arrayLen d a => opArrayLen s d a
+  | .arrayGet d a i r => opArrayGet s d a i r
+  | .arraySet x i v => opArraySet s x i v
+  | .arrayNew d nl => opArrayNew s d nl
 
 def mexec (i : MI) (rest : Code) (s : St) : Res (Code × St) :=
   Res.liftC rest (mop s i)

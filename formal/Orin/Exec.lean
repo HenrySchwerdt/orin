@@ -14,6 +14,7 @@ Input format (one token group per line, `#` starts a comment line):
     const D | move D S | borrow D S | dup D S | release X
     structNew D Y*          getField D O I r|s   (r: D is a reference local, s: a scalar)
     setField X I V | takeField D X I | putField X I S | makeUnique X
+    arrayLen D A | arrayGet D A I r|s | arraySet X I V | arrayNew D N   (index/length are scalar locals)
     if C / else / end       structured branch; the code after `end` is the continuation
     endprog
 
@@ -36,6 +37,10 @@ def describe : MI → String
   | .takeField d x i => s!"takeField l{d} <- l{x}.{i}"
   | .putField x i s => s!"putField l{x}.{i} <- l{s}"
   | .makeUnique x => s!"makeUnique l{x}"
+  | .arrayLen d a => s!"arrayLen l{d} <- l{a}"
+  | .arrayGet d a i _ => s!"arrayGet l{d} <- l{a}[l{i}]"
+  | .arraySet x i v => s!"arraySet l{x}[l{i}] <- l{v}"
+  | .arrayNew d n => s!"arrayNew l{d} len l{n}"
 
 /-- Same shape as `chk`, but names the first rejected instruction.  Uses `stepA`/`joinS`. -/
 def diag (np : Nat) : AState → Code → Except String AState
@@ -119,6 +124,13 @@ def instr (ps : PS) : List String → Except String PS
   | ["takeField", d, x, i] => do return addOp ps (.takeField (← nat d) (← nat x) (← nat i))
   | ["putField", x, i, s] => do return addOp ps (.putField (← nat x) (← nat i) (← nat s))
   | ["makeUnique", x] => do return addOp ps (.makeUnique (← nat x))
+  | ["arrayLen", d, a] => do return addOp ps (.arrayLen (← nat d) (← nat a))
+  | ["arrayGet", d, a, i, c] => do
+      let r ← (if c == "r" then pure true else if c == "s" then pure false
+               else throw s!"bad class '{c}'")
+      return addOp ps (.arrayGet (← nat d) (← nat a) (← nat i) r)
+  | ["arraySet", x, i, v] => do return addOp ps (.arraySet (← nat x) (← nat i) (← nat v))
+  | ["arrayNew", d, n] => do return addOp ps (.arrayNew (← nat d) (← nat n))
   | ["if", c] => do
       return { ps with frames := ⟨← nat c, none, ps.cur⟩ :: ps.frames, cur := [] }
   | ["else"] =>

@@ -98,6 +98,22 @@ def consume (a : List AS) (v : Nat) : Option (List AS) :=
     | _ => none
   else none
 
+/-- `IGetField` / `IArrayGet` rule. -/
+def stepGet (np : Nat) (a : List AS) (d o : Nat) (r : Bool) : Option (List AS) :=
+  if d < a.length ∧ o < a.length ∧ np ≤ d ∧ (gk a o).isRef then
+    if r then
+      (if rootOf a o ≠ d then some (defK a d (.borrowed (rootOf a o))) else none)
+    else some (defK a d .init)
+  else none
+
+/-- `ISetField` / `IPutField` / `IArraySet` rule. -/
+def stepSet (a : List AS) (x v : Nat) : Option (List AS) :=
+  if x < a.length ∧ x ≠ v ∧ gk a x = .unique then (consume a v).map (killB x) else none
+
+/-- `IArrayNew` / `alloc` rule. -/
+def stepAlloc (np : Nat) (a : List AS) (d : Nat) : Option (List AS) :=
+  if d < a.length ∧ np ≤ d then some (defK a d .unique) else none
+
 /-- Kind transfer function (one rule per instruction of `docs/mir.md`). `np` = number of
 parameters (never redefined). -/
 def stepL (np : Nat) (a : List AS) : MI → Option (List AS)
@@ -117,24 +133,21 @@ def stepL (np : Nat) (a : List AS) : MI → Option (List AS)
     else none
   | .release x =>
     if x < a.length ∧ (gk a x).counted then some (killK a x) else none
-  | .alloc d _ =>
-    if d < a.length ∧ np ≤ d then some (defK a d .unique) else none
-  | .getField d o _ r =>
-    if d < a.length ∧ o < a.length ∧ np ≤ d ∧ (gk a o).isRef then
-      if r then
-        (if rootOf a o ≠ d then some (defK a d (.borrowed (rootOf a o))) else none)
-      else some (defK a d .init)
-    else none
-  | .setField x _ v =>
-    if x < a.length ∧ x ≠ v ∧ gk a x = .unique then (consume a v).map (killB x) else none
+  | .alloc d _ => stepAlloc np a d
+  | .getField d o _ r => stepGet np a d o r
+  | .setField x _ v => stepSet a x v
   | .takeField d x _ =>
     if d < a.length ∧ x < a.length ∧ np ≤ d ∧ d ≠ x ∧ gk a x = .unique then
       some (defK (killB x a) d .owned)
     else none
-  | .putField x _ s =>
-    if x < a.length ∧ x ≠ s ∧ gk a x = .unique then (consume a s).map (killB x) else none
+  | .putField x _ s => stepSet a x s
   | .makeUnique x =>
     if x < a.length ∧ (gk a x).counted then some ((killB x a).set x .unique) else none
+  | .arrayLen d x =>
+    if d < a.length ∧ x < a.length ∧ np ≤ d ∧ (gk a x).isRef then some (defK a d .init) else none
+  | .arrayGet d x i r => if i < a.length ∧ gk a i = .init then stepGet np a d x r else none
+  | .arraySet x i v => if i < a.length ∧ gk a i = .init then stepSet a x v else none
+  | .arrayNew d nl => if nl < a.length ∧ gk a nl = .init then stepAlloc np a d else none
 
 /-! ### hole sets -/
 
@@ -156,6 +169,10 @@ def stepH (hs : List (Nat × Nat)) : MI → Option (List (Nat × Nat))
     if hasHole hs s || !decide ((x, i) ∈ hs) then none
     else some (hs.filter (fun p => p != (x, i)))
   | .makeUnique x => if hasHole hs x then none else some hs
+  | .arrayLen d a => if hasHole hs d || hasHole hs a then none else some hs
+  | .arrayGet d a _ _ => if hasHole hs d || hasHole hs a then none else some hs
+  | .arraySet x _ v => if hasHole hs v || hasHole hs x then none else some hs
+  | .arrayNew d _ => if hasHole hs d then none else some hs
 
 def stepA (np : Nat) (a : AState) (i : MI) : Option AState :=
   match stepL np a.ls i with

@@ -32,6 +32,10 @@ import Orin
 #print axioms Orin.op_putField
 #print axioms Orin.op_takeField
 #print axioms Orin.op_makeUnique
+#print axioms Orin.op_arrayLen
+#print axioms Orin.op_arrayGet
+#print axioms Orin.op_arraySet
+#print axioms Orin.op_arrayNew
 #print axioms Orin.drain_inv
 #print axioms Orin.Inv.weaken
 #print axioms Orin.joinL_fle_left
@@ -50,3 +54,5 @@ import Orin
 #print axioms Orin.store_frame_other_slot
 #print axioms Orin.store_frame_other_local
 #print axioms Orin.makeUnique_frame
+#print axioms Orin.arrayGet_oob
+#print axioms Orin.arrayGet_inb
