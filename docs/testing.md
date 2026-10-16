@@ -168,7 +168,7 @@ tests still runs), `tools/mutation.sh std` (mutants, each in its own directory; 
 (the files; each runs in its own working directory because the verifier writes its solver queries to
 `build/contracts-vc/`), `test_compiler_contracts.sh` (the self-compile check and the suite run at the same time).
 `run_tests.py` compiles the runtime once per run instead of once per test (same flags; keyed by the sources). `tools/parallel.py`
-is the shared helper. `tools/protocol.sh lsp|mcp` is one protocol session each and `test_osig.py` / `test_effects.py`
+is the shared helper. `tools/protocol.sh lsp|mcp` is one protocol session each and `clitests.sh osig` / `test_effects.py`
 take seconds, so they stay sequential; `--orin PATH` skips their compiler build.
 
 **CI.** The `build` job caches `build/bootstrap/orin2` and `stage2.c` (`actions/cache`), keyed by the hash of
@@ -296,6 +296,37 @@ Parity was established by running both implementations against the same compiler
 104 and 191 checks; and against a deliberately broken compiler (a copy of `compiler/` with the `implementationProvider`
 capability removed, the effect summary text changed, `mutates` inverted and the "outside the authorized root" message changed):
 both fail the same two LSP checks and the same eleven MCP checks.
+
+## CLI tests harness (Orin): OSIG and formatter
+
+The tests of `orin graph` / `orin diff` and of `orin fmt` / `orin check --format=json` are `tooling/clitests`, an Orin package
+(ADR-0047 phase 5; it replaces `tools/test_osig.py` and `tools/test_fmt.py`). One package with two subcommands, because both
+suites run the compiler as a child process, compare its captured output with files in `tests/` and share the helpers (text,
+JSON paths, the check log, the process pool of `tooling/differential`); one build serves both. `tools/clitests.sh` builds it with
+the bootstrapped compiler (never with the compiler under test) and runs it; the flags, `FAIL ...` lines, summaries and exit
+status are those of the old scripts:
+
+```bash
+tools/clitests.sh osig [--orin build/bootstrap/orin2] [--update]   # 121 checks; --update rewrites tests/osig/*.graph.json
+tools/clitests.sh fmt [--orin2 build/bootstrap/orin2] [--no-build] [--jobs N] [-v]   # 15 pairs, 1,938 corpus files, 61 JSON: 2,014 passed
+tools/clitests.sh --unit-tests                                     # @Test tests of the pure helpers (options, comments, spans, diagnostics)
+```
+
+`osig` runs the nine sections of the Python script in the same order (golden, determinism, evidence classes, snapshot files,
+acceptance, HTML, primitive I/O, task events, user annotations); the golden files stay in `tests/osig/`. `fmt` builds
+`compiler/main.or` and `compiler/tests/parse_main.or` into `build/fmt/` (like the Python script; `--no-build` reuses them) and
+checks the 15 `tests/fmt/*.in.or` pairs, the corpus (idempotence, AST and comment preservation, syntax errors reported and the file
+left untouched) and the JSON diagnostics of `tests/errors`. The language cannot capture the output of a child process
+(`std:io` has `shell` and `shellTimeout`), so every command redirects stdout and stderr to files of a private work directory and the
+verdicts read them back. The `fmt` commands run on `--jobs` workers of the pool in two rounds (default: twice the CPU count; each
+job is one shell command that runs its steps in turn, because a finished command is noticed every 10 ms); the verdicts are computed
+afterwards in the order of the lists, so the `FAIL` lines come out in a fixed order (the Python script printed them as its threads
+finished). Differences from the Python scripts: a compiler that produces no JSON fails the checks that read it instead of ending
+with a traceback; the unified diff of a differing golden pair is the one of `diff -u`; `--root DIR` names the repository root.
+
+Parity was established by running both implementations against the same `orin2`: the same check counts (121; 2,014 with the same
+set of passed names), and with a mutated golden snapshot / a mutated formatter golden both print the same single `FAIL` line, the
+same summary and exit status 1.
 
 ## Execution deadlines
 
