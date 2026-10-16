@@ -1,7 +1,9 @@
-import { assert, assertEqString } from "std:test";
+import { assert, assertEqString, assertEqUsize } from "std:test";
+import { Host, useHost } from "std:host";
+import { exists } from "std:fs";
 import {
   isDigit, isJsonSpace, hexVal, hexDigitLower, hexDigitUpper, shq, trunc, countNewlines, lineCol, addUnique,
-  hasStr, hasUsize,
+  hasStr, hasUsize, workerCount, mapOrdered, mapOrderedFs, mapOrderedProcess, shellRun,
 } from "../util";
 
 @Test
@@ -54,4 +56,54 @@ function collections(): void {
   assert(hasStr(xs, "b") && !hasStr(xs, "c"), "hasStr");
   const us: usize[] = [3, 5];
   assert(hasUsize(us, 5) && !hasUsize(us, 4), "hasUsize");
+}
+
+// ---- ordered parallel maps (ORIN_THREADS=N must never change a result) ---------------------------------------------------
+
+@Test
+function mapOrderedKeepsIndexOrder(): void {
+  assertEqUsize(mapOrdered(0, (i: usize) => i).length, 0, "no indices");
+  const one = mapOrdered(1, (i: usize) => i + 7);
+  assert(one.length == 1 && one[0] == 7, "one index");
+  const sq = mapOrdered(101, (i: usize) => i * i);
+  assertEqUsize(sq.length, 101, "length");
+  let i: usize = 0;
+  while (i < 101) {
+    assert(sq[i] == i * i, "square " + i.toString());
+    i += 1;
+  }
+  assert(workerCount(0) == 1 && workerCount(1) == 1 && workerCount(5) >= 1 && workerCount(5) <= 5, "workerCount");
+}
+
+@Test
+function mapOrderedMovesHeapResults(): void {
+  const names: string[] = ["a", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg"];
+  const rs = mapOrdered(names.length, (i: usize) => names[i] + "!" + i.toString());
+  assertEqUsize(rs.length, 7, "length");
+  assertEqString(rs.join(","), "a!0,bb!1,ccc!2,dddd!3,eeeee!4,ffffff!5,ggggggg!6", "strings in index order");
+}
+
+@Test
+function mapOrderedWithGrants(host: Host): void {
+  useHost(
+    host,
+    (fs, proc, stdio, clock) => {
+      const codes = mapOrderedProcess(proc, 9, (i: usize, g) => shellRun(g, "exit " + i.toString()));
+      assertEqUsize(codes.length, 9, "process: length");
+      let i: usize = 0;
+      while (i < 9) {
+        assert(codes[i] == i.toInt(), "process: exit status of " + i.toString());
+        i += 1;
+      }
+      const seen = mapOrderedFs(fs, 6, (i: usize, g) => exists(g, i % 2 == 0 ? "/" : "/no/such/path/" + i.toString()));
+      assertEqUsize(seen.length, 6, "fs: length");
+      i = 0;
+      while (i < 6) {
+        assert(seen[i] == (i % 2 == 0), "fs: result of " + i.toString());
+        i += 1;
+      }
+      assertEqUsize(mapOrderedFs(fs, 0, (i: usize, g) => i).length, 0, "fs: no indices");
+      assertEqUsize(mapOrderedProcess(proc, 0, (i: usize, g) => i).length, 0, "process: no indices");
+    },
+  );
 }

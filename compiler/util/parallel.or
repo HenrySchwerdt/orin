@@ -1,0 +1,114 @@
+// Ordered parallel maps over indices (ADR-0049 section 2): `mapOrdered(n, f)` is `[f(0), ..., f(n - 1)]`, computed by
+// worker tasks of `std:task` and returned in index order, whatever the number of threads.
+//
+// With `parallelism() == 1` (ORIN_THREADS=1) or fewer than two indices the code path is the plain sequential loop on the
+// calling task. A task body is copied into its task, so what `f` captures should be small (indices, file names), not a
+// compiler structure; results travel back to the caller by move or copy.
+//
+// `f` must not depend on the order in which indices run: there is no sharing, so the only effects it may have are on
+// per-index files and process grants. A closure cannot capture a grant, so `mapOrderedFs` and `mapOrderedProcess` hand
+// every worker a grant of the same authority as a parameter of `f` (std:task `spawnFs` / `spawnProcess`).
+
+import { forkJoin, parallelism, scopeFs, scopeProcess, spawnFs, spawnProcess, TaskHandle } from "std:task";
+import { FsGrant } from "std:fs";
+import { ProcessGrant } from "std:process";
+
+// Worker count for n indices: 1 (the sequential path) when there is nothing to overlap.
+@Ensures(result >= 1 && (n < 2 ? result == 1 : result <= n))
+export function workerCount(n: usize): usize {
+  if (n < 2) {
+    return 1;
+  }
+  const t = parallelism();
+  return t < n ? t : n;
+}
+
+// Index order from the per-worker results: worker w computed the indices w, w + W, w + 2W, ...
+function interleave<T>(parts: T[][], n: usize): T[] {
+  const w = parts.length;
+  let out: T[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    out.push(parts[i % w][i / w]);
+    i += 1;
+  }
+  return out;
+}
+
+// [f(0), ..., f(n - 1)] in index order.
+@Ensures(result.length == n)
+export function mapOrdered<T>(n: usize, f: (i: usize) => T): T[] {
+  return forkJoin(n, workerCount(n), f);
+}
+
+// As mapOrdered, `f` also gets a file-system grant (with the authority of `fs`, owned by its worker).
+@Ensures(result.length == n)
+export function mapOrderedFs<T>(fs: FsGrant, n: usize, f: (i: usize, g: FsGrant) => T): T[] {
+  const w = workerCount(n);
+  if (w <= 1) {
+    let out: T[] = [];
+    while (out.length < n) {
+      out.push(f(out.length, fs));
+    }
+    return out;
+  }
+  const parts = scopeFs(fs, (s, g) => {
+    let hs: TaskHandle<T[]>[] = [];
+    let k: usize = 0;
+    while (k < w) {
+      const first = k;
+      hs.push(spawnFs(s, g, gg => {
+        let part: T[] = [];
+        let i = first;
+        while (i < n) {
+          part.push(f(i, gg));
+          i += w;
+        }
+        return part;
+      }));
+      k += 1;
+    }
+    let ps: T[][] = [];
+    for (const h of hs) {
+      ps.push(h.join());
+    }
+    return ps;
+  });
+  return interleave(parts, n);
+}
+
+// As mapOrdered, `f` also gets a process grant (with the authority of `proc`, owned by its worker).
+@Ensures(result.length == n)
+export function mapOrderedProcess<T>(proc: ProcessGrant, n: usize, f: (i: usize, g: ProcessGrant) => T): T[] {
+  const w = workerCount(n);
+  if (w <= 1) {
+    let out: T[] = [];
+    while (out.length < n) {
+      out.push(f(out.length, proc));
+    }
+    return out;
+  }
+  const parts = scopeProcess(proc, (s, g) => {
+    let hs: TaskHandle<T[]>[] = [];
+    let k: usize = 0;
+    while (k < w) {
+      const first = k;
+      hs.push(spawnProcess(s, g, gg => {
+        let part: T[] = [];
+        let i = first;
+        while (i < n) {
+          part.push(f(i, gg));
+          i += w;
+        }
+        return part;
+      }));
+      k += 1;
+    }
+    let ps: T[][] = [];
+    for (const h of hs) {
+      ps.push(h.join());
+    }
+    return ps;
+  });
+  return interleave(parts, n);
+}
