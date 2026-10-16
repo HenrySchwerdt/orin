@@ -1,0 +1,140 @@
+// Lenient readers over std:jsonvalue trees: a missing or mistyped field is `None`, never a trap. The benchmark JSON is
+// written by tools/bench.py and read by Python's json module with `.get(...)`; these helpers give the same "absent is
+// not an error" behaviour, and the typed model in bench.or decides what an absent value means.
+
+import { JsonValue, JsonMember, JsonReadOptions, JsonLimits, PreserveDuplicates, parseDocument } from "std:jsonvalue";
+import { JsonNumber, numberAsInt } from "std:jsonnumber";
+
+export function limits(): JsonLimits {
+  return JsonLimits {
+    maxInputBytes: 67108864,
+    maxDepth: 64,
+    maxNodes: 4000000,
+    maxContainerItems: 1000000,
+    maxStringBytes: 1048576,
+    maxDecodedStringBytes: 33554432,
+    maxNumberBytes: 1024,
+    maxOutputBytes: 4194304,
+  };
+}
+
+// Duplicate keys are kept (Python's json keeps the last one; `get` below does the same).
+export function parse(text: string): Result<JsonValue, string> {
+  const r = parseDocument(text, JsonReadOptions { limits: limits(), duplicates: PreserveDuplicates });
+  return match (r) {
+    Ok(v) => Ok(v),
+    Err(e) => Err("invalid JSON at line " + e.line.toString() + ", column " + e.column.toString()),
+  };
+}
+
+export function members(v: JsonValue): JsonMember[] {
+  return match (v) {
+    ValueObject(ms) => ms,
+    _ => [],
+  };
+}
+
+export function isObject(v: JsonValue): bool {
+  return match (v) {
+    ValueObject(ms) => true,
+    _ => false,
+  };
+}
+
+export function items(v: JsonValue): JsonValue[] {
+  return match (v) {
+    ValueArray(xs) => xs,
+    _ => [],
+  };
+}
+
+export function get(v: JsonValue, key: string): Option<JsonValue> {
+  let found: Option<JsonValue> = None;
+  for (const m of members(v)) {
+    if (m.key == key) {
+      found = Some(m.value);
+    }
+  }
+  return found;
+}
+
+// `get(v, a).get(b)` of the Python code (`x.get("a", {}).get("b")`)
+export function path2(v: JsonValue, a: string, b: string): Option<JsonValue> {
+  const first = get(v, a);
+  if (first.isNone()) {
+    return None;
+  }
+  return get(first.unwrap(), b);
+}
+
+export function asStr(v: Option<JsonValue>): Option<string> {
+  if (v.isNone()) {
+    return None;
+  }
+  return match (v.unwrap()) {
+    ValueString(s) => Some(s),
+    _ => None,
+  };
+}
+
+export function asNumber(v: Option<JsonValue>): Option<JsonNumber> {
+  if (v.isNone()) {
+    return None;
+  }
+  return match (v.unwrap()) {
+    ValueNumber(n) => Some(n),
+    _ => None,
+  };
+}
+
+// json.load turns every number into a float or an int; the value is the nearest double of the exact token
+export function asFloat(v: Option<JsonValue>): Option<float> {
+  const n = asNumber(v);
+  if (n.isNone()) {
+    return None;
+  }
+  return parseFloat(n.unwrap().token);
+}
+
+export function asInt(v: Option<JsonValue>): Option<int> {
+  const n = asNumber(v);
+  if (n.isNone()) {
+    return None;
+  }
+  const r = numberAsInt(n.unwrap());
+  return r.isOk() ? Some(r.unwrap()) : None;
+}
+
+// Python truthiness of `x.get("flag")` for the flags used here: absent, null, false, 0 and "" are false
+export function truthy(v: Option<JsonValue>): bool {
+  if (v.isNone()) {
+    return false;
+  }
+  return match (v.unwrap()) {
+    ValueNull => false,
+    ValueBool(b) => b,
+    ValueNumber(n) => parseFloat(n.token).unwrapOr(0.0) != 0.0,
+    ValueString(s) => s.length > 0,
+    ValueArray(xs) => xs.length > 0,
+    ValueObject(ms) => ms.length > 0,
+  };
+}
+
+// `x.get("flag", True)`: absent is true, a present value is judged by `truthy`
+export function boolOrTrue(v: Option<JsonValue>): bool {
+  return v.isNone() ? true : truthy(v);
+}
+
+// "%s" % value for the scalars the header prints (an int keeps its digits, a float is shown shortest, True / False / None)
+export function show(v: Option<JsonValue>, dflt: string): string {
+  if (v.isNone()) {
+    return dflt;
+  }
+  return match (v.unwrap()) {
+    ValueNull => "None",
+    ValueBool(b) => b ? "True" : "False",
+    ValueNumber(n) => n.token,
+    ValueString(s) => s,
+    _ => dflt,
+  };
+}

@@ -1,0 +1,193 @@
+// bench-report: reports of the benchmark results written by `tools/bench.py --json` (docs/benchmarks.md "Benchmark workflow").
+//
+//   bench-report summary RUN.json
+//       Markdown tables of one run: the job summary of .github/workflows/bench.yml.
+//   bench-report compare --history DIR RUN.json
+//       Markdown diff of RUN.json against the newest earlier entries of DIR: the PR comment. A row is flagged as a regression
+//       when the executed instructions rise by more than 2 % or the wall-time median by more than 15 %. Always exits 0.
+//   bench-report render --history DIR --out DIR [--repo owner/name]
+//       charts/*.svg and README.md for the `bench-results` branch, and report.html (the stand-alone OX report).
+//
+// History files are the JSON of bench.py, one per run, named <date>-<sha>.json; they are ordered by their "date" field.
+
+import { Host, useHost } from "std:host";
+import { FsGrant, readFile, writeFile, exists, listDir } from "std:fs";
+import { ProcessGrant, args, exit } from "std:process";
+import { shell } from "std:io";
+import { BenchRun, decodeRun, strCmp } from "./bench";
+import { parse } from "./jv";
+import { summary, compare } from "./markdown";
+import { charts, readme } from "./render";
+import { renderHtml } from "./htmlreport";
+import { svgText } from "orin-reports";
+
+function usage(): void {
+  console.error("usage: bench-report summary RUN.json");
+  console.error("       bench-report compare --history DIR RUN.json");
+  console.error("       bench-report render --history DIR --out DIR [--repo owner/name]");
+  exit(2);
+}
+
+function fail(msg: string): void {
+  console.error("bench-report: " + msg);
+  exit(1);
+}
+
+function baseName(path: string): string {
+  const parts = path.split("/");
+  return parts[parts.length - 1];
+}
+
+function loadRun(fs: FsGrant, path: string, name: string): Result<BenchRun, string> {
+  const text = readFile(fs, path)?;
+  const doc = parse(text)?;
+  return decodeRun(doc, name);
+}
+
+function joinPath(dir: string, name: string): string {
+  return dir.endsWith("/") ? dir + name : dir + "/" + name;
+}
+
+// every *.json of the directory (not dot files), ordered by (date, file name); a file that does not load is skipped
+function loadHistory(fs: FsGrant, dir: string): BenchRun[] {
+  let runs: BenchRun[] = [];
+  if (!exists(fs, dir)) {
+    return runs;
+  }
+  for (const entry of listDir(fs, dir)) {
+    if (!entry.endsWith(".json") || entry.startsWith(".")) {
+      continue;
+    }
+    const path = joinPath(dir, entry);
+    const r = loadRun(fs, path, entry);
+    match (r) {
+      Ok(run) => { runs.push(run); },
+      Err(e) => { console.error("skipping " + path + ": " + e); },
+    }
+  }
+  return runs.sort((a: BenchRun, b: BenchRun): int => {
+    const c = strCmp(a.date.unwrapOr(""), b.date.unwrapOr(""));
+    return c != 0 ? c : strCmp(a.file, b.file);
+  });
+}
+
+// sys.stdout.write(text): the reports end with exactly one newline, which console.log supplies
+function emit(text: string): void {
+  console.log(text.endsWith("\n") ? text.substring(0, text.length - 1) : text);
+}
+
+function shellQuote(s: string): string {
+  return "'" + s.split("'").join("'\\''") + "'";
+}
+
+function mkdirs(proc: ProcessGrant, dir: string): void {
+  if (shell(proc, "mkdir -p " + shellQuote(dir)) != 0) {
+    fail("cannot create the directory " + dir);
+  }
+}
+
+function put(fs: FsGrant, path: string, text: string): void {
+  const r = writeFile(fs, path, text);
+  if (r.isErr()) {
+    fail("cannot write " + path + ": " + r.unwrapErr());
+  }
+}
+
+function runSummary(fs: FsGrant, a: string[]): void {
+  if (a.length != 1) {
+    usage();
+  }
+  const r = loadRun(fs, a[0], baseName(a[0]));
+  if (r.isErr()) {
+    fail(a[0] + ": " + r.unwrapErr());
+    return;
+  }
+  emit(summary(r.unwrap()));
+}
+
+function runCompare(fs: FsGrant, a: string[]): void {
+  let history = "";
+  let run = "";
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] == "--history" && i + 1 < a.length) {
+      history = a[i + 1];
+      i += 2;
+    } else if (!a[i].startsWith("--") && run.length == 0) {
+      run = a[i];
+      i += 1;
+    } else {
+      usage();
+      return;
+    }
+  }
+  if (history.length == 0 || run.length == 0) {
+    usage();
+    return;
+  }
+  const head = loadRun(fs, run, baseName(run));
+  if (head.isErr()) {
+    fail(run + ": " + head.unwrapErr());
+    return;
+  }
+  emit(compare(loadHistory(fs, history), head.unwrap()).text);
+}
+
+function runRender(fs: FsGrant, proc: ProcessGrant, a: string[]): void {
+  let history = "";
+  let out = "";
+  let repo = "";
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] == "--history" && i + 1 < a.length) {
+      history = a[i + 1];
+      i += 2;
+    } else if (a[i] == "--out" && i + 1 < a.length) {
+      out = a[i + 1];
+      i += 2;
+    } else if (a[i] == "--repo" && i + 1 < a.length) {
+      repo = a[i + 1];
+      i += 2;
+    } else {
+      usage();
+      return;
+    }
+  }
+  if (history.length == 0 || out.length == 0) {
+    usage();
+    return;
+  }
+  const runs = loadHistory(fs, history);
+  mkdirs(proc, joinPath(out, "charts"));
+  const list = charts(runs);
+  let names: string[] = [];
+  for (const c of list) {
+    put(fs, joinPath(joinPath(out, "charts"), c.file), svgText(c.svg));
+    names.push(c.file);
+  }
+  put(fs, joinPath(out, "README.md"), readme(runs, repo, list));
+  put(fs, joinPath(out, "report.html"), renderHtml(runs) + "\n");
+  console.error("rendered " + runs.length.toString() + " runs: " + names.join(", ") + ", report.html");
+}
+
+function main(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => { dispatch(fs, proc); });
+}
+
+function dispatch(fs: FsGrant, proc: ProcessGrant): void {
+  const all = args(proc);
+  if (all.length < 1) {
+    usage();
+    return;
+  }
+  const rest = all.slice(1, all.length);
+  if (all[0] == "summary") {
+    runSummary(fs, rest);
+  } else if (all[0] == "compare") {
+    runCompare(fs, rest);
+  } else if (all[0] == "render") {
+    runRender(fs, proc, rest);
+  } else {
+    usage();
+  }
+}

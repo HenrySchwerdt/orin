@@ -1,0 +1,222 @@
+// Shared OX layout components: page shell, summary cards, status badges, tables, notices, figures, sections.
+// All dynamic text is a `string` child or attribute, so std:html escapes it; the only raw HTML in this module is the
+// sealed `SvgDoc` of a chart (built, with its own escaping, by canvas.or) and the static stylesheet of theme_css.or.
+
+import ox from "std:html";
+import { Html, document, empty, trustHtml } from "std:html";
+import { SvgDoc, svgText } from "./canvas";
+import {
+  Status, statusLabel, statusToken, statusIcon, Align, AlignRight, Column, Cell, Table, Card, Block, Cards, Paragraph, Notice,
+  Heading, Data, Figure, Details, Diff, DiffTable, DiffRow, DiffKind, DiffAdded, DiffRemoved, DiffChanged, DiffSame, Section, MetaItem, Report,
+} from "./model";
+import { ThemeStyle } from "./theme_css";
+
+export function Badge(status: Status): Html {
+  return <span class={"r-badge r-badge-" + statusToken(status)}>
+    <span aria-hidden="true">{statusIcon(status)}</span>
+    {statusLabel(status)}
+  </span>;
+}
+
+function OptionalBadge(status: Option<Status>): Html {
+  return match (status) {
+    Some(s) => <Badge status={s} />,
+    None => empty(),
+  };
+}
+
+function CardView(card: Card): Html {
+  return <li class="r-card">
+    <div class="r-card-label">{card.label}</div>
+    <div class="r-card-value">{card.value}</div>
+    {card.note.isSome() ? <div class="r-card-note">{card.note.unwrap()}</div> : empty()}
+    {card.status.isSome() ? <div class="r-card-status"><OptionalBadge status={card.status} /></div> : empty()}
+  </li>;
+}
+
+export function CardGrid(cards: Card[]): Html {
+  return <ul class="r-cards">{cards.map(c => <CardView card={c} />)}</ul>;
+}
+
+function CellView(cell: Cell, align: Align): Html {
+  return <>
+    <span class={cell.mono ? "r-mono" : "r-text"}>{cell.text}</span>
+    {cell.status.isSome() ? <> <OptionalBadge status={cell.status} /></> : empty()}
+  </>;
+}
+
+function alignClass(a: Align): string {
+  return match (a) {
+    AlignRight => "r-num",
+    _ => "r-text",
+  };
+}
+
+function HeadCell(column: Column): Html {
+  return <th scope="col" class={alignClass(column.align)}>{column.header}</th>;
+}
+
+function BodyRow(row: Cell[], columns: Column[]): Html {
+  let cells: Html[] = [];
+  let i: usize = 0;
+  while (i < row.length && i < columns.length) {
+    cells.push(<BodyCell cell={row[i]} column={columns[i]} first={i == 0} />);
+    i += 1;
+  }
+  return <tr>{cells}</tr>;
+}
+
+function BodyCell(cell: Cell, column: Column, first: bool): Html {
+  return first
+    ? <th scope="row" class={alignClass(column.align)}><CellView cell={cell} align={column.align} /></th>
+    : <td class={alignClass(column.align)}><CellView cell={cell} align={column.align} /></td>;
+}
+
+export function DataTable(table: Table): Html {
+  return <div class="r-table-wrap" role="region" aria-label={table.caption} tabindex={0}>
+    <table class="r-table">
+      <caption>{table.caption}</caption>
+      <thead><tr>{table.columns.map(c => <HeadCell column={c} />)}</tr></thead>
+      <tbody>{table.rows.map(r => <BodyRow row={r} columns={table.columns} />)}</tbody>
+    </table>
+    {table.rows.length == 0 ? <p class="r-empty">{table.emptyText}</p> : empty()}
+  </div>;
+}
+
+function diffClass(k: DiffKind): string {
+  return match (k) {
+    DiffAdded => "r-diff-added",
+    DiffRemoved => "r-diff-removed",
+    DiffChanged => "r-diff-changed",
+    DiffSame => "r-diff-same",
+  };
+}
+
+// the marker is text, not colour alone: + added, - removed, ~ changed
+function diffMark(k: DiffKind): string {
+  return match (k) {
+    DiffAdded => "+",
+    DiffRemoved => "-",
+    DiffChanged => "~",
+    DiffSame => " ",
+  };
+}
+
+function diffWord(k: DiffKind): string {
+  return match (k) {
+    DiffAdded => "added",
+    DiffRemoved => "removed",
+    DiffChanged => "changed",
+    DiffSame => "unchanged",
+  };
+}
+
+function DiffRowView(row: DiffRow): Html {
+  return <tr class={diffClass(row.kind)}>
+    <th scope="row"><span class="r-diff-mark" aria-hidden="true">{diffMark(row.kind)}</span><span class="r-sr">{diffWord(row.kind)}: </span>{row.label}</th>
+    <td class="r-mono">{row.before}</td>
+    <td class="r-mono">{row.after}</td>
+  </tr>;
+}
+
+// A before / after table whose rows carry added / removed / changed markers.
+export function DiffView(table: DiffTable): Html {
+  return <div class="r-table-wrap" role="region" aria-label={table.caption} tabindex={0}>
+    <table class="r-table">
+      <caption>{table.caption}</caption>
+      <thead><tr><th scope="col">{table.labelHeader}</th><th scope="col">{table.beforeHeader}</th><th scope="col">{table.afterHeader}</th></tr></thead>
+      <tbody>{table.rows.map(r => <DiffRowView row={r} />)}</tbody>
+    </table>
+    {table.rows.length == 0 ? <p class="r-empty">{table.emptyText}</p> : empty()}
+  </div>;
+}
+
+function NoticeView(status: Status, text: string): Html {
+  return <p class={"r-notice r-notice-" + statusToken(status)} role={status_role(status)}>
+    <Badge status={status} />
+    <span>{text}</span>
+  </p>;
+}
+
+// failures are announced; everything else is plain content
+function status_role(s: Status): string {
+  return match (s) {
+    Failed => "alert",
+    _ => "note",
+  };
+}
+
+function FigureView(caption: string, svg: SvgDoc): Html {
+  return <figure class="r-figure">
+    {trustHtml(svgText(svg))}
+    <figcaption>{caption}</figcaption>
+  </figure>;
+}
+
+function BlockView(block: Block): Html {
+  return match (block) {
+    Diff(t) => <div class="r-block"><DiffView table={t} /></div>,
+    Cards(cards) => <CardGrid cards={cards} />,
+    Paragraph(text) => <p class="r-intro">{text}</p>,
+    Notice(status, text) => <NoticeView status={status} text={text} />,
+    Heading(text) => <h3>{text}</h3>,
+    Data(table) => <div class="r-block"><DataTable table={table} /></div>,
+    Figure(caption, alt, svg) => <FigureView caption={caption} svg={svg} />,
+    Details(summary, body) => <details class="r-details"><summary>{summary}</summary><pre class="r-pre">{body}</pre></details>,
+  };
+}
+
+function SectionView(section: Section): Html {
+  return <section class="r-section" id={section.id} aria-labelledby={section.id + "-h"}>
+    <h2 id={section.id + "-h"}>{section.title}</h2>
+    {section.intro.isSome() ? <p class="r-intro">{section.intro.unwrap()}</p> : empty()}
+    {section.blocks.map(b => <BlockView block={b} />)}
+  </section>;
+}
+
+function MetaView(item: MetaItem): Html {
+  return <div><dt>{item.label}</dt><dd>{item.value}</dd></div>;
+}
+
+function NavItem(section: Section): Html {
+  return <li><a href={"#" + section.id}>{section.title}</a></li>;
+}
+
+// The page shell: a sidebar slot (navigation, filters, a module tree, ...) next to the content column. Reused by every report.
+export function Shell(title: string, sidebar: Html, content: Html): Html {
+  return <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <meta name="color-scheme" content="light dark" />
+      <title>{title}</title>
+      <ThemeStyle />
+    </head>
+    <body>
+      <a class="r-skip" href="#main">Skip to the report</a>
+      <div class="r-layout">
+        <aside class="r-sidebar"><p class="r-brand">{title}</p>{sidebar}</aside>
+        <div class="r-content">{content}</div>
+      </div>
+    </body>
+  </html>;
+}
+
+export function Page(report: Report): Html {
+  const sidebar = <nav aria-label="Sections"><ul class="r-nav">{report.sections.map(s => <NavItem section={s} />)}</ul></nav>;
+  const content = <>
+    <header class="r-header">
+      <h1 class="r-title">{report.title}</h1>
+      <p class="r-subtitle">{report.subtitle}</p>
+      <dl class="r-meta">{report.meta.map(m => <MetaView item={m} />)}</dl>
+    </header>
+    <main id="main">{report.sections.map(s => <SectionView section={s} />)}</main>
+    <footer class="r-footer">{report.footer}</footer>
+  </>;
+  return <Shell title={report.title} sidebar={sidebar} content={content} />;
+}
+
+// The complete, stand-alone document (doctype included).
+export function renderReport(report: Report): string {
+  return document(<Page report={report} />);
+}

@@ -1,0 +1,88 @@
+// `render`: the SVG charts and README.md of the `bench-results` branch (byte-identical to the Python tool's, apart from the
+// one sentence that names the generating tool) and the new stand-alone report.html.
+
+import { fixed, SvgDoc, svgText } from "orin-reports";
+import { BenchRun, dateRaw, dateOrQ, selfInstr, selfWall, commitStr } from "./bench";
+import { summary, short, head, big, s3 } from "./markdown";
+import { chartRatio, chartSelfcompile, chartParallel, Wall, Instructions } from "./charts";
+
+export type Chart = { file: string; alt: string; svg: SvgDoc; };
+
+// the four charts, ids unprefixed (stand-alone files)
+export function charts(runs: BenchRun[]): Chart[] {
+  return [
+    Chart { file: "ratio_wall.svg", alt: "Orin to C wall-time ratio per benchmark over time", svg: chartRatio(runs, Wall, "") },
+    Chart { file: "ratio_instructions.svg", alt: "Orin to C executed-instruction ratio per benchmark over time",
+            svg: chartRatio(runs, Instructions, "") },
+    Chart { file: "selfcompile.svg", alt: "Self-compile instructions and wall time over time", svg: chartSelfcompile(runs, "") },
+    Chart { file: "parallel.svg", alt: "Parallel speedup by worker threads", svg: chartParallel(runs, "") },
+  ];
+}
+
+// "[`sha10`](https://github.com/repo/commit/sha)" or just "`sha10`" without a repository
+function commitLink(sha: string, repo: string): string {
+  const s = sha.length > 0 ? sha : "?";
+  const sh = short(Some(s));
+  return repo.length > 0 ? "[`" + sh + "`](https://github.com/" + repo + "/commit/" + s + ")" : "`" + sh + "`";
+}
+
+function orQ(s: Option<string>): string {
+  return s.isSome() && s.unwrap().length > 0 ? s.unwrap() : "?";
+}
+
+// Python's str.replace(old, new, 1)
+function replaceFirst(s: string, old: string, rep: string): string {
+  const at = s.indexOf(old);
+  if (at.isNone()) {
+    return s;
+  }
+  const i = at.unwrap();
+  return s.substring(0, i) + rep + s.substring(i + old.length, s.length);
+}
+
+// The README of the branch. Python's text is "charts rendered by `tools/bench_report.py render`"; the Orin tool names itself.
+export function readme(runs: BenchRun[], repo: string, chartList: Chart[]): string {
+  let L: string[] = [
+    "# Orin benchmark history", "",
+    "Written by `.github/workflows/bench.yml` (nightly and manual runs on `main`); one JSON file per run in "
+      + "[`history/`](history/), charts rendered by `tooling/benchmarks` (`bench-report render`, no external services). "
+      + "The same data as a stand-alone page: [`report.html`](report.html). "
+      + "Metrics and methodology: `docs/benchmarks.md` on `main`. Do not edit this branch by hand.",
+    "",
+  ];
+  if (runs.length == 0) {
+    L.push("No runs yet.");
+    L.push("");
+  } else {
+    const last = runs[runs.length - 1];
+    const link = commitLink(commitStr(last), repo);
+    L.push(runs.length.toString() + " runs, " + head(dateRaw(runs[0]), 10) + " to " + head(dateRaw(last), 10) + ". Latest: " + link + ".");
+    L.push("");
+    L.push("Instruction counts are the regression metric: they are deterministic for single-threaded programs, while wall "
+      + "time on a shared runner moves by 10-25 % between identical binaries.");
+    L.push("");
+  }
+  for (const c of chartList) {
+    L.push("![" + c.alt + "](charts/" + c.file + ")");
+    L.push("");
+  }
+  if (runs.length > 0) {
+    const last = runs[runs.length - 1];
+    L.push("## Latest run");
+    L.push("");
+    L.push(replaceFirst(summary(last), "## Orin benchmarks\n", ""));
+    L.push("## All runs");
+    L.push("");
+    L.push("| date | commit | ref | self-compile instructions | self-compile wall s | file |");
+    L.push("|---|---|---|---:|---:|---|");
+    let i: int = runs.length.toInt() - 1;
+    while (i >= 0) {
+      const r = runs[i.toUsize()];
+      L.push("| " + dateRaw(r) + " | `" + short(r.commit) + "` | " + orQ(r.ref) + " | " + big(selfInstr(r)) + " | " + s3(selfWall(r))
+        + " | [json](history/" + r.file + ") |");
+      i -= 1;
+    }
+    L.push("");
+  }
+  return L.join("\n");
+}

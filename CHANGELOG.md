@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Benchmark reports in Orin + OX (ADR-0047 phase 6).** New packages `tooling/reports` (typed report model, shared OX components, static CSS design system, SVG canvas) and `tooling/benchmarks` (`bench-report summary|compare|render`) replace `tools/bench_report.py`; Markdown, SVG and README are byte-identical to the Python output (golden tests, fuzzed against the old tool), and `render` adds a stand-alone `report.html`. `.github/workflows/bench.yml` builds and uses the Orin tool.
 - **Escape analysis, scalar replacement of temporary array literals (ADR-0038 addendum 2026-10-16, class (c)).** New optimiser pass
   `compiler/opt/lits.or`: `t = arraynew [e1..ek]; arrayextend x, t; release t` (the lowering of `x = x.concat([e1, .., ek])`) becomes
   `arraypush x, e1; ..; arraypush x, ek`. No MIR change, no new verifier rule, no runtime change. appends -48.6 % executed instructions
