@@ -25,6 +25,7 @@ import { Host, useHost } from "std:host";
 import { FsGrant } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { StdioGrant } from "std:io";
+import { ClockGrant, monotonicNow } from "std:time";
 import { writeFile } from "std:fs";
 import {
   SourceMap, Diagnostic, render, describeSpan, TerminalOptions, terminalOptions, renderTerminal,
@@ -60,7 +61,7 @@ import { runMcp } from "./mcp";
 
 function usage(): void {
   console.error(
-    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
+    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--strict]] <entry.or>",
   );
   exit(2);
 }
@@ -157,7 +158,7 @@ function runVerify(prog: MProgram, sm: SourceMap, verbose: bool): usize {
 
 // The compiler needs the whole file system (it reads sources and writes C / LLVM IR next to them), the process grant
 // (`orin test`, `orin mcp` and `orin verify --contracts` run the C compiler and the solver; every command reads its
-// arguments) and stdio (`orin lsp`, `orin mcp`); it does not use the clock. The grants come from the host policy
+// arguments) and stdio (`orin lsp`, `orin mcp`); the clock is read only for `compile --timings`. The grants come from the host policy
 // (ORIN_DENY, ADR-0027).
 // The fusion pass (compiler/fuse); with `--fuse-report` every array pipeline it found is listed on stderr: where, its stages,
 // and whether it became one loop (or why not).
@@ -180,7 +181,7 @@ function main(host: Host): void {
   useHost(
     host,
     (fs, proc, stdio, clock) => {
-      driver(fs, proc, stdio);
+      driver(fs, proc, stdio, clock);
     },
   );
 }
@@ -210,7 +211,7 @@ function runTool(
 
 // The options of `check`, `api`, `mir`, `verify` and `compile`. `switches` holds the boolean flags that were given (see
 // `switchNames`); the remaining words are the command, the entry and, for `compile`, `-o <out>`.
-type Options = { switches: string[]; z3: string; checkSnap: Option<string>; argv: string[]; };
+type Options = { switches: string[]; z3: string; checkSnap: Option<string>; timings: Option<string>; argv: string[]; };
 
 // Every boolean flag of the build commands. `--backend=c` is the absence of `--backend=llvm`.
 function switchNames(): string[] {
@@ -240,7 +241,7 @@ function on(o: Options, flag: string): bool {
 // None after printing the usage or the unknown-option error (both exit).
 function parseOptions(all: string[]): Option<Options> {
   const known = switchNames();
-  let o = Options { switches: [], z3: "z3", checkSnap: None, argv: [] };
+  let o = Options { switches: [], z3: "z3", checkSnap: None, timings: None, argv: [] };
   let expectZ3 = false;
   let ai: usize = 0;
   while (ai < all.length) {
@@ -258,6 +259,13 @@ function parseOptions(all: string[]): Option<Options> {
       }
       o.checkSnap = Some(all[ai]);
       ai += 1;
+    } else if (a == "--timings") {
+      if (ai >= all.length) {
+        usage();
+        return None;
+      }
+      o.timings = Some(all[ai]);
+      ai += 1;
     } else if (a == "--backend=c") {
       o.switches = o.switches.filter(f => f != "--backend=llvm");
     } else if (known.includes(a)) {
@@ -273,15 +281,56 @@ function parseOptions(all: string[]): Option<Options> {
   return Some(o);
 }
 
-// HIR -> fused -> MIR -> optimised: the pipeline of `mir`, `verify` and `compile`.
-function buildMir(checked: Program, sm: SourceMap, o: Options): MProgram {
-  if (on(o, "--no-opt")) {
-    return lower(checked);
-  }
-  return optimize(lower(on(o, "--no-fuse") ? checked : fused(checked, sm, on(o, "--fuse-report"))));
+// Wall time per pipeline phase for `orin compile --timings <file>` (schema orin-timings/0.1). The only clock a program can
+// reach is the monotonic one of std:time, in whole milliseconds, so a phase shorter than a millisecond reads 0 and the numbers
+// are for trends over many runs, not for a single small program. A disabled timer reads no clock and records nothing, so
+// the generated output cannot depend on the flag.
+type Timer = { enabled: bool; last: int; names: string[]; ms: int[]; };
+
+function nowMs(clock: ClockGrant, fallback: int): int {
+  const r = monotonicNow(clock);
+  return r.isOk() ? r.unwrap().millis : fallback;
 }
 
-function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
+function newTimer(clock: ClockGrant, enabled: bool): Timer {
+  return Timer { enabled: enabled, last: enabled ? nowMs(clock, 0) : 0, names: [], ms: [] };
+}
+
+// the timer after the phase `name`, which began at the previous lap (unchanged when disabled)
+function lapped(t: Timer, clock: ClockGrant, name: string): Timer {
+  if (!t.enabled) {
+    return t;
+  }
+  const n = nowMs(clock, t.last);
+  return Timer { enabled: true, last: n, names: t.names.concat([name]), ms: t.ms.concat([n - t.last]) };
+}
+
+function timingsJson(t: Timer, entry: string, backend: string): string {
+  let total: int = 0;
+  let phases: string[] = [];
+  let k: usize = 0;
+  while (k < t.names.length) {
+    total += t.ms[k];
+    phases.push("{\"name\":" + jsonString(t.names[k]) + ",\"ms\":" + t.ms[k].toString() + "}");
+    k += 1;
+  }
+  return "{\"schema\":\"orin-timings/0.1\",\"entry\":" + jsonString(entry) + ",\"backend\":" + jsonString(backend)
+      + ",\"clock\":\"monotonic-ms\",\"phases\":[" + phases.join(",") + "],\"total\":" + total.toString() + "}\n";
+}
+
+type Built = { mir: MProgram; timer: Timer; };
+
+// HIR -> fused -> MIR -> optimised: the pipeline of `mir`, `verify` and `compile`, with the timer after each phase.
+function buildMir(checked: Program, sm: SourceMap, o: Options, t0: Timer, clock: ClockGrant): Built {
+  const prepared = on(o, "--no-fuse") ? checked : fused(checked, sm, on(o, "--fuse-report"));
+  const t1 = lapped(t0, clock, "hir");
+  const m = lower(prepared);
+  const t2 = lapped(t1, clock, "mir");
+  const opt = on(o, "--no-opt") ? m : optimize(m);
+  return Built { mir: opt, timer: lapped(t2, clock, "optimise") };
+}
+
+function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant, clock: ClockGrant): void {
   const raw = args(proc);
   if (raw.length == 5 && raw[0] == "__result") {
     console.log(
@@ -303,7 +352,7 @@ function driver(fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant): void {
   if (parsed.isNone()) {
     return;
   }
-  runBuildCommand(fs, proc, ui, parsed.unwrap());
+  runBuildCommand(fs, proc, clock, ui, parsed.unwrap());
 }
 
 // `orin api`: prints the public API snapshot, or compares it with the snapshot given by `--check`.
@@ -374,16 +423,27 @@ function runVerifyContracts(
 }
 
 // `orin compile`: MIR -> ownership verifier -> C (or LLVM IR) written to `out`.
-function runCompile(fs: FsGrant, sm: SourceMap, checked: Program, o: Options, out: string): void {
+function runCompile(
+  fs: FsGrant,
+  sm: SourceMap,
+  checked: Program,
+  o: Options,
+  out: string,
+  entry: string,
+  t0: Timer,
+  clock: ClockGrant,
+): void {
   const llvm = on(o, "--backend=llvm");
   const assertFacts = on(o, "--assert-facts");
   const statsSites = on(o, "--stats-sites");
-  const mir = buildMir(checked, sm, o);
+  const built = buildMir(checked, sm, o, t0, clock);
+  const mir = built.mir;
   if (!on(o, "--no-verify") && runVerify(mir, sm, false) > 0) {
     console.error("error: internal compiler error: MIR ownership verification failed");
     exit(70);
     return;
   }
+  const t1 = lapped(built.timer, clock, "verify");
   if (assertFacts && statsSites) {
     console.error("error: --assert-facts cannot be combined with --stats-sites");
     exit(2);
@@ -410,10 +470,25 @@ function runCompile(fs: FsGrant, sm: SourceMap, checked: Program, o: Options, ou
   if (written.isErr()) {
     console.error("error: cannot write " + out + ": " + written.unwrapErr());
     exit(1);
+    return;
+  }
+  const t2 = lapped(t1, clock, "emit");
+  if (t2.enabled) {
+    const tw = writeFile(fs, o.timings.unwrap(), timingsJson(t2, entry, llvm ? "llvm" : "c"));
+    if (tw.isErr()) {
+      console.error("error: cannot write " + o.timings.unwrap() + ": " + tw.unwrapErr());
+      exit(1);
+    }
   }
 }
 
-function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o: Options): void {
+function runBuildCommand(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  clock: ClockGrant,
+  ui: TerminalOptions,
+  o: Options,
+): void {
   const argv = o.argv;
   if (argv.length < 2) {
     usage();
@@ -432,6 +507,12 @@ function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o
     usage();
     return;
   }
+  if (o.timings.isSome() && !isCompile) {
+    console.error("error: --timings needs the compile command");
+    exit(2);
+    return;
+  }
+  const timer0 = newTimer(clock, o.timings.isSome());
   const usePrelude = !on(o, "--c-builtins") && cmd != "check" && cmd != "api" && cmd != "expand";
   const noOverlay: SourceFile[] = [];
   const loaded = loadWithRoots(
@@ -444,6 +525,7 @@ function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o
     report(loaded.sm, loaded.diags, json, ui);
     return;
   }
+  const timer1 = lapped(timer0, clock, "load");
   let program = loaded.program.unwrap();
   if (cmd == "expand") {
     const cs = expandCompanions(fs, program, loaded.sm);
@@ -511,17 +593,18 @@ function runBuildCommand(fs: FsGrant, proc: ProcessGrant, ui: TerminalOptions, o
   if (!withTests) {
     printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictFlag, ui);
   }
+  const timer2 = lapped(timer1, clock, "check");
   if (cmd == "check") {
     runCheck(program, o, json, ui);
   } else if (cmd == "mir") {
-    console.log(printProgram(buildMir(checked.unwrap(), loaded.sm, o)));
+    console.log(printProgram(buildMir(checked.unwrap(), loaded.sm, o, timer2, clock).mir));
   } else if (cmd == "verify" && verifyContractsFlag) {
     runVerifyContracts(fs, proc, program, loaded.sm, checked.unwrap(), o, json);
   } else if (cmd == "verify") {
-    if (runVerify(buildMir(checked.unwrap(), loaded.sm, o), loaded.sm, true) > 0) {
+    if (runVerify(buildMir(checked.unwrap(), loaded.sm, o, timer2, clock).mir, loaded.sm, true) > 0) {
       exit(1);
     }
   } else {
-    runCompile(fs, loaded.sm, checked.unwrap(), o, argv[3]);
+    runCompile(fs, loaded.sm, checked.unwrap(), o, argv[3], entry, timer2, clock);
   }
 }
