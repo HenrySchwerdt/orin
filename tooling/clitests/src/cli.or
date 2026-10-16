@@ -1,0 +1,161 @@
+// Command line of the CLI test harness: `orin-clitests osig [--orin PATH] [--update]` and
+// `orin-clitests fmt [--orin2 PATH] [--no-build] [--jobs N] [-v]`, each with `--root DIR`. The flags are those of
+// tools/test_osig.py and tools/test_fmt.py (`--root` is new: the Python scripts derive the root from their location).
+// `--opt=value` is accepted. Errors exit with status 2 and print `usage` and `error:` to stderr, like argparse.
+// Pure functions: tests/cli_test.or.
+
+import { reprStr } from "./text";
+
+export type Options = {
+  suite: string;     // osig | fmt
+  orin: string;      // osig: the compiler under test ("": build/bootstrap/orin2)
+  update: bool;      // osig: rewrite the golden snapshots
+  orin2: string;     // fmt: the bootstrapped compiler that builds the compiler under test
+  noBuild: bool;     // fmt: reuse build/fmt/orin when it exists
+  jobs: int;         // fmt: parallel jobs, 0 = the CPU count
+  verbose: bool;     // fmt: print every passed check
+  root: string;
+  help: bool;
+};
+
+export type Parsed = { ok: bool; options: Options; error: string; };
+
+export function defaultOptions(): Options {
+  return Options {
+    suite: "", orin: "", update: false, orin2: "build/bootstrap/orin2", noBuild: false, jobs: 0, verbose: false,
+    root: ".", help: false
+  };
+}
+
+export function usage(): string {
+  return "usage: orin-clitests [-h] {osig,fmt} ...\n"
+  + "       orin-clitests osig [--orin ORIN] [--update] [--root ROOT]\n"
+  + "       orin-clitests fmt [--orin2 ORIN2] [--no-build] [--jobs JOBS] [-v] [--root ROOT]";
+}
+
+export function helpText(): string {
+  return usage() + "\n\n"
+  + "Tests of `orin graph` / `orin diff` (OSIG) and of `orin fmt` / `orin check --format=json` (the Orin port of\n"
+  + "tools/test_osig.py and tools/test_fmt.py)\n\n"
+  + "osig options:\n"
+  + "  --orin ORIN    compiler under test (default: build/bootstrap/orin2)\n"
+  + "  --update       rewrite the golden snapshots\n\n"
+  + "fmt options:\n"
+  + "  --orin2 ORIN2  bootstrapped compiler that builds the compiler under test (default: build/bootstrap/orin2)\n"
+  + "  --no-build     reuse build/fmt/orin and build/fmt/parse_main when they exist\n"
+  + "  --jobs JOBS    parallel jobs (default: the CPU count)\n"
+  + "  -v             print every passed check\n\n"
+  + "common options:\n"
+  + "  -h, --help     show this help message and exit\n"
+  + "  --root ROOT    repository root holding tests/, compiler/ and runtime/ (default: the current directory)";
+}
+
+function fail(msg: string): Parsed {
+  return Parsed { ok: false, options: defaultOptions(), error: msg };
+}
+
+function isValueOption(a: string): bool {
+  return a == "--orin" || a == "--orin2" || a == "--root" || a == "--jobs";
+}
+
+function isFlag(a: string): bool {
+  return a == "--update" || a == "--no-build" || a == "-v";
+}
+
+// The suite an option belongs to ("" for the common ones).
+function belongsTo(a: string): string {
+  if (a == "--orin" || a == "--update") {
+    return "osig";
+  }
+  if (a == "--orin2" || a == "--jobs" || a == "--no-build" || a == "-v") {
+    return "fmt";
+  }
+  return "";
+}
+
+function apply(o: Options, name: string, value: string): Parsed {
+  if (name == "--orin") {
+    return Parsed { ok: true, options: Options { ...o, orin: value }, error: "" };
+  }
+  if (name == "--orin2") {
+    return Parsed { ok: true, options: Options { ...o, orin2: value }, error: "" };
+  }
+  if (name == "--root") {
+    return Parsed { ok: true, options: Options { ...o, root: value }, error: "" };
+  }
+  const n = parseInt(value);
+  if (n.isNone()) {
+    return fail("argument --jobs: invalid int value: " + reprStr(value));
+  }
+  return Parsed { ok: true, options: Options { ...o, jobs: n.unwrap() }, error: "" };
+}
+
+function setFlag(o: Options, name: string): Options {
+  if (name == "--update") {
+    return Options { ...o, update: true };
+  }
+  if (name == "--no-build") {
+    return Options { ...o, noBuild: true };
+  }
+  return Options { ...o, verbose: true };
+}
+
+export function parseArgs(argv: string[]): Parsed {
+  let o = defaultOptions();
+  let i: usize = 0;
+  // options seen before the suite are checked once it is known
+  let seen: string[] = [];
+  while (i < argv.length) {
+    const a = argv[i];
+    if (a == "-h" || a == "--help") {
+      return Parsed { ok: true, options: Options { ...o, help: true }, error: "" };
+    }
+    const eqAt = a.indexOf("=");
+    if (a.startsWith("--") && eqAt.isSome()) {
+      const name = a.substring(0, eqAt.unwrap());
+      if (!isValueOption(name)) {
+        return fail("unrecognized arguments: " + a);
+      }
+      const r = apply(o, name, a.substring(eqAt.unwrap() + 1, a.length));
+      if (!r.ok) {
+        return r;
+      }
+      o = r.options;
+      seen.push(name);
+    } else if (isValueOption(a)) {
+      if (i + 1 >= argv.length || argv[i + 1].startsWith("-")) {
+        return fail("argument " + a + ": expected one argument");
+      }
+      const r = apply(o, a, argv[i + 1]);
+      if (!r.ok) {
+        return r;
+      }
+      o = r.options;
+      seen.push(a);
+      i += 1;
+    } else if (isFlag(a)) {
+      o = setFlag(o, a);
+      seen.push(a);
+    } else if (a == "osig" || a == "fmt") {
+      if (o.suite != "") {
+        return fail("unrecognized arguments: " + a);
+      }
+      o = Options { ...o, suite: a };
+    } else if (a.startsWith("-")) {
+      return fail("unrecognized arguments: " + a);
+    } else {
+      return fail("argument suite: invalid choice: " + reprStr(a) + " (choose from 'osig', 'fmt')");
+    }
+    i += 1;
+  }
+  if (o.suite == "") {
+    return fail("the following arguments are required: suite");
+  }
+  for (const s of seen) {
+    const b = belongsTo(s);
+    if (b != "" && b != o.suite) {
+      return fail("unrecognized arguments: " + s);
+    }
+  }
+  return Parsed { ok: true, options: o, error: "" };
+}

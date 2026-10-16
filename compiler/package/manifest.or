@@ -16,6 +16,9 @@
 //   [modules.users]                # module = directory relative to the entry file's directory
 //   allowed_dependencies = ["database", "logging"]
 //
+//   [annotations]                  # annotation processors of dependencies that may run (ADR-0046); own and std processors always run
+//   processors = ["dep", "dep/module"]
+//
 //   [effects]                      # capability policy (ADR-0037 D4, docs/capabilities.md): the primitive effects the code of a
 //   allowed = ["Fs.Read"]          # module may perform; this table is the package default, absent = no restriction
 //   [effects.loader]               # per module (same naming as [modules.x]); a module without a table gets the default
@@ -62,6 +65,7 @@ export type Manifest = {
   rules: ModuleRule[];
   strictContracts: bool; // `[contracts] strict = true` (ADR-0028): strict contract-coverage warnings
   effects: EffectRule[]; // `[effects]` / `[effects.<module>]` (ADR-0037 D4); empty = no restriction
+  processors: string[]; // `[annotations] processors = ["dep", "dep/module"]` (ADR-0046): processors of dependencies that may run
   // The manifest file itself (the loader sets the path): the spans above point into it. A diagnostic about a table that
   // is found after loading (the effect policy, compiler/analysis/effectpolicy.or) is rendered against it.
   source: SourceFile;
@@ -190,6 +194,27 @@ function contractsTable(file: usize, t: TomlTable): Result<bool, Diagnostic> {
   return Ok(strict);
 }
 
+// `[annotations]`: `processors = ["dep", "dep/module"]`, the processors of dependencies that may run (ADR-0046 §2).
+function annotationsTable(file: usize, t: TomlTable): Result<string[], Diagnostic> {
+  let out: string[] = [];
+  for (const e of t.entries) {
+    if (e.key != "processors") {
+      return Err(
+        invalid(file, entrySpan(file, e), "unknown key `" + e.key + "` in [annotations] (expected processors)"),
+      );
+    }
+    match (e.value) {
+      TArr(xs) => {
+        out = xs;
+      },
+      _ => {
+        return Err(invalid(file, entrySpan(file, e), "`processors` must be an array of strings"));
+      },
+    }
+  }
+  return Ok(out);
+}
+
 // `[effects]` or `[effects.<module path>]`: one key, `allowed`, an array of strings.
 function effectRule(file: usize, t: TomlTable): Result<EffectRule, Diagnostic> {
   const mname = t.path.slice(1, t.path.length).join("/");
@@ -267,6 +292,7 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
     rules: noRules,
     strictContracts: false,
     effects: noEffects,
+    processors: [],
     source: SourceFile { path: "orin.toml", text: text },
   };
   let havePackage = false;
@@ -325,6 +351,12 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
         return Err(r.unwrapErr());
       }
       m = Manifest { ...m, strictContracts: r.unwrap() };
+    } else if (head == "annotations" && t.path.length == 1) {
+      const r = annotationsTable(file, t);
+      if (r.isErr()) {
+        return Err(r.unwrapErr());
+      }
+      m = Manifest { ...m, processors: r.unwrap() };
     } else if (head == "effects") {
       const r = effectRule(file, t);
       if (r.isErr()) {
@@ -370,7 +402,7 @@ export function parseManifest(file: usize, text: string): Result<Manifest, Diagn
           file,
           span(file, t.start, t.end),
           "unknown table `[" + t.path.join(".")
-              + "]` (expected [package], [architecture], [contracts], [effects] or [modules.<path>])",
+              + "]` (expected [package], [architecture], [contracts], [annotations], [effects] or [modules.<path>])",
         ),
       );
     }

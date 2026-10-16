@@ -1,6 +1,6 @@
 # ADR-0046: User-defined annotations and pure annotation processors
 
-Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below; S1-S4 implemented, S5 and S6 see the slice table).
+Date: 2026-10-16. Status: **implemented** (slices S1-S6; the LSP/MCP/OSIG expansion of generated code is listed under "Not done" in the "As built" notes of S4 and S5 and in docs/known-limitations.md).
 Related: spec/05-annotations-and-metaprogramming.md, ADR-0012 (contract clauses), ADR-0016 (1.0 scope, amended
 here), ADR-0024 (built-in annotations), ADR-0027 (capabilities), ADR-0044 (OX, `@Sealed`), ADR-0020/0023 (OSIG).
 Supersedes the first draft of this ADR (PR #109), whose three-capability split, safety rules and alternatives are kept.
@@ -190,7 +190,7 @@ on `main`; parser and checker overlaps with ADR-0049 are coordinated with that w
 | **S3 `std:meta`** | `Input`/`Output`/`MDecl`/`MStmt`/`MExpr`/`MType`, builders, `fresh`, the stable JSON encoding of both | pure std tests with `@Test`; round-trip encode/decode; parallel to S1 |
 | **S4 expansion without execution** | `.gen` placeholders in the loader, sub-program check, snapshot extraction, Output -> AST conversion, hygiene and collision checks (E0449, E0521), re-check, `orin expand`; test hook that feeds a recorded `Output` | goldens from recorded outputs, negative tests (bad names, cycles, private leaks, generated type errors), both backends |
 | **S5 processor execution** | `@Processor` rules and purity (E0448), harness build, run with limits (E0520), cache, `[annotations]` policy, W0490 | tests for traps, timeouts, oversized output, impure processors, cache hits |
-| **S6 proof of usefulness** | `@Json`/`@JsonName` with `jsonCodecs` in `std:json`; a route-table example package (`@Route`) in `examples/`; docs/annotations.md, spec 05, known limitations | goldens, C/LLVM differential on generated code, compile-time and binary-size numbers in docs/benchmarks.md |
+| **S6 proof of usefulness** | `@Json`/`@JsonName` with `jsonCodecs` as an **example package** `examples/json-codec` (owner decision 2026-10-16: not in the compiler, not in `std`); a route-table example `examples/routes` (`@Route`); docs, known limitations | goldens, C/LLVM differential on generated code, compile-time numbers in docs/benchmarks.md |
 
 **As built in S4.** The test hook is a sidecar file `<module path without .or>.gen.<AnnotationName>.json` next to the source
 module, holding a recorded `std:meta` `Output` (docs/annotation-processors.md). It is read only when the program imports a
@@ -202,6 +202,37 @@ diagnostic reported by the processor, W0491 a processor warning. The span of gen
 annotated declaration of the run; diagnostics inside generated code carry a note naming the run. Compiler code: `compiler/meta`
 (snapshot, Output to AST, hygiene), `compiler/expand` (pipeline, `orin expand` text). Not done in S4: LSP, MCP, `orin test`
 and OSIG do not run the expansion (a `.gen` import is E0300 there); OSIG `GENERATED_BY` edges.
+
+**As built in S5.** `@Processor(A)` is read by the parser as the user annotation `Processor` with one argument (no parser change);
+`check/userannos.or` skips that name and `compiler/expand/processors.or` does the rest: placement, signature, "same module as `A`",
+one per annotation, and purity (`inferPurity` of the contract checker; the explanation is the one `E0416` prints), all E0448. The
+purity analysis already counts every I/O built-in and every grant as impure, and the signature gives a processor no grant, so no
+separate effects pass runs. `compiler/expand/helper.or` builds the helper by loading the processor module together with a
+generated overlay file `__orin_processor_main.or` through the ordinary loader (module rules apply as for any file of that
+directory), compiles it like `orin test` does (C backend only; `--cc`, `--runtime`) and runs it with `ORIN_DENY=fs,process,clock,net`
+(not `all`: the harness exchanges `Input`/`Output` over stdio, and the processor has no grant to reach it), the deadline of
+`std:io.shellTimeout` (`--processor-timeout`, default 10 s), the output piped through `head -c` (16 MiB) and the global limit of 10,000
+generated declarations; every failure is E0520 with the stderr as a note. A heap limit is not implemented (deadline and output cap
+only). The cache lives in `<package>/.orin/processors/<helper key>/` (`--processor-cache`): `helper` and `out-<input key>.json`;
+the helper key hashes the format version, the generated main and path and text of the processor module's import closure (std
+included); the C compiler is not in the key, so `orin check` can use a cache built by another compiler. `orin check` without a C
+compiler and without a cached helper reports W0490 and leaves the companion empty; `compile` and `expand` fail with E0520. The
+trust policy is `[annotations] processors = ["dep", "dep/module"]` (a dependency name, or dependency and module path below its
+`src`); an unlisted dependency processor is not run and reports W0492. A recorded sidecar output (the S4 hook) wins over a processor.
+New codes: E0448, W0490, W0492. Not done in S5: LSP, MCP, `orin test`, `orin graph`, `orin effects` do not expand; OSIG `GENERATED_BY`;
+the helper is always built with the C backend; no memory limit.
+
+**As built in S6 (2026-10-16).** `@Json` is not part of `std:json` or the compiler: `examples/json-codec/lib` is an ordinary package
+(annotations `Json`, `JsonName`, the processor `jsonCodecs`, and a runtime support module that the generated code calls) and
+`examples/json-codec/app` uses it through a path dependency with `[annotations] processors = ["json-codec"]`. The processor
+needed no compiler change. Findings that shape the example: a dependency exposes only its root module `src/module.or`, so the
+runtime support is re-exported from it; there are no import aliases, so `std:json`'s `Json` value type is exported as `JsonValue`
+(the annotation owns the name `Json`); a processor is stateless (parameters and class instances cannot be mutated through a call),
+so helper names are a function of the type (`fresh("encArrOfstring", freshBase)`); `std:json` has integers only, so `float` fields are
+a processor diagnostic; a companion cannot import another companion (E0520, one round of expansion), so a `@Json` record nested in
+another record must be declared in the same module (cross-module nesting is a diagnostic that says so). `examples/routes` generates
+a route table and a matcher from `@Route` on methods; handlers are named, not called (a processor cannot form a method value).
+Tests: `tools/test_processors.py` (goldens of `orin expand`, C and LLVM output identical, diagnostics of `tests/processors/json_bad`).
 
 S1 and S3 can run in parallel (parser/checker vs. std only). S2 follows S1; S4 needs S1 and S3; S5 follows S4; S6
 follows S5. Every slice keeps contracts, built-ins and their codes unchanged.
