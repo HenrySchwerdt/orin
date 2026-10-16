@@ -25,7 +25,8 @@ import {
   ClassInfo, MethodInfo, ValEnt, Inst, mapOrigin, parOrigin, mapGenType, isMapKeyType, EntRecord, EntUnion,
   EntAlias, EntGen, EntIface, EntBuiltin, typeEq, isBool, isString, isVoid, isIntish, isFloatTy,
   isArrayTy, isIface, isSignedInt, isFn, showType, mismatch, globalVal, findType, findVal, originOf,
-  boundOf, ifaceMethodIndex, IfaceSig, typeInRange, isWellFormedEnv,
+  boundOf, ifaceMethodIndex, IfaceSig, typeInRange, isWellFormedEnv, CmOld, CmEnsures, sameContractMode, inContract,
+  isEnsuresMode, isOldMode, isMutRetMode, isUnit, isRecordKind,
 } from "./env";
 import { checkBounds, internVtable } from "./ifaces";
 import {
@@ -52,7 +53,7 @@ import { liftClosure, wrapperOf } from "./lift";
 import { Inference, grantMissingErr, grantMismatchErr } from "./call";
 import { localsBound, placeBound } from "./hirok";
 import {
-  OxOut, OxProvider, OX_MARKUP, OX_COMPONENTS, oxProvider, sealedErr, oxEncodeStatic, oxIsVoid, oxIsRawText, oxRuleFor,
+  OxOut, OxProvider, OxMarkup, OxComponents, isOxMarkup, oxProvider, sealedErr, oxEncodeStatic, oxIsVoid, oxIsRawText, oxRuleFor,
   isTagName, isAttrName, asciiLower, oxOutNew, oxOutStatic, oxOutDyn, oxOutFinish,
 } from "./ox";
 
@@ -193,7 +194,8 @@ export class ExprChecker {
   @Ensures(result.isOk() ==> localsBound(result.unwrap(), this.fx.locals.length))
   @Ensures(result.isOk() ==> this.fx.scope.depth() == old(this.fx.scope.depth()))
   @Ensures(result.isOk()
-      ==> this.fx.loops.length == old(this.fx.loops.length) && this.fx.cmode == old(this.fx.cmode))
+      ==> this.fx.loops.length == old(this.fx.loops.length)
+          && sameContractMode(this.fx.cmode, old(this.fx.cmode)))
   @Ensures(result.isOk() ==> this.fx.pre.length >= old(this.fx.pre.length))
   @Ensures(this.fx.locals.length >= old(this.fx.locals.length))
   check(e: Expr, exp: Option<Type>): Result<HExpr, Diagnostic> {
@@ -278,7 +280,7 @@ export class ExprChecker {
         return this.index(span, base, idx);
       },
       ETry(x) => {
-        if (this.fx.cmode > 0) {
+        if (inContract(this.fx.cmode)) {
           return Err(diag("E0415", span, "`?` is not allowed in a contract expression"));
         }
         return this.tryExpr(span, x);
@@ -449,7 +451,7 @@ export class ExprChecker {
     if (el.name.isNone()) {
       return this.oxFragment(p, el.children, exp, el.span);
     }
-    if (p.kind == OX_COMPONENTS) {
+    if (!isOxMarkup(p.kind)) {
       return this.oxProviderElement(p, el);
     }
     const o = this.oxEmit(p, el, oxOutNew())?;
@@ -852,7 +854,7 @@ export class ExprChecker {
       None => p.result,
     };
     if (typeEq(t, p.result)) {
-      if (p.kind == OX_MARKUP) {
+      if (isOxMarkup(p.kind)) {
         const o = this.oxChildren(p, kids, false, oxOutNew())?;
         return Ok(this.oxWrap(p, oxOutFinish(o, span), span));
       }
@@ -1002,7 +1004,7 @@ export class ExprChecker {
       return Ok(s);
     }
     if (typeEq(e, p.result)) {
-      if (p.kind == OX_COMPONENTS) {
+      if (!isOxMarkup(p.kind)) {
         return Ok(mk(XCall(p.ctext, [s]), p.result, span));
       }
       const enc = match (s.kind) {
@@ -1659,7 +1661,7 @@ export class ExprChecker {
     };
     if (isImpl) {
       // `a ==> b` (ADR-0012) is `!a || b` (short-circuit); only valid inside contract expressions.
-      if (this.fx.cmode == 0) {
+      if (!inContract(this.fx.cmode)) {
         return Err(
           diag(
             "E0415",
@@ -1702,7 +1704,7 @@ export class ExprChecker {
 
   // `t` is a Map instance and the code being checked is not the Map prelude itself (which owns the fields).
   private outsideMapPrelude(t: Type): bool {
-    return this.fx.unit.toInt() != this.fx.env.mapUnit && mapOrigin(this.fx.env, t).isSome();
+    return !isUnit(this.fx.env.mapUnit, this.fx.unit) && mapOrigin(this.fx.env, t).isSome();
   }
 
   private member(span: Span, base: Expr, name: Ident): Result<HExpr, Diagnostic> {
@@ -1784,7 +1786,7 @@ export class ExprChecker {
             );
           },
         }
-        if (this.fx.fmode == 4) {
+        if (isMutRetMode(this.fx.fmode)) {
           return this.tryInMutating(o, span, t, et);
         }
         return Ok(mk(XTry(o), t, span));
@@ -2076,7 +2078,7 @@ export class ExprChecker {
         let rid: usize = 0;
         match (o) {
           Some(inst) => {
-            if (inst.kind == 0 && inst.gid == g) {
+            if (isRecordKind(inst.kind) && inst.gid == g) {
               ok = true;
               rid = inst.id;
             }
@@ -2277,7 +2279,7 @@ export class ExprChecker {
     args: Expr[],
     exp: Option<Type>,
   ): Result<HExpr, Diagnostic> {
-    if (this.fx.cmode > 0) {
+    if (inContract(this.fx.cmode)) {
       match (callee.kind) {
         EIdent(id) => {
           if (id.name == "old") {
@@ -2305,14 +2307,14 @@ export class ExprChecker {
 
   // `old(e)` in an `@Ensures` expression (ADR-0012): the value of `e` in the pre-state. Type checking
   // treats it as `e` itself (the runtime-check expansion evaluates it at entry).
-  @Ensures(result.isOk() ==> this.fx.cmode == 2)
+  @Ensures(result.isOk() ==> isEnsuresMode(this.fx.cmode))
   private oldExpr(span: Span, args: Expr[]): Result<HExpr, Diagnostic> {
-    if (this.fx.cmode != 2) {
+    if (!isEnsuresMode(this.fx.cmode)) {
       return Err(
         diag(
           "E0415",
           span,
-          this.fx.cmode == 3
+          isOldMode(this.fx.cmode)
               ? "`old(..)` cannot be nested"
               : "`old(..)` is only allowed in an @Ensures expression",
         ),
@@ -2321,9 +2323,9 @@ export class ExprChecker {
     if (args.length != 1) {
       return Err(diag("E0404", span, "`old` expects 1 argument, found " + args.length.toString()));
     }
-    this.fx.setCmode(3);
+    this.fx.setCmode(CmOld);
     const r = this.ex(args[0], None)?;
-    this.fx.setCmode(2);
+    this.fx.setCmode(CmEnsures);
     return Ok(r);
   }
 
@@ -3536,7 +3538,7 @@ export class ExprChecker {
     const env = this.fx.env;
     if (name.name == "Map"
         && findType(env.units[this.fx.unit].scope, "Map").isNone()
-        && env.mapUnit >= 0) {
+        && env.mapUnit.isSome()) {
       return this.newMap(span, targs, args, exp);
     }
     const found = findType(env.units[this.fx.unit].scope, name.name);
@@ -3758,7 +3760,7 @@ export class ExprChecker {
     const fo = instFunc(this.fx.env, mi.fid, args, this.fx.depth + 1, span)?;
     const f = fo.env.funcs[fo.fid];
     let rr: usize = 0;
-    if (f.mode == 4) {
+    if (isMutRetMode(f.mode)) {
       rr = match (f.ret) {
         TyRecord(r) => r,
         _ => 0,
@@ -4116,7 +4118,7 @@ export class ExprChecker {
       name.span,
       "no method `" + n + "` on type `" + showType(this.fx.env, TyArray(elem)) + "`",
     );
-    if (this.fx.env.prelude < 0) {
+    if (this.fx.env.prelude.isNone()) {
       return Err(noMethod);
     }
     const argTy: Option<Type> = (n == "indexOf" || n == "includes") && isIntish(elem)
@@ -4125,7 +4127,7 @@ export class ExprChecker {
     return this.preludeCall(
       b,
       span,
-      this.fx.env.prelude.toUsize(),
+      this.fx.env.prelude.unwrap(),
       fname,
       n,
       noMethod,
@@ -4152,7 +4154,7 @@ export class ExprChecker {
       name.span,
       "no method `parallel` on type `" + showType(this.fx.env, TyArray(elem)) + "`",
     );
-    if (this.fx.env.parUnit < 0) {
+    if (this.fx.env.parUnit.isNone()) {
       return Err(noMethod);
     }
     if (!this.parallelElem(elem)) {
@@ -4167,7 +4169,7 @@ export class ExprChecker {
       );
     }
     return this.preludeCall(
-      b, span, this.fx.env.parUnit.toUsize(), "parallel", "parallel", noMethod, args, noPre(args.length), exp, None,
+      b, span, this.fx.env.parUnit.unwrap(), "parallel", "parallel", noMethod, args, noPre(args.length), exp, None,
     );
   }
 
@@ -4216,7 +4218,7 @@ export class ExprChecker {
       return Err(noMethod);
     }
     return this.preludeCall(
-      b, span, this.fx.env.parUnit.toUsize(), fname, n, noMethod, args, noPre(args.length), exp, None,
+      b, span, this.fx.env.parUnit.unwrap(), fname, n, noMethod, args, noPre(args.length), exp, None,
     );
   }
 
@@ -4320,7 +4322,7 @@ export class ExprChecker {
     if (this.fx.abs) {
       return Ok(0);
     }
-    const ent = findVal(this.fx.env.units[this.fx.env.mapUnit.toUsize()].scope, fname);
+    const ent = findVal(this.fx.env.units[this.fx.env.mapUnit.unwrap()].scope, fname);
     if (ent.isSome()) {
       match (ent.unwrap()) {
         VGFunc(g) => {
@@ -4399,7 +4401,7 @@ export class ExprChecker {
     inst: Inst,
   ): Result<HExpr, Diagnostic> {
     const n = name.name;
-    const unit = this.fx.env.mapUnit.toUsize();
+    const unit = this.fx.env.mapUnit.unwrap();
     const noMethod = diag(
       "E0405",
       name.span,

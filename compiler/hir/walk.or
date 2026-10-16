@@ -1,0 +1,145 @@
+// A generic fold over the HIR (ADR-0049, audit item A4). One traversal that every analysis over a checked function body
+// shares, instead of one hand-written 100-line `match` over `HExprKind` per pass. The state `S` is threaded explicitly:
+// a closure cannot mutate a captured variable, so the callback takes the state and returns the next one (a state that is
+// a record of arrays may update them in place, as the passes do).
+//
+// Order (fixed, and the order the passes in check/ always used):
+//   * `foldExpr` calls `f(e, s)` on the node FIRST (pre-order), then visits the children left to right:
+//       XUnary x | XBinary a b | XCall / XBuiltin / XVariant / XArray args | XField base | XIndex base index
+//       XRecord spread (if any), then the explicit fields' values in source order | XTry x | XCond c t f
+//       XMutMethod: the index expressions of the place path, then args
+//       XMatch: the scrutinee, then for each arm its body block and then its value (patterns bind locals only)
+//       XClosure the captures | XCallIndirect callee, args | XIface value | XCallVirtual receiver, args
+//   * `foldStmt` visits: HLet init | HAssign the index expressions of the place path, then the value | HExprStmt e
+//       HIf cond, then-block, else-block | HWhile cond, body | HForOf iterated expression, body | HReturn value
+//       HBlockStmt block (HBreak / HContinue have no children). Statements carry no callback of their own.
+// A pass that decides per node whether to skip the subtree, or passes a context down, does not fit this fold and keeps its
+// own walk (check/resources.or, check/hirok.or).
+
+import { HExpr, HStmt, HBlock, Place } from "./hir";
+
+export function foldExprs<S>(es: HExpr[], s0: S, f: (e: HExpr, s: S) => S): S {
+  let s = s0;
+  for (const e of es) {
+    s = foldExpr(e, s, f);
+  }
+  return s;
+}
+
+// The index expressions of a place path, in order.
+export function foldPlace<S>(p: Place, s0: S, f: (e: HExpr, s: S) => S): S {
+  let s = s0;
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => { s = foldExpr(ix, s, f); },
+      _ => {}
+    }
+  }
+  return s;
+}
+
+export function foldExpr<S>(e: HExpr, s0: S, f: (e: HExpr, s: S) => S): S {
+  let s = f(e, s0);
+  match (e.kind) {
+    XUnary(_, x) => { s = foldExpr(x, s, f); },
+    XBinary(_, a, b) => {
+      s = foldExpr(a, s, f);
+      s = foldExpr(b, s, f);
+    },
+    XCall(_, args) => { s = foldExprs(args, s, f); },
+    XBuiltin(_, args) => { s = foldExprs(args, s, f); },
+    XMutMethod(_, p, args) => {
+      s = foldPlace(p, s, f);
+      s = foldExprs(args, s, f);
+    },
+    XField(b, _, _) => { s = foldExpr(b, s, f); },
+    XIndex(a, b) => {
+      s = foldExpr(a, s, f);
+      s = foldExpr(b, s, f);
+    },
+    XRecord(_, spread, fields) => {
+      match (spread) {
+        Some(x) => { s = foldExpr(x, s, f); },
+        None => {}
+      }
+      for (const fi of fields) {
+        s = foldExpr(fi.value, s, f);
+      }
+    },
+    XVariant(_, args) => { s = foldExprs(args, s, f); },
+    XArray(xs) => { s = foldExprs(xs, s, f); },
+    XTry(x) => { s = foldExpr(x, s, f); },
+    XCond(a, b, c) => {
+      s = foldExpr(a, s, f);
+      s = foldExpr(b, s, f);
+      s = foldExpr(c, s, f);
+    },
+    XMatch(x, arms) => {
+      s = foldExpr(x, s, f);
+      for (const a of arms) {
+        s = foldBlock(a.body, s, f);
+        match (a.value) {
+          Some(v) => { s = foldExpr(v, s, f); },
+          None => {}
+        }
+      }
+    },
+    XClosure(_, caps) => { s = foldExprs(caps, s, f); },
+    XCallIndirect(c, args) => {
+      s = foldExpr(c, s, f);
+      s = foldExprs(args, s, f);
+    },
+    XIface(_, v) => { s = foldExpr(v, s, f); },
+    XCallVirtual(r, _, args) => {
+      s = foldExpr(r, s, f);
+      s = foldExprs(args, s, f);
+    },
+    _ => {}
+  }
+  return s;
+}
+
+export function foldBlock<S>(b: HBlock, s0: S, f: (e: HExpr, s: S) => S): S {
+  let s = s0;
+  for (const st of b.stmts) {
+    s = foldStmt(st, s, f);
+  }
+  return s;
+}
+
+export function foldStmt<S>(st: HStmt, s0: S, f: (e: HExpr, s: S) => S): S {
+  let s = s0;
+  match (st) {
+    HLet(_, e) => { s = foldExpr(e, s, f); },
+    HAssign(p, _, e) => {
+      s = foldPlace(p, s, f);
+      s = foldExpr(e, s, f);
+    },
+    HExprStmt(e) => { s = foldExpr(e, s, f); },
+    HIf(c, t, el) => {
+      s = foldExpr(c, s, f);
+      s = foldBlock(t, s, f);
+      match (el) {
+        Some(b) => { s = foldBlock(b, s, f); },
+        None => {}
+      }
+    },
+    HWhile(c, b) => {
+      s = foldExpr(c, s, f);
+      s = foldBlock(b, s, f);
+    },
+    HForOf(_, it, b) => {
+      s = foldExpr(it, s, f);
+      s = foldBlock(b, s, f);
+    },
+    HReturn(o) => {
+      match (o) {
+        Some(e) => { s = foldExpr(e, s, f); },
+        None => {}
+      }
+    },
+    HBlockStmt(b) => { s = foldBlock(b, s, f); },
+    _ => {}
+  }
+  return s;
+}

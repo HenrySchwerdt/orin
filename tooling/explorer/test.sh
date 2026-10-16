@@ -2,7 +2,7 @@
 # Tests of tooling/explorer (the code explorer, ADR-0050).
 #   1. the embedded assets are generated from theme/explorer.{css,js}; the fixture snapshots and the diff are what
 #      `orin graph` / `orin diff` write for tooling/explorer/testdata/shop/{base,head} today (so an OSIG change shows up here);
-#   2. the @Test suite: escaping of hostile text on every page, no remote resources and no inline script, determinism,
+#   2. the @Test suites (explorer_test.or, business_test.or): escaping of hostile text on every page, no remote resources and no inline script, determinism,
 #      slugs, the empty diff, refused inputs, the graph layout;
 #   3. the `explore` program: its site for the fixture equals testdata/golden/ byte for byte, two runs are identical,
 #      bad input fails with a diagnostic and writes nothing, and the site works offline (relative links only, all of them
@@ -29,6 +29,9 @@ grep -q '"doc":"Price of `qty` items' $T/shop.head.graph.json && ok "the snapsho
 out=$($ORIN2 test tooling/explorer/tests/explorer_test.or --runtime runtime/core 2>&1) \
   && ok "tooling/explorer tests: $(echo "$out" | tail -1)" || { echo "$out"; bad "tooling/explorer tests"; }
 
+out=$($ORIN2 test tooling/explorer/tests/business_test.or --runtime runtime/core 2>&1) \
+  && ok "business view tests (ADR-0051): $(echo "$out" | tail -1)" || { echo "$out"; bad "business view tests"; }
+
 $ORIN2 compile tooling/explorer -o "$B/ex.c"
 cc -O1 -w -I runtime/core "$B/ex.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$B/explore"
 EX=$B/explore
@@ -39,6 +42,14 @@ if diff -r $T/golden "$B/site1" > "$B/golden.diff"; then ok "site for the fixtur
 diff -r "$B/site1" "$B/site2" > /dev/null && ok "two runs are byte-identical" || bad "output is not deterministic"
 "$EX" $T/shop.head.graph.json --out "$B/nodiff" 2> /dev/null
 [ ! -e "$B/nodiff/diff.html" ] && ! grep -q 'href="diff.html"' "$B/nodiff/index.html" && ok "without --diff there is no changes page and no link to it" || bad "diff page without --diff"
+
+for f in business.html usecases.html rules.html capabilities.html behaviour.html u/root-main.html assets/business.css; do
+  [ -f "$B/site1/$f" ] || bad "business view: $f missing"
+done
+[ ! -e "$B/nodiff/behaviour.html" ] && ! grep -q 'href="behaviour.html"' "$B/nodiff/business.html" && [ -f "$B/nodiff/business.html" ] \
+  && ok "business view: pages written; no behaviour page and no link to it without --diff" || bad "business view without --diff"
+grep -q 'New rule: ' "$B/site1/behaviour.html" && grep -q 'may now read the clock' "$B/site1/behaviour.html" && grep -q 'must be zero or greater' "$B/site1/rules.html" \
+  && ok "business view: rule sentences and behaviour changes in plain language" || bad "business view: expected sentences missing"
 
 # every relative link and every stylesheet / script reference of every page resolves to a file of the site
 python3 - "$B/site1" <<'PY' && ok "all links of the site resolve (offline, relative only)" || bad "dangling or absolute link"
