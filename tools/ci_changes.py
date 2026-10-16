@@ -9,7 +9,7 @@ std is embedded in the compiler:
   library/std/<m>.or, tests/std/<m>*                  -> build + all test jobs, std mutants of <m> only
   compiler/, runtime/, seed/, tools/  -> build + all test jobs (+ macOS); std mutants only
                                                     for modules whose source or tests changed
-  tools/mutate_std.py, tests/std/spec_sorted.or,
+  tools/mutation.sh, tooling/mutation/**, tests/std/spec_sorted.or,
   tests/std/expect_trap/**, the workflow itself  -> all std mutants
 
 Independent C/LLVM oracle checks select encoding/jsonnumber/jsonvalue/jsondecode/url for their source, tests or runners;
@@ -26,12 +26,14 @@ import subprocess
 import sys
 
 MODULES = ["bytes", "utf8", "collections", "http", "net", "text", "html", "taskcore"]
-# modules whose mutants are split over several CI jobs (tools/mutate_std.py --shard I/N): the http mutants run the slow
+# modules whose mutants are split over several CI jobs (tools/mutation.sh std --shard I/N): the http mutants run the slow
 # property tests, about 15 minutes on one runner
 SHARDS = {"http": 3}
 # std modules that only declare types for another module's tests (library/std/ox.or: the OX provider types std:html uses)
 DEPENDENTS = {"library/std/ox.or": "html"}
-ALL_MUTANTS = ["tools/mutate_std.py", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
+ALL_MUTANTS = ["tools/mutation.sh", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
+# the mutation tool (an Orin package, ADR-0047 phase 5): any change of its code runs every std mutant
+MUTATION_TOOL = "tooling/mutation/"
 MACOS = ("compiler/", "runtime/", "seed/", "tools/", "tooling/", ".github/")
 
 
@@ -77,7 +79,8 @@ def decide(files, everything=False):
     vscode = any(f.startswith("editors/vscode/") for f in files)
     checks = std_backend_checks(files)
     macos = any(f.startswith(MACOS) for f in files) or bool(checks)
-    if any(f in ALL_MUTANTS or f.startswith("tests/std/expect_trap/") for f in files):
+    if any(f in ALL_MUTANTS or f.startswith("tests/std/expect_trap/") or (f.startswith(MUTATION_TOOL) and not is_doc(f))
+           for f in files):
         mutants = list(MODULES)
     else:
         mutants = [m for m in MODULES
@@ -101,7 +104,10 @@ def selftest():
         (["library/std/README.md"], {"code": True, "macos": False, "vscode": False, "mutants": []}),
         (["compiler/lower/ops.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tests/std/http_prop_test.or"], {"code": True, "macos": False, "vscode": False, "mutants": ["http"]}),
-        (["tools/mutate_std.py"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
+        (["tools/mutation.sh"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
+        (["tooling/mutation/src/std_check.or"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
+        (["tooling/mutation/tests/cli_test.or"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
+        (["tooling/conformance/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tooling/differential/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tools/differential.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tooling/protocol/src/lsp.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
