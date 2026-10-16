@@ -2,21 +2,23 @@
 // report, and writes a static, offline site: overview, module graph, symbol pages with documentation, contracts and effects,
 // processes and the changes between two states.
 //
-//   explore SNAPSHOT.json [--diff DIFF.json] [--title NAME] --out DIR
+//   explore SNAPSHOT.json [--diff DIFF.json] [--runs FILE-OR-DIR] [--title NAME] --out DIR
 //
 // Deterministic: the same inputs give byte-identical files. Exit 1 on unreadable or invalid input, 2 on a usage error.
 
 import { Host, useHost } from "std:host";
-import { FsGrant, readFile, writeFile } from "std:fs";
+import { FsGrant, readFile, writeFile, exists, listDir } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 import { shell } from "std:io";
 import { decodeSnap, decodeDiff, Diff } from "./model";
-import { buildSite } from "./site";
+import { buildSiteWith } from "./site";
+import { decodeRuns, sortRuns, Run } from "./runs";
 
 function usage(): void {
-  console.error("usage: explore SNAPSHOT.json [--diff DIFF.json] [--title NAME] --out DIR");
+  console.error("usage: explore SNAPSHOT.json [--diff DIFF.json] [--runs FILE-OR-DIR] [--title NAME] --out DIR");
   console.error("  SNAPSHOT.json  the output of `orin graph <package> -o SNAPSHOT.json`");
   console.error("  NAME           the display name of the package (default: the package name of the snapshot; a package without a manifest is \"_\")");
+  console.error("  FILE-OR-DIR    run history (orin-runs/0.1 records, tools/run_record.py): one file, or a directory of *.json files; adds per-phase times and suite outcomes to the Processes page (optional)");
   console.error("  DIFF.json      the output of `orin diff --base A --head B --format=json -o DIFF.json` (optional)");
   exit(2);
 }
@@ -34,6 +36,50 @@ function joinPath(dir: string, name: string): string {
   return dir.endsWith("/") ? dir + name : dir + "/" + name;
 }
 
+// The records of a file, or of every *.json file of a directory (a file that holds none is reported and skipped; a path that
+// yields no record at all is an error).
+function loadRuns(fs: FsGrant, proc: ProcessGrant, path: string): Result<Run[], string> {
+  if (!exists(fs, path)) {
+    return Err("cannot read " + path + ": no such file or directory");
+  }
+  let runs: Run[] = [];
+  if (shell(proc, "test -d " + shellQuote(path)) != 0) {
+    const text = readFile(fs, path);
+    if (text.isErr()) {
+      return Err("cannot read " + path + ": " + text.unwrapErr());
+    }
+    const r = decodeRuns(text.unwrap());
+    if (r.isErr()) {
+      return Err(path + ": " + r.unwrapErr());
+    }
+    runs = r.unwrap();
+  } else {
+    for (const e of listDir(fs, path)) {
+      if (!e.endsWith(".json") || e.startsWith(".")) {
+        continue;
+      }
+      const p = joinPath(path, e);
+      const t = readFile(fs, p);
+      if (t.isErr()) {
+        console.error("explore: skipping " + p + ": " + t.unwrapErr());
+        continue;
+      }
+      const r = decodeRuns(t.unwrap());
+      if (r.isErr()) {
+        console.error("explore: skipping " + p + ": " + r.unwrapErr());
+        continue;
+      }
+      for (const x of r.unwrap()) {
+        runs.push(x);
+      }
+    }
+    if (runs.length == 0) {
+      return Err(path + ": no run record found");
+    }
+  }
+  return Ok(sortRuns(runs));
+}
+
 function main(host: Host): void {
   useHost(host, (fs, proc, stdio, clock) => { run(fs, proc); });
 }
@@ -42,12 +88,16 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
   const a = args(proc);
   let snapPath = "";
   let diffPath = "";
+  let runsPath = "";
   let out = "";
   let title = "";
   let i: usize = 0;
   while (i < a.length) {
     if (a[i] == "--diff" && i + 1 < a.length) {
       diffPath = a[i + 1];
+      i += 2;
+    } else if (a[i] == "--runs" && i + 1 < a.length) {
+      runsPath = a[i + 1];
       i += 2;
     } else if (a[i] == "--title" && i + 1 < a.length) {
       title = a[i + 1];
@@ -95,7 +145,16 @@ function run(fs: FsGrant, proc: ProcessGrant): void {
   if (title.length > 0) {
     sn.pkg = title;
   }
-  const files = buildSite(sn, diff);
+  let runs: Run[] = [];
+  if (runsPath.length > 0) {
+    const loaded = loadRuns(fs, proc, runsPath);
+    if (loaded.isErr()) {
+      fail(loaded.unwrapErr());
+      return;
+    }
+    runs = loaded.unwrap();
+  }
+  const files = buildSiteWith(sn, diff, runs);
   if (shell(proc, "mkdir -p " + shellQuote(joinPath(out, "m")) + " " + shellQuote(joinPath(out, "s")) + " " + shellQuote(joinPath(out, "u")) + " " + shellQuote(joinPath(out, "assets"))) != 0) {
     fail("cannot create the directory " + out);
     return;

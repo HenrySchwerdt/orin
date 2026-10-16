@@ -70,6 +70,8 @@ mkdir -p build
   echo "first: sh tools/test_resources.sh"
   echo "first: sh tools/test_capabilities.sh"
   echo 'python3 tools/test_time.py --orinc "$ORIN2"'
+  # orin compile --timings (byte-identical output, schema) and the CI run record (ADR-0050 step 3)
+  echo 'python3 tools/test_timings.py --orinc "$ORIN2"'
   echo "first: sh tools/test_net.sh"
 } | python3 tools/parallel.py $JOBS
 # Guard: every compiler unit test file must be run by some test script or CI step (an unwired test
