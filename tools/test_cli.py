@@ -46,8 +46,10 @@ class CliTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_cli(self, *args, code=0, cwd=None, env=None):
+        # CI implies --locked in workspace mode; tests set it explicitly where they mean it.
+        base = {k: v for k, v in os.environ.items() if k != "CI"}
         result = subprocess.run([str(self.cli), *args], cwd=cwd or self.cwd,
-                                env={**os.environ, "NO_COLOR": "1", **(env or {})},
+                                env={**base, "NO_COLOR": "1", **(env or {})},
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
