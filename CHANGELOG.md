@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **Unique receivers and results across calls (ADR-0038 lever 2, T5; MIR v2.5, verifier rules U2-U5; `compiler/opt/uniqflags.or`).** Two new
+  `MFunction` flags, `unique-in` (the in/out receiver is `Unique` on entry) and `unique-out` (the value handed back is `Unique`), set by the
+  optimiser by optimistic assumption and retraction and re-checked by the verifier at both ends of every call; the emitters ignore them. A
+  `Unique` receiver stays `Unique` across `r.next()` in a loop, so neither the call site nor the callee tests `rc` again. mutres -5.6% executed
+  instructions, the other four lever-2 benchmarks unchanged, self-compile +0.83%; only `cow_inplace` moves. Verifier fix found on the way: an
+  in/out call now demotes its `Unique` arguments in borrowed positions (the callee can keep a copy of them in the receiver it hands back).
 - **Project CLI and terminal UX.** `orin init` (application, library, HTTP template), project discovery,
   content-cached native builds, `dev`/test watch, project-wide formatting and independent test discovery.
   Source diagnostics have themed colors, source excerpts and bounded multiline highlights; compact/JSON,

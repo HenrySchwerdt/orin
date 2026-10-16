@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.4; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4)
+# MIR and the OIM ownership verifier (v2.5; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4, unique receivers and results v2.5)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -46,6 +46,12 @@ it in place of the second `getfield` / `arrayget` of a scalar slot in a block. T
 `unjustified forward`. Forwarding is behaviour-only, not memory safety (an unjustified one reads a stale scalar, never a freed
 object), but it is checked to the standard of ADR-0032 like every other fact the optimiser acts on. Both emitters print `d = s`;
 `orin2 compile --assert-facts` additionally checks the claim at run time.
+
+v2.5 (ADR-0038 lever 2, T5) **unique receivers and results across calls**: two flags on `MFunction`, printed after the existing ones in the
+function header (`fn7 Reader.next (params 1, owned l0, inout, unique-in, unique-out) -> int`): `unique-in` (the in/out receiver, local 0, is
+`Unique` on entry) and `unique-out` (the value handed back is `Unique`: local 0 at each return of an `inout` function, the returned local of
+any other function with a reference result). They are declarations that the verifier checks on both sides of every call (rules **U2-U5**,
+section "Unique receivers and results" below); the emitters ignore them. No new instruction.
 
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
@@ -106,6 +112,10 @@ hole slot when reading that slot.
   call is an error (second use is Dead). A borrowed-position operand of the same call may not be the
   consumed local or a `Borrowed` alias of it (the callee could release the object while reading the
   alias): **error**. `IBuiltin` operands are all borrowed (no builtin takes ownership).
+  **v2.5:** a call of a `unique-in` function needs `Unique` for argument 0 (U4), and a call of a `unique-out` function defines its
+  result (or, for an `inout` function, the receiver) `Unique` instead of `Owned` (U5). A call of an `inout` function demotes every
+  `Unique` argument in a borrowed position whatever its result type (the callee may keep a counted reference to it in the receiver
+  it hands back).
   Otherwise a call does not change argument states (borrowed for the call), **except** that a `Unique`
   ref argument is demoted to `Owned` when the call has a ref-typed result: the callee may return
   a retained alias of its argument, so uniqueness is no longer provable (found by the verifier;
@@ -194,6 +204,63 @@ basic block with no redefinition of `x` / `v` in between (a `release` of `d` or 
 `getfield d.1` -> `borrow v` / `copy v`, `release d` -> release of x and v, `t = getfield d.0; u = dup t` -> `u = move x`).
 Mutation corpus: `inout-drop-receiver`, `inout-release-receiver` (tools/mutate_mir.py); hand-written cases:
 `compiler/tests/verify_main.or` `inoutCases`. The Lean model covers the structured fragment without calls, so it is unaffected.
+
+## Unique receivers and results (v2.5, ADR-0038 lever 2 T5, rules U2-U5)
+A mutating method starts with `makeunique this`, a test of `rc == 1`, and after every in/out call the receiver is `Owned` again, so the
+next call tests it again. v2.5 lets a function *declare* that it expects (`unique-in`) or promises (`unique-out`) a `Unique` value, and
+the verifier checks the declaration on both sides. All four rules are local to one function or one call; there is no whole-program
+fixpoint in the verifier.
+- wf (`wf.or`): `unique-in` needs `inout` (only an in/out function has a receiver); `unique-out` needs `inout` or a reference result.
+  `main` is not `unique-in` (the runtime calls it).
+- **U2**, callee entry (`verify.or` `entryState`): if `unique-in`, local 0 starts `Unique` instead of `Owned`.
+- **U3**, return (`rules.or` `uniqueReturn`): if `unique-out`, at every `TReturn` local 0 (`inout`) or the returned local (otherwise; an
+  `OStr` or a missing operand is an error) must be `Unique`, else **error** `... not Unique (rule U3)`. Checked before the return consumes it.
+- **U4**, call site: `ICall` of a `unique-in` function needs argument 0 `Unique` (`needUnique`), else **error** `... requires ... to be Unique`.
+- **U5**, call result: after `ICall` of a `unique-out` function the destination is `Unique` (non-`inout`), or the receiver local that was
+  redefined `Owned` is redefined `Unique` (`inout`).
+- Demotion at calls (v1.1) is unchanged for non-`inout` callees. New in v2.5: an `inout` call also demotes its borrowed `Unique` arguments when
+  the result is a scalar (see "Checked, not assumed" below).
+
+Checked, not assumed. The soundness argument rests on three facts that were checked in the code, not taken from the ADR text:
+1. *An `inout` function is never reached except by a direct `ICall`.* `IClosure` (`wf.or` `closureMsg`) and the vtable check
+   (`verify.or` `vtableMsg`) both require every parameter to be borrowed, and an `inout` function has an owned parameter 0 (wf), so neither can
+   name one. `ICallIndirect` and `ICallVirtual` only call closure and vtable targets. `main` is rejected as `unique-in`. So every call of a
+   `unique-in` function is an `ICall`, and U4 covers all of them: U2's assumption holds at runtime.
+2. *The receiver is the only reference at an `inout` call.* `Unique` means no other counted reference (`rc == 1` from this local) and no
+   live `Borrowed` alias: every way to alias a `Unique` local demotes it (`IDup`, whole `IBorrow`, a closure/iface/struct that consumes it) or
+   consumes it (which runs `killBorrows`); the call consumes argument 0 in an owned position, which kills every `Borrowed` alias of it
+   (`consume` -> `kill` -> `killBorrows`), and a borrowed argument that is the receiver or an alias of it is already an error
+   (`callOwned`). The callee's local 0 is therefore the only reference to the object. *Found while checking:* before v2.5 a `Unique`
+   argument in a **borrowed** position stayed `Unique` after an `inout` call with a scalar or void result, although the callee may
+   `dup` it and store the copy in the receiver it hands back (`push(items, item)` with a borrowed `item`). That made `Unique` unsound for
+   such an argument (harmless while only a runtime `makeunique` consumed the fact, fatal once a callee skips the test). The rule now demotes
+   every borrowed argument of an `inout` call; `compiler/tests/verify_main.or` `uniqueCases` has the case.
+3. *A returned `Unique` local is not reachable from anything the callee keeps (U3 for a non-`inout` result).* The callee can keep nothing:
+   there are no globals, a closure consumes what it captures, a callee cannot store into a borrowed parameter (`needUnique` rejects a store
+   through a `Param`), and an owned parameter it consumes is gone. The only state that outlives the call is the `inout` receiver, and that
+   case is covered by 2 (a stored copy was made by a `dup`, which demotes the original). `KUnique` is produced only by `IStructNew`,
+   `IArrayNew`, `IClosure`, `IIface`, `IMakeUnique` (a fresh or sole object) and a move of a `Unique` local, and lost by every alias-creating
+   instruction, so at a return it means the object has no other reference, and returning it hands the sole reference to the caller.
+   U3 checks only the kind of the returned local, and that is enough.
+Optimiser (`compiler/opt/uniqflags.or`): optimistic assumption and retraction. Candidates: an `inout` function whose block 0 starts with
+the `makeunique` of its receiver is a `unique-in` candidate; an `inout` function or a function with a reference result is a `unique-out`
+candidate when some caller can use the result (the local that receives it is, up to moves, made Unique or passed as a `unique-in`
+receiver) and a flow-insensitive filter says its return is plausibly Unique. A worklist analyses each function with the must-analysis of
+`opt/unique.or` (at most as permissive as the verifier) under the current flags, callees before callers: a `unique-out` with a non-`Unique`
+return is retracted and its callers are analysed again; a `unique-in` with a call site **inside a loop** whose receiver is not `Unique` is
+retracted. A call site outside every loop never costs the flag: a `makeunique` goes before the call (the callee starts with the
+`makeunique` of its receiver, so the copy happens where the callee would have made it, `cow_copies` is unchanged, and it is paid once, not
+per iteration). Flags only go from set to cleared. Compile-time budget (design gate: self-compile +1 %): a function without a loop is not
+analysed, it gets the `makeunique` before every such call and `opt/unique.or` (T1) removes the redundant ones; a function with more than
+12000 blocks times locals gets no `unique-out`, and a loop in it that calls a `unique-in` candidate removes that flag. `opt/unique.or` (T1)
+also knows the entry state (U2) and the results of `unique-out` calls (U5), and drops the `makeunique` instructions they make redundant. The
+result is verified like every pass output.
+Mutation corpus (`tools/mutate_mir.py`, the callee's header seen by the mutated caller is edited too): `uniq-flag-flip-in` (`unique-in` on
+a callee whose call site passes a receiver that is not `Unique`: U4), `uniq-flag-flip-out` (`unique-out` on a function that returns a
+value that is not `Unique`: U3), `uniq-in-shared-caller` (`t = dup x` before a call of a `unique-in` function: U4), `uniq-out-then-dup`
+(`t = dup x` after a call of a `unique-out` function, with a store through `x` after it: U5). Hand-written cases:
+`compiler/tests/verify_main.or` `uniqueCases`; optimiser: `compiler/tests/opt_test.or` (T5 section). The Lean model has no calls, so
+U2-U5 are outside it (docs/tcb.md "rules not yet in the model").
 
 ## Load forwarding (v2.4, ADR-0038 lever 2 T4, rule F1)
 `d = forward s, o[key]` is accepted when a backward scan of **the same block**, over at most 64 instructions (`WINDOW` in `forward.or`),

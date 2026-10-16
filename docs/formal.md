@@ -132,7 +132,7 @@ Load forwarding (`Forward.lean`, ADR-0038 lever 2 T4, the facts behind verifier 
 * `store_frame_other_slot`, `store_frame_other_local` - a store into another slot of the same object, or through another local
   (which needs count 1, so it cannot be `x`'s object in a well-formed state), leaves every slot of `x` unchanged.
 * `makeUnique_frame` - `makeUnique x` keeps every slot value of `x` (shallow copy).
-Calls and array length are outside the model; F1 ends its scan at any call that receives the object.
+Calls and array length are outside the model; F1 ends its scan at any call that receives the object. The verifier rules U2-U5 of MIR v2.5 (`unique-in` / `unique-out` across calls, ADR-0038 T5) are likewise outside the model: they need calls, which `Machine.lean` does not have. They are listed with the other rules not yet in the model (docs/tcb.md) and are not claimed as proved.
 
 `view H f v` (`View.lean`) is the depth-`f` structural unfolding of the value denoted by `v`:
 scalars are themselves, a reference denotes the tuple of the views of its fields. Counts and
