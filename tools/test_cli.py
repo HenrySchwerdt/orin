@@ -552,26 +552,59 @@ class CliTests(unittest.TestCase):
         self.run_cli("init", "hello")
         project = self.cwd / "hello"
         env, log = self.fake_toolchain()
-        # Without the pinned toolchain a --release --backend=llvm build falls back to the C backend and says so.
-        result = self.run_cli("build", "--release", "--backend=llvm", cwd=project, env=env)
-        self.assertIn("pinned LLVM 19.1.7 is not installed", result.stderr)
-        self.assertFalse(log.exists())
+        real_clang = shutil.which("clang")
+        def system_clang(version):
+            """A directory with a fake `clang` of that version first on PATH; it logs its use and runs the real clang."""
+            bindir = self.cwd / f"sys-clang-{version}"
+            bindir.mkdir(exist_ok=True)
+            fake = bindir / "clang"
+            fake.write_text(f'#!/bin/sh\nif [ "$1" = --version ]; then echo "clang version {version}.0.0 (fake)"; exit 0; fi\n'
+                            f'echo used >> "{log}"\nexec "{real_clang}" "$@"\n')
+            fake.chmod(0o755)
+            return {**env, "PATH": f"{bindir}:{os.environ['PATH']}"}
         binary = project / "build/release/hello"
+        note = "pinned LLVM 19.1.7 is not installed"
+        # Without the pinned toolchain and without a new enough system clang, the default --release build falls back to
+        # the C backend and says so once; so does an explicit --backend=llvm.
+        old = system_clang(18)
+        for flags in ((), ("--backend=llvm",)):
+            result = self.run_cli("build", "--release", *flags, cwd=project, env=old)
+            self.assertEqual(result.stderr.count("note:"), 1, result.stderr)
+            self.assertIn(note, result.stderr)
+            self.assertFalse(log.exists())
+            self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
+            self.run_cli("clean", cwd=project)
+        # --backend=c is explicit and silent; a dev build never prints the note.
+        self.assertNotIn("note:", self.run_cli("build", "--release", "--backend=c", cwd=project, env=old).stderr)
         self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
         self.run_cli("clean", cwd=project)
+        # A new enough system clang is used by the default --release build (LLVM); an explicit CC that is not clang keeps C.
+        new = system_clang(19)
+        result = self.run_cli("build", "--release", cwd=project, env=new)
+        self.assertNotIn("note:", result.stderr)
+        self.assertTrue(log.exists(), "the default release build did not use the LLVM backend")
+        self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
+        log.unlink()
+        self.run_cli("clean", cwd=project)
+        self.run_cli("build", "--release", cwd=project, env={**new, "CC": "cc"})
+        self.assertFalse(log.exists())
+        self.run_cli("clean", cwd=project)
         self.assertFalse(binary.exists())
-        # `orin toolchain install` then makes --backend=llvm use the pinned clang.
+        # `orin toolchain install` then makes the default --release build use the pinned clang.
         self.run_cli("toolchain", "status", code=1, env=env)
         self.assertIn("sha256 verified", self.run_cli("toolchain", "install", env=env).stdout)
         self.assertIn("installed:   yes", self.run_cli("toolchain", "status", env=env).stdout)
-        result = self.run_cli("build", "--release", "--backend=llvm", cwd=project, env=env)
+        result = self.run_cli("build", "--release", cwd=project, env=old)
         self.assertNotIn("not installed", result.stderr)
         self.assertTrue(log.exists(), "the pinned clang was not used")
         self.assertIn("Hello", subprocess.check_output([str(binary)], text=True))
-        # An explicit CC still wins over the pinned toolchain.
+        # --backend=c still works with the toolchain installed, and an explicit CC still wins over it.
         log.unlink()
         self.run_cli("clean", cwd=project)
-        self.run_cli("build", "--release", "--backend=llvm", cwd=project, env={**env, "CC": "clang"})
+        self.run_cli("build", "--release", "--backend=c", cwd=project, env=env)
+        self.assertFalse(log.exists())
+        self.run_cli("clean", cwd=project)
+        self.run_cli("build", "--release", cwd=project, env={**env, "CC": "clang"})
         self.assertFalse(log.exists())
         # doctor reports the pinned toolchain.
         self.assertIn("LLVM toolchain: pinned 19.1.7 installed", self.run_cli("doctor", env=env).stdout)
