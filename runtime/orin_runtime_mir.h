@@ -50,7 +50,7 @@ static inline void orin_mir_array_replace(OrinObj *a, uint64_t i, uint64_t slot)
     if (((OrinArray *)a)->is_ref) orin_release(ORIN_REF(old));
 }
 
-/* The unchecked forms for IArraySetU (docs/mir.md v2.5, rule U1): same as put / replace without the kind and bounds checks. */
+/* The unchecked forms for IArraySetU (docs/mir.md v2.6, rule U1): same as put / replace without the kind and bounds checks. */
 static inline void orin_mir_array_put_u(OrinObj *a, uint64_t i, uint64_t slot) {
     *orin_array_slot_ptr_u(a, i) = slot;
 }

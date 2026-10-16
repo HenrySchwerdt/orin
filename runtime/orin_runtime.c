@@ -536,7 +536,7 @@ void orin_assert_fact(const OrinObj *o, uint64_t key, uint64_t got) {
     orin_platform_exit(70);
 }
 
-/* `orin2 compile --assert-facts` (docs/mir.md v2.5, rule U1): the kind check and the bounds check that an IArrayGetU / IArraySetU
+/* `orin2 compile --assert-facts` (docs/mir.md v2.6, rule U1): the kind check and the bounds check that an IArrayGetU / IArraySetU
  * leaves out, executed before it. A failure is a verifier or optimiser bug, not a program error: exit 70 (internal error). */
 void orin_assert_array(const OrinObj *o, uint64_t i) {
     const char *why = 0;
