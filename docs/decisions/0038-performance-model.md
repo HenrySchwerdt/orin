@@ -709,3 +709,74 @@ key and stays alive, and since MIR v2.3 it was already the only allocation of `"
 inherent, and the gain there (-28%) is instructions only (the digit loop). The allocation gain is where the destination already
 existed: OX roots and hand-written `out += ...` (html -2.6M, html_hand -4.9M) and `s += "item" + i.toString() + ","` (strings
 -0.5M). The census row "up to 6.13M" is therefore an upper bound that is reached only where the number is not kept.
+
+## Addendum (2026-10-16): escape analysis, scalar replacement of temporary array literals (census row 3, class (c))
+
+The census ranks class (c) third: 1.27M allocations (1.9 %), 6.7 % of the self-compile's and 100 % of `appends`' (200,021 `[i]` /
+`[i, i]` at bench/appends/main.or:49, :55). **No language-visible change** (same values, same traps, same evaluation order),
+**no MIR change, no new verifier rule**, no runtime change. This addendum fixes which part of the class is removed, and why the
+rest is not.
+
+### What the class contains (read against the sites)
+
+1. *A temporary array literal that is only appended.* `a = a.concat([e1, .., ek])` lowers to `t = arraynew [..]`, and the
+   in-place pass (`inplace.or`, MIR v1.10) turns the concatenation into `arrayextend a, t; release t`. `t` is defined once, read
+   by the one extend (which only copies its elements) and released at once: it does not escape in any sense (not stored,
+   returned, captured, passed in an owned position, or read twice). It costs an object, a buffer, the extend call and two frees.
+2. *Method-local helper objects of the compiler* (`BlockSink`, `State`, `RewritePlan`, `Transfer`, `runBlock`'s `Transfer`,
+   `Cx`): classes with mutable fields that are built, mutated through methods and dropped. Their arrays are moved into the result
+   (`BlockSink.finish` hands `instrs` / `spans` to the `MBlock`), so only the small header object of each is removable; removing it
+   needs the methods inlined (the object is mutated through `this`) and the fields turned into locals (scalar replacement of a
+   *mutable* object), which is a new interprocedural analysis plus an inliner, and the verifier would have to accept field
+   locals that alias the heap arrays. Measured ceiling: `BlockSink` 111k + `State` 95k + `RewritePlan` 95k + `Transfer` 75k +
+   `runBlock` 92k + `Cx` is about 0.5M of the self-compile's 15.8M allocations; at about 120 executed instructions per
+   allocate / free pair (24.8G instructions, 15.8M allocations: the whole allocation cost is below 8 %), that is about 0.5 % of
+   its instructions. Below the 2 % bar of the task, so **not built**; no stack allocation of objects either (it would need a
+   verifier rule for a non-heap object that must not be retained, released or stored: a new TCB rule for ~0.5 %).
+
+### Choice: remove (1) in the optimiser, with the existing verifier rules
+
+`compiler/opt/lits.or` (`pushLiterals`, last step of `optimizeFunction`) rewrites three adjacent instructions
+
+    t = arraynew [e1, .., ek]          arraypush x, e1 ; .. ; arraypush x, ek
+    arrayextend x, t              =>
+    release t
+
+when `t` is defined once and used exactly twice (the extend and the release), `x != t`, no element is `x`, and `k <= 8`; an empty
+literal extends nothing and its three instructions are deleted. Why this is sound without a new rule:
+
+* `arrayextend x, t` and `arraypush x, e` have the same rule on `x` (Owned or Unique, not a parameter or borrow, stays Owned,
+  borrows of `x` die: `mutateOwned`). The extend's extra rule (`t` not `x`, not borrowed from `x`) is vacuous for a fresh `t`.
+* The elements are consumed by the literal today and by the pushes afterwards (`consume`, each ref element an Owned local or
+  `OStr`, becoming Dead); between the literal and the extend there is no instruction, so no local changes state in between.
+  The runtime retains the ref elements of `t` and `release t` frees them again; a push moves them: the same reference counts.
+* Value semantics are those of the extend: `orin_mir_array_push` makes `x` unique first (a shared `x` is copied, never changed
+  behind the other reference), as `orin_array_extend` does.
+* The result is verified like any other MIR, so a wrong rewrite would be rejected (or the C differential would see it); the
+  contract `passKept` (same signature, locals only appended, same calls and builtins in the same order) is checked on the pass.
+
+Rejected: a general points-to / escape analysis over `IArrayNew` + builtins (the only non-escaping consumer that occurs in the
+census is the extend; a general analysis would add a TCB-visible fact language for no further site); a runtime `extend_lit`
+primitive (new trusted C for what the verified push already does); a stack-allocated literal object (see above).
+
+Not covered, by design: a literal that is bound to a name and used twice, passed to a call (owned or borrowed), stored, returned
+or captured keeps its object; so does a ref array whose destination is `string[]` of more than 8 literal elements. Regression
+test: `tests/next/run/escape_array_literal.or` (each escape form, shared destinations, empty literal, literals built from the
+destination, ref elements, nested arrays, record / class / element destinations); its output is byte-identical to main's.
+
+### Measurement (same inputs; main `d297509` vs this branch; valgrind instructions, census counters)
+
+| workload | instructions before | after | change | allocations before | after | change |
+|---|---:|---:|---:|---:|---:|---:|
+| appends | 119,868,365 | 61,568,375 | -48.6% | 200,019 | 19 | -99.99% |
+| self-compile, same input | 24,816,681,927 | 24,816,681,927 | 0.00% | 15,764,604 | 15,764,604 | 0 |
+| bintrees, bytesstr, fib, html, html_hand, http_parse, mapfreq, mutres, nbody, pqueue, qsort_func, qsort_inplace, sieve, sortedmap, streams, strings, url, wordfreq | | | 0.00% each | | | 0 |
+
+The compiler's own source contains no `concat([..])` of a literal, so the C that the self-compile produces is byte-identical
+(`== stage2.c`) and its counts do not move: the self-compile gate (<= +1 %) holds with 0.00 %. The gain is where the idiom
+occurs: appends -58.3M instructions for 200,000 literals, about 290 instructions per literal (an object, an item buffer, the extend
+call and two frees). The ratio to C falls from 4.7x to 2.4x. Retains / releases of `appends` are unchanged (0 / 200,019 before,
+0 / 19 after).
+
+Consequence for the ranking: the remaining class (c) in the compiler is real but worth about 0.5 % of its instructions, and
+needs either an inliner with scalar replacement of mutable objects or a verified non-heap object; neither is justified at that size.
