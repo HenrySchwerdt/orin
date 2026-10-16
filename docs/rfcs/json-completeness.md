@@ -297,3 +297,15 @@ tokens, invalid suffixes, duplicate-heavy objects and deep containers. Report
 wall time/allocation and hash-collision limits separately from linear-time goals.
 Check bootstrap if embedding/resolver/compiler glue changes. No proof of these
 algorithms is claimed by this design document.
+
+## Approved first implementation slice: std:jsonnumber
+
+Coordinator direction after RFC approval narrows the first delivery to sealed
+JsonNumber, jsonNumber, numberFromInt, numberAsInt and error formatting, in a
+separate `std:jsonnumber` module. Dedicated registration keeps legacy std:json
+imports and its embedded source independent of the new implementation; existing
+Json/JNum and both parsers are unchanged. Numeric type identities are therefore
+owned by std:jsonnumber; a future JsonValue module can import/re-export them
+rather than define a second number type. Float utilities, document parsing/writing,
+decoders and bridges remain proposals, not shipped APIs. See
+[the concrete number API](../std-jsonnumber.md) for this slice's contract.
