@@ -1298,14 +1298,14 @@ OrinObj *orin_array_extend(OrinObj *x, OrinObj *y) {
 
 /* Narrow n 8-byte slots to bytes and widen n bytes to slots (u8[] <-> string). The slots of a u8 array hold 0..255, but the
  * runtime does not trust that: narrow_slots returns the OR of all slots, so a value above 255 shows as a result above 255.
- * Both loops run 16 elements per iteration with SSE2 where it exists (x86-64 always has it), else 4 per iteration in plain C
+ * Both loops run 16 elements per iteration with SSE2 where it exists (x86-64 only: the reduction uses _mm_cvtsi128_si64), else 4 per iteration in plain C
  * (docs/decisions/0038 addendum "packed arrays": the byte loops cost 6 instructions per element). */
-#if defined(__SSE2__)
+#if defined(__SSE2__) && defined(__x86_64__)
 #include <emmintrin.h>
 #endif
 static uint64_t narrow_slots(char *dst, const uint64_t *src, uint64_t n) {
     uint64_t bad = 0, i = 0;
-#if defined(__SSE2__)
+#if defined(__SSE2__) && defined(__x86_64__)
     __m128i acc = _mm_setzero_si128();
     for (; i + 16 <= n; i += 16) {
         const __m128i *p = (const __m128i *)(src + i);
@@ -1340,7 +1340,7 @@ static uint64_t narrow_slots(char *dst, const uint64_t *src, uint64_t n) {
 
 static void widen_bytes(uint64_t *dst, const char *src, uint64_t n) {
     uint64_t i = 0;
-#if defined(__SSE2__)
+#if defined(__SSE2__) && defined(__x86_64__)
     const __m128i z = _mm_setzero_si128();
     for (; i + 16 <= n; i += 16) {
         __m128i b = _mm_loadu_si128((const __m128i *)(src + i));
