@@ -1,0 +1,276 @@
+// Small helpers over std:json for the protocol checks: builders for requests, total path access (a missing step is
+// JNull, like `.get` with a default in the Python scripts, never a trap) and the comparisons the checks need.
+// Pure functions: tests/jx_test.or.
+
+import { Json, JNull, JBool, JNum, JStr, JArr, JObj, JField, field, stringify } from "std:json";
+
+export function S(s: string): Json {
+  return JStr(s);
+}
+
+export function N(n: int): Json {
+  return JNum(n);
+}
+
+export function B(b: bool): Json {
+  return JBool(b);
+}
+
+export function A(xs: Json[]): Json {
+  return JArr(xs);
+}
+
+export function O(fs: JField[]): Json {
+  return JObj(fs);
+}
+
+export function F(key: string, value: Json): JField {
+  return field(key, value);
+}
+
+export function nil(): Json {
+  return JNull;
+}
+
+// Strings as a JSON array.
+export function SA(xs: string[]): Json {
+  let out: Json[] = [];
+  for (const x of xs) {
+    out.push(JStr(x));
+  }
+  return JArr(out);
+}
+
+function lastField(fs: JField[], key: string): Option<Json> {
+  let i = fs.length;
+  while (i > 0) {
+    i -= 1;
+    if (fs[i].key == key) {
+      return Some(fs[i].value);
+    }
+  }
+  return None;
+}
+
+function isIndex(k: string): bool {
+  if (k.length == 0 || k.length > 6) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < k.length) {
+    const c = k.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function step(j: Json, k: string): Json {
+  match (j) {
+    JObj(fs) => {
+      const f = lastField(fs, k);
+      return f.isSome() ? f.unwrap() : JNull;
+    },
+    JArr(xs) => {
+      if (isIndex(k)) {
+        const n = parseIndex(k);
+        return n < xs.length ? xs[n] : JNull;
+      }
+      return JNull;
+    },
+    _ => {}
+  }
+  return JNull;
+}
+
+function parseIndex(k: string): usize {
+  let n: usize = 0;
+  let i: usize = 0;
+  while (i < k.length) {
+    n = n * 10 + (k.charCodeAt(i) - 48).toUsize();
+    i += 1;
+  }
+  return n;
+}
+
+// Follows `keys` through objects (by key) and arrays (a decimal key is an index); JNull when a step is missing.
+export function at(j: Json, keys: string[]): Json {
+  let cur = j;
+  for (const k of keys) {
+    cur = step(cur, k);
+  }
+  return cur;
+}
+
+export function has(j: Json, key: string): bool {
+  return match (j) {
+    JObj(fs) => lastField(fs, key).isSome(),
+    _ => false
+  };
+}
+
+export function isNull(j: Json): bool {
+  return match (j) {
+    JNull => true,
+    _ => false
+  };
+}
+
+export function str(j: Json): string {
+  return match (j) {
+    JStr(s) => s,
+    _ => ""
+  };
+}
+
+export function isStr(j: Json): bool {
+  return match (j) {
+    JStr(s) => true,
+    _ => false
+  };
+}
+
+export function isStrEq(j: Json, s: string): bool {
+  return match (j) {
+    JStr(x) => x == s,
+    _ => false
+  };
+}
+
+export function isIntEq(j: Json, n: int): bool {
+  return match (j) {
+    JNum(x) => x == n,
+    _ => false
+  };
+}
+
+// `x is True` / `x is False` of the Python scripts: exactly that boolean.
+export function isBoolEq(j: Json, b: bool): bool {
+  return match (j) {
+    JBool(x) => x == b,
+    _ => false
+  };
+}
+
+export function isArr(j: Json): bool {
+  return match (j) {
+    JArr(xs) => true,
+    _ => false
+  };
+}
+
+export function isObj(j: Json): bool {
+  return match (j) {
+    JObj(fs) => true,
+    _ => false
+  };
+}
+
+export function items(j: Json): Json[] {
+  return match (j) {
+    JArr(xs) => xs,
+    _ => []
+  };
+}
+
+export function fields(j: Json): JField[] {
+  return match (j) {
+    JObj(fs) => fs,
+    _ => []
+  };
+}
+
+export function len(j: Json): int {
+  return match (j) {
+    JArr(xs) => xs.length.toInt(),
+    JObj(fs) => fs.length.toInt(),
+    JStr(s) => s.length.toInt(),
+    _ => -1
+  };
+}
+
+// The strings of an array (non-strings become "").
+export function strs(j: Json): string[] {
+  let out: string[] = [];
+  for (const x of items(j)) {
+    out.push(str(x));
+  }
+  return out;
+}
+
+export function keysOf(j: Json): string[] {
+  let out: string[] = [];
+  for (const f of fields(j)) {
+    out.push(f.key);
+  }
+  return out;
+}
+
+export function strEq(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+export function containsStr(xs: string[], s: string): bool {
+  for (const x of xs) {
+    if (x == s) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function eqArr(xs: Json[], b: Json): bool {
+  const ys = items(b);
+  if (!isArr(b) || xs.length != ys.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < xs.length) {
+    if (!eq(xs[i], ys[i])) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function eqObj(fa: JField[], b: Json): bool {
+  if (!isObj(b) || keysOf(JObj(fa)).length != keysOf(b).length) {
+    return false;
+  }
+  for (const f of fa) {
+    if (!has(b, f.key) || !eq(f.value, at(b, [f.key]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Structural equality; object field order does not matter (Python's dict equality).
+export function eq(a: Json, b: Json): bool {
+  return match (a) {
+    JNull => isNull(b),
+    JBool(x) => isBoolEq(b, x),
+    JNum(x) => isIntEq(b, x),
+    JStr(x) => isStrEq(b, x),
+    JArr(xs) => eqArr(xs, b),
+    JObj(fa) => eqObj(fa, b)
+  };
+}
+
+// For failure messages ("got ...").
+export function show(j: Json): string {
+  return stringify(j);
+}

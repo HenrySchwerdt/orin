@@ -29,11 +29,11 @@ orin diff --base <package-dir | entry.or | snapshot.json> --head <package-dir | 
 `orin api --check` is unchanged: it stays the small, reviewed public-API contract (full signature lines
 of exported symbols). `orin diff` covers everything else (call/import/type edges, impact).
 
-## Snapshot shape (`osig/0.3`)
+## Snapshot shape (`osig/0.4`)
 
 ```json
 {
-"schema": "osig/0.3",
+"schema": "osig/0.4",
 "package": "demo",
 "hash": "h62:0123456789abcdef",
 "nodes": [
@@ -55,14 +55,16 @@ closures, contract clauses).
 
 **Edge kinds:** `DEFINES`, `HAS_FIELD`, `HAS_CONTRACT`, `IMPORTS` (module to module), `IMPLEMENTS`,
 `REFERENCES_TYPE`, `CALLS`, `PERFORMS_IO` (a primitive I/O call site, ADR-0027), `MAY_PERFORM` (the transitive effect summary,
-`osig/0.2`, below).
+`osig/0.2`, below), `ANNOTATED_WITH` (a user annotation use, `osig/0.4`, below).
 
 **Schema history** (ADR-0023 versioning: additive changes bump the minor version, readers ignore what they do not know, a
 reader refuses another major): `osig/0.1` the first schema; `osig/0.2` adds the edge kind `MAY_PERFORM` and the edge field
 `next` (present on `MAY_PERFORM` edges only, so every other edge line is unchanged); `osig/0.3` adds the node field `doc` (the
 rendered `/** ... */` documentation comment attached to the declaration, Markdown with `@tags`, see `analysis/doccomments.or`;
 written only when the declaration has one, so every other node line is unchanged). `orin diff` reads every `osig/0.*`
-snapshot; against a snapshot older than 0.2 the effect sections are skipped ("not compared").
+snapshot; against a snapshot older than 0.2 the effect sections are skipped ("not compared"). `osig/0.4` adds the edge kind `ANNOTATED_WITH` (ADR-0046 S2, below); a program without user annotations has exactly the same nodes and edges as under 0.3, only the `schema` string (and with it the `hash`) differs.
+
+**User annotations (`ANNOTATED_WITH`, ADR-0046 S2):** one edge from every declaration that carries a user-defined annotation (`@Route("/x", Get)`: a function, method, class, type, interface, interface method, module constant, record or class field) to the `@Annotation` record of the annotation (a node of kind `Record` in the module that declares it). `evidence` is `MUST`. `via` holds the argument list as written in the source, constants in field order: `("/users/:id", Get, Some("admin"))`, and "" for a use without arguments (`@Json`); line breaks inside an argument list are written as spaces. `span` is the annotation name. The built-in annotations (`@Test`, `@Deprecated`, `@Inline`, `@Sealed`) produce no edge. The use is also a reference to the record, so the declaration has a `REFERENCES_TYPE` edge to it as well. `orin api` prints the annotation lines of exported declarations, so `orin api --check` reports a changed annotation; `orin diff` does not compare `ANNOTATED_WITH` edges (yet). Golden: `tests/osig/annotated.graph.json` (package `tests/osig/annotated`).
 
 **Effects (`MAY_PERFORM`, ADR-0037 D2, [capabilities.md](capabilities.md)):** for every function, method, constructor and class
 (field initialisers) one edge per primitive effect it may perform *transitively*, to the compiler-owned `Effect` node

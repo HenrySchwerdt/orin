@@ -41,10 +41,11 @@
   downcasts, no `instanceof`, `==` on interface values is E0410. Interface values are boxed (one allocation
   per conversion, one indirect call per method call). Go-to-definition from a call on a bounded type parameter inside a generic body
   resolves to the interface method; hover shows the implementations of an interface.
+- Companion modules (`./m.gen`, ADR-0046 S4) run no processors; see docs/annotation-processors.md.
 - Built-in annotations (ADR-0024, self-hosted compiler only): `@Test`, `@Deprecated`, `@Inline` and
   `@Sealed` (record construction/update restriction outside the declaring module, ADR-0044) exist;
   user-defined annotations (ADR-0046 S1) are metadata only: records marked `@Annotation(targets..)`, constant
-  arguments, no processors or code generation yet (S3-S6); any other `@Name` is E0408. `orin test` runs `void` tests that fail by
+  arguments, no processors or code generation yet (S3-S6), but the tools know them (S2: go to definition, references, rename, hover, `orin api`, OSIG `ANNOTATED_WITH`, MCP `inspect`); any other `@Name` is E0408. `orin test` runs `void` tests that fail by
   trapping (no `Result` tests, fixtures, parameterised tests, parallel runs, coverage); it finds the tests of the
   modules the entry loads, builds with the C backend and needs a C compiler. `@Deprecated` warnings are not listed
   by the MCP `check` tool. `@Inline` is a hint (a recursive `@Inline` function is E0444; calls through function
