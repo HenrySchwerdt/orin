@@ -13,7 +13,7 @@ A structured fragment of MIR (`compiler/mir/mir.or`, `docs/mir.md`) over the mac
 * ownership-*transferring* operations (`move`, `structNew`, `setField`, `putField`,
   `takeField`) move a count without touching the reference count;
 * control flow is structured: `Code` is straight-line code with `ite` (if/else with a
-  continuation).  Loops and calls are not modelled.
+  continuation) and `loop` (while).  Calls are not modelled in this file.
 
 The concrete machine knows nothing about ownership states; `bad` is still only "access to a
 non-live location or in-place store into an object whose count is not 1".
@@ -64,6 +64,10 @@ inductive Code where
   | nil : Code
   | op (i : MI) (k : Code) : Code
   | ite (c : Nat) (t e k : Code) : Code
+  /-- `while`: test the scalar local `c`; `0` runs the body `t` and tests again, anything else
+  leaves the loop and continues with `k`.  (The condition is recomputed at the end of the body;
+  a MIR header block that computes it is duplicated in front of the loop.) -/
+  | loop (c : Nat) (t k : Code) : Code
 
 namespace Code
 
@@ -71,6 +75,7 @@ def app : Code → Code → Code
   | .nil, k => k
   | .op i c, k => .op i (app c k)
   | .ite c t e k', k => .ite c t e (app k' k)
+  | .loop c t k', k => .loop c t (app k' k)
 
 /-- operands stored into slots `i, i+1, …` of the fresh object `d` -/
 def storeAll (d : Nat) : Nat → List Nat → Code → Code
@@ -264,6 +269,13 @@ def mstep (c : Code × St) : Option (Res (Code × St)) :=
         match c.2.get cnd with
         | .int 0 => some (.ok (t.app k, c.2))
         | .int _ => some (.ok (e.app k, c.2))
+        | .ref _ => some .ill
+      else some .ill
+    | .loop cnd t k =>
+      if cnd < c.2.locals.length then
+        match c.2.get cnd with
+        | .int 0 => some (.ok (t.app (.loop cnd t k), c.2))
+        | .int _ => some (.ok (k, c.2))
         | .ref _ => some .ill
       else some .ill
 

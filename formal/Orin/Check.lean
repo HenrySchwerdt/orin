@@ -203,6 +203,20 @@ def joinS (a1 a2 : AState) : Option AState :=
 
 /-! ### the checker -/
 
+/-- Loop invariant search: from the head state `b`, run the body, join the result into the head
+state, and stop when the head state no longer changes (kinds only move up the join order, so a
+bounded number of rounds suffices; running out of fuel rejects).  Returns the invariant. -/
+def loopFix (body : AState → Option AState) (c : Nat) : Nat → AState → Option AState
+  | 0, _ => none
+  | fuel + 1, b =>
+    if c < b.ls.length ∧ gk b.ls c = .init then
+      (body b).bind fun b2 =>
+      (joinS b b2).bind fun b' =>
+      if b'.ls = b.ls then some b else loopFix body c fuel b'
+    else none
+
+def loopFuel (a : AState) : Nat := 2 * a.ls.length + 3
+
 /-- Abstract execution of structured code; `none` = rejected. -/
 def chk (np : Nat) : AState → Code → Option AState
   | a, .nil => some a
@@ -214,6 +228,8 @@ def chk (np : Nat) : AState → Code → Option AState
       (joinS at' ae).bind fun aj =>
       chk np aj k
     else none
+  | a, .loop c t k =>
+    (loopFix (fun b => chk np b t) c (loopFuel a) a).bind fun b => chk np b k
 
 structure Prog where
   /-- number of locals -/

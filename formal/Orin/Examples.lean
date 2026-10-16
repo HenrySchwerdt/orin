@@ -120,6 +120,36 @@ def badArrayAfterRelease : Prog :=
     code := .op (.arrayNew 1 0) <| .op (.const 2 0) <| .op (.release 1) <|
       .op (.arrayGet 3 1 2 false) .nil }
 
+/-- a loop whose body weakens `Unique` to `Owned`: the invariant needs a second round -/
+def exLoop : Prog :=
+  { n := 3, params := [],
+    code :=
+      .op (.const 0 0) <|
+      .op (.alloc 1 0) <|
+      .loop 0 (.op (.dup 2 1) <| .op (.release 2) <| .op (.const 0 1) .nil) <|
+      .op (.release 1) .nil }
+
+/-- a loop body that releases a variable of the enclosing scope: second iteration double-frees -/
+def badLoopRelease : Prog :=
+  { n := 2, params := [],
+    code := .op (.const 0 0) <| .op (.alloc 1 0) <|
+      .loop 0 (.op (.release 1) .nil) .nil }
+
+/-- a loop body that moves a local out each round without refilling it -/
+def badLoopMove : Prog :=
+  { n := 3, params := [],
+    code := .op (.const 0 0) <| .op (.alloc 1 0) <|
+      .loop 0 (.op (.move 2 1) .nil) <| .op (.release 2) .nil }
+
+/-- the loop condition must be an initialised scalar -/
+def badLoopCond : Prog :=
+  { n := 2, params := [],
+    code := .op (.alloc 0 0) <| .loop 0 .nil .nil }
+
+example : check exLoop = true := by decide
+example : check badLoopRelease = false := by decide
+example : check badLoopMove = false := by decide
+example : check badLoopCond = false := by decide
 example : check exArray = true := by decide
 example : check badArraySetShared = false := by decide
 example : check badArrayIndexRef = false := by decide

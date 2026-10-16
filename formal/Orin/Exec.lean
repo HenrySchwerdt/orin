@@ -16,6 +16,7 @@ Input format (one token group per line, `#` starts a comment line):
     setField X I V | takeField D X I | putField X I S | makeUnique X
     arrayLen D A | arrayGet D A I r|s | arraySet X I V | arrayNew D N   (index/length are scalar locals)
     if C / else / end       structured branch; the code after `end` is the continuation
+    loop C / end            while: the body (up to `end`) runs while the scalar local C is 0
     endprog
 
 Output: `NAME ACCEPT` or `NAME REJECT <reason>`; a malformed program gives `NAME ERROR <why>`.
@@ -61,6 +62,10 @@ def diag (np : Nat) : AState → Code → Except String AState
           | none => .error "join rejected (hole sets differ)"
           | some aj => diag np aj k
     else .error s!"if condition l{c} is not an initialised scalar"
+  | a, .loop c t k =>
+    match loopFix (fun b => chk np b t) c (loopFuel a) a with
+    | none => .error s!"loop: no invariant (condition l{c} not an initialised scalar, body rejected, or no fixpoint)"
+    | some b => diag np b k
 
 def reason (p : Prog) : String :=
   match diag p.params.length p.entry p.code with
@@ -73,17 +78,20 @@ inductive Item where
   | op (i : MI)
   | sn (d : Nat) (ys : List Nat)
   | ite (c : Nat) (t e : Code)
+  | lp (c : Nat) (t : Code)
 
 def toCode (rev : List Item) : Code :=
   rev.foldl (fun k it =>
     match it with
     | .op i => Code.op i k
     | .sn d ys => Code.structNew d ys k
-    | .ite c t e => Code.ite c t e k) Code.nil
+    | .ite c t e => Code.ite c t e k
+    | .lp c t => Code.loop c t k) Code.nil
 
 structure Frame where
   c : Nat
   thn : Option Code
+  isLoop : Bool := false
   saved : List Item
 
 structure PS where
@@ -132,16 +140,22 @@ def instr (ps : PS) : List String → Except String PS
   | ["arraySet", x, i, v] => do return addOp ps (.arraySet (← nat x) (← nat i) (← nat v))
   | ["arrayNew", d, n] => do return addOp ps (.arrayNew (← nat d) (← nat n))
   | ["if", c] => do
-      return { ps with frames := ⟨← nat c, none, ps.cur⟩ :: ps.frames, cur := [] }
+      return { ps with frames := ⟨← nat c, none, false, ps.cur⟩ :: ps.frames, cur := [] }
+  | ["loop", c] => do
+      return { ps with frames := ⟨← nat c, none, true, ps.cur⟩ :: ps.frames, cur := [] }
   | ["else"] =>
       match ps.frames with
       | f :: fs =>
-        if f.thn.isSome then .error "second else"
+        if f.isLoop then .error "else in a loop"
+        else if f.thn.isSome then .error "second else"
         else .ok { ps with frames := { f with thn := some (toCode ps.cur) } :: fs, cur := [] }
       | [] => .error "else without if"
   | ["end"] =>
       match ps.frames with
       | f :: fs =>
+        if f.isLoop then
+          .ok { ps with frames := fs, cur := .lp f.c (toCode ps.cur) :: f.saved }
+        else
         match f.thn with
         | some t => .ok { ps with frames := fs, cur := .ite f.c t (toCode ps.cur) :: f.saved }
         | none => .error "if without else"
@@ -149,7 +163,7 @@ def instr (ps : PS) : List String → Except String PS
   | ws => .error s!"unknown line '{" ".intercalate ws}'"
 
 def finish (ps : PS) : String :=
-  if !ps.frames.isEmpty then s!"{ps.name} ERROR unclosed if"
+  if !ps.frames.isEmpty then s!"{ps.name} ERROR unclosed if or loop"
   else
     let p : Prog := ⟨ps.n, ps.params, toCode ps.cur⟩
     let v := check p

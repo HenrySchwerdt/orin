@@ -56,3 +56,6 @@ import Orin
 #print axioms Orin.makeUnique_frame
 #print axioms Orin.arrayGet_oob
 #print axioms Orin.arrayGet_inb
+#print axioms Orin.loopFix_spec
+#print axioms Orin.Cont.seq
+#print axioms Orin.Fle.trans
