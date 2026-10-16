@@ -10,6 +10,7 @@
 # Needs build/bootstrap/orin2 (tools/bootstrap.sh). Usage: tooling/explorer/test.sh
 set -eu
 cd "$(dirname "$0")/../.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 T=tooling/explorer/testdata
 B=build/explorer-test
@@ -33,7 +34,7 @@ out=$($ORIN2 test tooling/explorer/tests/business_test.or --runtime runtime/core
   && ok "business view tests (ADR-0051): $(echo "$out" | tail -1)" || { echo "$out"; bad "business view tests"; }
 
 $ORIN2 compile tooling/explorer -o "$B/ex.c"
-cc -O1 -w -I runtime/core "$B/ex.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$B/explore"
+cc -O1 -w $(rt_inc) "$B/ex.c" $(rt_src) -lm -o "$B/explore"
 EX=$B/explore
 
 "$EX" $T/shop.head.graph.json --diff $T/shop.diff.json --out "$B/site1" 2> /dev/null

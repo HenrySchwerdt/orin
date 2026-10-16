@@ -14,6 +14,7 @@ import { forwardingOntoIndex } from "../../compiler/tests/emit_test";
 import { verify } from "../../compiler/verify";
 import { emitCFacts } from "../../compiler/backends/c";
 import { emitLlvmFacts } from "../../compiler/backends/llvm";
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 function main(host: Host): void {
   useProcess(host, proc => {
@@ -47,8 +48,8 @@ def main():
         driver = out / "driver"
         generated = out / "driver.c"
         run([args.orinc, "compile", str(source), "-o", str(generated)])
-        runtime = ["runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
-        run(["cc", "-O1", "-w", "-I", "runtime/core", str(generated), *runtime, "-lm", "-o", str(driver)])
+        runtime = rt_src()
+        run(["cc", "-O1", "-w", *rt_inc(), str(generated), *runtime, "-lm", "-o", str(driver)])
         for backend in ("c", "llvm"):
             for facts in ("plain", "facts"):
                 for initial in ("0", "1"):
@@ -56,10 +57,10 @@ def main():
                     emitted = run([str(driver), backend, facts, initial])
                     target = out / ("case.ll" if backend == "llvm" else "case.c")
                     target.write_text(emitted)
-                    extra = ["runtime/core/orin_runtime_llvm.c"] if backend == "llvm" else []
+                    extra = rt_llvm() if backend == "llvm" else []
                     exe = out / "case"
                     # LLVM's assembler also rejects duplicate SSA register names.
-                    run(["clang", "-O2", "-w", "-I", "runtime/core", str(target), *runtime, *extra, "-lm", "-o", str(exe)])
+                    run(["clang", "-O2", "-w", *rt_inc(), str(target), *runtime, *extra, "-lm", "-o", str(exe)])
                     result = subprocess.run([str(exe)], cwd=ROOT, text=True, capture_output=True, timeout=10)
                     if result.returncode != 0 or result.stdout or result.stderr:
                         failures.append(f"{label}: exit {result.returncode}: {result.stdout}{result.stderr}")

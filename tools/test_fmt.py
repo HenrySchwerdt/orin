@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "build", "fmt")
@@ -41,7 +42,7 @@ def build(orin2, src, name):
     rc, _, err = run([orin2, "compile", src, "-o", c])
     if rc != 0:
         sys.exit("cannot compile %s:\n%s" % (src, err.decode()))
-    rc, _, err = run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", exe])
+    rc, _, err = run(["cc", "-O1", "-w", *rt_inc(), c, *rt_src(), "-o", exe])
     if rc != 0:
         sys.exit("cc failed for %s:\n%s" % (src, err.decode()))
     return exe

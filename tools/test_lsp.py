@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import queue
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -41,7 +42,7 @@ def build(orin2):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         sys.exit("orin2 failed to compile compiler/main.or:\n" + r.stderr.decode())
-    r = subprocess.run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", exe],
+    r = subprocess.run(["cc", "-O1", "-w", *rt_inc(), c, *rt_src(), "-o", exe],
                        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         sys.exit("cc failed:\n" + r.stderr.decode())

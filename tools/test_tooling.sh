@@ -5,6 +5,7 @@
 #   printed in the listed order and the run stops at the first failing case in that order, as the sequential script did.
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 export ORIN2
 
@@ -14,7 +15,7 @@ if [ "${1:-}" = "--unit" ]; then
   source=compiler/tests/$t.or
   [ "$t" != workspace_cli ] || source=compiler/package/wscli_smoke.or
   $ORIN2 compile "$source" -o build/$t.c
-  cc -O1 -w -I runtime/core build/$t.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -o build/$t
+  cc -O1 -w $(rt_inc) build/$t.c $(rt_src) -o build/$t
   exec ./build/$t
 fi
 JOBS=

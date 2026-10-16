@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build/time"
@@ -20,13 +21,13 @@ def run(command, expected=0, stdout=None, stderr=None, env=None):
 
 def link(source, binary, llvm=False, fake=False):
     flags = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
-    sources = [source, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
+    sources = [source, *rt_src()]
     if llvm:
-        sources.append("runtime/core/orin_runtime_llvm.c")
+        sources.extend(rt_llvm())
     if fake:
         flags += ["-Dclock_gettime=orin_test_clock_gettime", "-DCLOCK_STUB_ONLY", "-ftrivial-auto-var-init=pattern"]
         sources.append("runtime/core/tests/clock_test.c")
-    run(["clang", "-O1", "-g", *flags, "-I", "runtime/core", *sources, "-lm", "-o", binary])
+    run(["clang", "-O1", "-g", *flags, *rt_inc(), *sources, "-lm", "-o", binary])
 
 
 
@@ -53,8 +54,8 @@ def main():
     env["ASAN_OPTIONS"] = "detect_leaks=0"
     native = OUT / "native"
     run(["clang", "-O1", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
-         "-ftrivial-auto-var-init=pattern", "-Dclock_gettime=orin_test_clock_gettime", "-I", "runtime/core",
-         "runtime/core/tests/clock_test.c", "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-lm", "-o", native])
+         "-ftrivial-auto-var-init=pattern", "-Dclock_gettime=orin_test_clock_gettime", *rt_inc(),
+         "runtime/core/tests/clock_test.c", *rt_src(), "-lm", "-o", native])
     run([native, "platform"], stdout="platform clock cases passed\n", env=env)
     run([native], stdout="clock failure returned None\n", env=env)
     run([native, "wrong"], expected=101, stderr="invalid capability grant", env=env)

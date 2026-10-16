@@ -1,6 +1,6 @@
 import { assertEq, assertEqString, assertEqBool, assertEqUsize } from "std:test";
 import { Options, defaultOptions } from "../src/cli";
-import { Side, Program, modeFlags, pipeline, ccBase, runtimeSources, compilerPath, describe, verdict, needsCompare } from "../src/suite";
+import { Side, Program, modeFlags, pipeline, ccBase, runtimeSources, listWords, includeFlags, compilerPath, describe, verdict, needsCompare } from "../src/suite";
 import { modeArgs, reprArgs, compilerCommand, errHead } from "../src/compilers";
 
 function ok(rc: int, out: string): Side {
@@ -35,25 +35,44 @@ function compilerNaming(): void {
   assertEqString(compilerCommand("b/orin"), "./b/orin", "relative path");
 }
 
+// A runtime source list in the format of tools/runtime-sources.txt (a fixture: the real one is read by main).
+function listText(): string {
+  return "# comment\ncore.include = runtime/core\ncore.sources = runtime/core/a.c runtime/platform/p.c\ncore.llvm = runtime/core/shim.c\n"
+    + "legacy.include = snap runtime/core\nlegacy.sources = snap/a.c runtime/platform/p.c\nlegacy.llvm = snap/shim.c\n";
+}
+
+function withList(): Options {
+  return Options { ...defaultOptions(), rtList: listText() };
+}
+
+@Test
+function theRuntimeSourceList(): void {
+  assertEqString(listWords(listText(), "core.sources").join(","), "runtime/core/a.c,runtime/platform/p.c", "sources");
+  assertEqUsize(listWords(listText(), "core.nothing").length, 0, "unknown key");
+  assertEqString(includeFlags(listText(), "legacy").join(" "), "-I snap -I runtime/core", "legacy include");
+}
+
 @Test
 function cCompilerCommand(): void {
-  const o = defaultOptions();
-  assertEqString(ccBase(o, false).join(" "), "cc -O1 -w -I runtime/core", "c backend");
-  assertEqString(ccBase(o, true).join(" "), "clang -O2 -w -I runtime/core", "llvm");
+  const o = withList();
+  assertEqString(ccBase(o, false, "core").join(" "), "cc -O1 -w -I runtime/core", "c backend");
+  assertEqString(ccBase(o, true, "core").join(" "), "clang -O2 -w -I runtime/core", "llvm");
+  assertEqString(ccBase(o, false, "legacy").join(" "), "cc -O1 -w -I snap -I runtime/core", "legacy world");
   const s = parseSanitize();
-  assertEqString(ccBase(s, false).join(" "), "cc -O1 -w -I runtime/core -fsanitize=address,undefined -fno-omit-frame-pointer", "sanitize");
-  assertEqUsize(runtimeSources(false).length, 2, "c runtime");
-  assertEqUsize(runtimeSources(true).length, 3, "llvm shim");
+  assertEqString(ccBase(s, false, "core").join(" "), "cc -O1 -w -I runtime/core -fsanitize=address,undefined -fno-omit-frame-pointer", "sanitize");
+  assertEqUsize(runtimeSources(o, false, "core").length, 2, "c runtime");
+  assertEqUsize(runtimeSources(o, true, "core").length, 3, "llvm shim");
+  assertEqString(runtimeSources(o, false, "legacy").join(" "), "snap/a.c runtime/platform/p.c", "legacy runtime");
 }
 
 function parseSanitize(): Options {
-  return Options { ...defaultOptions(), sanitize: true };
+  return Options { ...withList(), sanitize: true };
 }
 
 @Test
 function pipelineFilesAndCommands(): void {
   const p = Program { name: "next_x", entry: "tests/next/run/x.or" };
-  const pipe = pipeline(defaultOptions(), p, "old", ["--backend=llvm"], true);
+  const pipe = pipeline(withList(), p, "old", ["--backend=llvm"], true);
   assertEqString(pipe.cFile, "build/diff/next_x.old.ll", "ll file");
   assertEqString(pipe.exe, "build/diff/next_x.old.exe", "exe");
   assertEqUsize(pipe.cmds.length, 3, "three steps");
@@ -61,7 +80,8 @@ function pipelineFilesAndCommands(): void {
   assertEq(pipe.timeouts[2], 10, "run timeout");
   assertEqString(pipe.cmds[0], "cd '.' && './build/bootstrap/orin2' 'compile' 'tests/next/run/x.or' '-o' 'build/diff/next_x.old.ll' '--backend=llvm' >/dev/null 2>'build/diff/next_x.old.cerr' </dev/null", "compile");
   assertEqBool(pipe.cmds[1].includes("'clang' '-O2'"), true, "clang for llvm");
-  assertEqBool(pipe.cmds[1].includes("'runtime/core/orin_runtime_llvm.c'"), true, "llvm shim linked");
+  assertEqBool(pipe.cmds[1].includes("'runtime/core/shim.c'"), true, "llvm shim linked");
+
   assertEqString(pipe.cmds[2], "cd '.' && './build/diff/next_x.old.exe' >'build/diff/next_x.old.rout' 2>/dev/null </dev/null", "run");
 }
 
