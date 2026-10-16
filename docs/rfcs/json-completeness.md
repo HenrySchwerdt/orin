@@ -309,3 +309,14 @@ owned by std:jsonnumber; a future JsonValue module can import/re-export them
 rather than define a second number type. Float utilities, document parsing/writing,
 decoders and bridges remain proposals, not shipped APIs. See
 [the concrete number API](../std-jsonnumber.md) for this slice's contract.
+
+## Approved document slice: std:jsonvalue
+
+The bounded parser/compact-writer slice is a separate std:jsonvalue module,
+consistent with the reviewed std:jsonnumber placement. It owns JsonValue,
+JsonMember, document limits/options and document errors, and imports the existing
+sealed number type instead of duplicating it. This keeps opt-in tree semantics
+and stricter Unicode/duplicate policies distinct from both legacy parsers.
+No JsonValue re-export or behavior change is added to std:json. Float conversion,
+decoders and protocol migration remain deferred. See the
+[document API and exact error policies](../std-jsonvalue.md).
