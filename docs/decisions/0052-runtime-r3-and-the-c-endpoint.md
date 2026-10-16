@@ -201,6 +201,30 @@ under the L0 runtime lock, for which no core op exists, and revokes grants and c
 `refmask`, `is_ref` and the pin bits), `task_main` (calls a closure through a raw function address; no core op). In R3d they stay C and read the
 shared block through the offsets of R3d.1. The porting table of ADR-0017 Addendum A is unchanged.
 
+**R3d.1 (done): the offsets of the shared block.** `heapBase()` is `&orin_heap`, `extern __thread OrinHeap orin_heap` in `runtime/core/orin_runtime.h`
+(1024 bytes, 128 words, replacing the 64-word placeholder of R3d.0; word 63 stays the scratch word of `std:coreprobe`). Every offset is pinned by a `_Static_assert`.
+
+| offset | size | field (`OrinHeap`) | was | note |
+|---:|---:|---|---|---|
+| 0 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` 0, `alloc_array` 8, `alloc_struct` 16, `frees` 24, `retains` 32, `releases` 40, `cow_copies` 48, `cow_inplace` 56, `array_grows` 64, `string_grows` 72, `peak_live_objs` 80, `peak_live_bytes` 88, `live_bytes` 96, `file_opens` 104, `file_closes` 112, `transfer_moves` 120, `transfer_copies` 128, `tasks_spawned` 136 |
+| 144 | 8 | `live` (i64) | `g_live` | signed: a task can free more than it allocated |
+| 152 | 8 | `dstack` (`OrinObj **`) | `t_dstack` | work stack of `orin_destroy`, NULL until first use |
+| 160 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
+| 168 | 8 | reserved | | |
+| 176 | 72 | `fl_struct[9]` | `fl_struct` | free struct objects by `nslots` 0..8 (next pointer in word 0) |
+| 248 | 8 | `fl_array` | `fl_array` | free array headers |
+| 256 | 40 | `fl_n[10]` (u32) | `fl_n` | list lengths, `[9]` the array headers; cap `FL_CAP` = 2^18 |
+| 296 | 8 | pad | | |
+| 304 | 136 | `sb_list[17]` | `sb_list` | small-block cache by 16-byte class 0..16 (`SB_MAX` 256) |
+| 440 | 64 | reserved | | task pointer, grant and file tables (R3e) |
+| 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
+| 512 | 68 | `sb_cnt[17]` (u32) | `sb_cnt` | cache sizes, cap `SB_CAP` = 2^15 |
+| 584 | 440 | reserved | | up to 1024 bytes (128 words) |
+
+**Not moved (they stay `static __thread` in C until R3e):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
+Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
+`orin_stats` is now `#define orin_stats (orin_heap.stats)`, so inline code and generated C are unchanged; the block is `extern __thread OrinHeap orin_heap` (local-exec as before), `heapBase()` is its address (the C backend emits `&orin_heap`, the LLVM declaration is `[128 x i64]`).
+
 ### 6. Open questions for the project owner
 
 1. **Marker of a core module.** Recommend virtual root `$rt/` plus internal module `std:core`, and amending spec 19 and this ADR from "manifest
