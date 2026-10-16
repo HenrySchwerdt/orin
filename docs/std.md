@@ -225,7 +225,7 @@ class standard of ADR-0030 §3 (summary):
 * no tautologies; every public function has `@Test` coverage including edge cases (`tests/std/*_test.or`);
 * tests run twice: with contract checking (the `orin test` default) and with `--no-contracts` (the logic must not
   depend on the contracts). `tools/test_std.sh` does both; `tools/test_std.sh --mutate` adds the **mutation check**
-  (`tools/mutate_std.py`): 60 deliberately broken one-line variants of the three modules, each of which must make a
+  (`tools/mutation.sh std`): 60 deliberately broken one-line variants of the three modules, each of which must make a
   test or a contract fail (CI step "Provable std").
 
 Contract counts (clauses in the source): `std:bytes` 3 invariants + 6 `@Requires` + 85 `@Ensures`;
@@ -606,7 +606,7 @@ truncate, special bytes, CRLF to LF/CR, whitespace around the colon), 10,000 of 
 none may trap, the parser and the specification must agree on accept and refuse, one-shot and random chunking must
 agree, and everything accepted survives parse, serialize, parse unchanged. Five more tests in `tests/std/expect_trap/`
 must trap in every build (constructors of `Headers`, `Status`, `Request`, `Response`, `Limits`).
-`tools/mutate_std.py --module http`: 41 mutants of the parser, rules, limits, serializer and constructors, all killed
+`tools/mutation.sh std --module http`: 41 mutants of the parser, rules, limits, serializer and constructors, all killed
 (`41 mutants, 41 killed with contracts on: 18 by a contract violation, 23 by tests; 34 of them are also killed without contracts by the first test file that kills them, 5 by the trap tests of the constructors (which run without contracts by design), and 2 (`reset` keeping its error, `consumed` counting the chunk) only show up in that file as contract violations`).
 
 ### Not covered
@@ -807,7 +807,7 @@ a letter, prefixes and extensions of an allowed scheme, `data:`); and **differen
 `escapeSpec`, the char-by-char reference kept in the test file: all 256 single bytes (alone and inside a string), 3000
 pseudo-random mixes of the special characters, letters, entities and multi-byte UTF-8, and long strings. A generated-URL
 test checks that `safeUrl` is the identity or the constant and that `isSafeUrl` always holds for the result.
-`tools/mutate_std.py --module html`: 41 mutants (dropped or wrong entities, off-by-one in the run copying, `javascript` or
+`tools/mutation.sh std --module html`: 41 mutants (dropped or wrong entities, off-by-one in the run copying, `javascript` or
 `data` accepted, `tel`/`mailto` rejected, case-sensitive or length-agnostic scheme comparison, the `/`, `?`, `#` cut-offs,
 empty scheme accepted, `safeUrl` or `escapeUrl` skipping a step, `joinAll` skipping the first or last element, wrong
 `document`/`text`/`trustHtml`/`fragment`/`isEmpty`), all killed with and without contracts (23 by a contract violation).

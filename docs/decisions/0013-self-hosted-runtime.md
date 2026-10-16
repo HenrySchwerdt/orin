@@ -1,6 +1,6 @@
 # ADR-0013: Predominantly self-hosted runtime over a minimal, separately verifiable platform layer
 
-Status: accepted (2026-10-13). Spec: `spec/19-runtime-and-platform-layer.md`.
+Status: accepted (2026-10-13); R3 plan refined by ADR-0052. Spec: `spec/19-runtime-and-platform-layer.md`.
 
 - Three layers: **L0 platform** (C, closed API list, hard size budget, per-function contracts,
   separately verified), **L1 core runtime** (Orin with core-only intrinsics: object model, RC,

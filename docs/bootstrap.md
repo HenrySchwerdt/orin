@@ -77,7 +77,7 @@ second implementation of the then-current language, which is not planned.
 The self-hosted compiler also embeds the std prelude (`library/core/`, spec 19 R1; docs/architecture.md
 "Preludes"). `tools/bootstrap.sh` first checks that `compiler/loader/embedded_std.or` is up to date
 (`tools/embed_prelude.py --check`). Every stage compiles `compiler/` with the prelude (library calls inside the compiler become Orin
-code); `--c-builtins` keeps the C runtime implementations, and `tools/diff_backends.py --mode builtins`
+code); `--c-builtins` keeps the C runtime implementations, and `tools/differential.sh --mode builtins`
 compares the two.
 
 All stages share the CLI `<compiler> compile <entry.or> -o <out.c>` and the C runtime.
@@ -106,7 +106,7 @@ above), though `compiler/` has not been rewritten yet. Features beyond Orin-B ge
   class tables, lookups), `check/classfix.or` (inferred-mutability fixpoint by probing method bodies,
   `$ret` records), `check/body.or` (`new`, method/static calls, `p = C.m(p, ..)` lowering through
   hoisted statements `FnCtx.pre`, private access E0405, `this` errors E0300, const receiver E0401),
-  `check/index.or` (class/field/method defs and refs; method detail `mut method m(..)` when inferred
+  `check/index/` (class/field/method defs and refs; method detail `mut method m(..)` when inferred
   mutating), `fmt/printer.or`. HIR and backends are unchanged.
 
 * Closures (ADR-0011): `syntax/` (`EArrow`, `TFn`), `check/fnctx.or` (captures), `check/body.or` (closure

@@ -81,7 +81,7 @@ the lever that unlocks the fastest one.
     program either way; no existing test changed. Early exit never hides a trap: when a stage before an early-exit terminal
     may trap (conservative analysis: checked integer arithmetic, an index, an unwrap, a call), the loop keeps running the
     stages after the hit without evaluating the terminal (`tests/next/run/fuse_trap_early_exit.or`).
-  - *Evidence:* `tools/diff_backends.py --mode fuse` (fused vs `--no-fuse`, every run test, 0 differences) and `--mode opt`;
+  - *Evidence:* `tools/differential.sh --mode fuse` (fused vs `--no-fuse`, every run test, 0 differences) and `--mode opt`;
     `tests/next/run/fuse_shapes.or` (every shape, output equal to the unfused compiler's), `fuse_not_fused.or` (every case
     that must not be fused, with effects whose order would show a wrong fusion), `fuse_trap_early_exit.or`; the MIR ownership
     verifier runs on every fused program; `compiler/tests/fuse_test.or`. Programs without an array-API call compile to
@@ -605,7 +605,7 @@ object of an `IForward` must be a reference local (an unboxed aggregate is alrea
 
 Order is by risk, not by size of the win. Gates common to every PR: `stage2.c == stage3.c` (the compiler's own code changes), the full test
 suite, `compiler/tests/verify_main.or` and `verify_text.or` cases for the new rules, `tools/mutate_mir.py` with zero survivors and zero wrong-reason,
-`tools/diff_backends.py --mode opt` and `--mode llvm` with 0 differences, ASan + UBSan (`--sanitize`) on every suite and TSan on
+`tools/differential.sh --mode opt` and `--mode llvm` with 0 differences, ASan + UBSan (`--sanitize`) on every suite and TSan on
 `tools/test_concurrency.sh`, the census identity stated for the step, callgrind instruction counts of the five benchmarks before and
 after (reported in docs/benchmarks.md), and self-compile instructions not worse than +1 % (the fusion step missed "not worse" by 0.84 %, so the verifier cost is a gate here).
 

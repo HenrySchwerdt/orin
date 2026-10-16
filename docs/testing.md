@@ -164,7 +164,7 @@ must emit the same C and the same `.ll` as `orin2` (ADR-0038 gate 2; the CI `llv
 order of the sequential run, and failures are reported as before (the shell scripts stop at the first failing case in
 that order). Parallel: `tools/conformance.sh` / `run_tests.py` (tests), `test_std.sh` (test files with and without contracts, expect-trap
 tests), `test_tooling.sh` (unit test files and the resources / capabilities / net scripts; the guard for unwired unit
-tests still runs), `mutate_std.py` (mutants, each in its own directory; also `--shard I/N`), `test_verify_contracts.py`
+tests still runs), `tools/mutation.sh std` (mutants, each in its own directory; also `--shard I/N`) and `ox`, `test_verify_contracts.py`
 (the files; each runs in its own working directory because the verifier writes its solver queries to
 `build/contracts-vc/`), `test_compiler_contracts.sh` (the self-compile check and the suite run at the same time).
 `run_tests.py` compiles the runtime once per run instead of once per test (same flags; keyed by the sources). `tools/parallel.py`
@@ -207,11 +207,68 @@ mismatch is reported without skipping the (then wasted) build step; the unified 
 environment access, so `$ORIN_JOBS` and the CPU count come from one shell command.
 
 **Why the Python script stays.** ADR-0047 section 3: the self-hosted compiler must not be its only judge. `tools/run_tests.py`
-is the independent oracle (also still used by `orin mcp` and `tools/mutate_ox.py`). `tools/check_conformance_parity.py` runs
+is the independent oracle (also still used by `orin mcp`). `tools/check_conformance_parity.py` runs
 both over `--suite all` for the C and LLVM backends (`--sanitize` optionally), over a tree of deliberately broken tests (wrong
 expected output, missing expectation, wrong exit status, compile failure, wrong or missing error code, wrong `// warns:` /
 `// stderr:`, a hanging executable) and over the command line, and requires identical output and exit status. The CI job
 `conformance-parity` runs it on every change, so the two cannot drift. All other CI jobs use the Orin runner.
+
+## Mutation checks (Orin)
+
+The mutation checks are `tooling/mutation`, an Orin package (ADR-0047 phase 5); `tools/mutation.sh` builds it with the
+bootstrapped compiler (never with the compiler under test) and runs it. It replaces `tools/mutate_std.py` and
+`tools/mutate_ox.py`; the flags, the mutants (same operators, same order, same count per module and shard), the result lines
+and the exit status (0 all killed, 1 a mutant survived, 2 a broken mutant) are those of the scripts:
+
+```bash
+tools/mutation.sh std --orinc build/bootstrap/orin2 --module taskcore      # bytes|utf8|collections|http|net|text|html|taskcore
+tools/mutation.sh std --module http --shard 2/3 -j 4                        # the CI matrix runs every module and shard
+tools/mutation.sh ox --orinc build/dev/orin -j 2                            # the OX part of the compiler (33 mutants)
+tools/mutation.sh --unit-tests                                              # @Test tests of the tool (mutant tables, shards, options)
+```
+
+`std` copies the std modules and the test files of the module to `build/mutate_std/<module>_<mutant>/`, rewrites the std
+imports to relative ones, applies the mutation and runs `orin test` with and without `--no-contracts`; `net` rebuilds a copy of
+the compiler per mutant (its module imports the internal `std:fsraw`). `ox` builds the compiler with each mutant of the OX
+lexer, parser and checker and runs the OX conformance tests (`tests/next/{run,errors}/ox_*`) with it. Parallelism is
+`std:task`: one worker per `-j` slot (default `$ORIN_JOBS`, else the CPU count) runs the shell steps of a mutant through
+`shellTimeout` (900 s per run, 120 s for `http`, 120 s for the `net` tests), so a hung mutant is a failing test and its process
+group is killed; the main task reads the outputs and judges in mutant order, so the lines do not depend on `-j`.
+
+Differences from the scripts (none changes a result on the repository): the result lines of a run are printed when all its
+mutants are done, not one by one; `--root DIR` names the repository root (default: the current directory); `$ORIN_JOBS`, the CPU
+count and `$CC` come from one shell command; a signal-killed run is exit `-1` or `128+n`, not `-n`; `ox` judges with
+`tools/conformance.sh` (the Orin runner) instead of `tools/run_tests.py`, in a private root per mutant (links to `tests/` and
+`runtime/`), so the mutants may run in parallel without sharing `build/tests`; a failing copy or `tools/embed_prelude.py` of a `net`
+mutant is a COMPILE ERROR (the script raised an exception). `tools/embed_prelude.py` (Python) is still what regenerates the
+embedded library of a `net` mutant's compiler copy. `tools/mutate_mir.py` and `tools/contract_mutation.py` are separate tools
+and unchanged.
+
+## Differential harness (Orin)
+
+The differential tests of compiler modes and of two compilers are `tooling/differential`, an Orin package (ADR-0047 phase 5; it
+replaces `tools/diff_backends.py` and `tools/diff_compilers.py`). `tools/differential.sh` builds it with the bootstrapped compiler
+(never with the compiler under test) and runs it; the flags, output and exit status are those of the old scripts:
+
+```bash
+tools/differential.sh --mode opt|llvm|builtins|fuse [--orinc COMPILER] [--cc CC] [--filter SUBSTR] [--sanitize] [--shard I/N] [--list]
+tools/differential.sh compilers BASE_ORIN NEW_ORIN     # diagnostics of two compilers, byte for byte
+tools/differential.sh --unit-tests                     # @Test tests of the harness itself
+```
+
+Each program of `tests/run` and `tests/next/run` (names of the latter start with `next_`) is compiled with the default pipeline and
+with the alternative (`opt`: `--no-opt`; `llvm`: `--backend=llvm`, built with clang -O2 and the LLVM shim; `builtins`:
+`--c-builtins`; `fuse`: `--no-fuse`), both are built and run, and exit status and stdout are compared (a failing compile or C
+build is compared by its first 300 bytes of error output). A program for which exactly one side timed out is reported as `SKIP` and
+is not a difference. `--shard I/N` runs every N-th program (after `--filter`) starting at the I-th, so the CI shards of the fuse run
+together run every program once; `--list` prints the selected names. Exit status: 0 no difference, 1 differences, 2 usage.
+`compilers` runs both compilers over every input of `tests/{errors,next/errors,parse_edge,run,next/run,contracts}`, every package
+directory under `tests/` and `compiler/main.or` (`compile X -o /dev/null`, `check X`, `check --format=json X`) and compares exit
+status, stdout and stderr. Execution is `std:task`: one worker per CPU (four for `compilers`) takes jobs from a channel and runs
+the steps through `shellTimeout` (compile and C build 120 s, run 10 s, `compilers` 300 s); stdout is compared with `cmp` on the
+captured files, so the output does not depend on the number of workers. `--root DIR` names the repository root (default: the
+current directory). Differences from the Python scripts: a signal-killed step is exit `-1` or `128+n`, not `-n`; a program's
+stdin is `/dev/null`; the byte slice of stderr in a `compilers` DIFF line is cut on a character boundary.
 
 ## Execution deadlines
 

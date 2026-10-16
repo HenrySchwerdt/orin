@@ -1,0 +1,146 @@
+// Primitive I/O events (OSIG PERFORMS_IO, ADR-0027): the registry and the builtin / library functions that perform them.
+// Part of the semantic index (check/index/build.or).
+
+import { isIoBuiltin } from "../purity";
+import { Builtin } from "../../hir";
+
+// ---- primitive I/O events (OSIG PERFORMS_IO, ADR-0027) ----------------------------------------------------
+// "<operation>|<direction>|<grant>": the operation names are compiler-owned (they do not depend on what a library calls
+// its functions); the direction is INPUT (bytes / information enter the process), OUTPUT (leave it) or CONTROL
+// (open, spawn, acquire, exit). The grant is the family of authority the call needs, or "ambient" for the calls that
+// need none (console output, exit). "" = not a primitive I/O builtin.
+//
+// The names are the registry `primitiveEffects` below; the contract ties every operation to it, and every builtin that has
+// one to the purity analysis (purity.or `isIoBuiltin`): a function that performs an effect is impure, so the two tables
+// of I/O builtins must not drift apart (docs/capabilities.md).
+@Ensures(result == "" || isPrimitiveEffect(result))
+@Ensures(result != "" ==> isIoBuiltin(b))
+export function ioOpOf(b: Builtin): string {
+  return match (b) {
+    BConsoleLog => "Console.Write|OUTPUT|ambient",
+    BConsoleError => "Console.Write|OUTPUT|ambient",
+    BProcessExit => "Process.Exit|CONTROL|ambient",
+    BFsReadFile => "Fs.ReadFile|INPUT|FsGrant",
+    BFsWriteFile => "Fs.WriteFile|OUTPUT|FsGrant",
+    BFsExists => "Fs.Stat|INPUT|FsGrant",
+    BFsListDir => "Fs.Stat|INPUT|FsGrant",
+    BFileOpen => "Fs.Open|CONTROL|FsGrant",
+    BFileReadLine => "Fs.Read|INPUT|FsGrant",
+    BFileRead => "Fs.Read|INPUT|FsGrant",
+    BFileReadAll => "Fs.Read|INPUT|FsGrant",
+    BFileWrite => "Fs.Write|OUTPUT|FsGrant",
+    BFileWriteLine => "Fs.Write|OUTPUT|FsGrant",
+    BFileFlush => "Fs.Write|OUTPUT|FsGrant",
+    BProcessArgs => "Process.Args|INPUT|ProcessGrant",
+    BIoShell => "Process.Spawn|CONTROL|ProcessGrant",
+    BIoShellTimeout => "Process.Spawn|CONTROL|ProcessGrant",
+    BIoReadBytes => "Stdio.Read|INPUT|StdioGrant",
+    BIoReadLine => "Stdio.Read|INPUT|StdioGrant",
+    BIoWriteStdout => "Stdio.Write|OUTPUT|StdioGrant",
+    BTimeNowMillis => "Clock.Now|INPUT|ClockGrant",
+    BTimeMonotonicMillis => "Clock.Now|INPUT|ClockGrant",
+    BNetListen => "Net.Bind|CONTROL|NetGrant",
+    BNetAccept => "Net.Accept|INPUT|Listener",
+    BNetConnect => "Net.Connect|CONTROL|NetGrant",
+    BNetRecv => "Stream.Read|INPUT|Stream",
+    BNetSend => "Stream.Write|OUTPUT|Stream",
+    BNetShutdown => "Stream.Write|OUTPUT|Stream",
+    BNetResolve => "Net.Connect|CONTROL|NetGrant",
+    BNetNow => "Clock.Now|INPUT|Stream",
+    _ => ""
+  };
+}
+
+// The std library functions that perform a primitive I/O operation or derive a grant (they are library code, so the
+// call site in user code is the only place the event is visible).
+@Ensures(result == "" || isPrimitiveEffect(result))
+export function ioOpOfLib(name: string): string {
+  const lt = name.indexOf("<");
+  const n = lt.isSome() ? name.substring(0, lt.unwrap()) : name;
+  if (n == "$stdlib/fs.withFile" || n == "$stdlib/fs.useFile" || n == "$stdlib/fs.withFiles" || n == "$stdlib/fs.useFiles") {
+    return "Fs.Open|CONTROL|FsGrant";
+  }
+  if (n == "$stdlib/fs.withUnder" || n == "$stdlib/fs.useUnder" || n == "$stdlib/fs.withReadOnly" || n == "$stdlib/fs.useReadOnly") {
+    return "Fs.Narrow|CONTROL|FsGrant";
+  }
+  if (n == "$stdlib/process.withArgsOnly" || n == "$stdlib/process.useArgsOnly") {
+    return "Process.Narrow|CONTROL|ProcessGrant";
+  }
+  if (n == "$stdlib/net.useListen" || n == "$stdlib/net.useConnect" || n == "$stdlib/net.withListen" || n == "$stdlib/net.withConnect") {
+    return "Net.Narrow|CONTROL|NetGrant";
+  }
+  if (n == "$stdlib/net.useListener" || n == "$stdlib/net.withListener" || n == "$stdlib/net.useListenerNet") {
+    return "Net.Bind|CONTROL|NetGrant";
+  }
+  if (n == "$stdlib/net.useAccepted" || n == "$stdlib/net.withAccepted") {
+    return "Net.Accept|INPUT|Listener";
+  }
+  if (n == "$stdlib/net.useConnection" || n == "$stdlib/net.withConnection" || n == "$stdlib/net.useConnectionBeside" || n == "$stdlib/net.resolve") {
+    return "Net.Connect|CONTROL|NetGrant";
+  }
+  if (n == "$stdlib/net.recv" || n.startsWith("$stdlib/net.StreamReader.read")) {
+    return "Stream.Read|INPUT|Stream";
+  }
+  if (n == "$stdlib/net.send" || n == "$stdlib/net.sendAll" || n == "$stdlib/net.shutdownWrite") {
+    return "Stream.Write|OUTPUT|Stream";
+  }
+  if (n.startsWith("$stdlib/host.")) {
+    return "Host.Acquire|CONTROL|Host";
+  }
+  // std:task (ADR-0017): starting a task is a CONTROL event; the grant column says which authority is delegated to it;
+  // a send / receive on a channel is an OUTPUT / INPUT event between tasks
+  if (n == "$stdlib/task.spawn" || n == "$stdlib/task.spawnDo" || n == "$stdlib/task.parallelMap") {
+    return "Task.Spawn|CONTROL|ambient";
+  }
+  if (n == "$stdlib/task.spawnFs") {
+    return "Task.SpawnFs|CONTROL|FsGrant";
+  }
+  if (n == "$stdlib/task.spawnProcess") {
+    return "Task.SpawnProcess|CONTROL|ProcessGrant";
+  }
+  if (n == "$stdlib/task.spawnStdio") {
+    return "Task.SpawnStdio|CONTROL|StdioGrant";
+  }
+  if (n == "$stdlib/task.spawnClock") {
+    return "Task.SpawnClock|CONTROL|ClockGrant";
+  }
+  if (n.startsWith("$stdlib/task.scope") || n == "$stdlib/task.TaskHandle.join") {
+    return "Task.Join|CONTROL|ambient";
+  }
+  if (n == "$stdlib/task.channel") {
+    return "Channel.Open|CONTROL|ambient";
+  }
+  if (n == "$stdlib/task.Sender.send") {
+    return "Channel.Send|OUTPUT|ambient";
+  }
+  if (n == "$stdlib/task.Receiver.recv") {
+    return "Channel.Receive|INPUT|ambient";
+  }
+  return "";
+}
+
+// Every primitive effect the compiler knows, "<operation>|<direction>|<grant>": the closed list of ADR-0037 D1 (only the
+// compiler defines operations). `orin.toml` `[effects]` names are checked against it (analysis/effectpolicy.or).
+export function primitiveEffects(): string[] {
+  return [
+    "Clock.Now|INPUT|ClockGrant", "Console.Write|OUTPUT|ambient", "Fs.Narrow|CONTROL|FsGrant", "Fs.Open|CONTROL|FsGrant",
+    "Fs.Read|INPUT|FsGrant", "Fs.ReadFile|INPUT|FsGrant", "Fs.Stat|INPUT|FsGrant", "Fs.Write|OUTPUT|FsGrant",
+    "Fs.WriteFile|OUTPUT|FsGrant", "Host.Acquire|CONTROL|Host", "Process.Args|INPUT|ProcessGrant",
+    "Process.Exit|CONTROL|ambient", "Process.Narrow|CONTROL|ProcessGrant", "Process.Spawn|CONTROL|ProcessGrant",
+    "Stdio.Read|INPUT|StdioGrant", "Stdio.Write|OUTPUT|StdioGrant", "Net.Bind|CONTROL|NetGrant",
+    "Net.Accept|INPUT|Listener", "Net.Connect|CONTROL|NetGrant", "Net.Narrow|CONTROL|NetGrant", "Stream.Read|INPUT|Stream",
+    "Stream.Write|OUTPUT|Stream", "Clock.Now|INPUT|Stream",
+    "Task.Spawn|CONTROL|ambient", "Task.SpawnFs|CONTROL|FsGrant", "Task.SpawnProcess|CONTROL|ProcessGrant",
+    "Task.SpawnStdio|CONTROL|StdioGrant", "Task.SpawnClock|CONTROL|ClockGrant", "Task.Join|CONTROL|ambient",
+    "Channel.Open|CONTROL|ambient", "Channel.Send|OUTPUT|ambient", "Channel.Receive|INPUT|ambient"
+  ];
+}
+
+export function isPrimitiveEffect(s: string): bool {
+  for (const e of primitiveEffects()) {
+    if (e == s) {
+      return true;
+    }
+  }
+  return false;
+}
