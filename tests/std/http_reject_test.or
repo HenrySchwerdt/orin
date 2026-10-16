@@ -3,16 +3,19 @@
 // `--no-contracts`. See tools/test_std.sh. Positions are 0-based byte offsets from the start of the message.
 import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
 import { Bytes, bytesFromString, emptyBytes } from "std:bytes";
-import { Request, Response, Limits, ParseResult, NeedMore, Done, Failed, Get, Http10, HttpReason, ParserFinished, RequestParser,
-  ResponseParser, defaultLimits, parseRequest, parseResponse, parseResponseToEof, reasonName, reasonText, versionText,
-  emptyHeaders, standardStatus, edgeAllowed, stateName, hexString, httpError } from "std:http";
+import {
+  Request, Response, HttpLimits, ParseResult, NeedMore, Done, Failed, Get, Http10, HttpErrorKind, ParserFinished,
+  RequestParser, ResponseParser, defaultLimits, parseRequest, parseResponse, parseResponseToEof, httpErrorKindName,
+  httpErrorKindText, versionText, emptyHeaders, standardStatus, edgeAllowed, stateName, hexString, httpError, ToHead,
+  ToOther, httpErrorMessage
+} from "std:http";
 
 function bs(s: string): Bytes {
   return bytesFromString(s);
 }
 
-function lim(startLine: usize, count: usize, line: usize, head: usize, chunkLine: usize, body: usize): Limits {
-  return new Limits(startLine, count, line, head, chunkLine, body);
+function lim(startLine: usize, count: usize, line: usize, head: usize, chunkLine: usize, body: usize): HttpLimits {
+  return HttpLimits { maxStartLine: startLine, maxHeaderCount: count, maxHeaderLine: line, maxHeaderBytes: head, maxChunkLine: chunkLine, maxBody: body };
 }
 
 function rep(s: string, n: usize): string {
@@ -35,12 +38,12 @@ function failRes(why: string): Response {
   return new Response(standardStatus(200), Http10, emptyHeaders(), emptyBytes(), emptyHeaders(), false);
 }
 
-function okReqWith(msg: string, l: Limits): Request {
+function okReqWith(msg: string, l: HttpLimits): Request {
   const r = parseRequest(bs(msg), l);
   return match (r) {
     Done(q, used) => q,
     NeedMore => failReq("NeedMore for: " + msg),
-    Failed(e) => failReq("refused: " + e.message + " for: " + msg)
+    Failed(e) => failReq("refused: " + httpErrorMessage(e) + " for: " + msg)
   };
 }
 
@@ -49,11 +52,11 @@ function okReq(msg: string): Request {
 }
 
 function okRes(msg: string, forHead: bool): Response {
-  const r = parseResponseToEof(bs(msg), defaultLimits(), forHead);
+  const r = parseResponseToEof(bs(msg), defaultLimits(), (forHead ? ToHead : ToOther));
   return match (r) {
     Done(q, used) => q,
     NeedMore => failRes("NeedMore for: " + msg),
-    Failed(e) => failRes("refused: " + e.message + " for: " + msg)
+    Failed(e) => failRes("refused: " + httpErrorMessage(e) + " for: " + msg)
   };
 }
 
@@ -62,7 +65,7 @@ function outcome(r: ParseResult<Request>): string {
   return match (r) {
     NeedMore => "NeedMore",
     Done(q, used) => "Done",
-    Failed(e) => reasonName(e.reason)
+    Failed(e) => httpErrorKindName(e.kind)
   };
 }
 
@@ -70,7 +73,7 @@ function outcome2(r: ParseResult<Response>): string {
   return match (r) {
     NeedMore => "NeedMore",
     Done(q, used) => "Done",
-    Failed(e) => reasonName(e.reason)
+    Failed(e) => httpErrorKindName(e.kind)
   };
 }
 
@@ -79,13 +82,13 @@ function expectFail(msg: string, reason: string, pos: usize): void {
   expectFailWith(msg, defaultLimits(), reason, pos);
 }
 
-function expectFailWith(msg: string, l: Limits, reason: string, pos: usize): void {
+function expectFailWith(msg: string, l: HttpLimits, reason: string, pos: usize): void {
   const r = parseRequest(bs(msg), l);
   match (r) {
     Failed(e) => {
-      assertEqString(reasonName(e.reason), reason, "reason for: " + msg);
-      assertEqUsize(e.position, pos, "position for: " + msg);
-      assert(e.message.length > 0, "message");
+      assertEqString(httpErrorKindName(e.kind), reason, "reason for: " + msg);
+      assertEqUsize(e.offset, pos, "position for: " + msg);
+      assert(httpErrorMessage(e).length > 0, "message");
     },
     NeedMore => { fail("NeedMore, expected " + reason + " for: " + msg); },
     Done(q, used) => { fail("accepted, expected " + reason + " for: " + msg); }
@@ -93,11 +96,11 @@ function expectFailWith(msg: string, l: Limits, reason: string, pos: usize): voi
 }
 
 function expectResFail(msg: string, forHead: bool, reason: string, pos: usize): void {
-  const r = parseResponseToEof(bs(msg), defaultLimits(), forHead);
+  const r = parseResponseToEof(bs(msg), defaultLimits(), (forHead ? ToHead : ToOther));
   match (r) {
     Failed(e) => {
-      assertEqString(reasonName(e.reason), reason, "reason for: " + msg);
-      assertEqUsize(e.position, pos, "position for: " + msg);
+      assertEqString(httpErrorKindName(e.kind), reason, "reason for: " + msg);
+      assertEqUsize(e.offset, pos, "position for: " + msg);
     },
     NeedMore => { fail("NeedMore, expected " + reason + " for: " + msg); },
     Done(q, used) => { fail("accepted, expected " + reason + " for: " + msg); }
@@ -108,7 +111,7 @@ function expectNeedMore(msg: string): void {
   const r = parseRequest(bs(msg), defaultLimits());
   match (r) {
     NeedMore => { assert(true, ""); },
-    Failed(e) => { fail("refused: " + e.message + " for: " + msg); },
+    Failed(e) => { fail("refused: " + httpErrorMessage(e) + " for: " + msg); },
     Done(q, used) => { fail("complete, expected NeedMore for: " + msg); }
   };
 }
@@ -125,8 +128,8 @@ function rejectsBareLfWhereCrlfIsRequired(): void {
   expectFail("GET / HTTP/1.1\r\nHost: a\r\n\n", "BareLf", 25);
   expectFail("GET / HTTP/1.1\r\nHo\nst: a\r\n\r\n", "BareLf", 18);
   expectFail("GET / HTTP/1.1\r\nHost:\n a\r\n\r\n", "BareLf", 21);
-  expectFail("GET /\n HTTP/1.1\r\n", "BadTarget", 5);
-  expectFail("GE\nT / HTTP/1.1\r\n", "BadMethod", 2);
+  expectFail("GET /\n HTTP/1.1\r\n", "InvalidTarget", 5);
+  expectFail("GE\nT / HTTP/1.1\r\n", "InvalidMethod", 2);
 }
 
 @Test
@@ -157,32 +160,32 @@ function rejectsWhitespaceBeforeTheColon(): void {
 
 @Test
 function rejectsInvalidTokenCharacters(): void {
-  expectFail("G@T / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 1);
-  expectFail("GET( / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 3);
-  expectFail(" GET / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 0);
-  expectFail("\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n", "BadMethod", 0);
-  expectFail("GET\r\n", "BadMethod", 3);
-  expectFail("GE\x00T / HTTP/1.1\r\n", "BadMethod", 2);
-  expectFail("GET / HTTP/1.1\r\nHo(st: a\r\n\r\n", "BadHeaderName", 18);
-  expectFail("GET / HTTP/1.1\r\n: a\r\n\r\n", "BadHeaderName", 16);
-  expectFail("GET / HTTP/1.1\r\n\"Host\": a\r\n", "BadHeaderName", 16);
-  expectFail("GET / HTTP/1.1\r\nH\xe9st: a\r\n", "BadHeaderName", 17);
+  expectFail("G@T / HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidMethod", 1);
+  expectFail("GET( / HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidMethod", 3);
+  expectFail(" GET / HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidMethod", 0);
+  expectFail("\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidMethod", 0);
+  expectFail("GET\r\n", "InvalidMethod", 3);
+  expectFail("GE\x00T / HTTP/1.1\r\n", "InvalidMethod", 2);
+  expectFail("GET / HTTP/1.1\r\nHo(st: a\r\n\r\n", "InvalidFieldName", 18);
+  expectFail("GET / HTTP/1.1\r\n: a\r\n\r\n", "InvalidFieldName", 16);
+  expectFail("GET / HTTP/1.1\r\n\"Host\": a\r\n", "InvalidFieldName", 16);
+  expectFail("GET / HTTP/1.1\r\nH\xe9st: a\r\n", "InvalidFieldName", 17);
   expectFail("GET / HTTP/1.1\r\nHost\r\n\r\n", "MissingColon", 20);
-  expectFail("GET / HTTP/1.1\r\nHo@st: a\r\n", "BadHeaderName", 18);
-  expectFail("GET / HTTP/1.1\r\nHost\x00: a\r\n", "BadHeaderName", 20);
+  expectFail("GET / HTTP/1.1\r\nHo@st: a\r\n", "InvalidFieldName", 18);
+  expectFail("GET / HTTP/1.1\r\nHost\x00: a\r\n", "InvalidFieldName", 20);
 }
 
 @Test
 function rejectsControlCharactersInValuesAndTargets(): void {
-  expectFail(PRE + "X: a\x00b\r\n\r\n", "BadHeaderValue", 29);
-  expectFail(PRE + "X: a\x7fb\r\n\r\n", "BadHeaderValue", 29);
-  expectFail(PRE + "X: a\x01b\r\n\r\n", "BadHeaderValue", 29);
-  expectFail(PRE + "X: a\x0bb\r\n\r\n", "BadHeaderValue", 29);
-  expectFail(PRE + "X: a\x1fb\r\n\r\n", "BadHeaderValue", 29);
-  expectFail(PRE + "X: \x00\r\n\r\n", "BadHeaderValue", 28);
-  expectFail("GET /\x00 HTTP/1.1\r\n", "BadTarget", 5);
-  expectFail("GET /a\tb HTTP/1.1\r\n", "BadTarget", 6);
-  expectFail("GET /\xc3\xa9 HTTP/1.1\r\n", "BadTarget", 5);
+  expectFail(PRE + "X: a\x00b\r\n\r\n", "InvalidFieldValue", 29);
+  expectFail(PRE + "X: a\x7fb\r\n\r\n", "InvalidFieldValue", 29);
+  expectFail(PRE + "X: a\x01b\r\n\r\n", "InvalidFieldValue", 29);
+  expectFail(PRE + "X: a\x0bb\r\n\r\n", "InvalidFieldValue", 29);
+  expectFail(PRE + "X: a\x1fb\r\n\r\n", "InvalidFieldValue", 29);
+  expectFail(PRE + "X: \x00\r\n\r\n", "InvalidFieldValue", 28);
+  expectFail("GET /\x00 HTTP/1.1\r\n", "InvalidTarget", 5);
+  expectFail("GET /a\tb HTTP/1.1\r\n", "InvalidTarget", 6);
+  expectFail("GET /\xc3\xa9 HTTP/1.1\r\n", "InvalidTarget", 5);
 }
 
 @Test
@@ -190,27 +193,27 @@ function rejectsBadVersions(): void {
   expectFail("GET / HTTP/1.2\r\n\r\n", "UnsupportedVersion", 13);
   expectFail("GET / HTTP/2.0\r\n\r\n", "UnsupportedVersion", 11);
   expectFail("GET / HTTP/0.9\r\n\r\n", "UnsupportedVersion", 11);
-  expectFail("GET / http/1.1\r\n\r\n", "BadVersion", 6);
-  expectFail("GET / HTTP/1.1 \r\n\r\n", "BadVersion", 14);
-  expectFail("GET / HTTP/1.\r\n\r\n", "BadVersion", 13);
-  expectFail("GET / HTTP/11.1\r\n\r\n", "BadVersion", 12);
-  expectFail("GET / HTTP/1.x\r\n\r\n", "BadVersion", 13);
-  expectFail("GET / HTTP/1.1x\r\n\r\n", "BadVersion", 14);
-  expectFail("GET /\r\n\r\n", "BadVersion", 5);
-  expectFail("GET / \r\n\r\n", "BadVersion", 6);
-  expectFail("GET / HTTP\r\n\r\n", "BadVersion", 10);
-  expectFail("GET / HTTP/1.1 extra\r\n", "BadVersion", 14);
+  expectFail("GET / http/1.1\r\n\r\n", "InvalidVersion", 6);
+  expectFail("GET / HTTP/1.1 \r\n\r\n", "InvalidVersion", 14);
+  expectFail("GET / HTTP/1.\r\n\r\n", "InvalidVersion", 13);
+  expectFail("GET / HTTP/11.1\r\n\r\n", "InvalidVersion", 12);
+  expectFail("GET / HTTP/1.x\r\n\r\n", "InvalidVersion", 13);
+  expectFail("GET / HTTP/1.1x\r\n\r\n", "InvalidVersion", 14);
+  expectFail("GET /\r\n\r\n", "InvalidVersion", 5);
+  expectFail("GET / \r\n\r\n", "InvalidVersion", 6);
+  expectFail("GET / HTTP\r\n\r\n", "InvalidVersion", 10);
+  expectFail("GET / HTTP/1.1 extra\r\n", "InvalidVersion", 14);
 }
 
 @Test
 function rejectsBadTargets(): void {
-  expectFail("GET  / HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
-  expectFail("GET foo HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
-  expectFail("GET /a#b HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
-  expectFail("GET * HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
-  expectFail("CONNECT /x HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 8);
-  expectFail("GET example.com:80 HTTP/1.1\r\nHost: a\r\n\r\n", "BadTarget", 4);
-  expectFail("GET /a b HTTP/1.1\r\nHost: a\r\n\r\n", "BadVersion", 7);
+  expectFail("GET  / HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidTarget", 4);
+  expectFail("GET foo HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidTarget", 4);
+  expectFail("GET /a#b HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidTarget", 4);
+  expectFail("GET * HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidTarget", 4);
+  expectFail("CONNECT /x HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidTarget", 8);
+  expectFail("GET example.com:80 HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidTarget", 4);
+  expectFail("GET /a b HTTP/1.1\r\nHost: a\r\n\r\n", "InvalidVersion", 7);
 }
 
 @Test
@@ -218,8 +221,8 @@ function enforcesTheHostRules(): void {
   expectFail("GET / HTTP/1.1\r\n\r\n", "MissingHost", 16);
   expectFail(PRE + "Host: b\r\n\r\n", "DuplicateHost", 25);
   expectFail(PRE + "host: a\r\n\r\n", "DuplicateHost", 25);
-  expectFail("GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "BadHost", 16);
-  expectFail("GET / HTTP/1.1\r\nHost: a@b\r\n\r\n", "BadHost", 16);
+  expectFail("GET / HTTP/1.1\r\nHost: a b\r\n\r\n", "InvalidHost", 16);
+  expectFail("GET / HTTP/1.1\r\nHost: a@b\r\n\r\n", "InvalidHost", 16);
   expectFail("GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n", "DuplicateHost", 25);
   assertEqString(okReq("GET / HTTP/1.1\r\nhost: example.org:8080\r\n\r\n").headers().get("Host").unwrap(), "example.org:8080", "lower-case name");
   assertEqString(okReq("GET / HTTP/1.1\r\nHost:\r\n\r\n").headers().get("Host").unwrap(), "", "empty Host is legal");
@@ -243,17 +246,17 @@ function smugglingDuplicateAndConflictingContentLength(): void {
   expectFail(POSTPRE + "Content-Length: 4\r\nContent-Length: 4\r\n\r\nabcd", "DuplicateContentLength", 45);
   expectFail(POSTPRE + "Content-Length: 4\r\nContent-Length: 5\r\n\r\nabcd", "DuplicateContentLength", 45);
   expectFail(POSTPRE + "Content-Length: 4\r\ncontent-length: 4\r\n\r\nabcd", "DuplicateContentLength", 45);
-  expectFail(POSTPRE + "Content-Length: 4, 4\r\n\r\nabcd", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: 4,5\r\n\r\nabcd", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: -1\r\n\r\n", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: +4\r\n\r\nabcd", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: 4x\r\n\r\nabcd", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: 0x4\r\n\r\nabcd", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: 1e1\r\n\r\n", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length:\r\n\r\n", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: 4\x0b\r\n\r\nabcd", "BadHeaderValue", 43);
-  expectFail(POSTPRE + "Content-Length: 1000000000000000000\r\n\r\n", "BadContentLength", 26);
-  expectFail(POSTPRE + "Content-Length: 18446744073709551616\r\n\r\n", "BadContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4, 4\r\n\r\nabcd", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4,5\r\n\r\nabcd", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: -1\r\n\r\n", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: +4\r\n\r\nabcd", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4x\r\n\r\nabcd", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 0x4\r\n\r\nabcd", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 1e1\r\n\r\n", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length:\r\n\r\n", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 4\x0b\r\n\r\nabcd", "InvalidFieldValue", 43);
+  expectFail(POSTPRE + "Content-Length: 1000000000000000000\r\n\r\n", "InvalidContentLength", 26);
+  expectFail(POSTPRE + "Content-Length: 18446744073709551616\r\n\r\n", "InvalidContentLength", 26);
   expectFail(POSTPRE + "Content-Length: 99999999999\r\n\r\n", "BodyTooLarge", 55);
   // a Content-Length that is not repeated and has optional whitespace is fine
   assertEqString(okReq(POSTPRE + "Content-Length: \t4 \t\r\n\r\nabcd").body().toRawString(), "abcd", "OWS around a valid value");
@@ -271,7 +274,7 @@ function smugglingTransferEncodingVariants(): void {
   expectFail(POSTPRE + "Transfer-Encoding: chunked, chunked\r\n\r\n", "UnsupportedTransferEncoding", 26);
   expectFail(POSTPRE + "Transfer-Encoding: identity\r\n\r\n", "UnsupportedTransferEncoding", 26);
   expectFail(POSTPRE + "Transfer-Encoding: xchunked\r\n\r\n", "UnsupportedTransferEncoding", 26);
-  expectFail(POSTPRE + "Transfer-Encoding: chunked \x00\r\n\r\n", "BadHeaderValue", 53);
+  expectFail(POSTPRE + "Transfer-Encoding: chunked \x00\r\n\r\n", "InvalidFieldValue", 53);
   expectFail("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "UnsupportedTransferEncoding", 45);
   // a tab before the value and a different case are fine
   assertEqString(okReq(POSTPRE + "transfer-ENCODING:\tCHUNKED\r\n\r\n3\r\nabc\r\n0\r\n\r\n").body().toRawString(), "abc", "case and tab");
@@ -284,17 +287,17 @@ function smugglingChunkSizes(): void {
   expectFail(te + "FFFFFFFFFFFFFFFF\r\nx", "BodyTooLarge", 61);
   expectFail(te + "100001\r\nx", "BodyTooLarge", 61);
   expectFail(te + "7FFFFFFFFFFFFFFF\r\n", "BodyTooLarge", 61);
-  expectFail(te + "-1\r\n", "BadChunkSize", 56);
-  expectFail(te + "-0\r\n", "BadChunkSize", 56);
-  expectFail(te + "+5\r\nhello\r\n", "BadChunkSize", 56);
-  expectFail(te + "0x5\r\nhello\r\n", "BadChunkSize", 57);
-  expectFail(te + " 5\r\nhello\r\n", "BadChunkSize", 56);
-  expectFail(te + "5 5\r\nhello\r\n", "BadChunkSize", 58);
-  expectFail(te + "\r\n", "BadChunkSize", 56);
-  expectFail(te + "g\r\n", "BadChunkSize", 56);
-  expectFail(te + "5g\r\nhello\r\n", "BadChunkSize", 57);
-  expectFail(te + ";ext\r\n", "BadChunkSize", 56);
-  expectFail(te + "5\r\nhello\r\n-1\r\n", "BadChunkSize", 66);
+  expectFail(te + "-1\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "-0\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "+5\r\nhello\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "0x5\r\nhello\r\n", "InvalidChunkSize", 57);
+  expectFail(te + " 5\r\nhello\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "5 5\r\nhello\r\n", "InvalidChunkSize", 58);
+  expectFail(te + "\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "g\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "5g\r\nhello\r\n", "InvalidChunkSize", 57);
+  expectFail(te + ";ext\r\n", "InvalidChunkSize", 56);
+  expectFail(te + "5\r\nhello\r\n-1\r\n", "InvalidChunkSize", 66);
   expectFail(te + rep("0", 1030) + "5\r\n", "ChunkLineTooLong", 56 + 1024);
   expectFail(te + "5;" + rep("x", 1030) + "\r\n", "ChunkLineTooLong", 56 + 1024);
   expectNeedMore(te + "10\r\nonly part of it");
@@ -307,21 +310,21 @@ function smugglingChunkSizes(): void {
 @Test
 function smugglingChunkFraming(): void {
   const te = POSTPRE + "Transfer-Encoding: chunked\r\n\r\n";
-  expectFail(te + "5\r\nhelloXX\r\n", "BadChunkTerminator", 64);
+  expectFail(te + "5\r\nhelloXX\r\n", "InvalidChunkTerminator", 64);
   expectFail(te + "5\r\nhello\n0\r\n\r\n", "BareLf", 64);
   expectFail(te + "5\r\nhello\r0\r\n\r\n", "BareCr", 65);
   expectFail(te + "5\n", "BareLf", 57);
   expectFail(te + "5\rhello", "BareCr", 58);
-  expectFail(te + "5;a\x01b\r\n", "BadChunkExtension", 59);
-  expectFail(te + "5;a\x00\r\n", "BadChunkExtension", 59);
+  expectFail(te + "5;a\x01b\r\n", "InvalidChunkExtension", 59);
+  expectFail(te + "5;a\x00\r\n", "InvalidChunkExtension", 59);
   expectFail(te + "5;a\nb\r\n", "BareLf", 59);
   expectFail(te + "5;a\rb\r\n", "BareCr", 60);
-  expectFail(te + "5 \x01\r\n", "BadChunkSize", 58);
+  expectFail(te + "5 \x01\r\n", "InvalidChunkSize", 58);
   expectFail(te + "0\r\n\n", "BareLf", 59);
   expectFail(te + "0\r\n X: 1\r\n\r\n", "ObsFold", 59);
   expectFail(te + "0\r\nX : 1\r\n\r\n", "SpaceBeforeColon", 60);
   expectFail(te + "0\r\nX: a\nb\r\n\r\n", "BareLf", 63);
-  expectFail(te + "0\r\nX: a\x00\r\n\r\n", "BadHeaderValue", 63);
+  expectFail(te + "0\r\nX: a\x00\r\n\r\n", "InvalidFieldValue", 63);
   expectFail(te + "0\r\nContent-Length: 5\r\n\r\n", "ForbiddenTrailer", 59);
   expectFail(te + "0\r\nTransfer-Encoding: chunked\r\n\r\n", "ForbiddenTrailer", 59);
   expectFail(te + "0\r\nhost: b\r\n\r\n", "ForbiddenTrailer", 59);
@@ -343,7 +346,7 @@ function smuggledRequestAfterTheBodyIsTheNextMessageNotPartOfThisOne(): void {
       assertEqString(wire.slice(used, wire.length()).toRawString(), evil, "the rest is untouched");
     },
     NeedMore => { fail("need more"); },
-    Failed(e) => { fail(e.message); }
+    Failed(e) => { fail(httpErrorMessage(e)); }
   };
   // chunked: the bytes after the last chunk are not consumed either
   const c = POSTPRE + "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
@@ -351,7 +354,7 @@ function smuggledRequestAfterTheBodyIsTheNextMessageNotPartOfThisOne(): void {
   match (p2.feed(bs(c + evil))) {
     Done(q, used) => { assertEqUsize(used, c.length, "chunked: exactly the message"); },
     NeedMore => { fail("need more"); },
-    Failed(e) => { fail(e.message); }
+    Failed(e) => { fail(httpErrorMessage(e)); }
   };
 }
 
@@ -366,7 +369,7 @@ function limitsOnTheRequestLine(): void {
   expectFailWith("GETGETGETGETGETG / HTTP/1.1\r\n", l, "StartLineTooLong", 16);
   expectFailWith("GET /aaaaaaaaaaaaa HTTP/1.1\r\n", l, "StartLineTooLong", 16);
   expectFailWith("GET /aaaaaaaaaaaa HTTP/1.1\r\n", l, "StartLineTooLong", 16);
-  assertEqString(outcome(parseRequest(bs("GETGETGETGETGETG\r\n"), l)), "BadMethod", "a 16-byte method then CR is a bad method, not a long line");
+  assertEqString(outcome(parseRequest(bs("GETGETGETGETGETG\r\n"), l)), "InvalidMethod", "a 16-byte method then CR is a bad method, not a long line");
   const ok = parseRequest(bs("GET /ab HTTP/1.1\r\nHost: a\r\n\r\n"), l);
   assertEqString(outcome(ok), "Done", "a line of exactly 16 bytes is accepted");
   const r2 = parseRequest(bs("GET /a HTTP/1.0\r\n\r\n"), l);
@@ -415,9 +418,9 @@ function limitsOnTheTrailerSection(): void {
   // the trailer section has its own budget of 64 bytes, counted from its first byte
   const t1 = head + "0\r\n" + "T: " + rep("v", 57) + "\r\n\r\n";
   match (parseRequest(bs(t1), l)) {
-    Done(q, used) => { assertEqUsize(q.trailers().count(), 1, "trailer within budget"); },
+    Done(q, used) => { assertEqUsize(q.trailers().size(), 1, "trailer within budget"); },
     NeedMore => { fail("need more"); },
-    Failed(e) => { fail("trailers: " + e.message); }
+    Failed(e) => { fail("trailers: " + httpErrorMessage(e)); }
   };
   const t2 = head + "0\r\n" + "T: " + rep("v", 58) + "\r\n\r\n";
   expectFailWith(t2, l, "HeadersTooLarge", head.length + 3 + 64);
@@ -498,37 +501,37 @@ function responsesWithoutABody(): void {
 @Test
 function responseBodyUntilClose(): void {
   const msg = "HTTP/1.1 200 OK\r\nServer: x\r\n\r\nbody until the connection closes";
-  assertEqString(outcome2(parseResponse(bs(msg), defaultLimits(), false)), "NeedMore", "without EOF the message is not complete");
+  assertEqString(outcome2(parseResponse(bs(msg), defaultLimits(), ToOther)), "NeedMore", "without EOF the message is not complete");
   const r = okRes(msg, false);
   assertEqString(r.body().toRawString(), "body until the connection closes", "close-delimited body");
   const e = okRes("HTTP/1.1 200 OK\r\n\r\n", false);
   assertEqUsize(e.body().length(), 0, "empty close-delimited body");
   // a body limit applies
   const l = lim(8192, 100, 8192, 65536, 1024, 4);
-  const r2 = parseResponseToEof(bs("HTTP/1.1 200 OK\r\n\r\n12345"), l, false);
+  const r2 = parseResponseToEof(bs("HTTP/1.1 200 OK\r\n\r\n12345"), l, ToOther);
   assertEqString(outcome2(r2), "BodyTooLarge", "limit on a close-delimited body");
-  const r3 = parseResponseToEof(bs("HTTP/1.1 200 OK\r\n\r\n1234"), l, false);
+  const r3 = parseResponseToEof(bs("HTTP/1.1 200 OK\r\n\r\n1234"), l, ToOther);
   assertEqString(outcome2(r3), "Done", "exactly the limit");
 }
 
 @Test
 function responseEofHandling(): void {
-  let p = new ResponseParser(defaultLimits(), false);
+  let p = new ResponseParser(defaultLimits(), ToOther);
   assertEqString(outcome2(p.feed(bs("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"))), "NeedMore", "partial body");
   assertEqString(outcome2(p.atEof()), "UnexpectedEof", "EOF inside a Content-Length body");
-  let q = new ResponseParser(defaultLimits(), false);
+  let q = new ResponseParser(defaultLimits(), ToOther);
   assertEqString(outcome2(q.feed(bs("HTTP/1.1 200 OK\r\nServer"))), "NeedMore", "partial head");
   assertEqString(outcome2(q.atEof()), "UnexpectedEof", "EOF inside the head");
-  let c = new ResponseParser(defaultLimits(), false);
+  let c = new ResponseParser(defaultLimits(), ToOther);
   assertEqString(outcome2(c.feed(bs("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n"))), "NeedMore", "partial chunked");
   assertEqString(outcome2(c.atEof()), "UnexpectedEof", "EOF inside a chunked body");
-  let d = new ResponseParser(defaultLimits(), false);
+  let d = new ResponseParser(defaultLimits(), ToOther);
   assertEqString(outcome2(d.feed(bs("HTTP/1.0 200 OK\r\n\r\nxyz"))), "NeedMore", "close-delimited");
   assertEqBool(d.isDone(), false, "not done before EOF");
   assertEqString(outcome2(d.atEof()), "Done", "EOF ends a close-delimited body");
   assertEqBool(d.isDone(), true, "done");
   assertEqString(outcome2(d.atEof()), "ParserFinished", "second EOF");
-  let i = new ResponseParser(defaultLimits(), false);
+  let i = new ResponseParser(defaultLimits(), ToOther);
   assertEqBool(i.isIdle(), true, "idle");
   assertEqString(outcome2(i.atEof()), "UnexpectedEof", "EOF before any byte");
   let r = new RequestParser(defaultLimits());
@@ -538,24 +541,24 @@ function responseEofHandling(): void {
 
 @Test
 function rejectsBadStatusLines(): void {
-  expectResFail("HTTP/1.1 200\r\n\r\n", false, "BadStatusLine", 12);
-  expectResFail("HTTP/1.1 20 OK\r\n\r\n", false, "BadStatusCode", 11);
-  expectResFail("HTTP/1.1 600 X\r\n\r\n", false, "BadStatusCode", 9);
-  expectResFail("HTTP/1.1 099 X\r\n\r\n", false, "BadStatusCode", 9);
-  expectResFail("HTTP/1.1 000 X\r\n\r\n", false, "BadStatusCode", 9);
-  expectResFail("HTTP/1.1  200 X\r\n\r\n", false, "BadStatusCode", 9);
-  expectResFail("HTTP/1.1 2000 X\r\n\r\n", false, "BadStatusLine", 12);
-  expectResFail("HTTP/1.1 abc X\r\n\r\n", false, "BadStatusCode", 9);
-  expectResFail("HTTP/1.1 +200 X\r\n\r\n", false, "BadStatusCode", 9);
-  expectResFail("HTTP/1.1\r\n\r\n", false, "BadStatusLine", 8);
-  expectResFail("HTTP/1.1 200 O\x00K\r\n\r\n", false, "BadStatusLine", 14);
+  expectResFail("HTTP/1.1 200\r\n\r\n", false, "InvalidStatusLine", 12);
+  expectResFail("HTTP/1.1 20 OK\r\n\r\n", false, "InvalidStatusCode", 11);
+  expectResFail("HTTP/1.1 600 X\r\n\r\n", false, "InvalidStatusCode", 9);
+  expectResFail("HTTP/1.1 099 X\r\n\r\n", false, "InvalidStatusCode", 9);
+  expectResFail("HTTP/1.1 000 X\r\n\r\n", false, "InvalidStatusCode", 9);
+  expectResFail("HTTP/1.1  200 X\r\n\r\n", false, "InvalidStatusCode", 9);
+  expectResFail("HTTP/1.1 2000 X\r\n\r\n", false, "InvalidStatusLine", 12);
+  expectResFail("HTTP/1.1 abc X\r\n\r\n", false, "InvalidStatusCode", 9);
+  expectResFail("HTTP/1.1 +200 X\r\n\r\n", false, "InvalidStatusCode", 9);
+  expectResFail("HTTP/1.1\r\n\r\n", false, "InvalidStatusLine", 8);
+  expectResFail("HTTP/1.1 200 O\x00K\r\n\r\n", false, "InvalidStatusLine", 14);
   expectResFail("HTTP/1.1 200 OK\n\r\n", false, "BareLf", 15);
   expectResFail("HTTP/1.1 200 OK\rX", false, "BareCr", 16);
   expectResFail("HTTP/2 200 OK\r\n\r\n", false, "UnsupportedVersion", 5);
   expectResFail("HTTP/1.2 200 OK\r\n\r\n", false, "UnsupportedVersion", 7);
-  expectResFail("http/1.1 200 OK\r\n\r\n", false, "BadVersion", 0);
-  expectResFail("HTTP/1.1200 OK\r\n\r\n", false, "BadStatusLine", 8);
-  expectResFail("GET / HTTP/1.1\r\n\r\n", false, "BadVersion", 0);
+  expectResFail("http/1.1 200 OK\r\n\r\n", false, "InvalidVersion", 0);
+  expectResFail("HTTP/1.1200 OK\r\n\r\n", false, "InvalidStatusLine", 8);
+  expectResFail("GET / HTTP/1.1\r\n\r\n", false, "InvalidVersion", 0);
 }
 
 @Test
@@ -569,7 +572,7 @@ function responsesUseTheSameFramingRules(): void {
   expectResFail("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", false, "UnsupportedTransferEncoding", 17 + 28);
   expectResFail("HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\n\r\n", false, "BodyTooLarge", 17 + 25);
   expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFF\r\n", false, "BodyTooLarge", 17 + 28 + 2 + 5);
-  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxx", false, "BadChunkTerminator", 17 + 28 + 2 + 3 + 1);
+  expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxx", false, "InvalidChunkTerminator", 17 + 28 + 2 + 3 + 1);
   expectResFail("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nContent-Length: 1\r\n\r\n", false, "ForbiddenTrailer", 17 + 28 + 2 + 3);
   // a response may carry any Host field: it is not a request
   const r = okRes("HTTP/1.1 200 OK\r\nHost: a\r\nHost: b\r\nContent-Length: 0\r\n\r\n", false);
@@ -644,7 +647,7 @@ function hexStringFormatsChunkSizes(): void {
   assertEqString(hexString(1048576), "100000", "1 MiB");
 }
 
-function finished(): HttpReason {
+function finished(): HttpErrorKind {
   return ParserFinished;
 }
 
@@ -653,13 +656,13 @@ function errorMessagesNameTheRuleAndThePosition(): void {
   const r = parseRequest(bs("GET / HTTP/1.1\r\nHost : a\r\n\r\n"), defaultLimits());
   match (r) {
     Failed(e) => {
-      assertEqString(e.message, "whitespace between the field name and the colon at byte 20", "message");
-      assertEqString(reasonText(e.reason), "whitespace between the field name and the colon", "reasonText");
+      assertEqString(httpErrorMessage(e), "whitespace between the field name and the colon at byte 20", "message");
+      assertEqString(httpErrorKindText(e.kind), "whitespace between the field name and the colon", "httpErrorKindText");
     },
     NeedMore => { fail("need more"); },
     Done(q, used) => { fail("accepted"); }
   };
   const h = httpError(7, finished());
-  assertEqUsize(h.position, 7, "httpError position");
-  assertEqString(reasonName(h.reason), "ParserFinished", "httpError reason");
+  assertEqUsize(h.offset, 7, "httpError offset");
+  assertEqString(httpErrorKindName(h.kind), "ParserFinished", "httpError kind");
 }
