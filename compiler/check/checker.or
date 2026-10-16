@@ -5,7 +5,9 @@ import { Diagnostic, SourceMap, diag } from "../diag";
 import { Ident, DAlias, FunctionDecl } from "../syntax";
 import { Program, Function, HBlock, HExpr, XLocal, HReturn, Type, IfaceDef } from "../hir";
 import { LoadedProgram } from "../loader";
-import { Env, FuncInfo, dedupDiags, isVoid } from "./env";
+import {
+  Env, FuncInfo, dedupDiags, isVoid, isOrdinaryMode, isCtorMode, isMutVoidMode, isLiftedMode,
+} from "./env";
 import { collect } from "./collect";
 import { resolveDecls, findMain } from "./decls";
 import { newFnCtx } from "./fnctx";
@@ -30,7 +32,7 @@ type FuncOut = { func: Function; err: Option<Diagnostic>; env: Env; cexprs: HExp
 // Checks one function body. `abs` marks the abstract check of a generic body (type parameters
 // are opaque types; no function instances are created). Returns the (possibly grown) environment.
 function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
-  if (f.mode == 6) {
+  if (isLiftedMode(f.mode)) {
     // A lifted closure function: its HIR was produced while its enclosing function was checked.
     const noErr: Option<Diagnostic> = None;
     return FuncOut { func: env.lifted[f.cls], err: noErr, env: env, cexprs: [] };
@@ -83,11 +85,11 @@ function checkFunc(env: Env, f: FuncInfo, abs: bool): FuncOut {
       let block = b.block;
       // Classes: constructors and void mutating methods return the receiver (`this` is the first local
       // after the parameters).
-      if ((f.mode == 1 || f.mode == 3) && !b.div) {
+      if ((isCtorMode(f.mode) || isMutVoidMode(f.mode)) && !b.div) {
         const thisE = HExpr { kind: XLocal(f.paramLocals.length), ty: f.ret, span: f.decl.span };
         block.stmts.push(HReturn(Some(thisE)));
       }
-      const srcVoid = f.mode == 0 ? isVoid(f.ret) : isVoid(f.srcRet);
+      const srcVoid = isOrdinaryMode(f.mode) ? isVoid(f.ret) : isVoid(f.srcRet);
       if (!srcVoid && !b.div) {
         err = Some(diag(
           "E0403",
@@ -163,21 +165,21 @@ function abstractType(env: Env, g: usize): Option<Diagnostic> {
 }
 
 // Unit index of the array prelude (`library/collections/array.or`, loaded implicitly as unit `$array/array`; see
-// compiler/loader/prelude.or), or -1 when the program was loaded without preludes.
-function arrayPreludeUnit(prog: LoadedProgram): int {
+// compiler/loader/prelude.or), or None when the program was loaded without preludes.
+function arrayPreludeUnit(prog: LoadedProgram): Option<usize> {
   return preludeUnit(prog, "$array/array");
 }
 
-// Unit index of the unit called `name` (a prelude unit), or -1.
-function preludeUnit(prog: LoadedProgram, name: string): int {
+// Unit index of the unit called `name` (a prelude unit), or None.
+function preludeUnit(prog: LoadedProgram, name: string): Option<usize> {
   let i: usize = 0;
   while (i < prog.units.length) {
     if (prog.units[i].name == name) {
-      return i.toInt();
+      return Some(i);
     }
     i += 1;
   }
-  return -1;
+  return None;
 }
 
 function ifaceDefs(env: Env): IfaceDef[] {
@@ -282,7 +284,7 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
       diags.push(d);
     }
   }
-  if (diags.length == 0 && env.parUnit >= 0) {
+  if (diags.length == 0 && env.parUnit.isSome()) {
     for (const d of parallelDiags(sm, funcs)) {
       diags.push(d);
     }
@@ -301,7 +303,7 @@ export function check(prog: LoadedProgram, sm: SourceMap): Result<Program, Diagn
   let inl: bool[] = [];
   let inlineFns: string[] = [];
   for (const fi2 of env.funcs) {
-    const h = fi2.mode != 6 && hasInline(fi2.decl.annotations);
+    const h = !isLiftedMode(fi2.mode) && hasInline(fi2.decl.annotations);
     inl.push(h);
     if (h) {
       inlineFns.push(fi2.qname);

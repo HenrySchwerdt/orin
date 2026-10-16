@@ -53,8 +53,58 @@ type Ctx = {
   tqDefs: usize[];
   fnDef: Option<usize>[];      // HIR function id -> the def it was lowered from (generic instances and lifted closures: the
                                // enclosing generic function / function / method; function-value wrappers: the wrapped function)
-  fnKind: usize[];             // HIR function id -> 0 ordinary or generic instance, 1 lifted closure body, 2 function-value wrapper
+  fnKind: FnKind[];            // HIR function id -> what it was lowered from
 };
+
+// What a HIR function is: FkOrdinary an ordinary function or generic instance, FkClosure a lifted closure body,
+// FkWrapper a function-value wrapper (`f$closure`).
+type FnKind = FkOrdinary | FkClosure | FkWrapper;
+
+function fnKindNos(ks: FnKind[]): usize[] {
+  let out: usize[] = [];
+  for (const k of ks) {
+    out.push(fnKindNo(k));
+  }
+  return out;
+}
+
+function isOrdinaryKind(k: FnKind): bool {
+  return match (k) {
+    FkOrdinary => true,
+    _ => false,
+  };
+}
+
+function isClosureKind(k: FnKind): bool {
+  return match (k) {
+    FkClosure => true,
+    _ => false,
+  };
+}
+
+function isWrapperKind(k: FnKind): bool {
+  return match (k) {
+    FkWrapper => true,
+    _ => false,
+  };
+}
+
+// The kind as the number `SemanticIndex.fnKinds` stores (0 ordinary, 1 closure, 2 wrapper).
+function fnKindNo(k: FnKind): usize {
+  return match (k) {
+    FkOrdinary => 0,
+    FkClosure => 1,
+    FkWrapper => 2,
+  };
+}
+
+// `q` is a parameter of the ordinary function body being walked (`np`, see W).
+function isParamOf(np: Option<usize>, q: usize): bool {
+  return match (np) {
+    Some(n) => q < n,
+    None => false,
+  };
+}
 
 // Mutable walker state.
 type W = {
@@ -65,7 +115,7 @@ type W = {
   calls: CallSite[];           // call sites (OSIG CALLS edges)
   cur: Option<usize>;          // caller def of the HIR body being walked
   curMay: bool;                // the body is a lifted closure: its calls are MAY edges of the enclosing function
-  np: int;                     // parameter count of the ordinary function body being walked; -1 in a closure body (a
+  np: Option<usize>;           // parameter count of the ordinary function body being walked; None in a closure body (a
                                // parameter of a closure is not one of the enclosing function)
   bnd: usize[];                // interface defs bounding the type parameters of the generic function instance being walked
   lNames: string[];            // flat scope stack of visible locals: name, def id, HIR type
@@ -761,7 +811,7 @@ function newW(): W {
   const tys: Option<Type>[] = [];
   const tt: Type[] = [];
   return W {
-    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, np: -1, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
+    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, np: None, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
     hl: s, hlTy: tt, hk: 0
   };
 }
@@ -1540,11 +1590,11 @@ function fnArgKinds(w: W, c: Ctx, args: HExpr[], lead: bool): string {
         match (a.kind) {
           XClosure(fid, _) => {
             if (fid < c.fnKind.length) {
-              k = c.fnKind[fid] == 2 ? "v" : "c";
+              k = isWrapperKind(c.fnKind[fid]) ? "v" : "c";
             }
           },
           XLocal(q) => {
-            if (w.np >= 0 && q.toInt() < w.np) {
+            if (isParamOf(w.np, q)) {
               k = "p" + q.toString();
             }
           },
@@ -1569,7 +1619,7 @@ function isContained(w: W, d: usize): bool {
 // with bounded type parameters the call of a method of the instance's class is a call of the interface method.
 function callSite(w: W, c: Ctx, e: HExpr, fid: usize, args: HExpr[]): W {
   let x = w;
-  if (fid >= c.fnDef.length || c.fnKind[fid] != 0) {
+  if (fid >= c.fnDef.length || !isOrdinaryKind(c.fnKind[fid])) {
     return x;
   }
   const fa = fnArgKinds(x, c, args, false);
@@ -1631,7 +1681,7 @@ function virtCall(w: W, c: Ctx, e: HExpr, recv: HExpr, slot: usize, args: HExpr[
 // A function used as a value (the lifted wrapper `f$closure`, ADR-0011): the wrapped function may be
 // called wherever the value flows.
 function valueRef(w: W, c: Ctx, e: HExpr, fid: usize): W {
-  if (fid < c.fnDef.length && c.fnKind[fid] == 2) {
+  if (fid < c.fnDef.length && isWrapperKind(c.fnKind[fid])) {
     match (c.fnDef[fid]) {
       Some(d) => { return addCall(w, Some(d), "MAY", "value", e.span); },
       None => {}
@@ -1822,7 +1872,7 @@ function hExpr(w: W, c: Ctx, e: HExpr, ty: bool): W {
       let pk: int = -1;
       match (f.kind) {
         XLocal(q) => {
-          if (x.np >= 0 && q.toInt() < x.np) {
+          if (isParamOf(x.np, q)) {
             pk = q.toInt();
           }
         },
@@ -2104,16 +2154,16 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     None => {}
   }
   let fnDef: Option<usize>[] = [];
-  let fnKind: usize[] = [];
+  let fnKind: FnKind[] = [];
   match (hir) {
     Some(h) => {
       const fq = functionNames(prog, tabs, w.defs);
       for (const f of h.functions) {
         let nm = f.name;
-        let kind: usize = 0;
+        let kind: FnKind = FkOrdinary;
         const ci = nm.indexOf("$closure");
         if (ci.isSome()) {
-          kind = ci.unwrap() + 8 == nm.length ? 2 : 1;
+          kind = ci.unwrap() + 8 == nm.length ? FkWrapper : FkClosure;
           nm = nm.substring(0, ci.unwrap());
         }
         const lt = nm.indexOf("<");
@@ -2147,10 +2197,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 if (hn < h.functions.length && h.functions[hn].name == u.name + "." + f.name.name) {
                   hf = Some(h.functions[hn]);
                   w.cur = Some(did);
-                  w.np = h.functions[hn].paramCount.toInt();
+                  w.np = Some(h.functions[hn].paramCount);
                   w = hBlock(w, c, h.functions[hn].body, true);
                   w.cur = None;
-                  w.np = -1;
+                  w.np = None;
                 }
               },
               None => {}
@@ -2248,10 +2298,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                 match (ctorHf) {
                   Some(hf) => {
                     w.cur = Some(dk);
-                    w.np = hf.paramCount.toInt();
+                    w.np = Some(hf.paramCount);
                     w = hBlock(w, c, hf.body, true);
                     w.cur = None;
-                    w.np = -1;
+                    w.np = None;
                   },
                   None => {}
                 }
@@ -2267,10 +2317,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
                       if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
                         hf = Some(h.functions[hn]);
                         w.cur = Some(dk);
-                        w.np = h.functions[hn].paramCount.toInt();
+                        w.np = Some(h.functions[hn].paramCount);
                         w = hBlock(w, c, h.functions[hn].body, true);
                         w.cur = None;
-                        w.np = -1;
+                        w.np = None;
                       }
                     },
                     None => {}
@@ -2290,10 +2340,10 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
             match (ctorHf) {
               Some(hf) => {
                 w.cur = Some(did);
-                w.np = hf.paramCount.toInt();
+                w.np = Some(hf.paramCount);
                 w = hBlock(w, c, hf.body, false);
                 w.cur = None;
-                w.np = -1;
+                w.np = None;
               },
               None => {}
             }
@@ -2310,13 +2360,13 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
       while (hn < h.functions.length) {
         // Lifted closure bodies (arrow functions, ADR-0011) also contribute expression types.
         w.bnd = boundDefs(c, h.functions[hn].name);
-        w.cur = c.fnKind[hn] == 2 ? None : c.fnDef[hn];
-        w.curMay = c.fnKind[hn] == 1;
-        w.np = c.fnKind[hn] == 0 ? h.functions[hn].paramCount.toInt() : -1;
+        w.cur = isWrapperKind(c.fnKind[hn]) ? None : c.fnDef[hn];
+        w.curMay = isClosureKind(c.fnKind[hn]);
+        w.np = isOrdinaryKind(c.fnKind[hn]) ? Some(h.functions[hn].paramCount) : None;
         w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
         w.cur = None;
         w.curMay = false;
-        w.np = -1;
+        w.np = None;
         const noB: usize[] = [];
         w.bnd = noB;
         hn += 1;
@@ -2350,7 +2400,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     impls: w.impls,
     calls: w.calls,
     fnDefs: fnDef,
-    fnKinds: fnKind,
+    fnKinds: fnKindNos(fnKind),
     typed: hir.isSome()
   };
 }
