@@ -138,8 +138,8 @@ separator is raised through `process.exit(101)` after printing the same message.
     was needed (the port is plain safe Orin). **What still needs the C copies of the R1/R3b functions** (none is
     referenced by code generated in the default path, and none is deleted): (1) `--c-builtins`
     (`tools/differential.sh --mode builtins`, `BStr*`/`BParseInt*`/`BIntToString`/... fall back to the `orin_*` calls in
-    `compiler/cemit/function.or` and `compiler/llvm/function.or`; `compiler/llvm/runtime.or` declares them); (2) the
-    frozen seed `seed/orin-seed.c.gz` is the compiler program compiled WITH the prelude, so the seed program itself
+    `compiler/backends/c/function.or` and `compiler/backends/llvm/function.or`; `compiler/backends/llvm/runtime.or` declares them); (2) the
+    frozen seed `bootstrap/seed/orin-seed.c.gz` is the compiler program compiled WITH the prelude, so the seed program itself
     does not call them (they appear there only as strings of the emitter tables), but it links the same
     `runtime/core/orin_runtime.c` and its `--c-builtins` mode needs them. Deleting them means deleting `--c-builtins`
     and the builtins differential mode; that is the R3f step, not R3b.
