@@ -6,7 +6,7 @@ next modules (check, lower / opt / verify, backends, tooling: step 3e below) fol
 
 The rules are in [ADR-0015](decisions/0015-compiler-modernisation-and-contract-dogfooding.md): one
 module per PR, **behaviour-preserving**, no new language features, contracts for real invariants,
-performance measured. The seed (`seed/`, `tools/bootstrap.sh`) understands the whole language, so
+performance measured. The seed (`bootstrap/seed/`, `tools/bootstrap.sh`) understands the whole language, so
 the compiler source is not restricted to Orin-B any more.
 
 ## Checklist per module

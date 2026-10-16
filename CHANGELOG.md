@@ -2,6 +2,9 @@
 
 ## Unreleased
 - **Protocol harness in Orin (ADR-0047 phase 5).** New package `tooling/protocol` (`tools/protocol.sh lsp|mcp [--orin PATH] [--orin2 PATH]`, `--unit-tests`, `--build-only`) replaces `tools/test_lsp.py` and `tools/test_mcp.py`, which are deleted; same test cases (104 and 191 checks), assertions, `FAIL:` lines, summary and exit status. The server runs as a background process through the shell (stdin on a named pipe, stdout on a file) because the language has no child-process pipes; unit tests of the framing, position, JSON-path and option helpers in `tooling/protocol/tests`. The CI `tooling` job, `tools/ci_local.sh` and `tools/dev.sh tooling` use it.
+- **Backends and seed moved (ADR-0047 phase 4).** `compiler/cemit` is now `compiler/backends/c`, `compiler/llvm` is
+  `compiler/backends/llvm`, and `seed/` is `bootstrap/seed/` (pure moves: imports, scripts, CI path rules and docs follow; no
+  behaviour change). `tools/bootstrap.sh` and `tools/update_seed.sh` read and write `bootstrap/seed/`.
 - **Mutation checks in Orin (ADR-0047 phase 5).** New package `tooling/mutation` (`tools/mutation.sh std|ox`) replaces
   `tools/mutate_std.py` and `tools/mutate_ox.py`, which are deleted: the same flags, the same 188 std mutants, 10 `std:net`
   mutants and 33 OX mutants in the same order, the same result lines and exit status; the CI `std-mutants` jobs run it (and the

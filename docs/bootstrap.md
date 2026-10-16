@@ -1,13 +1,13 @@
 # Bootstrap plan
 
 The build starts from a committed **seed**, the generated C of a self-hosted compiler
-(`seed/orin-seed.c.gz`, described by `seed/SEED_INFO`). Only a C compiler, python3, gzip and
+(`bootstrap/seed/orin-seed.c.gz`, described by `bootstrap/seed/SEED_INFO`). Only a C compiler, python3, gzip and
 sha256sum/shasum are required. The seed is the **single root** of the build (ADR-0014, ADR-0015); the
 Rust Stage 0 is retired (see "Retired Stage 0" below).
 
 | Stage | Built by | Source | Output |
 |---|---|---|---|
-| seed | `cc` | `seed/orin-seed.c.gz` (sha256-verified) | `orin0` |
+| seed | `cc` | `bootstrap/seed/orin-seed.c.gz` (sha256-verified) | `orin0` |
 | 1 | `orin0` | `compiler/` | `orin1` |
 | 2 | `orin1` | `compiler/` | `orin2` (+ `stage2.c`) |
 | 3 | `orin2` | `compiler/` | `stage3.c` — must be byte-identical to `stage2.c` |
@@ -49,7 +49,7 @@ contained it: the `bootstrap/` crate, `tools/diff_parsers.py`, `tools/stage0/`, 
 `tools/bootstrap.sh --from-stage0`). Its documented contract is `docs/bootstrap-subset.md`.
 
 **Diverse double root evidence.** Until `ec1ba3e` CI required that the seed root and the Rust root
-produce a byte-identical `stage2.c`. For the seed refreshed from `ec1ba3e` (`seed/SEED_INFO`,
+produce a byte-identical `stage2.c`. For the seed refreshed from `ec1ba3e` (`bootstrap/seed/SEED_INFO`,
 sha256 `a7ec8b3b...40c6`, 5590974 bytes) this was checked once more before Stage 0 was removed: both
 roots gave the same `stage2.c`. To reproduce it:
 
@@ -57,7 +57,7 @@ roots gave the same `stage2.c`. To reproduce it:
 git worktree add ../orin-stage0 archive/stage0-final     # or: git checkout archive/stage0-final
 cd ../orin-stage0
 ./tools/bootstrap.sh --from-stage0                       # needs cargo; Rust root -> orin1 -> orin2 -> stage3
-sha256sum build/bootstrap/stage2.c                       # must equal the sha256 in seed/SEED_INFO of main
+sha256sum build/bootstrap/stage2.c                       # must equal the sha256 in bootstrap/seed/SEED_INFO of main
 ```
 
 What is established: the seed whose source commit is `ec1ba3e` is exactly what a toolchain with no
@@ -106,7 +106,7 @@ above), though `compiler/` has not been rewritten yet. Features beyond Orin-B ge
   class tables, lookups), `check/classfix.or` (inferred-mutability fixpoint by probing method bodies,
   `$ret` records), `check/body.or` (`new`, method/static calls, `p = C.m(p, ..)` lowering through
   hoisted statements `FnCtx.pre`, private access E0405, `this` errors E0300, const receiver E0401),
-  `check/index.or` (class/field/method defs and refs; method detail `mut method m(..)` when inferred
+  `check/index/` (class/field/method defs and refs; method detail `mut method m(..)` when inferred
   mutating), `fmt/printer.or`. HIR and backends are unchanged.
 
 * Closures (ADR-0011): `syntax/` (`EArrow`, `TFn`), `check/fnctx.or` (captures), `check/body.or` (closure
