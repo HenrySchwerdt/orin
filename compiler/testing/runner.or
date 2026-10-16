@@ -15,11 +15,11 @@ import { loadWithRoots, preludeRoots, isInside } from "../loader";
 import { SourceFile } from "../diag";
 import { check, checkRuntime, checkWithIndex, deprecationWarnings, hasDeprecated, qualityWarnings, strictContracts } from "../check";
 import { lower } from "../lower";
-import { emitC } from "../cemit";
+import { emitC } from "../backends/c";
 import { optimize, pruneProgram } from "../opt";
 import { fuseProgram } from "../fuse";
 import { verify } from "../verify";
-import { shellRun, shellRunTimeout, shq, readOr, lineCol } from "../util";
+import { shellRun, shellRunTimeout, shq, readOr, lineCol, mapOrderedProcess } from "../util";
 import { quoteJson } from "../json";
 import { formatDiagnosticJson } from "../tools";
 import { readFile, writeFile, exists } from "std:fs";
@@ -199,19 +199,32 @@ export function runTests(fs: FsGrant, proc: ProcessGrant, o: TestOpts): TestRun 
     }
     return failRun(sm, "the C compiler failed (`" + o.cc + "`, exit " + cc.toString() + "): " + text);
   }
-  let results: TestResult[] = [];
+  let selected: TestCase[] = [];
   for (const t of tests) {
-    if (!matches(t.id, o.filter)) {
-      continue;
+    if (matches(t.id, o.filter)) {
+      selected.push(t);
     }
+  }
+  // One process per test, overlapped by worker tasks (ADR-0049, P9). Each test owns its files (`t<index>.out/.err`), and
+  // the exit codes come back in selection order, so the report is the same for every thread count. A task captures only
+  // the executable name, the build directory, the indices and the timeout.
+  const indices = selected.map(t => t.index);
+  const timeout = o.timeout;
+  const codes = mapOrderedProcess(proc, selected.length, (k: usize, g: ProcessGrant) =>
+    shellRunTimeout(g, runCommand(exe, indices[k], dir + "/t" + indices[k].toString()), timeout));
+  let results: TestResult[] = [];
+  let k: usize = 0;
+  while (k < selected.length) {
+    const t = selected[k];
     const base = dir + "/t" + t.index.toString();
-    const code = shellRunTimeout(proc, runCommand(exe, t.index, base), o.timeout);
+    const code = codes[k];
     const text = sm.files[t.file].text;
     results.push(TestResult {
       test: t, path: sm.files[t.file].path, line: lineCol(text, t.start).line, col: lineCol(text, t.start).col,
       pass: code == 0, exitCode: code, reason: reasonOf(code),
       stdout: chomp(readOr(fs, base + ".out")), stderr: chomp(readOr(fs, base + ".err"))
     });
+    k += 1;
   }
   if (ownDir && !o.keep) {
     shellRun(proc, "rm -rf " + shq(dir));

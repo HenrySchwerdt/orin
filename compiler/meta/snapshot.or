@@ -1,0 +1,611 @@
+// Snapshot extraction (ADR-0046 S4): the `std:meta` `Input` of one processor run, built from the syntax trees of the
+// (already checked) source module and the units it imports, as the JSON document of library/std/metajson.or
+// (`inputToJson`; key order and tags are those of the encoder, so `decodeInput` of std:meta reads it back).
+//
+// A run is one (annotation, source module) pair. Its input lists every declaration of the module that carries the
+// annotation (on the declaration, on a field of a record or class, or on a method), in source order, with kind, name,
+// export flag, type parameters, fields, constructor parameters, methods, variants, doc comment, contract clauses as text and the applied
+// annotations with typed constants; every named type that occurs is listed once with its own shape when it is visible
+// from the module. Private declarations of other modules never appear (lookup follows `export` only).
+//
+// Each item that a diagnostic can point at gets a ref (a dense id, 0, 1, ...). `refs[id]` is the span of the item's name
+// in the source file: the position of a diagnostic of the processor.
+
+import { SourceMap, Span } from "../diag";
+import {
+  Item, Annotation, Expr, TypeExpr, ContractClause, Param, FieldDecl, VariantDecl, TypeDecl, ClassDecl, FunctionDecl,
+  MethodDecl, InterfaceDecl, IfaceMethod, ConstDecl, Ident, scanComments, Comment,
+} from "../syntax";
+import { Json, stringifyJson } from "../json";
+import { LoadedProgram } from "../loader";
+import { documentationFrom } from "../analysis";
+import { Res, lookupDecl, moduleLabel, memberAnnotations, ownAnnotations, declName, declExported } from "./lookup";
+import { constJson } from "./consts";
+import { obj, tagged, fld, jstr, jint, jbool, jnull, jarr, strs } from "./jsonutil";
+
+// One processor run: the annotation `annoName` (declared in unit `annoUnit`) used in unit `unit`.
+export type Run = {
+  unit: usize;
+  annoUnit: usize;
+  annoName: string;
+  items: usize[];     // indices into `unit.ast.items` of the annotated declarations, in source order
+  names: string[];    // their names
+  cause: Span;        // the first use of the annotation: where generated code points
+};
+
+export type Snapshot = { text: string; refs: Span[]; };
+
+type Wanted = { name: string; unit: usize; };
+
+// The user annotations in `as` that resolve to the annotation `annoName` of `annoUnit`.
+function usesOf(prog: LoadedProgram, ui: usize, as: Annotation[], annoUnit: usize, annoName: string): Annotation[] {
+  let out: Annotation[] = [];
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, _) => {
+        const r = lookupDecl(prog, ui, id.name);
+        if (r.isSome() && r.unwrap().unit == annoUnit && declName(r.unwrap().item) == annoName) {
+          out.push(a);
+        }
+      },
+      _ => {},
+    }
+  }
+  return out;
+}
+
+// All runs of unit `ui`: one per annotation that the unit's declarations use, in order of first use.
+export function findRuns(prog: LoadedProgram, ui: usize): Run[] {
+  let runs: Run[] = [];
+  const items = prog.units[ui].ast.items;
+  let k: usize = 0;
+  while (k < items.length) {
+    const it = items[k];
+    const all = ownAnnotations(it).concat(memberAnnotations(it));
+    for (const a of all) {
+      match (a.kind) {
+        ACustom(id, _) => {
+          const r = lookupDecl(prog, ui, id.name);
+          if (r.isSome()) {
+            const au = r.unwrap().unit;
+            const an = declName(r.unwrap().item);
+            let at: Option<usize> = None;
+            let j: usize = 0;
+            while (j < runs.length) {
+              if (runs[j].annoUnit == au && runs[j].annoName == an) {
+                at = Some(j);
+              }
+              j += 1;
+            }
+            if (at.isNone()) {
+              runs.push(Run { unit: ui, annoUnit: au, annoName: an, items: [k], names: [declName(it)], cause: a.span });
+            } else {
+              const i = at.unwrap();
+              if (runs[i].items[runs[i].items.length - 1] != k) {
+                runs[i].items.push(k);
+                runs[i].names.push(declName(it));
+              }
+            }
+          }
+        },
+        _ => {},
+      }
+    }
+    k += 1;
+  }
+  return runs;
+}
+
+function contractKind(c: ContractClause): string {
+  return match (c.kind) {
+    CRequires => "requires",
+    CEnsures => "ensures",
+    CInvariant => "invariant",
+    CDecreases => "decreases",
+    CRule => "rule",
+  };
+}
+
+// The text with every run of white space replaced by one blank.
+function collapse(s: string): string {
+  let out = "";
+  let blank = false;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c == 32 || c == 9 || c == 10 || c == 13) {
+      blank = out != "";
+    } else {
+      if (blank) {
+        out += " ";
+        blank = false;
+      }
+      out += s.substring(i, i + 1);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function unitMinStart(start: usize, as: Annotation[], cs: ContractClause[]): usize {
+  let m = start;
+  for (const a of as) {
+    if (a.span.start < m) {
+      m = a.span.start;
+    }
+  }
+  for (const c of cs) {
+    if (c.span.start < m) {
+      m = c.span.start;
+    }
+  }
+  return m;
+}
+
+class SnapBuilder {
+  prog: LoadedProgram;
+  sm: SourceMap;
+  cur: usize;                    // the unit whose names are being resolved
+  refs: Span[] = [];
+  wanted: Wanted[] = [];
+  tparams: string[] = [];        // type parameters in scope (never listed as types)
+  commentCache: Comment[][] = [];
+  commentFile: usize[] = [];
+  failure: string = "";
+
+  constructor(prog: LoadedProgram, sm: SourceMap, cur: usize) {
+    this.prog = prog;
+    this.sm = sm;
+    this.cur = cur;
+  }
+
+  newRef(sp: Span): Json {
+    this.refs.push(sp);
+    return jint((this.refs.length - 1).toInt());
+  }
+
+  comments(file: usize): Comment[] {
+    let i: usize = 0;
+    while (i < this.commentFile.length) {
+      if (this.commentFile[i] == file) {
+        return this.commentCache[i];
+      }
+      i += 1;
+    }
+    const cs = scanComments(this.sm.files[file].text);
+    this.commentFile.push(file);
+    this.commentCache.push(cs);
+    return cs;
+  }
+
+  docOf(sp: Span, as: Annotation[], cs: ContractClause[]): string {
+    if (sp.file >= this.sm.files.length) {
+      return "";
+    }
+    const start = unitMinStart(sp.start, as, cs);
+    return documentationFrom(this.sm.files[sp.file].text, this.comments(sp.file), start).unwrapOr("");
+  }
+
+  note(name: string) {
+    for (const t of this.tparams) {
+      if (t == name) {
+        return;
+      }
+    }
+    for (const w of this.wanted) {
+      if (w.name == name && w.unit == this.cur) {
+        return;
+      }
+    }
+    this.wanted.push(Wanted { name: name, unit: this.cur });
+  }
+
+  typeJson(t: TypeExpr): Json {
+    match (t.kind) {
+      TNamed(id, args) => {
+        let as: Json[] = [];
+        for (const a of args) {
+          as.push(this.typeJson(a));
+        }
+        if (id.name == "Option" && args.length == 1) {
+          return tagged("option", [fld("elem", as[0])]);
+        }
+        if (id.name == "Result" && args.length == 2) {
+          return tagged("result", [fld("ok", as[0]), fld("err", as[1])]);
+        }
+        this.note(id.name);
+        return tagged("named", [fld("name", jstr(id.name)), fld("args", jarr(as))]);
+      },
+      TArray(el) => {
+        return tagged("array", [fld("elem", this.typeJson(el))]);
+      },
+      TFn(ps, ret) => {
+        let params: Json[] = [];
+        for (const p of ps) {
+          params.push(this.typeJson(p.ty));
+        }
+        return tagged("fn", [fld("params", jarr(params)), fld("returns", this.typeJson(ret))]);
+      },
+    }
+  }
+
+  voidType(): Json {
+    return tagged("named", [fld("name", jstr("void")), fld("args", jarr([]))]);
+  }
+
+  optType(t: Option<TypeExpr>): Json {
+    return match (t) {
+      Some(x) => this.typeJson(x),
+      None => this.voidType(),
+    };
+  }
+
+  paramJson(p: Param): Json {
+    return obj([fld("name", jstr(p.name.name)), fld("ty", this.typeJson(p.ty))]);
+  }
+
+  paramsJson(ps: Param[]): Json {
+    let out: Json[] = [];
+    for (const p of ps) {
+      out.push(this.paramJson(p));
+    }
+    return jarr(out);
+  }
+
+  variantJson(v: VariantDecl): Json {
+    let ps: Json[] = [];
+    for (const t of v.payload) {
+      ps.push(this.typeJson(t));
+    }
+    return obj([fld("name", jstr(v.name.name)), fld("payload", jarr(ps))]);
+  }
+
+  variantsJson(vs: VariantDecl[]): Json {
+    let out: Json[] = [];
+    for (const v of vs) {
+      out.push(this.variantJson(v));
+    }
+    return jarr(out);
+  }
+
+  contractsJson(cs: ContractClause[]): Json {
+    let out: Json[] = [];
+    for (const c of cs) {
+      let text = c.rule;
+      match (c.expr) {
+        Some(e) => {
+          if (e.span.file < this.sm.files.length && e.span.end <= this.sm.files[e.span.file].text.length) {
+            text = collapse(this.sm.files[e.span.file].text.substring(e.span.start, e.span.end));
+          }
+        },
+        None => {},
+      }
+      out.push(obj([fld("kind", jstr(contractKind(c))), fld("text", jstr(text))]));
+    }
+    return jarr(out);
+  }
+
+  // The annotations (user annotations only) of a declaration written in the current unit.
+  annotationsJson(as: Annotation[]): Json {
+    let out: Json[] = [];
+    for (const a of as) {
+      match (a.kind) {
+        ACustom(id, args) => {
+          const r = lookupDecl(this.prog, this.cur, id.name);
+          if (r.isSome()) {
+            out.push(this.annotationJson(r.unwrap(), id, args));
+          }
+        },
+        _ => {},
+      }
+    }
+    return jarr(out);
+  }
+
+  annotationJson(def: Res, id: Ident, args: Expr[]): Json {
+    let fields: FieldDecl[] = [];
+    match (def.item) {
+      IType(t) => {
+        match (t.body) {
+          DRecord(fs) => {
+            fields = fs;
+          },
+          _ => {},
+        }
+      },
+      _ => {},
+    }
+    let out: Json[] = [];
+    let i: usize = 0;
+    while (i < fields.length) {
+      let value = tagged("none", []);
+      if (i < args.length) {
+        const c = constJson(this.prog, def.unit, this.cur, fields[i].ty, args[i], 0);
+        if (c.isOk()) {
+          value = c.unwrap();
+        } else if (this.failure == "") {
+          this.failure = "annotation `@" + id.name + "`: " + c.unwrapErr();
+        }
+      }
+      out.push(obj([fld("name", jstr(fields[i].name.name)), fld("value", value)]));
+      i += 1;
+    }
+    return obj([
+      fld("source", jstr(moduleLabel(this.prog, def.unit))),
+      fld("name", jstr(declName(def.item))),
+      fld("args", jarr(out)),
+    ]);
+  }
+
+  fieldViewJson(f: FieldDecl, exported: bool): Json {
+    return obj([
+      fld("ref", this.newRef(f.name.span)),
+      fld("name", jstr(f.name.name)),
+      fld("ty", this.typeJson(f.ty)),
+      fld("exported", jbool(exported)),
+      fld("annotations", this.annotationsJson(f.annotations)),
+    ]);
+  }
+
+  fieldsJson(fs: FieldDecl[]): Json {
+    let out: Json[] = [];
+    for (const f of fs) {
+      out.push(this.fieldViewJson(f, true));
+    }
+    return jarr(out);
+  }
+
+  methodJson(name: Ident, exported: bool, tps: Ident[], params: Param[], ret: Option<TypeExpr>, sp: Span, as: Annotation[], cs: ContractClause[]): Json {
+    const saved = this.tparams;
+    for (const t of tps) {
+      this.tparams.push(t.name);
+    }
+    const r = obj([
+      fld("ref", this.newRef(name.span)),
+      fld("name", jstr(name.name)),
+      fld("exported", jbool(exported)),
+      fld("typeParams", strs(identNames(tps))),
+      fld("params", this.paramsJson(params)),
+      fld("returns", this.optType(ret)),
+      fld("doc", jstr(this.docOf(sp, as, cs))),
+      fld("annotations", this.annotationsJson(as)),
+      fld("contracts", this.contractsJson(cs)),
+    ]);
+    this.tparams = saved;
+    return r;
+  }
+
+  // The view of one declaration (`MDeclView`).
+  declJson(it: Item): Json {
+    let kind = "";
+    let name = "";
+    let exported = false;
+    let tps: Ident[] = [];
+    let sp: Span = Span { file: 0, start: 0, end: 0 };
+    let nameSp = sp;
+    let as: Annotation[] = [];
+    let cs: ContractClause[] = [];
+    let fields: Json = jarr([]);
+    let ctorParams: Json = jarr([]);
+    let methods: Json = jarr([]);
+    let variants: Json = jarr([]);
+    let params: Json = jarr([]);
+    let ty: Json = jnull();
+    const rid = this.refs.length;
+    this.refs.push(sp);
+    match (it) {
+      IType(t) => {
+        name = t.name.name;
+        exported = t.exported;
+        tps = t.typeParams;
+        sp = t.span;
+        nameSp = t.name.span;
+        as = t.annotations;
+        cs = t.contracts;
+        this.enter(tps);
+        match (t.body) {
+          DRecord(fs) => {
+            kind = "record";
+            fields = this.fieldsJson(fs);
+          },
+          DUnion(vs) => {
+            kind = "union";
+            variants = this.variantsJson(vs);
+          },
+          DAlias(te) => {
+            kind = "alias";
+            ty = this.typeJson(te);
+          },
+        }
+      },
+      IFunction(f) => {
+        kind = "function";
+        name = f.name.name;
+        exported = f.exported;
+        tps = f.typeParams;
+        sp = f.span;
+        nameSp = f.name.span;
+        as = f.annotations;
+        cs = f.contracts;
+        this.enter(tps);
+        params = this.paramsJson(f.params);
+        ty = this.optType(f.ret);
+      },
+      IConst(k) => {
+        kind = "const";
+        name = k.name.name;
+        exported = k.exported;
+        sp = k.span;
+        nameSp = k.name.span;
+        as = k.annotations;
+        ty = match (k.ty) {
+          Some(te) => this.typeJson(te),
+          None => jnull(),
+        };
+      },
+      IClass(c) => {
+        kind = "class";
+        name = c.name.name;
+        exported = c.exported;
+        tps = c.typeParams;
+        sp = c.span;
+        nameSp = c.name.span;
+        as = c.annotations;
+        cs = c.contracts;
+        this.enter(tps);
+        let fs: Json[] = [];
+        let ms: Json[] = [];
+        for (const m of c.members) {
+          match (m) {
+            MField(f) => {
+              fs.push(
+                obj([
+                  fld("ref", this.newRef(f.name.span)),
+                  fld("name", jstr(f.name.name)),
+                  fld("ty", this.typeJson(f.ty)),
+                  fld("exported", jbool(!f.priv)),
+                  fld("annotations", this.annotationsJson(f.annotations)),
+                ]),
+              );
+            },
+            MCtor(k) => {
+              let ps: Json[] = [];
+              for (const p of k.params) {
+                ps.push(obj([fld("name", jstr(p.name.name)), fld("ty", this.typeJson(p.ty))]));
+              }
+              ctorParams = jarr(ps);
+            },
+            MMethod(md) => {
+              ms.push(this.methodJson(md.name, !md.priv, md.typeParams, md.params, md.ret, md.span, md.annotations, md.contracts));
+            },
+          }
+        }
+        fields = jarr(fs);
+        methods = jarr(ms);
+      },
+      IInterface(i) => {
+        kind = "interface";
+        name = i.name.name;
+        exported = i.exported;
+        sp = i.span;
+        nameSp = i.name.span;
+        as = i.annotations;
+        let ms: Json[] = [];
+        for (const m of i.methods) {
+          const noContracts: ContractClause[] = [];
+          ms.push(this.methodJson(m.name, true, [], m.params, m.ret, m.span, m.annotations, noContracts));
+        }
+        methods = jarr(ms);
+      },
+      _ => {},
+    }
+    const doc = this.docOf(sp, as, cs);
+    this.refs[rid] = nameSp;
+    const view = obj([
+      fld("ref", jint(rid.toInt())),
+      fld("kind", jstr(kind)),
+      fld("name", jstr(name)),
+      fld("exported", jbool(exported)),
+      fld("typeParams", strs(identNames(tps))),
+      fld("doc", jstr(doc)),
+      fld("annotations", this.annotationsJson(as)),
+      fld("contracts", this.contractsJson(cs)),
+      fld("fields", fields),
+      fld("ctorParams", ctorParams),
+      fld("methods", methods),
+      fld("variants", variants),
+      fld("params", params),
+      fld("ty", ty),
+    ]);
+    this.tparams = [];
+    return view;
+  }
+
+  enter(tps: Ident[]) {
+    this.tparams = identNames(tps);
+  }
+
+  // The shape of the named type `w` (`MTypeShape`), or None when it is not a declaration visible from its unit.
+  shapeJson(w: Wanted): Option<Json> {
+    const r = lookupDecl(this.prog, w.unit, w.name);
+    if (r.isNone()) {
+      return None;
+    }
+    const saved = this.cur;
+    this.cur = r.unwrap().unit;
+    let tps: Ident[] = [];
+    let shape = tagged("opaque", []);
+    match (r.unwrap().item) {
+      IType(t) => {
+        tps = t.typeParams;
+        this.enter(tps);
+        match (t.body) {
+          DRecord(fs) => {
+            shape = tagged("record", [fld("fields", this.fieldsJson(fs))]);
+          },
+          DUnion(vs) => {
+            shape = tagged("union", [fld("variants", this.variantsJson(vs))]);
+          },
+          DAlias(te) => {
+            shape = tagged("alias", [fld("ty", this.typeJson(te))]);
+          },
+        }
+      },
+      IClass(c) => {
+        tps = c.typeParams;
+      },
+      _ => {},
+    }
+    const out = obj([
+      fld("name", jstr(w.name)),
+      fld("source", jstr(moduleLabel(this.prog, r.unwrap().unit))),
+      fld("typeParams", strs(identNames(tps))),
+      fld("shape", shape),
+    ]);
+    this.cur = saved;
+    this.tparams = [];
+    return Some(out);
+  }
+}
+
+function identNames(ids: Ident[]): string[] {
+  let out: string[] = [];
+  for (const i of ids) {
+    out.push(i.name);
+  }
+  return out;
+}
+
+// The input of `run` as JSON text, with the table of refs. `freshBase` is the base of the run's `NameGen`.
+// Err when an annotation argument cannot be translated (the checker accepted it, so this is an internal error).
+export function buildSnapshot(prog: LoadedProgram, sm: SourceMap, run: Run, freshBase: int): Result<Snapshot, string> {
+  let b = new SnapBuilder(prog, sm, run.unit);
+  const items = prog.units[run.unit].ast.items;
+  let decls: Json[] = [];
+  for (const k of run.items) {
+    b.cur = run.unit;
+    decls.push(b.declJson(items[k]));
+  }
+  let types: Json[] = [];
+  let i: usize = 0;
+  while (i < b.wanted.length) {
+    const s = b.shapeJson(b.wanted[i]);
+    if (s.isSome()) {
+      types.push(s.unwrap());
+    }
+    i += 1;
+  }
+  if (b.failure != "") {
+    return Err(b.failure);
+  }
+  const doc = obj([
+    fld("format", jstr("orin.meta.input")),
+    fld("version", jint(1)),
+    fld("modulePath", jstr(moduleLabel(prog, run.unit))),
+    fld("annotation", jstr(run.annoName)),
+    fld("freshBase", jint(freshBase)),
+    fld("decls", jarr(decls)),
+    fld("types", jarr(types)),
+  ]);
+  return Ok(Snapshot { text: stringifyJson(doc), refs: b.refs });
+}

@@ -1,0 +1,153 @@
+// Pure text helpers of the LLVM backend: IR types of MIR types with the attributes the language guarantees, and the
+// constant globals (C strings for trap messages, Orin string literals).
+
+import { MType } from "../../mir";
+
+export function u(n: usize): string {
+  return n.toString();
+}
+
+export function isRefT(t: MType): bool {
+  return match (t) {
+    MRef => true,
+    _ => false,
+  };
+}
+
+export function isUsizeT(t: MType): bool {
+  return match (t) {
+    MUsize => true,
+    _ => false,
+  };
+}
+
+export function isFloatT(t: MType): bool {
+  return match (t) {
+    MFloat => true,
+    _ => false,
+  };
+}
+
+// int, usize, bool and handles are i64; float / f32 are `double` (ADR-0018); references are `ptr`; an unboxed aggregate
+// MAgg(n) is the array of its n + 1 words, `[n+1 x i64]` (docs/mir.md v2.2), passed and returned by value.
+export function lty(t: MType): string {
+  return match (t) {
+    MVoid => "void",
+    MRef => "ptr",
+    MFloat => "double",
+    MAgg(n) => "[" + u(n + 1) + " x i64]",
+    _ => "i64",
+  };
+}
+
+export function isAggT(t: MType): bool {
+  return match (t) {
+    MAgg(_) => true,
+    _ => false,
+  };
+}
+
+// The zero value of a local of type `t` (the initialising store of every non-parameter local).
+export function zeroOf(t: MType): string {
+  return match (t) {
+    MRef => "null",
+    MFloat => "0.0",
+    MAgg(_) => "zeroinitializer",
+    _ => "0",
+  };
+}
+
+// Type with the attributes the language guarantees for results of generated functions (ADR-0038 step 1: every value is
+// initialised, a reference is never null). Result attributes go before the type.
+export function attrTy(t: MType): string {
+  return match (t) {
+    MVoid => "void",
+    MRef => "noundef nonnull ptr",
+    _ => "noundef " + lty(t),
+  };
+}
+
+// Parameter type then attributes (parameter attributes go after the type).
+export function paramTy(t: MType): string {
+  return match (t) {
+    MRef => "ptr noundef nonnull",
+    _ => lty(t) + " noundef",
+  };
+}
+
+function hexDigit(n: int): string {
+  return "0123456789ABCDEF".charAt(n.toUsize());
+}
+
+function hexValue(c: int): Option<int> {
+  if (c >= 48 && c <= 57) {
+    return Some(c - 48);
+  }
+  if (c >= 65 && c <= 70) {
+    return Some(c - 55);
+  }
+  return None;
+}
+
+// The bytes the contents of an LLVM `c"..."` literal (as `llStr` writes it: printable characters except `"` and `\`, and
+// `\XX` escapes with upper-case hex digits) stand for, or None. Independent of `llStr`; used by its contract.
+export function llStrValue(text: string): Option<string> {
+  let out = "";
+  let i: usize = 0;
+  while (i < text.length) {
+    const c = text.charCodeAt(i);
+    if (c == 34 || c < 32 || c > 126) {
+      return None;
+    }
+    if (c != 92) {
+      out += text.charAt(i);
+      i += 1;
+    } else {
+      if (i + 2 >= text.length) {
+        return None;
+      }
+      const hi = hexValue(text.charCodeAt(i + 1));
+      const lo = hexValue(text.charCodeAt(i + 2));
+      if (hi.isNone() || lo.isNone()) {
+        return None;
+      }
+      out += String.fromCharCode(hi.unwrap() * 16 + lo.unwrap());
+      i += 3;
+    }
+  }
+  return Some(out);
+}
+
+// Contents of an LLVM `c"..."` literal (without the quotes and without a terminator).
+@Ensures(llStrValue(result).isSome() && llStrValue(result).unwrap() == s)
+export function llStr(s: string): string {
+  let out = "";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (c < 32 || c > 126 || c == 34 || c == 92) {
+      out += s.substring(start, i);
+      out += "\\" + hexDigit(c / 16) + hexDigit(c % 16);
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += s.substring(start, s.length);
+  return out;
+}
+
+// A NUL-terminated constant byte array `name` (a trap message).
+export function cstrGlobal(name: string, linkage: string, s: string): string {
+  const n = s.length + 1;
+  return name + " = " + linkage + " constant [" + u(n) + " x i8] c\"" + llStr(s)
+      + "\\00\", align 1\n";
+}
+
+// The immortal string object `@orin_s<i>` (header rc -1, kind 1, then length, capacity and the bytes with a NUL).
+export function strGlobal(i: usize, s: string): string {
+  const n = s.length + 1;
+  return "@orin_s" + u(i) + " = private constant <{ i64, i32, i32, i64, i64, [" + u(n)
+      + " x i8] }> <{ i64 -1, i32 1, i32 0, i64 " + u(s.length) + ", i64 " + u(s.length) + ", ["
+      + u(n) + " x i8] c\"" + llStr(s) + "\\00\" }>, align 8\n";
+}

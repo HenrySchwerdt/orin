@@ -1,0 +1,125 @@
+// Message framing of the two protocols and the pure position helpers of the LSP checks. LSP frames are
+// `Content-Length: N\r\n\r\n<N bytes>` (headers end at an empty line, the name is case-insensitive); MCP (stdio) frames
+// are one JSON document per line. Both parsers work on a buffer that grows while the server writes and return
+// "not complete yet" instead of failing, so the caller can poll. Pure functions: tests/rpc_test.or.
+
+import { strip, lower, findByte, countNewlines, findFrom } from "./text";
+
+// `found`: a complete message starts at `pos`; `body` its payload; `next` the offset after it. `error` is non-empty for
+// a frame without a usable Content-Length (then `found` is true so the caller can report it and stop).
+export type Frame = { found: bool; body: string; next: usize; error: string; };
+
+function notYet(pos: usize): Frame {
+  return Frame { found: false, body: "", next: pos, error: "" };
+}
+
+// Digits of a Content-Length value ("12", " 12 "); -1 when it is not a plain non-negative number.
+export function parseLength(v: string): int {
+  const t = strip(v);
+  if (t.length == 0 || t.length > 9) {
+    return -1;
+  }
+  let n = 0;
+  let i: usize = 0;
+  while (i < t.length) {
+    const c = t.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return -1;
+    }
+    n = n * 10 + (c - 48);
+    i += 1;
+  }
+  return n;
+}
+
+// The LSP frame that starts at `pos` of `buf`.
+export function nextLspFrame(buf: string, pos: usize): Frame {
+  let i = pos;
+  let length = -1;
+  let sawLength = false;
+  while (true) {
+    const nl = findByte(buf, i, 10);
+    if (nl >= buf.length) {
+      return notYet(pos);
+    }
+    let line = buf.substring(i, nl);
+    if (line.length > 0 && line.charCodeAt(line.length - 1) == 13) {
+      line = line.substring(0, line.length - 1);
+    }
+    i = nl + 1;
+    if (line.length == 0) {
+      break;
+    }
+    if (lower(line).startsWith("content-length:")) {
+      const colon = findByte(line, 0, 58);
+      length = parseLength(line.substring(colon + 1, line.length));
+      sawLength = true;
+    }
+  }
+  if (!sawLength || length < 0) {
+    return Frame { found: true, body: "", next: i, error: "frame without a valid Content-Length header" };
+  }
+  const end = i + length.toUsize();
+  if (end > buf.length) {
+    return notYet(pos);
+  }
+  return Frame { found: true, body: buf.substring(i, end), next: end, error: "" };
+}
+
+// The MCP line that starts at `pos`: everything up to the next "\n" (a "\r" before it is dropped).
+export function nextLine(buf: string, pos: usize): Frame {
+  const nl = findByte(buf, pos, 10);
+  if (nl >= buf.length) {
+    return notYet(pos);
+  }
+  let line = buf.substring(pos, nl);
+  if (line.length > 0 && line.charCodeAt(line.length - 1) == 13) {
+    line = line.substring(0, line.length - 1);
+  }
+  return Frame { found: true, body: line, next: nl + 1, error: "" };
+}
+
+// `Content-Length` framing of one message body, as the client sends it.
+export function frameLsp(body: string): string {
+  return "Content-Length: " + body.length.toString() + "\r\n\r\n" + body;
+}
+
+// One MCP message: the document and a newline.
+export function frameLine(body: string): string {
+  return body + "\n";
+}
+
+// ---- positions ----------------------------------------------------------------------------------------------
+
+export type Pos = { line: int; character: int; };
+
+export function uriOf(path: string): string {
+  return "file://" + path;
+}
+
+// The 0-based position of the `occurrence`-th (0-based) match of `needle` in `text`, plus `delta` bytes. line -1 when
+// there is no such match. A byte offset, like the Python `pos_of`, which counts characters of the (ASCII) test texts.
+export function posOf(text: string, needle: string, occurrence: int, delta: int): Pos {
+  let idx: int = -1;
+  let k = 0;
+  while (k <= occurrence) {
+    idx = findFrom(text, needle, (idx + 1).toUsize());
+    if (idx < 0) {
+      return Pos { line: -1, character: -1 };
+    }
+    k += 1;
+  }
+  idx += delta;
+  const at = idx.toUsize();
+  const line = countNewlines(text, at);
+  let start: int = 0;
+  let j = at;
+  while (j > 0) {
+    if (text.charCodeAt(j - 1) == 10) {
+      start = j.toInt();
+      break;
+    }
+    j -= 1;
+  }
+  return Pos { line: line, character: idx - start };
+}

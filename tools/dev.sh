@@ -91,8 +91,8 @@ case "$CMD" in
     tools/test_std.sh $files ;;
   tooling)
     tools/test_tooling.sh
-    python3 tools/test_lsp.py --orin $D/orin
-    python3 tools/test_mcp.py --orin $D/orin
+    tools/protocol.sh lsp --orin $D/orin
+    tools/protocol.sh mcp --orin $D/orin
     python3 tools/test_osig.py --orin $D/orin
     python3 tools/test_effects.py --orin $D/orin ;;
 esac

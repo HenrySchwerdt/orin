@@ -4,7 +4,7 @@
 import { Span, SourceMap } from "../../diag";
 import { Ident, TypeExpr, Annotation } from "../../syntax";
 import { LoadedProgram } from "../../loader";
-import { Type, Local, Program, SymbolKind, SymbolDef, SymbolRef, TypeAt, ImplLink, CallSite } from "../../hir";
+import { Type, Local, Program, SymbolKind, SymbolDef, SymbolRef, TypeAt, ImplLink, AnnoUse, CallSite } from "../../hir";
 import { renderTE, renderTy } from "./render";
 import { FnKind, UnitTab } from "./tables";
 
@@ -45,6 +45,7 @@ export type W = {
   types: TypeAt[];
   impls: ImplLink[];           // `implements` links (ADR-0019)
   calls: CallSite[];           // call sites (OSIG CALLS edges)
+  annos: AnnoUse[];            // uses of user-defined annotations (ADR-0046 S2)
   cur: Option<usize>;          // caller def of the HIR body being walked
   curMay: bool;                // the body is a lifted closure: its calls are MAY edges of the enclosing function
   np: Option<usize>;           // parameter count of the ordinary function body being walked; None in a closure body (a
@@ -83,11 +84,29 @@ function annotationText(sm: SourceMap, as: Annotation[]): string {
   return out;
 }
 
+// The source text of a range, line breaks turned into spaces.
+function sourceText(sm: SourceMap, sp: Span): string {
+  return sm.files[sp.file].text.substring(sp.start, sp.end).split("\n").join(" ");
+}
+
 // `addDef` for a declaration that may carry annotations: the hover detail starts with them and
 // `@Deprecated` is recorded on the definition.
 export function addDefA(w: W, name: string, kind: SymbolKind, nameSpan: Span, declSpan: Span, container: Option<usize>,
     exported: bool, detail: string, as: Annotation[], sm: SourceMap): W {
   let x = addDef(w, name, kind, nameSpan, declSpan, container, exported, annotationText(sm, as) + detail);
+  const owner = x.defs.length - 1;
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        let texts: string[] = [];
+        for (const e of args) {
+          texts.push(sourceText(sm, e.span));
+        }
+        x.annos.push(AnnoUse { owner: owner, name: id.name, nameSpan: id.span, def: None, args: texts });
+      },
+      _ => {}
+    }
+  }
   for (const a of as) {
     const isD = match (a.kind) {
       ADeprecated => true,
@@ -204,7 +223,7 @@ export function isTypeParam(w: W, name: string): bool {
 
 export function newW(): W {
   return W {
-    defs: [], refs: [], types: [], impls: [], calls: [], cur: None, curMay: false, np: None, bnd: [], scope: [],
+    defs: [], refs: [], types: [], impls: [], calls: [], annos: [], cur: None, curMay: false, np: None, bnd: [], scope: [],
     marks: [], hn: 0, tps: [], unit: 0, fn: None, hl: [], hk: 0
   };
 }

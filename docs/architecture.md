@@ -10,7 +10,7 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `spec/` | Language/product specification (authoritative). |
 | `docs/bootstrap-subset.md` | Historical: the frozen Orin-B subset of the retired Stage 0 (diagnostics table still valid). |
 | `docs/decisions/` | ADRs (interpretations of OPEN points, deviations). |
-| `seed/` | The committed **seed** (generated C of the self-hosted compiler, `orin-seed.c.gz` + `SEED_INFO`), the single bootstrap root. The Rust Stage 0 is retired to branch `archive/stage0-final`. |
+| `bootstrap/seed/` | The committed **seed** (generated C of the self-hosted compiler, `orin-seed.c.gz` + `SEED_INFO`), the single bootstrap root. The Rust Stage 0 is retired to branch `archive/stage0-final`. |
 | `runtime/platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `runtime/platform/tests/` (contract tests, CBMC harnesses). |
 | `runtime/core/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `runtime/platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
@@ -46,7 +46,7 @@ file.or ──lexer/parser──▶ AST ──loader (imports, module rules, DAG
 ```
 
 The former direct HIR -> C backend (`compiler/codegen/`, `--legacy-codegen`) was removed in the first
-post-freeze cleanup; HIR is lowered to MIR and emitted by `compiler/cemit` or `compiler/llvm` only.
+post-freeze cleanup; HIR is lowered to MIR and emitted by `compiler/backends/c` or `compiler/backends/llvm` only.
 
 (Historical: the Stage 0 contracts were the Rust modules `span.rs`, `diag.rs`, `ast.rs`, `hir.rs`,
 `loader.rs`; they now live only on the archive branch.)

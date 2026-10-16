@@ -36,7 +36,7 @@ of combining historical totals. This inventory update does not report a fresh pl
 
 | Component | Trust | Evidence |
 |---|---|---|
-| Seed C (`seed/orin-seed.c.gz`) | trusted; single root | the seed from source commit `ec1ba3e` was cross-checked by the diverse double root (Rust Stage 0 root and seed root gave a byte-identical `stage2.c`; reproducible from branch `archive/stage0-final`, docs/bootstrap.md). Later seeds are not cross-checked by an independent root: they rest on that clean starting point, the reviewed source diff and the fixed point |
+| Seed C (`bootstrap/seed/orin-seed.c.gz`) | trusted; single root | the seed from source commit `ec1ba3e` was cross-checked by the diverse double root (Rust Stage 0 root and seed root gave a byte-identical `stage2.c`; reproducible from branch `archive/stage0-final`, docs/bootstrap.md). Later seeds are not cross-checked by an independent root: they rest on that clean starting point, the reviewed source diff and the fixed point |
 | Rust Stage 0 (branch `archive/stage0-final`) | retired; no longer part of the build | its evidence is historical (valid for `ec1ba3e` only); the Rust toolchain is not in the TCB of the current build |
 | Fixed point | — | `stage2.c == stage3.c`; LLVM-built compiler reproduces `stage3.c` |
 

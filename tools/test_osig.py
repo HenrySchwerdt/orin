@@ -65,7 +65,7 @@ def main():
         want = f.read()
     check(g1 == want, "graph of the demo package equals tests/osig/demo.graph.json (run with --update after a deliberate change)")
     snap = json.loads(g1)
-    check(snap["schema"] == "osig/0.3" and snap["package"] == "demo" and snap["hash"].startswith("h62:"), "schema, package, hash")
+    check(snap["schema"] == "osig/0.4" and snap["package"] == "demo" and snap["hash"].startswith("h62:"), "schema, package, hash")
 
     # ---- 2. determinism -------------------------------------------------------------------
     rc, g2, _ = run(orin, ["graph", "tests/osig/demo"])
@@ -305,6 +305,39 @@ def main():
     check(all(e["evidence"] in ("MUST", "MAY") for e in st["edges"] if e["kind"] == "PERFORMS_IO"), "task events are never UNKNOWN")
     rc, gt2, _ = run(orin, ["graph", "tests/osig/tasks/main.or"])
     check(gt2 == gt, "the task graph is deterministic")
+
+    # ---- 9. user annotations (ADR-0046 S2): ANNOTATED_WITH edges -------------------------------------------
+    rc, ga, err = run(orin, ["graph", "tests/osig/annotated"])
+    check(rc == 0, "graph of the annotated package exits 0 (%s)" % err)
+    ann_golden = os.path.join(ROOT, "tests", "osig", "annotated.graph.json")
+    if a.update:
+        with open(ann_golden, "w") as f:
+            f.write(ga)
+    with open(ann_golden) as f:
+        check(ga == f.read(), "graph of the annotated package equals tests/osig/annotated.graph.json (run with --update after a deliberate change)")
+    sa = json.loads(ga)
+    annotated = {(e["src"], e["dst"], e["via"], e["evidence"]) for e in sa["edges"] if e["kind"] == "ANNOTATED_WITH"}
+    root = "annotated:(root)::"
+    meta = "annotated:meta::"
+    want_ann = {
+        (root + "User", meta + "Json", "", "MUST"),
+        (root + "User", meta + "Doc", '("A user of the service")', "MUST"),
+        (root + "User.name", meta + "JsonName", '("display_name")', "MUST"),
+        (root + "LIMIT", meta + "Doc", '("The limit")', "MUST"),
+        (root + "Handlers.list", meta + "Route", '("/users", Get, Some("admin"))', "MUST"),
+        (root + "create", meta + "Route", '("/users/:id", Post)', "MUST"),
+        (root + "create", meta + "Doc", '("Creates a user")', "MUST"),
+    }
+    check(annotated == want_ann, "ANNOTATED_WITH edges: declaration -> annotation type, arguments as written in via (got %s)" % sorted(annotated ^ want_ann))
+    ann_nodes = {n["id"] for n in sa["nodes"]}
+    check(all(e["src"] in ann_nodes and e["dst"] in ann_nodes for e in sa["edges"]), "annotated: every edge connects existing nodes")
+    one = [e for e in sa["edges"] if e["kind"] == "ANNOTATED_WITH" and e["src"] == root + "create" and e["dst"] == meta + "Route"]
+    check(len(one) == 1 and one[0]["span"]["file"] == "src/main.or" and one[0]["span"]["line"] == 21 and one[0]["span"]["col"] == 2,
+          "ANNOTATED_WITH span is the annotation name (got %r)" % (one,))
+    check(sa["schema"] == "osig/0.4", "schema osig/0.4 (the new edge kind)")
+    check(not any(e["kind"] == "ANNOTATED_WITH" for e in snap["edges"]), "a program without user annotations has no ANNOTATED_WITH edge")
+    rc, ga2, _ = run(orin, ["graph", "tests/osig/annotated"])
+    check(ga2 == ga, "the annotated graph is deterministic")
 
     shutil.rmtree(tmp, ignore_errors=True)
     print("%d checks, %d failures" % (checks, len(failures)))

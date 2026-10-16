@@ -1,0 +1,126 @@
+// The allocation-site census build (`orin2 compile --stats-sites`; runtime/core/orin_runtime.h "Allocation-site census",
+// tools/alloc_census.py). Site ids are 1-based and numbered in MIR order: function, block, instruction, with the
+// terminator of a block as its last site, exactly as `genFunction` in cemit.or numbers its `ORIN_SITE(n)` marks.
+// Only the census build calls this file; a normal build is unchanged.
+
+import { Instr, MFunction, MProgram, instrStr, termStr, hasSpan } from "../../mir";
+
+function u(n: usize): string {
+  return n.toString();
+}
+
+// Number of sites of `f`: its instructions plus one terminator per block.
+export function siteCount(f: MFunction): usize {
+  let n: usize = 0;
+  for (const blk of f.blocks) {
+    n += blk.instrs.length + 1;
+  }
+  return n;
+}
+
+function clean(f: string): string {
+  let out = "";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < f.length) {
+    const c = f.charCodeAt(i);
+    if (c < 32 || c > 126) {
+      out += f.substring(start, i);
+      out += "_";
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += f.substring(start, f.length);
+  return out;
+}
+
+// The fields of a description, joined by tabs, as a C string literal. A field's own tabs, newlines and other control or
+// non-ASCII bytes become `_` (the runtime prints the table as tab-separated lines).
+function cLit(fields: string[]): string {
+  let s = "";
+  let fi: usize = 0;
+  for (const f of fields) {
+    if (fi > 0) {
+      s += "\t";
+    }
+    s += clean(f);
+    fi += 1;
+  }
+  let out = "\"";
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    let esc = "";
+    if (c == 34) {
+      esc = "\\\"";
+    } else if (c == 92) {
+      esc = "\\\\";
+    } else if (c == 63) {
+      esc = "\\?";
+    } else if (c == 9) {
+      esc = "\\t";
+    } else if (c < 32 || c > 126) {
+      esc = "_";
+    }
+    if (esc.length > 0) {
+      out += s.substring(start, i);
+      out += esc;
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out += s.substring(start, s.length);
+  out += "\"";
+  return out;
+}
+
+// The function an instruction names directly (a call or a closure), else "".
+function target(p: MProgram, i: Instr): string {
+  return match (i) {
+    ICall(_, f, _) => p.functions[f].name,
+    IClosure(_, f, _) => p.functions[f].name,
+    _ => ""
+  };
+}
+
+// `fn<idx> \t name \t b<block>.<k> \t file \t start \t end \t MIR text \t target` (file "-" and offsets 0 without a span).
+function siteLine(p: MProgram, fi: usize, b: usize, k: usize, file: string, start: usize, end: usize, text: string, tgt: string): string {
+  const d = ["fn" + u(fi), p.functions[fi].name, "b" + u(b) + "." + u(k), file, u(start), u(end), text, tgt];
+  return "  " + cLit(d) + ",\n";
+}
+
+function fileName(files: string[], i: usize): string {
+  return i < files.length ? files[i] : "-";
+}
+
+// The table the census runtime prints: `orin_site_names[0]` is the runtime itself, entry n describes site n.
+export function siteTable(p: MProgram, files: string[]): string {
+  let out: string[] = [];
+  out.push("\n/* allocation-site census: site descriptions (tools/alloc_census.py reads them back from the report) */\n");
+  out.push("const char *const orin_site_names[] = {\n  \"fn-\\t<runtime>\\t-\\t-\\t0\\t0\\t-\\t\",\n");
+  let n: usize = 0;
+  let fi: usize = 0;
+  for (const f of p.functions) {
+    let b: usize = 0;
+    for (const blk of f.blocks) {
+      let k: usize = 0;
+      for (const ins of blk.instrs) {
+        const sp = blk.spans[k];
+        const has = hasSpan(sp);
+        out.push(siteLine(p, fi, b, k, has ? fileName(files, sp.file) : "-", has ? sp.start : 0, has ? sp.end : 0, instrStr(ins), target(p, ins)));
+        k += 1;
+        n += 1;
+      }
+      const ts = blk.termSpan;
+      const th = hasSpan(ts);
+      out.push(siteLine(p, fi, b, k, th ? fileName(files, ts.file) : "-", th ? ts.start : 0, th ? ts.end : 0, termStr(blk.term), ""));
+      n += 1;
+      b += 1;
+    }
+    fi += 1;
+  }
+  out.push("};\nconst uint32_t orin_site_count = " + u(n) + ";\n");
+  return out.join("");
+}
