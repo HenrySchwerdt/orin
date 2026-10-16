@@ -1,6 +1,6 @@
 # ADR-0046: User-defined annotations and pure annotation processors
 
-Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below; S1 implemented, S2-S6 not started).
+Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below; S1 and S4 implemented, S2, S3, S5 and S6 see the slice table).
 Related: spec/05-annotations-and-metaprogramming.md, ADR-0012 (contract clauses), ADR-0016 (1.0 scope, amended
 here), ADR-0024 (built-in annotations), ADR-0027 (capabilities), ADR-0044 (OX, `@Sealed`), ADR-0020/0023 (OSIG).
 Supersedes the first draft of this ADR (PR #109), whose three-capability split, safety rules and alternatives are kept.
@@ -180,6 +180,17 @@ on `main`; parser and checker overlaps with ADR-0049 are coordinated with that w
 | **S4 expansion without execution** | `.gen` placeholders in the loader, sub-program check, snapshot extraction, Output -> AST conversion, hygiene and collision checks (E0449, E0521), re-check, `orin expand`; test hook that feeds a recorded `Output` | goldens from recorded outputs, negative tests (bad names, cycles, private leaks, generated type errors), both backends |
 | **S5 processor execution** | `@Processor` rules and purity (E0448), harness build, run with limits (E0520), cache, `[annotations]` policy, W0490 | tests for traps, timeouts, oversized output, impure processors, cache hits |
 | **S6 proof of usefulness** | `@Json`/`@JsonName` with `jsonCodecs` in `std:json`; a route-table example package (`@Route`) in `examples/`; docs/annotations.md, spec 05, known limitations | goldens, C/LLVM differential on generated code, compile-time and binary-size numbers in docs/benchmarks.md |
+
+**As built in S4.** The test hook is a sidecar file `<module path without .or>.gen.<AnnotationName>.json` next to the source
+module, holding a recorded `std:meta` `Output` (docs/annotation-processors.md). It is read only when the program imports a
+`.gen` module, or for `orin expand`; annotations without a sidecar stay plain metadata. Code of a companion module may import
+only modules the program has already loaded (E0520 otherwise; the manifest rules of `orin.toml` apply, E0501). Codes:
+E0449 duplicate exported name in a companion, E0521 cycle (a companion imported while its source loads, or a module that
+runs a processor and depends on a companion), E0520 unusable recorded output (S5 reuses it for harness failures), E0522 an error
+diagnostic reported by the processor, W0491 a processor warning. The span of generated nodes is the annotation use of the first
+annotated declaration of the run; diagnostics inside generated code carry a note naming the run. Compiler code: `compiler/meta`
+(snapshot, Output to AST, hygiene), `compiler/expand` (pipeline, `orin expand` text). Not done in S4: LSP, MCP, `orin test`
+and OSIG do not run the expansion (a `.gen` import is E0300 there); OSIG `GENERATED_BY` edges.
 
 S1 and S3 can run in parallel (parser/checker vs. std only). S2 follows S1; S4 needs S1 and S3; S5 follows S4; S6
 follows S5. Every slice keeps contracts, built-ins and their codes unchanged.
