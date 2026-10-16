@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Verifier: an in/out call demotes its borrowed arguments.** A `Unique` local passed in a borrowed position to an in/out
+  function stayed `Unique` after the call, although the callee can keep a counted reference to it in the receiver it hands
+  back (`push(items, item)`). The verifier now demotes such arguments, as it already did for calls with a reference result.
+  The generated code is unchanged (lowering still emits the `makeunique` before every store); this closes a gap in the
+  trusted checker, found while building ADR-0038 T5.
 - **Project CLI and terminal UX.** `orin init` (application, library, HTTP template), project discovery,
   content-cached native builds, `dev`/test watch, project-wide formatting and independent test discovery.
   Source diagnostics have themed colors, source excerpts and bounded multiline highlights; compact/JSON,
