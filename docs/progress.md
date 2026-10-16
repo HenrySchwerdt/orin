@@ -85,7 +85,8 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
 3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
-4. **LLVM gates 2 + 3** (ADR-0038 §8): LLVM fixed point of the self-compile, pinned toolchain. Gate 1 is met (LLVM at or
+4. **LLVM gate 3** (ADR-0038 §8): pinned toolchain (`orin toolchain install`). Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
+   the LLVM-built compiler emits the same C and the same `.ll` as orin2, also with a third stage). Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
 5. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the
    global `g_netbuf`, and a concurrent HTTP server with limits and TSan / load tests.

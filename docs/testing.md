@@ -156,6 +156,8 @@ Before a pull request run `tools/bootstrap.sh` (seed -> orin0 -> orin1 -> orin2 
 runs the whole Linux CI). `bootstrap.sh` builds orin0 and orin1 at `-O1` (`STAGE01_CFLAGS`) and orin2 at `-O2`
 (`CFLAGS`): orin0 and orin1 compile the compiler only once, so the C compile at `-O2` costs more than it saves. The fixed
 point compares generated C, not binaries, so it is unchanged; `STAGE01_CFLAGS="-O2 -w"` gives the old all-`-O2` build.
+`sh tools/llvm_fixpoint.sh` (after `bootstrap.sh`, needs clang) is the same check for the LLVM backend: the LLVM-built compiler
+must emit the same C and the same `.ll` as `orin2` (ADR-0038 gate 2; the CI `llvm` job runs it; `--deep` adds a third stage).
 
 **Parallel cases.** Every test tool runs its independent cases in parallel, as many as there are CPUs; `-j N` or
 `ORIN_JOBS=N` overrides it (`-j 1` = sequential). The output does not depend on `-j`: results are printed in the fixed

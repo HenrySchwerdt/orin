@@ -1,6 +1,10 @@
 # Changelog
 
 ## Unreleased
+- **LLVM fixed point (ADR-0038 section 8, gate 2).** New `tools/llvm_fixpoint.sh` (run in the CI `llvm` job): `orin2` compiles
+  `compiler/main.or` with `--backend=llvm`, clang links `orin2-llvm`, and `orin2-llvm` reproduces both the C (`== stage2.c`,
+  11,055,024 bytes) and the LLVM IR (45,279,878 bytes) byte for byte; `--deep` adds a third stage. No differences were found,
+  so no backend or runtime change. LLVM is still not the release default (gate 3, the pinned toolchain, is open).
 - **bench/url prints no wall-clock time.** The benchmark printed `ms=<elapsed>` next to its checksum, so every run differed from the
   previous one (also C against C) and `tools/bench.py` reported "CHECKSUM MISMATCH in url (llvm)". This was not an LLVM miscompile:
   output of the C and LLVM binaries is identical apart from the timing field. The benchmark now prints only deterministic values

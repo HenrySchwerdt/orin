@@ -15,7 +15,14 @@ Rust Stage 0 is retired (see "Retired Stage 0" below).
 ```bash
 ./tools/bootstrap.sh                 # seed -> orin0 -> orin1 -> orin2 -> stage3, compare, conformance
 python3 tools/run_tests.py --orinc build/bootstrap/orin2
+sh tools/llvm_fixpoint.sh [--deep]   # LLVM fixed point (needs clang), see below
 ```
+
+**LLVM fixed point (ADR-0038 section 8, gate 2).** `tools/llvm_fixpoint.sh` compiles `compiler/main.or` with `orin2
+--backend=llvm`, links the `.ll` with clang to `orin2-llvm`, and lets that compiler compile `compiler/main.or` again, to C
+and to LLVM IR. The C must equal `stage2.c` and the `.ll` must equal the first one, byte for byte; `--deep` repeats this
+with a third compiler built from the second `.ll`. Output goes to `build/llvm-fixpoint/`. It takes about 2 minutes (3.5 with
+`--deep`) on a loaded 4-CPU machine and runs in the CI `llvm` job. The release default stays the C backend.
 
 `compiler/` is no longer restricted to Orin-B (the subset Stage 0 understood); it may use any language
 feature the current seed can compile. A feature the seed cannot compile first needs a seed update

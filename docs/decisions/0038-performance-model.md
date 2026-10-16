@@ -191,6 +191,9 @@ proof.
      at or below the C backend; `appends` (+0.9 %) and `bintrees` (+0.5 %) are still above, caused by the C
      runtime being compiled by clang instead of gcc. Table and causes: docs/benchmarks.md, "Backends: ADR-0038 §8 gate 1".
   2. **Fixed point:** the LLVM backend also reproduces itself, `stage2.ll == stage3.ll`, in CI.
+     **Status (2026-10-16): met.** `tools/llvm_fixpoint.sh` (CI job `llvm`): `orin2` compiles `compiler/main.or` with
+     `--backend=llvm`, clang links `orin2-llvm`, and `orin2-llvm` emits C identical to `stage2.c` and LLVM IR identical to the
+     first `.ll` (and, with `--deep`, so does a third compiler built from that `.ll`). No difference was found.
   3. **Toolchain:** a pinned LLVM version is used, as described below.
 - **Toolchain: pinned, not bundled into the compiler.**
   - Orin keeps emitting textual LLVM IR, but only for **one pinned LLVM version**. The pin is recorded in the
