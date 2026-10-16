@@ -1,0 +1,102 @@
+// Scalar replacement of a temporary array literal (ADR-0038 addendum "Escape analysis: scalar replacement of array
+// literals", class (c)). The lowering of `a.concat([e1, .., ek])` builds the literal, and the in-place rewrite of
+// inplace.or turns the concatenation into an `arrayextend`:
+//
+//     t = arraynew [e1, .., ek]
+//     arrayextend x, t
+//     release t
+//
+// `t` never escapes: it is defined, read by the one `arrayextend` (which only copies its elements) and released right
+// away, so the literal needs no object at all. Its elements go straight onto `x`:
+//
+//     arraypush x, e1 ; .. ; arraypush x, ek
+//
+// An `arrayextend` of a unique `x` appends the elements of `t` in place and an `arraypush` appends one element
+// (copy-on-write when `x` is shared, exactly as the extend copies); a ref element is consumed by the literal and is
+// consumed by the push in the same way. The two forms differ only in the allocation of `t`, its free and the call into
+// the runtime. No new verifier rule: `arrayextend x, t` and `arraypush x, e` have the same rules on `x` (Owned or Unique,
+// not borrowed, stays Owned, `mutateOwned`) and the elements are consumed by the literal today and by the pushes
+// afterwards (`consume`); the result is verified like any other MIR.
+//
+// Pattern (three adjacent instructions, one block), all of: `t` is defined once and used exactly twice (the extend, the
+// release); `x != t`; no element is `x` itself; at most MAX_LIT elements. An empty literal extends nothing (the runtime
+// returns `x` unchanged), so its three instructions are deleted.
+
+import { MFunction, MBlock, Instr, Operand } from "../mir";
+import { Counts, countsOf } from "./analysis";
+import { RewritePlan, withBody } from "./rewrite";
+import { passKept, fnShapeOk, extendCount } from "./wellformed";
+
+// Literals with more elements than this keep the extend (k pushes would grow the code more than the allocation saves).
+const MAX_LIT: usize = 8;
+
+function isLocal(o: Operand, x: usize): bool {
+  return match (o) {
+    OLocal(l) => l == x,
+    _ => false,
+  };
+}
+
+// The pushes that replace the pattern at `i`, or None.
+function literalPushes(instrs: Instr[], i: usize, cnt: Counts): Option<Instr[]> {
+  if (i + 2 >= instrs.length) {
+    return None;
+  }
+  return match (instrs[i]) {
+    IArrayNew(t, _, es) => {
+      if (es.length > MAX_LIT || cnt.defs[t] != 1 || cnt.uses[t] != 2) {
+        return None;
+      }
+      return match (instrs[i + 1]) {
+        IArrayExtend(x, y) => {
+          if (x == t || !isLocal(y, t) || es.some(e => isLocal(e, x))) {
+            return None;
+          }
+          return match (instrs[i + 2]) {
+            IRelease(r) => {
+              if (r != t) {
+                return None;
+              }
+              return Some(es.map(e => IArrayPush(x, e)));
+            },
+            _ => None,
+          };
+        },
+        _ => None,
+      };
+    },
+    _ => None,
+  };
+}
+
+// `f` with every temporary array literal that is only appended to an array replaced by pushes of its elements.
+@Requires(fnShapeOk(f))
+@Ensures(passKept(f, result) && result.blocks.length == f.blocks.length)
+@Ensures(extendCount(result) <= extendCount(f))
+export function pushLiterals(f: MFunction): MFunction {
+  if (extendCount(f) == 0) {
+    return f;
+  }
+  const cnt = countsOf(f);
+  let blocks: MBlock[] = [];
+  for (const blk of f.blocks) {
+    const instrs = blk.instrs;
+    let plan = new RewritePlan(instrs.length);
+    let i: usize = 0;
+    while (i < instrs.length) {
+      match (literalPushes(instrs, i, cnt)) {
+        Some(pushes) => {
+          plan.replace(i, pushes);
+          plan.remove(i + 1);
+          plan.remove(i + 2);
+          i += 3;
+        },
+        None => {
+          i += 1;
+        },
+      }
+    }
+    blocks.push(plan.apply(blk));
+  }
+  return withBody(f, f.locals, blocks);
+}

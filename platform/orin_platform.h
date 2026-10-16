@@ -342,6 +342,17 @@ int orin_platform_file_write(const char *path, size_t plen, const char *data, si
     ensures \result == 1 <==> path has no NUL byte and stat(2) on it succeeds; otherwise 0;
     assigns \nothing; */
 int orin_platform_file_exists(const char *path, size_t plen);
+/*@ requires plen == 0 || path[0..plen-1] readable;
+    requires each is a valid callback and ctx is valid for every callback invocation;
+    ensures path contains a NUL byte ==> \result == ORIN_PLATFORM_EINVAL and each is never called;
+    ensures \result == 0 ==> each was called once per observed entry except "." and "..", in readdir order;
+    ensures is_dir passed to each is true only for physical directories (symbolic links are not followed);
+    ensures name passed to each is readable for len bytes and valid only until the callback returns;
+    ensures \result != 0 ==> errno-style open, allocation, enumeration, classification or close error;
+    ensures an error may follow callbacks for a partial listing; the caller must discard those entries;
+    assigns \fs (access times only), callback-owned state at ctx; */
+int orin_platform_dir_list(const char *path, size_t plen, void (*each)(void *ctx, const char *name, size_t len, int is_dir),
+                           void *ctx);
 
 /* ---------------------------------------------------------------- file streams (ADR-0025)
  * An open file for incremental reading and writing (the substrate of the resource handle `File` of

@@ -69,6 +69,24 @@ need_project() {
   done
 }
 info() { "$BIN" __package info "$1" "$2"; }
+workspace_command() {
+  [ $# -ge 1 ] || fail 'Usage: orin workspace list|lock|check [--root <directory>]' 2
+  local sub=$1 root=$PWD; shift
+  case $sub in list|lock|check) ;; *) fail 'Usage: orin workspace list|lock|check [--root <directory>]' 2;; esac
+  if [ $# -gt 0 ]; then
+    [ $# -eq 2 ] && [ "$1" = --root ] && [ -n "$2" ] || fail 'Usage: orin workspace list|lock|check [--root <directory>]' 2
+    case $2 in --*) fail 'Missing workspace root directory.' 2;; esac
+    root=$(cd -- "$2" 2>/dev/null && pwd -P) || fail 'Workspace root is not an accessible directory.'
+  else
+    root=$(pwd -P)
+    while [ ! -f "$root/orin-workspace.toml" ]; do
+      [ "$root" != / ] || fail 'No orin-workspace.toml found in this directory or its ancestors.'
+      root=${root%/*}; [ -n "$root" ] || root=/
+    done
+  fi
+  compiler workspace "$sub" --root "$root"
+}
+
 valid_name() { case $1 in ''|-*|*[!a-zA-Z0-9_-]*) return 1 ;; esac; }
 quote_toml() { printf '%s' "$1" | sed 's/\\/\\\\/g;s/"/\\"/g'; }
 help_main() {
@@ -98,6 +116,7 @@ Manage
   doctor               Check your installation
 
 Inspect and integrate
+  workspace list|lock|check  Inspect the nearest workspace
   explain <code>       Explain a diagnostic
   api, effects, graph, diff, verify, compile, mir, lsp, mcp
 
@@ -109,6 +128,7 @@ HELP
 }
 help_command() {
   case $1 in
+    workspace) echo 'Usage: orin workspace list|lock|check [--root <directory>]' ;;
     init) echo 'Usage: orin init [name] [--lib | --template http]'; echo 'Create a project without overwriting existing files.' ;;
     add) echo 'Usage: orin add --path <directory> [--dev]'; echo '       orin add --git <url> [--tag <tag> | --rev <commit>] [--name <alias>] [--dev]' ;;
     build|run|dev) echo "Usage: orin $1 [file.or | project-directory] [--release] [--backend=c|llvm] [-o path] [-- program-arguments]" ;;
@@ -547,6 +567,7 @@ case $command in
   *)
     for arg in "${args[@]}"; do if [ "$arg" = --help ] || [ "$arg" = -h ]; then help_command "$command"; exit 0; fi; done
     case $command in
+      workspace) workspace_command "${args[@]}" ;;
       init) init_project "${args[@]}" ;;
       build) build_command "${args[@]}"; if $json; then result_json true artifact "$artifact"; fi ;;
       run) $json && fail 'run does not support --format=json; application stdout belongs to the program.' 2; build_command "${args[@]}"; $quiet || printf '%s Running %s\n\n' "$mark_arrow" "$(basename "$artifact")" >&2; exec "$artifact" "${program_args[@]}" ;;

@@ -32,6 +32,7 @@ class CliTests(unittest.TestCase):
         (package / "examples").symlink_to(ROOT / "examples")
         (package / "VERSION").write_text("test\n")
         cls.cli = package / "bin/orin"
+        cls.compiler = compiler
 
     @classmethod
     def tearDownClass(cls):
@@ -50,6 +51,181 @@ class CliTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result
+
+    def run_compiler(self, *args, code=0, cwd=None):
+        result = subprocess.run([str(self.compiler), *args], cwd=cwd or self.cwd,
+                                env={**os.environ, "NO_COLOR": "1"},
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        return result
+
+    def workspace(self):
+        root = self.cwd / "workspace with spaces"
+        shutil.copytree(ROOT / "tests/workspace/ok/topo_order", root)
+        return root
+
+    def test_workspace_discovery_and_standalone_compatibility(self):
+        root = self.workspace()
+        nested = root / "app/nested/src"
+        nested.mkdir(parents=True)
+        expected = "lib  lib\napp  app\n"
+        for cwd in (root, root / "app", nested):
+            self.assertEqual(self.run_cli("workspace", "list", cwd=cwd).stdout, expected)
+            self.assertEqual(self.run_compiler("workspace", "list", cwd=cwd).stdout, expected)
+        self.assertEqual(self.run_compiler("workspace", "list", "--root", str(root)).stdout, expected)
+        self.assertEqual(self.run_cli("workspace", "list", "--root", str(root)).stdout, expected)
+        self.run_cli("check", cwd=root / "lib")
+        self.run_cli("workspace", "list", code=1)
+        self.run_compiler("workspace", "list", code=1)
+
+    def test_workspace_lock_check_and_stale_lock(self):
+        root = self.workspace()
+        self.run_cli("workspace", "check", cwd=root, code=1)
+        self.run_cli("workspace", "lock", cwd=root / "app")
+        before = (root / "orin.lock").read_bytes()
+        self.run_cli("workspace", "check", cwd=root / "lib")
+        self.assertEqual(before, (root / "orin.lock").read_bytes())
+        manifest = root / "lib/orin.toml"
+        manifest.write_text(manifest.read_text().replace('0.1.0', '0.1.1'))
+        self.assertIn("E0509", self.run_cli("workspace", "check", cwd=root, code=1).stderr)
+        self.assertEqual(before, (root / "orin.lock").read_bytes())
+        self.run_compiler("workspace", "lock", "--root", str(root))
+        self.run_compiler("workspace", "check", "--root", str(root))
+        (root / "orin.lock").write_text('[member.removed]\npath = "old"\nversion = "0.0.1"\ndependencies = []\n')
+        self.run_cli("workspace", "lock", cwd=root)
+        self.run_cli("workspace", "check", cwd=root)
+        self.assertNotIn("removed", (root / "orin.lock").read_text())
+
+    def test_workspace_refuses_project_or_unknown_lock(self):
+        root = self.workspace()
+        for contents in ("# Orin lock v1: name|kind|source|selector|commit\nx|git|repo|HEAD|abc\n",
+                         "do not overwrite this lock\n",
+                         '[member.notes]\nunknown = "data"\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\n',
+                         '[member.app]\npath = true\nversion = "0.1.0"\ndependencies = []\n',
+                         '[member.app]\npath = "app"\nversion = 1\ndependencies = []\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\ndependencies = "lib"\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\ndependencies = [1]\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\ndependencies = []\nunknown = "data"\n',
+                         '[member.app]\npath = "app"\npath = "other"\nversion = "0.1.0"\ndependencies = []\n'):
+            (root / "orin.lock").write_text(contents)
+            for invoke in (self.run_cli, self.run_compiler):
+                invoke("workspace", "lock", cwd=root, code=1)
+                self.assertEqual((root / "orin.lock").read_bytes(), contents.encode())
+        (root / "orin.lock").unlink()
+        (root / "orin.lock").mkdir()
+        self.run_cli("workspace", "lock", cwd=root, code=1)
+        self.assertTrue((root / "orin.lock").is_dir())
+
+    def test_workspace_read_write_errors_and_terminal_options(self):
+        root = self.workspace()
+        manifest = root / "lib/orin.toml"
+        original = manifest.read_bytes()
+        manifest.unlink()
+        manifest.mkdir()
+        self.assertIn("cannot read", self.run_cli("workspace", "list", cwd=root, code=1).stderr)
+        manifest.rmdir()
+        manifest.write_text("")
+        empty = self.run_cli("workspace", "list", cwd=root, code=1)
+        self.assertIn("error[", empty.stderr)
+        self.assertNotIn("E0505", empty.stderr)
+        manifest.write_bytes(original)
+        workspace = root / "orin-workspace.toml"
+        workspace.write_text('[workspace]\nmembers = ["../outside"]\n')
+        plain = self.run_cli("workspace", "list", cwd=root, code=1)
+        self.assertNotIn("\x1b", plain.stderr)
+        self.assertIn("^", plain.stderr)
+        colored = self.run_cli("workspace", "list", "--color=always", cwd=root, code=1)
+        self.assertIn("\x1b[", colored.stderr)
+        workspace.unlink()
+        workspace.mkdir()
+        self.run_compiler("workspace", "list", "--root", str(root), code=1)
+        workspace.rmdir()
+        workspace.write_text('[workspace]\nmembers = ["app", "lib"]\n')
+        if os.geteuid() != 0:
+            root.chmod(0o555)
+            try:
+                self.assertIn("cannot write", self.run_cli("workspace", "lock", cwd=root, code=1).stderr)
+                self.assertFalse((root / "orin.lock").exists())
+            finally:
+                root.chmod(0o755)
+
+    @unittest.skipIf(os.geteuid() == 0, "permission failure requires an ordinary user")
+    def test_workspace_enumeration_failure_preserves_lock(self):
+        root = self.cwd / "workspace"
+        shutil.copytree(ROOT / "tests/workspace/ok/single", root)
+        library = root / "library"
+        shutil.copytree(root / "app", library / "base")
+        manifest = library / "base/orin.toml"
+        manifest.write_text(manifest.read_text().replace('name = "app"', 'name = "base"'))
+        (root / "orin-workspace.toml").write_text('[workspace]\nmembers = ["app", "library/*"]\n')
+        self.run_cli("workspace", "lock", cwd=root)
+        before = (root / "orin.lock").read_bytes()
+        library.chmod(0)
+        try:
+            for sub in ("list", "lock"):
+                result = subprocess.run([str(self.cli), "workspace", sub], cwd=root,
+                                        capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(before, (root / "orin.lock").read_bytes())
+        finally:
+            library.chmod(0o755)
+
+    def test_workspace_strict_usage_and_json(self):
+        root = self.workspace()
+        for invoke in (self.run_cli, self.run_compiler):
+            for args in ((), ("wat",), ("list", "extra"), ("list", "--unknown"),
+                         ("list", "--root"), ("list", "--root", "--unknown"),
+                         ("list", "--root", str(root), "--root", str(root)),
+                         ("list", "--format=json")):
+                invoke("workspace", *args, cwd=root, code=2)
+        self.assertIn("workspace", self.run_cli("--help").stdout)
+        self.assertIn("list|lock|check", self.run_cli("help", "workspace").stdout)
+
+    def test_workspace_list_escapes_terminal_controls(self):
+        root = self.cwd / "workspace"
+        shutil.copytree(ROOT / "tests/workspace/ok/single", root)
+        manifest = root / "app/orin.toml"
+        manifest.write_text(manifest.read_text().replace('name = "app"', 'name = "app\\nspoof"'))
+        for invoke in (self.run_cli, self.run_compiler):
+            result = invoke("workspace", "list", cwd=root)
+            self.assertEqual(result.stdout, "app\\x0aspoof  app\n")
+
+    def test_workspace_compact_diagnostic_escapes_terminal_controls(self):
+        root = self.cwd / "workspace\x1b[31m"
+        shutil.copytree(ROOT / "tests/workspace/ok/single", root)
+        (root / "orin-workspace.toml").write_text('[workspace]\nmembers = ["../\x1b[31m"]\n')
+        result = self.run_compiler("workspace", "list", cwd=root, code=1)
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertIn("\\x1b", result.stderr)
+        self.assertIn("E0505", result.stderr)
+        result = self.run_compiler("workspace", "list", "--root", str(root), code=1)
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertIn("workspace\\x1b", result.stderr)
+
+    def test_workspace_fixtures_through_cli(self):
+        count = 0
+        for group in ("ok", "fail"):
+            fixtures = sorted((ROOT / "tests/workspace" / group).iterdir())
+            self.assertTrue(fixtures)
+            for fixture in fixtures:
+                if not fixture.is_dir():
+                    continue
+                with self.subTest(fixture=fixture.name):
+                    expected = (fixture / "expected.txt").read_text().strip()
+                    command = "check" if fixture.name == "stale_lockfile" else "list"
+                    result = self.run_cli("workspace", command, cwd=fixture,
+                                          code=0 if group == "ok" else 1)
+                    if group == "ok":
+                        self.assertEqual([line.split("  ", 1)[0] for line in result.stdout.splitlines()],
+                                         expected.splitlines())
+                    else:
+                        diagnostic, line = expected.split()
+                        self.assertIn("error[" + diagnostic + "]", result.stderr)
+                        self.assertRegex(result.stderr, r":" + line + r":\d+")
+                    count += 1
+        self.assertEqual(count, 30)
+
 
     def test_help_and_usage(self):
         self.assertIn("init", self.run_cli("--help").stdout)

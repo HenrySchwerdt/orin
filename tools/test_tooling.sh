@@ -11,7 +11,9 @@ export ORIN2
 # one compiled unit test (run by tools/parallel.py): --unit NAME
 if [ "${1:-}" = "--unit" ]; then
   t=$2
-  $ORIN2 compile compiler/tests/$t.or -o build/$t.c
+  source=compiler/tests/$t.or
+  [ "$t" != workspace_cli ] || source=compiler/package/wscli_smoke.or
+  $ORIN2 compile "$source" -o build/$t.c
   cc -O1 -w -I runtime build/$t.c runtime/orin_runtime.c platform/orin_platform.c -o build/$t
   exec ./build/$t
 fi
@@ -26,7 +28,7 @@ mkdir -p build
 # one line per case, in the order of the output; `first:` starts a slow case before the others (tools/parallel.py)
 {
   echo 'python3 tools/test_execution.py --orinc "$ORIN2"'
-  for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test; do
+  for t in path_test json_test analysis_test effects_test lsp_test verify_main package_test workspace_fixtures workspace_cli; do
     echo "sh tools/test_tooling.sh --unit $t"
   done
   echo '$ORIN2 test compiler/tests/terminal_test.or --runtime runtime'
@@ -54,6 +56,7 @@ mkdir -p build
   echo 'python3 tools/test_recovery.py --orinc "$ORIN2"'
   # verifier unit tests (3b): ownership lattice, State / Worklist / Transfer / Fixpoint, reports, MIR + HIR predicates
   echo '$ORIN2 test compiler/tests/verify_test.or --runtime runtime'
+  echo '$ORIN2 test compiler/tests/workspace_test.or --runtime runtime'
   echo '$ORIN2 test compiler/tests/quality_test.or --runtime runtime'
   echo '$ORIN2 test compiler/tests/doccomments_test.or --runtime runtime'
   # tooling unit tests (3e): JSON cursor / round trip, workspace, positions, index queries, LSP and MCP reply rule,

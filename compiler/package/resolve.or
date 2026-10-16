@@ -1,0 +1,405 @@
+// Workspace resolution (ADR-0047 phase 2b, docs/workspace.md §3–4): from a checked `Workspace`, the directories of the
+// tree and the member manifests to the members in build order, or the first error. The tree is passed in as data (the
+// relative directory paths, and a reader for `<dir>/orin.toml`), so resolution is pure and unit-testable; the CLI feeds
+// it from the file system.
+//
+// Diagnostics: E0505 literal member without `orin.toml`, E0506 duplicate package name, E0507 overlapping or dangling
+// entries (member inside member, `exclude` matching nothing, `default-members` that is no member, nested workspace),
+// E0508 path dependency to a non-member or a dependency cycle, E0509 stale lockfile. Member manifest errors are the
+// manifest's own (E0500, E0503).
+
+import { Diagnostic, diag, span } from "../diag";
+import { normalize, join } from "std:path";
+import { Workspace, WsPath, isPattern, pathWithin, pathMatches, buildOrder } from "./workspace";
+import { Manifest, parseManifest } from "./manifest";
+import { parseToml, TomlValue } from "./toml";
+
+// The tree as seen from the workspace root: every directory (relative, `/` separated, no trailing `/`), which of them
+// hold an `orin-workspace.toml`, and the text of each directory's `orin.toml` (None when it has none).
+export type Tree = {
+  dirs: string[];
+  workspaceDirs: string[];
+  npmDirs: string[];
+  manifest: (dir: string) => Option<string>;
+};
+
+@Invariant(this.file > 0)
+export type Member = { dir: string; name: string; file: usize; manifest: Manifest; deps: usize[]; };
+
+export type Resolved = { members: Member[]; order: usize[]; defaults: usize[]; };
+
+function at(ws: Workspace, p: WsPath, code: string, msg: string): Diagnostic {
+  return diag(code, span(ws.file, p.start, p.end), "orin-workspace.toml: " + msg);
+}
+
+function sorted(xs: string[]): string[] {
+  let out: string[] = [];
+  for (const x of xs) {
+    let next: string[] = [];
+    let placed = false;
+    for (const y of out) {
+      if (!placed && !lessEq(y, x)) {
+        next.push(x);
+        placed = true;
+      }
+      next.push(y);
+    }
+    if (!placed) {
+      next.push(x);
+    }
+    out = next;
+  }
+  return out;
+}
+
+function lessEq(a: string, b: string): bool {
+  let i: usize = 0;
+  while (i < a.length && i < b.length) {
+    if (a.charCodeAt(i) != b.charCodeAt(i)) {
+      return a.charCodeAt(i) < b.charCodeAt(i);
+    }
+    i += 1;
+  }
+  return a.length <= b.length;
+}
+
+// Direct subdirectories of `parent` that hold an `orin.toml`, in byte order.
+function patternDirs(tree: Tree, parent: string): string[] {
+  let out: string[] = [];
+  for (const d of tree.dirs) {
+    const inside = parent == ""
+        ? !d.includes("/")
+        : d.startsWith(parent + "/") && !d.substring(parent.length + 1, d.length).includes("/");
+    if (inside && tree.manifest(d).isSome()) {
+      out.push(d);
+    }
+  }
+  return sorted(out);
+}
+
+// The member directories in manifest order (patterns expanded), before `exclude`; Err on a literal member without
+// `orin.toml`.
+function candidates(ws: Workspace, tree: Tree): Result<string[], Diagnostic> {
+  let out: string[] = [];
+  for (const m of ws.members) {
+    if (isPattern(m.text)) {
+      const parent = m.text == "*" ? "" : m.text.substring(0, m.text.length - 2);
+      for (const d of patternDirs(tree, parent)) {
+        if (!out.includes(d)) {
+          out.push(d);
+        }
+      }
+    } else if (tree.manifest(m.text).isNone()) {
+      return Err(at(ws, m, "E0505", "member `" + m.text + "` has no orin.toml"));
+    } else if (!out.includes(m.text)) {
+      out.push(m.text);
+    }
+  }
+  return Ok(out);
+}
+
+// Resolves the workspace. The manifest of `tree.dirs[k]` gets file id `firstFile + k`, so a caller can build the source
+// map from the tree alone.
+@Requires(firstFile > 0)
+@Ensures(result.isErr() || result.unwrap().order.length == result.unwrap().members.length)
+export function resolveWorkspace(
+  ws: Workspace,
+  tree: Tree,
+  firstFile: usize,
+): Result<Resolved, Diagnostic> {
+  const cr = candidates(ws, tree);
+  if (cr.isErr()) {
+    return Err(cr.unwrapErr());
+  }
+  const all = cr.unwrap();
+  for (const x of ws.exclude) {
+    if (!all.some(d => pathMatches(d, x.text))) {
+      return Err(at(ws, x, "E0507", "`exclude` entry `" + x.text + "` matches no member"));
+    }
+  }
+  let dirs: string[] = [];
+  for (const d of all) {
+    if (!ws.exclude.some(x => pathMatches(d, x.text))) {
+      dirs.push(d);
+    }
+  }
+  // Overlaps that only the expanded set shows: a member inside another, a nested workspace.
+  for (const a of dirs) {
+    for (const b of dirs) {
+      if (a != b && pathWithin(a, b)) {
+        return Err(
+          at(ws, entryOf(ws, a), "E0507", "member `" + a + "` lies inside member `" + b + "`"),
+        );
+      }
+    }
+    for (const w of tree.workspaceDirs) {
+      if (w != "" && (pathWithin(w, a) || pathWithin(a, w))) {
+        return Err(
+          at(
+            ws,
+            entryOf(ws, a),
+            "E0507",
+            "member `" + a + "` contains a nested workspace at `" + w + "`",
+          ),
+        );
+      }
+    }
+  }
+  for (const tool of ws.tools) {
+    if (dirs.some(d => pathWithin(tool.path.text, d))) {
+      return Err(at(ws, tool.path, "E0507", "tool `" + tool.name + "` lies inside a member"));
+    }
+    if (!tree.npmDirs.includes(tool.path.text)) {
+      return Err(at(ws, tool.path, "E0507", "tool `" + tool.name + "` has no package.json"));
+    }
+  }
+  // Member manifests; names are unique.
+  let members: Member[] = [];
+  let i: usize = 0;
+  while (i < dirs.length) {
+    const text = tree.manifest(dirs[i]).unwrap();
+    const fid = firstFile + dirIndex(tree, dirs[i]);
+    const mr = parseManifest(fid, text);
+    if (mr.isErr()) {
+      return Err(mr.unwrapErr());
+    }
+    const m = mr.unwrap();
+    for (const o of members) {
+      if (o.name == m.name) {
+        return Err(
+          at(
+            ws,
+            entryOf(ws, dirs[i]),
+            "E0506",
+            "package name `" + m.name + "` is used by `" + o.dir + "` and `" + dirs[i] + "`",
+          ),
+        );
+      }
+    }
+    members.push(Member { dir: dirs[i], name: m.name, file: fid, manifest: m, deps: [] });
+    i += 1;
+  }
+  // Path dependencies must name members.
+  let k: usize = 0;
+  while (k < members.length) {
+    let deps: usize[] = [];
+    for (const d of members[k].manifest.dependencies) {
+      if (d.path == "") {
+        continue;
+      }
+      const target = normalize(join([members[k].dir, d.path]));
+      let found: Option<usize> = None;
+      let j: usize = 0;
+      while (j < members.length) {
+        if (members[j].dir == target) {
+          found = Some(j);
+        }
+        j += 1;
+      }
+      match (found) {
+        Some(j2) => {
+          deps.push(j2);
+        },
+        None => {
+          return Err(
+            depError(
+              members[k],
+              d.name,
+              "path dependency `" + d.name + "` (`" + d.path + "`) is not a workspace member",
+            ),
+          );
+        },
+      }
+    }
+    members[k].deps = deps;
+    k += 1;
+  }
+  let names: string[] = [];
+  let graph: usize[][] = [];
+  for (const m of members) {
+    names.push(m.name);
+    graph.push(m.deps);
+  }
+  let order: usize[] = [];
+  match (buildOrder(names, graph)) {
+    Ok(o) => {
+      order = o;
+    },
+    Err(cycle) => {
+      const text = cycle.map(c => names[c]).join(" -> ") + " -> " + names[cycle[0]];
+      return Err(
+        depError(
+          members[cycle[0]],
+          names[cycle[cycle.length > 1 ? 1 : 0]],
+          "dependency cycle: " + text,
+        ),
+      );
+    },
+  }
+  let defaults: usize[] = [];
+  for (const p of ws.defaults) {
+    let found = false;
+    let j: usize = 0;
+    while (j < members.length) {
+      if (members[j].dir == p.text) {
+        defaults.push(j);
+        found = true;
+      }
+      j += 1;
+    }
+    if (!found) {
+      return Err(at(ws, p, "E0507", "`default-members` entry `" + p.text + "` is not a member"));
+    }
+  }
+  return Ok(Resolved { members: members, order: order, defaults: defaults });
+}
+
+// Position of `d` in `tree.dirs` (members always come from it, literal members are checked to have a manifest there).
+function dirIndex(tree: Tree, d: string): usize {
+  let i: usize = 0;
+  while (i < tree.dirs.length) {
+    if (tree.dirs[i] == d) {
+      return i;
+    }
+    i += 1;
+  }
+  return tree.dirs.length;
+}
+
+// The `members` entry that produced directory `d` (its literal entry, else the pattern).
+function entryOf(ws: Workspace, d: string): WsPath {
+  for (const m of ws.members) {
+    if (m.text == d) {
+      return m;
+    }
+  }
+  for (const m of ws.members) {
+    if (isPattern(m.text) && pathMatches(d, m.text)) {
+      return m;
+    }
+  }
+  return ws.members[0];
+}
+
+// E0508 at the dependency entry `dep` of member `m` (its key in `[dependencies]`), or at the manifest start.
+function depError(m: Member, dep: string, msg: string): Diagnostic {
+  const text = m.manifest.source.text;
+  let start: usize = 0;
+  let end: usize = 0;
+  const pr = parseToml(m.file, text);
+  if (pr.isOk()) {
+    for (const t of pr.unwrap().tables) {
+      if (t.path.length == 1 && (t.path[0] == "dependencies" || t.path[0] == "dev-dependencies")) {
+        for (const e of t.entries) {
+          if (e.key == dep) {
+            start = e.start;
+            end = e.end;
+          }
+        }
+      }
+    }
+  }
+  return diag("E0508", span(m.file, start, end), m.dir + "/orin.toml: " + msg);
+}
+
+// `orin.lock` (docs/workspace.md §4): one `[member.<name>]` table per member with `path`, `version` and `dependencies`
+// (the member names it depends on, in build order). The canonical text of a resolution:
+function quoted(s: string): string {
+  return "\""
+      + s
+          .split("\\")
+          .join("\\\\")
+          .split("\"")
+          .join("\\\"")
+          .split("\n")
+          .join("\\n")
+          .split("\r")
+          .join("\\r")
+          .split("\t")
+          .join("\\t")
+      + "\"";
+}
+
+export function lockText(r: Resolved): string {
+  let out = "# generated by `orin lock`; do not edit\n";
+  for (const i of r.order) {
+    const m = r.members[i];
+    const deps = m.deps.map(d => quoted(r.members[d].name)).join(", ");
+    out = out + "\n[member." + quoted(m.name) + "]\npath = " + quoted(m.dir) + "\nversion = "
+        + quoted(m.manifest.version) + "\ndependencies = [" + deps + "]\n";
+  }
+  return out;
+}
+
+function sameStrings(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// E0509 when `lock` (file id `file`) does not describe `r`: at the `[member.<name>]` table that differs or names no
+// member, or at the end of the file for a member the lock lacks.
+export function checkLock(r: Resolved, file: usize, lock: string): Option<Diagnostic> {
+  const pr = parseToml(file, lock);
+  if (pr.isErr()) {
+    return Some(diag("E0509", pr.unwrapErr().span, "orin.lock: unreadable, run `orin lock`"));
+  }
+  const tables = pr.unwrap().tables;
+  for (const t of tables) {
+    if (t.path.length == 0 && t.entries.length == 0) {
+      continue;
+    }
+    if (t.path.length != 2 || t.path[0] != "member" || !r.members.some(m => m.name == t.path[1])) {
+      return Some(
+        diag("E0509", span(file, t.start, t.end), "orin.lock: unexpected table, run `orin lock`"),
+      );
+    }
+  }
+  for (const i of r.order) {
+    const m = r.members[i];
+    const deps = m.deps.map(d => r.members[d].name);
+    let seen = false;
+    for (const t of tables) {
+      if (t.path.length == 2 && t.path[1] == m.name) {
+        seen = true;
+        let ok = t.entries.length == 3;
+        for (const e of t.entries) {
+          ok = ok
+              && match (e.value) {
+                TStr(v) => e.key == "path" && v == m.dir
+                    || e.key == "version" && v == m.manifest.version,
+                TArr(vs) => e.key == "dependencies" && sameStrings(vs, deps),
+                _ => false,
+              };
+        }
+        if (!ok) {
+          return Some(
+            diag(
+              "E0509",
+              span(file, t.start, t.end),
+              "orin.lock: member `" + m.name + "` changed, run `orin lock`",
+            ),
+          );
+        }
+      }
+    }
+    if (!seen) {
+      return Some(
+        diag(
+          "E0509",
+          span(file, lock.length, lock.length),
+          "orin.lock: member `" + m.name + "` is missing, run `orin lock`",
+        ),
+      );
+    }
+  }
+  return None;
+}

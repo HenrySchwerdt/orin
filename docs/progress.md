@@ -61,6 +61,9 @@ ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
    interruptible waits before a scheduler experiment; syntax changes require their own ADR decision.
 4. Continue the remaining checker/VC rewrite under ADR-0015. Performance PRs #91 and #98 remain
    decision/parked work, as detailed below; their existence is not implementation on main.
+5. After the ADR-0047 layout move and the escape-analysis work: unify the std API per
+   [ADR-0048](decisions/0048-std-api-conventions.md) and clean up and parallelise the compiler per
+   [ADR-0049](decisions/0049-compiler-cleanup-and-parallel-compilation.md); evidence in [`audits/`](audits).
 
 ## Open work and decision gates (performance history retained)
 Merged 2026-10-15: unboxing (#62, MIR v2.2), packed verifier state (#64), census quick wins (#65), borrow inference (#67),
@@ -91,7 +94,12 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    T6 (range facts, same branch, draft #98) is built: `compiler/verify/range.or`, nbody -53.1% (the ceiling), pqueue / sieve /
    qsort_inplace / mutres unchanged (parameter and push-built arrays have no shape fact), self-compile +0.37%; verifier 2476 -> 3461
    code lines (T2 +115, T6 +870). Needs the owner's decision on the interval domain before merge (ADR-0038 T6).
-3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
+   Escape analysis / scalar replacement (c) is done for its one clean case (ADR-0038 addendum 2026-10-16, `compiler/opt/lits.or`, no MIR
+   or verifier change): a temporary array literal that is only appended (`x = x.concat([..])`) becomes pushes; appends -48.6%
+   instructions, -99.99% allocations, all other benchmarks and the self-compile unchanged. The rest of class (c) in the compiler
+   (`BlockSink`, `State`, `RewritePlan`, `Transfer`: mutable helper objects) is worth about 0.5% of the self-compile and needs an inliner
+   or a verified non-heap object; not built.
+3. **Performance, further ADR-0038 steps:** unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, deferred: measured 2026-10-16, free lists and iterative release already exist, regions would give about -50 %
    on bintrees alone and nothing elsewhere; ADR-0038 addendum); packed arrays (b). Done on the way: small-block cache for
