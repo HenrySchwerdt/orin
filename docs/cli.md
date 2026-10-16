@@ -62,8 +62,13 @@ orin build --backend=llvm
 `--backend=llvm` compiles the generated LLVM IR with clang. `orin toolchain install` downloads the one LLVM version Orin is
 tested with (`lib/orin/llvm.pin`), checks the archive's sha256 against the pin, and installs `clang`, `llc` and clang's resource
 files (about 400 MB) into `~/.orin/toolchains/llvm-<version>` (`ORIN_HOME` relocates it). `--backend=llvm` uses it when present;
-an explicit `CC` wins; without it a dev build uses the system `clang`, and `build --release --backend=llvm` falls back to the C
-backend with a note. `orin doctor` reports whether the pinned toolchain is installed. The default backend is still C.
+an explicit `CC` wins; without it a dev build uses the system `clang`.
+
+`--release` (also for `run` and `test`) defaults to the LLVM backend; dev builds use the C backend. Without the pinned toolchain a
+default release build uses the system `clang` if its major version is at least the pin's, and otherwise falls back to the C backend
+with one note. `--backend=llvm` without the pinned toolchain falls back to C with the same note. `--backend=c` always selects the C
+backend, and a `CC` that is not clang keeps a default release build on C. Both backends run the same MIR optimiser and compile at
+`-O2`. `orin doctor` reports whether the pinned toolchain is installed.
 
 ## Workspaces
 

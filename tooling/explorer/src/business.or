@@ -1,0 +1,886 @@
+// The business view (ADR-0051): the data of the pages for product owners and business people, derived from an OSIG snapshot and
+// an optional diff. Pure: no HTML and no file access, so the tests exercise it directly.
+//
+//   rules       every @Requires / @Ensures / @Invariant clause as a readable sentence ("Qty must be zero or greater."), grouped by
+//               the module it belongs to, with its assurance status (proved, checked at run time, open, or unknown)
+//   use cases   the entry points (main, exported functions and methods), their documentation as the description, the rules they
+//               rely on (everything they can reach) and their effects
+//   capabilities  what the software may do, per package, module and use case, in plain language ("read files", "read the clock")
+//   behaviour   what changed between two versions, in the same words ("New rule: ...", "Use case X may now ...")
+
+import { Snap, Sym, Rel, Diff, DSym, DEffect, DReach } from "./model";
+import { Ix, NONE } from "./index";
+import { strCmp, lower, afterLast } from "./util";
+
+// ---- reading expressions -------------------------------------------------------------------------------------------------------
+
+function isIdentChar(c: int): bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c == 46 || c == 36;
+}
+
+function isIdent(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < s.length) {
+    if (!isIdentChar(s.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function isNumber(s: string): bool {
+  if (s.length == 0) {
+    return false;
+  }
+  let i: usize = s.startsWith("-") ? 1 : 0;
+  if (i >= s.length) {
+    return false;
+  }
+  while (i < s.length) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || c == 46)) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// the text of `e` split at the top-level occurrences of `op` ("&&", "||"); brackets and string literals are not entered
+function splitTop(e: string, op: string): string[] {
+  let parts: string[] = [];
+  let depth: int = 0;
+  let quote: int = 0;
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < e.length) {
+    const c = e.charCodeAt(i);
+    if (quote != 0) {
+      if (c == 92) {
+        i += 1;
+      } else if (c == quote) {
+        quote = 0;
+      }
+    } else if (c == 34 || c == 39) {
+      quote = c;
+    } else if (c == 40 || c == 91) {
+      depth += 1;
+    } else if (c == 41 || c == 93) {
+      depth -= 1;
+    } else if (depth == 0 && i + op.length <= e.length && e.substring(i, i + op.length) == op) {
+      parts.push(e.substring(start, i).trim());
+      i += op.length;
+      start = i;
+      continue;
+    }
+    i += 1;
+  }
+  parts.push(e.substring(start, e.length).trim());
+  return parts;
+}
+
+// `e` without redundant outer parentheses
+function stripParens(e: string): string {
+  let cur = e.trim();
+  while (cur.length >= 2 && cur.startsWith("(") && cur.endsWith(")")) {
+    let depth: int = 0;
+    let closesAtEnd = true;
+    let i: usize = 0;
+    while (i < cur.length) {
+      const c = cur.charCodeAt(i);
+      if (c == 40) {
+        depth += 1;
+      } else if (c == 41) {
+        depth -= 1;
+        if (depth == 0 && i + 1 < cur.length) {
+          closesAtEnd = false;
+        }
+      }
+      i += 1;
+    }
+    if (!closesAtEnd) {
+      return cur;
+    }
+    cur = cur.substring(1, cur.length - 1).trim();
+  }
+  return cur;
+}
+
+type OpAt = { found: bool; at: usize; op: string; };
+
+// the first top-level comparison operator of `e`
+function findCompare(e: string): OpAt {
+  let depth: int = 0;
+  let quote: int = 0;
+  let i: usize = 0;
+  while (i < e.length) {
+    const c = e.charCodeAt(i);
+    if (quote != 0) {
+      if (c == 92) {
+        i += 1;
+      } else if (c == quote) {
+        quote = 0;
+      }
+    } else if (c == 34 || c == 39) {
+      quote = c;
+    } else if (c == 40 || c == 91) {
+      depth += 1;
+    } else if (c == 41 || c == 93) {
+      depth -= 1;
+    } else if (depth == 0) {
+      const two = i + 2 <= e.length ? e.substring(i, i + 2) : "";
+      if (two == "==" || two == "!=" || two == ">=" || two == "<=") {
+        return OpAt { found: true, at: i, op: two };
+      }
+      if ((c == 62 || c == 60) && two != "=>" && !(i > 0 && e.charCodeAt(i - 1) == 61)) {
+        return OpAt { found: true, at: i, op: e.substring(i, i + 1) };
+      }
+    }
+    i += 1;
+  }
+  return OpAt { found: false, at: 0, op: "" };
+}
+
+function withoutThis(s: string): string {
+  return s.startsWith("this.") ? s.substring(5, s.length) : s;
+}
+
+export function capitalise(s: string): string {
+  if (s.length == 0) {
+    return s;
+  }
+  const c = s.charCodeAt(0);
+  return (c >= 97 && c <= 122 ? String.fromCharCode(c - 32) : s.substring(0, 1)) + s.substring(1, s.length);
+}
+
+// ---- rule sentences ---------------------------------------------------------------------------------------------------------------
+
+// A condition split into a subject and a relation: "qty" + "zero or greater" (not negated), "name" + "empty" (negated).
+type Clause = { subject: string; rel: string; neg: bool; raw: string; };
+
+function numberWord(s: string): string {
+  return s == "0" ? "zero" : s;
+}
+
+function flip(op: string): string {
+  return op == ">" ? "<" : (op == "<" ? ">" : (op == ">=" ? "<=" : (op == "<=" ? ">=" : op)));
+}
+
+function subjectOf(s: string): string {
+  const t = withoutThis(s.trim());
+  if (t == "result") {
+    return "the result";
+  }
+  if (t.endsWith(".length") && isIdent(t)) {
+    return "the length of " + t.substring(0, t.length - 7);
+  }
+  return t;
+}
+
+function clauseOf(raw: string): Clause {
+  const e = stripParens(raw);
+  const fallback = Clause { subject: "", rel: "", neg: false, raw: e };
+  if (e.length == 0) {
+    return fallback;
+  }
+  const c = findCompare(e);
+  if (!c.found) {
+    if (e.startsWith("!") && !e.startsWith("!=")) {
+      const inner = stripParens(e.substring(1, e.length));
+      return Clause { subject: isIdent(inner) ? subjectOf(inner) : "the check " + inner, rel: "false", neg: false, raw: "" };
+    }
+    return Clause { subject: isIdent(e) ? subjectOf(e) : "the check " + e, rel: "true", neg: false, raw: "" };
+  }
+  let lhs = e.substring(0, c.at).trim();
+  let rhs = e.substring(c.at + c.op.length, e.length).trim();
+  let op = c.op;
+  if (isNumber(lhs) && !isNumber(rhs)) {
+    const t = lhs;
+    lhs = rhs;
+    rhs = t;
+    op = flip(op);
+  }
+  if (lhs.length == 0 || rhs.length == 0) {
+    return fallback;
+  }
+  const subject = subjectOf(lhs);
+  const r = withoutThis(rhs);
+  // "x.length > 0" and friends: a non-empty / empty check
+  if (lhs.endsWith(".length") && (r == "0" || r == "1")) {
+    const base = withoutThis(lhs.substring(0, lhs.length - 7));
+    if ((op == ">" && r == "0") || (op == "!=" && r == "0") || (op == ">=" && r == "1")) {
+      return Clause { subject: base, rel: "empty", neg: true, raw: "" };
+    }
+    if ((op == "==" && r == "0") || (op == "<" && r == "1") || (op == "<=" && r == "0")) {
+      return Clause { subject: base, rel: "empty", neg: false, raw: "" };
+    }
+  }
+  if (op == ">") {
+    return Clause { subject: subject, rel: r == "0" ? "positive" : "greater than " + r, neg: false, raw: "" };
+  }
+  if (op == ">=") {
+    return Clause { subject: subject, rel: r == "0" ? "zero or greater" : "at least " + r, neg: false, raw: "" };
+  }
+  if (op == "<") {
+    return Clause { subject: subject, rel: r == "0" ? "negative" : "less than " + r, neg: false, raw: "" };
+  }
+  if (op == "<=") {
+    return Clause { subject: subject, rel: r == "0" ? "zero or less" : "at most " + r, neg: false, raw: "" };
+  }
+  if (op == "==") {
+    return Clause { subject: subject, rel: "equal to " + numberWord(r), neg: false, raw: "" };
+  }
+  return Clause { subject: subject, rel: "equal to " + numberWord(r), neg: true, raw: "" };
+}
+
+// "must be" / "will be" / "is always" and their negations, by the kind of clause
+function modal(kind: string, neg: bool): string {
+  if (kind == "ensures") {
+    return neg ? "will not be" : "will be";
+  }
+  if (kind == "invariant") {
+    return neg ? "is never" : "is always";
+  }
+  return neg ? "must not be" : "must be";
+}
+
+function holds(kind: string): string {
+  return kind == "ensures" ? "will hold" : (kind == "invariant" ? "always holds" : "must hold");
+}
+
+// one condition as the body of a sentence (no capital, no full stop)
+function bodyOf(kind: string, e: string): string {
+  const imp = splitTop(stripParens(e), "=>");
+  if (imp.length == 2) {
+    return "if " + bodyOf(kind, imp[0]) + ", then " + bodyOf(kind, imp[1]);
+  }
+  const ors = splitTop(stripParens(e), "||");
+  if (ors.length > 1) {
+    return "either " + ors.map(p => bodyOf(kind, p)).join(", or ");
+  }
+  const ands = splitTop(stripParens(e), "&&");
+  if (ands.length > 1) {
+    return ands.map(p => bodyOf(kind, p)).join(" and ");
+  }
+  const cl = clauseOf(e);
+  if (cl.raw.length > 0 || cl.subject.length == 0) {
+    return "the condition " + cl.raw + " " + holds(kind);
+  }
+  return cl.subject + " " + modal(kind, cl.neg) + " " + cl.rel;
+}
+
+// The sentences of a contract clause: `kind` is "requires", "ensures" or "invariant" (anything else reads like requires),
+// `expr` the condition as written. A conjunction gives one sentence per part.
+export function ruleSentences(kind: string, expr: string): string[] {
+  const k = kind == "ensures" || kind == "invariant" ? kind : "requires";
+  let out: string[] = [];
+  for (const part of splitTop(stripParens(expr), "&&")) {
+    out.push(capitalise(bodyOf(k, part)) + ".");
+  }
+  return out;
+}
+
+// "requires" of "@Requires(n > 0)" ("" when the text is not a contract clause)
+export function contractKindOf(sig: string): string {
+  const p = sig.indexOf("(");
+  if (!sig.startsWith("@") || p.isNone()) {
+    return "";
+  }
+  return lower(sig.substring(1, p.unwrap()));
+}
+
+// "n > 0" of "@Requires(n > 0)"
+export function exprOfSig(sig: string): string {
+  const p = sig.indexOf("(");
+  if (p.isNone() || !sig.endsWith(")")) {
+    return sig;
+  }
+  return sig.substring(p.unwrap() + 1, sig.length - 1).trim();
+}
+
+// the sentences of a clause given as source text ("@Requires(n > 0)")
+export function sentencesOfSig(sig: string): string[] {
+  return ruleSentences(contractKindOf(sig), exprOfSig(sig));
+}
+
+export function kindLabel(kind: string): string {
+  return kind == "ensures" ? "Guarantee" : (kind == "invariant" ? "Always true" : "Condition");
+}
+
+// ---- assurance ----------------------------------------------------------------------------------------------------------------------
+
+// proved | runtime | open | unknown. The snapshot does not record verification outcomes yet (ADR-0051), so a clause without the
+// optional `assurance` field is "unknown": the page never claims more than the data says.
+export function assuranceKey(a: string): string {
+  return a == "proved" || a == "runtime" || a == "open" ? a : "unknown";
+}
+
+export function assuranceLabel(key: string): string {
+  return key == "proved" ? "Proved" : (key == "runtime" ? "Checked at run time" : (key == "open" ? "Open" : "Unknown"));
+}
+
+export function assuranceMeaning(key: string): string {
+  return key == "proved" ? "The verifier proved that this rule always holds."
+    : (key == "runtime" ? "Not proved; the program checks the rule while it runs and stops when it is broken."
+    : (key == "open" ? "Neither proved nor checked: nothing makes sure the rule holds."
+    : "The snapshot does not say whether this rule is proved or checked."));
+}
+
+// ---- capabilities in plain words ------------------------------------------------------------------------------------------------------
+
+// the operation of an effect node id ("~io:Fs.ReadFile" -> "Fs.ReadFile"; "~unknown" -> "Unknown.Unresolved")
+export function opOf(dst: string): string {
+  return dst.startsWith("~io:") ? dst.substring(4, dst.length) : (dst == "~unknown" ? "Unknown.Unresolved" : dst);
+}
+
+export function familyOf(op: string): string {
+  const p = op.indexOf(".");
+  return p.isSome() ? op.substring(0, p.unwrap()) : op;
+}
+
+// what the software may do, as a verb phrase after "may" ("read files")
+export function capPhrase(op: string): string {
+  if (op == "Fs.ReadFile") { return "read files"; }
+  if (op == "Fs.Stat") { return "check whether files exist"; }
+  if (op == "Fs.Read") { return "read from open files"; }
+  if (op == "Fs.WriteFile") { return "write files"; }
+  if (op == "Fs.Write") { return "write to open files"; }
+  if (op == "Fs.Open") { return "open files"; }
+  if (op == "Fs.Narrow") { return "limit its own file access"; }
+  if (op == "Process.Args") { return "read the command-line arguments"; }
+  if (op == "Process.Spawn") { return "start other programs"; }
+  if (op == "Process.Narrow") { return "limit its own right to start programs"; }
+  if (op == "Process.Exit") { return "stop the program"; }
+  if (op == "Stdio.Read") { return "read from standard input"; }
+  if (op == "Stdio.Write") { return "write to standard output"; }
+  if (op == "Clock.Now") { return "read the clock"; }
+  if (op == "Console.Write") { return "write messages to the console"; }
+  if (op == "Host.Acquire") { return "ask the host system for access rights"; }
+  const f = familyOf(op);
+  if (f == "Net" || f == "Http" || f == "Socket") { return "open network connections"; }
+  if (f == "Task") { return "run work in parallel"; }
+  if (f == "Channel") { return "pass messages between parallel tasks"; }
+  if (f == "Unknown") { return "do something the analysis cannot see (a call through a function value)"; }
+  return "perform " + op;
+}
+
+// the area a capability belongs to, for grouping
+export function capArea(op: string): string {
+  const f = familyOf(op);
+  if (f == "Fs") { return "Files"; }
+  if (f == "Net" || f == "Http" || f == "Socket") { return "Network"; }
+  if (f == "Clock") { return "Time"; }
+  if (f == "Process") { return "Programs"; }
+  if (f == "Stdio" || f == "Console") { return "Console"; }
+  if (f == "Task" || f == "Channel") { return "Parallel work"; }
+  if (f == "Host") { return "System"; }
+  if (f == "Unknown") { return "Not known"; }
+  return "Other";
+}
+
+function areaRank(area: string): int {
+  return area == "Network" ? 0 : (area == "Files" ? 1 : (area == "Programs" ? 2 : (area == "System" ? 3 : (area == "Time" ? 4
+    : (area == "Console" ? 5 : (area == "Parallel work" ? 6 : (area == "Other" ? 7 : 8)))))));
+}
+
+// "may read files" order: the more far-reaching areas first, then by name
+export function capCmp(a: string, b: string): int {
+  const ra = areaRank(capArea(a));
+  const rb = areaRank(capArea(b));
+  return ra != rb ? (ra < rb ? -1 : 1) : strCmp(a, b);
+}
+
+// the permission an effect needs, in words ("" is never returned): from the effect node's `sig` ("INPUT; grant: FsGrant")
+export function grantPhrase(effectSig: string): string {
+  const p = effectSig.indexOf("grant: ");
+  const g = p.isSome() ? effectSig.substring(p.unwrap() + 7, effectSig.length) : "";
+  if (g == "FsGrant") { return "file-system permission"; }
+  if (g == "ProcessGrant") { return "process permission"; }
+  if (g == "StdioGrant") { return "standard-input/output permission"; }
+  if (g == "ClockGrant") { return "clock permission"; }
+  if (g == "Host") { return "host permission"; }
+  if (g == "ambient" || g.length == 0) { return "none needed"; }
+  return g;
+}
+
+// ---- titles ------------------------------------------------------------------------------------------------------------------------------
+
+// "saveOrder" -> "Save order"
+export function humanize(name: string): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < name.length) {
+    const c = name.charCodeAt(i);
+    if (c == 95) {
+      out += " ";
+    } else if (c >= 65 && c <= 90) {
+      const prevLower = i > 0 && name.charCodeAt(i - 1) >= 97 && name.charCodeAt(i - 1) <= 122;
+      out += (prevLower ? " " : "") + String.fromCharCode(c + 32);
+    } else {
+      out += name.substring(i, i + 1);
+    }
+    i += 1;
+  }
+  return capitalise(out.trim());
+}
+
+// The business title of a function or method id: "Start the program" for main, "Save order" for `saveOrder`, "Cart: add" for a
+// method. Works on the id alone, so it also names symbols that only one side of a diff has.
+export function titleOfId(id: string): string {
+  const c = id.indexOf("::");
+  const q = c.isSome() ? id.substring(c.unwrap() + 2, id.length) : id;
+  const dot = q.indexOf(".");
+  if (dot.isSome()) {
+    return q.substring(0, dot.unwrap()) + ": " + lower(humanize(q.substring(dot.unwrap() + 1, q.length)));
+  }
+  return q == "main" ? "Start the program" : humanize(q);
+}
+
+// the first paragraph of a documentation comment as plain prose: no code fences, no @tags, no backticks
+export function plainDoc(doc: string): string {
+  let words: string[] = [];
+  for (const raw of doc.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("```") || line.startsWith("@")) {
+      break;
+    }
+    if (line.length == 0) {
+      if (words.length > 0) {
+        break;
+      }
+      continue;
+    }
+    words.push(line);
+  }
+  return words.join(" ").split("`").join("");
+}
+
+// ---- the model ---------------------------------------------------------------------------------------------------------------------------
+
+export type Rule = {
+  node: usize;          // the contract clause node
+  kind: string;         // requires | ensures | invariant
+  owner: usize;         // the declaration the clause is written on (NONE when the snapshot lacks it)
+  module: string;
+  sentences: string[];
+  expr: string;
+  assurance: string;    // proved | runtime | open | unknown
+  users: int;           // use cases that rely on it
+};
+
+export type CapUse = { op: string; ev: string; next: string; };
+
+export type UseCase = {
+  node: usize; title: string; desc: string; http: bool; module: string;
+  rules: usize[];       // indices into Biz.rules: the clauses of everything the use case can reach (its own first)
+  ownRules: int;        // how many of those are written on the use case itself
+  caps: CapUse[];       // sorted by capCmp
+  reached: int;         // symbols it can reach through calls
+};
+
+export type CapRow = { op: string; grant: string; modules: string[]; users: usize[]; };   // users: indices into Biz.usecases
+
+export type Biz = { rules: Rule[]; usecases: UseCase[]; caps: CapRow[]; ruleAt: usize[]; ucAt: usize[]; };
+
+function isUseCase(s: Sym): bool {
+  return s.entry && (s.kind == "Function" || s.kind == "Method") && s.name != "constructor" && s.name != "new";
+}
+
+// a handler of an HTTP request, as far as a signature shows it: takes a request and returns a response
+function looksHttp(sig: string): bool {
+  return sig.indexOf("Request").isSome() && sig.indexOf("Response").isSome();
+}
+
+function pushUnique(xs: usize[], x: usize): usize[] {
+  for (const y of xs) {
+    if (y == x) {
+      return xs;
+    }
+  }
+  return xs.concat([x]);
+}
+
+export function buildBiz(ix: Ix): Biz {
+  const nodes = ix.snap.nodes;
+  const n = nodes.length;
+  let ruleAt: usize[] = [];
+  let ucAt: usize[] = [];
+  let i: usize = 0;
+  while (i < n) {
+    ruleAt.push(NONE);
+    ucAt.push(NONE);
+    i += 1;
+  }
+  // rules, ordered by module, then owner, then clause id
+  let order: usize[] = [];
+  i = 0;
+  while (i < n) {
+    if (nodes[i].kind == "Contract") {
+      order.push(i);
+    }
+    i += 1;
+  }
+  order = order.sort((a: usize, b: usize): int => {
+    const c = strCmp(nodes[a].module, nodes[b].module);
+    return c != 0 ? c : strCmp(nodes[a].id, nodes[b].id);
+  });
+  let rules: Rule[] = [];
+  for (const k of order) {
+    const s = nodes[k];
+    const owner = ix.byId.get(s.owner);
+    const kind = contractKindOf(s.sig).length > 0 ? contractKindOf(s.sig) : lower(s.name);
+    ruleAt[k] = rules.length;
+    rules.push(Rule {
+      node: k, kind: kind, owner: owner.isSome() ? owner.unwrap() : NONE, module: s.module, sentences: ruleSentences(kind, exprOfSig(s.sig)),
+      expr: exprOfSig(s.sig), assurance: assuranceKey(s.assurance), users: 0,
+    });
+  }
+  // the clauses written on each declaration (a method also answers to the invariants of its class)
+  let own: usize[][] = [];
+  i = 0;
+  while (i < n) {
+    own.push([]);
+    i += 1;
+  }
+  for (const r of rules) {
+    if (r.owner != NONE) {
+      own[r.owner].push(ruleAt[r.node]);
+    }
+  }
+  // use cases
+  let usecases: UseCase[] = [];
+  let capUsers = new Map<string, usize[]>();
+  i = 0;
+  while (i < n) {
+    const s = nodes[i];
+    if (ix.page[i] == i && isUseCase(s)) {
+      // everything reachable through calls (a worklist in discovery order, so the result is deterministic)
+      let seen = new Map<string, bool>();
+      let work: usize[] = [i];
+      seen.set(i.toString(), true);
+      let w: usize = 0;
+      let relied: usize[] = [];
+      while (w < work.length) {
+        const cur = work[w];
+        w += 1;
+        for (const ri of own[cur]) {
+          relied = pushUnique(relied, ri);
+        }
+        const ow = ix.byId.get(nodes[cur].owner);
+        if (ow.isSome() && nodes[ow.unwrap()].kind == "Class") {
+          for (const ri of own[ow.unwrap()]) {
+            relied = pushUnique(relied, ri);
+          }
+        }
+        for (const ei of ix.out[cur]) {
+          const e = ix.snap.edges[ei];
+          if (e.kind != "CALLS") {
+            continue;
+          }
+          const t = ix.byId.get(e.dst);
+          if (t.isSome() && !seen.has(t.unwrap().toString())) {
+            seen.set(t.unwrap().toString(), true);
+            work.push(t.unwrap());
+          }
+        }
+      }
+      // own clauses first, then the others in rule order
+      let ownList: usize[] = [];
+      for (const ri of own[i]) {
+        ownList = pushUnique(ownList, ri);
+      }
+      const ownerOfUse = ix.byId.get(s.owner);
+      if (ownerOfUse.isSome() && nodes[ownerOfUse.unwrap()].kind == "Class") {
+        for (const ri of own[ownerOfUse.unwrap()]) {
+          ownList = pushUnique(ownList, ri);
+        }
+      }
+      let others: usize[] = [];
+      for (const ri of relied) {
+        let isOwn = false;
+        for (const o of ownList) {
+          isOwn = isOwn || o == ri;
+        }
+        if (!isOwn) {
+          others.push(ri);
+        }
+      }
+      others = others.sort((a: usize, b: usize): int => a < b ? -1 : (a > b ? 1 : 0));
+      let all: usize[] = ownList.sort((a: usize, b: usize): int => a < b ? -1 : (a > b ? 1 : 0));
+      const ownCount = all.length.toInt();
+      for (const o of others) {
+        all.push(o);
+      }
+      for (const ri of all) {
+        rules[ri].users += 1;
+      }
+      // effects of the use case itself (the snapshot's MAY_PERFORM edges are already transitive)
+      let caps: CapUse[] = [];
+      let seenOps = new Map<string, usize>();
+      for (const ei of ix.out[i]) {
+        const e = ix.snap.edges[ei];
+        if (e.kind != "MAY_PERFORM") {
+          continue;
+        }
+        const op = opOf(e.dst);
+        const at = seenOps.get(op);
+        if (at.isNone()) {
+          seenOps.set(op, caps.length);
+          caps.push(CapUse { op: op, ev: e.ev, next: e.next });
+          const cu = capUsers.get(op);
+          capUsers.set(op, cu.isSome() ? pushUnique(cu.unwrap(), usecases.length) : [usecases.length]);
+        } else if (e.ev == "MUST" && caps[at.unwrap()].ev != "MUST") {
+          caps[at.unwrap()] = CapUse { op: op, ev: e.ev, next: e.next };
+        }
+      }
+      caps = caps.sort((a: CapUse, b: CapUse): int => capCmp(a.op, b.op));
+      ucAt[i] = usecases.length;
+      usecases.push(UseCase {
+        node: i, title: titleOfId(s.id), desc: plainDoc(s.doc), http: looksHttp(s.sig), module: s.module, rules: all, ownRules: ownCount,
+        caps: caps, reached: work.length.toInt() - 1,
+      });
+    }
+    i += 1;
+  }
+  // the package's capabilities: every effect any function of the snapshot may perform, with the modules and use cases
+  let ops: string[] = [];
+  let grants = new Map<string, string>();
+  let mods = new Map<string, string[]>();
+  for (const e of ix.snap.edges) {
+    if (e.kind != "MAY_PERFORM") {
+      continue;
+    }
+    const op = opOf(e.dst);
+    const src = ix.byId.get(e.src);
+    if (src.isNone()) {
+      continue;
+    }
+    if (!grants.has(op)) {
+      ops.push(op);
+      const ef = ix.byId.get(e.dst);
+      grants.set(op, ef.isSome() ? grantPhrase(nodes[ef.unwrap()].sig) : "none needed");
+      mods.set(op, []);
+    }
+    const m = nodes[src.unwrap()].module;
+    let cur = mods.get(op).unwrap();
+    let have = false;
+    for (const x of cur) {
+      have = have || x == m;
+    }
+    if (!have) {
+      cur.push(m);
+      mods.set(op, cur);
+    }
+  }
+  ops = ops.sort((a: string, b: string): int => capCmp(a, b));
+  let caps: CapRow[] = [];
+  for (const op of ops) {
+    const ms = mods.get(op).unwrap().sort((a: string, b: string): int => strCmp(a, b));
+    const us = capUsers.get(op);
+    caps.push(CapRow { op: op, grant: grants.get(op).unwrap(), modules: ms, users: us.isSome() ? us.unwrap() : [] });
+  }
+  // use cases: main first, then by module and id (node order is by id already)
+  return Biz { rules: rules, usecases: usecases, caps: caps, ruleAt: ruleAt, ucAt: ucAt };
+}
+
+// ---- the behaviour diff --------------------------------------------------------------------------------------------------------------------
+
+// area: rule | usecase | capability; op: added | changed | removed
+export type BChange = { area: string; op: string; headline: string; detail: string; id: string; module: string; };
+
+function opRank(op: string): int {
+  return op == "added" ? 0 : (op == "changed" ? 1 : 2);
+}
+
+function areaOrder(a: string): int {
+  return a == "capability" ? 0 : (a == "rule" ? 1 : 2);
+}
+
+function moduleOfId(id: string): string {
+  const c = id.indexOf(":");
+  const rest = c.isSome() ? id.substring(c.unwrap() + 1, id.length) : id;
+  const d = rest.indexOf("::");
+  return d.isSome() ? rest.substring(0, d.unwrap()) : rest;
+}
+
+function ownerOfClauseId(id: string): string {
+  const parts = id.split("@");
+  return parts.length > 1 ? parts.slice(0, parts.length - 1).join("@") : id;
+}
+
+function plainId(id: string): string {
+  const c = id.indexOf(":");
+  return c.isSome() ? id.substring(c.unwrap() + 1, id.length) : id;
+}
+
+function isClause(s: DSym): bool {
+  return s.kind == "Contract";
+}
+
+function isUseKind(kind: string): bool {
+  return kind == "Function" || kind == "Method";
+}
+
+function idIsConstructor(id: string): bool {
+  return id.endsWith(".constructor") || id.endsWith(".new");
+}
+
+// The first nodes of the entry paths that reach a changed function: the use cases that the change touches.
+function entriesOf(r: DReach): string[] {
+  let out: string[] = [];
+  for (const p of r.paths) {
+    if (p.nodes.length > 0) {
+      let have = false;
+      for (const x of out) {
+        have = have || x == p.nodes[0];
+      }
+      if (!have) {
+        out.push(p.nodes[0]);
+      }
+    }
+  }
+  return out.sort((a: string, b: string): int => strCmp(a, b));
+}
+
+function changeCmp(a: BChange, b: BChange): int {
+  if (areaOrder(a.area) != areaOrder(b.area)) {
+    return areaOrder(a.area) < areaOrder(b.area) ? -1 : 1;
+  }
+  if (opRank(a.op) != opRank(b.op)) {
+    return opRank(a.op) < opRank(b.op) ? -1 : 1;
+  }
+  const c = strCmp(a.headline, b.headline);
+  return c != 0 ? c : strCmp(a.id, b.id);
+}
+
+// Every business-relevant change of a diff, in plain words. `ix` is the index of the head snapshot (it knows which symbols are
+// entry points and which functions still perform an effect). Pure and deterministic; sorted by area, kind of change, text.
+export function behaviourChanges(ix: Ix, d: Diff): BChange[] {
+  let out: BChange[] = [];
+  // rules
+  for (const s of d.added) {
+    if (isClause(s)) {
+      out.push(BChange { area: "rule", op: "added", headline: "New rule: " + sentencesOfSig(s.sig).join(" "),
+                         detail: "Applies to " + plainId(ownerOfClauseId(s.id)) + ".", id: s.id, module: moduleOfId(s.id) });
+    }
+  }
+  for (const s of d.removed) {
+    if (isClause(s)) {
+      out.push(BChange { area: "rule", op: "removed", headline: "Rule removed: " + sentencesOfSig(s.sig).join(" "),
+                         detail: "Applied to " + plainId(ownerOfClauseId(s.id)) + ".", id: s.id, module: moduleOfId(s.id) });
+    }
+  }
+  for (const s of d.changed) {
+    if (isClause(s)) {
+      out.push(BChange { area: "rule", op: "changed", headline: "Rule changed: " + sentencesOfSig(s.after).join(" "),
+                         detail: "Was: " + sentencesOfSig(s.before).join(" ") + " Applies to " + plainId(ownerOfClauseId(s.id)) + ".",
+                         id: s.id, module: moduleOfId(s.id) });
+    }
+  }
+  // use cases (a rename is one change, not a removal plus an addition)
+  let renamedFrom = new Map<string, string>();
+  let renamedTo = new Map<string, string>();
+  for (const r of d.renames) {
+    if (isUseKind(r.kind)) {
+      renamedFrom.set(r.oldId, r.newId);
+      renamedTo.set(r.newId, r.oldId);
+    }
+  }
+  for (const s of d.added) {
+    if (isUseKind(s.kind) && s.entry && !idIsConstructor(s.id)) {
+      const prior = renamedTo.get(s.id);
+      const x = ix.byId.get(s.id);
+      const desc = x.isSome() ? plainDoc(ix.snap.nodes[x.unwrap()].doc) : "";
+      if (prior.isSome()) {
+        out.push(BChange { area: "usecase", op: "changed", headline: "Use case renamed: " + titleOfId(prior.unwrap()) + " is now called " + titleOfId(s.id),
+                           detail: desc, id: s.id, module: moduleOfId(s.id) });
+      } else {
+        out.push(BChange { area: "usecase", op: "added", headline: "New use case: " + titleOfId(s.id), detail: desc, id: s.id, module: moduleOfId(s.id) });
+      }
+    }
+  }
+  for (const s of d.removed) {
+    if (isUseKind(s.kind) && s.entry && !idIsConstructor(s.id) && !renamedFrom.has(s.id)) {
+      out.push(BChange { area: "usecase", op: "removed", headline: "Use case removed: " + titleOfId(s.id), detail: "", id: s.id, module: moduleOfId(s.id) });
+    }
+  }
+  for (const s of d.changed) {
+    const x = ix.byId.get(s.id);
+    if (!isClause(s) && isUseKind(s.kind) && x.isSome() && ix.snap.nodes[x.unwrap()].entry) {
+      let what: string[] = [];
+      for (const a of s.aspects) {
+        what.push(a == "signature" ? "what it takes or returns" : a);
+      }
+      out.push(BChange { area: "usecase", op: "changed", headline: "Use case changed: " + titleOfId(s.id),
+                         detail: what.length > 0 ? "Changed: " + what.join(", ") + "." : "", id: s.id, module: moduleOfId(s.id) });
+    }
+  }
+  // capabilities: every use case that reaches a function whose effects changed
+  let seen = new Map<string, bool>();
+  let addedFns = new Map<string, Map<string, bool>>();
+  let removedOps = new Map<string, bool>();
+  for (const e of d.effects) {
+    if (e.kind != "added" && e.kind != "removed") {
+      continue;
+    }
+    const added = e.kind == "added";
+    const phrase = capPhrase(e.op);
+    let who = entriesOf(e.reach);
+    const viaPaths = who.length > 0;
+    if (!viaPaths) {
+      who = [e.fn];
+    }
+    for (const w of who) {
+      const key = w + "|" + e.op + "|" + e.kind;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.set(key, true);
+      out.push(BChange {
+        area: "capability", op: e.kind, id: w, module: moduleOfId(w),
+        headline: (viaPaths ? "Use case " : "Function ") + titleOfId(w) + (added ? " may now " : " may no longer ") + phrase + ".",
+        detail: w == e.fn ? "Directly in " + plainId(e.fn) + "." : "Through " + plainId(e.fn) + ".",
+      });
+    }
+    if (added) {
+      const m = addedFns.get(e.op);
+      let fns = m.isSome() ? m.unwrap() : new Map<string, bool>();
+      fns.set(e.fn, true);
+      addedFns.set(e.op, fns);
+    } else {
+      removedOps.set(e.op, true);
+    }
+  }
+  // the whole software gained a capability when every function that has it now is one that just gained it; it lost one when
+  // no function has it any more
+  let stillHas = new Map<string, bool>();
+  let preExisting = new Map<string, bool>();
+  for (const e of ix.snap.edges) {
+    if (e.kind != "MAY_PERFORM") {
+      continue;
+    }
+    const op = opOf(e.dst);
+    stillHas.set(op, true);
+    const m = addedFns.get(op);
+    if (m.isNone() || !m.unwrap().has(e.src)) {
+      preExisting.set(op, true);
+    }
+  }
+  for (const e of d.effects) {
+    if (e.kind == "added" && !preExisting.has(e.op) && !seen.has("pkg|" + e.op + "|added")) {
+      seen.set("pkg|" + e.op + "|added", true);
+      out.push(BChange { area: "capability", op: "added", headline: "New capability for the whole software: it may now " + capPhrase(e.op) + ".",
+                         detail: "Nothing in the previous version could.", id: "", module: "" });
+    }
+    if (e.kind == "removed" && !stillHas.has(e.op) && !seen.has("pkg|" + e.op + "|removed")) {
+      seen.set("pkg|" + e.op + "|removed", true);
+      out.push(BChange { area: "capability", op: "removed", headline: "Capability gone: the software may no longer " + capPhrase(e.op) + ".",
+                         detail: "Nothing in this version does.", id: "", module: "" });
+    }
+  }
+  return out.sort((a: BChange, b: BChange): int => changeCmp(a, b));
+}

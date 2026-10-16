@@ -12,7 +12,10 @@
 import { Span, Diagnostic, diag } from "../diag";
 import { Ident, Block, Stmt, Expr, MatchArm, TypeExpr, AssignOp, ContractClause } from "../syntax";
 import { Type, HBlock, HStmt, HExpr, HExprKind, HArm, VariantDef, FieldInitH } from "../hir";
-import { Env, isVoid, isIntish, isBool, showType, typeInRange } from "./env";
+import {
+  Env, isVoid, isIntish, isBool, showType, typeInRange, ContractMode, isClauseMode,
+  sameContractMode, isCtorMode, isMutVoidMode, isMutRetMode, CmContract,
+} from "./env";
 import { FnCtx } from "./fnctx";
 import { checkPattern } from "./pattern";
 import {
@@ -86,7 +89,7 @@ export class StmtChecker {
       if (isClause) {
         match (s.kind) {
           SContract(c) => {
-            const x = this.clause(c, 1)?;
+            const x = this.clause(c, CmContract)?;
             match (x) {
               Some(h) => {
                 this.ex.fx.cexprs.push(h);
@@ -161,19 +164,19 @@ export class StmtChecker {
   }
 
   // Type-checks one contract clause (ADR-0012, spec 15 §4.2a) in a fork of the context and discards
-  // the result, so contracts never reach the generated code. `cmode`: 1 `@Requires`, `@Invariant`,
-  // `@Decreases`, loop clauses; 2 `@Ensures`. The expression must be `bool` (`@Decreases`: `int` or
+  // the result, so contracts never reach the generated code. `cmode`: CmContract for `@Requires`, `@Invariant`,
+  // `@Decreases`, loop clauses; CmEnsures for `@Ensures`. The expression must be `bool` (`@Decreases`: `int` or
   // `usize`, E0414); mutating method calls are rejected (E0416). The returned HIR is only used by the
   // purity pass (purity.or), which also judges the closures of the clause (ADR-0031 A4). Environment
   // growth (generic instances and lifted closures requested by the clause) is kept so function ids
   // stay consistent; everything else the clause did to the context is dropped.
-  @Requires(cmode >= 1 && cmode <= 2)
-  @Ensures(result.isOk() ==> this.ex.fx.cmode == old(this.ex.fx.cmode))
+  @Requires(isClauseMode(cmode))
+  @Ensures(result.isOk() ==> sameContractMode(this.ex.fx.cmode, old(this.ex.fx.cmode)))
   @Ensures(result.isOk() ==> this.ex.fx.locals.length == old(this.ex.fx.locals.length))
   @Ensures(result.isOk() ==> this.ex.fx.pre.length == old(this.ex.fx.pre.length))
   @Ensures(result.isOk() ==> this.ex.fx.scope.depth() == old(this.ex.fx.scope.depth()))
   @Ensures(this.ex.fx.env.funcs.length >= old(this.ex.fx.env.funcs.length))
-  clause(c: ContractClause, cmode: int): Result<Option<HExpr>, Diagnostic> {
+  clause(c: ContractClause, cmode: ContractMode): Result<Option<HExpr>, Diagnostic> {
     const none: Option<HExpr> = None;
     match (c.expr) {
       None => {
@@ -380,7 +383,7 @@ export class StmtChecker {
             ),
           );
         }
-        if (this.ex.fx.fmode == 1 || this.ex.fx.fmode == 3) {
+        if (isCtorMode(this.ex.fx.fmode) || isMutVoidMode(this.ex.fx.fmode)) {
           return Ok(StmtRes { stmt: HReturn(Some(this.ex.thisRead(span))), div: true });
         }
         return Ok(StmtRes { stmt: HReturn(None), div: true });
@@ -392,7 +395,7 @@ export class StmtChecker {
           );
         }
         const r = this.ex.expect(e, this.ex.fx.ret)?;
-        if (this.ex.fx.fmode == 4) {
+        if (isMutRetMode(this.ex.fx.fmode)) {
           const rid = match (this.ex.fx.lret) {
             TyRecord(x) => x,
             _ => 0,
@@ -700,13 +703,13 @@ export function checkBlock(fx: FnCtx, b: Block): Result<BlockOut, Diagnostic> {
 
 // Checks one contract clause of a function in (a fork of) the context `fx`; see `StmtChecker.clause`.
 // The context of the caller is not changed; the environment after the clause is returned.
-@Requires(cmode >= 1 && cmode <= 2)
+@Requires(isClauseMode(cmode))
 @Ensures(result.isOk() ==> result.unwrap().expr.isSome() == c.expr.isSome())
 @Ensures(result.isOk() ==> result.unwrap().env.funcs.length >= fx.env.funcs.length)
 export function checkClause(
   fx: FnCtx,
   c: ContractClause,
-  cmode: int,
+  cmode: ContractMode,
 ): Result<ClauseOut, Diagnostic> {
   let sc = new StmtChecker(new ExprChecker(fx, new StmtHost()));
   const x = sc.clause(c, cmode)?;

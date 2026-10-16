@@ -1,0 +1,891 @@
+// std:metacore -- the data model and the builders of std:meta (ADR-0046 §2, slice S3). Import `std:meta`, which
+// re-exports this module and the JSON codec of `std:metajson`.
+//
+// UNSTABLE until ADR-0046 is fully implemented (slices S4/S5 connect it to the compiler).
+//
+// Everything here is PURE: plain records and unions (values, no classes with identity, no grants, no I/O). A processor
+// (`@Processor(A) function p(input: Input): Output`) reads an `Input` and builds an `Output` out of the builders below.
+//
+//   * Input side: `Input` -> `MDeclView` (one per annotated declaration, in source order) -> `MFieldView`,
+//     `MMethodView`, `MVariant`, `MAnnotation`/`MArg`/`MConst`, `MContract`; types are `MType` trees; every named type
+//     that occurs is listed once in `Input.types` with its `MTypeShape`.
+//   * Output side: `Output` -> `MDecl` -> `MStmt` / `MExpr` / `MPattern` / `MType`, plus imports and diagnostics. A
+//     diagnostic points at the input with an `MRef` the processor copied from an input item, never a free position.
+//   * Hygiene: `fresh(name, n)` yields `__g<n>_<name>`; the counter is NOT global state. It is threaded by the caller:
+//     either pass your own `n`, or use a `NameGen` that starts at `Input.freshBase` (the compiler gives every
+//     processor run a distinct base, so two processors in one companion module never produce the same name).
+//
+// Complexity: every builder is O(1) in its arguments' size (it only wraps them); nothing here traverses a tree.
+
+// ---- shared pieces --------------------------------------------------------------------------------------------------
+
+// An opaque handle for an item of the input (declaration, field, method). Assigned by the compiler, unique within one
+// `Input`; a diagnostic carries one so that the compiler can point at the source span of the item.
+export type MRef = { id: int; };
+
+// A constant argument of an applied annotation. `MCFloat` keeps the source text of the literal (the JSON encoding is
+// integer only). `MCTag` is a variant name of a payload-free union. `MCNone`/`MCSome` are `Option` values.
+export type MConst =
+  MCBool(bool)
+  | MCInt(int)
+  | MCFloat(string)
+  | MCString(string)
+  | MCTag(string)
+  | MCArray(MConst[])
+  | MCNone
+  | MCSome(MConst);
+
+// A type. `MNamed("User", [])`, `MNamed("Pair", [a, b])`, `MArray(t)` is `t[]`, `MOption(t)` is `Option<t>`,
+// `MResult(t, e)` is `Result<t, e>`, `MFn(params, ret)` a function type, `MUnion(vs)` an anonymous union.
+export type MType =
+  MNamed(string, MType[])
+  | MArray(MType)
+  | MOption(MType)
+  | MResult(MType, MType)
+  | MFn(MType[], MType)
+  | MUnion(MVariant[]);
+
+// A union variant with its payload types (empty for a tag).
+export type MVariant = { name: string; payload: MType[]; };
+
+// A named, typed value: a parameter, a record field.
+export type MParam = { name: string; ty: MType; };
+
+// ---- input ----------------------------------------------------------------------------------------------------------
+
+// One argument of an applied annotation: the field name of the annotation record, and its constant. Omitted trailing
+// `Option` arguments are present as `MCNone`, so `args` always has one entry per annotation field, in field order.
+export type MArg = { name: string; value: MConst; };
+
+// An applied annotation: `source` is the module path that declares it ("std:json", "./route"), `name` its name.
+export type MAnnotation = { source: string; name: string; args: MArg[]; };
+
+export type MContractKind = MRequires | MEnsures | MInvariant | MDecreases | MRule;
+
+// A contract clause as read-only text (the expression exactly as the formatter prints it).
+export type MContract = { kind: MContractKind; text: string; };
+
+export type MDeclKind = MKRecord | MKUnion | MKAlias | MKClass | MKInterface | MKFunction | MKConst;
+
+export type MFieldView = {
+  ref: MRef;
+  name: string;
+  ty: MType;
+  exported: bool;
+  annotations: MAnnotation[];
+};
+
+export type MMethodView = {
+  ref: MRef;
+  name: string;
+  exported: bool;
+  typeParams: string[];
+  params: MParam[];
+  returns: MType;
+  doc: string;
+  annotations: MAnnotation[];
+  contracts: MContract[];
+};
+
+// An annotated declaration. Which members are filled depends on `kind`; the others are empty / None:
+//   MKRecord    fields                          MKUnion      variants
+//   MKAlias     ty = the aliased type           MKClass      fields, ctorParams, methods
+//   MKInterface methods                         MKFunction   params, ty = Some(return type), contracts
+//   MKConst     ty = Some(declared type)
+export type MDeclView = {
+  ref: MRef;
+  kind: MDeclKind;
+  name: string;
+  exported: bool;
+  typeParams: string[];
+  doc: string;
+  annotations: MAnnotation[];
+  contracts: MContract[];
+  fields: MFieldView[];
+  ctorParams: MParam[];
+  methods: MMethodView[];
+  variants: MVariant[];
+  params: MParam[];
+  ty: Option<MType>;
+};
+
+// The shape of a named type that occurs in the input and is visible from the source module.
+export type MShape = MSRecord(MFieldView[]) | MSUnion(MVariant[]) | MSAlias(MType) | MSOpaque;
+
+export type MTypeShape = { name: string; source: string; typeParams: string[]; shape: MShape; };
+
+// What a processor receives: the module it runs over, the annotation it was registered for, the annotated
+// declarations (source order), the named types they mention (first occurrence order), and the base of `NameGen`.
+export type Input = {
+  modulePath: string;
+  annotation: string;
+  freshBase: int;
+  decls: MDeclView[];
+  types: MTypeShape[];
+};
+
+// ---- output ---------------------------------------------------------------------------------------------------------
+
+export type MUnOp = OpNeg | OpNot | OpBitNot;
+export type MBinOp =
+  OpAdd
+  | OpSub
+  | OpMul
+  | OpDiv
+  | OpRem
+  | OpEq
+  | OpNe
+  | OpLt
+  | OpLe
+  | OpGt
+  | OpGe
+  | OpAnd
+  | OpOr
+  | OpBitAnd
+  | OpBitOr
+  | OpBitXor
+  | OpShl
+  | OpShr;
+
+// `Some(x)`, `Ok(v)`, `Err(e)`, `Get`, `None` are all `MPVariant` (no sub-patterns for a tag); `MPBind` binds a name;
+// `MPLit` matches a constant (int, string, bool).
+export type MPattern = MPWild | MPBind(string) | MPVariant(string, MPattern[]) | MPLit(MConst);
+
+export type MExpr =
+  MEInt(int)
+  | MEFloat(string)
+  | MEString(string)
+  | MEBool(bool)
+  | MEName(string)
+  | MECall(MExpr, MType[], MExpr[])
+  | MEMethod(MExpr, string, MExpr[])
+  | MEField(MExpr, string)
+  | MEIndex(MExpr, MExpr)
+  | MERecord(string, MFieldInit[])
+  | MEArray(MExpr[])
+  | MEUnary(MUnOp, MExpr)
+  | MEBinary(MBinOp, MExpr, MExpr)
+  | MEMatch(MExpr, MArm[])
+  | METry(MExpr)
+  | MECond(MExpr, MExpr, MExpr);
+
+export type MFieldInit = { name: string; value: MExpr; };
+
+// A `match` arm. In an expression (`MEMatch`) the arm yields `value` (required) after running `stmts`; in a statement
+// (`MSMatch`) `value` is None or an expression evaluated for effect.
+export type MArm = { pattern: MPattern; stmts: MStmt[]; value: Option<MExpr>; };
+
+export type MStmt =
+  MSConst(string, Option<MType>, MExpr)
+  | MSLet(string, Option<MType>, MExpr)
+  | MSAssign(MExpr, MExpr)
+  | MSReturn(Option<MExpr>)
+  | MSExpr(MExpr)
+  | MSIf(MExpr, MStmt[], MStmt[])
+  | MSWhile(MExpr, MStmt[])
+  | MSForOf(string, MExpr, MStmt[])
+  | MSMatch(MExpr, MArm[]);
+
+export type MFnDecl = {
+  name: string;
+  exported: bool;
+  typeParams: string[];
+  params: MParam[];
+  returns: MType;
+  body: MStmt[];
+  doc: string;
+};
+export type MConstDecl = { name: string; exported: bool; ty: MType; value: MExpr; doc: string; };
+export type MRecordDecl = {
+  name: string;
+  exported: bool;
+  typeParams: string[];
+  fields: MParam[];
+  doc: string;
+};
+export type MUnionDecl = {
+  name: string;
+  exported: bool;
+  typeParams: string[];
+  variants: MVariant[];
+  doc: string;
+};
+// Class fields are private unless `exported`. A class without `ctor` has none. Methods use `MFnDecl`: `exported` means
+// public; their `typeParams` are the method's own. No inheritance.
+export type MClassField = { name: string; ty: MType; exported: bool; };
+export type MCtorDecl = { params: MParam[]; body: MStmt[]; };
+export type MClassDecl = {
+  name: string;
+  exported: bool;
+  typeParams: string[];
+  fields: MClassField[];
+  ctor: Option<MCtorDecl>;
+  methods: MFnDecl[];
+  doc: string;
+};
+
+export type MDecl =
+  MDFn(MFnDecl)
+  | MDConst(MConstDecl)
+  | MDRecord(MRecordDecl)
+  | MDUnion(MUnionDecl)
+  | MDClass(MClassDecl);
+
+// `import { names } from "source"` needed by the generated code.
+export type MImport = { names: string[]; source: string; };
+
+export type MSeverity = MError | MWarning;
+
+// `at` is a ref copied from an input item; the compiler turns it into the span of that item.
+export type MDiagnostic = { severity: MSeverity; message: string; at: MRef; };
+
+export type Output = { imports: MImport[]; decls: MDecl[]; diagnostics: MDiagnostic[]; };
+
+// ---- hygiene --------------------------------------------------------------------------------------------------------
+
+// fresh(name: string, n: int): string -- "__g<n>_<name>". Pure: the same (name, n) always gives the same string, and
+// different `n` give different strings. `name` must be an identifier (not checked). Identifiers that start with
+// "__g" are reserved for generated code. O(len).
+export function fresh(name: string, n: int): string {
+  return "__g" + n.toString() + "_" + name;
+}
+
+// A counter threaded through a processor: `let g = nameGen(input.freshBase); const t = g.fresh("tmp");`. Every call
+// of `fresh` returns a new name (`__g<base>_x`, `__g<base+1>_x`, ...). The state is local to the value you create, and
+// so is deterministic for a deterministic processor; there is no global counter.
+export class NameGen {
+  private next: int;
+
+  constructor(start: int) {
+    this.next = start;
+  }
+
+  fresh(name: string): string {
+    const n = this.next;
+    this.next = n + 1;
+    return fresh(name, n);
+  }
+
+  // The next number that `fresh` will use (to continue a counter elsewhere).
+  peek(): int {
+    return this.next;
+  }
+}
+
+export function nameGen(start: int): NameGen {
+  return new NameGen(start);
+}
+
+// ---- input helpers --------------------------------------------------------------------------------------------------
+
+// ref(id: int): MRef
+export function ref(id: int): MRef {
+  return MRef { id: id };
+}
+
+// annotationArg(a: MAnnotation, name: string): Option<MConst> -- the argument named `name` (the LAST if repeated). O(args).
+export function annotationArg(a: MAnnotation, name: string): Option<MConst> {
+  let i = a.args.length;
+  while (i > 0) {
+    i -= 1;
+    if (a.args[i].name == name) {
+      return Some(a.args[i].value);
+    }
+  }
+  return None;
+}
+
+// findAnnotation(as: MAnnotation[], name: string): Option<MAnnotation> -- the first annotation called `name`. O(n).
+export function findAnnotation(list: MAnnotation[], name: string): Option<MAnnotation> {
+  for (const a of list) {
+    if (a.name == name) {
+      return Some(a);
+    }
+  }
+  return None;
+}
+
+// constString(c: MConst): Option<string> / constInt / constBool: the payload when the constant has that kind.
+export function constString(c: MConst): Option<string> {
+  return match (c) {
+    MCString(s) => Some(s),
+    _ => None,
+  };
+}
+
+export function constInt(c: MConst): Option<int> {
+  return match (c) {
+    MCInt(n) => Some(n),
+    _ => None,
+  };
+}
+
+export function constBool(c: MConst): Option<bool> {
+  return match (c) {
+    MCBool(b) => Some(b),
+    _ => None,
+  };
+}
+
+// emptyInput(modulePath, annotation): an Input without declarations (for tests and tools).
+export function emptyInput(modulePath: string, annotation: string): Input {
+  return Input {
+    modulePath: modulePath,
+    annotation: annotation,
+    freshBase: 0,
+    decls: [],
+    types: [],
+  };
+}
+
+// ---- type builders --------------------------------------------------------------------------------------------------
+
+export function named(name: string): MType {
+  return MNamed(name, []);
+}
+
+export function generic(name: string, args: MType[]): MType {
+  return MNamed(name, args);
+}
+
+export function arrayOf(t: MType): MType {
+  return MArray(t);
+}
+
+export function optionOf(t: MType): MType {
+  return MOption(t);
+}
+
+export function resultOf(ok: MType, err: MType): MType {
+  return MResult(ok, err);
+}
+
+export function fnOf(params: MType[], returns: MType): MType {
+  return MFn(params, returns);
+}
+
+export function unionOf(variants: MVariant[]): MType {
+  return MUnion(variants);
+}
+
+export function variant(name: string, payload: MType[]): MVariant {
+  return MVariant { name: name, payload: payload };
+}
+
+export function param(name: string, ty: MType): MParam {
+  return MParam { name: name, ty: ty };
+}
+
+// ---- constants and patterns -----------------------------------------------------------------------------------------
+
+export function cInt(n: int): MConst {
+  return MCInt(n);
+}
+
+export function cStr(s: string): MConst {
+  return MCString(s);
+}
+
+export function cBool(b: bool): MConst {
+  return MCBool(b);
+}
+
+export function pWild(): MPattern {
+  return MPWild;
+}
+
+export function pBind(name: string): MPattern {
+  return MPBind(name);
+}
+
+export function pVariant(name: string, subs: MPattern[]): MPattern {
+  return MPVariant(name, subs);
+}
+
+export function pLit(c: MConst): MPattern {
+  return MPLit(c);
+}
+
+// ---- expression builders --------------------------------------------------------------------------------------------
+
+export function intLit(n: int): MExpr {
+  return MEInt(n);
+}
+
+export function floatLit(text: string): MExpr {
+  return MEFloat(text);
+}
+
+export function str(s: string): MExpr {
+  return MEString(s);
+}
+
+export function boolLit(b: bool): MExpr {
+  return MEBool(b);
+}
+
+export function name(n: string): MExpr {
+  return MEName(n);
+}
+
+// call("encodeUser", [x]) -- a call of a named function. callExpr calls any expression; callGeneric passes type arguments.
+export function call(fnName: string, args: MExpr[]): MExpr {
+  return MECall(MEName(fnName), [], args);
+}
+
+export function callExpr(callee: MExpr, args: MExpr[]): MExpr {
+  return MECall(callee, [], args);
+}
+
+export function callGeneric(fnName: string, typeArgs: MType[], args: MExpr[]): MExpr {
+  return MECall(MEName(fnName), typeArgs, args);
+}
+
+export function method(receiver: MExpr, methodName: string, args: MExpr[]): MExpr {
+  return MEMethod(receiver, methodName, args);
+}
+
+// dot(e, "name") -- field access `e.name`.
+export function dot(e: MExpr, fieldName: string): MExpr {
+  return MEField(e, fieldName);
+}
+
+export function index(e: MExpr, i: MExpr): MExpr {
+  return MEIndex(e, i);
+}
+
+export function initField(fieldName: string, value: MExpr): MFieldInit {
+  return MFieldInit { name: fieldName, value: value };
+}
+
+// record("User", [initField("id", x)]) -- the record literal `User { id: x }`.
+export function record(typeName: string, inits: MFieldInit[]): MExpr {
+  return MERecord(typeName, inits);
+}
+
+export function arrayLit(items: MExpr[]): MExpr {
+  return MEArray(items);
+}
+
+export function unary(op: MUnOp, e: MExpr): MExpr {
+  return MEUnary(op, e);
+}
+
+export function binary(op: MBinOp, a: MExpr, b: MExpr): MExpr {
+  return MEBinary(op, a, b);
+}
+
+export function neg(e: MExpr): MExpr {
+  return MEUnary(OpNeg, e);
+}
+
+export function not(e: MExpr): MExpr {
+  return MEUnary(OpNot, e);
+}
+
+export function add(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpAdd, a, b);
+}
+
+export function sub(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpSub, a, b);
+}
+
+export function mul(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpMul, a, b);
+}
+
+export function div(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpDiv, a, b);
+}
+
+export function rem(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpRem, a, b);
+}
+
+export function eq(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpEq, a, b);
+}
+
+export function ne(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpNe, a, b);
+}
+
+export function lt(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpLt, a, b);
+}
+
+export function le(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpLe, a, b);
+}
+
+export function gt(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpGt, a, b);
+}
+
+export function ge(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpGe, a, b);
+}
+
+export function andAlso(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpAnd, a, b);
+}
+
+export function orElse(a: MExpr, b: MExpr): MExpr {
+  return MEBinary(OpOr, a, b);
+}
+
+// tryOp(e) -- the postfix `e?`.
+export function tryOp(e: MExpr): MExpr {
+  return METry(e);
+}
+
+// cond(c, a, b) -- the conditional expression `c ? a : b`.
+export function cond(c: MExpr, a: MExpr, b: MExpr): MExpr {
+  return MECond(c, a, b);
+}
+
+// arm(p, v) -- `p => v`; armStmts(p, ss, v) -- `p => { ss; v }` (v may be None in a statement match).
+export function arm(pattern: MPattern, value: MExpr): MArm {
+  return MArm { pattern: pattern, stmts: [], value: Some(value) };
+}
+
+export function armStmts(pattern: MPattern, stmts: MStmt[], value: Option<MExpr>): MArm {
+  return MArm { pattern: pattern, stmts: stmts, value: value };
+}
+
+export function matchExpr(scrutinee: MExpr, arms: MArm[]): MExpr {
+  return MEMatch(scrutinee, arms);
+}
+
+// ---- statement builders ---------------------------------------------------------------------------------------------
+
+export function constS(n: string, value: MExpr): MStmt {
+  return MSConst(n, None, value);
+}
+
+export function constT(n: string, ty: MType, value: MExpr): MStmt {
+  return MSConst(n, Some(ty), value);
+}
+
+export function letS(n: string, value: MExpr): MStmt {
+  return MSLet(n, None, value);
+}
+
+export function letT(n: string, ty: MType, value: MExpr): MStmt {
+  return MSLet(n, Some(ty), value);
+}
+
+export function assign(target: MExpr, value: MExpr): MStmt {
+  return MSAssign(target, value);
+}
+
+export function ret(value: MExpr): MStmt {
+  return MSReturn(Some(value));
+}
+
+export function retVoid(): MStmt {
+  return MSReturn(None);
+}
+
+export function exprS(e: MExpr): MStmt {
+  return MSExpr(e);
+}
+
+export function ifS(c: MExpr, thenBody: MStmt[], elseBody: MStmt[]): MStmt {
+  return MSIf(c, thenBody, elseBody);
+}
+
+export function whileS(c: MExpr, body: MStmt[]): MStmt {
+  return MSWhile(c, body);
+}
+
+export function forOf(varName: string, iterable: MExpr, body: MStmt[]): MStmt {
+  return MSForOf(varName, iterable, body);
+}
+
+export function matchS(scrutinee: MExpr, arms: MArm[]): MStmt {
+  return MSMatch(scrutinee, arms);
+}
+
+// ---- declaration builders -------------------------------------------------------------------------------------------
+
+// fn("encodeUser", [param("u", named("User"))], named("Json"), [ret(call("x", [...]))]) -- a private, non-generic
+// function without a doc comment. Change it with exportDecl / withTypeParams / withDoc.
+export function fn(fnName: string, params: MParam[], returns: MType, body: MStmt[]): MDecl {
+  return MDFn(MFnDecl {
+    name: fnName,
+    exported: false,
+    typeParams: [],
+    params: params,
+    returns: returns,
+    body: body,
+    doc: "",
+  });
+}
+
+export function constant(n: string, ty: MType, value: MExpr): MDecl {
+  return MDConst(MConstDecl { name: n, exported: false, ty: ty, value: value, doc: "" });
+}
+
+export function recordType(n: string, fields: MParam[]): MDecl {
+  return MDRecord(MRecordDecl {
+    name: n,
+    exported: false,
+    typeParams: [],
+    fields: fields,
+    doc: "",
+  });
+}
+
+export function unionType(n: string, variants: MVariant[]): MDecl {
+  return MDUnion(MUnionDecl {
+    name: n,
+    exported: false,
+    typeParams: [],
+    variants: variants,
+    doc: "",
+  });
+}
+
+export function classField(n: string, ty: MType, isExported: bool): MClassField {
+  return MClassField { name: n, ty: ty, exported: isExported };
+}
+
+export function ctor(params: MParam[], body: MStmt[]): MCtorDecl {
+  return MCtorDecl { params: params, body: body };
+}
+
+// methodDecl: an `MFnDecl` for a class method (public when `isExported`).
+export function methodDecl(
+  n: string,
+  isExported: bool,
+  params: MParam[],
+  returns: MType,
+  body: MStmt[],
+): MFnDecl {
+  return MFnDecl {
+    name: n,
+    exported: isExported,
+    typeParams: [],
+    params: params,
+    returns: returns,
+    body: body,
+    doc: "",
+  };
+}
+
+export function classType(
+  n: string,
+  fields: MClassField[],
+  ctorDecl: Option<MCtorDecl>,
+  methods: MFnDecl[],
+): MDecl {
+  return MDClass(MClassDecl {
+    name: n,
+    exported: false,
+    typeParams: [],
+    fields: fields,
+    ctor: ctorDecl,
+    methods: methods,
+    doc: "",
+  });
+}
+
+// declName(d) -- the name of any declaration.
+export function declName(d: MDecl): string {
+  return match (d) {
+    MDFn(f) => f.name,
+    MDConst(c) => c.name,
+    MDRecord(r) => r.name,
+    MDUnion(u) => u.name,
+    MDClass(c) => c.name,
+  };
+}
+
+// declExported(d) -- the export flag of any declaration.
+export function declExported(d: MDecl): bool {
+  return match (d) {
+    MDFn(f) => f.exported,
+    MDConst(c) => c.exported,
+    MDRecord(r) => r.exported,
+    MDUnion(u) => u.exported,
+    MDClass(c) => c.exported,
+  };
+}
+
+// exportDecl(d, flag) -- `decl.exported(flag)` of ADR-0046: the same declaration with the export flag set. Exported
+// names are public and are checked for collisions (E0449); helper names should stay private.
+export function exportDecl(d: MDecl, flag: bool): MDecl {
+  return match (d) {
+    MDFn(f) => MDFn(MFnDecl {
+      name: f.name,
+      exported: flag,
+      typeParams: f.typeParams,
+      params: f.params,
+      returns: f.returns,
+      body: f.body,
+      doc: f.doc,
+    }),
+    MDConst(c) => MDConst(MConstDecl {
+      name: c.name,
+      exported: flag,
+      ty: c.ty,
+      value: c.value,
+      doc: c.doc,
+    }),
+    MDRecord(r) => MDRecord(MRecordDecl {
+      name: r.name,
+      exported: flag,
+      typeParams: r.typeParams,
+      fields: r.fields,
+      doc: r.doc,
+    }),
+    MDUnion(u) => MDUnion(MUnionDecl {
+      name: u.name,
+      exported: flag,
+      typeParams: u.typeParams,
+      variants: u.variants,
+      doc: u.doc,
+    }),
+    MDClass(c) => MDClass(MClassDecl {
+      name: c.name,
+      exported: flag,
+      typeParams: c.typeParams,
+      fields: c.fields,
+      ctor: c.ctor,
+      methods: c.methods,
+      doc: c.doc,
+    }),
+  };
+}
+
+// withTypeParams(d, ps) -- the declaration with type parameters `ps` (a constant has none: returned unchanged).
+export function withTypeParams(d: MDecl, ps: string[]): MDecl {
+  return match (d) {
+    MDFn(f) => MDFn(MFnDecl {
+      name: f.name,
+      exported: f.exported,
+      typeParams: ps,
+      params: f.params,
+      returns: f.returns,
+      body: f.body,
+      doc: f.doc,
+    }),
+    MDConst(c) => MDConst(c),
+    MDRecord(r) => MDRecord(MRecordDecl {
+      name: r.name,
+      exported: r.exported,
+      typeParams: ps,
+      fields: r.fields,
+      doc: r.doc,
+    }),
+    MDUnion(u) => MDUnion(MUnionDecl {
+      name: u.name,
+      exported: u.exported,
+      typeParams: ps,
+      variants: u.variants,
+      doc: u.doc,
+    }),
+    MDClass(c) => MDClass(MClassDecl {
+      name: c.name,
+      exported: c.exported,
+      typeParams: ps,
+      fields: c.fields,
+      ctor: c.ctor,
+      methods: c.methods,
+      doc: c.doc,
+    }),
+  };
+}
+
+// withDoc(d, text) -- the declaration with a doc comment (printed as `//` lines above it).
+export function withDoc(d: MDecl, text: string): MDecl {
+  return match (d) {
+    MDFn(f) => MDFn(MFnDecl {
+      name: f.name,
+      exported: f.exported,
+      typeParams: f.typeParams,
+      params: f.params,
+      returns: f.returns,
+      body: f.body,
+      doc: text,
+    }),
+    MDConst(c) => MDConst(MConstDecl {
+      name: c.name,
+      exported: c.exported,
+      ty: c.ty,
+      value: c.value,
+      doc: text,
+    }),
+    MDRecord(r) => MDRecord(MRecordDecl {
+      name: r.name,
+      exported: r.exported,
+      typeParams: r.typeParams,
+      fields: r.fields,
+      doc: text,
+    }),
+    MDUnion(u) => MDUnion(MUnionDecl {
+      name: u.name,
+      exported: u.exported,
+      typeParams: u.typeParams,
+      variants: u.variants,
+      doc: text,
+    }),
+    MDClass(c) => MDClass(MClassDecl {
+      name: c.name,
+      exported: c.exported,
+      typeParams: c.typeParams,
+      fields: c.fields,
+      ctor: c.ctor,
+      methods: c.methods,
+      doc: text,
+    }),
+  };
+}
+
+// ---- output builders ------------------------------------------------------------------------------------------------
+
+export function importFrom(names: string[], source: string): MImport {
+  return MImport { names: names, source: source };
+}
+
+export function diagError(at: MRef, message: string): MDiagnostic {
+  return MDiagnostic { severity: MError, message: message, at: at };
+}
+
+export function diagWarning(at: MRef, message: string): MDiagnostic {
+  return MDiagnostic { severity: MWarning, message: message, at: at };
+}
+
+export function emptyOutput(): Output {
+  return Output { imports: [], decls: [], diagnostics: [] };
+}
+
+// output(decls) -- an Output with these declarations and nothing else.
+export function output(decls: MDecl[]): Output {
+  return Output { imports: [], decls: decls, diagnostics: [] };
+}
+
+// withImports / withDiagnostics -- the same Output with the lists replaced.
+export function withImports(o: Output, imports: MImport[]): Output {
+  return Output { imports: imports, decls: o.decls, diagnostics: o.diagnostics };
+}
+
+export function withDiagnostics(o: Output, diagnostics: MDiagnostic[]): Output {
+  return Output { imports: o.imports, decls: o.decls, diagnostics: diagnostics };
+}
+
+// hasErrors(o) -- true when some diagnostic is an error (the compiler then discards the declarations). O(diagnostics).
+export function hasErrors(o: Output): bool {
+  for (const d of o.diagnostics) {
+    const isErr = match (d.severity) {
+      MError => true,
+      MWarning => false,
+    };
+    if (isErr) {
+      return true;
+    }
+  }
+  return false;
+}

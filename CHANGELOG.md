@@ -7,6 +7,12 @@
   package's `@Test` unit tests). Parallelism is `std:task`, deadlines are native (`shellTimeout`). Parity was checked against the scripts on one
   commit for every CI matrix target and `mutate_ox` (identical mutant counts and killed/survived results). A change under
   `tooling/mutation/` (or `tools/mutation.sh`) now selects every std mutant job in `tools/ci_changes.py`.
+- **Explorer business view (ADR-0051).** `tooling/explorer` adds, first in its navigation, pages for product owners and business people: a summary, use cases (entry points with their documentation, the rules they rely on and what they may touch), business rules (every `@Requires` / `@Ensures` / `@Invariant` as a sentence, grouped by module, with proved / checked at run time / open / unknown status; OSIG does not carry the status yet, so it reads Unknown unless a node has the optional `assurance` field), capabilities in plain words ("may read the clock") per use case and package, and with `--diff` a page of behaviour changes ("New rule: ...", "Use case X may now ...", a rename is one line). No compiler change; new `business*.or` files, `theme/business.css`, tests in `tests/business_test.or`.
+- **`--release` defaults to the LLVM backend (ADR-0038 section 8, owner's decision).** `orin build|run|test --release` now compiles with
+  LLVM; `--backend=c` is the explicit fallback and dev builds stay on C. Without the pinned toolchain the default release build uses
+  a system `clang` whose major version is at least the pin's and otherwise falls back to C with one note; a `CC` that is not clang
+  keeps C. Both backends run the same MIR optimiser and compile at `-O2`. `tools/test_cli.py` covers default, fallback, `--backend=c`
+  and `CC` precedence.
 - **Pinned LLVM toolchain (ADR-0038 section 8, gate 3).** New `orin toolchain install [--force]` / `status` (in `dist/orin`, wired
   into `dist/orin-cli.sh`): it downloads the LLVM release pinned in `dist/llvm.pin` (19.1.7; linux-x86_64, linux-aarch64,
   macos-arm64), refuses the archive unless its sha256 matches the pin, unpacks `clang`, `llc` and clang's resource directory (about

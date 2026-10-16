@@ -24,6 +24,7 @@ API table (`compiler/mcp/apitable.or`).
 | `std:text` | Orin, `library/std/text.or` | `trimBlankLines`, `dedent` (common indentation *prefix*, as Python's `textwrap.dedent`), `indentLines`, `normalizeNewlines`, `isBlankLine`, `leadingIndent`: pure byte-oriented text layout for diagnostics, documentation and CLIs (UTF-8 bytes are preserved; code points belong to `std:utf8`) |
 | `std:html` | Orin, `library/std/html.or` | `Html` (`@Sealed`), `escape`, `safeUrl`, `escapeUrl`, `joinAll`, `trustHtml`, `text`, `fragment`, `render`, `document`: HTML escaping and the URL-scheme rule; the OX provider `ox()` (`import ox from "std:html";`, ADR-0044); below, "std:html" |
 | `std:ox` | Orin, `library/std/ox.or` (types only) | `Markup<R>`, `Components<R>`, `AttrRule`, `Escape`: the protocol an OX provider's `ox()` returns (ADR-0044, docs/ox.md); below, "std:ox" |
+| `std:meta` | Orin, `library/std/meta.or` (re-exports `metacore.or`, `metajson.or`) | **unstable, ADR-0046 slice S3:** the pure processor interface: `Input` (annotated declarations, types, constants), the `Output` builder tree (`MDecl`/`MStmt`/`MExpr`/`MType`), `fresh`/`NameGen` hygiene and the stable JSON encoding of both; not yet called by the compiler; [API](std-meta.md) |
 | `std:taskcore` | Orin, `library/std/taskcore.or` | the pure bookkeeping of `std:task` (`Ring` = one channel buffer, `Ledger` = one scope's task table), invariants and contracts, tested and mutated without threads; import `std:task` |
 | `std:task` | Orin, `library/std/task.or` over L0 thread / monitor primitives and a small temporary C interface (`std:fsraw`, internal) | **stage 0, unstable** (ADR-0017 Addendum A): `scope`, `spawn`, `TaskHandle.join`, bounded channels, grant delegation, `parallelMap`, the work-stealing fork/join pool `forkJoin` / `forkJoinUntil` / `parallelism`; see docs/concurrency.md |
 | `parallel()` on arrays | Orin prelude (`library/collections/parallel.or`, loaded only for a file that calls it) over `std:task`'s pool | parallel array pipelines (ADR-0039): `map`, `filter`, `reduce`, `some`, `every`, `find`, `findIndex`, `toArray`; below, "Parallel pipelines" |
@@ -37,7 +38,7 @@ API table (`compiler/mcp/apitable.or`).
 `compiler/loader/embedded_stdlib.or`; run it after editing `library/std/`, `tools/bootstrap.sh` checks it).
 It is a *library root* (`PreludeRoot` with an empty `entry`): its files are served from memory under
 `$stdlib/<name>.or` but, unlike `library/core/` and `library/collections/`, **not** imported implicitly. The loader maps
-`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`) to the unit `$stdlib/path`.
+`import ... from "std:path"` (also `std:json`, `std:time`, `std:graph`, `std:test`, `std:bytes`, `std:utf8`, `std:url`, `std:collections`, `std:http`, `std:seq`, `std:net`, `std:text`, `std:html`, `std:meta`) to the unit `$stdlib/path`.
 Programs that do not import a module pay nothing for it, and the leading `$` makes unused functions of
 imported modules disappear in `compiler/opt/prune.or`. The sources use the full language (generics,
 records, closures); only the compiler itself has to stay Orin-B. Type names in diagnostics show the

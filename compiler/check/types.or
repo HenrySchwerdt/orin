@@ -18,7 +18,8 @@ import { hasResource, resourceNested } from "./resources";
 import {
   Env, FuncInfo, Inst, EntRecord, EntUnion, EntAlias, EntGen, EntIface, EntBuiltin, findType,
   findInst, originOf, isVoid, tysKey, mapGenType, isMapKeyType, showType, addBound, boundOf,
-  isWellFormedEnv, typeEq, typeInRange, typesInRange,
+  isWellFormedEnv, typeEq, typeInRange, typesInRange, InstKind, IkRecord, IkUnion, IkFunction,
+  isOrdinaryMode, isCtorMode, isMutVoidMode, isMutRetMode,
 } from "./env";
 
 export const CYCLE_MSG: string = "type alias is defined in terms of itself";
@@ -440,7 +441,7 @@ export function instType(
     DRecord(_) => true,
     _ => false,
   };
-  const kind: int = isRec ? 0 : 1;
+  const kind: InstKind = isRec ? IkRecord : IkUnion;
   const old = findInst(env, kind, g, args);
   if (old.isSome()) {
     const i = old.unwrap();
@@ -469,7 +470,7 @@ export function instType(
       const id = e.records.length;
       const none: FieldDef[] = [];
       e.records.push(RecordDef { name: name, fields: none });
-      e.insts.add(Inst { kind: 0, gid: g, args: args, id: id, depth: depth });
+      e.insts.add(Inst { kind: IkRecord, gid: g, args: args, id: id, depth: depth });
       let out: FieldDef[] = [];
       for (const f of fields) {
         for (const o of out) {
@@ -488,7 +489,7 @@ export function instType(
       const id = e.unions.length;
       const none: VariantDef[] = [];
       e.unions.push(UnionDef { name: name, variants: none });
-      e.insts.add(Inst { kind: 1, gid: g, args: args, id: id, depth: depth });
+      e.insts.add(Inst { kind: IkUnion, gid: g, args: args, id: id, depth: depth });
       let out: VariantDef[] = [];
       for (const v of vs) {
         let payload: Type[] = [];
@@ -634,7 +635,7 @@ export function instFunc(
   if (redirect.isSome()) {
     return Ok(FuncOut { env: env, fid: redirect.unwrap() });
   }
-  const old = findInst(env, 2, g, args);
+  const old = findInst(env, IkFunction, g, args);
   if (old.isSome()) {
     return Ok(FuncOut { env: env, fid: old.unwrap().id });
   }
@@ -649,16 +650,16 @@ export function instFunc(
   const id = e.funcs.length;
   const qname = `${gf.qname}<${tysKey(env, args)}>`;
   // The constructor and instance methods of a generic class (ADR-0026) are lowered like those of an
-  // ordinary class (ADR-0009): mode 1 constructor, 2 non-mutating method, 3 mutating method returning
-  // the updated receiver, 4 mutating method with a result (a `$ret` record per instance).
+  // ordinary class (ADR-0009): FmCtor constructor, FmMethod non-mutating method, FmMutVoid mutating method
+  // returning the updated receiver, FmMutRet mutating method with a result (a `$ret` record per instance).
   let ret = sig.ret;
   let srcRet: Type = TyVoid;
-  if (gf.mode != 0 && gf.mode != 1) {
+  if (!isOrdinaryMode(gf.mode) && !isCtorMode(gf.mode)) {
     srcRet = sig.ret;
   }
-  if (gf.mode == 3) {
+  if (isMutVoidMode(gf.mode)) {
     ret = sig.params[0];
-  } else if (gf.mode == 4) {
+  } else if (isMutRetMode(gf.mode)) {
     const rid = e.records.length;
     const fields: FieldDef[] = [
       FieldDef { name: "self", ty: sig.params[0] },
@@ -681,7 +682,7 @@ export function instFunc(
     cls: gf.cls,
     srcRet: srcRet,
   });
-  e.insts.add(Inst { kind: 2, gid: g, args: args, id: id, depth: depth });
+  e.insts.add(Inst { kind: IkFunction, gid: g, args: args, id: id, depth: depth });
   return Ok(FuncOut { env: e, fid: id });
 }
 
