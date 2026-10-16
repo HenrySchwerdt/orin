@@ -2,7 +2,7 @@
 // Part of the semantic index (check/index/build.or).
 
 import {
-  Ident, FunctionDecl, TypeDecl, TypeExpr, Block, Stmt, Expr, FieldInit, MatchArm, Pattern, oxExprs, oxComponents
+  Ident, Item, Annotation, FunctionDecl, TypeDecl, TypeExpr, Block, Stmt, Expr, FieldInit, MatchArm, Pattern, oxExprs, oxComponents
 } from "../../syntax";
 import { Type, Local, Function, SkRecord, SkLocal, SkParam } from "../../hir";
 import {
@@ -451,5 +451,99 @@ export function walkTypeDecl(w: W, c: Ctx, t: TypeDecl): W {
   }
   const none: string[] = [];
   x.tps = none;
+  return x;
+}
+
+// ---- user annotation uses (ADR-0046 S2) ------------------------------------------------------------------
+
+// An argument of a user annotation: only a module constant (or a union tag of the field) can be a name; those that
+// resolve to a constant of the module are references, the rest are literals.
+export function annoArgRefs(w: W, c: Ctx, e: Expr): W {
+  let x = w;
+  match (e.kind) {
+    EIdent(id) => {
+      const d = lookupVal(x, c, id.name);
+      if (d.isSome()) {
+        x = addRef(x, id.span, d.unwrap());
+      }
+    },
+    EUnary(_, a) => { x = annoArgRefs(x, c, a); },
+    EArray(xs) => {
+      for (const a of xs) {
+        x = annoArgRefs(x, c, a);
+      }
+    },
+    ECall(_, as) => {
+      for (const a of as) {
+        x = annoArgRefs(x, c, a);
+      }
+    },
+    _ => {}
+  }
+  return x;
+}
+
+// Each `@Name(..)` use is a reference to the `@Annotation` record `Name` (go to definition, find references, rename).
+function annoRefs(w: W, c: Ctx, as: Annotation[]): W {
+  let x = w;
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        const td = lookupType(x, c, id.name);
+        if (td.isSome()) {
+          x = addRef(x, id.span, td.unwrap());
+          let k: usize = 0;
+          while (k < x.annos.length) {
+            if (x.annos[k].nameSpan.file == id.span.file && x.annos[k].nameSpan.start == id.span.start) {
+              x.annos[k].def = Some(td.unwrap());
+            }
+            k += 1;
+          }
+        }
+        for (const e of args) {
+          x = annoArgRefs(x, c, e);
+        }
+      },
+      _ => {}
+    }
+  }
+  return x;
+}
+
+// The annotation uses of one top-level item and of its members.
+export function itemAnnoRefs(w: W, c: Ctx, item: Item): W {
+  let x = w;
+  match (item) {
+    IFunction(f) => { x = annoRefs(x, c, f.annotations); },
+    IConst(k) => { x = annoRefs(x, c, k.annotations); },
+    IType(t) => {
+      x = annoRefs(x, c, t.annotations);
+      match (t.body) {
+        DRecord(fs) => {
+          for (const f of fs) {
+            x = annoRefs(x, c, f.annotations);
+          }
+        },
+        _ => {}
+      }
+    },
+    IInterface(k) => {
+      x = annoRefs(x, c, k.annotations);
+      for (const m of k.methods) {
+        x = annoRefs(x, c, m.annotations);
+      }
+    },
+    IClass(cd) => {
+      x = annoRefs(x, c, cd.annotations);
+      for (const m of cd.members) {
+        match (m) {
+          MField(f) => { x = annoRefs(x, c, f.annotations); },
+          MMethod(md) => { x = annoRefs(x, c, md.annotations); },
+          _ => {}
+        }
+      }
+    },
+    _ => {}
+  }
   return x;
 }
