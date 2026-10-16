@@ -122,3 +122,73 @@ cancellation, that a trapped task frees its heap.
 
 **Bootstrap.** The runtime ABI only gained functions and thread-local qualifiers; generated code of the previous seed links
 against the new runtime unchanged, so no seed bridge was needed (the compiler source uses no feature newer than the seed).
+
+## Addendum B: structured cancellation and outcomes (Gate 1, C0) (2026-10-16)
+
+Status: accepted per [roadmap](../roadmaps/orin-1.0.md) default D1 = option B (owner default 2026-10-16; Henry can still
+overturn it). This addendum fixes the semantics; C0 implements only the pure state machines (`std:taskcore`: `CancelState`,
+`CancelScope`, `TaskCell` and the functions around them); blocking behaviour lands in C1-C3. Related: ADR-0054 (the L0 budget that
+C1/C3 need), ADR-0048 (naming), [async-concurrency roadmap](../roadmaps/async-concurrency.md).
+
+**No new syntax.** No `async`/`await`, no new keywords or operators, no new checker rules. Cancellation, deadlines, `select` and
+`sleep` are library functions of `std:task`; the API stays blocking on OS threads and a later M:N scheduler sits behind it unchanged.
+
+**1. Cancellation tree.** Every scope owns a cancellation token; a task's token is a child of its scope's token, a nested scope's
+token a child of the enclosing task's token. Cancellation flows only downward: cancelling a token cancels all descendants, never
+an ancestor. A token holds one *cause*, set once and never replaced (first cause wins): `Cancelled` (explicit `cancel()`, an
+ancestor, or a trapped sibling) or `Deadline`. When a task traps, its scope is cancelled with cause `Cancelled`: the siblings stop
+at their next checkpoint, the scope waits for all of them (structured: no task outlives its scope) and then traps, as stage 0 already does
+for a panic. This supersedes the stage-0 note "sibling cancellation is not implemented".
+
+**2. Task outcomes.** Every task ends with exactly one outcome, ordered by severity:
+`Completed < Closed < Cancelled < Deadline < Error`.
+
+| Outcome | Meaning |
+|---|---|
+| `Completed` | the body returned |
+| `Closed` | a blocking call stopped because the channel end it waited on was closed and drained |
+| `Cancelled` | it stopped at a checkpoint because its token's cause is `Cancelled` |
+| `Deadline` | it stopped at a checkpoint because its token's cause is `Deadline` |
+| `Error` | it trapped |
+
+A scope's outcome over its children is the most severe one (a join-semilattice: commutative, associative, idempotent).
+At a checkpoint the precedence is: the operation can complete (`Completed`), else closed (`Closed`), else the cause, else keep waiting;
+so a value already in a channel is never dropped by a cancellation that arrives at the same time.
+
+**3. Exactly-once result and token ownership.** A task's result slot is settled once (`settle`) and taken once (`take`); a second
+`join` of the same handle still traps (ADR-0017 Addendum A). The transfer token of the result (a move-or-copy token, ADR-0017) is
+owned by the slot until `take`, then by the joiner; a result that is never taken is released by the scope at its exit. A cancelled task
+that already produced a value still reports `Completed` with that value; cancellation never turns a produced result into `Cancelled`.
+
+**4. Cooperative checkpoints.** Cancellation is observed, never injected. A task observes its token at: `recv`, `send`,
+`join`, `sleep`, `select`, the net waits (`accept`, `connect`, `read`, `write`; C3), `yield`, and an explicit `checkIn()`/`isCancelled()`
+call that long computations may place themselves. Pure computation without those calls is not interrupted. After a checkpoint
+reports cancellation, the call returns its cancelled variant (`None`/`Err(Cancelled)`, per the API chosen in C1 under ADR-0048) and
+the task is expected to return; cleanup code runs normally (resources are released by their scopes, ADR-0016).
+
+**5. Absolute monotonic deadlines.** A deadline is an absolute `MonotonicInstant` (`std:time`, millisecond resolution, process-local),
+never a duration, so retries and nested waits cannot stretch it. A token's deadline can only move earlier (`min` with the parent's;
+none is the loosest), a timed wait computes `waitBudget(deadline, now)` once per wakeup, and an expired deadline (`now >= at`) sets the
+cause `Deadline` unless a cause is already set (a parent cancelled first wins). Additions saturate at the largest i64 instead of
+overflowing. The wait itself is the C1 timed monitor wait on `CLOCK_MONOTONIC`.
+
+**6. `select` and `sleep` (sketch, implemented in C1).**
+
+```ts
+import { scope, spawn, channel, select, sleep, withDeadline } from "std:task";
+
+scope(s => {
+  withDeadline(s, deadlineAfter(now, seconds(5)));   // narrows the scope token's deadline
+  match (select([rx1.arm(), rx2.arm(), timeout(d)])) {  // first ready arm; ties resolve in list order
+    Recv(0, v) => ..., Recv(1, v) => ..., TimedOut => ..., Cancelled => ..., Closed(i) => ...,
+  }
+  sleep(milliseconds(10));                           // a checkpoint that waits; wakes early on cancellation
+});
+```
+
+Shapes (names subject to the ADR-0048 review in C1): `recvTimeout(rx, d)`, `joinTimeout(h, d)`, `sleep(d)`,
+`select(arms)`, `cancel(scope)`, `isCancelled()`. All are ordinary functions over `Result`/`Option`/variants; none needs syntax.
+A `select` of several arms is one monitor wait on a shared wake word, not a poll loop.
+
+**7. What is not changed.** Isolation, move-or-copy transfer, non-atomic RC, bounded channels and 1:1 threads in stage 0 stay.
+A trap inside a task still never unwinds the process; it becomes the `Error` outcome of that task.

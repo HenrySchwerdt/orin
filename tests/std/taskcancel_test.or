@@ -1,0 +1,132 @@
+// Tests for the cancellation and outcome state machines of std:taskcore (ADR-0017 Addendum B, C0). Pure: no threads, no clock.
+import { assert, assertEqUsize, assertEqBool, assertEq } from "std:test";
+import {
+  CancelState, TaskCell, CancelScope, causeMerge, causeInherit, outcomeJoin, outcomeOfCause, checkpointOutcome,
+  deadlineMin, deadlineAfterMillis, deadlineExpired, waitBudget, isSettled,
+} from "std:taskcore";
+
+@Test
+function firstCauseWins(): void {
+  assertEqUsize(causeMerge(0, 1), 1, "set");
+  assertEqUsize(causeMerge(2, 1), 2, "deadline stays");
+  assertEqUsize(causeMerge(1, 2), 1, "cancel stays");
+  assertEqUsize(causeMerge(0, 0), 0, "live");
+  assertEqUsize(causeInherit(0, 2), 2, "child takes the parent's cause");
+  assertEqUsize(causeInherit(1, 2), 1, "child keeps its own");
+}
+
+@Test
+function outcomeJoinIsLattice(): void {
+  let a: usize = 1;
+  while (a <= 5) {
+    assertEqUsize(outcomeJoin(a, a), a, "idempotent");
+    let b: usize = 1;
+    while (b <= 5) {
+      assertEqUsize(outcomeJoin(a, b), outcomeJoin(b, a), "commutative");
+      let c: usize = 1;
+      while (c <= 5) {
+        assertEqUsize(outcomeJoin(outcomeJoin(a, b), c), outcomeJoin(a, outcomeJoin(b, c)), "associative");
+        c += 1;
+      }
+      b += 1;
+    }
+    a += 1;
+  }
+  assertEqUsize(outcomeJoin(1, 5), 5, "error dominates");
+  assertEqUsize(outcomeJoin(3, 4), 4, "deadline above cancelled");
+  assert(isSettled(3) && !isSettled(0) && !isSettled(6), "settled range");
+}
+
+@Test
+function checkpointPrecedence(): void {
+  assertEqUsize(checkpointOutcome(true, true, 1), 1, "a ready value is never dropped");
+  assertEqUsize(checkpointOutcome(false, true, 1), 2, "closed beats cancelled");
+  assertEqUsize(checkpointOutcome(false, false, 1), 3, "cancelled");
+  assertEqUsize(checkpointOutcome(false, false, 2), 4, "deadline");
+  assertEqUsize(checkpointOutcome(false, false, 0), 0, "keep waiting");
+  assertEqUsize(outcomeOfCause(1), 3, "cause to outcome");
+  assertEqUsize(outcomeOfCause(2), 4, "cause to outcome");
+}
+
+@Test
+function deadlineArithmetic(): void {
+  assertEq(deadlineMin(-1, -1), -1, "none");
+  assertEq(deadlineMin(-1, 7), 7, "none is loosest");
+  assertEq(deadlineMin(5, -1), 5, "none is loosest");
+  assertEq(deadlineMin(5, 7), 5, "tighter");
+  assertEq(deadlineAfterMillis(100, 50), 150, "sum");
+  assertEq(deadlineAfterMillis(9223372036854775800, 100), 9223372036854775807, "saturates");
+  assertEqBool(deadlineExpired(-1, 1000), false, "no deadline never expires");
+  assertEqBool(deadlineExpired(10, 9), false, "before");
+  assertEqBool(deadlineExpired(10, 10), true, "equality is expired");
+  assertEq(waitBudget(-1, 5), -1, "unlimited");
+  assertEq(waitBudget(10, 4), 6, "distance");
+  assertEq(waitBudget(10, 12), 0, "expired");
+}
+
+@Test
+function tokenTree(): void {
+  let parent = new CancelState(0, -1);
+  let child = new CancelState(0, -1);
+  assertEqBool(child.observe(parent.cause, 0), false, "live");
+  parent.cancel();
+  assertEqBool(child.observe(parent.cause, 0), true, "cancellation flows down");
+  assertEqUsize(child.cause, 1, "with the parent's cause");
+  child.cancel();
+  assertEqUsize(child.cause, 1, "idempotent");
+  assertEqBool(parent.observe(0, 0), true, "a child's state never flows up: parent stays as is");
+}
+
+@Test
+function tokenDeadline(): void {
+  let t = new CancelState(0, -1);
+  t.limit(100);
+  t.limit(200);
+  assertEq(t.deadline, 100, "only moves earlier");
+  assertEq(t.budget(40), 60, "budget");
+  assertEqBool(t.observe(0, 99), false, "not yet");
+  assertEqBool(t.observe(0, 100), true, "expired");
+  assertEqUsize(t.cause, 2, "deadline cause");
+  t.cancel();
+  assertEqUsize(t.cause, 2, "first cause wins");
+  assertEq(t.budget(0), 0, "a cancelled token waits no longer");
+  let u = new CancelState(0, 5);
+  assertEqBool(u.observe(1, 9), true, "parent cause wins over an expiring deadline");
+  assertEqUsize(u.cause, 1, "parent cause");
+}
+
+@Test
+function resultExactlyOnce(): void {
+  let c = new TaskCell();
+  assertEqBool(c.isDone(), false, "pending");
+  assertEqBool(c.canTake(), false, "nothing to take");
+  c.settle(1);
+  assertEqBool(c.canTake(), true, "settled");
+  assertEqUsize(c.take(), 1, "the outcome");
+  assertEqBool(c.canTake(), false, "taken exactly once");
+  assertEqBool(c.isDone(), true, "still done");
+}
+
+@Test
+function scopeTrapCancelsSiblings(): void {
+  let s = new CancelScope(0);
+  s.spawn();
+  s.spawn();
+  s.spawn();
+  assertEqUsize(s.running(), 3, "three running");
+  s.settle(1);
+  assertEqUsize(s.cause, 0, "a clean finish cancels nothing");
+  s.settle(5);
+  assertEqUsize(s.cause, 1, "a trap cancels the scope");
+  assertEqBool(s.isDone(), false, "one task left");
+  s.settle(3);
+  assertEqBool(s.isDone(), true, "all finished");
+  assertEqUsize(s.worst, 5, "the scope reports the trap");
+  let d = new CancelScope(0);
+  d.spawn();
+  d.cancel(2);
+  d.cancel(1);
+  assertEqUsize(d.cause, 2, "first cause wins in a scope");
+  d.settle(4);
+  assertEqUsize(d.worst, 4, "deadline outcome");
+}
