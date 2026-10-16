@@ -84,6 +84,19 @@ All stages share the CLI `<compiler> compile <entry.or> -o <out.c>` and the C ru
 Generated C must not contain timestamps, absolute paths or hash-order-dependent output.
 Stage equality is a consistency check, not a correctness proof (spec 09).
 
+## Split C (`--split N`)
+
+`orin compile x.or -o out.c --split N` writes `out.c` as usual (byte-identical to a run without the flag) and, next to it, the
+same program as `N + 1` translation units: `out.h` (prototypes, string and vtable declarations, the bodies of the `@Inline`
+functions, which stay `static inline` and are repeated in every unit), `out.0.c` .. `out.<N-1>.c` (the other functions, cut into
+runs of consecutive indices of about equal text length) and `out.data.c` (string literals, vtables, `main`). Non-inline
+functions already have external linkage and the unique symbol `orin_fn_<index>_<name>`; strings and vtables are defined once
+and exported. `tools/cc_split.sh out.c BIN [CFLAGS] [-- LDFLAGS]` compiles them (and the runtime) in parallel. `tools/bootstrap.sh`
+builds orin2 this way (`SPLIT=0` disables) and still compares the single-file `stage2.c == stage3.c`; the seed compiler does not
+know the flag, so stage 1 is one file until the seed is refreshed. `tools/test_split.sh [--self]` is the test. Not available with
+`--backend=llvm` or `--stats-sites`; an LLVM split would need one module per unit with `declare`s for every function, `external`
+string and vtable globals and a link step (`llvm-link` or `clang` on N `.ll` files).
+
 ## Stage 1 layout (`compiler/`)
 
 Each directory is a module (`module.or` = public API). Contracts written by the lead:
