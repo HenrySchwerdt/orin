@@ -104,7 +104,9 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    or a verified non-heap object; not built.
 3. **Performance, further ADR-0038 steps:** unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
-   bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
+   bintrees (f, deferred: measured 2026-10-16, free lists and iterative release already exist, regions would give about -50 %
+   on bintrees alone and nothing elsewhere; ADR-0038 addendum); packed arrays (b). Done on the way: small-block cache for
+   strings and array buffers, self-compile -4.9 %, wordfreq -13 %, mapfreq -9 %.
 4. **LLVM default for `--release`** (ADR-0038 §8). Gate 3 is met (2026-10-16: pinned LLVM 19.1.7, `dist/llvm.pin`,
    `orin toolchain install` verifies the sha256; `orin doctor` reports it; `--release --backend=llvm` without it falls back to C
    and says so). LLVM is not yet the release default: the decision is the owner's (`release_backend` in `dist/orin-cli.sh`).

@@ -782,6 +782,84 @@ call and two frees). The ratio to C falls from 4.7x to 2.4x. Retains / releases 
 Consequence for the ranking: the remaining class (c) in the compiler is real but worth about 0.5 % of its instructions, and
 needs either an inliner with scalar replacement of mutable objects or a verified non-heap object; neither is justified at that size.
 
+## Addendum (2026-10-16): bintrees regions, measured first (class (f)) and a small-block cache
+
+Question: is a region/arena for `bench/bintrees` (33.4M allocations, 49.6 % of the census, 26.7 % of its RC operations) worth
+building, or do cheaper runtime-only levers (a size-class free list in front of malloc, an iterative release) get most of it?
+Method: callgrind (`--tool=callgrind`, `-O2 -g`, runtime from `main` `d297509`) on the C-backend binaries, same inputs.
+
+### What the runtime already had
+
+Both runtime-only options exist since ADR-0017 stage 0, so there is no malloc to remove on bintrees:
+- **(a) size-class free lists:** per-thread lists for struct objects of 0..8 slots and for array headers (`fl_struct`, `fl_array`, cap
+  2^18 each; off under ASan or `-DORIN_NO_FREELIST`);
+- **(b) iterative release:** `orin_destroy` runs on an explicit work stack and cannot overflow the C stack on deep trees.
+
+### Profile of bintrees (6,198,920,279 instructions, 33.4M objects, 186 instructions per node built, checked and dropped)
+
+| where | instructions | share | per node |
+|---|---:|---:|---:|
+| `orin_destroy` (release of a whole tree) | 2,075,639,086 | 33.5 % | 62 |
+| `orin_struct_new` (free-list pop, header, slots) | 1,403,047,254 | 22.6 % | 42 |
+| `check` (generated code, incl. inlined shape checks) | 764,700,380 + 464,327,014 | 19.8 % | 37 |
+| `make` (generated code) | 662,525,360 + 115,103,084 | 12.5 % | 23 |
+| `orin_nullary` (the shared `Leaf`, acquire load per call) | 640,024,586 | 10.3 % | 19 |
+| malloc (`_int_malloc`, start-up only) | 36,446,150 | 0.6 % | 1 |
+| free | 0 | 0 % | 0 |
+
+Inside `orin_destroy` the per-child loop (refmask test, `rc > 0` test, decrement, push) is 1.30G of the 2.08G.
+
+### Ceilings
+
+| option | bintrees | other benchmarks and self-compile |
+|---|---|---|
+| (a) free list for struct objects | already built: malloc+free = 0.6 % left, ceiling 0 | none left for structs |
+| (b) iterative release | already built; tuning it is worth little. Two variants measured: bit-scan of `refmask` instead of the slot loop -1.1 % (6,132,108,519); in addition keeping the last dead child out of the work stack +1.1 % (worse, 6,265,732,079). Ceiling of the whole function if it cost nothing: -33 % | not a lever outside trees |
+| (c) real regions: bump allocation, no per-object release | upper bound about -50 % instructions (destroy 62 -> about 0, `struct_new` 42 -> about 10 per node; `Leaf`, `make` and `check` unchanged). Needs escape facts or a verifier rule for "nothing outside points in" (docs/tcb.md) and a new copy-out at the boundary | nil by the census: bintrees is 100 % of class (f) and no other workload has a tree built and dropped per scope. mapfreq / wordfreq / html / sortedmap / streams have no big structure graphs: their cost is strings, array buffers and lookups |
+
+So (a) and (b) cannot give the 5 % on bintrees (the best measured runtime-only change is -1.1 %), and (c) would give about half
+of bintrees and nothing else, for the largest change to the trusted base. Decision: **regions stay deferred** (as in the census,
+rank 6), and the bintrees lever is closed as "no cheap variant".
+
+### What the profile showed instead
+
+Strings and array item buffers were not covered by the free lists: they go straight to glibc, and the profiles of the string and
+map workloads carry 15-20 % of their instructions in `malloc`/`free`/`realloc` (wordfreq 18 %, mapfreq 15 %, html 15 %, the
+self-compile 9.7 %: `_int_malloc` 3.4 %, `_int_free` 2.1 %, `malloc` 1.4 %, `free` 0.8 %, `realloc` 0.8 %, `malloc_consolidate`
+0.7 %, `_int_realloc` 0.5 %; glibc's tcache holds only 7 blocks per size). Extending (a) to these buffers is the cheap,
+runtime-only lever that does reach the other benchmarks, so it was built.
+
+### Change: small-block cache for string objects and array item buffers
+
+`runtime/orin_runtime.c`: `sb_alloc` / `sb_free` / `sb_realloc` / `sb_drain`. Blocks of at most 256 bytes are allocated with their
+size rounded up to 16-byte classes and cached on a per-thread list per class (cap 2^15 blocks per class, beyond which a block
+goes back to the allocator). No header: the size is known at every free (strings `sizeof(OrinString) + cap + 1`, item buffers
+`cap * 8`), and a grow within one class does not move the block. Larger buffers keep `realloc`. Per thread like the object lists
+(a block is plain malloc memory, so a block freed on another thread just joins that thread's list), drained in
+`orin_rt_heap_exit`, compiled out with them under ASan and `-DORIN_NO_FREELIST`. Runtime only: no compiler, MIR or verifier
+change, no Lean change, same generated C (self-compile output identical, hash `b01183cb`).
+
+Measurement (valgrind instructions, same inputs, `main` `d297509` against this branch; peak RSS in KiB):
+
+| workload | instructions before | after | change | RSS before | after |
+|---|---:|---:|---:|---:|---:|
+| bintrees | 6,198,920,233 | 6,198,919,166 | 0 | 17,800 | 17,948 |
+| mapfreq | 1,171,658,908 | 1,060,960,418 | -9.4 % | 10,604 | 11,324 |
+| wordfreq | 878,433,734 | 764,400,650 | -13.0 % | 2,332 | 2,336 |
+| html | 1,900,805,542 | 1,834,311,062 | -3.5 % | 3,888 | 3,932 |
+| sortedmap | 1,387,524,604 | 1,361,887,373 | -1.8 % | 9,492 | 11,232 |
+| appends | 119,462,891 | 99,563,401 | -16.7 % | 4,616 | 4,620 |
+| strings | 694,105,349 | 647,452,075 | -6.7 % | 47,240 | 47,244 |
+| bytesstr | 507,095,151 | 507,227,227 | +0.03 % | 11,784 | 11,784 |
+| url | 4,977,063,136 | 4,976,046,193 | 0 | 6,612 | 6,612 |
+| http_parse | 1,739,673,896 | 1,534,852,483 | -11.8 % | 1,756 | 1,756 |
+| pqueue | 1,403,174,728 | 1,403,174,027 | 0 | 6,284 | 6,284 |
+| mutres | 2,541,565,008 | 2,541,564,779 | 0 | 1,568 | 1,568 |
+| self-compile (`compiler/main.or`) | 23,761,246,629 | 22,590,961,715 | -4.9 % | 225,328 | 229,908 |
+
+Cost: the lists keep up to 2^15 freed blocks per class instead of returning them to glibc, so peak RSS rises where a program
+frees many small buffers (sortedmap +1.7 MB, mapfreq +0.7 MB, self-compile +2.0 %).
+
 ## Addendum (2026-10-16): the pinned LLVM toolchain (section 8, gate 3)
 
 Gate 3 of section 8 is: a pinned LLVM version is used; the pin is recorded in the repository and checked in CI;
