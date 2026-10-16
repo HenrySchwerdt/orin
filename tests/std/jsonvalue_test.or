@@ -1,0 +1,429 @@
+import { assert, assertEqString, assertEqUsize } from "std:test";
+import { jsonNumber, numberFromInt } from "std:jsonnumber";
+import {
+  JsonValue, JsonMember, JsonLimits, JsonReadOptions, JsonDuplicatePolicy, JsonValueErrorKind,
+  parseDocument, writeDocument, defaultJsonOptions, defaultJsonLimits,
+} from "std:jsonvalue";
+
+function kind(k: JsonValueErrorKind): string {
+  return match (k) {
+    JsonSyntax => "syntax",
+    JsonInvalidUtf8 => "utf8",
+    JsonInvalidSurrogate => "surrogate",
+    JsonDuplicateKey => "duplicate",
+    JsonLimitExceeded => "limit",
+    JsonInvalidLimits => "options",
+  };
+}
+function read(s: string): JsonValue {
+  return parseDocument(s, defaultJsonOptions()).unwrap();
+}
+function write(v: JsonValue): string {
+  return writeDocument(v, defaultJsonLimits()).unwrap();
+}
+function options(l: JsonLimits): JsonReadOptions {
+  return JsonReadOptions { limits: l, duplicates: RejectDuplicates };
+}
+function bad(s: string, at: usize, why: string): void {
+  const r = parseDocument(s, defaultJsonOptions());
+  assert(r.isErr(), "malformed document rejected");
+  assertEqString(kind(r.unwrapErr().kind), why, s);
+  assertEqUsize(r.unwrapErr().offset, at, "error byte offset");
+  assert(r.unwrapErr().limit.isNone(), "syntax/Unicode/duplicate errors have no limit name");
+}
+function parseLimit(s: string, l: JsonLimits, name: string, at: usize): void {
+  const e = parseDocument(s, options(l)).unwrapErr();
+  assertEqString(kind(e.kind), "limit", "limit kind");
+  assertEqString(e.limit.unwrap(), name, "limit name");
+  assertEqUsize(e.offset, at, "limit byte");
+}
+function writeLimit(v: JsonValue, l: JsonLimits, name: string): void {
+  const e = writeDocument(v, l).unwrapErr();
+  assertEqString(kind(e.kind), "limit", "writer limit kind");
+  assertEqString(e.limit.unwrap(), name, "writer limit name");
+}
+function equal(a: JsonValue, b: JsonValue): bool {
+  match (a) {
+    ValueNull => {
+      return match (b) {
+        ValueNull => true,
+        _ => false,
+      };
+    },
+    ValueBool(x) => {
+      return match (b) {
+        ValueBool(y) => x == y,
+        _ => false,
+      };
+    },
+    ValueNumber(x) => {
+      return match (b) {
+        ValueNumber(y) => x.token == y.token,
+        _ => false,
+      };
+    },
+    ValueString(x) => {
+      return match (b) {
+        ValueString(y) => x == y,
+        _ => false,
+      };
+    },
+    ValueArray(xs) => {
+      match (b) {
+        ValueArray(ys) => {
+          if (xs.length != ys.length) {
+            return false;
+          }
+          let i: usize = 0;
+          while (i < xs.length) {
+            if (!equal(xs[i], ys[i])) {
+              return false;
+            }
+            i += 1;
+          }
+          return true;
+        },
+        _ => {
+          return false;
+        },
+      }
+    },
+    ValueObject(xs) => {
+      match (b) {
+        ValueObject(ys) => {
+          if (xs.length != ys.length) {
+            return false;
+          }
+          let i: usize = 0;
+          while (i < xs.length) {
+            if (xs[i].key != ys[i].key || !equal(xs[i].value, ys[i].value)) {
+              return false;
+            }
+            i += 1;
+          }
+          return true;
+        },
+        _ => {
+          return false;
+        },
+      }
+    },
+  }
+  return false;
+}
+
+@Test
+function knownValuesAndExactTokens(): void {
+  assert(equal(read("\"\""), ValueString("")), "empty decoded string");
+  assertEqString(write(ValueString("")), "\"\"", "empty string output");
+  const emptyKey = ValueObject([JsonMember { key: "", value: ValueNull }]);
+  assert(equal(read("{\"\":null}"), emptyKey), "empty decoded key");
+  assertEqString(write(emptyKey), "{\"\":null}", "empty key output");
+  assert(equal(read(" null\r\n"), ValueNull), "null tree");
+  assert(equal(read("true"), ValueBool(true)), "true tree");
+  assert(equal(read("false"), ValueBool(false)), "false tree");
+  for (const token of [
+    "-0",
+    "-0.00",
+    "1.00e+003",
+    "9007199254740993",
+    "-9223372036854775808",
+    "18446744073709551615",
+    "1e999",
+    "1e-999",
+  ]) {
+    const expected = ValueNumber(jsonNumber(token, 1024).unwrap());
+    assert(equal(read(token), expected), "exact token tree");
+    assertEqString(write(expected), token, "writer numeric lexeme");
+  }
+  const expected = ValueObject([
+    JsonMember { key: "s", value: ValueString("a\n\t\0\"\\/") },
+    JsonMember { key: "a", value: ValueArray([ValueNull, ValueBool(false), ValueObject([])]) },
+  ]);
+  const source = " { \"s\":\"a\\n\\t\\u0000\\\"\\\\\\/\", \"a\":[null,false,{}]} ";
+  assert(equal(read(source), expected), "known nested tree");
+  assertEqString(
+    write(expected),
+    "{\"s\":\"a\\n\\t\\u0000\\\"\\\\/\",\"a\":[null,false,{}]}",
+    "independent writer vector",
+  );
+}
+
+@Test
+function strictGrammarAndPositions(): void {
+  bad("", 0, "syntax");
+  bad(" ", 1, "syntax");
+  bad("[", 1, "syntax");
+  bad("[1,]", 3, "syntax");
+  bad("{\"a\":1,}", 7, "syntax");
+  bad("{a:1}", 1, "syntax");
+  bad("{\"a\" 1}", 5, "syntax");
+  bad("[1 2]", 3, "syntax");
+  bad("true false", 5, "syntax");
+  bad("tru", 3, "syntax");
+  bad("nulx", 3, "syntax");
+  bad("01", 1, "syntax");
+  bad("+1", 0, "syntax");
+  bad("1.", 2, "syntax");
+  bad("1e+", 3, "syntax");
+  bad("[1e+]", 4, "syntax");
+  bad("NaN", 0, "syntax");
+  bad("Infinity", 0, "syntax");
+  bad("0x10", 1, "syntax");
+  bad("-", 1, "syntax");
+  bad("\"x", 2, "syntax");
+  bad("\"\\", 2, "syntax");
+  bad("\"\\q\"", 2, "syntax");
+  bad("\"a\n\"", 2, "syntax");
+  bad("\"\\u12", 5, "syntax");
+  bad("\"\\u12x4\"", 5, "syntax");
+  const multi = parseDocument("[\n\"é\",\n x]", defaultJsonOptions()).unwrapErr();
+  assertEqUsize(multi.offset, 9, "UTF8 byte position");
+  assertEqUsize(multi.line, 3, "line after LF");
+  assertEqUsize(multi.column, 2, "byte column");
+  const crlf = parseDocument("[\r\n x]", defaultJsonOptions()).unwrapErr();
+  assertEqUsize(crlf.line, 2, "CRLF line");
+  assertEqUsize(crlf.column, 2, "CRLF column");
+}
+
+@Test
+function unicodeAndSurrogates(): void {
+  assert(
+    equal(read("\"\\ud800\\udc00\\udbff\\udfff\""), ValueString("𐀀􏿿")),
+    "surrogate pair endpoints",
+  );
+  assert(
+    equal(read("\"\\ud7ff\\ue000\\uffff\""), ValueString("퟿￿")),
+    "BMP scalar boundaries",
+  );
+  assert(
+    equal(read("\"\\u0000\\u00e9\\ud83d\\ude00\""), ValueString("\0é😀")),
+    "Unicode scalar decoding",
+  );
+  assertEqString(write(ValueString("é😀")), "\"é😀\"", "UTF8 output");
+  bad("\"\\ud800\"", 1, "surrogate");
+  bad("\"\\udc00\"", 1, "surrogate");
+  bad("\"\\ud800\\u0041\"", 1, "surrogate");
+  bad("\"\\ud800x\"", 1, "surrogate");
+  bad("\"\\ud800\\u12", 11, "syntax");
+  for (const s of [
+    "\x80",
+    "\xc0\xaf",
+    String.fromCharCode(237) + String.fromCharCode(160) + String.fromCharCode(128),
+    "\xe2\x82",
+  ]) {
+    bad(s, 0, "utf8");
+  }
+  bad("x\xff", 1, "utf8"); // full UTF8 preflight precedes grammar
+  assertEqString(
+    kind(writeDocument(ValueString("\xff"), defaultJsonLimits()).unwrapErr().kind),
+    "utf8",
+    "caller string validated",
+  );
+  const invalidKey = ValueObject([JsonMember { key: "\xff", value: ValueNull }]);
+  assertEqString(
+    kind(writeDocument(invalidKey, defaultJsonLimits()).unwrapErr().kind),
+    "utf8",
+    "caller key validated",
+  );
+}
+
+@Test
+function duplicatePolicies(): void {
+  bad("{\"\\u00e9\":0,\"é\":1}", 12, "duplicate");
+  assert(
+    parseDocument("{\"\\u00e9\":0,\"e\\u0301\":1}", defaultJsonOptions()).isOk(),
+    "no Unicode normalization",
+  );
+  const s = "{\"a\":1,\"\\u0061\":2}";
+  bad(s, 7, "duplicate");
+  const opt = JsonReadOptions { limits: defaultJsonLimits(), duplicates: PreserveDuplicates };
+  const expected = ValueObject([
+    JsonMember { key: "a", value: ValueNumber(numberFromInt(1)) },
+    JsonMember { key: "a", value: ValueNumber(numberFromInt(2)) },
+  ]);
+  const v = parseDocument(s, opt).unwrap();
+  assert(equal(v, expected), "decoded duplicate names and order preserved");
+  assertEqString(write(v), "{\"a\":1,\"a\":2}", "writer preserves duplicate member list");
+  assert(equal(parseDocument(write(v), opt).unwrap(), v), "duplicate-preserving round trip");
+  assert(
+    parseDocument("{\"a\":0,\"A\":0,\"a.b\":0,\"\":0}", defaultJsonOptions()).isOk(),
+    "no key folding",
+  );
+  const nested = read("[{\"a\":0},{\"a\":1}]");
+  assertEqString(write(nested), "[{\"a\":0},{\"a\":1}]", "duplicate sets scoped per object");
+}
+
+@Test
+function inputDepthNodeAndItemBudgets(): void {
+  let l = defaultJsonLimits();
+  l.maxInputBytes = 4;
+  assert(parseDocument("null", options(l)).isOk(), "input N");
+  parseLimit("null ", l, "maxInputBytes", 4);
+  l = defaultJsonLimits();
+  l.maxDepth = 1;
+  assert(parseDocument("[]", options(l)).isOk(), "depth N");
+  parseLimit("[[]]", l, "maxDepth", 1);
+  assert(writeDocument(ValueArray([]), l).isOk(), "writer depth N");
+  writeLimit(ValueArray([ValueArray([])]), l, "maxDepth");
+  l = defaultJsonLimits();
+  l.maxNodes = 2;
+  assert(parseDocument("[0]", options(l)).isOk(), "nodes N");
+  parseLimit("[0,0]", l, "maxNodes", 3);
+  assert(writeDocument(ValueArray([ValueNull]), l).isOk(), "writer nodes N");
+  writeLimit(ValueArray([ValueNull, ValueNull]), l, "maxNodes");
+  l = defaultJsonLimits();
+  l.maxContainerItems = 1;
+  assert(parseDocument("[0]", options(l)).isOk(), "array items N");
+  parseLimit("[0,0]", l, "maxContainerItems", 3);
+  assert(parseDocument("{\"a\":0}", options(l)).isOk(), "object items N");
+  parseLimit("{\"a\":0,\"b\":0}", l, "maxContainerItems", 7);
+  assert(writeDocument(ValueArray([ValueNull]), l).isOk(), "writer items N");
+  writeLimit(ValueArray([ValueNull, ValueNull]), l, "maxContainerItems");
+  writeLimit(
+    ValueObject([
+      JsonMember { key: "a", value: ValueNull },
+      JsonMember { key: "b", value: ValueNull },
+    ]),
+    l,
+    "maxContainerItems",
+  );
+}
+
+@Test
+function stringNumberAndOutputBudgets(): void {
+  let l = defaultJsonLimits();
+  l.maxStringBytes = 1;
+  assert(parseDocument("\"a\"", options(l)).isOk(), "string N");
+  parseLimit("\"ab\"", l, "maxStringBytes", 2);
+  parseLimit("{\"ab\":0}", l, "maxStringBytes", 3);
+  parseLimit("\"\\u00e9\"", l, "maxStringBytes", 1);
+  parseLimit("\"é\"", l, "maxStringBytes", 2);
+  assert(writeDocument(ValueString("a"), l).isOk(), "writer string N");
+  writeLimit(ValueString("ab"), l, "maxStringBytes");
+  writeLimit(ValueObject([JsonMember { key: "ab", value: ValueNull }]), l, "maxStringBytes");
+  l = defaultJsonLimits();
+  l.maxDecodedStringBytes = 2;
+  assert(parseDocument("{\"a\":\"b\"}", options(l)).isOk(), "decoded bytes N includes key");
+  parseLimit("{\"a\":\"bc\"}", l, "maxDecodedStringBytes", 7);
+  assert(
+    writeDocument(ValueObject([JsonMember { key: "a", value: ValueString("b") }]), l).isOk(),
+    "writer decoded N",
+  );
+  writeLimit(
+    ValueObject([JsonMember { key: "a", value: ValueString("bc") }]),
+    l,
+    "maxDecodedStringBytes",
+  );
+  l = defaultJsonLimits();
+  l.maxNumberBytes = 3;
+  assert(parseDocument("1e2", options(l)).isOk(), "number N");
+  parseLimit("1e23", l, "maxNumberBytes", 3);
+  assert(writeDocument(ValueNumber(jsonNumber("1e2", 3).unwrap()), l).isOk(), "writer number N");
+  writeLimit(ValueNumber(jsonNumber("1e23", 4).unwrap()), l, "maxNumberBytes");
+  l = defaultJsonLimits();
+  l.maxOutputBytes = 4;
+  assertEqString(writeDocument(ValueNull, l).unwrap(), "null", "output N");
+  l.maxOutputBytes = 3;
+  writeLimit(ValueNull, l, "maxOutputBytes");
+  l.maxOutputBytes = 8;
+  assert(writeDocument(ValueString("\0"), l).isOk(), "escaped output N");
+  l.maxOutputBytes = 7;
+  writeLimit(ValueString("\0"), l, "maxOutputBytes");
+  l.maxOutputBytes = 4;
+  assert(writeDocument(ValueString("\n"), l).isOk(), "short escape N");
+  l.maxOutputBytes = 3;
+  writeLimit(ValueString("\n"), l, "maxOutputBytes");
+}
+
+@Test
+function invalidOptionsAndExtremeDepth(): void {
+  const base = defaultJsonLimits();
+  const invalid = [
+    JsonLimits { ...base, maxInputBytes: 0 },
+    JsonLimits { ...base, maxDepth: 0 },
+    JsonLimits { ...base, maxDepth: 201 },
+    JsonLimits { ...base, maxNodes: 0 },
+    JsonLimits { ...base, maxContainerItems: 0 },
+    JsonLimits { ...base, maxStringBytes: 0 },
+    JsonLimits { ...base, maxDecodedStringBytes: 0 },
+    JsonLimits { ...base, maxNumberBytes: 0 },
+    JsonLimits { ...base, maxOutputBytes: 0 },
+  ];
+  for (const l of invalid) {
+    assertEqString(
+      kind(parseDocument("null", options(l)).unwrapErr().kind),
+      "options",
+      "invalid reader options",
+    );
+    assertEqString(
+      kind(writeDocument(ValueNull, l).unwrapErr().kind),
+      "options",
+      "invalid writer options",
+    );
+  }
+  let v: JsonValue = ValueNull;
+  let source = "null";
+  let i = 0;
+  while (i < 200) {
+    v = ValueArray([v]);
+    source = "[" + source + "]";
+    i += 1;
+  }
+  let l = base;
+  l.maxDepth = 200;
+  assertEqString(writeDocument(v, l).unwrap(), source, "maximum supported writer depth");
+  assert(equal(parseDocument(source, options(l)).unwrap(), v), "maximum supported reader depth");
+  writeLimit(ValueArray([v]), l, "maxDepth");
+  parseLimit("[" + source + "]", l, "maxDepth", 200);
+}
+
+@Test
+function truncationsAndRoundTripLaws(): void {
+  const full = "[{\"s\":\"\\ud83d\\ude00\\n\",\"n\":-1.00e+2},true,null]";
+  let i: usize = 0;
+  while (i < full.length) {
+    const prefix = full.substring(0, i);
+    const r = parseDocument(prefix, defaultJsonOptions());
+    assert(r.isErr(), "every proper container prefix rejected");
+    assert(r.unwrapErr().offset <= prefix.length, "truncation offset within input");
+    i += 1;
+  }
+  let state = 12345;
+  let n = 0;
+  while (n < 400) {
+    state = (state * 251 + 17) % 65521;
+    const v = ValueObject([
+      JsonMember { key: "n", value: ValueNumber(numberFromInt(state - 32760)) },
+      JsonMember { key: "s", value: ValueString("\"\\\0\né") },
+      JsonMember {
+        key: "a",
+        value: ValueArray([ValueBool(state % 2 == 0), ValueNull, ValueArray([])]),
+      },
+    ]);
+    const text = write(v);
+    assert(equal(read(text), v), "caller tree structural round trip");
+    assertEqString(write(read(text)), text, "deterministic compact round trip");
+    n += 1;
+  }
+}
+
+@Test
+function largeStringsAndObjects(): void {
+  let text = "\0\"\\é";
+  while (text.length < 32768) {
+    text = text + text;
+  }
+  // Truncate on a UTF8 boundary (five-byte seed length divides the target).
+  text = text.substring(0, 32765);
+  const v = ValueString(text);
+  assert(equal(read(write(v)), v), "large escaped string round trip");
+  let members: JsonMember[] = [];
+  let i = 0;
+  while (i < 1000) {
+    members.push(JsonMember { key: "key" + i.toString(), value: ValueNumber(numberFromInt(i)) });
+    i += 1;
+  }
+  const object = ValueObject(members);
+  assert(equal(read(write(object)), object), "many ordered unique keys");
+}
