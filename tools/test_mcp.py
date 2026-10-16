@@ -297,6 +297,25 @@ def main():
     err, v, raw = c.call("inspect", {})
     check(err, "inspect without target is an error")
 
+    # user annotations (ADR-0046 S2): `annotations` lists each use with its arguments and the definition
+    write(os.path.join(proj, "anno.or"),
+          "type Verb = Get | Post;\n\n@Annotation(function, method)\ntype Route = { path: string; verb: Verb; };\n\n"
+          "@Annotation(function, field)\ntype Doc = { text: string; };\n\n"
+          "class Api {\n  @Doc(\"field\") n: int = 0;\n  @Route(\"/a\", Post)\n  call(): int {\n    return this.n;\n  }\n}\n\n"
+          "@Route(\"/users/:id\", Get)\n@Doc(\"Finds\")\nfunction lookupUser(id: int): int {\n  return id;\n}\n\n"
+          "function plain(): int {\n  return 1;\n}\n\nfunction main(): void {\n  console.log(lookupUser(new Api().call()).toString());\n}\n")
+    err, v, raw = c.call("inspect", {"symbol": "lookupUser", "entry": "anno.or"})
+    check(not err and v.get("annotations") == [
+        {"name": "Route", "args": ['"/users/:id"', "Get"], "definition": "anno.or:4:6"},
+        {"name": "Doc", "args": ['"Finds"'], "definition": "anno.or:7:6"}], "inspect: user annotations of a function (%s)" % raw)
+    check(not err and v.get("sig", "").startswith('@Route("/users/:id", Get)\n@Doc("Finds")\nfunction lookupUser'), "inspect: sig carries the annotation lines (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "Api.call", "entry": "anno.or"})
+    check(not err and v.get("annotations") == [{"name": "Route", "args": ['"/a"', "Post"], "definition": "anno.or:4:6"}],
+          "inspect: user annotations of a method (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "plain", "entry": "anno.or"})
+    check(not err and "annotations" not in v, "inspect: a declaration without annotations has no annotations key (%s)" % raw)
+    os.remove(os.path.join(proj, "anno.or"))
+
     # ---- packages (orin.toml, spec 04): module inspect shows the rule; violations are diagnostics
     import shutil
     shutil.copytree(os.path.join(ROOT, "tests", "next", "packages", "shop"), os.path.join(proj, "shop"))
@@ -364,7 +383,7 @@ def main():
     for side in ("base", "head"):
         shutil.copytree(os.path.join(ROOT, "tests", "osig", "accept", side), os.path.join(proj, "osig", side))
     err, v, raw = c.call("graph", {"entry": "osig/head"})
-    check(not err and v["schema"] == "osig/0.3" and v["package"] == "acme" and v["hash"].startswith("h62:")
+    check(not err and v["schema"] == "osig/0.4" and v["package"] == "acme" and v["hash"].startswith("h62:")
           and v["nodes"] > 5 and v["edges"] > 5 and "snapshot" not in v, "graph summary (%s)" % raw)
     err, v2, raw = c.call("graph", {"entry": "osig/head", "full": True, "out": "osig/head.json"})
     check(not err and v2["hash"] == v["hash"] and json.loads(v2["snapshot"])["hash"] == v["hash"], "graph full is deterministic")

@@ -26,7 +26,7 @@ import {
 import { LoadedProgram, ImportTarget } from "../loader";
 import { isIoBuiltin } from "./purity";
 import {
-  Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink, CallSite,
+  Type, Program, Function, HBlock, HStmt, HExpr, Place, SymbolKind, SymbolDef, SymbolRef, TypeAt, SemanticIndex, ImplLink, AnnoUse, CallSite,
   SkFunction, SkRecord, SkUnion, SkVariant, SkAlias, SkConst, SkLocal, SkParam, SkField, SkInterface, kindName, Builtin, grantTypeName
 } from "../hir";
 
@@ -113,6 +113,7 @@ type W = {
   types: TypeAt[];
   impls: ImplLink[];           // `implements` links (ADR-0019)
   calls: CallSite[];           // call sites (OSIG CALLS edges)
+  annos: AnnoUse[];            // uses of user-defined annotations (ADR-0046 S2)
   cur: Option<usize>;          // caller def of the HIR body being walked
   curMay: bool;                // the body is a lifted closure: its calls are MAY edges of the enclosing function
   np: Option<usize>;           // parameter count of the ordinary function body being walked; None in a closure body (a
@@ -301,11 +302,29 @@ function annotationText(sm: SourceMap, as: Annotation[]): string {
   return out;
 }
 
+// The source text of a range, line breaks turned into spaces.
+function sourceText(sm: SourceMap, sp: Span): string {
+  return sm.files[sp.file].text.substring(sp.start, sp.end).split("\n").join(" ");
+}
+
 // `addDef` for a declaration that may carry annotations: the hover detail starts with them and
 // `@Deprecated` is recorded on the definition.
 function addDefA(w: W, name: string, kind: SymbolKind, nameSpan: Span, declSpan: Span, container: Option<usize>,
     exported: bool, detail: string, as: Annotation[], sm: SourceMap): W {
   let x = addDef(w, name, kind, nameSpan, declSpan, container, exported, annotationText(sm, as) + detail);
+  const owner = x.defs.length - 1;
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        let texts: string[] = [];
+        for (const e of args) {
+          texts.push(sourceText(sm, e.span));
+        }
+        x.annos.push(AnnoUse { owner: owner, name: id.name, nameSpan: id.span, def: None, args: texts });
+      },
+      _ => {}
+    }
+  }
   for (const a of as) {
     const isD = match (a.kind) {
       ADeprecated => true,
@@ -493,8 +512,8 @@ function declareType(p: P1, unitName: string, t: TypeDecl, sm: SourceMap): P1 {
       w = addDefA(w, t.name.name, SkRecord, t.name.span, t.span, None, t.exported,
         head + " = { " + parts.join("; ") + " }" + cdetail, t.annotations, sm);
       for (const f of fs) {
-        w = addDef(w, f.name.name, SkField, f.name.span, f.span, Some(id), t.exported,
-          f.name.name + ": " + renderTE(f.ty));
+        w = addDefA(w, f.name.name, SkField, f.name.span, f.span, Some(id), t.exported,
+          f.name.name + ": " + renderTE(f.ty), f.annotations, sm);
       }
     },
     DUnion(vs) => {
@@ -637,8 +656,8 @@ function declareClass(p: P1, unitName: string, c: ClassDecl, hir: Option<Program
   for (const m of c.members) {
     match (m) {
       MField(f) => {
-        w = addDef(w, f.name.name, SkField, f.name.span, f.span, Some(id), c.exported,
-          (f.priv ? "private " : "") + f.name.name + ": " + renderTE(f.ty));
+        w = addDefA(w, f.name.name, SkField, f.name.span, f.span, Some(id), c.exported,
+          (f.priv ? "private " : "") + f.name.name + ": " + renderTE(f.ty), f.annotations, sm);
       },
       _ => {}
     }
@@ -811,7 +830,7 @@ function newW(): W {
   const tys: Option<Type>[] = [];
   const tt: Type[] = [];
   return W {
-    defs: d, refs: r, types: t, impls: [], calls: [], cur: None, curMay: false, np: None, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
+    defs: d, refs: r, types: t, impls: [], calls: [], annos: [], cur: None, curMay: false, np: None, bnd: ids, lNames: s, lIds: ids, lTys: tys, marks: ids, tps: s, unit: 0, fn: None,
     hl: s, hlTy: tt, hk: 0
   };
 }
@@ -2087,6 +2106,100 @@ function functionNames(prog: LoadedProgram, tabs: UnitTab[], defs: SymbolDef[]):
   return FnNames { names: names, defs: ds };
 }
 
+// ---- user annotation uses (ADR-0046 S2) ------------------------------------------------------------------
+
+// An argument of a user annotation: only a module constant (or a union tag of the field) can be a name; those that
+// resolve to a constant of the module are references, the rest are literals.
+function annoArgRefs(w: W, c: Ctx, e: Expr): W {
+  let x = w;
+  match (e.kind) {
+    EIdent(id) => {
+      const d = lookupVal(x, c, id.name);
+      if (d.isSome()) {
+        x = addRef(x, id.span, d.unwrap());
+      }
+    },
+    EUnary(_, a) => { x = annoArgRefs(x, c, a); },
+    EArray(xs) => {
+      for (const a of xs) {
+        x = annoArgRefs(x, c, a);
+      }
+    },
+    ECall(_, as) => {
+      for (const a of as) {
+        x = annoArgRefs(x, c, a);
+      }
+    },
+    _ => {}
+  }
+  return x;
+}
+
+// Each `@Name(..)` use is a reference to the `@Annotation` record `Name` (go to definition, find references, rename).
+function annoRefs(w: W, c: Ctx, as: Annotation[]): W {
+  let x = w;
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        const td = lookupType(x, c, id.name);
+        if (td.isSome()) {
+          x = addRef(x, id.span, td.unwrap());
+          let k: usize = 0;
+          while (k < x.annos.length) {
+            if (x.annos[k].nameSpan.file == id.span.file && x.annos[k].nameSpan.start == id.span.start) {
+              x.annos[k].def = Some(td.unwrap());
+            }
+            k += 1;
+          }
+        }
+        for (const e of args) {
+          x = annoArgRefs(x, c, e);
+        }
+      },
+      _ => {}
+    }
+  }
+  return x;
+}
+
+// The annotation uses of one top-level item and of its members.
+function itemAnnoRefs(w: W, c: Ctx, item: Item): W {
+  let x = w;
+  match (item) {
+    IFunction(f) => { x = annoRefs(x, c, f.annotations); },
+    IConst(k) => { x = annoRefs(x, c, k.annotations); },
+    IType(t) => {
+      x = annoRefs(x, c, t.annotations);
+      match (t.body) {
+        DRecord(fs) => {
+          for (const f of fs) {
+            x = annoRefs(x, c, f.annotations);
+          }
+        },
+        _ => {}
+      }
+    },
+    IInterface(k) => {
+      x = annoRefs(x, c, k.annotations);
+      for (const m of k.methods) {
+        x = annoRefs(x, c, m.annotations);
+      }
+    },
+    IClass(cd) => {
+      x = annoRefs(x, c, cd.annotations);
+      for (const m of cd.members) {
+        match (m) {
+          MField(f) => { x = annoRefs(x, c, f.annotations); },
+          MMethod(md) => { x = annoRefs(x, c, md.annotations); },
+          _ => {}
+        }
+      }
+    },
+    _ => {}
+  }
+  return x;
+}
+
 // ---- driver -------------------------------------------------------------------------------------------
 
 export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): SemanticIndex {
@@ -2111,7 +2224,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
         },
         IConst(k) => {
           did = p.w.defs.length;
-          p.w = addDef(p.w, k.name.name, SkConst, k.name.span, k.span, None, k.exported, constDetail(k));
+          p.w = addDefA(p.w, k.name.name, SkConst, k.name.span, k.span, None, k.exported, constDetail(k), k.annotations, sm);
           p.tab = addV(p.tab, k.name.name, did, k.exported);
         },
         IType(t) => {
@@ -2188,6 +2301,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     for (const item of u.ast.items) {
       const did = tabs[ui].itemDefs[k];
       k += 1;
+      w = itemAnnoRefs(w, c, item);
       match (item) {
         IFunction(f) => {
           let hf: Option<Function> = None;
@@ -2399,6 +2513,7 @@ export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Progr
     types: dedupTypes(sortTypes(w.types)),
     impls: w.impls,
     calls: w.calls,
+    annos: w.annos,
     fnDefs: fnDef,
     fnKinds: fnKindNos(fnKind),
     typed: hir.isSome()
