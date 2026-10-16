@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Encoding-only parity, sanitizer and deterministic scaling benchmark.
 
-Run after bootstrap: python3 tools/check_encoding.py [--orinc build/bootstrap/orin2]
+Run after bootstrap: python3 tools/check_encoding.py [--orinc build/bootstrap/orin2] [--skip-bench]
 Builds ordinary-main versions of the actual @Test bodies to run the same checks
 under C/LLVM, contracts on/off, and C ASan/UBSan. Benchmarks include startup and
 input construction, use three fixed sizes and four rounds, and report medians
@@ -39,7 +39,7 @@ def compile_orin(orinc, source, backend, contracts=False, sanitize=False):
     run(cmd)
     binary = OUT / stem
     cmd = ["clang", "-O2", "-w", "-I", ROOT / "runtime", generated,
-           ROOT / "runtime/orin_runtime.c", ROOT / "platform/orin_platform.c", "-o", binary]
+           ROOT / "runtime/orin_runtime.c", ROOT / "platform/orin_platform.c", "-lm", "-o", binary]
     if backend == "llvm":
         cmd += [ROOT / "runtime/orin_runtime_llvm.c"]
     if sanitize:
@@ -51,11 +51,14 @@ def compile_orin(orinc, source, backend, contracts=False, sanitize=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orinc", default="build/bootstrap/orin2")
+    parser.add_argument("--skip-bench", action="store_true", help="run vectors/oracles and backend checks only")
     opts = parser.parse_args()
     orinc = ROOT / opts.orinc
     OUT.mkdir(parents=True, exist_ok=True)
     tests = (ROOT / "tests/std/encoding_test.or").read_text()
     names = re.findall(r"@Test\s+function (\w+)\(", tests)
+    if not names:
+        raise RuntimeError("no encoding tests discovered")
     driver = tests.replace("@Test", "")
     driver += "\nfunction main(): void {\n" + "".join(f"  {n}();\n" for n in names)
     # Fixed pseudo-random inputs, independent Python standard-library oracle.
@@ -82,6 +85,8 @@ def main():
         binary = compile_orin(orinc, source, backend, contracts, san)
         assert run([binary], env=env) == "encoding parity passed\n"
         print(f"PASS {backend} contracts={contracts} sanitizers={san}", flush=True)
+    if opts.skip_bench:
+        return
     imports = '''import { ByteBuilder, bytesFromString } from "std:bytes";
 import { hexEncode, hexDecode, base64Encode, base64Decode, base64UrlEncode, base64UrlDecode } from "std:encoding";
 import { assert } from "std:test";

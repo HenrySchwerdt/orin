@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exact JSON-number parity, independent oracle and deterministic scaling.
 
-python3 tools/check_jsonnumber.py [--orinc build/bootstrap/orin2]
+python3 tools/check_jsonnumber.py [--orinc build/bootstrap/orin2] [--skip-bench]
 All generated sources/results stay in build/jsonnumber. Only Python's standard
 library is used. Benchmark times include startup and input construction.
 """
@@ -40,7 +40,7 @@ def build(orinc, source, backend, contracts=False, sanitize=False):
     run(cmd)
     binary = OUT / stem
     cmd = ["clang", "-O2", "-w", "-I", "runtime", generated,
-           "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", binary]
+           "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", binary]
     if backend == "llvm":
         cmd += ["runtime/orin_runtime_llvm.c"]
     if sanitize:
@@ -98,11 +98,14 @@ def oracle_cases():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--orinc", default="build/bootstrap/orin2")
+    parser.add_argument("--skip-bench", action="store_true", help="run vectors/oracles and backend checks only")
     args = parser.parse_args()
     orinc = (ROOT / args.orinc).resolve()
     OUT.mkdir(parents=True, exist_ok=True)
     test = (ROOT / "tests/std/jsonnumber_test.or").read_text()
     names = re.findall(r"@Test\s+function (\w+)\(", test)
+    if not names:
+        raise RuntimeError("no jsonnumber tests discovered")
     entries = oracle_cases()
     source = OUT / "oracle.or"
     source.write_text(test.replace("@Test", "") + '''
@@ -132,6 +135,8 @@ function main(): void {
         binary = build(orinc, source, backend, contracts, sanitize)
         assert run([binary], env=env) == "jsonnumber oracle passed\n"
         print(f"PASS {len(entries)} independent cases + tests: {backend} contracts={contracts} sanitizers={sanitize}", flush=True)
+    if args.skip_bench:
+        return
     for size in [65536, 262144, 1048576]:
         source = OUT / f"benchmark_{size}.or"
         source.write_text('''import { ByteBuilder } from "std:bytes";
