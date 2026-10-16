@@ -3,7 +3,7 @@ import { Host, useHost } from "std:host";
 import { exists } from "std:fs";
 import {
   isDigit, isJsonSpace, hexVal, hexDigitLower, hexDigitUpper, shq, trunc, countNewlines, lineCol, addUnique,
-  hasStr, hasUsize, workerCount, mapOrdered, mapOrderedFs, mapOrderedProcess, shellRun,
+  hasStr, hasUsize, workerCount, mapOrdered, mapOrderedFs, mapOrderedProcess, shellRun, mapOrderedLent, mapChunksLent,
 } from "../util";
 
 @Test
@@ -81,6 +81,72 @@ function mapOrderedMovesHeapResults(): void {
   const rs = mapOrdered(names.length, (i: usize) => names[i] + "!" + i.toString());
   assertEqUsize(rs.length, 7, "length");
   assertEqString(rs.join(","), "a!0,bb!1,ccc!2,dddd!3,eeeee!4,ffffff!5,ggggggg!6", "strings in index order");
+}
+
+type Row = { id: usize; name: string; cells: string[]; };
+
+function rows(n: usize): Row[] {
+  let rs: Row[] = [];
+  while (rs.length < n) {
+    const id = rs.length;
+    rs.push(Row { id: id, name: "row" + id.toString(), cells: ["c" + id.toString(), "x"] });
+  }
+  return rs;
+}
+
+@Test
+function mapOrderedLentReadsTheGraphInIndexOrder(): void {
+  const rs = rows(57);
+  assertEqUsize(mapOrderedLent(rs, 0, (i: usize) => i).length, 0, "no indices");
+  assertEqString(mapOrderedLent(rs, 1, (i: usize) => rs[i].name)[0], "row0", "one index");
+  const out = mapOrderedLent(rs, 57, (i: usize) => rs[i].name + "/" + rs[i].cells[0]);
+  assertEqUsize(out.length, 57, "length");
+  let i: usize = 0;
+  while (i < 57) {
+    assertEqString(out[i], "row" + i.toString() + "/c" + i.toString(), "element " + i.toString());
+    i += 1;
+  }
+}
+
+@Test
+function mapOrderedLentResultsAreCopies(): void {
+  let rs = rows(20);
+  const picked = mapOrderedLent(rs, 20, (i: usize) => rs[i]);
+  rs[3].name = "changed";
+  rs[3].cells[0] = "changed";
+  assertEqString(picked[3].name, "row3", "a result keeps its value when the graph changes");
+  assertEqString(picked[3].cells[0], "c3", "also in a nested array");
+}
+
+@Test
+function mapChunksLentCoversEveryIndexOnce(): void {
+  const rs = rows(103);
+  assertEqUsize(mapChunksLent(rs, 0, 10, (lo: usize, hi: usize) => lo).length, 0, "no indices");
+  const sizes: usize[] = [0, 1, 7, 64, 103, 500];
+  for (const size of sizes) {
+    const pieces = mapChunksLent(rs, 103, size, (lo: usize, hi: usize) => {
+      let names: string[] = [];
+      let i = lo;
+      while (i < hi) {
+        names.push(rs[i].name);
+        i += 1;
+      }
+      return names.join(",");
+    });
+    const sz = size == 0 ? 1 : size;
+    assertEqUsize(pieces.length, (103 + sz - 1) / sz, "pieces for size " + size.toString());
+    let all: string[] = [];
+    for (const p of pieces) {
+      all.push(p);
+    }
+    let want: string[] = [];
+    let i: usize = 0;
+    while (i < 103) {
+      want.push("row" + i.toString());
+      i += 1;
+    }
+    assertEqString(all.join(","), want.join(","), "every index once, in order, for size " + size.toString());
+  }
 }
 
 @Test
