@@ -192,11 +192,11 @@ The rows refine the milestones above, rather than authorize implementation.
 
 | Slice | Main implementation area | Merge gate |
 |---|---|---|
-| Cancellation/termination model | ADR-0017 amendment and pure `stdlib/taskcore.or` machines | Terminal-event and ownership transition tests |
-| Channel waits | Minimal L0 timed/wake primitives and `stdlib/task.or` | No lost wake or token leak under cancel/close/deadline races |
+| Cancellation/termination model | ADR-0017 amendment and pure `library/std/taskcore.or` machines | Terminal-event and ownership transition tests |
+| Channel waits | Minimal L0 timed/wake primitives and `library/std/task.or` | No lost wake or token leak under cancel/close/deadline races |
 | Completion waits | Runtime completion publication plus Orin join bookkeeping | Timeout leaves a valid join obligation; exactly one final claimant |
 | Nested-scope termination | Runtime live-scope registration and Orin cancellation/drain | Trapping parent joins cooperative descendants before state release |
-| TCP wait interruption | L0 readiness/wake and `stdlib/net.or` adapters | Numeric loopback cancellation and total-deadline tests; DNS limitation explicit |
+| TCP wait interruption | L0 readiness/wake and `library/std/net.or` adapters | Numeric loopback cancellation and total-deadline tests; DNS limitation explicit |
 | Concurrent server ownership | Separate resource/grant ADR and bounded example | No forbidden capture or authority widening; admission/cleanup campaign |
 | Reclamation | R3/R4 object model or approved alternative | Repeated faults restore accounting including transfers/lends |
 | Scheduler experiment | Explicit task state, bounded queues/timers, readiness backend | One-worker progress, worker-bound and fairness evidence before multi-worker migration |

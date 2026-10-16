@@ -47,14 +47,14 @@ now() { date +%s; }
 build() {
   mkdir -p $D
   if ! python3 tools/embed_prelude.py --check >/dev/null; then
-    python3 tools/embed_prelude.py   # the embedded std/ array/ stdlib/ sources are stale: regenerate (commit the result)
+    python3 tools/embed_prelude.py   # the embedded library/ sources are stale: regenerate (commit the result)
   fi
   if [ -x $B/orin2 ]; then host=$B/orin2; else
     [ -x $B/orin0 ] || { echo "[dev] no $B/orin2: building the seed compiler"; ./tools/bootstrap.sh --seed-only >/dev/null; }
     host=$B/orin0
   fi
   # inputs of the build: the compiler and every source it embeds, the runtime, and the compiler that builds it
-  stamp=$(cat "$host" $(find compiler std array stdlib runtime platform -type f | LC_ALL=C sort) | cksum)
+  stamp=$(cat "$host" $(find compiler library runtime -type f | LC_ALL=C sort) | cksum)
   if [ -x $D/orin ] && [ "$(cat $D/stamp 2>/dev/null)" = "$stamp" ]; then
     echo "[dev] $D/orin is up to date"
     return

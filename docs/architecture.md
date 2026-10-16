@@ -14,8 +14,8 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `platform/tests/` (contract tests, CBMC harnesses). |
 | `runtime/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
-| `stdlib/` | **Std modules in Orin** (`std:host`, `std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`; `std:host` and `std:fs` implement the capability grants of ADR-0027): embedded library root, see docs/std.md. |
-| `std/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
+| `library/std/` | **Std modules in Orin** (`std:host`, `std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`; `std:host` and `std:fs` implement the capability grants of ADR-0027): embedded library root, see docs/std.md. |
+| `library/core/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
 | `tests/run/` | Conformance programs: `x.or` + expected stdout `x.out`. |
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
 | `tests/next/` | Same formats (`run/`, `errors/`) for language beyond Orin-B; self-hosted compiler only (`--suite next`). |
@@ -75,11 +75,11 @@ A **prelude** is a directory of ordinary Orin sources that the self-hosted compi
 into every program, so library logic can be written in Orin instead of C. Mechanism (all deterministic,
 so `stage2.c == stage3.c` still holds):
 
-- **Source and embedding.** `std/` (repo root) holds the std prelude: `module.or` (entry, lists the
+- **Source and embedding.** `library/core/` (repo root) holds the std prelude: `module.or` (entry, lists the
   rules) + `strings.or`, `numbers.or`. The compiler is one native binary and cannot find files next to
   itself, so `tools/embed_prelude.py` turns each prelude directory into a generated Orin file
   (`compiler/loader/embedded_std.or`, a function returning `SourceFile[]`). Run the script after
-  editing `std/`; `tools/bootstrap.sh` fails on a stale file (`--check`).
+  editing `library/core/`; `tools/bootstrap.sh` fails on a stale file (`--check`).
 - **Prelude roots (the general mechanism).** `compiler/loader/prelude.or` has `preludeRoots()`, a list
   of `PreludeRoot { entry, files }`. `loadWithRoots` (loader.or) serves every root's files from memory under
   virtual paths `$<name>/...` and adds an empty import of each root's `entry` to the program's entry
@@ -105,7 +105,7 @@ so `stage2.c == stage3.c` still holds):
 - **Flags.** `--c-builtins` keeps the C runtime path (differential testing:
   `python3 tools/diff_backends.py --mode builtins`); `orin check` loads no
   prelude.
-- **Rules for prelude code** (also in `std/module.or`): only the primitives the C runtime keeps
+- **Rules for prelude code** (also in `library/core/module.or`): only the primitives the C runtime keeps
   (`length`, `charCodeAt`, `charAt`, `substring`, `String.fromCharCode`, `+`, array `push`/index/`length`,
   console, `process.exit`); never call a built-in that is itself implemented in the prelude (the lowering
   would make it a recursive call); keep within what the self-hosted compiler accepts.
@@ -139,7 +139,7 @@ queues, integer words). The platform layer is now thread-safe (the stdout buffer
 |---|---|
 | Bounds-checked indexing, checked arithmetic | Implemented in runtime/codegen; tested only |
 | Struct/variant field access and array slot access check object kind and slot count (backstop for lowering bugs the ownership verifier cannot see, docs/assurance.md F-shape) | Implemented in the runtime and both backends; a mismatch traps (exit 101); tested only. Not a proof: the verifier does not check value shapes yet (P0 proof debt) |
-| Library string/number functions (R1) | Safe Orin in `std/` (checked by the compiler, verified by the MIR verifier, `tools/verify_all.py`); functional behaviour tested only, differentially against the C implementations |
+| Library string/number functions (R1) | Safe Orin in `library/core/` (checked by the compiler, verified by the MIR verifier, `tools/verify_all.py`); functional behaviour tested only, differentially against the C implementations |
 | RC never under-counts (no UAF/double free) | Generated code: tested + ASan/UBSan on all suites and on the compiler self-compiling. Abstract machine: **proven** in Lean (`formal/`, theorem `run_safe`; rc ≥ owners invariant) — see docs/formal.md |
 | Value semantics / COW | Abstract machine: **proven** for `makeUnique; store` (`makeUnique_store_cow`); generated code: tested |
 | MIR ownership discipline | Independent verifier implemented (`compiler/verify`, docs/mir.md); lowering to MIR in progress; verifier itself not mechanically verified |

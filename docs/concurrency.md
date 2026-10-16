@@ -6,7 +6,7 @@ remains is split into L0 primitives that stay C forever and one small temporary 
 [ADR-0017](decisions/0017-concurrency-design.md) and its addendum "Stage 0 as built"; related: ADR-0027 (grants are
 resources; Q10), ADR-0030 (L0 is the only C), spec 19, ADR-0038 (per-task regions later).
 
-Module: `std:task` (`stdlib/task.or`, unstable; its pure bookkeeping classes are in `std:taskcore`). Stage 0 has no `async` / `await`.
+Module: `std:task` (`library/std/task.or`, unstable; its pure bookkeeping classes are in `std:taskcore`). Stage 0 has no `async` / `await`.
 
 The [proposed async/concurrency roadmap](roadmaps/async-concurrency.md) records the
 current baseline, cleanup/cancellation/deadline prerequisites and scheduler/syntax
@@ -99,7 +99,7 @@ delegated grant).
 
 | Layer | Contents | Language | Lines (code, no comments or blank lines) |
 |---|---|---|---|
-| `std:task` (L2) | scope table and task bookkeeping (`Ledger`, `drain`), join results, panic propagation, channel buffers (`Ring`), `Sender` / `Receiver`, grant delegation, `parallelMap` | **Orin**, `stdlib/task.or`, and the pure state machines `Ring` and `Ledger` in `stdlib/taskcore.or` | 508 (`task.or` 416 + `taskcore.or` 92), with 8 `@Invariant` and 26 `@Requires` / `@Ensures` |
+| `std:task` (L2) | scope table and task bookkeeping (`Ledger`, `drain`), join results, panic propagation, channel buffers (`Ring`), `Sender` / `Receiver`, grant delegation, `parallelMap` | **Orin**, `library/std/task.or`, and the pure state machines `Ring` and `Ledger` in `library/std/taskcore.or` | 508 (`task.or` 416 + `taskcore.or` 92), with 8 `@Invariant` and 26 `@Requires` / `@Ensures` |
 | L0 platform | thread create / join / exit / id; monitors (mutex + 2 condition queues + integer words); the runtime lock; the lock of the stdout buffer | **C, forever** (`platform/orin_platform.{c,h}`) | +243 (platform total 700 of the 1,000 budget). Why a monitor has words: Orin values cannot be shared between tasks, so the state that tasks DO share (the task table of a scope, the buffer of a channel) needs minimal shared memory with the OS's mutual exclusion; integers behind a lock are the smallest such cell (an "atomic counter" with a lock, handle-checked), and they let every line of channel and scope logic stay Orin |
 | runtime, temporary | transfer (`orin_rt_transfer_*`), task start / join / trap (`orin_rt_task_*`, `orin_rt_heap_exit`), forwarders that trap on a failed L0 call (`orin_mon_*`), grant clone / move / adopt (`orin_cap_*`) | **C, until R3** (`runtime/orin_runtime.c`, section "tasks and transfer") | 342 (transfer 130, tasks 80, `orin_mon_*` 35, trap forwarder 8, grants 70, rest 19), plus about 30 changed lines for per-task state |
 
@@ -234,7 +234,7 @@ Added after stage 0, for parallel array pipelines (docs/std.md "Parallel pipelin
 
 **Soundness of lending (TESTED_ONLY, like the rest of the C transfer).** While a value is lent, nothing in its graph changes:
 a retain / release of a pinned object is a no-op (no shared count is written, so no data race), `orin_make_unique` copies it
-(count != 1), nothing in it is freed. The owner's obligation, kept by the only user (`array/parallel.or` and the code the fusion
+(count != 1), nothing in it is freed. The owner's obligation, kept by the only user (`library/collections/parallel.or` and the code the fusion
 pass generates): between lend and end it only spawns the worker tasks and joins them, and a reference to a pinned object made in
 the window is gone before the end (a reference that outlived it would be uncounted). Worker results come back through a transfer
 by a non-owner, which copies pinned objects. Evidence: `runtime/tests/task_test.c` (`test_lend`: no copy, counts untouched and

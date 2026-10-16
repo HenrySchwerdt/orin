@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The character tables of stdlib/http.or (ADR-0030 §3, std:http).
+"""The character tables of library/std/http.or (ADR-0030 §3, std:http).
 
 Orin has no constant arrays, so the byte classification of the HTTP/1.1 parser is a pair of 256-character string constants
 read with `charCodeAt`. This script derives them from the RFC 9110 / 9112 character sets:
@@ -12,7 +12,7 @@ read with `charCodeAt`. This script derives them from the RFC 9110 / 9112 charac
   HTTP_HEXV   the value of a hex digit, 16 for every other byte.
 
 Usage: python3 tools/gen_http_tables.py           print the two constant declarations
-       python3 tools/gen_http_tables.py --check   fail unless stdlib/http.or contains exactly these declarations
+       python3 tools/gen_http_tables.py --check   fail unless library/std/http.or contains exactly these declarations
 tests/std/http_test.or recomputes the same classes from explicit RFC character lists (a second, independent check).
 """
 import os
@@ -70,11 +70,11 @@ def declarations():
 def main():
     a, b = declarations()
     if "--check" in sys.argv[1:]:
-        src = open(os.path.join(ROOT, "stdlib", "http.or"), encoding="utf-8").read()
+        src = open(os.path.join(ROOT, "library", "std", "http.or"), encoding="utf-8").read()
         for d in (a, b):
             if d not in src:
-                sys.exit("stdlib/http.or: %s is not the generated table (run tools/gen_http_tables.py)" % d.split(":")[0])
-        print("stdlib/http.or tables are current")
+                sys.exit("library/std/http.or: %s is not the generated table (run tools/gen_http_tables.py)" % d.split(":")[0])
+        print("library/std/http.or tables are current")
         return
     print(a)
     print(b)

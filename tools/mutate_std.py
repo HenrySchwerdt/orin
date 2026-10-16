@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mutation check for the provable std modules (ADR-0030 §3, ADR-0028).
 
-Each mutant is a one-line, deliberately wrong change of stdlib/{bytes,utf8,collections,http,text,html}.or. The module and its
+Each mutant is a one-line, deliberately wrong change of library/std/{bytes,utf8,collections,http,text,html}.or. The module and its
 test file are copied to build/mutate_std/, the std imports are rewritten to relative ones, the mutation is applied and
 `orin test` is run twice: with runtime contract checking (the default) and with `--no-contracts`. A mutant is
 killed when a test fails. It is "killed by a contract" when a failing test's stderr says `contract violated`.
@@ -233,9 +233,9 @@ MUTANTS = [
 
 ]
 
-# std:net mutants (module "net"): stdlib/net.or imports the internal std:fsraw, so a copy outside the library root cannot be
-# compiled. These mutants are applied to stdlib/net.or in place, the compiler (which embeds the library) is rebuilt with the
-# given compiler, and tests/std/net_test.or runs with the mutated compiler; stdlib/net.or is restored afterwards.
+# std:net mutants (module "net"): library/std/net.or imports the internal std:fsraw, so a copy outside the library root cannot be
+# compiled. These mutants are applied to library/std/net.or in place, the compiler (which embeds the library) is rebuilt with the
+# given compiler, and tests/std/net_test.or runs with the mutated compiler; library/std/net.or is restored afterwards.
 NET_MUTANTS = [
     ("net", "findFrom-misses-delimiter-at-end", "  while (i + m <= n) {", "  while (i + m < n) {"),
     ("net", "readUntil-receives-past-the-limit", "const r = recv(s, limit - this.pending.length(), left);", "const r = recv(s, limit, left);"),
@@ -252,21 +252,21 @@ NET_MUTANTS = [
 
 def net_mutant(orinc, mutant):
     """One NET_MUTANT: the compiler sources and the libraries it embeds are copied to the mutant's directory, the mutant
-    is applied to the copy of stdlib/net.or, the copy's embedded library is regenerated and the copy of the compiler is
+    is applied to the copy of library/std/net.or, the copy's embedded library is regenerated and the copy of the compiler is
     built with `orinc`; tests/std/net_test.or then runs with the mutated compiler. The working tree is never changed, so
     the mutants can run in parallel. Returns (output line, survived, error message or None)."""
     import subprocess as sp
     mod, name, old, new = mutant
-    orig = open(os.path.join(ROOT, "stdlib", "net.or"), encoding="utf-8").read()
+    orig = open(os.path.join(ROOT, "library", "std", "net.or"), encoding="utf-8").read()
     if orig.count(old) < 1:
         return None, False, "BAD MUTANT %s/%s: pattern not found" % (mod, name)
     d = os.path.join(OUT, "net_" + name)
     src = os.path.join(d, "src")
     os.makedirs(os.path.join(src, "tools"), exist_ok=True)
-    for sub in ("compiler", "stdlib", "std", "array"):
+    for sub in ("compiler", "library"):
         shutil.copytree(os.path.join(ROOT, sub), os.path.join(src, sub))
     shutil.copy(os.path.join(ROOT, "tools", "embed_prelude.py"), os.path.join(src, "tools"))
-    open(os.path.join(src, "stdlib", "net.or"), "w", encoding="utf-8").write(orig.replace(old, new, 1))
+    open(os.path.join(src, "library", "std", "net.or"), "w", encoding="utf-8").write(orig.replace(old, new, 1))
     sp.run([sys.executable, os.path.join(src, "tools", "embed_prelude.py")], cwd=src, check=True, stdout=sp.DEVNULL)
     c = os.path.join(d, "orin.c")
     r = sp.run([orinc, "compile", os.path.relpath(os.path.join(src, "compiler", "main.or"), ROOT), "-o", c], cwd=ROOT,
@@ -329,13 +329,13 @@ def std_mutant(orinc, mutant):
     rewrite = {"std:" + m: "./" + m for m in mods}
     mod, name, old, new = mutant[:4]
     extra = mutant[4] if len(mutant) > 4 else ""
-    src = open(os.path.join(ROOT, "stdlib", mod + ".or"), encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "library", "std", mod + ".or"), encoding="utf-8").read()
     if src.count(old) < 1:
         return None, None, "BAD MUTANT %s/%s: pattern not found" % (mod, name)
     d = os.path.join(OUT, mod + "_" + name)
     os.makedirs(d)
     for m in mods:
-        s = open(os.path.join(ROOT, "stdlib", m + ".or"), encoding="utf-8").read()
+        s = open(os.path.join(ROOT, "library", "std", m + ".or"), encoding="utf-8").read()
         if m == mod:
             s = s.replace(old, new, 1)
         for k, v in rewrite.items():

@@ -38,7 +38,7 @@ Functions/recursion, simple types `int/bool/string`, arrays, records, declaratio
 
 ## Milestones
 
-M0 language sketch and shared AST contracts; M1 Stage 0 compiles golden tests; M2 self-hosted Orin compiler source; M3 Stage 2+3 bootstrap; M4 typed memory IR + independent verifier; M5 classes/annotations/modules hardening; M6 stdlib/MCP; M7 backend optimization; M8 verified-core milestones.
+M0 language sketch and shared AST contracts; M1 Stage 0 compiles golden tests; M2 self-hosted Orin compiler source; M3 Stage 2+3 bootstrap; M4 typed memory IR + independent verifier; M5 classes/annotations/modules hardening; M6 library/std/MCP; M7 backend optimization; M8 verified-core milestones.
 
 ## Practical parallel-agent coordination
 

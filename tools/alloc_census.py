@@ -246,11 +246,11 @@ def cmd_identity(a):
 
 def src_path(p):
     if p.startswith("$stdlib/"):
-        return os.path.join(ROOT, "stdlib", p[len("$stdlib/"):])
+        return os.path.join(ROOT, "library", "std", p[len("$stdlib/"):])
     if p.startswith("$std/"):
-        return os.path.join(ROOT, "std", p[len("$std/"):])
+        return os.path.join(ROOT, "library", "core", p[len("$std/"):])
     if p.startswith("$array/"):
-        return os.path.join(ROOT, "array", p[len("$array/"):])
+        return os.path.join(ROOT, "library", "collections", p[len("$array/"):])
     return os.path.join(ROOT, p)
 
 

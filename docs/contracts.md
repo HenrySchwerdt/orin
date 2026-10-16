@@ -336,7 +336,7 @@ of its own):
 @Invariant(this.total == sumBy(this.items, it => it.price * it.qty))
 ```
 
-The runtime meaning is the code of `stdlib/seq.or` (`range` builds the index array, `sum` / `sumBy` are loops): under
+The runtime meaning is the code of `library/std/seq.or` (`range` builds the index array, `sum` / `sumBy` are loops): under
 `--check-contracts` the same clauses are executed. Unsupported: a lambda with a block body, a quantifier or sum inside a
 quantifier body, `reduce`.
 

@@ -14,7 +14,7 @@ also two distinct parsers, not one implementation to silently generalize:
 
 | Evidence | Current behavior / affected callers |
 |---|---|
-| [stdlib/json.or](../../stdlib/json.or), `parseNumber`, `Json`, `asInt` | `JNum(int)`; decimals/exponents rejected; public parser excludes i64 minimum; ordered duplicate fields retained, `get` returns last |
+| [library/std/json.or](../../stdlib/json.or), `parseNumber`, `Json`, `asInt` | `JNum(int)`; decimals/exponents rejected; public parser excludes i64 minimum; ordered duplicate fields retained, `get` returns last |
 | [compiler/json/parse.or](../../compiler/json/parse.or), `JsonCursor.number` | full i64 range; fractions validated then **truncated toward zero**; exponents rejected; string errors containing offsets |
 | [compiler/json/json.or](../../compiler/json/json.or), [write.or](../../compiler/json/write.or) | separate union, exhaustive `jsonEq`/writer; writer contracts depend on parse-back equality |
 | [compiler/lsp/handler.or](../../compiler/lsp/handler.or), [compiler/mcp/tools.or](../../compiler/mcp/tools.or) | integer positions, revisions and limits use `getInt`/`getPathInt`; a broad parser migration changes protocol inputs |
@@ -58,7 +58,7 @@ type JsonNumber = { token: string; };
 ```
 
 The sealed-number pattern already exists for Html in
-[stdlib/html.or](../../stdlib/html.or): callers can read its token but cannot
+[library/std/html.or](../../stdlib/html.or): callers can read its token but cannot
 forge a record literal or mutate the field outside its defining module. A checked
 factory establishes syntax even with contracts disabled. No new annotation,
 reflection, generic-method feature or arbitrary-precision runtime object is needed.

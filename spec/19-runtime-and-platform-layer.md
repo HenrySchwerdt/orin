@@ -18,7 +18,7 @@ model) cover the runtime as well.
 |---|---|---|---|
 | **L0 platform** (`platform/`) | C (or asm), freestanding style, no libc dependency beyond a declared list | raw memory: `page_alloc`/`page_free` (or `malloc`/`free` wrappers), byte load/store at an address, `memcpy`/`memmove`/`memcmp`; process: args, exit, abort; I/O: `read`/`write` on fds, open/close; clock; host policy and path-scope primitives for the capability grants (ADR-0027: `policy_parse/load`, `path_normalize/within/absolute/real`); later atomics and threads | each function has a written contract (pre/post/frame) and is verified separately (e.g. Frama-C/WP, VST, CBMC) or, until then, exhaustively tested and fuzzed; kept under a hard size budget (≤ 1,000 code lines, contracts and comments excluded: the budget limits trusted code, not its specification; no data structures) |
 | **L1 core runtime** (`core/`, Orin "core dialect") | Orin with a small set of *core intrinsics* (raw address type, load/store, size_of) usable **only** in modules the package manifest marks `core = true` | object header layout, `retain`/`release`/`make_unique`, allocation, arrays (push/pop/grow), strings (concat/append/compare/slice), struct slots, traps, the `ORIN_STATS` counters | proven to implement the operations of the formal memory model (refinement: each core function satisfies the corresponding Lean machine operation's specification); all core code also passes the MIR ownership verifier where it uses ordinary values |
-| **L2 std** (`std/`) | safe Orin only | string utilities (`split`, `trim`, `indexOf`, `parseInt`, number formatting), array utilities, `fs`/`process`/`io` wrappers over L0, later maps, JSON, … | ordinary safe Orin: memory safety follows from the language guarantees; functional correctness by tests and optional contracts (spec 15) |
+| **L2 std** (`library/core/`) | safe Orin only | string utilities (`split`, `trim`, `indexOf`, `parseInt`, number formatting), array utilities, `fs`/`process`/`io` wrappers over L0, later maps, JSON, … | ordinary safe Orin: memory safety follows from the language guarantees; functional correctness by tests and optional contracts (spec 15) |
 
 Rules:
 - Safe user code can never name core intrinsics; using them outside a `core` module is a compile
@@ -48,7 +48,7 @@ Documentation MUST state for each runtime function which layer it is in and whic
   `runtime/orin_runtime.c` (split, trim, indexOf/includes, parseInt, int/usize→string, join,
   slice/concat helpers) into Orin modules compiled with every program; keep C versions only where
   Stage 0 needs them. Differential tests old vs new; benchmarks.
-  **Status: done (2026-10-13).** The implementation lives in `std/` (repo root; embedded into the
+  **Status: done (2026-10-13).** The implementation lives in `library/core/` (repo root; embedded into the
   compiler by `tools/embed_prelude.py`, loaded implicitly via the general "prelude roots" mechanism,
   see docs/architecture.md "Preludes"). The checker keeps the same surface API; lowering maps the
   moved built-ins to calls of the prelude functions; unreachable prelude functions are pruned from the
@@ -66,12 +66,12 @@ spec 07: *safe Orin* (language guarantees, MIR-verified), *tested only*, *truste
 
 | Function (runtime/orin_runtime.{h,c}) | Layer | Status after R1 |
 |---|---|---|
-| `orin_str_index_of`, `orin_str_includes` | L2 | moved: `std/strings.or` `strIndexOf`, `strIncludes` (naive scan with first-byte filter instead of `memmem`); C copy kept for Stage 0 / `--c-builtins` |
+| `orin_str_index_of`, `orin_str_includes` | L2 | moved: `library/core/strings.or` `strIndexOf`, `strIncludes` (naive scan with first-byte filter instead of `memmem`); C copy kept for Stage 0 / `--c-builtins` |
 | `orin_str_starts_with`, `orin_str_ends_with` | L2 | moved: `strStartsWith`, `strEndsWith`; C copy kept |
 | `orin_str_split` | L2 | moved: `strSplit` (empty separator still traps `split with empty separator`, status 101, via `console.error` + `process.exit(101)`); C copy kept |
 | `orin_str_trim` | L2 | moved: `strTrim`; C copy kept |
 | `orin_array_join` | L2 | moved: `strJoin` (grows the result by repeated in-place append instead of a pre-sized buffer); C copy kept |
-| `orin_parse_int` | L2 | moved: `std/numbers.or` `strParseInt` (overflow checks done by hand; same accepted syntax); C copy kept |
+| `orin_parse_int` | L2 | moved: `library/core/numbers.or` `strParseInt` (overflow checks done by hand; same accepted syntax); C copy kept |
 | `orin_int_to_string`, `orin_usize_to_string`, `orin_bool_to_string` | L2 | moved: `intToString`, `usizeToString`, `boolToString` (no `snprintf`); C copies kept |
 | `orin_str_char_code_at` | L1 primitive | stays in C; now `static inline` in the header (the prelude loops over it) |
 | `orin_str_char_at`, `orin_str_substring`, `orin_string_from_char_code` | L1 primitive | stay in C: allocation, bounds traps, shared 1-byte immortals |

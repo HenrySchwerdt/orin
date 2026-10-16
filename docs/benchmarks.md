@@ -274,7 +274,7 @@ Notes.
 
 What changed: `split`, `trim`, `indexOf`, `includes`, `startsWith`, `endsWith`, `parseInt`,
 `int/usize/bool.toString()` and `string[].join` are no longer runtime C calls but Orin functions of the std
-prelude (`std/`), compiled with every program (only the reachable ones are emitted). `orin_str_char_code_at` became
+prelude (`library/core/`), compiled with every program (only the reachable ones are emitted). `orin_str_char_code_at` became
 `static inline`. Method: `tools/bench.py` with the pre-change `orin2` (copy of the binary built before R1) against the
 R1 `orin2`, same machine, back to back; the machine was shared and busy (load average 6-16 on 4 vCPUs, other
 jobs running), so only differences well above the Go/C columns' own drift are meaningful.
