@@ -91,15 +91,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(before, (root / "orin.lock").read_bytes())
         self.run_compiler("workspace", "lock", "--root", str(root))
         self.run_compiler("workspace", "check", "--root", str(root))
+        (root / "orin.lock").write_text('[member.removed]\npath = "old"\nversion = "0.0.1"\ndependencies = []\n')
+        self.run_cli("workspace", "lock", cwd=root)
+        self.run_cli("workspace", "check", cwd=root)
+        self.assertNotIn("removed", (root / "orin.lock").read_text())
 
     def test_workspace_refuses_project_or_unknown_lock(self):
         root = self.workspace()
         for contents in ("# Orin lock v1: name|kind|source|selector|commit\nx|git|repo|HEAD|abc\n",
-                         "do not overwrite this lock\n"):
+                         "do not overwrite this lock\n",
+                         '[member.notes]\nunknown = "data"\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\n',
+                         '[member.app]\npath = true\nversion = "0.1.0"\ndependencies = []\n',
+                         '[member.app]\npath = "app"\nversion = 1\ndependencies = []\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\ndependencies = "lib"\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\ndependencies = [1]\n',
+                         '[member.app]\npath = "app"\nversion = "0.1.0"\ndependencies = []\nunknown = "data"\n',
+                         '[member.app]\npath = "app"\npath = "other"\nversion = "0.1.0"\ndependencies = []\n'):
             (root / "orin.lock").write_text(contents)
             for invoke in (self.run_cli, self.run_compiler):
                 invoke("workspace", "lock", cwd=root, code=1)
-                self.assertEqual((root / "orin.lock").read_text(), contents)
+                self.assertEqual((root / "orin.lock").read_bytes(), contents.encode())
         (root / "orin.lock").unlink()
         (root / "orin.lock").mkdir()
         self.run_cli("workspace", "lock", cwd=root, code=1)
@@ -178,6 +190,18 @@ class CliTests(unittest.TestCase):
         for invoke in (self.run_cli, self.run_compiler):
             result = invoke("workspace", "list", cwd=root)
             self.assertEqual(result.stdout, "app\\x0aspoof  app\n")
+
+    def test_workspace_compact_diagnostic_escapes_terminal_controls(self):
+        root = self.cwd / "workspace\x1b[31m"
+        shutil.copytree(ROOT / "tests/workspace/ok/single", root)
+        (root / "orin-workspace.toml").write_text('[workspace]\nmembers = ["../\x1b[31m"]\n')
+        result = self.run_compiler("workspace", "list", cwd=root, code=1)
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertIn("\\x1b", result.stderr)
+        self.assertIn("E0505", result.stderr)
+        result = self.run_compiler("workspace", "list", "--root", str(root), code=1)
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertIn("workspace\\x1b", result.stderr)
 
     def test_workspace_fixtures_through_cli(self):
         count = 0
