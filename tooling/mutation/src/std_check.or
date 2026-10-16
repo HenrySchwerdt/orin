@@ -1,0 +1,353 @@
+// Mutation check of the provable std modules (ADR-0030 section 3, ADR-0028): port of tools/mutate_std.py.
+//
+// Each mutant is a one-line, deliberately wrong change of library/std/<module>.or (mutants_std.or). The std modules and the
+// test files of the module are copied to build/mutate_std/<module>_<mutant>/, the std imports are rewritten to relative
+// ones, the mutation is applied and `orin test` is run twice: with runtime contract checking (the default) and with
+// `--no-contracts`. A mutant is killed when a test fails; it is "killed by a contract" when a failing test's stderr says
+// `contract violated`. The mutants are independent (each has its own directory) and run in parallel (-j); the result lines
+// are printed in the fixed mutant order whatever the -j. Exit status 1 if any mutant survives (is not killed with
+// contracts on), 2 for a broken mutant (BAD MUTANT, COMPILE ERROR).
+//
+// The pure parts (selection, shards, import rewriting, the result lines and the summary) are checked by tests/std_check_test.or;
+// the worker of one mutant (`runStd`) only runs shell commands and returns exit statuses, the main task reads the files
+// they wrote and judges (`judgeStd`).
+
+import { ProcessGrant } from "std:process";
+import { FsGrant, writeFile, readFile } from "std:fs";
+import { shellTimeout } from "std:io";
+import { shq, replaceFirst, replaceAll, countOf, countLinePrefix, cutBytes, padEnd, padStart } from "./text";
+import { StdMutant } from "./mutants_std";
+import { NOT_RUN } from "./exec";
+
+export const OUT: string = "build/mutate_std";
+export const FAIL_TIMEOUT: int = -2;
+
+// The std modules a mutant directory holds (copied, imports rewritten); `net` is not among them.
+export function stdModules(): string[] {
+  return ["bytes", "utf8", "collections", "http", "text", "html", "ox", "taskcore"];
+}
+
+// Further test files of a module that also run against every mutant.
+function extraTests(target: string): string[] {
+  if (target == "utf8") {
+    return ["utf8_dfa_test"];
+  }
+  if (target == "collections") {
+    return ["sorted_btree_test"];
+  }
+  if (target == "http") {
+    return ["http_reject_test", "http_split_test", "http_prop_test"];
+  }
+  return [];
+}
+
+// Modules whose mutants stop at the first test file that kills them (the http property tests are slow).
+export function isEarlyExit(target: string): bool {
+  return target == "http";
+}
+
+// The test files of a module, in the order they run (fast and most selective first): TEST_ORDER, else <module>_test then EXTRA_TESTS.
+export function testFiles(target: string): string[] {
+  if (target == "http") {
+    return ["http_reject_test", "http_test", "http_split_test", "http_prop_test"];
+  }
+  return [target + "_test"].concat(extraTests(target));
+}
+
+// The mutants of shard i/N (1-based): every N-th mutant starting at the i-th, so slow mutants spread over the shards.
+export function selectShard(mutants: StdMutant[], i: usize, n: usize): StdMutant[] {
+  let out: StdMutant[] = [];
+  let k: usize = 0;
+  while (k < mutants.length) {
+    if (k % n == i - 1) {
+      out.push(mutants[k]);
+    }
+    k += 1;
+  }
+  return out;
+}
+
+// The mutants a run selects: `module` "" is every std module, otherwise the one; `net` has its own list.
+export function selectStd(std: StdMutant[], net: StdMutant[], module: string, i: usize, n: usize): StdMutant[] {
+  if (module == "net") {
+    return selectShard(net, i, n);
+  }
+  let pool: StdMutant[] = [];
+  for (const m of std) {
+    if ((module == "" || module == m.target) && m.target != "net") {
+      pool.push(m);
+    }
+  }
+  return selectShard(pool, i, n);
+}
+
+export function dirName(m: StdMutant): string {
+  return OUT + "/" + m.target + "_" + m.name;
+}
+
+// `"std:bytes"` -> `"./bytes"` for every module of the mutant directory.
+export function rewriteImports(text: string): string {
+  let s = text;
+  for (const m of stdModules()) {
+    s = replaceAll(s, "\"std:" + m + "\"", "\"./" + m + "\"");
+  }
+  return s;
+}
+
+export type Row = { target: string; name: string; status: string; fails1: usize; viol: usize; fails2: usize; };
+
+export function rowLine(r: Row): string {
+  return padEnd(r.target, 12) + " " + padEnd(r.name, 36) + " " + padEnd(r.status, 20) + " tests failing: "
+    + padStart(r.fails1.toString(), 2) + " (contract traps " + padStart(r.viol.toString(), 2) + "); without contracts: "
+    + padStart(r.fails2.toString(), 2);
+}
+
+// The per-module summary lines, modules in order of first appearance.
+export function summaryLines(rows: Row[]): string[] {
+  let mods: string[] = [];
+  let n: usize[] = [];
+  let killed: usize[] = [];
+  let contract: usize[] = [];
+  let testsOnly: usize[] = [];
+  for (const r of rows) {
+    let k: usize = 0;
+    while (k < mods.length && mods[k] != r.target) {
+      k += 1;
+    }
+    if (k == mods.length) {
+      mods.push(r.target);
+      n.push(0);
+      killed.push(0);
+      contract.push(0);
+      testsOnly.push(0);
+    }
+    n[k] += 1;
+    if (r.status != "SURVIVED") {
+      killed[k] += 1;
+    }
+    if (r.viol > 0) {
+      contract[k] += 1;
+    }
+    if (r.fails2 > 0) {
+      testsOnly[k] += 1;
+    }
+  }
+  let out: string[] = [];
+  let k: usize = 0;
+  while (k < mods.length) {
+    out.push(mods[k] + ": " + n[k].toString() + " mutants, " + killed[k].toString() + " killed (" + contract[k].toString()
+      + " with a contract violation), " + testsOnly[k].toString() + " killed without contracts");
+    k += 1;
+  }
+  return out;
+}
+
+// ------------------------------------------------------------------------------------------------------ the worker
+
+// What one std mutant runs: the test files (paths relative to the root), with their timeout, and the expect-trap test.
+export type StdJob = {
+  root: string;
+  orinc: string;        // as a command word, relative to the root (or absolute)
+  dir: string;          // build/mutate_std/<module>_<mutant>
+  tests: string[];      // test file names without .or
+  timeout: int;
+  early: bool;
+  extra: string;        // "" or the name of the expect-trap test written to dir
+};
+
+// Exit statuses of the runs of one mutant. rc1[k] / rc2[k]: test file k with contracts / without; `xrc`: the expect-trap test
+// (NOT_RUN when it did not run).
+export type StdRun = { rc1: int[]; rc2: int[]; xrc: int; };
+
+function cdRoot(root: string): string {
+  return "cd " + shq(root) + " && ";
+}
+
+function testCmd(j: StdJob, file: string, flag: string, out: string): string {
+  return cdRoot(j.root) + shq(j.orinc) + " test " + shq(file) + (flag == "" ? "" : " " + flag) + " > " + shq(out) + " 2>&1 </dev/null";
+}
+
+export function runStd(p: ProcessGrant, j: StdJob): StdRun {
+  let rc1: int[] = [];
+  let rc2: int[] = [];
+  let files1: string[] = [];
+  for (const t of j.tests) {
+    const f = j.dir + "/" + t + ".or";
+    const o1 = j.dir + "/" + t + ".out1";
+    const c1 = shellTimeout(p, testCmd(j, f, "", o1), j.timeout);
+    const c2 = shellTimeout(p, testCmd(j, f, "--no-contracts", j.dir + "/" + t + ".out2"), j.timeout);
+    rc1.push(c1);
+    rc2.push(c2);
+    files1.push(shq(o1));
+    if (j.early) {
+      // a timeout is a failing test; otherwise: does a line of the output start with `FAIL `?
+      if (c1 == FAIL_TIMEOUT || shellTimeout(p, cdRoot(j.root) + "grep -q '^FAIL ' " + shq(o1), 60) == 0) {
+        break;
+      }
+    }
+  }
+  let xrc = NOT_RUN;
+  if (j.extra != "") {
+    // only a mutant that survived the tests needs the expect-trap test
+    let failed = false;
+    for (const c of rc1) {
+      if (c == FAIL_TIMEOUT) {
+        failed = true;
+      }
+    }
+    if (!failed) {
+      failed = shellTimeout(p, cdRoot(j.root) + "grep -q -E '^FAIL |contract violated' " + files1.join(" "), 60) == 0;
+    }
+    if (!failed) {
+      xrc = shellTimeout(p, testCmd(j, j.dir + "/" + j.extra + ".or", "--no-contracts", j.dir + "/" + j.extra + ".out"), 900);
+    }
+  }
+  return StdRun { rc1: rc1, rc2: rc2, xrc: xrc };
+}
+
+// ------------------------------------------------------------------------------------------------------ the judge
+
+export type StdResult = { ok: bool; row: Row; line: string; error: string; };
+
+function readOut(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+// The output of a run: a timed-out run counts as a failing test, whatever it wrote.
+function outputOf(fs: FsGrant, root: string, rc: int, path: string, timeout: int): string {
+  if (rc == FAIL_TIMEOUT) {
+    return "FAIL (timeout after " + timeout.toString() + " s)\n";
+  }
+  return readOut(fs, root + "/" + path);
+}
+
+// Counts the failures of the runs of a mutant and decides its status (std_mutant of tools/mutate_std.py).
+export function judgeStd(fs: FsGrant, m: StdMutant, j: StdJob, r: StdRun): StdResult {
+  let fails1: usize = 0;
+  let fails2: usize = 0;
+  let viol: usize = 0;
+  let out1 = "";
+  let code1 = false;
+  let k: usize = 0;
+  while (k < r.rc1.length) {
+    const t = j.tests[k];
+    const o1 = outputOf(fs, j.root, r.rc1[k], j.dir + "/" + t + ".out1", j.timeout);
+    const o2 = outputOf(fs, j.root, r.rc2[k], j.dir + "/" + t + ".out2", j.timeout);
+    fails1 += countLinePrefix(o1, "FAIL ");
+    fails2 += countLinePrefix(o2, "FAIL ");
+    viol += countOf(o1, "contract violated");
+    out1 += o1;
+    if (r.rc1[k] == 1 && o1.includes("error[")) {
+      code1 = true;
+    }
+    k += 1;
+  }
+  const empty = Row { target: m.target, name: m.name, status: "", fails1: 0, viol: 0, fails2: 0 };
+  if (code1 && fails1 == 0) {
+    return StdResult { ok: false, row: empty, line: "",
+      error: "COMPILE ERROR in mutant " + m.target + "/" + m.name + ":\n" + cutBytes(out1, 600) };
+  }
+  let status = viol > 0 ? "killed by contract" : (fails1 > 0 ? "killed by tests" : "SURVIVED");
+  if (status == "SURVIVED" && m.extra != "" && r.xrc == 0) {
+    status = "killed by tests";
+    fails1 = 1;
+  }
+  const row = Row { target: m.target, name: m.name, status: status, fails1: fails1, viol: viol, fails2: fails2 };
+  return StdResult { ok: true, row: row, line: rowLine(row), error: "" };
+}
+
+// ----------------------------------------------------------------------------------------------------- the prepare
+
+function readLib(fs: FsGrant, root: string, path: string): string {
+  return readOut(fs, root + "/" + path);
+}
+
+// Sources read once per run: the std modules (imports rewritten), the other files of the mutant directories by name.
+export type Sources = { libRaw: string[]; libRewritten: string[]; names: string[]; texts: string[]; };
+
+// The files of tests/std that the mutants of `selected` copy: spec_sorted, the test files of each module, the expect-trap tests.
+export function neededTests(selected: StdMutant[]): string[] {
+  let rels: string[] = ["tests/std/spec_sorted.or"];
+  for (const m of selected) {
+    for (const t of testFiles(m.target)) {
+      if (!rels.includes("tests/std/" + t + ".or")) {
+        rels.push("tests/std/" + t + ".or");
+      }
+    }
+    if (m.extra != "" && !rels.includes("tests/std/expect_trap/" + m.extra + ".or")) {
+      rels.push("tests/std/expect_trap/" + m.extra + ".or");
+    }
+  }
+  return rels;
+}
+
+export function loadSources(fs: FsGrant, root: string, rels: string[]): Sources {
+  let raw: string[] = [];
+  let rew: string[] = [];
+  for (const m of stdModules()) {
+    const s = readLib(fs, root, "library/std/" + m + ".or");
+    raw.push(s);
+    rew.push(rewriteImports(s));
+  }
+  let texts: string[] = [];
+  for (const rel of rels) {
+    texts.push(rewriteImports(readLib(fs, root, rel)));
+  }
+  return Sources { libRaw: raw, libRewritten: rew, names: rels, texts: texts };
+}
+
+function moduleIndex(target: string): int {
+  let k: usize = 0;
+  for (const m of stdModules()) {
+    if (m == target) {
+      return k.toInt();
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+// A file of tests/std with the imports rewritten (read once by loadSources).
+function testText(fs: FsGrant, root: string, src: Sources, rel: string): string {
+  let k: usize = 0;
+  while (k < src.names.length) {
+    if (src.names[k] == rel) {
+      return src.texts[k];
+    }
+    k += 1;
+  }
+  return rewriteImports(readLib(fs, root, rel));
+}
+
+export type Prepared = { ok: bool; job: StdJob; error: string; };
+
+// Writes the files of the mutant directory (`dir` exists) and returns the job; an error for a pattern that is not found.
+export function prepareStd(fs: FsGrant, root: string, orinc: string, src: Sources, m: StdMutant): Prepared {
+  const dir = dirName(m);
+  const idx = moduleIndex(m.target);
+  const none = StdJob { root: root, orinc: orinc, dir: dir, tests: [], timeout: 0, early: false, extra: "" };
+  if (idx < 0 || countOf(src.libRaw[idx.toUsize()], m.oldText) < 1) {
+    return Prepared { ok: false, job: none, error: "BAD MUTANT " + m.target + "/" + m.name + ": pattern not found" };
+  }
+  let k: usize = 0;
+  for (const name of stdModules()) {
+    const text = k == idx.toUsize() ? rewriteImports(replaceFirst(src.libRaw[k], m.oldText, m.newText)) : src.libRewritten[k];
+    writeFile(fs, root + "/" + dir + "/" + name + ".or", text);
+    k += 1;
+  }
+  writeFile(fs, root + "/" + dir + "/spec_sorted.or", testText(fs, root, src, "tests/std/spec_sorted.or"));
+  const tests = testFiles(m.target);
+  for (const t of tests) {
+    writeFile(fs, root + "/" + dir + "/" + t + ".or", testText(fs, root, src, "tests/std/" + t + ".or"));
+  }
+  if (m.extra != "") {
+    writeFile(fs, root + "/" + dir + "/" + m.extra + ".or", testText(fs, root, src, "tests/std/expect_trap/" + m.extra + ".or"));
+  }
+  const early = isEarlyExit(m.target);
+  return Prepared { ok: true, error: "",
+    job: StdJob { root: root, orinc: orinc, dir: dir, tests: tests, timeout: early ? 120 : 900, early: early, extra: m.extra } };
+}

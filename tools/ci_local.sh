@@ -10,11 +10,13 @@ step "package smoke"           ./tools/package.sh 0.0.0-ci linux-x86_64
 step "install.sh + doctor"      tools/test_install.sh build/dist/orin-0.0.0-ci-linux-x86_64.tar.gz
 step "all suites (llvm)"       tools/conformance.sh --orinc build/bootstrap/orin2 --suite all --backend llvm
 step "conformance runner (unit)" tools/conformance.sh --unit-tests
+step "mutation tool (unit)"    tools/mutation.sh --unit-tests
 step "conformance parity (py/orin)" python3 tools/check_conformance_parity.py
-step "diff llvm"               python3 tools/diff_backends.py --mode llvm
-step "diff builtins"           python3 tools/diff_backends.py --mode builtins
-step "diff opt"                python3 tools/diff_backends.py --mode opt
-step "diff fuse"               python3 tools/diff_backends.py --mode fuse
+step "differential harness (unit)" tools/differential.sh --unit-tests
+step "diff llvm"               tools/differential.sh --mode llvm
+step "diff builtins"           tools/differential.sh --mode builtins
+step "diff opt"                tools/differential.sh --mode opt
+step "diff fuse"               tools/differential.sh --mode fuse
 step "formatter"               python3 tools/test_fmt.py
 step "tooling"                 ./tools/test_tooling.sh
 step "lsp"                     python3 tools/test_lsp.py

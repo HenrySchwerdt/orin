@@ -1,0 +1,97 @@
+import { assertEq, assertEqString, assertEqBool } from "std:test";
+import { parseArgs, parseShard, inShard } from "../src/cli";
+
+@Test
+function defaults(): void {
+  const p = parseArgs(["--mode", "opt"]);
+  assertEqBool(p.ok, true, "ok");
+  assertEqString(p.options.mode, "opt", "mode");
+  assertEqString(p.options.orinc, "build/bootstrap/orin2", "orinc");
+  assertEqString(p.options.cc, "cc", "cc");
+  assertEqString(p.options.filter, "", "filter");
+  assertEqBool(p.options.sanitize, false, "sanitize");
+  assertEqBool(p.options.list, false, "list");
+  assertEq(p.options.shardIndex, 1, "shard index");
+  assertEq(p.options.shardCount, 1, "shard count");
+  assertEqString(p.options.root, ".", "root");
+}
+
+@Test
+function everyFlag(): void {
+  const p = parseArgs(["--orinc", "/x/orin", "--cc", "clang", "--filter", "ox", "--sanitize", "--shard", "2/3", "--list", "--mode=fuse", "--root", "/r"]);
+  assertEqBool(p.ok, true, "ok");
+  assertEqString(p.options.orinc, "/x/orin", "orinc");
+  assertEqString(p.options.cc, "clang", "cc");
+  assertEqString(p.options.filter, "ox", "filter");
+  assertEqBool(p.options.sanitize, true, "sanitize");
+  assertEq(p.options.shardIndex, 2, "shard index");
+  assertEq(p.options.shardCount, 3, "shard count");
+  assertEqBool(p.options.list, true, "list");
+  assertEqString(p.options.mode, "fuse", "mode");
+  assertEqString(p.options.root, "/r", "root");
+}
+
+@Test
+function prefixesAndAmbiguity(): void {
+  const p = parseArgs(["--mo", "llvm", "--ori", "o2"]);
+  assertEqBool(p.ok, true, "prefixes");
+  assertEqString(p.options.mode, "llvm", "mode");
+  assertEqString(p.options.orinc, "o2", "orinc");
+  const a = parseArgs(["--s", "--mode", "opt"]);
+  assertEqBool(a.ok, false, "--s is ambiguous");
+  assertEqString(a.error, "ambiguous option: --s could match --sanitize, --shard", "message");
+}
+
+@Test
+function errors(): void {
+  assertEqString(parseArgs([]).error, "the following arguments are required: --mode", "mode required");
+  assertEqString(parseArgs(["--mode", "x"]).error, "argument --mode: invalid choice: 'x' (choose from 'opt', 'llvm', 'builtins', 'fuse')", "bad mode");
+  assertEqString(parseArgs(["--mode"]).error, "argument --mode: expected one argument", "missing value");
+  assertEqString(parseArgs(["--mode", "--list"]).error, "argument --mode: expected one argument", "option as value");
+  assertEqString(parseArgs(["--mode", "opt", "extra", "--nope"]).error, "unrecognized arguments: extra --nope", "unknown");
+  assertEqString(parseArgs(["--mode", "opt", "--list=1"]).error, "argument --list: ignored explicit argument '1'", "explicit");
+  assertEqString(parseArgs(["--mode", "opt", "--shard", "4"]).error, "argument --shard: --shard expects I/N, for example 2/3", "shard form");
+}
+
+@Test
+function helpWinsOverMissingMode(): void {
+  const p = parseArgs(["-h"]);
+  assertEqBool(p.ok, true, "ok");
+  assertEqBool(p.options.help, true, "help");
+}
+
+@Test
+function shardParsing(): void {
+  assertEqBool(parseShard("1/1").isOk(), true, "1/1");
+  assertEqBool(parseShard("3/3").isOk(), true, "3/3");
+  assertEqBool(parseShard("0/3").isErr(), true, "0/3");
+  assertEqBool(parseShard("4/3").isErr(), true, "4/3");
+  assertEqBool(parseShard("1/0").isErr(), true, "1/0");
+  assertEqString(parseShard("4/3").unwrapErr(), "--shard I/N needs 1 <= I <= N", "range message");
+  assertEqString(parseShard("a/3").unwrapErr(), "--shard expects I/N, for example 2/3", "form message");
+  assertEqString(parseShard("1/2/3").unwrapErr(), "--shard expects I/N, for example 2/3", "three parts");
+  assertEqString(parseShard("2").unwrapErr(), "--shard expects I/N, for example 2/3", "one part");
+}
+
+@Test
+function shardsPartitionThePrograms(): void {
+  let k: usize = 0;
+  while (k < 10) {
+    let hits = 0;
+    if (inShard(k, 1, 3)) {
+      hits += 1;
+    }
+    if (inShard(k, 2, 3)) {
+      hits += 1;
+    }
+    if (inShard(k, 3, 3)) {
+      hits += 1;
+    }
+    assertEq(hits, 1, "exactly one shard");
+    k += 1;
+  }
+  assertEqBool(inShard(0, 1, 3), true, "first program in shard 1");
+  assertEqBool(inShard(1, 2, 3), true, "second program in shard 2");
+  assertEqBool(inShard(3, 1, 3), true, "fourth program in shard 1");
+  assertEqBool(inShard(5, 1, 1), true, "1/1 selects everything");
+}
