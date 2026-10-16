@@ -1,0 +1,239 @@
+// Walker state and read-only context of the index passes, and the helpers that add definitions, references and locals.
+// Part of the semantic index (check/index/build.or).
+
+import { Span, SourceMap } from "../../diag";
+import { Ident, TypeExpr, Annotation } from "../../syntax";
+import { LoadedProgram } from "../../loader";
+import { Type, Local, Program, SymbolKind, SymbolDef, SymbolRef, TypeAt, ImplLink, AnnoUse, CallSite } from "../../hir";
+import { renderTE, renderTy } from "./render";
+import { FnKind, UnitTab } from "./tables";
+
+// The interface defs bounding the type parameters of a generic declaration, found for the HIR instances made from it:
+// `name` is the HIR name of the function (`prefix` false: "unit.f") or the prefix of the names of the constructor and
+// methods of a generic class (`prefix` true: "unit.C."), ADR-0019 / ADR-0026.
+export type BoundRule = { name: string; prefix: bool; defs: usize[]; };
+
+// Read-only context of pass 2.
+export type Ctx = {
+  prog: LoadedProgram;
+  sm: SourceMap;
+  tabs: UnitTab[];
+  hir: Option<Program>;
+  recDef: Option<usize>[];     // HIR record id -> its SkRecord def
+  tq: Map<string, usize>;      // qualified type name ("unit.Name") -> def, for classes' method references
+  fnDef: Option<usize>[];      // HIR function id -> the def it was lowered from (generic instances and lifted closures: the
+                               // enclosing generic function / function / method; function-value wrappers: the wrapped function)
+  fnKind: FnKind[];            // HIR function id -> what it was lowered from
+  bounds: BoundRule[];         // the declarations with bounded type parameters, in program order
+};
+
+// `q` is a parameter of the ordinary function body being walked (`np`, see W).
+export function isParamOf(np: Option<usize>, q: usize): bool {
+  return match (np) {
+    Some(n) => q < n,
+    None => false,
+  };
+}
+
+// A visible local or parameter of the AST walk: its name, def and the type the HIR gave it (None without HIR).
+export type Binding = { name: string; def: usize; ty: Option<Type>; };
+
+// Mutable walker state.
+export type W = {
+  defs: SymbolDef[];
+  refs: SymbolRef[];
+  types: TypeAt[];
+  impls: ImplLink[];           // `implements` links (ADR-0019)
+  calls: CallSite[];           // call sites (OSIG CALLS edges)
+  annos: AnnoUse[];            // uses of user-defined annotations (ADR-0046 S2)
+  cur: Option<usize>;          // caller def of the HIR body being walked
+  curMay: bool;                // the body is a lifted closure: its calls are MAY edges of the enclosing function
+  np: Option<usize>;           // parameter count of the ordinary function body being walked; None in a closure body (a
+                               // parameter of a closure is not one of the enclosing function)
+  bnd: usize[];                // interface defs bounding the type parameters of the generic function instance being walked
+  scope: Binding[];            // flat scope stack of the visible locals
+  marks: usize[];                // scope length at each open block
+  hn: usize;                   // next ordinary (non-generic) HIR function (pass 2 walks the HIR functions in source order)
+  tps: string[];               // type parameters in scope
+  unit: usize;
+  fn: Option<usize>;           // enclosing function def
+  hl: Local[];                 // HIR locals of the current function, matched by name along `hk` ...
+  hk: usize;                   // ... cursor into hl
+};
+
+// ---- state helpers ------------------------------------------------------------------------------
+
+export function addDef(w: W, name: string, kind: SymbolKind, nameSpan: Span, declSpan: Span, container: Option<usize>,
+    exported: bool, detail: string): W {
+  let x = w;
+  const id = x.defs.length;
+  x.defs.push(SymbolDef {
+    id: id, name: name, kind: kind, nameSpan: nameSpan, declSpan: declSpan, unit: x.unit,
+    container: container, exported: exported, detail: detail, deprecated: None
+  });
+  return x;
+}
+
+// Annotations (ADR-0024) as written in the source, one per line, for hover texts.
+function annotationText(sm: SourceMap, as: Annotation[]): string {
+  let out = "";
+  for (const a of as) {
+    const f = sm.files[a.span.file];
+    out += f.text.substring(a.span.start, a.span.end).split("\n").join(" ") + "\n";
+  }
+  return out;
+}
+
+// The source text of a range, line breaks turned into spaces.
+function sourceText(sm: SourceMap, sp: Span): string {
+  return sm.files[sp.file].text.substring(sp.start, sp.end).split("\n").join(" ");
+}
+
+// `addDef` for a declaration that may carry annotations: the hover detail starts with them and
+// `@Deprecated` is recorded on the definition.
+export function addDefA(w: W, name: string, kind: SymbolKind, nameSpan: Span, declSpan: Span, container: Option<usize>,
+    exported: bool, detail: string, as: Annotation[], sm: SourceMap): W {
+  let x = addDef(w, name, kind, nameSpan, declSpan, container, exported, annotationText(sm, as) + detail);
+  const owner = x.defs.length - 1;
+  for (const a of as) {
+    match (a.kind) {
+      ACustom(id, args) => {
+        let texts: string[] = [];
+        for (const e of args) {
+          texts.push(sourceText(sm, e.span));
+        }
+        x.annos.push(AnnoUse { owner: owner, name: id.name, nameSpan: id.span, def: None, args: texts });
+      },
+      _ => {}
+    }
+  }
+  for (const a of as) {
+    const isD = match (a.kind) {
+      ADeprecated => true,
+      _ => false
+    };
+    if (isD) {
+      x.defs[x.defs.length - 1].deprecated = Some(a.message);
+    }
+  }
+  return x;
+}
+
+export function addRef(w: W, sp: Span, def: usize): W {
+  let x = w;
+  x.refs.push(SymbolRef { span: sp, def: def });
+  return x;
+}
+
+export function pushScope(w: W): W {
+  let x = w;
+  x.marks.push(x.scope.length);
+  return x;
+}
+
+export function popScope(w: W): W {
+  let x = w;
+  const m = x.marks.pop();
+  const k = m.unwrapOr(0);
+  while (x.scope.length > k) {
+    x.scope.pop();
+  }
+  return x;
+}
+
+export function lookupLocal(w: W, name: string): Option<Binding> {
+  let i = w.scope.length;
+  while (i > 0) {
+    i -= 1;
+    if (w.scope[i].name == name) {
+      return Some(w.scope[i]);
+    }
+  }
+  return None;
+}
+
+export function children(defs: SymbolDef[], parent: usize): usize[] {
+  let out: usize[] = [];
+  let i = parent + 1;
+  while (i < defs.length) {
+    const hit = match (defs[i].container) {
+      Some(c) => c == parent,
+      None => false
+    };
+    if (!hit) {
+      break;
+    }
+    out.push(i);
+    i += 1;
+  }
+  return out;
+}
+
+export function fieldDef(w: W, rec: usize, name: string): Option<usize> {
+  for (const k of children(w.defs, rec)) {
+    if (w.defs[k].name == name) {
+      return Some(k);
+    }
+  }
+  return None;
+}
+
+// Declares a local or parameter: new def, scope entry, and its HIR type (matched by name along
+// the HIR locals of the current function, which the checker allocates in declaration order).
+export function declare(w: W, c: Ctx, id: Ident, declSpan: Span, kind: SymbolKind, label: string, annot: Option<TypeExpr>): W {
+  let x = w;
+  let ty: Option<Type> = None;
+  let k = x.hk;
+  while (k < x.hl.length) {
+    if (x.hl[k].name == id.name) {
+      ty = Some(x.hl[k].ty);
+      x.hk = k + 1;
+      break;
+    }
+    k += 1;
+  }
+  let text = "";
+  match (annot) {
+    Some(t) => { text = renderTE(t); },
+    None => {
+      match (ty) {
+        Some(t) => {
+          match (c.hir) {
+            Some(p) => { text = renderTy(p, t); },
+            None => {}
+          }
+        },
+        None => {}
+      }
+    }
+  }
+  let detail = label + " " + id.name;
+  if (text.length > 0) {
+    detail += ": " + text;
+  }
+  const did = x.defs.length;
+  x = addDef(x, id.name, kind, id.span, declSpan, x.fn, false, detail);
+  x.scope.push(Binding { name: id.name, def: did, ty: ty });
+  return x;
+}
+
+export function isTypeParam(w: W, name: string): bool {
+  return w.tps.includes(name);
+}
+
+export function newW(): W {
+  return W {
+    defs: [], refs: [], types: [], impls: [], calls: [], annos: [], cur: None, curMay: false, np: None, bnd: [], scope: [],
+    marks: [], hn: 0, tps: [], unit: 0, fn: None, hl: [], hk: 0
+  };
+}
+
+export function lookupVal(w: W, c: Ctx, name: string): Option<usize> {
+  const t = c.tabs[w.unit];
+  return t.valDef(name);
+}
+
+export function lookupType(w: W, c: Ctx, name: string): Option<usize> {
+  const t = c.tabs[w.unit];
+  return t.typeDef(name);
+}

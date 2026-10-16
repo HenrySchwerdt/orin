@@ -234,8 +234,8 @@ no node object. See docs/benchmarks.md "HTML rendering".
 
 - `python3 tools/run_tests.py --suite next --filter ox` — conformance and error tests (including the `ox_widgets` and
   `ox_xml` providers and the provider error directories).
-- `tools/test_std.sh tests/std/html_test.or`, `python3 tools/mutate_std.py --module html` — `std:html` and its `ox()`
+- `tools/test_std.sh tests/std/html_test.or`, `tools/mutation.sh std --module html` — `std:html` and its `ox()`
   literal.
-- `python3 tools/mutate_ox.py -j 2` — builds the compiler with each deliberate bug in the lexer, parser and checker and
+- `tools/mutation.sh ox -j 2` — builds the compiler with each deliberate bug in the lexer, parser and checker and
   requires the OX tests to catch it.
 - `python3 tools/bench.py --only html,html_hand --no-selfcompile` — the benchmark.
