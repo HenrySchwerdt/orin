@@ -1,0 +1,524 @@
+// Pure HIR helpers of the fusion pass (fuse.or): recognising array-API calls, facts about expressions (may it trap, does it
+// mention a local), and renumbering the locals of an inlined closure. No state; split out of fuse.or (ADR-0049, A4).
+
+import { Span } from "../diag";
+import {
+  Type, Function, RecordDef, FieldDef, HBlock, HStmt, HExpr, HExprKind, Place,
+  PlaceElem, HArm, HPattern, FieldInitH, BinOp, UnOp, Builtin, HLet, HAssign, HExprStmt,
+  HIf, HWhile, HForOf, HBreak, HContinue, HReturn, HBlockStmt, foldExpr,
+} from "../hir";
+import { closureBody, returnedExpr } from "../check";
+
+// ------------------------------------------------------------------------------------------------ recognising calls
+
+// The array-API operation implemented by the prelude function `name`, "" for any other function.
+export function arrayOp(name: string): string {
+  const pre = "$array/array.";
+  if (!name.startsWith(pre)) {
+    return "";
+  }
+  const rest = name.substring(pre.length, name.length);
+  const ops = ["map", "filter", "reduce", "some", "every", "findIndex", "find", "forEach"];
+  for (const o of ops) {
+    if (rest.startsWith(o + "<")) {
+      return o;
+    }
+  }
+  if (rest.startsWith("indexOf")) {
+    return "indexOf";
+  }
+  if (rest.startsWith("includes")) {
+    return "includes";
+  }
+  return "";
+}
+
+// Operations that end a chain with a single value and may stop at the first hit.
+export function isEarlyExit(op: string): bool {
+  return op == "some"
+      || op == "every"
+      || op == "find"
+      || op == "findIndex"
+      || op == "includes"
+      || op == "indexOf";
+}
+
+// The arity of an operation's function argument (0 when it has none).
+export function closureArity(op: string): usize {
+  if (op == "reduce") {
+    return 2;
+  }
+  if (op == "includes" || op == "indexOf" || op == "toArray") {
+    return 0;
+  }
+  return 1;
+}
+
+export function isRefType(t: Type): bool {
+  return match (t) {
+    TyInt => false,
+    TyUsize => false,
+    TyIntK(_) => false,
+    TyBool => false,
+    TyFloat => false,
+    TyF32 => false,
+    TyFile => false,
+    TyGrant(_) => false,
+    TyVoid => false,
+    _ => true,
+  };
+}
+
+export function elemOf(t: Type): Type {
+  return match (t) {
+    TyArray(e) => e,
+    _ => TyVoid,
+  };
+}
+
+// A value of type t that the fused per-chunk fold can start from before its first element (never read before it is
+// overwritten): scalars and strings only.
+export function placeholder(t: Type, sp: Span): Option<HExpr> {
+  return match (t) {
+    TyInt => Some(mk(XInt(0), t, sp)),
+    TyUsize => Some(mk(XInt(0), t, sp)),
+    TyIntK(_) => Some(mk(XInt(0), t, sp)),
+    TyBool => Some(mk(XBool(false), t, sp)),
+    TyFloat => Some(mk(XFloat("0.0"), t, sp)),
+    TyF32 => Some(mk(XFloat("0.0"), t, sp)),
+    TyString => Some(mk(XStr(""), t, sp)),
+    _ => None,
+  };
+}
+
+export function mk(k: HExprKind, t: Type, sp: Span): HExpr {
+  return HExpr { kind: k, ty: t, span: sp };
+}
+
+// ------------------------------------------------------------------------------------------------ expression facts
+
+// An expression that is evaluated without effects and without a trap (literals, locals, fields, non-trapping operators):
+// it may move before or after the stages of a chain.
+export function isSimple(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => true,
+    XFloat(_) => true,
+    XBool(_) => true,
+    XStr(_) => true,
+    XLocal(_) => true,
+    XField(b, _, _) => isSimple(b),
+    XUnary(op, x) => match (op) {
+      UnNot => isSimple(x),
+      UnNeg => isFloatT(x.ty) && isSimple(x),
+    },
+    XBinary(op, a, b) => !binaryMayTrap(op, a, b) && isSimple(a) && isSimple(b),
+    XCond(c, a, b) => isSimple(c) && isSimple(a) && isSimple(b),
+    _ => false,
+  };
+}
+
+function isFloatT(t: Type): bool {
+  return match (t) {
+    TyFloat => true,
+    TyF32 => true,
+    _ => false,
+  };
+}
+
+function isIntT(t: Type): bool {
+  return match (t) {
+    TyInt => true,
+    TyUsize => true,
+    TyIntK(_) => true,
+    _ => false,
+  };
+}
+
+// Integer + - * can overflow, / and % can divide by zero (or overflow for MIN / -1); a division by a constant other than
+// 0 and -1 cannot trap.
+function binaryMayTrap(op: BinOp, a: HExpr, b: HExpr): bool {
+  if (!isIntT(a.ty)) {
+    return false;
+  }
+  return match (op) {
+    OpAdd => true,
+    OpSub => true,
+    OpMul => true,
+    OpDiv => !safeDivisor(b),
+    OpRem => !safeDivisor(b),
+    _ => false,
+  };
+}
+
+function safeDivisor(b: HExpr): bool {
+  return match (b.kind) {
+    XInt(v) => v != 0 && v != -1,
+    _ => false,
+  };
+}
+
+// Built-ins that never trap (and have no effect).
+function safeBuiltin(b: Builtin): bool {
+  return match (b) {
+    BStrLength => true,
+    BArrLength => true,
+    BStrIncludes => true,
+    BStrStartsWith => true,
+    BStrEndsWith => true,
+    BStrIndexOf => true,
+    BStrTrim => true,
+    BIntToString => true,
+    BUsizeToString => true,
+    BBoolToString => true,
+    BFloatToString => true,
+    BF32ToString => true,
+    BIntToFloat => true,
+    BUsizeToFloat => true,
+    BF32ToFloat => true,
+    BF32Round => true,
+    BFloatFloor => true,
+    BFloatCeil => true,
+    BFloatRound => true,
+    BFloatSqrt => true,
+    BFloatAbs => true,
+    BFloatPow => true,
+    BFloatIsNaN => true,
+    BFloatIsFinite => true,
+    BOptIsSome => true,
+    BOptIsNone => true,
+    BOptUnwrapOr => true,
+    BResIsOk => true,
+    BResIsErr => true,
+    BIntId => true,
+    BParseInt => true,
+    BParseFloat => true,
+    BParseIntK => true,
+    BIntChk => true,
+    _ => false,
+  };
+}
+
+// May evaluating `e` trap? Conservative: a call of a function, an index, an unwrap, a checked integer operation. The test
+// is per node (`nodeMayTrap`); the fold (hir/walk.or) asks it of every sub-expression.
+export function mayTrap(e: HExpr): bool {
+  return foldExpr(e, false, trapStep);
+}
+
+function trapStep(e: HExpr, t: bool): bool {
+  return t || nodeMayTrap(e);
+}
+
+function nodeMayTrap(e: HExpr): bool {
+  return match (e.kind) {
+    XInt(_) => false,
+    XFloat(_) => false,
+    XBool(_) => false,
+    XStr(_) => false,
+    XLocal(_) => false,
+    XUnary(op, x) => match (op) {
+      UnNot => false,
+      UnNeg => isIntT(x.ty),
+    },
+    XBinary(op, a, b) => binaryMayTrap(op, a, b),
+    XBuiltin(b, _) => !safeBuiltin(b),
+    XField(_, _, _) => false,
+    XRecord(_, _, _) => false,
+    XVariant(_, _) => false,
+    XArray(_) => false,
+    XCond(_, _, _) => false,
+    XClosure(_, _) => false,
+    _ => true,
+  };
+}
+
+export function stmtsMayTrap(ss: HStmt[]): bool {
+  for (const s of ss) {
+    const t = match (s) {
+      HLet(_, e) => mayTrap(e),
+      HReturn(o) => match (o) {
+        Some(e) => mayTrap(e),
+        None => false,
+      },
+      HExprStmt(e) => mayTrap(e),
+      _ => true,
+    };
+    if (t) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Does `e` mention local `l` (or leave its function: `?`)? Used to refuse bodies that cannot be inlined.
+function exprMentions(e: HExpr, l: usize): bool {
+  return match (e.kind) {
+    XLocal(k) => k == l,
+    XTry(_) => true,
+    XUnary(_, x) => exprMentions(x, l),
+    XBinary(_, a, b) => exprMentions(a, l) || exprMentions(b, l),
+    XCall(_, args) => anyMentions(args, l),
+    XBuiltin(_, args) => anyMentions(args, l),
+    XMutMethod(_, p, args) => p.root == l || placeMentions(p, l) || anyMentions(args, l),
+    XField(b, _, _) => exprMentions(b, l),
+    XIndex(a, b) => exprMentions(a, l) || exprMentions(b, l),
+    XRecord(_, spread, fields) => {
+      let m = false;
+      match (spread) {
+        Some(x) => {
+          m = exprMentions(x, l);
+        },
+        None => {},
+      }
+      for (const f of fields) {
+        if (exprMentions(f.value, l)) {
+          m = true;
+        }
+      }
+      return m;
+    },
+    XVariant(_, args) => anyMentions(args, l),
+    XArray(xs) => anyMentions(xs, l),
+    XCond(c, a, b) => exprMentions(c, l) || exprMentions(a, l) || exprMentions(b, l),
+    XMatch(x, arms) => {
+      if (exprMentions(x, l)) {
+        return true;
+      }
+      for (const a of arms) {
+        if (blockMentions(a.body, l)) {
+          return true;
+        }
+        match (a.value) {
+          Some(v) => {
+            if (exprMentions(v, l)) {
+              return true;
+            }
+          },
+          None => {},
+        }
+      }
+      return false;
+    },
+    XClosure(_, caps) => anyMentions(caps, l),
+    XCallIndirect(c, args) => exprMentions(c, l) || anyMentions(args, l),
+    XIface(_, v) => exprMentions(v, l),
+    XCallVirtual(r, _, args) => exprMentions(r, l) || anyMentions(args, l),
+    _ => false,
+  };
+}
+
+function anyMentions(es: HExpr[], l: usize): bool {
+  for (const e of es) {
+    if (exprMentions(e, l)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function placeMentions(p: Place, l: usize): bool {
+  for (const el of p.path) {
+    match (el) {
+      PIndex(ix) => {
+        if (exprMentions(ix, l)) {
+          return true;
+        }
+      },
+      _ => {},
+    }
+  }
+  return false;
+}
+
+// A nested block of a match arm: any `return` leaves the closure, so it counts as a mention (not inlinable).
+function blockMentions(b: HBlock, l: usize): bool {
+  for (const s of b.stmts) {
+    const m = match (s) {
+      HLet(_, e) => exprMentions(e, l),
+      HAssign(p, _, e) => p.root == l || placeMentions(p, l) || exprMentions(e, l),
+      HExprStmt(e) => exprMentions(e, l),
+      HIf(c, t, el) => exprMentions(c, l)
+          || blockMentions(t, l)
+          || match (el) {
+            Some(x) => blockMentions(x, l),
+            None => false,
+          },
+      HWhile(c, body) => exprMentions(c, l) || blockMentions(body, l),
+      HForOf(_, it, body) => exprMentions(it, l) || blockMentions(body, l),
+      HReturn(_) => true,
+      HBlockStmt(x) => blockMentions(x, l),
+      _ => false,
+    };
+    if (m) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The body of lifted closure `f` can be inlined: `let`s and one final `return e` (or, for a void closure, `let`s and
+// expression statements), none of which leaves the closure early or reads the environment parameter directly.
+export function inlinable(f: Function, isVoidFn: bool): bool {
+  const body = closureBody(f);
+  if (!isVoidFn && body.length == 0) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < body.length) {
+    const last = i + 1 == body.length;
+    const ok = match (body[i]) {
+      HLet(_, e) => !exprMentions(e, 0),
+      HExprStmt(e) => isVoidFn && !exprMentions(e, 0),
+      HReturn(o) => match (o) {
+        Some(e) => last && !isVoidFn && !exprMentions(e, 0),
+        None => false,
+      },
+      _ => false,
+    };
+    if (!ok) {
+      return false;
+    }
+    i += 1;
+  }
+  if (!isVoidFn) {
+    return returnedExpr(f).isSome() || endsWithReturn(body);
+  }
+  return true;
+}
+
+function endsWithReturn(body: HStmt[]): bool {
+  if (body.length == 0) {
+    return false;
+  }
+  return match (body[body.length - 1]) {
+    HReturn(o) => o.isSome(),
+    _ => false,
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ renaming locals
+
+// Local j >= 1 of an inlined closure becomes local base + j - 1 of the host.
+export function rl(l: usize, base: usize): usize {
+  return base + l - 1;
+}
+
+function rnExprs(es: HExpr[], base: usize): HExpr[] {
+  let out: HExpr[] = [];
+  for (const e of es) {
+    out.push(rnExpr(e, base));
+  }
+  return out;
+}
+
+function rnPlace(p: Place, base: usize): Place {
+  let path: PlaceElem[] = [];
+  for (const el of p.path) {
+    path.push(
+      match (el) {
+        PIndex(ix) => PIndex(rnExpr(ix, base)),
+        _ => el,
+      },
+    );
+  }
+  return Place { root: rl(p.root, base), path: path, ty: p.ty };
+}
+
+export function rnExpr(e: HExpr, base: usize): HExpr {
+  const k: HExprKind = match (e.kind) {
+    XLocal(l) => XLocal(rl(l, base)),
+    XUnary(op, x) => XUnary(op, rnExpr(x, base)),
+    XBinary(op, a, b) => XBinary(op, rnExpr(a, base), rnExpr(b, base)),
+    XCall(f, args) => XCall(f, rnExprs(args, base)),
+    XBuiltin(b, args) => XBuiltin(b, rnExprs(args, base)),
+    XMutMethod(m, p, args) => XMutMethod(m, rnPlace(p, base), rnExprs(args, base)),
+    XField(b, r, i) => XField(rnExpr(b, base), r, i),
+    XIndex(a, b) => XIndex(rnExpr(a, base), rnExpr(b, base)),
+    XRecord(r, spread, fields) => XRecord(r, rnOpt(spread, base), rnFields(fields, base)),
+    XVariant(t, args) => XVariant(t, rnExprs(args, base)),
+    XArray(xs) => XArray(rnExprs(xs, base)),
+    XTry(x) => XTry(rnExpr(x, base)),
+    XCond(c, a, b) => XCond(rnExpr(c, base), rnExpr(a, base), rnExpr(b, base)),
+    XMatch(x, arms) => XMatch(rnExpr(x, base), rnArms(arms, base)),
+    XClosure(f, caps) => XClosure(f, rnExprs(caps, base)),
+    XCallIndirect(c, args) => XCallIndirect(rnExpr(c, base), rnExprs(args, base)),
+    XIface(v, x) => XIface(v, rnExpr(x, base)),
+    XCallVirtual(r, s, args) => XCallVirtual(rnExpr(r, base), s, rnExprs(args, base)),
+    _ => e.kind,
+  };
+  return HExpr { kind: k, ty: e.ty, span: e.span };
+}
+
+function rnOpt(o: Option<HExpr>, base: usize): Option<HExpr> {
+  return match (o) {
+    Some(x) => Some(rnExpr(x, base)),
+    None => None,
+  };
+}
+
+function rnFields(fs: FieldInitH[], base: usize): FieldInitH[] {
+  let out: FieldInitH[] = [];
+  for (const f of fs) {
+    out.push(FieldInitH { index: f.index, value: rnExpr(f.value, base) });
+  }
+  return out;
+}
+
+function rnArms(arms: HArm[], base: usize): HArm[] {
+  let out: HArm[] = [];
+  for (const a of arms) {
+    out.push(HArm {
+      pattern: rnPattern(a.pattern, base),
+      body: rnBlock(a.body, base),
+      value: rnOpt(a.value, base),
+    });
+  }
+  return out;
+}
+
+function rnPattern(p: HPattern, base: usize): HPattern {
+  return match (p) {
+    HPVariant(tag, binds) => {
+      let bs: Option<usize>[] = [];
+      for (const b of binds) {
+        bs.push(
+          match (b) {
+            Some(l) => Some(rl(l, base)),
+            None => None,
+          },
+        );
+      }
+      return HPVariant(tag, bs);
+    },
+    _ => p,
+  };
+}
+
+function rnBlock(b: HBlock, base: usize): HBlock {
+  let out: HStmt[] = [];
+  for (const s of b.stmts) {
+    out.push(rnStmt(s, base));
+  }
+  return HBlock { stmts: out };
+}
+
+export function rnStmt(s: HStmt, base: usize): HStmt {
+  return match (s) {
+    HLet(l, e) => HLet(rl(l, base), rnExpr(e, base)),
+    HAssign(p, op, e) => HAssign(rnPlace(p, base), op, rnExpr(e, base)),
+    HExprStmt(e) => HExprStmt(rnExpr(e, base)),
+    HIf(c, t, el) => HIf(
+      rnExpr(c, base),
+      rnBlock(t, base),
+      match (el) {
+        Some(x) => Some(rnBlock(x, base)),
+        None => None,
+      },
+    ),
+    HWhile(c, b) => HWhile(rnExpr(c, base), rnBlock(b, base)),
+    HForOf(l, it, b) => HForOf(rl(l, base), rnExpr(it, base), rnBlock(b, base)),
+    HReturn(o) => HReturn(rnOpt(o, base)),
+    HBlockStmt(b) => HBlockStmt(rnBlock(b, base)),
+    _ => s,
+  };
+}
+
