@@ -195,7 +195,7 @@ proof.
      `--backend=llvm`, clang links `orin2-llvm`, and `orin2-llvm` emits C identical to `stage2.c` and LLVM IR identical to the
      first `.ll` (and, with `--deep`, so does a third compiler built from that `.ll`). No difference was found.
   3. **Toolchain:** a pinned LLVM version is used, as described below.
-     **Status (2026-10-16): met.** LLVM 19.1.7, `dist/llvm.pin`, `orin toolchain install`; see the addendum "the pinned LLVM toolchain".
+     **Status (2026-10-16): met; LLVM is the release default (owner, 2026-10-16).** LLVM 19.1.7, `dist/llvm.pin`, `orin toolchain install`; see the addendum "the pinned LLVM toolchain".
 - **Toolchain: pinned, not bundled into the compiler.**
   - Orin keeps emitting textual LLVM IR, but only for **one pinned LLVM version**. The pin is recorded in the
     repository and checked in CI.
@@ -865,8 +865,8 @@ frees many small buffers (sortedmap +1.7 MB, mapfreq +0.7 MB, self-compile +2.0 
 Gate 3 of section 8 is: a pinned LLVM version is used; the pin is recorded in the repository and checked in CI;
 `orin toolchain install` downloads the matching `clang`/`llc` into `~/.orin/toolchains/llvm-<version>`, verified by checksum;
 `orin doctor` reports the installed version and whether it matches; without a matching LLVM, `--release` falls back to the C
-backend and says so. Gates 1 and 2 were already met. **Status: met.** LLVM is **still not the release default**; that is a
-separate decision (below).
+backend and says so. Gates 1 and 2 were already met. **Status: met.** The release default was a separate decision (below);
+the owner took it on 2026-10-16: `orin build|run|test --release` now defaults to LLVM, `--backend=c` is the explicit fallback.
 
 - **The pin** is `dist/llvm.pin` (shipped as `lib/orin/llvm.pin`): `version 19.1.7` and, per platform (`linux-x86_64`,
   `linux-aarch64`, `macos-arm64`), the URL and sha256 of the official, unmodified LLVM release archive. There is no
@@ -889,3 +889,6 @@ separate decision (below).
   (the ADR says "may"); they ship only the pin. (3) The checksums are those of the archives downloaded while writing this change,
   not compared with a checksum published by LLVM. (4) The real download was exercised only on linux-x86_64; the aarch64 and
   macOS entries are checksummed but not run.
+
+**Decision (2026-10-16, owner): LLVM is the `--release` default.** Without the pinned toolchain the default release build uses a system
+`clang` of at least the pin's major version, else falls back to C with one note. Both backends run the same optimiser at `-O2`.

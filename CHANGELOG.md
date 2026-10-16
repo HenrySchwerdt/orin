@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **`--release` defaults to the LLVM backend (ADR-0038 section 8, owner's decision).** `orin build|run|test --release` now compiles with
+  LLVM; `--backend=c` is the explicit fallback and dev builds stay on C. Without the pinned toolchain the default release build uses
+  a system `clang` whose major version is at least the pin's and otherwise falls back to C with one note; a `CC` that is not clang
+  keeps C. Both backends run the same MIR optimiser and compile at `-O2`. `tools/test_cli.py` covers default, fallback, `--backend=c`
+  and `CC` precedence.
 - **Pinned LLVM toolchain (ADR-0038 section 8, gate 3).** New `orin toolchain install [--force]` / `status` (in `dist/orin`, wired
   into `dist/orin-cli.sh`): it downloads the LLVM release pinned in `dist/llvm.pin` (19.1.7; linux-x86_64, linux-aarch64,
   macos-arm64), refuses the archive unless its sha256 matches the pin, unpacks `clang`, `llc` and clang's resource directory (about

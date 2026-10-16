@@ -107,9 +107,9 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    bintrees (f, deferred: measured 2026-10-16, free lists and iterative release already exist, regions would give about -50 %
    on bintrees alone and nothing elsewhere; ADR-0038 addendum); packed arrays (b). Done on the way: small-block cache for
    strings and array buffers, self-compile -4.9 %, wordfreq -13 %, mapfreq -9 %.
-4. **LLVM default for `--release`** (ADR-0038 §8). Gate 3 is met (2026-10-16: pinned LLVM 19.1.7, `dist/llvm.pin`,
+4. **LLVM default for `--release`** (ADR-0038 §8): **done** (owner, 2026-10-16); `--backend=c` is the explicit fallback. Gate 3 is met (2026-10-16: pinned LLVM 19.1.7, `dist/llvm.pin`,
    `orin toolchain install` verifies the sha256; `orin doctor` reports it; `--release --backend=llvm` without it falls back to C
-   and says so). LLVM is not yet the release default: the decision is the owner's (`release_backend` in `dist/orin-cli.sh`).
+   and says so). `--release` now defaults to LLVM (`release_backend` in `dist/orin-cli.sh`); without the pinned clang it uses a system clang at least as new as the pin, else C.
    Not bundled in the packages; aarch64 / macOS downloads unexercised. Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
    the LLVM-built compiler emits the same C and the same `.ll` as orin2, also with a third stage). Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
