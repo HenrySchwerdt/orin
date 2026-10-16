@@ -672,6 +672,77 @@ OrinObj *orin_str_append(OrinObj *a, OrinObj *b) {
     return &r->h;
 }
 
+/* a += decimal text of v. The shared tail of orin_str_append_int / _usize: the digits are formed in a local buffer, then
+   appended with the growth and the sharing rule of orin_str_append (in place only when a->rc == 1). */
+static OrinObj *str_append_decimal(OrinObj *a, uint64_t v, int neg) {
+    char buf[24];
+    int i = (int)sizeof buf;
+    do { buf[--i] = (char)('0' + v % 10); v /= 10; } while (v);
+    if (neg) buf[--i] = '-';
+    const uint64_t k = (uint64_t)sizeof buf - (uint64_t)i;
+    OrinString *x = (OrinString *)a;
+    uint64_t n = x->len + k;
+    if (a->rc == 1) {
+        if (n > x->cap) {
+            uint64_t cap = x->cap * 2;
+            if (cap < n) cap = n;
+            if (cap < 16) cap = 16;
+            uint64_t oldcap = x->cap; (void)oldcap;
+            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            ORIN_STAT(orin_stats.live_bytes += cap - oldcap);
+            ORIN_STAT(orin_stats.string_grows++);
+            SITE_GROW(&x->h, cap - oldcap);
+            x->cap = cap;
+        }
+        orin_platform_mem_copy(x->data + x->len, buf + i, k);
+        x->len = n;
+        x->data[n] = 0;
+        return &x->h;
+    }
+    OrinString *r = str_alloc(n, n + n / 2 + 8);
+    if (x->len) orin_platform_mem_copy(r->data, x->data, x->len);
+    orin_platform_mem_copy(r->data + x->len, buf + i, k);
+    orin_release(a);
+    return &r->h;
+}
+
+OrinObj *orin_str_append_sub(OrinObj *a, OrinObj *s, uint64_t i, uint64_t j) {
+    OrinString *y = (OrinString *)s;
+    if (i > j || j > y->len) orin_trap("substring out of range");
+    if (i == j) return a;
+    OrinString *x = (OrinString *)a;
+    const uint64_t k = j - i;
+    const uint64_t n = x->len + k;
+    if (a->rc == 1 && a != s) {
+        if (n > x->cap) {
+            uint64_t cap = x->cap * 2;
+            if (cap < n) cap = n;
+            if (cap < 16) cap = 16;
+            uint64_t oldcap = x->cap; (void)oldcap;
+            x = (OrinString *)xrealloc(x, sizeof(OrinString) + cap + 1);
+            ORIN_STAT(orin_stats.live_bytes += cap - oldcap);
+            ORIN_STAT(orin_stats.string_grows++);
+            SITE_GROW(&x->h, cap - oldcap);
+            x->cap = cap;
+        }
+        orin_platform_mem_copy(x->data + x->len, y->data + i, k);
+        x->len = n;
+        x->data[n] = 0;
+        return &x->h;
+    }
+    OrinString *r = str_alloc(n, n + n / 2 + 8);
+    if (x->len) orin_platform_mem_copy(r->data, x->data, x->len);
+    orin_platform_mem_copy(r->data + x->len, y->data + i, k);
+    orin_release(a);
+    return &r->h;
+}
+
+OrinObj *orin_str_append_usize(OrinObj *a, uint64_t v) { return str_append_decimal(a, v, 0); }
+
+OrinObj *orin_str_append_int(OrinObj *a, int64_t v) {
+    return v < 0 ? str_append_decimal(a, 0 - (uint64_t)v, 1) : str_append_decimal(a, (uint64_t)v, 0);
+}
+
 OrinObj *orin_str_prepend(OrinObj *a, OrinObj *b) {
     OrinString *x = (OrinString *)a, *y = (OrinString *)b;
     if (y->len == 0) return a;

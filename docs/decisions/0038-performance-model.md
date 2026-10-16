@@ -577,3 +577,79 @@ after (reported in docs/benchmarks.md), and self-compile instructions not worse 
 4. MIR types for slots and elements: take this as the next lever, which would remove the remaining kind checks and make T3 a verified fact?
 5. May calls stop ending the forwarding window (T4 step 2) once the Lean lemma for "a live reference excludes in-place mutation" is merged?
 6. T5 inserts a `makeunique` at call sites outside loops. Acceptable, or only set the flags when no site needs an insertion?
+
+
+## Addendum (2026-10-16): string intermediates (census row 1)
+
+The allocation census (`docs/perf/alloc-census.md`, ranking of 2026-10-16) ranks "string intermediates" first: the decimal text of
+a number built as a string only to be appended to another (`usizeToString`, 6.13M allocations), the `substring` pieces of
+`html.escape` (1.83M) and the temporaries of `bench/strings`. This addendum fixes how they are removed. **No language-visible
+change**: same text, same traps, same evaluation order. It adds MIR instructions, so it is MIR v2.5 (docs/mir.md, docs/tcb.md).
+
+### Choice
+
+Three candidates were read against the code:
+
+1. *A pure std/lowering change.* Not possible for the digits: `usizeToString` is already one allocation (the result), because
+   `"w" + n.toString()` was already lowered to a `strprepend` onto that result (MIR v2.3). What costs is the Orin digit loop
+   (a `fromCharCode` and an `orin_str_append` call per digit, plus the power-of-ten loop) and, whenever the destination already
+   exists (`s += "item" + i.toString() + ","`, a template, an OX root), the temporary that is built, copied and dropped. Without a
+   primitive that writes digits into the destination there is no way to remove either, and no existing builtin consumes and
+   returns its destination (a builtin is non-mutating for the verifier).
+2. *An append-decimal runtime primitive reached through a new MIR instruction* `IStrAppendNum(x, y, unsigned)`: chosen.
+   Its verifier rule is that of `IStrAppend` (the destination must be Owned, borrows of it die, the result stays Owned), and the
+   source is a scalar, so there is no aliasing case at all (the `y` not borrowed from `x` rule of `IStrAppend` is vacuous).
+3. *`html.escape` appends its pieces.* The pieces are `s.substring(a, b)`; the primitive that removes the object is
+   `IStrAppendSub(x, y, a, b)`, again with the `IStrAppend` rule (y live, not `x`, not borrowed from `x`; a, b usize scalars).
+   Escaping by single bytes would also avoid the object but costs an append call per byte.
+
+Rejected: a new verifier analysis (none is needed: both instructions are instances of the existing mutate-an-Owned-string rule,
+and in-place is decided at run time by `rc == 1`, as for `IStrAppend`); changing `escape` to a different algorithm (the std
+source is unchanged except that its `out += s.substring(..)` is now lowered to the primitive).
+
+### Lowering (compiler/lower/lowerer.or)
+
+* `a + n.toString()` with `n` an `int`/`usize` (the checker produces the same HIR for `${n}`): `a` is evaluated, then `n`; the
+  digits of `n` are appended onto an owned copy of `a` (`strappendi` / `strappendu`). A borrowed or literal `a` is `dup`ed first, as
+  before, so a shared destination is copied by the runtime and never changed.
+* `n.toString()` as a value: `str.withCapacity(24)` then `strappendi`: one allocation, no digit loop in Orin. The prelude
+  functions `numbers.intToString` / `usizeToString` stay (they are the `--c-builtins` reference semantics and exported), but the
+  lowering no longer calls them.
+* `s += e` (and `s = s + e`) on a string local: `e` is split into the operands of its left-nested `+` chain. All operands are
+  evaluated first, in order, by the existing `args`, and only then appended one by one; an operand that is the destination's own
+  value is `dup`ed before the first append (`s += "a" + s` appends the old `s`). `s ++ ((a ++ b) ++ c) == ((s ++ a) ++ b) ++ c`,
+  so the value is the same, and since nothing is appended before every operand has been evaluated, the evaluation order and the
+  first trap are those of the concatenation. A `.toString()` operand appends its digits.
+* The last operand `x.substring(i, j)` of such a chain is appended with `strappendsub`. Only the last: the substring range check
+  now happens at the append, after the earlier operands were appended (unobservable: a trap ends the task and `s` is local);
+  a middle operand would let a later operand's side effect or trap run before the substring's trap.
+
+### Runtime and verifier
+
+`orin_str_append_int/_usize(a, v)` form the digits in a 24-byte stack buffer and append with the growth rule of
+`orin_str_append`; `orin_str_append_sub(a, s, i, j)` traps `substring out of range` first and then appends the bytes. All three:
+in place iff `a->rc == 1` (and `a != s` for the substring), otherwise a fresh string and the old one released. They add about
+70 lines to the trusted runtime (docs/tcb.md); the Orin digit loop they replace was untrusted code, which is the one cost of this
+change. Verifier: `rules.or` (one arm each, `mutateOwned`), `wf.or` (classes), `analysis.or`, printer and text parser;
+`compiler/tests/verify_main.or` has positive and negative cases for both, and `tools/mutate_mir.py` gains the classes
+`append-after-release`, `append-borrowed` and `append-kills-borrow` for every string append instruction of the corpus
+(`strappend`, `strprepend`, `strappendi`, `strappendu`, `strappendsub`).
+
+### Measurement (same inputs, main `e23ff6d` vs this branch; valgrind instructions, census allocations)
+
+| workload | instructions before | after | change | allocations before | after | change |
+|---|---:|---:|---:|---:|---:|---:|
+| mapfreq | 1,621,489,667 | 1,171,665,517 | -27.7% | 1,050,017 | 1,050,017 | 0 |
+| wordfreq | 1,235,942,915 | 878,444,843 | -28.9% | 1,006,028 | 1,006,028 | 0 |
+| html | 3,005,772,527 | 1,907,050,854 | -36.6% | 4,338,006 | 1,720,006 | -60.4% |
+| html_hand | 4,590,162,194 | 1,608,789,644 | -65.0% | 5,034,406 | 118,806 | -97.6% |
+| strings | 1,119,961,484 | 696,111,714 | -37.8% | 1,500,009 | 1,000,008 | -33.3% |
+| url | 4,978,414,075 | 4,978,402,795 | 0 | 10,972 | 10,966 | 0 |
+| self-compile, same input (this branch's `compiler/main.or`, built by main's vs this branch's compiler) | 24,620,120,259 | 24,488,437,976 | -0.5% | 15,127,543 | 15,087,407 | -0.3% |
+| self-compile, each tree's own source (main `e23ff6d` vs this branch) | 24,544,355,195 | 24,488,437,976 | -0.2% | 15,072,609 | 15,087,407 | +0.1% (more source) |
+
+Finding that corrects the census: for mapfreq and wordfreq (95% / 99% of their allocations) the `toString` string *is* the map
+key and stays alive, and since MIR v2.3 it was already the only allocation of `"w" + n.toString()`; those allocations are
+inherent, and the gain there (-28%) is instructions only (the digit loop). The allocation gain is where the destination already
+existed: OX roots and hand-written `out += ...` (html -2.6M, html_hand -4.9M) and `s += "item" + i.toString() + ","` (strings
+-0.5M). The census row "up to 6.13M" is therefore an upper bound that is reached only where the number is not kept.

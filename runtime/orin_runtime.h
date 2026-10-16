@@ -438,6 +438,25 @@ OrinObj *orin_str_with_capacity(uint64_t cap);
 OrinObj *orin_str_concat(OrinObj *a, OrinObj *b);
 /* a += b. CONSUMES a, returns owned result; in place (amortised O(1)) when a is unique. */
 OrinObj *orin_str_append(OrinObj *a, OrinObj *b);
+/*@ orin_str_append_usize(a, v) / orin_str_append_int(a, v): a = a ++ decimal(v), no temporary string (ADR-0038 addendum
+    2026-10-16, MIR v2.5 IStrAppendNum). CONSUMES a, returns the owned result.
+    requires a is a string kept alive by its caller;
+    ensures  \result is a string equal to a followed by the decimal digits of v (no leading zeros, `0` for zero; for the
+             signed form a `-` first when v < 0, so INT64_MIN is "-9223372036854775808"), exactly the text of
+             orin_usize_to_string / orin_int_to_string;
+    ensures  a->rc == 1 ==> \result == a, extended in place (capacity at least doubles on growth); a shared a (rc != 1,
+             e.g. a literal) is never modified: \result is a fresh string and a has been released;
+    assigns  the heap (a, or a new string). */
+OrinObj *orin_str_append_usize(OrinObj *a, uint64_t v);
+/*@ orin_str_append_sub(a, s, i, j): a = a ++ s.substring(i, j) without the substring object (MIR v2.5 IStrAppendSub).
+    CONSUMES a, s is only read.
+    requires a and s are strings, each kept alive by its caller;
+    ensures  traps ("substring out of range") exactly when orin_str_substring(s, i, j) does (i > j or j > len(s));
+    ensures  otherwise \result is a followed by the bytes [i, j) of s; a->rc == 1 && a != s ==> \result == a, extended in
+             place; a shared a (or a == s) is never modified: \result is then a fresh string and a has been released;
+    assigns  the heap (a, or a new string). */
+OrinObj *orin_str_append_sub(OrinObj *a, OrinObj *s, uint64_t i, uint64_t j);
+OrinObj *orin_str_append_int(OrinObj *a, int64_t v);
 /*@ orin_str_prepend(a, b): a = b ++ a.  CONSUMES a (the result replaces it), b is only read.
     requires a and b are strings, each kept alive by its caller;
     ensures  \result is a string equal to b followed by a (len(result) == len(a) + len(b)); b is unchanged;

@@ -1,4 +1,4 @@
-# MIR and the OIM ownership verifier (v2.4; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4)
+# MIR and the OIM ownership verifier (v2.5; in/out receivers and `IArrayExtend` are v1.10, unboxed aggregates v2.2, load forwarding `IForward` v2.4, string append primitives v2.5)
 
 Normative companion to `compiler/mir/mir.or`. Status: contract defined; implementation in
 progress. Relation to spec 07: MIR is the *memory IR* layer; the verifier is the independent
@@ -46,6 +46,17 @@ it in place of the second `getfield` / `arrayget` of a scalar slot in a block. T
 `unjustified forward`. Forwarding is behaviour-only, not memory safety (an unjustified one reads a stale scalar, never a freed
 object), but it is checked to the standard of ADR-0032 like every other fact the optimiser acts on. Both emitters print `d = s`;
 `orin2 compile --assert-facts` additionally checks the claim at run time.
+
+v2.5 (ADR-0038 addendum 2026-10-16, string intermediates) two new instructions, both with exactly the ownership rules of
+`IStrAppend`: `IStrAppendNum(x, y, unsigned)` (`x = x ++ decimal(y)`, textual `strappendi x, y` / `strappendu x, y`) appends the
+decimal text of the scalar `y` (an `int`, or a `usize` when `unsigned`) without building a string for it, and
+`IStrAppendSub(x, y, a, b)` (`x = x ++ y[a..b]`, textual `strappendsub x, y, a, b`) appends the bytes `[a, b)` of the string `y`
+(`a`, `b` usize scalars) without the substring object; it traps `substring out of range` exactly when `BStrSubstring` does
+(`a > b` or `b > len(y)`). The lowering emits them for `s + n.toString()`, `${n}`, `s += n.toString()`, for a bare `n.toString()`
+(`str.withCapacity(24)` then `strappendi`) and for the last piece of a string `+=` chain that is a `substring` (a left-nested
+`s += a + b + c` is appended piece by piece, every piece evaluated first and in order, so the evaluation order and the traps are
+those of the concatenation). Runtime: `orin_str_append_int` / `orin_str_append_usize` / `orin_str_append_sub` (in place only when
+the destination has `rc == 1` and is not the source, otherwise a fresh string and the old one released, as `orin_str_append`).
 
 v2.0 (ADR-0020 D3, rewrite step 3a) **source spans**: every instruction and every terminator carries the span of the HIR node it was
 lowered from. `MBlock` is now `{ instrs; spans; term; termSpan }` (`spans[i]` belongs to `instrs[i]`, record invariant
@@ -113,6 +124,9 @@ hole slot when reading that slot.
   borrowed positions only (consumed operands are Dead afterwards).
 - `IStrAppend(x, y)`: x Owned/Unique (stays Owned); y live.
 - `IStrPrepend(x, y)` (v2.3): the same rules as `IStrAppend` with the roles of the operands in the result swapped (`x = y ++ x`).
+- `IStrAppendNum(x, y, uns)` (v2.5): x Owned/Unique/Imm (stays Owned, borrows of x die); y is a scalar of class `int` (`usize` when
+  `uns`), so it cannot alias x. `IStrAppendSub(x, y, a, b)` (v2.5): the rules of `IStrAppend` for x and y (y live, not x, not
+  borrowed from x), `a` and `b` usize scalars. Well-formedness: x and y reference class, bounds usize class (`wf.or`).
 - `IArrayExtend(x, y)` (v1.10): the same rules for arrays: x Owned/Unique (stays Owned: the runtime appends in place when x is
   unique and otherwise replaces it by a new array), y a live reference *local* that is neither x nor borrowed from x; the
   reference elements of y are retained by the runtime, y itself is not consumed. Borrows of x die.
@@ -379,21 +393,21 @@ verifier's own check is independent of them, and its contracts state that it imp
   that overwrites a local that may still own a reference. A discarded reference result
   (`ICall(None, ..)` of a ref-returning function) is *not* flagged (no obligation tracked).
 - **Invalidation** of `Borrowed(x)` happens on release, move/consume, redefinition, and on every
-  mutating op including `IPutField`/`IArrayPut`, `IStrAppend` and `IStrPrepend`. `IGetField`/`IArrayGet` of a
+  mutating op including `IPutField`/`IArrayPut`, `IStrAppend`, `IStrPrepend`, `IStrAppendNum` and `IStrAppendSub`. `IGetField`/`IArrayGet` of a
   borrowed object get the same root; of a Param the root is the Param itself. `Borrowed(x)` is
   also dead after `IMakeUnique(x)`, `IArrayPush`, `IArrayPop`.
 - **Holes.** A hole key is a constant slot/index or a `usize` local used as array index
   (symbolic). Reads/takes/sets use a conservative "may alias" test (any symbolic key matches
   anything); `put` needs the identical key. Redefining a local that names an open hole is an
   error. *Any whole-object use* of an object with an open hole (call argument, `IDup`,
-  `IBorrow`, move, release, consume, return, `IMakeUnique`, push/pop/`IStrAppend`/`IStrPrepend`) is an error:
+  `IBorrow`, move, release, consume, return, `IMakeUnique`, push/pop/`IStrAppend`/`IStrPrepend`/`IStrAppendNum`/`IStrAppendSub`) is an error:
   the callee/runtime would see an empty slot. `ISetField` into a taken slot is an error (use put).
 - **Calls and uniqueness (rule strengthened).** The table says calls do not change argument
   states. That is unsound for `Unique`: a callee can return (a dup of) its argument, leaving a
   second reference to an object still believed Unique. The verifier therefore demotes a `Unique`
   local passed directly as an argument of an `ICall`/`IBuiltin` **whose destination is a
   reference** to `Owned` (re-establish with `IMakeUnique`). Scalar-result calls keep Unique.
-- `IMakeUnique`/`IArrayPush`/`IArrayPop`/`IStrAppend`/`IStrPrepend` accept Owned/Unique/Imm; push/pop/append
+- `IMakeUnique`/`IArrayPush`/`IArrayPop`/`IStrAppend`/`IStrPrepend`/`IStrAppendNum`/`IStrAppendSub` accept Owned/Unique/Imm; push/pop/append
   leave the local `Owned`, `IMakeUnique` leaves it `Unique`. `IStrAppend`/`IStrPrepend` reject `y` being `x`
   or borrowed from `x`.
 - Not checked (no type information in MIR): field/slot index bounds, tags, `ITag`/`IGetField`
