@@ -1,4 +1,4 @@
-# ADR-0053: L0 platform budget for concurrency
+# ADR-0054: L0 platform budget for concurrency
 
 Status: accepted (owner default 2026-10-16 per [roadmap](../roadmaps/orin-1.0.md) D7; Henry can still overturn it).
 Amends [ADR-0030](0030-provable-std-and-minimal-trusted-runtime.md) section 1 (the 1,000-line L0 budget). Does not change

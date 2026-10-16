@@ -20,7 +20,7 @@ recommendation of every open decision. Henry can still overturn each one; a reve
 | D4 | linux-x86_64, macos-arm64, linux-aarch64, macos-x86_64 with a dry run each; Windows via WSL2, native Windows post-1.0 |
 | D5 | Amend: 1.0 requires a self-hosted, reproducible, behaviour-stable compiler, not the finished ADR-0015 rewrite |
 | D6 | A short named experimental list; everything else frozen under ADR-0048 |
-| D7 | Raise the L0 budget to 1,400 code lines by ADR, each addition with contracts and a CBMC harness (ADR-0053) |
+| D7 | Raise the L0 budget to 1,400 code lines by ADR, each addition with contracts and a CBMC harness (ADR-0054) |
 | D8 | Do not gate 1.0 on R3f; gate on R3d/R3e being merged |
 | D9 | Park T6 #98 and T5 #91 until after 1.0 |
 | D10 | `v1.0.0-beta.1` at M4, `-rc.N` at M5, `--prerelease` tied to the tag suffix |

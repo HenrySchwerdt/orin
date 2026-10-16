@@ -1,7 +1,7 @@
 #!/bin/sh
 # L0 platform layer checks (spec 19 R2, docs/formal.md "L0 platform layer"):
 #   1. executable contract tests (runtime/platform/tests/platform_test.c), plain, under ASan+UBSan and under ThreadSanitizer
-#   2. size budget (<= 1,400 CODE lines (ADR-0053) in runtime/platform/*.c, runtime/platform/*.h: comments, contract blocks and blank lines do not
+#   2. size budget (<= 1,400 CODE lines (ADR-0054) in runtime/platform/*.c, runtime/platform/*.h: comments, contract blocks and blank lines do not
 #      count, ADR-0030 / ADR-0017 stage 0) and the runtime boundary check
 #   3. bounded model checking of the pure/memory primitives with CBMC (runtime/platform/tests/cbmc_harness.c);
 #      skipped with a notice when `cbmc` is not installed (apt install cbmc);
@@ -40,7 +40,7 @@ $CC -Wall -Wextra -g -fsanitize=thread runtime/platform/tests/platform_test.c ru
 TSAN_OPTIONS=allocator_may_return_null=1 $B/platform_test_tsan < /dev/null
 
 echo "[platform] size budget"
-# Budget: <= 1,400 CODE lines (ADR-0053) (non-blank, comments and ACSL contracts excluded) in runtime/platform/*.c, runtime/platform/*.h.
+# Budget: <= 1,400 CODE lines (ADR-0054) (non-blank, comments and ACSL contracts excluded) in runtime/platform/*.c, runtime/platform/*.h.
 # The budget limits trusted code, not its specification (ADR-0030 section 1).
 code=$(python3 - runtime/platform/*.c runtime/platform/*.h <<'PY'
 import re, sys

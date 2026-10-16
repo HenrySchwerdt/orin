@@ -127,7 +127,7 @@ against the new runtime unchanged, so no seed bridge was needed (the compiler so
 
 Status: accepted per [roadmap](../roadmaps/orin-1.0.md) default D1 = option B (owner default 2026-10-16; Henry can still
 overturn it). This addendum fixes the semantics; C0 implements only the pure state machines (`std:taskcore`: `CancelState`,
-`CancelScope`, `TaskCell` and the functions around them); blocking behaviour lands in C1-C3. Related: ADR-0053 (the L0 budget that
+`CancelScope`, `TaskCell` and the functions around them); blocking behaviour lands in C1-C3. Related: ADR-0054 (the L0 budget that
 C1/C3 need), ADR-0048 (naming), [async-concurrency roadmap](../roadmaps/async-concurrency.md).
 
 **No new syntax.** No `async`/`await`, no new keywords or operators, no new checker rules. Cancellation, deadlines, `select` and

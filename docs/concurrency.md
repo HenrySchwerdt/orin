@@ -268,7 +268,7 @@ first-cause-wins cancellation cause plus an absolute monotonic deadline that onl
 pure functions for the outcome lattice (`Completed < Closed < Cancelled < Deadline < Error`, `outcomeJoin`), checkpoint precedence
 (`checkpointOutcome`) and deadline arithmetic (`deadlineMin`, saturating `deadlineAfterMillis`, `deadlineExpired`, `waitBudget`), all with
 `@Requires`/`@Ensures`/`@Invariant` contracts and tests in `tests/std/taskcancel_test.or`. The L0 budget for what follows is
-ADR-0053 (1,400 code lines).
+ADR-0054 (1,400 code lines).
 
 Next: **C1** timed monitor wait (L0), `recvTimeout`/`joinTimeout`/`select`/`sleep` and scope cancellation in `std:task`, wired to these
 machines; C3 interruptible network waits.
