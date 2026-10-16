@@ -1114,6 +1114,28 @@ export class ExprChecker {
     const recv = el.recv.unwrap();
     const shown = oxPathText(recv) + "." + tag.name;
     const env = this.fx.env;
+    // `<Theme.Button>` where `Theme` names a class (not a value): its static method, resolved as `Theme.Button(..)` is
+    const sc = this.oxStaticClass(recv);
+    if (sc.isSome()) {
+      const ci = env.classes[sc.unwrap()];
+      const mo = findMethod(ci, tag.name);
+      if (mo.isNone()) {
+        return Err(diag("E0491", tag.span, "no static method `" + tag.name + "` on class `" + ci.name + "`"));
+      }
+      const mi = ci.methods[mo.unwrap()];
+      if (!mi.isStatic) {
+        return Err(
+          diag(
+            "E0491",
+            tag.span,
+            "`" + shown + "` is an instance method; a member tag on a class name calls a static method",
+          ),
+        );
+      }
+      // a static method is a plain function, also in a generic class (as in `staticCall`)
+      const f = env.funcs[mi.fid];
+      return this.oxCall(p, el, "static method `" + shown + "`", None, None, oxSigOfParams(f.decl.params, Some(f.params)));
+    }
     const saved = this.fx;
     const b = this.ex(recv, None)?;
     this.fx = saved;
@@ -1173,6 +1195,29 @@ export class ExprChecker {
       },
     }
     return this.oxCall(p, el, "method `" + shown + "`", None, None, sig.unwrap());
+  }
+
+  // The class a member tag's receiver names when it is a bare type name and no value of that name is in scope (the
+  // rule of `callMember` for `T.m(..)`).
+  private oxStaticClass(recv: Expr): Option<usize> {
+    const bid = match (recv.kind) {
+      EIdent(id) => id,
+      _ => {
+        return None;
+      },
+    };
+    if (this.fx.isVisibleVar(bid.name) || globalVal(this.fx.env, this.fx.unit, bid.name).isSome()) {
+      return None;
+    }
+    const te = findType(this.fx.env.units[this.fx.unit].scope, bid.name);
+    if (te.isNone()) {
+      return None;
+    }
+    return match (te.unwrap()) {
+      EntRecord(r) => classOfRec(this.fx.env, r),
+      EntGen(g) => classOfGeneric(this.fx.env, g),
+      _ => None,
+    };
   }
 
   private oxSigOfIface(m: IfaceSig): OxSig {
