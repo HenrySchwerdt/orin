@@ -313,7 +313,7 @@ What each phase delivers:
 | Release matrix: linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64; per-target bootstrap, smoke test, `.sha256`, combined `SHA256SUMS`; dry-run dispatch | done (`.github/workflows/release.yml`) |
 | `install.sh` (checksum-verified, `~/.orin`, uninstall), tested in CI against the packages (`tools/test_install.sh`) | done ([install.md](install.md)) |
 | `orin doctor` and `orin --version` in the wrapper | done (no compiler change) |
-| Homebrew tap `HenrySchwerdt/orin` (macOS arm64; formula update PRs from the release workflow) | done ([install.md](install.md#homebrew-macos-apple-silicon)) |
+| Homebrew tap `orin-lang/orin` (macOS arm64; formula update PRs from the release workflow) | done ([install.md](install.md#homebrew-macos-apple-silicon)) |
 | Native Windows (clang, PowerShell wrapper, zip, Scoop, winget, `install.ps1`) | planned, starts after capabilities Stage A ([windows.md](windows.md)) |
 | Notarised/signed macOS and Windows binaries; `.deb`/`.rpm`; musl (static Linux) builds | not planned yet |
 

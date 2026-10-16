@@ -179,7 +179,7 @@ orin doctor        # checks the install and the C compiler, prints fixes
 **Homebrew** (macOS on Apple silicon):
 
 ```bash
-brew install HenrySchwerdt/orin/orin
+brew install orin-lang/orin/orin
 ```
 
 **Windows**: WSL2 works today ([docs/windows.md](docs/windows.md)); a native build is planned.

@@ -75,11 +75,11 @@ requests per hour per IP for anonymous callers; pin `ORIN_VERSION` in CI.
 ## Homebrew (macOS, Apple silicon)
 
 ```sh
-brew install HenrySchwerdt/orin/orin
+brew install orin-lang/orin/orin
 orin doctor
 ```
 
-The tap is [HenrySchwerdt/homebrew-orin](https://github.com/HenrySchwerdt/homebrew-orin). Its formula installs the
+The tap is [orin-lang/homebrew-orin](https://github.com/orin-lang/homebrew-orin). Its formula installs the
 `macos-arm64` release package (pinned URL and sha256) and runs `orin --version`, `orin doctor`, `orin run` and
 `orin build` as its test. `brew upgrade orin` updates, `brew uninstall orin` removes it. Intel macOS and Linux use
 the one-line install until their Homebrew smoke tests exist.
