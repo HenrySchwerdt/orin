@@ -43,7 +43,7 @@ import { Ledger, Ranges, ringCanPush, ringSlot, ringNextHead, ringIsDone } from 
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
-  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne, parThreads
+  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne, parThreads, lendPut
 } from "std:fsraw";
 
 // ------------------------------------------------------------------------------------------------------ transfer
@@ -786,6 +786,29 @@ export function forkJoin<R>(chunks: usize, workers: usize, body: (k: usize) => R
   const nw = workers < chunks ? workers : chunks;
   const slots = inOrder(chunks, runPool(chunks, nw, body, false, (r: R) => false));
   return slots.map(o => o.unwrap());
+}
+
+// The record a lend is made from (two slots: see runtime/core/orin_runtime.c "lending").
+type Lent<A> = { v: A; spare: usize; };
+
+// forkJoinLent(lent, chunks, workers, body): forkJoin, with `lent` LENT to the worker tasks (ADR-0039 section 4, ADR-0049
+// row 13a) instead of copied. `body` reaches the lent value through its captures; the lent graph is pinned while the pool
+// runs (counts frozen: nothing in it is freed or changed in place) and shared by every worker without a copy, so a
+// capture of the lent value costs nothing per worker. The other captures of `body` are copied to every worker as in
+// forkJoin and must stay small. Results are built by the workers and travel back by move or copy; a result never refers
+// into the lent graph (a transfer by a worker copies pinned objects). The lent value is released again before the call
+// returns, also for the calling task, which only spawns and joins while it is lent (the owner's obligation of lending).
+// With workers <= 1 or chunks <= 1 nothing is lent and `body` runs in order on the calling task. `lent` can be any value
+// but a handle (E0480).
+@Ensures(result.length == chunks)
+export function forkJoinLent<A, R>(lent: A, chunks: usize, workers: usize, body: (k: usize) => R): R[] {
+  if (workers <= 1 || chunks <= 1) {
+    return forkJoin(chunks, 1, body);
+  }
+  const tok = lendPut(Lent<A> { v: lent, spare: 0 });
+  const r = forkJoin(chunks, workers, body);
+  transitDrop(tok);
+  return r;
 }
 
 // forkJoinUntil(chunks, workers, body, hit): [body(0), ..., body(j)] where j is the first piece whose result is a hit (all
