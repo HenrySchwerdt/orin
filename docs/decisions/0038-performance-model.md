@@ -415,6 +415,18 @@ relational fact the interval domain of T6 cannot prove, so its bounds check stay
 
 #### T2. Repeated bounds / kind checks on the same (array, index)
 
+**Status (2026-10-16): implemented on branch `claude/project-thread-niggkx-t2-checks`, gain measured as nil; not recommended for merge as is.**
+MIR v2.6 (built as v2.5 before main took v2.5 for the string append primitives, PR #100; renumbered on merge): `IArrayGetU` /
+`IArraySetU`, rule U1 (`compiler/verify/unchecked.or`, helpers shared with F1 in `scan.or`), pass `compiler/opt/bounds.or` (last pass),
+`--assert-facts` via `orin_assert_array`, mutation classes `bce-*` (0 survivors, positive controls accepted), Lean: outside the model
+(array length), documented in docs/tcb.md and docs/formal.md. Deviations from the text below, all conservative: `arraytake` / `arrayput`
+on the array end the scan; a source that redefines its own index (or the array) is not a source; an `IForward` from the array does not end it.
+Measured (valgrind, executed instructions, main 8587609 against the same plus T2, same benchmark inputs): nbody 1,402,363,100 -> 1,402,363,072,
+mutres -28, pqueue -28, sieve -28 (all within noise: 9 / 0 / 0 / 0 static sites), qsort_inplace 583,004,355 -> 584,039,634 (+0.18 %, 4 sites).
+`ORIN_STATS` counters identical on all five; the generated C differs only at the converted accesses (compiler/main.or: 44 lines, nbody 9,
+qsort_inplace 4). The reason is that `gcc -O2` already removes the second kind and bounds check of the same `(array, index)` inside one C
+function, so the estimate of -30 instructions per pair for nbody above does not hold; what remains in nbody's inner loop is not a repeated check.
+
 - *MIR change:* v2.6. Two instructions, `IArrayGetU(d, a, i)` and `IArraySetU(x, i, v)`: same meaning as `IArrayGet` / `IArraySet`
   with the kind check and the bounds check omitted. (Take / put variants later if `pqueue` shows they matter.) Emitters: C
   `items[i]` directly; LLVM `getelementptr inbounds` and no compare.
@@ -515,7 +527,7 @@ object of an `IForward` must be a reference local (an unboxed aggregate is alrea
 - *Tests:* backend differential (C against LLVM, `--mode opt`) and sanitizers (LeakSanitizer runs of the suites stay clean).
   `ORIN_STATS` counters identical.
 
-#### T6. Range facts for constant-length arrays (separate approval)
+#### T6. Range facts for constant-length arrays (implemented on the T2 branch, see "As built")
 
 - *MIR change:* none beyond T2's `...U` instructions; the verifier gains a fact source for them.
 - *Legality, re-checked:* a new abstract state, the largest addition to the TCB in this addendum: for each `usize` / `int` local an
@@ -531,6 +543,47 @@ object of an `IForward` must be a reference local (an unboxed aggregate is alrea
 - *Open:* whether this domain belongs here or waits for the ADR-0036 verifier fragment, which will also give `@Invariant`-based
   facts (§4) through the same `...U` instructions. The assurance report names the fact kind for every removed check:
   `dominated-by-check`, `interval`, or (later) `contract`.
+
+- *As built (2026-10-16, branch `claude/project-thread-niggkx-t2-checks`, on top of T2; MIR v2.6, no new instruction):*
+  `compiler/verify/range.or` (811 code lines; the verifier grows from 2591 to 3461 code lines with T6, +870 including `unchecked.or`
+  and `verify.or`), rules R1-R5 in docs/mir.md "Range facts". Interval per `int` / `usize` local, array length interval per
+  reference local (`arraynew` with n elements -> `[n, n]`, moved by `move`, destroyed by every other mention except plain reads and
+  stores, `makeunique`, `forward`, `arr.length` and a borrowed-position argument of a known call), refinement from a same-block
+  compare feeding the `TBranch` (`lt le gt ge eq ne`, local against local or constant), transfer through `copy` / `add` / `sub` with the
+  traps kept (a `usize` subtraction that always underflows ends the path), hull join, widening to the function's constants after two
+  changes of a block, one in-order narrowing round. Acceptance: shape known, `lo(i) >= 0`, `hi(i) < lo(len)`. Deviations from the
+  text above: parameters and call results have no shape fact (as planned); a function is analysed only when it accesses a local
+  built by a non-empty `arraynew` and its `locals x blocks` product is at most 4000 (the first version had no such gate and cost
+  +17 % self-compile instructions, `RangeFx.joinInto` alone 11 %; the gate, a join that writes only on change and the access-based
+  filter brought it to +0.37 %); the optimiser pass (`opt/bounds.or`) asks the same `rangeAccepted` table, so it cannot emit
+  what the verifier would not re-derive. No assurance report hook exists in the tree yet, so the fact kind is visible only in the
+  mutation tool's census (`unchecked accesses by fact: both 9, dominated-by-check 34, interval 141` over the corpus) and
+  `verify_text --facts`. `--assert-facts` re-checks every unchecked access (`orin_assert_array`), all suites clean.
+- *Measured (valgrind, executed instructions, same inputs; main `a63a1e2`-based baseline against this branch):*
+
+  | benchmark | main | T2 + T6 | change | ceiling (all checks removed) |
+  |---|---|---|---|---|
+  | nbody | 1,402,357,380 | 658,357,335 | -53.06 % | -53 % |
+  | pqueue | 1,404,018,704 | 1,404,018,708 | 0 | -37 % |
+  | sieve | 410,380,710 | 410,380,713 | 0 | -18 % |
+  | qsort_inplace | 583,001,188 | 584,036,481 | +0.18 % (T2) | -16 % |
+  | mutres | 2,541,569,601 | 2,541,569,605 | 0 | -13 % |
+  | self-compile (same input) | 24,488,990,415 | 24,578,761,644 | +0.37 % | gate +1 % |
+
+  nbody reaches the ceiling because its `main` builds the arrays by literals and indexes them in counted loops. The others gain
+  nothing: their hot arrays are parameters (no shape fact by design), built by `push` in a loop (the length is not known) or
+  indexed by values the intervals cannot bound (heap indices, `i * 2 + 1`, a partition cursor against a variable `hi`). Reaching them needs
+  a relational domain or contract facts (the "Open" item above), not a better interval implementation.
+- *Soundness corner cases handled:* `<=` against the length keeps the check; a push, pop, extend, take, put, dup, borrow,
+  release, consuming constructor, owned or in/out call, indirect call or redefinition of the array, or of the index
+  after the guard, drops the fact; a borrowed call keeps the length (a borrowed parameter is never mutated, and the caller's live reference
+  forces copy-on-write); an unsigned underflow of `n - 1` still traps and nothing after it is claimed; a negative `int` cannot index
+  (`toUsize` traps first); an unreached or dead block justifies nothing; a branch condition redefined between compare and branch
+  refines nothing; a huge or unknown index keeps the check.
+- *Tests:* about 110 cases `rangeCases` in `compiler/tests/verify_main.or`, four optimiser tests in `opt_test.or`, eight `tests/next/run/bce_range_*`
+  programs (outputs identical to main), mutation classes `range-*` (see docs/mir.md) with 0 survivors and 0 wrong-reason mutants.
+  The T2 optimiser tests now use owned array parameters, because a literal array with constant indices is interval-justified.
+- *Lean:* array length is outside the model; nothing is claimed as proved (docs/tcb.md, docs/formal.md).
 
 ### Lean model, ADR-0032, docs/tcb.md
 

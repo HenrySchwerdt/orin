@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Unchecked array accesses from range facts (ADR-0038 lever 2, T6, MIR v2.6; draft).** The verifier gains an interval analysis
+  (`compiler/verify/range.or`, rules R1-R5 in docs/mir.md) that accepts `arraygetu` / `arraysetu` when the index is provably below the length
+  of an array built by `arraynew` in the same function; the optimiser pass `opt/bounds.or` emits them where the verifier agrees.
+  nbody -53.1 % executed instructions, the other benchmarks unchanged, self-compile +0.37 %. Array length stays outside the Lean model
+  (docs/tcb.md). New mutation classes `range-*`, regression programs `tests/next/run/bce_range_*`.
 - **LLVM fixed point (ADR-0038 section 8, gate 2).** New `tools/llvm_fixpoint.sh` (run in the CI `llvm` job): `orin2` compiles
   `compiler/main.or` with `--backend=llvm`, clang links `orin2-llvm`, and `orin2-llvm` reproduces both the C (`== stage2.c`,
   11,055,024 bytes) and the LLVM IR (45,279,878 bytes) byte for byte; `--deep` adds a third stage. No differences were found,

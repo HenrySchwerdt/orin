@@ -134,6 +134,16 @@ Load forwarding (`Forward.lean`, ADR-0038 lever 2 T4, the facts behind verifier 
 * `makeUnique_frame` - `makeUnique x` keeps every slot value of `x` (shallow copy).
 Calls and array length are outside the model; F1 ends its scan at any call that receives the object.
 
+Unchecked array access (rule U1, MIR v2.6, ADR-0038 lever 2 T2) has **no lemma**: what it needs is "the kind and the length of the object a live
+local holds are unchanged between two instructions unless the object is pushed to, popped, extended or the local redefined", and the model has no
+arrays with a length (`Machine.lean`: `load`, `store`, `makeUnique` over fixed slot tuples) and no calls. It is listed with the other rules not
+yet in the model (docs/tcb.md) and checked by the mutation corpus and `--assert-facts`, not claimed as proved.
+
+The interval facts of U1 (T6, `compiler/verify/range.or`, docs/mir.md "Range facts") are outside the model for the same reason and for two more:
+an interval abstract interpretation over `int` / `usize` locals (the model has no machine integers with traps, no widening, no branch refinement)
+and the length of an array a borrowed call leaves alone. There is no lemma and nothing here is claimed as proved; the evidence is the code, the
+mutation classes `range-*`, `compiler/tests/verify_main.or` and the run-time re-check of every unchecked access by `--assert-facts`.
+
 `view H f v` (`View.lean`) is the depth-`f` structural unfolding of the value denoted by `v`:
 scalars are themselves, a reference denotes the tuple of the views of its fields. Counts and
 addresses are not observable. The statement is therefore the logical-snapshot semantics of

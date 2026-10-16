@@ -1,0 +1,94 @@
+// Bounds and kind checks that cannot fire (ADR-0038 lever 2, T2 and T6; docs/mir.md v2.6). An `arrayget` / `arrayset` becomes
+// `IArrayGetU` / `IArraySetU`, which the emitters compile without the kind check and the bounds check, when one of two facts holds:
+//   dominated-by-check (T2): an earlier access of the same array local and the same index in the same block already passed both
+//     checks, and nothing since could have changed the kind or the length of `a`;
+//   interval (T6): the interval analysis of the verifier (compiler/verify/range.or) shows that `a` was built by `arraynew` in this
+//     function with a length the index stays below, e.g. `x[i]` in `while (i < 5)` for a five-element literal `x`.
+//
+//     x = arrayget a[i]                        x = arrayget a[i]
+//     ...                          ==>         ...
+//     arrayset a[i] = y                        arraysetu a[i] = y
+//
+// The pass asks the verifier's own rule U1 (`uncheckedJustified`, compiler/verify/unchecked.or, and `rangeAccepted`,
+// compiler/verify/range.or) and never emits an instruction that rule rejects; the verifier checks the result again like that of every other pass. No check moves: the
+// first access keeps its check, in its place, with its message, so every trap fires where and as before. It runs last, after
+// load forwarding and the removal of redundant `makeunique`, so it sees the final instruction stream.
+
+import { MProgram, MFunction, Instr, OLocal } from "../mir";
+import { uncheckedJustified, rangeAccepted, rangeOk } from "../verify";
+import { fnWellFormed, passKept } from "./wellformed";
+
+// The unchecked form of the access at position `at` of block `bi`, if it is a checked one and rule U1 accepts it: by a
+// dominating access, or by the interval facts of `table` (`rangeAccepted` of the function before this pass; replacing an access
+// by its unchecked form changes no interval fact, and the positions stay).
+function unchecked(p: MProgram, f: MFunction, bi: usize, at: usize, table: bool[][]): Option<Instr> {
+  match (f.blocks[bi].instrs[at]) {
+    IArrayGet(d, a, i) => {
+      if (rangeOk(table, bi, at) || uncheckedJustified(p, f, bi, at, a, i)) {
+        return Some(IArrayGetU(d, a, i));
+      }
+    },
+    IArraySet(x, i, v) => {
+      if (rangeOk(table, bi, at) || uncheckedJustified(p, f, bi, at, OLocal(x), i)) {
+        return Some(IArraySetU(x, i, v));
+      }
+    },
+    _ => {},
+  }
+  return None;
+}
+
+// `f` with every justified array access made unchecked. The accesses are visited in block and instruction order on the
+// function as rewritten so far, so an unchecked access is itself a source for the ones after it (it was justified in turn).
+@Requires(fnWellFormed(p, f))
+@Ensures(fnWellFormed(p, result) && passKept(f, result))
+export function uncheckAccesses(p: MProgram, f: MFunction): MFunction {
+  let g = f;
+  const table = rangeAccepted(p, f);
+  let bi: usize = 0;
+  while (bi < g.blocks.length) {
+    let i: usize = 0;
+    while (i < g.blocks[bi].instrs.length) {
+      match (unchecked(p, g, bi, i, table)) {
+        Some(r) => {
+          g.blocks[bi].instrs[i] = r;
+        },
+        None => {},
+      }
+      i += 1;
+    }
+    bi += 1;
+  }
+  return g;
+}
+
+// `p` with `uncheckAccesses` applied to every function (each reads only `p` and itself, so the order does not matter).
+@Requires(p.functions.every(f => fnWellFormed(p, f)))
+export function uncheckProgram(p: MProgram): MProgram {
+  return MProgram {
+    functions: p.functions.map(f => uncheckAccesses(p, f)),
+    strings: p.strings,
+    main: p.main,
+    vtables: p.vtables,
+    inlineFns: p.inlineFns,
+  };
+}
+
+// The number of unchecked accesses of `f`.
+export function uncheckedCount(f: MFunction): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IArrayGetU(_, _, _) => {
+          n += 1;
+        },
+        IArraySetU(_, _, _) => {
+          n += 1;
+        },
+        _ => {},
+      }
+    }
+  }
+  return n;
+}

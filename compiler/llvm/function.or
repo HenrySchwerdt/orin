@@ -662,6 +662,19 @@ export class LlvmFunctionEmitter {
         + name + "items, i64 " + i + "\n";
   }
 
+  // The address of element `i` of array `a` WITHOUT the kind and bounds checks (`IArrayGetU` / `IArraySetU`, rule U1): the
+  // verifier has shown that an earlier access of the block passed both. The only place of this backend whose memory safety
+  // rests on a verified fact; the `inbounds` GEPs are the ones the checked form uses.
+  private arraySlotUncheckedInline(name: string, a: string, i: string): string {
+    return "  " + name + "ip = getelementptr inbounds i8, ptr " + a + ", i64 40\n  " + name + "items = load ptr, ptr " + name
+        + "ip\n  " + name + " = getelementptr inbounds i64, ptr " + name + "items, i64 " + i + "\n";
+  }
+
+  // `--assert-facts`: the checks an unchecked access omits, run before it (the operands %<p>o0 / %<p>o1 are loaded).
+  private assertArrayI(p: string, a: string, i: string): string {
+    return this.facts ? "  call void @orin_assert_array(ptr " + a + ", i64 " + i + ")\n" : "";
+  }
+
   private binaryI(p: string, d: usize, op: BinOp, a: Operand, b: Operand): string {
     const t = this.opTy(a);
     if (isFloatT(t)) {
@@ -1118,6 +1131,12 @@ export class LlvmFunctionEmitter {
       IArraySet(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
           + this.ld(p, 2, v) + this.arraySlotInline(p + "g", p + "x", ov(p, 1, k))
           + this.replaceI(p, p + "g", 2, v),
+      IArrayGetU(d, a, k) => this.ld(p, 0, a) + this.ld(p, 1, k) + this.assertArrayI(p, ov(p, 0, a), ov(p, 1, k))
+          + this.arraySlotUncheckedInline(p + "g", ov(p, 0, a), ov(p, 1, k)) + "  " + p + "r = load "
+          + lty(this.f.locals[d].ty) + ", ptr " + p + "g\n" + this.st(d, p + "r"),
+      IArraySetU(x, k, v) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
+          + this.ld(p, 2, v) + this.assertArrayI(p, p + "x", ov(p, 1, k))
+          + this.arraySlotUncheckedInline(p + "g", p + "x", ov(p, 1, k)) + this.replaceI(p, p + "g", 2, v),
       IArrayTake(d, x, k) => "  " + p + "x = load ptr, ptr %l" + u(x) + "\n" + this.ld(p, 1, k)
           + this.arraySlotInline(p + "g", p + "x", ov(p, 1, k)) + "  " + p + "r = load ptr, ptr "
           + p + "g\n  store ptr null, ptr " + p + "g\n" + this.st(d, p + "r"),
