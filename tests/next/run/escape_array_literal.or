@@ -1,0 +1,141 @@
+// A temporary array literal that is only appended to an array (`x = x.concat([e1, .., ek])`) is scalar-replaced by the
+// optimiser: the elements are pushed onto x and no literal object exists (compiler/opt/lits.or, ADR-0038 addendum
+// "Escape analysis"). Every case below is one way the literal does or does not escape; the outputs must be the same as
+// without the rewrite: a literal that is stored, returned, captured, passed owned or used twice keeps its object, and a
+// shared destination is copied, never changed behind the other reference.
+
+type Rec = { a: int[]; names: string[]; };
+
+class Acc {
+  xs: int[];
+  names: string[];
+  constructor() {
+    this.xs = [];
+    this.names = [];
+  }
+  add(i: int): void {
+    this.xs = this.xs.concat([i, i + 1]);
+    this.names = this.names.concat(["n" + i.toString()]);
+  }
+}
+
+function sum(a: int[]): int {
+  let s = 0;
+  for (const v of a) {
+    s += v;
+  }
+  return s;
+}
+
+function show(a: int[]): string {
+  return "[" + a.map(v => v.toString()).join(",") + "]";
+}
+
+function consume(a: int[]): int[] {
+  return a.concat([100]);
+}
+
+// the literal is returned: it escapes
+function fresh(i: int): int[] {
+  return [i, i];
+}
+
+// the literal is the argument of a call: it escapes into the callee
+function viaCall(a: int[], i: int): int[] {
+  return a.concat(consume([i]));
+}
+
+// the literal is captured by a closure: it escapes
+function viaClosure(a: int[], i: int): int[] {
+  const lit = [i, i * 2];
+  const f = (): int => lit[1];
+  return a.concat([f()]).concat(lit);
+}
+
+// one name, used twice: not a temporary
+function twice(a: int[], i: int): int[] {
+  const lit = [i];
+  const b = a.concat(lit);
+  return b.concat(lit);
+}
+
+function main(): void {
+  // 1. loop, local destination, 1 and 2 elements
+  let a: int[] = [];
+  let i = 0;
+  while (i < 5) {
+    a = a.concat([i]);
+    a = a.concat([i * 10, i * 10 + 1]);
+    i += 1;
+  }
+  console.log(show(a) + " " + sum(a).toString());
+
+  // 2. shared destination: the copy taken before is unchanged
+  let b = a;
+  a = a.concat([7, 8, 9]);
+  console.log(b.length.toString() + " " + a.length.toString() + " " + show(b));
+
+  // 3. empty literal, literal built from the destination
+  a = a.concat([]);
+  a = a.concat([sum(a), a[0]]);
+  console.log(show(a));
+
+  // 4. strings (reference elements), shared, and elements taken from the destination itself
+  let s: string[] = [];
+  let k = 0;
+  while (k < 4) {
+    s = s.concat(["s" + k.toString()]);
+    k += 1;
+  }
+  const t = s;
+  s = s.concat([s[0], s[3], "end"]);
+  console.log(s.join(",") + " | " + t.join(","));
+
+  // 5. nested arrays
+  let n: int[][] = [];
+  n = n.concat([[1, 2]]);
+  n = n.concat([[3], [4, 5]]);
+  console.log(n.length.toString() + " " + show(n[1]) + " " + show(n[2]));
+
+  // 6. destination in a record field, a class field, an array element
+  let r = Rec { a: [], names: [] };
+  i = 0;
+  while (i < 3) {
+    r.a = r.a.concat([i, -i]);
+    r.names = r.names.concat(["f" + i.toString()]);
+    i += 1;
+  }
+  const r2 = r;
+  r.a = r.a.concat([99]);
+  console.log(show(r.a) + " " + show(r2.a) + " " + r.names.join(","));
+  let acc = new Acc();
+  acc.add(1);
+  acc.add(5);
+  console.log(show(acc.xs) + " " + acc.names.join(","));
+  let rows: int[][] = [[], []];
+  i = 0;
+  while (i < 3) {
+    rows[1] = rows[1].concat([i, i, i]);
+    i += 1;
+  }
+  console.log(show(rows[0]) + show(rows[1]));
+
+  // 7. the literal escapes: returned, passed, captured, used twice, stored
+  let c = fresh(3);
+  c = c.concat(fresh(4));
+  console.log(show(c));
+  console.log(show(viaCall([1], 2)));
+  console.log(show(viaClosure([5], 6)));
+  console.log(show(twice([0], 9)));
+  let stored: int[][] = [];
+  i = 0;
+  while (i < 3) {
+    const lit = [i, i + 1];
+    stored.push(lit);
+    a = a.concat(lit);
+    i += 1;
+  }
+  console.log(stored.length.toString() + " " + show(stored[2]) + " " + a.length.toString());
+  r.a = r.a.concat(r.a);
+  console.log(r.a.length.toString());
+}

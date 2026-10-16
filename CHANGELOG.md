@@ -1,6 +1,12 @@
 # Changelog
 
 ## Unreleased
+- **Escape analysis, scalar replacement of temporary array literals (ADR-0038 addendum 2026-10-16, class (c)).** New optimiser pass
+  `compiler/opt/lits.or`: `t = arraynew [e1..ek]; arrayextend x, t; release t` (the lowering of `x = x.concat([e1, .., ek])`) becomes
+  `arraypush x, e1; ..; arraypush x, ek`. No MIR change, no new verifier rule, no runtime change. appends -48.6 % executed instructions
+  and -99.99 % allocations (200,019 -> 19); every other benchmark and the self-compile are unchanged (the compiler has no such
+  literal). Regression program `tests/next/run/escape_array_literal`. The method-local helper objects of the compiler (`BlockSink`,
+  `State`, ...) were measured at about 0.5 % of the self-compile's instructions and are not removed.
 - **Unchecked array accesses from range facts (ADR-0038 lever 2, T6, MIR v2.6; draft).** The verifier gains an interval analysis
   (`compiler/verify/range.or`, rules R1-R5 in docs/mir.md) that accepts `arraygetu` / `arraysetu` when the index is provably below the length
   of an array built by `arraynew` in the same function; the optimiser pass `opt/bounds.or` emits them where the verifier agrees.

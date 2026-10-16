@@ -91,7 +91,12 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
    T6 (range facts, same branch, draft #98) is built: `compiler/verify/range.or`, nbody -53.1% (the ceiling), pqueue / sieve /
    qsort_inplace / mutres unchanged (parameter and push-built arrays have no shape fact), self-compile +0.37%; verifier 2476 -> 3461
    code lines (T2 +115, T6 +870). Needs the owner's decision on the interval domain before merge (ADR-0038 T6).
-3. **Performance, further ADR-0038 steps:** escape analysis / scalar replacement (c); unboxing of records with reference
+   Escape analysis / scalar replacement (c) is done for its one clean case (ADR-0038 addendum 2026-10-16, `compiler/opt/lits.or`, no MIR
+   or verifier change): a temporary array literal that is only appended (`x = x.concat([..])`) becomes pushes; appends -48.6%
+   instructions, -99.99% allocations, all other benchmarks and the self-compile unchanged. The rest of class (c) in the compiler
+   (`BlockSink`, `State`, `RewritePlan`, `Transfer`: mutable helper objects) is worth about 0.5% of the self-compile and needs an inliner
+   or a verified non-heap object; not built.
+3. **Performance, further ADR-0038 steps:** unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
 4. **LLVM gate 3** (ADR-0038 §8): pinned toolchain (`orin toolchain install`). Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
