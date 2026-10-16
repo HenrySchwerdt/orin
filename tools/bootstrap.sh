@@ -29,6 +29,9 @@ SEED_DIR=${ORIN_SEED_DIR:-bootstrap/seed}
 mkdir -p "$B"
 python3 tools/embed_prelude.py --check
 . tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
+# cc_link FLAGS WORLD C OUT. WORLD legacy (stage 0 and 1) links the frozen runtime snapshot bootstrap/seed/runtime/: the seed and
+# stage1.c come from compilers with the pre-R3d logic and the live runtime may lose definitions they reference (ADR-0052
+# Addendum A section 4); WORLD core (stage 2 on) links runtime/core/.
 cc_link() { flags=$1; world=$2; shift 2; $CC $flags $(rt_inc "$world") "$1" $(rt_src "$world") -o "$2"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 T0=$(date +%s)
@@ -45,10 +48,10 @@ if [ -z "$want" ] || [ "$want" != "$got" ]; then
 fi
 echo "[seed] sha256 ok ($got)"
 echo "[stage0] cc $STAGE01_CFLAGS seed -> orin0"
-cc_link "$STAGE01_CFLAGS" core $B/seed.c $B/orin0
+cc_link "$STAGE01_CFLAGS" legacy $B/seed.c $B/orin0
 if [ -n "$SEED_ONLY" ]; then echo "[seed-only] built $B/orin0"; exit 0; fi
 echo "[stage1] orin0 compiles compiler/main.or; cc $STAGE01_CFLAGS -> orin1 ($(elapsed))"
-$B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" core $B/stage1.c $B/orin1
+$B/orin0 compile compiler/main.or -o $B/stage1.c && cc_link "$STAGE01_CFLAGS" legacy $B/stage1.c $B/orin1
 echo "[stage2] orin1 compiles compiler/main.or; cc $CFLAGS -> orin2 ($(elapsed))"
 $B/orin1 compile compiler/main.or -o $B/stage2.c && cc_link "$CFLAGS" core $B/stage2.c $B/orin2
 echo "[stage3] orin2 compiles compiler/main.or ($(elapsed))"
