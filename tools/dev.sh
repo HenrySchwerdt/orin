@@ -93,7 +93,7 @@ case "$CMD" in
     tools/test_tooling.sh
     tools/protocol.sh lsp --orin $D/orin
     tools/protocol.sh mcp --orin $D/orin
-    python3 tools/test_osig.py --orin $D/orin
+    tools/clitests.sh osig --orin $D/orin
     python3 tools/test_effects.py --orin $D/orin ;;
 esac
 echo "[dev] $CMD done in $(( $(now) - t0 )) s (with $D/orin; before a PR: tools/bootstrap.sh)"

@@ -1,0 +1,182 @@
+// The pure checks of the formatter suite (tools/test_fmt.py): the multiset of comments of a source text, the AST dump without
+// spans, the error codes and the first position of a text-mode diagnostic. No I/O (tests/fmtlogic_test.or).
+
+import { isSpace, sortedStrs } from "./text";
+
+// `str.rstrip()` (ASCII whitespace).
+export function rstrip(s: string): string {
+  let b = s.length;
+  while (b > 0 && isSpace(s.charCodeAt(b - 1))) {
+    b -= 1;
+  }
+  return s.substring(0, b);
+}
+
+function findFrom(s: string, needle: string, start: usize): int {
+  let i = start;
+  while (i + needle.length <= s.length) {
+    if (s.substring(i, i + needle.length) == needle) {
+      return i.toInt();
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+// The comments of a source text, sorted (a multiset): `// ...` to the end of the line (right-trimmed) and `/* ... */`;
+// string literals are skipped. The `comments()` of tools/test_fmt.py (a Counter there; two multisets are equal exactly
+// when their sorted lists are).
+export function commentsOf(text: string): string[] {
+  let out: string[] = [];
+  let i: usize = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c == 34) {
+      i += 1;
+      while (i < n && text.charCodeAt(i) != 34 && text.charCodeAt(i) != 10) {
+        i += text.charCodeAt(i) == 92 ? 2 : 1;
+      }
+      i += 1;
+    } else if (c == 47 && i + 1 < n && text.charCodeAt(i + 1) == 47) {
+      const j = findFrom(text, "\n", i);
+      const e = j < 0 ? n : j.toUsize();
+      out.push(rstrip(text.substring(i, e)));
+      i = e;
+    } else if (c == 47 && i + 1 < n && text.charCodeAt(i + 1) == 42) {
+      const j = findFrom(text, "*/", i + 2);
+      const e = j < 0 ? n : j.toUsize() + 2;
+      out.push(text.substring(i, e));
+      i = e;
+    } else {
+      i += 1;
+    }
+  }
+  return sortedStrs(out);
+}
+
+export function sameStrs(a: string[], b: string[]): bool {
+  if (a.length != b.length) {
+    return false;
+  }
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+// `re.sub(r"@\d+-\d+", "", s)`: the spans of the AST dump.
+export function stripSpans(s: string): string {
+  let parts: string[] = [];
+  let keep: usize = 0;
+  let i: usize = 0;
+  const n = s.length;
+  while (i < n) {
+    if (s.charCodeAt(i) == 64) {
+      let j = i + 1;
+      while (j < n && isDigit(s.charCodeAt(j))) {
+        j += 1;
+      }
+      if (j > i + 1 && j < n && s.charCodeAt(j) == 45) {
+        let k = j + 1;
+        while (k < n && isDigit(s.charCodeAt(k))) {
+          k += 1;
+        }
+        if (k > j + 1) {
+          parts.push(s.substring(keep, i));
+          keep = k;
+          i = k;
+          continue;
+        }
+      }
+    }
+    i += 1;
+  }
+  if (keep == 0) {
+    return s;
+  }
+  parts.push(s.substring(keep, n));
+  return parts.join("");
+}
+
+// `re.fullmatch(r"E\d{4}", s)`
+export function isErrorCode(s: string): bool {
+  if (s.length != 5 || s.charCodeAt(0) != 69) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < 5) {
+    if (!isDigit(s.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// `re.findall(r"error\[(E\d{4})\]", text)`
+export function errorCodes(text: string): string[] {
+  let out: string[] = [];
+  const open = "error[";
+  let i: usize = 0;
+  while (i + open.length + 6 <= text.length) {
+    if (text.substring(i, i + open.length) == open && text.charCodeAt(i + open.length + 5) == 93
+        && isErrorCode(text.substring(i + open.length, i + open.length + 5))) {
+      out.push(text.substring(i + open.length, i + open.length + 5));
+      i += open.length + 6;
+    } else {
+      i += 1;
+    }
+  }
+  return out;
+}
+
+export type DiagPos = { found: bool; file: string; line: int; col: int; };
+
+// `re.match(r"(.*?):(\d+):(\d+): error", text)` (the first line, `.` does not match a newline).
+export function firstDiag(text: string): DiagPos {
+  const nl = findFrom(text, "\n", 0);
+  const line = nl < 0 ? text : text.substring(0, nl.toUsize());
+  let i: usize = 0;
+  while (i < line.length) {
+    if (line.charCodeAt(i) == 58) {
+      let a = i + 1;
+      while (a < line.length && isDigit(line.charCodeAt(a))) {
+        a += 1;
+      }
+      if (a > i + 1 && a < line.length && line.charCodeAt(a) == 58) {
+        let b = a + 1;
+        while (b < line.length && isDigit(line.charCodeAt(b))) {
+          b += 1;
+        }
+        if (b > a + 1 && line.substring(b, line.length).startsWith(": error")) {
+          const l = parseInt(line.substring(i + 1, a));
+          const c = parseInt(line.substring(a + 1, b));
+          return DiagPos { found: true, file: line.substring(0, i), line: l.unwrapOr(0), col: c.unwrapOr(0) };
+        }
+      }
+    }
+    i += 1;
+  }
+  return DiagPos { found: false, file: "", line: 0, col: 0 };
+}
+
+// `text.splitlines()` for text without \r: the lines, no final empty one.
+export function splitLines(text: string): string[] {
+  if (text == "") {
+    return [];
+  }
+  let parts = text.split("\n");
+  if (text.endsWith("\n")) {
+    parts.pop();
+  }
+  return parts;
+}
