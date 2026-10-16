@@ -220,6 +220,22 @@ def main():
     err, v, raw = c.call("check", {"entry": "main.or", "format": "compact"})
     check(v["errors"] == 0, "main still valid")
 
+    # ---- analysis cache: repeated calls agree; a file that main.or imports changing on disk is never served stale ----------
+    err, v1, raw1 = c.call("inspect", {"symbol": "double", "entry": "main.or"})
+    err, v2, raw2 = c.call("inspect", {"symbol": "double", "entry": "main.or"})
+    check(not err and raw1 == raw2, "repeated inspect gives the same answer (%s)" % raw2)
+    write(os.path.join(proj, "lib.or"), LIB.replace("return n * 2;", "return \"two\";"))
+    err, v, raw = c.call("check", {"entry": "main.or"})
+    check(not err and v["errors"] >= 1, "imported file changed on disk: the next check sees its error (%s)" % raw)
+    write(os.path.join(proj, "lib.or"), LIB.replace("export function double(n: int): int", "export function double(n: int, m: int): int"))
+    err, v, raw = c.call("inspect", {"symbol": "double", "entry": "main.or"})
+    check(not err and "m: int" in raw, "inspect after an imported file changed on disk sees the new signature (%s)" % raw)
+    write(os.path.join(proj, "lib.or"), LIB)
+    err, v, raw = c.call("check", {"entry": "main.or"})
+    check(not err and v["errors"] == 0, "restored file: clean again (%s)" % raw)
+    err, v, raw = c.call("inspect", {"symbol": "double", "entry": "main.or"})
+    check(not err and raw == raw1, "restored file: inspect as before (%s)" % raw)
+
     # ---- delta across an edit ---------------------------------------------------------------
     write(os.path.join(proj, "bad.or"), BAD.replace('const a: int = "x";', 'const a: int = 1;'))
     err, v, raw = c.call("check", {"entry": "bad.or", "sinceRevision": rev_bad})

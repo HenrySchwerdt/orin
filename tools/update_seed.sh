@@ -1,11 +1,11 @@
 #!/bin/sh
-# Regenerate seed/ from the current compiler/ (ADR-0014).
+# Regenerate bootstrap/seed/ from the current compiler/ (ADR-0014).
 #   tools/update_seed.sh                 bootstrap from the current seed
 # The new seed is stage2.c, i.e. the C of the compiler as compiled by a compiler built from the
 # *previous* root. Commit the result in a PR that shows the full bootstrap from the old seed.
 set -eu
 cd "$(dirname "$0")/.."
-SEED=seed
+SEED=bootstrap/seed
 B=build/bootstrap
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 prev=$(sed -n 's/^source-commit: *//p' $SEED/SEED_INFO | head -n1)

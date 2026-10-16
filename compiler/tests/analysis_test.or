@@ -3,11 +3,11 @@
 // Build: build/bootstrap/orin2 compile compiler/tests/analysis_test.or -o x.c && cc -O1 -w -I runtime/core x.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c
 
 import { Host, useFs } from "std:host";
-import { FsGrant } from "std:fs";
+import { FsGrant, writeFile } from "std:fs";
 import {
   newWorkspace, openFile, changeFile, closeFile, fileText, openPaths, analyze, diagsForPath, documentSymbols,
   keywordCompletions, declCompletions, offsetToPos, posToOffset, definitionAt, hoverAt, referencesTo,
-  renameEdits, symbolSpanAt, Workspace, DocSymbol, CompletionItem, PathDiag, DkFunction, DkRecord,
+  renameEdits, symbolSpanAt, newAnalysisCache, Workspace, DocSymbol, CompletionItem, PathDiag, DkFunction, DkRecord,
   DkUnion, DkVariant, DkConst, DkField, DkImported, DkAlias
 } from "../analysis";
 import { SemanticIndex, SymbolDef, SymbolRef, TypeAt, SkFunction, SkParam } from "../hir";
@@ -156,6 +156,67 @@ function testAnalyze(fs: FsGrant, f: string[]): string[] {
   if (a.diags.length == 1) {
     fails = eq(fails, "missing", a.diags[0].code, "E0301");
   }
+  return fails;
+}
+
+// AnalysisCache: a hit needs the same workspace revision and unchanged inputs; a changed overlay buffer, a changed file on
+// disk, a failed load and the capacity each lead to a fresh analysis.
+function testAnalysisCache(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  let cache = newAnalysisCache(2);
+  let ws = openFile(newWorkspace(), "/v/c1.or", "export function f(x: int): int { return x + 1; }");
+  const a1 = cache.analyze(fs, ws, "/v/c1.or");
+  const a2 = cache.analyze(fs, ws, "/v/./c1.or");
+  fails = eq(fails, "miss then hit", cache.hits.toString() + "/" + cache.misses.toString(), "1/1");
+  fails = eq(fails, "hit is the same result", a1.entry + a1.diags.length.toString() + a1.revision.toString(),
+    a2.entry + a2.diags.length.toString() + a2.revision.toString());
+  // A change of the buffer bumps the revision: the entry is recomputed and sees the new text.
+  ws = changeFile(ws, "/v/c1.or", "function f(): int { return true; }");
+  const a3 = cache.analyze(fs, ws, "/v/c1.or");
+  fails = eq(fails, "change misses", cache.hits.toString() + "/" + cache.misses.toString(), "1/2");
+  fails = eqi(fails, "change sees new text", a3.diags.length, 1);
+  const a4 = cache.analyze(fs, ws, "/v/c1.or");
+  fails = eqi(fails, "hit after change", cache.hits, 2);
+  fails = eqi(fails, "hit keeps the diagnostics", a4.diags.length, 1);
+  // A load that fails is never cached.
+  ws = changeFile(ws, "/v/c1.or", "function f( {");
+  cache.analyze(fs, ws, "/v/c1.or");
+  cache.analyze(fs, ws, "/v/c1.or");
+  fails = eq(fails, "failed load not cached", cache.hits.toString() + "/" + cache.misses.toString(), "2/4");
+  fails = eqi(fails, "nothing cached", cache.size(), 0);
+  // Capacity 2: the oldest entry goes.
+  ws = openFile(ws, "/v/c1.or", "function f(): int { return 1; }");
+  ws = openFile(ws, "/v/c2.or", "function g(): int { return 2; }");
+  ws = openFile(ws, "/v/c3.or", "function h(): int { return 3; }");
+  cache.analyze(fs, ws, "/v/c1.or");
+  cache.analyze(fs, ws, "/v/c2.or");
+  cache.analyze(fs, ws, "/v/c3.or");
+  fails = eqi(fails, "bounded", cache.size(), 2);
+  const hits = cache.hits;
+  cache.analyze(fs, ws, "/v/c3.or");
+  cache.analyze(fs, ws, "/v/c1.or");
+  fails = eqi(fails, "newest kept, oldest dropped", cache.hits - hits, 1);
+  cache.clear();
+  fails = eqi(fails, "clear", cache.size(), 0);
+
+  // A file read from disk: the same workspace (a fresh overlay of the entry, as the MCP server builds it) hits while the
+  // file is unchanged and misses once it changed on disk.
+  const lib = "/tmp/orin_analysis_cache_test_lib.or";
+  const w1 = writeFile(fs, lib, "export function g(): int { return 1; }\n");
+  fails = eq(fails, "write lib", w1.isOk().toString(), "true");
+  const main = "import { g } from \"./orin_analysis_cache_test_lib\";\nfunction main(): void {\n  const n: int = g();\n}\n";
+  const ws2 = openFile(newWorkspace(), "/tmp/orin_analysis_cache_test_main.or", main);
+  let c2 = newAnalysisCache(4);
+  const b1 = c2.analyze(fs, ws2, "/tmp/orin_analysis_cache_test_main.or");
+  fails = eqi(fails, "disk project loads", b1.diags.length, 0);
+  fails = eqi(fails, "disk project cached", c2.size(), 1);
+  const ws3 = openFile(newWorkspace(), "/tmp/orin_analysis_cache_test_main.or", main);
+  c2.analyze(fs, ws3, "/tmp/orin_analysis_cache_test_main.or");
+  fails = eq(fails, "fresh overlay, same files: hit", c2.hits.toString() + "/" + c2.misses.toString(), "1/1");
+  writeFile(fs, lib, "export function g(): string { return \"s\"; }\n");
+  const b2 = c2.analyze(fs, ws3, "/tmp/orin_analysis_cache_test_main.or");
+  fails = eq(fails, "disk change: miss", c2.hits.toString() + "/" + c2.misses.toString(), "1/2");
+  fails = eqi(fails, "disk change seen", b2.diags.length, 1);
   return fails;
 }
 
@@ -367,6 +428,7 @@ function run(fs: FsGrant): void {
   f = testWorkspace(f);
   f = testPositions(f);
   f = testAnalyze(fs, f);
+  f = testAnalysisCache(fs, f);
   f = testSymbols(fs, f);
   f = testIndex(f);
   if (f.length == 0) {

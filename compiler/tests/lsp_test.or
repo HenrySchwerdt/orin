@@ -4,7 +4,7 @@
 import { Host, useFs } from "std:host";
 import { FsGrant } from "std:fs";
 import {
-  LspServer, LspStep, newLspState, withTestIndex, lspExitCode, handleText, pump, frameMessage, unframe,
+  LspServer, LspStep, newLspState, withTestIndex, lspExitCode, lspCacheHits, lspCacheMisses, handleText, pump, frameMessage, unframe,
   uriToPath, pathToUri, fullDocumentEdits
 } from "../lsp";
 import { Json, stringifyJson } from "../json";
@@ -431,6 +431,79 @@ function testFraming(fs: FsGrant, f: string[]): string[] {
   return fails;
 }
 
+function stats(st: LspServer): string {
+  return lspCacheHits(st).toString() + "/" + lspCacheMisses(st).toString();
+}
+
+function hoverAtF(fs: FsGrant, st: LspServer, id: int, uri: string): LspStep {
+  return req(fs, st, id, "textDocument/hover", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":0,\"character\":9}}");
+}
+
+// The analysis cache (analysis/cache.or): requests at one workspace revision share one analysis (hits/misses), and every
+// change that can alter the answer (didChange, didSave, didClose, another document's change) invalidates it.
+function testAnalysisCache(fs: FsGrant, f: string[]): string[] {
+  let fails = f;
+  const uri = "file:///c/a.or";
+  let st = initialized(fs);
+  fails = eq(fails, "fresh", stats(st), "0/0");
+  let s = open(fs, st, uri, "function f(a: int): int {\n  return a;\n}\n");
+  st = s.state;
+  fails = eq(fails, "open analyses once", stats(st), "0/1");
+
+  // Two hovers and a definition at this revision: no new analysis, same answers as the first.
+  s = hoverAtF(fs, st, 20, uri);
+  st = s.state;
+  const h1 = show(s);
+  fails = eq(fails, "hover int", has(h1, "function f(a: int): int"), "true");
+  s = hoverAtF(fs, st, 20, uri);
+  st = s.state;
+  fails = eq(fails, "same hover", show(s), h1);
+  s = req(fs, st, 22, "textDocument/definition", "{\"textDocument\":{\"uri\":\"" + uri + "\"},\"position\":{\"line\":0,\"character\":9}}");
+  st = s.state;
+  fails = eq(fails, "requests hit", stats(st), "3/1");
+
+  // didChange: the new contents are analysed once (republish); the hover after it sees them and hits.
+  s = change(fs, st, uri, "function f(a: int): bool {\n  return true;\n}\n");
+  st = s.state;
+  fails = eq(fails, "change analyses once", stats(st), "3/2");
+  s = hoverAtF(fs, st, 23, uri);
+  st = s.state;
+  fails = eq(fails, "hover sees the change", has(show(s), "function f(a: int): bool"), "true");
+  fails = eq(fails, "hover not the old text", has(show(s), "): int"), "false");
+  fails = eq(fails, "hover after change hits", stats(st), "4/2");
+
+  // A document whose load fails is not cached; the repair is seen at once.
+  st = change(fs, st, uri, "function f( {\n").state;
+  s = hoverAtF(fs, st, 24, uri);
+  st = s.state;
+  fails = eq(fails, "broken document not cached", stats(st), "4/4");
+  st = change(fs, st, uri, "function f(a: int): string {\n  return \"s\";\n}\n").state;
+  s = hoverAtF(fs, st, 25, uri);
+  st = s.state;
+  fails = eq(fails, "hover after repair", has(show(s), "function f(a: int): string"), "true");
+
+  // didSave drops the entries (the disk may have changed): the republish analyses again, once.
+  const before = lspCacheMisses(st);
+  s = handleText(fs, st, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didSave\",\"params\":{\"textDocument\":{\"uri\":\"" + uri + "\"}}}");
+  st = s.state;
+  fails = eq(fails, "save re-analyses", (lspCacheMisses(st) - before).toString(), "1");
+
+  // Two documents: a change of the imported one is seen in the importer's diagnostics.
+  const ua = "file:///c/main.or";
+  const ub = "file:///c/lib.or";
+  st = open(fs, initialized(fs), ub, "export function g(x: int): int {\n  return x;\n}\n").state;
+  s = open(fs, st, ua, "import { g } from \"./lib\";\nfunction main(): void {\n  const n: int = g(1);\n}\n");
+  st = s.state;
+  fails = eq(fails, "importer clean", has(show(s), "E0"), "false");
+  s = change(fs, st, ub, "export function g(x: int): string {\n  return \"s\";\n}\n");
+  st = s.state;
+  fails = eq(fails, "importer sees the new type", has(show(s), "E0400"), "true");
+  s = close(fs, st, ub);
+  st = s.state;
+  fails = eq(fails, "close: lib falls back to the disk", has(show(s), "E0"), "true");
+  return fails;
+}
+
 function main(host: Host): void {
   useFs(host, fs => { run(fs); });
 }
@@ -445,6 +518,7 @@ function run(fs: FsGrant): void {
   f = testInterfaces(fs, f);
   f = testDeprecated(fs, f);
   f = testHoverEffects(fs, f);
+  f = testAnalysisCache(fs, f);
   f = testFraming(fs, f);
   if (f.length == 0) {
     console.log("ok");
