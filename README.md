@@ -103,7 +103,7 @@ than claiming complete memory-safety proof for every compiler and runtime path:
   this gap was hit once by a real compiler bug, and runtime field bounds checks are now the backstop
   ([finding F-shape](docs/assurance.md));
 - the runtime has an Orin standard-library layer and an L0 platform boundary; further runtime
-  implementation and verification work remains ([runtime plan](spec/19-self-hosted-runtime.md),
+  implementation and verification work remains ([runtime plan](spec/19-runtime-and-platform-layer.md),
   [assurance ledger](docs/assurance.md)).
 
 **5. Business rules you can specify and selectively verify.** Contract clauses can be checked
@@ -180,7 +180,7 @@ orin doctor        # checks the install and the C compiler, prints fixes
 
 **Windows**: WSL2 works today ([docs/windows.md](docs/windows.md)); a native build is planned.
 
-**Manual tarball**: download a package from [Releases](../../releases) and run it in place:
+**Manual tarball**: download a package from [Releases](https://github.com/HenrySchwerdt/orin/releases) and run it in place:
 
 ```bash
 tar xzf orin-<version>-<platform>.tar.gz && cd orin-<version>-<platform>
@@ -254,6 +254,7 @@ single root. See [`docs/bootstrap.md`](docs/bootstrap.md).
 
 ## Learn more
 
+- [Documentation index](docs/README.md): current guides, implementation status, decisions and dated release evidence
 - Coming from TypeScript? [Orin for TypeScript developers](docs/ts-developers.md): where code that looks the same behaves differently
 - Language specification: [`spec/`](spec/spec.md)
 - Architecture and safety status: [`docs/architecture.md`](docs/architecture.md)

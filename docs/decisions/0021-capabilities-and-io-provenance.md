@@ -2,7 +2,7 @@
 
 Status: **proposed** (2026-10-13), except **Stage A (D1, the resource-handle part of D2, D4a handle identity, D7 Stage A), which is accepted and implemented** -- see Addendum A and [ADR-0027](0027-stage-a-root-capabilities.md). Everything else (D3 library adapters, D4 events beyond primitives, D5 process discovery, D6 attestations, Stages B-D) stays proposed. This ADR specifies the language/runtime authority model and the interfaces needed for OSIG processes and later field lineage. It does **not** claim that these mechanisms are implemented or that capabilities alone reconstruct processes.
 
-Relates to [ADR-0016](0016-language-1.0-core-scope.md) (two-stage freeze), [ADR-0020](0020-verifiable-software-roadmap.md) D2–D5, [ADR-0023](0023-osig-schema-v0.1.md), [ADR-0025](0025-resources-and-streaming-fs.md), [spec 19](../../spec/19-self-hosted-runtime.md) and [docs/osig.md](../osig.md).
+Relates to [ADR-0016](0016-language-1.0-core-scope.md) (two-stage freeze), [ADR-0020](0020-verifiable-software-roadmap.md) D2–D5, [ADR-0023](0023-osig-schema-v0.1.md), [ADR-0025](0025-resources-and-streaming-fs.md), [spec 19](../../spec/19-runtime-and-platform-layer.md) and [docs/osig.md](../osig.md).
 
 ## Motivation and goals
 
