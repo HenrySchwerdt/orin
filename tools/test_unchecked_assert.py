@@ -9,6 +9,7 @@ import pathlib
 import subprocess
 import tempfile
 
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DRIVER = '''
 import { Host, useProcess } from "std:host";
@@ -18,7 +19,6 @@ import { uncheckedMir } from "../../compiler/tests/emit_test";
 import { verify } from "../../compiler/verify";
 import { emitCFacts } from "../../compiler/backends/c";
 import { emitLlvmFacts } from "../../compiler/backends/llvm";
-from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 function main(host: Host): void {
   useProcess(host, proc => {
