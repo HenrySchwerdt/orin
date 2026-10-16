@@ -108,6 +108,8 @@ def selftest():
         (["tooling/mutation/src/std_check.or"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
         (["tooling/mutation/tests/cli_test.or"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
         (["tooling/conformance/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/differential/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tools/differential.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
         (["runtime/platform/orin_platform.c", "library/std/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
     ]

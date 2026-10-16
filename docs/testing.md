@@ -244,6 +244,32 @@ mutant is a COMPILE ERROR (the script raised an exception). `tools/embed_prelude
 embedded library of a `net` mutant's compiler copy. `tools/mutate_mir.py` and `tools/contract_mutation.py` are separate tools
 and unchanged.
 
+## Differential harness (Orin)
+
+The differential tests of compiler modes and of two compilers are `tooling/differential`, an Orin package (ADR-0047 phase 5; it
+replaces `tools/diff_backends.py` and `tools/diff_compilers.py`). `tools/differential.sh` builds it with the bootstrapped compiler
+(never with the compiler under test) and runs it; the flags, output and exit status are those of the old scripts:
+
+```bash
+tools/differential.sh --mode opt|llvm|builtins|fuse [--orinc COMPILER] [--cc CC] [--filter SUBSTR] [--sanitize] [--shard I/N] [--list]
+tools/differential.sh compilers BASE_ORIN NEW_ORIN     # diagnostics of two compilers, byte for byte
+tools/differential.sh --unit-tests                     # @Test tests of the harness itself
+```
+
+Each program of `tests/run` and `tests/next/run` (names of the latter start with `next_`) is compiled with the default pipeline and
+with the alternative (`opt`: `--no-opt`; `llvm`: `--backend=llvm`, built with clang -O2 and the LLVM shim; `builtins`:
+`--c-builtins`; `fuse`: `--no-fuse`), both are built and run, and exit status and stdout are compared (a failing compile or C
+build is compared by its first 300 bytes of error output). A program for which exactly one side timed out is reported as `SKIP` and
+is not a difference. `--shard I/N` runs every N-th program (after `--filter`) starting at the I-th, so the CI shards of the fuse run
+together run every program once; `--list` prints the selected names. Exit status: 0 no difference, 1 differences, 2 usage.
+`compilers` runs both compilers over every input of `tests/{errors,next/errors,parse_edge,run,next/run,contracts}`, every package
+directory under `tests/` and `compiler/main.or` (`compile X -o /dev/null`, `check X`, `check --format=json X`) and compares exit
+status, stdout and stderr. Execution is `std:task`: one worker per CPU (four for `compilers`) takes jobs from a channel and runs
+the steps through `shellTimeout` (compile and C build 120 s, run 10 s, `compilers` 300 s); stdout is compared with `cmp` on the
+captured files, so the output does not depend on the number of workers. `--root DIR` names the repository root (default: the
+current directory). Differences from the Python scripts: a signal-killed step is exit `-1` or `128+n`, not `-n`; a program's
+stdin is `/dev/null`; the byte slice of stderr in a `compilers` DIFF line is cut on a character boundary.
+
 ## Execution deadlines
 
 CLI tests and MCP program/unit tests use native POSIX process groups and a
