@@ -3,7 +3,7 @@
 `import { Input, Output, fn, param, named, ret, call, fresh } from "std:meta";`
 
 **Unstable.** This is slice S3 of [ADR-0046](decisions/0046-typed-annotation-processors.md). The module is pure
-data plus builders and a JSON codec; nothing in the compiler calls it yet (expansion is S4, processor execution S5).
+data plus builders and a JSON codec; the compiler uses it for companion modules (S4) and runs processors written against it (S5).
 Names and shapes may change until S4/S5 land.
 
 It is pure: no grants, no I/O, no global state. The source is `library/std/metacore.or` (model and builders),
@@ -87,6 +87,7 @@ companion module never produce the same helper name. `__g` names are reserved fo
 
 ## Not here
 
-Processor execution (S5) is not built. The compiler consumes recorded `Output`s since S4 (docs/annotation-processors.md,
-`orin expand` prints the generated code through the formatter). No validation that a built tree
+The compiler runs processors since S5: it builds the processor into a helper executable whose generated `main` calls
+`decodeInput` / `encodeOutput` of this module (docs/annotation-processors.md), or consumes a recorded `Output` (S4 test hook);
+`orin expand` prints the generated code through the formatter. No validation that a built tree
 type-checks: generated code is checked like hand-written code by the compiler.

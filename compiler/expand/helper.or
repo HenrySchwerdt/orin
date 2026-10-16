@@ -1,0 +1,336 @@
+// Running a processor (ADR-0046 §3, slice S5): one helper executable per processor, one process per (processor, source module).
+//
+// The helper is built like the executable of `orin test` (compiler/testing/runner.or): the processor module and everything it
+// imports, `std:meta`, and a generated `main` module that reads the encoded `Input` (one line of JSON) from stdin, calls the
+// processor and writes the encoded `Output` to stdout. The compiler runs it through the shell with a deadline
+// (`std:io.shellTimeout` via util/process.or), `ORIN_DENY` set so that no capability family but stdio exists (the harness needs
+// stdio; the processor is pure and cannot reach a grant anyway), and the output piped through `head -c` so that a runaway
+// processor cannot fill the disk. Whatever goes wrong is a `Failure` with the captured stderr; nothing partial is ever used.
+//
+// Cache (in `<package>/.orin/processors/`, or `--processor-cache DIR`): `<helper key>/helper` is the executable and
+// `<helper key>/out-<input key>.json` the output of a successful run. The helper key hashes the cache format version, the
+// generated main and the path and text of every unit of the processor module's closure; the input key
+// hashes the encoded `Input`. Only successful runs are cached. Two compilers running at once on one cache directory is not
+// supported (each file is written under a temporary name and moved into place, so the worst case is a repeated build).
+
+import { FsGrant, readFile, writeFile, exists } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { SourceMap, SourceFile, Diagnostic, render } from "../diag";
+import { LoadedProgram, ImportUnit, ImportStd, loadWithRoots, preludeRoots, dirname, joinPath } from "../loader";
+import { check } from "../check";
+import { lower } from "../lower";
+import { emitC } from "../backends/c";
+import { optimize, pruneProgram } from "../opt";
+import { fuseProgram } from "../fuse";
+import { verify } from "../verify";
+import { shellRun, shellRunTimeout, shq, readOr, trunc } from "../util";
+import { Processor, packageRoot } from "./processors";
+
+// Bump when the generated main, the way the helper is built or run, or the encoding changes.
+const CACHE_FORMAT: string = "orin-processor-cache-1";
+
+// The limits of a run (ADR-0046 §3).
+export const OUTPUT_LIMIT: usize = 16777216;          // 16 MiB of encoded output
+export const DECLARATION_LIMIT: usize = 10000;       // generated declarations per program
+export const DEFAULT_TIMEOUT: int = 10;              // seconds per run
+
+export type ProcConfig = {
+  timeout: int;        // seconds per run, 0 = none
+  cc: string;          // C compiler command, flags allowed
+  runtime: string;     // directory with orin_runtime.c (the platform layer is ../platform)
+  cacheDir: string;    // "" = <package or entry directory>/.orin/processors
+  verbose: bool;       // say on stderr what was built, reused and run
+  lenient: bool;       // `orin check`: without a C compiler a processor is not run (W0490) instead of failing
+};
+
+export function defaultProcConfig(): ProcConfig {
+  return ProcConfig {
+    timeout: DEFAULT_TIMEOUT, cc: "cc", runtime: "runtime/core", cacheDir: "", verbose: false, lenient: false,
+  };
+}
+
+// Why a run failed: a one-line message and the stderr of the helper (or of the C compiler).
+export type Failure = { message: string; stderr: string; };
+
+// `text` is the encoded Output; `skipped` (lenient mode, no C compiler) means there is none.
+export type Executed = { text: string; skipped: bool; why: string; };
+
+function fail(msg: string, err: string): Result<Executed, Failure> {
+  return Err(Failure { message: msg, stderr: err });
+}
+
+// ---- hashing --------------------------------------------------------------------------------------------------------
+
+function hexOf(n: int): string {
+  const digits = "0123456789abcdef";
+  let out = "";
+  let v = n;
+  let i: usize = 0;
+  while (i < 8) {
+    const d = (v % 16).toUsize();
+    out = digits.substring(d, d + 1) + out;
+    v = v / 16;
+    i += 1;
+  }
+  return out;
+}
+
+// A 62-bit fingerprint (two polynomial hashes modulo primes below 2^31) of the parts, in order, as 16 hex digits. It is a
+// cache key, not a security device: the cache directory is the user's own.
+function fingerprint(parts: string[]): string {
+  let h1: int = 7;
+  let h2: int = 11;
+  for (const s of parts) {
+    let i: usize = 0;
+    while (i < s.length) {
+      const c = s.charCodeAt(i).toInt() + 1;
+      h1 = (h1 * 131 + c) % 2147483629;
+      h2 = (h2 * 137 + c * 7 + 3) % 2147483587;
+      i += 1;
+    }
+    h1 = (h1 * 131 + 1 + s.length.toInt()) % 2147483629;
+    h2 = (h2 * 137 + 2 + s.length.toInt()) % 2147483587;
+  }
+  return hexOf(h1) + hexOf(h2);
+}
+
+// ---- the helper's source --------------------------------------------------------------------------------------------
+
+function baseName(path: string): string {
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < path.length) {
+    if (path.charCodeAt(i) == 47) {
+      start = i + 1;
+    }
+    i += 1;
+  }
+  const rest = path.substring(start, path.length);
+  return rest.endsWith(".or") ? rest.substring(0, rest.length - 3) : rest;
+}
+
+const MAIN_FILE: string = "__orin_processor_main.or";
+
+function mainSource(module: string, fnName: string): string {
+  return "import { Host, useStdio } from \"std:host\";\n"
+    + "import { readLine, writeStdout } from \"std:io\";\n"
+    + "import { exit } from \"std:process\";\n"
+    + "import { decodeInput, encodeOutput } from \"std:meta\";\n"
+    + "import { " + fnName + " } from \"./" + module + "\";\n"
+    + "\n"
+    + "function main(host: Host): void {\n"
+    + "  useStdio(host, stdio => {\n"
+    + "    const line = readLine(stdio);\n"
+    + "    if (line.isNone()) {\n"
+    + "      console.error(\"processor harness: no input on stdin\");\n"
+    + "      exit(2);\n"
+    + "      return;\n"
+    + "    }\n"
+    + "    const input = decodeInput(line.unwrap());\n"
+    + "    if (input.isErr()) {\n"
+    + "      console.error(\"processor harness: malformed input: \" + input.unwrapErr());\n"
+    + "      exit(2);\n"
+    + "      return;\n"
+    + "    }\n"
+    + "    writeStdout(stdio, encodeOutput(" + fnName + "(input.unwrap())));\n"
+    + "  });\n"
+    + "}\n";
+}
+
+// ---- keys -----------------------------------------------------------------------------------------------------------
+
+// The units the processor module depends on, itself included, in unit order.
+function closure(prog: LoadedProgram, start: usize): usize[] {
+  let seen: bool[] = [];
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    seen.push(false);
+    i += 1;
+  }
+  let stack: usize[] = [start];
+  while (stack.length > 0) {
+    const k = stack.pop().unwrap();
+    if (seen[k]) {
+      continue;
+    }
+    seen[k] = true;
+    for (const t of prog.units[k].imports) {
+      match (t) {
+        ImportUnit(j) => {
+          stack.push(j);
+        },
+        ImportStd(_) => {},
+      }
+    }
+  }
+  let out: usize[] = [];
+  i = 0;
+  while (i < seen.length) {
+    if (seen[i]) {
+      out.push(i);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function helperKey(prog: LoadedProgram, sm: SourceMap, p: Processor, main: string): string {
+  let parts: string[] = [CACHE_FORMAT, p.name, main];
+  for (const k of closure(prog, p.unit)) {
+    parts.push(prog.units[k].path);
+    parts.push(sm.files[prog.units[k].file].text);
+  }
+  return fingerprint(parts);
+}
+
+export function cacheRoot(prog: LoadedProgram, cfg: ProcConfig): string {
+  if (cfg.cacheDir != "") {
+    return cfg.cacheDir;
+  }
+  const root = packageRoot(prog);
+  return joinPath(root != "" ? root : dirname(prog.units[prog.entry].path), ".orin/processors");
+}
+
+// ---- building -------------------------------------------------------------------------------------------------------
+
+function loadFailure(sm: SourceMap, ds: Diagnostic[]): string {
+  let lines: string[] = [];
+  for (const d of ds) {
+    lines.push(render(sm, d));
+  }
+  return trunc(lines.join("\n"), 4000);
+}
+
+// Builds the helper executable of `p` at `dir/helper`.
+function build(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, p: Processor, main: string, dir: string, cfg: ProcConfig): Result<bool, Failure> {
+  const procPath = prog.units[p.unit].path;
+  const mainPath = joinPath(dirname(procPath), MAIN_FILE);
+  const overlay = [SourceFile { path: mainPath, text: main }];
+  const loaded = loadWithRoots(fs, mainPath, overlay, preludeRoots());
+  if (loaded.diags.length > 0) {
+    return Err(Failure { message: "cannot load the processor module for the helper", stderr: loadFailure(loaded.sm, loaded.diags) });
+  }
+  const sm = loaded.sm;
+  const checked = check(loaded.program.unwrap(), sm);
+  if (checked.isErr()) {
+    return Err(Failure { message: "the processor helper does not type-check", stderr: loadFailure(sm, checked.unwrapErr()) });
+  }
+  const mir = optimize(lower(fuseProgram(checked.unwrap()).program));
+  if (verify(mir).errors.length > 0) {
+    return Err(Failure { message: "internal compiler error: MIR ownership verification failed for the processor helper", stderr: "" });
+  }
+  const cfile = dir + "/helper.c";
+  const w = writeFile(fs, cfile, emitC(pruneProgram(mir)));
+  if (w.isErr()) {
+    return Err(Failure { message: "cannot write " + cfile, stderr: w.unwrapErr() });
+  }
+  const rt = cfg.runtime;
+  if (!exists(fs, rt + "/orin_runtime.c")) {
+    return Err(Failure { message: "runtime not found at " + rt + " (pass --runtime <dir>; the packaged `orin` launcher does this)", stderr: "" });
+  }
+  const log = dir + "/cc.log";
+  const tmpExe = dir + "/helper.new";
+  const rc = shellRun(
+    proc,
+    cfg.cc + " -O1 -w -I " + shq(rt) + " " + shq(cfile) + " " + shq(rt + "/orin_runtime.c") + " "
+        + shq(rt + "/../platform/orin_platform.c") + " -lm -o " + shq(tmpExe) + " > " + shq(log) + " 2>&1",
+  );
+  if (rc != 0) {
+    return Err(Failure { message: "the C compiler failed (`" + cfg.cc + "`, exit " + rc.toString() + ")", stderr: trunc(readOr(fs, log), 2000) });
+  }
+  shellRun(proc, "mv -f " + shq(tmpExe) + " " + shq(dir + "/helper"));
+  return Ok(true);
+}
+
+// ---- running --------------------------------------------------------------------------------------------------------
+
+function parseStatus(text: string): Option<int> {
+  let t = text;
+  while (t.length > 0 && (t.charCodeAt(t.length - 1) == 10 || t.charCodeAt(t.length - 1) == 32)) {
+    t = t.substring(0, t.length - 1);
+  }
+  return parseInt(t);
+}
+
+function note(cfg: ProcConfig, msg: string): void {
+  if (cfg.verbose) {
+    console.error("processor: " + msg);
+  }
+}
+
+// Runs processor `p` over the encoded `input` for the module `where` (for messages). Ok(skipped) only in lenient mode without a
+// C compiler.
+export function runProcessor(
+  fs: FsGrant,
+  proc: ProcessGrant,
+  prog: LoadedProgram,
+  sm: SourceMap,
+  p: Processor,
+  where: string,
+  input: string,
+  cfg: ProcConfig,
+): Result<Executed, Failure> {
+  const main = mainSource(baseName(prog.units[p.unit].path), p.name);
+  const hk = helperKey(prog, sm, p, main);
+  const dir = cacheRoot(prog, cfg) + "/" + hk;
+  const outFile = dir + "/out-" + fingerprint([input]) + ".json";
+  if (exists(fs, outFile)) {
+    const cached = readFile(fs, outFile);
+    if (cached.isOk()) {
+      note(cfg, "reused the output of `" + p.name + "` for " + where);
+      return Ok(Executed { text: cached.unwrap(), skipped: false, why: "" });
+    }
+  }
+  if (shellRun(proc, "mkdir -p " + shq(dir)) != 0) {
+    return fail("cannot create the processor cache directory " + dir + " (use --processor-cache DIR)", "");
+  }
+  const exe = dir + "/helper";
+  if (exists(fs, exe)) {
+    note(cfg, "reused the helper of `" + p.name + "` (" + hk + ")");
+  } else {
+    if (cfg.lenient && shellRun(proc, cfg.cc + " --version > /dev/null 2>&1") != 0) {
+      return Ok(Executed { text: "", skipped: true, why: "no C compiler (`" + cfg.cc + "`) to build the helper of `" + p.name + "`" });
+    }
+    const b = build(fs, proc, prog, p, main, dir, cfg);
+    if (b.isErr()) {
+      return Err(b.unwrapErr());
+    }
+    note(cfg, "built the helper of `" + p.name + "` (" + hk + ")");
+  }
+  const inFile = dir + "/run.in";
+  const runOut = dir + "/run.out";
+  const runErr = dir + "/run.err";
+  const runSt = dir + "/run.st";
+  const w = writeFile(fs, inFile, input + "\n");
+  if (w.isErr()) {
+    return fail("cannot write " + inFile, w.unwrapErr());
+  }
+  shellRun(proc, "rm -f " + shq(runSt) + " " + shq(runOut) + " " + shq(runErr));
+  note(cfg, "running `" + p.name + "` for " + where);
+  const cmd = "{ ORIN_DENY=fs,process,clock,net " + shq(exe) + " < " + shq(inFile) + " 2> " + shq(runErr) + "; echo $? > " + shq(runSt)
+    + "; } | head -c " + (OUTPUT_LIMIT + 1).toString() + " > " + shq(runOut);
+  const code = shellRunTimeout(proc, cmd, cfg.timeout);
+  const err = trunc(readOr(fs, runErr), 2000);
+  if (code == -2) {
+    return fail("timed out after " + cfg.timeout.toString() + " s (--processor-timeout)", err);
+  }
+  if (code != 0) {
+    return fail("could not run the helper (shell status " + code.toString() + ")", err);
+  }
+  const text = readOr(fs, runOut);
+  if (text.length > OUTPUT_LIMIT) {
+    return fail("produced more than " + OUTPUT_LIMIT.toString() + " bytes of output", err);
+  }
+  const st = parseStatus(readOr(fs, runSt));
+  if (st.isNone()) {
+    return fail("the helper did not finish", err);
+  }
+  if (st.unwrap() == 101) {
+    return fail("trapped (exit status 101)", err);
+  }
+  if (st.unwrap() != 0) {
+    return fail("failed with exit status " + st.unwrap().toString(), err);
+  }
+  shellRun(proc, "mv -f " + shq(runOut) + " " + shq(outFile));
+  return Ok(Executed { text: text, skipped: false, why: "" });
+}

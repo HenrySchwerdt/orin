@@ -1,0 +1,462 @@
+// `@Json` and `@JsonName`: JSON codecs generated at compile time (ADR-0046 S6). This is an example package, not part of the
+// compiler or of `std`: the annotations and their processor are ordinary Orin declarations (docs/annotation-processors.md).
+//
+//   import { Json, JsonName } from "json-codec";
+//   @Json export type User = { id: int; @JsonName("display_name") name: string; tags: string[]; nick: Option<string>; };
+//   import { encodeUser, decodeUser } from "./models.gen";
+//
+// For every `@Json` record the processor generates, in the companion module of the annotated module,
+//   export function encodeUser(v: User): JsonValue
+//   export function decodeUser(j: JsonValue): Result<User, string>
+//   export function decodeUserAt(j: JsonValue, path: string): Result<User, string>   // used by records that nest `User`
+// `JsonValue` is `Json` of `std:json` (renamed in "json-codec" because `Json` is the annotation here).
+//
+// Supported field types: `int`, `bool`, `string`, `T[]` and `Option<T>` of supported types, and records annotated `@Json`
+// (in this module, or in a module that is imported: its own companion supplies the codecs). Anything else is a processor
+// diagnostic that points at the field (`float`: `std:json` has integers only). An absent or `null` `Option` field is `None`.
+// Decode errors are strings such as `$.address.zip: expected an int, found a string`.
+import {
+  Input, Output, MDecl, MType, MStmt, MExpr, MImport, MDiagnostic, MDeclView, MFieldView,
+  MTypeShape, MFieldInit, MDeclKind, MNamed, MArray, MOption, MSRecord, MKRecord, fresh, MParam, fn,
+  param, named, arrayOf, optionOf, resultOf, ret, retVoid, constS, constT, letT, assign, exprS, ifS,
+  whileS, forOf, name, str, intLit, call, method, dot, index, add, lt, record, initField, arrayLit,
+  tryOp, matchExpr, arm, pVariant, pBind, exportDecl, output, withImports, withDiagnostics,
+  importFrom, diagError, findAnnotation, annotationArg, constString,
+} from "std:meta";
+
+// The runtime support of the generated code (a dependency exposes only its root module, so it is re-exported from here).
+export {
+  JsonValue, jNull, jInt, jBool, jStr, jArr, jField, jObj, isNull, decInt, decBool, decString,
+  decArray, decObject, lookup, required, indexPath,
+} from "./runtime";
+
+@Annotation(type)
+export type Json = {};
+
+@Annotation(field)
+export type JsonName = { name: string; };
+
+@Processor(Json)
+export function jsonCodecs(input: Input): Output {
+  const diags = check(input);
+  if (diags.length > 0) {
+    return withDiagnostics(output([]), diags);
+  }
+  // Compound field types (arrays, options) get one private helper pair per distinct type.
+  let compound: MType[] = [];
+  for (const d of input.decls) {
+    for (const f of d.fields) {
+      compound = collect(f.ty, compound);
+    }
+  }
+  let decls: MDecl[] = [];
+  for (const d of input.decls) {
+    decls.push(exportDecl(encodeRecord(input, d), true));
+    decls.push(exportDecl(decodeRecordAt(input, d), true));
+    decls.push(exportDecl(decodeRecord(d), true));
+  }
+  for (const t of compound) {
+    decls.push(encodeHelper(input, t));
+    decls.push(decodeHelper(input, t));
+  }
+  const imports: MImport[] = [importFrom(runtimeNames(), "json-codec")];
+  return withImports(output(decls), imports);
+}
+
+function runtimeNames(): string[] {
+  return [
+    "JsonValue",
+    "jNull",
+    "jInt",
+    "jBool",
+    "jStr",
+    "jArr",
+    "jField",
+    "jObj",
+    "isNull",
+    "decInt",
+    "decBool",
+    "decString",
+    "decArray",
+    "decObject",
+    "lookup",
+    "required",
+    "indexPath",
+  ];
+}
+
+function contains(xs: string[], s: string): bool {
+  for (const x of xs) {
+    if (x == s) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---- types --------------------------------------------------------------------------------------------------------------
+
+function typeText(t: MType): string {
+  return match (t) {
+    MNamed(n, args) => args.length == 0 ? n : n + "<...>",
+    MArray(e) => typeText(e) + "[]",
+    MOption(e) => "Option<" + typeText(e) + ">",
+    _ => "this type",
+  };
+}
+
+function isPrimitive(n: string): bool {
+  return n == "int" || n == "bool" || n == "string";
+}
+
+function isRecordKind(k: MDeclKind): bool {
+  return match (k) {
+    MKRecord => true,
+    _ => false,
+  };
+}
+
+function ownRecord(input: Input, n: string): Option<MDeclView> {
+  for (const d of input.decls) {
+    if (d.name == n && isRecordKind(d.kind)) {
+      return Some(d);
+    }
+  }
+  return None;
+}
+
+function shapeOf(input: Input, n: string): Option<MTypeShape> {
+  for (const t of input.types) {
+    if (t.name == n) {
+      return Some(t);
+    }
+  }
+  return None;
+}
+
+// "" when the type can be encoded and decoded, else the reason.
+function unsupported(input: Input, t: MType): string {
+  return match (t) {
+    MNamed(n, args) => namedProblem(input, n, args.length),
+    MArray(e) => unsupported(input, e),
+    MOption(e) => optionProblem(input, e),
+    _ => "`" + typeText(t)
+        + "` is not supported (supported: int, bool, string, T[], Option<T>, records annotated @Json)",
+  };
+}
+
+function optionProblem(input: Input, e: MType): string {
+  return match (e) {
+    MOption(x) => "Option<Option<...>> is not supported: `null` could not tell the two apart",
+    _ => unsupported(input, e),
+  };
+}
+
+function namedProblem(input: Input, n: string, argc: usize): string {
+  if (argc > 0) {
+    return "the generic type `" + n + "` is not supported";
+  }
+  if (isPrimitive(n)) {
+    return "";
+  }
+  if (n == "float") {
+    return "`float` is not supported: std:json has integers only";
+  }
+  if (ownRecord(input, n).isSome()) {
+    return "";
+  }
+  const s = shapeOf(input, n);
+  if (s.isSome()) {
+    const shape = s.unwrap();
+    const isRecord = match (shape.shape) {
+      MSRecord(fs) => true,
+      _ => false,
+    };
+    if (isRecord && shape.source != input.modulePath) {
+      return "the record `" + n + "` is declared in " + shape.source
+          + ": a companion module cannot import another one (one round of expansion), so nested @Json records must be declared in the same module";
+    }
+    if (isRecord) {
+      return "the record `" + n + "` needs @Json for its codecs";
+    }
+  }
+  return "the type `" + n
+      + "` is not supported (supported: int, bool, string, T[], Option<T>, records annotated @Json)";
+}
+
+// The JSON key of a field: the argument of `@JsonName`, else the field name.
+function jsonKey(f: MFieldView): string {
+  const a = findAnnotation(f.annotations, "JsonName");
+  if (a.isSome()) {
+    const v = annotationArg(a.unwrap(), "name");
+    if (v.isSome()) {
+      return constString(v.unwrap()).unwrapOr(f.name);
+    }
+  }
+  return f.name;
+}
+
+function check(input: Input): MDiagnostic[] {
+  let out: MDiagnostic[] = [];
+  for (const d of input.decls) {
+    if (!isRecordKind(d.kind)) {
+      out.push(
+        diagError(d.ref, "@Json applies to record types only; `" + d.name + "` is not a record"),
+      );
+    } else if (d.typeParams.length > 0) {
+      out.push(diagError(d.ref, "@Json does not support the generic record `" + d.name + "`"));
+    } else {
+      let seen: string[] = [];
+      for (const f of d.fields) {
+        const why = unsupported(input, f.ty);
+        if (why != "") {
+          out.push(
+            diagError(
+              f.ref,
+              "@Json cannot encode field `" + f.name + "` of `" + d.name + "`: " + why,
+            ),
+          );
+        }
+        const key = jsonKey(f);
+        if (contains(seen, key)) {
+          out.push(
+            diagError(
+              f.ref,
+              "@Json: the JSON key \"" + key + "\" is used twice in `" + d.name + "`",
+            ),
+          );
+        }
+        seen.push(key);
+      }
+    }
+  }
+  return out;
+}
+
+// ---- helpers per compound type ------------------------------------------------------------------------------------------
+
+function containsType(xs: MType[], t: MType): bool {
+  const k = typeText(t);
+  for (const x of xs) {
+    if (typeText(x) == k) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Adds the arrays and options inside `t` (inner types first) to `acc`.
+function collect(t: MType, acc: MType[]): MType[] {
+  let out = acc;
+  match (t) {
+    MArray(e) => {
+      out = collect(e, out);
+    },
+    MOption(e) => {
+      out = collect(e, out);
+    },
+    _ => {},
+  }
+  match (t) {
+    MNamed(n, args) => {},
+    _ => {
+      if (!containsType(out, t)) {
+        out.push(t);
+      }
+    },
+  }
+  return out;
+}
+
+function mangle(t: MType): string {
+  return match (t) {
+    MNamed(n, args) => n,
+    MArray(e) => "ArrOf" + mangle(e),
+    MOption(e) => "OptOf" + mangle(e),
+    _ => "T",
+  };
+}
+
+// The names of the helpers are a function of the type, so they need no state and are unique per run (`freshBase`).
+function encName(input: Input, t: MType): string {
+  return fresh("enc" + mangle(t), input.freshBase);
+}
+
+function decName(input: Input, t: MType): string {
+  return fresh("dec" + mangle(t), input.freshBase);
+}
+
+// ---- encoding -----------------------------------------------------------------------------------------------------------
+
+// An expression of type JsonValue for the value `v` of type `t`.
+function encode(input: Input, t: MType, v: MExpr): MExpr {
+  return match (t) {
+    MNamed(n, args) => encodeNamed(n, v),
+    _ => call(encName(input, t), [v]),
+  };
+}
+
+function encodeNamed(n: string, v: MExpr): MExpr {
+  if (n == "int") {
+    return call("jInt", [v]);
+  }
+  if (n == "bool") {
+    return call("jBool", [v]);
+  }
+  if (n == "string") {
+    return call("jStr", [v]);
+  }
+  return call("encode" + n, [v]);
+}
+
+function encodeHelper(input: Input, t: MType): MDecl {
+  let body: MStmt[] = [];
+  match (t) {
+    MArray(e) => {
+      body = [
+        letT("out", arrayOf(named("JsonValue")), arrayLit([])),
+        forOf("x", name("v"), [exprS(method(name("out"), "push", [encode(input, e, name("x"))]))]),
+        ret(call("jArr", [name("out")])),
+      ];
+    },
+    MOption(e) => {
+      body = [
+        ret(
+          matchExpr(
+            name("v"),
+            [
+              arm(pVariant("Some", [pBind("x")]), encode(input, e, name("x"))),
+              arm(pVariant("None", []), call("jNull", [])),
+            ],
+          ),
+        ),
+      ];
+    },
+    _ => {},
+  }
+  return fn(encName(input, t), [param("v", t)], named("JsonValue"), body);
+}
+
+function encodeRecord(input: Input, d: MDeclView): MDecl {
+  let fields: MExpr[] = [];
+  for (const f of d.fields) {
+    fields.push(call("jField", [str(jsonKey(f)), encode(input, f.ty, dot(name("v"), f.name))]));
+  }
+  const body = [ret(call("jObj", [arrayLit(fields)]))];
+  return fn("encode" + d.name, [param("v", named(d.name))], named("JsonValue"), body);
+}
+
+// ---- decoding -----------------------------------------------------------------------------------------------------------
+
+// A `Result<t, string>` expression that decodes the JSON value `j` at the path `p` into `t`.
+function decode(input: Input, t: MType, j: MExpr, p: MExpr): MExpr {
+  return match (t) {
+    MNamed(n, args) => decodeNamed(n, j, p),
+    _ => call(decName(input, t), [j, p]),
+  };
+}
+
+function decodeNamed(n: string, j: MExpr, p: MExpr): MExpr {
+  if (n == "int") {
+    return call("decInt", [j, p]);
+  }
+  if (n == "bool") {
+    return call("decBool", [j, p]);
+  }
+  if (n == "string") {
+    return call("decString", [j, p]);
+  }
+  return call("decode" + n + "At", [j, p]);
+}
+
+function jsonParams(): MParam[] {
+  return [param("j", named("JsonValue")), param("path", named("string"))];
+}
+
+function decodeHelper(input: Input, t: MType): MDecl {
+  let body: MStmt[] = [];
+  match (t) {
+    MArray(e) => {
+      const item = decode(
+        input,
+        e,
+        index(name("items"), name("i")),
+        call("indexPath", [name("path"), name("i")]),
+      );
+      body = [
+        constS("items", tryOp(call("decArray", [name("j"), name("path")]))),
+        letT("out", arrayOf(e), arrayLit([])),
+        letT("i", named("usize"), intLit(0)),
+        whileS(
+          lt(name("i"), dot(name("items"), "length")),
+          [
+            constS("e", tryOp(item)),
+            exprS(method(name("out"), "push", [name("e")])),
+            assign(name("i"), add(name("i"), intLit(1))),
+          ],
+        ),
+        ret(call("Ok", [name("out")])),
+      ];
+    },
+    MOption(e) => {
+      // `null` is None; anything else is decoded as the payload.
+      body = [
+        ifS(call("isNull", [name("j")]), [ret(call("Ok", [name("None")]))], []),
+        constS("x", tryOp(decode(input, e, name("j"), name("path")))),
+        ret(call("Ok", [call("Some", [name("x")])])),
+      ];
+    },
+    _ => {},
+  }
+  return fn(decName(input, t), jsonParams(), resultOf(t, named("string")), body);
+}
+
+function isOption(t: MType): bool {
+  return match (t) {
+    MOption(e) => true,
+    _ => false,
+  };
+}
+
+function decodeRecordAt(input: Input, d: MDeclView): MDecl {
+  let body: MStmt[] = [constS("o", tryOp(call("decObject", [name("j"), name("path")])))];
+  let inits: MFieldInit[] = [];
+  for (const f of d.fields) {
+    const local = "f_" + f.name;
+    const key = jsonKey(f);
+    const where = add(name("path"), str("." + key));
+    if (isOption(f.ty)) {
+      // A missing key is None.
+      body.push(letT(local, f.ty, name("None")));
+      body.push(constS("r_" + f.name, call("lookup", [name("o"), str(key)])));
+      body.push(
+        ifS(
+          method(name("r_" + f.name), "isSome", []),
+          [
+            assign(
+              name(local),
+              tryOp(decode(input, f.ty, method(name("r_" + f.name), "unwrap", []), where)),
+            ),
+          ],
+          [],
+        ),
+      );
+    } else {
+      const json = tryOp(call("required", [name("o"), str(key), name("path")]));
+      body.push(constS(local, tryOp(decode(input, f.ty, json, where))));
+    }
+    inits.push(initField(f.name, name(local)));
+  }
+  body.push(ret(call("Ok", [record(d.name, inits)])));
+  return fn("decode" + d.name + "At", jsonParams(), resultOf(named(d.name), named("string")), body);
+}
+
+function decodeRecord(d: MDeclView): MDecl {
+  const body = [ret(call("decode" + d.name + "At", [name("j"), str("$")]))];
+  return fn(
+    "decode" + d.name,
+    [param("j", named("JsonValue"))],
+    resultOf(named(d.name), named("string")),
+    body,
+  );
+}
