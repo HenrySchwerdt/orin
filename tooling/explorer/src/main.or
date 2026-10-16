@@ -1,0 +1,102 @@
+// explore: the Orin code explorer (ADR-0050). Reads an OSIG snapshot (`orin graph`), optionally an `orin diff --format=json`
+// report, and writes a static, offline site: overview, module graph, symbol pages with documentation, contracts and effects,
+// processes and the changes between two states.
+//
+//   explore SNAPSHOT.json [--diff DIFF.json] --out DIR
+//
+// Deterministic: the same inputs give byte-identical files. Exit 1 on unreadable or invalid input, 2 on a usage error.
+
+import { Host, useHost } from "std:host";
+import { FsGrant, readFile, writeFile } from "std:fs";
+import { ProcessGrant, args, exit } from "std:process";
+import { shell } from "std:io";
+import { decodeSnap, decodeDiff, Diff } from "./model";
+import { buildSite } from "./site";
+
+function usage(): void {
+  console.error("usage: explore SNAPSHOT.json [--diff DIFF.json] --out DIR");
+  console.error("  SNAPSHOT.json  the output of `orin graph <package> -o SNAPSHOT.json`");
+  console.error("  DIFF.json      the output of `orin diff --base A --head B --format=json -o DIFF.json` (optional)");
+  exit(2);
+}
+
+function fail(msg: string): void {
+  console.error("explore: " + msg);
+  exit(1);
+}
+
+function shellQuote(s: string): string {
+  return "'" + s.split("'").join("'\\''") + "'";
+}
+
+function joinPath(dir: string, name: string): string {
+  return dir.endsWith("/") ? dir + name : dir + "/" + name;
+}
+
+function main(host: Host): void {
+  useHost(host, (fs, proc, stdio, clock) => { run(fs, proc); });
+}
+
+function run(fs: FsGrant, proc: ProcessGrant): void {
+  const a = args(proc);
+  let snapPath = "";
+  let diffPath = "";
+  let out = "";
+  let i: usize = 0;
+  while (i < a.length) {
+    if (a[i] == "--diff" && i + 1 < a.length) {
+      diffPath = a[i + 1];
+      i += 2;
+    } else if (a[i] == "--out" && i + 1 < a.length) {
+      out = a[i + 1];
+      i += 2;
+    } else if (!a[i].startsWith("--") && snapPath.length == 0) {
+      snapPath = a[i];
+      i += 1;
+    } else {
+      usage();
+      return;
+    }
+  }
+  if (snapPath.length == 0 || out.length == 0) {
+    usage();
+    return;
+  }
+  const text = readFile(fs, snapPath);
+  if (text.isErr()) {
+    fail("cannot read " + snapPath + ": " + text.unwrapErr());
+    return;
+  }
+  const snap = decodeSnap(text.unwrap());
+  if (snap.isErr()) {
+    fail(snapPath + ": " + snap.unwrapErr());
+    return;
+  }
+  let diff: Option<Diff> = None;
+  if (diffPath.length > 0) {
+    const dt = readFile(fs, diffPath);
+    if (dt.isErr()) {
+      fail("cannot read " + diffPath + ": " + dt.unwrapErr());
+      return;
+    }
+    const d = decodeDiff(dt.unwrap());
+    if (d.isErr()) {
+      fail(diffPath + ": " + d.unwrapErr());
+      return;
+    }
+    diff = Some(d.unwrap());
+  }
+  const files = buildSite(snap.unwrap(), diff);
+  if (shell(proc, "mkdir -p " + shellQuote(joinPath(out, "m")) + " " + shellQuote(joinPath(out, "s")) + " " + shellQuote(joinPath(out, "assets"))) != 0) {
+    fail("cannot create the directory " + out);
+    return;
+  }
+  for (const f of files) {
+    const r = writeFile(fs, joinPath(out, f.path), f.text);
+    if (r.isErr()) {
+      fail("cannot write " + joinPath(out, f.path) + ": " + r.unwrapErr());
+      return;
+    }
+  }
+  console.error("explore: wrote " + files.length.toString() + " files to " + out);
+}

@@ -1,0 +1,196 @@
+import { buildSite, OutFile } from "../src/site";
+import { Snap, Sym, Rel, decodeSnap, decodeDiff } from "../src/model";
+import { buildIx, NONE } from "../src/index";
+import { layered, LNode, LEdge, Layout } from "../src/layout";
+import { slugOf, clip, percent } from "../src/util";
+import { assertEqString, assertEqBool, assertEq, assert } from "std:test";
+
+const EVIL: string = "<script>alert(1)</script>&\"'";
+
+function contains(s: string, needle: string): bool {
+  return s.indexOf(needle).isSome();
+}
+
+function sym(id: string, kind: string, name: string, module: string, owner: string, sig: string, doc: string): Sym {
+  return Sym { id: id, kind: kind, name: name, module: module, owner: owner, sig: sig, exported: true, entry: kind == "Function",
+               file: "src/a.or", line: 3, endLine: 5, doc: doc };
+}
+
+function rel(kind: string, src: string, dst: string, ev: string, via: string): Rel {
+  return Rel { kind: kind, src: src, dst: dst, ev: ev, via: via, file: "src/a.or", line: 4, next: "" };
+}
+
+// a package whose every name, signature, documentation and edge text is hostile
+function evilSnap(): Snap {
+  const pkg = "p";
+  const m = pkg + ":" + EVIL;
+  const f = m + "::" + EVIL;
+  const g = m + "::g";
+  return Snap {
+    schema: "osig/0.3", pkg: pkg, hash: EVIL,
+    nodes: [
+      sym(m, "Module", EVIL, EVIL, pkg, "", ""),
+      sym(f, "Function", EVIL, EVIL, m, "function " + EVIL + "(): void", "Doc " + EVIL + "\n\n```\n" + EVIL + "\n```\n\n@param x " + EVIL + "\n@returns `" + EVIL + "`"),
+      sym(g, "Function", "g", EVIL, m, "function g(): void", ""),
+      sym(f + "@requires#0", "Contract", "requires", EVIL, f, "@Requires(" + EVIL + ")", ""),
+      sym("~io:Fs." + EVIL, "Effect", "Fs." + EVIL, "", "", "INPUT; grant: FsGrant", ""),
+    ],
+    edges: [
+      rel("CALLS", f, g, "MUST", "direct"),
+      rel("CALLS", g, f, "MAY", "impl"),
+      rel("MAY_PERFORM", f, "~io:Fs." + EVIL, "MUST", "INPUT"),
+    ],
+  };
+}
+
+function htmlOf(files: OutFile[]): OutFile[] {
+  let r: OutFile[] = [];
+  for (const f of files) {
+    if (f.path.endsWith(".html")) {
+      r.push(f);
+    }
+  }
+  return r;
+}
+
+@Test
+function hostile_text_is_escaped_on_every_page(): void {
+  const files = htmlOf(buildSite(evilSnap(), None));
+  assert(files.length >= 6, "pages were written");
+  for (const f of files) {
+    assertEqBool(contains(f.text, "<script>"), false, f.path + ": raw <script>");
+    assertEqBool(contains(f.text, "alert(1)</script>"), false, f.path + ": raw closing tag");
+    assertEqBool(contains(f.text, "\"><script"), false, f.path + ": attribute breakout");
+  }
+  let escaped = false;
+  for (const f of files) {
+    escaped = escaped || contains(f.text, "&lt;script&gt;alert(1)&lt;/script&gt;&amp;");
+  }
+  assertEqBool(escaped, true, "the text is present, escaped");
+}
+
+@Test
+function pages_load_nothing_remote_and_carry_no_inline_script(): void {
+  const files = htmlOf(buildSite(evilSnap(), None));
+  for (const f of files) {
+    assertEqBool(contains(f.text, "https://"), false, f.path + ": remote https");
+    assertEqBool(contains(f.text, "http://"), contains(f.text, "http://www.w3.org/2000/svg"), f.path + ": only the SVG namespace");
+    assertEqBool(contains(f.text, "<img"), false, f.path + ": image");
+    assertEqBool(contains(f.text, "<script>"), false, f.path + ": inline script");
+    assertEqBool(contains(f.text, "<style"), false, f.path + ": inline style");
+    assertEqBool(contains(f.text, "onclick"), false, f.path + ": event handler attribute");
+  }
+}
+
+@Test
+function output_is_deterministic(): void {
+  const a = buildSite(evilSnap(), None);
+  const b = buildSite(evilSnap(), None);
+  assertEq(a.length.toInt(), b.length.toInt(), "same number of files");
+  let i: usize = 0;
+  while (i < a.length) {
+    assertEqString(a[i].path, b[i].path, "same path");
+    assertEqBool(a[i].text == b[i].text, true, a[i].path + ": same bytes");
+    i += 1;
+  }
+}
+
+@Test
+function slugs_are_lower_case_file_names_and_unique(): void {
+  assertEqString(slugOf("analysis::EffectTable.callbacksOf"), "analysis-effecttable.callbacksof", "punctuation runs become one dash");
+  assertEqString(slugOf("../../etc/passwd"), "etc-passwd", "no path traversal");
+  assertEqString(slugOf("::"), "x", "never empty");
+  const snap = Snap {
+    schema: "osig/0.3", pkg: "p", hash: "h",
+    nodes: [sym("p:m::Token", "Class", "Token", "m", "p:m", "class Token", ""), sym("p:m::token", "Function", "token", "m", "p:m", "function token()", ""),
+            sym("p:m", "Module", "m", "m", "p", "", "")],
+    edges: [],
+  };
+  const ix = buildIx(snap);
+  assertEqBool(ix.slug[0] != ix.slug[1], true, "Token and token do not collide on a case-insensitive file system");
+  assertEqString(ix.slug[2], "", "a module has no symbol page");
+}
+
+@Test
+function empty_diff_says_nothing_changed(): void {
+  const d = decodeDiff("{\"schema\":\"osig-diff/0.2\",\"base\":{\"package\":\"p\",\"hash\":\"h1\"},\"head\":{\"package\":\"p\",\"hash\":\"h1\"},"
+    + "\"differences\":false,\"effectsComparable\":true,\"summary\":{\"truncated\":false}}");
+  assertEqBool(d.isOk(), true, "a diff without lists decodes");
+  const files = buildSite(evilSnap(), Some(d.unwrap()));
+  let page = "";
+  for (const f of files) {
+    if (f.path == "diff.html") {
+      page = f.text;
+    }
+  }
+  assert(page.length > 0, "diff.html written");
+  assertEqBool(contains(page, "nothing changed"), true, "identical notice");
+  assertEqBool(contains(page, "No symbol changed."), true, "empty table text");
+  assertEqBool(contains(page, "No edge changed."), true, "empty edges text");
+}
+
+@Test
+function hostile_diff_text_is_escaped(): void {
+  const d = decodeDiff("{\"schema\":\"osig-diff/0.2\",\"base\":{\"package\":\"<b>\",\"hash\":\"h\"},\"head\":{\"package\":\"p\",\"hash\":\"h2\"},"
+    + "\"differences\":true,\"changedSymbols\":[{\"id\":\"p:<script>::f\",\"kind\":\"Function\",\"aspects\":[\"signature\"],\"before\":\"<script>a</script>\","
+    + "\"after\":\"x&y\\\"'\",\"span\":{\"file\":\"<f>\",\"line\":1}}],"
+    + "\"addedEdges\":[{\"kind\":\"CALLS\",\"src\":\"p:m::<i>\",\"dst\":\"p:m::g\",\"evidence\":\"MUST\",\"via\":\"direct\",\"span\":{\"file\":\"<f>\",\"line\":2}}]}");
+  assertEqBool(d.isOk(), true, "decodes");
+  let page = "";
+  for (const f of buildSite(evilSnap(), Some(d.unwrap()))) {
+    if (f.path == "diff.html") {
+      page = f.text;
+    }
+  }
+  assertEqBool(contains(page, "<script>"), false, "no raw script");
+  assertEqBool(contains(page, "&lt;script&gt;a&lt;/script&gt;"), true, "before text escaped");
+  assertEqBool(contains(page, "x&amp;y&quot;&#39;"), true, "after text escaped");
+}
+
+@Test
+function wrong_inputs_are_refused(): void {
+  assertEqBool(decodeSnap("[]").isErr(), true, "array");
+  assertEqBool(decodeSnap("{\"schema\":\"other/1\"}").isErr(), true, "foreign schema");
+  assertEqBool(decodeSnap("{").isErr(), true, "broken JSON");
+  assertEqBool(decodeSnap("{\"schema\":\"osig/0.9\",\"unknownField\":1,\"nodes\":[],\"edges\":[]}").isOk(), true, "a newer minor version is read");
+  assertEqBool(decodeDiff("{\"schema\":\"osig/0.2\"}").isErr(), true, "a snapshot is not a diff");
+}
+
+@Test
+function layout_is_left_to_right_and_overlap_free(): void {
+  let nodes: LNode[] = [];
+  let i: int = 0;
+  while (i < 6) {
+    nodes.push(LNode { w: 100.0, h: 40.0 });
+    i += 1;
+  }
+  // 0 -> 1 -> 2 -> 3, 0 -> 3 (a long edge), 4 -> 3, 5 -> 5 (self loop), 3 -> 1 (closes a cycle)
+  const edges = [LEdge { a: 0, b: 1 }, LEdge { a: 1, b: 2 }, LEdge { a: 2, b: 3 }, LEdge { a: 0, b: 3 }, LEdge { a: 4, b: 3 },
+                 LEdge { a: 5, b: 5 }, LEdge { a: 3, b: 1 }];
+  const lay = layered(nodes, edges, 60.0, 20.0);
+  assertEqBool(lay.nodes[1].x > lay.nodes[0].x && lay.nodes[2].x > lay.nodes[1].x && lay.nodes[3].x > lay.nodes[2].x, true, "layers flow left to right");
+  assertEqBool(lay.routes[6].back, true, "the edge that closes the cycle is drawn backwards");
+  assertEqBool(lay.routes[3].pts.length >= 3, true, "the long edge is routed through a dummy column");
+  assertEq(lay.routes[5].pts.length.toInt(), 0, "a self loop is not drawn");
+  let a: usize = 0;
+  while (a < nodes.length) {
+    let b = a + 1;
+    while (b < nodes.length) {
+      const overlapX = lay.nodes[a].x < lay.nodes[b].x + 100.0 && lay.nodes[b].x < lay.nodes[a].x + 100.0;
+      const overlapY = lay.nodes[a].y < lay.nodes[b].y + 40.0 && lay.nodes[b].y < lay.nodes[a].y + 40.0;
+      assertEqBool(overlapX && overlapY, false, "no two nodes overlap");
+      b += 1;
+    }
+    a += 1;
+  }
+  const again = layered(nodes, edges, 60.0, 20.0);
+  assertEqBool(again.nodes[3].y == lay.nodes[3].y && again.width == lay.width, true, "deterministic");
+}
+
+@Test
+function util_helpers(): void {
+  assertEqString(clip("abcdef", 4), "abcd…", "clip");
+  assertEqString(clip("abc", 4), "abc", "short text is kept");
+  assertEqString(percent(1, 3), "33 %", "percent");
+  assertEqString(percent(0, 0), "0 %", "no division by zero");
+}
