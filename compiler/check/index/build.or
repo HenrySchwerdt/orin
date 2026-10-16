@@ -1,0 +1,571 @@
+// Semantic index producer (hir/index.or contract; spec 18 §1, ADR-0008).
+//
+// `buildIndex(prog, sm, hir)` computes definitions, references and expression types for the
+// whole loaded program. It is a separate, additive pass next to the checker:
+//
+//   - definitions and references come from the AST with the module-level scope rules of
+//     `collect.or` (declarations, imports with union variants, re-exports) and lexical scopes
+//     for parameters, `const`/`let`, `for ... of` and pattern bindings. This needs no type
+//     information, so locals, functions, types, variants and import-list names resolve even
+//     when the program has type errors.
+//   - field references (`a.b` reads, `p.x = ...` writes, record literal field names) and the
+//     `types` table come from the typed HIR when checking succeeded (`hir` is Some): reads use
+//     the checker's resolved record/field ids, writes are resolved through the declared types
+//     of locals. With type errors these are absent (the index is then partial).
+//
+// Determinism: defs are numbered per unit (units in loader order): top-level declarations (with
+// their fields / variants right behind them) first, then locals and parameters in source order
+// per function. `refs` and `types` are sorted by position; duplicates are removed.
+
+import { Span, SourceMap } from "../../diag";
+import { FunctionDecl, Param } from "../../syntax";
+import { LoadedProgram } from "../../loader";
+import {
+  Program,
+  Function,
+  SymbolDef,
+  SymbolRef,
+  TypeAt,
+  SemanticIndex,
+  ImplLink,
+  SkFunction,
+  SkConst,
+  SkInterface
+} from "../../hir";
+import {
+  P1,
+  allCtorClauses,
+  classFieldCount,
+  declareClass,
+  declareInterface,
+  declareType,
+  resolveImports
+} from "./declare";
+import { hBlock } from "./hir";
+import { constDetail, funcDetail } from "./render";
+import { Ctx, addDef, addDefA, addRef, children, lookupType, newW } from "./state";
+import {
+  FnKind,
+  UnitTab,
+  addV,
+  emptyTab,
+  findName,
+  fnKindNos,
+  isClosureKind,
+  isOrdinaryKind,
+  isWrapperKind
+} from "./tables";
+import { optTypeRefs, typeRefs, walkExpr, walkFunction, walkTypeDecl } from "./walk";
+
+// ---- sorting ----------------------------------------------------------------------------------------
+
+function spanLess(a: Span, b: Span): bool {
+  if (a.file != b.file) {
+    return a.file < b.file;
+  }
+  if (a.start != b.start) {
+    return a.start < b.start;
+  }
+  return a.end < b.end;
+}
+
+function sortRefs(xs: SymbolRef[]): SymbolRef[] {
+  if (xs.length < 2) {
+    return xs;
+  }
+  const mid = xs.length / 2;
+  const l = sortRefs(xs.slice(0, mid));
+  const r = sortRefs(xs.slice(mid, xs.length));
+  let out: SymbolRef[] = [];
+  let i: usize = 0;
+  let j: usize = 0;
+  while (i < l.length && j < r.length) {
+    if (spanLess(r[j].span, l[i].span)) {
+      out.push(r[j]);
+      j += 1;
+    } else {
+      out.push(l[i]);
+      i += 1;
+    }
+  }
+  while (i < l.length) {
+    out.push(l[i]);
+    i += 1;
+  }
+  while (j < r.length) {
+    out.push(r[j]);
+    j += 1;
+  }
+  return out;
+}
+
+function sortTypes(xs: TypeAt[]): TypeAt[] {
+  if (xs.length < 2) {
+    return xs;
+  }
+  const mid = xs.length / 2;
+  const l = sortTypes(xs.slice(0, mid));
+  const r = sortTypes(xs.slice(mid, xs.length));
+  let out: TypeAt[] = [];
+  let i: usize = 0;
+  let j: usize = 0;
+  while (i < l.length && j < r.length) {
+    if (spanLess(r[j].span, l[i].span)) {
+      out.push(r[j]);
+      j += 1;
+    } else {
+      out.push(l[i]);
+      i += 1;
+    }
+  }
+  while (i < l.length) {
+    out.push(l[i]);
+    i += 1;
+  }
+  while (j < r.length) {
+    out.push(r[j]);
+    j += 1;
+  }
+  return out;
+}
+
+function sameSpan(a: Span, b: Span): bool {
+  return a.file == b.file && a.start == b.start && a.end == b.end;
+}
+
+function dedupRefs(xs: SymbolRef[]): SymbolRef[] {
+  let out: SymbolRef[] = [];
+  for (const r of xs) {
+    if (out.length > 0 && sameSpan(out[out.length - 1].span, r.span) && out[out.length - 1].def == r.def) {
+      continue;
+    }
+    out.push(r);
+  }
+  return out;
+}
+
+function dedupTypes(xs: TypeAt[]): TypeAt[] {
+  let out: TypeAt[] = [];
+  for (const t of xs) {
+    if (out.length > 0 && sameSpan(out[out.length - 1].span, t.span)) {
+      continue;
+    }
+    out.push(t);
+  }
+  return out;
+}
+
+// The interface defs bounding the type parameters of the generic function that the HIR instance
+// `unit.name<args>` was made from (ADR-0019); empty for anything else.
+function boundDefs(c: Ctx, hirName: string): usize[] {
+  let out: usize[] = [];
+  const lt = hirName.indexOf("<");
+  if (lt.isNone()) {
+    return out;
+  }
+  const base = hirName.substring(0, lt.unwrap());
+  let ui: usize = 0;
+  for (const u of c.prog.units) {
+    for (const item of u.ast.items) {
+      match (item) {
+        IFunction(f) => {
+          if (u.name + "." + f.name.name == base) {
+            for (const b of f.bounds) {
+              match (b) {
+                Some(id) => {
+                  const t = c.tabs[ui];
+                  const d = findName(t.tNames, t.tDefs, id.name);
+                  if (d.isSome()) {
+                    out.push(d.unwrap());
+                  }
+                },
+                None => {}
+              }
+            }
+          }
+        },
+        IClass(cd) => {
+          // the constructor and instance methods of a generic class (ADR-0026) carry the bounds of the class
+          if (base.startsWith(u.name + "." + cd.name.name + ".")) {
+            for (const b of cd.bounds) {
+              match (b) {
+                Some(id) => {
+                  const t = c.tabs[ui];
+                  const d = findName(t.tNames, t.tDefs, id.name);
+                  if (d.isSome()) {
+                    out.push(d.unwrap());
+                  }
+                },
+                None => {}
+              }
+            }
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
+  }
+  return out;
+}
+
+// Qualified HIR names ("unit.f", "unit.C.m", "unit.C.constructor") of the functions, methods and constructors
+// of the program, with their defs. A class without explicit constructor maps `constructor` to the class def.
+type FnNames = { names: string[]; defs: usize[]; };
+
+function functionNames(prog: LoadedProgram, tabs: UnitTab[], defs: SymbolDef[]): FnNames {
+  let names: string[] = [];
+  let ds: usize[] = [];
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    let k: usize = 0;
+    for (const item of u.ast.items) {
+      const did = tabs[ui].itemDefs[k];
+      k += 1;
+      match (item) {
+        IFunction(f) => {
+          names.push(u.name + "." + f.name.name);
+          ds.push(did);
+        },
+        IClass(cd) => {
+          let explicitCtor = false;
+          for (const m of children(defs, did)) {
+            const isFn = match (defs[m].kind) { SkFunction => true, _ => false };
+            if (isFn) {
+              names.push(u.name + "." + cd.name.name + "." + defs[m].name);
+              ds.push(m);
+              if (defs[m].name == "constructor") {
+                explicitCtor = true;
+              }
+            }
+          }
+          if (!explicitCtor) {
+            names.push(u.name + "." + cd.name.name + ".constructor");
+            ds.push(did);
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
+  }
+  return FnNames { names: names, defs: ds };
+}
+
+// ---- driver -------------------------------------------------------------------------------------------
+
+export function buildIndex(prog: LoadedProgram, sm: SourceMap, hir: Option<Program>): SemanticIndex {
+  // Pass 1: top-level definitions, imports and exports, units in loader order.
+  let w = newW();
+  let tabs: UnitTab[] = [];
+  let tq: string[] = [];
+  let tqDefs: usize[] = [];
+  let ui: usize = 0;
+  for (const u of prog.units) {
+    w.unit = ui;
+    let tab = emptyTab();
+    let itemDefs: usize[] = [];
+    let p = P1 { w: w, tab: tab, tq: tq, tqDefs: tqDefs };
+    for (const item of u.ast.items) {
+      let did: usize = 0;
+      match (item) {
+        IFunction(f) => {
+          did = p.w.defs.length;
+          p.w = addDefA(p.w, f.name.name, SkFunction, f.name.span, f.span, None, f.exported, funcDetail(f, sm), f.annotations, sm);
+          p.tab = addV(p.tab, f.name.name, did, f.exported);
+        },
+        IConst(k) => {
+          did = p.w.defs.length;
+          p.w = addDef(p.w, k.name.name, SkConst, k.name.span, k.span, None, k.exported, constDetail(k));
+          p.tab = addV(p.tab, k.name.name, did, k.exported);
+        },
+        IType(t) => {
+          did = p.w.defs.length;
+          p = declareType(p, u.name, t, sm);
+        },
+        IClass(cd) => {
+          did = p.w.defs.length;
+          p = declareClass(p, u.name, cd, hir, sm);
+        },
+        IInterface(ik) => {
+          did = p.w.defs.length;
+          p = declareInterface(p, u.name, ik, sm);
+        },
+        _ => {}
+      }
+      itemDefs.push(did);
+    }
+    p = resolveImports(p, ui, prog, tabs);
+    p.tab.itemDefs = itemDefs;
+    w = p.w;
+    tabs.push(p.tab);
+    tq = p.tq;
+    tqDefs = p.tqDefs;
+    ui += 1;
+  }
+  // HIR record id -> SkRecord def (generic instances map to their generic declaration).
+  let recDef: Option<usize>[] = [];
+  match (hir) {
+    Some(h) => {
+      for (const r of h.records) {
+        let base = r.name;
+        const lt = base.indexOf("<");
+        if (lt.isSome()) {
+          base = base.substring(0, lt.unwrap());
+        }
+        recDef.push(findName(tq, tqDefs, base));
+      }
+    },
+    None => {}
+  }
+  let fnDef: Option<usize>[] = [];
+  let fnKind: FnKind[] = [];
+  match (hir) {
+    Some(h) => {
+      const fq = functionNames(prog, tabs, w.defs);
+      for (const f of h.functions) {
+        let nm = f.name;
+        let kind: FnKind = FkOrdinary;
+        const ci = nm.indexOf("$closure");
+        if (ci.isSome()) {
+          kind = ci.unwrap() + 8 == nm.length ? FkWrapper : FkClosure;
+          nm = nm.substring(0, ci.unwrap());
+        }
+        const lt = nm.indexOf("<");
+        if (lt.isSome()) {
+          nm = nm.substring(0, lt.unwrap());
+        }
+        fnDef.push(findName(fq.names, fq.defs, nm));
+        fnKind.push(kind);
+      }
+    },
+    None => {}
+  }
+  const c = Ctx {
+    prog: prog, sm: sm, tabs: tabs, hir: hir, recDef: recDef, tq: tq, tqDefs: tqDefs, fnDef: fnDef, fnKind: fnKind
+  };
+  // Pass 2: bodies.
+  let hn: usize = 0;     // next ordinary (non-generic) HIR function
+  ui = 0;
+  for (const u of prog.units) {
+    w.unit = ui;
+    let k: usize = 0;
+    for (const item of u.ast.items) {
+      const did = tabs[ui].itemDefs[k];
+      k += 1;
+      match (item) {
+        IFunction(f) => {
+          let hf: Option<Function> = None;
+          if (f.typeParams.length == 0) {
+            match (hir) {
+              Some(h) => {
+                if (hn < h.functions.length && h.functions[hn].name == u.name + "." + f.name.name) {
+                  hf = Some(h.functions[hn]);
+                  w.cur = Some(did);
+                  w.np = Some(h.functions[hn].paramCount);
+                  w = hBlock(w, c, h.functions[hn].body, true);
+                  w.cur = None;
+                  w.np = None;
+                }
+              },
+              None => {}
+            }
+            hn += 1;
+          }
+          w = walkFunction(w, c, f, did, hf);
+        },
+        IConst(kd) => {
+          const none: string[] = [];
+          w.tps = none;
+          w = optTypeRefs(w, c, kd.ty);
+          w = walkExpr(w, c, kd.value);
+        },
+        IType(t) => { w = walkTypeDecl(w, c, t); },
+        IInterface(ik) => {
+          const none: string[] = [];
+          w.tps = none;
+          for (const m of ik.methods) {
+            for (const p of m.params) {
+              w = typeRefs(w, c, p.ty);
+            }
+            w = optTypeRefs(w, c, m.ret);
+          }
+        },
+        IClass(cd) => {
+          for (const im of cd.impls) {
+            const idf = lookupType(w, c, im.name);
+            if (idf.isSome()) {
+              w = addRef(w, im.span, idf.unwrap());
+              w.impls.push(ImplLink { cls: did, iface: idf.unwrap(), span: im.span });
+            }
+          }
+          // HIR functions of a class: the constructor, then the methods in member order.
+          // A generic class (ADR-0026): its constructor and instance methods are generic functions (instances
+          // come after the ordinary functions); only its static methods are in this sequence.
+          const genericCls = cd.typeParams.length > 0;
+          let ctorHf: Option<Function> = None;
+          let explicitCtor = false;
+          if (!genericCls) {
+            match (hir) {
+              Some(h) => {
+                if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + ".constructor") {
+                  ctorHf = Some(h.functions[hn]);
+                }
+              },
+              None => {}
+            }
+            hn += 1;
+          }
+          for (const m of cd.members) {
+            match (m) {
+              MCtor(_) => { explicitCtor = true; },
+              _ => {}
+            }
+          }
+          let dk = did + 1 + classFieldCount(cd);
+          let ctps: string[] = [];
+          for (const t of cd.typeParams) {
+            ctps.push(t.name);
+          }
+          w.tps = ctps;
+          for (const b of cd.bounds) {
+            match (b) {
+              Some(id) => {
+                const bd = lookupType(w, c, id.name);
+                if (bd.isSome()) {
+                  w = addRef(w, id.span, bd.unwrap());
+                }
+              },
+              None => {}
+            }
+          }
+          for (const m of cd.members) {
+            match (m) {
+              MField(f) => {
+                w.tps = ctps;
+                w = typeRefs(w, c, f.ty);
+                match (f.init) {
+                  Some(ie) => { w = walkExpr(w, c, ie); },
+                  None => {}
+                }
+              },
+              MCtor(k) => {
+                let ps: Param[] = [];
+                w.tps = ctps;
+                for (const cp of k.params) {
+                  w = typeRefs(w, c, cp.ty);
+                  ps.push(Param { name: cp.name, ty: cp.ty, span: cp.span });
+                }
+                const fd = FunctionDecl {
+                  exported: false, name: cd.name, typeParams: cd.typeParams, bounds: [], params: ps,
+                  ret: None, body: k.body, contracts: allCtorClauses(cd, k), annotations: [], span: k.span
+                };
+                match (ctorHf) {
+                  Some(hf) => {
+                    w.cur = Some(dk);
+                    w.np = Some(hf.paramCount);
+                    w = hBlock(w, c, hf.body, true);
+                    w.cur = None;
+                    w.np = None;
+                  },
+                  None => {}
+                }
+                w = walkFunction(w, c, fd, dk, ctorHf);
+                dk += 1;
+              },
+              MMethod(md) => {
+                let hf: Option<Function> = None;
+                const inSeq = !genericCls || md.isStatic;
+                if (inSeq) {
+                  match (hir) {
+                    Some(h) => {
+                      if (hn < h.functions.length && h.functions[hn].name == u.name + "." + cd.name.name + "." + md.name.name) {
+                        hf = Some(h.functions[hn]);
+                        w.cur = Some(dk);
+                        w.np = Some(h.functions[hn].paramCount);
+                        w = hBlock(w, c, h.functions[hn].body, true);
+                        w.cur = None;
+                        w.np = None;
+                      }
+                    },
+                    None => {}
+                  }
+                  hn += 1;
+                }
+                const fd = FunctionDecl {
+                  exported: false, name: md.name, typeParams: md.isStatic ? [] : cd.typeParams, bounds: [], params: md.params,
+                  ret: md.ret, body: md.body, contracts: md.contracts, annotations: md.annotations, span: md.span
+                };
+                w = walkFunction(w, c, fd, dk, hf);
+                dk += 1;
+              }
+            }
+          }
+          if (!explicitCtor) {
+            match (ctorHf) {
+              Some(hf) => {
+                w.cur = Some(did);
+                w.np = Some(hf.paramCount);
+                w = hBlock(w, c, hf.body, false);
+                w.cur = None;
+                w.np = None;
+              },
+              None => {}
+            }
+          }
+        },
+        _ => {}
+      }
+    }
+    ui += 1;
+  }
+  // Generic function instances (after the ordinary functions): field references only.
+  match (hir) {
+    Some(h) => {
+      while (hn < h.functions.length) {
+        // Lifted closure bodies (arrow functions, ADR-0011) also contribute expression types.
+        w.bnd = boundDefs(c, h.functions[hn].name);
+        w.cur = isWrapperKind(c.fnKind[hn]) ? None : c.fnDef[hn];
+        w.curMay = isClosureKind(c.fnKind[hn]);
+        w.np = isOrdinaryKind(c.fnKind[hn]) ? Some(h.functions[hn].paramCount) : None;
+        w = hBlock(w, c, h.functions[hn].body, h.functions[hn].name.includes("$closure"));
+        w.cur = None;
+        w.curMay = false;
+        w.np = None;
+        const noB: usize[] = [];
+        w.bnd = noB;
+        hn += 1;
+      }
+    },
+    None => {}
+  }
+  // The hover text of an interface lists the classes that implement it (ADR-0019).
+  let impl: usize = 0;
+  while (impl < w.defs.length) {
+    match (w.defs[impl].kind) {
+      SkInterface => {
+        let names: string[] = [];
+        for (const l of w.impls) {
+          if (l.iface == impl) {
+            names.push(w.defs[l.cls].name);
+          }
+        }
+        if (names.length > 0) {
+          w.defs[impl].detail = w.defs[impl].detail + " (implemented by " + names.join(", ") + ")";
+        }
+      },
+      _ => {}
+    }
+    impl += 1;
+  }
+  return SemanticIndex {
+    defs: w.defs,
+    refs: dedupRefs(sortRefs(w.refs)),
+    types: dedupTypes(sortTypes(w.types)),
+    impls: w.impls,
+    calls: w.calls,
+    fnDefs: fnDef,
+    fnKinds: fnKindNos(fnKind),
+    typed: hir.isSome()
+  };
+}
