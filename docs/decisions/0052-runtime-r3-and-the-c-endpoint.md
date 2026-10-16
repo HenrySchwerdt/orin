@@ -1,6 +1,6 @@
 # ADR-0052: Runtime R3 plan and how much C remains
 
-Status: proposed (2026-10-16). Refines ADR-0013 and spec 19 §4 (R3/R4); no code change in this ADR.
+Status: accepted (2026-10-16, Henry). Refines ADR-0013 and spec 19 §4 (R3/R4); no code change in this ADR.
 
 ## Question
 
