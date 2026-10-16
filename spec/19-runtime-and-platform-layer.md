@@ -158,7 +158,7 @@ separator is raised through `process.exit(101)` after printing the same message.
     files a program is linked with, per world (`core`, `legacy`); the shell tools (`tools/runtime_files.sh`), the Python tools
     (`tools/runtime_files.py`) and the Orin harnesses (`tooling/conformance`, `tooling/differential`) read it. Not yet
     converted (they name the installed layout or are literals in CI): `dist/orin-cli.sh`, `compiler/testing/runner.or`,
-    `compiler/mcp/tools.or`, `tooling/mutation/src/{ox,net}_check.or`, `.github/workflows/{ci,bench}.yml`,
+    `compiler/mcp/tools.or`, `tooling/mutation/src/{ox,net}_check.or`, `tooling/protocol/src/main.or`, `.github/workflows/{ci,bench}.yml`,
     `tools/verify_platform.sh`. The prune root set for L1 entries and the `--freelist` / `--stats` driver flags of `cfg` are
     not needed before the first L1 function is called by name (R3d.2 / R3d.3).  - **R3b strings and numbers (partly done).** `parseI8` .. `parseUsize` moved (`strParseIntK`, one more slot in
     `compiler/lower/prelude.or`). The rest of the inventory above stays in C for the stated reasons; no core operation
