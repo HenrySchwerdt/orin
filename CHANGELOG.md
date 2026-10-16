@@ -1,6 +1,13 @@
 # Changelog
 
 ## Unreleased
+- **Mutation checks in Orin (ADR-0047 phase 5).** New package `tooling/mutation` (`tools/mutation.sh std|ox`) replaces
+  `tools/mutate_std.py` and `tools/mutate_ox.py`, which are deleted: the same flags, the same 188 std mutants, 10 `std:net`
+  mutants and 33 OX mutants in the same order, the same result lines and exit status; the CI `std-mutants` jobs run it (and the
+  package's `@Test` unit tests). Parallelism is `std:task`, deadlines are native (`shellTimeout`). Parity was checked against the scripts on one
+  commit for every CI matrix target and `mutate_ox` (identical mutant counts and killed/survived results). A change under
+  `tooling/mutation/` (or `tools/mutation.sh`) now selects every std mutant job in `tools/ci_changes.py`.
+
 - **Differential harness in Orin (ADR-0047 phase 5).** New package `tooling/differential` (`tools/differential.sh --mode opt|llvm|builtins|fuse [--shard I/N] [--list]` and `tools/differential.sh compilers BASE NEW`) replaces `tools/diff_backends.py` and `tools/diff_compilers.py`, which are deleted; same flags, output, shard semantics and exit status. Parallelism is `std:task` with per-step deadlines; unit tests in `tooling/differential/tests` (`tools/differential.sh --unit-tests`). The CI jobs `llvm`, `backends` and `backends-fuse` use it.
 - **Explorer business view (ADR-0051).** `tooling/explorer` adds, first in its navigation, pages for product owners and business people: a summary, use cases (entry points with their documentation, the rules they rely on and what they may touch), business rules (every `@Requires` / `@Ensures` / `@Invariant` as a sentence, grouped by module, with proved / checked at run time / open / unknown status; OSIG does not carry the status yet, so it reads Unknown unless a node has the optional `assurance` field), capabilities in plain words ("may read the clock") per use case and package, and with `--diff` a page of behaviour changes ("New rule: ...", "Use case X may now ...", a rename is one line). No compiler change; new `business*.or` files, `theme/business.css`, tests in `tests/business_test.or`.
 - **`--release` defaults to the LLVM backend (ADR-0038 section 8, owner's decision).** `orin build|run|test --release` now compiles with

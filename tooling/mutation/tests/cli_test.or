@@ -1,0 +1,92 @@
+import { assertEq, assertEqString, assertEqUsize, assertEqBool } from "std:test";
+import { parseStdArgs, parseOxArgs, parseShard, parseIntLoose } from "../src/cli";
+
+@Test
+function stdDefaults(): void {
+  const p = parseStdArgs([]);
+  assertEqBool(p.ok, true, "ok");
+  assertEqString(p.value.orinc, "build/bootstrap/orin2", "orinc");
+  assertEqString(p.value.target, "", "module");
+  assertEqBool(p.value.list, false, "list");
+  assertEqUsize(p.value.shardI, 1, "shard I");
+  assertEqUsize(p.value.shardN, 1, "shard N");
+  assertEq(p.value.jobs, 0, "jobs not given");
+  assertEqString(p.value.root, ".", "root");
+}
+
+@Test
+function stdEveryFlag(): void {
+  const p = parseStdArgs(["--orinc", "/x/orin", "--module", "http", "--list", "--shard", "2/3", "-j", "4", "--root", "/r"]);
+  assertEqBool(p.ok, true, "ok");
+  assertEqString(p.value.orinc, "/x/orin", "orinc");
+  assertEqString(p.value.target, "http", "module");
+  assertEqBool(p.value.list, true, "list");
+  assertEqUsize(p.value.shardI, 2, "shard I");
+  assertEqUsize(p.value.shardN, 3, "shard N");
+  assertEq(p.value.jobs, 4, "jobs");
+  assertEqString(p.value.root, "/r", "root");
+}
+
+@Test
+function oxFlags(): void {
+  const d = parseOxArgs([]);
+  assertEqString(d.value.orinc, "build/dev/orin", "default compiler");
+  assertEqString(d.value.cc, "", "cc not given");
+  const p = parseOxArgs(["--orinc", "o", "--cc", "clang", "--list", "--only", "a,b", "-j2"]);
+  assertEqBool(p.ok, true, "ok");
+  assertEqString(p.value.orinc, "o", "orinc");
+  assertEqString(p.value.cc, "clang", "cc");
+  assertEqBool(p.value.list, true, "list");
+  assertEqString(p.value.only, "a,b", "only");
+  assertEq(p.value.jobs, 2, "-jN");
+}
+
+@Test
+function argparseConventions(): void {
+  assertEqString(parseStdArgs(["--module=net"]).value.target, "net", "--opt=value");
+  assertEq(parseStdArgs(["--jobs=3"]).value.jobs, 3, "--jobs=N");
+  assertEqString(parseStdArgs(["--mod", "text"]).value.target, "text", "unambiguous prefix");
+  assertEqString(parseStdArgs(["--module", "a", "--module", "b"]).value.target, "b", "the last one wins");
+  assertEq(parseStdArgs(["-j", "0"]).value.jobs, 1, "0 jobs is sequential");
+  assertEqBool(parseStdArgs(["-h"]).help, true, "-h");
+  assertEqBool(parseStdArgs(["--help"]).help, true, "--help");
+}
+
+@Test
+function errorsAreUsageErrors(): void {
+  assertEqBool(parseStdArgs(["--bogus"]).ok, false, "unknown option");
+  assertEqBool(parseStdArgs(["stray"]).ok, false, "positional argument");
+  assertEqBool(parseStdArgs(["-j", "many"]).ok, false, "bad jobs");
+  assertEqBool(parseStdArgs(["--module"]).ok, false, "missing value");
+  assertEqBool(parseStdArgs(["--module", "--list"]).ok, false, "an option is not a value");
+  assertEqBool(parseStdArgs(["--list=1"]).ok, false, "flag with a value");
+  assertEqBool(parseOxArgs(["--shard", "1/2"]).ok, false, "ox has no --shard");
+  assertEqString(parseStdArgs(["--bogus"]).error, "unrecognized arguments: --bogus", "message");
+  assertEqString(parseStdArgs(["-j", "x"]).error, "argument -j/--jobs: invalid int value: 'x'", "jobs message");
+  assertEqString(parseStdArgs(["--module"]).error, "argument --module: expected one argument", "missing value message");
+}
+
+@Test
+function shardsAreIOfN(): void {
+  const ok = parseShard("2/3");
+  assertEqBool(ok.isOk(), true, "2/3");
+  assertEqUsize(ok.unwrap()[0], 2, "I");
+  assertEqUsize(ok.unwrap()[1], 3, "N");
+  assertEqBool(parseShard(" 1 / 2 ").isOk(), true, "blanks are allowed, like int()");
+  assertEqString(parseShard("5").unwrapErr(), "argument --shard: --shard expects I/N, for example 2/3", "one number");
+  assertEqString(parseShard("a/b").unwrapErr(), "argument --shard: --shard expects I/N, for example 2/3", "not numbers");
+  assertEqString(parseShard("1/2/3").unwrapErr(), "argument --shard: --shard expects I/N, for example 2/3", "three parts");
+  assertEqString(parseShard("0/2").unwrapErr(), "argument --shard: --shard I/N needs 1 <= I <= N", "zero");
+  assertEqString(parseShard("3/2").unwrapErr(), "argument --shard: --shard I/N needs 1 <= I <= N", "I above N");
+  assertEqBool(parseStdArgs(["--shard", "9/2"]).ok, false, "rejected on the command line");
+}
+
+@Test
+function looseIntegers(): void {
+  assertEq(parseIntLoose(" 12 ").unwrap(), 12, "blanks");
+  assertEq(parseIntLoose("+7").unwrap(), 7, "plus");
+  assertEq(parseIntLoose("-3").unwrap(), -3, "minus");
+  assertEqBool(parseIntLoose("1.5").isNone(), true, "float");
+  assertEqBool(parseIntLoose("").isNone(), true, "empty");
+  assertEqBool(parseIntLoose("+").isNone(), true, "sign only");
+}
