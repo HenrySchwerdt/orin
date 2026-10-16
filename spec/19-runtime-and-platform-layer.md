@@ -106,6 +106,27 @@ separator is raised through `process.exit(101)` after printing the same message.
   access) restricted to `core` modules; reimplement the object model (retain/release/make_unique,
   allocation, arrays, strings) in Orin; the C object model is deleted. Stage 0 keeps its own C
   runtime (frozen) or links the generated C of L1.
+  - **R3a core operations (done, ADR-0052).** The first piece of the core dialect: ONE builtin family
+    `BCore(k)` (table and doc in `compiler/hir/coreops.or`, same pattern as the task primitives `BTask`),
+    exported by the internal module `std:fsraw`. An address is a plain `usize`; there is no new type and no
+    operation that turns an address back into a reference. Library code only (user code gets E0301); the gate
+    narrows to runtime modules with the first R3 module. All operations are impure for contracts and effects
+    (loads read mutable memory). Both backends emit the same behaviour: loads and stores are native-endian and
+    unaligned-safe (C: `__builtin_memcpy` of a constant size, LLVM: `align 1`); the memory operations are
+    the L0 functions in C and libc malloc/free plus the LLVM intrinsics in LLVM. Self-test: `std:coreprobe`
+    (`library/std/coreprobe.or`, `tests/run/core_ops.or`, compared on both backends).
+
+    | operation | meaning |
+    |---|---|
+    | `load8/load32/load64(addr) -> usize` | zero-extended load of 1/4/8 bytes |
+    | `loadF64(addr) -> float` | 8-byte IEEE load |
+    | `store8/store32/store64(addr, v: usize)` | store of the low 8/32/64 bits |
+    | `storeF64(addr, v: float)` | 8-byte IEEE store |
+    | `memAlloc(n) -> usize` | `orin_platform_alloc` (never 0; `n = 0` gives one byte) |
+    | `memFree(addr)` | `orin_platform_free` |
+    | `memCopy(dst, src, n)` | `orin_platform_mem_copy` (no overlap) |
+    | `memSet(dst, byte, n)` | `orin_platform_mem_set` (low 8 bits of `byte`) |
+    | `addrOf(x) -> usize` | object address of a string, array or record; read-only, the reference count is unchanged |
 - **R4 — proofs:** L0 contracts verified with a C verification tool; L1 refinement proofs against
   the Lean machine; update the safety-status table.
 
