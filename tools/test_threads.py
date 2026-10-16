@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Thread-count equality for the parallel commands (ADR-0049 section 2): `orin test` and `orin fmt` give the same stdout,
-stderr and exit status for every ORIN_THREADS. Stdlib only.
+stderr and exit status for every ORIN_THREADS; so do the parallel compiler phases (row 14, the verifier): the C output of
+`orin compile compiler/main.or`, the verifier messages of the hand-built cases (compiler/tests/verify_main.or) and of the
+mutants of tools/mutate_mir.py, and `orin verify` over test programs. Stdlib only.
 
 Usage: python3 tools/test_threads.py [--orin2 build/bootstrap/orin2] [--threads 1,2,4,8]
 """
@@ -34,10 +36,79 @@ def run(cmd, threads, cwd):
     return r.returncode, r.stdout, r.stderr
 
 
+def same(name, cmd, threads, cwd, failures, filt=None, want=None):
+    """Run cmd for every thread count; the (filtered) exit status, stdout and stderr must be equal."""
+    outs = []
+    for t in threads:
+        rc, out, err = run(cmd, t, cwd)
+        outs.append((rc, filt(out) if filt else out, filt(err) if filt else err))
+    if want is not None and outs[0][0] not in want:
+        failures.append("%s: unexpected exit %d\n%s" % (name, outs[0][0], outs[0][2].decode(errors="replace")[:800]))
+    for t, o in zip(threads[1:], outs[1:]):
+        if o != outs[0]:
+            failures.append("%s: ORIN_THREADS=%d differs from ORIN_THREADS=%d (exit %d vs %d)" % (name, t, threads[0], o[0], outs[0][0]))
+    if not name.startswith("verify "):
+        print("%-24s exit %d, %d bytes stdout, same for threads %s" % (name, outs[0][0], len(outs[0][1]), ",".join(map(str, threads))), flush=True)
+    return outs[0]
+
+
+def build_driver(orin, src, out):
+    c = out + ".c"
+    subprocess.run([orin, "compile", os.path.join(ROOT, src), "-o", c], cwd=ROOT, check=True, timeout=600)
+    subprocess.run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c",
+                    "runtime/platform/orin_platform.c", "-lm", "-o", out], cwd=ROOT, check=True, timeout=600)
+    return out
+
+
+def verifier_cases(orin, threads, mutant_programs, failures):
+    """Row 14: the verifier's function loop runs on the task pool; its messages must not depend on ORIN_THREADS."""
+    with tempfile.TemporaryDirectory(prefix="orin-threads-v-") as d:
+        # (i) the whole compiler's C output (the verify phase runs over its ~4000 functions)
+        outs = []
+        for t in threads:
+            c = os.path.join(d, "main-%d.c" % t)
+            run([orin, "compile", "compiler/main.or", "-o", c], t, ROOT)
+            with open(c, "rb") as f:
+                outs.append(f.read())
+        if any(o != outs[0] for o in outs[1:]):
+            failures.append("compile compiler/main.or: the generated C differs between thread counts")
+        print("%-24s %d bytes of C, %s" % ("C output", len(outs[0]), "identical" if all(o == outs[0] for o in outs) else "DIFFERENT"), flush=True)
+        # (ii) verifier messages: hand-built broken MIR, and the mutation corpus
+        vm = build_driver(orin, "compiler/tests/verify_main.or", os.path.join(d, "verify_main"))
+        same("verify_main cases", [vm], threads, ROOT, failures, want=(0,))
+        vt = build_driver(orin, "compiler/tests/verify_text.or", os.path.join(d, "verify_text"))
+        mir = subprocess.run([orin, "mir", "compiler/main.or"], cwd=ROOT, stdout=subprocess.PIPE, check=True, timeout=600).stdout
+        mf = os.path.join(d, "compiler.mir")
+        with open(mf, "wb") as f:
+            f.write(mir)
+        same("verify_text compiler MIR", [vt, mf], threads, ROOT, failures, want=(0, 1))
+
+        def untimed(b):
+            return b"\n".join(l for l in b.split(b"\n") if not l.startswith((b"corpus:", b"time ")))
+        same("mutate_mir", [sys.executable, os.path.join(ROOT, "tools/mutate_mir.py"), "--orinc", orin, "--verify-text", vt,
+                            "--limit", str(mutant_programs)], threads, ROOT, failures, filt=untimed, want=(0,))
+        # (iii) `orin verify` over test programs
+        corpus = []
+        base = os.path.join(ROOT, "tests", "run")
+        for e in sorted(os.listdir(base)):
+            p = os.path.join(base, e)
+            if os.path.isdir(p) and os.path.isfile(os.path.join(p, "main.or")):
+                corpus.append(os.path.relpath(os.path.join(p, "main.or"), ROOT))
+            elif e.endswith(".or"):
+                corpus.append(os.path.relpath(p, ROOT))
+        corpus = corpus[:40] + ["compiler/main.or"]
+        n0 = len(failures)
+        for rel in corpus:
+            same("verify " + rel, [orin, "verify", rel], threads, ROOT, failures)
+        print("%-24s %d programs, %d differences" % ("orin verify", len(corpus), len(failures) - n0), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--orin2", default=os.environ.get("ORIN2", "build/bootstrap/orin2"))
     ap.add_argument("--threads", default="1,2,4,8")
+    ap.add_argument("--no-verifier", action="store_true", help="skip the (slower) verifier cases")
+    ap.add_argument("--mutant-programs", type=int, default=24, help="corpus programs mutated by the verifier case")
     a = ap.parse_args()
     orin = os.path.abspath(os.path.join(ROOT, a.orin2))
     threads = [int(t) for t in a.threads.split(",")]
@@ -93,6 +164,8 @@ def main():
         if any(r != results[0] for r in results[1:]):
             failures.append("fmt (in place): results differ between thread counts")
         print("%-20s exit %d, same files for threads %s" % ("fmt (in place)", results[0][0], a.threads))
+    if not a.no_verifier:
+        verifier_cases(orin, threads, a.mutant_programs, failures)
     for f in failures:
         print("FAIL " + f, file=sys.stderr)
     print("%d failed" % len(failures))
