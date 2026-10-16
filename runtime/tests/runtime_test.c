@@ -242,6 +242,10 @@ static void t_list_escape(void) {
     (void)orin_fs_list_dir(orin_cap_narrow(g_fs, 0, S("/tmp/orin_rt_scope/in")), S("/tmp/orin_rt_scope/in/esc"));
 }
 
+static int64_t list_error_fs;
+static OrinObj *list_error_path;
+static void t_list_error(void) { (void)orin_fs_list_dir(list_error_fs, list_error_path); }
+
 static void test_list_dir(void) {
     int64_t baseline = orin_live_count();
     char directory[] = "/tmp/orin_rt_listing_XXXXXX", path[128];
@@ -283,22 +287,20 @@ static void test_list_dir(void) {
     CHECK(orin_array_len(entries) == sizeof expected / sizeof *expected);
     orin_release(entries);
     snprintf(path, sizeof path, "%s/absent", directory);
-    entries = orin_fs_list_dir(fs, S(path));
-    CHECK(orin_array_len(entries) == 0);
-    orin_release(entries);
+    list_error_fs = fs;
+    list_error_path = S(path);
+    CHECK(trap_code(t_list_error) == 101);
     snprintf(path, sizeof path, "%s/a.", directory);
-    entries = orin_fs_list_dir(fs, S(path));
-    CHECK(orin_array_len(entries) == 0);
-    orin_release(entries);
-    entries = orin_fs_list_dir(fs, lit_nul);
-    CHECK(orin_array_len(entries) == 0);
-    orin_release(entries);
+    list_error_fs = fs;
+    list_error_path = S(path);
+    CHECK(trap_code(t_list_error) == 101);
+    list_error_path = lit_nul;
+    CHECK(trap_code(t_list_error) == 101);
     /* Root can read mode-000 directories; only assert permission refusal for ordinary users. */
     if (geteuid() != 0) {
         CHECK(chmod(directory, 0) == 0);
-        entries = orin_fs_list_dir(fs, dir);
-        CHECK(orin_array_len(entries) == 0);
-        orin_release(entries);
+        list_error_path = dir;
+        CHECK(trap_code(t_list_error) == 101);
         CHECK(chmod(directory, 0700) == 0);
     }
     for (size_t i = 0; i < sizeof expected / sizeof *expected; i++) {
