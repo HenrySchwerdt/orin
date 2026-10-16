@@ -106,4 +106,4 @@ and disable the night-shift heartbeat. Do not claim feature completeness or proo
 - Detailed local handoff: build/overnight/morning-report.md; generated state: build/overnight/state.json.
 - Stable scope, final candidate artifacts/platform validation and remaining std/proof gaps are
   recorded in the handoff and release-readiness audit. No 1.0 readiness or publication is claimed.
-- This final plan checkpoint is local and uncommitted; no post-cutoff implementation or PR was started.
+- This checkpoint was saved locally at the cutoff and committed during the later, explicitly authorized continuation. No implementation was started after the cutoff until that new instruction.
