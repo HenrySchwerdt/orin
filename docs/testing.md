@@ -202,20 +202,25 @@ are not bounded by this per-execution deadline. Details and test evidence:
 
 The ordinary `std` job already runs every `tests/std/*_test.or` with contracts on/off through
 `orin test` (C backend). The general LLVM conformance job covers `tests/run` and `tests/next/run`,
-not those std `@Test` files. Encoding/JSON-number Python oracles and URL backend assertions therefore
+not those std `@Test` files. Encoding/JSON-number/JSON-value/JSON-decoder Python oracles and URL backend assertions therefore
 have a separate selected path in [CI](../.github/workflows/ci.yml):
 
 | Selected module | Checks, with benchmarks disabled |
 |---|---|
 | encoding | `tools/check_encoding.py --orinc build/bootstrap/orin2 --skip-bench`: vectors/test bodies plus independent Python codecs, C/LLVM contracts on/off, C ASan/UBSan |
 | jsonnumber | `tools/check_jsonnumber.py --orinc build/bootstrap/orin2 --skip-bench`: vectors/test bodies plus deterministic Decimal/grammar oracle, C/LLVM contracts on/off, C ASan/UBSan |
+| jsonvalue | `tools/check_jsonvalue.py --orinc build/bootstrap/orin2 --skip-bench`: independent tree/token/writer vectors and std test groups, C/LLVM contracts on/off, C ASan/UBSan |
+| jsondecode | `tools/check_jsondecode.py --orinc build/bootstrap/orin2 --skip-bench`: independent structural/path vectors and std test groups, C/LLVM contracts on/off, C ASan/UBSan |
 | url | `bench/url/check.py --orin build/bootstrap/orin2 --skip-bench`: vectors, malformed-input offsets and byte/query round trips, C/LLVM contracts on/off |
 
-[The selector](../tools/ci_changes.py) enables only the affected module for its source, tests or
-runner. Shared compiler/runtime/platform/seed/prelude inputs, bytes, bootstrap/embedding scripts,
-the std test driver, selector and CI workflow select all three. UTF-8 source selects URL; a regenerated
+[The selector](../tools/ci_changes.py) enables the affected module for its tests or runner, plus known dependents of
+changed sources/shared harnesses. Shared compiler/runtime/platform/seed/prelude inputs, bytes, bootstrap/embedding scripts,
+the std test driver/assertion module, selector and CI workflow select all five.
+JSON-number source selects number/value/decoder; JSON-value source or its Python harness
+selects value/decoder (the decoder runner reuses that harness). UTF-8 source selects
+value/decoder/URL; the config example selects decoder. A regenerated
 embedded stdlib also counts as a shared compiler input. The selection is a stable ordered set.
-Docs/editor-only PRs select none; pushes to main and scheduled/manual runs select all three as a
+Docs/editor-only PRs select none; pushes to main and scheduled/manual runs select all five as a
 safety net. Existing mutation selection is unchanged; this does not add mutation coverage for these modules.
 
 Linux reuses the bootstrap artifact in the `std-backends` job. Selected checks also enable the existing
@@ -223,10 +228,9 @@ macOS job and run against its native bootstrap, without attempting to execute a 
 Both paths pin Python 3.12, check for clang from the runner image, and pass the compiler path explicitly.
 Each runner command has its existing 180-second subprocess deadline; each workflow step independently
 has an eight-minute deadline, and the Linux job has a 25-minute cap. Errors and failed vectors fail the job.
-No benchmark is run or compared against a timing threshold. Empty encoding/JSON-number test discovery
+No benchmark is run or compared against a timing threshold. Empty encoding/JSON-number/JSON-value/JSON-decoder test discovery
 fails instead of silently dropping their test bodies. The runner defaults still include local benchmarks.
 
 These are targeted regression checks, not a new all-stdlib LLVM matrix or implementation proof.
-The new numeric JSON value layer has separate ownership and is not included by this selection yet.
 `python3 tools/ci_changes.py --selftest` checks module/dependency selection, docs exclusions and main's
 full-selection behavior; run it when changing selection rules.

@@ -12,8 +12,8 @@ std is embedded in the compiler:
   tools/mutate_std.py, tests/std/spec_sorted.or,
   tests/std/expect_trap/**, the workflow itself  -> all std mutants
 
-Independent C/LLVM oracle checks select encoding/jsonnumber/url for their source, tests or runners;
-shared compiler/runtime/prelude inputs select all three. Selected checks also enable macOS.
+Independent C/LLVM oracle checks select encoding/jsonnumber/jsonvalue/jsondecode/url for their source, tests or runners;
+shared compiler/runtime/prelude inputs select all five. Selected checks also enable macOS.
 No timing benchmarks run in CI.
 
 A push to main, a scheduled run and a manual run select everything (the safety net for this filter).
@@ -42,21 +42,29 @@ def is_doc(f):
 
 
 # Independent oracle/backend runners are intentionally separate from the C-only std @Test job.
-STD_BACKEND_CHECKS = ["encoding", "jsonnumber", "url"]
+STD_BACKEND_CHECKS = ["encoding", "jsonnumber", "jsonvalue", "jsondecode", "url"]
+# Transitive source dependencies and Python harness reuse; output follows STD_BACKEND_CHECKS order.
+BACKEND_DEPENDENTS = {
+    "stdlib/jsonnumber.or": ["jsonvalue", "jsondecode"],
+    "stdlib/jsonvalue.or": ["jsondecode"],
+    "stdlib/utf8.or": ["jsonvalue", "jsondecode", "url"],
+    "tools/check_jsonvalue.py": ["jsondecode"],
+    "examples/json_config.or": ["jsondecode"],
+}
 
 
 def std_backend_checks(files):
     files = [f for f in files if not is_doc(f)]
     shared = ("compiler/", "runtime/", "platform/", "seed/", "std/", "array/")
     if any(f.startswith(shared) or f in (
-            "stdlib/bytes.or", "tools/bootstrap.sh", "tools/embed_prelude.py", "tools/ci_changes.py",
+            "stdlib/bytes.or", "stdlib/test.or", "tools/bootstrap.sh", "tools/embed_prelude.py", "tools/ci_changes.py",
             "tools/test_std.sh", ".github/workflows/ci.yml") for f in files):
         return list(STD_BACKEND_CHECKS)
     selected = []
     for module in STD_BACKEND_CHECKS:
         runner = "bench/url/check.py" if module == "url" else f"tools/check_{module}.py"
         if any(f == f"stdlib/{module}.or" or f.startswith(f"tests/std/{module}")
-               or f == runner or (module == "url" and f == "stdlib/utf8.or") for f in files):
+               or f == runner or module in BACKEND_DEPENDENTS.get(f, []) for f in files):
             selected.append(module)
     return selected
 
@@ -97,7 +105,7 @@ def selftest():
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
         (["platform/orin_platform.c", "stdlib/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
     ]
-    all_backend_checks = ["encoding", "jsonnumber", "url"]
+    all_backend_checks = ["encoding", "jsonnumber", "jsonvalue", "jsondecode", "url"]
     for files, want in cases:
         want["std_backend_checks"] = (all_backend_checks if any(
             f.startswith(("compiler/", "runtime/", "platform/")) for f in files) else [])
@@ -106,7 +114,8 @@ def selftest():
                            ("url", "bench/url/check.py")]:
         for file in [f"stdlib/{module}.or", f"tests/std/{module}_test.or", runner]:
             cases.append(([file], {"code": True, "macos": True, "vscode": False,
-                                   "mutants": [], "std_backend_checks": [module]}))
+                                   "mutants": [], "std_backend_checks": (["jsonnumber", "jsonvalue", "jsondecode"]
+                                       if file == "stdlib/jsonnumber.or" else [module])}))
     for file in ["stdlib/bytes.or", "compiler/loader/embedded_stdlib.or", "std/string.or",
                  "array/core.or", "seed/SEED_INFO", "tools/bootstrap.sh", "tools/embed_prelude.py",
                  "tools/ci_changes.py", ".github/workflows/ci.yml"]:
@@ -114,7 +123,7 @@ def selftest():
         cases.append(([file], {"code": True, "macos": True, "vscode": False,
                                "mutants": mutants, "std_backend_checks": all_backend_checks}))
     cases.append((["stdlib/utf8.or"], {"code": True, "macos": True, "vscode": False,
-                                       "mutants": ["utf8"], "std_backend_checks": ["url"]}))
+                                       "mutants": ["utf8"], "std_backend_checks": ["jsonvalue", "jsondecode", "url"]}))
     cases.append((["docs/std-encoding.md", "bench/url/README.md"], {
         "code": False, "macos": False, "vscode": False, "mutants": [], "std_backend_checks": []}))
     cases.append((["stdlib/encoding.or", "tests/std/url_test.or", "tools/check_encoding.py"], {
@@ -122,6 +131,25 @@ def selftest():
         "std_backend_checks": ["encoding", "url"]}))
     cases.append((["stdlib/json.or"], {"code": True, "macos": False, "vscode": False,
                                        "mutants": [], "std_backend_checks": []}))
+    dependencies = [
+        ("stdlib/jsonnumber.or", ["jsonnumber", "jsonvalue", "jsondecode"]),
+        ("stdlib/jsonvalue.or", ["jsonvalue", "jsondecode"]),
+        ("tools/check_jsonvalue.py", ["jsonvalue", "jsondecode"]),
+        ("stdlib/jsondecode.or", ["jsondecode"]),
+        ("tools/check_jsondecode.py", ["jsondecode"]),
+        ("tests/std/jsonvalue_test.or", ["jsonvalue"]),
+        ("tests/std/jsondecode_test.or", ["jsondecode"]),
+        ("examples/json_config.or", ["jsondecode"]),
+        ("stdlib/test.or", all_backend_checks),
+    ]
+    for file, checks in dependencies:
+        cases.append(([file], {"code": True, "macos": True, "vscode": False,
+                               "mutants": [], "std_backend_checks": checks}))
+    cases.append((["docs/std-jsonvalue.md", "docs/std-jsondecode.md"], {
+        "code": False, "macos": False, "vscode": False, "mutants": [], "std_backend_checks": []}))
+    cases.append((["stdlib/jsondecode.or", "stdlib/jsonnumber.or", "tools/check_jsonvalue.py"], {
+        "code": True, "macos": True, "vscode": False, "mutants": [],
+        "std_backend_checks": ["jsonnumber", "jsonvalue", "jsondecode"]}))
     bad = 0
     for files, want in cases:
         got = decide(files)

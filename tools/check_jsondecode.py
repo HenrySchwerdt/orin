@@ -92,12 +92,16 @@ function main(host: Host): void {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--orinc', default='build/bootstrap/orin2')
-    parser.add_argument('--bench-only', action='store_true', help='reuse a completed correctness run')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--bench-only', action='store_true', help='reuse a completed correctness run')
+    mode.add_argument('--skip-bench', action='store_true', help='run vectors/oracles and backend checks only')
     opts = parser.parse_args()
     orinc = (ROOT / opts.orinc).resolve()
     OUT.mkdir(parents=True, exist_ok=True)
     tests = (ROOT / 'tests/std/jsondecode_test.or').read_text()
     names = re.findall(r'@Test\s+function (\w+)\(', tests)
+    if not names:
+        raise RuntimeError("no jsondecode tests discovered")
     entries = oracle_cases()
     source = OUT / 'oracle.or'
     source.write_text(tests.replace('@Test', '') + '\nfunction main(): void {\n' +
@@ -112,6 +116,8 @@ def main():
         assert harness.run([binary], env) == 'jsondecode oracle passed\n'
         print(f'PASS {len(entries)} independent structural/pointer vectors + {len(names)} test groups: '
               f'{backend} contracts={contracts} sanitizers={sanitize}', flush=True)
+    if opts.skip_bench:
+        return
     source = OUT / 'benchmark.or'
     source.write_text(BENCHMARK)
     for backend in ['c', 'llvm']:
