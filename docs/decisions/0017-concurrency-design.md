@@ -44,6 +44,11 @@ match (rx.receive()) { Some(m) => ..., None => ... }   // None when all senders 
   is "consume the argument" (verifier rule like an owned parameter).
 
 ## Post-1.0 options (not decided)
+
+Implementation sequencing and evidence gates are proposed in the
+[async/concurrency roadmap](../roadmaps/async-concurrency.md); that proposal does
+not amend this ADR or approve new syntax.
+
 `Shared<T>` for deeply immutable values with atomic RC (opt-in, explicit type) for large
 read-only data; async/await syntax if blocking tasks prove insufficient.
 

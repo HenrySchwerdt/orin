@@ -8,6 +8,10 @@ resources; Q10), ADR-0030 (L0 is the only C), spec 19, ADR-0038 (per-task region
 
 Module: `std:task` (`stdlib/task.or`, unstable; its pure bookkeeping classes are in `std:taskcore`). Stage 0 has no `async` / `await`.
 
+The [proposed async/concurrency roadmap](roadmaps/async-concurrency.md) records the
+current baseline, cleanup/cancellation/deadline prerequisites and scheduler/syntax
+decision gates. It does not change stage-0 semantics or accepted ADR policy.
+
 ## The API
 
 ```ts
