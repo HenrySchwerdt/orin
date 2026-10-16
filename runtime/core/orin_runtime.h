@@ -251,6 +251,8 @@ typedef struct OrinStats {
  * come from another thread's heap and joins this one's (capped by FL_CAP / SB_CAP). */
 enum { FL_STRUCT_CLASSES = 9, SB_MAX = 256, SB_CLASSES = SB_MAX / 16, ORIN_HEAP_WORDS = 128 };
 typedef struct FreeNode { struct FreeNode *next; } FreeNode;
+/* A small-block cache class: list head and length side by side, so one scaled index reaches both. */
+typedef struct SbClass { FreeNode *head; uint64_t n; } SbClass;
 typedef struct OrinHeap {
     FreeNode *fl_struct[FL_STRUCT_CLASSES]; /* @0    free struct objects by nslots 0..8 */
     FreeNode *fl_array;                     /* @72   free array headers */
@@ -260,11 +262,10 @@ typedef struct OrinHeap {
     uint64_t dcap;                          /* @176  its capacity in entries */
     uint64_t reserved0;                     /* @184 */
     OrinStats stats;                        /* @192  the counters (OrinStats, 18 words) */
-    FreeNode *sb_list[SB_CLASSES + 1];      /* @336  small-block cache by 16-byte class 0..16 */
-    uint64_t reserved1[4];                  /* @472  task pointer, grant and file tables, ... */
+    uint64_t reserved1[21];                 /* @336  task pointer, grant and file tables, ... */
     uint64_t probe;                         /* @504  std:coreprobe scratch word */
-    uint64_t sb_cnt[SB_CLASSES + 1];        /* @512  cache sizes by class */
-    uint64_t reserved2[47];                 /* @648  up to 1024 */
+    SbClass sb[SB_CLASSES + 1];             /* @512  small-block cache by 16-byte class 0..16: list head, length */
+    uint64_t reserved2[30];                 /* @784  up to 1024 */
 } OrinHeap;
 extern __thread OrinHeap orin_heap ORIN_TLS_MODEL;
 /* The counters keep their name: `orin_stats.retains++` in the inline functions below and in generated code. */
@@ -280,11 +281,10 @@ _Static_assert(ORIN_HEAP_OFF(dstack) == 168, "orin_heap.dstack @168");
 _Static_assert(ORIN_HEAP_OFF(dcap) == 176, "orin_heap.dcap @176");
 _Static_assert(ORIN_HEAP_OFF(reserved0) == 184, "orin_heap.reserved0 @184");
 _Static_assert(ORIN_HEAP_OFF(stats) == 192, "orin_heap.stats @192");
-_Static_assert(ORIN_HEAP_OFF(sb_list) == 336, "orin_heap.sb_list @336");
-_Static_assert(ORIN_HEAP_OFF(reserved1) == 472, "orin_heap.reserved1 @472");
+_Static_assert(ORIN_HEAP_OFF(reserved1) == 336, "orin_heap.reserved1 @336");
 _Static_assert(ORIN_HEAP_OFF(probe) == 504, "orin_heap.probe @504");
-_Static_assert(ORIN_HEAP_OFF(sb_cnt) == 512, "orin_heap.sb_cnt @512");
-_Static_assert(ORIN_HEAP_OFF(reserved2) == 648, "orin_heap.reserved2 @648");
+_Static_assert(ORIN_HEAP_OFF(sb) == 512 && sizeof(SbClass) == 16, "orin_heap.sb @512, 16 bytes per class (head @+0, n @+8)");
+_Static_assert(ORIN_HEAP_OFF(reserved2) == 784, "orin_heap.reserved2 @784");
 _Static_assert(sizeof(OrinHeap) == ORIN_HEAP_WORDS * 8, "orin_heap is 128 words (1024 bytes)");
 _Static_assert(offsetof(OrinStats, alloc_string) == 0 && offsetof(OrinStats, alloc_array) == 8 && offsetof(OrinStats, alloc_struct) == 16 &&
                    offsetof(OrinStats, frees) == 24 && offsetof(OrinStats, retains) == 32 && offsetof(OrinStats, releases) == 40 &&

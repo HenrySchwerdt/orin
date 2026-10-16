@@ -14,8 +14,8 @@ __thread OrinHeap orin_heap ORIN_TLS_MODEL; /* all of it, in one block: orin_run
 #define fl_struct (orin_heap.fl_struct)
 #define fl_array (orin_heap.fl_array)
 #define fl_n (orin_heap.fl_n)
-#define sb_list (orin_heap.sb_list)
-#define sb_cnt (orin_heap.sb_cnt)
+#define sb_list(c) (orin_heap.sb[c].head)
+#define sb_cnt(c) (orin_heap.sb[c].n)
 #define t_dstack (orin_heap.dstack)
 static OrinStats g_fold;
 static int64_t g_fold_live;
@@ -390,10 +390,10 @@ enum { SB_CAP = 1 << 15 };
 static inline void *sb_alloc(size_t n) {
     if (n <= SB_MAX) {
         size_t c = (n + 15) >> 4;
-        FreeNode *f = sb_list[c];
+        FreeNode *f = sb_list(c);
         if (f) {
-            sb_list[c] = f->next;
-            sb_cnt[c]--;
+            sb_list(c) = f->next;
+            sb_cnt(c)--;
             return f;
         }
         return xmalloc(c << 4);
@@ -403,10 +403,10 @@ static inline void *sb_alloc(size_t n) {
 static inline void sb_free(void *p, size_t n) {
     if (n <= SB_MAX) {
         size_t c = (n + 15) >> 4;
-        if (sb_cnt[c] < SB_CAP) {
-            ((FreeNode *)p)->next = sb_list[c];
-            sb_list[c] = (FreeNode *)p;
-            sb_cnt[c]++;
+        if (sb_cnt(c) < SB_CAP) {
+            ((FreeNode *)p)->next = sb_list(c);
+            sb_list(c) = (FreeNode *)p;
+            sb_cnt(c)++;
             return;
         }
     }
@@ -425,10 +425,10 @@ static void *sb_realloc(void *p, size_t old, size_t n) {
 }
 static void sb_drain(void) {
     for (int c = 0; c <= SB_CLASSES; c++)
-        while (sb_list[c]) {
-            FreeNode *n = sb_list[c];
-            sb_list[c] = n->next;
-            sb_cnt[c]--;
+        while (sb_list(c)) {
+            FreeNode *n = sb_list(c);
+            sb_list(c) = n->next;
+            sb_cnt(c)--;
             orin_platform_free(n);
         }
 }
