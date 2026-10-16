@@ -102,7 +102,10 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
 3. **Performance, further ADR-0038 steps:** unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, low priority: bintrees is already at 0.94x C instructions); packed arrays (b).
-4. **LLVM gate 3** (ADR-0038 §8): pinned toolchain (`orin toolchain install`). Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
+4. **LLVM default for `--release`** (ADR-0038 §8). Gate 3 is met (2026-10-16: pinned LLVM 19.1.7, `dist/llvm.pin`,
+   `orin toolchain install` verifies the sha256; `orin doctor` reports it; `--release --backend=llvm` without it falls back to C
+   and says so). LLVM is not yet the release default: the decision is the owner's (`release_backend` in `dist/orin-cli.sh`).
+   Not bundled in the packages; aarch64 / macOS downloads unexercised. Gate 2 is met (2026-10-16: `tools/llvm_fixpoint.sh`, in CI;
    the LLVM-built compiler emits the same C and the same `.ll` as orin2, also with a third stage). Gate 1 is met (LLVM at or
    below the C backend on 13 of 15 instruction rows; appends +0.8%, qsort_func +0.5%).
 5. **Parallel sockets:** `spawnNet` / `scopeNet`, a move rule for `Stream`, a per-task net buffer in place of the

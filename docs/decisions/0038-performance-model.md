@@ -195,6 +195,7 @@ proof.
      `--backend=llvm`, clang links `orin2-llvm`, and `orin2-llvm` emits C identical to `stage2.c` and LLVM IR identical to the
      first `.ll` (and, with `--deep`, so does a third compiler built from that `.ll`). No difference was found.
   3. **Toolchain:** a pinned LLVM version is used, as described below.
+     **Status (2026-10-16): met.** LLVM 19.1.7, `dist/llvm.pin`, `orin toolchain install`; see the addendum "the pinned LLVM toolchain".
 - **Toolchain: pinned, not bundled into the compiler.**
   - Orin keeps emitting textual LLVM IR, but only for **one pinned LLVM version**. The pin is recorded in the
     repository and checked in CI.
@@ -780,3 +781,33 @@ call and two frees). The ratio to C falls from 4.7x to 2.4x. Retains / releases 
 
 Consequence for the ranking: the remaining class (c) in the compiler is real but worth about 0.5 % of its instructions, and
 needs either an inliner with scalar replacement of mutable objects or a verified non-heap object; neither is justified at that size.
+
+## Addendum (2026-10-16): the pinned LLVM toolchain (section 8, gate 3)
+
+Gate 3 of section 8 is: a pinned LLVM version is used; the pin is recorded in the repository and checked in CI;
+`orin toolchain install` downloads the matching `clang`/`llc` into `~/.orin/toolchains/llvm-<version>`, verified by checksum;
+`orin doctor` reports the installed version and whether it matches; without a matching LLVM, `--release` falls back to the C
+backend and says so. Gates 1 and 2 were already met. **Status: met.** LLVM is **still not the release default**; that is a
+separate decision (below).
+
+- **The pin** is `dist/llvm.pin` (shipped as `lib/orin/llvm.pin`): `version 19.1.7` and, per platform (`linux-x86_64`,
+  `linux-aarch64`, `macos-arm64`), the URL and sha256 of the official, unmodified LLVM release archive. There is no
+  `macos-x86_64` archive in that release. `tools/test_llvm_toolchain.sh` (CI job `llvm`) checks the pin's shape.
+- **Why 19.1.7, not 18.x.** The 18.1.8 Linux x86_64 archive links `libtinfo.so.5`, which current distributions no longer ship,
+  so the downloaded `clang` would not start. 19.1.7 starts without it. The gates were rerun with the pinned clang (not the
+  system clang 18): the whole suite with `--backend llvm` (925 passed) and `tools/llvm_fixpoint.sh` (C and IR of the LLVM-built
+  compiler identical) both pass, so the textual IR is accepted by LLVM 19 without a backend change.
+- **`orin toolchain install [--force]`** downloads the archive for the platform (`curl`, or `wget`), compares its sha256 with the
+  pin **before unpacking**, unpacks only `bin/clang`, `bin/llc` and clang's resource directory (the full archive unpacks to
+  several GB; the install is about 400 MB), checks that `clang --version` reports the pinned version, and moves the tree into
+  `~/.orin/toolchains/llvm-19.1.7` in one step. A checksum mismatch, a missing platform entry, a wrong version or a failed unpack
+  installs nothing. `orin toolchain status` reports the pin and the install state. `ORIN_HOME` relocates the directory.
+- **Use.** `orin build|run --backend=llvm` uses the pinned clang when it is installed; an explicit `CC` wins; a dev build
+  without the pinned toolchain uses the system `clang` as before. A `--release` build that asks for LLVM without the pinned
+  toolchain **falls back to the C backend and prints a note** naming `orin toolchain install`. `orin doctor` reports
+  "pinned 19.1.7 installed" or "not installed" (informational, never a warning: the C backend needs no LLVM).
+- **Open for the owner.** (1) Whether `--release` defaults to LLVM: one variable, `release_backend=c` in `build_command`
+  (`dist/orin-cli.sh`); with gates 1-3 met the decision is the owner's. (2) The release packages do not yet bundle the toolchain
+  (the ADR says "may"); they ship only the pin. (3) The checksums are those of the archives downloaded while writing this change,
+  not compared with a checksum published by LLVM. (4) The real download was exercised only on linux-x86_64; the aarch64 and
+  macOS entries are checksummed but not run.

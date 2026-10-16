@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Pinned LLVM toolchain (ADR-0038 section 8, gate 3).** New `orin toolchain install [--force]` / `status` (in `dist/orin`, wired
+  into `dist/orin-cli.sh`): it downloads the LLVM release pinned in `dist/llvm.pin` (19.1.7; linux-x86_64, linux-aarch64,
+  macos-arm64), refuses the archive unless its sha256 matches the pin, unpacks `clang`, `llc` and clang's resource directory (about
+  400 MB) into `~/.orin/toolchains/llvm-19.1.7`. `orin build|run --backend=llvm` then uses that clang; `--release --backend=llvm`
+  without it falls back to the C backend and prints a note; `orin doctor` reports the toolchain (informational). With the pinned
+  clang the llvm suite (925 tests) and `tools/llvm_fixpoint.sh` pass unchanged. `tools/test_llvm_toolchain.sh` (CI job `llvm`) checks
+  the pin and the install against a local fake archive (wrong checksum, tampered file, wrong version, unpinned platform);
+  `tools/test_cli.py` covers fallback, install, use and `CC` precedence. LLVM is still not the release default (all three gates
+  are met; the decision is the owner's). 18.1.8 was rejected: its Linux x86_64 archive needs `libtinfo.so.5`.
 - **Benchmark reports in Orin + OX (ADR-0047 phase 6).** New packages `tooling/reports` (typed report model, shared OX components, static CSS design system, SVG canvas) and `tooling/benchmarks` (`bench-report summary|compare|render`) replace `tools/bench_report.py`; Markdown, SVG and README are byte-identical to the Python output (golden tests, fuzzed against the old tool), and `render` adds a stand-alone `report.html`. `.github/workflows/bench.yml` builds and uses the Orin tool.
 - **Escape analysis, scalar replacement of temporary array literals (ADR-0038 addendum 2026-10-16, class (c)).** New optimiser pass
   `compiler/opt/lits.or`: `t = arraynew [e1..ek]; arrayextend x, t; release t` (the lowering of `x = x.concat([e1, .., ek])`) becomes

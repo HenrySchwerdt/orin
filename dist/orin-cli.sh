@@ -114,6 +114,7 @@ Manage
   update [name]        Update Git resolutions
   clean                Remove generated build artifacts
   doctor               Check your installation
+  toolchain install    Install the pinned LLVM for --backend=llvm (also: status)
 
 Inspect and integrate
   workspace list|lock|check  Inspect the nearest workspace
@@ -132,6 +133,7 @@ help_command() {
     init) echo 'Usage: orin init [name] [--lib | --template http]'; echo 'Create a project without overwriting existing files.' ;;
     add) echo 'Usage: orin add --path <directory> [--dev]'; echo '       orin add --git <url> [--tag <tag> | --rev <commit>] [--name <alias>] [--dev]' ;;
     build|run|dev) echo "Usage: orin $1 [file.or | project-directory] [--release] [--backend=c|llvm] [-o path] [-- program-arguments]" ;;
+    toolchain) echo 'Usage: orin toolchain install [--force] | status'; echo 'Installs the pinned LLVM (sha256-verified) into ~/.orin/toolchains/llvm-<version>; --backend=llvm uses it.' ;;
     test) echo 'Usage: orin test [path] [--filter text] [--watch] [--allow-empty] [--format=json]' ;;
     fmt) echo 'Usage: orin fmt [paths...] [--check | --stdout]' ;;
     check) echo 'Usage: orin check [path] [--format=json] [--deps] [--strict-contracts]' ;;
@@ -286,7 +288,7 @@ native_build() {
   mv -f "$emit" "$out"; rm -rf "$tmp"
 }
 build_command() {
-  profile=dev backend=c
+  profile=dev backend=''
   local src='' output='' arg key cache
   program_args=()
   while [ $# -gt 0 ]; do
@@ -299,7 +301,20 @@ build_command() {
       *) [ -z "$src" ] || { if [ "$command" = run ]; then program_args+=("$1"); else fail 'Expected one source path.' 2; fi; }; [ -n "$src" ] || src=$1 ;;
     esac; shift
   done
-  if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then CC=clang; fi
+  # ADR-0038 section 8: the backend of a --release build when none is given. Flipping this to llvm is the owner's
+  # decision (gates 1-3 are met); it is deliberately still the C backend.
+  local release_backend=c
+  if [ -z "$backend" ]; then if [ "$profile" = release ]; then backend=$release_backend; else backend=c; fi; fi
+  if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then
+    # The pinned LLVM (orin toolchain install) is preferred. A release build without it falls back to the C backend.
+    local pinned
+    if pinned=$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain path 2>/dev/null); then CC=$pinned
+    elif [ "$profile" = release ]; then
+      backend=c
+      $quiet || printf 'note: the pinned LLVM %s is not installed (run `orin toolchain install`); building --release with the C backend\n' \
+        "$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain version 2>/dev/null || echo '?')" >&2
+    else CC=clang; fi
+  fi
   project_target "$src"
   validate_locked_dependencies "$project" || return 1
   local name
@@ -579,6 +594,7 @@ case $command in
       add|remove|fetch|update|deps) package_command "${args[@]}" ;;
       clean) need_project; [ ! -L "$project/build" ] || fail 'Refusing to clean a symlinked build directory.'; rm -rf "$project/build"; if $json; then result_json true message 'Cleaned build artifacts'; else status 'Cleaned build artifacts'; fi ;;
       doctor) ORIN_LEGACY_DRIVER=1 exec "$HERE/bin/orin" doctor ;;
+      toolchain) ORIN_LEGACY_DRIVER=1 exec "$HERE/bin/orin" toolchain "${args[@]}" ;;
       explain) [ ${#args[@]} -eq 1 ] || fail 'Usage: orin explain <diagnostic-code>' 2; case ${args[0]} in
         E0300) printf 'E0300: Unknown name or type\n\nCheck spelling, imports, and the declaration scope.\n' ;;
         E0400) printf 'E0400: Type mismatch\n\nThe value does not match the expected type. Orin does not implicitly coerce values.\n' ;;
