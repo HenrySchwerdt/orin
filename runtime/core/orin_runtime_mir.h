@@ -1,5 +1,5 @@
 /*
- * Runtime helpers used only by code emitted from MIR (compiler/cemit). Header-only (static
+ * Runtime helpers used only by code emitted from MIR (compiler/backends/c). Header-only (static
  * inline) so no extra object file has to be linked. Operations that the MIR verifier guarantees
  * apply to a Unique object (docs/mir.md): take / put / in-place replace of a slot.
  */

@@ -7,7 +7,7 @@ std is embedded in the compiler:
   docs only (docs/**, *.md outside library/std/)      -> no build, no test jobs
   editors/vscode/**                              -> the vscode job
   library/std/<m>.or, tests/std/<m>*                  -> build + all test jobs, std mutants of <m> only
-  compiler/, runtime/, seed/, tools/  -> build + all test jobs (+ macOS); std mutants only
+  compiler/, runtime/, bootstrap/seed/, tools/  -> build + all test jobs (+ macOS); std mutants only
                                                     for modules whose source or tests changed
   tools/mutation.sh, tooling/mutation/**, tests/std/spec_sorted.or,
   tests/std/expect_trap/**, the workflow itself  -> all std mutants
@@ -34,7 +34,7 @@ DEPENDENTS = {"library/std/ox.or": "html"}
 ALL_MUTANTS = ["tools/mutation.sh", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
 # the mutation tool (an Orin package, ADR-0047 phase 5): any change of its code runs every std mutant
 MUTATION_TOOL = "tooling/mutation/"
-MACOS = ("compiler/", "runtime/", "seed/", "tools/", "tooling/", ".github/")
+MACOS = ("compiler/", "runtime/", "bootstrap/seed/", "tools/", "tooling/", ".github/")
 
 
 def is_doc(f):
@@ -57,7 +57,7 @@ BACKEND_DEPENDENTS = {
 
 def std_backend_checks(files):
     files = [f for f in files if not is_doc(f)]
-    shared = ("compiler/", "runtime/", "seed/", "library/core/", "library/collections/")
+    shared = ("compiler/", "runtime/", "bootstrap/seed/", "library/core/", "library/collections/")
     if any(f.startswith(shared) or f in (
             "library/std/bytes.or", "library/std/test.or", "tools/bootstrap.sh", "tools/embed_prelude.py", "tools/ci_changes.py",
             "tools/test_std.sh", ".github/workflows/ci.yml") for f in files):
@@ -111,6 +111,8 @@ def selftest():
         (["tooling/differential/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tools/differential.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
+        (["compiler/backends/c/function.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["compiler/backends/llvm/function.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["runtime/platform/orin_platform.c", "library/std/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
     ]
     all_backend_checks = ["encoding", "jsonnumber", "jsonvalue", "jsondecode", "url"]
@@ -125,7 +127,7 @@ def selftest():
                                    "mutants": [], "std_backend_checks": (["jsonnumber", "jsonvalue", "jsondecode"]
                                        if file == "library/std/jsonnumber.or" else [module])}))
     for file in ["library/std/bytes.or", "compiler/loader/embedded_stdlib.or", "library/core/string.or",
-                 "library/collections/core.or", "seed/SEED_INFO", "tools/bootstrap.sh", "tools/embed_prelude.py",
+                 "library/collections/core.or", "bootstrap/seed/SEED_INFO", "bootstrap/seed/orin-seed.c.gz", "tools/bootstrap.sh", "tools/embed_prelude.py",
                  "tools/ci_changes.py", ".github/workflows/ci.yml"]:
         mutants = ["bytes"] if file == "library/std/bytes.or" else (list(MODULES) if file == ".github/workflows/ci.yml" else [])
         cases.append(([file], {"code": True, "macos": True, "vscode": False,
