@@ -45,7 +45,7 @@
 - Built-in annotations (ADR-0024, self-hosted compiler only): `@Test`, `@Deprecated`, `@Inline` and
   `@Sealed` (record construction/update restriction outside the declaring module, ADR-0044) exist;
   user-defined annotations (ADR-0046 S1) are metadata only: records marked `@Annotation(targets..)`, constant
-  arguments, no processors or code generation yet (S3-S6); any other `@Name` is E0408. `orin test` runs `void` tests that fail by
+  arguments, no processors or code generation yet (S3-S6), but the tools know them (S2: go to definition, references, rename, hover, `orin api`, OSIG `ANNOTATED_WITH`, MCP `inspect`); any other `@Name` is E0408. `orin test` runs `void` tests that fail by
   trapping (no `Result` tests, fixtures, parameterised tests, parallel runs, coverage); it finds the tests of the
   modules the entry loads, builds with the C backend and needs a C compiler. `@Deprecated` warnings are not listed
   by the MCP `check` tool. `@Inline` is a hint (a recursive `@Inline` function is E0444; calls through function

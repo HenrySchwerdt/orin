@@ -401,6 +401,56 @@ def run(exe):
     check(len(d) == 1 and d[0].get("code") == "E0432" and d[0]["range"]["start"] == pos_of(tpl_bad, "p}`", 0),
           "template: diagnostic E0432 on an interpolated record, located at the expression (got %r)" % (d,))
 
+    # ---- user annotations (ADR-0046 S2): a use is a reference to its @Annotation record ---------------
+    alib = os.path.join(tmp, "alib.or")
+    amain = os.path.join(tmp, "amain.or")
+    alib_text = ("export type Verb = Get | Post;\n\n"
+                 "@Annotation(function, method, field)\nexport type Route = { path: string; verb: Verb; };\n")
+    amain_text = ('import { Route, Verb } from "./alib";\n\n'
+                  'class Api {\n  @Route("/n", Get) n: int = 0;\n'
+                  '  @Route("/c", Post)\n  call(): int {\n    return this.n;\n  }\n}\n\n'
+                  '@Route("/users/:id", Get)\nfunction find(id: int): int {\n  return id;\n}\n\n'
+                  'function main(): void {\n  console.log(find(new Api().call()).toString());\n}\n')
+    open_doc(c, alib, alib_text)
+    open_doc(c, amain, amain_text)
+    d = sync(c, uri_of(amain))
+    check(d == [], "annotations: no diagnostics (got %r)" % (d,))
+    use_find = pos_of(amain_text, "Route(\"/users", 0)
+    r = c.request("textDocument/definition", td(amain, use_find))
+    locs = r.get("result") or []
+    if isinstance(locs, dict):
+        locs = [locs]
+    check(len(locs) == 1 and locs[0]["uri"] == uri_of(alib) and locs[0]["range"]["start"] == pos_of(alib_text, "Route =", 0),
+          "annotations: go to definition of a use is the @Annotation record (got %r)" % (locs,))
+    r = c.request("textDocument/references", {**td(alib, pos_of(alib_text, "Route =", 0)), "context": {"includeDeclaration": True}})
+    locs = r.get("result") or []
+    in_main = [l for l in locs if l["uri"] == uri_of(amain)]
+    check(len(locs) == 5 and len(in_main) == 4,
+          "annotations: references of the record are the import and the 3 uses (got %d in main, %d in all)" % (len(in_main), len(locs)))
+    r = c.request("textDocument/hover", td(amain, use_find))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check("@Annotation(function, method, field)" in hv and "type Route = { path: string; verb: Verb }" in hv,
+          "annotations: hover on the annotation name shows the definition (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(amain, pos_of(amain_text, "find(id", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check('@Route("/users/:id", Get)' in hv and "function find(id: int): int" in hv,
+          "annotations: hover on a declaration shows its annotations with their arguments (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(amain, pos_of(amain_text, "call()", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check('@Route("/c", Post)' in hv, "annotations: hover on a method shows its annotation (got %r)" % (hv,))
+    r = c.request("textDocument/hover", td(amain, pos_of(amain_text, "n: int", 0)))
+    hv = (r.get("result") or {}).get("contents", {}).get("value", "")
+    check('@Route("/n", Get)' in hv, "annotations: hover on a field shows its annotation (got %r)" % (hv,))
+    r = c.request("textDocument/rename", {**td(alib, pos_of(alib_text, "Route =", 0)), "newName": "Endpoint"})
+    changes = (r.get("result") or {}).get("changes", {})
+    check(len(changes.get(uri_of(alib), [])) == 1 and len(changes.get(uri_of(amain), [])) == 4
+          and all(e["newText"] == "Endpoint" for es in changes.values() for e in es),
+          "annotations: rename of the record renames the import and every use (got %r)" % ({k: len(v) for k, v in changes.items()},))
+    r = c.request("textDocument/rename", {**td(amain, use_find), "newName": "Endpoint"})
+    changes = (r.get("result") or {}).get("changes", {})
+    check(len(changes.get(uri_of(alib), [])) == 1 and len(changes.get(uri_of(amain), [])) == 4,
+          "annotations: rename from a use renames the definition too (got %r)" % ({k: len(v) for k, v in changes.items()},))
+
     # ---- contract clauses (ADR-0012): diagnostics with their own codes, hover shows the clauses ----
     kc = os.path.join(tmp, "contracts.or")
     kc_good = ("@Requires(a > 0)\n@Ensures(result >= a)\nfunction add(a: int): int {\n  return a;\n}\n\n"
