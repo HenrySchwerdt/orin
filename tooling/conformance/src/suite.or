@@ -1,0 +1,207 @@
+// Test discovery and the commands of the three steps of a test (compile with the compiler under test, build the C/LLVM
+// output into an executable, run it). Port of `discover`, `compile_orin`, `cc_base`, `runtime_sources` and the command
+// building of `run_test` in tools/run_tests.py. Paths in a Case are relative to the repository root; every command
+// starts with `cd <root>`, like the Python runner's `cwd=ROOT`.
+
+import { FsGrant, exists, listDir, readFile } from "std:fs";
+import { shq, sortedStrings } from "./text";
+import { Options } from "./cli";
+import { Spec, parseSpec } from "./headers";
+
+export const BUILD: string = "build/tests";
+export const RUN_TIMEOUT: int = 10;
+export const COMPILE_TIMEOUT: int = 120;
+
+// A discovered test: `tests/<sub>/<kind>/<name>.or` (+ `<name>.out`) or `tests/<sub>/<kind>/<name>/main.or` (+ `expected.out`).
+export type Found = { name: string; entry: string; exp: string; };
+
+// One test of the run: what to execute and what to check afterwards.
+export type Case = {
+  label: string;      // run | errors | next/run | next/errors
+  kind: string;       // run | errors
+  name: string;
+  tag: string;        // "<label>/<name>"
+  entry: string;
+  exp: string;        // "" for an error test
+  spec: Spec;
+  early: string;      // non-empty: the test failed before anything ran (bad header, missing expectation)
+  cOut: string;
+  exe: string;
+  cerr: string;       // captured stderr of the compile / cc / run
+  ccerr: string;
+  rout: string;
+  rerr: string;
+  compileCmd: string;
+  ccCmd: string;
+  runCmd: string;
+};
+
+export function labelsFor(suite: string): string[] {
+  let labels: string[] = [];
+  if (suite == "default" || suite == "all") {
+    labels.push("run");
+    labels.push("errors");
+  }
+  if (suite == "next" || suite == "all") {
+    labels.push("next/run");
+    labels.push("next/errors");
+  }
+  return labels;
+}
+
+export function kindOf(label: string): string {
+  return label.endsWith("errors") ? "errors" : "run";
+}
+
+export function subOf(label: string): string {
+  return label.startsWith("next/") ? "next" : "";
+}
+
+export function baseDir(label: string): string {
+  const sub = subOf(label);
+  return "tests/" + (sub == "" ? "" : sub + "/") + kindOf(label);
+}
+
+function dropSlash(e: string): string {
+  return e.endsWith("/") ? e.substring(0, e.length - 1) : e;
+}
+
+// `base` must be an existing directory. Entries in byte order of their names, as `sorted(os.listdir(base))`.
+export function discover(fs: FsGrant, root: string, base: string, kind: string): Found[] {
+  let raw: string[] = [];
+  for (const e of listDir(fs, root + "/" + base)) {
+    raw.push(e);
+  }
+  // `listDir` puts a "/" after directories; Python's listdir does not, so sort by the bare names
+  let names: string[] = [];
+  for (const e of raw) {
+    names.push(dropSlash(e));
+  }
+  const sorted = sortedStrings(names);
+  let out: Found[] = [];
+  for (const n of sorted) {
+    const isDir = raw.includes(n + "/");
+    if (isDir) {
+      const main = base + "/" + n + "/main.or";
+      if (exists(fs, root + "/" + main)) {
+        out.push(Found { name: n, entry: main, exp: kind == "run" ? base + "/" + n + "/expected.out" : "" });
+      }
+    } else if (n.endsWith(".or")) {
+      const name = n.substring(0, n.length - 3);
+      out.push(Found { name: name, entry: base + "/" + n, exp: kind == "run" ? base + "/" + name + ".out" : "" });
+    }
+  }
+  return out;
+}
+
+// The C compiler command and flags a test executable is built with (words, without the inputs).
+export function ccBase(o: Options): string[] {
+  let cc: string[] = [];
+  if (o.backend == "llvm") {
+    cc = [o.cc != "cc" ? o.cc : "clang", "-O2", "-w", "-I", "runtime"];
+  } else {
+    cc = [o.cc, "-O1", "-w", "-I", "runtime"];
+  }
+  if (o.sanitize) {
+    cc = cc.concat(["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]);
+  }
+  return cc;
+}
+
+// C runtime sources to link; the LLVM backend also needs the out-of-line shim.
+export function runtimeSources(backend: string): string[] {
+  let srcs = ["runtime/orin_runtime.c", "platform/orin_platform.c"];
+  if (backend == "llvm") {
+    srcs.push("runtime/orin_runtime_llvm.c");
+  }
+  return srcs;
+}
+
+function words(ws: string[]): string {
+  let q: string[] = [];
+  for (const w of ws) {
+    q.push(shq(w));
+  }
+  return q.join(" ");
+}
+
+function dirOf(p: string): string {
+  const parts = p.split("/");
+  let keep: string[] = [];
+  let i: usize = 0;
+  while (i + 1 < parts.length) {
+    keep.push(parts[i]);
+    i += 1;
+  }
+  return keep.join("/");
+}
+
+function baseName(p: string): string {
+  const parts = p.split("/");
+  return parts[parts.length - 1];
+}
+
+// Reads the header of the test and builds its commands. `rtObjs` are the prebuilt runtime objects (relative to the root),
+// empty when they could not be built (the sources are then compiled into every test).
+export function makeCase(fs: FsGrant, o: Options, root: string, label: string, f: Found, rtObjs: string[]): Case {
+  const kind = kindOf(label);
+  const tag = label + "/" + f.name;
+  const safe = f.name.split("/").join("_");
+  const outdir = BUILD + "/" + label;
+  const cOut = outdir + "/" + safe + (o.backend == "llvm" ? ".ll" : ".c");
+  const exe = outdir + "/" + safe + ".exe";
+  const text = readText(fs, root + "/" + f.entry);
+  const spec = parseSpec(text);
+  let c = Case {
+    label: label, kind: kind, name: f.name, tag: tag, entry: f.entry, exp: f.exp, spec: spec, early: "",
+    cOut: cOut, exe: exe, cerr: outdir + "/" + safe + ".cerr", ccerr: outdir + "/" + safe + ".ccerr",
+    rout: outdir + "/" + safe + ".rout", rerr: outdir + "/" + safe + ".rerr",
+    compileCmd: "", ccCmd: "", runCmd: ""
+  };
+  if (kind == "errors") {
+    if (spec.errorCode == "") {
+      return Case { ...c, early: "bad or missing '// error: E0xxx' header in first line" };
+    }
+  } else if (f.exp == "" || !exists(fs, root + "/" + f.exp)) {
+    return Case { ...c, early: "missing expected output file" };
+  }
+  let flags: string[] = [];
+  if (o.backend == "llvm") {
+    flags.push("--backend=llvm");
+  }
+  if (o.assertFacts) {
+    flags.push("--assert-facts");
+  }
+  flags = flags.concat(spec.flags);
+  const cd = "cd " + shq(root) + " && ";
+  c = Case {
+    ...c,
+    compileCmd: cd + words([o.orinc, "compile", f.entry, "-o", cOut].concat(flags)) + " >/dev/null 2>" + shq(c.cerr) + " </dev/null"
+  };
+  if (kind == "errors") {
+    return c;
+  }
+  const inputs = rtObjs.length > 0 ? rtObjs : runtimeSources(o.backend);
+  c = Case {
+    ...c,
+    ccCmd: cd + words(ccBase(o).concat([cOut]).concat(inputs).concat(["-lm", "-o", exe])) + " >/dev/null 2>" + shq(c.ccerr) + " </dev/null"
+  };
+  // optional stdin: `input.in` next to `main.or`, or `<name>.in` next to `<name>.or`
+  const inPath = dirOf(f.entry) + "/" + (baseName(f.entry) == "main.or" ? "input.in" : f.name + ".in");
+  const stdin = exists(fs, root + "/" + inPath) ? shq(inPath) : "/dev/null";
+  c = Case {
+    ...c,
+    runCmd: cd + (o.sanitize ? "ASAN_OPTIONS=detect_leaks=0 " : "") + shq("./" + exe) + " >" + shq(c.rout)
+      + " 2>" + shq(c.rerr) + " <" + stdin
+  };
+  return c;
+}
+
+// The whole file, "" when it cannot be read.
+export function readText(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}

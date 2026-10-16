@@ -5,10 +5,12 @@ set -eu
 cd "$(dirname "$0")/.."
 step() { name=$1; shift; printf '%-34s ' "$name"; out=$("$@" 2>&1) || { echo FAIL; echo "$out" | tail -30; exit 1; }; echo "$out" | tail -1; }
 step "bootstrap (seed root)"   ./tools/bootstrap.sh
-step "all suites (sanitize)"   python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --sanitize
+step "all suites (sanitize)"   tools/conformance.sh --orinc build/bootstrap/orin2 --suite all --sanitize
 step "package smoke"           ./tools/package.sh 0.0.0-ci linux-x86_64
 step "install.sh + doctor"      tools/test_install.sh build/dist/orin-0.0.0-ci-linux-x86_64.tar.gz
-step "all suites (llvm)"       python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --backend llvm
+step "all suites (llvm)"       tools/conformance.sh --orinc build/bootstrap/orin2 --suite all --backend llvm
+step "conformance runner (unit)" tools/conformance.sh --unit-tests
+step "conformance parity (py/orin)" python3 tools/check_conformance_parity.py
 step "diff llvm"               python3 tools/diff_backends.py --mode llvm
 step "diff builtins"           python3 tools/diff_backends.py --mode builtins
 step "diff opt"                python3 tools/diff_backends.py --mode opt

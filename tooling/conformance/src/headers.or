@@ -1,0 +1,143 @@
+// Test headers (tests/README.md): the leading `//` comment lines of a test file. Port of the header regexes of
+// tools/run_tests.py:
+//   // exit: N        expected exit status of a run test (the last one wins)
+//   // error: E0xxx   first line of an error test: the code the compiler must print
+//   // flags: ...     extra compiler flags (all lines add up)
+//   // warns: W0450 W0452 | none   the warning codes of the compile, sorted (the last one wins)
+//   // stderr: text   stderr of the run (of the compile, for an error test) must contain text (all lines)
+// Pure functions: tests/headers_test.or.
+
+import { strip, splitWords, sortedStrings, splitLines } from "./text";
+
+export type Spec = {
+  flags: string[];
+  hasWarns: bool;       // `// warns:` present
+  warns: string[];      // sorted codes (empty for `none`)
+  stderrs: string[];
+  wantExit: int;
+  errorCode: string;    // "" when the first line is not `// error: E0xxx`
+};
+
+// The text after `// <key>:` when `line` has that shape (`^//\s*key:`), stripped on both sides.
+export function headerValue(line: string, key: string): Option<string> {
+  if (!line.startsWith("//")) {
+    return None;
+  }
+  const rest = strip(line.substring(2, line.length));
+  if (!rest.startsWith(key + ":")) {
+    return None;
+  }
+  return Some(strip(rest.substring(key.length + 1, rest.length)));
+}
+
+function isDigit(c: int): bool {
+  return c >= 48 && c <= 57;
+}
+
+// `-?\d+`
+export function parseExit(v: string): Option<int> {
+  let i: usize = 0;
+  if (v.length > 0 && v.charCodeAt(0) == 45) {
+    i = 1;
+  }
+  if (i >= v.length) {
+    return None;
+  }
+  let k = i;
+  while (k < v.length) {
+    if (!isDigit(v.charCodeAt(k))) {
+      return None;
+    }
+    k += 1;
+  }
+  return parseInt(v);
+}
+
+// `E\d{4}`
+export function isErrorCode(v: string): bool {
+  if (v.length != 5 || v.charCodeAt(0) != 69) {
+    return false;
+  }
+  let i: usize = 1;
+  while (i < 5) {
+    if (!isDigit(v.charCodeAt(i))) {
+      return false;
+    }
+    i += 1;
+  }
+  return true;
+}
+
+// The leading `//` lines (at most `limit`), each stripped.
+export function headerLines(text: string, limit: usize): string[] {
+  let out: string[] = [];
+  for (const l of splitLines(text)) {
+    if (out.length >= limit || !l.startsWith("//")) {
+      break;
+    }
+    out.push(strip(l));
+  }
+  return out;
+}
+
+// The first line of the file, stripped (`""` for an empty file).
+export function firstLine(text: string): string {
+  const ls = splitLines(text);
+  return ls.length == 0 ? "" : strip(ls[0]);
+}
+
+export function parseSpec(text: string): Spec {
+  const first = firstLine(text);
+  let spec = Spec { flags: [], hasWarns: false, warns: [], stderrs: [], wantExit: 0, errorCode: "" };
+  const e = headerValue(first, "error");
+  if (e.isSome() && isErrorCode(e.unwrap())) {
+    spec = Spec { ...spec, errorCode: e.unwrap() };
+  }
+  for (const h of headerLines(text, 16)) {
+    const f = headerValue(h, "flags");
+    if (f.isSome()) {
+      spec = Spec { ...spec, flags: spec.flags.concat(splitWords(f.unwrap())) };
+    }
+    const s = headerValue(h, "stderr");
+    if (s.isSome()) {
+      spec = Spec { ...spec, stderrs: spec.stderrs.concat([s.unwrap()]) };
+    }
+    const w = headerValue(h, "warns");
+    if (w.isSome()) {
+      spec = Spec {
+        ...spec,
+        hasWarns: true,
+        warns: w.unwrap() == "none" ? [] : sortedStrings(splitWords(w.unwrap()))
+      };
+    }
+    const x = headerValue(h, "exit");
+    if (x.isSome()) {
+      const n = parseExit(x.unwrap());
+      if (n.isSome()) {
+        spec = Spec { ...spec, wantExit: n.unwrap() };
+      }
+    }
+  }
+  return spec;
+}
+
+// `warning[W\d{4}]` in compiler stderr, in order of appearance (the caller sorts).
+export function warningCodes(text: string): string[] {
+  let out: string[] = [];
+  const needle = "warning[W";
+  let i: usize = 0;
+  while (i + needle.length + 5 <= text.length) {
+    if (text.charCodeAt(i) == 119 && text.substring(i, i + needle.length) == needle) {
+      const code = text.substring(i + needle.length - 1, i + needle.length + 4);
+      if (isDigit(text.charCodeAt(i + needle.length)) && isDigit(text.charCodeAt(i + needle.length + 1))
+          && isDigit(text.charCodeAt(i + needle.length + 2)) && isDigit(text.charCodeAt(i + needle.length + 3))
+          && text.charCodeAt(i + needle.length + 4) == 93) {
+        out.push(code);
+        i += needle.length + 5;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  return out;
+}

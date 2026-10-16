@@ -32,7 +32,7 @@ SHARDS = {"http": 3}
 # std modules that only declare types for another module's tests (stdlib/ox.or: the OX provider types std:html uses)
 DEPENDENTS = {"stdlib/ox.or": "html"}
 ALL_MUTANTS = ["tools/mutate_std.py", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
-MACOS = ("compiler/", "runtime/", "platform/", "seed/", "tools/", ".github/")
+MACOS = ("compiler/", "runtime/", "platform/", "seed/", "tools/", "tooling/", ".github/")
 
 
 def is_doc(f):

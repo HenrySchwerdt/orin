@@ -1,0 +1,214 @@
+// Orin conformance test runner (ADR-0047 phase 5): the Orin port of tools/run_tests.py, with the same flags, test
+// formats, messages, summary and exit status. See tooling/conformance/README.md and docs/testing.md.
+//
+//   orin-conformance [--orinc COMPILER] [--cc CC] [--filter SUBSTR] [-j N] [--sanitize]
+//                    [--suite default|next|all] [--backend c|llvm] [--assert-facts] [--root DIR]
+//
+// Exit status: 0 every selected test passed, 1 a test failed or none matched (or $ORIN_JOBS is not a number), 2 usage.
+
+import { Host, withHost } from "std:host";
+import { ProcessGrant, args, exit } from "std:process";
+import { FsGrant, readFile } from "std:fs";
+import { shell, shellTimeout } from "std:io";
+import { strip, shq, splitLines } from "./text";
+import { Options, parseArgs, parseIntLoose, usage, helpText } from "./cli";
+import { BUILD, COMPILE_TIMEOUT, RUN_TIMEOUT, Found, Case, labelsFor, baseDir, kindOf, discover, makeCase, ccBase, runtimeSources, readText } from "./suite";
+import { Job, Outcome, runAll } from "./exec";
+import { Verdict, judge } from "./judge";
+
+function padEnd(s: string, n: usize): string {
+  let out = s;
+  while (out.length < n) {
+    out += " ";
+  }
+  return out;
+}
+
+function inRoot(root: string, cmd: string): string {
+  return "cd " + shq(root) + " && " + cmd;
+}
+
+// `$ORIN_JOBS` (blank: unset) and the CPU count, through the shell: the language has no environment access.
+// Returns the number of parallel cases, or -1 after printing the error of an invalid $ORIN_JOBS.
+function defaultJobs(fs: FsGrant, proc: ProcessGrant, root: string): int {
+  const file = BUILD + "/.runner-env";
+  const sh = "{ printf '%s\\n' \"${ORIN_JOBS:-}\"; getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null"
+    + " || sysctl -n hw.ncpu 2>/dev/null || echo 4; } > " + shq(file);
+  if (shell(proc, inRoot(root, sh)) != 0) {
+    return 4;
+  }
+  const lines = readText(fs, root + "/" + file).split("\n");
+  const env = lines.length > 0 ? strip(lines[0]) : "";
+  if (env != "") {
+    const n = parseIntLoose(env);
+    if (n.isNone()) {
+      console.error("ORIN_JOBS must be a number, got '" + env + "'");
+      return -1;
+    }
+    return n.unwrap() < 1 ? 1 : n.unwrap();
+  }
+  if (lines.length > 1) {
+    const cpus = parseIntLoose(strip(lines[1]));
+    if (cpus.isSome() && cpus.unwrap() > 0) {
+      return cpus.unwrap();
+    }
+  }
+  return 4;
+}
+
+// Compiles the runtime sources once per run, with the flags of the test executables, instead of once per test (the
+// `runtime_objects` of tools/run_tests.py). The objects are keyed by the compiler command and the contents of the
+// runtime and platform sources and headers, so a stale object is never linked. Returns the object paths (relative to
+// the root), or [] if anything failed (the tests then compile the sources themselves and report the error).
+function runtimeObjects(fs: FsGrant, proc: ProcessGrant, o: Options): string[] {
+  const cc = ccBase(o);
+  let ccWords: string[] = [];
+  for (const w of cc) {
+    ccWords.push(shq(w));
+  }
+  const hashFile = BUILD + "/.rt-hash";
+  const hashCmd = "{ printf '%s\\n' " + ccWords.join(" ") + "; " + shq(cc[0]) + " --version 2>&1; ls -1 runtime platform;"
+    + " cat runtime/*.c runtime/*.h platform/*.c platform/*.h; } 2>/dev/null"
+    + " | { sha256sum 2>/dev/null || shasum -a 256 2>/dev/null; } | cut -c1-16 > " + shq(hashFile);
+  if (shellTimeout(proc, inRoot(o.root, hashCmd), COMPILE_TIMEOUT) != 0) {
+    return [];
+  }
+  const hash = strip(readText(fs, o.root + "/" + hashFile));
+  if (hash.length != 16) {
+    return [];
+  }
+  const outdir = BUILD + "/rt-orin/" + hash;
+  if (shell(proc, inRoot(o.root, "mkdir -p " + shq(outdir))) != 0) {
+    return [];
+  }
+  let objs: string[] = [];
+  for (const src of runtimeSources(o.backend)) {
+    const parts = src.split("/");
+    const base = parts[parts.length - 1];
+    const obj = outdir + "/" + base.substring(0, base.length - 2) + ".o";
+    // compile to a private name and rename: a concurrent run never sees half an object
+    const build = "[ -f " + shq(obj) + " ] || { " + ccWords.join(" ") + " -c " + shq(src) + " -o \"" + obj + ".$$.tmp.o\" && mv \""
+      + obj + ".$$.tmp.o\" " + shq(obj) + "; }";
+    if (shellTimeout(proc, inRoot(o.root, build), COMPILE_TIMEOUT) != 0) {
+      return [];
+    }
+    objs.push(obj);
+  }
+  return objs;
+}
+
+function isDirectory(proc: ProcessGrant, root: string, path: string): bool {
+  return shell(proc, inRoot(root, "test -d " + shq(path))) == 0;
+}
+
+function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  const parsed = parseArgs(argv);
+  if (!parsed.ok) {
+    console.error(usage());
+    console.error("orin-conformance: error: " + parsed.error);
+    return 2;
+  }
+  if (parsed.options.help) {
+    console.log(helpText());
+    return 0;
+  }
+  let o = parsed.options;
+  if (shell(proc, inRoot(o.root, "mkdir -p " + shq(BUILD))) != 0) {
+    console.error("orin-conformance: cannot create " + o.root + "/" + BUILD);
+    return 1;
+  }
+  const envJobs = defaultJobs(fs, proc, o.root);
+  if (envJobs < 0) {
+    return 1;
+  }
+  const workers = o.jobs > 0 ? o.jobs : envJobs;
+
+  let labels = labelsFor(o.suite);
+  let selected: Found[] = [];
+  let selectedLabel: string[] = [];
+  for (const label of labels) {
+    const base = baseDir(label);
+    if (!isDirectory(proc, o.root, base)) {
+      continue;
+    }
+    for (const t of discover(fs, o.root, base, kindOf(label))) {
+      if ((label + "/" + t.name).includes(o.filter)) {
+        selected.push(t);
+        selectedLabel.push(label);
+      }
+    }
+  }
+  if (selected.length == 0) {
+    console.log("no tests matched");
+    return 1;
+  }
+
+  // one directory per label for the outputs of the tests
+  let dirs: string[] = [];
+  for (const label of labels) {
+    dirs.push(shq(BUILD + "/" + label));
+  }
+  shell(proc, inRoot(o.root, "mkdir -p " + dirs.join(" ")));
+
+  const rtObjs = runtimeObjects(fs, proc, o);
+  let cases: Case[] = [];
+  let jobs: Job[] = [];
+  let jobOf: int[] = [];
+  let i: usize = 0;
+  while (i < selected.length) {
+    const c = makeCase(fs, o, o.root, selectedLabel[i], selected[i], rtObjs);
+    cases.push(c);
+    if (c.early == "") {
+      jobOf.push(jobs.length.toInt());
+      jobs.push(Job { id: jobs.length, compileCmd: c.compileCmd, ccCmd: c.ccCmd, runCmd: c.runCmd });
+    } else {
+      jobOf.push(-1);
+    }
+    i += 1;
+  }
+  const outcomes = runAll(proc, jobs, workers.toUsize(), COMPILE_TIMEOUT, RUN_TIMEOUT);
+
+  let verdicts: Verdict[] = [];
+  let k: usize = 0;
+  while (k < cases.length) {
+    const r = jobOf[k] >= 0 ? outcomes[jobOf[k].toUsize()] : Outcome { id: 0, compileRc: 0, ccRc: 0, runRc: 0 };
+    verdicts.push(judge(fs, o.root, cases[k], r));
+    k += 1;
+  }
+
+  let failed: usize = 0;
+  for (const v of verdicts) {
+    if (!v.ok) {
+      failed += 1;
+      console.log("FAIL " + v.tag);
+      for (const line of splitLines(v.detail)) {
+        console.log("    " + line);
+      }
+    }
+  }
+  for (const label of labels) {
+    let ok: usize = 0;
+    let bad: usize = 0;
+    let any = false;
+    for (const v of verdicts) {
+      if (v.tag.startsWith(label + "/")) {
+        any = true;
+        if (v.ok) {
+          ok += 1;
+        } else {
+          bad += 1;
+        }
+      }
+    }
+    if (any) {
+      console.log(padEnd(label, 11) + " " + ok.toString() + " passed, " + bad.toString() + " failed");
+    }
+  }
+  console.log("TOTAL  " + (verdicts.length - failed).toString() + " passed, " + failed.toString() + " failed");
+  return failed > 0 ? 1 : 0;
+}
+
+function main(host: Host): void {
+  const code = withHost(host, (fs, proc, stdio, clock) => run(fs, proc, args(proc)));
+  exit(code);
+}

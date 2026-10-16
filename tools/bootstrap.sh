@@ -58,4 +58,4 @@ else
   echo "[compare] FAIL: stage2.c and stage3.c differ"; exit 1
 fi
 echo "[conformance] tests with orin2"
-python3 tools/run_tests.py --orinc $B/orin2
+ORIN_CONFORMANCE_BUILDER=$B/orin2 tools/conformance.sh --orinc $B/orin2

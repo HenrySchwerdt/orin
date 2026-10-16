@@ -245,7 +245,7 @@ Editor support: see [`editors/vscode`](editors/vscode) (syntax highlighting + la
 
 ```bash
 ./tools/bootstrap.sh     # committed seed → orin0 → orin1 → orin2 → stage3 (stage2/3 must be identical)
-python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all
+tools/conformance.sh --orinc build/bootstrap/orin2 --suite all
 ```
 
 The build needs only a C compiler, `python3`, `gzip` and `sha256sum`/`shasum`.

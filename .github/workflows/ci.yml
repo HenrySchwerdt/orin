@@ -105,7 +105,7 @@ jobs:
         with: { name: bootstrap }
       - run: tar -xzf bootstrap.tgz
       - name: Conformance tests with self-hosted compiler (ASan + UBSan)
-        run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --sanitize
+        run: tools/conformance.sh --orinc build/bootstrap/orin2 --suite all --sanitize
 
   llvm:
     needs: build
@@ -116,11 +116,29 @@ jobs:
         with: { name: bootstrap }
       - run: tar -xzf bootstrap.tgz
       - name: LLVM IR backend (conformance, all suites; clang is preinstalled on ubuntu-latest)
-        run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all --backend llvm
+        run: tools/conformance.sh --orinc build/bootstrap/orin2 --suite all --backend llvm
       - name: C backend vs LLVM backend (differential)
         run: python3 tools/diff_backends.py --mode llvm
       - name: LLVM fixed point (ADR-0038 gate 2; the LLVM-built compiler emits the same C and the same .ll as orin2)
         run: sh tools/llvm_fixpoint.sh
+
+  # ADR-0047 section 3: the Orin conformance runner (tooling/conformance) is what the jobs use; tools/run_tests.py is the
+  # independent Python oracle. This job runs both over the real suites (C and LLVM) and over a tree of deliberately
+  # broken tests and requires identical output, so the two cannot drift and the self-hosted toolchain is not its only judge.
+  conformance-parity:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: bootstrap }
+      - run: tar -xzf bootstrap.tgz
+      - name: Conformance runner unit tests
+        run: tools/conformance.sh --unit-tests
+      - name: Build the Orin runner
+        run: tools/conformance.sh --build-only
+      - name: Python oracle vs Orin runner (real suites, broken fixtures, command line)
+        run: python3 tools/check_conformance_parity.py --backends c,llvm
 
   backends:
     needs: build
@@ -412,7 +430,7 @@ jobs:
       - name: Portable execution deadlines (native, C/LLVM, CLI and MCP)
         run: python3 tools/test_execution.py
       - name: All suites with the self-hosted compiler
-        run: python3 tools/run_tests.py --orinc build/bootstrap/orin2 --suite all
+        run: tools/conformance.sh --orinc build/bootstrap/orin2 --suite all
       - name: std:net on the loopback (HTTP server example, slowloris timeout, scope refusals, ORIN_DENY=net)
         run: sh tools/test_net.sh
       - name: L0 platform layer tests (sockets, handle identity, scope; no CBMC on this job)
