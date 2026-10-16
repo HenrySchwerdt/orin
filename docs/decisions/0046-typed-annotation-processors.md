@@ -88,7 +88,7 @@ export class Users {
 
 ```ts
 // std:json (stdlib/json.or), next to `Json`
-import { Input, Output, Decl } from "std:meta";
+import { Input, Output, MDecl } from "std:meta";
 
 @Processor(Json)
 export function jsonCodecs(input: Input): Output { ... }    // builds encodeUser / decodeUser
@@ -115,7 +115,7 @@ export function jsonCodecs(input: Input): Output { ... }    // builds encodeUser
   `MType`) covering the ordinary statement and expression forms: literals, names, calls, method calls, fields, index,
   record/array literals, unary/binary operators, `match` on unions/Option/Result, `?`, `if`, `for of`, `while`,
   `const`/`let`, assignment, `return`. No raw text, no MIR, no LLVM.
-* **Hygiene.** Names that the processor exports are public and must be declared as such (`decl.exported(true)`); they
+* **Hygiene.** Names that the processor exports are public and must be declared as such (`exportDecl(d, true)`); they
   are checked for collisions with each other and with other processors' output in the same companion (E0449). Helper
   names come from `meta.fresh("tmp")`, which yields `__g<N>_tmp`; identifiers starting with `__g` are reserved for
   generated code (E0447 in user code). Local variables in generated bodies are scoped like any Orin block.
