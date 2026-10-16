@@ -1,7 +1,8 @@
 # Workspace manifest (`orin-workspace.toml`) — specification
 
-Status: specification for ADR-0047 phase 1 (syntax, semantics, failcase fixtures). Not implemented yet; no files move.
-Phase 2 implements the resolution, the CLI and the lockfile against the fixtures in `tests/workspace/`.
+Status: specification for ADR-0047 phase 1 (syntax, semantics, failcase fixtures). Parser (`compiler/package/workspace.or`), resolution and lockfile (`compiler/package/resolve.or`) are implemented and
+unit-tested (`compiler/tests/workspace_test.or`); the CLI and the file-system tree (it needs a directory-listing
+primitive) come next. No files move.
 
 ## 1. File and discovery
 
@@ -50,10 +51,12 @@ no backslashes. Resolution is lexicographic, so the member order is deterministi
 
 ## 4. Lockfile (`orin.lock`)
 
-- One lockfile at the workspace root, written only by `orin lock` (phase 2), never by a build.
-- It records, per member, the package name, its path and a SHA-256 of its `orin.toml`, plus the resolved external
-  dependencies. A build with a lockfile whose member set or manifest hashes differ from the tree fails (E0509) and names
-  the changed member; `--locked` is the default in CI.
+- One lockfile at the workspace root, written only by `orin lock`, never by a build.
+- It holds one `[member.<name>]` table per member, in build order, with `path`, `version` and `dependencies` (the
+  member names it depends on). `lockText` in `compiler/package/resolve.or` is the canonical text.
+- A build whose resolution differs from the lock (a member added, removed, moved, re-versioned or with changed member
+  dependencies) fails with E0509 at the differing table; `--locked` is the default in CI. External dependencies join the
+  lock when the package manager resolves them.
 
 ## 5. Diagnostics
 

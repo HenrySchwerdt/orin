@@ -3,7 +3,9 @@
 
 import { assertEqString, assertEqBool, assertEqUsize } from "std:test";
 import { Diagnostic } from "../diag";
-import { parseWorkspace, buildOrder, pathProblem } from "../package";
+import {
+  parseWorkspace, buildOrder, pathProblem, Tree, resolveWorkspace, lockText, checkLock,
+} from "../package";
 
 // "CODE line" of the diagnostic for `text`, or "ok".
 function outcome(text: string): string {
@@ -142,4 +144,152 @@ function order(): void {
   );
   assertEqBool(buildOrder([], []).isOk(), true, "empty");
   assertEqUsize(buildOrder(["a"], [[]]).unwrap().length, 1, "one");
+}
+
+// ---- resolution (phase 2b) -------------------------------------------------------------------
+
+function pkg(name: string, deps: string): string {
+  const head = "[package]\nname = \"" + name + "\"\nentry = \"main.or\"\nversion = \"0.1.0\"\n";
+  return deps == "" ? head : head + "\n[dependencies]\n" + deps;
+}
+
+// `dirs[i]` holds `manifests[i]` ("" = no orin.toml).
+function tree(dirs: string[], manifests: string[], workspaces: string[]): Tree {
+  return Tree {
+    dirs: dirs,
+    workspaceDirs: workspaces,
+    manifest: (d: string) => {
+      let i: usize = 0;
+      while (i < dirs.length) {
+        if (dirs[i] == d && manifests[i] != "") {
+          return Some(manifests[i]);
+        }
+        i += 1;
+      }
+      return None;
+    },
+  };
+}
+
+// Member directories in build order, or "CODE".
+function resolved(text: string, t: Tree): string {
+  const w = parseWorkspace(0, text);
+  if (w.isErr()) {
+    return "parse " + w.unwrapErr().code;
+  }
+  return match (resolveWorkspace(w.unwrap(), t, 1)) {
+    Ok(r) => r.order.map(i => r.members[i].dir).join(" "),
+    Err(d) => d.code,
+  };
+}
+
+@Test
+function resolution(): void {
+  const lib = pkg("lib", "");
+  const app = pkg("app", "lib = { path = \"../lib\" }\n");
+  assertEqString(
+    resolved(ws("members = [\"app\", \"lib\"]\n"), tree(["app", "lib"], [app, lib], [])),
+    "lib app",
+    "topological",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"library/*\"]\n"),
+      tree(
+        ["library", "library/b", "library/a", "library/x"],
+        ["", pkg("b", ""), pkg("a", ""), ""],
+        [],
+      ),
+    ),
+    "library/a library/b",
+    "pattern expands to directories with orin.toml, in byte order",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"tooling/*\"]\nexclude = [\"tooling/vscode\"]\n"),
+      tree(["tooling/bench", "tooling/vscode"], [pkg("bench", ""), pkg("vsc", "")], []),
+    ),
+    "tooling/bench",
+    "exclude",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"a\", \"nothing\"]\n"),
+      tree(["a", "nothing"], [pkg("a", ""), ""], []),
+    ),
+    "E0505",
+    "literal member without orin.toml",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"x\", \"y\"]\n"),
+      tree(["x", "y"], [pkg("same", ""), pkg("same", "")], []),
+    ),
+    "E0506",
+    "duplicate package name",
+  );
+  assertEqString(
+    resolved(ws("members = [\"a\"]\nexclude = [\"b\"]\n"), tree(["a"], [pkg("a", "")], [])),
+    "E0507",
+    "exclude matches nothing",
+  );
+  assertEqString(
+    resolved(ws("members = [\"a\"]\ndefault-members = [\"b\"]\n"), tree(["a"], [pkg("a", "")], [])),
+    "E0507",
+    "default not a member",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"*\"]\n"),
+      tree(["a", "a/inner"], [pkg("a", ""), pkg("inner", "")], []),
+    ),
+    "a",
+    "a pattern only takes direct children",
+  );
+  assertEqString(
+    resolved(ws("members = [\"a\"]\n"), tree(["a"], [pkg("a", "")], ["", "a"])),
+    "E0507",
+    "nested workspace",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"app\"]\n"),
+      tree(["app", "util"], [pkg("app", "util = { path = \"../util\" }\n"), pkg("util", "")], []),
+    ),
+    "E0508",
+    "path dependency to a non-member",
+  );
+  assertEqString(
+    resolved(
+      ws("members = [\"a\", \"b\"]\n"),
+      tree(
+        ["a", "b"],
+        [pkg("a", "b = { path = \"../b\" }\n"), pkg("b", "a = { path = \"../a\" }\n")],
+        [],
+      ),
+    ),
+    "E0508",
+    "dependency cycle",
+  );
+}
+
+@Test
+function lockfile(): void {
+  const t = tree(["app", "lib"], [pkg("app", "lib = { path = \"../lib\" }\n"), pkg("lib", "")], []);
+  const r = resolveWorkspace(
+    parseWorkspace(0, ws("members = [\"app\", \"lib\"]\n")).unwrap(),
+    t,
+    1,
+  ).unwrap();
+  const lock = lockText(r);
+  assertEqBool(checkLock(r, 9, lock).isNone(), true, "fresh lock accepted");
+  const stale = lock.split("version = \"0.1.0\"").join("version = \"0.0.9\"");
+  assertEqString(checkLock(r, 9, stale).unwrap().code, "E0509", "changed version");
+  const missing = "[member.lib]\npath = \"lib\"\nversion = \"0.1.0\"\ndependencies = []\n";
+  assertEqString(checkLock(r, 9, missing).unwrap().code, "E0509", "member missing");
+  assertEqString(
+    checkLock(r, 9, lock + "\n[member.ghost]\npath = \"g\"\n").unwrap().code,
+    "E0509",
+    "unknown member",
+  );
 }
