@@ -174,7 +174,7 @@ def main():
     # ---- 2. the OSIG carries the same summaries -----------------------------------------------------------
     sg = json.loads(g)
     nodes = {n["id"]: n for n in sg["nodes"]}
-    check(sg["schema"] == "osig/0.2", "snapshot schema is osig/0.2")
+    check(sg["schema"] == "osig/0.3", "snapshot schema is osig/0.2")
     mp = [e for e in sg["edges"] if e["kind"] == "MAY_PERFORM"]
     check(len(mp) > 5 and all(e["evidence"] in ("MUST", "MAY", "UNKNOWN") and "next" in e and e["src"] in nodes and e["dst"] in nodes
                               and (e["next"] == "" or e["next"] in nodes) for e in mp),

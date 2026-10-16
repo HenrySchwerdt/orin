@@ -50,6 +50,9 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 | Runtime R3/R4 (object model in Orin, refinement proofs) | not started |
 
 ## Next milestones
+
+**User-defined annotations (ADR-0046, accepted 2026-10-16):** design done, implementation in slices S1-S6 (definitions and uses, tooling metadata, `std:meta`, expansion, processor execution, `@Json` + route example); compiler slices start after the ADR-0047 layout move.
+
 See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-software tracks of
 ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
 1. Resolve stable API/I/O scope and final candidate/platform evidence before claiming 1.0 readiness;

@@ -111,6 +111,7 @@ ships with tests and docs and passes the full CI, including the bootstrap.
   - resources and the streaming `std:fs`
   - ~~generic classes (`class Graph<T>`), then `std:graph` on `Graph<T>`/`GraphId<T>`~~ (done, ADR-0026)
   - **all language-freeze prerequisites are done** (integers, interpolation, annotations, resources, generic classes)
+  - **user-defined annotations and pure processors** (owner decision 2026-10-16, [ADR-0046](decisions/0046-typed-annotation-processors.md)): accepted design, slices S1-S6, compiler slices after the ADR-0047 layout move
 - **capabilities (language part):** ADR-0021 Stage A is **done** ([ADR-0027](decisions/0027-stage-a-root-capabilities.md)):
   `main(host: Host)`, grants as resource handles derived by scope functions and narrowed without amplification, the
   std I/O functions take their grant first, enforcement in the runtime / platform layer (`ORIN_DENY`, path scopes),

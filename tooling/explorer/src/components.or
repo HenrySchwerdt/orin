@@ -1,0 +1,231 @@
+// OX components shared by the pages of the explorer: the page frame with its navigation, badges, symbol links, tables with
+// links, documentation text. All dynamic text is a `string` child or attribute (escaped by std:html); the SVG graphs are the
+// only trusted markup and come from sealed `SvgDoc`s (orin-reports' canvas).
+
+import ox from "std:html";
+import { Html, empty, trustHtml } from "std:html";
+import { ShellWith, SvgDoc, svgText } from "orin-reports";
+import { Ix, NONE } from "./index";
+import { Diff } from "./model";
+import { lower, afterLast } from "./util";
+
+export type Ctx = { ix: Ix; diff: Option<Diff>; root: string; };
+
+// the relative URL of the page of a node (page nodes only)
+export function symHref(ctx: Ctx, i: usize): string {
+  return ctx.root + "s/" + ctx.ix.slug[i] + ".html";
+}
+
+export function modHref(ctx: Ctx, m: usize): string {
+  return ctx.root + "m/" + ctx.ix.mods[m].slug + ".html";
+}
+
+function NavLink(href: string, label: string, active: bool, count: string): Html {
+  return <li><a href={href} class={active ? "ex-nav-on" : "ex-nav-off"} aria-current={active ? "page" : ""}>
+    <span>{label}</span>{count.length > 0 ? <span class="ex-nav-count">{count}</span> : empty()}
+  </a></li>;
+}
+
+function Nav(ctx: Ctx, active: string): Html {
+  const ix = ctx.ix;
+  return <nav aria-label="Explorer">
+    <ul class="r-nav ex-nav">
+      <NavLink href={ctx.root + "index.html"} label="Overview" active={active == "overview"} count="" />
+      <NavLink href={ctx.root + "graph.html"} label="Graph" active={active == "graph"} count="" />
+      <NavLink href={ctx.root + "symbols.html"} label="Symbols" active={active == "symbols"} count="" />
+      <NavLink href={ctx.root + "processes.html"} label="Processes" active={active == "processes"} count="" />
+      {ctx.diff.isSome() ? <NavLink href={ctx.root + "diff.html"} label="Changes" active={active == "diff"} count="" /> : empty()}
+    </ul>
+    <p class="ex-nav-head">Modules</p>
+    <ul class="r-nav ex-nav ex-nav-mods">
+      {ix.mods.map(m => <NavLink href={ctx.root + "m/" + m.slug + ".html"} label={m.name} active={active == "m:" + m.slug} count={m.symbols.toString()} />)}
+    </ul>
+  </nav>;
+}
+
+// The page frame: stylesheet and script are files of the site (assets/), the sidebar is the navigation.
+export function Frame(ctx: Ctx, active: string, title: string, body: Html): Html {
+  const styles = <link rel="stylesheet" href={ctx.root + "assets/explorer.css"} />;
+  const foot = <script src={ctx.root + "assets/explorer.js"} defer></script>;
+  return <ShellWith title={title + " · " + ctx.ix.snap.pkg} brand={"Orin explorer"} styles={styles}
+    sidebar={<Nav ctx={ctx} active={active} />} content={<main id="main" class="ex-main">{body}</main>} foot={foot} />;
+}
+
+export function PageHead(eyebrow: Html, title: string, lead: string): Html {
+  return <header class="ex-head">
+    <p class="ex-eyebrow">{eyebrow}</p>
+    <h1 class="ex-title">{title}</h1>
+    {lead.length > 0 ? <p class="ex-lead">{lead}</p> : empty()}
+  </header>;
+}
+
+export function KindBadge(kind: string): Html {
+  return <span class={"ex-kind ex-k-" + lower(kind)}>{kind}</span>;
+}
+
+export function EvBadge(ev: string): Html {
+  return <span class={"ex-evb ex-evb-" + lower(ev)} title={evMeaning(ev)}>{ev}</span>;
+}
+
+function evMeaning(ev: string): string {
+  return ev == "MUST" ? "MUST: a static call or definition in the body"
+    : (ev == "MAY" ? "MAY: possible, through a closure, a function value or an interface implementation"
+    : "UNKNOWN: the target is not known statically");
+}
+
+export function Flag(text: string, tip: string): Html {
+  return <span class="ex-flag" title={tip}>{text}</span>;
+}
+
+// a link to the page of node `i` (or its plain name when the node has no page)
+export function SymLink(ctx: Ctx, i: usize, label: string): Html {
+  const p = ctx.ix.page[i];
+  return p == NONE ? <span class="ex-sym">{label}</span> : <a class="ex-sym" href={symHref(ctx, p)}>{label}</a>;
+}
+
+// a link to the symbol with `id`, if the snapshot has it (a symbol only the other side of a diff has stays text)
+export function IdLink(ctx: Ctx, id: string): Html {
+  const x = ctx.ix.byId.get(id);
+  const label = qualified(id);
+  return x.isSome() ? <SymLink ctx={ctx} i={x.unwrap()} label={label} /> : <span class="ex-sym ex-gone">{label}</span>;
+}
+
+// `module::Name.member` of an id (the package prefix is dropped)
+export function qualified(id: string): string {
+  const i = id.indexOf(":");
+  return i.isSome() ? id.substring(i.unwrap() + 1, id.length) : id;
+}
+
+export function Svg(doc: SvgDoc): Html {
+  return trustHtml(svgText(doc));
+}
+
+export function Figure(caption: string, doc: SvgDoc, wide: bool): Html {
+  return <figure class={wide ? "ex-figure ex-figure-wide" : "ex-figure"}>
+    <div class="ex-scroll" tabindex={0} role="group" aria-label={caption}>{trustHtml(svgText(doc))}</div>
+    <figcaption>{caption}</figcaption>
+  </figure>;
+}
+
+export function Section(id: string, title: string, intro: string, body: Html): Html {
+  return <section class="ex-section" id={id}>
+    <h2>{title}</h2>
+    {intro.length > 0 ? <p class="ex-intro">{intro}</p> : empty()}
+    {body}
+  </section>;
+}
+
+export function Empty(text: string): Html {
+  return <p class="ex-empty">{text}</p>;
+}
+
+// ---- documentation text (TSDoc: paragraphs, `code`, fenced blocks, @tags) --------------------------------------------------
+
+function Inline(text: string): Html {
+  const parts = text.split("`");
+  let out: Html[] = [];
+  let i: usize = 0;
+  while (i < parts.length) {
+    if (i % 2 == 1 && i + 1 < parts.length) {
+      out.push(<code>{parts[i]}</code>);
+    } else {
+      out.push(<>{i % 2 == 1 ? "`" + parts[i] : parts[i]}</>);
+    }
+    i += 1;
+  }
+  return <>{out}</>;
+}
+
+function tagName(line: string): string {
+  const sp = line.indexOf(" ");
+  return sp.isSome() ? line.substring(0, sp.unwrap()) : line;
+}
+
+function tagRest(line: string): string {
+  const sp = line.indexOf(" ");
+  return sp.isSome() ? line.substring(sp.unwrap() + 1, line.length) : "";
+}
+
+// The documentation comment as blocks: prose paragraphs, fenced code, then the @tags as a definition list.
+export function DocView(doc: string): Html {
+  const lines = doc.split("\n");
+  let blocks: Html[] = [];
+  let para: string[] = [];
+  let tagTerms: string[] = [];
+  let tagBodies: string[] = [];
+  let code: string[] = [];
+  let inFence = false;
+  let inTag = false;
+  for (const raw of lines) {
+    const line = raw;
+    if (line.startsWith("```")) {
+      if (inFence) {
+        blocks.push(<pre class="ex-code"><code>{code.join("\n")}</code></pre>);
+        code = [];
+        inFence = false;
+      } else {
+        if (para.length > 0) {
+          blocks.push(<p>{Inline(para.join(" "))}</p>);
+          para = [];
+        }
+        inFence = true;
+      }
+    } else if (inFence) {
+      code.push(line);
+    } else if (line.startsWith("@")) {
+      if (para.length > 0) {
+        blocks.push(<p>{Inline(para.join(" "))}</p>);
+        para = [];
+      }
+      const name = tagName(line);
+      let rest = tagRest(line);
+      let term = name;
+      if ((name == "@param" || name == "@typeParam" || name == "@throws") && rest.length > 0) {
+        const sp = rest.indexOf(" ");
+        term = name + " " + (sp.isSome() ? rest.substring(0, sp.unwrap()) : rest);
+        rest = sp.isSome() ? rest.substring(sp.unwrap() + 1, rest.length) : "";
+      }
+      tagTerms.push(term);
+      tagBodies.push(rest);
+      inTag = true;
+    } else if (line.trim().length == 0) {
+      if (para.length > 0) {
+        blocks.push(<p>{Inline(para.join(" "))}</p>);
+        para = [];
+      }
+      inTag = false;
+    } else if (inTag && tagBodies.length > 0) {
+      tagBodies[tagBodies.length - 1] = tagBodies[tagBodies.length - 1] + " " + line.trim();
+    } else {
+      para.push(line.trim());
+    }
+  }
+  if (inFence && code.length > 0) {
+    blocks.push(<pre class="ex-code"><code>{code.join("\n")}</code></pre>);
+  }
+  if (para.length > 0) {
+    blocks.push(<p>{Inline(para.join(" "))}</p>);
+  }
+  let tags: Html[] = [];
+  let t: usize = 0;
+  while (t < tagTerms.length) {
+    tags.push(<div><dt>{tagTerms[t]}</dt><dd>{Inline(tagBodies[t])}</dd></div>);
+    t += 1;
+  }
+  return <div class="ex-doc">{blocks}{tags.length > 0 ? <dl class="ex-tags">{tags}</dl> : empty()}</div>;
+}
+
+// the first sentence of a documentation comment, for lists
+export function summaryOf(doc: string): string {
+  const para = doc.split("\n\n")[0].split("\n").join(" ");
+  const dot = para.indexOf(". ");
+  return dot.isSome() ? para.substring(0, dot.unwrap() + 1) : para;
+}
+
+export function Loc(file: string, line: int): Html {
+  return file.length == 0 ? empty() : <span class="ex-loc">{file + ":" + line.toString()}</span>;
+}
+
+export function lastSegment(id: string): string {
+  return afterLast(qualified(id), "::");
+}
