@@ -67,7 +67,7 @@ member's `orin.toml` for dependency errors) and are never downgraded to warnings
 | E0506 | duplicate: two members with the same package name, or a path listed twice |
 | E0507 | ambiguous or overlapping layout: a member inside another member, a tool inside a member, an `exclude` that matches nothing, a `default-members` entry that is not a member, a nested workspace |
 | E0508 | dependency error: a path dependency to a non-member, a dependency cycle (the message lists the cycle) |
-| E0509 | stale lockfile: member set or a member manifest hash differs from `orin.lock` |
+| E0509 | stale lockfile: member set or a member manifest hash differs from `orin.lock` (span in `orin.lock`) |
 
 ## 6. Commands (phase 2)
 
