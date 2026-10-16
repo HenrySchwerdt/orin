@@ -18,10 +18,10 @@ build() { # backend name
   b=$1; n=$2
   if [ "$b" = llvm ]; then
     $ORIN2 compile tests/next/deny/$n.or --backend=llvm -o build/capabilities/$n.$b.ll
-    $CC -O1 -w -I runtime build/capabilities/$n.$b.ll runtime/orin_runtime.c runtime/orin_runtime_llvm.c platform/orin_platform.c -lm -o build/capabilities/$n.$b
+    $CC -O1 -w -I runtime/core build/capabilities/$n.$b.ll runtime/core/orin_runtime.c runtime/core/orin_runtime_llvm.c runtime/platform/orin_platform.c -lm -o build/capabilities/$n.$b
   else
     $ORIN2 compile tests/next/deny/$n.or -o build/capabilities/$n.$b.c
-    $CC -O1 -w -I runtime build/capabilities/$n.$b.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/capabilities/$n.$b
+    $CC -O1 -w -I runtime/core build/capabilities/$n.$b.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/capabilities/$n.$b
   fi
 }
 

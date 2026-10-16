@@ -1,7 +1,7 @@
 # Orin on Windows
 
 Status: **WSL2 works today. A native Windows build does not exist yet**; this page gives the WSL2 steps and
-the plan for the native port. Nothing in `runtime/` or `platform/` has been changed for Windows.
+the plan for the native port. Nothing in `runtime/core/` or `runtime/platform/` has been changed for Windows.
 
 ## WSL2 (works today)
 
@@ -31,13 +31,13 @@ Run the installer inside WSL, not in Git Bash/MSYS2/Cygwin: `install.sh` refuses
 ## Native port: plan
 
 Not started. **It starts after capabilities Stage A lands**, because that work changes
-`platform/orin_platform.h` / `.c` (and std): porting before would port an API that is about to change.
+`runtime/platform/orin_platform.h` / `.c` (and std): porting before would port an API that is about to change.
 The first task of the port is to re-read the platform layer as it is then; the list below is for the
 current layer and shows the size of the job.
 
-### What `platform/orin_platform.c` needs
+### What `runtime/platform/orin_platform.c` needs
 
-Every function defined in the current `orin_platform.c` (from `grep -n "^[a-z].*(" platform/orin_platform.c`) is listed; "portable" ones are plain C and need no change:
+Every function defined in the current `orin_platform.c` (from `grep -n "^[a-z].*(" runtime/platform/orin_platform.c`) is listed; "portable" ones are plain C and need no change:
 
 | Function | Windows work |
 |---|---|
@@ -54,7 +54,7 @@ Every function defined in the current `orin_platform.c` (from `grep -n "^[a-z].*
 
 Further places that are not the platform layer but will break on Windows (to be handled in the same port,
 outside the scope of this page's "platform" list):
-- `runtime/` uses GCC/Clang extensions (`__builtin_*`, `__attribute__((noreturn, cold))`,
+- `runtime/core/` uses GCC/Clang extensions (`__builtin_*`, `__attribute__((noreturn, cold))`,
   `__builtin_expect`). MSVC's `cl` does not accept them; this is the main argument for clang (below).
 - The compiler's test runner and `orin test` use `/tmp/orin-test-N` and shell command lines; the wrapper
   quoting and temp-dir handling need a Windows variant.
@@ -67,7 +67,7 @@ Threads (ADR-0017 stage 0) add `orin_platform_thread_create / join / exit / id`,
 runtime itself uses `__thread` and GCC `__atomic` builtins, which clang accepts. Until then std:task does not work on Windows.
 
 Later capabilities (ADR-0021: file system, processes, network handles) will add more functions; each needs a
-Win32 backend from day one, so the port should be structured as `platform/orin_platform_win32.c` beside the
+Win32 backend from day one, so the port should be structured as `runtime/platform/orin_platform_win32.c` beside the
 POSIX file rather than `#ifdef`s inside one file, and `tools/check_platform_boundary.sh` must cover both.
 
 ### C compiler
@@ -120,7 +120,7 @@ produces `orin0.exe`".
 ### Order of work
 
 1. Wait for capabilities Stage A (platform layer API settles).
-2. Make the seed, `runtime/` and the platform layer compile with clang on Windows (new
+2. Make the seed, `runtime/core/` and the platform layer compile with clang on Windows (new
    `orin_platform_win32.c`); get the bootstrap to a fixed point (stage2 = stage3) on a Windows runner.
 3. PowerShell wrapper and `doctor`; zip package; CI job and the install test for Windows.
 4. Scoop bucket, `install.ps1`, then winget.

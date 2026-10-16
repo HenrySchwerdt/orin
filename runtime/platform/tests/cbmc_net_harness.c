@@ -1,6 +1,6 @@
 /* CBMC harnesses for the network primitives of the L0 platform layer (ADR-0033): buffer bounds of recv / send and the
  * scope checks. Run by tools/verify_platform.sh:
- *   cbmc platform/tests/cbmc_net_harness.c --function <harness> --bounds-check --pointer-check --unwind N ...
+ *   cbmc runtime/platform/tests/cbmc_net_harness.c --function <harness> --bounds-check --pointer-check --unwind N ...
  * The harness INCLUDES orin_platform.c (to reach the static scope functions) and replaces the system calls by stubs
  * that count calls and check their arguments: `recv` / `send` assert that the buffer they are given is valid for exactly
  * the length they are asked to transfer, and return an arbitrary value (including more than was asked); `socket`, `bind`,

@@ -10,8 +10,8 @@ claim about Orin in general.
 - **Programs**: `bench/<name>/main.or` (Orin-B), `main.go` (Go 1.24) and `main.c` (C, `cc -O2`)
   implement the same algorithm on the same input. Each prints a few checksum lines; `tools/bench.py`
   fails if stdout differs between the three. Inputs are fixed constants in the sources (no args).
-- **Builds**: Orin = `build/bootstrap/orin2 compile` to C, then `cc -O2 -w -I runtime` with
-  `runtime/orin_runtime.c` (no LTO, runtime is a separate translation unit); Go = `go build`
+- **Builds**: Orin = `build/bootstrap/orin2 compile` to C, then `cc -O2 -w -I runtime/core` with
+  `runtime/core/orin_runtime.c` (no LTO, runtime is a separate translation unit); Go = `go build`
   (default flags); C = `cc -O2 -w`. Same `cc` for Orin and C.
 - **Measurement**: one unrecorded warm-up run, then 5 runs; median wall time (min-max shown) from
   `perf_counter` around the process; peak RSS is `ru_maxrss` of the child, obtained through the small
@@ -20,7 +20,7 @@ claim about Orin in general.
   Build times are a single, uncached-for-C/Orin but Go-build-cache-warm measurement and are only indicative.
 - **Orin counters**: `ORIN_STATS=1 ./prog` prints a one-line JSON summary to stderr at exit (allocations by
   kind, frees, retains, releases, COW copies vs in-place `make_unique` hits, array/string growth
-  reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). The counters are a **build-time option**: compile the generated C and the runtime with `-DORIN_STATS_ENABLED` (e.g. `cc -O2 -DORIN_STATS_ENABLED prog.c runtime/orin_runtime.c platform/orin_platform.c`); the default build compiles the hot ones (allocations, frees, retains, releases, COW, growth, live/peak bytes) out, so `ORIN_STATS=1` then reports `"counters":"cold"` with those fields 0. The cold ones (`file_opens`/`file_closes`, `transfer_moves`/`transfer_copies`, `tasks_spawned`) and `live_objs_at_exit` are always kept. `tools/bench.py` times a build without the option and takes the counters from a second binary built with it; `tools/alloc_census.py` and `tools/test_resources.sh` build with it. `orin test` and `orin compile` have no flag for it (the driver does not invoke the C compiler for builds); pass the define on your own `cc` line.
+  reallocations, peak live objects/bytes, `file_opens`/`file_closes` of the resource handles of ADR-0025). The counters are a **build-time option**: compile the generated C and the runtime with `-DORIN_STATS_ENABLED` (e.g. `cc -O2 -DORIN_STATS_ENABLED prog.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c`); the default build compiles the hot ones (allocations, frees, retains, releases, COW, growth, live/peak bytes) out, so `ORIN_STATS=1` then reports `"counters":"cold"` with those fields 0. The cold ones (`file_opens`/`file_closes`, `transfer_moves`/`transfer_copies`, `tasks_spawned`) and `live_objs_at_exit` are always kept. `tools/bench.py` times a build without the option and takes the counters from a second binary built with it; `tools/alloc_census.py` and `tools/test_resources.sh` build with it. `orin test` and `orin compile` have no flag for it (the driver does not invoke the C compiler for builds); pass the define on your own `cc` line.
   **Per allocation site** (opt-in, not compiled into normal builds): `orin2 compile --stats-sites` plus a runtime built with
   `-DORIN_SITE_STATS`, then `ORIN_STATS=sites` reports allocations, bytes, retains, releases and COW copies per MIR instruction;
   `tools/alloc_census.py` runs it on every benchmark, the HTTP server and the self-compile (docs/perf/alloc-census.md).
@@ -159,7 +159,7 @@ was measured; not a like-for-like comparison of implementations). Binary size is
 
 ## Runtime fast-path optimization (runtime-only; before/after)
 
-Changes (only `runtime/orin_runtime.{h,c}`; no semantic, ABI, trap-message or counter changes; stats counters
+Changes (only `runtime/core/orin_runtime.{h,c}`; no semantic, ABI, trap-message or counter changes; stats counters
 are bit-identical on all benchmarks except the self-compile row, whose input differs slightly because the
 compiler source was merged forward):
 
@@ -240,7 +240,7 @@ patterns); the gain is asymptotic (state-threading code) rather than constant-fa
 ## LLVM IR backend (ADR-0006): C backend vs LLVM backend vs Go vs C
 
 Method: `python3 tools/bench.py` (5 runs, median after 1 warm-up), 4-core 2.8 GHz Xeon VM, Ubuntu clang 18.1.3
-(`clang -O2 -w` on the emitted `.ll` plus `runtime/orin_runtime.c` and the shim `runtime/orin_runtime_llvm.c`),
+(`clang -O2 -w` on the emitted `.ll` plus `runtime/core/orin_runtime.c` and the shim `runtime/core/orin_runtime_llvm.c`),
 gcc 13.3 for the C backend and the C reference, Go 1.24.7. The VM was noisy (min-max ranges of 20-40% within one
 cell), so differences below roughly 25% are not significant. Checksums are identical across all columns.
 
@@ -316,7 +316,7 @@ The Map is Orin prelude code (hash table over arrays), not a C object.
 
 ## R2: L0 platform layer (spec 19, ADR-0013)
 
-What changed: every libc/OS call of the runtime now goes through `platform/orin_platform.{h,c}`. Memory and
+What changed: every libc/OS call of the runtime now goes through `runtime/platform/orin_platform.{h,c}`. Memory and
 `mem_*` primitives are `static inline` wrappers in the header (same machine code as before); `console.log` is one
 call `orin_platform_write_line` (was `fwrite_unlocked` + `putc_unlocked`); `int/usize.toString` use a hand-written
 decimal formatter instead of `snprintf`; the `ORIN_STATS` report is assembled without printf. Method:
@@ -458,7 +458,7 @@ instruction `arrayextend` (runtime `orin_array_extend`: in place when unique, ot
 | bench/appends (200k string appends to a local, a field, a class field, an element; 100k array concats to a local and a field) | 74.4 s (one run) | 0.013 s (0.012-0.014) |
 
 Tests: `tests/next/run/append_in_place.or` (value semantics with copies, aliasing operands, nesting, 50,000 appends),
-`runtime/tests/runtime_test.c` (`orin_array_extend`), `compiler/tests/verify_main.or` (`IArrayExtend` rules).
+`runtime/core/tests/runtime_test.c` (`orin_array_extend`), `compiler/tests/verify_main.or` (`IArrayExtend` rules).
 
 ### Fix 2: a mutating method that returns a value
 
@@ -489,7 +489,7 @@ generic classes, copies taken before the call), all 805 existing conformance pro
 ### Fix 3: bulk bytes <-> string
 
 `bytesToString(a: u8[], start, len): string` and `stringToBytes(s): u8[]` are built-ins over the runtime object model
-(`orin_bytes_to_string`, `orin_string_to_bytes`, contracts in `runtime/orin_runtime.h`; bounds are checked ("slice out of range"), an
+(`orin_bytes_to_string`, `orin_string_to_bytes`, contracts in `runtime/core/orin_runtime.h`; bounds are checked ("slice out of range"), an
 element above 255 or a non-u8 array traps instead of being truncated; no platform call, so the boundary check is unchanged).
 std:bytes (`toRawString`, `bytesFromString`, `ByteBuilder.appendString`) and std:http (`sliceString`) use them. bench/bytesstr
 (1 MiB, 40 round trips through `bytesFromString` / `toRawString`): **1.322 s (1.115-1.520) -> 0.157 s (0.077-0.187)**, 8.4x. Tests:
@@ -640,7 +640,7 @@ add/jo sequence gcc emits):
 1. **A trap call blocks shrink-wrapping.** Every trap was `call @orin_trap` + `unreachable` inside an `alwaysinline` helper. A call in a block
    with no return needs a stack frame, so LLVM hoisted the whole prologue (3 pushes, 3 pops) above the `n < 2` test: every call of `fib`,
    including the leaf calls (about 60 % of all), paid it. Now the trap is written at function level as the function's own return,
-   `%t = tail call <ret> @orinl_trap_<i|p|f|v>(msg); ret %t` (four tiny shims in `runtime/orin_runtime_llvm.c` that call `orin_trap`).
+   `%t = tail call <ret> @orinl_trap_<i|p|f|v>(msg); ret %t` (four tiny shims in `runtime/core/orin_runtime_llvm.c` that call `orin_trap`).
    That is a `jmp` with no frame, the check blocks stay out of the frame, and the prologue moves to the slow path. Checked `+ - *`, `/ %`, negation, the
    range / conversion guards, struct slot checks, array slot / push kind and bounds checks, and `charCodeAt` are therefore expanded in the function
    instead of called as prelude helpers (the helpers remain for `unwrap_or` and `array_new`). The check keeps its `llvm.*.with.overflow` form, so the
@@ -825,7 +825,7 @@ the static CSS design system, an SVG canvas and exact number formatting). Build 
 
 ```sh
 build/bootstrap/orin2 compile tooling/benchmarks -o build/bench/bench-report.c
-cc -O1 -w -I runtime build/bench/bench-report.c runtime/orin_runtime.c platform/orin_platform.c -lm -o build/bench/bench-report
+cc -O1 -w -I runtime/core build/bench/bench-report.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o build/bench/bench-report
 build/bench/bench-report summary RUN.json                      # job summary (Markdown)
 build/bench/bench-report compare --history DIR RUN.json        # PR comment (Markdown, always exit 0)
 build/bench/bench-report render --history DIR --out DIR [--repo owner/name]   # charts/*.svg, README.md, report.html

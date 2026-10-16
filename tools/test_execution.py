@@ -28,8 +28,8 @@ def run(cmd, *, timeout=30, env=None, input=None, expected=0):
 def native_tests():
     for sanitized in [False, True]:
         exe = OUT / ("process_san" if sanitized else "process")
-        cmd = ["cc", "-Wall", "-Wextra", "-O1", "-g", "platform/tests/process_test.c",
-               "platform/orin_platform.c", "-o", exe]
+        cmd = ["cc", "-Wall", "-Wextra", "-O1", "-g", "runtime/platform/tests/process_test.c",
+               "runtime/platform/orin_platform.c", "-o", exe]
         if sanitized:
             cmd += ["-fsanitize=address,undefined", "-fno-sanitize-recover=undefined"]
         run(cmd)
@@ -77,10 +77,10 @@ function main(host: Host): void {
         generated = OUT / ("bounded.c" if backend == "c" else "bounded.ll")
         exe = OUT / ("bounded_" + backend)
         run([orinc, "compile", source, "--backend=" + backend, "-o", generated])
-        cmd = ["clang", "-O2", "-w", "-I", "runtime", generated, "runtime/orin_runtime.c",
-               "platform/orin_platform.c", "-o", exe]
+        cmd = ["clang", "-O2", "-w", "-I", "runtime/core", generated, "runtime/core/orin_runtime.c",
+               "runtime/platform/orin_platform.c", "-o", exe]
         if backend == "llvm":
-            cmd += ["runtime/orin_runtime_llvm.c"]
+            cmd += ["runtime/core/orin_runtime_llvm.c"]
         run(cmd)
         result = run([exe], timeout=5)
         assert result.stdout == "hello\n7\n124\n-2\n-1\n", result

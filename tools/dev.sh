@@ -62,7 +62,7 @@ build() {
   t0=$(now)
   echo "[dev] $host compiles compiler/main.or -> $D/orin (cc -O1)"
   $host compile compiler/main.or -o $D/orin.c
-  $CC -O1 -w -I runtime $D/orin.c runtime/orin_runtime.c platform/orin_platform.c -lm -o $D/orin.tmp
+  $CC -O1 -w -I runtime/core $D/orin.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $D/orin.tmp
   mv $D/orin.tmp $D/orin
   echo "$stamp" > $D/stamp
   echo "[dev] built $D/orin in $(( $(now) - t0 )) s"

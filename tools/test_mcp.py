@@ -40,7 +40,7 @@ def build(orin2):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         sys.exit("orin2 failed to compile compiler/main.or:\n" + r.stderr.decode())
-    r = subprocess.run(["cc", "-O1", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", exe],
+    r = subprocess.run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", exe],
                        cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         sys.exit("cc failed:\n" + r.stderr.decode())

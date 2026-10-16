@@ -1,12 +1,12 @@
 /*
  * Orin L0 platform layer (spec 19 section 2, ADR-0013): the CLOSED LIST of primitives through which
- * the runtime (runtime/) and the code emitted by the compiler reach the operating system and the
- * C library. Nothing outside platform/ may call libc directly (tools/check_platform_boundary.sh).
+ * the runtime (runtime/core/) and the code emitted by the compiler reach the operating system and the
+ * C library. Nothing outside runtime/platform/ may call libc directly (tools/check_platform_boundary.sh).
  * Adding a function needs an ADR.
  *
  * Rules for this layer: no data structures (one opaque OS handle type, `orin_platform_stream`, excepted),
  * no global state beyond argc/argv, the stdout lock and the thread / monitor tables, no knowledge of Orin
- * objects. Hard budget: platform/ (sources + header, without tests) stays <= 1,000 CODE lines (blank lines,
+ * objects. Hard budget: runtime/platform/ (sources + header, without tests) stays <= 1,000 CODE lines (blank lines,
  * comments and contract blocks do not count: tools/verify_platform.sh). Thread-safe except where said otherwise
  * (ADR-0017 stage 0: threads and monitors below; the network functions, ADR-0033, act on caller-owned handles).
  *
@@ -185,7 +185,7 @@ int64_t orin_platform_now_millis(void);
  * the calling thread holds the mutex. Everything above them (tasks, scopes, channels, results) is Orin (std:task).
  * Handles are 64-bit values `generation << 32 | (index + 1)` and are VALIDATED on every call: a stale (already freed or
  * joined), forged or foreign handle is refused with ORIN_PLATFORM_EINVAL, never dereferenced; records are recycled, not
- * freed, so a lookup never touches freed memory. Contract status: tested only (platform/tests/platform_test.c, plain,
+ * freed, so a lookup never touches freed memory. Contract status: tested only (runtime/platform/tests/platform_test.c, plain,
  * ASan+UBSan and ThreadSanitizer; tools/verify_platform.sh); CBMC cannot model threads. All other functions of this
  * layer may now be called from several threads at the same time unless said otherwise; the stdout buffer is serialised
  * inside orin_platform_write / write_line / flush. */
@@ -412,7 +412,7 @@ int orin_platform_stream_error(const orin_platform_stream *s);
 int orin_platform_stream_close(orin_platform_stream *s);
 
 /* ---------------------------------------------------------------- host policy and path scopes (ADR-0021 Stage A, ADR-0027)
- * The pure/OS primitives behind the capability grants of the runtime (runtime/orin_runtime.c keeps the table
+ * The pure/OS primitives behind the capability grants of the runtime (runtime/core/orin_runtime.c keeps the table
  * of grants; this layer only parses the host policy and decides path questions). Families are bits:
  * ORIN_PLATFORM_FAM_*. A path scope is a NORMALISED ABSOLUTE path (starts with '/', no "." or ".." component,
  * no repeated or trailing '/', except the root "/"); a path is inside a scope when it equals it or continues it

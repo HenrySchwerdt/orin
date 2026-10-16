@@ -2,7 +2,7 @@
 # Orin memory IR: heap model
 
 Values, heap objects, and the primitive heap operations of the Orin runtime
-(`runtime/orin_runtime.h`): allocation, retain, decrement, free, shallow copy support.
+(`runtime/core/orin_runtime.h`): allocation, retain, decrement, free, shallow copy support.
 
 Modelling choices (see `docs/formal.md`):
 * A location is a `Nat`. Locations are never reused (`next` only grows), so a freed

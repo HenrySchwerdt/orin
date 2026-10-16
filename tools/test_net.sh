@@ -19,7 +19,7 @@ trap kill_server EXIT
 
 build() { # source name
   $ORIN2 compile $1 -o $B/$2.c
-  $CC -O2 -w -I runtime $B/$2.c runtime/orin_runtime.c platform/orin_platform.c -lm -o $B/$2
+  $CC -O2 -w -I runtime/core $B/$2.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o $B/$2
 }
 build examples/http_server.or http_server
 build tests/net/client.or client

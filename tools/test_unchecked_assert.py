@@ -56,8 +56,8 @@ def main():
         driver = out / "driver"
         generated = out / "driver.c"
         run([args.orinc, "compile", str(source), "-o", str(generated)])
-        runtime = ["runtime/orin_runtime.c", "platform/orin_platform.c"]
-        run(["cc", "-O1", "-w", "-I", "runtime", str(generated), *runtime, "-lm", "-o", str(driver)])
+        runtime = ["runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"]
+        run(["cc", "-O1", "-w", "-I", "runtime/core", str(generated), *runtime, "-lm", "-o", str(driver)])
         cases = [("0", "plain", 0, ""), ("0", "facts", 0, ""),
                  ("1", "facts", 70, "an unchecked array access is out of bounds"),
                  ("2", "facts", 70, "an unchecked array access on an object that is not an array")]
@@ -67,9 +67,9 @@ def main():
                 emitted = run([str(driver), backend, facts, variant])
                 target = out / ("case.ll" if backend == "llvm" else "case.c")
                 target.write_text(emitted)
-                extra = ["runtime/orin_runtime_llvm.c"] if backend == "llvm" else []
+                extra = ["runtime/core/orin_runtime_llvm.c"] if backend == "llvm" else []
                 exe = out / "case"
-                run(["clang", "-O2", "-w", "-I", "runtime", str(target), *runtime, *extra, "-lm", "-o", str(exe)])
+                run(["clang", "-O2", "-w", "-I", "runtime/core", str(target), *runtime, *extra, "-lm", "-o", str(exe)])
                 result = subprocess.run([str(exe)], cwd=ROOT, text=True, capture_output=True, timeout=10)
                 ok = result.returncode == want and (message in result.stderr if want else not result.stdout and not result.stderr)
                 if ok:

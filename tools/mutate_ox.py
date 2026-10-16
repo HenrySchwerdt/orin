@@ -103,7 +103,7 @@ def run_mutant(args, m):
     r = sh([args.orinc, "compile", os.path.join(d, "compiler", "main.or"), "-o", orin_c])
     if r.returncode != 0:
         return name, "killed", "the mutated compiler does not compile"
-    r = sh([args.cc, "-O1", "-w", "-I", "runtime", orin_c, "runtime/orin_runtime.c", "platform/orin_platform.c",
+    r = sh([args.cc, "-O1", "-w", "-I", "runtime/core", orin_c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c",
             "-lm", "-lpthread", "-o", exe])
     if r.returncode != 0:
         return name, "ERROR", "cc failed: " + r.stdout.decode("utf-8", "replace")[-400:]

@@ -23,7 +23,7 @@ TSAN_RUN=""
 if command -v setarch >/dev/null 2>&1 && setarch "$ARCH" -R true >/dev/null 2>&1; then
   TSAN_RUN="setarch $ARCH -R"
 fi
-RT="runtime/orin_runtime.c platform/orin_platform.c"
+RT="runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
 count=0
 for t in tests/next/run/par_*.or tests/concurrency/par_*.or; do
   [ -f "$t" ] || continue
@@ -38,7 +38,7 @@ for t in tests/next/run/par_*.or tests/concurrency/par_*.or; do
       noopt) flags="--no-opt" ;;
     esac
     $ORIN2 compile "$t" -o $B/$n.$mode.c $flags 2> $B/$n.$mode.warn
-    $CC -O1 -w -I runtime $B/$n.$mode.c $RT -lm -lpthread -o $B/$n.$mode
+    $CC -O1 -w -I runtime/core $B/$n.$mode.c $RT -lm -lpthread -o $B/$n.$mode
     for th in default $THREADS; do
       if [ "$th" = default ]; then
         timeout 300 $B/$n.$mode > $B/$n.actual
@@ -51,13 +51,13 @@ for t in tests/next/run/par_*.or tests/concurrency/par_*.or; do
   done
   ORIN_STATS=1 ORIN_THREADS=4 timeout 300 $B/$n.fused 2> $B/$n.stats > /dev/null
   grep -q '"live_objs_at_exit":0' $B/$n.stats || { echo "[parallel] FAIL $n: objects still live at exit"; cat $B/$n.stats; exit 1; }
-  $CC -g -O1 -w -fsanitize=thread -I runtime $B/$n.fused.c $RT -lm -lpthread -o $B/$n.tsan
+  $CC -g -O1 -w -fsanitize=thread -I runtime/core $B/$n.fused.c $RT -lm -lpthread -o $B/$n.tsan
   for th in 2 4 8; do
     ORIN_THREADS=$th TSAN_OPTIONS="halt_on_error=1 allocator_may_return_null=1" $TSAN_RUN timeout 900 $B/$n.tsan > $B/$n.actual
     cmp -s "$out" $B/$n.actual || { echo "[parallel] FAIL $n (tsan, threads $th): output differs"; exit 1; }
   done
   if [ "$QUICK" = 0 ]; then
-    $CC -g -O1 -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -I runtime \
+    $CC -g -O1 -w -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -I runtime/core \
       $B/$n.fused.c $RT -lm -lpthread -o $B/$n.asan
     ORIN_THREADS=4 ASAN_OPTIONS=detect_leaks=0 timeout 900 $B/$n.asan > $B/$n.actual
     cmp -s "$out" $B/$n.actual || { echo "[parallel] FAIL $n (asan): output differs"; exit 1; }

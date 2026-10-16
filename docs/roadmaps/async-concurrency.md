@@ -30,7 +30,7 @@ places async/await post-1.0 and requires ADR approval for syntax/semantic change
 Source anchors: runtime `task_trap`, `task_main`, `orin_rt_heap_exit`,
 `orin_rt_task_join` in [orin_runtime.c](../../runtime/orin_runtime.c);
 `orin_platform_thread_exit`, `orin_platform_monitor_wait`, `net_wait`,
-`orin_platform_tcp_connect` in [orin_platform.c](../../platform/orin_platform.c).
+`orin_platform_tcp_connect` in [orin_platform.c](../../runtime/platform/orin_platform.c).
 The source calls `pthread_join` / `pthread_cond_wait`; `net_wait` polls one fd.
 Internal socket nonblocking mode alone does not provide nonblocking task waits.
 Existing timeout documentation is not evidence of a total DNS/connect bound:

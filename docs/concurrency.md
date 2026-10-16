@@ -100,11 +100,11 @@ delegated grant).
 | Layer | Contents | Language | Lines (code, no comments or blank lines) |
 |---|---|---|---|
 | `std:task` (L2) | scope table and task bookkeeping (`Ledger`, `drain`), join results, panic propagation, channel buffers (`Ring`), `Sender` / `Receiver`, grant delegation, `parallelMap` | **Orin**, `library/std/task.or`, and the pure state machines `Ring` and `Ledger` in `library/std/taskcore.or` | 508 (`task.or` 416 + `taskcore.or` 92), with 8 `@Invariant` and 26 `@Requires` / `@Ensures` |
-| L0 platform | thread create / join / exit / id; monitors (mutex + 2 condition queues + integer words); the runtime lock; the lock of the stdout buffer | **C, forever** (`platform/orin_platform.{c,h}`) | +243 (platform total 700 of the 1,000 budget). Why a monitor has words: Orin values cannot be shared between tasks, so the state that tasks DO share (the task table of a scope, the buffer of a channel) needs minimal shared memory with the OS's mutual exclusion; integers behind a lock are the smallest such cell (an "atomic counter" with a lock, handle-checked), and they let every line of channel and scope logic stay Orin |
-| runtime, temporary | transfer (`orin_rt_transfer_*`), task start / join / trap (`orin_rt_task_*`, `orin_rt_heap_exit`), forwarders that trap on a failed L0 call (`orin_mon_*`), grant clone / move / adopt (`orin_cap_*`) | **C, until R3** (`runtime/orin_runtime.c`, section "tasks and transfer") | 342 (transfer 130, tasks 80, `orin_mon_*` 35, trap forwarder 8, grants 70, rest 19), plus about 30 changed lines for per-task state |
+| L0 platform | thread create / join / exit / id; monitors (mutex + 2 condition queues + integer words); the runtime lock; the lock of the stdout buffer | **C, forever** (`runtime/platform/orin_platform.{c,h}`) | +243 (platform total 700 of the 1,000 budget). Why a monitor has words: Orin values cannot be shared between tasks, so the state that tasks DO share (the task table of a scope, the buffer of a channel) needs minimal shared memory with the OS's mutual exclusion; integers behind a lock are the smallest such cell (an "atomic counter" with a lock, handle-checked), and they let every line of channel and scope logic stay Orin |
+| runtime, temporary | transfer (`orin_rt_transfer_*`), task start / join / trap (`orin_rt_task_*`, `orin_rt_heap_exit`), forwarders that trap on a failed L0 call (`orin_mon_*`), grant clone / move / adopt (`orin_cap_*`) | **C, until R3** (`runtime/core/orin_runtime.c`, section "tasks and transfer") | 342 (transfer 130, tasks 80, `orin_mon_*` 35, trap forwarder 8, grants 70, rest 19), plus about 30 changed lines for per-task state |
 
 Everything in the third row needs the object model (reference counts, struct / array / string layout, thread-local free
-lists) and therefore cannot be Orin before R3. It is one interface, declared in one block of `runtime/orin_runtime.h`
+lists) and therefore cannot be Orin before R3. It is one interface, declared in one block of `runtime/core/orin_runtime.h`
 ("tasks"). Each function maps 1:1 onto a planned Orin core-dialect function (spec 19 R3; the core dialect has raw
 addresses, load / store, `size_of` and header access, and calls L0 only through the closed list):
 
@@ -125,7 +125,7 @@ addresses, load / store, `size_of` and header access, and calls L0 only through 
 | `orin_mon_*` (11 forwarders) | trap when an L0 monitor call fails | `core.sync.*`, one line each; the L0 functions they call are unchanged |
 | `orin_cap_clone` / `orin_cap_move` / `orin_cap_adopt_*` | delegation of a grant (clone the record, detach it into a token, adopt it) | part of the `core.cap` module that replaces the C grant table |
 
-L0 functions (stay C, handle-checked, contracts in `platform/orin_platform.h`): `orin_platform_thread_create / join / exit /
+L0 functions (stay C, handle-checked, contracts in `runtime/platform/orin_platform.h`): `orin_platform_thread_create / join / exit /
 id`, `monitor_new / free / lock / unlock / wait / notify / get / set / grow`, `runtime_lock / unlock`. They do not move in R3.
 
 The rest of the change in `runtime/` is mechanical and disappears with the C object model: `__thread` on `g_live`,
@@ -165,7 +165,7 @@ C code: (1) allocation and reference counts are thread-local; (2) `orin_rt_trans
 reference in the graph is the only one, so the sender's heap holds no other counted reference, and the MIR ownership
 verifier guarantees that no uncounted borrowed alias of the consumed local survives; otherwise it copies; (3) the only
 state that crosses tasks is transfer slots, monitor words (integers, under a lock) and grant tokens, all behind handles
-that are validated. The evidence is `runtime/tests/task_test.c`, `platform/tests/platform_test.c` and the stress tests,
+that are validated. The evidence is `runtime/core/tests/task_test.c`, `runtime/platform/tests/platform_test.c` and the stress tests,
 run under ThreadSanitizer, AddressSanitizer + UBSan and plain, plus the conformance programs; not a proof. R3 moves (1)-(3)
 into Orin core code (then MIR-verified for the ownership part) and R4 proves the transfer against the Lean model ("disjoint
 heaps, send transfers ownership"). L0 thread and monitor primitives stay C: contracts written, `TESTED_ONLY` (CBMC cannot
@@ -184,8 +184,8 @@ allocated.
 | `tests/std/taskcore_test.or` (5 `@Test`), `tests/std/task_test.or` (7) and `tests/std/expect_trap/task_*.or` (4) | the invariants and contracts of `Ring` and `Ledger` (checked by `orin test`; all 35 contract obligations of `std:taskcore` are `VERIFIED` by `orin verify --contracts`), channel semantics in one task, the move / copy counters, joins in any order, `parallelMap` against `map`; traps that hold without contracts (join twice, a panic reaching the joiner, use of a released channel, capacity 0). `tools/mutate_std.py --module taskcore`: 16 mutants, 16 killed (14 by a contract) |
 | `compiler/tests/verify_main.or` (14 cases) | the grant move rules of the MIR verifier |
 | `tools/test_osig.py` section 8 | the task events of the OSIG |
-| `runtime/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
-| `platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
+| `runtime/core/tests/task_test.c` (98 checks) | transfer (move, copy, shared children, immortals, scalars, a 200,000-deep chain), 64 tasks, trap in a task, ping-pong, cross-heap frees, grants moved and per task, invalid handles |
+| `runtime/platform/tests/platform_test.c` (+54 checks, 795 in all) | thread / monitor contracts, errors, mutual exclusion, condition queues, a thread dying with a lock held, concurrent stdout |
 | `tests/concurrency/stress_tasks.or`, `stress_messages.or`, `panic_chain.or`, `panic_many.or`, `move_counts.or` | 3,000 live tasks, a tree of 255 scopes, 20,000 short tasks (23,254 tasks in all), 40,000 messages through one channel with 8 producers and 4 consumers, 20,000 ping-pong round trips, structured messages checked on arrival; a panic crossing three tasks and 300 simultaneous unjoined panics (exit status 101, no hang or crash under the sanitizers); no live object at exit (`ORIN_STATS`); what the default build moves and what it copies |
 | `tools/test_concurrency.sh` | all C tests and the stress tests plain, under **ThreadSanitizer** and under **ASan + UBSan**; `tools/verify_platform.sh` also runs the platform tests under ThreadSanitizer. CI: `ci_local.sh` steps "concurrency (tsan, asan)" and "platform layer" |
 
@@ -237,7 +237,7 @@ a retain / release of a pinned object is a no-op (no shared count is written, so
 (count != 1), nothing in it is freed. The owner's obligation, kept by the only user (`library/collections/parallel.or` and the code the fusion
 pass generates): between lend and end it only spawns the worker tasks and joins them, and a reference to a pinned object made in
 the window is gone before the end (a reference that outlived it would be uncounted). Worker results come back through a transfer
-by a non-owner, which copies pinned objects. Evidence: `runtime/tests/task_test.c` (`test_lend`: no copy, counts untouched and
+by a non-owner, which copies pinned objects. Evidence: `runtime/core/tests/task_test.c` (`test_lend`: no copy, counts untouched and
 restored, a record sent back is a copy, no live object), `tests/concurrency/par_pipelines.or` and `tools/test_parallel.sh`
 (ORIN_THREADS 1..8, fused / `--no-fuse` / `--no-opt`, ThreadSanitizer at 2, 4, 8 threads, ASan + UBSan). `ORIN_STATS`: the peak
 live counters no longer wrap to 2^64 - 1 for a task whose own frees exceed its allocations (a defect found here).

@@ -12,7 +12,7 @@ benchmark workflow .github/workflows/bench.yml). --instructions adds executed-in
 regression metric). The parallel section runs bench/parallel_* and bench/streams_parallel with 1, 2 and 4 worker threads.
 
 For every directory bench/<name>/ containing main.or / main.go / main.c it
-  * builds Orin (orinc -> C -> cc -O2 with runtime/orin_runtime.c), Orin-LLVM (orinc --backend=llvm
+  * builds Orin (orinc -> C -> cc -O2 with runtime/core/orin_runtime.c), Orin-LLVM (orinc --backend=llvm
     -> .ll -> clang -O2 with the runtime; skipped without clang), Go (go build) and C (cc -O2),
   * runs each binary once to verify that the stdout (the checksum lines) is identical,
   * runs each binary N times (plus one unrecorded warm-up) and records wall time and peak RSS
@@ -317,21 +317,21 @@ def main():
     extras = {}   # name -> {"java": .., "rust": ..}
     stats = {}
     mismatches = []
-    rt = [os.path.join(ROOT, "runtime", "orin_runtime.c")]
+    rt = [os.path.join(ROOT, "runtime", "core", "orin_runtime.c")]
     for name in names:
         src = os.path.join("bench", name)
         out = os.path.join("build", "bench", name)
         os.makedirs(os.path.join(ROOT, out), exist_ok=True)
         builds = {
             "orin": [[orinc, "compile", src + "/main.or", "-o", out + "/orin.c"],
-                     ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", out + "/orin"]],
+                     ["cc"] + CFLAGS + ["-I", "runtime/core", out + "/orin.c", "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-lm", "-o", out + "/orin"]],
             "go": [["go", "build", "-o", out + "/go", src + "/main.go"]],
             "c": [["cc"] + CFLAGS + [src + "/main.c", "-lm", "-o", out + "/c"]],
         }
         if HAVE_CLANG:
             builds["llvm"] = [[orinc, "compile", src + "/main.or", "--backend=llvm", "-o", out + "/orin_llvm.ll"],
-                              ["clang"] + CFLAGS + ["-I", "runtime", out + "/orin_llvm.ll", "runtime/orin_runtime.c", "platform/orin_platform.c",
-                                                    "runtime/orin_runtime_llvm.c", "-lm", "-o", out + "/llvm"]]
+                              ["clang"] + CFLAGS + ["-I", "runtime/core", out + "/orin_llvm.ll", "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c",
+                                                    "runtime/core/orin_runtime_llvm.c", "-lm", "-o", out + "/llvm"]]
         res = {}
         have = {"orin": True, "llvm": HAVE_CLANG,
                 "go": os.path.isfile(os.path.join(ROOT, src, "main.go")), "c": os.path.isfile(os.path.join(ROOT, src, "main.c"))}
@@ -375,7 +375,7 @@ def main():
                 instr[name][lang] = ({"count": n, "args": iargs} if iargs else {"count": n}) if n is not None else {"skipped": why}
         # the counters are a build-time option (-DORIN_STATS_ENABLED); the timed binary is built without them, so the counter run
         # uses a second binary of the same C
-        sh(["cc"] + CFLAGS + ["-DORIN_STATS_ENABLED", "-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c", "platform/orin_platform.c",
+        sh(["cc"] + CFLAGS + ["-DORIN_STATS_ENABLED", "-I", "runtime/core", out + "/orin.c", "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c",
                               "-lm", "-o", out + "/orin_stats"])
         _, _, _, _, se = run_once([os.path.join(ROOT, out, "orin_stats")], env={"ORIN_STATS": "1"})
         stats[name] = json.loads(se.decode().strip().splitlines()[-1])["orin_stats"]
@@ -420,7 +420,7 @@ def main():
         # rebuild orin2 from its own C with the *current* runtime (timed build: no counters; a second build with them follows)
         stage = os.path.join(out, "orin2_cur")
         bt = timed_build([[orinc, "compile", "compiler/main.or", "-o", out + "/orin2_cur.c"],
-                          ["cc"] + CFLAGS + ["-I", "runtime", out + "/orin2_cur.c", "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", stage]])
+                          ["cc"] + CFLAGS + ["-I", "runtime/core", out + "/orin2_cur.c", "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", stage]])
         cmd = [os.path.join(ROOT, stage), "compile", "compiler/main.or", "-o", out + "/out.c"]
 
         def check_self(rc, so, se):
@@ -430,8 +430,8 @@ def main():
         digest = hashlib.sha256(open(os.path.join(ROOT, out, "out.c"), "rb").read()).hexdigest()
         ref = os.path.join(ROOT, "build", "bootstrap", "stage2.c")
         same = os.path.exists(ref) and hashlib.sha256(open(ref, "rb").read()).hexdigest() == digest
-        sh(["cc"] + CFLAGS + ["-DORIN_STATS_ENABLED", "-I", "runtime", out + "/orin2_cur.c", "runtime/orin_runtime.c",
-                              "platform/orin_platform.c", "-o", out + "/orin2_stats"])
+        sh(["cc"] + CFLAGS + ["-DORIN_STATS_ENABLED", "-I", "runtime/core", out + "/orin2_cur.c", "runtime/core/orin_runtime.c",
+                              "runtime/platform/orin_platform.c", "-o", out + "/orin2_stats"])
         _, _, _, _, se = run_once([os.path.join(ROOT, out, "orin2_stats")] + cmd[1:], env={"ORIN_STATS": "1"})
         st = json.loads(se.decode().strip().splitlines()[-1])["orin_stats"]
         selfc.update({"stats": st, "same": same, "size": sizes(os.path.join(ROOT, stage)), "build_s": bt,
@@ -448,8 +448,8 @@ def main():
         out = os.path.join("build", "bench", name)
         os.makedirs(os.path.join(ROOT, out), exist_ok=True)
         timed_build([[orinc, "compile", src + "/main.or", "-o", out + "/orin.c"],
-                     ["cc"] + CFLAGS + ["-pthread", "-I", "runtime", out + "/orin.c", "runtime/orin_runtime.c",
-                                        "platform/orin_platform.c", "-lm", "-o", out + "/orin"]])
+                     ["cc"] + CFLAGS + ["-pthread", "-I", "runtime/core", out + "/orin.c", "runtime/core/orin_runtime.c",
+                                        "runtime/platform/orin_platform.c", "-lm", "-o", out + "/orin"]])
         exe = os.path.join(ROOT, out, "orin")
         rows = {}
         ref_out = None

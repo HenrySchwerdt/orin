@@ -9,7 +9,7 @@ API table (`compiler/mcp/apitable.or`).
 |---|---|---|
 | `std:host` | Orin, `library/std/host.or` over the grant primitives of `std:fsraw` | the root of authority: `Host`, scope functions that derive grants (ADR-0027); **unstable** until the I/O freeze |
 | `std:fs` | Orin, `library/std/fs.or` (scope API) over C runtime primitives (`std:fsraw`, internal) | done; takes an `FsGrant` first (ADR-0027), **unstable** until the owner confirms the I/O freeze (ADR-0016); resources and streaming: ADR-0025 |
-| `std:process`, `std:io` | C runtime built-ins (`runtime/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
+| `std:process`, `std:io` | C runtime built-ins (`runtime/core/orin_runtime*.c/.h`) | done; `args`, `shell`, `readLine`, ... take a `ProcessGrant` / `StdioGrant` first (ADR-0027), **unstable** |
 | `std:path` | Orin, `library/std/path.or` | done (POSIX, lexical) |
 | `std:json` | Orin, `library/std/json.or` | done, **integers only** |
 | `std:time` | Orin, `library/std/time.or` + clock-read built-ins | wall/monotonic clocks, checked elapsed/deadline helpers, durations and UTC calendar; no `sleep`; **unstable** (ADR-0027); [monotonic API](std-time-monotonic.md) |
@@ -44,7 +44,7 @@ records, closures); only the compiler itself has to stay Orin-B. Type names in d
 unit (`$stdlib/json.Json`).
 
 The wall-clock built-in is `nowMillis(clock: ClockGrant): int` (`hir.BTimeNowMillis`, C function
-`orin_time_now_millis` in `runtime/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
+`orin_time_now_millis` in `runtime/core/orin_runtime_io.h`, `orinl_time_now_millis` for the LLVM backend).
 It is reachable through the internal module `std:clock`; `std:time` re-exports it. The internal monotonic read returns `Option<int>` and is wrapped by the fallible public `monotonicNow`. Use `std:time`.
 
 ## std:host and capability grants (UNSTABLE until the I/O freeze, ADR-0021 Stage A, ADR-0027)

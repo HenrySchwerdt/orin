@@ -7,7 +7,7 @@ std is embedded in the compiler:
   docs only (docs/**, *.md outside library/std/)      -> no build, no test jobs
   editors/vscode/**                              -> the vscode job
   library/std/<m>.or, tests/std/<m>*                  -> build + all test jobs, std mutants of <m> only
-  compiler/, runtime/, platform/, seed/, tools/  -> build + all test jobs (+ macOS); std mutants only
+  compiler/, runtime/, seed/, tools/  -> build + all test jobs (+ macOS); std mutants only
                                                     for modules whose source or tests changed
   tools/mutate_std.py, tests/std/spec_sorted.or,
   tests/std/expect_trap/**, the workflow itself  -> all std mutants
@@ -32,7 +32,7 @@ SHARDS = {"http": 3}
 # std modules that only declare types for another module's tests (library/std/ox.or: the OX provider types std:html uses)
 DEPENDENTS = {"library/std/ox.or": "html"}
 ALL_MUTANTS = ["tools/mutate_std.py", "tests/std/spec_sorted.or", ".github/workflows/ci.yml"]
-MACOS = ("compiler/", "runtime/", "platform/", "seed/", "tools/", "tooling/", ".github/")
+MACOS = ("compiler/", "runtime/", "seed/", "tools/", "tooling/", ".github/")
 
 
 def is_doc(f):
@@ -55,7 +55,7 @@ BACKEND_DEPENDENTS = {
 
 def std_backend_checks(files):
     files = [f for f in files if not is_doc(f)]
-    shared = ("compiler/", "runtime/", "platform/", "seed/", "library/core/", "library/collections/")
+    shared = ("compiler/", "runtime/", "seed/", "library/core/", "library/collections/")
     if any(f.startswith(shared) or f in (
             "library/std/bytes.or", "library/std/test.or", "tools/bootstrap.sh", "tools/embed_prelude.py", "tools/ci_changes.py",
             "tools/test_std.sh", ".github/workflows/ci.yml") for f in files):
@@ -103,12 +103,12 @@ def selftest():
         (["tests/std/http_prop_test.or"], {"code": True, "macos": False, "vscode": False, "mutants": ["http"]}),
         (["tools/mutate_std.py"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
-        (["platform/orin_platform.c", "library/std/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
+        (["runtime/platform/orin_platform.c", "library/std/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
     ]
     all_backend_checks = ["encoding", "jsonnumber", "jsonvalue", "jsondecode", "url"]
     for files, want in cases:
         want["std_backend_checks"] = (all_backend_checks if any(
-            f.startswith(("compiler/", "runtime/", "platform/")) for f in files) else [])
+            f.startswith(("compiler/", "runtime/")) for f in files) else [])
     for module, runner in [("encoding", "tools/check_encoding.py"),
                            ("jsonnumber", "tools/check_jsonnumber.py"),
                            ("url", "bench/url/check.py")]:

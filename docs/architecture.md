@@ -11,8 +11,8 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `docs/bootstrap-subset.md` | Historical: the frozen Orin-B subset of the retired Stage 0 (diagnostics table still valid). |
 | `docs/decisions/` | ADRs (interpretations of OPEN points, deviations). |
 | `seed/` | The committed **seed** (generated C of the self-hosted compiler, `orin-seed.c.gz` + `SEED_INFO`), the single bootstrap root. The Rust Stage 0 is retired to branch `archive/stage0-final`. |
-| `platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `platform/tests/` (contract tests, CBMC harnesses). |
-| `runtime/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `platform/`. |
+| `runtime/platform/` | **L0 platform layer** (spec 19 R2): `orin_platform.{h,c}`, the closed list of OS/libc primitives with ACSL-style contracts; `runtime/platform/tests/` (contract tests, CBMC harnesses). |
+| `runtime/core/` | C runtime `orin_runtime.{h,c}` (object model, strings, arrays, traps) shared by all stages' generated code; reaches the OS only through `runtime/platform/`. |
 | `compiler/` | **Stage 1+** compiler written in Orin (`compiler/main.or`). |
 | `library/std/` | **Std modules in Orin** (`std:host`, `std:fs`, `std:path`, `std:json`, `std:time`, `std:graph`; `std:host` and `std:fs` implement the capability grants of ADR-0027): embedded library root, see docs/std.md. |
 | `library/core/` | **Std prelude** in Orin (spec 19 layer L2): library logic compiled with every program (see "Preludes"). |
@@ -20,6 +20,23 @@ Status: living document. Owner: lead architect. Normative source of language req
 | `tests/errors/` | Must-fail programs; first line `// error: E0xxx`. |
 | `tests/next/` | Same formats (`run/`, `errors/`) for language beyond Orin-B; self-hosted compiler only (`--suite next`). |
 | `tools/` | Test runner and bootstrap scripts. |
+
+### Old to new paths (ADR-0047 phase 3)
+
+The libraries and the runtime moved without any semantic change. Public `std:*` import names, the virtual prelude roots
+(`$std`, `$array`, `$stdlib`) and the C ABI are unchanged.
+
+| Before | Now | Release package (unchanged) |
+|---|---|---|
+| `std/` | `library/core/` (prelude `$std`) | embedded in the compiler |
+| `array/` | `library/collections/` (prelude `$array`) | embedded in the compiler |
+| `stdlib/` | `library/std/` (`std:*` modules, `$stdlib`) | embedded in the compiler |
+| `runtime/` | `runtime/core/` | `lib/orin/runtime/` |
+| `platform/` | `runtime/platform/` | `lib/orin/platform/` |
+
+`runtime/core/` includes `../platform/orin_platform.h`; that relative path resolves in the source tree (`runtime/platform/`)
+and in a release (`lib/orin/platform/`). `tools/package.sh` maps source to release, so `install.sh` and installed
+releases keep working. `orin test` defaults to `--runtime runtime/core` in a checkout (the `orin` launcher passes its own).
 
 ## Pipeline
 
@@ -112,15 +129,15 @@ so `stage2.c == stage3.c` still holds):
 
 ## Platform layer (spec 19 R2)
 
-Everything the runtime needs from the OS or libc goes through `platform/orin_platform.h`: memory
+Everything the runtime needs from the OS or libc goes through `runtime/platform/orin_platform.h`: memory
 (`alloc`/`realloc`/`free`, `mem_copy/move/set/cmp/find`), decimal formatting, process (`init`, `arg_count/arg`,
 `getenv`, `at_exit`, `exit`, `abort`, `shell`), byte I/O (`write`, `write_line`, `flush`, `stdin_read`,
-`stdin_getc`) and whole-file operations (`file_read/write/exists`, `error_message`). `runtime/*.{c,h}` include only
+`stdin_getc`) and whole-file operations (`file_read/write/exists`, `error_message`). `runtime/core/*.{c,h}` include only
 freestanding headers (`stddef.h`, `stdint.h`) plus the platform header; `tools/check_platform_boundary.sh`
-(run in CI) fails on any direct libc call or libc include in `runtime/`. The runtime includes the header as
-`../platform/orin_platform.h`, so `platform/` must be a sibling directory of `runtime/` in a checkout and in
-a package (`lib/orin/runtime`, `lib/orin/platform`); every link line is
-`cc -I runtime out.c runtime/orin_runtime.c platform/orin_platform.c`. The memory primitives are `static inline`
+(run in CI) fails on any direct libc call or libc include in `runtime/core/`. The runtime includes the header as
+`../platform/orin_platform.h`, so `platform/` must be a sibling directory of the runtime directory (`runtime/platform` next to
+`runtime/core` in a checkout) and in a package (`lib/orin/runtime`, `lib/orin/platform`); every link line is
+`cc -I runtime/core out.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c`. The memory primitives are `static inline`
 in the header (no cost on hot paths); everything else is out of line. The platform layer owns the process-wide
 stdout buffer and the argv copy; the runtime keeps no libc state. Contracts, status labels and verification:
 docs/formal.md "L0 platform layer".
@@ -145,6 +162,6 @@ queues, integer words). The platform layer is now thread-safe (the stdout buffer
 | MIR ownership discipline | Independent verifier implemented (`compiler/verify`, docs/mir.md); lowering to MIR in progress; verifier itself not mechanically verified |
 | Link verifier ⇄ Lean model | **Proven for the structured MIR core** (`check_sound`: Lean checker transcribing docs/mir.md accepts ⇒ no use-after-free/double free/shared store), given a caller contract. Not covered: calls/builtins, loops, switch, arrays/strings; the Orin verifier source is not itself verified against the Lean checker (manual transcription). See docs/formal.md |
 | Source type safety (progress/preservation) | Not started |
-| L0 platform layer (`platform/`) | Contracts written (ACSL-style); memory/string/format primitives bounded-verified with CBMC; I/O, process and file primitives tested only (docs/formal.md) |
+| L0 platform layer (`runtime/platform/`) | Contracts written (ACSL-style); memory/string/format primitives bounded-verified with CBMC; I/O, process and file primitives tested only (docs/formal.md) |
 | Task isolation (ADR-0017 stage 0) | Static: handles cannot be captured / stored / sent, E0481-E0483, MIR verifier handle rules for grants moved into tasks. Run time: handle validation, one-shot tokens. **Tested only** (ThreadSanitizer, ASan + UBSan, stress): the C transfer and the L0 thread / monitor primitives; not verified, see docs/concurrency.md "Safety argument" |
 | Native artifact | TCB: runtime, C compiler, allocator, emitter — unverified |

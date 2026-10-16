@@ -160,7 +160,7 @@ Beyond Orin-B (self-hosted compiler only; Stage 0 rejects the import with E0301)
 - `shell(proc, cmd: string): int`: runs `cmd` with `/bin/sh -c`, returns the exit status (-1 if it could not
   run or was killed by a signal). Used by `orin mcp` (`test`/`build`, only with `--allow-exec`).
 Strings are byte strings. Used by `orin lsp` (`compiler/lsp/stdio.or`); runtime in
-`runtime/orin_runtime_io.h` (header-only, included by generated C of both backends).
+`runtime/core/orin_runtime_io.h` (header-only, included by generated C of both backends).
 
 Methods/properties:
 

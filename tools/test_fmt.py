@@ -41,7 +41,7 @@ def build(orin2, src, name):
     rc, _, err = run([orin2, "compile", src, "-o", c])
     if rc != 0:
         sys.exit("cannot compile %s:\n%s" % (src, err.decode()))
-    rc, _, err = run(["cc", "-O1", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-o", exe])
+    rc, _, err = run(["cc", "-O1", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-o", exe])
     if rc != 0:
         sys.exit("cc failed for %s:\n%s" % (src, err.decode()))
     return exe

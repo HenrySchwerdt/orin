@@ -19,7 +19,7 @@ also two distinct parsers, not one implementation to silently generalize:
 | [compiler/json/json.or](../../compiler/json/json.or), [write.or](../../compiler/json/write.or) | separate union, exhaustive `jsonEq`/writer; writer contracts depend on parse-back equality |
 | [compiler/lsp/handler.or](../../compiler/lsp/handler.or), [compiler/mcp/tools.or](../../compiler/mcp/tools.or) | integer positions, revisions and limits use `getInt`/`getPathInt`; a broad parser migration changes protocol inputs |
 | [compiler/analysis/osig.or](../../compiler/analysis/osig.or), [compiler/tests/tooling_test.or](../../compiler/tests/tooling_test.or) | integer source coordinates, deterministic snapshots, variant-sensitive structural equality and minimum-integer round trips |
-| [compiler/check/builtins.or](../../compiler/check/builtins.or), [runtime/orin_runtime.c](../../runtime/orin_runtime.c), [ADR-0018](../decisions/0018-floats-and-maps.md) | binary64 `float`, explicit integer conversions, `parseFloat`, `isFinite`; float-to-int can trap; `parseFloat` accepts non-JSON NaN/Infinity and can overflow/underflow |
+| [compiler/check/builtins.or](../../compiler/check/builtins.or), [runtime/core/orin_runtime.c](../../runtime/orin_runtime.c), [ADR-0018](../decisions/0018-floats-and-maps.md) | binary64 `float`, explicit integer conversions, `parseFloat`, `isFinite`; float-to-int can trap; `parseFloat` accepts non-JSON NaN/Infinity and can overflow/underflow |
 
 A local C-backend probe of the baseline produced:
 

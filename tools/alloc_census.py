@@ -2,7 +2,7 @@
 """Allocation census (docs/perf/alloc-census.md, ADR-0038): where the heap allocations and RC operations come from.
 
 Every workload is compiled in the opt-in census mode (`orin2 compile --stats-sites`: a site mark before every MIR
-instruction, see runtime/orin_runtime.h "Allocation-site census") and linked with a runtime built with -DORIN_SITE_STATS;
+instruction, see runtime/core/orin_runtime.h "Allocation-site census") and linked with a runtime built with -DORIN_SITE_STATS;
 ORIN_STATS=sites then writes, per MIR site, the objects allocated there (by runtime kind), their bytes, growths and
 frees, the retains / releases / COW copies executed there and those suffered by the objects allocated there, and the
 joint (executing site, allocating site) RC counts. Counts are deterministic; nothing here measures time.
@@ -53,9 +53,9 @@ def sh(cmd, **kw):
 
 def build_runtime(out):
     objs = []
-    for src in ("runtime/orin_runtime.c", "platform/orin_platform.c"):
+    for src in ("runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"):
         o = os.path.join(out, os.path.basename(src)[:-2] + ".sites.o")
-        sh([CC] + CFLAGS + ["-DORIN_SITE_STATS", "-I", "runtime", "-c", src, "-o", o])
+        sh([CC] + CFLAGS + ["-DORIN_SITE_STATS", "-I", "runtime/core", "-c", src, "-o", o])
         objs.append(o)
     return objs
 
@@ -64,7 +64,7 @@ def build(orinc, src, out, name, rt):
     c = os.path.join(out, name + ".c")
     exe = os.path.join(out, name)
     sh([orinc, "compile", "--stats-sites", src, "-o", c], timeout=1800)
-    sh([CC] + CFLAGS + ["-I", "runtime", c] + rt + ["-lm", "-lpthread", "-o", exe], timeout=1800)
+    sh([CC] + CFLAGS + ["-I", "runtime/core", c] + rt + ["-lm", "-lpthread", "-o", exe], timeout=1800)
     save_mir(orinc, src, out, name)
     return exe
 

@@ -105,7 +105,7 @@ def build_tree(dest, with_hang):
     os.makedirs(os.path.join(dest, "tools"))
     for name in ("run_tests.py", "parallel.py"):
         shutil.copy(os.path.join(ROOT, "tools", name), os.path.join(dest, "tools", name))
-    for d in ("runtime", "platform"):
+    for d in ("runtime",):
         os.symlink(os.path.join(ROOT, d), os.path.join(dest, d))
     for rel in COPIED:
         os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)

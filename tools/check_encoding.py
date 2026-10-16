@@ -38,10 +38,10 @@ def compile_orin(orinc, source, backend, contracts=False, sanitize=False):
         cmd += ["--check-contracts"]
     run(cmd)
     binary = OUT / stem
-    cmd = ["clang", "-O2", "-w", "-I", ROOT / "runtime", generated,
-           ROOT / "runtime/orin_runtime.c", ROOT / "platform/orin_platform.c", "-lm", "-o", binary]
+    cmd = ["clang", "-O2", "-w", "-I", ROOT / "runtime" / "core", generated,
+           ROOT / "runtime/core/orin_runtime.c", ROOT / "runtime/platform/orin_platform.c", "-lm", "-o", binary]
     if backend == "llvm":
-        cmd += [ROOT / "runtime/orin_runtime_llvm.c"]
+        cmd += [ROOT / "runtime/core/orin_runtime_llvm.c"]
     if sanitize:
         cmd += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     run(cmd)

@@ -45,14 +45,14 @@ Documentation MUST state for each runtime function which layer it is in and whic
 ## 4. Migration plan (incremental, never breaking the bootstrap)
 
 - **R1 — std in Orin (no new language features):** move pure library logic currently in
-  `runtime/orin_runtime.c` (split, trim, indexOf/includes, parseInt, int/usize→string, join,
+  `runtime/core/orin_runtime.c` (split, trim, indexOf/includes, parseInt, int/usize→string, join,
   slice/concat helpers) into Orin modules compiled with every program; keep C versions only where
   Stage 0 needs them. Differential tests old vs new; benchmarks.
   **Status: done (2026-10-13).** The implementation lives in `library/core/` (repo root; embedded into the
   compiler by `tools/embed_prelude.py`, loaded implicitly via the general "prelude roots" mechanism,
   see docs/architecture.md "Preludes"). The checker keeps the same surface API; lowering maps the
   moved built-ins to calls of the prelude functions; unreachable prelude functions are pruned from the
-  emitted C. The C versions stay in `runtime/orin_runtime.c` because Stage 0 (frozen) and
+  emitted C. The C versions stay in `runtime/core/orin_runtime.c` because Stage 0 (frozen) and
   `--c-builtins` (the differential-test path, `tools/diff_backends.py --mode builtins`) still use
   them. Slice/concat/get of arrays were **not** moved: they are generic over the element type, and
   the prelude has no way to be instantiated per element type without generics-in-prelude (checker
@@ -64,7 +64,7 @@ Documentation MUST state for each runtime function which layer it is in and whic
 Layer = the layer the function belongs to in the target design (section 2). Assurance labels follow
 spec 07: *safe Orin* (language guarantees, MIR-verified), *tested only*, *trusted* (C).
 
-| Function (runtime/orin_runtime.{h,c}) | Layer | Status after R1 |
+| Function (runtime/core/orin_runtime.{h,c}) | Layer | Status after R1 |
 |---|---|---|
 | `orin_str_index_of`, `orin_str_includes` | L2 | moved: `library/core/strings.or` `strIndexOf`, `strIncludes` (naive scan with first-byte filter instead of `memmem`); C copy kept for Stage 0 / `--c-builtins` |
 | `orin_str_starts_with`, `orin_str_ends_with` | L2 | moved: `strStartsWith`, `strEndsWith`; C copy kept |
@@ -92,7 +92,7 @@ over all run suites, ASan/UBSan, plus `tests/run/std_prelude_edges.or`); everyth
 separator is raised through `process.exit(101)` after printing the same message.
 - **R2 — carve out L0:** split the remaining C into `platform/` (the closed list) and the object
   model; write L0 contracts.
-  **Status: done (2026-10-13).** `platform/orin_platform.{h,c}` (about 440 lines incl. contracts; budget
+  **Status: done (2026-10-13).** `runtime/platform/orin_platform.{h,c}` (about 440 lines incl. contracts; budget
   1,000) is the closed list; the final API: memory `alloc, realloc, free, mem_copy, mem_move, mem_set,
   mem_cmp, mem_find`; formatting `fmt_i64, fmt_u64`; process `init, arg_count, arg, getenv, at_exit, exit,
   abort, shell`; byte I/O `write, write_line, flush, stdin_read, stdin_getc`; files `file_read, file_write,
@@ -100,7 +100,7 @@ separator is raised through `process.exit(101)` after printing the same message.
   an ACSL-style `requires/ensures/assigns` block in the header. `tools/check_platform_boundary.sh` (CI)
   forbids direct libc calls/includes in `runtime/`. Assurance: memory, find and format primitives are
   bounded-verified with CBMC (`tools/verify_platform.sh`, docs/formal.md "L0 platform layer"); I/O, process
-  and file primitives are tested only (`platform/tests/platform_test.c`, plain and under ASan/UBSan). The
+  and file primitives are tested only (`runtime/platform/tests/platform_test.c`, plain and under ASan/UBSan). The
   inventory above shows the layer of each runtime function after R2.
 - **R3 — core dialect:** add core intrinsics (raw address type, load/store, size_of, header
   access) restricted to `core` modules; reimplement the object model (retain/release/make_unique,

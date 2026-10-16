@@ -28,7 +28,7 @@ B=build/bootstrap
 SEED_DIR=${ORIN_SEED_DIR:-seed}
 mkdir -p "$B"
 python3 tools/embed_prelude.py --check
-cc_link() { flags=$1; shift; $CC $flags -I runtime "$1" runtime/orin_runtime.c platform/orin_platform.c -o "$2"; }
+cc_link() { flags=$1; shift; $CC $flags -I runtime/core "$1" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -o "$2"; }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 T0=$(date +%s)
 elapsed() { echo "$(( $(date +%s) - T0 )) s"; }

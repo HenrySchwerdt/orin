@@ -27,8 +27,8 @@ class CliTests(unittest.TestCase):
         compiler = Path(os.environ.get("ORIN2", ROOT / "build/dev/orin")).resolve()
         (package / "libexec/orin").symlink_to(compiler)
         (package / "lib/orin").mkdir(parents=True)
-        (package / "lib/orin/runtime").symlink_to(ROOT / "runtime")
-        (package / "lib/orin/platform").symlink_to(ROOT / "platform")
+        (package / "lib/orin/runtime").symlink_to(ROOT / "runtime" / "core")
+        (package / "lib/orin/platform").symlink_to(ROOT / "runtime" / "platform")
         (package / "examples").symlink_to(ROOT / "examples")
         (package / "VERSION").write_text("test\n")
         cls.cli = package / "bin/orin"

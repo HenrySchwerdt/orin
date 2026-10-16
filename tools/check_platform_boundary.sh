@@ -1,11 +1,11 @@
 #!/bin/sh
-# Spec 19 / ADR-0013 (R2): the runtime must reach the OS and libc ONLY through platform/orin_platform.h.
-# Fails when a runtime source (runtime/*.c, runtime/*.h) calls a libc function directly or includes a
+# Spec 19 / ADR-0013 (R2): the runtime must reach the OS and libc ONLY through runtime/platform/orin_platform.h.
+# Fails when a runtime source (runtime/core/*.c, runtime/core/*.h) calls a libc function directly or includes a
 # libc header other than the freestanding ones. Comments and string literals are ignored.
-#   tools/check_platform_boundary.sh [file ...]     (default: runtime/*.c runtime/*.h)
+#   tools/check_platform_boundary.sh [file ...]     (default: runtime/core/*.c runtime/core/*.h)
 set -eu
 cd "$(dirname "$0")/.."
-[ $# -gt 0 ] || set -- runtime/*.c runtime/*.h
+[ $# -gt 0 ] || set -- runtime/core/*.c runtime/core/*.h
 exec python3 - "$@" <<'PY'
 import re, sys
 
@@ -58,7 +58,7 @@ for path in sys.argv[1:]:
     for m in re.finditer(r'^\s*#\s*include\s*<([^>]+)>', raw, re.M):
         if m.group(1) not in ALLOWED_INCLUDES:
             line = raw.count("\n", 0, m.start()) + 1
-            print("%s:%d: forbidden include <%s> (use platform/orin_platform.h)" % (path, line, m.group(1)))
+            print("%s:%d: forbidden include <%s> (use runtime/platform/orin_platform.h)" % (path, line, m.group(1)))
             bad += 1
     for m in call.finditer(text):
         line = text.count("\n", 0, m.start()) + 1

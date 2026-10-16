@@ -232,7 +232,7 @@ def sample(mutants, limit, seed):
 
 def run_tests(orinc, workdir, entry_rel, timeout):
     """(kind, detail): kind is 'pass', 'fail', 'contract', 'invalid' for one `orin test` run in `workdir`."""
-    cmd = [orinc, "test", "--format=json", "--runtime", os.path.join(ROOT, "runtime"), "--timeout", str(timeout),
+    cmd = [orinc, "test", "--format=json", "--runtime", os.path.join(ROOT, "runtime", "core"), "--timeout", str(timeout),
            "--out-dir", os.path.join(workdir, ".mut-out"), os.path.join(workdir, entry_rel)]
     try:
         r = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

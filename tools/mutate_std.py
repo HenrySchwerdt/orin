@@ -272,7 +272,7 @@ def net_mutant(orinc, mutant):
     r = sp.run([orinc, "compile", os.path.relpath(os.path.join(src, "compiler", "main.or"), ROOT), "-o", c], cwd=ROOT,
                stdout=sp.PIPE, stderr=sp.STDOUT)
     if r.returncode == 0:
-        r = sp.run(["cc", "-O0", "-w", "-I", "runtime", c, "runtime/orin_runtime.c", "platform/orin_platform.c", "-lm", "-o", os.path.join(d, "orin")],
+        r = sp.run(["cc", "-O0", "-w", "-I", "runtime/core", c, "runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c", "-lm", "-o", os.path.join(d, "orin")],
                    cwd=ROOT, stdout=sp.PIPE, stderr=sp.STDOUT)
     if r.returncode:
         return None, False, "COMPILE ERROR in mutant net/%s:\n%s" % (name, r.stdout.decode()[:600])
@@ -280,7 +280,7 @@ def net_mutant(orinc, mutant):
     fails = []
     for flag in ([], ["--no-contracts"]):
         try:
-            t = sp.run([os.path.join(d, "orin"), "test", "tests/std/net_test.or", "--runtime", "runtime"] + flag, cwd=ROOT,
+            t = sp.run([os.path.join(d, "orin"), "test", "tests/std/net_test.or", "--runtime", "runtime/core"] + flag, cwd=ROOT,
                        stdout=sp.PIPE, stderr=sp.STDOUT, timeout=120)
         except sp.TimeoutExpired:  # a mutant that waits forever is a failing test
             fails.append(1)
