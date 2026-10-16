@@ -105,7 +105,7 @@ Census re-run 2026-10-16 (after lever 1 and T1/T3/T4) with the current lever ran
 3. **Performance, further ADR-0038 steps:** unboxing of records with reference
    payloads and flattening `Span` into its containers (a); reuse in place for field/element in/out (e); regions for
    bintrees (f, deferred: measured 2026-10-16, free lists and iterative release already exist, regions would give about -50 %
-   on bintrees alone and nothing elsewhere; ADR-0038 addendum); packed arrays (b). Done on the way: small-block cache for
+   on bintrees alone and nothing elsewhere; ADR-0038 addendum); packed arrays (b). **Measured 2026-10-16 (ADR-0038 addendum "packed arrays (b) and reuse in place (e)"):** (e) is worth at most 0.54 % of the self-compile (all COW copies together 2.25 %, the rest is real sharing) and nothing on any benchmark: not built. (b): full packing would give bytesstr -99 % and http_parse at most -9 %, nothing on the compiler, for a MIR version, a lowering change and 40 runtime array sites: not built; instead the `u8[]` <-> string conversion loops are vectorised in the runtime (bytesstr -58.9 %, http_parse -1.5 %, no MIR / verifier change). Done on the way: small-block cache for
    strings and array buffers, self-compile -4.9 %, wordfreq -13 %, mapfreq -9 %.
 4. **LLVM default for `--release`** (ADR-0038 §8): **done** (owner, 2026-10-16); `--backend=c` is the explicit fallback. Gate 3 is met (2026-10-16: pinned LLVM 19.1.7, `dist/llvm.pin`,
    `orin toolchain install` verifies the sha256; `orin doctor` reports it; `--release --backend=llvm` without it falls back to C

@@ -1296,18 +1296,82 @@ OrinObj *orin_array_extend(OrinObj *x, OrinObj *y) {
     return r;
 }
 
+/* Narrow n 8-byte slots to bytes and widen n bytes to slots (u8[] <-> string). The slots of a u8 array hold 0..255, but the
+ * runtime does not trust that: narrow_slots returns the OR of all slots, so a value above 255 shows as a result above 255.
+ * Both loops run 16 elements per iteration with SSE2 where it exists (x86-64 always has it), else 4 per iteration in plain C
+ * (docs/decisions/0038 addendum "packed arrays": the byte loops cost 6 instructions per element). */
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+static uint64_t narrow_slots(char *dst, const uint64_t *src, uint64_t n) {
+    uint64_t bad = 0, i = 0;
+#if defined(__SSE2__)
+    __m128i acc = _mm_setzero_si128();
+    for (; i + 16 <= n; i += 16) {
+        const __m128i *p = (const __m128i *)(src + i);
+        __m128i v0 = _mm_loadu_si128(p), v1 = _mm_loadu_si128(p + 1), v2 = _mm_loadu_si128(p + 2), v3 = _mm_loadu_si128(p + 3);
+        __m128i v4 = _mm_loadu_si128(p + 4), v5 = _mm_loadu_si128(p + 5), v6 = _mm_loadu_si128(p + 6), v7 = _mm_loadu_si128(p + 7);
+        acc = _mm_or_si128(acc, _mm_or_si128(_mm_or_si128(_mm_or_si128(v0, v1), _mm_or_si128(v2, v3)),
+                                             _mm_or_si128(_mm_or_si128(v4, v5), _mm_or_si128(v6, v7))));
+        /* low 32 bits of each 64-bit slot -> 4 x i32, then 8 x i16, then 16 x u8 (values <= 255 are exact) */
+        __m128i a0 = _mm_unpacklo_epi64(_mm_shuffle_epi32(v0, 0x08), _mm_shuffle_epi32(v1, 0x08));
+        __m128i a1 = _mm_unpacklo_epi64(_mm_shuffle_epi32(v2, 0x08), _mm_shuffle_epi32(v3, 0x08));
+        __m128i a2 = _mm_unpacklo_epi64(_mm_shuffle_epi32(v4, 0x08), _mm_shuffle_epi32(v5, 0x08));
+        __m128i a3 = _mm_unpacklo_epi64(_mm_shuffle_epi32(v6, 0x08), _mm_shuffle_epi32(v7, 0x08));
+        __m128i b0 = _mm_packs_epi32(a0, a1), b1 = _mm_packs_epi32(a2, a3);
+        _mm_storeu_si128((__m128i *)(dst + i), _mm_packus_epi16(b0, b1));
+    }
+    bad = (uint64_t)_mm_cvtsi128_si64(acc) | (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(acc, acc));
+#else
+    for (; i + 4 <= n; i += 4) {
+        uint64_t a = src[i], b = src[i + 1], c = src[i + 2], d = src[i + 3];
+        bad |= a | b | c | d;
+        dst[i] = (char)(unsigned char)a; dst[i + 1] = (char)(unsigned char)b;
+        dst[i + 2] = (char)(unsigned char)c; dst[i + 3] = (char)(unsigned char)d;
+    }
+#endif
+    for (; i < n; i++) {
+        uint64_t v = src[i];
+        bad |= v;
+        dst[i] = (char)(unsigned char)v;
+    }
+    return bad;
+}
+
+static void widen_bytes(uint64_t *dst, const char *src, uint64_t n) {
+    uint64_t i = 0;
+#if defined(__SSE2__)
+    const __m128i z = _mm_setzero_si128();
+    for (; i + 16 <= n; i += 16) {
+        __m128i b = _mm_loadu_si128((const __m128i *)(src + i));
+        __m128i w0 = _mm_unpacklo_epi8(b, z), w1 = _mm_unpackhi_epi8(b, z); /* 8 x u16 each */
+        __m128i d0 = _mm_unpacklo_epi16(w0, z), d1 = _mm_unpackhi_epi16(w0, z), d2 = _mm_unpacklo_epi16(w1, z), d3 = _mm_unpackhi_epi16(w1, z);
+        __m128i *p = (__m128i *)(dst + i);
+        _mm_storeu_si128(p, _mm_unpacklo_epi32(d0, z));
+        _mm_storeu_si128(p + 1, _mm_unpackhi_epi32(d0, z));
+        _mm_storeu_si128(p + 2, _mm_unpacklo_epi32(d1, z));
+        _mm_storeu_si128(p + 3, _mm_unpackhi_epi32(d1, z));
+        _mm_storeu_si128(p + 4, _mm_unpacklo_epi32(d2, z));
+        _mm_storeu_si128(p + 5, _mm_unpackhi_epi32(d2, z));
+        _mm_storeu_si128(p + 6, _mm_unpacklo_epi32(d3, z));
+        _mm_storeu_si128(p + 7, _mm_unpackhi_epi32(d3, z));
+    }
+#else
+    for (; i + 4 <= n; i += 4) {
+        dst[i] = (unsigned char)src[i]; dst[i + 1] = (unsigned char)src[i + 1];
+        dst[i + 2] = (unsigned char)src[i + 2]; dst[i + 3] = (unsigned char)src[i + 3];
+    }
+#endif
+    for (; i < n; i++) dst[i] = (unsigned char)src[i];
+}
+
 OrinObj *orin_bytes_to_string(OrinObj *o, uint64_t start, uint64_t len) {
     OrinArray *a = (OrinArray *)o;
     if (ORIN_UNLIKELY(o->kind != ORIN_K_ARRAY || a->is_ref)) orin_trap_shape();
     if (ORIN_UNLIKELY(start > a->len || len > a->len - start)) orin_trap("slice out of range");
     OrinString *s = str_alloc(len, len);
-    uint64_t bad = 0;
-    for (uint64_t i = 0; i < len; i++) {
-        /* Empty arrays may have NULL items; only form an element address when len > 0. */
-        uint64_t v = a->items[start + i];
-        bad |= v;
-        s->data[i] = (char)(unsigned char)v;
-    }
+    /* Empty arrays may have NULL items; only form an element address when len > 0. */
+    uint64_t bad = len ? narrow_slots(s->data, a->items + start, len) : 0;
     if (ORIN_UNLIKELY(bad > 255)) {
         orin_release(&s->h);
         orin_trap("byte out of range");
@@ -1320,7 +1384,7 @@ OrinObj *orin_string_to_bytes(OrinObj *o) {
     const OrinString *s = (const OrinString *)o;
     OrinObj *r = orin_array_new(s->len, 0);
     OrinArray *a = (OrinArray *)r;
-    for (uint64_t i = 0; i < s->len; i++) a->items[i] = (unsigned char)s->data[i];
+    if (s->len) widen_bytes(a->items, s->data, s->len);
     a->len = s->len;
     return r;
 }
