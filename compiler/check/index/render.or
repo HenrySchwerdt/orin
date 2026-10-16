@@ -1,0 +1,172 @@
+// Source and type rendering for hover texts and `detail` strings.
+// Part of the semantic index (check/index/build.or).
+
+import { SourceMap } from "../../diag";
+import { Ident, FunctionDecl, ConstDecl, TypeExpr, Param, ContractClause } from "../../syntax";
+import { Type, Program, kindName, grantTypeName } from "../../hir";
+
+// ---- rendering --------------------------------------------------------------------------------
+
+export function renderTE(t: TypeExpr): string {
+  return match (t.kind) {
+    TNamed(id, args) => {
+      if (args.length == 0) {
+        return id.name;
+      }
+      let parts: string[] = [];
+      for (const a of args) {
+        parts.push(renderTE(a));
+      }
+      return id.name + "<" + parts.join(", ") + ">";
+    },
+    TArray(e) => {
+      const inner = renderTE(e);
+      return match (e.kind) {
+        TFn(_, _) => "(" + inner + ")[]",
+        _ => inner + "[]"
+      };
+    },
+    TFn(ps, ret) => {
+      let parts: string[] = [];
+      for (const p of ps) {
+        parts.push(p.name.name + ": " + renderTE(p.ty));
+      }
+      return "(" + parts.join(", ") + ") => " + renderTE(ret);
+    }
+  };
+}
+
+// `<T extends Shape, U>`: type parameters with their bounds (generic classes, ADR-0026).
+export function tpListB(ps: Ident[], bounds: Option<Ident>[]): string {
+  if (ps.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  let i: usize = 0;
+  while (i < ps.length) {
+    let t = ps[i].name;
+    if (i < bounds.length && bounds[i].isSome()) {
+      t += " extends " + bounds[i].unwrap().name;
+    }
+    parts.push(t);
+    i += 1;
+  }
+  return "<" + parts.join(", ") + ">";
+}
+
+export function tpList(ps: Ident[]): string {
+  if (ps.length == 0) {
+    return "";
+  }
+  let parts: string[] = [];
+  for (const p of ps) {
+    parts.push(p.name);
+  }
+  return "<" + parts.join(", ") + ">";
+}
+
+// Contract clauses (ADR-0012) as written in the source, one per line, for hover texts.
+export function contractText(sm: SourceMap, cs: ContractClause[]): string {
+  let out = "";
+  for (const k of cs) {
+    const f = sm.files[k.span.file];
+    out += "\n" + f.text.substring(k.span.start, k.span.end).split("\n").join(" ");
+  }
+  return out;
+}
+
+export function funcDetail(f: FunctionDecl, sm: SourceMap): string {
+  let ps: string[] = [];
+  for (const p of f.params) {
+    ps.push(p.name.name + ": " + renderTE(p.ty));
+  }
+  let s = "function " + f.name.name + tpList(f.typeParams) + "(" + ps.join(", ") + ")";
+  match (f.ret) {
+    Some(t) => { s += ": " + renderTE(t); },
+    None => {}
+  }
+  return s + contractText(sm, f.contracts);
+}
+
+// "users/user.User<int,string>" -> "User<int,string>"
+function shortName(q: string): string {
+  let end = q.length;
+  const lt = q.indexOf("<");
+  if (lt.isSome()) {
+    end = lt.unwrap();
+  }
+  let start: usize = 0;
+  let i: usize = 0;
+  while (i < end) {
+    if (q.charCodeAt(i) == 46) {
+      start = i + 1;
+    }
+    i += 1;
+  }
+  return q.substring(start, q.length);
+}
+
+export function renderTy(p: Program, t: Type): string {
+  return match (t) {
+    TyInt => "int",
+    TyUsize => "usize",
+    TyIntK(k) => kindName(k.toInt()),
+    TyBool => "bool",
+    TyFloat => "float",
+    TyF32 => "f32",
+    TyString => "string",
+    TyVoid => "void",
+    TyArray(e) => renderTy(p, e) + "[]",
+    TyOption(e) => "Option<" + renderTy(p, e) + ">",
+    TyResult(a, b) => "Result<" + renderTy(p, a) + ", " + renderTy(p, b) + ">",
+    TyRecord(r) => r < p.records.length ? shortName(p.records[r].name) : "?",
+    TyUnion(u) => u < p.unions.length ? shortName(p.unions[u].name) : "?",
+    TyFn(ps, r) => {
+      let parts: string[] = [];
+      for (const t of ps) {
+        parts.push(renderTy(p, t));
+      }
+      return "(" + parts.join(", ") + ") => " + renderTy(p, r);
+    },
+    TyIface(i) => i < p.ifaces.length ? shortName(p.ifaces[i].name) : "?",
+    TyFile => "File",
+    TyGrant(k) => grantTypeName(k)
+  };
+}
+
+export function constDetail(k: ConstDecl): string {
+  let ty = "";
+  match (k.ty) {
+    Some(t) => { ty = renderTE(t); },
+    None => {
+      ty = match (k.value.kind) {
+        EInt(_) => "int",
+        EBigInt(_) => "u64",
+        EFloat(_) => "float",
+        EStr(_) => "string",
+        EBool(_) => "bool",
+        _ => ""
+      };
+    }
+  }
+  return ty.length > 0 ? "const " + k.name.name + ": " + ty : "const " + k.name.name;
+}
+
+export function paramsText(ps: Param[]): string {
+  let parts: string[] = [];
+  for (const p of ps) {
+    parts.push(p.name.name + ": " + renderTE(p.ty));
+  }
+  return parts.join(", ");
+}
+
+export function variantText(name: string, payload: TypeExpr[]): string {
+  if (payload.length == 0) {
+    return name;
+  }
+  let parts: string[] = [];
+  for (const t of payload) {
+    parts.push(renderTE(t));
+  }
+  return name + "(" + parts.join(", ") + ")";
+}
