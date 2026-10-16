@@ -206,20 +206,19 @@ shared block through the offsets of R3d.1. The porting table of ADR-0017 Addendu
 
 | offset | size | field (`OrinHeap`) | was | note |
 |---:|---:|---|---|---|
-| 0 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` 0, `alloc_array` 8, `alloc_struct` 16, `frees` 24, `retains` 32, `releases` 40, `cow_copies` 48, `cow_inplace` 56, `array_grows` 64, `string_grows` 72, `peak_live_objs` 80, `peak_live_bytes` 88, `live_bytes` 96, `file_opens` 104, `file_closes` 112, `transfer_moves` 120, `transfer_copies` 128, `tasks_spawned` 136 |
-| 144 | 8 | `live` (i64) | `g_live` | signed: a task can free more than it allocated |
-| 152 | 8 | `dstack` (`OrinObj **`) | `t_dstack` | work stack of `orin_destroy`, NULL until first use |
-| 160 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
-| 168 | 8 | reserved | | |
-| 176 | 72 | `fl_struct[9]` | `fl_struct` | free struct objects by `nslots` 0..8 (next pointer in word 0) |
-| 248 | 8 | `fl_array` | `fl_array` | free array headers |
-| 256 | 40 | `fl_n[10]` (u32) | `fl_n` | list lengths, `[9]` the array headers; cap `FL_CAP` = 2^18 |
-| 296 | 8 | pad | | |
-| 304 | 136 | `sb_list[17]` | `sb_list` | small-block cache by 16-byte class 0..16 (`SB_MAX` 256) |
-| 440 | 64 | reserved | | task pointer, grant and file tables (R3e) |
+| 0 | 72 | `fl_struct[9]` | `fl_struct` | free struct objects by `nslots` 0..8 (next pointer in word 0) |
+| 72 | 8 | `fl_array` | `fl_array` | free array headers |
+| 80 | 80 | `fl_n[10]` (u64) | `fl_n` (u32) | list lengths, `[9]` the array headers; cap `FL_CAP` = 2^18 |
+| 160 | 8 | `live` (i64) | `g_live` | signed: a task can free more than it allocated |
+| 168 | 8 | `dstack` (`OrinObj **`) | `t_dstack` | work stack of `orin_destroy`, NULL until first use |
+| 176 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
+| 184 | 8 | reserved | | |
+| 192 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` +0, `alloc_array` +8, `alloc_struct` +16, `frees` +24, `retains` +32, `releases` +40, `cow_copies` +48, `cow_inplace` +56, `array_grows` +64, `string_grows` +72, `peak_live_objs` +80, `peak_live_bytes` +88, `live_bytes` +96, `file_opens` +104, `file_closes` +112, `transfer_moves` +120, `transfer_copies` +128, `tasks_spawned` +136 |
+| 336 | 136 | `sb_list[17]` | `sb_list` | small-block cache by 16-byte class 0..16 (`SB_MAX` 256) |
+| 472 | 32 | reserved | | task pointer, grant and file tables (R3e) |
 | 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
-| 512 | 68 | `sb_cnt[17]` (u32) | `sb_cnt` | cache sizes, cap `SB_CAP` = 2^15 |
-| 584 | 440 | reserved | | up to 1024 bytes (128 words) |
+| 512 | 136 | `sb_cnt[17]` (u64) | `sb_cnt` (u32) | cache sizes, cap `SB_CAP` = 2^15 |
+| 648 | 376 | reserved | | up to 1024 bytes (128 words) |
 
 **Not moved (they stay `static __thread` in C until R3e):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
 Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
