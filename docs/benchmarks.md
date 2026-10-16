@@ -604,7 +604,7 @@ are initialised and no reference is null; `nounwind` was already on every functi
 added: the MIR has no purity or termination information, and a function with checked arithmetic or a bounds check can trap (call
 `orin_trap`, which writes and exits), so `memory(none)` would let LLVM delete a trap whose result is unused. Measured effect on the LLVM
 column: none distinguishable from noise (fib 0.894 s vs 0.787 s in the baseline run, bintrees 1.31 vs 0.85 s, at a load average of 5-16
-against 1-4); `diff_backends.py --mode llvm` and the LLVM suites pass. The C backend has no equivalent attributes that the language
+against 1-4); `tools/differential.sh --mode llvm` and the LLVM suites pass. The C backend has no equivalent attributes that the language
 guarantees (the C compilers already see `static` functions).
 
 ### Backends: ADR-0038 §8 gate 1 (LLVM against C, executed instructions)
@@ -659,7 +659,7 @@ add/jo sequence gcc emits):
    7,437 M to 6,836 M.
 
 Behaviour is unchanged: same checks in the same order, same messages (two moved into the fixed message table: the wrong-shape message and the
-`charCodeAt` message), same exit status 101; `diff_backends.py --mode llvm`, the LLVM suites and the tooling tests pass.
+`charCodeAt` message), same exit status 101; `tools/differential.sh --mode llvm`, the LLVM suites and the tooling tests pass.
 
 **Still above 1.0:** `appends` (+0.9 %) and `bintrees` (+0.5 %). In both, every function the backend generates is at or below the C backend's count; the
 difference is in the C runtime compiled by clang instead of gcc: `orin_destroy` costs clang about 45 % more instructions per call in `appends`

@@ -1,0 +1,109 @@
+import { assertEq, assertEqString, assertEqBool, assertEqUsize } from "std:test";
+import { Options, defaultOptions } from "../src/cli";
+import { Side, Program, modeFlags, pipeline, ccBase, runtimeSources, compilerPath, describe, verdict, needsCompare } from "../src/suite";
+import { modeArgs, reprArgs, compilerCommand, errHead } from "../src/compilers";
+
+function ok(rc: int, out: string): Side {
+  return Side { kind: "ok", rc: rc, detail: "", out: out };
+}
+
+function longText(c: string): string {
+  let s = "";
+  while (s.length < 1000) {
+    s += c;
+  }
+  return s;
+}
+
+function failure(kind: string, detail: string): Side {
+  return Side { kind: kind, rc: 1, detail: detail, out: "" };
+}
+
+@Test
+function flagsOfTheAlternativeSide(): void {
+  assertEqString(modeFlags("opt").join(" "), "--no-opt", "opt");
+  assertEqString(modeFlags("llvm").join(" "), "--backend=llvm", "llvm");
+  assertEqString(modeFlags("builtins").join(" "), "--c-builtins", "builtins");
+  assertEqString(modeFlags("fuse").join(" "), "--no-fuse", "fuse");
+}
+
+@Test
+function compilerNaming(): void {
+  assertEqString(compilerPath("build/bootstrap/orin2"), "./build/bootstrap/orin2", "relative");
+  assertEqString(compilerPath("/opt/orin"), "/opt/orin", "absolute");
+  assertEqString(compilerCommand("orin"), "orin", "bare name is looked up in PATH");
+  assertEqString(compilerCommand("b/orin"), "./b/orin", "relative path");
+}
+
+@Test
+function cCompilerCommand(): void {
+  const o = defaultOptions();
+  assertEqString(ccBase(o, false).join(" "), "cc -O1 -w -I runtime/core", "c backend");
+  assertEqString(ccBase(o, true).join(" "), "clang -O2 -w -I runtime/core", "llvm");
+  const s = parseSanitize();
+  assertEqString(ccBase(s, false).join(" "), "cc -O1 -w -I runtime/core -fsanitize=address,undefined -fno-omit-frame-pointer", "sanitize");
+  assertEqUsize(runtimeSources(false).length, 2, "c runtime");
+  assertEqUsize(runtimeSources(true).length, 3, "llvm shim");
+}
+
+function parseSanitize(): Options {
+  return Options { ...defaultOptions(), sanitize: true };
+}
+
+@Test
+function pipelineFilesAndCommands(): void {
+  const p = Program { name: "next_x", entry: "tests/next/run/x.or" };
+  const pipe = pipeline(defaultOptions(), p, "old", ["--backend=llvm"], true);
+  assertEqString(pipe.cFile, "build/diff/next_x.old.ll", "ll file");
+  assertEqString(pipe.exe, "build/diff/next_x.old.exe", "exe");
+  assertEqUsize(pipe.cmds.length, 3, "three steps");
+  assertEq(pipe.timeouts[0], 120, "compile timeout");
+  assertEq(pipe.timeouts[2], 10, "run timeout");
+  assertEqString(pipe.cmds[0], "cd '.' && './build/bootstrap/orin2' 'compile' 'tests/next/run/x.or' '-o' 'build/diff/next_x.old.ll' '--backend=llvm' >/dev/null 2>'build/diff/next_x.old.cerr' </dev/null", "compile");
+  assertEqBool(pipe.cmds[1].includes("'clang' '-O2'"), true, "clang for llvm");
+  assertEqBool(pipe.cmds[1].includes("'runtime/core/orin_runtime_llvm.c'"), true, "llvm shim linked");
+  assertEqString(pipe.cmds[2], "cd '.' && './build/diff/next_x.old.exe' >'build/diff/next_x.old.rout' 2>/dev/null </dev/null", "run");
+}
+
+@Test
+function describesLikePythonTuples(): void {
+  assertEqString(describe(ok(0, "hi\n")), "('ok', (0, b'hi\\n'))", "ok");
+  assertEqString(describe(ok(-2, "")), "('ok', (None, b''))", "timeout");
+  assertEqString(describe(failure("compile-fail", "boom")), "('compile-fail', 'boom')", "compile-fail");
+  assertEqString(describe(failure("cc-fail", "it's")), "('cc-fail', \"it's\")", "cc-fail");
+  assertEqUsize(describe(ok(0, longText("x"))).length, 300, "cut at 300");
+}
+
+@Test
+function verdicts(): void {
+  assertEqString(verdict(ok(0, "a"), ok(0, "a"), true), "same", "same");
+  assertEqString(verdict(ok(0, "a"), ok(0, "b"), false), "diff", "stdout differs");
+  assertEqString(verdict(ok(0, "a"), ok(1, "a"), true), "diff", "exit differs");
+  assertEqString(verdict(ok(-2, ""), ok(-2, ""), false), "same", "both time out");
+  assertEqString(verdict(ok(-2, ""), ok(0, "a"), false), "skip", "one side times out");
+  assertEqString(verdict(ok(0, "a"), ok(-2, ""), false), "skip", "other side times out");
+  const f = failure("compile-fail", "e");
+  assertEqString(verdict(f, f, true), "same", "same failure");
+  assertEqString(verdict(f, failure("compile-fail", "f"), true), "diff", "other message");
+  assertEqString(verdict(f, ok(0, ""), true), "diff", "failure vs ok");
+  assertEqString(verdict(failure("cc-fail", "e"), f, true), "diff", "other step");
+}
+
+@Test
+function stdoutIsOnlyComparedWhenBothFinished(): void {
+  assertEqBool(needsCompare(ok(0, ""), ok(0, "")), true, "both ok");
+  assertEqBool(needsCompare(ok(0, ""), ok(1, "")), false, "different status");
+  assertEqBool(needsCompare(ok(-2, ""), ok(-2, "")), false, "timeouts");
+  assertEqBool(needsCompare(failure("compile-fail", ""), ok(0, "")), false, "failure");
+}
+
+@Test
+function compilerInvocations(): void {
+  const m = modeArgs("tests/run/a.or");
+  assertEqUsize(m.length, 3, "three modes");
+  assertEqString(reprArgs(m[0]), "['compile', 'tests/run/a.or', '-o', '/dev/null']", "compile");
+  assertEqString(reprArgs(m[1]), "['check', 'tests/run/a.or']", "check");
+  assertEqString(reprArgs(m[2]), "['check', '--format=json', 'tests/run/a.or']", "json");
+  assertEqString(errHead("E0001: x\n"), "b'E0001: x\\n'", "stderr head");
+  assertEqUsize(errHead(longText("y")).length, 300 + 3, "cut at 300 bytes plus b'' ");
+}

@@ -102,6 +102,8 @@ def selftest():
         (["compiler/lower/ops.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tests/std/http_prop_test.or"], {"code": True, "macos": False, "vscode": False, "mutants": ["http"]}),
         (["tools/mutate_std.py"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
+        (["tooling/differential/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tools/differential.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
         (["runtime/platform/orin_platform.c", "library/std/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
     ]

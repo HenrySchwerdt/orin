@@ -22,7 +22,7 @@ The compiler should read like the Orin we want users to write, and it should use
 3. HIR traversals use one generic fold (`foldExpr<S>(e, s, f)` plus `mapExpr`), with state threaded explicitly because closures cannot mutate captures.
 4. Interfaces only where there are really two implementations and never on hot paths (interfaces are boxed; `docs/rewrite.md` records the cost). Hot per-instruction loops stay loops (rewrite rule 7).
 5. Not cleanup targets: the packed verifier state, the struct-of-arrays tables in `opt/unbox.or` and `verify/verify.or`, and sorts or predicates that carry proved contracts unless the contract moves to a wrapper.
-6. Every cleanup PR is behaviour-neutral and proves it: bootstrap fixed point, LLVM fixed point, a zero diff of the generated C of `compiler/main.or` and the test corpus between the pre-PR and post-PR compiler (`tools/diff_compilers.py`), the LSP/MCP/OSIG/fmt/CLI suites, and `tools/test_compiler_contracts.sh` where contracts change. A cleanup PR never touches the library (`std/`, `stdlib/`, `array/`, later `library/`), because the embedded prelude is generated from it; library changes follow ADR-0048.
+6. Every cleanup PR is behaviour-neutral and proves it: bootstrap fixed point, LLVM fixed point, a zero diff of the generated C of `compiler/main.or` and the test corpus between the pre-PR and post-PR compiler (`tools/differential.sh compilers`), the LSP/MCP/OSIG/fmt/CLI suites, and `tools/test_compiler_contracts.sh` where contracts change. A cleanup PR never touches the library (`std/`, `stdlib/`, `array/`, later `library/`), because the embedded prelude is generated from it; library changes follow ADR-0048.
 
 ### 2. Parallel compilation
 
