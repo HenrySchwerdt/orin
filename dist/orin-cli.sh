@@ -69,22 +69,157 @@ need_project() {
   done
 }
 info() { "$BIN" __package info "$1" "$2"; }
+find_workspace_root() { # sets workspace_root to the nearest ancestor holding orin-workspace.toml, or returns 1
+  workspace_root=$(pwd -P)
+  while [ ! -f "$workspace_root/orin-workspace.toml" ]; do
+    [ "$workspace_root" != / ] || return 1
+    workspace_root=${workspace_root%/*}; [ -n "$workspace_root" ] || workspace_root=/
+  done
+}
 workspace_command() {
-  [ $# -ge 1 ] || fail 'Usage: orin workspace list|lock|check [--root <directory>]' 2
-  local sub=$1 root=$PWD; shift
-  case $sub in list|lock|check) ;; *) fail 'Usage: orin workspace list|lock|check [--root <directory>]' 2;; esac
+  local usage='Usage: orin workspace list [--default]|lock|check [--root <directory>]'
+  [ $# -ge 1 ] || fail "$usage" 2
+  local sub=$1 root=$PWD extra=(); shift
+  case $sub in list|lock|check) ;; *) fail "$usage" 2;; esac
+  if [ "$sub" = list ] && [ $# -gt 0 ] && [ "$1" = --default ]; then extra=(--default); shift; fi
   if [ $# -gt 0 ]; then
-    [ $# -eq 2 ] && [ "$1" = --root ] && [ -n "$2" ] || fail 'Usage: orin workspace list|lock|check [--root <directory>]' 2
+    [ $# -eq 2 ] && [ "$1" = --root ] && [ -n "$2" ] || fail "$usage" 2
     case $2 in --*) fail 'Missing workspace root directory.' 2;; esac
     root=$(cd -- "$2" 2>/dev/null && pwd -P) || fail 'Workspace root is not an accessible directory.'
   else
-    root=$(pwd -P)
-    while [ ! -f "$root/orin-workspace.toml" ]; do
-      [ "$root" != / ] || fail 'No orin-workspace.toml found in this directory or its ancestors.'
-      root=${root%/*}; [ -n "$root" ] || root=/
+    find_workspace_root || fail 'No orin-workspace.toml found in this directory or its ancestors.'
+    root=$workspace_root
+  fi
+  compiler workspace "$sub" "${extra[@]}" --root "$root"
+}
+
+# Workspace-wide build/check/test/fmt (ADR-0047 phase 2). The member list, order, and every manifest/lock diagnostic
+# come from the compiler (`workspace list|check`); this driver only selects members and runs the ordinary
+# single-project command in each member directory, so a member behaves exactly like a standalone project.
+workspace_wants() { # workspace_wants <args...>: true when the arguments select workspace mode explicitly
+  local a
+  for a in "$@"; do
+    case $a in --) return 1;; --workspace|-p|--package|--package=*) return 0;; esac
+  done
+  return 1
+}
+workspace_has_path() { # true when the arguments contain an explicit path target (a non-option word)
+  local a skip=false
+  for a in "$@"; do
+    if $skip; then skip=false; continue; fi
+    case $a in
+      --) return 1 ;;
+      --filter|--timeout|--out-dir|--runtime|--cc|-o|--backend|--z3|--module|--function) skip=true ;;
+      -*) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+workspace_run() { # workspace_run <command> <args...>
+  local cmd=$1; shift
+  local select_all=false packages=() locked=false unlocked=false keep=default rest=() a
+  case ${CI:-} in ''|0|false|FALSE|False) ;; *) locked=true;; esac
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --) rest+=("$@"); break ;;
+      --workspace) select_all=true ;;
+      -p|--package) [ $# -ge 2 ] && [ -n "$2" ] || fail "Missing package name for $1." 2; packages+=("$2"); shift ;;
+      --package=*) [ -n "${1#*=}" ] || fail 'Missing package name for --package.' 2; packages+=("${1#*=}") ;;
+      --locked) locked=true ;;
+      --unlocked) unlocked=true; locked=false ;;
+      --keep-going) keep=yes ;;
+      --fail-fast) keep=no ;;
+      *) rest+=("$1") ;;
+    esac; shift
+  done
+  $json && fail "--format=json is not supported for workspace-wide $cmd." 2
+  for a in ${rest[@]+"${rest[@]}"}; do [ "$a" != -- ] || break; [ "$a" != --watch ] || fail 'test --watch is not supported for a workspace; run it inside one member.' 2; done
+  $select_all && [ ${#packages[@]} -gt 0 ] && fail '--workspace and --package cannot be combined.' 2
+  workspace_has_path ${rest[@]+"${rest[@]}"} && fail "Workspace-wide $cmd takes no path; use -p <name> or run it inside a member directory." 2
+  find_workspace_root || fail 'No orin-workspace.toml found in this directory or its ancestors.'
+  local root=$workspace_root
+  # Validates the manifest and the member graph; every error carries a span. E0509 on lock drift when locked.
+  if $locked; then
+    compiler workspace check --root "$root" || exit 1
+  fi
+  local listing line name dir members=() dirs=() all_names=() i
+  if $select_all || [ ${#packages[@]} -gt 0 ]; then listing=$(compiler workspace list --root "$root") || exit 1
+  else listing=$(compiler workspace list --default --root "$root") || exit 1; fi
+  local full; full=$(compiler workspace list --root "$root") || exit 1
+  while IFS= read -r line; do [ -n "$line" ] || continue; all_names+=("${line%%  *}"); done <<< "$full"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    members+=("${line%%  *}"); dirs+=("${line#*  }")
+  done <<< "$listing"
+  if [ ${#packages[@]} -gt 0 ]; then
+    local picked_m=() picked_d=() want found
+    for want in "${packages[@]}"; do
+      found=false
+      i=0; while [ $i -lt ${#members[@]} ]; do
+        if [ "${members[$i]}" = "$want" ]; then found=true; picked_m+=("$want"); picked_d+=("${dirs[$i]}"); fi
+        i=$((i + 1))
+      done
+      $found || fail "No workspace member named '$want'. Members: ${all_names[*]}" 2
+    done
+    # Keep dependency order whatever the order of -p flags.
+    members=() dirs=()
+    i=0; while [ $i -lt ${#all_names[@]} ]; do
+      local j=0
+      while [ $j -lt ${#picked_m[@]} ]; do
+        if [ "${picked_m[$j]}" = "${all_names[$i]}" ]; then members+=("${picked_m[$j]}"); dirs+=("${picked_d[$j]}"); picked_m[$j]=''; fi
+        j=$((j + 1))
+      done
+      i=$((i + 1))
     done
   fi
-  compiler workspace "$sub" --root "$root"
+  [ ${#members[@]} -gt 0 ] || fail 'The workspace selection is empty.'
+  # build and check stop at the first failing member (later members may depend on it); test and fmt report every member.
+  local inherit=("--color=$color") failed=() status_code=0 rc total=${#members[@]} ran=0 filter=false extra=()
+  $quiet && inherit+=(--quiet); $verbose && inherit+=(--verbose); $ascii && inherit+=(--ascii)
+  # An application without tests is normal in a workspace, so test passes --allow-empty to each member. With
+  # --filter a member may legitimately match nothing; only a filter that matches in no member is an error.
+  if [ "$cmd" = test ]; then
+    for a in ${rest[@]+"${rest[@]}"}; do [ "$a" != -- ] || break; [ "$a" != --filter ] || filter=true; done
+    $filter || extra=(--allow-empty)
+  fi
+  local keep_going=false
+  case $keep in yes) keep_going=true;; no) ;; *) case $cmd in test|fmt) keep_going=true;; esac;; esac
+  i=0
+  while [ $i -lt $total ]; do
+    $quiet || { paint 36 "$mark_arrow"; printf ' %s %s (%d/%d)\n' "$cmd" "${members[$i]}" $((i + 1)) "$total" | safe; } >&2
+    rc=0
+    # A library (entry without `function main(`) has no executable: `build` type-checks it instead.
+    local member_cmd=$cmd entry
+    if [ "$cmd" = build ]; then
+      entry=$(info entry "$root/${dirs[$i]}") || exit 1
+      grep -q 'function main(' "$root/${dirs[$i]}/$entry" 2>/dev/null || { member_cmd=check; $quiet || printf '  %s is a library: checking instead of building\n' "${members[$i]}" | safe >&2; }
+    fi
+    if $filter; then
+      local errfile; errfile=$(mktemp); cleanup_files+=("$errfile")
+      (cd -- "$root/${dirs[$i]}" && ORIN_PACKAGE_ROOT=$HERE exec bash "$HERE/bin/orin-cli.sh" "${inherit[@]}" "$member_cmd" ${rest[@]+"${rest[@]}"} 2> "$errfile") || rc=$?
+      if [ $rc -ne 0 ] && grep -q 'No tests matched' "$errfile"; then rc=0; $quiet || printf '  no tests matched in %s\n' "${members[$i]}" >&2
+      else ran=$((ran + 1)); cat "$errfile" >&2; fi
+    else
+      ran=$((ran + 1))
+      (cd -- "$root/${dirs[$i]}" && ORIN_PACKAGE_ROOT=$HERE exec bash "$HERE/bin/orin-cli.sh" "${inherit[@]}" "$member_cmd" ${extra[@]+"${extra[@]}"} ${rest[@]+"${rest[@]}"}) || rc=$?
+    fi
+    if [ $rc -ne 0 ]; then
+      failed+=("${members[$i]}")
+      [ $status_code -ne 0 ] || status_code=$rc
+      if ! $keep_going; then
+        printf 'error: %s failed in workspace member %s (exit %d); not running the remaining %d member(s). Use --keep-going to continue.\n' "$cmd" "${members[$i]}" "$rc" $((total - i - 1)) | safe >&2
+        exit "$rc"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  if [ ${#failed[@]} -gt 0 ]; then
+    printf 'error: %s failed in %d of %d workspace member(s): %s\n' "$cmd" ${#failed[@]} "$total" "${failed[*]}" | safe >&2
+    exit 1
+  fi
+  [ "$ran" -gt 0 ] || fail 'No tests matched in any workspace member.'
+  status "Workspace $cmd: $total member(s) ok"
 }
 
 valid_name() { case $1 in ''|-*|*[!a-zA-Z0-9_-]*) return 1 ;; esac; }
@@ -116,7 +251,7 @@ Manage
   doctor               Check your installation
 
 Inspect and integrate
-  workspace list|lock|check  Inspect the nearest workspace
+  workspace list|lock|check  Inspect the nearest workspace (build|check|test|fmt accept --workspace, -p <name>, --locked)
   explain <code>       Explain a diagnostic
   api, effects, graph, diff, verify, compile, mir, lsp, mcp
 
@@ -566,6 +701,12 @@ case $command in
   lsp|mcp) exec "$BIN" "$command" "${args[@]}" ;;
   *)
     for arg in "${args[@]}"; do if [ "$arg" = --help ] || [ "$arg" = -h ]; then help_command "$command"; exit 0; fi; done
+    case $command in build|check|test|fmt)
+      # Workspace mode: explicit flags, or no path at a workspace root. Anything else is the unchanged single-project path.
+      if workspace_wants "${args[@]}" || { [ -f "$PWD/orin-workspace.toml" ] && ! workspace_has_path "${args[@]}"; }; then
+        workspace_run "$command" "${args[@]}"; exit $?
+      fi ;;
+    esac
     case $command in
       workspace) workspace_command "${args[@]}" ;;
       init) init_project "${args[@]}" ;;
