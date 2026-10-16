@@ -1,0 +1,301 @@
+// Processors (ADR-0046 §2, slice S5): finding the `@Processor(A)` functions of a program, the placement and signature rules
+// (E0448) and the purity rule (E0448 with the explanation of check/purity.or), and the trust policy for processors that
+// come from dependencies (`[annotations] processors` in orin.toml).
+//
+// The parser reads `@Processor(A)` as a user annotation named `Processor` with one argument (`ACustom`); the checker's
+// resolution of user annotations (check/userannos.or) skips that name, so everything that is specific to processors is
+// here and nothing in the parser changes.
+//
+// A processor is an exported top-level function `(input: Input): Output` (both from `std:meta`) in the module that declares
+// the annotation `A`; there is at most one per annotation. It and everything it calls must be pure in the sense of the
+// contract checker. The purity analysis counts every I/O built-in and every use of a grant as impure, and the signature gives
+// the function no grant to use, so a processor has no way to perform I/O: that, and not a sandbox, is the safety argument.
+
+import { Span, SourceMap, Diagnostic, diag } from "../diag";
+import { Ident, Annotation, FunctionDecl, TypeDecl, TypeExpr } from "../syntax";
+import { LoadedProgram, isInside, joinPath, dirname, relativeTo } from "../loader";
+import { Function } from "../hir";
+import { inferPurity, explain } from "../check";
+import { isUserUnit, lookupDecl, ownAnnotations, memberAnnotations } from "../meta";
+
+export const E_PROCESSOR_DECL: string = "E0448";
+export const W_NOT_TRUSTED: string = "W0492";
+
+// One `@Processor(A)` function: its unit, name, the annotation it serves (declared in the same unit) and where it is.
+export type Processor = { unit: usize; name: string; anno: string; use: Span; nameSpan: Span; };
+
+export type ProcScan = { procs: Processor[]; diags: Diagnostic[]; };
+
+function isProcessorUse(a: Annotation): bool {
+  return match (a.kind) {
+    ACustom(id, _) => id.name == "Processor",
+    _ => false,
+  };
+}
+
+// True when `t` is a record type marked `@Annotation(..)`.
+function isAnnotationDef(t: TypeDecl): bool {
+  for (const a of t.annotations) {
+    const d = match (a.kind) {
+      AAnnotation(_) => true,
+      _ => false,
+    };
+    if (d) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Does unit `ui` import `name` from `std:meta`?
+function importsFromMeta(prog: LoadedProgram, ui: usize, name: string): bool {
+  for (const it of prog.units[ui].ast.items) {
+    match (it) {
+      IImport(d) => {
+        if (d.path == "std:meta") {
+          for (const n of d.names) {
+            if (n.name == name) {
+              return true;
+            }
+          }
+        }
+      },
+      _ => {},
+    }
+  }
+  return false;
+}
+
+function namedTypeIs(t: TypeExpr, name: string): bool {
+  return match (t.kind) {
+    TNamed(id, args) => id.name == name && args.length == 0,
+    _ => false,
+  };
+}
+
+// The problem with the signature of `f` ("" when it is `export function f(input: Input): Output` with both from std:meta).
+function signatureProblem(prog: LoadedProgram, ui: usize, f: FunctionDecl): string {
+  if (!f.exported) {
+    return "a processor must be exported";
+  }
+  if (f.typeParams.length > 0) {
+    return "a processor cannot be generic";
+  }
+  if (f.params.length != 1 || !namedTypeIs(f.params[0].ty, "Input") || !importsFromMeta(prog, ui, "Input")) {
+    return "a processor takes exactly one parameter of type `Input` imported from \"std:meta\"";
+  }
+  if (f.ret.isNone() || !namedTypeIs(f.ret.unwrap(), "Output") || !importsFromMeta(prog, ui, "Output")) {
+    return "a processor returns `Output` imported from \"std:meta\"";
+  }
+  if (f.name.name == "main") {
+    return "a processor cannot be called `main`";
+  }
+  return "";
+}
+
+function e448(sp: Span, msg: string): Diagnostic {
+  return diag(E_PROCESSOR_DECL, sp, msg);
+}
+
+// The annotation name `A` of `@Processor(A)`, or the problem.
+function annotationArg(a: Annotation): Result<Ident, string> {
+  match (a.kind) {
+    ACustom(_, args) => {
+      if (args.length != 1) {
+        return Err("`@Processor` takes exactly one argument, the annotation it serves: `@Processor(Json)`");
+      }
+      return match (args[0].kind) {
+        EIdent(id) => Ok(id),
+        _ => Err("the argument of `@Processor` must be the name of an annotation"),
+      };
+    },
+    _ => {
+      return Err("not a processor annotation");
+    },
+  }
+}
+
+// The problem with the processor `f` of unit `ui` serving the annotation named in `a` ("" when there is none).
+function useProblem(prog: LoadedProgram, ui: usize, a: Annotation, name: string, argSpan: Span): Option<Diagnostic> {
+  const r = lookupDecl(prog, ui, name);
+  if (r.isNone()) {
+    return Some(e448(argSpan, "`" + name + "` is not an annotation that is declared or imported here"));
+  }
+  const isDef = match (r.unwrap().item) {
+    IType(t) => isAnnotationDef(t),
+    _ => false,
+  };
+  if (!isDef) {
+    return Some(e448(argSpan, "`" + name + "` is not an `@Annotation` record"));
+  }
+  if (r.unwrap().unit != ui) {
+    return Some(
+      e448(
+        argSpan,
+        "the annotation `" + name + "` is declared in another module; a processor lives in the module that declares its annotation",
+      ),
+    );
+  }
+  return None;
+}
+
+// All processors of the user modules and the E0448 diagnostics of their placement and signature.
+export function findProcessors(prog: LoadedProgram): ProcScan {
+  let procs: Processor[] = [];
+  let diags: Diagnostic[] = [];
+  let ui: usize = 0;
+  while (ui < prog.units.length) {
+    if (isUserUnit(prog, ui)) {
+      for (const it of prog.units[ui].ast.items) {
+        match (it) {
+          IFunction(f) => {
+            for (const a of f.annotations) {
+              if (!isProcessorUse(a)) {
+                continue;
+              }
+              const pre = "invalid processor `" + f.name.name + "`: ";
+              const sig = signatureProblem(prog, ui, f);
+              if (sig != "") {
+                diags.push(e448(a.span, pre + sig));
+                continue;
+              }
+              const arg = annotationArg(a);
+              if (arg.isErr()) {
+                diags.push(e448(a.span, pre + arg.unwrapErr()));
+                continue;
+              }
+              const name = arg.unwrap().name;
+              const bad = useProblem(prog, ui, a, name, arg.unwrap().span);
+              if (bad.isSome()) {
+                let d = bad.unwrap();
+                d.message = pre + d.message;
+                diags.push(d);
+                continue;
+              }
+              let dup = false;
+              for (const p of procs) {
+                if (p.unit == ui && p.anno == name) {
+                  dup = true;
+                  diags.push(
+                    e448(a.span, "annotation `" + name + "` already has the processor `" + p.name + "`; there is one processor per annotation"),
+                  );
+                }
+              }
+              if (!dup) {
+                procs.push(Processor { unit: ui, name: f.name.name, anno: name, use: a.span, nameSpan: f.name.span });
+              }
+            }
+          },
+          _ => {
+            for (const a of ownAnnotations(it).concat(memberAnnotations(it))) {
+              if (isProcessorUse(a)) {
+                diags.push(e448(a.span, "`@Processor` applies to an exported top-level function only"));
+              }
+            }
+          },
+        }
+      }
+    }
+    ui += 1;
+  }
+  return ProcScan { procs: procs, diags: diags };
+}
+
+// The index of the processor's function in the function table (check/collect.or names a function `<unit name>.<name>`).
+function hirIndex(prog: LoadedProgram, funcs: Function[], p: Processor): Option<usize> {
+  const want = prog.units[p.unit].name + "." + p.name;
+  let k: usize = 0;
+  while (k < funcs.length) {
+    if (funcs[k].name == want) {
+      return Some(k);
+    }
+    k += 1;
+  }
+  return None;
+}
+
+// E0448 for every processor that is not pure: `funcs` is the function table of the checked program.
+export function purityProblems(prog: LoadedProgram, sm: SourceMap, funcs: Function[], procs: Processor[]): Diagnostic[] {
+  let out: Diagnostic[] = [];
+  for (const p of procs) {
+    const k = hirIndex(prog, funcs, p);
+    if (k.isNone()) {
+      out.push(e448(p.nameSpan, "cannot verify that the processor `" + p.name + "` is pure: it is not part of the checked program"));
+      continue;
+    }
+    const pur = inferPurity(funcs, [k.unwrap()]);
+    if (pur.impure[k.unwrap()]) {
+      let d = e448(p.nameSpan, "the processor `" + p.name + "` is not pure: " + explain(sm, funcs, pur, k.unwrap()));
+      d.notes.push("a processor and everything it calls must be pure and effect-free (ADR-0046 §2): it runs in a helper process and has no way to do I/O");
+      out.push(d);
+    }
+  }
+  return out;
+}
+
+// The diagnostics of all processors of the program: placement and signature first, then purity (only when those are fine).
+export function processorDiags(prog: LoadedProgram, sm: SourceMap, funcs: Function[]): Diagnostic[] {
+  const s = findProcessors(prog);
+  if (s.diags.length > 0) {
+    return s.diags;
+  }
+  return purityProblems(prog, sm, funcs, s.procs);
+}
+
+// The processor for annotation `anno` declared in unit `annoUnit`.
+export function processorFor(procs: Processor[], annoUnit: usize, anno: string): Option<Processor> {
+  for (const p of procs) {
+    if (p.unit == annoUnit && p.anno == anno) {
+      return Some(p);
+    }
+  }
+  return None;
+}
+
+// ---- trust policy ---------------------------------------------------------------------------------------------------
+
+// The directory of the package of the program (where orin.toml is), "" without a manifest.
+export function packageRoot(prog: LoadedProgram): string {
+  if (prog.manifest.isNone()) {
+    return "";
+  }
+  return dirname(prog.manifest.unwrap().source.path);
+}
+
+function stripOr(s: string): string {
+  return s.endsWith(".or") ? s.substring(0, s.length - 3) : s;
+}
+
+// Is the processor of unit `ui` allowed to run? Processors of the package's own modules and of `std` run; processors of
+// dependencies run only when `[annotations] processors` lists the dependency (`"dep"`) or its module (`"dep/module"`, the
+// path of the module below the dependency's `src`). Err carries the reason.
+export function trusted(prog: LoadedProgram, ui: usize): Result<bool, string> {
+  const u = prog.units[ui];
+  if (prog.manifest.isNone() || u.path.startsWith("$")) {
+    return Ok(true);
+  }
+  const m = prog.manifest.unwrap();
+  const root = packageRoot(prog);
+  for (const d of m.dependencies) {
+    const depRoot = d.path != "" ? joinPath(root, d.path) : joinPath(root, ".orin/packages/" + d.name);
+    if (!isInside(depRoot, u.path)) {
+      continue;
+    }
+    const src = joinPath(depRoot, "src");
+    const base = isInside(src, u.path) ? src : depRoot;
+    const modName = d.name + "/" + stripOr(relativeTo(base, u.path));
+    for (const e of m.processors) {
+      if (e == d.name || e == modName) {
+        return Ok(true);
+      }
+    }
+    return Err(
+      "it comes from the dependency `" + d.name + "` and is not listed in `[annotations] processors` of orin.toml (list `\""
+          + d.name + "\"` or `\"" + modName + "\"`)",
+    );
+  }
+  if (isInside(joinPath(root, ".orin"), u.path)) {
+    return Err("it comes from a package below `.orin/` that is not a direct dependency of this package");
+  }
+  return Ok(true);
+}

@@ -54,7 +54,7 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 
 **Consolidated plan to 1.0:** [Orin 1.0 roadmap](roadmaps/orin-1.0.md) (proposal for owner review, 2026-10-16): definition of done, gaps, milestones M0-M5 and the open owner decisions.
 
-**User-defined annotations (ADR-0046, accepted 2026-10-16):** design done, implementation in slices S1-S6 (definitions and uses, tooling metadata, `std:meta`, expansion, processor execution, `@Json` + route example); compiler slices start after the ADR-0047 layout move.
+**User-defined annotations (ADR-0046, implemented 2026-10-16):** S1 definitions and uses, S2 tooling metadata, S3 `std:meta`, S4 companion modules and `orin expand`, S5 processor execution, S6 the examples `examples/json-codec` (`@Json` codecs) and `examples/routes` (`@Route` table) as example packages, not std (owner decision). Not done: LSP/MCP/`orin test`/`orin graph` do not expand `.gen`, OSIG `GENERATED_BY` edges, processor memory limit.
 
 See [`roadmap.md`](roadmap.md) (integrated plan, including the verifiable-software tracks of
 ADR-0020) and [`tcb.md`](tcb.md) (what every guarantee currently trusts).
