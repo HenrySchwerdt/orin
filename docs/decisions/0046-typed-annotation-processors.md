@@ -1,6 +1,6 @@
 # ADR-0046: User-defined annotations and pure annotation processors
 
-Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below, not started).
+Date: 2026-10-16. Status: **accepted** (design; implementation in slices S1-S6 below; S1 implemented, S2-S6 not started).
 Related: spec/05-annotations-and-metaprogramming.md, ADR-0012 (contract clauses), ADR-0016 (1.0 scope, amended
 here), ADR-0024 (built-in annotations), ADR-0027 (capabilities), ADR-0044 (OX, `@Sealed`), ADR-0020/0023 (OSIG).
 Supersedes the first draft of this ADR (PR #109), whose three-capability split, safety rules and alternatives are kept.

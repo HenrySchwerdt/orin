@@ -1053,28 +1053,57 @@ function clauseText(c: Layout, k: ContractClause, ind: usize): string {
   }
 }
 
-// `@Test`, `@Deprecated("message")`, `@Inline` (ADR-0024), `@Sealed` (ADR-0044).
-function annotationLine(a: Annotation): string {
+// `@Test`, `@Deprecated("message")`, `@Inline` (ADR-0024), `@Sealed` (ADR-0044), `@Annotation(targets)` and the uses of
+// user annotations `@Name` / `@Name(a, b)` (ADR-0046).
+function annotationLine(c: Layout, a: Annotation, ind: usize): string {
   return match (a.kind) {
     ATest => "@Test",
     ADeprecated => "@Deprecated(" + quote(a.message) + ")",
     AInline => "@Inline",
     ASealed => "@Sealed",
+    ACustom(id, args) => customAnnotationText(c, id, args, ind),
+    AAnnotation(ts) => "@Annotation(" + ts.map(t => t.name).join(", ") + ")",
   };
 }
 
-// The built-in annotations, one per line, in source order.
-function annosPrefix(as: Annotation[], ind: usize): string {
+function customAnnotationText(c: Layout, id: Ident, args: Expr[], ind: usize): string {
+  let t = "@" + id.name;
+  if (args.length == 0) {
+    return t;
+  }
+  t += "(";
+  let first = true;
+  for (const e of args) {
+    if (!first) {
+      t += ", ";
+    }
+    first = false;
+    t += ex(c, e, ind, ind + t.length, 1, WIDTH);
+  }
+  return t + ")";
+}
+
+// The annotations, one per line, in source order.
+function annosPrefix(c: Layout, as: Annotation[], ind: usize): string {
   let out = "";
   for (const a of as) {
-    out += annotationLine(a) + "\n" + pad(ind);
+    out += annotationLine(c, a, ind) + "\n" + pad(ind);
+  }
+  return out;
+}
+
+// The annotations of a field, on the field's line.
+function annosInline(c: Layout, as: Annotation[], ind: usize): string {
+  let out = "";
+  for (const a of as) {
+    out += annotationLine(c, a, ind) + " ";
   }
   return out;
 }
 
 // Annotations first, then contract clauses, one per line above the declaration.
 function decoPrefix(c: Layout, as: Annotation[], ks: ContractClause[], ind: usize): string {
-  return annosPrefix(as, ind) + clausesPrefix(c, ks, ind);
+  return annosPrefix(c, as, ind) + clausesPrefix(c, ks, ind);
 }
 
 // The clauses of a declaration, each followed by a line break and the indentation of the declaration.
@@ -1230,7 +1259,8 @@ function memberSpan(m: ClassMember): Span {
 function memberText(c: Layout, m: ClassMember, ind: usize): string {
   match (m) {
     MField(f) => {
-      let t = (f.priv ? "private " : "") + f.name.name + ": " + typeText(f.ty);
+      let t = annosInline(c, f.annotations, ind) + (f.priv ? "private " : "") + f.name.name + ": "
+          + typeText(f.ty);
       if (f.init.isSome()) {
         t += " = ";
         t += ex(c, f.init.unwrap(), ind, ind + t.length, 1, WIDTH);
@@ -1328,7 +1358,7 @@ function ifaceMethodText(c: Layout, m: IfaceMethod, ind: usize): string {
   const open = c.findChar(m.name.span.end, 40) + 1;
   const forced = c.gapsHave(starts, ends, open, close);
   const flat = m.name.name + "(" + texts.join(", ") + ")" + ret + ";";
-  const pre = annosPrefix(m.annotations, ind);
+  const pre = annosPrefix(c, m.annotations, ind);
   if (!forced && ind + flat.length <= WIDTH) {
     return pre + flat;
   }
@@ -1358,7 +1388,7 @@ function interfaceText(c: Layout, k: InterfaceDecl): string {
     texts.push(ifaceMethodText(c, m, 2));
   }
   const open = c.findChar(lo2, 123) + 1;
-  return annosPrefix(k.annotations, 0)
+  return annosPrefix(c, k.annotations, 0)
       + c.bracketed(head + " {", "}", open, k.span.end - 1, starts, ends, texts, 0, "");
 }
 
@@ -1394,7 +1424,7 @@ function typeDeclBodyText(c: Layout, t: TypeDecl): string {
       for (const f of fields) {
         starts.push(f.span.start);
         ends.push(f.span.end);
-        texts.push(f.name.name + ": " + typeText(f.ty));
+        texts.push(annosInline(c, f.annotations, 2) + f.name.name + ": " + typeText(f.ty));
       }
       const open = c.findChar(lo2, 123) + 1;
       const forced = c.gapsHave(starts, ends, open, hi);
@@ -1433,7 +1463,7 @@ function constText(c: Layout, k: ConstDecl): string {
     head += ": " + typeText(k.ty.unwrap());
   }
   head += " = ";
-  return head + ex(c, k.value, 0, head.length, 1, WIDTH) + ";";
+  return annosPrefix(c, k.annotations, 0) + head + ex(c, k.value, 0, head.length, 1, WIDTH) + ";";
 }
 
 function itemSpan(it: Item): Span {

@@ -542,7 +542,7 @@ Contracts, with the bug each would catch:
 * **tokens**: `lex` / `Lexer.run` ensure `tokensWellFormed` (in the source and the file, ordered, non-overlapping, non-empty,
   exactly one KEof, at the end); a token one byte short, or a newline that is not skipped, is caught.
 * **errors**: `lex` ensures E0100 with a span inside the source; `parse` ensures one of the parse-error codes (`isSyntaxCode`:
-  E0100, E0200, E0201, E0408, E0440, E0441, E0442) and a span inside the source and the file (a diagnostic past the end
+  E0100, E0200, E0201, E0408, E0440, E0441, E0442, E0447) and a span inside the source and the file (a diagnostic past the end
   cannot be rendered); `errAt` ensures E0200 / E0201 at the token; `checkPlacement` is `Ok` exactly when every clause is allowed,
   `checkAnnoPlacement` exactly when every annotation is allowed and no kind repeats.
 * **operators**: `OpTable.level` ensures the level is that of a row with that spelling (or -1 exactly when no row has it);
