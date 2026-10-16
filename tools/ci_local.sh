@@ -21,11 +21,13 @@ step "diff fuse"               tools/differential.sh --mode fuse
 step "formatter"               python3 tools/test_fmt.py
 step "thread-count equality"   python3 tools/test_threads.py
 step "tooling"                 ./tools/test_tooling.sh
-step "lsp"                     python3 tools/test_lsp.py
-step "mcp"                     python3 tools/test_mcp.py
+step "protocol harness (unit)" tools/protocol.sh --unit-tests
+step "lsp"                     tools/protocol.sh lsp
+step "mcp"                     tools/protocol.sh mcp
 step "packages"                ./tools/test_packages.sh
 step "osig graph/diff"         python3 tools/test_osig.py --orin build/bootstrap/orin2
 step "effects (Stage B)"       python3 tools/test_effects.py --orin build/bootstrap/orin2
+step "companion modules"       python3 tools/test_expand.py --orinc build/bootstrap/orin2
 step "compiler contracts"      tools/test_compiler_contracts.sh
 step "verify all"              python3 tools/verify_all.py compiler/main.or
 step "contract erasure"        python3 tools/test_contract_erasure.py --orinc build/bootstrap/orin2

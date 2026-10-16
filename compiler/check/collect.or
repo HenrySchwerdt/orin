@@ -174,6 +174,24 @@ function exportLookup(exports: Names[], target: ImportTarget, name: string): Loo
   };
 }
 
+// A companion module is a virtual unit whose path is the source module's path with `.gen` instead of `.or` (the loader).
+function isCompanionUnit(path: string): bool {
+  return !path.startsWith("$") && path.endsWith(".gen");
+}
+
+// The unit index of the source module of the companion at `path`.
+function companionSource(prog: LoadedProgram, path: string): Option<usize> {
+  const want = path.substring(0, path.length - 4) + ".or";
+  let i: usize = 0;
+  while (i < prog.units.length) {
+    if (prog.units[i].path == want) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
 export function collect(prog: LoadedProgram): Collected {
   let diags: Diagnostic[] = [];
   let units: UnitInfo[] = [];
@@ -194,9 +212,19 @@ export function collect(prog: LoadedProgram): Collected {
   const noTypes: Type[] = [];
   const noLocals: Local[] = [];
   let ui: usize = 0;
+  // Companion modules (ADR-0046 S4): `m.gen` is generated *for* `m`, so it starts with the scope of `m` (its private
+  // declarations and imports); it exports only what it declares itself. `scopesAll` is kept only when a companion exists.
+  const hasCompanion = prog.units.some(u => isCompanionUnit(u.path));
+  let scopesAll: Names[] = [];
   for (const unit of prog.units) {
     let scope = emptyNames();
     let exports = emptyNames();
+    if (hasCompanion && isCompanionUnit(unit.path)) {
+      const src = companionSource(prog, unit.path);
+      if (src.isSome() && src.unwrap() < scopesAll.length) {
+        scope = scopesAll[src.unwrap()];
+      }
+    }
     for (const item of unit.ast.items) {
       match (item) {
         IFunction(f) => {
@@ -443,6 +471,7 @@ export function collect(prog: LoadedProgram): Collected {
       }
     }
     units.push(UnitInfo { name: unit.name, file: unit.file, scope: scope, ox: oxUnit });
+    scopesAll.push(hasCompanion ? scope : emptyNames());
     exportsAll.push(exports);
     ui += 1;
   }

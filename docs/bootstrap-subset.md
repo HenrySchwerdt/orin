@@ -260,6 +260,11 @@ Format: `path:line:col: error[CODE]: message` on stderr, exit status 1. Codes:
 | W0471 | **warning**, strict mode only: public method that mutates `this` and has no `@Ensures` — beyond Orin-B (ADR-0028) |
 | E0473 | a module may perform an effect outside its `[effects]` allowance in `orin.toml` (transitive; the notes carry the explanation path) — beyond Orin-B (ADR-0037 D2/D4, docs/capabilities.md) |
 | E0474 | an `[effects]` `allowed` entry names no effect the compiler knows — beyond Orin-B (docs/capabilities.md) |
+| E0449 | a companion module (`./m.gen`) generates one name more than once and at least one of them is exported (ADR-0046 S4) |
+| E0520 | the recorded output of a processor is unusable: not JSON, wrong format or version, missing key, unknown declaration kind, invalid identifier, unsupported construct, import of a module the program has not loaded, unknown diagnostic reference (ADR-0046 S4) |
+| E0521 | cyclic companion: `./a.gen` imported while `a` is loading, or a module that runs a processor depends on a companion (ADR-0046 S4) |
+| E0522 | a processor reported an error diagnostic (ADR-0046 S4) |
+| W0491 | **warning**: a processor reported a warning (ADR-0046 S4) |
 | E0500 | `orin.toml` syntax error (beyond Orin-B; self-hosted compiler only, spec 04) |
 | E0501 | import violates a module's `allowed_dependencies` rule in `orin.toml` (beyond Orin-B) |
 | E0502 | `orin.toml` names a module that does not exist (no `module.or`), in `[modules.x]` or `[effects.x]` (beyond Orin-B) |
