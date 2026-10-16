@@ -693,7 +693,7 @@ Tests: `compiler/tests/recovery_test.or` (9 `@Test`, run by `tools/test_tooling.
 cap and its note, the lexer, `Parser` without recovery unchanged, 400 garbage token soups and every prefix and every 3-byte
 deletion of a program checked against `parse`), `tests/recovery/` with `tools/test_recovery.py` (8 programs with the exact
 expected `check` output in `<name>.err`; also checks `compile`, `--format=json` and that `fmt --check` refuses the file), new
-cases in `test_lsp.py`, `test_mcp.py` and `analysis_test.or`. Mutation check: 12 hand-made mutants of the recovery code
+cases in `protocol.sh lsp`, `protocol.sh mcp` and `analysis_test.or`. Mutation check: 12 hand-made mutants of the recovery code
 against `recovery_test.or` (no skipping in `recoverStmt`, no cascade floor, cap off by one, top-level resume at the error
 token, `if` body not a statement end, no unwinding at a declaration keyword, one-token cascade window, first error dropped,
 note on another error, a method body's `}` not consumed, recovery always on, `recoverStmt` ignoring `unwinding`): 11 killed;
@@ -717,8 +717,8 @@ Results (against the baseline compiler built before the change):
   812/812 conformance tests, `test_verify_contracts` 809 checks, no contract fired;
 * `orin check --strict-contracts compiler/main.or`: 0 warnings;
 * `test_fmt.py` 1,661 passed; `orin fmt --stdout` of 3,243 files byte-identical between the two compilers (1,271 formatted,
-  1,972 refused); `test_tooling.sh` passed (`recovery_test` 9/9, `test_recovery.py` 8/8); `test_lsp.py` 104 checks,
-  `test_mcp.py` 191 checks, 0 failed.
+  1,972 refused); `test_tooling.sh` passed (`recovery_test` 9/9, `test_recovery.py` 8/8); `protocol.sh lsp` 104 checks,
+  `protocol.sh mcp` 191 checks, 0 failed.
 
 Performance (callgrind instruction counts, both compilers built by the baseline compiler, both on the new tree):
 `orin compile compiler/main.or` 38,780 M -> 38,792 M (+0.03 %), `orin check compiler/main.or` (front end) 2,575.0 M ->
@@ -887,10 +887,10 @@ Behaviour preservation (against the baseline compiler built from `origin/main` b
   relocated E0474 / E0502 do not show there; `tools/test_effects.py` checks them);
 * conformance `--suite all` 812/812 (C), default suite with `--backend=llvm` 141/141;
 * `tools/test_compiler_contracts.sh`: contract-checked self-compile byte-identical to `stage2.c`, 812/812 conformance tests,
-  verifier contracts 809/809, **no contract fired**; `tools/test_lsp.py` (100 checks), `test_mcp.py` (188), `test_osig.py` (101),
+  verifier contracts 809/809, **no contract fired**; `tools/protocol.sh lsp` (100 checks), `protocol.sh mcp` (188), `test_osig.py` (101),
   `test_effects.py` (89) also pass with the contract-checked compiler as the binary under test (that run found the E0474 defect);
 * `tools/test_tooling.sh`, `tools/test_fmt.py` (13 goldens, 1,584 corpus files: idempotence, AST and comment preservation,
-  61 JSON diagnostics; 1,658 passed), `test_lsp.py`, `test_mcp.py`, `test_osig.py`, `test_effects.py`: pass;
+  61 JSON diagnostics; 1,658 passed), `protocol.sh lsp`, `protocol.sh mcp`, `test_osig.py`, `test_effects.py`: pass;
 * `orin fmt --stdout` of the 1,609-file formatter corpus with the contract-checked compiler: output byte-identical to the
   baseline's, no contract fired (idempotence and comment contracts on every file);
 * `orin check --strict-contracts compiler/main.or`: 13 warnings, the same 13 W0471 of `compiler/vc/` as on `origin/main`;

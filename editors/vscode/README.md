@@ -65,7 +65,7 @@ workspace has errors, because the semantic index is then partial. See
 3. Every open document is analysed as its own entry (a missing `main` is tolerated); unsaved buffers
    are used for imported modules too.
 
-Check it without an editor: `python3 tools/test_lsp.py` drives a freshly built `orin lsp` with real
+Check it without an editor: `tools/protocol.sh lsp` drives a freshly built `orin lsp` with real
 JSON-RPC messages.
 
 ## Develop

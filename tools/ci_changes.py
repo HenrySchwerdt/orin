@@ -104,6 +104,8 @@ def selftest():
         (["tools/mutate_std.py"], {"code": True, "macos": True, "vscode": False, "mutants": list(MODULES)}),
         (["tooling/differential/src/main.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["tools/differential.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/protocol/src/lsp.or"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
+        (["tooling/protocol/tests/rpc_test.or", "tools/protocol.sh"], {"code": True, "macos": True, "vscode": False, "mutants": []}),
         (["editors/vscode/package.json"], {"code": False, "macos": False, "vscode": True, "mutants": []}),
         (["runtime/platform/orin_platform.c", "library/std/net.or"], {"code": True, "macos": True, "vscode": False, "mutants": ["net"]}),
     ]

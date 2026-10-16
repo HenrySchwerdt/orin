@@ -1,0 +1,501 @@
+// End-to-end test of `orin mcp` (spec 10): speaks real MCP (2025-06-18) over stdio. The Orin port of tools/test_mcp.py:
+// the same requests, expected responses and `check` messages, in the same order. Checks: initialize, tools/list
+// (schemas), check on a valid and an invalid project, delta behaviour across an edit (and the full-snapshot fallback for
+// an unknown base), inspect (symbol, module, position, built-in API), effects, rename (dry run, validation, apply),
+// graph/diff, and the permission refusals (path escape, build/test without --allow-exec). A second server with
+// --allow-exec checks build and test.
+
+import { FsGrant, readFile, writeFile, exists } from "std:fs";
+import { ProcessGrant } from "std:process";
+import { shell } from "std:io";
+import { Json, JNum, parse } from "std:json";
+import { Session, ToolResult } from "./session";
+import { replaceAll, shq, sortedStrs, reprStr } from "./text";
+import {
+  S, N, B, A, O, F, nil, at, has, isNull, isStrEq, isIntEq, isBoolEq, str, items, len, strs, keysOf, eq, show,
+  containsStr, strEq
+} from "./jx";
+
+const MAIN: string = "import { double, Point } from \"./lib\";\n\nfunction main(): void {\n  const p = Point { x: 1, y: 2 };\n  console.log(double(p.x).toString());\n}\n";
+
+function libText(): string {
+  return "export type Point = { x: int; y: int; };\n\nexport function double(n: int): int {\n  return n * 2;\n}\n\n"
+  + "export class Counter implements Gauge {\n  n: int = 0;\n  bump(): void {\n    this.n = this.n + 1;\n  }\n  peek(): int {\n    return this.n;\n  }\n}\n\n"
+  + "export interface Gauge {\n  peek(): int;\n}\n";
+}
+
+function genText(): string {
+  return "import { Gauge, Counter } from \"./lib\";\n\nexport class Cell<T extends Gauge> {\n  items: T[] = [];\n  add(x: T): void {\n    this.items.push(x);\n  }\n"
+  + "  total(): int {\n    let t = 0;\n    for (const i of this.items) {\n      t += i.peek();\n    }\n    return t;\n  }\n}\n\n"
+  + "function main(): void {\n  let c = new Cell<Counter>();\n  c.add(new Counter());\n  console.log(c.total().toString());\n}\n";
+}
+
+const BAD: string = "function f(): void {\n  const a: int = \"x\";\n}\n\nfunction g(): void {\n  const b: string = 1;\n}\n\nfunction main(): void {}\n";
+
+function readText(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  return r.isOk() ? r.unwrap() : "";
+}
+
+function ent(entry: string): Json {
+  return O([F("entry", S(entry))]);
+}
+
+function pos(line: int, column: int): Json {
+  return O([F("line", N(line)), F("column", N(column))]);
+}
+
+function intVal(j: Json): int {
+  return match (j) {
+    JNum(n) => n,
+    _ => -999999
+  };
+}
+
+function lastOf(j: Json): Json {
+  const xs = items(j);
+  return xs.length == 0 ? nil() : xs[xs.length - 1];
+}
+
+function contains(hay: Json, needle: string): bool {
+  return str(hay).includes(needle);
+}
+
+// `x.get(k, {})` of a JSON object that may be absent
+function orEmpty(j: Json): Json {
+  return isNull(j) ? O([]) : j;
+}
+
+// Copies a directory of the repository into the project (`shutil.copytree`); false when `cp` failed.
+function copyTree(p: ProcessGrant, src: string, to: string): bool {
+  return shell(p, "mkdir -p " + shq(to) + " && rmdir " + shq(to) + " && cp -R " + shq(src) + " " + shq(to)) == 0;
+}
+
+function effectKeys(effects: Json): string[] {
+  let out: string[] = [];
+  for (const e of items(effects)) {
+    out.push(str(at(e, ["operation"])) + "|" + str(at(e, ["direction"])) + "|" + str(at(e, ["evidence"])));
+  }
+  return out;
+}
+
+function head(raw: string, n: usize): string {
+  return raw.substring(0, raw.length < n ? raw.length : n);
+}
+
+export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, root: string, tmp: string): void {
+  const proj = tmp + "/proj";
+  shell(p, "mkdir -p " + shq(proj));
+  writeFile(fs, proj + "/main.or", MAIN);
+  writeFile(fs, proj + "/lib.or", libText());
+  writeFile(fs, proj + "/bad.or", BAD);
+  writeFile(fs, proj + "/gen.or", genText());
+  const outside = tmp + "/outside.or";
+  writeFile(fs, outside, "function main(): void {}\n");
+
+  if (!s.start(fs, p, exe, "mcp --root " + shq(proj))) {
+    s.setFatal(fs, "cannot start " + exe + " mcp");
+    return;
+  }
+
+  // ---- initialize / tools/list ------------------------------------------------------------
+  const pre = s.mcpRequest(fs, p, "tools/list", nil(), false);
+  s.check(fs, has(pre, "error") && isIntEq(at(pre, ["error", "code"]), -32002), "tools/list before initialize is refused");
+  let r = s.mcpRequest(fs, p, "initialize", O([F("protocolVersion", S("2025-06-18")), F("capabilities", O([])),
+    F("clientInfo", O([F("name", S("test")), F("version", S("0"))]))]), true);
+  const res = at(r, ["result"]);
+  s.check(fs, isStrEq(at(res, ["protocolVersion"]), "2025-06-18"), "protocol version");
+  s.check(fs, has(at(res, ["capabilities"]), "tools"), "tools capability");
+  s.check(fs, isStrEq(at(res, ["serverInfo", "name"]), "orin"), "server name");
+  s.notifyBare(fs, p, "notifications/initialized");
+  r = s.mcpRequest(fs, p, "ping", nil(), false);
+  s.check(fs, eq(at(r, ["result"]), O([])), "ping");
+  r = s.mcpRequest(fs, p, "tools/list", nil(), false);
+  const toolList = items(at(r, ["result", "tools"]));
+  let names: string[] = [];
+  for (const t of toolList) {
+    names.push(str(at(t, ["name"])));
+  }
+  s.check(fs, strEq(sortedStrs(names), ["build", "check", "diff", "edit", "graph", "inspect", "test"]), "tool names: [" + names.join(", ") + "]");
+  for (const t of toolList) {
+    const sch = at(t, ["inputSchema"]);
+    s.check(fs, isStrEq(at(sch, ["type"]), "object") && has(sch, "properties") && str(at(t, ["description"])) != "",
+      "schema for " + str(at(t, ["name"])));
+  }
+  let checkTool: Json = nil();
+  for (const t of toolList) {
+    if (isStrEq(at(t, ["name"]), "check")) {
+      checkTool = t;
+    }
+  }
+  s.check(fs, strEq(strs(at(checkTool, ["inputSchema", "required"])), ["entry"]), "check requires entry");
+  s.check(fs, has(at(checkTool, ["inputSchema", "properties"]), "sinceRevision"), "check has sinceRevision");
+  r = s.mcpRequest(fs, p, "tools/call", O([F("name", S("nope")), F("arguments", O([]))]), true);
+  s.check(fs, isIntEq(at(r, ["error", "code"]), -32602), "unknown tool is a protocol error");
+  r = s.mcpRequest(fs, p, "resources/list", nil(), false);
+  s.check(fs, isIntEq(at(r, ["error", "code"]), -32601), "unknown method");
+
+  // ---- check ------------------------------------------------------------------------------
+  let t = s.mcpCall(fs, p, "check", ent("main.or"));
+  let v = t.value;
+  s.check(fs, !t.err && isIntEq(at(v, ["errors"]), 0) && !has(v, "diags"), "valid project: no errors (" + t.raw + ")");
+  const revOk = at(v, ["revision"]);
+  t = s.mcpCall(fs, p, "check", ent("main.or"));
+  v = t.value;
+  s.check(fs, eq(at(v, ["revision"]), revOk), "unchanged project keeps its revision");
+  t = s.mcpCall(fs, p, "check", ent("bad.or"));
+  v = t.value;
+  s.check(fs, !t.err && isIntEq(at(v, ["errors"]), 2), "invalid project: 2 errors (" + t.raw + ")");
+  let allCompact = true;
+  for (const d of strs(at(v, ["diags"]))) {
+    if (!d.startsWith("E0400 bad.or:")) {
+      allCompact = false;
+    }
+  }
+  s.check(fs, allCompact, "compact diag format (" + t.raw + ")");
+  s.check(fs, str(at(v, ["diags", "0"])).startsWith("E0400 bad.or:2:18 "), "diag position 1-based (" + str(at(v, ["diags", "0"])) + ")");
+  const revBad = at(v, ["revision"]);
+  s.check(fs, !eq(revBad, revOk), "different project, different revision");
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("bad.or")), F("format", S("detailed"))]));
+  v = t.value;
+  const d0 = at(v, ["diags", "0"]);
+  let haveFields = true;
+  for (const k of ["id", "code", "file", "line", "col", "endLine", "endCol", "message"]) {
+    if (!has(d0, k)) {
+      haveFields = false;
+    }
+  }
+  s.check(fs, haveFields, "detailed fields");
+  s.check(fs, len(at(d0, ["id"])) == 8, "stable id");
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("main.or")), F("format", S("compact"))]));
+  v = t.value;
+  s.check(fs, isIntEq(at(v, ["errors"]), 0), "main still valid");
+
+  // ---- delta across an edit ---------------------------------------------------------------
+  writeFile(fs, proj + "/bad.or", replaceAll(BAD, "const a: int = \"x\";", "const a: int = 1;"));
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("bad.or")), F("sinceRevision", revBad)]));
+  v = t.value;
+  s.check(fs, eq(at(v, ["base"]), revBad) && !eq(at(v, ["revision"]), revBad), "delta carries base and a new revision (" + t.raw + ")");
+  s.check(fs, len(at(v, ["resolved"])) == 1 && str(at(v, ["resolved", "0"])).startsWith("E0400 bad.or:2:"), "one diagnostic resolved (" + t.raw + ")");
+  s.check(fs, eq(at(v, ["added"]), A([])) && isIntEq(at(v, ["remaining"]), 1), "nothing added, one remaining (" + t.raw + ")");
+  s.check(fs, !has(v, "diags"), "delta has no full list");
+  const rev1 = at(v, ["revision"]);
+  // a new error appears, with a line shift: the old one keeps its identity
+  writeFile(fs, proj + "/bad.or",
+    "// shifted\nfunction f(): void {\n  const a: int = 1;\n}\n\nfunction g(): void {\n  const b: string = 1;\n}\n\nfunction main(): void {\n  const z: bool = 5;\n}\n");
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("bad.or")), F("sinceRevision", rev1)]));
+  v = t.value;
+  s.check(fs, len(at(v, ["added"])) == 1 && isIntEq(at(v, ["remaining"]), 1) && eq(at(v, ["resolved"]), A([])),
+    "added 1, remaining 1 across line shift (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("bad.or")), F("sinceRevision", N(9999))]));
+  v = t.value;
+  s.check(fs, isIntEq(at(v, ["errors"]), 2) && has(v, "diags") && has(v, "note"),
+    "unknown base revision falls back to full snapshot (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "check", O([F("entry", S("bad.or")), F("sinceRevision", revOk)]));
+  v = t.value;
+  s.check(fs, has(v, "diags"), "a revision of another entry is not a base");
+
+  // parser error recovery: every syntax error of the file (three), no type error (the checker does not run)
+  writeFile(fs, proj + "/syn.or",
+    "function f(): int {\n  return true;\n}\n\nfunction g(): void {\n  let a = ;\n  h(1;\n}\n\nfunction k(: int): void {}\n\nfunction main(): void {}\n");
+  t = s.mcpCall(fs, p, "check", ent("syn.or"));
+  v = t.value;
+  s.check(fs, !t.err && isIntEq(at(v, ["errors"]), 3), "syntax errors: all 3 reported (" + t.raw + ")");
+  let heads: string[] = [];
+  for (const d of strs(at(v, ["diags"]))) {
+    const w = d.split(" ");
+    heads.push(w.length >= 2 ? w[0] + " " + w[1] : w[0]);
+  }
+  s.check(fs, strEq(heads, ["E0200 syn.or:6:11", "E0200 syn.or:7:6", "E0200 syn.or:10:12"]),
+    "syntax errors: codes and positions in order (" + t.raw + ")");
+  shell(p, "rm -f " + shq(proj + "/syn.or"));
+
+  t = s.mcpCall(fs, p, "check", ent("missing.or"));
+  s.check(fs, t.err && t.raw.includes("cannot read"), "missing entry is a tool error");
+  t = s.mcpCall(fs, p, "check", O([]));
+  s.check(fs, t.err && t.raw.includes("entry"), "missing argument is a tool error");
+
+  // ---- inspect ----------------------------------------------------------------------------
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("double")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "function") && isStrEq(at(v, ["sig"]), "function double(n: int): int"), "inspect symbol (" + t.raw + ")");
+  s.check(fs, isStrEq(at(v, ["at"]), "lib.or:3:17") && isBoolEq(at(v, ["exported"]), true), "defining location (" + t.raw + ")");
+  s.check(fs, !has(v, "source"), "no source by default");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("double")), F("entry", S("main.or")), F("includeSource", B(true))]));
+  v = t.value;
+  s.check(fs, contains(at(v, ["source"]), "return n * 2;"), "includeSource returns the declaration");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Counter.bump")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "method") && isBoolEq(at(v, ["mutates"]), true), "mutating method inferred (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Counter.peek")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["mutates"]), false), "non-mutating method (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Gauge")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "interface") && str(at(v, ["implementedBy", "0"])).startsWith("Counter at lib.or:"),
+    "interface lists its implementations (" + t.raw + ")");
+  s.check(fs, contains(at(v, ["sig"]), "implemented by Counter"), "interface signature shows implementations (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Gauge.peek")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "method") && isStrEq(at(v, ["in"]), "Gauge") && isBoolEq(at(v, ["mutates"]), false),
+    "interface method (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Counter")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "class") && strEq(strs(at(v, ["implements"])), ["Gauge"]),
+    "class lists the interfaces it implements (" + t.raw + ")");
+  // generic classes (ADR-0026): the class is one symbol; its methods carry the inferred mutability
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Cell")), F("entry", S("gen.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "class") && str(at(v, ["sig"])).startsWith("class Cell<T extends Gauge>"),
+    "generic class signature (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Cell.add")), F("entry", S("gen.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["kind"]), "method") && isBoolEq(at(v, ["mutates"]), true) && isStrEq(at(v, ["sig"]), "mut method add(x: T): void"),
+    "generic class: mutating method (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Cell.total")), F("entry", S("gen.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["mutates"]), false), "generic class: non-mutating method (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Nope")), F("entry", S("main.or"))]));
+  s.check(fs, t.err && t.raw.includes("not found"), "unknown symbol");
+  t = s.mcpCall(fs, p, "inspect", O([F("module", S("lib.or")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["module"]), "lib") && containsStr(strs(at(v, ["exports"])), "function double(n: int): int"),
+    "module exports (" + t.raw + ")");
+  s.check(fs, strEq(strs(at(v, ["importedBy"])), ["main"]) && eq(at(v, ["imports"]), A([])), "module dependency edges (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("module", S("main.or"))]));
+  v = t.value;
+  s.check(fs, strEq(strs(at(v, ["imports"])), ["lib"]), "module imports (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("file", S("main.or")), F("position", pos(5, 15))]));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["name"]), "double"), "inspect by position (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("Array.find"))]));
+  v = t.value;
+  s.check(fs, !t.err && contains(at(v, ["sig"]), "Option<T>") && contains(at(v, ["fails"]), "None"), "builtin Array.find (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("string.split"))]));
+  v = t.value;
+  s.check(fs, !t.err && contains(at(v, ["fails"]), "traps"), "builtin string.split (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([]));
+  s.check(fs, t.err, "inspect without target is an error");
+
+  // ---- packages (orin.toml, spec 04): module inspect shows the rule; violations are diagnostics
+  if (!copyTree(p, root + "/tests/next/packages/shop", proj + "/shop")) {
+    s.setFatal(fs, "cannot copy tests/next/packages/shop");
+    return;
+  }
+  t = s.mcpCall(fs, p, "inspect", O([F("module", S("shop/src/payments/module.or")), F("entry", S("shop/src/main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && strEq(strs(at(v, ["allowedDependencies"])), ["users", "database"]) && isStrEq(at(v, ["moduleId"]), "payments")
+    && isStrEq(at(v, ["package"]), "shop") && strEq(strs(at(v, ["moduleImports"])), ["database", "users"]),
+    "inspect module shows manifest rule (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "check", ent("shop/src/main.or"));
+  v = t.value;
+  s.check(fs, !t.err && isIntEq(at(v, ["errors"]), 0), "package checks clean (" + t.raw + ")");
+
+  // ---- inspect: the inferred effect summary (ADR-0037 D2; the same analysis as `orin effects`) ------------
+  if (!copyTree(p, root + "/tests/osig/effects/app", proj + "/effapp")) {
+    s.setFatal(fs, "cannot copy tests/osig/effects/app");
+    return;
+  }
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("loadConfig")), F("entry", S("effapp/src/main.or"))]));
+  let ef = t.err ? O([]) : orEmpty(at(t.value, ["effects"]));
+  s.check(fs, !t.err && isBoolEq(at(ef, ["pure"]), false) && strEq(effectKeys(at(ef, ["effects"])), ["Fs.ReadFile|INPUT|MUST"]),
+    "inspect symbol: a direct effect (" + t.raw + ")");
+  s.check(fs, !t.err && isStrEq(at(lastOf(at(ef, ["effects", "0", "path"])), ["function"]), "store::loadConfig")
+    && isStrEq(at(lastOf(at(ef, ["effects", "0", "path"])), ["span", "file"]), "src/store/store.or"),
+    "inspect symbol: the path ends at the primitive call");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("reload")), F("entry", S("effapp/src/main.or"))]));
+  ef = t.err ? O([]) : orEmpty(at(t.value, ["effects"]));
+  let reloadKeys: string[] = [];
+  for (const e of items(at(ef, ["effects"]))) {
+    let fns: string[] = [];
+    for (const h of items(at(e, ["path"]))) {
+      fns.push(str(at(h, ["function"])));
+    }
+    reloadKeys.push(str(at(e, ["operation"])) + "|" + str(at(e, ["evidence"])) + "|" + fns.join(","));
+  }
+  s.check(fs, !t.err && strEq(reloadKeys, ["Fs.ReadFile|MAY|store::reload,store::loadConfig"]),
+    "inspect symbol: a transitive effect with its path (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("fact")), F("entry", S("effapp/src/main.or"))]));
+  s.check(fs, !t.err && isBoolEq(at(orEmpty(at(t.value, ["effects"])), ["pure"]), true) && eq(at(t.value, ["effects", "effects"]), A([])),
+    "inspect symbol: a pure function (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("runDynamic")), F("entry", S("effapp/src/main.or"))]));
+  let ops: string[] = [];
+  for (const e of items(at(orEmpty(at(t.value, ["effects"])), ["effects"]))) {
+    ops.push(str(at(e, ["operation"])));
+  }
+  s.check(fs, !t.err && strEq(ops, ["Unknown.FunctionValue"]) && isStrEq(at(t.value, ["effects", "effects", "0", "evidence"]), "UNKNOWN"),
+    "inspect symbol: UNKNOWN is not pure (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("apply")), F("entry", S("effapp/src/main.or"))]));
+  s.check(fs, !t.err && strEq(strs(at(orEmpty(at(t.value, ["effects"])), ["callbacks"])), ["f"]) && isBoolEq(at(t.value, ["effects", "pure"]), false),
+    "inspect symbol: a function that calls its parameter names the callback (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "inspect", O([F("module", S("effapp/src/store/module.or")), F("entry", S("effapp/src/main.or"))]));
+  let modOps: string[] = [];
+  for (const e of items(at(t.value, ["effects"]))) {
+    modOps.push(str(at(e, ["operation"])) + "|" + str(at(e, ["evidence"])));
+  }
+  s.check(fs, !t.err && strEq(sortedStrs(modOps), ["Fs.ReadFile|MUST", "Fs.WriteFile|MUST"]), "inspect module: the module's effects (" + t.raw + ")");
+  const userFile = proj + "/shop/src/users/user.or";
+  writeFile(fs, userFile, replaceAll(readText(fs, userFile), "import { hidden }", "import { charge } from \"../payments\";\nimport { hidden }"));
+  t = s.mcpCall(fs, p, "check", ent("shop/src/main.or"));
+  s.check(fs, t.raw.includes("E0501"), "disallowed module dependency is reported by check (" + t.raw + ")");
+
+  // ---- edit (rename) ----------------------------------------------------------------------
+  const before = readText(fs, proj + "/lib.or");
+  t = s.mcpCall(fs, p, "edit", O([F("kind", S("rename")), F("file", S("lib.or")), F("position", pos(3, 20)),
+    F("newName", S("twice")), F("entry", S("main.or"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["valid"]), true) && !isBoolEq(at(v, ["applied"]), true), "dry run is valid, nothing applied (" + t.raw + ")");
+  s.check(fs, strEq(sortedStrs(strs(at(v, ["edits"]))), ["lib.or:3:17", "main.or:1:10", "main.or:5:15"]), "edit list across files (" + t.raw + ")");
+  s.check(fs, readText(fs, proj + "/lib.or") == before, "dry run leaves the file untouched");
+  t = s.mcpCall(fs, p, "edit", O([F("kind", S("rename")), F("file", S("lib.or")), F("position", S("3:20")),
+    F("newName", S("class")), F("entry", S("main.or"))]));
+  s.check(fs, t.err && t.raw.includes("reserved"), "reserved word rejected (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "edit", O([F("kind", S("rename")), F("file", S("lib.or")), F("position", pos(1, 1)),
+    F("newName", S("x")), F("entry", S("main.or"))]));
+  s.check(fs, t.err, "no symbol at position");
+  t = s.mcpCall(fs, p, "edit", O([F("kind", S("extract")), F("file", S("lib.or")), F("position", S("3:20")), F("newName", S("x"))]));
+  s.check(fs, t.err && t.raw.includes("unsupported"), "unsupported kind");
+  t = s.mcpCall(fs, p, "edit", O([F("kind", S("rename")), F("file", S("lib.or")), F("position", pos(3, 20)),
+    F("newName", S("twice")), F("entry", S("main.or")), F("apply", B(true))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["applied"]), true), "apply writes (" + t.raw + ")");
+  s.check(fs, readText(fs, proj + "/lib.or").includes("twice") && readText(fs, proj + "/main.or").includes("twice(p.x)"), "files rewritten");
+  t = s.mcpCall(fs, p, "check", ent("main.or"));
+  v = t.value;
+  s.check(fs, isIntEq(at(v, ["errors"]), 0), "project still valid after rename (" + t.raw + ")");
+
+  // ---- graph / diff (OSIG, docs/osig.md) -----------------------------------------------------
+  for (const side of ["base", "head"]) {
+    if (!copyTree(p, root + "/tests/osig/accept/" + side, proj + "/osig/" + side)) {
+      s.setFatal(fs, "cannot copy tests/osig/accept/" + side);
+      return;
+    }
+  }
+  t = s.mcpCall(fs, p, "graph", ent("osig/head"));
+  v = t.value;
+  s.check(fs, !t.err && isStrEq(at(v, ["schema"]), "osig/0.3") && isStrEq(at(v, ["package"]), "acme") && str(at(v, ["hash"])).startsWith("h62:")
+    && intVal(at(v, ["nodes"])) > 5 && intVal(at(v, ["edges"])) > 5 && !has(v, "snapshot"), "graph summary (" + t.raw + ")");
+  const graphV = v;
+  t = s.mcpCall(fs, p, "graph", O([F("entry", S("osig/head")), F("full", B(true)), F("out", S("osig/head.json"))]));
+  const v2 = t.value;
+  const snap = parse(str(at(v2, ["snapshot"])));
+  s.check(fs, !t.err && eq(at(v2, ["hash"]), at(graphV, ["hash"])) && snap.isOk() && eq(at(snap.unwrap(), ["hash"]), at(graphV, ["hash"])),
+    "graph full is deterministic");
+  s.check(fs, exists(fs, proj + "/osig/head.json"), "graph out written inside the root");
+  t = s.mcpCall(fs, p, "diff", O([F("base", S("osig/base")), F("head", S("osig/head"))]));
+  const dv = t.value;
+  s.check(fs, !t.err && isStrEq(at(dv, ["schema"]), "osig-diff/0.2") && isBoolEq(at(dv, ["differences"]), true), "diff json (" + head(t.raw, 200) + ")");
+  let changedIds: string[] = [];
+  for (const c of items(at(dv, ["changedSymbols"]))) {
+    changedIds.push(str(at(c, ["id"])));
+  }
+  s.check(fs, strEq(changedIds, ["acme:orders::checkout"]) && strEq(strs(at(dv, ["changedSymbols", "0", "aspects"])), ["signature"]),
+    "diff: API signature change");
+  s.check(fs, len(at(dv, ["possibleRenames"])) == 1 && isBoolEq(at(dv, ["possibleRenames", "0", "heuristic"]), true)
+    && str(at(dv, ["possibleRenames", "0", "from"])).endsWith("applyDiscount"), "diff: rename is heuristic");
+  let newPath = false;
+  for (const f of items(at(dv, ["newCallPaths"]))) {
+    if (isStrEq(at(f, ["edge", "dst"]), "acme:audit::record")) {
+      newPath = true;
+    }
+  }
+  s.check(fs, newPath, "diff: new call path");
+  t = s.mcpCall(fs, p, "diff", O([F("base", S("osig/base")), F("head", S("osig/head.json")), F("format", S("text"))]));
+  s.check(fs, !t.err && t.raw.includes("possible renames (HEURISTIC") && t.raw.includes("<- NEW"), "diff text, head from a snapshot file");
+  t = s.mcpCall(fs, p, "diff", O([F("base", S("osig/head")), F("head", S("osig/head.json")), F("format", S("text"))]));
+  s.check(fs, !t.err && t.raw.includes("no differences"), "diff of identical graphs reports nothing");
+  t = s.mcpCall(fs, p, "diff", O([F("base", S("osig/base")), F("head", S("osig/head")), F("format", S("html")), F("out", S("osig/r.html"))]));
+  s.check(fs, !t.err && isStrEq(at(t.value, ["written"]), "osig/r.html") && readText(fs, proj + "/osig/r.html").includes("<!doctype html>"),
+    "diff html written");
+  t = s.mcpCall(fs, p, "graph", ent("../outside.or"));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "graph outside root refused");
+  t = s.mcpCall(fs, p, "diff", O([F("base", S("osig/base")), F("head", S("../outside.or"))]));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "diff outside root refused");
+
+  // ---- security ---------------------------------------------------------------------------
+  t = s.mcpCall(fs, p, "check", ent("../outside.or"));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "relative escape refused (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "check", ent(outside));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "absolute path outside root refused");
+  t = s.mcpCall(fs, p, "edit", O([F("kind", S("rename")), F("file", S("../outside.or")), F("position", S("1:1")), F("newName", S("x")), F("apply", B(true))]));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "edit outside root refused");
+  t = s.mcpCall(fs, p, "build", O([F("entry", S("main.or")), F("out", S("out.c"))]));
+  s.check(fs, t.err && t.raw.includes("--allow-exec"), "build refused without --allow-exec (" + t.raw + ")");
+  s.check(fs, !exists(fs, proj + "/out.c"), "refused build wrote nothing");
+  t = s.mcpCall(fs, p, "test", ent("main.or"));
+  s.check(fs, t.err && t.raw.includes("--allow-exec"), "test refused without --allow-exec");
+  t = s.mcpCall(fs, p, "test", O([F("suite", S("default"))]));
+  s.check(fs, t.err && t.raw.includes("--allow-exec"), "suite refused without --allow-exec");
+  // a project importing a file outside the root
+  writeFile(fs, proj + "/esc.or", "import { main } from \"../outside\";\nfunction main(): void {}\n");
+  t = s.mcpCall(fs, p, "check", ent("esc.or"));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "import escaping the root refused (" + t.raw + ")");
+  // bad JSON, then the server must still answer
+  s.sendRaw(fs, p, "{not json\n");
+  let m = s.receive(fs, p, 120000);
+  s.check(fs, m.ok && isIntEq(at(m.value, ["error", "code"]), -32700), "parse error reported");
+  r = s.mcpRequest(fs, p, "ping", nil(), false);
+  s.check(fs, eq(at(r, ["result"]), O([])), "server alive after parse error");
+  s.mcpClose(fs, p);
+
+  // ---- exec-enabled server ----------------------------------------------------------------
+  if (!s.start(fs, p, exe, "mcp --root " + shq(proj) + " --allow-exec --repo " + shq(root))) {
+    s.setFatal(fs, "cannot start " + exe + " mcp --allow-exec");
+    return;
+  }
+  s.mcpRequest(fs, p, "initialize", O([F("protocolVersion", S("2025-06-18")), F("capabilities", O([])),
+    F("clientInfo", O([F("name", S("t")), F("version", S("0"))]))]), true);
+  s.notifyBare(fs, p, "notifications/initialized");
+  t = s.mcpCall(fs, p, "build", O([F("entry", S("bad.or")), F("out", S("build/bad.c"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), false) && isIntEq(at(v, ["errors"]), 2), "build reports diagnostics (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "build", O([F("entry", S("main.or")), F("out", S("build/main.c")), F("binary", S("build/main"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), true) && isStrEq(at(v, ["binary"]), "build/main"), "build to C and binary (" + t.raw + ")");
+  shell(p, shq(proj + "/build/main") + " > " + shq(proj + "/build/main.out") + " 2>/dev/null");
+  const ran = readText(fs, proj + "/build/main.out");
+  s.check(fs, ran == "2\n", "built binary runs: " + reprStr(ran));
+  t = s.mcpCall(fs, p, "build", O([F("entry", S("main.or")), F("out", S("../escape.c"))]));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "build out outside root refused");
+  writeFile(fs, proj + "/t.or", "// exit: 0\nfunction main(): void {\n  console.log(\"hi\");\n}\n");
+  writeFile(fs, proj + "/t.out", "hi\n");
+  t = s.mcpCall(fs, p, "test", ent("t.or"));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["passed"]), true), "test entry passes (" + t.raw + ")");
+  writeFile(fs, proj + "/t.out", "ho\n");
+  t = s.mcpCall(fs, p, "test", ent("t.or"));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["passed"]), false) && contains(at(v, ["why"]), "line 1"), "test entry mismatch reported (" + t.raw + ")");
+  // @Test functions (ADR-0024): per-test results, shared with `orin test`
+  writeFile(fs, proj + "/u.or", "import { assertEq } from \"std:test\";\n\n@Test\nfunction ok(): void {\n  assertEq(1 + 1, 2, \"sum\");\n}\n\n"
+    + "@Test\nfunction bad(): void {\n  assertEq(1 + 1, 3, \"sum\");\n}\n\nfunction main(): void {\n}\n");
+  t = s.mcpCall(fs, p, "test", O([F("entry", S("u.or")), F("unit", B(true))]));
+  v = t.value;
+  let statuses: string[] = [];
+  for (const x of items(at(v, ["tests"]))) {
+    statuses.push(str(at(x, ["status"])));
+  }
+  s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), false) && isIntEq(at(v, ["total"]), 2) && isIntEq(at(v, ["passed"]), 1) && isIntEq(at(v, ["failed"]), 1)
+    && strEq(statuses, ["pass", "fail"]) && contains(at(v, ["tests", "1", "stderr"]), "expected 3, got 2"),
+    "test unit=true runs @Test functions (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "test", O([F("entry", S("u.or")), F("unit", B(true)), F("filter", S("ok"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), true) && isIntEq(at(v, ["total"]), 1) && isIntEq(at(v, ["filtered"]), 1),
+    "test unit=true with filter (" + t.raw + ")");
+  writeFile(fs, proj + "/ue.or", "import { assertEq } from \"std:test\";\n\n@Test\nfunction broken(): void {\n  assertEq(\"a\", 1, \"x\");\n}\n\nfunction main(): void {\n}\n");
+  t = s.mcpCall(fs, p, "test", O([F("entry", S("ue.or")), F("unit", B(true))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), false) && isIntEq(at(v, ["errors"]), 1) && contains(at(v, ["diags", "0"]), "E0400"),
+    "test unit=true reports compile errors (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "test", O([F("entry", S("esc.or")), F("unit", B(true))]));
+  s.check(fs, t.err && t.raw.includes("outside the authorized root"), "test unit=true refuses files outside the root (" + t.raw + ")");
+  t = s.mcpCall(fs, p, "build", O([F("entry", S("u.or")), F("out", S("build/u.c"))]));
+  v = t.value;
+  s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), true), "build erases @Test functions and does not run them (" + t.raw + ")");
+  if (exists(fs, root + "/build/bootstrap/orin2")) {
+    t = s.mcpCall(fs, p, "test", O([F("suite", S("default")), F("filter", S("hello"))]));
+    v = t.value;
+    s.check(fs, !t.err && isIntEq(at(v, ["failed"]), 0) && intVal(at(v, ["passed"])) >= 1, "suite with filter (" + t.raw + ")");
+  }
+  s.mcpClose(fs, p);
+}

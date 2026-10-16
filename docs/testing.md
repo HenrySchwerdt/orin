@@ -168,7 +168,7 @@ tests still runs), `mutate_std.py` (mutants, each in its own directory; also `--
 (the files; each runs in its own working directory because the verifier writes its solver queries to
 `build/contracts-vc/`), `test_compiler_contracts.sh` (the self-compile check and the suite run at the same time).
 `run_tests.py` compiles the runtime once per run instead of once per test (same flags; keyed by the sources). `tools/parallel.py`
-is the shared helper. `test_lsp.py` and `test_mcp.py` are one protocol session each and `test_osig.py` / `test_effects.py`
+is the shared helper. `tools/protocol.sh lsp|mcp` is one protocol session each and `test_osig.py` / `test_effects.py`
 take seconds, so they stay sequential; `--orin PATH` skips their compiler build.
 
 **CI.** The `build` job caches `build/bootstrap/orin2` and `stage2.c` (`actions/cache`), keyed by the hash of
@@ -238,6 +238,33 @@ the steps through `shellTimeout` (compile and C build 120 s, run 10 s, `compiler
 captured files, so the output does not depend on the number of workers. `--root DIR` names the repository root (default: the
 current directory). Differences from the Python scripts: a signal-killed step is exit `-1` or `128+n`, not `-n`; a program's
 stdin is `/dev/null`; the byte slice of stderr in a `compilers` DIFF line is cut on a character boundary.
+
+## Protocol harness (Orin)
+
+The end-to-end tests of the language server and the MCP server are `tooling/protocol`, an Orin package (ADR-0047 phase 5; it
+replaces `tools/test_lsp.py` and `tools/test_mcp.py`). `tools/protocol.sh` builds it with the bootstrapped compiler (never
+with the compiler under test) and runs it; the flags, `FAIL: ...` lines, summary and exit status are those of the old scripts:
+
+```bash
+tools/protocol.sh lsp --orin build/bootstrap/orin2     # orin lsp over stdio: 104 checks
+tools/protocol.sh mcp --orin build/bootstrap/orin2     # orin mcp over stdio: 191 checks
+tools/protocol.sh lsp|mcp [--orin2 build/bootstrap/orin2]   # without --orin: builds compiler/main.or into build/protocol/<suite>/orin first
+tools/protocol.sh --unit-tests                          # @Test tests of the pure helpers (framing, positions, JSON paths, options)
+```
+
+Every case of the Python scripts exists with the same requests, expected responses and `check` messages in the same order, so
+the number of checks is the same (104 and 191) and a failing compiler fails the same checks. The language has no API for a child
+process with pipes (`std:io` has `shell` and `shellTimeout`, which run a command to completion), so the harness starts the server
+in the background through the shell with stdin on a named pipe and stdout on a file, writes each message with `cat` and polls the
+file for complete frames (`Content-Length` frames for LSP, lines for MCP). Because a mutating method needs a `let` receiver, the
+session state (request id, read offset, notifications, check log) lives in small files of a private temporary directory. Handling
+of a server that dies: the run stops with the server's stderr and exit status 1 (the Python scripts end with a traceback).
+Differences from the Python scripts: the "got ..." part of a `FAIL` line shows the JSON of the value, not the Python `repr`.
+
+Parity was established by running both implementations against the same compiler (`orin2` of the same commit): both pass with
+104 and 191 checks; and against a deliberately broken compiler (a copy of `compiler/` with the `implementationProvider`
+capability removed, the effect summary text changed, `mutates` inverted and the "outside the authorized root" message changed):
+both fail the same two LSP checks and the same eleven MCP checks.
 
 ## Execution deadlines
 
