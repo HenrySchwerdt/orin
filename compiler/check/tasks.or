@@ -18,7 +18,7 @@
 // captures were already checked where it was created: it cannot capture a handle at all, E0452).
 
 import { Span, Diagnostic, diag } from "../diag";
-import { Type, RecordDef, Function, HBlock, HStmt, HExpr, Place } from "../hir";
+import { Type, RecordDef, Function, HExpr, foldBlock } from "../hir";
 
 type Tc = { funcs: Function[]; records: RecordDef[]; diags: Diagnostic[]; };
 
@@ -75,27 +75,10 @@ function body(c: Tc, args: HExpr[]): Tc {
   return x;
 }
 
-function exprs(c: Tc, es: HExpr[]): Tc {
-  let x = c;
-  for (const e of es) {
-    x = expr(x, e);
-  }
-  return x;
-}
-
-function expr(c: Tc, e: HExpr): Tc {
+// What one node contributes (the traversal is hir/walk.or): the closure literals passed to `spawn*`, the capacity of a channel.
+function expr(e: HExpr, c: Tc): Tc {
   let x = c;
   match (e.kind) {
-    XInt(_) => {},
-    XFloat(_) => {},
-    XBool(_) => {},
-    XStr(_) => {},
-    XLocal(_) => {},
-    XUnary(_, a) => { x = expr(x, a); },
-    XBinary(_, a, b) => {
-      x = expr(x, a);
-      x = expr(x, b);
-    },
     XCall(fid, args) => {
       const n = calleeName(x, fid);
       if (isSpawn(n)) {
@@ -111,112 +94,8 @@ function expr(c: Tc, e: HExpr): Tc {
           _ => {}
         }
       }
-      x = exprs(x, args);
     },
-    XBuiltin(_, args) => { x = exprs(x, args); },
-    XMutMethod(_, p, args) => {
-      x = place(x, p);
-      x = exprs(x, args);
-    },
-    XField(b, _, _) => { x = expr(x, b); },
-    XIndex(b, i) => {
-      x = expr(x, b);
-      x = expr(x, i);
-    },
-    XRecord(_, sp, fs) => {
-      match (sp) {
-        Some(s) => { x = expr(x, s); },
-        None => {}
-      }
-      for (const f of fs) {
-        x = expr(x, f.value);
-      }
-    },
-    XVariant(_, payload) => { x = exprs(x, payload); },
-    XArray(xs) => { x = exprs(x, xs); },
-    XTry(a) => { x = expr(x, a); },
-    XCond(a, b, d) => {
-      x = expr(x, a);
-      x = expr(x, b);
-      x = expr(x, d);
-    },
-    XMatch(s, arms) => {
-      x = expr(x, s);
-      for (const a of arms) {
-        x = block(x, a.body);
-        match (a.value) {
-          Some(v) => { x = expr(x, v); },
-          None => {}
-        }
-      }
-    },
-    XClosure(_, caps) => { x = exprs(x, caps); },
-    XCallIndirect(f, args) => {
-      x = expr(x, f);
-      x = exprs(x, args);
-    },
-    XIface(_, v) => { x = expr(x, v); },
-    XCallVirtual(r, _, args) => {
-      x = expr(x, r);
-      x = exprs(x, args);
-    }
-  }
-  return x;
-}
-
-function place(c: Tc, p: Place): Tc {
-  let x = c;
-  for (const el of p.path) {
-    match (el) {
-      PIndex(ix) => { x = expr(x, ix); },
-      _ => {}
-    }
-  }
-  return x;
-}
-
-function block(c: Tc, b: HBlock): Tc {
-  let x = c;
-  for (const s of b.stmts) {
-    x = stmt(x, s);
-  }
-  return x;
-}
-
-function stmt(c: Tc, s: HStmt): Tc {
-  let x = c;
-  match (s) {
-    HLet(_, init) => { x = expr(x, init); },
-    HAssign(p, _, v) => {
-      x = place(x, p);
-      x = expr(x, v);
-    },
-    HExprStmt(e) => { x = expr(x, e); },
-    HIf(cond, th, el) => {
-      x = expr(x, cond);
-      x = block(x, th);
-      match (el) {
-        Some(b) => { x = block(x, b); },
-        None => {}
-      }
-    },
-    HWhile(cond, b) => {
-      x = expr(x, cond);
-      x = block(x, b);
-    },
-    HForOf(_, it, b) => {
-      x = expr(x, it);
-      x = block(x, b);
-    },
-    HBreak => {},
-    HContinue => {},
-    HReturn(r) => {
-      match (r) {
-        Some(e) => { x = expr(x, e); },
-        None => {}
-      }
-    },
-    HBlockStmt(b) => { x = block(x, b); }
+    _ => {}
   }
   return x;
 }
@@ -235,7 +114,7 @@ export function taskDiags(funcs: Function[], records: RecordDef[]): Diagnostic[]
   }
   let c = Tc { funcs: funcs, records: records, diags: [] };
   for (const f of funcs) {
-    c = block(c, f.body);
+    c = foldBlock(f.body, c, expr);
   }
   return c.diags;
 }

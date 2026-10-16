@@ -2,6 +2,11 @@
 
 ## Unreleased
 - **User-defined annotations, metadata only (ADR-0046 S1).** A record type marked `@Annotation(function, method, class, type, interface, field, const)` defines an annotation; `@Name` / `@Name(a, b)` applies it to functions, methods, classes, types, interfaces, interface methods, module constants and the fields of records and classes (fields and constants of built-ins are still E0440). Arguments are constants in field order (literals with unary `-`, array literals, tags of a payload-free union, module `const`s with constant initialisers; trailing `Option` fields may be omitted). Names resolve like type names, local or imported. New code `compiler/check/userannos.or`; AST `ACustom` / `AAnnotation`, annotations on `FieldDecl`, `ClassField` and `ConstDecl`; the formatter prints them like the built-ins (a field annotation on the field's line). New errors E0446 (unsupported field type of an annotation record) and E0447 (reserved name declared, imported or shadowed; `__g` identifier prefix); E0408, E0440, E0441, E0442 extend to user annotations. No code generation: programs compile to the same C and LLVM IR as before. The explorer component `Inline` was renamed `InlineText` (`Inline` is a reserved name).
+- **`--release` defaults to the LLVM backend (ADR-0038 section 8, owner's decision).** `orin build|run|test --release` now compiles with
+  LLVM; `--backend=c` is the explicit fallback and dev builds stay on C. Without the pinned toolchain the default release build uses
+  a system `clang` whose major version is at least the pin's and otherwise falls back to C with one note; a `CC` that is not clang
+  keeps C. Both backends run the same MIR optimiser and compile at `-O2`. `tools/test_cli.py` covers default, fallback, `--backend=c`
+  and `CC` precedence.
 - **Pinned LLVM toolchain (ADR-0038 section 8, gate 3).** New `orin toolchain install [--force]` / `status` (in `dist/orin`, wired
   into `dist/orin-cli.sh`): it downloads the LLVM release pinned in `dist/llvm.pin` (19.1.7; linux-x86_64, linux-aarch64,
   macos-arm64), refuses the archive unless its sha256 matches the pin, unpacks `clang`, `llc` and clang's resource directory (about

@@ -34,6 +34,7 @@ mkdir -p build
     echo "sh tools/test_tooling.sh --unit $t"
   done
   echo '$ORIN2 test compiler/tests/terminal_test.or --runtime runtime/core'
+  echo '$ORIN2 test compiler/tests/util_test.or --runtime runtime/core'
   # diag + loader unit tests (@Test; `orin test` runs them with contract checking)
   echo '$ORIN2 test compiler/tests/loader_test.or --runtime runtime/core'
   echo '$ORIN2 test compiler/tests/loader_classes_test.or --runtime runtime/core'
@@ -44,6 +45,8 @@ mkdir -p build
   echo '$ORIN2 test compiler/tests/lower_test.or --runtime runtime/core'
   # fusion of array pipelines (ADR-0038 §2): recognisers, chain analysis, verifier on fused MIR
   echo '$ORIN2 test compiler/tests/fuse_test.or --runtime runtime/core'
+  # the generic HIR fold (hir/walk.or): visiting order and threaded state
+  echo '$ORIN2 test compiler/tests/hirwalk_test.or --runtime runtime/core'
   # optimiser and code generator unit tests (3d): passes, inference, pruning, emitters, symbol tables, rule 8
   echo '$ORIN2 test compiler/tests/opt_test.or --runtime runtime/core'
   echo '$ORIN2 test compiler/tests/emit_test.or --runtime runtime/core'
