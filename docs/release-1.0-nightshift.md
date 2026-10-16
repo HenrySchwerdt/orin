@@ -94,3 +94,16 @@ and disable the night-shift heartbeat. Do not claim feature completeness or proo
   legacy Json/public/internal parsers, float conversion and decoders stay outside scope.
 - Maximum two writers, independent review and coordinator-only merging remain in
   force. Morning checkpoint remains 07:30 Europe/Berlin; incomplete work is reported honestly.
+
+## 07:30 final checkpoint (2026-10-16)
+
+- Night shift stopped; heartbeat orin-1-0-night-shift is PAUSED. Both workers were asked to checkpoint.
+- Coordinator merged #82–#90 and #93–#97 after independent review and exact-head green CI.
+- Latest observed main e2fb538 (including separately merged Claude #100) has green CI; the
+  coordinator-reviewed integration through #97 at 21681d2 also passed.
+- Open #91 requires an owner tradeoff decision; #98 is parked; new #101 needs review.
+- Final usage observation: five-hour 93%, weekly 45%. No new dispatch. Local Claude auth remains absent.
+- Detailed local handoff: build/overnight/morning-report.md; generated state: build/overnight/state.json.
+- Stable scope, final candidate artifacts/platform validation and remaining std/proof gaps are
+  recorded in the handoff and release-readiness audit. No 1.0 readiness or publication is claimed.
+- This final plan checkpoint is local and uncommitted; no post-cutoff implementation or PR was started.
