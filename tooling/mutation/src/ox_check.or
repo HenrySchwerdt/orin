@@ -1,0 +1,127 @@
+// Mutation check of the OX part of the compiler (ADR-0043, ADR-0044): port of tools/mutate_ox.py.
+//
+// Each mutant (mutants_ox.or) is a small, deliberately wrong change of the OX lexer, parser or checker. The compiler sources
+// are copied to build/mutate_ox/<mutant>/, the mutation is applied, the mutated compiler is built (one self-compile by
+// --orinc, then cc -O1) and the OX conformance tests (`tests/next/{run,errors}/ox_*`) are run with it. A mutant is killed
+// when a test fails (or the mutated compiler does not build). Every mutant must be killed.
+
+import { ProcessGrant } from "std:process";
+import { FsGrant, readFile, writeFile } from "std:fs";
+import { shellTimeout } from "std:io";
+import { shq, countOf, replaceFirst, replaceAll, splitLines, tailBytes, padEnd } from "./text";
+import { OxMutant } from "./mutants_ox";
+import { NOT_RUN } from "./exec";
+
+export const OX_OUT: string = "build/mutate_ox";
+
+export type OxJob = { root: string; orinc: string; cc: string; dir: string; rel: string; };
+
+// Stage of the run that decided the mutant: 1 the mutated compiler does not compile (killed), 2 the C build failed
+// (ERROR), 3 a conformance test failed (killed), 4 every test passed (SURVIVED). `copy` is the status of the copy step.
+export type OxRun = { stage: int; copy: int; };
+
+// The mutants selected by `--only NAME[,NAME]` (every mutant for "").
+export function selectOx(all: OxMutant[], only: string): OxMutant[] {
+  if (only == "") {
+    return all;
+  }
+  const keep = only.split(",");
+  let out: OxMutant[] = [];
+  for (const m of all) {
+    if (keep.includes(m.name)) {
+      out.push(m);
+    }
+  }
+  return out;
+}
+
+export function listLine(m: OxMutant): string {
+  return padEnd(m.name, 36) + " " + m.rel;
+}
+
+export function resultLine(name: string, status: string, detail: string): string {
+  return "[mutate_ox] " + padEnd(name, 36) + " " + status + " " + detail;
+}
+
+export function summaryLine(total: usize, killed: usize, notKilled: usize): string {
+  return "[mutate_ox] " + total.toString() + " mutants, " + killed.toString() + " killed, " + notKilled.toString() + " not killed";
+}
+
+// The first three failing tests of the output of the conformance runner: its `FAIL <suite>/<test>` lines.
+export function failDetail(output: string): string {
+  let names: string[] = [];
+  for (const l of splitLines(output)) {
+    if (l.startsWith("FAIL") && names.length < 3) {
+      names.push(l.substring(5, l.length));
+    }
+  }
+  return names.join(", ");
+}
+
+export function runOx(p: ProcessGrant, j: OxJob): OxRun {
+  const root = "cd " + shq(j.root) + " && ";
+  const d = shq(j.dir);
+  const log = " > " + shq(j.dir + "/build.log") + " 2>&1 </dev/null";
+  // the mutated file is in place of the copy's: <dir>.mutated was written by the main task
+  let rc = shellTimeout(p, root + "rm -rf " + d + " && mkdir -p " + d + " && cp -R compiler " + shq(j.dir + "/compiler") + " && cp "
+    + shq(j.dir + ".mutated") + " " + shq(j.dir + "/compiler/" + j.rel), 900);
+  if (rc != 0) {
+    return OxRun { stage: 0, copy: rc };
+  }
+  rc = shellTimeout(p, root + shq(j.orinc) + " compile " + shq(j.dir + "/compiler/main.or") + " -o " + shq(j.dir + "/orin.c") + log, 900);
+  if (rc != 0) {
+    return OxRun { stage: 1, copy: 0 };
+  }
+  rc = shellTimeout(p, root + shq(j.cc) + " -O1 -w -I runtime/core " + shq(j.dir + "/orin.c") + " runtime/core/orin_runtime.c runtime/platform/orin_platform.c"
+    + " -lm -lpthread -o " + shq(j.dir + "/orin") + log, 900);
+  if (rc != 0) {
+    return OxRun { stage: 2, copy: 0 };
+  }
+  // The tests run in the mutant's own root (its tests/ and runtime/ are links to the repository's), so that the build
+  // directory build/tests of the runner is private to the mutant: mutants running in parallel never share a test executable.
+  rc = shellTimeout(p, root + "ln -s \"$PWD/tests\" " + shq(j.dir + "/tests") + " && ln -s \"$PWD/runtime\" " + shq(j.dir + "/runtime")
+    + " && tools/conformance.sh --root " + shq(j.dir) + " --orinc \"$PWD\"/" + shq(j.dir + "/orin") + " --suite next --filter ox --jobs 1 > "
+    + shq(j.dir + "/run.log") + " 2>&1 </dev/null", 900);
+  if (rc != 0) {
+    return OxRun { stage: 3, copy: 0 };
+  }
+  return OxRun { stage: 4, copy: 0 };
+}
+
+function readOut(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+// status and detail of a mutant from the stage its run reached.
+export type OxResult = { status: string; detail: string; };
+
+export function judgeOx(fs: FsGrant, j: OxJob, r: OxRun): OxResult {
+  if (r.stage == 0) {
+    return OxResult { status: "ERROR", detail: "copying the compiler sources failed (exit " + r.copy.toString() + ")" };
+  }
+  if (r.stage == 1) {
+    return OxResult { status: "killed", detail: "the mutated compiler does not compile" };
+  }
+  if (r.stage == 2) {
+    return OxResult { status: "ERROR", detail: "cc failed: " + tailBytes(readOut(fs, j.root + "/" + j.dir + "/build.log"), 400) };
+  }
+  if (r.stage == 3) {
+    return OxResult { status: "killed", detail: failDetail(readOut(fs, j.root + "/" + j.dir + "/run.log")) };
+  }
+  return OxResult { status: "SURVIVED", detail: "" };
+}
+
+// Writes the mutated source of `compiler/<rel>` to <dir>.mutated; an error text unless the old text occurs exactly once.
+export function prepareOx(fs: FsGrant, root: string, orinc: string, cc: string, src: string, m: OxMutant): Result<OxJob, string> {
+  const n = countOf(src, m.oldText);
+  if (n != 1) {
+    return Err("the old text occurs " + n.toString() + " times in " + m.rel);
+  }
+  const dir = OX_OUT + "/" + m.name;
+  writeFile(fs, root + "/" + dir + ".mutated", replaceFirst(src, m.oldText, m.newText));
+  return Ok(OxJob { root: root, orinc: orinc, cc: cc, dir: dir, rel: m.rel });
+}
