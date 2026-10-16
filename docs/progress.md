@@ -23,6 +23,7 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 | Lean: RC machine safety, COW, checker soundness for the MIR core | done (partial) |
 | Tooling: fmt, check --format=json, lsp, mcp, VS Code | done |
 | Parser error recovery: up to 20 syntax errors per file (CLI, JSON, LSP, MCP), first error unchanged, no type checking of a file that does not parse (docs/rewrite.md "Parser error recovery") | done |
+| Code explorer (ADR-0050) with a business view for product owners (ADR-0051): rules as sentences, use cases, capabilities, behaviour diff; rule status (proved / runtime / open) waits for OSIG to carry it | done (status: open item) |
 | Releases (dispatch workflow, packages, seed C) | done |
 | Seed bootstrap (ADR-0014) | done |
 | Floats (`float`, `f32`), `std:math`, `Map<K,V>` (ADR-0018) | done |

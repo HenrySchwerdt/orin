@@ -120,7 +120,7 @@ so `stage2.c == stage3.c` still holds):
   `tools/verify_all.py` verifies the whole prelude. A new MIR instruction that names a function must be
   added to `callees`/`renumber` there.
 - **Flags.** `--c-builtins` keeps the C runtime path (differential testing:
-  `python3 tools/diff_backends.py --mode builtins`); `orin check` loads no
+  `tools/differential.sh --mode builtins`); `orin check` loads no
   prelude.
 - **Rules for prelude code** (also in `library/core/module.or`): only the primitives the C runtime keeps
   (`length`, `charCodeAt`, `charAt`, `substring`, `String.fromCharCode`, `+`, array `push`/index/`length`,

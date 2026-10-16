@@ -1,0 +1,200 @@
+// Program discovery, the commands of the build-and-run pipeline of one program, and the comparison of two runs. Port of
+// `entries`, `build_and_run` and the comparison loop of `main` in tools/diff_backends.py. Paths are relative to the
+// repository root; every command starts with `cd <root>`, like the Python script's `cwd=ROOT`.
+
+import { FsGrant, exists, listDir, readFile } from "std:fs";
+import { shq, sortedStrings, reprStr, reprBytes, cutBytes } from "./text";
+import { Options } from "./cli";
+
+export const OUT: string = "build/diff";
+export const COMPILE_TIMEOUT: int = 120;
+export const RUN_TIMEOUT: int = 10;
+
+// A program: its name (`next_` before the name of a `tests/next/run` program) and its entry file.
+export type Program = { name: string; entry: string; };
+
+function dropSlash(e: string): string {
+  return e.endsWith("/") ? e.substring(0, e.length - 1) : e;
+}
+
+// The programs of `tests/<suite>` (suite: "run" or "next/run"): `<name>.or` files and `<name>/main.or` directories, in byte
+// order of the entry names.
+export function entries(fs: FsGrant, root: string, suite: string): Program[] {
+  const base = "tests/" + suite;
+  const prefix = suite == "run" ? "" : suite.split("/").join("_") + "_";
+  let raw: string[] = [];
+  for (const e of listDir(fs, root + "/" + base)) {
+    raw.push(e);
+  }
+  // `listDir` puts a "/" after directories; Python's listdir does not, so sort by the bare names
+  let names: string[] = [];
+  for (const e of raw) {
+    names.push(dropSlash(e));
+  }
+  let out: Program[] = [];
+  for (const n of sortedStrings(names)) {
+    if (raw.includes(n + "/")) {
+      if (exists(fs, root + "/" + base + "/" + n + "/main.or")) {
+        out.push(Program { name: prefix + n, entry: base + "/" + n + "/main.or" });
+      }
+    } else if (n.endsWith(".or")) {
+      out.push(Program { name: prefix + n.substring(0, n.length - 3), entry: base + "/" + n });
+    }
+  }
+  return out;
+}
+
+// The extra compiler flags of the alternative side of a mode (the default pipeline is the other side).
+export function modeFlags(mode: string): string[] {
+  if (mode == "opt") {
+    return ["--no-opt"];
+  }
+  if (mode == "llvm") {
+    return ["--backend=llvm"];
+  }
+  if (mode == "builtins") {
+    return ["--c-builtins"];
+  }
+  return ["--no-fuse"];
+}
+
+function words(ws: string[]): string {
+  let q: string[] = [];
+  for (const w of ws) {
+    q.push(shq(w));
+  }
+  return q.join(" ");
+}
+
+// The compiler as the shell must name it: a relative path is relative to the root (the Python script joins it with ROOT).
+export function compilerPath(orinc: string): string {
+  return orinc.startsWith("/") ? orinc : "./" + orinc;
+}
+
+// The files and commands of one side (default pipeline or alternative) of one program.
+export type Pipe = {
+  cFile: string;
+  exe: string;
+  cerr: string;
+  ccerr: string;
+  rout: string;
+  cmds: string[];      // compile, build, run
+  timeouts: int[];
+};
+
+// C compiler command and flags of a side: clang -O2 for the LLVM side, `--cc` -O1 otherwise; sanitizers on both.
+export function ccBase(o: Options, llvm: bool): string[] {
+  let cc: string[] = [];
+  if (llvm) {
+    cc = ["clang", "-O2", "-w", "-I", "runtime/core"];
+  } else {
+    cc = [o.cc, "-O1", "-w", "-I", "runtime/core"];
+  }
+  if (o.sanitize) {
+    cc = cc.concat(["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]);
+  }
+  return cc;
+}
+
+export function runtimeSources(llvm: bool): string[] {
+  let srcs = ["runtime/core/orin_runtime.c", "runtime/platform/orin_platform.c"];
+  if (llvm) {
+    srcs.push("runtime/core/orin_runtime_llvm.c");
+  }
+  return srcs;
+}
+
+export function pipeline(o: Options, p: Program, tag: string, extra: string[], llvm: bool): Pipe {
+  const stem = OUT + "/" + p.name + "." + tag;
+  const cFile = stem + (llvm ? ".ll" : ".c");
+  const exe = stem + ".exe";
+  const cerr = stem + ".cerr";
+  const ccerr = stem + ".ccerr";
+  const rout = stem + ".rout";
+  const cd = "cd " + shq(o.root) + " && ";
+  const compile = cd + words([compilerPath(o.orinc), "compile", p.entry, "-o", cFile].concat(extra))
+    + " >/dev/null 2>" + shq(cerr) + " </dev/null";
+  const build = cd + words(ccBase(o, llvm).concat([cFile]).concat(runtimeSources(llvm)).concat(["-lm", "-o", exe]))
+    + " >/dev/null 2>" + shq(ccerr) + " </dev/null";
+  const run = cd + shq("./" + exe) + " >" + shq(rout) + " 2>/dev/null </dev/null";
+  return Pipe {
+    cFile: cFile, exe: exe, cerr: cerr, ccerr: ccerr, rout: rout,
+    cmds: [compile, build, run], timeouts: [COMPILE_TIMEOUT, COMPILE_TIMEOUT, RUN_TIMEOUT]
+  };
+}
+
+// What one side of a program did. `kind`: "compile-fail" | "cc-fail" (then `detail` is the first 300 characters of the
+// error output, "timeout" for a timeout) | "ok" (then `rc` is the exit status of the program, -2 for a timeout, and `out`
+// its stdout, "" after a timeout).
+export type Side = { kind: string; rc: int; detail: string; out: string; };
+
+export const TIMEOUT: int = -2;
+
+export function timedOut(s: Side): bool {
+  return s.kind == "ok" && s.rc == TIMEOUT;
+}
+
+// The `str()` of the Python tuple a side is: ('compile-fail', '...') or ('ok', (0, b'...')); cut to 300 characters.
+export function describe(s: Side): string {
+  let text = "";
+  if (s.kind == "ok") {
+    text = "('ok', (" + (s.rc == TIMEOUT ? "None" : s.rc.toString()) + ", " + reprBytes(s.out) + "))";
+  } else {
+    text = "(" + reprStr(s.kind) + ", " + reprStr(s.detail) + ")";
+  }
+  return cutBytes(text, 300);
+}
+
+// "same", "skip" (exactly one side timed out: not a behavioural difference, e.g. the unoptimised build of a test that is
+// quadratic without owned parameters) or "diff". `sameOut`: the stdout of the two sides is identical (only read when both
+// sides ran to completion with the same status).
+export function verdict(a: Side, b: Side, sameOut: bool): string {
+  let same = a.kind == b.kind;
+  if (same) {
+    if (a.kind == "ok") {
+      same = a.rc == b.rc && (a.rc == TIMEOUT || sameOut);
+    } else {
+      same = a.detail == b.detail;
+    }
+  }
+  if (same) {
+    return "same";
+  }
+  if (timedOut(a) != timedOut(b)) {
+    return "skip";
+  }
+  return "diff";
+}
+
+// True when the stdout files of two completed runs must be compared (`cmp`): both ran, same status, no timeout.
+export function needsCompare(a: Side, b: Side): bool {
+  return a.kind == "ok" && b.kind == "ok" && a.rc == b.rc && a.rc != TIMEOUT;
+}
+
+// The whole file, "" when it cannot be read.
+export function readText(fs: FsGrant, path: string): string {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return "";
+  }
+  return r.unwrap();
+}
+
+// The side from the exit statuses `rcs` of its pipeline and the files it wrote.
+export function sideOf(fs: FsGrant, root: string, pipe: Pipe, rcs: int[]): Side {
+  if (rcs[0] != 0) {
+    return Side { kind: "compile-fail", rc: rcs[0], detail: failDetail(fs, root, pipe.cerr, rcs[0]), out: "" };
+  }
+  if (rcs[1] != 0) {
+    return Side { kind: "cc-fail", rc: rcs[1], detail: failDetail(fs, root, pipe.ccerr, rcs[1]), out: "" };
+  }
+  const out = rcs[2] == TIMEOUT ? "" : readText(fs, root + "/" + pipe.rout);
+  return Side { kind: "ok", rc: rcs[2], detail: "", out: out };
+}
+
+function failDetail(fs: FsGrant, root: string, errFile: string, rc: int): string {
+  if (rc == TIMEOUT) {
+    return "timeout";
+  }
+  return cutBytes(readText(fs, root + "/" + errFile), 300);
+}

@@ -53,7 +53,7 @@ Documentation MUST state for each runtime function which layer it is in and whic
   see docs/architecture.md "Preludes"). The checker keeps the same surface API; lowering maps the
   moved built-ins to calls of the prelude functions; unreachable prelude functions are pruned from the
   emitted C. The C versions stay in `runtime/core/orin_runtime.c` because Stage 0 (frozen) and
-  `--c-builtins` (the differential-test path, `tools/diff_backends.py --mode builtins`) still use
+  `--c-builtins` (the differential-test path, `tools/differential.sh --mode builtins`) still use
   them. Slice/concat/get of arrays were **not** moved: they are generic over the element type, and
   the prelude has no way to be instantiated per element type without generics-in-prelude (checker
   instance requests) or the R3 core dialect (raw slot copies). `substring` stays in C as a primitive

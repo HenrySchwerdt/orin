@@ -5,7 +5,10 @@
 import { Diagnostic, diag } from "../diag";
 import { Ident } from "../syntax";
 import { Type, Local, HStmt, HExpr, Place } from "../hir";
-import { FuncInfo, Env, typeEq } from "./env";
+import {
+  FuncInfo, Env, typeEq, FnMode, FmOrdinary, ContractMode, CmCode, sameContractMode, isOrdinaryMode,
+  isClassMode,
+} from "./env";
 import { MAX_DEPTH } from "./types";
 
 // What a visible name is bound to: the local's id and the scope level it was declared at.
@@ -178,19 +181,18 @@ function sameTables(old: Env, e: Env): bool {
 // body gets a context of its own (`newClosureCtx`).
 //
 // Invariants: a scope is always open (the parameters' scope at least); every capture is a local;
-// `cmode` is one of the four contract modes; a result type is only inferred (`retSeen`) for a closure
+// a result type is only inferred (`retSeen`) for a closure
 // that asked for it; a closure has its environment local 0; the type parameters and their bindings are
 // parallel; an ordinary function's lowered result type is its source result type; a generic instance is
 // no deeper than the instantiation limit (types.or).
 @Invariant(this.scope.depth() >= 1)
 @Invariant(this.caps.size() <= this.locals.length)
-@Invariant(this.cmode >= 0 && this.cmode <= 3)
 @Invariant(this.retSeen.isSome() ==> this.retInfer)
 @Invariant(this.outer.isSome() ==> this.locals.length >= 1)
 @Invariant(this.tpNames.length == this.tpTys.length)
-@Invariant(this.fmode >= 0 && this.fmode <= 6 && this.clsAcc >= -1)
+@Invariant(this.clsAcc >= -1)
 @Invariant(this.depth <= MAX_DEPTH)
-@Invariant(this.fmode == 0 ==> typeEq(this.ret, this.lret))
+@Invariant(isOrdinaryMode(this.fmode) ==> typeEq(this.ret, this.lret))
 export class FnCtx {
   unit: usize;
   ret: Type; // the source-level result type
@@ -203,7 +205,7 @@ export class FnCtx {
   abs: bool = false; // abstract check of a generic body: no function instances are created
   depth: usize = 0; // instantiation depth of the function being checked
   // Classes (ADR-0009): FuncInfo.mode / cls of the function being checked ...
-  fmode: int = 0;
+  fmode: FnMode = FmOrdinary;
   fcls: usize = 0;
   lret: Type; // the lowered return type (FuncInfo.ret); `ret` is the source-level one
   // ... statements hoisted out of the expression being checked (mutating method calls), flushed by
@@ -226,10 +228,9 @@ export class FnCtx {
   clsAcc: int = -1; // class whose private members are visible here (-1: none); closures inherit it
   selfName: string = ""; // name of the `let` whose initialiser is being checked ("" if none)
   pendLet: string = ""; // set by `let` while checking its initialiser, consumed by an arrow
-  // Contract clauses (ADR-0012): 0 ordinary code, 1 contract expression (`@Requires`, `@Invariant`,
-  // `@Decreases`), 2 `@Ensures` expression (`result`, `old(..)`), 3 inside `old(..)`; and the checked
+  // Contract clauses (ADR-0012): the ContractMode of the expression being checked; and the checked
   // expressions of the loop clauses seen so far (for the purity pass).
-  cmode: int = 0;
+  cmode: ContractMode = CmCode;
   cexprs: HExpr[] = [];
 
   @Requires(scope.depth() >= 1)
@@ -432,9 +433,8 @@ export class FnCtx {
 
   // ---- contract modes and mutation tracking ----------------------------------------------------
 
-  @Requires(m >= 0 && m <= 3)
-  @Ensures(this.cmode == m)
-  setCmode(m: int): void {
+  @Ensures(sameContractMode(this.cmode, m))
+  setCmode(m: ContractMode): void {
     this.cmode = m;
   }
 
@@ -474,7 +474,14 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
     scope.bind(l.name, i);
     i += 1;
   }
-  let fx = new FnCtx(f.unit, f.qname, env, f.paramLocals, scope, f.mode == 0 ? f.ret : f.srcRet);
+  let fx = new FnCtx(
+    f.unit,
+    f.qname,
+    env,
+    f.paramLocals,
+    scope,
+    isOrdinaryMode(f.mode) ? f.ret : f.srcRet,
+  );
   fx.tpNames = f.tpNames;
   fx.tpTys = f.tpTys;
   fx.abs = abs;
@@ -482,7 +489,7 @@ export function newFnCtx(f: FuncInfo, env: Env, abs: bool): FnCtx {
   fx.fmode = f.mode;
   fx.fcls = f.cls;
   fx.lret = f.ret;
-  fx.clsAcc = f.mode >= 1 && f.mode <= 5 ? f.cls.toInt() : -1;
+  fx.clsAcc = isClassMode(f.mode) ? f.cls.toInt() : -1;
   return fx;
 }
 

@@ -1,0 +1,168 @@
+// Orin differential harness (ADR-0047 phase 5): the Orin port of tools/diff_backends.py and tools/diff_compilers.py, with the
+// same flags, output and exit status. See tooling/differential/README.md and docs/testing.md.
+//
+//   orin-differential --mode opt|llvm|builtins|fuse [--orinc COMPILER] [--cc CC] [--filter SUBSTR] [--sanitize]
+//                     [--shard I/N] [--list] [--root DIR]
+//   orin-differential compilers BASE_ORIN NEW_ORIN [--root DIR]
+//
+// Exit status: 0 no difference, 1 differences, 2 usage.
+
+import { Host, withHost } from "std:host";
+import { ProcessGrant, args, exit } from "std:process";
+import { FsGrant } from "std:fs";
+import { shell } from "std:io";
+import { shq, strip } from "./text";
+import { Options, parseArgs, parseIntLoose, inShard, usage, helpText } from "./cli";
+import { OUT, Program, Pipe, Side, entries, modeFlags, pipeline, sideOf, verdict, needsCompare, describe, readText } from "./suite";
+import { Job, Outcome, runAll } from "./exec";
+import { runCompilers } from "./compilers";
+
+// The CPU count (`os.cpu_count() or 4`), through the shell: the language has no way to ask for it.
+function cpuCount(fs: FsGrant, proc: ProcessGrant, root: string): usize {
+  const file = OUT + "/.cpus";
+  const sh = "{ getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; } > " + shq(file);
+  if (shell(proc, "cd " + shq(root) + " && " + sh) == 0) {
+    const n = parseIntLoose(strip(readText(fs, root + "/" + file)));
+    if (n.isSome() && n.unwrap() > 0) {
+      return n.unwrap().toUsize();
+    }
+  }
+  return 4;
+}
+
+function runModes(fs: FsGrant, proc: ProcessGrant, o: Options): int {
+  if (shell(proc, "cd " + shq(o.root) + " && mkdir -p " + shq(OUT)) != 0) {
+    console.error("orin-differential: cannot create " + o.root + "/" + OUT);
+    return 1;
+  }
+  let tests: Program[] = [];
+  for (const suite of ["run", "next/run"]) {
+    for (const p of entries(fs, o.root, suite)) {
+      if (p.name.includes(o.filter)) {
+        tests.push(p);
+      }
+    }
+  }
+  let selected: Program[] = [];
+  let k: usize = 0;
+  while (k < tests.length) {
+    if (inShard(k, o.shardIndex, o.shardCount)) {
+      selected.push(tests[k]);
+    }
+    k += 1;
+  }
+  if (o.list) {
+    let names: string[] = [];
+    for (const p of selected) {
+      names.push(p.name);
+    }
+    console.log(names.join("\n"));
+    return 0;
+  }
+  const oldFlags = modeFlags(o.mode);
+  const oldIsLlvm = o.mode == "llvm";
+  // two pipelines per program (default, alternative): jobs 2i and 2i+1
+  let pipes: Pipe[] = [];
+  let jobs: Job[] = [];
+  for (const p of selected) {
+    const a = pipeline(o, p, "new", [], false);
+    const b = pipeline(o, p, "old", oldFlags, oldIsLlvm);
+    for (const pipe of [a, b]) {
+      pipes.push(pipe);
+      jobs.push(Job { id: jobs.length, cmds: pipe.cmds, timeouts: pipe.timeouts, stop: true });
+    }
+  }
+  const ran = runAll(proc, jobs, cpuCount(fs, proc, o.root));
+  let sidesA: Side[] = [];
+  let sidesB: Side[] = [];
+  k = 0;
+  while (k < selected.length) {
+    sidesA.push(sideOf(fs, o.root, pipes[2 * k], ran[2 * k].rcs));
+    sidesB.push(sideOf(fs, o.root, pipes[2 * k + 1], ran[2 * k + 1].rcs));
+    k += 1;
+  }
+  // byte comparison of the stdout files, for the programs that ran to completion with the same status
+  let cmpJobs: Job[] = [];
+  let cmpOf: int[] = [];
+  k = 0;
+  while (k < selected.length) {
+    if (needsCompare(sidesA[k], sidesB[k])) {
+      cmpOf.push(cmpJobs.length.toInt());
+      cmpJobs.push(Job {
+        id: cmpJobs.length,
+        cmds: ["cd " + shq(o.root) + " && cmp -s " + shq(pipes[2 * k].rout) + " " + shq(pipes[2 * k + 1].rout)],
+        timeouts: [60],
+        stop: false
+      });
+    } else {
+      cmpOf.push(-1);
+    }
+    k += 1;
+  }
+  const cmps = runAll(proc, cmpJobs, cpuCount(fs, proc, o.root));
+  let diffs: usize = 0;
+  let skipped: usize = 0;
+  k = 0;
+  while (k < selected.length) {
+    const c = cmpOf[k];
+    const sameOut = c < 0 || cmps[c.toUsize()].rcs[0] == 0;
+    const v = verdict(sidesA[k], sidesB[k], sameOut);
+    if (v == "skip") {
+      skipped += 1;
+      console.log("SKIP " + selected[k].name + " (one side timed out)");
+    } else if (v == "diff") {
+      diffs += 1;
+      console.log("DIFF " + selected[k].name + "\n   new: " + describe(sidesA[k]) + "\n   old: " + describe(sidesB[k]));
+    }
+    k += 1;
+  }
+  console.log(selected.length.toString() + " programs compared (" + o.mode + "), " + diffs.toString() + " differences, "
+    + skipped.toString() + " skipped (timeout)");
+  return diffs > 0 ? 1 : 0;
+}
+
+// `compilers BASE NEW [--root DIR]`
+function runCompilersCommand(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  let pos: string[] = [];
+  let root = ".";
+  let i: usize = 1;
+  while (i < argv.length) {
+    if (argv[i] == "--root" && i + 1 < argv.length) {
+      root = argv[i + 1];
+      i += 2;
+    } else if (argv[i].startsWith("--root=")) {
+      root = argv[i].substring(7, argv[i].length);
+      i += 1;
+    } else {
+      pos.push(argv[i]);
+      i += 1;
+    }
+  }
+  if (pos.length < 2) {
+    console.error("usage: orin-differential compilers BASE_ORIN NEW_ORIN [--root ROOT]");
+    return 2;
+  }
+  return runCompilers(fs, proc, root, pos[0], pos[1]);
+}
+
+function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
+  if (argv.length > 0 && argv[0] == "compilers") {
+    return runCompilersCommand(fs, proc, argv);
+  }
+  const parsed = parseArgs(argv);
+  if (!parsed.ok) {
+    console.error(usage());
+    console.error("orin-differential: error: " + parsed.error);
+    return 2;
+  }
+  if (parsed.options.help) {
+    console.log(helpText());
+    return 0;
+  }
+  return runModes(fs, proc, parsed.options);
+}
+
+function main(host: Host): void {
+  const code = withHost(host, (fs, proc, stdio, clock) => run(fs, proc, args(proc)));
+  exit(code);
+}

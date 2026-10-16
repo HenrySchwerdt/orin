@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- **Differential harness in Orin (ADR-0047 phase 5).** New package `tooling/differential` (`tools/differential.sh --mode opt|llvm|builtins|fuse [--shard I/N] [--list]` and `tools/differential.sh compilers BASE NEW`) replaces `tools/diff_backends.py` and `tools/diff_compilers.py`, which are deleted; same flags, output, shard semantics and exit status. Parallelism is `std:task` with per-step deadlines; unit tests in `tooling/differential/tests` (`tools/differential.sh --unit-tests`). The CI jobs `llvm`, `backends` and `backends-fuse` use it.
+- **Explorer business view (ADR-0051).** `tooling/explorer` adds, first in its navigation, pages for product owners and business people: a summary, use cases (entry points with their documentation, the rules they rely on and what they may touch), business rules (every `@Requires` / `@Ensures` / `@Invariant` as a sentence, grouped by module, with proved / checked at run time / open / unknown status; OSIG does not carry the status yet, so it reads Unknown unless a node has the optional `assurance` field), capabilities in plain words ("may read the clock") per use case and package, and with `--diff` a page of behaviour changes ("New rule: ...", "Use case X may now ...", a rename is one line). No compiler change; new `business*.or` files, `theme/business.css`, tests in `tests/business_test.or`.
 - **`--release` defaults to the LLVM backend (ADR-0038 section 8, owner's decision).** `orin build|run|test --release` now compiles with
   LLVM; `--backend=c` is the explicit fallback and dev builds stay on C. Without the pinned toolchain the default release build uses
   a system `clang` whose major version is at least the pin's and otherwise falls back to C with one note; a `CC` that is not clang
@@ -95,7 +97,7 @@
   capacity for a final `map`. Not fused: function values, impure closures, non-simple value arguments, results bound to a
   variable, `sort` (a barrier). Traps: the same (stage, element) pairs are evaluated, so a fused chain traps iff the unfused one
   does; the first of two traps may differ; early exit never hides a trap. `filter -> map -> reduce` over 5 M ints: 3.9x the loop's
-  CPU time before, 1.02x after. New flags `--no-fuse` and `--fuse-report`; `tools/diff_backends.py --mode fuse`; programs without
+  CPU time before, 1.02x after. New flags `--no-fuse` and `--fuse-report`; `tools/differential.sh --mode fuse`; programs without
   an array-API call compile to byte-identical code. The rewrite exception "hot loops stay loops" is gone (docs/rewrite.md rule 7).
 - **Parallel pipelines (ADR-0039 steps 1-3).** `xs.parallel()` with `map`, `filter`, `reduce`, `some`, `every`, `find`,
   `findIndex`, `toArray`: fixed chunks of 4,096 (bit-identical results for every thread count), fused per chunk by the optimiser,
