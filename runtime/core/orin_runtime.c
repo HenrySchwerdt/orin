@@ -8,8 +8,15 @@
 /* Per-thread heap state (ADR-0017): every task allocates from, and counts in, its own thread-local state, so reference counts
  * and free lists need no atomics. Moving an object to another task's heap is safe because a block is just malloc memory
  * (freed on any thread). The process-wide totals of finished tasks are g_fold / g_fold_live. */
-static __thread int64_t g_live;
-__thread OrinStats orin_stats ORIN_TLS_MODEL;
+__thread OrinHeap orin_heap ORIN_TLS_MODEL; /* all of it, in one block: orin_runtime.h "The per-thread heap block" */
+/* The names the code below uses for the fields of the block. */
+#define g_live (orin_heap.live)
+#define fl_struct (orin_heap.fl_struct)
+#define fl_array (orin_heap.fl_array)
+#define fl_n (orin_heap.fl_n)
+#define sb_list(c) (orin_heap.sb[c].head)
+#define sb_cnt(c) (orin_heap.sb[c].n)
+#define t_dstack (orin_heap.dstack)
 static OrinStats g_fold;
 static int64_t g_fold_live;
 
@@ -356,15 +363,10 @@ void orin_trap(const char *msg) {
 #endif
 #endif
 #ifndef ORIN_NO_FREELIST
-enum { FL_STRUCT_CLASSES = 9 }; /* nslots 0..8 */
 /* A free list holds at most FL_CAP objects: a task that frees more than it allocates (the consumer of a channel) must not hoard
  * the memory of a producer that keeps allocating; beyond the cap an object goes back to the allocator. fl_n[FL_STRUCT_CLASSES]
  * counts the array headers. */
 enum { FL_CAP = 1 << 18 };
-typedef struct FreeNode { struct FreeNode *next; } FreeNode;
-static __thread FreeNode *fl_struct[FL_STRUCT_CLASSES];
-static __thread FreeNode *fl_array;
-static __thread uint32_t fl_n[FL_STRUCT_CLASSES + 1];
 #endif
 
 static void *xmalloc(size_t n) {
@@ -384,16 +386,14 @@ static void *xrealloc(void *q, size_t n) {
  * Per thread like the object lists above (a block is plain malloc memory), capped per class, and compiled out with them
  * (ASan, -DORIN_NO_FREELIST). Larger buffers go to the allocator (realloc keeps its in-place growth for them). */
 #ifndef ORIN_NO_FREELIST
-enum { SB_MAX = 256, SB_CLASSES = SB_MAX / 16, SB_CAP = 1 << 15 };
-static __thread FreeNode *sb_list[SB_CLASSES + 1];
-static __thread uint32_t sb_cnt[SB_CLASSES + 1];
+enum { SB_CAP = 1 << 15 };
 static inline void *sb_alloc(size_t n) {
     if (n <= SB_MAX) {
         size_t c = (n + 15) >> 4;
-        FreeNode *f = sb_list[c];
+        FreeNode *f = sb_list(c);
         if (f) {
-            sb_list[c] = f->next;
-            sb_cnt[c]--;
+            sb_list(c) = f->next;
+            sb_cnt(c)--;
             return f;
         }
         return xmalloc(c << 4);
@@ -403,10 +403,10 @@ static inline void *sb_alloc(size_t n) {
 static inline void sb_free(void *p, size_t n) {
     if (n <= SB_MAX) {
         size_t c = (n + 15) >> 4;
-        if (sb_cnt[c] < SB_CAP) {
-            ((FreeNode *)p)->next = sb_list[c];
-            sb_list[c] = (FreeNode *)p;
-            sb_cnt[c]++;
+        if (sb_cnt(c) < SB_CAP) {
+            ((FreeNode *)p)->next = sb_list(c);
+            sb_list(c) = (FreeNode *)p;
+            sb_cnt(c)++;
             return;
         }
     }
@@ -425,10 +425,10 @@ static void *sb_realloc(void *p, size_t old, size_t n) {
 }
 static void sb_drain(void) {
     for (int c = 0; c <= SB_CLASSES; c++)
-        while (sb_list[c]) {
-            FreeNode *n = sb_list[c];
-            sb_list[c] = n->next;
-            sb_cnt[c]--;
+        while (sb_list(c)) {
+            FreeNode *n = sb_list(c);
+            sb_list(c) = n->next;
+            sb_cnt(c)--;
             orin_platform_free(n);
         }
 }
@@ -441,13 +441,12 @@ static void sb_drain(void) {
 
 /* ---------------------------------------------------------------- destroy */
 
-static __thread OrinObj **t_dstack; /* the work stack of orin_destroy: per task, freed when the task ends */
-static __thread size_t t_dcap;
+/* t_dstack / t_dcap: the work stack of orin_destroy: per task, freed when the task ends */
 
 void orin_destroy(OrinObj *o) {
     /* Iterative so that long chains (lists, deep trees) cannot overflow the C stack. */
     OrinObj **stack = t_dstack;
-    size_t scap = t_dcap, sp = 0;
+    size_t scap = (size_t)orin_heap.dcap, sp = 0;
 #define PUSH(x)                                                                                 \
     do {                                                                                        \
         if (sp == scap) {                                                                       \
@@ -517,7 +516,7 @@ void orin_destroy(OrinObj *o) {
         ORIN_STAT(orin_stats.frees++);
     }
     t_dstack = stack;
-    t_dcap = scap;
+    orin_heap.dcap = scap;
 #undef PUSH
 #undef DEC
 }
@@ -2436,7 +2435,7 @@ void orin_rt_heap_exit(void) {
     files_at_exit();
     orin_platform_free(t_dstack);
     t_dstack = NULL;
-    t_dcap = 0;
+    orin_heap.dcap = 0;
 #ifndef ORIN_NO_FREELIST
     for (int c = 0; c < FL_STRUCT_CLASSES; c++)
         while (fl_struct[c]) {

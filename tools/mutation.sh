@@ -16,6 +16,7 @@
 # built first. docs/testing.md, "Mutation checks".
 set -eu
 cd "$(dirname "$0")/.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 OUT=build/mutation
 RUNNER=$OUT/orin-mutation
 BUILD_ONLY=
@@ -50,7 +51,7 @@ if [ ! -x "$RUNNER" ] || [ "$(cat "$OUT/stamp" 2>/dev/null || true)" != "$stamp"
   mkdir -p "$OUT"
   echo "[mutation] $BUILDER builds tooling/mutation -> $RUNNER" >&2
   "$BUILDER" compile tooling/mutation/src/main.or -o "$OUT/runner.c"
-  $CC -O1 -w -I runtime/core "$OUT/runner.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -lpthread -o "$OUT/runner.tmp"
+  $CC -O1 -w $(rt_inc) "$OUT/runner.c" $(rt_src) -lm -lpthread -o "$OUT/runner.tmp"
   mv "$OUT/runner.tmp" "$RUNNER"
   echo "$stamp" > "$OUT/stamp"
 fi
