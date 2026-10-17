@@ -49,10 +49,6 @@ typedef struct OrinObj {
     int64_t rc;    /* >0 live count, <0 immortal */
     uint32_t kind; /* ORIN_K_* */
     uint32_t tag;  /* variant tag (struct kind only; records use 0) */
-#ifdef ORIN_SITE_STATS
-    uint32_t site; /* allocation-site census only (see "Allocation-site census" below): the site that allocated it */
-    uint32_t site_pad;
-#endif
 } OrinObj;
 
 typedef struct OrinString {
@@ -117,6 +113,11 @@ void orin_trap(const char *msg) __attribute__((noreturn, cold));
 /* Number of live (non-immortal) heap objects; for leak/UAF tests. Counts the calling thread's allocations minus its
  * frees plus the net of all finished tasks (an object moved between tasks is allocated by one and freed by another). */
 int64_t orin_live_count(void);
+/* internal, ADR-0052 R3d.5: Orin functions of runtime/core/stats.or (the ORIN_STATS report, run at exit by orin_init, and the live-object
+ * count above), defined by the code a program is compiled to (compiler/backends/{c,llvm}/rtwrap.or), and the C services that Orin
+ * runtime code reaches through the core operation `hook` (orin_runtime.c lists them). */
+void orin_stats_report(void);
+uint64_t orin_core_hook(uint64_t k, uint64_t a, uint64_t b, uint64_t c);
 
 /* internal, ADR-0052 R3d.3 (c): Orin functions of runtime/core/heap.or and object.or (the small-block cache and string allocation), defined by
  * the code a program is compiled to for the C shells of the runtime (compiler/backends/{c,llvm}/rtwrap.or). */
@@ -310,8 +311,9 @@ _Static_assert(offsetof(OrinStats, alloc_string) == 0 && offsetof(OrinStats, all
  * every function sets on entry to the call site that entered it, one level of calling context for its allocations) and a
  * table `orin_site_names` describing every site; the
  * runtime must be compiled with -DORIN_SITE_STATS (a mismatch is a link error: each side references a symbol only the other
- * defines). Every object records the site that allocated it (OrinObj.site), so the counters are both "at the site" (operations
- * the site executed, on any object) and "of the site" (operations on the objects the site allocated). Report: ORIN_STATS=sites
+ * defines). Every heap object records the site that allocated it in a prefix word of 8 bytes before its header (ORIN_SITE_OF; the
+ * object layout is the same in all builds), so the counters are both "at the site" (operations the site executed, on any object)
+ * and "of the site" (operations on the objects the site allocated). Report: ORIN_STATS=sites
  * writes one line per site that did anything to $ORIN_SITES_OUT (stderr when unset), besides the usual summary line.
  * Without ORIN_SITE_STATS every hook below is an empty macro: normal builds are unchanged. */
 #ifdef ORIN_SITE_STATS
@@ -319,7 +321,10 @@ extern __thread uint32_t orin_site_cur ORIN_TLS_MODEL; /* the site executing now
 extern __thread uint32_t orin_site_par ORIN_TLS_MODEL; /* the call site that entered the function of orin_site_cur */
 #define ORIN_SITE(n, caller) (orin_site_cur = (uint32_t)(n), orin_site_par = (caller))
 enum { ORIN_SITE_RETAIN = 0, ORIN_SITE_RELEASE = 1, ORIN_SITE_COW_COPY = 2, ORIN_SITE_COW_INPLACE = 3 };
-void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur and at o->site */
+void orin_site_rc(OrinObj *o, int what); /* out of line: counts at orin_site_cur and at the site of o */
+/* The site that allocated `o`: its prefix word. An immortal object (count -1: the static literals and variants, which no prefix word
+ * precedes) has site 0. A dying object (count 0) and a lend-pinned one (top two bits 10, see "lending" in orin_runtime.c) still have it. */
+#define ORIN_SITE_OF(o) (((uint64_t)(o)->rc >> 62) != 3 ? ((const uint32_t *)(o))[-2] : 0u)
 #define ORIN_SITE_RC(o, what) orin_site_rc((o), (what))
 #else
 #define ORIN_SITE_RC(o, what) ((void)0)
@@ -454,7 +459,7 @@ OrinObj *orin_parse_int_k(OrinObj *s, int64_t kind);                      /* Opt
 /* New struct with all slots zero (null refs). Fill with orin_struct_init (init only).
  * orin_struct_new, orin_variant1 and orin_array_new are Orin functions of runtime/core/object.or ($rt, ADR-0052 R3d.3 (a)): the code a
  * program is compiled to defines these C names (compiler/backends/{c,llvm}/rtwrap.or) and calls the Orin functions directly; a test that links
- * only the C files of the runtime links tools/rt_stub.sh's object. -DORIN_SITE_STATS builds keep the C versions (census hooks). */
+ * only the C files of the runtime links tools/rt_stub.sh's object. */
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask);
 /* Immortal singleton for a payload-less variant, for the C shells: tag 0 (Ok of void) or 1 (None, Err), one static object per
  * translation unit. Generated code has its own static objects per tag (`orin_nz<tag>`, ADR-0052 R3d.2). */
