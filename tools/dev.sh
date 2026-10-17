@@ -70,7 +70,9 @@ build() {
     rm -f $D/orin.h $D/orin.data.c $D/orin.[0-9]*.c
   else
     $host compile compiler/main.or -o $D/orin.c
-    $CC -O1 -w $(rt_inc) $D/orin.c $(rt_src) -lm -o $D/orin.tmp
+    # C from the seed compiler (orin0) links the frozen legacy runtime, as in tools/bootstrap.sh
+    world=core; [ "$host" = $B/orin0 ] && world=legacy
+    $CC -O1 -w $(rt_inc $world) $D/orin.c $(rt_src $world) -lm -o $D/orin.tmp
   fi
   mv $D/orin.tmp $D/orin
   echo "$stamp" > $D/stamp

@@ -30,10 +30,12 @@ const names = users.filter(u => u.active).map(u => u.name);
 program       = { declaration } ;
 declaration   = importDecl | exportDecl | functionDecl | typeDecl
               | enumDecl | classDecl | interfaceDecl | annotationDecl ;
-importDecl    = "import", "{", identifiers, "}", "from", string, ";" ;
+importDecl    = "import", ("{", importNames, "}" | "*", "as", identifier), "from", string, ";" ;
+importNames   = importName, {",", importName}, [","] ;
+importName    = identifier, ["as", identifier] ;
 exportDecl    = "export", (functionDecl | typeDecl | enumDecl | classDecl
               | interfaceDecl | reexportDecl) ;
-reexportDecl  = "{", identifiers, "}", "from", string, ";" ;
+reexportDecl  = "{", importNames, "}", "from", string, ";" ;
 functionDecl  = {annotationUse}, "function", identifier, [typeParams],
               "(", [params], ")", [":", type], block ;
 params        = param, {",", param} ;

@@ -1,4 +1,6 @@
 /* Runtime-only tests. Build: cc -I runtime/core runtime/core/tests/runtime_test.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c
+ *     $(tools/rt_stub.sh build/rt_stub.o)
+ * (the object model is Orin code, ADR-0052 R3d.3; the stub object defines orin_struct_new, orin_destroy, ... for the C shells).
  * Optionally with -fsanitize=address,undefined. Exits 0 and prints "ok" on success. */
 #define _GNU_SOURCE
 #include "orin_runtime.h"
@@ -133,8 +135,8 @@ static void test_deep_chain(void) {
 }
 
 static void test_misc(void) {
-    CHECK(orin_add_i(1, 2) == 3 && orin_div_i(-7, 2) == -3 && orin_rem_i(-7, 2) == -1);
-    CHECK(orin_int_to_usize(5) == 5 && orin_usize_to_int(5) == 5);
+    /* The checked arithmetic of generated code is defined by the compiler's preamble (compiler/backends/c/preamble.or, ADR-0052 R3d.6);
+     * its results and traps are covered by tests/run and the conformance suite, not here. */
     OrinObj *none = orin_none();
     CHECK(none->rc < 0 && orin_nullary(1) == none);
     orin_release(none); /* no-op on immortal */

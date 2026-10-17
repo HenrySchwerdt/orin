@@ -240,6 +240,31 @@ export function runLsp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, tm
   hv = hoverAt(s, fs, p, main, posOf(mainText, "d.toString", 0, 0));
   s.check(fs, hv.includes("int"), "hover: local type (got " + reprStr(hv) + ")");
 
+  // ---- namespace imports (ADR-0048 addendum): diagnostics, definition, hover and member completion after `lib.` ----
+  const nsMain = tmp + "/nsmain.or";
+  const nsText = "import * as lib from \"./lib\";\n\nfunction main(): void {\n  const p: lib.Point = lib.Point { x: 1, y: 2 };\n  console.log(lib.dist(p).toString());\n}\n";
+  openDoc(s, fs, p, nsMain, nsText, 1);
+  d = sync(s, fs, p, uriOf(nsMain));
+  s.check(fs, eq(d, A([])), "namespace: no diagnostics (got " + show(d) + ")");
+  const nsCall = posOf(nsText, "lib.dist(p)", 0, 5);
+  r = s.lspRequest(fs, p, "textDocument/definition", td(nsMain, nsCall));
+  loc = at(r, ["result"]);
+  s.check(fs, isObj(loc) && isStrEq(at(loc, ["uri"]), uriOf(lib)), "namespace: definition of lib.dist jumps into lib.or (got " + show(loc) + ")");
+  if (isObj(loc)) {
+    s.check(fs, eq(at(loc, ["range", "start"]), pj(posOf(libText, "dist", 0, 0))), "namespace: definition at the declaration name (got " + show(loc) + ")");
+  }
+  hv = hoverAt(s, fs, p, nsMain, nsCall);
+  s.check(fs, hv.includes("function dist(p: Point): int"), "namespace: hover of lib.dist (got " + reprStr(hv) + ")");
+  const nsTyping = "import * as lib from \"./lib\";\n\nfunction main(): void {\n  lib.\n}\n";
+  changeDoc(s, fs, p, nsMain, nsTyping, 2);
+  r = s.lspRequest(fs, p, "textDocument/completion", td(nsMain, posOf(nsTyping, "lib.\n", 0, 4)));
+  let nsLabels: string[] = [];
+  for (const it of items(at(r, ["result", "items"]))) {
+    nsLabels.push(str(at(it, ["label"])));
+  }
+  s.check(fs, containsStr(nsLabels, "dist") && containsStr(nsLabels, "Point") && !containsStr(nsLabels, "main") && !containsStr(nsLabels, "function"),
+    "namespace: completion after `lib.` offers the members only (got [" + nsLabels.join(", ") + "])");
+
   let locs = refsAt(s, fs, p, main, call, true);
   let uris = uriSet(locs);
   s.check(fs, containsStr(uris, uriOf(lib)) && containsStr(uris, uriOf(main)), "references: across both files (got " + show(A(locs)) + ")");

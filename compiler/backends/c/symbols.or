@@ -6,16 +6,16 @@
 // vtables (`orin_vt<k>`). Emitting a function only *reads* this table, so the functions can be emitted independently (in
 // any order, or in parallel) and joined in index order with byte-identical output.
 
-import { MProgram, MFunction, isInlineFn, rtIds, rtLoaded } from "../../mir";
+import { MProgram, MFunction, isInlineFn, rtIds, rtLoaded, rtCold } from "../../mir";
 import { u, cty, fnSymbol, identChars } from "./text";
-import { siteCount } from "./sites";
+import { siteCount, isRtFunction } from "./sites";
 
 // `@Inline` (ADR-0024) becomes `static inline`: a hint the C compiler may ignore, so semantics and link behaviour (one
 // translation unit) are unchanged.
 @Requires(f.paramCount <= f.locals.length)
 @Ensures(result.includes(` ${name}(`) && result.endsWith(")"))
 export function signature(name: string, f: MFunction, inl: bool): string {
-  let s = (inl ? "static inline " : "") + cty(f.ret) + " " + name + "(";
+  let s = (inl ? "static inline " : rtCold(f.name) ? "__attribute__((noinline)) " : "") + cty(f.ret) + " " + name + "(";
   if (f.paramCount == 0) {
     s += "void";
   }
@@ -77,7 +77,7 @@ export class CSymbols {
     return rtLoaded(this.rt);
   }
 
-  // The allocation-site census id of the first site of function `i` (`--stats-sites`); 0 in a normal build.
+  // The allocation-site census id of the first site of function `i` (`--stats-sites`); 0 in a normal build and for a function of `$rt`.
   @Requires(i < this.firstSites.length)
   firstSite(i: usize): usize {
     return this.firstSites[i];
@@ -128,7 +128,7 @@ export function sitesNumbered(prog: MProgram, syms: CSymbols): bool {
   let next: usize = 1;
   let i: usize = 0;
   while (i < prog.functions.length) {
-    if (syms.firstSite(i) != next) {
+    if (syms.firstSite(i) != (isRtFunction(prog.functions[i]) ? 0 : next)) {
       return false;
     }
     next += siteCount(prog.functions[i]);
@@ -154,7 +154,7 @@ export function cSymbolsWith(prog: MProgram, sites: bool): CSymbols {
     names.push(n);
     sigs.push(signature(n, f, isInlineFn(prog, f.name)));
     byName.set(n, i);
-    firstSites.push(site);
+    firstSites.push(sites && isRtFunction(f) ? 0 : site);
     if (sites) {
       site += siteCount(f);
     }
