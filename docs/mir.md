@@ -87,6 +87,10 @@ reference local (never an unboxed aggregate: that path has no header to check an
 verifier rejects an unchecked access it cannot justify (rule **U6**, `compiler/verify/fieldcheck.or`, section "Unchecked struct slots" below, error
 text `unchecked struct slot access without a dominating check`). The optimiser (`compiler/opt/fieldcheck.or`, its last pass) emits them where U6
 accepts them; the lowering never does. Textual forms `l2 = getfieldu l0.1` and `setfieldu l0.0 = l3`. `ITakeField` / `IPutField` keep their check.
+A third instruction, `IShapeCheck(o, k)` (`shapecheck l0.3`), traps with the shape message unless `o` is a struct with more than `k` slots, and does nothing
+otherwise: the check of the first access of a block, on its own. The optimiser puts one in front of the first access of a struct local when later
+accesses of the same block use higher slots, and then every access of the group is unchecked. Both backends emit just the existing guard
+(`orinc_chk_slot`; the LLVM `slotGuardInline`).
 `--assert-facts` does not re-run the omitted check for these (it would need a new runtime symbol; runtime/ and the seed are frozen for this change).
 (v2.7 is taken by another branch, so this is v2.8.)
 
@@ -160,6 +164,7 @@ hole slot when reading that slot.
   s and o live, slot `key` of o not a hole; d `Init`. Rule F1 must justify the claim (below), else **error** `unjustified forward`.
 - `IArrayGetU(d, a, i)` (v2.6): the rules of `IArrayGet`, and rule U1 must justify the omitted checks (below, by a dominating access or by
   interval facts), else **error** `unchecked array access without a dominating check or a range fact`.
+- `IShapeCheck(o, k)` (v2.8): `o` live (a plain read; it defines nothing, kills no borrow and is no obstacle to a forward).
 - `IGetFieldU(d, o, i)` / `ISetFieldU(x, i, v)` (v2.8): the rules of `IGetField` / `ISetField` for a reference local, and rule U6 must justify the
   omitted check (below), else **error** `unchecked struct slot access without a dominating check`.
 - `ISetField(x, i, v)` / `IArraySet(x, i, v)` / `IArraySetU(x, i, v)` (v2.6, plus rule U1): x **Unique**; v consumed as for StructNew.
@@ -311,7 +316,7 @@ model (`formal/Orin/Machine.lean` has no arrays with a length), so U1 has no lem
 `d = getfieldu o.k` and `setfieldu o.k = v` skip the check of the runtime (`orin_struct_get` / `orin_struct_set`: the object is a struct and `k < nslots`).
 The verifier accepts one only when a backward scan of **the same block**, over at most 64 instructions (`WINDOW`, `scan.or`), finds an earlier
 `getfield`, `getfieldu`, `setfield`, `setfieldu`, `takefield` or `putfield` of the **same struct local** `o` with slot `k' >= k` (each of them traps unless
-the object is a struct with more than `k'` slots, hence more than `k`), with no instruction in between that **defines `o`** (a destination, a move, the
+the object is a struct with more than `k'` slots, hence more than `k`), (or an `IShapeCheck(o, k')` with `k' >= k`, or the `IStructNew` that builds `o` with more than `k` slots: the slot count is known statically) with no instruction in between that **defines `o`** (a destination, a move, the
 receiver of an in/out call) and no in-place string / array operation on `o` (fail closed). An access of a lower slot is no source but does not end the
 scan. A source that defines `o` itself (`o = getfield o.k`) justifies nothing after it. *Unlike U1 nothing else ends the scan*: the kind and the slot
 count of a struct are fixed by `IStructNew` and no instruction changes them, and the copy `IMakeUnique` makes of a shared struct has the same header,
@@ -320,7 +325,9 @@ so `makeunique`, takes and puts, stores, calls that receive `o` and any other us
 instruction itself (`getfieldu` is a `getfield`: a hole or a borrow is as for the checked form; `setfieldu` needs a `Unique` object).
 *Trap semantics.* The removed check duplicates one that passed on the same object, so it cannot fire; the first access keeps its check, in its place.
 *Tests.* `compiler/tests/verify_main.or` `fieldCases`, `compiler/tests/opt_test.or` and `emit_test.or` (T7 sections); mutation classes of
-`tools/mutate_mir.py`: `field-no-fact`, `field-after-redef`, `field-across-block`, `field-higher-slot` and the positive control `field-makeunique-ok`.
+`tools/mutate_mir.py`: `field-no-fact`, `field-after-redef`, `field-across-block`, `field-higher-slot`, `shape-drop`, `shape-too-small` and the positive control `field-makeunique-ok`.
+*Shape checks.* A trap that would have fired at a later, higher-slot access now fires at the shape check in front of the first access, with the same message; it
+only concerns an object of the wrong shape, which is a compiler bug (docs/assurance.md), never a program error.
 `verify_text --facts` reports `field-checked` / `field-none` per unchecked field access.
 
 ### Range facts (v2.6, ADR-0038 lever 2 T6, rules R1-R5)

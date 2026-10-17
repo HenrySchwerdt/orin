@@ -590,6 +590,7 @@ function sInstr(i: Instr): Instr {
     INullary(d, tag) => INullary(d + 1, tag),
     ITag(d, o) => ITag(d + 1, so(o)),
     IGetField(d, o, k) => IGetField(d + 1, so(o), k),
+    IShapeCheck(x, k) => IShapeCheck(x + 1, k),
     IGetFieldU(d, o, k) => IGetFieldU(d + 1, so(o), k),
     ISetField(x, k, o) => ISetField(x + 1, k, so(o)),
     ISetFieldU(x, k, o) => ISetFieldU(x + 1, k, so(o)),
@@ -1402,6 +1403,7 @@ function fbadCall(name: string, instrs: Instr[]): bool {
   return neg("unchecked field " + name, prog([fn("f", 0, flocs(), MVoid, [bk(instrs, ret())]), gVoid(), ioNext()]), FIELD_NEEDLE);
 }
 
+function rec0(): Instr { return IStructNew(0, 0, []); }
 function rec2(): Instr { return IStructNew(0, 0, [OInt(1), OInt(2)]); }
 function fget1(): Instr { return IGetField(1, OLocal(0), 1); }
 function fgetU1(): Instr { return IGetFieldU(2, OLocal(0), 1); }
@@ -1428,15 +1430,23 @@ function fieldCases(): usize {
   bad += cnt(pos("unchecked field across a call that borrows the struct",
     prog([fn("f", 0, flocs(), MVoid, [bk([rec2(), fget1(), ICall(None, 1, [OLocal(0)]), fgetU1(), done()], ret())]), gVoid()])));
   bad += cnt(fok("after a take of a higher slot", [rec2(), ITakeField(4, 0, 1), IPutField(0, 1, 4), fgetU0(), done()]));
+  bad += cnt(fok("a new struct with enough slots is a source", [rec2(), fgetU1(), done()]));
+  bad += cnt(fok("a new struct with enough slots is a source for a store", [rec2(), fw5(), fsetU0(), done()]));
+  bad += cnt(fok("a shape check of a high slot justifies lower and equal slots", [
+    rec0(), IShapeCheck(0, 1), fgetU1(), fgetU0(), fw5(), fsetU0(), done()]));
+  bad += cnt(fok("a shape check is a plain read: makeunique and a call do not end the scan", [
+    rec0(), IShapeCheck(0, 1), IMakeUnique(0), fgetU1(), done()]));
+  bad += cnt(fok("a shape check is no obstacle to a forward", [
+    rec2(), fget1(), IShapeCheck(0, 1), IForward(3, 1, OLocal(0), OUsize(1)), done()]));
   // rejected
-  bad += cnt(fbad("get with no earlier access", [rec2(), fgetU1(), done()]));
-  bad += cnt(fbad("set with no earlier access", [rec2(), fw5(), fsetU0(), done()]));
-  bad += cnt(fbad("get of a higher slot than any earlier access", [rec2(), IGetField(1, OLocal(0), 0), fgetU1(), done()]));
-  bad += cnt(fbad("set of a higher slot than any earlier access", [rec2(), IGetField(1, OLocal(0), 0), fw5(), ISetFieldU(0, 1, OLocal(3)), done()]));
-  bad += cnt(fbad("access of another struct", [rec2(), IStructNew(5, 0, [OInt(1), OInt(2)]), IGetField(1, OLocal(5), 1), fgetU1(), IRelease(5), done()]));
-  bad += cnt(fbad("after the struct was redefined", [rec2(), fget1(), done(), rec2(), fgetU1(), done()]));
-  bad += cnt(fbad("after the struct was moved in", [rec2(), IStructNew(5, 0, [OInt(1), OInt(2)]), fget1(), done(), IMove(0, 5), fgetU1(), done()]));
-  bad += cnt(fbadCall("across an in/out call on the struct", [rec2(), fget1(), ICall(Some(3), 2, [OLocal(0)]), fgetU1(), done()]));
+  bad += cnt(fbad("get with no earlier access", [rec0(), fgetU1(), done()]));
+  bad += cnt(fbad("set with no earlier access", [rec0(), fw5(), fsetU0(), done()]));
+  bad += cnt(fbad("get of a higher slot than any earlier access", [rec0(), IGetField(1, OLocal(0), 0), fgetU1(), done()]));
+  bad += cnt(fbad("set of a higher slot than any earlier access", [rec0(), IGetField(1, OLocal(0), 0), fw5(), ISetFieldU(0, 1, OLocal(3)), done()]));
+  bad += cnt(fbad("access of another struct", [rec0(), IStructNew(5, 0, [OInt(1), OInt(2)]), IGetField(1, OLocal(5), 1), fgetU1(), IRelease(5), done()]));
+  bad += cnt(fbad("after the struct was redefined", [rec0(), fget1(), done(), rec0(), fgetU1(), done()]));
+  bad += cnt(fbad("after the struct was moved in", [rec0(), IStructNew(5, 0, [OInt(1), OInt(2)]), fget1(), done(), IMove(0, 5), fgetU1(), done()]));
+  bad += cnt(fbadCall("across an in/out call on the struct", [rec0(), fget1(), ICall(Some(3), 2, [OLocal(0)]), fgetU1(), done()]));
   // the source redefines the struct local itself (`o = getfield o.0`): afterwards `o` names another object
   const nest = [lr("o"), lr("n")];
   bad += cnt(neg("unchecked field after a load that redefines its object", straight(0, nest, [
@@ -1446,13 +1456,21 @@ function fieldCases(): usize {
     IStructNew(1, 0, [OInt(1), OInt(2)]), IStructNew(0, 0, [OLocal(1), OInt(3)]), IGetField(1, OLocal(0), 0),
     IGetFieldU(0, OLocal(0), 0), IGetFieldU(1, OLocal(0), 0), IRelease(0)]), FIELD_NEEDLE));
   bad += cnt(neg("unchecked field across blocks", prog([fn("f", 0, flocs(), MVoid, [
-    bk([rec2(), fget1()], TGoto(1)), bk([fgetU1(), done()], ret())])]), FIELD_NEEDLE));
+    bk([rec0(), fget1()], TGoto(1)), bk([fgetU1(), done()], ret())])]), FIELD_NEEDLE));
   bad += cnt(neg("unchecked field of a non-local object", straight(0, flocs(), [IGetFieldU(2, OStr(0), 1)]), "IGetFieldU: bad destination"));
   bad += cnt(neg("unchecked field of a scalar object", straight(0, flocs(), [IGetFieldU(2, OLocal(1), 1)]), "IGetFieldU: bad destination"));
   bad += cnt(neg("unchecked store into a scalar", straight(0, flocs(), [ISetFieldU(1, 0, OInt(1))]), "ISetFieldU: bad object"));
   // an unchecked access is still a read or a store: the ordinary rules apply to it
   bad += cnt(neg("unchecked store into a struct that is not unique", straight(0, flocs(), [
-    rec2(), IDup(5, OLocal(0)), fget1(), fw5(), fsetU0(), IRelease(5), done()]), "Unique"));
+    rec0(), IDup(5, OLocal(0)), fget1(), fw5(), fsetU0(), IRelease(5), done()]), "Unique"));
+  bad += cnt(fbad("a new struct with too few slots", [IStructNew(0, 0, [OInt(1)]), fgetU1(), done()]));
+  bad += cnt(fbad("a shape check of a lower slot", [rec0(), IShapeCheck(0, 0), fgetU1(), done()]));
+  bad += cnt(fbad("a shape check of another struct", [rec0(), IStructNew(5, 0, []), IShapeCheck(5, 1), fgetU1(), IRelease(5), done()]));
+  bad += cnt(fbad("a shape check before the struct was redefined", [rec0(), IShapeCheck(0, 1), done(), rec0(), fgetU1(), done()]));
+  bad += cnt(neg("unchecked field after a shape check in another block", prog([fn("f", 0, flocs(), MVoid, [
+    bk([rec0(), IShapeCheck(0, 1)], TGoto(1)), bk([fgetU1(), done()], ret())])]), FIELD_NEEDLE));
+  bad += cnt(neg("shape check of a scalar", straight(0, flocs(), [IShapeCheck(1, 0)]), "IShapeCheck: needs a reference"));
+  bad += cnt(neg("shape check of a dead struct", straight(0, flocs(), [rec0(), done(), IShapeCheck(0, 0)]), "dead"));
   // the window is 64 instructions
   let near: Instr[] = [rec2(), fget1()];
   let far: Instr[] = [rec2(), fget1()];

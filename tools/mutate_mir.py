@@ -56,6 +56,8 @@ Mutation classes (id: injected bug -> required reaction)
   field-after-redef   redefine the struct local before the unchecked access (`t = dup o; o = move t`)  -> ERROR without a dominating check
   field-across-block  split the block between the checked access and the unchecked one               -> ERROR without a dominating check
   field-higher-slot   access a slot above every slot the block accessed before                       -> ERROR without a dominating check
+  shape-drop          delete a `shapecheck o.K` that justifies the unchecked accesses after it                     -> ERROR without a dominating check
+  shape-too-small     check one slot fewer (`shapecheck o.K-1`) when an unchecked access of slot K relies on it   -> ERROR without a dominating check
   field-makeunique-ok `makeunique o` there (positive control)                                        -> ACCEPTED (rejection is a finding)
   range facts (rule U1, interval fact, docs/mir.md v2.6; applied to every unchecked access that ONLY the interval analysis justifies):
   range-widen-off-by-one    the loop bound one too large (`lt i, N` -> `le i, N`, `le i, N-1` -> `le i, N`) -> ERROR without a dominating check
@@ -350,6 +352,8 @@ def uniq_transfer(f, U, line):
         keep = {t[0]}
     elif w in TAKES:
         keep = {t[1]}
+    elif w == "shapecheck":
+        keep = {t[0]}
     elif w in KEEP_READS:
         keep = set(t[1:])
     elif w == "makeunique":
@@ -488,6 +492,8 @@ def sites(f):
                 out += nofact_sites(f, bi, ii, line)
             if w in ("getfieldu", "setfieldu"):
                 out += field_sites(f, bi, ii, line)
+            if w == "shapecheck":
+                out += shape_sites(f, bi, ii, line)
             if w in ("getfield", "setfield"):
                 out += field_nofact_sites(f, bi, ii, line)
     if f.inout:
@@ -734,12 +740,18 @@ def field_parts(line):
 
 def field_slots_before(ins, ii, o):
     """The slots of local o that earlier instructions of the block access (any form)."""
-    pat = re.compile(r"(?:l\d+ = (?:getfieldu?|takefield) l%d\.(\d+)$|(?:setfieldu?|putfield) l%d\.(\d+) = )" % (o, o))
+    pat = re.compile(r"(?:l\d+ = (?:getfieldu?|takefield) l%d\.(\d+)$|(?:setfieldu?|putfield) l%d\.(\d+) = |shapecheck l%d\.(\d+)$)" % (o, o, o))
+    new = re.compile(r"l%d = struct tag\d+ \{(.*)\}$" % o)
     out = []
     for l in ins[:ii]:
         m = pat.match(l)
         if m:
-            out.append(int(m.group(1) or m.group(2)))
+            out.append(int(m.group(1) or m.group(2) or m.group(3)))
+        m = new.match(l)
+        if m:
+            n = len([x for x in m.group(1).split(", ") if x.strip()])
+            if n > 0:
+                out.append(n - 1)
     return out
 
 
@@ -772,6 +784,42 @@ def field_sites(f, bi, ii, line):
     if no_ref_alias_of(f, o) and o >= f.nparams and certainly_unique(f, bi, ii, o):
         out.append(Mut("field-makeunique-ok", f, (bi, ii), "makeunique l%d before `%s` %s" % (o, line, where),
                        "positive control: makeunique keeps kind and slot count", None, "accept"))
+    return out
+
+
+def apply_shape(m, f):
+    ins = f.blocks[m.bi][1]
+    line = ins[m.ii]
+    o, k = (int(x) for x in SHAPE_RE.match(line).groups())
+    if m.cls == "shape-drop":
+        del ins[m.ii]
+    elif m.cls == "shape-too-small":
+        ins[m.ii] = "shapecheck l%d.%d" % (o, k - 1)
+    else:
+        raise ValueError(m.cls)
+    return f
+
+
+SHAPE_RE = re.compile(r"shapecheck l(\d+)\.(\d+)$")
+
+
+def shape_sites(f, bi, ii, line):
+    """A shape check that is the first mention of its struct local in the block (so it alone justifies the unchecked accesses after it):
+    dropping it, or checking one slot fewer, must leave an unchecked access unjustified."""
+    o, k = (int(x) for x in SHAPE_RE.match(line).groups())
+    ins = f.blocks[bi][1]
+    if any(o in toks(l) and op(l) != "makeunique" for l in ins[:ii]):
+        return []
+    if any(dest(l) == o for l in ins[ii + 1:]):
+        return []
+    if any(re.match(r"(?:l\d+ = )?(?:getfield|takefield|shapecheck|setfield|putfield) l%d\b" % o, l) for l in ins[ii + 1:]):
+        return []
+    where = "(b%d i%d)" % (bi, ii)
+    need = "without a dominating check"
+    out = [Mut("shape-drop", f, (bi, ii), "delete `%s` %s" % (line, where), None, need, "error")]
+    top = max([int(x) for l in ins[ii + 1:] for x in re.findall(r"(?:getfieldu|setfieldu) l%d\.(\d+)" % o, l)] + [-1])
+    if k >= 1 and top == k:
+        out.append(Mut("shape-too-small", f, (bi, ii), "check %d slots fewer: `shapecheck l%d.%d` %s" % (1, o, k - 1, where), None, need, "error"))
     return out
 
 
@@ -1145,6 +1193,8 @@ def apply(m):
         return apply_bounds(m, f)
     if m.cls.startswith("field-"):
         return apply_fields(m, f)
+    if m.cls.startswith("shape-"):
+        return apply_shape(m, f)
     if m.cls.startswith("range-"):
         return apply_range(m, f)
     if m.cls == "inout-drop-receiver":

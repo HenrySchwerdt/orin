@@ -4,7 +4,8 @@
 //   dominated-by-check: an earlier access of the SAME struct local already passed the check for this slot or a higher one.
 //     The scan is a backward walk over the same block, at most WINDOW instructions (scan.or):
 //   the source: an instruction on the way back that touches struct local `o` with a checked or unchecked
-//               IGetField / ISetField / ITakeField / IPutField of slot k' >= k (every one of them traps unless the object is
+//               IGetField / ISetField / ITakeField / IPutField of slot k' >= k, an `IShapeCheck(o, k')` with k' >= k, or the
+//               `IStructNew` that builds `o` with more than k slots (every field access of them traps unless the object is
 //               a struct with more than k' slots). An access of a lower slot is no source but does not end the scan. It must
 //               not define `o` itself: `o = getfield o.k` leaves `o` naming another object, so it justifies nothing after it.
 //   no change:  on the way back there is no definition of `o` (a move, a call result, the receiver of an in/out call ...)
@@ -20,38 +21,49 @@
 import { MProgram, MFunction, MRef, Instr, Operand } from "../mir";
 import { WINDOW, isLocal, defines } from "./scan";
 
-// The highest slot of local `o` that `ins` has checked, when `ins` is a heap field access of `o` that does not redefine it
-// (`Some(k)`), else `None`.
-function checkedSlot(ins: Instr, o: usize): Option<usize> {
+// The number of slots that `ins` has shown local `o` to have (the object is a struct with at least that many), when `ins` is a
+// heap field access of `o` that does not redefine it (slot k' shows k' + 1), an `IShapeCheck(o, k')` (k' + 1), or the `IStructNew`
+// that builds `o` (the number of its slots); else `None`.
+function knownSlots(ins: Instr, o: usize): Option<usize> {
   match (ins) {
     IGetField(d, x, k) => {
       if (isLocal(x, o) && d != o) {
-        return Some(k);
+        return Some(k + 1);
       }
     },
     IGetFieldU(d, x, k) => {
       if (isLocal(x, o) && d != o) {
-        return Some(k);
+        return Some(k + 1);
       }
     },
     ISetField(x, k, _) => {
       if (x == o) {
-        return Some(k);
+        return Some(k + 1);
       }
     },
     ISetFieldU(x, k, _) => {
       if (x == o) {
-        return Some(k);
+        return Some(k + 1);
       }
     },
     ITakeField(d, x, k) => {
       if (x == o && d != o) {
-        return Some(k);
+        return Some(k + 1);
       }
     },
     IPutField(x, k, _) => {
       if (x == o) {
-        return Some(k);
+        return Some(k + 1);
+      }
+    },
+    IShapeCheck(x, k) => {
+      if (x == o) {
+        return Some(k + 1);
+      }
+    },
+    IStructNew(d, _, slots) => {
+      if (d == o) {
+        return Some(slots.length);
       }
     },
     _ => {},
@@ -71,6 +83,11 @@ function replacesInPlace(ins: Instr, o: usize): bool {
     IArrayPop(_, x) => x == o,
     _ => false,
   };
+}
+
+// The instruction ends the scan for local `o`: it defines it, or may replace the object in place.
+export function scanEnds(p: MProgram, ins: Instr, o: usize): bool {
+  return defines(p, ins, o) || replacesInPlace(ins, o);
 }
 
 // Rule U6: is the unchecked access of slot `k` of struct operand `x` at position `at` of block `blk` of `f` justified?
@@ -96,15 +113,15 @@ export function fieldJustified(p: MProgram, f: MFunction, blk: usize, at: usize,
         i -= 1;
         n += 1;
         const ins = instrs[i];
-        match (checkedSlot(ins, o)) {
+        match (knownSlots(ins, o)) {
           Some(s) => {
-            if (s >= k) {
+            if (s > k) {
               return true;
             }
           },
           None => {},
         }
-        if (defines(p, ins, o) || replacesInPlace(ins, o)) {
+        if (scanEnds(p, ins, o)) {
           return false;
         }
       }

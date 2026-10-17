@@ -9,12 +9,134 @@
 //     setfield o.2 = z                         setfieldu o.2 = z
 //
 // The pass asks the verifier's own rule U6 (`fieldJustified`, compiler/verify/fieldcheck.or) and never emits an instruction that
-// rule rejects; the verifier checks the result again like that of every other pass. No check moves: the first access keeps
-// its check, in its place, with its message. It runs after the array pass, so it sees the final instruction stream.
+// rule rejects; the verifier checks the result again like that of every other pass. It runs after the array pass, so it sees
+// the final instruction stream.
+//
+// The first access of a struct local in a block has no source, so it keeps its check. When later accesses of the same local
+// in the block (within the window, before the local is redefined) use higher slots, the pass puts ONE `IShapeCheck(o, K)`
+// (K the highest of those slots) in front of the first access: the first access and every later one are then justified by
+// it, and the block executes one check instead of several.
+//
+//     x = getfield o.0                         shapecheck o.2
+//     y = getfield o.1             ==>         x = getfieldu o.0
+//     z = getfield o.2                         y = getfieldu o.1
+//                                              z = getfieldu o.2
+//
+// The only change in behaviour is for a struct with fewer slots than the highest later access: it traps at the first access
+// instead of at the later one, with the same message (an object of the wrong shape is a compiler bug, docs/assurance.md).
 
-import { MProgram, MFunction, Instr, OLocal } from "../mir";
-import { fieldJustified } from "../verify";
+import { MProgram, MFunction, MBlock, MRef, Instr, Operand, OLocal } from "../mir";
+import { WINDOW, fieldJustified, scanEnds } from "../verify";
 import { fnWellFormed, passKept } from "./wellformed";
+
+function isLocal(x: Operand, l: usize): bool {
+  return match (x) {
+    OLocal(m) => m == l,
+    _ => false,
+  };
+}
+
+// The slot of a get or set (checked or not) of local `o` that `ins` is.
+function accessSlot(ins: Instr, o: usize): Option<usize> {
+  match (ins) {
+    IGetField(_, x, k) => {
+      if (isLocal(x, o)) {
+        return Some(k);
+      }
+    },
+    IGetFieldU(_, x, k) => {
+      if (isLocal(x, o)) {
+        return Some(k);
+      }
+    },
+    ISetField(x, k, _) => {
+      if (x == o) {
+        return Some(k);
+      }
+    },
+    ISetFieldU(x, k, _) => {
+      if (x == o) {
+        return Some(k);
+      }
+    },
+    _ => {},
+  }
+  return None;
+}
+
+// The shape check to insert in front of the access at position `at` of block `bi`: when that access is a checked get or set that
+// rule U6 does not justify, and a later get or set of the same local in the block (within the window of the check, before
+// the local is redefined) uses a higher slot, `IShapeCheck(o, K)` with K the highest such slot.
+@Requires(bi < f.blocks.length && at < f.blocks[bi].instrs.length)
+function shapeCheckFor(p: MProgram, f: MFunction, bi: usize, at: usize): Option<Instr> {
+  const instrs = f.blocks[bi].instrs;
+  let o: usize = 0;
+  let k: usize = 0;
+  match (instrs[at]) {
+    IGetField(_, x, s) => {
+      match (x) {
+        OLocal(l) => {
+          o = l;
+          k = s;
+        },
+        _ => {
+          return None;
+        },
+      }
+    },
+    ISetField(x, s, _) => {
+      o = x;
+      k = s;
+    },
+    _ => {
+      return None;
+    },
+  }
+  if (o >= f.locals.length || fieldJustified(p, f, bi, at, OLocal(o), k)) {
+    return None;
+  }
+  match (f.locals[o].ty) {
+    MRef => {},
+    _ => {
+      return None;
+    },
+  }
+  if (scanEnds(p, instrs[at], o)) {
+    return None;
+  }
+  let top = k;
+  let j = at + 1;
+  @Invariant(at < j && j <= instrs.length)
+  @Decreases(instrs.length - j)
+  while (j < instrs.length && j + 1 - at <= WINDOW) {
+    match (accessSlot(instrs[j], o)) {
+      Some(s) => {
+        if (s > top) {
+          top = s;
+        }
+      },
+      None => {},
+    }
+    if (scanEnds(p, instrs[j], o)) {
+      j = instrs.length;
+    } else {
+      j += 1;
+    }
+  }
+  return top > k ? Some(IShapeCheck(o, top)) : None;
+}
+
+// `b` with `ins` (and the span of the instruction it precedes) inserted at position `at`.
+@Requires(at < b.instrs.length && b.spans.length == b.instrs.length)
+@Ensures(result.instrs.length == b.instrs.length + 1 && result.spans.length == result.instrs.length)
+function insertAt(b: MBlock, at: usize, ins: Instr): MBlock {
+  return MBlock {
+    instrs: b.instrs.slice(0, at).concat([ins]).concat(b.instrs.slice(at, b.instrs.length)),
+    spans: b.spans.slice(0, at).concat([b.spans[at]]).concat(b.spans.slice(at, b.spans.length)),
+    term: b.term,
+    termSpan: b.termSpan,
+  };
+}
 
 // The unchecked form of the access at position `at` of block `bi`, if it is a checked one and rule U6 accepts it.
 @Requires(bi < f.blocks.length && at < f.blocks[bi].instrs.length)
@@ -46,6 +168,13 @@ export function uncheckFields(p: MProgram, f: MFunction): MFunction {
     let i: usize = 0;
     @Invariant(bi < g.blocks.length)
     while (i < g.blocks[bi].instrs.length) {
+      match (shapeCheckFor(p, g, bi, i)) {
+        Some(c) => {
+          g.blocks[bi] = insertAt(g.blocks[bi], i, c);
+          i += 1;
+        },
+        None => {},
+      }
       match (unchecked(p, g, bi, i)) {
         Some(r) => {
           g.blocks[bi].instrs[i] = r;
@@ -81,6 +210,22 @@ export function uncheckedFieldCount(f: MFunction): usize {
           n += 1;
         },
         ISetFieldU(_, _, _) => {
+          n += 1;
+        },
+        _ => {},
+      }
+    }
+  }
+  return n;
+}
+
+// The number of `IShapeCheck` instructions of `f`.
+export function shapeCheckCount(f: MFunction): usize {
+  let n: usize = 0;
+  for (const b of f.blocks) {
+    for (const i of b.instrs) {
+      match (i) {
+        IShapeCheck(_, _) => {
           n += 1;
         },
         _ => {},

@@ -22,7 +22,7 @@ import {
   usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
-  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, uncheckFields, uncheckFieldsProgram, uncheckedFieldCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
+  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, uncheckFields, uncheckFieldsProgram, uncheckedFieldCount, shapeCheckCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -1307,7 +1307,20 @@ function aLowerSlotAnotherStructOrAnotherBlockKeepsTheCheck(): void {
     IGetField(2, OLocal(0), 1),
     IRelease(0),
   ]);
-  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([lower]), lower)), 0, "slot 1 was not checked by an access of slot 0");
+  const lowerG = uncheckFields(prog([lower]), lower);
+  assertEqUsize(uncheckedFieldCount(lowerG), 2, "slot 1 is not covered by an access of slot 0, but by the shape check put before it");
+  assertEqUsize(shapeCheckCount(lowerG), 1, "one shape check");
+  match (lowerG.blocks[0].instrs[0]) {
+    IShapeCheck(x, k) => {
+      assertEqUsize(x, 0, "of the struct");
+      assertEqUsize(k, 1, "for the highest later slot");
+    },
+    _ => {
+      assert(false, "an IShapeCheck first");
+    },
+  }
+  assert(passKept(lower, lowerG), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([lowerG])), "the verifier accepts the result");
   const twoStructs = withArrays(2, [lr("o"), lr("q"), li("s"), li("d")], [
     IGetField(2, OLocal(0), 1),
     IGetField(3, OLocal(1), 1),
@@ -1320,6 +1333,72 @@ function aLowerSlotAnotherStructOrAnotherBlockKeepsTheCheck(): void {
     bk([IGetField(2, OLocal(0), 1), IRelease(0)], TReturn(None)),
   ]);
   assertEqUsize(uncheckedFieldCount(uncheckFields(prog([across]), across)), 0, "the scan stays within the block");
+}
+
+@Test
+function theFirstAccessOfABlockIsCoveredByAShapeCheckOfTheHighestLaterSlot(): void {
+  const f = withArrays(1, [lr("o"), li("a"), li("b"), li("c"), li("w")], [
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 1),
+    ICopy(4, OInt(7)),
+    IMakeUnique(0),
+    ISetField(0, 2, OLocal(4)),
+    IGetField(3, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = uncheckFields(p, f);
+  assertEqUsize(shapeCheckCount(g), 1, "one shape check");
+  assertEqUsize(uncheckedFieldCount(g), 4, "every access is unchecked, the first one too");
+  assertEqUsize(g.blocks[0].instrs.length, f.blocks[0].instrs.length + 1, "one instruction more");
+  match (g.blocks[0].instrs[0]) {
+    IShapeCheck(x, k) => {
+      assertEqUsize(x, 0, "of the struct");
+      assertEqUsize(k, 2, "for slot 2");
+    },
+    _ => {
+      assert(false, "an IShapeCheck first");
+    },
+  }
+  assert(passKept(f, g), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([g]), g)), 1, "doing it again adds nothing");
+}
+
+@Test
+function noShapeCheckIsAddedWhereItRemovesNothing(): void {
+  const descending = withArrays(1, [lr("o"), li("a"), li("b")], [
+    IGetField(1, OLocal(0), 2),
+    IGetField(2, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([descending]), descending)), 0, "the first access covers the later, lower slot");
+  const single = withArrays(1, [lr("o"), li("a")], [IGetField(1, OLocal(0), 2), IRelease(0)]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([single]), single)), 0, "a single access has nothing to cover");
+  const moved = withArrays(2, [lr("o"), lr("q"), li("a"), li("b")], [
+    IGetField(2, OLocal(0), 0),
+    IMove(0, 1),
+    IGetField(3, OLocal(0), 3),
+    IRelease(0),
+  ]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([moved]), moved)), 0, "o is another object after the move");
+  const selfLoad = withArrays(1, [lr("o"), li("a")], [
+    IGetField(0, OLocal(0), 0),
+    IGetField(1, OLocal(0), 3),
+    IRelease(0),
+  ]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([selfLoad]), selfLoad)), 0, "a load that redefines o covers nothing after it");
+  let far: Instr[] = [IGetField(1, OLocal(0), 0)];
+  let n: usize = 0;
+  while (n < 70) {
+    far.push(ICopy(2, OInt(1)));
+    n += 1;
+  }
+  far.push(IGetField(3, OLocal(0), 1));
+  far.push(IRelease(0));
+  const beyond = withArrays(1, [lr("o"), li("a"), li("w"), li("b")], far);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([beyond]), beyond)), 0, "the later access is beyond the window of the check");
 }
 
 @Test

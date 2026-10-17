@@ -961,9 +961,16 @@ and every other use of the local leave the fact intact, because a struct's kind 
 same header. The optimiser pass `compiler/opt/fieldcheck.or` asks the same predicate. `--assert-facts` does not re-check these (it needs a new runtime
 symbol; runtime/ and the seed are frozen here).
 
-Measured (executed instructions, cachegrind, LLVM backend / C backend, main vs this change): mutres 2,030M / 2,542M to 1,877M / 2,507M; pqueue,
-nbody, bintrees, qsort_inplace, html, mapfreq unchanged within 0.3%. In the self-compile 1,936 of 26,162 field accesses (7.4%) become unchecked.
-The gain is a fraction of the hand-removal because the first access to a struct in each block (typically a parameter, `l1 = move l0; getfield l1.k`)
-keeps its check: nothing in the function proves a parameter is a struct. Removing those needs a fact across calls (a typed-parameter shape
-invariant) or a dominator-based rule across blocks; both are follow-ups. Mutation classes `field-*` in `tools/mutate_mir.py` (736 unchecked accesses
-of the corpus, 5,369 checked ones) are all rejected, and the positive control is accepted.
+A second step makes the first access of a block benefit as well. The new instruction `IShapeCheck(o, k)` is exactly the check of a field access,
+alone; rule U6 also accepts it, and the `IStructNew` that builds the local (slot count known statically), as sources. The optimiser puts one
+`IShapeCheck(o, K)` in front of the first checked access of a struct local in a block when later accesses of the same block (within the window, before the
+local is redefined) use higher slots (K the highest), so the whole group executes one check instead of several, and the first access is unchecked too.
+Insertion happens only where it removes at least one check. A struct too small for K now traps at the first access instead of the later one, with the same
+message (a compiler bug either way).
+
+Measured (executed instructions, cachegrind, LLVM backend / C backend, main vs this change): mutres 2,030M / 2,542M to 1,757M / 2,407M; pqueue 1,344M /
+1,411M to 1,350M / 1,384M; bintrees 4,320M / 4,457M to 4,219M / 4,324M; nbody, qsort_inplace, html, mapfreq unchanged within 0.02%. In the self-compile
+8,440 of 27,210 field accesses (31%) become unchecked, behind 2,646 shape checks. The remaining distance to the hand-removal (mutres 1.02G) is the
+first access of each function on a parameter, which needs a fact across calls (a typed-parameter shape invariant) or a rule across blocks: follow-ups.
+Mutation classes `field-*` and `shape-*` in `tools/mutate_mir.py` (2,556 unchecked accesses and 507 shape checks of the corpus) are all rejected, and the
+positive control is accepted.
