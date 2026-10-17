@@ -18,12 +18,12 @@ Assumptions, all of them facts the verifier establishes elsewhere:
 * `opCls cls key ≠ .ref`: the index is a scalar (`wf.or`: `opIs(.., CUsize)`);
 * `NoSelf`: an `IArraySet(x, i, v)` never stores the array into itself (`wf.or`, `valueOk`:
   `!isLocal(v, x)`);
-* `Held a`: whenever the array local holds a reference at a point of the prefix, it is a *counted*
-  reference (ownership model, the `ctd` ghost bit of `RangeSem.lean`).  The contract `GenOK` keeps
-  the object of a counted reference alive and as long as it was across an instruction that does not
-  mention the local.  For a local that is only *borrowed* in the frame (a parameter) the model has no
-  `ctd` bit, so this theorem does not cover that case: it is the part of T2 that rests on the
-  ownership argument in prose (`docs/tcb.md`).
+* `Held a`: whenever the array local holds a reference at a point of the prefix, it is a *pinned*
+  reference (the `ctd` ghost bit of `RangeSem.lean`: counted, or lent by the caller as a `Param`).  The
+  contract `GenOK` keeps the object of a pinned reference alive and as long as it was across an
+  instruction that does not mention the local.  `Held` is a hypothesis of `dom_sound` / `t2_sound`;
+  `RangePin.lean` discharges it for an array parameter that the function only uses in kept positions
+  (`t2_param`), `CallLink.lean` ties the bit to the ownership kinds (`pinA_of_inv`).
 -/
 
 namespace Orin
@@ -95,7 +95,7 @@ def NoSelf : RI → Prop
   | .set x _ v => v ≠ x
   | _ => True
 
-/-- at this point, if `a` holds a reference, it is a counted one -/
+/-- at this point, if `a` holds a reference, it is a pinned one (counted, or a lent parameter) -/
 def Held (a : Nat) (s : CS) : Prop := ∀ l, s.get a = .ref l → s.ctd a = true
 
 /-! ### facts about the states -/
