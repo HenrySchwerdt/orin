@@ -282,7 +282,7 @@ help_command() {
     workspace) echo 'Usage: orin workspace list|lock|check [--root <directory>]' ;;
     init) echo 'Usage: orin init [name] [--lib | --template http]'; echo 'Create a project without overwriting existing files.' ;;
     add) echo 'Usage: orin add --path <directory> [--dev]'; echo '       orin add --git <url> [--tag <tag> | --rev <commit>] [--name <alias>] [--dev]' ;;
-    build|run|dev) echo "Usage: orin $1 [file.or | project-directory] [--release] [--backend=c|llvm] [-o path] [-- program-arguments]" ;;
+    build|run|dev) echo "Usage: orin $1 [file.or | project-directory] [--release] [--backend=c|llvm] [--target=native|wasm64-orbit] [-o path] [-- program-arguments]" ;;
     toolchain) echo 'Usage: orin toolchain install [--force] | status'; echo 'Installs the pinned LLVM (sha256-verified) into ~/.orin/toolchains/llvm-<version>; --backend=llvm uses it.' ;;
     test) echo 'Usage: orin test [path] [--filter text] [--watch] [--allow-empty] [--format=json]' ;;
     fmt) echo 'Usage: orin fmt [paths...] [--check | --stdout]' ;;
@@ -391,9 +391,9 @@ validate_locked_dependencies() {
 fingerprint() {
   local root=$1 file depname deppath depgit deptag deprev depdev
   {
-    printf '%s\n' "$CC" "$profile" "$backend" "${target:-}"
+    printf '%s\n' "$CC" "$profile" "$backend" "${target:-}" "wasm=${wasm:-false}"
     cksum "$BIN" "$HERE/bin/orin-cli.sh"
-    for file in "$RT"/*.[ch] "$PF"/*.[ch]; do cksum "$file"; done
+    for file in "$RT"/*.[ch] "$PF"/*.[ch] "$PF"/orbit/*.[ch] "$PF"/orbit/include/*.h; do [ ! -f "$file" ] || cksum "$file"; done
     command -v "${CC%% *}" || true
     ${CC} --version 2>/dev/null || true
     source_fingerprint "$root" ""
@@ -423,7 +423,9 @@ native_build() {
   # Compile output goes to an adjacent temporary executable; failed builds preserve the last success.
   local generated=$tmp/out.c
   [ "$backend" != llvm ] || generated=$tmp/out.ll
-  if ! compiler compile "$src" -o "$generated" "--backend=$backend" --runtime "$RT" --cc "$CC" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
+  local target_flag=()
+  [ "$wasm" != true ] || target_flag=(--target=wasm64-orbit)
+  if ! compiler compile "$src" -o "$generated" "--backend=$backend" "${target_flag[@]}" --runtime "$RT" --cc "$CC" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
     if $json; then result_json false error "$(cat "$tmp/compile.err")"; else cat "$tmp/compile.err" >&2; fi
     rm -rf "$tmp"; return 1
   fi
@@ -433,10 +435,16 @@ native_build() {
   mkdir -p "$(dirname "$out")"
   local emit=$out.tmp.$$
   cleanup_files+=("$emit")
-  local sources=("$RT/orin_runtime.c" "$PF/orin_platform.c")
+  local sources=("$RT/orin_runtime.c" "$PF/orin_platform.c") link=(-lm -pthread) flags=(-I "$RT")
   [ "$backend" != llvm ] || sources+=("$RT/orin_runtime_llvm.c")
+  if [ "$wasm" = true ]; then
+    # ADR-0055: a freestanding wasm64 module over the Orbit host ABI; its own L0 and mini libc, no WASI, entry `orin_main`.
+    sources=("$RT/orin_runtime.c" "$PF/orbit/orin_platform_orbit.c" "$PF/orbit/orin_libc_orbit.c" "$PF/orbit/orin_float_orbit.c" "$PF/orbit/orin_builtins_orbit.c")
+    flags=(--target=wasm64-unknown-unknown -mbulk-memory -ffreestanding -nostdlib -I "$PF/orbit/include" -I "$RT")
+    link=(-Wl,--no-entry -Wl,--stack-first -Wl,-z,stack-size=1048576)
+  fi
   $verbose && printf 'Compiling with %s %s\n' "$CC" "$ccflags" >&2
-  if ! ${CC} "$ccflags" -w -I "$RT" "$generated" "${sources[@]}" -lm -pthread -o "$emit" > "$tmp/cc.log" 2>&1; then
+  if ! ${CC} "$ccflags" -w "${flags[@]}" "$generated" "${sources[@]}" "${link[@]}" -o "$emit" > "$tmp/cc.log" 2>&1; then
     local logfile=$out.build.log
     cp "$tmp/cc.log" "$logfile"
     if $json; then result_json false error "Native build failed. See $logfile"; else printf 'error: Native build failed\n\n' >&2; head -15 "$logfile" >&2; fi
@@ -446,7 +454,7 @@ native_build() {
   mv -f "$emit" "$out"; rm -rf "$tmp"
 }
 build_command() {
-  profile=dev backend=''
+  profile=dev backend='' wasm=false
   local src='' output='' arg key cache
   program_args=()
   while [ $# -gt 0 ]; do
@@ -454,6 +462,9 @@ build_command() {
       --) shift; program_args=("$@"); break ;;
       --release) profile=release ;;
       --backend=c|--backend=llvm) backend=${1#*=} ;;
+      --target=native) wasm=false ;;
+      --target=wasm64-orbit) wasm=true ;;
+      --target=*) fail "Unknown target: ${1#*=} (expected native or wasm64-orbit)" 2 ;;
       -o) [ $# -ge 2 ] || fail 'Missing output path.' 2; output=$2; shift ;;
       -*) fail "Unknown $command option: $1" 2 ;;
       *) [ -z "$src" ] || { if [ "$command" = run ]; then program_args+=("$1"); else fail 'Expected one source path.' 2; fi; }; [ -n "$src" ] || src=$1 ;;
@@ -462,6 +473,17 @@ build_command() {
   # ADR-0038 section 8: --release defaults to the LLVM backend (the owner's decision, 2026-10-16); --backend=c is the
   # explicit fallback. Both backends run the same MIR optimiser and are compiled at -O2 (native_build).
   local release_backend=llvm explicit_backend=$backend
+  if [ "$wasm" = true ]; then
+    # ADR-0055: the WebAssembly target uses the C backend and a clang with the WebAssembly backend and wasm-ld: the pinned
+    # LLVM (orin toolchain install) when present, else the system clang.
+    [ "$command" = build ] || fail "orin $command does not support --target=wasm64-orbit; build it and run it with Orbit (orbit run <file>.wasm --grant log/v1 --invoke orin_main)" 2
+    [ "$backend" != llvm ] || fail '--target=wasm64-orbit uses the C backend; drop --backend=llvm.' 2
+    backend=c
+    if [ -z "$CC_EXPLICIT" ]; then
+      local pinned
+      if pinned=$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain path 2>/dev/null); then CC=$pinned; else CC=clang; fi
+    fi
+  fi
   if [ -z "$backend" ]; then if [ "$profile" = release ]; then backend=$release_backend; else backend=c; fi; fi
   if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then
     # The pinned LLVM (orin toolchain install) is preferred. Without it a dev build uses the system clang; a release
@@ -490,6 +512,7 @@ build_command() {
   if [ -f "$project/orin.toml" ]; then name=$(info name "$project"); else name=$(basename "$target" .or); fi
   valid_name "$name" || fail 'Invalid executable name in package manifest.'
   artifact=${output:-$project/build/$profile/$name}
+  [ "$wasm" != true ] || [ -n "$output" ] || artifact=$project/build/$profile/$name.wasm
   cache=$artifact.fingerprint
   key=$(fingerprint "$project")
   if [ -x "$artifact" ] && [ -f "$cache" ] && [ "$(cat "$cache")" = "$key" ]; then status "Up to date · $name"

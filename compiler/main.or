@@ -48,6 +48,7 @@ import { LoadedProgram } from "./loader";
 import { verifyContracts, reportJson, reportText, failedCount, unknownCount, SolverLimits, defaultSolverLimits } from "./vc";
 import {
   moduleDeps, depsText, depsJsonText, apiSnapshot, apiDiff, effectPolicyDiags, policySourceMap,
+  effectsContext, orbitPlan, orbitManifestC, ORBIT_TARGET,
 } from "./analysis";
 import { readFile } from "std:fs";
 import { lower } from "./lower";
@@ -66,7 +67,7 @@ import { runMcp } from "./mcp";
 
 function usage(): void {
   console.error(
-    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--split <n>] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict]] <entry.or>",
+    "usage:\n  orin workspace list|lock|check [--root <directory>]\n  orin check [--format=json] [--deps] [--strict-contracts] <entry.or | package-dir>\n  orin api [--check <snapshot>] <entry.or | package-dir>\n  orin expand [--input] [--processor-timeout <seconds>] [--processor-cache <dir>] <entry.or | package-dir>\n  orin graph <entry.or | package-dir> [-o out.json]\n  orin diff --base <dir|.or|.json> --head <dir|.or|.json> [--format=json|text|html] [--link-base <url>] [-o out] [--exit-code]\n  orin effects <entry.or | package-dir> [--format=json] [--summary] [--module <id>] [--function <name>] [--no-paths] [--tests] [--check-purity]\n  orin compile [--format=json] <entry.or> -o <out.c> [--no-verify] [--no-opt] [--no-fuse] [--fuse-report] [--c-builtins] [--backend=c|llvm] [--target=native|wasm64-orbit] [--check-contracts] [--strict-contracts] [--stats-sites] [--assert-facts] [--split <n>] [--timings <file.json>]\n  orin fmt [--check] [--stdout] <file.or>...\n  orin lsp\n  orin mcp [--root <dir>] [--allow-exec] [--repo <dir>]\n  orin test [--filter <substring>] [--format=json] [--runtime <dir>] [--cc <cmd>] <entry.or | package-dir>\n  orin mir <entry.or>\n  orin verify [--contracts [--format=json] [--z3 PATH] [--timeout-ms N] [--retry-ms N] [--rlimit N] [--strict]] <entry.or>",
   );
   exit(2);
 }
@@ -223,6 +224,7 @@ type Options = {
   checkSnap: Option<string>;
   timings: Option<string>;
   split: usize;
+  target: string;      // `--target=`: "native" (default) or "wasm64-orbit" (analysis/orbit.or)
   argv: string[];
   procs: ProcConfig;   // `--processor-timeout`, `--cc`, `--runtime`, `--processor-cache` (ADR-0046 S5)
 };
@@ -255,7 +257,7 @@ function on(o: Options, flag: string): bool {
 // None after printing the usage or the unknown-option error (both exit).
 function parseOptions(all: string[]): Option<Options> {
   const known = switchNames();
-  let o = Options { switches: [], z3: "z3", lim: defaultSolverLimits(), checkSnap: None, timings: None, split: 0, argv: [], procs: defaultProcConfig() };
+  let o = Options { switches: [], z3: "z3", lim: defaultSolverLimits(), checkSnap: None, timings: None, split: 0, target: "native", argv: [], procs: defaultProcConfig() };
   let expectZ3 = false;
   let ai: usize = 0;
   while (ai < all.length) {
@@ -329,6 +331,14 @@ function parseOptions(all: string[]): Option<Options> {
       }
       o.split = n.unwrap().toUsize();
       ai += 1;
+    } else if (a.startsWith("--target=")) {
+      const t = a.substring(9, a.length);
+      if (t != "native" && t != ORBIT_TARGET) {
+        console.error("error: unknown target `" + t + "`; the targets are native and " + ORBIT_TARGET);
+        exit(2);
+        return None;
+      }
+      o.target = t;
     } else if (a == "--backend=c") {
       o.switches = o.switches.filter(f => f != "--backend=llvm");
     } else if (known.includes(a)) {
@@ -508,6 +518,7 @@ function runCompile(
   entry: string,
   t0: Timer,
   clock: ClockGrant,
+  manifest: string,
 ): void {
   const llvm = on(o, "--backend=llvm");
   const assertFacts = on(o, "--assert-facts");
@@ -565,6 +576,8 @@ function runCompile(
         ? emitLlvmFacts(pruneProgram(mir), assertFacts)
         : emitCFacts(pruneProgram(mir), assertFacts);
   }
+  // the Orbit capability manifest ("" for the native target): the very last thing in the file (analysis/orbit.or)
+  c = c + manifest;
   const written = writeFile(fs, out, c);
   if (written.isErr()) {
     console.error("error: cannot write " + out + ": " + written.unwrapErr());
@@ -624,6 +637,17 @@ function runBuildCommand(
   }
   if (o.timings.isSome() && !isCompile) {
     console.error("error: --timings needs the compile command");
+    exit(2);
+    return;
+  }
+  const wasm = o.target == ORBIT_TARGET;
+  if (o.target != "native" && !isCompile) {
+    console.error("error: --target needs the compile command");
+    exit(2);
+    return;
+  }
+  if (wasm && (on(o, "--backend=llvm") || on(o, "--stats-sites") || o.split > 0)) {
+    console.error("error: --target=" + ORBIT_TARGET + " needs the C backend without --stats-sites and --split");
     exit(2);
     return;
   }
@@ -715,6 +739,18 @@ function runBuildCommand(
     printWarnings(program, loaded.sm, json && !verifyContractsFlag, strictFlag, ui);
   }
   const timer2 = lapped(timer1, clock, "check");
+  // `--target=wasm64-orbit`: the capabilities `main` needs, from the effect analysis; an effect the target lacks is E0523.
+  let manifest = "";
+  if (isCompile && wasm) {
+    const shipped = hasTests(program) ? eraseTests(program) : program;
+    const ci = checkWithIndex(shipped, loaded.sm);
+    const plan = orbitPlan(effectsContext(shipped, ci.index, loaded.sm));
+    if (plan.errors.length > 0) {
+      report(loaded.sm, plan.errors, json, ui);
+      return;
+    }
+    manifest = orbitManifestC(plan.requires);
+  }
   if (cmd == "check") {
     runCheck(program, o, json, ui);
   } else if (cmd == "mir") {
@@ -726,6 +762,6 @@ function runBuildCommand(
       exit(1);
     }
   } else {
-    runCompile(fs, loaded.sm, checked.unwrap(), o, argv[3], entry, timer2, clock);
+    runCompile(fs, loaded.sm, checked.unwrap(), o, argv[3], entry, timer2, clock, manifest);
   }
 }

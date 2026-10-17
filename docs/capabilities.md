@@ -264,3 +264,25 @@ purity agreement, not-typed program, policy matching; `tools/test_tooling.sh`), 
 `tests/osig/effects/app.*`, determinism, OSIG `MAY_PERFORM` invariants on four programs including the compiler, the diff
 sections, the policy cases), the LSP hover tests in `compiler/tests/lsp_test.or` and `tools/protocol.sh lsp`, the MCP `inspect`
 tests in `tools/protocol.sh mcp`, and `tools/test_capabilities.sh` (the inferred effects cover what the runtime denies).
+
+## The Orbit capability manifest (`--target=wasm64-orbit`)
+
+`orin compile <entry.or> -o out.c --target=wasm64-orbit` (C backend only; with `--backend=llvm`, `--stats-sites` or `--split` it is a
+usage error, exit 2; `--target=native` is the default and changes nothing) appends a manifest for the Orbit WebAssembly runtime to
+the generated C, as the very last lines: a custom section `orbit.manifest` whose payload is the UTF-8 JSON
+`{"abi":1,"requires":[...],"producer":"orin"}` (host ABI section 6). It describes requirements and never authorises.
+
+`requires` is derived from the effect set of `main` that `orin effects <entry> --summary` reports for the entry point:
+
+| effect | capability |
+|---|---|
+| `Console.Write`, `Stdio.Write` | `log/v1` |
+| `Clock.Now` | `clock/v1` |
+| `Process.Exit`, `Process.Args`, `Stdio.Read`, `Host.Acquire` | none (handled in the guest: exit traps after recording the status, args are `["main"]`, stdin is empty) |
+| `Unknown.*` (an unresolved call, e.g. of a function value) | no error; `clock/v1` is required as well (the safe over-approximation: the guest can import only `log/v1` and `clock/v1`) |
+| anything else (`Fs.*`, `Process.Spawn`, `Net.*`, `Stream.*`, `Task.*`, `Channel.*`) | not available: error E0523 |
+
+`log/v1` is always required (a runtime trap prints its message to stderr, which maps to the log capability); the list is sorted
+without duplicates. E0523 is reported once per unavailable effect, located at the evidence the analysis has
+(``error[E0523]: `main` needs Fs.ReadFile, which the wasm64-orbit target does not provide``). Implementation:
+`compiler/analysis/orbit.or`; tests: `tools/test_effects.py` (section 5).

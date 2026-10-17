@@ -409,6 +409,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(before, binary.stat().st_mtime_ns)
         self.run_cli("fmt", "--check", cwd=project)
 
+    def test_wasm64_orbit_build(self):
+        # ADR-0055: `orin build --target=wasm64-orbit` makes a freestanding WebAssembly module with an Orbit manifest.
+        probe = subprocess.run(["clang", "--target=wasm64-unknown-unknown", "-print-targets"], capture_output=True, text=True)
+        if probe.returncode != 0 or "wasm64" not in probe.stdout or not shutil.which("wasm-ld"):
+            self.skipTest("no clang with the WebAssembly backend and wasm-ld")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("build", "--target=wasm64-orbit", cwd=project, env={"CC": "clang"})
+        module = (project / "build/dev/hello.wasm").read_bytes()
+        self.assertEqual(module[:4], b"\0asm")
+        self.assertIn(b'orbit.manifest{"abi":1,"requires":["log/v1"],"producer":"orin"}', module)
+        self.assertNotIn(b"wasi_snapshot_preview1", module)
+        self.assertIn("does not support --target=wasm64-orbit", self.run_cli("run", "--target=wasm64-orbit", cwd=project, code=2).stderr)
+        self.assertIn("C backend", self.run_cli("build", "--target=wasm64-orbit", "--backend=llvm", cwd=project, code=2).stderr)
+        self.assertIn("Unknown target", self.run_cli("build", "--target=arm", cwd=project, code=2).stderr)
+
     def test_init_conflict_is_unchanged(self):
         (self.cwd / "src").mkdir()
         (self.cwd / "src/main.or").write_text("keep me")
