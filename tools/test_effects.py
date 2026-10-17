@@ -352,6 +352,10 @@ def main():
         "hello": ["log/v1"],
         "clock": ["clock/v1", "log/v1"],
         "exit": ["log/v1"],
+        # Task.* and Channel.* need no capability (the guest runs tasks itself, one at a time); the spawned closure is an
+        # unresolved callback (Unknown.Callback), which adds clock/v1 like any function value
+        "task": ["clock/v1", "log/v1"],
+        "channel": ["clock/v1", "log/v1"],
         "closure": ["clock/v1", "log/v1"],  # an unresolved call (Unknown.*): conservative, not an error
     }
     for name, req in want.items():

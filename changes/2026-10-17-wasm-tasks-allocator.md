@@ -1,0 +1,1 @@
+- wasm64-orbit: `std:task` and channels run under WebAssembly (tasks run one at a time when something waits on them), and a large-block allocator brings growing arrays near native memory (ADR-0055).
