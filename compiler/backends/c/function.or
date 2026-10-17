@@ -8,6 +8,7 @@ import { BinOp, UnOp, Builtin, taskOpC } from "../../hir";
 import {
   MType, MLocal, Operand, Instr, SwitchCase, Terminator, MBlock, MFunction, MProgram, aggWords,
   isAggTy, slotWords, RT_OPT_UNWRAP, RT_RES_UNWRAP, RT_RES_UNWRAP_ERR, RT_V_UNWRAP, RT_ASSERT_FACT, RT_ASSERT_ARRAY,
+  RT_STRUCT_NEW, RT_ARRAY_NEW,
 } from "../../mir";
 
 import {
@@ -243,6 +244,9 @@ function coreC(k: usize, a: string[]): string {
     21 => "({ void *m_ = orin_platform_realloc(" + addrC(a[0]) + ", (size_t)(" + a[1]
         + ")); if (!m_) orin_trap(\"out of memory\"); (uint64_t)(uintptr_t)m_; })",
     22 => "(void)orin_platform_mem_move(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2] + "))",
+    24 => "((uint64_t)(" + a[0] + ") + (uint64_t)(" + a[1] + "))",
+    25 => "((uint64_t)(" + a[0] + ") - (uint64_t)(" + a[1] + "))",
+    26 => "((uint64_t)(" + a[0] + ") * (uint64_t)(" + a[1] + "))",
     _ => "({ int c_ = orin_platform_mem_cmp(" + addrC(a[0]) + ", " + addrC(a[1]) + ", (size_t)(" + a[2]
         + ")); (int64_t)((c_ > 0) - (c_ < 0)); })",
   };
@@ -620,8 +624,7 @@ export class CFunctionEmitter {
     }
     const n = lname(d);
 
-    let s = n + " = orin_struct_new(" + u(tag) + ", " + u(slots.length) + ", "
-        + u(this.maskOf(slots)) + "ULL);";
+    let s = n + " = " + this.newStruct(u(tag), u(slots.length), u(this.maskOf(slots)) + "ULL") + ";";
     let k: usize = 0;
     for (const o of slots) {
       s += " orin_struct_init(" + n + ", " + u(k) + ", " + this.slotOf(o) + ");";
@@ -632,11 +635,20 @@ export class CFunctionEmitter {
 
   private arrayNew(d: usize, isRef: bool, es: Operand[]): string {
     const n = lname(d);
-    let s = n + " = orin_array_new(" + u(es.length) + ", " + (isRef ? "1" : "0") + ");";
+    const sym = this.syms.l1(RT_ARRAY_NEW);
+    let s = n + " = " + (sym != "" ? "(OrinObj *)(uintptr_t)" + sym : "orin_array_new") + "(" + u(es.length) + ", "
+        + (isRef ? "1" : "0") + ");";
     for (const o of es) {
       s += " orin_array_push(" + n + ", " + this.slotOf(o) + ");";
     }
     return s;
+  }
+
+  // The C expression of a new struct (`orin_struct_new`): the Orin function of `$rt` when the program has it (a `static inline`
+  // the C compiler can inline), else the C runtime's.
+  private newStruct(tag: string, nslots: string, mask: string): string {
+    const sym = this.syms.l1(RT_STRUCT_NEW);
+    return (sym != "" ? "(OrinObj *)(uintptr_t)" + sym : "orin_struct_new") + "(" + tag + ", " + nslots + ", " + mask + ")";
   }
 
   // The immortal payload-less variant with tag `t`: a static object of the unit when the program has the L1 entries
@@ -654,8 +666,7 @@ export class CFunctionEmitter {
     let s = "";
     let env = this.nullaryC(0);
     if (caps.length > 0) {
-      s += "{ OrinObj *env_ = orin_struct_new(0, " + u(caps.length) + ", " + u(this.maskOf(caps))
-          + "ULL);";
+      s += "{ OrinObj *env_ = " + this.newStruct("0", u(caps.length), u(this.maskOf(caps)) + "ULL") + ";";
       let k: usize = 0;
       for (const o of caps) {
         s += " orin_struct_init(env_, " + u(k) + ", " + this.slotOf(o) + ");";
@@ -664,7 +675,7 @@ export class CFunctionEmitter {
       s += " ";
       env = "env_";
     }
-    s += n + " = orin_struct_new(0, 2, 2ULL); orin_struct_init(" + n + ", 0, (uint64_t)(uintptr_t)&"
+    s += n + " = " + this.newStruct("0", "2", "2ULL") + "; orin_struct_init(" + n + ", 0, (uint64_t)(uintptr_t)&"
         + this.syms.name(g) + "); orin_struct_init(" + n + ", 1, ORIN_SLOT(" + env + "));";
     if (caps.length > 0) {
       s += " }";
@@ -695,7 +706,7 @@ export class CFunctionEmitter {
   @Requires(vt < this.syms.vtables())
   private iface(d: usize, vt: usize, v: Operand): string {
     const n = lname(d);
-    return n + " = orin_struct_new(0, 2, 2ULL); orin_struct_init(" + n
+    return n + " = " + this.newStruct("0", "2", "2ULL") + "; orin_struct_init(" + n
         + ", 0, (uint64_t)(uintptr_t)orin_vt" + u(vt) + "); orin_struct_init(" + n + ", 1, "
         + this.slotOf(v) + ");";
   }

@@ -381,10 +381,10 @@ static void *xrealloc(void *q, size_t n) {
 }
 
 /* Small-block cache for the variable-size buffers: string objects and array item buffers of at most SB_MAX bytes (16-byte
- * size classes). Every such block is allocated with its size rounded up to the class, and its free passes the same size
- * (string: sizeof(OrinString) + cap + 1; items: cap * 8), so a block can sit on any thread's list and no header is needed.
- * Per thread like the object lists above (a block is plain malloc memory), capped per class, and compiled out with them
- * (ASan, -DORIN_NO_FREELIST). Larger buffers go to the allocator (realloc keeps its in-place growth for them). */
+ * size classes). It is Orin code now (sbAlloc, sbFree, sbRealloc of runtime/core/heap.or, ADR-0052 R3d.3 (c)) over the lists in the heap
+ * block (orin_runtime.h); the C below calls the Orin functions through the wrappers the emitted code defines. Only a census build
+ * (-DORIN_SITE_STATS) keeps the C versions. sb_drain, the return of the lists at the end of a task, stays C until R3e. */
+#ifdef ORIN_SITE_STATS
 #ifndef ORIN_NO_FREELIST
 enum { SB_CAP = 1 << 15 };
 static inline void *sb_alloc(size_t n) {
@@ -423,6 +423,17 @@ static void *sb_realloc(void *p, size_t old, size_t n) {
     }
     return q;
 }
+#else
+#define sb_alloc(n) xmalloc(n)
+#define sb_free(p, n) orin_platform_free(p)
+#define sb_realloc(p, old, n) xrealloc((p), (n))
+#endif
+#else
+static inline void *sb_alloc(size_t n) { return orin_sb_alloc(n); }
+static inline void sb_free(void *p, size_t n) { orin_sb_free(p, n); }
+static inline void *sb_realloc(void *p, size_t old, size_t n) { return orin_sb_realloc(p, old, n); }
+#endif
+#ifndef ORIN_NO_FREELIST
 static void sb_drain(void) {
     for (int c = 0; c <= SB_CLASSES; c++)
         while (sb_list(c)) {
@@ -433,13 +444,15 @@ static void sb_drain(void) {
         }
 }
 #else
-#define sb_alloc(n) xmalloc(n)
-#define sb_free(p, n) orin_platform_free(p)
-#define sb_realloc(p, old, n) xrealloc((p), (n))
 #define sb_drain() ((void)0)
 #endif
 
 /* ---------------------------------------------------------------- destroy */
+
+/* orin_destroy and orin_make_unique_slow are Orin functions of $rt/rc.or now (ADR-0052 R3d.3 (b)); the code the program is compiled to
+ * defines them under these names for the header inlines (orin_release, orin_make_unique) and the C shells. A census build
+ * (-DORIN_SITE_STATS) keeps the C versions (the census hooks are C; they go with the census in R3d.5). */
+#ifdef ORIN_SITE_STATS
 
 /* t_dstack / t_dcap: the work stack of orin_destroy: per task, freed when the task ends */
 
@@ -520,9 +533,14 @@ void orin_destroy(OrinObj *o) {
 #undef PUSH
 #undef DEC
 }
+#endif
 
 /* ---------------------------------------------------------------- structs */
 
+/* orin_struct_new, orin_variant1 and orin_array_new are Orin functions of $rt/object.or now (ADR-0052 R3d.3 (a)); the code the program is
+ * compiled to defines them under these names for the C shells below. A census build (-DORIN_SITE_STATS, `orin2 compile --stats-sites`)
+ * keeps the C versions, because the census hooks (SITE_ALLOC) are C: they go with the census in R3d.5. */
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     if (nslots > 64) orin_trap("struct has more than 64 slots");
     OrinStruct *s;
@@ -555,20 +573,24 @@ OrinObj *orin_struct_new(uint32_t tag, uint32_t nslots, uint64_t refmask) {
     SITE_ALLOC(&s->h, 3, sizeof(OrinStruct) + (uint64_t)nslots * 8);
     return &s->h;
 }
+#endif
 
 /* orin_nullary, orin_assert_fact, orin_assert_array, orin_struct_copy_slot, orin_opt_unwrap, orin_res_unwrap, orin_res_unwrap_err and
  * orin_v_unwrap are written in Orin now ($rt/leaf.or, ADR-0052 R3d.2); the frozen runtime in bootstrap/seed/runtime/ keeps the C versions
  * for the seed and --c-builtins. orin_trap_shape stays: the header inlines and the functions below call it. */
 void orin_trap_shape(void) { orin_trap("field access on a value of the wrong shape (compiler bug)"); }
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_variant1(uint32_t tag, uint64_t refmask, uint64_t slot) {
     OrinObj *o = orin_struct_new(tag, 1, refmask & 1);
     ((OrinStruct *)o)->slots[0] = slot;
     return o;
 }
+#endif
 
 /* ---------------------------------------------------------------- make_unique */
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_make_unique_slow(OrinObj *o) {
     ORIN_STAT(orin_stats.cow_copies++);
     ORIN_SITE_RC(o, ORIN_SITE_COW_COPY);
@@ -600,9 +622,12 @@ OrinObj *orin_make_unique_slow(OrinObj *o) {
     orin_release(o);
     return r;
 }
+#endif
 
 /* ---------------------------------------------------------------- strings */
 
+/* str_alloc is the Orin function strAlloc of runtime/core/object.or (R3d.3 (c)); a census build keeps the C version. */
+#ifdef ORIN_SITE_STATS
 static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     if (cap < len) cap = len;
     if (cap > ((uint64_t)1 << 48)) orin_trap("string too large");
@@ -618,6 +643,9 @@ static OrinString *str_alloc(uint64_t len, uint64_t cap) {
     SITE_ALLOC(&s->h, 0, sizeof(OrinString) + cap + 1);
     return s;
 }
+#else
+static inline OrinString *str_alloc(uint64_t len, uint64_t cap) { return (OrinString *)orin_str_alloc(len, cap); }
+#endif
 
 OrinObj *orin_str_new(const char *p, uint64_t n) {
     OrinString *s = str_alloc(n, n);
@@ -1085,6 +1113,7 @@ OrinObj *orin_parse_float(OrinObj *s) {
 
 /* ---------------------------------------------------------------- arrays */
 
+#ifdef ORIN_SITE_STATS
 OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     if (cap > ((uint64_t)1 << 40)) orin_trap("array too large");
     OrinArray *a;
@@ -1108,7 +1137,10 @@ OrinObj *orin_array_new(uint64_t cap, int64_t is_ref) {
     SITE_ALLOC(&a->h, is_ref ? 2 : 1, sizeof(OrinArray) + cap * 8);
     return &a->h;
 }
+#endif
 
+/* orin_array_push_grow is the Orin function arrayPushGrow of runtime/core/object.or (R3d.3 (c)); a census build keeps the C version. */
+#ifdef ORIN_SITE_STATS
 void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     OrinArray *a = (OrinArray *)o;
     uint64_t cap = a->cap ? a->cap * 2 : 4;
@@ -1120,6 +1152,7 @@ void orin_array_push_grow(OrinObj *o, uint64_t slot) {
     a->cap = cap;
     a->items[a->len++] = slot;
 }
+#endif
 
 OrinObj *orin_array_pop(OrinObj *o) {
     OrinArray *a = (OrinArray *)o;

@@ -1,0 +1,229 @@
+// $rt/rc -- destroy and copy-on-write, written in Orin (ADR-0052 Addendum A, step R3d.3 (b)).
+//
+// `destroy` frees an object whose count reached 0 (iterative, so long chains and deep trees cannot overflow the stack; the work
+// stack is per task and lives in the heap block), `makeUniqueSlow` is the copying path of `make_unique`. The backends call them by
+// name in place of `orin_destroy` and `orin_make_unique_slow` (compiler/mir/rt.or); the C shells reach them through the wrappers of
+// the same names that the emitted code defines. The retain / release fast paths stay inline in the emitted code.
+//
+// A count above 0 is a live object; a count of 0 or below is immortal (static literals, the nullary objects) or pinned by a
+// lend (docs/concurrency.md, "lending"): neither is counted. Counters and the live balance are updated exactly as the C versions
+// did.
+
+import { load32, load64, store64, memFree, memRealloc, memCopy, heapBase, cfg, wadd, wsub, wmul, shl, shr, and } from "std:core";
+import {
+  isLive, addAt, subAt, liveDec, sbFree, FL_STRUCT, FL_ARRAY, FL_N, FL_CAP, DSTACK, DCAP, S_RELEASES, S_RETAINS, S_COW_COPIES,
+  S_LIVE_BYTES
+} from "./heap";
+import { structNew, arrayNew, strAlloc } from "./object";
+
+// One reference dropped: true when the count of the live object `c` reached 0 (the caller destroys it). Immortal, pinned and null
+// references are left alone.
+@Inline
+function decRef(c: usize): bool {
+  if (c != 0) {
+    const rc = load64(c);
+    if (isLive(rc)) {
+      if (cfg(1) == 1) {
+        addAt(wadd(heapBase(), S_RELEASES), 1);
+      }
+      const n = wsub(rc, 1);
+      store64(c, n);
+      return n == 0;
+    }
+  }
+  return false;
+}
+
+// One reference taken (`orin_retain`): a live object's count goes up, an immortal one is left alone.
+@Inline
+function retain(o: usize): void {
+  const rc = load64(o);
+  if (isLive(rc)) {
+    store64(o, wadd(rc, 1));
+    if (cfg(1) == 1) {
+      addAt(wadd(heapBase(), S_RETAINS), 1);
+    }
+  }
+}
+
+// The work stack outgrew its capacity `scap` (0 before the first use): twice as many entries, 256 at first. The new block and
+// capacity are stored in the heap block; returns the capacity.
+function growStack(scap: usize): usize {
+  const h = heapBase();
+  const ncap = scap != 0 ? wmul(scap, 2) : 256;
+  store64(wadd(h, DSTACK), memRealloc(load64(wadd(h, DSTACK)), shl(ncap, 3)));
+  store64(wadd(h, DCAP), ncap);
+  return ncap;
+}
+
+// Free the object `o` (count 0) and every child whose count reaches 0 through it. The first dying child of an object is freed next
+// without a trip through the work stack (`cur`), the others wait on the stack: the order differs from a plain stack, the set of freed
+// objects does not. A freed struct or array header goes back on its free list (capped by FL_CAP); a string and an item buffer go to
+// the small-block cache; the rest to the allocator.
+export function destroy(o: usize): void {
+  const h = heapBase();
+  let stack = load64(wadd(h, DSTACK));
+  let scap = load64(wadd(h, DCAP));
+  let sp: usize = 0;
+  let cur = o;
+  while (cur != 0 || sp != 0) {
+    if (cur == 0) {
+      sp = wsub(sp, 1);
+      cur = load64(wadd(stack, shl(sp, 3)));
+    }
+    const x = cur;
+    cur = 0;
+    const kind = load32(wadd(x, 8));
+    let recycled = false;
+    if (kind == 2) {
+      // array: release the elements of a reference array, free the item buffer, recycle the header
+      const cap = load64(wadd(x, 24));
+      const items = load64(wadd(x, 40));
+      if (load64(wadd(x, 32)) != 0) {
+        const len = load64(wadd(x, 16));
+        let p = items;
+        let i: usize = 0;
+        while (i < len) {
+          const c = load64(p);
+          if (decRef(c)) {
+            if (cur == 0) {
+              cur = c;
+            } else {
+              if (sp == scap) {
+                scap = growStack(scap);
+                stack = load64(wadd(h, DSTACK));
+              }
+              store64(wadd(stack, shl(sp, 3)), c);
+              sp = wadd(sp, 1);
+            }
+          }
+          p = wadd(p, 8);
+          i = wadd(i, 1);
+        }
+      }
+      if (cfg(1) == 1) {
+        subAt(wadd(h, S_LIVE_BYTES), wadd(48, shl(cap, 3)));
+      }
+      if (items != 0) {
+        sbFree(items, shl(cap, 3));
+      }
+      if (cfg(0) == 1 && load64(wadd(wadd(h, FL_N), 72)) < FL_CAP) {
+        store64(x, load64(wadd(h, FL_ARRAY)));
+        store64(wadd(h, FL_ARRAY), x);
+        addAt(wadd(wadd(h, FL_N), 72), 1);
+        liveDec();
+        recycled = true;
+      }
+    } else if (kind == 3) {
+      // struct: release the reference slots (refmask, lowest bit first, stopping at the last set bit; no bit is set at or above nslots), recycle the object by
+      // size class
+      const n = load32(wadd(x, 16));
+      let m = load64(wadd(x, 24));
+      let p = wadd(x, 32);
+      while (m != 0) {
+        if (and(m, 1) == 1) {
+          const c = load64(p);
+          if (decRef(c)) {
+            if (cur == 0) {
+              cur = c;
+            } else {
+              if (sp == scap) {
+                scap = growStack(scap);
+                stack = load64(wadd(h, DSTACK));
+              }
+              store64(wadd(stack, shl(sp, 3)), c);
+              sp = wadd(sp, 1);
+            }
+          }
+        }
+        m = shr(m, 1);
+        p = wadd(p, 8);
+      }
+      if (cfg(1) == 1) {
+        subAt(wadd(h, S_LIVE_BYTES), wadd(32, shl(n, 3)));
+      }
+      if (cfg(0) == 1 && n < 9 && load64(wadd(wadd(h, FL_N), shl(n, 3))) < FL_CAP) {
+        const lp = wadd(wadd(h, FL_STRUCT), shl(n, 3));
+        store64(x, load64(lp));
+        store64(lp, x);
+        addAt(wadd(wadd(h, FL_N), shl(n, 3)), 1);
+        liveDec();
+        recycled = true;
+      }
+    } else {
+      // string: one block of 32 + cap + 1 bytes
+      const total = wadd(load64(wadd(x, 24)), 33);
+      if (cfg(1) == 1) {
+        subAt(wadd(h, S_LIVE_BYTES), total);
+      }
+      sbFree(x, total);
+      liveDec();
+      recycled = true;
+    }
+    if (!recycled) {
+      memFree(x);
+      liveDec();
+    }
+  }
+}
+
+// The copying path of `make_unique` (the count of `o` is not 1): a shallow copy with the children retained, one count of `o`
+// released. Consumes the caller's reference to `o`, returns an owned one.
+export function makeUniqueSlow(o: usize): usize {
+  if (cfg(1) == 1) {
+    addAt(wadd(heapBase(), S_COW_COPIES), 1);
+  }
+  const kind = load32(wadd(o, 8));
+  let r: usize = 0;
+  if (kind == 3) {
+    const n = load32(wadd(o, 16));
+    const mask = load64(wadd(o, 24));
+    r = structNew(load32(wadd(o, 12)), n, mask);
+    let i: usize = 0;
+    while (i < n) {
+      const v = load64(wadd(wadd(o, 32), shl(i, 3)));
+      store64(wadd(wadd(r, 32), shl(i, 3)), v);
+      if (and(shr(mask, i), 1) == 1) {
+        retain(v);
+      }
+      i = wadd(i, 1);
+    }
+  } else if (kind == 2) {
+    const len = load64(wadd(o, 16));
+    const isRef = load64(wadd(o, 32));
+    r = arrayNew(len, isRef);
+    const src = load64(wadd(o, 40));
+    const dst = load64(wadd(r, 40));
+    if (isRef != 0) {
+      let i: usize = 0;
+      while (i < len) {
+        const v = load64(wadd(src, shl(i, 3)));
+        store64(wadd(dst, shl(i, 3)), v);
+        retain(v);
+        i = wadd(i, 1);
+      }
+    } else if (len != 0) {
+      memCopy(dst, src, shl(len, 3));
+    }
+    store64(wadd(r, 16), len);
+  } else {
+    const len = load64(wadd(o, 16));
+    r = strAlloc(len, len);
+    if (len != 0) {
+      memCopy(wadd(r, 32), wadd(o, 32), len);
+    }
+  }
+  // orin_release(o)
+  const rc = load64(o);
+  if (isLive(rc)) {
+    if (cfg(1) == 1) {
+      addAt(wadd(heapBase(), S_RELEASES), 1);
+    }
+    const n = wsub(rc, 1);
+    store64(o, n);
+    if (n == 0) {
+      destroy(o);
+    }
+  }
+  return r;
+}
