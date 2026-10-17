@@ -4,13 +4,14 @@
 // functions `orin_struct_new`, `orin_variant1` and `orin_array_new`; the C shells of the runtime reach them through the
 // exported wrappers of the same names that the emitted code defines. An object is its address as a `usize`. The layout and the
 // heap block are described in heap.or. A failed allocation traps "out of memory" in `memAlloc` itself. Counters and the
-// live-object balance are updated exactly as the C versions did (the ORIN_STATS=1 report is the equivalence oracle).
+// live-object balance are updated exactly as the C versions did (the ORIN_STATS=1 report is the equivalence oracle). In a census build
+// (cfg 2) each object is preceded by the census prefix word (heap.or `pfx`) and the allocation is reported to the census (`siteAlloc`).
 
 import { load64, store8, store32, store64, memAlloc, memSet, heapBase, cfg, expect, wadd, wsub, wmul, shl, and } from "std:core";
 import { taskTrap } from "std:fsraw";
 import {
-  sbAlloc, sbRealloc, subAt, addAt, liveInc, statAlloc, statGrow, S_ALLOC_STRING, S_ALLOC_STRUCT, S_ALLOC_ARRAY, S_ARRAY_GROWS, FL_ARRAY,
-  FL_N
+  sbAlloc, sbRealloc, subAt, addAt, liveInc, statAlloc, statGrow, pfx, siteAlloc, siteGrow, S_ALLOC_STRING, S_ALLOC_STRUCT,
+  S_ALLOC_ARRAY, S_ARRAY_GROWS, FL_ARRAY, FL_N
 } from "./heap";
 
 // A new struct with all slots zero (null refs): `nslots` slots of 8 bytes behind the 32-byte header, rc 1. `refmask` bit i set:
@@ -28,11 +29,11 @@ export function structNew(tag: usize, nslots: usize, refmask: usize): usize {
     if (expect(head != 0, true)) {
       store64(lp, load64(head));
       subAt(wadd(wadd(heapBase(), FL_N), shl(nslots, 3)), 1);
-      s = head;
+      s = wadd(head, pfx());
     }
   }
   if (s == 0) {
-    s = memAlloc(wadd(32, shl(nslots, 3)));
+    s = wadd(memAlloc(wadd(wadd(32, shl(nslots, 3)), pfx())), pfx());
   }
   store64(s, 1);
   store32(wadd(s, 8), 3);
@@ -59,6 +60,7 @@ export function structNew(tag: usize, nslots: usize, refmask: usize): usize {
   }
   liveInc();
   statAlloc(S_ALLOC_STRUCT, wadd(32, shl(nslots, 3)));
+  siteAlloc(s, 3, wadd(32, shl(nslots, 3)));
   return s;
 }
 
@@ -83,11 +85,11 @@ export function arrayNew(cap: usize, isRef: usize): usize {
     if (head != 0) {
       store64(lp, load64(head));
       subAt(wadd(wadd(heapBase(), FL_N), 72), 1);
-      a = head;
+      a = wadd(head, pfx());
     }
   }
   if (a == 0) {
-    a = memAlloc(48);
+    a = wadd(memAlloc(wadd(48, pfx())), pfx());
   }
   store64(a, 1);
   store32(wadd(a, 8), 2);
@@ -98,6 +100,7 @@ export function arrayNew(cap: usize, isRef: usize): usize {
   store64(wadd(a, 40), cap != 0 ? sbAlloc(shl(cap, 3)) : 0);
   liveInc();
   statAlloc(S_ALLOC_ARRAY, wadd(48, shl(cap, 3)));
+  siteAlloc(a, isRef != 0 ? 2 : 1, wadd(48, shl(cap, 3)));
   return a;
 }
 
@@ -110,7 +113,7 @@ export function strAlloc(len: usize, cap0: usize): usize {
     taskTrap("string too large");
   }
   const total = wadd(cap, 33);
-  const s = sbAlloc(total);
+  const s = wadd(sbAlloc(wadd(total, pfx())), pfx());
   store64(s, 1);
   store32(wadd(s, 8), 1);
   store32(wadd(s, 12), 0);
@@ -119,6 +122,7 @@ export function strAlloc(len: usize, cap0: usize): usize {
   store8(wadd(wadd(s, 32), len), 0);
   liveInc();
   statAlloc(S_ALLOC_STRING, total);
+  siteAlloc(s, 0, total);
   return s;
 }
 
@@ -132,6 +136,7 @@ export function arrayPushGrow(o: usize, slot: usize): void {
   if (cfg(1) == 1) {
     addAt(wadd(heapBase(), S_ARRAY_GROWS), 1);
   }
+  siteGrow(o, shl(wsub(cap, cap0), 3));
   store64(wadd(o, 24), cap);
   const len = load64(wadd(o, 16));
   store64(wadd(items, shl(len, 3)), slot);

@@ -12,7 +12,7 @@
 
 import { load64, store8, store64, memCopy, memMove, heapBase, cfg, wadd, wsub, wmul, shr } from "std:core";
 import { taskTrap } from "std:fsraw";
-import { sbRealloc, addAt, S_LIVE_BYTES, S_STRING_GROWS } from "./heap";
+import { sbRealloc, addAt, pfx, siteGrow, S_LIVE_BYTES, S_STRING_GROWS } from "./heap";
 import { strAlloc } from "./object";
 import { retain, release } from "./rc";
 
@@ -26,12 +26,13 @@ function strGrow(a: usize, n: usize): usize {
   if (cap < 16) {
     cap = 16;
   }
-  const x = sbRealloc(a, wadd(oldCap, 33), wadd(cap, 33));
+  const x = wadd(sbRealloc(wsub(a, pfx()), wadd(wadd(oldCap, 33), pfx()), wadd(wadd(cap, 33), pfx())), pfx());
   if (cfg(1) == 1) {
     const h = heapBase();
     addAt(wadd(h, S_LIVE_BYTES), wsub(cap, oldCap));
     addAt(wadd(h, S_STRING_GROWS), 1);
   }
+  siteGrow(x, wsub(cap, oldCap));
   store64(wadd(x, 24), cap);
   return x;
 }
@@ -145,15 +146,37 @@ function decimalFresh(a: usize, v: usize, neg: usize, k: usize, n: usize): usize
   return r;
 }
 
-// a = a ++ decimal text of `v` (a minus sign first when `neg` is 1). The digits are written straight behind the old bytes.
-function appendDecimal(a: usize, v: usize, neg: usize): usize {
-  let digits: usize = 1;
-  let t = v / 10;
+// The number of decimal digits of `v` (at least 1). A ladder of compares for the common short numbers, a division loop from six digits on:
+// counting by repeated division would cost as much as writing the digits (R3d.5: it was +1.4 % instructions on `mapfreq`).
+@Inline
+function decimalDigits(v: usize): usize {
+  if (v < 10) {
+    return 1;
+  }
+  if (v < 100) {
+    return 2;
+  }
+  if (v < 1000) {
+    return 3;
+  }
+  if (v < 10000) {
+    return 4;
+  }
+  if (v < 100000) {
+    return 5;
+  }
+  let d: usize = 5;
+  let t = v / 100000;
   while (t != 0) {
-    digits = wadd(digits, 1);
+    d = wadd(d, 1);
     t = t / 10;
   }
-  const k = wadd(digits, neg);
+  return d;
+}
+
+// a = a ++ decimal text of `v` (a minus sign first when `neg` is 1). The digits are written straight behind the old bytes.
+function appendDecimal(a: usize, v: usize, neg: usize): usize {
+  const k = wadd(decimalDigits(v), neg);
   const n = wadd(load64(wadd(a, 16)), k);
   if (load64(a) != 1) {
     return decimalFresh(a, v, neg, k, n);

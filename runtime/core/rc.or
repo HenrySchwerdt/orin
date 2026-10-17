@@ -7,12 +7,14 @@
 //
 // A count above 0 is a live object; a count of 0 or below is immortal (static literals, the nullary objects) or pinned by a
 // lend (docs/concurrency.md, "lending"): neither is counted. Counters and the live balance are updated exactly as the C versions
-// did.
+// did. In a census build (cfg 2) the reference-count operations, the frees and the copy-on-write copies are reported to the census
+// (`siteRc`, `siteFree`; the headers' inline retain / release of the generated C do the same), and an object's block starts `pfx()`
+// bytes before its address.
 
 import { load32, load64, store64, memFree, memRealloc, memCopy, heapBase, cfg, wadd, wsub, wmul, shl, shr, and } from "std:core";
 import {
-  isLive, addAt, subAt, liveDec, sbFree, FL_STRUCT, FL_ARRAY, FL_N, FL_CAP, DSTACK, DCAP, S_RELEASES, S_RETAINS, S_COW_COPIES,
-  S_LIVE_BYTES
+  isLive, addAt, subAt, liveDec, sbFree, pfx, siteFree, siteRc, FL_STRUCT, FL_ARRAY, FL_N, FL_CAP, DSTACK, DCAP, S_RELEASES, S_RETAINS,
+  S_COW_COPIES, S_LIVE_BYTES
 } from "./heap";
 import { structNew, arrayNew, strAlloc } from "./object";
 
@@ -26,6 +28,7 @@ function decRef(c: usize): bool {
       if (cfg(1) == 1) {
         addAt(wadd(heapBase(), S_RELEASES), 1);
       }
+      siteRc(c, 1);
       const n = wsub(rc, 1);
       store64(c, n);
       return n == 0;
@@ -43,6 +46,7 @@ export function retain(o: usize): void {
     if (cfg(1) == 1) {
       addAt(wadd(heapBase(), S_RETAINS), 1);
     }
+    siteRc(o, 0);
   }
 }
 
@@ -55,6 +59,7 @@ export function release(o: usize): void {
     if (cfg(1) == 1) {
       addAt(wadd(heapBase(), S_RELEASES), 1);
     }
+    siteRc(o, 1);
     const n = wsub(rc, 1);
     store64(o, n);
     if (n == 0) {
@@ -90,6 +95,8 @@ export function destroy(o: usize): void {
     }
     const x = cur;
     cur = 0;
+    siteFree(x);
+    const base = wsub(x, pfx());
     const kind = load32(wadd(x, 8));
     let recycled = false;
     if (kind == 2) {
@@ -125,8 +132,8 @@ export function destroy(o: usize): void {
         sbFree(items, shl(cap, 3));
       }
       if (cfg(0) == 1 && load64(wadd(wadd(h, FL_N), 72)) < FL_CAP) {
-        store64(x, load64(wadd(h, FL_ARRAY)));
-        store64(wadd(h, FL_ARRAY), x);
+        store64(base, load64(wadd(h, FL_ARRAY)));
+        store64(wadd(h, FL_ARRAY), base);
         addAt(wadd(wadd(h, FL_N), 72), 1);
         liveDec();
         recycled = true;
@@ -161,8 +168,8 @@ export function destroy(o: usize): void {
       }
       if (cfg(0) == 1 && n < 9 && load64(wadd(wadd(h, FL_N), shl(n, 3))) < FL_CAP) {
         const lp = wadd(wadd(h, FL_STRUCT), shl(n, 3));
-        store64(x, load64(lp));
-        store64(lp, x);
+        store64(base, load64(lp));
+        store64(lp, base);
         addAt(wadd(wadd(h, FL_N), shl(n, 3)), 1);
         liveDec();
         recycled = true;
@@ -173,12 +180,12 @@ export function destroy(o: usize): void {
       if (cfg(1) == 1) {
         subAt(wadd(h, S_LIVE_BYTES), total);
       }
-      sbFree(x, total);
+      sbFree(base, wadd(total, pfx()));
       liveDec();
       recycled = true;
     }
     if (!recycled) {
-      memFree(x);
+      memFree(base);
       liveDec();
     }
   }
@@ -190,6 +197,7 @@ export function makeUniqueSlow(o: usize): usize {
   if (cfg(1) == 1) {
     addAt(wadd(heapBase(), S_COW_COPIES), 1);
   }
+  siteRc(o, 2);
   const kind = load32(wadd(o, 8));
   let r: usize = 0;
   if (kind == 3) {

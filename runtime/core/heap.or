@@ -13,7 +13,7 @@
 // Object layout (frozen, spec 19): header rc@0 kind@8 tag@12 (16 bytes); string len@16 cap@24 data@32; array len@16 cap@24
 // is_ref@32 items@40; struct nslots@16 refmask@24 slots@32; kinds string 1, array 2, struct 3.
 
-import { load64, store64, memAlloc, memFree, memRealloc, memCopy, heapBase, cfg, wadd, wsub, shl, shr, xor } from "std:core";
+import { load64, store64, memAlloc, memFree, memRealloc, memCopy, heapBase, cfg, hook, wadd, wsub, shl, shr, xor } from "std:core";
 
 // ---------------------------------------------------------------- offsets in the heap block
 
@@ -36,6 +36,11 @@ export const S_STRING_GROWS: usize = 264;
 export const S_PEAK_LIVE_OBJS: usize = 272;
 export const S_PEAK_LIVE_BYTES: usize = 280;
 export const S_LIVE_BYTES: usize = 288;
+export const S_FILE_OPENS: usize = 296;
+export const S_FILE_CLOSES: usize = 304;
+export const S_TRANSFER_MOVES: usize = 312;
+export const S_TRANSFER_COPIES: usize = 320;
+export const S_TASKS_SPAWNED: usize = 328;
 export const SB: usize = 512;        // small-block cache: 17 classes of {head, length}, 16 bytes each
 
 export const FL_CAP: usize = 262144;  // 2^18 objects per free list
@@ -43,6 +48,64 @@ export const SB_CAP: usize = 32768;   // 2^15 blocks per small-block class
 export const SB_MAX: usize = 256;     // the largest cached block
 
 const SIGN: usize = 9223372036854775808;
+
+// ---------------------------------------------------------------- C runtime hooks and the allocation-site census
+
+// The services of the C runtime that Orin code reaches through the core operation `hook` (orin_core_hook in runtime/core/orin_runtime.c
+// lists the same numbers): the process environment and stderr, the runtime lock, the totals of finished tasks, the census.
+export const HK_GETENV: usize = 0;       // (name: C string) -> the value (C string) or 0
+export const HK_LOCK: usize = 1;         // take the runtime lock
+export const HK_UNLOCK: usize = 2;       // release it
+export const HK_WRITE_LINE: usize = 3;   // (buf, n): n bytes and a newline on stderr
+export const HK_FOLD_STATS: usize = 4;   // -> the address of the OrinStats of the finished tasks (under the lock)
+export const HK_FOLD_LIVE: usize = 5;    // -> the address of their live-object balance (an i64)
+export const HK_STATS_ON: usize = 6;     // -> 1 when the runtime was built with the hot counters (ORIN_STATS_ENABLED)
+export const HK_SITE_ALLOC: usize = 7;   // (o, kind 0 string 1 value array 2 reference array 3 struct, bytes): census, a new object
+export const HK_SITE_GROW: usize = 8;    // (o, bytes): census, a buffer of `o` grew
+export const HK_SITE_FREE: usize = 9;    // (o): census, `o` is being freed
+export const HK_SITE_RC: usize = 10;     // (o, what: 0 retain 1 release 2 copy-on-write copy): census, a reference-count operation
+export const HK_SITE_REPORT: usize = 11; // the census table (ORIN_STATS=sites)
+
+// The census prefix word (ADR-0052 Addendum A, rule 4): in a census build (cfg 2) every heap object is preceded by 8 bytes holding the
+// site that allocated it, so the offsets of the object layout are the same in all builds. `pfx()` is that size (0 in a normal build).
+// The address of an object is the address of its block plus `pfx()`; a free list holds the block address (the link is stored in the
+// first word of the block, the prefix word in a census build).
+@Inline
+export function pfx(): usize {
+  return shl(cfg(2), 3);
+}
+
+// Census: `o` was allocated (kind 0 string, 1 value array, 2 reference array, 3 struct; `bytes` as a normal build lays it out).
+@Inline
+export function siteAlloc(o: usize, kind: usize, bytes: usize): void {
+  if (cfg(2) == 1) {
+    hook(HK_SITE_ALLOC, o, kind, bytes);
+  }
+}
+
+// Census: a buffer of `o` grew by `bytes`.
+@Inline
+export function siteGrow(o: usize, bytes: usize): void {
+  if (cfg(2) == 1) {
+    hook(HK_SITE_GROW, o, bytes, 0);
+  }
+}
+
+// Census: `o` is being freed.
+@Inline
+export function siteFree(o: usize): void {
+  if (cfg(2) == 1) {
+    hook(HK_SITE_FREE, o, 0, 0);
+  }
+}
+
+// Census: a reference-count operation on `o` (0 retain, 1 release, 2 copy-on-write copy).
+@Inline
+export function siteRc(o: usize, what: usize): void {
+  if (cfg(2) == 1) {
+    hook(HK_SITE_RC, o, what, 0);
+  }
+}
 
 // ---------------------------------------------------------------- word helpers
 
