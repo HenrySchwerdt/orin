@@ -368,6 +368,34 @@ Z0, Z1 and Z2 start at once and touch disjoint code (compiler sources, the solve
 feature in Z2-Z7 comes with positive, negative and soundness tests in `tests/contracts/` before it may turn an `UNKNOWN` into
 `VERIFIED`; a feature that cannot be modelled soundly keeps `UNKNOWN` and is reported here instead.
 
+### U5 result (Z7, 2026-10-17)
+
+**What was tried.** Cone-of-influence slicing: before the full query, the goal was asked with only the assertions that share a
+constant with it, directly or through other kept assertions. Only `unsat` of the slice was used; anything else fell back to the full
+query, so the slice could not cause a wrong VERIFIED or REFUTED. It was measured with `--timeout-ms 2000`, one thread, instrumented
+per-module runs, on a heavily loaded machine:
+
+| module | statuses without → with slicing | status changes | first-query timeouts | z3 s | queries sliced / proved by the slice |
+|---|---|---|---|---|---|
+| verify | 103 VERIFIED / 179 UNKNOWN, unchanged | 0 | 113 → 111 | 554 → 554 | 31 / 3 |
+| analysis | 124 VERIFIED / 133 UNKNOWN, unchanged | 0 | 184 → 184 | 985 → 1006 | 16 / 14 |
+| opt (first 126 of 257 functions, 4 745 queries) | (compared per query) | 0 answers changed by slicing | 1 402 → 1 402 | 5 391 → 5 356 | 235 / 235, all also proved by the full query |
+
+**Why slicing does not help.** The facts of a query are chained through the symbolic state (each value is defined from the one
+before), so the cone of a goal is 90-100 % of the query. On about 200 timed-out queries saved by the baseline run (opt, verify,
+analysis), the full-cone slice proved none. Slices limited to 1-3 hops from the goal only give a quick `sat`: a model of fewer facts,
+which says nothing about the full query. Checking incrementally (the slice first, then the remaining facts in the same z3 process) still
+timed out. So did z3 options (`smt.mbqi=false`, `smt.relevancy=0`, `smt.arith.solver=2`). Most of the timed-out queries also time out,
+or are `sat`, with every quantified fact removed. Incremental push/pop per function was not built: parsing the largest query
+costs about 0.1 s of CPU, while calls that time out are 91 % of the z3 time. Push/pop would also make an answer depend on the order of the
+queries; today it depends on the query text only, which the deferred solver rounds rely on.
+
+**What it means.** The U5 timeouts are goals that do not follow from the facts the verifier has, not queries that are too large: the
+missing pieces are callee facts (U1, Z4), loop invariants (U4, Z6), and element or permutation invariants of the data (for
+example "`order` is a permutation of `0..n`"). U5 is handled there, not by reducing the query. The time lever stays the solver budget
+(Z1). The slicing code (`compiler/vc/slice.or`, `--slice`) was not merged; it is kept for reference in commit `c7d15f37` (branch
+`claude/project-thread-niggkx-verify-slice`, PR #28).
+
 ### Consequences
 
 - The compiler becomes the main test case for the verifier; every gap it shows is a gap for user programs too.
