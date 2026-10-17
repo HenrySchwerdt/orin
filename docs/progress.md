@@ -49,6 +49,7 @@ _Status refresh: 2026-10-16, baseline `732af00`; dated measurements below retain
 | OSIG: `orin graph`, `orin diff`, static HTML report, MCP `graph`/`diff` (ADR-0023, docs/osig.md) | done (phase 1 MVP: symbols, calls with MUST/MAY/UNKNOWN evidence, imports, implements, type refs, contracts) |
 | Feature manifest, effects, lineage, `.orcert` (ADR-0020) | not started |
 | Runtime R3/R4 (object model in Orin, refinement proofs) | R3a done (core operations `BCore`, ADR-0052: all of `runtime/core` to Orin in R3a-R3f, L0 stays C); R3b partly done (`parseI8`..`parseUsize` in Orin; float format/parse, prepend/append-decimal, array slice/concat/extend stay C, see spec 19 inventory); R3c-R3f and R4 not started |
+| Provability phase: record/class invariants proved, memory-safety proof chain (ADR-0053, M1-M13) | proposed (ADR only); starts after the language work, M9-M12 wait for ADR-0052 R3b/R3d/R3e |
 
 ## Next milestones
 
