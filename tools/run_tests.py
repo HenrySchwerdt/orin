@@ -21,6 +21,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from parallel import add_jobs_arg, ordered_map  # noqa: E402
+from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: tools/runtime-sources.txt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join("build", "tests")
@@ -99,18 +100,18 @@ def compile_orin(args, entry, c_out, flags=()):
 
 def runtime_sources(backend):
     """C runtime sources to link; the LLVM backend also needs the out-of-line shim."""
-    srcs = [os.path.join("runtime", "core", "orin_runtime.c"), os.path.join("runtime", "platform", "orin_platform.c")]
+    srcs = rt_src()
     if backend == "llvm":
-        srcs.append(os.path.join("runtime", "core", "orin_runtime_llvm.c"))
+        srcs.extend(rt_llvm())
     return srcs
 
 
 def cc_base(args):
     """The C compiler command and flags a test executable is built with (without the inputs)."""
     if args.backend == "llvm":
-        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", "-I", "runtime/core"]
+        cc = [args.cc if args.cc != "cc" else "clang", "-O2", "-w", *rt_inc()]
     else:
-        cc = [args.cc, "-O1", "-w", "-I", "runtime/core"]
+        cc = [args.cc, "-O1", "-w", *rt_inc()]
     if args.sanitize:
         cc += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     return cc
@@ -218,7 +219,7 @@ def run_test(args, label, test):
 
     env = dict(os.environ)
     if args.sanitize:
-        env["ASAN_OPTIONS"] = "detect_leaks=0"
+        env["ASAN_OPTIONS"] = "detect_leaks=0:allocator_may_return_null=1"
     # Optional stdin: `name.in` next to `name.or`, or `input.in` next to `main.or`.
     stdin_data = None
     in_path = os.path.join(os.path.dirname(entry), "input.in" if os.path.basename(entry) == "main.or" else name + ".in")
