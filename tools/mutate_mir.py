@@ -437,6 +437,16 @@ def uniq_states(f):
     return ins
 
 
+def uniq_at(f, bi, ii):
+    """The certainly-Unique locals just before instruction ii of block bi (uncached)."""
+    U = uniq_states(f)[bi]
+    if U is None:
+        return set()
+    for line in f.blocks[bi][1][:ii]:
+        U = uniq_transfer(f, U, line)
+    return U
+
+
 def certainly_unique(f, bi, ii, x, cache={}):
     key = id(f)
     if key not in cache:
@@ -1190,7 +1200,15 @@ def unique_call_sites(f, bi, ii, line):
     out = []
     x = args[0] if g.inout and args and args[0] is not None else None
     if x is not None and not g.uin:
-        benign = "the receiver is certainly Unique at the call, so the flag would be justified here" if certainly_unique(f, bi, ii, x) else None
+        if g is f:
+            # a self-recursive call: the flipped flag also makes the receiver Unique on entry (rule U2), so judge the call
+            # with the mutated entry state
+            f.uin = True
+            ok = x in uniq_at(f, bi, ii)
+            f.uin = False
+        else:
+            ok = certainly_unique(f, bi, ii, x)
+        benign = "the receiver is certainly Unique at the call, so the flag would be justified here" if ok else None
         out.append(Mut("uniq-flag-flip-in", f, (bi, ii), "`unique-in` on fn%d for `%s` %s" % (n, line, where), benign,
                        "to be Unique", "error", peer=(n, "unique-in")))
     if x is not None and g.uin:
@@ -1522,6 +1540,9 @@ def main():
                 if m.peer:
                     fs = list(funcs)
                     fs[m.peer[0]] = funcs[m.peer[0]].with_flag(m.peer[1])
+                    if m.peer[0] == i:
+                        # a self-recursive call: the target is rendered in full, not as a stub, so it carries the flag itself
+                        mf = mf.with_flag(m.peer[1])
                 yield mid, program_text(prefix, fs, i, mf)
 
     out_lines = run_driver(exe, entries(), tmp, "mutants")
