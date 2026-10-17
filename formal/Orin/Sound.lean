@@ -1,4 +1,4 @@
-import Orin.SimArr
+import Orin.Hole
 
 /-!
 # Soundness of the ownership checker
@@ -21,7 +21,7 @@ variable {ext : List Val} {np : Nat} {sg : List Sig}
 out the abstract state satisfies `E` (a derivation that mirrors `chk`, closed under weakening so
 that it survives the join at the end of an `if` and the loop invariant).  The end condition `E`
 is what lets a loop body be checked against "return to the loop head": `loop` takes a body
-derivation whose end condition is `Fle · b`, `b` the loop invariant. -/
+derivation whose end condition is `FleS · b`, `b` the loop invariant. -/
 inductive Cont (sg : List Sig) (np : Nat) : (AState → Prop) → AState → Code → Prop
   | nil {E : AState → Prop} {a : AState} : E a → Cont sg np E a .nil
   | op {E : AState → Prop} {a a1 : AState} {i : MI} {k : Code} :
@@ -30,12 +30,12 @@ inductive Cont (sg : List Sig) (np : Nat) : (AState → Prop) → AState → Cod
       c < a.ls.length → gk a.ls c = .init → Cont sg np E a (t.app k) → Cont sg np E a (e.app k) →
       Cont sg np E a (.ite c t e k)
   | loop {E : AState → Prop} {a b : AState} {c : Nat} {t k : Code} :
-      Fle a.ls b.ls → c < b.ls.length → gk b.ls c = .init →
-      Cont sg np (fun x => Fle x.ls b.ls) b t → Cont sg np E b k → Cont sg np E a (.loop c t k)
+      FleS a b → c < b.ls.length → gk b.ls c = .init →
+      Cont sg np (fun x => FleS x b) b t → Cont sg np E b k → Cont sg np E a (.loop c t k)
   | call {E : AState → Prop} {a a1 : AState} {d f : Nat} {args : List Nat} {k : Code} :
       stepAC np sg a d f args = some a1 → Cont sg np E a1 k → Cont sg np E a (.call d f args k)
   | weak {E : AState → Prop} {a b : AState} {code : Code} :
-      Fle a.ls b.ls → Cont sg np E b code → Cont sg np E a code
+      FleS a b → Cont sg np E b code → Cont sg np E a code
 
 theorem Code.app_nil : ∀ c : Code, c.app .nil = c
   | .nil => rfl
@@ -84,102 +84,49 @@ theorem Cont.seq {E1 E : AState → Prop} {a : AState} {t : Code} (h : Cont sg n
 
 /-! ### the loop invariant search -/
 
-theorem loopFix_spec (body : AState → Option AState) (c : Nat) :
-    ∀ (fuel : Nat) (b bi : AState), loopFix body c fuel b = some bi →
-      Fle b.ls bi.ls ∧ c < bi.ls.length ∧ gk bi.ls c = .init ∧
-      ∃ b2, body bi = some b2 ∧ Fle b2.ls bi.ls := by
-  intro fuel
-  induction fuel with
-  | zero => intro b bi h; simp [loopFix] at h
-  | succ n ih =>
-    intro b bi h
-    simp only [loopFix] at h
-    split at h
-    · rename_i hc
-      cases hb : body b with
-      | none => rw [hb] at h; simp at h
-      | some b2 =>
-        rw [hb] at h
-        simp only [Option.bind_some] at h
-        cases hj : joinS b b2 with
-        | none => rw [hj] at h; simp at h
-        | some b' =>
-          rw [hj] at h
-          simp only [Option.bind_some] at h
-          have hjc := hj
-          unfold joinS at hjc
-          split at hjc
-          · rename_i hcond
-            have hb' : b' = ⟨joinL b.ls b2.ls, b.holes⟩ := (Option.some.inj hjc).symm
-            have hlen : b.ls.length = b2.ls.length := hcond.1
-            have hF1 : Fle b.ls b'.ls := by rw [hb']; exact joinL_fle_left _ _ hlen
-            by_cases hls : b'.ls = b.ls
-            · rw [if_pos hls] at h
-              have hbi : b = bi := Option.some.inj h
-              subst hbi
-              have hF2 : Fle b2.ls b'.ls := by rw [hb']; exact joinL_fle_right _ _ hlen
-              rw [hls] at hF2 hF1
-              exact ⟨hF1, hc.1, hc.2, b2, hb, hF2⟩
-            · rw [if_neg hls] at h
-              obtain ⟨hF, hcb, hini, b3, hb3, hF3⟩ := ih b' bi h
-              exact ⟨hF1.trans hF, hcb, hini, b3, hb3, hF3⟩
-          · simp at hjc
-    · simp at h
-
 /-! ### the checker yields a `Cont` derivation -/
 
 theorem chk_cont : ∀ (t : Code) (a at' : AState) (k : Code) (E : AState → Prop),
-    chk np sg a t = some at' → Cont sg np E at' k → Cont sg np E a (t.app k) := by
+    HU a → chk np sg a t = some at' → Cont sg np E at' k → Cont sg np E a (t.app k) := by
   intro t
   induction t with
   | nil =>
-    intro a at' k E h hk
+    intro a at' k E _ h hk
     simp only [chk, Option.some.injEq] at h
     subst h
     exact hk
   | op i t1 ih =>
-    intro a at' k E h hk
+    intro a at' k E hu h hk
     simp only [chk, Option.bind_eq_some_iff] at h
     obtain ⟨a1, h1, h2⟩ := h
-    exact Cont.op h1 (ih a1 at' k E h2 hk)
+    exact Cont.op h1 (ih a1 at' k E (HU_stepA hu h1) h2 hk)
   | ite c t e k1 iht ihe ihk =>
-    intro a at' k E h hk
+    intro a at' k E hu h hk
     simp only [chk] at h
     split at h
     · rename_i hc
       simp only [Option.bind_eq_some_iff] at h
       obtain ⟨at1, ht, ae, he, aj, hj, hk1⟩ := h
-      have hjoin := hj
-      unfold joinS at hjoin
-      split at hjoin
-      · rename_i hjc
-        have haj : aj = ⟨joinL at1.ls ae.ls, at1.holes⟩ := (Option.some.inj hjoin).symm
-        subst haj
-        have hkc := ihk _ at' k E hk1 hk
-        have hl : at1.ls.length = ae.ls.length := hjc.1
-        have hct : Cont sg np E at1 (k1.app k) :=
-          Cont.weak (a := at1) (b := ⟨joinL at1.ls ae.ls, at1.holes⟩)
-            (joinL_fle_left _ _ hl) hkc
-        have hce : Cont sg np E ae (k1.app k) :=
-          Cont.weak (a := ae) (b := ⟨joinL at1.ls ae.ls, at1.holes⟩)
-            (joinL_fle_right _ _ hl) hkc
-        exact Cont.ite hc.1 hc.2 (iht a at1 _ E ht hct) (ihe a ae _ E he hce)
-      · simp at hjoin
+      obtain ⟨hF1, hF2, huj⟩ := joinS_fleS hj (HU_chk _ _ _ hu ht) (HU_chk _ _ _ hu he)
+      have hkc := ihk _ at' k E huj hk1 hk
+      exact Cont.ite hc.1 hc.2 (iht a at1 _ E hu ht (Cont.weak hF1 hkc))
+        (ihe a ae _ E hu he (Cont.weak hF2 hkc))
     · simp at h
   | loop c t1 k1 iht ihk =>
-    intro a at' k E h hk
+    intro a at' k E hu h hk
     simp only [chk, Option.bind_eq_some_iff] at h
     obtain ⟨b, hfix, hkb⟩ := h
-    obtain ⟨hF, hcb, hini, b2, hb2, hFb2⟩ := loopFix_spec _ _ _ _ _ hfix
-    have hbody : Cont sg np (fun x => Fle x.ls b.ls) b t1 := by
-      have := iht b b2 .nil (fun x => Fle x.ls b.ls) hb2 (Cont.nil hFb2)
+    obtain ⟨hub, hF, hcb, hini, b2, hb2, hFb2⟩ :=
+      loopFix_spec_S _ c (fun x y hx hy => HU_chk t1 x y hx hy) _ a b hu hfix
+    have hbody : Cont sg np (fun x => FleS x b) b t1 := by
+      have := iht b b2 .nil (fun x => FleS x b) hub hb2 (Cont.nil hFb2)
       rwa [Code.app_nil] at this
-    exact Cont.loop hF hcb hini hbody (ihk b at' k E hkb hk)
+    exact Cont.loop hF hcb hini hbody (ihk b at' k E hub hkb hk)
   | call d f args k1 ih =>
-    intro a at' k E h hk
+    intro a at' k E hu h hk
     simp only [chk, Option.bind_eq_some_iff] at h
     obtain ⟨a1, h1, h2⟩ := h
-    exact Cont.call h1 (ih a1 at' k E h2 hk)
+    exact Cont.call h1 (ih a1 at' k E (HU_stepAC hu h1) h2 hk)
 
 /-! ### one step -/
 
@@ -257,10 +204,10 @@ theorem sound_step_nopending {E : AState → Prop} {a : AState} {code : Code}
   | @loop E a b c t k hF hcb hinit hBody hK ihBody ihK =>
     intro s hI hp
     right
-    have hIb : Inv ext b.ls s := hI.weaken hF
+    have hIb : Inv ext b.ls s := hI.weaken hF.1
     have hcl : c < s.locals.length := hIb.len ▸ hcb
     obtain ⟨n, hn⟩ := (hIb.cl c).ini hinit
-    have hFbb : Fle b.ls b.ls := ⟨rfl, fun i => Or.inl rfl, hF.2.2⟩
+    have hFbb : FleS b b := hF.self_right
     have hself : Cont sg np E b (.loop c t k) := Cont.loop hFbb hcb hinit hBody hK
     by_cases h0 : n = 0
     · subst h0
@@ -280,7 +227,7 @@ theorem sound_step_nopending {E : AState → Prop} {a : AState} {code : Code}
     simp [mstep, hp]
   | @weak E a b code hF hk ih =>
     intro s hI hp
-    exact ih s (hI.weaken hF) hp
+    exact ih s (hI.weaken hF.1) hp
 
 theorem sound_step {E : AState → Prop} {a : AState} {code : Code} (hC : Cont sg np E a code)
     {s : St}

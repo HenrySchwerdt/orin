@@ -1106,6 +1106,46 @@ def build_driver(orinc, out_dir):
     return exe
 
 
+BATCH_BYTES = 48 << 20   # a driver run holds ~4.5x its input file in RSS: peak memory is bounded by this, not by the corpus
+
+
+def run_driver(exe, items, tmp, tag, extra=()):
+    """Run the batch driver over `items` ((name, text) pairs, a lazy iterable) in batches of about BATCH_BYTES, a few at a time,
+    and return the stdout lines of all batches. The corpus is >3 GB of program text; verify_text reads a file into one string and
+    splits it into lines, so a single run over all of it needs >14 GB."""
+    jobs = max(1, min(int(os.environ.get("ORIN_JOBS") or os.cpu_count() or 4), 4))
+    lines = []
+
+    def one(path):
+        r = subprocess.run([exe, path, *extra], capture_output=True, text=True, errors="replace", timeout=1800)
+        os.remove(path)
+        if r.returncode != 0:
+            sys.exit("verify_text failed: " + r.stderr[:500])
+        return r.stdout.splitlines()
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        pending, buf, size, n = [], [], 0, 0
+        for name, text in items:
+            buf.append("=== %s\n%s" % (name, text))
+            size += len(text)
+            if size >= BATCH_BYTES:
+                path = os.path.join(tmp, "%s%d.txt" % (tag, n))
+                with open(path, "w", errors="surrogateescape") as fh:
+                    fh.writelines(buf)
+                buf, size, n = [], 0, n + 1
+                pending.append(pool.submit(one, path))
+                while len(pending) > jobs:   # bound the files and processes in flight
+                    lines.extend(pending.pop(0).result())
+        if buf:
+            path = os.path.join(tmp, "%s%d.txt" % (tag, n))
+            with open(path, "w", errors="surrogateescape") as fh:
+                fh.writelines(buf)
+            pending.append(pool.submit(one, path))
+        for f in pending:
+            lines.extend(f.result())
+    return lines
+
+
 def corpus():
     out = []
     for suite in ("run", os.path.join("next", "run")):
@@ -1171,15 +1211,10 @@ def main():
     exe = a.verify_text or build_driver(a.orinc, tmp)
 
     # the fact (dominated-by-check / interval / both) behind every unchecked access of every baseline function
-    path = os.path.join(tmp, "baselines.txt")
-    with open(path, "w", errors="surrogateescape") as fh:
-        for n, (k, (prefix, funcs, i)) in enumerate(sorted(seen.items())):
-            fh.write("=== base%d\n%s" % (n, program_text(prefix, funcs, i, funcs[i])))
-    r = subprocess.run([exe, path, "--facts"], capture_output=True, text=True, errors="replace", timeout=1800)
-    if r.returncode != 0:
-        sys.exit("verify_text --facts failed: " + r.stderr[:500])
+    facts_out = run_driver(exe, (("base%d" % n, program_text(prefix, funcs, i, funcs[i]))
+                                 for n, (k, (prefix, funcs, i)) in enumerate(sorted(seen.items()))), tmp, "facts", ("--facts",))
     keys = sorted(seen.items())
-    for line in r.stdout.splitlines():
+    for line in facts_out:
         p = line.split("\t")
         n = int(p[0][4:])
         ti = keys[n][1][2]
@@ -1192,33 +1227,28 @@ def main():
         kinds[v] = kinds.get(v, 0) + 1
     print("unchecked accesses by fact: %s" % ", ".join("%s %d" % kv for kv in sorted(kinds.items())))
 
-    entries = []   # (id, text)
     meta = {}
-    for n, (k, (prefix, funcs, i)) in enumerate(sorted(seen.items())):
-        fn = funcs[i]
-        bid = "base%d" % n
-        entries.append((bid, program_text(prefix, funcs, i, fn)))
-        meta[bid] = ("base", fn, None)
-        for mi, m in enumerate(sites(fn)):
-            mf = apply(m)
-            mid = "m%d_%d" % (n, mi)
-            entries.append((mid, program_text(prefix, funcs, i, mf)))
-            meta[mid] = ("mut", fn, m)
 
-    path = os.path.join(tmp, "mutants.txt")
-    with open(path, "w", errors="surrogateescape") as fh:
-        for name, text in entries:
-            fh.write("=== %s\n%s" % (name, text))
-    r = subprocess.run([exe, path], capture_output=True, text=True, errors="replace", timeout=1800)
-    if r.returncode != 0:
-        sys.exit("verify_text failed: " + r.stderr[:500])
+    def entries():   # lazy: the texts are >3 GB in all and are never held together
+        for n, (k, (prefix, funcs, i)) in enumerate(sorted(seen.items())):
+            fn = funcs[i]
+            bid = "base%d" % n
+            meta[bid] = ("base", fn, None)
+            yield bid, program_text(prefix, funcs, i, fn)
+            for mi, m in enumerate(sites(fn)):
+                mf = apply(m)
+                mid = "m%d_%d" % (n, mi)
+                meta[mid] = ("mut", fn, m)
+                yield mid, program_text(prefix, funcs, i, mf)
+
+    out_lines = run_driver(exe, entries(), tmp, "mutants")
     tmpdir.cleanup()
     res = {}
-    for line in r.stdout.splitlines():
+    for line in out_lines:
         p = line.split("\t")
         res[p[0]] = (p[1], int(p[2]), p[3:])
-    if len(res) != len(entries):
-        sys.exit("driver returned %d results for %d entries" % (len(res), len(entries)))
+    if len(res) != len(meta):
+        sys.exit("driver returned %d results for %d entries" % (len(res), len(meta)))
 
     # baselines: every distinct function must verify without errors
     base_warn = {}

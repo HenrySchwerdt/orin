@@ -161,7 +161,7 @@ def stepH (hs : List (Nat × Nat)) : MI → Option (List (Nat × Nat))
   | .borrow d s => if hasHole hs d || hasHole hs s then none else some hs
   | .dup d s => if hasHole hs d || hasHole hs s then none else some hs
   | .release x => if hasHole hs x then none else some hs
-  | .alloc d _ => if hasHole hs d then none else some hs
+  | .alloc d n => if hasHole hs d then none else some (hs ++ (List.range n).map (fun i => (d, i)))
   | .getField d o i _ => if hasHole hs d || decide ((o, i) ∈ hs) then none else some hs
   | .setField x i v => if hasHole hs v || decide ((x, i) ∈ hs) then none else some hs
   | .takeField d x i => if hasHole hs d || decide ((x, i) ∈ hs) then none else some ((x, i) :: hs)
@@ -248,7 +248,7 @@ def stepAC (np : Nat) (sg : List Sig) (a : AState) (d f : Nat) (args : List Nat)
   match stepCall sg np a.ls d f args with
   | none => none
   | some ls' =>
-    if args.any (hasHole a.holes) || hasHole a.holes d then none else some ⟨ls', a.holes⟩
+    if a.holes.isEmpty then some ⟨ls', a.holes⟩ else none
 
 /-- Loop invariant search: from the head state `b`, run the body, join the result into the head
 state, and stop when the head state no longer changes (kinds only move up the join order, so a

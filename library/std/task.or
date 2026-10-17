@@ -34,15 +34,25 @@
 //   parameter, like the body of a scope function of std:host.
 // * `parallelMap(xs, f, parts)` maps `f` over `xs` in `parts` tasks and returns the results in order.
 //
-// Stage 0 has no `async` / `await`, no cancellation other than `rx.close()`, no timeouts, no deadlock detection (all tasks
-// blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
+// * Timed and wakeable waits (ADR-0017 Addendum B, C1). Every timed call has an ABSOLUTE form on a `Deadline` of std:time (an
+//   instant on the monotonic clock, so retries and nested waits cannot stretch it) and a relative form that takes the
+//   `ClockGrant` to read "now" (a deadline is the only thing that needs authority; waiting for one does not):
+//   `rx.recvUntil(d)` / `rx.recvTimeout(clock, t)`, `tx.sendUntil(v, d)` / `tx.sendTimeout(clock, v, t)`,
+//   `h.joinUntil(d)` / `h.joinTimeout(clock, t)`, `select(rxs)` / `selectUntil(rxs, d)` / `selectTimeout(clock, rxs, t)`,
+//   `sleep(clock, t)` / `sleepUntil(d)`. A timed call returns `Result<_, TaskError>`: `Timeout` when the deadline passed
+//   first, `Closed` when the channel is closed and drained (all of them, for `select`), `ClockUnavailable` / `InvalidDuration`
+//   from the relative forms. A value that is there when the deadline passes is still delivered, never dropped.
+//
+// Stage 0 has no `async` / `await`, no cancellation other than `rx.close()` (scope cancellation is C2), no deadlock detection
+// (all tasks blocked is a hang) and no work stealing: a task is a thread, so thousands are fine, hundreds of thousands are not.
 // A panic in the BODY of a scope (not in a task) is not unwound: tasks still running keep running until the process ends.
 
-import { Ledger, Ranges, ringCanPush, ringSlot, ringNextHead, ringIsDone } from "std:taskcore";
+import { Ledger, Ranges, ringCanPush, ringSlot, ringNextHead, ringIsDone, deadlineAfterMillis } from "std:taskcore";
+import { Deadline, Duration, MonotonicInstant, monotonicNow } from "std:time";
 import {
   FsGrant, ProcessGrant, StdioGrant, ClockGrant, grantRevoke, grantClone, grantMove, grantAdoptFs, grantAdoptProcess,
   grantAdoptStdio, grantAdoptClock, monNew, monFree, monLock, monUnlock, monWait, monNotifyAll, monGet, monSet, monGrow,
-  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne, parThreads, lendPut
+  transitPut, transitTake, transitDrop, taskSpawn, taskJoin, taskMessage, taskTrap, transferCount, monNotifyOne, parThreads, lendPut, monWaitUntil, taskWatch
 } from "std:fsraw";
 
 // ------------------------------------------------------------------------------------------------------ transfer
@@ -78,11 +88,47 @@ export function copiedCount(): usize {
   return transferCount(1);
 }
 
+// ------------------------------------------------------------------------------------------------------ errors
+
+// Why a timed call returned no value (ADR-0048 section 3.1). Timeout = the deadline passed (outcome `Deadline` of std:taskcore),
+// Closed = the channel is closed and drained (outcome `Closed`), ClockUnavailable = the monotonic clock failed, InvalidDuration =
+// a negative timeout.
+export type TaskErrorKind = Timeout | Closed | ClockUnavailable | InvalidDuration;
+export type TaskError = { kind: TaskErrorKind; };
+
+// taskErrorMessage(e): a stable, nonempty explanation.
+@Ensures(result.length > 0)
+export function taskErrorMessage(e: TaskError): string {
+  return match (e.kind) {
+    Timeout => "the deadline passed",
+    Closed => "the channel is closed",
+    ClockUnavailable => "monotonic clock unavailable",
+    InvalidDuration => "a timeout must not be negative"
+  };
+}
+
+function fail(kind: TaskErrorKind): TaskError {
+  return TaskError { kind: kind };
+}
+
+// The absolute deadline `timeout` after now (saturating: a huge timeout means practically never).
+function deadlineIn(clock: ClockGrant, timeout: Duration): Result<Deadline, TaskError> {
+  if (timeout.millis < 0) {
+    return Err(fail(InvalidDuration));
+  }
+  const now = monotonicNow(clock);
+  if (now.isErr()) {
+    return Err(fail(ClockUnavailable));
+  }
+  return Ok(Deadline { at: MonotonicInstant { millis: deadlineAfterMillis(now.unwrap().millis, timeout.millis) } });
+}
+
 // ------------------------------------------------------------------------------------------------------ channels
 
-// Monitor words of a channel: [0] capacity, [1] head, [2] len, [3] flags (1 = tx closed, 2 = rx closed), [4 + i] the
-// token in ring slot i.
-const CH_HDR: usize = 4;
+// Monitor words of a channel: [0] capacity, [1] head, [2] len, [3] flags (1 = tx closed, 2 = rx closed), [4] number of
+// watchers (the wake monitors of `select` calls waiting on this channel), [5] room for watchers, [6 + i] the token in ring
+// slot i, [6 + capacity + k] watcher k.
+const CH_HDR: usize = 6;
 
 // The channel functions work on the monitor's words as plain locals (cap, head, len, flags) with the arithmetic of
 // std:taskcore's `Ring` (`ringCanPush`, `ringSlot`, ...): a `Ring` object per send / receive was 40% of the allocations
@@ -100,6 +146,31 @@ function chRx(flags: usize): bool {
 function wakeAll(m: usize): void {
   monNotifyAll(m, 0);
   monNotifyAll(m, 1);
+  pingWatchers(m);
+}
+
+// Wakes every `select` waiting on the channel (locked by the caller): bumps the ticket (word 0) of each watcher's monitor. Lock
+// order is channel, then watcher; a selector never holds its watcher monitor while it takes a channel.
+function pingWatchers(ch: usize): void {
+  const n = monGet(ch, 4);
+  const base = CH_HDR + monGet(ch, 0);
+  let k: usize = 0;
+  while (k < n) {
+    const w = monGet(ch, base + k);
+    monLock(w);
+    monSet(w, 0, monGet(w, 0) + 1);
+    monNotifyAll(w, 0);
+    monUnlock(w);
+    k += 1;
+  }
+}
+
+// Takes the oldest value (the channel is locked, len > 0) and returns its token; the caller unlocks and calls takeBox.
+function popLocked(ch: usize, cap: usize, head: usize, len: usize, flags: usize): usize {
+  const tok = monGet(ch, CH_HDR + head);
+  storeRing(ch, ringNextHead(cap, head), len - 1, flags);
+  monNotifyOne(ch, 0);
+  return tok;
 }
 
 function storeRing(m: usize, head: usize, len: usize, flags: usize): void {
@@ -144,8 +215,49 @@ export class Sender<T> {
     monSet(ch, CH_HDR + slot, tok);
     storeRing(ch, head, len + 1, flags);
     monNotifyOne(ch, 1);
+    pingWatchers(ch);
     monUnlock(ch);
     return true;
+  }
+
+  // sendUntil(v, deadline): send(v) that gives up when the absolute monotonic deadline passes while the channel is full:
+  // Err(Timeout), or Err(Closed) when it is closed by either end. `v` is dropped on an error. A free slot at the deadline
+  // still accepts it. Traps if the deadline is negative.
+  @Requires(deadline.at.millis >= 0)
+  sendUntil(v: T, deadline: Deadline): Result<void, TaskError> {
+    const tok = putBox(v);
+    const ch = this.ch;
+    const dl = deadline.at.millis.toUsize();
+    monLock(ch);
+    const cap = monGet(ch, 0);
+    let head = monGet(ch, 1);
+    let len = monGet(ch, 2);
+    let flags = monGet(ch, 3);
+    let late = false;
+    while (!ringCanPush(len, cap, chTx(flags), chRx(flags)) && flags == 0 && !late) {
+      late = monWaitUntil(ch, 0, dl) == 1;
+      head = monGet(ch, 1);
+      len = monGet(ch, 2);
+      flags = monGet(ch, 3);
+    }
+    if (!ringCanPush(len, cap, chTx(flags), chRx(flags))) {
+      monUnlock(ch);
+      transitDrop(tok);
+      return Err(fail(flags != 0 ? Closed : Timeout));
+    }
+    const slot = ringSlot(cap, head, len);
+    monSet(ch, CH_HDR + slot, tok);
+    storeRing(ch, head, len + 1, flags);
+    monNotifyOne(ch, 1);
+    pingWatchers(ch);
+    monUnlock(ch);
+    return Ok();
+  }
+
+  // sendTimeout(clock, v, timeout): sendUntil(v, now + timeout). Err(InvalidDuration) for a negative timeout.
+  sendTimeout(clock: ClockGrant, v: T, timeout: Duration): Result<void, TaskError> {
+    const d = deadlineIn(clock, timeout)?;
+    return this.sendUntil(v, d);
   }
 
   // close(): no more values will be sent; receivers drain what is buffered and then get None.
@@ -203,6 +315,41 @@ export class Receiver<T> {
     return Some(v);
   }
 
+  // recvUntil(deadline): recv() that gives up when the absolute monotonic deadline passes while the channel is empty:
+  // Ok(value), Err(Timeout), or Err(Closed) once the channel is closed and drained. A value that is already there is
+  // returned even if the deadline has passed. Traps if the deadline is negative.
+  @Requires(deadline.at.millis >= 0)
+  recvUntil(deadline: Deadline): Result<T, TaskError> {
+    const ch = this.ch;
+    const dl = deadline.at.millis.toUsize();
+    monLock(ch);
+    const cap = monGet(ch, 0);
+    let head = monGet(ch, 1);
+    let len = monGet(ch, 2);
+    let flags = monGet(ch, 3);
+    let late = false;
+    while (len == 0 && !ringIsDone(len, chTx(flags), chRx(flags)) && !late) {
+      late = monWaitUntil(ch, 1, dl) == 1;
+      head = monGet(ch, 1);
+      len = monGet(ch, 2);
+      flags = monGet(ch, 3);
+    }
+    if (len == 0) {
+      monUnlock(ch);
+      return Err(fail(ringIsDone(len, chTx(flags), chRx(flags)) ? Closed : Timeout));
+    }
+    const tok = popLocked(ch, cap, head, len, flags);
+    monUnlock(ch);
+    const v: T = takeBox(tok);
+    return Ok(v);
+  }
+
+  // recvTimeout(clock, timeout): recvUntil(now + timeout). Err(InvalidDuration) for a negative timeout.
+  recvTimeout(clock: ClockGrant, timeout: Duration): Result<T, TaskError> {
+    const d = deadlineIn(clock, timeout)?;
+    return this.recvUntil(d);
+  }
+
   // close(): this end is done: buffered values are dropped, a blocked or later send returns false.
   close(): void {
     const ch = this.ch;
@@ -251,6 +398,156 @@ export function channel<T>(capacity: usize): Channel<T> {
   return Channel<T> { tx: new Sender<T>(m), rx: new Receiver<T>(m) };
 }
 
+// ------------------------------------------------------------------------------------------------------ select, sleep
+
+// The result of a `select`: which receiver (position in the array) delivered, and the value.
+export type Selected<T> = { index: usize; value: T; };
+
+// Registers the wake monitor `w` of a select with the channel (and removes it again).
+function watch(ch: usize, w: usize): void {
+  monLock(ch);
+  const base = CH_HDR + monGet(ch, 0);
+  const n = monGet(ch, 4);
+  const room = monGet(ch, 5);
+  if (n == room) {
+    const grown = room == 0 ? 2 : room * 2;
+    monGrow(ch, base + grown);
+    monSet(ch, 5, grown);
+  }
+  monSet(ch, base + n, w);
+  monSet(ch, 4, n + 1);
+  monUnlock(ch);
+}
+
+function unwatch(ch: usize, w: usize): void {
+  monLock(ch);
+  const base = CH_HDR + monGet(ch, 0);
+  const n = monGet(ch, 4);
+  let k: usize = 0;
+  while (k < n) {
+    if (monGet(ch, base + k) == w) {
+      monSet(ch, base + k, monGet(ch, base + n - 1));
+      monSet(ch, 4, n - 1);
+      k = n;
+    } else {
+      k += 1;
+    }
+  }
+  monUnlock(ch);
+}
+
+// One monitor `w` (word 0 = a ticket) is registered with every channel; a send or close on any of them bumps the ticket and
+// notifies. The selector reads the ticket, scans the channels in order (the first with a value wins), and waits only while the
+// ticket is unchanged, so a send between the scan and the wait is never lost; it holds no monitor while it takes another. A
+// deadline `dl` < 0 means none.
+function selectCore<T>(rxs: Receiver<T>[], dl: int): Result<Selected<T>, TaskError> {
+  const n = rxs.length;
+  const w = monNew(1);
+  let k: usize = 0;
+  while (k < n) {
+    watch(rxs[k].ch, w);
+    k += 1;
+  }
+  let state = 0;
+  let index: usize = 0;
+  let tok: usize = 0;
+  let late = false;
+  while (state == 0) {
+    monLock(w);
+    const ticket = monGet(w, 0);
+    monUnlock(w);
+    let closed: usize = 0;
+    let j: usize = 0;
+    while (j < n && state == 0) {
+      const ch = rxs[j].ch;
+      monLock(ch);
+      const cap = monGet(ch, 0);
+      const head = monGet(ch, 1);
+      const len = monGet(ch, 2);
+      const flags = monGet(ch, 3);
+      if (len > 0) {
+        tok = popLocked(ch, cap, head, len, flags);
+        index = j;
+        state = 1;
+      } else if (ringIsDone(len, chTx(flags), chRx(flags))) {
+        closed += 1;
+      }
+      monUnlock(ch);
+      j += 1;
+    }
+    if (state == 0 && closed == n) {
+      state = 2;
+    } else if (state == 0 && late) {
+      state = 3;
+    } else if (state == 0) {
+      monLock(w);
+      while (monGet(w, 0) == ticket && !late) {
+        if (dl < 0) {
+          monWait(w, 0);
+        } else {
+          late = monWaitUntil(w, 0, dl.toUsize()) == 1;
+        }
+      }
+      monUnlock(w);
+    }
+  }
+  k = 0;
+  while (k < n) {
+    unwatch(rxs[k].ch, w);
+    k += 1;
+  }
+  monFree(w);
+  if (state == 1) {
+    const v: T = takeBox(tok);
+    return Ok(Selected<T> { index: index, value: v });
+  }
+  return Err(fail(state == 2 ? Closed : Timeout));
+}
+
+// select(rxs): waits until one of the receivers has a value and returns its position and the value (the first ready receiver in
+// array order wins a tie). Receivers that are closed and drained are skipped; Err(Closed) when all of them are. The receivers
+// must carry one value type (use a variant for different kinds). Traps on an empty array.
+@Requires(rxs.length >= 1)
+export function select<T>(rxs: Receiver<T>[]): Result<Selected<T>, TaskError> {
+  return selectCore(rxs, -1);
+}
+
+// selectUntil(rxs, deadline): select that gives up with Err(Timeout) when the absolute monotonic deadline passes first. A value
+// that is already there is delivered even if the deadline has passed. Traps if the deadline is negative.
+@Requires(rxs.length >= 1 && deadline.at.millis >= 0)
+export function selectUntil<T>(rxs: Receiver<T>[], deadline: Deadline): Result<Selected<T>, TaskError> {
+  return selectCore(rxs, deadline.at.millis);
+}
+
+// selectTimeout(clock, rxs, timeout): selectUntil(rxs, now + timeout). Err(InvalidDuration) for a negative timeout.
+@Requires(rxs.length >= 1)
+export function selectTimeout<T>(clock: ClockGrant, rxs: Receiver<T>[], timeout: Duration): Result<Selected<T>, TaskError> {
+  const d = deadlineIn(clock, timeout)?;
+  return selectCore(rxs, d.at.millis);
+}
+
+// sleepUntil(deadline): blocks until the absolute monotonic deadline has passed (at least that long: never early; returns at once
+// when it has passed). Traps if the deadline is negative.
+@Requires(deadline.at.millis >= 0)
+export function sleepUntil(deadline: Deadline): void {
+  const m = monNew(1);
+  monLock(m);
+  let late = false;
+  while (!late) {
+    late = monWaitUntil(m, 0, deadline.at.millis.toUsize()) == 1;
+  }
+  monUnlock(m);
+  monFree(m);
+}
+
+// sleep(clock, timeout): blocks for at least `timeout` on the monotonic clock. Err(InvalidDuration) for a negative timeout,
+// Err(ClockUnavailable) when the clock cannot be read.
+export function sleep(clock: ClockGrant, timeout: Duration): Result<void, TaskError> {
+  const d = deadlineIn(clock, timeout)?;
+  sleepUntil(d);
+  return Ok();
+}
+
 // ------------------------------------------------------------------------------------------------------ scopes
 
 const LG_HDR: usize = 4;
@@ -282,7 +579,7 @@ export class Scope {
   // can be started.
   @Ensures(result.tab == this.tab)
   spawn<T>(f: () => T): TaskHandle<T> {
-    const res = monNew(1);
+    const res = monNew(2);
     const body: Thunk = () => runTask(f, res);
     const tok = putBox(body);
     monLock(this.tab);
@@ -350,6 +647,31 @@ export class TaskHandle<T> {
     monFree(this.res);
     return takeBox<T>(tok);
   }
+
+  // joinUntil(deadline): waits for the task until the absolute monotonic deadline. Err(Timeout) if it has not ended by then (the
+  // handle stays valid: join or joinUntil it again); otherwise exactly `join()` (a panic of the task is a trap of the joiner).
+  // Traps if the deadline is negative, or the handle was joined before.
+  @Requires(deadline.at.millis >= 0)
+  joinUntil(deadline: Deadline): Result<T, TaskError> {
+    const dl = deadline.at.millis.toUsize();
+    monLock(this.res);
+    let late = false;
+    while (monGet(this.res, 1) == 0 && !late) {
+      late = monWaitUntil(this.res, 0, dl) == 1;
+    }
+    const ended = monGet(this.res, 1) != 0;
+    monUnlock(this.res);
+    if (!ended) {
+      return Err(fail(Timeout));
+    }
+    return Ok(this.join());
+  }
+
+  // joinTimeout(clock, timeout): joinUntil(now + timeout). Err(InvalidDuration) for a negative timeout.
+  joinTimeout(clock: ClockGrant, timeout: Duration): Result<T, TaskError> {
+    const d = deadlineIn(clock, timeout)?;
+    return this.joinUntil(d);
+  }
 }
 
 // tryJoin(h): `h.join()` that returns None instead of trapping when the task panicked (its message is then `taskMessage()`).
@@ -378,8 +700,10 @@ function tryJoin<T>(h: TaskHandle<T>): Option<T> {
   return Some(v);
 }
 
-// What a task does, as the runtime runs it: compute, publish the result in the result monitor.
+// What a task does, as the runtime runs it: compute, publish the result in the result monitor. Result monitor words: [0] the token
+// of the result, [1] 1 once the task has ended (by return or trap; set by the runtime, taskWatch), which `joinUntil` waits for.
 function runTask<T>(f: () => T, res: usize): void {
+  taskWatch(res);
   const r = f();
   const tok = putBox<T>(r);
   monLock(res);
