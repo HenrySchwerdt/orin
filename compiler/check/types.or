@@ -174,7 +174,7 @@ export function resolveTy(
 ): Result<TyOut, Diagnostic> {
   return match (te.kind) {
     TArray(inner) => {
-      const r = resolveTy(env, sc, inner, false, stack)?;
+      const r = resolveTy(env, sc, inner, true, stack)?;
       if (hasResource(r.ty)) {
         return Err(resourceIn(te.span, "an array element"));
       }
@@ -259,7 +259,7 @@ function resolveNamed(
         diag(
           "E0400",
           te.span,
-          "`void` is only allowed as a return type or as `T` in `Result<T, E>`",
+          "`void` is only allowed as a return type or as a type argument (`Result<void, E>`, `Option<void>`, `Box<void>`, `void[]`)",
         ),
       );
     }
@@ -269,7 +269,7 @@ function resolveNamed(
     if (args.length != 1) {
       return Err(diag("E0400", te.span, "`Option` takes exactly one type argument"));
     }
-    const t = resolveTy(env, sc, args[0], false, stack)?;
+    const t = resolveTy(env, sc, args[0], true, stack)?;
     if (hasResource(t.ty)) {
       return Err(resourceIn(te.span, "the type argument of `Option`"));
     }
@@ -387,7 +387,7 @@ function resolveGeneric(
   let cur = env;
   let tys: Type[] = [];
   for (const a of args) {
-    const r = resolveTy(cur, sc, a, false, stack)?;
+    const r = resolveTy(cur, sc, a, true, stack)?;
     cur = r.env;
     if (hasResource(r.ty)) {
       return Err(resourceIn(a.span, `a type argument of \`${name.name}\``));
@@ -749,14 +749,15 @@ function unifyNamed(
   if (args.length == 0) {
     const k = indexOfName(tp, n);
     if (k.isSome()) {
-      if (!isVoid(actual)) {
-        const i = k.unwrap();
-        match (b[i]) {
-          None => {
-            b[i] = Some(actual);
-          },
-          Some(_) => {},
-        }
+      // `void` is bound like any type (ADR-0040): a nested position (`() => T` against a closure returning `void`,
+      // `Option<T>`, `T[]`, ...) instantiates `T = void`. A bare `T` against a `void` argument or expectation is not an
+      // instantiation (that is `Inference.learn`, which skips it): `void` as a value stays an error.
+      const i = k.unwrap();
+      match (b[i]) {
+        None => {
+          b[i] = Some(actual);
+        },
+        Some(_) => {},
       }
       return b;
     }
