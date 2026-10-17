@@ -1,0 +1,384 @@
+// Inputs for tools/test_verify_contracts.py: `e?` (early return on Err / None) and calls of mutating methods inside an
+// expression (ADR-0053 Addendum A, groups U6 and U7). `e?` returns from the function with `Err(payload)` / `None` when
+// `e` is Err / None, so every @Ensures must hold on that path as well (with the function's result type); the call of a
+// mutating method is executed before the expression, in the order the expression evaluates it, with its frame.
+// A claim that is wrong on the early-return path is never VERIFIED; a claim about the state after a modular call is
+// UNKNOWN rather than REFUTED (the model of the callee is only its contract), as in verify_classes.
+// `// expect:` lines are `function kind status`; methods are `Class.method`.
+// expect: pass_on ensures VERIFIED
+// expect: pass_on ensures VERIFIED
+// expect: pass_on_wrong ensures REFUTED
+// expect: pass_err_wrong ensures REFUTED
+// expect: chain ensures VERIFIED
+// expect: chain ensures VERIFIED
+// expect: chain_wrong ensures REFUTED
+// expect: widen ensures VERIFIED
+// expect: in_return ensures VERIFIED
+// expect: in_return_wrong ensures REFUTED
+// expect: in_condition ensures VERIFIED
+// expect: in_condition_wrong ensures REFUTED
+// expect: shortcut ensures UNKNOWN
+// expect: branch_arm ensures UNKNOWN
+// expect: drain_two unwrap VERIFIED
+// expect: drain_two unwrap VERIFIED
+// expect: drain_two ensures VERIFIED
+// expect: drain_two_wrong unwrap VERIFIED
+// expect: drain_two_wrong unwrap VERIFIED
+// expect: drain_two_wrong ensures REFUTED
+// expect: Cursor.constructor invariant VERIFIED
+// expect: Cursor.next ensures VERIFIED
+// expect: Cursor.next ensures VERIFIED
+// expect: Cursor.next invariant VERIFIED
+// expect: Cursor.step ensures VERIFIED
+// expect: Cursor.step ensures VERIFIED
+// expect: Cursor.step invariant VERIFIED
+// expect: Cursor.sum2 call-precondition VERIFIED
+// expect: Cursor.sum2 call-precondition VERIFIED
+// expect: Cursor.sum2 ensures VERIFIED
+// expect: Cursor.sum2 ensures VERIFIED
+// expect: Cursor.sum2 invariant VERIFIED
+// expect: Cursor.minus call-precondition VERIFIED
+// expect: Cursor.minus call-precondition VERIFIED
+// expect: Cursor.minus ensures VERIFIED
+// expect: Cursor.minus ensures VERIFIED
+// expect: Cursor.minus invariant VERIFIED
+// expect: Cursor.minusWrongOrder call-precondition VERIFIED
+// expect: Cursor.minusWrongOrder call-precondition VERIFIED
+// expect: Cursor.minusWrongOrder ensures UNKNOWN
+// expect: Cursor.minusWrongOrder invariant VERIFIED
+// expect: Cursor.readBefore call-precondition VERIFIED
+// expect: Cursor.readBefore ensures VERIFIED
+// expect: Cursor.readBefore invariant VERIFIED
+// expect: Cursor.readBeforeWrong call-precondition VERIFIED
+// expect: Cursor.readBeforeWrong ensures UNKNOWN
+// expect: Cursor.readBeforeWrong invariant VERIFIED
+// expect: Cursor.run2 ensures VERIFIED
+// expect: Cursor.run2 ensures VERIFIED
+// expect: Cursor.run2 invariant VERIFIED
+// expect: Cursor.run2Ok ensures UNKNOWN
+// expect: Cursor.run2Ok invariant VERIFIED
+// expect: Cursor.run2Moves ensures UNKNOWN
+// expect: Cursor.run2Moves invariant VERIFIED
+// expect: Cursor.stmtTry ensures VERIFIED
+// expect: Cursor.stmtTry invariant VERIFIED
+// expect: Cursor.argEffect call-precondition VERIFIED
+// expect: Cursor.argEffect call-precondition VERIFIED
+// expect: Cursor.argEffect ensures VERIFIED
+// expect: Cursor.argEffect ensures VERIFIED
+// expect: Cursor.argEffect invariant VERIFIED
+// expect: Cursor.add ensures VERIFIED
+// expect: Cursor.asField ensures VERIFIED
+// expect: Cursor.asField invariant VERIFIED
+// expect: Cursor.armEffect call-precondition VERIFIED
+// expect: Cursor.armEffect call-precondition VERIFIED
+// expect: Cursor.armEffect ensures VERIFIED
+// expect: Cursor.armEffect ensures VERIFIED
+// expect: Cursor.armEffect ensures VERIFIED
+// expect: Cursor.armEffect invariant VERIFIED
+// expect: Cursor.armEffectWrong call-precondition VERIFIED
+// expect: Cursor.armEffectWrong call-precondition VERIFIED
+// expect: Cursor.armEffectWrong ensures UNKNOWN
+// expect: Cursor.armEffectWrong invariant VERIFIED
+// expect: Cursor.armTry ensures VERIFIED
+// expect: Cursor.armTry ensures VERIFIED
+// expect: Cursor.armTry invariant VERIFIED
+// expect: Cursor.guarded call-precondition VERIFIED
+// expect: Cursor.guarded ensures VERIFIED
+// expect: Cursor.guarded invariant VERIFIED
+// expect: Gauge.constructor invariant VERIFIED
+// expect: Gauge.bad invariant REFUTED
+// expect: Gauge.good invariant VERIFIED
+// warn: widen W0460
+
+// `r?` returns Err(..) of the result type when `r` is Err: Ok-ness is passed on, in both directions.
+@Ensures(result.isOk() == r.isOk())
+@Ensures(result.isErr() == r.isErr())
+function pass_on(r: Result<int, string>): Result<int, string> {
+  const x = r?;
+  return Ok(x);
+}
+
+// Wrong: when `r` is Err the function returns Err, so the result is not always Ok.
+@Ensures(result.isOk())
+function pass_on_wrong(r: Result<int, string>): Result<int, string> {
+  const x = r?;
+  return Ok(x);
+}
+
+// Wrong: the Err that is returned is the one of `r`, whatever it says, not 7.
+@Ensures(result.isErr() ==> result.unwrapErr() == 7)
+function pass_err_wrong(r: Result<int, int>): Result<int, int> {
+  const x = r?;
+  return Ok(x);
+}
+
+// Two `?` in a row: the result is Ok only when both are.
+@Ensures(result.isOk() == (a.isOk() && b.isOk()))
+@Ensures(result.isErr() == (a.isErr() || b.isErr()))
+function chain(a: Result<int, string>, b: Result<int, string>): Result<int, string> {
+  const x = a?;
+  const y = b?;
+  return Ok(0);
+}
+
+// Wrong: when only `b` is Err the result is Err.
+@Ensures(result.isOk() == a.isOk())
+function chain_wrong(a: Result<int, string>, b: Result<int, string>): Result<int, string> {
+  const x = a?;
+  const y = b?;
+  return Ok(0);
+}
+
+// The payload is what the clauses speak about after the `?`: here the unwrap of the continuing path is fine, and the
+// type fact of the payload (a u8) is known.
+@Ensures(result.isOk() ==> result.unwrap() <= 255)
+function widen(r: Result<u8, string>): Result<u8, string> {
+  const b = r?;
+  return Ok(b);
+}
+
+// `?` inside the returned expression.
+@Ensures(result.isOk() == r.isOk())
+function in_return(r: Result<int, string>): Result<int, string> {
+  return Ok((r?) * 2);
+}
+
+@Ensures(result.isOk())
+function in_return_wrong(r: Result<int, string>): Result<int, string> {
+  return Ok((r?) * 2);
+}
+
+// `?` in an `if` condition.
+@Ensures(result.isOk() == r.isOk())
+function in_condition(r: Result<bool, string>): Result<int, string> {
+  if (r?) {
+    return Ok(1);
+  }
+  return Ok(0);
+}
+
+@Ensures(result.isOk() && result.unwrap() == 1)
+function in_condition_wrong(r: Result<bool, string>): Result<int, string> {
+  if (r?) {
+    return Ok(1);
+  }
+  return Ok(0);
+}
+
+// A `?` that is not always evaluated (right operand of `&&`, an arm of `?:`) is not encoded: UNKNOWN, never VERIFIED.
+@Ensures(result.isOk() == r.isOk())
+function shortcut(b: bool, r: Result<bool, string>): Result<bool, string> {
+  return Ok(b && r?);
+}
+
+@Ensures(result.isOk() == r.isOk())
+function branch_arm(b: bool, r: Result<int, string>): Result<int, string> {
+  return Ok(b ? r? : 0);
+}
+
+// A mutating builtin inside an expression, in evaluation order: the first pop is the left operand.
+@Requires(xs.length >= 2)
+@Ensures(result == xs[xs.length - 1] - xs[xs.length - 2])
+function drain_two(xs: int[]): int {
+  let ys = xs;
+  const r = ys.pop().unwrap() - ys.pop().unwrap();
+  return r;
+}
+
+// Wrong: that is the other order.
+@Requires(xs.length >= 2)
+@Ensures(result == xs[xs.length - 2] - xs[xs.length - 1])
+function drain_two_wrong(xs: int[]): int {
+  let ys = xs;
+  const r = ys.pop().unwrap() - ys.pop().unwrap();
+  return r;
+}
+
+@Invariant(this.pos >= 0 && this.pos <= 1000000)
+class Cursor {
+  private pos: int = 0;
+
+  constructor() {
+  }
+
+  // Returns the position before the step.
+  @Requires(this.pos < 1000000)
+  @Ensures(this.pos == old(this.pos) + 1)
+  @Ensures(result == old(this.pos))
+  next(): int {
+    const p = this.pos;
+    this.pos += 1;
+    return p;
+  }
+
+  // Fails (without moving) at the end.
+  @Ensures(result.isOk() ==> this.pos == old(this.pos) + 1)
+  @Ensures(result.isErr() ==> this.pos == old(this.pos))
+  step(): Result<int, string> {
+    if (this.pos >= 1000000) {
+      return Err("end");
+    }
+    this.pos += 1;
+    return Ok(this.pos);
+  }
+
+  // Both calls are executed, left to right.
+  @Requires(this.pos < 999999)
+  @Ensures(this.pos == old(this.pos) + 2)
+  @Ensures(result == 2 * old(this.pos) + 1)
+  sum2(): int {
+    return this.next() + this.next();
+  }
+
+  @Requires(this.pos < 999999)
+  @Ensures(this.pos == old(this.pos) + 2)
+  @Ensures(result == -1)
+  minus(): int {
+    return this.next() - this.next();
+  }
+
+  // Wrong: the left operand is evaluated first.
+  @Requires(this.pos < 999999)
+  @Ensures(result == 1)
+  minusWrongOrder(): int {
+    return this.next() - this.next();
+  }
+
+  // What is read before the call is read before it: the position before the step, not after.
+  @Requires(this.pos < 1000000)
+  @Ensures(result == old(this.pos) * 10 + old(this.pos))
+  readBefore(): int {
+    return this.pos * 10 + this.next();
+  }
+
+  // Wrong: that is the value if the field were read after the call.
+  @Requires(this.pos < 1000000)
+  @Ensures(result == (old(this.pos) + 1) * 10 + old(this.pos))
+  readBeforeWrong(): int {
+    return this.pos * 10 + this.next();
+  }
+
+  // `?` on a mutating call: on Err the function returns it, the state is the one after the failed step.
+  @Ensures(result.isOk() ==> this.pos == old(this.pos) + 2)
+  @Ensures(this.pos >= old(this.pos))
+  run2(): Result<int, string> {
+    const a = this.step()?;
+    const b = this.step()?;
+    return Ok(a + b);
+  }
+
+  // Wrong: the second step can fail.
+  @Ensures(result.isOk())
+  run2Ok(): Result<int, string> {
+    const a = this.step()?;
+    const b = this.step()?;
+    return Ok(a + b);
+  }
+
+  // Wrong: the early return happens after the first step only (or none).
+  @Ensures(this.pos == old(this.pos) + 2)
+  run2Moves(): Result<int, string> {
+    const a = this.step()?;
+    const b = this.step()?;
+    return Ok(a + b);
+  }
+
+  // A statement `this.step()?;`.
+  @Ensures(result.isOk() ==> this.pos == old(this.pos) + 1)
+  stmtTry(): Result<int, string> {
+    this.step()?;
+    return Ok(0);
+  }
+
+  // An effect in the argument of a call: the argument is evaluated, then the call happens.
+  @Requires(this.pos < 999999)
+  @Ensures(this.pos == old(this.pos) + 1)
+  @Ensures(result == old(this.pos) + 1)
+  argEffect(): int {
+    return this.add(this.next(), 1);
+  }
+
+  @Requires(a >= 0 && a <= 1000000 && b >= 0 && b <= 1)
+  @Ensures(result == a + b)
+  private add(a: int, b: int): int {
+    return a + b;
+  }
+
+  // The value of a `?` assigned to a field-like place.
+  @Ensures(result.isOk() ==> this.pos == old(this.pos) + 1)
+  asField(): Result<int, string> {
+    const v = this.step()?;
+    return Ok(v);
+  }
+
+  // `return match` with an effect in an arm: the arm that matches is executed.
+  @Requires(this.pos < 999999)
+  @Ensures(this.pos == old(this.pos) + 1)
+  @Ensures(o.isSome() ==> result == old(this.pos))
+  @Ensures(o.isNone() ==> result == old(this.pos) + 10)
+  armEffect(o: Option<int>): int {
+    return match (o) {
+      Some(x) => this.next(),
+      None => this.next() + 10
+    };
+  }
+
+  // Wrong: the arms differ.
+  @Requires(this.pos < 999999)
+  @Ensures(result == old(this.pos))
+  armEffectWrong(o: Option<int>): int {
+    return match (o) {
+      Some(x) => this.next(),
+      None => this.next() + 10
+    };
+  }
+
+  // `?` in an arm returns from the function, the other arm continues.
+  @Ensures(o.isSome() && result.isOk() ==> this.pos == old(this.pos) + 1)
+  @Ensures(o.isNone() ==> result.isOk())
+  armTry(o: Option<int>): Result<int, string> {
+    return match (o) {
+      Some(x) => Ok(this.step()?),
+      None => Ok(0)
+    };
+  }
+
+  // `if (this.next() > 3)`: the call is executed before the test, on both branches.
+  @Requires(this.pos < 1000000)
+  @Ensures(this.pos == old(this.pos) + 1)
+  guarded(): int {
+    if (this.next() > 3) {
+      return 1;
+    }
+    return 0;
+  }
+}
+
+// The state at the early return is the state of that point: here the invariant is broken when `r` is Err, because the
+// field is restored only after the `?`.
+@Invariant(this.v >= 0 && this.v <= 1)
+class Gauge {
+  private v: int = 0;
+
+  constructor() {
+  }
+
+  bad(r: Result<int, string>): Result<int, string> {
+    this.v = 5;
+    const x = r?;
+    this.v = 0;
+    return Ok(x);
+  }
+
+  good(r: Result<int, string>): Result<int, string> {
+    this.v = 1;
+    this.v = 0;
+    const x = r?;
+    this.v = 1;
+    return Ok(x);
+  }
+}
+
+function main(): void {
+  console.log("verify_try");
+}
