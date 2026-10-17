@@ -242,7 +242,7 @@ that R3b makes redundant _(inference)_).
 | Item | Today | Needed |
 |---|---|---|
 | Org move to `orin-lang/orin-lang` | PR #150 prepared | M0. All URLs in `install.sh`, docs, `dist/`, workflow, VS Code manifest follow |
-| Homebrew tap `orin-lang/homebrew-orin` | PR #149 | M0. Note ADR-0047 section 6 names `HenrySchwerdt/homebrew-orin`; the ADR text needs the new owner |
+| Homebrew tap `orin-lang/homebrew-orin` | PR #149 | M0 |
 | Platforms | linux-x86_64, macos-arm64 published; linux-aarch64 and macos-x86_64 built by the workflow but absent from alpha.2; Windows only via WSL2 | D4 |
 | Release workflow | always `--prerelease`, title "(experimental)" (`release.yml` line ~113) | Make pre-release status depend on the tag (`-alpha`, `-beta`, `-rc` suffix); 1.0.0 publishes a normal release. S |
 | Notarisation and signing | not notarised | Not required for 1.0; document the quarantine workaround (already in install.md). Owner may want it for the Homebrew cask path |
