@@ -211,7 +211,6 @@ typedef struct OrinStats {
 #else
 #define ORIN_TLS_MODEL
 #endif
-extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 #if defined(ORIN_SITE_STATS) && !defined(ORIN_STATS_ENABLED)
 #define ORIN_STATS_ENABLED 1
 #endif
@@ -222,6 +221,79 @@ extern __thread OrinStats orin_stats ORIN_TLS_MODEL;
 #define ORIN_STAT(...) ((void)0)
 #define ORIN_STAT_ON 0
 #endif
+
+/* Build configuration as seen by the core operation cfg(k) (ADR-0052 Addendum A section 2; compiler/hir/coreops.or): 0 free lists
+ * on (off under ASan / MSan or -DORIN_NO_FREELIST), 1 hot counters, 2 allocation-site census. Constants, so Orin code folds them. */
+#if defined(ORIN_NO_FREELIST) || defined(__SANITIZE_ADDRESS__)
+#define ORIN_CFG_FREELIST 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)
+#define ORIN_CFG_FREELIST 0
+#endif
+#endif
+#ifndef ORIN_CFG_FREELIST
+#define ORIN_CFG_FREELIST 1
+#endif
+#define ORIN_CFG_STATS ORIN_STAT_ON
+#ifdef ORIN_SITE_STATS
+#define ORIN_CFG_SITES 1
+#else
+#define ORIN_CFG_SITES 0
+#endif
+
+/* The per-thread heap block (ADR-0052 Addendum A section 5, step R3d.1): ALL allocator state of a thread / task (ADR-0017) in one
+ * zero-initialised `__thread` object, so a new thread starts with empty lists and zeroed counters. It is the block the core operation
+ * heapBase() returns, so Orin code (the L1 modules of later steps) reaches every field at a fixed byte offset from heapBase(); the
+ * offsets are part of the runtime ABI like the object layout (rule 3 of the Addendum), pinned by the _Static_asserts below and listed
+ * in spec/19 "R3d.1". Offsets are independent of the build configuration: the free lists and the counters exist (unused) with
+ * -DORIN_NO_FREELIST or without ORIN_STATS_ENABLED. Word 63 (byte 504) is the scratch word of std:coreprobe; the "reserved" ranges
+ * are for later fields (task pointer, grant and file tables) and stay zero. A block is plain malloc memory, so a free-list node may
+ * come from another thread's heap and joins this one's (capped by FL_CAP / SB_CAP). */
+enum { FL_STRUCT_CLASSES = 9, SB_MAX = 256, SB_CLASSES = SB_MAX / 16, ORIN_HEAP_WORDS = 128 };
+typedef struct FreeNode { struct FreeNode *next; } FreeNode;
+/* A small-block cache class: list head and length side by side, so one scaled index reaches both. */
+typedef struct SbClass { FreeNode *head; uint64_t n; } SbClass;
+typedef struct OrinHeap {
+    FreeNode *fl_struct[FL_STRUCT_CLASSES]; /* @0    free struct objects by nslots 0..8 */
+    FreeNode *fl_array;                     /* @72   free array headers */
+    uint64_t fl_n[FL_STRUCT_CLASSES + 1];   /* @80   list lengths: structs by nslots, [9] the array headers */
+    int64_t live;                           /* @160  live objects of this heap (signed: a task can free more than it allocated) */
+    OrinObj **dstack;                       /* @168  the work stack of orin_destroy (NULL until first use) */
+    uint64_t dcap;                          /* @176  its capacity in entries */
+    uint64_t reserved0;                     /* @184 */
+    OrinStats stats;                        /* @192  the counters (OrinStats, 18 words) */
+    uint64_t reserved1[21];                 /* @336  task pointer, grant and file tables, ... */
+    uint64_t probe;                         /* @504  std:coreprobe scratch word */
+    SbClass sb[SB_CLASSES + 1];             /* @512  small-block cache by 16-byte class 0..16: list head, length */
+    uint64_t reserved2[30];                 /* @784  up to 1024 */
+} OrinHeap;
+extern __thread OrinHeap orin_heap ORIN_TLS_MODEL;
+/* The counters keep their name: `orin_stats.retains++` in the inline functions below and in generated code. */
+#define orin_stats (orin_heap.stats)
+#define ORIN_HEAP_OFF(f) offsetof(OrinHeap, f)
+_Static_assert(sizeof(OrinStats) == 144, "OrinStats is 18 words");
+_Static_assert(sizeof(FreeNode *) == 8 && sizeof(size_t) == 8, "the heap block assumes 64-bit pointers");
+_Static_assert(ORIN_HEAP_OFF(fl_struct) == 0, "orin_heap.fl_struct @0");
+_Static_assert(ORIN_HEAP_OFF(fl_array) == 72, "orin_heap.fl_array @72");
+_Static_assert(ORIN_HEAP_OFF(fl_n) == 80, "orin_heap.fl_n @80");
+_Static_assert(ORIN_HEAP_OFF(live) == 160, "orin_heap.live @160");
+_Static_assert(ORIN_HEAP_OFF(dstack) == 168, "orin_heap.dstack @168");
+_Static_assert(ORIN_HEAP_OFF(dcap) == 176, "orin_heap.dcap @176");
+_Static_assert(ORIN_HEAP_OFF(reserved0) == 184, "orin_heap.reserved0 @184");
+_Static_assert(ORIN_HEAP_OFF(stats) == 192, "orin_heap.stats @192");
+_Static_assert(ORIN_HEAP_OFF(reserved1) == 336, "orin_heap.reserved1 @336");
+_Static_assert(ORIN_HEAP_OFF(probe) == 504, "orin_heap.probe @504");
+_Static_assert(ORIN_HEAP_OFF(sb) == 512 && sizeof(SbClass) == 16, "orin_heap.sb @512, 16 bytes per class (head @+0, n @+8)");
+_Static_assert(ORIN_HEAP_OFF(reserved2) == 784, "orin_heap.reserved2 @784");
+_Static_assert(sizeof(OrinHeap) == ORIN_HEAP_WORDS * 8, "orin_heap is 128 words (1024 bytes)");
+_Static_assert(offsetof(OrinStats, alloc_string) == 0 && offsetof(OrinStats, alloc_array) == 8 && offsetof(OrinStats, alloc_struct) == 16 &&
+                   offsetof(OrinStats, frees) == 24 && offsetof(OrinStats, retains) == 32 && offsetof(OrinStats, releases) == 40 &&
+                   offsetof(OrinStats, cow_copies) == 48 && offsetof(OrinStats, cow_inplace) == 56 && offsetof(OrinStats, array_grows) == 64 &&
+                   offsetof(OrinStats, string_grows) == 72 && offsetof(OrinStats, peak_live_objs) == 80 &&
+                   offsetof(OrinStats, peak_live_bytes) == 88 && offsetof(OrinStats, live_bytes) == 96 && offsetof(OrinStats, file_opens) == 104 &&
+                   offsetof(OrinStats, file_closes) == 112 && offsetof(OrinStats, transfer_moves) == 120 &&
+                   offsetof(OrinStats, transfer_copies) == 128 && offsetof(OrinStats, tasks_spawned) == 136,
+               "OrinStats field offsets (relative to orin_heap.stats, i.e. to heapBase())");
 
 /* Allocation-site census (opt-in, docs/perf/alloc-census.md, tools/alloc_census.py). Compiled in only when BOTH the generated C
  * and the runtime are built with ORIN_SITE_STATS: the compiler (`orin2 compile --stats-sites`) then defines it at the top of

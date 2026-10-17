@@ -8,6 +8,7 @@
 # Needs build/bootstrap/orin2 (tools/bootstrap.sh). Usage: tooling/benchmarks/test.sh
 set -eu
 cd "$(dirname "$0")/../.."
+. tools/runtime_files.sh   # the runtime source list: tools/runtime-sources.txt
 ORIN2=${ORIN2:-build/bootstrap/orin2}
 T=tooling/benchmarks/testdata
 G=$T/golden
@@ -23,7 +24,7 @@ out=$($ORIN2 test tooling/reports/tests/report_test.or --runtime runtime/core 2>
   && ok "tooling/reports tests: $(echo "$out" | tail -1)" || { echo "$out"; bad "tooling/reports tests"; }
 
 $ORIN2 compile tooling/benchmarks -o "$B/br.c"
-cc -O1 -w -I runtime/core "$B/br.c" runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o "$B/bench-report"
+cc -O1 -w $(rt_inc) "$B/br.c" $(rt_src) -lm -o "$B/bench-report"
 BR=$B/bench-report
 
 # case NAME HISTORY-DIR RUN-FILE

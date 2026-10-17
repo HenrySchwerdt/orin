@@ -83,7 +83,7 @@ Orin and still links libc. It becomes worth doing only when Orin's verifier cove
 
 ## Addendum A: R3d object model in Orin (design)
 
-Status: proposed (2026-10-16), design only, no code. Read against PR #141 (R3a `BCore`, R3b). *(inference)* marks a conclusion from the code,
+Status: proposed (2026-10-16). Step R3d.0 is implemented on the working assumptions of section 6 (spec 19 "R3d.0 preparation"); the rest is design only. Read against PR #141 (R3a `BCore`, R3b). *(inference)* marks a conclusion from the code,
 not something the code states. Open questions for the owner: section 6.
 
 ### 1. Where the L1 modules live, how they load, how the gate narrows
@@ -201,7 +201,34 @@ under the L0 runtime lock, for which no core op exists, and revokes grants and c
 `refmask`, `is_ref` and the pin bits), `task_main` (calls a closure through a raw function address; no core op). In R3d they stay C and read the
 shared block through the offsets of R3d.1. The porting table of ADR-0017 Addendum A is unchanged.
 
+**R3d.1 (done): the offsets of the shared block.** `heapBase()` is `&orin_heap`, `extern __thread OrinHeap orin_heap` in `runtime/core/orin_runtime.h`
+(1024 bytes, 128 words, replacing the 64-word placeholder of R3d.0; word 63 stays the scratch word of `std:coreprobe`). Every offset is pinned by a `_Static_assert`.
+
+| offset | size | field (`OrinHeap`) | was | note |
+|---:|---:|---|---|---|
+| 0 | 72 | `fl_struct[9]` | `fl_struct` | free struct objects by `nslots` 0..8 (next pointer in word 0) |
+| 72 | 8 | `fl_array` | `fl_array` | free array headers |
+| 80 | 80 | `fl_n[10]` (u64) | `fl_n` (u32) | list lengths, `[9]` the array headers; cap `FL_CAP` = 2^18 |
+| 160 | 8 | `live` (i64) | `g_live` | signed: a task can free more than it allocated |
+| 168 | 8 | `dstack` (`OrinObj **`) | `t_dstack` | work stack of `orin_destroy`, NULL until first use |
+| 176 | 8 | `dcap` (u64) | `t_dcap` | its capacity in entries |
+| 184 | 8 | reserved | | |
+| 192 | 144 | `stats` (`OrinStats`, 18 u64) | `orin_stats` | `alloc_string` +0, `alloc_array` +8, `alloc_struct` +16, `frees` +24, `retains` +32, `releases` +40, `cow_copies` +48, `cow_inplace` +56, `array_grows` +64, `string_grows` +72, `peak_live_objs` +80, `peak_live_bytes` +88, `live_bytes` +96, `file_opens` +104, `file_closes` +112, `transfer_moves` +120, `transfer_copies` +128, `tasks_spawned` +136 |
+| 336 | 168 | reserved | | task pointer, grant and file tables (R3e) |
+| 504 | 8 | `probe` | | scratch word of `std:coreprobe` |
+| 512 | 272 | `sb[17]` (`{head, n}` pairs, 16 bytes each) | `sb_list`, `sb_cnt` (u32) | small-block cache by 16-byte class 0..16 (`SB_MAX` 256): list head @+0, length @+8, cap `SB_CAP` = 2^15 |
+| 784 | 240 | reserved | | up to 1024 bytes (128 words) |
+
+**Not moved (they stay `static __thread` in C until R3e):** `t_sites`, `t_pairs`, `t_calls` (census), `g_grants`, `g_files`, `t_task`, `t_joined_msg`, `orin_site_cur`, `orin_site_par`.
+Offsets do not depend on the build configuration (the lists and counters exist unused under `-DORIN_NO_FREELIST` or without `ORIN_STATS_ENABLED`) and are pinned by `_Static_assert`s in `runtime/core/orin_runtime.h`.
+`orin_stats` is now `#define orin_stats (orin_heap.stats)`, so inline code and generated C are unchanged; the block is `extern __thread OrinHeap orin_heap` (local-exec as before), `heapBase()` is its address (the C backend emits `&orin_heap`, the LLVM declaration is `[128 x i64]`).
+
 ### 6. Open questions for the project owner
+
+**Working assumptions until the owner confirms (2026-10-17):** the work proceeds on the recommendations below, as the decision
+card in the project thread says it would. Budget rule as applied: per step at most +1 % executed instructions on the LLVM backend
+(the `--release` default), and below +2 % on the C backend. R3d.1 measured LLVM -0.9 to -1.6 %, C +0.55 to +1.62 % (bintrees).
+Each assumption is a separate commit (R3d.0) and can be reverted alone if the owner decides otherwise.
 
 1. **Marker of a core module.** Recommend virtual root `$rt/` plus internal module `std:core`, and amending spec 19 and this ADR from "manifest
    `core = true`" to "modules of the embedded runtime root"; add the key when a second runtime (WASI, freestanding) needs user-visible core packages.
