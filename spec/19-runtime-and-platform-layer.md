@@ -180,6 +180,17 @@ separator is raised through `process.exit(101)` after printing the same message.
     (-10.3 %); mutres, pqueue, sortedmap, strings unchanged to 30 instructions; selfcompile (C) 24,781,316,263 -> 24,788,630,444 (+0.03 %).
     `ORIN_STATS` counters identical (`orin_nullary` was never counted).
 
+  - **R3d.3 the object model in Orin (done, ADR-0052 Addendum A sections 3 and 5; three commits, each revertible alone).** (a) `runtime/core/object.or`
+    (`structNew`, `variant1`, `arrayNew`, free lists); (b) `runtime/core/rc.or` (`destroy` iterative with the work stack in the heap block and the
+    first dying child freed without a push, `makeUniqueSlow`); (c) `runtime/core/heap.or` (`sbAlloc`, `sbFree`, `sbRealloc`, the small-block cache),
+    `strAlloc`, `arrayPushGrow` (kept out of line in LLVM, `noinline`). All sit on the `OrinHeap` block at the offsets of R3d.1. Generated code calls
+    the entries directly (`newStruct`, array-new); the C shells of `orin_runtime.c` reach them through wrappers that the emitted code defines under the
+    old C names (`backends/{c,llvm}/rtwrap.or`), so the C runtime keeps its call sites. New pure core operations 24..26: `wadd`, `wsub`, `wmul`
+    (wrapping `usize` arithmetic; `wrappingAdd` is an out-of-line call and `+` adds trap paths). Census builds (`-DORIN_SITE_STATS`, `--stats-sites`)
+    keep the C definitions, because the census hooks are C: `rtIdsFor(prog, sites)` leaves the entries out and the C versions stay under
+    `#ifdef ORIN_SITE_STATS` until R3d.5; `sb_drain` stays C. `cfg(0)` is a constant 1 in LLVM, so LLVM builds under ASan keep the free lists
+    (ASan then does not see a recycled header). The C unit tests of the runtime link `tools/rt_stub.sh` (an empty program compiled to C with `main`
+    renamed), which carries the wrappers. `compiler/mir/rt.or` also holds `rtAlways` (the entries `opt/prune.or` always keeps).
   - **R3d.1 the per-thread heap block (done, ADR-0052 Addendum A section 5).** `g_live`, the free lists, the small-block cache, the
     work stack of `orin_destroy` and `orin_stats` are fields of one exported `__thread OrinHeap orin_heap` (1024 bytes, zero-initialised,
     the block `heapBase()` returns), so Orin code reaches each at a fixed offset. ADR-0017 behaviour is unchanged (per task, returned in
