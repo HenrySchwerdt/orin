@@ -165,12 +165,12 @@ interpolation, or a bad escape, is E0100.
 ```
 
 `..` alone is E0100 ("did you mean `...`?"). `==>` is the contract implication (chapter 7). `|` appears
-only in union declarations, `&` only in a rejected bound (`T extends A & B`, E0408); there are no bitwise
+only in union declarations, `&` only between the bounds of a type parameter (`T extends A & B`); there are no bitwise
 operators, shifts, `??`, `?.`, `**`, `++` or `--` in the language, and each is a syntax error.
 - Tests: `tests/parse_edge/ok_ops_adjacent.or`, `tests/parse_edge/err0100_bad_dotdot.or`,
   `tests/parse_edge/err0200_binary_bitor.or`, `tests/parse_edge/err0200_binary_shift.or`,
   `tests/parse_edge/err0200_binary_coalesce.or`, `tests/parse_edge/err0200_incr.or`,
-  `tests/parse_edge/err0200_assign_pow.or`, `tests/next/errors/e0408_multiple_bounds.or`.
+  `tests/parse_edge/err0200_assign_pow.or`, `tests/next/run/multi_bounds_ord_hash.or`.
 
 ## 1.10 Lexical modes of OX
 

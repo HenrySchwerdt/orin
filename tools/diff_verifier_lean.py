@@ -39,9 +39,11 @@ from runtime_files import rt_inc, rt_src, rt_llvm  # the runtime source list: to
 def build_driver(orinc, out_dir):
     c = os.path.join(out_dir, "verify_text.c")
     exe = os.path.join(out_dir, "verify_text")
-    subprocess.run([orinc, "compile", "compiler/tests/verify_text.or", "-o", c], cwd=ROOT, check=True)
-    # C from the seed compilers (orin0, orin1: logic that predates R3d) links the frozen snapshot, as in tools/bootstrap.sh
-    world = "legacy" if os.path.basename(orinc) in ("orin0", "orin1") else "core"
+    # C from the seed compilers (orin0, orin1: logic that predates R3d) is built with --c-builtins and links the frozen snapshot,
+    # as in tools/bootstrap.sh
+    seed = os.path.basename(orinc) in ("orin0", "orin1")
+    world = "legacy" if seed else "core"
+    subprocess.run([orinc, "compile", *(["--c-builtins"] if seed else []), "compiler/tests/verify_text.or", "-o", c], cwd=ROOT, check=True)
     subprocess.run(["cc", "-O1", "-w", *rt_inc(world), c, *rt_src(world), "-lm", "-o", exe], cwd=ROOT, check=True)
     return exe
 

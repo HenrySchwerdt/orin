@@ -240,7 +240,34 @@ limits, worker count, timeout units, compiler revision, backend and host details
   contracts on/off, C/LLVM parity, Linux/macOS loopback, ASan/UBSan and TSan
   where supported. Report unsupported sanitizer environments as such.
 
-These are future acceptance requirements, not tests run for this design PR.
+### C5 results (2026-10-17)
+
+Work package C5 runs the part of the campaign that the floor (C0-C4) makes testable: `tools/test_server_campaign.sh` against
+`examples/http_server.or`, which is now the concurrent server (8 workers, queue 16 in the campaign; the former
+`http_server_concurrent.or` was merged into it). Recorded on Linux 6.18 x86_64, 4 cores, gcc 13.3 and clang 18.1, compiler revision
+`orin2` of this branch, request deadline 800 ms, send deadline 1,500 ms, loopback, 100 to 2,000 byte bodies; the whole campaign takes
+about 60 s (`--quick` skips 1,024 clients and the sanitizers). It runs in CI (`concurrency` job on Linux, and `std:net` job on macOS).
+The 1,024-client batch is larger than the pool plus queue (24) plus the accept backlog (128): it is the over-limit batch, and passes
+because clients wait in the kernel and none is dropped. These are fixtures, not capacity claims.
+
+| Requirement | Result | Measured |
+|---|---|---|
+| 1 / 64 / 1,024 clients, every answer is its own, none dropped | pass (C and LLVM) | 21-24 ms / 28 ms / 135-150 ms; server fds 6 before and after |
+| Slowloris (16 droppers, 2 batches of 8 workers) | pass (C, LLVM, TSan, ASan) | all cut off with 408 within 1.6 s (deadline 0.8 s per batch); a healthy client answered in 1.3 s, then at once |
+| Non-reading peers (8, 5.4 MB owed each) | pass (C, LLVM) | healthy client answered at once while the peers hold sends; all 8 closed by the send deadline, then service at once |
+| Peers vanishing or resetting mid-request (300) | pass (C, LLVM, TSan, ASan) | the server answers a healthy client afterwards in under 10 ms |
+| Cancellation storm: 192 tasks blocked in accept / recv / send, one cancel, 3 rounds | pass (C, LLVM) | all woke with `Cancelled`, slowest 24-56 ms after the cancel; fds 3 before and 3 after |
+| Same storm, 32-48 tasks, TSan / ASan+UBSan | pass | slowest about 2 s under TSan (1 MiB buffers built under instrumentation), 0.3 s under ASan; fds unchanged |
+| Graceful shutdown (`POST /shutdown`, CancelToken of the accepting scope) | pass (C, LLVM, TSan, ASan) | held request served to its 408, exit status 0, accepted == served, port refused afterwards |
+| C / LLVM parity | pass | the same 20 result lines (numbers aside) |
+| ThreadSanitizer: 64 clients, slowloris, abrupt peers, shutdown, storm | pass | no report |
+| AddressSanitizer + UBSan (with leak detection): the same | pass | no report |
+
+Not covered by C5 (open, not claimed): backpressure at channel capacity 1 and total queued bytes, scheduling fairness against hot
+producers and latency tails, trap injection at admission / parse / receive / send / shutdown, deadline-versus-cancel at every waiter
+boundary, contracts on/off and macOS-specific numbers (the campaign runs on macOS CI, with descriptor counts skipped there); the
+earlier C-level tests in `tests/concurrency` and `tests/net/interrupt.or` cover parts of these. The macOS accept backlog is capped
+at 128 and the load client retries a connect that was reset.
 
 ## Decision gate: is async/await needed?
 

@@ -9,8 +9,8 @@
 // argument, so such a program cannot call one (compile error E0470).
 //
 // From the Host a program derives grants, one per family of operation (the "root operation families"):
-//   FsGrant       std:fs       open / read / write / exist files (further narrowed by `withUnder`, `withReadOnly`)
-//   ProcessGrant  std:process  `args`, `shell` (further narrowed by `withArgsOnly`: no spawning)
+//   FsGrant       std:fs       open / read / write / list files (further narrowed by `withUnder`, `withReadOnly`)
+//   ProcessGrant  std:io       `shell`, `shellTimeout`; std:process `args` (further narrowed by `withArgsOnly`: no spawning)
 //   StdioGrant    std:io       read stdin, `writeStdout`
 //   ClockGrant    std:time     `nowMillis`
 //   NetGrant      std:net      listen / connect / resolve (`useNet`; narrowed by `useListen`, `useConnect`)
@@ -25,8 +25,8 @@
 //
 // The host policy decides what the OS process may give: by default everything the process has; the environment
 // variable ORIN_DENY (a comma-separated list of: fs, process, stdio, clock, net, all) denies families. A denied family is
-// still handed out (the program type-checks and runs); every operation then reports `Err("... denied by the host
-// policy (ORIN_DENY)")` if it returns a Result, and traps ("capability denied: ...") otherwise.
+// still handed out (the program type-checks and runs); every operation then reports an `Err` (FsError kind Denied, ...)
+// if it returns a Result, and traps ("capability denied: ...") otherwise.
 //
 // The raw primitives (grantFs, grantRevoke ... of the internal module std:fsraw) can only be used by the std
 // library: user code cannot name them (E0301), so it cannot create, copy or forge a grant.
@@ -37,8 +37,9 @@ import {
 
 export { Host } from "std:fsraw";
 
-// withFs<T>(host, body: (fs: FsGrant) => T): T -- the file-system grant of the host policy (the whole file system,
-// unless the policy denies `fs`). Revoked when `body` returns.
+// withFs<T>(host, body: (fs: FsGrant) => T): T
+// The file-system grant of the host policy (the whole file system, unless the policy denies `fs`). Revoked when `body`
+// returns.
 export function withFs<T>(host: Host, body: (fs: FsGrant) => T): T {
   const g = grantFs(host);
   const r = body(g);
@@ -53,7 +54,8 @@ export function useFs(host: Host, body: (fs: FsGrant) => void): void {
   grantRevoke(g);
 }
 
-// withProcess / useProcess: the process grant (`args`, `shell`).
+// withProcess<T>(host, body: (proc: ProcessGrant) => T): T
+// The process grant (`shell`, `shellTimeout` of std:io, `args` of std:process). Revoked when `body` returns.
 export function withProcess<T>(host: Host, body: (proc: ProcessGrant) => T): T {
   const g = grantProcess(host);
   const r = body(g);
@@ -61,13 +63,15 @@ export function withProcess<T>(host: Host, body: (proc: ProcessGrant) => T): T {
   return r;
 }
 
+// useProcess(host, body: (proc: ProcessGrant) => void): void -- `withProcess` for a body that returns nothing.
 export function useProcess(host: Host, body: (proc: ProcessGrant) => void): void {
   const g = grantProcess(host);
   body(g);
   grantRevoke(g);
 }
 
-// withStdio / useStdio: the stdin / stdout grant of std:io.
+// withStdio<T>(host, body: (stdio: StdioGrant) => T): T
+// The standard input / output grant of std:io (`readLine`, `readBytes`, `writeStdout`). Revoked when `body` returns.
 export function withStdio<T>(host: Host, body: (stdio: StdioGrant) => T): T {
   const g = grantStdio(host);
   const r = body(g);
@@ -75,13 +79,15 @@ export function withStdio<T>(host: Host, body: (stdio: StdioGrant) => T): T {
   return r;
 }
 
+// useStdio(host, body: (stdio: StdioGrant) => void): void -- `withStdio` for a body that returns nothing.
 export function useStdio(host: Host, body: (stdio: StdioGrant) => void): void {
   const g = grantStdio(host);
   body(g);
   grantRevoke(g);
 }
 
-// withClock / useClock: the clock grant of std:time.
+// withClock<T>(host, body: (clock: ClockGrant) => T): T
+// The clock grant of std:time (`nowMillis`, `monotonicNow`). Revoked when `body` returns.
 export function withClock<T>(host: Host, body: (clock: ClockGrant) => T): T {
   const g = grantClock(host);
   const r = body(g);
@@ -89,14 +95,17 @@ export function withClock<T>(host: Host, body: (clock: ClockGrant) => T): T {
   return r;
 }
 
+// useClock(host, body: (clock: ClockGrant) => void): void -- `withClock` for a body that returns nothing.
 export function useClock(host: Host, body: (clock: ClockGrant) => void): void {
   const g = grantClock(host);
   body(g);
   grantRevoke(g);
 }
 
-// withNet / useNet: the network grant (std:net, ADR-0033): may listen and connect anywhere the host policy allows (unless
-// the policy denies `net`: then every network operation is refused). Narrow it with `useListen` / `useConnect` of std:net.
+// withNet<T>(host, body: (net: NetGrant) => T): T
+// The network grant (std:net, ADR-0033): may listen and connect anywhere the host policy allows (unless the policy denies
+// `net`: then every network operation is refused). Narrow it with `useListen` / `useConnect` of std:net. Revoked when
+// `body` returns.
 export function withNet<T>(host: Host, body: (net: NetGrant) => T): T {
   const g = grantNet(host);
   const r = body(g);
@@ -104,13 +113,16 @@ export function withNet<T>(host: Host, body: (net: NetGrant) => T): T {
   return r;
 }
 
+// useNet(host, body: (net: NetGrant) => void): void -- `withNet` for a body that returns nothing.
 export function useNet(host: Host, body: (net: NetGrant) => void): void {
   const g = grantNet(host);
   body(g);
   grantRevoke(g);
 }
 
-// withHost / useHost: all four grants at once (the usual shape of a command line program's main).
+// withHost<T>(host, body: (fs, proc, stdio, clock) => T): T
+// All four grants at once (the usual shape of a command line program's main); the network grant is taken with `withNet`.
+// Revoked in reverse order when `body` returns.
 export function withHost<T>(
   host: Host, body: (fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant, clock: ClockGrant) => T
 ): T {
@@ -126,6 +138,7 @@ export function withHost<T>(
   return r;
 }
 
+// useHost(host, body: (fs, proc, stdio, clock) => void): void -- `withHost` for a body that returns nothing.
 export function useHost(
   host: Host, body: (fs: FsGrant, proc: ProcessGrant, stdio: StdioGrant, clock: ClockGrant) => void
 ): void {
@@ -140,8 +153,9 @@ export function useHost(
   grantRevoke(f);
 }
 
-// withArgsOnly(proc, body: (p: ProcessGrant) => T): T -- a process grant that can read `args` but not spawn (`shell`
-// traps with "capability denied"). Narrowing only restricts: the new grant never has more authority than `proc`.
+// withArgsOnly<T>(proc, body: (p: ProcessGrant) => T): T
+// A process grant that can read `args` but not spawn (`shell` and `shellTimeout` trap with "capability denied").
+// Narrowing only restricts: the new grant never has more authority than `proc`.
 export function withArgsOnly<T>(proc: ProcessGrant, body: (p: ProcessGrant) => T): T {
   const g = grantArgsOnly(proc);
   const r = body(g);
@@ -149,6 +163,7 @@ export function withArgsOnly<T>(proc: ProcessGrant, body: (p: ProcessGrant) => T
   return r;
 }
 
+// useArgsOnly(proc, body: (p: ProcessGrant) => void): void -- `withArgsOnly` for a body that returns nothing.
 export function useArgsOnly(proc: ProcessGrant, body: (p: ProcessGrant) => void): void {
   const g = grantArgsOnly(proc);
   body(g);

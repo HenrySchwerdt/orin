@@ -262,18 +262,36 @@ Use `orin help <command>` for command help.
 Get started: orin init hello && cd hello && orin run
 HELP
 }
+# Fails for a word that is not an Orin command, with a hint for the names other toolchains use (npm, cargo, tsc, prettier).
+unknown_command() {
+  local hint=''
+  case $1 in
+    new|create) hint=" To create a project, run 'orin init <name>'." ;;
+    install|i|ci) hint=" To fetch dependencies, run 'orin fetch'." ;;
+    start|exec|node|ts-node|tsx) hint=" To build and run a program, run 'orin run [file.or]'." ;;
+    watch) hint=" To rebuild and restart on every change, run 'orin dev'." ;;
+    format|prettier) hint=" To format sources, run 'orin fmt'." ;;
+    lint|tsc|typecheck) hint=" To type-check without building, run 'orin check'." ;;
+    --verison|--versoin) hint=" Did you mean 'orin --version'?" ;;
+    *.or) hint=" To run a file, use 'orin run $1'." ;;
+  esac
+  fail "Unknown command '$1'.$hint Run 'orin --help' to see available commands." 2
+}
 help_command() {
   case $1 in
     workspace) echo 'Usage: orin workspace list|lock|check [--root <directory>]' ;;
     init) echo 'Usage: orin init [name] [--lib | --template http]'; echo 'Create a project without overwriting existing files.' ;;
     add) echo 'Usage: orin add --path <directory> [--dev]'; echo '       orin add --git <url> [--tag <tag> | --rev <commit>] [--name <alias>] [--dev]' ;;
-    build|run|dev) echo "Usage: orin $1 [file.or | project-directory] [--release] [--backend=c|llvm] [-o path] [-- program-arguments]" ;;
+    build|run|dev) echo "Usage: orin $1 [file.or | project-directory] [--release] [--backend=c|llvm] [--target=native|wasm64-orbit] [-o path] [-- program-arguments]" ;;
     toolchain) echo 'Usage: orin toolchain install [--force] | status'; echo 'Installs the pinned LLVM (sha256-verified) into ~/.orin/toolchains/llvm-<version>; --backend=llvm uses it.' ;;
     test) echo 'Usage: orin test [path] [--filter text] [--watch] [--allow-empty] [--format=json]' ;;
     fmt) echo 'Usage: orin fmt [paths...] [--check | --stdout]' ;;
     check) echo 'Usage: orin check [path] [--format=json] [--deps] [--strict-contracts]' ;;
     fetch|deps|update|remove|clean) echo "Usage: orin $1 $([ "$1" = remove ] && echo '<name>' || true) [--locked] [--offline]" ;;
-    *) echo "Usage: orin $1 — see the compiler command reference in docs/" ;;
+    explain) echo 'Usage: orin explain <diagnostic-code>   e.g. orin explain E0401' ;;
+    doctor) echo 'Usage: orin doctor'; echo 'Checks the installation: version, layout, C compiler, PATH.' ;;
+    api|effects|graph|diff|verify|compile|mir|lsp|mcp) echo "Usage: orin $1 [path] [options] — see docs/cli.md" ;;
+    *) unknown_command "$1" ;;
   esac
 }
 init_project() {
@@ -353,6 +371,11 @@ project_target() {
   local path=${1:-}
   if [ -z "$path" ]; then need_project; target=$project; [ "$project" != "$PWD" ] || target=.
   elif [ -d "$path" ]; then project=$(cd "$path" && pwd); target=$project
+  elif [ ! -e "$path" ]; then
+    case $path in
+      *.or) fail "File not found: $path" ;;
+      *) fail "Not found: $path. Pass a .or file or a project directory (one that contains orin.toml)." ;;
+    esac
   else target=$path; project=$(cd "$(dirname "$path")" && pwd); fi
   local ancestor=$project
   while [ "$ancestor" != / ] && [ ! -f "$ancestor/orin.toml" ]; do ancestor=${ancestor%/*}; [ -n "$ancestor" ] || ancestor=/; done
@@ -368,9 +391,9 @@ validate_locked_dependencies() {
 fingerprint() {
   local root=$1 file depname deppath depgit deptag deprev depdev
   {
-    printf '%s\n' "$CC" "$profile" "$backend" "${target:-}"
+    printf '%s\n' "$CC" "$profile" "$backend" "${target:-}" "wasm=${wasm:-false}"
     cksum "$BIN" "$HERE/bin/orin-cli.sh"
-    for file in "$RT"/*.[ch] "$PF"/*.[ch]; do cksum "$file"; done
+    for file in "$RT"/*.[ch] "$PF"/*.[ch] "$PF"/orbit/*.[ch] "$PF"/orbit/include/*.h; do [ ! -f "$file" ] || cksum "$file"; done
     command -v "${CC%% *}" || true
     ${CC} --version 2>/dev/null || true
     source_fingerprint "$root" ""
@@ -400,7 +423,9 @@ native_build() {
   # Compile output goes to an adjacent temporary executable; failed builds preserve the last success.
   local generated=$tmp/out.c
   [ "$backend" != llvm ] || generated=$tmp/out.ll
-  if ! compiler compile "$src" -o "$generated" "--backend=$backend" --runtime "$RT" --cc "$CC" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
+  local target_flag=()
+  [ "$wasm" != true ] || target_flag=(--target=wasm64-orbit)
+  if ! compiler compile "$src" -o "$generated" "--backend=$backend" "${target_flag[@]}" --runtime "$RT" --cc "$CC" > "$tmp/compile.out" 2> "$tmp/compile.err"; then
     if $json; then result_json false error "$(cat "$tmp/compile.err")"; else cat "$tmp/compile.err" >&2; fi
     rm -rf "$tmp"; return 1
   fi
@@ -410,10 +435,16 @@ native_build() {
   mkdir -p "$(dirname "$out")"
   local emit=$out.tmp.$$
   cleanup_files+=("$emit")
-  local sources=("$RT/orin_runtime.c" "$PF/orin_platform.c")
+  local sources=("$RT/orin_runtime.c" "$PF/orin_platform.c") link=(-lm -pthread) flags=(-I "$RT")
   [ "$backend" != llvm ] || sources+=("$RT/orin_runtime_llvm.c")
+  if [ "$wasm" = true ]; then
+    # ADR-0055: a freestanding wasm64 module over the Orbit host ABI; its own L0 and mini libc, no WASI, entry `orin_main`.
+    sources=("$RT/orin_runtime.c" "$PF/orbit/orin_platform_orbit.c" "$PF/orbit/orin_libc_orbit.c" "$PF/orbit/orin_float_orbit.c" "$PF/orbit/orin_builtins_orbit.c")
+    flags=(--target=wasm64-unknown-unknown -mbulk-memory -ffreestanding -nostdlib -I "$PF/orbit/include" -I "$RT")
+    link=(-Wl,--no-entry -Wl,--stack-first -Wl,-z,stack-size=1048576)
+  fi
   $verbose && printf 'Compiling with %s %s\n' "$CC" "$ccflags" >&2
-  if ! ${CC} "$ccflags" -w -I "$RT" "$generated" "${sources[@]}" -lm -pthread -o "$emit" > "$tmp/cc.log" 2>&1; then
+  if ! ${CC} "$ccflags" -w "${flags[@]}" "$generated" "${sources[@]}" "${link[@]}" -o "$emit" > "$tmp/cc.log" 2>&1; then
     local logfile=$out.build.log
     cp "$tmp/cc.log" "$logfile"
     if $json; then result_json false error "Native build failed. See $logfile"; else printf 'error: Native build failed\n\n' >&2; head -15 "$logfile" >&2; fi
@@ -423,7 +454,7 @@ native_build() {
   mv -f "$emit" "$out"; rm -rf "$tmp"
 }
 build_command() {
-  profile=dev backend=''
+  profile=dev backend='' wasm=false
   local src='' output='' arg key cache
   program_args=()
   while [ $# -gt 0 ]; do
@@ -431,6 +462,9 @@ build_command() {
       --) shift; program_args=("$@"); break ;;
       --release) profile=release ;;
       --backend=c|--backend=llvm) backend=${1#*=} ;;
+      --target=native) wasm=false ;;
+      --target=wasm64-orbit) wasm=true ;;
+      --target=*) fail "Unknown target: ${1#*=} (expected native or wasm64-orbit)" 2 ;;
       -o) [ $# -ge 2 ] || fail 'Missing output path.' 2; output=$2; shift ;;
       -*) fail "Unknown $command option: $1" 2 ;;
       *) [ -z "$src" ] || { if [ "$command" = run ]; then program_args+=("$1"); else fail 'Expected one source path.' 2; fi; }; [ -n "$src" ] || src=$1 ;;
@@ -439,6 +473,17 @@ build_command() {
   # ADR-0038 section 8: --release defaults to the LLVM backend (the owner's decision, 2026-10-16); --backend=c is the
   # explicit fallback. Both backends run the same MIR optimiser and are compiled at -O2 (native_build).
   local release_backend=llvm explicit_backend=$backend
+  if [ "$wasm" = true ]; then
+    # ADR-0055: the WebAssembly target uses the C backend and a clang with the WebAssembly backend and wasm-ld: the pinned
+    # LLVM (orin toolchain install) when present, else the system clang.
+    [ "$command" = build ] || fail "orin $command does not support --target=wasm64-orbit; build it and run it with Orbit (orbit run <file>.wasm --grant log/v1 --invoke orin_main)" 2
+    [ "$backend" != llvm ] || fail '--target=wasm64-orbit uses the C backend; drop --backend=llvm.' 2
+    backend=c
+    if [ -z "$CC_EXPLICIT" ]; then
+      local pinned
+      if pinned=$(ORIN_LEGACY_DRIVER=1 "$HERE/bin/orin" toolchain path 2>/dev/null); then CC=$pinned; else CC=clang; fi
+    fi
+  fi
   if [ -z "$backend" ]; then if [ "$profile" = release ]; then backend=$release_backend; else backend=c; fi; fi
   if [ "$backend" = llvm ] && [ -z "$CC_EXPLICIT" ]; then
     # The pinned LLVM (orin toolchain install) is preferred. Without it a dev build uses the system clang; a release
@@ -467,6 +512,7 @@ build_command() {
   if [ -f "$project/orin.toml" ]; then name=$(info name "$project"); else name=$(basename "$target" .or); fi
   valid_name "$name" || fail 'Invalid executable name in package manifest.'
   artifact=${output:-$project/build/$profile/$name}
+  [ "$wasm" != true ] || [ -n "$output" ] || artifact=$project/build/$profile/$name.wasm
   cache=$artifact.fingerprint
   key=$(fingerprint "$project")
   if [ -x "$artifact" ] && [ -f "$cache" ] && [ "$(cat "$cache")" = "$key" ]; then status "Up to date · $name"
@@ -723,7 +769,7 @@ fi
 case $command in
   --help|-h|help)
     if [ ${#args[@]} -gt 0 ]; then help_command "${args[0]}"; else help_main; fi ;;
-  --version|version) cat "$HERE/VERSION" ;;
+  --version|-V|version) cat "$HERE/VERSION" ;;
   lsp|mcp) exec "$BIN" "$command" "${args[@]}" ;;
   *)
     for arg in "${args[@]}"; do if [ "$arg" = --help ] || [ "$arg" = -h ]; then help_command "$command"; exit 0; fi; done
@@ -752,7 +798,17 @@ case $command in
         E0400) printf 'E0400: Type mismatch\n\nThe value does not match the expected type. Orin does not implicitly coerce values.\n' ;;
         E0200) printf 'E0200: Syntax error\n\nUse the highlighted source location to check punctuation and expression syntax.\n' ;;
         E0301) printf 'E0301: Module not found\n\nCheck the import path and dependency declaration. Run `orin fetch` for Git dependencies.\n' ;;
-        *) fail 'No extended explanation is available for this code yet.' 2;; esac ;;
+        E0201) printf 'E0201: `var` is not allowed\n\nDeclare with `const` (cannot be reassigned) or `let` (can be reassigned).\n' ;;
+        E0401) printf 'E0401: Assignment to an immutable binding\n\nA `const` binding, a parameter or a captured variable cannot be assigned, and a mutating method (one that assigns to `this`, or `push` on an array) can only be called on a `let` variable. Declare it with `let`.\n' ;;
+        E0402) printf 'E0402: Invalid or non-exhaustive match\n\nA `match` must cover every variant (or end with `_`). Patterns are a variant name with plain bindings, e.g. `Circle(r)`; nested patterns are not supported, match the inner value in a second `match`.\n' ;;
+        E0403) printf 'E0403: Missing return\n\nEvery path through a function with a result type must end in `return`. Add an `else` branch or a final `return`.\n' ;;
+        E0404) printf 'E0404: Wrong number of arguments\n\nThe call passes more or fewer arguments than the function declares. Orin has no optional or default parameters.\n' ;;
+        E0405) printf 'E0405: Unknown field, method or variant\n\nThe type has no member with that name. Check the spelling and the type; some JavaScript methods (for example `repeat`) do not exist in Orin.\n' ;;
+        E0406) printf 'E0406: Invalid use of `?`\n\nPostfix `?` works on a `Result<T, E>` inside a function that returns a `Result` with the same error type E. There is no optional chaining; use `match` on an `Option`.\n' ;;
+        E0407) printf 'E0407: Cannot infer a type\n\nAdd a type annotation, for example a parameter type in an arrow function or the element type of an empty array.\n' ;;
+        E0408) printf 'E0408: Construct not supported\n\nThe language deliberately has no class inheritance, interface fields, generic methods or similar constructs; the message names the alternative.\n' ;;
+        E0410) printf 'E0410: Invalid operand types\n\nThe operator is not defined for these types. Operands must have the same type; convert explicitly and use template literals to build strings.\n' ;;
+        *) fail "No extended explanation is available for ${args[0]} yet." 2;; esac ;;
       check|verify|api|effects|graph|mir)
         # Commands with no explicit path target the nearest project.
         haspath=false; expect=false; validation_path=
@@ -779,6 +835,6 @@ case $command in
         args+=(--runtime "$RT" --cc "$CC")
         compiler "$command" "${args[@]}" ;;
       diff) $json && args+=(--format=json); compiler "$command" "${args[@]}" ;;
-      *) fail "Unknown command '$command'. Run 'orin --help' to see available commands." 2 ;;
+      *) unknown_command "$command" ;;
     esac ;;
 esac

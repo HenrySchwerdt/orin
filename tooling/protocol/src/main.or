@@ -9,11 +9,10 @@
 
 import { Host, withHost } from "std:host";
 import { ProcessGrant, args, exit } from "std:process";
-import { FsGrant, readFile, exists } from "std:fs";
-import { shell } from "std:io";
+import { FsGrant, readFile } from "std:fs";
 import { shq, strip } from "./text";
 import { Options, parseArgs, usage, helpText } from "./cli";
-import { Session, LSP, MCP } from "./session";
+import { Session, LSP, MCP, shellStatus, existsOr } from "./session";
 import { runLsp } from "./lsp";
 import { runMcp } from "./mcp";
 
@@ -24,7 +23,7 @@ function readText(fs: FsGrant, path: string): string {
 
 // `mktemp -d` with a prefix (the `tempfile.mkdtemp` of the Python scripts); "" on failure. `note` is a scratch file.
 function makeTemp(fs: FsGrant, proc: ProcessGrant, prefix: string, note: string): string {
-  if (shell(proc, "mktemp -d \"${TMPDIR:-/tmp}/" + prefix + "XXXXXX\" > " + shq(note)) != 0) {
+  if (shellStatus(proc, "mktemp -d \"${TMPDIR:-/tmp}/" + prefix + "XXXXXX\" > " + shq(note)) != 0) {
     return "";
   }
   let p = strip(readText(fs, note));
@@ -42,7 +41,7 @@ function absolute(cwd: string, p: string): string {
 // Builds the compiler under test (`orin compile compiler/main.or`, then the C compiler), like `build()` of the Python
 // scripts. Returns the binary, or "" after printing the error.
 function buildCompiler(fs: FsGrant, proc: ProcessGrant, root: string, orin2: string, outDir: string): string {
-  if (shell(proc, "mkdir -p " + shq(outDir)) != 0) {
+  if (shellStatus(proc, "mkdir -p " + shq(outDir)) != 0) {
     console.error("cannot create " + outDir);
     return "";
   }
@@ -50,13 +49,13 @@ function buildCompiler(fs: FsGrant, proc: ProcessGrant, root: string, orin2: str
   const exe = outDir + "/orin";
   const err = outDir + "/build.err";
   const compile = "cd " + shq(root) + " && " + shq(orin2) + " compile compiler/main.or -o " + shq(c) + " 2> " + shq(err);
-  if (shell(proc, compile) != 0) {
+  if (shellStatus(proc, compile) != 0) {
     console.error("orin2 failed to compile compiler/main.or:\n" + readText(fs, err));
     return "";
   }
   const cc = "cd " + shq(root) + " && cc -O1 -w -I runtime/core " + shq(c)
     + " runtime/core/orin_runtime.c runtime/platform/orin_platform.c -o " + shq(exe) + " 2> " + shq(err);
-  if (shell(proc, cc) != 0) {
+  if (shellStatus(proc, cc) != 0) {
     console.error("cc failed:\n" + readText(fs, err));
     return "";
   }
@@ -79,7 +78,7 @@ function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
 
   // the working directory and the repository root, absolute (the commands below `cd`)
   const scratch = "/tmp/orin-protocol-cwd." + o.suite;
-  if (shell(proc, "pwd -P > " + shq(scratch) + " && cd " + shq(o.root) + " && pwd -P >> " + shq(scratch)) != 0) {
+  if (shellStatus(proc, "pwd -P > " + shq(scratch) + " && cd " + shq(o.root) + " && pwd -P >> " + shq(scratch)) != 0) {
     console.error("orin-protocol: cannot enter the root " + o.root);
     return 1;
   }
@@ -90,7 +89,7 @@ function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
   let exe = o.orin;
   if (exe == "") {
     const orin2Full = o.orin2.startsWith("/") ? o.orin2 : root + "/" + o.orin2;
-    if (!exists(fs, orin2Full)) {
+    if (!existsOr(fs, orin2Full)) {
       console.error("missing " + orin2Full + " (run tools/bootstrap.sh)");
       return 1;
     }
@@ -123,7 +122,7 @@ function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
   if (fatal != "") {
     console.error((lsp ? "test_lsp: " : "test_mcp: ") + fatal);
     // the server may still be running: end its input and kill it
-    shell(proc, "kill $(cat " + shq(dir + "/pid") + ") 2>/dev/null; : 1<> " + shq(dir + "/ctl") + "; rm -rf " + shq(dir) + " " + shq(scratch) + " " + shq(note) + "; true");
+    shellStatus(proc, "kill $(cat " + shq(dir + "/pid") + ") 2>/dev/null; : 1<> " + shq(dir + "/ctl") + "; rm -rf " + shq(dir) + " " + shq(scratch) + " " + shq(note) + "; true");
     return 1;
   }
   const t = s.totals(fs);
@@ -132,7 +131,7 @@ function run(fs: FsGrant, proc: ProcessGrant, argv: string[]): int {
   } else {
     console.log(t.checks.toString() + " checks, " + t.failures.toString() + " failures");
   }
-  shell(proc, "rm -rf " + shq(dir) + " " + shq(scratch) + " " + shq(note));
+  shellStatus(proc, "rm -rf " + shq(dir) + " " + shq(scratch) + " " + shq(note));
   return t.failures > 0 ? 1 : 0;
 }
 

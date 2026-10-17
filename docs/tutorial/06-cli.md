@@ -12,12 +12,12 @@ if it is given the right to.
 // A small tool: count the lines and words of a file, optionally save a summary.
 //   06-cli FILE [SUMMARY]
 import { Host, useHost } from "std:host";
-import { FsGrant, withFile, readFile, writeFile, Read } from "std:fs";
+import { FsGrant, FsError, fsErrorMessage, withFile, readFile, writeFile, Read } from "std:fs";
 import { ProcessGrant, args, exit } from "std:process";
 
 type Stats = { lines: int; words: int; };
 
-function countFile(fs: FsGrant, path: string): Result<Stats, string> {
+function countFile(fs: FsGrant, path: string): Result<Stats, FsError> {
   return withFile(fs, path, Read, f => {
     let lines = 0;
     let words = 0;
@@ -37,11 +37,7 @@ function countFile(fs: FsGrant, path: string): Result<Stats, string> {
   });
 }
 
-function run(fs: FsGrant, proc: ProcessGrant): Result<void, string> {
-  const argv = args(proc);
-  if (argv.length < 1) {
-    return Err("usage: 06-cli FILE [SUMMARY]");
-  }
+function run(fs: FsGrant, argv: string[]): Result<void, FsError> {
   const stats = countFile(fs, argv[0])?;
   const summary = stats.lines.toString() + " lines, " + stats.words.toString() + " words";
   console.log(argv[0] + ": " + summary);
@@ -54,9 +50,14 @@ function run(fs: FsGrant, proc: ProcessGrant): Result<void, string> {
 
 function main(host: Host): void {
   useHost(host, (fs, proc, stdio, clock) => {
-    const r = run(fs, proc);
+    const argv = args(proc);
+    if (argv.length < 1) {
+      console.error("error: usage: 06-cli FILE [SUMMARY]");
+      exit(1);
+    }
+    const r = run(fs, argv);
     if (r.isErr()) {
-      console.error("error: " + r.unwrapErr());
+      console.error("error: " + fsErrorMessage(r.unwrapErr()));
       exit(1);
     }
   });
@@ -89,20 +90,20 @@ available.
 **Grants.** `useHost(host, (fs, proc, stdio, clock) => { ... })` hands the body four *grants*: file system, process
 (arguments, `shell`), standard input/output and clock. Every I/O function takes the matching grant as its first
 argument: `args(proc)`, `readFile(fs, path)`, `writeFile(fs, path, text)`. Passing grants down as parameters
-(`run(fs, proc)`) keeps the code that needs authority visible in its signatures. A grant lives only inside the callback and
+(`run(fs, argv)`) keeps the code that needs authority visible in its signatures. A grant lives only inside the callback and
 cannot be stored or captured by a closure. You can narrow one before passing it on: `useUnder(fs, "data", sub => ...)`
 only allows paths inside `data/`, and `useReadOnly(fs, ro => ...)` cannot write. The environment variable
 `ORIN_DENY=fs` (also `process`, `stdio`, `clock`, `net`) turns a family off for a run: here `readFile` then returns an
 `Err` that says `denied by the host policy`.
 
-**Files.** `readFile` and `writeFile` handle whole files and return a `Result<..., string>`. For streaming,
+**Files.** `readFile` and `writeFile` handle whole files and return a `Result<..., FsError>` (a record: `kind`, `op`, `path`, `reason`; `fsErrorMessage` renders it). For streaming,
 `withFile(fs, path, Read, f => ...)` opens the file, runs the callback with a `File` handle, and closes the file on every
 path. The handle can only be a parameter: it cannot be stored in a variable, record or returned, so a file cannot leak.
 `f.readLine()` returns an `Option<string>` (`None` at the end). Opening can fail, so `withFile` itself returns a `Result`,
 and `countFile` hands it straight on.
 
-**Errors flow with `?`.** `run` returns `Result<void, string>`; `countFile(...)?` and `writeFile(...)?` return early on
-`Err`. Only `main` decides what an error means: print it and `exit(1)`.
+**Errors flow with `?`.** `run` returns `Result<void, FsError>`; `countFile(...)?` and `writeFile(...)?` return early on
+`Err`. Only `main` decides what an error means: print it (with `fsErrorMessage`) and `exit(1)`.
 
 The modules used here (`std:host`, `std:fs`, `std:process`) are marked unstable until the I/O interface is frozen;
 see [std.md](../std.md).

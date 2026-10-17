@@ -5,8 +5,27 @@
 // of the jobs, whatever the number of workers (the `ThreadPoolExecutor.map` of the Python scripts).
 
 import { ProcessGrant } from "std:process";
-import { shellTimeout } from "std:io";
+import { shellTimeout, Timeout, shell } from "std:io";
+import { seconds } from "std:time";
 import { scopeProcess, spawnProcess, channel, TaskHandle } from "std:task";
+
+// Exit status 0..255 of the command, -1 when it could not be run (the tool keeps statuses as data).
+export function shellStatus(p: ProcessGrant, cmd: string): int {
+  const r = shell(p, cmd);
+  return r.isOk() ? r.unwrap() : 0 - 1;
+}
+
+// Exit status 0..255 of the command, -2 when the time ran out, -1 when it could not be run: the tool keeps statuses as data.
+function shellTimeoutStatus(p: ProcessGrant, cmd: string, limit: int): int {
+  return match (shellTimeout(p, cmd, seconds(limit))) {
+    Ok(status) => status,
+    Err(e) => match (e.kind) {
+      Timeout => 0 - 2,
+      _ => 0 - 1
+    }
+  };
+}
+
 
 // `cmds[k]` runs with the deadline `timeouts[k]` seconds. With `stop`, the first command that does not exit 0 ends the job
 // (a build pipeline: compile, link, run); without it every command runs (independent runs whose exit status is data).
@@ -27,7 +46,7 @@ export function runJob(p: ProcessGrant, j: Job): Outcome {
     if (stopped) {
       rcs.push(NOT_RUN);
     } else {
-      const rc = shellTimeout(p, j.cmds[k], j.timeouts[k]);
+      const rc = shellTimeoutStatus(p, j.cmds[k], j.timeouts[k]);
       rcs.push(rc);
       if (rc != 0 && j.stop) {
         stopped = true;

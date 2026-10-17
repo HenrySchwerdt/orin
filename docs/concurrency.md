@@ -31,8 +31,8 @@ ch.tx.close();  ch.rx.close();                // end of stream / cancellation; c
 
 | Function | Meaning |
 |---|---|
-| `scope<R>(body: (s: Scope) => R): R`, `scopeDo(body)` | runs `body(s)`, then joins every task spawned in the scope, then returns. `scopeDo` is the `void` flavour (a generic result cannot be `void`; std:host has the same pairs) |
-| `spawn<T>(s, f: () => T): TaskHandle<T>`, `spawnDo(s, f: () => void): TaskHandle<bool>` | starts `f` as a task (an operating-system thread with its own heap). `ADR-0017` sketched `s.spawn(..)`; generic methods do not exist (E0460, ADR-0026), so it is a function taking the scope |
+| `scope<R>(body: (s: Scope) => R): R` | runs `body(s)`, then joins every task spawned in the scope, then returns. `R` may be `void` (ADR-0040); `scopeDo` and the other `*Do` flavours are `@Deprecated` wrappers kept for one release |
+| `s.spawn<T>(f: () => T): TaskHandle<T>` | starts `f` as a task (an operating-system thread with its own heap). `T` may be `void` (ADR-0040); the function form `spawn(s, f)` and `spawnDo` are `@Deprecated` wrappers kept for one release |
 | `TaskHandle<T>.join(): T` | waits for the task; its result. Panic: traps with `task panicked: <message>`. A second `join`, or a join after the scope ended, traps |
 | `channel<T>(capacity): Channel<T>` with `Channel<T> = { tx: Sender<T>, rx: Receiver<T> }` | a bounded FIFO. Both ends are copyable values and can be used by any number of tasks (several senders, several receivers) |
 | `Sender<T>.send(v): bool`, `.close()` | `send` blocks while the channel is full. `true`: handed over (moved if unique, copied otherwise). `false`: the channel is closed by either end and `v` is dropped |

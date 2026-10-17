@@ -388,6 +388,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("init", self.run_cli("--help").stdout)
         self.assertIn("--lib", self.run_cli("help", "init").stdout)
         self.run_cli("wat", code=2)
+        self.assertIn("orin init", self.run_cli("new", "demo", code=2).stderr)
+        self.assertIn("Unknown command", self.run_cli("help", "wat", code=2).stderr)
+        self.assertIn("File not found: nope.or", self.run_cli("run", "nope.or", code=1).stderr)
+        self.assertIn("E0401", self.run_cli("explain", "E0401").stdout)
         self.run_cli("build", "--unknown", code=2)
 
     def test_application_journey_and_cache(self):
@@ -404,6 +408,22 @@ class CliTests(unittest.TestCase):
         self.run_cli("build", cwd=project)
         self.assertEqual(before, binary.stat().st_mtime_ns)
         self.run_cli("fmt", "--check", cwd=project)
+
+    def test_wasm64_orbit_build(self):
+        # ADR-0055: `orin build --target=wasm64-orbit` makes a freestanding WebAssembly module with an Orbit manifest.
+        probe = subprocess.run(["clang", "--target=wasm64-unknown-unknown", "-print-targets"], capture_output=True, text=True)
+        if probe.returncode != 0 or "wasm64" not in probe.stdout or not shutil.which("wasm-ld"):
+            self.skipTest("no clang with the WebAssembly backend and wasm-ld")
+        self.run_cli("init", "hello")
+        project = self.cwd / "hello"
+        self.run_cli("build", "--target=wasm64-orbit", cwd=project, env={"CC": "clang"})
+        module = (project / "build/dev/hello.wasm").read_bytes()
+        self.assertEqual(module[:4], b"\0asm")
+        self.assertIn(b'orbit.manifest{"abi":1,"requires":["log/v1"],"producer":"orin"}', module)
+        self.assertNotIn(b"wasi_snapshot_preview1", module)
+        self.assertIn("does not support --target=wasm64-orbit", self.run_cli("run", "--target=wasm64-orbit", cwd=project, code=2).stderr)
+        self.assertIn("C backend", self.run_cli("build", "--target=wasm64-orbit", "--backend=llvm", cwd=project, code=2).stderr)
+        self.assertIn("Unknown target", self.run_cli("build", "--target=arm", cwd=project, code=2).stderr)
 
     def test_init_conflict_is_unchanged(self):
         (self.cwd / "src").mkdir()

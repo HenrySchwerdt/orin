@@ -253,7 +253,7 @@ export class StmtChecker {
       },
     }
     this.ex.fx.pendLet = "";
-    if (isVoid(t)) {
+    if (isVoid(t) && !this.ex.fx.inst) {
       return Err(diag("E0400", init.span, "cannot bind a `void` value to a variable"));
     }
     if (this.ex.fx.declaredInScope(name.name)) {
@@ -358,7 +358,15 @@ export class StmtChecker {
           },
         }
         if (isVoid(r.ty)) {
-          return Err(diag("E0400", e.span, "cannot return a value of type `void`"));
+          if (!this.ex.fx.inst) {
+            return Err(diag("E0400", e.span, "cannot return a value of type `void`"));
+          }
+          // an instance with `T = void` (ADR-0040): `return f();` is `f(); return;`
+          this.ex.fx.retSeen = Some(TyVoid);
+          return Ok(StmtRes {
+            stmt: HBlockStmt(HBlock { stmts: [HExprStmt(r), HReturn(None)] }),
+            div: true,
+          });
         }
         this.ex.fx.retSeen = Some(r.ty);
         return Ok(StmtRes { stmt: HReturn(Some(r)), div: true });
@@ -390,9 +398,20 @@ export class StmtChecker {
       },
       Some(e) => {
         if (isVoid(this.ex.fx.ret)) {
-          return Err(
-            diag("E0400", e.span, "cannot return a value from a function returning `void`"),
-          );
+          if (!this.ex.fx.inst) {
+            let d = diag("E0400", e.span, "cannot return a value from a function returning `void`");
+            d.notes.push("declare the result type, e.g. `function f(x: int): int`");
+            return Err(d);
+          }
+          if (!isMutRetMode(this.ex.fx.fmode)) {
+            // an instance with `T = void` (ADR-0040): `return f();` is `f(); return;`
+            const vr = this.ex.expect(e, TyVoid)?;
+            const rs = this.stmtReturn(span, None)?;
+            return Ok(StmtRes {
+              stmt: HBlockStmt(HBlock { stmts: [HExprStmt(vr), rs.stmt] }),
+              div: true,
+            });
+          }
         }
         const r = this.ex.expect(e, this.ex.fx.ret)?;
         if (isMutRetMode(this.ex.fx.fmode)) {
