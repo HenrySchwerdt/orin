@@ -248,7 +248,7 @@ def stepAC (np : Nat) (sg : List Sig) (a : AState) (d f : Nat) (args : List Nat)
   match stepCall sg np a.ls d f args with
   | none => none
   | some ls' =>
-    if args.any (hasHole a.holes) || hasHole a.holes d then none else some ⟨ls', a.holes⟩
+    if a.holes.isEmpty then some ⟨ls', a.holes⟩ else none
 
 /-- Loop invariant search: from the head state `b`, run the body, join the result into the head
 state, and stop when the head state no longer changes (kinds only move up the join order, so a

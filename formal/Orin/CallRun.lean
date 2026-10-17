@@ -88,7 +88,7 @@ theorem Cont.nil_inv (h : Cont sg np E a .nil) :
   | call _ _ _ => cases hc
   | weak hF _ ih =>
     obtain ⟨b, hb, hi⟩ := ih hc
-    exact ⟨b, hb, fun ext s hI => hi ext s (hI.weaken hF)⟩
+    exact ⟨b, hb, fun ext s hI => hi ext s (hI.weaken hF.1)⟩
 
 theorem Cont.call_inv {d f : Nat} {args : List Nat} {k : Code}
     (h : Cont sg np E a (.call d f args k)) :
@@ -103,7 +103,7 @@ theorem Cont.call_inv {d f : Nat} {args : List Nat} {k : Code}
   | call hs hk _ => cases hc; exact ⟨_, _, hs, hk, fun _ _ h => h⟩
   | weak hF _ ih =>
     obtain ⟨b, a1, hs, hk, hi⟩ := ih hc
-    exact ⟨b, a1, hs, hk, fun ext s hI => hi ext s (hI.weaken hF)⟩
+    exact ⟨b, a1, hs, hk, fun ext s hI => hi ext s (hI.weaken hF.1)⟩
 
 end inv
 
@@ -150,7 +150,6 @@ theorem stepAC_spec {np : Nat} {sg : List Sig} {b a1 : AState} {d f : Nat} {args
     simp only at h
     split at h
     · cases h
-    · cases h
       unfold stepCall at hc
       cases hs : sg[f]? with
       | none => rw [hs] at hc; simp at hc
@@ -162,6 +161,7 @@ theorem stepAC_spec {np : Nat} {sg : List Sig} {b a1 : AState} {d f : Nat} {args
           cases hc
           exact ⟨sig, rfl, hcond.1, hcond.2.1, hcond.2.2.2.1, hcond.2.2.2.2, by simp [retK]⟩
         · simp at hc
+    · cases h
 
 theorem fcheck_cont {sg : List Sig} {f : Fn} (h : fcheck sg f = true) :
     f.params.length ≤ f.n ∧
@@ -176,7 +176,7 @@ theorem fcheck_cont {sg : List Sig} {f : Fn} (h : fcheck sg f = true) :
     rw [hc] at hm
     simp only [Bool.and_eq_true, decide_eq_true_eq] at hm
     have h1 := chk_cont (np := f.params.length) (sg := sg) f.code f.entry af .nil
-      (retPred f.ret f.retRef) hc (Cont.nil hm.2)
+      (retPred f.ret f.retRef) (HU_nil _) hc (Cont.nil hm.2)
     rwa [Code.app_nil] at h1
 
 /-! ### the ghost invariant -/

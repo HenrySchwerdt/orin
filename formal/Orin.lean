@@ -19,6 +19,7 @@ import Orin.Sim6
 import Orin.Sim7
 import Orin.Weaken
 import Orin.SimArr
+import Orin.Hole
 import Orin.Sound
 import Orin.Top
 import Orin.Examples
