@@ -2423,6 +2423,7 @@ enum { TASK_MSG = 480 };
 typedef struct {
     uint64_t tok;       /* the transfer token of the task body (a closure) */
     int trapped;        /* written by the task thread, read after the join */
+    uint64_t done_mon;  /* monitor whose word 1 becomes 1 when the task ends, by return or trap (orin_rt_task_watch); 0 = none */
     char msg[TASK_MSG]; /* the trap message */
 } RtTask;
 static __thread RtTask *t_task;                        /* the task this thread runs, NULL on the main thread */
@@ -2463,6 +2464,16 @@ void orin_rt_heap_exit(void) {
 
 static int task_active(void) { return t_task != NULL; }
 
+/* The task is over (its heap is gone): publish it for a timed join. Only L0 calls; the joiner frees the monitor after the join. */
+static void task_signal_done(void) {
+    uint64_t m = t_task->done_mon;
+    if (!m) return;
+    orin_platform_monitor_lock((int64_t)m);
+    orin_platform_monitor_set((int64_t)m, 1, 1);
+    orin_platform_monitor_notify((int64_t)m, 0, 1);
+    orin_platform_monitor_unlock((int64_t)m);
+}
+
 /* Called by orin_trap on a task thread: record the message, end the task, never return. */
 static void task_trap(const char *msg) {
     size_t n = 0;
@@ -2471,6 +2482,7 @@ static void task_trap(const char *msg) {
     t_task->msg[n] = 0;
     t_task->trapped = 1;
     orin_rt_heap_exit();
+    task_signal_done();
     orin_platform_thread_exit();
 }
 
@@ -2482,12 +2494,14 @@ static void task_main(void *p) {
     ((void (*)(OrinObj *))(uintptr_t)clo->slots[0])(ORIN_REF(clo->slots[1])); /* closure layout: docs/mir.md v1.3 */
     orin_release(box);
     orin_rt_heap_exit();
+    task_signal_done();
 }
 
 uint64_t orin_rt_task_spawn(uint64_t tok) {
     RtTask *t = (RtTask *)xmalloc(sizeof *t);
     t->tok = tok;
     t->trapped = 0;
+    t->done_mon = 0;
     t->msg[0] = 0;
     int64_t h = orin_platform_thread_create(task_main, t);
     if (!h) {
@@ -2509,6 +2523,11 @@ uint64_t orin_rt_task_join(uint64_t h) {
     t_joined_msg[TASK_MSG] = 0;
     orin_platform_free(t);
     return st;
+}
+
+/* Called by a task on its own thread (std:task `spawn`): word 1 of monitor m is set to 1 and queue 0 notified when the task ends. */
+void orin_rt_task_watch(uint64_t m) {
+    if (t_task) t_task->done_mon = m;
 }
 
 OrinObj *orin_rt_task_message(void) {
@@ -2535,6 +2554,14 @@ void orin_mon_lock(uint64_t m) { mon_check(orin_platform_monitor_lock((int64_t)m
 void orin_mon_unlock(uint64_t m) { mon_check(orin_platform_monitor_unlock((int64_t)m)); }
 void orin_mon_wait(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_wait((int64_t)m, (int)c)); }
 void orin_mon_notify_all(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_notify((int64_t)m, (int)c, 1)); }
+/* Timed wait on an absolute CLOCK_MONOTONIC deadline in milliseconds: 1 when it passed, 0 when notified (or spurious). */
+uint64_t orin_mon_wait_until(uint64_t m, uint64_t c, uint64_t deadline) {
+    if (deadline > (uint64_t)INT64_MAX) deadline = (uint64_t)INT64_MAX;
+    int rc = orin_platform_monitor_wait_until((int64_t)m, (int)c, (int64_t)deadline);
+    if (rc == ORIN_PLATFORM_WAIT_TIMEOUT) return 1;
+    mon_check(rc);
+    return 0;
+}
 void orin_mon_notify_one(uint64_t m, uint64_t c) { mon_check(orin_platform_monitor_notify((int64_t)m, (int)c, 0)); }
 uint64_t orin_mon_get(uint64_t m, uint64_t i) {
     uint64_t v = 0;
