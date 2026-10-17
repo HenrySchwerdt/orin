@@ -74,6 +74,8 @@ server. It finds `orin` on PATH; see [install.md](install.md#editor-vs-code).
 ## Where next
 
 - [Tutorial](tutorial/README.md)
+- [notes-service](../examples/projects/notes-service/README.md): a small concurrent JSON service with unit tests, a project to copy
+- [wc](../examples/projects/wc/README.md): a command-line tool (flags, stdin, exit codes) with unit tests, a project to copy
 - [Language reference](reference/README.md)
 - [Standard library](std.md)
 - [Orin for TypeScript developers](ts-developers.md)

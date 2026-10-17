@@ -31,8 +31,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join("build", "tests")
 RUN_TIMEOUT = 10
 WASM = "wasm64-orbit"
-WASM_CFLAGS = ["--target=wasm64-unknown-unknown", "-mbulk-memory", "-ffreestanding", "-nostdlib"]
+# `-D__thread=...`: the runtime keeps per-task state in __thread objects; one WebAssembly thread runs every task, so the L0 switches
+# that state by copying one block. Putting every __thread object into the section orin_tls makes it one contiguous block with the
+# linker symbols __start_orin_tls / __stop_orin_tls (ADR-0055; no atomics, no wasm-ld TLS, which is broken for non-shared memory).
+WASM_TLS = '-D__thread=__attribute__((section("orin_tls")))'
+WASM_CFLAGS = ["--target=wasm64-unknown-unknown", "-mbulk-memory", "-ffreestanding", "-nostdlib", WASM_TLS]
 WASM_LINK = ["-Wl,--no-entry", "-Wl,--stack-first", "-Wl,-z,stack-size=1048576"]
+WASM_LIMIT = "wasm64-orbit: "  # prefix of the line the WebAssembly L0 prints when it hits a limit of running tasks one at a time
 WASM_UNAVAILABLE = "which the wasm64-orbit target does not provide"  # the compile error for such an effect
 COMPILE_TIMEOUT = 120
 
@@ -258,6 +263,13 @@ def run_test(args, label, test):
     for w in want_stderr:
         if w not in err:
             problems.append("stderr does not contain %r" % w)
+    if problems and args.target == WASM:
+        # The L0 ends the module with a line `wasm64-orbit: <reason>` when the program needs something one WebAssembly thread
+        # cannot do: two tasks running at once (a wait nobody queued can satisfy), a task that traps (no unwinding to its join).
+        # A test that then differs from its expectation is SKIP with that reason; a test that still matches passes for real.
+        for line in err.splitlines():
+            if line.startswith(WASM_LIMIT):
+                return tag, None, line[len(WASM_LIMIT):]
     if problems:
         if err.strip():
             problems.append("stderr head:\n" + head(err, 8))
