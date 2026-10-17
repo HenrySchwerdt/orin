@@ -19,6 +19,8 @@ int orin_platform_dir_list(const char *path, size_t plen,
     each(ctx, "a", 1, 0);
     return error_code;
 }
+/* The unwrap helpers are Orin functions now ($rt/leaf.or, ADR-0052 R3d.2); this test reads the payload slot directly. */
+static uint64_t orin_res_unwrap(OrinObj *r) { return orin_tag(r) == 0 ? orin_struct_get(r, 0) : 0; }
 static int failures;
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); failures++; } } while (0)
 static int cleanup_fd;
