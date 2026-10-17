@@ -13,15 +13,24 @@ Build and audit: `./check.sh` (builds, rejects `sorry`/`axiom`/..., prints `#pri
   the callee runs on a fresh frame whose anchors are the caller's counted locals (`inv_entry`); while it
   runs nothing the caller reaches changes (`Frozen`, `frozen_step`); on return the caller's relation
   is re-established (`inv_ret`); `good_step` is the invariant over the whole stack.
+* `Hole.lean`, `Typed.lean`, `TypedOps.lean`, `TypedSound.lean`, `TypedTop.lean`: struct shapes.
+  A field access out of range is `ill` in the machine (array out of range stays a `trap`). A fresh
+  struct opens one hole per slot (`alloc`); every open hole's owner is `Unique` (`HU`). The type
+  pass `tcode` plus `check` gives `check_sound_ill`: no reachable step is `ill` or `bad`. The
+  invariant `TInv` (typed locals, typed objects with a ghost `hty`, null reference slots only in
+  open holes) is carried by `sound_stepT` along the same `Cont` derivation as `sound_step`.
+  The model is stricter than the verifier: a call needs an empty hole set, arrays hold scalars.
 * `Examples.lean`, `CallExamples.lean`: accepted and rejected programs by kernel evaluation.
 
 ## Not covered (stated, not proved)
 
-* Struct shapes (static field counts): a field access out of range is a `trap`, which is safe; the
-  model does not use shapes to rule it out.
 * The entry function of `prog_sound` takes scalar and borrowed parameters only.
 * A call demotes every `Unique` local to `Owned` (stricter than `compiler/verify`); callee locals left
   over at return are leaked (never freed, so never a use after free).
 * Closures, vtables, strings, floats; the text format of `Exec.lean` and `tools/gen_mir_fragment.py`
   still cover the call-free fragment (the differential test is unchanged).
-* `ill` (null or type confusion) is not excluded.
+* `ill` (null or type confusion) is excluded only by `check_sound_ill` for one function without calls;
+  `prog_sound` (calls) still excludes only `bad`. Extending the type pass to calls needs signature
+  types, a typed call frame and a typed `StkI`.
+* The type pass `tcode` has no counterpart in `compiler/verify`; it takes the shape table and local
+  types as given (no inference).

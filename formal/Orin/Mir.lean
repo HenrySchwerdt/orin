@@ -43,7 +43,8 @@ inductive MI where
   | release (x : Nat)
   /-- allocation of a fresh count-1 object with `n` scalar-zero slots; `d` becomes `Unique`.
   `IStructNew d slots` is the macro `Code.structNew`: `alloc d |slots|` followed by one
-  `setField d i yᵢ` per operand (operands consumed left to right). -/
+  `putField d i yᵢ` per operand (operands consumed left to right; the checker opens a hole for every
+  slot of a fresh object and each `putField` closes one). -/
   | alloc (d n : Nat)
   /-- `IGetField d o i`; `isRef` is the static class of `d` (reference: borrowed result;
   scalar: plain value) -/
@@ -93,7 +94,7 @@ def app : Code → Code → Code
 /-- operands stored into slots `i, i+1, …` of the fresh object `d` -/
 def storeAll (d : Nat) : Nat → List Nat → Code → Code
   | _, [], k => k
-  | i, y :: ys, k => .op (.setField d i y) (storeAll d (i + 1) ys k)
+  | i, y :: ys, k => .op (.putField d i y) (storeAll d (i + 1) ys k)
 
 /-- `IStructNew d ys`: allocate, then move each operand into its slot. -/
 def structNew (d : Nat) (ys : List Nat) (k : Code) : Code :=
@@ -132,7 +133,7 @@ def opAllocN (s : St) (d n : Nat) : Res St :=
 destination must receive a scalar, a reference destination a reference (`ill` otherwise: type
 confusion, or a read of an emptied/`hole` slot, which the hole discipline of the verifier is
 meant to exclude). -/
-def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
+def opGetFieldE (oob : Res St) (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
   if d < s.locals.length ∧ o < s.locals.length then
     match s.get o with
     | .int _ => .ill
@@ -141,7 +142,7 @@ def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
       | none => .bad .dead
       | some ob =>
         match ob.fields[i]? with
-        | none => .trap
+        | none => oob
         | some w =>
           match isRef, w with
           | false, .ref _ => .ill
@@ -149,9 +150,14 @@ def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St :=
           | _, _ => .ok (s.setL d w)
   else .ill
 
+/-- struct field read: an index at or beyond the arity of the struct is an ill-shaped access
+(`ill`; the shape check of `Typed.lean` rules it out).  Array element reads (`opArrayGet`) use the
+same lookup with a bounds *trap* instead. -/
+def opGetField (s : St) (d o i : Nat) (isRef : Bool) : Res St := opGetFieldE .ill s d o i isRef
+
 /-- `ISetField`/`IPutField`: in-place update of a count-1 object; the stored value is
 *moved* (no retain); the old slot value is released. -/
-def opSetField (s : St) (x i v : Nat) : Res St :=
+def opSetFieldE (oob : Res St) (s : St) (x i v : Nat) : Res St :=
   if x < s.locals.length ∧ v < s.locals.length then
     match s.get x with
     | .int _ => .ill
@@ -161,12 +167,15 @@ def opSetField (s : St) (x i v : Nat) : Res St :=
       | some ob =>
         if ob.rc ≠ 1 then .bad .shared else
         match ob.fields[i]? with
-        | none => .trap
+        | none => oob
         | some old =>
           .ok { s.clr v with
                 heap := s.heap.setObj l { ob with fields := ob.fields.set i (s.get v) },
                 pending := old :: s.pending }
   else .ill
+
+/-- struct slot store: an index at or beyond the arity is `ill` (array stores trap instead). -/
+def opSetField (s : St) (x i v : Nat) : Res St := opSetFieldE .ill s x i v
 
 /-- `ITakeField`: the (reference) slot is emptied (`int 0`), its value moves into `d`. -/
 def opTakeField (s : St) (d x i : Nat) : Res St :=
@@ -179,7 +188,7 @@ def opTakeField (s : St) (d x i : Nat) : Res St :=
       | some ob =>
         if ob.rc ≠ 1 then .bad .shared else
         match ob.fields[i]? with
-        | none => .trap
+        | none => .ill
         | some old =>
           match old with
           | .int _ => .ill
@@ -196,7 +205,7 @@ def opArrayGet (s : St) (d a i : Nat) (isRef : Bool) : Res St :=
     match s.get i with
     | .ref _ => .ill
     | .int n =>
-      if 0 ≤ n then opGetField s d a n.toNat isRef
+      if 0 ≤ n then opGetFieldE .trap s d a n.toNat isRef
       else if d < s.locals.length ∧ a < s.locals.length then
         match s.get a with
         | .int _ => .ill
@@ -212,7 +221,7 @@ def opArraySet (s : St) (x i v : Nat) : Res St :=
     match s.get i with
     | .ref _ => .ill
     | .int n =>
-      if 0 ≤ n then opSetField s x n.toNat v
+      if 0 ≤ n then opSetFieldE .trap s x n.toNat v
       else if x < s.locals.length ∧ v < s.locals.length then
         match s.get x with
         | .int _ => .ill
