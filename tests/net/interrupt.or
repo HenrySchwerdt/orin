@@ -16,12 +16,12 @@
 import { Host, useNet } from "std:host";
 import { Deadline, MonotonicInstant, milliseconds } from "std:time";
 import { Bytes, fromString } from "std:bytes";
-import { Scope, TaskHandle, CancelToken, Sender, channel, scopeNetDo, spawnNet, sleepUntil } from "std:task";
+import { Scope, TaskHandle, CancelToken, Sender, channel, scopeNet, spawnNet, sleepUntil } from "std:task";
 import {
   NetGrant, Listener, Stream, Peer, NetError, NetErrorKind, StreamReader, Fill, Filled, FillClosed, FillLimit, FillTimeout, FillError,
   RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError, Denied, Closed, Timeout, Cancelled, Reset, InvalidArgument, InvalidPeer, Os,
-  useListenerNet, useConnectionBeside, useAccepted, useConnection, withConnectionUntil, acceptDetached, dropAccepted, Accepted, portOf, recv, recvUntil,
-  sendAll, sendAllUntil, monotonicMillis
+  withListenerNet, withConnectionBeside, withAccepted, withConnection, withConnectionUntil, acceptDetached, dropAccepted, Accepted, portOf, recv, recvUntil,
+  sendAll, sendAllUntil, monotonicMillis, netErrorMessage
 } from "std:net";
 
 const DELAY: int = 200;
@@ -63,15 +63,21 @@ function fillName(f: Fill): string {
   };
 }
 
-// The monotonic clock in milliseconds, read through a scratch loopback connection.
+// A Result whose failure is reported as a Probe.
+function probeOf(r: Result<Probe, NetError>, what: string): Probe {
+  if (r.isOk()) {
+    return r.unwrap();
+  }
+  return Probe { what: what + ": " + netErrorMessage(r.unwrapErr()), t0: 0, t1: 0 };
+}
+
+// The monotonic clock in milliseconds, read through a scratch loopback connection (-1 when that fails).
 function nowMs(net: NetGrant): int {
-  const out: int[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 1, (ln: Listener, n: NetGrant) => {
-    useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (s: Stream, l2: Listener) => {
-      out.push(monotonicMillis(s));
-    });
+  const r = withListenerNet(net, "127.0.0.1", 0, 1, (ln: Listener, n: NetGrant) => {
+    const c = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (s: Stream, l2: Listener) => monotonicMillis(s));
+    return c.isOk() ? c.unwrap() : -1;
   });
-  return out.length > 0 ? out[0] : -1;
+  return r.isOk() ? r.unwrap() : -1;
 }
 
 function at(ms: int): Deadline {
@@ -96,42 +102,39 @@ function verdict(name: string, p: Probe, wantKind: string): string {
 
 // accept: bind, make one connection and take it (so that the queue is empty and the clock is at hand), then wait for another.
 function blockedAccept(net: NetGrant, starts: Sender<int>): Probe {
-  const out: Probe[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
-    useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
-      useAccepted(l2, milliseconds(2000), (a: Stream, p: Peer) => {});
+  const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+    const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
+      withAccepted(l2, milliseconds(2000), (a: Stream, p: Peer) => 0);
       const t0 = monotonicMillis(c);
       starts.send(t0);
-      const r = acceptDetached(l2, milliseconds(LONG));
+      const a = acceptDetached(l2, milliseconds(LONG));
       const t1 = monotonicMillis(c);
-      match (r) {
-        Ok(acc) => {
-          dropAccepted(acc);
-          out.push(Probe { what: "accepted", t0: t0, t1: t1 });
-        },
-        Err(e) => {
-          out.push(Probe { what: kindName(e.kind), t0: t0, t1: t1 });
-        }
+      if (a.isOk()) {
+        dropAccepted(a.unwrap());
+        return Probe { what: "accepted", t0: t0, t1: t1 };
       }
+      return Probe { what: kindName(a.unwrapErr().kind), t0: t0, t1: t1 };
     });
+    return probeOf(q, "connect");
   });
-  return out.length > 0 ? out[0] : Probe { what: "no listener", t0: 0, t1: 0 };
+  return probeOf(r, "listen");
 }
 
 // recv: the server side of an idle connection waits for bytes the client never sends.
 function blockedRecv(net: NetGrant, starts: Sender<int>): Probe {
-  const out: Probe[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
-    useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
-      useAccepted(l2, milliseconds(2000), (a: Stream, p: Peer) => {
-        const t0 = monotonicMillis(a);
+  const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+    const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
+      const a = withAccepted(l2, milliseconds(2000), (s: Stream, p: Peer) => {
+        const t0 = monotonicMillis(s);
         starts.send(t0);
-        const r = recv(a, 100, milliseconds(LONG));
-        out.push(Probe { what: recvName(r), t0: t0, t1: monotonicMillis(a) });
+        const got = recv(s, 100, milliseconds(LONG));
+        return Probe { what: recvName(got), t0: t0, t1: monotonicMillis(s) };
       });
+      return probeOf(a, "accept");
     });
+    return probeOf(q, "connect");
   });
-  return out.length > 0 ? out[0] : Probe { what: "no connection", t0: 0, t1: 0 };
+  return probeOf(r, "listen");
 }
 
 function megabytes(n: usize): Bytes {
@@ -139,7 +142,7 @@ function megabytes(n: usize): Bytes {
   while (block.length < 65536) {
     block = block + block;
   }
-  let b = fromString(block);
+  const b = fromString(block);
   let total = b;
   let i: usize = 1;
   while (i < n * 16) {
@@ -151,26 +154,27 @@ function megabytes(n: usize): Bytes {
 
 // send: the server side writes 64 MB to a client that never reads.
 function blockedSend(net: NetGrant, starts: Sender<int>): Probe {
-  const out: Probe[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
-    useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
-      useAccepted(l2, milliseconds(2000), (a: Stream, p: Peer) => {
-        const t0 = monotonicMillis(a);
+  const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+    const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
+      const a = withAccepted(l2, milliseconds(2000), (s: Stream, p: Peer) => {
+        const t0 = monotonicMillis(s);
         starts.send(t0);
-        const r = sendAll(a, megabytes(64), milliseconds(LONG));
-        const t1 = monotonicMillis(a);
-        out.push(Probe { what: r.isOk() ? "sent" : kindName(r.unwrapErr().kind), t0: t0, t1: t1 });
+        const sent = sendAll(s, megabytes(64), milliseconds(LONG));
+        const t1 = monotonicMillis(s);
+        return Probe { what: sent.isOk() ? "sent" : kindName(sent.unwrapErr().kind), t0: t0, t1: t1 };
       });
+      return probeOf(a, "accept");
     });
+    return probeOf(q, "connect");
   });
-  return out.length > 0 ? out[0] : Probe { what: "no connection", t0: 0, t1: 0 };
+  return probeOf(r, "listen");
 }
 
 // Fills the accept queue of a backlog-1 listener until a connect times out; true when one did (the queue swallows SYNs).
 function fillQueue(net: NetGrant, port: int): bool {
   let i: int = 0;
   while (i < 8) {
-    const r = useConnection(net, "127.0.0.1", port, milliseconds(250), (s: Stream) => {});
+    const r = withConnection(net, "127.0.0.1", port, milliseconds(250), (s: Stream) => 0);
     if (r.isErr()) {
       return r.unwrapErr().kind == Timeout;
     }
@@ -181,21 +185,19 @@ function fillQueue(net: NetGrant, port: int): bool {
 
 // connect: to a listener whose queue is full. what is "skipped" where the OS does not drop the SYN.
 function blockedConnect(net: NetGrant, starts: Sender<int>): Probe {
-  const out: Probe[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 1, (bh: Listener, n: NetGrant) => {
+  const r = withListenerNet(net, "127.0.0.1", 0, 1, (bh: Listener, n: NetGrant) => {
     const port = portOf(bh);
     if (!fillQueue(n, port)) {
       starts.send(nowMs(n));
-      out.push(Probe { what: "skipped", t0: 0, t1: 0 });
-    } else {
-      const t0 = nowMs(n);
-      starts.send(t0);
-      const r = useConnection(n, "127.0.0.1", port, milliseconds(LONG), (s: Stream) => {});
-      const t1 = nowMs(n);
-      out.push(Probe { what: r.isOk() ? "connected" : kindName(r.unwrapErr().kind), t0: t0, t1: t1 });
+      return Probe { what: "skipped", t0: 0, t1: 0 };
     }
+    const t0 = nowMs(n);
+    starts.send(t0);
+    const c = withConnection(n, "127.0.0.1", port, milliseconds(LONG), (s: Stream) => 0);
+    const t1 = nowMs(n);
+    return Probe { what: c.isOk() ? "connected" : kindName(c.unwrapErr().kind), t0: t0, t1: t1 };
   });
-  return out.length > 0 ? out[0] : Probe { what: "no listener", t0: 0, t1: 0 };
+  return probeOf(r, "listen");
 }
 
 // ---------------------------------------------------------------------------------------------------- cases
@@ -203,8 +205,7 @@ function blockedConnect(net: NetGrant, starts: Sender<int>): Probe {
 // One probe task and one canceller in a scope; the canceller sleeps DELAY ms after the probe's start and cancels the scope.
 function cancelCase(net: NetGrant, name: string, which: int): string {
   const ch = channel<int>(2);
-  const result: string[] = [];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
     const tok = sc.token();
     const rx = ch.rx;
     const tx = ch.tx;
@@ -219,33 +220,27 @@ function cancelCase(net: NetGrant, name: string, which: int): string {
     const p = probe.join();
     const cancelled = stopper.join();
     if (p.what == "skipped") {
-      result.push(name + ": skipped (this OS does not drop a SYN for a full accept queue)");
-    } else {
-      result.push(verdict(name, p, "Cancelled") + (cancelled ? "" : " (the token was already cancelled)"));
+      return name + ": skipped (this OS does not drop a SYN for a full accept queue)";
     }
+    return verdict(name, p, "Cancelled") + (cancelled ? "" : " (the token was already cancelled)");
   });
-  return result.length > 0 ? result[0] : name + ": FAIL no result";
 }
 
 // A task spawned into a cancelled scope fails at once, also against a listener that has a connection waiting.
 function precancelled(net: NetGrant): string {
-  const result: string[] = [];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
     sc.cancel();
     const h = spawnNet(sc, g, (t: NetGrant) => {
-      const out: string[] = [];
-      useListenerNet(t, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
-        const c = useConnection(n, "127.0.0.1", portOf(ln), milliseconds(LONG), (s: Stream) => {});
-        out.push("connect " + (c.isErr() ? kindName(c.unwrapErr().kind) : "ok"));
+      const r = withListenerNet(t, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+        const c = withConnection(n, "127.0.0.1", portOf(ln), milliseconds(LONG), (s: Stream) => 0);
         const a = acceptDetached(ln, milliseconds(LONG));
-        out.push("accept " + (a.isErr() ? kindName(a.unwrapErr().kind) : "ok"));
+        return "connect " + (c.isErr() ? kindName(c.unwrapErr().kind) : "ok") + ", accept " + (a.isErr() ? kindName(a.unwrapErr().kind) : "ok");
       });
-      return out.length == 2 ? out[0] + ", " + out[1] : "listener failed";
+      return r.isOk() ? r.unwrap() : "no listener";
     });
     const r = h.join();
-    result.push(r == "connect Cancelled, accept Cancelled" ? "precancelled: ok" : "precancelled: FAIL " + r);
+    return r == "connect Cancelled, accept Cancelled" ? "precancelled: ok" : "precancelled: FAIL " + r;
   });
-  return result[0];
 }
 
 // nested: a task of the outer scope opens an inner scope with a probe and a canceller of the INNER scope, while the outer scope has
@@ -254,8 +249,7 @@ function precancelled(net: NetGrant): string {
 function nested(net: NetGrant): string {
   const chOuter = channel<int>(2);
   const chInner = channel<int>(2);
-  const result: string[] = [];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
     const outerTok = sc.token();
     const rxOuter = chOuter.rx;
     const txOuter = chOuter.tx;
@@ -263,8 +257,7 @@ function nested(net: NetGrant): string {
     const txInner = chInner.tx;
     const outerProbe = spawnNet(sc, g, (t: NetGrant) => blockedRecv(t, txOuter));
     const middle = spawnNet(sc, g, (t: NetGrant) => {
-      const inner: Probe[] = [];
-      scopeNetDo(t, (sc2: Scope, g2: NetGrant) => {
+      return scopeNet(t, (sc2: Scope, g2: NetGrant) => {
         const innerTok = sc2.token();
         const innerProbe = spawnNet(sc2, g2, (u: NetGrant) => blockedAccept(u, txInner));
         const innerStop = spawnNet(sc2, g2, (u: NetGrant) => {
@@ -272,134 +265,135 @@ function nested(net: NetGrant): string {
           sleepUntil(at(t0 + DELAY));
           return innerTok.cancel();
         });
-        inner.push(innerProbe.join());
+        const p = innerProbe.join();
         innerStop.join();
+        return p;
       });
-      return inner[0];
     });
     const outerStart = rxOuter.recv().unwrapOr(0);
     const innerResult = middle.join();
     sleepUntil(at(outerStart + 3 * DELAY));
     const outerSet = outerTok.cancel();
     const outerResult = outerProbe.join();
-    result.push(innerResult.what == "Cancelled" ? "nested inner: ok" : "nested inner: FAIL " + innerResult.what);
     const stayed = outerResult.t1 - outerResult.t0;
-    result.push(outerResult.what == "Cancelled" && stayed >= 3 * DELAY - 40 && stayed <= 3 * DELAY + WAKE_SLACK ? "nested outer: ok"
-      : "nested outer: FAIL " + outerResult.what + " after " + stayed.toString() + " ms (it must outlast the inner cancel and end at the outer one)");
-    result.push(outerSet ? "nested token: ok" : "nested token: FAIL already set");
+    const l1 = innerResult.what == "Cancelled" ? "nested inner: ok" : "nested inner: FAIL " + innerResult.what;
+    const l2 = outerResult.what == "Cancelled" && stayed >= 3 * DELAY - 40 && stayed <= 3 * DELAY + WAKE_SLACK ? "nested outer: ok"
+      : "nested outer: FAIL " + outerResult.what + " after " + stayed.toString() + " ms (it must outlast the inner cancel and end at the outer one)";
+    const l3 = outerSet ? "nested token: ok" : "nested token: FAIL already set";
+    return l1 + "\n" + l2 + "\n" + l3;
   });
-  return result[0] + "\n" + result[1] + "\n" + result[2];
 }
 
 // trickle: a peer that sends one byte every 25 ms; readExactUntil of 500 bytes with one 300 ms deadline ends at the deadline.
 function trickleFeeder(net: NetGrant, port: int): bool {
-  const r = useConnection(net, "127.0.0.1", port, milliseconds(2000), (c: Stream) => {
+  const r = withConnection(net, "127.0.0.1", port, milliseconds(2000), (c: Stream) => {
     const base = monotonicMillis(c);
     let i: int = 0;
     while (i < 200) {
       if (sendAll(c, fromString("x"), milliseconds(1000)).isErr()) {
-        return;
+        return false;
       }
       i += 1;
       sleepUntil(at(base + 25 * i));
     }
+    return true;
   });
   return r.isOk();
 }
 
+function trickleReader(s: Stream): string {
+  let rd = new StreamReader(1024);
+  const t0 = monotonicMillis(s);
+  const f = rd.readExactUntil(s, 500, at(t0 + 300));
+  const dt = monotonicMillis(s) - t0;
+  const got = rd.buffered().length();
+  // then recvUntil in a loop on a second deadline: many small chunks, one deadline
+  const t1 = monotonicMillis(s);
+  const end = at(t1 + 300);
+  let chunks: int = 0;
+  let last = "data";
+  while (last == "data") {
+    last = recvName(recvUntil(s, 64, end));
+    if (last == "data") {
+      chunks += 1;
+    }
+  }
+  const dt2 = monotonicMillis(s) - t1;
+  if (fillName(f) != "Timeout") {
+    return "trickle: FAIL readExactUntil gave " + fillName(f);
+  }
+  if (dt < 280 || dt > 300 + WAKE_SLACK) {
+    return "trickle: FAIL readExactUntil ended after " + dt.toString() + " ms (deadline 300)";
+  }
+  if (got < 3 || got >= 500) {
+    return "trickle: FAIL " + got.toString() + " bytes buffered";
+  }
+  if (last != "Timeout" || dt2 < 280 || dt2 > 300 + WAKE_SLACK || chunks < 3) {
+    return "trickle: FAIL recvUntil loop ended " + last + " after " + dt2.toString() + " ms with " + chunks.toString() + " chunks";
+  }
+  return "trickle: ok";
+}
+
 function trickle(net: NetGrant): string {
-  const result: string[] = [];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
-    const wire = useListenerNet(g, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
+    const wire = withListenerNet(g, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
       const port = portOf(ln);
       const feeder = spawnNet(sc, n, (t: NetGrant) => trickleFeeder(t, port));
-      useAccepted(ln, milliseconds(2000), (s: Stream, p: Peer) => {
-        let rd = new StreamReader(1024);
-        const t0 = monotonicMillis(s);
-        const f = rd.readExactUntil(s, 500, at(t0 + 300));
-        const dt = monotonicMillis(s) - t0;
-        const got = rd.buffered().length();
-        // then recvUntil in a loop on a second deadline: many small chunks, one deadline
-        const t1 = monotonicMillis(s);
-        const end = at(t1 + 300);
-        let chunks: int = 0;
-        let last = "data";
-        while (last == "data") {
-          last = recvName(recvUntil(s, 64, end));
-          if (last == "data") {
-            chunks += 1;
-          }
-        }
-        const dt2 = monotonicMillis(s) - t1;
-        if (fillName(f) != "Timeout") {
-          result.push("trickle: FAIL readExactUntil gave " + fillName(f));
-        } else if (dt < 280 || dt > 300 + WAKE_SLACK) {
-          result.push("trickle: FAIL readExactUntil ended after " + dt.toString() + " ms (deadline 300)");
-        } else if (got < 3 || got >= 500) {
-          result.push("trickle: FAIL " + got.toString() + " bytes buffered");
-        } else if (last != "Timeout" || dt2 < 280 || dt2 > 300 + WAKE_SLACK || chunks < 3) {
-          result.push("trickle: FAIL recvUntil loop ended " + last + " after " + dt2.toString() + " ms with " + chunks.toString() + " chunks");
-        } else {
-          result.push("trickle: ok");
-        }
-      });
+      const a = withAccepted(ln, milliseconds(2000), (s: Stream, p: Peer) => trickleReader(s));
       feeder.join();
+      return a.isOk() ? a.unwrap() : "trickle: FAIL accept: " + netErrorMessage(a.unwrapErr());
     });
-    if (wire.isErr()) {
-      result.push("trickle: FAIL no listener");
-    }
+    return wire.isOk() ? wire.unwrap() : "trickle: FAIL no listener";
   });
-  return result.length > 0 ? result[0] : "trickle: FAIL no result";
 }
 
 // senddeadline: a peer that reads nothing; sendAllUntil of 64 MB with one 300 ms deadline.
 function sendDeadline(net: NetGrant): string {
-  const out: string[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
-    useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
-      useAccepted(l2, milliseconds(2000), (a: Stream, p: Peer) => {
-        const t0 = monotonicMillis(a);
-        const r = sendAllUntil(a, megabytes(64), at(t0 + 300));
-        const dt = monotonicMillis(a) - t0;
-        if (r.isOk() || r.unwrapErr().kind != Timeout) {
-          out.push("senddeadline: FAIL " + (r.isOk() ? "sent everything" : kindName(r.unwrapErr().kind)));
-        } else if (dt < 280 || dt > 300 + WAKE_SLACK) {
-          out.push("senddeadline: FAIL ended after " + dt.toString() + " ms (deadline 300)");
-        } else {
-          out.push("senddeadline: ok");
+  const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+    const q = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (c: Stream, l2: Listener) => {
+      const a = withAccepted(l2, milliseconds(2000), (s: Stream, p: Peer) => {
+        const t0 = monotonicMillis(s);
+        const sent = sendAllUntil(s, megabytes(64), at(t0 + 300));
+        const dt = monotonicMillis(s) - t0;
+        if (sent.isOk() || sent.unwrapErr().kind != Timeout) {
+          return "senddeadline: FAIL " + (sent.isOk() ? "sent everything" : kindName(sent.unwrapErr().kind));
         }
+        if (dt < 280 || dt > 300 + WAKE_SLACK) {
+          return "senddeadline: FAIL ended after " + dt.toString() + " ms (deadline 300)";
+        }
+        return "senddeadline: ok";
       });
+      return a.isOk() ? a.unwrap() : "senddeadline: FAIL accept";
     });
+    return q.isOk() ? q.unwrap() : "senddeadline: FAIL connect";
   });
-  return out.length > 0 ? out[0] : "senddeadline: FAIL no result";
+  return r.isOk() ? r.unwrap() : "senddeadline: FAIL listen";
 }
 
 // connectdeadline: connect to a listener with a full queue, absolute deadline 300 ms away.
 function connectDeadline(net: NetGrant): string {
-  const out: string[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 1, (bh: Listener, n: NetGrant) => {
+  const r = withListenerNet(net, "127.0.0.1", 0, 1, (bh: Listener, n: NetGrant) => {
     const port = portOf(bh);
     if (!fillQueue(n, port)) {
-      out.push("connectdeadline: skipped (this OS does not drop a SYN for a full accept queue)");
-    } else {
-      const t0 = nowMs(n);
-      const r = withConnectionUntil(n, "127.0.0.1", port, at(t0 + 300), (s: Stream) => 0);
-      const dt = nowMs(n) - t0;
-      if (r.isOk() || r.unwrapErr().kind != Timeout) {
-        out.push("connectdeadline: FAIL " + (r.isOk() ? "connected" : kindName(r.unwrapErr().kind)));
-      } else if (dt < 280 || dt > 300 + WAKE_SLACK) {
-        out.push("connectdeadline: FAIL ended after " + dt.toString() + " ms (deadline 300)");
-      } else {
-        out.push("connectdeadline: ok");
-      }
+      return "connectdeadline: skipped (this OS does not drop a SYN for a full accept queue)";
     }
+    const t0 = nowMs(n);
+    const c = withConnectionUntil(n, "127.0.0.1", port, at(t0 + 300), (s: Stream) => 0);
+    const dt = nowMs(n) - t0;
+    if (c.isOk() || c.unwrapErr().kind != Timeout) {
+      return "connectdeadline: FAIL " + (c.isOk() ? "connected" : kindName(c.unwrapErr().kind));
+    }
+    if (dt < 280 || dt > 300 + WAKE_SLACK) {
+      return "connectdeadline: FAIL ended after " + dt.toString() + " ms (deadline 300)";
+    }
+    return "connectdeadline: ok";
   });
-  return out.length > 0 ? out[0] : "connectdeadline: FAIL no result";
+  return r.isOk() ? r.unwrap() : "connectdeadline: FAIL listen";
 }
 
 function main(host: Host): void {
   useNet(host, net => {
-    const lines: string[] = [];
+    let lines: string[] = [];
     lines.push(cancelCase(net, "accept", 0));
     lines.push(cancelCase(net, "recv", 1));
     lines.push(cancelCase(net, "send", 2));
@@ -412,7 +406,7 @@ function main(host: Host): void {
     let bad: int = 0;
     for (const l of lines) {
       console.log(l);
-      if (l.indexOf("FAIL") >= 0) {
+      if (l.includes("FAIL")) {
         bad += 1;
       }
     }

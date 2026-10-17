@@ -2,11 +2,13 @@
 // with contract checking (every @Invariant / @Requires / @Ensures of std:net is a run-time trap) and without.
 import { assert, assertEq, assertEqUsize, assertEqString, assertEqBool, fail } from "std:test";
 import { Host, useNet } from "std:host";
-import { milliseconds } from "std:time";
+import { milliseconds, Deadline, MonotonicInstant } from "std:time";
+import { Scope, scopeNetDo } from "std:task";
 import { Bytes, fromString, fromInts } from "std:bytes";
 import {
   NetGrant, Listener, Stream, Peer, NetError, NetErrorKind, parsePeer, netErrorFromCode, netErrorMessage, isDenied, isTimeout, isReset,
   useListenerNet, useConnectionBeside, useAccepted, portOf, recv, send, sendAll, shutdownWrite, monotonicMillis, StreamReader,
+  recvUntil, sendUntil, sendAllUntil, withListenerNet, withConnectionBeside, withAccepted, withAcceptedUntil, withConnectionUntil, acceptDetachedUntil, dropAccepted,
   RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError, Fill, Filled, FillClosed, FillLimit, FillTimeout, FillError,
   Denied, Closed, Timeout, Cancelled, Reset, InvalidArgument, InvalidPeer, Os
 } from "std:net";
@@ -277,5 +279,91 @@ function readUntilDeadline(host: Host): void {
       });
     });
     assert(l.isOk(), "listener");
+  });
+}
+
+function at(ms: int): Deadline {
+  return Deadline { at: MonotonicInstant { millis: ms } };
+}
+
+@Test
+function absoluteDeadlines(host: Host): void {
+  useNet(host, net => {
+    const l = useListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
+      pair(ln, n, (c: Stream) => {
+        sendAll(c, fromString("abcd"), milliseconds(1000));
+      }, (s: Stream) => {
+        const t0 = monotonicMillis(s);
+        // a deadline that has passed still delivers what is ready, and nothing waits
+        assertEqString(kind(recvUntil(s, 2, at(t0 - 1000))), "data 2", "ready bytes at a passed deadline");
+        let rd = new StreamReader(64);
+        // two bytes are left; one deadline for the whole call, shared with the recvUntil below
+        const dl = at(t0 + 200);
+        assertEqString(fillKind(rd.readExactUntil(s, 5, dl)), "timeout", "five bytes never come");
+        const dt = monotonicMillis(s) - t0;
+        assert(dt >= 180 && dt < 3000, "readExactUntil ends at its deadline: " + dt.toString());
+        assertEqUsize(rd.buffered().length(), 2, "the bytes that did arrive stay buffered");
+        assertEqString(kind(recvUntil(s, 8, dl)), "timeout", "the shared deadline has passed: no wait");
+        assert(monotonicMillis(s) - t0 < 3000, "recvUntil at a passed deadline does not wait");
+        assertEqString(kind(recvUntil(s, 0, dl)), "error", "maxBytes 0");
+        assert(sendAllUntil(s, fromString("ok"), at(monotonicMillis(s) + 1000)).isOk(), "sendAllUntil of a little data");
+        assert(sendUntil(s, fromString("ok"), at(monotonicMillis(s) + 1000)).unwrap() == 2, "sendUntil");
+        const late = sendAllUntil(s, fromString("x"), at(t0 - 1));
+        assert(late.isErr() && late.unwrapErr().kind == Timeout, "sendAllUntil at a passed deadline times out");
+      });
+    });
+    assert(l.isOk(), "listener");
+  });
+}
+
+@Test
+function acceptAndConnectUntil(host: Host): void {
+  useNet(host, net => {
+    const r = withListenerNet(net, "127.0.0.1", 0, 8, (ln, n) => {
+      const c = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (s: Stream, l2: Listener) => {
+        const now = monotonicMillis(s);
+        const a = withAcceptedUntil(l2, at(now + 2000), (t: Stream, p: Peer) => p.host);
+        assert(a.isOk() && a.unwrap() == "127.0.0.1", "accepted before the deadline");
+        const none = withAcceptedUntil(l2, at(monotonicMillis(s) + 100), (t: Stream, p: Peer) => 0);
+        assert(none.isErr() && none.unwrapErr().kind == Timeout, "nobody connects: Timeout at the deadline");
+        const d = acceptDetachedUntil(l2, at(monotonicMillis(s) - 5));
+        assert(d.isErr() && d.unwrapErr().kind == Timeout, "a passed deadline with nothing queued");
+        return 7;
+      });
+      assert(c.isOk() && c.unwrap() == 7, "withConnectionBeside returns the value of its body");
+      const u = withConnectionUntil(n, "127.0.0.1", portOf(ln), at(monotonicMillis0(n) + 2000), (s: Stream) => 9);
+      assert(u.isOk() && u.unwrap() == 9, "connect before the deadline");
+      return 1;
+    });
+    assert(r.isOk() && r.unwrap() == 1, "withListenerNet returns the value of its body");
+  });
+}
+
+// monotonic time through a scratch connection (a program with a NetGrant has no other clock)
+function monotonicMillis0(net: NetGrant): int {
+  const r = withListenerNet(net, "127.0.0.1", 0, 1, (ln, n) => {
+    const c = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(2000), ln, (s: Stream, l2: Listener) => monotonicMillis(s));
+    return c.isOk() ? c.unwrap() : 0;
+  });
+  return r.isOk() ? r.unwrap() : 0;
+}
+
+@Test
+function cancelledScopeFailsNetCalls(host: Host): void {
+  useNet(host, net => {
+    scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+      assert(sc.cancel(), "cancel changes the token once");
+      const l = useListenerNet(g, "127.0.0.1", 0, 8, (ln, n) => {
+        // every network call of a cancelled task fails with Cancelled, without waiting and without touching the socket
+        const c = useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(5000), ln, (s: Stream, l2: Listener) => {
+          fail("connect must not succeed in a cancelled scope");
+        });
+        assert(c.isErr() && c.unwrapErr().kind == Cancelled, "connect: Cancelled");
+        const a = useAccepted(ln, milliseconds(5000), (s: Stream, p: Peer) => { fail("accept must not succeed"); });
+        assert(a.isErr() && a.unwrapErr().kind == Cancelled, "accept: Cancelled");
+        assertEqString(netErrorMessage(a.unwrapErr()).length > 0 ? "text" : "empty", "text", "Cancelled has text");
+      });
+      assert(l.isOk(), "binding a listener is not a wait: it still works");
+    });
   });
 }

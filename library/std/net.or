@@ -306,6 +306,26 @@ export function useListenerNet(
   return Ok();
 }
 
+// withListenerNet<T>(net, addr, port, backlog, body): Result<T, NetError> -- `useListenerNet` for a body that returns a value: body(listener,
+// net) with `net` passed through again (a closure cannot capture a grant), the listener closed afterwards. The way to get a value out
+// of a body that both listens and connects (a closure cannot modify a variable it captured).
+export function withListenerNet<T>(
+  net: NetGrant, addr: string, port: int, backlog: int, body: (ln: Listener, net: NetGrant) => T
+): Result<T, NetError> {
+  const g = grantListen(net, addr, port);
+  const ln = netListen(g, addr, port, backlog, 1);
+  const code = netStatus(ln);
+  if (code != 0) {
+    netClose(ln);
+    grantRevoke(g);
+    return Err(netErrorFromCode(code));
+  }
+  const r = body(ln, net);
+  netClose(ln);
+  grantRevoke(g);
+  return Ok(r);
+}
+
 // portOf(ln): int -- the port the listener is bound to (the real one when it was asked for port 0). O(1).
 @Ensures(result >= 0 && result <= 65535)
 export function portOf(ln: Listener): int {
@@ -541,6 +561,21 @@ export function useConnectionBeside(
   body(s, ln);
   netClose(s);
   return Ok();
+}
+
+// withConnectionBeside<T>(net, host, port, timeout, ln, body): Result<T, NetError> -- `useConnectionBeside` for a body that returns a value.
+export function withConnectionBeside<T>(
+  net: NetGrant, host: string, port: int, timeout: Duration, ln: Listener, body: (s: Stream, ln: Listener) => T
+): Result<T, NetError> {
+  const s = netConnect(net, host, port, clampMs(timeout.millis), 1);
+  const code = netStatus(s);
+  if (code != 0) {
+    netClose(s);
+    return Err(netErrorFromCode(code));
+  }
+  const r = body(s, ln);
+  netClose(s);
+  return Ok(r);
 }
 
 // resolve(net, name): Result<string[], NetError> -- the numeric addresses of `name` (IPv4 and IPv6, no duplicates), or

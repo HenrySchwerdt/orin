@@ -8,11 +8,11 @@
 // No descriptor leaks: the whole run uses a few hundred sockets one round after the other.
 import { Host, useNet } from "std:host";
 import { milliseconds } from "std:time";
-import { Scope, TaskHandle, CancelToken, scopeNetDo, spawnNet } from "std:task";
+import { Scope, TaskHandle, CancelToken, scopeNet, spawnNet } from "std:task";
 import {
   NetGrant, Listener, Stream, Peer, NetErrorKind, RecvResult, RecvData, RecvEof, RecvTimeout, RecvReset, RecvError,
   Denied, Closed, Timeout, Cancelled, Reset, InvalidArgument, InvalidPeer, Os,
-  useListenerNet, useConnectionBeside, useAccepted, acceptDetached, dropAccepted, portOf, recv
+  withListenerNet, withConnectionBeside, withAccepted, acceptDetached, dropAccepted, portOf, recv
 } from "std:net";
 
 const LONG: int = 30000;
@@ -43,34 +43,22 @@ function recvName(r: RecvResult): string {
 // One blocked task: its own listener; kind 0 waits in accept on it, kind 1 connects, accepts and waits in recv on the accepted side.
 // Returns the kind of the error that ended the wait, or what it got.
 function blocked(net: NetGrant, kind: int): string {
-  const out: string[] = [];
-  useListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
+  const r = withListenerNet(net, "127.0.0.1", 0, 4, (ln: Listener, n: NetGrant) => {
     if (kind == 0) {
-      const r = acceptDetached(ln, milliseconds(LONG));
-      match (r) {
-        Ok(a) => {
-          dropAccepted(a);
-          out.push("accepted");
-        },
-        Err(e) => {
-          out.push(kindName(e.kind));
-        }
+      const a = acceptDetached(ln, milliseconds(LONG));
+      if (a.isOk()) {
+        dropAccepted(a.unwrap());
+        return "accepted";
       }
-    } else {
-      const c = useConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(LONG), ln, (cs: Stream, l2: Listener) => {
-        const a = useAccepted(l2, milliseconds(LONG), (s: Stream, p: Peer) => {
-          out.push(recvName(recv(s, 16, milliseconds(LONG))));
-        });
-        if (a.isErr()) {
-          out.push(kindName(a.unwrapErr().kind));
-        }
-      });
-      if (c.isErr() && out.length == 0) {
-        out.push(kindName(c.unwrapErr().kind));
-      }
+      return kindName(a.unwrapErr().kind);
     }
+    const c = withConnectionBeside(n, "127.0.0.1", portOf(ln), milliseconds(LONG), ln, (cs: Stream, l2: Listener) => {
+      const a = withAccepted(l2, milliseconds(LONG), (s: Stream, p: Peer) => recvName(recv(s, 16, milliseconds(LONG))));
+      return a.isOk() ? a.unwrap() : kindName(a.unwrapErr().kind);
+    });
+    return c.isOk() ? c.unwrap() : kindName(c.unwrapErr().kind);
   });
-  return out.length > 0 ? out[0] : "no listener";
+  return r.isOk() ? r.unwrap() : "no listener";
 }
 
 // a short, uneven delay that does not read the clock: the cancellers fire while the others are at different stages
@@ -85,8 +73,7 @@ function spin(n: int): int {
 }
 
 function round(net: NetGrant, tasks: int, cancellers: int, salt: int): int {
-  const counts: int[] = [0];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
     const tok = sc.token();
     let probes: TaskHandle<string>[] = [];
     let i: int = 0;
@@ -109,26 +96,25 @@ function round(net: NetGrant, tasks: int, cancellers: int, salt: int): int {
     for (const h of stops) {
       h.join();
     }
+    let n: int = 0;
     for (const p of probes) {
       if (p.join() == "Cancelled") {
-        counts[0] = counts[0] + 1;
+        n += 1;
       }
     }
+    return n;
   });
-  return counts[0];
 }
 
 // nested: 8 outer tasks, each with an inner scope of 3 blocked tasks; only the outer token is cancelled
 function nestedStorm(net: NetGrant): int {
-  const counts: int[] = [0];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
     const tok = sc.token();
     let outer: TaskHandle<int>[] = [];
     let i: int = 0;
     while (i < 8) {
       outer.push(spawnNet(sc, g, (t: NetGrant) => {
-        const n: int[] = [0];
-        scopeNetDo(t, (sc2: Scope, g2: NetGrant) => {
+        return scopeNet(t, (sc2: Scope, g2: NetGrant) => {
           let inner: TaskHandle<string>[] = [];
           let j: int = 0;
           while (j < 3) {
@@ -136,32 +122,30 @@ function nestedStorm(net: NetGrant): int {
             inner.push(spawnNet(sc2, g2, (u: NetGrant) => blocked(u, k % 2)));
             j += 1;
           }
+          let n: int = 0;
           for (const h of inner) {
             if (h.join() == "Cancelled") {
-              n[0] = n[0] + 1;
+              n += 1;
             }
           }
+          return n;
         });
-        return n[0];
       }));
       i += 1;
     }
     const x = spin(20000);
     tok.cancel();
+    let total: int = x < 0 ? -1 : 0;
     for (const h of outer) {
-      counts[0] = counts[0] + h.join();
+      total += h.join();
     }
-    if (x < 0) {
-      counts[0] = -1;
-    }
+    return total;
   });
-  return counts[0];
 }
 
 // tasks spawned after the cancel (or while it is in flight) fail at once instead of blocking
 function lateSpawns(net: NetGrant): int {
-  const counts: int[] = [0];
-  scopeNetDo(net, (sc: Scope, g: NetGrant) => {
+  return scopeNet(net, (sc: Scope, g: NetGrant) => {
     sc.cancel();
     let hs: TaskHandle<string>[] = [];
     let i: int = 0;
@@ -170,13 +154,14 @@ function lateSpawns(net: NetGrant): int {
       hs.push(spawnNet(sc, g, (t: NetGrant) => blocked(t, k % 2)));
       i += 1;
     }
+    let n: int = 0;
     for (const h of hs) {
       if (h.join() == "Cancelled") {
-        counts[0] = counts[0] + 1;
+        n += 1;
       }
     }
+    return n;
   });
-  return counts[0];
 }
 
 function main(host: Host): void {
