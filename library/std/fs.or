@@ -23,12 +23,15 @@
 // takes a body that returns nothing. Both exist for one file and for two files (`withFiles`, `useFiles`), which is how
 // you stream from one file to another: a handle cannot be captured by a nested scope's closure.
 //
-// Whole-file functions: readFile(fs, path): Result<string, string>, writeFile(fs, path, data):
-// Result<void, string>, exists(fs, path): bool, listDir(fs, path): string[] (the entries of a directory in byte order,
-// physical subdirectories with a trailing `/` (directory symlinks are not followed); readable empty directories yield [].
-// Any enumeration error (including missing paths, non-directories and permission errors) traps after discarding partial
-// results. Allocation failure traps. A refused operation (policy, scope, read-only) is an `Err` for the
-// functions that return a Result (and for the scope functions' open) and a trap for `exists`.
+// Failure (ADR-0048 section 3): every function that can fail for an outside reason returns `Result<_, FsError>`; the
+// error has a `kind` (NotFound, PermissionDenied, Denied, ...), the failed operation `op`, the `path` and the `reason`
+// text, and `fsErrorMessage(e)` renders it. Nothing traps on a missing path, a non-directory, a permission error or a
+// refusal by the host policy / the narrowed grant; only a forged, stale or wrong-family grant and allocation failure do.
+//
+// Whole-file functions: readFile(fs, path): Result<string, FsError>, writeFile(fs, path, data): Result<void, FsError>,
+// exists(fs, path): Result<bool, FsError>, listDir(fs, path): Result<string[], FsError> (the entries of a directory in
+// byte order, physical subdirectories with a trailing `/`; directory symlinks are not followed; a readable empty
+// directory yields `Ok([])`; a partial listing is never returned).
 //
 // Narrowing (ADR-0027): `withUnder(fs, dir, body)` runs `body` with a grant that only reaches paths inside `dir`
 // (compared after making both absolute and removing "." / ".." / repeated "/" -- and, for existing path prefixes,
@@ -37,16 +40,171 @@
 // a directory outside the parent's scope yields a grant that reaches nothing. Narrowed grants are handles like any
 // other (a scope parameter, no capture, no storing).
 
-import { File, FsGrant, fileOpen, fileIsOpen, fileOpenError, fileClose, grantUnder, grantReadOnly, grantRevoke } from "std:fsraw";
+import {
+  File, FsGrant, fsReadFile, fsWriteFile, fsExists, fsListDir, fileOpen, fileIsOpen, fileOpenError, fileClose, grantUnder,
+  grantReadOnly, grantRevoke
+} from "std:fsraw";
 
-export { readFile, writeFile, exists, listDir, File, FsGrant } from "std:fsraw";
+export { File, FsGrant } from "std:fsraw";
 
-// Text of an error of this module (currently the human-readable message).
-export type FsError = string;
+// Why an operation failed. NotFound, PermissionDenied, IsDirectory, NotDirectory and AlreadyExists are the operating
+// system's answers; Denied is the host policy (ORIN_DENY names `fs`), OutsideScope a path outside a narrowed grant
+// (`withUnder`) or one that cannot be resolved inside it, ReadOnly a write through `withReadOnly`, WrongMode a read on
+// a file opened for writing or the reverse, TooManyFiles the limit of 256 open files, Io every other system error.
+export type FsErrorKind =
+  NotFound
+  | PermissionDenied
+  | IsDirectory
+  | NotDirectory
+  | AlreadyExists
+  | Denied
+  | OutsideScope
+  | ReadOnly
+  | WrongMode
+  | TooManyFiles
+  | Io;
+
+// What was being attempted when the error happened.
+export type FsOp = OpRead | OpWrite | OpOpen | OpList | OpStat | OpClose;
+
+// An error of this module. `path` is the path as the caller wrote it, `reason` the system's or the policy's explanation
+// (diagnostic text, not for matching: match on `kind`). Render it with `fsErrorMessage`.
+export type FsError = { kind: FsErrorKind; op: FsOp; path: string; reason: string; };
+
+// fsErrorMessage(e: FsError): string -- "cannot read 'a.txt': No such file or directory" (verbs: read, write, open, list,
+// check; a failure found when a file is closed reads "I/O error on 'p': reason"). Never empty. O(path + reason).
+export function fsErrorMessage(e: FsError): string {
+  return match (e.op) {
+    OpClose => "I/O error on '" + e.path + "': " + e.reason,
+    _ => "cannot " + opVerb(e.op) + " '" + e.path + "': " + e.reason
+  };
+}
+
+function opVerb(op: FsOp): string {
+  return match (op) {
+    OpRead => "read",
+    OpWrite => "write",
+    OpOpen => "open",
+    OpList => "list",
+    OpStat => "check",
+    OpClose => "close"
+  };
+}
+
+// The kind for the explanation text of the runtime (the strerror text of the platform or one of the policy texts).
+function kindOfReason(reason: string): FsErrorKind {
+  if (reason == "denied by the host policy (ORIN_DENY)") {
+    return Denied;
+  }
+  if (reason == "outside the granted file scope" || reason == "path cannot be resolved inside the granted scope") {
+    return OutsideScope;
+  }
+  if (reason == "the file grant is read-only") {
+    return ReadOnly;
+  }
+  if (reason == "No such file or directory") {
+    return NotFound;
+  }
+  if (reason == "Permission denied" || reason == "Operation not permitted") {
+    return PermissionDenied;
+  }
+  if (reason == "Is a directory") {
+    return IsDirectory;
+  }
+  if (reason == "Not a directory") {
+    return NotDirectory;
+  }
+  if (reason == "File exists") {
+    return AlreadyExists;
+  }
+  if (reason == "Bad file descriptor") {
+    return WrongMode;
+  }
+  if (reason == "Too many open files") {
+    return TooManyFiles;
+  }
+  return Io;
+}
+
+// The runtime reports "cannot <verb> '<path>': <reason>"; the reason is what follows the prefix.
+function reasonOf(op: FsOp, path: string, raw: string): string {
+  const prefix = "cannot " + opVerb(op) + " '" + path + "': ";
+  if (raw.startsWith(prefix)) {
+    return raw.substring(prefix.length, raw.length);
+  }
+  return raw;
+}
+
+function fromReason(op: FsOp, path: string, reason: string): FsError {
+  return FsError { kind: kindOfReason(reason), op: op, path: path, reason: reason };
+}
+
+function fromRaw(op: FsOp, path: string, raw: string): FsError {
+  return fromReason(op, path, reasonOf(op, path, raw));
+}
+
+// The error for a refusal code of the grant (100001 host policy, 100003 read-only, 100002 scope, 100004 unresolvable).
+function denial(op: FsOp, path: string, code: int): FsError {
+  if (code == 100001) {
+    return FsError { kind: Denied, op: op, path: path, reason: "denied by the host policy (ORIN_DENY)" };
+  }
+  if (code == 100003) {
+    return FsError { kind: ReadOnly, op: op, path: path, reason: "the file grant is read-only" };
+  }
+  if (code == 100004) {
+    return FsError { kind: OutsideScope, op: op, path: path, reason: "path cannot be resolved inside the granted scope" };
+  }
+  return FsError { kind: OutsideScope, op: op, path: path, reason: "outside the granted file scope" };
+}
+
+// readFile(fs, path): Result<string, FsError>
+// The whole file as text. Err: NotFound, PermissionDenied, IsDirectory, Denied, OutsideScope or Io. O(file size); allocates
+// the result.
+export function readFile(fs: FsGrant, path: string): Result<string, FsError> {
+  const r = fsReadFile(fs, path);
+  return match (r) {
+    Ok(text) => Ok(text),
+    Err(raw) => Err(fromRaw(OpRead, path, raw))
+  };
+}
+
+// writeFile(fs, path, data): Result<void, FsError>
+// Creates or truncates `path` and writes `data`. Err: NotFound (missing directory), PermissionDenied, IsDirectory,
+// Denied, OutsideScope, ReadOnly or Io. O(data size).
+export function writeFile(fs: FsGrant, path: string, data: string): Result<void, FsError> {
+  const r = fsWriteFile(fs, path, data);
+  if (r.isErr()) {
+    return Err(fromRaw(OpWrite, path, r.unwrapErr()));
+  }
+  return Ok();
+}
+
+// exists(fs, path): Result<bool, FsError>
+// True when `path` names a file, a directory or the target of a symbolic link; a dangling link and a path the process
+// cannot stat are `Ok(false)`. Err only when the grant refuses the query (Denied, OutsideScope). O(1) system call.
+export function exists(fs: FsGrant, path: string): Result<bool, FsError> {
+  const r = fsExists(fs, path);
+  if (r < 0) {
+    return Err(denial(OpStat, path, 0 - r));
+  }
+  return Ok(r != 0);
+}
+
+// listDir(fs, path): Result<string[], FsError>
+// The entries of the directory in byte order, subdirectories with a trailing "/", "." and ".." omitted; symbolic links are
+// not followed. Err: NotFound, NotDirectory, PermissionDenied, Denied, OutsideScope or Io, never a partial listing.
+// O(n log n) in the number of entries; allocates the array.
+export function listDir(fs: FsGrant, path: string): Result<string[], FsError> {
+  const r = fsListDir(fs, path);
+  return match (r) {
+    Ok(entries) => Ok(entries),
+    Err(raw) => Err(fromRaw(OpList, path, raw))
+  };
+}
 
 // How a file is opened: Read (the file must exist), Write (create or truncate), Append (create if missing,
 // every write goes to the end). A file opened with Read cannot be written and vice versa (the failed operation is
-// reported as an `Err` when the scope ends).
+// reported as an `Err` of kind WrongMode when the scope ends).
 export type FileMode = Read | Write | Append;
 
 function modeCode(m: FileMode): int {
@@ -57,33 +215,44 @@ function modeCode(m: FileMode): int {
   };
 }
 
-function openMessage(path: string, h: File): string {
-  return "cannot open '" + path + "': " + fileOpenError(h);
+// The error of a failed open: the handle holds the reason text.
+function openError(path: string, h: File): FsError {
+  return fromReason(OpOpen, path, fileOpenError(h));
 }
 
-// Close message of a handle: Some(error) if any operation failed.
-function firstError(a: Option<string>, b: Option<string>): Option<string> {
+// The error of a failed operation found at close ("I/O error: <reason>" from the runtime).
+function closeError(path: string, raw: string): FsError {
+  const prefix = "I/O error: ";
+  const reason = raw.startsWith(prefix) ? raw.substring(prefix.length, raw.length) : raw;
+  return fromReason(OpClose, path, reason);
+}
+
+// The first failure of the closes of two files (path A first).
+function firstClose(pathA: string, a: Option<string>, pathB: string, b: Option<string>): Option<FsError> {
   return match (a) {
-    Some(m) => Some(m),
-    None => b
+    Some(m) => Some(closeError(pathA, m)),
+    None => match (b) {
+      Some(n) => Some(closeError(pathB, n)),
+      None => None
+    }
   };
 }
 
 // withFile<T>(fs, path, mode, body): Result<T, FsError>
-// Opens `path`, runs `body(file)`, closes the file, and returns `Ok(<body's value>)`; `Err(message)` if the file
-// cannot be opened (body is not called) or if any operation on it or the final flush/close failed (the body's
-// value is discarded). O(1) plus the work of `body`; at most 256 files can be open at once.
+// Opens `path`, runs `body(file)`, closes the file, and returns `Ok(<body's value>)`; `Err` if the file cannot be opened
+// (body is not called; kinds as for readFile / writeFile) or if any operation on it or the final flush/close failed (the
+// body's value is discarded). O(1) plus the work of `body`; at most 256 files can be open at once.
 export function withFile<T>(fs: FsGrant, path: string, mode: FileMode, body: (file: File) => T): Result<T, FsError> {
   const h = fileOpen(fs, path, modeCode(mode));
   if (!fileIsOpen(h)) {
-    const msg = openMessage(path, h);
+    const err = openError(path, h);
     fileClose(h);
-    return Err(msg);
+    return Err(err);
   }
   const r = body(h);
   const e = fileClose(h);
   return match (e) {
-    Some(m) => Err(m),
+    Some(m) => Err(closeError(path, m)),
     None => Ok(r)
   };
 }
@@ -92,41 +261,42 @@ export function withFile<T>(fs: FsGrant, path: string, mode: FileMode, body: (fi
 export function useFile(fs: FsGrant, path: string, mode: FileMode, body: (file: File) => void): Result<void, FsError> {
   const h = fileOpen(fs, path, modeCode(mode));
   if (!fileIsOpen(h)) {
-    const msg = openMessage(path, h);
+    const err = openError(path, h);
     fileClose(h);
-    return Err(msg);
+    return Err(err);
   }
   body(h);
   const e = fileClose(h);
   return match (e) {
-    Some(m) => Err(m),
+    Some(m) => Err(closeError(path, m)),
     None => Ok()
   };
 }
 
-// withFiles<T>(fs, pathA, modeA, pathB, modeB, body): Result<T, FsError> -- two files open at the same time (for
-// example copying a file line by line). If the second cannot be opened the first is closed again.
+// withFiles<T>(fs, pathA, modeA, pathB, modeB, body): Result<T, FsError>
+// Two files open at the same time (for example copying a file line by line). If the second cannot be opened the first is
+// closed again; the first failure to close is reported (file A before file B).
 export function withFiles<T>(
   fs: FsGrant, pathA: string, modeA: FileMode, pathB: string, modeB: FileMode, body: (a: File, b: File) => T
 ): Result<T, FsError> {
   const a = fileOpen(fs, pathA, modeCode(modeA));
   if (!fileIsOpen(a)) {
-    const msg = openMessage(pathA, a);
+    const err = openError(pathA, a);
     fileClose(a);
-    return Err(msg);
+    return Err(err);
   }
   const b = fileOpen(fs, pathB, modeCode(modeB));
   if (!fileIsOpen(b)) {
-    const msg = openMessage(pathB, b);
+    const err = openError(pathB, b);
     fileClose(b);
     fileClose(a);
-    return Err(msg);
+    return Err(err);
   }
   const r = body(a, b);
   const eb = fileClose(b);
   const ea = fileClose(a);
-  return match (firstError(ea, eb)) {
-    Some(m) => Err(m),
+  return match (firstClose(pathA, ea, pathB, eb)) {
+    Some(err) => Err(err),
     None => Ok(r)
   };
 }
@@ -137,29 +307,30 @@ export function useFiles(
 ): Result<void, FsError> {
   const a = fileOpen(fs, pathA, modeCode(modeA));
   if (!fileIsOpen(a)) {
-    const msg = openMessage(pathA, a);
+    const err = openError(pathA, a);
     fileClose(a);
-    return Err(msg);
+    return Err(err);
   }
   const b = fileOpen(fs, pathB, modeCode(modeB));
   if (!fileIsOpen(b)) {
-    const msg = openMessage(pathB, b);
+    const err = openError(pathB, b);
     fileClose(b);
     fileClose(a);
-    return Err(msg);
+    return Err(err);
   }
   body(a, b);
   const eb = fileClose(b);
   const ea = fileClose(a);
-  return match (firstError(ea, eb)) {
-    Some(m) => Err(m),
+  return match (firstClose(pathA, ea, pathB, eb)) {
+    Some(err) => Err(err),
     None => Ok()
   };
 }
 
-// withUnder<T>(fs, dir, body: (sub: FsGrant) => T): T -- a grant restricted to the directory `dir` (and below). `dir` may
-// be relative (to the working directory) or absolute. Not allowed to widen: if `dir` is not inside the scope of `fs`,
-// the result reaches nothing (every operation is refused). O(1) plus the work of `body`.
+// withUnder<T>(fs, dir, body: (sub: FsGrant) => T): T
+// Runs `body` with a grant restricted to the directory `dir` (and below). `dir` may be relative (to the working
+// directory) or absolute. Not allowed to widen: if `dir` is not inside the scope of `fs`, the result reaches nothing
+// (every operation is refused with OutsideScope). O(1) plus the work of `body`.
 export function withUnder<T>(fs: FsGrant, dir: string, body: (sub: FsGrant) => T): T {
   const g = grantUnder(fs, dir);
   const r = body(g);
@@ -167,14 +338,16 @@ export function withUnder<T>(fs: FsGrant, dir: string, body: (sub: FsGrant) => T
   return r;
 }
 
-// useUnder(fs, dir, body) -- `withUnder` for a body that returns nothing.
+// useUnder(fs, dir, body: (sub: FsGrant) => void): void -- `withUnder` for a body that returns nothing.
 export function useUnder(fs: FsGrant, dir: string, body: (sub: FsGrant) => void): void {
   const g = grantUnder(fs, dir);
   body(g);
   grantRevoke(g);
 }
 
-// withReadOnly<T>(fs, body: (ro: FsGrant) => T): T -- a grant that can read but not create, write or truncate.
+// withReadOnly<T>(fs, body: (ro: FsGrant) => T): T
+// Runs `body` with a grant that can read but not create, write or truncate (such an operation is refused with ReadOnly).
+// O(1) plus the work of `body`.
 export function withReadOnly<T>(fs: FsGrant, body: (ro: FsGrant) => T): T {
   const g = grantReadOnly(fs);
   const r = body(g);
@@ -182,27 +355,28 @@ export function withReadOnly<T>(fs: FsGrant, body: (ro: FsGrant) => T): T {
   return r;
 }
 
-// useReadOnly(fs, body) -- `withReadOnly` for a body that returns nothing.
+// useReadOnly(fs, body: (ro: FsGrant) => void): void -- `withReadOnly` for a body that returns nothing.
 export function useReadOnly(fs: FsGrant, body: (ro: FsGrant) => void): void {
   const g = grantReadOnly(fs);
   body(g);
   grantRevoke(g);
 }
 
-// withFileFs<T>(fs, path, mode, body: (file: File, fs: FsGrant) => T): Result<T, FsError> -- `withFile` whose body also
-// receives the SAME grant again as a parameter. A closure cannot capture a grant (the capture would let it outlive the
-// scope), so a body that must open further files (a nested scope, a recursive helper) gets the grant this way.
+// withFileFs<T>(fs, path, mode, body: (file: File, fs: FsGrant) => T): Result<T, FsError>
+// `withFile` whose body also receives the SAME grant again as a parameter. A closure cannot capture a grant (the capture
+// would let it outlive the scope), so a body that must open further files (a nested scope, a recursive helper) gets the
+// grant this way.
 export function withFileFs<T>(fs: FsGrant, path: string, mode: FileMode, body: (file: File, fs: FsGrant) => T): Result<T, FsError> {
   const h = fileOpen(fs, path, modeCode(mode));
   if (!fileIsOpen(h)) {
-    const msg = openMessage(path, h);
+    const err = openError(path, h);
     fileClose(h);
-    return Err(msg);
+    return Err(err);
   }
   const r = body(h, fs);
   const e = fileClose(h);
   return match (e) {
-    Some(m) => Err(m),
+    Some(m) => Err(closeError(path, m)),
     None => Ok(r)
   };
 }

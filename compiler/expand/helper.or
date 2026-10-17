@@ -13,7 +13,7 @@
 // hashes the encoded `Input`. Only successful runs are cached. Two compilers running at once on one cache directory is not
 // supported (each file is written under a temporary name and moved into place, so the worst case is a repeated build).
 
-import { FsGrant, readFile, writeFile, exists } from "std:fs";
+import { FsGrant, readFile, writeFile, fsErrorMessage } from "std:fs";
 import { ProcessGrant } from "std:process";
 import { SourceMap, SourceFile, Diagnostic, render } from "../diag";
 import { LoadedProgram, ImportUnit, ImportStd, loadWithRoots, preludeRoots, dirname, joinPath } from "../loader";
@@ -23,7 +23,7 @@ import { emitC } from "../backends/c";
 import { optimize, pruneProgram } from "../opt";
 import { fuseProgram } from "../fuse";
 import { verify } from "../verify";
-import { shellRun, shellRunTimeout, shq, readOr, trunc } from "../util";
+import { shellRun, shellRunTimeout, shq, readOr, existsOr, trunc } from "../util";
 import { Processor, packageRoot } from "./processors";
 
 // Bump when the generated main, the way the helper is built or run, or the encoding changes.
@@ -222,10 +222,10 @@ function build(fs: FsGrant, proc: ProcessGrant, prog: LoadedProgram, p: Processo
   const cfile = dir + "/helper.c";
   const w = writeFile(fs, cfile, emitC(pruneProgram(mir)));
   if (w.isErr()) {
-    return Err(Failure { message: "cannot write " + cfile, stderr: w.unwrapErr() });
+    return Err(Failure { message: "cannot write " + cfile, stderr: fsErrorMessage(w.unwrapErr()) });
   }
   const rt = cfg.runtime;
-  if (!exists(fs, rt + "/orin_runtime.c")) {
+  if (!existsOr(fs, rt + "/orin_runtime.c")) {
     return Err(Failure { message: "runtime not found at " + rt + " (pass --runtime <dir>; the packaged `orin` launcher does this)", stderr: "" });
   }
   const log = dir + "/cc.log";
@@ -274,7 +274,7 @@ export function runProcessor(
   const hk = helperKey(prog, sm, p, main);
   const dir = cacheRoot(prog, cfg) + "/" + hk;
   const outFile = dir + "/out-" + fingerprint([input]) + ".json";
-  if (exists(fs, outFile)) {
+  if (existsOr(fs, outFile)) {
     const cached = readFile(fs, outFile);
     if (cached.isOk()) {
       note(cfg, "reused the output of `" + p.name + "` for " + where);
@@ -285,7 +285,7 @@ export function runProcessor(
     return fail("cannot create the processor cache directory " + dir + " (use --processor-cache DIR)", "");
   }
   const exe = dir + "/helper";
-  if (exists(fs, exe)) {
+  if (existsOr(fs, exe)) {
     note(cfg, "reused the helper of `" + p.name + "` (" + hk + ")");
   } else {
     if (cfg.lenient && shellRun(proc, cfg.cc + " --version > /dev/null 2>&1") != 0) {
@@ -303,7 +303,7 @@ export function runProcessor(
   const runSt = dir + "/run.st";
   const w = writeFile(fs, inFile, input + "\n");
   if (w.isErr()) {
-    return fail("cannot write " + inFile, w.unwrapErr());
+    return fail("cannot write " + inFile, fsErrorMessage(w.unwrapErr()));
   }
   shellRun(proc, "rm -f " + shq(runSt) + " " + shq(runOut) + " " + shq(runErr));
   note(cfg, "running `" + p.name + "` for " + where);

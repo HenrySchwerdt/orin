@@ -5,11 +5,10 @@
 // graph/diff, and the permission refusals (path escape, build/test without --allow-exec). A second server with
 // --allow-exec checks build and test.
 
-import { FsGrant, readFile, writeFile, exists } from "std:fs";
+import { FsGrant, readFile, writeFile } from "std:fs";
 import { ProcessGrant } from "std:process";
-import { shell } from "std:io";
 import { Json, JNum, parse } from "std:json";
-import { Session, ToolResult } from "./session";
+import { Session, ToolResult, shellStatus, existsOr } from "./session";
 import { replaceAll, shq, sortedStrs, reprStr } from "./text";
 import {
   S, N, B, A, O, F, SA, nil, at, has, isNull, isStrEq, isIntEq, isBoolEq, str, items, len, strs, keysOf, eq, show,
@@ -68,7 +67,7 @@ function orEmpty(j: Json): Json {
 
 // Copies a directory of the repository into the project (`shutil.copytree`); false when `cp` failed.
 function copyTree(p: ProcessGrant, src: string, to: string): bool {
-  return shell(p, "mkdir -p " + shq(to) + " && rmdir " + shq(to) + " && cp -R " + shq(src) + " " + shq(to)) == 0;
+  return shellStatus(p, "mkdir -p " + shq(to) + " && rmdir " + shq(to) + " && cp -R " + shq(src) + " " + shq(to)) == 0;
 }
 
 function effectKeys(effects: Json): string[] {
@@ -85,7 +84,7 @@ function head(raw: string, n: usize): string {
 
 export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, root: string, tmp: string): void {
   const proj = tmp + "/proj";
-  shell(p, "mkdir -p " + shq(proj));
+  shellStatus(p, "mkdir -p " + shq(proj));
   writeFile(fs, proj + "/main.or", MAIN);
   writeFile(fs, proj + "/lib.or", libText());
   writeFile(fs, proj + "/bad.or", BAD);
@@ -226,7 +225,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   }
   s.check(fs, strEq(heads, ["E0200 syn.or:6:11", "E0200 syn.or:7:6", "E0200 syn.or:10:12"]),
     "syntax errors: codes and positions in order (" + t.raw + ")");
-  shell(p, "rm -f " + shq(proj + "/syn.or"));
+  shellStatus(p, "rm -f " + shq(proj + "/syn.or"));
 
   t = s.mcpCall(fs, p, "check", ent("missing.or"));
   s.check(fs, t.err && t.raw.includes("cannot read"), "missing entry is a tool error");
@@ -318,7 +317,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   t = s.mcpCall(fs, p, "inspect", O([F("symbol", S("plain")), F("entry", S("anno.or"))]));
   v = t.value;
   s.check(fs, !t.err && !has(v, "annotations"), "inspect: a declaration without annotations has no annotations key (" + t.raw + ")");
-  shell(p, "rm -f " + shq(proj + "/anno.or"));
+  shellStatus(p, "rm -f " + shq(proj + "/anno.or"));
 
   // ---- packages (orin.toml, spec 04): module inspect shows the rule; violations are diagnostics
   if (!copyTree(p, root + "/tests/next/packages/shop", proj + "/shop")) {
@@ -424,7 +423,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   const snap = parse(str(at(v2, ["snapshot"])));
   s.check(fs, !t.err && eq(at(v2, ["hash"]), at(graphV, ["hash"])) && snap.isOk() && eq(at(snap.unwrap(), ["hash"]), at(graphV, ["hash"])),
     "graph full is deterministic");
-  s.check(fs, exists(fs, proj + "/osig/head.json"), "graph out written inside the root");
+  s.check(fs, existsOr(fs, proj + "/osig/head.json"), "graph out written inside the root");
   t = s.mcpCall(fs, p, "diff", O([F("base", S("osig/base")), F("head", S("osig/head"))]));
   const dv = t.value;
   s.check(fs, !t.err && isStrEq(at(dv, ["schema"]), "osig-diff/0.2") && isBoolEq(at(dv, ["differences"]), true), "diff json (" + head(t.raw, 200) + ")");
@@ -464,7 +463,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   s.check(fs, t.err && t.raw.includes("outside the authorized root"), "edit outside root refused");
   t = s.mcpCall(fs, p, "build", O([F("entry", S("main.or")), F("out", S("out.c"))]));
   s.check(fs, t.err && t.raw.includes("--allow-exec"), "build refused without --allow-exec (" + t.raw + ")");
-  s.check(fs, !exists(fs, proj + "/out.c"), "refused build wrote nothing");
+  s.check(fs, !existsOr(fs, proj + "/out.c"), "refused build wrote nothing");
   t = s.mcpCall(fs, p, "test", ent("main.or"));
   s.check(fs, t.err && t.raw.includes("--allow-exec"), "test refused without --allow-exec");
   t = s.mcpCall(fs, p, "test", O([F("suite", S("default"))]));
@@ -495,7 +494,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   t = s.mcpCall(fs, p, "build", O([F("entry", S("main.or")), F("out", S("build/main.c")), F("binary", S("build/main"))]));
   v = t.value;
   s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), true) && isStrEq(at(v, ["binary"]), "build/main"), "build to C and binary (" + t.raw + ")");
-  shell(p, shq(proj + "/build/main") + " > " + shq(proj + "/build/main.out") + " 2>/dev/null");
+  shellStatus(p, shq(proj + "/build/main") + " > " + shq(proj + "/build/main.out") + " 2>/dev/null");
   const ran = readText(fs, proj + "/build/main.out");
   s.check(fs, ran == "2\n", "built binary runs: " + reprStr(ran));
   t = s.mcpCall(fs, p, "build", O([F("entry", S("main.or")), F("out", S("../escape.c"))]));
@@ -535,7 +534,7 @@ export function runMcp(fs: FsGrant, p: ProcessGrant, s: Session, exe: string, ro
   t = s.mcpCall(fs, p, "build", O([F("entry", S("u.or")), F("out", S("build/u.c"))]));
   v = t.value;
   s.check(fs, !t.err && isBoolEq(at(v, ["ok"]), true), "build erases @Test functions and does not run them (" + t.raw + ")");
-  if (exists(fs, root + "/build/bootstrap/orin2")) {
+  if (existsOr(fs, root + "/build/bootstrap/orin2")) {
     t = s.mcpCall(fs, p, "test", O([F("suite", S("default")), F("filter", S("hello"))]));
     v = t.value;
     s.check(fs, !t.err && isIntEq(at(v, ["failed"]), 0) && intVal(at(v, ["passed"])) >= 1, "suite with filter (" + t.raw + ")");

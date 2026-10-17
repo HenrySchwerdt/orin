@@ -9,14 +9,13 @@
 // in two rounds (the second round needs the outcome of the first), and the verdicts are computed afterwards in the order
 // of the lists, so the FAIL lines come out in a fixed order.
 
-import { FsGrant, readFile, writeFile, exists, listDir, useFile, Append } from "std:fs";
+import { FsGrant, readFile, writeFile, listDir, useFile, Append } from "std:fs";
 import { ProcessGrant } from "std:process";
-import { shell } from "std:io";
 import { Json, JNull, JNum, parse } from "std:json";
 import { shq, strip, sortedStrs, reprStr } from "./text";
 import { head, reprList, lastPart } from "./strs";
 import { at, isStr, isArr, keysOf, items, str } from "./jx";
-import { Ctx, readText } from "./ctx";
+import { Ctx, readText, shellStatus, existsOr } from "./ctx";
 import { Job, Outcome, runAll } from "./exec";
 import { commentsOf, sameStrs, stripSpans, errorCodes, isErrorCode, firstDiag, splitLines } from "./fmtlogic";
 
@@ -28,7 +27,7 @@ function corpusDirs(): string[] {
 // `cpu_count() or 4`, through the shell.
 export function cpuCount(fs: FsGrant, proc: ProcessGrant, scratch: string): usize {
   const sh = "{ getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; } > " + shq(scratch);
-  if (shell(proc, sh) == 0) {
+  if (shellStatus(proc, sh) == 0) {
     const n = parseInt(strip(readText(fs, scratch)));
     if (n.isSome() && n.unwrap() > 0) {
       return n.unwrap().toUsize();
@@ -43,13 +42,13 @@ export function buildExe(fs: FsGrant, proc: ProcessGrant, root: string, orin2: s
   const exe = outDir + "/" + name;
   const err = outDir + "/" + name + ".err";
   const compile = "cd " + shq(root) + " && " + shq(orin2) + " compile " + shq(src) + " -o " + shq(cFile) + " 2> " + shq(err);
-  if (shell(proc, compile) != 0) {
+  if (shellStatus(proc, compile) != 0) {
     console.error("cannot compile " + src + ":\n" + readText(fs, err));
     return "";
   }
   const cc = "cd " + shq(root) + " && cc -O1 -w -I runtime/core " + shq(cFile)
     + " runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -o " + shq(exe) + " 2> " + shq(err);
-  if (shell(proc, cc) != 0) {
+  if (shellStatus(proc, cc) != 0) {
     console.error("cc failed for " + src + ":\n" + readText(fs, err));
     return "";
   }
@@ -72,7 +71,7 @@ function inRoot(root: string, cmd: string): string {
 
 function sortedListing(fs: FsGrant, dir: string): string[] {
   let names: string[] = [];
-  for (const e of listDir(fs, dir)) {
+  for (const e of listDir(fs, dir).unwrap()) {
     names.push(e.endsWith("/") ? e.substring(0, e.length - 1) : e);
   }
   return sortedStrs(names);
@@ -251,7 +250,7 @@ export function runFmt(fs: FsGrant, proc: ProcessGrant, c: Ctx, f: Fmt, workers:
   for (const d of corpusDirs()) {
     finds.push("find -L " + d + " -type f -name '*.or' -not -name '.*' -not -path '*/.*'");
   }
-  shell(proc, inRoot(root, "{ " + finds.join("; ") + "; } | LC_ALL=C sort > " + shq(listing)));
+  shellStatus(proc, inRoot(root, "{ " + finds.join("; ") + "; } | LC_ALL=C sort > " + shq(listing)));
   let files: string[] = [];
   for (const ln of readText(fs, listing).split("\n")) {
     if (ln != "") {
@@ -259,14 +258,14 @@ export function runFmt(fs: FsGrant, proc: ProcessGrant, c: Ctx, f: Fmt, workers:
     }
   }
   let errs: string[] = [];
-  const errListing = listDir(fs, root + "/tests/errors");
+  const errListing = listDir(fs, root + "/tests/errors").unwrap();
   for (const n of sortedListing(fs, root + "/tests/errors")) {
     if (n.startsWith(".")) {
       continue;
     }
     const p = "tests/errors/" + n;
     const entry = errListing.includes(n + "/") ? p + "/main.or" : p;
-    if (exists(fs, root + "/" + entry)) {
+    if (existsOr(fs, root + "/" + entry)) {
       errs.push(entry);
     }
   }

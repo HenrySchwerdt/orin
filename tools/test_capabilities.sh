@@ -66,9 +66,9 @@ for b in $backends; do
   # a family that is not denied is unaffected
   expect $b fs_open process,stdio,clock,net 0 "read: ok" ""
 
-  # ... but a bool cannot carry a denial: exists traps
-  expect $b fs_exists fs 101 "before" "trap: capability denied: fs exists: denied by the host policy (ORIN_DENY)"
-  expect $b fs_exists clock 0 "true" ""
+  # exists and listDir are Results as well (ADR-0048): a denial is an Err, not a trap
+  expect $b fs_exists fs 0 "exists: cannot check 'tests/next/deny/fs_exists.or': denied by the host policy (ORIN_DENY)" ""
+  expect $b fs_exists clock 0 "exists: true" ""
   # process
   expect $b process_args process 101 "before" "trap: capability denied: process args"
   expect $b process_shell process 101 "before" "trap: capability denied: process shell"

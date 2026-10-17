@@ -1641,17 +1641,19 @@ OrinObj *orin_fs_write_file(int64_t gh, OrinObj *path, OrinObj *data) {
     return orin_ok_void();
 }
 
-/* A bool cannot carry a denial: a refused query traps (like every operation without a Result). */
+/* exists: 1 = present, 0 = absent, or -DEN_* when the grant refuses the query (the library turns it into an `Err`).
+ * A forged, stale or wrong-family grant still traps (grant_ref). */
 int64_t orin_fs_exists(int64_t gh, OrinObj *path) {
     OrinString *p = (OrinString *)path;
     char eff[CAP_PATH + 1];
     int scoped, den = fs_check(gh, 0, path, eff, &scoped);
-    if (den) trap_denied(GK_FS, "exists", den_text(den));
+    if (den) return -(int64_t)den;
     return scoped ? orin_platform_file_exists(eff, strlen_(eff)) : orin_platform_file_exists(p->data, p->len);
 }
 
-/* listDir: the entries in byte order, subdirectories with a trailing '/'. Enumeration failures and refused
- * queries trap; an unreadable or partial directory must never appear successfully empty. */
+/* listDir: Result<string[], string>. Ok: the entries in byte order, subdirectories with a trailing '/'. Err: a refused
+ * query or an enumeration failure ("cannot list 'p': reason"); an unreadable or partial directory never appears
+ * successfully empty. Running out of memory traps. */
 typedef struct { OrinObj **items; size_t n, cap; int oom; } DirAcc;
 
 static void dir_collect(void *ctx, const char *name, size_t len, int is_dir) {
@@ -1688,7 +1690,7 @@ OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
     OrinString *p = (OrinString *)path;
     char eff[CAP_PATH + 1];
     int scoped, den = fs_check(gh, 0, path, eff, &scoped);
-    if (den) trap_denied(GK_FS, "listDir", den_text(den));
+    if (den) return err_msg("cannot list", path, den_text(den));
     DirAcc a = {NULL, 0, 0, 0};
     int rc = scoped ? orin_platform_dir_list(eff, strlen_(eff), dir_collect, &a)
                     : orin_platform_dir_list(p->data, p->len, dir_collect, &a);
@@ -1696,7 +1698,7 @@ OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
         for (size_t i = 0; i < a.n; i++) orin_release(a.items[i]);
         if (a.items) orin_platform_free(a.items);
         if (a.oom || rc == ORIN_PLATFORM_ENOMEM) orin_trap("out of memory");
-        orin_trap("listDir: directory enumeration failed");
+        return err_result("cannot list", path, rc);
     }
     for (size_t i = 1; i < a.n; i++) { /* insertion sort: directories are small */
         OrinObj *x = a.items[i];
@@ -1707,7 +1709,7 @@ OrinObj *orin_fs_list_dir(int64_t gh, OrinObj *path) {
     OrinObj *arr = orin_array_new((uint64_t)a.n, 1);
     for (size_t i = 0; i < a.n; i++) orin_array_push(arr, ORIN_SLOT(a.items[i]));
     if (a.items) orin_platform_free(a.items);
-    return arr;
+    return orin_variant1(0, 1, ORIN_SLOT(arr));
 }
 
 /* ---------------------------------------------------------------- file resources (ADR-0025) */
