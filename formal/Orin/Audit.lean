@@ -94,3 +94,31 @@ import Orin
 #print axioms Orin.good_stepT
 #print axioms Orin.goodT_reach
 #print axioms Orin.prog_sound_ill
+
+-- interval analysis (ADR-0053 M8)
+#print axioms Orin.Range.r2_add
+#print axioms Orin.Range.r2_sub
+#print axioms Orin.Range.mem_opd
+#print axioms Orin.Range.exec_summ
+#print axioms Orin.Range.res_dd
+#print axioms Orin.Range.res_ok
+#print axioms Orin.Range.step_sound
+#print axioms Orin.Range.refine_sound
+#print axioms Orin.Range.edge_sound
+#print axioms Orin.Range.runA_sound
+#print axioms Orin.Range.widenLo_mem
+#print axioms Orin.Range.widenHi_mem
+#print axioms Orin.Range.joinInto_cov_right
+#print axioms Orin.Range.joinInto_cov_left
+#print axioms Orin.Range.hullAll_cov
+#print axioms Orin.Range.soundS_cov
+#print axioms Orin.Range.postfix_sound
+#print axioms Orin.Range.feed_spec
+#print axioms Orin.Range.wreach_inv
+#print axioms Orin.Range.fix_sound
+#print axioms Orin.Range.narrow_sound
+#print axioms Orin.Range.inRange_sound
+#print axioms Orin.Range.accessOk_in_bounds
+#print axioms Orin.Range.u1_sound
+#print axioms Orin.Range.range_accepted
+#print axioms Orin.Range.u1_machine
