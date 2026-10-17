@@ -6,7 +6,7 @@
 #      attempt to leave the granted scope (another port, another host, a widened narrowing) is refused
 #   4. ORIN_DENY=net: the server cannot listen and says why; the client cannot connect
 #   5. a program started with a listen grant for another port cannot be made to listen elsewhere (tests/next/run/net_loopback)
-#   6. concurrent server (ADR-0017 Addendum C, examples/http_server_concurrent.or): a bounded worker pool fed by moved connections.
+#   6. concurrent server (ADR-0017 Addendum C, examples/http_server.or, the same server as 1-5): a bounded worker pool fed by moved connections.
 #      tools/net_concurrent.py (held connections do not block others, 408 at the deadline, a full pool queues instead of dropping,
 #      many clients), an Orin client with 64 / 256 parallel tasks (spawnNet), the same server built with ThreadSanitizer when the
 #      toolchain has it, and the library-level E0487 rules (tests/net/libcheck)
@@ -51,7 +51,7 @@ REQUEST_MS=800
 start_server $REQUEST_MS
 URL=http://127.0.0.1:$PORT
 
-# 1. curl
+# 1. curl (the server is the concurrent one, with its defaults: 8 workers)
 [ "$(curl -s --max-time 5 $URL/health)" = "ok" ] || fail "GET /health"
 [ "$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' $URL/health)" = 200 ] || fail "GET /health status"
 [ "$(curl -s --max-time 5 -d 'hello echo' $URL/echo)" = "hello echo" ] || fail "POST /echo"
@@ -101,7 +101,6 @@ kill_server
 echo "ORIN_DENY=net: ok"
 
 # 6. the concurrent server
-build examples/http_server_concurrent.or http_server_concurrent
 build tests/net/parallel_clients.or parallel_clients
 WORKERS=4
 start_concurrent() { # $1 = binary, $2 = workers; sets PORT
@@ -116,7 +115,7 @@ start_concurrent() { # $1 = binary, $2 = workers; sets PORT
   PORT=$(sed -n 's/.*listening on 127.0.0.1:\([0-9]*\).*/\1/p' $B/server.err | head -n1)
   [ -n "$PORT" ] || fail "no port in the concurrent server's output"
 }
-start_concurrent $B/http_server_concurrent $WORKERS
+start_concurrent $B/http_server $WORKERS
 [ "$(curl -s --max-time 5 http://127.0.0.1:$PORT/health)" = "ok" ] || fail "concurrent: GET /health"
 python3 tools/net_concurrent.py $PORT 800 $WORKERS || fail "net_concurrent.py"
 $B/parallel_clients $PORT 64 3000 > $B/parallel.out 2>&1 || fail "parallel_clients 64: $(cat $B/parallel.out)"
@@ -129,7 +128,7 @@ echo "concurrent server: ok"
 # the same server and the same load under ThreadSanitizer (skipped where the toolchain has no TSan)
 echo 'int main(void){return 0;}' > $B/tsan_probe.c
 if $CC -fsanitize=thread $B/tsan_probe.c -o $B/tsan_probe 2>/dev/null && $B/tsan_probe 2>/dev/null; then
-  $ORIN2 compile examples/http_server_concurrent.or -o $B/hsc_tsan.c
+  $ORIN2 compile examples/http_server.or -o $B/hsc_tsan.c
   $CC -g -O1 -w -fsanitize=thread -I runtime/core $B/hsc_tsan.c runtime/core/orin_runtime.c runtime/platform/orin_platform.c -lm -lpthread -o $B/hsc_tsan
   TSAN_OPTIONS="halt_on_error=0 exitcode=66 log_path=$B/tsan" start_concurrent $B/hsc_tsan $WORKERS
   python3 tools/net_concurrent.py $PORT 800 $WORKERS || fail "net_concurrent.py under TSan"
