@@ -20,7 +20,7 @@ import. Importing a name that the target does not export (or that is private) is
 **MOD-2a.** **Aliases** (ADR-0048 addendum). `import { exists as fileExists, empty as emptyBytes } from "path";` binds the export under the new name, for
 types and values alike (the variants of an imported union keep their own names). `export { a as b } from "path";` re-exports under another name. The
 alias is the only name the file gets; two bindings of one name stay E0304 (MOD-6), and an export the target lacks is E0300.
-- Tests: `tests/next/run/import_alias.or`, `tests/next/errors/e0304_duplicate_import_alias.or`, `tests/next/errors/e0304_import_alias_collides_with_declaration.or`,
+- Tests: `tests/next/run/import_alias.or`, `tests/next/run/import_alias_reexport`, `tests/next/errors/e0304_duplicate_import_alias.or`, `tests/next/errors/e0304_import_alias_collides_with_declaration.or`,
   `tests/next/errors/e0300_import_alias_unknown_name.or`.
 
 **MOD-2b.** **Namespace imports** (ADR-0048 addendum). `import * as m from "path";` binds the name `m`, a compile-time namespace of the target's exports:
@@ -151,7 +151,7 @@ workspace CLI, library/runtime moves) are in the tree.
 
 ## Gaps: rules without a test
 
-- MOD-2: no test shows an import of a name that is exported by `export { x } from` of a third module (only the union case, `modules_reexport_union`). MOD-2a/2b: the re-export alias `export { a as b } from` is covered by a parse-only test; a union type exported through a namespace is covered only for a local module.
+- MOD-2: no test shows an import of a name that is exported by `export { x } from` of a third module (only the union case, `modules_reexport_union`). MOD-2a/2b: a union type exported through a namespace is covered only for a local module.
 - MOD-3: the `$`-path rejection has no test.
 - MOD-6: no test for an import colliding with a local declaration or with another import (E0304 probed with `orin2`).
 - MOD-7: that an exported declaration may mention a private type, and that an importer can then read its fields, has no test (see the README discrepancies).
