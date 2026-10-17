@@ -22,7 +22,7 @@ import {
   usedFlags, borrowReads, readInfo, callsOf, inplaceSlots, takePutChains, pairReturns, ancestors, ancestorsClosed, BlockSink,
   RewritePlan, fnShapeOk, fnWellFormed, progWellFormed, passKept, effects, instrCount, dupCount,
   releaseCount, concatCount, extendCount, getterCount, onlyEdgeBlocksAdded, indices, tablesAgree,
-  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
+  instrUses, usesAffecting, forwardLoads, forwardProgram, forwardCount, uncheckAccesses, uncheckProgram, uncheckedCount, uncheckFields, uncheckFieldsProgram, uncheckedFieldCount, shapeCheckCount, dropUniqueChecks, dropUniqueProgram, makeUniqueCount,
 } from "../opt";
 
 // ---------------------------------------------------------------- builders
@@ -1227,6 +1227,233 @@ function optimizeUnchecksRepeatedAccessesAndTheVerifierAcceptsThem(host: Host): 
       const n = q.functions.reduce((k: usize, f: MFunction) => k + uncheckedCount(f), 0);
       const r = uncheckProgram(q);
       assertEqUsize(r.functions.reduce((k: usize, f: MFunction) => k + uncheckedCount(f), 0), n, "doing it again changes nothing");
+      assertEqUsize(verify(r).errors.length, 0, "and the verifier still accepts it");
+    },
+  );
+}
+
+// ---------------------------------------------------------------- repeated struct slot checks (T7, docs/mir.md v2.8)
+
+// The positions of the unchecked field accesses of block 0.
+function uncheckedFieldAt(f: MFunction): usize[] {
+  let out: usize[] = [];
+  let i: usize = 0;
+  while (i < f.blocks[0].instrs.length) {
+    match (f.blocks[0].instrs[i]) {
+      IGetFieldU(_, _, _) => {
+        out.push(i);
+      },
+      ISetFieldU(_, _, _) => {
+        out.push(i);
+      },
+      _ => {},
+    }
+    i += 1;
+  }
+  return out;
+}
+
+@Test
+function aFieldAfterALoadOfAHigherSlotOfTheSameStructIsUnchecked(): void {
+  const f = withArrays(1, [lr("o"), li("s"), li("d"), li("w")], [
+    IMakeUnique(0),
+    IGetField(1, OLocal(0), 2),
+    IGetField(2, OLocal(0), 1),
+    ICopy(3, OInt(9)),
+    ISetField(0, 0, OLocal(3)),
+    IRelease(0),
+  ]);
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = uncheckFields(p, f);
+  assertEqUsize(uncheckedFieldCount(g), 2, "the second load and the store");
+  assertEqUsize(uncheckedFieldAt(g)[0], 2, "the load of the lower slot");
+  assertEqUsize(uncheckedFieldAt(g)[1], 4, "and the store");
+  match (g.blocks[0].instrs[1]) {
+    IGetField(_, _, k) => {
+      assertEqUsize(k, 2, "the first access keeps its check");
+    },
+    _ => {
+      assert(false, "the first access is still an IGetField");
+    },
+  }
+  assert(passKept(f, g), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+}
+
+@Test
+function aFieldAccessIsUncheckedAcrossMakeUniqueAndCalls(): void {
+  const callee = fn("g", 1, [lr("p")], [bk([], TReturn(None))]);
+  const f = withArrays(1, [lr("o"), li("s"), li("d"), li("w")], [
+    IGetField(1, OLocal(0), 1),
+    IMakeUnique(0),
+    ICall(None, 1, [OLocal(0)]),
+    ICopy(3, OInt(4)),
+    ISetField(0, 1, OLocal(3)),
+    IGetField(2, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  const p = prog([f, callee]);
+  assert(verifies(p), "the input verifies");
+  const g = uncheckFields(p, f);
+  assertEqUsize(uncheckedFieldCount(g), 2, "the store and the load, though the struct was made unique and passed to a call");
+  assert(verifies(prog([g, callee])), "the verifier accepts the result");
+}
+
+@Test
+function aLowerSlotAnotherStructOrAnotherBlockKeepsTheCheck(): void {
+  const lower = withArrays(1, [lr("o"), li("s"), li("d")], [
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  const lowerG = uncheckFields(prog([lower]), lower);
+  assertEqUsize(uncheckedFieldCount(lowerG), 2, "slot 1 is not covered by an access of slot 0, but by the shape check put before it");
+  assertEqUsize(shapeCheckCount(lowerG), 1, "one shape check");
+  match (lowerG.blocks[0].instrs[0]) {
+    IShapeCheck(x, k) => {
+      assertEqUsize(x, 0, "of the struct");
+      assertEqUsize(k, 1, "for the highest later slot");
+    },
+    _ => {
+      assert(false, "an IShapeCheck first");
+    },
+  }
+  assert(passKept(lower, lowerG), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([lowerG])), "the verifier accepts the result");
+  const twoStructs = withArrays(2, [lr("o"), lr("q"), li("s"), li("d")], [
+    IGetField(2, OLocal(0), 1),
+    IGetField(3, OLocal(1), 1),
+    IRelease(0),
+    IRelease(1),
+  ]);
+  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([twoStructs]), twoStructs)), 0, "another struct has not been checked");
+  const across = fn("f", 1, [lr("o"), li("s"), li("d")], [
+    bk([IGetField(1, OLocal(0), 1)], TGoto(1)),
+    bk([IGetField(2, OLocal(0), 1), IRelease(0)], TReturn(None)),
+  ]);
+  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([across]), across)), 0, "the scan stays within the block");
+}
+
+@Test
+function theFirstAccessOfABlockIsCoveredByAShapeCheckOfTheHighestLaterSlot(): void {
+  const f = withArrays(1, [lr("o"), li("a"), li("b"), li("c"), li("w")], [
+    IGetField(1, OLocal(0), 0),
+    IGetField(2, OLocal(0), 1),
+    ICopy(4, OInt(7)),
+    IMakeUnique(0),
+    ISetField(0, 2, OLocal(4)),
+    IGetField(3, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  const p = prog([f]);
+  assert(verifies(p), "the input verifies");
+  const g = uncheckFields(p, f);
+  assertEqUsize(shapeCheckCount(g), 1, "one shape check");
+  assertEqUsize(uncheckedFieldCount(g), 4, "every access is unchecked, the first one too");
+  assertEqUsize(g.blocks[0].instrs.length, f.blocks[0].instrs.length + 1, "one instruction more");
+  match (g.blocks[0].instrs[0]) {
+    IShapeCheck(x, k) => {
+      assertEqUsize(x, 0, "of the struct");
+      assertEqUsize(k, 2, "for slot 2");
+    },
+    _ => {
+      assert(false, "an IShapeCheck first");
+    },
+  }
+  assert(passKept(f, g), "the pass keeps the function's shape and effects");
+  assert(verifies(prog([g])), "the verifier accepts the result");
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([g]), g)), 1, "doing it again adds nothing");
+}
+
+@Test
+function noShapeCheckIsAddedWhereItRemovesNothing(): void {
+  const descending = withArrays(1, [lr("o"), li("a"), li("b")], [
+    IGetField(1, OLocal(0), 2),
+    IGetField(2, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([descending]), descending)), 0, "the first access covers the later, lower slot");
+  const single = withArrays(1, [lr("o"), li("a")], [IGetField(1, OLocal(0), 2), IRelease(0)]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([single]), single)), 0, "a single access has nothing to cover");
+  const moved = withArrays(2, [lr("o"), lr("q"), li("a"), li("b")], [
+    IGetField(2, OLocal(0), 0),
+    IMove(0, 1),
+    IGetField(3, OLocal(0), 3),
+    IRelease(0),
+  ]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([moved]), moved)), 0, "o is another object after the move");
+  const selfLoad = withArrays(1, [lr("o"), li("a")], [
+    IGetField(0, OLocal(0), 0),
+    IGetField(1, OLocal(0), 3),
+    IRelease(0),
+  ]);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([selfLoad]), selfLoad)), 0, "a load that redefines o covers nothing after it");
+  let far: Instr[] = [IGetField(1, OLocal(0), 0)];
+  let n: usize = 0;
+  while (n < 70) {
+    far.push(ICopy(2, OInt(1)));
+    n += 1;
+  }
+  far.push(IGetField(3, OLocal(0), 1));
+  far.push(IRelease(0));
+  const beyond = withArrays(1, [lr("o"), li("a"), li("w"), li("b")], far);
+  assertEqUsize(shapeCheckCount(uncheckFields(prog([beyond]), beyond)), 0, "the later access is beyond the window of the check");
+}
+
+@Test
+function aRedefinitionOfTheStructEndsTheScan(): void {
+  const moved = withArrays(2, [lr("o"), lr("q"), li("s"), li("d")], [
+    IGetField(2, OLocal(0), 1),
+    IMove(0, 1),
+    IGetField(3, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([moved]), moved)), 0, "o names another object after the move");
+  const callee = fn("g", 1, [lr("p")], [bk([], TReturn(None))]);
+  const io = MFunction {
+    name: "h", paramCount: 1, paramOwned: [true], inout: true, locals: [lr("p")], ret: MVoid, blocks: [bk([], TReturn(None))],
+  };
+  const viaCall = withArrays(1, [lr("o"), li("s"), li("d")], [
+    IGetField(1, OLocal(0), 1),
+    ICall(None, 2, [OLocal(0)]),
+    IGetField(2, OLocal(0), 1),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([viaCall, callee, io]), viaCall)), 0, "an in/out call hands back another object");
+}
+
+@Test
+function aLoadThatOverwritesItsOwnObjectIsNotASource(): void {
+  const f = withArrays(1, [lr("o"), li("d")], [
+    IGetField(0, OLocal(0), 0),
+    IGetField(1, OLocal(0), 0),
+    IRelease(0),
+  ]);
+  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([f]), f)), 0, "o.0 names another object after `o = o.0`");
+}
+
+@Test
+function anUncheckedFieldAccessOfAnUnboxedAggregateNeverHappens(): void {
+  const f = MFunction {
+    name: "f", paramCount: 0, paramOwned: [], inout: false,
+    locals: [MLocal { name: "a", ty: MAgg(2) }, li("s"), li("d")], ret: MVoid,
+    blocks: [bk([IStructNew(0, 0, [OInt(1), OInt(2)]), IGetField(1, OLocal(0), 0), IGetField(2, OLocal(0), 0)], TReturn(None))],
+  };
+  assertEqUsize(uncheckedFieldCount(uncheckFields(prog([f]), f)), 0, "an aggregate has no header to check");
+}
+
+@Test
+function optimizeUnchecksRepeatedFieldAccessesAndTheVerifierAcceptsThem(host: Host): void {
+  useFs(
+    host,
+    fs => {
+      const p = optimized(fs, sampleSource()).unwrap();
+      const q = optimize(p);
+      assertEqUsize(verify(q).errors.length, 0, "the verifier accepts the optimised program");
+      const n = q.functions.reduce((k: usize, f: MFunction) => k + uncheckedFieldCount(f), 0);
+      const r = uncheckFieldsProgram(q);
+      assertEqUsize(r.functions.reduce((k: usize, f: MFunction) => k + uncheckedFieldCount(f), 0), n, "doing it again changes nothing");
       assertEqUsize(verify(r).errors.length, 0, "and the verifier still accepts it");
     },
   );

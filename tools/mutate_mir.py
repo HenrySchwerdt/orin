@@ -51,6 +51,14 @@ Mutation classes (id: injected bug -> required reaction)
   bce-other-index-ok  read another index of a there (positive control)                       -> ACCEPTED (rejection is a finding)
   The bce-* classes are applied to the unchecked accesses that only the dominating-access fact justifies, and bce-no-fact to every
   checked access left after the optimiser (so none of them is justified by an interval); `verify_text --facts` tells the kinds apart.
+  unchecked struct slots (rule U6, docs/mir.md v2.8; applied to every `getfieldu` / `setfieldu` of the optimised corpus):
+  field-no-fact       make a checked field access unchecked that has no earlier access of its struct local in its block -> ERROR without a dominating check
+  field-after-redef   redefine the struct local before the unchecked access (`t = dup o; o = move t`)  -> ERROR without a dominating check
+  field-across-block  split the block between the checked access and the unchecked one               -> ERROR without a dominating check
+  field-higher-slot   access a slot above every slot the block accessed before                       -> ERROR without a dominating check
+  shape-drop          delete a `shapecheck o.K` that justifies the unchecked accesses after it                     -> ERROR without a dominating check
+  shape-too-small     check one slot fewer (`shapecheck o.K-1`) when an unchecked access of slot K relies on it   -> ERROR without a dominating check
+  field-makeunique-ok `makeunique o` there (positive control)                                        -> ACCEPTED (rejection is a finding)
   range facts (rule U1, interval fact, docs/mir.md v2.6; applied to every unchecked access that ONLY the interval analysis justifies):
   range-widen-off-by-one    the loop bound one too large (`lt i, N` -> `le i, N`, `le i, N-1` -> `le i, N`) -> ERROR without a dominating check
   range-after-push          `arraypush a` before the access                                  -> ERROR
@@ -194,7 +202,7 @@ def op(line):
 
 
 APPENDS = ("strappend", "strprepend", "strappendi", "strappendu", "strappendsub")
-STORES = ("setfield", "putfield", "arrayset", "arraysetu", "arrayput")
+STORES = ("setfield", "setfieldu", "putfield", "arrayset", "arraysetu", "arrayput")
 TAKES = ("takefield", "arraytake")
 
 
@@ -330,7 +338,7 @@ def reaches_return(f, bi):
 # Independent, deliberately conservative "definitely Unique" dataflow (not the verifier's rules):
 # a local is Unique after struct/arraynew/closure/makeunique and after a move of a Unique local;
 # every other mention that is not a plain read or an in-place store loses it; join = intersection.
-KEEP_READS = ("getfield", "arrayget", "arraygetu", "tag", "forward")
+KEEP_READS = ("getfield", "getfieldu", "arrayget", "arraygetu", "tag", "forward")
 
 
 def uniq_transfer(f, U, line):
@@ -344,6 +352,8 @@ def uniq_transfer(f, U, line):
         keep = {t[0]}
     elif w in TAKES:
         keep = {t[1]}
+    elif w == "shapecheck":
+        keep = {t[0]}
     elif w in KEEP_READS:
         keep = set(t[1:])
     elif w == "makeunique":
@@ -453,7 +463,7 @@ def sites(f):
                     # mutant is accepted, so it is a SURVIVOR); no BENIGN classification remains for this class.
                     cls = "redundant-makeunique-census" if certainly_unique(f, bi, ii, x) else "drop-makeunique"
                     out.append(Mut(cls, f, (bi, ii), "delete `%s` (b%d i%d) before `%s`" % (line, bi, ii, ins[later]), None, "to be Unique", "error"))
-            if (w == "borrow" or w == "getfield" or w == "arrayget") and d is not None and f.is_ref(d):
+            if (w == "borrow" or w in ("getfield", "getfieldu") or w == "arrayget") and d is not None and f.is_ref(d):
                 out.append(Mut("release-borrowed", f, (bi, ii), "release l%d after `%s` (b%d i%d)" % (d, line, bi, ii), None, "of borrowed", "error"))
             if w == "dup" and d is not None:
                 nxt = mentions_after(f, bi, ii, d)
@@ -480,6 +490,12 @@ def sites(f):
                     out += range_sites(f, bi, ii, line)
             if w in ("arrayget", "arrayset"):
                 out += nofact_sites(f, bi, ii, line)
+            if w in ("getfieldu", "setfieldu"):
+                out += field_sites(f, bi, ii, line)
+            if w == "shapecheck":
+                out += shape_sites(f, bi, ii, line)
+            if w in ("getfield", "setfield"):
+                out += field_nofact_sites(f, bi, ii, line)
     if f.inout:
         # v1.10: parameter 0 is handed back to the caller at every return
         for bi, (label, ins, term) in enumerate(f.blocks):
@@ -511,7 +527,7 @@ def fwd_kind(ins, ii, o, key):
     """'field' or 'array' (the form of the nearest earlier access to slot (o, key), looking through forwards), else None."""
     for j in range(ii - 1, -1, -1):
         line = ins[j]
-        m = re.match(r"(?:l\d+ = getfield|setfield) l%d\.%s\b" % (o, re.escape(key[:-1])), line)
+        m = re.match(r"(?:l\d+ = getfieldu?|setfieldu?) l%d\.%s\b" % (o, re.escape(key[:-1])), line)
         if m and key.endswith("u"):
             return "field"
         if re.match(r"(?:l\d+ = arrayget|arrayset)u? l%d\[%s\]" % (o, re.escape(key)), line):
@@ -524,7 +540,7 @@ def fwd_kind(ins, ii, o, key):
 def no_ref_alias_of(f, o):
     """No reference local is projected or borrowed from o: a store through o kills such borrows, which would reject a
     positive control for a reason that has nothing to do with forwarding."""
-    pat = re.compile(r"l(\d+) = (?:getfield|borrow) l%d\b|l(\d+) = arraygetu? l%d\[" % (o, o))
+    pat = re.compile(r"l(\d+) = (?:getfieldu?|borrow) l%d\b|l(\d+) = arraygetu? l%d\[" % (o, o))
     for _, ins, _t in f.blocks:
         for line in ins:
             m = pat.match(line)
@@ -700,6 +716,137 @@ def apply_bounds(m, f):
         k2 = re.search(r"\[(\d+)u\] before", m.desc).group(1) + "u"
         w = f.new_local(scalar_ty(f, a, key, val, d))
         ins.insert(ii, "l%d = arrayget l%d[%s]" % (w, a, k2))
+    else:
+        raise ValueError(m.cls)
+    return f
+
+
+# ---------------------------------------------------------------- unchecked struct slots (rule U6)
+
+FGET_RE = re.compile(r"l(\d+) = getfieldu? l(\d+)\.(\d+)$")
+FSET_RE = re.compile(r"setfieldu? l(\d+)\.(\d+) = (.+)$")
+
+
+def field_parts(line):
+    """(struct local, slot, destination local or None) of a getfield / setfield line (either form)."""
+    m = FGET_RE.match(line)
+    if m:
+        return int(m.group(2)), int(m.group(3)), int(m.group(1))
+    m = FSET_RE.match(line)
+    if m:
+        return int(m.group(1)), int(m.group(2)), None
+    return None
+
+
+def field_slots_before(ins, ii, o):
+    """The slots of local o that earlier instructions of the block access (any form)."""
+    pat = re.compile(r"(?:l\d+ = (?:getfieldu?|takefield) l%d\.(\d+)$|(?:setfieldu?|putfield) l%d\.(\d+) = |shapecheck l%d\.(\d+)$)" % (o, o, o))
+    new = re.compile(r"l%d = struct tag\d+ \{(.*)\}$" % o)
+    out = []
+    for l in ins[:ii]:
+        m = pat.match(l)
+        if m:
+            out.append(int(m.group(1) or m.group(2) or m.group(3)))
+        m = new.match(l)
+        if m:
+            n = len([x for x in m.group(1).split(", ") if x.strip()])
+            if n > 0:
+                out.append(n - 1)
+    return out
+
+
+def field_nofact_sites(f, bi, ii, line):
+    """A checked field access with no earlier access of the same struct local in its block: making it unchecked is the
+    field-no-fact mutant (the optimiser leaves exactly these checked, or those whose sources are too far or too low)."""
+    p = field_parts(line)
+    if p is None or not f.is_ref(p[0]):
+        return []
+    o, k, d = p
+    ins = f.blocks[bi][1]
+    if field_slots_before(ins, ii, o):
+        return []
+    return [Mut("field-no-fact", f, (bi, ii), "make `%s` unchecked, with no earlier access of l%d in the block (b%d i%d)" % (line, o, bi, ii),
+                None, "without a dominating check", "error")]
+
+
+def field_sites(f, bi, ii, line):
+    o, k, d = field_parts(line)
+    ins = f.blocks[bi][1]
+    where = "(b%d i%d)" % (bi, ii)
+    need = "without a dominating check"
+    out = [
+        Mut("field-after-redef", f, (bi, ii), "redefine l%d before `%s` %s" % (o, line, where), None, need, "error"),
+        Mut("field-across-block", f, (bi, ii), "split the block before `%s` %s" % (line, where), None, need, "error"),
+    ]
+    # a slot above every slot of o that the block has accessed so far: no earlier check covers it
+    top = max(field_slots_before(ins, ii, o) + [k])
+    out.append(Mut("field-higher-slot", f, (bi, ii), "access slot %d of l%d instead of %d in `%s` %s" % (top + 1, o, k, line, where), None, need, "error"))
+    if no_ref_alias_of(f, o) and o >= f.nparams and certainly_unique(f, bi, ii, o):
+        out.append(Mut("field-makeunique-ok", f, (bi, ii), "makeunique l%d before `%s` %s" % (o, line, where),
+                       "positive control: makeunique keeps kind and slot count", None, "accept"))
+    return out
+
+
+def apply_shape(m, f):
+    ins = f.blocks[m.bi][1]
+    line = ins[m.ii]
+    o, k = (int(x) for x in SHAPE_RE.match(line).groups())
+    if m.cls == "shape-drop":
+        del ins[m.ii]
+    elif m.cls == "shape-too-small":
+        ins[m.ii] = "shapecheck l%d.%d" % (o, k - 1)
+    else:
+        raise ValueError(m.cls)
+    return f
+
+
+SHAPE_RE = re.compile(r"shapecheck l(\d+)\.(\d+)$")
+
+
+def shape_sites(f, bi, ii, line):
+    """A shape check that is the first mention of its struct local in the block (so it alone justifies the unchecked accesses after it):
+    dropping it, or checking one slot fewer, must leave an unchecked access unjustified."""
+    o, k = (int(x) for x in SHAPE_RE.match(line).groups())
+    ins = f.blocks[bi][1]
+    if any(o in toks(l) and op(l) != "makeunique" for l in ins[:ii]):
+        return []
+    if any(dest(l) == o for l in ins[ii + 1:]):
+        return []
+    if any(re.match(r"(?:l\d+ = )?(?:getfield|takefield|shapecheck|setfield|putfield) l%d\b" % o, l) for l in ins[ii + 1:]):
+        return []
+    where = "(b%d i%d)" % (bi, ii)
+    need = "without a dominating check"
+    out = [Mut("shape-drop", f, (bi, ii), "delete `%s` %s" % (line, where), None, need, "error")]
+    top = max([int(x) for l in ins[ii + 1:] for x in re.findall(r"(?:getfieldu|setfieldu) l%d\.(\d+)" % o, l)] + [-1])
+    if k >= 1 and top == k:
+        out.append(Mut("shape-too-small", f, (bi, ii), "check %d slots fewer: `shapecheck l%d.%d` %s" % (1, o, k - 1, where), None, need, "error"))
+    return out
+
+
+def apply_fields(m, f):
+    b = f.blocks[m.bi]
+    ins = b[1]
+    ii = m.ii
+    line = ins[ii]
+    o, k, d = field_parts(line)
+    if m.cls == "field-no-fact":
+        ins[ii] = line.replace("getfield ", "getfieldu ", 1) if d is not None else line.replace("setfield ", "setfieldu ", 1)
+    elif m.cls == "field-after-redef":
+        n = f.new_local()
+        ins.insert(ii, "l%d = dup l%d" % (n, o))
+        ins.insert(ii + 1, "l%d = move l%d" % (o, n))
+    elif m.cls == "field-across-block":
+        rest = ins[ii:]
+        del ins[ii:]
+        label = "b%d" % len(f.blocks)
+        ins_term = b[2]
+        b[2] = "goto %s" % label
+        f.blocks.append([label, rest, ins_term])
+    elif m.cls == "field-higher-slot":
+        k2 = int(re.search(r"access slot (\d+) of", m.desc).group(1))
+        ins[ii] = line.replace(".%d" % k, ".%d" % k2, 1)
+    elif m.cls == "field-makeunique-ok":
+        ins.insert(ii, "makeunique l%d" % o)
     else:
         raise ValueError(m.cls)
     return f
@@ -1044,6 +1191,10 @@ def apply(m):
         return apply_forward(m, f)
     if m.cls.startswith("bce-"):
         return apply_bounds(m, f)
+    if m.cls.startswith("field-"):
+        return apply_fields(m, f)
+    if m.cls.startswith("shape-"):
+        return apply_shape(m, f)
     if m.cls.startswith("range-"):
         return apply_range(m, f)
     if m.cls == "inout-drop-receiver":
